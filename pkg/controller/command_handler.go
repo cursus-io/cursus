@@ -21,22 +21,22 @@ var regexCache sync.Map
 
 // handleHelp processes HELP command
 func (ch *CommandHandler) handleHelp() string {
-	return `Available commands:  
-CREATE topic=<name> [partitions=<N>] - create topic (default=4)  
-DELETE topic=<name> - delete topic  
-LIST - list all topics  
-PUBLISH topic=<name> acks=<0|1> message=<text> producerId=<id> [seqNum=<N> epoch=<N>] - publish message
-CONSUME topic=<name> partition=<N> offset=<N> group=<name> [autoOffsetReset=<earliest|latest>] - consume messages  
-JOIN_GROUP topic=<name> group=<name> member=<id> - join consumer group  
-SYNC_GROUP topic=<name> group=<name> member=<id> generation=<N> - sync group assignments  
-LEAVE_GROUP group=<name> member=<id> - leave consumer group  
-HEARTBEAT topic=<name> group=<name> member=<id> - send heartbeat  
-COMMIT_OFFSET topic=<name> partition=<N> group=<name> offset=<N> - commit offset  
-FETCH_OFFSET topic=<name> partition=<N> group=<name> - fetch committed offset  
-REGISTER_GROUP topic=<name> group=<name> - register consumer group  
-GROUP_STATUS group=<name> - get group status  
-DESCRIBE topic=<name> - get topic/partition metadata (leader, ISR, offsets)  
-HELP - show this help  
+	return `Available commands:
+CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] - create topic (default partitions=4, idempotent=false)
+DELETE topic=<name> - delete topic
+LIST - list all topics
+PUBLISH topic=<name> acks=<0|1> message=<text> producerId=<id> [seqNum=<N> epoch=<N>] [isIdempotent=<true|false>] - publish message
+CONSUME topic=<name> partition=<N> offset=<N> group=<name> [autoOffsetReset=<earliest|latest>] - consume messages
+JOIN_GROUP topic=<name> group=<name> member=<id> - join consumer group
+SYNC_GROUP topic=<name> group=<name> member=<id> generation=<N> - sync group assignments
+LEAVE_GROUP group=<name> member=<id> - leave consumer group
+HEARTBEAT topic=<name> group=<name> member=<id> - send heartbeat
+COMMIT_OFFSET topic=<name> partition=<N> group=<name> offset=<N> - commit offset
+FETCH_OFFSET topic=<name> partition=<N> group=<name> - fetch committed offset
+REGISTER_GROUP topic=<name> group=<name> - register consumer group
+GROUP_STATUS group=<name> - get group status
+DESCRIBE topic=<name> - get topic/partition metadata (leader, ISR, offsets)
+HELP - show this help
 EXIT - exit`
 }
 
@@ -57,6 +57,11 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 		partitions = n
 	}
 
+	idempotent := false
+	if idempStr, ok := args["idempotent"]; ok {
+		idempotent = strings.ToLower(idempStr) == "true"
+	}
+
 	tm := ch.TopicManager
 	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
@@ -66,9 +71,8 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 		payload := map[string]interface{}{
 			"name":       topicName,
 			"partitions": partitions,
-			// todo. (issues #27) "leader_id": partition leader
+			"idempotent": idempotent,
 		}
-
 		_, err := ch.applyAndWait("TOPIC", payload)
 		if err != nil {
 			return fmt.Sprintf("❌ Failed to create topic: %v", err)
@@ -681,35 +685,30 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 		Topic: topicName,
 	}
 
-	var leaderAddr string
+	var raftLeader string
 	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
-		leaderAddr = ch.Cluster.RaftManager.GetLeaderAddress()
+		raftLeader = ch.Cluster.RaftManager.GetLeaderAddress()
 	}
 
 	for _, p := range t.Partitions {
 		pm := PartitionMetadata{
 			ID:     p.ID(),
-			Leader: leaderAddr,
+			Leader: raftLeader, // default to Raft leader
 			LEO:    p.NextOffset(),
 			HWM:    p.HWM,
 		}
 
 		if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
-			confFuture := ch.Cluster.RaftManager.GetConfiguration()
-			if confFuture.Error() == nil {
-				for _, s := range confFuture.Configuration().Servers {
-					pm.Replicas = append(pm.Replicas, string(s.Address))
-				}
-			}
-
-			// retrieve actual ISR from FSM
+			// retrieve actual partition-specific leader from FSM
 			if fsm := ch.Cluster.RaftManager.GetFSM(); fsm != nil {
 				partitionKey := fmt.Sprintf("%s-%d", topicName, p.ID())
 				if meta := fsm.GetPartitionMetadata(partitionKey); meta != nil {
 					pm.ISR = meta.ISR
-				} else {
-					// fallback to replicas
-					pm.ISR = pm.Replicas
+					pm.Replicas = meta.Replicas
+
+					if leaderBroker := fsm.GetBroker(meta.Leader); leaderBroker != nil {
+						pm.Leader = leaderBroker.Addr
+					}
 				}
 			}
 		}

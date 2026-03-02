@@ -93,6 +93,10 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 
 		cc = clusterController.NewClusterController(ctx, cfg, rm, sd)
 
+		if cd != nil {
+			cd.SetLeaderChecker(cc.IsLeader)
+		}
+
 		globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
 		cc.SetLocalProcessor(globalCH)
 

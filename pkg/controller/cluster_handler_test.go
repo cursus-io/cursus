@@ -31,10 +31,10 @@ func (m *MockRaftManagerForForward) ApplyCommand(prefix string, data []byte) err
 func (m *MockRaftManagerForForward) LeaderCh() <-chan bool                         { return nil }
 func (m *MockRaftManagerForForward) GetFSM() *fsm.BrokerFSM                        { return nil }
 func (m *MockRaftManagerForForward) GetConfiguration() raft.ConfigurationFuture    { return nil }
-func (m *MockRaftManagerForForward) ReplicateWithQuorum(t string, p int, msg types.Message, i int) (types.AckResponse, error) {
+func (m *MockRaftManagerForForward) ReplicateWithQuorum(t string, p int, msg types.Message, i int, idemp bool, scope string) (types.AckResponse, error) {
 	return types.AckResponse{}, nil
 }
-func (m *MockRaftManagerForForward) ReplicateBatchWithQuorum(t string, p int, msgs []types.Message, i int, a string) (types.AckResponse, error) {
+func (m *MockRaftManagerForForward) ReplicateBatchWithQuorum(t string, p int, msgs []types.Message, i int, a string, idemp bool, scope string) (types.AckResponse, error) {
 	return types.AckResponse{}, nil
 }
 func (m *MockRaftManagerForForward) ApplyResponse(p string, d []byte, t time.Duration) (types.AckResponse, error) {

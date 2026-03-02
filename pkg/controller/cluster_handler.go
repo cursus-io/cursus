@@ -17,13 +17,13 @@ func (ch *CommandHandler) ProcessCommand(cmd string) string {
 }
 
 func (ch *CommandHandler) isAuthorizedForPartition(topic string, partition int) bool {
-	if ch.Cluster == nil {
+	if !ch.Config.EnabledDistribution || ch.Cluster == nil {
 		return true
 	}
 	return ch.Cluster.IsAuthorized(topic, partition)
 }
 
-// todo. (issues #27) isLeaderAndForward checks if the current node is the cluster leader
+// isLeaderAndForward checks if the current node is the cluster leader
 func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 	if !ch.Config.EnabledDistribution || ch.Cluster == nil || ch.Cluster.RaftManager == nil {
 		return "", false, nil

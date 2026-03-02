@@ -16,6 +16,11 @@ func (c *Coordinator) monitorHeartbeats() {
 	for {
 		select {
 		case <-ticker.C:
+			if c.cfg.EnabledDistribution && c.leaderChecker != nil {
+				if !c.leaderChecker() {
+					continue
+				}
+			}
 			c.checkAllGroupsTimeout()
 		case <-c.stopCh:
 			return

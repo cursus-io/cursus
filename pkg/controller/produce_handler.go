@@ -37,6 +37,11 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 		acks = "1"
 	}
 
+	isIdempotent := false
+	if val, ok := args["isIdempotent"]; ok {
+		isIdempotent = val == "true"
+	}
+
 	acksLower := strings.ToLower(acks)
 	if acksLower != "0" && acksLower != "1" && acksLower != "-1" && acksLower != "all" {
 		return fmt.Sprintf("ERROR: invalid acks value: %s. Expected -1 (all), 0, or 1", acks)
@@ -59,12 +64,6 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 	}
 
 	var ackResp types.AckResponse
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
-		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
-			return resp
-		}
-	}
-
 	tm := ch.TopicManager
 	t := tm.GetTopic(topicName)
 	if t == nil {
@@ -97,10 +96,15 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 	}
 
 	partition := t.GetPartitionForMessage(*msg)
+
 	if ch.Config.EnabledDistribution && ch.Cluster != nil {
 		if !ch.isAuthorizedForPartition(topicName, partition) {
-			util.Error("NOT_AUTHORIZED_FOR_PARTITION %s:%d", topicName, partition)
-			return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_PARTITION %s:%d", topicName, partition)
+			util.Debug("Not leader for %s:%d, forwarding to partition leader", topicName, partition)
+			resp, err := ch.Cluster.Router.ForwardToPartitionLeader(topicName, partition, cmd)
+			if err != nil {
+				return ch.errorResponse(fmt.Sprintf("failed to forward to partition leader: %v", err))
+			}
+			return resp
 		}
 
 		p, err := t.GetPartition(partition)
@@ -111,8 +115,15 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 
 		assignedOffset := p.ReserveOffsets(1)
 		msg.Offset = assignedOffset
+		effectiveIdempotent := isIdempotent || ch.Config.EnableIdempotence
+
+		scope := "global"
+		if effectiveIdempotent {
+			scope = "partition"
+		}
+
 		if acks == "-1" || acksLower == "all" {
-			ackResp, err = ch.Cluster.RaftManager.ReplicateWithQuorum(topicName, partition, *msg, ch.Config.MinInSyncReplicas)
+			ackResp, err = ch.Cluster.RaftManager.ReplicateWithQuorum(topicName, partition, *msg, ch.Config.MinInSyncReplicas, effectiveIdempotent, scope)
 
 			if err != nil {
 				return ch.errorResponse(fmt.Sprintf("failed to replicate with quorum (acks=-1): %v", err))
@@ -121,9 +132,10 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 
 		} else {
 			messageData := types.MessageCommand{
-				Topic:        topicName,
-				Partition:    partition,
-				IsIdempotent: false,
+				Topic:         topicName,
+				Partition:     partition,
+				IsIdempotent:  effectiveIdempotent,
+				SequenceScope: scope,
 				Messages: []types.Message{
 					{
 						Offset:     assignedOffset,
@@ -215,19 +227,19 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 	var respAck types.AckResponse
 	var lastMsg *types.Message
 	if ch.Config.EnabledDistribution && ch.Cluster != nil {
-		leader := ch.Cluster.IsLeader()
-		if !leader {
+		if !ch.isAuthorizedForPartition(batch.Topic, batch.Partition) {
 			const maxRetries = 3
 			const retryDelay = 200 * time.Millisecond
 			var lastErr error
 
 			for i := 0; i < maxRetries; i++ {
-				resp, forwardErr := ch.Cluster.Router.ForwardDataToLeader(data)
+				util.Debug("Not leader for %s:%d, forwarding BATCH to partition leader (Attempt %d/%d)", batch.Topic, batch.Partition, i+1, maxRetries)
+				resp, forwardErr := ch.Cluster.Router.ForwardDataToPartitionLeader(batch.Topic, batch.Partition, data)
 				if forwardErr == nil {
 					return resp, nil
 				}
 
-				util.Debug("Failed to forward batch to leader. Retrying (Attempt %d/%d). Error: %v", i+1, maxRetries, forwardErr)
+				util.Debug("Failed to forward batch to partition leader. Error: %v", forwardErr)
 
 				if i < maxRetries-1 {
 					time.Sleep(retryDelay)
@@ -235,16 +247,10 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 				lastErr = forwardErr
 			}
 
-			return ch.errorResponse(fmt.Sprintf("failed to forward BATCH to leader after %d attempts: %v", maxRetries, lastErr)), nil
-		} else {
-			leaderAddr := ch.Cluster.RaftManager.GetLeaderAddress()
-			util.Debug("Processing BATCH locally as leader: %s", leaderAddr)
+			return ch.errorResponse(fmt.Sprintf("failed to forward BATCH to partition leader after %d attempts: %v", maxRetries, lastErr)), nil
 		}
 
-		if !ch.isAuthorizedForPartition(batch.Topic, batch.Partition) {
-			util.Error("NOT_AUTHORIZED_FOR_PARTITION %s:%d", batch.Topic, batch.Partition)
-			return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_PARTITION %s:%d", batch.Topic, batch.Partition), nil
-		}
+		util.Debug("Processing BATCH locally as authorized leader for %s:%d", batch.Topic, batch.Partition)
 
 		t := ch.TopicManager.GetTopic(batch.Topic)
 		if t == nil {
@@ -264,8 +270,13 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 			batch.Messages[i].Offset = startOffset + uint64(i)
 		}
 
+		scope := "global"
+		if batch.IsIdempotent {
+			scope = "partition"
+		}
+
 		if acks == "-1" || acksLower == "all" {
-			respAck, err = ch.Cluster.RaftManager.ReplicateBatchWithQuorum(batch.Topic, batch.Partition, batch.Messages, ch.Config.MinInSyncReplicas, acks)
+			respAck, err = ch.Cluster.RaftManager.ReplicateBatchWithQuorum(batch.Topic, batch.Partition, batch.Messages, ch.Config.MinInSyncReplicas, acks, batch.IsIdempotent, scope)
 			if err != nil {
 				return ch.errorResponse(err.Error()), nil
 			}
