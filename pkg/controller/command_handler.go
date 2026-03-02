@@ -699,7 +699,17 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 			if confFuture.Error() == nil {
 				for _, s := range confFuture.Configuration().Servers {
 					pm.Replicas = append(pm.Replicas, string(s.Address))
-					pm.ISR = append(pm.ISR, string(s.Address))
+				}
+			}
+
+			// retrieve actual ISR from FSM
+			if fsm := ch.Cluster.RaftManager.GetFSM(); fsm != nil {
+				partitionKey := fmt.Sprintf("%s-%d", topicName, p.ID())
+				if meta := fsm.GetPartitionMetadata(partitionKey); meta != nil {
+					pm.ISR = meta.ISR
+				} else {
+					// fallback to replicas
+					pm.ISR = pm.Replicas
 				}
 			}
 		}

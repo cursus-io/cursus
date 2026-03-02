@@ -12,6 +12,9 @@ type StreamManagerAdapter struct {
 }
 
 func NewStreamManagerAdapter(sm *stream.StreamManager) *StreamManagerAdapter {
+	if sm == nil {
+		panic("stream manager cannot be nil")
+	}
 	return &StreamManagerAdapter{sm: sm}
 }
 

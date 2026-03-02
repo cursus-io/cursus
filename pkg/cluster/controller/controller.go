@@ -51,6 +51,10 @@ func (cc *ClusterController) Start(ctx context.Context) {
 }
 
 func (cc *ClusterController) SetLocalProcessor(lp LocalProcessor) {
+	if lp == nil {
+		util.Warn("LocalProcessor is nil, ignoring")
+		return
+	}
 	if cc.Router != nil {
 		cc.Router.localProcessor = lp
 	}

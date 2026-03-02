@@ -38,6 +38,9 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 		if ch.Cluster.RaftManager.GetLeaderAddress() != "" {
 			break
 		}
+		if i == maxRetries-1 {
+			return "ERROR: no Raft leader elected after retries", true, fmt.Errorf("no leader elected")
+		}
 		util.Debug("Waiting for Raft leader to be elected... (attempt %d/%d)", i+1, maxRetries)
 		time.Sleep(retryDelay)
 	}
@@ -47,9 +50,9 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 			return "ERROR: not the leader, and router is nil", true, nil
 		}
 
+		encodedCmd := util.EncodeMessage("", cmd)
 		var lastErr error
 		for i := 0; i < maxRetries; i++ {
-			encodedCmd := util.EncodeMessage("", cmd)
 			resp, err := ch.Cluster.Router.ForwardToLeader(string(encodedCmd))
 			if err == nil {
 				return resp, true, nil

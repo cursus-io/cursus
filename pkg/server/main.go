@@ -229,7 +229,7 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 		if isCommand(rawInput) {
 			return handleCommandMessage(rawInput, cmdHandler, ctx, conn)
 		}
-		util.Error("⚠️ Decode error: %v [%s]", err, string(data))
+		util.Error("⚠️ Decode error and not a raw command: %v [%s]", err, string(data))
 		return false, err
 	}
 
