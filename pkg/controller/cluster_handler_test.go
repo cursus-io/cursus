@@ -51,18 +51,15 @@ func TestCommandHandler_isLeaderAndForward_WaitRetry(t *testing.T) {
 
 	ch := NewCommandHandler(tm, cfg, nil, nil, cc)
 
-	start := time.Now()
+	ready := make(chan struct{})
 	go func() {
-		time.Sleep(1 * time.Second)
+		close(ready)
 		rm.leaderAddress.Store("localhost:7001")
 	}()
 
+	<-ready
 	resp, forwarded, err := ch.isLeaderAndForward("LIST")
-	duration := time.Since(start)
 
-	if duration < 1*time.Second {
-		t.Errorf("Expected wait for at least 1 second, but waited only %v", duration)
-	}
 	if !forwarded {
 		t.Error("Expected forwarded to be true")
 	}

@@ -18,7 +18,11 @@ type MockHandlerProvider struct {
 
 func (m *MockHandlerProvider) GetHandler(topic string, partitionID int) (types.StorageHandler, error) {
 	args := m.Called(topic, partitionID)
-	return args.Get(0).(types.StorageHandler), args.Error(1)
+	handler := args.Get(0)
+	if handler == nil {
+		return nil, args.Error(1)
+	}
+	return handler.(types.StorageHandler), args.Error(1)
 }
 
 type MockStorageHandler struct {
@@ -37,7 +41,11 @@ func (m *MockStorageHandler) AppendMessageSync(topic string, partition int, msg 
 
 func (m *MockStorageHandler) ReadMessages(offset uint64, max int) ([]types.Message, error) {
 	args := m.Called(offset, max)
-	return args.Get(0).([]types.Message), args.Error(1)
+	msgs := args.Get(0)
+	if msgs == nil {
+		return nil, args.Error(1)
+	}
+	return msgs.([]types.Message), args.Error(1)
 }
 
 func (m *MockStorageHandler) GetAbsoluteOffset() uint64 {
@@ -155,11 +163,11 @@ func TestTopicManagerCreateTopic(t *testing.T) {
 	hp.AssertExpectations(t)
 
 	errorTopicName := "error-topic"
-	mockStorageHandlerForError := new(MockStorageHandler)
-	mockStorageHandlerForError.On("GetLatestOffset").Return(uint64(0)).Once()
-	hp.On("GetHandler", errorTopicName, 0).Return(mockStorageHandlerForError, assert.AnError).Once()
+	hp.On("GetHandler", errorTopicName, 0).Return(nil, assert.AnError).Once()
 
 	tm.CreateTopic(errorTopicName, 1)
 	assert.Nil(t, tm.GetTopic(errorTopicName))
 	hp.AssertExpectations(t)
+
+	tm.Stop()
 }

@@ -2,12 +2,34 @@ package controller
 
 import (
 	"testing"
+	"time"
 
-	"github.com/cursus-io/cursus/pkg/cluster/replication"
-	"github.com/cursus-io/cursus/pkg/config"
-	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/hashicorp/raft"
 )
+
+type MockRaftManager struct {
+	isLeader bool
+}
+
+func (m *MockRaftManager) IsLeader() bool { return m.isLeader }
+func (m *MockRaftManager) GetLeaderAddress() string {
+	return "localhost:9001"
+}
+func (m *MockRaftManager) ApplyCommand(prefix string, data []byte) error { return nil }
+func (m *MockRaftManager) LeaderCh() <-chan bool                         { return nil }
+func (m *MockRaftManager) GetFSM() *fsm.BrokerFSM                        { return nil }
+func (m *MockRaftManager) GetConfiguration() raft.ConfigurationFuture    { return nil }
+func (m *MockRaftManager) ReplicateWithQuorum(topic string, partition int, msg types.Message, minISR int) (types.AckResponse, error) {
+	return types.AckResponse{}, nil
+}
+func (m *MockRaftManager) ReplicateBatchWithQuorum(topic string, partition int, messages []types.Message, minISR int, acks string) (types.AckResponse, error) {
+	return types.AckResponse{}, nil
+}
+func (m *MockRaftManager) ApplyResponse(prefix string, data []byte, timeout time.Duration) (types.AckResponse, error) {
+	return types.AckResponse{}, nil
+}
 
 type MockLocalProcessor struct {
 	processed bool
@@ -18,38 +40,10 @@ func (m *MockLocalProcessor) ProcessCommand(cmd string) string {
 	return "OK"
 }
 
-type MockStorageHandler struct{}
-
-func (m *MockStorageHandler) ReadMessages(o uint64, max int) ([]types.Message, error) {
-	return nil, nil
-}
-func (m *MockStorageHandler) GetAbsoluteOffset() uint64      { return 0 }
-func (m *MockStorageHandler) GetLatestOffset() uint64        { return 0 }
-func (m *MockStorageHandler) GetSegmentPath(b uint64) string { return "" }
-func (m *MockStorageHandler) AppendMessage(t string, p int, msg *types.Message) (uint64, error) {
-	return 0, nil
-}
-func (m *MockStorageHandler) AppendMessageSync(t string, p int, msg *types.Message) (uint64, error) {
-	return 0, nil
-}
-func (m *MockStorageHandler) WriteBatch(b []types.DiskMessage) error { return nil }
-func (m *MockStorageHandler) Flush()                                 {}
-func (m *MockStorageHandler) Close() error                           { return nil }
-
-type FakeHandlerProvider struct{}
-
-func (f *FakeHandlerProvider) GetHandler(t string, p int) (types.StorageHandler, error) {
-	return &MockStorageHandler{}, nil
-}
-
 func TestClusterRouter_LocalProcess(t *testing.T) {
-	cfg := &config.Config{LogDir: t.TempDir()}
-	hp := &FakeHandlerProvider{}
-	_ = topic.NewTopicManager(cfg, hp, nil)
-
 	processor := &MockLocalProcessor{}
 
-	rm := &replication.RaftReplicationManager{}
+	rm := &MockRaftManager{isLeader: true}
 	router := NewClusterRouter("node1", "localhost:7000", processor, rm, 9000)
 
 	if router.processLocally("CREATE topic=t1") != "OK" {
