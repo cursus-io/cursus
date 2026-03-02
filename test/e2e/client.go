@@ -133,31 +133,52 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 
 		cmdBytes := util.EncodeMessage(cmdTopic, cmdPayload)
 		if err := util.WriteWithLength(conn, cmdBytes); err != nil {
-			_ = conn.Close()
-			bc.mu.Lock()
-			bc.conn = nil
-			bc.mu.Unlock()
+			bc.closeInternal()
 			lastErr = err
+			util.Debug("Write error, retrying: %v", err)
 			continue
 		}
 
 		if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
-			lastErr = err
-			continue
+			bc.closeInternal()
+			return "", err
 		}
 
 		respBuf, err := util.ReadWithLength(conn)
 		if err != nil {
-			_ = conn.Close()
-			bc.mu.Lock()
-			bc.conn = nil
-			bc.mu.Unlock()
+			bc.closeInternal()
 			lastErr = err
-			continue
+
+			if isIdempotent(cmdPayload) {
+				util.Debug("Read error on idempotent command, retrying: %v", err)
+				continue
+			}
+
+			return "", fmt.Errorf("write succeeded but read failed (possible duplicate if retried): %w", err)
 		}
 		return strings.TrimSpace(string(respBuf)), nil
 	}
 	return "", fmt.Errorf("command failed after retries: %w", lastErr)
+}
+
+func (bc *BrokerClient) closeInternal() {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	if bc.conn != nil {
+		_ = bc.conn.Close()
+		bc.conn = nil
+	}
+}
+
+func isIdempotent(payload string) bool {
+	p := strings.ToUpper(strings.TrimSpace(payload))
+	return strings.HasPrefix(p, "DESCRIBE") ||
+		strings.HasPrefix(p, "LIST") ||
+		strings.HasPrefix(p, "FETCH_OFFSET") ||
+		strings.HasPrefix(p, "GROUP_STATUS") ||
+		strings.HasPrefix(p, "HELP") ||
+		strings.HasPrefix(p, "CONSUME") ||
+		strings.HasPrefix(p, "LIST_GROUPS")
 }
 
 // executeCommand is a simplified wrapper for commands expected to return only "OK" or "ERROR:".

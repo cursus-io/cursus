@@ -20,11 +20,14 @@ func ISRMaintained() e2e.Expectation {
 		if !strings.Contains(resp, "\"isr\":") {
 			return fmt.Errorf("ISR info not found in metadata")
 		}
+		if strings.Contains(resp, "\"isr\": []") {
+			return fmt.Errorf("ISR is empty")
+		}
 		return nil
 	}
 }
 
-func LeaderChanged() e2e.Expectation {
+func LeaderChanged(oldLeader string) e2e.Expectation {
 	return func(ctx *e2e.TestContext) error {
 		topic := ctx.GetTopic()
 		client := ctx.GetClient()
@@ -35,7 +38,10 @@ func LeaderChanged() e2e.Expectation {
 		if strings.Contains(resp, "ERROR:") {
 			return fmt.Errorf("metadata fetch failed: %s", resp)
 		}
-		ctx.GetT().Logf("Verified leader after failover: %s", resp)
+		if oldLeader != "" && strings.Contains(resp, fmt.Sprintf("\"leader\": \"%s\"", oldLeader)) {
+			return fmt.Errorf("leader has not changed from %s", oldLeader)
+		}
+		ctx.GetT().Logf("Verified leader change: %s", resp)
 		return nil
 	}
 }
@@ -56,35 +62,14 @@ func ExpectDataConsistent() e2e.Expectation {
 			return fmt.Errorf("broker error in DESCRIBE: %s", resp)
 		}
 
-		if ctx.GetPublishedCount() > 0 && !strings.Contains(resp, "\"leo\":") {
-			return fmt.Errorf("consistency check failed: LEO not found in metadata")
+		if ctx.GetPublishedCount() > 0 {
+			if !strings.Contains(resp, "\"leo\":") {
+				return fmt.Errorf("consistency check failed: LEO not found in metadata")
+			}
 		}
 
 		ctx.GetT().Log("Data consistency metadata verified")
 		return nil
-	}
-}
-
-func PublishFailure() e2e.Expectation {
-	return func(ctx *e2e.TestContext) error {
-		lastErr := ctx.GetLastError()
-		if lastErr == nil {
-			return fmt.Errorf("expected publish failure but it succeeded")
-		}
-
-		errStr := strings.ToLower(lastErr.Error())
-		if strings.Contains(errStr, "not enough in-sync replicas") ||
-			strings.Contains(errStr, "failed to forward") ||
-			strings.Contains(errStr, "eof") ||
-			strings.Contains(errStr, "read length") ||
-			strings.Contains(errStr, "refused") ||
-			strings.Contains(errStr, "failed after retries") ||
-			strings.Contains(errStr, "connection") {
-			ctx.GetT().Logf("Confirmed expected cluster failure: %v", lastErr)
-			return nil
-		}
-
-		return fmt.Errorf("unexpected error message: %v", lastErr)
 	}
 }
 
@@ -94,19 +79,23 @@ func ExpectOffsetMatched(partition int, expected uint64) e2e.Expectation {
 		group := ctx.GetConsumerGroup()
 		client := ctx.GetClient()
 
-		time.Sleep(2 * time.Second)
+		maxRetries := 10
+		var lastOffset uint64
+		var lastErr error
 
-		offset, err := client.FetchCommittedOffset(topic, partition, group)
-		if err != nil {
-			return fmt.Errorf("failed to fetch offset for verification: %w", err)
+		for i := 0; i < maxRetries; i++ {
+			lastOffset, lastErr = client.FetchCommittedOffset(topic, partition, group)
+			if lastErr == nil && lastOffset == expected {
+				ctx.GetT().Logf("Confirmed: Offset %d is correctly replicated and matched", lastOffset)
+				return nil
+			}
+			time.Sleep(1 * time.Second)
 		}
 
-		if offset != expected {
-			return fmt.Errorf("offset mismatch: expected %d, got %d", expected, offset)
+		if lastErr != nil {
+			return fmt.Errorf("failed to fetch offset after retries: %w", lastErr)
 		}
-
-		ctx.GetT().Logf("Confirmed: Offset %d is correctly replicated and matched", offset)
-		return nil
+		return fmt.Errorf("offset mismatch after retries: expected %d, got %d", expected, lastOffset)
 	}
 }
 

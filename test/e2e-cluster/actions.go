@@ -120,6 +120,8 @@ func (a *ClusterActions) SimulateFollowerFailure(nodeIndex int) *ClusterActions 
 		return a
 	}
 
+	a.ctx.GetClient().Close()
+
 	a.ctx.GetT().Logf("Successfully stopped %s", containerName)
 	time.Sleep(2 * time.Second)
 	return a
@@ -137,6 +139,8 @@ func (a *ClusterActions) RecoverFollower(nodeIndex int) *ClusterActions {
 	if err := cmd.Run(); err != nil {
 		a.ctx.GetT().Fatalf("Failed to recover follower: %v", err)
 	}
+
+	a.ctx.GetClient().Close()
 
 	healthAddrs := clusterHealthCheckAddrs(a.ctx.clusterSize)
 	if err := a.waitForNodeHealth(nodeIndex, healthAddrs[nodeIndex-1]); err != nil {
@@ -170,6 +174,7 @@ func (a *ClusterActions) WaitForTopicMetadata() *ClusterActions {
 			tempClient := e2e.NewBrokerClient([]string{addr})
 			cmd := fmt.Sprintf("DESCRIBE topic=%s", topic)
 			resp, err := tempClient.SendCommand("", cmd, 2*time.Second)
+			tempClient.Close()
 
 			if err == nil &&
 				!strings.Contains(resp, "not found") &&
@@ -188,7 +193,7 @@ func (a *ClusterActions) WaitForTopicMetadata() *ClusterActions {
 	return a
 }
 
-func (a *ClusterActions) SimulateLeaderFailure() *ClusterActions {
+func (a *ClusterActions) SimulateLeaderFailure() (int, *ClusterActions) {
 	topic := a.ctx.GetTopic()
 	a.ctx.GetT().Logf("Simulating leader failure for topic: %s", topic)
 
@@ -217,7 +222,7 @@ func (a *ClusterActions) SimulateLeaderFailure() *ClusterActions {
 	}
 
 	if leaderNode == 0 {
-		leaderNode = 1 // default fallback
+		a.ctx.GetT().Fatalf("Could not identify leader for topic %s from response: %s", topic, resp)
 	}
 
 	containerName := fmt.Sprintf("broker-%d", leaderNode)
@@ -228,6 +233,8 @@ func (a *ClusterActions) SimulateLeaderFailure() *ClusterActions {
 		a.ctx.GetT().Fatalf("Failed to stop leader %s: %v", containerName, err)
 	}
 
+	a.ctx.GetClient().Close()
+
 	time.Sleep(5 * time.Second)
-	return a
+	return leaderNode, a
 }

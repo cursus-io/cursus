@@ -36,14 +36,15 @@ func TestLeaderFailover(t *testing.T) {
 		WithAcks("all")
 	defer ctx.Cleanup()
 
-	ctx.WhenCluster().
+	leaderNode, actions := ctx.WhenCluster().
 		StartCluster().
 		CreateTopic().
 		DescribeTopic().
 		PublishMessages().
-		SimulateLeaderFailure().
-		DescribeTopic().
-		RecoverFollower(1).
+		SimulateLeaderFailure()
+
+	actions.DescribeTopic().
+		RecoverFollower(leaderNode).
 		Then().
 		Expect(MessagesPublishedWithQuorum())
 }
@@ -84,8 +85,8 @@ func TestDistributedOffsetResilience(t *testing.T) {
 		StartCluster().
 		CreateTopic().
 		JoinGroup().
-		CommitOffset(0, 50).
-		SimulateLeaderFailure()
+		CommitOffset(0, 50)
+	ctx.WhenCluster().SimulateLeaderFailure()
 
 	time.Sleep(5 * time.Second) // wait for election
 
@@ -134,8 +135,8 @@ func TestClusterWideDeduplication(t *testing.T) {
 	ctx.WhenCluster().
 		StartCluster().
 		CreateTopic().
-		PublishMessages().
-		SimulateLeaderFailure()
+		PublishMessages()
+	ctx.WhenCluster().SimulateLeaderFailure()
 
 	time.Sleep(7 * time.Second)
 
@@ -157,8 +158,9 @@ func TestConsumerGroupRebalanceFailover(t *testing.T) {
 		StartCluster().
 		CreateTopic().
 		JoinGroup().
-		SyncGroup().
-		SimulateLeaderFailure().
-		Then().
+		SyncGroup()
+	ctx.WhenCluster().SimulateLeaderFailure()
+
+	ctx.Then().
 		Expect(ISRMaintained())
 }
