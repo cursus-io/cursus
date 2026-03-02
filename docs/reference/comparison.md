@@ -20,7 +20,7 @@ This document compares **cursus** with other popular messaging systems to help y
 
 **cursus** is heavily inspired by Kafka's partitioned log architecture but aims for a much smaller operational footprint.
 
-*   **Simplicity:** Kafka is a massive ecosystem requiring JVM and complex configuration. Cursus is a single Go binary with minimal dependencies, ideal for edge computing or small-to-medium scale environments.
+*   **Simplicity:** Kafka is a massive ecosystem requiring JVM and complex configuration. Cursus is a single Go binary with minimal dependencies, ideal for edge computing or small-to-medium-scale environments.
 *   **Built-in Deduplication:** Cursus provides a native 30-minute deduplication window, whereas Kafka requires idempotent producers or external state management for exactly-once processing.
 *   **Performance:** While Kafka scales to petabytes, Cursus optimizes for single-node or small cluster performance using Linux-specific optimizations like `sendfile` and `fadvise`.
 
