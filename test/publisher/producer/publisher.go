@@ -311,7 +311,7 @@ func (p *Publisher) sendBatch(part int, batch []types.Message) {
 	}
 	p.partitionBatchMus[part].Unlock()
 
-	data, err := util.EncodeBatchMessages(p.config.Topic, part, p.config.Acks, batch)
+	data, err := util.EncodeBatchMessages(p.config.Topic, part, p.config.Acks, p.config.EnableIdempotence, batch)
 	if err != nil {
 		util.Error("encode batch failed: %v", err)
 		p.cleanupBatchState(part, batchID)

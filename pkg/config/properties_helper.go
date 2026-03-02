@@ -88,7 +88,7 @@ func (cfg *Config) Normalize() {
 
 	// internal channels
 	if cfg.ChannelBufferSize <= 0 {
-		cfg.ChannelBufferSize = 1024
+		cfg.ChannelBufferSize = 100000
 	}
 	if cfg.PartitionChannelBufSize <= 0 {
 		cfg.PartitionChannelBufSize = 10000

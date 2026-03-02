@@ -31,11 +31,23 @@ func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
 	last := cmd.Messages[len(cmd.Messages)-1]
 
 	f.mu.Lock()
-	if cmd.IsIdempotent {
-		exists, lastSeq := f.getProducerSequence(cmd.Topic, cmd.Partition, first.ProducerID)
+	meta, topicExists := f.partitionMetadata[cmd.Topic]
+
+	effectiveIdempotent := cmd.IsIdempotent
+	if topicExists && meta.Idempotent {
+		effectiveIdempotent = true
+	}
+
+	if effectiveIdempotent {
+		trackPartition := -1
+		if cmd.SequenceScope == "partition" {
+			trackPartition = cmd.Partition
+		}
+
+		exists, lastSeq := f.getProducerSequence(cmd.Topic, trackPartition, first.ProducerID)
 		if exists && int64(last.SeqNum) <= lastSeq {
 			f.mu.Unlock()
-			util.Debug("FSM: Duplicate detected for idempotent producer %s, skipping", first.ProducerID)
+			util.Debug("FSM: Duplicate detected for idempotent producer %s (Topic: %s, Scope: %s, Partition: %d), skipping", first.ProducerID, cmd.Topic, cmd.SequenceScope, trackPartition)
 			return f.makeSuccessAck(&last, first.SeqNum)
 		}
 	}
@@ -56,8 +68,17 @@ func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
 		return errorAckResponse(err.Error(), first.ProducerID, first.Epoch)
 	}
 
+	partition.SetHWM(last.Offset + 1)
+	partition.UpdateLEO(last.Offset + 1)
+
 	f.mu.Lock()
-	f.updateProducerState(cmd.Topic, cmd.Partition, first.ProducerID, int64(last.SeqNum))
+	if effectiveIdempotent {
+		trackPartition := -1
+		if cmd.SequenceScope == "partition" {
+			trackPartition = cmd.Partition
+		}
+		f.updateProducerState(cmd.Topic, trackPartition, first.ProducerID, int64(last.SeqNum))
+	}
 	f.mu.Unlock()
 
 	return f.makeSuccessAck(&last, first.SeqNum)
@@ -68,6 +89,14 @@ func (f *BrokerFSM) getProducerSequence(topic string, partition int, pID string)
 		if sMap, ok := pMap[partition]; ok {
 			if seq, ok := sMap[pID]; ok {
 				return true, seq
+			}
+		}
+		// If searching for specific partition, fallback to check global (-1)
+		if partition != -1 {
+			if gMap, ok := pMap[-1]; ok {
+				if seq, ok := gMap[pID]; ok {
+					return true, seq
+				}
 			}
 		}
 	}
@@ -101,18 +130,54 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 	}
 
 	firstMsg := cmd.Messages[0]
+	lastMsg := cmd.Messages[len(cmd.Messages)-1]
 
 	f.mu.Lock()
-	_, topicExists := f.partitionMetadata[cmd.Topic]
-	exists, lastSeq := f.getProducerSequence(cmd.Topic, cmd.Partition, firstMsg.ProducerID)
+	meta, topicExists := f.partitionMetadata[cmd.Topic]
+
+	effectiveIdempotent := cmd.IsIdempotent
+	if topicExists && meta.Idempotent {
+		effectiveIdempotent = true
+	}
+
+	trackPartition := -1
+	if cmd.SequenceScope == "partition" {
+		trackPartition = cmd.Partition
+	}
+	exists, lastSeq := f.getProducerSequence(cmd.Topic, trackPartition, firstMsg.ProducerID)
 	f.mu.Unlock()
 
 	if !topicExists {
 		return fmt.Errorf("topic '%s' not found", cmd.Topic)
 	}
 
-	if cmd.IsIdempotent && exists && uint64(firstMsg.SeqNum) > uint64(lastSeq+1) {
-		return fmt.Errorf("idempotency gap: expected %d, got %d", lastSeq+1, firstMsg.SeqNum)
+	if effectiveIdempotent {
+		if cmd.SequenceScope == "partition" {
+			if exists {
+				if int64(lastMsg.SeqNum) <= lastSeq {
+					return nil
+				}
+				if int64(firstMsg.SeqNum) <= lastSeq {
+					return fmt.Errorf("out-of-order sequence (overlap) in partition scope: lastSeq %d, firstMsg.SeqNum %d", lastSeq, firstMsg.SeqNum)
+				}
+				if firstMsg.SeqNum > uint64(lastSeq+1) {
+					return fmt.Errorf("idempotency gap in partition scope for producer %s: expected %d, got %d", firstMsg.ProducerID, lastSeq+1, firstMsg.SeqNum)
+				}
+			} else if firstMsg.SeqNum > 1 {
+				return fmt.Errorf("idempotency error: first message in partition scope for producer %s must have seqNum 1, got %d", firstMsg.ProducerID, firstMsg.SeqNum)
+			}
+		} else {
+			if exists {
+				if int64(firstMsg.SeqNum) <= lastSeq {
+					if int64(lastMsg.SeqNum) <= lastSeq {
+						return nil // entire batch is duplicate
+					}
+					return fmt.Errorf("out-of-order sequence (overlap) in global scope: lastSeq %d, firstMsg.SeqNum %d", lastSeq, firstMsg.SeqNum)
+				}
+			} else if firstMsg.SeqNum > 1 {
+				return fmt.Errorf("idempotency error: first message in global scope for producer %s must have seqNum 1, got %d", firstMsg.ProducerID, firstMsg.SeqNum)
+			}
+		}
 	}
 
 	for i, curr := range cmd.Messages {
@@ -123,7 +188,7 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 			return fmt.Errorf("empty payload at index %d", i)
 		}
 		if i > 0 {
-			if err := f.validateSequence(cmd.IsIdempotent, cmd.Messages[i-1], curr, i); err != nil {
+			if err := f.validateSequence(effectiveIdempotent, cmd.Messages[i-1], curr, i); err != nil {
 				return err
 			}
 		}
@@ -132,11 +197,8 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 }
 
 func (f *BrokerFSM) validateSequence(isIdempotent bool, prev, curr types.Message, idx int) error {
-	if curr.Offset != prev.Offset+1 {
-		return fmt.Errorf("offset gap at %d: %d->%d", idx, prev.Offset, curr.Offset)
-	}
 	if isIdempotent && curr.SeqNum != prev.SeqNum+1 {
-		return fmt.Errorf("seq gap at %d: %d->%d", idx, prev.SeqNum, curr.SeqNum)
+		return fmt.Errorf("seq gap within batch at %d: %d->%d", idx, prev.SeqNum, curr.SeqNum)
 	}
 	if !isIdempotent && curr.SeqNum <= prev.SeqNum {
 		return fmt.Errorf("seq not increasing at %d: %d->%d", idx, prev.SeqNum, curr.SeqNum)

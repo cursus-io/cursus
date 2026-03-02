@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -100,14 +99,18 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 	data := string(log.Data)
 	var reqID string
 
+	// skip prefixs like "MESSAGE:" or "REGISTER:"
 	if startIdx := strings.Index(data, "{"); startIdx != -1 {
-		dec := json.NewDecoder(strings.NewReader(data[startIdx:]))
+		jsonData := data[startIdx:]
+		dec := json.NewDecoder(strings.NewReader(jsonData))
 		var meta struct {
 			ReqID string `json:"req_id"`
 		}
 
 		if err := dec.Decode(&meta); err != nil {
-			util.Error("FSM Apply: failed to decode req_id: %v", err)
+			if !strings.Contains(data, "REGISTER:") && !strings.Contains(data, "DEREGISTER:") {
+				util.Debug("FSM Apply: potential JSON decode issue for req_id (Prefix: %s): %v", data[:startIdx], err)
+			}
 		} else {
 			reqID = meta.ReqID
 		}
@@ -244,19 +247,13 @@ func (f *BrokerFSM) GetPartitionMetadata(key string) *PartitionMetadata {
 	return nil
 }
 
-// todo. (issues #27)
-func (f *BrokerFSM) getCurrentRaftLeaderID() string {
+func (f *BrokerFSM) GetBroker(id string) *BrokerInfo {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	if len(f.brokers) == 0 {
-		return ""
+	if broker, ok := f.brokers[id]; ok {
+		copy := *broker
+		return &copy
 	}
-
-	var ids []string
-	for id := range f.brokers {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	return ids[0]
+	return nil
 }

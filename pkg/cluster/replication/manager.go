@@ -122,50 +122,55 @@ func NewRaftReplicationManager(cfg *config.Config, brokerID string, diskManager 
 				}
 
 				if len(cfg.StaticClusterMembers) == 0 {
-					return nil, fmt.Errorf("STATIC_CLUSTER_MEMBERS is required for static cluster bootstrap")
-				}
-
-				for _, member := range cfg.StaticClusterMembers {
-					member = strings.TrimSpace(member)
-					if member == "" {
-						continue
-					}
-
-					var memberID, memberAddr string
-					if strings.Contains(member, "@") {
-						parts := strings.SplitN(member, "@", 2)
-						if len(parts) == 2 {
-							memberID = parts[0]
-							memberAddr = parts[1]
-						} else {
-							continue
-						}
-					} else {
-						memberAddr = member
-						memberID = strings.Split(memberAddr, ":")[0]
-					}
-
+					util.Info("No static members found, bootstrapping with local node only: %s (%s)", brokerID, localAddr)
 					servers = append(servers, raft.Server{
-						ID:       raft.ServerID(memberID),
-						Address:  raft.ServerAddress(memberAddr),
+						ID:       raft.ServerID(brokerID),
+						Address:  raft.ServerAddress(localAddr),
 						Suffrage: raft.Voter,
 					})
-					util.Debug("Added static cluster member: id=%s addr=%s", memberID, memberAddr)
+				} else {
+					for _, member := range cfg.StaticClusterMembers {
+						member = strings.TrimSpace(member)
+						if member == "" {
+							continue
+						}
+
+						var memberID, memberAddr string
+						if strings.Contains(member, "@") {
+							parts := strings.SplitN(member, "@", 2)
+							if len(parts) == 2 {
+								memberID = parts[0]
+								memberAddr = parts[1]
+							} else {
+								continue
+							}
+						} else {
+							memberAddr = member
+							memberID = strings.Split(memberAddr, ":")[0]
+						}
+
+						servers = append(servers, raft.Server{
+							ID:       raft.ServerID(memberID),
+							Address:  raft.ServerAddress(memberAddr),
+							Suffrage: raft.Voter,
+						})
+						util.Debug("Added static cluster member: id=%s addr=%s", memberID, memberAddr)
+					}
 				}
 
 				if len(servers) == 0 {
-					return nil, fmt.Errorf("no valid servers found in StaticClusterMembers")
+					return nil, fmt.Errorf("no valid servers found for bootstrap")
 				}
 
 				bootstrapConfig := raft.Configuration{Servers: servers}
-				util.Debug("Static bootstrap configuration: %+v", bootstrapConfig)
+				util.Debug("Bootstrap configuration: %+v", bootstrapConfig)
 
 				future := r.BootstrapCluster(bootstrapConfig)
 				if err := future.Error(); err != nil {
-					util.Error("Failed to bootstrap static cluster: %v", err)
-					return nil, fmt.Errorf("failed to bootstrap static cluster: %w", err)
+					util.Error("Failed to bootstrap raft cluster: %v", err)
+					return nil, fmt.Errorf("failed to bootstrap raft: %w", err)
 				}
-				util.Info("✅ Static cluster bootstrap completed")
+				util.Info("✅ Raft cluster bootstrap completed with %d servers", len(servers))
 			}
 		}
 	} else if len(cfg.RaftPeers) > 0 {
@@ -243,7 +248,7 @@ func (rm *RaftReplicationManager) GetConfiguration() raft.ConfigurationFuture {
 
 func (rm *RaftReplicationManager) ApplyCommand(prefix string, data []byte) error {
 	fullCmd := []byte(fmt.Sprintf("%s:%s", prefix, string(data)))
-	future := rm.raft.Apply(fullCmd, 5*time.Second)
+	future := rm.raft.Apply(fullCmd, 2*time.Second)
 	return future.Error()
 }
 
@@ -271,7 +276,7 @@ func (rm *RaftReplicationManager) RemoveServer(id string) error {
 }
 
 // ReplicateWithQuorum processes a single message, ensuring required ISR count is met.
-func (rm *RaftReplicationManager) ReplicateWithQuorum(topic string, partition int, msg types.Message, minISR int) (types.AckResponse, error) {
+func (rm *RaftReplicationManager) ReplicateWithQuorum(topic string, partition int, msg types.Message, minISR int, isIdempotent bool, sequenceScope string) (types.AckResponse, error) {
 	util.Debug("Replicating with quorum for topic %s partition %d (min ISR: %d)", topic, partition, minISR)
 
 	if rm.isrManager != nil {
@@ -282,13 +287,22 @@ func (rm *RaftReplicationManager) ReplicateWithQuorum(topic string, partition in
 		}
 	}
 
-	data, err := json.Marshal(msg)
-	if err != nil {
-		util.Error("Failed to marshal message for quorum replication: %v", err)
-		return types.AckResponse{}, fmt.Errorf("failed to marshal message: %w", err)
+	cmd := types.MessageCommand{
+		Topic:         topic,
+		Partition:     partition,
+		Messages:      []types.Message{msg},
+		Acks:          "-1",
+		IsIdempotent:  isIdempotent,
+		SequenceScope: sequenceScope,
 	}
 
-	future := rm.raft.Apply([]byte(fmt.Sprintf("MESSAGE:%s", string(data))), 5*time.Second)
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		util.Error("Failed to marshal message command for quorum replication: %v", err)
+		return types.AckResponse{}, fmt.Errorf("failed to marshal message command: %w", err)
+	}
+
+	future := rm.raft.Apply([]byte(fmt.Sprintf("MESSAGE:%s", string(data))), 2*time.Second)
 	if err := future.Error(); err != nil {
 		metrics.QuorumOperations.WithLabelValues("write", "failure").Inc()
 		util.Error("Failed to replicate with quorum for topic %s partition %d: %v", topic, partition, err)
@@ -308,7 +322,7 @@ func (rm *RaftReplicationManager) ReplicateWithQuorum(topic string, partition in
 }
 
 // ReplicateBatchWithQuorum processes a batch of messages, ensuring they are replicated
-func (rm *RaftReplicationManager) ReplicateBatchWithQuorum(topic string, partition int, messages []types.Message, minISR int, acks string) (types.AckResponse, error) {
+func (rm *RaftReplicationManager) ReplicateBatchWithQuorum(topic string, partition int, messages []types.Message, minISR int, acks string, isIdempotent bool, sequenceScope string) (types.AckResponse, error) {
 	if len(messages) == 0 {
 		return types.AckResponse{}, nil
 	}
@@ -323,20 +337,17 @@ func (rm *RaftReplicationManager) ReplicateBatchWithQuorum(topic string, partiti
 		}
 	}
 
-	batchStart := messages[0].SeqNum
-	batchEnd := messages[len(messages)-1].SeqNum
-
 	if acks == "" {
 		acks = "-1"
 	}
 
-	batchData := types.Batch{
-		Topic:      topic,
-		Partition:  partition,
-		BatchStart: batchStart,
-		BatchEnd:   batchEnd,
-		Acks:       acks,
-		Messages:   messages,
+	batchData := types.MessageCommand{
+		Topic:         topic,
+		Partition:     partition,
+		IsIdempotent:  isIdempotent,
+		SequenceScope: sequenceScope,
+		Messages:      messages,
+		Acks:          acks,
 	}
 
 	data, err := json.Marshal(batchData)
@@ -345,7 +356,7 @@ func (rm *RaftReplicationManager) ReplicateBatchWithQuorum(topic string, partiti
 		return types.AckResponse{}, fmt.Errorf("failed to marshal batch messages: %w", err)
 	}
 
-	future := rm.raft.Apply([]byte(fmt.Sprintf("BATCH:%s", string(data))), 5*time.Second)
+	future := rm.raft.Apply([]byte(fmt.Sprintf("MESSAGE:%s", string(data))), 2*time.Second)
 	if err := future.Error(); err != nil {
 		metrics.QuorumOperations.WithLabelValues("batch_write", "failure").Inc()
 		util.Error("Failed to replicate batch with quorum for topic %s partition %d: %v", topic, partition, err)
@@ -366,7 +377,7 @@ func (rm *RaftReplicationManager) ReplicateBatchWithQuorum(topic string, partiti
 func (rm *RaftReplicationManager) ApplyResponse(prefix string, data []byte, timeout time.Duration) (types.AckResponse, error) {
 	fullCmd := []byte(fmt.Sprintf("%s:%s", prefix, string(data)))
 
-	future := rm.raft.Apply(fullCmd, timeout)
+	future := rm.raft.Apply(fullCmd, 2*time.Second)
 	if err := future.Error(); err != nil {
 		util.Error("Raft apply future error: %v", err)
 		return types.AckResponse{}, err

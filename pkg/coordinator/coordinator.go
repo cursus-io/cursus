@@ -22,6 +22,9 @@ type Coordinator struct {
 	offsetTopicPartitionCount int
 
 	offsets map[string]map[string]map[int]uint64 // group -> topic -> partition -> offset
+
+	// ensure only the active GroupCoordinator handles session expiration.
+	leaderChecker func() bool
 }
 
 type TopicHandler interface {
@@ -101,6 +104,12 @@ func NewCoordinator(cfg *config.Config, handler TopicHandler) *Coordinator {
 
 	handler.CreateTopic(c.offsetTopic, c.offsetTopicPartitionCount)
 	return c
+}
+
+func (c *Coordinator) SetLeaderChecker(f func() bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.leaderChecker = f
 }
 
 // Start launches background monitoring processes (e.g., heartbeat monitor).

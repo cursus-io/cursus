@@ -186,6 +186,7 @@ func LoadPublisherConfig(explicitPath string) (*PublisherConfig, error) {
 	if cfg.Acks == "all" {
 		cfg.Acks = "-1"
 	}
+
 	if cfg.EnableIdempotence && cfg.Acks == "0" {
 		util.Warn("Idempotence requires acks >= 1, setting acks=1")
 		cfg.Acks = "1"

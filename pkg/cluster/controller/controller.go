@@ -19,8 +19,8 @@ type RaftManager interface {
 	LeaderCh() <-chan bool
 	GetFSM() *fsm.BrokerFSM
 	GetConfiguration() raft.ConfigurationFuture
-	ReplicateWithQuorum(topic string, partition int, msg types.Message, minISR int) (types.AckResponse, error)
-	ReplicateBatchWithQuorum(topic string, partition int, messages []types.Message, minISR int, acks string) (types.AckResponse, error)
+	ReplicateWithQuorum(topic string, partition int, msg types.Message, minISR int, isIdempotent bool, sequenceScope string) (types.AckResponse, error)
+	ReplicateBatchWithQuorum(topic string, partition int, messages []types.Message, minISR int, acks string, isIdempotent bool, sequenceScope string) (types.AckResponse, error)
 	ApplyResponse(prefix string, data []byte, timeout time.Duration) (types.AckResponse, error)
 }
 
@@ -29,6 +29,7 @@ type ClusterController struct {
 	Discovery   ServiceDiscovery
 	Election    *ControllerElection
 	Router      *ClusterRouter
+	brokerID    string
 }
 
 func NewClusterController(ctx context.Context, cfg *config.Config, rm RaftManager, sd ServiceDiscovery) *ClusterController {
@@ -40,6 +41,7 @@ func NewClusterController(ctx context.Context, cfg *config.Config, rm RaftManage
 		Discovery:   sd,
 		Election:    NewControllerElection(rm),
 		Router:      NewClusterRouter(brokerID, localAddr, nil, rm, cfg.BrokerPort),
+		brokerID:    brokerID,
 	}
 
 	return cc
@@ -81,7 +83,21 @@ func (cc *ClusterController) IsLeader() bool {
 	return false
 }
 
-// todo. (issues #27) Delegate authorization to partition-level leader checks in future releases.
 func (cc *ClusterController) IsAuthorized(topic string, partition int) bool {
-	return cc.IsLeader()
+	if cc.RaftManager == nil {
+		return false
+	}
+
+	fsm := cc.RaftManager.GetFSM()
+	if fsm == nil {
+		return cc.IsLeader() // fallback to leader (Raft, not partition)
+	}
+
+	partitionKey := fmt.Sprintf("%s-%d", topic, partition)
+	meta := fsm.GetPartitionMetadata(partitionKey)
+	if meta == nil {
+		return cc.IsLeader()
+	}
+
+	return meta.Leader == cc.brokerID
 }

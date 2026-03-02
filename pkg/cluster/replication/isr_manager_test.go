@@ -51,22 +51,38 @@ func TestISRManager_Quorum(t *testing.T) {
 	topicName := "test-topic"
 	partitionID := 0
 
+	for _, id := range []string{"node1", "node2", "node3"} {
+		brokerInfo := fsm.BrokerInfo{ID: id, Addr: "127.0.0.1:0", Status: "active", LastSeen: time.Now()}
+		data, _ := json.Marshal(brokerInfo)
+		brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", string(data)))})
+	}
+
 	topicPayload := map[string]interface{}{
 		"name":       topicName,
 		"partitions": 1,
 		"leader_id":  "node1",
 	}
-	topicData, _ := json.Marshal(topicPayload)
-	brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", string(topicData)))})
+	topicData, err := json.Marshal(topicPayload)
+	if err != nil {
+		t.Fatalf("failed to marshal topic payload: %v", err)
+	}
+	if err := brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", string(topicData)))}); err != nil {
+		t.Fatalf("failed to apply TOPIC command: %v", err)
+	}
 
 	partitionMetadata := fsm.PartitionMetadata{
 		Replicas:       []string{"node1", "node2", "node3"},
 		ISR:            []string{"node1", "node2", "node3"},
 		PartitionCount: 1,
 	}
-	metaData, _ := json.Marshal(partitionMetadata)
+	metaData, err := json.Marshal(partitionMetadata)
+	if err != nil {
+		t.Fatalf("failed to marshal partition metadata: %v", err)
+	}
 	key := fmt.Sprintf("%s-%d", topicName, partitionID)
-	brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("PARTITION:%s:%s", key, string(metaData)))})
+	if err := brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("PARTITION:%s:%s", key, string(metaData)))}); err != nil {
+		t.Fatalf("failed to apply PARTITION command: %v", err)
+	}
 
 	isrManager := NewISRManager(brokerFSM, "node1", 100*time.Millisecond)
 

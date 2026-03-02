@@ -135,8 +135,13 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 		if err := util.WriteWithLength(conn, cmdBytes); err != nil {
 			bc.closeInternal()
 			lastErr = err
-			util.Debug("Write error, retrying: %v", err)
-			continue
+
+			if isIdempotent(cmdPayload) {
+				util.Debug("Write error on idempotent command, retrying: %v", err)
+				continue
+			}
+
+			return "", fmt.Errorf("write failed (possible duplicate if retried): %w", err)
 		}
 
 		if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {

@@ -3,17 +3,19 @@ package fsm
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/cursus-io/cursus/util"
 )
 
 type PartitionMetadata struct {
-	Leader         string // todo
+	Leader         string
 	Replicas       []string
 	ISR            []string
-	LeaderEpoch    int64
+	LeaderEpoch    int
 	PartitionCount int
+	Idempotent     bool
 }
 
 func (f *BrokerFSM) applyRegisterCommand(jsonData string) error {
@@ -42,7 +44,8 @@ func (f *BrokerFSM) applyTopicCommand(data string) interface{} {
 	var topicCmd struct {
 		Name       string `json:"name"`
 		Partitions int    `json:"partitions"`
-		LeaderID   string `json:"leader_id"`
+		LeaderID   string `json:"leader_id"` // optional
+		Idempotent bool   `json:"idempotent"`
 	}
 
 	if err := json.Unmarshal([]byte(data), &topicCmd); err != nil {
@@ -50,18 +53,44 @@ func (f *BrokerFSM) applyTopicCommand(data string) interface{} {
 		return err
 	}
 
-	leader := topicCmd.LeaderID
-	if leader == "" {
-		leader = f.getCurrentRaftLeaderID()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// round-robin assignment
+	var brokers []string
+	for id := range f.brokers {
+		brokers = append(brokers, id)
+	}
+	sort.Strings(brokers)
+
+	if len(brokers) == 0 {
+		return fmt.Errorf("no active brokers available for partition assignment")
 	}
 
-	f.mu.Lock()
+	// partition-specific metadata
+	for i := 0; i < topicCmd.Partitions; i++ {
+		key := fmt.Sprintf("%s-%d", topicCmd.Name, i)
+
+		assignedLeader := topicCmd.LeaderID
+		if assignedLeader == "" {
+			assignedLeader = brokers[i%len(brokers)]
+		}
+
+		f.partitionMetadata[key] = &PartitionMetadata{
+			PartitionCount: topicCmd.Partitions,
+			Leader:         assignedLeader,
+			LeaderEpoch:    1,
+			Idempotent:     topicCmd.Idempotent,
+			Replicas:       brokers, // initially all nodes are replicas
+			ISR:            brokers,
+		}
+		util.Info("FSM: Assigned leader %s to partition %s", assignedLeader, key)
+	}
+
 	f.partitionMetadata[topicCmd.Name] = &PartitionMetadata{
 		PartitionCount: topicCmd.Partitions,
-		Leader:         leader,
-		LeaderEpoch:    1,
+		Idempotent:     topicCmd.Idempotent,
 	}
-	f.mu.Unlock()
 
 	if f.tm != nil {
 		f.tm.CreateTopic(topicCmd.Name, topicCmd.Partitions)

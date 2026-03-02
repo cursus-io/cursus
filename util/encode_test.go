@@ -73,7 +73,7 @@ func TestBatchMessagesRoundTrip(t *testing.T) {
 				{Offset: 101, SeqNum: 2, ProducerID: "p2", Key: "k2", Payload: "msg2", Epoch: 2},
 			}
 
-			data, err := util.EncodeBatchMessages(testTopic, testPartition, acks, msgs)
+			data, err := util.EncodeBatchMessages(testTopic, testPartition, acks, false, msgs)
 			if err != nil {
 				t.Fatalf("EncodeBatchMessages failed: %v", err)
 			}
@@ -125,7 +125,7 @@ func TestBatchMessagesRoundTrip(t *testing.T) {
 func TestDecodeBatchMessagesInvalidData(t *testing.T) {
 	t.Run("TruncatedBuffer", func(t *testing.T) {
 		msgs := []types.Message{{Payload: "test-data"}}
-		data, _ := util.EncodeBatchMessages("topic", 0, "1", msgs)
+		data, _ := util.EncodeBatchMessages("topic", 0, "1", false, msgs)
 
 		truncated := data[:len(data)-5]
 		_, err := util.DecodeBatchMessages(truncated)
@@ -135,7 +135,7 @@ func TestDecodeBatchMessagesInvalidData(t *testing.T) {
 	})
 
 	t.Run("InvalidMessageCount", func(t *testing.T) {
-		data, _ := util.EncodeBatchMessages("topic", 0, "1", []types.Message{{Payload: "msg"}})
+		data, _ := util.EncodeBatchMessages("topic", 0, "1", false, []types.Message{{Payload: "msg"}})
 		corrupted := data[:10]
 
 		_, err := util.DecodeBatchMessages(corrupted[:10])
@@ -149,7 +149,7 @@ func TestDecodeBatchMessagesInvalidData(t *testing.T) {
 
 func TestBatchMessagesEdgeCases(t *testing.T) {
 	t.Run("EmptyBatch", func(t *testing.T) {
-		data, err := util.EncodeBatchMessages("topic", 0, "1", []types.Message{})
+		data, err := util.EncodeBatchMessages("topic", 0, "1", false, []types.Message{})
 		if err != nil {
 			t.Fatalf("Encoding empty batch failed: %v", err)
 		}
@@ -169,7 +169,7 @@ func TestBatchMessagesEdgeCases(t *testing.T) {
 		}
 		largePayload := string(largeData)
 		msgs := []types.Message{{Payload: largePayload}}
-		data, err := util.EncodeBatchMessages("topic", 0, "1", msgs)
+		data, err := util.EncodeBatchMessages("topic", 0, "1", false, msgs)
 		if err != nil {
 			t.Fatalf("Encoding large payload failed: %v", err)
 		}
