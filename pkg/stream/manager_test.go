@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/types"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 var readFn = func(offset uint64, max int) ([]types.Message, error) {

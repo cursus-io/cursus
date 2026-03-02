@@ -6,10 +6,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/util"
 	"github.com/google/uuid"
 
-	"github.com/downfa11-org/cursus/test/consumer/config"
+	"github.com/cursus-io/cursus/test/consumer/config"
 )
 
 type leaderInfo struct {

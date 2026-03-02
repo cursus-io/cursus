@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/coordinator"
-	"github.com/downfa11-org/cursus/pkg/disk"
-	"github.com/downfa11-org/cursus/pkg/topic"
-	"github.com/downfa11-org/cursus/pkg/types"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
 )
 

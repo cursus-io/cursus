@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/coordinator"
-	"github.com/downfa11-org/cursus/pkg/topic"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/util"
 )
 
 // todo. consider an LRU cache(match) to prevent potential memory bloat.
@@ -35,6 +35,7 @@ COMMIT_OFFSET topic=<name> partition=<N> group=<name> offset=<N> - commit offset
 FETCH_OFFSET topic=<name> partition=<N> group=<name> - fetch committed offset  
 REGISTER_GROUP topic=<name> group=<name> - register consumer group  
 GROUP_STATUS group=<name> - get group status  
+DESCRIBE topic=<name> - get topic/partition metadata (leader, ISR, offsets)  
 HELP - show this help  
 EXIT - exit`
 }
@@ -119,6 +120,12 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 
 // handleList processes LIST command
 func (ch *CommandHandler) handleList() string {
+	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+		if resp, forwarded, _ := ch.isLeaderAndForward("LIST"); forwarded {
+			return resp
+		}
+	}
+
 	tm := ch.TopicManager
 	names := tm.ListTopics()
 	if len(names) == 0 {
@@ -635,4 +642,84 @@ func match(p, t string) bool {
 
 	regexCache.Store(p, newRe)
 	return newRe.MatchString(t)
+}
+
+// handleDescribeTopic processes DESCRIBE topic=<name> command
+func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
+	args := parseKeyValueArgs(cmd[9:])
+	topicName, ok := args["topic"]
+	if !ok || topicName == "" {
+		return "missing topic parameter. Expected: DESCRIBE topic=<name>"
+	}
+
+	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
+			return resp
+		}
+	}
+
+	t := ch.TopicManager.GetTopic(topicName)
+	if t == nil {
+		return fmt.Sprintf("topic '%s' not found", topicName)
+	}
+
+	type PartitionMetadata struct {
+		ID       int      `json:"id"`
+		Leader   string   `json:"leader"`
+		Replicas []string `json:"replicas"`
+		ISR      []string `json:"isr"`
+		LEO      uint64   `json:"leo"`
+		HWM      uint64   `json:"hwm"`
+	}
+
+	type TopicMetadata struct {
+		Topic      string              `json:"topic"`
+		Partitions []PartitionMetadata `json:"partitions"`
+	}
+
+	meta := TopicMetadata{
+		Topic: topicName,
+	}
+
+	var leaderAddr string
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+		leaderAddr = ch.Cluster.RaftManager.GetLeaderAddress()
+	}
+
+	for _, p := range t.Partitions {
+		pm := PartitionMetadata{
+			ID:     p.ID(),
+			Leader: leaderAddr,
+			LEO:    p.NextOffset(),
+			HWM:    p.HWM,
+		}
+
+		if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+			confFuture := ch.Cluster.RaftManager.GetConfiguration()
+			if confFuture.Error() == nil {
+				for _, s := range confFuture.Configuration().Servers {
+					pm.Replicas = append(pm.Replicas, string(s.Address))
+				}
+			}
+
+			// retrieve actual ISR from FSM
+			if fsm := ch.Cluster.RaftManager.GetFSM(); fsm != nil {
+				partitionKey := fmt.Sprintf("%s-%d", topicName, p.ID())
+				if meta := fsm.GetPartitionMetadata(partitionKey); meta != nil {
+					pm.ISR = meta.ISR
+				} else {
+					// fallback to replicas
+					pm.ISR = pm.Replicas
+				}
+			}
+		}
+
+		meta.Partitions = append(meta.Partitions, pm)
+	}
+
+	respJSON, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Sprintf("failed to marshal metadata: %v", err)
+	}
+	return string(respJSON)
 }

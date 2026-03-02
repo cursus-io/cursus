@@ -2,14 +2,14 @@
 
 <img src=".github/cursus-readme.png" alt="cursus" width="60%" height="60%"> 
 
-[![GitHub](https://img.shields.io/github/stars/downfa11-org/cursus.svg?style=social)](https://github.com/downfa11-org/cursus)
-[![Latest Release](https://img.shields.io/github/v/release/downfa11-org/cursus?include_prereleases&label=release&color=00ADD8)](https://github.com/downfa11-org/cursus/releases)
-[![Build Status](https://github.com/downfa11-org/cursus/actions/workflows/ci-build.yml/badge.svg?branch=main)](https://github.com/downfa11-org/cursus/actions/workflows/ci-build.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/downfa11-org/cursus)](https://goreportcard.com/report/github.com/downfa11-org/cursus)
-[![CodeCov](https://img.shields.io/codecov/c/github/downfa11-org/cursus)](https://codecov.io/gh/downfa11-org/cursus)
-![Go Version](https://img.shields.io/github/go-mod/go-version/downfa11-org/cursus)
-[![Godoc](http://img.shields.io/badge/go-documentation-blue.svg?style=flat-square)](https://godoc.org/github.com/downfa11-org/cursus)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg?)](https://github.com/downfa11-org/cursus/blob/main/LICENSE)
+[![GitHub](https://img.shields.io/github/stars/cursus-io/cursus.svg?style=social)](https://github.com/cursus-io/cursus)
+[![Latest Release](https://img.shields.io/github/v/release/cursus-io/cursus?include_prereleases&label=release&color=00ADD8)](https://github.com/cursus-io/cursus/releases)
+[![Build Status](https://github.com/cursus-io/cursus/actions/workflows/ci-build.yml/badge.svg?branch=main)](https://github.com/cursus-io/cursus/actions/workflows/ci-build.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/cursus-io/cursus)](https://goreportcard.com/report/github.com/cursus-io/cursus)
+[![CodeCov](https://img.shields.io/codecov/c/github/cursus-io/cursus)](https://codecov.io/gh/cursus-io/cursus)
+![Go Version](https://img.shields.io/github/go-mod/go-version/cursus-io/cursus)
+[![Godoc](http://img.shields.io/badge/go-documentation-blue.svg?style=flat-square)](https://godoc.org/github.com/cursus-io/cursus)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg?)](https://github.com/cursus-io/cursus/blob/main/LICENSE)
 
 </div>
 

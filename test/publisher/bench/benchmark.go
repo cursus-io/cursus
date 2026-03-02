@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/util"
 )
 
 const sep = "========================================"

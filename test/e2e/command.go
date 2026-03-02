@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/util"
 )
 
 // CreateTopic sends CREATE command to broker
@@ -70,7 +70,7 @@ func (bc *BrokerClient) PublishSimple(topic, payload, acks string) error {
 func (bc *BrokerClient) GetConsumerGroupStatus(groupID string) (*ConsumerGroupStatus, error) {
 	statusCmd := fmt.Sprintf("GROUP_STATUS group=%s", groupID)
 
-	respStr, err := bc.sendCommandAndGetResponse("admin", statusCmd, 2*time.Second)
+	respStr, err := bc.SendCommand("admin", statusCmd, 2*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +120,7 @@ func (bc *BrokerClient) CommitOffset(topic string, partition int, groupID string
 func (bc *BrokerClient) FetchCommittedOffset(topic string, partition int, groupID string) (uint64, error) {
 	cmd := fmt.Sprintf("FETCH_OFFSET topic=%s partition=%d group=%s", topic, partition, groupID)
 
-	respStr, err := bc.sendCommandAndGetResponse("admin", cmd, 2*time.Second)
+	respStr, err := bc.SendCommand("admin", cmd, 2*time.Second)
 	if err != nil {
 		return 0, err
 	}
@@ -143,7 +143,7 @@ func (bc *BrokerClient) JoinGroup(topic, group string) (int, string, error) {
 
 	joinCmd := fmt.Sprintf("JOIN_GROUP topic=%s group=%s member=%s", topic, group, initialMemberID)
 
-	resp, err := bc.sendCommandAndGetResponse("", joinCmd, 2*time.Second)
+	resp, err := bc.SendCommand("", joinCmd, 2*time.Second)
 	if err != nil {
 		return 0, "", fmt.Errorf("join group failed: %w", err)
 	}
@@ -191,7 +191,7 @@ func (bc *BrokerClient) JoinGroup(topic, group string) (int, string, error) {
 func (bc *BrokerClient) SyncGroup(topic, group string, generation int, memberID string) ([]int, error) {
 	syncCmd := fmt.Sprintf("SYNC_GROUP topic=%s group=%s member=%s generation=%d", topic, group, memberID, generation)
 
-	resp, err := bc.sendCommandAndGetResponse("", syncCmd, 2*time.Second)
+	resp, err := bc.SendCommand("", syncCmd, 2*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("sync group failed: %w", err)
 	}

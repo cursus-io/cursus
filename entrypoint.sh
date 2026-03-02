@@ -1,4 +1,4 @@
-#!/bin/bash  
-set -e  
- 
+#!/bin/bash
+set -e
+
 exec ./broker -config ./config.yaml

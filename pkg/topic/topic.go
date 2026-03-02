@@ -5,10 +5,10 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/downfa11-org/cursus/pkg/config"
-	"github.com/downfa11-org/cursus/pkg/stream"
-	"github.com/downfa11-org/cursus/pkg/types"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/config"
+
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 const DefaultBufSize = 10000
@@ -22,11 +22,11 @@ type Topic struct {
 	consumerGroups map[string]*types.ConsumerGroup
 	mu             sync.RWMutex
 	cfg            *config.Config
-	streamManager  *stream.StreamManager
+	streamManager  StreamManager
 }
 
 // NewTopic initializes a topic with partitions.
-func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm *stream.StreamManager) (*Topic, error) {
+func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager) (*Topic, error) {
 	partitions := make([]*Partition, partitionCount)
 	for i := 0; i < partitionCount; i++ {
 		dh, err := hp.GetHandler(name, i)

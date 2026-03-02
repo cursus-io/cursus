@@ -2,9 +2,11 @@ package e2e_cluster
 
 import (
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/downfa11-org/cursus/test/e2e"
+	"github.com/cursus-io/cursus/test/e2e"
 )
 
 const (
@@ -84,6 +86,22 @@ func GivenClusterRestart(t *testing.T) *ClusterTestContext {
 		t.Fatalf("Cluster failed to stabilize within timeout: %v", err)
 	}
 
+	t.Log("Waiting for Raft leader to be elected...")
+	leaderElected := false
+	for i := 0; i < 20; i++ {
+		resp, err := actions.actions.SendCommand("LIST")
+		if err == nil && !strings.Contains(resp, "ERROR:") && !strings.Contains(resp, "unknown") {
+			leaderElected = true
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	if !leaderElected {
+		t.Fatal("Cluster started but no leader was elected within 20 seconds")
+	}
+	t.Log("Raft leader elected, cluster ready.")
+
 	return ctx
 }
 
@@ -99,6 +117,11 @@ func (c *ClusterTestContext) WithPartitions(partitions int) *ClusterTestContext 
 
 func (c *ClusterTestContext) WithNumMessages(num int) *ClusterTestContext {
 	c.TestContext.WithNumMessages(num)
+	return c
+}
+
+func (c *ClusterTestContext) ResetPublishedCount() *ClusterTestContext {
+	c.TestContext.ResetPublishedCount()
 	return c
 }
 

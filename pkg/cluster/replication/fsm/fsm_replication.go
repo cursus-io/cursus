@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/downfa11-org/cursus/pkg/types"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 func (f *BrokerFSM) applyMessageCommand(jsonData string) interface{} {

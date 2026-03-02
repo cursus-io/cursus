@@ -6,12 +6,12 @@ import (
 	"os"
 	"strings"
 
-	"github.com/downfa11-org/cursus/pkg/config"
-	"github.com/downfa11-org/cursus/pkg/controller"
-	"github.com/downfa11-org/cursus/pkg/coordinator"
-	"github.com/downfa11-org/cursus/pkg/disk"
-	"github.com/downfa11-org/cursus/pkg/stream"
-	"github.com/downfa11-org/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/controller"
+	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/stream"
+	"github.com/cursus-io/cursus/pkg/topic"
 )
 
 func main() {
@@ -23,7 +23,8 @@ func main() {
 
 	dm := disk.NewDiskManager(cfg)
 	sm := stream.NewStreamManager(cfg.MaxStreamConnections, cfg.StreamTimeout, cfg.StreamHeartbeatInterval)
-	tm := topic.NewTopicManager(cfg, dm, sm)
+	smAdapter := topic.NewStreamManagerAdapter(sm)
+	tm := topic.NewTopicManager(cfg, dm, smAdapter)
 	cd := coordinator.NewCoordinator(cfg, tm)
 	tm.SetCoordinator(cd)
 

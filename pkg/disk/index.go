@@ -7,16 +7,17 @@ import (
 	"os"
 	"sort"
 
-	"github.com/downfa11-org/cursus/pkg/types"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"golang.org/x/exp/mmap"
 )
 
 func (d *DiskHandler) openIndexFiles() error {
 	if d.indexFile != nil {
 		if err := d.indexFile.Close(); err != nil {
-			return fmt.Errorf("failed to close index file: %w", err)
+			return fmt.Errorf("failed to close existing index file: %w", err)
 		}
+		d.indexFile = nil
 	}
 	indexPath := d.GetIndexPath(d.CurrentSegment)
 
@@ -197,6 +198,10 @@ func getLastOffsetFromIndex(indexPath string, baseOffset uint64) (lastOffset uin
 func (dh *DiskHandler) findSegmentForOffset(offset uint64) (string, uint64, error) {
 	dh.mu.Lock()
 	defer dh.mu.Unlock()
+
+	if offset > dh.AbsoluteOffset {
+		return "", 0, fmt.Errorf("offset %d is out of bounds, latest is %d", offset, dh.AbsoluteOffset)
+	}
 
 	if offset >= dh.CurrentSegment {
 		return dh.GetSegmentPath(dh.CurrentSegment), dh.CurrentSegment, nil

@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/downfa11-org/cursus/test/publisher/bench"
-	"github.com/downfa11-org/cursus/test/publisher/config"
-	"github.com/downfa11-org/cursus/test/publisher/producer"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/test/publisher/bench"
+	"github.com/cursus-io/cursus/test/publisher/config"
+	"github.com/cursus-io/cursus/test/publisher/producer"
+	"github.com/cursus-io/cursus/util"
 )
 
 func main() {

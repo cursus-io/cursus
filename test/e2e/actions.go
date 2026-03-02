@@ -57,7 +57,8 @@ func (a *Actions) PublishMessages() *Actions {
 		)
 
 		if err != nil {
-			a.ctx.lastError = err
+			a.ctx.t.Logf("Expected/Captured publish failure: %v", err)
+			a.ctx.SetLastError(err)
 			return a
 		}
 
@@ -198,11 +199,32 @@ func (a *Actions) CommitAllOffsets(offset uint64) *Actions {
 	return a
 }
 
+func (a *Actions) FetchOffset(partition int) *Actions {
+	a.ctx.t.Logf("Fetching offset for partition %d in group '%s'...", partition, a.ctx.consumerGroup)
+	client := a.ctx.getClient()
+
+	offset, err := client.FetchCommittedOffset(a.ctx.topic, partition, a.ctx.consumerGroup)
+	if err != nil {
+		a.ctx.t.Fatalf("Fetch offset failed: %v", err)
+	}
+
+	if a.ctx.offsetCache == nil {
+		a.ctx.offsetCache = make(map[int]uint64)
+	}
+	a.ctx.offsetCache[partition] = offset
+	a.ctx.t.Logf("Committed offset: %d", offset)
+	return a
+}
+
 func (a *Actions) SimulateNetworkFailure() *Actions {
 	a.ctx.t.Log("Simulating network failure...")
 	time.Sleep(100 * time.Millisecond)
 	a.ctx.t.Log("Network failure simulated")
 	return a
+}
+
+func (a *Actions) SendCommand(cmd string) (string, error) {
+	return a.ctx.getClient().SendCommand("", cmd, 5*time.Second)
 }
 
 // Then transitions to assertion phase

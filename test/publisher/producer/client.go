@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/downfa11-org/cursus/test/publisher/config"
+	"github.com/cursus-io/cursus/test/publisher/config"
 	"github.com/google/uuid"
 )
 

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/downfa11-org/cursus/test/consumer/bench"
+	"github.com/cursus-io/cursus/test/consumer/bench"
 )
 
 func TestConsumerMetrics_PhaseSeparation(t *testing.T) {

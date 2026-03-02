@@ -3,8 +3,8 @@ package coordinator_test
 import (
 	"testing"
 
-	"github.com/downfa11-org/cursus/pkg/config"
-	"github.com/downfa11-org/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/coordinator"
 )
 
 func TestCoordinator_Register_Add_Remove(t *testing.T) {

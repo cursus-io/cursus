@@ -5,13 +5,20 @@ import (
 	"sync"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/config"
-	"github.com/downfa11-org/cursus/pkg/coordinator"
-	"github.com/downfa11-org/cursus/pkg/metrics"
-	"github.com/downfa11-org/cursus/pkg/stream"
-	"github.com/downfa11-org/cursus/pkg/types"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/metrics"
+	"github.com/cursus-io/cursus/pkg/stream"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
+
+type StreamManager interface {
+	AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), commitInterval time.Duration) error
+	RemoveStream(key string)
+	GetStreamsForPartition(topic string, partition int) []*stream.StreamConnection
+	StopStream(key string)
+}
 
 type TopicManager struct {
 	topics        map[string]*Topic
@@ -21,7 +28,7 @@ type TopicManager struct {
 	hp            HandlerProvider
 	mu            sync.RWMutex
 	cfg           *config.Config
-	StreamManager *stream.StreamManager
+	StreamManager StreamManager
 	coordinator   *coordinator.Coordinator
 }
 
@@ -34,7 +41,7 @@ func (tm *TopicManager) SetCoordinator(cd *coordinator.Coordinator) {
 	tm.coordinator = cd
 }
 
-func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm *stream.StreamManager) *TopicManager {
+func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *TopicManager {
 	cleanupSec := cfg.CleanupInterval
 	if cleanupSec <= 0 {
 		cleanupSec = 60

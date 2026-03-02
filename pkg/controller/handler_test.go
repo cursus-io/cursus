@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/downfa11-org/cursus/pkg/config"
-	"github.com/downfa11-org/cursus/pkg/controller"
-	"github.com/downfa11-org/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/controller"
+	"github.com/cursus-io/cursus/pkg/topic"
 )
 
 type fakeTopicManager struct {

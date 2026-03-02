@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/types"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 // handlePublish processes PUBLISH command
@@ -60,30 +60,8 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 
 	var ackResp types.AckResponse
 	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
-		leader := ch.Cluster.IsLeader()
-		if !leader {
-			const maxRetries = 3
-			const retryDelay = 200 * time.Millisecond
-			var lastErr error
-
-			encodedCmd := string(util.EncodeMessage(topicName, cmd))
-			for i := 0; i < maxRetries; i++ {
-				resp, forwardErr := ch.Cluster.Router.ForwardToLeader(encodedCmd)
-				if forwardErr == nil {
-					return resp
-				}
-
-				util.Debug("Failed to forward PUBLISH (Attempt %d/%d). Error: %v", i+1, maxRetries, forwardErr)
-
-				if i < maxRetries-1 {
-					time.Sleep(retryDelay)
-				}
-				lastErr = forwardErr
-			}
-			return ch.errorResponse(fmt.Sprintf("failed to forward PUBLISH: %v", lastErr))
-		} else {
-			leaderAddr := ch.Cluster.RaftManager.GetLeaderAddress()
-			util.Debug("Processing PUBLISH locally as leader: %s", leaderAddr)
+		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
+			return resp
 		}
 	}
 

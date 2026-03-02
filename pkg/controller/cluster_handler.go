@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/util"
 	"github.com/google/uuid"
 )
 
@@ -29,27 +29,40 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 		return "", false, nil
 	}
 
+	const (
+		maxRetries = 5
+		retryDelay = 500 * time.Millisecond
+	)
+
+	for i := 0; i < maxRetries; i++ {
+		if ch.Cluster.RaftManager.GetLeaderAddress() != "" {
+			break
+		}
+		if i == maxRetries-1 {
+			return "ERROR: no Raft leader elected after retries", true, fmt.Errorf("no leader elected")
+		}
+		util.Debug("Waiting for Raft leader to be elected... (attempt %d/%d)", i+1, maxRetries)
+		time.Sleep(retryDelay)
+	}
+
 	if !ch.Cluster.RaftManager.IsLeader() {
 		if ch.Cluster.Router == nil {
 			return "ERROR: not the leader, and router is nil", true, nil
 		}
 
-		encodedCmd := string(util.EncodeMessage("", cmd))
-		const (
-			maxRetries = 3
-			retryDelay = 200 * time.Millisecond
-		)
-
+		encodedCmd := util.EncodeMessage("", cmd)
+		var lastErr error
 		for i := 0; i < maxRetries; i++ {
-			resp, err := ch.Cluster.Router.ForwardToLeader(encodedCmd)
+			resp, err := ch.Cluster.Router.ForwardToLeader(string(encodedCmd))
 			if err == nil {
 				return resp, true, nil
 			}
-			util.Debug("Retrying forward to leader... attempt %d", i+1)
+			lastErr = err
+			util.Debug("Retrying forward to leader (Target Leader %s)... attempt %d: %v", ch.Cluster.RaftManager.GetLeaderAddress(), i+1, err)
 			time.Sleep(retryDelay)
 		}
 		leaderAddr := ch.Cluster.RaftManager.GetLeaderAddress()
-		return fmt.Sprintf("ERROR: failed to forward command to leader (Leader: %s)", leaderAddr), true, nil
+		return fmt.Sprintf("ERROR: failed to forward command to leader (Leader: %s, Error: %v)", leaderAddr, lastErr), true, nil
 	}
 	return "", false, nil
 }

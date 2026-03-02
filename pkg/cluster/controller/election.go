@@ -3,17 +3,16 @@ package controller
 import (
 	"context"
 
-	"github.com/downfa11-org/cursus/pkg/cluster/replication"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/util"
 )
 
 type ControllerElection struct {
-	rm     *replication.RaftReplicationManager
+	rm     RaftManager
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
-func NewControllerElection(rm *replication.RaftReplicationManager) *ControllerElection {
+func NewControllerElection(rm RaftManager) *ControllerElection {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &ControllerElection{
 		rm:     rm,

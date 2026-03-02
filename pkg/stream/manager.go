@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/types"
 )
 
 type StreamManager struct {

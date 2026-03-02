@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/downfa11-org/cursus/pkg/config"
-	"github.com/downfa11-org/cursus/pkg/coordinator"
-	"github.com/downfa11-org/cursus/pkg/disk"
-	"github.com/downfa11-org/cursus/pkg/server"
-	"github.com/downfa11-org/cursus/pkg/stream"
-	"github.com/downfa11-org/cursus/pkg/topic"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/server"
+	"github.com/cursus-io/cursus/pkg/stream"
+	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/util"
 )
 
 func main() {
@@ -42,8 +42,9 @@ func main() {
 	// Initialization
 	dm := disk.NewDiskManager(cfg)
 	sm := stream.NewStreamManager(cfg.MaxStreamConnections, cfg.StreamTimeout, cfg.StreamHeartbeatInterval)
+	smAdapter := topic.NewStreamManagerAdapter(sm)
 
-	tm := topic.NewTopicManager(cfg, dm, sm)
+	tm := topic.NewTopicManager(cfg, dm, smAdapter)
 	cd := coordinator.NewCoordinator(cfg, tm)
 	tm.SetCoordinator(cd)
 

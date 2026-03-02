@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

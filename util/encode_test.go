@@ -3,8 +3,8 @@ package util_test
 import (
 	"testing"
 
-	"github.com/downfa11-org/cursus/pkg/types"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 func TestEncodeDecodeMessage(t *testing.T) {

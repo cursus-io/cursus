@@ -12,18 +12,18 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/cluster"
-	client "github.com/downfa11-org/cursus/pkg/cluster/client"
-	clusterController "github.com/downfa11-org/cursus/pkg/cluster/controller"
-	"github.com/downfa11-org/cursus/pkg/cluster/replication"
-	"github.com/downfa11-org/cursus/pkg/config"
-	"github.com/downfa11-org/cursus/pkg/controller"
-	"github.com/downfa11-org/cursus/pkg/coordinator"
-	"github.com/downfa11-org/cursus/pkg/disk"
-	"github.com/downfa11-org/cursus/pkg/metrics"
-	"github.com/downfa11-org/cursus/pkg/stream"
-	"github.com/downfa11-org/cursus/pkg/topic"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/cluster"
+	client "github.com/cursus-io/cursus/pkg/cluster/client"
+	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
+	"github.com/cursus-io/cursus/pkg/cluster/replication"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/controller"
+	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/metrics"
+	"github.com/cursus-io/cursus/pkg/stream"
+	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/util"
 )
 
 const (
@@ -84,7 +84,7 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 
 		sd := clusterController.NewServiceDiscovery(rm, brokerID, localAddr)
 		discoveryAddr := fmt.Sprintf(":%d", cfg.DiscoveryPort)
-		cs := cluster.NewClusterServer(*sd)
+		cs := cluster.NewClusterServer(sd)
 		go func() {
 			if _, err := cs.Start(discoveryAddr); err != nil {
 				util.Error("discovery-server start error: %v", err)
@@ -92,6 +92,9 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 		}()
 
 		cc = clusterController.NewClusterController(ctx, cfg, rm, sd)
+
+		globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
+		cc.SetLocalProcessor(globalCH)
 
 		go func() {
 			util.Info("🔄 Starting cluster leader election monitor...")
@@ -221,13 +224,19 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 
 	_, payload, err := util.DecodeMessage(data)
 	if err != nil {
-		util.Error("⚠️ Decode error: %v [%s]", err, string(data))
+		rawInput := string(data)
+		rawInput = strings.Trim(rawInput, "\x00 \t\n\r")
+		if isCommand(rawInput) {
+			return handleCommandMessage(rawInput, cmdHandler, ctx, conn)
+		}
+		util.Error("⚠️ Decode error and not a raw command: %v [%s]", err, string(data))
 		return false, err
 	}
 
-	writeTimeout := 10 * time.Second
+	payload = strings.Trim(payload, "\x00 \t\n\r")
+
 	if strings.HasPrefix(strings.ToUpper(payload), "HEARTBEAT") {
-		writeResponseWithTimeout(conn, "OK", writeTimeout)
+		writeResponseWithTimeout(conn, "OK", 10*time.Second)
 		return false, nil
 	}
 
@@ -270,6 +279,34 @@ func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler,
 	return false, nil
 }
 
+// isBatchMessage checks if the data is in binary batch format
+func isBatchMessage(data []byte) bool {
+	if len(data) < 6 {
+		return false
+	}
+	if data[0] != 0xBA || data[1] != 0x7C {
+		return false
+	}
+
+	topicLen := binary.BigEndian.Uint16(data[2:4])
+	if topicLen == 0 || int(topicLen)+2 > len(data) {
+		return false
+	}
+	return true
+}
+
+func isCommand(s string) bool {
+	keywords := []string{"CREATE", "DELETE", "LIST", "PUBLISH", "CONSUME", "STREAM", "HELP",
+		"HEARTBEAT", "JOIN_GROUP", "LEAVE_GROUP", "COMMIT_OFFSET", "BATCH_COMMIT", "REGISTER_GROUP",
+		"GROUP_STATUS", "FETCH_OFFSET", "LIST_GROUPS", "SYNC_GROUP", "DESCRIBE"}
+	for _, k := range keywords {
+		if strings.HasPrefix(strings.ToUpper(s), k) {
+			return true
+		}
+	}
+	return false
+}
+
 // writeResponseWithTimeout adds write timeout
 func writeResponseWithTimeout(conn net.Conn, msg string, timeout time.Duration) {
 	resp := []byte(msg)
@@ -292,34 +329,6 @@ func writeResponseWithTimeout(conn net.Conn, msg string, timeout time.Duration) 
 	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
 		util.Error("Failed to reset write deadline: %v", err)
 	}
-}
-
-// isBatchMessage checks if the data is in binary batch format
-func isBatchMessage(data []byte) bool {
-	if len(data) < 6 {
-		return false
-	}
-	if data[0] != 0xBA || data[1] != 0x7C {
-		return false
-	}
-
-	topicLen := binary.BigEndian.Uint16(data[2:4])
-	if topicLen == 0 || int(topicLen)+2 > len(data) {
-		return false
-	}
-	return true
-}
-
-func isCommand(s string) bool {
-	keywords := []string{"CREATE", "DELETE", "LIST", "PUBLISH", "CONSUME", "STREAM", "HELP",
-		"HEARTBEAT", "JOIN_GROUP", "LEAVE_GROUP", "COMMIT_OFFSET", "BATCH_COMMIT", "REGISTER_GROUP",
-		"GROUP_STATUS", "FETCH_OFFSET", "LIST_GROUPS", "SYNC_GROUP"}
-	for _, k := range keywords {
-		if strings.HasPrefix(strings.ToUpper(s), k) {
-			return true
-		}
-	}
-	return false
 }
 
 func writeResponse(conn net.Conn, msg string) {

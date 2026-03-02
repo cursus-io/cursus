@@ -21,7 +21,7 @@ The fastest way to get cursus running is using Docker Compose:
 ## Clone the repository
 
 ```
-git clone https://github.com/downfa11-org/cursus
+git clone https://github.com/cursus-io/cursus
 cd cursus
 ```
 

@@ -6,20 +6,29 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/cluster/replication"
-	"github.com/downfa11-org/cursus/pkg/cluster/replication/fsm"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/cluster/replication"
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/util"
 )
 
-type ServiceDiscovery struct {
+type ServiceDiscovery interface {
+	Register() error
+	Deregister() error
+	DiscoverBrokers() ([]fsm.BrokerInfo, error)
+	AddNode(nodeID string, addr string) (string, error)
+	RemoveNode(nodeID string) (string, error)
+	StartReconciler(ctx context.Context)
+}
+
+type serviceDiscovery struct {
 	rm       *replication.RaftReplicationManager
 	fsm      *fsm.BrokerFSM
 	brokerID string
 	addr     string
 }
 
-func NewServiceDiscovery(rm *replication.RaftReplicationManager, brokerID, addr string) *ServiceDiscovery {
-	return &ServiceDiscovery{
+func NewServiceDiscoveryImpl(rm *replication.RaftReplicationManager, brokerID, addr string) *serviceDiscovery {
+	return &serviceDiscovery{
 		rm:       rm,
 		fsm:      rm.GetFSM(),
 		brokerID: brokerID,
@@ -27,7 +36,11 @@ func NewServiceDiscovery(rm *replication.RaftReplicationManager, brokerID, addr 
 	}
 }
 
-func (sd *ServiceDiscovery) Register() error {
+func NewServiceDiscovery(rm *replication.RaftReplicationManager, brokerID, addr string) ServiceDiscovery {
+	return NewServiceDiscoveryImpl(rm, brokerID, addr)
+}
+
+func (sd *serviceDiscovery) Register() error {
 	broker := &fsm.BrokerInfo{
 		ID:       sd.brokerID,
 		Addr:     sd.addr,
@@ -50,7 +63,7 @@ func (sd *ServiceDiscovery) Register() error {
 	return nil
 }
 
-func (sd *ServiceDiscovery) Deregister() error {
+func (sd *serviceDiscovery) Deregister() error {
 	if err := sd.rm.ApplyCommand("DEREGISTER", []byte(sd.brokerID)); err != nil {
 		util.Error("Failed to deregister broker %s: %v", sd.brokerID, err)
 		return err
@@ -60,12 +73,12 @@ func (sd *ServiceDiscovery) Deregister() error {
 	return nil
 }
 
-func (sd *ServiceDiscovery) DiscoverBrokers() ([]fsm.BrokerInfo, error) {
+func (sd *serviceDiscovery) DiscoverBrokers() ([]fsm.BrokerInfo, error) {
 	brokers := sd.fsm.GetBrokers()
 	return brokers, nil
 }
 
-func (sd *ServiceDiscovery) AddNode(nodeID string, addr string) (string, error) {
+func (sd *serviceDiscovery) AddNode(nodeID string, addr string) (string, error) {
 	leaderAddr := sd.rm.GetLeaderAddress()
 	if !sd.rm.IsLeader() {
 		return leaderAddr, fmt.Errorf("not leader; contact leader at %s", leaderAddr)
@@ -97,7 +110,7 @@ func (sd *ServiceDiscovery) AddNode(nodeID string, addr string) (string, error) 
 	return leaderAddr, nil
 }
 
-func (sd *ServiceDiscovery) RemoveNode(nodeID string) (string, error) {
+func (sd *serviceDiscovery) RemoveNode(nodeID string) (string, error) {
 	leaderAddr := sd.rm.GetLeaderAddress()
 
 	if !sd.rm.IsLeader() {
@@ -116,7 +129,7 @@ func (sd *ServiceDiscovery) RemoveNode(nodeID string) (string, error) {
 	return leaderAddr, nil
 }
 
-func (sd *ServiceDiscovery) StartReconciler(ctx context.Context) {
+func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	go func() {
 		defer ticker.Stop()
@@ -137,7 +150,7 @@ func (sd *ServiceDiscovery) StartReconciler(ctx context.Context) {
 	}()
 }
 
-func (sd *ServiceDiscovery) reconcile() {
+func (sd *serviceDiscovery) reconcile() {
 	future := sd.rm.GetConfiguration()
 	if err := future.Error(); err != nil {
 		util.Error("Failed to get Raft configuration: %v", err)

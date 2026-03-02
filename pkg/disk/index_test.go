@@ -4,8 +4,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/downfa11-org/cursus/pkg/config"
-	"github.com/downfa11-org/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/types"
 )
 
 func setupDiskHandlerWithIndex(t *testing.T) *DiskHandler {

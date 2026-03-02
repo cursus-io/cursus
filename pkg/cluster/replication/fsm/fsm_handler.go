@@ -1,6 +1,6 @@
 package fsm
 
-import "github.com/downfa11-org/cursus/util"
+import "github.com/cursus-io/cursus/util"
 
 func (f *BrokerFSM) storeBroker(id string, broker *BrokerInfo) {
 	f.mu.Lock()

@@ -3,7 +3,7 @@ package metrics_test
 import (
 	"testing"
 
-	"github.com/downfa11-org/cursus/pkg/metrics"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )

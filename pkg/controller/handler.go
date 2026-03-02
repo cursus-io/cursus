@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"strings"
 
-	clusterController "github.com/downfa11-org/cursus/pkg/cluster/controller"
-	"github.com/downfa11-org/cursus/pkg/config"
-	"github.com/downfa11-org/cursus/pkg/coordinator"
-	"github.com/downfa11-org/cursus/pkg/stream"
-	"github.com/downfa11-org/cursus/pkg/topic"
-	"github.com/downfa11-org/cursus/pkg/types"
-	"github.com/downfa11-org/cursus/util"
+	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/stream"
+	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 const DefaultMaxPollRecords = 8192
@@ -102,6 +102,8 @@ func (ch *CommandHandler) handleCommandByType(cmd, upper string, ctx *ClientCont
 		return ch.handleFetchOffset(cmd)
 	case strings.HasPrefix(upper, "GROUP_STATUS "):
 		return ch.handleGroupStatus(cmd)
+	case strings.HasPrefix(upper, "DESCRIBE "):
+		return ch.handleDescribeTopic(cmd)
 	case strings.HasPrefix(upper, "HEARTBEAT "):
 		return ch.handleHeartbeat(cmd)
 	case strings.HasPrefix(upper, "COMMIT_OFFSET "):

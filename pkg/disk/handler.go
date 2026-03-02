@@ -13,9 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/config"
-	"github.com/downfa11-org/cursus/pkg/types"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"golang.org/x/exp/mmap"
 )
 
@@ -59,6 +59,10 @@ type DiskHandler struct {
 
 	closeOnce sync.Once
 	shutdown  sync.WaitGroup
+}
+
+func (d *DiskHandler) GetActiveReaders() int32 {
+	return atomic.LoadInt32(&d.activeReaders)
 }
 
 func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*DiskHandler, error) {

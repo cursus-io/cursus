@@ -11,11 +11,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/downfa11-org/cursus/test/consumer/bench"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/test/consumer/bench"
+	"github.com/cursus-io/cursus/util"
 
-	"github.com/downfa11-org/cursus/test/consumer/client"
-	"github.com/downfa11-org/cursus/test/consumer/config"
+	"github.com/cursus-io/cursus/test/consumer/client"
+	"github.com/cursus-io/cursus/test/consumer/config"
 )
 
 type Consumer struct {

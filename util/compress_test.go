@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/util"
 )
 
 // TestCompressMessage_AllTypes tests all supported compression types

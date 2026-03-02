@@ -6,8 +6,8 @@ import (
 	"net"
 	"strings"
 
-	"github.com/downfa11-org/cursus/pkg/cluster/controller"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/cluster/controller"
+	"github.com/cursus-io/cursus/util"
 )
 
 type joinRequest struct {

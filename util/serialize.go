@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/downfa11-org/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/types"
 )
 
 // serializeMessage converts types.Message to serialized bytes

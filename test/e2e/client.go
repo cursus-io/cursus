@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/util"
 )
 
 // BrokerClient wraps low-level broker communication
@@ -79,15 +79,15 @@ func (bc *BrokerClient) connect() error {
 		return nil
 	}
 
+	if bc.conn != nil {
+		_ = bc.conn.Close()
+		bc.conn = nil
+	}
+
 	var lastErr error
 	for _, addr := range bc.addrs {
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err == nil {
-			if bc.conn != nil {
-				if err := bc.conn.Close(); err != nil {
-					util.Debug("failed to close connection: %v", err)
-				}
-			}
 			bc.conn = conn
 			bc.closed = false
 			return nil
@@ -111,39 +111,79 @@ func (bc *BrokerClient) Close() {
 	bc.closed = true
 }
 
-// sendCommandAndGetResponse executes a command on an existing connection and returns the response string.
-func (bc *BrokerClient) sendCommandAndGetResponse(cmdTopic, cmdPayload string, readTimeout time.Duration) (string, error) {
-	if err := bc.connect(); err != nil {
-		return "", err
-	}
+func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout time.Duration) (string, error) {
+	const maxRetries = 2
+	var lastErr error
 
+	for i := 0; i <= maxRetries; i++ {
+		if err := bc.connect(); err != nil {
+			lastErr = err
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		bc.mu.Lock()
+		conn := bc.conn
+		bc.mu.Unlock()
+
+		if conn == nil {
+			lastErr = fmt.Errorf("connection is nil")
+			continue
+		}
+
+		cmdBytes := util.EncodeMessage(cmdTopic, cmdPayload)
+		if err := util.WriteWithLength(conn, cmdBytes); err != nil {
+			bc.closeInternal()
+			lastErr = err
+			util.Debug("Write error, retrying: %v", err)
+			continue
+		}
+
+		if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+			bc.closeInternal()
+			return "", err
+		}
+
+		respBuf, err := util.ReadWithLength(conn)
+		if err != nil {
+			bc.closeInternal()
+			lastErr = err
+
+			if isIdempotent(cmdPayload) {
+				util.Debug("Read error on idempotent command, retrying: %v", err)
+				continue
+			}
+
+			return "", fmt.Errorf("write succeeded but read failed (possible duplicate if retried): %w", err)
+		}
+		return strings.TrimSpace(string(respBuf)), nil
+	}
+	return "", fmt.Errorf("command failed after retries: %w", lastErr)
+}
+
+func (bc *BrokerClient) closeInternal() {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
-
-	if bc.conn == nil || bc.closed {
-		return "", fmt.Errorf("connection is closed")
+	if bc.conn != nil {
+		_ = bc.conn.Close()
+		bc.conn = nil
 	}
+}
 
-	cmdBytes := util.EncodeMessage(cmdTopic, cmdPayload)
-	if err := util.WriteWithLength(bc.conn, cmdBytes); err != nil {
-		return "", fmt.Errorf("send command: %w", err)
-	}
-
-	if err := bc.conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
-		return "", fmt.Errorf("set read deadline: %w", err)
-	}
-
-	respBuf, err := util.ReadWithLength(bc.conn)
-
-	if err != nil {
-		return "", fmt.Errorf("read response: %w", err)
-	}
-	return strings.TrimSpace(string(respBuf)), nil
+func isIdempotent(payload string) bool {
+	p := strings.ToUpper(strings.TrimSpace(payload))
+	return strings.HasPrefix(p, "DESCRIBE") ||
+		strings.HasPrefix(p, "LIST") ||
+		strings.HasPrefix(p, "FETCH_OFFSET") ||
+		strings.HasPrefix(p, "GROUP_STATUS") ||
+		strings.HasPrefix(p, "HELP") ||
+		strings.HasPrefix(p, "CONSUME") ||
+		strings.HasPrefix(p, "LIST_GROUPS")
 }
 
 // executeCommand is a simplified wrapper for commands expected to return only "OK" or "ERROR:".
 func (bc *BrokerClient) executeCommand(topic, payload string) error {
-	resp, err := bc.sendCommandAndGetResponse(topic, payload, 2*time.Second)
+	resp, err := bc.SendCommand(topic, payload, 2*time.Second)
 	if err != nil {
 		return err
 	}

@@ -6,9 +6,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/downfa11-org/cursus/test/consumer/config"
-	"github.com/downfa11-org/cursus/test/consumer/subscriber"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/test/consumer/config"
+	"github.com/cursus-io/cursus/test/consumer/subscriber"
+	"github.com/cursus-io/cursus/util"
 )
 
 func main() {

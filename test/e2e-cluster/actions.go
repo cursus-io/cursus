@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
+	"strings"
 	"time"
 
-	"github.com/downfa11-org/cursus/test/e2e"
+	"github.com/cursus-io/cursus/test/e2e"
+	"github.com/cursus-io/cursus/util"
 )
 
 // ClusterActions represents cluster-specific test actions
@@ -70,6 +72,16 @@ func (a *ClusterActions) PublishMessages() *ClusterActions {
 	return a
 }
 
+func (a *ClusterActions) ResetPublishedCount() *ClusterActions {
+	a.ctx.ResetPublishedCount()
+	return a
+}
+
+func (a *ClusterActions) RetryPublishMessages() *ClusterActions {
+	a.actions.RetryPublishMessages()
+	return a
+}
+
 func (a *ClusterActions) JoinGroup() *ClusterActions {
 	a.actions.JoinGroup()
 	return a
@@ -82,6 +94,11 @@ func (a *ClusterActions) SyncGroup() *ClusterActions {
 
 func (a *ClusterActions) ConsumeMessages() *ClusterActions {
 	a.actions.ConsumeMessages()
+	return a
+}
+
+func (a *ClusterActions) CommitOffset(partition int, offset uint64) *ClusterActions {
+	a.actions.CommitOffset(partition, offset)
 	return a
 }
 
@@ -103,6 +120,8 @@ func (a *ClusterActions) SimulateFollowerFailure(nodeIndex int) *ClusterActions 
 		return a
 	}
 
+	a.ctx.GetClient().Close()
+
 	a.ctx.GetT().Logf("Successfully stopped %s", containerName)
 	time.Sleep(2 * time.Second)
 	return a
@@ -121,9 +140,101 @@ func (a *ClusterActions) RecoverFollower(nodeIndex int) *ClusterActions {
 		a.ctx.GetT().Fatalf("Failed to recover follower: %v", err)
 	}
 
+	a.ctx.GetClient().Close()
+
 	healthAddrs := clusterHealthCheckAddrs(a.ctx.clusterSize)
 	if err := a.waitForNodeHealth(nodeIndex, healthAddrs[nodeIndex-1]); err != nil {
 		a.ctx.GetT().Fatalf("node health check failed: %v", err)
 	}
 	return a
+}
+
+func (a *ClusterActions) DescribeTopic() *ClusterActions {
+	topic := a.ctx.GetTopic()
+	a.ctx.GetT().Logf("Describing topic: %s", topic)
+
+	cmd := fmt.Sprintf("DESCRIBE topic=%s", topic)
+	resp, err := a.actions.SendCommand(cmd)
+	if err != nil {
+		a.ctx.GetT().Fatalf("Failed to describe topic %s: %v", topic, err)
+	}
+
+	a.ctx.GetT().Logf("Topic Metadata:\n%s", resp)
+	return a
+}
+
+func (a *ClusterActions) WaitForTopicMetadata() *ClusterActions {
+	topic := a.ctx.GetTopic()
+	a.ctx.GetT().Logf("Waiting for topic metadata to propagate: %s", topic)
+
+	addrs := a.ctx.GetBrokerAddrs()
+
+	for i := 0; i < 60; i++ {
+		for _, addr := range addrs {
+			tempClient := e2e.NewBrokerClient([]string{addr})
+			cmd := fmt.Sprintf("DESCRIBE topic=%s", topic)
+			resp, err := tempClient.SendCommand("", cmd, 2*time.Second)
+			tempClient.Close()
+
+			if err == nil &&
+				!strings.Contains(resp, "not found") &&
+				!strings.Contains(resp, "ERROR:") &&
+				strings.Contains(resp, topic) &&
+				strings.Contains(resp, "{") {
+				a.ctx.GetT().Logf("Topic metadata for '%s' is now available on node %s", topic, addr)
+				return a
+			}
+			util.Debug("Still waiting for metadata on %s: resp=%s, err=%v", addr, resp, err)
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	a.ctx.GetT().Fatalf("Timed out waiting for topic metadata to propagate for topic %s", topic)
+	return a
+}
+
+func (a *ClusterActions) SimulateLeaderFailure() (int, *ClusterActions) {
+	topic := a.ctx.GetTopic()
+	a.ctx.GetT().Logf("Simulating leader failure for topic: %s", topic)
+
+	cmd := fmt.Sprintf("DESCRIBE topic=%s", topic)
+	resp, err := a.actions.SendCommand(cmd)
+	if err != nil {
+		a.ctx.GetT().Fatalf("Failed to find leader for topic %s: %v", topic, err)
+	}
+
+	var leaderNode int
+	// "leader": "broker-X:9000"
+	for i := 1; i <= a.ctx.clusterSize; i++ {
+		target := fmt.Sprintf("\"leader\": \"broker-%d:9000\"", i)
+		if strings.Contains(resp, target) {
+			leaderNode = i
+			break
+		}
+	}
+	if leaderNode == 0 {
+		for i := 1; i <= a.ctx.clusterSize; i++ {
+			if strings.Contains(resp, fmt.Sprintf("broker-%d", i)) {
+				leaderNode = i
+				break
+			}
+		}
+	}
+
+	if leaderNode == 0 {
+		a.ctx.GetT().Fatalf("Could not identify leader for topic %s from response: %s", topic, resp)
+	}
+
+	containerName := fmt.Sprintf("broker-%d", leaderNode)
+	a.ctx.GetT().Logf("Stopping leader container: %s", containerName)
+
+	stopCmd := exec.Command("docker", "stop", containerName)
+	if err := stopCmd.Run(); err != nil {
+		a.ctx.GetT().Fatalf("Failed to stop leader %s: %v", containerName, err)
+	}
+
+	a.ctx.GetClient().Close()
+
+	time.Sleep(5 * time.Second)
+	return leaderNode, a
 }

@@ -45,6 +45,7 @@ type TestContext struct {
 	memberID           string
 	generation         int
 	assignedPartitions []int
+	offsetCache        map[int]uint64
 
 	// Client helper
 	client *BrokerClient
@@ -59,7 +60,7 @@ func Given(t *testing.T) *TestContext {
 		topic:          "test-topic",
 		partitions:     1,
 		numMessages:    10,
-		publishDelayMS: 100,
+		publishDelayMS: 0,
 		startTime:      time.Now(),
 		consumerGroup:  fmt.Sprintf("test-group-%s", uniqueID),
 		memberID:       fmt.Sprintf("e2e-consumer-%s", uniqueID),
@@ -176,9 +177,20 @@ func (ctx *TestContext) GetPublishedCount() int {
 	return ctx.publishedCount
 }
 
+func (ctx *TestContext) ResetPublishedCount() *TestContext {
+	ctx.publishedCount = 0
+	ctx.publishedSeqNums = []uint64{}
+	return ctx
+}
+
 // GetConsumedCount returns the number of consumed messages
 func (ctx *TestContext) GetConsumedCount() int {
 	return ctx.consumedCount
+}
+
+// GetLastError returns the last error encountered during test execution
+func (ctx *TestContext) GetLastError() error {
+	return ctx.lastError
 }
 
 // GetAcks returns the acks setting
@@ -199,6 +211,11 @@ func (ctx *TestContext) GetAssignedPartitions() []int {
 // SetConsumedCount sets the consumed message count
 func (ctx *TestContext) SetConsumedCount(count int) {
 	ctx.consumedCount = count
+}
+
+// SetLastError records the last error encountered
+func (ctx *TestContext) SetLastError(err error) {
+	ctx.lastError = err
 }
 
 // GetProducerID returns the current producer ID

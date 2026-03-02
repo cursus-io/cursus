@@ -6,3 +6,14 @@ manifests/logs/*
 test/logs/*
 .vscode/settings.json
 test/publisher/bench/*
+
+*.exe
+*.test
+
+coverage/
+coverage-server/
+*.out
+
+bin/
+
+$coverfile

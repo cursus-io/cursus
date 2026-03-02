@@ -22,6 +22,7 @@ This directory contains various documents explaining different aspects of the pr
   - **[Configuration](user-guide/configuration.md)** – Configuration options and settings.
 - **Reference**
   - **[API Reference](reference/api-reference.md)** – Complete API documentation.
+  - **[Comparison with Others](reference/comparison.md)** – Detailed comparison with other message brokers.
   - **[Benchmark](reference/benchmark.md)** – Performance benchmark results and testing methodology.
   - **[Command Interface](reference/command-interface.md)** – CLI commands and usage.
   - **[Observability](reference/observability.md)** – Metrics, logging, and monitoring.

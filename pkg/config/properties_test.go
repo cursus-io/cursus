@@ -3,7 +3,7 @@ package config_test
 import (
 	"testing"
 
-	"github.com/downfa11-org/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/config"
 )
 
 func TestNormalizeDefaults(t *testing.T) {

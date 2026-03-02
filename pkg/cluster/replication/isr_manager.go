@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/cluster/replication/fsm"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/util"
 )
 
 const defaultHeartbeatTimeout = 10 * time.Second

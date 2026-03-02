@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/downfa11-org/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/types"
 )
 
 // EncodeMessage serializes topic and payload into bytes.

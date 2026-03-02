@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/config"
-	"github.com/downfa11-org/cursus/pkg/disk"
-	"github.com/downfa11-org/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/types"
 )
 
 // TestDiskHandlerBasic verifies basic append and flush behavior
@@ -196,7 +196,7 @@ func TestDiskHandlerRotation(t *testing.T) {
 		}
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	pattern := filepath.Join(cfg.LogDir, topic, "partition_0_segment_*.log")
 	files, err := filepath.Glob(pattern)
@@ -226,5 +226,160 @@ func TestDiskHandlerRotation(t *testing.T) {
 		if msg.SeqNum != uint64(100+i) {
 			t.Errorf("message %d: expected SeqNum %d, got %d", i, 100+i, msg.SeqNum)
 		}
+	}
+}
+
+func TestDiskHandler_GetLatestOffset(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		DiskFlushBatchSize:  1,
+		DiskFlushIntervalMS: 10,
+		LingerMS:            10,
+		ChannelBufferSize:   10,
+		DiskWriteTimeoutMS:  100,
+		IndexIntervalBytes:  4096,
+		LogDir:              dir,
+		SegmentSize:         20,
+	}
+
+	topic := "offsetlog"
+	dh, err := disk.NewDiskHandler(cfg, topic, 0)
+	if err != nil {
+		t.Fatalf("NewDiskHandler: %v", err)
+	}
+	defer func() { _ = dh.Close() }()
+
+	expectedOffset := uint64(0)
+	if offset := dh.GetLatestOffset(); offset != expectedOffset {
+		t.Errorf("GetLatestOffset: expected %d, got %d", expectedOffset, offset)
+	}
+
+	if _, err := dh.AppendMessage(topic, 0, &types.Message{Payload: "test1", SeqNum: 1}); err != nil {
+		t.Fatalf("AppendMessage 1: %v", err)
+	}
+	if _, err := dh.AppendMessage(topic, 0, &types.Message{Payload: "test2", SeqNum: 2}); err != nil {
+		t.Fatalf("AppendMessage 2: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	expectedOffset = uint64(2)
+	if offset := dh.GetLatestOffset(); offset != expectedOffset {
+		t.Errorf("GetLatestOffset after append: expected %d, got %d", expectedOffset, offset)
+	}
+}
+
+func TestDiskHandler_GetIndexFile(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		DiskFlushBatchSize:  1,
+		DiskFlushIntervalMS: 10,
+		LingerMS:            10,
+		ChannelBufferSize:   10,
+		DiskWriteTimeoutMS:  100,
+		IndexIntervalBytes:  4096,
+		LogDir:              dir,
+		SegmentSize:         20,
+	}
+
+	topic := "indexfilelog"
+	dh, err := disk.NewDiskHandler(cfg, topic, 0)
+	if err != nil {
+		t.Fatalf("NewDiskHandler: %v", err)
+	}
+	defer func() { _ = dh.Close() }()
+
+	indexFile := dh.GetIndexFile()
+	if indexFile == nil {
+		t.Error("GetIndexFile: expected non-nil file, got nil")
+	}
+}
+
+func TestReadSession_Close(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		DiskFlushBatchSize:  1,
+		DiskFlushIntervalMS: 10,
+		LingerMS:            10,
+		ChannelBufferSize:   10,
+		DiskWriteTimeoutMS:  100,
+		IndexIntervalBytes:  4096,
+		LogDir:              dir,
+		SegmentSize:         20,
+	}
+
+	topic := "readsessioncloselog"
+	dh, err := disk.NewDiskHandler(cfg, topic, 0)
+	if err != nil {
+		t.Fatalf("NewDiskHandler: %v", err)
+	}
+	defer func() { _ = dh.Close() }()
+
+	if _, err := dh.AppendMessage(topic, 0, &types.Message{Payload: "test", SeqNum: 1}); err != nil {
+		t.Fatalf("AppendMessage failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	session, err := dh.OpenForRead(0)
+	if err != nil {
+		t.Fatalf("OpenForRead failed: %v", err)
+	}
+	if dh.GetActiveReaders() != 1 {
+		t.Errorf("Expected 1 active reader, got %d", dh.GetActiveReaders())
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("ReadSession.Close failed: %v", err)
+	}
+	if dh.GetActiveReaders() != 0 {
+		t.Errorf("Expected 0 active readers after close, got %d", dh.GetActiveReaders())
+	}
+}
+
+func TestDiskHandler_OpenForRead(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		DiskFlushBatchSize:  1,
+		DiskFlushIntervalMS: 10,
+		LingerMS:            10,
+		ChannelBufferSize:   10,
+		DiskWriteTimeoutMS:  100,
+		IndexIntervalBytes:  4096,
+		LogDir:              dir,
+		SegmentSize:         20,
+	}
+
+	topic := "open-for-read-log"
+	dh, err := disk.NewDiskHandler(cfg, topic, 0)
+	if err != nil {
+		t.Fatalf("NewDiskHandler: %v", err)
+	}
+	defer func() { _ = dh.Close() }()
+
+	if _, err := dh.AppendMessage(topic, 0, &types.Message{Payload: "first", SeqNum: 1}); err != nil {
+		t.Fatalf("AppendMessage failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	session, err := dh.OpenForRead(0)
+	if err != nil {
+		t.Fatalf("OpenForRead failed: %v", err)
+	}
+	if session == nil {
+		t.Fatal("OpenForRead returned nil session")
+	}
+	if dh.GetActiveReaders() != 1 {
+		t.Errorf("Expected 1 active reader, got %d", dh.GetActiveReaders())
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Session close failed: %v", err)
+	}
+	if dh.GetActiveReaders() != 0 {
+		t.Errorf("Expected 0 active readers after session close, got %d", dh.GetActiveReaders())
+	}
+	session, err = dh.OpenForRead(100)
+	if err == nil {
+		t.Fatal("OpenForRead for non-existent offset did not return error")
+	}
+	if session != nil {
+		_ = session.Close()
 	}
 }

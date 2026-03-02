@@ -7,7 +7,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/cluster/replication"
+	"github.com/cursus-io/cursus/util"
 )
 
 type LocalProcessor interface {
@@ -17,13 +17,13 @@ type LocalProcessor interface {
 type ClusterRouter struct {
 	LocalAddr      string
 	brokerID       string
-	rm             *replication.RaftReplicationManager
+	rm             RaftManager
 	clientPort     int
 	timeout        time.Duration
 	localProcessor LocalProcessor
 }
 
-func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm *replication.RaftReplicationManager, clientPort int) *ClusterRouter {
+func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm RaftManager, clientPort int) *ClusterRouter {
 	return &ClusterRouter{
 		brokerID:       brokerID,
 		LocalAddr:      localAddr,
@@ -44,11 +44,12 @@ func (r *ClusterRouter) getLeader() (string, error) {
 
 func (r *ClusterRouter) ForwardToLeader(req string) (string, error) {
 	leader, err := r.getLeader()
-	if err != nil {
-		return "", err
+	if r.rm.IsLeader() || (leader != "" && leader == r.LocalAddr) {
+		return r.processLocally(req), nil
 	}
 
-	if r.rm.IsLeader() || leader == r.LocalAddr {
+	if err != nil || leader == "" {
+		util.Debug("Leader unknown, attempting local processing as fallback")
 		return r.processLocally(req), nil
 	}
 
@@ -58,7 +59,11 @@ func (r *ClusterRouter) ForwardToLeader(req string) (string, error) {
 	}
 
 	clientLeaderAddr := fmt.Sprintf("%s:%d", host, r.clientPort)
-	return r.sendRequest(clientLeaderAddr, req)
+	resp, err := r.sendRequest(clientLeaderAddr, req)
+	if err != nil {
+		return "", fmt.Errorf("failed to forward request to leader at %s: %w", clientLeaderAddr, err)
+	}
+	return resp, nil
 }
 
 func (r *ClusterRouter) ForwardDataToLeader(data []byte) (string, error) {

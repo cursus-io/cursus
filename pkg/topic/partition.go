@@ -6,11 +6,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/downfa11-org/cursus/pkg/config"
-	"github.com/downfa11-org/cursus/pkg/disk"
-	"github.com/downfa11-org/cursus/pkg/stream"
-	"github.com/downfa11-org/cursus/pkg/types"
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 // Partition handles messages for one shard of a topic.
@@ -24,11 +23,11 @@ type Partition struct {
 	mu            sync.RWMutex
 	dh            types.StorageHandler
 	closed        bool
-	streamManager *stream.StreamManager
+	streamManager StreamManager
 }
 
 // NewPartition creates a partition instance.
-func NewPartition(id int, topic string, dh types.StorageHandler, sm *stream.StreamManager, cfg *config.Config) *Partition {
+func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManager, cfg *config.Config) *Partition {
 	bufSize := DefaultBufSize
 	if cfg != nil && cfg.BroadcastChannelBufferSize > 0 {
 		bufSize = cfg.BroadcastChannelBufferSize
@@ -225,6 +224,10 @@ func (p *Partition) GetLatestOffset() uint64 {
 		return 0
 	}
 	return p.dh.GetLatestOffset()
+}
+
+func (p *Partition) ID() int {
+	return p.id
 }
 
 // NextOffset returns the next available offset in the partition (Log End Offset).

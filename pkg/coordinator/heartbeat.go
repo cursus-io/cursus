@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/downfa11-org/cursus/util"
+	"github.com/cursus-io/cursus/util"
 )
 
 // monitorHeartbeats checks consumer heartbeat intervals and triggers rebalancing when timeouts occur.
