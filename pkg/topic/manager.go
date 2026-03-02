@@ -22,8 +22,6 @@ type StreamManager interface {
 
 type TopicManager struct {
 	topics        map[string]*Topic
-	DedupMap      sync.Map
-	cleanupInt    time.Duration
 	stopCh        chan struct{}
 	hp            HandlerProvider
 	mu            sync.RWMutex
@@ -42,20 +40,13 @@ func (tm *TopicManager) SetCoordinator(cd *coordinator.Coordinator) {
 }
 
 func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *TopicManager {
-	cleanupSec := cfg.CleanupInterval
-	if cleanupSec <= 0 {
-		cleanupSec = 60
-	}
-
 	tm := &TopicManager{
 		topics:        make(map[string]*Topic),
-		cleanupInt:    time.Duration(cleanupSec) * time.Second,
 		stopCh:        make(chan struct{}),
 		hp:            hp,
 		cfg:           cfg,
 		StreamManager: sm,
 	}
-	go tm.cleanupLoop()
 	return tm
 }
 
@@ -155,10 +146,6 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 			continue
 		}
 
-		if tm.checkAndMarkDuplicate(topicName, partition, &msg) {
-			util.Debug("Duplicate message detected: topic: %s, partition=%d, seqNum=%d", topicName, partition, msg.SeqNum)
-			continue
-		}
 		partitioned[partition] = append(partitioned[partition], msg)
 	}
 
@@ -225,11 +212,6 @@ func (tm *TopicManager) publishInternal(topicName string, partition int, msg *ty
 	util.Debug("Starting publish. Topic: %s, RequireAck: %v, ProducerID: %s, SeqNum: %d", topicName, requireAck, msg.ProducerID, msg.SeqNum)
 	start := time.Now()
 
-	if tm.checkAndMarkDuplicate(topicName, partition, msg) {
-		util.Debug("Duplicate message detected. topic: %s, partition=%d, producerID=%s, seqNum=%d", topicName, partition, msg.ProducerID, msg.SeqNum)
-		return nil
-	}
-
 	t := tm.GetTopic(topicName)
 	if t == nil {
 		util.Warn("tm: topic '%s' does not exist", topicName)
@@ -238,9 +220,6 @@ func (tm *TopicManager) publishInternal(topicName string, partition int, msg *ty
 
 	if requireAck {
 		if err := t.PublishSync(*msg); err != nil {
-			// Allow safe retry with same message
-			dedupKey := tm.getDedupKey(topicName, partition, msg)
-			tm.DedupMap.Delete(dedupKey)
 			return fmt.Errorf("sync publish failed: %w", err)
 		}
 	} else {
@@ -295,30 +274,6 @@ func (tm *TopicManager) Stop() {
 	close(tm.stopCh)
 }
 
-func (tm *TopicManager) cleanupLoop() {
-	ticker := time.NewTicker(tm.cleanupInt)
-	for {
-		select {
-		case <-ticker.C:
-			tm.CleanupDedup()
-		case <-tm.stopCh:
-			ticker.Stop()
-			return
-		}
-	}
-}
-
-func (tm *TopicManager) CleanupDedup() {
-	expireBefore := time.Now().Add(-30 * time.Minute)
-	tm.DedupMap.Range(func(key, value any) bool {
-		if ts, ok := value.(time.Time); ok && ts.Before(expireBefore) {
-			tm.DedupMap.Delete(key)
-			metrics.CleanupCount.Inc()
-		}
-		return true
-	})
-}
-
 func (tm *TopicManager) DeleteTopic(name string) bool {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
@@ -349,17 +304,3 @@ func (tm *TopicManager) EnsureDefaultGroups() {
 	}
 }
 
-func (tm *TopicManager) getDedupKey(topicName string, _ int, msg *types.Message) string {
-	if msg.ProducerID != "" && msg.SeqNum > 0 {
-		return fmt.Sprintf("%s-%s-%d", topicName, msg.ProducerID, msg.SeqNum)
-	}
-	return fmt.Sprintf("%s-%s", topicName, msg.Payload)
-}
-
-func (tm *TopicManager) checkAndMarkDuplicate(topicName string, partition int, msg *types.Message) bool {
-	dedupKey := tm.getDedupKey(topicName, partition, msg)
-	if _, loaded := tm.DedupMap.LoadOrStore(dedupKey, time.Now()); loaded {
-		return true
-	}
-	return false
-}

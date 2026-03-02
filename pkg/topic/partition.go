@@ -86,6 +86,9 @@ func (p *Partition) Enqueue(msg types.Message) {
 
 	msg.Offset = offset
 	p.LEO.Store(offset + 1)
+	if p.HWM < offset+1 {
+		p.HWM = offset + 1
+	}
 
 	p.NotifyNewMessage()
 	p.enqueueToBroadcast(msg)
@@ -104,6 +107,9 @@ func (p *Partition) EnqueueSync(msg types.Message) error {
 	}
 	msg.Offset = offset
 	p.LEO.Store(offset + 1)
+	if p.HWM < offset+1 {
+		p.HWM = offset + 1
+	}
 
 	p.NotifyNewMessage()
 	p.enqueueToBroadcast(msg)
@@ -127,6 +133,9 @@ func (p *Partition) EnqueueBatchSync(msgs []types.Message) error {
 		}
 		msgs[i].Offset = offset
 		p.LEO.Store(offset + 1)
+		if p.HWM < offset+1 {
+			p.HWM = offset + 1
+		}
 		p.enqueueToBroadcast(msgs[i])
 	}
 	p.NotifyNewMessage()
@@ -150,6 +159,9 @@ func (p *Partition) EnqueueBatch(msgs []types.Message) error {
 
 		msgs[i].Offset = offset
 		p.LEO.Store(offset + 1)
+		if p.HWM < offset+1 {
+			p.HWM = offset + 1
+		}
 		p.enqueueToBroadcast(msgs[i])
 	}
 	p.NotifyNewMessage()
@@ -237,6 +249,19 @@ func (p *Partition) NextOffset() uint64 {
 
 func (p *Partition) ReserveOffsets(count int) uint64 {
 	return p.LEO.Add(uint64(count)) - uint64(count)
+}
+
+func (p *Partition) SetHWM(hwm uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if hwm > p.HWM {
+		p.HWM = hwm
+		p.NotifyNewMessage()
+	}
+}
+
+func (p *Partition) UpdateLEO(leo uint64) {
+	p.LEO.Store(leo)
 }
 
 // Close shuts down the partition.
