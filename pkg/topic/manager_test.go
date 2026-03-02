@@ -108,7 +108,6 @@ func TestNewTopicManager(t *testing.T) {
 
 	assert.NotNil(t, tm)
 	assert.NotNil(t, tm.topics)
-	assert.Equal(t, time.Duration(cfg.CleanupInterval)*time.Second, tm.cleanupInt)
 	assert.NotNil(t, tm.stopCh)
 	assert.Equal(t, hp, tm.hp)
 	assert.Equal(t, cfg, tm.cfg)
@@ -119,7 +118,7 @@ func TestNewTopicManager(t *testing.T) {
 	case <-tm.stopCh:
 		// success
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("cleanupLoop didn't stop in time")
+		t.Fatal("stopCh was not closed")
 	}
 }
 
