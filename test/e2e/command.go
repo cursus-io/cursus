@@ -22,9 +22,12 @@ func (bc *BrokerClient) CreateTopic(topic string, partitions int) error {
 }
 
 // PublishIdempotent sends a message with idempotence metadata
-func (bc *BrokerClient) PublishIdempotent(topic, producerID string, seqNum uint64, epoch int64, payload, acks string) error {
+func (bc *BrokerClient) PublishIdempotent(topic, producerID string, seqNum uint64, epoch int64, payload, acks string, isIdempotent bool) error {
 	publishCmd := fmt.Sprintf("PUBLISH topic=%s acks=%s producerId=%s seqNum=%d epoch=%d message=%s",
 		topic, acks, producerID, seqNum, epoch, payload)
+	if isIdempotent {
+		publishCmd += " isIdempotent=true"
+	}
 
 	if acks == "0" {
 		addr, err := bc.getPrimaryAddr()

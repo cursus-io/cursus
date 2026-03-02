@@ -54,6 +54,7 @@ func (a *Actions) PublishMessages() *Actions {
 			time.Now().UnixNano(),
 			payload,
 			a.ctx.acks,
+			a.ctx.isIdempotent,
 		)
 
 		if err != nil {
@@ -88,6 +89,7 @@ func (a *Actions) RetryPublishMessages() *Actions {
 			time.Now().UnixNano(),
 			payload,
 			a.ctx.acks,
+			a.ctx.isIdempotent,
 		)
 
 		if err != nil {
