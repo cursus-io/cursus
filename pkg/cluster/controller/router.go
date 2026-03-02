@@ -54,15 +54,43 @@ func (r *ClusterRouter) ForwardToLeader(req string) (string, error) {
 		return "", fmt.Errorf("node marked as leader in Raft but IsLeader() is false (transitioning?)")
 	}
 
-	host, _, splitErr := net.SplitHostPort(leader)
-	if splitErr != nil {
-		return "", fmt.Errorf("invalid leader address format: %w", splitErr)
+	return r.forwardWithTimeout(leader, req)
+}
+
+func (r *ClusterRouter) ForwardToPartitionLeader(topic string, partition int, req string) (string, error) {
+	fsm := r.rm.GetFSM()
+	if fsm == nil {
+		return r.ForwardToLeader(req)
 	}
 
-	clientLeaderAddr := fmt.Sprintf("%s:%d", host, r.clientPort)
-	resp, err := r.sendRequest(clientLeaderAddr, req)
+	partitionKey := fmt.Sprintf("%s-%d", topic, partition)
+	meta := fsm.GetPartitionMetadata(partitionKey)
+	if meta == nil {
+		return r.ForwardToLeader(req)
+	}
+
+	if meta.Leader == r.brokerID {
+		return r.processLocally(req), nil
+	}
+
+	broker := fsm.GetBroker(meta.Leader)
+	if broker == nil {
+		return "", fmt.Errorf("partition leader broker %s not found in registry", meta.Leader)
+	}
+
+	return r.forwardWithTimeout(broker.Addr, req)
+}
+
+func (r *ClusterRouter) forwardWithTimeout(addr, req string) (string, error) {
+	host, _, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil {
+		return "", fmt.Errorf("invalid address format %s: %w", addr, splitErr)
+	}
+
+	clientAddr := fmt.Sprintf("%s:%d", host, r.clientPort)
+	resp, err := r.sendRequest(clientAddr, req)
 	if err != nil {
-		return "", fmt.Errorf("failed to forward request to leader at %s: %w", clientLeaderAddr, err)
+		return "", fmt.Errorf("failed to forward request to %s: %w", clientAddr, err)
 	}
 	return resp, nil
 }
@@ -77,13 +105,41 @@ func (r *ClusterRouter) ForwardDataToLeader(data []byte) (string, error) {
 		return "", fmt.Errorf("internal routing error: cannot forward batch data to self")
 	}
 
-	host, _, splitErr := net.SplitHostPort(leader)
-	if splitErr != nil {
-		return "", fmt.Errorf("invalid leader address format: %w", splitErr)
+	return r.forwardDataWithTimeout(leader, data)
+}
+
+func (r *ClusterRouter) ForwardDataToPartitionLeader(topic string, partition int, data []byte) (string, error) {
+	fsm := r.rm.GetFSM()
+	if fsm == nil {
+		return r.ForwardDataToLeader(data)
 	}
 
-	clientLeaderAddr := fmt.Sprintf("%s:%d", host, r.clientPort)
-	return r.sendDataRequest(clientLeaderAddr, data)
+	partitionKey := fmt.Sprintf("%s-%d", topic, partition)
+	meta := fsm.GetPartitionMetadata(partitionKey)
+	if meta == nil {
+		return r.ForwardDataToLeader(data)
+	}
+
+	if meta.Leader == r.brokerID {
+		return "", fmt.Errorf("internal routing error: current node is leader for partition %s", partitionKey)
+	}
+
+	broker := fsm.GetBroker(meta.Leader)
+	if broker == nil {
+		return "", fmt.Errorf("partition leader broker %s not found in registry", meta.Leader)
+	}
+
+	return r.forwardDataWithTimeout(broker.Addr, data)
+}
+
+func (r *ClusterRouter) forwardDataWithTimeout(addr string, data []byte) (string, error) {
+	host, _, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil {
+		return "", fmt.Errorf("invalid address format %s: %w", addr, splitErr)
+	}
+
+	clientAddr := fmt.Sprintf("%s:%d", host, r.clientPort)
+	return r.sendDataRequest(clientAddr, data)
 }
 
 func (r *ClusterRouter) processLocally(req string) string {
@@ -97,7 +153,6 @@ func (r *ClusterRouter) sendRequest(addr, command string) (string, error) {
 	return r.sendDataRequest(addr, []byte(command))
 }
 
-// sendDataRequest sends raw data (byte slice) to the specified address and expects a response string.
 func (r *ClusterRouter) sendDataRequest(addr string, data []byte) (string, error) {
 	conn, err := net.DialTimeout("tcp", addr, r.timeout)
 	if err != nil {
@@ -125,7 +180,6 @@ func (r *ClusterRouter) sendDataRequest(addr string, data []byte) (string, error
 	}
 
 	respLen := binary.BigEndian.Uint32(respLenBuf)
-
 	if respLen == 0 {
 		return "", nil
 	}

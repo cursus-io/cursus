@@ -65,6 +65,19 @@ func (f *BrokerFSM) applyBatchOffsetSyncCommand(jsonData string) interface{} {
 		return err
 	}
 
+	// update HWM for partitions
+	if f.tm != nil {
+		topic := f.tm.GetTopic(cmd.Topic)
+		if topic != nil {
+			for _, item := range cmd.Offsets {
+				p, err := topic.GetPartition(item.Partition)
+				if err == nil {
+					p.SetHWM(item.Offset)
+				}
+			}
+		}
+	}
+
 	if len(cmd.Offsets) > 0 {
 		first := cmd.Offsets[0]
 		last := cmd.Offsets[len(cmd.Offsets)-1]
