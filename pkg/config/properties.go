@@ -7,10 +7,16 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cursus-io/cursus/util"
 	"gopkg.in/yaml.v3"
+)
+
+var (
+	defaultConfig *Config
+	defaultOnce   sync.Once
 )
 
 type ConsumerGroupConfig struct {
@@ -83,60 +89,77 @@ type Config struct {
 }
 
 func DefaultConfig() *Config {
-	return &Config{
-		BrokerPort:      9000,
-		HealthCheckPort: 9080,
-		EnableExporter:  true,
-		ExporterPort:    9100,
-		LogLevel:        util.LogLevelInfo,
+	defaultOnce.Do(func() {
+		defaultConfig = &Config{
+			BrokerPort:      9000,
+			HealthCheckPort: 9080,
+			EnableExporter:  true,
+			ExporterPort:    9100,
+			LogLevel:        util.LogLevelInfo,
 
-		// disk storage
-		LogDir:              "broker-logs",
-		DiskFlushBatchSize:  50,
-		DiskFlushIntervalMS: 500,
-		DiskWriteTimeoutMS:  10,
-		LingerMS:            50,
-		CompressionType:     "none",
+			// disk storage
+			LogDir:              "broker-logs",
+			DiskFlushBatchSize:  50,
+			DiskFlushIntervalMS: 500,
+			DiskWriteTimeoutMS:  10,
+			LingerMS:            50,
+			CompressionType:     "none",
 
-		// log segment & retention
-		CleanupInterval:           300,
-		SegmentSize:               1 * 1024 * 1024 * 1024,  // 1GB
-		SegmentRollTimeMS:         7 * 24 * 60 * 60 * 1000, // 7day
-		IndexSize:                 10 * 1024 * 1024,        // 10MB
-		IndexIntervalBytes:        4096,
-		CleanupPolicy:             "delete", // delete, compact
-		RetentionHours:            168,
-		RetentionBytes:            -1,
-		RetentionCheckIntervalMS:  300000,
-		CompactionCheckIntervalMS: 300000,
-		MinCleanableDirtyRatio:    0.5,
+			// log segment & retention
+			CleanupInterval:           300,
+			SegmentSize:               1 * 1024 * 1024 * 1024,  // 1GB
+			SegmentRollTimeMS:         7 * 24 * 60 * 60 * 1000, // 7day
+			IndexSize:                 10 * 1024 * 1024,        // 10MB
+			IndexIntervalBytes:        4096,
+			CleanupPolicy:             "delete", // delete, compact
+			RetentionHours:            168,
+			RetentionBytes:            -1,
+			RetentionCheckIntervalMS:  300000,
+			CompactionCheckIntervalMS: 300000,
+			MinCleanableDirtyRatio:    0.5,
 
-		// internal channels
-		ChannelBufferSize:          1024,
-		PartitionChannelBufSize:    10000,
-		ConsumerChannelBufSize:     1000,
-		BroadcastChannelBufferSize: 10000,
+			// internal channels
+			ChannelBufferSize:          1024,
+			PartitionChannelBufSize:    10000,
+			ConsumerChannelBufSize:     1000,
+			BroadcastChannelBufferSize: 10000,
 
-		// distributed cluster
-		EnabledDistribution:  false,
-		RaftPort:             9001,
-		DiscoveryPort:        8000,
-		RaftPeers:            []string{},
-		StaticClusterMembers: []string{},
-		BootstrapCluster:     false,
-		AdvertisedHost:       "localhost",
-		MinInSyncReplicas:    2,
+			// distributed cluster
+			EnabledDistribution:  false,
+			RaftPort:             9001,
+			DiscoveryPort:        8000,
+			RaftPeers:            []string{},
+			StaticClusterMembers: []string{},
+			BootstrapCluster:     false,
+			AdvertisedHost:       "localhost",
+			MinInSyncReplicas:    2,
 
-		// consumer
-		ConsumerSessionTimeoutMS: 10000,
-		ConsumerHeartbeatCheckMS: 5000,
+			// consumer
+			ConsumerSessionTimeoutMS: 10000,
+			ConsumerHeartbeatCheckMS: 5000,
 
-		// stream
-		MaxStreamConnections:    1000,
-		StreamTimeout:           30 * time.Minute,
-		StreamHeartbeatInterval: 3 * time.Second,
-		StreamCommitInterval:    5 * time.Second,
+			// stream
+			MaxStreamConnections:    1000,
+			StreamTimeout:           30 * time.Minute,
+			StreamHeartbeatInterval: 3 * time.Second,
+			StreamCommitInterval:    5 * time.Second,
+		}
+	})
+
+	cfgCopy := *defaultConfig
+	if defaultConfig.RaftPeers != nil {
+		cfgCopy.RaftPeers = make([]string, len(defaultConfig.RaftPeers))
+		copy(cfgCopy.RaftPeers, defaultConfig.RaftPeers)
 	}
+	if defaultConfig.StaticClusterMembers != nil {
+		cfgCopy.StaticClusterMembers = make([]string, len(defaultConfig.StaticClusterMembers))
+		copy(cfgCopy.StaticClusterMembers, defaultConfig.StaticClusterMembers)
+	}
+	if defaultConfig.StaticConsumerGroups != nil {
+		cfgCopy.StaticConsumerGroups = make([]ConsumerGroupConfig, len(defaultConfig.StaticConsumerGroups))
+		copy(cfgCopy.StaticConsumerGroups, defaultConfig.StaticConsumerGroups)
+	}
+	return &cfgCopy
 }
 
 func LoadConfig() (*Config, error) {
