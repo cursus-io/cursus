@@ -1,12 +1,26 @@
 package e2e_cluster
 
 import (
+	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/cursus-io/cursus/test/e2e"
 )
+
+type partitionMetadata struct {
+	ID       int      `json:"id"`
+	Leader   string   `json:"leader"`
+	Replicas []string `json:"replicas"`
+	ISR      []string `json:"isr"`
+	LEO      uint64   `json:"leo"`
+	HWM      uint64   `json:"hwm"`
+}
+
+type topicMetadata struct {
+	Topic      string              `json:"topic"`
+	Partitions []partitionMetadata `json:"partitions"`
+}
 
 // ISRMaintained verifies ISR is maintained during operations
 func ISRMaintained() e2e.Expectation {
@@ -17,11 +31,16 @@ func ISRMaintained() e2e.Expectation {
 		if err != nil {
 			return err
 		}
-		if !strings.Contains(resp, "\"isr\":") {
-			return fmt.Errorf("ISR info not found in metadata")
+
+		var meta topicMetadata
+		if err := json.Unmarshal([]byte(resp), &meta); err != nil {
+			return fmt.Errorf("failed to parse metadata: %w (resp: %s)", err, resp)
 		}
-		if strings.Contains(resp, "\"isr\": []") {
-			return fmt.Errorf("ISR is empty")
+
+		for _, p := range meta.Partitions {
+			if len(p.ISR) == 0 {
+				return fmt.Errorf("ISR is empty for partition %d", p.ID)
+			}
 		}
 		return nil
 	}
@@ -35,13 +54,19 @@ func LeaderChanged(oldLeader string) e2e.Expectation {
 		if err != nil {
 			return err
 		}
-		if strings.Contains(resp, "ERROR:") {
-			return fmt.Errorf("metadata fetch failed: %s", resp)
+
+		var meta topicMetadata
+		if err := json.Unmarshal([]byte(resp), &meta); err != nil {
+			return fmt.Errorf("failed to parse metadata: %w (resp: %s)", err, resp)
 		}
-		if oldLeader != "" && strings.Contains(resp, fmt.Sprintf("\"leader\": \"%s\"", oldLeader)) {
-			return fmt.Errorf("leader has not changed from %s", oldLeader)
+
+		for _, p := range meta.Partitions {
+			if oldLeader != "" && p.Leader == oldLeader {
+				return fmt.Errorf("leader for partition %d has not changed from %s", p.ID, oldLeader)
+			}
 		}
-		ctx.GetT().Logf("Verified leader change: %s", resp)
+
+		ctx.GetT().Logf("Verified leader change for all partitions")
 		return nil
 	}
 }
@@ -58,13 +83,17 @@ func ExpectDataConsistent() e2e.Expectation {
 			return fmt.Errorf("failed to describe topic for consistency check: %w", err)
 		}
 
-		if strings.Contains(resp, "ERROR:") {
-			return fmt.Errorf("broker error in DESCRIBE: %s", resp)
+		var meta topicMetadata
+		if err := json.Unmarshal([]byte(resp), &meta); err != nil {
+			return fmt.Errorf("failed to parse metadata: %w (resp: %s)", err, resp)
 		}
 
 		if ctx.GetPublishedCount() > 0 {
-			if !strings.Contains(resp, "\"leo\":") {
-				return fmt.Errorf("consistency check failed: LEO not found in metadata")
+			expectedLEO := uint64(ctx.GetPublishedCount())
+			for _, p := range meta.Partitions {
+				if p.LEO < expectedLEO {
+					return fmt.Errorf("consistency check failed: partition %d LEO (%d) < expected (%d)", p.ID, p.LEO, expectedLEO)
+				}
 			}
 		}
 

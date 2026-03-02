@@ -317,6 +317,11 @@ func writeResponseWithTimeout(conn net.Conn, msg string, timeout time.Duration) 
 		util.Error("⚠️ SetWriteDeadline error: %v", err)
 		return
 	}
+	defer func() {
+		if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+			util.Error("Failed to reset write deadline: %v", err)
+		}
+	}()
 
 	if _, err := conn.Write(respLen); err != nil {
 		util.Error("⚠️ Write length error: %v", err)
@@ -325,9 +330,6 @@ func writeResponseWithTimeout(conn net.Conn, msg string, timeout time.Duration) 
 	if _, err := conn.Write(resp); err != nil {
 		util.Error("⚠️ Write response error: %v", err)
 		return
-	}
-	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
-		util.Error("Failed to reset write deadline: %v", err)
 	}
 }
 

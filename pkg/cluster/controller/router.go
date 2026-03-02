@@ -6,8 +6,6 @@ import (
 	"io"
 	"net"
 	"time"
-
-	"github.com/cursus-io/cursus/util"
 )
 
 type LocalProcessor interface {
@@ -44,13 +42,16 @@ func (r *ClusterRouter) getLeader() (string, error) {
 
 func (r *ClusterRouter) ForwardToLeader(req string) (string, error) {
 	leader, err := r.getLeader()
-	if r.rm.IsLeader() || (leader != "" && leader == r.LocalAddr) {
+	if r.rm.IsLeader() {
 		return r.processLocally(req), nil
 	}
 
 	if err != nil || leader == "" {
-		util.Debug("Leader unknown, attempting local processing as fallback")
-		return r.processLocally(req), nil
+		return "", fmt.Errorf("leader unknown, cannot process command: %w", err)
+	}
+
+	if leader == r.LocalAddr {
+		return "", fmt.Errorf("node marked as leader in Raft but IsLeader() is false (transitioning?)")
 	}
 
 	host, _, splitErr := net.SplitHostPort(leader)

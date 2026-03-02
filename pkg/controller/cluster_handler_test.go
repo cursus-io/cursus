@@ -53,8 +53,8 @@ func TestCommandHandler_isLeaderAndForward_WaitRetry(t *testing.T) {
 
 	ready := make(chan struct{})
 	go func() {
-		close(ready)
 		rm.leaderAddress.Store("localhost:7001")
+		close(ready)
 	}()
 
 	<-ready

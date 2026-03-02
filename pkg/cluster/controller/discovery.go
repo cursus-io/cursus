@@ -103,8 +103,13 @@ func (sd *serviceDiscovery) AddNode(nodeID string, addr string) (string, error) 
 	}
 
 	if err := sd.rm.ApplyCommand("REGISTER", data); err != nil {
-		util.Error("REGISTER command failed after AddVoter. Raft cluster and FSM are now inconsistent: id=%s err=%v", nodeID, err)
-		return leaderAddr, fmt.Errorf("REGISTER command failed: %w", err)
+		util.Error("REGISTER command failed after AddVoter. Attempting rollback: id=%s err=%v", nodeID, err)
+		if rollbackErr := sd.rm.RemoveServer(nodeID); rollbackErr != nil {
+			util.Error("CRITICAL: Rollback RemoveServer failed after REGISTER failure: id=%s err=%v", nodeID, rollbackErr)
+		} else {
+			util.Info("Successfully rolled back AddVoter for node %s", nodeID)
+		}
+		return leaderAddr, fmt.Errorf("REGISTER command failed (rolled back): %w", err)
 	}
 
 	return leaderAddr, nil

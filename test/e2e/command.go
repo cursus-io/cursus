@@ -75,6 +75,10 @@ func (bc *BrokerClient) GetConsumerGroupStatus(groupID string) (*ConsumerGroupSt
 		return nil, err
 	}
 
+	if strings.HasPrefix(respStr, "ERROR:") {
+		return nil, fmt.Errorf("broker error: %s", respStr)
+	}
+
 	var status ConsumerGroupStatus
 	if err := json.Unmarshal([]byte(respStr), &status); err != nil {
 		return nil, fmt.Errorf("parse response: %w", err)
@@ -123,6 +127,9 @@ func (bc *BrokerClient) FetchCommittedOffset(topic string, partition int, groupI
 	respStr, err := bc.SendCommand("admin", cmd, 2*time.Second)
 	if err != nil {
 		return 0, err
+	}
+	if strings.HasPrefix(respStr, "ERROR:") {
+		return 0, fmt.Errorf("broker error: %s", respStr)
 	}
 
 	var offset uint64

@@ -58,7 +58,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 	}
 
 	tm := ch.TopicManager
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -96,7 +96,7 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 		return "missing topic parameter. Expected: DELETE topic=<name>"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -120,7 +120,7 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 
 // handleList processes LIST command
 func (ch *CommandHandler) handleList() string {
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward("LIST"); forwarded {
 			return resp
 		}
@@ -189,7 +189,7 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 	consumerID = fmt.Sprintf("%s-%s", consumerID, randSuffix)
 
 	var assignments []int
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -256,7 +256,7 @@ func (ch *CommandHandler) handleSyncGroup(cmd string) string {
 		return "coordinator not available"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -286,7 +286,7 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 		return "LEAVE_GROUP requires member parameter"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -332,7 +332,7 @@ func (ch *CommandHandler) handleFetchOffset(cmd string) string {
 		return "FETCH_OFFSET requires group parameter"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -374,7 +374,7 @@ func (ch *CommandHandler) handleGroupStatus(cmd string) string {
 		return "coordinator not available"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -409,7 +409,7 @@ func (ch *CommandHandler) handleHeartbeat(cmd string) string {
 		return "HEARTBEAT requires member parameter"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -456,7 +456,7 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 		return "invalid offset"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -504,7 +504,7 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 	memberID := args["member"]
 	generation, _ := strconv.Atoi(args["generation"])
 
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -538,7 +538,7 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 			continue
 		}
 
-		if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+		if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 			if !ch.isAuthorizedForPartition(topicName, p) {
 				util.Warn("Unauthorized batch commit attempt for %s:%d", topicName, p)
 				continue
@@ -558,7 +558,7 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 		return "ERROR: no_valid_offsets"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		batchCommitData := map[string]interface{}{
 			"type":    "BATCH_COMMIT",
 			"group":   groupID,
@@ -652,7 +652,7 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 		return "missing topic parameter. Expected: DESCRIBE topic=<name>"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster.RaftManager != nil {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}

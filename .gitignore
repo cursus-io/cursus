@@ -15,5 +15,3 @@ coverage-server/
 *.out
 
 bin/
-
-$coverfile
