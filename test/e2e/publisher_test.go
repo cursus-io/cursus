@@ -67,6 +67,7 @@ func TestIdempotentProducer(t *testing.T) {
 	ctx.WithTopic("idempotent-test").
 		WithPartitions(1).
 		WithNumMessages(5).
+		WithIdempotent(true).
 		When().
 		StartBroker().
 		CreateTopic().
@@ -77,7 +78,8 @@ func TestIdempotentProducer(t *testing.T) {
 		SyncGroup().
 		ConsumeMessages().
 		Then().
-		Expect(MessagesConsumed(5))
+		Expect(MessagesConsumed(5)).
+		And(NoDuplicateMessages())
 }
 
 // TestPublisherAcks verifies different ACK modes

@@ -1,14 +1,23 @@
+# Publisher
 broker_addrs:  
   - "broker:9000" 
-enable_benchmark: true
-log_level: "info"
-max_retries: 1
-retry_backoff_ms: 50
+log_level: "info" # debug, info, warn, error
 
-acks: "1"
+# Performance
 num_messages: 100000
 partitions: 12
 max_inflight_requests: 10
 batch_size: 10000
 buffer_size: 70000
 linger_ms: 100
+
+# Idempotency
+acks: "1" # "0" (no ack), "1" (leader only), "all" or "-1" (quorum)
+enable_idempotence: false
+
+# Retry
+max_retries: 3
+retry_backoff_ms: 100
+
+# Benchmark
+enable_benchmark: true

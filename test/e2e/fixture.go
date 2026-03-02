@@ -40,6 +40,7 @@ type TestContext struct {
 	seqNum           uint64
 	publishedSeqNums []uint64
 	acks             string
+	isIdempotent     bool
 
 	// Consumer state
 	memberID           string
@@ -261,6 +262,11 @@ func (ctx *TestContext) WithAcks(acks string) *TestContext {
 
 func (ctx *TestContext) WithConsumerGroup(group string) *TestContext {
 	ctx.consumerGroup = group
+	return ctx
+}
+
+func (ctx *TestContext) WithIdempotent(enabled bool) *TestContext {
+	ctx.isIdempotent = enabled
 	return ctx
 }
 

@@ -26,8 +26,9 @@ type ProducerState struct {
 }
 
 type ProducerClient struct {
-	ID           string
-	globalSeqNum atomic.Uint64
+	ID               string
+	globalSeqNum     atomic.Uint64
+	partitionSeqNums sync.Map // int -> *atomic.Uint64
 
 	Epoch  int64
 	mu     sync.RWMutex
@@ -53,7 +54,12 @@ func NewProducerClient(partitions int, config *config.PublisherConfig) *Producer
 }
 
 func (pc *ProducerClient) NextSeqNum(partition int) uint64 {
-	return pc.globalSeqNum.Add(1)
+	if !pc.config.EnableIdempotence {
+		return pc.globalSeqNum.Add(1)
+	}
+
+	val, _ := pc.partitionSeqNums.LoadOrStore(partition, &atomic.Uint64{})
+	return val.(*atomic.Uint64).Add(1)
 }
 
 func (pc *ProducerClient) connectPartitionLocked(idx int, addr string, useTLS bool, certPath, keyPath string) error {
