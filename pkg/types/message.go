@@ -21,12 +21,13 @@ func (m Message) String() string {
 }
 
 type Batch struct {
-	Topic      string
-	Partition  int
-	BatchStart uint64
-	BatchEnd   uint64
-	Acks       string // "0", "1", "-1(=all)"
-	Messages   []Message
+	Topic        string
+	Partition    int
+	BatchStart   uint64
+	BatchEnd     uint64
+	Acks         string // "0", "1", "-1(=all)"
+	IsIdempotent bool
+	Messages     []Message
 }
 
 // DiskMessage represents a message stored on disk with full metadata
