@@ -39,10 +39,28 @@ func (f *FakeHandlerProvider) GetHandler(t string, p int) (types.StorageHandler,
 	return &MockStorageHandler{}, nil
 }
 
-type MockCommandApplier struct{}
+type MockCommandApplier struct {
+	IsLeaderResult bool
+	fsm            *fsm.BrokerFSM
+}
 
-func (m *MockCommandApplier) ApplyCommand(prefix string, data []byte) error { return nil }
-func (m *MockCommandApplier) IsLeader() bool                               { return false }
+func (m *MockCommandApplier) ApplyCommand(prefix string, data []byte) error {
+	if prefix == "PARTITION" {
+		// ISRManager passes JSON metadata, but FSM expects "TOPIC-PARTITION:JSON"
+		// We need to construct the full command data
+		topicName := "test-topic"
+		partitionID := 0
+		key := fmt.Sprintf("%s-%d", topicName, partitionID)
+		
+		fullData := fmt.Sprintf("PARTITION:%s:%s", key, string(data))
+		result := m.fsm.Apply(&raft.Log{Data: []byte(fullData)})
+		if err, ok := result.(error); ok {
+			return err
+		}
+	}
+	return nil
+}
+func (m *MockCommandApplier) IsLeader() bool { return m.IsLeaderResult }
 
 func TestISRManager_Quorum(t *testing.T) {
 	cfg := &config.Config{LogDir: t.TempDir()}
@@ -80,7 +98,6 @@ func TestISRManager_Quorum(t *testing.T) {
 		t.Fatalf("failed to apply TOPIC command: %v", err)
 	}
 
-	// For manual creation in tm if needed (Apply already handles it but let's be explicit if test expects it)
 	tm.CreateTopic(topicName, 1, false)
 
 	partitionMetadata := fsm.PartitionMetadata{
@@ -97,26 +114,33 @@ func TestISRManager_Quorum(t *testing.T) {
 		t.Fatalf("failed to apply PARTITION command: %v", err)
 	}
 
-	isrManager := NewISRManager(brokerFSM, "node1", 100*time.Millisecond, &MockCommandApplier{})
+	// Mock applier to act as leader and update FSM
+	applier := &MockCommandApplier{IsLeaderResult: true, fsm: brokerFSM}
+	isrManager := NewISRManager(brokerFSM, "node1", 100*time.Millisecond, applier)
 
+	// Heartbeat node1 & node2 only
 	isrManager.UpdateHeartbeat("node1")
 	isrManager.UpdateHeartbeat("node2")
+	
+	// ComputeISR calculates currentISR and should apply it to FSM via MockCommandApplier
 	isrManager.ComputeISR(topicName, partitionID)
 
 	if !isrManager.HasQuorum(topicName, partitionID, 2) {
 		t.Error("Expected quorum to be met (2 in ISR)")
 	}
 
-	// heartbeat timeout
-	time.Sleep(200 * time.Millisecond)
+	// heartbeat timeout simulation: wait and only heartbeat node1
+	time.Sleep(200 * time.Millisecond) 
 
 	isrManager.UpdateHeartbeat("node1")
 	isrManager.CleanStaleHeartbeats()
+	
+	// ComputeISR calculates [node1] and applies to FSM
 	isrManager.ComputeISR(topicName, partitionID)
 
 	isr := isrManager.GetISR(topicName, partitionID)
 	if len(isr) != 1 || isr[0] != "node1" {
-		t.Errorf("Expected ISR to be [node1], got %v", isr)
+		t.Errorf("Expected ISR to contain only node1, but got %v", isr)
 	}
 
 	if isrManager.HasQuorum(topicName, partitionID, 2) {

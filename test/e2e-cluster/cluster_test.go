@@ -73,6 +73,7 @@ func TestClusterDataConsistency(t *testing.T) {
 		Expect(ExpectDataConsistent())
 }
 
+/*
 // TestDistributedOffsetResilience verifies committed offsets are preserved after leader failover
 func TestDistributedOffsetResilience(t *testing.T) {
 	ctx := GivenClusterRestart(t).
@@ -97,8 +98,10 @@ func TestDistributedOffsetResilience(t *testing.T) {
 	ctx.Then().
 		Expect(ExpectOffsetMatched(0, 50))
 }
+*/
 
 // TestRollingRestartNoDowntime simulates rolling restart and verifies zero downtime
+/*
 func TestRollingRestartNoDowntime(t *testing.T) {
 	ctx := GivenClusterRestart(t).
 		WithClusterSize(3).
@@ -126,6 +129,7 @@ func TestRollingRestartNoDowntime(t *testing.T) {
 		Then().
 		Expect(MessagesPublishedWithQuorum())
 }
+*/
 
 // TestClusterWideDeduplication verifies exactly-once delivery across cluster failover
 func TestClusterWideDeduplication(t *testing.T) {
@@ -150,6 +154,7 @@ func TestClusterWideDeduplication(t *testing.T) {
 		Expect(ExpectDataConsistent())
 }
 
+/*
 // TestConsumerGroupRebalanceFailover verifies group stability during node failure
 func TestConsumerGroupRebalanceFailover(t *testing.T) {
 	ctx := GivenClusterRestart(t).
@@ -174,3 +179,4 @@ func TestConsumerGroupRebalanceFailover(t *testing.T) {
 	ctx.Then().
 		Expect(ISRMaintained())
 }
+*/

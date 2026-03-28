@@ -100,11 +100,11 @@ func TestBrokerFSM_Apply_Deregister(t *testing.T) {
 	fsm := newTestFSM()
 	fsm.brokers["b1"] = &BrokerInfo{ID: "b1"}
 
-	log := &raft.Log{Data: []byte("DEREGISTER:b1"), Index: 2}
+	log := &raft.Log{Data: []byte("DEREGISTER:{\"id\":\"b1\"}"), Index: 2}
 	fsm.Apply(log)
 
-	if len(fsm.GetBrokers()) != 0 {
-		t.Error("Broker not deregistered")
+	if fsm.brokers["b1"].Status != "inactive" {
+		t.Error("Broker not marked inactive")
 	}
 }
 
@@ -112,15 +112,15 @@ func TestBrokerFSM_Apply_Deregister_ReturnsNil(t *testing.T) {
 	fsm := newTestFSM()
 	fsm.brokers["b1"] = &BrokerInfo{ID: "b1"}
 
-	log := &raft.Log{Data: []byte("DEREGISTER:b1"), Index: 2}
+	log := &raft.Log{Data: []byte("DEREGISTER:{\"id\":\"b1\"}"), Index: 2}
 	result := fsm.Apply(log)
 
 	if result != nil {
 		t.Fatalf("DEREGISTER should return nil, got: %v", result)
 	}
 
-	if len(fsm.GetBrokers()) != 0 {
-		t.Fatal("broker not deregistered")
+	if fsm.brokers["b1"].Status != "inactive" {
+		t.Fatal("broker status not inactive")
 	}
 }
 
