@@ -174,6 +174,9 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 					}
 					return fmt.Errorf("out-of-order sequence (overlap) in global scope: lastSeq %d, firstMsg.SeqNum %d", lastSeq, firstMsg.SeqNum)
 				}
+				if firstMsg.SeqNum > uint64(lastSeq+1) {
+					return fmt.Errorf("idempotency gap in global scope for producer %s: expected %d, got %d", firstMsg.ProducerID, lastSeq+1, firstMsg.SeqNum)
+				}
 			} else if firstMsg.SeqNum > 1 {
 				return fmt.Errorf("idempotency error: first message in global scope for producer %s must have seqNum 1, got %d", firstMsg.ProducerID, firstMsg.SeqNum)
 			}

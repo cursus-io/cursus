@@ -28,6 +28,7 @@ type TopicManager struct {
 	cfg           *config.Config
 	StreamManager StreamManager
 	coordinator   *coordinator.Coordinator
+	producerState map[string]map[int]map[string]int64 // Topic -> Partition -> ProducerID -> LastSeq
 }
 
 // HandlerProvider defines an interface to provide disk handlers.
@@ -46,11 +47,12 @@ func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *
 		hp:            hp,
 		cfg:           cfg,
 		StreamManager: sm,
+		producerState: make(map[string]map[int]map[string]int64),
 	}
 	return tm
 }
 
-func (tm *TopicManager) CreateTopic(name string, partitionCount int) {
+func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent bool) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -70,7 +72,7 @@ func (tm *TopicManager) CreateTopic(name string, partitionCount int) {
 		}
 	}
 
-	t, err := NewTopic(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager)
+	t, err := NewTopic(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager, idempotent)
 	if err != nil {
 		util.Error("❌ failed to create topic '%s': %v\n", name, err)
 		return
@@ -139,6 +141,18 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 
 	for _, m := range messages {
 		msg := m
+
+		// Stand-alone idempotency check (Global scope support)
+		if msg.ProducerID != "" && msg.SeqNum > 0 {
+			tm.mu.Lock()
+			if tm.checkAndMarkDuplicate(topicName, -1, &msg) {
+				tm.mu.Unlock()
+				util.Debug("tm: skipping duplicate message (Global) in batch from producer %s (seq %d)", msg.ProducerID, msg.SeqNum)
+				continue
+			}
+			tm.mu.Unlock()
+		}
+
 		partition = t.GetPartitionForMessage(msg)
 		if partition == -1 {
 			util.Debug("tm: skipping message for topic '%s' (no valid partition found)", topicName)
@@ -208,7 +222,7 @@ func (tm *TopicManager) PublishBatchAsync(topicName string, messages []types.Mes
 	return tm.processBatchMessages(topicName, messages, true)
 }
 
-func (tm *TopicManager) publishInternal(topicName string, partition int, msg *types.Message, requireAck bool) error {
+func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Message, requireAck bool) error {
 	util.Debug("Starting publish. Topic: %s, RequireAck: %v, ProducerID: %s, SeqNum: %d", topicName, requireAck, msg.ProducerID, msg.SeqNum)
 	start := time.Now()
 
@@ -216,6 +230,19 @@ func (tm *TopicManager) publishInternal(topicName string, partition int, msg *ty
 	if t == nil {
 		util.Warn("tm: topic '%s' does not exist", topicName)
 		return fmt.Errorf("topic '%s' does not exist", topicName)
+	}
+
+	// Stand-alone idempotency check (Global scope support)
+	if msg.ProducerID != "" && msg.SeqNum > 0 {
+		tm.mu.Lock()
+		// Default to global scope if no partition mapping exists for this producer yet
+		// In stand-alone, we always check global scope (-1) to handle partition reassignment on retry
+		if tm.checkAndMarkDuplicate(topicName, -1, msg) {
+			tm.mu.Unlock()
+			util.Debug("tm: skipping duplicate message (Global) from producer %s (seq %d)", msg.ProducerID, msg.SeqNum)
+			return nil
+		}
+		tm.mu.Unlock()
 	}
 
 	if requireAck {
@@ -230,6 +257,23 @@ func (tm *TopicManager) publishInternal(topicName string, partition int, msg *ty
 	metrics.MessagesProcessed.Inc()
 	metrics.LatencyHist.Observe(elapsed)
 	return nil
+}
+
+func (tm *TopicManager) checkAndMarkDuplicate(topicName string, partition int, msg *types.Message) bool {
+	if tm.producerState[topicName] == nil {
+		tm.producerState[topicName] = make(map[int]map[string]int64)
+	}
+	if tm.producerState[topicName][partition] == nil {
+		tm.producerState[topicName][partition] = make(map[string]int64)
+	}
+
+	lastSeq, ok := tm.producerState[topicName][partition][msg.ProducerID]
+	if ok && int64(msg.SeqNum) <= lastSeq {
+		return true
+	}
+
+	tm.producerState[topicName][partition][msg.ProducerID] = int64(msg.SeqNum)
+	return false
 }
 
 func (tm *TopicManager) RegisterConsumerGroup(topicName, groupName string, consumerCount int) (*types.ConsumerGroup, error) {

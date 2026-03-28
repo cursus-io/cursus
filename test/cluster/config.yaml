@@ -9,10 +9,11 @@ enabled_distribution: true
 raft_port: 9001
 discovery_port: 8000
 min_insync_replicas: 1 
+bootstrap_cluster: true
 static_cluster_members: 
-  - "broker-1:9001"
-  - "broker-2:9001"
-  - "broker-3:9001"
+  - "broker-1-9000@broker-1:9001"
+  - "broker-2-9000@broker-2:9001"
+  - "broker-3-9000@broker-3:9001"
 
 # Idempotency
 enable_idempotence: false

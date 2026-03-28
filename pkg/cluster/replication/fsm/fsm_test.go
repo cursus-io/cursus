@@ -262,17 +262,17 @@ func TestBrokerFSM_ValidateIdempotency(t *testing.T) {
 
 	fsm.updateProducerState("t1", -1, "p1", 1)
 
-	cmd.Partition = 1
+	cmd.Partition = 0
 	cmd.Messages[0].SeqNum = 2
 	if err := fsm.validateMessageCommand(cmd); err != nil {
-		t.Errorf("Next message (SeqNum 2) should be valid on partition 1 via global scope: %v", err)
+		t.Errorf("Next message (SeqNum 2) should be valid on partition 0 via global scope: %v", err)
 	}
 }
 
 func TestBrokerFSM_SequenceScope_Partition(t *testing.T) {
 	fsm := newTestFSM()
 	fsm.partitionMetadata["t1"] = &PartitionMetadata{PartitionCount: 2, Idempotent: true}
-	fsm.tm.CreateTopic("t1", 2)
+	fsm.tm.CreateTopic("t1", 2, true)
 
 	cmdP0 := &types.MessageCommand{
 		Topic:         "t1",

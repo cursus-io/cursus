@@ -39,6 +39,11 @@ func (f *FakeHandlerProvider) GetHandler(t string, p int) (types.StorageHandler,
 	return &MockStorageHandler{}, nil
 }
 
+type MockCommandApplier struct{}
+
+func (m *MockCommandApplier) ApplyCommand(prefix string, data []byte) error { return nil }
+func (m *MockCommandApplier) IsLeader() bool                               { return false }
+
 func TestISRManager_Quorum(t *testing.T) {
 	cfg := &config.Config{LogDir: t.TempDir()}
 
@@ -53,8 +58,13 @@ func TestISRManager_Quorum(t *testing.T) {
 
 	for _, id := range []string{"node1", "node2", "node3"} {
 		brokerInfo := fsm.BrokerInfo{ID: id, Addr: "127.0.0.1:0", Status: "active", LastSeen: time.Now()}
-		data, _ := json.Marshal(brokerInfo)
-		brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", string(data)))})
+		data, err := json.Marshal(brokerInfo)
+		if err != nil {
+			t.Fatalf("failed to marshal broker info: %v", err)
+		}
+		if result := brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", string(data)))}); result != nil {
+			t.Fatalf("failed to register broker: %v", result)
+		}
 	}
 
 	topicPayload := map[string]interface{}{
@@ -70,6 +80,9 @@ func TestISRManager_Quorum(t *testing.T) {
 		t.Fatalf("failed to apply TOPIC command: %v", err)
 	}
 
+	// For manual creation in tm if needed (Apply already handles it but let's be explicit if test expects it)
+	tm.CreateTopic(topicName, 1, false)
+
 	partitionMetadata := fsm.PartitionMetadata{
 		Replicas:       []string{"node1", "node2", "node3"},
 		ISR:            []string{"node1", "node2", "node3"},
@@ -84,7 +97,7 @@ func TestISRManager_Quorum(t *testing.T) {
 		t.Fatalf("failed to apply PARTITION command: %v", err)
 	}
 
-	isrManager := NewISRManager(brokerFSM, "node1", 100*time.Millisecond)
+	isrManager := NewISRManager(brokerFSM, "node1", 100*time.Millisecond, &MockCommandApplier{})
 
 	isrManager.UpdateHeartbeat("node1")
 	isrManager.UpdateHeartbeat("node2")

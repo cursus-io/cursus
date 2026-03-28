@@ -39,7 +39,15 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 
 	isIdempotent := false
 	if val, ok := args["isIdempotent"]; ok {
-		isIdempotent = val == "true"
+		valLower := strings.ToLower(val)
+		switch valLower {
+		case "true":
+			isIdempotent = true
+		case "false":
+			isIdempotent = false
+		default:
+			return fmt.Sprintf("ERROR: invalid isIdempotent value: %s. Expected 'true' or 'false'", val)
+		}
 	}
 
 	acksLower := strings.ToLower(acks)
@@ -270,18 +278,20 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 			batch.Messages[i].Offset = startOffset + uint64(i)
 		}
 
+		effectiveIdempotent := batch.IsIdempotent || ch.Config.EnableIdempotence
 		scope := "global"
-		if batch.IsIdempotent {
+		if effectiveIdempotent {
 			scope = "partition"
 		}
 
 		if acks == "-1" || acksLower == "all" {
-			respAck, err = ch.Cluster.RaftManager.ReplicateBatchWithQuorum(batch.Topic, batch.Partition, batch.Messages, ch.Config.MinInSyncReplicas, acks, batch.IsIdempotent, scope)
+			respAck, err = ch.Cluster.RaftManager.ReplicateBatchWithQuorum(batch.Topic, batch.Partition, batch.Messages, ch.Config.MinInSyncReplicas, acks, effectiveIdempotent, scope)
 			if err != nil {
 				return ch.errorResponse(err.Error()), nil
 			}
 			goto Respond
 		} else {
+			batch.IsIdempotent = effectiveIdempotent
 			batchData, err := json.Marshal(batch)
 			if err != nil {
 				util.Error("Failed to marshal: %v", err)

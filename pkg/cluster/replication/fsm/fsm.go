@@ -130,8 +130,10 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyMessageCommand(strings.TrimPrefix(data, "BATCH:"))
 	case strings.HasPrefix(data, "TOPIC:"):
 		res = f.applyTopicCommand(strings.TrimPrefix(data, "TOPIC:"))
+	case strings.HasPrefix(data, "TOPIC_DELETE:"):
+		res = f.applyTopicDeleteCommand(strings.TrimPrefix(data, "TOPIC_DELETE:"))
 	case strings.HasPrefix(data, "PARTITION:"):
-		res = f.applyPartitionCommand(data)
+		res = f.applyPartitionCommand(strings.TrimPrefix(data, "PARTITION:"))
 	case strings.HasPrefix(data, "GROUP_SYNC:"):
 		res = f.applyGroupSyncCommand(strings.TrimPrefix(data, "GROUP_SYNC:"))
 	case strings.HasPrefix(data, "OFFSET_SYNC:"):
@@ -256,4 +258,32 @@ func (f *BrokerFSM) GetBroker(id string) *BrokerInfo {
 		return &copy
 	}
 	return nil
+}
+
+func (f *BrokerFSM) RegisterNotifier(reqID string) chan interface{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	ch := make(chan interface{}, 1)
+	f.notifiers[reqID] = ch
+	return ch
+}
+
+func (f *BrokerFSM) UnregisterNotifier(reqID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.notifiers, reqID)
+}
+
+func (f *BrokerFSM) notify(reqID string, res interface{}) {
+	f.mu.RLock()
+	ch, ok := f.notifiers[reqID]
+	f.mu.RUnlock()
+
+	if ok {
+		select {
+		case ch <- res:
+		default:
+		}
+	}
 }

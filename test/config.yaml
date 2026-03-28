@@ -2,7 +2,7 @@ broker_port: 9000
 health_check_port: 9080
 enable_exporter: true
 exporter_port: 9100
-log_level: "debug" # debug, info, warn, error
+log_level: "info" # debug, info, warn, error
 
 # Idempotency
 enable_idempotence: false # exactly-once, at-Least-once

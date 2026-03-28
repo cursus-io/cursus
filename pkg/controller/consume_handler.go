@@ -86,7 +86,11 @@ func (ch *CommandHandler) consumeFromTopic(conn net.Conn, topicName string, cArg
 	currentGen := -1
 	if ch.Coordinator != nil {
 		currentGen = ch.Coordinator.GetGeneration(cArgs.GroupName)
-		_ = ch.Coordinator.RecordHeartbeat(cArgs.GroupName, cArgs.MemberID)
+
+		if err := ch.Coordinator.RecordHeartbeat(cArgs.GroupName, cArgs.MemberID); err != nil {
+			util.Warn("Failed to record heartbeat during consume: %v", err)
+			return 0, fmt.Errorf("heartbeat failed: %w", err)
+		}
 	}
 
 	if ctx.Generation != currentGen {

@@ -98,6 +98,15 @@ func (bc *BrokerClient) connect() error {
 	return fmt.Errorf("failed to connect to any broker in %v: %w", bc.addrs, lastErr)
 }
 
+func (bc *BrokerClient) rotateAddrs() {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	if len(bc.addrs) > 1 {
+		first := bc.addrs[0]
+		bc.addrs = append(bc.addrs[1:], first)
+	}
+}
+
 func (bc *BrokerClient) Close() {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
@@ -112,12 +121,13 @@ func (bc *BrokerClient) Close() {
 }
 
 func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout time.Duration) (string, error) {
-	const maxRetries = 2
+	const maxRetries = 5
 	var lastErr error
 
 	for i := 0; i <= maxRetries; i++ {
 		if err := bc.connect(); err != nil {
 			lastErr = err
+			bc.rotateAddrs()
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
@@ -135,6 +145,7 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 		if err := util.WriteWithLength(conn, cmdBytes); err != nil {
 			bc.closeInternal()
 			lastErr = err
+			bc.rotateAddrs()
 
 			if isIdempotent(cmdPayload) {
 				util.Debug("Write error on idempotent command, retrying: %v", err)
@@ -153,6 +164,7 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 		if err != nil {
 			bc.closeInternal()
 			lastErr = err
+			bc.rotateAddrs()
 
 			if isIdempotent(cmdPayload) {
 				util.Debug("Read error on idempotent command, retrying: %v", err)
@@ -161,7 +173,18 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 
 			return "", fmt.Errorf("write succeeded but read failed (possible duplicate if retried): %w", err)
 		}
-		return strings.TrimSpace(string(respBuf)), nil
+
+		respStr := strings.TrimSpace(string(respBuf))
+		if strings.Contains(respStr, "NOT_AUTHORIZED_FOR_PARTITION") {
+			bc.closeInternal()
+			bc.rotateAddrs()
+			lastErr = fmt.Errorf("broker error: %s", respStr)
+			util.Debug("Not authorized for partition, rotating and retrying (%d/%d)", i, maxRetries)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		return respStr, nil
 	}
 	return "", fmt.Errorf("command failed after retries: %w", lastErr)
 }

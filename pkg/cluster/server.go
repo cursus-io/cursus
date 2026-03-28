@@ -30,6 +30,10 @@ type leaveResp struct {
 	Error   string `json:"error,omitempty"`
 }
 
+type heartbeatRequest struct {
+	NodeID string `json:"node_id"`
+}
+
 type ClusterServer struct {
 	sd controller.ServiceDiscovery
 }
@@ -83,10 +87,24 @@ func (h *ClusterServer) handleConnection(conn net.Conn) {
 			h.handleJoinCluster(conn, payload)
 		} else if strings.HasPrefix(payload, "LEAVE_CLUSTER ") {
 			h.handleLeaveCluster(conn, payload)
+		} else if strings.HasPrefix(payload, "HEARTBEAT_CLUSTER ") {
+			h.handleHeartbeatCluster(conn, payload)
 		} else if payload == "LIST_CLUSTER" {
 			h.handleListCluster(conn)
 		}
 	}
+}
+
+func (h *ClusterServer) handleHeartbeatCluster(conn net.Conn, payload string) {
+	jsonData := strings.TrimPrefix(payload, "HEARTBEAT_CLUSTER ")
+	var req heartbeatRequest
+	if err := json.Unmarshal([]byte(jsonData), &req); err != nil {
+		util.Error("invalid heartbeat json: %v", err)
+		return
+	}
+	util.Debug("ClusterServer: Received heartbeat from %s", req.NodeID)
+	h.sd.UpdateHeartbeat(req.NodeID)
+	h.writeResponse(conn, map[string]bool{"success": true})
 }
 
 func (h *ClusterServer) handleJoinCluster(conn net.Conn, payload string) {

@@ -23,10 +23,11 @@ type Topic struct {
 	mu             sync.RWMutex
 	cfg            *config.Config
 	streamManager  StreamManager
+	IsIdempotent   bool
 }
 
 // NewTopic initializes a topic with partitions.
-func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager) (*Topic, error) {
+func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager, idempotent bool) (*Topic, error) {
 	partitions := make([]*Partition, partitionCount)
 	for i := 0; i < partitionCount; i++ {
 		dh, err := hp.GetHandler(name, i)
@@ -41,6 +42,7 @@ func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.C
 		consumerGroups: make(map[string]*types.ConsumerGroup),
 		cfg:            cfg,
 		streamManager:  sm,
+		IsIdempotent:   idempotent,
 	}, nil
 }
 

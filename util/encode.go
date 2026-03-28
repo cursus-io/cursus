@@ -196,6 +196,14 @@ func DecodeBatchMessages(data []byte) (*types.Batch, error) {
 		return nil, fmt.Errorf("failed to read message count: %w", err)
 	}
 
+	if msgCount < 0 {
+		return nil, fmt.Errorf("invalid negative message count: %d", msgCount)
+	}
+	const maxBatchMessages = 100000
+	if msgCount > maxBatchMessages {
+		return nil, fmt.Errorf("message count too high: %d (max: %d)", msgCount, maxBatchMessages)
+	}
+
 	batch := &types.Batch{
 		Topic:        string(topicBytes),
 		Partition:    int(partition),

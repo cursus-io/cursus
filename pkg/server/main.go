@@ -73,7 +73,7 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	if cfg.EnabledDistribution {
 		brokerID := fmt.Sprintf("%s-%d", cfg.AdvertisedHost, cfg.BrokerPort)
 		localAddr := fmt.Sprintf("%s:%d", cfg.AdvertisedHost, cfg.RaftPort)
-		raftServerID := cfg.AdvertisedHost
+		raftServerID := brokerID
 
 		var err error
 		clusterClient := client.TCPClusterClient{}
@@ -96,6 +96,9 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 		if cd != nil {
 			cd.SetLeaderChecker(cc.IsLeader)
 		}
+
+		// Start background heartbeats to all cluster members
+		clusterClient.StartHeartbeat(ctx, cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort)
 
 		globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
 		cc.SetLocalProcessor(globalCH)

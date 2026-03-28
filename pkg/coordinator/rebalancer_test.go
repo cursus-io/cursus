@@ -13,7 +13,7 @@ type DummyPublisher struct{}
 func (d *DummyPublisher) Publish(topic string, msg *types.Message) error {
 	return nil
 }
-func (d *DummyPublisher) CreateTopic(topic string, partitionCount int) {}
+func (d *DummyPublisher) CreateTopic(topic string, partitionCount int, idempotent bool) {}
 
 func TestRebalanceRange_AssignsPartitionsEvenly(t *testing.T) {
 	cfg := &config.Config{

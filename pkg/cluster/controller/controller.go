@@ -90,13 +90,13 @@ func (cc *ClusterController) IsAuthorized(topic string, partition int) bool {
 
 	fsm := cc.RaftManager.GetFSM()
 	if fsm == nil {
-		return cc.IsLeader() // fallback to leader (Raft, not partition)
+		return false
 	}
 
 	partitionKey := fmt.Sprintf("%s-%d", topic, partition)
 	meta := fsm.GetPartitionMetadata(partitionKey)
 	if meta == nil {
-		return cc.IsLeader()
+		return false
 	}
 
 	return meta.Leader == cc.brokerID

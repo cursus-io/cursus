@@ -78,7 +78,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			return fmt.Sprintf("❌ Failed to create topic: %v", err)
 		}
 	} else {
-		tm.CreateTopic(topicName, partitions)
+		tm.CreateTopic(topicName, partitions, idempotent)
 	}
 
 	t := tm.GetTopic(topicName)

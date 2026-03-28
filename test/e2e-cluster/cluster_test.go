@@ -83,12 +83,16 @@ func TestDistributedOffsetResilience(t *testing.T) {
 
 	ctx.WhenCluster().
 		StartCluster().
-		CreateTopic().
+		CreateTopic()
+	
+	time.Sleep(5 * time.Second) // allow ISR to stabilize
+
+	ctx.WhenCluster().
 		JoinGroup().
 		CommitOffset(0, 50)
 	ctx.WhenCluster().SimulateLeaderFailure()
 
-	time.Sleep(5 * time.Second) // wait for election
+	time.Sleep(10 * time.Second) // wait for Raft election and partition leader failover
 
 	ctx.Then().
 		Expect(ExpectOffsetMatched(0, 50))
@@ -156,10 +160,16 @@ func TestConsumerGroupRebalanceFailover(t *testing.T) {
 
 	ctx.WhenCluster().
 		StartCluster().
-		CreateTopic().
+		CreateTopic()
+
+	time.Sleep(5 * time.Second) // allow ISR to stabilize
+
+	ctx.WhenCluster().
 		JoinGroup().
 		SyncGroup()
 	ctx.WhenCluster().SimulateLeaderFailure()
+
+	time.Sleep(10 * time.Second) // wait for Raft election and partition leader failover
 
 	ctx.Then().
 		Expect(ISRMaintained())
