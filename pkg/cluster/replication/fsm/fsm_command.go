@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/cursus-io/cursus/util"
 )
@@ -91,10 +90,14 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	prefix := payload.Topic + "-"
+	// Ensure prefix matching is exact for topic-partition keys (e.g., "foo-" matches "foo-0", but not "foo-bar-0")
 	for key := range f.partitionMetadata {
-		if strings.HasPrefix(key, prefix) {
-			delete(f.partitionMetadata, key)
+		idx := strings.LastIndex(key, "-")
+		if idx != -1 {
+			topicName := key[:idx]
+			if topicName == payload.Topic {
+				delete(f.partitionMetadata, key)
+			}
 		}
 	}
 
@@ -204,8 +207,6 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	info.LastSeen = time.Now()
-	info.Status = "active"
 	f.brokers[info.ID] = &info
 
 	util.Info("FSM: Member %s added to registry", info.ID)

@@ -118,10 +118,11 @@ func TestExactlyOnceWithFailures(t *testing.T) {
 		acks        string
 		failures    []string
 		expectDupes bool
+		expectLoss  bool
 	}{
-		{"acks=1_network_failure", "1", []string{"network"}, false},
-		{"acks=all_broker_failure", "all", []string{"broker"}, false},
-		{"acks=0_no_guarantee", "0", []string{"network"}, true},
+		{"acks=1_network_failure", "1", []string{"network"}, false, false},
+		{"acks=all_broker_failure", "all", []string{"broker"}, false, false},
+		{"acks=0_no_guarantee", "0", []string{"network"}, true, true},
 	}
 
 	for _, tc := range testCases {
@@ -153,7 +154,10 @@ func TestExactlyOnceWithFailures(t *testing.T) {
 				ConsumeMessages().
 				Then()
 
-			if tc.expectDupes {
+			if tc.expectLoss {
+				consequences.Expect(MessageLossAllowed()).
+					And(PublisherRetriedSuccessfully())
+			} else if tc.expectDupes {
 				consequences.Expect(DuplicatesAllowed()).
 					And(PublisherRetriedSuccessfully())
 			} else {

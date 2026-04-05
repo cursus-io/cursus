@@ -32,10 +32,7 @@ type ClusterController struct {
 	brokerID    string
 }
 
-func NewClusterController(ctx context.Context, cfg *config.Config, rm RaftManager, sd ServiceDiscovery) *ClusterController {
-	brokerID := fmt.Sprintf("%s-%d", cfg.AdvertisedHost, cfg.BrokerPort)
-	localAddr := fmt.Sprintf("%s:%d", cfg.AdvertisedHost, cfg.BrokerPort)
-
+func NewClusterController(ctx context.Context, cfg *config.Config, rm RaftManager, sd ServiceDiscovery, brokerID, localAddr string) *ClusterController {
 	cc := &ClusterController{
 		RaftManager: rm,
 		Discovery:   sd,

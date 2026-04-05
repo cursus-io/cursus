@@ -142,6 +142,11 @@ func MessagesPublishedWithQuorum() e2e.Expectation {
 			return fmt.Errorf("acks not set to 'all': got %s", ctx.GetAcks())
 		}
 
+		if ctx.GetPublishedCount() != ctx.GetNumMessages() {
+			return fmt.Errorf("expected %d messages to be published with quorum, but got %d",
+				ctx.GetNumMessages(), ctx.GetPublishedCount())
+		}
+
 		ctx.GetT().Logf("Quorum achieved: %d messages published with acks=%s",
 			ctx.GetPublishedCount(), ctx.GetAcks())
 		return nil

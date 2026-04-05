@@ -77,6 +77,7 @@ func (c *TCPClusterClient) sendHeartbeat(peers []string, nodeID, localAddr strin
 			}
 			defer conn.Close()
 
+			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			_ = util.WriteWithLength(conn, util.EncodeMessage("cluster", cmd))
 		}(peer)
 	}
@@ -135,6 +136,10 @@ func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, lo
 		return err
 	}
 	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
 
 	if err := util.WriteWithLength(conn, util.EncodeMessage("cluster", joinCmd)); err != nil {
 		return err

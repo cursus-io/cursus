@@ -244,6 +244,19 @@ func (f *BrokerFSM) GetPartitionMetadata(key string) *PartitionMetadata {
 
 	if meta := f.partitionMetadata[key]; meta != nil {
 		copy := *meta
+		// Deep copy slices to avoid aliasing internal FSM state
+		if meta.Replicas != nil {
+			copy.Replicas = make([]string, len(meta.Replicas))
+			for i, r := range meta.Replicas {
+				copy.Replicas[i] = r
+			}
+		}
+		if meta.ISR != nil {
+			copy.ISR = make([]string, len(meta.ISR))
+			for i, r := range meta.ISR {
+				copy.ISR[i] = r
+			}
+		}
 		return &copy
 	}
 	return nil

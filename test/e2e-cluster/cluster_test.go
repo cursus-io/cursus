@@ -73,9 +73,9 @@ func TestClusterDataConsistency(t *testing.T) {
 		Expect(ExpectDataConsistent())
 }
 
-/*
 // TestDistributedOffsetResilience verifies committed offsets are preserved after leader failover
 func TestDistributedOffsetResilience(t *testing.T) {
+	t.Skip("Unstable: Offset replication after failover needs further stabilizing")
 	ctx := GivenClusterRestart(t).
 		WithClusterSize(3).
 		WithTopic("offset-test").
@@ -98,11 +98,10 @@ func TestDistributedOffsetResilience(t *testing.T) {
 	ctx.Then().
 		Expect(ExpectOffsetMatched(0, 50))
 }
-*/
 
 // TestRollingRestartNoDowntime simulates rolling restart and verifies zero downtime
-/*
 func TestRollingRestartNoDowntime(t *testing.T) {
+	t.Skip("Unstable: Rolling restart timing issues in CI environment")
 	ctx := GivenClusterRestart(t).
 		WithClusterSize(3).
 		WithTopic("rolling-test").
@@ -129,7 +128,6 @@ func TestRollingRestartNoDowntime(t *testing.T) {
 		Then().
 		Expect(MessagesPublishedWithQuorum())
 }
-*/
 
 // TestClusterWideDeduplication verifies exactly-once delivery across cluster failover
 func TestClusterWideDeduplication(t *testing.T) {
@@ -154,9 +152,9 @@ func TestClusterWideDeduplication(t *testing.T) {
 		Expect(ExpectDataConsistent())
 }
 
-/*
 // TestConsumerGroupRebalanceFailover verifies group stability during node failure
 func TestConsumerGroupRebalanceFailover(t *testing.T) {
+	t.Skip("Unstable: Rebalance timing and member session timeouts are flaky in CI")
 	ctx := GivenClusterRestart(t).
 		WithClusterSize(3).
 		WithTopic("rebalance-test").
@@ -179,4 +177,3 @@ func TestConsumerGroupRebalanceFailover(t *testing.T) {
 	ctx.Then().
 		Expect(ISRMaintained())
 }
-*/

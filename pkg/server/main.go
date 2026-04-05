@@ -91,7 +91,7 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 			}
 		}()
 
-		cc = clusterController.NewClusterController(ctx, cfg, rm, sd)
+		cc = clusterController.NewClusterController(ctx, cfg, rm, sd, brokerID, localAddr)
 
 		if cd != nil {
 			cd.SetLeaderChecker(cc.IsLeader)

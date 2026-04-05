@@ -213,7 +213,12 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 			}
 
 			data, _ := json.Marshal(newMetadata)
-			_ = i.applier.ApplyCommand("PARTITION", data)
+			// The FSM expects PARTITION:<topic>-<partition>:<json>
+			// ApplyCommand(prefix, data) results in "prefix:data"
+			payload := []byte(fmt.Sprintf("%s:%s", key, string(data)))
+			if err := i.applier.ApplyCommand("PARTITION", payload); err != nil {
+				util.Error("ISRManager: Failed to apply ISR update for %s: %v", key, err)
+			}
 		}
 	}
 
