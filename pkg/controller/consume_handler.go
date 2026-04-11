@@ -131,8 +131,21 @@ func (ch *CommandHandler) consumeFromTopic(conn net.Conn, topicName string, cArg
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 
+		const heartbeatInterval = 1 * time.Second
+		lastHeartbeat := time.Now()
+
 		for time.Since(startTime) < cArgs.WaitTimeout {
 			<-ticker.C
+
+			// Renew heartbeat periodically so the coordinator does not evict
+			// the consumer while the poll is blocked waiting for messages.
+			if ch.Coordinator != nil && time.Since(lastHeartbeat) >= heartbeatInterval {
+				if err := ch.Coordinator.RecordHeartbeat(cArgs.GroupName, cArgs.MemberID); err != nil {
+					return streamedCount, fmt.Errorf("heartbeat failed during wait: %w", err)
+				}
+				lastHeartbeat = time.Now()
+			}
+
 			newMessages, err := p.ReadCommitted(currentOffset, cArgs.BatchSize)
 			if err != nil {
 				util.Error("Failed to read messages during wait: %v", err)

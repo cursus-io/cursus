@@ -33,7 +33,6 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	}
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	var brokers []string
 	for id, info := range f.brokers {
@@ -44,8 +43,30 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	sort.Strings(brokers)
 
 	if len(brokers) == 0 {
+		f.mu.Unlock()
 		util.Error("FSM: No active brokers available for topic creation")
 		return fmt.Errorf("no active brokers")
+	}
+
+	if topicCmd.Partitions <= 0 {
+		f.mu.Unlock()
+		util.Error("FSM: Invalid partition count %d for topic %s", topicCmd.Partitions, topicCmd.Name)
+		return fmt.Errorf("invalid partition count: %d", topicCmd.Partitions)
+	}
+
+	if topicCmd.LeaderID != "" {
+		found := false
+		for _, b := range brokers {
+			if b == topicCmd.LeaderID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			f.mu.Unlock()
+			util.Error("FSM: Explicit leader %s not in active broker set %v", topicCmd.LeaderID, brokers)
+			return fmt.Errorf("leader %s not in active broker set", topicCmd.LeaderID)
+		}
 	}
 
 	for i := 0; i < topicCmd.Partitions; i++ {
@@ -70,8 +91,13 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		util.Info("FSM: Assigned leader %s to partition %s", assignedLeader, key)
 	}
 
-	if f.tm != nil {
-		f.tm.CreateTopic(topicCmd.Name, topicCmd.Partitions, topicCmd.Idempotent)
+	tm := f.tm
+	f.mu.Unlock()
+
+	if tm != nil {
+		if err := tm.CreateTopic(topicCmd.Name, topicCmd.Partitions, topicCmd.Idempotent); err != nil {
+			util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicCmd.Name, err)
+		}
 	}
 	util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, topicCmd.Partitions)
 
@@ -88,21 +114,18 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 	}
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
-	// Ensure prefix matching is exact for topic-partition keys (e.g., "foo-" matches "foo-0", but not "foo-bar-0")
 	for key := range f.partitionMetadata {
-		idx := strings.LastIndex(key, "-")
-		if idx != -1 {
-			topicName := key[:idx]
-			if topicName == payload.Topic {
-				delete(f.partitionMetadata, key)
-			}
+		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
+			delete(f.partitionMetadata, key)
 		}
 	}
 
-	if f.tm != nil {
-		f.tm.DeleteTopic(payload.Topic)
+	tm := f.tm
+	f.mu.Unlock()
+
+	if tm != nil {
+		tm.DeleteTopic(payload.Topic)
 	}
 	util.Info("FSM: Deleted topic '%s'", payload.Topic)
 
@@ -130,7 +153,7 @@ func (f *BrokerFSM) applyPartitionCommand(jsonData string) interface{} {
 	return nil
 }
 
-// applyJoinGroupCommand 복구
+// applyJoinGroupCommand restores group join state.
 func (f *BrokerFSM) applyJoinGroupCommand(jsonData string) interface{} {
 	var cmd struct {
 		Group  string `json:"group"`
@@ -241,4 +264,4 @@ func (f *BrokerFSM) handleUnknownCommand(data string) interface{} {
 	return fmt.Errorf("unknown command: %s", preview)
 }
 
-// applyMessageCommand 메서드는 fsm_replication.go에 정의되어 있으므로 여기서는 중복 정의하지 않습니다.
+// applyMessageCommand is defined in fsm_replication.go and is not duplicated here.

@@ -29,11 +29,12 @@ type TestContext struct {
 	publishDelayMS int
 
 	// Test state
-	startTime      time.Time
-	publishedCount int
-	consumedCount  int
-	consumerGroup  string
-	lastError      error
+	startTime        time.Time
+	publishedCount   int
+	consumedCount    int
+	consumedMessages []string
+	consumerGroup    string
+	lastError        error
 
 	// Producer state
 	producerID       string

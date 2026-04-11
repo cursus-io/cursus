@@ -272,7 +272,9 @@ func TestBrokerFSM_ValidateIdempotency(t *testing.T) {
 func TestBrokerFSM_SequenceScope_Partition(t *testing.T) {
 	fsm := newTestFSM()
 	fsm.partitionMetadata["t1"] = &PartitionMetadata{PartitionCount: 2, Idempotent: true}
-	fsm.tm.CreateTopic("t1", 2, true)
+	if err := fsm.tm.CreateTopic("t1", 2, true); err != nil {
+		t.Fatalf("CreateTopic failed: %v", err)
+	}
 
 	cmdP0 := &types.MessageCommand{
 		Topic:         "t1",

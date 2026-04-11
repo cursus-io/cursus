@@ -94,7 +94,9 @@ func TestISRManager_Quorum(t *testing.T) {
 		t.Fatalf("failed to apply TOPIC command: %v", err)
 	}
 
-	tm.CreateTopic(topicName, 1, false)
+	if err := tm.CreateTopic(topicName, 1, false); err != nil {
+		t.Fatalf("CreateTopic failed: %v", err)
+	}
 
 	partitionMetadata := fsm.PartitionMetadata{
 		Replicas:       []string{"node1", "node2", "node3"},

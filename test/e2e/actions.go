@@ -149,6 +149,7 @@ func (a *Actions) ConsumeMessagesFromTopic(topic string) *Actions {
 	}
 
 	totalConsumed := 0
+	var allMessages []string
 	for _, partition := range a.ctx.assignedPartitions {
 		messages, offsets, err := client.ConsumeMessagesWithOffsets(
 			topic, partition, a.ctx.consumerGroup, client.memberID, client.generation, 5*time.Second,
@@ -159,7 +160,8 @@ func (a *Actions) ConsumeMessagesFromTopic(topic string) *Actions {
 		}
 
 		count := len(messages)
-		totalConsumed += len(messages)
+		totalConsumed += count
+		allMessages = append(allMessages, messages...)
 
 		if count > 0 {
 			lastOffset := offsets[len(offsets)-1]
@@ -174,6 +176,7 @@ func (a *Actions) ConsumeMessagesFromTopic(topic string) *Actions {
 	}
 
 	a.ctx.consumedCount = totalConsumed
+	a.ctx.consumedMessages = allMessages
 	return a
 }
 

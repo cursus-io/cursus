@@ -52,7 +52,7 @@ func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *
 	return tm
 }
 
-func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent bool) {
+func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent bool) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -60,24 +60,25 @@ func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent 
 		current := len(existing.Partitions)
 		switch {
 		case partitionCount < current:
-			util.Error("⚠️ cannot decrease partitions for topic '%s' (%d → %d)\n", name, current, partitionCount)
-			return
+			util.Error("cannot decrease partitions for topic '%s' (%d -> %d)", name, current, partitionCount)
+			return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", name, current, partitionCount)
 		case partitionCount > current:
 			existing.AddPartitions(partitionCount-current, tm.hp)
-			util.Info("🔄 topic '%s' partitions increased: %d → %d\n", name, current, len(existing.Partitions))
-			return
+			util.Info("topic '%s' partitions increased: %d -> %d", name, current, len(existing.Partitions))
+			return nil
 		default:
-			util.Info("ℹ️ topic '%s' already exists with %d partitions\n", name, current)
-			return
+			util.Info("topic '%s' already exists with %d partitions", name, current)
+			return nil
 		}
 	}
 
 	t, err := NewTopic(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager, idempotent)
 	if err != nil {
-		util.Error("❌ failed to create topic '%s': %v\n", name, err)
-		return
+		util.Error("failed to create topic '%s': %v", name, err)
+		return fmt.Errorf("failed to create topic '%s': %w", name, err)
 	}
 	tm.topics[name] = t
+	return nil
 }
 
 func (tm *TopicManager) GetTopic(name string) *Topic {
@@ -142,15 +143,15 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 	for _, m := range messages {
 		msg := m
 
-		// Stand-alone idempotency check (Global scope support)
+		// Check for duplicate before routing; do NOT advance sequence state yet.
 		if msg.ProducerID != "" && msg.SeqNum > 0 {
 			tm.mu.Lock()
-			if tm.checkAndMarkDuplicate(topicName, -1, &msg) {
-				tm.mu.Unlock()
+			isDup := tm.isDuplicateProducer(topicName, -1, &msg)
+			tm.mu.Unlock()
+			if isDup {
 				util.Debug("tm: skipping duplicate message (Global) in batch from producer %s (seq %d)", msg.ProducerID, msg.SeqNum)
 				continue
 			}
-			tm.mu.Unlock()
 		}
 
 		partition = t.GetPartitionForMessage(msg)
@@ -167,7 +168,22 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 		return fmt.Errorf("failed to route any messages in batch for topic '%s' (all partitions returned -1)", topicName)
 	}
 
-	return tm.executeBatch(t, partitioned, async)
+	if err := tm.executeBatch(t, partitioned, async); err != nil {
+		return err
+	}
+
+	// Advance sequence state only after all writes succeeded.
+	tm.mu.Lock()
+	for _, msgs := range partitioned {
+		for i := range msgs {
+			if msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
+				tm.markProducerSequence(topicName, -1, &msgs[i])
+			}
+		}
+	}
+	tm.mu.Unlock()
+
+	return nil
 }
 
 func (tm *TopicManager) executeBatch(t *Topic, partitioned map[int][]types.Message, async bool) error {
@@ -232,17 +248,15 @@ func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Mess
 		return fmt.Errorf("topic '%s' does not exist", topicName)
 	}
 
-	// Stand-alone idempotency check (Global scope support)
+	// Check for duplicate before writing; do NOT advance sequence state yet.
 	if msg.ProducerID != "" && msg.SeqNum > 0 {
 		tm.mu.Lock()
-		// Default to global scope if no partition mapping exists for this producer yet
-		// In stand-alone, we always check global scope (-1) to handle partition reassignment on retry
-		if tm.checkAndMarkDuplicate(topicName, -1, msg) {
-			tm.mu.Unlock()
+		isDup := tm.isDuplicateProducer(topicName, -1, msg)
+		tm.mu.Unlock()
+		if isDup {
 			util.Debug("tm: skipping duplicate message (Global) from producer %s (seq %d)", msg.ProducerID, msg.SeqNum)
 			return nil
 		}
-		tm.mu.Unlock()
 	}
 
 	if requireAck {
@@ -253,27 +267,41 @@ func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Mess
 		t.Publish(*msg)
 	}
 
+	// Advance sequence state only after the write has been accepted.
+	if msg.ProducerID != "" && msg.SeqNum > 0 {
+		tm.mu.Lock()
+		tm.markProducerSequence(topicName, -1, msg)
+		tm.mu.Unlock()
+	}
+
 	elapsed := time.Since(start).Seconds()
 	metrics.MessagesProcessed.Inc()
 	metrics.LatencyHist.Observe(elapsed)
 	return nil
 }
 
-func (tm *TopicManager) checkAndMarkDuplicate(topicName string, partition int, msg *types.Message) bool {
+// isDuplicateProducer checks whether msg is a duplicate based on producer sequence state.
+// It does NOT mutate state; call markProducerSequence after a successful write.
+func (tm *TopicManager) isDuplicateProducer(topicName string, partition int, msg *types.Message) bool {
+	if tm.producerState[topicName] == nil {
+		return false
+	}
+	if tm.producerState[topicName][partition] == nil {
+		return false
+	}
+	lastSeq, ok := tm.producerState[topicName][partition][msg.ProducerID]
+	return ok && int64(msg.SeqNum) <= lastSeq
+}
+
+// markProducerSequence records the producer's latest sequence number after a successful write.
+func (tm *TopicManager) markProducerSequence(topicName string, partition int, msg *types.Message) {
 	if tm.producerState[topicName] == nil {
 		tm.producerState[topicName] = make(map[int]map[string]int64)
 	}
 	if tm.producerState[topicName][partition] == nil {
 		tm.producerState[topicName][partition] = make(map[string]int64)
 	}
-
-	lastSeq, ok := tm.producerState[topicName][partition][msg.ProducerID]
-	if ok && int64(msg.SeqNum) <= lastSeq {
-		return true
-	}
-
 	tm.producerState[topicName][partition][msg.ProducerID] = int64(msg.SeqNum)
-	return false
 }
 
 func (tm *TopicManager) RegisterConsumerGroup(topicName, groupName string, consumerCount int) (*types.ConsumerGroup, error) {
@@ -323,6 +351,7 @@ func (tm *TopicManager) DeleteTopic(name string) bool {
 	defer tm.mu.Unlock()
 	if _, ok := tm.topics[name]; ok {
 		delete(tm.topics, name)
+		delete(tm.producerState, name)
 		return true
 	}
 	return false

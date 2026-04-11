@@ -174,14 +174,23 @@ func PublishFailed() Expectation {
 	}
 }
 
-// NoDuplicateMessages verifies no duplicates in consumed messages
+// NoDuplicateMessages verifies no duplicate payloads exist in consumed messages.
 func NoDuplicateMessages() Expectation {
 	return func(ctx *TestContext) error {
 		if ctx.consumedCount == 0 {
 			return fmt.Errorf("no messages consumed to check for duplicates")
 		}
 
-		if ctx.consumedCount > ctx.publishedCount {
+		if len(ctx.consumedMessages) > 0 {
+			seen := make(map[string]struct{}, len(ctx.consumedMessages))
+			for _, msg := range ctx.consumedMessages {
+				if _, exists := seen[msg]; exists {
+					return fmt.Errorf("duplicate payload detected: %q", msg)
+				}
+				seen[msg] = struct{}{}
+			}
+		} else if ctx.consumedCount > ctx.publishedCount {
+			// Fall back to count-based check when individual payloads are unavailable.
 			return fmt.Errorf("consumed %d messages but only %d published (duplicates detected)",
 				ctx.consumedCount, ctx.publishedCount)
 		}

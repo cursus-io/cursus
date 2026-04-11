@@ -39,6 +39,7 @@ type ISRManagerInterface interface {
 	GetISR(topic string, partition int) []string
 	ComputeISR(topic string, partition int) []string
 	SetLeader(isLeader bool)
+	Start()
 }
 
 type RaftReplicationManager struct {
@@ -150,9 +151,9 @@ func NewRaftReplicationManager(cfg *config.Config, brokerID string, diskManager 
 					bootstrapConfig := raft.Configuration{Servers: servers}
 					if err := r.BootstrapCluster(bootstrapConfig).Error(); err != nil {
 						util.Error("❌ Raft bootstrap failed for node %s: %v", brokerID, err)
-					} else {
-						util.Info("✅ Raft cluster bootstrap initiated with %d servers on node %s", len(servers), brokerID)
+						return nil, fmt.Errorf("bootstrap failed: %w", err)
 					}
+					util.Info("✅ Raft cluster bootstrap initiated with %d servers on node %s", len(servers), brokerID)
 				}
 			} else {
 				util.Info("ℹ️ Raft node %s already has %d servers in configuration, skipping bootstrap", brokerID, len(conf.Servers))
@@ -172,7 +173,7 @@ func NewRaftReplicationManager(cfg *config.Config, brokerID string, diskManager 
 	}
 
 	rm.isrManager = NewISRManager(brokerFSM, brokerID, 5*time.Second, rm)
-	go rm.isrManager.(*ISRManager).Start()
+	go rm.isrManager.Start()
 
 	go rm.observeLeadership(notifyCh)
 

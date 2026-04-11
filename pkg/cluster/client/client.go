@@ -77,7 +77,8 @@ func (c *TCPClusterClient) sendHeartbeat(peers []string, nodeID, localAddr strin
 			}
 			defer conn.Close()
 
-			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			// Set a write deadline to prevent goroutine buildup on slow connections
+			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 			_ = util.WriteWithLength(conn, util.EncodeMessage("cluster", cmd))
 		}(peer)
 	}
@@ -116,10 +117,15 @@ func (c *TCPClusterClient) joinClusterWithContext(ctx context.Context, peers []s
 				return nil
 			}
 		}
-		time.Sleep(1 * time.Second)
+		// Respect context cancellation while retrying
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second):
+		}
 	}
 
-	return fmt.Errorf("failed to join cluster")
+	return fmt.Errorf("failed to join cluster after 5 attempts")
 }
 
 func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, localAddr string) error {
@@ -137,8 +143,11 @@ func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, lo
 	}
 	defer conn.Close()
 
+	// Set connection deadlines based on the context's remaining time
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	}
 
 	if err := util.WriteWithLength(conn, util.EncodeMessage("cluster", joinCmd)); err != nil {

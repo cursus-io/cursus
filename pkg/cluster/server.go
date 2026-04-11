@@ -100,8 +100,15 @@ func (h *ClusterServer) handleHeartbeatCluster(conn net.Conn, payload string) {
 	var req heartbeatRequest
 	if err := json.Unmarshal([]byte(jsonData), &req); err != nil {
 		util.Error("invalid heartbeat json: %v", err)
+		h.writeErrorResponse(conn, "invalid heartbeat format")
 		return
 	}
+
+	if req.NodeID == "" {
+		h.writeErrorResponse(conn, "node_id is required")
+		return
+	}
+
 	util.Debug("ClusterServer: Received heartbeat from %s", req.NodeID)
 	h.sd.UpdateHeartbeat(req.NodeID)
 	h.writeResponse(conn, map[string]bool{"success": true})

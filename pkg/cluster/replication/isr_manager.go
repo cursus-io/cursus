@@ -139,9 +139,13 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 		return nil
 	}
 
-	// Calculate who is alive based on heartbeats
+	// Calculate who is alive based on heartbeats and broker status.
+	// Skip brokers that have been deregistered (Status != "active").
 	i.mu.RLock()
 	for _, replica := range metadata.Replicas {
+		if broker := i.fsm.GetBroker(replica); broker != nil && broker.Status != "active" {
+			continue
+		}
 		if lastSeen, ok := i.lastSeen[replica]; ok {
 			if time.Since(lastSeen) < i.heartbeatTimeout {
 				currentISR = append(currentISR, replica)
@@ -231,7 +235,9 @@ func (i *ISRManager) GetISR(topic string, partition int) []string {
 	if metadata == nil {
 		return nil
 	}
-	return metadata.ISR
+	isr := make([]string, len(metadata.ISR))
+	copy(isr, metadata.ISR)
+	return isr
 }
 
 func (i *ISRManager) HasQuorum(topic string, partition int, minISR int) bool {

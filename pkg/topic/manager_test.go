@@ -137,12 +137,12 @@ func TestTopicManagerCreateTopic(t *testing.T) {
 		hp.On("GetHandler", topicName, i).Return(mockStorageHandler, nil).Once()
 	}
 
-	tm.CreateTopic(topicName, partitionCount, false)
+	assert.NoError(t, tm.CreateTopic(topicName, partitionCount, false))
 	assert.NotNil(t, tm.GetTopic(topicName))
 	assert.Equal(t, partitionCount, len(tm.GetTopic(topicName).Partitions))
 	hp.AssertExpectations(t)
 
-	tm.CreateTopic(topicName, partitionCount, false)
+	assert.NoError(t, tm.CreateTopic(topicName, partitionCount, false))
 	assert.Equal(t, partitionCount, len(tm.GetTopic(topicName).Partitions))
 	hp.AssertExpectations(t)
 
@@ -153,18 +153,18 @@ func TestTopicManagerCreateTopic(t *testing.T) {
 		hp.On("GetHandler", topicName, i).Return(mockStorageHandler, nil).Once()
 	}
 
-	tm.CreateTopic(topicName, newPartitionCount, false)
+	assert.NoError(t, tm.CreateTopic(topicName, newPartitionCount, false))
 	assert.Equal(t, newPartitionCount, len(tm.GetTopic(topicName).Partitions))
 	hp.AssertExpectations(t)
 
-	tm.CreateTopic(topicName, 2, false)
+	assert.Error(t, tm.CreateTopic(topicName, 2, false))
 	assert.Equal(t, newPartitionCount, len(tm.GetTopic(topicName).Partitions)) // should still be 5
 	hp.AssertExpectations(t)
 
 	errorTopicName := "error-topic"
 	hp.On("GetHandler", errorTopicName, 0).Return(nil, assert.AnError).Once()
 
-	tm.CreateTopic(errorTopicName, 1, false)
+	assert.Error(t, tm.CreateTopic(errorTopicName, 1, false))
 	assert.Nil(t, tm.GetTopic(errorTopicName))
 	hp.AssertExpectations(t)
 

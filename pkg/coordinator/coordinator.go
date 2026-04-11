@@ -29,7 +29,7 @@ type Coordinator struct {
 
 type TopicHandler interface {
 	Publish(topic string, msg *types.Message) error
-	CreateTopic(topic string, partitionCount int, idempotent bool)
+	CreateTopic(topic string, partitionCount int, idempotent bool) error
 }
 
 // GroupMetadata holds metadata for a single consumer group.
@@ -102,7 +102,9 @@ func NewCoordinator(cfg *config.Config, handler TopicHandler) *Coordinator {
 		offsets:                   make(map[string]map[string]map[int]uint64),
 	}
 
-	handler.CreateTopic(c.offsetTopic, c.offsetTopicPartitionCount, false)
+	if err := handler.CreateTopic(c.offsetTopic, c.offsetTopicPartitionCount, false); err != nil {
+		util.Error("Coordinator: failed to create offset topic '%s': %v", c.offsetTopic, err)
+	}
 	return c
 }
 

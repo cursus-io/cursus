@@ -70,7 +70,9 @@ func (p *Partition) runBroadcaster() {
 }
 
 func (p *Partition) isDuplicate(msg *types.Message) bool {
-	if msg.ProducerID == "" {
+	// SeqNum == 0 means the producer did not explicitly set a sequence number;
+	// skip dedup to avoid incorrectly rejecting every message after the first.
+	if msg.ProducerID == "" || msg.SeqNum == 0 {
 		return false
 	}
 

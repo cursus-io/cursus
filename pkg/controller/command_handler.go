@@ -78,10 +78,15 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			return fmt.Sprintf("❌ Failed to create topic: %v", err)
 		}
 	} else {
-		tm.CreateTopic(topicName, partitions, idempotent)
+		if err := tm.CreateTopic(topicName, partitions, idempotent); err != nil {
+			return fmt.Sprintf("ERROR: failed to create topic '%s': %v", topicName, err)
+		}
 	}
 
 	t := tm.GetTopic(topicName)
+	if t == nil {
+		return fmt.Sprintf("ERROR: topic '%s' was not created", topicName)
+	}
 
 	if ch.Coordinator != nil {
 		err := ch.Coordinator.RegisterGroup(topicName, "default-group", partitions)
@@ -89,7 +94,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			util.Warn("Failed to register default group with coordinator: %v", err)
 		}
 	}
-	return fmt.Sprintf("✅ Topic '%s' now has %d partitions", topicName, len(t.Partitions))
+	return fmt.Sprintf("Topic '%s' now has %d partitions", topicName, len(t.Partitions))
 }
 
 // handleDelete processes DELETE command
@@ -710,23 +715,28 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 
 	for _, p := range t.Partitions {
 		pm := PartitionMetadata{
-			ID:     p.ID(),
-			Leader: raftLeader, // default to Raft leader
-			LEO:    p.NextOffset(),
-			HWM:    p.HWM,
+			ID:  p.ID(),
+			LEO: p.NextOffset(),
+			HWM: p.HWM,
 		}
 
 		if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
-			// retrieve actual partition-specific leader from FSM
-			if fsm := ch.Cluster.RaftManager.GetFSM(); fsm != nil {
+			if fsmObj := ch.Cluster.RaftManager.GetFSM(); fsmObj != nil {
 				partitionKey := fmt.Sprintf("%s-%d", topicName, p.ID())
-				if meta := fsm.GetPartitionMetadata(partitionKey); meta != nil {
-					pm.ISR = meta.ISR
-					pm.Replicas = meta.Replicas
+				if partMeta := fsmObj.GetPartitionMetadata(partitionKey); partMeta != nil {
+					pm.ISR = partMeta.ISR
+					pm.Replicas = partMeta.Replicas
 
-					if leaderBroker := fsm.GetBroker(meta.Leader); leaderBroker != nil {
+					if leaderBroker := fsmObj.GetBroker(partMeta.Leader); leaderBroker != nil {
 						pm.Leader = leaderBroker.Addr
+					} else {
+						// Partition metadata exists but leader broker is unresolvable (failover in progress).
+						// Report the raw leader ID rather than silently falling back to the Raft leader.
+						pm.Leader = partMeta.Leader
 					}
+				} else {
+					// No partition metadata yet; fall back to Raft leader address.
+					pm.Leader = raftLeader
 				}
 			}
 		}
