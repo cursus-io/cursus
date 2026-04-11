@@ -21,10 +21,10 @@ func (m *MockRaftManager) ApplyCommand(prefix string, data []byte) error { retur
 func (m *MockRaftManager) LeaderCh() <-chan bool                         { return nil }
 func (m *MockRaftManager) GetFSM() *fsm.BrokerFSM                        { return nil }
 func (m *MockRaftManager) GetConfiguration() raft.ConfigurationFuture    { return nil }
-func (m *MockRaftManager) ReplicateWithQuorum(topic string, partition int, msg types.Message, minISR int) (types.AckResponse, error) {
+func (m *MockRaftManager) ReplicateWithQuorum(topic string, partition int, msg types.Message, minISR int, isIdempotent bool, sequenceScope string) (types.AckResponse, error) {
 	return types.AckResponse{}, nil
 }
-func (m *MockRaftManager) ReplicateBatchWithQuorum(topic string, partition int, messages []types.Message, minISR int, acks string) (types.AckResponse, error) {
+func (m *MockRaftManager) ReplicateBatchWithQuorum(topic string, partition int, messages []types.Message, minISR int, acks string, isIdempotent bool, sequenceScope string) (types.AckResponse, error) {
 	return types.AckResponse{}, nil
 }
 func (m *MockRaftManager) ApplyResponse(prefix string, data []byte, timeout time.Duration) (types.AckResponse, error) {

@@ -39,6 +39,25 @@ func (f *FakeHandlerProvider) GetHandler(t string, p int) (types.StorageHandler,
 	return &MockStorageHandler{}, nil
 }
 
+type MockCommandApplier struct {
+	IsLeaderResult bool
+	fsm            *fsm.BrokerFSM
+}
+
+func (m *MockCommandApplier) ApplyCommand(prefix string, data []byte) error {
+	if prefix == "PARTITION" {
+		// ISRManager now passes "TOPIC-PARTITION:JSON" as data
+		// RaftReplicationManager adds "PARTITION:" prefix
+		fullData := fmt.Sprintf("PARTITION:%s", string(data))
+		result := m.fsm.Apply(&raft.Log{Data: []byte(fullData)})
+		if err, ok := result.(error); ok {
+			return err
+		}
+	}
+	return nil
+}
+func (m *MockCommandApplier) IsLeader() bool { return m.IsLeaderResult }
+
 func TestISRManager_Quorum(t *testing.T) {
 	cfg := &config.Config{LogDir: t.TempDir()}
 
@@ -51,43 +70,75 @@ func TestISRManager_Quorum(t *testing.T) {
 	topicName := "test-topic"
 	partitionID := 0
 
+	for _, id := range []string{"node1", "node2", "node3"} {
+		brokerInfo := fsm.BrokerInfo{ID: id, Addr: "127.0.0.1:0", Status: "active", LastSeen: time.Now()}
+		data, err := json.Marshal(brokerInfo)
+		if err != nil {
+			t.Fatalf("failed to marshal broker info: %v", err)
+		}
+		if result := brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", string(data)))}); result != nil {
+			t.Fatalf("failed to register broker: %v", result)
+		}
+	}
+
 	topicPayload := map[string]interface{}{
 		"name":       topicName,
 		"partitions": 1,
 		"leader_id":  "node1",
 	}
-	topicData, _ := json.Marshal(topicPayload)
-	brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", string(topicData)))})
+	topicData, err := json.Marshal(topicPayload)
+	if err != nil {
+		t.Fatalf("failed to marshal topic payload: %v", err)
+	}
+	if err := brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", string(topicData)))}); err != nil {
+		t.Fatalf("failed to apply TOPIC command: %v", err)
+	}
+
+	if err := tm.CreateTopic(topicName, 1, false); err != nil {
+		t.Fatalf("CreateTopic failed: %v", err)
+	}
 
 	partitionMetadata := fsm.PartitionMetadata{
 		Replicas:       []string{"node1", "node2", "node3"},
 		ISR:            []string{"node1", "node2", "node3"},
 		PartitionCount: 1,
 	}
-	metaData, _ := json.Marshal(partitionMetadata)
+	metaData, err := json.Marshal(partitionMetadata)
+	if err != nil {
+		t.Fatalf("failed to marshal partition metadata: %v", err)
+	}
 	key := fmt.Sprintf("%s-%d", topicName, partitionID)
-	brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("PARTITION:%s:%s", key, string(metaData)))})
+	if err := brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("PARTITION:%s:%s", key, string(metaData)))}); err != nil {
+		t.Fatalf("failed to apply PARTITION command: %v", err)
+	}
 
-	isrManager := NewISRManager(brokerFSM, "node1", 100*time.Millisecond)
+	// Mock applier to act as leader and update FSM
+	applier := &MockCommandApplier{IsLeaderResult: true, fsm: brokerFSM}
+	isrManager := NewISRManager(brokerFSM, "node1", 100*time.Millisecond, applier)
 
+	// Heartbeat node1 & node2 only
 	isrManager.UpdateHeartbeat("node1")
 	isrManager.UpdateHeartbeat("node2")
+	
+	// ComputeISR calculates currentISR and should apply it to FSM via MockCommandApplier
 	isrManager.ComputeISR(topicName, partitionID)
 
 	if !isrManager.HasQuorum(topicName, partitionID, 2) {
 		t.Error("Expected quorum to be met (2 in ISR)")
 	}
 
-	// heartbeat timeout
-	time.Sleep(200 * time.Millisecond)
+	// heartbeat timeout simulation: wait and only heartbeat node1
+	time.Sleep(200 * time.Millisecond) 
 
 	isrManager.UpdateHeartbeat("node1")
 	isrManager.CleanStaleHeartbeats()
+	
+	// ComputeISR calculates [node1] and applies to FSM
 	isrManager.ComputeISR(topicName, partitionID)
 
 	isr := isrManager.GetISR(topicName, partitionID)
 	if len(isr) != 1 || isr[0] != "node1" {
-		t.Errorf("Expected ISR to be [node1], got %v", isr)
+		t.Errorf("Expected ISR to contain only node1, but got %v", isr)
 	}
 
 	if isrManager.HasQuorum(topicName, partitionID, 2) {

@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -13,26 +14,40 @@ import (
 
 const defaultHeartbeatTimeout = 10 * time.Second
 
+type CommandApplier interface {
+	ApplyCommand(prefix string, data []byte) error
+	IsLeader() bool
+}
+
 type ISRManager struct {
 	fsm              *fsm.BrokerFSM
 	brokerID         string
+	applier          CommandApplier
 	mu               sync.RWMutex
 	lastSeen         map[string]time.Time
 	heartbeatTimeout time.Duration
+	leaderSince      time.Time
 
 	stopCh    chan struct{}
 	startOnce sync.Once
 	stopOnce  sync.Once
 }
 
-func NewISRManager(fsm *fsm.BrokerFSM, brokerID string, heartbeatTimeout time.Duration) *ISRManager {
+func NewISRManager(fsm *fsm.BrokerFSM, brokerID string, heartbeatTimeout time.Duration, applier CommandApplier) *ISRManager {
 	if heartbeatTimeout <= 0 {
 		heartbeatTimeout = defaultHeartbeatTimeout
 	}
+	
+	lastSeen := make(map[string]time.Time)
+	if brokerID != "" {
+		lastSeen[brokerID] = time.Now()
+	}
+
 	return &ISRManager{
 		fsm:              fsm,
 		brokerID:         brokerID,
-		lastSeen:         make(map[string]time.Time),
+		applier:          applier,
+		lastSeen:         lastSeen,
 		heartbeatTimeout: heartbeatTimeout,
 		stopCh:           make(chan struct{}),
 	}
@@ -41,12 +56,14 @@ func NewISRManager(fsm *fsm.BrokerFSM, brokerID string, heartbeatTimeout time.Du
 func (i *ISRManager) Start() {
 	i.startOnce.Do(func() {
 		go func() {
-			ticker := time.NewTicker(i.heartbeatTimeout / 2)
+			// Check ISR and Heartbeats more frequently
+			ticker := time.NewTicker(1 * time.Second)
 			defer ticker.Stop()
 
 			for {
 				select {
 				case <-ticker.C:
+					i.UpdateHeartbeat(i.brokerID)
 					i.refreshAllISRs()
 					i.CleanStaleHeartbeats()
 				case <-i.stopCh:
@@ -64,102 +81,177 @@ func (i *ISRManager) Stop() {
 }
 
 func (i *ISRManager) refreshAllISRs() {
-	partitionKeys := i.fsm.GetAllPartitionKeys()
+	if i.applier != nil && !i.applier.IsLeader() {
+		return
+	}
 
+	partitionKeys := i.fsm.GetAllPartitionKeys()
 	for _, key := range partitionKeys {
 		idx := strings.LastIndex(key, "-")
 		if idx == -1 {
 			continue
 		}
 		topic := key[:idx]
-		partition, err := strconv.Atoi(key[idx+1:])
-		if err != nil {
-			util.Debug("skipping invalid partition key format: %s", key)
-			continue
-		}
-		util.Debug("refreshing ISR for topic: %s, partition: %d", topic, partition)
+		partition, _ := strconv.Atoi(key[idx+1:])
+		
 		i.ComputeISR(topic, partition)
 	}
 }
 
-// UpdateHeartbeat records the last heartbeat for a broker.
 func (i *ISRManager) UpdateHeartbeat(brokerID string) {
+	if brokerID == "" {
+		return
+	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.lastSeen[brokerID] = time.Now()
 }
 
+func (i *ISRManager) SetLeader(isLeader bool) {
+	i.mu.Lock()
+	if isLeader {
+		if i.leaderSince.IsZero() {
+			i.leaderSince = time.Now()
+			// Mark self as alive immediately
+			i.lastSeen[i.brokerID] = time.Now()
+			util.Info("ISRManager: Successfully became leader at %v", i.leaderSince)
+		}
+	} else {
+		i.leaderSince = time.Time{}
+	}
+	i.mu.Unlock()
+
+	if isLeader {
+		// Force immediate refresh instead of waiting for ticker
+		go i.refreshAllISRs()
+	}
+}
+
 func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 	key := fmt.Sprintf("%s-%d", topic, partition)
-	var isr []string
+	var currentISR []string
 
 	i.mu.RLock()
 	metadata := i.fsm.GetPartitionMetadata(key)
+	i.mu.RUnlock()
 
 	if metadata == nil {
-		i.mu.RUnlock()
-		util.Warn("Partition metadata not found for %s. Returning empty ISR.", key)
 		return nil
 	}
 
-	for _, broker := range metadata.Replicas {
-		if last, ok := i.lastSeen[broker]; ok && time.Since(last) < i.heartbeatTimeout {
-			isr = append(isr, broker)
+	// Calculate who is alive based on heartbeats and broker status.
+	// Skip brokers that have been deregistered (Status != "active").
+	i.mu.RLock()
+	for _, replica := range metadata.Replicas {
+		if broker := i.fsm.GetBroker(replica); broker != nil && broker.Status != "active" {
+			continue
+		}
+		if lastSeen, ok := i.lastSeen[replica]; ok {
+			if time.Since(lastSeen) < i.heartbeatTimeout {
+				currentISR = append(currentISR, replica)
+			}
 		}
 	}
 	i.mu.RUnlock()
 
-	i.fsm.UpdatePartitionISR(key, isr)
-	return isr
+	// Ensure self is in ISR if we are part of replicas
+	selfInReplicas := false
+	for _, r := range metadata.Replicas {
+		if r == i.brokerID {
+			selfInReplicas = true
+			break
+		}
+	}
+	if selfInReplicas {
+		alreadyIn := false
+		for _, node := range currentISR {
+			if node == i.brokerID {
+				alreadyIn = true
+				break
+			}
+		}
+		if !alreadyIn {
+			currentISR = append(currentISR, i.brokerID)
+		}
+	}
+
+	// If we are Raft leader, propose changes if needed
+	if i.applier != nil && i.applier.IsLeader() {
+		needsUpdate := false
+		
+		// 1. Check if ISR count changed
+		if len(currentISR) != len(metadata.ISR) {
+			needsUpdate = true
+		} else {
+			// Compare members
+			isrMap := make(map[string]bool)
+			for _, m := range metadata.ISR {
+				isrMap[m] = true
+			}
+			for _, m := range currentISR {
+				if !isrMap[m] {
+					needsUpdate = true
+					break
+				}
+			}
+		}
+
+		// 2. Check if leader is dead
+		leaderAlive := false
+		for _, m := range currentISR {
+			if m == metadata.Leader {
+				leaderAlive = true
+				break
+			}
+		}
+
+		if !leaderAlive || needsUpdate {
+			newMetadata := *metadata
+			newMetadata.ISR = currentISR
+			
+			if !leaderAlive && len(currentISR) > 0 {
+				// Elect new leader from ISR
+				newMetadata.Leader = currentISR[0]
+				newMetadata.LeaderEpoch++
+				util.Info("ISRManager: Failover for %s: %s -> %s", key, metadata.Leader, newMetadata.Leader)
+			}
+
+			data, _ := json.Marshal(newMetadata)
+			// The FSM expects PARTITION:<topic>-<partition>:<json>
+			// ApplyCommand(prefix, data) results in "prefix:data"
+			payload := []byte(fmt.Sprintf("%s:%s", key, string(data)))
+			if err := i.applier.ApplyCommand("PARTITION", payload); err != nil {
+				util.Error("ISRManager: Failed to apply ISR update for %s: %v", key, err)
+			}
+		}
+	}
+
+	return currentISR
 }
 
-// GetISR returns the latest ISR for a partition (FSM authoritative).
 func (i *ISRManager) GetISR(topic string, partition int) []string {
 	key := fmt.Sprintf("%s-%d", topic, partition)
 	metadata := i.fsm.GetPartitionMetadata(key)
 	if metadata == nil {
-		util.Warn("Partition metadata not found for %s. Returning empty ISR.", key)
 		return nil
 	}
-	return append([]string(nil), metadata.ISR...)
+	isr := make([]string, len(metadata.ISR))
+	copy(isr, metadata.ISR)
+	return isr
 }
 
-// HasQuorum checks if enough live replicas exist for the partition.
 func (i *ISRManager) HasQuorum(topic string, partition int, minISR int) bool {
 	isr := i.GetISR(topic, partition)
-
-	currentISRCount := len(isr)
-	isLeaderInISR := false
-	for _, brokerID := range isr {
-		if brokerID == i.brokerID {
-			isLeaderInISR = true
-			break
-		}
-	}
-
-	if !isLeaderInISR {
-		util.Error("Leader (%s) is not in its own ISR list for %s-%d", i.brokerID, topic, partition)
-		return false
-	}
-
-	if currentISRCount >= minISR {
-		util.Debug("Quorum met for %s-%d: current ISR count %d >= min ISR %d", topic, partition, currentISRCount, minISR)
-		return true
-	}
-
-	util.Warn("Quorum NOT met for %s-%d: current ISR count %d < min ISR %d", topic, partition, currentISRCount, minISR)
-	return false
+	return len(isr) >= minISR
 }
 
-// CleanStaleHeartbeats removes old heartbeat entries.
 func (i *ISRManager) CleanStaleHeartbeats() {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-
 	now := time.Now()
-	for brokerID, last := range i.lastSeen {
-		if now.Sub(last) > i.heartbeatTimeout {
-			delete(i.lastSeen, brokerID)
+	for id, last := range i.lastSeen {
+		if id != i.brokerID && now.Sub(last) > i.heartbeatTimeout {
+			delete(i.lastSeen, id)
 		}
 	}
 }

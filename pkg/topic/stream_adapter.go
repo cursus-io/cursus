@@ -1,6 +1,7 @@
 package topic
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/stream"
@@ -11,11 +12,11 @@ type StreamManagerAdapter struct {
 	sm *stream.StreamManager
 }
 
-func NewStreamManagerAdapter(sm *stream.StreamManager) *StreamManagerAdapter {
+func NewStreamManagerAdapter(sm *stream.StreamManager) (*StreamManagerAdapter, error) {
 	if sm == nil {
-		panic("stream manager cannot be nil")
+		return nil, fmt.Errorf("stream manager cannot be nil")
 	}
-	return &StreamManagerAdapter{sm: sm}
+	return &StreamManagerAdapter{sm: sm}, nil
 }
 
 func (a *StreamManagerAdapter) AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), commitInterval time.Duration) error {

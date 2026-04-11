@@ -1,15 +1,24 @@
 broker_port: 9000
-exporter_port: 9100
+health_check_port: 9080
 enable_exporter: true
-log_level: "info"
+exporter_port: 9100
+log_level: "info" # debug, info, warn, error
 
+# Idempotency
+enable_idempotence: false # exactly-once, at-Least-once
+
+# Storage
+log_dir: "broker-logs"
 linger_ms: 50
 disk_flush_batch_size: 1000            
 log_cleanup_interval: 60            
-log_segment_bytes: 10485760                  
+log_segment_bytes: 10485760 # 10MB
 
+compression_type: "none" # none, gzip, snappy, lz4
 channel_buffer_size: 8192
 partition_channel_buffer_size: 20000
 consumer_channel_buffer_size: 5000
+
+# Consumer session management
 consumer_session_timeout_ms: 30000
 consumer_heartbeat_check_ms: 5000

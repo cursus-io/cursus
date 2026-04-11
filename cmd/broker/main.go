@@ -42,7 +42,10 @@ func main() {
 	// Initialization
 	dm := disk.NewDiskManager(cfg)
 	sm := stream.NewStreamManager(cfg.MaxStreamConnections, cfg.StreamTimeout, cfg.StreamHeartbeatInterval)
-	smAdapter := topic.NewStreamManagerAdapter(sm)
+	smAdapter, err := topic.NewStreamManagerAdapter(sm)
+	if err != nil {
+		util.Fatal("❌ Failed to create stream manager adapter: %v", err)
+	}
 
 	tm := topic.NewTopicManager(cfg, dm, smAdapter)
 	cd := coordinator.NewCoordinator(cfg, tm)

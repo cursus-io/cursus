@@ -5,6 +5,7 @@
   "log.dir": "broker-logs",
   "enable.exporter": true,
   "exporter.port": 9100,
+  "enable.idempotence": false,
   "channel.buffer.size": 8192,
   "partition.channel.buffer.size": 20000,
   "consumer.channel.buffer.size": 5000,

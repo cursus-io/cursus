@@ -3,82 +3,255 @@ package fsm
 import (
 	"encoding/json"
 	"fmt"
-	"time"
+	"sort"
+	"strings"
 
 	"github.com/cursus-io/cursus/util"
 )
 
 type PartitionMetadata struct {
-	Leader         string // todo
-	Replicas       []string
-	ISR            []string
-	LeaderEpoch    int64
-	PartitionCount int
+	Leader         string   `json:"leader"`
+	Replicas       []string `json:"replicas"`
+	ISR            []string `json:"isr"`
+	LeaderEpoch    int      `json:"leader_epoch"`
+	PartitionCount int      `json:"partition_count"`
+	Idempotent     bool     `json:"idempotent"`
 }
 
-func (f *BrokerFSM) applyRegisterCommand(jsonData string) error {
-	var broker BrokerInfo
-	if err := json.Unmarshal([]byte(jsonData), &broker); err != nil {
-		util.Error("Failed to unmarshal broker registration: %v", err)
+type TopicCommand struct {
+	Name       string `json:"name"`
+	Partitions int    `json:"partitions"`
+	Idempotent bool   `json:"idempotent"`
+	LeaderID   string `json:"leader_id"`
+}
+
+func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
+	var topicCmd TopicCommand
+	if err := json.Unmarshal([]byte(jsonData), &topicCmd); err != nil {
+		util.Error("FSM: Failed to unmarshal topic command: %v", err)
 		return err
-	}
-
-	if broker.ID == "" || broker.Addr == "" {
-		return fmt.Errorf("invalid broker registration: %+v", broker)
-	}
-
-	f.storeBroker(broker.ID, &broker)
-	util.Info("Registered broker %s at %s", broker.ID, broker.Addr)
-	return nil
-}
-
-func (f *BrokerFSM) applyDeregisterCommand(brokerID string) error {
-	f.removeBroker(brokerID)
-	util.Info("Deregistered broker %s", brokerID)
-	return nil
-}
-
-func (f *BrokerFSM) applyTopicCommand(data string) interface{} {
-	var topicCmd struct {
-		Name       string `json:"name"`
-		Partitions int    `json:"partitions"`
-		LeaderID   string `json:"leader_id"`
-	}
-
-	if err := json.Unmarshal([]byte(data), &topicCmd); err != nil {
-		util.Error("Failed to unmarshal topic command: %v", err)
-		return err
-	}
-
-	leader := topicCmd.LeaderID
-	if leader == "" {
-		leader = f.getCurrentRaftLeaderID()
 	}
 
 	f.mu.Lock()
-	f.partitionMetadata[topicCmd.Name] = &PartitionMetadata{
-		PartitionCount: topicCmd.Partitions,
-		Leader:         leader,
-		LeaderEpoch:    1,
+
+	var brokers []string
+	for id, info := range f.brokers {
+		if info.Status == "active" {
+			brokers = append(brokers, id)
+		}
 	}
+	sort.Strings(brokers)
+
+	if len(brokers) == 0 {
+		f.mu.Unlock()
+		util.Error("FSM: No active brokers available for topic creation")
+		return fmt.Errorf("no active brokers")
+	}
+
+	if topicCmd.Partitions <= 0 {
+		f.mu.Unlock()
+		util.Error("FSM: Invalid partition count %d for topic %s", topicCmd.Partitions, topicCmd.Name)
+		return fmt.Errorf("invalid partition count: %d", topicCmd.Partitions)
+	}
+
+	if topicCmd.LeaderID != "" {
+		found := false
+		for _, b := range brokers {
+			if b == topicCmd.LeaderID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			f.mu.Unlock()
+			util.Error("FSM: Explicit leader %s not in active broker set %v", topicCmd.LeaderID, brokers)
+			return fmt.Errorf("leader %s not in active broker set", topicCmd.LeaderID)
+		}
+	}
+
+	for i := 0; i < topicCmd.Partitions; i++ {
+		key := fmt.Sprintf("%s-%d", topicCmd.Name, i)
+
+		assignedLeader := topicCmd.LeaderID
+		if assignedLeader == "" {
+			assignedLeader = brokers[i%len(brokers)]
+		}
+
+		replicasCopy := append([]string(nil), brokers...)
+		isrCopy := append([]string(nil), brokers...)
+
+		f.partitionMetadata[key] = &PartitionMetadata{
+			PartitionCount: topicCmd.Partitions,
+			Leader:         assignedLeader,
+			LeaderEpoch:    1,
+			Idempotent:     topicCmd.Idempotent,
+			Replicas:       replicasCopy,
+			ISR:            isrCopy,
+		}
+		util.Info("FSM: Assigned leader %s to partition %s", assignedLeader, key)
+	}
+
+	tm := f.tm
 	f.mu.Unlock()
 
-	if f.tm != nil {
-		f.tm.CreateTopic(topicCmd.Name, topicCmd.Partitions)
-		util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, topicCmd.Partitions)
+	if tm != nil {
+		if err := tm.CreateTopic(topicCmd.Name, topicCmd.Partitions, topicCmd.Idempotent); err != nil {
+			util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicCmd.Name, err)
+		}
+	}
+	util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, topicCmd.Partitions)
+
+	return nil
+}
+
+func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
+	var payload struct {
+		Topic string `json:"topic"`
+	}
+	if err := json.Unmarshal([]byte(jsonData), &payload); err != nil {
+		util.Error("FSM: Failed to unmarshal topic delete command: %v", err)
+		return err
+	}
+
+	f.mu.Lock()
+
+	for key := range f.partitionMetadata {
+		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
+			delete(f.partitionMetadata, key)
+		}
+	}
+
+	tm := f.tm
+	f.mu.Unlock()
+
+	if tm != nil {
+		tm.DeleteTopic(payload.Topic)
+	}
+	util.Info("FSM: Deleted topic '%s'", payload.Topic)
+
+	return nil
+}
+
+func (f *BrokerFSM) applyPartitionCommand(jsonData string) interface{} {
+	parts := strings.SplitN(jsonData, ":", 2)
+	if len(parts) != 2 {
+		util.Error("FSM: Invalid partition command format: %s", jsonData)
+		return fmt.Errorf("invalid partition command format")
+	}
+
+	key := parts[0]
+	var metadata PartitionMetadata
+	if err := json.Unmarshal([]byte(parts[1]), &metadata); err != nil {
+		util.Error("FSM: Failed to unmarshal partition metadata for %s: %v", key, err)
+		return err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.partitionMetadata[key] = &metadata
+	util.Debug("FSM: Updated partition metadata for %s", key)
+	return nil
+}
+
+// applyJoinGroupCommand restores group join state.
+func (f *BrokerFSM) applyJoinGroupCommand(jsonData string) interface{} {
+	var cmd struct {
+		Group  string `json:"group"`
+		Member string `json:"member"`
+	}
+	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
+		util.Error("FSM: Failed to unmarshal join group: %v", err)
+		return err
+	}
+
+	if f.cd != nil {
+		_, err := f.cd.AddConsumer(cmd.Group, cmd.Member)
+		if err != nil {
+			return err
+		}
+		util.Info("FSM: Synced JOIN_GROUP group=%s member=%s", cmd.Group, cmd.Member)
+	}
+	return nil
+}
+
+func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
+	var cmd struct {
+		Type   string `json:"type"`
+		Group  string `json:"group"`
+		Member string `json:"member"`
+		Topic  string `json:"topic"`
+	}
+
+	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
+		util.Error("Failed to unmarshal group sync: %v", err)
+		return err
+	}
+
+	if f.cd == nil {
+		return fmt.Errorf("coordinator not ready")
+	}
+
+	switch cmd.Type {
+	case "JOIN":
+		if f.cd.GetGroup(cmd.Group) == nil {
+			if f.tm == nil {
+				return fmt.Errorf("topic manager not available in FSM")
+			}
+			t := f.tm.GetTopic(cmd.Topic)
+			if t == nil {
+				return fmt.Errorf("topic '%s' not found during group join", cmd.Topic)
+			}
+
+			if err := f.cd.RegisterGroup(cmd.Topic, cmd.Group, len(t.Partitions)); err != nil {
+				util.Warn("FSM: Failed to auto-register group %s: %v", cmd.Group, err)
+			} else {
+				util.Info("FSM: Auto-registered group %s for topic %s", cmd.Group, cmd.Topic)
+			}
+		}
+
+		_, err := f.cd.AddConsumer(cmd.Group, cmd.Member)
+		if err != nil {
+			return err
+		}
+	case "LEAVE":
+		_ = f.cd.RemoveConsumer(cmd.Group, cmd.Member)
 	}
 
 	return nil
 }
 
-func (f *BrokerFSM) applyPartitionCommand(data string) error {
-	key, metadata, err := f.parsePartitionCommand(data)
-	if err != nil {
+func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
+	var info BrokerInfo
+	if err := json.Unmarshal([]byte(jsonData), &info); err != nil {
+		util.Error("FSM: Failed to unmarshal registration: %v", err)
 		return err
 	}
 
-	f.storePartitionMetadata(key, metadata)
-	util.Debug("Updated partition metadata for %s", key)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.brokers[info.ID] = &info
+
+	util.Info("FSM: Member %s added to registry", info.ID)
+	return nil
+}
+
+func (f *BrokerFSM) applyDeregisterCommand(jsonData string) interface{} {
+	var info struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(jsonData), &info); err != nil {
+		util.Error("FSM: Failed to unmarshal deregistration: %v", err)
+		return err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if b, ok := f.brokers[info.ID]; ok {
+		b.Status = "inactive"
+		util.Info("FSM: Member %s marked as inactive", info.ID)
+	}
 	return nil
 }
 
@@ -91,70 +264,4 @@ func (f *BrokerFSM) handleUnknownCommand(data string) interface{} {
 	return fmt.Errorf("unknown command: %s", preview)
 }
 
-func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
-	var cmd struct {
-		Type   string `json:"type"` // JOIN or LEAVE
-		Group  string `json:"group"`
-		Member string `json:"member"`
-		Topic  string `json:"topic"`
-	}
-
-	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
-		util.Error("Failed to unmarshal group sync: %v", err)
-		return err
-	}
-
-	if f.cd == nil {
-		util.Warn("Coordinator not set in FSM, skipping group sync")
-		return nil
-	}
-
-	switch cmd.Type {
-	case "JOIN":
-		if f.cd.GetGroup(cmd.Group) == nil {
-			util.Info("FSM: Group '%s' not found, creating implicitly for topic '%s'", cmd.Group, cmd.Topic)
-
-			var partitionCount int
-			if t := f.tm.GetTopic(cmd.Topic); t != nil {
-				partitionCount = len(t.Partitions)
-			}
-
-			if err := f.cd.RegisterGroup(cmd.Topic, cmd.Group, partitionCount); err != nil {
-				util.Error("FSM: Failed to implicitly register group: %v", err)
-				return err
-			}
-		}
-
-		_, err := f.cd.AddConsumer(cmd.Group, cmd.Member)
-		if err != nil {
-			util.Error("FSM: Failed to sync JOIN for member %s: %v", cmd.Member, err)
-		} else {
-			util.Info("FSM: Synced JOIN group=%s member=%s", cmd.Group, cmd.Member)
-		}
-	case "LEAVE":
-		err := f.cd.RemoveConsumer(cmd.Group, cmd.Member)
-		if err != nil {
-			util.Warn("FSM: LEAVE failed (potentially already removed): %v", err)
-		} else {
-			util.Info("FSM: Synced LEAVE group=%s member=%s", cmd.Group, cmd.Member)
-		}
-	}
-	return nil
-}
-
-func (f *BrokerFSM) applyJoinGroupCommand(data string) interface{} {
-	var info BrokerInfo
-	if err := json.Unmarshal([]byte(data), &info); err != nil {
-		return fmt.Errorf("failed to unmarshal join info: %w", err)
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	info.LastSeen = time.Now()
-	info.Status = "active"
-	f.brokers[info.ID] = &info
-
-	util.Info("FSM: Member %s added to registry", info.ID)
-	return nil
-}
+// applyMessageCommand is defined in fsm_replication.go and is not duplicated here.

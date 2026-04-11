@@ -1,24 +1,20 @@
+# Consumer
 broker_addrs:  
-  - "broker-1:9000"  
-  - "broker-2:9000"  
-  - "broker-3:9000"  
+  - "broker-1:9000"
+  - "broker-2:9000"
+  - "broker-3:9000"
+log_level: "info"
+
+topic: "bench-topic"
+group_id: "cluster-consumer-group"
+consumer_id: "cluster-consumer-1"
+
+mode: "polling"
+poll_interval: 100ms
+poll_timeout_ms: 5000
+batch_size: 5000
+
+session_timeout_ms: 30000
 enable_benchmark: true
 enable_correctness: true
 num_messages: 100000
-log_level: "info"
-topic: "bench-topic"
-group_id: "test-consumer-group-1"
-consumer_id: "consumer-1"
-mode: "polling"
-
-poll_interval: 10ms
-poll_timeout_ms: 5000
-max_poll_records: 1000
-
-enable_auto_commit: true
-auto_commit_interval: 500ms
-commit_retry_backoff: 100ms
-
-session_timeout_ms: 10000
-heartbeat_interval_ms: 3000
-streaming_read_deadline_ms: 10000

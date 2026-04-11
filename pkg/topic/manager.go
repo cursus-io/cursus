@@ -22,14 +22,13 @@ type StreamManager interface {
 
 type TopicManager struct {
 	topics        map[string]*Topic
-	DedupMap      sync.Map
-	cleanupInt    time.Duration
 	stopCh        chan struct{}
 	hp            HandlerProvider
 	mu            sync.RWMutex
 	cfg           *config.Config
 	StreamManager StreamManager
 	coordinator   *coordinator.Coordinator
+	producerState map[string]map[int]map[string]int64 // Topic -> Partition -> ProducerID -> LastSeq
 }
 
 // HandlerProvider defines an interface to provide disk handlers.
@@ -42,24 +41,18 @@ func (tm *TopicManager) SetCoordinator(cd *coordinator.Coordinator) {
 }
 
 func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *TopicManager {
-	cleanupSec := cfg.CleanupInterval
-	if cleanupSec <= 0 {
-		cleanupSec = 60
-	}
-
 	tm := &TopicManager{
 		topics:        make(map[string]*Topic),
-		cleanupInt:    time.Duration(cleanupSec) * time.Second,
 		stopCh:        make(chan struct{}),
 		hp:            hp,
 		cfg:           cfg,
 		StreamManager: sm,
+		producerState: make(map[string]map[int]map[string]int64),
 	}
-	go tm.cleanupLoop()
 	return tm
 }
 
-func (tm *TopicManager) CreateTopic(name string, partitionCount int) {
+func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent bool) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -67,24 +60,25 @@ func (tm *TopicManager) CreateTopic(name string, partitionCount int) {
 		current := len(existing.Partitions)
 		switch {
 		case partitionCount < current:
-			util.Error("⚠️ cannot decrease partitions for topic '%s' (%d → %d)\n", name, current, partitionCount)
-			return
+			util.Error("cannot decrease partitions for topic '%s' (%d -> %d)", name, current, partitionCount)
+			return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", name, current, partitionCount)
 		case partitionCount > current:
 			existing.AddPartitions(partitionCount-current, tm.hp)
-			util.Info("🔄 topic '%s' partitions increased: %d → %d\n", name, current, len(existing.Partitions))
-			return
+			util.Info("topic '%s' partitions increased: %d -> %d", name, current, len(existing.Partitions))
+			return nil
 		default:
-			util.Info("ℹ️ topic '%s' already exists with %d partitions\n", name, current)
-			return
+			util.Info("topic '%s' already exists with %d partitions", name, current)
+			return nil
 		}
 	}
 
-	t, err := NewTopic(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager)
+	t, err := NewTopic(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager, idempotent)
 	if err != nil {
-		util.Error("❌ failed to create topic '%s': %v\n", name, err)
-		return
+		util.Error("failed to create topic '%s': %v", name, err)
+		return fmt.Errorf("failed to create topic '%s': %w", name, err)
 	}
 	tm.topics[name] = t
+	return nil
 }
 
 func (tm *TopicManager) GetTopic(name string) *Topic {
@@ -148,6 +142,18 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 
 	for _, m := range messages {
 		msg := m
+
+		// Check for duplicate before routing; do NOT advance sequence state yet.
+		if msg.ProducerID != "" && msg.SeqNum > 0 {
+			tm.mu.Lock()
+			isDup := tm.isDuplicateProducer(topicName, -1, &msg)
+			tm.mu.Unlock()
+			if isDup {
+				util.Debug("tm: skipping duplicate message (Global) in batch from producer %s (seq %d)", msg.ProducerID, msg.SeqNum)
+				continue
+			}
+		}
+
 		partition = t.GetPartitionForMessage(msg)
 		if partition == -1 {
 			util.Debug("tm: skipping message for topic '%s' (no valid partition found)", topicName)
@@ -155,10 +161,6 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 			continue
 		}
 
-		if tm.checkAndMarkDuplicate(topicName, partition, &msg) {
-			util.Debug("Duplicate message detected: topic: %s, partition=%d, seqNum=%d", topicName, partition, msg.SeqNum)
-			continue
-		}
 		partitioned[partition] = append(partitioned[partition], msg)
 	}
 
@@ -166,7 +168,22 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 		return fmt.Errorf("failed to route any messages in batch for topic '%s' (all partitions returned -1)", topicName)
 	}
 
-	return tm.executeBatch(t, partitioned, async)
+	if err := tm.executeBatch(t, partitioned, async); err != nil {
+		return err
+	}
+
+	// Advance sequence state only after all writes succeeded.
+	tm.mu.Lock()
+	for _, msgs := range partitioned {
+		for i := range msgs {
+			if msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
+				tm.markProducerSequence(topicName, -1, &msgs[i])
+			}
+		}
+	}
+	tm.mu.Unlock()
+
+	return nil
 }
 
 func (tm *TopicManager) executeBatch(t *Topic, partitioned map[int][]types.Message, async bool) error {
@@ -221,14 +238,9 @@ func (tm *TopicManager) PublishBatchAsync(topicName string, messages []types.Mes
 	return tm.processBatchMessages(topicName, messages, true)
 }
 
-func (tm *TopicManager) publishInternal(topicName string, partition int, msg *types.Message, requireAck bool) error {
+func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Message, requireAck bool) error {
 	util.Debug("Starting publish. Topic: %s, RequireAck: %v, ProducerID: %s, SeqNum: %d", topicName, requireAck, msg.ProducerID, msg.SeqNum)
 	start := time.Now()
-
-	if tm.checkAndMarkDuplicate(topicName, partition, msg) {
-		util.Debug("Duplicate message detected. topic: %s, partition=%d, producerID=%s, seqNum=%d", topicName, partition, msg.ProducerID, msg.SeqNum)
-		return nil
-	}
 
 	t := tm.GetTopic(topicName)
 	if t == nil {
@@ -236,21 +248,60 @@ func (tm *TopicManager) publishInternal(topicName string, partition int, msg *ty
 		return fmt.Errorf("topic '%s' does not exist", topicName)
 	}
 
+	// Check for duplicate before writing; do NOT advance sequence state yet.
+	if msg.ProducerID != "" && msg.SeqNum > 0 {
+		tm.mu.Lock()
+		isDup := tm.isDuplicateProducer(topicName, -1, msg)
+		tm.mu.Unlock()
+		if isDup {
+			util.Debug("tm: skipping duplicate message (Global) from producer %s (seq %d)", msg.ProducerID, msg.SeqNum)
+			return nil
+		}
+	}
+
 	if requireAck {
 		if err := t.PublishSync(*msg); err != nil {
-			// Allow safe retry with same message
-			dedupKey := tm.getDedupKey(topicName, partition, msg)
-			tm.DedupMap.Delete(dedupKey)
 			return fmt.Errorf("sync publish failed: %w", err)
 		}
 	} else {
 		t.Publish(*msg)
 	}
 
+	// Advance sequence state only after the write has been accepted.
+	if msg.ProducerID != "" && msg.SeqNum > 0 {
+		tm.mu.Lock()
+		tm.markProducerSequence(topicName, -1, msg)
+		tm.mu.Unlock()
+	}
+
 	elapsed := time.Since(start).Seconds()
 	metrics.MessagesProcessed.Inc()
 	metrics.LatencyHist.Observe(elapsed)
 	return nil
+}
+
+// isDuplicateProducer checks whether msg is a duplicate based on producer sequence state.
+// It does NOT mutate state; call markProducerSequence after a successful write.
+func (tm *TopicManager) isDuplicateProducer(topicName string, partition int, msg *types.Message) bool {
+	if tm.producerState[topicName] == nil {
+		return false
+	}
+	if tm.producerState[topicName][partition] == nil {
+		return false
+	}
+	lastSeq, ok := tm.producerState[topicName][partition][msg.ProducerID]
+	return ok && int64(msg.SeqNum) <= lastSeq
+}
+
+// markProducerSequence records the producer's latest sequence number after a successful write.
+func (tm *TopicManager) markProducerSequence(topicName string, partition int, msg *types.Message) {
+	if tm.producerState[topicName] == nil {
+		tm.producerState[topicName] = make(map[int]map[string]int64)
+	}
+	if tm.producerState[topicName][partition] == nil {
+		tm.producerState[topicName][partition] = make(map[string]int64)
+	}
+	tm.producerState[topicName][partition][msg.ProducerID] = int64(msg.SeqNum)
 }
 
 func (tm *TopicManager) RegisterConsumerGroup(topicName, groupName string, consumerCount int) (*types.ConsumerGroup, error) {
@@ -295,35 +346,12 @@ func (tm *TopicManager) Stop() {
 	close(tm.stopCh)
 }
 
-func (tm *TopicManager) cleanupLoop() {
-	ticker := time.NewTicker(tm.cleanupInt)
-	for {
-		select {
-		case <-ticker.C:
-			tm.CleanupDedup()
-		case <-tm.stopCh:
-			ticker.Stop()
-			return
-		}
-	}
-}
-
-func (tm *TopicManager) CleanupDedup() {
-	expireBefore := time.Now().Add(-30 * time.Minute)
-	tm.DedupMap.Range(func(key, value any) bool {
-		if ts, ok := value.(time.Time); ok && ts.Before(expireBefore) {
-			tm.DedupMap.Delete(key)
-			metrics.CleanupCount.Inc()
-		}
-		return true
-	})
-}
-
 func (tm *TopicManager) DeleteTopic(name string) bool {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	if _, ok := tm.topics[name]; ok {
 		delete(tm.topics, name)
+		delete(tm.producerState, name)
 		return true
 	}
 	return false
@@ -349,17 +377,3 @@ func (tm *TopicManager) EnsureDefaultGroups() {
 	}
 }
 
-func (tm *TopicManager) getDedupKey(topicName string, _ int, msg *types.Message) string {
-	if msg.ProducerID != "" && msg.SeqNum > 0 {
-		return fmt.Sprintf("%s-%s-%d", topicName, msg.ProducerID, msg.SeqNum)
-	}
-	return fmt.Sprintf("%s-%s", topicName, msg.Payload)
-}
-
-func (tm *TopicManager) checkAndMarkDuplicate(topicName string, partition int, msg *types.Message) bool {
-	dedupKey := tm.getDedupKey(topicName, partition, msg)
-	if _, loaded := tm.DedupMap.LoadOrStore(dedupKey, time.Now()); loaded {
-		return true
-	}
-	return false
-}

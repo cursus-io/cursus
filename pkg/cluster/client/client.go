@@ -21,6 +21,70 @@ func NewTCPClusterClient() *TCPClusterClient {
 	}
 }
 
+func (c *TCPClusterClient) StartHeartbeat(ctx context.Context, peers []string, nodeID, localAddr string, discoveryPort int) {
+	ticker := time.NewTicker(1 * time.Second)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// sendHeartbeat internal loop uses goroutines now
+				_ = c.sendHeartbeat(peers, nodeID, localAddr, discoveryPort)
+			}
+		}
+	}()
+}
+
+func (c *TCPClusterClient) sendHeartbeat(peers []string, nodeID, localAddr string, discoveryPort int) error {
+	apiPort := discoveryPort
+	if apiPort == 0 {
+		apiPort = 8000
+	}
+
+	payload := map[string]string{"node_id": nodeID}
+	body, _ := json.Marshal(payload)
+	cmd := fmt.Sprintf("HEARTBEAT_CLUSTER %s", string(body))
+
+	for _, peer := range peers {
+		// Launch each heartbeat in a separate goroutine to avoid blocking on DNS/Connection
+		go func(p string) {
+			addrOnly := p
+			if strings.Contains(p, "@") {
+				addrOnly = strings.Split(p, "@")[1]
+			}
+
+			if addrOnly == localAddr {
+				return
+			}
+
+			host := addrOnly
+			if strings.Contains(addrOnly, ":") {
+				var err error
+				host, _, err = net.SplitHostPort(addrOnly)
+				if err != nil {
+					host = addrOnly
+				}
+			}
+
+			target := net.JoinHostPort(host, fmt.Sprintf("%d", apiPort))
+			
+			// Use short timeout for heartbeat connection
+			conn, err := net.DialTimeout("tcp", target, 1*time.Second)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			// Set a write deadline to prevent goroutine buildup on slow connections
+			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_ = util.WriteWithLength(conn, util.EncodeMessage("cluster", cmd))
+		}(peer)
+	}
+	return nil
+}
+
 func (c *TCPClusterClient) JoinCluster(peers []string, nodeID, addr string, discoveryPort int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -36,153 +100,87 @@ func (c *TCPClusterClient) joinClusterWithContext(ctx context.Context, peers []s
 
 	seedHosts := c.extractSeedHosts(peers, addr)
 	if len(seedHosts) == 0 {
-		util.Warn("No seed hosts available for join; aborting join attempts")
 		return fmt.Errorf("no seed hosts available")
 	}
 
-	maxAttempts := 8
-	backoff := time.Second
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		if err := c.attemptJoin(ctx, seedHosts, nodeID, addr, apiPort, attempt, maxAttempts); err != nil {
-			util.Warn("Join attempt %d failed: %v", attempt, err)
-		} else {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
-		}
-		backoff *= 2
-		if backoff > 10*time.Second {
-			backoff = 10 * time.Second
-		}
-	}
-
-	return fmt.Errorf("failed to join cluster after %d attempts", maxAttempts)
-}
-
-func (c *TCPClusterClient) attemptJoin(ctx context.Context, seedHosts []string, nodeID, addr string, apiPort, attempt, maxAttempts int) error {
-	payload := map[string]string{
-		"node_id": nodeID,
-		"address": addr,
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal join payload: %w", err)
-	}
-	joinCmd := fmt.Sprintf("JOIN_CLUSTER %s", string(body))
-
-	for _, seed := range seedHosts {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		hostOnly := seed
-		if strings.Contains(seed, ":") {
-			if h, _, err := net.SplitHostPort(seed); err == nil {
-				hostOnly = h
+	for attempt := 1; attempt <= 5; attempt++ {
+		for _, seed := range seedHosts {
+			hostOnly := seed
+			if strings.Contains(seed, ":") {
+				if h, _, err := net.SplitHostPort(seed); err == nil {
+					hostOnly = h
+				}
+			}
+			targetAddr := net.JoinHostPort(hostOnly, fmt.Sprintf("%d", apiPort))
+			
+			if err := c.sendJoinCommand(ctx, targetAddr, nodeID, addr); err == nil {
+				return nil
 			}
 		}
-		addr := net.JoinHostPort(hostOnly, fmt.Sprintf("%d", apiPort))
-		util.Info("attempting cluster join to %s (attempt %d/%d)", addr, attempt, maxAttempts)
-
-		if err := c.sendJoinCommand(ctx, addr, joinCmd); err != nil {
-			util.Warn("join request to %s failed: %v", addr, err)
-			continue
+		// Respect context cancellation while retrying
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second):
 		}
-
-		return nil
 	}
 
-	return fmt.Errorf("all join attempts failed")
+	return fmt.Errorf("failed to join cluster after 5 attempts")
 }
 
-func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, joinCmd string) error {
-	dialer := &net.Dialer{
-		Timeout: c.timeout,
+func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, localAddr string) error {
+	payload := map[string]string{
+		"node_id": nodeID,
+		"address": localAddr,
 	}
+	body, _ := json.Marshal(payload)
+	joinCmd := fmt.Sprintf("JOIN_CLUSTER %s", string(body))
 
+	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return fmt.Errorf("connect failed: %w", err)
+		return err
 	}
-	defer func() { _ = conn.Close() }()
+	defer conn.Close()
+
+	// Set connection deadlines based on the context's remaining time
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	}
 
 	if err := util.WriteWithLength(conn, util.EncodeMessage("cluster", joinCmd)); err != nil {
-		return fmt.Errorf("send command failed: %w", err)
+		return err
 	}
 
 	resp, err := util.ReadWithLength(conn)
 	if err != nil {
-		return fmt.Errorf("read response failed: %w", err)
+		return err
 	}
 
 	var jr struct {
 		Success bool   `json:"success"`
-		Leader  string `json:"leader"`
 		Error   string `json:"error"`
 	}
 	if err := json.Unmarshal(resp, &jr); err != nil {
-		return fmt.Errorf("invalid response: %w", err)
+		return err
 	}
 
-	if jr.Success {
-		util.Info("join succeeded via %s; leader=%s", addr, jr.Leader)
-		return nil
+	if !jr.Success {
+		return fmt.Errorf("%s", jr.Error)
 	}
 
-	if jr.Leader != "" {
-		return c.retryWithLeader(ctx, jr.Leader, 8000, joinCmd)
-	}
-
-	return fmt.Errorf("join failed: %s", jr.Error)
-}
-
-func (c *TCPClusterClient) retryWithLeader(ctx context.Context, leader string, apiPort int, joinCmd string) error {
-	leaderHost := leader
-	if strings.Contains(leader, ":") {
-		if h, _, err := net.SplitHostPort(leader); err == nil {
-			leaderHost = h
-		}
-	}
-
-	addr := net.JoinHostPort(leaderHost, fmt.Sprintf("%d", apiPort))
-	util.Info("retrying join at leader %s", addr)
-
-	return c.sendJoinCommand(ctx, addr, joinCmd)
+	return nil
 }
 
 func (c *TCPClusterClient) extractSeedHosts(peers []string, localAddr string) []string {
 	seedHosts := make([]string, 0, len(peers))
 	for _, p := range peers {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-
-		var addrOnly string
+		addrOnly := p
 		if strings.Contains(p, "@") {
-			parts := strings.SplitN(p, "@", 2)
-			if len(parts) == 2 {
-				addrOnly = parts[1]
-			} else {
-				addrOnly = p
-			}
-		} else {
-			addrOnly = p
+			addrOnly = strings.Split(p, "@")[1]
 		}
-
 		if addrOnly != localAddr {
 			seedHosts = append(seedHosts, addrOnly)
 		}

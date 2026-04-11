@@ -1,17 +1,24 @@
+# Consumer
 broker_addrs:  
   - "broker:9000" 
-enable_benchmark: true
-enable_correctness: true
-num_messages: 100000
-log_level: "info"
+log_level: "info" # debug, info, warn, error
+
 topic: "bench-topic"
 group_id: "test-consumer-group-1"
 consumer_id: "consumer-1"
-mode: "polling"
 
+# Consumption
+mode: "polling" # polling, streaming
 poll_interval: 100ms
 poll_timeout_ms: 3000
 batch_size: 10000
-session_timeout_ms: 8000
-streaming_read_deadline_ms: 10000
 max_poll_records: 10000
+
+# Timeout
+session_timeout_ms: 30000
+streaming_read_deadline_ms: 10000
+
+# Benchmark, Validation
+enable_benchmark: true
+enable_correctness: true
+num_messages: 100000

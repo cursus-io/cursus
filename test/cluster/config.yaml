@@ -1,29 +1,33 @@
-enabled_distribution: true
-min_insync_replicas: 2
-raft_port: 7000
-static_cluster_members: 
-  - "broker-1@broker-1:7000"
-  - "broker-2@broker-2:7000"
-  - "broker-3@broker-3:7000"
-
 broker_port: 9000
 health_check_port: 9080
 enable_exporter: true
 exporter_port: 9100
 log_level: "info"
-log_dir: "broker-logs"
 
-disk_flush_batch_size: 1000
-disk_write_timeout_ms: 500
-linger_ms: 50
-log_cleanup_interval: 300  
+# Distributed Clustering
+enabled_distribution: true
+raft_port: 9001
+discovery_port: 8000
+min_insync_replicas: 2
+bootstrap_cluster: true
+static_cluster_members: 
+  - "broker-1-9000@broker-1:9001"
+  - "broker-2-9000@broker-2:9001"
+  - "broker-3-9000@broker-3:9001"
 
-channel_buffer_size: 1024 
-partition_channel_buffer_size: 10000  
-consumer_channel_buffer_size: 1000  
-consumer_session_timeout_ms: 30000  
-consumer_heartbeat_check_ms: 5000   
+# Idempotency
+enable_idempotence: false
 
-max_stream_connections: 1000  
-stream_timeout: "30m"  
-stream_heartbeat_interval: "30s"
+# Disk storage and performance
+log_dir: "cluster-logs"
+linger_ms: 100
+disk_flush_batch_size: 10000            
+channel_buffer_size: 100000
+partition_channel_buffer_size: 100000
+broadcast_channel_buffer_size: 100000
+log_cleanup_interval: 300
+log_segment_bytes: 1073741824 # 1GB
+
+# Consumer session management
+consumer_session_timeout_ms: 30000
+consumer_heartbeat_check_ms: 5000

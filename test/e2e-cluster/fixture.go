@@ -66,7 +66,7 @@ func GivenCluster(t *testing.T) *ClusterTestContext {
 
 func GivenClusterRestart(t *testing.T) *ClusterTestContext {
 	_ = e2e.RunCompose("-f", composeFile, "down", "-v", "--remove-orphans").Run()
-	cmd := e2e.RunCompose("-f", composeFile, "up", "-d", "--force-recreate")
+	cmd := e2e.RunCompose("-f", composeFile, "up", "-d", "--force-recreate", "--build")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("Failed to start docker compose: %v\nOutput: %s", err, string(output))
 	}

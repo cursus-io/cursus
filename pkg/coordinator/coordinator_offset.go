@@ -134,8 +134,11 @@ func (c *Coordinator) updateOffsetPartitionCount() {
 	c.mu.Unlock()
 
 	go func() {
-		c.topicHandler.CreateTopic(topicName, newCount)
-		util.Info("✅ Offset topic '%s' partitions scaled to %d", topicName, newCount)
+		if err := c.topicHandler.CreateTopic(topicName, newCount, false); err != nil {
+			util.Error("Failed to scale offset topic '%s' to %d partitions: %v", topicName, newCount, err)
+			return
+		}
+		util.Info("Offset topic '%s' partitions scaled to %d", topicName, newCount)
 	}()
 }
 

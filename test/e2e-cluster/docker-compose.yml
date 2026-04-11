@@ -8,22 +8,21 @@ services:
     environment:
       - CONFIG_PATH=/root/config.yaml
       - ADVERTISED_HOST=broker-1
-      - BOOTSTRAP_CLUSTER=true
-      - RAFT_PEERS=
-    volumes:
-      - ../cluster/config.yaml:/root/config.yaml:ro
+      - RAFT_PORT=9001
+      - DISCOVERY_PORT=8000
     ports:
       - "9001:9000"
+      - "8000:8000"
       - "9081:9080"
-      - "9101:9100"
-      - "8001:8000"
-    networks:
-      - cluster_network
+    volumes:
+      - ../cluster/config.yaml:/root/config.yaml
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9080/health"]
       interval: 3s
       timeout: 1s
       retries: 3
+    networks:
+      - cluster_network
 
   broker-2:
     build:
@@ -34,15 +33,14 @@ services:
     environment:
       - CONFIG_PATH=/root/config.yaml
       - ADVERTISED_HOST=broker-2
-      - BOOTSTRAP_CLUSTER=false
-      - RAFT_PEERS=
-    volumes:
-      - ../cluster/config.yaml:/root/config.yaml:ro
+      - RAFT_PORT=9001
+      - DISCOVERY_PORT=8000
     ports:
       - "9002:9000"
+      - "8001:8000"
       - "9082:9080"
-      - "9102:9100"
-      - "8002:8000"
+    volumes:
+      - ../cluster/config.yaml:/root/config.yaml
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9080/health"]
       interval: 3s
@@ -63,15 +61,14 @@ services:
     environment:
       - CONFIG_PATH=/root/config.yaml
       - ADVERTISED_HOST=broker-3
-      - BOOTSTRAP_CLUSTER=false
-      - RAFT_PEERS=
-    volumes:
-      - ../cluster/config.yaml:/root/config.yaml:ro
+      - RAFT_PORT=9001
+      - DISCOVERY_PORT=8000
     ports:
       - "9003:9000"
+      - "8002:8000"
       - "9083:9080"
-      - "9103:9100"
-      - "8003:8000"
+    volumes:
+      - ../cluster/config.yaml:/root/config.yaml
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9080/health"]
       interval: 3s

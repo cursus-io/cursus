@@ -22,11 +22,14 @@ type Coordinator struct {
 	offsetTopicPartitionCount int
 
 	offsets map[string]map[string]map[int]uint64 // group -> topic -> partition -> offset
+
+	// ensure only the active GroupCoordinator handles session expiration.
+	leaderChecker func() bool
 }
 
 type TopicHandler interface {
 	Publish(topic string, msg *types.Message) error
-	CreateTopic(topic string, partitionCount int)
+	CreateTopic(topic string, partitionCount int, idempotent bool) error
 }
 
 // GroupMetadata holds metadata for a single consumer group.
@@ -99,8 +102,16 @@ func NewCoordinator(cfg *config.Config, handler TopicHandler) *Coordinator {
 		offsets:                   make(map[string]map[string]map[int]uint64),
 	}
 
-	handler.CreateTopic(c.offsetTopic, c.offsetTopicPartitionCount)
+	if err := handler.CreateTopic(c.offsetTopic, c.offsetTopicPartitionCount, false); err != nil {
+		util.Error("Coordinator: failed to create offset topic '%s': %v", c.offsetTopic, err)
+	}
 	return c
+}
+
+func (c *Coordinator) SetLeaderChecker(f func() bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.leaderChecker = f
 }
 
 // Start launches background monitoring processes (e.g., heartbeat monitor).

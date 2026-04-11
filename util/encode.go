@@ -35,7 +35,7 @@ func DecodeMessage(data []byte) (string, string, error) {
 	return topic, payload, nil
 }
 
-func EncodeBatchMessages(topic string, partition int, acks string, msgs []types.Message) ([]byte, error) {
+func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent bool, msgs []types.Message) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.Write([]byte{0xBA, 0x7C})
 
@@ -70,6 +70,10 @@ func EncodeBatchMessages(topic string, partition int, acks string, msgs []types.
 	}
 	if _, err := buf.Write(acksBytes); err != nil {
 		return nil, fmt.Errorf("write acks bytes failed: %w", err)
+	}
+
+	if err := write(isIdempotent); err != nil {
+		return nil, err
 	}
 
 	var batchStart, batchEnd uint64
@@ -174,6 +178,11 @@ func DecodeBatchMessages(data []byte) (*types.Batch, error) {
 		return nil, fmt.Errorf("failed to read acks bytes: %w", err)
 	}
 
+	var isIdempotent bool
+	if err := binary.Read(reader, binary.BigEndian, &isIdempotent); err != nil {
+		return nil, fmt.Errorf("failed to read isIdempotent: %w", err)
+	}
+
 	var batchStart, batchEnd uint64
 	if err := binary.Read(reader, binary.BigEndian, &batchStart); err != nil {
 		return nil, fmt.Errorf("failed to read batch start: %w", err)
@@ -187,11 +196,20 @@ func DecodeBatchMessages(data []byte) (*types.Batch, error) {
 		return nil, fmt.Errorf("failed to read message count: %w", err)
 	}
 
+	if msgCount < 0 {
+		return nil, fmt.Errorf("invalid negative message count: %d", msgCount)
+	}
+	const maxBatchMessages = 100000
+	if msgCount > maxBatchMessages {
+		return nil, fmt.Errorf("message count too high: %d (max: %d)", msgCount, maxBatchMessages)
+	}
+
 	batch := &types.Batch{
-		Topic:     string(topicBytes),
-		Partition: int(partition),
-		Acks:      string(acksBytes),
-		Messages:  make([]types.Message, 0, msgCount),
+		Topic:        string(topicBytes),
+		Partition:    int(partition),
+		Acks:         string(acksBytes),
+		IsIdempotent: isIdempotent,
+		Messages:     make([]types.Message, 0, msgCount),
 	}
 
 	for i := 0; i < int(msgCount); i++ {

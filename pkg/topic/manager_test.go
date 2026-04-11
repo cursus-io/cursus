@@ -108,7 +108,6 @@ func TestNewTopicManager(t *testing.T) {
 
 	assert.NotNil(t, tm)
 	assert.NotNil(t, tm.topics)
-	assert.Equal(t, time.Duration(cfg.CleanupInterval)*time.Second, tm.cleanupInt)
 	assert.NotNil(t, tm.stopCh)
 	assert.Equal(t, hp, tm.hp)
 	assert.Equal(t, cfg, tm.cfg)
@@ -119,7 +118,7 @@ func TestNewTopicManager(t *testing.T) {
 	case <-tm.stopCh:
 		// success
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("cleanupLoop didn't stop in time")
+		t.Fatal("stopCh was not closed")
 	}
 }
 
@@ -138,12 +137,12 @@ func TestTopicManagerCreateTopic(t *testing.T) {
 		hp.On("GetHandler", topicName, i).Return(mockStorageHandler, nil).Once()
 	}
 
-	tm.CreateTopic(topicName, partitionCount)
+	assert.NoError(t, tm.CreateTopic(topicName, partitionCount, false))
 	assert.NotNil(t, tm.GetTopic(topicName))
 	assert.Equal(t, partitionCount, len(tm.GetTopic(topicName).Partitions))
 	hp.AssertExpectations(t)
 
-	tm.CreateTopic(topicName, partitionCount)
+	assert.NoError(t, tm.CreateTopic(topicName, partitionCount, false))
 	assert.Equal(t, partitionCount, len(tm.GetTopic(topicName).Partitions))
 	hp.AssertExpectations(t)
 
@@ -154,18 +153,18 @@ func TestTopicManagerCreateTopic(t *testing.T) {
 		hp.On("GetHandler", topicName, i).Return(mockStorageHandler, nil).Once()
 	}
 
-	tm.CreateTopic(topicName, newPartitionCount)
+	assert.NoError(t, tm.CreateTopic(topicName, newPartitionCount, false))
 	assert.Equal(t, newPartitionCount, len(tm.GetTopic(topicName).Partitions))
 	hp.AssertExpectations(t)
 
-	tm.CreateTopic(topicName, 2)
+	assert.Error(t, tm.CreateTopic(topicName, 2, false))
 	assert.Equal(t, newPartitionCount, len(tm.GetTopic(topicName).Partitions)) // should still be 5
 	hp.AssertExpectations(t)
 
 	errorTopicName := "error-topic"
 	hp.On("GetHandler", errorTopicName, 0).Return(nil, assert.AnError).Once()
 
-	tm.CreateTopic(errorTopicName, 1)
+	assert.Error(t, tm.CreateTopic(errorTopicName, 1, false))
 	assert.Nil(t, tm.GetTopic(errorTopicName))
 	hp.AssertExpectations(t)
 

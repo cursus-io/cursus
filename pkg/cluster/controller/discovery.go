@@ -17,7 +17,9 @@ type ServiceDiscovery interface {
 	DiscoverBrokers() ([]fsm.BrokerInfo, error)
 	AddNode(nodeID string, addr string) (string, error)
 	RemoveNode(nodeID string) (string, error)
+	UpdateHeartbeat(nodeID string)
 	StartReconciler(ctx context.Context)
+	Reconcile()
 }
 
 type serviceDiscovery struct {
@@ -78,6 +80,12 @@ func (sd *serviceDiscovery) DiscoverBrokers() ([]fsm.BrokerInfo, error) {
 	return brokers, nil
 }
 
+func (sd *serviceDiscovery) UpdateHeartbeat(nodeID string) {
+	if sd.rm != nil && sd.rm.GetISRManager() != nil {
+		sd.rm.GetISRManager().UpdateHeartbeat(nodeID)
+	}
+}
+
 func (sd *serviceDiscovery) AddNode(nodeID string, addr string) (string, error) {
 	leaderAddr := sd.rm.GetLeaderAddress()
 	if !sd.rm.IsLeader() {
@@ -103,8 +111,14 @@ func (sd *serviceDiscovery) AddNode(nodeID string, addr string) (string, error) 
 	}
 
 	if err := sd.rm.ApplyCommand("REGISTER", data); err != nil {
-		util.Error("REGISTER command failed after AddVoter. Raft cluster and FSM are now inconsistent: id=%s err=%v", nodeID, err)
-		return leaderAddr, fmt.Errorf("REGISTER command failed: %w", err)
+		util.Error("REGISTER command failed after AddVoter. Attempting rollback: id=%s err=%v", nodeID, err)
+		if rollbackErr := sd.rm.RemoveServer(nodeID); rollbackErr != nil {
+			util.Error("CRITICAL: Rollback RemoveServer failed after REGISTER failure: id=%s err=%v", nodeID, rollbackErr)
+			return leaderAddr, fmt.Errorf("REGISTER failed and rollback failed: %v (rollback error: %v)", err, rollbackErr)
+		} else {
+			util.Info("Successfully rolled back AddVoter for node %s", nodeID)
+		}
+		return leaderAddr, fmt.Errorf("REGISTER command failed (rolled back): %w", err)
 	}
 
 	return leaderAddr, nil
@@ -141,7 +155,7 @@ func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
 				if !sd.rm.IsLeader() {
 					continue
 				}
-				sd.reconcile()
+				sd.Reconcile()
 			case <-ctx.Done():
 				util.Debug("reconciler stopping for broker %s due to context cancellation", sd.brokerID)
 				return
@@ -150,7 +164,7 @@ func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
 	}()
 }
 
-func (sd *serviceDiscovery) reconcile() {
+func (sd *serviceDiscovery) Reconcile() {
 	future := sd.rm.GetConfiguration()
 	if err := future.Error(); err != nil {
 		util.Error("Failed to get Raft configuration: %v", err)

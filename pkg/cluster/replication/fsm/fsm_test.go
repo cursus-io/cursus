@@ -8,11 +8,44 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
 )
 
+type MockStorageHandler struct {
+	types.StorageHandler
+	offset uint64
+}
+
+func (m *MockStorageHandler) Write(msg types.Message) (uint64, error) {
+	m.offset++
+	return m.offset, nil
+}
+func (m *MockStorageHandler) AppendMessage(topic string, partition int, msg *types.Message) (uint64, error) {
+	m.offset++
+	msg.Offset = m.offset
+	return m.offset, nil
+}
+func (m *MockStorageHandler) GetAbsoluteOffset() uint64 { return m.offset }
+func (m *MockStorageHandler) GetLatestOffset() uint64   { return m.offset }
+func (m *MockStorageHandler) ReserveOffsets(n int) uint64 {
+	start := m.offset
+	m.offset += uint64(n)
+	return start
+}
+func (m *MockStorageHandler) Close() error { return nil }
+
+type MockHandlerProvider struct{}
+
+func (m *MockHandlerProvider) GetHandler(topic string, partitionID int) (types.StorageHandler, error) {
+	return &MockStorageHandler{}, nil
+}
+
 func newTestFSM() *BrokerFSM {
-	fsm := NewBrokerFSM(nil, nil, nil)
+	tm := topic.NewTopicManager(config.DefaultConfig(), &MockHandlerProvider{}, nil)
+	fsm := NewBrokerFSM(nil, tm, nil)
 
 	if fsm.brokers == nil {
 		fsm.brokers = make(map[string]*BrokerInfo)
@@ -67,11 +100,11 @@ func TestBrokerFSM_Apply_Deregister(t *testing.T) {
 	fsm := newTestFSM()
 	fsm.brokers["b1"] = &BrokerInfo{ID: "b1"}
 
-	log := &raft.Log{Data: []byte("DEREGISTER:b1"), Index: 2}
+	log := &raft.Log{Data: []byte("DEREGISTER:{\"id\":\"b1\"}"), Index: 2}
 	fsm.Apply(log)
 
-	if len(fsm.GetBrokers()) != 0 {
-		t.Error("Broker not deregistered")
+	if fsm.brokers["b1"].Status != "inactive" {
+		t.Error("Broker not marked inactive")
 	}
 }
 
@@ -79,15 +112,15 @@ func TestBrokerFSM_Apply_Deregister_ReturnsNil(t *testing.T) {
 	fsm := newTestFSM()
 	fsm.brokers["b1"] = &BrokerInfo{ID: "b1"}
 
-	log := &raft.Log{Data: []byte("DEREGISTER:b1"), Index: 2}
+	log := &raft.Log{Data: []byte("DEREGISTER:{\"id\":\"b1\"}"), Index: 2}
 	result := fsm.Apply(log)
 
 	if result != nil {
 		t.Fatalf("DEREGISTER should return nil, got: %v", result)
 	}
 
-	if len(fsm.GetBrokers()) != 0 {
-		t.Fatal("broker not deregistered")
+	if fsm.brokers["b1"].Status != "inactive" {
+		t.Fatal("broker status not inactive")
 	}
 }
 
@@ -195,6 +228,84 @@ func TestBrokerFSM_Snapshot_ClosesSink(t *testing.T) {
 
 	if !sink.closed {
 		t.Fatal("snapshot sink was not closed")
+	}
+}
+
+func TestBrokerFSM_ValidateIdempotency(t *testing.T) {
+	fsm := newTestFSM()
+	fsm.partitionMetadata["t1"] = &PartitionMetadata{PartitionCount: 1, Idempotent: true}
+
+	cmd := &types.MessageCommand{
+		Topic:        "t1",
+		Partition:    0,
+		IsIdempotent: false,
+		Messages: []types.Message{
+			{ProducerID: "p1", SeqNum: 1, Payload: "m1"},
+		},
+	}
+
+	if err := fsm.validateMessageCommand(cmd); err != nil {
+		t.Errorf("Initial message should be valid via topic policy: %v", err)
+	}
+
+	// Error (First must be 1)
+	cmd2 := &types.MessageCommand{
+		Topic:     "t1",
+		Partition: 0,
+		Messages: []types.Message{
+			{ProducerID: "p2", SeqNum: 2, Payload: "m1"},
+		},
+	}
+	if err := fsm.validateMessageCommand(cmd2); err == nil {
+		t.Error("Expected error for first message with SeqNum 2, got nil")
+	}
+
+	fsm.updateProducerState("t1", -1, "p1", 1)
+
+	cmd.Partition = 0
+	cmd.Messages[0].SeqNum = 2
+	if err := fsm.validateMessageCommand(cmd); err != nil {
+		t.Errorf("Next message (SeqNum 2) should be valid on partition 0 via global scope: %v", err)
+	}
+}
+
+func TestBrokerFSM_SequenceScope_Partition(t *testing.T) {
+	fsm := newTestFSM()
+	fsm.partitionMetadata["t1"] = &PartitionMetadata{PartitionCount: 2, Idempotent: true}
+	if err := fsm.tm.CreateTopic("t1", 2, true); err != nil {
+		t.Fatalf("CreateTopic failed: %v", err)
+	}
+
+	cmdP0 := &types.MessageCommand{
+		Topic:         "t1",
+		Partition:     0,
+		SequenceScope: "partition",
+		Messages:      []types.Message{{ProducerID: "p1", SeqNum: 1, Payload: "m1"}},
+	}
+	cmdP1 := &types.MessageCommand{
+		Topic:         "t1",
+		Partition:     1,
+		SequenceScope: "partition",
+		Messages:      []types.Message{{ProducerID: "p1", SeqNum: 1, Payload: "m1"}},
+	}
+
+	if err := fsm.validateMessageCommand(cmdP0); err != nil {
+		t.Errorf("Initial P0 should be valid: %v", err)
+	}
+	if err := fsm.validateMessageCommand(cmdP1); err != nil {
+		t.Errorf("Initial P1 should be valid (independent sequence): %v", err)
+	}
+
+	fsm.applyMessageBatch(cmdP0)
+	fsm.applyMessageBatch(cmdP1)
+
+	cmdP0.Messages[0].SeqNum = 2
+	cmdP1.Messages[0].SeqNum = 2
+	if err := fsm.validateMessageCommand(cmdP0); err != nil {
+		t.Errorf("P0 next message should be valid: %v", err)
+	}
+	if err := fsm.validateMessageCommand(cmdP1); err != nil {
+		t.Errorf("P1 next message should be valid: %v", err)
 	}
 }
 

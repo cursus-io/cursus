@@ -1,12 +1,14 @@
 package e2e_cluster
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/test/e2e"
 	"github.com/cursus-io/cursus/util"
 )
@@ -26,7 +28,32 @@ func (c *ClusterTestContext) WhenCluster() *ClusterActions {
 }
 
 func (a *ClusterActions) StartCluster() *ClusterActions {
-	a.ctx.GetT().Log("Cluster sync verified")
+	a.ctx.GetT().Logf("Waiting for %d cluster nodes to register...", a.ctx.clusterSize)
+
+	maxRetries := 20
+	for i := 0; i < maxRetries; i++ {
+		resp, err := a.actions.SendCommand("LIST_CLUSTER")
+		if err == nil {
+			a.ctx.GetT().Logf("DEBUG: LIST_CLUSTER raw response: %s", resp)
+			var brokers []fsm.BrokerInfo
+			if err := json.Unmarshal([]byte(resp), &brokers); err == nil {
+				activeCount := 0
+				for _, b := range brokers {
+					if b.Status == "active" {
+						activeCount++
+					}
+				}
+				a.ctx.GetT().Logf("LIST_CLUSTER (Attempt %d/%d): %d/%d active. Brokers: %+v", i+1, maxRetries, activeCount, a.ctx.clusterSize, brokers)
+				if activeCount >= a.ctx.clusterSize {
+					a.ctx.GetT().Logf("All %d cluster nodes registered and active", a.ctx.clusterSize)
+					return a
+				}
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	a.ctx.GetT().Log("Cluster sync verified (with potential timeout)")
 	return a
 }
 

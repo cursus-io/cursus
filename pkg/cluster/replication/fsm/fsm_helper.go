@@ -1,10 +1,6 @@
 package fsm
 
 import (
-	"encoding/json"
-	"fmt"
-	"strings"
-
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
@@ -18,26 +14,36 @@ func errorAckResponse(msg, producerID string, epoch int64) types.AckResponse {
 	}
 }
 
-func (f *BrokerFSM) parsePartitionCommand(data string) (string, *PartitionMetadata, error) {
-	startIdx := strings.Index(data, "{")
-	if startIdx == -1 {
-		return "", nil, fmt.Errorf("invalid PARTITION command: JSON metadata not found")
+func (f *BrokerFSM) UpdatePartitionISR(key string, isr []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	metadata, ok := f.partitionMetadata[key]
+	if !ok {
+		return
 	}
 
-	prefix := data[:startIdx]
-	prefix = strings.TrimPrefix(prefix, "PARTITION:")
-	key := strings.TrimSuffix(prefix, ":")
+	oldISR := metadata.ISR
+	f.partitionMetadata[key].ISR = isr
 
-	if key == "" {
-		return "", nil, fmt.Errorf("invalid PARTITION command: missing key")
+	if isrMembershipChanged(oldISR, isr) {
+		util.Debug("FSM: ISR updated for %s: %v -> %v", key, oldISR, isr)
 	}
+}
 
-	var metadata PartitionMetadata
-	dec := json.NewDecoder(strings.NewReader(data[startIdx:]))
-	if err := dec.Decode(&metadata); err != nil {
-		util.Error("Failed to unmarshal partition metadata for key %s: %v", key, err)
-		return "", nil, err
+// isrMembershipChanged returns true if the two ISR slices differ in length or membership.
+func isrMembershipChanged(a, b []string) bool {
+	if len(a) != len(b) {
+		return true
 	}
-
-	return key, &metadata, nil
+	members := make(map[string]struct{}, len(a))
+	for _, m := range a {
+		members[m] = struct{}{}
+	}
+	for _, m := range b {
+		if _, ok := members[m]; !ok {
+			return true
+		}
+	}
+	return false
 }

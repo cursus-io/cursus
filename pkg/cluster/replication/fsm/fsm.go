@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -100,14 +99,18 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 	data := string(log.Data)
 	var reqID string
 
+	// skip prefixs like "MESSAGE:" or "REGISTER:"
 	if startIdx := strings.Index(data, "{"); startIdx != -1 {
-		dec := json.NewDecoder(strings.NewReader(data[startIdx:]))
+		jsonData := data[startIdx:]
+		dec := json.NewDecoder(strings.NewReader(jsonData))
 		var meta struct {
 			ReqID string `json:"req_id"`
 		}
 
 		if err := dec.Decode(&meta); err != nil {
-			util.Error("FSM Apply: failed to decode req_id: %v", err)
+			if !strings.Contains(data, "REGISTER:") && !strings.Contains(data, "DEREGISTER:") {
+				util.Debug("FSM Apply: potential JSON decode issue for req_id (Prefix: %s): %v", data[:startIdx], err)
+			}
 		} else {
 			reqID = meta.ReqID
 		}
@@ -127,8 +130,10 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyMessageCommand(strings.TrimPrefix(data, "BATCH:"))
 	case strings.HasPrefix(data, "TOPIC:"):
 		res = f.applyTopicCommand(strings.TrimPrefix(data, "TOPIC:"))
+	case strings.HasPrefix(data, "TOPIC_DELETE:"):
+		res = f.applyTopicDeleteCommand(strings.TrimPrefix(data, "TOPIC_DELETE:"))
 	case strings.HasPrefix(data, "PARTITION:"):
-		res = f.applyPartitionCommand(data)
+		res = f.applyPartitionCommand(strings.TrimPrefix(data, "PARTITION:"))
 	case strings.HasPrefix(data, "GROUP_SYNC:"):
 		res = f.applyGroupSyncCommand(strings.TrimPrefix(data, "GROUP_SYNC:"))
 	case strings.HasPrefix(data, "OFFSET_SYNC:"):
@@ -239,24 +244,59 @@ func (f *BrokerFSM) GetPartitionMetadata(key string) *PartitionMetadata {
 
 	if meta := f.partitionMetadata[key]; meta != nil {
 		copy := *meta
+		// Deep copy slices to avoid aliasing internal FSM state
+		if meta.Replicas != nil {
+			copy.Replicas = make([]string, len(meta.Replicas))
+			for i, r := range meta.Replicas {
+				copy.Replicas[i] = r
+			}
+		}
+		if meta.ISR != nil {
+			copy.ISR = make([]string, len(meta.ISR))
+			for i, r := range meta.ISR {
+				copy.ISR[i] = r
+			}
+		}
 		return &copy
 	}
 	return nil
 }
 
-// todo. (issues #27)
-func (f *BrokerFSM) getCurrentRaftLeaderID() string {
+func (f *BrokerFSM) GetBroker(id string) *BrokerInfo {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	if len(f.brokers) == 0 {
-		return ""
+	if broker, ok := f.brokers[id]; ok {
+		copy := *broker
+		return &copy
 	}
+	return nil
+}
 
-	var ids []string
-	for id := range f.brokers {
-		ids = append(ids, id)
+func (f *BrokerFSM) RegisterNotifier(reqID string) chan interface{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	ch := make(chan interface{}, 1)
+	f.notifiers[reqID] = ch
+	return ch
+}
+
+func (f *BrokerFSM) UnregisterNotifier(reqID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.notifiers, reqID)
+}
+
+func (f *BrokerFSM) notify(reqID string, res interface{}) {
+	f.mu.RLock()
+	ch, ok := f.notifiers[reqID]
+	f.mu.RUnlock()
+
+	if ok {
+		select {
+		case ch <- res:
+		default:
+		}
 	}
-	sort.Strings(ids)
-	return ids[0]
 }

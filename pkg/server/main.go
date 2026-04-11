@@ -73,7 +73,7 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	if cfg.EnabledDistribution {
 		brokerID := fmt.Sprintf("%s-%d", cfg.AdvertisedHost, cfg.BrokerPort)
 		localAddr := fmt.Sprintf("%s:%d", cfg.AdvertisedHost, cfg.RaftPort)
-		raftServerID := cfg.AdvertisedHost
+		raftServerID := brokerID
 
 		var err error
 		clusterClient := client.TCPClusterClient{}
@@ -91,23 +91,43 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 			}
 		}()
 
-		cc = clusterController.NewClusterController(ctx, cfg, rm, sd)
+		cc = clusterController.NewClusterController(ctx, cfg, rm, sd, brokerID, localAddr)
+
+		if cd != nil {
+			cd.SetLeaderChecker(cc.IsLeader)
+		}
+
+		// Start background heartbeats to all cluster members
+		clusterClient.StartHeartbeat(ctx, cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort)
 
 		globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
 		cc.SetLocalProcessor(globalCH)
+
+		// Every node should attempt to join the cluster via seeds
+		go func() {
+			util.Info("🚀 Attempting to join cluster via seeds...")
+			// Wait a bit for Raft to initialize
+			time.Sleep(2 * time.Second)
+			
+			if err := clusterClient.JoinCluster(cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort); err != nil {
+				util.Warn("⚠️ Join cluster attempt failed: %v. This is normal if already part of the cluster.", err)
+			} else {
+				util.Info("✅ Successfully joined cluster")
+			}
+		}()
 
 		go func() {
 			util.Info("🔄 Starting cluster leader election monitor...")
 			for isLeader := range rm.LeaderCh() {
 				if isLeader {
-					util.Info("🎉 Became cluster leader! Registering self and starting controller.")
+					util.Info("🎉 Became cluster leader! Syncing all members with FSM.")
 					if regErr := sd.Register(); regErr != nil {
 						util.Error("❌ Failed to register as leader: %v", regErr)
-						continue
 					}
-					util.Info("✅ Cluster registration completed")
+					// Immediate reconcile ensures all Raft members are in FSM
+					sd.Reconcile()
 				} else {
-					util.Info("💀 Lost cluster leadership. Stopping controller functions.")
+					util.Info("💀 Lost cluster leadership.")
 				}
 			}
 		}()
@@ -296,7 +316,7 @@ func isBatchMessage(data []byte) bool {
 }
 
 func isCommand(s string) bool {
-	keywords := []string{"CREATE", "DELETE", "LIST", "PUBLISH", "CONSUME", "STREAM", "HELP",
+	keywords := []string{"CREATE", "DELETE", "LIST", "LIST_CLUSTER", "PUBLISH", "CONSUME", "STREAM", "HELP",
 		"HEARTBEAT", "JOIN_GROUP", "LEAVE_GROUP", "COMMIT_OFFSET", "BATCH_COMMIT", "REGISTER_GROUP",
 		"GROUP_STATUS", "FETCH_OFFSET", "LIST_GROUPS", "SYNC_GROUP", "DESCRIBE"}
 	for _, k := range keywords {
@@ -317,6 +337,11 @@ func writeResponseWithTimeout(conn net.Conn, msg string, timeout time.Duration) 
 		util.Error("⚠️ SetWriteDeadline error: %v", err)
 		return
 	}
+	defer func() {
+		if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+			util.Error("Failed to reset write deadline: %v", err)
+		}
+	}()
 
 	if _, err := conn.Write(respLen); err != nil {
 		util.Error("⚠️ Write length error: %v", err)
@@ -325,9 +350,6 @@ func writeResponseWithTimeout(conn net.Conn, msg string, timeout time.Duration) 
 	if _, err := conn.Write(resp); err != nil {
 		util.Error("⚠️ Write response error: %v", err)
 		return
-	}
-	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
-		util.Error("Failed to reset write deadline: %v", err)
 	}
 }
 

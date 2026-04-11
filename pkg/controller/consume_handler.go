@@ -86,6 +86,11 @@ func (ch *CommandHandler) consumeFromTopic(conn net.Conn, topicName string, cArg
 	currentGen := -1
 	if ch.Coordinator != nil {
 		currentGen = ch.Coordinator.GetGeneration(cArgs.GroupName)
+
+		if err := ch.Coordinator.RecordHeartbeat(cArgs.GroupName, cArgs.MemberID); err != nil {
+			util.Warn("Failed to record heartbeat during consume: %v", err)
+			return 0, fmt.Errorf("heartbeat failed: %w", err)
+		}
 	}
 
 	if ctx.Generation != currentGen {
@@ -115,7 +120,7 @@ func (ch *CommandHandler) consumeFromTopic(conn net.Conn, topicName string, cArg
 	}
 
 	streamedCount := 0
-	messages, err := p.ReadMessages(currentOffset, cArgs.BatchSize)
+	messages, err := p.ReadCommitted(currentOffset, cArgs.BatchSize)
 	if err != nil {
 		util.Error("Failed to read messages: %v", err)
 		return streamedCount, err
@@ -126,9 +131,22 @@ func (ch *CommandHandler) consumeFromTopic(conn net.Conn, topicName string, cArg
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 
+		const heartbeatInterval = 1 * time.Second
+		lastHeartbeat := time.Now()
+
 		for time.Since(startTime) < cArgs.WaitTimeout {
 			<-ticker.C
-			newMessages, err := p.ReadMessages(currentOffset, cArgs.BatchSize)
+
+			// Renew heartbeat periodically so the coordinator does not evict
+			// the consumer while the poll is blocked waiting for messages.
+			if ch.Coordinator != nil && time.Since(lastHeartbeat) >= heartbeatInterval {
+				if err := ch.Coordinator.RecordHeartbeat(cArgs.GroupName, cArgs.MemberID); err != nil {
+					return streamedCount, fmt.Errorf("heartbeat failed during wait: %w", err)
+				}
+				lastHeartbeat = time.Now()
+			}
+
+			newMessages, err := p.ReadCommitted(currentOffset, cArgs.BatchSize)
 			if err != nil {
 				util.Error("Failed to read messages during wait: %v", err)
 				return streamedCount, err
@@ -140,7 +158,7 @@ func (ch *CommandHandler) consumeFromTopic(conn net.Conn, topicName string, cArg
 		}
 	}
 
-	batchData, err := util.EncodeBatchMessages(topicName, cArgs.PartitionID, "1", messages)
+	batchData, err := util.EncodeBatchMessages(topicName, cArgs.PartitionID, "1", false, messages)
 	if err != nil {
 		return 0, fmt.Errorf("failed to encode batch: %w", err)
 	}
@@ -241,7 +259,7 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	streamConn.SetCoordinator(ch.Coordinator)
 
 	readFn := func(offset uint64, max int) ([]types.Message, error) {
-		return p.ReadMessages(offset, max)
+		return p.ReadCommitted(offset, max)
 	}
 
 	return ch.StreamManager.AddStream(streamKey, streamConn, readFn, ch.Config.StreamCommitInterval)
