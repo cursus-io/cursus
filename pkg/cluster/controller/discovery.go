@@ -19,6 +19,7 @@ type ServiceDiscovery interface {
 	RemoveNode(nodeID string) (string, error)
 	UpdateHeartbeat(nodeID string)
 	StartReconciler(ctx context.Context)
+	Reconcile()
 }
 
 type serviceDiscovery struct {
@@ -154,7 +155,7 @@ func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
 				if !sd.rm.IsLeader() {
 					continue
 				}
-				sd.reconcile()
+				sd.Reconcile()
 			case <-ctx.Done():
 				util.Debug("reconciler stopping for broker %s due to context cancellation", sd.brokerID)
 				return
@@ -163,7 +164,7 @@ func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
 	}()
 }
 
-func (sd *serviceDiscovery) reconcile() {
+func (sd *serviceDiscovery) Reconcile() {
 	future := sd.rm.GetConfiguration()
 	if err := future.Error(); err != nil {
 		util.Error("Failed to get Raft configuration: %v", err)

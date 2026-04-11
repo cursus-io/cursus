@@ -88,6 +88,8 @@ func (ch *CommandHandler) handleCommandByType(cmd, upper string, ctx *ClientCont
 		return ch.handleDelete(cmd)
 	case strings.EqualFold(cmd, "LIST"):
 		return ch.handleList()
+	case strings.EqualFold(cmd, "LIST_CLUSTER"):
+		return ch.handleListCluster()
 	case strings.HasPrefix(upper, "PUBLISH "):
 		return ch.handlePublish(cmd)
 	case strings.HasPrefix(upper, "REGISTER_GROUP "):

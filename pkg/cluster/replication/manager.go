@@ -111,10 +111,11 @@ func NewRaftReplicationManager(cfg *config.Config, brokerID string, diskManager 
 	}
 
 	if cfg.BootstrapCluster {
+		util.Info("🚀 Raft node %s checking if bootstrap is needed", brokerID)
 		if confFuture := r.GetConfiguration(); confFuture.Error() == nil {
 			conf := confFuture.Configuration()
 			if len(conf.Servers) == 0 {
-				util.Info("🚀 Starting static cluster bootstrap")
+				util.Info("🚀 No Raft servers found, starting static cluster bootstrap (members=%v)", cfg.StaticClusterMembers)
 
 				var servers []raft.Server
 				for _, member := range cfg.StaticClusterMembers {
@@ -137,6 +138,7 @@ func NewRaftReplicationManager(cfg *config.Config, brokerID string, diskManager 
 						memberID = memberAddr
 					}
 
+					util.Info("🔗 Adding Raft voter: ID=%s, Addr=%s", memberID, memberAddr)
 					servers = append(servers, raft.Server{
 						ID:       raft.ServerID(memberID),
 						Address:  raft.ServerAddress(memberAddr),
@@ -146,10 +148,17 @@ func NewRaftReplicationManager(cfg *config.Config, brokerID string, diskManager 
 
 				if len(servers) > 0 {
 					bootstrapConfig := raft.Configuration{Servers: servers}
-					r.BootstrapCluster(bootstrapConfig)
-					util.Info("✅ Raft cluster bootstrap initiated with %d servers", len(servers))
+					if err := r.BootstrapCluster(bootstrapConfig).Error(); err != nil {
+						util.Error("❌ Raft bootstrap failed for node %s: %v", brokerID, err)
+					} else {
+						util.Info("✅ Raft cluster bootstrap initiated with %d servers on node %s", len(servers), brokerID)
+					}
 				}
+			} else {
+				util.Info("ℹ️ Raft node %s already has %d servers in configuration, skipping bootstrap", brokerID, len(conf.Servers))
 			}
+		} else {
+			util.Error("❌ Failed to get Raft configuration for node %s: %v", brokerID, confFuture.Error())
 		}
 	}
 

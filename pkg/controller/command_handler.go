@@ -138,6 +138,24 @@ func (ch *CommandHandler) handleList() string {
 	return strings.Join(names, ", ")
 }
 
+// handleListCluster processes LIST_CLUSTER command
+func (ch *CommandHandler) handleListCluster() string {
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+		fsm := ch.Cluster.RaftManager.GetFSM()
+		if fsm == nil {
+			return "ERROR: FSM not available"
+		}
+
+		brokers := fsm.GetBrokers()
+		data, err := json.Marshal(brokers)
+		if err != nil {
+			return fmt.Sprintf("ERROR: failed to marshal brokers: %v", err)
+		}
+		return string(data)
+	}
+	return "ERROR: distribution not enabled"
+}
+
 // handleRegisterGroup processes REGISTER_GROUP command
 func (ch *CommandHandler) handleRegisterGroup(cmd string) string {
 	args := parseKeyValueArgs(cmd[15:])

@@ -41,6 +41,7 @@ func ExpectDataConsistent() e2e.Expectation {
 
 		for _, p := range meta.Partitions {
 			if len(p.ISR) < 1 {
+				ctx.GetT().Logf("DEBUG: ISR empty for partition %d. Metadata: %+v", p.ID, p)
 				return fmt.Errorf("ISR is empty for partition %d", p.ID)
 			}
 			if p.Leader == "" {

@@ -46,13 +46,9 @@ type MockCommandApplier struct {
 
 func (m *MockCommandApplier) ApplyCommand(prefix string, data []byte) error {
 	if prefix == "PARTITION" {
-		// ISRManager passes JSON metadata, but FSM expects "TOPIC-PARTITION:JSON"
-		// We need to construct the full command data
-		topicName := "test-topic"
-		partitionID := 0
-		key := fmt.Sprintf("%s-%d", topicName, partitionID)
-		
-		fullData := fmt.Sprintf("PARTITION:%s:%s", key, string(data))
+		// ISRManager now passes "TOPIC-PARTITION:JSON" as data
+		// RaftReplicationManager adds "PARTITION:" prefix
+		fullData := fmt.Sprintf("PARTITION:%s", string(data))
 		result := m.fsm.Apply(&raft.Log{Data: []byte(fullData)})
 		if err, ok := result.(error); ok {
 			return err

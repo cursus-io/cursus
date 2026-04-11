@@ -103,18 +103,31 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 		globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
 		cc.SetLocalProcessor(globalCH)
 
+		// Every node should attempt to join the cluster via seeds
+		go func() {
+			util.Info("🚀 Attempting to join cluster via seeds...")
+			// Wait a bit for Raft to initialize
+			time.Sleep(2 * time.Second)
+			
+			if err := clusterClient.JoinCluster(cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort); err != nil {
+				util.Warn("⚠️ Join cluster attempt failed: %v. This is normal if already part of the cluster.", err)
+			} else {
+				util.Info("✅ Successfully joined cluster")
+			}
+		}()
+
 		go func() {
 			util.Info("🔄 Starting cluster leader election monitor...")
 			for isLeader := range rm.LeaderCh() {
 				if isLeader {
-					util.Info("🎉 Became cluster leader! Registering self and starting controller.")
+					util.Info("🎉 Became cluster leader! Syncing all members with FSM.")
 					if regErr := sd.Register(); regErr != nil {
 						util.Error("❌ Failed to register as leader: %v", regErr)
-						continue
 					}
-					util.Info("✅ Cluster registration completed")
+					// Immediate reconcile ensures all Raft members are in FSM
+					sd.Reconcile()
 				} else {
-					util.Info("💀 Lost cluster leadership. Stopping controller functions.")
+					util.Info("💀 Lost cluster leadership.")
 				}
 			}
 		}()
@@ -303,7 +316,7 @@ func isBatchMessage(data []byte) bool {
 }
 
 func isCommand(s string) bool {
-	keywords := []string{"CREATE", "DELETE", "LIST", "PUBLISH", "CONSUME", "STREAM", "HELP",
+	keywords := []string{"CREATE", "DELETE", "LIST", "LIST_CLUSTER", "PUBLISH", "CONSUME", "STREAM", "HELP",
 		"HEARTBEAT", "JOIN_GROUP", "LEAVE_GROUP", "COMMIT_OFFSET", "BATCH_COMMIT", "REGISTER_GROUP",
 		"GROUP_STATUS", "FETCH_OFFSET", "LIST_GROUPS", "SYNC_GROUP", "DESCRIBE"}
 	for _, k := range keywords {
