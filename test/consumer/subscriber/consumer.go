@@ -238,9 +238,26 @@ func (c *Consumer) startCommitWorker() {
 				flush()
 				c.processRetryQueue()
 
-			case <-c.mainCtx.Done():
-				flush()
-				return
+			case <-c.doneCh:
+				// Drain remaining commit entries before exiting
+				for {
+					select {
+					case entry, ok := <-c.commitCh:
+						if !ok {
+							flush()
+							return
+						}
+						if existing, exists := pendingOffsets[entry.partition]; !exists || entry.offset > existing {
+							pendingOffsets[entry.partition] = entry.offset
+						}
+						if entry.respCh != nil {
+							respChannels[entry.partition] = append(respChannels[entry.partition], entry.respCh)
+						}
+					default:
+						flush()
+						return
+					}
+				}
 			}
 		}
 	}()
@@ -922,9 +939,12 @@ func (c *Consumer) Close() error {
 	}
 
 	close(c.doneCh)
-	c.mainCancel()
 
+	// Wait for workers to finish processing remaining batches and commits
+	// before cancelling context, so final offset commits are not aborted.
 	c.wg.Wait()
+
+	c.mainCancel()
 	c.flushOffsets()
 
 	close(c.commitCh)

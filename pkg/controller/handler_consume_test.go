@@ -16,13 +16,13 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 	cfg := config.DefaultConfig()
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
-	tm.CreateTopic("topic1", 1, false)
+	_ = tm.CreateTopic("topic1", 1, false)
 	
 	p, _ := tm.GetTopic("topic1").GetPartition(0)
 	p.SetHWM(100)
 
 	coord := coordinator.NewCoordinator(cfg, &DummyPublisher{})
-	coord.RegisterGroup("topic1", "g1", 1)
+	_ = coord.RegisterGroup("topic1", "g1", 1)
 	memberID := "m1"
 	_, _ = coord.AddConsumer("g1", memberID)
 	coord.Rebalance("g1")
@@ -47,7 +47,7 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 
 		// Read response
 		buf := make([]byte, 1024)
-		client.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_ = client.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 		_, err := client.Read(buf)
 		assert.NoError(t, err)
 	})
@@ -66,7 +66,7 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 		}()
 
 		buf := make([]byte, 1024)
-		client.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_ = client.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 		_, err := client.Read(buf)
 		assert.NoError(t, err)
 	})

@@ -152,7 +152,7 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 	f.mu.Unlock()
 
 	if !topicExists {
-		return fmt.Errorf("topic '%s' not found", cmd.Topic)
+		return fmt.Errorf("partition metadata '%s' not found (topic=%s, partition=%d)", partitionKey, cmd.Topic, cmd.Partition)
 	}
 
 	if effectiveIdempotent {

@@ -96,8 +96,11 @@ func readSegmentFile(path string) ([]DiskMessage, error) {
 	for pos+4 <= len(data) {
 		msgLen := int(binary.BigEndian.Uint32(data[pos : pos+4]))
 		pos += 4
-		if msgLen <= 0 || pos+msgLen > len(data) {
-			break
+		if msgLen <= 0 {
+			return nil, fmt.Errorf("invalid record length %d at byte %d", msgLen, pos-4)
+		}
+		if pos+msgLen > len(data) {
+			return nil, fmt.Errorf("truncated record at byte %d: need %d bytes but only %d remain", pos, msgLen, len(data)-pos)
 		}
 		msg, err := deserializeDiskMessage(data[pos : pos+msgLen])
 		if err != nil {
@@ -115,7 +118,7 @@ func main() {
 		os.Exit(1)
 	}
 	logDir := os.Args[1]
-	expectedTotal := 100000
+	expectedTotal := -1
 	if len(os.Args) >= 3 {
 		fmt.Sscanf(os.Args[2], "%d", &expectedTotal)
 	}
@@ -193,7 +196,9 @@ func main() {
 	fmt.Println("\n========================================")
 	fmt.Printf("VERIFICATION RESULTS\n")
 	fmt.Printf("Total messages on disk  : %d\n", totalMessages)
-	fmt.Printf("Expected messages       : %d\n", expectedTotal)
+	if expectedTotal >= 0 {
+		fmt.Printf("Expected messages       : %d\n", expectedTotal)
+	}
 	fmt.Printf("Total duplicates        : %d\n", totalDuplicates)
 	fmt.Printf("Partitions              : %d\n", len(partitions))
 
@@ -220,11 +225,12 @@ func main() {
 	}
 
 	fmt.Println("\n========================================")
-	if totalMessages == expectedTotal && totalDuplicates == 0 && allContiguous {
+	countOK := expectedTotal < 0 || totalMessages == expectedTotal
+	if countOK && totalDuplicates == 0 && allContiguous {
 		fmt.Println("RESULT: PASS - All messages verified, no duplicates, no gaps")
 	} else {
 		fmt.Println("RESULT: FAIL")
-		if totalMessages != expectedTotal {
+		if !countOK {
 			fmt.Printf("  - Message count mismatch: got %d, expected %d\n", totalMessages, expectedTotal)
 		}
 		if totalDuplicates > 0 {

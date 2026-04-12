@@ -21,7 +21,7 @@ func TestCommandHandler_Publish(t *testing.T) {
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
 	ctx := controller.NewClientContext("test-group", 0)
 
-	tm.CreateTopic("test-topic", 1, false)
+	_ = tm.CreateTopic("test-topic", 1, false)
 
 	t.Run("PUBLISH basic", func(t *testing.T) {
 		cmd := "PUBLISH topic=test-topic producerId=p1 acks=1 message=hello"
@@ -80,7 +80,7 @@ func TestCommandHandler_Consume(t *testing.T) {
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
 	ctx := controller.NewClientContext("test-group", 0)
 
-	tm.CreateTopic("test-topic", 1, false)
+	_ = tm.CreateTopic("test-topic", 1, false)
 
 	t.Run("CONSUME syntax error", func(t *testing.T) {
 		resp := ch.HandleCommand("CONSUME topic=test-topic", ctx)
@@ -96,7 +96,7 @@ func TestCommandHandler_Consume(t *testing.T) {
 
 		go func() {
 			buf := make([]byte, 1024)
-			server.Read(buf)
+			_, _ = server.Read(buf)
 		}()
 
 		_, err := ch.HandleConsumeCommand(client, "CONSUME topic=test-topic", ctx)
@@ -112,7 +112,7 @@ func TestCommandHandler_BatchPublish(t *testing.T) {
 	tm := topic.NewTopicManager(cfg, hp, nil)
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
 
-	tm.CreateTopic("test-topic", 1, false)
+	_ = tm.CreateTopic("test-topic", 1, false)
 
 	t.Run("HandleBatchMessage valid", func(t *testing.T) {
 		msgs := []types.Message{

@@ -24,7 +24,7 @@ func TestCommandHandler_GroupOps(t *testing.T) {
 	cfg := config.DefaultConfig()
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
-	tm.CreateTopic("topic1", 4, false)
+	_ = tm.CreateTopic("topic1", 4, false)
 
 	coord := coordinator.NewCoordinator(cfg, &DummyPublisher{})
 	ch := controller.NewCommandHandler(tm, cfg, coord, nil, nil)
@@ -76,13 +76,13 @@ func TestCommandHandler_OffsetOps(t *testing.T) {
 	cfg := config.DefaultConfig()
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
-	tm.CreateTopic("topic1", 4, false)
+	_ = tm.CreateTopic("topic1", 4, false)
 
 	coord := coordinator.NewCoordinator(cfg, &DummyPublisher{})
 	ch := controller.NewCommandHandler(tm, cfg, coord, nil, nil)
 	ctx := controller.NewClientContext("g1", 0)
 
-	coord.RegisterGroup("topic1", "g1", 4)
+	_ = coord.RegisterGroup("topic1", "g1", 4)
 
 	t.Run("COMMIT_OFFSET", func(t *testing.T) {
 		resp := ch.HandleCommand("COMMIT_OFFSET topic=topic1 partition=0 group=g1 offset=123", ctx)

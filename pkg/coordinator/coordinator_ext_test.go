@@ -11,8 +11,8 @@ func TestCoordinator_StatusAndList(t *testing.T) {
 	cfg := &config.Config{}
 	c := NewCoordinator(cfg, &DummyPublisher{})
 
-	c.RegisterGroup("topic1", "group1", 4)
-	c.AddConsumer("group1", "c1")
+	_ = c.RegisterGroup("topic1", "group1", 4)
+	_, _ = c.AddConsumer("group1", "c1")
 	c.Rebalance("group1")
 
 	t.Run("ListGroups", func(t *testing.T) {
@@ -41,7 +41,7 @@ func TestCoordinator_Offsets(t *testing.T) {
 	cfg := &config.Config{}
 	c := NewCoordinator(cfg, &DummyPublisher{})
 
-	c.RegisterGroup("topic1", "group1", 2)
+	_ = c.RegisterGroup("topic1", "group1", 2)
 	
 	t.Run("FetchOffset - Empty", func(t *testing.T) {
 		off, ok := c.GetOffset("group1", "topic1", 0)
@@ -88,8 +88,8 @@ func TestCoordinator_MemberAssignments(t *testing.T) {
 	cfg := &config.Config{}
 	c := NewCoordinator(cfg, &DummyPublisher{})
 
-	c.RegisterGroup("t1", "g1", 2)
-	c.AddConsumer("g1", "m1")
+	_ = c.RegisterGroup("t1", "g1", 2)
+	_, _ = c.AddConsumer("g1", "m1")
 	c.Rebalance("g1")
 
 	asgn := c.GetMemberAssignments("g1", "m1")

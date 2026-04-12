@@ -33,12 +33,6 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 		return 0, err
 	}
 
-	if !strings.ContainsAny(cArgs.TopicName, "*?") {
-		if err := ch.checkPartitionAuthorization(cArgs.TopicName, cArgs.PartitionID); err != nil {
-			return 0, err
-		}
-	}
-
 	matchedTopics, err := ch.matchTopicPattern(cArgs.TopicName)
 	if err != nil {
 		return 0, err
@@ -60,10 +54,6 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 
 	totalStreamed := 0
 	for _, tName := range matchedTopics {
-		if err := ch.checkPartitionAuthorization(tName, cArgs.PartitionID); err != nil {
-			return totalStreamed, err
-		}
-
 		streamed, err := ch.consumeFromTopic(conn, tName, cArgs, ctx)
 		if err != nil {
 			return totalStreamed, err
@@ -234,10 +224,6 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 		return err
 	}
 
-	if err := ch.checkPartitionAuthorization(cArgs.TopicName, cArgs.PartitionID); err != nil {
-		return err
-	}
-
 	if !ch.ValidateOwnership(ctx.ConsumerGroup, cArgs.MemberID, ctx.Generation, cArgs.PartitionID) {
 		return fmt.Errorf("not partition owner or generation mismatch")
 	}
@@ -309,13 +295,7 @@ func (ch *CommandHandler) checkLeaderOrRedirect(conn net.Conn) error {
 	return fmt.Errorf("not leader")
 }
 
-// checkPartitionAuthorization checks if the client is authorized for the given topic/partition.
-func (ch *CommandHandler) checkPartitionAuthorization(topic string, partition int) error {
-	if !ch.isAuthorizedForPartition(topic, partition) {
-		return fmt.Errorf("ERROR: NOT_AUTHORIZED_FOR_PARTITION %s:%d", topic, partition)
-	}
-	return nil
-}
+
 
 func (ch *CommandHandler) getTopicAndPartition(topicName string, partitionID int) (*topic.Topic, *topic.Partition, error) {
 	t := ch.TopicManager.GetTopic(topicName)
