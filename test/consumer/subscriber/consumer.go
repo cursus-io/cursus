@@ -139,7 +139,7 @@ func (c *Consumer) validateCommitConn() bool {
 }
 
 func (c *Consumer) Start() error {
-	gen, mid, assignments, err := c.joinGroup()
+	gen, mid, assignments, err := c.joinGroupWithRetry()
 	if err != nil {
 		return fmt.Errorf("join group failed: %w", err)
 	}
@@ -542,13 +542,6 @@ func (c *Consumer) handleRebalanceSignal() {
 }
 
 func (c *Consumer) startConsuming() {
-	if atomic.LoadInt32(&c.rebalancing) == 1 {
-		return
-	}
-
-	atomic.StoreInt32(&c.rebalancing, 1)
-	defer atomic.StoreInt32(&c.rebalancing, 0)
-
 	if c.config.EnableBenchmark {
 		c.bmStartTime = time.Now()
 	}
@@ -614,6 +607,33 @@ func (c *Consumer) TriggerBenchmarkStop() {
 	}()
 }
 
+// joinGroupWithRetry retries joining the consumer group to handle scenarios
+// where the broker or topic is not yet ready (e.g., publisher hasn't created the topic yet).
+func (c *Consumer) joinGroupWithRetry() (int64, string, []int, error) {
+	const maxAttempts = 30
+	backoff := 1 * time.Second
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		gen, mid, assignments, err := c.joinGroup()
+		if err == nil {
+			return gen, mid, assignments, nil
+		}
+
+		util.Warn("Join group attempt %d/%d failed: %v", attempt, maxAttempts, err)
+
+		select {
+		case <-c.mainCtx.Done():
+			return 0, "", nil, fmt.Errorf("consumer shutting down during join retry")
+		case <-time.After(backoff):
+		}
+
+		if backoff < 5*time.Second {
+			backoff += 1 * time.Second
+		}
+	}
+	return 0, "", nil, fmt.Errorf("failed to join group after %d attempts", maxAttempts)
+}
+
 func (c *Consumer) joinGroup() (generation int64, memberID string, assignments []int, err error) {
 	conn, err := c.getLeaderConn()
 	if err != nil {
@@ -637,8 +657,8 @@ func (c *Consumer) joinGroup() (generation int64, memberID string, assignments [
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return 0, "", nil, fmt.Errorf("broker error: %s", respStr)
+	if !strings.HasPrefix(respStr, "OK") {
+		return 0, "", nil, fmt.Errorf("join group rejected: %s", respStr)
 	}
 
 	util.Info("join-group: %s\n", respStr)
@@ -705,8 +725,8 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return nil, fmt.Errorf("broker error: %s", respStr)
+	if !strings.HasPrefix(respStr, "OK") {
+		return nil, fmt.Errorf("sync group rejected: %s", respStr)
 	}
 
 	util.Info("sync-group: %s\n", respStr)
