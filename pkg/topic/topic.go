@@ -34,7 +34,9 @@ func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.C
 		if err != nil {
 			return nil, fmt.Errorf("open handler for %s[%d]: %w", name, i, err)
 		}
-		partitions[i] = NewPartition(i, name, dh, sm, cfg)
+		p := NewPartition(i, name, dh, sm, cfg)
+		p.isIdempotent = idempotent
+		partitions[i] = p
 	}
 	return &Topic{
 		Name:           name,
@@ -77,6 +79,7 @@ func (t *Topic) AddPartitions(extra int, hp HandlerProvider) {
 			return
 		}
 		newP := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
+		newP.isIdempotent = t.IsIdempotent
 		t.Partitions = append(t.Partitions, newP)
 	}
 }

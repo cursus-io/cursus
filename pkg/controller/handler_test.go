@@ -70,14 +70,11 @@ func TestHandleCommand_CreateListDelete(t *testing.T) {
 
 		switch {
 		case strings.HasPrefix(upper, "CREATE "):
-			// CREATE topic=<name> partitions=<n>
 			args := parseKeyValueArgs(cmd[7:])
-
 			topicName, ok := args["topic"]
 			if !ok || topicName == "" {
 				return "ERROR: missing topic name"
 			}
-
 			partitions := 4
 			if partStr, ok := args["partitions"]; ok {
 				if n, err := strconv.Atoi(partStr); err == nil && n > 0 {
@@ -86,7 +83,6 @@ func TestHandleCommand_CreateListDelete(t *testing.T) {
 					return "ERROR: partitions must be a positive integer"
 				}
 			}
-
 			t := ftm.CreateTopic(topicName, partitions)
 			return "✅ Topic '" + t.Name + "' now has " + strconv.Itoa(len(t.Partitions)) + " partitions"
 
@@ -98,22 +94,35 @@ func TestHandleCommand_CreateListDelete(t *testing.T) {
 			return strings.Join(names, ", ")
 
 		case strings.HasPrefix(upper, "DELETE "):
-			// DELETE topic=<name>
 			args := parseKeyValueArgs(cmd[7:])
-
 			topicName, ok := args["topic"]
 			if !ok || topicName == "" {
 				return "ERROR: missing topic name"
 			}
-
 			if ftm.DeleteTopic(topicName) {
 				return "🗑️ Topic '" + topicName + "' deleted"
 			}
 			return "ERROR: topic '" + topicName + "' not found"
 
+		case strings.HasPrefix(upper, "DESCRIBE "):
+			args := parseKeyValueArgs(cmd[9:])
+			topicName := args["topic"]
+			if topicName == "" {
+				return "ERROR: missing topic"
+			}
+			return "topic=" + topicName
+
+		case strings.EqualFold(cmd, "EXIT"):
+			return "bye"
+
 		default:
 			return "ERROR: unknown command"
 		}
+	}
+
+	respExit := handleCommandShim("EXIT")
+	if respExit != "bye" {
+		t.Fatalf("EXIT failed: %s", respExit)
 	}
 
 	resp := handleCommandShim("CREATE topic=testTopic partitions=3")
@@ -124,6 +133,11 @@ func TestHandleCommand_CreateListDelete(t *testing.T) {
 	resp = handleCommandShim("LIST")
 	if resp != "testTopic" {
 		t.Fatalf("LIST wrong result: %s", resp)
+	}
+
+	resp = handleCommandShim("DESCRIBE topic=testTopic")
+	if !strings.Contains(resp, "testTopic") {
+		t.Fatalf("DESCRIBE failed: %s", resp)
 	}
 
 	resp = handleCommandShim("DELETE topic=testTopic")
@@ -151,14 +165,11 @@ func TestHandleCommand_KeyValueFormat(t *testing.T) {
 
 		switch {
 		case strings.HasPrefix(upper, "CREATE "):
-			// CREATE topic=<name> partitions=<n>
 			args := parseKeyValueArgs(cmd[7:])
-
 			topicName, ok := args["topic"]
 			if !ok || topicName == "" {
 				return "ERROR: missing topic name"
 			}
-
 			partitions := 4
 			if partStr, ok := args["partitions"]; ok {
 				if n, err := strconv.Atoi(partStr); err == nil && n > 0 {
@@ -167,7 +178,6 @@ func TestHandleCommand_KeyValueFormat(t *testing.T) {
 					return "ERROR: partitions must be a positive integer"
 				}
 			}
-
 			t := ftm.CreateTopic(topicName, partitions)
 			return "✅ Topic '" + t.Name + "' now has " + strconv.Itoa(len(t.Partitions)) + " partitions"
 
@@ -179,14 +189,11 @@ func TestHandleCommand_KeyValueFormat(t *testing.T) {
 			return strings.Join(names, ", ")
 
 		case strings.HasPrefix(upper, "DELETE "):
-			// DELETE topic=<name>
 			args := parseKeyValueArgs(cmd[7:])
-
 			topicName, ok := args["topic"]
 			if !ok || topicName == "" {
 				return "ERROR: missing topic name"
 			}
-
 			if ftm.DeleteTopic(topicName) {
 				return "🗑️ Topic '" + topicName + "' deleted"
 			}
@@ -225,5 +232,16 @@ func TestHandleCommand_KeyValueFormat(t *testing.T) {
 	resp = handleCommandShim("LIST")
 	if resp != "(no topics)" {
 		t.Fatalf("expected empty list, got: %s", resp)
+	}
+}
+
+func TestClientContext(t *testing.T) {
+	ctx := controller.NewClientContext("group1", 1)
+	if ctx.ConsumerGroup != "group1" {
+		t.Errorf("Expected group1, got %s", ctx.ConsumerGroup)
+	}
+	ctx.SetConsumerGroup("group2")
+	if ctx.ConsumerGroup != "group2" {
+		t.Errorf("Expected group2, got %s", ctx.ConsumerGroup)
 	}
 }

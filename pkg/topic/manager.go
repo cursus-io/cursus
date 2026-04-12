@@ -144,7 +144,8 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 		msg := m
 
 		// Check for duplicate before routing; do NOT advance sequence state yet.
-		if msg.ProducerID != "" && msg.SeqNum > 0 {
+		// Only perform dedup when the topic has idempotency enabled.
+		if t.IsIdempotent && msg.ProducerID != "" && msg.SeqNum > 0 {
 			tm.mu.Lock()
 			isDup := tm.isDuplicateProducer(topicName, -1, &msg)
 			tm.mu.Unlock()
@@ -173,15 +174,17 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 	}
 
 	// Advance sequence state only after all writes succeeded.
-	tm.mu.Lock()
-	for _, msgs := range partitioned {
-		for i := range msgs {
-			if msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
-				tm.markProducerSequence(topicName, -1, &msgs[i])
+	if t.IsIdempotent {
+		tm.mu.Lock()
+		for _, msgs := range partitioned {
+			for i := range msgs {
+				if msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
+					tm.markProducerSequence(topicName, -1, &msgs[i])
+				}
 			}
 		}
+		tm.mu.Unlock()
 	}
-	tm.mu.Unlock()
 
 	return nil
 }
@@ -249,7 +252,8 @@ func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Mess
 	}
 
 	// Check for duplicate before writing; do NOT advance sequence state yet.
-	if msg.ProducerID != "" && msg.SeqNum > 0 {
+	// Only perform dedup when the topic has idempotency enabled.
+	if t.IsIdempotent && msg.ProducerID != "" && msg.SeqNum > 0 {
 		tm.mu.Lock()
 		isDup := tm.isDuplicateProducer(topicName, -1, msg)
 		tm.mu.Unlock()
@@ -268,7 +272,7 @@ func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Mess
 	}
 
 	// Advance sequence state only after the write has been accepted.
-	if msg.ProducerID != "" && msg.SeqNum > 0 {
+	if t.IsIdempotent && msg.ProducerID != "" && msg.SeqNum > 0 {
 		tm.mu.Lock()
 		tm.markProducerSequence(topicName, -1, msg)
 		tm.mu.Unlock()

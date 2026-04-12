@@ -3,10 +3,24 @@ package util
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+// IsNil checks if the interface value is nil, including its dynamic value.
+func IsNil(i interface{}) bool {
+	if i == nil {
+		return true
+	}
+	v := reflect.ValueOf(i)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Ptr, reflect.UnsafePointer, reflect.Interface, reflect.Slice:
+		return v.IsNil()
+	}
+	return false
+}
 
 type LogLevel int
 
