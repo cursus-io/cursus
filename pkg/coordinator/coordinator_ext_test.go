@@ -28,7 +28,9 @@ func TestCoordinator_StatusAndList(t *testing.T) {
 		assert.Equal(t, "Stable", status.State)
 		assert.Equal(t, 1, status.MemberCount)
 		assert.Equal(t, 4, status.PartitionCount)
-		assert.Equal(t, 4, len(status.Members[0].Assignments))
+		if assert.NotEmpty(t, status.Members) {
+			assert.Equal(t, 4, len(status.Members[0].Assignments))
+		}
 	})
 
 	t.Run("GetGroupStatus - Not Found", func(t *testing.T) {

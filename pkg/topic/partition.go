@@ -230,7 +230,7 @@ func (p *Partition) enqueueToBroadcast(msg types.Message) {
 }
 
 func (p *Partition) broadcastToStreams(msg types.Message) {
-	if p.streamManager == nil || util.IsNil(p.streamManager) {
+	if util.IsNil(p.streamManager) {
 		return
 	}
 

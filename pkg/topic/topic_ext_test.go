@@ -81,14 +81,11 @@ func TestTopic_Basic(t *testing.T) {
 	})
 
 	t.Run("PublishSync", func(t *testing.T) {
-		msg := types.Message{Payload: "sync-msg"}
-		mh := topic.Partitions[0].dh.(*MockStorageHandler)
-		mh.On("AppendMessageSync", topicName, 0, mock.Anything).Return(uint64(50), nil).Once()
+		msg := types.Message{Payload: "sync-msg", Key: "fixed-key"}
+		pID := topic.GetPartitionForMessage(msg)
+		mh := topic.Partitions[pID].dh.(*MockStorageHandler)
+		mh.On("AppendMessageSync", topicName, pID, mock.Anything).Return(uint64(50), nil).Once()
 
-		// Force the partition index to 0 by manipulating the counter if necessary,
-		// or just check which one was called.
-		// Since GetPartitionForMessage is round-robin, we can check.
-		topic.counter = 0 
 		err := topic.PublishSync(msg)
 		assert.NoError(t, err)
 		mh.AssertExpectations(t)
@@ -109,8 +106,10 @@ func TestPartition_Basic(t *testing.T) {
 		msg := types.Message{Payload: "msg1"}
 		mh.On("AppendMessage", "test-topic", 0, mock.Anything).Return(uint64(11), nil).Once()
 		p.Enqueue(msg)
-		time.Sleep(10 * time.Millisecond) // Wait for broadcaster
-		assert.Equal(t, uint64(12), p.NextOffset())
+		
+		assert.Eventually(t, func() bool {
+			return p.NextOffset() == 12
+		}, 500*time.Millisecond, 5*time.Millisecond, "offset should increment after enqueue")
 	})
 
 	t.Run("EnqueueSync", func(t *testing.T) {

@@ -1,6 +1,7 @@
 package controller_test
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -58,10 +59,10 @@ func TestCommandHandler_GroupOps(t *testing.T) {
 	})
 
 	t.Run("handleBatchCommit", func(t *testing.T) {
-		cmd := "BATCH_COMMIT topic=topic1 group=g1 generation=1 member=" + ctx.MemberID + " 0:150,1:250"
+		cmd := fmt.Sprintf("BATCH_COMMIT topic=topic1 group=g1 generation=%d member=%s 0:150,1:250", ctx.Generation, ctx.MemberID)
 		resp := ch.HandleCommand(cmd, ctx)
 		assert.Contains(t, resp, "OK batched=2")
-		
+
 		off0, _ := coord.GetOffset("g1", "topic1", 0)
 		assert.Equal(t, uint64(150), off0)
 	})

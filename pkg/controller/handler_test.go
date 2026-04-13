@@ -140,6 +140,11 @@ func TestHandleCommand_CreateListDelete(t *testing.T) {
 		t.Fatalf("DESCRIBE failed: %s", resp)
 	}
 
+	resp = handleCommandShim("DESCRIBE topic=")
+	if !strings.Contains(resp, "ERROR: missing topic") {
+		t.Fatalf("expected missing topic error, got: %s", resp)
+	}
+
 	resp = handleCommandShim("DELETE topic=testTopic")
 	if !strings.Contains(resp, "deleted") {
 		t.Fatalf("DELETE failed: %s", resp)

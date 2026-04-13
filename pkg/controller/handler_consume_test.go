@@ -2,6 +2,7 @@ package controller_test
 
 import (
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
 	_ = tm.CreateTopic("topic1", 1, false)
-	
+
 	p, _ := tm.GetTopic("topic1").GetPartition(0)
 	p.SetHWM(100)
 
@@ -37,19 +38,24 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 		defer server.Close()
 		defer client.Close()
 
+		errCh := make(chan error, 1)
 		go func() {
 			cmd := "CONSUME topic=topic1 partition=0 offset=0 group=g1 member=" + memberID
 			_, err := ch.HandleConsumeCommand(server, cmd, ctx)
-			if err != nil {
-				t.Logf("HandleConsumeCommand error: %v", err)
-			}
+			errCh <- err
 		}()
 
 		// Read response
 		buf := make([]byte, 1024)
-		_ = client.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_ = client.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		_, err := client.Read(buf)
 		assert.NoError(t, err)
+
+		client.Close()
+		err = <-errCh
+		if err != nil && !strings.Contains(err.Error(), "closed pipe") && !strings.Contains(err.Error(), "EOF") {
+			t.Errorf("HandleConsumeCommand failed: %v", err)
+		}
 	})
 
 	t.Run("HandleConsumeCommand topic pattern", func(t *testing.T) {
@@ -57,18 +63,23 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 		defer server.Close()
 		defer client.Close()
 
+		errCh := make(chan error, 1)
 		go func() {
 			cmd := "CONSUME topic=top* partition=0 offset=0 group=g1 member=" + memberID
 			_, err := ch.HandleConsumeCommand(server, cmd, ctx)
-			if err != nil {
-				t.Logf("HandleConsumeCommand error: %v", err)
-			}
+			errCh <- err
 		}()
 
 		buf := make([]byte, 1024)
-		_ = client.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_ = client.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		_, err := client.Read(buf)
 		assert.NoError(t, err)
+
+		client.Close()
+		err = <-errCh
+		if err != nil && !strings.Contains(err.Error(), "closed pipe") && !strings.Contains(err.Error(), "EOF") {
+			t.Errorf("HandleConsumeCommand failed: %v", err)
+		}
 	})
 
 	t.Run("HandleConsumeCommand invalid topic", func(t *testing.T) {
@@ -85,7 +96,7 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 
 func TestCommandHandler_StreamSyntax(t *testing.T) {
 	ch := controller.NewCommandHandler(nil, nil, nil, nil, nil)
-	
+
 	resp := ch.HandleCommand("STREAM topic=t1 partition=0 group=g1", nil)
 	assert.Equal(t, "STREAM_DATA", resp)
 

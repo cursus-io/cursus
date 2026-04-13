@@ -638,6 +638,10 @@ func (c *Consumer) joinGroupWithRetry() (int64, string, []int, error) {
 
 		util.Warn("Join group attempt %d/%d failed: %v", attempt, maxAttempts, err)
 
+		if attempt == maxAttempts {
+			break
+		}
+
 		select {
 		case <-c.mainCtx.Done():
 			return 0, "", nil, fmt.Errorf("consumer shutting down during join retry")

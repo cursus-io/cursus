@@ -4,8 +4,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -83,7 +84,7 @@ func TestClusterController_Basic(t *testing.T) {
 		lp := &MockLocalProcessor{}
 		cc.SetLocalProcessor(lp)
 		assert.Equal(t, lp, cc.Router.localProcessor)
-		
+
 		cc.SetLocalProcessor(nil) // Should ignore with warning
 		assert.Equal(t, lp, cc.Router.localProcessor)
 	})
@@ -122,5 +123,24 @@ func TestClusterRouter_Forwarding(t *testing.T) {
 		resp, err := router.ForwardToPartitionLeader("non-existent", 0, "test")
 		assert.NoError(t, err)
 		assert.Equal(t, "OK", resp)
+	})
+
+	t.Run("ForwardToPartitionLeader - Remote Leader", func(t *testing.T) {
+		rm.isLeader = false
+		rm.mockFSM = fsm.NewBrokerFSM(nil, nil, nil)
+
+		// Register a remote broker
+		brokerJSON := `{"id":"node2","addr":"127.0.0.1:9002","status":"active"}`
+		rm.mockFSM.Apply(&raft.Log{Data: append([]byte("REGISTER:"), []byte(brokerJSON)...), Index: 1})
+
+		// Set partition leader to that broker
+		metaJSON := `{"leader":"node2"}`
+		rm.mockFSM.Apply(&raft.Log{Data: append([]byte("PARTITION:topic1-0:"), []byte(metaJSON)...), Index: 2})
+
+		router.brokerID = "node1"
+
+		_, err := router.ForwardToPartitionLeader("topic1", 0, "test")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "127.0.0.1")
 	})
 }

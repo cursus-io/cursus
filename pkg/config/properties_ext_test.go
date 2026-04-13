@@ -1,7 +1,6 @@
 package config_test
 
 import (
-	"os"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -19,10 +18,8 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 func TestLoadConfig_EnvOverrides(t *testing.T) {
-	os.Setenv("BROKER_PORT", "9999")
-	os.Setenv("LOG_RETENTION_HOURS", "24")
-	defer os.Unsetenv("BROKER_PORT")
-	defer os.Unsetenv("LOG_RETENTION_HOURS")
+	t.Setenv("BROKER_PORT", "9999")
+	t.Setenv("LOG_RETENTION_HOURS", "24")
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -38,7 +35,7 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 }
 
 func TestConfig_Normalize(t *testing.T) {
-	cfg := config.DefaultConfig()
+	cfg := &config.Config{}
 	cfg.BrokerPort = -1
 	cfg.Normalize()
 	if cfg.BrokerPort != 9000 {

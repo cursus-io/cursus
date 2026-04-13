@@ -4,11 +4,15 @@ import (
 	"fmt"
 	"testing"
 	"time"
+ 
+	"github.com/google/uuid"
 )
 
 // TestMultipleTopicConsumption tests consuming from multiple topics
 func TestMultipleTopicConsumption(t *testing.T) {
-	topics := []string{"test-alpha", "test-beta", "test-gamma", "other-topic"}
+	uniqueID := uuid.New().String()[:4]
+	prefix := "mult-" + uniqueID
+	topics := []string{prefix + "-a", prefix + "-b", prefix + "-c", "other-topic-" + uniqueID}
 
 	brokerCtx := GivenStandalone(t)
 	defer brokerCtx.Cleanup()
@@ -26,10 +30,10 @@ func TestMultipleTopicConsumption(t *testing.T) {
 	}
 
 	totalConsumed := 0
-	matchingTopics := []string{"test-alpha", "test-beta", "test-gamma"}
+	matchingTopics := []string{prefix + "-a", prefix + "-b", prefix + "-c"}
 
 	for i, topic := range matchingTopics {
-		groupName := fmt.Sprintf("multiple-test-group-%d", i)
+		groupName := fmt.Sprintf("mult-%s-group-%d", uniqueID, i)
 
 		consumerCtx := GivenStandalone(t).
 			WithTopic(topic).
@@ -54,7 +58,9 @@ func TestMultipleTopicConsumption(t *testing.T) {
 
 // TestRegexPatternConsumption tests actual regex pattern matching
 func TestRegexPatternConsumption(t *testing.T) {
-	topics := []string{"regex-alpha", "regex-beta", "regex-gamma", "regex-topic"}
+	uniqueID := uuid.New().String()[:4]
+	prefix := "regx-" + uniqueID
+	topics := []string{prefix + "-a", prefix + "-b", prefix + "-c", prefix + "-topic"}
 
 	brokerCtx := GivenStandalone(t)
 	defer brokerCtx.Cleanup()
@@ -71,9 +77,9 @@ func TestRegexPatternConsumption(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	groupName := "regex-test-group"
+	groupName := "regx-" + uniqueID + "-group"
 	consumerCtx := GivenStandalone(t).
-		WithTopic("regex-alpha"). // actual topic name
+		WithTopic(prefix + "-a"). // actual topic name for group registration
 		WithPartitions(1).
 		WithNumMessages(0).
 		WithConsumerGroup(groupName)
@@ -82,14 +88,16 @@ func TestRegexPatternConsumption(t *testing.T) {
 	consumerCtx.When().
 		JoinGroup().
 		SyncGroup().
-		ConsumeMessagesFromTopic("regex-*"). // regex pattern consume
+		ConsumeMessagesFromTopic(prefix + "-*"). // regex pattern consume matches alpha, beta, gamma, topic (4 topics * 5 msgs)
 		Then().
-		Expect(MessagesConsumed(5))
+		Expect(MessagesConsumed(20))
 }
 
 // TestRegexPatternWithQuestionMark tests ? wildcard functionality
 func TestRegexPatternWithQuestionMark(t *testing.T) {
-	topics := []string{"log-1", "log-2", "log-3"}
+	uniqueID := uuid.New().String()[:4]
+	prefix := "qmrk-" + uniqueID
+	topics := []string{prefix + "-1", prefix + "-2", prefix + "-3"}
 
 	brokerCtx := GivenStandalone(t)
 	defer brokerCtx.Cleanup()
@@ -106,9 +114,9 @@ func TestRegexPatternWithQuestionMark(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	groupName := "question-mark-test-group"
+	groupName := "qmrk-" + uniqueID + "-group"
 	consumerCtx := GivenStandalone(t).
-		WithTopic("log-1"). // actual topic name
+		WithTopic(prefix + "-1"). // actual topic name
 		WithPartitions(1).
 		WithNumMessages(0).
 		WithConsumerGroup(groupName)
@@ -117,7 +125,7 @@ func TestRegexPatternWithQuestionMark(t *testing.T) {
 	consumerCtx.When().
 		JoinGroup().
 		SyncGroup().
-		ConsumeMessagesFromTopic("log-?").
+		ConsumeMessagesFromTopic(prefix + "-?"). // matches log-1, log-2, log-3 (3 topics * 3 msgs)
 		Then().
-		Expect(MessagesConsumed(3))
+		Expect(MessagesConsumed(9))
 }

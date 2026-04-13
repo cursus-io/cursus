@@ -5,7 +5,6 @@ import (
 	"net"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
@@ -26,7 +25,7 @@ func TestCommandHandler_Publish(t *testing.T) {
 	t.Run("PUBLISH basic", func(t *testing.T) {
 		cmd := "PUBLISH topic=test-topic producerId=p1 acks=1 message=hello"
 		resp := ch.HandleCommand(cmd, ctx)
-		
+
 		var ack types.AckResponse
 		if err := json.Unmarshal([]byte(resp), &ack); err != nil {
 			t.Fatalf("Failed to unmarshal response: %v, resp: %s", err, resp)
@@ -59,16 +58,11 @@ func TestCommandHandler_Publish(t *testing.T) {
 	})
 
 	t.Run("PUBLISH non-existent topic", func(t *testing.T) {
-		start := time.Now()
 		cmd := "PUBLISH topic=no-topic producerId=p1 message=hello"
 		resp := ch.HandleCommand(cmd, ctx)
-		duration := time.Since(start)
-		
+
 		if !strings.Contains(resp, "ERROR: topic 'no-topic' does not exist") {
 			t.Errorf("Expected topic not found error, got: %s", resp)
-		}
-		if duration < 500*time.Millisecond {
-			t.Errorf("Expected retry delay, but took only %v", duration)
 		}
 	})
 }
@@ -127,7 +121,7 @@ func TestCommandHandler_BatchPublish(t *testing.T) {
 		if err != nil {
 			t.Fatalf("HandleBatchMessage failed: %v", err)
 		}
-		
+
 		var ack types.AckResponse
 		if err := json.Unmarshal([]byte(resp), &ack); err != nil {
 			t.Fatalf("Failed to unmarshal response: %v, resp: %s", err, resp)

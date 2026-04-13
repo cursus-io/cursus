@@ -38,39 +38,71 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 		return 0, err
 	}
 
-	if ch.Coordinator != nil && strings.ContainsAny(cArgs.TopicName, "*?") {
-		group := ch.Coordinator.GetGroup(ctx.ConsumerGroup)
-		if group != nil {
-			pattern := "^" + strings.ReplaceAll(strings.ReplaceAll(regexp.QuoteMeta(cArgs.TopicName), "\\*", ".*"), "\\?", ".") + "$"
-			if matched, _ := regexp.MatchString(pattern, group.TopicName); matched {
-				matchedTopics = []string{group.TopicName}
-			}
-		}
-	}
-
 	if len(matchedTopics) == 0 {
 		return 0, fmt.Errorf("no assigned topics match pattern '%s'", cArgs.TopicName)
 	}
 
 	totalStreamed := 0
+	var allMessages []types.Message
+
 	for _, tName := range matchedTopics {
-		streamed, err := ch.consumeFromTopic(conn, tName, cArgs, ctx)
+		if totalStreamed >= cArgs.BatchSize {
+			break
+		}
+
+		remainingBatch := cArgs.BatchSize - totalStreamed
+		messages, err := ch.readFromTopic(tName, cArgs, ctx, remainingBatch)
 		if err != nil {
 			return totalStreamed, err
 		}
-		totalStreamed += streamed
+		if len(messages) > 0 {
+			allMessages = append(allMessages, messages...)
+			totalStreamed += len(messages)
+		}
 	}
+
+	if totalStreamed == 0 && cArgs.WaitTimeout > 0 {
+		startTime := time.Now()
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for time.Since(startTime) < cArgs.WaitTimeout {
+			<-ticker.C
+			for _, tName := range matchedTopics {
+				messages, err := ch.readFromTopic(tName, cArgs, ctx, cArgs.BatchSize)
+				if err != nil {
+					return 0, err
+				}
+				if len(messages) > 0 {
+					allMessages = append(allMessages, messages...)
+					totalStreamed += len(messages)
+					goto sendBatch
+				}
+			}
+		}
+	}
+
+sendBatch:
+	batchData, err := util.EncodeBatchMessages(cArgs.TopicName, cArgs.PartitionID, "1", false, allMessages)
+	if err != nil {
+		return 0, fmt.Errorf("failed to encode batch: %w", err)
+	}
+
+	if err := util.WriteWithLength(conn, batchData); err != nil {
+		return 0, fmt.Errorf("failed to stream batch: %w", err)
+	}
+
 	return totalStreamed, nil
 }
 
-func (ch *CommandHandler) consumeFromTopic(conn net.Conn, topicName string, cArgs CommonArgs, ctx *ClientContext) (int, error) {
+func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx *ClientContext, batchSize int) ([]types.Message, error) {
 	if cArgs.MemberID == "" {
-		return 0, fmt.Errorf("missing member parameter")
+		return nil, fmt.Errorf("missing member parameter")
 	}
 
 	_, p, err := ch.getTopicAndPartition(topicName, cArgs.PartitionID)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	currentGen := -1
@@ -79,7 +111,7 @@ func (ch *CommandHandler) consumeFromTopic(conn net.Conn, topicName string, cArg
 
 		if err := ch.Coordinator.RecordHeartbeat(cArgs.GroupName, cArgs.MemberID); err != nil {
 			util.Warn("Failed to record heartbeat during consume: %v", err)
-			return 0, fmt.Errorf("heartbeat failed: %w", err)
+			return nil, fmt.Errorf("heartbeat failed: %w", err)
 		}
 	}
 
@@ -99,70 +131,28 @@ func (ch *CommandHandler) consumeFromTopic(conn net.Conn, topicName string, cArg
 	} else {
 		actualOffset, err := ch.resolveOffset(p, topicName, cArgs)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		currentOffset = actualOffset
 	}
 
 	if !ch.ValidateOwnership(cArgs.GroupName, cArgs.MemberID, ctx.Generation, cArgs.PartitionID) {
-		util.Debug("not validate ownership")
-		return 0, fmt.Errorf("not partition owner or generation mismatch")
+		util.Debug("Ownership validation failed for topic %s", topicName)
+		return nil, nil // Skip this topic if not owned (allowing regex to continue with other owned topics)
 	}
 
-	streamedCount := 0
-	messages, err := p.ReadCommitted(currentOffset, cArgs.BatchSize)
+	messages, err := p.ReadCommitted(currentOffset, batchSize)
 	if err != nil {
-		util.Error("Failed to read messages: %v", err)
-		return streamedCount, err
+		util.Error("Failed to read messages from topic %s: %v", topicName, err)
+		return nil, err
 	}
 
-	if len(messages) == 0 && cArgs.WaitTimeout > 0 {
-		startTime := time.Now()
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-
-		const heartbeatInterval = 1 * time.Second
-		lastHeartbeat := time.Now()
-
-		for time.Since(startTime) < cArgs.WaitTimeout {
-			<-ticker.C
-
-			// Renew heartbeat periodically so the coordinator does not evict
-			// the consumer while the poll is blocked waiting for messages.
-			if ch.Coordinator != nil && time.Since(lastHeartbeat) >= heartbeatInterval {
-				if err := ch.Coordinator.RecordHeartbeat(cArgs.GroupName, cArgs.MemberID); err != nil {
-					return streamedCount, fmt.Errorf("heartbeat failed during wait: %w", err)
-				}
-				lastHeartbeat = time.Now()
-			}
-
-			newMessages, err := p.ReadCommitted(currentOffset, cArgs.BatchSize)
-			if err != nil {
-				util.Error("Failed to read messages during wait: %v", err)
-				return streamedCount, err
-			}
-			if len(newMessages) > 0 {
-				messages = newMessages
-				break
-			}
-		}
-	}
-
-	batchData, err := util.EncodeBatchMessages(topicName, cArgs.PartitionID, "1", false, messages)
-	if err != nil {
-		return 0, fmt.Errorf("failed to encode batch: %w", err)
-	}
-
-	if err := util.WriteWithLength(conn, batchData); err != nil {
-		return 0, fmt.Errorf("failed to stream batch: %w", err)
-	}
-	streamedCount = len(messages)
-
-	if streamedCount > 0 {
-		lastMsg := messages[streamedCount-1]
+	if len(messages) > 0 {
+		lastMsg := messages[len(messages)-1]
 		ctx.OffsetCache[cacheKey] = lastMsg.Offset + 1
 	}
-	return streamedCount, nil
+
+	return messages, nil
 }
 
 func (ch *CommandHandler) matchTopicPattern(pattern string) ([]string, error) {

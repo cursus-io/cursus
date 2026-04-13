@@ -30,7 +30,14 @@ func runCompose(args ...string) *exec.Cmd {
 }
 
 func composeDown(t *testing.T, file string) {
-	cmd := runCompose("-f", file, "down", "-v", "--remove-orphans")
+	// Force remove containers first to handle conflicts from other compose projects
+	// sharing the same container names
+	cmd := runCompose("-f", file, "rm", "-f", "-s", "-v")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Logf("compose rm warning: %v\n%s", err, string(output))
+	}
+
+	cmd = runCompose("-f", file, "down", "-v", "--remove-orphans")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Logf("compose down warning: %v\n%s", err, string(output))
 	}
@@ -44,7 +51,7 @@ func composeUp(t *testing.T, file string) {
 	}
 }
 
-func waitForContainerExit(t *testing.T, file, container string, timeout time.Duration) (string, bool) {
+func waitForContainerExit(t *testing.T, file, service, container string, timeout time.Duration) (string, bool) {
 	deadline := time.After(timeout)
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -52,13 +59,13 @@ func waitForContainerExit(t *testing.T, file, container string, timeout time.Dur
 	for {
 		select {
 		case <-deadline:
-			// Dump logs for debugging
-			logsCmd := runCompose("-f", file, "logs", "--tail", "50", container)
+			// Dump logs for debugging (compose logs uses service name)
+			logsCmd := runCompose("-f", file, "logs", "--tail", "50", service)
 			logs, _ := logsCmd.CombinedOutput()
 			t.Logf("Timeout waiting for %s. Last logs:\n%s", container, string(logs))
 			return string(logs), false
 		case <-ticker.C:
-			// Check if container has exited
+			// Check if container has exited (docker inspect uses container name)
 			inspectCmd := exec.Command("docker", "inspect", "-f", "{{.State.Status}}", container)
 			out, err := inspectCmd.Output()
 			if err != nil {
@@ -66,7 +73,7 @@ func waitForContainerExit(t *testing.T, file, container string, timeout time.Dur
 			}
 			status := strings.TrimSpace(string(out))
 			if status == "exited" {
-				logsCmd := runCompose("-f", file, "logs", container)
+				logsCmd := runCompose("-f", file, "logs", service)
 				logs, _ := logsCmd.CombinedOutput()
 				return string(logs), true
 			}
@@ -92,7 +99,7 @@ func assertBenchmarkSuccess(t *testing.T, logs string, component string) {
 	}
 
 	// Check exit code
-	if strings.Contains(logs, "exit code 0") || !strings.Contains(logs, "exit code") {
+	if strings.Contains(logs, "exit code 0") {
 		t.Logf("%s exited (likely success)", component)
 		return
 	}
@@ -122,7 +129,7 @@ func TestStandaloneBenchmark(t *testing.T) {
 
 	// Wait for publisher to finish
 	t.Log("Waiting for publisher to complete...")
-	pubLogs, pubDone := waitForContainerExit(t, standaloneCompose, "bench-publisher", benchmarkTimeout)
+	pubLogs, pubDone := waitForContainerExit(t, standaloneCompose, "publisher", "bench-publisher", benchmarkTimeout)
 	if !pubDone {
 		t.Fatal("Publisher did not complete within timeout")
 	}
@@ -130,7 +137,7 @@ func TestStandaloneBenchmark(t *testing.T) {
 
 	// Wait for consumer to finish
 	t.Log("Waiting for consumer to complete...")
-	consLogs, consDone := waitForContainerExit(t, standaloneCompose, "bench-consumer", benchmarkTimeout)
+	consLogs, consDone := waitForContainerExit(t, standaloneCompose, "consumer", "bench-consumer", benchmarkTimeout)
 	if !consDone {
 		t.Fatal("Consumer did not complete within timeout")
 	}
@@ -151,7 +158,7 @@ func TestClusterBenchmark(t *testing.T) {
 
 	// Wait for publisher to finish
 	t.Log("Waiting for publisher to complete...")
-	pubLogs, pubDone := waitForContainerExit(t, clusterCompose, "broker-publisher", benchmarkTimeout)
+	pubLogs, pubDone := waitForContainerExit(t, clusterCompose, "publisher", "broker-publisher", benchmarkTimeout)
 	if !pubDone {
 		t.Fatal("Publisher did not complete within timeout")
 	}
@@ -159,7 +166,7 @@ func TestClusterBenchmark(t *testing.T) {
 
 	// Wait for consumer to finish
 	t.Log("Waiting for consumer to complete...")
-	consLogs, consDone := waitForContainerExit(t, clusterCompose, "broker-consumer", benchmarkTimeout)
+	consLogs, consDone := waitForContainerExit(t, clusterCompose, "consumer", "broker-consumer", benchmarkTimeout)
 	if !consDone {
 		t.Fatal("Consumer did not complete within timeout")
 	}

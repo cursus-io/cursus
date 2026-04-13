@@ -12,6 +12,7 @@ import (
 type MockRaftManager struct {
 	isLeader bool
 	leaderCh chan bool
+	mockFSM  *fsm.BrokerFSM
 }
 
 func (m *MockRaftManager) IsLeader() bool { return m.isLeader }
@@ -25,7 +26,9 @@ func (m *MockRaftManager) LeaderCh() <-chan bool {
 	}
 	return m.leaderCh
 }
-func (m *MockRaftManager) GetFSM() *fsm.BrokerFSM                        { return nil }
+func (m *MockRaftManager) GetFSM() *fsm.BrokerFSM {
+	return m.mockFSM
+}
 func (m *MockRaftManager) GetConfiguration() raft.ConfigurationFuture    { return nil }
 func (m *MockRaftManager) ReplicateWithQuorum(topic string, partition int, msg types.Message, minISR int, isIdempotent bool, sequenceScope string) (types.AckResponse, error) {
 	return types.AckResponse{}, nil

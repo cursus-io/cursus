@@ -121,9 +121,6 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 		effectiveIdempotent := isIdempotent || ch.Config.EnableIdempotence
 
 		scope := "global"
-		if effectiveIdempotent {
-			scope = "partition"
-		}
 
 		if acks == "-1" || acksLower == "all" {
 			ackResp, err = ch.Cluster.RaftManager.ReplicateWithQuorum(topicName, partition, *msg, ch.Config.MinInSyncReplicas, effectiveIdempotent, scope)
@@ -275,9 +272,6 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 
 		effectiveIdempotent := batch.IsIdempotent || ch.Config.EnableIdempotence
 		scope := "global"
-		if effectiveIdempotent {
-			scope = "partition"
-		}
 
 		if acks == "-1" || acksLower == "all" {
 			respAck, err = ch.Cluster.RaftManager.ReplicateBatchWithQuorum(batch.Topic, batch.Partition, batch.Messages, ch.Config.MinInSyncReplicas, acks, effectiveIdempotent, scope)
