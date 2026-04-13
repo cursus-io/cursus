@@ -25,6 +25,7 @@ type Partition struct {
 	closed        bool
 	streamManager StreamManager
 	producerState sync.Map // map[string]uint64 (ProducerID -> LastSeqNum)
+	isIdempotent  bool
 }
 
 // NewPartition creates a partition instance.
@@ -70,6 +71,9 @@ func (p *Partition) runBroadcaster() {
 }
 
 func (p *Partition) isDuplicate(msg *types.Message) bool {
+	if !p.isIdempotent {
+		return false
+	}
 	// SeqNum == 0 means the producer did not explicitly set a sequence number;
 	// skip dedup to avoid incorrectly rejecting every message after the first.
 	if msg.ProducerID == "" || msg.SeqNum == 0 {
@@ -226,7 +230,7 @@ func (p *Partition) enqueueToBroadcast(msg types.Message) {
 }
 
 func (p *Partition) broadcastToStreams(msg types.Message) {
-	if p.streamManager == nil {
+	if util.IsNil(p.streamManager) {
 		return
 	}
 

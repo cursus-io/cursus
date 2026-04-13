@@ -233,7 +233,7 @@ func TestBrokerFSM_Snapshot_ClosesSink(t *testing.T) {
 
 func TestBrokerFSM_ValidateIdempotency(t *testing.T) {
 	fsm := newTestFSM()
-	fsm.partitionMetadata["t1"] = &PartitionMetadata{PartitionCount: 1, Idempotent: true}
+	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{PartitionCount: 1, Idempotent: true}
 
 	cmd := &types.MessageCommand{
 		Topic:        "t1",
@@ -271,7 +271,8 @@ func TestBrokerFSM_ValidateIdempotency(t *testing.T) {
 
 func TestBrokerFSM_SequenceScope_Partition(t *testing.T) {
 	fsm := newTestFSM()
-	fsm.partitionMetadata["t1"] = &PartitionMetadata{PartitionCount: 2, Idempotent: true}
+	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{PartitionCount: 2, Idempotent: true}
+	fsm.partitionMetadata["t1-1"] = &PartitionMetadata{PartitionCount: 2, Idempotent: true}
 	if err := fsm.tm.CreateTopic("t1", 2, true); err != nil {
 		t.Fatalf("CreateTopic failed: %v", err)
 	}

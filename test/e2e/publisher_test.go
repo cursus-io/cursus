@@ -47,6 +47,7 @@ func TestExactlyOnceSemantics(t *testing.T) {
 	ctx.WithTopic("exactly-once-test").
 		WithPartitions(1).
 		WithNumMessages(10).
+		WithIdempotent(true).
 		When().
 		StartBroker().
 		CreateTopic().
@@ -114,15 +115,16 @@ func TestPublisherAcks(t *testing.T) {
 // TestExactlyOnceWithFailures tests exactly-once semantics with various failure scenarios
 func TestExactlyOnceWithFailures(t *testing.T) {
 	testCases := []struct {
-		name        string
-		acks        string
-		failures    []string
-		expectDupes bool
-		expectLoss  bool
+		name         string
+		acks         string
+		failures     []string
+		expectDupes  bool
+		expectLoss   bool
+		isIdempotent bool
 	}{
-		{"acks=1_network_failure", "1", []string{"network"}, false, false},
-		{"acks=all_broker_failure", "all", []string{"broker"}, false, false},
-		{"acks=0_no_guarantee", "0", []string{"network"}, true, true},
+		{"acks=1_network_failure", "1", []string{"network"}, false, false, true},
+		{"acks=all_broker_failure", "all", []string{"broker"}, false, false, true},
+		{"acks=0_no_guarantee", "0", []string{"network"}, true, true, false},
 	}
 
 	for _, tc := range testCases {
@@ -131,7 +133,8 @@ func TestExactlyOnceWithFailures(t *testing.T) {
 				WithTopic("exactly-once-" + tc.name).
 				WithPartitions(3).
 				WithNumMessages(50).
-				WithAcks(tc.acks)
+				WithAcks(tc.acks).
+				WithIdempotent(tc.isIdempotent)
 			defer ctx.Cleanup()
 
 			actions := ctx.When().
@@ -175,6 +178,7 @@ func TestIdempotencyUnderStress(t *testing.T) {
 		WithPartitions(5).
 		WithNumMessages(1000).
 		WithAcks("all").
+		WithIdempotent(true).
 		WithPublishDelay(0) // no delay
 	defer ctx.Cleanup()
 

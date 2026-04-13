@@ -143,12 +143,10 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 	for _, m := range messages {
 		msg := m
 
-		// Check for duplicate before routing; do NOT advance sequence state yet.
-		if msg.ProducerID != "" && msg.SeqNum > 0 {
-			tm.mu.Lock()
-			isDup := tm.isDuplicateProducer(topicName, -1, &msg)
-			tm.mu.Unlock()
-			if isDup {
+		// Check and mark duplicate before routing. 
+		// Moving this BEFORE the write prevents race conditions from concurrent retries.
+		if t.IsIdempotent && msg.ProducerID != "" && msg.SeqNum > 0 {
+			if isDup := tm.CheckAndMarkProducerSequence(topicName, -1, &msg); isDup {
 				util.Debug("tm: skipping duplicate message (Global) in batch from producer %s (seq %d)", msg.ProducerID, msg.SeqNum)
 				continue
 			}
@@ -172,17 +170,7 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 		return err
 	}
 
-	// Advance sequence state only after all writes succeeded.
-	tm.mu.Lock()
-	for _, msgs := range partitioned {
-		for i := range msgs {
-			if msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
-				tm.markProducerSequence(topicName, -1, &msgs[i])
-			}
-		}
-	}
-	tm.mu.Unlock()
-
+	// Sequence advancement moved BEFORE write for atomicity and race prevention.
 	return nil
 }
 
@@ -248,12 +236,9 @@ func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Mess
 		return fmt.Errorf("topic '%s' does not exist", topicName)
 	}
 
-	// Check for duplicate before writing; do NOT advance sequence state yet.
-	if msg.ProducerID != "" && msg.SeqNum > 0 {
-		tm.mu.Lock()
-		isDup := tm.isDuplicateProducer(topicName, -1, msg)
-		tm.mu.Unlock()
-		if isDup {
+	// Check and mark duplicate before write.
+	if t.IsIdempotent && msg.ProducerID != "" && msg.SeqNum > 0 {
+		if isDup := tm.CheckAndMarkProducerSequence(topicName, -1, msg); isDup {
 			util.Debug("tm: skipping duplicate message (Global) from producer %s (seq %d)", msg.ProducerID, msg.SeqNum)
 			return nil
 		}
@@ -267,41 +252,37 @@ func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Mess
 		t.Publish(*msg)
 	}
 
-	// Advance sequence state only after the write has been accepted.
-	if msg.ProducerID != "" && msg.SeqNum > 0 {
-		tm.mu.Lock()
-		tm.markProducerSequence(topicName, -1, msg)
-		tm.mu.Unlock()
-	}
-
 	elapsed := time.Since(start).Seconds()
 	metrics.MessagesProcessed.Inc()
 	metrics.LatencyHist.Observe(elapsed)
 	return nil
 }
 
-// isDuplicateProducer checks whether msg is a duplicate based on producer sequence state.
-// It does NOT mutate state; call markProducerSequence after a successful write.
-func (tm *TopicManager) isDuplicateProducer(topicName string, partition int, msg *types.Message) bool {
-	if tm.producerState[topicName] == nil {
-		return false
-	}
-	if tm.producerState[topicName][partition] == nil {
-		return false
-	}
-	lastSeq, ok := tm.producerState[topicName][partition][msg.ProducerID]
-	return ok && int64(msg.SeqNum) <= lastSeq
-}
+// CheckAndMarkProducerSequence checks whether msg is a duplicate and records the new sequence if not.
+// This is an atomic operation to prevent race conditions in high-concurrency stress tests.
+func (tm *TopicManager) CheckAndMarkProducerSequence(topicName string, partition int, msg *types.Message) bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
 
-// markProducerSequence records the producer's latest sequence number after a successful write.
-func (tm *TopicManager) markProducerSequence(topicName string, partition int, msg *types.Message) {
-	if tm.producerState[topicName] == nil {
+	// Ensure maps are initialized for this topic/partition
+	if _, ok := tm.producerState[topicName]; !ok {
 		tm.producerState[topicName] = make(map[int]map[string]int64)
 	}
-	if tm.producerState[topicName][partition] == nil {
+	if _, ok := tm.producerState[topicName][partition]; !ok {
 		tm.producerState[topicName][partition] = make(map[string]int64)
 	}
+	
+	lastSeq, ok := tm.producerState[topicName][partition][msg.ProducerID]
+	if ok && int64(msg.SeqNum) <= lastSeq {
+		util.Debug("tm: [idempotency] DUPLICATE detected for topic=%s, partition=%d, producer=%s, seq=%d (lastSeq=%d)", 
+			topicName, partition, msg.ProducerID, msg.SeqNum, lastSeq)
+		return true // Duplicate
+	}
+
 	tm.producerState[topicName][partition][msg.ProducerID] = int64(msg.SeqNum)
+	util.Debug("tm: [idempotency] UPDATED sequence for topic=%s, partition=%d, producer=%s, seq=%d (previous=%d, ok=%v)", 
+		topicName, partition, msg.ProducerID, msg.SeqNum, lastSeq, ok)
+	return false // New message, state updated
 }
 
 func (tm *TopicManager) RegisterConsumerGroup(topicName, groupName string, consumerCount int) (*types.ConsumerGroup, error) {

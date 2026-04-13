@@ -30,8 +30,10 @@ func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
 	first := cmd.Messages[0]
 	last := cmd.Messages[len(cmd.Messages)-1]
 
+	partitionKey := fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition)
+
 	f.mu.Lock()
-	meta, topicExists := f.partitionMetadata[cmd.Topic]
+	meta, topicExists := f.partitionMetadata[partitionKey]
 
 	effectiveIdempotent := cmd.IsIdempotent
 	if topicExists && meta.Idempotent {
@@ -132,8 +134,10 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 	firstMsg := cmd.Messages[0]
 	lastMsg := cmd.Messages[len(cmd.Messages)-1]
 
+	partitionKey := fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition)
+
 	f.mu.Lock()
-	meta, topicExists := f.partitionMetadata[cmd.Topic]
+	meta, topicExists := f.partitionMetadata[partitionKey]
 
 	effectiveIdempotent := cmd.IsIdempotent
 	if topicExists && meta.Idempotent {
@@ -148,7 +152,7 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 	f.mu.Unlock()
 
 	if !topicExists {
-		return fmt.Errorf("topic '%s' not found", cmd.Topic)
+		return fmt.Errorf("partition metadata '%s' not found (topic=%s, partition=%d)", partitionKey, cmd.Topic, cmd.Partition)
 	}
 
 	if effectiveIdempotent {

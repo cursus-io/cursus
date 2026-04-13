@@ -11,8 +11,8 @@ import (
 )
 
 // CreateTopic sends CREATE command to broker
-func (bc *BrokerClient) CreateTopic(topic string, partitions int) error {
-	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d", topic, partitions)
+func (bc *BrokerClient) CreateTopic(topic string, partitions int, idempotent bool) error {
+	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, partitions, idempotent)
 
 	err := bc.executeCommand("admin", createCmd)
 	if err != nil && strings.Contains(err.Error(), "topic exists") {

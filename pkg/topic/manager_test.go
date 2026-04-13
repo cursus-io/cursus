@@ -136,6 +136,7 @@ func TestTopicManagerCreateTopic(t *testing.T) {
 		mockStorageHandler.On("GetLatestOffset").Return(uint64(0)).Once()
 		hp.On("GetHandler", topicName, i).Return(mockStorageHandler, nil).Once()
 	}
+	sm.On("GetStreamsForPartition", mock.Anything, mock.Anything).Return([]*stream.StreamConnection{}).Maybe()
 
 	assert.NoError(t, tm.CreateTopic(topicName, partitionCount, false))
 	assert.NotNil(t, tm.GetTopic(topicName))

@@ -92,7 +92,7 @@ func initEnvironment(t *testing.T) {
 	envOnce.Do(func() {
 		t.Log("Starting docker compose environment...")
 
-		cmd := RunCompose("-f", composeFile, "up", "-d")
+		cmd := RunCompose("-f", composeFile, "up", "-d", "--build")
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("Failed to start docker compose: %v\nOutput: %s", err, string(output))
 		}

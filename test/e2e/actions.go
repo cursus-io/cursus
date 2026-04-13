@@ -29,7 +29,7 @@ func (a *Actions) StopBroker() *Actions {
 func (a *Actions) CreateTopic() *Actions {
 	a.ctx.t.Logf("Creating topic '%s' with %d partitions...", a.ctx.topic, a.ctx.partitions)
 
-	err := a.ctx.getClient().CreateTopic(a.ctx.topic, a.ctx.partitions)
+	err := a.ctx.getClient().CreateTopic(a.ctx.topic, a.ctx.partitions, a.ctx.isIdempotent)
 	if err != nil {
 		a.ctx.t.Fatalf("Failed to create topic: %v", err)
 	}

@@ -110,6 +110,8 @@ func (pc *PartitionConsumer) pollAndProcess() {
 
 	pc.initWorker()
 
+	util.Debug("Partition [%d] pollAndProcess: starting", pc.partitionID)
+
 	if err := pc.ensureConnection(); err != nil {
 		util.Warn("Partition [%d] cannot poll: %v", pc.partitionID, err)
 		return
@@ -128,6 +130,7 @@ func (pc *PartitionConsumer) pollAndProcess() {
 
 	consumeCmd := fmt.Sprintf("CONSUME topic=%s partition=%d offset=%d group=%s generation=%d member=%s",
 		pc.consumer.config.Topic, pc.partitionID, currentOffset, pc.consumer.config.GroupID, generation, memberID)
+	util.Debug("Partition [%d] pollAndProcess: sending CONSUME offset=%d", pc.partitionID, currentOffset)
 	if err := util.WriteWithLength(conn, util.EncodeMessage(pc.consumer.config.Topic, consumeCmd)); err != nil {
 		util.Error("Partition [%d] send command failed: %v", pc.partitionID, err)
 		pc.closeConnection()
@@ -145,6 +148,7 @@ func (pc *PartitionConsumer) pollAndProcess() {
 		return
 	}
 
+	util.Debug("Partition [%d] pollAndProcess: waiting for response (timeout=%v)", pc.partitionID, idleTimeout)
 	bo := pc.getBackoff()
 	batchData, err := util.ReadWithLength(conn)
 	if err != nil {
@@ -154,7 +158,10 @@ func (pc *PartitionConsumer) pollAndProcess() {
 		return
 	}
 
+	util.Debug("Partition [%d] pollAndProcess: received %d bytes", pc.partitionID, len(batchData))
+
 	if pc.handleBrokerError(batchData) || len(batchData) == 0 {
+		util.Debug("Partition [%d] pollAndProcess: broker error or empty response", pc.partitionID)
 		if !pc.waitWithBackoff(bo) {
 			return
 		}
