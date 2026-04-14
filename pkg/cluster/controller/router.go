@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
+	"strings"
 	"time"
+
+	"github.com/cursus-io/cursus/util"
 )
 
 type LocalProcessor interface {
@@ -19,6 +23,10 @@ type ClusterRouter struct {
 	clientPort     int
 	timeout        time.Duration
 	localProcessor LocalProcessor
+
+	// Cached coordinator ring
+	coordRing       *util.ConsistentHashRing
+	coordBrokerHash string // hash of active broker IDs to detect changes
 }
 
 func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm RaftManager, clientPort int) *ClusterRouter {
@@ -79,6 +87,56 @@ func (r *ClusterRouter) ForwardToPartitionLeader(topic string, partition int, re
 	}
 
 	return r.forwardWithTimeout(broker.Addr, req)
+}
+
+func (r *ClusterRouter) FindCoordinator(groupName string) (string, string, error) {
+	fsmRef := r.rm.GetFSM()
+	if fsmRef == nil {
+		return "", "", fmt.Errorf("FSM not available")
+	}
+
+	brokers := fsmRef.GetBrokers()
+	var activeBrokerIDs []string
+	for _, info := range brokers {
+		if info.Status == "active" {
+			activeBrokerIDs = append(activeBrokerIDs, info.ID)
+		}
+	}
+
+	if len(activeBrokerIDs) == 0 {
+		return "", "", fmt.Errorf("no active brokers available")
+	}
+
+	sort.Strings(activeBrokerIDs)
+	brokerHash := strings.Join(activeBrokerIDs, ",")
+
+	// Rebuild ring only when broker membership changes
+	if r.coordRing == nil || r.coordBrokerHash != brokerHash {
+		r.coordRing = util.NewConsistentHashRing(150, nil)
+		r.coordRing.Add(activeBrokerIDs...)
+		r.coordBrokerHash = brokerHash
+	}
+
+	coordID := r.coordRing.Get(groupName)
+	broker := fsmRef.GetBroker(coordID)
+	if broker == nil {
+		return "", "", fmt.Errorf("coordinator broker %s not found in registry", coordID)
+	}
+
+	return coordID, broker.Addr, nil
+}
+
+func (r *ClusterRouter) ForwardToCoordinator(groupName, req string) (string, error) {
+	id, addr, err := r.FindCoordinator(groupName)
+	if err != nil {
+		return "", err
+	}
+
+	if id == r.brokerID {
+		return r.processLocally(req), nil
+	}
+
+	return r.forwardWithTimeout(addr, req)
 }
 
 func (r *ClusterRouter) forwardWithTimeout(addr, req string) (string, error) {

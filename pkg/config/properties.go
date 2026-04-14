@@ -68,8 +68,9 @@ type Config struct {
 	StaticClusterMembers []string `yaml:"static_cluster_members" json:"distribution.static_cluster_members"`
 	BootstrapCluster     bool     `yaml:"bootstrap_cluster" json:"distribution.bootstrap"`
 
-	AdvertisedHost       string   `yaml:"advertised_host" json:"distribution.advertised_host"`
-	MinInSyncReplicas    int      `yaml:"min_insync_replicas" json:"min.insync.replicas"`
+	AdvertisedHost            string   `yaml:"advertised_host" json:"distribution.advertised_host"`
+	MinInSyncReplicas         int      `yaml:"min_insync_replicas" json:"min.insync.replicas"`
+	DefaultReplicationFactor  int      `yaml:"default_replication_factor" json:"default.replication.factor"`
 
 	// idempotency
 	EnableIdempotence bool `yaml:"enable_idempotence" json:"enable.idempotence"`
@@ -136,7 +137,8 @@ func DefaultConfig() *Config {
 			StaticClusterMembers: []string{},
 			BootstrapCluster:     false,
 			AdvertisedHost:       "localhost",
-			MinInSyncReplicas:    2,
+			MinInSyncReplicas:         2,
+			DefaultReplicationFactor:  3,
 
 			// idempotency
 			EnableIdempotence: false,
@@ -216,6 +218,7 @@ func LoadConfig() (*Config, error) {
 	flag.BoolVar(&cfg.BootstrapCluster, "bootstrap-cluster", cfg.BootstrapCluster, "Bootstrap Raft cluster")
 	flag.StringVar(&cfg.AdvertisedHost, "advertised-host", cfg.AdvertisedHost, "Advertised host for discovery")
 	flag.IntVar(&cfg.MinInSyncReplicas, "min-insync-replicas", cfg.MinInSyncReplicas, "Minimum in-sync replicas for writes")
+	flag.IntVar(&cfg.DefaultReplicationFactor, "default-replication-factor", cfg.DefaultReplicationFactor, "Default replication factor for new topics")
 
 	// idempotency
 	flag.BoolVar(&cfg.EnableIdempotence, "enable-idempotence", cfg.EnableIdempotence, "Enable producer idempotency")
@@ -326,6 +329,7 @@ func LoadConfig() (*Config, error) {
 	overrideEnvStringSlice(&cfg.StaticClusterMembers, "STATIC_CLUSTER_MEMBERS")
 	overrideEnvBool(&cfg.BootstrapCluster, "BOOTSTRAP_CLUSTER")
 	overrideEnvInt(&cfg.MinInSyncReplicas, "MIN_INSYNC_REPLICAS")
+	overrideEnvInt(&cfg.DefaultReplicationFactor, "DEFAULT_REPLICATION_FACTOR")
 
 	overrideEnvBool(&cfg.EnableIdempotence, "ENABLE_IDEMPOTENCE")
 

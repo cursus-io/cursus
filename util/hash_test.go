@@ -25,8 +25,8 @@ func TestGenerateID(t *testing.T) {
 
 func TestHashDeterministic(t *testing.T) {
 	key := "my-key"
-	hash1 := util.Hash(key)
-	hash2 := util.Hash(key)
+	hash1 := util.HashString(key)
+	hash2 := util.HashString(key)
 
 	if hash1 != hash2 {
 		t.Errorf("Hash should be deterministic, got %v and %v", hash1, hash2)
@@ -37,7 +37,7 @@ func TestHashDifferentKeys(t *testing.T) {
 	key1 := "key-one"
 	key2 := "key-two"
 
-	if util.Hash(key1) == util.Hash(key2) {
+	if util.HashString(key1) == util.HashString(key2) {
 		t.Errorf("Hash should produce different results for different keys")
 	}
 }
@@ -47,7 +47,7 @@ func TestPartitionIndex(t *testing.T) {
 	keys := []string{"a", "b", "c", "d", "e"}
 
 	for _, key := range keys {
-		index := util.Hash(key) % partitions
+		index := util.HashString(key) % partitions
 		if index < 0 {
 			t.Errorf("Partition index out of bounds: %v", index)
 		}

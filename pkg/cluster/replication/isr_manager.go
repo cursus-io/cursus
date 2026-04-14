@@ -208,12 +208,23 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 		if !leaderAlive || needsUpdate {
 			newMetadata := *metadata
 			newMetadata.ISR = currentISR
-			
+
 			if !leaderAlive && len(currentISR) > 0 {
 				// Elect new leader from ISR
 				newMetadata.Leader = currentISR[0]
 				newMetadata.LeaderEpoch++
 				util.Info("ISRManager: Failover for %s: %s -> %s", key, metadata.Leader, newMetadata.Leader)
+			} else if !leaderAlive && len(currentISR) == 0 && len(metadata.Replicas) > 0 {
+				// ISR is empty: fallback to any available replica (unclean leader election)
+				for _, replica := range metadata.Replicas {
+					if broker := i.fsm.GetBroker(replica); broker != nil && broker.Status == "active" {
+						newMetadata.Leader = replica
+						newMetadata.LeaderEpoch++
+						newMetadata.ISR = []string{replica}
+						util.Warn("ISRManager: Unclean leader election for %s: %s -> %s (ISR was empty, fell back to replica)", key, metadata.Leader, replica)
+						break
+					}
+				}
 			}
 
 			data, _ := json.Marshal(newMetadata)

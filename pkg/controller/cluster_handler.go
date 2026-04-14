@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/cursus-io/cursus/util"
@@ -65,6 +66,63 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 		return fmt.Sprintf("ERROR: failed to forward command to leader (Leader: %s, Error: %v)", leaderAddr, lastErr), true, nil
 	}
 	return "", false, nil
+}
+
+func (ch *CommandHandler) isCoordinatorAndForward(groupName, cmd string) (string, bool, error) {
+	if !ch.Config.EnabledDistribution || ch.Cluster == nil || ch.Cluster.Router == nil {
+		return "", false, nil
+	}
+
+	const (
+		maxRetries = 3
+		retryDelay = 200 * time.Millisecond
+	)
+
+	encodedCmd := util.EncodeMessage("", cmd)
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		resp, err := ch.Cluster.Router.ForwardToCoordinator(groupName, string(encodedCmd))
+		if err == nil {
+			// If response contains "not the coordinator", we might need to retry because the ring changed.
+			if !strings.HasPrefix(resp, "ERROR: not the coordinator") {
+				return resp, true, nil
+			}
+			lastErr = fmt.Errorf("%s", resp)
+		} else {
+			lastErr = err
+		}
+		time.Sleep(retryDelay)
+	}
+
+	return fmt.Sprintf("ERROR: failed to forward command to coordinator for group %s: %v", groupName, lastErr), true, nil
+}
+
+func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition int, cmd string) (string, bool, error) {
+	if !ch.Config.EnabledDistribution || ch.Cluster == nil || ch.Cluster.Router == nil {
+		return "", false, nil
+	}
+
+	const (
+		maxRetries = 3
+		retryDelay = 200 * time.Millisecond
+	)
+
+	encodedCmd := util.EncodeMessage("", cmd)
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		resp, err := ch.Cluster.Router.ForwardToPartitionLeader(topic, partition, string(encodedCmd))
+		if err == nil {
+			if !strings.HasPrefix(resp, "ERROR: not the partition leader") {
+				return resp, true, nil
+			}
+			lastErr = fmt.Errorf("%s", resp)
+		} else {
+			lastErr = err
+		}
+		time.Sleep(retryDelay)
+	}
+
+	return fmt.Sprintf("ERROR: failed to forward command to partition leader for %s:%d: %v", topic, partition, lastErr), true, nil
 }
 
 func (ch *CommandHandler) applyAndWait(cmdType string, payload map[string]interface{}) (interface{}, error) {

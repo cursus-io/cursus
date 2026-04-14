@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/controller"
+	"github.com/cursus-io/cursus/pkg/cluster/replication"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/topic"
@@ -40,6 +41,9 @@ func (m *MockRaftManagerForForward) ReplicateBatchWithQuorum(t string, p int, ms
 func (m *MockRaftManagerForForward) ApplyResponse(p string, d []byte, t time.Duration) (types.AckResponse, error) {
 	return types.AckResponse{}, nil
 }
+func (m *MockRaftManagerForForward) AddVoter(id string, addr string) error              { return nil }
+func (m *MockRaftManagerForForward) RemoveServer(id string) error                       { return nil }
+func (m *MockRaftManagerForForward) GetISRManager() replication.ISRManagerInterface     { return nil }
 
 func TestCommandHandler_isLeaderAndForward_WaitRetry(t *testing.T) {
 	tm := topic.NewTopicManager(&config.Config{}, nil, nil)

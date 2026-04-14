@@ -19,10 +19,11 @@ type PartitionMetadata struct {
 }
 
 type TopicCommand struct {
-	Name       string `json:"name"`
-	Partitions int    `json:"partitions"`
-	Idempotent bool   `json:"idempotent"`
-	LeaderID   string `json:"leader_id"`
+	Name              string `json:"name"`
+	Partitions        int    `json:"partitions"`
+	Idempotent        bool   `json:"idempotent"`
+	LeaderID          string `json:"leader_id"`
+	ReplicationFactor int    `json:"replication_factor,omitempty"`
 }
 
 func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
@@ -69,26 +70,52 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		}
 	}
 
+	replicationFactor := topicCmd.ReplicationFactor
+	if replicationFactor <= 0 {
+		replicationFactor = 3 // default, same as Kafka
+	}
+	if replicationFactor > len(brokers) {
+		replicationFactor = len(brokers)
+	}
+
+	ring := util.NewConsistentHashRing(150, nil)
+	ring.Add(brokers...)
+
 	for i := 0; i < topicCmd.Partitions; i++ {
 		key := fmt.Sprintf("%s-%d", topicCmd.Name, i)
 
 		assignedLeader := topicCmd.LeaderID
+		var replicas []string
 		if assignedLeader == "" {
-			assignedLeader = brokers[i%len(brokers)]
+			replicas = ring.GetN(key, replicationFactor)
+			assignedLeader = replicas[0]
+		} else {
+			// Explicit leader: build replica set starting from leader
+			replicas = ring.GetN(key, replicationFactor)
+			// Ensure the explicit leader is in the replica set
+			leaderFound := false
+			for _, r := range replicas {
+				if r == assignedLeader {
+					leaderFound = true
+					break
+				}
+			}
+			if !leaderFound {
+				replicas[len(replicas)-1] = assignedLeader
+			}
 		}
 
-		replicasCopy := append([]string(nil), brokers...)
-		isrCopy := append([]string(nil), brokers...)
+		isrCopy := append([]string(nil), replicas...)
 
 		f.partitionMetadata[key] = &PartitionMetadata{
 			PartitionCount: topicCmd.Partitions,
 			Leader:         assignedLeader,
 			LeaderEpoch:    1,
 			Idempotent:     topicCmd.Idempotent,
-			Replicas:       replicasCopy,
+			Replicas:       replicas,
 			ISR:            isrCopy,
 		}
-		util.Info("FSM: Assigned leader %s to partition %s", assignedLeader, key)
+		util.Info("FSM: Assigned leader %s to partition %s (replicas=%v)", assignedLeader, key, replicas)
 	}
 
 	tm := f.tm

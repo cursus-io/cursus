@@ -2,9 +2,12 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -22,6 +25,9 @@ type RaftManager interface {
 	ReplicateWithQuorum(topic string, partition int, msg types.Message, minISR int, isIdempotent bool, sequenceScope string) (types.AckResponse, error)
 	ReplicateBatchWithQuorum(topic string, partition int, messages []types.Message, minISR int, acks string, isIdempotent bool, sequenceScope string) (types.AckResponse, error)
 	ApplyResponse(prefix string, data []byte, timeout time.Duration) (types.AckResponse, error)
+	AddVoter(id string, addr string) error
+	RemoveServer(id string) error
+	GetISRManager() replication.ISRManagerInterface
 }
 
 type ClusterController struct {
@@ -97,4 +103,73 @@ func (cc *ClusterController) IsAuthorized(topic string, partition int) bool {
 	}
 
 	return meta.Leader == cc.brokerID
+}
+
+func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, msgCmd types.MessageCommand, minISR int) error {
+	fsm := cc.RaftManager.GetFSM()
+	if fsm == nil {
+		return fmt.Errorf("FSM not available")
+	}
+
+	partitionKey := fmt.Sprintf("%s-%d", topic, partition)
+	meta := fsm.GetPartitionMetadata(partitionKey)
+	if meta == nil {
+		return fmt.Errorf("partition metadata not found")
+	}
+
+	followers := []string{}
+	for _, replica := range meta.ISR {
+		if replica != cc.brokerID {
+			followers = append(followers, replica)
+		}
+	}
+
+	if len(meta.ISR) < minISR {
+		return fmt.Errorf("insufficient in-sync replicas: have %d, want %d", len(meta.ISR), minISR)
+	}
+
+	if len(followers) == 0 {
+		return nil
+	}
+
+	data, err := json.Marshal(msgCmd)
+	if err != nil {
+		return err
+	}
+	replicateCmd := fmt.Sprintf("REPLICATE_MESSAGE payload=%s", string(data))
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(followers))
+
+	for _, followerID := range followers {
+		follower := fsm.GetBroker(followerID)
+		if follower == nil {
+			continue
+		}
+
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			_, err := cc.Router.forwardWithTimeout(addr, replicateCmd)
+			if err != nil {
+				errCh <- err
+			}
+		}(follower.Addr)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	// In a real Kafka-like system, we might tolerate some follower failures as long as we have minISR.
+	// For now, if acks=-1 was requested (implicit here if calling this), we might want all ISR to succeed.
+	// Actually, Kafka only waits for followers in ISR.
+	
+	// If any error occurred, we should probably return it if we want strict acks.
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
