@@ -33,13 +33,13 @@ const (
 
 func parseLogLevelString(s string) LogLevel {
 	switch strings.ToLower(s) {
-	case "debug":
+	case "debug", "0":
 		return LogLevelDebug
-	case "info":
+	case "info", "1":
 		return LogLevelInfo
-	case "warn", "warning":
+	case "warn", "warning", "2":
 		return LogLevelWarn
-	case "error":
+	case "error", "3":
 		return LogLevelError
 	default:
 		return LogLevelInfo
