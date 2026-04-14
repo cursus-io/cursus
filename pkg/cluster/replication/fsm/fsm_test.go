@@ -637,7 +637,7 @@ func TestBrokerFSM_Notifier(t *testing.T) {
 
 	// Simulate Apply with req_id
 	data, _ := json.Marshal(BrokerInfo{ID: "b1", Addr: "localhost:9001", Status: "active", LastSeen: time.Now()})
-	payload := fmt.Sprintf(`REGISTER:{"id":"b1","addr":"localhost:9001","status":"active","last_seen":"2026-01-01T00:00:00Z","req_id":"req-1"}`)
+	payload := `REGISTER:{"id":"b1","addr":"localhost:9001","status":"active","last_seen":"2026-01-01T00:00:00Z","req_id":"req-1"}`
 	f.Apply(&raft.Log{Data: []byte(payload), Index: 1})
 
 	select {
