@@ -14,7 +14,7 @@ func TestAllMetricsRegistered(t *testing.T) {
 	assert.NotNil(t, LatencyHist)
 	assert.NotNil(t, QueueSize)
 	assert.NotNil(t, CleanupCount)
-	
+
 	assert.NotNil(t, ClusterBrokersTotal)
 	assert.NotNil(t, PartitionLeadersTotal)
 	assert.NotNil(t, ClusterReplicationLag)

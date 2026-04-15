@@ -11,17 +11,15 @@ import (
 func TestISRManager_Lifecycle(t *testing.T) {
 	brokerFSM := fsm.NewBrokerFSM(nil, nil, nil)
 	isrManager := NewISRManager(brokerFSM, "node1", 100*time.Millisecond, nil)
+	t.Cleanup(isrManager.Stop)
 
 	isrManager.Start()
-	time.Sleep(50 * time.Millisecond)
-	
+
 	isrManager.UpdateHeartbeat("node2")
 	isrManager.mu.RLock()
 	_, ok := isrManager.lastSeen["node2"]
 	isrManager.mu.RUnlock()
 	assert.True(t, ok)
-
-	isrManager.Stop()
 }
 
 func TestISRManager_SetLeader(t *testing.T) {

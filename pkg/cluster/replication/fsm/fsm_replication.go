@@ -27,6 +27,10 @@ func (f *BrokerFSM) applyMessageCommand(jsonData string) interface{} {
 }
 
 func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
+	if len(cmd.Messages) == 0 {
+		return errorAckResponse("cannot process empty message batch", "", 0)
+	}
+
 	first := cmd.Messages[0]
 	last := cmd.Messages[len(cmd.Messages)-1]
 

@@ -108,7 +108,7 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 			util.Info("🚀 Attempting to join cluster via seeds...")
 			// Wait a bit for Raft to initialize
 			time.Sleep(2 * time.Second)
-			
+
 			if err := clusterClient.JoinCluster(cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort); err != nil {
 				util.Warn("⚠️ Join cluster attempt failed: %v. This is normal if already part of the cluster.", err)
 			} else {

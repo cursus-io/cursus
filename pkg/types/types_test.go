@@ -1,8 +1,8 @@
 package types
 
 import (
-	"testing"
 	"github.com/stretchr/testify/assert"
+	"testing"
 )
 
 func TestMessageString(t *testing.T) {
@@ -15,7 +15,7 @@ func TestMessageString(t *testing.T) {
 		Epoch:      1,
 		RetryCount: 0,
 	}
-	
+
 	expected := "Message { ID: p1-100, Payload:hello, Offset:50, Key:k1, Epoch:1, RetryCount:0 }"
 	assert.Equal(t, expected, m.String())
 }

@@ -40,34 +40,35 @@ func TestJoinCluster_Success(t *testing.T) {
 	addr := ln.Addr().String()
 	_, portStr, _ := net.SplitHostPort(addr)
 	var port int
-	fmt.Sscanf(portStr, "%d", &port)
+	_, _ = fmt.Sscanf(portStr, "%d", &port)
 
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		_, _ = fmt.Sscanf(portStr, "%d", &port)
 
-		// Read length
-		lenBuf := make([]byte, 4)
-		io.ReadFull(conn, lenBuf)
-		length := binary.BigEndian.Uint32(lenBuf)
+			// Read length
+			lenBuf := make([]byte, 4)
+			_, _ = io.ReadFull(conn, lenBuf)
+			length := binary.BigEndian.Uint32(lenBuf)
 
-		// Read message
-		msgBuf := make([]byte, length)
-		io.ReadFull(conn, msgBuf)
+			// Read message
+			msgBuf := make([]byte, length)
+			_, _ = io.ReadFull(conn, msgBuf)
 
-		// Send success response
-		resp := map[string]interface{}{
-			"success": true,
-		}
-		respData, _ := json.Marshal(resp)
-		
-		respLenBuf := make([]byte, 4)
-		binary.BigEndian.PutUint32(respLenBuf, uint32(len(respData)))
-		conn.Write(respLenBuf)
-		conn.Write(respData)
+			// Send success response
+			resp := map[string]interface{}{
+				"success": true,
+			}
+			respData, _ := json.Marshal(resp)
+
+			respLenBuf := make([]byte, 4)
+			binary.BigEndian.PutUint32(respLenBuf, uint32(len(respData)))
+			_, _ = conn.Write(respLenBuf)
+			_, _ = conn.Write(respData)
+
 	}()
 
 	client := NewTCPClusterClient()
@@ -86,7 +87,7 @@ func TestJoinCluster_Fail(t *testing.T) {
 	addr := ln.Addr().String()
 	_, portStr, _ := net.SplitHostPort(addr)
 	var port int
-	fmt.Sscanf(portStr, "%d", &port)
+	_, _ = fmt.Sscanf(portStr, "%d", &port)
 
 	go func() {
 		for i := 0; i < 5; i++ {
@@ -94,13 +95,13 @@ func TestJoinCluster_Fail(t *testing.T) {
 			if err != nil {
 				return
 			}
-			
+
 			// Read request
 			lenBuf := make([]byte, 4)
-			io.ReadFull(conn, lenBuf)
+			_, _ = io.ReadFull(conn, lenBuf)
 			length := binary.BigEndian.Uint32(lenBuf)
 			msgBuf := make([]byte, length)
-			io.ReadFull(conn, msgBuf)
+			_, _ = io.ReadFull(conn, msgBuf)
 
 			// Send failure response
 			resp := map[string]interface{}{
@@ -108,18 +109,18 @@ func TestJoinCluster_Fail(t *testing.T) {
 				"error":   "already joined",
 			}
 			respData, _ := json.Marshal(resp)
-			
+
 			respLenBuf := make([]byte, 4)
 			binary.BigEndian.PutUint32(respLenBuf, uint32(len(respData)))
-			conn.Write(respLenBuf)
-			conn.Write(respData)
+			_, _ = conn.Write(respLenBuf)
+			_, _ = conn.Write(respData)
 			conn.Close()
 		}
 	}()
 
 	client := NewTCPClusterClient()
 	peers := []string{addr}
-	
+
 	// Create a short-lived context for faster testing of failure
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -138,7 +139,7 @@ func TestStartHeartbeat(t *testing.T) {
 	addr := ln.Addr().String()
 	_, portStr, _ := net.SplitHostPort(addr)
 	var port int
-	fmt.Sscanf(portStr, "%d", &port)
+	_, _ = fmt.Sscanf(portStr, "%d", &port)
 
 	received := make(chan bool, 1)
 	go func() {

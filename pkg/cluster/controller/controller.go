@@ -117,19 +117,12 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 		return fmt.Errorf("partition metadata not found")
 	}
 
-	followers := []string{}
-	for _, replica := range meta.ISR {
+	// Fan out to all replicas, not just ISR
+	targets := []string{}
+	for _, replica := range meta.Replicas {
 		if replica != cc.brokerID {
-			followers = append(followers, replica)
+			targets = append(targets, replica)
 		}
-	}
-
-	if len(meta.ISR) < minISR {
-		return fmt.Errorf("insufficient in-sync replicas: have %d, want %d", len(meta.ISR), minISR)
-	}
-
-	if len(followers) == 0 {
-		return nil
 	}
 
 	data, err := json.Marshal(msgCmd)
@@ -139,11 +132,13 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 	replicateCmd := fmt.Sprintf("REPLICATE_MESSAGE payload=%s", string(data))
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, len(followers))
+	var successCount int32 = 1 // Count self (leader)
+	var mu sync.Mutex
+	errCh := make(chan error, len(targets))
 
-	for _, followerID := range followers {
-		follower := fsm.GetBroker(followerID)
-		if follower == nil {
+	for _, targetID := range targets {
+		broker := fsm.GetBroker(targetID)
+		if broker == nil {
 			continue
 		}
 
@@ -151,24 +146,21 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 		go func(addr string) {
 			defer wg.Done()
 			_, err := cc.Router.forwardWithTimeout(addr, replicateCmd)
-			if err != nil {
+			if err == nil {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			} else {
 				errCh <- err
 			}
-		}(follower.Addr)
+		}(broker.Addr)
 	}
 
 	wg.Wait()
 	close(errCh)
 
-	// In a real Kafka-like system, we might tolerate some follower failures as long as we have minISR.
-	// For now, if acks=-1 was requested (implicit here if calling this), we might want all ISR to succeed.
-	// Actually, Kafka only waits for followers in ISR.
-	
-	// If any error occurred, we should probably return it if we want strict acks.
-	for err := range errCh {
-		if err != nil {
-			return err
-		}
+	if int(successCount) < minISR {
+		return fmt.Errorf("insufficient successful acknowledgements: got %d, want minISR %d", successCount, minISR)
 	}
 
 	return nil

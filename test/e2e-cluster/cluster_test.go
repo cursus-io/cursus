@@ -85,7 +85,7 @@ func TestDistributedOffsetResilience(t *testing.T) {
 	ctx.WhenCluster().
 		StartCluster().
 		CreateTopic()
-	
+
 	time.Sleep(5 * time.Second) // allow ISR to stabilize
 
 	ctx.WhenCluster().

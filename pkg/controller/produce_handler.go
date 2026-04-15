@@ -267,7 +267,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 			// Actually HandleBatchMessage is called for binary BATCH data.
 			// I need a way to forward binary data to Partition Leader.
 			util.Warn("Binary batch forwarding to partition leader is not fully implemented for all cases")
-			// For now, let's just forward to Raft leader if not the leader, 
+			// For now, let's just forward to Raft leader if not the leader,
 			// but better would be to use ForwardDataToPartitionLeader.
 		}
 

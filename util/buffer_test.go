@@ -13,7 +13,7 @@ func TestBufferReadWrite(t *testing.T) {
 	defer c2.Close()
 
 	data := []byte("hello world")
-	
+
 	go func() {
 		err := WriteWithLength(c1, data)
 		assert.NoError(t, err)
@@ -34,7 +34,7 @@ func TestBufferErrorCases(t *testing.T) {
 
 	err = WriteWithLength(c1, []byte("fail"))
 	assert.Error(t, err)
-	
+
 	// Max size error
 	largeData := make([]byte, MaxMessageSize+1)
 	err = WriteWithLength(c1, largeData)

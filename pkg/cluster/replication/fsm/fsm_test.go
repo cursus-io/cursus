@@ -372,10 +372,10 @@ func TestBrokerFSM_TopicCreation_ReplicaSubset(t *testing.T) {
 	}
 }
 
-func TestBrokerFSM_TopicCreation_DefaultReplicationFactor(t *testing.T) {
+func TestBrokerFSM_TopicCreation_DefaultRF_Capped(t *testing.T) {
 	fsm := newTestFSM()
 
-	// Register 2 brokers (less than default RF=3)
+	// Register only 2 brokers — default RF=3 should be capped to 2.
 	for i := 1; i <= 2; i++ {
 		data, _ := json.Marshal(BrokerInfo{
 			ID:     fmt.Sprintf("broker-%d", i),
@@ -385,29 +385,65 @@ func TestBrokerFSM_TopicCreation_DefaultReplicationFactor(t *testing.T) {
 		fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", data)), Index: uint64(i)})
 	}
 
-	// Create topic without specifying replication_factor (defaults to 3, capped to 2)
 	topicCmd := TopicCommand{
-		Name:       "small-topic",
+		Name:       "capped-rf-topic",
 		Partitions: 4,
 	}
 	data, _ := json.Marshal(topicCmd)
 	fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", data)), Index: 10})
 
 	for i := 0; i < 4; i++ {
-		key := fmt.Sprintf("small-topic-%d", i)
+		key := fmt.Sprintf("capped-rf-topic-%d", i)
 		meta := fsm.GetPartitionMetadata(key)
-		if meta == nil {
-			t.Fatalf("Partition %s metadata not found", key)
-		}
-		// Should be capped to 2 (number of brokers)
 		if len(meta.Replicas) != 2 {
-			t.Errorf("Partition %s: expected 2 replicas (capped), got %d", key, len(meta.Replicas))
+			t.Errorf("Partition %s: expected 2 replicas (capped from default 3), got %d: %v", key, len(meta.Replicas), meta.Replicas)
+		}
+	}
+}
+
+func TestBrokerFSM_TopicCreation_DefaultRF_Satisfied(t *testing.T) {
+	fsm := newTestFSM()
+
+	// Register 5 brokers — enough to satisfy the default RF=3 without capping.
+	// This proves that the default is actually 3 and not just "all available brokers".
+	for i := 1; i <= 5; i++ {
+		data, _ := json.Marshal(BrokerInfo{
+			ID:     fmt.Sprintf("broker-%d", i),
+			Addr:   fmt.Sprintf("localhost:900%d", i),
+			Status: "active",
+		})
+		fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", data)), Index: uint64(i)})
+	}
+
+	topicCmd := TopicCommand{
+		Name:       "default-rf-topic",
+		Partitions: 4,
+	}
+	data, _ := json.Marshal(topicCmd)
+	fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", data)), Index: 10})
+
+	for i := 0; i < 4; i++ {
+		key := fmt.Sprintf("default-rf-topic-%d", i)
+		meta := fsm.GetPartitionMetadata(key)
+		if len(meta.Replicas) != 3 {
+			t.Errorf("Partition %s: expected 3 replicas (default RF), got %d: %v", key, len(meta.Replicas), meta.Replicas)
+		}
+		if len(meta.ISR) != 3 {
+			t.Errorf("Partition %s: expected 3 ISR members (default RF), got %d: %v", key, len(meta.ISR), meta.ISR)
 		}
 	}
 }
 
 func TestBrokerFSM_TopicCreation_ConsistentHashing_Stability(t *testing.T) {
-	// Create two FSMs with same 3 brokers, create same topic -> should get same assignments
+	// Two FSMs with the same broker set must produce byte-identical assignments.
+	// Snapshot the full leader+replica layout from the first trial and compare
+	// the second trial against it so replica-level nondeterminism also fails.
+	type assignment struct {
+		Leader   string
+		Replicas []string
+	}
+
+	var firstTrial map[string]assignment
 	for trial := 0; trial < 2; trial++ {
 		fsm := newTestFSM()
 		for i := 1; i <= 3; i++ {
@@ -427,17 +463,51 @@ func TestBrokerFSM_TopicCreation_ConsistentHashing_Stability(t *testing.T) {
 		data, _ := json.Marshal(topicCmd)
 		fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", data)), Index: 10})
 
-		// Check leaders are distributed across brokers (not all on one)
+		current := make(map[string]assignment, 8)
 		leaderCounts := make(map[string]int)
 		for i := 0; i < 8; i++ {
 			key := fmt.Sprintf("stable-topic-%d", i)
 			meta := fsm.GetPartitionMetadata(key)
+			if meta == nil {
+				t.Fatalf("Trial %d: partition %s metadata missing", trial, key)
+			}
+			replicas := append([]string(nil), meta.Replicas...)
+			current[key] = assignment{Leader: meta.Leader, Replicas: replicas}
 			leaderCounts[meta.Leader]++
 		}
+
 		if len(leaderCounts) < 2 {
 			t.Errorf("Trial %d: leaders not distributed, all on same broker: %v", trial, leaderCounts)
 		}
-		t.Logf("Trial %d leader distribution: %v", trial, leaderCounts)
+
+		if trial == 0 {
+			firstTrial = current
+			continue
+		}
+
+		// Compare full leader+replica layout against first trial.
+		if len(current) != len(firstTrial) {
+			t.Fatalf("Trial %d: partition count mismatch (got %d, want %d)", trial, len(current), len(firstTrial))
+		}
+		for key, got := range current {
+			want, ok := firstTrial[key]
+			if !ok {
+				t.Errorf("Trial %d: partition %s missing from first trial", trial, key)
+				continue
+			}
+			if got.Leader != want.Leader {
+				t.Errorf("Trial %d partition %s leader mismatch: got %s, want %s", trial, key, got.Leader, want.Leader)
+			}
+			if len(got.Replicas) != len(want.Replicas) {
+				t.Errorf("Trial %d partition %s replica length mismatch: got %v, want %v", trial, key, got.Replicas, want.Replicas)
+				continue
+			}
+			for j := range got.Replicas {
+				if got.Replicas[j] != want.Replicas[j] {
+					t.Errorf("Trial %d partition %s replica[%d] mismatch: got %s, want %s", trial, key, j, got.Replicas[j], want.Replicas[j])
+				}
+			}
+		}
 	}
 }
 
@@ -463,6 +533,26 @@ func TestBrokerFSM_Snapshot_Restore_WithReplicas(t *testing.T) {
 	data, _ := json.Marshal(topicCmd)
 	f.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", data)), Index: 10})
 
+	// Capture the pre-snapshot layout so we can compare concrete member IDs after restore.
+	type layout struct {
+		Leader   string
+		Replicas []string
+		ISR      []string
+	}
+	before := make(map[string]layout, 4)
+	for i := 0; i < 4; i++ {
+		key := fmt.Sprintf("snap-topic-%d", i)
+		meta := f.GetPartitionMetadata(key)
+		if meta == nil {
+			t.Fatalf("Partition %s metadata missing before snapshot", key)
+		}
+		before[key] = layout{
+			Leader:   meta.Leader,
+			Replicas: append([]string(nil), meta.Replicas...),
+			ISR:      append([]string(nil), meta.ISR...),
+		}
+	}
+
 	// Snapshot
 	snapshot, err := f.Snapshot()
 	if err != nil {
@@ -481,20 +571,34 @@ func TestBrokerFSM_Snapshot_Restore_WithReplicas(t *testing.T) {
 		t.Fatalf("Restore failed: %v", err)
 	}
 
-	// Verify replica subsets are preserved
-	for i := 0; i < 4; i++ {
-		key := fmt.Sprintf("snap-topic-%d", i)
+	// Verify replica membership is preserved byte-for-byte, not just length.
+	for key, want := range before {
 		meta := newFSM.GetPartitionMetadata(key)
 		if meta == nil {
 			t.Fatalf("Partition %s metadata not restored", key)
 		}
-		if len(meta.Replicas) != 2 {
-			t.Errorf("Partition %s: expected 2 replicas after restore, got %d", key, len(meta.Replicas))
+		if meta.Leader != want.Leader {
+			t.Errorf("Partition %s: leader mismatch after restore: got %s, want %s", key, meta.Leader, want.Leader)
 		}
-		if len(meta.ISR) != 2 {
-			t.Errorf("Partition %s: expected 2 ISR after restore, got %d", key, len(meta.ISR))
+		if !equalStringSlice(meta.Replicas, want.Replicas) {
+			t.Errorf("Partition %s: replicas mismatch after restore: got %v, want %v", key, meta.Replicas, want.Replicas)
+		}
+		if !equalStringSlice(meta.ISR, want.ISR) {
+			t.Errorf("Partition %s: ISR mismatch after restore: got %v, want %v", key, meta.ISR, want.ISR)
 		}
 	}
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestBrokerFSM_TopicDelete(t *testing.T) {
@@ -592,6 +696,30 @@ func TestBrokerFSM_TopicCreation_ExplicitLeader(t *testing.T) {
 		if meta.Leader != "b2" {
 			t.Errorf("Partition %s: expected leader b2, got %s", key, meta.Leader)
 		}
+
+		// Explicit leader must appear in both the replica set and the initial ISR,
+		// otherwise followers and quorum calculations will ignore the leader.
+		leaderInReplicas := false
+		for _, r := range meta.Replicas {
+			if r == "b2" {
+				leaderInReplicas = true
+				break
+			}
+		}
+		if !leaderInReplicas {
+			t.Errorf("Partition %s: explicit leader b2 missing from replicas %v", key, meta.Replicas)
+		}
+
+		leaderInISR := false
+		for _, r := range meta.ISR {
+			if r == "b2" {
+				leaderInISR = true
+				break
+			}
+		}
+		if !leaderInISR {
+			t.Errorf("Partition %s: explicit leader b2 missing from ISR %v", key, meta.ISR)
+		}
 	}
 }
 
@@ -634,23 +762,23 @@ func TestBrokerFSM_Notifier(t *testing.T) {
 	f := newTestFSM()
 
 	ch := f.RegisterNotifier("req-1")
+	defer f.UnregisterNotifier("req-1")
 
 	// Simulate Apply with req_id
-	data, _ := json.Marshal(BrokerInfo{ID: "b1", Addr: "localhost:9001", Status: "active", LastSeen: time.Now()})
 	payload := `REGISTER:{"id":"b1","addr":"localhost:9001","status":"active","last_seen":"2026-01-01T00:00:00Z","req_id":"req-1"}`
 	f.Apply(&raft.Log{Data: []byte(payload), Index: 1})
 
+	// Apply's notify path is synchronous, but guard with a short timeout to
+	// fail loudly if the req_id dispatch ever regresses instead of silently
+	// treating the missed notification as success.
 	select {
 	case res := <-ch:
-		if res != nil {
-			t.Logf("Notifier received: %v", res)
+		if err, ok := res.(error); ok && err != nil {
+			t.Fatalf("Notifier reported error: %v", err)
 		}
-	default:
-		// Notifier may or may not fire depending on parsing
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Notifier did not receive event for req-1 within timeout")
 	}
-
-	_ = data // suppress unused
-	f.UnregisterNotifier("req-1")
 }
 
 type MockSnapshotSink struct {

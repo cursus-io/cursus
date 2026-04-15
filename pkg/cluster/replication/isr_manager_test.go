@@ -119,7 +119,7 @@ func TestISRManager_Quorum(t *testing.T) {
 	// Heartbeat node1 & node2 only
 	isrManager.UpdateHeartbeat("node1")
 	isrManager.UpdateHeartbeat("node2")
-	
+
 	// ComputeISR calculates currentISR and should apply it to FSM via MockCommandApplier
 	isrManager.ComputeISR(topicName, partitionID)
 
@@ -128,11 +128,11 @@ func TestISRManager_Quorum(t *testing.T) {
 	}
 
 	// heartbeat timeout simulation: wait and only heartbeat node1
-	time.Sleep(200 * time.Millisecond) 
+	time.Sleep(200 * time.Millisecond)
 
 	isrManager.UpdateHeartbeat("node1")
 	isrManager.CleanStaleHeartbeats()
-	
+
 	// ComputeISR calculates [node1] and applies to FSM
 	isrManager.ComputeISR(topicName, partitionID)
 

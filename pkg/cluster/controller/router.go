@@ -7,6 +7,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cursus-io/cursus/util"
@@ -17,6 +18,7 @@ type LocalProcessor interface {
 }
 
 type ClusterRouter struct {
+	mu             sync.RWMutex
 	LocalAddr      string
 	brokerID       string
 	rm             RaftManager
@@ -110,14 +112,26 @@ func (r *ClusterRouter) FindCoordinator(groupName string) (string, string, error
 	sort.Strings(activeBrokerIDs)
 	brokerHash := strings.Join(activeBrokerIDs, ",")
 
-	// Rebuild ring only when broker membership changes
-	if r.coordRing == nil || r.coordBrokerHash != brokerHash {
-		r.coordRing = util.NewConsistentHashRing(150, nil)
-		r.coordRing.Add(activeBrokerIDs...)
-		r.coordBrokerHash = brokerHash
+	// Check if rebuild needed
+	r.mu.RLock()
+	needsRebuild := r.coordRing == nil || r.coordBrokerHash != brokerHash
+	r.mu.RUnlock()
+
+	if needsRebuild {
+		r.mu.Lock()
+		// Double-check
+		if r.coordRing == nil || r.coordBrokerHash != brokerHash {
+			r.coordRing = util.NewConsistentHashRing(150, nil)
+			r.coordRing.Add(activeBrokerIDs...)
+			r.coordBrokerHash = brokerHash
+		}
+		r.mu.Unlock()
 	}
 
+	r.mu.RLock()
 	coordID := r.coordRing.Get(groupName)
+	r.mu.RUnlock()
+
 	broker := fsmRef.GetBroker(coordID)
 	if broker == nil {
 		return "", "", fmt.Errorf("coordinator broker %s not found in registry", coordID)

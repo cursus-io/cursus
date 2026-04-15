@@ -102,6 +102,11 @@ func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition in
 		return "", false, nil
 	}
 
+	// Fast-path: Check if we are already the owner
+	if ch.Cluster.IsAuthorized(topic, partition) {
+		return "", false, nil
+	}
+
 	const (
 		maxRetries = 3
 		retryDelay = 200 * time.Millisecond

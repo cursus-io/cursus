@@ -121,7 +121,7 @@ func TestServiceDiscovery_RegisterDeregister(t *testing.T) {
 		rm.On("ApplyCommand", "REGISTER", mock.Anything).Return(nil).Once()
 		err := sd.Register()
 		assert.NoError(t, err)
-		
+
 		brokers := rm.mockFSM.GetBrokers()
 		assert.Len(t, brokers, 1)
 		assert.Equal(t, "node1", brokers[0].ID)
@@ -132,7 +132,7 @@ func TestServiceDiscovery_RegisterDeregister(t *testing.T) {
 		rm.On("ApplyCommand", "DEREGISTER", mock.Anything).Return(nil).Once()
 		err := sd.Deregister()
 		assert.NoError(t, err)
-		
+
 		brokers := rm.mockFSM.GetBrokers()
 		assert.Len(t, brokers, 1)
 		assert.Equal(t, "inactive", brokers[0].Status)
@@ -159,11 +159,11 @@ func TestServiceDiscovery_NodeOperations(t *testing.T) {
 		rm.On("GetLeaderAddress").Return("localhost:9001").Once()
 		rm.On("AddVoter", "node2", "localhost:9002").Return(nil).Once()
 		rm.On("ApplyCommand", "REGISTER", mock.Anything).Return(nil).Once()
-		
+
 		leader, err := sd.AddNode("node2", "localhost:9002")
 		assert.NoError(t, err)
 		assert.Equal(t, "localhost:9001", leader)
-		
+
 		brokers := rm.mockFSM.GetBrokers()
 		assert.Len(t, brokers, 1)
 		assert.Equal(t, "node2", brokers[0].ID)
@@ -175,11 +175,11 @@ func TestServiceDiscovery_NodeOperations(t *testing.T) {
 		rm.On("GetLeaderAddress").Return("localhost:9001").Once()
 		rm.On("RemoveServer", "node2").Return(nil).Once()
 		rm.On("ApplyCommand", "DEREGISTER", mock.Anything).Return(nil).Once()
-		
+
 		leader, err := sd.RemoveNode("node2")
 		assert.NoError(t, err)
 		assert.Equal(t, "localhost:9001", leader)
-		
+
 		brokers := rm.mockFSM.GetBrokers()
 		assert.Len(t, brokers, 1)
 		assert.Equal(t, "inactive", brokers[0].Status)

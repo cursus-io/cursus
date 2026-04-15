@@ -3,12 +3,13 @@ package server
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
-	"sync/atomic"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/stretchr/testify/assert"
@@ -41,23 +42,28 @@ func TestIsCommand(t *testing.T) {
 func TestHealthCheckServer(t *testing.T) {
 	ready := &atomic.Bool{}
 	ready.Store(false)
-	
-	port := 19080
+
+	// Use dynamic port
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NoError(t, err)
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
 	startHealthCheckServer(port, ready)
-	
-	// Wait a bit for server to start
-	time.Sleep(100 * time.Millisecond)
 
 	// Test Not Ready
-	resp, err := http.Get("http://localhost:19080/health")
+	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
+	resp, err := http.Get(url)
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
-	
+	resp.Body.Close()
+
 	// Test Ready
 	ready.Store(true)
-	resp, err = http.Get("http://localhost:19080/health")
+	resp, err = http.Get(url)
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	resp.Body.Close()
 }
 
 func TestWriteResponse(t *testing.T) {
@@ -79,12 +85,12 @@ func TestWriteResponse(t *testing.T) {
 	defer conn.Close()
 
 	lenBuf := make([]byte, 4)
-	io.ReadFull(conn, lenBuf)
+	_, _ = io.ReadFull(conn, lenBuf)
 	length := binary.BigEndian.Uint32(lenBuf)
 	assert.Equal(t, uint32(2), length)
 
 	msgBuf := make([]byte, length)
-	io.ReadFull(conn, msgBuf)
+	_, _ = io.ReadFull(conn, msgBuf)
 	assert.Equal(t, "OK", string(msgBuf))
 	<-done
 }
@@ -102,7 +108,7 @@ func TestReadMessage(t *testing.T) {
 		buf := make([]byte, 4+len(msg))
 		binary.BigEndian.PutUint32(buf[0:4], uint32(len(msg)))
 		copy(buf[4:], []byte(msg))
-		conn.Write(buf)
+		_, _ = conn.Write(buf)
 		conn.Close()
 	}()
 
@@ -122,21 +128,30 @@ func TestHandleConnection_Exit(t *testing.T) {
 	defer l.Close()
 
 	cfg := config.DefaultConfig()
-	
+	done := make(chan struct{})
+
 	go func() {
-		conn, _ := l.Accept()
+		defer close(done)
+		conn, err := l.Accept()
+		if err != nil {
+			return
+		}
 		HandleConnection(context.Background(), conn, nil, cfg, nil, nil, nil)
 	}()
 
 	conn, _ := net.Dial("tcp", l.Addr().String())
-	// Send malformed or something that causes exit
+	// Send malformed msg
 	msg := "MALFORMED"
 	buf := make([]byte, 4+len(msg))
 	binary.BigEndian.PutUint32(buf[0:4], uint32(len(msg)))
 	copy(buf[4:], []byte(msg))
-	conn.Write(buf)
-	
-	// Wait for HandleConnection to process and close
-	time.Sleep(100 * time.Millisecond)
+	_, _ = conn.Write(buf)
 	conn.Close()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleConnection failed to exit")
+	}
 }

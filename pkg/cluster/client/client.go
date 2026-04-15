@@ -69,7 +69,7 @@ func (c *TCPClusterClient) sendHeartbeat(peers []string, nodeID, localAddr strin
 			}
 
 			target := net.JoinHostPort(host, fmt.Sprintf("%d", apiPort))
-			
+
 			// Use short timeout for heartbeat connection
 			conn, err := net.DialTimeout("tcp", target, 1*time.Second)
 			if err != nil {
@@ -112,7 +112,7 @@ func (c *TCPClusterClient) joinClusterWithContext(ctx context.Context, peers []s
 				}
 			}
 			targetAddr := net.JoinHostPort(hostOnly, fmt.Sprintf("%d", apiPort))
-			
+
 			if err := c.sendJoinCommand(ctx, targetAddr, nodeID, addr); err == nil {
 				return nil
 			}

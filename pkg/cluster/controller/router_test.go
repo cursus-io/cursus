@@ -30,10 +30,10 @@ func (m *MockRaftManager) LeaderCh() <-chan bool {
 func (m *MockRaftManager) GetFSM() *fsm.BrokerFSM {
 	return m.mockFSM
 }
-func (m *MockRaftManager) GetConfiguration() raft.ConfigurationFuture    { return nil }
-func (m *MockRaftManager) AddVoter(id string, addr string) error           { return nil }
-func (m *MockRaftManager) RemoveServer(id string) error                    { return nil }
-func (m *MockRaftManager) GetISRManager() replication.ISRManagerInterface  { return nil }
+func (m *MockRaftManager) GetConfiguration() raft.ConfigurationFuture     { return nil }
+func (m *MockRaftManager) AddVoter(id string, addr string) error          { return nil }
+func (m *MockRaftManager) RemoveServer(id string) error                   { return nil }
+func (m *MockRaftManager) GetISRManager() replication.ISRManagerInterface { return nil }
 func (m *MockRaftManager) ReplicateWithQuorum(topic string, partition int, msg types.Message, minISR int, isIdempotent bool, sequenceScope string) (types.AckResponse, error) {
 	return types.AckResponse{}, nil
 }
@@ -77,7 +77,6 @@ func TestClusterRouter_FindCoordinator(t *testing.T) {
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
 	router := NewClusterRouter("node1", "localhost:7001", nil, rm, 7000)
 
-
 	group1 := "group-a"
 	id1, addr1, err := router.FindCoordinator(group1)
 	if err != nil {
@@ -103,7 +102,6 @@ func TestClusterRouter_FindCoordinator(t *testing.T) {
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"node4\",\"addr\":\"localhost:7004\",\"status\":\"active\"}")})
 	id1_after, _, _ := router.FindCoordinator(group1)
 
-	
 	// With 3->4 nodes, group-a might or might not move, but it shouldn't depend on other groups
 	t.Logf("Group %s after adding node4 -> %s", group1, id1_after)
 }

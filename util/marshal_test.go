@@ -10,22 +10,22 @@ import (
 
 func TestIsNil(t *testing.T) {
 	assert.True(t, IsNil(nil))
-	
+
 	var p *int
 	assert.True(t, IsNil(p))
-	
+
 	var s []int
 	assert.True(t, IsNil(s))
-	
+
 	var m map[string]int
 	assert.True(t, IsNil(m))
-	
+
 	var c chan int
 	assert.True(t, IsNil(c))
-	
+
 	var i interface{}
 	assert.True(t, IsNil(i))
-	
+
 	assert.False(t, IsNil(10))
 	assert.False(t, IsNil("hello"))
 }

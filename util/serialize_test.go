@@ -50,9 +50,27 @@ func TestDiskMessageSerialization(t *testing.T) {
 }
 
 func TestDeserializeMessage_ErrorCases(t *testing.T) {
-	_, err := DeserializeMessage([]byte{0}) // too short
+	// Too short for initial fields
+	_, err := DeserializeMessage([]byte{0})
 	assert.Error(t, err)
-	
-	_, err = DeserializeDiskMessage([]byte{0}) // too short
+	assert.Contains(t, err.Error(), "producer length")
+
+	_, err = DeserializeDiskMessage([]byte{0})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "topic length")
+
+	// Malformed length-prefixes (claims to have more data than provided)
+	// DeserializeMessage: [2 bytes producer length] [producer ID...]
+	_, err = DeserializeMessage([]byte{0, 10}) // claims 10 bytes, but 0 provided
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "producer ID")
+
+	// DeserializeDiskMessage: [2 bytes topic length] [topic...] [4 bytes partition] ...
+	_, err = DeserializeDiskMessage([]byte{0, 5, 't', 'e', 's', 't', '1'}) // claims 5 bytes topic, OK, but missing partition
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "partition")
+
+	// Large claims that exceed buffer
+	_, err = DeserializeMessage([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255})
 	assert.Error(t, err)
 }

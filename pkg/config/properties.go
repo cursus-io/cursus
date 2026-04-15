@@ -68,9 +68,9 @@ type Config struct {
 	StaticClusterMembers []string `yaml:"static_cluster_members" json:"distribution.static_cluster_members"`
 	BootstrapCluster     bool     `yaml:"bootstrap_cluster" json:"distribution.bootstrap"`
 
-	AdvertisedHost            string   `yaml:"advertised_host" json:"distribution.advertised_host"`
-	MinInSyncReplicas         int      `yaml:"min_insync_replicas" json:"min.insync.replicas"`
-	DefaultReplicationFactor  int      `yaml:"default_replication_factor" json:"default.replication.factor"`
+	AdvertisedHost           string `yaml:"advertised_host" json:"distribution.advertised_host"`
+	MinInSyncReplicas        int    `yaml:"min_insync_replicas" json:"min.insync.replicas"`
+	DefaultReplicationFactor int    `yaml:"default_replication_factor" json:"default.replication.factor"`
 
 	// idempotency
 	EnableIdempotence bool `yaml:"enable_idempotence" json:"enable.idempotence"`
@@ -130,15 +130,15 @@ func DefaultConfig() *Config {
 			BroadcastChannelBufferSize: 10000,
 
 			// distributed cluster
-			EnabledDistribution:  false,
-			RaftPort:             9001,
-			DiscoveryPort:        8000,
-			RaftPeers:            []string{},
-			StaticClusterMembers: []string{},
-			BootstrapCluster:     false,
-			AdvertisedHost:       "localhost",
-			MinInSyncReplicas:         2,
-			DefaultReplicationFactor:  3,
+			EnabledDistribution:      false,
+			RaftPort:                 9001,
+			DiscoveryPort:            8000,
+			RaftPeers:                []string{},
+			StaticClusterMembers:     []string{},
+			BootstrapCluster:         false,
+			AdvertisedHost:           "localhost",
+			MinInSyncReplicas:        2,
+			DefaultReplicationFactor: 3,
 
 			// idempotency
 			EnableIdempotence: false,

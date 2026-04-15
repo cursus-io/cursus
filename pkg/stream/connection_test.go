@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -69,8 +70,9 @@ func TestStreamConnection_Keepalive(t *testing.T) {
 
 	// Read keepalive from c2
 	buf := make([]byte, 4)
-	c2.SetReadDeadline(time.Now().Add(1 * time.Second))
-	_, err := c2.Read(buf)
+	err := c2.SetReadDeadline(time.Now().Add(1 * time.Second))
+	assert.NoError(t, err)
+	_, err = io.ReadFull(c2, buf)
 	assert.NoError(t, err)
 	assert.Equal(t, []byte{0, 0, 0, 0}, buf)
 
