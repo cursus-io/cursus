@@ -17,8 +17,8 @@ type mockStorage struct{}
 func (m *mockStorage) ReadMessages(offset uint64, max int) ([]types.Message, error) {
 	return []types.Message{}, nil
 }
-func (m *mockStorage) GetAbsoluteOffset() uint64        { return 0 }
-func (m *mockStorage) GetLatestOffset() uint64          { return 0 }
+func (m *mockStorage) GetAbsoluteOffset() uint64               { return 0 }
+func (m *mockStorage) GetLatestOffset() uint64                 { return 0 }
 func (m *mockStorage) GetSegmentPath(baseOffset uint64) string { return "" }
 
 func (m *mockStorage) AppendMessage(topic string, partition int, msg *types.Message) (uint64, error) {
@@ -138,7 +138,7 @@ func TestCommandHandler_GroupCommands(t *testing.T) {
 
 func TestCommandHandler_ErrorResponses(t *testing.T) {
 	ch := controller.NewCommandHandler(nil, nil, nil, nil, nil)
-	
+
 	t.Run("CREATE missing topic", func(t *testing.T) {
 		resp := ch.HandleCommand("CREATE partitions=3", nil)
 		if !strings.Contains(resp, "missing topic parameter") {

@@ -33,13 +33,13 @@ const (
 
 func parseLogLevelString(s string) LogLevel {
 	switch strings.ToLower(s) {
-	case "debug":
+	case "debug", "0":
 		return LogLevelDebug
-	case "info":
+	case "info", "1":
 		return LogLevelInfo
-	case "warn", "warning":
+	case "warn", "warning", "2":
 		return LogLevelWarn
-	case "error":
+	case "error", "3":
 		return LogLevelError
 	default:
 		return LogLevelInfo
@@ -48,38 +48,58 @@ func parseLogLevelString(s string) LogLevel {
 
 // UnmarshalYAML implements custom YAML unmarshaling for LogLevel
 func (l *LogLevel) UnmarshalYAML(value *yaml.Node) error {
-	var s string
-	if err := value.Decode(&s); err == nil {
-		*l = parseLogLevelString(s)
-		return nil
+	if value.Tag == "!!null" {
+		return fmt.Errorf("log_level cannot be null")
 	}
 
-	var i int
-	if err := value.Decode(&i); err != nil {
-		return fmt.Errorf("log_level must be a string (debug/info/warn/error) or integer (0-3)")
+	switch value.Kind {
+	case yaml.ScalarNode:
+		switch value.Tag {
+		case "!!str":
+			*l = parseLogLevelString(value.Value)
+			return nil
+		case "!!int":
+			var i int
+			if err := value.Decode(&i); err != nil {
+				return err
+			}
+			if i < 0 || i > int(LogLevelError) {
+				return fmt.Errorf("log_level integer must be between 0 and %d", LogLevelError)
+			}
+			*l = LogLevel(i)
+			return nil
+		default:
+			return fmt.Errorf("log_level must be a string or integer")
+		}
+	default:
+		return fmt.Errorf("log_level must be a string or integer")
 	}
-	if i < 0 || i > int(LogLevelError) {
-		return fmt.Errorf("log_level integer must be between 0 and %d", LogLevelError)
-	}
-	*l = LogLevel(i)
-	return nil
 }
 
 // UnmarshalJSON implements custom JSON unmarshaling for LogLevel
 func (l *LogLevel) UnmarshalJSON(data []byte) error {
-	var s string
-	if err := json.Unmarshal(data, &s); err == nil {
-		*l = parseLogLevelString(s)
-		return nil
+	var v interface{}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
 	}
 
-	var i int
-	if err := json.Unmarshal(data, &i); err != nil {
-		return fmt.Errorf("log_level must be a string (debug/info/warn/error) or integer (0-3)")
+	switch val := v.(type) {
+	case string:
+		*l = parseLogLevelString(val)
+		return nil
+	case float64:
+		i := int(val)
+		if float64(i) != val {
+			return fmt.Errorf("log_level integer must be a whole number")
+		}
+		if i < 0 || i > int(LogLevelError) {
+			return fmt.Errorf("log_level integer must be between 0 and %d", LogLevelError)
+		}
+		*l = LogLevel(i)
+		return nil
+	case nil:
+		return fmt.Errorf("log_level cannot be null")
+	default:
+		return fmt.Errorf("log_level must be a string or integer")
 	}
-	if i < 0 || i > int(LogLevelError) {
-		return fmt.Errorf("log_level integer must be between 0 and %d", LogLevelError)
-	}
-	*l = LogLevel(i)
-	return nil
 }

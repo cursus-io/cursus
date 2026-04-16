@@ -62,6 +62,15 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 		idempotent = strings.ToLower(idempStr) == "true"
 	}
 
+	replicationFactor := ch.Config.DefaultReplicationFactor
+	if rfStr, ok := args["replication_factor"]; ok {
+		n, err := strconv.Atoi(rfStr)
+		if err != nil || n <= 0 {
+			return "replication_factor must be a positive integer"
+		}
+		replicationFactor = n
+	}
+
 	tm := ch.TopicManager
 	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
@@ -69,9 +78,10 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 		}
 
 		payload := map[string]interface{}{
-			"name":       topicName,
-			"partitions": partitions,
-			"idempotent": idempotent,
+			"name":               topicName,
+			"partitions":         partitions,
+			"idempotent":         idempotent,
+			"replication_factor": replicationFactor,
 		}
 		_, err := ch.applyAndWait("TOPIC", payload)
 		if err != nil {
@@ -173,6 +183,12 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string) string {
 		return "REGISTER_GROUP requires group parameter"
 	}
 
+	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.Router != nil {
+		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
+			return resp
+		}
+	}
+
 	t := ch.TopicManager.GetTopic(topicName)
 	if t == nil {
 		util.Warn("ch registerGroup: topic '%s' does not exist", topicName)
@@ -217,6 +233,10 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 
 	var assignments []int
 	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
+			return resp
+		}
+
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -284,6 +304,9 @@ func (ch *CommandHandler) handleSyncGroup(cmd string) string {
 	}
 
 	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
+			return resp
+		}
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -314,6 +337,9 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 	}
 
 	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
+			return resp
+		}
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -360,6 +386,9 @@ func (ch *CommandHandler) handleFetchOffset(cmd string) string {
 	}
 
 	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
+			return resp
+		}
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -402,6 +431,9 @@ func (ch *CommandHandler) handleGroupStatus(cmd string) string {
 	}
 
 	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
+			return resp
+		}
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -437,6 +469,9 @@ func (ch *CommandHandler) handleHeartbeat(cmd string) string {
 	}
 
 	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
+			return resp
+		}
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -484,6 +519,10 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	}
 
 	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupID, cmd); forwarded {
+			return resp
+		}
+
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -532,6 +571,9 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 	generation, _ := strconv.Atoi(args["generation"])
 
 	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupID, cmd); forwarded {
+			return resp
+		}
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}

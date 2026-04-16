@@ -37,7 +37,7 @@ func NewISRManager(fsm *fsm.BrokerFSM, brokerID string, heartbeatTimeout time.Du
 	if heartbeatTimeout <= 0 {
 		heartbeatTimeout = defaultHeartbeatTimeout
 	}
-	
+
 	lastSeen := make(map[string]time.Time)
 	if brokerID != "" {
 		lastSeen[brokerID] = time.Now()
@@ -93,7 +93,7 @@ func (i *ISRManager) refreshAllISRs() {
 		}
 		topic := key[:idx]
 		partition, _ := strconv.Atoi(key[idx+1:])
-		
+
 		i.ComputeISR(topic, partition)
 	}
 }
@@ -178,7 +178,7 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 	// If we are Raft leader, propose changes if needed
 	if i.applier != nil && i.applier.IsLeader() {
 		needsUpdate := false
-		
+
 		// 1. Check if ISR count changed
 		if len(currentISR) != len(metadata.ISR) {
 			needsUpdate = true
@@ -208,12 +208,34 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 		if !leaderAlive || needsUpdate {
 			newMetadata := *metadata
 			newMetadata.ISR = currentISR
-			
+
 			if !leaderAlive && len(currentISR) > 0 {
 				// Elect new leader from ISR
 				newMetadata.Leader = currentISR[0]
 				newMetadata.LeaderEpoch++
 				util.Info("ISRManager: Failover for %s: %s -> %s", key, metadata.Leader, newMetadata.Leader)
+			} else if !leaderAlive && len(currentISR) == 0 && len(metadata.Replicas) > 0 {
+				// ISR is empty: fallback to any available replica (unclean leader election)
+				found := false
+				for _, replica := range metadata.Replicas {
+					// Fallback to the first alive replica
+					if i.isBrokerAlive(replica) {
+						newMetadata.Leader = replica
+						newMetadata.LeaderEpoch++
+						newMetadata.ISR = []string{replica}
+						util.Warn("ISRManager: Unclean leader election for %s: %s -> %s (ISR was empty, fell back to replica)", key, metadata.Leader, replica)
+						found = true
+						break
+					}
+				}
+				// If no alive, fallback to the very first replica in metadata regardless
+				if !found {
+					replica := metadata.Replicas[0]
+					newMetadata.Leader = replica
+					newMetadata.LeaderEpoch++
+					newMetadata.ISR = []string{replica}
+					util.Warn("ISRManager: Unclean leader election (emergency fallback) for %s: %s -> %s", key, metadata.Leader, replica)
+				}
 			}
 
 			data, _ := json.Marshal(newMetadata)
@@ -227,6 +249,15 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 	}
 
 	return currentISR
+}
+
+func (i *ISRManager) isBrokerAlive(brokerID string) bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	if lastSeen, ok := i.lastSeen[brokerID]; ok {
+		return time.Since(lastSeen) < i.heartbeatTimeout
+	}
+	return false
 }
 
 func (i *ISRManager) GetISR(topic string, partition int) []string {

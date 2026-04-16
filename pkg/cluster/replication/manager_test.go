@@ -4,138 +4,145 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 )
 
 type MockRaft struct {
-	ApplyFunc            func([]byte, time.Duration) raft.ApplyFuture
-	AddVoterFunc         func(raft.ServerID, raft.ServerAddress, uint64, time.Duration) raft.IndexFuture
-	RemoveServerFunc     func(raft.ServerID, uint64, time.Duration) raft.IndexFuture
-	StateFunc            func() raft.RaftState
-	LeaderFunc           func() raft.ServerAddress
-	BootstrapClusterFunc func(raft.Configuration) raft.Future
-	ShutdownFunc         func() raft.Future
+	mock.Mock
 }
 
-func (m *MockRaft) Apply(d []byte, t time.Duration) raft.ApplyFuture {
-	if m.ApplyFunc == nil {
-		return &MockFuture{}
-	}
-	return m.ApplyFunc(d, t)
+func (m *MockRaft) Apply(data []byte, timeout time.Duration) raft.ApplyFuture {
+	args := m.Called(data, timeout)
+	return args.Get(0).(raft.ApplyFuture)
 }
 
-func (m *MockRaft) AddVoter(id raft.ServerID, addr raft.ServerAddress, idx uint64, t time.Duration) raft.IndexFuture {
-	if m.AddVoterFunc == nil {
-		return &MockFuture{}
-	}
-	return m.AddVoterFunc(id, addr, idx, t)
+func (m *MockRaft) AddVoter(id raft.ServerID, addr raft.ServerAddress, index uint64, timeout time.Duration) raft.IndexFuture {
+	args := m.Called(id, addr, index, timeout)
+	return args.Get(0).(raft.IndexFuture)
 }
 
-func (m *MockRaft) RemoveServer(id raft.ServerID, idx uint64, t time.Duration) raft.IndexFuture {
-	if m.RemoveServerFunc == nil {
-		return &MockFuture{}
-	}
-
-	return m.RemoveServerFunc(id, idx, t)
-}
-
-func (m *MockRaft) State() raft.RaftState {
-	if m.StateFunc == nil {
-		return raft.Follower
-	}
-	return m.StateFunc()
+func (m *MockRaft) RemoveServer(id raft.ServerID, index uint64, timeout time.Duration) raft.IndexFuture {
+	args := m.Called(id, index, timeout)
+	return args.Get(0).(raft.IndexFuture)
 }
 
 func (m *MockRaft) Leader() raft.ServerAddress {
-	if m.LeaderFunc == nil {
-		return ""
-	}
-	return m.LeaderFunc()
+	return raft.ServerAddress(m.Called().String(0))
+}
+
+func (m *MockRaft) State() raft.RaftState {
+	return m.Called().Get(0).(raft.RaftState)
+}
+
+func (m *MockRaft) GetConfiguration() raft.ConfigurationFuture {
+	return m.Called().Get(0).(raft.ConfigurationFuture)
+}
+
+func (m *MockRaft) BootstrapCluster(cfg raft.Configuration) raft.Future {
+	return m.Called(cfg).Get(0).(raft.Future)
 }
 
 func (m *MockRaft) Shutdown() raft.Future {
-	if m.ShutdownFunc == nil {
-		return &MockFuture{}
-	}
-	return m.ShutdownFunc()
+	return m.Called().Get(0).(raft.Future)
 }
 
-func (m *MockRaft) BootstrapCluster(c raft.Configuration) raft.Future {
-	if m.BootstrapClusterFunc == nil {
-		return &MockFuture{}
-	}
-
-	return m.BootstrapClusterFunc(c)
+type MockApplyFuture struct {
+	mock.Mock
 }
 
-func (m *MockRaft) GetConfiguration() raft.ConfigurationFuture { return &MockConfigurationFuture{} }
+func (m *MockApplyFuture) Error() error          { return m.Called().Error(0) }
+func (m *MockApplyFuture) Response() interface{} { return m.Called().Get(0) }
+func (m *MockApplyFuture) Index() uint64         { return 0 }
 
-func newTestRaftRM(raftMock *MockRaft) *RaftReplicationManager {
-	return &RaftReplicationManager{
-		raft:      raftMock,
-		brokerID:  "b1",
-		localAddr: "127.0.0.1:8000",
-		peers:     make(map[string]string),
-		leaderCh:  make(chan bool, 1),
-	}
+type MockIndexFuture struct {
+	mock.Mock
 }
 
-func TestAddVoter_Success(t *testing.T) {
-	called := false
-	mockRaft := &MockRaft{
-		AddVoterFunc: func(id raft.ServerID, addr raft.ServerAddress, idx uint64, timeout time.Duration) raft.IndexFuture {
-			called = true
-			if id != "node2" || addr != "127.0.0.1:8001" {
-				t.Errorf("Unexpected voter data: %v, %v", id, addr)
-			}
-			return &MockFuture{ErrorVal: nil}
-		},
-	}
+func (m *MockIndexFuture) Error() error  { return m.Called().Error(0) }
+func (m *MockIndexFuture) Index() uint64 { return 0 }
 
-	rm := newTestRaftRM(mockRaft)
-	err := rm.AddVoter("node2", "127.0.0.1:8001")
+func TestRaftReplicationManager_ApplyCommand(t *testing.T) {
+	mr := new(MockRaft)
+	rm := &RaftReplicationManager{raft: mr}
 
-	if err != nil {
-		t.Fatalf("AddVoter failed: %v", err)
-	}
-	if !called {
-		t.Error("AddVoterFunc was not called")
-	}
+	fut := new(MockApplyFuture)
+	fut.On("Error").Return(nil)
+	mr.On("Apply", mock.MatchedBy(func(b []byte) bool {
+		return string(b) == "TEST:data"
+	}), 5*time.Second).Return(fut)
+
+	err := rm.ApplyCommand("TEST", []byte("data"))
+	assert.NoError(t, err)
 }
 
-func TestApplyCommand(t *testing.T) {
-	mockRaft := &MockRaft{
-		ApplyFunc: func(data []byte, timeout time.Duration) raft.ApplyFuture {
-			expected := "PREFIX:payload"
-			if string(data) != expected {
-				t.Errorf("Expected %s, got %s", expected, string(data))
-			}
-			return &MockFuture{ErrorVal: nil}
-		},
-	}
+func TestRaftReplicationManager_AddRemoveVoter(t *testing.T) {
+	mr := new(MockRaft)
+	rm := &RaftReplicationManager{raft: mr, peers: make(map[string]string)}
 
-	rm := newTestRaftRM(mockRaft)
-	err := rm.ApplyCommand("PREFIX", []byte("payload"))
+	t.Run("AddVoter", func(t *testing.T) {
+		fut := new(MockIndexFuture)
+		fut.On("Error").Return(nil)
+		mr.On("AddVoter", raft.ServerID("n1"), raft.ServerAddress("a1"), uint64(0), 10*time.Second).Return(fut)
 
-	if err != nil {
-		t.Errorf("ApplyCommand failed: %v", err)
-	}
+		err := rm.AddVoter("n1", "a1")
+		assert.NoError(t, err)
+		assert.Equal(t, "a1", rm.peers["n1"])
+	})
+
+	t.Run("RemoveServer", func(t *testing.T) {
+		fut := new(MockIndexFuture)
+		fut.On("Error").Return(nil)
+		mr.On("RemoveServer", raft.ServerID("n1"), uint64(0), 10*time.Second).Return(fut)
+
+		err := rm.RemoveServer("n1")
+		assert.NoError(t, err)
+
+		// Ensure the peer is removed from the map.
+		// Simply using assert.Empty on value doesn't guarantee the key was deleted if value was "".
+		_, exists := rm.peers["n1"]
+		assert.False(t, exists, "peer n1 should be removed from the map")
+	})
 }
 
-type MockFuture struct {
-	ErrorVal    error
-	ResponseVal interface{}
+type MockISRManager struct {
+	mock.Mock
 }
 
-func (m *MockFuture) Error() error          { return m.ErrorVal }
-func (m *MockFuture) Response() interface{} { return m.ResponseVal }
-func (m *MockFuture) Index() uint64         { return 0 }
-
-type MockConfigurationFuture struct {
-	raft.ConfigurationFuture
+func (m *MockISRManager) HasQuorum(topic string, partition int, minISR int) bool {
+	return m.Called(topic, partition, minISR).Bool(0)
 }
+func (m *MockISRManager) UpdateHeartbeat(id string)           { m.Called(id) }
+func (m *MockISRManager) GetISR(t string, p int) []string     { return nil }
+func (m *MockISRManager) ComputeISR(t string, p int) []string { return nil }
+func (m *MockISRManager) SetLeader(l bool)                    { m.Called(l) }
+func (m *MockISRManager) Start()                              { m.Called() }
 
-func (m *MockConfigurationFuture) Error() error { return nil }
-func (m *MockConfigurationFuture) Configuration() raft.Configuration {
-	return raft.Configuration{}
+func TestRaftReplicationManager_ReplicateWithQuorum(t *testing.T) {
+	mr := new(MockRaft)
+	mi := new(MockISRManager)
+	rm := &RaftReplicationManager{raft: mr, isrManager: mi}
+
+	msg := types.Message{Payload: "hello"}
+
+	t.Run("No Quorum", func(t *testing.T) {
+		mi.On("HasQuorum", "t1", 0, 2).Return(false).Once()
+		_, err := rm.ReplicateWithQuorum("t1", 0, msg, 2, false, "")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "insufficient")
+	})
+
+	t.Run("Success", func(t *testing.T) {
+		mi.On("HasQuorum", "t1", 0, 1).Return(true).Once()
+		fut := new(MockApplyFuture)
+		fut.On("Error").Return(nil)
+		fut.On("Response").Return(types.AckResponse{Status: "OK"})
+		mr.On("Apply", mock.Anything, 5*time.Second).Return(fut)
+
+		resp, err := rm.ReplicateWithQuorum("t1", 0, msg, 1, false, "")
+		assert.NoError(t, err)
+		assert.Equal(t, "OK", resp.Status)
+	})
 }

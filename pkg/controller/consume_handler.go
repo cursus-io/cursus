@@ -285,8 +285,6 @@ func (ch *CommandHandler) checkLeaderOrRedirect(conn net.Conn) error {
 	return fmt.Errorf("not leader")
 }
 
-
-
 func (ch *CommandHandler) getTopicAndPartition(topicName string, partitionID int) (*topic.Topic, *topic.Partition, error) {
 	t := ch.TopicManager.GetTopic(topicName)
 	if t == nil {

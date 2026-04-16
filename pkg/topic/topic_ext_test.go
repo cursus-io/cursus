@@ -106,7 +106,7 @@ func TestPartition_Basic(t *testing.T) {
 		msg := types.Message{Payload: "msg1"}
 		mh.On("AppendMessage", "test-topic", 0, mock.Anything).Return(uint64(11), nil).Once()
 		p.Enqueue(msg)
-		
+
 		assert.Eventually(t, func() bool {
 			return p.NextOffset() == 12
 		}, 500*time.Millisecond, 5*time.Millisecond, "offset should increment after enqueue")
@@ -123,14 +123,14 @@ func TestPartition_Basic(t *testing.T) {
 	t.Run("Idempotence", func(t *testing.T) {
 		p.isIdempotent = true
 		msg := types.Message{Payload: "idemp", ProducerID: "p1", SeqNum: 10}
-		
+
 		mh.On("AppendMessageSync", "test-topic", 0, mock.Anything).Return(uint64(13), nil).Once()
 		err := p.EnqueueSync(msg)
 		assert.NoError(t, err)
 
 		// Duplicate
 		err = p.EnqueueSync(msg)
-		assert.NoError(t, err) // Should skip without error
+		assert.NoError(t, err)                      // Should skip without error
 		assert.Equal(t, uint64(14), p.NextOffset()) // Offset didn't increase
 	})
 

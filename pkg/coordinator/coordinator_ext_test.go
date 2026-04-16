@@ -44,7 +44,7 @@ func TestCoordinator_Offsets(t *testing.T) {
 	c := NewCoordinator(cfg, &DummyPublisher{})
 
 	_ = c.RegisterGroup("topic1", "group1", 2)
-	
+
 	t.Run("FetchOffset - Empty", func(t *testing.T) {
 		off, ok := c.GetOffset("group1", "topic1", 0)
 		assert.False(t, ok)
@@ -54,7 +54,7 @@ func TestCoordinator_Offsets(t *testing.T) {
 	t.Run("CommitOffset", func(t *testing.T) {
 		err := c.CommitOffset("group1", "topic1", 0, 100)
 		assert.NoError(t, err)
-		
+
 		off, ok := c.GetOffset("group1", "topic1", 0)
 		assert.True(t, ok)
 		assert.Equal(t, uint64(100), off)
@@ -67,7 +67,7 @@ func TestCoordinator_Offsets(t *testing.T) {
 		}
 		err := c.CommitOffsetsBulk("group1", "topic1", offsets)
 		assert.NoError(t, err)
-		
+
 		off0, _ := c.GetOffset("group1", "topic1", 0)
 		off1, _ := c.GetOffset("group1", "topic1", 1)
 		assert.Equal(t, uint64(300), off0)
@@ -80,7 +80,7 @@ func TestCoordinator_Offsets(t *testing.T) {
 		}
 		err := c.ApplyOffsetUpdateFromFSM("group1", "topic1", offsets)
 		assert.NoError(t, err)
-		
+
 		off, _ := c.GetOffset("group1", "topic1", 0)
 		assert.Equal(t, uint64(500), off)
 	})

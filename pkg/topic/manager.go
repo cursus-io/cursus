@@ -143,7 +143,7 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 	for _, m := range messages {
 		msg := m
 
-		// Check and mark duplicate before routing. 
+		// Check and mark duplicate before routing.
 		// Moving this BEFORE the write prevents race conditions from concurrent retries.
 		if t.IsIdempotent && msg.ProducerID != "" && msg.SeqNum > 0 {
 			if isDup := tm.CheckAndMarkProducerSequence(topicName, -1, &msg); isDup {
@@ -271,16 +271,16 @@ func (tm *TopicManager) CheckAndMarkProducerSequence(topicName string, partition
 	if _, ok := tm.producerState[topicName][partition]; !ok {
 		tm.producerState[topicName][partition] = make(map[string]int64)
 	}
-	
+
 	lastSeq, ok := tm.producerState[topicName][partition][msg.ProducerID]
 	if ok && int64(msg.SeqNum) <= lastSeq {
-		util.Debug("tm: [idempotency] DUPLICATE detected for topic=%s, partition=%d, producer=%s, seq=%d (lastSeq=%d)", 
+		util.Debug("tm: [idempotency] DUPLICATE detected for topic=%s, partition=%d, producer=%s, seq=%d (lastSeq=%d)",
 			topicName, partition, msg.ProducerID, msg.SeqNum, lastSeq)
 		return true // Duplicate
 	}
 
 	tm.producerState[topicName][partition][msg.ProducerID] = int64(msg.SeqNum)
-	util.Debug("tm: [idempotency] UPDATED sequence for topic=%s, partition=%d, producer=%s, seq=%d (previous=%d, ok=%v)", 
+	util.Debug("tm: [idempotency] UPDATED sequence for topic=%s, partition=%d, producer=%s, seq=%d (previous=%d, ok=%v)",
 		topicName, partition, msg.ProducerID, msg.SeqNum, lastSeq, ok)
 	return false // New message, state updated
 }
@@ -357,4 +357,3 @@ func (tm *TopicManager) EnsureDefaultGroups() {
 		util.Info("Registered default-group for topic '%s'", name)
 	}
 }
-

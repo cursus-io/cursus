@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cursus-io/cursus/pkg/cluster/replication"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/util"
 )
@@ -23,22 +22,25 @@ type ServiceDiscovery interface {
 }
 
 type serviceDiscovery struct {
-	rm       *replication.RaftReplicationManager
+	rm       RaftManager
 	fsm      *fsm.BrokerFSM
 	brokerID string
 	addr     string
 }
 
-func NewServiceDiscoveryImpl(rm *replication.RaftReplicationManager, brokerID, addr string) *serviceDiscovery {
-	return &serviceDiscovery{
+func NewServiceDiscoveryImpl(rm RaftManager, brokerID, addr string) *serviceDiscovery {
+	sd := &serviceDiscovery{
 		rm:       rm,
-		fsm:      rm.GetFSM(),
 		brokerID: brokerID,
 		addr:     addr,
 	}
+	if rm != nil {
+		sd.fsm = rm.GetFSM()
+	}
+	return sd
 }
 
-func NewServiceDiscovery(rm *replication.RaftReplicationManager, brokerID, addr string) ServiceDiscovery {
+func NewServiceDiscovery(rm RaftManager, brokerID, addr string) ServiceDiscovery {
 	return NewServiceDiscoveryImpl(rm, brokerID, addr)
 }
 
@@ -66,7 +68,9 @@ func (sd *serviceDiscovery) Register() error {
 }
 
 func (sd *serviceDiscovery) Deregister() error {
-	if err := sd.rm.ApplyCommand("DEREGISTER", []byte(sd.brokerID)); err != nil {
+	payload := map[string]string{"id": sd.brokerID}
+	data, _ := json.Marshal(payload)
+	if err := sd.rm.ApplyCommand("DEREGISTER", data); err != nil {
 		util.Error("Failed to deregister broker %s: %v", sd.brokerID, err)
 		return err
 	}
@@ -135,7 +139,9 @@ func (sd *serviceDiscovery) RemoveNode(nodeID string) (string, error) {
 		return leaderAddr, err
 	}
 
-	if err := sd.rm.ApplyCommand("DEREGISTER", []byte(nodeID)); err != nil {
+	payload := map[string]string{"id": nodeID}
+	data, _ := json.Marshal(payload)
+	if err := sd.rm.ApplyCommand("DEREGISTER", data); err != nil {
 		util.Error("DEREGISTER failed after RemoveServer. FSM contains stale node info: id=%s err=%v", nodeID, err)
 		return leaderAddr, fmt.Errorf("DEREGISTER failed: %w", err)
 	}
@@ -184,7 +190,9 @@ func (sd *serviceDiscovery) Reconcile() {
 		fsmMap[b.ID] = true
 		if _, exists := raftMap[b.ID]; !exists {
 			util.Warn("Node %s found in FSM but missing in Raft. Cleaning up...", b.ID)
-			if err := sd.rm.ApplyCommand("DEREGISTER", []byte(b.ID)); err != nil {
+			payload := map[string]string{"id": b.ID}
+			data, _ := json.Marshal(payload)
+			if err := sd.rm.ApplyCommand("DEREGISTER", data); err != nil {
 				util.Error("Failed to apply DEREGISTER for node %s: %v", b.ID, err)
 			} else {
 				util.Info("Successfully removed stale node %s from FSM", b.ID)
