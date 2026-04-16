@@ -74,9 +74,9 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	if replicationFactor <= 0 {
 		replicationFactor = 3 // default, same as Kafka
 	}
-	if replicationFactor > len(f.brokers) {
-		f.mu.Unlock()
-		return fmt.Errorf("replication factor %d exceeds active brokers %d", replicationFactor, len(f.brokers))
+	if replicationFactor > len(brokers) {
+		util.Warn("FSM: Requested RF %d exceeds active brokers %d. Capping to %d", replicationFactor, len(brokers), len(brokers))
+		replicationFactor = len(brokers)
 	}
 
 	ring := util.NewConsistentHashRing(150, nil)
