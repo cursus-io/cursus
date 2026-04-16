@@ -4,7 +4,8 @@
 
 [![GitHub](https://img.shields.io/github/stars/cursus-io/cursus.svg?style=social)](https://github.com/cursus-io/cursus)
 [![Latest Release](https://img.shields.io/github/v/release/cursus-io/cursus?include_prereleases&label=release&color=00ADD8)](https://github.com/cursus-io/cursus/releases)
-[![Build Status](https://github.com/cursus-io/cursus/actions/workflows/ci-build.yml/badge.svg?branch=main)](https://github.com/cursus-io/cursus/actions/workflows/ci-build.yml)
+[![Unit Tests](https://github.com/cursus-io/cursus/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/cursus-io/cursus/actions/workflows/unit-tests.yml)
+[![E2E Tests](https://github.com/cursus-io/cursus/actions/workflows/e2e-tests.yml/badge.svg)](https://github.com/cursus-io/cursus/actions/workflows/e2e-tests.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/cursus-io/cursus)](https://goreportcard.com/report/github.com/cursus-io/cursus)
 [![CodeCov](https://img.shields.io/codecov/c/github/cursus-io/cursus)](https://codecov.io/gh/cursus-io/cursus)
 ![Go Version](https://img.shields.io/github/go-mod/go-version/cursus-io/cursus)
