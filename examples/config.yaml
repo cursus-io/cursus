@@ -1,0 +1,18 @@
+# Broker Settings
+broker_addrs:
+  - "localhost:9000"
+
+# Topic Settings
+topic: "example-topic"
+partitions: 1
+
+# Publisher Settings
+acks: "1"
+batch_size: 1
+linger_ms: 0
+
+# Consumer Settings
+group_id: "example-group"
+consumer_id: "example-consumer-1"
+mode: "streaming"
+auto_commit_interval: "1s"
