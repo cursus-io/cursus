@@ -395,6 +395,9 @@ func TestBrokerFSM_TopicCreation_DefaultRF_Capped(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		key := fmt.Sprintf("capped-rf-topic-%d", i)
 		meta := fsm.GetPartitionMetadata(key)
+		if meta == nil {
+			t.Fatalf("Partition %s metadata not found", key)
+		}
 		if len(meta.Replicas) != 2 {
 			t.Errorf("Partition %s: expected 2 replicas (capped from default 3), got %d: %v", key, len(meta.Replicas), meta.Replicas)
 		}
@@ -425,6 +428,9 @@ func TestBrokerFSM_TopicCreation_DefaultRF_Satisfied(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		key := fmt.Sprintf("default-rf-topic-%d", i)
 		meta := fsm.GetPartitionMetadata(key)
+		if meta == nil {
+			t.Fatalf("Partition %s metadata not found", key)
+		}
 		if len(meta.Replicas) != 3 {
 			t.Errorf("Partition %s: expected 3 replicas (default RF), got %d: %v", key, len(meta.Replicas), meta.Replicas)
 		}

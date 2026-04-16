@@ -47,7 +47,7 @@ func TestJoinCluster_Success(t *testing.T) {
 		if err != nil {
 			return
 		}
-		_, _ = fmt.Sscanf(portStr, "%d", &port)
+		defer conn.Close()
 
 			// Read length
 			lenBuf := make([]byte, 4)
