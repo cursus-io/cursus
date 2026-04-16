@@ -161,7 +161,12 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 
 // HandleConnection processes a single client connection
 func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager, cfg *config.Config, cd *coordinator.Coordinator, sm *stream.StreamManager, cc *clusterController.ClusterController) {
-	defer func() { _ = conn.Close() }()
+	isStreamed := false
+	defer func() {
+		if !isStreamed {
+			_ = conn.Close()
+		}
+	}()
 
 	clientCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -189,6 +194,21 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 
 		shouldExit, err := processMessage(data, cmdHandler, cmdCtx, conn)
 		if err != nil || shouldExit {
+			// Check if this was a STREAM command to prevent closing the connection
+			if shouldExit {
+				// Try to decode or inspect the command
+				_, payload, decodeErr := util.DecodeMessage(data)
+				cmd := ""
+				if decodeErr == nil {
+					cmd = strings.TrimSpace(payload)
+				} else {
+					cmd = strings.TrimSpace(string(data))
+				}
+
+				if strings.HasPrefix(strings.ToUpper(cmd), "STREAM ") {
+					isStreamed = true
+				}
+			}
 			return
 		}
 	}
@@ -284,8 +304,9 @@ func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler,
 		if strings.HasPrefix(strings.ToUpper(payload), "STREAM ") {
 			if err := cmdHandler.HandleStreamCommand(conn, payload, ctx); err != nil {
 				writeResponse(conn, fmt.Sprintf("ERROR: %v", err))
+				return false, nil // 에러 발생 시 연결 유지
 			}
-			return true, nil
+			return true, nil // 성공 시 스트림 매니저에게 소유권 이전
 		} else {
 			if _, err := cmdHandler.HandleConsumeCommand(conn, payload, ctx); err != nil {
 				writeResponse(conn, fmt.Sprintf("ERROR: %v", err))

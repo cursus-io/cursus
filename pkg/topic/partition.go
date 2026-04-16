@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/disk"
@@ -230,30 +229,8 @@ func (p *Partition) enqueueToBroadcast(msg types.Message) {
 }
 
 func (p *Partition) broadcastToStreams(msg types.Message) {
-	if util.IsNil(p.streamManager) {
-		return
-	}
-
-	streams := p.streamManager.GetStreamsForPartition(p.topic, p.id)
-	for _, stream := range streams {
-		conn := stream.Conn()
-		if conn == nil {
-			continue
-		}
-
-		if err := conn.SetWriteDeadline(time.Now().Add(1 * time.Second)); err != nil {
-			util.Error("⚠️ SetWriteDeadline error: %v", err)
-			continue
-		}
-
-		if err := util.WriteWithLength(conn, []byte(msg.Payload)); err != nil {
-			util.Warn("Failed to broadcast to stream for topic '%s' partition %d: %v", p.topic, p.id, err)
-			continue
-		}
-
-		stream.IncrementOffset()
-		stream.SetLastActive(time.Now())
-	}
+	// Real-time broadcast is disabled to prevent data interleaving with StreamConnection.Run.
+	// StreamConnection.Run handles fetching and delivering messages based on the client's offset.
 }
 
 func (p *Partition) NotifyNewMessage() {
