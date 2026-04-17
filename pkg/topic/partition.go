@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/disk"
@@ -17,7 +16,6 @@ type Partition struct {
 	id            int
 	topic         string
 	newMessageCh  chan struct{}
-	broadcastCh   chan types.Message
 	LEO           atomic.Uint64
 	HWM           uint64
 	mu            sync.RWMutex
@@ -30,11 +28,6 @@ type Partition struct {
 
 // NewPartition creates a partition instance.
 func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManager, cfg *config.Config) *Partition {
-	bufSize := DefaultBufSize
-	if cfg != nil && cfg.BroadcastChannelBufferSize > 0 {
-		bufSize = cfg.BroadcastChannelBufferSize
-	}
-
 	latest := dh.GetLatestOffset()
 	initialOffset := latest + 1
 
@@ -44,7 +37,6 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		dh:            dh,
 		streamManager: sm,
 		newMessageCh:  make(chan struct{}, 1),
-		broadcastCh:   make(chan types.Message, bufSize),
 	}
 
 	p.LEO.Store(initialOffset)
@@ -60,14 +52,7 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		}
 	}
 
-	go p.runBroadcaster()
 	return p
-}
-
-func (p *Partition) runBroadcaster() {
-	for msg := range p.broadcastCh {
-		p.broadcastToStreams(msg)
-	}
 }
 
 func (p *Partition) isDuplicate(msg *types.Message) bool {
@@ -124,7 +109,6 @@ func (p *Partition) Enqueue(msg types.Message) {
 	}
 
 	p.NotifyNewMessage()
-	p.enqueueToBroadcast(msg)
 }
 
 func (p *Partition) EnqueueSync(msg types.Message) error {
@@ -152,7 +136,6 @@ func (p *Partition) EnqueueSync(msg types.Message) error {
 	}
 
 	p.NotifyNewMessage()
-	p.enqueueToBroadcast(msg)
 	return nil
 }
 
@@ -183,7 +166,6 @@ func (p *Partition) EnqueueBatchSync(msgs []types.Message) error {
 		if p.HWM < offset+1 {
 			p.HWM = offset + 1
 		}
-		p.enqueueToBroadcast(msgs[i])
 	}
 	p.NotifyNewMessage()
 	return nil
@@ -215,45 +197,9 @@ func (p *Partition) EnqueueBatch(msgs []types.Message) error {
 		if p.HWM < offset+1 {
 			p.HWM = offset + 1
 		}
-		p.enqueueToBroadcast(msgs[i])
 	}
 	p.NotifyNewMessage()
 	return nil
-}
-
-func (p *Partition) enqueueToBroadcast(msg types.Message) {
-	select {
-	case p.broadcastCh <- msg:
-	default:
-		util.Warn("⚠️ partition %d: Broadcast channel full, dropping real-time delivery", p.id)
-	}
-}
-
-func (p *Partition) broadcastToStreams(msg types.Message) {
-	if util.IsNil(p.streamManager) {
-		return
-	}
-
-	streams := p.streamManager.GetStreamsForPartition(p.topic, p.id)
-	for _, stream := range streams {
-		conn := stream.Conn()
-		if conn == nil {
-			continue
-		}
-
-		if err := conn.SetWriteDeadline(time.Now().Add(1 * time.Second)); err != nil {
-			util.Error("⚠️ SetWriteDeadline error: %v", err)
-			continue
-		}
-
-		if err := util.WriteWithLength(conn, []byte(msg.Payload)); err != nil {
-			util.Warn("Failed to broadcast to stream for topic '%s' partition %d: %v", p.topic, p.id, err)
-			continue
-		}
-
-		stream.IncrementOffset()
-		stream.SetLastActive(time.Now())
-	}
 }
 
 func (p *Partition) NotifyNewMessage() {
@@ -325,5 +271,4 @@ func (p *Partition) Close() {
 		return
 	}
 	p.closed = true
-	close(p.broadcastCh)
 }

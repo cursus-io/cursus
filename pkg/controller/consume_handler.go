@@ -115,9 +115,15 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 		}
 	}
 
+	// Use generation from arguments if provided, otherwise fallback to coordinator
+	if cArgs.Generation != -1 {
+		currentGen = cArgs.Generation
+	}
+
 	if ctx.Generation != currentGen {
 		ctx.OffsetCache = make(map[string]uint64)
 		ctx.Generation = currentGen
+		ctx.MemberID = cArgs.MemberID
 		util.Debug("Generation changed to %d, cache cleared", currentGen)
 	}
 
@@ -136,8 +142,8 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 		currentOffset = actualOffset
 	}
 
-	if !ch.ValidateOwnership(cArgs.GroupName, cArgs.MemberID, ctx.Generation, cArgs.PartitionID) {
-		util.Debug("Ownership validation failed for topic %s", topicName)
+	if !ch.ValidateOwnership(cArgs.GroupName, cArgs.MemberID, currentGen, cArgs.PartitionID) {
+		util.Debug("Ownership validation failed for topic %s (gen=%d)", topicName, currentGen)
 		return nil, nil // Skip this topic if not owned (allowing regex to continue with other owned topics)
 	}
 
@@ -214,9 +220,12 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 		return err
 	}
 
-	if !ch.ValidateOwnership(ctx.ConsumerGroup, cArgs.MemberID, ctx.Generation, cArgs.PartitionID) {
+	if !ch.ValidateOwnership(ctx.ConsumerGroup, cArgs.MemberID, cArgs.Generation, cArgs.PartitionID) {
 		return fmt.Errorf("not partition owner or generation mismatch")
 	}
+
+	ctx.Generation = cArgs.Generation
+	ctx.MemberID = cArgs.MemberID
 
 	_, p, err := ch.getTopicAndPartition(cArgs.TopicName, cArgs.PartitionID)
 	if err != nil {
@@ -311,6 +320,7 @@ type CommonArgs struct {
 	PartitionID     int
 	GroupName       string
 	MemberID        string
+	Generation      int
 	HasOffset       bool
 	Offset          uint64
 	BatchSize       int
@@ -322,6 +332,16 @@ func (ch *CommandHandler) parseCommonArgs(args map[string]string) (CommonArgs, e
 	pID, err := strconv.Atoi(args["partition"])
 	if err != nil && args["partition"] != "" {
 		return CommonArgs{}, fmt.Errorf("invalid partition value: %s", args["partition"])
+	}
+
+	gen := -1
+	genStr := args["generation"]
+	if genStr != "" {
+		g, err := strconv.Atoi(genStr)
+		if err != nil {
+			return CommonArgs{}, fmt.Errorf("invalid generation value: %s", genStr)
+		}
+		gen = g
 	}
 
 	offsetStr, hasOffsetKey := args["offset"]
@@ -349,6 +369,7 @@ func (ch *CommandHandler) parseCommonArgs(args map[string]string) (CommonArgs, e
 		PartitionID:     pID,
 		GroupName:       ch.resolveConsumerGroup(args["group"]),
 		MemberID:        args["member"],
+		Generation:      gen,
 		HasOffset:       hasOffsetKey && offsetStr != "",
 		Offset:          offset,
 		BatchSize:       batch,
