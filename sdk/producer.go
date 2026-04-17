@@ -316,12 +316,15 @@ func (p *Producer) nextPartition() int {
 }
 
 func (p *Producer) CreateTopic(topic string, partitions int) error {
+	if len(p.config.BrokerAddrs) == 0 {
+		return fmt.Errorf("no broker addresses available")
+	}
 	brokerAddr := p.config.BrokerAddrs[0]
 	conn, err := net.Dial("tcp", brokerAddr)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d", topic, partitions)
 	cmdBytes := EncodeMessage("admin", createCmd)

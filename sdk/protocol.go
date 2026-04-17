@@ -207,7 +207,7 @@ func DecompressMessage(data []byte, compressionType string) ([]byte, error) {
 		}
 		res, err := io.ReadAll(gr)
 		if err != nil {
-			gr.Close()
+			_ = gr.Close()
 			return nil, err
 		}
 		if err := gr.Close(); err != nil {

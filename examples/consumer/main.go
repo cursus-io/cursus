@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/cursus-io/cursus/sdk"
 )
@@ -15,11 +19,17 @@ func main() {
 		}
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	c, err := sdk.NewConsumer(cfg)
 	if err != nil {
 		log.Fatalf("Failed to create consumer: %v", err)
 	}
-	defer func() {
+
+	go func() {
+		<-ctx.Done()
+		log.Println("Shutting down consumer...")
 		if err := c.Close(); err != nil {
 			log.Printf("Error closing consumer: %v", err)
 		}
@@ -31,7 +41,7 @@ func main() {
 		return nil
 	})
 
-	if err != nil {
+	if err != nil && err != context.Canceled {
 		log.Fatalf("Consumer error: %v", err)
 	}
 }

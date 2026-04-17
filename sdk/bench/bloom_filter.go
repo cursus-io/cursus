@@ -62,8 +62,9 @@ func hashf(data []byte) (uint64, uint64) {
 	h1.Write(data)
 	sum1 := h1.Sum64()
 
+	// Use a different seed/type of hash for better independence
 	h2 := fnv.New64()
-	h2.Write([]byte{0x9e, 0x37, 0x79, 0xb9})
+	h2.Write([]byte{0xDE, 0xAD, 0xBE, 0xEF})
 	h2.Write(data)
 	sum2 := h2.Sum64()
 
