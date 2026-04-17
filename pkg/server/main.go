@@ -304,9 +304,9 @@ func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler,
 		if strings.HasPrefix(strings.ToUpper(payload), "STREAM ") {
 			if err := cmdHandler.HandleStreamCommand(conn, payload, ctx); err != nil {
 				writeResponse(conn, fmt.Sprintf("ERROR: %v", err))
-				return false, nil // 에러 발생 시 연결 유지
+				return false, nil
 			}
-			return true, nil // 성공 시 스트림 매니저에게 소유권 이전
+			return true, nil
 		} else {
 			if _, err := cmdHandler.HandleConsumeCommand(conn, payload, ctx); err != nil {
 				writeResponse(conn, fmt.Sprintf("ERROR: %v", err))

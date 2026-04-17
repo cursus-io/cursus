@@ -284,30 +284,44 @@ func DecodeBatchMessages(data []byte) ([]Message, string, int, error) {
 	for i := 0; i < int(msgCount); i++ {
 		var m Message
 		if err := binary.Read(reader, binary.BigEndian, &m.Offset); err != nil {
-			return nil, "", 0, err
+			return nil, "", 0, fmt.Errorf("read offset[%d]: %w", i, err)
 		}
 		if err := binary.Read(reader, binary.BigEndian, &m.SeqNum); err != nil {
-			return nil, "", 0, err
+			return nil, "", 0, fmt.Errorf("read seqnum[%d]: %w", i, err)
 		}
 
 		var pIdLen uint16
-		binary.Read(reader, binary.BigEndian, &pIdLen)
+		if err := binary.Read(reader, binary.BigEndian, &pIdLen); err != nil {
+			return nil, "", 0, fmt.Errorf("read producerID length[%d]: %w", i, err)
+		}
 		pIdBytes := make([]byte, pIdLen)
-		io.ReadFull(reader, pIdBytes)
+		if _, err := io.ReadFull(reader, pIdBytes); err != nil {
+			return nil, "", 0, fmt.Errorf("read producerID[%d]: %w", i, err)
+		}
 		m.ProducerID = string(pIdBytes)
 
 		var keyLen uint16
-		binary.Read(reader, binary.BigEndian, &keyLen)
+		if err := binary.Read(reader, binary.BigEndian, &keyLen); err != nil {
+			return nil, "", 0, fmt.Errorf("read key length[%d]: %w", i, err)
+		}
 		keyBytes := make([]byte, keyLen)
-		io.ReadFull(reader, keyBytes)
+		if _, err := io.ReadFull(reader, keyBytes); err != nil {
+			return nil, "", 0, fmt.Errorf("read key[%d]: %w", i, err)
+		}
 		m.Key = string(keyBytes)
 
-		binary.Read(reader, binary.BigEndian, &m.Epoch)
+		if err := binary.Read(reader, binary.BigEndian, &m.Epoch); err != nil {
+			return nil, "", 0, fmt.Errorf("read epoch[%d]: %w", i, err)
+		}
 
 		var payloadLen uint32
-		binary.Read(reader, binary.BigEndian, &payloadLen)
+		if err := binary.Read(reader, binary.BigEndian, &payloadLen); err != nil {
+			return nil, "", 0, fmt.Errorf("read payload length[%d]: %w", i, err)
+		}
 		payloadBytes := make([]byte, payloadLen)
-		io.ReadFull(reader, payloadBytes)
+		if _, err := io.ReadFull(reader, payloadBytes); err != nil {
+			return nil, "", 0, fmt.Errorf("read payload[%d]: %w", i, err)
+		}
 		m.Payload = string(payloadBytes)
 
 		messages = append(messages, m)

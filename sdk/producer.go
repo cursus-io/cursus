@@ -77,10 +77,18 @@ func (pc *ProducerClient) connectPartitionLocked(idx int, addr string) error {
 			return fmt.Errorf("TLS dial to %s failed: %w", addr, err)
 		}
 	} else {
-		conn, err = net.Dial("tcp", addr)
+		conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
 		if err != nil {
 			return fmt.Errorf("TCP dial to %s failed: %w", addr, err)
 		}
+	}
+
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcpConn.SetReadBuffer(2 * 1024 * 1024)
+		_ = tcpConn.SetWriteBuffer(2 * 1024 * 1024)
 	}
 
 	var currentConns []net.Conn
@@ -279,8 +287,7 @@ func NewProducer(cfg *PublisherConfig) (*Producer, error) {
 	}
 
 	if err := p.CreateTopic(cfg.Topic, cfg.Partitions); err != nil {
-		logError("failed to create topic '%s': %v", cfg.Topic, err)
-		// We might still continue if AutoCreateTopics is true on broker, but better to fail early if explicit create fails
+		LogError("failed to create topic '%s': %v", cfg.Topic, err)
 	}
 
 	connectedCount := 0
@@ -288,7 +295,7 @@ func NewProducer(cfg *PublisherConfig) (*Producer, error) {
 		p.buffers[i] = newPartitionBuffer()
 		brokerAddr := p.client.selectBroker()
 		if err := p.client.ConnectPartition(i, brokerAddr); err != nil {
-			logError("Failed to connect partition %d: %v", i, err)
+			LogError("Failed to connect partition %d: %v", i, err)
 		} else {
 			connectedCount++
 		}
@@ -336,9 +343,10 @@ func (p *Producer) CreateTopic(topic string, partitions int) error {
 	return nil
 }
 
+// Send enqueues payload for delivery and returns the assigned sequence number.
 func (p *Producer) Send(payload string) (uint64, error) {
 	if atomic.LoadInt32(&p.closed) == 1 {
-		return 0, fmt.Errorf("producer closed")
+		return 0, fmt.Errorf("send: %w", ErrProducerClosed)
 	}
 
 	p.closeMu.Lock()
@@ -350,7 +358,7 @@ func (p *Producer) Send(payload string) (uint64, error) {
 	defer buf.mu.Unlock()
 
 	if buf.closed {
-		return 0, fmt.Errorf("partition %d buffer is closed", part)
+		return 0, fmt.Errorf("partition %d buffer closed: %w", part, ErrProducerClosed)
 	}
 
 	if len(buf.msgs) >= p.config.BufferSize {
@@ -369,6 +377,11 @@ func (p *Producer) Send(payload string) (uint64, error) {
 	buf.cond.Signal()
 
 	return seqNum, nil
+}
+
+// PublishMessage is an alias for Send, for compatibility with test/publisher.
+func (p *Producer) PublishMessage(payload string) (uint64, error) {
+	return p.Send(payload)
 }
 
 func (p *Producer) partitionSender(part int) {
@@ -485,7 +498,7 @@ func (p *Producer) sendBatch(part int, batch []Message) {
 
 	data, err := EncodeBatchMessages(p.config.Topic, part, p.config.Acks, p.config.EnableIdempotence, batch)
 	if err != nil {
-		logError("encode batch failed: %v", err)
+		LogError("encode batch failed: %v", err)
 		p.cleanupBatchState(part, batchID)
 		p.handleSendFailure(part, batch)
 		return
@@ -493,7 +506,7 @@ func (p *Producer) sendBatch(part int, batch []Message) {
 
 	payload, err := CompressMessage(data, p.config.CompressionType)
 	if err != nil {
-		logError("compress batch failed: %v", err)
+		LogError("compress batch failed: %v", err)
 		p.cleanupBatchState(part, batchID)
 		p.handleSendFailure(part, batch)
 		return
@@ -501,7 +514,7 @@ func (p *Producer) sendBatch(part int, batch []Message) {
 
 	ackResp, err := p.sendWithRetry(payload, part)
 	if err != nil {
-		logError("send failed: %v", err)
+		LogError("send failed: %v", err)
 		p.cleanupBatchState(part, batchID)
 		p.handleSendFailure(part, batch)
 		return
@@ -518,7 +531,7 @@ func (p *Producer) sendBatch(part int, batch []Message) {
 		p.partitionSentMus[part].Unlock()
 		p.markBatchAckedByID(part, batchID, len(batch))
 	case "PARTIAL":
-		logWarn("Partial success for batch %s", batchID)
+		LogWarn("Partial success for batch %s", batchID)
 		p.cleanupBatchState(part, batchID)
 		p.handlePartialFailure(part, batch, ackResp)
 	default:
@@ -681,19 +694,33 @@ func (p *Producer) markBatchAckedByID(part int, batchID string, batchLen int) {
 }
 
 func (p *Producer) parseAckResponse(resp []byte) (*AckResponse, error) {
+	respStr := string(resp)
+	// Handle plain-text error prefix from some broker versions
+	if strings.HasPrefix(respStr, "ERROR:") {
+		return nil, fmt.Errorf("broker error: %s", strings.TrimSpace(respStr))
+	}
+
 	var ackResp AckResponse
 	if err := json.Unmarshal(resp, &ackResp); err != nil {
 		return nil, fmt.Errorf("invalid ack format: %w", err)
 	}
 
-	if ackResp.Leader != "" {
-		if ackResp.Leader != p.client.GetLeaderAddr() {
-			p.client.UpdateLeader(ackResp.Leader)
-		}
+	if ackResp.Leader != "" && ackResp.Leader != p.client.GetLeaderAddr() {
+		p.client.UpdateLeader(ackResp.Leader)
 	}
 
 	if ackResp.Status == "ERROR" {
 		return &ackResp, fmt.Errorf("broker error: %s", ackResp.ErrorMsg)
+	}
+
+	// Validate epoch and ProducerID for idempotent producers (BUG-02 fix)
+	if p.config.EnableIdempotence {
+		if ackResp.ProducerID == "" {
+			return nil, fmt.Errorf("incomplete ack: missing ProducerID")
+		}
+		if ackResp.ProducerEpoch != p.client.Epoch {
+			return nil, fmt.Errorf("epoch mismatch: expected %d, got %d", p.client.Epoch, ackResp.ProducerEpoch)
+		}
 	}
 
 	return &ackResp, nil
@@ -715,8 +742,7 @@ func (p *Producer) Flush() {
 	for time.Now().Before(deadline) {
 		allClear := true
 		for part := 0; part < p.partitions; part++ {
-			inFlight := atomic.LoadInt32(&p.inFlight[part])
-			if inFlight > 0 {
+			if atomic.LoadInt32(&p.inFlight[part]) > 0 {
 				allClear = false
 				break
 			}
@@ -728,6 +754,117 @@ func (p *Producer) Flush() {
 
 		time.Sleep(10 * time.Millisecond)
 	}
+
+	LogWarn("Flush timeout after %v", timeout)
+}
+
+// FlushBenchmark waits until all expectedTotal messages are acknowledged or timeout expires.
+func (p *Producer) FlushBenchmark(expectedTotal int) {
+	for _, buf := range p.buffers {
+		buf.mu.Lock()
+		buf.cond.Broadcast()
+		buf.mu.Unlock()
+	}
+
+	timeout := time.Duration(p.config.FlushTimeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	start := time.Now()
+
+	for time.Now().Before(deadline) {
+		allInFlightClear := true
+		for part := 0; part < p.partitions; part++ {
+			if atomic.LoadInt32(&p.inFlight[part]) > 0 {
+				LogDebug("Partition %d still has in-flight messages", part)
+				allInFlightClear = false
+				break
+			}
+		}
+
+		if allInFlightClear {
+			ackedSoFar := p.GetUniqueAckCount()
+			totalPending := 0
+			for part := 0; part < p.partitions; part++ {
+				p.partitionBatchMus[part].Lock()
+				totalPending += len(p.partitionBatchStates[part])
+				p.partitionBatchMus[part].Unlock()
+			}
+
+			if ackedSoFar >= expectedTotal && totalPending == 0 {
+				LogInfo("FlushBenchmark completed — all %d messages acknowledged (%.3fs)", expectedTotal, time.Since(start).Seconds())
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	LogWarn("FlushBenchmark timeout after %v. Only %d/%d messages acknowledged.", timeout, p.GetUniqueAckCount(), expectedTotal)
+}
+
+// VerifySentSequences checks that exactly expectedCount unique sequences were acknowledged.
+func (p *Producer) VerifySentSequences(expectedCount int) error {
+	totalSent := 0
+	for part := 0; part < p.partitions; part++ {
+		p.partitionSentMus[part].Lock()
+		totalSent += len(p.partitionSentSeqs[part])
+		p.partitionSentMus[part].Unlock()
+	}
+
+	if totalSent != expectedCount {
+		return fmt.Errorf("expected %d messages sent, got %d", expectedCount, totalSent)
+	}
+
+	LogInfo("All %d sequences sent successfully across all partitions", expectedCount)
+	return nil
+}
+
+// GetPartitionStats returns per-partition batch timing statistics.
+func (p *Producer) GetPartitionStats() []PartitionStat {
+	p.bmMu.Lock()
+	defer p.bmMu.Unlock()
+
+	stats := make([]PartitionStat, 0, p.partitions)
+	for part := 0; part < p.partitions; part++ {
+		count := p.bmTotalCount[part]
+		totalTime := p.bmTotalTime[part]
+		var avg time.Duration
+		if count > 0 {
+			avg = totalTime / time.Duration(count)
+		}
+		stats = append(stats, PartitionStat{
+			PartitionID: part,
+			BatchCount:  count,
+			AvgDuration: avg,
+		})
+	}
+	return stats
+}
+
+// GetLatencies returns a copy of all recorded batch latencies.
+func (p *Producer) GetLatencies() []time.Duration {
+	p.bmMu.Lock()
+	defer p.bmMu.Unlock()
+
+	res := make([]time.Duration, len(p.bmLatencies))
+	copy(res, p.bmLatencies)
+	return res
+}
+
+// GetUniqueAckCount returns the number of uniquely acknowledged messages.
+func (p *Producer) GetUniqueAckCount() int {
+	return int(p.uniqueCount.Load())
+}
+
+// GetAttemptsCount returns total number of messages attempted (including retries).
+func (p *Producer) GetAttemptsCount() int {
+	return int(p.attemptsCount.Load())
+}
+
+// GetPartitionCount returns the configured partition count.
+func (p *Producer) GetPartitionCount() int {
+	return p.partitions
 }
 
 func (p *Producer) batchStateGC() {
@@ -748,6 +885,7 @@ func (p *Producer) batchStateGC() {
 					}
 
 					if !st.Acked && st.SentTime.Before(staleCutoff) {
+						LogWarn("GC: Dropping unacked stale batch: %s", id)
 						delete(p.partitionBatchStates[part], id)
 					}
 				}

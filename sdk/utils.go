@@ -33,13 +33,13 @@ func LogInfo(format string, v ...interface{}) {
 	}
 }
 
-func logWarn(format string, v ...interface{}) {
+func LogWarn(format string, v ...interface{}) {
 	if currentLevel.Load() <= int32(LogLevelWarn) {
 		log.Printf("[WARN] "+format, v...)
 	}
 }
 
-func logError(format string, v ...interface{}) {
+func LogError(format string, v ...interface{}) {
 	if currentLevel.Load() <= int32(LogLevelError) {
 		log.Printf("[ERROR] "+format, v...)
 	}

@@ -1,6 +1,9 @@
 package sdk
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Message represents a single message
 type Message struct {
@@ -30,4 +33,11 @@ type AckResponse struct {
 	SeqEnd        uint64 `json:"seq_end"`
 	Leader        string `json:"leader,omitempty"`
 	ErrorMsg      string `json:"error,omitempty"`
+}
+
+// PartitionStat holds per-partition benchmark statistics for a producer.
+type PartitionStat struct {
+	PartitionID int
+	BatchCount  int
+	AvgDuration time.Duration
 }
