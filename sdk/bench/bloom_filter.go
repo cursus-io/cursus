@@ -8,9 +8,9 @@ import (
 )
 
 func encodeOffset(partition int, offset int64) []byte {
-	var buf [16]byte
-	binary.BigEndian.PutUint64(buf[0:8], uint64(partition))
-	binary.BigEndian.PutUint64(buf[8:16], uint64(offset))
+	var buf [12]byte
+	binary.BigEndian.PutUint32(buf[0:4], uint32(partition))
+	binary.BigEndian.PutUint64(buf[4:12], uint64(offset))
 	return buf[:]
 }
 

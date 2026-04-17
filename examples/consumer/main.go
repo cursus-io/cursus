@@ -8,15 +8,22 @@ import (
 
 func main() {
 	cfg := sdk.NewDefaultConsumerConfig()
+	// Try loading from current dir, then parent dir
 	if err := sdk.LoadConfig("config.yaml", cfg); err != nil {
-		log.Printf("Config file not found or invalid, using defaults: %v", err)
+		if err := sdk.LoadConfig("../config.yaml", cfg); err != nil {
+			log.Printf("Config file not found or invalid, using defaults: %v", err)
+		}
 	}
 
 	c, err := sdk.NewConsumer(cfg)
 	if err != nil {
 		log.Fatalf("Failed to create consumer: %v", err)
 	}
-	defer c.Close()
+	defer func() {
+		if err := c.Close(); err != nil {
+			log.Printf("Error closing consumer: %v", err)
+		}
+	}()
 
 	log.Printf("Starting consumer for topic: %s", cfg.Topic)
 	err = c.Start(func(msg sdk.Message) error {

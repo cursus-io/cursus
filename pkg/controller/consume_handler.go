@@ -335,7 +335,12 @@ func (ch *CommandHandler) parseCommonArgs(args map[string]string) (CommonArgs, e
 	}
 
 	gen := -1
-	if g, err := strconv.Atoi(args["generation"]); err == nil {
+	genStr := args["generation"]
+	if genStr != "" {
+		g, err := strconv.Atoi(genStr)
+		if err != nil {
+			return CommonArgs{}, fmt.Errorf("invalid generation value: %s", genStr)
+		}
 		gen = g
 	}
 

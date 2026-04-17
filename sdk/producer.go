@@ -683,7 +683,25 @@ func (p *Producer) markBatchAckedByID(part int, batchID string, batchLen int) {
 	delete(p.partitionBatchStates[part], batchID)
 	p.partitionBatchMus[part].Unlock()
 
-	p.ackedCount.Store(state.EndSeqNum)
+	// Atomic max update for ackedCount
+	for {
+		current := p.ackedCount.Load()
+		if state.EndSeqNum <= current {
+			break
+		}
+		if p.ackedCount.CompareAndSwap(current, state.EndSeqNum) {
+			break
+		}
+	}
+
+	// Prune sent sequences below the highest acked to prevent memory leak
+	p.partitionSentMus[part].Lock()
+	for seq := range p.partitionSentSeqs[part] {
+		if seq <= state.EndSeqNum {
+			delete(p.partitionSentSeqs[part], seq)
+		}
+	}
+	p.partitionSentMus[part].Unlock()
 
 	elapsed := time.Since(state.SentTime)
 	p.bmMu.Lock()
@@ -897,11 +915,11 @@ func (p *Producer) batchStateGC() {
 	}
 }
 
-func (p *Producer) Close() {
+func (p *Producer) Close() error {
 	p.closeMu.Lock()
 	if atomic.LoadInt32(&p.closed) == 1 {
 		p.closeMu.Unlock()
-		return
+		return nil
 	}
 	atomic.StoreInt32(&p.closed, 1)
 	close(p.done)
@@ -917,5 +935,5 @@ func (p *Producer) Close() {
 	p.gcTicker.Stop()
 	p.sendersWG.Wait()
 
-	_ = p.client.Close()
+	return p.client.Close()
 }

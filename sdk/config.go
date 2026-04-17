@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 )
 
@@ -37,7 +38,7 @@ type PublisherConfig struct {
 	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
 	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
 
-	CompressionType string `yaml:"compression_type" json:"compression.type"` // "none", "gzip", "snappy", "lz4"
+	CompressionType string `yaml:"compression_type" json:"compression_type"` // "none", "gzip", "snappy", "lz4"
 
 	EnableBenchmark bool   `yaml:"enable_benchmark" json:"enable_benchmark"`
 	BenchTopicName  string `yaml:"bench_topic_name" json:"bench_topic_name"`
@@ -118,7 +119,7 @@ type ConsumerConfig struct {
 
 	LeaderStaleness time.Duration `yaml:"leader_staleness" json:"leader_staleness"`
 
-	CompressionType string `yaml:"compression_type" json:"compression.type"` // "none", "gzip", "snappy", "lz4"
+	CompressionType string `yaml:"compression_type" json:"compression_type"` // "none", "gzip", "snappy", "lz4"
 
 	LogLevel LogLevel `yaml:"log_level" json:"log_level"`
 }
@@ -126,7 +127,7 @@ type ConsumerConfig struct {
 func NewDefaultConsumerConfig() *ConsumerConfig {
 	return &ConsumerConfig{
 		BrokerAddrs:              []string{"localhost:9000"},
-		ConsumerID:               "default-consumer",
+		ConsumerID:               "consumer-" + uuid.New().String()[:8],
 		GroupID:                  "default-group",
 		WorkerChannelSize:        1000,
 		PollInterval:             500 * time.Millisecond,
@@ -152,6 +153,13 @@ func NewDefaultConsumerConfig() *ConsumerConfig {
 }
 
 func LoadConfig(path string, cfg interface{}) error {
+	// Seed default values before unmarshalling if possible
+	if c, ok := cfg.(*ConsumerConfig); ok {
+		*c = *NewDefaultConsumerConfig()
+	} else if p, ok := cfg.(*PublisherConfig); ok {
+		*p = *NewDefaultPublisherConfig()
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err

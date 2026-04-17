@@ -35,6 +35,13 @@ type PartitionConsumer struct {
 // initWorker lazily starts the per-partition worker goroutine (once).
 func (pc *PartitionConsumer) initWorker() {
 	pc.once.Do(func() {
+		pc.mu.Lock()
+		if pc.closed {
+			pc.mu.Unlock()
+			return
+		}
+		pc.mu.Unlock()
+
 		channelSize := pc.consumer.config.WorkerChannelSize
 		if channelSize <= 0 {
 			channelSize = 1000

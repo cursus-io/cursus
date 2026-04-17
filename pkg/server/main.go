@@ -193,21 +193,21 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 		}
 
 		shouldExit, err := processMessage(data, cmdHandler, cmdCtx, conn)
-		if err != nil || shouldExit {
+		if err != nil {
+			return
+		}
+		if shouldExit {
 			// Check if this was a STREAM command to prevent closing the connection
-			if shouldExit {
-				// Try to decode or inspect the command
-				_, payload, decodeErr := util.DecodeMessage(data)
-				cmd := ""
-				if decodeErr == nil {
-					cmd = strings.TrimSpace(payload)
-				} else {
-					cmd = strings.TrimSpace(string(data))
-				}
+			_, payload, decodeErr := util.DecodeMessage(data)
+			cmd := ""
+			if decodeErr == nil {
+				cmd = strings.TrimSpace(payload)
+			} else {
+				cmd = strings.TrimSpace(string(data))
+			}
 
-				if strings.HasPrefix(strings.ToUpper(cmd), "STREAM ") {
-					isStreamed = true
-				}
+			if strings.HasPrefix(strings.ToUpper(cmd), "STREAM ") {
+				isStreamed = true
 			}
 			return
 		}

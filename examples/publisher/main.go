@@ -10,15 +10,22 @@ import (
 
 func main() {
 	cfg := sdk.NewDefaultPublisherConfig()
+	// Try loading from current dir, then parent dir
 	if err := sdk.LoadConfig("config.yaml", cfg); err != nil {
-		log.Printf("Config file not found or invalid, using defaults: %v", err)
+		if err := sdk.LoadConfig("../config.yaml", cfg); err != nil {
+			log.Printf("Config file not found or invalid, using defaults: %v", err)
+		}
 	}
 
 	p, err := sdk.NewProducer(cfg)
 	if err != nil {
 		log.Fatalf("Failed to create producer: %v", err)
 	}
-	defer p.Close()
+	defer func() {
+		if err := p.Close(); err != nil {
+			log.Printf("Error closing producer: %v", err)
+		}
+	}()
 
 	for i := 0; i < 10; i++ {
 		payload := fmt.Sprintf("Hello Cursus! Message %d", i)

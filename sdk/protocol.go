@@ -205,15 +205,26 @@ func DecompressMessage(data []byte, compressionType string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer gr.Close()
-		return io.ReadAll(gr)
+		res, err := io.ReadAll(gr)
+		if err != nil {
+			gr.Close()
+			return nil, err
+		}
+		if err := gr.Close(); err != nil {
+			return nil, err
+		}
+		return res, nil
 
 	case "snappy":
 		return snappy.Decode(data)
 
 	case "lz4":
 		reader := lz4.NewReader(bytes.NewReader(data))
-		return io.ReadAll(reader)
+		res, err := io.ReadAll(reader)
+		if err != nil {
+			return nil, fmt.Errorf("lz4 read all: %w", err)
+		}
+		return res, nil
 
 	case "none", "":
 		return data, nil

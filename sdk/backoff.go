@@ -12,14 +12,14 @@ type backoff struct {
 	factor  float64
 }
 
-func newBackoff(min, max time.Duration) *backoff {
-	if min <= 0 {
-		min = time.Millisecond
+func newBackoff(minWait, maxWait time.Duration) *backoff {
+	if minWait <= 0 {
+		minWait = time.Millisecond
 	}
-	if max < min {
-		max = min
+	if maxWait < minWait {
+		maxWait = minWait
 	}
-	return &backoff{current: min, min: min, max: max, factor: 2.0}
+	return &backoff{current: minWait, min: minWait, max: maxWait, factor: 2.0}
 }
 
 // duration returns the next backoff duration with 10% jitter, then advances the internal state.

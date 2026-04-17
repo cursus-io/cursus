@@ -281,15 +281,19 @@ func (m *ConsumerMetrics) PrintSummaryTo(w io.Writer) {
 		pm := m.phases[Phase(k)]
 
 		var pIDs []int
+		pm.mu.RLock()
 		for id := range pm.partitions {
 			pIDs = append(pIDs, id)
 		}
+		pm.mu.RUnlock()
 		sort.Ints(pIDs)
 
 		var tpsValues []float64
+		pm.mu.RLock()
 		for _, id := range pIDs {
 			tpsValues = append(tpsValues, pm.partitions[id].TPS())
 		}
+		pm.mu.RUnlock()
 		sort.Float64s(tpsValues)
 
 		fmt.Fprintln(w)
