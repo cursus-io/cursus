@@ -92,21 +92,30 @@ func main() {
 
 	// 3. Add items
 	fmt.Println("[Command] AddItem (Mechanical Keyboard)")
-	r, _ = store.Append(orderID, 2, &sdk.Event{
+	r, err = store.Append(orderID, 2, &sdk.Event{
 		Type: "ItemAdded",
 		Payload: toJSON(ItemAdded{SKU: "KB-MX01", Name: "Mechanical Keyboard", Qty: 1, Price: 89.99}),
 	})
+	if err != nil {
+		log.Fatalf("  failed: %v", err)
+	}
 	fmt.Printf("  -> version=%d\n", r.Version)
 
 	fmt.Println("[Command] AddItem (USB-C Cable x3)")
-	r, _ = store.Append(orderID, 3, &sdk.Event{
+	r, err = store.Append(orderID, 3, &sdk.Event{
 		Type: "ItemAdded",
 		Payload: toJSON(ItemAdded{SKU: "CBL-UC3", Name: "USB-C Cable", Qty: 3, Price: 9.99}),
 	})
+	if err != nil {
+		log.Fatalf("  failed: %v", err)
+	}
 	fmt.Printf("  -> version=%d\n\n", r.Version)
 
 	// 4. Check version
-	ver, _ := store.StreamVersion(orderID)
+	ver, err := store.StreamVersion(orderID)
+	if err != nil {
+		log.Fatalf("StreamVersion failed: %v", err)
+	}
 	fmt.Printf("[Query] StreamVersion = %d\n\n", ver)
 
 	// 5. Version conflict demo
@@ -119,10 +128,13 @@ func main() {
 
 	// 6. Ship order
 	fmt.Println("[Command] ShipOrder")
-	r, _ = store.Append(orderID, 4, &sdk.Event{
+	r, err = store.Append(orderID, 4, &sdk.Event{
 		Type: "OrderShipped",
 		Payload: toJSON(OrderShipped{Carrier: "FedEx", Tracking: "TRK-98765"}),
 	})
+	if err != nil {
+		log.Fatalf("  failed: %v", err)
+	}
 	fmt.Printf("  -> version=%d\n\n", r.Version)
 
 	// 7. Save snapshot (aggregate state at version 4)
@@ -146,7 +158,10 @@ func main() {
 
 	// 8. Read snapshot back
 	fmt.Println("[Query] ReadSnapshot")
-	snap, _ := store.ReadSnapshot(orderID)
+	snap, err := store.ReadSnapshot(orderID)
+	if err != nil {
+		log.Fatalf("ReadSnapshot failed: %v", err)
+	}
 	if snap != nil {
 		var order Order
 		_ = json.Unmarshal([]byte(snap.Payload), &order)
@@ -160,14 +175,20 @@ func main() {
 
 	// 9. Append after snapshot
 	fmt.Println("[Command] PartialRefund")
-	r, _ = store.Append(orderID, 5, &sdk.Event{
+	r, err = store.Append(orderID, 5, &sdk.Event{
 		Type: "PartialRefund",
 		Payload: toJSON(PartialRefund{SKU: "CBL-UC3", Amount: 9.99, Reason: "defective"}),
 	})
+	if err != nil {
+		log.Fatalf("  failed: %v", err)
+	}
 	fmt.Printf("  -> version=%d\n\n", r.Version)
 
 	// 10. Final state
-	finalVer, _ := store.StreamVersion(orderID)
+	finalVer, err := store.StreamVersion(orderID)
+	if err != nil {
+		log.Fatalf("StreamVersion failed: %v", err)
+	}
 	fmt.Printf("[Result] Order '%s' — %d events, snapshot at v4, current v%d\n", orderID, finalVer, finalVer)
 	fmt.Println()
 	fmt.Println("=== Example Complete ===")

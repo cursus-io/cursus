@@ -71,17 +71,27 @@ func NewEventStore(addr, topic, producerID string) *EventStore {
 // getConn returns an existing or new TCP connection.
 func (es *EventStore) getConn() (net.Conn, error) {
 	es.mu.Lock()
-	defer es.mu.Unlock()
-
 	if es.conn != nil {
-		return es.conn, nil
+		c := es.conn
+		es.mu.Unlock()
+		return c, nil
 	}
+	es.mu.Unlock()
 
 	conn, err := net.DialTimeout("tcp", es.addr, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s: %w", es.addr, err)
 	}
+
+	es.mu.Lock()
+	if es.conn != nil {
+		// Another goroutine connected while we were dialing.
+		es.mu.Unlock()
+		_ = conn.Close()
+		return es.conn, nil
+	}
 	es.conn = conn
+	es.mu.Unlock()
 	return conn, nil
 }
 
@@ -270,6 +280,9 @@ func (es *EventStore) ReadSnapshot(key string) (*Snapshot, error) {
 	}
 	if resp == "NULL" || strings.Contains(resp, "NOT_FOUND") {
 		return nil, nil
+	}
+	if strings.HasPrefix(resp, "ERROR") {
+		return nil, fmt.Errorf("broker: %s", resp)
 	}
 
 	var snap Snapshot

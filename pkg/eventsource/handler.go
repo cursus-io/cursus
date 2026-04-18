@@ -158,23 +158,26 @@ func (h *Handler) HandleAppendStream(cmd string) string {
 		return fmt.Sprintf("ERROR: %v", err)
 	}
 
-	// EnqueueSync acquires p.mu.Lock internally.
-	if err := p.EnqueueSync(msg); err != nil {
-		return fmt.Sprintf("ERROR: enqueue failed: %v", err)
-	}
-
-	// Atomically check version and append index entry.
-	// This prevents two concurrent requests from both passing the version check.
-	offset := p.NextOffset() - 1
-	ok, current, err := idx.CheckAndAppend(key, expectedVersion, offset, 0)
+	// Atomically: check version, enqueue message, and append index entry.
+	// Holding the index lock across all three prevents concurrent requests
+	// from interleaving between the version check and the append.
+	var appendedOffset uint64
+	ok, current, err := idx.CheckEnqueueAndAppend(key, expectedVersion, func() (uint64, error) {
+		if err := p.EnqueueSync(msg); err != nil {
+			return 0, err
+		}
+		offset := p.NextOffset() - 1
+		appendedOffset = offset
+		return offset, nil
+	})
 	if err != nil {
-		return fmt.Sprintf("ERROR: index append failed: %v", err)
+		return fmt.Sprintf("ERROR: %v", err)
 	}
 	if !ok {
 		return fmt.Sprintf("ERROR: version_conflict current=%d expected=%d", current, expectedVersion)
 	}
 
-	return fmt.Sprintf("OK version=%d offset=%d partition=%d", expectedVersion, offset, partitionID)
+	return fmt.Sprintf("OK version=%d offset=%d partition=%d", expectedVersion, appendedOffset, partitionID)
 }
 
 // HandleReadStream writes event data directly to conn.
@@ -203,6 +206,10 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 	t := h.tm.GetTopic(topicName)
 	if t == nil {
 		writeError(conn, fmt.Sprintf("topic '%s' does not exist", topicName))
+		return
+	}
+	if !t.IsEventSourcing {
+		writeError(conn, fmt.Sprintf("topic '%s' is not event-sourcing enabled", topicName))
 		return
 	}
 
@@ -332,6 +339,9 @@ func (h *Handler) HandleSaveSnapshot(cmd string) string {
 	if t == nil {
 		return fmt.Sprintf("ERROR: topic '%s' does not exist", topicName)
 	}
+	if !t.IsEventSourcing {
+		return fmt.Sprintf("ERROR: topic '%s' is not event-sourcing enabled", topicName)
+	}
 
 	partitionID := t.GetPartitionForMessage(types.Message{Key: key})
 	if partitionID < 0 {
@@ -379,6 +389,9 @@ func (h *Handler) HandleReadSnapshot(cmd string) string {
 	if t == nil {
 		return fmt.Sprintf("ERROR: topic '%s' does not exist", topicName)
 	}
+	if !t.IsEventSourcing {
+		return fmt.Sprintf("ERROR: topic '%s' is not event-sourcing enabled", topicName)
+	}
 
 	partitionID := t.GetPartitionForMessage(types.Message{Key: key})
 	if partitionID < 0 {
@@ -423,6 +436,9 @@ func (h *Handler) HandleStreamVersion(cmd string) string {
 	t := h.tm.GetTopic(topicName)
 	if t == nil {
 		return fmt.Sprintf("ERROR: topic '%s' does not exist", topicName)
+	}
+	if !t.IsEventSourcing {
+		return fmt.Sprintf("ERROR: topic '%s' is not event-sourcing enabled", topicName)
 	}
 
 	partitionID := t.GetPartitionForMessage(types.Message{Key: key})

@@ -310,6 +310,10 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 			return fmt.Sprintf("ERROR: PARTITION_NOT_FOUND %d", batch.Partition), nil
 		}
 
+		if len(batch.Messages) == 0 {
+			return ch.errorResponse("empty batch messages"), nil
+		}
+
 		effectiveIdempotent := batch.IsIdempotent || ch.Config.EnableIdempotence
 		scope := "global"
 

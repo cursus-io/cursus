@@ -2,7 +2,7 @@ package topic
 
 import (
 	"fmt"
-	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -232,7 +232,9 @@ func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Mess
 			return fmt.Errorf("sync publish failed: %w", err)
 		}
 	} else {
-		t.Publish(*msg)
+		if err := t.Publish(*msg); err != nil {
+			return fmt.Errorf("async publish failed: %w", err)
+		}
 	}
 
 	elapsed := time.Since(start).Seconds()
@@ -304,7 +306,7 @@ func (tm *TopicManager) ListTopics() []string {
 }
 
 func (tm *TopicManager) GetLogDir(topicName string, partitionID int) string {
-	return fmt.Sprintf("%s%c%s%cpartition_%d", tm.cfg.LogDir, os.PathSeparator, topicName, os.PathSeparator, partitionID)
+	return filepath.Join(tm.cfg.LogDir, topicName, fmt.Sprintf("partition_%d", partitionID))
 }
 
 func (tm *TopicManager) EnsureDefaultGroups() {

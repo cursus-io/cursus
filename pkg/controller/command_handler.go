@@ -94,6 +94,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			"name":               topicName,
 			"partitions":         partitions,
 			"idempotent":         idempotent,
+			"event_sourcing":     eventSourcing,
 			"replication_factor": replicationFactor,
 		}
 		_, err := ch.applyAndWait("TOPIC", payload)

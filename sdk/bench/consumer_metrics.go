@@ -240,35 +240,49 @@ func percentile(sorted []float64, p float64) float64 {
 }
 
 // PrintSummaryTo writes a formatted summary to w.
-func (m *ConsumerMetrics) PrintSummaryTo(w io.Writer) {
+func (m *ConsumerMetrics) PrintSummaryTo(w io.Writer) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
+	var firstErr error
+	p := func(format string, args ...any) {
+		if firstErr != nil {
+			return
+		}
+		_, firstErr = fmt.Fprintf(w, format, args...)
+	}
+	pln := func(a ...any) {
+		if firstErr != nil {
+			return
+		}
+		_, firstErr = fmt.Fprintln(w, a...)
+	}
 
 	elapsed := time.Since(m.startTime).Seconds()
 	total := atomic.LoadInt64(&m.totalMsgs)
 
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, consumerSep)
-	_, _ = fmt.Fprintln(w, "CONSUMER BENCHMARK SUMMARY")
-	_, _ = fmt.Fprintf(w, "Total Messages       : %d\n", total)
-	_, _ = fmt.Fprintf(w, "Elapsed Time         : %.2fs\n", elapsed)
+	pln()
+	pln(consumerSep)
+	pln("CONSUMER BENCHMARK SUMMARY")
+	p("Total Messages       : %d\n", total)
+	p("Elapsed Time         : %.2fs\n", elapsed)
 
 	overallTPS := 0.0
 	if elapsed > 0 {
 		overallTPS = float64(total) / elapsed
 	}
-	_, _ = fmt.Fprintf(w, "Overall TPS          : %.2f msg/s\n", overallTPS)
+	p("Overall TPS          : %.2f msg/s\n", overallTPS)
 
 	if m.enableCorrectness {
-		_, _ = fmt.Fprintf(w, "Duplicate (MessageID): %d (fp possible)\n", atomic.LoadInt64(&m.dupCount))
-		_, _ = fmt.Fprintf(w, "Duplicate (Offset)   : %d (fp possible)\n", atomic.LoadInt64(&m.dupOffsetCount))
-		_, _ = fmt.Fprintf(w, "Messages missing     : %d\n", atomic.LoadInt64(&m.missingCount))
+		p("Duplicate (MessageID): %d (fp possible)\n", atomic.LoadInt64(&m.dupCount))
+		p("Duplicate (Offset)   : %d (fp possible)\n", atomic.LoadInt64(&m.dupOffsetCount))
+		p("Messages missing     : %d\n", atomic.LoadInt64(&m.missingCount))
 	} else {
-		_, _ = fmt.Fprintf(w, "Correctness Check    : disabled\n")
+		p("Correctness Check    : disabled\n")
 	}
 
 	if m.rebalance != nil && !m.rebalance.End.IsZero() {
-		_, _ = fmt.Fprintf(w, "Rebalancing Cost     : %d ms\n", m.rebalance.End.Sub(m.rebalance.Start).Milliseconds())
+		p("Rebalancing Cost     : %d ms\n", m.rebalance.End.Sub(m.rebalance.Start).Milliseconds())
 	}
 
 	var phaseKeys []string
@@ -295,23 +309,26 @@ func (m *ConsumerMetrics) PrintSummaryTo(w io.Writer) {
 
 		sort.Float64s(tpsValues)
 
-		_, _ = fmt.Fprintln(w)
-		_, _ = fmt.Fprintf(w, "Phase: %s\n", k)
-		_, _ = fmt.Fprintf(w, "  Phase Total TPS       : %.2f\n", pm.TPS())
-		_, _ = fmt.Fprintf(w, "  p95 Partition TPS     : %.2f\n", percentile(tpsValues, 0.95))
-		_, _ = fmt.Fprintf(w, "  p99 Partition TPS     : %.2f\n", percentile(tpsValues, 0.99))
+		pln()
+		p("Phase: %s\n", k)
+		p("  Phase Total TPS       : %.2f\n", pm.TPS())
+		p("  p95 Partition TPS     : %.2f\n", percentile(tpsValues, 0.95))
+		p("  p99 Partition TPS     : %.2f\n", percentile(tpsValues, 0.99))
 
 		for _, id := range pIDs {
-			p := pm.partitions[id]
-			_, _ = fmt.Fprintf(w, "    #%-2d total=%-8d avgTPS=%.1f\n", p.ID, atomic.LoadInt64(&p.totalMsgs), p.TPS())
+			pt := pm.partitions[id]
+			p("    #%-2d total=%-8d avgTPS=%.1f\n", pt.ID, atomic.LoadInt64(&pt.totalMsgs), pt.TPS())
 		}
 	}
 
-	_, _ = fmt.Fprintln(w, consumerSep)
+	pln(consumerSep)
+	return firstErr
 }
 
 // PrintSummary writes the summary to stdout.
 func (m *ConsumerMetrics) PrintSummary() {
 	_, _ = fmt.Fprintln(os.Stdout, "Benchmark completed successfully!")
-	m.PrintSummaryTo(os.Stdout)
+	if err := m.PrintSummaryTo(os.Stdout); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write summary: %v\n", err)
+	}
 }

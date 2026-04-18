@@ -14,6 +14,9 @@ import (
 const DefaultFSMApplyTimeout = 5 * time.Second
 
 func backoffDelay(attempt int, base time.Duration) time.Duration {
+	if attempt > 30 {
+		attempt = 30
+	}
 	delay := base * time.Duration(1<<uint(attempt))
 	if delay > 5*time.Second {
 		delay = 5 * time.Second
@@ -78,7 +81,9 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 			}
 			lastErr = err
 			util.Debug("Retrying forward to leader (Target Leader %s)... attempt %d: %v", ch.Cluster.RaftManager.GetLeaderAddress(), i+1, err)
-			time.Sleep(backoffDelay(i, 100*time.Millisecond))
+			if i < maxRetries-1 {
+				time.Sleep(backoffDelay(i, 100*time.Millisecond))
+			}
 		}
 		leaderAddr := ch.Cluster.RaftManager.GetLeaderAddress()
 		return fmt.Sprintf("ERROR: failed to forward command to leader (Leader: %s, Error: %v)", leaderAddr, lastErr), true, nil

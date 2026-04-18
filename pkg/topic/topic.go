@@ -37,6 +37,9 @@ func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.C
 		}
 		p := NewPartition(i, name, dh, sm, cfg)
 		p.isIdempotent = idempotent
+		if idempotent {
+			go p.runProducerCleanup()
+		}
 		partitions[i] = p
 	}
 	return &Topic{
@@ -91,6 +94,9 @@ func (t *Topic) AddPartitions(extra int, hp HandlerProvider) error {
 		}
 		newP := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
 		newP.isIdempotent = t.IsIdempotent
+		if t.IsIdempotent {
+			go newP.runProducerCleanup()
+		}
 		t.Partitions = append(t.Partitions, newP)
 	}
 	return nil
@@ -137,17 +143,17 @@ func (t *Topic) DeregisterConsumerGroup(groupName string) error {
 // Publish sends a message to one partition.
 // Partition selection and enqueue happen under a single RLock to prevent
 // TOCTOU races with AddPartitions.
-func (t *Topic) Publish(msg types.Message) {
+func (t *Topic) Publish(msg types.Message) error {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	idx := t.getPartitionIndex(msg, len(t.Partitions))
 	if idx == -1 {
-		util.Error("No partitions available for topic '%s'", t.Name)
-		return
+		return fmt.Errorf("no partitions available for topic '%s'", t.Name)
 	}
 
 	t.Partitions[idx].Enqueue(msg)
+	return nil
 }
 
 // PublishSync sends a message synchronously to one partition.

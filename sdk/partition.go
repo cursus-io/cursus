@@ -174,8 +174,9 @@ func (pc *PartitionConsumer) pollAndProcess() {
 		return
 	}
 
-	// Empty data is a keepalive signal from the broker; skip backoff.
+	// Empty data is a keepalive signal from the broker; reset backoff.
 	if len(batchData) == 0 {
+		bo.reset()
 		return
 	}
 

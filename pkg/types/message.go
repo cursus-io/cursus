@@ -21,8 +21,8 @@ type Message struct {
 }
 
 func (m Message) String() string {
-	return fmt.Sprintf("Message { ID: %s-%d, Payload:%s, Offset:%d, Key:%s, Epoch:%d, RetryCount:%d }",
-		m.ProducerID, m.SeqNum, m.Payload, m.Offset, m.Key, m.Epoch, m.RetryCount)
+	return fmt.Sprintf("Message { ID: %s-%d, Payload:%s, Offset:%d, Key:%s, Epoch:%d, RetryCount:%d, EventType:%s, AggregateVersion:%d }",
+		m.ProducerID, m.SeqNum, m.Payload, m.Offset, m.Key, m.Epoch, m.RetryCount, m.EventType, m.AggregateVersion)
 }
 
 type Batch struct {

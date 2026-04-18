@@ -171,6 +171,33 @@ func (si *StreamIndex) CheckAndAppend(key string, expectedVersion, offset, posit
 	return true, expectedVersion, nil
 }
 
+// CheckEnqueueAndAppend atomically validates expected version, enqueues via the
+// provided callback, and appends the resulting offset to the index.
+// This ensures no concurrent request can interleave between version check and append.
+func (si *StreamIndex) CheckEnqueueAndAppend(key string, expectedVersion uint64, enqueueFn func() (uint64, error)) (bool, uint64, error) {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+
+	current := uint64(0)
+	if st, ok := si.states[key]; ok {
+		current = st.currentVersion
+	}
+
+	if expectedVersion != current+1 {
+		return false, current, nil
+	}
+
+	offset, err := enqueueFn()
+	if err != nil {
+		return false, current, err
+	}
+
+	if err := si.appendLocked(key, expectedVersion, offset, 0); err != nil {
+		return false, current, err
+	}
+	return true, expectedVersion, nil
+}
+
 // Append writes a new index entry for the given aggregate key.
 // On the first append for a new key, the key-to-hash mapping is written to the sidecar.
 func (si *StreamIndex) Append(key string, aggregateVersion, offset, position uint64) error {

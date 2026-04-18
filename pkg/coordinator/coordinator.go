@@ -263,7 +263,7 @@ func (c *Coordinator) getGroupSafe(name string) *GroupMetadata {
 }
 
 // getOffsetSafe reads an offset from the group's per-group offset map.
-// Caller must hold at least gm.mu.RLock.
+// GUARDED_BY(gm.mu) — caller must hold at least gm.mu.RLock.
 func (gm *GroupMetadata) getOffsetSafe(topic string, partition int) (uint64, bool) {
 	if partitions, ok := gm.Offsets[topic]; ok {
 		if offset, ok := partitions[partition]; ok {
@@ -274,7 +274,7 @@ func (gm *GroupMetadata) getOffsetSafe(topic string, partition int) (uint64, boo
 }
 
 // storeOffset writes an offset into the group's per-group offset map.
-// Caller must hold gm.mu.Lock.
+// GUARDED_BY(gm.mu) — caller must hold gm.mu.Lock (exclusive).
 func (gm *GroupMetadata) storeOffset(topic string, partition int, offset uint64) {
 	if gm.Offsets == nil {
 		gm.Offsets = make(map[string]map[int]uint64)

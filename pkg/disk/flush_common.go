@@ -377,9 +377,12 @@ func (d *DiskHandler) openSegment() error {
 func (d *DiskHandler) Flush() {
 	batch := make([]types.DiskMessage, 0, d.batchSize)
 
-	for {
+	for len(batch) < d.batchSize {
 		select {
-		case msg := <-d.writeCh:
+		case msg, ok := <-d.writeCh:
+			if !ok {
+				goto perform_write
+			}
 			batch = append(batch, msg)
 		default:
 			goto perform_write
@@ -392,7 +395,6 @@ perform_write:
 			util.Error("Flush write failed: %v", err)
 			return
 		}
-		return
 	}
 
 	d.ioMu.Lock()

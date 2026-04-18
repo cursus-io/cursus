@@ -268,28 +268,40 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	offset += payloadLen
 
 	// Event sourcing fields (optional — backward compatible with old messages)
-	if offset+2 <= len(data) {
+	// If event-sourcing trailer is present, all fields must be complete.
+	if offset < len(data) {
+		if offset+2 > len(data) {
+			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated event type length")
+		}
 		eventTypeLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 		offset += 2
-		if offset+eventTypeLen <= len(data) {
-			msg.EventType = string(data[offset : offset+eventTypeLen])
-			offset += eventTypeLen
+		if offset+eventTypeLen > len(data) {
+			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated event type")
 		}
-	}
-	if offset+4 <= len(data) {
+		msg.EventType = string(data[offset : offset+eventTypeLen])
+		offset += eventTypeLen
+
+		if offset+4 > len(data) {
+			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated schema version")
+		}
 		msg.SchemaVersion = binary.BigEndian.Uint32(data[offset : offset+4])
 		offset += 4
-	}
-	if offset+8 <= len(data) {
+
+		if offset+8 > len(data) {
+			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated aggregate version")
+		}
 		msg.AggregateVersion = binary.BigEndian.Uint64(data[offset : offset+8])
 		offset += 8
-	}
-	if offset+2 <= len(data) {
+
+		if offset+2 > len(data) {
+			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated metadata length")
+		}
 		metadataLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 		offset += 2
-		if offset+metadataLen <= len(data) {
-			msg.Metadata = string(data[offset : offset+metadataLen])
+		if offset+metadataLen > len(data) {
+			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated metadata")
 		}
+		msg.Metadata = string(data[offset : offset+metadataLen])
 	}
 
 	return msg, nil

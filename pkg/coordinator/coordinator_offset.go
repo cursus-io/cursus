@@ -16,6 +16,11 @@ func calculateOffsetPartitionCount(groupCount int) int {
 func (c *Coordinator) CommitOffset(groupName, topic string, partition int, offset uint64) error {
 	util.Debug("Committing offset: group='%s', topic='%s', partition=%d, offset=%d", groupName, topic, partition, offset)
 
+	gm := c.getGroupSafe(groupName)
+	if gm == nil {
+		return fmt.Errorf("group '%s' not found", groupName)
+	}
+
 	offsetMsg := OffsetCommitMessage{
 		Group:     groupName,
 		Topic:     topic,
@@ -37,11 +42,6 @@ func (c *Coordinator) CommitOffset(groupName, topic string, partition int, offse
 		return err
 	}
 
-	gm := c.getGroupSafe(groupName)
-	if gm == nil {
-		return fmt.Errorf("group '%s' not found", groupName)
-	}
-
 	gm.mu.Lock()
 	gm.storeOffset(topic, partition, offset)
 	gm.mu.Unlock()
@@ -52,6 +52,11 @@ func (c *Coordinator) CommitOffset(groupName, topic string, partition int, offse
 func (c *Coordinator) CommitOffsetsBulk(groupName, topic string, offsets []OffsetItem) error {
 	if len(offsets) == 0 {
 		return nil
+	}
+
+	gm := c.getGroupSafe(groupName)
+	if gm == nil {
+		return fmt.Errorf("group '%s' not found", groupName)
 	}
 
 	bulkMsg := BulkOffsetMsg{
@@ -72,11 +77,6 @@ func (c *Coordinator) CommitOffsetsBulk(groupName, topic string, offsets []Offse
 		Key:        fmt.Sprintf("%s-%s-bulk", groupName, topic),
 	}); err != nil {
 		return err
-	}
-
-	gm := c.getGroupSafe(groupName)
-	if gm == nil {
-		return fmt.Errorf("group '%s' not found", groupName)
 	}
 
 	gm.mu.Lock()

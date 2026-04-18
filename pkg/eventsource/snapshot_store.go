@@ -69,6 +69,7 @@ func (s *SnapshotStore) loadFromDisk() error {
 	}
 
 	var offset uint64
+	var lastGoodOffset uint64
 	for {
 		entryOffset := offset
 
@@ -85,6 +86,13 @@ func (s *SnapshotStore) loadFromDisk() error {
 		// Read Key.
 		keyBuf := make([]byte, keyLen)
 		if _, err := io.ReadFull(s.file, keyBuf); err != nil {
+			if err == io.ErrUnexpectedEOF {
+				// Truncate to last good entry.
+				if truncErr := s.file.Truncate(int64(lastGoodOffset)); truncErr != nil {
+					return fmt.Errorf("snapshot store: truncate after partial key: %w", truncErr)
+				}
+				break
+			}
 			return err
 		}
 		offset += uint64(keyLen)
@@ -92,6 +100,12 @@ func (s *SnapshotStore) loadFromDisk() error {
 		// Read Version (8 bytes).
 		var version uint64
 		if err := binary.Read(s.file, binary.BigEndian, &version); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				if truncErr := s.file.Truncate(int64(lastGoodOffset)); truncErr != nil {
+					return fmt.Errorf("snapshot store: truncate after partial version: %w", truncErr)
+				}
+				break
+			}
 			return err
 		}
 		offset += 8
@@ -99,13 +113,22 @@ func (s *SnapshotStore) loadFromDisk() error {
 		// Read PayloadLen (4 bytes).
 		var payloadLen uint32
 		if err := binary.Read(s.file, binary.BigEndian, &payloadLen); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				if truncErr := s.file.Truncate(int64(lastGoodOffset)); truncErr != nil {
+					return fmt.Errorf("snapshot store: truncate after partial payload len: %w", truncErr)
+				}
+				break
+			}
 			return err
 		}
 		offset += 4
 
 		// Skip Payload bytes.
 		if _, err := s.file.Seek(int64(payloadLen), io.SeekCurrent); err != nil {
-			return err
+			if truncErr := s.file.Truncate(int64(lastGoodOffset)); truncErr != nil {
+				return fmt.Errorf("snapshot store: truncate after partial payload: %w", truncErr)
+			}
+			break
 		}
 		offset += uint64(payloadLen)
 
@@ -114,9 +137,10 @@ func (s *SnapshotStore) loadFromDisk() error {
 			fileOffset: entryOffset,
 			version:    version,
 		}
+		lastGoodOffset = offset
 	}
 
-	s.writeOffset = offset
+	s.writeOffset = lastGoodOffset
 	return nil
 }
 
@@ -187,37 +211,38 @@ func (s *SnapshotStore) Read(key string) (*SnapshotData, error) {
 		return nil, nil
 	}
 
-	// Seek to the entry's file offset.
-	if _, err := s.file.Seek(int64(ptr.fileOffset), io.SeekStart); err != nil {
-		return nil, fmt.Errorf("snapshot store: seek: %w", err)
-	}
+	pos := int64(ptr.fileOffset)
 
-	// Read KeyLen.
-	var keyLen uint16
-	if err := binary.Read(s.file, binary.BigEndian, &keyLen); err != nil {
+	// Read KeyLen (2 bytes).
+	var keyLenBuf [2]byte
+	if _, err := s.file.ReadAt(keyLenBuf[:], pos); err != nil {
 		return nil, fmt.Errorf("snapshot store: read key len: %w", err)
 	}
+	keyLen := binary.BigEndian.Uint16(keyLenBuf[:])
+	pos += 2
 
 	// Skip Key.
-	if _, err := s.file.Seek(int64(keyLen), io.SeekCurrent); err != nil {
-		return nil, fmt.Errorf("snapshot store: skip key: %w", err)
-	}
+	pos += int64(keyLen)
 
-	// Read Version.
-	var version uint64
-	if err := binary.Read(s.file, binary.BigEndian, &version); err != nil {
+	// Read Version (8 bytes).
+	var versionBuf [8]byte
+	if _, err := s.file.ReadAt(versionBuf[:], pos); err != nil {
 		return nil, fmt.Errorf("snapshot store: read version: %w", err)
 	}
+	version := binary.BigEndian.Uint64(versionBuf[:])
+	pos += 8
 
-	// Read PayloadLen.
-	var payloadLen uint32
-	if err := binary.Read(s.file, binary.BigEndian, &payloadLen); err != nil {
+	// Read PayloadLen (4 bytes).
+	var payloadLenBuf [4]byte
+	if _, err := s.file.ReadAt(payloadLenBuf[:], pos); err != nil {
 		return nil, fmt.Errorf("snapshot store: read payload len: %w", err)
 	}
+	payloadLen := binary.BigEndian.Uint32(payloadLenBuf[:])
+	pos += 4
 
 	// Read Payload.
 	payloadBuf := make([]byte, payloadLen)
-	if _, err := io.ReadFull(s.file, payloadBuf); err != nil {
+	if _, err := s.file.ReadAt(payloadBuf, pos); err != nil {
 		return nil, fmt.Errorf("snapshot store: read payload: %w", err)
 	}
 

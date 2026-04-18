@@ -127,6 +127,9 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 
 		// Event sourcing fields
 		eventTypeBytes := []byte(m.EventType)
+		if len(eventTypeBytes) > 0xFFFF {
+			return nil, fmt.Errorf("eventType too long: %d bytes", len(eventTypeBytes))
+		}
 		if err := write(uint16(len(eventTypeBytes))); err != nil {
 			return nil, err
 		}
@@ -143,6 +146,9 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 		}
 
 		metadataBytes := []byte(m.Metadata)
+		if len(metadataBytes) > 0xFFFF {
+			return nil, fmt.Errorf("metadata too long: %d bytes", len(metadataBytes))
+		}
 		if err := write(uint16(len(metadataBytes))); err != nil {
 			return nil, err
 		}
@@ -314,6 +320,14 @@ func DecodeBatchMessages(data []byte) ([]Message, string, int, error) {
 	var msgCount int32
 	if err := binary.Read(reader, binary.BigEndian, &msgCount); err != nil {
 		return nil, "", 0, fmt.Errorf("failed to read message count: %w", err)
+	}
+
+	if msgCount < 0 {
+		return nil, "", 0, fmt.Errorf("invalid negative message count: %d", msgCount)
+	}
+	const maxBatchMessages = 100000
+	if msgCount > maxBatchMessages {
+		return nil, "", 0, fmt.Errorf("message count too high: %d (max: %d)", msgCount, maxBatchMessages)
 	}
 
 	messages := make([]Message, 0, msgCount)

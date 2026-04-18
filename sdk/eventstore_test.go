@@ -103,7 +103,7 @@ func TestAppendCommandFormat(t *testing.T) {
 	}
 	cmd := "APPEND_STREAM topic=" + es.topic +
 		" key=order-1" +
-		" expected_version=" + strconv.FormatUint(0, 10) +
+		" version=" + strconv.FormatUint(0, 10) +
 		" event_type=" + event.Type +
 		" schema_version=" + strconv.FormatUint(uint64(sv), 10) +
 		" producerId=" + es.producerID +
@@ -112,7 +112,7 @@ func TestAppendCommandFormat(t *testing.T) {
 	assert.True(t, strings.HasPrefix(cmd, "APPEND_STREAM"))
 	assert.Contains(t, cmd, "topic=orders")
 	assert.Contains(t, cmd, "key=order-1")
-	assert.Contains(t, cmd, "expected_version=0")
+	assert.Contains(t, cmd, "version=0")
 	assert.Contains(t, cmd, "event_type=OrderCreated")
 	assert.Contains(t, cmd, "schema_version=1")
 	assert.Contains(t, cmd, "producerId=p-1")

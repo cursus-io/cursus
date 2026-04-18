@@ -137,6 +137,9 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 
 		// Event sourcing fields
 		eventTypeBytes := []byte(m.EventType)
+		if len(eventTypeBytes) > 0xFFFF {
+			return nil, fmt.Errorf("eventType too long: %d bytes", len(eventTypeBytes))
+		}
 		if err := write(uint16(len(eventTypeBytes))); err != nil {
 			return nil, err
 		}
@@ -153,6 +156,9 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 		}
 
 		metadataBytes := []byte(m.Metadata)
+		if len(metadataBytes) > 0xFFFF {
+			return nil, fmt.Errorf("metadata too long: %d bytes", len(metadataBytes))
+		}
 		if err := write(uint16(len(metadataBytes))); err != nil {
 			return nil, err
 		}

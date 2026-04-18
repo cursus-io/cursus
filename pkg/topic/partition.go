@@ -61,7 +61,6 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		}
 	}
 
-	go p.runProducerCleanup()
 	return p
 }
 

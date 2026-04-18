@@ -95,3 +95,41 @@ func TestStreamIndex_UnknownKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, entries)
 }
+
+func TestStreamIndex_CheckAndAppend_VersionConflict(t *testing.T) {
+	dir := t.TempDir()
+
+	idx, err := NewStreamIndex(dir, 0)
+	require.NoError(t, err)
+	defer func() { _ = idx.Close() }()
+
+	key := "order-conflict"
+
+	// First append at version 1 should succeed.
+	ok, _, err := idx.CheckAndAppend(key, 1, 100, 0)
+	require.NoError(t, err)
+	assert.True(t, ok, "first append should succeed")
+
+	// Second append at version 2 should succeed.
+	ok, _, err = idx.CheckAndAppend(key, 2, 200, 1)
+	require.NoError(t, err)
+	assert.True(t, ok, "second append should succeed")
+
+	// Duplicate version 2 should fail (conflict).
+	ok, current, err := idx.CheckAndAppend(key, 2, 300, 2)
+	require.NoError(t, err)
+	assert.False(t, ok, "duplicate version should conflict")
+	assert.Equal(t, uint64(2), current, "current version should be 2")
+
+	// Out-of-order version 1 should also fail.
+	ok, current, err = idx.CheckAndAppend(key, 1, 400, 3)
+	require.NoError(t, err)
+	assert.False(t, ok, "out-of-order version should conflict")
+	assert.Equal(t, uint64(2), current, "current version should still be 2")
+
+	// Version 3 should succeed (correct next version).
+	ok, _, err = idx.CheckAndAppend(key, 3, 500, 4)
+	require.NoError(t, err)
+	assert.True(t, ok, "version 3 should succeed")
+	assert.Equal(t, uint64(3), idx.GetVersion(key))
+}

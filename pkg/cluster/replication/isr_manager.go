@@ -31,6 +31,7 @@ type ISRManager struct {
 	leaderSince      time.Time
 
 	ctx       context.Context
+	cancel    context.CancelFunc
 	startOnce sync.Once
 }
 
@@ -46,13 +47,16 @@ func NewISRManager(ctx context.Context, fsm *fsm.BrokerFSM, brokerID string, hea
 		lastSeen[brokerID] = time.Now()
 	}
 
+	childCtx, cancel := context.WithCancel(ctx)
+
 	return &ISRManager{
 		fsm:              fsm,
 		brokerID:         brokerID,
 		applier:          applier,
 		lastSeen:         lastSeen,
 		heartbeatTimeout: heartbeatTimeout,
-		ctx:              ctx,
+		ctx:              childCtx,
+		cancel:           cancel,
 	}
 }
 
@@ -77,8 +81,12 @@ func (i *ISRManager) Start() {
 	})
 }
 
-// Stop is a no-op; cancellation is handled by the context passed to NewISRManager.
-func (i *ISRManager) Stop() {}
+// Stop cancels the ISR manager's context, shutting down the background goroutine.
+func (i *ISRManager) Stop() {
+	if i.cancel != nil {
+		i.cancel()
+	}
+}
 
 func (i *ISRManager) refreshAllISRs() {
 	if i.applier != nil && !i.applier.IsLeader() {
