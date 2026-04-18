@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/coordinator"
-	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -49,19 +48,17 @@ type BrokerFSM struct {
 	producerState     map[string]map[int]map[string]int64 // Topic -> Partition -> ProducerID -> LastSeq
 	applied           uint64
 
-	dm *disk.DiskManager
 	tm *topic.TopicManager
 	cd *coordinator.Coordinator
 }
 
-func NewBrokerFSM(dm *disk.DiskManager, tm *topic.TopicManager, cd *coordinator.Coordinator) *BrokerFSM {
+func NewBrokerFSM(tm *topic.TopicManager, cd *coordinator.Coordinator) *BrokerFSM {
 	return &BrokerFSM{
 		notifiers:         make(map[string]chan interface{}),
 		logs:              make(map[uint64]*ReplicationEntry),
 		brokers:           make(map[string]*BrokerInfo),
 		partitionMetadata: make(map[string]*PartitionMetadata),
 		producerState:     make(map[string]map[int]map[string]int64),
-		dm:                dm,
 		tm:                tm,
 		cd:                cd,
 	}
@@ -213,6 +210,14 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	metadataCopy := make(map[string]*PartitionMetadata, len(f.partitionMetadata))
 	for k, v := range f.partitionMetadata {
 		metaCopy := *v
+		if v.Replicas != nil {
+			metaCopy.Replicas = make([]string, len(v.Replicas))
+			copy(metaCopy.Replicas, v.Replicas)
+		}
+		if v.ISR != nil {
+			metaCopy.ISR = make([]string, len(v.ISR))
+			copy(metaCopy.ISR, v.ISR)
+		}
 		metadataCopy[k] = &metaCopy
 	}
 	producerStateCopy := make(map[string]map[int]map[string]int64, len(f.producerState))

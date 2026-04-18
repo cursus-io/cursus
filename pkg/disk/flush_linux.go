@@ -4,31 +4,13 @@
 package disk
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net"
-	"os"
 
 	"github.com/cursus-io/cursus/util"
 	"golang.org/x/sys/unix"
 )
-
-func (d *DiskHandler) openSegment() error {
-	flags := os.O_CREATE | os.O_RDWR | os.O_APPEND
-	filePath := d.GetSegmentPath(d.CurrentSegment)
-
-	f, err := os.OpenFile(filePath, flags, 0644)
-	if err != nil {
-		return err
-	}
-	d.file = f
-	d.writer = bufio.NewWriter(f)
-
-	// sequential access hint
-	_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_SEQUENTIAL)
-	return nil
-}
 
 func (d *DiskHandler) SendCurrentSegmentToConn(conn net.Conn) (int, error) {
 	d.mu.Lock()

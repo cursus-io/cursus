@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -9,7 +10,7 @@ import (
 
 func TestCoordinator_StatusAndList(t *testing.T) {
 	cfg := &config.Config{}
-	c := NewCoordinator(cfg, &DummyPublisher{})
+	c := NewCoordinator(context.Background(), cfg, &DummyPublisher{})
 
 	_ = c.RegisterGroup("topic1", "group1", 4)
 	_, _ = c.AddConsumer("group1", "c1")
@@ -41,7 +42,7 @@ func TestCoordinator_StatusAndList(t *testing.T) {
 
 func TestCoordinator_Offsets(t *testing.T) {
 	cfg := &config.Config{}
-	c := NewCoordinator(cfg, &DummyPublisher{})
+	c := NewCoordinator(context.Background(), cfg, &DummyPublisher{})
 
 	_ = c.RegisterGroup("topic1", "group1", 2)
 
@@ -88,7 +89,7 @@ func TestCoordinator_Offsets(t *testing.T) {
 
 func TestCoordinator_MemberAssignments(t *testing.T) {
 	cfg := &config.Config{}
-	c := NewCoordinator(cfg, &DummyPublisher{})
+	c := NewCoordinator(context.Background(), cfg, &DummyPublisher{})
 
 	_ = c.RegisterGroup("t1", "g1", 2)
 	_, _ = c.AddConsumer("g1", "m1")

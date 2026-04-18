@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -29,7 +30,7 @@ func main() {
 		os.Exit(1)
 	}
 	tm := topic.NewTopicManager(cfg, dm, smAdapter)
-	cd := coordinator.NewCoordinator(cfg, tm)
+	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
 	tm.SetCoordinator(cd)
 
 	ctx := controller.NewClientContext("default-group", 0)

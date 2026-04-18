@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os/signal"
+	"syscall"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
@@ -48,7 +51,9 @@ func main() {
 	}
 
 	tm := topic.NewTopicManager(cfg, dm, smAdapter)
-	cd := coordinator.NewCoordinator(cfg, tm)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	cd := coordinator.NewCoordinator(ctx, cfg, tm)
 	tm.SetCoordinator(cd)
 
 	// Static consumer groups

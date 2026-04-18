@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -15,7 +16,6 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
-	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -56,8 +56,8 @@ type RaftReplicationManager struct {
 	leaderCh chan bool
 }
 
-func NewRaftReplicationManager(cfg *config.Config, brokerID string, diskManager *disk.DiskManager, topicManager *topic.TopicManager, coordinator *coordinator.Coordinator, client client.TCPClusterClient) (*RaftReplicationManager, error) {
-	brokerFSM := fsm.NewBrokerFSM(diskManager, topicManager, coordinator)
+func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID string, topicManager *topic.TopicManager, coordinator *coordinator.Coordinator, client client.TCPClusterClient) (*RaftReplicationManager, error) {
+	brokerFSM := fsm.NewBrokerFSM(topicManager, coordinator)
 
 	localAddr := fmt.Sprintf("%s:%d", cfg.AdvertisedHost, cfg.RaftPort)
 	raftCfg := raft.DefaultConfig()
@@ -66,7 +66,7 @@ func NewRaftReplicationManager(cfg *config.Config, brokerID string, diskManager 
 	// Raft Security Rule: HeartbeatTimeout must be larger than LeaderLeaseTimeout
 	raftCfg.HeartbeatTimeout = 1000 * time.Millisecond
 	raftCfg.ElectionTimeout = 2000 * time.Millisecond
-	raftCfg.LeaderLeaseTimeout = 500 * time.Millisecond
+	raftCfg.LeaderLeaseTimeout = 800 * time.Millisecond
 	raftCfg.CommitTimeout = 50 * time.Millisecond
 	raftCfg.LogLevel = "Info"
 
@@ -172,7 +172,7 @@ func NewRaftReplicationManager(cfg *config.Config, brokerID string, diskManager 
 		leaderCh:  make(chan bool, 10),
 	}
 
-	rm.isrManager = NewISRManager(brokerFSM, brokerID, 5*time.Second, rm)
+	rm.isrManager = NewISRManager(ctx, brokerFSM, brokerID, 5*time.Second, rm)
 	go rm.isrManager.Start()
 
 	go rm.observeLeadership(notifyCh)

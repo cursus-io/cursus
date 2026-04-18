@@ -22,6 +22,7 @@ type TopicCommand struct {
 	Name              string `json:"name"`
 	Partitions        int    `json:"partitions"`
 	Idempotent        bool   `json:"idempotent"`
+	EventSourcing     bool   `json:"event_sourcing"`
 	LeaderID          string `json:"leader_id"`
 	ReplicationFactor int    `json:"replication_factor,omitempty"`
 }
@@ -89,6 +90,10 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		var replicas []string
 		if assignedLeader == "" {
 			replicas = ring.GetN(key, replicationFactor)
+			if len(replicas) == 0 {
+				f.mu.Unlock()
+				return fmt.Errorf("no replicas assigned for partition %s", key)
+			}
 			assignedLeader = replicas[0]
 		} else {
 			// Explicit leader: build replica set starting from leader
@@ -123,7 +128,7 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	f.mu.Unlock()
 
 	if tm != nil {
-		if err := tm.CreateTopic(topicCmd.Name, topicCmd.Partitions, topicCmd.Idempotent); err != nil {
+		if err := tm.CreateTopic(topicCmd.Name, topicCmd.Partitions, topicCmd.Idempotent, topicCmd.EventSourcing); err != nil {
 			util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicCmd.Name, err)
 		}
 	}

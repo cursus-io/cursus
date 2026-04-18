@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -9,8 +10,8 @@ import (
 )
 
 func TestISRManager_Lifecycle(t *testing.T) {
-	brokerFSM := fsm.NewBrokerFSM(nil, nil, nil)
-	isrManager := NewISRManager(brokerFSM, "node1", 100*time.Millisecond, nil)
+	brokerFSM := fsm.NewBrokerFSM(nil, nil)
+	isrManager := NewISRManager(context.Background(), brokerFSM, "node1", 100*time.Millisecond, nil)
 	t.Cleanup(isrManager.Stop)
 
 	isrManager.Start()
@@ -23,9 +24,9 @@ func TestISRManager_Lifecycle(t *testing.T) {
 }
 
 func TestISRManager_SetLeader(t *testing.T) {
-	brokerFSM := fsm.NewBrokerFSM(nil, nil, nil)
+	brokerFSM := fsm.NewBrokerFSM(nil, nil)
 	applier := &MockCommandApplier{IsLeaderResult: false}
-	isrManager := NewISRManager(brokerFSM, "node1", 100*time.Millisecond, applier)
+	isrManager := NewISRManager(context.Background(), brokerFSM, "node1", 100*time.Millisecond, applier)
 
 	isrManager.SetLeader(true)
 	isrManager.mu.RLock()

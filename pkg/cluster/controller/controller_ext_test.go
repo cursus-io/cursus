@@ -85,7 +85,7 @@ func TestClusterController_Basic(t *testing.T) {
 		cc.SetLocalProcessor(lp)
 		assert.Equal(t, lp, cc.Router.localProcessor)
 
-		cc.SetLocalProcessor(nil) // Should ignore with warning
+		cc.SetLocalProcessor(nil) // should ignore with warning
 		assert.Equal(t, lp, cc.Router.localProcessor)
 	})
 }
@@ -127,13 +127,13 @@ func TestClusterRouter_Forwarding(t *testing.T) {
 
 	t.Run("ForwardToPartitionLeader - Remote Leader", func(t *testing.T) {
 		rm.isLeader = false
-		rm.mockFSM = fsm.NewBrokerFSM(nil, nil, nil)
+		rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
 
-		// Register a remote broker
+		// register a remote broker
 		brokerJSON := `{"id":"node2","addr":"127.0.0.1:9002","status":"active"}`
 		rm.mockFSM.Apply(&raft.Log{Data: append([]byte("REGISTER:"), []byte(brokerJSON)...), Index: 1})
 
-		// Set partition leader to that broker
+		// set partition leader to that broker
 		metaJSON := `{"leader":"node2"}`
 		rm.mockFSM.Apply(&raft.Log{Data: append([]byte("PARTITION:topic1-0:"), []byte(metaJSON)...), Index: 2})
 

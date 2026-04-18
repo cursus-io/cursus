@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -9,7 +10,6 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
-	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
@@ -63,9 +63,8 @@ func TestISRManager_Quorum(t *testing.T) {
 
 	hp := &FakeHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
-	dm := disk.NewDiskManager(cfg)
-	cd := coordinator.NewCoordinator(cfg, tm)
-	brokerFSM := fsm.NewBrokerFSM(dm, tm, cd)
+	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
+	brokerFSM := fsm.NewBrokerFSM(tm, cd)
 
 	topicName := "test-topic"
 	partitionID := 0
@@ -94,7 +93,7 @@ func TestISRManager_Quorum(t *testing.T) {
 		t.Fatalf("failed to apply TOPIC command: %v", err)
 	}
 
-	if err := tm.CreateTopic(topicName, 1, false); err != nil {
+	if err := tm.CreateTopic(topicName, 1, false, false); err != nil {
 		t.Fatalf("CreateTopic failed: %v", err)
 	}
 
@@ -114,7 +113,7 @@ func TestISRManager_Quorum(t *testing.T) {
 
 	// Mock applier to act as leader and update FSM
 	applier := &MockCommandApplier{IsLeaderResult: true, fsm: brokerFSM}
-	isrManager := NewISRManager(brokerFSM, "node1", 100*time.Millisecond, applier)
+	isrManager := NewISRManager(context.Background(), brokerFSM, "node1", 100*time.Millisecond, applier)
 
 	// Heartbeat node1 & node2 only
 	isrManager.UpdateHeartbeat("node1")
@@ -151,9 +150,8 @@ func TestISRManager_ReplicaSubset(t *testing.T) {
 
 	hp := &FakeHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
-	dm := disk.NewDiskManager(cfg)
-	cd := coordinator.NewCoordinator(cfg, tm)
-	brokerFSM := fsm.NewBrokerFSM(dm, tm, cd)
+	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
+	brokerFSM := fsm.NewBrokerFSM(tm, cd)
 
 	// Register 5 brokers
 	for i := 1; i <= 5; i++ {
@@ -177,7 +175,7 @@ func TestISRManager_ReplicaSubset(t *testing.T) {
 	brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("PARTITION:%s:%s", key, metaData))})
 
 	applier := &MockCommandApplier{IsLeaderResult: true, fsm: brokerFSM}
-	isrManager := NewISRManager(brokerFSM, "node1", 100*time.Millisecond, applier)
+	isrManager := NewISRManager(context.Background(), brokerFSM, "node1", 100*time.Millisecond, applier)
 
 	// Only heartbeat node1 and node3 (node5 is stale)
 	isrManager.UpdateHeartbeat("node1")
@@ -214,9 +212,8 @@ func TestISRManager_UncleanLeaderElection(t *testing.T) {
 
 	hp := &FakeHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
-	dm := disk.NewDiskManager(cfg)
-	cd := coordinator.NewCoordinator(cfg, tm)
-	brokerFSM := fsm.NewBrokerFSM(dm, tm, cd)
+	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
+	brokerFSM := fsm.NewBrokerFSM(tm, cd)
 
 	// Register 3 brokers
 	for i := 1; i <= 3; i++ {
@@ -239,7 +236,7 @@ func TestISRManager_UncleanLeaderElection(t *testing.T) {
 	brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("PARTITION:%s:%s", key, metaData))})
 
 	applier := &MockCommandApplier{IsLeaderResult: true, fsm: brokerFSM}
-	isrManager := NewISRManager(brokerFSM, "node2", 100*time.Millisecond, applier)
+	isrManager := NewISRManager(context.Background(), brokerFSM, "node2", 100*time.Millisecond, applier)
 
 	// Only heartbeat node2 (leader node1 is dead, no heartbeat)
 	isrManager.UpdateHeartbeat("node2")

@@ -1,8 +1,10 @@
 package replication
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,7 +14,7 @@ import (
 	"github.com/cursus-io/cursus/util"
 )
 
-const defaultHeartbeatTimeout = 10 * time.Second
+const defaultHeartbeatTimeout = 3 * time.Second
 
 type CommandApplier interface {
 	ApplyCommand(prefix string, data []byte) error
@@ -28,12 +30,14 @@ type ISRManager struct {
 	heartbeatTimeout time.Duration
 	leaderSince      time.Time
 
-	stopCh    chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
 	startOnce sync.Once
-	stopOnce  sync.Once
 }
 
-func NewISRManager(fsm *fsm.BrokerFSM, brokerID string, heartbeatTimeout time.Duration, applier CommandApplier) *ISRManager {
+// NewISRManager creates a new ISRManager. The provided ctx controls the lifetime
+// of the background ISR-check goroutine started by Start().
+func NewISRManager(ctx context.Context, fsm *fsm.BrokerFSM, brokerID string, heartbeatTimeout time.Duration, applier CommandApplier) *ISRManager {
 	if heartbeatTimeout <= 0 {
 		heartbeatTimeout = defaultHeartbeatTimeout
 	}
@@ -43,13 +47,16 @@ func NewISRManager(fsm *fsm.BrokerFSM, brokerID string, heartbeatTimeout time.Du
 		lastSeen[brokerID] = time.Now()
 	}
 
+	childCtx, cancel := context.WithCancel(ctx)
+
 	return &ISRManager{
 		fsm:              fsm,
 		brokerID:         brokerID,
 		applier:          applier,
 		lastSeen:         lastSeen,
 		heartbeatTimeout: heartbeatTimeout,
-		stopCh:           make(chan struct{}),
+		ctx:              childCtx,
+		cancel:           cancel,
 	}
 }
 
@@ -66,7 +73,7 @@ func (i *ISRManager) Start() {
 					i.UpdateHeartbeat(i.brokerID)
 					i.refreshAllISRs()
 					i.CleanStaleHeartbeats()
-				case <-i.stopCh:
+				case <-i.ctx.Done():
 					return
 				}
 			}
@@ -74,10 +81,11 @@ func (i *ISRManager) Start() {
 	})
 }
 
+// Stop cancels the ISR manager's context, shutting down the background goroutine.
 func (i *ISRManager) Stop() {
-	i.stopOnce.Do(func() {
-		close(i.stopCh)
-	})
+	if i.cancel != nil {
+		i.cancel()
+	}
 }
 
 func (i *ISRManager) refreshAllISRs() {
@@ -92,7 +100,11 @@ func (i *ISRManager) refreshAllISRs() {
 			continue
 		}
 		topic := key[:idx]
-		partition, _ := strconv.Atoi(key[idx+1:])
+		partition, err := strconv.Atoi(key[idx+1:])
+		if err != nil {
+			util.Warn("ISRManager: skipping invalid partition key: %s", key)
+			continue
+		}
 
 		i.ComputeISR(topic, partition)
 	}
@@ -210,7 +222,7 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 			newMetadata.ISR = currentISR
 
 			if !leaderAlive && len(currentISR) > 0 {
-				// Elect new leader from ISR
+				sort.Strings(currentISR)
 				newMetadata.Leader = currentISR[0]
 				newMetadata.LeaderEpoch++
 				util.Info("ISRManager: Failover for %s: %s -> %s", key, metadata.Leader, newMetadata.Leader)
@@ -238,7 +250,11 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 				}
 			}
 
-			data, _ := json.Marshal(newMetadata)
+			data, err := json.Marshal(newMetadata)
+		if err != nil {
+			util.Error("ISRManager: Failed to marshal metadata for %s: %v", key, err)
+			return currentISR
+		}
 			// The FSM expects PARTITION:<topic>-<partition>:<json>
 			// ApplyCommand(prefix, data) results in "prefix:data"
 			payload := []byte(fmt.Sprintf("%s:%s", key, string(data)))

@@ -4,12 +4,19 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
+
+// producerEntry tracks the last sequence number and activity time for a producer.
+type producerEntry struct {
+	lastSeq  uint64
+	lastSeen time.Time
+}
 
 // Partition handles messages for one shard of a topic.
 type Partition struct {
@@ -22,8 +29,9 @@ type Partition struct {
 	dh            types.StorageHandler
 	closed        bool
 	streamManager StreamManager
-	producerState sync.Map // map[string]uint64 (ProducerID -> LastSeqNum)
+	producerState sync.Map // map[string]*producerEntry
 	isIdempotent  bool
+	closeCh       chan struct{}
 }
 
 // NewPartition creates a partition instance.
@@ -37,6 +45,7 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		dh:            dh,
 		streamManager: sm,
 		newMessageCh:  make(chan struct{}, 1),
+		closeCh:       make(chan struct{}),
 	}
 
 	p.LEO.Store(initialOffset)
@@ -65,9 +74,10 @@ func (p *Partition) isDuplicate(msg *types.Message) bool {
 		return false
 	}
 
-	lastSeq, ok := p.producerState.Load(msg.ProducerID)
+	val, ok := p.producerState.Load(msg.ProducerID)
 	if ok {
-		if msg.SeqNum <= lastSeq.(uint64) {
+		entry := val.(*producerEntry)
+		if msg.SeqNum <= entry.lastSeq {
 			return true
 		}
 	}
@@ -76,7 +86,10 @@ func (p *Partition) isDuplicate(msg *types.Message) bool {
 
 func (p *Partition) updateProducerState(msg *types.Message) {
 	if msg.ProducerID != "" {
-		p.producerState.Store(msg.ProducerID, msg.SeqNum)
+		p.producerState.Store(msg.ProducerID, &producerEntry{
+			lastSeq:  msg.SeqNum,
+			lastSeen: time.Now(),
+		})
 	}
 }
 
@@ -259,6 +272,13 @@ func (p *Partition) SetHWM(hwm uint64) {
 	}
 }
 
+// GetHWM returns the high water mark in a thread-safe manner.
+func (p *Partition) GetHWM() uint64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.HWM
+}
+
 func (p *Partition) UpdateLEO(leo uint64) {
 	p.LEO.Store(leo)
 }
@@ -271,4 +291,32 @@ func (p *Partition) Close() {
 		return
 	}
 	p.closed = true
+	close(p.closeCh)
+}
+
+const producerStateTTL = 30 * time.Minute
+
+// cleanStaleProducers removes producer entries that have not been seen within the TTL.
+func (p *Partition) cleanStaleProducers() {
+	cutoff := time.Now().Add(-producerStateTTL)
+	p.producerState.Range(func(key, value any) bool {
+		if entry := value.(*producerEntry); entry.lastSeen.Before(cutoff) {
+			p.producerState.Delete(key)
+		}
+		return true
+	})
+}
+
+// runProducerCleanup periodically evicts stale producer state to bound memory usage.
+func (p *Partition) runProducerCleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			p.cleanStaleProducers()
+		case <-p.closeCh:
+			return
+		}
+	}
 }

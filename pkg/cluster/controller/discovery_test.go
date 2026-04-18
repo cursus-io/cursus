@@ -65,9 +65,10 @@ func (m *ComprehensiveMockRaftManager) GetFSM() *fsm.BrokerFSM {
 func (m *ComprehensiveMockRaftManager) ApplyCommand(prefix string, data []byte) error {
 	args := m.Called(prefix, data)
 	if args.Error(0) == nil {
-		if prefix == "REGISTER" {
+		switch prefix {
+		case "REGISTER":
 			m.mockFSM.Apply(&raft.Log{Data: append([]byte("REGISTER:"), data...), Index: 1})
-		} else if prefix == "DEREGISTER" {
+		case "DEREGISTER":
 			m.mockFSM.Apply(&raft.Log{Data: append([]byte("DEREGISTER:"), data...), Index: 2})
 		}
 	}
@@ -114,7 +115,7 @@ func (m *ComprehensiveMockRaftManager) ApplyResponse(prefix string, data []byte,
 
 func TestServiceDiscovery_RegisterDeregister(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
-	rm.mockFSM = fsm.NewBrokerFSM(nil, nil, nil)
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
 	sd := NewServiceDiscovery(rm, "node1", "localhost:9001")
 
 	t.Run("Register Success", func(t *testing.T) {
@@ -142,7 +143,7 @@ func TestServiceDiscovery_RegisterDeregister(t *testing.T) {
 
 func TestServiceDiscovery_NodeOperations(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
-	rm.mockFSM = fsm.NewBrokerFSM(nil, nil, nil)
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
 	sd := NewServiceDiscovery(rm, "node1", "localhost:9001")
 
 	t.Run("AddNode - Not Leader", func(t *testing.T) {
@@ -203,7 +204,7 @@ func TestServiceDiscovery_Heartbeat(t *testing.T) {
 
 func TestServiceDiscovery_DiscoverBrokers(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
-	rm.mockFSM = fsm.NewBrokerFSM(nil, nil, nil)
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
 	sd := NewServiceDiscovery(rm, "node1", "localhost:9001")
 
 	// Register two brokers directly in FSM
@@ -217,7 +218,7 @@ func TestServiceDiscovery_DiscoverBrokers(t *testing.T) {
 
 func TestServiceDiscovery_RemoveNode_NotLeader(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
-	rm.mockFSM = fsm.NewBrokerFSM(nil, nil, nil)
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
 	rm.isLeader = false
 	sd := NewServiceDiscovery(rm, "node1", "localhost:9001")
 

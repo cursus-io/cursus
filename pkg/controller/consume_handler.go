@@ -227,7 +227,7 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	ctx.Generation = cArgs.Generation
 	ctx.MemberID = cArgs.MemberID
 
-	_, p, err := ch.getTopicAndPartition(cArgs.TopicName, cArgs.PartitionID)
+	t, p, err := ch.getTopicAndPartition(cArgs.TopicName, cArgs.PartitionID)
 	if err != nil {
 		return err
 	}
@@ -241,7 +241,15 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	streamConn := stream.NewStreamConnection(conn, cArgs.TopicName, cArgs.PartitionID, cArgs.GroupName, actualOffset)
 	streamConn.SetBatchSize(cArgs.BatchSize)
 	streamConn.SetInterval(100 * time.Millisecond)
-	streamConn.SetCoordinator(ch.Coordinator)
+	if ch.Coordinator != nil {
+		streamConn.SetCommitter(ch.Coordinator)
+	}
+
+	// Pass partition's message signal for event-driven streaming
+	signalCh := t.NewMessageSignal(cArgs.PartitionID)
+	if signalCh != nil {
+		streamConn.SetNewMessageCh(signalCh)
+	}
 
 	readFn := func(offset uint64, max int) ([]types.Message, error) {
 		return p.ReadCommitted(offset, max)
@@ -268,7 +276,7 @@ func (ch *CommandHandler) validateConsumeSyntax(cmd, raw string) string {
 
 // checkLeaderOrRedirect checks if this broker is the leader and writes a redirect error if not.
 func (ch *CommandHandler) checkLeaderOrRedirect(conn net.Conn) error {
-	if !ch.Config.EnabledDistribution || ch.Cluster.Router == nil {
+	if !ch.Config.EnabledDistribution || ch.Cluster == nil || ch.Cluster.Router == nil {
 		return nil
 	}
 

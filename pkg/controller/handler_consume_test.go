@@ -1,6 +1,7 @@
 package controller_test
 
 import (
+	"context"
 	"net"
 	"strings"
 	"testing"
@@ -17,12 +18,12 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 	cfg := config.DefaultConfig()
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
-	_ = tm.CreateTopic("topic1", 1, false)
+	_ = tm.CreateTopic("topic1", 1, false, false)
 
 	p, _ := tm.GetTopic("topic1").GetPartition(0)
 	p.SetHWM(100)
 
-	coord := coordinator.NewCoordinator(cfg, &DummyPublisher{})
+	coord := coordinator.NewCoordinator(context.Background(), cfg, &DummyPublisher{})
 	_ = coord.RegisterGroup("topic1", "g1", 1)
 	memberID := "m1"
 	_, _ = coord.AddConsumer("g1", memberID)
@@ -35,8 +36,8 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 
 	t.Run("HandleConsumeCommand basic", func(t *testing.T) {
 		server, client := net.Pipe()
-		defer server.Close()
-		defer client.Close()
+		defer func() { _ = server.Close() }()
+		defer func() { _ = client.Close() }()
 
 		errCh := make(chan error, 1)
 		go func() {
@@ -51,7 +52,7 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 		_, err := client.Read(buf)
 		assert.NoError(t, err)
 
-		client.Close()
+		_ = client.Close()
 		err = <-errCh
 		if err != nil && !strings.Contains(err.Error(), "closed pipe") && !strings.Contains(err.Error(), "EOF") {
 			t.Errorf("HandleConsumeCommand failed: %v", err)
@@ -60,8 +61,8 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 
 	t.Run("HandleConsumeCommand topic pattern", func(t *testing.T) {
 		server, client := net.Pipe()
-		defer server.Close()
-		defer client.Close()
+		defer func() { _ = server.Close() }()
+		defer func() { _ = client.Close() }()
 
 		errCh := make(chan error, 1)
 		go func() {
@@ -75,7 +76,7 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 		_, err := client.Read(buf)
 		assert.NoError(t, err)
 
-		client.Close()
+		_ = client.Close()
 		err = <-errCh
 		if err != nil && !strings.Contains(err.Error(), "closed pipe") && !strings.Contains(err.Error(), "EOF") {
 			t.Errorf("HandleConsumeCommand failed: %v", err)
@@ -84,8 +85,8 @@ func TestCommandHandler_ConsumeFull(t *testing.T) {
 
 	t.Run("HandleConsumeCommand invalid topic", func(t *testing.T) {
 		server, client := net.Pipe()
-		defer server.Close()
-		defer client.Close()
+		defer func() { _ = server.Close() }()
+		defer func() { _ = client.Close() }()
 
 		cmd := "CONSUME topic=no-topic partition=0 offset=0 group=g1 member=" + memberID
 		_, err := ch.HandleConsumeCommand(server, cmd, ctx)

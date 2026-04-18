@@ -1,6 +1,7 @@
 package coordinator_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -9,7 +10,10 @@ import (
 
 func TestCoordinator_Register_Add_Remove(t *testing.T) {
 	cfg := &config.Config{ConsumerSessionTimeoutMS: 30000, ConsumerHeartbeatCheckMS: 5000}
-	c := coordinator.NewCoordinator(cfg, &coordinator.DummyPublisher{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := coordinator.NewCoordinator(ctx, cfg, &coordinator.DummyPublisher{})
+	defer c.Stop()
 
 	err := c.RegisterGroup("orders", "groupA", 3)
 	if err != nil {

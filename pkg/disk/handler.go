@@ -224,10 +224,7 @@ func countMessagesInFile(filePath string) (int, error) {
 }
 
 func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.Message) (uint64, error) {
-	d.mu.Lock()
-	offset := d.AbsoluteOffset
-	d.AbsoluteOffset++
-	d.mu.Unlock()
+	offset := atomic.AddUint64(&d.AbsoluteOffset, 1) - 1
 
 	msg.Offset = offset
 	if err := d.WriteDirect(topic, partition, *msg); err != nil {
@@ -238,10 +235,7 @@ func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.
 
 // AppendMessage sends a message to the internal write channel for asynchronous disk persistence.
 func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Message) (uint64, error) {
-	d.mu.Lock()
-	offset := d.AbsoluteOffset
-	d.AbsoluteOffset++
-	d.mu.Unlock()
+	offset := atomic.AddUint64(&d.AbsoluteOffset, 1) - 1
 
 	msg.Offset = offset
 	diskMsg := types.DiskMessage{

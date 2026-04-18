@@ -43,7 +43,7 @@ func TestClusterServer_Join(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	addr := ln.Addr().String()
 
@@ -52,7 +52,7 @@ func TestClusterServer_Join(t *testing.T) {
 
 		conn, err := net.Dial("tcp", addr)
 		assert.NoError(t, err)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		payload := `{"node_id":"node1","address":"127.0.0.1:9001"}`
 		msg := util.EncodeMessage("cluster", "JOIN_CLUSTER "+payload)
@@ -75,7 +75,7 @@ func TestClusterServer_Join(t *testing.T) {
 
 		conn, err := net.Dial("tcp", addr)
 		assert.NoError(t, err)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		payload := `{"node_id":"node2","address":"127.0.0.1:9002"}`
 		msg := util.EncodeMessage("cluster", "JOIN_CLUSTER "+payload)
@@ -101,7 +101,7 @@ func TestClusterServer_Heartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	addr := ln.Addr().String()
 
@@ -109,7 +109,7 @@ func TestClusterServer_Heartbeat(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	assert.NoError(t, err)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	payload := `{"node_id":"node-hb"}`
 	msg := util.EncodeMessage("cluster", "HEARTBEAT_CLUSTER "+payload)
@@ -130,7 +130,7 @@ func TestClusterServer_List(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	addr := ln.Addr().String()
 
@@ -138,7 +138,7 @@ func TestClusterServer_List(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	assert.NoError(t, err)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	msg := util.EncodeMessage("cluster", "LIST_CLUSTER")
 	err = util.WriteWithLength(conn, msg)

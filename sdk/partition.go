@@ -169,8 +169,14 @@ func (pc *PartitionConsumer) pollAndProcess() {
 		return
 	}
 
-	if pc.handleBrokerError(batchData) || len(batchData) == 0 {
+	if pc.handleBrokerError(batchData) {
 		pc.waitWithBackoff(bo)
+		return
+	}
+
+	// Empty data is a keepalive signal from the broker; reset backoff.
+	if len(batchData) == 0 {
+		bo.reset()
 		return
 	}
 
@@ -291,10 +297,15 @@ func (pc *PartitionConsumer) startStreamLoop() {
 				break
 			}
 
-			if len(batchData) == 0 || pc.handleBrokerError(batchData) {
+			if pc.handleBrokerError(batchData) {
 				if !pc.waitWithBackoff(bo) {
 					return
 				}
+				continue
+			}
+
+			// Empty data is a keepalive signal from the broker; continue without backoff.
+			if len(batchData) == 0 {
 				continue
 			}
 

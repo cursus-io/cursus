@@ -16,8 +16,11 @@ import (
 	"github.com/cursus-io/cursus/util"
 )
 
-// todo. consider an LRU cache(match) to prevent potential memory bloat.
-var regexCache sync.Map
+var (
+	regexMu      sync.RWMutex
+	regexCache   = make(map[string]*regexp.Regexp)
+	maxCacheSize = 1024
+)
 
 // handleHelp processes HELP command
 func (ch *CommandHandler) handleHelp() string {
@@ -36,6 +39,11 @@ FETCH_OFFSET topic=<name> partition=<N> group=<name> - fetch committed offset
 REGISTER_GROUP topic=<name> group=<name> - register consumer group
 GROUP_STATUS group=<name> - get group status
 DESCRIBE topic=<name> - get topic/partition metadata (leader, ISR, offsets)
+APPEND_STREAM topic=<name> key=<aggregate_key> version=<N> event_type=<type> message=<payload> - append event to stream
+READ_STREAM topic=<name> key=<aggregate_key> [from_version=<N>] - read events from stream (binary response)
+SAVE_SNAPSHOT topic=<name> key=<aggregate_key> version=<N> message=<json_payload> - save aggregate snapshot
+READ_SNAPSHOT topic=<name> key=<aggregate_key> - read latest snapshot
+STREAM_VERSION topic=<name> key=<aggregate_key> - get current stream version
 HELP - show this help
 EXIT - exit`
 }
@@ -62,6 +70,11 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 		idempotent = strings.ToLower(idempStr) == "true"
 	}
 
+	eventSourcing := false
+	if esStr, ok := args["event_sourcing"]; ok {
+		eventSourcing = strings.ToLower(esStr) == "true"
+	}
+
 	replicationFactor := ch.Config.DefaultReplicationFactor
 	if rfStr, ok := args["replication_factor"]; ok {
 		n, err := strconv.Atoi(rfStr)
@@ -72,7 +85,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 	}
 
 	tm := ch.TopicManager
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -81,6 +94,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			"name":               topicName,
 			"partitions":         partitions,
 			"idempotent":         idempotent,
+			"event_sourcing":     eventSourcing,
 			"replication_factor": replicationFactor,
 		}
 		_, err := ch.applyAndWait("TOPIC", payload)
@@ -88,7 +102,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			return fmt.Sprintf("❌ Failed to create topic: %v", err)
 		}
 	} else {
-		if err := tm.CreateTopic(topicName, partitions, idempotent); err != nil {
+		if err := tm.CreateTopic(topicName, partitions, idempotent, eventSourcing); err != nil {
 			return fmt.Sprintf("ERROR: failed to create topic '%s': %v", topicName, err)
 		}
 	}
@@ -115,7 +129,7 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 		return "missing topic parameter. Expected: DELETE topic=<name>"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -139,7 +153,7 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 
 // handleList processes LIST command
 func (ch *CommandHandler) handleList() string {
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isLeaderAndForward("LIST"); forwarded {
 			return resp
 		}
@@ -155,7 +169,7 @@ func (ch *CommandHandler) handleList() string {
 
 // handleListCluster processes LIST_CLUSTER command
 func (ch *CommandHandler) handleListCluster() string {
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		fsm := ch.Cluster.RaftManager.GetFSM()
 		if fsm == nil {
 			return "ERROR: FSM not available"
@@ -183,7 +197,7 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string) string {
 		return "REGISTER_GROUP requires group parameter"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.Router != nil {
+	if ch.hasRouter() {
 		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
 			return resp
 		}
@@ -232,7 +246,7 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 	consumerID = fmt.Sprintf("%s-%s", consumerID, randSuffix)
 
 	var assignments []int
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
 			return resp
 		}
@@ -303,7 +317,7 @@ func (ch *CommandHandler) handleSyncGroup(cmd string) string {
 		return "coordinator not available"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
 			return resp
 		}
@@ -336,7 +350,7 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 		return "LEAVE_GROUP requires member parameter"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
 			return resp
 		}
@@ -385,7 +399,7 @@ func (ch *CommandHandler) handleFetchOffset(cmd string) string {
 		return "FETCH_OFFSET requires group parameter"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
 			return resp
 		}
@@ -430,7 +444,7 @@ func (ch *CommandHandler) handleGroupStatus(cmd string) string {
 		return "coordinator not available"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
 			return resp
 		}
@@ -468,7 +482,7 @@ func (ch *CommandHandler) handleHeartbeat(cmd string) string {
 		return "HEARTBEAT requires member parameter"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
 			return resp
 		}
@@ -518,7 +532,7 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 		return "invalid offset"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupID, cmd); forwarded {
 			return resp
 		}
@@ -570,7 +584,7 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 	memberID := args["member"]
 	generation, _ := strconv.Atoi(args["generation"])
 
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupID, cmd); forwarded {
 			return resp
 		}
@@ -596,7 +610,8 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 			continue
 		}
 
-		p, err := strconv.Atoi(kv[0])
+		partStr := strings.TrimPrefix(kv[0], "P")
+		p, err := strconv.Atoi(partStr)
 		if err != nil {
 			util.Warn("Invalid partition in batch commit: %s", kv[0])
 			continue
@@ -607,7 +622,7 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 			continue
 		}
 
-		if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+		if ch.isDistributed() {
 			if !ch.isAuthorizedForPartition(topicName, p) {
 				util.Warn("Unauthorized batch commit attempt for %s:%d", topicName, p)
 				continue
@@ -627,7 +642,7 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 		return "ERROR: no_valid_offsets"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		batchCommitData := map[string]interface{}{
 			"type":    "BATCH_COMMIT",
 			"group":   groupID,
@@ -693,10 +708,12 @@ func isTopicMatched(pattern, topicName string) bool {
 }
 
 func match(p, t string) bool {
-	if val, ok := regexCache.Load(p); ok {
-		if cachedRe, ok := val.(*regexp.Regexp); ok {
-			return cachedRe.MatchString(t)
-		}
+	regexMu.RLock()
+	cachedRe, ok := regexCache[p]
+	regexMu.RUnlock()
+
+	if ok {
+		return cachedRe.MatchString(t)
 	}
 
 	escaped := regexp.QuoteMeta(p)
@@ -709,7 +726,13 @@ func match(p, t string) bool {
 		return false
 	}
 
-	regexCache.Store(p, newRe)
+	regexMu.Lock()
+	if len(regexCache) >= maxCacheSize {
+		regexCache = make(map[string]*regexp.Regexp)
+	}
+	regexCache[p] = newRe
+	regexMu.Unlock()
+
 	return newRe.MatchString(t)
 }
 
@@ -721,7 +744,7 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 		return "missing topic parameter. Expected: DESCRIBE topic=<name>"
 	}
 
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
@@ -751,7 +774,7 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 	}
 
 	var raftLeader string
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		raftLeader = ch.Cluster.RaftManager.GetLeaderAddress()
 	}
 
@@ -759,10 +782,10 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 		pm := PartitionMetadata{
 			ID:  p.ID(),
 			LEO: p.NextOffset(),
-			HWM: p.HWM,
+			HWM: p.GetHWM(),
 		}
 
-		if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+		if ch.isDistributed() {
 			if fsmObj := ch.Cluster.RaftManager.GetFSM(); fsmObj != nil {
 				partitionKey := fmt.Sprintf("%s-%d", topicName, p.ID())
 				if partMeta := fsmObj.GetPartitionMetadata(partitionKey); partMeta != nil {

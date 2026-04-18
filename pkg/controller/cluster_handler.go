@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -11,6 +12,29 @@ import (
 )
 
 const DefaultFSMApplyTimeout = 5 * time.Second
+
+func backoffDelay(attempt int, base time.Duration) time.Duration {
+	if attempt > 30 {
+		attempt = 30
+	}
+	delay := base * time.Duration(1<<uint(attempt))
+	if delay > 5*time.Second {
+		delay = 5 * time.Second
+	}
+	// Add jitter: ±25%
+	jitter := time.Duration(rand.Int63n(int64(delay)/2)) - delay/4
+	return delay + jitter
+}
+
+// isDistributed returns true if the broker is running in distributed cluster mode.
+func (ch *CommandHandler) isDistributed() bool {
+	return ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil
+}
+
+// hasRouter returns true if distributed mode is enabled with a working router.
+func (ch *CommandHandler) hasRouter() bool {
+	return ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.Router != nil
+}
 
 func (ch *CommandHandler) ProcessCommand(cmd string) string {
 	ctx := NewClientContext("default-group", 0)
@@ -26,14 +50,11 @@ func (ch *CommandHandler) isAuthorizedForPartition(topic string, partition int) 
 
 // isLeaderAndForward checks if the current node is the cluster leader
 func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
-	if !ch.Config.EnabledDistribution || ch.Cluster == nil || ch.Cluster.RaftManager == nil {
+	if !ch.isDistributed() {
 		return "", false, nil
 	}
 
-	const (
-		maxRetries = 5
-		retryDelay = 500 * time.Millisecond
-	)
+	const maxRetries = 5
 
 	for i := 0; i < maxRetries; i++ {
 		if ch.Cluster.RaftManager.GetLeaderAddress() != "" {
@@ -43,7 +64,7 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 			return "ERROR: no Raft leader elected after retries", true, fmt.Errorf("no leader elected")
 		}
 		util.Debug("Waiting for Raft leader to be elected... (attempt %d/%d)", i+1, maxRetries)
-		time.Sleep(retryDelay)
+		time.Sleep(backoffDelay(i, 100*time.Millisecond))
 	}
 
 	if !ch.Cluster.RaftManager.IsLeader() {
@@ -60,7 +81,9 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 			}
 			lastErr = err
 			util.Debug("Retrying forward to leader (Target Leader %s)... attempt %d: %v", ch.Cluster.RaftManager.GetLeaderAddress(), i+1, err)
-			time.Sleep(retryDelay)
+			if i < maxRetries-1 {
+				time.Sleep(backoffDelay(i, 100*time.Millisecond))
+			}
 		}
 		leaderAddr := ch.Cluster.RaftManager.GetLeaderAddress()
 		return fmt.Sprintf("ERROR: failed to forward command to leader (Leader: %s, Error: %v)", leaderAddr, lastErr), true, nil
@@ -69,14 +92,11 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 }
 
 func (ch *CommandHandler) isCoordinatorAndForward(groupName, cmd string) (string, bool, error) {
-	if !ch.Config.EnabledDistribution || ch.Cluster == nil || ch.Cluster.Router == nil {
+	if !ch.hasRouter() {
 		return "", false, nil
 	}
 
-	const (
-		maxRetries = 3
-		retryDelay = 200 * time.Millisecond
-	)
+	const maxRetries = 3
 
 	encodedCmd := util.EncodeMessage("", cmd)
 	var lastErr error
@@ -91,14 +111,14 @@ func (ch *CommandHandler) isCoordinatorAndForward(groupName, cmd string) (string
 		} else {
 			lastErr = err
 		}
-		time.Sleep(retryDelay)
+		time.Sleep(backoffDelay(i, 100*time.Millisecond))
 	}
 
 	return fmt.Sprintf("ERROR: failed to forward command to coordinator for group %s: %v", groupName, lastErr), true, nil
 }
 
 func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition int, cmd string) (string, bool, error) {
-	if !ch.Config.EnabledDistribution || ch.Cluster == nil || ch.Cluster.Router == nil {
+	if !ch.hasRouter() {
 		return "", false, nil
 	}
 
@@ -107,10 +127,7 @@ func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition in
 		return "", false, nil
 	}
 
-	const (
-		maxRetries = 3
-		retryDelay = 200 * time.Millisecond
-	)
+	const maxRetries = 3
 
 	encodedCmd := util.EncodeMessage("", cmd)
 	var lastErr error
@@ -124,7 +141,7 @@ func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition in
 		} else {
 			lastErr = err
 		}
-		time.Sleep(retryDelay)
+		time.Sleep(backoffDelay(i, 100*time.Millisecond))
 	}
 
 	return fmt.Sprintf("ERROR: failed to forward command to partition leader for %s:%d: %v", topic, partition, lastErr), true, nil

@@ -134,6 +134,37 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 		if _, err := buf.Write(payloadBytes); err != nil {
 			return nil, fmt.Errorf("write payload bytes failed: %w", err)
 		}
+
+		// Event sourcing fields
+		eventTypeBytes := []byte(m.EventType)
+		if len(eventTypeBytes) > 0xFFFF {
+			return nil, fmt.Errorf("eventType too long: %d bytes", len(eventTypeBytes))
+		}
+		if err := write(uint16(len(eventTypeBytes))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(eventTypeBytes); err != nil {
+			return nil, err
+		}
+
+		if err := write(m.SchemaVersion); err != nil {
+			return nil, err
+		}
+
+		if err := write(m.AggregateVersion); err != nil {
+			return nil, err
+		}
+
+		metadataBytes := []byte(m.Metadata)
+		if len(metadataBytes) > 0xFFFF {
+			return nil, fmt.Errorf("metadata too long: %d bytes", len(metadataBytes))
+		}
+		if err := write(uint16(len(metadataBytes))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(metadataBytes); err != nil {
+			return nil, err
+		}
 	}
 
 	return buf.Bytes(), nil
@@ -255,6 +286,35 @@ func DecodeBatchMessages(data []byte) (*types.Batch, error) {
 			return nil, fmt.Errorf("failed to read message[%d] payload bytes: %w", i, err)
 		}
 		m.Payload = string(payloadBytes)
+
+		// Event sourcing fields
+		var eventTypeLen uint16
+		if err := binary.Read(reader, binary.BigEndian, &eventTypeLen); err != nil {
+			return nil, fmt.Errorf("failed to read message[%d] event type length: %w", i, err)
+		}
+		eventTypeBytes := make([]byte, eventTypeLen)
+		if _, err := io.ReadFull(reader, eventTypeBytes); err != nil {
+			return nil, fmt.Errorf("failed to read message[%d] event type: %w", i, err)
+		}
+		m.EventType = string(eventTypeBytes)
+
+		if err := binary.Read(reader, binary.BigEndian, &m.SchemaVersion); err != nil {
+			return nil, fmt.Errorf("failed to read message[%d] schema version: %w", i, err)
+		}
+
+		if err := binary.Read(reader, binary.BigEndian, &m.AggregateVersion); err != nil {
+			return nil, fmt.Errorf("failed to read message[%d] aggregate version: %w", i, err)
+		}
+
+		var metadataLen uint16
+		if err := binary.Read(reader, binary.BigEndian, &metadataLen); err != nil {
+			return nil, fmt.Errorf("failed to read message[%d] metadata length: %w", i, err)
+		}
+		metadataBytes := make([]byte, metadataLen)
+		if _, err := io.ReadFull(reader, metadataBytes); err != nil {
+			return nil, fmt.Errorf("failed to read message[%d] metadata: %w", i, err)
+		}
+		m.Metadata = string(metadataBytes)
 
 		batch.Messages = append(batch.Messages, m)
 	}

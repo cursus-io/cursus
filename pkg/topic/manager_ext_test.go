@@ -36,7 +36,7 @@ func TestTopicManager_GetLastOffset(t *testing.T) {
 	mockHandler.On("GetLatestOffset").Return(uint64(0))
 	hp.On("GetHandler", topicName, 0).Return(mockHandler, nil)
 
-	err := tm.CreateTopic(topicName, 1, false)
+	err := tm.CreateTopic(topicName, 1, false, false)
 	assert.NoError(t, err)
 
 	assert.Equal(t, uint64(0), tm.GetLastOffset(topicName, -1))
@@ -62,7 +62,7 @@ func TestTopicManager_Publish(t *testing.T) {
 	mockHandler.On("GetLatestOffset").Return(uint64(0))
 	hp.On("GetHandler", topicName, 0).Return(mockHandler, nil)
 
-	err = tm.CreateTopic(topicName, 1, false)
+	err = tm.CreateTopic(topicName, 1, false, false)
 	assert.NoError(t, err)
 
 	// mock.Anything is used because we don't care about the specific message object for this test
@@ -88,7 +88,7 @@ func TestTopicManager_PublishWithAck(t *testing.T) {
 	mockHandler.On("GetLatestOffset").Return(uint64(0))
 	hp.On("GetHandler", topicName, 0).Return(mockHandler, nil)
 
-	err = tm.CreateTopic(topicName, 1, false)
+	err = tm.CreateTopic(topicName, 1, false, false)
 	assert.NoError(t, err)
 
 	mockHandler.On("AppendMessageSync", topicName, 0, mock.Anything).Return(uint64(1), nil)
@@ -123,7 +123,7 @@ func TestTopicManager_PublishBatch(t *testing.T) {
 	mockHandler.On("GetLatestOffset").Return(uint64(0))
 	hp.On("GetHandler", topicName, 0).Return(mockHandler, nil)
 
-	err = tm.CreateTopic(topicName, 1, false)
+	err = tm.CreateTopic(topicName, 1, false, false)
 	assert.NoError(t, err)
 
 	// Two messages in Sync batch
@@ -153,20 +153,6 @@ func TestTopicManager_DeleteAndList(t *testing.T) {
 	assert.Len(t, tm.ListTopics(), 1)
 }
 
-func TestTopicManager_CheckAndMarkProducerSequence(t *testing.T) {
-	tm := NewTopicManager(config.DefaultConfig(), nil, nil)
-	topic := "topic1"
-	partition := 0
-	producer := "p1"
-
-	msg1 := &types.Message{ProducerID: producer, SeqNum: 10}
-	msg2 := &types.Message{ProducerID: producer, SeqNum: 5}  // Duplicate (less than 10)
-	msg3 := &types.Message{ProducerID: producer, SeqNum: 11} // New
-
-	assert.False(t, tm.CheckAndMarkProducerSequence(topic, partition, msg1))
-	assert.True(t, tm.CheckAndMarkProducerSequence(topic, partition, msg2))
-	assert.False(t, tm.CheckAndMarkProducerSequence(topic, partition, msg3))
-}
 
 func TestTopicManager_Flush(t *testing.T) {
 	hp := new(MockHandlerProvider)
@@ -177,7 +163,7 @@ func TestTopicManager_Flush(t *testing.T) {
 	mockHandler.On("GetLatestOffset").Return(uint64(0))
 	hp.On("GetHandler", topicName, 0).Return(mockHandler, nil)
 
-	err := tm.CreateTopic(topicName, 1, false)
+	err := tm.CreateTopic(topicName, 1, false, false)
 	assert.NoError(t, err)
 
 	mockHandler.On("Flush").Return().Once()

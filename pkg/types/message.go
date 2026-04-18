@@ -11,13 +11,18 @@ type Message struct {
 	Key        string // optional: partition routing key
 	Epoch      int64
 
+	EventType        string
+	SchemaVersion    uint32
+	AggregateVersion uint64
+	Metadata         string
+
 	RetryCount int
 	Retry      bool
 }
 
 func (m Message) String() string {
-	return fmt.Sprintf("Message { ID: %s-%d, Payload:%s, Offset:%d, Key:%s, Epoch:%d, RetryCount:%d }",
-		m.ProducerID, m.SeqNum, m.Payload, m.Offset, m.Key, m.Epoch, m.RetryCount)
+	return fmt.Sprintf("Message { ID: %s-%d, Payload:%s, Offset:%d, Key:%s, Epoch:%d, RetryCount:%d, EventType:%s, AggregateVersion:%d }",
+		m.ProducerID, m.SeqNum, m.Payload, m.Offset, m.Key, m.Epoch, m.RetryCount, m.EventType, m.AggregateVersion)
 }
 
 type Batch struct {
@@ -39,6 +44,11 @@ type DiskMessage struct {
 	SeqNum     uint64
 	Epoch      int64
 	Payload    string
+
+	EventType        string
+	SchemaVersion    uint32
+	AggregateVersion uint64
+	Metadata         string
 }
 
 // AppendResult represents the result of appending a message to storage

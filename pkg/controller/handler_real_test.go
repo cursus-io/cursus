@@ -114,7 +114,9 @@ func TestCommandHandler_GroupCommands(t *testing.T) {
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
 	ctx := controller.NewClientContext("test-group", 0)
 
-	_ = tm.CreateTopic("topic1", 1, false)
+	if err := tm.CreateTopic("topic1", 1, false, false); err != nil {
+		t.Fatalf("CreateTopic failed: %v", err)
+	}
 
 	commands := []struct {
 		cmd    string

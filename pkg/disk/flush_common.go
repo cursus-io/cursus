@@ -1,8 +1,10 @@
 package disk
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -357,14 +359,30 @@ func (d *DiskHandler) rotateSegment(nextBaseOffset uint64) error {
 	return d.openIndexFiles()
 }
 
+// openSegment opens or creates the current segment file for writing.
+func (d *DiskHandler) openSegment() error {
+	flags := os.O_CREATE | os.O_RDWR | os.O_APPEND
+	filePath := d.GetSegmentPath(d.CurrentSegment)
+
+	f, err := os.OpenFile(filePath, flags, 0644)
+	if err != nil {
+		return err
+	}
+	d.file = f
+	d.writer = bufio.NewWriter(f)
+	return nil
+}
+
 // Flush forces all pending data to be written and synced to disk.
 func (d *DiskHandler) Flush() {
-	pendingLen := len(d.writeCh)
-	batch := make([]types.DiskMessage, 0, pendingLen)
+	batch := make([]types.DiskMessage, 0, d.batchSize)
 
-	for range len(d.writeCh) {
+	for len(batch) < d.batchSize {
 		select {
-		case msg := <-d.writeCh:
+		case msg, ok := <-d.writeCh:
+			if !ok {
+				goto perform_write
+			}
 			batch = append(batch, msg)
 		default:
 			goto perform_write
@@ -377,7 +395,6 @@ perform_write:
 			util.Error("Flush write failed: %v", err)
 			return
 		}
-		return
 	}
 
 	d.ioMu.Lock()

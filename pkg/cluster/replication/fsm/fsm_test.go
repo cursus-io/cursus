@@ -45,7 +45,7 @@ func (m *MockHandlerProvider) GetHandler(topic string, partitionID int) (types.S
 
 func newTestFSM() *BrokerFSM {
 	tm := topic.NewTopicManager(config.DefaultConfig(), &MockHandlerProvider{}, nil)
-	fsm := NewBrokerFSM(nil, tm, nil)
+	fsm := NewBrokerFSM(tm, nil)
 
 	if fsm.brokers == nil {
 		fsm.brokers = make(map[string]*BrokerInfo)
@@ -273,7 +273,7 @@ func TestBrokerFSM_SequenceScope_Partition(t *testing.T) {
 	fsm := newTestFSM()
 	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{PartitionCount: 2, Idempotent: true}
 	fsm.partitionMetadata["t1-1"] = &PartitionMetadata{PartitionCount: 2, Idempotent: true}
-	if err := fsm.tm.CreateTopic("t1", 2, true); err != nil {
+	if err := fsm.tm.CreateTopic("t1", 2, true, false); err != nil {
 		t.Fatalf("CreateTopic failed: %v", err)
 	}
 

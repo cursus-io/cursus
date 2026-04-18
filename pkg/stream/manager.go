@@ -62,11 +62,15 @@ func (sm *StreamManager) monitorConnection(key string, stream *StreamConnection)
 	for {
 		select {
 		case <-stream.stopCh:
+			sm.mu.Lock()
+			delete(sm.streams, key)
+			sm.mu.Unlock()
 			stream.closeConn()
 			return
 		case <-ticker.C:
 			if time.Since(stream.LastActive()) > sm.timeout {
 				sm.RemoveStream(key)
+				stream.closeConn()
 				return
 			}
 		}

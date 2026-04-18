@@ -77,7 +77,7 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 
 		var err error
 		clusterClient := client.TCPClusterClient{}
-		rm, err := replication.NewRaftReplicationManager(cfg, raftServerID, dm, tm, cd, clusterClient)
+		rm, err := replication.NewRaftReplicationManager(ctx, cfg, raftServerID, tm, cd, clusterClient)
 		if err != nil {
 			return fmt.Errorf("failed to create raft replication manager: %w", err)
 		}
@@ -221,11 +221,6 @@ func initializeConnection(cfg *config.Config, tm *topic.TopicManager, cd *coordi
 }
 
 func readMessage(conn net.Conn, compressionType string) ([]byte, error) {
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		util.Error("⚠️ SetReadDeadline error: %v", err)
-		return nil, err
-	}
-
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(conn, lenBuf); err != nil {
 		if err != io.EOF {
@@ -299,6 +294,11 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 }
 
 func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler, ctx *controller.ClientContext, conn net.Conn) (bool, error) {
+	if strings.HasPrefix(strings.ToUpper(payload), "READ_STREAM ") {
+		cmdHandler.ESHandler.HandleReadStream(payload, conn)
+		return false, nil
+	}
+
 	resp := cmdHandler.HandleCommand(payload, ctx)
 	if resp == controller.STREAM_DATA_SIGNAL {
 		if strings.HasPrefix(strings.ToUpper(payload), "STREAM ") {
@@ -339,7 +339,8 @@ func isBatchMessage(data []byte) bool {
 func isCommand(s string) bool {
 	keywords := []string{"CREATE", "DELETE", "LIST", "LIST_CLUSTER", "PUBLISH", "CONSUME", "STREAM", "HELP",
 		"HEARTBEAT", "JOIN_GROUP", "LEAVE_GROUP", "COMMIT_OFFSET", "BATCH_COMMIT", "REGISTER_GROUP",
-		"GROUP_STATUS", "FETCH_OFFSET", "LIST_GROUPS", "SYNC_GROUP", "DESCRIBE"}
+		"GROUP_STATUS", "FETCH_OFFSET", "LIST_GROUPS", "SYNC_GROUP", "DESCRIBE",
+		"APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT", "READ_SNAPSHOT", "STREAM_VERSION"}
 	for _, k := range keywords {
 		if strings.HasPrefix(strings.ToUpper(s), k) {
 			return true

@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -15,13 +16,12 @@ type Coordinator struct {
 	groups map[string]*GroupMetadata // All consumer groups
 	mu     sync.RWMutex              // Global lock for coordinator state
 	cfg    *config.Config            // Configuration reference
-	stopCh chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	topicHandler              TopicHandler
 	offsetTopic               string
 	offsetTopicPartitionCount int
-
-	offsets map[string]map[string]map[int]uint64 // group -> topic -> partition -> offset
 
 	// ensure only the active GroupCoordinator handles session expiration.
 	leaderChecker func() bool
@@ -29,16 +29,18 @@ type Coordinator struct {
 
 type TopicHandler interface {
 	Publish(topic string, msg *types.Message) error
-	CreateTopic(topic string, partitionCount int, idempotent bool) error
+	CreateTopic(topic string, partitionCount int, idempotent bool, eventSourcing bool) error
 }
 
 // GroupMetadata holds metadata for a single consumer group.
 type GroupMetadata struct {
+	mu            sync.RWMutex               // Per-group lock for offset operations
 	TopicName     string                     // Topic this group consumes
 	Members       map[string]*MemberMetadata // Active members
 	Generation    int                        // Current generation (unused but reserved)
 	Partitions    []int                      // All partitions of the topic
 	LastRebalance time.Time                  // Timestamp of last rebalance
+	Offsets       map[string]map[int]uint64  // topic -> partition -> offset
 }
 
 // MemberMetadata holds state for a single consumer instance.
@@ -87,22 +89,25 @@ type BulkOffsetMsg struct {
 }
 
 // NewCoordinator creates a new Coordinator instance.
-func NewCoordinator(cfg *config.Config, handler TopicHandler) *Coordinator {
+// The provided ctx controls the lifetime of background goroutines (e.g., heartbeat monitor).
+func NewCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandler) *Coordinator {
 	if handler == nil {
 		util.Fatal("Coordinator requires a non-nil TopicHandler")
 	}
 
+	childCtx, cancel := context.WithCancel(ctx)
+
 	c := &Coordinator{
 		groups:                    make(map[string]*GroupMetadata),
 		cfg:                       cfg,
-		stopCh:                    make(chan struct{}),
+		ctx:                       childCtx,
+		cancel:                    cancel,
 		topicHandler:              handler,
 		offsetTopic:               "__consumer_offsets",
 		offsetTopicPartitionCount: 4, // init. dynamic
-		offsets:                   make(map[string]map[string]map[int]uint64),
 	}
 
-	if err := handler.CreateTopic(c.offsetTopic, c.offsetTopicPartitionCount, false); err != nil {
+	if err := handler.CreateTopic(c.offsetTopic, c.offsetTopicPartitionCount, false, false); err != nil {
 		util.Error("Coordinator: failed to create offset topic '%s': %v", c.offsetTopic, err)
 	}
 	return c
@@ -119,9 +124,9 @@ func (c *Coordinator) Start() {
 	go c.monitorHeartbeats()
 }
 
-// Stop launches background monitoring processes (graceful shutdown)
+// Stop cancels the coordinator context, shutting down all background goroutines.
 func (c *Coordinator) Stop() {
-	close(c.stopCh)
+	c.cancel()
 }
 
 // GetAssignments returns the current partition assignments for each group member.
@@ -250,13 +255,32 @@ func contains(slice []int, item int) bool {
 	return false
 }
 
-func (c *Coordinator) getOffsetSafe(group, topic string, partition int) (uint64, bool) {
-	if topics, ok := c.offsets[group]; ok {
-		if partitions, ok := topics[topic]; ok {
-			if offset, ok := partitions[partition]; ok {
-				return offset, true
-			}
+// getGroupSafe returns the GroupMetadata for the given name under the global read lock.
+func (c *Coordinator) getGroupSafe(name string) *GroupMetadata {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.groups[name]
+}
+
+// getOffsetSafe reads an offset from the group's per-group offset map.
+// GUARDED_BY(gm.mu) — caller must hold at least gm.mu.RLock.
+func (gm *GroupMetadata) getOffsetSafe(topic string, partition int) (uint64, bool) {
+	if partitions, ok := gm.Offsets[topic]; ok {
+		if offset, ok := partitions[partition]; ok {
+			return offset, true
 		}
 	}
 	return 0, false
+}
+
+// storeOffset writes an offset into the group's per-group offset map.
+// GUARDED_BY(gm.mu) — caller must hold gm.mu.Lock (exclusive).
+func (gm *GroupMetadata) storeOffset(topic string, partition int, offset uint64) {
+	if gm.Offsets == nil {
+		gm.Offsets = make(map[string]map[int]uint64)
+	}
+	if _, ok := gm.Offsets[topic]; !ok {
+		gm.Offsets[topic] = make(map[int]uint64)
+	}
+	gm.Offsets[topic][partition] = offset
 }
