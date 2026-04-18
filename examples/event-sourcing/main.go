@@ -1,173 +1,174 @@
 package main
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net"
 	"os"
-	"strings"
+
+	"github.com/cursus-io/cursus/sdk"
 )
 
-const brokerAddr = "localhost:9000"
+
+type OrderCreated struct {
+	OrderID  string `json:"order_id"`
+	Customer string `json:"customer"`
+}
+
+type ItemAdded struct {
+	SKU   string  `json:"sku"`
+	Name  string  `json:"name"`
+	Qty   int     `json:"qty"`
+	Price float64 `json:"price"`
+}
+
+type OrderShipped struct {
+	Carrier  string `json:"carrier"`
+	Tracking string `json:"tracking"`
+}
+
+type PartialRefund struct {
+	SKU    string  `json:"sku"`
+	Amount float64 `json:"amount"`
+	Reason string  `json:"reason"`
+}
+
+// --- Order Aggregate (for snapshot) ---
+
+type Order struct {
+	ID       string            `json:"id"`
+	Customer string            `json:"customer"`
+	Items    map[string]Item   `json:"items"`
+	Total    float64           `json:"total"`
+	Status   string            `json:"status"`
+	Tracking string            `json:"tracking,omitempty"`
+}
+
+type Item struct {
+	Name  string  `json:"name"`
+	Qty   int     `json:"qty"`
+	Price float64 `json:"price"`
+}
+
+func toJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
 
 func main() {
-	conn, err := net.Dial("tcp", brokerAddr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect to broker at %s: %v\n", brokerAddr, err)
-		os.Exit(1)
+	addr := "localhost:9000"
+	if len(os.Args) > 1 {
+		addr = os.Args[1]
 	}
-	defer func() { _ = conn.Close() }()
 
-	fmt.Println("=== Cursus Event Sourcing Example ===")
-	fmt.Printf("Connected to broker at %s\n\n", brokerAddr)
+	store := sdk.NewEventStore(addr, "orders", "order-service")
+	defer func() { _ = store.Close() }()
 
-	fmt.Println("--- Step 1: Create event-sourcing topic ---")
-	resp := sendCommand(conn, "", "CREATE topic=orders partitions=4 event_sourcing=true")
-	fmt.Printf("Response: %s\n\n", resp)
-
-	fmt.Println("--- Step 2: Append first event (OrderCreated) ---")
-	orderID := "order-12345"
-	eventPayload := `{"order_id":"order-12345","customer":"alice","items":[{"sku":"WIDGET-1","qty":2}],"total":49.98}`
-
-	cmd := fmt.Sprintf(
-		"APPEND_STREAM topic=orders key=%s version=1 event_type=OrderCreated message=%s",
-		orderID, eventPayload,
-	)
-	resp = sendCommand(conn, "", cmd)
-	fmt.Printf("Response: %s\n\n", resp)
-
-	fmt.Println("--- Step 3: Append second event (ItemAdded) ---")
-
-	eventPayload2 := `{"sku":"GADGET-7","qty":1,"price":19.99}`
-	cmd = fmt.Sprintf(
-		"APPEND_STREAM topic=orders key=%s version=2 event_type=ItemAdded message=%s",
-		orderID, eventPayload2,
-	)
-	resp = sendCommand(conn, "", cmd)
-	fmt.Printf("Response: %s\n\n", resp)
-
-	fmt.Println("--- Step 4: Append third event (OrderShipped) ---")
-	eventPayload3 := `{"tracking_number":"TRK-98765","carrier":"FedEx"}`
-	cmd = fmt.Sprintf(
-		"APPEND_STREAM topic=orders key=%s version=3 event_type=OrderShipped message=%s",
-		orderID, eventPayload3,
-	)
-	resp = sendCommand(conn, "", cmd)
-	fmt.Printf("Response: %s\n\n", resp)
-
-	fmt.Println("--- Step 5: Check stream version ---")
-	cmd = fmt.Sprintf("STREAM_VERSION topic=orders key=%s", orderID)
-	resp = sendCommand(conn, "", cmd)
-	fmt.Printf("Current version of '%s': %s\n\n", orderID, resp)
-
-	fmt.Println("--- Step 6: Demonstrate version conflict ---")
-	fmt.Println("Attempting to append with stale version=2 (current is 3)...")
-
-	conflictPayload := `{"note":"this should fail"}`
-	cmd = fmt.Sprintf(
-		"APPEND_STREAM topic=orders key=%s version=2 event_type=StaleEvent message=%s",
-		orderID, conflictPayload,
-	)
-	resp = sendCommand(conn, "", cmd)
-	fmt.Printf("Response (expected error): %s\n\n", resp)
-
-	fmt.Println("--- Step 7: Save a snapshot at version 3 ---")
-	snapshotPayload := `{"order_id":"order-12345","customer":"alice","items":[{"sku":"WIDGET-1","qty":2},{"sku":"GADGET-7","qty":1}],"total":69.97,"status":"shipped","tracking":"TRK-98765"}`
-	cmd = fmt.Sprintf(
-		"SAVE_SNAPSHOT topic=orders key=%s version=3 message=%s",
-		orderID, snapshotPayload,
-	)
-	resp = sendCommand(conn, "", cmd)
-	fmt.Printf("Response: %s\n\n", resp)
-
-	fmt.Println("--- Step 8: Read snapshot ---")
-	cmd = fmt.Sprintf("READ_SNAPSHOT topic=orders key=%s", orderID)
-	resp = sendCommand(conn, "", cmd)
-	prettyPrintJSON("Snapshot", resp)
+	fmt.Println("=== Order Aggregate — Event Sourcing Example ===")
 	fmt.Println()
 
-	fmt.Println("--- Step 9: Append events after snapshot ---")
-	eventPayload4 := `{"refund_amount":19.99,"reason":"defective item"}`
-	cmd = fmt.Sprintf(
-		"APPEND_STREAM topic=orders key=%s version=4 event_type=PartialRefund message=%s",
-		orderID, eventPayload4,
-	)
-	resp = sendCommand(conn, "", cmd)
-	fmt.Printf("Response: %s\n\n", resp)
-
-	eventPayload5 := `{"new_total":49.98}`
-	cmd = fmt.Sprintf(
-		"APPEND_STREAM topic=orders key=%s version=5 event_type=TotalRecalculated message=%s",
-		orderID, eventPayload5,
-	)
-	resp = sendCommand(conn, "", cmd)
-	fmt.Printf("Response: %s\n\n", resp)
-
-	fmt.Println("--- Step 10: Verify final stream version ---")
-	cmd = fmt.Sprintf("STREAM_VERSION topic=orders key=%s", orderID)
-	resp = sendCommand(conn, "", cmd)
-	fmt.Printf("Final version of '%s': %s\n\n", orderID, resp)
-
-	fmt.Println("=== Example Complete ===")
-}
-
-// sendCommand sends a text command to the broker using length-prefixed framing
-// with the topic+payload envelope, then reads and returns the response.
-//
-// Framing: [4-byte BE length][body]
-// Body (topic envelope): [topicLen:2][topic][payload]
-//
-// If topic is empty, topicLen is 0 and the body is just [0x00 0x00][payload].
-func sendCommand(conn net.Conn, topicName, command string) string {
-	// [topicLen:2][topic][command]
-	topicBytes := []byte(topicName)
-	cmdBytes := []byte(command)
-	bodyLen := 2 + len(topicBytes) + len(cmdBytes)
-
-	body := make([]byte, bodyLen)
-	binary.BigEndian.PutUint16(body[0:2], uint16(len(topicBytes)))
-	copy(body[2:], topicBytes)
-	copy(body[2+len(topicBytes):], cmdBytes)
-
-	// Write length prefix + body.
-	frame := make([]byte, 4+bodyLen)
-	binary.BigEndian.PutUint32(frame[0:4], uint32(bodyLen))
-	copy(frame[4:], body)
-
-	if _, err := conn.Write(frame); err != nil {
-		log.Fatalf("Failed to send command: %v", err)
+	// 1. Create topic
+	if err := store.CreateTopic(4); err != nil {
+		log.Fatalf("CreateTopic: %v", err)
 	}
+	fmt.Println("[Topic] 'orders' created (4 partitions, event_sourcing=true)")
+	fmt.Println()
 
-	// Read response: [4-byte BE length][response body]
-	var respLen uint32
-	if err := binary.Read(conn, binary.BigEndian, &respLen); err != nil {
-		log.Fatalf("Failed to read response length: %v", err)
-	}
+	orderID := "order-1001"
 
-	respBody := make([]byte, respLen)
-	if _, err := io.ReadFull(conn, respBody); err != nil {
-		log.Fatalf("Failed to read response body: %v", err)
-	}
-
-	return string(respBody)
-}
-
-// prettyPrintJSON attempts to format a JSON string with indentation.
-// If the input is not valid JSON, it prints the raw string.
-func prettyPrintJSON(label, s string) {
-	s = strings.TrimSpace(s)
-	var obj interface{}
-	if err := json.Unmarshal([]byte(s), &obj); err != nil {
-		fmt.Printf("%s: %s\n", label, s)
-		return
-	}
-	pretty, err := json.MarshalIndent(obj, "  ", "  ")
+	// 2. Create order
+	fmt.Println("[Command] CreateOrder")
+	r, err := store.Append(orderID, 1, &sdk.Event{
+		Type: "OrderCreated",
+		Payload: toJSON(OrderCreated{
+			OrderID:  orderID,
+			Customer: "Alice Kim",
+		}),
+	})
 	if err != nil {
-		fmt.Printf("%s: %s\n", label, s)
-		return
+		log.Fatalf("  failed: %v", err)
 	}
-	fmt.Printf("%s:\n  %s\n", label, string(pretty))
+	fmt.Printf("  -> version=%d offset=%d\n\n", r.Version, r.Offset)
+
+	// 3. Add items
+	fmt.Println("[Command] AddItem (Mechanical Keyboard)")
+	r, _ = store.Append(orderID, 2, &sdk.Event{
+		Type: "ItemAdded",
+		Payload: toJSON(ItemAdded{SKU: "KB-MX01", Name: "Mechanical Keyboard", Qty: 1, Price: 89.99}),
+	})
+	fmt.Printf("  -> version=%d\n", r.Version)
+
+	fmt.Println("[Command] AddItem (USB-C Cable x3)")
+	r, _ = store.Append(orderID, 3, &sdk.Event{
+		Type: "ItemAdded",
+		Payload: toJSON(ItemAdded{SKU: "CBL-UC3", Name: "USB-C Cable", Qty: 3, Price: 9.99}),
+	})
+	fmt.Printf("  -> version=%d\n\n", r.Version)
+
+	// 4. Check version
+	ver, _ := store.StreamVersion(orderID)
+	fmt.Printf("[Query] StreamVersion = %d\n\n", ver)
+
+	// 5. Version conflict demo
+	fmt.Println("[Command] AddItem with stale version (expecting conflict)")
+	_, err = store.Append(orderID, 2, &sdk.Event{
+		Type:    "ItemAdded",
+		Payload: toJSON(ItemAdded{SKU: "STALE", Name: "Should Fail", Qty: 1, Price: 0}),
+	})
+	fmt.Printf("  -> expected error: %v\n\n", err)
+
+	// 6. Ship order
+	fmt.Println("[Command] ShipOrder")
+	r, _ = store.Append(orderID, 4, &sdk.Event{
+		Type: "OrderShipped",
+		Payload: toJSON(OrderShipped{Carrier: "FedEx", Tracking: "TRK-98765"}),
+	})
+	fmt.Printf("  -> version=%d\n\n", r.Version)
+
+	// 7. Save snapshot (aggregate state at version 4)
+	fmt.Println("[Snapshot] Saving aggregate state at version 4")
+	snapshot := Order{
+		ID:       orderID,
+		Customer: "Alice Kim",
+		Items: map[string]Item{
+			"KB-MX01": {Name: "Mechanical Keyboard", Qty: 1, Price: 89.99},
+			"CBL-UC3": {Name: "USB-C Cable", Qty: 3, Price: 9.99},
+		},
+		Total:    119.96,
+		Status:   "shipped",
+		Tracking: "TRK-98765",
+	}
+	if err := store.SaveSnapshot(orderID, 4, toJSON(snapshot)); err != nil {
+		log.Fatalf("  failed: %v", err)
+	}
+	fmt.Println("  -> saved")
+	fmt.Println()
+
+	// 8. Read snapshot back
+	fmt.Println("[Query] ReadSnapshot")
+	snap, _ := store.ReadSnapshot(orderID)
+	if snap != nil {
+		var order Order
+		_ = json.Unmarshal([]byte(snap.Payload), &order)
+		fmt.Printf("  version  : %d\n", snap.Version)
+		fmt.Printf("  customer : %s\n", order.Customer)
+		fmt.Printf("  items    : %d\n", len(order.Items))
+		fmt.Printf("  total    : $%.2f\n", order.Total)
+		fmt.Printf("  status   : %s\n", order.Status)
+	}
+	fmt.Println()
+
+	// 9. Append after snapshot
+	fmt.Println("[Command] PartialRefund")
+	r, _ = store.Append(orderID, 5, &sdk.Event{
+		Type: "PartialRefund",
+		Payload: toJSON(PartialRefund{SKU: "CBL-UC3", Amount: 9.99, Reason: "defective"}),
+	})
+	fmt.Printf("  -> version=%d\n\n", r.Version)
+
+	// 10. Final state
+	finalVer, _ := store.StreamVersion(orderID)
+	fmt.Printf("[Result] Order '%s' — %d events, snapshot at v4, current v%d\n", orderID, finalVer, finalVer)
+	fmt.Println()
+	fmt.Println("=== Example Complete ===")
 }

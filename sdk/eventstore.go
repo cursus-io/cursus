@@ -137,7 +137,7 @@ func (es *EventStore) Append(key string, expectedVersion uint64, event *Event) (
 		sv = 1
 	}
 
-	cmd := fmt.Sprintf("APPEND_STREAM topic=%s key=%s expected_version=%d event_type=%s schema_version=%d producerId=%s",
+	cmd := fmt.Sprintf("APPEND_STREAM topic=%s key=%s version=%d event_type=%s schema_version=%d producerId=%s",
 		es.topic, key, expectedVersion, event.Type, sv, es.producerID)
 	if event.Metadata != "" {
 		cmd += fmt.Sprintf(" metadata=%s", event.Metadata)
