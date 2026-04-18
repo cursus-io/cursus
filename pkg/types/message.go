@@ -11,6 +11,11 @@ type Message struct {
 	Key        string // optional: partition routing key
 	Epoch      int64
 
+	EventType        string
+	SchemaVersion    uint32
+	AggregateVersion uint64
+	Metadata         string
+
 	RetryCount int
 	Retry      bool
 }
@@ -39,6 +44,11 @@ type DiskMessage struct {
 	SeqNum     uint64
 	Epoch      int64
 	Payload    string
+
+	EventType        string
+	SchemaVersion    uint32
+	AggregateVersion uint64
+	Metadata         string
 }
 
 // AppendResult represents the result of appending a message to storage

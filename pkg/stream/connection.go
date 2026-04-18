@@ -5,10 +5,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
+
+// OffsetCommitter abstracts offset commit operations to break the
+// circular dependency between stream and coordinator packages.
+type OffsetCommitter interface {
+	CommitOffset(group, topic string, partition int, offset uint64) error
+}
 
 type StreamConnection struct {
 	conn      net.Conn
@@ -23,10 +28,12 @@ type StreamConnection struct {
 	stopCh   chan struct{}
 	stopOnce sync.Once
 
-	batchSize int
-	interval  time.Duration
+	batchSize         int
+	interval          time.Duration
+	keepaliveInterval time.Duration
+	newMessageCh      <-chan struct{} // signal from partition when new messages arrive
 
-	coordinator *coordinator.Coordinator
+	committer OffsetCommitter
 }
 
 // NewStreamConnection creates a new stream connection
@@ -39,8 +46,9 @@ func NewStreamConnection(conn net.Conn, topic string, partition int, group strin
 		offset:     offset,
 		lastActive: time.Now(),
 		stopCh:     make(chan struct{}),
-		batchSize:  10,
-		interval:   100 * time.Millisecond,
+		batchSize:         10,
+		interval:          100 * time.Millisecond,
+		keepaliveInterval: 5 * time.Second,
 	}
 	return sc
 }
@@ -57,10 +65,22 @@ func (sc *StreamConnection) SetInterval(interval time.Duration) {
 	sc.interval = interval
 }
 
-func (sc *StreamConnection) SetCoordinator(coord *coordinator.Coordinator) {
+func (sc *StreamConnection) SetCommitter(c OffsetCommitter) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	sc.coordinator = coord
+	sc.committer = c
+}
+
+func (sc *StreamConnection) SetKeepaliveInterval(d time.Duration) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.keepaliveInterval = d
+}
+
+func (sc *StreamConnection) SetNewMessageCh(ch <-chan struct{}) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.newMessageCh = ch
 }
 
 func (sc *StreamConnection) Run(
@@ -68,71 +88,100 @@ func (sc *StreamConnection) Run(
 	commitInterval time.Duration,
 ) {
 	defer func() {
-		if sc.coordinator != nil {
-			_ = sc.coordinator.CommitOffset(sc.group, sc.topic, sc.partition, sc.Offset())
+		if sc.committer != nil {
+			_ = sc.committer.CommitOffset(sc.group, sc.topic, sc.partition, sc.Offset())
 		}
 	}()
 
-	ticker := time.NewTicker(sc.interval)
+	pollTicker := time.NewTicker(sc.interval)
 	commitTicker := time.NewTicker(commitInterval)
-	defer ticker.Stop()
+	keepaliveTicker := time.NewTicker(sc.keepaliveInterval)
+	defer pollTicker.Stop()
 	defer commitTicker.Stop()
+	defer keepaliveTicker.Stop()
+
+	// sendMessages reads and sends available messages. Returns false on fatal error.
+	sendMessages := func() bool {
+		sc.mu.RLock()
+		conn := sc.conn
+		bs := sc.batchSize
+		sc.mu.RUnlock()
+
+		if conn == nil {
+			return false
+		}
+
+		currentOffset := sc.Offset()
+		msgs, err := readFn(currentOffset, bs)
+		if err != nil {
+			util.Error("Stream read error for %s/%d: %v", sc.topic, sc.partition, err)
+			return false
+		}
+
+		if len(msgs) == 0 {
+			return true
+		}
+
+		// Offset gap detection
+		firstOffset := msgs[0].Offset
+		if currentOffset > 0 && firstOffset > currentOffset {
+			util.Warn("Stream %s/%d: offset gap detected, expected %d but got %d (missing %d messages)",
+				sc.topic, sc.partition, currentOffset, firstOffset, firstOffset-currentOffset)
+		}
+
+		batchData, err := util.EncodeBatchMessages(sc.topic, sc.partition, "1", false, msgs)
+		if err != nil {
+			util.Error("Failed to encode batch messages: %v", err)
+			return false
+		}
+
+		if err := util.WriteWithLength(conn, batchData); err != nil {
+			util.Debug("Batch write error in stream: %v", err)
+			sc.closeConn()
+			return false
+		}
+
+		lastOffset := msgs[len(msgs)-1].Offset
+		sc.SetOffset(lastOffset + 1)
+		sc.SetLastActive(time.Now())
+		return true
+	}
 
 	for {
 		select {
 		case <-sc.stopCh:
 			return
+
 		case <-commitTicker.C:
-			if sc.coordinator != nil {
-				_ = sc.coordinator.CommitOffset(sc.group, sc.topic, sc.partition, sc.Offset())
-				util.Debug("Periodically committed offset %d for %s/%d", sc.Offset(), sc.topic, sc.partition)
+			if sc.committer != nil {
+				_ = sc.committer.CommitOffset(sc.group, sc.topic, sc.partition, sc.Offset())
 			}
-		case <-ticker.C:
-			sc.mu.Lock()
-			conn := sc.conn
-			if conn == nil {
-				sc.mu.Unlock()
-				util.Debug("Stream connection closed, stopping stream for %s partition %d", sc.topic, sc.partition)
-				return
-			}
-			sc.mu.Unlock()
-			msgs, err := readFn(sc.Offset(), sc.batchSize)
-			if err != nil {
-				util.Error("Stream read error for %s/%d: %v", sc.topic, sc.partition, err)
+
+		case <-sc.newMessageCh:
+			if !sendMessages() {
 				sc.Stop()
 				return
 			}
 
-			if len(msgs) == 0 {
+		case <-pollTicker.C:
+			if !sendMessages() {
+				sc.Stop()
+				return
+			}
+
+		case <-keepaliveTicker.C:
+			sc.mu.RLock()
+			conn := sc.conn
+			sc.mu.RUnlock()
+			if conn != nil {
 				if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
-					util.Debug("Keepalive write error in stream: %v", err)
+					util.Debug("Keepalive write error: %v", err)
 					sc.closeConn()
 					sc.Stop()
 					return
 				}
 				sc.SetLastActive(time.Now())
-				continue
 			}
-
-			batchData, err := util.EncodeBatchMessages(sc.topic, sc.partition, "1", false, msgs)
-			if err != nil {
-				util.Error("Failed to encode batch messages: %v", err)
-				sc.Stop()
-				return
-			}
-
-			if err := util.WriteWithLength(conn, batchData); err != nil {
-				util.Debug("Batch write error in stream, closing connection: %v", err)
-				sc.closeConn()
-				sc.Stop()
-				return
-			}
-
-			lastOffset := msgs[len(msgs)-1].Offset
-			sc.SetOffset(lastOffset + 1)
-			sc.SetLastActive(time.Now())
-
-			util.Debug("Stream sent batch of %d messages, new offset: %d", len(msgs), sc.Offset())
 		}
 	}
 }

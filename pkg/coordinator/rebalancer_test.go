@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
@@ -13,7 +14,7 @@ type DummyPublisher struct{}
 func (d *DummyPublisher) Publish(topic string, msg *types.Message) error {
 	return nil
 }
-func (d *DummyPublisher) CreateTopic(topic string, partitionCount int, idempotent bool) error {
+func (d *DummyPublisher) CreateTopic(topic string, partitionCount int, idempotent bool, eventSourcing bool) error {
 	return nil
 }
 
@@ -21,7 +22,7 @@ func TestRebalanceRange_AssignsPartitionsEvenly(t *testing.T) {
 	cfg := &config.Config{
 		ConsumerSessionTimeoutMS: 30000,
 	}
-	c := NewCoordinator(cfg, &DummyPublisher{})
+	c := NewCoordinator(context.Background(), cfg, &DummyPublisher{})
 
 	groupName := "group1"
 	partitionCount := 5
@@ -56,7 +57,7 @@ func TestRebalanceRange_AssignsPartitionsEvenly(t *testing.T) {
 
 func TestRebalanceRange_NoMembers(t *testing.T) {
 	cfg := &config.Config{}
-	c := NewCoordinator(cfg, &DummyPublisher{})
+	c := NewCoordinator(context.Background(), cfg, &DummyPublisher{})
 
 	groupName := "groupEmpty"
 	if err := c.RegisterGroup("topicX", groupName, 3); err != nil {
@@ -68,7 +69,7 @@ func TestRebalanceRange_NoMembers(t *testing.T) {
 
 func TestRebalanceRange_MoreMembersThanPartitions(t *testing.T) {
 	cfg := &config.Config{}
-	c := NewCoordinator(cfg, &DummyPublisher{})
+	c := NewCoordinator(context.Background(), cfg, &DummyPublisher{})
 
 	groupName := "group2"
 	if err := c.RegisterGroup("topicY", groupName, 2); err != nil {

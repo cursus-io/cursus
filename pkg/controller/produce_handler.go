@@ -116,8 +116,6 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 			return fmt.Sprintf("ERROR: PARTITION_NOT_FOUND %d", partition)
 		}
 
-		assignedOffset := p.ReserveOffsets(1)
-		msg.Offset = assignedOffset
 		effectiveIdempotent := isIdempotent || ch.Config.EnableIdempotence
 
 		scope := "global"
@@ -128,7 +126,6 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 			SequenceScope: scope,
 			Messages: []types.Message{
 				{
-					Offset:     assignedOffset,
 					Payload:    message,
 					ProducerID: producerID,
 					SeqNum:     seqNum,
@@ -138,10 +135,16 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 			Acks: acks,
 		}
 
-		// 1. Append locally
+		// Save HWM before enqueue so we can roll back on replication failure
+		prevHWM := p.GetHWM()
+
+		// 1. Append locally (EnqueueBatch assigns offsets and updates LEO/HWM internally)
 		if err := p.EnqueueBatch(messageData.Messages); err != nil {
 			return ch.errorResponse(fmt.Sprintf("failed to append locally: %v", err))
 		}
+
+		// Read the offset assigned by EnqueueBatch
+		assignedOffset := messageData.Messages[0].Offset
 
 		// 2. Replicate to followers if acks != 0
 		if acksLower != "0" {
@@ -152,13 +155,11 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 
 			err = ch.Cluster.ReplicateToFollowers(topicName, partition, messageData, minISR)
 			if err != nil {
-				return ch.errorResponse(fmt.Sprintf("replication failed: %v", err))
+				// Roll back HWM so consumers don't see unreplicated messages
+				p.SetHWM(prevHWM)
+				return ch.errorResponse(fmt.Sprintf("replication failed (offset=%d): %v", assignedOffset, err))
 			}
 		}
-
-		// 3. Update HWM and LEO locally
-		p.SetHWM(assignedOffset + 1)
-		p.UpdateLEO(assignedOffset + 1)
 
 		ackResp = types.AckResponse{
 			Status:        "OK",
@@ -193,7 +194,7 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 	}
 
 Respond:
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if leader := ch.Cluster.RaftManager.GetLeaderAddress(); leader != "" {
 			ackResp.Leader = leader
 		}
@@ -230,13 +231,14 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 		return fmt.Sprintf("ERROR: partition %d not found", msgCmd.Partition)
 	}
 
+	// Guard against empty messages to prevent index-out-of-range panic
+	if len(msgCmd.Messages) == 0 {
+		return "ERROR: empty messages in replicate command"
+	}
+
 	if err := p.EnqueueBatch(msgCmd.Messages); err != nil {
 		return fmt.Sprintf("ERROR: enqueue failed: %v", err)
 	}
-
-	lastMsg := msgCmd.Messages[len(msgCmd.Messages)-1]
-	p.SetHWM(lastMsg.Offset + 1)
-	p.UpdateLEO(lastMsg.Offset + 1)
 
 	return "OK"
 }
@@ -308,19 +310,19 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 			return fmt.Sprintf("ERROR: PARTITION_NOT_FOUND %d", batch.Partition), nil
 		}
 
-		batchSize := len(batch.Messages)
-		startOffset := p.ReserveOffsets(batchSize)
-		for i := range batch.Messages {
-			batch.Messages[i].Offset = startOffset + uint64(i)
-		}
-
 		effectiveIdempotent := batch.IsIdempotent || ch.Config.EnableIdempotence
 		scope := "global"
 
-		// 1. Append locally
+		// Save HWM before enqueue so we can roll back on replication failure
+		prevHWM := p.GetHWM()
+
+		// 1. Append locally (EnqueueBatch assigns offsets and updates LEO/HWM internally)
 		if err := p.EnqueueBatch(batch.Messages); err != nil {
 			return ch.errorResponse(fmt.Sprintf("failed to append batch locally: %v", err)), nil
 		}
+
+		// Read offsets assigned by EnqueueBatch
+		lastOffset := batch.Messages[len(batch.Messages)-1].Offset
 
 		// 2. Replicate to followers if acks != 0
 		if acksLower != "0" {
@@ -340,14 +342,11 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 
 			err = ch.Cluster.ReplicateToFollowers(batch.Topic, batch.Partition, msgCmd, minISR)
 			if err != nil {
-				return ch.errorResponse(fmt.Sprintf("batch replication failed: %v", err)), nil
+				// Roll back HWM so consumers don't see unreplicated messages
+				p.SetHWM(prevHWM)
+				return ch.errorResponse(fmt.Sprintf("batch replication failed (offset=%d): %v", lastOffset, err)), nil
 			}
 		}
-
-		// 3. Update HWM and LEO locally
-		lastOffset := batch.Messages[len(batch.Messages)-1].Offset
-		p.SetHWM(lastOffset + 1)
-		p.UpdateLEO(lastOffset + 1)
 
 		respAck = types.AckResponse{
 			Status:        "OK",
@@ -389,7 +388,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 	}
 
 Respond:
-	if ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil {
+	if ch.isDistributed() {
 		if leader := ch.Cluster.RaftManager.GetLeaderAddress(); leader != "" {
 			respAck.Leader = leader
 		}

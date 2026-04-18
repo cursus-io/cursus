@@ -12,8 +12,8 @@ import (
 
 func TestStreamConnection_Basic(t *testing.T) {
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 
 	sc := NewStreamConnection(c1, "test-topic", 0, "test-group", 100)
 	assert.Equal(t, "test-topic", sc.Topic())
@@ -29,8 +29,8 @@ func TestStreamConnection_Basic(t *testing.T) {
 
 func TestStreamConnection_Run(t *testing.T) {
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 
 	sc := NewStreamConnection(c1, "t1", 0, "g1", 0)
 	sc.SetInterval(10 * time.Millisecond)
@@ -56,11 +56,12 @@ func TestStreamConnection_Run(t *testing.T) {
 
 func TestStreamConnection_Keepalive(t *testing.T) {
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 
 	sc := NewStreamConnection(c1, "t1", 0, "g1", 0)
 	sc.SetInterval(10 * time.Millisecond)
+	sc.SetKeepaliveInterval(100 * time.Millisecond)
 
 	readFn := func(offset uint64, max int) ([]types.Message, error) {
 		return []types.Message{}, nil // No messages -> should send keepalive

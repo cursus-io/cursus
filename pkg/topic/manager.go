@@ -2,6 +2,7 @@ package topic
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -28,7 +29,6 @@ type TopicManager struct {
 	cfg           *config.Config
 	StreamManager StreamManager
 	coordinator   *coordinator.Coordinator
-	producerState map[string]map[int]map[string]int64 // Topic -> Partition -> ProducerID -> LastSeq
 }
 
 // HandlerProvider defines an interface to provide disk handlers.
@@ -47,12 +47,11 @@ func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *
 		hp:            hp,
 		cfg:           cfg,
 		StreamManager: sm,
-		producerState: make(map[string]map[int]map[string]int64),
 	}
 	return tm
 }
 
-func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent bool) error {
+func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent bool, eventSourcing bool) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -63,7 +62,9 @@ func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent 
 			util.Error("cannot decrease partitions for topic '%s' (%d -> %d)", name, current, partitionCount)
 			return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", name, current, partitionCount)
 		case partitionCount > current:
-			existing.AddPartitions(partitionCount-current, tm.hp)
+			if err := existing.AddPartitions(partitionCount-current, tm.hp); err != nil {
+				return fmt.Errorf("failed to add partitions to topic '%s': %w", name, err)
+			}
 			util.Info("topic '%s' partitions increased: %d -> %d", name, current, len(existing.Partitions))
 			return nil
 		default:
@@ -72,7 +73,7 @@ func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent 
 		}
 	}
 
-	t, err := NewTopic(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager, idempotent)
+	t, err := NewTopic(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager, idempotent, eventSourcing)
 	if err != nil {
 		util.Error("failed to create topic '%s': %v", name, err)
 		return fmt.Errorf("failed to create topic '%s': %w", name, err)
@@ -91,7 +92,7 @@ func (tm *TopicManager) GetLastOffset(topicName string, partitionID int) uint64 
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 
-	t := tm.GetTopic(topicName)
+	t := tm.topics[topicName]
 	if t == nil {
 		return 0
 	}
@@ -143,15 +144,6 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 	for _, m := range messages {
 		msg := m
 
-		// Check and mark duplicate before routing.
-		// Moving this BEFORE the write prevents race conditions from concurrent retries.
-		if t.IsIdempotent && msg.ProducerID != "" && msg.SeqNum > 0 {
-			if isDup := tm.CheckAndMarkProducerSequence(topicName, -1, &msg); isDup {
-				util.Debug("tm: skipping duplicate message (Global) in batch from producer %s (seq %d)", msg.ProducerID, msg.SeqNum)
-				continue
-			}
-		}
-
 		partition = t.GetPartitionForMessage(msg)
 		if partition == -1 {
 			util.Debug("tm: skipping message for topic '%s' (no valid partition found)", topicName)
@@ -170,7 +162,6 @@ func (tm *TopicManager) processBatchMessages(topicName string, messages []types.
 		return err
 	}
 
-	// Sequence advancement moved BEFORE write for atomicity and race prevention.
 	return nil
 }
 
@@ -203,9 +194,9 @@ func (tm *TopicManager) executeBatch(t *Topic, partitioned map[int][]types.Messa
 			}
 		}(targetPartition, batch)
 	}
-	t.mu.RUnlock()
 
 	wg.Wait()
+	t.mu.RUnlock()
 	close(errCh)
 
 	var lastErr error
@@ -236,14 +227,6 @@ func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Mess
 		return fmt.Errorf("topic '%s' does not exist", topicName)
 	}
 
-	// Check and mark duplicate before write.
-	if t.IsIdempotent && msg.ProducerID != "" && msg.SeqNum > 0 {
-		if isDup := tm.CheckAndMarkProducerSequence(topicName, -1, msg); isDup {
-			util.Debug("tm: skipping duplicate message (Global) from producer %s (seq %d)", msg.ProducerID, msg.SeqNum)
-			return nil
-		}
-	}
-
 	if requireAck {
 		if err := t.PublishSync(*msg); err != nil {
 			return fmt.Errorf("sync publish failed: %w", err)
@@ -256,33 +239,6 @@ func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Mess
 	metrics.MessagesProcessed.Inc()
 	metrics.LatencyHist.Observe(elapsed)
 	return nil
-}
-
-// CheckAndMarkProducerSequence checks whether msg is a duplicate and records the new sequence if not.
-// This is an atomic operation to prevent race conditions in high-concurrency stress tests.
-func (tm *TopicManager) CheckAndMarkProducerSequence(topicName string, partition int, msg *types.Message) bool {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	// Ensure maps are initialized for this topic/partition
-	if _, ok := tm.producerState[topicName]; !ok {
-		tm.producerState[topicName] = make(map[int]map[string]int64)
-	}
-	if _, ok := tm.producerState[topicName][partition]; !ok {
-		tm.producerState[topicName][partition] = make(map[string]int64)
-	}
-
-	lastSeq, ok := tm.producerState[topicName][partition][msg.ProducerID]
-	if ok && int64(msg.SeqNum) <= lastSeq {
-		util.Debug("tm: [idempotency] DUPLICATE detected for topic=%s, partition=%d, producer=%s, seq=%d (lastSeq=%d)",
-			topicName, partition, msg.ProducerID, msg.SeqNum, lastSeq)
-		return true // Duplicate
-	}
-
-	tm.producerState[topicName][partition][msg.ProducerID] = int64(msg.SeqNum)
-	util.Debug("tm: [idempotency] UPDATED sequence for topic=%s, partition=%d, producer=%s, seq=%d (previous=%d, ok=%v)",
-		topicName, partition, msg.ProducerID, msg.SeqNum, lastSeq, ok)
-	return false // New message, state updated
 }
 
 func (tm *TopicManager) RegisterConsumerGroup(topicName, groupName string, consumerCount int) (*types.ConsumerGroup, error) {
@@ -332,7 +288,6 @@ func (tm *TopicManager) DeleteTopic(name string) bool {
 	defer tm.mu.Unlock()
 	if _, ok := tm.topics[name]; ok {
 		delete(tm.topics, name)
-		delete(tm.producerState, name)
 		return true
 	}
 	return false
@@ -346,6 +301,10 @@ func (tm *TopicManager) ListTopics() []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+func (tm *TopicManager) GetLogDir(topicName string, partitionID int) string {
+	return fmt.Sprintf("%s%c%s%cpartition_%d", tm.cfg.LogDir, os.PathSeparator, topicName, os.PathSeparator, partitionID)
 }
 
 func (tm *TopicManager) EnsureDefaultGroups() {

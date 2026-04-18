@@ -34,6 +34,7 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 		TopicName:  topicName,
 		Members:    make(map[string]*MemberMetadata),
 		Partitions: partitions,
+		Offsets:    make(map[string]map[int]uint64),
 	}
 	c.mu.Unlock()
 
@@ -132,7 +133,9 @@ func (c *Coordinator) rebalanceRange(groupName string) {
 			if end > pCount {
 				end = pCount
 			}
-			newAssignments = group.Partitions[partitionIdx:end]
+			// Copy the slice to avoid sharing the backing array with group.Partitions
+			newAssignments = make([]int, end-partitionIdx)
+			copy(newAssignments, group.Partitions[partitionIdx:end])
 		}
 
 		group.Members[memberID].Assignments = newAssignments

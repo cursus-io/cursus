@@ -172,6 +172,27 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 		return nil, err
 	}
 
+	eventTypeBytes := []byte(msg.EventType)
+	if err := binary.Write(&buf, binary.BigEndian, uint16(len(eventTypeBytes))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.Write(eventTypeBytes); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(&buf, binary.BigEndian, msg.SchemaVersion); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(&buf, binary.BigEndian, msg.AggregateVersion); err != nil {
+		return nil, err
+	}
+	metadataBytes := []byte(msg.Metadata)
+	if err := binary.Write(&buf, binary.BigEndian, uint16(len(metadataBytes))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.Write(metadataBytes); err != nil {
+		return nil, err
+	}
+
 	return buf.Bytes(), nil
 }
 
@@ -244,6 +265,32 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 		return msg, errors.New("data too short for payload")
 	}
 	msg.Payload = string(data[offset : offset+payloadLen])
+	offset += payloadLen
+
+	// Event sourcing fields (optional — backward compatible with old messages)
+	if offset+2 <= len(data) {
+		eventTypeLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+		if offset+eventTypeLen <= len(data) {
+			msg.EventType = string(data[offset : offset+eventTypeLen])
+			offset += eventTypeLen
+		}
+	}
+	if offset+4 <= len(data) {
+		msg.SchemaVersion = binary.BigEndian.Uint32(data[offset : offset+4])
+		offset += 4
+	}
+	if offset+8 <= len(data) {
+		msg.AggregateVersion = binary.BigEndian.Uint64(data[offset : offset+8])
+		offset += 8
+	}
+	if offset+2 <= len(data) {
+		metadataLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+		if offset+metadataLen <= len(data) {
+			msg.Metadata = string(data[offset : offset+metadataLen])
+		}
+	}
 
 	return msg, nil
 }

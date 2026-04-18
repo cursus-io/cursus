@@ -27,7 +27,7 @@ func TestTopic_Basic(t *testing.T) {
 		hp.On("GetHandler", topicName, i).Return(mh, nil)
 	}
 
-	topic, err := NewTopic(topicName, partitionCount, hp, cfg, sm, false)
+	topic, err := NewTopic(topicName, partitionCount, hp, cfg, sm, false, false)
 	assert.NoError(t, err)
 	assert.NotNil(t, topic)
 	assert.Equal(t, topicName, topic.Name)
@@ -56,16 +56,8 @@ func TestTopic_Basic(t *testing.T) {
 		g2 := topic.RegisterConsumerGroup(groupName, 5) // Existing
 		assert.Equal(t, 3, len(g2.Consumers))
 
-		err := topic.CommitOffset(groupName, 0, 100)
+		err := topic.DeregisterConsumerGroup(groupName)
 		assert.NoError(t, err)
-		off, ok := topic.GetCommittedOffset(groupName, 0)
-		assert.True(t, ok)
-		assert.Equal(t, uint64(100), off)
-
-		err = topic.DeregisterConsumerGroup(groupName)
-		assert.NoError(t, err)
-		_, ok = topic.GetCommittedOffset(groupName, 0)
-		assert.False(t, ok)
 
 		err = topic.DeregisterConsumerGroup("non-existent")
 		assert.Error(t, err)
@@ -76,7 +68,8 @@ func TestTopic_Basic(t *testing.T) {
 		mh.On("GetLatestOffset").Return(uint64(0))
 		hp.On("GetHandler", topicName, 2).Return(mh, nil)
 
-		topic.AddPartitions(1, hp)
+		err := topic.AddPartitions(1, hp)
+		assert.NoError(t, err)
 		assert.Equal(t, 3, len(topic.Partitions))
 	})
 

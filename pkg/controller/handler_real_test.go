@@ -114,7 +114,7 @@ func TestCommandHandler_GroupCommands(t *testing.T) {
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
 	ctx := controller.NewClientContext("test-group", 0)
 
-	_ = tm.CreateTopic("topic1", 1, false)
+	_ = tm.CreateTopic("topic1", 1, false, false)
 
 	commands := []struct {
 		cmd    string

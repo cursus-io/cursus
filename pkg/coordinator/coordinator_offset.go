@@ -13,21 +13,11 @@ func calculateOffsetPartitionCount(groupCount int) int {
 	return min(max(groupCount/10, 4), 50)
 }
 
-func (c *Coordinator) storeOffsetInMemory(group, topic string, partition int, offset uint64) {
-	if _, ok := c.offsets[group]; !ok {
-		c.offsets[group] = make(map[string]map[int]uint64)
-	}
-	if _, ok := c.offsets[group][topic]; !ok {
-		c.offsets[group][topic] = make(map[int]uint64)
-	}
-	c.offsets[group][topic][partition] = offset
-}
-
-func (c *Coordinator) CommitOffset(group, topic string, partition int, offset uint64) error {
-	util.Debug("Committing offset: group='%s', topic='%s', partition=%d, offset=%d", group, topic, partition, offset)
+func (c *Coordinator) CommitOffset(groupName, topic string, partition int, offset uint64) error {
+	util.Debug("Committing offset: group='%s', topic='%s', partition=%d, offset=%d", groupName, topic, partition, offset)
 
 	offsetMsg := OffsetCommitMessage{
-		Group:     group,
+		Group:     groupName,
 		Topic:     topic,
 		Partition: partition,
 		Offset:    offset,
@@ -42,24 +32,30 @@ func (c *Coordinator) CommitOffset(group, topic string, partition int, offset ui
 	if err := c.topicHandler.Publish(c.offsetTopic, &types.Message{
 		ProducerID: "broker",
 		Payload:    string(payload),
-		Key:        fmt.Sprintf("%s-%s-%d", group, topic, partition),
+		Key:        fmt.Sprintf("%s-%s-%d", groupName, topic, partition),
 	}); err != nil {
 		return err
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.storeOffsetInMemory(group, topic, partition, offset)
+	gm := c.getGroupSafe(groupName)
+	if gm == nil {
+		return fmt.Errorf("group '%s' not found", groupName)
+	}
+
+	gm.mu.Lock()
+	gm.storeOffset(topic, partition, offset)
+	gm.mu.Unlock()
+
 	return nil
 }
 
-func (c *Coordinator) CommitOffsetsBulk(group, topic string, offsets []OffsetItem) error {
+func (c *Coordinator) CommitOffsetsBulk(groupName, topic string, offsets []OffsetItem) error {
 	if len(offsets) == 0 {
 		return nil
 	}
 
 	bulkMsg := BulkOffsetMsg{
-		Group:     group,
+		Group:     groupName,
 		Topic:     topic,
 		Offsets:   offsets,
 		Timestamp: time.Now(),
@@ -73,47 +69,65 @@ func (c *Coordinator) CommitOffsetsBulk(group, topic string, offsets []OffsetIte
 	if err := c.topicHandler.Publish(c.offsetTopic, &types.Message{
 		ProducerID: "broker",
 		Payload:    string(payload),
-		Key:        fmt.Sprintf("%s-%s-bulk", group, topic),
+		Key:        fmt.Sprintf("%s-%s-bulk", groupName, topic),
 	}); err != nil {
 		return err
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for _, item := range offsets {
-		c.storeOffsetInMemory(group, topic, item.Partition, item.Offset)
+	gm := c.getGroupSafe(groupName)
+	if gm == nil {
+		return fmt.Errorf("group '%s' not found", groupName)
 	}
+
+	gm.mu.Lock()
+	for _, item := range offsets {
+		gm.storeOffset(topic, item.Partition, item.Offset)
+	}
+	gm.mu.Unlock()
 
 	return nil
 }
 
-func (c *Coordinator) ApplyOffsetUpdateFromFSM(group, topic string, offsets []OffsetItem) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if group == "" || topic == "" {
+func (c *Coordinator) ApplyOffsetUpdateFromFSM(groupName, topic string, offsets []OffsetItem) error {
+	if groupName == "" || topic == "" {
 		return fmt.Errorf("invalid group or topic name")
 	}
 
-	if _, ok := c.offsets[group]; !ok {
-		c.offsets[group] = make(map[string]map[int]uint64)
+	// FSM replay may arrive before RegisterGroup, so we need to get-or-create.
+	c.mu.Lock()
+	gm, ok := c.groups[groupName]
+	if !ok {
+		gm = &GroupMetadata{
+			Offsets: make(map[string]map[int]uint64),
+		}
+		c.groups[groupName] = gm
 	}
-	if _, ok := c.offsets[group][topic]; !ok {
-		c.offsets[group][topic] = make(map[int]uint64)
-	}
+	c.mu.Unlock()
 
-	for _, item := range offsets {
-		c.offsets[group][topic][item.Partition] = item.Offset
+	gm.mu.Lock()
+	if gm.Offsets == nil {
+		gm.Offsets = make(map[string]map[int]uint64)
 	}
+	if _, exists := gm.Offsets[topic]; !exists {
+		gm.Offsets[topic] = make(map[int]uint64)
+	}
+	for _, item := range offsets {
+		gm.Offsets[topic][item.Partition] = item.Offset
+	}
+	gm.mu.Unlock()
 
 	return nil
 }
 
-func (c *Coordinator) GetOffset(group, topic string, partition int) (uint64, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.getOffsetSafe(group, topic, partition)
+func (c *Coordinator) GetOffset(groupName, topic string, partition int) (uint64, bool) {
+	gm := c.getGroupSafe(groupName)
+	if gm == nil {
+		return 0, false
+	}
+
+	gm.mu.RLock()
+	defer gm.mu.RUnlock()
+	return gm.getOffsetSafe(topic, partition)
 }
 
 // updateOffsetPartitionCount updates the number of partitions for the internal offset topic.
@@ -134,7 +148,7 @@ func (c *Coordinator) updateOffsetPartitionCount() {
 	c.mu.Unlock()
 
 	go func() {
-		if err := c.topicHandler.CreateTopic(topicName, newCount, false); err != nil {
+		if err := c.topicHandler.CreateTopic(topicName, newCount, false, false); err != nil {
 			util.Error("Failed to scale offset topic '%s' to %d partitions: %v", topicName, newCount, err)
 			return
 		}
@@ -143,6 +157,7 @@ func (c *Coordinator) updateOffsetPartitionCount() {
 }
 
 func (c *Coordinator) ValidateAndCommit(groupName, topic string, partition int, offset uint64, generation int, memberID string) error {
+	// Validate membership under global lock (membership is managed globally)
 	c.mu.RLock()
 	group := c.groups[groupName]
 
@@ -160,6 +175,12 @@ func (c *Coordinator) ValidateAndCommit(groupName, topic string, partition int, 
 	}
 	c.mu.RUnlock()
 
+	// Store offset under per-group lock
+	group.mu.Lock()
+	prevOffset, hadPrev := group.getOffsetSafe(topic, partition)
+	group.storeOffset(topic, partition, offset)
+	group.mu.Unlock()
+
 	offsetMsg := OffsetCommitMessage{
 		Group:     groupName,
 		Topic:     topic,
@@ -170,6 +191,7 @@ func (c *Coordinator) ValidateAndCommit(groupName, topic string, partition int, 
 
 	payload, err := json.Marshal(offsetMsg)
 	if err != nil {
+		c.rollbackOffset(group, topic, partition, prevOffset, hadPrev)
 		return fmt.Errorf("failed to marshal offset: %w", err)
 	}
 
@@ -180,20 +202,21 @@ func (c *Coordinator) ValidateAndCommit(groupName, topic string, partition int, 
 	})
 
 	if err != nil {
+		c.rollbackOffset(group, topic, partition, prevOffset, hadPrev)
 		return fmt.Errorf("failed to publish offset: %w", err)
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	return nil
+}
 
-	g, ok := c.groups[groupName]
-	if ok && g.Generation == generation {
-		c.storeOffsetInMemory(groupName, topic, partition, offset)
-		return nil
+func (c *Coordinator) rollbackOffset(gm *GroupMetadata, topic string, partition int, prevOffset uint64, hadPrev bool) {
+	gm.mu.Lock()
+	defer gm.mu.Unlock()
+	if hadPrev {
+		gm.storeOffset(topic, partition, prevOffset)
+	} else if partitions, ok := gm.Offsets[topic]; ok {
+		delete(partitions, partition)
 	}
-
-	util.Warn("offset published but not stored in memory: Generation changed (%d -> %d) for group %s", generation, g.Generation, groupName)
-	return fmt.Errorf("generation changed during commit")
 }
 
 func (c *Coordinator) getGroupUnsafe(name string) *GroupMetadata {

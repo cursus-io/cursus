@@ -15,19 +15,51 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-type RaftManager interface {
+// LeaderChecker provides leadership status queries.
+type LeaderChecker interface {
 	IsLeader() bool
 	GetLeaderAddress() string
-	ApplyCommand(prefix string, data []byte) error
 	LeaderCh() <-chan bool
-	GetFSM() *fsm.BrokerFSM
-	GetConfiguration() raft.ConfigurationFuture
-	ReplicateWithQuorum(topic string, partition int, msg types.Message, minISR int, isIdempotent bool, sequenceScope string) (types.AckResponse, error)
-	ReplicateBatchWithQuorum(topic string, partition int, messages []types.Message, minISR int, acks string, isIdempotent bool, sequenceScope string) (types.AckResponse, error)
+}
+
+// CommandApplier applies commands to the Raft log.
+type CommandApplier interface {
+	ApplyCommand(prefix string, data []byte) error
 	ApplyResponse(prefix string, data []byte, timeout time.Duration) (types.AckResponse, error)
+}
+
+// MembershipManager handles cluster membership changes.
+type MembershipManager interface {
 	AddVoter(id string, addr string) error
 	RemoveServer(id string) error
+	GetConfiguration() raft.ConfigurationFuture
+}
+
+// FSMAccessor provides access to the finite state machine.
+type FSMAccessor interface {
+	GetFSM() *fsm.BrokerFSM
+}
+
+// Replicator handles message replication with quorum.
+type Replicator interface {
+	ReplicateWithQuorum(topic string, partition int, msg types.Message, minISR int, isIdempotent bool, sequenceScope string) (types.AckResponse, error)
+	ReplicateBatchWithQuorum(topic string, partition int, messages []types.Message, minISR int, acks string, isIdempotent bool, sequenceScope string) (types.AckResponse, error)
+}
+
+// ISRProvider provides access to the ISR manager.
+type ISRProvider interface {
 	GetISRManager() replication.ISRManagerInterface
+}
+
+// RaftManager is the composite interface for full Raft functionality.
+// Individual components should depend on the narrowest sub-interface they need.
+type RaftManager interface {
+	LeaderChecker
+	CommandApplier
+	MembershipManager
+	FSMAccessor
+	Replicator
+	ISRProvider
 }
 
 type ClusterController struct {

@@ -1,28 +1,12 @@
-//go:build windows
-// +build windows
+//go:build !linux
 
 package disk
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net"
-	"os"
 )
-
-func (d *DiskHandler) openSegment() error {
-	flags := os.O_CREATE | os.O_RDWR | os.O_APPEND
-	filePath := d.GetSegmentPath(d.CurrentSegment)
-
-	f, err := os.OpenFile(filePath, flags, 0644)
-	if err != nil {
-		return err
-	}
-	d.file = f
-	d.writer = bufio.NewWriter(f)
-	return nil
-}
 
 func (d *DiskHandler) SendCurrentSegmentToConn(conn net.Conn) (int, error) {
 	d.mu.Lock()

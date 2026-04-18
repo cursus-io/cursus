@@ -22,12 +22,13 @@ type Topic struct {
 	consumerGroups map[string]*types.ConsumerGroup
 	mu             sync.RWMutex
 	cfg            *config.Config
-	streamManager  StreamManager
-	IsIdempotent   bool
+	streamManager    StreamManager
+	IsIdempotent     bool
+	IsEventSourcing  bool
 }
 
 // NewTopic initializes a topic with partitions.
-func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager, idempotent bool) (*Topic, error) {
+func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager, idempotent bool, eventSourcing bool) (*Topic, error) {
 	partitions := make([]*Partition, partitionCount)
 	for i := 0; i < partitionCount; i++ {
 		dh, err := hp.GetHandler(name, i)
@@ -42,32 +43,43 @@ func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.C
 		Name:           name,
 		Partitions:     partitions,
 		consumerGroups: make(map[string]*types.ConsumerGroup),
-		cfg:            cfg,
-		streamManager:  sm,
-		IsIdempotent:   idempotent,
+		cfg:             cfg,
+		streamManager:   sm,
+		IsIdempotent:    idempotent,
+		IsEventSourcing: eventSourcing,
 	}, nil
 }
 
-func (t *Topic) GetPartitionForMessage(msg types.Message) int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	partitionsLen := uint64(len(t.Partitions))
+// getPartitionIndex computes the target partition index without acquiring any lock.
+// The caller must hold at least RLock and pass the current partition count.
+func (t *Topic) getPartitionIndex(msg types.Message, partitionsLen int) int {
 	if partitionsLen == 0 {
 		return -1
 	}
 
 	if msg.Key != "" {
 		keyID := util.GenerateID(msg.Key)
-		return int(keyID % partitionsLen)
+		return int(keyID % uint64(partitionsLen))
 	}
 
 	oldCounter := atomic.AddUint64(&t.counter, 1) - 1
-	return int(oldCounter % partitionsLen)
+	return int(oldCounter % uint64(partitionsLen))
+}
+
+// GetPartitionForMessage returns the partition index for a message.
+// This is intended for external callers (e.g. TopicManager). Internal publish
+// methods use getPartitionIndex under an already-held RLock to avoid TOCTOU races.
+func (t *Topic) GetPartitionForMessage(msg types.Message) int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.getPartitionIndex(msg, len(t.Partitions))
 }
 
 // AddPartitions extends the topic with new partitions.
-func (t *Topic) AddPartitions(extra int, hp HandlerProvider) {
+// Returns an error if any partition fails to initialize; partitions created
+// before the failure are kept.
+func (t *Topic) AddPartitions(extra int, hp HandlerProvider) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -75,13 +87,13 @@ func (t *Topic) AddPartitions(extra int, hp HandlerProvider) {
 		idx := len(t.Partitions)
 		dh, err := hp.GetHandler(t.Name, idx)
 		if err != nil {
-			util.Error("❌ failed to attach partition %d for topic '%s': %v\n", idx, t.Name, err)
-			return
+			return fmt.Errorf("failed to attach partition %d for topic '%s': %w", idx, t.Name, err)
 		}
 		newP := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
 		newP.isIdempotent = t.IsIdempotent
 		t.Partitions = append(t.Partitions, newP)
 	}
+	return nil
 }
 
 // RegisterConsumerGroup registers a consumer group to the topic.
@@ -94,9 +106,8 @@ func (t *Topic) RegisterConsumerGroup(groupName string, consumerCount int) *type
 	}
 
 	group := &types.ConsumerGroup{
-		Name:             groupName,
-		Consumers:        make([]*types.Consumer, consumerCount),
-		CommittedOffsets: make(map[int]uint64),
+		Name:      groupName,
+		Consumers: make([]*types.Consumer, consumerCount),
 	}
 
 	for i := 0; i < consumerCount; i++ {
@@ -124,64 +135,58 @@ func (t *Topic) DeregisterConsumerGroup(groupName string) error {
 }
 
 // Publish sends a message to one partition.
+// Partition selection and enqueue happen under a single RLock to prevent
+// TOCTOU races with AddPartitions.
 func (t *Topic) Publish(msg types.Message) {
-	idx := t.GetPartitionForMessage(msg)
-
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
+	idx := t.getPartitionIndex(msg, len(t.Partitions))
 	if idx == -1 {
-		util.Error("❌ No partitions available for topic '%s'", t.Name)
-		return
-	}
-	if idx < 0 || idx >= len(t.Partitions) {
-		util.Error("❌ Partition index %d out of range for topic '%s'", idx, t.Name)
+		util.Error("No partitions available for topic '%s'", t.Name)
 		return
 	}
 
-	p := t.Partitions[idx]
-	p.Enqueue(msg)
+	t.Partitions[idx].Enqueue(msg)
 }
 
+// PublishSync sends a message synchronously to one partition.
+// Partition selection and enqueue happen under a single RLock to prevent
+// TOCTOU races with AddPartitions.
 func (t *Topic) PublishSync(msg types.Message) error {
-	idx := t.GetPartitionForMessage(msg)
-
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
+	idx := t.getPartitionIndex(msg, len(t.Partitions))
 	if idx == -1 {
 		return fmt.Errorf("no partitions available for topic '%s'", t.Name)
-	}
-	if idx < 0 || idx >= len(t.Partitions) {
-		return fmt.Errorf("partition index %d out of range", idx)
 	}
 
 	return t.Partitions[idx].EnqueueSync(msg)
 }
 
+// PublishBatchSync sends a batch of messages synchronously, grouping by partition.
+// Partition selection and enqueue happen under a single RLock to prevent
+// TOCTOU races with AddPartitions.
 func (t *Topic) PublishBatchSync(msgs []types.Message) error {
 	if len(msgs) == 0 {
 		return nil
 	}
 
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	partitionsLen := len(t.Partitions)
 	partitioned := make(map[int][]types.Message)
 	for _, msg := range msgs {
-		idx := t.GetPartitionForMessage(msg)
+		idx := t.getPartitionIndex(msg, partitionsLen)
 		if idx != -1 {
 			partitioned[idx] = append(partitioned[idx], msg)
 		}
 	}
 
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
 	for idx, pm := range partitioned {
-		if idx < 0 || idx >= len(t.Partitions) {
-			continue
-		}
-
-		p := t.Partitions[idx]
-		if err := p.EnqueueBatchSync(pm); err != nil {
+		if err := t.Partitions[idx].EnqueueBatchSync(pm); err != nil {
 			return fmt.Errorf("partition %d: failed to publish batch: %w", idx, err)
 		}
 	}
@@ -215,39 +220,6 @@ func (t *Topic) applyAssignments(groupName string, assignments map[string][]int)
 	}
 
 	util.Debug("Applied assignments for group '%s': %v", groupName, assignments)
-}
-
-func (t *Topic) GetCommittedOffset(groupName string, partition int) (uint64, bool) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	group, ok := t.consumerGroups[groupName]
-	if !ok {
-		return 0, false
-	}
-
-	offset, ok := group.CommittedOffsets[partition]
-	return offset, ok
-}
-
-func (t *Topic) CommitOffset(groupName string, partition int, offset uint64) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if partition < 0 || partition >= len(t.Partitions) {
-		return fmt.Errorf("partition %d out of range [0, %d)", partition, len(t.Partitions))
-	}
-
-	group, ok := t.consumerGroups[groupName]
-	if !ok {
-		return fmt.Errorf("consumer group '%s' not found", groupName)
-	}
-
-	if group.CommittedOffsets == nil {
-		group.CommittedOffsets = make(map[int]uint64)
-	}
-	group.CommittedOffsets[partition] = offset
-	return nil
 }
 
 func (t *Topic) NewMessageSignal(partition int) <-chan struct{} {

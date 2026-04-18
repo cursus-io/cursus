@@ -8,6 +8,7 @@ import (
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/eventsource"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -23,6 +24,15 @@ type CommandHandler struct {
 	Coordinator   *coordinator.Coordinator
 	StreamManager *stream.StreamManager
 	Cluster       *clusterController.ClusterController
+	ESHandler     *eventsource.Handler
+	commands      []commandEntry
+}
+
+// commandEntry defines a single command routing rule.
+type commandEntry struct {
+	prefix  string
+	exact   bool
+	handler func(cmd string, ctx *ClientContext) string
 }
 
 type ConsumeArgs struct {
@@ -38,13 +48,39 @@ func NewCommandHandler(
 	sm *stream.StreamManager,
 	cc *clusterController.ClusterController,
 ) *CommandHandler {
-	return &CommandHandler{
+	ch := &CommandHandler{
 		TopicManager:  tm,
 		Config:        cfg,
 		Coordinator:   cd,
 		StreamManager: sm,
 		Cluster:       cc,
+		ESHandler:     eventsource.NewHandler(tm),
 	}
+	ch.commands = []commandEntry{
+		{prefix: "HELP", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHelp() }},
+		{prefix: "LIST_CLUSTER", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListCluster() }},
+		{prefix: "LIST", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList() }},
+		{prefix: "CREATE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd) }},
+		{prefix: "DELETE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd) }},
+		{prefix: "PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd) }},
+		{prefix: "REGISTER_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRegisterGroup(cmd) }},
+		{prefix: "JOIN_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleJoinGroup(cmd, ctx) }},
+		{prefix: "SYNC_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSyncGroup(cmd) }},
+		{prefix: "LEAVE_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleLeaveGroup(cmd) }},
+		{prefix: "FETCH_OFFSET ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchOffset(cmd) }},
+		{prefix: "GROUP_STATUS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleGroupStatus(cmd) }},
+		{prefix: "DESCRIBE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDescribeTopic(cmd) }},
+		{prefix: "HEARTBEAT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHeartbeat(cmd) }},
+		{prefix: "COMMIT_OFFSET ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCommitOffset(cmd) }},
+		{prefix: "BATCH_COMMIT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd) }},
+		{prefix: "APPEND_STREAM ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.ESHandler.HandleAppendStream(cmd) }},
+		{prefix: "STREAM_VERSION ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.ESHandler.HandleStreamVersion(cmd) }},
+		{prefix: "SAVE_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.ESHandler.HandleSaveSnapshot(cmd) }},
+		{prefix: "READ_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.ESHandler.HandleReadSnapshot(cmd) }},
+		{prefix: "READ_STREAM ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return STREAM_DATA_SIGNAL }},
+		{prefix: "REPLICATE_MESSAGE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateMessage(cmd) }},
+	}
+	return ch
 }
 
 func (ch *CommandHandler) logCommandResult(cmd, response string) {
@@ -77,46 +113,20 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) strin
 	return resp
 }
 
-// handleCommandByType delegates to specific command handlers
+// handleCommandByType dispatches to the matching command handler from the registry.
 func (ch *CommandHandler) handleCommandByType(cmd, upper string, ctx *ClientContext) string {
-	switch {
-	case strings.EqualFold(cmd, "HELP"):
-		return ch.handleHelp()
-	case strings.HasPrefix(upper, "CREATE "):
-		return ch.handleCreate(cmd)
-	case strings.HasPrefix(upper, "DELETE "):
-		return ch.handleDelete(cmd)
-	case strings.EqualFold(cmd, "LIST"):
-		return ch.handleList()
-	case strings.EqualFold(cmd, "LIST_CLUSTER"):
-		return ch.handleListCluster()
-	case strings.HasPrefix(upper, "PUBLISH "):
-		return ch.handlePublish(cmd)
-	case strings.HasPrefix(upper, "REGISTER_GROUP "):
-		return ch.handleRegisterGroup(cmd)
-	case strings.HasPrefix(upper, "JOIN_GROUP "):
-		return ch.handleJoinGroup(cmd, ctx)
-	case strings.HasPrefix(upper, "SYNC_GROUP "):
-		return ch.handleSyncGroup(cmd)
-	case strings.HasPrefix(upper, "LEAVE_GROUP "):
-		return ch.handleLeaveGroup(cmd)
-	case strings.HasPrefix(upper, "FETCH_OFFSET "):
-		return ch.handleFetchOffset(cmd)
-	case strings.HasPrefix(upper, "GROUP_STATUS "):
-		return ch.handleGroupStatus(cmd)
-	case strings.HasPrefix(upper, "DESCRIBE "):
-		return ch.handleDescribeTopic(cmd)
-	case strings.HasPrefix(upper, "HEARTBEAT "):
-		return ch.handleHeartbeat(cmd)
-	case strings.HasPrefix(upper, "COMMIT_OFFSET "):
-		return ch.handleCommitOffset(cmd)
-	case strings.HasPrefix(upper, "BATCH_COMMIT "):
-		return ch.handleBatchCommit(cmd)
-	case strings.HasPrefix(upper, "REPLICATE_MESSAGE "):
-		return ch.handleReplicateMessage(cmd)
-	default:
-		return "ERROR: unknown command: " + cmd
+	for _, entry := range ch.commands {
+		if entry.exact {
+			if strings.EqualFold(cmd, entry.prefix) {
+				return entry.handler(cmd, ctx)
+			}
+		} else {
+			if strings.HasPrefix(upper, entry.prefix) {
+				return entry.handler(cmd, ctx)
+			}
+		}
 	}
+	return "ERROR: unknown command: " + cmd
 }
 
 func (ch *CommandHandler) fail(raw, msg string) string {

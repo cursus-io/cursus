@@ -1,6 +1,7 @@
 package controller_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -17,7 +18,7 @@ type DummyPublisher struct{}
 func (d *DummyPublisher) Publish(topic string, msg *types.Message) error {
 	return nil
 }
-func (d *DummyPublisher) CreateTopic(topic string, partitionCount int, idempotent bool) error {
+func (d *DummyPublisher) CreateTopic(topic string, partitionCount int, idempotent bool, eventSourcing bool) error {
 	return nil
 }
 
@@ -25,9 +26,9 @@ func TestCommandHandler_GroupOps(t *testing.T) {
 	cfg := config.DefaultConfig()
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
-	_ = tm.CreateTopic("topic1", 4, false)
+	_ = tm.CreateTopic("topic1", 4, false, false)
 
-	coord := coordinator.NewCoordinator(cfg, &DummyPublisher{})
+	coord := coordinator.NewCoordinator(context.Background(), cfg, &DummyPublisher{})
 	ch := controller.NewCommandHandler(tm, cfg, coord, nil, nil)
 	ctx := controller.NewClientContext("", 0)
 
@@ -77,9 +78,9 @@ func TestCommandHandler_OffsetOps(t *testing.T) {
 	cfg := config.DefaultConfig()
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
-	_ = tm.CreateTopic("topic1", 4, false)
+	_ = tm.CreateTopic("topic1", 4, false, false)
 
-	coord := coordinator.NewCoordinator(cfg, &DummyPublisher{})
+	coord := coordinator.NewCoordinator(context.Background(), cfg, &DummyPublisher{})
 	ch := controller.NewCommandHandler(tm, cfg, coord, nil, nil)
 	ctx := controller.NewClientContext("g1", 0)
 

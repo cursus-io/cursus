@@ -855,10 +855,10 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 	c.mu.RUnlock()
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("BATCH_COMMIT topic=%s group=%s generation=%d member=%s ", c.config.Topic, c.config.GroupID, generation, memberID))
+	fmt.Fprintf(&sb, "BATCH_COMMIT topic=%s group=%s generation=%d member=%s ", c.config.Topic, c.config.GroupID, generation, memberID)
 	parts := []string{}
 	for pid, off := range offsets {
-		parts = append(parts, fmt.Sprintf("%d:%d", pid, off))
+		parts = append(parts, fmt.Sprintf("P%d:%d", pid, off))
 	}
 	sb.WriteString(strings.Join(parts, ","))
 

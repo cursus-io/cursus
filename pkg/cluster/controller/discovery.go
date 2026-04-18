@@ -69,7 +69,11 @@ func (sd *serviceDiscovery) Register() error {
 
 func (sd *serviceDiscovery) Deregister() error {
 	payload := map[string]string{"id": sd.brokerID}
-	data, _ := json.Marshal(payload)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		util.Error("Failed to marshal payload: %v", err)
+		return fmt.Errorf("marshal payload: %w", err)
+	}
 	if err := sd.rm.ApplyCommand("DEREGISTER", data); err != nil {
 		util.Error("Failed to deregister broker %s: %v", sd.brokerID, err)
 		return err
@@ -140,7 +144,11 @@ func (sd *serviceDiscovery) RemoveNode(nodeID string) (string, error) {
 	}
 
 	payload := map[string]string{"id": nodeID}
-	data, _ := json.Marshal(payload)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		util.Error("Failed to marshal payload: %v", err)
+		return leaderAddr, fmt.Errorf("marshal payload: %w", err)
+	}
 	if err := sd.rm.ApplyCommand("DEREGISTER", data); err != nil {
 		util.Error("DEREGISTER failed after RemoveServer. FSM contains stale node info: id=%s err=%v", nodeID, err)
 		return leaderAddr, fmt.Errorf("DEREGISTER failed: %w", err)
@@ -150,7 +158,7 @@ func (sd *serviceDiscovery) RemoveNode(nodeID string) (string, error) {
 }
 
 func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	go func() {
 		defer ticker.Stop()
 		util.Debug("reconciler started for broker %s", sd.brokerID)
@@ -191,7 +199,11 @@ func (sd *serviceDiscovery) Reconcile() {
 		if _, exists := raftMap[b.ID]; !exists {
 			util.Warn("Node %s found in FSM but missing in Raft. Cleaning up...", b.ID)
 			payload := map[string]string{"id": b.ID}
-			data, _ := json.Marshal(payload)
+			data, err := json.Marshal(payload)
+			if err != nil {
+				util.Error("Failed to marshal payload: %v", err)
+				continue
+			}
 			if err := sd.rm.ApplyCommand("DEREGISTER", data); err != nil {
 				util.Error("Failed to apply DEREGISTER for node %s: %v", b.ID, err)
 			} else {

@@ -35,7 +35,7 @@ func TestJoinCluster_Success(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	addr := ln.Addr().String()
 	_, portStr, _ := net.SplitHostPort(addr)
@@ -47,7 +47,7 @@ func TestJoinCluster_Success(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 			// Read length
 			lenBuf := make([]byte, 4)
@@ -82,7 +82,7 @@ func TestJoinCluster_Fail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	addr := ln.Addr().String()
 	_, portStr, _ := net.SplitHostPort(addr)
@@ -114,7 +114,7 @@ func TestJoinCluster_Fail(t *testing.T) {
 			binary.BigEndian.PutUint32(respLenBuf, uint32(len(respData)))
 			_, _ = conn.Write(respLenBuf)
 			_, _ = conn.Write(respData)
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
@@ -134,7 +134,7 @@ func TestStartHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	addr := ln.Addr().String()
 	_, portStr, _ := net.SplitHostPort(addr)
@@ -147,7 +147,7 @@ func TestStartHeartbeat(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		received <- true
 	}()
 

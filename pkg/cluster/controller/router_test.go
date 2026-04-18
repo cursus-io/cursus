@@ -68,7 +68,7 @@ func TestClusterRouter_LocalProcess(t *testing.T) {
 }
 
 func TestClusterRouter_FindCoordinator(t *testing.T) {
-	mockFSM := fsm.NewBrokerFSM(nil, nil, nil)
+	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	// Add some brokers
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"node1\",\"addr\":\"localhost:7001\",\"status\":\"active\"}")})
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"node2\",\"addr\":\"localhost:7002\",\"status\":\"active\"}")})
@@ -107,7 +107,7 @@ func TestClusterRouter_FindCoordinator(t *testing.T) {
 }
 
 func TestClusterRouter_FindCoordinator_CacheRebuild(t *testing.T) {
-	mockFSM := fsm.NewBrokerFSM(nil, nil, nil)
+	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n1\",\"addr\":\"localhost:7001\",\"status\":\"active\"}")})
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n2\",\"addr\":\"localhost:7002\",\"status\":\"active\"}")})
 
@@ -136,7 +136,7 @@ func TestClusterRouter_FindCoordinator_CacheRebuild(t *testing.T) {
 }
 
 func TestClusterRouter_FindCoordinator_NoActiveBrokers(t *testing.T) {
-	mockFSM := fsm.NewBrokerFSM(nil, nil, nil)
+	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
 	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000)
 
@@ -157,7 +157,7 @@ func TestClusterRouter_FindCoordinator_NilFSM(t *testing.T) {
 }
 
 func TestClusterRouter_ForwardToCoordinator_Local(t *testing.T) {
-	mockFSM := fsm.NewBrokerFSM(nil, nil, nil)
+	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n1\",\"addr\":\"localhost:7001\",\"status\":\"active\"}")})
 
 	processor := &MockLocalProcessor{}
@@ -178,7 +178,7 @@ func TestClusterRouter_ForwardToCoordinator_Local(t *testing.T) {
 }
 
 func TestClusterRouter_ForwardToPartitionLeader_Local(t *testing.T) {
-	mockFSM := fsm.NewBrokerFSM(nil, nil, nil)
+	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n1\",\"addr\":\"localhost:7001\",\"status\":\"active\"}")})
 
 	// Create a topic with 1 partition, leader = n1

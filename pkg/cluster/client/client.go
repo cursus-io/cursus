@@ -75,7 +75,7 @@ func (c *TCPClusterClient) sendHeartbeat(peers []string, nodeID, localAddr strin
 			if err != nil {
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			// Set a write deadline to prevent goroutine buildup on slow connections
 			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
@@ -141,7 +141,7 @@ func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, lo
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Set connection deadlines based on the context's remaining time
 	if deadline, ok := ctx.Deadline(); ok {

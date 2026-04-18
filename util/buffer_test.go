@@ -9,8 +9,8 @@ import (
 
 func TestBufferReadWrite(t *testing.T) {
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 
 	data := []byte("hello world")
 
@@ -26,8 +26,8 @@ func TestBufferReadWrite(t *testing.T) {
 
 func TestBufferErrorCases(t *testing.T) {
 	c1, c2 := net.Pipe()
-	c1.Close()
-	c2.Close()
+	_ = c1.Close()
+	_ = c2.Close()
 
 	_, err := ReadWithLength(c2)
 	assert.Error(t, err)

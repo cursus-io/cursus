@@ -12,7 +12,6 @@ import (
 
 func main() {
 	cfg := sdk.NewDefaultConsumerConfig()
-	// Try loading from current dir, then parent dir
 	if err := sdk.LoadConfig("config.yaml", cfg); err != nil {
 		if err := sdk.LoadConfig("../config.yaml", cfg); err != nil {
 			log.Printf("Config file not found or invalid, using defaults: %v", err)

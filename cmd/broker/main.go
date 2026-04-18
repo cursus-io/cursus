@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -48,7 +49,7 @@ func main() {
 	}
 
 	tm := topic.NewTopicManager(cfg, dm, smAdapter)
-	cd := coordinator.NewCoordinator(cfg, tm)
+	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
 	tm.SetCoordinator(cd)
 
 	// Static consumer groups

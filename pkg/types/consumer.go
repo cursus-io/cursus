@@ -20,7 +20,6 @@ type Consumer struct {
 
 // ConsumerGroup contains consumers subscribed to the same topic.
 type ConsumerGroup struct {
-	Name             string
-	Consumers        []*Consumer
-	CommittedOffsets map[int]uint64
+	Name      string
+	Consumers []*Consumer
 }

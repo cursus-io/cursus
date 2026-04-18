@@ -14,6 +14,11 @@ type Message struct {
 	Key        string // optional: partition routing key
 	Epoch      int64
 
+	EventType        string
+	SchemaVersion    uint32
+	AggregateVersion uint64
+	Metadata         string
+
 	RetryCount int
 	Retry      bool
 }

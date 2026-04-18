@@ -22,7 +22,7 @@ func (c *Coordinator) monitorHeartbeats() {
 				}
 			}
 			c.checkAllGroupsTimeout()
-		case <-c.stopCh:
+		case <-c.ctx.Done():
 			return
 		}
 	}
@@ -60,15 +60,14 @@ func (c *Coordinator) checkSingleGroupTimeout(groupName string, timeout time.Dur
 		}
 	}
 
-	hasChanges := len(timedOutMembers) > 0
-	if hasChanges {
+	if len(timedOutMembers) > 0 {
 		group.Generation++
+		c.rebalanceRange(groupName)
 	}
 	c.mu.Unlock()
 
-	if hasChanges {
-		util.Warn("⚠️ Group '%s': %d members timed out. Triggering rebalance.", groupName, len(timedOutMembers))
-		c.triggerRebalance(groupName)
+	if len(timedOutMembers) > 0 {
+		util.Warn("⚠️ Group '%s': %d members timed out. Triggered rebalance.", groupName, len(timedOutMembers))
 	}
 }
 
@@ -92,9 +91,4 @@ func (c *Coordinator) RecordHeartbeat(groupName, consumerID string) error {
 
 	util.Info("💓 Heartbeat from %s/%s", groupName, consumerID)
 	return nil
-}
-
-// triggerRebalance invokes the range-based rebalance strategy.
-func (c *Coordinator) triggerRebalance(groupName string) {
-	c.rebalanceRange(groupName)
 }

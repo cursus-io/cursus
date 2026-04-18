@@ -74,8 +74,8 @@ func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
 		return errorAckResponse(err.Error(), first.ProducerID, first.Epoch)
 	}
 
-	partition.SetHWM(last.Offset + 1)
-	partition.UpdateLEO(last.Offset + 1)
+	// Re-read after EnqueueBatch since it assigns actual disk offsets
+	last = cmd.Messages[len(cmd.Messages)-1]
 
 	f.mu.Lock()
 	if effectiveIdempotent {

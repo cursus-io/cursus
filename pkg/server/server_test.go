@@ -47,7 +47,7 @@ func TestHealthCheckServer(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	assert.NoError(t, err)
 	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	_ = ln.Close()
 
 	startHealthCheckServer(port, ready)
 
@@ -56,14 +56,14 @@ func TestHealthCheckServer(t *testing.T) {
 	resp, err := http.Get(url)
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Test Ready
 	ready.Store(true)
 	resp, err = http.Get(url)
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 func TestWriteResponse(t *testing.T) {
@@ -71,18 +71,18 @@ func TestWriteResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 
 	done := make(chan bool)
 	go func() {
 		conn, _ := l.Accept()
 		writeResponse(conn, "OK")
-		conn.Close()
+		_ = conn.Close()
 		done <- true
 	}()
 
 	conn, _ := net.Dial("tcp", l.Addr().String())
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	lenBuf := make([]byte, 4)
 	_, _ = io.ReadFull(conn, lenBuf)
@@ -100,7 +100,7 @@ func TestReadMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 
 	go func() {
 		conn, _ := l.Accept()
@@ -109,11 +109,11 @@ func TestReadMessage(t *testing.T) {
 		binary.BigEndian.PutUint32(buf[0:4], uint32(len(msg)))
 		copy(buf[4:], []byte(msg))
 		_, _ = conn.Write(buf)
-		conn.Close()
+		_ = conn.Close()
 	}()
 
 	conn, _ := net.Dial("tcp", l.Addr().String())
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	data, err := readMessage(conn, "none")
 	assert.NoError(t, err)
@@ -125,7 +125,7 @@ func TestHandleConnection_Exit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 
 	cfg := config.DefaultConfig()
 	done := make(chan struct{})
@@ -146,7 +146,7 @@ func TestHandleConnection_Exit(t *testing.T) {
 	binary.BigEndian.PutUint32(buf[0:4], uint32(len(msg)))
 	copy(buf[4:], []byte(msg))
 	_, _ = conn.Write(buf)
-	conn.Close()
+	_ = conn.Close()
 
 	select {
 	case <-done:
