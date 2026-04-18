@@ -43,6 +43,7 @@ func TestCommandHandler_Real(t *testing.T) {
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = ch.Close() })
 	ctx := controller.NewClientContext("test-group", 0)
 
 	t.Run("HELP command", func(t *testing.T) {
@@ -110,8 +111,8 @@ func TestCommandHandler_GroupCommands(t *testing.T) {
 	cfg := &config.Config{}
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
-	// We might need a real Coordinator if we want to test these, but for now we check the "coordinator not available" response
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = ch.Close() })
 	ctx := controller.NewClientContext("test-group", 0)
 
 	if err := tm.CreateTopic("topic1", 1, false, false); err != nil {
@@ -140,6 +141,7 @@ func TestCommandHandler_GroupCommands(t *testing.T) {
 
 func TestCommandHandler_ErrorResponses(t *testing.T) {
 	ch := controller.NewCommandHandler(nil, nil, nil, nil, nil)
+	t.Cleanup(func() { _ = ch.Close() })
 
 	t.Run("CREATE missing topic", func(t *testing.T) {
 		resp := ch.HandleCommand("CREATE partitions=3", nil)
@@ -161,6 +163,7 @@ func TestCommandHandler_EventSourcingCreate(t *testing.T) {
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = ch.Close() })
 	ctx := controller.NewClientContext("test-group", 0)
 
 	resp := ch.HandleCommand("CREATE topic=es-topic partitions=2 event_sourcing=true", ctx)
@@ -182,6 +185,7 @@ func TestCommandHandler_PublishAndAck(t *testing.T) {
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = ch.Close() })
 	ctx := controller.NewClientContext("test-group", 0)
 
 	// Create topic first
@@ -217,6 +221,7 @@ func TestCommandHandler_ProcessCommand(t *testing.T) {
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = ch.Close() })
 
 	resp := ch.ProcessCommand("HELP")
 	if !strings.Contains(resp, "Available commands") {
@@ -234,6 +239,7 @@ func TestCommandHandler_PublishAcksZero(t *testing.T) {
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = ch.Close() })
 	ctx := controller.NewClientContext("test-group", 0)
 
 	ch.HandleCommand("CREATE topic=ack0-topic partitions=1", ctx)
@@ -249,6 +255,7 @@ func TestCommandHandler_PublishErrors(t *testing.T) {
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = ch.Close() })
 	ctx := controller.NewClientContext("test-group", 0)
 
 	// Missing topic
@@ -289,6 +296,7 @@ func TestCommandHandler_EventSourcingCommands(t *testing.T) {
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = ch.Close() })
 	ctx := controller.NewClientContext("test-group", 0)
 
 	// Create event-sourcing topic
@@ -330,6 +338,7 @@ func TestCommandHandler_CaseInsensitivity(t *testing.T) {
 	hp := &mockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = ch.Close() })
 	ctx := controller.NewClientContext("test-group", 0)
 
 	cmds := []struct {

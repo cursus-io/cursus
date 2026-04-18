@@ -214,22 +214,30 @@ func TestStreamIndex_ConcurrentCheckAndAppend(t *testing.T) {
 
 	var wg sync.WaitGroup
 	successes := make(chan uint64, goroutines)
+	errors := make(chan error, goroutines)
 
-	// All goroutines try to append version 1 concurrently; exactly one should win.
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func(offset uint64) {
 			defer wg.Done()
 			ok, _, err := idx.CheckAndAppend(key, 1, offset, 0)
-			if err == nil && ok {
+			if err != nil {
+				errors <- err
+				return
+			}
+			if ok {
 				successes <- offset
 			}
 		}(uint64(i))
 	}
 	wg.Wait()
 	close(successes)
+	close(errors)
 
-	// Exactly one goroutine should have succeeded.
+	for err := range errors {
+		t.Errorf("unexpected error from concurrent append: %v", err)
+	}
+
 	var wins []uint64
 	for off := range successes {
 		wins = append(wins, off)

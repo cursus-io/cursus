@@ -20,6 +20,7 @@ type Handler struct {
 
 	mu        sync.RWMutex
 	closed    bool
+	wg        sync.WaitGroup
 	indexes   map[string]*StreamIndex   // key: "topic:partition"
 	snapshots map[string]*SnapshotStore // key: "topic:partition"
 }
@@ -106,6 +107,9 @@ func (h *Handler) getSnapshot(topicName string, partitionID int) (*SnapshotStore
 //
 //	APPEND_STREAM topic=<name> key=<aggregate_key> version=<expected> event_type=<type> message=<payload>
 func (h *Handler) HandleAppendStream(cmd string) string {
+	h.wg.Add(1)
+	defer h.wg.Done()
+
 	args := parseKeyValueArgs(cmd[len("APPEND_STREAM "):])
 
 	topicName := args["topic"]
@@ -192,6 +196,9 @@ func (h *Handler) HandleAppendStream(cmd string) string {
 // HandleReadStream writes event data directly to conn.
 // Protocol: two length-prefixed frames — JSON envelope + binary batch.
 func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
+	h.wg.Add(1)
+	defer h.wg.Done()
+
 	args := parseKeyValueArgs(cmd[len("READ_STREAM "):])
 
 	topicName := args["topic"]
@@ -274,7 +281,7 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 			writeError(conn, fmt.Sprintf("read error at offset %d: %v", entry.Offset, err))
 			return
 		}
-		if len(batch) > 0 {
+		if len(batch) > 0 && batch[0].Key == key {
 			msgs = append(msgs, batch[0])
 		}
 	}
@@ -321,6 +328,9 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 //
 //	SAVE_SNAPSHOT topic=<name> key=<aggregate_key> version=<N> message=<json_payload>
 func (h *Handler) HandleSaveSnapshot(cmd string) string {
+	h.wg.Add(1)
+	defer h.wg.Done()
+
 	args := parseKeyValueArgs(cmd[len("SAVE_SNAPSHOT "):])
 
 	topicName := args["topic"]
@@ -383,6 +393,9 @@ func (h *Handler) HandleSaveSnapshot(cmd string) string {
 //
 //	READ_SNAPSHOT topic=<name> key=<aggregate_key>
 func (h *Handler) HandleReadSnapshot(cmd string) string {
+	h.wg.Add(1)
+	defer h.wg.Done()
+
 	args := parseKeyValueArgs(cmd[len("READ_SNAPSHOT "):])
 
 	topicName := args["topic"]
@@ -431,6 +444,9 @@ func (h *Handler) HandleReadSnapshot(cmd string) string {
 //
 //	STREAM_VERSION topic=<name> key=<aggregate_key>
 func (h *Handler) HandleStreamVersion(cmd string) string {
+	h.wg.Add(1)
+	defer h.wg.Done()
+
 	args := parseKeyValueArgs(cmd[len("STREAM_VERSION "):])
 
 	topicName := args["topic"]
@@ -468,9 +484,13 @@ func (h *Handler) HandleStreamVersion(cmd string) string {
 // After Close, getIndex and getSnapshot will return errors.
 func (h *Handler) Close() error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	h.closed = true
+	h.mu.Unlock()
+
+	h.wg.Wait()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
 	var firstErr error
 	for key, idx := range h.indexes {

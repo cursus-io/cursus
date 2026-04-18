@@ -100,9 +100,6 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 		// Start background heartbeats to all cluster members
 		clusterClient.StartHeartbeat(ctx, cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort)
 
-		globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
-		cc.SetLocalProcessor(globalCH)
-
 		// Every node should attempt to join the cluster via seeds
 		go func() {
 			util.Info("🚀 Attempting to join cluster via seeds...")
@@ -141,9 +138,10 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	}
 	startHealthCheckServer(healthPort, brokerReady)
 
-	// Create a single shared CommandHandler for all connections.
-	// This avoids creating a new ESHandler (with open file descriptors) per connection.
 	globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
+	if cc != nil {
+		cc.SetLocalProcessor(globalCH)
+	}
 	go func() {
 		<-ctx.Done()
 		if err := globalCH.Close(); err != nil {
@@ -238,6 +236,7 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 	defer cancel()
 
 	cmdHandler, cmdCtx := initializeConnection(cfg, tm, cd, sm, cc)
+	defer func() { _ = cmdHandler.Close() }()
 
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {

@@ -9,11 +9,13 @@ import (
 
 func captureLog(fn func()) string {
 	var buf bytes.Buffer
+	origOutput := log.Writer()
+	origFlags := log.Flags()
 	log.SetOutput(&buf)
 	log.SetFlags(0)
 	defer func() {
-		log.SetOutput(nil)
-		log.SetFlags(log.LstdFlags)
+		log.SetOutput(origOutput)
+		log.SetFlags(origFlags)
 	}()
 	fn()
 	return buf.String()

@@ -229,8 +229,7 @@ func TestSnapshotStore_PartialWriteRecovery(t *testing.T) {
 	require.NoError(t, store.Save("good-key", 3, `{"ok":true}`))
 	require.NoError(t, store.Close())
 
-	// Append garbage (a valid key-length header but truncated key) to the snapshot file.
-	path := filepath.Join(dir, "partition_0_snapshots.dat")
+	path := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots.dat", 0))
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)
 	require.NoError(t, err)
 

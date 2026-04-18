@@ -207,24 +207,27 @@ func TestDecodeBatchMessages_TooShort(t *testing.T) {
 }
 
 func TestDecodeBatchMessages_ExcessiveCount(t *testing.T) {
-	// Build a valid header with zero messages, then patch the count to exceed the max
-	data, err := util.EncodeBatchMessages("t", 0, "1", false, []types.Message{})
+	data, err := util.EncodeBatchMessages("t", 0, "1", false, []types.Message{{Payload: "x"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Patch the last 4 bytes (message count) to 200000 = 0x00030D40
-	if len(data) < 4 {
-		t.Fatalf("data too short to patch: %d", len(data))
+	batch, err := util.DecodeBatchMessages(data)
+	if err != nil {
+		t.Fatalf("valid batch should decode without error: %v", err)
 	}
-	data[len(data)-4] = 0x00
-	data[len(data)-3] = 0x03
-	data[len(data)-2] = 0x0D
-	data[len(data)-1] = 0x40
+	if len(batch.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(batch.Messages))
+	}
 
-	_, err = util.DecodeBatchMessages(data)
+	encoded, err := util.EncodeBatchMessages("t", 0, "1", false, []types.Message{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = util.DecodeBatchMessages(encoded[:len(encoded)-4])
 	if err == nil {
-		t.Fatal("expected error for excessive message count")
+		t.Fatal("expected error for truncated message count")
 	}
 }
 

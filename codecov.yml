@@ -14,5 +14,5 @@ ignore:
   - "test/**"
   - "docs/**"
   - "manifests/**"
-  - "sdk/bench/**"
+  - "**/bench/**"
   - "broker.go"
