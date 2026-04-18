@@ -147,6 +147,14 @@ func (ch *CommandHandler) errorResponse(msg string) string {
 	return string(respBytes)
 }
 
+// Close releases resources held by the command handler (e.g., event-sourcing indexes and snapshots).
+func (ch *CommandHandler) Close() error {
+	if ch.ESHandler != nil {
+		return ch.ESHandler.Close()
+	}
+	return nil
+}
+
 func parseKeyValueArgs(argsStr string) map[string]string {
 	result := make(map[string]string)
 

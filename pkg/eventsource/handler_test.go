@@ -1,11 +1,103 @@
 package eventsource
 
 import (
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/stream"
+	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// --- test helpers ---
+
+type fakeStorageHandler struct {
+	mu      sync.Mutex
+	msgs    []types.Message
+	offset  uint64
+}
+
+func (f *fakeStorageHandler) ReadMessages(off uint64, max int) ([]types.Message, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var result []types.Message
+	for _, m := range f.msgs {
+		if m.Offset >= off && len(result) < max {
+			result = append(result, m)
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeStorageHandler) GetAbsoluteOffset() uint64 { return f.offset }
+func (f *fakeStorageHandler) GetLatestOffset() uint64   { return f.offset }
+func (f *fakeStorageHandler) GetSegmentPath(_ uint64) string { return "" }
+
+func (f *fakeStorageHandler) AppendMessage(_ string, _ int, msg *types.Message) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	off := f.offset
+	msg.Offset = off
+	f.msgs = append(f.msgs, *msg)
+	f.offset++
+	return off, nil
+}
+
+func (f *fakeStorageHandler) AppendMessageSync(t string, p int, msg *types.Message) (uint64, error) {
+	return f.AppendMessage(t, p, msg)
+}
+
+func (f *fakeStorageHandler) WriteBatch(_ []types.DiskMessage) error { return nil }
+func (f *fakeStorageHandler) Flush()                                 {}
+func (f *fakeStorageHandler) Close() error                           { return nil }
+
+type fakeHandlerProvider struct {
+	handlers map[string]*fakeStorageHandler
+}
+
+func newFakeHandlerProvider() *fakeHandlerProvider {
+	return &fakeHandlerProvider{handlers: make(map[string]*fakeStorageHandler)}
+}
+
+func (fp *fakeHandlerProvider) GetHandler(topicName string, partitionID int) (types.StorageHandler, error) {
+	key := fmt.Sprintf("%s:%d", topicName, partitionID)
+	h, ok := fp.handlers[key]
+	if !ok {
+		h = &fakeStorageHandler{}
+		fp.handlers[key] = h
+	}
+	return h, nil
+}
+
+type fakeStreamManager struct{}
+
+func (f *fakeStreamManager) AddStream(_ string, _ *stream.StreamConnection, _ func(uint64, int) ([]types.Message, error), _ time.Duration) error {
+	return nil
+}
+func (f *fakeStreamManager) RemoveStream(_ string)                                        {}
+func (f *fakeStreamManager) GetStreamsForPartition(_ string, _ int) []*stream.StreamConnection { return nil }
+func (f *fakeStreamManager) StopStream(_ string)                                          {}
+
+// newTestHandler creates a Handler backed by a TopicManager with a single event-sourcing topic.
+func newTestHandler(t *testing.T) *Handler {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := &config.Config{LogDir: dir}
+	hp := newFakeHandlerProvider()
+	sm := &fakeStreamManager{}
+	tm := topic.NewTopicManager(cfg, hp, sm)
+	err := tm.CreateTopic("orders", 1, false, true)
+	require.NoError(t, err)
+	// Also create a non-event-sourcing topic for negative tests.
+	err = tm.CreateTopic("plain", 1, false, false)
+	require.NoError(t, err)
+	return NewHandler(tm)
+}
 
 // TestAppendAndReadStream_Integration verifies that appending events updates
 // the version correctly and that snapshot-based lookup skips already-snapshotted versions.
@@ -174,4 +266,248 @@ func TestMultipleAggregates(t *testing.T) {
 
 	// A key that was never appended should have version 0.
 	assert.Equal(t, uint64(0), idx.GetVersion("nonexistent"))
+}
+
+// --- Handler method tests ---
+
+func TestHandler_HandleAppendStream_Validation(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	tests := []struct {
+		name string
+		cmd  string
+		want string
+	}{
+		{"missing topic", "APPEND_STREAM key=k1 version=1 message=hi", "ERROR: missing topic parameter"},
+		{"missing key", "APPEND_STREAM topic=orders version=1 message=hi", "ERROR: missing key parameter"},
+		{"missing version", "APPEND_STREAM topic=orders key=k1 message=hi", "ERROR: missing version parameter"},
+		{"invalid version", "APPEND_STREAM topic=orders key=k1 version=abc message=hi", "ERROR: invalid version"},
+		{"missing message", "APPEND_STREAM topic=orders key=k1 version=1", "ERROR: missing message parameter"},
+		{"nonexistent topic", "APPEND_STREAM topic=nope key=k1 version=1 message=hi", "ERROR: topic 'nope' does not exist"},
+		{"non-eventsourcing topic", "APPEND_STREAM topic=plain key=k1 version=1 message=hi", "ERROR: topic 'plain' is not event-sourcing enabled"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := h.HandleAppendStream(tt.cmd)
+			assert.Equal(t, tt.want, result)
+		})
+	}
+}
+
+func TestHandler_HandleAppendStream_Success(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	result := h.HandleAppendStream("APPEND_STREAM topic=orders key=order-1 version=1 message={\"item\":\"A\"}")
+	assert.Contains(t, result, "OK version=1")
+	assert.Contains(t, result, "offset=0")
+	assert.Contains(t, result, "partition=0")
+
+	// Second append should succeed at version 2.
+	result = h.HandleAppendStream("APPEND_STREAM topic=orders key=order-1 version=2 message={\"item\":\"B\"}")
+	assert.Contains(t, result, "OK version=2")
+}
+
+func TestHandler_HandleAppendStream_VersionConflict(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	// Seed version 1.
+	result := h.HandleAppendStream("APPEND_STREAM topic=orders key=order-1 version=1 message=init")
+	assert.Contains(t, result, "OK")
+
+	// Attempting version 1 again should conflict.
+	result = h.HandleAppendStream("APPEND_STREAM topic=orders key=order-1 version=1 message=dup")
+	assert.Contains(t, result, "ERROR: version_conflict")
+	assert.Contains(t, result, "current=1")
+	assert.Contains(t, result, "expected=1")
+}
+
+func TestHandler_HandleStreamVersion(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	// Version of nonexistent key is 0.
+	result := h.HandleStreamVersion("STREAM_VERSION topic=orders key=new-key")
+	assert.Equal(t, "0", result)
+
+	// Append and check version.
+	h.HandleAppendStream("APPEND_STREAM topic=orders key=sv-key version=1 message=data")
+	result = h.HandleStreamVersion("STREAM_VERSION topic=orders key=sv-key")
+	assert.Equal(t, "1", result)
+}
+
+func TestHandler_HandleStreamVersion_Validation(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	tests := []struct {
+		name string
+		cmd  string
+		want string
+	}{
+		{"missing topic", "STREAM_VERSION key=k1", "ERROR: missing topic parameter"},
+		{"missing key", "STREAM_VERSION topic=orders", "ERROR: missing key parameter"},
+		{"nonexistent topic", "STREAM_VERSION topic=nope key=k1", "ERROR: topic 'nope' does not exist"},
+		{"non-eventsourcing", "STREAM_VERSION topic=plain key=k1", "ERROR: topic 'plain' is not event-sourcing enabled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := h.HandleStreamVersion(tt.cmd)
+			assert.Equal(t, tt.want, result)
+		})
+	}
+}
+
+func TestHandler_HandleSaveSnapshot_Validation(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	tests := []struct {
+		name string
+		cmd  string
+		want string
+	}{
+		{"missing topic", "SAVE_SNAPSHOT key=k1 version=1 message=data", "ERROR: missing topic parameter"},
+		{"missing key", "SAVE_SNAPSHOT topic=orders version=1 message=data", "ERROR: missing key parameter"},
+		{"missing version", "SAVE_SNAPSHOT topic=orders key=k1 message=data", "ERROR: missing version parameter"},
+		{"invalid version", "SAVE_SNAPSHOT topic=orders key=k1 version=xyz message=data", "ERROR: invalid version"},
+		{"missing message", "SAVE_SNAPSHOT topic=orders key=k1 version=1", "ERROR: missing message parameter"},
+		{"nonexistent topic", "SAVE_SNAPSHOT topic=nope key=k1 version=1 message=data", "ERROR: topic 'nope' does not exist"},
+		{"non-eventsourcing", "SAVE_SNAPSHOT topic=plain key=k1 version=1 message=data", "ERROR: topic 'plain' is not event-sourcing enabled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := h.HandleSaveSnapshot(tt.cmd)
+			assert.Equal(t, tt.want, result)
+		})
+	}
+}
+
+func TestHandler_HandleSaveSnapshot_VersionExceedsStream(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	// Stream is at version 0 (no events). Saving snapshot at version 5 should fail.
+	result := h.HandleSaveSnapshot("SAVE_SNAPSHOT topic=orders key=k1 version=5 message={}")
+	assert.Contains(t, result, "ERROR: snapshot version 5 exceeds stream version 0")
+}
+
+func TestHandler_HandleSaveAndReadSnapshot(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	// Append an event so the stream reaches version 1.
+	result := h.HandleAppendStream("APPEND_STREAM topic=orders key=snap-key version=1 message=event1")
+	assert.Contains(t, result, "OK")
+
+	// Save a snapshot at version 1.
+	result = h.HandleSaveSnapshot("SAVE_SNAPSHOT topic=orders key=snap-key version=1 message={\"total\":100}")
+	assert.Contains(t, result, "OK version=1")
+
+	// Read it back.
+	result = h.HandleReadSnapshot("READ_SNAPSHOT topic=orders key=snap-key")
+	assert.Contains(t, result, `"version":1`)
+	assert.Contains(t, result, `"payload":"{\"total\":100}"`)
+}
+
+func TestHandler_HandleReadSnapshot_Validation(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	tests := []struct {
+		name string
+		cmd  string
+		want string
+	}{
+		{"missing topic", "READ_SNAPSHOT key=k1", "ERROR: missing topic parameter"},
+		{"missing key", "READ_SNAPSHOT topic=orders", "ERROR: missing key parameter"},
+		{"nonexistent topic", "READ_SNAPSHOT topic=nope key=k1", "ERROR: topic 'nope' does not exist"},
+		{"non-eventsourcing", "READ_SNAPSHOT topic=plain key=k1", "ERROR: topic 'plain' is not event-sourcing enabled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := h.HandleReadSnapshot(tt.cmd)
+			assert.Equal(t, tt.want, result)
+		})
+	}
+}
+
+func TestHandler_HandleReadSnapshot_NotFound(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	result := h.HandleReadSnapshot("READ_SNAPSHOT topic=orders key=nope")
+	assert.Equal(t, "NULL", result)
+}
+
+func TestHandler_NewHandlerAndClose(t *testing.T) {
+	h := newTestHandler(t)
+
+	// Trigger lazy creation of an index and snapshot store.
+	h.HandleAppendStream("APPEND_STREAM topic=orders key=close-key version=1 message=data")
+	h.HandleReadSnapshot("READ_SNAPSHOT topic=orders key=close-key")
+
+	// Close should succeed.
+	err := h.Close()
+	assert.NoError(t, err)
+}
+
+func TestParseKeyValueArgs(t *testing.T) {
+	t.Run("standard_key_value_pairs", func(t *testing.T) {
+		result := parseKeyValueArgs("topic=orders key=order-1 version=3")
+		assert.Equal(t, "orders", result["topic"])
+		assert.Equal(t, "order-1", result["key"])
+		assert.Equal(t, "3", result["version"])
+	})
+
+	t.Run("message_preserves_spaces", func(t *testing.T) {
+		result := parseKeyValueArgs(`topic=orders key=k1 message={"name": "hello world"}`)
+		assert.Equal(t, "orders", result["topic"])
+		assert.Equal(t, "k1", result["key"])
+		assert.Equal(t, `{"name": "hello world"}`, result["message"])
+	})
+
+	t.Run("empty_value", func(t *testing.T) {
+		result := parseKeyValueArgs("topic= key=abc")
+		assert.Equal(t, "", result["topic"])
+		assert.Equal(t, "abc", result["key"])
+	})
+
+	t.Run("message_at_start", func(t *testing.T) {
+		result := parseKeyValueArgs("message=hello world this is payload")
+		assert.Equal(t, "hello world this is payload", result["message"])
+		// No other keys should be present.
+		assert.Empty(t, result["topic"])
+	})
+
+	t.Run("no_message", func(t *testing.T) {
+		result := parseKeyValueArgs("topic=events key=user-5 version=1")
+		assert.Equal(t, "events", result["topic"])
+		assert.Equal(t, "user-5", result["key"])
+		assert.Equal(t, "1", result["version"])
+		_, hasMessage := result["message"]
+		assert.False(t, hasMessage, "message key should not exist when not provided")
+	})
+
+	t.Run("empty_string", func(t *testing.T) {
+		result := parseKeyValueArgs("")
+		assert.Empty(t, result)
+	})
+
+	t.Run("message_with_equals_signs", func(t *testing.T) {
+		result := parseKeyValueArgs(`topic=t1 message=base64data==more=stuff`)
+		assert.Equal(t, "t1", result["topic"])
+		assert.Equal(t, "base64data==more=stuff", result["message"])
+	})
+
+	t.Run("keys_after_message_are_consumed_as_payload", func(t *testing.T) {
+		result := parseKeyValueArgs("topic=t1 message=payload key=should-be-in-message")
+		assert.Equal(t, "t1", result["topic"])
+		assert.Equal(t, "payload key=should-be-in-message", result["message"])
+		// key should NOT be separately parsed since it comes after message=
+		assert.NotEqual(t, "should-be-in-message", result["key"])
+	})
 }

@@ -1,0 +1,18 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 50%
+        threshold: 2%
+    patch:
+      default:
+        target: 50%
+
+ignore:
+  - "cmd/**"
+  - "examples/**"
+  - "test/**"
+  - "docs/**"
+  - "manifests/**"
+  - "sdk/bench/**"
+  - "broker.go"

@@ -147,6 +147,87 @@ func TestDecodeBatchMessagesInvalidData(t *testing.T) {
 	})
 }
 
+func TestBatchMessages_EventSourcingFields(t *testing.T) {
+	msgs := []types.Message{
+		{
+			Offset:           0,
+			SeqNum:           1,
+			ProducerID:       "p1",
+			Key:              "order-123",
+			Epoch:            200,
+			Payload:          `{"amount":50}`,
+			EventType:        "OrderCreated",
+			SchemaVersion:    2,
+			AggregateVersion: 5,
+			Metadata:         `{"source":"api"}`,
+		},
+	}
+
+	data, err := util.EncodeBatchMessages("events", 0, "1", false, msgs)
+	if err != nil {
+		t.Fatalf("EncodeBatchMessages failed: %v", err)
+	}
+
+	batch, err := util.DecodeBatchMessages(data)
+	if err != nil {
+		t.Fatalf("DecodeBatchMessages failed: %v", err)
+	}
+
+	if len(batch.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(batch.Messages))
+	}
+
+	got := batch.Messages[0]
+	if got.EventType != "OrderCreated" {
+		t.Errorf("EventType: got %q, want %q", got.EventType, "OrderCreated")
+	}
+	if got.SchemaVersion != 2 {
+		t.Errorf("SchemaVersion: got %d, want 2", got.SchemaVersion)
+	}
+	if got.AggregateVersion != 5 {
+		t.Errorf("AggregateVersion: got %d, want 5", got.AggregateVersion)
+	}
+	if got.Metadata != `{"source":"api"}` {
+		t.Errorf("Metadata: got %q, want %q", got.Metadata, `{"source":"api"}`)
+	}
+}
+
+func TestDecodeBatchMessages_WrongMagic(t *testing.T) {
+	_, err := util.DecodeBatchMessages([]byte{0xFF, 0xFF, 0x00, 0x00})
+	if err == nil {
+		t.Fatal("expected error for wrong magic number")
+	}
+}
+
+func TestDecodeBatchMessages_TooShort(t *testing.T) {
+	_, err := util.DecodeBatchMessages([]byte{0x00})
+	if err == nil {
+		t.Fatal("expected error for too-short data")
+	}
+}
+
+func TestDecodeBatchMessages_ExcessiveCount(t *testing.T) {
+	// Build a valid header with zero messages, then patch the count to exceed the max
+	data, err := util.EncodeBatchMessages("t", 0, "1", false, []types.Message{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Patch the last 4 bytes (message count) to 200000 = 0x00030D40
+	if len(data) < 4 {
+		t.Fatalf("data too short to patch: %d", len(data))
+	}
+	data[len(data)-4] = 0x00
+	data[len(data)-3] = 0x03
+	data[len(data)-2] = 0x0D
+	data[len(data)-1] = 0x40
+
+	_, err = util.DecodeBatchMessages(data)
+	if err == nil {
+		t.Fatal("expected error for excessive message count")
+	}
+}
+
 func TestBatchMessagesEdgeCases(t *testing.T) {
 	t.Run("EmptyBatch", func(t *testing.T) {
 		data, err := util.EncodeBatchMessages("topic", 0, "1", false, []types.Message{})
