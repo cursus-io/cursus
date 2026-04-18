@@ -3,7 +3,7 @@ CLI_NAME := cursus-cli
 
 GO := go
 GOLINT := golangci-lint
-TEST_FLAGS := -v -race -cover
+TEST_FLAGS := -v -race
 BUILD_FLAGS := -ldflags="-s -w"
 
 E2E_COMPOSE_FILE := test/e2e/docker-compose.yml
@@ -146,11 +146,11 @@ fmt:
 	@echo "Formatting code..."  
 	$(GO) fmt ./...  
   
-.PHONY: coverage  
-coverage:  
-	@echo "Running tests with coverage..."  
-	$(GO) test $(TEST_FLAGS) -coverprofile=coverage.out $(shell go list ./... | grep -v /test/e2e)    
-	@echo "Coverage report saved to coverage.out"  
+.PHONY: coverage
+coverage:
+	@echo "Running tests with coverage..."
+	$(GO) test $(TEST_FLAGS) -coverprofile=coverage.out $(shell go list ./... | grep -v -E '/test/|/examples/|/cmd/|/bench$$')
+	@echo "Coverage report saved to coverage.out"
   
 .PHONY: help  
 help:  

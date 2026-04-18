@@ -100,9 +100,6 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 		// Start background heartbeats to all cluster members
 		clusterClient.StartHeartbeat(ctx, cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort)
 
-		globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
-		cc.SetLocalProcessor(globalCH)
-
 		// Every node should attempt to join the cluster via seeds
 		go func() {
 			util.Info("🚀 Attempting to join cluster via seeds...")
@@ -140,11 +137,23 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 		healthPort = DefaultHealthCheckPort
 	}
 	startHealthCheckServer(healthPort, brokerReady)
+
+	globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
+	if cc != nil {
+		cc.SetLocalProcessor(globalCH)
+	}
+	go func() {
+		<-ctx.Done()
+		if err := globalCH.Close(); err != nil {
+			util.Error("Failed to close command handler: %v", err)
+		}
+	}()
+
 	workerCh := make(chan net.Conn, maxWorkers)
 	for i := 0; i < maxWorkers; i++ {
 		go func() {
 			for conn := range workerCh {
-				HandleConnection(ctx, conn, tm, cfg, cd, sm, cc)
+				handleConn(ctx, conn, globalCH)
 			}
 		}()
 	}
@@ -159,7 +168,62 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	}
 }
 
-// HandleConnection processes a single client connection
+// handleConn processes a connection using a shared CommandHandler.
+func handleConn(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler) {
+	isStreamed := false
+	defer func() {
+		if !isStreamed {
+			_ = conn.Close()
+		}
+	}()
+
+	clientCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	cmdCtx := controller.NewClientContext("default-group", 0)
+
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			util.Error("⚠️ SetReadDeadline error: %v", err)
+			return
+		}
+
+		data, err := readMessage(conn, cmdHandler.Config.CompressionType)
+		if err != nil {
+			select {
+			case <-clientCtx.Done():
+				return
+			default:
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				return
+			}
+		}
+
+		shouldExit, err := processMessage(data, cmdHandler, cmdCtx, conn)
+		if err != nil {
+			return
+		}
+		if shouldExit {
+			_, payload, decodeErr := util.DecodeMessage(data)
+			cmd := ""
+			if decodeErr == nil {
+				cmd = strings.TrimSpace(payload)
+			} else {
+				cmd = strings.TrimSpace(string(data))
+			}
+
+			if strings.HasPrefix(strings.ToUpper(cmd), "STREAM ") {
+				isStreamed = true
+			}
+			return
+		}
+	}
+}
+
+// HandleConnection processes a single client connection (creates a new CommandHandler per call).
+// Deprecated: prefer handleConn with a shared CommandHandler to avoid file descriptor leaks.
 func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager, cfg *config.Config, cd *coordinator.Coordinator, sm *stream.StreamManager, cc *clusterController.ClusterController) {
 	isStreamed := false
 	defer func() {
@@ -172,6 +236,7 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 	defer cancel()
 
 	cmdHandler, cmdCtx := initializeConnection(cfg, tm, cd, sm, cc)
+	defer func() { _ = cmdHandler.Close() }()
 
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {

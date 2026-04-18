@@ -31,6 +31,10 @@ type streamState struct {
 
 // StreamIndex is a per-partition index that maps aggregate keys to their event offsets.
 // It maintains an on-disk index file and a sidecar file for key-to-hash recovery.
+//
+// NOTE: The on-disk index stores FNV-64a key hashes, not raw keys. In the rare event of
+// a hash collision, after a restart, entries for colliding keys may appear under all keys
+// that share the same hash. This is a known imprecision with negligible probability.
 type StreamIndex struct {
 	mu sync.RWMutex
 
@@ -47,7 +51,7 @@ type StreamIndex struct {
 	entries map[string][]StreamIndexEntry
 
 	// Track which keys have been written to the sidecar.
-	knownKeys map[uint64]string
+	knownKeys map[string]bool
 }
 
 // NewStreamIndex opens or creates the index and sidecar files for the given partition,
@@ -74,7 +78,7 @@ func NewStreamIndex(dir string, partitionID int) (*StreamIndex, error) {
 		sidecarFile: sidecarFile,
 		states:      make(map[string]*streamState),
 		entries:     make(map[string][]StreamIndexEntry),
-		knownKeys:   make(map[uint64]string),
+		knownKeys:   make(map[string]bool),
 	}
 
 	if err := si.loadFromDisk(); err != nil {
@@ -95,7 +99,7 @@ func (si *StreamIndex) loadFromDisk() error {
 		return fmt.Errorf("read sidecar: %w", err)
 	}
 
-	hashToKey := make(map[uint64]string)
+	hashToKeys := make(map[uint64][]string)
 	pos := 0
 	for pos < len(sidecarData) {
 		if pos+10 > len(sidecarData) {
@@ -109,8 +113,11 @@ func (si *StreamIndex) loadFromDisk() error {
 		}
 		key := string(sidecarData[pos : pos+int(keyLen)])
 		pos += int(keyLen)
-		hashToKey[hash] = key
-		si.knownKeys[hash] = key
+		// Handle hash collisions: store all keys that map to the same hash.
+		if !si.knownKeys[key] {
+			hashToKeys[hash] = append(hashToKeys[hash], key)
+			si.knownKeys[key] = true
+		}
 	}
 
 	// Read index file entries.
@@ -127,24 +134,29 @@ func (si *StreamIndex) loadFromDisk() error {
 			Position:         binary.BigEndian.Uint64(indexData[i+24 : i+32]),
 		}
 
-		key, ok := hashToKey[entry.KeyHash]
-		if !ok {
+		keys, ok := hashToKeys[entry.KeyHash]
+		if !ok || len(keys) == 0 {
 			// Skip entries with unknown keys (should not happen with valid data).
 			continue
 		}
 
-		si.entries[key] = append(si.entries[key], entry)
+		// If only one key maps to this hash, use it directly.
+		// If multiple keys collide on the same hash, add the entry to all of them;
+		// the in-memory entries will be resolved by the caller's key lookup.
+		for _, key := range keys {
+			si.entries[key] = append(si.entries[key], entry)
 
-		st, exists := si.states[key]
-		if !exists {
-			st = &streamState{}
-			si.states[key] = st
+			st, exists := si.states[key]
+			if !exists {
+				st = &streamState{}
+				si.states[key] = st
+			}
+			if entry.AggregateVersion > st.currentVersion {
+				st.currentVersion = entry.AggregateVersion
+			}
+			st.lastOffset = entry.Offset
+			st.entryCount++
 		}
-		if entry.AggregateVersion > st.currentVersion {
-			st.currentVersion = entry.AggregateVersion
-		}
-		st.lastOffset = entry.Offset
-		st.entryCount++
 	}
 
 	return nil
@@ -211,11 +223,11 @@ func (si *StreamIndex) appendLocked(key string, aggregateVersion, offset, positi
 	keyHash := util.GenerateID(key)
 
 	// Write to sidecar on first occurrence of this key.
-	if _, exists := si.knownKeys[keyHash]; !exists {
+	if !si.knownKeys[key] {
 		if err := si.writeSidecarEntry(keyHash, key); err != nil {
 			return fmt.Errorf("write sidecar entry: %w", err)
 		}
-		si.knownKeys[keyHash] = key
+		si.knownKeys[key] = true
 	}
 
 	entry := StreamIndexEntry{
@@ -252,8 +264,15 @@ func (si *StreamIndex) appendLocked(key string, aggregateVersion, offset, positi
 }
 
 // writeSidecarEntry writes a key-to-hash mapping: [hash:8][keyLen:2][keyBytes:N]
+// maxSidecarKeyLen is the maximum allowed key length for sidecar entries.
+// The sidecar format stores key length as a uint16, so the maximum is 65535.
+const maxSidecarKeyLen = 65535
+
 func (si *StreamIndex) writeSidecarEntry(hash uint64, key string) error {
 	keyBytes := []byte(key)
+	if len(keyBytes) > maxSidecarKeyLen {
+		return fmt.Errorf("key length %d exceeds maximum %d bytes", len(keyBytes), maxSidecarKeyLen)
+	}
 	buf := make([]byte, 10+len(keyBytes))
 	binary.BigEndian.PutUint64(buf[0:8], hash)
 	binary.BigEndian.PutUint16(buf[8:10], uint16(len(keyBytes)))
