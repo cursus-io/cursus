@@ -11,8 +11,6 @@ import (
 	"github.com/google/uuid"
 )
 
-const defaultLeaderStalenessThreshold = 30 * time.Second
-
 type leaderInfo struct {
 	addr    string
 	updated time.Time
@@ -23,15 +21,16 @@ type ProducerClient struct {
 	globalSeqNum     atomic.Uint64
 	partitionSeqNums sync.Map // int -> *atomic.Uint64
 
-	Epoch  int64
-	mu     sync.RWMutex
-	conns  atomic.Pointer[[]net.Conn]
-	config *PublisherConfig
+	Epoch     int64
+	mu        sync.RWMutex
+	conns     atomic.Pointer[[]net.Conn]
+	config    *PublisherConfig
+	tlsConfig *tls.Config
 
 	leader atomic.Pointer[leaderInfo]
 }
 
-func NewProducerClient(config *PublisherConfig) *ProducerClient {
+func NewProducerClient(config *PublisherConfig) (*ProducerClient, error) {
 	pc := &ProducerClient{
 		ID:     uuid.New().String(),
 		Epoch:  time.Now().UnixNano(),
@@ -43,7 +42,18 @@ func NewProducerClient(config *PublisherConfig) *ProducerClient {
 		updated: time.Time{},
 	})
 
-	return pc
+	if config.UseTLS {
+		cert, err := tls.LoadX509KeyPair(config.TLSCertPath, config.TLSKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("load TLS cert: %w", err)
+		}
+		pc.tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+	}
+
+	return pc, nil
 }
 
 func (pc *ProducerClient) NextSeqNum(partition int) uint64 {
@@ -64,15 +74,12 @@ func (pc *ProducerClient) connectPartitionLocked(idx int, addr string) error {
 	var err error
 
 	if pc.config.UseTLS {
-		var cert tls.Certificate
-		cert, err = tls.LoadX509KeyPair(pc.config.TLSCertPath, pc.config.TLSKeyPath)
-		if err != nil {
-			return fmt.Errorf("load TLS cert: %w", err)
+		if pc.tlsConfig == nil {
+			return fmt.Errorf("TLS enabled but certificate not loaded")
 		}
 		conn, err = tls.DialWithDialer(
 			&net.Dialer{Timeout: 5 * time.Second},
-			"tcp", addr,
-			&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},
+			"tcp", addr, pc.tlsConfig,
 		)
 		if err != nil {
 			return fmt.Errorf("TLS dial to %s failed: %w", addr, err)
@@ -132,10 +139,9 @@ func (pc *ProducerClient) Close() error {
 	}
 
 	conns := *ptr
-	for i, c := range conns {
+	for _, c := range conns {
 		if c != nil {
 			_ = c.Close()
-			conns[i] = nil
 		}
 	}
 
@@ -167,8 +173,13 @@ func (pc *ProducerClient) selectBroker() string {
 		return ""
 	}
 
+	staleness := pc.config.LeaderStaleness
+	if staleness <= 0 {
+		staleness = 30 * time.Second
+	}
+
 	info := pc.leader.Load()
-	if info != nil && info.addr != "" && time.Since(info.updated) < defaultLeaderStalenessThreshold {
+	if info != nil && info.addr != "" && time.Since(info.updated) < staleness {
 		return info.addr
 	}
 
@@ -190,6 +201,13 @@ func (pc *ProducerClient) ConnectPartition(idx int, addr string) error {
 }
 
 func (pc *ProducerClient) ReconnectPartition(idx int, addr string) error {
+	if addr == "" {
+		addr = pc.selectBroker()
+	}
+	if addr == "" {
+		return fmt.Errorf("no broker address available for partition %d", idx)
+	}
+
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 

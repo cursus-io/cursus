@@ -400,7 +400,7 @@ cfg.EnableMetrics = true
 
 // Expose metrics endpoint
 http.Handle("/metrics", sdk.MetricsHandler())
-go http.ListenAndServe(":2112", nil)
+go log.Fatal(http.ListenAndServe(":2112", nil))
 ```
 
 ### Available SDK Metrics

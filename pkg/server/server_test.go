@@ -27,13 +27,18 @@ func newTestConnPair(t *testing.T) (client, server net.Conn) {
 
 	connCh := make(chan net.Conn, 1)
 	go func() {
-		c, _ := l.Accept()
+		c, err := l.Accept()
+		if err != nil {
+			connCh <- nil
+			return
+		}
 		connCh <- c
 	}()
 
 	client, err = net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
 	server = <-connCh
+	require.NotNil(t, server, "Accept() failed")
 	t.Cleanup(func() {
 		_ = client.Close()
 		_ = server.Close()

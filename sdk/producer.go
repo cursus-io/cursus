@@ -71,9 +71,14 @@ func NewProducer(cfg *PublisherConfig) (*Producer, error) {
 		initMetrics()
 	}
 
+	client, err := NewProducerClient(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create producer client: %w", err)
+	}
+
 	p := &Producer{
 		config:       cfg,
-		client:       NewProducerClient(cfg),
+		client:       client,
 		partitions:   cfg.Partitions,
 		buffers:      make([]*partitionBuffer, cfg.Partitions),
 		done:         make(chan struct{}),

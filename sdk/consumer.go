@@ -61,7 +61,10 @@ func NewConsumer(cfg *ConsumerConfig) (*Consumer, error) {
 		initMetrics()
 	}
 
-	client := NewConsumerClient(cfg)
+	client, err := NewConsumerClient(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create consumer client: %w", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	c := &Consumer{

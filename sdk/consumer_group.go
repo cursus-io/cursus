@@ -20,20 +20,9 @@ func (c *Consumer) heartbeatLoop() {
 		case <-c.doneCh:
 			return
 		case <-ticker.C:
-			c.hbMu.Lock()
-			conn := c.hbConn
-			c.hbMu.Unlock()
-
+			conn := c.getOrDialHeartbeatConn()
 			if conn == nil {
-				newConn, err := c.getLeaderConn()
-				if err != nil {
-					LogError("Heartbeat: failed to connect: %v", err)
-					continue
-				}
-				c.hbMu.Lock()
-				c.hbConn = newConn
-				conn = newConn
-				c.hbMu.Unlock()
+				continue
 			}
 
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
@@ -73,6 +62,33 @@ func (c *Consumer) cleanupHbConn(bad net.Conn) {
 		c.hbConn = nil
 	}
 	c.hbMu.Unlock()
+}
+
+func (c *Consumer) getOrDialHeartbeatConn() net.Conn {
+	c.hbMu.Lock()
+	conn := c.hbConn
+	if conn != nil {
+		c.hbMu.Unlock()
+		return conn
+	}
+	c.hbMu.Unlock()
+
+	newConn, err := c.getLeaderConn()
+	if err != nil {
+		LogError("Heartbeat: failed to connect: %v", err)
+		return nil
+	}
+
+	c.hbMu.Lock()
+	if c.hbConn != nil {
+		_ = newConn.Close()
+		conn = c.hbConn
+	} else {
+		c.hbConn = newConn
+		conn = newConn
+	}
+	c.hbMu.Unlock()
+	return conn
 }
 
 func (c *Consumer) resetHeartbeatConn() {
@@ -180,25 +196,20 @@ func (c *Consumer) handleRebalanceSignal() {
 
 	c.mainCancel()
 
-	drainDone := make(chan struct{})
-	go func() {
-		deadline := time.After(3 * time.Second)
-		for {
-			select {
-			case <-c.commitCh:
-			case <-time.After(100 * time.Millisecond):
-				close(drainDone)
-				return
-			case <-deadline:
-				LogWarn("Rebalance drain timeout, forcing continuation")
-				close(drainDone)
-				return
-			}
-		}
-	}()
-
 	c.wg.Wait()
-	<-drainDone
+
+	drainDeadline := time.After(3 * time.Second)
+	for {
+		select {
+		case <-c.commitCh:
+		case <-time.After(100 * time.Millisecond):
+			goto drainDone
+		case <-drainDeadline:
+			LogWarn("Rebalance drain timeout, forcing continuation")
+			goto drainDone
+		}
+	}
+drainDone:
 
 	c.resetHeartbeatConn()
 	c.commitMu.Lock()

@@ -17,18 +17,31 @@ type consumerLeaderInfo struct {
 
 // ConsumerClient manages broker connections with leader-aware failover.
 type ConsumerClient struct {
-	ID     string
-	config *ConsumerConfig
-	leader atomic.Pointer[consumerLeaderInfo]
+	ID        string
+	config    *ConsumerConfig
+	leader    atomic.Pointer[consumerLeaderInfo]
+	tlsConfig *tls.Config
 }
 
-func NewConsumerClient(cfg *ConsumerConfig) *ConsumerClient {
+func NewConsumerClient(cfg *ConsumerConfig) (*ConsumerClient, error) {
 	c := &ConsumerClient{
 		ID:     uuid.New().String(),
 		config: cfg,
 	}
 	c.leader.Store(&consumerLeaderInfo{addr: "", updated: time.Time{}})
-	return c
+
+	if cfg.UseTLS {
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCertPath, cfg.TLSKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("load TLS cert: %w", err)
+		}
+		c.tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+	}
+
+	return c, nil
 }
 
 func (c *ConsumerClient) UpdateLeader(addr string) {
@@ -48,14 +61,12 @@ func (c *ConsumerClient) Connect(addr string) (net.Conn, error) {
 	var err error
 
 	if c.config.UseTLS {
-		cert, certErr := tls.LoadX509KeyPair(c.config.TLSCertPath, c.config.TLSKeyPath)
-		if certErr != nil {
-			return nil, fmt.Errorf("load TLS cert: %w", certErr)
+		if c.tlsConfig == nil {
+			return nil, fmt.Errorf("TLS enabled but certificate not loaded")
 		}
 		conn, err = tls.DialWithDialer(
 			&net.Dialer{Timeout: 5 * time.Second},
-			"tcp", addr,
-			&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},
+			"tcp", addr, c.tlsConfig,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("TLS dial to %s failed: %w", addr, err)
@@ -92,9 +103,11 @@ func (c *ConsumerClient) ConnectWithFailover() (net.Conn, string, error) {
 	}
 
 	if leaderAddr != "" {
-		if conn, err := c.Connect(leaderAddr); err == nil {
+		conn, err := c.Connect(leaderAddr)
+		if err == nil {
 			return conn, leaderAddr, nil
 		}
+		LogWarn("Cached leader %s unreachable: %v", leaderAddr, err)
 	}
 
 	var lastErr error

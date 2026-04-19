@@ -132,6 +132,12 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	}
 
 	pollStart := time.Now()
+	cfg := pc.consumer.config
+	defer func() {
+		if cfg.EnableMetrics {
+			consumerPollLatency.WithLabelValues(cfg.Topic, cfg.GroupID).Observe(time.Since(pollStart).Seconds())
+		}
+	}()
 
 	pc.mu.Lock()
 	conn := pc.conn
@@ -204,9 +210,7 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	atomic.StoreUint64(&pc.fetchOffset, newOffset)
 	bo.reset()
 
-	cfg := c.config
 	if cfg.EnableMetrics {
-		consumerPollLatency.WithLabelValues(cfg.Topic, cfg.GroupID).Observe(time.Since(pollStart).Seconds())
 		consumerMessagesReceived.WithLabelValues(cfg.Topic, cfg.GroupID).Add(float64(len(messages)))
 	}
 

@@ -4,25 +4,17 @@ on:
   push:
     branches: [main, release-*]
     paths:
-      - '.github/workflows/**'
+      - '**/*.go'
       - 'go.mod'
       - 'go.sum'
-      - 'broker.go'
-      - 'cmd/**'
-      - 'pkg/**'
-      - 'sdk/**'
-      - 'util/**'
+      - '.github/workflows/gosec-analysis.yml'
   pull_request:
     branches: [main]
     paths:
-      - '.github/workflows/**'
+      - '**/*.go'
       - 'go.mod'
       - 'go.sum'
-      - 'broker.go'
-      - 'cmd/**'
-      - 'pkg/**'
-      - 'sdk/**'
-      - 'util/**'
+      - '.github/workflows/gosec-analysis.yml'
 
 jobs:
   gosec:

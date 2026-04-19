@@ -290,7 +290,7 @@ func TestLoadConfig_PublisherDefaults(t *testing.T) {
 	assert.Equal(t, 30*time.Second, loaded.LeaderStaleness)
 }
 
-func TestLoadConfig_JSONOverridesYAMLExt(t *testing.T) {
+func TestLoadConfig_PublisherYAMLWithTLSAndMetrics(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "cfg.yaml")
 	yamlData := `topic: yaml-topic

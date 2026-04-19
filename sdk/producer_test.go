@@ -11,9 +11,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func mustNewProducerClient(cfg *PublisherConfig) *ProducerClient {
+	pc, _ := NewProducerClient(cfg)
+	return pc
+}
+
 func TestNewProducerClient_BasicConstruction(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	client := NewProducerClient(cfg)
+	client, _ := NewProducerClient(cfg)
 
 	if client == nil {
 		t.Fatal("expected non-nil ProducerClient")
@@ -40,8 +45,8 @@ func TestNewProducerClient_BasicConstruction(t *testing.T) {
 
 func TestNewProducerClient_UniqueIDs(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	p1 := NewProducerClient(cfg)
-	p2 := NewProducerClient(cfg)
+	p1, _ := NewProducerClient(cfg)
+	p2, _ := NewProducerClient(cfg)
 
 	if p1.ID == p2.ID {
 		t.Error("expected different IDs for different clients")
@@ -51,7 +56,7 @@ func TestNewProducerClient_UniqueIDs(t *testing.T) {
 func TestNextSeqNum_GlobalIncrement(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	cfg.EnableIdempotence = false
-	client := NewProducerClient(cfg)
+	client, _ := NewProducerClient(cfg)
 
 	s1 := client.NextSeqNum(0)
 	s2 := client.NextSeqNum(0)
@@ -71,7 +76,7 @@ func TestNextSeqNum_GlobalIncrement(t *testing.T) {
 func TestNextSeqNum_PerPartitionWithIdempotence(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	cfg.EnableIdempotence = true
-	client := NewProducerClient(cfg)
+	client, _ := NewProducerClient(cfg)
 
 	// Partition 0
 	s1 := client.NextSeqNum(0)
@@ -93,7 +98,7 @@ func TestNextSeqNum_PerPartitionWithIdempotence(t *testing.T) {
 func TestNextSeqNum_ConcurrentSafety(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	cfg.EnableIdempotence = false
-	client := NewProducerClient(cfg)
+	client, _ := NewProducerClient(cfg)
 
 	const goroutines = 100
 	var wg sync.WaitGroup
@@ -121,13 +126,13 @@ func TestProducerClient_SelectBroker_NilConfig(t *testing.T) {
 
 func TestProducerClient_SelectBroker_NoBrokers(t *testing.T) {
 	cfg := &PublisherConfig{BrokerAddrs: []string{}}
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 	assert.Equal(t, "", pc.selectBroker())
 }
 
 func TestProducerClient_SelectBroker_FreshLeader(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 
 	pc.leader.Store(&leaderInfo{
 		addr:    "leader:9000",
@@ -138,7 +143,7 @@ func TestProducerClient_SelectBroker_FreshLeader(t *testing.T) {
 
 func TestProducerClient_SelectBroker_StaleLeader(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 
 	pc.leader.Store(&leaderInfo{
 		addr:    "old-leader:9000",
@@ -149,13 +154,13 @@ func TestProducerClient_SelectBroker_StaleLeader(t *testing.T) {
 
 func TestProducerClient_SelectBroker_EmptyLeader(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 	assert.Equal(t, "localhost:9000", pc.selectBroker())
 }
 
 func TestProducerClient_UpdateLeader(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 
 	pc.UpdateLeader("broker-1:9000")
 	info := pc.leader.Load()
@@ -165,7 +170,7 @@ func TestProducerClient_UpdateLeader(t *testing.T) {
 
 func TestProducerClient_UpdateLeader_SameAddrNoOp(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 
 	pc.UpdateLeader("broker-1:9000")
 	firstUpdate := pc.leader.Load().updated
@@ -179,7 +184,7 @@ func TestProducerClient_UpdateLeader_SameAddrNoOp(t *testing.T) {
 
 func TestProducerClient_UpdateLeader_DifferentAddrUpdates(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 
 	pc.UpdateLeader("broker-1:9000")
 	pc.UpdateLeader("broker-2:9000")
@@ -190,42 +195,40 @@ func TestProducerClient_UpdateLeader_DifferentAddrUpdates(t *testing.T) {
 
 func TestProducerClient_GetLeaderAddr_Empty(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 	assert.Equal(t, "", pc.GetLeaderAddr())
 }
 
 func TestProducerClient_GetLeaderAddr_Set(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 	pc.UpdateLeader("broker:9000")
 	assert.Equal(t, "broker:9000", pc.GetLeaderAddr())
 }
 
 func TestProducerClient_GetConn_Nil(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 	assert.Nil(t, pc.GetConn(0))
 }
 
 func TestProducerClient_GetConn_OutOfRange(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 
-	conns := make([]any, 0)
-	_ = conns
 	assert.Nil(t, pc.GetConn(5))
 	assert.Nil(t, pc.GetConn(-1))
 }
 
 func TestProducerClient_Close_NilConns(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 	assert.NoError(t, pc.Close())
 }
 
 func TestProducerClient_ConnectPartition_NoBroker(t *testing.T) {
 	cfg := &PublisherConfig{BrokerAddrs: []string{}}
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 	err := pc.ConnectPartition(0, "")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "no broker address available")
@@ -233,7 +236,7 @@ func TestProducerClient_ConnectPartition_NoBroker(t *testing.T) {
 
 func TestProducerClient_ConnectPartitionLocked_NegativeIndex(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 	err := pc.connectPartitionLocked(-1, "localhost:9000")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid partition index")
@@ -375,7 +378,7 @@ func TestProducer_ExtractAny_DrainAll(t *testing.T) {
 func TestProducer_ParseAckResponse_OK(t *testing.T) {
 	p := &Producer{
 		config: &PublisherConfig{},
-		client: NewProducerClient(NewDefaultPublisherConfig()),
+		client: mustNewProducerClient(NewDefaultPublisherConfig()),
 	}
 
 	ack := AckResponse{
@@ -395,7 +398,7 @@ func TestProducer_ParseAckResponse_OK(t *testing.T) {
 func TestProducer_ParseAckResponse_ErrorPrefix(t *testing.T) {
 	p := &Producer{
 		config: &PublisherConfig{},
-		client: NewProducerClient(NewDefaultPublisherConfig()),
+		client: mustNewProducerClient(NewDefaultPublisherConfig()),
 	}
 
 	_, err := p.parseAckResponse([]byte("ERROR: broker busy"))
@@ -406,7 +409,7 @@ func TestProducer_ParseAckResponse_ErrorPrefix(t *testing.T) {
 func TestProducer_ParseAckResponse_InvalidJSON(t *testing.T) {
 	p := &Producer{
 		config: &PublisherConfig{},
-		client: NewProducerClient(NewDefaultPublisherConfig()),
+		client: mustNewProducerClient(NewDefaultPublisherConfig()),
 	}
 
 	_, err := p.parseAckResponse([]byte("not json"))
@@ -417,7 +420,7 @@ func TestProducer_ParseAckResponse_InvalidJSON(t *testing.T) {
 func TestProducer_ParseAckResponse_ErrorStatus(t *testing.T) {
 	p := &Producer{
 		config: &PublisherConfig{},
-		client: NewProducerClient(NewDefaultPublisherConfig()),
+		client: mustNewProducerClient(NewDefaultPublisherConfig()),
 	}
 
 	ack := AckResponse{
@@ -437,7 +440,7 @@ func TestProducer_ParseAckResponse_LeaderUpdate(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	p := &Producer{
 		config: cfg,
-		client: NewProducerClient(cfg),
+		client: mustNewProducerClient(cfg),
 	}
 
 	ack := AckResponse{
@@ -457,7 +460,7 @@ func TestProducer_ParseAckResponse_Idempotence_MissingProducerID(t *testing.T) {
 	cfg.EnableIdempotence = true
 	p := &Producer{
 		config: cfg,
-		client: NewProducerClient(cfg),
+		client: mustNewProducerClient(cfg),
 	}
 
 	ack := AckResponse{
@@ -476,7 +479,7 @@ func TestProducer_ParseAckResponse_Idempotence_EpochMismatch(t *testing.T) {
 	cfg.EnableIdempotence = true
 	p := &Producer{
 		config: cfg,
-		client: NewProducerClient(cfg),
+		client: mustNewProducerClient(cfg),
 	}
 
 	ack := AckResponse{
@@ -496,7 +499,7 @@ func TestProducer_ParseAckResponse_Idempotence_Valid(t *testing.T) {
 	cfg.EnableIdempotence = true
 	p := &Producer{
 		config: cfg,
-		client: NewProducerClient(cfg),
+		client: mustNewProducerClient(cfg),
 	}
 
 	ack := AckResponse{
@@ -594,6 +597,7 @@ func TestBatchState_Fields(t *testing.T) {
 
 func TestProducer_MarkBatchAckedByID(t *testing.T) {
 	p := &Producer{
+		config:               NewDefaultPublisherConfig(),
 		partitions:           2,
 		partitionBatchStates: make([]map[string]*BatchState, 2),
 		partitionBatchMus:    make([]sync.Mutex, 2),
@@ -849,7 +853,7 @@ func TestProducer_VerifySentSequences_Mismatch(t *testing.T) {
 	assert.Contains(t, err.Error(), "expected 5 messages sent, got 2")
 }
 
-func TestProducer_CommitBatch_SuccessNotifiesChannels(t *testing.T) {
+func TestProducer_CommitBatch_FailureNotifiesChannels(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	c, err := NewConsumer(cfg)
 	require.NoError(t, err)
@@ -871,7 +875,7 @@ func TestProducer_CommitBatch_SuccessNotifiesChannels(t *testing.T) {
 func TestProducerClient_SelectBroker_RecentLeader(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	cfg.BrokerAddrs = []string{"fallback:9000"}
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 
 	pc.leader.Store(&leaderInfo{
 		addr:    "current-leader:9000",
@@ -884,11 +888,11 @@ func TestProducerClient_SelectBroker_RecentLeader(t *testing.T) {
 func TestProducerClient_SelectBroker_ExactlyStaleThreshold(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	cfg.BrokerAddrs = []string{"fallback:9000"}
-	pc := NewProducerClient(cfg)
+	pc, _ := NewProducerClient(cfg)
 
 	pc.leader.Store(&leaderInfo{
 		addr:    "stale-leader:9000",
-		updated: time.Now().Add(-defaultLeaderStalenessThreshold - 1*time.Second),
+		updated: time.Now().Add(-31 * time.Second),
 	})
 
 	assert.Equal(t, "fallback:9000", pc.selectBroker())

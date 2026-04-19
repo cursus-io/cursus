@@ -219,6 +219,8 @@ func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error)
 		ackResp, err := p.parseAckResponse(resp)
 		if err != nil {
 			lastErr = err
+			time.Sleep(time.Duration(backoff) * time.Millisecond)
+			backoff = min(backoff*2, p.config.MaxBackoffMS)
 			continue
 		}
 
@@ -263,7 +265,9 @@ func (p *Producer) markBatchAckedByID(part int, batchID string, batchLen int) {
 	p.bmMu.Lock()
 	p.bmTotalCount[part] += 1
 	p.bmTotalTime[part] += elapsed
-	p.bmLatencies = append(p.bmLatencies, elapsed)
+	if p.config.EnableBenchmark {
+		p.bmLatencies = append(p.bmLatencies, elapsed)
+	}
 	p.bmMu.Unlock()
 }
 

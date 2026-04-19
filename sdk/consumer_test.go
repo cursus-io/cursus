@@ -10,7 +10,7 @@ import (
 
 func TestNewConsumerClient_BasicConstruction(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
-	client := NewConsumerClient(cfg)
+	client, _ := NewConsumerClient(cfg)
 
 	if client == nil {
 		t.Fatal("expected non-nil ConsumerClient")
@@ -34,8 +34,8 @@ func TestNewConsumerClient_BasicConstruction(t *testing.T) {
 
 func TestNewConsumerClient_UniqueIDs(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
-	c1 := NewConsumerClient(cfg)
-	c2 := NewConsumerClient(cfg)
+	c1, _ := NewConsumerClient(cfg)
+	c2, _ := NewConsumerClient(cfg)
 
 	if c1.ID == c2.ID {
 		t.Error("expected different IDs for different clients")
@@ -44,7 +44,7 @@ func TestNewConsumerClient_UniqueIDs(t *testing.T) {
 
 func TestConsumerClient_UpdateLeader(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
-	client := NewConsumerClient(cfg)
+	client, _ := NewConsumerClient(cfg)
 
 	client.UpdateLeader("broker-1:9000")
 	info := client.leader.Load()
@@ -54,7 +54,7 @@ func TestConsumerClient_UpdateLeader(t *testing.T) {
 
 func TestConsumerClient_UpdateLeader_SameAddrNoOp(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
-	client := NewConsumerClient(cfg)
+	client, _ := NewConsumerClient(cfg)
 
 	client.UpdateLeader("broker-1:9000")
 	firstUpdate := client.leader.Load().updated
@@ -68,7 +68,7 @@ func TestConsumerClient_UpdateLeader_SameAddrNoOp(t *testing.T) {
 
 func TestConsumerClient_UpdateLeader_DifferentAddrUpdates(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
-	client := NewConsumerClient(cfg)
+	client, _ := NewConsumerClient(cfg)
 
 	client.UpdateLeader("broker-1:9000")
 	first := client.leader.Load()
@@ -84,7 +84,7 @@ func TestConsumerClient_UpdateLeader_DifferentAddrUpdates(t *testing.T) {
 func TestConsumerClient_ConnectWithFailover_NoBrokers(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	cfg.BrokerAddrs = []string{}
-	client := NewConsumerClient(cfg)
+	client, _ := NewConsumerClient(cfg)
 
 	_, _, err := client.ConnectWithFailover()
 	assert.Error(t, err)
@@ -95,7 +95,7 @@ func TestConsumerClient_LeaderStaleness(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	cfg.LeaderStaleness = 50 * time.Millisecond
 	cfg.BrokerAddrs = []string{"unreachable:9999"}
-	client := NewConsumerClient(cfg)
+	client, _ := NewConsumerClient(cfg)
 
 	client.leader.Store(&consumerLeaderInfo{
 		addr:    "stale-leader:9000",
