@@ -88,6 +88,26 @@ func TestStreamData_EmptyEvents(t *testing.T) {
 }
 
 // Helper: verify append command formatting matches the expected protocol.
+func TestEventStore_ResetConn_Nil(t *testing.T) {
+	es := NewEventStore("localhost:9000", "orders", "p-1")
+	es.resetConn()
+	assert.Nil(t, es.conn)
+}
+
+func TestParseAppendResponse_UnknownFields(t *testing.T) {
+	resp := "OK version=7 unknown=foo offset=42 partition=1 extra=bar"
+	result := parseAppendResponse(resp)
+	assert.Equal(t, uint64(7), result.Version)
+	assert.Equal(t, uint64(42), result.Offset)
+	assert.Equal(t, 1, result.Partition)
+}
+
+func TestParseAppendResponse_NoEquals(t *testing.T) {
+	resp := "OK done"
+	result := parseAppendResponse(resp)
+	assert.Equal(t, uint64(0), result.Version)
+}
+
 func TestAppendCommandFormat(t *testing.T) {
 	es := NewEventStore("localhost:9000", "orders", "p-1")
 

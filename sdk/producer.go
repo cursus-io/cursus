@@ -1,207 +1,13 @@
 package sdk
 
 import (
-	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"net"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
 )
-
-const defaultLeaderStalenessThreshold = 30 * time.Second
-
-type leaderInfo struct {
-	addr    string
-	updated time.Time
-}
-
-type ProducerClient struct {
-	ID               string
-	globalSeqNum     atomic.Uint64
-	partitionSeqNums sync.Map // int -> *atomic.Uint64
-
-	Epoch  int64
-	mu     sync.RWMutex
-	conns  atomic.Pointer[[]net.Conn]
-	config *PublisherConfig
-
-	leader atomic.Pointer[leaderInfo]
-}
-
-func NewProducerClient(config *PublisherConfig) *ProducerClient {
-	pc := &ProducerClient{
-		ID:     uuid.New().String(),
-		Epoch:  time.Now().UnixNano(),
-		config: config,
-	}
-
-	pc.leader.Store(&leaderInfo{
-		addr:    "",
-		updated: time.Time{},
-	})
-
-	return pc
-}
-
-func (pc *ProducerClient) NextSeqNum(partition int) uint64 {
-	if !pc.config.EnableIdempotence {
-		return pc.globalSeqNum.Add(1)
-	}
-
-	val, _ := pc.partitionSeqNums.LoadOrStore(partition, &atomic.Uint64{})
-	return val.(*atomic.Uint64).Add(1)
-}
-
-func (pc *ProducerClient) connectPartitionLocked(idx int, addr string) error {
-	if idx < 0 {
-		return fmt.Errorf("invalid partition index: %d", idx)
-	}
-
-	var conn net.Conn
-	var err error
-
-	if pc.config.UseTLS {
-		var cert tls.Certificate
-		cert, err = tls.LoadX509KeyPair(pc.config.TLSCertPath, pc.config.TLSKeyPath)
-		if err != nil {
-			return fmt.Errorf("load TLS cert: %w", err)
-		}
-		conn, err = tls.Dial("tcp", addr, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
-		if err != nil {
-			return fmt.Errorf("TLS dial to %s failed: %w", addr, err)
-		}
-	} else {
-		conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
-		if err != nil {
-			return fmt.Errorf("TCP dial to %s failed: %w", addr, err)
-		}
-	}
-
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true)
-		_ = tcpConn.SetKeepAlive(true)
-		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		_ = tcpConn.SetReadBuffer(2 * 1024 * 1024)
-		_ = tcpConn.SetWriteBuffer(2 * 1024 * 1024)
-	}
-
-	var currentConns []net.Conn
-	if ptr := pc.conns.Load(); ptr != nil {
-		currentConns = *ptr
-	}
-
-	newSize := idx + 1
-	if len(currentConns) > newSize {
-		newSize = len(currentConns)
-	}
-
-	tmp := make([]net.Conn, newSize)
-	copy(tmp, currentConns)
-	tmp[idx] = conn
-
-	pc.conns.Store(&tmp)
-	return nil
-}
-
-func (pc *ProducerClient) GetConn(part int) net.Conn {
-	ptr := pc.conns.Load()
-	if ptr == nil {
-		return nil
-	}
-	conns := *ptr
-	if part >= 0 && part < len(conns) {
-		return conns[part]
-	}
-	return nil
-}
-
-func (pc *ProducerClient) Close() error {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
-	ptr := pc.conns.Swap(nil)
-	if ptr == nil {
-		return nil
-	}
-
-	conns := *ptr
-	for i, c := range conns {
-		if c != nil {
-			_ = c.Close()
-			conns[i] = nil
-		}
-	}
-
-	return nil
-}
-
-func (pc *ProducerClient) GetLeaderAddr() string {
-	info := pc.leader.Load()
-	if info == nil || info.addr == "" {
-		return ""
-	}
-	return info.addr
-}
-
-func (pc *ProducerClient) UpdateLeader(leaderAddr string) {
-	old := pc.leader.Load()
-	if old != nil && old.addr == leaderAddr {
-		return
-	}
-
-	pc.leader.Store(&leaderInfo{
-		addr:    leaderAddr,
-		updated: time.Now(),
-	})
-}
-
-func (pc *ProducerClient) selectBroker() string {
-	if pc.config == nil || len(pc.config.BrokerAddrs) == 0 {
-		return ""
-	}
-
-	info := pc.leader.Load()
-	if info != nil && info.addr != "" && time.Since(info.updated) < defaultLeaderStalenessThreshold {
-		return info.addr
-	}
-
-	return pc.config.BrokerAddrs[0]
-}
-
-func (pc *ProducerClient) ConnectPartition(idx int, addr string) error {
-	if addr == "" {
-		addr = pc.selectBroker()
-	}
-	if addr == "" {
-		return fmt.Errorf("no broker address available for partition %d", idx)
-	}
-
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
-	return pc.connectPartitionLocked(idx, addr)
-}
-
-func (pc *ProducerClient) ReconnectPartition(idx int, addr string) error {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
-	oldPtr := pc.conns.Load()
-	if oldPtr != nil {
-		conns := *oldPtr
-		if idx < len(conns) && conns[idx] != nil {
-			_ = conns[idx].Close()
-		}
-	}
-
-	return pc.connectPartitionLocked(idx, addr)
-}
 
 type BatchState struct {
 	BatchID     string
@@ -261,6 +67,10 @@ type Producer struct {
 }
 
 func NewProducer(cfg *PublisherConfig) (*Producer, error) {
+	if cfg.EnableMetrics {
+		initMetrics()
+	}
+
 	p := &Producer{
 		config:       cfg,
 		client:       NewProducerClient(cfg),
@@ -471,281 +281,7 @@ func (p *Producer) extractAny(buf *partitionBuffer) []Message {
 	return batch
 }
 
-func (p *Producer) sendBatch(part int, batch []Message) {
-	if len(batch) == 0 {
-		return
-	}
-
-	atomic.AddInt32(&p.inFlight[part], 1)
-	defer atomic.AddInt32(&p.inFlight[part], -1)
-
-	var batchStart, batchEnd uint64
-	if len(batch) > 0 {
-		batchStart = batch[0].SeqNum
-		batchEnd = batch[len(batch)-1].SeqNum
-	}
-
-	shortID := p.client.ID[:8]
-	batchID := fmt.Sprintf("%s-%d-p%d-%d-%d", shortID, p.client.Epoch, part, batchStart, batchEnd)
-
-	p.partitionBatchMus[part].Lock()
-	p.partitionBatchStates[part][batchID] = &BatchState{
-		BatchID:     batchID,
-		StartSeqNum: batchStart,
-		EndSeqNum:   batchEnd,
-		Partition:   part,
-		SentTime:    time.Now(),
-		Acked:       false,
-	}
-	p.partitionBatchMus[part].Unlock()
-
-	data, err := EncodeBatchMessages(p.config.Topic, part, p.config.Acks, p.config.EnableIdempotence, batch)
-	if err != nil {
-		LogError("encode batch failed: %v", err)
-		p.cleanupBatchState(part, batchID)
-		p.handleSendFailure(part, batch)
-		return
-	}
-
-	payload, err := CompressMessage(data, p.config.CompressionType)
-	if err != nil {
-		LogError("compress batch failed: %v", err)
-		p.cleanupBatchState(part, batchID)
-		p.handleSendFailure(part, batch)
-		return
-	}
-
-	ackResp, err := p.sendWithRetry(payload, part)
-	if err != nil {
-		LogError("send failed: %v", err)
-		p.cleanupBatchState(part, batchID)
-		p.handleSendFailure(part, batch)
-		return
-	}
-
-	p.attemptsCount.Add(uint64(len(batch)))
-
-	switch ackResp.Status {
-	case "OK":
-		p.partitionSentMus[part].Lock()
-		for _, m := range batch {
-			p.partitionSentSeqs[part][m.SeqNum] = struct{}{}
-		}
-		p.partitionSentMus[part].Unlock()
-		p.markBatchAckedByID(part, batchID, len(batch))
-	case "PARTIAL":
-		LogWarn("Partial success for batch %s", batchID)
-		p.cleanupBatchState(part, batchID)
-		p.handlePartialFailure(part, batch, ackResp)
-	default:
-		p.cleanupBatchState(part, batchID)
-	}
-}
-
-func (p *Producer) cleanupBatchState(part int, batchID string) {
-	p.partitionBatchMus[part].Lock()
-	delete(p.partitionBatchStates[part], batchID)
-	p.partitionBatchMus[part].Unlock()
-}
-
-func (p *Producer) handleSendFailure(part int, batch []Message) {
-	if len(batch) == 0 {
-		return
-	}
-
-	buf := p.buffers[part]
-	buf.mu.Lock()
-	defer buf.mu.Unlock()
-
-	p.partitionSentMus[part].Lock()
-	var retryBatch []Message
-	for _, msg := range batch {
-		if _, exists := p.partitionSentSeqs[part][msg.SeqNum]; !exists {
-			msg.Retry = true
-			retryBatch = append(retryBatch, msg)
-		}
-	}
-	p.partitionSentMus[part].Unlock()
-
-	allMsgs := append(buf.msgs, retryBatch...)
-	sort.Slice(allMsgs, func(i, j int) bool {
-		if allMsgs[i].Retry && !allMsgs[j].Retry {
-			return true
-		}
-		if !allMsgs[i].Retry && allMsgs[j].Retry {
-			return false
-		}
-		return allMsgs[i].SeqNum < allMsgs[j].SeqNum
-	})
-
-	buf.msgs = allMsgs
-	buf.cond.Signal()
-}
-
-func (p *Producer) handlePartialFailure(part int, batch []Message, ackResp *AckResponse) {
-	lastSuccessSeq := ackResp.SeqEnd
-
-	buf := p.buffers[part]
-	buf.mu.Lock()
-	defer buf.mu.Unlock()
-
-	var retryBatch []Message
-	for _, msg := range batch {
-		if msg.SeqNum > lastSuccessSeq {
-			retryBatch = append(retryBatch, msg)
-		}
-	}
-
-	if len(retryBatch) > 0 {
-		allMsgs := append(buf.msgs, retryBatch...)
-		sort.Slice(allMsgs, func(i, j int) bool {
-			return allMsgs[i].SeqNum < allMsgs[j].SeqNum
-		})
-		buf.msgs = allMsgs
-		buf.cond.Signal()
-	}
-}
-
-func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error) {
-	maxAttempts := p.config.MaxRetries + 1
-	backoff := p.config.RetryBackoffMS
-
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		conn := p.client.GetConn(part)
-		if conn == nil {
-			brokerAddr := p.client.selectBroker()
-			if err := p.client.ReconnectPartition(part, brokerAddr); err != nil {
-				lastErr = fmt.Errorf("reconnect failed: %w", err)
-				time.Sleep(time.Duration(backoff) * time.Millisecond)
-				backoff = min(backoff*2, p.config.MaxBackoffMS)
-				continue
-			}
-			conn = p.client.GetConn(part)
-			if conn == nil {
-				lastErr = fmt.Errorf("no connection after reconnect")
-				time.Sleep(time.Duration(backoff) * time.Millisecond)
-				backoff = min(backoff*2, p.config.MaxBackoffMS)
-				continue
-			}
-		}
-
-		if err := conn.SetWriteDeadline(time.Now().Add(time.Duration(p.config.WriteTimeoutMS) * time.Millisecond)); err != nil {
-			lastErr = fmt.Errorf("set write deadline failed: %w", err)
-			time.Sleep(time.Duration(backoff) * time.Millisecond)
-			backoff = min(backoff*2, p.config.MaxBackoffMS)
-			continue
-		}
-
-		if err := WriteWithLength(conn, payload); err != nil {
-			lastErr = fmt.Errorf("write failed: %w", err)
-			brokerAddr := p.client.selectBroker()
-			_ = p.client.ReconnectPartition(part, brokerAddr)
-			time.Sleep(time.Duration(backoff) * time.Millisecond)
-			backoff = min(backoff*2, p.config.MaxBackoffMS)
-			continue
-		}
-
-		if p.config.Acks == "0" {
-			return &AckResponse{Status: "OK"}, nil
-		}
-
-		_ = conn.SetReadDeadline(time.Now().Add(time.Duration(p.config.AckTimeoutMS) * time.Millisecond))
-		resp, err := ReadWithLength(conn)
-		_ = conn.SetReadDeadline(time.Time{})
-
-		if err != nil {
-			lastErr = fmt.Errorf("read ack failed: %w", err)
-			time.Sleep(time.Duration(backoff) * time.Millisecond)
-			backoff = min(backoff*2, p.config.MaxBackoffMS)
-			continue
-		}
-
-		ackResp, err := p.parseAckResponse(resp)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		return ackResp, nil
-	}
-	return nil, lastErr
-}
-
-func (p *Producer) markBatchAckedByID(part int, batchID string, batchLen int) {
-	p.partitionBatchMus[part].Lock()
-	state, ok := p.partitionBatchStates[part][batchID]
-	if !ok || state.Acked {
-		p.partitionBatchMus[part].Unlock()
-		return
-	}
-
-	state.Acked = true
-	p.uniqueCount.Add(uint64(batchLen))
-
-	delete(p.partitionBatchStates[part], batchID)
-	p.partitionBatchMus[part].Unlock()
-
-	// Atomic max update for ackedCount
-	for {
-		current := p.ackedCount.Load()
-		if state.EndSeqNum <= current {
-			break
-		}
-		if p.ackedCount.CompareAndSwap(current, state.EndSeqNum) {
-			break
-		}
-	}
-
-	// Prune sent sequences below the highest acked to prevent memory leak
-	p.partitionSentMus[part].Lock()
-	for seq := range p.partitionSentSeqs[part] {
-		if seq <= state.EndSeqNum {
-			delete(p.partitionSentSeqs[part], seq)
-		}
-	}
-	p.partitionSentMus[part].Unlock()
-
-	elapsed := time.Since(state.SentTime)
-	p.bmMu.Lock()
-	p.bmTotalCount[part] += 1
-	p.bmTotalTime[part] += elapsed
-	p.bmLatencies = append(p.bmLatencies, elapsed)
-	p.bmMu.Unlock()
-}
-
-func (p *Producer) parseAckResponse(resp []byte) (*AckResponse, error) {
-	respStr := string(resp)
-	// Handle plain-text error prefix from some broker versions
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return nil, fmt.Errorf("broker error: %s", strings.TrimSpace(respStr))
-	}
-
-	var ackResp AckResponse
-	if err := json.Unmarshal(resp, &ackResp); err != nil {
-		return nil, fmt.Errorf("invalid ack format: %w", err)
-	}
-
-	if ackResp.Leader != "" && ackResp.Leader != p.client.GetLeaderAddr() {
-		p.client.UpdateLeader(ackResp.Leader)
-	}
-
-	if ackResp.Status == "ERROR" {
-		return &ackResp, fmt.Errorf("broker error: %s", ackResp.ErrorMsg)
-	}
-
-	// Validate epoch and ProducerID for idempotent producers (BUG-02 fix)
-	if p.config.EnableIdempotence {
-		if ackResp.ProducerID == "" {
-			return nil, fmt.Errorf("incomplete ack: missing ProducerID")
-		}
-		if ackResp.ProducerEpoch != p.client.Epoch {
-			return nil, fmt.Errorf("epoch mismatch: expected %d, got %d", p.client.Epoch, ackResp.ProducerEpoch)
-		}
-	}
-
-	return &ackResp, nil
-}
+// ─── Flush / Stats ────────────────────────────────────────────────────────────
 
 func (p *Producer) Flush() {
 	for _, buf := range p.buffers {
@@ -824,7 +360,6 @@ func (p *Producer) FlushBenchmark(expectedTotal int) {
 	LogWarn("FlushBenchmark timeout after %v. Only %d/%d messages acknowledged.", timeout, p.GetUniqueAckCount(), expectedTotal)
 }
 
-// VerifySentSequences checks that exactly expectedCount unique sequences were acknowledged.
 func (p *Producer) VerifySentSequences(expectedCount int) error {
 	totalSent := 0
 	for part := 0; part < p.partitions; part++ {
@@ -841,7 +376,6 @@ func (p *Producer) VerifySentSequences(expectedCount int) error {
 	return nil
 }
 
-// GetPartitionStats returns per-partition batch timing statistics.
 func (p *Producer) GetPartitionStats() []PartitionStat {
 	p.bmMu.Lock()
 	defer p.bmMu.Unlock()
@@ -863,7 +397,6 @@ func (p *Producer) GetPartitionStats() []PartitionStat {
 	return stats
 }
 
-// GetLatencies returns a copy of all recorded batch latencies.
 func (p *Producer) GetLatencies() []time.Duration {
 	p.bmMu.Lock()
 	defer p.bmMu.Unlock()
@@ -873,17 +406,14 @@ func (p *Producer) GetLatencies() []time.Duration {
 	return res
 }
 
-// GetUniqueAckCount returns the number of uniquely acknowledged messages.
 func (p *Producer) GetUniqueAckCount() int {
 	return int(p.uniqueCount.Load())
 }
 
-// GetAttemptsCount returns total number of messages attempted (including retries).
 func (p *Producer) GetAttemptsCount() int {
 	return int(p.attemptsCount.Load())
 }
 
-// GetPartitionCount returns the configured partition count.
 func (p *Producer) GetPartitionCount() int {
 	return p.partitions
 }

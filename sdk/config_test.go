@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestNewDefaultPublisherConfig(t *testing.T) {
@@ -189,4 +191,169 @@ func TestLoadConfig_ConsumerDefaults(t *testing.T) {
 	if loaded.BatchSize != 100 {
 		t.Errorf("expected default BatchSize=100, got %d", loaded.BatchSize)
 	}
+}
+
+func TestNewDefaultPublisherConfig_AllDefaults(t *testing.T) {
+	cfg := NewDefaultPublisherConfig()
+
+	assert.Equal(t, 100, cfg.RetryBackoffMS)
+	assert.Equal(t, 2000, cfg.MaxBackoffMS)
+	assert.Equal(t, 0, cfg.PublishDelayMS)
+	assert.False(t, cfg.UseTLS)
+	assert.Equal(t, "", cfg.TLSCertPath)
+	assert.Equal(t, "", cfg.TLSKeyPath)
+	assert.False(t, cfg.EnableMetrics)
+	assert.False(t, cfg.EnableIdempotence)
+	assert.False(t, cfg.EnableBenchmark)
+	assert.Equal(t, "", cfg.BenchTopicName)
+	assert.Equal(t, 0, cfg.MessageSize)
+	assert.Equal(t, 0, cfg.NumMessages)
+	assert.Equal(t, 0, cfg.CurrentBrokerIndex)
+	assert.False(t, cfg.AutoCreateTopics)
+}
+
+func TestNewDefaultConsumerConfig_AllDefaults(t *testing.T) {
+	cfg := NewDefaultConsumerConfig()
+
+	assert.Equal(t, 1000, cfg.WorkerChannelSize)
+	assert.Equal(t, 500*time.Millisecond, cfg.CommitRetryBackoff)
+	assert.Equal(t, 2*time.Second, cfg.CommitRetryMaxBackoff)
+	assert.Equal(t, 1*time.Second, cfg.StreamingCommitInterval)
+	assert.Equal(t, 100, cfg.StreamingCommitBatchSize)
+	assert.Equal(t, 300000, cfg.StreamingReadDeadlineMS)
+	assert.Equal(t, 1000, cfg.StreamingRetryIntervalMS)
+	assert.False(t, cfg.UseTLS)
+	assert.Equal(t, "", cfg.TLSCertPath)
+	assert.Equal(t, "", cfg.TLSKeyPath)
+	assert.False(t, cfg.EnableMetrics)
+	assert.False(t, cfg.EnableBenchmark)
+	assert.False(t, cfg.EnableCorrectness)
+	assert.Equal(t, 0, cfg.NumMessages)
+	assert.Equal(t, 0, cfg.CurrentBrokerIndex)
+	assert.False(t, cfg.EnableImmediateCommit)
+	assert.Equal(t, 0, cfg.MaxConnectRetries)
+	assert.Equal(t, 0, cfg.ConnectRetryBackoffMS)
+}
+
+func TestConsumerConfig_TLSFields(t *testing.T) {
+	cfg := NewDefaultConsumerConfig()
+	cfg.UseTLS = true
+	cfg.TLSCertPath = "/path/to/cert.pem"
+	cfg.TLSKeyPath = "/path/to/key.pem"
+
+	assert.True(t, cfg.UseTLS)
+	assert.Equal(t, "/path/to/cert.pem", cfg.TLSCertPath)
+	assert.Equal(t, "/path/to/key.pem", cfg.TLSKeyPath)
+}
+
+func TestPublisherConfig_TLSFields(t *testing.T) {
+	cfg := NewDefaultPublisherConfig()
+	cfg.UseTLS = true
+	cfg.TLSCertPath = "/path/to/cert.pem"
+	cfg.TLSKeyPath = "/path/to/key.pem"
+
+	assert.True(t, cfg.UseTLS)
+	assert.Equal(t, "/path/to/cert.pem", cfg.TLSCertPath)
+	assert.Equal(t, "/path/to/key.pem", cfg.TLSKeyPath)
+}
+
+func TestConsumerConfig_EnableMetrics(t *testing.T) {
+	cfg := NewDefaultConsumerConfig()
+	assert.False(t, cfg.EnableMetrics)
+	cfg.EnableMetrics = true
+	assert.True(t, cfg.EnableMetrics)
+}
+
+func TestPublisherConfig_EnableMetrics(t *testing.T) {
+	cfg := NewDefaultPublisherConfig()
+	assert.False(t, cfg.EnableMetrics)
+	cfg.EnableMetrics = true
+	assert.True(t, cfg.EnableMetrics)
+}
+
+func TestLoadConfig_PublisherDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "p.json")
+	if err := os.WriteFile(path, []byte(`{"topic":"override-topic"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var loaded PublisherConfig
+	if err := LoadConfig(path, &loaded); err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	assert.Equal(t, "override-topic", loaded.Topic)
+	assert.Equal(t, 3, loaded.MaxRetries)
+	assert.Equal(t, 100, loaded.RetryBackoffMS)
+	assert.Equal(t, 5000, loaded.AckTimeoutMS)
+	assert.Equal(t, 1, loaded.Partitions)
+	assert.Equal(t, 30*time.Second, loaded.LeaderStaleness)
+}
+
+func TestLoadConfig_JSONOverridesYAMLExt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.yaml")
+	yamlData := `topic: yaml-topic
+partitions: 4
+use_tls: true
+tls_cert_path: /cert
+tls_key_path: /key
+enable_metrics: true`
+	if err := os.WriteFile(path, []byte(yamlData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var loaded PublisherConfig
+	if err := LoadConfig(path, &loaded); err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	assert.Equal(t, "yaml-topic", loaded.Topic)
+	assert.Equal(t, 4, loaded.Partitions)
+	assert.True(t, loaded.UseTLS)
+	assert.Equal(t, "/cert", loaded.TLSCertPath)
+	assert.Equal(t, "/key", loaded.TLSKeyPath)
+	assert.True(t, loaded.EnableMetrics)
+}
+
+func TestLoadConfig_ConsumerYAMLWithTLSAndMetrics(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	yamlData := `group_id: tls-group
+use_tls: true
+tls_cert_path: /consumer/cert
+tls_key_path: /consumer/key
+enable_metrics: true`
+	if err := os.WriteFile(path, []byte(yamlData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var loaded ConsumerConfig
+	if err := LoadConfig(path, &loaded); err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	assert.Equal(t, "tls-group", loaded.GroupID)
+	assert.True(t, loaded.UseTLS)
+	assert.Equal(t, "/consumer/cert", loaded.TLSCertPath)
+	assert.Equal(t, "/consumer/key", loaded.TLSKeyPath)
+	assert.True(t, loaded.EnableMetrics)
+	assert.Equal(t, 100, loaded.BatchSize)
+}
+
+func TestConsumerMode_Constants(t *testing.T) {
+	assert.Equal(t, ConsumerMode("polling"), ModePolling)
+	assert.Equal(t, ConsumerMode("streaming"), ModeStreaming)
+}
+
+func TestLoadConfig_UnknownType_UsesYAML(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.txt")
+	yamlData := `topic: txt-topic`
+	if err := os.WriteFile(path, []byte(yamlData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var loaded PublisherConfig
+	err := LoadConfig(path, &loaded)
+	assert.NoError(t, err)
+	assert.Equal(t, "txt-topic", loaded.Topic)
 }

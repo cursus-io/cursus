@@ -83,6 +83,15 @@ func TestDuration_CapsAtMax(t *testing.T) {
 	}
 }
 
+func TestDuration_CurrentZeroClamp(t *testing.T) {
+	b := newBackoff(100*time.Millisecond, 10*time.Second)
+	b.current = 0
+	d := b.duration()
+	if d < time.Millisecond {
+		t.Errorf("expected at least 1ms after zero clamp, got %v", d)
+	}
+}
+
 func TestReset(t *testing.T) {
 	b := newBackoff(10*time.Millisecond, 10*time.Second)
 

@@ -1,0 +1,205 @@
+package sdk
+
+import (
+	"crypto/tls"
+	"fmt"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+const defaultLeaderStalenessThreshold = 30 * time.Second
+
+type leaderInfo struct {
+	addr    string
+	updated time.Time
+}
+
+type ProducerClient struct {
+	ID               string
+	globalSeqNum     atomic.Uint64
+	partitionSeqNums sync.Map // int -> *atomic.Uint64
+
+	Epoch  int64
+	mu     sync.RWMutex
+	conns  atomic.Pointer[[]net.Conn]
+	config *PublisherConfig
+
+	leader atomic.Pointer[leaderInfo]
+}
+
+func NewProducerClient(config *PublisherConfig) *ProducerClient {
+	pc := &ProducerClient{
+		ID:     uuid.New().String(),
+		Epoch:  time.Now().UnixNano(),
+		config: config,
+	}
+
+	pc.leader.Store(&leaderInfo{
+		addr:    "",
+		updated: time.Time{},
+	})
+
+	return pc
+}
+
+func (pc *ProducerClient) NextSeqNum(partition int) uint64 {
+	if !pc.config.EnableIdempotence {
+		return pc.globalSeqNum.Add(1)
+	}
+
+	val, _ := pc.partitionSeqNums.LoadOrStore(partition, &atomic.Uint64{})
+	return val.(*atomic.Uint64).Add(1)
+}
+
+func (pc *ProducerClient) connectPartitionLocked(idx int, addr string) error {
+	if idx < 0 {
+		return fmt.Errorf("invalid partition index: %d", idx)
+	}
+
+	var conn net.Conn
+	var err error
+
+	if pc.config.UseTLS {
+		var cert tls.Certificate
+		cert, err = tls.LoadX509KeyPair(pc.config.TLSCertPath, pc.config.TLSKeyPath)
+		if err != nil {
+			return fmt.Errorf("load TLS cert: %w", err)
+		}
+		conn, err = tls.DialWithDialer(
+			&net.Dialer{Timeout: 5 * time.Second},
+			"tcp", addr,
+			&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},
+		)
+		if err != nil {
+			return fmt.Errorf("TLS dial to %s failed: %w", addr, err)
+		}
+	} else {
+		conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			return fmt.Errorf("TCP dial to %s failed: %w", addr, err)
+		}
+	}
+
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcpConn.SetReadBuffer(2 * 1024 * 1024)
+		_ = tcpConn.SetWriteBuffer(2 * 1024 * 1024)
+	}
+
+	var currentConns []net.Conn
+	if ptr := pc.conns.Load(); ptr != nil {
+		currentConns = *ptr
+	}
+
+	newSize := idx + 1
+	if len(currentConns) > newSize {
+		newSize = len(currentConns)
+	}
+
+	tmp := make([]net.Conn, newSize)
+	copy(tmp, currentConns)
+	tmp[idx] = conn
+
+	pc.conns.Store(&tmp)
+	return nil
+}
+
+func (pc *ProducerClient) GetConn(part int) net.Conn {
+	ptr := pc.conns.Load()
+	if ptr == nil {
+		return nil
+	}
+	conns := *ptr
+	if part >= 0 && part < len(conns) {
+		return conns[part]
+	}
+	return nil
+}
+
+func (pc *ProducerClient) Close() error {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	ptr := pc.conns.Swap(nil)
+	if ptr == nil {
+		return nil
+	}
+
+	conns := *ptr
+	for i, c := range conns {
+		if c != nil {
+			_ = c.Close()
+			conns[i] = nil
+		}
+	}
+
+	return nil
+}
+
+func (pc *ProducerClient) GetLeaderAddr() string {
+	info := pc.leader.Load()
+	if info == nil || info.addr == "" {
+		return ""
+	}
+	return info.addr
+}
+
+func (pc *ProducerClient) UpdateLeader(leaderAddr string) {
+	old := pc.leader.Load()
+	if old != nil && old.addr == leaderAddr {
+		return
+	}
+
+	pc.leader.Store(&leaderInfo{
+		addr:    leaderAddr,
+		updated: time.Now(),
+	})
+}
+
+func (pc *ProducerClient) selectBroker() string {
+	if pc.config == nil || len(pc.config.BrokerAddrs) == 0 {
+		return ""
+	}
+
+	info := pc.leader.Load()
+	if info != nil && info.addr != "" && time.Since(info.updated) < defaultLeaderStalenessThreshold {
+		return info.addr
+	}
+
+	return pc.config.BrokerAddrs[0]
+}
+
+func (pc *ProducerClient) ConnectPartition(idx int, addr string) error {
+	if addr == "" {
+		addr = pc.selectBroker()
+	}
+	if addr == "" {
+		return fmt.Errorf("no broker address available for partition %d", idx)
+	}
+
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	return pc.connectPartitionLocked(idx, addr)
+}
+
+func (pc *ProducerClient) ReconnectPartition(idx int, addr string) error {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	oldPtr := pc.conns.Load()
+	if oldPtr != nil {
+		conns := *oldPtr
+		if idx < len(conns) && conns[idx] != nil {
+			_ = conns[idx].Close()
+		}
+	}
+
+	return pc.connectPartitionLocked(idx, addr)
+}
