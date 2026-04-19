@@ -257,6 +257,7 @@ func TestConsumer_GetOrDialHeartbeatConn_ExistingConn(t *testing.T) {
 
 	server, client := net.Pipe()
 	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
 
 	c.hbMu.Lock()
 	c.hbConn = client

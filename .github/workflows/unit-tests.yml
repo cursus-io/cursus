@@ -17,6 +17,7 @@ on:
       - 'sdk/**'
       - 'test/**'
       - 'util/**'
+      - 'codecov.yml'
   pull_request:
     branches: [main, release-*]
     paths:
@@ -33,6 +34,7 @@ on:
       - 'sdk/**'
       - 'test/**'
       - 'util/**'
+      - 'codecov.yml'
 
 jobs:
   lint:
