@@ -9,7 +9,7 @@ import (
 	"net"
 
 	"github.com/pierrec/lz4/v4"
-	snappy "github.com/segmentio/kafka-go/compress/snappy/go-xerial-snappy"
+	snappy "github.com/eapache/go-xerial-snappy"
 )
 
 const MaxMessageSize = 64 * 1024 * 1024 // 64MB
