@@ -38,6 +38,6 @@ require (
 	github.com/prometheus/procfs v0.16.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546
-	golang.org/x/sys v0.37.0
+	golang.org/x/sys v0.43.0
 	google.golang.org/protobuf v1.36.10 // indirect
 )
