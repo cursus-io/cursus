@@ -304,6 +304,67 @@ This allows configuration like:
 bootstrap_servers: "broker1:9000,broker2:9000,broker3:9000"
 ```
 
+## SDK Client Configuration
+
+### Consumer TLS
+
+The Go SDK consumer now supports TLS connections, matching the producer's TLS capabilities. Add the following fields to `ConsumerConfig`:
+
+| Parameter      | Type   | Default | Description                          |
+|---------------|--------|---------|--------------------------------------|
+| `use_tls`      | bool   | false   | Enable TLS for consumer connections  |
+| `tls_cert_path`| string | ""      | Path to TLS certificate file         |
+| `tls_key_path` | string | ""      | Path to TLS private key file         |
+
+```yaml
+consumer:
+  broker_addrs: ["broker1:9000"]
+  topic: "orders"
+  group_id: "my-group"
+  use_tls: true
+  tls_cert_path: "certs/client.crt"
+  tls_key_path: "certs/client.key"
+```
+
+When `use_tls` is enabled, both producer and consumer use `tls.DialWithDialer()` with TLS 1.2 minimum.
+
+### SDK Metrics (Prometheus)
+
+Both `PublisherConfig` and `ConsumerConfig` support an `enable_metrics` field to opt in to Prometheus runtime metrics.
+
+| Parameter       | Type | Default | Description                              |
+|----------------|------|---------|------------------------------------------|
+| `enable_metrics`| bool | false   | Enable Prometheus runtime metric collection |
+
+When enabled, the SDK registers the following metrics in a dedicated Prometheus registry:
+
+**Producer Metrics:**
+
+| Metric                                    | Type      | Labels  | Description                        |
+|------------------------------------------|-----------|---------|-------------------------------------|
+| `cursus_producer_messages_sent_total`     | Counter   | topic   | Messages successfully sent          |
+| `cursus_producer_send_errors_total`       | Counter   | topic   | Send errors                         |
+| `cursus_producer_batch_latency_seconds`   | Histogram | topic   | Batch send latency                  |
+
+**Consumer Metrics:**
+
+| Metric                                     | Type      | Labels       | Description                     |
+|-------------------------------------------|-----------|--------------|----------------------------------|
+| `cursus_consumer_messages_received_total`  | Counter   | topic, group | Messages received                |
+| `cursus_consumer_commit_total`             | Counter   | topic, group | Offset commits                   |
+| `cursus_consumer_commit_errors_total`      | Counter   | topic, group | Commit errors                    |
+| `cursus_consumer_poll_latency_seconds`     | Histogram | topic, group | Poll operation latency           |
+| `cursus_consumer_rebalance_total`          | Counter   | topic, group | Rebalance events                 |
+
+To expose metrics via HTTP:
+
+```go
+import "github.com/cursus-io/cursus/sdk"
+
+http.Handle("/metrics", sdk.MetricsHandler())
+log.Fatal(http.ListenAndServe(":2112", nil))
+```
+
 ## Configuration Validation
 
 The current implementation performs minimal validation during configuration loading. The following validations are implicit:

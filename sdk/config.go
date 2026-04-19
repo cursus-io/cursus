@@ -40,6 +40,8 @@ type PublisherConfig struct {
 
 	CompressionType string `yaml:"compression_type" json:"compression_type"` // "none", "gzip", "snappy", "lz4"
 
+	EnableMetrics bool `yaml:"enable_metrics" json:"enable_metrics"`
+
 	EnableBenchmark bool   `yaml:"enable_benchmark" json:"enable_benchmark"`
 	BenchTopicName  string `yaml:"bench_topic_name" json:"bench_topic_name"`
 	MessageSize     int    `yaml:"benchmark_message_size" json:"benchmark_message_size"`
@@ -117,9 +119,15 @@ type ConsumerConfig struct {
 	EnableImmediateCommit    bool          `yaml:"enable_immediate_commit" json:"enable_immediate_commit"`
 	StreamingCommitBatchSize int           `yaml:"streaming_commit_batch_size" json:"streaming_commit_batch_size"`
 
+	UseTLS      bool   `yaml:"use_tls" json:"use_tls"`
+	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
+	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
+
 	LeaderStaleness time.Duration `yaml:"leader_staleness" json:"leader_staleness"`
 
 	CompressionType string `yaml:"compression_type" json:"compression_type"` // "none", "gzip", "snappy", "lz4"
+
+	EnableMetrics bool `yaml:"enable_metrics" json:"enable_metrics"`
 
 	LogLevel LogLevel `yaml:"log_level" json:"log_level"`
 }

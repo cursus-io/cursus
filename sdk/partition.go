@@ -131,6 +131,14 @@ func (pc *PartitionConsumer) pollAndProcess() {
 		return
 	}
 
+	pollStart := time.Now()
+	cfg := pc.consumer.config
+	defer func() {
+		if cfg.EnableMetrics {
+			consumerPollLatency.WithLabelValues(cfg.Topic, cfg.GroupID).Observe(time.Since(pollStart).Seconds())
+		}
+	}()
+
 	pc.mu.Lock()
 	conn := pc.conn
 	currentOffset := atomic.LoadUint64(&pc.fetchOffset)
@@ -201,6 +209,10 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	newOffset := messages[len(messages)-1].Offset + 1
 	atomic.StoreUint64(&pc.fetchOffset, newOffset)
 	bo.reset()
+
+	if cfg.EnableMetrics {
+		consumerMessagesReceived.WithLabelValues(cfg.Topic, cfg.GroupID).Add(float64(len(messages)))
+	}
 
 	select {
 	case pc.dataCh <- &messageBatch{topic: topic, messages: messages}:
@@ -334,6 +346,10 @@ func (pc *PartitionConsumer) startStreamLoop() {
 			atomic.StoreUint64(&pc.fetchOffset, lastOffset+1)
 			bo.reset()
 
+			if c.config.EnableMetrics {
+				consumerMessagesReceived.WithLabelValues(c.config.Topic, c.config.GroupID).Add(float64(len(messages)))
+			}
+
 			select {
 			case pc.dataCh <- &messageBatch{topic: topic, messages: messages}:
 			case <-c.doneCh:
@@ -465,10 +481,16 @@ func (pc *PartitionConsumer) commitOffsetWithRetry(offset uint64) error {
 		}()
 
 		if err == nil {
+			if pc.consumer.config.EnableMetrics {
+				consumerCommitTotal.WithLabelValues(pc.consumer.config.Topic, pc.consumer.config.GroupID).Inc()
+			}
 			return nil
 		}
 
 		lastErr = err
+		if pc.consumer.config.EnableMetrics {
+			consumerCommitErrors.WithLabelValues(pc.consumer.config.Topic, pc.consumer.config.GroupID).Inc()
+		}
 		LogError("Partition [%d] commit attempt %d/%d failed: %v", pc.partitionID, attempt+1, maxRetries, err)
 
 		if !pc.waitWithBackoff(bo) {

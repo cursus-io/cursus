@@ -10,99 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
 )
-
-// ─── ConsumerClient ──────────────────────────────────────────────────────────
-
-type consumerLeaderInfo struct {
-	addr    string
-	updated time.Time
-}
-
-// ConsumerClient manages broker connections with leader-aware failover.
-type ConsumerClient struct {
-	ID     string
-	config *ConsumerConfig
-	leader atomic.Pointer[consumerLeaderInfo]
-}
-
-func NewConsumerClient(cfg *ConsumerConfig) *ConsumerClient {
-	c := &ConsumerClient{
-		ID:     uuid.New().String(),
-		config: cfg,
-	}
-	c.leader.Store(&consumerLeaderInfo{addr: "", updated: time.Time{}})
-	return c
-}
-
-func (c *ConsumerClient) UpdateLeader(addr string) {
-	oldInfo := c.leader.Load()
-	if oldInfo.addr != addr {
-		c.leader.Store(&consumerLeaderInfo{
-			addr:    addr,
-			updated: time.Now(),
-		})
-		LogDebug("Updated leader: %s", addr)
-	}
-}
-
-// Connect opens a TCP connection to addr with socket tuning applied.
-func (c *ConsumerClient) Connect(addr string) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: 5 * time.Second}
-	conn, err := dialer.Dial("tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("dial failed to %s: %w", addr, err)
-	}
-
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true)
-		_ = tcpConn.SetKeepAlive(true)
-		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		_ = tcpConn.SetReadBuffer(2 * 1024 * 1024)
-		_ = tcpConn.SetWriteBuffer(2 * 1024 * 1024)
-	}
-
-	return conn, nil
-}
-
-// ConnectWithFailover tries the cached leader first, then each broker in order.
-func (c *ConsumerClient) ConnectWithFailover() (net.Conn, string, error) {
-	addrs := c.config.BrokerAddrs
-	if len(addrs) == 0 {
-		return nil, "", fmt.Errorf("no broker addresses configured")
-	}
-
-	leaderAddr := ""
-	if info := c.leader.Load(); info != nil && info.addr != "" && time.Since(info.updated) < c.config.LeaderStaleness {
-		leaderAddr = info.addr
-	}
-
-	if leaderAddr != "" {
-		if conn, err := c.Connect(leaderAddr); err == nil {
-			return conn, leaderAddr, nil
-		}
-	}
-
-	var lastErr error
-	for _, addr := range addrs {
-		if addr == leaderAddr {
-			continue
-		}
-		conn, err := c.Connect(addr)
-		if err == nil {
-			c.UpdateLeader(addr)
-			return conn, addr, nil
-		}
-		lastErr = err
-	}
-
-	if lastErr != nil {
-		return nil, "", fmt.Errorf("all brokers unreachable: %w", lastErr)
-	}
-	return nil, "", fmt.Errorf("all brokers unreachable")
-}
 
 type commitEntry struct {
 	partition int
@@ -127,9 +35,7 @@ type Consumer struct {
 	currentOffsets map[int]uint64
 	offsetsMu      sync.Mutex
 
-	// wg tracks per-rebalance goroutines (heartbeat, partition workers, runWorkers).
-	wg sync.WaitGroup
-	// commitWg tracks the commit worker (long-lived, survives rebalances).
+	wg       sync.WaitGroup
 	commitWg sync.WaitGroup
 
 	mainCtx    context.Context
@@ -151,7 +57,14 @@ type Consumer struct {
 }
 
 func NewConsumer(cfg *ConsumerConfig) (*Consumer, error) {
-	client := NewConsumerClient(cfg)
+	if cfg.EnableMetrics {
+		initMetrics()
+	}
+
+	client, err := NewConsumerClient(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create consumer client: %w", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	c := &Consumer{
@@ -227,6 +140,8 @@ func (c *Consumer) Start(handler func(Message) error) error {
 	<-c.mainCtx.Done()
 	return nil
 }
+
+// ─── Commit Worker ────────────────────────────────────────────────────────────
 
 func (c *Consumer) startCommitWorker() {
 	c.commitWg.Add(1)
@@ -369,7 +284,6 @@ func (c *Consumer) commitBatch(offsets map[int]uint64, respChannels map[int][]ch
 	}
 }
 
-// validateCommitConn probes the commit connection with a 1ms deadline to detect stale connections.
 func (c *Consumer) validateCommitConn() bool {
 	if c.commitConn == nil {
 		return false
@@ -466,7 +380,6 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 	return false
 }
 
-// directCommit sends a single COMMIT_OFFSET without going through the commit channel.
 func (c *Consumer) directCommit(partition int, offset uint64) error {
 	c.mu.RLock()
 	generation := c.generation
@@ -501,7 +414,6 @@ func (c *Consumer) directCommit(partition int, offset uint64) error {
 	return nil
 }
 
-// handleLeaderRedirection parses a LEADER_IS response and updates the cached leader.
 func (c *Consumer) handleLeaderRedirection(resp string) {
 	if !strings.Contains(resp, "LEADER_IS") {
 		return
@@ -515,7 +427,8 @@ func (c *Consumer) handleLeaderRedirection(resp string) {
 	}
 }
 
-// joinGroupWithRetry retries joining with exponential backoff up to 30 attempts.
+// ─── Group Protocol ───────────────────────────────────────────────────────────
+
 func (c *Consumer) joinGroupWithRetry() (int64, string, []int, error) {
 	const maxAttempts = 30
 	bo := newBackoff(1*time.Second, 5*time.Second)
@@ -674,254 +587,6 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 	return offset, nil
 }
 
-// ─── Heartbeat ────────────────────────────────────────────────────────────────
-
-func (c *Consumer) heartbeatLoop() {
-	ticker := time.NewTicker(time.Duration(c.config.HeartbeatIntervalMS) * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.doneCh:
-			return
-		case <-ticker.C:
-			c.hbMu.Lock()
-			conn := c.hbConn
-			c.hbMu.Unlock()
-
-			if conn == nil {
-				newConn, err := c.getLeaderConn()
-				if err != nil {
-					LogError("Heartbeat: failed to connect: %v", err)
-					continue
-				}
-				c.hbMu.Lock()
-				c.hbConn = newConn
-				conn = newConn
-				c.hbMu.Unlock()
-			}
-
-			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-			hb := fmt.Sprintf("HEARTBEAT topic=%s group=%s member=%s generation=%d",
-				c.config.Topic, c.config.GroupID, c.memberID, c.generation)
-			if err := WriteWithLength(conn, EncodeMessage("", hb)); err != nil {
-				LogError("Heartbeat send failed: %v", err)
-				c.cleanupHbConn(conn)
-				continue
-			}
-
-			resp, err := ReadWithLength(conn)
-			_ = conn.SetDeadline(time.Time{})
-			if err != nil {
-				LogError("Heartbeat response failed: %v", err)
-				c.cleanupHbConn(conn)
-				continue
-			}
-
-			respStr := string(resp)
-			if strings.Contains(respStr, "REBALANCE_REQUIRED") || strings.Contains(respStr, "GEN_MISMATCH") {
-				LogWarn("Heartbeat: rebalance triggered: %s", respStr)
-				select {
-				case c.rebalanceSig <- struct{}{}:
-				default:
-				}
-				return
-			}
-		}
-	}
-}
-
-func (c *Consumer) cleanupHbConn(bad net.Conn) {
-	_ = bad.Close()
-	c.hbMu.Lock()
-	if c.hbConn == bad {
-		c.hbConn = nil
-	}
-	c.hbMu.Unlock()
-}
-
-func (c *Consumer) resetHeartbeatConn() {
-	c.hbMu.Lock()
-	if c.hbConn != nil {
-		_ = c.hbConn.Close()
-		c.hbConn = nil
-	}
-	c.hbMu.Unlock()
-}
-
-// ─── Consume / Stream ─────────────────────────────────────────────────────────
-
-func (c *Consumer) startConsuming() {
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		c.heartbeatLoop()
-	}()
-
-	for pid, pc := range c.partitionConsumers {
-		c.wg.Add(1)
-		go func(pid int, pc *PartitionConsumer) {
-			defer c.wg.Done()
-			for {
-				select {
-				case <-c.doneCh:
-					return
-				case <-c.mainCtx.Done():
-					LogInfo("Partition [%d] polling worker stopping", pid)
-					return
-				default:
-					if !c.ownsPartition(pid) {
-						LogWarn("Partition [%d] no longer owned, stopping poller", pid)
-						return
-					}
-					pc.pollAndProcess()
-					select {
-					case <-time.After(c.config.PollInterval):
-					case <-c.mainCtx.Done():
-						return
-					case <-c.doneCh:
-						return
-					}
-				}
-			}
-		}(pid, pc)
-	}
-}
-
-func (c *Consumer) startStreaming() {
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		c.heartbeatLoop()
-	}()
-
-	c.mu.RLock()
-	pcs := make([]*PartitionConsumer, 0, len(c.partitionConsumers))
-	for _, pc := range c.partitionConsumers {
-		pcs = append(pcs, pc)
-	}
-	c.mu.RUnlock()
-
-	for _, pc := range pcs {
-		c.wg.Add(1)
-		go func(pc *PartitionConsumer) {
-			defer c.wg.Done()
-			pc.startStreamLoop()
-		}(pc)
-	}
-}
-
-func (c *Consumer) ownsPartition(pid int) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	pc, ok := c.partitionConsumers[pid]
-	return ok && !pc.closed
-}
-
-// ─── Rebalance ────────────────────────────────────────────────────────────────
-
-func (c *Consumer) rebalanceMonitorLoop() {
-	for {
-		select {
-		case <-c.doneCh:
-			return
-		case <-c.rebalanceSig:
-			c.handleRebalanceSignal()
-		}
-	}
-}
-
-func (c *Consumer) handleRebalanceSignal() {
-	if !atomic.CompareAndSwapInt32(&c.rebalancing, 0, 1) {
-		return
-	}
-	defer atomic.StoreInt32(&c.rebalancing, 0)
-
-	LogInfo("Rebalance started — stopping existing workers")
-
-	c.mainCancel()
-
-	// Drain commitCh for up to 3 seconds concurrently with wg.Wait.
-	drainDone := make(chan struct{})
-	go func() {
-		deadline := time.After(3 * time.Second)
-		for {
-			select {
-			case <-c.commitCh:
-			case <-time.After(100 * time.Millisecond):
-				close(drainDone)
-				return
-			case <-deadline:
-				LogWarn("Rebalance drain timeout, forcing continuation")
-				close(drainDone)
-				return
-			}
-		}
-	}()
-
-	c.wg.Wait()
-	<-drainDone
-
-	c.resetHeartbeatConn()
-	c.commitMu.Lock()
-	if c.commitConn != nil {
-		_ = c.commitConn.Close()
-		c.commitConn = nil
-	}
-	c.commitMu.Unlock()
-
-	c.mu.Lock()
-	for _, pc := range c.partitionConsumers {
-		pc.close()
-	}
-	c.partitionConsumers = make(map[int]*PartitionConsumer)
-	c.offsets = make(map[int]uint64)
-	c.mu.Unlock()
-
-	c.mainCtx, c.mainCancel = context.WithCancel(context.Background())
-
-	gen, mid, assignments, err := c.joinGroupWithRetry()
-	if err != nil {
-		LogError("Rebalance join failed: %v", err)
-		return
-	}
-	if len(assignments) == 0 {
-		assignments, err = c.syncGroup(gen, mid)
-		if err != nil {
-			LogError("Rebalance sync failed: %v", err)
-			return
-		}
-	}
-
-	c.mu.Lock()
-	c.generation = gen
-	c.memberID = mid
-	for _, pid := range assignments {
-		offset, err := c.fetchOffset(pid)
-		if err != nil {
-			LogWarn("Rebalance: offset fetch failed for P%d: %v, starting from 0", pid, err)
-			offset = 0
-		}
-		c.partitionConsumers[pid] = &PartitionConsumer{
-			partitionID:  pid,
-			consumer:     c,
-			fetchOffset:  offset,
-			commitOffset: offset,
-		}
-		c.offsets[pid] = offset
-		LogInfo("Rebalance: P%d assigned at offset %d (gen=%d)", pid, offset, gen)
-	}
-	c.mu.Unlock()
-
-	if c.config.Mode == ModeStreaming {
-		go c.startStreaming()
-	} else {
-		go c.startConsuming()
-	}
-
-	LogInfo("Rebalance completed — consuming %d partitions", len(assignments))
-}
-
 // ─── Close ────────────────────────────────────────────────────────────────────
 
 func (c *Consumer) Close() error {
@@ -937,7 +602,6 @@ func (c *Consumer) Close() error {
 	close(c.commitCh)
 	c.commitWg.Wait()
 
-	// Send LEAVE_GROUP to broker.
 	if c.memberID != "" {
 		if conn, err := c.getLeaderConn(); err == nil {
 			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s",

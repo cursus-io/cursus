@@ -388,6 +388,60 @@ docker inspect cursus | grep LogConfig
 docker exec cursus ls -la /proc/1/fd/1
 ```
 
+## SDK Client Metrics
+
+In addition to broker-side metrics, the Go SDK provides built-in Prometheus metrics for producer and consumer clients. These are opt-in via the `enable_metrics` configuration field.
+
+### Enabling SDK Metrics
+
+```go
+cfg := sdk.NewDefaultPublisherConfig()
+cfg.EnableMetrics = true
+
+// Expose metrics endpoint
+http.Handle("/metrics", sdk.MetricsHandler())
+go log.Fatal(http.ListenAndServe(":2112", nil))
+```
+
+### Available SDK Metrics
+
+**Producer:**
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cursus_producer_messages_sent_total` | Counter | Total messages successfully acknowledged |
+| `cursus_producer_send_errors_total` | Counter | Total send failures (network errors, partial failures) |
+| `cursus_producer_batch_latency_seconds` | Histogram | End-to-end batch send latency |
+
+**Consumer:**
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cursus_consumer_messages_received_total` | Counter | Total messages received (polling + streaming) |
+| `cursus_consumer_commit_total` | Counter | Successful offset commits |
+| `cursus_consumer_commit_errors_total` | Counter | Failed offset commit attempts |
+| `cursus_consumer_poll_latency_seconds` | Histogram | Poll round-trip latency |
+| `cursus_consumer_rebalance_total` | Counter | Consumer group rebalance events |
+
+### Prometheus Scrape Configuration for SDK
+
+```yaml
+scrape_configs:
+  - job_name: 'cursus-sdk'
+    scrape_interval: 10s
+    static_configs:
+      - targets: ['app-host:2112']
+```
+
+### Recommended Alerts for SDK Metrics
+
+| Alert | Condition | Severity |
+|-------|-----------|----------|
+| HighSendErrorRate | `rate(cursus_producer_send_errors_total[5m]) > 0.1` | Warning |
+| ConsumerLag | `rate(cursus_consumer_messages_received_total[5m]) == 0` | Warning |
+| FrequentRebalances | `rate(cursus_consumer_rebalance_total[5m]) > 0.5` | Warning |
+| HighCommitFailure | `rate(cursus_consumer_commit_errors_total[5m]) > 0.05` | Warning |
+
 # Summary
 
 cursus provides comprehensive observability through three independent systems:
