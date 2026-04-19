@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -221,4 +222,56 @@ func TestConsumer_OwnsPartition_ClosedPartition(t *testing.T) {
 	consumer.mu.Unlock()
 
 	assert.False(t, consumer.ownsPartition(0))
+}
+
+func TestNewConsumerClient_TLSError(t *testing.T) {
+	cfg := NewDefaultConsumerConfig()
+	cfg.UseTLS = true
+	cfg.TLSCertPath = "/nonexistent/cert.pem"
+	cfg.TLSKeyPath = "/nonexistent/key.pem"
+
+	client, err := NewConsumerClient(cfg)
+	assert.Nil(t, client)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "load TLS cert")
+}
+
+func TestConsumerClient_Connect_TLSEnabledButNilConfig(t *testing.T) {
+	cfg := NewDefaultConsumerConfig()
+	cfg.UseTLS = true
+
+	client := &ConsumerClient{
+		ID:     "test-id",
+		config: cfg,
+	}
+	client.leader.Store(&consumerLeaderInfo{addr: "", updated: time.Time{}})
+
+	conn, err := client.Connect("localhost:9999")
+	assert.Nil(t, conn)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "TLS enabled but certificate not loaded")
+}
+
+func TestConsumer_GetOrDialHeartbeatConn_ExistingConn(t *testing.T) {
+	c := newTestConsumer(t)
+
+	server, client := net.Pipe()
+	defer func() { _ = server.Close() }()
+
+	c.hbMu.Lock()
+	c.hbConn = client
+	c.hbMu.Unlock()
+
+	conn := c.getOrDialHeartbeatConn()
+	assert.Equal(t, client, conn)
+}
+
+func TestConsumer_GetOrDialHeartbeatConn_NilConnGetLeaderFails(t *testing.T) {
+	cfg := NewDefaultConsumerConfig()
+	cfg.BrokerAddrs = []string{}
+	c, err := NewConsumer(cfg)
+	require.NoError(t, err)
+
+	conn := c.getOrDialHeartbeatConn()
+	assert.Nil(t, conn)
 }

@@ -98,7 +98,11 @@ func (c *ConsumerClient) ConnectWithFailover() (net.Conn, string, error) {
 	}
 
 	leaderAddr := ""
-	if info := c.leader.Load(); info != nil && info.addr != "" && time.Since(info.updated) < c.config.LeaderStaleness {
+	staleness := c.config.LeaderStaleness
+	if staleness <= 0 {
+		staleness = 30 * time.Second
+	}
+	if info := c.leader.Load(); info != nil && info.addr != "" && time.Since(info.updated) < staleness {
 		leaderAddr = info.addr
 	}
 

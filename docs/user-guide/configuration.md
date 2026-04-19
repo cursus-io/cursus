@@ -91,10 +91,6 @@ The same configuration can be expressed in JSON format:
 The configuration is represented by the Config struct in the codebase, which organizes parameters into logical categories.
 
 
-### Configuration Parameters
-
-_todo_
-
 ### Common Parameters
 
 | Parameter           | Type       | Default        | Description                                      |

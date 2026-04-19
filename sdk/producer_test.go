@@ -898,6 +898,122 @@ func TestProducerClient_SelectBroker_ExactlyStaleThreshold(t *testing.T) {
 	assert.Equal(t, "fallback:9000", pc.selectBroker())
 }
 
+func TestNewProducerClient_TLSError(t *testing.T) {
+	cfg := NewDefaultPublisherConfig()
+	cfg.UseTLS = true
+	cfg.TLSCertPath = "/nonexistent/cert.pem"
+	cfg.TLSKeyPath = "/nonexistent/key.pem"
+
+	client, err := NewProducerClient(cfg)
+	assert.Nil(t, client)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "load TLS cert")
+}
+
+func TestProducerClient_ReconnectPartition_EmptyAddrFallsBackToSelectBroker(t *testing.T) {
+	cfg := NewDefaultPublisherConfig()
+	cfg.BrokerAddrs = []string{}
+	pc, _ := NewProducerClient(cfg)
+
+	err := pc.ReconnectPartition(0, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no broker address available")
+}
+
+func TestProducerClient_SelectBroker_CustomLeaderStaleness(t *testing.T) {
+	cfg := NewDefaultPublisherConfig()
+	cfg.BrokerAddrs = []string{"fallback:9000"}
+	cfg.LeaderStaleness = 5 * time.Second
+	pc, _ := NewProducerClient(cfg)
+
+	pc.leader.Store(&leaderInfo{
+		addr:    "leader:9000",
+		updated: time.Now().Add(-3 * time.Second),
+	})
+	assert.Equal(t, "leader:9000", pc.selectBroker())
+
+	pc.leader.Store(&leaderInfo{
+		addr:    "leader:9000",
+		updated: time.Now().Add(-6 * time.Second),
+	})
+	assert.Equal(t, "fallback:9000", pc.selectBroker())
+}
+
+func TestProducerClient_SelectBroker_ZeroLeaderStaleness(t *testing.T) {
+	cfg := NewDefaultPublisherConfig()
+	cfg.BrokerAddrs = []string{"fallback:9000"}
+	cfg.LeaderStaleness = 0
+	pc, _ := NewProducerClient(cfg)
+
+	pc.leader.Store(&leaderInfo{
+		addr:    "leader:9000",
+		updated: time.Now().Add(-20 * time.Second),
+	})
+	assert.Equal(t, "leader:9000", pc.selectBroker())
+}
+
+func TestProducer_MarkBatchAckedByID_BenchmarkEnabled(t *testing.T) {
+	p := &Producer{
+		config:               &PublisherConfig{EnableBenchmark: true},
+		partitions:           1,
+		partitionBatchStates: make([]map[string]*BatchState, 1),
+		partitionBatchMus:    make([]sync.Mutex, 1),
+		partitionSentSeqs:    make([]map[uint64]struct{}, 1),
+		partitionSentMus:     make([]sync.Mutex, 1),
+		bmTotalTime:          make(map[int]time.Duration),
+		bmTotalCount:         make(map[int]int),
+		bmLatencies:          make([]time.Duration, 0),
+	}
+	p.partitionBatchStates[0] = make(map[string]*BatchState)
+	p.partitionSentSeqs[0] = make(map[uint64]struct{})
+
+	p.partitionBatchStates[0]["batch-bm"] = &BatchState{
+		BatchID:     "batch-bm",
+		StartSeqNum: 1,
+		EndSeqNum:   3,
+		Partition:   0,
+		SentTime:    time.Now().Add(-10 * time.Millisecond),
+	}
+
+	p.markBatchAckedByID(0, "batch-bm", 3)
+
+	p.bmMu.Lock()
+	assert.Len(t, p.bmLatencies, 1)
+	assert.Greater(t, p.bmLatencies[0], time.Duration(0))
+	p.bmMu.Unlock()
+}
+
+func TestProducer_MarkBatchAckedByID_BenchmarkDisabled(t *testing.T) {
+	p := &Producer{
+		config:               &PublisherConfig{EnableBenchmark: false},
+		partitions:           1,
+		partitionBatchStates: make([]map[string]*BatchState, 1),
+		partitionBatchMus:    make([]sync.Mutex, 1),
+		partitionSentSeqs:    make([]map[uint64]struct{}, 1),
+		partitionSentMus:     make([]sync.Mutex, 1),
+		bmTotalTime:          make(map[int]time.Duration),
+		bmTotalCount:         make(map[int]int),
+		bmLatencies:          make([]time.Duration, 0),
+	}
+	p.partitionBatchStates[0] = make(map[string]*BatchState)
+	p.partitionSentSeqs[0] = make(map[uint64]struct{})
+
+	p.partitionBatchStates[0]["batch-nobm"] = &BatchState{
+		BatchID:     "batch-nobm",
+		StartSeqNum: 1,
+		EndSeqNum:   3,
+		Partition:   0,
+		SentTime:    time.Now().Add(-10 * time.Millisecond),
+	}
+
+	p.markBatchAckedByID(0, "batch-nobm", 3)
+
+	p.bmMu.Lock()
+	assert.Empty(t, p.bmLatencies)
+	assert.Equal(t, 1, p.bmTotalCount[0])
+	p.bmMu.Unlock()
+}
+
 func TestProducer_Extract_PreservesOrder(t *testing.T) {
 	p := &Producer{
 		config: &PublisherConfig{BatchSize: 3},
