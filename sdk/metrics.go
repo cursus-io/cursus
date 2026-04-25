@@ -21,6 +21,7 @@ var (
 	consumerCommitErrors     *prometheus.CounterVec
 	consumerPollLatency      *prometheus.HistogramVec
 	consumerRebalanceTotal   *prometheus.CounterVec
+	consumerOffsetGapTotal   *prometheus.CounterVec
 )
 
 func initMetrics() {
@@ -109,6 +110,16 @@ func initMetrics() {
 			[]string{"topic", "group"},
 		)
 
+		consumerOffsetGapTotal = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: "cursus",
+				Subsystem: "consumer",
+				Name:      "offset_gap_total",
+				Help:      "Total number of offset gaps detected during consumption.",
+			},
+			[]string{"topic", "group"},
+		)
+
 		metricsRegistry.MustRegister(
 			producerMessagesSent,
 			producerSendErrors,
@@ -118,6 +129,7 @@ func initMetrics() {
 			consumerCommitErrors,
 			consumerPollLatency,
 			consumerRebalanceTotal,
+			consumerOffsetGapTotal,
 		)
 	})
 }

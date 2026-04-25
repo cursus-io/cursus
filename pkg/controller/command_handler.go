@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/util"
 )
@@ -568,9 +569,9 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 		err := ch.Coordinator.CommitOffset(groupID, topicName, partition, offset)
 		if err != nil {
 			return fmt.Sprintf("ERROR: %v", err)
-		} else {
-			return "OK"
 		}
+		ch.recordConsumerLag(topicName, partition, offset, groupID)
+		return "OK"
 	}
 	return "offset manager not available"
 }
@@ -661,7 +662,28 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 		}
 	}
 
+	for _, item := range offsetList {
+		ch.recordConsumerLag(topicName, item.Partition, item.Offset, groupID)
+	}
+
 	return fmt.Sprintf("OK batched=%d", len(offsetList))
+}
+
+func (ch *CommandHandler) recordConsumerLag(topicName string, partition int, committedOffset uint64, groupID string) {
+	t := ch.TopicManager.GetTopic(topicName)
+	if t == nil {
+		return
+	}
+	p, err := t.GetPartition(partition)
+	if err != nil {
+		return
+	}
+	leo := p.NextOffset()
+	lag := float64(0)
+	if leo > committedOffset {
+		lag = float64(leo - committedOffset)
+	}
+	metrics.ConsumerLag.WithLabelValues(topicName, fmt.Sprintf("%d", partition), groupID).Set(lag)
 }
 
 // resolveOffset determines the starting offset for a consumer

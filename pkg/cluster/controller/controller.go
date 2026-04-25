@@ -10,6 +10,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
@@ -138,6 +139,8 @@ func (cc *ClusterController) IsAuthorized(topic string, partition int) bool {
 }
 
 func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, msgCmd types.MessageCommand, minISR int) error {
+	replicationStart := time.Now()
+
 	fsm := cc.RaftManager.GetFSM()
 	if fsm == nil {
 		return fmt.Errorf("FSM not available")
@@ -168,6 +171,7 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 	var mu sync.Mutex
 	errCh := make(chan error, len(targets))
 
+	partitionStr := fmt.Sprintf("%d", partition)
 	for _, targetID := range targets {
 		broker := fsm.GetBroker(targetID)
 		if broker == nil {
@@ -175,17 +179,18 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 		}
 
 		wg.Add(1)
-		go func(addr string) {
+		go func(addr, brokerID string) {
 			defer wg.Done()
 			_, err := cc.Router.forwardWithTimeout(addr, replicateCmd)
 			if err == nil {
 				mu.Lock()
 				successCount++
 				mu.Unlock()
+				metrics.ClusterReplicationLag.WithLabelValues(topic, partitionStr, brokerID).Observe(time.Since(replicationStart).Seconds())
 			} else {
 				errCh <- err
 			}
-		}(broker.Addr)
+		}(broker.Addr, targetID)
 	}
 
 	wg.Wait()
