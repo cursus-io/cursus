@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/cursus-io/cursus/pkg/types"
 )
@@ -122,78 +123,86 @@ func DeserializeMessage(data []byte) (types.Message, error) {
 	return msg, nil
 }
 
+var diskMsgBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 0, 256)
+		return &buf
+	},
+}
+
+// EstimateDiskMessageSize returns the serialized size of a DiskMessage without allocating.
+func EstimateDiskMessageSize(msg types.DiskMessage) int {
+	return 2 + len(msg.Topic) + 4 + 8 + 2 + len(msg.ProducerID) + 8 + 8 +
+		4 + len(msg.Payload) + 2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata)
+}
+
 // SerializeDiskMessage serializes a DiskMessage for disk storage
 func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
-	var buf bytes.Buffer
+	size := EstimateDiskMessageSize(msg)
+	bufp := diskMsgBufPool.Get().(*[]byte)
+	buf := (*bufp)[:0]
+	if cap(buf) < size {
+		buf = make([]byte, 0, size)
+	}
+
+	var tmp [8]byte
 
 	// Topic (length + string)
-	topicBytes := []byte(msg.Topic)
-	if err := binary.Write(&buf, binary.BigEndian, uint16(len(topicBytes))); err != nil {
-		return nil, err
-	}
-	if _, err := buf.Write(topicBytes); err != nil {
-		return nil, err
-	}
+	binary.BigEndian.PutUint16(tmp[:2], uint16(len(msg.Topic)))
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.Topic...)
 
 	// Partition (4 bytes)
-	if err := binary.Write(&buf, binary.BigEndian, msg.Partition); err != nil {
-		return nil, err
-	}
+	binary.BigEndian.PutUint32(tmp[:4], uint32(msg.Partition))
+	buf = append(buf, tmp[:4]...)
 
 	// Offset (8 bytes)
-	if err := binary.Write(&buf, binary.BigEndian, msg.Offset); err != nil {
-		return nil, err
-	}
+	binary.BigEndian.PutUint64(tmp[:8], msg.Offset)
+	buf = append(buf, tmp[:8]...)
 
-	// ProducerID
-	if err := binary.Write(&buf, binary.BigEndian, uint16(len(msg.ProducerID))); err != nil {
-		return nil, err
-	}
-	if _, err := buf.WriteString(msg.ProducerID); err != nil {
-		return nil, err
-	}
+	// ProducerID (length + string)
+	binary.BigEndian.PutUint16(tmp[:2], uint16(len(msg.ProducerID)))
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.ProducerID...)
 
-	// SeqNum
-	if err := binary.Write(&buf, binary.BigEndian, msg.SeqNum); err != nil {
-		return nil, err
-	}
+	// SeqNum (8 bytes)
+	binary.BigEndian.PutUint64(tmp[:8], msg.SeqNum)
+	buf = append(buf, tmp[:8]...)
 
-	// Epoch
-	if err := binary.Write(&buf, binary.BigEndian, msg.Epoch); err != nil {
-		return nil, err
-	}
+	// Epoch (8 bytes)
+	binary.BigEndian.PutUint64(tmp[:8], uint64(msg.Epoch))
+	buf = append(buf, tmp[:8]...)
 
 	// Payload (length + string)
-	payloadBytes := []byte(msg.Payload)
-	if err := binary.Write(&buf, binary.BigEndian, uint32(len(payloadBytes))); err != nil {
-		return nil, err
-	}
-	if _, err := buf.Write(payloadBytes); err != nil {
-		return nil, err
-	}
+	binary.BigEndian.PutUint32(tmp[:4], uint32(len(msg.Payload)))
+	buf = append(buf, tmp[:4]...)
+	buf = append(buf, msg.Payload...)
 
-	eventTypeBytes := []byte(msg.EventType)
-	if err := binary.Write(&buf, binary.BigEndian, uint16(len(eventTypeBytes))); err != nil {
-		return nil, err
-	}
-	if _, err := buf.Write(eventTypeBytes); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(&buf, binary.BigEndian, msg.SchemaVersion); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(&buf, binary.BigEndian, msg.AggregateVersion); err != nil {
-		return nil, err
-	}
-	metadataBytes := []byte(msg.Metadata)
-	if err := binary.Write(&buf, binary.BigEndian, uint16(len(metadataBytes))); err != nil {
-		return nil, err
-	}
-	if _, err := buf.Write(metadataBytes); err != nil {
-		return nil, err
-	}
+	// EventType (length + string)
+	binary.BigEndian.PutUint16(tmp[:2], uint16(len(msg.EventType)))
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.EventType...)
 
-	return buf.Bytes(), nil
+	// SchemaVersion (4 bytes)
+	binary.BigEndian.PutUint32(tmp[:4], msg.SchemaVersion)
+	buf = append(buf, tmp[:4]...)
+
+	// AggregateVersion (8 bytes)
+	binary.BigEndian.PutUint64(tmp[:8], msg.AggregateVersion)
+	buf = append(buf, tmp[:8]...)
+
+	// Metadata (length + string)
+	binary.BigEndian.PutUint16(tmp[:2], uint16(len(msg.Metadata)))
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.Metadata...)
+
+	// Return a copy so the pooled buffer can be reused
+	result := make([]byte, len(buf))
+	copy(result, buf)
+	*bufp = buf
+	diskMsgBufPool.Put(bufp)
+
+	return result, nil
 }
 
 // DeserializeDiskMessage deserializes bytes back to DiskMessage

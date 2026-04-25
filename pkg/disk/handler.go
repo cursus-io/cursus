@@ -373,16 +373,17 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 
 // readMessagesFromPosition reads messages starting from a specific byte position
 func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position uint64, max int, targetOffset uint64) []types.Message {
-	messages := []types.Message{}
+	messages := make([]types.Message, 0, max)
 	pos := int(position)
+	var lenBuf [4]byte
+	var dataBuf []byte
 
 	for len(messages) < max && pos+4 <= reader.Len() {
-		lenBytes := make([]byte, 4)
-		if _, err := reader.ReadAt(lenBytes, int64(pos)); err != nil {
+		if _, err := reader.ReadAt(lenBuf[:], int64(pos)); err != nil {
 			break
 		}
 
-		msgLen := binary.BigEndian.Uint32(lenBytes)
+		msgLen := binary.BigEndian.Uint32(lenBuf[:])
 		if msgLen == 0 || msgLen > MaxMessageSize {
 			util.Error("Corrupted message length detected at pos %d: %d bytes (limit: %d)", pos, msgLen, MaxMessageSize)
 			break
@@ -392,12 +393,17 @@ func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position 
 			util.Error("Incomplete message at pos %d: expected %d bytes but reached EOF", pos, msgLen)
 			break
 		}
-		data := make([]byte, msgLen)
-		if _, err := reader.ReadAt(data, int64(pos+4)); err != nil {
+
+		if cap(dataBuf) < int(msgLen) {
+			dataBuf = make([]byte, msgLen)
+		} else {
+			dataBuf = dataBuf[:msgLen]
+		}
+		if _, err := reader.ReadAt(dataBuf, int64(pos+4)); err != nil {
 			break
 		}
 
-		diskMsg, err := util.DeserializeDiskMessage(data)
+		diskMsg, err := util.DeserializeDiskMessage(dataBuf)
 		if err != nil {
 			util.Error("failed to deserialize disk message at pos %d: %v", pos, err)
 			pos += 4 + int(msgLen)
