@@ -8,8 +8,8 @@ Cursus is a log-centric message broker designed for high-throughput persistence 
 
 ### 1. The Persistence Path (Durability First)
 When a message is published, it is immediately handed off to the `DiskHandler` for the target partition. 
-- **Asynchronous Batching:** Messages are queued in a `writeCh` and flushed to disk in batches (default 500 messages or 100ms) to maximize I/O efficiency.
-- **Segmented Storage:** Data is stored in immutable segment files (default 1MB), enabling efficient retention and historical replay.
+- **Asynchronous Batching:** Messages are queued in a `writeCh` and flushed to disk in batches (default 50 messages or 50ms) to maximize I/O efficiency.
+- **Segmented Storage:** Data is stored in immutable segment files (default 1GB, configurable), enabling efficient retention and historical replay.
 
 ### 2. The Real-time Dispatch Path (Low Latency)
 Simultaneously, the message is enqueued into the partition's in-memory channel.
@@ -17,6 +17,24 @@ Simultaneously, the message is enqueued into the partition's in-memory channel.
 - **Zero-Disk Read for Active Consumers:** Active subscribers receive messages directly from memory, avoiding disk I/O latency for real-time processing.
 
 ---
+
+```mermaid
+graph TD
+    PUB[Publisher] -->|PUBLISH| CMD[CommandHandler]
+    CMD -->|Publish| TM[TopicManager]
+    TM -->|dedup check| DM{Duplicate?}
+    DM -->|yes| REJ[Reject]
+    DM -->|no| TOP[Topic]
+    TOP -->|partition select| PART[Partition]
+    PART -->|EnqueueBatch| DH[DiskHandler.writeCh]
+    DH -->|flushLoop| DISK[(Segment File)]
+    PART -->|NotifyNewMessage| SM[StreamManager]
+    SM -->|push to active| CONS[Consumer]
+
+    CONS2[Consumer] -->|CONSUME| CMD2[CommandHandler]
+    CMD2 -->|ReadCommitted| PART2[Partition]
+    PART2 -->|mmap read| DISK2[(Segment File)]
+```
 
 ## Detailed Message Journey
 

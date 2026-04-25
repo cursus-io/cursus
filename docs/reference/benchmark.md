@@ -20,6 +20,26 @@ The benchmark tool executes a three-phase workflow:
 
 ## Benchmark Architecture
 
+```mermaid
+graph LR
+    subgraph "Phase 1"
+        TC[Topic Creation]
+    end
+    subgraph "Phase 2: Producers"
+        P0[Producer 0] --> B[Broker]
+        P1[Producer 1] --> B
+        PN[Producer N] --> B
+    end
+    subgraph "Phase 3: Consumers"
+        B --> C0[Consumer 0]
+        B --> C1[Consumer 1]
+        B --> CN[Consumer N]
+    end
+    TC --> P0
+    TC --> P1
+    TC --> PN
+```
+
 ### Running Benchmarks Locally
 
 The benchmark tool is built as part of the standard build process:
@@ -318,7 +338,52 @@ All benchmark messages use the standard cursus protocol:
 The consumer phase sends commands in this format:
 
 ```
-CONSUME <topic> <partition> <offset>
+CONSUME topic=<name> partition=<N> offset=<N> group=<name> generation=<N> member=<id>
 ```
 
-This instructs the broker to stream messages from partition 0 starting at offset 0.
+This instructs the broker to read messages from the specified partition starting at the given offset.
+
+## Disk-Level Benchmarks (Go test)
+
+In addition to the end-to-end benchmark tool, cursus includes Go-native benchmarks for measuring disk I/O performance in isolation. These are useful for evaluating the impact of storage-layer optimizations without network overhead.
+
+### Running Disk Benchmarks
+
+```bash
+go test ./pkg/disk/ -bench=. -benchmem -count=3 -timeout=120s
+```
+
+### Available Benchmarks
+
+| Benchmark | Description |
+|-----------|-------------|
+| `BenchmarkWriteBatch_100` | Write 100-message batches to disk |
+| `BenchmarkWriteBatch_500` | Write 500-message batches to disk |
+| `BenchmarkSerializeDiskMessage` | Serialize a single DiskMessage to binary format |
+| `BenchmarkReadMessages` | Read 100 messages from a 1000-message segment |
+
+### Running Specific Benchmarks
+
+```bash
+# Serialize only
+go test ./pkg/disk/ -bench=BenchmarkSerializeDiskMessage -benchmem -count=5
+
+# Write path only
+go test ./pkg/disk/ -bench='BenchmarkWriteBatch' -benchmem -count=3
+
+# Read path only
+go test ./pkg/disk/ -bench=BenchmarkReadMessages -benchmem -count=3
+```
+
+### Interpreting Results
+
+```
+BenchmarkWriteBatch_100-14    48786    24185 ns/op    17165 B/op    105 allocs/op
+```
+
+- **48786**: iterations run
+- **24185 ns/op**: nanoseconds per operation
+- **17165 B/op**: bytes allocated per operation
+- **105 allocs/op**: heap allocations per operation
+
+Lower values in all three metrics indicate better performance. The `allocs/op` metric is particularly important for GC pressure under sustained load.

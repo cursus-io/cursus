@@ -34,10 +34,10 @@ Each DiskHandler manages disk I/O for a single topic-partition pair. It maintain
 | Field          | Type            | Purpose                                         |
 |----------------|----------------|-------------------------------------------------|
 | BaseName       | string          | Base file path: `{LogDir}/{topic}/partition_{id}` |
-| SegmentSize    | int             | Maximum segment size (default: 1MB)            |
-| CurrentOffset  | int             | Current write position within segment          |
-| CurrentSegment | int             | Current segment number                          |
-| writeCh        | chan string     | Unbuffered channel for asynchronous writes     |
+| SegmentSize    | uint64          | Maximum segment size (default: 1GB)            |
+| CurrentOffset  | uint64          | Current write position within segment          |
+| CurrentSegment | uint64          | Current segment number                          |
+| writeCh        | chan DiskMessage | Buffered channel for asynchronous writes       |
 | done           | chan struct{}   | Shutdown signal channel                         |
 | batchSize      | int             | Max messages per batch (from DiskFlushBatchSize) |
 | linger         | time.Duration   | Max wait time before flushing partial batch    |
@@ -51,15 +51,52 @@ Each DiskHandler manages disk I/O for a single topic-partition pair. It maintain
 
 The write path is fully asynchronous to prevent blocking publishers. Messages flow through a channel to a dedicated flush goroutine that performs batching and periodic flushing.
 
+```mermaid
+sequenceDiagram
+    participant P as Publisher
+    participant AH as AppendMessage
+    participant CH as writeCh
+    participant FL as flushLoop
+    participant WB as WriteBatch
+    participant SL as syncLoop
+    participant D as Disk
+
+    P->>AH: AppendMessage(topic, partition, msg)
+    AH->>AH: Assign offset (atomic)
+    AH->>CH: send DiskMessage
+
+    loop Batch accumulation
+        CH->>FL: receive msg
+        FL->>FL: append to batch
+    end
+
+    alt Batch full OR linger timeout
+        FL->>WB: WriteBatch(batch)
+        Note over WB: Serialize outside lock
+        WB->>WB: mu.Lock + ioMu.Lock
+        WB->>WB: Check segment rotation
+        WB->>D: bufio.Write (length + data)
+        WB->>D: bufio.Flush
+        WB->>WB: mu.Unlock + ioMu.Unlock
+    end
+
+    loop Every sync interval
+        SL->>D: file.Sync() (fsync)
+        SL->>SL: Notify OnSync callback
+    end
+```
+
 Key Write Functions:
 
 | Function                | File              | Purpose                                       |
 |-------------------------|-------------------|-----------------------------------------------|
-| `AppendMessage(msg string)` | handler.go        | Non-blocking enqueue to write channel        |
+| `AppendMessage(topic, partition, msg)` | handler.go        | Non-blocking enqueue to write channel        |
+| `AppendMessageSync(topic, partition, msg)` | handler.go | Synchronous write (bypasses channel)          |
 | `flushLoop()`             | flush_common.go   | Main batching loop in dedicated goroutine     |
-| `writeBatch(batch []string)` | flush_common.go | Write a batch of messages to disk             |
-| `rotateSegment()`         | flush_common.go   | Close current segment and open next           |
-| `WriteDirect(msg string)` | flush_common.go   | Synchronous write (bypasses channel)          |
+| `syncLoop()`              | flush_common.go   | Periodic fsync for durability                 |
+| `WriteBatch(batch []DiskMessage)` | flush_common.go | Write a batch of messages to disk             |
+| `WriteDirect(topic, partition, msg)` | flush_common.go | Direct synchronous write                      |
+| `rotateSegment(nextBaseOffset)` | flush_common.go   | Close current segment and open next           |
 
 ## Read Path: Memory-Mapped I/O
 
@@ -97,7 +134,7 @@ Example:
 
 Rotation Trigger:
 
-When CurrentOffset + messageSize > SegmentSize (1MB by default)
+When CurrentOffset + messageSize > SegmentSize (1GB by default)
 
 Occurs within `writeBatch()` before writing a message that would exceed the limit
 
@@ -135,6 +172,27 @@ Advantages:
 
 The DiskHandler uses a dual-mutex strategy to allow concurrent reads while serializing writes.
 
+```mermaid
+graph TD
+    subgraph "Write Path"
+        WB[WriteBatch] -->|1. acquire| MU[mu - metadata]
+        WB -->|2. acquire| IOMU[ioMu - I/O]
+        WB -->|3. write| DISK[(Segment File)]
+        WD[WriteDirect] -->|acquire both| MU
+        WD -->|acquire both| IOMU
+    end
+
+    subgraph "Read Path (lock-free I/O)"
+        RM[ReadMessages] -->|acquire mu briefly| MU2[mu - read segment list]
+        RM -->|mmap read| DISK2[(Segment File)]
+    end
+
+    subgraph "Sync Path"
+        SL[syncLoop] -->|acquire| IOMU2[ioMu]
+        SL -->|fsync| DISK3[(Segment File)]
+    end
+```
+
 ### Lock Responsibilities
 
 mu (Metadata Lock):
@@ -166,21 +224,23 @@ The disk persistence system is configured through the config.Config structure:
 
 | Parameter       | Field                | Default  | Purpose                                      |
 |-----------------|--------------------|---------|----------------------------------------------|
-| Log Directory   | LogDir              | `./logs`| Base directory for segment files             |
-| Batch Size      | DiskFlushBatchSize  | 500     | Max messages per flush batch                 |
-| Linger Time     | LingerMS            | 100     | Max milliseconds before flushing partial batch |
-| Write Timeout   | DiskWriteTimeoutMS  | 5000    | Timeout for enqueuing to write channel      |
-| Channel Buffer  | ChannelBufferSize   | 10000   | Size of partition message channels           |
-| Segment Size    | Hardcoded           | 1048576 | 1MB per segment file                         |
+| Log Directory   | LogDir              | `broker-logs` | Base directory for segment files             |
+| Batch Size      | DiskFlushBatchSize  | 50      | Max messages per flush batch                 |
+| Linger Time     | LingerMS            | 50      | Max milliseconds before flushing partial batch |
+| Write Timeout   | DiskWriteTimeoutMS  | 10      | Timeout for enqueuing to write channel (ms) |
+| Channel Buffer  | ChannelBufferSize   | 1024    | Size of DiskHandler write channel            |
+| Segment Size    | SegmentSize         | 1GB     | Max segment file size (configurable via `log_segment_bytes`) |
+| Index Size      | IndexSize           | 10MB    | Max index file size (configurable via `log_index_size_bytes`) |
+| Flush Interval  | DiskFlushIntervalMS | 500     | Periodic fsync interval (ms)                 |
 
 # Summary
 
 The disk persistence system provides durable message storage through:
 
 - **Registry Pattern**: DiskManager maintains handlers for each topic-partition
-- **Asynchronous Writes**: Channel-based write path with batching (500 msgs or 100ms)
+- **Asynchronous Writes**: Channel-based write path with batching (50 msgs or 50ms default)
 - **Synchronous Reads**: Memory-mapped I/O for efficient sequential access
-- **Segment-Based Storage**: 1MB segments enable parallel I/O and efficient management
+- **Segment-Based Storage**: Configurable segments (1GB default) with index files for fast offset lookup
 - **Dual-Mutex Concurrency**: Separate locks for metadata and I/O operations
 - **Length-Prefixed Format**: Enables random access and streaming without parsing
 - **Graceful Shutdown**: Ensures all buffered messages are flushed before exit
@@ -210,10 +270,10 @@ The DiskHandler is the core component responsible for persisting messages to dis
 | Field          | Type             | Purpose                                                      |
 |----------------|-----------------|--------------------------------------------------------------|
 | BaseName       | string           | Base path for segment files, e.g., `./logs/orders/partition_0` |
-| SegmentSize    | int              | Maximum size per segment file (default: 1MB)                |
-| CurrentOffset  | int              | Current write position within the active segment            |
-| CurrentSegment | int              | Active segment number (increments on rotation)              |
-| writeCh        | chan string      | Unbuffered channel for asynchronous message enqueue         |
+| SegmentSize    | uint64           | Maximum size per segment file (default: 1GB)                |
+| CurrentOffset  | uint64           | Current write position within the active segment            |
+| CurrentSegment | uint64           | Active segment number (base offset of current segment)      |
+| writeCh        | chan DiskMessage  | Buffered channel for asynchronous message enqueue           |
 | done           | chan struct{}    | Shutdown signal channel                                      |
 | batchSize      | int              | Maximum messages per batch (default: 500)                   |
 | linger         | time.Duration    | Maximum wait time before flushing partial batch (default: 100ms) |
@@ -230,11 +290,12 @@ The following `config.Config` fields control DiskHandler behavior:
 
 | Config Field           | DiskHandler Field | Default      | Purpose                                      |
 |------------------------|-----------------|-------------|----------------------------------------------|
-| LogDir                 | BaseName (derived)| `./logs`      | Root directory for segment files             |
-| ChannelBufferSize      | writeCh capacity | varies      | Size of write channel buffer                 |
-| DiskFlushBatchSize     | batchSize        | 500         | Messages per batch                            |
-| LingerMS               | linger           | 100ms       | Max wait before flushing partial batch       |
-| DiskWriteTimeoutMS     | writeTimeout     | varies      | Timeout for channel enqueue                   |
+| LogDir                 | BaseName (derived)| `broker-logs` | Root directory for segment files             |
+| ChannelBufferSize      | writeCh capacity | 1024        | Size of write channel buffer                 |
+| DiskFlushBatchSize     | batchSize        | 50          | Messages per batch                            |
+| LingerMS               | linger           | 50ms        | Max wait before flushing partial batch       |
+| DiskWriteTimeoutMS     | writeTimeout     | 10ms        | Timeout for channel enqueue                   |
+| DiskFlushIntervalMS    | syncIntervalMS   | 500ms       | Periodic fsync interval                       |
 
 ## Asynchronous Write Path
 
@@ -268,8 +329,8 @@ The flushLoop goroutine is the heart of the asynchronous write path. It continuo
 
 | Condition         | Threshold                          | Behavior                          |
 |------------------|-----------------------------------|----------------------------------|
-| Batch Full        | len(batch) >= batchSize (500)      | Immediate flush                  |
-| Linger Timeout    | ticker.C fires (100ms)             | Flush if len(batch) > 0          |
+| Batch Full        | len(batch) >= batchSize (50)       | Immediate flush                  |
+| Linger Timeout    | ticker.C fires (50ms)              | Flush if len(batch) > 0          |
 | Shutdown          | done channel closed                 | Drain and flush remaining messages|
 
 
@@ -416,7 +477,7 @@ Note: For complete configuration reference, see [Configuration Reference](../../
 The DiskHandler write path provides:
 
 - **Asynchronous writes**: Non-blocking AppendMessage for publishers
-- **Batching**: Up to 500 messages per batch or 100ms linger timeout
+- **Batching**: Up to 50 messages per batch or 50ms linger timeout (configurable)
 - **Durability**: Guaranteed fsync after each batch
 - **Concurrency control**: Dual-mutex strategy for parallel reads/writes
 - **Graceful shutdown**: Drain loop ensures all messages are persisted
