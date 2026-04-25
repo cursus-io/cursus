@@ -25,7 +25,7 @@ jobs:
       security-events: write
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run GoSec
         uses: securego/gosec@v2.25.0
