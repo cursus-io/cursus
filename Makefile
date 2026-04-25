@@ -107,18 +107,34 @@ bench:
 	docker compose -f test/docker-compose.yml down -v; \
 	'
 
+.PHONY: bench-disk
+bench-disk:
+	@echo "Running disk I/O benchmarks..."
+	$(GO) test ./pkg/disk/ -bench=. -benchmem -count=3 -timeout=120s
+
+.PHONY: bench-serialize
+bench-serialize:
+	@echo "Running serialization benchmarks..."
+	$(GO) test ./pkg/disk/ -bench=BenchmarkSerializeDiskMessage -benchmem -count=5 -timeout=60s
+
 .PHONY: build
 build: build-api build-cli
 
 .PHONY: build-api
 build-api:
 	@echo "Building API server..."
-	CGO_ENABLED=0 GOOS=linux $(GO) build $(BUILD_FLAGS) -o bin/$(APP_NAME) ./cmd/broker/main.go
+	CGO_ENABLED=0 $(GO) build $(BUILD_FLAGS) -o bin/$(APP_NAME) ./cmd/broker/main.go
 
 .PHONY: build-cli
 build-cli:
 	@echo "Building CLI..."
-	CGO_ENABLED=0 GOOS=linux $(GO) build $(BUILD_FLAGS) -o bin/$(CLI_NAME) ./cmd/cli/main.go
+	CGO_ENABLED=0 $(GO) build $(BUILD_FLAGS) -o bin/$(CLI_NAME) ./cmd/cli/main.go
+
+.PHONY: build-linux
+build-linux:
+	@echo "Building for Linux..."
+	CGO_ENABLED=0 GOOS=linux $(GO) build $(BUILD_FLAGS) -o bin/$(APP_NAME)-linux ./cmd/broker/main.go
+	CGO_ENABLED=0 GOOS=linux $(GO) build $(BUILD_FLAGS) -o bin/$(CLI_NAME)-linux ./cmd/cli/main.go
 
 .PHONY: clean
 clean:
@@ -160,10 +176,14 @@ help:
 	@echo "  make e2e             Run E2E tests (builds images first)"  
 	@echo "  make e2e-verbose     Run E2E tests with race detection" 
 	@echo "  make e2e-logs        Show E2E test container logs" 
-	@echo "  make bench           Run benchmarks"  
-	@echo "  make build           Build all binaries (api, cli)"  
-	@echo "  make clean           Remove build artifacts"  
-	@echo "  make run             Run broker in dev mode" 
-	@echo "  make tools           Install or update development tools"  
-	@echo "  make fmt             Format code according to Go standards"  
+	@echo "  make bench           Run end-to-end benchmarks (Docker)"
+	@echo "  make bench-disk      Run disk I/O benchmarks (Go test)"
+	@echo "  make bench-serialize Run serialization benchmarks"
+	@echo "  make build           Build all binaries for current OS"
+	@echo "  make build-linux     Cross-compile for Linux amd64"
+	@echo "  make clean           Remove build artifacts"
+	@echo "  make run             Run broker in dev mode"
+	@echo "  make cli             Run CLI in dev mode"
+	@echo "  make tools           Install or update development tools"
+	@echo "  make fmt             Format code according to Go standards"
 	@echo "  make coverage        Run tests with coverage report"
