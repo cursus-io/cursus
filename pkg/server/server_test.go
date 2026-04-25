@@ -153,7 +153,14 @@ func TestHealthCheckServer(t *testing.T) {
 	startHealthCheckServer(port, ready)
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
-	resp, err := http.Get(url)
+	var resp *http.Response
+	for i := 0; i < 20; i++ {
+		resp, err = http.Get(url)
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 	body, _ := io.ReadAll(resp.Body)
@@ -181,7 +188,14 @@ func TestHealthCheckServer_RootEndpoint(t *testing.T) {
 	startHealthCheckServer(port, ready)
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/", port)
-	resp, err := http.Get(url)
+	var resp *http.Response
+	for i := 0; i < 20; i++ {
+		resp, err = http.Get(url)
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	_ = resp.Body.Close()

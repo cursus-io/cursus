@@ -7,7 +7,7 @@ import (
 	"io"
 
 	"github.com/pierrec/lz4/v4"
-	snappy "github.com/segmentio/kafka-go/compress/snappy/go-xerial-snappy"
+	snappy "github.com/eapache/go-xerial-snappy"
 )
 
 // CompressMessage compresses a message if enabled
