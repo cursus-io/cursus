@@ -140,7 +140,7 @@ func (i *ISRManager) SetLeader(isLeader bool) {
 }
 
 func (i *ISRManager) ComputeISR(topic string, partition int) []string {
-	key := fmt.Sprintf("%s-%d", topic, partition)
+	key := topic + "-" + strconv.Itoa(partition)
 	var currentISR []string
 
 	i.mu.RLock()
@@ -277,7 +277,7 @@ func (i *ISRManager) isBrokerAlive(brokerID string) bool {
 }
 
 func (i *ISRManager) GetISR(topic string, partition int) []string {
-	key := fmt.Sprintf("%s-%d", topic, partition)
+	key := topic + "-" + strconv.Itoa(partition)
 	metadata := i.fsm.GetPartitionMetadata(key)
 	if metadata == nil {
 		return nil

@@ -36,7 +36,7 @@ func NewHandler(tm *topic.TopicManager) *Handler {
 
 // getIndex returns the StreamIndex for the given topic and partition, creating it lazily.
 func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, error) {
-	key := fmt.Sprintf("%s:%d", topicName, partitionID)
+	key := topicName + ":" + strconv.Itoa(partitionID)
 
 	h.mu.RLock()
 	if h.closed {
@@ -71,7 +71,7 @@ func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, err
 
 // getSnapshot returns the SnapshotStore for the given topic and partition, creating it lazily.
 func (h *Handler) getSnapshot(topicName string, partitionID int) (*SnapshotStore, error) {
-	key := fmt.Sprintf("%s:%d", topicName, partitionID)
+	key := topicName + ":" + strconv.Itoa(partitionID)
 
 	h.mu.RLock()
 	if h.closed {

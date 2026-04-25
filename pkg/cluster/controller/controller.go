@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -128,7 +129,7 @@ func (cc *ClusterController) IsAuthorized(topic string, partition int) bool {
 		return false
 	}
 
-	partitionKey := fmt.Sprintf("%s-%d", topic, partition)
+	partitionKey := topic + "-" + strconv.Itoa(partition)
 	meta := fsm.GetPartitionMetadata(partitionKey)
 	if meta == nil {
 		return false
@@ -143,7 +144,7 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 		return fmt.Errorf("FSM not available")
 	}
 
-	partitionKey := fmt.Sprintf("%s-%d", topic, partition)
+	partitionKey := topic + "-" + strconv.Itoa(partition)
 	meta := fsm.GetPartitionMetadata(partitionKey)
 	if meta == nil {
 		return fmt.Errorf("partition metadata not found")

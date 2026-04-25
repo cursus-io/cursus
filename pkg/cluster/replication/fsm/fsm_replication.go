@@ -3,6 +3,7 @@ package fsm
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -34,7 +35,7 @@ func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
 	first := cmd.Messages[0]
 	last := cmd.Messages[len(cmd.Messages)-1]
 
-	partitionKey := fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition)
+	partitionKey := cmd.Topic + "-" + strconv.Itoa(cmd.Partition)
 
 	f.mu.Lock()
 	meta, topicExists := f.partitionMetadata[partitionKey]
@@ -138,7 +139,7 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 	firstMsg := cmd.Messages[0]
 	lastMsg := cmd.Messages[len(cmd.Messages)-1]
 
-	partitionKey := fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition)
+	partitionKey := cmd.Topic + "-" + strconv.Itoa(cmd.Partition)
 
 	f.mu.Lock()
 	meta, topicExists := f.partitionMetadata[partitionKey]

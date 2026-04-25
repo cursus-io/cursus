@@ -3,6 +3,7 @@ package coordinator
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
@@ -37,7 +38,7 @@ func (c *Coordinator) CommitOffset(groupName, topic string, partition int, offse
 	if err := c.topicHandler.Publish(c.offsetTopic, &types.Message{
 		ProducerID: "broker",
 		Payload:    string(payload),
-		Key:        fmt.Sprintf("%s-%s-%d", groupName, topic, partition),
+		Key:        groupName + "-" + topic + "-" + strconv.Itoa(partition),
 	}); err != nil {
 		return err
 	}
@@ -198,7 +199,7 @@ func (c *Coordinator) ValidateAndCommit(groupName, topic string, partition int, 
 	err = c.topicHandler.Publish(c.offsetTopic, &types.Message{
 		ProducerID: "broker",
 		Payload:    string(payload),
-		Key:        fmt.Sprintf("%s-%s-%d", groupName, topic, partition),
+		Key:        groupName + "-" + topic + "-" + strconv.Itoa(partition),
 	})
 
 	if err != nil {
