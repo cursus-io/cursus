@@ -150,7 +150,8 @@ var diskMsgBufPool = sync.Pool{
 // EstimateDiskMessageSize returns the serialized size of a DiskMessage without allocating.
 func EstimateDiskMessageSize(msg types.DiskMessage) int {
 	return 2 + len(msg.Topic) + 4 + 8 + 2 + len(msg.ProducerID) + 8 + 8 +
-		4 + len(msg.Payload) + 2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata)
+		4 + len(msg.Payload) + 2 + len(msg.Key) +
+		2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata)
 }
 
 // SerializeDiskMessage serializes a DiskMessage for disk storage
@@ -241,6 +242,11 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	binary.BigEndian.PutUint16(tmp[:2], metadataLen)
 	buf = append(buf, tmp[:2]...)
 	buf = append(buf, msg.Metadata...)
+
+	// Key (length + string)
+	binary.BigEndian.PutUint16(tmp[:2], uint16(len(msg.Key)))
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.Key...)
 
 	// Return a copy so the pooled buffer can be reused
 	result := make([]byte, len(buf))
@@ -367,6 +373,16 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated metadata")
 		}
 		msg.Metadata = string(data[offset : offset+metadataLen])
+		offset += metadataLen
+
+		// Key (optional — backward compatible with messages before Key was added)
+		if offset+2 <= len(data) {
+			keyLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+			offset += 2
+			if offset+keyLen <= len(data) {
+				msg.Key = string(data[offset : offset+keyLen])
+			}
+		}
 	}
 
 	return msg, nil

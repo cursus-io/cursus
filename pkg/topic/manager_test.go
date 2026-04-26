@@ -53,6 +53,11 @@ func (m *MockStorageHandler) GetAbsoluteOffset() uint64 {
 	return args.Get(0).(uint64)
 }
 
+func (m *MockStorageHandler) GetFlushedOffset() uint64 {
+	args := m.Called()
+	return args.Get(0).(uint64)
+}
+
 func (m *MockStorageHandler) Close() error {
 	args := m.Called()
 	return args.Error(0)

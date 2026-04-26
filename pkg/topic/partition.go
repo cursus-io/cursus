@@ -249,12 +249,26 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 		return nil, nil
 	}
 
+	// Cap at flushed offset to avoid reading data not yet on disk
+	flushed := p.dh.GetFlushedOffset()
+	if flushed < hwm {
+		hwm = flushed
+	}
+	if offset >= hwm {
+		return nil, nil
+	}
+
 	canRead := int(hwm - offset)
 	if max > canRead {
 		max = canRead
 	}
 
 	return p.ReadMessages(offset, max)
+}
+
+// FlushDisk forces all pending async writes to disk.
+func (p *Partition) FlushDisk() {
+	p.dh.Flush()
 }
 
 func (p *Partition) GetLatestOffset() uint64 {

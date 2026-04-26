@@ -215,6 +215,10 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 			break
 		}
 	}
+
+	// Update flushed offset so readers know data is on disk
+	atomic.StoreUint64(&d.FlushedOffset, newAbsOffset)
+
 	return nil
 }
 
@@ -235,12 +239,17 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	defer d.ioMu.Unlock()
 
 	diskMsg := types.DiskMessage{
-		Topic:     topic,
-		Partition: int32(partition),
-		Offset:    msg.Offset,
-		SeqNum:    msg.SeqNum,
-		Epoch:     msg.Epoch,
-		Payload:   msg.Payload,
+		Topic:            topic,
+		Partition:        int32(partition),
+		Offset:           msg.Offset,
+		SeqNum:           msg.SeqNum,
+		Epoch:            msg.Epoch,
+		Payload:          msg.Payload,
+		Key:              msg.Key,
+		EventType:        msg.EventType,
+		SchemaVersion:    msg.SchemaVersion,
+		AggregateVersion: msg.AggregateVersion,
+		Metadata:         msg.Metadata,
 	}
 
 	serialized, err := util.SerializeDiskMessage(diskMsg)
@@ -283,9 +292,11 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	}
 
 	d.CurrentOffset += totalLen
+	newAbsOffset := msg.Offset + 1
 	if msg.Offset >= atomic.LoadUint64(&d.AbsoluteOffset) {
-		atomic.StoreUint64(&d.AbsoluteOffset, msg.Offset+1)
+		atomic.StoreUint64(&d.AbsoluteOffset, newAbsOffset)
 	}
+	atomic.StoreUint64(&d.FlushedOffset, newAbsOffset)
 
 	if msgPosition-d.lastIndexPosition >= interval {
 		indexEntry := types.IndexEntry{
@@ -420,6 +431,11 @@ perform_write:
 // GetAbsoluteOffset returns the current absolute offset in a thread-safe manner
 func (d *DiskHandler) GetAbsoluteOffset() uint64 {
 	return atomic.LoadUint64(&d.AbsoluteOffset)
+}
+
+// GetFlushedOffset returns the offset up to which data has been written to disk
+func (d *DiskHandler) GetFlushedOffset() uint64 {
+	return atomic.LoadUint64(&d.FlushedOffset)
 }
 
 // GetCurrentSegment returns the current segment number in a thread-safe manner

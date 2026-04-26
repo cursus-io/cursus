@@ -3,6 +3,7 @@ package types
 type StorageHandler interface {
 	ReadMessages(offset uint64, max int) ([]Message, error)
 	GetAbsoluteOffset() uint64
+	GetFlushedOffset() uint64
 	GetLatestOffset() uint64
 	GetSegmentPath(baseOffset uint64) string
 

@@ -35,6 +35,7 @@ func (f *fakeStorageHandler) ReadMessages(off uint64, max int) ([]types.Message,
 }
 
 func (f *fakeStorageHandler) GetAbsoluteOffset() uint64 { return f.offset }
+func (f *fakeStorageHandler) GetFlushedOffset() uint64  { return f.offset }
 func (f *fakeStorageHandler) GetLatestOffset() uint64   { return f.offset }
 func (f *fakeStorageHandler) GetSegmentPath(_ uint64) string { return "" }
 
