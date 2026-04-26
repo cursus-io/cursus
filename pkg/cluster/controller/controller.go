@@ -188,6 +188,9 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 				successCount++
 				mu.Unlock()
 				metrics.ClusterReplicationLag.WithLabelValues(topic, partitionStr, brokerID).Observe(time.Since(replicationStart).Seconds())
+				if isrMgr := cc.RaftManager.GetISRManager(); isrMgr != nil {
+					isrMgr.UpdateHeartbeat(brokerID)
+				}
 			} else {
 				errCh <- err
 			}

@@ -822,13 +822,23 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 
 	partitionCount := len(t.Partitions)
 	leaders := make([]string, partitionCount)
+	epochs := make([]string, partitionCount)
 
 	for i := 0; i < partitionCount; i++ {
 		leaders[i] = ch.resolvePartitionLeaderAddr(topicName, i)
+		epochs[i] = "0"
+		if ch.isDistributed() {
+			if fsmRef := ch.Cluster.RaftManager.GetFSM(); fsmRef != nil {
+				key := fmt.Sprintf("%s-%d", topicName, i)
+				if meta := fsmRef.GetPartitionMetadata(key); meta != nil {
+					epochs[i] = strconv.Itoa(meta.LeaderEpoch)
+				}
+			}
+		}
 	}
 
-	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s",
-		topicName, partitionCount, strings.Join(leaders, ","))
+	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s",
+		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","))
 }
 
 func (ch *CommandHandler) handleFindCoordinator(cmd string) string {

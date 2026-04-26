@@ -454,6 +454,12 @@ func (pc *PartitionConsumer) handleBrokerError(data []byte) bool {
 				break
 			}
 		}
+		// Trigger full metadata refresh — other partitions may have moved too
+		go func() {
+			if err := pc.consumer.fetchMetadata(); err != nil {
+				LogDebug("Metadata refresh after NOT_LEADER failed: %v", err)
+			}
+		}()
 	}
 
 	if strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "REBALANCE_REQUIRED") {
