@@ -56,6 +56,9 @@ type Producer struct {
 	partitionBatchMus    []sync.Mutex
 	gcTicker             *time.Ticker
 
+	partitionLeaders map[int]string
+	partitionMu      sync.RWMutex
+
 	done    chan struct{}
 	closed  int32
 	closeMu sync.Mutex
@@ -85,8 +88,9 @@ func NewProducer(cfg *PublisherConfig) (*Producer, error) {
 		bmTotalTime:  make(map[int]time.Duration),
 		bmTotalCount: make(map[int]int),
 		bmLatencies:  make([]time.Duration, 0),
-		inFlight:     make([]int32, cfg.Partitions),
-		gcTicker:     time.NewTicker(1 * time.Minute),
+		inFlight:         make([]int32, cfg.Partitions),
+		gcTicker:         time.NewTicker(1 * time.Minute),
+		partitionLeaders: make(map[int]string),
 	}
 
 	p.partitionSentSeqs = make([]map[uint64]struct{}, cfg.Partitions)
@@ -105,10 +109,12 @@ func NewProducer(cfg *PublisherConfig) (*Producer, error) {
 		LogError("failed to create topic '%s': %v", cfg.Topic, err)
 	}
 
+	p.fetchMetadata()
+
 	connectedCount := 0
 	for i := 0; i < cfg.Partitions; i++ {
 		p.buffers[i] = newPartitionBuffer()
-		brokerAddr := p.client.selectBroker()
+		brokerAddr := p.getPartitionLeaderAddr(i)
 		if err := p.client.ConnectPartition(i, brokerAddr); err != nil {
 			LogError("Failed to connect partition %d: %v", i, err)
 		} else {
@@ -123,6 +129,53 @@ func NewProducer(cfg *PublisherConfig) (*Producer, error) {
 
 	go p.batchStateGC()
 	return p, nil
+}
+
+func (p *Producer) fetchMetadata() {
+	addrs := p.config.BrokerAddrs
+	if len(addrs) == 0 {
+		return
+	}
+	for _, addr := range addrs {
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			continue
+		}
+		cmd := fmt.Sprintf("METADATA topic=%s", p.config.Topic)
+		if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
+			conn.Close()
+			continue
+		}
+		resp, err := ReadWithLength(conn)
+		conn.Close()
+		if err != nil {
+			continue
+		}
+		respStr := strings.TrimSpace(string(resp))
+		if !strings.HasPrefix(respStr, "OK") {
+			continue
+		}
+		for _, part := range strings.Fields(respStr) {
+			if strings.HasPrefix(part, "leaders=") {
+				addrs := strings.Split(strings.TrimPrefix(part, "leaders="), ",")
+				p.partitionMu.Lock()
+				for i, a := range addrs {
+					if a = strings.TrimSpace(a); a != "" {
+						p.partitionLeaders[i] = a
+					}
+				}
+				p.partitionMu.Unlock()
+				return
+			}
+		}
+		return
+	}
+}
+
+func (p *Producer) getPartitionLeaderAddr(partition int) string {
+	p.partitionMu.RLock()
+	defer p.partitionMu.RUnlock()
+	return p.partitionLeaders[partition]
 }
 
 func (p *Producer) nextPartition() int {

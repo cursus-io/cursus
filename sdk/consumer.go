@@ -510,6 +510,28 @@ func (c *Consumer) updatePartitionLeader(partitionID int, addr string) {
 	c.partitionMu.Unlock()
 }
 
+// ─── Metadata Refresh Loop ────────────────────────────────────────────────────
+
+func (c *Consumer) metadataRefreshLoop() {
+	interval := c.config.MetadataRefreshInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.doneCh:
+			return
+		case <-ticker.C:
+			if err := c.fetchMetadata(); err != nil {
+				LogDebug("Metadata refresh failed: %v", err)
+			}
+		}
+	}
+}
+
 // ─── Group Protocol ───────────────────────────────────────────────────────────
 
 func (c *Consumer) joinGroupWithRetry() (int64, string, []int, error) {

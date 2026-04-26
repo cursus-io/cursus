@@ -106,6 +106,12 @@ func (c *Consumer) startConsuming() {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
+		c.metadataRefreshLoop()
+	}()
+
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
 		c.heartbeatLoop()
 	}()
 
@@ -140,6 +146,12 @@ func (c *Consumer) startConsuming() {
 }
 
 func (c *Consumer) startStreaming() {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.metadataRefreshLoop()
+	}()
+
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()

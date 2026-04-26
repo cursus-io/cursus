@@ -169,7 +169,7 @@ func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error)
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		conn := p.client.GetConn(part)
 		if conn == nil {
-			brokerAddr := p.client.selectBroker()
+			brokerAddr := p.getPartitionLeaderAddr(part)
 			if err := p.client.ReconnectPartition(part, brokerAddr); err != nil {
 				lastErr = fmt.Errorf("reconnect failed: %w", err)
 				time.Sleep(time.Duration(backoff) * time.Millisecond)
@@ -194,7 +194,7 @@ func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error)
 
 		if err := WriteWithLength(conn, payload); err != nil {
 			lastErr = fmt.Errorf("write failed: %w", err)
-			brokerAddr := p.client.selectBroker()
+			brokerAddr := p.getPartitionLeaderAddr(part)
 			_ = p.client.ReconnectPartition(part, brokerAddr)
 			time.Sleep(time.Duration(backoff) * time.Millisecond)
 			backoff = min(backoff*2, p.config.MaxBackoffMS)

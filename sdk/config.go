@@ -123,7 +123,8 @@ type ConsumerConfig struct {
 	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
 	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
 
-	LeaderStaleness time.Duration `yaml:"leader_staleness" json:"leader_staleness"`
+	LeaderStaleness         time.Duration `yaml:"leader_staleness" json:"leader_staleness"`
+	MetadataRefreshInterval time.Duration `yaml:"metadata_refresh_interval" json:"metadata_refresh_interval"`
 
 	CompressionType string `yaml:"compression_type" json:"compression_type"` // "none", "gzip", "snappy", "lz4"
 
