@@ -42,9 +42,10 @@ type DiskHandler struct {
 
 	FlushedOffset uint64 // last offset confirmed written to disk
 
-	writeCh chan types.DiskMessage
-	done    chan struct{}
-	OnSync  func(uint64)
+	writeCh     chan types.DiskMessage
+	done        chan struct{}
+	flushSignal chan chan struct{}
+	OnSync      func(uint64)
 
 	batchSize      int
 	linger         time.Duration
@@ -140,6 +141,7 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 
 		writeCh:        make(chan types.DiskMessage, cfg.ChannelBufferSize),
 		done:           make(chan struct{}),
+		flushSignal:    make(chan chan struct{}, 1),
 		batchSize:      cfg.DiskFlushBatchSize,
 		linger:         time.Duration(cfg.LingerMS) * time.Millisecond,
 		writeTimeout:   time.Duration(cfg.DiskWriteTimeoutMS) * time.Millisecond,
@@ -239,6 +241,25 @@ func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.
 		return 0, fmt.Errorf("WriteDirect failed: %w", err)
 	}
 	return offset, nil
+}
+
+// AppendMessageWithOffset writes a message with a pre-assigned offset (for follower replication).
+// Unlike AppendMessage/AppendMessageSync, it does NOT allocate a new offset.
+func (d *DiskHandler) AppendMessageWithOffset(topic string, partition int, msg *types.Message) error {
+	if err := d.WriteDirect(topic, partition, *msg); err != nil {
+		return fmt.Errorf("WriteDirect failed: %w", err)
+	}
+	for {
+		current := atomic.LoadUint64(&d.AbsoluteOffset)
+		newOffset := msg.Offset + 1
+		if newOffset <= current {
+			break
+		}
+		if atomic.CompareAndSwapUint64(&d.AbsoluteOffset, current, newOffset) {
+			break
+		}
+	}
+	return nil
 }
 
 // AppendMessage sends a message to the internal write channel for asynchronous disk persistence.

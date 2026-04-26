@@ -39,6 +39,11 @@ func (m *MockStorageHandler) AppendMessageSync(topic string, partition int, msg 
 	return args.Get(0).(uint64), args.Error(1)
 }
 
+func (m *MockStorageHandler) AppendMessageWithOffset(topic string, partition int, msg *types.Message) error {
+	args := m.Called(topic, partition, msg)
+	return args.Error(0)
+}
+
 func (m *MockStorageHandler) ReadMessages(offset uint64, max int) ([]types.Message, error) {
 	args := m.Called(offset, max)
 	msgs := args.Get(0)

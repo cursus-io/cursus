@@ -145,7 +145,7 @@ func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bo
 			if strings.HasPrefix(part, "host=") {
 				host = strings.TrimPrefix(part, "host=")
 			} else if strings.HasPrefix(part, "port=") {
-				fmt.Sscanf(part, "port=%d", &port)
+				_, _ = fmt.Sscanf(part, "port=%d", &port)
 			}
 		}
 		if host != "" && port > 0 {

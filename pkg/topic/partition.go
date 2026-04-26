@@ -229,6 +229,71 @@ func (p *Partition) EnqueueBatch(msgs []types.Message) error {
 	return nil
 }
 
+// EnqueueBatchLeader appends messages and updates LEO, but does NOT update HWM.
+// Used by the partition leader in cluster mode. HWM is updated separately after
+// successful replication, ensuring consumers never read unreplicated messages.
+func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return fmt.Errorf("partition %d is closed", p.id)
+	}
+
+	for i := range msgs {
+		if p.isDuplicate(&msgs[i]) {
+			continue
+		}
+
+		offset, err := p.dh.AppendMessage(p.topic, p.id, &msgs[i])
+		if err != nil {
+			p.NotifyNewMessage()
+			return fmt.Errorf("batch enqueue failed at index %d: %w", i, err)
+		}
+
+		p.updateProducerState(&msgs[i])
+		msgs[i].Offset = offset
+		p.LEO.Store(offset + 1)
+	}
+	p.NotifyNewMessage()
+	return nil
+}
+
+// AdvanceHWM sets HWM to the current LEO. Called after successful replication.
+func (p *Partition) AdvanceHWM() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	leo := p.LEO.Load()
+	if leo > p.HWM {
+		p.HWM = leo
+	}
+}
+
+// ReplicaAppend writes messages with pre-assigned offsets from the leader (follower replication).
+// It preserves the leader's offset assignments and updates LEO/HWM accordingly.
+func (p *Partition) ReplicaAppend(msgs []types.Message) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return fmt.Errorf("partition %d is closed", p.id)
+	}
+
+	for i := range msgs {
+		if err := p.dh.AppendMessageWithOffset(p.topic, p.id, &msgs[i]); err != nil {
+			return fmt.Errorf("replica append failed at index %d: %w", i, err)
+		}
+
+		newLEO := msgs[i].Offset + 1
+		if currentLEO := p.LEO.Load(); newLEO > currentLEO {
+			p.LEO.Store(newLEO)
+		}
+		if p.HWM < newLEO {
+			p.HWM = newLEO
+		}
+	}
+	p.NotifyNewMessage()
+	return nil
+}
+
 func (p *Partition) NotifyNewMessage() {
 	select {
 	case p.newMessageCh <- struct{}{}:

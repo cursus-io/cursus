@@ -53,6 +53,10 @@ func (f *fakeStorageHandler) AppendMessageSync(t string, p int, msg *types.Messa
 	return f.AppendMessage(t, p, msg)
 }
 
+func (f *fakeStorageHandler) AppendMessageWithOffset(t string, p int, msg *types.Message) error {
+	return nil
+}
+
 func (f *fakeStorageHandler) WriteBatch(_ []types.DiskMessage) error { return nil }
 func (f *fakeStorageHandler) Flush()                                 {}
 func (f *fakeStorageHandler) Close() error                           { return nil }

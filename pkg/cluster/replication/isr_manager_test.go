@@ -30,6 +30,9 @@ func (m *MockStorageHandler) AppendMessage(t string, p int, msg *types.Message) 
 func (m *MockStorageHandler) AppendMessageSync(t string, p int, msg *types.Message) (uint64, error) {
 	return 0, nil
 }
+func (m *MockStorageHandler) AppendMessageWithOffset(t string, p int, msg *types.Message) error {
+	return nil
+}
 func (m *MockStorageHandler) WriteBatch(b []types.DiskMessage) error { return nil }
 func (m *MockStorageHandler) Flush()                                 {}
 func (m *MockStorageHandler) Close() error                           { return nil }

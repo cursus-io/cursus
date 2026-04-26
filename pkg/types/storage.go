@@ -9,6 +9,7 @@ type StorageHandler interface {
 
 	AppendMessage(topic string, partition int, msg *Message) (uint64, error)
 	AppendMessageSync(topic string, partition int, msg *Message) (uint64, error)
+	AppendMessageWithOffset(topic string, partition int, msg *Message) error
 	WriteBatch(batch []DiskMessage) error
 
 	Flush()

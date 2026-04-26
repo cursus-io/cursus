@@ -84,13 +84,6 @@ func NewClusterController(ctx context.Context, cfg *config.Config, rm RaftManage
 	return cc
 }
 
-func effectiveBrokerPort(cfg *config.Config) int {
-	if cfg.AdvertisedBrokerPort > 0 {
-		return cfg.AdvertisedBrokerPort
-	}
-	return cfg.BrokerPort
-}
-
 func (cc *ClusterController) Start(ctx context.Context) {
 	cc.Election.Start()
 	cc.Discovery.StartReconciler(ctx)

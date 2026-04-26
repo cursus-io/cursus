@@ -135,11 +135,8 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 			Acks: acks,
 		}
 
-		// Save HWM before enqueue so we can roll back on replication failure
-		prevHWM := p.GetHWM()
-
-		// 1. Append locally (async batch write)
-		if err := p.EnqueueBatch(messageData.Messages); err != nil {
+		// 1. Append locally (LEO advances, HWM stays until replication succeeds)
+		if err := p.EnqueueBatchLeader(messageData.Messages); err != nil {
 			return ch.errorResponse(fmt.Sprintf("failed to append locally: %v", err))
 		}
 
@@ -155,14 +152,15 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 
 			err = ch.Cluster.ReplicateToFollowers(topicName, partition, messageData, minISR)
 			if err != nil {
-				// Roll back HWM so consumers don't see unreplicated messages
-				p.SetHWM(prevHWM)
 				return ch.errorResponse(fmt.Sprintf("replication failed (offset=%d): %v", assignedOffset, err))
 			}
 		}
 
 		// Ensure data is on disk before ACK
 		p.FlushDisk()
+
+		// Advance HWM now that replication and flush are complete
+		p.AdvanceHWM()
 
 		ackResp = types.AckResponse{
 			Status:        "OK",
@@ -239,8 +237,8 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 		return "ERROR: empty messages in replicate command"
 	}
 
-	if err := p.EnqueueBatch(msgCmd.Messages); err != nil {
-		return fmt.Sprintf("ERROR: enqueue failed: %v", err)
+	if err := p.ReplicaAppend(msgCmd.Messages); err != nil {
+		return fmt.Sprintf("ERROR: replica append failed: %v", err)
 	}
 
 	return "OK"
@@ -311,11 +309,8 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 		effectiveIdempotent := batch.IsIdempotent || ch.Config.EnableIdempotence
 		scope := "global"
 
-		// Save HWM before enqueue so we can roll back on replication failure
-		prevHWM := p.GetHWM()
-
-		// 1. Append locally (async batch write)
-		if err := p.EnqueueBatch(batch.Messages); err != nil {
+		// 1. Append locally (LEO advances, HWM stays until replication succeeds)
+		if err := p.EnqueueBatchLeader(batch.Messages); err != nil {
 			return ch.errorResponse(fmt.Sprintf("failed to append batch locally: %v", err)), nil
 		}
 
@@ -340,14 +335,15 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 
 			err = ch.Cluster.ReplicateToFollowers(batch.Topic, batch.Partition, msgCmd, minISR)
 			if err != nil {
-				// Roll back HWM so consumers don't see unreplicated messages
-				p.SetHWM(prevHWM)
 				return ch.errorResponse(fmt.Sprintf("batch replication failed (offset=%d): %v", lastOffset, err)), nil
 			}
 		}
 
 		// Ensure data is on disk before ACK
 		p.FlushDisk()
+
+		// Advance HWM now that replication and flush are complete
+		p.AdvanceHWM()
 
 		respAck = types.AckResponse{
 			Status:        "OK",

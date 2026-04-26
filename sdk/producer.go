@@ -143,11 +143,11 @@ func (p *Producer) fetchMetadata() {
 		}
 		cmd := fmt.Sprintf("METADATA topic=%s", p.config.Topic)
 		if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 		resp, err := ReadWithLength(conn)
-		conn.Close()
+		_ = conn.Close()
 		if err != nil {
 			continue
 		}

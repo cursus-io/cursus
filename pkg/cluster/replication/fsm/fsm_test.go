@@ -28,6 +28,9 @@ func (m *MockStorageHandler) AppendMessage(topic string, partition int, msg *typ
 	msg.Offset = m.offset
 	return m.offset, nil
 }
+func (m *MockStorageHandler) AppendMessageWithOffset(topic string, partition int, msg *types.Message) error {
+	return nil
+}
 func (m *MockStorageHandler) GetAbsoluteOffset() uint64 { return m.offset }
 func (m *MockStorageHandler) GetFlushedOffset() uint64  { return m.offset }
 func (m *MockStorageHandler) GetLatestOffset() uint64   { return m.offset }

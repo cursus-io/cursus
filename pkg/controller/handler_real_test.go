@@ -28,6 +28,9 @@ func (m *mockStorage) AppendMessage(topic string, partition int, msg *types.Mess
 func (m *mockStorage) AppendMessageSync(topic string, partition int, msg *types.Message) (uint64, error) {
 	return 0, nil
 }
+func (m *mockStorage) AppendMessageWithOffset(topic string, partition int, msg *types.Message) error {
+	return nil
+}
 func (m *mockStorage) WriteBatch(batch []types.DiskMessage) error { return nil }
 
 func (m *mockStorage) Flush()       {}
