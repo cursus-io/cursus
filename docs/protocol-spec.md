@@ -199,6 +199,40 @@ Response (JSON — `AckResponse`):
 | `1` | Leader writes to local disk, then responds |
 | `-1` / `all` | Leader waits for `min_in_sync_replicas` acknowledgments |
 
+#### Cluster Discovery
+
+**FIND_COORDINATOR**
+```
+FIND_COORDINATOR group=<name>
+```
+| Param | Required | Description |
+|-------|----------|-------------|
+| group | Yes | Consumer group name |
+
+Response: `OK coordinator_id=<broker_id> host=<host> port=<port>`
+
+Any broker can answer this command. The coordinator is determined by consistent hashing of the group name across active brokers.
+
+> In cluster mode, group commands (`JOIN_GROUP`, `SYNC_GROUP`, `LEAVE_GROUP`, `HEARTBEAT`, `COMMIT_OFFSET`, `FETCH_OFFSET`) must be sent to the coordinator. If sent to a non-coordinator broker, the response will be:
+> `ERROR: NOT_COORDINATOR host=<coordinator_host> port=<coordinator_port>`
+
+**METADATA**
+```
+METADATA topic=<name>
+```
+| Param | Required | Description |
+|-------|----------|-------------|
+| topic | Yes | Topic name |
+
+Response: `OK topic=<name> partitions=<N> leaders=<host:port>,<host:port>,...`
+
+Returns the client-facing address of each partition's leader broker, in partition order (P0, P1, P2, ...).
+
+Any broker can answer this command. Addresses are the advertised client addresses from the FSM broker registry.
+
+> In cluster mode, `CONSUME` and `STREAM` should be sent to the partition leader. If sent to a non-leader broker, the response will be:
+> `ERROR: NOT_LEADER LEADER_IS <host:port>`
+
 #### Consumer Group Coordination
 
 **JOIN_GROUP**
