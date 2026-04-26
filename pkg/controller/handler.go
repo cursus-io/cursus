@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/config"
@@ -26,6 +27,9 @@ type CommandHandler struct {
 	Cluster       *clusterController.ClusterController
 	ESHandler     *eventsource.Handler
 	commands      []commandEntry
+
+	coordCache   map[string]coordCacheEntry
+	coordCacheMu sync.RWMutex
 }
 
 // commandEntry defines a single command routing rule.
@@ -53,6 +57,7 @@ func NewCommandHandler(
 		Config:        cfg,
 		Coordinator:   cd,
 		StreamManager: sm,
+		coordCache:    make(map[string]coordCacheEntry),
 		Cluster:       cc,
 		ESHandler:     eventsource.NewHandler(tm),
 	}
@@ -78,7 +83,10 @@ func NewCommandHandler(
 		{prefix: "SAVE_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.ESHandler.HandleSaveSnapshot(cmd) }},
 		{prefix: "READ_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.ESHandler.HandleReadSnapshot(cmd) }},
 		{prefix: "READ_STREAM ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return STREAM_DATA_SIGNAL }},
+		{prefix: "METADATA ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleMetadata(cmd) }},
+		{prefix: "FIND_COORDINATOR ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFindCoordinator(cmd) }},
 		{prefix: "REPLICATE_MESSAGE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateMessage(cmd) }},
+		{prefix: "RAFT_APPLY ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd) }},
 	}
 	return ch
 }

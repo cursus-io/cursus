@@ -917,7 +917,7 @@ func TestProcessMessage_DecodeErrorNonCommand(t *testing.T) {
 
 	data := []byte{0x00}
 	_, err := processMessage(data, cmdHandler, cmdCtx, server)
-	assert.Error(t, err)
+	assert.NoError(t, err) // Error response is sent to conn, not returned
 }
 
 func TestWriteResponseWithTimeout_LongMessage(t *testing.T) {

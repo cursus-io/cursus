@@ -18,6 +18,7 @@ func (m *mockStorage) ReadMessages(offset uint64, max int) ([]types.Message, err
 	return []types.Message{}, nil
 }
 func (m *mockStorage) GetAbsoluteOffset() uint64               { return 0 }
+func (m *mockStorage) GetFlushedOffset() uint64                { return 0 }
 func (m *mockStorage) GetLatestOffset() uint64                 { return 0 }
 func (m *mockStorage) GetSegmentPath(baseOffset uint64) string { return "" }
 

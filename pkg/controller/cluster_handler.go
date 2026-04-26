@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net"
 	"strings"
 	"time"
 
 	"github.com/cursus-io/cursus/util"
+
 	"github.com/google/uuid"
 )
 
@@ -38,6 +40,13 @@ func (ch *CommandHandler) hasRouter() bool {
 
 func (ch *CommandHandler) ProcessCommand(cmd string) string {
 	ctx := NewClientContext("default-group", 0)
+
+	// Forwarded commands arrive wrapped in a binary envelope
+	// (2-byte topic length + topic + payload). Decode it first.
+	if _, payload, err := util.DecodeMessage([]byte(cmd)); err == nil {
+		cmd = strings.TrimSpace(payload)
+	}
+
 	return ch.HandleCommand(cmd, ctx)
 }
 
@@ -91,30 +100,74 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 	return "", false, nil
 }
 
-func (ch *CommandHandler) isCoordinatorAndForward(groupName, cmd string) (string, bool, error) {
+// AdvertisedAddr holds the external-facing address for a coordinator broker.
+type AdvertisedAddr struct {
+	Host string
+	Port int
+}
+
+type coordCacheEntry struct {
+	addr    AdvertisedAddr
+	updated time.Time
+}
+
+const coordCacheTTL = 30 * time.Second
+
+// checkCoordinator checks if this broker is the coordinator for the given group.
+// Returns (addr, false) if another broker is coordinator, or (_, true) if we are.
+func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bool) {
 	if !ch.hasRouter() {
-		return "", false, nil
+		return AdvertisedAddr{}, true
+	}
+	id, _, err := ch.Cluster.Router.FindCoordinator(groupName)
+	if err != nil {
+		return AdvertisedAddr{}, true
+	}
+	if id == ch.Cluster.Router.BrokerID() {
+		return AdvertisedAddr{}, true
 	}
 
-	const maxRetries = 3
+	// Check cache
+	ch.coordCacheMu.RLock()
+	if cached, ok := ch.coordCache[id]; ok && time.Since(cached.updated) < coordCacheTTL {
+		ch.coordCacheMu.RUnlock()
+		return cached.addr, false
+	}
+	ch.coordCacheMu.RUnlock()
 
-	encodedCmd := util.EncodeMessage("", cmd)
-	var lastErr error
-	for i := 0; i < maxRetries; i++ {
-		resp, err := ch.Cluster.Router.ForwardToCoordinator(groupName, string(encodedCmd))
-		if err == nil {
-			// If response contains "not the coordinator", we might need to retry because the ring changed.
-			if !strings.HasPrefix(resp, "ERROR: not the coordinator") {
-				return resp, true, nil
+	// Get coordinator's advertised address by forwarding FIND_COORDINATOR to it
+	findCmd := fmt.Sprintf("FIND_COORDINATOR group=%s", groupName)
+	encodedCmd := util.EncodeMessage("", findCmd)
+	resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(groupName, string(encodedCmd))
+	if fwdErr == nil && strings.HasPrefix(resp, "OK") {
+		host, port := "", 0
+		for _, part := range strings.Fields(resp) {
+			if strings.HasPrefix(part, "host=") {
+				host = strings.TrimPrefix(part, "host=")
+			} else if strings.HasPrefix(part, "port=") {
+				fmt.Sscanf(part, "port=%d", &port)
 			}
-			lastErr = fmt.Errorf("%s", resp)
-		} else {
-			lastErr = err
 		}
-		time.Sleep(backoffDelay(i, 100*time.Millisecond))
+		if host != "" && port > 0 {
+			addr := AdvertisedAddr{Host: host, Port: port}
+			ch.coordCacheMu.Lock()
+			ch.coordCache[id] = coordCacheEntry{addr: addr, updated: time.Now()}
+			ch.coordCacheMu.Unlock()
+			return addr, false
+		}
 	}
 
-	return fmt.Sprintf("ERROR: failed to forward command to coordinator for group %s: %v", groupName, lastErr), true, nil
+	// Fallback
+	host := ch.Config.AdvertisedClientHost
+	if host == "" {
+		host = "localhost"
+	}
+	return AdvertisedAddr{Host: host, Port: ch.Cluster.Router.ClientPort()}, false
+}
+
+// notCoordinatorResponse builds the NOT_COORDINATOR error response.
+func notCoordinatorResponse(addr AdvertisedAddr) string {
+	return fmt.Sprintf("ERROR: NOT_COORDINATOR host=%s port=%d", addr.Host, addr.Port)
 }
 
 func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition int, cmd string) (string, bool, error) {
@@ -145,6 +198,112 @@ func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition in
 	}
 
 	return fmt.Sprintf("ERROR: failed to forward command to partition leader for %s:%d: %v", topic, partition, lastErr), true, nil
+}
+
+// resolvePartitionLeaderAddr returns the client-facing address of the partition leader.
+func (ch *CommandHandler) resolvePartitionLeaderAddr(topicName string, partitionID int) string {
+	if !ch.isDistributed() {
+		return ch.fallbackClientAddr()
+	}
+
+	fsmRef := ch.Cluster.RaftManager.GetFSM()
+	if fsmRef == nil {
+		return ch.fallbackClientAddr()
+	}
+
+	partitionKey := fmt.Sprintf("%s-%d", topicName, partitionID)
+	meta := fsmRef.GetPartitionMetadata(partitionKey)
+	if meta == nil {
+		return ch.fallbackClientAddr()
+	}
+
+	broker := fsmRef.GetBroker(meta.Leader)
+	if broker == nil {
+		return ch.fallbackClientAddr()
+	}
+
+	if broker.ClientAddr != "" {
+		return broker.ClientAddr
+	}
+
+	// Legacy fallback: derive from Raft addr
+	if h, _, err := net.SplitHostPort(broker.Addr); err == nil {
+		return fmt.Sprintf("%s:%d", h, ch.Cluster.Router.ClientPort())
+	}
+	return ch.fallbackClientAddr()
+}
+
+func (ch *CommandHandler) fallbackClientAddr() string {
+	host := ch.Config.AdvertisedClientHost
+	if host == "" {
+		host = "localhost"
+	}
+	port := ch.Config.AdvertisedBrokerPort
+	if port == 0 {
+		port = ch.Config.BrokerPort
+	}
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
+// handleRaftApply processes RAFT_APPLY command (internal, from coordinator to leader).
+func (ch *CommandHandler) handleRaftApply(cmd string) string {
+	rest := cmd[11:] // len("RAFT_APPLY ") = 11
+
+	typeIdx := strings.Index(rest, "type=")
+	payloadIdx := strings.Index(rest, "payload=")
+	if typeIdx == -1 || payloadIdx == -1 {
+		return "ERROR: RAFT_APPLY requires type and payload parameters"
+	}
+
+	cmdType := strings.TrimSpace(rest[typeIdx+5 : payloadIdx])
+	payloadStr := strings.TrimSpace(rest[payloadIdx+8:])
+
+	if cmdType == "" || payloadStr == "" {
+		return "ERROR: RAFT_APPLY requires non-empty type and payload"
+	}
+
+	if !ch.isDistributed() {
+		return "ERROR: RAFT_APPLY requires distributed mode"
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(payloadStr), &payload); err != nil {
+		return fmt.Sprintf("ERROR: invalid payload JSON: %v", err)
+	}
+
+	_, err := ch.applyAndWait(cmdType, payload)
+	if err != nil {
+		return fmt.Sprintf("ERROR: %v", err)
+	}
+	return "OK"
+}
+
+// applyViaLeader tries local Raft apply first; if not leader, forwards to leader via RAFT_APPLY.
+func (ch *CommandHandler) applyViaLeader(cmdType string, payload map[string]interface{}) (interface{}, error) {
+	result, err := ch.applyAndWait(cmdType, payload)
+	if err == nil {
+		return result, nil
+	}
+
+	if !ch.isDistributed() || ch.Cluster.Router == nil {
+		return nil, err
+	}
+
+	data, jsonErr := json.Marshal(payload)
+	if jsonErr != nil {
+		return nil, fmt.Errorf("marshal payload: %w", jsonErr)
+	}
+
+	forwardCmd := fmt.Sprintf("RAFT_APPLY type=%s payload=%s", cmdType, string(data))
+	encodedCmd := util.EncodeMessage("", forwardCmd)
+	resp, fwdErr := ch.Cluster.Router.ForwardToLeader(string(encodedCmd))
+	if fwdErr != nil {
+		return nil, fmt.Errorf("forward raft apply to leader: %w", fwdErr)
+	}
+	if strings.HasPrefix(resp, "ERROR") {
+		return nil, fmt.Errorf("leader raft apply: %s", resp)
+	}
+	return resp, nil
 }
 
 func (ch *CommandHandler) applyAndWait(cmdType string, payload map[string]interface{}) (interface{}, error) {

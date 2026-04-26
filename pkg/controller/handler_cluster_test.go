@@ -18,10 +18,9 @@ func TestCommandHandler_DistributionDisabled(t *testing.T) {
 	assert.False(t, forwarded)
 	assert.NoError(t, err)
 
-	resp, forwarded, err = ch.isCoordinatorAndForward("group1", "HELP")
-	assert.Empty(t, resp)
-	assert.False(t, forwarded)
-	assert.NoError(t, err)
+	// checkCoordinator should return true (we are coordinator) when distribution is disabled
+	_, isCoord := ch.checkCoordinator("group1")
+	assert.True(t, isCoord)
 }
 
 func TestIsTopicMatched(t *testing.T) {

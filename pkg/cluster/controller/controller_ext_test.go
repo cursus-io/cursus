@@ -93,7 +93,7 @@ func TestClusterController_Basic(t *testing.T) {
 func TestClusterRouter_Forwarding(t *testing.T) {
 	rm := &MockRaftManager{isLeader: false}
 	lp := &MockLocalProcessor{}
-	router := NewClusterRouter("node1", "localhost:9001", lp, rm, 9000)
+	router := NewClusterRouter("node1", "localhost:9001", lp, rm, 9000, "")
 
 	t.Run("ForwardToLeader - Leader is self (error case)", func(t *testing.T) {
 		rm.isLeader = false

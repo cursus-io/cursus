@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -82,7 +83,17 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 			return fmt.Errorf("failed to create raft replication manager: %w", err)
 		}
 
-		sd := clusterController.NewServiceDiscovery(rm, brokerID, localAddr)
+		clientHost := cfg.AdvertisedClientHost
+		if clientHost == "" {
+			clientHost = cfg.AdvertisedHost
+		}
+		clientPort := cfg.AdvertisedBrokerPort
+		if clientPort == 0 {
+			clientPort = cfg.BrokerPort
+		}
+		clientAddr := fmt.Sprintf("%s:%d", clientHost, clientPort)
+
+		sd := clusterController.NewServiceDiscovery(rm, brokerID, localAddr, clientAddr)
 		discoveryAddr := fmt.Sprintf(":%d", cfg.DiscoveryPort)
 		cs := cluster.NewClusterServer(sd)
 		go func() {
@@ -111,6 +122,31 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 			} else {
 				util.Info("✅ Successfully joined cluster")
 			}
+
+			// Register self with ClientAddr — try local first, then forward to leader
+			go func() {
+				for i := 0; i < 15; i++ {
+					time.Sleep(3 * time.Second)
+					// Try direct Raft apply (works if we're the leader)
+					if err := sd.Register(); err == nil {
+						util.Info("✅ Registered with client address %s", clientAddr)
+						return
+					}
+					// Forward via RAFT_APPLY to leader
+					if cc != nil && cc.Router != nil {
+						brokerJSON, _ := json.Marshal(map[string]interface{}{
+							"id": brokerID, "addr": localAddr, "client_addr": clientAddr,
+							"status": "active",
+						})
+						raftCmd := fmt.Sprintf("RAFT_APPLY type=REGISTER payload=%s", string(brokerJSON))
+						encodedCmd := util.EncodeMessage("", raftCmd)
+						if resp, err := cc.Router.ForwardToLeader(string(encodedCmd)); err == nil && !strings.HasPrefix(resp, "ERROR") {
+							util.Info("✅ Registered via leader with client address %s", clientAddr)
+							return
+						}
+					}
+				}
+			}()
 		}()
 
 		go func() {
@@ -330,7 +366,8 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 			return handleCommandMessage(rawInput, cmdHandler, ctx, conn)
 		}
 		util.Error("⚠️ Decode error and not a raw command: %v [%s]", err, string(data))
-		return false, err
+		writeResponse(conn, fmt.Sprintf("ERROR: decode failed: %v", err))
+		return false, nil
 	}
 
 	payload = strings.Trim(payload, "\x00 \t\n\r")
@@ -379,9 +416,10 @@ func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler,
 			return false, nil
 		}
 	}
-	if resp != "" {
-		writeResponse(conn, resp)
+	if resp == "" {
+		resp = "ERROR: empty response from command handler"
 	}
+	writeResponse(conn, resp)
 	return false, nil
 }
 
@@ -405,7 +443,8 @@ func isCommand(s string) bool {
 	keywords := []string{"CREATE", "DELETE", "LIST", "LIST_CLUSTER", "PUBLISH", "CONSUME", "STREAM", "HELP",
 		"HEARTBEAT", "JOIN_GROUP", "LEAVE_GROUP", "COMMIT_OFFSET", "BATCH_COMMIT", "REGISTER_GROUP",
 		"GROUP_STATUS", "FETCH_OFFSET", "LIST_GROUPS", "SYNC_GROUP", "DESCRIBE",
-		"APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT", "READ_SNAPSHOT", "STREAM_VERSION"}
+		"APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT", "READ_SNAPSHOT", "STREAM_VERSION",
+		"FIND_COORDINATOR", "RAFT_APPLY", "METADATA"}
 	for _, k := range keywords {
 		if strings.HasPrefix(strings.ToUpper(s), k) {
 			return true

@@ -23,10 +23,11 @@ type ReplicationEntry struct {
 }
 
 type BrokerInfo struct {
-	ID       string    `json:"id"`
-	Addr     string    `json:"addr"`
-	Status   string    `json:"status"`
-	LastSeen time.Time `json:"last_seen"`
+	ID         string    `json:"id"`
+	Addr       string    `json:"addr"`
+	ClientAddr string    `json:"client_addr,omitempty"`
+	Status     string    `json:"status"`
+	LastSeen   time.Time `json:"last_seen"`
 }
 
 type BrokerFSMState struct {
