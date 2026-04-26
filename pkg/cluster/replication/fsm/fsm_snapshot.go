@@ -3,6 +3,7 @@ package fsm
 import (
 	"encoding/json"
 
+	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
 )
@@ -13,16 +14,18 @@ type BrokerFSMSnapshot struct {
 	brokers           map[string]*BrokerInfo
 	partitionMetadata map[string]*PartitionMetadata
 	producerState     map[string]map[int]map[string]int64
+	groupState        map[string]*coordinator.GroupStateSnapshot
 }
 
 func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	state := BrokerFSMState{
-		Version:           1,
+		Version:           2,
 		Applied:           s.applied,
 		Logs:              s.logs,
 		Brokers:           s.brokers,
 		PartitionMetadata: s.partitionMetadata,
 		ProducerState:     s.producerState,
+		GroupState:        s.groupState,
 	}
 
 	util.Debug("Persisting snapshot data")
