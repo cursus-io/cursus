@@ -96,48 +96,15 @@ sendBatch:
 }
 
 func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx *ClientContext, batchSize int) ([]types.Message, error) {
-	if cArgs.MemberID == "" {
-		return nil, fmt.Errorf("missing member parameter")
-	}
-
 	_, p, err := ch.getTopicAndPartition(topicName, cArgs.PartitionID)
 	if err != nil {
 		return nil, err
-	}
-
-	currentGen := -1
-	if cArgs.Generation != -1 {
-		currentGen = cArgs.Generation
-	}
-
-	// Record heartbeat and validate ownership only if this broker has the member's session.
-	// In cluster mode with coordinator routing, CONSUME goes to the partition leader
-	// which may not be the coordinator — skip coordinator checks in that case.
-	if ch.Coordinator != nil {
-		if coordGen := ch.Coordinator.GetGeneration(cArgs.GroupName); coordGen > 0 {
-			if currentGen == -1 {
-				currentGen = coordGen
-			}
-			// Only record heartbeat if this broker knows about the member
-			if err := ch.Coordinator.RecordHeartbeat(cArgs.GroupName, cArgs.MemberID); err != nil {
-				util.Debug("Heartbeat during consume skipped: %v", err)
-				// Don't fail — this broker may not be the coordinator
-			}
-		}
-	}
-
-	if ctx.Generation != currentGen {
-		ctx.OffsetCache = make(map[string]uint64)
-		ctx.Generation = currentGen
-		ctx.MemberID = cArgs.MemberID
-		util.Debug("Generation changed to %d, cache cleared", currentGen)
 	}
 
 	cacheKey := fmt.Sprintf("%s-%d", topicName, cArgs.PartitionID)
 	var currentOffset uint64
 	if cArgs.HasOffset {
 		currentOffset = cArgs.Offset
-		util.Debug("Using explicit offset: %d", currentOffset)
 	} else if cached, ok := ctx.OffsetCache[cacheKey]; ok {
 		currentOffset = cached
 	} else {
@@ -146,15 +113,6 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 			return nil, err
 		}
 		currentOffset = actualOffset
-	}
-
-	// Validate ownership only if coordinator has session info for this group.
-	// Partition leaders may not have group membership data.
-	if ch.Coordinator != nil && ch.Coordinator.GetGroup(cArgs.GroupName) != nil {
-		if !ch.ValidateOwnership(cArgs.GroupName, cArgs.MemberID, currentGen, cArgs.PartitionID) {
-			util.Debug("Ownership validation failed for topic %s (gen=%d)", topicName, currentGen)
-			return nil, nil
-		}
 	}
 
 	messages, err := p.ReadCommitted(currentOffset, batchSize)

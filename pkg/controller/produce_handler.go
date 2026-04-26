@@ -138,7 +138,7 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 		// Save HWM before enqueue so we can roll back on replication failure
 		prevHWM := p.GetHWM()
 
-		// 1. Append locally (EnqueueBatch assigns offsets and updates LEO/HWM internally)
+		// 1. Append locally (async batch write)
 		if err := p.EnqueueBatch(messageData.Messages); err != nil {
 			return ch.errorResponse(fmt.Sprintf("failed to append locally: %v", err))
 		}
@@ -160,6 +160,9 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 				return ch.errorResponse(fmt.Sprintf("replication failed (offset=%d): %v", assignedOffset, err))
 			}
 		}
+
+		// Ensure data is on disk before ACK
+		p.FlushDisk()
 
 		ackResp = types.AckResponse{
 			Status:        "OK",
@@ -264,15 +267,6 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 	var respAck types.AckResponse
 	var lastMsg *types.Message
 	if ch.Config.EnabledDistribution && ch.Cluster != nil {
-		if _, forwarded, _ := ch.isPartitionLeaderAndForward(batch.Topic, batch.Partition, "BATCH"); forwarded {
-			// Note: isPartitionLeaderAndForward doesn't support binary BATCH data currently.
-			// Actually HandleBatchMessage is called for binary BATCH data.
-			// I need a way to forward binary data to Partition Leader.
-			util.Warn("Binary batch forwarding to partition leader is not fully implemented for all cases")
-			// For now, let's just forward to Raft leader if not the leader,
-			// but better would be to use ForwardDataToPartitionLeader.
-		}
-
 		if !ch.Cluster.IsAuthorized(batch.Topic, batch.Partition) {
 			const maxRetries = 3
 			const retryDelay = 200 * time.Millisecond
@@ -320,7 +314,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 		// Save HWM before enqueue so we can roll back on replication failure
 		prevHWM := p.GetHWM()
 
-		// 1. Append locally (EnqueueBatch assigns offsets and updates LEO/HWM internally)
+		// 1. Append locally (async batch write)
 		if err := p.EnqueueBatch(batch.Messages); err != nil {
 			return ch.errorResponse(fmt.Sprintf("failed to append batch locally: %v", err)), nil
 		}
@@ -351,6 +345,9 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 				return ch.errorResponse(fmt.Sprintf("batch replication failed (offset=%d): %v", lastOffset, err)), nil
 			}
 		}
+
+		// Ensure data is on disk before ACK
+		p.FlushDisk()
 
 		respAck = types.AckResponse{
 			Status:        "OK",
