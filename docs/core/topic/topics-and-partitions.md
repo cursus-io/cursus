@@ -8,6 +8,74 @@ For information about consumer groups and how they interact with partitions, see
 
 A Topic is a named message stream that is divided into one or more Partitions. Each partition operates independently with its own message queue and disk storage, allowing cursus to parallelize message processing and storage operations. The system supports two partition selection strategies: key-based routing for ordering guarantees and round-robin for load balancing.
 
+## Topic and Partition Structure
+
+```mermaid
+flowchart TB
+    subgraph "TopicManager"
+        TM["topics: map[string]*Topic\ndedupMap: sync.Map\n30-min dedup window"]
+    end
+
+    subgraph "Topic: orders"
+        direction TB
+        TMETA["Name: orders\ncounter: uint64 (round-robin)\nmu: sync.RWMutex"]
+
+        subgraph "Partition 0"
+            P0CH["ch: chan Message\ncap 10,000"]
+            P0DH["DiskHandler\nwriteCh → flushLoop"]
+            P0SEG[("segment-0.log\nsegment-1.log")]
+            P0SUBS["subs: map[groupName]chan\ncap 10,000 each"]
+        end
+
+        subgraph "Partition 1"
+            P1CH["ch: chan Message\ncap 10,000"]
+            P1DH["DiskHandler\nwriteCh → flushLoop"]
+            P1SEG[("segment-0.log")]
+            P1SUBS["subs: map[groupName]chan\ncap 10,000 each"]
+        end
+
+        subgraph "Partition N"
+            PNCH["ch: chan Message\ncap 10,000"]
+            PNDH["DiskHandler\nwriteCh → flushLoop"]
+            PNSEG[("segment-0.log")]
+            PNSUBS["subs: map[groupName]chan\ncap 10,000 each"]
+        end
+
+        subgraph "ConsumerGroups"
+            CGA["Group A\n[Consumer0, Consumer1]\nMsgCh cap 1000 each"]
+            CGB["Group B\n[Consumer0]\nMsgCh cap 1000"]
+        end
+    end
+
+    TM --> TMETA
+    TMETA --> P0CH & P1CH & PNCH
+
+    P0CH -->|run goroutine| P0SUBS
+    P0CH -->|EnqueueBatch| P0DH
+    P0DH --> P0SEG
+
+    P1CH -->|run goroutine| P1SUBS
+    P1CH -->|EnqueueBatch| P1DH
+    P1DH --> P1SEG
+
+    PNCH -->|run goroutine| PNSUBS
+    PNCH -->|EnqueueBatch| PNDH
+    PNDH --> PNSEG
+
+    P0SUBS -->|forward goroutine\npartitionID % consumerCount| CGA
+    P1SUBS -->|forward goroutine| CGA
+    P0SUBS -->|forward goroutine| CGB
+    P1SUBS -->|forward goroutine| CGB
+
+    subgraph "Partition Selection"
+        KEY["Key != ''\n→ hash(Key) % N"]
+        RR["Key == ''\n→ counter++ % N"]
+    end
+
+    TMETA -.->|msg with key| KEY
+    TMETA -.->|msg without key| RR
+```
+
 ## Topic Structure
 
 The Topic struct represents a logical message stream and manages partition assignment and consumer group registration.

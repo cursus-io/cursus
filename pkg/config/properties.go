@@ -68,7 +68,9 @@ type Config struct {
 	StaticClusterMembers []string `yaml:"static_cluster_members" json:"distribution.static_cluster_members"`
 	BootstrapCluster     bool     `yaml:"bootstrap_cluster" json:"distribution.bootstrap"`
 
-	AdvertisedHost           string `yaml:"advertised_host" json:"distribution.advertised_host"`
+	AdvertisedHost       string `yaml:"advertised_host" json:"distribution.advertised_host"`
+	AdvertisedBrokerPort int    `yaml:"advertised_broker_port" json:"distribution.advertised_broker_port"`
+	AdvertisedClientHost string `yaml:"advertised_client_host" json:"distribution.advertised_client_host"`
 	MinInSyncReplicas        int    `yaml:"min_insync_replicas" json:"min.insync.replicas"`
 	DefaultReplicationFactor int    `yaml:"default_replication_factor" json:"default.replication.factor"`
 
@@ -137,6 +139,7 @@ func DefaultConfig() *Config {
 			StaticClusterMembers:     []string{},
 			BootstrapCluster:         false,
 			AdvertisedHost:           "localhost",
+			AdvertisedBrokerPort:     0,
 			MinInSyncReplicas:        2,
 			DefaultReplicationFactor: 3,
 
@@ -323,6 +326,8 @@ func LoadConfig() (*Config, error) {
 
 	overrideEnvBool(&cfg.EnabledDistribution, "ENABLE_DISTRIBUTION")
 	overrideEnvString(&cfg.AdvertisedHost, "ADVERTISED_HOST")
+	overrideEnvInt(&cfg.AdvertisedBrokerPort, "ADVERTISED_BROKER_PORT")
+	overrideEnvString(&cfg.AdvertisedClientHost, "ADVERTISED_CLIENT_HOST")
 	overrideEnvInt(&cfg.RaftPort, "RAFT_PORT")
 	overrideEnvInt(&cfg.DiscoveryPort, "DISCOVERY_PORT")
 	overrideEnvStringSlice(&cfg.RaftPeers, "RAFT_PEERS")

@@ -77,11 +77,18 @@ func NewClusterController(ctx context.Context, cfg *config.Config, rm RaftManage
 		RaftManager: rm,
 		Discovery:   sd,
 		Election:    NewControllerElection(rm),
-		Router:      NewClusterRouter(brokerID, localAddr, nil, rm, cfg.BrokerPort),
+		Router:      NewClusterRouter(brokerID, localAddr, nil, rm, cfg.BrokerPort, cfg.AdvertisedClientHost),
 		brokerID:    brokerID,
 	}
 
 	return cc
+}
+
+func effectiveBrokerPort(cfg *config.Config) int {
+	if cfg.AdvertisedBrokerPort > 0 {
+		return cfg.AdvertisedBrokerPort
+	}
+	return cfg.BrokerPort
 }
 
 func (cc *ClusterController) Start(ctx context.Context) {

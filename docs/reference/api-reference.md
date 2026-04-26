@@ -25,6 +25,40 @@ If gzip compression is enabled via configuration (enable_gzip: true), messages a
 
 The DecompressMessage function handles decompression transparently.
 
+## Command Dispatch Flowchart
+
+```mermaid
+flowchart TD
+    CLIENT([Client TCP Connection]) -->|"[4-byte len][payload]"| HC[HandleConnection]
+    HC --> DEC[DecodeMessage\ntopic + payload]
+    DEC --> IC{isCommand?\nCREATE/DELETE/LIST\nSUBSCRIBE/PUBLISH\nCONSUME/HELP}
+
+    IC -->|"yes"| CMD[HandleCommand]
+    IC -->|"no → data frame"| DATA[Route to topic\nby topic field]
+
+    CMD --> PARSE{Parse first\ntoken}
+
+    PARSE -->|CREATE| CRT["CreateTopic(name, partitions)\n→ TopicManager\n→ Response: OK / ERROR"]
+    PARSE -->|DELETE| DEL["DeleteTopic(name)\n→ TopicManager\n→ Response: OK / ERROR"]
+    PARSE -->|LIST| LST["ListTopics()\n→ TopicManager\n→ comma-separated names"]
+    PARSE -->|SUBSCRIBE| SUB["RegisterConsumerGroup\n→ StreamManager\n→ Response: Subscribed"]
+    PARSE -->|PUBLISH| PUB["TopicManager.Publish\n→ dedup → partition\n→ disk + consumers"]
+    PARSE -->|CONSUME| CON["STREAM_DATA_SIGNAL\n→ HandleConsumeCommand\n→ DiskHandler read\n→ length-prefixed stream"]
+    PARSE -->|HELP| HLP["writeResponse(helpText)"]
+    PARSE -->|unknown| ERR["writeResponse\nERROR: unknown command"]
+
+    CRT --> LOG[logCommandResult\nSUCCESS / FAILURE]
+    DEL --> LOG
+    LST --> LOG
+    SUB --> LOG
+    PUB --> LOG
+    CON --> LOG
+    HLP --> LOG
+    ERR --> LOG
+
+    LOG --> HC
+```
+
 ## Command Reference
 
 ### 1. CREATE

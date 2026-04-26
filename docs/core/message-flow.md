@@ -2,6 +2,40 @@
 
 This document explains how messages flow through Cursus from publication to consumption.
 
+## Message Flow Sequence
+
+```mermaid
+sequenceDiagram
+    participant PROD as Producer
+    participant BROKER as Broker (CommandHandler)
+    participant TM as TopicManager
+    participant PART as Partition
+    participant DH as DiskHandler
+    participant DISK as Disk (Segment Files)
+    participant SM as StreamManager
+    participant CONS as Consumer
+
+    PROD->>BROKER: PUBLISH topic message
+    BROKER->>TM: Publish(topic, msg)
+    TM->>TM: dedup check (FNV-1a hash)
+    TM->>PART: select partition\n(key-hash or round-robin)
+
+    par Persistence path
+        PART->>DH: EnqueueBatch → writeCh
+        DH->>DISK: flushLoop: WriteBatch\n(50 msgs / 50ms linger)
+    and Real-time dispatch path
+        PART->>SM: NotifyNewMessage
+        SM->>CONS: push to Consumer.MsgCh
+    end
+
+    Note over CONS,DISK: Polling consumption (CONSUME command)
+    CONS->>BROKER: CONSUME topic partition offset
+    BROKER->>PART: ReadCommitted(offset)
+    PART->>DISK: mmap read
+    DISK-->>BROKER: raw bytes
+    BROKER-->>CONS: length-prefixed messages
+```
+
 ## Architecture: Persistent Log with Real-time Fan-out
 
 Cursus is a log-centric message broker designed for high-throughput persistence with low-latency real-time delivery. Unlike brokers that treat memory and disk as separate modes, Cursus employs a unified path where every message is destined for a persistent log, while simultaneously being dispatched to active consumers.

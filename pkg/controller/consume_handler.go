@@ -26,8 +26,8 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 	if err != nil {
 		return 0, err
 	}
-	if err := ch.checkLeaderOrRedirect(conn); err != nil {
-		if err.Error() == "not leader" {
+	if err := ch.checkPartitionLeaderOrRedirect(conn, cArgs.TopicName, cArgs.PartitionID); err != nil {
+		if err.Error() == "not partition leader" {
 			return 0, nil
 		}
 		return 0, err
@@ -106,18 +106,24 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 	}
 
 	currentGen := -1
-	if ch.Coordinator != nil {
-		currentGen = ch.Coordinator.GetGeneration(cArgs.GroupName)
-
-		if err := ch.Coordinator.RecordHeartbeat(cArgs.GroupName, cArgs.MemberID); err != nil {
-			util.Warn("Failed to record heartbeat during consume: %v", err)
-			return nil, fmt.Errorf("heartbeat failed: %w", err)
-		}
-	}
-
-	// Use generation from arguments if provided, otherwise fallback to coordinator
 	if cArgs.Generation != -1 {
 		currentGen = cArgs.Generation
+	}
+
+	// Record heartbeat and validate ownership only if this broker has the member's session.
+	// In cluster mode with coordinator routing, CONSUME goes to the partition leader
+	// which may not be the coordinator — skip coordinator checks in that case.
+	if ch.Coordinator != nil {
+		if coordGen := ch.Coordinator.GetGeneration(cArgs.GroupName); coordGen > 0 {
+			if currentGen == -1 {
+				currentGen = coordGen
+			}
+			// Only record heartbeat if this broker knows about the member
+			if err := ch.Coordinator.RecordHeartbeat(cArgs.GroupName, cArgs.MemberID); err != nil {
+				util.Debug("Heartbeat during consume skipped: %v", err)
+				// Don't fail — this broker may not be the coordinator
+			}
+		}
 	}
 
 	if ctx.Generation != currentGen {
@@ -142,9 +148,13 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 		currentOffset = actualOffset
 	}
 
-	if !ch.ValidateOwnership(cArgs.GroupName, cArgs.MemberID, currentGen, cArgs.PartitionID) {
-		util.Debug("Ownership validation failed for topic %s (gen=%d)", topicName, currentGen)
-		return nil, nil // Skip this topic if not owned (allowing regex to continue with other owned topics)
+	// Validate ownership only if coordinator has session info for this group.
+	// Partition leaders may not have group membership data.
+	if ch.Coordinator != nil && ch.Coordinator.GetGroup(cArgs.GroupName) != nil {
+		if !ch.ValidateOwnership(cArgs.GroupName, cArgs.MemberID, currentGen, cArgs.PartitionID) {
+			util.Debug("Ownership validation failed for topic %s (gen=%d)", topicName, currentGen)
+			return nil, nil
+		}
 	}
 
 	messages, err := p.ReadCommitted(currentOffset, batchSize)
@@ -213,8 +223,8 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	}
 	ctx.ConsumerGroup = cArgs.GroupName
 
-	if err := ch.checkLeaderOrRedirect(conn); err != nil {
-		if err.Error() == "not leader" {
+	if err := ch.checkPartitionLeaderOrRedirect(conn, cArgs.TopicName, cArgs.PartitionID); err != nil {
+		if err.Error() == "not partition leader" {
 			return nil
 		}
 		return err
@@ -274,6 +284,25 @@ func (ch *CommandHandler) validateConsumeSyntax(cmd, raw string) string {
 	return STREAM_DATA_SIGNAL
 }
 
+// checkPartitionLeaderOrRedirect checks if this broker is the leader for the given partition.
+// If not, writes a NOT_LEADER redirect with the partition leader's client address.
+func (ch *CommandHandler) checkPartitionLeaderOrRedirect(conn net.Conn, topicName string, partitionID int) error {
+	if !ch.Config.EnabledDistribution || ch.Cluster == nil || ch.Cluster.Router == nil {
+		return nil
+	}
+
+	if ch.Cluster.IsAuthorized(topicName, partitionID) {
+		return nil
+	}
+
+	leaderAddr := ch.resolvePartitionLeaderAddr(topicName, partitionID)
+	errResp := fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", leaderAddr)
+	if err := util.WriteWithLength(conn, []byte(errResp)); err != nil {
+		return fmt.Errorf("failed to send partition leader redirect: %w", err)
+	}
+	return fmt.Errorf("not partition leader")
+}
+
 // checkLeaderOrRedirect checks if this broker is the leader and writes a redirect error if not.
 func (ch *CommandHandler) checkLeaderOrRedirect(conn net.Conn) error {
 	if !ch.Config.EnabledDistribution || ch.Cluster == nil || ch.Cluster.Router == nil {
@@ -291,7 +320,14 @@ func (ch *CommandHandler) checkLeaderOrRedirect(conn net.Conn) error {
 
 	serviceLeader := leaderAddr
 	if host, _, splitErr := net.SplitHostPort(leaderAddr); splitErr == nil {
-		serviceLeader = net.JoinHostPort(host, strconv.Itoa(ch.Config.BrokerPort))
+		if ch.Config.AdvertisedClientHost != "" {
+			host = ch.Config.AdvertisedClientHost
+		}
+		port := ch.Config.BrokerPort
+		if ch.Config.AdvertisedBrokerPort > 0 {
+			port = ch.Config.AdvertisedBrokerPort
+		}
+		serviceLeader = net.JoinHostPort(host, strconv.Itoa(port))
 	}
 
 	errResp := fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", serviceLeader)

@@ -125,6 +125,7 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	}
 
 	pc.initWorker()
+	LogInfo("Partition [%d] pollAndProcess starting, fetchOffset=%d", pc.partitionID, atomic.LoadUint64(&pc.fetchOffset))
 
 	if err := pc.ensureConnection(); err != nil {
 		LogWarn("Partition [%d] cannot poll: %v", pc.partitionID, err)
@@ -152,17 +153,17 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	consumeCmd := fmt.Sprintf("CONSUME topic=%s partition=%d offset=%d group=%s generation=%d member=%s",
 		c.config.Topic, pc.partitionID, currentOffset, c.config.GroupID, generation, memberID)
 
-	if err := WriteWithLength(conn, EncodeMessage(c.config.Topic, consumeCmd)); err != nil {
+	if err := WriteWithLength(conn, EncodeMessage("", consumeCmd)); err != nil {
 		LogError("Partition [%d] send CONSUME failed: %v", pc.partitionID, err)
 		pc.closeConnection()
 		return
 	}
 
-	idleTimeout := time.Duration(c.config.StreamingReadDeadlineMS) * time.Millisecond
-	if idleTimeout <= 0 {
-		idleTimeout = 5 * time.Second
+	pollTimeout := time.Duration(c.config.PollTimeoutMS) * time.Millisecond
+	if pollTimeout <= 0 {
+		pollTimeout = 5 * time.Second
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(pollTimeout)); err != nil {
 		pc.closeConnection()
 		return
 	}
@@ -385,6 +386,23 @@ func (pc *PartitionConsumer) ensureConnection() error {
 		maxRetries = 5
 	}
 
+	leaderAddr := pc.consumer.getPartitionLeaderAddr(pc.partitionID)
+	if leaderAddr != "" {
+		conn, err := pc.consumer.client.ConnectToAddr(leaderAddr)
+		if err == nil {
+			pc.mu.Lock()
+			if pc.closed {
+				_ = conn.Close()
+				pc.mu.Unlock()
+				return fmt.Errorf("%w", ErrConsumerClosed)
+			}
+			pc.conn = conn
+			pc.mu.Unlock()
+			return nil
+		}
+		LogWarn("Partition [%d] leader %s unreachable: %v, falling back", pc.partitionID, leaderAddr, err)
+	}
+
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		pc.mu.Lock()
@@ -429,7 +447,13 @@ func (pc *PartitionConsumer) handleBrokerError(data []byte) bool {
 	LogWarn("Partition [%d] broker error: %s", pc.partitionID, respStr)
 
 	if strings.Contains(respStr, "NOT_LEADER") {
-		pc.consumer.handleLeaderRedirection(respStr)
+		fields := strings.Fields(respStr)
+		for i, f := range fields {
+			if f == "LEADER_IS" && i+1 < len(fields) {
+				pc.consumer.updatePartitionLeader(pc.partitionID, fields[i+1])
+				break
+			}
+		}
 	}
 
 	if strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "REBALANCE_REQUIRED") {

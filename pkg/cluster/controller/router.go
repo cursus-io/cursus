@@ -24,6 +24,7 @@ type ClusterRouter struct {
 	brokerID       string
 	rm             RaftManager
 	clientPort     int
+	clientHost     string
 	timeout        time.Duration
 	localProcessor LocalProcessor
 
@@ -32,15 +33,24 @@ type ClusterRouter struct {
 	coordBrokerHash string // hash of active broker IDs to detect changes
 }
 
-func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm RaftManager, clientPort int) *ClusterRouter {
+func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm RaftManager, clientPort int, clientHost string) *ClusterRouter {
 	return &ClusterRouter{
 		brokerID:       brokerID,
 		LocalAddr:      localAddr,
 		rm:             rm,
 		clientPort:     clientPort,
+		clientHost:     clientHost,
 		timeout:        5 * time.Second,
 		localProcessor: processor,
 	}
+}
+
+func (r *ClusterRouter) BrokerID() string {
+	return r.brokerID
+}
+
+func (r *ClusterRouter) ClientPort() int {
+	return r.clientPort
 }
 
 func (r *ClusterRouter) getLeader() (string, error) {
