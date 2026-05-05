@@ -1,7 +1,7 @@
 package util
 
 import (
-	"fmt"
+	"strconv"
 	"hash/crc32"
 	"sort"
 )
@@ -34,7 +34,7 @@ func (m *ConsistentHashRing) IsEmpty() bool {
 func (m *ConsistentHashRing) Add(keys ...string) {
 	for _, key := range keys {
 		for i := 0; i < m.replicas; i++ {
-			hash := int(m.hash([]byte(fmt.Sprintf("%s:%d", key, i))))
+			hash := int(m.hash([]byte(key + ":" + strconv.Itoa(i))))
 			m.keys = append(m.keys, hash)
 			m.hashMap[hash] = key
 		}
@@ -44,7 +44,7 @@ func (m *ConsistentHashRing) Add(keys ...string) {
 
 func (m *ConsistentHashRing) Remove(key string) {
 	for i := 0; i < m.replicas; i++ {
-		hash := int(m.hash([]byte(fmt.Sprintf("%s:%d", key, i))))
+		hash := int(m.hash([]byte(key + ":" + strconv.Itoa(i))))
 		delete(m.hashMap, hash)
 	}
 

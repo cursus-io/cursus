@@ -3,6 +3,7 @@ package fsm
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sort"
 	"strings"
 
@@ -84,7 +85,7 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	ring.Add(brokers...)
 
 	for i := 0; i < topicCmd.Partitions; i++ {
-		key := fmt.Sprintf("%s-%d", topicCmd.Name, i)
+		key := topicCmd.Name + "-" + strconv.Itoa(i)
 
 		assignedLeader := topicCmd.LeaderID
 		var replicas []string

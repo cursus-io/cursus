@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/binary"
 	"fmt"
+	"strconv"
 	"io"
 	"net"
 	"sort"
@@ -73,7 +74,7 @@ func (r *ClusterRouter) ForwardToPartitionLeader(topic string, partition int, re
 		return r.ForwardToLeader(req)
 	}
 
-	partitionKey := fmt.Sprintf("%s-%d", topic, partition)
+	partitionKey := topic + "-" + strconv.Itoa(partition)
 	meta := fsm.GetPartitionMetadata(partitionKey)
 	if meta == nil {
 		return r.ForwardToLeader(req)
@@ -186,7 +187,7 @@ func (r *ClusterRouter) ForwardDataToPartitionLeader(topic string, partition int
 		return r.ForwardDataToLeader(data)
 	}
 
-	partitionKey := fmt.Sprintf("%s-%d", topic, partition)
+	partitionKey := topic + "-" + strconv.Itoa(partition)
 	meta := fsm.GetPartitionMetadata(partitionKey)
 	if meta == nil {
 		return r.ForwardDataToLeader(data)

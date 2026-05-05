@@ -2,6 +2,7 @@ package disk
 
 import (
 	"fmt"
+	"strconv"
 	"os"
 	"sync"
 
@@ -28,7 +29,7 @@ func (dm *DiskManager) GetHandler(topic string, partitionID int) (types.StorageH
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
-	key := fmt.Sprintf("%s_%d", topic, partitionID)
+	key := topic + "_" + strconv.Itoa(partitionID)
 	if dh, ok := dm.handlers[key]; ok {
 		return dh, nil
 	}
