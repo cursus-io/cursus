@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 
 	"github.com/cursus-io/cursus/pkg/types"
 )
@@ -13,6 +14,9 @@ import (
 // EncodeMessage serializes topic and payload into bytes.
 func EncodeMessage(topic string, payload string) []byte {
 	topicBytes := []byte(topic)
+	if len(topicBytes) > math.MaxUint16 {
+		return nil
+	}
 	payloadBytes := []byte(payload)
 	data := make([]byte, 2+len(topicBytes)+len(payloadBytes))
 	binary.BigEndian.PutUint16(data[:2], uint16(len(topicBytes)))
@@ -47,7 +51,7 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 	}
 
 	topicBytes := []byte(topic)
-	if len(topicBytes) > 0xFFFF {
+	if len(topicBytes) > math.MaxUint16 {
 		return nil, fmt.Errorf("topic too long: %d bytes", len(topicBytes))
 	}
 	if err := write(uint16(len(topicBytes))); err != nil {
@@ -57,12 +61,15 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 		return nil, fmt.Errorf("write topic bytes failed: %w", err)
 	}
 
+	if partition < math.MinInt32 || partition > math.MaxInt32 {
+		return nil, fmt.Errorf("partition out of int32 range: %d", partition)
+	}
 	if err := write(int32(partition)); err != nil {
 		return nil, err
 	}
 
 	acksBytes := []byte(acks)
-	if len(acksBytes) > 0xFF {
+	if len(acksBytes) > math.MaxUint8 {
 		return nil, fmt.Errorf("acks value too long: %d bytes", len(acksBytes))
 	}
 	if err := write(uint8(len(acksBytes))); err != nil {
@@ -88,6 +95,9 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 		return nil, err
 	}
 
+	if len(msgs) > math.MaxInt32 {
+		return nil, fmt.Errorf("message count exceeds int32 max: %d", len(msgs))
+	}
 	if err := write(int32(len(msgs))); err != nil {
 		return nil, err
 	}
@@ -102,7 +112,7 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 		}
 
 		producerIDBytes := []byte(m.ProducerID)
-		if len(producerIDBytes) > 0xFFFF {
+		if len(producerIDBytes) > math.MaxUint16 {
 			return nil, fmt.Errorf("producerID too long: %d bytes", len(producerIDBytes))
 		}
 		if err := write(uint16(len(producerIDBytes))); err != nil {
@@ -113,7 +123,7 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 		}
 
 		keyBytes := []byte(m.Key)
-		if len(keyBytes) > 0xFFFF {
+		if len(keyBytes) > math.MaxUint16 {
 			return nil, fmt.Errorf("key too long: %d bytes", len(keyBytes))
 		}
 		if err := write(uint16(len(keyBytes))); err != nil {
@@ -128,6 +138,9 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 		}
 
 		payloadBytes := []byte(m.Payload)
+		if len(payloadBytes) > math.MaxUint32 {
+			return nil, fmt.Errorf("payload too long: %d bytes", len(payloadBytes))
+		}
 		if err := write(uint32(len(payloadBytes))); err != nil {
 			return nil, err
 		}
@@ -137,7 +150,7 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 
 		// Event sourcing fields
 		eventTypeBytes := []byte(m.EventType)
-		if len(eventTypeBytes) > 0xFFFF {
+		if len(eventTypeBytes) > math.MaxUint16 {
 			return nil, fmt.Errorf("eventType too long: %d bytes", len(eventTypeBytes))
 		}
 		if err := write(uint16(len(eventTypeBytes))); err != nil {
@@ -156,7 +169,7 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 		}
 
 		metadataBytes := []byte(m.Metadata)
-		if len(metadataBytes) > 0xFFFF {
+		if len(metadataBytes) > math.MaxUint16 {
 			return nil, fmt.Errorf("metadata too long: %d bytes", len(metadataBytes))
 		}
 		if err := write(uint16(len(metadataBytes))); err != nil {

@@ -17,7 +17,11 @@ func SerializeMessage(msg types.Message) ([]byte, error) {
 
 	// ProducerID (length + string)
 	producerBytes := []byte(msg.ProducerID)
-	if err = binary.Write(&buf, binary.BigEndian, uint16(len(producerBytes))); err != nil {
+	producerLen, ok := SafeIntToUint16(len(producerBytes))
+	if !ok {
+		return nil, fmt.Errorf("producerID too long: %d", len(producerBytes))
+	}
+	if err = binary.Write(&buf, binary.BigEndian, producerLen); err != nil {
 		return nil, fmt.Errorf("write producer length: %w", err)
 	}
 	if _, err = buf.Write(producerBytes); err != nil {
@@ -31,7 +35,11 @@ func SerializeMessage(msg types.Message) ([]byte, error) {
 
 	// Payload (length + string)
 	payloadBytes := []byte(msg.Payload)
-	if err = binary.Write(&buf, binary.BigEndian, uint32(len(payloadBytes))); err != nil {
+	payloadLen, ok := SafeIntToUint32(len(payloadBytes))
+	if !ok {
+		return nil, fmt.Errorf("payload too long: %d", len(payloadBytes))
+	}
+	if err = binary.Write(&buf, binary.BigEndian, payloadLen); err != nil {
 		return nil, fmt.Errorf("write payload length: %w", err)
 	}
 	if _, err = buf.Write(payloadBytes); err != nil {
@@ -40,7 +48,11 @@ func SerializeMessage(msg types.Message) ([]byte, error) {
 
 	// Key (length + string)
 	keyBytes := []byte(msg.Key)
-	if err = binary.Write(&buf, binary.BigEndian, uint16(len(keyBytes))); err != nil {
+	keyLen, ok := SafeIntToUint16(len(keyBytes))
+	if !ok {
+		return nil, fmt.Errorf("key too long: %d", len(keyBytes))
+	}
+	if err = binary.Write(&buf, binary.BigEndian, keyLen); err != nil {
 		return nil, fmt.Errorf("write key length: %w", err)
 	}
 	if _, err = buf.Write(keyBytes); err != nil {
@@ -118,7 +130,12 @@ func DeserializeMessage(data []byte) (types.Message, error) {
 	}
 
 	// Epoch (8 bytes)
-	msg.Epoch = int64(binary.BigEndian.Uint64(data[offset : offset+8]))
+	epochRaw := binary.BigEndian.Uint64(data[offset : offset+8])
+	epochVal, ok := SafeUint64ToInt64(epochRaw)
+	if !ok {
+		return msg, fmt.Errorf("epoch value %d exceeds int64 max", epochRaw)
+	}
+	msg.Epoch = epochVal
 
 	return msg, nil
 }
@@ -138,6 +155,36 @@ func EstimateDiskMessageSize(msg types.DiskMessage) int {
 
 // SerializeDiskMessage serializes a DiskMessage for disk storage
 func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
+	topicLen, ok := SafeIntToUint16(len(msg.Topic))
+	if !ok {
+		return nil, fmt.Errorf("topic too long: %d", len(msg.Topic))
+	}
+	producerLen, ok := SafeIntToUint16(len(msg.ProducerID))
+	if !ok {
+		return nil, fmt.Errorf("producerID too long: %d", len(msg.ProducerID))
+	}
+	payloadLen, ok := SafeIntToUint32(len(msg.Payload))
+	if !ok {
+		return nil, fmt.Errorf("payload too long: %d", len(msg.Payload))
+	}
+	eventTypeLen, ok := SafeIntToUint16(len(msg.EventType))
+	if !ok {
+		return nil, fmt.Errorf("eventType too long: %d", len(msg.EventType))
+	}
+	metadataLen, ok := SafeIntToUint16(len(msg.Metadata))
+	if !ok {
+		return nil, fmt.Errorf("metadata too long: %d", len(msg.Metadata))
+	}
+	partitionVal, ok := SafeUint32ToInt32(uint32(msg.Partition)) // Partition is int32, re-validate
+	if msg.Partition < 0 {
+		return nil, fmt.Errorf("negative partition: %d", msg.Partition)
+	}
+	_ = ok
+	epochVal, ok := SafeInt64ToUint64(msg.Epoch)
+	if !ok {
+		return nil, fmt.Errorf("negative epoch: %d", msg.Epoch)
+	}
+
 	size := EstimateDiskMessageSize(msg)
 	bufp := diskMsgBufPool.Get().(*[]byte)
 	buf := (*bufp)[:0]
@@ -148,12 +195,12 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	var tmp [8]byte
 
 	// Topic (length + string)
-	binary.BigEndian.PutUint16(tmp[:2], uint16(len(msg.Topic)))
+	binary.BigEndian.PutUint16(tmp[:2], topicLen)
 	buf = append(buf, tmp[:2]...)
 	buf = append(buf, msg.Topic...)
 
 	// Partition (4 bytes)
-	binary.BigEndian.PutUint32(tmp[:4], uint32(msg.Partition))
+	binary.BigEndian.PutUint32(tmp[:4], uint32(partitionVal))
 	buf = append(buf, tmp[:4]...)
 
 	// Offset (8 bytes)
@@ -161,7 +208,7 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	buf = append(buf, tmp[:8]...)
 
 	// ProducerID (length + string)
-	binary.BigEndian.PutUint16(tmp[:2], uint16(len(msg.ProducerID)))
+	binary.BigEndian.PutUint16(tmp[:2], producerLen)
 	buf = append(buf, tmp[:2]...)
 	buf = append(buf, msg.ProducerID...)
 
@@ -170,16 +217,16 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	buf = append(buf, tmp[:8]...)
 
 	// Epoch (8 bytes)
-	binary.BigEndian.PutUint64(tmp[:8], uint64(msg.Epoch))
+	binary.BigEndian.PutUint64(tmp[:8], epochVal)
 	buf = append(buf, tmp[:8]...)
 
 	// Payload (length + string)
-	binary.BigEndian.PutUint32(tmp[:4], uint32(len(msg.Payload)))
+	binary.BigEndian.PutUint32(tmp[:4], payloadLen)
 	buf = append(buf, tmp[:4]...)
 	buf = append(buf, msg.Payload...)
 
 	// EventType (length + string)
-	binary.BigEndian.PutUint16(tmp[:2], uint16(len(msg.EventType)))
+	binary.BigEndian.PutUint16(tmp[:2], eventTypeLen)
 	buf = append(buf, tmp[:2]...)
 	buf = append(buf, msg.EventType...)
 
@@ -192,7 +239,7 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	buf = append(buf, tmp[:8]...)
 
 	// Metadata (length + string)
-	binary.BigEndian.PutUint16(tmp[:2], uint16(len(msg.Metadata)))
+	binary.BigEndian.PutUint16(tmp[:2], metadataLen)
 	buf = append(buf, tmp[:2]...)
 	buf = append(buf, msg.Metadata...)
 
@@ -227,7 +274,12 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	if offset+4 > len(data) {
 		return msg, errors.New("data too short for partition")
 	}
-	msg.Partition = int32(binary.BigEndian.Uint32(data[offset : offset+4]))
+	partRaw := binary.BigEndian.Uint32(data[offset : offset+4])
+	partVal, ok := SafeUint32ToInt32(partRaw)
+	if !ok {
+		return msg, fmt.Errorf("partition value %d exceeds int32 max", partRaw)
+	}
+	msg.Partition = partVal
 	offset += 4
 
 	// Offset
@@ -260,7 +312,12 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	if offset+8 > len(data) {
 		return msg, errors.New("data too short for epoch")
 	}
-	msg.Epoch = int64(binary.BigEndian.Uint64(data[offset : offset+8]))
+	diskEpochRaw := binary.BigEndian.Uint64(data[offset : offset+8])
+	diskEpochVal, ok := SafeUint64ToInt64(diskEpochRaw)
+	if !ok {
+		return msg, fmt.Errorf("epoch value %d exceeds int64 max", diskEpochRaw)
+	}
+	msg.Epoch = diskEpochVal
 	offset += 8
 
 	// Payload

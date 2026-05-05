@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"sync/atomic"
 	"time"
@@ -123,7 +124,7 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 		if err != nil {
 			return fmt.Errorf("serialize failed at index %d: %w", i, err)
 		}
-		if len(serialized) > 0xFFFFFFFF {
+		if len(serialized) > math.MaxUint32 {
 			return fmt.Errorf("message too large at index %d: %d bytes", i, len(serialized))
 		}
 		serializedMsgs[i] = serialized
@@ -218,6 +219,10 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 
 // WriteDirect writes a single message immediately without batching.
 func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message) error {
+	if partition < 0 || partition > math.MaxInt32 {
+		return fmt.Errorf("partition out of int32 range: %d", partition)
+	}
+
 	interval := d.indexInterval
 	if interval == 0 {
 		interval = 4096 // default interval (4KB)
@@ -242,7 +247,7 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 		return fmt.Errorf("serialize failed: %w", err)
 	}
 
-	if len(serialized) > 0xFFFFFFFF {
+	if len(serialized) > math.MaxUint32 {
 		return fmt.Errorf("message too large: %d bytes", len(serialized))
 	}
 

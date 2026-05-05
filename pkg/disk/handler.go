@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -103,7 +104,9 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 			if countErr != nil {
 				util.Error("failed to count messages in last segment %s: %v", lastFile, countErr)
 			}
-			lastAbsoluteOffset = currentSegmentBase + uint64(c)
+			if c >= 0 {
+				lastAbsoluteOffset = currentSegmentBase + uint64(c)
+			}
 		}
 	}
 
@@ -117,6 +120,9 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat file: %w", err)
 	}
+	if fileInfo.Size() < 0 {
+		return nil, fmt.Errorf("negative file size: %d", fileInfo.Size())
+	}
 	currentOffset := uint64(fileInfo.Size())
 
 	dh := &DiskHandler{
@@ -128,7 +134,7 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 		CurrentOffset:  currentOffset,
 		AbsoluteOffset: lastAbsoluteOffset,
 
-		indexInterval: uint64(cfg.IndexIntervalBytes),
+		indexInterval: safeIntToUint64(cfg.IndexIntervalBytes),
 
 		writeCh:        make(chan types.DiskMessage, cfg.ChannelBufferSize),
 		done:           make(chan struct{}),
@@ -235,6 +241,9 @@ func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.
 
 // AppendMessage sends a message to the internal write channel for asynchronous disk persistence.
 func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Message) (uint64, error) {
+	if partition < 0 || partition > math.MaxInt32 {
+		return 0, fmt.Errorf("partition out of int32 range: %d", partition)
+	}
 	offset := atomic.AddUint64(&d.AbsoluteOffset, 1) - 1
 
 	msg.Offset = offset
@@ -317,7 +326,7 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 		}
 
 		actualSize := fi.Size()
-		if actualSize == 0 {
+		if actualSize <= 0 {
 			util.Debug("Segment %d is currently empty, skipping", segBase)
 			continue
 		}
@@ -335,7 +344,7 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 		}
 
 		batch := dh.readMessagesFromPosition(reader, readPos, remaining, offset)
-		if len(batch) == 0 && uint64(actualSize) > readPos+4 {
+		if len(batch) == 0 && actualSize > 0 && uint64(actualSize) > readPos+4 {
 			if err := reader.Close(); err != nil {
 				util.Debug("error closing reader: %v", err)
 			}
@@ -373,6 +382,9 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 
 // readMessagesFromPosition reads messages starting from a specific byte position
 func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position uint64, max int, targetOffset uint64) []types.Message {
+	if position > math.MaxInt {
+		return nil
+	}
 	messages := make([]types.Message, 0, max)
 	pos := int(position)
 	var lenBuf [4]byte
@@ -429,6 +441,13 @@ func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position 
 
 func (d *DiskHandler) countMessagesInSegment() (int, error) {
 	return d.countMessagesInSegmentID(d.CurrentSegment)
+}
+
+func safeIntToUint64(v int) uint64 {
+	if v < 0 {
+		return 0
+	}
+	return uint64(v)
 }
 
 func (d *DiskHandler) countMessagesInSegmentID(segmentID uint64) (int, error) {
