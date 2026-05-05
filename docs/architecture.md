@@ -36,12 +36,27 @@ cursus exposes three network ports, each serving a distinct purpose:
 
 ## Core Data Flow
 
+```mermaid
+graph LR
+    P[Publisher] -->|TCP| S[Server :9000]
+    S --> TM[TopicManager]
+    TM -->|dedup check| T[Topic]
+    T -->|hash/round-robin| Part[Partition]
+    Part -->|async| DH[DiskHandler]
+    DH -->|writeCh| FL[flushLoop]
+    FL -->|WriteBatch| Seg[Segment Files]
+    Part -->|notify| SM[StreamManager]
+    SM -->|push| C[Consumer]
+    C -->|CONSUME/STREAM| Part
+    Part -->|ReadCommitted| Seg
+```
+
 ### Key flow characteristics:
 
 - **Deduplication**: `TopicManager.Publish()` checks dedupMap using message ID (hash of payload) to prevent duplicate processing within 30 minutes 
 - **Partition Selection**: `Topic.Publish()` uses key-based hashing for ordered delivery or round-robin counter for load balancing
 - **Dual-path delivery**: `Partition.Enqueue()` sends to both disk (via DiskHandler) and consumer channels
-- **Asynchronous writes**: DiskHandler batches up to 500 messages or flushes after 100ms linger timeout for efficiency
+- **Asynchronous writes**: DiskHandler batches up to 50 messages or flushes after 50ms linger timeout (configurable)
 - **Consumer isolation**: Each ConsumerGroup receives messages independently through dedicated channels
 
 ## Message Persistence
@@ -51,8 +66,8 @@ Messages are persisted using a segment-based append-only log architecture
 Each topic-partition pair gets its own DiskHandler instance:
 
 - Writes asynchronously via `flushLoop()` goroutine
-- Batches up to 500 messages or flushes after 100ms linger
-- Rotates segments at 1MB boundaries
+- Batches up to 50 messages or flushes after 50ms linger (configurable)
+- Rotates segments at 1GB boundaries (configurable via `log_segment_bytes`)
 - Uses `mmap`(memory-mapped I/O) for reads
 - Stores messages with 4-byte big-endian length prefixes
 

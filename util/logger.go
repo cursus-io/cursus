@@ -2,6 +2,7 @@ package util
 
 import (
 	"log"
+	"math"
 	"os"
 	"sync/atomic"
 )
@@ -9,6 +10,9 @@ import (
 var currentLevel atomic.Int32
 
 func SetLevel(level LogLevel) {
+	if level < 0 || level > LogLevel(math.MaxInt32) {
+		return
+	}
 	currentLevel.Store(int32(level))
 }
 

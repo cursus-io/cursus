@@ -8,6 +8,20 @@ These features enable operators to monitor broker health, track performance metr
 
 ## Overview
 
+```mermaid
+graph LR
+    B[Broker :9000] -->|expose| M[Metrics :9100]
+    B -->|expose| H[Health :9080]
+    B -->|write| L[stdout/stderr]
+    M -->|scrape| P[Prometheus]
+    P --> G[Grafana]
+    H -->|poll| LB[Load Balancer]
+    L -->|collect| ELK[Log Aggregator]
+
+    SDK[SDK Client] -->|expose| SM[SDK Metrics :2112]
+    SM -->|scrape| P
+```
+
 cursus provides three primary observability mechanisms:
 
 | Component            | Port       | Protocol          | Purpose                                                      |
@@ -70,17 +84,36 @@ The Prometheus metrics exporter runs as a separate HTTP server on port 9100, exp
 
 ### Metric Categories
 
-While the pkg/metrics package implementation isn't shown in the provided files, the architecture suggests these metric categories based on the system design:
+The `pkg/metrics` package exposes the following Prometheus metrics:
 
-| Category          | Metric Examples                                  | Description                        |
-|------------------|-------------------------------------------------|------------------------------------|
-| Topic Metrics     | Topics created, deleted, active topics         | Topic lifecycle tracking            |
-| Partition Metrics | Messages per partition, partition queue depth  | Partition-level performance         |
-| Disk Metrics      | Bytes written, flush operations, segment rotations | Storage subsystem performance       |
-| Consumer Metrics  | Active consumers, messages delivered           | Consumer tracking                   |
-| Server Metrics    | Active connections, commands processed         | Server-level operations             |
+**Broker Metrics** (`pkg/metrics/broker.go`):
 
-The TopicManager includes a metrics field [pkg/topic] for tracking deduplication and message flow.
+| Metric | Type | Description |
+|--------|------|-------------|
+| `broker_messages_processed_total` | Counter | Total messages processed |
+| `broker_messages_per_second` | Gauge | Current throughput |
+| `broker_message_latency_seconds` | Histogram | Message processing latency |
+| `broker_queue_size` | Gauge | Current topic manager queue size |
+| `broker_cleanup_count_total` | Counter | Deduped message IDs cleaned up |
+| `broker_seqnum_gap_total` | Counter | SeqNum gaps detected (labels: topic, partition, producer_id) |
+| `broker_seqnum_duplicate_total` | Counter | Duplicate seqNums detected (labels: topic, partition) |
+| `broker_consumer_lag` | Gauge | Consumer lag per partition (labels: topic, partition, group) |
+
+**Cluster Metrics** (`pkg/metrics/cluster.go`):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cluster_brokers_total` | Gauge | Total brokers in cluster |
+| `cluster_partition_leaders_total` | Gauge | Partition leaders per broker |
+| `cluster_replication_lag_seconds` | Histogram | Replication lag (labels: topic, partition, broker) |
+| `cluster_leader_elections_total` | Counter | Leader elections |
+| `cluster_isr_size` | Gauge | ISR size per partition |
+| `cluster_replication_lag_bytes` | Gauge | Replication lag in bytes |
+| `cluster_isr_changes_total` | Counter | ISR membership changes |
+| `cluster_leader_election_failures_total` | Counter | Failed leader elections |
+| `cluster_broker_health_status` | Gauge | Broker health (1=healthy, 0=unhealthy) |
+| `cluster_quorum_operations_total` | Counter | Quorum operations |
+| `cluster_partition_reassignments_total` | Counter | Partition reassignments |
 
 ### Configuration
 

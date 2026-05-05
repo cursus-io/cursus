@@ -101,7 +101,7 @@ The configuration is represented by the Config struct in the codebase, which org
 | `enable_exporter`    | bool       | true           | Enable Prometheus metrics exporter              |
 | `exporter_port`      | int        | 9100           | HTTP port for Prometheus metrics endpoint       |
 | `enable_benchmark`   | bool       | false          | Enable benchmark mode for testing               |
-| `cleanup_interval`   | int        | 300            | Deduplication map cleanup interval (seconds)   |
+| `cleanup_interval`   | int        | 300            | Log cleanup interval (seconds)                 |
 
 
 # Security and Compression
@@ -124,7 +124,13 @@ These parameters directly affect the write path performance and batching behavio
 | `disk_flush_batch_size` | int  | 50      | Number of messages to batch before flushing to disk       |
 | `linger_ms`             | int  | 50      | Maximum time to wait before flushing (milliseconds)       |
 | `channel_buffer_size`   | int  | 1024    | Buffer size for DiskHandler's writeCh channel             |
-| `disk_write_timeout_ms` | int  | 5       | Timeout for synchronous writes when channel is full       |
+| `disk_write_timeout_ms` | int  | 10      | Timeout for synchronous writes when channel is full (ms)  |
+| `disk_flush_interval_ms`| int  | 500     | Periodic fsync interval (milliseconds)                    |
+| `log_segment_bytes`     | uint64 | 1073741824 | Maximum segment file size (1GB default)                |
+| `log_index_size_bytes`  | uint64 | 10485760   | Maximum index file size (10MB default)                 |
+| `log_index_interval_bytes` | int | 4096    | Index entry interval in bytes                            |
+| `log_retention_hours`   | int  | 168     | Log retention period in hours (7 days default)            |
+| `compression_type`      | string | "none" | Compression type: "none", "gzip", "snappy", "lz4"       |
 
 
 Trade-offs:

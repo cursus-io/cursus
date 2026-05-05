@@ -27,6 +27,9 @@ This directory contains various documents explaining different aspects of the pr
   - **[Command Interface](reference/command-interface.md)** – CLI commands and usage.
   - **[Observability](reference/observability.md)** – Metrics, logging, and monitoring.
   - **[Performance](reference/performance.md)** – Performance tuning and optimization strategies.
+- **Specs**
+  - **[Disk Snapshot Optimization](specs/disk-snapshot-concurrency-optimization.md)** – Disk I/O concurrency optimization with benchmarks.
+  - **[Sprintf Key Generation](specs/sprintf-key-generation-optimization.md)** – Hot-path key generation optimization.
 - **[Contributing](contributing/README.md)** – Guidelines for contributing to the project and documentation.
 
 ## 📝 Contribution and Maintenance

@@ -4,7 +4,7 @@
 
 This document explains how log segments are created, rotated, and managed in the cursus disk persistence system. 
 
-A segment is a physical file on disk that stores messages for a specific topic-partition pair. Segments are rotated (rolled over to a new file) when they reach 1MB in size, enabling efficient parallel I/O, simplified cleanup operations, and bounded resource usage.
+A segment is a physical file on disk that stores messages for a specific topic-partition pair. Segments are rotated (rolled over to a new file) when they reach the configured size limit (default 1GB), enabling efficient parallel I/O, simplified cleanup operations, and bounded resource usage.
 
 For information about the on-disk message format within segments, see [Disk Format](./disk-format.md). For platform-specific I/O optimizations, see [Platform-Specific Optimizations](./platform-optimizations.md).
 
@@ -12,27 +12,46 @@ For information about the on-disk message format within segments, see [Disk Form
 
 ### Naming Convention and Directory Layout
 
-Each topic-partition pair has its own directory and sequence of segment files. The directory structure follows this pattern:
+Each topic-partition pair has its own directory and sequence of segment files. Segment file names use zero-padded base offsets (20 digits):
 
 ```
-{LogDir}/{topicName}/partition_{partitionID}/
-├── {topicName}_partition_{partitionID}_segment_0.log
-├── {topicName}_partition_{partitionID}_segment_1.log
-├── {topicName}_partition_{partitionID}_segment_2.log
+{LogDir}/{topicName}/
+├── partition_{partitionID}_segment_00000000000000000000.log
+├── partition_{partitionID}_segment_00000000000000000000.index
+├── partition_{partitionID}_segment_00000000000000001024.log
+├── partition_{partitionID}_segment_00000000000000001024.index
 └── ...
 ```
 
-The BaseName for a DiskHandler is constructed as: `{LogDir}/{topicName}/partition_{partitionID}`, and individual segment files `append _segment_{N}.log` to this base.
+The BaseName for a DiskHandler is constructed as: `{LogDir}/{topicName}/partition_{partitionID}`, and individual segment files append `_segment_{offset}.log` (and `.index`) to this base. The offset in the filename is the base offset of the first message in that segment.
 
 ### Segment Size Limit
 
-Each segment has a maximum size of 1MB (1,048,576 bytes).
+Each segment has a configurable maximum size (default: 1GB = 1,073,741,824 bytes), set via `log_segment_bytes` in the configuration file.
 
-Parameter	Value	Location
-segmentSize	1024 * 1024 bytes (1MB)
-// todo
+| Parameter | Default | Config Key |
+|-----------|---------|------------|
+| Segment Size | 1GB | `log_segment_bytes` |
+| Index Size | 10MB | `log_index_size_bytes` |
+| Index Interval | 4096 bytes | `log_index_interval_bytes` |
+| Segment Roll Time | 7 days | `log_segment_roll_ms` |
 
-When writing a message would cause the current segment to exceed this size, rotation is triggered.
+Rotation is triggered when either the data file or index file would exceed its size limit, or when the time-based roll interval expires.
+
+## Segment Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Creating: NewDiskHandler()
+    Creating --> Active: openSegment()
+    Active --> Active: WriteBatch / WriteDirect
+    Active --> Rotating: size/index/time limit reached
+    Rotating --> Active: rotateSegment() opens new segment
+    Rotating --> Closed: old segment closed
+    Closed --> [*]: retention cleanup
+    Active --> Draining: Close() called
+    Draining --> [*]: all messages flushed
+```
 
 ## Segment Creation
 
@@ -130,7 +149,7 @@ The `GetHandler()` method implements lazy initialization - handlers are created 
 | 2    | Check if handler exists in map    | Map lookup           |
 | 3    | If exists, return existing handler| Early return         |
 | 4    | If not exists, create log directory| `os.MkdirAll()`       |
-| 5    | Create new DiskHandler (1MB segments)| `NewDiskHandler()`   |
+| 5    | Create new DiskHandler               | `NewDiskHandler()`   |
 | 6    | Store in handlers map             | Map insertion        |
 | 7    | Return new handler                | Release lock         |
 
@@ -212,7 +231,7 @@ This dual-lock design allows:
 
 ## Key Takeaways
 
-- **1MB Segment Boundary**: Hard limit enforced before writing each message to prevent segments from exceeding size
+- **Configurable Segment Boundary**: Default 1GB, enforced before writing each batch to prevent segments from exceeding size
 - **Sequential Naming**: Segments numbered sequentially (0, 1, 2, ...) per topic-partition
 - **Atomic Rotation**: `rotateSegment()` ensures clean transition with proper flush and close operations
 - **Lazy Creation**: DiskManager creates handlers on-demand via `GetHandler()`

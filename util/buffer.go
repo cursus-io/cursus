@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"net"
 )
 
@@ -13,6 +14,9 @@ const MaxMessageSize = 64 * 1024 * 1024 // 64MB
 func WriteWithLength(conn net.Conn, data []byte) error {
 	if len(data) > MaxMessageSize {
 		return fmt.Errorf("data size %d exceeds maximum %d", len(data), MaxMessageSize)
+	}
+	if len(data) > math.MaxUint32 {
+		return fmt.Errorf("data size %d exceeds uint32 max", len(data))
 	}
 
 	lenBuf := make([]byte, 4)

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 
@@ -26,7 +27,7 @@ func (d *DiskHandler) openIndexFiles() error {
 	var existingSize uint64
 	if os.IsNotExist(statErr) {
 		isNew = true
-	} else if statErr == nil {
+	} else if statErr == nil && info.Size() >= 0 {
 		existingSize = uint64(info.Size())
 	}
 
@@ -46,6 +47,9 @@ func (d *DiskHandler) openIndexFiles() error {
 	}
 
 	if !isReadOnly {
+		if d.IndexSize > math.MaxInt64 {
+			return fmt.Errorf("index size %d exceeds int64 max", d.IndexSize)
+		}
 		if err := f.Truncate(int64(d.IndexSize)); err != nil {
 			if err := f.Close(); err != nil {
 				util.Error("failed to close file: %v", err)
@@ -79,6 +83,9 @@ func (d *DiskHandler) seekLastValidIndexEntry(f *os.File, fileSize uint64) uint6
 
 	buf := make([]byte, entrySize)
 	for pos := fileSize - entrySize; ; pos -= entrySize {
+		if pos > math.MaxInt64 {
+			break
+		}
 		_, err := f.ReadAt(buf, int64(pos))
 		if err != nil {
 			break
@@ -163,11 +170,17 @@ func getLastOffsetFromIndex(indexPath string, baseOffset uint64) (lastOffset uin
 		}
 	}()
 
+	if info.Size() < 0 {
+		return 0, 0, fmt.Errorf("negative file size")
+	}
 	fileSize := uint64(info.Size())
 	buf := make([]byte, entrySize)
 	found := false
 
 	for pos := fileSize - entrySize; ; pos -= entrySize {
+		if pos > math.MaxInt64 {
+			break
+		}
 		_, err := f.ReadAt(buf, int64(pos))
 		if err != nil {
 			break
@@ -190,7 +203,11 @@ func getLastOffsetFromIndex(indexPath string, baseOffset uint64) (lastOffset uin
 		return 0, 0, fmt.Errorf("index empty or corrupt")
 	}
 
-	count = int(lastOffset - baseOffset + 1)
+	diff := lastOffset - baseOffset + 1
+	if diff > math.MaxInt {
+		return 0, 0, fmt.Errorf("offset range too large: %d", diff)
+	}
+	count = int(diff)
 	return lastOffset, count, nil
 }
 
@@ -239,6 +256,9 @@ func (d *DiskHandler) findOffsetPosition(offset uint64) (uint64, error) {
 		return 0, nil
 	}
 
+	if entryCount > math.MaxInt {
+		return 0, fmt.Errorf("entry count too large: %d", entryCount)
+	}
 	low, high := 0, int(entryCount)-1
 	var lastFoundPos uint64 = 0
 	buf := make([]byte, entrySize)

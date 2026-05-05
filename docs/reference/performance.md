@@ -19,12 +19,12 @@ The following table lists all performance-related configuration parameters with 
 
 | Parameter                  | Config Key                     | Default | CLI Flag                   | Impact                                           |
 |----------------------------|-------------------------------|---------|----------------------------|------------------------------------------------|
-| Partition Channel Buffer    | channel_buffer_size            | 10000   | --channel-buffer           | Controls partition input queue depth          |
-| Disk Flush Batch Size       | disk_flush_batch_size          | 500     | --disk-flush-batch         | Messages per disk flush operation             |
-| Linger Time                 | linger_ms                      | 100     | --linger-ms                | Maximum wait time before forced flush         |
+| Partition Channel Buffer    | channel_buffer_size            | 1024    | --channel-buffer           | Controls DiskHandler write channel depth      |
+| Disk Flush Batch Size       | disk_flush_batch_size          | 50      | --disk-flush-batch         | Messages per disk flush operation             |
+| Linger Time                 | linger_ms                      | 50      | --linger-ms                | Maximum wait time before forced flush         |
 | Partition Channel Buffer    | partition_channel_buffer_size  | 10000   | --partition-ch-buffer      | Partition message queue size                  |
 | Consumer Channel Buffer     | consumer_channel_buffer_size   | 1000    | --consumer-ch-buffer       | Per-consumer message queue size               |
-| Disk Write Timeout          | disk_write_timeout_ms          | 5       | --disk-write-timeout       | Timeout for synchronous writes when channel full |
+| Disk Write Timeout          | disk_write_timeout_ms          | 10      | --disk-write-timeout       | Timeout for synchronous writes when channel full |
 
 
 ## Configuration Hierarchy
@@ -46,9 +46,9 @@ The `partition_channel_buffer_size` parameter controls the input queue depth for
 
 ### Configuration:
 
-Default: 10000 messages
+Default: 1024 messages
 
-Config key: partition_channel_buffer_size
+Config key: channel_buffer_size
 
 CLI flag: --partition-ch-buffer
 
@@ -318,9 +318,9 @@ broker:
 
 Performance tuning in cursus involves balancing three primary parameters:
 
-- `disk_flush_batch_size` - Controls throughput vs latency trade-off (default: 500)
-- `linger_ms` - Sets maximum message latency guarantee (default: 100ms)
-- `channel_buffer_size` / `partition_channel_buffer_size` / `consumer_channel_buffer_size` - memory usage and burst handling (defaults: 10000/10000/1000)
+- `disk_flush_batch_size` - Controls throughput vs latency trade-off (default: 50)
+- `linger_ms` - Sets maximum message latency guarantee (default: 50ms)
+- `channel_buffer_size` / `partition_channel_buffer_size` / `consumer_channel_buffer_size` - memory usage and burst handling (defaults: 1024/10000/1000)
 
 ## Key principles:
 

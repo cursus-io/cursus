@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
-	"sort"
 	"sync/atomic"
 	"time"
 
@@ -116,6 +116,21 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 		interval = 4096 // default interval (4KB)
 	}
 
+	// Serialize outside of lock to reduce lock hold time
+	serializedMsgs := make([][]byte, len(batch))
+	totalSize := 0
+	for i, msg := range batch {
+		serialized, err := util.SerializeDiskMessage(msg)
+		if err != nil {
+			return fmt.Errorf("serialize failed at index %d: %w", i, err)
+		}
+		if _, ok := util.SafeIntToUint32(len(serialized)); !ok {
+			return fmt.Errorf("message too large at index %d: %d bytes", i, len(serialized))
+		}
+		serializedMsgs[i] = serialized
+		totalSize += 4 + len(serialized)
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.ioMu.Lock()
@@ -128,20 +143,6 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 		if err := d.openIndexFiles(); err != nil {
 			return err
 		}
-	}
-
-	serializedMsgs := make([][]byte, 0, len(batch))
-	totalSize := 0
-	for i, msg := range batch {
-		serialized, err := util.SerializeDiskMessage(msg)
-		if err != nil {
-			return fmt.Errorf("serialize failed at index %d: %w", i, err)
-		}
-		if len(serialized) > 0xFFFFFFFF {
-			return fmt.Errorf("message too large at index %d: %d bytes", i, len(serialized))
-		}
-		serializedMsgs = append(serializedMsgs, serialized)
-		totalSize += 4 + len(serialized)
 	}
 
 	const entrySize = uint64(types.IndexEntrySize)
@@ -159,7 +160,7 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 	}
 
 	accumulatedLen := uint64(0)
-	lenBuf := make([]byte, 4)
+	var lenBuf [4]byte
 	for i, serialized := range serializedMsgs {
 		msgPosition := d.CurrentOffset + accumulatedLen
 		msg := batch[i]
@@ -180,8 +181,9 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 			}
 		}
 
-		binary.BigEndian.PutUint32(lenBuf, uint32(len(serialized)))
-		if _, err := d.writer.Write(lenBuf); err != nil {
+		sLen, _ := util.SafeIntToUint32(len(serialized)) // validated in pre-loop
+		binary.BigEndian.PutUint32(lenBuf[:], sLen)
+		if _, err := d.writer.Write(lenBuf[:]); err != nil {
 			return fmt.Errorf("write length failed: %w", err)
 		}
 		if _, err := d.writer.Write(serialized); err != nil {
@@ -218,6 +220,10 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 
 // WriteDirect writes a single message immediately without batching.
 func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message) error {
+	if partition < 0 || partition > math.MaxInt32 {
+		return fmt.Errorf("partition out of int32 range: %d", partition)
+	}
+
 	interval := d.indexInterval
 	if interval == 0 {
 		interval = 4096 // default interval (4KB)
@@ -242,7 +248,8 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 		return fmt.Errorf("serialize failed: %w", err)
 	}
 
-	if len(serialized) > 0xFFFFFFFF {
+	serLen, ok := util.SafeIntToUint32(len(serialized))
+	if !ok {
 		return fmt.Errorf("message too large: %d bytes", len(serialized))
 	}
 
@@ -263,7 +270,7 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	}
 
 	var lenBuf [4]byte
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(serialized)))
+	binary.BigEndian.PutUint32(lenBuf[:], serLen)
 
 	if _, err := d.writer.Write(lenBuf[:]); err != nil {
 		return err
@@ -348,9 +355,6 @@ func (d *DiskHandler) rotateSegment(nextBaseOffset uint64) error {
 	d.segmentCreatedAt = time.Now()
 
 	d.segments = append(d.segments, nextBaseOffset)
-	sort.Slice(d.segments, func(i, j int) bool {
-		return d.segments[i] < d.segments[j]
-	})
 
 	if err := d.openSegment(); err != nil {
 		util.Error("Failed to open new segment: %v", err)

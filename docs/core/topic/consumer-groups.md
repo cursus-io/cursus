@@ -10,6 +10,33 @@ Consumer groups provide a mechanism for horizontal scaling of message consumptio
 
 Each partition's messages are delivered to exactly one consumer within a group, ensuring that ordering is preserved within each partition while enabling parallel processing across partitions.
 
+```mermaid
+graph TD
+    T[Topic: orders] --> P0[Partition 0]
+    T --> P1[Partition 1]
+    T --> P2[Partition 2]
+    T --> P3[Partition 3]
+
+    subgraph "Consumer Group A"
+        C0[Consumer 0]
+        C1[Consumer 1]
+    end
+
+    P0 -->|assigned| C0
+    P1 -->|assigned| C1
+    P2 -->|assigned| C0
+    P3 -->|assigned| C1
+
+    subgraph "Consumer Group B (independent)"
+        C2[Consumer 0]
+    end
+
+    P0 -.->|independent copy| C2
+    P1 -.-> C2
+    P2 -.-> C2
+    P3 -.-> C2
+```
+
 ## Key capabilities:
 
 - **Load balancing**: Partitions are distributed evenly across consumers using modulo arithmetic
