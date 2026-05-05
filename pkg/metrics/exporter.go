@@ -9,7 +9,7 @@ import (
 )
 
 func init() {
-	prometheus.MustRegister(MessagesProcessed, MessagesPerSec, LatencyHist, QueueSize, CleanupCount)
+	prometheus.MustRegister(MessagesProcessed, MessagesPerSec, LatencyHist, QueueSize, CleanupCount, SeqNumGapTotal, SeqNumDuplicateTotal, ConsumerLag)
 	prometheus.MustRegister(ClusterBrokersTotal, PartitionLeadersTotal, ClusterReplicationLag, LeaderElectionTotal, ISRSize)
 	prometheus.MustRegister(ReplicationLagBytes, ISRChangesTotal, LeaderElectionFailures, BrokerHealthStatus, QuorumOperations, PartitionReassignments)
 }

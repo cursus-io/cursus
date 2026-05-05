@@ -204,6 +204,9 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	if expectedOffset > 0 && firstOffset > expectedOffset {
 		LogError("Partition [%d] offset gap: expected %d, received %d (missing %d messages)",
 			pc.partitionID, expectedOffset, firstOffset, firstOffset-expectedOffset)
+		if cfg.EnableMetrics {
+			consumerOffsetGapTotal.WithLabelValues(cfg.Topic, cfg.GroupID).Add(float64(firstOffset - expectedOffset))
+		}
 	}
 
 	newOffset := messages[len(messages)-1].Offset + 1

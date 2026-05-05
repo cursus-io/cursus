@@ -14,6 +14,9 @@ func TestAllMetricsRegistered(t *testing.T) {
 	assert.NotNil(t, LatencyHist)
 	assert.NotNil(t, QueueSize)
 	assert.NotNil(t, CleanupCount)
+	assert.NotNil(t, SeqNumGapTotal)
+	assert.NotNil(t, SeqNumDuplicateTotal)
+	assert.NotNil(t, ConsumerLag)
 
 	assert.NotNil(t, ClusterBrokersTotal)
 	assert.NotNil(t, PartitionLeadersTotal)
@@ -30,4 +33,8 @@ func TestMetricIncrements(t *testing.T) {
 	ClusterBrokersTotal.WithLabelValues("c1").Set(3)
 	PartitionLeadersTotal.WithLabelValues("b1").Inc()
 	ISRSize.WithLabelValues("t1", "0").Set(2)
+
+	SeqNumGapTotal.WithLabelValues("t1", "0", "producer-1").Inc()
+	SeqNumDuplicateTotal.WithLabelValues("t1", "0").Inc()
+	ConsumerLag.WithLabelValues("t1", "0", "g1").Set(42)
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
@@ -78,6 +79,7 @@ func (p *Partition) isDuplicate(msg *types.Message) bool {
 	if ok {
 		entry := val.(*producerEntry)
 		if msg.SeqNum <= entry.lastSeq {
+			metrics.SeqNumDuplicateTotal.WithLabelValues(p.topic, fmt.Sprintf("%d", p.id)).Inc()
 			return true
 		}
 	}
@@ -85,12 +87,24 @@ func (p *Partition) isDuplicate(msg *types.Message) bool {
 }
 
 func (p *Partition) updateProducerState(msg *types.Message) {
-	if msg.ProducerID != "" {
-		p.producerState.Store(msg.ProducerID, &producerEntry{
-			lastSeq:  msg.SeqNum,
-			lastSeen: time.Now(),
-		})
+	if msg.ProducerID == "" {
+		return
 	}
+	if msg.SeqNum > 0 {
+		if val, ok := p.producerState.Load(msg.ProducerID); ok {
+			entry := val.(*producerEntry)
+			if msg.SeqNum > entry.lastSeq+1 {
+				gap := msg.SeqNum - entry.lastSeq - 1
+				metrics.SeqNumGapTotal.WithLabelValues(p.topic, fmt.Sprintf("%d", p.id), msg.ProducerID).Add(float64(gap))
+				util.Warn("Partition %d: seqNum gap detected for producer %s: expected %d, got %d (gap=%d)",
+					p.id, msg.ProducerID, entry.lastSeq+1, msg.SeqNum, gap)
+			}
+		}
+	}
+	p.producerState.Store(msg.ProducerID, &producerEntry{
+		lastSeq:  msg.SeqNum,
+		lastSeen: time.Now(),
+	})
 }
 
 // Enqueue pushes a message into the partition queue.
