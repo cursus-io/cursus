@@ -175,11 +175,10 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("metadata too long: %d", len(msg.Metadata))
 	}
-	partitionVal, ok := SafeUint32ToInt32(uint32(msg.Partition)) // Partition is int32, re-validate
-	if msg.Partition < 0 {
+	partitionVal, ok := SafeInt32ToUint32(msg.Partition)
+	if !ok {
 		return nil, fmt.Errorf("negative partition: %d", msg.Partition)
 	}
-	_ = ok
 	epochVal, ok := SafeInt64ToUint64(msg.Epoch)
 	if !ok {
 		return nil, fmt.Errorf("negative epoch: %d", msg.Epoch)
@@ -200,7 +199,7 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	buf = append(buf, msg.Topic...)
 
 	// Partition (4 bytes)
-	binary.BigEndian.PutUint32(tmp[:4], uint32(partitionVal))
+	binary.BigEndian.PutUint32(tmp[:4], partitionVal)
 	buf = append(buf, tmp[:4]...)
 
 	// Offset (8 bytes)

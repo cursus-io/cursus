@@ -124,7 +124,7 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 		if err != nil {
 			return fmt.Errorf("serialize failed at index %d: %w", i, err)
 		}
-		if len(serialized) > math.MaxUint32 {
+		if _, ok := util.SafeIntToUint32(len(serialized)); !ok {
 			return fmt.Errorf("message too large at index %d: %d bytes", i, len(serialized))
 		}
 		serializedMsgs[i] = serialized
@@ -181,7 +181,8 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 			}
 		}
 
-		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(serialized)))
+		sLen, _ := util.SafeIntToUint32(len(serialized)) // validated in pre-loop
+		binary.BigEndian.PutUint32(lenBuf[:], sLen)
 		if _, err := d.writer.Write(lenBuf[:]); err != nil {
 			return fmt.Errorf("write length failed: %w", err)
 		}
@@ -247,7 +248,8 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 		return fmt.Errorf("serialize failed: %w", err)
 	}
 
-	if len(serialized) > math.MaxUint32 {
+	serLen, ok := util.SafeIntToUint32(len(serialized))
+	if !ok {
 		return fmt.Errorf("message too large: %d bytes", len(serialized))
 	}
 
@@ -268,7 +270,7 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	}
 
 	var lenBuf [4]byte
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(serialized)))
+	binary.BigEndian.PutUint32(lenBuf[:], serLen)
 
 	if _, err := d.writer.Write(lenBuf[:]); err != nil {
 		return err

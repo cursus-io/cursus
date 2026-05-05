@@ -37,6 +37,13 @@ func SafeInt64ToUint64(v int64) (uint64, bool) {
 	return uint64(v), true // #nosec G115
 }
 
+func SafeInt32ToUint32(v int32) (uint32, bool) {
+	if v < 0 {
+		return 0, false
+	}
+	return uint32(v), true // #nosec G115
+}
+
 func SafeUint32ToInt32(v uint32) (int32, bool) {
 	if v > math.MaxInt32 {
 		return 0, false
