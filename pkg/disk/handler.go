@@ -40,9 +40,12 @@ type DiskHandler struct {
 	activeReaders     int32
 	lastIndexPosition uint64
 
-	writeCh chan types.DiskMessage
-	done    chan struct{}
-	OnSync  func(uint64)
+	FlushedOffset uint64 // last offset confirmed written to disk
+
+	writeCh     chan types.DiskMessage
+	done        chan struct{}
+	flushSignal chan chan struct{}
+	OnSync      func(uint64)
 
 	batchSize      int
 	linger         time.Duration
@@ -138,6 +141,7 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 
 		writeCh:        make(chan types.DiskMessage, cfg.ChannelBufferSize),
 		done:           make(chan struct{}),
+		flushSignal:    make(chan chan struct{}, 1),
 		batchSize:      cfg.DiskFlushBatchSize,
 		linger:         time.Duration(cfg.LingerMS) * time.Millisecond,
 		writeTimeout:   time.Duration(cfg.DiskWriteTimeoutMS) * time.Millisecond,
@@ -239,6 +243,25 @@ func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.
 	return offset, nil
 }
 
+// AppendMessageWithOffset writes a message with a pre-assigned offset (for follower replication).
+// Unlike AppendMessage/AppendMessageSync, it does NOT allocate a new offset.
+func (d *DiskHandler) AppendMessageWithOffset(topic string, partition int, msg *types.Message) error {
+	if err := d.WriteDirect(topic, partition, *msg); err != nil {
+		return fmt.Errorf("WriteDirect failed: %w", err)
+	}
+	for {
+		current := atomic.LoadUint64(&d.AbsoluteOffset)
+		newOffset := msg.Offset + 1
+		if newOffset <= current {
+			break
+		}
+		if atomic.CompareAndSwapUint64(&d.AbsoluteOffset, current, newOffset) {
+			break
+		}
+	}
+	return nil
+}
+
 // AppendMessage sends a message to the internal write channel for asynchronous disk persistence.
 func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Message) (uint64, error) {
 	if partition < 0 || partition > math.MaxInt32 {
@@ -248,13 +271,18 @@ func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Mess
 
 	msg.Offset = offset
 	diskMsg := types.DiskMessage{
-		Topic:      topic,
-		Partition:  int32(partition),
-		Offset:     offset,
-		ProducerID: msg.ProducerID,
-		SeqNum:     msg.SeqNum,
-		Epoch:      msg.Epoch,
-		Payload:    msg.Payload,
+		Topic:            topic,
+		Partition:        int32(partition),
+		Offset:           offset,
+		ProducerID:       msg.ProducerID,
+		SeqNum:           msg.SeqNum,
+		Epoch:            msg.Epoch,
+		Payload:          msg.Payload,
+		Key:              msg.Key,
+		EventType:        msg.EventType,
+		SchemaVersion:    msg.SchemaVersion,
+		AggregateVersion: msg.AggregateVersion,
+		Metadata:         msg.Metadata,
 	}
 
 	if d.writeTimeout > 0 {
@@ -428,11 +456,16 @@ func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position 
 		}
 
 		messages = append(messages, types.Message{
-			Offset:     diskMsg.Offset,
-			Payload:    diskMsg.Payload,
-			ProducerID: diskMsg.ProducerID,
-			SeqNum:     diskMsg.SeqNum,
-			Epoch:      diskMsg.Epoch,
+			Offset:           diskMsg.Offset,
+			Payload:          diskMsg.Payload,
+			ProducerID:       diskMsg.ProducerID,
+			SeqNum:           diskMsg.SeqNum,
+			Epoch:            diskMsg.Epoch,
+			Key:              diskMsg.Key,
+			EventType:        diskMsg.EventType,
+			SchemaVersion:    diskMsg.SchemaVersion,
+			AggregateVersion: diskMsg.AggregateVersion,
+			Metadata:         diskMsg.Metadata,
 		})
 		pos += 4 + int(msgLen)
 	}

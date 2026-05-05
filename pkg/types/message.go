@@ -44,6 +44,7 @@ type DiskMessage struct {
 	SeqNum     uint64
 	Epoch      int64
 	Payload    string
+	Key        string
 
 	EventType        string
 	SchemaVersion    uint32

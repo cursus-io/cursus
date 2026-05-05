@@ -23,19 +23,21 @@ type ReplicationEntry struct {
 }
 
 type BrokerInfo struct {
-	ID       string    `json:"id"`
-	Addr     string    `json:"addr"`
-	Status   string    `json:"status"`
-	LastSeen time.Time `json:"last_seen"`
+	ID         string    `json:"id"`
+	Addr       string    `json:"addr"`
+	ClientAddr string    `json:"client_addr,omitempty"`
+	Status     string    `json:"status"`
+	LastSeen   time.Time `json:"last_seen"`
 }
 
 type BrokerFSMState struct {
-	Version           int                                 `json:"version"`
-	Applied           uint64                              `json:"applied"`
-	Logs              map[uint64]*ReplicationEntry        `json:"logs"`
-	Brokers           map[string]*BrokerInfo              `json:"brokers"`
-	PartitionMetadata map[string]*PartitionMetadata       `json:"partitionMetadata"`
-	ProducerState     map[string]map[int]map[string]int64 `json:"producerState"`
+	Version           int                                        `json:"version"`
+	Applied           uint64                                     `json:"applied"`
+	Logs              map[uint64]*ReplicationEntry               `json:"logs"`
+	Brokers           map[string]*BrokerInfo                     `json:"brokers"`
+	PartitionMetadata map[string]*PartitionMetadata              `json:"partitionMetadata"`
+	ProducerState     map[string]map[int]map[string]int64        `json:"producerState"`
+	GroupState        map[string]*coordinator.GroupStateSnapshot `json:"groupState,omitempty"`
 }
 
 type BrokerFSM struct {
@@ -172,6 +174,8 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Warn("FSM Restore: Legacy snapshot detected (Version 0).")
 	case 1:
 		util.Info("FSM Restore: Validating snapshot Version 1")
+	case 2:
+		util.Info("FSM Restore: Validating snapshot Version 2 (with group state)")
 	default:
 		return fmt.Errorf("unknown snapshot version: %d", state.Version)
 	}
@@ -187,6 +191,11 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	f.producerState = state.ProducerState
 	if f.producerState == nil {
 		f.producerState = make(map[string]map[int]map[string]int64)
+	}
+
+	if state.GroupState != nil && f.cd != nil {
+		f.cd.ImportState(state.GroupState)
+		util.Info("FSM Restore: Restored %d consumer groups from snapshot", len(state.GroupState))
 	}
 
 	util.Info("FSM restore completed: %d logs, %d brokers, %d partitions", len(state.Logs), len(state.Brokers), len(state.PartitionMetadata))
@@ -233,6 +242,11 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		producerStateCopy[topic] = partitionMap
 	}
 
+	var groupState map[string]*coordinator.GroupStateSnapshot
+	if f.cd != nil {
+		groupState = f.cd.ExportState()
+	}
+
 	util.Debug("Creating FSM snapshot")
 	return &BrokerFSMSnapshot{
 		applied:           f.applied,
@@ -240,6 +254,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		brokers:           brokersCopy,
 		partitionMetadata: metadataCopy,
 		producerState:     producerStateCopy,
+		groupState:        groupState,
 	}, nil
 }
 

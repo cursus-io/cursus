@@ -41,6 +41,35 @@ func (d *DiskHandler) flushLoop() {
 				}
 				batch = batch[:0]
 			}
+		case done := <-d.flushSignal:
+			draining := true
+			for draining {
+				select {
+				case msg, ok := <-d.writeCh:
+					if !ok {
+						draining = false
+					} else {
+						batch = append(batch, msg)
+					}
+				default:
+					draining = false
+				}
+			}
+			if len(batch) > 0 {
+				if err := d.WriteBatch(batch); err != nil {
+					util.Error("WriteBatch failed during flush: %v", err)
+				}
+				batch = batch[:0]
+			}
+			d.ioMu.Lock()
+			if d.writer != nil {
+				_ = d.writer.Flush()
+			}
+			if d.file != nil {
+				_ = d.file.Sync()
+			}
+			d.ioMu.Unlock()
+			close(done)
 		case <-ticker.C:
 			if len(batch) > 0 {
 				util.Debug("Flushing %d messages on timer", len(batch))
@@ -215,6 +244,10 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 			break
 		}
 	}
+
+	// Update flushed offset so readers know data is on disk
+	atomic.StoreUint64(&d.FlushedOffset, newAbsOffset)
+
 	return nil
 }
 
@@ -235,12 +268,17 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	defer d.ioMu.Unlock()
 
 	diskMsg := types.DiskMessage{
-		Topic:     topic,
-		Partition: int32(partition),
-		Offset:    msg.Offset,
-		SeqNum:    msg.SeqNum,
-		Epoch:     msg.Epoch,
-		Payload:   msg.Payload,
+		Topic:            topic,
+		Partition:        int32(partition),
+		Offset:           msg.Offset,
+		SeqNum:           msg.SeqNum,
+		Epoch:            msg.Epoch,
+		Payload:          msg.Payload,
+		Key:              msg.Key,
+		EventType:        msg.EventType,
+		SchemaVersion:    msg.SchemaVersion,
+		AggregateVersion: msg.AggregateVersion,
+		Metadata:         msg.Metadata,
 	}
 
 	serialized, err := util.SerializeDiskMessage(diskMsg)
@@ -283,9 +321,11 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	}
 
 	d.CurrentOffset += totalLen
+	newAbsOffset := msg.Offset + 1
 	if msg.Offset >= atomic.LoadUint64(&d.AbsoluteOffset) {
-		atomic.StoreUint64(&d.AbsoluteOffset, msg.Offset+1)
+		atomic.StoreUint64(&d.AbsoluteOffset, newAbsOffset)
 	}
+	atomic.StoreUint64(&d.FlushedOffset, newAbsOffset)
 
 	if msgPosition-d.lastIndexPosition >= interval {
 		indexEntry := types.IndexEntry{
@@ -378,48 +418,26 @@ func (d *DiskHandler) openSegment() error {
 }
 
 // Flush forces all pending data to be written and synced to disk.
+// It signals the flushLoop to drain the write channel, avoiding a race condition
+// where both Flush and flushLoop read from writeCh concurrently.
 func (d *DiskHandler) Flush() {
-	batch := make([]types.DiskMessage, 0, d.batchSize)
-
-	for len(batch) < d.batchSize {
-		select {
-		case msg, ok := <-d.writeCh:
-			if !ok {
-				goto perform_write
-			}
-			batch = append(batch, msg)
-		default:
-			goto perform_write
-		}
-	}
-
-perform_write:
-	if len(batch) > 0 {
-		if err := d.WriteBatch(batch); err != nil {
-			util.Error("Flush write failed: %v", err)
-			return
-		}
-	}
-
-	d.ioMu.Lock()
-	defer d.ioMu.Unlock()
-
-	if d.writer != nil {
-		if err := d.writer.Flush(); err != nil {
-			util.Error("flush failed in Flush: %v", err)
-		}
-	}
-
-	if d.file != nil {
-		if err := d.file.Sync(); err != nil {
-			util.Error("failed to sync disk file: %v", err)
-		}
+	done := make(chan struct{})
+	select {
+	case d.flushSignal <- done:
+		<-done
+	case <-d.done:
+		return
 	}
 }
 
 // GetAbsoluteOffset returns the current absolute offset in a thread-safe manner
 func (d *DiskHandler) GetAbsoluteOffset() uint64 {
 	return atomic.LoadUint64(&d.AbsoluteOffset)
+}
+
+// GetFlushedOffset returns the offset up to which data has been written to disk
+func (d *DiskHandler) GetFlushedOffset() uint64 {
+	return atomic.LoadUint64(&d.FlushedOffset)
 }
 
 // GetCurrentSegment returns the current segment number in a thread-safe manner

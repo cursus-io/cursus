@@ -77,7 +77,7 @@ func NewClusterController(ctx context.Context, cfg *config.Config, rm RaftManage
 		RaftManager: rm,
 		Discovery:   sd,
 		Election:    NewControllerElection(rm),
-		Router:      NewClusterRouter(brokerID, localAddr, nil, rm, cfg.BrokerPort),
+		Router:      NewClusterRouter(brokerID, localAddr, nil, rm, cfg.BrokerPort, cfg.AdvertisedClientHost),
 		brokerID:    brokerID,
 	}
 
@@ -188,6 +188,9 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 				successCount++
 				mu.Unlock()
 				metrics.ClusterReplicationLag.WithLabelValues(topic, partitionStr, brokerID).Observe(time.Since(replicationStart).Seconds())
+				if isrMgr := cc.RaftManager.GetISRManager(); isrMgr != nil {
+					isrMgr.UpdateHeartbeat(brokerID)
+				}
 			} else {
 				errCh <- err
 			}

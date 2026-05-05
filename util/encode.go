@@ -18,6 +18,9 @@ func EncodeMessage(topic string, payload string) []byte {
 		return nil
 	}
 	payloadBytes := []byte(payload)
+	if len(topicBytes) > math.MaxInt-2 || len(payloadBytes) > math.MaxInt-2-len(topicBytes) {
+		return nil
+	}
 	data := make([]byte, 2+len(topicBytes)+len(payloadBytes))
 	binary.BigEndian.PutUint16(data[:2], uint16(len(topicBytes)))
 	copy(data[2:2+len(topicBytes)], topicBytes)

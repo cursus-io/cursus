@@ -22,17 +22,19 @@ type ServiceDiscovery interface {
 }
 
 type serviceDiscovery struct {
-	rm       RaftManager
-	fsm      *fsm.BrokerFSM
-	brokerID string
-	addr     string
+	rm         RaftManager
+	fsm        *fsm.BrokerFSM
+	brokerID   string
+	addr       string
+	clientAddr string
 }
 
-func NewServiceDiscoveryImpl(rm RaftManager, brokerID, addr string) *serviceDiscovery {
+func NewServiceDiscoveryImpl(rm RaftManager, brokerID, addr, clientAddr string) *serviceDiscovery {
 	sd := &serviceDiscovery{
-		rm:       rm,
-		brokerID: brokerID,
-		addr:     addr,
+		rm:         rm,
+		brokerID:   brokerID,
+		addr:       addr,
+		clientAddr: clientAddr,
 	}
 	if rm != nil {
 		sd.fsm = rm.GetFSM()
@@ -40,16 +42,17 @@ func NewServiceDiscoveryImpl(rm RaftManager, brokerID, addr string) *serviceDisc
 	return sd
 }
 
-func NewServiceDiscovery(rm RaftManager, brokerID, addr string) ServiceDiscovery {
-	return NewServiceDiscoveryImpl(rm, brokerID, addr)
+func NewServiceDiscovery(rm RaftManager, brokerID, addr, clientAddr string) ServiceDiscovery {
+	return NewServiceDiscoveryImpl(rm, brokerID, addr, clientAddr)
 }
 
 func (sd *serviceDiscovery) Register() error {
 	broker := &fsm.BrokerInfo{
-		ID:       sd.brokerID,
-		Addr:     sd.addr,
-		Status:   "active",
-		LastSeen: time.Now(),
+		ID:         sd.brokerID,
+		Addr:       sd.addr,
+		ClientAddr: sd.clientAddr,
+		Status:     "active",
+		LastSeen:   time.Now(),
 	}
 
 	data, err := json.Marshal(broker)
@@ -169,6 +172,7 @@ func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
 				if !sd.rm.IsLeader() {
 					continue
 				}
+				sd.ensureClientAddrs()
 				sd.Reconcile()
 			case <-ctx.Done():
 				util.Debug("reconciler stopping for broker %s due to context cancellation", sd.brokerID)
@@ -176,6 +180,19 @@ func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// ensureClientAddrs re-registers self if ClientAddr is missing in FSM.
+// Only called on the leader.
+func (sd *serviceDiscovery) ensureClientAddrs() {
+	if sd.fsm == nil || sd.clientAddr == "" {
+		return
+	}
+	if self := sd.fsm.GetBroker(sd.brokerID); self != nil && self.ClientAddr == "" {
+		if err := sd.Register(); err != nil {
+			util.Debug("ensureClientAddrs: self re-register failed: %v", err)
+		}
+	}
 }
 
 func (sd *serviceDiscovery) Reconcile() {
@@ -220,6 +237,9 @@ func (sd *serviceDiscovery) Reconcile() {
 				Addr:     addr,
 				Status:   "active",
 				LastSeen: time.Now(),
+			}
+			if id == sd.brokerID && sd.clientAddr != "" {
+				broker.ClientAddr = sd.clientAddr
 			}
 			data, err := json.Marshal(broker)
 			if err != nil {

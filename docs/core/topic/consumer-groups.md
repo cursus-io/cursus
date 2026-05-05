@@ -190,9 +190,67 @@ The locking hierarchy ensures:
 - **No offset management**: Applications must track their own offsets for disk reads
 - **Channel-based only**: Active consumption through channels, no pull-based API in this layer
 
+## Consumer Group Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant APP as Application
+    participant TM as TopicManager
+    participant TOP as Topic
+    participant PART as Partition
+    participant CG as ConsumerGroup
+    participant CONS as Consumer
+
+    APP->>TM: RegisterConsumerGroup(topic, group, count)
+    TM->>TOP: RegisterConsumerGroup(group, count)
+
+    alt group already exists
+        TOP-->>APP: return existing ConsumerGroup
+    else new group
+        TOP->>CG: create ConsumerGroup
+        loop for each consumer (0..count-1)
+            CG->>CONS: create Consumer with MsgCh (cap 1000)
+        end
+
+        loop for each partition
+            TOP->>PART: RegisterGroup(groupName)
+            PART->>PART: create subs[groupName] chan (cap 10000)
+            PART->>PART: start forwarding goroutine\n(subs[group] → Consumer.MsgCh\nusing partitionID % consumerCount)
+        end
+
+        TOP-->>APP: return ConsumerGroup
+    end
+
+    Note over APP,CONS: Message delivery after registration
+    APP->>CONS: receive from Consumer.MsgCh
+```
+
+## Rebalance Flow
+
+```mermaid
+flowchart TD
+    START([New consumer wants to join]) --> CHECK{Group\nalready\nregistered?}
+    CHECK -->|Yes| RETURN[Return existing ConsumerGroup\nno rebalance supported]
+    CHECK -->|No| CREATE[Create ConsumerGroup\nwith N consumers]
+    CREATE --> ASSIGN[Assign partitions via\npartitionID % consumerCount]
+    ASSIGN --> GOROUTINE[Start forwarding goroutines\nper partition per group]
+    GOROUTINE --> READY([Group ready to consume])
+
+    RETURN --> NOTE1[Static assignment\nConsumers cannot be\nadded or removed\nwithout re-registration]
+
+    READY --> RECV[Consumer receives\nfrom MsgCh]
+    RECV --> PROC[Process message]
+    PROC --> RECV
+
+    PROC -->|consumer failure| BLOCK[Channel blocks\nBackpressure propagates\nto partition]
+    BLOCK --> RECOVER{Application\nrecovers?}
+    RECOVER -->|Yes| RECV
+    RECOVER -->|No| OVERFLOW[Buffer overflow\ngoroutine blocks]
+```
+
 # Summary
 
-Consumer groups in cursus provide load balancing and ordering guarantees through a deterministic partition assignment mechanism. The modulo-based distribution ensures even load across consumers while maintaining per-partition message ordering. 
+Consumer groups in cursus provide load balancing and ordering guarantees through a deterministic partition assignment mechanism. The modulo-based distribution ensures even load across consumers while maintaining per-partition message ordering.
 
 Multiple consumer groups can independently consume the same topic, each with its own partition-to-consumer mapping and isolated message delivery channels.
 

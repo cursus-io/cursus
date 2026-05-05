@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
@@ -28,7 +30,11 @@ func (m *MockStorageHandler) AppendMessage(topic string, partition int, msg *typ
 	msg.Offset = m.offset
 	return m.offset, nil
 }
+func (m *MockStorageHandler) AppendMessageWithOffset(topic string, partition int, msg *types.Message) error {
+	return nil
+}
 func (m *MockStorageHandler) GetAbsoluteOffset() uint64 { return m.offset }
+func (m *MockStorageHandler) GetFlushedOffset() uint64  { return m.offset }
 func (m *MockStorageHandler) GetLatestOffset() uint64   { return m.offset }
 func (m *MockStorageHandler) ReserveOffsets(n int) uint64 {
 	start := m.offset
@@ -795,3 +801,54 @@ type MockSnapshotSink struct {
 func (m *MockSnapshotSink) ID() string    { return "" }
 func (m *MockSnapshotSink) Close() error  { m.closed = true; return nil }
 func (m *MockSnapshotSink) Cancel() error { return nil }
+
+func TestBrokerFSM_Snapshot_Restore_GroupState(t *testing.T) {
+	cfg := &config.Config{LogDir: t.TempDir()}
+	tm := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
+
+	f := NewBrokerFSM(tm, cd)
+
+	_ = cd.RegisterGroup("test-topic", "test-group", 4)
+	_, _ = cd.AddConsumer("test-group", "member-1")
+	_ = cd.CommitOffset("test-group", "test-topic", 0, 42)
+	_ = cd.CommitOffset("test-group", "test-topic", 1, 100)
+
+	snapshot, err := f.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+
+	buf := new(bytes.Buffer)
+	sink := &MockSnapshotSink{Writer: buf}
+	if err := snapshot.Persist(sink); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+
+	newTm := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+	newCd := coordinator.NewCoordinator(context.Background(), cfg, newTm)
+	newFSM := NewBrokerFSM(newTm, newCd)
+	rc := io.NopCloser(bytes.NewReader(buf.Bytes()))
+
+	if err := newFSM.Restore(rc); err != nil {
+		t.Fatalf("Restore failed: %v", err)
+	}
+
+	offset, found := newCd.GetOffset("test-group", "test-topic", 0)
+	if !found || offset != 42 {
+		t.Errorf("Expected offset 42 for partition 0, got %d (found=%v)", offset, found)
+	}
+
+	offset2, found2 := newCd.GetOffset("test-group", "test-topic", 1)
+	if !found2 || offset2 != 100 {
+		t.Errorf("Expected offset 100 for partition 1, got %d (found=%v)", offset2, found2)
+	}
+
+	group := newCd.GetGroup("test-group")
+	if group == nil {
+		t.Fatal("Group 'test-group' not found after restore")
+	}
+	if group.Generation != cd.GetGeneration("test-group") {
+		t.Errorf("Generation mismatch: expected %d, got %d", cd.GetGeneration("test-group"), group.Generation)
+	}
+}

@@ -21,6 +21,7 @@ func (m *MockStorageHandler) ReadMessages(o uint64, max int) ([]types.Message, e
 	return nil, nil
 }
 func (m *MockStorageHandler) GetAbsoluteOffset() uint64      { return 0 }
+func (m *MockStorageHandler) GetFlushedOffset() uint64       { return 0 }
 func (m *MockStorageHandler) GetLatestOffset() uint64        { return 0 }
 func (m *MockStorageHandler) GetSegmentPath(b uint64) string { return "" }
 func (m *MockStorageHandler) AppendMessage(t string, p int, msg *types.Message) (uint64, error) {
@@ -28,6 +29,9 @@ func (m *MockStorageHandler) AppendMessage(t string, p int, msg *types.Message) 
 }
 func (m *MockStorageHandler) AppendMessageSync(t string, p int, msg *types.Message) (uint64, error) {
 	return 0, nil
+}
+func (m *MockStorageHandler) AppendMessageWithOffset(t string, p int, msg *types.Message) error {
+	return nil
 }
 func (m *MockStorageHandler) WriteBatch(b []types.DiskMessage) error { return nil }
 func (m *MockStorageHandler) Flush()                                 {}

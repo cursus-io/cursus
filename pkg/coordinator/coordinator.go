@@ -50,6 +50,14 @@ type MemberMetadata struct {
 	Assignments   []int     // Partition assignments for this member
 }
 
+// GroupStateSnapshot is a serializable snapshot of a consumer group's state.
+type GroupStateSnapshot struct {
+	TopicName  string                    `json:"topic"`
+	Generation int                       `json:"generation"`
+	Members    map[string][]int          `json:"members"`
+	Offsets    map[string]map[int]uint64 `json:"offsets"`
+}
+
 // GroupStatus represents the status of a consumer group
 type GroupStatus struct {
 	GroupName      string       `json:"group_name"`
@@ -283,4 +291,74 @@ func (gm *GroupMetadata) storeOffset(topic string, partition int, offset uint64)
 		gm.Offsets[topic] = make(map[int]uint64)
 	}
 	gm.Offsets[topic][partition] = offset
+}
+
+// ExportState returns a serializable snapshot of all consumer groups.
+func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	result := make(map[string]*GroupStateSnapshot, len(c.groups))
+	for name, group := range c.groups {
+		group.mu.RLock()
+		snap := &GroupStateSnapshot{
+			TopicName:  group.TopicName,
+			Generation: group.Generation,
+			Members:    make(map[string][]int, len(group.Members)),
+			Offsets:    make(map[string]map[int]uint64),
+		}
+		for mid, member := range group.Members {
+			assignments := make([]int, len(member.Assignments))
+			copy(assignments, member.Assignments)
+			snap.Members[mid] = assignments
+		}
+		for topic, partitions := range group.Offsets {
+			snap.Offsets[topic] = make(map[int]uint64, len(partitions))
+			for pid, offset := range partitions {
+				snap.Offsets[topic][pid] = offset
+			}
+		}
+		group.mu.RUnlock()
+		result[name] = snap
+	}
+	return result
+}
+
+// ImportState restores consumer group state from a snapshot.
+func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for name, snap := range state {
+		group := &GroupMetadata{
+			TopicName:  snap.TopicName,
+			Generation: snap.Generation,
+			Members:    make(map[string]*MemberMetadata, len(snap.Members)),
+			Partitions: make([]int, 0),
+			Offsets:    make(map[string]map[int]uint64),
+		}
+
+		for mid, assignments := range snap.Members {
+			group.Members[mid] = &MemberMetadata{
+				ID:            mid,
+				LastHeartbeat: time.Now(),
+				Assignments:   assignments,
+			}
+		}
+
+		for topic, partitions := range snap.Offsets {
+			group.Offsets[topic] = make(map[int]uint64, len(partitions))
+			for pid, offset := range partitions {
+				group.Offsets[topic][pid] = offset
+			}
+		}
+
+		if topicOffsets, ok := snap.Offsets[snap.TopicName]; ok {
+			for pid := range topicOffsets {
+				group.Partitions = append(group.Partitions, pid)
+			}
+		}
+
+		c.groups[name] = group
+	}
 }

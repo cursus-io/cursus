@@ -97,8 +97,7 @@ func TestPartitionConsumer_HandleBrokerError_NotLeader(t *testing.T) {
 
 	assert.True(t, pc.handleBrokerError([]byte("ERROR NOT_LEADER LEADER_IS broker-2:9000")))
 
-	info := c.client.leader.Load()
-	assert.Equal(t, "broker-2:9000", info.addr)
+	assert.Equal(t, "broker-2:9000", c.getPartitionLeaderAddr(0))
 }
 
 func TestPartitionConsumer_HandleBrokerError_GenMismatch(t *testing.T) {

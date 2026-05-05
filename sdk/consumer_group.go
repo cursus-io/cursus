@@ -73,7 +73,7 @@ func (c *Consumer) getOrDialHeartbeatConn() net.Conn {
 	}
 	c.hbMu.Unlock()
 
-	newConn, err := c.getLeaderConn()
+	newConn, err := c.getCoordinatorConn()
 	if err != nil {
 		LogError("Heartbeat: failed to connect: %v", err)
 		return nil
@@ -103,6 +103,12 @@ func (c *Consumer) resetHeartbeatConn() {
 // ─── Consume / Stream ─────────────────────────────────────────────────────────
 
 func (c *Consumer) startConsuming() {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.metadataRefreshLoop()
+	}()
+
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
@@ -140,6 +146,12 @@ func (c *Consumer) startConsuming() {
 }
 
 func (c *Consumer) startStreaming() {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.metadataRefreshLoop()
+	}()
+
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
@@ -229,6 +241,12 @@ drainDone:
 
 	c.mainCtx, c.mainCancel = context.WithCancel(context.Background())
 
+	if coordAddr, err := c.findCoordinator(); err == nil {
+		c.mu.Lock()
+		c.coordinatorAddr = coordAddr
+		c.mu.Unlock()
+	}
+
 	gen, mid, assignments, err := c.joinGroupWithRetry()
 	if err != nil {
 		LogError("Rebalance join failed: %v", err)
@@ -261,6 +279,10 @@ drainDone:
 		LogInfo("Rebalance: P%d assigned at offset %d (gen=%d)", pid, offset, gen)
 	}
 	c.mu.Unlock()
+
+	if err := c.fetchMetadata(); err != nil {
+		LogWarn("Rebalance: failed to fetch metadata: %v", err)
+	}
 
 	if c.config.Mode == ModeStreaming {
 		go c.startStreaming()

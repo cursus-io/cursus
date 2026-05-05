@@ -28,6 +28,7 @@ func (m *testMockStorage) ReadMessages(offset uint64, max int) ([]types.Message,
 	return []types.Message{}, nil
 }
 func (m *testMockStorage) GetAbsoluteOffset() uint64               { return 0 }
+func (m *testMockStorage) GetFlushedOffset() uint64                { return 0 }
 func (m *testMockStorage) GetLatestOffset() uint64                 { return 0 }
 func (m *testMockStorage) GetSegmentPath(baseOffset uint64) string { return "" }
 func (m *testMockStorage) AppendMessage(topic string, partition int, msg *types.Message) (uint64, error) {
@@ -35,6 +36,9 @@ func (m *testMockStorage) AppendMessage(topic string, partition int, msg *types.
 }
 func (m *testMockStorage) AppendMessageSync(topic string, partition int, msg *types.Message) (uint64, error) {
 	return 0, nil
+}
+func (m *testMockStorage) AppendMessageWithOffset(topic string, partition int, msg *types.Message) error {
+	return nil
 }
 func (m *testMockStorage) WriteBatch(batch []types.DiskMessage) error { return nil }
 func (m *testMockStorage) Flush()                                     {}
@@ -1033,7 +1037,7 @@ func TestHandlePublish_AcksAllVariants(t *testing.T) {
 	assert.Equal(t, "OK", ack.Status)
 }
 
-func TestReadFromTopic_MissingMember(t *testing.T) {
+func TestReadFromTopic_NoMember_StatelessRead(t *testing.T) {
 	ch, tm, _ := newTestHandlerWithCoordinator(t)
 	_ = tm.CreateTopic("read-topic", 1, false, false)
 
@@ -1043,11 +1047,13 @@ func TestReadFromTopic_MissingMember(t *testing.T) {
 		PartitionID: 0,
 		GroupName:   "g1",
 		MemberID:    "",
+		HasOffset:   true,
+		Offset:      0,
 	}
 
-	_, err := ch.readFromTopic("read-topic", cArgs, ctx, 10)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "missing member")
+	msgs, err := ch.readFromTopic("read-topic", cArgs, ctx, 10)
+	assert.NoError(t, err)
+	assert.Empty(t, msgs)
 }
 
 func TestReadFromTopic_TopicNotFound(t *testing.T) {
@@ -1066,21 +1072,14 @@ func TestReadFromTopic_TopicNotFound(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not exist")
 }
 
-func TestReadFromTopic_GenerationChange(t *testing.T) {
-	ch, tm, coord := newTestHandlerWithCoordinator(t)
+func TestReadFromTopic_StatelessRead_UsesCachedOffset(t *testing.T) {
+	ch, tm, _ := newTestHandlerWithCoordinator(t)
 	_ = tm.CreateTopic("read-gen-topic", 1, false, false)
 	tObj := tm.GetTopic("read-gen-topic")
 	p, _ := tObj.GetPartition(0)
 	p.SetHWM(100)
 
-	_ = coord.RegisterGroup("read-gen-topic", "rg-g1", 1)
-	_, _ = coord.AddConsumer("rg-g1", "rg-m1")
-	coord.Rebalance("rg-g1")
-	gen := coord.GetGeneration("rg-g1")
-
 	ctx := NewClientContext("rg-g1", 0)
-	ctx.MemberID = "rg-m1"
-	ctx.Generation = gen - 1
 	ctx.OffsetCache = map[string]uint64{"read-gen-topic-0": 50}
 
 	cArgs := CommonArgs{
@@ -1088,30 +1087,22 @@ func TestReadFromTopic_GenerationChange(t *testing.T) {
 		PartitionID: 0,
 		GroupName:   "rg-g1",
 		MemberID:    "rg-m1",
-		Generation:  gen,
 	}
 
 	_, err := ch.readFromTopic("read-gen-topic", cArgs, ctx, 10)
 	assert.NoError(t, err)
-	assert.Equal(t, gen, ctx.Generation)
-	assert.Empty(t, ctx.OffsetCache)
+	// Stateless read: offset cache is preserved, no generation tracking
+	assert.Contains(t, ctx.OffsetCache, "read-gen-topic-0")
 }
 
 func TestReadFromTopic_UseCachedOffset(t *testing.T) {
-	ch, tm, coord := newTestHandlerWithCoordinator(t)
+	ch, tm, _ := newTestHandlerWithCoordinator(t)
 	_ = tm.CreateTopic("read-cache-topic", 1, false, false)
 	tObj := tm.GetTopic("read-cache-topic")
 	p, _ := tObj.GetPartition(0)
 	p.SetHWM(100)
 
-	_ = coord.RegisterGroup("read-cache-topic", "rc-g1", 1)
-	_, _ = coord.AddConsumer("rc-g1", "rc-m1")
-	coord.Rebalance("rc-g1")
-	gen := coord.GetGeneration("rc-g1")
-
 	ctx := NewClientContext("rc-g1", 0)
-	ctx.MemberID = "rc-m1"
-	ctx.Generation = gen
 	ctx.OffsetCache = map[string]uint64{"read-cache-topic-0": 25}
 
 	cArgs := CommonArgs{
@@ -1119,7 +1110,6 @@ func TestReadFromTopic_UseCachedOffset(t *testing.T) {
 		PartitionID: 0,
 		GroupName:   "rc-g1",
 		MemberID:    "rc-m1",
-		Generation:  gen,
 	}
 
 	_, err := ch.readFromTopic("read-cache-topic", cArgs, ctx, 10)

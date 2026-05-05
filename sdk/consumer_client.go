@@ -90,6 +90,11 @@ func (c *ConsumerClient) Connect(addr string) (net.Conn, error) {
 	return conn, nil
 }
 
+// ConnectToAddr opens a connection to a specific address (e.g., the coordinator).
+func (c *ConsumerClient) ConnectToAddr(addr string) (net.Conn, error) {
+	return c.Connect(addr)
+}
+
 // ConnectWithFailover tries the cached leader first, then each broker in order.
 func (c *ConsumerClient) ConnectWithFailover() (net.Conn, string, error) {
 	addrs := c.config.BrokerAddrs

@@ -116,7 +116,7 @@ func (m *ComprehensiveMockRaftManager) ApplyResponse(prefix string, data []byte,
 func TestServiceDiscovery_RegisterDeregister(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
 	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
-	sd := NewServiceDiscovery(rm, "node1", "localhost:9001")
+	sd := NewServiceDiscovery(rm, "node1", "localhost:9001", "")
 
 	t.Run("Register Success", func(t *testing.T) {
 		rm.On("ApplyCommand", "REGISTER", mock.Anything).Return(nil).Once()
@@ -144,7 +144,7 @@ func TestServiceDiscovery_RegisterDeregister(t *testing.T) {
 func TestServiceDiscovery_NodeOperations(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
 	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
-	sd := NewServiceDiscovery(rm, "node1", "localhost:9001")
+	sd := NewServiceDiscovery(rm, "node1", "localhost:9001", "")
 
 	t.Run("AddNode - Not Leader", func(t *testing.T) {
 		rm.isLeader = false
@@ -191,7 +191,7 @@ func TestServiceDiscovery_NodeOperations(t *testing.T) {
 func TestServiceDiscovery_Heartbeat(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
 	isr := new(MockISRManager)
-	sd := NewServiceDiscovery(rm, "node1", "localhost:9001")
+	sd := NewServiceDiscovery(rm, "node1", "localhost:9001", "")
 
 	rm.On("GetISRManager").Return(isr)
 	isr.On("UpdateHeartbeat", "node1").Return()
@@ -205,7 +205,7 @@ func TestServiceDiscovery_Heartbeat(t *testing.T) {
 func TestServiceDiscovery_DiscoverBrokers(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
 	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
-	sd := NewServiceDiscovery(rm, "node1", "localhost:9001")
+	sd := NewServiceDiscovery(rm, "node1", "localhost:9001", "")
 
 	// Register two brokers directly in FSM
 	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node1","addr":"localhost:9001","status":"active"}`)})
@@ -220,7 +220,7 @@ func TestServiceDiscovery_RemoveNode_NotLeader(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
 	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
 	rm.isLeader = false
-	sd := NewServiceDiscovery(rm, "node1", "localhost:9001")
+	sd := NewServiceDiscovery(rm, "node1", "localhost:9001", "")
 
 	rm.On("GetLeaderAddress").Return("leader:9001").Once()
 
@@ -231,7 +231,7 @@ func TestServiceDiscovery_RemoveNode_NotLeader(t *testing.T) {
 
 func TestServiceDiscovery_Heartbeat_NilISRManager(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
-	sd := NewServiceDiscovery(rm, "node1", "localhost:9001")
+	sd := NewServiceDiscovery(rm, "node1", "localhost:9001", "")
 
 	rm.On("GetISRManager").Return(nil)
 

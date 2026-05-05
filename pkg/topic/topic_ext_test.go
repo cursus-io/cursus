@@ -129,6 +129,7 @@ func TestPartition_Basic(t *testing.T) {
 
 	t.Run("ReadCommitted", func(t *testing.T) {
 		p.SetHWM(20)
+		mh.On("GetFlushedOffset").Return(uint64(20)).Maybe()
 		mh.On("ReadMessages", uint64(11), 2).Return([]types.Message{{Payload: "m1"}, {Payload: "m2"}}, nil).Once()
 		msgs, err := p.ReadCommitted(11, 2)
 		assert.NoError(t, err)

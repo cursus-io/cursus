@@ -198,12 +198,6 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string) string {
 		return "REGISTER_GROUP requires group parameter"
 	}
 
-	if ch.hasRouter() {
-		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
-			return resp
-		}
-	}
-
 	t := ch.TopicManager.GetTopic(topicName)
 	if t == nil {
 		util.Warn("ch registerGroup: topic '%s' does not exist", topicName)
@@ -248,12 +242,9 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 
 	var assignments []int
 	if ch.isDistributed() {
-		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
-			return resp
-		}
-
-		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
-			return resp
+		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
 		}
 
 		joinPayload := map[string]interface{}{
@@ -263,11 +254,19 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 			"topic":  topicName,
 		}
 
-		_, err := ch.applyAndWait("GROUP_SYNC", joinPayload)
+		_, err := ch.applyViaLeader("GROUP_SYNC", joinPayload)
 		if err != nil {
 			return fmt.Sprintf("ERROR: %v", err)
 		}
-		assignments = ch.Coordinator.GetMemberAssignments(groupName, consumerID)
+
+		// Wait briefly for Raft to propagate to local FSM
+		for i := 0; i < 10; i++ {
+			assignments = ch.Coordinator.GetMemberAssignments(groupName, consumerID)
+			if len(assignments) > 0 {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 	} else {
 		if ch.Coordinator != nil {
 			if ch.Coordinator.GetGroup(groupName) == nil {
@@ -319,11 +318,9 @@ func (ch *CommandHandler) handleSyncGroup(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
-			return resp
-		}
-		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
-			return resp
+		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
 		}
 	}
 
@@ -352,11 +349,9 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
-			return resp
-		}
-		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
-			return resp
+		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
 		}
 
 		payload := map[string]interface{}{
@@ -365,9 +360,9 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 			"member": consumerID,
 		}
 
-		_, err := ch.applyAndWait("GROUP_SYNC", payload)
+		_, err := ch.applyViaLeader("GROUP_SYNC", payload)
 		if err != nil {
-			return fmt.Sprintf("❌ ERROR: %v", err)
+			return fmt.Sprintf("ERROR: %v", err)
 		}
 	} else {
 		if ch.Coordinator != nil {
@@ -401,14 +396,9 @@ func (ch *CommandHandler) handleFetchOffset(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
-			return resp
-		}
-		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
-			return resp
-		}
-		if !ch.isAuthorizedForPartition(topicName, partition) {
-			return fmt.Sprintf("NOT_AUTHORIZED_FOR_PARTITION %s:%d", topicName, partition)
+		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
 		}
 	}
 
@@ -446,11 +436,9 @@ func (ch *CommandHandler) handleGroupStatus(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
-			return resp
-		}
-		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
-			return resp
+		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
 		}
 	}
 
@@ -484,11 +472,9 @@ func (ch *CommandHandler) handleHeartbeat(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupName, cmd); forwarded {
-			return resp
-		}
-		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
-			return resp
+		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
 		}
 	}
 
@@ -534,16 +520,9 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupID, cmd); forwarded {
-			return resp
-		}
-
-		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
-			return resp
-		}
-
-		if !ch.isAuthorizedForPartition(topicName, partition) {
-			return fmt.Sprintf("NOT_AUTHORIZED_FOR_PARTITION %s:%d", topicName, partition)
+		coordAddr, isCoord := ch.checkCoordinator(groupID)
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
 		}
 
 		payload := map[string]interface{}{
@@ -553,9 +532,9 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 			"partition": partition,
 			"offset":    offset,
 		}
-		_, err := ch.applyAndWait("OFFSET_SYNC", payload)
+		_, err := ch.applyViaLeader("OFFSET_SYNC", payload)
 		if err != nil {
-			return fmt.Sprintf("❌ Offset sync failed: %v", err)
+			return fmt.Sprintf("ERROR: Offset sync failed: %v", err)
 		}
 		return "OK"
 	}
@@ -586,11 +565,9 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 	generation, _ := strconv.Atoi(args["generation"])
 
 	if ch.isDistributed() {
-		if resp, forwarded, _ := ch.isCoordinatorAndForward(groupID, cmd); forwarded {
-			return resp
-		}
-		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
-			return resp
+		coordAddr, isCoord := ch.checkCoordinator(groupID)
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
 		}
 	}
 
@@ -623,13 +600,6 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 			continue
 		}
 
-		if ch.isDistributed() {
-			if !ch.isAuthorizedForPartition(topicName, p) {
-				util.Warn("Unauthorized batch commit attempt for %s:%d", topicName, p)
-				continue
-			}
-		}
-
 		if !ch.ValidateOwnership(groupID, memberID, generation, p) {
 			util.Warn("STALE_METADATA_OR_NOT_OWNER for partition %d in batch", p)
 			continue
@@ -650,10 +620,10 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 			"topic":   topicName,
 			"offsets": offsetList,
 		}
-		_, err := ch.applyAndWait("BATCH_OFFSET", batchCommitData)
+		_, err := ch.applyViaLeader("BATCH_OFFSET", batchCommitData)
 		if err != nil {
-			util.Error("❌ Raft batch apply failed: %v", err)
-			return fmt.Sprintf("❌ Raft batch apply failed: %v", err)
+			util.Error("Raft batch apply failed: %v", err)
+			return fmt.Sprintf("ERROR: Raft batch apply failed: %v", err)
 		}
 	} else if ch.Coordinator != nil {
 		err := ch.Coordinator.CommitOffsetsBulk(groupID, topicName, offsetList)
@@ -836,4 +806,81 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 		return fmt.Sprintf("failed to marshal metadata: %v", err)
 	}
 	return string(respJSON)
+}
+
+func (ch *CommandHandler) handleMetadata(cmd string) string {
+	args := parseKeyValueArgs(cmd[9:]) // len("METADATA ") = 9
+	topicName, ok := args["topic"]
+	if !ok || topicName == "" {
+		return "ERROR: METADATA requires topic parameter"
+	}
+
+	t := ch.TopicManager.GetTopic(topicName)
+	if t == nil {
+		return fmt.Sprintf("ERROR: topic '%s' does not exist", topicName)
+	}
+
+	partitionCount := len(t.Partitions)
+	leaders := make([]string, partitionCount)
+	epochs := make([]string, partitionCount)
+
+	for i := 0; i < partitionCount; i++ {
+		leaders[i] = ch.resolvePartitionLeaderAddr(topicName, i)
+		epochs[i] = "0"
+		if ch.isDistributed() {
+			if fsmRef := ch.Cluster.RaftManager.GetFSM(); fsmRef != nil {
+				key := fmt.Sprintf("%s-%d", topicName, i)
+				if meta := fsmRef.GetPartitionMetadata(key); meta != nil {
+					epochs[i] = strconv.Itoa(meta.LeaderEpoch)
+				}
+			}
+		}
+	}
+
+	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s",
+		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","))
+}
+
+func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
+	args := parseKeyValueArgs(cmd[17:]) // len("FIND_COORDINATOR ") = 17
+	groupName, ok := args["group"]
+	if !ok || groupName == "" {
+		return "ERROR: FIND_COORDINATOR requires group parameter"
+	}
+
+	host := "localhost"
+	port := ch.Config.BrokerPort
+
+	if ch.isDistributed() {
+		coordID, _, err := ch.Cluster.Router.FindCoordinator(groupName)
+		if err != nil {
+			return fmt.Sprintf("ERROR: %v", err)
+		}
+
+		if coordID == ch.Cluster.Router.BrokerID() {
+			if ch.Config.AdvertisedClientHost != "" {
+				host = ch.Config.AdvertisedClientHost
+			}
+			if ch.Config.AdvertisedBrokerPort > 0 {
+				port = ch.Config.AdvertisedBrokerPort
+			}
+			return fmt.Sprintf("OK coordinator_id=%s host=%s port=%d", coordID, host, port)
+		}
+
+		// Forward to coordinator to get its own advertised address
+		encodedCmd := util.EncodeMessage("", cmd)
+		resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(groupName, string(encodedCmd))
+		if fwdErr != nil {
+			return fmt.Sprintf("ERROR: %v", fwdErr)
+		}
+		return resp
+	}
+
+	if ch.Config.AdvertisedClientHost != "" {
+		host = ch.Config.AdvertisedClientHost
+	}
+	if ch.Config.AdvertisedBrokerPort > 0 {
+		port = ch.Config.AdvertisedBrokerPort
+	}
+	return fmt.Sprintf("OK coordinator_id=standalone host=%s port=%d", host, port)
 }

@@ -57,7 +57,7 @@ func TestClusterRouter_LocalProcess(t *testing.T) {
 	processor := &MockLocalProcessor{}
 
 	rm := &MockRaftManager{isLeader: true}
-	router := NewClusterRouter("node1", "localhost:7000", processor, rm, 9000)
+	router := NewClusterRouter("node1", "localhost:7000", processor, rm, 9000, "")
 
 	if router.processLocally("CREATE topic=t1") != "OK" {
 		t.Fatal("Expected local processing to succeed")
@@ -75,7 +75,7 @@ func TestClusterRouter_FindCoordinator(t *testing.T) {
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"node3\",\"addr\":\"localhost:7003\",\"status\":\"active\"}")})
 
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
-	router := NewClusterRouter("node1", "localhost:7001", nil, rm, 7000)
+	router := NewClusterRouter("node1", "localhost:7001", nil, rm, 7000, "")
 
 	group1 := "group-a"
 	id1, addr1, err := router.FindCoordinator(group1)
@@ -112,7 +112,7 @@ func TestClusterRouter_FindCoordinator_CacheRebuild(t *testing.T) {
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n2\",\"addr\":\"localhost:7002\",\"status\":\"active\"}")})
 
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
-	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000)
+	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "")
 
 	// First call builds ring
 	id1, _, err := router.FindCoordinator("group-x")
@@ -138,7 +138,7 @@ func TestClusterRouter_FindCoordinator_CacheRebuild(t *testing.T) {
 func TestClusterRouter_FindCoordinator_NoActiveBrokers(t *testing.T) {
 	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
-	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000)
+	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "")
 
 	_, _, err := router.FindCoordinator("group-x")
 	if err == nil {
@@ -148,7 +148,7 @@ func TestClusterRouter_FindCoordinator_NoActiveBrokers(t *testing.T) {
 
 func TestClusterRouter_FindCoordinator_NilFSM(t *testing.T) {
 	rm := &MockRaftManager{isLeader: true, mockFSM: nil}
-	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000)
+	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "")
 
 	_, _, err := router.FindCoordinator("group-x")
 	if err == nil {
@@ -162,7 +162,7 @@ func TestClusterRouter_ForwardToCoordinator_Local(t *testing.T) {
 
 	processor := &MockLocalProcessor{}
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
-	router := NewClusterRouter("n1", "localhost:7001", processor, rm, 7000)
+	router := NewClusterRouter("n1", "localhost:7001", processor, rm, 7000, "")
 
 	// With only one broker, all groups map to n1 -> local processing
 	resp, err := router.ForwardToCoordinator("any-group", "HEARTBEAT group=any-group member=m1")
@@ -187,7 +187,7 @@ func TestClusterRouter_ForwardToPartitionLeader_Local(t *testing.T) {
 
 	processor := &MockLocalProcessor{}
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
-	router := NewClusterRouter("n1", "localhost:7001", processor, rm, 7000)
+	router := NewClusterRouter("n1", "localhost:7001", processor, rm, 7000, "")
 
 	resp, err := router.ForwardToPartitionLeader("t1", 0, "PUBLISH topic=t1 message=hello")
 	if err != nil {
@@ -201,7 +201,7 @@ func TestClusterRouter_ForwardToPartitionLeader_Local(t *testing.T) {
 func TestClusterRouter_ForwardToLeader_IsLeader(t *testing.T) {
 	processor := &MockLocalProcessor{}
 	rm := &MockRaftManager{isLeader: true}
-	router := NewClusterRouter("n1", "localhost:7001", processor, rm, 7000)
+	router := NewClusterRouter("n1", "localhost:7001", processor, rm, 7000, "")
 
 	resp, err := router.ForwardToLeader("LIST")
 	if err != nil {

@@ -2,11 +2,68 @@
 
 ## Purpose and Scope
 
-This document provides a high-level introduction to cursus, a lightweight message broker system. 
+This document provides a high-level introduction to cursus, a lightweight message broker system.
 
-It covers the system's purpose, core components, and architectural design. For detailed information about specific subsystems, see [Architecture Overview](./contributing/README.md) and [Core Systems](./core/README.md). 
+It covers the system's purpose, core components, and architectural design. For detailed information about specific subsystems, see [Architecture Overview](./contributing/README.md) and [Core Systems](./core/README.md).
 
 For setup instructions, see [Getting Started](./user-guide/README.md).
+
+## System Architecture
+
+```mermaid
+flowchart TB
+    subgraph "Clients"
+        P[Producer]
+        C[Consumer]
+    end
+
+    subgraph "Network Layer"
+        TCP["TCP :9000\nserver.RunServer()"]
+        HTTP1["HTTP :9080\nHealth Check"]
+        HTTP2["HTTP :9100\nPrometheus Metrics"]
+    end
+
+    subgraph "Broker Core"
+        CMD[CommandHandler]
+        TM[TopicManager]
+        DM[DedupMap\n30-min window]
+
+        subgraph "Topic"
+            T[Topic]
+            P0[Partition 0]
+            P1[Partition 1]
+            PN[Partition N]
+        end
+
+        subgraph "Persistence"
+            DH0[DiskHandler 0]
+            DH1[DiskHandler 1]
+            DHN[DiskHandler N]
+            SEG[(Segment Files)]
+        end
+
+        subgraph "Consumer Delivery"
+            SM[StreamManager]
+            CG[ConsumerGroup]
+        end
+    end
+
+    P -->|TCP| TCP
+    C -->|TCP| TCP
+    TCP --> CMD
+    CMD --> TM
+    TM --> DM
+    DM -->|unique| T
+    T --> P0 & P1 & PN
+    P0 --> DH0
+    P1 --> DH1
+    PN --> DHN
+    DH0 & DH1 & DHN -->|WriteBatch| SEG
+    P0 & P1 & PN --> SM
+    SM --> CG
+    CG --> C
+    HTTP1 & HTTP2 -.->|observability| CMD
+```
 
 ## What is cursus?
 
@@ -35,6 +92,43 @@ cursus exposes three network ports, each serving a distinct purpose:
 
 
 ## Core Data Flow
+
+### End-to-End Data Flow Sequence
+
+```mermaid
+sequenceDiagram
+    participant PROD as Producer
+    participant SRV as Server :9000
+    participant TM as TopicManager
+    participant PART as Partition
+    participant DH as DiskHandler
+    participant DISK as Segment Files
+    participant SM as StreamManager
+    participant CONS as Consumer
+
+    PROD->>SRV: [4-byte len][PUBLISH topic msg]
+    SRV->>TM: Publish(topic, message)
+    TM->>TM: dedup check (FNV hash)
+    alt duplicate within 30min
+        TM-->>PROD: ERROR: duplicate
+    else unique message
+        TM->>PART: Enqueue(message)\nkey-hash or round-robin
+        PART->>DH: AppendMessage(writeCh)
+        DH-->>DISK: flushLoop batch write\n(50 msgs or 50ms)
+        PART->>SM: NotifyNewMessage
+        SM->>CONS: push to MsgCh
+        CONS-->>PROD: (async delivery)
+    end
+
+    Note over CONS,DISK: Disk-based replay (CONSUME)
+    CONS->>SRV: [4-byte len][CONSUME topic partition offset]
+    SRV->>PART: ReadCommitted(offset)
+    PART->>DISK: mmap read (up to 8192 bytes)
+    DISK-->>SRV: message batch
+    SRV-->>CONS: [4-byte len][msg1][4-byte len][msg2]...
+```
+
+### Mermaid Graph Overview
 
 ```mermaid
 graph LR
@@ -72,4 +166,148 @@ Each topic-partition pair gets its own DiskHandler instance:
 - Stores messages with 4-byte big-endian length prefixes
 
 This architecture enables parallel I/O across partitions and efficient sequential reads. For detailed persistence mechanics, see [Disk Persistence System](./core/storage/disk-persistence.md).
+
+## Cluster Architecture
+
+cursus supports a 3-node Raft-based cluster with Kafka-style routing.
+
+### Cluster Topology
+
+```mermaid
+flowchart TB
+    subgraph "Raft Cluster"
+        direction TB
+        B1["Broker-1\n:9001\nRaft Leader"]
+        B2["Broker-2\n:9002"]
+        B3["Broker-3\n:9003"]
+
+        B1 <-->|"Raft replication\nlog entries"| B2
+        B2 <-->|"Raft replication\nlog entries"| B3
+        B1 <-->|"Raft replication\nlog entries"| B3
+    end
+
+    subgraph "Clients"
+        PROD[Producer SDK]
+        CONS[Consumer SDK]
+    end
+
+    subgraph "Coordination"
+        COORD["Coordinator\n(consistent hash\nper group)"]
+    end
+
+    PROD -->|PUBLISH / METADATA| B1
+    CONS -->|FIND_COORDINATOR| B1
+    B1 -->|coordinator=B2| CONS
+    CONS -->|JOIN_GROUP / HEARTBEAT| COORD
+    COORD --- B2
+    CONS -->|CONSUME P0| B1
+    CONS -->|CONSUME P1| B3
+    CONS -->|CONSUME P2| B2
+```
+
+### Routing Model
+
+```mermaid
+graph TB
+    subgraph Client
+        SDK[SDK Consumer/Producer]
+    end
+
+    subgraph Cluster
+        B1[Broker-1<br/>Raft Leader]
+        B2[Broker-2]
+        B3[Broker-3]
+    end
+
+    SDK -->|1. FIND_COORDINATOR group=G| B1
+    B1 -->|coordinator=B2| SDK
+    SDK -->|2. JOIN_GROUP, HEARTBEAT, COMMIT| B2
+    SDK -->|3. METADATA topic=T| B1
+    B1 -->|P0=B1, P1=B3, P2=B2| SDK
+    SDK -->|4. CONSUME P0| B1
+    SDK -->|4. CONSUME P1| B3
+    SDK -->|4. CONSUME P2| B2
+```
+
+### Three Connection Types
+
+| Connection | Target | Discovery | Commands |
+|---|---|---|---|
+| Any broker | Any node | Config | `FIND_COORDINATOR`, `METADATA`, `CREATE`, `LIST` |
+| Coordinator | Per-group (consistent hash) | `FIND_COORDINATOR` | `JOIN_GROUP`, `SYNC_GROUP`, `LEAVE_GROUP`, `HEARTBEAT`, `COMMIT_OFFSET`, `FETCH_OFFSET` |
+| Partition leader | Per-partition | `METADATA` | `CONSUME`, `STREAM`, `PUBLISH` |
+
+### Coordinator Pattern (Kafka Model)
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer SDK
+    participant B1 as Broker-1
+    participant B2 as Broker-2 (Coordinator)
+    participant B3 as Broker-3
+
+    C->>B1: FIND_COORDINATOR group=G1
+    B1-->>C: OK host=B2 port=9002
+
+    C->>B2: JOIN_GROUP topic=T group=G1
+    B2-->>C: OK generation=1 assignments=[0,1]
+
+    C->>B2: HEARTBEAT group=G1
+    B2-->>C: OK
+
+    Note over C,B3: If coordinator changes...
+    C->>B2: HEARTBEAT group=G1
+    B2-->>C: ERROR: NOT_COORDINATOR host=B3 port=9003
+    C->>B3: HEARTBEAT group=G1
+    B3-->>C: OK
+```
+
+### Partition Leader Routing
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer SDK
+    participant B1 as Broker-1
+    participant B2 as Broker-2 (P0 Leader)
+    participant B3 as Broker-3 (P1 Leader)
+
+    C->>B1: METADATA topic=T
+    B1-->>C: OK leaders=B2:9002,B3:9003
+
+    C->>B2: CONSUME topic=T partition=0
+    B2-->>C: [messages]
+
+    C->>B3: CONSUME topic=T partition=1
+    B3-->>C: [messages]
+
+    Note over C,B3: If partition leader changes...
+    C->>B2: CONSUME topic=T partition=0
+    B2-->>C: ERROR: NOT_LEADER LEADER_IS B3:9003
+    C->>B3: CONSUME topic=T partition=0
+    B3-->>C: [messages]
+```
+
+### Raft Consensus
+
+Group state changes (JOIN, LEAVE, COMMIT) are persisted via Raft. The coordinator may not be the Raft leader — in that case, `applyViaLeader` forwards the Raft log entry to the leader internally via `RAFT_APPLY`.
+
+```mermaid
+graph LR
+    Coord[Coordinator Broker] -->|applyViaLeader| Leader[Raft Leader]
+    Leader -->|raft.Apply| FSM1[FSM Node 1]
+    Leader -->|replicate| FSM2[FSM Node 2]
+    Leader -->|replicate| FSM3[FSM Node 3]
+```
+
+### Advertised Addresses
+
+Each broker registers its client-facing address (`ClientAddr`) in the FSM on startup. This allows any broker to resolve any other broker's external address for `METADATA`, `FIND_COORDINATOR`, and `NOT_LEADER` responses.
+
+```yaml
+# Docker Compose example
+broker-1:
+  environment:
+    - ADVERTISED_CLIENT_HOST=localhost
+    - ADVERTISED_BROKER_PORT=9001
+```
 

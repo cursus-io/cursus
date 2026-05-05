@@ -26,8 +26,8 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 	if err != nil {
 		return 0, err
 	}
-	if err := ch.checkLeaderOrRedirect(conn); err != nil {
-		if err.Error() == "not leader" {
+	if err := ch.checkPartitionLeaderOrRedirect(conn, cArgs.TopicName, cArgs.PartitionID); err != nil {
+		if err.Error() == "not partition leader" {
 			return 0, nil
 		}
 		return 0, err
@@ -96,42 +96,15 @@ sendBatch:
 }
 
 func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx *ClientContext, batchSize int) ([]types.Message, error) {
-	if cArgs.MemberID == "" {
-		return nil, fmt.Errorf("missing member parameter")
-	}
-
 	_, p, err := ch.getTopicAndPartition(topicName, cArgs.PartitionID)
 	if err != nil {
 		return nil, err
-	}
-
-	currentGen := -1
-	if ch.Coordinator != nil {
-		currentGen = ch.Coordinator.GetGeneration(cArgs.GroupName)
-
-		if err := ch.Coordinator.RecordHeartbeat(cArgs.GroupName, cArgs.MemberID); err != nil {
-			util.Warn("Failed to record heartbeat during consume: %v", err)
-			return nil, fmt.Errorf("heartbeat failed: %w", err)
-		}
-	}
-
-	// Use generation from arguments if provided, otherwise fallback to coordinator
-	if cArgs.Generation != -1 {
-		currentGen = cArgs.Generation
-	}
-
-	if ctx.Generation != currentGen {
-		ctx.OffsetCache = make(map[string]uint64)
-		ctx.Generation = currentGen
-		ctx.MemberID = cArgs.MemberID
-		util.Debug("Generation changed to %d, cache cleared", currentGen)
 	}
 
 	cacheKey := fmt.Sprintf("%s-%d", topicName, cArgs.PartitionID)
 	var currentOffset uint64
 	if cArgs.HasOffset {
 		currentOffset = cArgs.Offset
-		util.Debug("Using explicit offset: %d", currentOffset)
 	} else if cached, ok := ctx.OffsetCache[cacheKey]; ok {
 		currentOffset = cached
 	} else {
@@ -140,11 +113,6 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 			return nil, err
 		}
 		currentOffset = actualOffset
-	}
-
-	if !ch.ValidateOwnership(cArgs.GroupName, cArgs.MemberID, currentGen, cArgs.PartitionID) {
-		util.Debug("Ownership validation failed for topic %s (gen=%d)", topicName, currentGen)
-		return nil, nil // Skip this topic if not owned (allowing regex to continue with other owned topics)
 	}
 
 	messages, err := p.ReadCommitted(currentOffset, batchSize)
@@ -213,8 +181,8 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	}
 	ctx.ConsumerGroup = cArgs.GroupName
 
-	if err := ch.checkLeaderOrRedirect(conn); err != nil {
-		if err.Error() == "not leader" {
+	if err := ch.checkPartitionLeaderOrRedirect(conn, cArgs.TopicName, cArgs.PartitionID); err != nil {
+		if err.Error() == "not partition leader" {
 			return nil
 		}
 		return err
@@ -274,6 +242,25 @@ func (ch *CommandHandler) validateConsumeSyntax(cmd, raw string) string {
 	return STREAM_DATA_SIGNAL
 }
 
+// checkPartitionLeaderOrRedirect checks if this broker is the leader for the given partition.
+// If not, writes a NOT_LEADER redirect with the partition leader's client address.
+func (ch *CommandHandler) checkPartitionLeaderOrRedirect(conn net.Conn, topicName string, partitionID int) error {
+	if !ch.Config.EnabledDistribution || ch.Cluster == nil || ch.Cluster.Router == nil {
+		return nil
+	}
+
+	if ch.Cluster.IsAuthorized(topicName, partitionID) {
+		return nil
+	}
+
+	leaderAddr := ch.resolvePartitionLeaderAddr(topicName, partitionID)
+	errResp := fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", leaderAddr)
+	if err := util.WriteWithLength(conn, []byte(errResp)); err != nil {
+		return fmt.Errorf("failed to send partition leader redirect: %w", err)
+	}
+	return fmt.Errorf("not partition leader")
+}
+
 // checkLeaderOrRedirect checks if this broker is the leader and writes a redirect error if not.
 func (ch *CommandHandler) checkLeaderOrRedirect(conn net.Conn) error {
 	if !ch.Config.EnabledDistribution || ch.Cluster == nil || ch.Cluster.Router == nil {
@@ -291,7 +278,14 @@ func (ch *CommandHandler) checkLeaderOrRedirect(conn net.Conn) error {
 
 	serviceLeader := leaderAddr
 	if host, _, splitErr := net.SplitHostPort(leaderAddr); splitErr == nil {
-		serviceLeader = net.JoinHostPort(host, strconv.Itoa(ch.Config.BrokerPort))
+		if ch.Config.AdvertisedClientHost != "" {
+			host = ch.Config.AdvertisedClientHost
+		}
+		port := ch.Config.BrokerPort
+		if ch.Config.AdvertisedBrokerPort > 0 {
+			port = ch.Config.AdvertisedBrokerPort
+		}
+		serviceLeader = net.JoinHostPort(host, strconv.Itoa(port))
 	}
 
 	errResp := fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", serviceLeader)

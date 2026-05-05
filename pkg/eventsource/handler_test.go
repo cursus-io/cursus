@@ -35,6 +35,7 @@ func (f *fakeStorageHandler) ReadMessages(off uint64, max int) ([]types.Message,
 }
 
 func (f *fakeStorageHandler) GetAbsoluteOffset() uint64 { return f.offset }
+func (f *fakeStorageHandler) GetFlushedOffset() uint64  { return f.offset }
 func (f *fakeStorageHandler) GetLatestOffset() uint64   { return f.offset }
 func (f *fakeStorageHandler) GetSegmentPath(_ uint64) string { return "" }
 
@@ -50,6 +51,10 @@ func (f *fakeStorageHandler) AppendMessage(_ string, _ int, msg *types.Message) 
 
 func (f *fakeStorageHandler) AppendMessageSync(t string, p int, msg *types.Message) (uint64, error) {
 	return f.AppendMessage(t, p, msg)
+}
+
+func (f *fakeStorageHandler) AppendMessageWithOffset(t string, p int, msg *types.Message) error {
+	return nil
 }
 
 func (f *fakeStorageHandler) WriteBatch(_ []types.DiskMessage) error { return nil }

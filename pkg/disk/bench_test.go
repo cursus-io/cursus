@@ -28,12 +28,12 @@ func newBenchDiskHandler(b *testing.B) (*DiskHandler, func()) {
 	}
 	dh, err := NewDiskHandler(cfg, "bench-topic", 0)
 	if err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		b.Fatal(err)
 	}
 	return dh, func() {
-		dh.Close()
-		os.RemoveAll(dir)
+		_ = dh.Close()
+		_ = os.RemoveAll(dir)
 	}
 }
 
