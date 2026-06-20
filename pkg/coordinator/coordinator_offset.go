@@ -168,6 +168,7 @@ func (c *Coordinator) LoadOffsetsFromLog(reader OffsetLogReader) error {
 		for {
 			messages, err := reader.ReadTopicPartition(c.offsetTopic, partition, next, batchSize)
 			if err != nil {
+				util.Warn("Coordinator: error reading offset log partition=%d offset=%d: %v", partition, next, err)
 				break
 			}
 			if len(messages) == 0 {

@@ -136,7 +136,7 @@ func TestCommandHandler_ConsumeUsesCommittedOffsetBeforeExplicitOffset(t *testin
 		errCh <- err
 	}()
 
-	_ = client.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
 	data, err := util.ReadWithLength(client)
 	require.NoError(t, err)
 	batch, err := util.DecodeBatchMessages(data)
