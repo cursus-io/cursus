@@ -22,6 +22,13 @@ func (c *Coordinator) CommitOffset(groupName, topic string, partition int, offse
 		return fmt.Errorf("group '%s' not found", groupName)
 	}
 
+	gm.mu.RLock()
+	if current, ok := gm.getOffsetSafe(topic, partition); ok && offset < current {
+		gm.mu.RUnlock()
+		return fmt.Errorf("offset regression for group=%s topic=%s partition=%d: current=%d attempted=%d", groupName, topic, partition, current, offset)
+	}
+	gm.mu.RUnlock()
+
 	offsetMsg := OffsetCommitMessage{
 		Group:     groupName,
 		Topic:     topic,
@@ -35,7 +42,7 @@ func (c *Coordinator) CommitOffset(groupName, topic string, partition int, offse
 		return fmt.Errorf("failed to marshal offset commit: %w", err)
 	}
 
-	if err := c.topicHandler.Publish(c.offsetTopic, &types.Message{
+	if err := c.publishOffsetMessage(&types.Message{
 		ProducerID: "broker",
 		Payload:    string(payload),
 		Key:        groupName + "-" + topic + "-" + strconv.Itoa(partition),
@@ -44,10 +51,10 @@ func (c *Coordinator) CommitOffset(groupName, topic string, partition int, offse
 	}
 
 	gm.mu.Lock()
-	gm.storeOffset(topic, partition, offset)
+	err = gm.storeOffsetMonotonic(groupName, topic, partition, offset)
 	gm.mu.Unlock()
 
-	return nil
+	return err
 }
 
 func (c *Coordinator) CommitOffsetsBulk(groupName, topic string, offsets []OffsetItem) error {
@@ -59,6 +66,15 @@ func (c *Coordinator) CommitOffsetsBulk(groupName, topic string, offsets []Offse
 	if gm == nil {
 		return fmt.Errorf("group '%s' not found", groupName)
 	}
+
+	gm.mu.RLock()
+	for _, item := range offsets {
+		if current, ok := gm.getOffsetSafe(topic, item.Partition); ok && item.Offset < current {
+			gm.mu.RUnlock()
+			return fmt.Errorf("offset regression for group=%s topic=%s partition=%d: current=%d attempted=%d", groupName, topic, item.Partition, current, item.Offset)
+		}
+	}
+	gm.mu.RUnlock()
 
 	bulkMsg := BulkOffsetMsg{
 		Group:     groupName,
@@ -72,7 +88,7 @@ func (c *Coordinator) CommitOffsetsBulk(groupName, topic string, offsets []Offse
 		return fmt.Errorf("failed to marshal: %w", err)
 	}
 
-	if err := c.topicHandler.Publish(c.offsetTopic, &types.Message{
+	if err := c.publishOffsetMessage(&types.Message{
 		ProducerID: "broker",
 		Payload:    string(payload),
 		Key:        fmt.Sprintf("%s-%s-bulk", groupName, topic),
@@ -81,12 +97,15 @@ func (c *Coordinator) CommitOffsetsBulk(groupName, topic string, offsets []Offse
 	}
 
 	gm.mu.Lock()
+	var firstErr error
 	for _, item := range offsets {
-		gm.storeOffset(topic, item.Partition, item.Offset)
+		if err := gm.storeOffsetMonotonic(groupName, topic, item.Partition, item.Offset); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	gm.mu.Unlock()
 
-	return nil
+	return firstErr
 }
 
 func (c *Coordinator) ApplyOffsetUpdateFromFSM(groupName, topic string, offsets []OffsetItem) error {
@@ -99,9 +118,16 @@ func (c *Coordinator) ApplyOffsetUpdateFromFSM(groupName, topic string, offsets 
 	gm, ok := c.groups[groupName]
 	if !ok {
 		gm = &GroupMetadata{
-			Offsets: make(map[string]map[int]uint64),
+			TopicName: topic,
+			Members:   make(map[string]*MemberMetadata),
+			Offsets:   make(map[string]map[int]uint64),
 		}
 		c.groups[groupName] = gm
+	} else if gm.TopicName == "" {
+		gm.TopicName = topic
+		if gm.Members == nil {
+			gm.Members = make(map[string]*MemberMetadata)
+		}
 	}
 	c.mu.Unlock()
 
@@ -109,15 +135,82 @@ func (c *Coordinator) ApplyOffsetUpdateFromFSM(groupName, topic string, offsets 
 	if gm.Offsets == nil {
 		gm.Offsets = make(map[string]map[int]uint64)
 	}
-	if _, exists := gm.Offsets[topic]; !exists {
-		gm.Offsets[topic] = make(map[int]uint64)
-	}
+	var firstErr error
 	for _, item := range offsets {
-		gm.Offsets[topic][item.Partition] = item.Offset
+		if err := gm.storeOffsetMonotonic(groupName, topic, item.Partition, item.Offset); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	gm.mu.Unlock()
 
+	return firstErr
+}
+
+func (c *Coordinator) publishOffsetMessage(msg *types.Message) error {
+	if sp, ok := c.topicHandler.(syncPublisher); ok {
+		return sp.PublishWithAck(c.offsetTopic, msg)
+	}
+	if err := c.topicHandler.Publish(c.offsetTopic, msg); err != nil {
+		return err
+	}
+	if flusher, ok := c.topicHandler.(interface{ Flush() }); ok {
+		flusher.Flush()
+	}
 	return nil
+}
+
+func (c *Coordinator) LoadOffsetsFromLog(reader OffsetLogReader) error {
+	const batchSize = 1024
+
+	applied := 0
+	for partition := 0; partition < c.offsetTopicPartitionCount; partition++ {
+		next := uint64(0)
+		for {
+			messages, err := reader.ReadTopicPartition(c.offsetTopic, partition, next, batchSize)
+			if err != nil {
+				break
+			}
+			if len(messages) == 0 {
+				break
+			}
+
+			for _, msg := range messages {
+				if err := c.applyOffsetLogPayload(msg.Payload); err != nil {
+					util.Warn("Coordinator: skipping invalid offset log record at partition=%d offset=%d: %v", partition, msg.Offset, err)
+					continue
+				}
+				applied++
+				next = msg.Offset + 1
+			}
+			if len(messages) < batchSize {
+				break
+			}
+		}
+	}
+
+	if applied > 0 {
+		util.Info("Coordinator: loaded %d committed offset records from '%s'", applied, c.offsetTopic)
+	}
+	return nil
+}
+
+func (c *Coordinator) applyOffsetLogPayload(payload string) error {
+	var bulk BulkOffsetMsg
+	if err := json.Unmarshal([]byte(payload), &bulk); err == nil && bulk.Group != "" && bulk.Topic != "" && len(bulk.Offsets) > 0 {
+		return c.ApplyOffsetUpdateFromFSM(bulk.Group, bulk.Topic, bulk.Offsets)
+	}
+
+	var single OffsetCommitMessage
+	if err := json.Unmarshal([]byte(payload), &single); err != nil {
+		return err
+	}
+	if single.Group == "" || single.Topic == "" {
+		return fmt.Errorf("missing group or topic")
+	}
+	return c.ApplyOffsetUpdateFromFSM(single.Group, single.Topic, []OffsetItem{{
+		Partition: single.Partition,
+		Offset:    single.Offset,
+	}})
 }
 
 func (c *Coordinator) GetOffset(groupName, topic string, partition int) (uint64, bool) {
@@ -179,7 +272,10 @@ func (c *Coordinator) ValidateAndCommit(groupName, topic string, partition int, 
 	// Store offset under per-group lock
 	group.mu.Lock()
 	prevOffset, hadPrev := group.getOffsetSafe(topic, partition)
-	group.storeOffset(topic, partition, offset)
+	if err := group.storeOffsetMonotonic(groupName, topic, partition, offset); err != nil {
+		group.mu.Unlock()
+		return err
+	}
 	group.mu.Unlock()
 
 	offsetMsg := OffsetCommitMessage{
@@ -196,7 +292,7 @@ func (c *Coordinator) ValidateAndCommit(groupName, topic string, partition int, 
 		return fmt.Errorf("failed to marshal offset: %w", err)
 	}
 
-	err = c.topicHandler.Publish(c.offsetTopic, &types.Message{
+	err = c.publishOffsetMessage(&types.Message{
 		ProducerID: "broker",
 		Payload:    string(payload),
 		Key:        groupName + "-" + topic + "-" + strconv.Itoa(partition),

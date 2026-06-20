@@ -103,9 +103,7 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 
 	cacheKey := fmt.Sprintf("%s-%d", topicName, cArgs.PartitionID)
 	var currentOffset uint64
-	if cArgs.HasOffset {
-		currentOffset = cArgs.Offset
-	} else if cached, ok := ctx.OffsetCache[cacheKey]; ok {
+	if cached, ok := ctx.OffsetCache[cacheKey]; ok {
 		currentOffset = cached
 	} else {
 		actualOffset, err := ch.resolveOffset(p, topicName, cArgs)

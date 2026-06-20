@@ -32,6 +32,14 @@ type TopicHandler interface {
 	CreateTopic(topic string, partitionCount int, idempotent bool, eventSourcing bool) error
 }
 
+type OffsetLogReader interface {
+	ReadTopicPartition(topic string, partitionID int, offset uint64, max int) ([]types.Message, error)
+}
+
+type syncPublisher interface {
+	PublishWithAck(topic string, msg *types.Message) error
+}
+
 // GroupMetadata holds metadata for a single consumer group.
 type GroupMetadata struct {
 	mu            sync.RWMutex               // Per-group lock for offset operations
@@ -117,6 +125,11 @@ func NewCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandle
 
 	if err := handler.CreateTopic(c.offsetTopic, c.offsetTopicPartitionCount, false, false); err != nil {
 		util.Error("Coordinator: failed to create offset topic '%s': %v", c.offsetTopic, err)
+	}
+	if reader, ok := handler.(OffsetLogReader); ok {
+		if err := c.LoadOffsetsFromLog(reader); err != nil {
+			util.Error("Coordinator: failed to load committed offsets from '%s': %v", c.offsetTopic, err)
+		}
 	}
 	return c
 }
@@ -282,7 +295,7 @@ func (gm *GroupMetadata) getOffsetSafe(topic string, partition int) (uint64, boo
 }
 
 // storeOffset writes an offset into the group's per-group offset map.
-// GUARDED_BY(gm.mu) — caller must hold gm.mu.Lock (exclusive).
+// GUARDED_BY(gm.mu) - caller must hold gm.mu.Lock (exclusive).
 func (gm *GroupMetadata) storeOffset(topic string, partition int, offset uint64) {
 	if gm.Offsets == nil {
 		gm.Offsets = make(map[string]map[int]uint64)
@@ -291,6 +304,17 @@ func (gm *GroupMetadata) storeOffset(topic string, partition int, offset uint64)
 		gm.Offsets[topic] = make(map[int]uint64)
 	}
 	gm.Offsets[topic][partition] = offset
+}
+
+// storeOffsetMonotonic writes an offset only if it does not move the committed
+// position backwards. Equal offsets are idempotent and accepted.
+// GUARDED_BY(gm.mu) — caller must hold gm.mu.Lock (exclusive).
+func (gm *GroupMetadata) storeOffsetMonotonic(groupName, topic string, partition int, offset uint64) error {
+	if current, ok := gm.getOffsetSafe(topic, partition); ok && offset < current {
+		return fmt.Errorf("offset regression for group=%s topic=%s partition=%d: current=%d attempted=%d", groupName, topic, partition, current, offset)
+	}
+	gm.storeOffset(topic, partition, offset)
+	return nil
 }
 
 // ExportState returns a serializable snapshot of all consumer groups.
