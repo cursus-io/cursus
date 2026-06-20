@@ -18,6 +18,19 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 
 	if existing, exists := c.groups[groupName]; exists {
 		currPartitions := len(existing.Partitions)
+		if currPartitions == 0 {
+			partitions := make([]int, partitionCount)
+			for i := 0; i < partitionCount; i++ {
+				partitions[i] = i
+			}
+			existing.TopicName = topicName
+			existing.Partitions = partitions
+			if existing.Members == nil {
+				existing.Members = make(map[string]*MemberMetadata)
+			}
+			c.mu.Unlock()
+			return nil
+		}
 		c.mu.Unlock()
 		if currPartitions != partitionCount {
 			return fmt.Errorf("partition count mismatch (existing: %d, requested: %d)", currPartitions, partitionCount)

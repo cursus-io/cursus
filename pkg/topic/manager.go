@@ -105,6 +105,18 @@ func (tm *TopicManager) GetLastOffset(topicName string, partitionID int) uint64 
 	return p.dh.GetAbsoluteOffset()
 }
 
+func (tm *TopicManager) ReadTopicPartition(topicName string, partitionID int, offset uint64, max int) ([]types.Message, error) {
+	t := tm.GetTopic(topicName)
+	if t == nil {
+		return nil, fmt.Errorf("topic '%s' does not exist", topicName)
+	}
+	p, err := t.GetPartition(partitionID)
+	if err != nil {
+		return nil, err
+	}
+	return p.dh.ReadMessages(offset, max)
+}
+
 // Async (acks=0)
 func (tm *TopicManager) Publish(topicName string, msg *types.Message) error {
 	t := tm.GetTopic(topicName)
