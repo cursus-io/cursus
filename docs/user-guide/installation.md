@@ -112,6 +112,21 @@ The build process is defined in Dockerfile:
 - Sets executable permissions on binaries
 - Configures entrypoint.sh as the entry point
 
+### Pull from GitHub Container Registry
+
+Official Docker images are published to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/cursus-io/cursus:latest
+docker run --rm ghcr.io/cursus-io/cursus:latest --help
+```
+
+Versioned release images are available with release tags:
+
+```bash
+docker pull ghcr.io/cursus-io/cursus:<version>
+```
+
 Building the Docker Image:
 
 ```
