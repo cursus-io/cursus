@@ -266,8 +266,8 @@ drainDone:
 	for _, pid := range assignments {
 		offset, err := c.fetchOffset(pid)
 		if err != nil {
-			LogWarn("Rebalance: offset fetch failed for P%d: %v, starting from 0", pid, err)
-			offset = 0
+			LogError("Rebalance: offset fetch failed for P%d: %v", pid, err)
+			return
 		}
 		c.partitionConsumers[pid] = &PartitionConsumer{
 			partitionID:  pid,
