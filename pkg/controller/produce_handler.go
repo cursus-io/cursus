@@ -19,17 +19,17 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
-		return "ERROR: missing topic parameter"
+		return "ERROR: missing_topic command=PUBLISH"
 	}
 
 	message, ok := args["message"]
 	if !ok || message == "" {
-		return "ERROR: missing message parameter"
+		return "ERROR: missing_message command=PUBLISH"
 	}
 
 	producerID, ok := args["producerId"]
 	if !ok || producerID == "" {
-		return "ERROR: missing producerID parameter"
+		return "ERROR: missing_producer_id command=PUBLISH"
 	}
 
 	acks, ok := args["acks"]
@@ -46,20 +46,20 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 		case "false":
 			isIdempotent = false
 		default:
-			return fmt.Sprintf("ERROR: invalid isIdempotent value: %s. Expected 'true' or 'false'", val)
+			return fmt.Sprintf("ERROR: invalid_is_idempotent value=%s", val)
 		}
 	}
 
 	acksLower := strings.ToLower(acks)
 	if acksLower != "0" && acksLower != "1" && acksLower != "-1" && acksLower != "all" {
-		return fmt.Sprintf("ERROR: invalid acks value: %s. Expected -1 (all), 0, or 1", acks)
+		return fmt.Sprintf("ERROR: invalid_acks value=%s", acks)
 	}
 
 	var seqNum uint64
 	if seqNumStr, ok := args["seqNum"]; ok {
 		seqNum, err = strconv.ParseUint(seqNumStr, 10, 64)
 		if err != nil {
-			return fmt.Sprintf("ERROR: invalid seqNum: %v", err)
+			return fmt.Sprintf("ERROR: invalid_seq_num reason=%q", err.Error())
 		}
 	}
 
@@ -67,7 +67,7 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 	if epochStr, ok := args["epoch"]; ok {
 		epoch, err = strconv.ParseInt(epochStr, 10, 64)
 		if err != nil {
-			return fmt.Sprintf("ERROR: invalid epoch: %v", err)
+			return fmt.Sprintf("ERROR: invalid_epoch reason=%q", err.Error())
 		}
 	}
 
@@ -92,7 +92,7 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 
 		if !found {
 			util.Warn("ch publish: topic '%s' does not exist after retries", topicName)
-			return fmt.Sprintf("ERROR: topic '%s' does not exist", topicName)
+			return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 		}
 	}
 
@@ -113,7 +113,7 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 		p, err := t.GetPartition(partition)
 		if err != nil {
 			util.Error("Publish failed: partition %d not found in topic %s: %v", partition, topicName, err)
-			return fmt.Sprintf("ERROR: PARTITION_NOT_FOUND %d", partition)
+			return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 		}
 
 		effectiveIdempotent := isIdempotent || ch.Config.EnableIdempotence
@@ -204,7 +204,7 @@ Respond:
 	respBytes, err := json.Marshal(ackResp)
 	if err != nil {
 		util.Error("Failed to marshal response: %v", err)
-		return "ERROR: internal marshal error"
+		return "ERROR: marshal_ack_failed"
 	}
 	return string(respBytes)
 }
@@ -213,32 +213,35 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 	// Format: REPLICATE_MESSAGE payload=<json_MessageCommand>
 	idx := strings.Index(cmd, "payload=")
 	if idx == -1 {
-		return "ERROR: missing payload"
+		return "ERROR: missing_payload command=REPLICATE_MESSAGE"
 	}
 
 	payload := cmd[idx+8:]
 	var msgCmd types.MessageCommand
 	if err := json.Unmarshal([]byte(payload), &msgCmd); err != nil {
-		return fmt.Sprintf("ERROR: unmarshal failed: %v", err)
+		return fmt.Sprintf("ERROR: unmarshal_failed reason=%q", err.Error())
 	}
 
 	t := ch.TopicManager.GetTopic(msgCmd.Topic)
 	if t == nil {
-		return fmt.Sprintf("ERROR: topic %s not found", msgCmd.Topic)
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", msgCmd.Topic)
 	}
 
 	p, err := t.GetPartition(msgCmd.Partition)
 	if err != nil {
-		return fmt.Sprintf("ERROR: partition %d not found", msgCmd.Partition)
+		return fmt.Sprintf("ERROR: partition_not_found partition=%d", msgCmd.Partition)
 	}
 
 	// Guard against empty messages to prevent index-out-of-range panic
 	if len(msgCmd.Messages) == 0 {
-		return "ERROR: empty messages in replicate command"
+		return "ERROR: empty_messages command=REPLICATE_MESSAGE"
 	}
 
 	if err := p.ReplicaAppend(msgCmd.Messages); err != nil {
-		return fmt.Sprintf("ERROR: replica append failed: %v", err)
+		return fmt.Sprintf("ERROR: replica_append_failed reason=%q", err.Error())
+	}
+	if err := ch.indexReplicatedEventSourceMessages(msgCmd.Topic, msgCmd.Partition, msgCmd.Messages); err != nil {
+		return fmt.Sprintf("ERROR: replica_index_failed reason=%q", err.Error())
 	}
 
 	return "OK"
@@ -249,7 +252,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 	batch, err := util.DecodeBatchMessages(data)
 	if err != nil {
 		util.Error("Batch message decoding failed: %v", err)
-		return fmt.Sprintf("ERROR: %v", err), nil
+		return fmt.Sprintf("ERROR: batch_decode_failed reason=%q", err.Error()), nil
 	}
 
 	acks := batch.Acks
@@ -259,7 +262,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 
 	acksLower := strings.ToLower(acks)
 	if acksLower != "0" && acksLower != "1" && acksLower != "-1" && acksLower != "all" {
-		return fmt.Sprintf("ERROR: invalid acks value in batch: %s. Expected -1 (all), 0, or 1", acks), nil
+		return fmt.Sprintf("ERROR: invalid_acks value=%s", acks), nil
 	}
 
 	var respAck types.AckResponse
@@ -293,13 +296,13 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 		t := ch.TopicManager.GetTopic(batch.Topic)
 		if t == nil {
 			util.Error("Batch process failed: topic '%s' not found", batch.Topic)
-			return fmt.Sprintf("ERROR: TOPIC_NOT_FOUND %s", batch.Topic), nil
+			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
 		}
 
 		p, err := t.GetPartition(batch.Partition)
 		if err != nil {
 			util.Error("Batch process failed: partition %d not found in topic %s", batch.Partition, batch.Topic)
-			return fmt.Sprintf("ERROR: PARTITION_NOT_FOUND %d", batch.Partition), nil
+			return fmt.Sprintf("ERROR: partition_not_found partition=%d", batch.Partition), nil
 		}
 
 		if len(batch.Messages) == 0 {
@@ -394,7 +397,7 @@ Respond:
 	ackBytes, err := json.Marshal(respAck)
 	if err != nil {
 		util.Error("Failed to marshal AckResponse: %v", err)
-		return "ERROR: internal marshal error", nil
+		return "ERROR: marshal_ack_failed", nil
 	}
 
 	responseStr := string(ackBytes)

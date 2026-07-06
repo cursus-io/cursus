@@ -43,6 +43,7 @@ graph TD
 - **Ordering guarantees**: All messages from a single partition go to the same consumer
 - **Independent consumption**: Multiple consumer groups can consume the same topic independently
 - **Static assignment**: Partition-to-consumer mapping is established at registration time
+- **Durable offset resume**: The broker stores committed next offsets per topic, group, and partition
 
 ## Data Structures
 
@@ -145,9 +146,76 @@ This design enables multiple independent consumer groups to consume the same top
 
 Multiple consumer groups can consume the same topic simultaneously. Each group maintains:
 
-- Independent offset tracking (via direct channel consumption or disk reads)
+- Independent committed offsets for each partition
 - Separate partition-to-consumer mappings
 - Isolated message delivery
+
+## Durable Consumer Group Offsets
+
+Cursus stores consumer group offsets in the broker, keyed by:
+
+```
+(topic, consumerGroup, partition) -> nextOffset
+```
+
+`nextOffset` is the offset the group should read next after processing a record
+or batch. For example, after processing records with offsets `10` through `14`,
+commit `15`.
+
+Offsets are written to the internal `__consumer_offsets` topic. The coordinator
+replays that topic during broker startup, so committed offsets survive broker
+restart. In distributed mode, offset updates also flow through the Raft FSM and
+are included in FSM snapshots.
+
+### Commit and Resume Contract
+
+Use these broker commands:
+
+```
+FETCH_OFFSET topic=<topic> group=<group> partition=<partition>
+COMMIT_OFFSET topic=<topic> group=<group> partition=<partition> offset=<nextOffset>
+BATCH_COMMIT topic=<topic> group=<group> member=<member> generation=<N> P0:<nextOffset>,P1:<nextOffset>
+```
+
+If no offset has been committed for the key, `FETCH_OFFSET` returns `OK offset=0`. This is
+the default earliest policy. A consumer may request `autoOffsetReset=latest` on
+`CONSUME`/`STREAM` for groups with no saved offset when it wants to skip retained
+history.
+
+When a committed offset exists, `CONSUME` and `STREAM` resume from that offset.
+Retained records before the committed offset are not delivered again to the same
+group/partition, even if the request includes a lower explicit `offset=`.
+
+Commits are monotonic. A commit lower than the current offset is rejected and the
+stored offset is left unchanged. Recommitting the same offset is idempotent.
+
+### Recommended Commit Timing
+
+For at-least-once delivery, process the records first, then commit
+`lastProcessedOffset + 1`. If the process crashes after handling a record but
+before committing, the record may be delivered again after restart.
+
+Committing before processing gives at-most-once behavior for that client: a crash
+after the commit can skip unprocessed records. Cursus does not provide
+exactly-once processing guarantees; make downstream game state updates
+idempotent if duplicate delivery must be harmless.
+
+### Game Server Example
+
+A server such as wargame-IOCP should use Cursus as the source of truth for group
+offsets:
+
+```
+JOIN_GROUP topic=match-events group=wargame-iocp member=game-01
+SYNC_GROUP topic=match-events group=wargame-iocp member=<assigned-member-id>
+FETCH_OFFSET topic=match-events partition=0 group=wargame-iocp
+CONSUME topic=match-events partition=0 offset=0 group=wargame-iocp member=<assigned-member-id> batch=128
+COMMIT_OFFSET topic=match-events partition=0 group=wargame-iocp offset=<lastProcessedOffset+1>
+```
+
+After this migration, the game server should not need an external
+`cursus_consumer_offsets` table for resume. Different game server groups can use
+different group names and will receive independent offsets.
 
 ## Concurrency and Thread Safety
 
@@ -182,12 +250,12 @@ The locking hierarchy ensures:
 | Rebalancing              | Not supported (static assignment)               |
 | Consumer failure         | Channel blocks, may lead to backpressure        |
 | Buffer overflow          | Goroutine blocks if consumer channel full       |
+| Offset storage           | Durable per topic/group/partition next offset   |
 
 ### Limitations
 
 - **Static assignment**: Consumers cannot be added/removed without re-registration
 - **No automatic rebalancing**: Partition distribution doesn't adjust to consumer changes
-- **No offset management**: Applications must track their own offsets for disk reads
 - **Channel-based only**: Active consumption through channels, no pull-based API in this layer
 
 ## Consumer Group Lifecycle

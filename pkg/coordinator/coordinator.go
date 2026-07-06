@@ -68,6 +68,7 @@ type GroupStateSnapshot struct {
 
 // GroupStatus represents the status of a consumer group
 type GroupStatus struct {
+	Status         string       `json:"status,omitempty"`
 	GroupName      string       `json:"group_name"`
 	TopicName      string       `json:"topic_name"`
 	State          string       `json:"state"` // "Stable", "Rebalancing", "Dead"

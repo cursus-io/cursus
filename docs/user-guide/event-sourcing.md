@@ -29,7 +29,7 @@ CREATE topic=orders partitions=4 event_sourcing=true
 Response:
 
 ```
-Topic 'orders' now has 4 partitions
+OK topic=orders partitions=4
 ```
 
 The `event_sourcing=true` flag tells the broker to maintain a per-partition stream index for aggregate-level version tracking.
@@ -69,7 +69,7 @@ STREAM_VERSION topic=orders key=order-123
 Response:
 
 ```
-2
+OK version=2
 ```
 
 Returns `0` if the aggregate does not exist.
@@ -178,19 +178,16 @@ Constraints:
 READ_SNAPSHOT topic=orders key=order-123
 ```
 
-Response (JSON):
+Response:
 
-```json
-{
-  "version": 3,
-  "payload": "{\"customer\":\"alice\",\"items\":[...],\"total\":69.97,\"status\":\"shipped\"}"
-}
+```text
+OK snapshot={"version":3,"payload":"{\"customer\":\"alice\",\"items\":[...],\"total\":69.97,\"status\":\"shipped\"}"}
 ```
 
 If no snapshot exists, the response is:
 
-```
-NULL
+```text
+OK snapshot=null
 ```
 
 ### Automatic Use in READ_STREAM
@@ -235,6 +232,47 @@ In distributed mode, snapshots are stored locally on each node. They are not rep
 
 ---
 
+## Distributed Event Sourcing
+
+Event-sourcing topics use the same partition leadership and replication model as normal Cursus topics. The aggregate `key` determines the partition, and the partition leader is the authority for append ordering and optimistic concurrency.
+
+### Write Path
+
+In distributed mode, `APPEND_STREAM` is routed to the leader for the aggregate partition. The leader:
+
+1. checks the current aggregate version in the stream index,
+2. appends the event to the partition log with the next aggregate version,
+3. replicates the assigned message to followers,
+4. indexes the event only after the append/replication path succeeds, and
+5. returns `OK version=<N> offset=<N> partition=<N>`.
+
+Followers index replicated event-sourcing messages as they arrive, preserving the leader-assigned offset and aggregate version. If a follower restarts or loses its local stream index files, it rebuilds the stream index from the committed partition log before answering stream commands.
+
+### Read Path
+
+`READ_STREAM`, `STREAM_VERSION`, `SAVE_SNAPSHOT`, and `READ_SNAPSHOT` are partition-routed commands. In distributed mode, clients should send them to the leader for the aggregate partition. A non-leader broker returns a leader redirect:
+
+```text
+ERROR: NOT_LEADER LEADER_IS <host:port>
+```
+
+SDKs should reconnect to the advertised leader and retry the command. `READ_STREAM` reads from the committed log, so it does not expose uncommitted leader-local events.
+
+### Snapshots and Retention
+
+Snapshots are local performance hints. They are not replicated between brokers, and correctness must not depend on a snapshot being present after failover. A new leader or restarted broker can rebuild stream state from the committed event log and replay from version 1 when no snapshot is available.
+
+Because event sourcing relies on replay, retention must be configured carefully. If old event records are deleted before a durable snapshot/export strategy exists for the aggregate, a broker can no longer rebuild the full stream history from version 1. For event-sourcing topics, prefer retention settings that preserve the event log for as long as the domain requires replay.
+
+### Guarantees
+
+- Append ordering is linearizable per aggregate key on the partition leader.
+- Optimistic concurrency is enforced by requiring `version = currentVersion + 1`.
+- Replicated followers maintain their own stream index from the replicated log.
+- Reads return committed events only.
+- Exactly-once side effects are not provided by the broker; projection handlers should remain idempotent.
+
+---
 ## Schema Evolution
 
 Events are immutable. Once written, their payload never changes. Schema evolution is handled at read time by the client application.
@@ -334,8 +372,8 @@ Error responses:
 
 ```
 ERROR: version_conflict current=<N> expected=<N>
-ERROR: topic '<name>' does not exist
-ERROR: topic '<name>' is not event-sourcing enabled
+ERROR: topic_not_found topic=<name>
+ERROR: event_sourcing_not_enabled topic=<name>
 ```
 
 ### READ_STREAM
@@ -381,7 +419,7 @@ STREAM_VERSION topic=<name> key=<aggregate_key>
 | topic | Yes | - | Topic name |
 | key | Yes | - | Aggregate ID |
 
-Response: Plain integer (e.g., `3`). Returns `0` if the aggregate does not exist.
+Response: `OK version=<N>` (for example, `OK version=3`). Returns `OK version=0` if the aggregate does not exist.
 
 ### SAVE_SNAPSHOT
 
@@ -407,8 +445,8 @@ OK version=<N> partition=<N>
 Error responses:
 
 ```
-ERROR: snapshot version <N> exceeds stream version <N>
-ERROR: topic '<name>' does not exist
+ERROR: snapshot_version_exceeds_stream version=<N> current=<N>
+ERROR: topic_not_found topic=<name>
 ```
 
 ### READ_SNAPSHOT
@@ -424,16 +462,16 @@ READ_SNAPSHOT topic=<name> key=<aggregate_key>
 | topic | Yes | - | Topic name |
 | key | Yes | - | Aggregate ID |
 
-Success response (JSON):
+Success response:
 
-```json
-{"version": 500, "payload": "..."}
+```text
+OK snapshot={"version":500,"payload":"..."}
 ```
 
 Not found response:
 
-```
-NULL
+```text
+OK snapshot=null
 ```
 
 ---

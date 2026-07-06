@@ -149,8 +149,12 @@ func (p *Publisher) CreateTopic(topic string, partitions int) error {
 		return fmt.Errorf("read response: %w", err)
 	}
 
-	if strings.Contains(string(resp), "ERROR:") {
-		return fmt.Errorf("broker error: %s", string(resp))
+	respStr := strings.TrimSpace(string(resp))
+	if strings.HasPrefix(respStr, "ERROR:") {
+		return fmt.Errorf("broker error: %s", respStr)
+	}
+	if !strings.HasPrefix(respStr, "OK") {
+		return fmt.Errorf("unexpected create response: %s", respStr)
 	}
 
 	util.Info("create topic %s partition %d", topic, partitions)

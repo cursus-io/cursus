@@ -25,28 +25,13 @@ var (
 
 // handleHelp processes HELP command
 func (ch *CommandHandler) handleHelp() string {
-	return `Available commands:
-CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] - create topic (default partitions=4, idempotent=false)
-DELETE topic=<name> - delete topic
-LIST - list all topics
-PUBLISH topic=<name> acks=<0|1> message=<text> producerId=<id> [seqNum=<N> epoch=<N>] [isIdempotent=<true|false>] - publish message
-CONSUME topic=<name> partition=<N> offset=<N> group=<name> [autoOffsetReset=<earliest|latest>] - consume messages
-JOIN_GROUP topic=<name> group=<name> member=<id> - join consumer group
-SYNC_GROUP topic=<name> group=<name> member=<id> generation=<N> - sync group assignments
-LEAVE_GROUP group=<name> member=<id> - leave consumer group
-HEARTBEAT topic=<name> group=<name> member=<id> - send heartbeat
-COMMIT_OFFSET topic=<name> partition=<N> group=<name> offset=<N> - commit offset
-FETCH_OFFSET topic=<name> partition=<N> group=<name> - fetch committed offset
-REGISTER_GROUP topic=<name> group=<name> - register consumer group
-GROUP_STATUS group=<name> - get group status
-DESCRIBE topic=<name> - get topic/partition metadata (leader, ISR, offsets)
-APPEND_STREAM topic=<name> key=<aggregate_key> version=<N> event_type=<type> message=<payload> - append event to stream
-READ_STREAM topic=<name> key=<aggregate_key> [from_version=<N>] - read events from stream (binary response)
-SAVE_SNAPSHOT topic=<name> key=<aggregate_key> version=<N> message=<json_payload> - save aggregate snapshot
-READ_SNAPSHOT topic=<name> key=<aggregate_key> - read latest snapshot
-STREAM_VERSION topic=<name> key=<aggregate_key> - get current stream version
-HELP - show this help
-EXIT - exit`
+	commands := []string{
+		"CREATE", "DELETE", "LIST", "PUBLISH", "CONSUME", "JOIN_GROUP", "SYNC_GROUP",
+		"LEAVE_GROUP", "HEARTBEAT", "COMMIT_OFFSET", "FETCH_OFFSET", "REGISTER_GROUP",
+		"GROUP_STATUS", "DESCRIBE", "APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT",
+		"READ_SNAPSHOT", "STREAM_VERSION", "METADATA", "FIND_COORDINATOR", "HELP", "EXIT",
+	}
+	return fmt.Sprintf("OK commands=%s", strings.Join(commands, ","))
 }
 
 // handleCreate processes CREATE command
@@ -54,14 +39,14 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 	args := parseKeyValueArgs(cmd[7:])
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
-		return "missing topic parameter. Expected: CREATE topic=<name> [partitions=<N>]"
+		return "ERROR: missing_topic expected=\"CREATE topic=<name> [partitions=<N>]\""
 	}
 
 	partitions := 4 // default
 	if partStr, ok := args["partitions"]; ok {
 		n, err := strconv.Atoi(partStr)
 		if err != nil || n <= 0 {
-			return "partitions must be a positive integer"
+			return "ERROR: invalid_partitions reason=\"must be a positive integer\""
 		}
 		partitions = n
 	}
@@ -80,7 +65,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 	if rfStr, ok := args["replication_factor"]; ok {
 		n, err := strconv.Atoi(rfStr)
 		if err != nil || n <= 0 {
-			return "replication_factor must be a positive integer"
+			return "ERROR: invalid_replication_factor reason=\"must be a positive integer\""
 		}
 		replicationFactor = n
 	}
@@ -100,17 +85,17 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 		}
 		_, err := ch.applyAndWait("TOPIC", payload)
 		if err != nil {
-			return fmt.Sprintf("❌ Failed to create topic: %v", err)
+			return fmt.Sprintf("ERROR: create_topic_failed reason=%q", err.Error())
 		}
 	} else {
 		if err := tm.CreateTopic(topicName, partitions, idempotent, eventSourcing); err != nil {
-			return fmt.Sprintf("ERROR: failed to create topic '%s': %v", topicName, err)
+			return fmt.Sprintf("ERROR: create_topic_failed topic=%s reason=%q", topicName, err.Error())
 		}
 	}
 
 	t := tm.GetTopic(topicName)
 	if t == nil {
-		return fmt.Sprintf("ERROR: topic '%s' was not created", topicName)
+		return fmt.Sprintf("ERROR: topic_create_missing topic=%s", topicName)
 	}
 
 	if ch.Coordinator != nil {
@@ -119,7 +104,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			util.Warn("Failed to register default group with coordinator: %v", err)
 		}
 	}
-	return fmt.Sprintf("Topic '%s' now has %d partitions", topicName, len(t.Partitions))
+	return fmt.Sprintf("OK topic=%s partitions=%d", topicName, len(t.Partitions))
 }
 
 // handleDelete processes DELETE command
@@ -127,7 +112,7 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 	args := parseKeyValueArgs(cmd[7:])
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
-		return "missing topic parameter. Expected: DELETE topic=<name>"
+		return "ERROR: missing_topic expected=\"DELETE topic=<name>\""
 	}
 
 	if ch.isDistributed() {
@@ -141,15 +126,15 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 
 		_, err := ch.applyAndWait("TOPIC_DELETE", payload)
 		if err != nil {
-			return fmt.Sprintf("❌ ERROR: %v", err)
+			return fmt.Sprintf("ERROR: delete_topic_failed reason=%q", err.Error())
 		}
-		return fmt.Sprintf("🗑️ Topic '%s' deleted across cluster", topicName)
+		return fmt.Sprintf("OK topic=%s deleted=true", topicName)
 	}
 
 	if ch.TopicManager.DeleteTopic(topicName) {
-		return fmt.Sprintf("🗑️ Topic '%s' deleted", topicName)
+		return fmt.Sprintf("OK topic=%s deleted=true", topicName)
 	}
-	return fmt.Sprintf("topic '%s' not found", topicName)
+	return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 }
 
 // handleList processes LIST command
@@ -162,10 +147,7 @@ func (ch *CommandHandler) handleList() string {
 
 	tm := ch.TopicManager
 	names := tm.ListTopics()
-	if len(names) == 0 {
-		return "(no topics)"
-	}
-	return strings.Join(names, ", ")
+	return fmt.Sprintf("OK count=%d topics=%s", len(names), strings.Join(names, ","))
 }
 
 // handleListCluster processes LIST_CLUSTER command
@@ -173,17 +155,17 @@ func (ch *CommandHandler) handleListCluster() string {
 	if ch.isDistributed() {
 		fsm := ch.Cluster.RaftManager.GetFSM()
 		if fsm == nil {
-			return "ERROR: FSM not available"
+			return "ERROR: fsm_not_available"
 		}
 
 		brokers := fsm.GetBrokers()
 		data, err := json.Marshal(brokers)
 		if err != nil {
-			return fmt.Sprintf("ERROR: failed to marshal brokers: %v", err)
+			return fmt.Sprintf("ERROR: marshal_brokers_failed reason=%q", err.Error())
 		}
-		return string(data)
+		return fmt.Sprintf("OK brokers=%s", string(data))
 	}
-	return "ERROR: distribution not enabled"
+	return "ERROR: distribution_not_enabled"
 }
 
 // handleRegisterGroup processes REGISTER_GROUP command
@@ -191,26 +173,26 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string) string {
 	args := parseKeyValueArgs(cmd[15:])
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
-		return "REGISTER_GROUP requires topic parameter"
+		return "ERROR: missing_topic command=REGISTER_GROUP"
 	}
 	groupName, ok := args["group"]
 	if !ok || groupName == "" {
-		return "REGISTER_GROUP requires group parameter"
+		return "ERROR: missing_group command=REGISTER_GROUP"
 	}
 
 	t := ch.TopicManager.GetTopic(topicName)
 	if t == nil {
 		util.Warn("ch registerGroup: topic '%s' does not exist", topicName)
-		return fmt.Sprintf("topic '%s' does not exist", topicName)
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
 
 	if ch.Coordinator != nil {
 		if err := ch.Coordinator.RegisterGroup(topicName, groupName, len(t.Partitions)); err != nil {
-			return fmt.Sprintf("ERROR: %v", err)
+			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 		}
-		return fmt.Sprintf("✅ Group '%s' registered for topic '%s'", groupName, topicName)
+		return fmt.Sprintf("OK group=%s topic=%s", groupName, topicName)
 	}
-	return "coordinator not available"
+	return "ERROR: coordinator_not_available"
 }
 
 // handleJoinGroup processes JOIN_GROUP command
@@ -219,15 +201,15 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
-		return "JOIN_GROUP requires topic parameter"
+		return "ERROR: missing_topic command=JOIN_GROUP"
 	}
 	groupName, ok := args["group"]
 	if !ok || groupName == "" {
-		return "JOIN_GROUP requires group parameter"
+		return "ERROR: missing_group command=JOIN_GROUP"
 	}
 	consumerID, ok := args["member"]
 	if !ok || consumerID == "" {
-		return "JOIN_GROUP requires member parameter"
+		return "ERROR: missing_member command=JOIN_GROUP"
 	}
 
 	n, err := rand.Int(rand.Reader, big.NewInt(10000))
@@ -256,7 +238,7 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 
 		_, err := ch.applyViaLeader("GROUP_SYNC", joinPayload)
 		if err != nil {
-			return fmt.Sprintf("ERROR: %v", err)
+			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 		}
 
 		// Wait briefly for Raft to propagate to local FSM
@@ -272,12 +254,12 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 			if ch.Coordinator.GetGroup(groupName) == nil {
 				topic := ch.TopicManager.GetTopic(topicName)
 				if topic == nil {
-					return fmt.Sprintf("topic '%s' not found", topicName)
+					return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 				}
 
 				err := ch.Coordinator.RegisterGroup(topicName, groupName, len(topic.Partitions))
 				if err != nil {
-					return fmt.Sprintf("failed to register group: %v", err)
+					return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 				}
 			}
 
@@ -286,7 +268,7 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 				util.Error("failed to join %s: %v", groupName, err)
 			}
 		} else {
-			return "coordinator not available"
+			return "ERROR: coordinator_not_available"
 		}
 	}
 
@@ -302,19 +284,19 @@ func (ch *CommandHandler) handleSyncGroup(cmd string) string {
 
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
-		return "SYNC_GROUP requires topic parameter"
+		return "ERROR: missing_topic command=SYNC_GROUP"
 	}
 	groupName, ok := args["group"]
 	if !ok || groupName == "" {
-		return "SYNC_GROUP requires group parameter"
+		return "ERROR: missing_group command=SYNC_GROUP"
 	}
 	memberID, ok := args["member"]
 	if !ok || memberID == "" {
-		return "SYNC_GROUP requires member parameter"
+		return "ERROR: missing_member command=SYNC_GROUP"
 	}
 
 	if ch.Coordinator == nil {
-		return "coordinator not available"
+		return "ERROR: coordinator_not_available"
 	}
 
 	if ch.isDistributed() {
@@ -326,7 +308,7 @@ func (ch *CommandHandler) handleSyncGroup(cmd string) string {
 
 	assignments := ch.Coordinator.GetMemberAssignments(groupName, memberID)
 	if assignments == nil {
-		return fmt.Sprintf("member %s not found in group or no assignments", memberID)
+		return fmt.Sprintf("ERROR: member_not_found member=%s group=%s", memberID, groupName)
 	}
 	return fmt.Sprintf("OK assignments=%v", assignments)
 }
@@ -337,15 +319,15 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
-		return "LEAVE_GROUP requires topic parameter"
+		return "ERROR: missing_topic command=LEAVE_GROUP"
 	}
 	groupName, ok := args["group"]
 	if !ok || groupName == "" {
-		return "LEAVE_GROUP requires group parameter"
+		return "ERROR: missing_group command=LEAVE_GROUP"
 	}
 	consumerID, ok := args["member"]
 	if !ok || consumerID == "" {
-		return "LEAVE_GROUP requires member parameter"
+		return "ERROR: missing_member command=LEAVE_GROUP"
 	}
 
 	if ch.isDistributed() {
@@ -362,16 +344,16 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 
 		_, err := ch.applyViaLeader("GROUP_SYNC", payload)
 		if err != nil {
-			return fmt.Sprintf("ERROR: %v", err)
+			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 		}
 	} else {
 		if ch.Coordinator != nil {
 			if err := ch.Coordinator.RemoveConsumer(groupName, consumerID); err != nil {
-				return fmt.Sprintf("ERROR: %v", err)
+				return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 			}
 		}
 	}
-	return fmt.Sprintf("✅ Left group '%s'", groupName)
+	return fmt.Sprintf("OK group=%s member=%s left=true", groupName, consumerID)
 }
 
 // handleFetchOffset processes FETCH_OFFSET command
@@ -380,19 +362,19 @@ func (ch *CommandHandler) handleFetchOffset(cmd string) string {
 
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
-		return "FETCH_OFFSET requires topic parameter"
+		return "ERROR: missing_topic command=FETCH_OFFSET"
 	}
 	partitionStr, ok := args["partition"]
 	if !ok || partitionStr == "" {
-		return "FETCH_OFFSET requires partition parameter"
+		return "ERROR: missing_partition command=FETCH_OFFSET"
 	}
 	partition, err := strconv.Atoi(partitionStr)
 	if err != nil {
-		return "invalid partition"
+		return "ERROR: invalid_partition"
 	}
 	groupName, ok := args["group"]
 	if !ok || groupName == "" {
-		return "FETCH_OFFSET requires group parameter"
+		return "ERROR: missing_group command=FETCH_OFFSET"
 	}
 
 	if ch.isDistributed() {
@@ -403,24 +385,24 @@ func (ch *CommandHandler) handleFetchOffset(cmd string) string {
 	}
 
 	if ch.Coordinator == nil {
-		return "offset manager not available"
+		return "ERROR: offset_manager_not_available"
 	}
 
 	group := ch.Coordinator.GetGroup(groupName)
 	if group == nil {
-		return fmt.Sprintf("ERROR group_not_found: %s", groupName)
+		return fmt.Sprintf("ERROR: group_not_found group=%s", groupName)
 	}
 
 	if !isTopicMatched(topicName, group.TopicName) {
-		return fmt.Sprintf("ERROR topic_not_assigned_to_group: %s %s", group.TopicName, topicName)
+		return fmt.Sprintf("ERROR: topic_not_assigned_to_group expected=%s actual=%s", group.TopicName, topicName)
 	}
 
 	offset, isFind := ch.Coordinator.GetOffset(groupName, topicName, partition)
 	if !isFind {
-		return "0"
+		return "OK offset=0"
 	}
 
-	return fmt.Sprintf("%d", offset)
+	return fmt.Sprintf("OK offset=%d", offset)
 }
 
 // handleGroupStatus processes GROUP_STATUS command
@@ -428,11 +410,11 @@ func (ch *CommandHandler) handleGroupStatus(cmd string) string {
 	args := parseKeyValueArgs(cmd[13:])
 	groupName, ok := args["group"]
 	if !ok || groupName == "" {
-		return "GROUP_STATUS requires group parameter"
+		return "ERROR: missing_group command=GROUP_STATUS"
 	}
 
 	if ch.Coordinator == nil {
-		return "coordinator not available"
+		return "ERROR: coordinator_not_available"
 	}
 
 	if ch.isDistributed() {
@@ -444,12 +426,14 @@ func (ch *CommandHandler) handleGroupStatus(cmd string) string {
 
 	status, err := ch.Coordinator.GetGroupStatus(groupName)
 	if err != nil {
-		return fmt.Sprintf("ERROR: %v", err)
+		return fmt.Sprintf("ERROR: group_status_failed reason=%q", err.Error())
 	}
+
+	status.Status = "OK"
 
 	statusJSON, err := json.Marshal(status)
 	if err != nil {
-		return fmt.Sprintf("failed to marshal status: %v", err)
+		return fmt.Sprintf("ERROR: marshal_status_failed reason=%q", err.Error())
 	}
 	return string(statusJSON)
 }
@@ -460,15 +444,15 @@ func (ch *CommandHandler) handleHeartbeat(cmd string) string {
 
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
-		return "HEARTBEAT requires topic parameter"
+		return "ERROR: missing_topic command=HEARTBEAT"
 	}
 	groupName, ok := args["group"]
 	if !ok || groupName == "" {
-		return "HEARTBEAT requires group parameter"
+		return "ERROR: missing_group command=HEARTBEAT"
 	}
 	consumerID, ok := args["member"]
 	if !ok || consumerID == "" {
-		return "HEARTBEAT requires member parameter"
+		return "ERROR: missing_member command=HEARTBEAT"
 	}
 
 	if ch.isDistributed() {
@@ -481,12 +465,12 @@ func (ch *CommandHandler) handleHeartbeat(cmd string) string {
 	if ch.Coordinator != nil {
 		err := ch.Coordinator.RecordHeartbeat(groupName, consumerID)
 		if err != nil {
-			return fmt.Sprintf("ERROR: %v", err)
+			return fmt.Sprintf("ERROR: heartbeat_failed reason=%q", err.Error())
 		} else {
 			return "OK"
 		}
 	} else {
-		return "coordinator not available"
+		return "ERROR: coordinator_not_available"
 	}
 }
 
@@ -496,27 +480,27 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
-		return "COMMIT_OFFSET requires topic parameter"
+		return "ERROR: missing_topic command=COMMIT_OFFSET"
 	}
 	partitionStr, ok := args["partition"]
 	if !ok || partitionStr == "" {
-		return "COMMIT_OFFSET requires partition parameter"
+		return "ERROR: missing_partition command=COMMIT_OFFSET"
 	}
 	partition, err := strconv.Atoi(partitionStr)
 	if err != nil {
-		return "invalid partition"
+		return "ERROR: invalid_partition"
 	}
 	groupID, ok := args["group"]
 	if !ok || groupID == "" {
-		return "COMMIT_OFFSET requires groupID parameter"
+		return "ERROR: missing_group command=COMMIT_OFFSET"
 	}
 	offsetStr, ok := args["offset"]
 	if !ok || offsetStr == "" {
-		return "COMMIT_OFFSET requires offset parameter"
+		return "ERROR: missing_offset command=COMMIT_OFFSET"
 	}
 	offset, err := strconv.ParseUint(offsetStr, 10, 64)
 	if err != nil {
-		return "invalid offset"
+		return "ERROR: invalid_offset"
 	}
 
 	if ch.isDistributed() {
@@ -534,7 +518,7 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 		}
 		_, err := ch.applyViaLeader("OFFSET_SYNC", payload)
 		if err != nil {
-			return fmt.Sprintf("ERROR: Offset sync failed: %v", err)
+			return fmt.Sprintf("ERROR: offset_sync_failed reason=%q", err.Error())
 		}
 		return "OK"
 	}
@@ -542,17 +526,17 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	if ch.Coordinator != nil {
 		group := ch.Coordinator.GetGroup(groupID)
 		if group != nil && !isTopicMatched(group.TopicName, topicName) {
-			return fmt.Sprintf("ERROR topic_not_assigned_to_group: %s %s", group.TopicName, topicName)
+			return fmt.Sprintf("ERROR: topic_not_assigned_to_group expected=%s actual=%s", group.TopicName, topicName)
 		}
 
 		err := ch.Coordinator.CommitOffset(groupID, topicName, partition, offset)
 		if err != nil {
-			return fmt.Sprintf("ERROR: %v", err)
+			return fmt.Sprintf("ERROR: commit_offset_failed reason=%q", err.Error())
 		}
 		ch.recordConsumerLag(topicName, partition, offset, groupID)
 		return "OK"
 	}
-	return "offset manager not available"
+	return "ERROR: offset_manager_not_available"
 }
 
 // handleBatchCommit processes BATCH_COMMIT topic=T1 group=G1 generation=1 member=M1 P0:10,P1:20...
@@ -574,7 +558,7 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 	// P0:10,P1:20...
 	partsIdx := strings.LastIndex(cmd, " ")
 	if partsIdx == -1 {
-		return "invalid batch commit format"
+		return "ERROR: invalid_batch_commit_format"
 	}
 
 	partitionData := cmd[partsIdx+1:]
@@ -623,13 +607,15 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 		_, err := ch.applyViaLeader("BATCH_OFFSET", batchCommitData)
 		if err != nil {
 			util.Error("Raft batch apply failed: %v", err)
-			return fmt.Sprintf("ERROR: Raft batch apply failed: %v", err)
+			return fmt.Sprintf("ERROR: raft_batch_apply_failed reason=%q", err.Error())
 		}
 	} else if ch.Coordinator != nil {
 		err := ch.Coordinator.CommitOffsetsBulk(groupID, topicName, offsetList)
 		if err != nil {
-			return fmt.Sprintf("bulk commit failed: %v", err)
+			return fmt.Sprintf("ERROR: bulk_commit_failed reason=%q", err.Error())
 		}
+	} else {
+		return "ERROR: offset_manager_not_available"
 	}
 
 	for _, item := range offsetList {
@@ -733,7 +719,7 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 	args := parseKeyValueArgs(cmd[9:])
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
-		return "missing topic parameter. Expected: DESCRIBE topic=<name>"
+		return "ERROR: missing_topic expected=\"DESCRIBE topic=<name>\""
 	}
 
 	if ch.isDistributed() {
@@ -744,7 +730,7 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 
 	t := ch.TopicManager.GetTopic(topicName)
 	if t == nil {
-		return fmt.Sprintf("topic '%s' not found", topicName)
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
 
 	type PartitionMetadata struct {
@@ -757,12 +743,14 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 	}
 
 	type TopicMetadata struct {
+		Status     string              `json:"status"`
 		Topic      string              `json:"topic"`
 		Partitions []PartitionMetadata `json:"partitions"`
 	}
 
 	meta := TopicMetadata{
-		Topic: topicName,
+		Status: "OK",
+		Topic:  topicName,
 	}
 
 	var raftLeader string
@@ -803,7 +791,7 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 
 	respJSON, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
-		return fmt.Sprintf("failed to marshal metadata: %v", err)
+		return fmt.Sprintf("ERROR: marshal_metadata_failed reason=%q", err.Error())
 	}
 	return string(respJSON)
 }
@@ -812,12 +800,12 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 	args := parseKeyValueArgs(cmd[9:]) // len("METADATA ") = 9
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
-		return "ERROR: METADATA requires topic parameter"
+		return "ERROR: missing_topic command=METADATA"
 	}
 
 	t := ch.TopicManager.GetTopic(topicName)
 	if t == nil {
-		return fmt.Sprintf("ERROR: topic '%s' does not exist", topicName)
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
 
 	partitionCount := len(t.Partitions)
@@ -845,7 +833,7 @@ func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 	args := parseKeyValueArgs(cmd[17:]) // len("FIND_COORDINATOR ") = 17
 	groupName, ok := args["group"]
 	if !ok || groupName == "" {
-		return "ERROR: FIND_COORDINATOR requires group parameter"
+		return "ERROR: missing_group command=FIND_COORDINATOR"
 	}
 
 	host := "localhost"
@@ -854,7 +842,7 @@ func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 	if ch.isDistributed() {
 		coordID, _, err := ch.Cluster.Router.FindCoordinator(groupName)
 		if err != nil {
-			return fmt.Sprintf("ERROR: %v", err)
+			return fmt.Sprintf("ERROR: find_coordinator_failed reason=%q", err.Error())
 		}
 
 		if coordID == ch.Cluster.Router.BrokerID() {
@@ -871,7 +859,7 @@ func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 		encodedCmd := util.EncodeMessage("", cmd)
 		resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(groupName, string(encodedCmd))
 		if fwdErr != nil {
-			return fmt.Sprintf("ERROR: %v", fwdErr)
+			return fmt.Sprintf("ERROR: forward_to_coordinator_failed reason=%q", fwdErr.Error())
 		}
 		return resp
 	}

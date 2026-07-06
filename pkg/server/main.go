@@ -366,7 +366,7 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 			return handleCommandMessage(rawInput, cmdHandler, ctx, conn)
 		}
 		util.Error("⚠️ Decode error and not a raw command: %v [%s]", err, string(data))
-		writeResponse(conn, fmt.Sprintf("ERROR: decode failed: %v", err))
+		writeResponse(conn, fmt.Sprintf("ERROR: decode_failed reason=%q", err.Error()))
 		return false, nil
 	}
 
@@ -391,13 +391,13 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 
 	rawInput := strings.TrimSpace(string(data))
 	util.Debug("[%s] Received unrecognized input: %s", conn.RemoteAddr().String(), rawInput)
-	writeResponse(conn, "ERROR: malformed input - missing topic or payload")
+	writeResponse(conn, "ERROR: malformed_input reason=missing_topic_or_payload")
 	return true, nil
 }
 
 func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler, ctx *controller.ClientContext, conn net.Conn) (bool, error) {
 	if strings.HasPrefix(strings.ToUpper(payload), "READ_STREAM ") {
-		cmdHandler.ESHandler.HandleReadStream(payload, conn)
+		cmdHandler.HandleReadStreamCommand(conn, payload)
 		return false, nil
 	}
 
@@ -405,19 +405,19 @@ func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler,
 	if resp == controller.STREAM_DATA_SIGNAL {
 		if strings.HasPrefix(strings.ToUpper(payload), "STREAM ") {
 			if err := cmdHandler.HandleStreamCommand(conn, payload, ctx); err != nil {
-				writeResponse(conn, fmt.Sprintf("ERROR: %v", err))
+				writeResponse(conn, fmt.Sprintf("ERROR: command_failed reason=%q", err.Error()))
 				return false, nil
 			}
 			return true, nil
 		} else {
 			if _, err := cmdHandler.HandleConsumeCommand(conn, payload, ctx); err != nil {
-				writeResponse(conn, fmt.Sprintf("ERROR: %v", err))
+				writeResponse(conn, fmt.Sprintf("ERROR: command_failed reason=%q", err.Error()))
 			}
 			return false, nil
 		}
 	}
 	if resp == "" {
-		resp = "ERROR: empty response from command handler"
+		resp = "ERROR: empty_command_response"
 	}
 	writeResponse(conn, resp)
 	return false, nil

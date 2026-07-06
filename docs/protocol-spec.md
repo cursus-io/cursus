@@ -112,6 +112,15 @@ Alternatively, raw command strings (without the topic envelope) are accepted if 
 - The `message=` parameter is special: it captures the entire remainder of the line
 - Command names are case-insensitive
 
+### Text Response Contract
+
+Text command responses are machine-readable.
+
+- Success responses MUST be `OK` or `OK key=value ...` unless the command returns a documented JSON envelope with `"status":"OK"`.
+- Failure responses MUST be `ERROR: <code> [key=value ...]`.
+- Clients SHOULD branch on the `OK` / JSON status / `ERROR:` contract instead of matching natural-language phrases.
+- Legacy bare responses, such as the old CREATE phrase or plain integer offsets, are deprecated and should only be accepted by clients as narrow backward-compatible fallbacks.
+
 ### Command Reference
 
 #### Topic Management
@@ -127,19 +136,25 @@ CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [replication_fact
 | idempotent | No | false | Enable producer dedup |
 | replication_factor | No | 3 | Replica count (distributed mode) |
 
-Response: `Topic '<name>' now has <N> partitions`
+Response: `OK topic=<name> partitions=<N>`
 
 **DELETE**
 ```
 DELETE topic=<name>
 ```
-Response: `Topic '<name>' deleted`
+Response: `OK topic=<name> deleted=true`
 
 **LIST**
 ```
 LIST
 ```
-Response: `topic1, topic2, topic3` or `(no topics)`
+Response: `OK count=<N> topics=<comma-separated-topic-names>`. Empty brokers return `OK count=0 topics=`.
+
+**HELP**
+```
+HELP
+```
+Response: `OK commands=<comma-separated-command-names>`.
 
 **DESCRIBE**
 ```
@@ -148,6 +163,7 @@ DESCRIBE topic=<name>
 Response (JSON):
 ```json
 {
+  "status": "OK",
   "topic": "mytopic",
   "partitions": [
     {
@@ -254,7 +270,7 @@ Response: `OK assignments=[0,1,2]`
 ```
 LEAVE_GROUP topic=<name> group=<name> member=<actual-id>
 ```
-Response: `Left group '<name>'`
+Response: `OK group=<name> member=<actual-id> left=true`
 
 **HEARTBEAT**
 ```
@@ -314,6 +330,13 @@ CONSUME topic=<name> partition=<N> offset=<N> member=<id> group=<name> [autoOffs
 
 Response: Binary batch frame (Section 5)
 
+If the broker has a committed offset for `(topic, group, partition)`, `CONSUME`
+starts from that committed offset even when the request includes a lower
+`offset=` value. If no committed offset exists, the explicit `offset=` value is
+used. If the command omits a usable explicit offset in a future protocol
+revision, `autoOffsetReset=earliest` starts at `0` and `autoOffsetReset=latest`
+starts at the partition high-water mark.
+
 **STREAM** (continuous push)
 ```
 STREAM topic=<name> partition=<N> member=<id> group=<name> [batch=<N>]
@@ -329,13 +352,22 @@ Keepalive: Server sends `[00 00 00 00]` (4 zero bytes as length prefix) when no 
 ```
 FETCH_OFFSET topic=<name> partition=<N> group=<name>
 ```
-Response: `<offset>` (plain integer) or `0` if not found
+Response: `OK offset=<nextOffset>`. If no offset has been committed, the broker returns `OK offset=0` (earliest). Older brokers returned a plain integer; clients may keep that only as a legacy fallback.
+
+The key is `(topic, group, partition)`. Offsets are independent for every group
+and every partition.
 
 **COMMIT_OFFSET**
 ```
 COMMIT_OFFSET topic=<name> partition=<N> group=<name> offset=<N>
 ```
 Response: `OK`
+
+The `offset` value is the next offset to read after the client has processed
+records. Commits are durable and monotonic per `(topic, group, partition)`.
+Committing the same offset is idempotent. Committing an offset lower than the
+current committed offset returns an error and does not move the stored offset
+backward.
 
 **BATCH_COMMIT**
 ```
@@ -347,9 +379,14 @@ Response: `OK batched=<N>`
 
 > The `P` prefix before partition numbers is required.
 
+Batch commits follow the same monotonic rule as `COMMIT_OFFSET` for each
+included partition.
+
 #### Event Sourcing Commands
 
 These commands are available only on topics created with `event_sourcing=true`.
+
+Event-sourcing commands are partition-routed by aggregate `key`. In distributed mode, `APPEND_STREAM`, `READ_STREAM`, `STREAM_VERSION`, `SAVE_SNAPSHOT`, and `READ_SNAPSHOT` must execute on the leader for the aggregate partition. A non-leader broker returns `ERROR: NOT_LEADER LEADER_IS <host:port>`; clients should reconnect to that address and retry. Followers index replicated event-sourcing messages and rebuild local stream indexes from the committed log on restart.
 
 **APPEND_STREAM**
 ```
@@ -369,7 +406,9 @@ Success response: `OK version=<N> offset=<N> partition=<N>`
 
 Error responses:
 - `ERROR: version_conflict current=<N> expected=<N>` — optimistic concurrency failure
-- `ERROR: topic '<name>' is not event-sourcing enabled` — topic not created with `event_sourcing=true`
+- `ERROR: event_sourcing_not_enabled topic=<name>` - topic not created with `event_sourcing=true`
+- `ERROR: invalid_schema_version` - `schema_version` was not an unsigned integer
+- `ERROR: NOT_LEADER LEADER_IS <host:port>` - command reached a non-leader broker in distributed mode
 
 **READ_STREAM**
 ```
@@ -407,7 +446,7 @@ STREAM_VERSION topic=<name> key=<aggregate_key>
 | topic | Yes | - | Topic name |
 | key | Yes | - | Aggregate ID |
 
-Response: Plain integer (e.g., `6`). Returns `0` if the aggregate does not exist.
+Response: `OK version=<N>` (for example, `OK version=6`). Returns `OK version=0` if the aggregate does not exist. Older brokers returned a plain integer; clients may keep that only as a legacy fallback.
 
 **SAVE_SNAPSHOT**
 ```
@@ -422,7 +461,7 @@ SAVE_SNAPSHOT topic=<name> key=<aggregate_key> version=<N> message=<payload>
 
 Success response: `OK version=<N> partition=<N>`
 
-Error response: `ERROR: snapshot version <N> exceeds stream version <N>`
+Error response: `ERROR: snapshot_version_exceeds_stream version=<N> current=<N>`
 
 **READ_SNAPSHOT**
 ```
@@ -433,12 +472,12 @@ READ_SNAPSHOT topic=<name> key=<aggregate_key>
 | topic | Yes | - | Topic name |
 | key | Yes | - | Aggregate ID |
 
-Success response (JSON):
-```json
-{"version": 500, "payload": "..."}
+Success response: `OK snapshot=<json>`
+```text
+OK snapshot={"version":500,"payload":"..."}
 ```
 
-Not found response: `NULL`
+Not found response: `OK snapshot=null`. Older brokers returned `NULL`; clients may keep that only as a legacy fallback.
 
 ---
 
@@ -480,7 +519,7 @@ Offset  Size  Type     Field
 
 ### Batch Response
 
-Server responds with the same binary batch format (for CONSUME) or JSON `AckResponse` (for PUBLISH).
+Server responds with the same binary batch format for CONSUME. PUBLISH with `acks=1` or `acks=all` returns JSON `AckResponse` with `status="OK"`; PUBLISH with `acks=0` returns `OK`.
 
 ---
 
@@ -518,11 +557,48 @@ Client action:
 ### Offset Resolution Priority
 
 ```
-1. Saved offset from coordinator (via FETCH_OFFSET)
+1. Saved offset from coordinator for (topic, group, partition)
 2. Explicit offset from request parameter
 3. autoOffsetReset = "latest" → partition HWM
 4. autoOffsetReset = "earliest" → 0
 ```
+
+### Offset Lifecycle and Delivery Guarantees
+
+Consumer group offsets are stored by the broker in the internal
+`__consumer_offsets` topic and loaded again when the broker starts. In
+distributed mode, offset updates are also applied through the Raft FSM and
+included in FSM snapshots. A successful `COMMIT_OFFSET` or `BATCH_COMMIT`
+therefore survives broker restart according to the configured broker storage
+durability.
+
+Recommended client loop:
+
+1. Fetch or join/sync assignments.
+2. Consume from the broker-selected resume offset.
+3. Process the returned records.
+4. Commit `lastProcessedOffset + 1`.
+
+This gives at-least-once delivery when the client commits after processing. If a
+client commits before processing and then crashes, it may skip unprocessed
+records, which is at-most-once behavior for that client. Cursus does not provide
+exactly-once processing semantics; applications that need exactly-once effects
+must make their processing idempotent or transactional outside the broker.
+
+Example for a game server such as wargame-IOCP:
+
+```
+JOIN_GROUP topic=match-events group=wargame-iocp member=game-01
+SYNC_GROUP topic=match-events group=wargame-iocp member=game-01-1234
+FETCH_OFFSET topic=match-events partition=0 group=wargame-iocp
+# broker returns: OK offset=<nextOffset>
+CONSUME topic=match-events partition=0 offset=<nextOffset> group=wargame-iocp member=game-01-1234 batch=128
+COMMIT_OFFSET topic=match-events partition=0 group=wargame-iocp offset=<lastProcessedOffset+1>
+```
+
+The game server does not need its own Postgres table for Cursus offsets once it
+uses this API. On reconnect or broker restart, the same group resumes from the
+last successful broker commit.
 
 ---
 
@@ -531,14 +607,14 @@ Client action:
 ### Error Response Format
 
 ```
-ERROR: <description>
+ERROR: <code> [key=value ...]
 ```
 
 ### Error Codes
 
 | Error | Cause | Client Action |
 |-------|-------|---------------|
-| `topic '<X>' does not exist` | Topic not created | CREATE topic first |
+| `topic_not_found topic=<X>` | Topic not created | CREATE topic first |
 | `PARTITION_NOT_FOUND <N>` | Invalid partition ID | Check DESCRIBE for valid IDs |
 | `TOPIC_NOT_FOUND <X>` | Topic not found | CREATE topic first |
 | `NOT_AUTHORIZED_FOR_PARTITION <T>:<P>` | Not partition leader | Redirect to correct leader |
@@ -549,8 +625,8 @@ ERROR: <description>
 | `not partition owner` | Assignment changed | Re-join group |
 | `no_valid_offsets` | BATCH_COMMIT parse failure | Check format: `P<N>:<offset>` |
 | `version_conflict current=N expected=N` | Optimistic concurrency failure | Reload aggregate and retry |
-| `topic '<X>' is not event-sourcing enabled` | ES command on non-ES topic | CREATE topic with `event_sourcing=true` |
-| `snapshot version N exceeds stream version N` | Invalid snapshot version | Use version <= current stream version |
+| `event_sourcing_not_enabled topic=<X>` | ES command on non-ES topic | CREATE topic with `event_sourcing=true` |
+| `snapshot_version_exceeds_stream version=N current=N` | Invalid snapshot version | Use version <= current stream version |
 
 ### Leader Redirect
 

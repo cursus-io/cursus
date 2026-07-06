@@ -276,3 +276,17 @@ func TestConsumer_GetOrDialHeartbeatConn_NilConnGetLeaderFails(t *testing.T) {
 	conn := c.getOrDialHeartbeatConn()
 	assert.Nil(t, conn)
 }
+
+func TestParseFetchOffsetResponse_StrictContract(t *testing.T) {
+	offset, err := parseFetchOffsetResponse("OK offset=42")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(42), offset)
+
+	_, err = parseFetchOffsetResponse("42")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected offset response")
+
+	_, err = parseFetchOffsetResponse("OK")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing offset")
+}

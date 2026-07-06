@@ -52,20 +52,20 @@ func TestCommandHandler_Real(t *testing.T) {
 
 	t.Run("HELP command", func(t *testing.T) {
 		resp := ch.HandleCommand("HELP", ctx)
-		if !strings.Contains(resp, "Available commands") {
+		if !strings.Contains(resp, "OK commands=") {
 			t.Errorf("Expected HELP response, got: %s", resp)
 		}
 	})
 
 	t.Run("CREATE and LIST topics", func(t *testing.T) {
 		resp := ch.HandleCommand("CREATE topic=test-topic partitions=2", ctx)
-		if !strings.Contains(resp, "Topic 'test-topic' now has 2 partitions") {
+		if !strings.Contains(resp, "OK topic=test-topic partitions=2") {
 			t.Errorf("Failed to create topic: %s", resp)
 		}
 
 		resp = ch.HandleCommand("LIST", ctx)
 		if !strings.Contains(resp, "test-topic") {
-			t.Errorf("Topic not found in list: %s", resp)
+			t.Errorf("Topic topic_not_found in list: %s", resp)
 		}
 	})
 
@@ -91,21 +91,21 @@ func TestCommandHandler_Real(t *testing.T) {
 		}
 
 		resp = ch.HandleCommand("LIST", ctx)
-		if resp != "(no topics)" {
-			t.Errorf("Expected empty list, got: %s", resp)
+		if resp != "OK count=0 topics=" {
+			t.Errorf("Expected empty contract list, got: %s", resp)
 		}
 	})
 
 	t.Run("Unknown command", func(t *testing.T) {
 		resp := ch.HandleCommand("INVALID_CMD", ctx)
-		if !strings.Contains(resp, "ERROR: unknown command") {
+		if !strings.Contains(resp, "ERROR: unknown_command") {
 			t.Errorf("Expected error for unknown command, got: %s", resp)
 		}
 	})
 
 	t.Run("Empty command", func(t *testing.T) {
 		resp := ch.HandleCommand("", ctx)
-		if !strings.Contains(resp, "ERROR: empty command") {
+		if !strings.Contains(resp, "ERROR: empty_command") {
 			t.Errorf("Expected error for empty command, got: %s", resp)
 		}
 	})
@@ -127,12 +127,12 @@ func TestCommandHandler_GroupCommands(t *testing.T) {
 		cmd    string
 		expect string
 	}{
-		{"REGISTER_GROUP topic=topic1 group=g1", "coordinator not available"},
-		{"JOIN_GROUP topic=topic1 group=g1 member=m1", "coordinator not available"},
-		{"HEARTBEAT topic=topic1 group=g1 member=m1", "coordinator not available"},
-		{"LEAVE_GROUP topic=topic1 group=g1 member=m1", "✅ Left group 'g1'"},
-		{"COMMIT_OFFSET topic=topic1 partition=0 group=g1 offset=10", "offset manager not available"},
-		{"FETCH_OFFSET topic=topic1 partition=0 group=g1", "offset manager not available"},
+		{"REGISTER_GROUP topic=topic1 group=g1", "coordinator_not_available"},
+		{"JOIN_GROUP topic=topic1 group=g1 member=m1", "coordinator_not_available"},
+		{"HEARTBEAT topic=topic1 group=g1 member=m1", "coordinator_not_available"},
+		{"LEAVE_GROUP topic=topic1 group=g1 member=m1", "left=true"},
+		{"COMMIT_OFFSET topic=topic1 partition=0 group=g1 offset=10", "offset_manager_not_available"},
+		{"FETCH_OFFSET topic=topic1 partition=0 group=g1", "offset_manager_not_available"},
 	}
 
 	for _, tc := range commands {
@@ -149,14 +149,14 @@ func TestCommandHandler_ErrorResponses(t *testing.T) {
 
 	t.Run("CREATE missing topic", func(t *testing.T) {
 		resp := ch.HandleCommand("CREATE partitions=3", nil)
-		if !strings.Contains(resp, "missing topic parameter") {
+		if !strings.Contains(resp, "missing_topic") {
 			t.Errorf("Expected error for missing topic, got: %s", resp)
 		}
 	})
 
 	t.Run("DELETE missing topic", func(t *testing.T) {
 		resp := ch.HandleCommand("DELETE topic=", nil)
-		if !strings.Contains(resp, "missing topic parameter") {
+		if !strings.Contains(resp, "missing_topic") {
 			t.Errorf("Expected error for missing topic, got: %s", resp)
 		}
 	})
@@ -171,13 +171,13 @@ func TestCommandHandler_EventSourcingCreate(t *testing.T) {
 	ctx := controller.NewClientContext("test-group", 0)
 
 	resp := ch.HandleCommand("CREATE topic=es-topic partitions=2 event_sourcing=true", ctx)
-	if !strings.Contains(resp, "Topic 'es-topic' now has 2 partitions") {
+	if !strings.Contains(resp, "OK topic=es-topic partitions=2") {
 		t.Fatalf("Failed to create event-sourcing topic: %s", resp)
 	}
 
 	tObj := tm.GetTopic("es-topic")
 	if tObj == nil {
-		t.Fatal("Topic 'es-topic' not found after creation")
+		t.Fatal("Topic 'es-topic' topic_not_found after creation")
 	}
 	if !tObj.IsEventSourcing {
 		t.Error("Expected IsEventSourcing=true on the created topic")
@@ -228,13 +228,13 @@ func TestCommandHandler_ProcessCommand(t *testing.T) {
 	t.Cleanup(func() { _ = ch.Close() })
 
 	resp := ch.ProcessCommand("HELP")
-	if !strings.Contains(resp, "Available commands") {
+	if !strings.Contains(resp, "OK commands=") {
 		t.Errorf("Expected HELP response from ProcessCommand, got: %s", resp)
 	}
 
 	resp = ch.ProcessCommand("LIST")
-	if resp != "(no topics)" {
-		t.Errorf("Expected empty list, got: %s", resp)
+	if resp != "OK count=0 topics=" {
+		t.Errorf("Expected empty contract list, got: %s", resp)
 	}
 }
 
@@ -314,8 +314,8 @@ func TestCommandHandler_EventSourcingCommands(t *testing.T) {
 
 	// STREAM_VERSION
 	resp = ch.HandleCommand("STREAM_VERSION topic=es-cmd-orders key=cmd-order-1", ctx)
-	if resp != "1" {
-		t.Errorf("Expected version 1, got: %s", resp)
+	if resp != "OK version=1" {
+		t.Errorf("Expected OK version=1, got: %s", resp)
 	}
 
 	// SAVE_SNAPSHOT
@@ -349,7 +349,7 @@ func TestCommandHandler_CaseInsensitivity(t *testing.T) {
 		cmd    string
 		expect string
 	}{
-		{"create topic=T1", "Topic 'T1' now has 4 partitions"},
+		{"create topic=T1", "OK topic=T1 partitions=4"},
 		{"list", "T1"},
 		{"describe topic=T1", "partitions"},
 		{"delete topic=T1", "deleted"},
