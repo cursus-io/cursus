@@ -47,7 +47,13 @@ func main() {
 	util.Info("✅ Consumer closed gracefully")
 
 	if cfg.EnableBenchmark {
-		c.GetMetrics().PrintSummary()
+		metrics := c.GetMetrics()
+		metrics.Finalize()
+		metrics.PrintSummary()
+		if ok, reason := metrics.IsFullyConsumed(int64(cfg.NumMessages)); !ok {
+			util.Error("benchmark incomplete: %s", reason)
+			os.Exit(1)
+		}
 	}
 	os.Exit(0)
 }

@@ -94,8 +94,8 @@ type ConsumerMetrics struct {
 
 	enableCorrectness bool
 	expectedTotal     int64
-	seenOffsetFilter  *BloomFilter
-	seenIDFilter      *BloomFilter
+	seenOffsets       map[string]struct{}
+	seenIDs           map[string]struct{}
 	dupCount          int64
 	dupOffsetCount    int64
 	missingCount      int64
@@ -105,13 +105,8 @@ type ConsumerMetrics struct {
 }
 
 // NewConsumerMetrics creates a metrics collector.
-// If enableCorrectness is true, bloom filters track duplicate offsets and message IDs.
+// If enableCorrectness is true, exact sets track duplicate offsets and message IDs.
 func NewConsumerMetrics(expected int64, enableCorrectness bool) *ConsumerMetrics {
-	var offsetBF, idBF *BloomFilter
-	if enableCorrectness {
-		offsetBF = NewBloomFilter(uint64(expected), 0.0001)
-		idBF = NewBloomFilter(uint64(expected), 0.0001)
-	}
 
 	return &ConsumerMetrics{
 		currentPhase: PhaseInitial,
@@ -120,8 +115,8 @@ func NewConsumerMetrics(expected int64, enableCorrectness bool) *ConsumerMetrics
 		},
 		expectedTotal:     expected,
 		enableCorrectness: enableCorrectness,
-		seenOffsetFilter:  offsetBF,
-		seenIDFilter:      idBF,
+		seenOffsets:       make(map[string]struct{}),
+		seenIDs:           make(map[string]struct{}),
 	}
 }
 
@@ -162,16 +157,19 @@ func (m *ConsumerMetrics) RecordMessage(partition int, offset int64, producerID 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	offsetKey := encodeOffset(partition, offset)
-	if m.seenOffsetFilter.Add(offsetKey) {
+	offsetKey := string(encodeOffset(partition, offset))
+	if _, seen := m.seenOffsets[offsetKey]; seen {
 		atomic.AddInt64(&m.dupOffsetCount, 1)
+	} else {
+		m.seenOffsets[offsetKey] = struct{}{}
 	}
 
-	messageKey := encodeMessageID(partition, producerID, seqNum)
-	if !m.seenIDFilter.Add(messageKey) {
-		atomic.AddInt64(&m.uniqueMsgs, 1)
-	} else {
+	messageKey := string(encodeMessageID(partition, producerID, seqNum))
+	if _, seen := m.seenIDs[messageKey]; seen {
 		atomic.AddInt64(&m.dupCount, 1)
+	} else {
+		m.seenIDs[messageKey] = struct{}{}
+		atomic.AddInt64(&m.uniqueMsgs, 1)
 	}
 }
 
@@ -206,10 +204,18 @@ func (m *ConsumerMetrics) OnFirstConsumeAfterRebalance() {
 	m.currentPhase = PhaseRebalanced
 }
 
-// IsFullyConsumed returns (true, "") when totalMsgs >= expectedTotal.
+// IsFullyConsumed returns (true, "") when the expected message count is reached.
+// When correctness tracking is enabled, unique message IDs are authoritative.
 func (m *ConsumerMetrics) IsFullyConsumed(expectedTotal int64) (bool, string) {
 	current := atomic.LoadInt64(&m.totalMsgs)
 	unique := atomic.LoadInt64(&m.uniqueMsgs)
+	if m.enableCorrectness {
+		if unique < expectedTotal {
+			return false, fmt.Sprintf("receiving... unique=%d/%d total=%d missing=%d",
+				unique, expectedTotal, current, expectedTotal-unique)
+		}
+		return true, ""
+	}
 	if current < expectedTotal {
 		return false, fmt.Sprintf("receiving... (%d/%d) unique=%d missing=%d",
 			current, expectedTotal, unique, expectedTotal-current)
@@ -222,15 +228,16 @@ func (m *ConsumerMetrics) Finalize() {
 	consumed := atomic.LoadInt64(&m.totalMsgs)
 	unique := atomic.LoadInt64(&m.uniqueMsgs)
 
-	if consumed < m.expectedTotal {
-		atomic.StoreInt64(&m.missingCount, m.expectedTotal-consumed)
+	observed := consumed
+	if m.enableCorrectness {
+		observed = unique
+	}
+	if observed < m.expectedTotal {
+		atomic.StoreInt64(&m.missingCount, m.expectedTotal-observed)
 	} else {
 		atomic.StoreInt64(&m.missingCount, 0)
 	}
-
-	_ = unique // may differ from consumed due to bloom filter false positives
 }
-
 func percentile(sorted []float64, p float64) float64 {
 	if len(sorted) == 0 {
 		return 0

@@ -92,15 +92,23 @@ func main() {
 			return true
 		})
 
-		if err := pub.VerifySentSequences(total); err != nil {
-			util.Info("verify failed: %v", err)
+		verifyErr := pub.VerifySentSequences(total)
+		if verifyErr != nil {
+			util.Error("verify failed: %v", verifyErr)
 		}
 
 		stats := pub.GetPartitionStats()
 		latencies := pub.GetLatencies()
 
-		util.Info("🎉 Benchmark completed successfully!")
+		if verifyErr == nil && publishedMessages == targetCount {
+			util.Info("🎉 Benchmark completed successfully!")
+		} else {
+			util.Error("benchmark incomplete: published=%d expected=%d", publishedMessages, targetCount)
+		}
 		bench.PrintBenchmarkSummaryFixedTo(os.Stdout, stats, totalSent, publishedMessages, targetCount, duration, errors, latencies)
+		if verifyErr != nil || publishedMessages != targetCount {
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 

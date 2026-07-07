@@ -4,11 +4,11 @@ broker_addrs:
 log_level: "info" # debug, info, warn, error
 
 # Performance
-num_messages: 100000
+num_messages: 20000
 partitions: 12
 max_inflight_requests: 10
-batch_size: 10000
-buffer_size: 70000
+batch_size: 2000
+buffer_size: 20000
 linger_ms: 100
 
 # Idempotency
@@ -18,6 +18,8 @@ enable_idempotence: false
 # Retry
 max_retries: 3
 retry_backoff_ms: 100
+ack_timeout_ms: 30000
 
 # Benchmark
 enable_benchmark: true
+flush_timeout_ms: 120000

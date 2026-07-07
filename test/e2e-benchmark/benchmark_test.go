@@ -3,17 +3,14 @@ package e2e_benchmark
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
-const (
-	standaloneCompose = "../docker-compose.yml"
-	clusterCompose    = "../cluster/docker-compose.yml"
-
-	benchmarkTimeout = 5 * time.Minute
-)
+const benchmarkTimeout = 5 * time.Minute
 
 func getComposeCommand() []string {
 	if _, err := exec.LookPath("docker-compose"); err == nil {
@@ -22,9 +19,18 @@ func getComposeCommand() []string {
 	return []string{"docker", "compose"}
 }
 
+func composeFile(rel string) string {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		panic("cannot resolve benchmark compose path")
+	}
+	return filepath.Join(filepath.Dir(file), rel)
+}
+
 func runCompose(args ...string) *exec.Cmd {
 	base := getComposeCommand()
-	fullArgs := append(base[1:], args...)
+	fullArgs := append([]string{"--project-name", "cursus-benchmark"}, base[1:]...)
+	fullArgs = append(fullArgs, args...)
 	cmd := exec.Command(base[0], fullArgs...)
 	return cmd
 }
@@ -84,27 +90,48 @@ func waitForContainerExit(t *testing.T, file, service, container string, timeout
 func assertBenchmarkSuccess(t *testing.T, logs string, component string) {
 	t.Helper()
 
-	if strings.Contains(logs, "All messages consumed") ||
-		strings.Contains(logs, "Benchmark completed") ||
-		strings.Contains(logs, "Consumer closed gracefully") ||
-		strings.Contains(logs, "All messages published") ||
-		strings.Contains(logs, "Publisher closed gracefully") {
-		t.Logf("%s benchmark completed successfully", component)
-		return
+	lower := strings.ToLower(logs)
+	failureMarkers := []string{
+		"fatal",
+		"panic",
+		"benchmark incomplete",
+		"verify failed",
+		"failed messages              : 1",
+		"failed messages              : 2",
+		"failed messages              : 3",
+		"failed messages              : 4",
+		"failed messages              : 5",
+		"failed messages              : 6",
+		"failed messages              : 7",
+		"failed messages              : 8",
+		"failed messages              : 9",
+		"message missing       : 1",
+		"message missing       : 2",
+		"message missing       : 3",
+		"message missing       : 4",
+		"message missing       : 5",
+		"message missing       : 6",
+		"message missing       : 7",
+		"message missing       : 8",
+		"message missing       : 9",
+	}
+	for _, marker := range failureMarkers {
+		if strings.Contains(lower, marker) {
+			t.Fatalf("%s benchmark reported failure marker %q:\n%s", component, marker, lastLines(logs, 40))
+		}
 	}
 
-	if strings.Contains(logs, "FATAL") || strings.Contains(logs, "panic") {
-		t.Errorf("%s crashed during benchmark:\n%s", component, lastLines(logs, 30))
-		return
+	if component == "Publisher" {
+		if !strings.Contains(logs, "Failed messages              : 0") || !strings.Contains(logs, "rate: 100.00%") {
+			t.Fatalf("publisher did not report a complete publish:\n%s", lastLines(logs, 40))
+		}
+	} else if component == "Consumer" {
+		if !strings.Contains(logs, "All messages consumed") || !strings.Contains(logs, "Message missing       : 0") {
+			t.Fatalf("consumer did not report complete consumption:\n%s", lastLines(logs, 40))
+		}
 	}
 
-	// Check exit code
-	if strings.Contains(logs, "exit code 0") {
-		t.Logf("%s exited (likely success)", component)
-		return
-	}
-
-	t.Errorf("%s benchmark did not complete successfully:\n%s", component, lastLines(logs, 30))
+	t.Logf("%s benchmark completed successfully", component)
 }
 
 func lastLines(s string, n int) string {
@@ -121,15 +148,15 @@ func TestStandaloneBenchmark(t *testing.T) {
 		t.Skip("skipping benchmark test in short mode")
 	}
 
-	composeDown(t, standaloneCompose)
-	t.Cleanup(func() { composeDown(t, standaloneCompose) })
+	composeDown(t, composeFile("../docker-compose.yml"))
+	t.Cleanup(func() { composeDown(t, composeFile("../docker-compose.yml")) })
 
 	t.Log("Starting standalone benchmark...")
-	composeUp(t, standaloneCompose)
+	composeUp(t, composeFile("../docker-compose.yml"))
 
 	// Wait for publisher to finish
 	t.Log("Waiting for publisher to complete...")
-	pubLogs, pubDone := waitForContainerExit(t, standaloneCompose, "publisher", "bench-publisher", benchmarkTimeout)
+	pubLogs, pubDone := waitForContainerExit(t, composeFile("../docker-compose.yml"), "publisher", "bench-publisher", benchmarkTimeout)
 	if !pubDone {
 		t.Fatal("Publisher did not complete within timeout")
 	}
@@ -137,7 +164,7 @@ func TestStandaloneBenchmark(t *testing.T) {
 
 	// Wait for consumer to finish
 	t.Log("Waiting for consumer to complete...")
-	consLogs, consDone := waitForContainerExit(t, standaloneCompose, "consumer", "bench-consumer", benchmarkTimeout)
+	consLogs, consDone := waitForContainerExit(t, composeFile("../docker-compose.yml"), "consumer", "bench-consumer", benchmarkTimeout)
 	if !consDone {
 		t.Fatal("Consumer did not complete within timeout")
 	}
@@ -150,15 +177,15 @@ func TestClusterBenchmark(t *testing.T) {
 		t.Skip("skipping benchmark test in short mode")
 	}
 
-	composeDown(t, clusterCompose)
-	t.Cleanup(func() { composeDown(t, clusterCompose) })
+	composeDown(t, composeFile("../cluster/docker-compose.yml"))
+	t.Cleanup(func() { composeDown(t, composeFile("../cluster/docker-compose.yml")) })
 
 	t.Log("Starting cluster benchmark (3 nodes)...")
-	composeUp(t, clusterCompose)
+	composeUp(t, composeFile("../cluster/docker-compose.yml"))
 
 	// Wait for publisher to finish
 	t.Log("Waiting for publisher to complete...")
-	pubLogs, pubDone := waitForContainerExit(t, clusterCompose, "publisher", "broker-publisher", benchmarkTimeout)
+	pubLogs, pubDone := waitForContainerExit(t, composeFile("../cluster/docker-compose.yml"), "publisher", "broker-publisher", benchmarkTimeout)
 	if !pubDone {
 		t.Fatal("Publisher did not complete within timeout")
 	}
@@ -166,7 +193,7 @@ func TestClusterBenchmark(t *testing.T) {
 
 	// Wait for consumer to finish
 	t.Log("Waiting for consumer to complete...")
-	consLogs, consDone := waitForContainerExit(t, clusterCompose, "consumer", "broker-consumer", benchmarkTimeout)
+	consLogs, consDone := waitForContainerExit(t, composeFile("../cluster/docker-compose.yml"), "consumer", "broker-consumer", benchmarkTimeout)
 	if !consDone {
 		t.Fatal("Consumer did not complete within timeout")
 	}
