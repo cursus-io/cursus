@@ -89,6 +89,9 @@ func NewCommandHandler(
 		{prefix: "FIND_COORDINATOR ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFindCoordinator(cmd) }},
 		{prefix: "REPLICATE_MESSAGE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateMessage(cmd) }},
 		{prefix: "REPLICATE_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateSnapshot(cmd) }},
+		{prefix: "LIST_SNAPSHOTS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListSnapshots(cmd) }},
+		{prefix: "FETCH_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchSnapshot(cmd) }},
+		{prefix: "CATCHUP_SNAPSHOTS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCatchupSnapshots(cmd) }},
 		{prefix: "RAFT_APPLY ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd) }},
 	}
 	return ch

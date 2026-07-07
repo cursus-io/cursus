@@ -40,11 +40,11 @@ type AppendResult struct {
 }
 
 type SnapshotResult struct {
-	Topic     string
-	Key       string
-	Version   uint64
-	Partition int
-	Payload   string
+	Topic     string `json:"topic"`
+	Key       string `json:"key"`
+	Version   uint64 `json:"version"`
+	Partition int    `json:"partition"`
+	Payload   string `json:"payload"`
 }
 
 // NewHandler creates a new event sourcing command handler.
@@ -539,6 +539,50 @@ func (h *Handler) SaveSnapshotReplica(result SnapshotResult) string {
 		return fmt.Sprintf("ERROR: snapshot_save_failed reason=%q", err.Error())
 	}
 	return ""
+}
+
+// ListSnapshots returns all latest snapshots for a topic partition.
+func (h *Handler) ListSnapshots(topicName string, partitionID int) ([]SnapshotResult, string) {
+	t := h.tm.GetTopic(topicName)
+	if t == nil {
+		return nil, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+	if !t.IsEventSourcing {
+		return nil, fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", topicName)
+	}
+	if _, err := t.GetPartition(partitionID); err != nil {
+		return nil, fmt.Sprintf("ERROR: partition_lookup_failed partition=%d reason=%q", partitionID, err.Error())
+	}
+	ss, err := h.getSnapshot(topicName, partitionID)
+	if err != nil {
+		return nil, fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", partitionID, err.Error())
+	}
+	records, err := ss.List()
+	if err != nil {
+		return nil, fmt.Sprintf("ERROR: snapshot_list_failed reason=%q", err.Error())
+	}
+	result := make([]SnapshotResult, 0, len(records))
+	for _, rec := range records {
+		result = append(result, SnapshotResult{Topic: topicName, Key: rec.Key, Version: rec.Version, Partition: partitionID, Payload: rec.Payload})
+	}
+	return result, ""
+}
+
+// FetchSnapshot returns the latest snapshot for a topic partition and aggregate key.
+func (h *Handler) FetchSnapshot(topicName string, partitionID int, key string) (*SnapshotResult, string) {
+	if key == "" {
+		return nil, "ERROR: missing_key"
+	}
+	snaps, errResp := h.ListSnapshots(topicName, partitionID)
+	if errResp != "" {
+		return nil, errResp
+	}
+	for _, snap := range snaps {
+		if snap.Key == key {
+			return &snap, ""
+		}
+	}
+	return nil, ""
 }
 
 // HandleReadSnapshot processes:

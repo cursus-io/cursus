@@ -404,6 +404,8 @@ APPEND_STREAM topic=<name> key=<aggregate_key> version=<N> event_type=<type> [sc
 
 Success response: `OK version=<N> offset=<N> partition=<N>`
 
+Internal broker catch-up commands: LIST_SNAPSHOTS topic=<name> partition=<N>, FETCH_SNAPSHOT topic=<name> partition=<N> key=<aggregate_key>, and CATCHUP_SNAPSHOTS topic=<name> partition=<N> [leader=<host:port>]. These commands are for broker-to-broker recovery only.
+
 Error responses:
 - `ERROR: version_conflict current=<N> expected=<N>` — optimistic concurrency failure
 - `ERROR: event_sourcing_not_enabled topic=<name>` - topic not created with `event_sourcing=true`

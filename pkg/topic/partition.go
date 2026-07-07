@@ -59,10 +59,16 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 
 	if handler, ok := dh.(*disk.DiskHandler); ok {
 		p.hwmCheckpointPath = hwmCheckpointPath(handler, id)
+		durableTail := handler.GetAbsoluteOffset()
 		if persistedHWM, ok := loadHWMCheckpoint(p.hwmCheckpointPath); ok {
-			p.HWM = persistedHWM
+			if persistedHWM > durableTail {
+				util.Warn("clamping HWM checkpoint %s from %d to durable tail %d", p.hwmCheckpointPath, persistedHWM, durableTail)
+				p.HWM = durableTail
+			} else {
+				p.HWM = persistedHWM
+			}
 		} else {
-			p.HWM = handler.GetAbsoluteOffset()
+			p.HWM = durableTail
 		}
 		handler.OnSync = func(uint64) {
 			p.NotifyNewMessage()
@@ -373,8 +379,23 @@ func (p *Partition) persistHWMCheckpointLocked() {
 	}
 	tmp := p.hwmCheckpointPath + ".tmp"
 	data := []byte(strconv.FormatUint(p.HWM, 10) + "\n")
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		util.Warn("failed to open HWM checkpoint %s: %v", tmp, err)
+		return
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
 		util.Warn("failed to write HWM checkpoint %s: %v", tmp, err)
+		return
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		util.Warn("failed to sync HWM checkpoint %s: %v", tmp, err)
+		return
+	}
+	if err := f.Close(); err != nil {
+		util.Warn("failed to close HWM checkpoint %s: %v", tmp, err)
 		return
 	}
 	_ = os.Remove(p.hwmCheckpointPath)

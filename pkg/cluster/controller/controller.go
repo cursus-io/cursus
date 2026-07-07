@@ -140,6 +140,13 @@ func (cc *ClusterController) IsAuthorized(topic string, partition int) bool {
 	return meta.Leader == cc.brokerID
 }
 
+func (cc *ClusterController) ForwardCommandToBroker(addr, command string) (string, error) {
+	if cc.Router == nil {
+		return "", fmt.Errorf("cluster router not available")
+	}
+	return cc.Router.forwardWithTimeout(addr, command)
+}
+
 func (cc *ClusterController) ReplicateCommandToFollowers(topic string, partition int, command string, minISR int) error {
 	replicationStart := time.Now()
 

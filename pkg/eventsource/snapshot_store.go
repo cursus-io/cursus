@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 )
 
@@ -19,6 +20,13 @@ type snapshotPointer struct {
 type SnapshotData struct {
 	Version uint64 `json:"version"`
 	Payload string `json:"payload"`
+}
+
+// SnapshotRecord represents the latest snapshot for one aggregate key.
+type SnapshotRecord struct {
+	Key     string
+	Version uint64
+	Payload string
 }
 
 // SnapshotStore is a per-partition append-only snapshot store.
@@ -202,6 +210,30 @@ func (s *SnapshotStore) Save(key string, version uint64, payload string) error {
 }
 
 // Read returns the latest snapshot for the given key, or nil if not found.
+// List returns the latest snapshot for every aggregate key in this partition.
+func (s *SnapshotStore) List() ([]SnapshotRecord, error) {
+	s.mu.RLock()
+	keys := make([]string, 0, len(s.index))
+	for key := range s.index {
+		keys = append(keys, key)
+	}
+	s.mu.RUnlock()
+
+	sort.Strings(keys)
+	records := make([]SnapshotRecord, 0, len(keys))
+	for _, key := range keys {
+		snap, err := s.Read(key)
+		if err != nil {
+			return nil, err
+		}
+		if snap == nil {
+			continue
+		}
+		records = append(records, SnapshotRecord{Key: key, Version: snap.Version, Payload: snap.Payload})
+	}
+	return records, nil
+}
+
 func (s *SnapshotStore) Read(key string) (*SnapshotData, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

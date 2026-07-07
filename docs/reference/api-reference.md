@@ -396,7 +396,7 @@ Event-sourcing commands are routed by aggregate `key`. In distributed mode, the 
 ERROR: NOT_LEADER LEADER_IS <host:port>
 ```
 
-Clients and SDKs should reconnect to that leader and retry. Followers index replicated event-sourcing records, apply quorum-replicated snapshots, and rebuild stream indexes from the committed log after restart. Partitions restore a persisted high-watermark checkpoint on restart, so committed reads remain bounded by the last successful committed tail.
+Clients and SDKs should reconnect to that leader and retry. Followers index replicated event-sourcing records, apply quorum-replicated snapshots, and can pull missing snapshots from the partition leader with internal catch-up commands after restart. Partitions restore a synced high-watermark checkpoint with durable-tail clamping, so committed reads remain bounded by the last successful committed tail.
 
 
 ### APPEND_STREAM
