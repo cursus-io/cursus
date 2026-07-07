@@ -120,6 +120,12 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 			return resp
 		}
 
+		if ch.ESHandler != nil {
+			if err := ch.ESHandler.DeleteTopic(topicName); err != nil {
+				util.Warn("Failed to close event sourcing metadata for deleted topic %s: %v", topicName, err)
+			}
+		}
+
 		payload := map[string]interface{}{
 			"topic": topicName,
 		}
@@ -131,6 +137,11 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 		return fmt.Sprintf("OK topic=%s deleted=true", topicName)
 	}
 
+	if ch.ESHandler != nil {
+		if err := ch.ESHandler.DeleteTopic(topicName); err != nil {
+			util.Warn("Failed to close event sourcing metadata for deleted topic %s: %v", topicName, err)
+		}
+	}
 	if ch.TopicManager.DeleteTopic(topicName) {
 		return fmt.Sprintf("OK topic=%s deleted=true", topicName)
 	}
@@ -393,11 +404,12 @@ func (ch *CommandHandler) handleFetchOffset(cmd string) string {
 		return fmt.Sprintf("ERROR: group_not_found group=%s", groupName)
 	}
 
-	if !isTopicMatched(topicName, group.TopicName) {
+	offsetTopic, ok := resolveOffsetTopic(group.TopicName, topicName)
+	if !ok {
 		return fmt.Sprintf("ERROR: topic_not_assigned_to_group expected=%s actual=%s", group.TopicName, topicName)
 	}
 
-	offset, isFind := ch.Coordinator.GetOffset(groupName, topicName, partition)
+	offset, isFind := ch.Coordinator.GetOffset(groupName, offsetTopic, partition)
 	if !isFind {
 		return "OK offset=0"
 	}
@@ -502,7 +514,10 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	if err != nil {
 		return "ERROR: invalid_offset"
 	}
-
+	offsetTopic, offsetTopicErr := ch.resolveGroupOffsetTopic(groupID, topicName)
+	if offsetTopicErr != "" {
+		return offsetTopicErr
+	}
 	if ch.isDistributed() {
 		coordAddr, isCoord := ch.checkCoordinator(groupID)
 		if !isCoord {
@@ -512,7 +527,7 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 		payload := map[string]interface{}{
 			"type":      "COMMIT",
 			"group":     groupID,
-			"topic":     topicName,
+			"topic":     offsetTopic,
 			"partition": partition,
 			"offset":    offset,
 		}
@@ -524,16 +539,11 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	}
 
 	if ch.Coordinator != nil {
-		group := ch.Coordinator.GetGroup(groupID)
-		if group != nil && !isTopicMatched(group.TopicName, topicName) {
-			return fmt.Sprintf("ERROR: topic_not_assigned_to_group expected=%s actual=%s", group.TopicName, topicName)
-		}
-
-		err := ch.Coordinator.CommitOffset(groupID, topicName, partition, offset)
+		err := ch.Coordinator.CommitOffset(groupID, offsetTopic, partition, offset)
 		if err != nil {
 			return fmt.Sprintf("ERROR: commit_offset_failed reason=%q", err.Error())
 		}
-		ch.recordConsumerLag(topicName, partition, offset, groupID)
+		ch.recordConsumerLag(offsetTopic, partition, offset, groupID)
 		return "OK"
 	}
 	return "ERROR: offset_manager_not_available"
@@ -547,7 +557,10 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 	groupID := args["group"]
 	memberID := args["member"]
 	generation, _ := strconv.Atoi(args["generation"])
-
+	offsetTopic, offsetTopicErr := ch.resolveGroupOffsetTopic(groupID, topicName)
+	if offsetTopicErr != "" {
+		return offsetTopicErr
+	}
 	if ch.isDistributed() {
 		coordAddr, isCoord := ch.checkCoordinator(groupID)
 		if !isCoord {
@@ -601,7 +614,7 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 		batchCommitData := map[string]interface{}{
 			"type":    "BATCH_COMMIT",
 			"group":   groupID,
-			"topic":   topicName,
+			"topic":   offsetTopic,
 			"offsets": offsetList,
 		}
 		_, err := ch.applyViaLeader("BATCH_OFFSET", batchCommitData)
@@ -610,7 +623,7 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 			return fmt.Sprintf("ERROR: raft_batch_apply_failed reason=%q", err.Error())
 		}
 	} else if ch.Coordinator != nil {
-		err := ch.Coordinator.CommitOffsetsBulk(groupID, topicName, offsetList)
+		err := ch.Coordinator.CommitOffsetsBulk(groupID, offsetTopic, offsetList)
 		if err != nil {
 			return fmt.Sprintf("ERROR: bulk_commit_failed reason=%q", err.Error())
 		}
@@ -619,12 +632,39 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 	}
 
 	for _, item := range offsetList {
-		ch.recordConsumerLag(topicName, item.Partition, item.Offset, groupID)
+		ch.recordConsumerLag(offsetTopic, item.Partition, item.Offset, groupID)
 	}
 
 	return fmt.Sprintf("OK batched=%d", len(offsetList))
 }
 
+func (ch *CommandHandler) resolveGroupOffsetTopic(groupName, topicName string) (string, string) {
+	if ch.Coordinator == nil {
+		return topicName, ""
+	}
+	group := ch.Coordinator.GetGroup(groupName)
+	if group == nil {
+		return topicName, ""
+	}
+	offsetTopic, ok := resolveOffsetTopic(group.TopicName, topicName)
+	if !ok {
+		return "", fmt.Sprintf("ERROR: topic_not_assigned_to_group expected=%s actual=%s", group.TopicName, topicName)
+	}
+	return offsetTopic, ""
+}
+
+func resolveOffsetTopic(groupTopic, requestedTopic string) (string, bool) {
+	if groupTopic == requestedTopic {
+		return requestedTopic, true
+	}
+	if isTopicMatched(groupTopic, requestedTopic) {
+		return requestedTopic, true
+	}
+	if isTopicMatched(requestedTopic, groupTopic) {
+		return groupTopic, true
+	}
+	return "", false
+}
 func (ch *CommandHandler) recordConsumerLag(topicName string, partition int, committedOffset uint64, groupID string) {
 	t := ch.TopicManager.GetTopic(topicName)
 	if t == nil {

@@ -2,7 +2,9 @@ package topic
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +36,10 @@ type TopicManager struct {
 // HandlerProvider defines an interface to provide disk handlers.
 type HandlerProvider interface {
 	GetHandler(topic string, partitionID int) (types.StorageHandler, error)
+}
+
+type topicHandlerCloser interface {
+	CloseTopicHandlers(topic string)
 }
 
 func (tm *TopicManager) SetCoordinator(cd *coordinator.Coordinator) {
@@ -300,11 +306,41 @@ func (tm *TopicManager) Stop() {
 func (tm *TopicManager) DeleteTopic(name string) bool {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	if _, ok := tm.topics[name]; ok {
-		delete(tm.topics, name)
-		return true
+	if _, ok := tm.topics[name]; !ok {
+		return false
 	}
-	return false
+
+	delete(tm.topics, name)
+	if closer, ok := tm.hp.(topicHandlerCloser); ok {
+		closer.CloseTopicHandlers(name)
+	}
+	if err := tm.deleteTopicLogDirLocked(name); err != nil {
+		util.Warn("Failed to delete topic log directory for %s: %v", name, err)
+	}
+	return true
+}
+
+func (tm *TopicManager) deleteTopicLogDirLocked(name string) error {
+	if tm.cfg == nil || strings.TrimSpace(tm.cfg.LogDir) == "" {
+		return nil
+	}
+
+	root, err := filepath.Abs(tm.cfg.LogDir)
+	if err != nil {
+		return err
+	}
+	target, err := filepath.Abs(filepath.Join(tm.cfg.LogDir, name))
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return err
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("refusing to delete topic path outside log root: %s", target)
+	}
+	return os.RemoveAll(target)
 }
 
 func (tm *TopicManager) ListTopics() []string {

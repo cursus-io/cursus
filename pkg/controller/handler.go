@@ -80,9 +80,7 @@ func NewCommandHandler(
 		{prefix: "STREAM_VERSION ", exact: false, handler: func(cmd string, ctx *ClientContext) string {
 			return ch.handleEventSourceRoutedCommand(cmd, "STREAM_VERSION ", ch.ESHandler.HandleStreamVersion)
 		}},
-		{prefix: "SAVE_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string {
-			return ch.handleEventSourceRoutedCommand(cmd, "SAVE_SNAPSHOT ", ch.ESHandler.HandleSaveSnapshot)
-		}},
+		{prefix: "SAVE_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSaveSnapshot(cmd) }},
 		{prefix: "READ_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string {
 			return ch.handleEventSourceRoutedCommand(cmd, "READ_SNAPSHOT ", ch.ESHandler.HandleReadSnapshot)
 		}},
@@ -90,6 +88,7 @@ func NewCommandHandler(
 		{prefix: "METADATA ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleMetadata(cmd) }},
 		{prefix: "FIND_COORDINATOR ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFindCoordinator(cmd) }},
 		{prefix: "REPLICATE_MESSAGE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateMessage(cmd) }},
+		{prefix: "REPLICATE_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateSnapshot(cmd) }},
 		{prefix: "RAFT_APPLY ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd) }},
 	}
 	return ch

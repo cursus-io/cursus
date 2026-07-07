@@ -136,6 +136,7 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 		segments:       make([]uint64, 0),
 		CurrentOffset:  currentOffset,
 		AbsoluteOffset: lastAbsoluteOffset,
+		FlushedOffset:  lastAbsoluteOffset,
 
 		indexInterval: safeIntToUint64(cfg.IndexIntervalBytes),
 

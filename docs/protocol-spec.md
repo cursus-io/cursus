@@ -386,7 +386,7 @@ included partition.
 
 These commands are available only on topics created with `event_sourcing=true`.
 
-Event-sourcing commands are partition-routed by aggregate `key`. In distributed mode, `APPEND_STREAM`, `READ_STREAM`, `STREAM_VERSION`, `SAVE_SNAPSHOT`, and `READ_SNAPSHOT` must execute on the leader for the aggregate partition. A non-leader broker returns `ERROR: NOT_LEADER LEADER_IS <host:port>`; clients should reconnect to that address and retry. Followers index replicated event-sourcing messages and rebuild local stream indexes from the committed log on restart.
+Event-sourcing commands are partition-routed by aggregate `key`. In distributed mode, `APPEND_STREAM`, `READ_STREAM`, `STREAM_VERSION`, `SAVE_SNAPSHOT`, and `READ_SNAPSHOT` must execute on the leader for the aggregate partition. A non-leader broker returns `ERROR: NOT_LEADER LEADER_IS <host:port>`; clients should reconnect to that address and retry. Followers index replicated event-sourcing messages, apply quorum-replicated snapshots, and rebuild local stream indexes from the committed log on restart. Partitions persist their high watermark checkpoint and restore it on broker restart so committed reads resume from the last successful committed tail.
 
 **APPEND_STREAM**
 ```
@@ -461,7 +461,11 @@ SAVE_SNAPSHOT topic=<name> key=<aggregate_key> version=<N> message=<payload>
 
 Success response: `OK version=<N> partition=<N>`
 
-Error response: `ERROR: snapshot_version_exceeds_stream version=<N> current=<N>`
+In distributed mode, success means the leader stored the snapshot and replicated it to the configured in-sync replica quorum through the internal `REPLICATE_SNAPSHOT` broker-to-broker command. Clients should not send `REPLICATE_SNAPSHOT` directly.
+
+Error responses:
+- `ERROR: snapshot_version_exceeds_stream version=<N> current=<N>`
+- `ERROR: snapshot_replicate_failed reason="..."`
 
 **READ_SNAPSHOT**
 ```

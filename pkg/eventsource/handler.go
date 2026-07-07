@@ -39,6 +39,14 @@ type AppendResult struct {
 	Message   types.Message
 }
 
+type SnapshotResult struct {
+	Topic     string
+	Key       string
+	Version   uint64
+	Partition int
+	Payload   string
+}
+
 // NewHandler creates a new event sourcing command handler.
 func NewHandler(tm *topic.TopicManager) *Handler {
 	return &Handler{
@@ -440,6 +448,18 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 //
 //	SAVE_SNAPSHOT topic=<name> key=<aggregate_key> version=<N> message=<json_payload>
 func (h *Handler) HandleSaveSnapshot(cmd string) string {
+	result, errResp := h.SaveSnapshot(cmd, nil)
+	if errResp != "" {
+		return errResp
+	}
+	return result.Response()
+}
+
+func (r *SnapshotResult) Response() string {
+	return fmt.Sprintf("OK version=%d partition=%d", r.Version, r.Partition)
+}
+
+func (h *Handler) SaveSnapshot(cmd string, afterSave func(result SnapshotResult) error) (*SnapshotResult, string) {
 	h.wg.Add(1)
 	defer h.wg.Done()
 
@@ -447,58 +467,78 @@ func (h *Handler) HandleSaveSnapshot(cmd string) string {
 
 	topicName := args["topic"]
 	if topicName == "" {
-		return "ERROR: missing_topic"
+		return nil, "ERROR: missing_topic"
 	}
 	key := args["key"]
 	if key == "" {
-		return "ERROR: missing_key"
+		return nil, "ERROR: missing_key"
 	}
 	versionStr := args["version"]
 	if versionStr == "" {
-		return "ERROR: missing_version"
+		return nil, "ERROR: missing_version"
 	}
 	version, err := strconv.ParseUint(versionStr, 10, 64)
 	if err != nil {
-		return "ERROR: invalid_version"
+		return nil, "ERROR: invalid_version"
 	}
 	payload := args["message"]
 	if payload == "" {
-		return "ERROR: missing_message"
+		return nil, "ERROR: missing_message"
 	}
 
 	t := h.tm.GetTopic(topicName)
 	if t == nil {
-		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+		return nil, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
 	if !t.IsEventSourcing {
-		return fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", topicName)
+		return nil, fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", topicName)
 	}
 
 	partitionID := t.GetPartitionForMessage(types.Message{Key: key})
 	if partitionID < 0 {
-		return "ERROR: no_partitions_available"
+		return nil, "ERROR: no_partitions_available"
 	}
 
-	// Validate that version <= current stream version.
 	idx, err := h.getIndex(topicName, partitionID)
 	if err != nil {
-		return fmt.Sprintf("ERROR: stream_index_failed partition=%d reason=%q", partitionID, err.Error())
+		return nil, fmt.Sprintf("ERROR: stream_index_failed partition=%d reason=%q", partitionID, err.Error())
 	}
 	currentVersion := idx.GetVersion(key)
 	if version > currentVersion {
-		return fmt.Sprintf("ERROR: snapshot_version_exceeds_stream version=%d current=%d", version, currentVersion)
+		return nil, fmt.Sprintf("ERROR: snapshot_version_exceeds_stream version=%d current=%d", version, currentVersion)
 	}
 
-	ss, err := h.getSnapshot(topicName, partitionID)
+	result := SnapshotResult{Topic: topicName, Key: key, Version: version, Partition: partitionID, Payload: payload}
+	if errResp := h.SaveSnapshotReplica(result); errResp != "" {
+		return nil, errResp
+	}
+	if afterSave != nil {
+		if err := afterSave(result); err != nil {
+			return nil, fmt.Sprintf("ERROR: snapshot_replicate_failed reason=%q", err.Error())
+		}
+	}
+	return &result, ""
+}
+
+func (h *Handler) SaveSnapshotReplica(result SnapshotResult) string {
+	t := h.tm.GetTopic(result.Topic)
+	if t == nil {
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", result.Topic)
+	}
+	if !t.IsEventSourcing {
+		return fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", result.Topic)
+	}
+	if _, err := t.GetPartition(result.Partition); err != nil {
+		return fmt.Sprintf("ERROR: partition_lookup_failed partition=%d reason=%q", result.Partition, err.Error())
+	}
+	ss, err := h.getSnapshot(result.Topic, result.Partition)
 	if err != nil {
-		return fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", partitionID, err.Error())
+		return fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", result.Partition, err.Error())
 	}
-
-	if err := ss.Save(key, version, payload); err != nil {
+	if err := ss.Save(result.Key, result.Version, result.Payload); err != nil {
 		return fmt.Sprintf("ERROR: snapshot_save_failed reason=%q", err.Error())
 	}
-
-	return fmt.Sprintf("OK version=%d partition=%d", version, partitionID)
+	return ""
 }
 
 // HandleReadSnapshot processes:
@@ -590,6 +630,34 @@ func (h *Handler) HandleStreamVersion(cmd string) string {
 
 	version := idx.GetVersion(key)
 	return fmt.Sprintf("OK version=%d", version)
+}
+
+// DeleteTopic closes cached stream indexes and snapshot stores for a deleted topic.
+func (h *Handler) DeleteTopic(topicName string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	prefix := topicName + ":"
+	var firstErr error
+	for key, idx := range h.indexes {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if err := idx.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("close index %s: %w", key, err)
+		}
+		delete(h.indexes, key)
+	}
+	for key, ss := range h.snapshots {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if err := ss.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("close snapshot store %s: %w", key, err)
+		}
+		delete(h.snapshots, key)
+	}
+	return firstErr
 }
 
 // Close closes all StreamIndex and SnapshotStore instances held by this handler.

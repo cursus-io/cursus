@@ -2,6 +2,10 @@ package topic
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,18 +25,19 @@ type producerEntry struct {
 
 // Partition handles messages for one shard of a topic.
 type Partition struct {
-	id            int
-	topic         string
-	newMessageCh  chan struct{}
-	LEO           atomic.Uint64
-	HWM           uint64
-	mu            sync.RWMutex
-	dh            types.StorageHandler
-	closed        bool
-	streamManager StreamManager
-	producerState sync.Map // map[string]*producerEntry
-	isIdempotent  bool
-	closeCh       chan struct{}
+	id                int
+	topic             string
+	newMessageCh      chan struct{}
+	LEO               atomic.Uint64
+	HWM               uint64
+	mu                sync.RWMutex
+	dh                types.StorageHandler
+	closed            bool
+	streamManager     StreamManager
+	hwmCheckpointPath string
+	producerState     sync.Map // map[string]*producerEntry
+	isIdempotent      bool
+	closeCh           chan struct{}
 }
 
 // NewPartition creates a partition instance.
@@ -53,11 +58,13 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	p.HWM = initialOffset
 
 	if handler, ok := dh.(*disk.DiskHandler); ok {
-		p.HWM = handler.GetAbsoluteOffset()
-		handler.OnSync = func(flushedOffset uint64) {
-			p.mu.Lock()
-			p.HWM = flushedOffset
-			p.mu.Unlock()
+		p.hwmCheckpointPath = hwmCheckpointPath(handler, id)
+		if persistedHWM, ok := loadHWMCheckpoint(p.hwmCheckpointPath); ok {
+			p.HWM = persistedHWM
+		} else {
+			p.HWM = handler.GetAbsoluteOffset()
+		}
+		handler.OnSync = func(uint64) {
 			p.NotifyNewMessage()
 		}
 	}
@@ -131,9 +138,7 @@ func (p *Partition) Enqueue(msg types.Message) {
 	p.updateProducerState(&msg)
 	msg.Offset = offset
 	p.LEO.Store(offset + 1)
-	if p.HWM < offset+1 {
-		p.HWM = offset + 1
-	}
+	p.setHWMLocked(offset + 1)
 
 	p.NotifyNewMessage()
 }
@@ -158,9 +163,7 @@ func (p *Partition) EnqueueSync(msg types.Message) error {
 	p.updateProducerState(&msg)
 	msg.Offset = offset
 	p.LEO.Store(offset + 1)
-	if p.HWM < offset+1 {
-		p.HWM = offset + 1
-	}
+	p.setHWMLocked(offset + 1)
 
 	p.NotifyNewMessage()
 	return nil
@@ -190,9 +193,7 @@ func (p *Partition) EnqueueBatchSync(msgs []types.Message) error {
 		p.updateProducerState(&msgs[i])
 		msgs[i].Offset = offset
 		p.LEO.Store(offset + 1)
-		if p.HWM < offset+1 {
-			p.HWM = offset + 1
-		}
+		p.setHWMLocked(offset + 1)
 	}
 	p.NotifyNewMessage()
 	return nil
@@ -221,9 +222,7 @@ func (p *Partition) EnqueueBatch(msgs []types.Message) error {
 		p.updateProducerState(&msgs[i])
 		msgs[i].Offset = offset
 		p.LEO.Store(offset + 1)
-		if p.HWM < offset+1 {
-			p.HWM = offset + 1
-		}
+		p.setHWMLocked(offset + 1)
 	}
 	p.NotifyNewMessage()
 	return nil
@@ -262,10 +261,7 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 func (p *Partition) AdvanceHWM() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	leo := p.LEO.Load()
-	if leo > p.HWM {
-		p.HWM = leo
-	}
+	p.setHWMLocked(p.LEO.Load())
 }
 
 // ReplicaAppend writes messages with pre-assigned offsets from the leader (follower replication).
@@ -286,9 +282,7 @@ func (p *Partition) ReplicaAppend(msgs []types.Message) error {
 		if currentLEO := p.LEO.Load(); newLEO > currentLEO {
 			p.LEO.Store(newLEO)
 		}
-		if p.HWM < newLEO {
-			p.HWM = newLEO
-		}
+		p.setHWMLocked(newLEO)
 	}
 	p.NotifyNewMessage()
 	return nil
@@ -359,10 +353,61 @@ func (p *Partition) ReserveOffsets(count int) uint64 {
 func (p *Partition) SetHWM(hwm uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if hwm > p.HWM {
-		p.HWM = hwm
+	if p.setHWMLocked(hwm) {
 		p.NotifyNewMessage()
 	}
+}
+
+func (p *Partition) setHWMLocked(hwm uint64) bool {
+	if hwm <= p.HWM {
+		return false
+	}
+	p.HWM = hwm
+	p.persistHWMCheckpointLocked()
+	return true
+}
+
+func (p *Partition) persistHWMCheckpointLocked() {
+	if p.hwmCheckpointPath == "" {
+		return
+	}
+	tmp := p.hwmCheckpointPath + ".tmp"
+	data := []byte(strconv.FormatUint(p.HWM, 10) + "\n")
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		util.Warn("failed to write HWM checkpoint %s: %v", tmp, err)
+		return
+	}
+	_ = os.Remove(p.hwmCheckpointPath)
+	if err := os.Rename(tmp, p.hwmCheckpointPath); err != nil {
+		util.Warn("failed to rename HWM checkpoint %s: %v", p.hwmCheckpointPath, err)
+	}
+}
+
+func hwmCheckpointPath(dh types.StorageHandler, partitionID int) string {
+	if dh == nil {
+		return ""
+	}
+	segmentPath := dh.GetSegmentPath(0)
+	if segmentPath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(segmentPath), fmt.Sprintf("partition_%d.hwm", partitionID))
+}
+
+func loadHWMCheckpoint(path string) (uint64, bool) {
+	if path == "" {
+		return 0, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	hwm, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		util.Warn("ignoring invalid HWM checkpoint %s: %v", path, err)
+		return 0, false
+	}
+	return hwm, true
 }
 
 // GetHWM returns the high water mark in a thread-safe manner.

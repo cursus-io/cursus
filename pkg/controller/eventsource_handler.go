@@ -41,6 +41,51 @@ func (ch *CommandHandler) handleAppendStream(cmd string) string {
 	return ch.ESHandler.HandleAppendStream(cmd)
 }
 
+func (ch *CommandHandler) handleSaveSnapshot(cmd string) string {
+	partition, errResp := ch.eventStreamPartition(cmd, "SAVE_SNAPSHOT ")
+	if errResp != "" {
+		return errResp
+	}
+	if ch.Config != nil && ch.Config.EnabledDistribution && ch.Cluster != nil {
+		topicName := eventStreamTopic(cmd, "SAVE_SNAPSHOT ")
+		if resp, forwarded, _ := ch.isPartitionLeaderAndForward(topicName, partition, cmd); forwarded {
+			return resp
+		}
+		result, errResp := ch.ESHandler.SaveSnapshot(cmd, func(result eventsource.SnapshotResult) error {
+			payload, err := json.Marshal(result)
+			if err != nil {
+				return err
+			}
+			replicateCmd := fmt.Sprintf("REPLICATE_SNAPSHOT payload=%s", string(payload))
+			return ch.Cluster.ReplicateCommandToFollowers(result.Topic, result.Partition, replicateCmd, ch.Config.MinInSyncReplicas)
+		})
+		if errResp != "" {
+			return errResp
+		}
+		return result.Response()
+	}
+	return ch.ESHandler.HandleSaveSnapshot(cmd)
+}
+
+func (ch *CommandHandler) handleReplicateSnapshot(cmd string) string {
+	idx := strings.Index(cmd, "payload=")
+	if idx == -1 {
+		return "ERROR: missing_payload command=REPLICATE_SNAPSHOT"
+	}
+	payload := cmd[idx+8:]
+	var snap eventsource.SnapshotResult
+	if err := json.Unmarshal([]byte(payload), &snap); err != nil {
+		return fmt.Sprintf("ERROR: unmarshal_failed reason=%q", err.Error())
+	}
+	if snap.Topic == "" || snap.Key == "" {
+		return "ERROR: invalid_snapshot_payload"
+	}
+	if errResp := ch.ESHandler.SaveSnapshotReplica(snap); errResp != "" {
+		return errResp
+	}
+	return "OK"
+}
+
 func (ch *CommandHandler) handleEventSourceRoutedCommand(cmd, prefix string, local func(string) string) string {
 	partition, errResp := ch.eventStreamPartition(cmd, prefix)
 	if errResp != "" {

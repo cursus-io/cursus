@@ -2,8 +2,9 @@ package disk
 
 import (
 	"fmt"
-	"strconv"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -53,6 +54,25 @@ func (dm *DiskManager) CloseAllHandlers() {
 	defer dm.mu.Unlock()
 
 	for name, dh := range dm.handlers {
+		util.Debug("Closing DiskHandler for %s", name)
+		if err := dh.Close(); err != nil {
+			util.Warn("Failed to close DiskHandler for %s: %v", name, err)
+		}
+		delete(dm.handlers, name)
+	}
+}
+
+// CloseTopicHandlers closes and forgets all handlers for a topic so its log
+// directory can be safely deleted before the topic is recreated.
+func (dm *DiskManager) CloseTopicHandlers(topic string) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	prefix := topic + "_"
+	for name, dh := range dm.handlers {
+		if name != topic && !strings.HasPrefix(name, prefix) {
+			continue
+		}
 		util.Debug("Closing DiskHandler for %s", name)
 		if err := dh.Close(); err != nil {
 			util.Warn("Failed to close DiskHandler for %s: %v", name, err)

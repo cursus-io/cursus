@@ -1142,3 +1142,43 @@ func encodeBatchWithCustomAcks(topicName string, partition int, acks string, isI
 	}
 	return json.Marshal(batch)
 }
+
+func TestHandleCommitAndFetchOffset_AllowsWildcardGroupTopic(t *testing.T) {
+	ch, tm, coord := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopic("wild-alpha", 1, false, false))
+	require.NoError(t, coord.RegisterGroup("wild-*", "wild-group", 1))
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("COMMIT_OFFSET topic=wild-alpha partition=0 group=wild-group offset=7", ctx)
+	assert.Equal(t, "OK", resp)
+
+	resp = ch.HandleCommand("FETCH_OFFSET topic=wild-alpha partition=0 group=wild-group", ctx)
+	assert.Equal(t, "OK offset=7", resp)
+}
+
+func TestHandleCommitAndFetchOffset_AllowsQuestionMarkGroupTopic(t *testing.T) {
+	ch, tm, coord := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopic("q-1", 1, false, false))
+	require.NoError(t, coord.RegisterGroup("q-?", "question-group", 1))
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("COMMIT_OFFSET topic=q-1 partition=0 group=question-group offset=3", ctx)
+	assert.Equal(t, "OK", resp)
+
+	resp = ch.HandleCommand("FETCH_OFFSET topic=q-1 partition=0 group=question-group", ctx)
+	assert.Equal(t, "OK offset=3", resp)
+}
+
+func TestHandleReplicateSnapshot_SavesFollowerSnapshot(t *testing.T) {
+	ch, tm, _ := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopic("snap-rep-topic", 1, false, true))
+	ctx := NewClientContext("", 0)
+
+	payload := `{"topic":"snap-rep-topic","key":"agg-1","version":2,"partition":0,"payload":"{\"state\":\"ok\"}"}`
+	resp := ch.HandleCommand("REPLICATE_SNAPSHOT payload="+payload, ctx)
+	assert.Equal(t, "OK", resp)
+
+	resp = ch.HandleCommand("READ_SNAPSHOT topic=snap-rep-topic key=agg-1", ctx)
+	assert.Contains(t, resp, `"version":2`)
+	assert.Contains(t, resp, `state`)
+}

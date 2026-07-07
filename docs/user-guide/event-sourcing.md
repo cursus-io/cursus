@@ -226,9 +226,11 @@ if aggregate.version % 500 == 0 {
 }
 ```
 
-### Snapshot Locality
+### Snapshot Replication
 
-In distributed mode, snapshots are stored locally on each node. They are not replicated. If a node lacks a snapshot, it replays events from version 1. This is by design: snapshots are a performance optimization, not a correctness requirement.
+In distributed mode, `SAVE_SNAPSHOT` is routed to the aggregate partition leader. The leader validates that the snapshot version is not ahead of the current stream version, stores the snapshot locally, then replicates it to followers with an internal `REPLICATE_SNAPSHOT` command before returning success. A successful response means the snapshot reached the configured in-sync replica quorum.
+
+Snapshots remain a replay optimization: correctness still comes from the committed event log. If a broker lacks a snapshot after failover or restore, it can rebuild stream state by replaying committed events.
 
 ---
 
@@ -258,9 +260,11 @@ ERROR: NOT_LEADER LEADER_IS <host:port>
 
 SDKs should reconnect to the advertised leader and retry the command. `READ_STREAM` reads from the committed log, so it does not expose uncommitted leader-local events.
 
-### Snapshots and Retention
+### Snapshots, Committed Tail, and Retention
 
-Snapshots are local performance hints. They are not replicated between brokers, and correctness must not depend on a snapshot being present after failover. A new leader or restarted broker can rebuild stream state from the committed event log and replay from version 1 when no snapshot is available.
+Snapshots are quorum-replicated by the partition leader before `SAVE_SNAPSHOT` returns `OK`. Followers apply the replicated snapshot locally, so a promoted follower can serve snapshot-assisted reads for snapshots that reached quorum. Snapshot replication is still a local broker-to-broker fanout path; if a node was offline during the write, it may need to replay committed events until it receives or creates a later snapshot.
+
+Each partition persists its committed tail as a high-watermark checkpoint. Leader appends advance LEO first; HWM advances only after the replicated write path succeeds and is flushed. On broker restart, the partition restores the checkpointed HWM and `READ_STREAM`/`CONSUME` only expose records at or below the recovered committed tail. This prevents uncommitted leader-local records that happened to be flushed before a crash from becoming visible after restart.
 
 Because event sourcing relies on replay, retention must be configured carefully. If old event records are deleted before a durable snapshot/export strategy exists for the aggregate, a broker can no longer rebuild the full stream history from version 1. For event-sourcing topics, prefer retention settings that preserve the event log for as long as the domain requires replay.
 
@@ -269,7 +273,8 @@ Because event sourcing relies on replay, retention must be configured carefully.
 - Append ordering is linearizable per aggregate key on the partition leader.
 - Optimistic concurrency is enforced by requiring `version = currentVersion + 1`.
 - Replicated followers maintain their own stream index from the replicated log.
-- Reads return committed events only.
+- Snapshot writes are quorum-replicated before success.
+- Reads return committed events only, bounded by the recovered HWM after restart.
 - Exactly-once side effects are not provided by the broker; projection handlers should remain idempotent.
 
 ---
