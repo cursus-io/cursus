@@ -379,6 +379,7 @@ func (p *Partition) persistHWMCheckpointLocked() {
 	}
 	tmp := p.hwmCheckpointPath + ".tmp"
 	data := []byte(strconv.FormatUint(p.HWM, 10) + "\n")
+	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		util.Warn("failed to open HWM checkpoint %s: %v", tmp, err)
