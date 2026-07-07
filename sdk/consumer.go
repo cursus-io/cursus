@@ -125,8 +125,7 @@ func (c *Consumer) Start(handler func(Message) error) error {
 	for _, pid := range assignments {
 		offset, err := c.fetchOffset(pid)
 		if err != nil {
-			LogWarn("Failed to fetch offset for P%d: %v, starting from 0", pid, err)
-			offset = 0
+			return fmt.Errorf("fetch offset for P%d failed: %w", pid, err)
 		}
 		offsetMap[pid] = offset
 	}
@@ -686,16 +685,28 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 		return 0, fmt.Errorf("fetch offset response: %w", err)
 	}
 
-	respStr := string(resp)
-	if strings.HasPrefix(respStr, "ERROR") {
+	respStr := strings.TrimSpace(string(resp))
+	return parseFetchOffsetResponse(respStr)
+}
+
+func parseFetchOffsetResponse(respStr string) (uint64, error) {
+	if strings.HasPrefix(respStr, "ERROR:") {
 		return 0, fmt.Errorf("fetch offset broker error: %s", respStr)
 	}
 
-	offset, err := strconv.ParseUint(strings.TrimSpace(respStr), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid offset response: %s", respStr)
+	if !strings.HasPrefix(respStr, "OK") {
+		return 0, fmt.Errorf("unexpected offset response: %s", respStr)
 	}
-	return offset, nil
+	for _, part := range strings.Fields(respStr) {
+		if strings.HasPrefix(part, "offset=") {
+			offset, err := strconv.ParseUint(strings.TrimPrefix(part, "offset="), 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("invalid offset response: %s", respStr)
+			}
+			return offset, nil
+		}
+	}
+	return 0, fmt.Errorf("missing offset in response: %s", respStr)
 }
 
 // ─── Close ────────────────────────────────────────────────────────────────────

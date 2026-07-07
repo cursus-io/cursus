@@ -7,31 +7,30 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseAppendResponse(t *testing.T) {
 	resp := "OK version=3 offset=1024 partition=2"
 
-	result := parseAppendResponse(resp)
+	result, err := parseAppendResponse(resp)
+	require.NoError(t, err)
 
 	assert.Equal(t, uint64(3), result.Version)
 	assert.Equal(t, uint64(1024), result.Offset)
 	assert.Equal(t, 2, result.Partition)
 }
 
-func TestParseAppendResponse_Partial(t *testing.T) {
-	resp := "OK version=1"
-
-	result := parseAppendResponse(resp)
-
-	assert.Equal(t, uint64(1), result.Version)
-	assert.Equal(t, uint64(0), result.Offset)
-	assert.Equal(t, 0, result.Partition)
+func TestParseAppendResponse_MissingFields(t *testing.T) {
+	_, err := parseAppendResponse("OK version=1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing append fields")
 }
 
-func TestParseAppendResponse_Empty(t *testing.T) {
-	result := parseAppendResponse("")
-	assert.Equal(t, uint64(0), result.Version)
+func TestParseAppendResponse_UnexpectedResponse(t *testing.T) {
+	_, err := parseAppendResponse("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected append response")
 }
 
 func TestEventStore_NewAndClose(t *testing.T) {
@@ -96,16 +95,17 @@ func TestEventStore_ResetConn_Nil(t *testing.T) {
 
 func TestParseAppendResponse_UnknownFields(t *testing.T) {
 	resp := "OK version=7 unknown=foo offset=42 partition=1 extra=bar"
-	result := parseAppendResponse(resp)
+	result, err := parseAppendResponse(resp)
+	require.NoError(t, err)
 	assert.Equal(t, uint64(7), result.Version)
 	assert.Equal(t, uint64(42), result.Offset)
 	assert.Equal(t, 1, result.Partition)
 }
 
 func TestParseAppendResponse_NoEquals(t *testing.T) {
-	resp := "OK done"
-	result := parseAppendResponse(resp)
-	assert.Equal(t, uint64(0), result.Version)
+	_, err := parseAppendResponse("OK done")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing append fields")
 }
 
 func TestAppendCommandFormat(t *testing.T) {
@@ -121,9 +121,11 @@ func TestAppendCommandFormat(t *testing.T) {
 	if sv == 0 {
 		sv = 1
 	}
+	expectedVersion := uint64(0)
+	nextVersion := expectedVersion + 1
 	cmd := "APPEND_STREAM topic=" + es.topic +
 		" key=order-1" +
-		" version=" + strconv.FormatUint(0, 10) +
+		" version=" + strconv.FormatUint(nextVersion, 10) +
 		" event_type=" + event.Type +
 		" schema_version=" + strconv.FormatUint(uint64(sv), 10) +
 		" producerId=" + es.producerID +
@@ -132,9 +134,42 @@ func TestAppendCommandFormat(t *testing.T) {
 	assert.True(t, strings.HasPrefix(cmd, "APPEND_STREAM"))
 	assert.Contains(t, cmd, "topic=orders")
 	assert.Contains(t, cmd, "key=order-1")
-	assert.Contains(t, cmd, "version=0")
+	assert.Contains(t, cmd, "version=1")
 	assert.Contains(t, cmd, "event_type=OrderCreated")
 	assert.Contains(t, cmd, "schema_version=1")
 	assert.Contains(t, cmd, "producerId=p-1")
 	assert.Contains(t, cmd, `message={"id":1}`)
+}
+func TestParseSnapshotResponse_StrictContract(t *testing.T) {
+	snapshotJSON, ok, err := parseSnapshotResponse(`OK snapshot={"version":1,"payload":"x"}`)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, `{"version":1,"payload":"x"}`, snapshotJSON)
+
+	snapshotJSON, ok, err = parseSnapshotResponse("OK snapshot=null")
+	require.NoError(t, err)
+	assert.False(t, ok)
+	assert.Empty(t, snapshotJSON)
+
+	_, _, err = parseSnapshotResponse("NULL")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected snapshot response")
+
+	_, _, err = parseSnapshotResponse(`{"version":1,"payload":"x"}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected snapshot response")
+}
+
+func TestParseStreamVersionResponse_StrictContract(t *testing.T) {
+	version, err := parseStreamVersionResponse("OK version=7")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(7), version)
+
+	_, err = parseStreamVersionResponse("7")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected version response")
+
+	_, err = parseStreamVersionResponse("OK")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing version")
 }
