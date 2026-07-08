@@ -76,12 +76,12 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 			p.HWM = durableTail
 		}
 		notifyCh := p.newMessageCh
-		handler.OnSync = func(uint64) {
+		handler.SetOnSync(func(uint64) {
 			select {
 			case notifyCh <- struct{}{}:
 			default:
 			}
-		}
+		})
 	}
 
 	if p.hwmCheckpointCh != nil {

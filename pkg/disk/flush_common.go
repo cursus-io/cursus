@@ -125,8 +125,8 @@ func (d *DiskHandler) syncLoop() {
 			currentOffset := atomic.LoadUint64(&d.AbsoluteOffset)
 			d.ioMu.Unlock()
 
-			if syncSuccess && d.OnSync != nil {
-				d.OnSync(currentOffset)
+			if syncSuccess {
+				d.notifySync(currentOffset)
 			}
 		case <-d.done:
 			return
