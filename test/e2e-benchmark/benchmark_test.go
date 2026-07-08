@@ -55,8 +55,15 @@ func TestRunComposePlacesProjectNameAfterComposeSubcommand(t *testing.T) {
 }
 
 func composeDown(t *testing.T, file string) {
-	// Force remove containers first to handle conflicts from other compose projects
-	// sharing the same container names
+	// Force remove containers first to handle conflicts from compose files that
+	// declare fixed container_name values outside project-name isolation.
+	for _, name := range fixedBenchmarkContainers(file) {
+		cmd := exec.Command("docker", "rm", "-f", "-v", name)
+		if output, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(output), "No such container") {
+			t.Logf("docker rm warning for %s: %v\n%s", name, err, string(output))
+		}
+	}
+
 	cmd := runCompose("-f", file, "rm", "-f", "-s", "-v")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Logf("compose rm warning: %v\n%s", err, string(output))
@@ -66,6 +73,13 @@ func composeDown(t *testing.T, file string) {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Logf("compose down warning: %v\n%s", err, string(output))
 	}
+}
+
+func fixedBenchmarkContainers(file string) []string {
+	if strings.Contains(filepath.ToSlash(file), "/cluster/") {
+		return []string{"broker-1", "broker-2", "broker-3", "broker-publisher", "broker-consumer", "prometheus"}
+	}
+	return []string{"bench-broker", "bench-publisher", "bench-consumer"}
 }
 
 func composeUp(t *testing.T, file string) {

@@ -114,7 +114,7 @@ func (p *Partition) isDuplicate(msg *types.Message) bool {
 }
 
 func (p *Partition) updateProducerState(msg *types.Message) {
-	if msg.ProducerID == "" {
+	if !p.isIdempotent || msg.ProducerID == "" {
 		return
 	}
 	if msg.SeqNum > 0 {

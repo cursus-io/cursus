@@ -99,14 +99,54 @@ e2e-logs:
 .PHONY: bench
 bench:
 	@bash -c '\
-	set +e; \
+	set -euo pipefail; \
+	compose="docker compose -f test/docker-compose.yml"; \
+	status=0; \
+	log_file=$$(mktemp); \
 	echo "[MAKE] Running benchmark with docker-compose..."; \
-	timeout 180s docker compose -f test/docker-compose.yml up --build --remove-orphans; \
-	echo "[MAKE] Containers finished or timed out"; \
-	docker compose -f test/docker-compose.yml logs; \
-	docker compose -f test/docker-compose.yml down -v; \
+	$$compose down -v --remove-orphans >/dev/null 2>&1 || true; \
+	$$compose up -d --build --remove-orphans || status=$$?; \
+	if [ "$$status" -eq 0 ]; then \
+		deadline=$$((SECONDS + 180)); \
+		while true; do \
+			publisher_status=$$(docker inspect -f "{{.State.Status}}" bench-publisher 2>/dev/null || echo missing); \
+			consumer_status=$$(docker inspect -f "{{.State.Status}}" bench-consumer 2>/dev/null || echo missing); \
+			if [ "$$publisher_status" = "exited" ] && [ "$$consumer_status" = "exited" ]; then \
+				break; \
+			fi; \
+			if [ "$$SECONDS" -ge "$$deadline" ]; then \
+				echo "[MAKE] Benchmark timed out: publisher=$$publisher_status consumer=$$consumer_status"; \
+				status=124; \
+				break; \
+			fi; \
+			sleep 2; \
+		done; \
+	fi; \
+	if [ "$$status" -eq 0 ]; then \
+		publisher_code=$$(docker inspect -f "{{.State.ExitCode}}" bench-publisher 2>/dev/null || echo 127); \
+		consumer_code=$$(docker inspect -f "{{.State.ExitCode}}" bench-consumer 2>/dev/null || echo 127); \
+		if [ "$$publisher_code" != "0" ] || [ "$$consumer_code" != "0" ]; then \
+			echo "[MAKE] Benchmark container failure: publisher=$$publisher_code consumer=$$consumer_code"; \
+			status=1; \
+		fi; \
+	fi; \
+	echo "[MAKE] Benchmark logs:"; \
+	$$compose logs | tee "$$log_file" || true; \
+	if grep -Eiq "benchmark incomplete|verify failed|Failed messages[[:space:]]*: [1-9][0-9]*|Message missing[[:space:]]*: [1-9][0-9]*|Duplicate \\(MessageID\\)[[:space:]]*: [1-9][0-9]*|Duplicate \\(Offset\\)[[:space:]]*: [1-9][0-9]*|panic:|fatal" "$$log_file"; then \
+		echo "[MAKE] Benchmark failure marker found in logs"; \
+		status=1; \
+	fi; \
+	rm -f "$$log_file"; \
+	cleanup_status=0; \
+	$$compose down -v --remove-orphans || cleanup_status=$$?; \
+	if [ "$$cleanup_status" -ne 0 ]; then \
+		echo "[MAKE] Benchmark cleanup failed: status=$$cleanup_status"; \
+		if [ "$$status" -eq 0 ]; then \
+			status=$$cleanup_status; \
+		fi; \
+	fi; \
+	exit "$$status"; \
 	'
-
 .PHONY: bench-disk
 bench-disk:
 	@echo "Running disk I/O benchmarks..."
