@@ -528,3 +528,43 @@ func TestPartitionConsumer_EnsureConnection_HasConn(t *testing.T) {
 	err := pc.ensureConnection()
 	assert.NoError(t, err)
 }
+
+func TestEffectivePollBatchSize(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *ConsumerConfig
+		want int
+	}{
+		{
+			name: "batch size below max poll records",
+			cfg:  &ConsumerConfig{BatchSize: 100, MaxPollRecords: 500},
+			want: 100,
+		},
+		{
+			name: "max poll records caps batch size",
+			cfg:  &ConsumerConfig{BatchSize: 5000, MaxPollRecords: 1000},
+			want: 1000,
+		},
+		{
+			name: "max poll records supplies missing batch size",
+			cfg:  &ConsumerConfig{BatchSize: 0, MaxPollRecords: 250},
+			want: 250,
+		},
+		{
+			name: "fallback",
+			cfg:  &ConsumerConfig{},
+			want: 100,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, effectivePollBatchSize(tt.cfg))
+		})
+	}
+}
+
+func TestEffectiveStreamBatchSize(t *testing.T) {
+	assert.Equal(t, 500, effectiveStreamBatchSize(&ConsumerConfig{BatchSize: 500}))
+	assert.Equal(t, 100, effectiveStreamBatchSize(&ConsumerConfig{}))
+}

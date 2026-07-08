@@ -88,15 +88,18 @@ func RunCompose(args ...string) *exec.Cmd {
 }
 
 // GivenRestart starts the broker environment and returns a new context
-func initEnvironment(t *testing.T) {
+func initEnvironment(t testing.TB) {
 	envOnce.Do(func() {
 		t.Log("Starting docker compose environment...")
 
 		cmd := RunCompose("-f", composeFile, "up", "-d", "--build")
 		if output, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("Failed to start docker compose: %v\nOutput: %s", err, string(output))
+			if healthErr := CheckBrokerHealth(StandAloneHealthCheckAddr); healthErr == nil {
+				t.Logf("docker compose up returned %v, but broker is healthy. Output: %s", err, string(output))
+			} else {
+				t.Fatalf("Failed to start docker compose: %v\nOutput: %s", err, string(output))
+			}
 		}
-
 		if err := CheckBrokerHealth(StandAloneHealthCheckAddr); err != nil {
 			t.Fatalf("Broker failed to become healthy: %v", err)
 		}

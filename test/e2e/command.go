@@ -135,9 +135,23 @@ func (bc *BrokerClient) FetchCommittedOffset(topic string, partition int, groupI
 		return 0, fmt.Errorf("broker error: %s", respStr)
 	}
 
+	if strings.HasPrefix(respStr, "OK") {
+		for _, part := range strings.Fields(respStr) {
+			if strings.HasPrefix(part, "offset=") {
+				var offset uint64
+				if n, err := fmt.Sscanf(part, "offset=%d", &offset); err != nil || n != 1 {
+					return 0, fmt.Errorf("invalid offset response: %s", respStr)
+				}
+				return offset, nil
+			}
+		}
+		return 0, fmt.Errorf("missing offset in response: %s", respStr)
+	}
+
+	// Legacy brokers returned a plain integer offset.
 	var offset uint64
 	if n, err := fmt.Sscanf(respStr, "%d", &offset); err != nil || n != 1 {
-		return 0, fmt.Errorf("expected integer offset, got: %s", respStr)
+		return 0, fmt.Errorf("expected offset response, got: %s", respStr)
 	}
 	return offset, nil
 }

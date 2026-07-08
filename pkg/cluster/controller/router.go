@@ -3,10 +3,10 @@ package controller
 import (
 	"encoding/binary"
 	"fmt"
-	"strconv"
 	"io"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -229,7 +229,7 @@ func (r *ClusterRouter) processLocally(req string) string {
 	if r.localProcessor != nil {
 		return r.localProcessor.ProcessCommand(req)
 	}
-	return "ERROR: no local processor configured"
+	return "ERROR: local_processor_not_configured"
 }
 
 func (r *ClusterRouter) sendRequest(addr, command string) (string, error) {

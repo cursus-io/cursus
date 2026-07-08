@@ -61,8 +61,8 @@ func TestCommandHandler_Publish(t *testing.T) {
 		cmd := "PUBLISH topic=no-topic producerId=p1 message=hello"
 		resp := ch.HandleCommand(cmd, ctx)
 
-		if !strings.Contains(resp, "ERROR: topic 'no-topic' does not exist") {
-			t.Errorf("Expected topic not found error, got: %s", resp)
+		if !strings.Contains(resp, "ERROR: topic_not_found topic=no-topic") {
+			t.Errorf("Expected topic_not_found error, got: %s", resp)
 		}
 	})
 }
@@ -78,7 +78,7 @@ func TestCommandHandler_Consume(t *testing.T) {
 
 	t.Run("CONSUME syntax error", func(t *testing.T) {
 		resp := ch.HandleCommand("CONSUME topic=test-topic", ctx)
-		if !strings.Contains(resp, "ERROR: invalid CONSUME syntax") {
+		if !strings.Contains(resp, "ERROR: invalid_consume_syntax") {
 			t.Errorf("Expected syntax error, got: %s", resp)
 		}
 	})

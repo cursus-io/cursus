@@ -45,7 +45,8 @@ type DiskHandler struct {
 	writeCh     chan types.DiskMessage
 	done        chan struct{}
 	flushSignal chan chan struct{}
-	OnSync      func(uint64)
+	onSyncMu    sync.RWMutex
+	onSync      func(uint64)
 
 	batchSize      int
 	linger         time.Duration
@@ -63,6 +64,21 @@ type DiskHandler struct {
 
 	closeOnce sync.Once
 	shutdown  sync.WaitGroup
+}
+
+func (d *DiskHandler) SetOnSync(callback func(uint64)) {
+	d.onSyncMu.Lock()
+	defer d.onSyncMu.Unlock()
+	d.onSync = callback
+}
+
+func (d *DiskHandler) notifySync(offset uint64) {
+	d.onSyncMu.RLock()
+	callback := d.onSync
+	d.onSyncMu.RUnlock()
+	if callback != nil {
+		callback(offset)
+	}
 }
 
 func (d *DiskHandler) GetActiveReaders() int32 {
@@ -136,6 +152,7 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 		segments:       make([]uint64, 0),
 		CurrentOffset:  currentOffset,
 		AbsoluteOffset: lastAbsoluteOffset,
+		FlushedOffset:  lastAbsoluteOffset,
 
 		indexInterval: safeIntToUint64(cfg.IndexIntervalBytes),
 

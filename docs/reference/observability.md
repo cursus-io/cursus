@@ -178,8 +178,8 @@ Request Logging
 Command Result Logging 
 
 ```
-[CMD] SUCCESS | Command: [CREATE orders 4] | Response: ✅ Topic 'orders' now has 4 partitions
-[CMD] FAILURE | Command: [DELETE nonexistent] | Response: ERROR: topic 'nonexistent' not found
+[CMD] SUCCESS | Command: [CREATE topic=orders partitions=4] | Response: OK topic=orders partitions=4
+[CMD] FAILURE | Command: [DELETE topic=nonexistent] | Response: ERROR: topic_not_found topic=nonexistent
 ```
 
 Streaming Logging 

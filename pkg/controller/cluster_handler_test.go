@@ -67,8 +67,8 @@ func TestCommandHandler_isLeaderAndForward_WaitRetry(t *testing.T) {
 	if !forwarded {
 		t.Error("Expected forwarded to be true")
 	}
-	if !strings.Contains(resp, "router is nil") {
-		t.Errorf("Expected 'router is nil' error, got %s", resp)
+	if !strings.Contains(resp, "router_not_available") {
+		t.Errorf("Expected 'router_not_available' error, got %s", resp)
 	}
 	if err != nil {
 		t.Errorf("Expected nil error (handled via response string), got %v", err)

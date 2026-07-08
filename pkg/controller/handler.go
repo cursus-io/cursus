@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -12,7 +11,6 @@ import (
 	"github.com/cursus-io/cursus/pkg/eventsource"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
-	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -78,14 +76,22 @@ func NewCommandHandler(
 		{prefix: "HEARTBEAT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHeartbeat(cmd) }},
 		{prefix: "COMMIT_OFFSET ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCommitOffset(cmd) }},
 		{prefix: "BATCH_COMMIT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd) }},
-		{prefix: "APPEND_STREAM ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.ESHandler.HandleAppendStream(cmd) }},
-		{prefix: "STREAM_VERSION ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.ESHandler.HandleStreamVersion(cmd) }},
-		{prefix: "SAVE_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.ESHandler.HandleSaveSnapshot(cmd) }},
-		{prefix: "READ_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.ESHandler.HandleReadSnapshot(cmd) }},
+		{prefix: "APPEND_STREAM ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAppendStream(cmd) }},
+		{prefix: "STREAM_VERSION ", exact: false, handler: func(cmd string, ctx *ClientContext) string {
+			return ch.handleEventSourceRoutedCommand(cmd, "STREAM_VERSION ", ch.ESHandler.HandleStreamVersion)
+		}},
+		{prefix: "SAVE_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSaveSnapshot(cmd) }},
+		{prefix: "READ_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string {
+			return ch.handleEventSourceRoutedCommand(cmd, "READ_SNAPSHOT ", ch.ESHandler.HandleReadSnapshot)
+		}},
 		{prefix: "READ_STREAM ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return STREAM_DATA_SIGNAL }},
 		{prefix: "METADATA ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleMetadata(cmd) }},
 		{prefix: "FIND_COORDINATOR ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFindCoordinator(cmd) }},
 		{prefix: "REPLICATE_MESSAGE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateMessage(cmd) }},
+		{prefix: "REPLICATE_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateSnapshot(cmd) }},
+		{prefix: "LIST_SNAPSHOTS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListSnapshots(cmd) }},
+		{prefix: "FETCH_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchSnapshot(cmd) }},
+		{prefix: "CATCHUP_SNAPSHOTS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCatchupSnapshots(cmd) }},
 		{prefix: "RAFT_APPLY ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd) }},
 	}
 	return ch
@@ -104,7 +110,7 @@ func (ch *CommandHandler) logCommandResult(cmd, response string) {
 func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) string {
 	cmd := strings.TrimSpace(rawCmd)
 	if cmd == "" {
-		return ch.fail(rawCmd, "ERROR: empty command")
+		return ch.fail(rawCmd, "ERROR: empty_command")
 	}
 
 	upper := strings.ToUpper(cmd)
@@ -134,7 +140,7 @@ func (ch *CommandHandler) handleCommandByType(cmd, upper string, ctx *ClientCont
 			}
 		}
 	}
-	return "ERROR: unknown command: " + cmd
+	return fmt.Sprintf("ERROR: unknown_command command=%s", cmd)
 }
 
 func (ch *CommandHandler) fail(raw, msg string) string {
@@ -143,16 +149,7 @@ func (ch *CommandHandler) fail(raw, msg string) string {
 }
 
 func (ch *CommandHandler) errorResponse(msg string) string {
-	errorResp := types.AckResponse{
-		Status:   "ERROR",
-		ErrorMsg: msg,
-	}
-	respBytes, err := json.Marshal(errorResp)
-	if err != nil {
-		return fmt.Sprintf("failed to marshal error resp: %v", err)
-	}
-
-	return string(respBytes)
+	return fmt.Sprintf("ERROR: broker_error reason=%q", msg)
 }
 
 // Close releases resources held by the command handler (e.g., event-sourcing indexes and snapshots).

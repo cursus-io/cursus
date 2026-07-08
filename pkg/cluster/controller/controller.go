@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -137,6 +138,82 @@ func (cc *ClusterController) IsAuthorized(topic string, partition int) bool {
 	}
 
 	return meta.Leader == cc.brokerID
+}
+
+func (cc *ClusterController) ForwardCommandToBroker(addr, command string) (string, error) {
+	if cc.Router == nil {
+		return "", fmt.Errorf("cluster router not available")
+	}
+	return cc.Router.forwardWithTimeout(addr, command)
+}
+
+func (cc *ClusterController) ReplicateCommandToFollowers(topic string, partition int, command string, minISR int) error {
+	replicationStart := time.Now()
+
+	fsm := cc.RaftManager.GetFSM()
+	if fsm == nil {
+		return fmt.Errorf("FSM not available")
+	}
+
+	partitionKey := topic + "-" + strconv.Itoa(partition)
+	meta := fsm.GetPartitionMetadata(partitionKey)
+	if meta == nil {
+		return fmt.Errorf("partition metadata not found")
+	}
+
+	targets := []string{}
+	for _, replica := range meta.Replicas {
+		if replica != cc.brokerID {
+			targets = append(targets, replica)
+		}
+	}
+
+	var wg sync.WaitGroup
+	var successCount int32 = 1
+	var mu sync.Mutex
+	errCh := make(chan error, len(targets))
+
+	partitionStr := fmt.Sprintf("%d", partition)
+	for _, targetID := range targets {
+		broker := fsm.GetBroker(targetID)
+		if broker == nil {
+			continue
+		}
+
+		wg.Add(1)
+		go func(addr, brokerID string) {
+			defer wg.Done()
+			resp, err := cc.Router.forwardWithTimeout(addr, command)
+			if err == nil && !strings.HasPrefix(resp, "ERROR") {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+				metrics.ClusterReplicationLag.WithLabelValues(topic, partitionStr, brokerID).Observe(time.Since(replicationStart).Seconds())
+				if isrMgr := cc.RaftManager.GetISRManager(); isrMgr != nil {
+					isrMgr.UpdateHeartbeat(brokerID)
+				}
+				return
+			}
+			if err != nil {
+				errCh <- err
+			} else {
+				errCh <- fmt.Errorf("replica command failed: %s", resp)
+			}
+		}(broker.Addr, targetID)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	if int(successCount) < minISR {
+		var reasons []string
+		for err := range errCh {
+			reasons = append(reasons, err.Error())
+		}
+		return fmt.Errorf("insufficient successful acknowledgements: got %d, want minISR %d: %s", successCount, minISR, strings.Join(reasons, "; "))
+	}
+
+	return nil
 }
 
 func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, msgCmd types.MessageCommand, minISR int) error {

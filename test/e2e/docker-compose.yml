@@ -9,6 +9,8 @@ services:
       - ../config.yaml:/root/config.yaml    
     environment:    
       - CONFIG_PATH=/root/config.yaml    
+      - ADVERTISED_CLIENT_HOST=localhost
+      - ADVERTISED_BROKER_PORT=10000
     ports:    
       - "10000:9000"    
       - "10100:9100"    

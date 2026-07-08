@@ -795,16 +795,28 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 		return 0, fmt.Errorf("fetch offset response failed: %v", err)
 	}
 
-	respStr := string(resp)
-	if strings.HasPrefix(respStr, "ERROR") {
+	respStr := strings.TrimSpace(string(resp))
+	if strings.HasPrefix(respStr, "ERROR:") {
 		return 0, fmt.Errorf("fetch offset error: %s", respStr)
 	}
 
-	offset, err := strconv.ParseUint(strings.TrimSpace(respStr), 10, 64)
+	if strings.HasPrefix(respStr, "OK") {
+		for _, part := range strings.Fields(respStr) {
+			if strings.HasPrefix(part, "offset=") {
+				offset, err := strconv.ParseUint(strings.TrimPrefix(part, "offset="), 10, 64)
+				if err != nil {
+					return 0, fmt.Errorf("invalid offset response: %s", respStr)
+				}
+				return offset, nil
+			}
+		}
+		return 0, fmt.Errorf("missing offset in response: %s", respStr)
+	}
+
+	offset, err := strconv.ParseUint(respStr, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid offset response: %s", respStr)
 	}
-
 	return offset, nil
 }
 

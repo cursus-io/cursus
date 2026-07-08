@@ -119,6 +119,7 @@ func (c *Consumer) startConsuming() {
 		c.wg.Add(1)
 		go func(pid int, pc *PartitionConsumer) {
 			defer c.wg.Done()
+			defer pc.closeDataCh()
 			for {
 				select {
 				case <-c.doneCh:

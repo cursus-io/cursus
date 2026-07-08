@@ -70,7 +70,7 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 			break
 		}
 		if i == maxRetries-1 {
-			return "ERROR: no Raft leader elected after retries", true, fmt.Errorf("no leader elected")
+			return "ERROR: no_raft_leader", true, fmt.Errorf("no leader elected")
 		}
 		util.Debug("Waiting for Raft leader to be elected... (attempt %d/%d)", i+1, maxRetries)
 		time.Sleep(backoffDelay(i, 100*time.Millisecond))
@@ -78,7 +78,7 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 
 	if !ch.Cluster.RaftManager.IsLeader() {
 		if ch.Cluster.Router == nil {
-			return "ERROR: not the leader, and router is nil", true, nil
+			return "ERROR: router_not_available", true, nil
 		}
 
 		encodedCmd := util.EncodeMessage("", cmd)
@@ -95,7 +95,7 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 			}
 		}
 		leaderAddr := ch.Cluster.RaftManager.GetLeaderAddress()
-		return fmt.Sprintf("ERROR: failed to forward command to leader (Leader: %s, Error: %v)", leaderAddr, lastErr), true, nil
+		return fmt.Sprintf("ERROR: forward_to_leader_failed leader=%s reason=%q", leaderAddr, lastErr.Error()), true, nil
 	}
 	return "", false, nil
 }
@@ -197,7 +197,7 @@ func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition in
 		time.Sleep(backoffDelay(i, 100*time.Millisecond))
 	}
 
-	return fmt.Sprintf("ERROR: failed to forward command to partition leader for %s:%d: %v", topic, partition, lastErr), true, nil
+	return fmt.Sprintf("ERROR: forward_to_partition_leader_failed topic=%s partition=%d reason=%q", topic, partition, lastErr.Error()), true, nil
 }
 
 // resolvePartitionLeaderAddr returns the client-facing address of the partition leader.
@@ -252,28 +252,28 @@ func (ch *CommandHandler) handleRaftApply(cmd string) string {
 	typeIdx := strings.Index(rest, "type=")
 	payloadIdx := strings.Index(rest, "payload=")
 	if typeIdx == -1 || payloadIdx == -1 {
-		return "ERROR: RAFT_APPLY requires type and payload parameters"
+		return "ERROR: missing_required_params command=RAFT_APPLY params=type,payload"
 	}
 
 	cmdType := strings.TrimSpace(rest[typeIdx+5 : payloadIdx])
 	payloadStr := strings.TrimSpace(rest[payloadIdx+8:])
 
 	if cmdType == "" || payloadStr == "" {
-		return "ERROR: RAFT_APPLY requires non-empty type and payload"
+		return "ERROR: empty_required_params command=RAFT_APPLY params=type,payload"
 	}
 
 	if !ch.isDistributed() {
-		return "ERROR: RAFT_APPLY requires distributed mode"
+		return "ERROR: distribution_required command=RAFT_APPLY"
 	}
 
 	var payload map[string]interface{}
 	if err := json.Unmarshal([]byte(payloadStr), &payload); err != nil {
-		return fmt.Sprintf("ERROR: invalid payload JSON: %v", err)
+		return fmt.Sprintf("ERROR: invalid_payload_json reason=%q", err.Error())
 	}
 
 	_, err := ch.applyAndWait(cmdType, payload)
 	if err != nil {
-		return fmt.Sprintf("ERROR: %v", err)
+		return fmt.Sprintf("ERROR: raft_apply_failed reason=%q", err.Error())
 	}
 	return "OK"
 }

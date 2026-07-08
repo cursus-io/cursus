@@ -105,7 +105,7 @@ func TestCommandHandler_StreamSyntax(t *testing.T) {
 	assert.Equal(t, "STREAM_DATA", resp)
 
 	resp = ch.HandleCommand("STREAM topic=t1", nil)
-	assert.Contains(t, resp, "ERROR: invalid STREAM syntax")
+	assert.Contains(t, resp, "ERROR: invalid_stream_syntax")
 }
 
 func TestCommandHandler_ConsumeUsesCommittedOffsetBeforeExplicitOffset(t *testing.T) {

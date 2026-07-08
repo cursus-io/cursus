@@ -227,7 +227,7 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 func (ch *CommandHandler) validateStreamSyntax(cmd, raw string) string {
 	args := parseKeyValueArgs(cmd[7:])
 	if args["topic"] == "" || args["partition"] == "" || args["group"] == "" {
-		return ch.fail(raw, "ERROR: invalid STREAM syntax")
+		return ch.fail(raw, "ERROR: invalid_stream_syntax")
 	}
 	return STREAM_DATA_SIGNAL
 }
@@ -235,7 +235,7 @@ func (ch *CommandHandler) validateStreamSyntax(cmd, raw string) string {
 func (ch *CommandHandler) validateConsumeSyntax(cmd, raw string) string {
 	args := parseKeyValueArgs(cmd[8:])
 	if args["topic"] == "" || args["partition"] == "" || args["offset"] == "" || args["member"] == "" {
-		return ch.fail(raw, "ERROR: invalid CONSUME syntax")
+		return ch.fail(raw, "ERROR: invalid_consume_syntax")
 	}
 	return STREAM_DATA_SIGNAL
 }
@@ -380,26 +380,26 @@ func (ch *CommandHandler) parseCommonArgs(args map[string]string) (CommonArgs, e
 
 func (ch *CommandHandler) validateConsumeArgs(args map[string]string) error {
 	if args["topic"] == "" {
-		return fmt.Errorf("missing topic parameter")
+		return fmt.Errorf("missing_topic")
 	}
 	if args["partition"] == "" {
-		return fmt.Errorf("missing partition parameter")
+		return fmt.Errorf("missing_partition")
 	}
 	if args["offset"] == "" {
-		return fmt.Errorf("missing offset parameter")
+		return fmt.Errorf("missing_offset")
 	}
 	if args["member"] == "" {
-		return fmt.Errorf("missing member parameter")
+		return fmt.Errorf("missing_member")
 	}
 	return nil
 }
 
 func (ch *CommandHandler) validateStreamArgs(args map[string]string) error {
 	if args["topic"] == "" {
-		return fmt.Errorf("missing topic parameter")
+		return fmt.Errorf("missing_topic")
 	}
 	if args["partition"] == "" {
-		return fmt.Errorf("missing partition parameter")
+		return fmt.Errorf("missing_partition")
 	}
 	return nil
 }

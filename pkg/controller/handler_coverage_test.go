@@ -19,8 +19,8 @@ import (
 
 type dummyPublisher struct{}
 
-func (d *dummyPublisher) Publish(topic string, msg *types.Message) error         { return nil }
-func (d *dummyPublisher) CreateTopic(string, int, bool, bool) error              { return nil }
+func (d *dummyPublisher) Publish(topic string, msg *types.Message) error { return nil }
+func (d *dummyPublisher) CreateTopic(string, int, bool, bool) error      { return nil }
 
 type testMockStorage struct{}
 
@@ -109,11 +109,7 @@ func TestErrorResponse(t *testing.T) {
 	ch, _ := newTestHandler(t)
 
 	resp := ch.errorResponse("something went wrong")
-	var ack types.AckResponse
-	err := json.Unmarshal([]byte(resp), &ack)
-	require.NoError(t, err)
-	assert.Equal(t, "ERROR", ack.Status)
-	assert.Equal(t, "something went wrong", ack.ErrorMsg)
+	assert.Equal(t, "ERROR: broker_error reason=\"something went wrong\"", resp)
 }
 
 func TestValidateStreamArgs(t *testing.T) {
@@ -124,11 +120,11 @@ func TestValidateStreamArgs(t *testing.T) {
 
 	err = ch.validateStreamArgs(map[string]string{"partition": "0"})
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "missing topic")
+	assert.Contains(t, err.Error(), "missing_topic")
 
 	err = ch.validateStreamArgs(map[string]string{"topic": "t1"})
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "missing partition")
+	assert.Contains(t, err.Error(), "missing_partition")
 }
 
 func TestValidateConsumeArgs(t *testing.T) {
@@ -143,25 +139,25 @@ func TestValidateConsumeArgs(t *testing.T) {
 		"partition": "0", "offset": "0", "member": "m1",
 	})
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "missing topic")
+	assert.Contains(t, err.Error(), "missing_topic")
 
 	err = ch.validateConsumeArgs(map[string]string{
 		"topic": "t1", "offset": "0", "member": "m1",
 	})
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "missing partition")
+	assert.Contains(t, err.Error(), "missing_partition")
 
 	err = ch.validateConsumeArgs(map[string]string{
 		"topic": "t1", "partition": "0", "member": "m1",
 	})
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "missing offset")
+	assert.Contains(t, err.Error(), "missing_offset")
 
 	err = ch.validateConsumeArgs(map[string]string{
 		"topic": "t1", "partition": "0", "offset": "0",
 	})
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "missing member")
+	assert.Contains(t, err.Error(), "missing_member")
 }
 
 func TestParseCommonArgs(t *testing.T) {
@@ -198,7 +194,7 @@ func TestParseCommonArgs(t *testing.T) {
 		assert.Equal(t, time.Duration(0), args.WaitTimeout)
 	})
 
-	t.Run("invalid partition", func(t *testing.T) {
+	t.Run("invalid_partition", func(t *testing.T) {
 		_, err := ch.parseCommonArgs(map[string]string{
 			"topic": "t1", "partition": "abc",
 		})
@@ -214,7 +210,7 @@ func TestParseCommonArgs(t *testing.T) {
 		assert.Contains(t, err.Error(), "invalid generation")
 	})
 
-	t.Run("invalid offset", func(t *testing.T) {
+	t.Run("invalid_offset", func(t *testing.T) {
 		_, err := ch.parseCommonArgs(map[string]string{
 			"topic": "t1", "partition": "0", "offset": "notanumber",
 		})
@@ -292,7 +288,7 @@ func TestGetTopicAndPartition(t *testing.T) {
 		assert.Contains(t, err.Error(), "does not exist")
 	})
 
-	t.Run("invalid partition", func(t *testing.T) {
+	t.Run("invalid_partition", func(t *testing.T) {
 		_, _, err := ch.getTopicAndPartition("gtp-topic", 999)
 		assert.Error(t, err)
 	})
@@ -303,10 +299,10 @@ func TestHandleCreate_InvalidPartitions(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("CREATE topic=t1 partitions=-1", ctx)
-	assert.Contains(t, resp, "partitions must be a positive integer")
+	assert.Contains(t, resp, "invalid_partitions")
 
 	resp = ch.HandleCommand("CREATE topic=t2 partitions=abc", ctx)
-	assert.Contains(t, resp, "partitions must be a positive integer")
+	assert.Contains(t, resp, "invalid_partitions")
 }
 
 func TestHandleCreate_InvalidReplicationFactor(t *testing.T) {
@@ -314,10 +310,10 @@ func TestHandleCreate_InvalidReplicationFactor(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("CREATE topic=t1 replication_factor=-1", ctx)
-	assert.Contains(t, resp, "replication_factor must be a positive integer")
+	assert.Contains(t, resp, "invalid_replication_factor")
 
 	resp = ch.HandleCommand("CREATE topic=t2 replication_factor=abc", ctx)
-	assert.Contains(t, resp, "replication_factor must be a positive integer")
+	assert.Contains(t, resp, "invalid_replication_factor")
 }
 
 func TestHandleCreate_IdempotentFlag(t *testing.T) {
@@ -326,7 +322,7 @@ func TestHandleCreate_IdempotentFlag(t *testing.T) {
 
 	resp := ch.HandleCommand("CREATE topic=idem-topic idempotent=true", ctx)
 	assert.Contains(t, resp, "idem-topic")
-	assert.Contains(t, resp, "4 partitions")
+	assert.Contains(t, resp, "partitions=4")
 }
 
 func TestHandleDelete_NonexistentTopic(t *testing.T) {
@@ -334,7 +330,7 @@ func TestHandleDelete_NonexistentTopic(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("DELETE topic=nonexistent", ctx)
-	assert.Contains(t, resp, "not found")
+	assert.Contains(t, resp, "topic_not_found")
 }
 
 func TestHandleList_Empty(t *testing.T) {
@@ -342,7 +338,7 @@ func TestHandleList_Empty(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("LIST", ctx)
-	assert.Equal(t, "(no topics)", resp)
+	assert.Equal(t, "OK count=0 topics=", resp)
 }
 
 func TestHandleListCluster_NonDistributed(t *testing.T) {
@@ -350,7 +346,7 @@ func TestHandleListCluster_NonDistributed(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("LIST_CLUSTER", ctx)
-	assert.Contains(t, resp, "distribution not enabled")
+	assert.Contains(t, resp, "distribution_not_enabled")
 }
 
 func TestHandleRegisterGroup_MissingParams(t *testing.T) {
@@ -358,10 +354,10 @@ func TestHandleRegisterGroup_MissingParams(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("REGISTER_GROUP group=g1", ctx)
-	assert.Contains(t, resp, "requires topic")
+	assert.Contains(t, resp, "missing_topic")
 
 	resp = ch.HandleCommand("REGISTER_GROUP topic=t1", ctx)
-	assert.Contains(t, resp, "requires group")
+	assert.Contains(t, resp, "missing_group")
 }
 
 func TestHandleRegisterGroup_NonexistentTopic(t *testing.T) {
@@ -369,7 +365,7 @@ func TestHandleRegisterGroup_NonexistentTopic(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("REGISTER_GROUP topic=no-topic group=g1", ctx)
-	assert.Contains(t, resp, "does not exist")
+	assert.Contains(t, resp, "topic_not_found")
 }
 
 func TestHandleJoinGroup_MissingParams(t *testing.T) {
@@ -377,13 +373,13 @@ func TestHandleJoinGroup_MissingParams(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("JOIN_GROUP group=g1 member=m1", ctx)
-	assert.Contains(t, resp, "requires topic")
+	assert.Contains(t, resp, "missing_topic")
 
 	resp = ch.HandleCommand("JOIN_GROUP topic=t1 member=m1", ctx)
-	assert.Contains(t, resp, "requires group")
+	assert.Contains(t, resp, "missing_group")
 
 	resp = ch.HandleCommand("JOIN_GROUP topic=t1 group=g1", ctx)
-	assert.Contains(t, resp, "requires member")
+	assert.Contains(t, resp, "missing_member")
 }
 
 func TestHandleSyncGroup_MissingParams(t *testing.T) {
@@ -391,13 +387,13 @@ func TestHandleSyncGroup_MissingParams(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("SYNC_GROUP group=g1 member=m1", ctx)
-	assert.Contains(t, resp, "requires topic")
+	assert.Contains(t, resp, "missing_topic")
 
 	resp = ch.HandleCommand("SYNC_GROUP topic=t1 member=m1", ctx)
-	assert.Contains(t, resp, "requires group")
+	assert.Contains(t, resp, "missing_group")
 
 	resp = ch.HandleCommand("SYNC_GROUP topic=t1 group=g1", ctx)
-	assert.Contains(t, resp, "requires member")
+	assert.Contains(t, resp, "missing_member")
 }
 
 func TestHandleSyncGroup_NilCoordinator(t *testing.T) {
@@ -405,7 +401,7 @@ func TestHandleSyncGroup_NilCoordinator(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("SYNC_GROUP topic=t1 group=g1 member=m1", ctx)
-	assert.Contains(t, resp, "coordinator not available")
+	assert.Contains(t, resp, "coordinator_not_available")
 }
 
 func TestHandleSyncGroup_MemberNotFound(t *testing.T) {
@@ -423,13 +419,13 @@ func TestHandleLeaveGroup_MissingParams(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("LEAVE_GROUP group=g1 member=m1", ctx)
-	assert.Contains(t, resp, "requires topic")
+	assert.Contains(t, resp, "missing_topic")
 
 	resp = ch.HandleCommand("LEAVE_GROUP topic=t1 member=m1", ctx)
-	assert.Contains(t, resp, "requires group")
+	assert.Contains(t, resp, "missing_group")
 
 	resp = ch.HandleCommand("LEAVE_GROUP topic=t1 group=g1", ctx)
-	assert.Contains(t, resp, "requires member")
+	assert.Contains(t, resp, "missing_member")
 }
 
 func TestHandleHeartbeat_MissingParams(t *testing.T) {
@@ -437,13 +433,13 @@ func TestHandleHeartbeat_MissingParams(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("HEARTBEAT group=g1 member=m1", ctx)
-	assert.Contains(t, resp, "requires topic")
+	assert.Contains(t, resp, "missing_topic")
 
 	resp = ch.HandleCommand("HEARTBEAT topic=t1 member=m1", ctx)
-	assert.Contains(t, resp, "requires group")
+	assert.Contains(t, resp, "missing_group")
 
 	resp = ch.HandleCommand("HEARTBEAT topic=t1 group=g1", ctx)
-	assert.Contains(t, resp, "requires member")
+	assert.Contains(t, resp, "missing_member")
 }
 
 func TestHandleHeartbeat_NilCoordinator(t *testing.T) {
@@ -451,7 +447,7 @@ func TestHandleHeartbeat_NilCoordinator(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("HEARTBEAT topic=t1 group=g1 member=m1", ctx)
-	assert.Contains(t, resp, "coordinator not available")
+	assert.Contains(t, resp, "coordinator_not_available")
 }
 
 func TestHandleFetchOffset_MissingParams(t *testing.T) {
@@ -459,13 +455,13 @@ func TestHandleFetchOffset_MissingParams(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("FETCH_OFFSET partition=0 group=g1", ctx)
-	assert.Contains(t, resp, "requires topic")
+	assert.Contains(t, resp, "missing_topic")
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=t1 group=g1", ctx)
-	assert.Contains(t, resp, "requires partition")
+	assert.Contains(t, resp, "missing_partition")
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=t1 partition=0", ctx)
-	assert.Contains(t, resp, "requires group")
+	assert.Contains(t, resp, "missing_group")
 }
 
 func TestHandleFetchOffset_InvalidPartition(t *testing.T) {
@@ -473,7 +469,7 @@ func TestHandleFetchOffset_InvalidPartition(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("FETCH_OFFSET topic=t1 partition=abc group=g1", ctx)
-	assert.Contains(t, resp, "invalid partition")
+	assert.Contains(t, resp, "invalid_partition")
 }
 
 func TestHandleFetchOffset_NilCoordinator(t *testing.T) {
@@ -481,7 +477,7 @@ func TestHandleFetchOffset_NilCoordinator(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("FETCH_OFFSET topic=t1 partition=0 group=g1", ctx)
-	assert.Contains(t, resp, "offset manager not available")
+	assert.Contains(t, resp, "offset_manager_not_available")
 }
 
 func TestHandleFetchOffset_GroupNotFound(t *testing.T) {
@@ -507,16 +503,16 @@ func TestHandleCommitOffset_MissingParams(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("COMMIT_OFFSET partition=0 group=g1 offset=10", ctx)
-	assert.Contains(t, resp, "requires topic")
+	assert.Contains(t, resp, "missing_topic")
 
 	resp = ch.HandleCommand("COMMIT_OFFSET topic=t1 group=g1 offset=10", ctx)
-	assert.Contains(t, resp, "requires partition")
+	assert.Contains(t, resp, "missing_partition")
 
 	resp = ch.HandleCommand("COMMIT_OFFSET topic=t1 partition=0 offset=10", ctx)
-	assert.Contains(t, resp, "requires group")
+	assert.Contains(t, resp, "missing_group")
 
 	resp = ch.HandleCommand("COMMIT_OFFSET topic=t1 partition=0 group=g1", ctx)
-	assert.Contains(t, resp, "requires offset")
+	assert.Contains(t, resp, "missing_offset")
 }
 
 func TestHandleCommitOffset_InvalidPartition(t *testing.T) {
@@ -524,7 +520,7 @@ func TestHandleCommitOffset_InvalidPartition(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("COMMIT_OFFSET topic=t1 partition=abc group=g1 offset=10", ctx)
-	assert.Contains(t, resp, "invalid partition")
+	assert.Contains(t, resp, "invalid_partition")
 }
 
 func TestHandleCommitOffset_InvalidOffset(t *testing.T) {
@@ -532,7 +528,7 @@ func TestHandleCommitOffset_InvalidOffset(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("COMMIT_OFFSET topic=t1 partition=0 group=g1 offset=xyz", ctx)
-	assert.Contains(t, resp, "invalid offset")
+	assert.Contains(t, resp, "invalid_offset")
 }
 
 func TestHandleCommitOffset_TopicMismatch(t *testing.T) {
@@ -550,7 +546,7 @@ func TestHandleGroupStatus_MissingParam(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("GROUP_STATUS group=", ctx)
-	assert.Contains(t, resp, "requires group")
+	assert.Contains(t, resp, "missing_group")
 }
 
 func TestHandleGroupStatus_NilCoordinator(t *testing.T) {
@@ -558,7 +554,7 @@ func TestHandleGroupStatus_NilCoordinator(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("GROUP_STATUS group=g1", ctx)
-	assert.Contains(t, resp, "coordinator not available")
+	assert.Contains(t, resp, "coordinator_not_available")
 }
 
 func TestHandleDescribeTopic_MissingParam(t *testing.T) {
@@ -566,7 +562,7 @@ func TestHandleDescribeTopic_MissingParam(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("DESCRIBE topic=", ctx)
-	assert.Contains(t, resp, "missing topic")
+	assert.Contains(t, resp, "missing_topic")
 }
 
 func TestHandleDescribeTopic_NonexistentTopic(t *testing.T) {
@@ -574,7 +570,7 @@ func TestHandleDescribeTopic_NonexistentTopic(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("DESCRIBE topic=nonexistent", ctx)
-	assert.Contains(t, resp, "not found")
+	assert.Contains(t, resp, "topic_not_found")
 }
 
 func TestHandleDescribeTopic_ValidTopic(t *testing.T) {
@@ -603,7 +599,7 @@ func TestHandlePublish_InvalidIsIdempotent(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("PUBLISH topic=pub-topic acks=1 producerId=p1 isIdempotent=maybe message=hi", ctx)
-	assert.Contains(t, resp, "invalid isIdempotent")
+	assert.Contains(t, resp, "invalid_is_idempotent")
 }
 
 func TestHandlePublish_InvalidSeqNum(t *testing.T) {
@@ -612,7 +608,7 @@ func TestHandlePublish_InvalidSeqNum(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("PUBLISH topic=pub-topic2 acks=1 producerId=p1 seqNum=abc message=hi", ctx)
-	assert.Contains(t, resp, "invalid seqNum")
+	assert.Contains(t, resp, "invalid_seq_num")
 }
 
 func TestHandlePublish_InvalidEpoch(t *testing.T) {
@@ -621,7 +617,7 @@ func TestHandlePublish_InvalidEpoch(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("PUBLISH topic=pub-topic3 acks=1 producerId=p1 epoch=abc message=hi", ctx)
-	assert.Contains(t, resp, "invalid epoch")
+	assert.Contains(t, resp, "invalid_epoch")
 }
 
 func TestHandlePublish_IdempotentTrue(t *testing.T) {
@@ -653,7 +649,7 @@ func TestHandleReplicateMessage_MissingPayload(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("REPLICATE_MESSAGE data=something", ctx)
-	assert.Contains(t, resp, "missing payload")
+	assert.Contains(t, resp, "missing_payload")
 }
 
 func TestHandleReplicateMessage_InvalidJSON(t *testing.T) {
@@ -661,7 +657,7 @@ func TestHandleReplicateMessage_InvalidJSON(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("REPLICATE_MESSAGE payload=not-json", ctx)
-	assert.Contains(t, resp, "unmarshal failed")
+	assert.Contains(t, resp, "unmarshal_failed")
 }
 
 func TestHandleReplicateMessage_TopicNotFound(t *testing.T) {
@@ -670,7 +666,7 @@ func TestHandleReplicateMessage_TopicNotFound(t *testing.T) {
 
 	payload := `{"topic":"no-such","partition":0,"messages":[{"payload":"hi"}]}`
 	resp := ch.HandleCommand("REPLICATE_MESSAGE payload="+payload, ctx)
-	assert.Contains(t, resp, "topic no-such not found")
+	assert.Contains(t, resp, "topic_not_found topic=no-such")
 }
 
 func TestHandleReplicateMessage_EmptyMessages(t *testing.T) {
@@ -680,7 +676,7 @@ func TestHandleReplicateMessage_EmptyMessages(t *testing.T) {
 
 	payload := `{"topic":"rep-topic","partition":0,"messages":[]}`
 	resp := ch.HandleCommand("REPLICATE_MESSAGE payload="+payload, ctx)
-	assert.Contains(t, resp, "empty messages")
+	assert.Contains(t, resp, "empty_messages")
 }
 
 func TestHandleReplicateMessage_Success(t *testing.T) {
@@ -700,7 +696,7 @@ func TestHandleReplicateMessage_InvalidPartition(t *testing.T) {
 
 	payload := `{"topic":"rep-topic3","partition":999,"messages":[{"payload":"hi"}]}`
 	resp := ch.HandleCommand("REPLICATE_MESSAGE payload="+payload, ctx)
-	assert.Contains(t, resp, "partition 999 not found")
+	assert.Contains(t, resp, "partition_not_found partition=999")
 }
 
 func TestHandleBatchCommit_NoValidOffsets(t *testing.T) {
@@ -829,10 +825,10 @@ func TestHandleConsumeSyntax_MissingFields(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("CONSUME topic=t1 partition=0", ctx)
-	assert.Contains(t, resp, "ERROR: invalid CONSUME syntax")
+	assert.Contains(t, resp, "ERROR: invalid_consume_syntax")
 
 	resp = ch.HandleCommand("CONSUME topic=t1 offset=0 member=m1", ctx)
-	assert.Contains(t, resp, "ERROR: invalid CONSUME syntax")
+	assert.Contains(t, resp, "ERROR: invalid_consume_syntax")
 }
 
 func TestParseKeyValueArgs_MessageHandling(t *testing.T) {
@@ -859,7 +855,7 @@ func TestHandleJoinGroup_TopicNotFound(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("JOIN_GROUP topic=no-topic group=g1 member=m1", ctx)
-	assert.Contains(t, resp, "not found")
+	assert.Contains(t, resp, "topic_not_found")
 }
 
 func TestHandleGroupStatus_WithCoordinator(t *testing.T) {
@@ -904,7 +900,7 @@ func TestHandleCommitOffset_WithCoordinator(t *testing.T) {
 	assert.Equal(t, "OK", resp)
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=commit-topic partition=0 group=commit-g1", ctx)
-	assert.Equal(t, "50", resp)
+	assert.Equal(t, "OK offset=50", resp)
 }
 
 func TestHandleLeaveGroup_WithCoordinator(t *testing.T) {
@@ -915,7 +911,7 @@ func TestHandleLeaveGroup_WithCoordinator(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("LEAVE_GROUP topic=leave-topic group=leave-g1 member=leave-m1", ctx)
-	assert.Contains(t, resp, "Left group")
+	assert.Contains(t, resp, "left=true")
 }
 
 func TestHandleLeaveGroup_NilCoordinator(t *testing.T) {
@@ -924,7 +920,7 @@ func TestHandleLeaveGroup_NilCoordinator(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("LEAVE_GROUP topic=leave-topic2 group=leave-g2 member=m1", ctx)
-	assert.Contains(t, resp, "Left group")
+	assert.Contains(t, resp, "left=true")
 }
 
 func TestHandleBatchCommit_InvalidPartitionFormat(t *testing.T) {
@@ -974,7 +970,7 @@ func TestHandleCreate_WithCoordinatorDefaultGroup(t *testing.T) {
 
 	resp := ch.HandleCommand("CREATE topic=coord-topic partitions=2", ctx)
 	assert.Contains(t, resp, "coord-topic")
-	assert.Contains(t, resp, "2 partitions")
+	assert.Contains(t, resp, "partitions=2")
 }
 
 func TestHandleDelete_WithTopic(t *testing.T) {
@@ -1145,4 +1141,44 @@ func encodeBatchWithCustomAcks(topicName string, partition int, acks string, isI
 		Messages:     msgs,
 	}
 	return json.Marshal(batch)
+}
+
+func TestHandleCommitAndFetchOffset_AllowsWildcardGroupTopic(t *testing.T) {
+	ch, tm, coord := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopic("wild-alpha", 1, false, false))
+	require.NoError(t, coord.RegisterGroup("wild-*", "wild-group", 1))
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("COMMIT_OFFSET topic=wild-alpha partition=0 group=wild-group offset=7", ctx)
+	assert.Equal(t, "OK", resp)
+
+	resp = ch.HandleCommand("FETCH_OFFSET topic=wild-alpha partition=0 group=wild-group", ctx)
+	assert.Equal(t, "OK offset=7", resp)
+}
+
+func TestHandleCommitAndFetchOffset_AllowsQuestionMarkGroupTopic(t *testing.T) {
+	ch, tm, coord := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopic("q-1", 1, false, false))
+	require.NoError(t, coord.RegisterGroup("q-?", "question-group", 1))
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("COMMIT_OFFSET topic=q-1 partition=0 group=question-group offset=3", ctx)
+	assert.Equal(t, "OK", resp)
+
+	resp = ch.HandleCommand("FETCH_OFFSET topic=q-1 partition=0 group=question-group", ctx)
+	assert.Equal(t, "OK offset=3", resp)
+}
+
+func TestHandleReplicateSnapshot_SavesFollowerSnapshot(t *testing.T) {
+	ch, tm, _ := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopic("snap-rep-topic", 1, false, true))
+	ctx := NewClientContext("", 0)
+
+	payload := `{"topic":"snap-rep-topic","key":"agg-1","version":2,"partition":0,"payload":"{\"state\":\"ok\"}"}`
+	resp := ch.HandleCommand("REPLICATE_SNAPSHOT payload="+payload, ctx)
+	assert.Equal(t, "OK", resp)
+
+	resp = ch.HandleCommand("READ_SNAPSHOT topic=snap-rep-topic key=agg-1", ctx)
+	assert.Contains(t, resp, `"version":2`)
+	assert.Contains(t, resp, `state`)
 }

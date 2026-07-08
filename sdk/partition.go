@@ -150,8 +150,8 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	memberID, generation := c.memberID, c.generation
 	c.mu.RUnlock()
 
-	consumeCmd := fmt.Sprintf("CONSUME topic=%s partition=%d offset=%d group=%s generation=%d member=%s",
-		c.config.Topic, pc.partitionID, currentOffset, c.config.GroupID, generation, memberID)
+	consumeCmd := fmt.Sprintf("CONSUME topic=%s partition=%d offset=%d group=%s generation=%d member=%s batch=%d",
+		c.config.Topic, pc.partitionID, currentOffset, c.config.GroupID, generation, memberID, effectivePollBatchSize(c.config))
 
 	if err := WriteWithLength(conn, EncodeMessage("", consumeCmd)); err != nil {
 		LogError("Partition [%d] send CONSUME failed: %v", pc.partitionID, err)
@@ -275,8 +275,8 @@ func (pc *PartitionConsumer) startStreamLoop() {
 		memberID, generation := c.memberID, c.generation
 		c.mu.RUnlock()
 
-		streamCmd := fmt.Sprintf("STREAM topic=%s partition=%d group=%s offset=%d generation=%d member=%s",
-			c.config.Topic, pid, c.config.GroupID, currentOffset, generation, memberID)
+		streamCmd := fmt.Sprintf("STREAM topic=%s partition=%d group=%s offset=%d generation=%d member=%s batch=%d",
+			c.config.Topic, pid, c.config.GroupID, currentOffset, generation, memberID, effectiveStreamBatchSize(c.config))
 
 		if err := WriteWithLength(conn, EncodeMessage("", streamCmd)); err != nil {
 			LogError("Partition [%d] STREAM send failed: %v", pid, err)
@@ -361,6 +361,24 @@ func (pc *PartitionConsumer) startStreamLoop() {
 			}
 		}
 	}
+}
+
+func effectivePollBatchSize(cfg *ConsumerConfig) int {
+	batchSize := cfg.BatchSize
+	if cfg.MaxPollRecords > 0 && (batchSize <= 0 || cfg.MaxPollRecords < batchSize) {
+		batchSize = cfg.MaxPollRecords
+	}
+	if batchSize <= 0 {
+		return 100
+	}
+	return batchSize
+}
+
+func effectiveStreamBatchSize(cfg *ConsumerConfig) int {
+	if cfg.BatchSize > 0 {
+		return cfg.BatchSize
+	}
+	return 100
 }
 
 // ensureConnection establishes a connection to the broker with retries and backoff.

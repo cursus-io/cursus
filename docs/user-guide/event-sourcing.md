@@ -29,7 +29,7 @@ CREATE topic=orders partitions=4 event_sourcing=true
 Response:
 
 ```
-Topic 'orders' now has 4 partitions
+OK topic=orders partitions=4
 ```
 
 The `event_sourcing=true` flag tells the broker to maintain a per-partition stream index for aggregate-level version tracking.
@@ -69,7 +69,7 @@ STREAM_VERSION topic=orders key=order-123
 Response:
 
 ```
-2
+OK version=2
 ```
 
 Returns `0` if the aggregate does not exist.
@@ -178,19 +178,16 @@ Constraints:
 READ_SNAPSHOT topic=orders key=order-123
 ```
 
-Response (JSON):
+Response:
 
-```json
-{
-  "version": 3,
-  "payload": "{\"customer\":\"alice\",\"items\":[...],\"total\":69.97,\"status\":\"shipped\"}"
-}
+```text
+OK snapshot={"version":3,"payload":"{\"customer\":\"alice\",\"items\":[...],\"total\":69.97,\"status\":\"shipped\"}"}
 ```
 
 If no snapshot exists, the response is:
 
-```
-NULL
+```text
+OK snapshot=null
 ```
 
 ### Automatic Use in READ_STREAM
@@ -229,12 +226,58 @@ if aggregate.version % 500 == 0 {
 }
 ```
 
-### Snapshot Locality
+### Snapshot Replication
 
-In distributed mode, snapshots are stored locally on each node. They are not replicated. If a node lacks a snapshot, it replays events from version 1. This is by design: snapshots are a performance optimization, not a correctness requirement.
+In distributed mode, `SAVE_SNAPSHOT` is routed to the aggregate partition leader. The leader validates that the snapshot version is not ahead of the current stream version, stores the snapshot locally, then replicates it to followers with an internal `REPLICATE_SNAPSHOT` command before returning success. A successful response means the snapshot reached the configured in-sync replica quorum.
+
+Snapshots remain a replay optimization: correctness still comes from the committed event log. If a broker lacks a snapshot after failover or restore, it can rebuild stream state by replaying committed events.
 
 ---
 
+## Distributed Event Sourcing
+
+Event-sourcing topics use the same partition leadership and replication model as normal Cursus topics. The aggregate `key` determines the partition, and the partition leader is the authority for append ordering and optimistic concurrency.
+
+### Write Path
+
+In distributed mode, `APPEND_STREAM` is routed to the leader for the aggregate partition. The leader:
+
+1. checks the current aggregate version in the stream index,
+2. appends the event to the partition log with the next aggregate version,
+3. replicates the assigned message to followers,
+4. indexes the event only after the append/replication path succeeds, and
+5. returns `OK version=<N> offset=<N> partition=<N>`.
+
+Followers index replicated event-sourcing messages as they arrive, preserving the leader-assigned offset and aggregate version. If a follower restarts or loses its local stream index files, it rebuilds the stream index from the committed partition log before answering stream commands.
+
+### Read Path
+
+`READ_STREAM`, `STREAM_VERSION`, `SAVE_SNAPSHOT`, and `READ_SNAPSHOT` are partition-routed commands. In distributed mode, clients should send them to the leader for the aggregate partition. A non-leader broker returns a leader redirect:
+
+```text
+ERROR: NOT_LEADER LEADER_IS <host:port>
+```
+
+SDKs should reconnect to the advertised leader and retry the command. `READ_STREAM` reads from the committed log, so it does not expose uncommitted leader-local events.
+
+### Snapshots, Committed Tail, and Retention
+
+Snapshots are quorum-replicated by the partition leader before `SAVE_SNAPSHOT` returns `OK`. Followers apply the replicated snapshot locally, so a promoted follower can serve snapshot-assisted reads for snapshots that reached quorum. Snapshot replication is quorum-gated on the write path. If a node was offline during the write, it can run the internal CATCHUP_SNAPSHOTS command for the partition to pull the latest snapshot catalog from the partition leader and apply missing snapshots locally. Correctness still comes from committed event replay if snapshot catch-up is delayed.
+
+Each partition persists its committed tail as a high-watermark checkpoint. The checkpoint is written through a synced temporary file and restored with a durable-tail clamp on restart. Leader appends advance LEO first; HWM advances only after the replicated write path succeeds and is flushed. On broker restart, the partition restores the checkpointed HWM and `READ_STREAM`/`CONSUME` only expose records at or below the recovered committed tail. This prevents uncommitted leader-local records that happened to be flushed before a crash from becoming visible after restart.
+
+Because event sourcing relies on replay, retention must be configured carefully. If old event records are deleted before a durable snapshot/export strategy exists for the aggregate, a broker can no longer rebuild the full stream history from version 1. For event-sourcing topics, prefer retention settings that preserve the event log for as long as the domain requires replay.
+
+### Guarantees
+
+- Append ordering is linearizable per aggregate key on the partition leader.
+- Optimistic concurrency is enforced by requiring `version = currentVersion + 1`.
+- Replicated followers maintain their own stream index from the replicated log.
+- Snapshot writes are quorum-replicated before success.
+- Reads return committed events only, bounded by the recovered HWM after restart.
+- Exactly-once side effects are not provided by the broker; projection handlers should remain idempotent.
+
+---
 ## Schema Evolution
 
 Events are immutable. Once written, their payload never changes. Schema evolution is handled at read time by the client application.
@@ -334,8 +377,8 @@ Error responses:
 
 ```
 ERROR: version_conflict current=<N> expected=<N>
-ERROR: topic '<name>' does not exist
-ERROR: topic '<name>' is not event-sourcing enabled
+ERROR: topic_not_found topic=<name>
+ERROR: event_sourcing_not_enabled topic=<name>
 ```
 
 ### READ_STREAM
@@ -381,7 +424,7 @@ STREAM_VERSION topic=<name> key=<aggregate_key>
 | topic | Yes | - | Topic name |
 | key | Yes | - | Aggregate ID |
 
-Response: Plain integer (e.g., `3`). Returns `0` if the aggregate does not exist.
+Response: `OK version=<N>` (for example, `OK version=3`). Returns `OK version=0` if the aggregate does not exist.
 
 ### SAVE_SNAPSHOT
 
@@ -407,8 +450,8 @@ OK version=<N> partition=<N>
 Error responses:
 
 ```
-ERROR: snapshot version <N> exceeds stream version <N>
-ERROR: topic '<name>' does not exist
+ERROR: snapshot_version_exceeds_stream version=<N> current=<N>
+ERROR: topic_not_found topic=<name>
 ```
 
 ### READ_SNAPSHOT
@@ -424,16 +467,16 @@ READ_SNAPSHOT topic=<name> key=<aggregate_key>
 | topic | Yes | - | Topic name |
 | key | Yes | - | Aggregate ID |
 
-Success response (JSON):
+Success response:
 
-```json
-{"version": 500, "payload": "..."}
+```text
+OK snapshot={"version":500,"payload":"..."}
 ```
 
 Not found response:
 
-```
-NULL
+```text
+OK snapshot=null
 ```
 
 ---

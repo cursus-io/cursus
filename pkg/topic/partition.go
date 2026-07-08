@@ -2,6 +2,11 @@ package topic
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,18 +26,22 @@ type producerEntry struct {
 
 // Partition handles messages for one shard of a topic.
 type Partition struct {
-	id            int
-	topic         string
-	newMessageCh  chan struct{}
-	LEO           atomic.Uint64
-	HWM           uint64
-	mu            sync.RWMutex
-	dh            types.StorageHandler
-	closed        bool
-	streamManager StreamManager
-	producerState sync.Map // map[string]*producerEntry
-	isIdempotent  bool
-	closeCh       chan struct{}
+	id                int
+	topic             string
+	newMessageCh      chan struct{}
+	LEO               atomic.Uint64
+	HWM               uint64
+	mu                sync.RWMutex
+	dh                types.StorageHandler
+	closed            bool
+	streamManager     StreamManager
+	hwmCheckpointPath string
+	hwmCheckpointCh   chan struct{}
+	hwmCheckpointMu   sync.Mutex
+	hwmCheckpointWG   sync.WaitGroup
+	producerState     sync.Map // map[string]*producerEntry
+	isIdempotent      bool
+	closeCh           chan struct{}
 }
 
 // NewPartition creates a partition instance.
@@ -53,13 +62,31 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	p.HWM = initialOffset
 
 	if handler, ok := dh.(*disk.DiskHandler); ok {
-		p.HWM = handler.GetAbsoluteOffset()
-		handler.OnSync = func(flushedOffset uint64) {
-			p.mu.Lock()
-			p.HWM = flushedOffset
-			p.mu.Unlock()
-			p.NotifyNewMessage()
+		p.hwmCheckpointPath = hwmCheckpointPath(handler, id)
+		p.hwmCheckpointCh = make(chan struct{}, 1)
+		durableTail := handler.GetAbsoluteOffset()
+		if persistedHWM, ok := loadHWMCheckpoint(p.hwmCheckpointPath); ok {
+			if persistedHWM > durableTail {
+				util.Warn("clamping HWM checkpoint %s from %d to durable tail %d", p.hwmCheckpointPath, persistedHWM, durableTail)
+				p.HWM = durableTail
+			} else {
+				p.HWM = persistedHWM
+			}
+		} else {
+			p.HWM = durableTail
 		}
+		notifyCh := p.newMessageCh
+		handler.SetOnSync(func(uint64) {
+			select {
+			case notifyCh <- struct{}{}:
+			default:
+			}
+		})
+	}
+
+	if p.hwmCheckpointCh != nil {
+		p.hwmCheckpointWG.Add(1)
+		go p.runHWMCheckpointLoop()
 	}
 
 	return p
@@ -131,9 +158,7 @@ func (p *Partition) Enqueue(msg types.Message) {
 	p.updateProducerState(&msg)
 	msg.Offset = offset
 	p.LEO.Store(offset + 1)
-	if p.HWM < offset+1 {
-		p.HWM = offset + 1
-	}
+	p.setHWMLocked(offset + 1)
 
 	p.NotifyNewMessage()
 }
@@ -158,9 +183,7 @@ func (p *Partition) EnqueueSync(msg types.Message) error {
 	p.updateProducerState(&msg)
 	msg.Offset = offset
 	p.LEO.Store(offset + 1)
-	if p.HWM < offset+1 {
-		p.HWM = offset + 1
-	}
+	p.setHWMLocked(offset + 1)
 
 	p.NotifyNewMessage()
 	return nil
@@ -190,9 +213,7 @@ func (p *Partition) EnqueueBatchSync(msgs []types.Message) error {
 		p.updateProducerState(&msgs[i])
 		msgs[i].Offset = offset
 		p.LEO.Store(offset + 1)
-		if p.HWM < offset+1 {
-			p.HWM = offset + 1
-		}
+		p.setHWMLocked(offset + 1)
 	}
 	p.NotifyNewMessage()
 	return nil
@@ -221,9 +242,7 @@ func (p *Partition) EnqueueBatch(msgs []types.Message) error {
 		p.updateProducerState(&msgs[i])
 		msgs[i].Offset = offset
 		p.LEO.Store(offset + 1)
-		if p.HWM < offset+1 {
-			p.HWM = offset + 1
-		}
+		p.setHWMLocked(offset + 1)
 	}
 	p.NotifyNewMessage()
 	return nil
@@ -262,10 +281,7 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 func (p *Partition) AdvanceHWM() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	leo := p.LEO.Load()
-	if leo > p.HWM {
-		p.HWM = leo
-	}
+	p.setHWMLocked(p.LEO.Load())
 }
 
 // ReplicaAppend writes messages with pre-assigned offsets from the leader (follower replication).
@@ -286,9 +302,7 @@ func (p *Partition) ReplicaAppend(msgs []types.Message) error {
 		if currentLEO := p.LEO.Load(); newLEO > currentLEO {
 			p.LEO.Store(newLEO)
 		}
-		if p.HWM < newLEO {
-			p.HWM = newLEO
-		}
+		p.setHWMLocked(newLEO)
 	}
 	p.NotifyNewMessage()
 	return nil
@@ -334,6 +348,7 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 // FlushDisk forces all pending async writes to disk.
 func (p *Partition) FlushDisk() {
 	p.dh.Flush()
+	p.persistHWMCheckpoint()
 }
 
 func (p *Partition) GetLatestOffset() uint64 {
@@ -359,10 +374,137 @@ func (p *Partition) ReserveOffsets(count int) uint64 {
 func (p *Partition) SetHWM(hwm uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if hwm > p.HWM {
-		p.HWM = hwm
+	if p.setHWMLocked(hwm) {
 		p.NotifyNewMessage()
 	}
+}
+
+func (p *Partition) setHWMLocked(hwm uint64) bool {
+	if hwm <= p.HWM {
+		return false
+	}
+	p.HWM = hwm
+	p.signalHWMCheckpointLocked()
+	return true
+}
+
+func (p *Partition) signalHWMCheckpointLocked() {
+	if p.hwmCheckpointCh == nil {
+		return
+	}
+	select {
+	case p.hwmCheckpointCh <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Partition) runHWMCheckpointLoop() {
+	defer p.hwmCheckpointWG.Done()
+
+	ticker := time.NewTicker(hwmCheckpointInterval)
+	defer ticker.Stop()
+
+	dirty := false
+	for {
+		select {
+		case <-p.hwmCheckpointCh:
+			dirty = true
+		case <-ticker.C:
+			if dirty {
+				p.persistHWMCheckpoint()
+				dirty = false
+			}
+		case <-p.closeCh:
+			p.persistHWMCheckpoint()
+			return
+		}
+	}
+}
+
+func (p *Partition) persistHWMCheckpoint() {
+	p.mu.RLock()
+	checkpointPath := p.hwmCheckpointPath
+	hwm := p.HWM
+	p.mu.RUnlock()
+
+	if checkpointPath == "" {
+		return
+	}
+
+	p.hwmCheckpointMu.Lock()
+	defer p.hwmCheckpointMu.Unlock()
+
+	tmp := checkpointPath + ".tmp"
+	data := []byte(strconv.FormatUint(hwm, 10) + "\n")
+	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		util.Warn("failed to open HWM checkpoint %s: %v", tmp, err)
+		return
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		util.Warn("failed to write HWM checkpoint %s: %v", tmp, err)
+		return
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		util.Warn("failed to sync HWM checkpoint %s: %v", tmp, err)
+		return
+	}
+	if err := f.Close(); err != nil {
+		util.Warn("failed to close HWM checkpoint %s: %v", tmp, err)
+		return
+	}
+	if err := replaceCheckpointFile(tmp, checkpointPath); err != nil {
+		util.Warn("failed to rename HWM checkpoint %s: %v", checkpointPath, err)
+		return
+	}
+	syncParentDir(filepath.Dir(checkpointPath))
+}
+
+func syncParentDir(path string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	// #nosec G304 -- checkpoint directory is derived from the broker-owned partition log directory.
+	dir, err := os.Open(path)
+	if err != nil {
+		util.Warn("failed to open HWM checkpoint directory %s: %v", path, err)
+		return
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		util.Warn("failed to sync HWM checkpoint directory %s: %v", path, err)
+	}
+}
+
+func hwmCheckpointPath(dh types.StorageHandler, partitionID int) string {
+	if dh == nil {
+		return ""
+	}
+	segmentPath := dh.GetSegmentPath(0)
+	if segmentPath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(segmentPath), fmt.Sprintf("partition_%d.hwm", partitionID))
+}
+
+func loadHWMCheckpoint(path string) (uint64, bool) {
+	if path == "" {
+		return 0, false
+	}
+	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	hwm, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		util.Warn("ignoring invalid HWM checkpoint %s: %v", path, err)
+		return 0, false
+	}
+	return hwm, true
 }
 
 // GetHWM returns the high water mark in a thread-safe manner.
@@ -379,13 +521,17 @@ func (p *Partition) UpdateLEO(leo uint64) {
 // Close shuts down the partition.
 func (p *Partition) Close() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed {
+		p.mu.Unlock()
 		return
 	}
 	p.closed = true
 	close(p.closeCh)
+	p.mu.Unlock()
+	p.hwmCheckpointWG.Wait()
 }
+
+const hwmCheckpointInterval = 250 * time.Millisecond
 
 const producerStateTTL = 30 * time.Minute
 

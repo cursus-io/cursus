@@ -1,209 +1,496 @@
 # API Reference
 
-This document provides a complete reference for the cursus command API. It describes the wire protocol format, command syntax, parameters, behavior, and responses for all supported operations. The cursus API is a text-based protocol transmitted over TCP with length-prefixed message framing.
+This document summarizes the Cursus TCP command API. The canonical response contract is defined in [Protocol Specification](../protocol-spec.md); this page is a command-oriented quick reference.
 
-For information about the on-disk storage format, see [Disk Format](../core/storage/disk-format.md).
+Cursus uses a length-prefixed TCP protocol. Every command request and text response is encoded as:
 
-# Wire Protocol Format
-All messages exchanged between clients and the broker follow a length-prefixed protocol over TCP.
-
-Each message consists of:
-
-- 4-byte length prefix (big-endian unsigned 32-bit integer)
-- Message payload (variable length)
-
-## Message Encoding
-Messages are encoded as:
-
-- Topic field: The topic name or command type
-- Payload field: The command string or message content
-
-The `util.DecodeMessage()` function splits the raw bytes into topic and payload components. Command detection occurs by checking if the payload starts with command keywords: CREATE, DELETE, LIST, SUBSCRIBE, PUBLISH, CONSUME, or HELP.
-
-## Optional Compression
-If gzip compression is enabled via configuration (enable_gzip: true), messages are compressed before length-prefixed framing. 
-
-The DecompressMessage function handles decompression transparently.
-
-## Command Dispatch Flowchart
-
-```mermaid
-flowchart TD
-    CLIENT([Client TCP Connection]) -->|"[4-byte len][payload]"| HC[HandleConnection]
-    HC --> DEC[DecodeMessage\ntopic + payload]
-    DEC --> IC{isCommand?\nCREATE/DELETE/LIST\nSUBSCRIBE/PUBLISH\nCONSUME/HELP}
-
-    IC -->|"yes"| CMD[HandleCommand]
-    IC -->|"no → data frame"| DATA[Route to topic\nby topic field]
-
-    CMD --> PARSE{Parse first\ntoken}
-
-    PARSE -->|CREATE| CRT["CreateTopic(name, partitions)\n→ TopicManager\n→ Response: OK / ERROR"]
-    PARSE -->|DELETE| DEL["DeleteTopic(name)\n→ TopicManager\n→ Response: OK / ERROR"]
-    PARSE -->|LIST| LST["ListTopics()\n→ TopicManager\n→ comma-separated names"]
-    PARSE -->|SUBSCRIBE| SUB["RegisterConsumerGroup\n→ StreamManager\n→ Response: Subscribed"]
-    PARSE -->|PUBLISH| PUB["TopicManager.Publish\n→ dedup → partition\n→ disk + consumers"]
-    PARSE -->|CONSUME| CON["STREAM_DATA_SIGNAL\n→ HandleConsumeCommand\n→ DiskHandler read\n→ length-prefixed stream"]
-    PARSE -->|HELP| HLP["writeResponse(helpText)"]
-    PARSE -->|unknown| ERR["writeResponse\nERROR: unknown command"]
-
-    CRT --> LOG[logCommandResult\nSUCCESS / FAILURE]
-    DEL --> LOG
-    LST --> LOG
-    SUB --> LOG
-    PUB --> LOG
-    CON --> LOG
-    HLP --> LOG
-    ERR --> LOG
-
-    LOG --> HC
+```text
+[4-byte big-endian length][payload]
 ```
 
-## Command Reference
+`CONSUME`, `STREAM`, and `READ_STREAM` are data-plane commands and can return one or more length-prefixed binary frames. Other control-plane commands return a single text or JSON response frame.
 
-### 1. CREATE
-| Aspect       | Description                                                                 |
-|--------------|-----------------------------------------------------------------------------|
-| Syntax       | `CREATE <topic> [<partitions>]`                                              |
-| Parameters   | topic (string, required) - Topic name to create <br> partitions (integer, optional, default=4) - Number of partitions |
-| Behavior     | Adds partitions if topic exists <br> Each partition has 10,000-message buffer and dedicated DiskHandler<br>Partition count must be positive |
-| Response     | `✅ Topic '<topic>' now has <N> partitions`                                  |
-| Errors       | `ERROR: missing topic name`<br>`ERROR: partitions must be a positive integer`  |
-| Example      | `CREATE orders 8`<br>`> ✅ Topic 'orders' now has 8 partitions`                  |
+## Response Contract
 
-### 2. DELETE
-| Aspect       | Description                                                                 |
-|--------------|-----------------------------------------------------------------------------|
-| Syntax       | `DELETE <topic>`                                                              |
-| Parameters   | topic (string, required) - Topic name to delete                             |
-| Behavior     | Removes topic from `TopicManager.topics`<br>Stops partition goroutines<br>Closes consumer channels<br>Disk segment files not automatically deleted |
-| Response     | `🗑️ Topic '<topic>' deleted`                                                  |
-| Errors       | `ERROR: topic '<topic>' not found`                                            |
-| Example      | `DELETE orders`<br>`> 🗑️ Topic 'orders' deleted`                                 |
+Control-plane commands use one of these response forms:
 
-### 3. LIST
-| Aspect       | Description                                                                 |
-|--------------|-----------------------------------------------------------------------------|
-| Syntax       | `LIST`                                                                        |
-| Parameters   | None                                                                        |
-| Behavior     | Returns comma-separated list of all topic names                             |
-| Response     | `<topic1>, <topic2>, <topic3>`<br>`If none exist: (no topics)`                 |
-| Example      | `LIST`<br>`> orders, payments, notifications`                                     |
-
-### 4. SUBSCRIBE
-| Aspect       | Description                                                                 |
-|--------------|-----------------------------------------------------------------------------|
-| Syntax       | `SUBSCRIBE <topic>`                                                           |
-| Parameters   | topic (string, required) - Topic name to subscribe to                       |
-| Behavior     | Registers client in topic<br>Creates consumer with 1,000-message buffer<br>Partitions distribute messages using modulo arithmetic<br>Tracks subscribed topics in ClientContext.CurrentTopics |
-| Response     | `✅ Subscribed to '<topic>'`                                                  |
-| Errors       | `ERROR: topic '<topic>' does not exist`                                       |
-| Example      | `SUBSCRIBE orders`<br>`> ✅ Subscribed to 'orders'`                                |
-
-### 5. PUBLISH
-| Aspect       | Description                                                                 |
-|--------------|-----------------------------------------------------------------------------|
-| Syntax       | `PUBLISH <topic> <message>`                                                   |
-| Parameters   | topic (string, required)<br>message (string, required) - payload           |
-| Behavior     | Assigns unique ID via `util.GenerateID`<br>Deduplication check (30 min)<br>Routes to partition (key-based or round-robin)<br>Writes to disk asynchronously<br>Distributes to consumers |
-| Response     | `📤 Published to '<topic>'`                                                   |
-| Errors       | `ERROR: invalid PUBLISH syntax`<br>`ERROR: topic '<topic>' does not exist`     |
-| Example      | `PUBLISH orders {"order_id":123,"amount":99.99}`<br>`> 📤 Published to 'orders'` |
-
-### 6. CONSUME
-| Aspect       | Description                                                                 |
-|--------------|-----------------------------------------------------------------------------|
-| Syntax       | `CONSUME <topic> <partition> <offset>`                                       |
-| Parameters   | topic (string, required)<br>partition (integer, required, 0-indexed)<br>offset (integer, required, byte offset in segment) |
-| Behavior     | Detected by HandleCommand → STREAM_DATA_SIGNAL<br>Handled by HandleConsumeCommand<br>Reads messages from DiskHandler (up to 8192 bytes)<br>Streams back with `util.WriteWithLength` |
-| Response     | Each message as `[4-byte length][message payload]`<br>Streamed count logged: `[STREAM]` Completed streaming N messages |
-| Errors       | `ERROR: invalid CONSUME syntax`<br>`ERROR: invalid partition ID`<br>`ERROR: invalid offset`<br>`ERROR: failed to get disk handler`<br>`ERROR: failed to read messages from disk` |
-| Example      | `CONSUME orders 0 0`<br>`> [4 bytes: 45][message payload 1]`<br>`[4 bytes: 52][message payload 2]` |
-
-### 7. HELP
-| Aspect       | Description                                                                 |
-|--------------|-----------------------------------------------------------------------------|
-| Syntax       | `HELP`                                                                        |
-| Parameters   | None                                                                        |
-| Response     | Lists all available commands with syntax                                     |
-| Example      | `HELP`<br>`> Available commands:`<br>`CREATE <topic> [<partitions>]`<br>`DELETE <topic>`<br>`LIST`<br>`SUBSCRIBE <topic>`<br>`PUBLISH <topic> <message>`<br>`CONSUME <topic> <pID> <offset>`<br>`HELP`<br>`EXIT` |
-
-## Response Format
-
-### Simple Commands
-
-- Commands other than CONSUME return a simple string response:
-    ```text
-    [4-byte length][response string]
-    ```
-- The writeResponse function handles this encoding:
-    ```text
-    Streaming Commands (CONSUME)
-    ```
-- CONSUME returns multiple length-prefixed messages:
-    ```
-    [4-byte length 1][message 1][4-byte length 2][message 2]...
-    ```
-
-## Error Handling
-
-### Error Response Format
-
-All errors are returned as strings prefixed with ERROR:
-
-```
-ERROR: <error description>
+```text
+OK
+OK key=value [key=value ...]
+{"status":"OK", ...}
+ERROR: <code> [key=value ...]
 ```
 
-### Common Error Scenarios
+Clients should treat `OK`, `OK ...`, and JSON responses with `status:"OK"` as success. Clients should treat every `ERROR:` response as failure and branch on the machine-readable error code immediately after the prefix.
 
-| Error                         | Cause                                | Example                       |
-|-------------------------------|--------------------------------------|-------------------------------|
-| `ERROR: empty command`           | Empty command string received         | -                             |
-| `ERROR: unknown command`         | Command not in supported list         | `ERROR: unknown command: FOO`   |
-| `ERROR: missing topic name`      | CREATE without topic name             | `CREATE`                        |
-| `ERROR: topic '<topic>' not found` | Operation on non-existent topic     | `DELETE nonexistent`            |
-| `ERROR: topic '<topic>' does not exist` | SUBSCRIBE/PUBLISH to missing topic | `SUBSCRIBE nonexistent`         |
-| `ERROR: invalid PUBLISH syntax` | PUBLISH without message               | `PUBLISH orders`                |
-| `ERROR: invalid CONSUME syntax` | CONSUME with wrong argument count     | `CONSUME orders`                |
+Legacy natural-language responses such as `Topic '<name>' now has <N> partitions`, `(no topics)`, or plain integer offsets are deprecated. SDKs may keep narrow fallback parsers for older brokers, but new client code should use the structured contract above.
 
+## Topic Commands
 
-### Error Logging
-The `logCommandResult` function logs all command outcomes:
+### CREATE
 
-```
-[CMD] SUCCESS for successful commands
-[CMD] FAILURE for error responses
+```text
+CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>]
 ```
 
-### Client Context
-Each connection maintains a `ClientContext` that tracks:
+Creates a topic or increases its partition count when the topic already exists.
 
-| Field         | Type                 | Description                                         |
-|---------------|--------------------|-----------------------------------------------------|
-| ConsumerGroup | string              | Consumer group identifier (e.g., "tcp-group")      |
-| ConsumerID    | int                 | Consumer identifier within group                   |
-| CurrentTopics | map[string]struct{} | Set of subscribed topic names                      |
+Success:
 
-## Implementation References
+```text
+OK topic=<name> partitions=<N>
+```
 
-### Key Functions
+Common errors:
 
-| Function               | Purpose                           |
-|------------------------|-----------------------------------|
-| HandleConnection        | Main connection handler loop       |
-| HandleCommand           | Command parser and dispatcher      |
-| HandleConsumeCommand    | CONSUME streaming handler          |
-| isCommand               | Command keyword detection          |
-| writeResponse           | Response encoding                  |
-| logCommandResult        | Command logging                    |
+```text
+ERROR: missing_topic expected="CREATE topic=<name> [partitions=<N>]"
+ERROR: invalid_partitions reason="must be a positive integer"
+ERROR: invalid_replication_factor reason="must be a positive integer"
+ERROR: create_topic_failed reason="..."
+```
 
-### Configuration Parameters
-Commands respect these configuration parameters:
+### DELETE
 
-| Parameter            | Config Field                  | Default    | Impact                              |
-|---------------------|-------------------------------|-----------|-------------------------------------|
-| Partition buffer size | `partition_channel_buffer_size` | 10000     | CREATE command partition capacity    |
-| Consumer buffer size  | `consumer_channel_buffer_size`  | 1000      | SUBSCRIBE consumer channel capacity |
-| Read batch size       | N/A               | 8192 bytes| CONSUME read size                   |
+```text
+DELETE topic=<name>
+```
 
+Success:
+
+```text
+OK topic=<name> deleted=true
+```
+
+Common errors:
+
+```text
+ERROR: missing_topic expected="DELETE topic=<name>"
+ERROR: topic_not_found topic=<name>
+ERROR: delete_topic_failed reason="..."
+```
+
+### LIST
+
+```text
+LIST
+```
+
+Success:
+
+```text
+OK count=<N> topics=<comma-separated-topic-names>
+```
+
+When no topics exist, the broker returns:
+
+```text
+OK count=0 topics=
+```
+
+### DESCRIBE
+
+```text
+DESCRIBE topic=<name>
+```
+
+Success is a JSON topic metadata object with `status:"OK"`.
+
+Common errors:
+
+```text
+ERROR: missing_topic expected="DESCRIBE topic=<name>"
+ERROR: topic_not_found topic=<name>
+ERROR: marshal_metadata_failed reason="..."
+```
+
+### HELP
+
+```text
+HELP
+```
+
+Success:
+
+```text
+OK commands=<comma-separated-command-names>
+```
+
+## Publish Commands
+
+### PUBLISH
+
+```text
+PUBLISH topic=<name> message=<payload> [key=<routing-key>] [producer_id=<id>] [seq_num=<N>] [epoch=<N>] [is_idempotent=<bool>] [acks=0|1|all]
+```
+
+For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. For `acks=0`, success is:
+
+```text
+OK
+```
+
+Common errors:
+
+```text
+ERROR: missing_topic command=PUBLISH
+ERROR: missing_message command=PUBLISH
+ERROR: topic_not_found topic=<name>
+ERROR: partition_not_found partition=<N>
+ERROR: invalid_acks value=<value>
+ERROR: invalid_seq_num reason="..."
+ERROR: invalid_epoch reason="..."
+```
+
+### REPLICATE_MESSAGE
+
+Internal replication command used between brokers.
+
+Success:
+
+```text
+OK
+```
+
+Common errors:
+
+```text
+ERROR: missing_payload command=REPLICATE_MESSAGE
+ERROR: unmarshal_failed reason="..."
+ERROR: topic_not_found topic=<name>
+ERROR: partition_not_found partition=<N>
+ERROR: replica_append_failed reason="..."
+```
+
+## Consume Commands
+
+### CONSUME
+
+```text
+CONSUME topic=<name> group=<group> partition=<N> offset=<N> member=<member-id> [batch=<N>]
+```
+
+`CONSUME` returns binary message frames. For consumer groups, the broker uses the committed offset for `(topic, group, partition)` as the authoritative resume point when one exists; otherwise the earliest offset policy is `0`.
+
+Common errors:
+
+```text
+ERROR: invalid_consume_syntax
+ERROR: missing_topic command=CONSUME
+ERROR: missing_partition command=CONSUME
+ERROR: missing_offset command=CONSUME
+ERROR: missing_member command=CONSUME
+ERROR: invalid_partition
+ERROR: invalid_offset
+ERROR: NOT_LEADER LEADER_IS <host:port>
+```
+
+### STREAM
+
+Continuous push-mode consume command.
+
+```text
+STREAM topic=<name> group=<group> partition=<N> offset=<N> member=<member-id>
+```
+
+Common errors:
+
+```text
+ERROR: invalid_stream_syntax
+ERROR: missing_topic command=STREAM
+ERROR: missing_partition command=STREAM
+ERROR: missing_offset command=STREAM
+ERROR: missing_member command=STREAM
+ERROR: NOT_LEADER LEADER_IS <host:port>
+```
+
+## Consumer Group Commands
+
+### REGISTER_GROUP
+
+```text
+REGISTER_GROUP topic=<name> group=<group>
+```
+
+Success:
+
+```text
+OK group=<group> topic=<name> registered=true
+```
+
+### JOIN_GROUP
+
+```text
+JOIN_GROUP topic=<name> group=<group> member=<member-id>
+```
+
+Success:
+
+```text
+OK member=<assigned-member-id> generation=<N>
+```
+
+### SYNC_GROUP
+
+```text
+SYNC_GROUP topic=<name> group=<group> member=<assigned-member-id>
+```
+
+Success:
+
+```text
+OK member=<assigned-member-id> generation=<N> assignments=<partition-list>
+```
+
+### HEARTBEAT
+
+```text
+HEARTBEAT topic=<name> group=<group> member=<assigned-member-id>
+```
+
+Success:
+
+```text
+OK member=<assigned-member-id> generation=<N>
+```
+
+### LEAVE_GROUP
+
+```text
+LEAVE_GROUP topic=<name> group=<group> member=<assigned-member-id>
+```
+
+Success:
+
+```text
+OK group=<group> member=<assigned-member-id> left=true
+```
+
+### FETCH_OFFSET
+
+```text
+FETCH_OFFSET topic=<name> group=<group> partition=<N>
+```
+
+Success:
+
+```text
+OK offset=<nextOffset>
+```
+
+When no offset has been committed, the broker returns `OK offset=0`.
+
+### COMMIT_OFFSET
+
+```text
+COMMIT_OFFSET topic=<name> group=<group> partition=<N> offset=<nextOffset>
+```
+
+The offset is the next offset to read after successful processing. Commits are monotonic per `(topic, group, partition)`: a commit lower than the current offset fails and does not rewind the group.
+
+Success:
+
+```text
+OK offset=<nextOffset>
+```
+
+Common errors:
+
+```text
+ERROR: invalid_offset
+ERROR: offset_regression current=<N> attempted=<N>
+ERROR: offset_manager_not_available
+ERROR: commit_offset_failed reason="..."
+```
+
+### BATCH_COMMIT
+
+```text
+BATCH_COMMIT topic=<name> group=<group> member=<member-id> generation=<N> P0:<nextOffset>,P1:<nextOffset>
+```
+
+Success:
+
+```text
+OK batched=<N>
+```
+
+Common errors:
+
+```text
+ERROR: invalid_batch_commit_format
+ERROR: no_valid_offsets
+ERROR: bulk_commit_failed reason="..."
+```
+
+### GROUP_STATUS
+
+```text
+GROUP_STATUS group=<group>
+```
+
+Success is a JSON group status response with `status:"OK"`.
+
+### FIND_COORDINATOR
+
+```text
+FIND_COORDINATOR group=<group>
+```
+
+Success:
+
+```text
+OK host=<host> port=<port>
+```
+
+In distributed mode, non-coordinator brokers can return:
+
+```text
+ERROR: NOT_COORDINATOR host=<host> port=<port>
+```
+
+## Cluster Commands
+
+### METADATA
+
+```text
+METADATA topic=<name>
+```
+
+Success is a JSON metadata response with `status:"OK"`.
+
+Common errors:
+
+```text
+ERROR: missing_topic command=METADATA
+ERROR: topic_not_found topic=<name>
+ERROR: fsm_not_available
+ERROR: distribution_not_enabled
+```
+
+### RAFT_APPLY
+
+Internal replication command used by distributed brokers.
+
+Success:
+
+```text
+OK
+```
+
+Common errors:
+
+```text
+ERROR: missing_required_params command=RAFT_APPLY params=type,payload
+ERROR: empty_required_params command=RAFT_APPLY params=type,payload
+ERROR: distribution_required command=RAFT_APPLY
+ERROR: invalid_payload_json reason="..."
+ERROR: raft_apply_failed reason="..."
+```
+
+## Event Sourcing Commands
+
+Event-sourcing commands are routed by aggregate `key`. In distributed mode, the broker handling the command must be the leader for the aggregate partition. A non-leader broker returns:
+
+```text
+ERROR: NOT_LEADER LEADER_IS <host:port>
+```
+
+Clients and SDKs should reconnect to that leader and retry. Followers index replicated event-sourcing records, apply quorum-replicated snapshots, and can pull missing snapshots from the partition leader with internal catch-up commands after restart. Partitions restore a synced high-watermark checkpoint with durable-tail clamping, so committed reads remain bounded by the last successful committed tail.
+
+
+### APPEND_STREAM
+
+```text
+APPEND_STREAM topic=<name> key=<aggregate-key> version=<N> [event_type=<type>] [schema_version=<N>] [metadata=<json>] message=<payload>
+```
+
+Success:
+
+```text
+OK version=<N> offset=<N> partition=<N>
+```
+
+Common errors:
+
+```text
+ERROR: missing_topic
+ERROR: missing_key
+ERROR: missing_version
+ERROR: invalid_version
+ERROR: missing_message
+ERROR: topic_not_found topic=<name>
+ERROR: event_sourcing_not_enabled topic=<name>
+ERROR: version_conflict current=<N> expected=<N>
+ERROR: append_stream_failed reason="..."
+```
+
+### READ_STREAM
+
+```text
+READ_STREAM topic=<name> key=<aggregate-key> [from_version=<N>]
+```
+
+Success returns a JSON envelope frame with `status:"OK"`, followed by a binary batch frame containing committed events. Error envelopes use JSON with `status:"ERROR"`.
+
+### STREAM_VERSION
+
+```text
+STREAM_VERSION topic=<name> key=<aggregate-key>
+```
+
+Success:
+
+```text
+OK version=<N>
+```
+
+### SAVE_SNAPSHOT
+
+```text
+SAVE_SNAPSHOT topic=<name> key=<aggregate-key> version=<N> message=<payload>
+```
+
+Success:
+
+```text
+OK version=<N> partition=<N>
+```
+
+Common errors:
+
+```text
+ERROR: snapshot_version_exceeds_stream version=<N> current=<N>
+ERROR: snapshot_save_failed reason="..."
+```
+
+### READ_SNAPSHOT
+
+```text
+READ_SNAPSHOT topic=<name> key=<aggregate-key>
+```
+
+Success when a snapshot exists:
+
+```text
+OK snapshot={"version":500,"payload":"..."}
+```
+
+Success when no snapshot exists:
+
+```text
+OK snapshot=null
+```
+
+## Server-Level Errors
+
+Malformed frames and handler failures also use the same error prefix:
+
+```text
+ERROR: decode_failed reason="..."
+ERROR: malformed_input reason=missing_topic_or_payload
+ERROR: command_failed reason="..."
+ERROR: empty_command_response
+ERROR: unknown_command command=<name>
+ERROR: empty_command
+```

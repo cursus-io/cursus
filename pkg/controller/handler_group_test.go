@@ -34,7 +34,8 @@ func TestCommandHandler_GroupOps(t *testing.T) {
 
 	t.Run("REGISTER_GROUP", func(t *testing.T) {
 		resp := ch.HandleCommand("REGISTER_GROUP topic=topic1 group=g1", ctx)
-		assert.Contains(t, resp, "✅ Group 'g1' registered")
+		assert.Contains(t, resp, "OK group=g1 topic=topic1")
+		assert.Contains(t, resp, "registered=true")
 	})
 
 	t.Run("JOIN_GROUP", func(t *testing.T) {
@@ -70,7 +71,7 @@ func TestCommandHandler_GroupOps(t *testing.T) {
 
 	t.Run("LEAVE_GROUP", func(t *testing.T) {
 		resp := ch.HandleCommand("LEAVE_GROUP topic=topic1 group=g1 member="+ctx.MemberID, ctx)
-		assert.Contains(t, resp, "✅ Left group 'g1'")
+		assert.Contains(t, resp, "left=true")
 	})
 }
 
@@ -93,11 +94,11 @@ func TestCommandHandler_OffsetOps(t *testing.T) {
 
 	t.Run("FETCH_OFFSET", func(t *testing.T) {
 		resp := ch.HandleCommand("FETCH_OFFSET topic=topic1 partition=0 group=g1", ctx)
-		assert.Equal(t, "123", resp)
+		assert.Equal(t, "OK offset=123", resp)
 	})
 
 	t.Run("FETCH_OFFSET - Not Found", func(t *testing.T) {
 		resp := ch.HandleCommand("FETCH_OFFSET topic=topic1 partition=1 group=g1", ctx)
-		assert.Equal(t, "0", resp)
+		assert.Equal(t, "OK offset=0", resp)
 	})
 }

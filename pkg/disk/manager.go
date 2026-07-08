@@ -2,8 +2,9 @@ package disk
 
 import (
 	"fmt"
-	"strconv"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -29,7 +30,7 @@ func (dm *DiskManager) GetHandler(topic string, partitionID int) (types.StorageH
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
-	key := topic + "_" + strconv.Itoa(partitionID)
+	key := diskHandlerKey(topic, partitionID)
 	if dh, ok := dm.handlers[key]; ok {
 		return dh, nil
 	}
@@ -59,4 +60,41 @@ func (dm *DiskManager) CloseAllHandlers() {
 		}
 		delete(dm.handlers, name)
 	}
+}
+
+// CloseTopicHandlers closes and forgets all handlers for a topic so its log
+// directory can be safely deleted before the topic is recreated.
+func (dm *DiskManager) CloseTopicHandlers(topic string) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	for name, dh := range dm.handlers {
+		if !diskHandlerKeyMatchesTopic(name, topic) {
+			continue
+		}
+		util.Debug("Closing DiskHandler for %s", name)
+		if err := dh.Close(); err != nil {
+			util.Warn("Failed to close DiskHandler for %s: %v", name, err)
+		}
+		delete(dm.handlers, name)
+	}
+}
+
+func diskHandlerKey(topic string, partitionID int) string {
+	return topic + "_" + strconv.Itoa(partitionID)
+}
+
+func diskHandlerKeyMatchesTopic(key, topic string) bool {
+	if key == topic {
+		return true
+	}
+	if !strings.HasPrefix(key, topic+"_") {
+		return false
+	}
+	suffix := strings.TrimPrefix(key, topic+"_")
+	if suffix == "" {
+		return false
+	}
+	_, err := strconv.Atoi(suffix)
+	return err == nil
 }
