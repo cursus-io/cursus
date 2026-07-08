@@ -194,7 +194,7 @@ func (p *Producer) CreateTopic(topic string, partitions int) error {
 	}
 	defer func() { _ = conn.Close() }()
 
-	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d", topic, partitions)
+	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, partitions, p.config.EnableIdempotence)
 	cmdBytes := EncodeMessage("admin", createCmd)
 
 	if err := WriteWithLength(conn, cmdBytes); err != nil {

@@ -9,8 +9,8 @@ services:
     environment:
       - CONFIG_PATH=/root/config.yaml
       - ADVERTISED_HOST=broker-1
-      - ADVERTISED_BROKER_PORT=9001
-      - ADVERTISED_CLIENT_HOST=localhost
+      - ADVERTISED_BROKER_PORT=9000
+      - ADVERTISED_CLIENT_HOST=broker-1
       - BOOTSTRAP_CLUSTER=true
       - RAFT_PEERS=
     volumes:
@@ -38,8 +38,8 @@ services:
     environment:
       - CONFIG_PATH=/root/config.yaml
       - ADVERTISED_HOST=broker-2
-      - ADVERTISED_BROKER_PORT=9002
-      - ADVERTISED_CLIENT_HOST=localhost
+      - ADVERTISED_BROKER_PORT=9000
+      - ADVERTISED_CLIENT_HOST=broker-2
       - BOOTSTRAP_CLUSTER=false
     depends_on:
       broker-1:
@@ -69,8 +69,8 @@ services:
     environment:
       - CONFIG_PATH=/root/config.yaml
       - ADVERTISED_HOST=broker-3
-      - ADVERTISED_BROKER_PORT=9003
-      - ADVERTISED_CLIENT_HOST=localhost
+      - ADVERTISED_BROKER_PORT=9000
+      - ADVERTISED_CLIENT_HOST=broker-3
       - BOOTSTRAP_CLUSTER=false
     depends_on:
       broker-1:

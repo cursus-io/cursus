@@ -11,8 +11,8 @@ consumer_id: "consumer-1"
 mode: "polling" # polling, streaming
 poll_interval: 100ms
 poll_timeout_ms: 3000
-batch_size: 2000
-max_poll_records: 2000
+batch_size: 5000
+max_poll_records: 5000
 
 # Timeout
 session_timeout_ms: 120000
@@ -22,4 +22,4 @@ streaming_read_deadline_ms: 30000
 # Benchmark, Validation
 enable_benchmark: true
 enable_correctness: true
-num_messages: 20000
+num_messages: 100000

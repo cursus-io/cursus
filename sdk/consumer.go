@@ -717,8 +717,10 @@ func (c *Consumer) Close() error {
 	}
 
 	close(c.doneCh)
-	c.wg.Wait()
+	// Cancel the active consume context and close live sockets so blocked I/O exits promptly.
 	c.mainCancel()
+	c.closeActiveConnections()
+	c.wg.Wait()
 
 	c.flushOffsets()
 	close(c.commitCh)
@@ -750,6 +752,28 @@ func (c *Consumer) Close() error {
 	c.mu.Unlock()
 
 	return nil
+}
+
+func (c *Consumer) closeActiveConnections() {
+	c.mu.RLock()
+	pcs := make([]*PartitionConsumer, 0, len(c.partitionConsumers))
+	for _, pc := range c.partitionConsumers {
+		pcs = append(pcs, pc)
+	}
+	c.mu.RUnlock()
+
+	for _, pc := range pcs {
+		pc.closeConnection()
+	}
+
+	c.resetHeartbeatConn()
+
+	c.commitMu.Lock()
+	if c.commitConn != nil {
+		_ = c.commitConn.Close()
+		c.commitConn = nil
+	}
+	c.commitMu.Unlock()
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
