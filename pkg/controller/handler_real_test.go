@@ -55,6 +55,9 @@ func TestCommandHandler_Real(t *testing.T) {
 		if !strings.Contains(resp, "OK commands=") {
 			t.Errorf("Expected HELP response, got: %s", resp)
 		}
+		if !strings.Contains(resp, "STREAM") || !strings.Contains(resp, "BATCH_COMMIT") {
+			t.Errorf("Expected HELP to include STREAM and BATCH_COMMIT, got: %s", resp)
+		}
 	})
 
 	t.Run("CREATE and LIST topics", func(t *testing.T) {

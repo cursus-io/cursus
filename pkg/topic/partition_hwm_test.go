@@ -25,6 +25,7 @@ func TestPartition_RestoresPersistedHWMCheckpoint(t *testing.T) {
 	require.NoError(t, p.EnqueueBatchLeader(leaderBatch))
 	p.FlushDisk()
 	require.Equal(t, uint64(1), p.GetHWM(), "leader append must not advance HWM before replication commit")
+	p.Close()
 	require.NoError(t, dh.Close())
 
 	restartedDH, err := disk.NewDiskHandler(cfg, "orders", 0)
@@ -37,4 +38,29 @@ func TestPartition_RestoresPersistedHWMCheckpoint(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)
 	require.Equal(t, "committed", msgs[0].Payload)
+}
+
+func TestPartition_ReplacesPersistedHWMCheckpoint(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 1
+
+	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	p := NewPartition(0, "orders", dh, nil, cfg)
+
+	require.NoError(t, p.EnqueueSync(types.Message{Payload: "first"}))
+	p.FlushDisk()
+	require.NoError(t, p.EnqueueSync(types.Message{Payload: "second"}))
+	p.FlushDisk()
+	p.Close()
+	require.NoError(t, dh.Close())
+
+	restartedDH, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { _ = restartedDH.Close() }()
+	restarted := NewPartition(0, "orders", restartedDH, nil, cfg)
+	defer restarted.Close()
+
+	require.Equal(t, uint64(2), restarted.GetHWM())
 }

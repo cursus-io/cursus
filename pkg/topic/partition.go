@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +36,9 @@ type Partition struct {
 	closed            bool
 	streamManager     StreamManager
 	hwmCheckpointPath string
+	hwmCheckpointCh   chan struct{}
+	hwmCheckpointMu   sync.Mutex
+	hwmCheckpointWG   sync.WaitGroup
 	producerState     sync.Map // map[string]*producerEntry
 	isIdempotent      bool
 	closeCh           chan struct{}
@@ -59,6 +63,7 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 
 	if handler, ok := dh.(*disk.DiskHandler); ok {
 		p.hwmCheckpointPath = hwmCheckpointPath(handler, id)
+		p.hwmCheckpointCh = make(chan struct{}, 1)
 		durableTail := handler.GetAbsoluteOffset()
 		if persistedHWM, ok := loadHWMCheckpoint(p.hwmCheckpointPath); ok {
 			if persistedHWM > durableTail {
@@ -77,6 +82,11 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 			default:
 			}
 		}
+	}
+
+	if p.hwmCheckpointCh != nil {
+		p.hwmCheckpointWG.Add(1)
+		go p.runHWMCheckpointLoop()
 	}
 
 	return p
@@ -338,6 +348,7 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 // FlushDisk forces all pending async writes to disk.
 func (p *Partition) FlushDisk() {
 	p.dh.Flush()
+	p.persistHWMCheckpoint()
 }
 
 func (p *Partition) GetLatestOffset() uint64 {
@@ -373,16 +384,58 @@ func (p *Partition) setHWMLocked(hwm uint64) bool {
 		return false
 	}
 	p.HWM = hwm
-	p.persistHWMCheckpointLocked()
+	p.signalHWMCheckpointLocked()
 	return true
 }
 
-func (p *Partition) persistHWMCheckpointLocked() {
-	if p.hwmCheckpointPath == "" {
+func (p *Partition) signalHWMCheckpointLocked() {
+	if p.hwmCheckpointCh == nil {
 		return
 	}
-	tmp := p.hwmCheckpointPath + ".tmp"
-	data := []byte(strconv.FormatUint(p.HWM, 10) + "\n")
+	select {
+	case p.hwmCheckpointCh <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Partition) runHWMCheckpointLoop() {
+	defer p.hwmCheckpointWG.Done()
+
+	ticker := time.NewTicker(hwmCheckpointInterval)
+	defer ticker.Stop()
+
+	dirty := false
+	for {
+		select {
+		case <-p.hwmCheckpointCh:
+			dirty = true
+		case <-ticker.C:
+			if dirty {
+				p.persistHWMCheckpoint()
+				dirty = false
+			}
+		case <-p.closeCh:
+			p.persistHWMCheckpoint()
+			return
+		}
+	}
+}
+
+func (p *Partition) persistHWMCheckpoint() {
+	p.mu.RLock()
+	checkpointPath := p.hwmCheckpointPath
+	hwm := p.HWM
+	p.mu.RUnlock()
+
+	if checkpointPath == "" {
+		return
+	}
+
+	p.hwmCheckpointMu.Lock()
+	defer p.hwmCheckpointMu.Unlock()
+
+	tmp := checkpointPath + ".tmp"
+	data := []byte(strconv.FormatUint(hwm, 10) + "\n")
 	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -403,9 +456,26 @@ func (p *Partition) persistHWMCheckpointLocked() {
 		util.Warn("failed to close HWM checkpoint %s: %v", tmp, err)
 		return
 	}
-	_ = os.Remove(p.hwmCheckpointPath)
-	if err := os.Rename(tmp, p.hwmCheckpointPath); err != nil {
-		util.Warn("failed to rename HWM checkpoint %s: %v", p.hwmCheckpointPath, err)
+	if err := replaceCheckpointFile(tmp, checkpointPath); err != nil {
+		util.Warn("failed to rename HWM checkpoint %s: %v", checkpointPath, err)
+		return
+	}
+	syncParentDir(filepath.Dir(checkpointPath))
+}
+
+func syncParentDir(path string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	// #nosec G304 -- checkpoint directory is derived from the broker-owned partition log directory.
+	dir, err := os.Open(path)
+	if err != nil {
+		util.Warn("failed to open HWM checkpoint directory %s: %v", path, err)
+		return
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		util.Warn("failed to sync HWM checkpoint directory %s: %v", path, err)
 	}
 }
 
@@ -451,13 +521,17 @@ func (p *Partition) UpdateLEO(leo uint64) {
 // Close shuts down the partition.
 func (p *Partition) Close() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed {
+		p.mu.Unlock()
 		return
 	}
 	p.closed = true
 	close(p.closeCh)
+	p.mu.Unlock()
+	p.hwmCheckpointWG.Wait()
 }
+
+const hwmCheckpointInterval = 250 * time.Millisecond
 
 const producerStateTTL = 30 * time.Minute
 

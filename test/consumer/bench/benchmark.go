@@ -274,11 +274,11 @@ func (m *ConsumerMetrics) PrintSummaryTo(w io.Writer) {
 	_, _ = fmt.Fprintf(w, "Overall TPS          : %.2f msg/s\n", overallTPS)
 
 	if m.enableCorrectness {
-		_, _ = fmt.Fprintf(w, "Duplicate (MessageID) : %d (fp possible)\n", atomic.LoadInt64(&m.dupCount))
-		_, _ = fmt.Fprintf(w, "Duplicate (Offset)    : %d (fp possible)\n", atomic.LoadInt64(&m.dupOffsetCount))
+		_, _ = fmt.Fprintf(w, "Duplicate (MessageID) : %d\n", atomic.LoadInt64(&m.dupCount))
+		_, _ = fmt.Fprintf(w, "Duplicate (Offset)    : %d\n", atomic.LoadInt64(&m.dupOffsetCount))
 		_, _ = fmt.Fprintf(w, "Message missing       : %d\n", atomic.LoadInt64(&m.missingCount))
 	} else {
-		_, _ = fmt.Fprintf(w, "Correctness Check     : disabled (no Bloom filter)\n")
+		_, _ = fmt.Fprintf(w, "Correctness Check     : disabled\n")
 	}
 
 	if m.rebalance != nil && !m.rebalance.End.IsZero() {

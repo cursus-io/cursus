@@ -26,8 +26,8 @@ var (
 // handleHelp processes HELP command
 func (ch *CommandHandler) handleHelp() string {
 	commands := []string{
-		"CREATE", "DELETE", "LIST", "PUBLISH", "CONSUME", "JOIN_GROUP", "SYNC_GROUP",
-		"LEAVE_GROUP", "HEARTBEAT", "COMMIT_OFFSET", "FETCH_OFFSET", "REGISTER_GROUP",
+		"CREATE", "DELETE", "LIST", "PUBLISH", "CONSUME", "STREAM", "JOIN_GROUP", "SYNC_GROUP",
+		"LEAVE_GROUP", "HEARTBEAT", "COMMIT_OFFSET", "BATCH_COMMIT", "FETCH_OFFSET", "REGISTER_GROUP",
 		"GROUP_STATUS", "DESCRIBE", "APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT",
 		"READ_SNAPSHOT", "STREAM_VERSION", "METADATA", "FIND_COORDINATOR", "HELP", "EXIT",
 	}
@@ -201,7 +201,7 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string) string {
 		if err := ch.Coordinator.RegisterGroup(topicName, groupName, len(t.Partitions)); err != nil {
 			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 		}
-		return fmt.Sprintf("OK group=%s topic=%s", groupName, topicName)
+		return fmt.Sprintf("OK group=%s topic=%s registered=true", groupName, topicName)
 	}
 	return "ERROR: coordinator_not_available"
 }

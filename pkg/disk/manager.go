@@ -30,7 +30,7 @@ func (dm *DiskManager) GetHandler(topic string, partitionID int) (types.StorageH
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
-	key := topic + "_" + strconv.Itoa(partitionID)
+	key := diskHandlerKey(topic, partitionID)
 	if dh, ok := dm.handlers[key]; ok {
 		return dh, nil
 	}
@@ -68,9 +68,8 @@ func (dm *DiskManager) CloseTopicHandlers(topic string) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
-	prefix := topic + "_"
 	for name, dh := range dm.handlers {
-		if name != topic && !strings.HasPrefix(name, prefix) {
+		if !diskHandlerKeyMatchesTopic(name, topic) {
 			continue
 		}
 		util.Debug("Closing DiskHandler for %s", name)
@@ -79,4 +78,23 @@ func (dm *DiskManager) CloseTopicHandlers(topic string) {
 		}
 		delete(dm.handlers, name)
 	}
+}
+
+func diskHandlerKey(topic string, partitionID int) string {
+	return topic + "_" + strconv.Itoa(partitionID)
+}
+
+func diskHandlerKeyMatchesTopic(key, topic string) bool {
+	if key == topic {
+		return true
+	}
+	if !strings.HasPrefix(key, topic+"_") {
+		return false
+	}
+	suffix := strings.TrimPrefix(key, topic+"_")
+	if suffix == "" {
+		return false
+	}
+	_, err := strconv.Atoi(suffix)
+	return err == nil
 }

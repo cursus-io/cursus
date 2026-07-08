@@ -29,10 +29,29 @@ func composeFile(rel string) string {
 
 func runCompose(args ...string) *exec.Cmd {
 	base := getComposeCommand()
-	fullArgs := append([]string{"--project-name", "cursus-benchmark"}, base[1:]...)
+	fullArgs := append([]string{}, base[1:]...)
+	fullArgs = append(fullArgs, "--project-name", "cursus-benchmark")
 	fullArgs = append(fullArgs, args...)
 	cmd := exec.Command(base[0], fullArgs...)
 	return cmd
+}
+
+func TestRunComposePlacesProjectNameAfterComposeSubcommand(t *testing.T) {
+	cmd := runCompose("-f", "docker-compose.yml", "up", "-d")
+	args := cmd.Args[1:]
+
+	if len(args) == 0 {
+		t.Fatalf("expected compose arguments")
+	}
+	if args[0] == "compose" {
+		if len(args) < 3 || args[1] != "--project-name" || args[2] != "cursus-benchmark" {
+			t.Fatalf("docker compose project name must follow compose subcommand, got %v", args)
+		}
+		return
+	}
+	if args[0] != "--project-name" || len(args) < 2 || args[1] != "cursus-benchmark" {
+		t.Fatalf("docker-compose project name must be first argument, got %v", args)
+	}
 }
 
 func composeDown(t *testing.T, file string) {

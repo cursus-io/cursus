@@ -12,7 +12,11 @@ func TestTextCommandResponseContract(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	assertContractSuccess(t, ch.HandleCommand("CREATE topic=contract-topic partitions=2", ctx), "CREATE")
-	assertContractSuccess(t, ch.HandleCommand("REGISTER_GROUP topic=contract-topic group=contract-group", ctx), "REGISTER_GROUP")
+	registerResp := ch.HandleCommand("REGISTER_GROUP topic=contract-topic group=contract-group", ctx)
+	assertContractSuccess(t, registerResp, "REGISTER_GROUP")
+	if !strings.Contains(registerResp, "registered=true") {
+		t.Fatalf("REGISTER_GROUP response missing registered=true: %s", registerResp)
+	}
 	assertContractSuccess(t, ch.HandleCommand("JOIN_GROUP topic=contract-topic group=contract-group member=contract-member", ctx), "JOIN_GROUP")
 	assertContractSuccess(t, ch.HandleCommand("SYNC_GROUP topic=contract-topic group=contract-group member="+ctx.MemberID, ctx), "SYNC_GROUP")
 	assertContractSuccess(t, ch.HandleCommand("HEARTBEAT topic=contract-topic group=contract-group member="+ctx.MemberID, ctx), "HEARTBEAT")

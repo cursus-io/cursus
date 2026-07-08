@@ -238,6 +238,7 @@ func (m *ConsumerMetrics) Finalize() {
 		atomic.StoreInt64(&m.missingCount, 0)
 	}
 }
+
 func percentile(sorted []float64, p float64) float64 {
 	if len(sorted) == 0 {
 		return 0
@@ -281,8 +282,8 @@ func (m *ConsumerMetrics) PrintSummaryTo(w io.Writer) error {
 	p("Overall TPS          : %.2f msg/s\n", overallTPS)
 
 	if m.enableCorrectness {
-		p("Duplicate (MessageID): %d (fp possible)\n", atomic.LoadInt64(&m.dupCount))
-		p("Duplicate (Offset)   : %d (fp possible)\n", atomic.LoadInt64(&m.dupOffsetCount))
+		p("Duplicate (MessageID): %d\n", atomic.LoadInt64(&m.dupCount))
+		p("Duplicate (Offset)   : %d\n", atomic.LoadInt64(&m.dupOffsetCount))
 		p("Messages missing     : %d\n", atomic.LoadInt64(&m.missingCount))
 	} else {
 		p("Correctness Check    : disabled\n")
