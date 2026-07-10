@@ -132,7 +132,7 @@ bench:
 	fi; \
 	echo "[MAKE] Benchmark logs:"; \
 	$$compose logs | tee "$$log_file" || true; \
-	if grep -Eiq "benchmark incomplete|verify failed|Failed messages[[:space:]]*: [1-9][0-9]*|Message missing[[:space:]]*: [1-9][0-9]*|Duplicate \\(MessageID\\)[[:space:]]*: [1-9][0-9]*|Duplicate \\(Offset\\)[[:space:]]*: [1-9][0-9]*|panic:|fatal" "$$log_file"; then \
+	if grep -Eiq "benchmark incomplete|verify failed|Failed messages[[:space:]]*: [1-9][0-9]*|Message missing[[:space:]]*: [1-9][0-9]*|Duplicate \\(MessageID\\)[[:space:]]*: [1-9][0-9]*|Duplicate \\(Offset\\)[[:space:]]*: [1-9][0-9]*|(^|[[:space:]])(panic:|\\[FATAL\\]|FATAL:|fatal error:|level=fatal)([[:space:]]|$$)" "$$log_file"; then \
 		echo "[MAKE] Benchmark failure marker found in logs"; \
 		status=1; \
 	fi; \

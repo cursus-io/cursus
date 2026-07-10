@@ -1,16 +1,25 @@
 package e2e_benchmark
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
 const benchmarkTimeout = 5 * time.Minute
+
+var severeBenchmarkLogPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)(^|[\s|])(?:panic:|\[fatal\]|fatal:|fatal error:|level=fatal)(\s|$)`),
+	regexp.MustCompile(`(?i)benchmark incomplete`),
+	regexp.MustCompile(`(?i)verify failed`),
+}
 
 func getComposeCommand() []string {
 	if _, err := exec.LookPath("docker-compose"); err == nil {
@@ -53,15 +62,42 @@ func TestRunComposePlacesProjectNameAfterComposeSubcommand(t *testing.T) {
 		t.Fatalf("docker-compose project name must be first argument, got %v", args)
 	}
 }
+func TestBenchmarkFailurePatternsAvoidBroadFatalMatches(t *testing.T) {
+	benign := "bench-consumer | nonfatal retry message\nbench-broker | fatality is not a log level"
+	for _, pattern := range severeBenchmarkLogPatterns {
+		if pattern.MatchString(benign) {
+			t.Fatalf("pattern %q matched benign log", pattern.String())
+		}
+	}
+
+	severe := "bench-consumer | fatal error: benchmark worker aborted"
+	matched := false
+	for _, pattern := range severeBenchmarkLogPatterns {
+		matched = matched || pattern.MatchString(severe)
+	}
+	if !matched {
+		t.Fatal("expected severe fatal log to match")
+	}
+}
+
+func TestBenchmarkCounterParsesMultiDigitFailures(t *testing.T) {
+	logs := "bench-consumer | Message missing       : 12\nbench-consumer | Duplicate (Offset)    : 0"
+	missing, ok := benchmarkCounter(logs, "Message missing")
+	if !ok || missing != 12 {
+		t.Fatalf("expected missing=12, got %d ok=%t", missing, ok)
+	}
+
+	dupOffset, ok := benchmarkCounter(logs, "Duplicate (Offset)")
+	if !ok || dupOffset != 0 {
+		t.Fatalf("expected duplicate offset=0, got %d ok=%t", dupOffset, ok)
+	}
+}
 
 func composeDown(t *testing.T, file string) {
-	// Force remove containers first to handle conflicts from compose files that
-	// declare fixed container_name values outside project-name isolation.
+	// Fixed container_name values bypass compose project-name isolation. Remove
+	// only containers that Docker labels as belonging to these benchmark compose files.
 	for _, name := range fixedBenchmarkContainers(file) {
-		cmd := exec.Command("docker", "rm", "-f", "-v", name)
-		if output, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(output), "No such container") {
-			t.Logf("docker rm warning for %s: %v\n%s", name, err, string(output))
-		}
+		removeFixedBenchmarkContainer(t, file, name)
 	}
 
 	cmd := runCompose("-f", file, "rm", "-f", "-s", "-v")
@@ -80,6 +116,43 @@ func fixedBenchmarkContainers(file string) []string {
 		return []string{"broker-1", "broker-2", "broker-3", "broker-publisher", "broker-consumer", "prometheus"}
 	}
 	return []string{"bench-broker", "bench-publisher", "bench-consumer"}
+}
+
+func removeFixedBenchmarkContainer(t *testing.T, file, name string) {
+	if !isFixedBenchmarkContainer(t, file, name) {
+		return
+	}
+
+	cmd := exec.Command("docker", "rm", "-f", "-v", name)
+	if output, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(output), "No such container") {
+		t.Logf("docker rm warning for %s: %v\n%s", name, err, string(output))
+	}
+}
+
+func isFixedBenchmarkContainer(t *testing.T, file, name string) bool {
+	format := strings.Join([]string{
+		`{{ index .Config.Labels "com.docker.compose.project" }}`,
+		`{{ index .Config.Labels "com.docker.compose.project.config_files" }}`,
+		`{{ index .Config.Labels "com.docker.compose.project.working_dir" }}`,
+	}, "\n")
+	cmd := exec.Command("docker", "inspect", "-f", format, name)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+
+	absFile, err := filepath.Abs(file)
+	if err != nil {
+		t.Logf("failed to resolve compose file %s: %v", file, err)
+		return false
+	}
+
+	labels := filepath.ToSlash(string(output))
+	expectedFile := filepath.ToSlash(absFile)
+	expectedDir := filepath.ToSlash(filepath.Dir(absFile))
+	return strings.Contains(labels, "cursus-benchmark") ||
+		strings.Contains(labels, expectedFile) ||
+		strings.Contains(labels, expectedDir)
 }
 
 func composeUp(t *testing.T, file string) {
@@ -123,48 +196,49 @@ func waitForContainerExit(t *testing.T, file, service, container string, timeout
 func assertBenchmarkSuccess(t *testing.T, logs string, component string) {
 	t.Helper()
 
-	lower := strings.ToLower(logs)
-	failureMarkers := []string{
-		"fatal",
-		"panic",
-		"benchmark incomplete",
-		"verify failed",
-		"failed messages              : 1",
-		"failed messages              : 2",
-		"failed messages              : 3",
-		"failed messages              : 4",
-		"failed messages              : 5",
-		"failed messages              : 6",
-		"failed messages              : 7",
-		"failed messages              : 8",
-		"failed messages              : 9",
-		"message missing       : 1",
-		"message missing       : 2",
-		"message missing       : 3",
-		"message missing       : 4",
-		"message missing       : 5",
-		"message missing       : 6",
-		"message missing       : 7",
-		"message missing       : 8",
-		"message missing       : 9",
+	for _, pattern := range severeBenchmarkLogPatterns {
+		if pattern.MatchString(logs) {
+			t.Fatalf("%s benchmark reported failure marker %q:\n%s", component, pattern.String(), lastLines(logs, 40))
+		}
 	}
-	for _, marker := range failureMarkers {
-		if strings.Contains(lower, marker) {
-			t.Fatalf("%s benchmark reported failure marker %q:\n%s", component, marker, lastLines(logs, 40))
+
+	for _, label := range []string{"Failed messages", "Message missing", "Duplicate (MessageID)", "Duplicate (Offset)"} {
+		if count, ok := benchmarkCounter(logs, label); ok && count > 0 {
+			t.Fatalf("%s benchmark reported %s=%d:\n%s", component, label, count, lastLines(logs, 40))
 		}
 	}
 
 	if component == "Publisher" {
-		if !strings.Contains(logs, "Failed messages              : 0") || !strings.Contains(logs, "rate: 100.00%") {
+		failed, ok := benchmarkCounter(logs, "Failed messages")
+		if !ok || failed != 0 || !strings.Contains(logs, "rate: 100.00%") {
 			t.Fatalf("publisher did not report a complete publish:\n%s", lastLines(logs, 40))
 		}
 	} else if component == "Consumer" {
-		if !strings.Contains(logs, "All messages consumed") || !strings.Contains(logs, "Message missing       : 0") {
+		if !strings.Contains(logs, "All messages consumed") {
 			t.Fatalf("consumer did not report complete consumption:\n%s", lastLines(logs, 40))
+		}
+		for _, label := range []string{"Message missing", "Duplicate (MessageID)", "Duplicate (Offset)"} {
+			count, ok := benchmarkCounter(logs, label)
+			if !ok || count != 0 {
+				t.Fatalf("consumer did not report %s=0:\n%s", label, lastLines(logs, 40))
+			}
 		}
 	}
 
 	t.Logf("%s benchmark completed successfully", component)
+}
+
+func benchmarkCounter(logs, label string) (int, bool) {
+	pattern := regexp.MustCompile(fmt.Sprintf(`(?im)%s[[:space:]]*:[[:space:]]*([0-9]+)`, regexp.QuoteMeta(label)))
+	match := pattern.FindStringSubmatch(logs)
+	if match == nil {
+		return 0, false
+	}
+	count, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0, false
+	}
+	return count, true
 }
 
 func lastLines(s string, n int) string {
