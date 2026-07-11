@@ -54,6 +54,12 @@ func (m *MockStorageHandler) ReadMessages(offset uint64, max int) ([]types.Messa
 }
 
 func (m *MockStorageHandler) GetFirstOffset() uint64 {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "GetFirstOffset" {
+			args := m.Called()
+			return args.Get(0).(uint64)
+		}
+	}
 	return 0
 }
 func (m *MockStorageHandler) GetAbsoluteOffset() uint64 {

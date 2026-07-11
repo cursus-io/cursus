@@ -708,6 +708,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 
 - Each idempotent message must have a unique `(producerId, epoch, seqNum)` tuple within a partition
 - `seqNum` must be monotonically increasing within the current producer epoch
+- A new `(producerId, epoch)` sequence starts at `seqNum=1`; starting above 1 is rejected as a gap
 - A higher `epoch` fences the previous producer session and may restart `seqNum` from 1
 - A lower `epoch` is rejected as stale producer state
 - `seqNum` = 0 disables dedup for that message

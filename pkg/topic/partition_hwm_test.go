@@ -171,3 +171,83 @@ func TestPartition_EnqueueBatchLeaderDoesNotAdvanceStateOnWriteFailure(t *testin
 	require.Equal(t, uint64(1), retryBatch[0].Offset)
 	require.Equal(t, uint64(2), p.NextOffset())
 }
+
+func TestPartition_RejectsNewProducerSequenceGap(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.isIdempotent = true
+
+	require.Error(t, p.EnqueueSync(types.Message{Payload: "gap", ProducerID: "producer-1", SeqNum: 2}))
+}
+
+func TestPartition_EnqueueBatchLeaderStagesProducerState(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	dh.On("WriteBatch", mock.MatchedBy(func(batch []types.DiskMessage) bool {
+		return len(batch) == 2 && batch[0].SeqNum == 1 && batch[1].SeqNum == 2
+	})).Return(nil).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.isIdempotent = true
+
+	batch := []types.Message{
+		{Payload: "one", ProducerID: "producer-1", SeqNum: 1},
+		{Payload: "two", ProducerID: "producer-1", SeqNum: 2},
+	}
+	require.NoError(t, p.EnqueueBatchLeader(batch))
+	dh.AssertExpectations(t)
+}
+
+func TestPartition_EnqueueBatchLeaderRejectsSequenceGapWithinBatch(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.isIdempotent = true
+
+	batch := []types.Message{
+		{Payload: "one", ProducerID: "producer-1", SeqNum: 1},
+		{Payload: "gap", ProducerID: "producer-1", SeqNum: 3},
+	}
+	require.Error(t, p.EnqueueBatchLeader(batch))
+	dh.AssertNotCalled(t, "WriteBatch", mock.Anything)
+}
+
+func TestPartition_EnqueueBatchLeaderSkipsDuplicateWithinBatch(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	dh.On("WriteBatch", mock.MatchedBy(func(batch []types.DiskMessage) bool {
+		return len(batch) == 1 && batch[0].SeqNum == 1
+	})).Return(nil).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.isIdempotent = true
+
+	batch := []types.Message{
+		{Payload: "one", ProducerID: "producer-1", SeqNum: 1},
+		{Payload: "duplicate", ProducerID: "producer-1", SeqNum: 1},
+	}
+	require.NoError(t, p.EnqueueBatchLeader(batch))
+	dh.AssertExpectations(t)
+}
+
+func TestPartition_ReadCommittedReturnsOutOfRangeWhenEarliestEqualsHWM(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	dh.On("GetFlushedOffset").Return(uint64(5)).Once()
+	dh.On("GetFirstOffset").Return(uint64(5)).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.SetHWM(5)
+
+	_, err := p.ReadCommitted(4, 10)
+	var offsetErr *types.OffsetOutOfRangeError
+	require.ErrorAs(t, err, &offsetErr)
+}

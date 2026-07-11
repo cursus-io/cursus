@@ -115,7 +115,7 @@ func TestPartition_Basic(t *testing.T) {
 
 	t.Run("Idempotence", func(t *testing.T) {
 		p.isIdempotent = true
-		msg := types.Message{Payload: "idemp", ProducerID: "p1", SeqNum: 10}
+		msg := types.Message{Payload: "idemp", ProducerID: "p1", SeqNum: 1}
 
 		mh.On("AppendMessageSync", "test-topic", 0, mock.Anything).Return(uint64(13), nil).Once()
 		err := p.EnqueueSync(msg)

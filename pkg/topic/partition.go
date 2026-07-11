@@ -27,6 +27,11 @@ type producerEntry struct {
 	lastSeen  time.Time
 }
 
+type stagedProducerEntry struct {
+	lastEpoch int64
+	lastSeq   uint64
+}
+
 // Partition handles messages for one shard of a topic.
 type Partition struct {
 	id                int
@@ -107,6 +112,10 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 }
 
 func (p *Partition) validateProducerMessage(msg *types.Message) (bool, error) {
+	return p.validateProducerMessageWithStage(msg, nil)
+}
+
+func (p *Partition) validateProducerMessageWithStage(msg *types.Message, staged map[string]stagedProducerEntry) (bool, error) {
 	if !p.isIdempotent {
 		return false, nil
 	}
@@ -116,19 +125,40 @@ func (p *Partition) validateProducerMessage(msg *types.Message) (bool, error) {
 		return false, nil
 	}
 
-	val, ok := p.producerState.Load(msg.ProducerID)
-	if ok {
-		entry := val.(*producerEntry)
-		if msg.Epoch < entry.lastEpoch {
-			return false, fmt.Errorf("stale_producer_epoch producer=%s current=%d got=%d", msg.ProducerID, entry.lastEpoch, msg.Epoch)
+	if staged != nil {
+		if entry, ok := staged[msg.ProducerID]; ok {
+			return p.validateAgainstProducerState(msg, entry.lastEpoch, entry.lastSeq, true)
 		}
-		if msg.Epoch == entry.lastEpoch && msg.SeqNum <= entry.lastSeq {
+	}
+
+	if val, ok := p.producerState.Load(msg.ProducerID); ok {
+		entry := val.(*producerEntry)
+		return p.validateAgainstProducerState(msg, entry.lastEpoch, entry.lastSeq, true)
+	}
+
+	if msg.SeqNum != 1 {
+		return false, fmt.Errorf("idempotency error: first message for producer %s must have seqNum 1, got %d", msg.ProducerID, msg.SeqNum)
+	}
+
+	return false, nil
+}
+
+func (p *Partition) validateAgainstProducerState(msg *types.Message, lastEpoch int64, lastSeq uint64, allowDuplicate bool) (bool, error) {
+	if msg.Epoch < lastEpoch {
+		return false, fmt.Errorf("stale_producer_epoch producer=%s current=%d got=%d", msg.ProducerID, lastEpoch, msg.Epoch)
+	}
+	if msg.Epoch == lastEpoch {
+		if allowDuplicate && msg.SeqNum <= lastSeq {
 			metrics.SeqNumDuplicateTotal.WithLabelValues(p.topic, fmt.Sprintf("%d", p.id)).Inc()
 			return true, nil
 		}
-		if msg.Epoch > entry.lastEpoch && msg.SeqNum > 1 {
-			return false, fmt.Errorf("idempotency error: first message in new producer epoch for producer %s must have seqNum 1, got %d", msg.ProducerID, msg.SeqNum)
+		if msg.SeqNum != lastSeq+1 {
+			return false, fmt.Errorf("idempotency gap for producer %s: expected %d, got %d", msg.ProducerID, lastSeq+1, msg.SeqNum)
 		}
+		return false, nil
+	}
+	if msg.SeqNum != 1 {
+		return false, fmt.Errorf("idempotency error: first message in new producer epoch for producer %s must have seqNum 1, got %d", msg.ProducerID, msg.SeqNum)
 	}
 	return false, nil
 }
@@ -308,14 +338,21 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 	nextOffset := p.LEO.Load()
 	pending := make([]pendingLeaderMessage, 0, len(msgs))
 	diskBatch := make([]types.DiskMessage, 0, len(msgs))
+	staged := make(map[string]stagedProducerEntry)
 
 	for i := range msgs {
-		duplicate, err := p.validateProducerMessage(&msgs[i])
+		duplicate, err := p.validateProducerMessageWithStage(&msgs[i], staged)
 		if err != nil {
 			return err
 		}
 		if duplicate {
 			continue
+		}
+		if p.isIdempotent && msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
+			staged[msgs[i].ProducerID] = stagedProducerEntry{
+				lastEpoch: msgs[i].Epoch,
+				lastSeq:   msgs[i].SeqNum,
+			}
 		}
 
 		offset := nextOffset
@@ -415,7 +452,7 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 	}
 
 	earliest := p.dh.GetFirstOffset()
-	if offset < earliest && earliest < hwm {
+	if offset < earliest {
 		return nil, &types.OffsetOutOfRangeError{
 			Requested: offset,
 			Earliest:  earliest,
@@ -464,16 +501,20 @@ func (p *Partition) NextOffset() uint64 {
 	return p.LEO.Load()
 }
 
-func (p *Partition) ReserveOffsets(count int) uint64 {
+func (p *Partition) ReserveOffsets(count int) (uint64, error) {
 	if count <= 0 {
-		return p.LEO.Load()
+		return p.LEO.Load(), nil
 	}
-	current := p.LEO.Load()
-	if uint64(count) > math.MaxUint64-current { // #nosec G115 -- count is positive before widening.
-		return current
+	delta := uint64(count) // #nosec G115 -- count is positive before widening.
+	for {
+		current := p.LEO.Load()
+		if delta > math.MaxUint64-current {
+			return current, fmt.Errorf("offset reservation overflow: current=%d count=%d", current, count)
+		}
+		if p.LEO.CompareAndSwap(current, current+delta) {
+			return current, nil
+		}
 	}
-	delta := uint64(count) // #nosec G115 -- count is positive and overflow-checked before widening.
-	return p.LEO.Add(delta) - delta
 }
 
 func (p *Partition) SetHWM(hwm uint64) {
