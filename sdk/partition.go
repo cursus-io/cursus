@@ -306,6 +306,14 @@ func (pc *PartitionConsumer) startStreamLoop() {
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
 					continue // idle timeout — retry read
 				}
+				if c.mainCtx.Err() != nil {
+					return
+				}
+				select {
+				case <-c.doneCh:
+					return
+				default:
+				}
 				LogError("Partition [%d] stream read error: %v", pid, err)
 				pc.closeConnection()
 				if !pc.waitWithBackoff(bo) {

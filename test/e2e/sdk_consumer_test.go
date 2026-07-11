@@ -10,6 +10,14 @@ import (
 )
 
 func TestGoSDKProducerConsumerBenchmarkRoundTrip(t *testing.T) {
+	runSDKConsumerBenchmarkRoundTrip(t, sdk.ModePolling)
+}
+
+func TestGoSDKStreamingConsumerBenchmarkRoundTrip(t *testing.T) {
+	runSDKConsumerBenchmarkRoundTrip(t, sdk.ModeStreaming)
+}
+
+func runSDKConsumerBenchmarkRoundTrip(t *testing.T, mode sdk.ConsumerMode) {
 	sdk.SetLogLevel(sdk.LogLevelWarn)
 	const (
 		totalMessages = 100000
@@ -17,9 +25,9 @@ func TestGoSDKProducerConsumerBenchmarkRoundTrip(t *testing.T) {
 	)
 
 	ctx := GivenStandalone(t).
-		WithTopic(fmt.Sprintf("sdk-consumer-benchmark-%d", time.Now().UnixNano())).
+		WithTopic(fmt.Sprintf("sdk-consumer-%s-benchmark-%d", mode, time.Now().UnixNano())).
 		WithPartitions(partitions).
-		WithConsumerGroup(fmt.Sprintf("sdk-consumer-group-%d", time.Now().UnixNano()))
+		WithConsumerGroup(fmt.Sprintf("sdk-consumer-%s-group-%d", mode, time.Now().UnixNano()))
 	defer ctx.Cleanup()
 
 	producerCfg := sdk.NewDefaultPublisherConfig()
@@ -54,7 +62,7 @@ func TestGoSDKProducerConsumerBenchmarkRoundTrip(t *testing.T) {
 		t.Fatalf("close sdk producer: %v", err)
 	}
 
-	consumer := newSDKTestConsumer(t, ctx, "sdk-consumer-1")
+	consumer := newSDKTestConsumer(t, ctx, "sdk-consumer-1", mode)
 	seen := consumeWithSDK(t, consumer, totalMessages, 180*time.Second)
 	if len(seen) != totalMessages {
 		t.Fatalf("sdk consumer read %d unique messages, want %d", len(seen), totalMessages)
@@ -68,7 +76,7 @@ func TestGoSDKProducerConsumerBenchmarkRoundTrip(t *testing.T) {
 	waitCommittedAtLeast(t, ctx, partitions, totalMessages, 60*time.Second)
 	closeSDKConsumer(t, consumer)
 
-	resumeConsumer := newSDKTestConsumer(t, ctx, "sdk-consumer-2")
+	resumeConsumer := newSDKTestConsumer(t, ctx, "sdk-consumer-2", mode)
 	resumed := consumeWithSDK(t, resumeConsumer, 1, 2*time.Second)
 	closeSDKConsumer(t, resumeConsumer)
 	if len(resumed) != 0 {
@@ -99,7 +107,7 @@ func waitCommittedAtLeast(t *testing.T, ctx *TestContext, partitions int, want u
 	t.Fatalf("committed offsets sum = %d, want at least %d", lastTotal, want)
 }
 
-func newSDKTestConsumer(t *testing.T, ctx *TestContext, id string) *sdk.Consumer {
+func newSDKTestConsumer(t *testing.T, ctx *TestContext, id string, mode sdk.ConsumerMode) *sdk.Consumer {
 	t.Helper()
 
 	cfg := sdk.NewDefaultConsumerConfig()
@@ -107,7 +115,7 @@ func newSDKTestConsumer(t *testing.T, ctx *TestContext, id string) *sdk.Consumer
 	cfg.Topic = ctx.topic
 	cfg.GroupID = ctx.consumerGroup
 	cfg.ConsumerID = id
-	cfg.Mode = sdk.ModePolling
+	cfg.Mode = mode
 	cfg.BatchSize = 5000
 	cfg.MaxPollRecords = 5000
 	cfg.PollInterval = 25 * time.Millisecond
