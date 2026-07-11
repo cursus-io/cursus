@@ -30,14 +30,34 @@ type BrokerInfo struct {
 	LastSeen   time.Time `json:"last_seen"`
 }
 
+type ProducerSequence struct {
+	Epoch int64 `json:"epoch"`
+	Seq   int64 `json:"seq"`
+}
+
+func (s *ProducerSequence) UnmarshalJSON(data []byte) error {
+	var legacySeq int64
+	if err := json.Unmarshal(data, &legacySeq); err == nil {
+		s.Seq = legacySeq
+		return nil
+	}
+	type alias ProducerSequence
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*s = ProducerSequence(decoded)
+	return nil
+}
+
 type BrokerFSMState struct {
-	Version           int                                        `json:"version"`
-	Applied           uint64                                     `json:"applied"`
-	Logs              map[uint64]*ReplicationEntry               `json:"logs"`
-	Brokers           map[string]*BrokerInfo                     `json:"brokers"`
-	PartitionMetadata map[string]*PartitionMetadata              `json:"partitionMetadata"`
-	ProducerState     map[string]map[int]map[string]int64        `json:"producerState"`
-	GroupState        map[string]*coordinator.GroupStateSnapshot `json:"groupState,omitempty"`
+	Version           int                                            `json:"version"`
+	Applied           uint64                                         `json:"applied"`
+	Logs              map[uint64]*ReplicationEntry                   `json:"logs"`
+	Brokers           map[string]*BrokerInfo                         `json:"brokers"`
+	PartitionMetadata map[string]*PartitionMetadata                  `json:"partitionMetadata"`
+	ProducerState     map[string]map[int]map[string]ProducerSequence `json:"producerState"`
+	GroupState        map[string]*coordinator.GroupStateSnapshot     `json:"groupState,omitempty"`
 }
 
 type BrokerFSM struct {
@@ -47,7 +67,7 @@ type BrokerFSM struct {
 	logs              map[uint64]*ReplicationEntry
 	brokers           map[string]*BrokerInfo
 	partitionMetadata map[string]*PartitionMetadata
-	producerState     map[string]map[int]map[string]int64 // Topic -> Partition -> ProducerID -> LastSeq
+	producerState     map[string]map[int]map[string]ProducerSequence // Topic -> Partition -> ProducerID -> Last Epoch/Seq
 	applied           uint64
 
 	tm *topic.TopicManager
@@ -60,7 +80,7 @@ func NewBrokerFSM(tm *topic.TopicManager, cd *coordinator.Coordinator) *BrokerFS
 		logs:              make(map[uint64]*ReplicationEntry),
 		brokers:           make(map[string]*BrokerInfo),
 		partitionMetadata: make(map[string]*PartitionMetadata),
-		producerState:     make(map[string]map[int]map[string]int64),
+		producerState:     make(map[string]map[int]map[string]ProducerSequence),
 		tm:                tm,
 		cd:                cd,
 	}
@@ -190,7 +210,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 
 	f.producerState = state.ProducerState
 	if f.producerState == nil {
-		f.producerState = make(map[string]map[int]map[string]int64)
+		f.producerState = make(map[string]map[int]map[string]ProducerSequence)
 	}
 
 	if state.GroupState != nil && f.cd != nil {
@@ -229,11 +249,11 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		}
 		metadataCopy[k] = &metaCopy
 	}
-	producerStateCopy := make(map[string]map[int]map[string]int64, len(f.producerState))
+	producerStateCopy := make(map[string]map[int]map[string]ProducerSequence, len(f.producerState))
 	for topic, partitions := range f.producerState {
-		partitionMap := make(map[int]map[string]int64, len(partitions))
+		partitionMap := make(map[int]map[string]ProducerSequence, len(partitions))
 		for pID, producers := range partitions {
-			producerMap := make(map[string]int64, len(producers))
+			producerMap := make(map[string]ProducerSequence, len(producers))
 			for prodID, seq := range producers {
 				producerMap[prodID] = seq
 			}

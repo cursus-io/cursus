@@ -13,7 +13,7 @@ type BrokerFSMSnapshot struct {
 	logs              map[uint64]*ReplicationEntry
 	brokers           map[string]*BrokerInfo
 	partitionMetadata map[string]*PartitionMetadata
-	producerState     map[string]map[int]map[string]int64
+	producerState     map[string]map[int]map[string]ProducerSequence
 	groupState        map[string]*coordinator.GroupStateSnapshot
 }
 

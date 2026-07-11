@@ -101,6 +101,29 @@ func TestPartition_RestoresProducerStateCheckpoint(t *testing.T) {
 	require.Len(t, msgs, 2)
 	require.Equal(t, "second", msgs[1].Payload)
 }
+
+func TestPartition_ProducerEpochFencing(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 1
+
+	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { _ = dh.Close() }()
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	defer p.Close()
+	p.isIdempotent = true
+
+	require.NoError(t, p.EnqueueSync(types.Message{Payload: "epoch-10", ProducerID: "producer-1", Epoch: 10, SeqNum: 1}))
+	require.NoError(t, p.EnqueueSync(types.Message{Payload: "epoch-11", ProducerID: "producer-1", Epoch: 11, SeqNum: 1}))
+	require.Error(t, p.EnqueueSync(types.Message{Payload: "stale-epoch", ProducerID: "producer-1", Epoch: 10, SeqNum: 2}))
+
+	msgs, err := p.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	require.Equal(t, "epoch-10", msgs[0].Payload)
+	require.Equal(t, "epoch-11", msgs[1].Payload)
+}
 func TestPartition_EnqueueBatchLeaderUsesSingleBatchWrite(t *testing.T) {
 	cfg := config.DefaultConfig()
 	dh := new(MockStorageHandler)

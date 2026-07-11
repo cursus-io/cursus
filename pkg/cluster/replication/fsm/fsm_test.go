@@ -274,7 +274,7 @@ func TestBrokerFSM_ValidateIdempotency(t *testing.T) {
 		t.Error("Expected error for first message with SeqNum 2, got nil")
 	}
 
-	fsm.updateProducerState("t1", -1, "p1", 1)
+	fsm.updateProducerState("t1", -1, "p1", 0, 1)
 
 	cmd.Partition = 0
 	cmd.Messages[0].SeqNum = 2
@@ -283,6 +283,42 @@ func TestBrokerFSM_ValidateIdempotency(t *testing.T) {
 	}
 }
 
+func TestBrokerFSM_ProducerEpochFencing(t *testing.T) {
+	fsm := newTestFSM()
+	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{PartitionCount: 1, Idempotent: true}
+	if err := fsm.tm.CreateTopic("t1", 1, true, false); err != nil {
+		t.Fatalf("CreateTopic failed: %v", err)
+	}
+
+	cmd := &types.MessageCommand{
+		Topic:     "t1",
+		Partition: 0,
+		Messages:  []types.Message{{ProducerID: "p1", Epoch: 10, SeqNum: 1, Payload: "m1"}},
+	}
+	if err := fsm.validateMessageCommand(cmd); err != nil {
+		t.Fatalf("initial epoch should be valid: %v", err)
+	}
+	fsm.applyMessageBatch(cmd)
+
+	nextEpoch := &types.MessageCommand{
+		Topic:     "t1",
+		Partition: 0,
+		Messages:  []types.Message{{ProducerID: "p1", Epoch: 11, SeqNum: 1, Payload: "m2"}},
+	}
+	if err := fsm.validateMessageCommand(nextEpoch); err != nil {
+		t.Fatalf("higher epoch should fence previous producer and restart sequence: %v", err)
+	}
+	fsm.applyMessageBatch(nextEpoch)
+
+	staleEpoch := &types.MessageCommand{
+		Topic:     "t1",
+		Partition: 0,
+		Messages:  []types.Message{{ProducerID: "p1", Epoch: 10, SeqNum: 2, Payload: "stale"}},
+	}
+	if err := fsm.validateMessageCommand(staleEpoch); err == nil {
+		t.Fatal("expected stale producer epoch to be rejected")
+	}
+}
 func TestBrokerFSM_SequenceScope_Partition(t *testing.T) {
 	fsm := newTestFSM()
 	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{PartitionCount: 2, Idempotent: true}

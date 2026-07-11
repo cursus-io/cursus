@@ -19,10 +19,11 @@ import (
 	"github.com/cursus-io/cursus/util"
 )
 
-// producerEntry tracks the last sequence number and activity time for a producer.
+// producerEntry tracks the last producer epoch, sequence number, and activity time for a producer.
 type producerEntry struct {
-	lastSeq  uint64
-	lastSeen time.Time
+	lastEpoch int64
+	lastSeq   uint64
+	lastSeen  time.Time
 }
 
 // Partition handles messages for one shard of a topic.
@@ -104,25 +105,28 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	return p
 }
 
-func (p *Partition) isDuplicate(msg *types.Message) bool {
+func (p *Partition) validateProducerMessage(msg *types.Message) (bool, error) {
 	if !p.isIdempotent {
-		return false
+		return false, nil
 	}
 	// SeqNum == 0 means the producer did not explicitly set a sequence number;
 	// skip dedup to avoid incorrectly rejecting every message after the first.
 	if msg.ProducerID == "" || msg.SeqNum == 0 {
-		return false
+		return false, nil
 	}
 
 	val, ok := p.producerState.Load(msg.ProducerID)
 	if ok {
 		entry := val.(*producerEntry)
-		if msg.SeqNum <= entry.lastSeq {
+		if msg.Epoch < entry.lastEpoch {
+			return false, fmt.Errorf("stale producer epoch for producer %s: current %d, got %d", msg.ProducerID, entry.lastEpoch, msg.Epoch)
+		}
+		if msg.Epoch == entry.lastEpoch && msg.SeqNum <= entry.lastSeq {
 			metrics.SeqNumDuplicateTotal.WithLabelValues(p.topic, fmt.Sprintf("%d", p.id)).Inc()
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func (p *Partition) updateProducerState(msg *types.Message) {
@@ -132,7 +136,7 @@ func (p *Partition) updateProducerState(msg *types.Message) {
 	if msg.SeqNum > 0 {
 		if val, ok := p.producerState.Load(msg.ProducerID); ok {
 			entry := val.(*producerEntry)
-			if msg.SeqNum > entry.lastSeq+1 {
+			if msg.Epoch == entry.lastEpoch && msg.SeqNum > entry.lastSeq+1 {
 				gap := msg.SeqNum - entry.lastSeq - 1
 				metrics.SeqNumGapTotal.WithLabelValues(p.topic, fmt.Sprintf("%d", p.id), msg.ProducerID).Add(float64(gap))
 				util.Warn("Partition %d: seqNum gap detected for producer %s: expected %d, got %d (gap=%d)",
@@ -141,8 +145,9 @@ func (p *Partition) updateProducerState(msg *types.Message) {
 		}
 	}
 	p.producerState.Store(msg.ProducerID, &producerEntry{
-		lastSeq:  msg.SeqNum,
-		lastSeen: time.Now(),
+		lastEpoch: msg.Epoch,
+		lastSeq:   msg.SeqNum,
+		lastSeen:  time.Now(),
 	})
 	p.signalProducerStateCheckpoint()
 }
@@ -157,8 +162,13 @@ func (p *Partition) Enqueue(msg types.Message) {
 		return
 	}
 
-	if p.isDuplicate(&msg) {
-		util.Debug("Partition %d: skipping duplicate message from producer %s (seq %d)", p.id, msg.ProducerID, msg.SeqNum)
+	duplicate, err := p.validateProducerMessage(&msg)
+	if err != nil {
+		util.Warn("Partition %d: rejecting message from producer %s: %v", p.id, msg.ProducerID, err)
+		return
+	}
+	if duplicate {
+		util.Debug("Partition %d: skipping duplicate message from producer %s (epoch %d seq %d)", p.id, msg.ProducerID, msg.Epoch, msg.SeqNum)
 		return
 	}
 
@@ -183,8 +193,12 @@ func (p *Partition) EnqueueSync(msg types.Message) error {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
 
-	if p.isDuplicate(&msg) {
-		util.Debug("Partition %d: skipping duplicate message from producer %s (seq %d)", p.id, msg.ProducerID, msg.SeqNum)
+	duplicate, err := p.validateProducerMessage(&msg)
+	if err != nil {
+		return err
+	}
+	if duplicate {
+		util.Debug("Partition %d: skipping duplicate message from producer %s (epoch %d seq %d)", p.id, msg.ProducerID, msg.Epoch, msg.SeqNum)
 		return nil
 	}
 
@@ -212,8 +226,12 @@ func (p *Partition) EnqueueBatchSync(msgs []types.Message) error {
 	}
 
 	for i := range msgs {
-		if p.isDuplicate(&msgs[i]) {
-			util.Debug("Partition %d: skipping duplicate message from producer %s (seq %d) in batch sync", p.id, msgs[i].ProducerID, msgs[i].SeqNum)
+		duplicate, err := p.validateProducerMessage(&msgs[i])
+		if err != nil {
+			return err
+		}
+		if duplicate {
+			util.Debug("Partition %d: skipping duplicate message from producer %s (epoch %d seq %d) in batch sync", p.id, msgs[i].ProducerID, msgs[i].Epoch, msgs[i].SeqNum)
 			continue
 		}
 
@@ -241,8 +259,12 @@ func (p *Partition) EnqueueBatch(msgs []types.Message) error {
 	}
 
 	for i := range msgs {
-		if p.isDuplicate(&msgs[i]) {
-			util.Debug("Partition %d: skipping duplicate message from producer %s (seq %d) in batch", p.id, msgs[i].ProducerID, msgs[i].SeqNum)
+		duplicate, err := p.validateProducerMessage(&msgs[i])
+		if err != nil {
+			return err
+		}
+		if duplicate {
+			util.Debug("Partition %d: skipping duplicate message from producer %s (epoch %d seq %d) in batch", p.id, msgs[i].ProducerID, msgs[i].Epoch, msgs[i].SeqNum)
 			continue
 		}
 
@@ -280,7 +302,11 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 	diskBatch := make([]types.DiskMessage, 0, len(msgs))
 
 	for i := range msgs {
-		if p.isDuplicate(&msgs[i]) {
+		duplicate, err := p.validateProducerMessage(&msgs[i])
+		if err != nil {
+			return err
+		}
+		if duplicate {
 			continue
 		}
 
@@ -570,7 +596,12 @@ func loadHWMCheckpoint(path string) (uint64, bool) {
 	return hwm, true
 }
 
-type producerStateCheckpoint map[string]uint64
+type producerStateCheckpoint map[string]producerStateCheckpointEntry
+
+type producerStateCheckpointEntry struct {
+	Epoch int64  `json:"epoch"`
+	Seq   uint64 `json:"seq"`
+}
 
 func (p *Partition) signalProducerStateCheckpoint() {
 	if p.producerStateCh == nil {
@@ -616,15 +647,22 @@ func (p *Partition) loadProducerStateCheckpoint() {
 	}
 	var checkpoint producerStateCheckpoint
 	if err := json.Unmarshal(data, &checkpoint); err != nil {
-		util.Warn("ignoring invalid producer state checkpoint %s: %v", p.producerStatePath, err)
-		return
+		var legacy map[string]uint64
+		if legacyErr := json.Unmarshal(data, &legacy); legacyErr != nil {
+			util.Warn("ignoring invalid producer state checkpoint %s: %v", p.producerStatePath, err)
+			return
+		}
+		checkpoint = make(producerStateCheckpoint, len(legacy))
+		for producerID, lastSeq := range legacy {
+			checkpoint[producerID] = producerStateCheckpointEntry{Seq: lastSeq}
+		}
 	}
 	now := time.Now()
-	for producerID, lastSeq := range checkpoint {
-		if producerID == "" || lastSeq == 0 {
+	for producerID, entry := range checkpoint {
+		if producerID == "" || entry.Seq == 0 {
 			continue
 		}
-		p.producerState.Store(producerID, &producerEntry{lastSeq: lastSeq, lastSeen: now})
+		p.producerState.Store(producerID, &producerEntry{lastEpoch: entry.Epoch, lastSeq: entry.Seq, lastSeen: now})
 	}
 }
 
@@ -643,7 +681,7 @@ func (p *Partition) persistProducerStateCheckpoint() {
 		if !ok || entry.lastSeq == 0 {
 			return true
 		}
-		checkpoint[producerID] = entry.lastSeq
+		checkpoint[producerID] = producerStateCheckpointEntry{Epoch: entry.lastEpoch, Seq: entry.lastSeq}
 		return true
 	})
 

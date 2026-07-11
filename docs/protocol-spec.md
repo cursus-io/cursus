@@ -705,14 +705,16 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 
 ### Requirements
 
-- Each message must have a unique `(producerId, seqNum)` pair
-- `seqNum` must be monotonically increasing per producer
+- Each idempotent message must have a unique `(producerId, epoch, seqNum)` tuple within a partition
+- `seqNum` must be monotonically increasing within the current producer epoch
+- A higher `epoch` fences the previous producer session and may restart `seqNum` from 1
+- A lower `epoch` is rejected as stale producer state
 - `seqNum` = 0 disables dedup for that message
 - Broker rejects duplicates silently (returns OK)
 
 ### Sequence Tracking
 
-- Broker tracks the last seen sequence per `(producerId)` per partition
+- Broker tracks the last seen `(epoch, seqNum)` per `(producerId)` per partition
 - Disk-backed partitions persist producer sequence checkpoints and restore them on broker restart
 - Distributed FSM snapshots also include producer sequence state for replicated message commands
 - Producer state expires from memory after 30 minutes of inactivity; durable checkpoints retain the last persisted sequence until the partition data is removed
