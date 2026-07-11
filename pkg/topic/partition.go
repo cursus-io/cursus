@@ -119,7 +119,7 @@ func (p *Partition) validateProducerMessage(msg *types.Message) (bool, error) {
 	if ok {
 		entry := val.(*producerEntry)
 		if msg.Epoch < entry.lastEpoch {
-			return false, fmt.Errorf("stale producer epoch for producer %s: current %d, got %d", msg.ProducerID, entry.lastEpoch, msg.Epoch)
+			return false, fmt.Errorf("stale_producer_epoch producer=%s current=%d got=%d", msg.ProducerID, entry.lastEpoch, msg.Epoch)
 		}
 		if msg.Epoch == entry.lastEpoch && msg.SeqNum <= entry.lastSeq {
 			metrics.SeqNumDuplicateTotal.WithLabelValues(p.topic, fmt.Sprintf("%d", p.id)).Inc()

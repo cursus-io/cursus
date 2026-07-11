@@ -663,6 +663,7 @@ ERROR: <code> [key=value ...]
 | `NOT_OWNER partition=N member=<M> group=<G> generation=N` | Assignment changed | Re-join group |
 | `member_not_found member=<M> group=<G>` | Member is no longer active | Re-join group |
 | `offset_regression reason="..."` | Commit lower than current stored offset | Treat commit as failed; refetch offset |
+| `stale_producer_epoch producer=<id> current=<N> got=<N>` | Idempotent producer request uses an older fenced epoch | Treat as fatal for that producer instance; create a new producer session |
 | `OFFSET_OUT_OF_RANGE requested=N earliest=N latest=N` | Requested offset is older than retained log or beyond available range | Treat as data loss or reset according to policy |
 | `no_valid_offsets` | BATCH_COMMIT parse failure | Check format: `P<N>:<offset>` |
 | `version_conflict current=N expected=N` | Optimistic concurrency failure | Reload aggregate and retry |

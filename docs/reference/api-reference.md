@@ -124,7 +124,7 @@ OK commands=<comma-separated-command-names>
 PUBLISH topic=<name> message=<payload> [key=<routing-key>] [producer_id=<id>] [seq_num=<N>] [epoch=<N>] [is_idempotent=<bool>] [acks=0|1|all]
 ```
 
-For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. For `acks=0`, success is:
+For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. For `acks=0`, success is:
 
 ```text
 OK
@@ -140,6 +140,7 @@ ERROR: partition_not_found partition=<N>
 ERROR: invalid_acks value=<value>
 ERROR: invalid_seq_num reason="..."
 ERROR: invalid_epoch reason="..."
+ERROR: stale_producer_epoch reason="..."
 ```
 
 ### REPLICATE_MESSAGE

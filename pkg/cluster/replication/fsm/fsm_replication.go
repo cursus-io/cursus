@@ -162,7 +162,7 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 	if effectiveIdempotent {
 		if exists {
 			if firstMsg.Epoch < state.Epoch {
-				return fmt.Errorf("stale producer epoch for producer %s: current %d, got %d", firstMsg.ProducerID, state.Epoch, firstMsg.Epoch)
+				return fmt.Errorf("stale_producer_epoch producer=%s current=%d got=%d", firstMsg.ProducerID, state.Epoch, firstMsg.Epoch)
 			}
 			if firstMsg.Epoch == state.Epoch {
 				if int64(lastMsg.SeqNum) <= state.Seq {
