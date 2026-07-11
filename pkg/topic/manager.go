@@ -58,6 +58,15 @@ func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *
 }
 
 func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent bool, eventSourcing bool) error {
+	return tm.CreateTopicWithPolicy(name, partitionCount, idempotent, eventSourcing, DefaultPolicy())
+}
+
+func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, idempotent bool, eventSourcing bool, policy Policy) error {
+	normalizedPolicy, err := policy.Normalize()
+	if err != nil {
+		return err
+	}
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -71,15 +80,17 @@ func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent 
 			if err := existing.AddPartitions(partitionCount-current, tm.hp); err != nil {
 				return fmt.Errorf("failed to add partitions to topic '%s': %w", name, err)
 			}
+			existing.Policy = normalizedPolicy
 			util.Info("topic '%s' partitions increased: %d -> %d", name, current, len(existing.Partitions))
 			return nil
 		default:
+			existing.Policy = normalizedPolicy
 			util.Info("topic '%s' already exists with %d partitions", name, current)
 			return nil
 		}
 	}
 
-	t, err := NewTopic(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager, idempotent, eventSourcing)
+	t, err := NewTopicWithPolicy(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager, idempotent, eventSourcing, normalizedPolicy)
 	if err != nil {
 		util.Error("failed to create topic '%s': %v", name, err)
 		return fmt.Errorf("failed to create topic '%s': %w", name, err)
@@ -134,6 +145,10 @@ func (tm *TopicManager) Publish(topicName string, msg *types.Message) error {
 	return tm.publishInternal(topicName, partition, msg, false)
 }
 
+func (tm *TopicManager) PublishToPartition(topicName string, partition int, msg *types.Message) error {
+	return tm.publishInternal(topicName, partition, msg, false)
+}
+
 // Sync (acks=1)
 func (tm *TopicManager) PublishWithAck(topicName string, msg *types.Message) error {
 	t := tm.GetTopic(topicName)
@@ -142,6 +157,10 @@ func (tm *TopicManager) PublishWithAck(topicName string, msg *types.Message) err
 	}
 
 	partition := t.GetPartitionForMessage(*msg)
+	return tm.publishInternal(topicName, partition, msg, true)
+}
+
+func (tm *TopicManager) PublishToPartitionWithAck(topicName string, partition int, msg *types.Message) error {
 	return tm.publishInternal(topicName, partition, msg, true)
 }
 
@@ -235,7 +254,7 @@ func (tm *TopicManager) PublishBatchAsync(topicName string, messages []types.Mes
 	return tm.processBatchMessages(topicName, messages, true)
 }
 
-func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Message, requireAck bool) error {
+func (tm *TopicManager) publishInternal(topicName string, partition int, msg *types.Message, requireAck bool) error {
 	util.Debug("Starting publish. Topic: %s, RequireAck: %v, ProducerID: %s, SeqNum: %d", topicName, requireAck, msg.ProducerID, msg.SeqNum)
 	start := time.Now()
 
@@ -246,11 +265,11 @@ func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Mess
 	}
 
 	if requireAck {
-		if err := t.PublishSync(*msg); err != nil {
+		if err := t.PublishToPartitionSync(partition, *msg); err != nil {
 			return fmt.Errorf("sync publish failed: %w", err)
 		}
 	} else {
-		if err := t.Publish(*msg); err != nil {
+		if err := t.PublishToPartition(partition, *msg); err != nil {
 			return fmt.Errorf("async publish failed: %w", err)
 		}
 	}

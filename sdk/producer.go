@@ -241,10 +241,14 @@ func (p *Producer) Send(payload string) (uint64, error) {
 	}
 
 	seqNum := p.client.NextSeqNum(part)
+	producerID := p.client.ID
+	if p.config.EnableIdempotence {
+		producerID = fmt.Sprintf("%s-p%d", p.client.ID, part)
+	}
 	bm := Message{
 		SeqNum:     seqNum,
 		Payload:    payload,
-		ProducerID: p.client.ID,
+		ProducerID: producerID,
 		Epoch:      p.client.Epoch,
 	}
 

@@ -290,3 +290,17 @@ func TestParseFetchOffsetResponse_StrictContract(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing offset")
 }
+
+func TestIsRetryableFetchOffsetError(t *testing.T) {
+	assert.True(t, isRetryableFetchOffsetError(&fetchOffsetTestError{msg: "fetch offset broker error: ERROR: NOT_COORDINATOR host=broker-2 port=9000"}))
+	assert.True(t, isRetryableFetchOffsetError(&fetchOffsetTestError{msg: "fetch offset broker error: ERROR: group_not_found group=g1"}))
+	assert.True(t, isRetryableFetchOffsetError(&fetchOffsetTestError{msg: "fetch offset broker error: ERROR: member_not_found member=m1"}))
+	assert.False(t, isRetryableFetchOffsetError(&fetchOffsetTestError{msg: "fetch offset broker error: ERROR: offset_manager_not_available"}))
+	assert.False(t, isRetryableFetchOffsetError(nil))
+}
+
+type fetchOffsetTestError struct {
+	msg string
+}
+
+func (e *fetchOffsetTestError) Error() string { return e.msg }

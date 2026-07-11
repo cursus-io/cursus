@@ -5,7 +5,7 @@ exporter_port: 9100
 log_level: "info" # debug, info, warn, error
 
 # Idempotency
-enable_idempotence: false # exactly-once, at-Least-once
+enable_idempotence: true # exactly-once, at-Least-once
 
 # Storage
 log_dir: "broker-logs"

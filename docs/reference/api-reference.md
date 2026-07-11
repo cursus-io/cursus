@@ -30,7 +30,7 @@ Legacy natural-language responses such as `Topic '<name>' now has <N> partitions
 ### CREATE
 
 ```text
-CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>]
+CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read>]
 ```
 
 Creates a topic or increases its partition count when the topic already exists.
@@ -121,10 +121,12 @@ OK commands=<comma-separated-command-names>
 ### PUBLISH
 
 ```text
-PUBLISH topic=<name> message=<payload> [key=<routing-key>] [producer_id=<id>] [seq_num=<N>] [epoch=<N>] [is_idempotent=<bool>] [acks=0|1|all]
+PUBLISH topic=<name> [partition=<N>] [key=<routing-key>] [producerId=<id>] [seqNum=<N>] [epoch=<N>] [isIdempotent=<bool>] [acks=0|1|all] message=<payload>
 ```
 
-For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. For `acks=0`, success is:
+Because `message=` captures the rest of the line, put optional parameters before `message=`.
+
+For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Distributed FSM snapshots that include producer epochs use snapshot version 3; avoid mixed-version rolling upgrades with binaries that cannot decode that snapshot state. For `acks=0`, success is:
 
 ```text
 OK
@@ -140,6 +142,7 @@ ERROR: partition_not_found partition=<N>
 ERROR: invalid_acks value=<value>
 ERROR: invalid_seq_num reason="..."
 ERROR: invalid_epoch reason="..."
+ERROR: stale_producer_epoch reason="..."
 ```
 
 ### REPLICATE_MESSAGE
@@ -170,7 +173,7 @@ ERROR: replica_append_failed reason="..."
 CONSUME topic=<name> group=<group> partition=<N> offset=<N> member=<member-id> [batch=<N>]
 ```
 
-`CONSUME` returns binary message frames. For consumer groups, the broker uses the committed offset for `(topic, group, partition)` as the authoritative resume point when one exists; otherwise the earliest offset policy is `0`.
+`CONSUME` returns binary message frames. For consumer groups, the broker uses the committed offset for `(topic, group, partition)` as the authoritative resume point when one exists; otherwise the earliest offset policy is `0`. `CONSUME` is a stateless partition-leader read: ownership, liveness, and generation fencing are enforced by coordinator commands, not on the data path.
 
 Common errors:
 
@@ -183,6 +186,7 @@ ERROR: missing_member command=CONSUME
 ERROR: invalid_partition
 ERROR: invalid_offset
 ERROR: NOT_LEADER LEADER_IS <host:port>
+ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>
 ```
 
 ### STREAM
@@ -192,6 +196,16 @@ Continuous push-mode consume command.
 ```text
 STREAM topic=<name> group=<group> partition=<N> offset=<N> member=<member-id>
 ```
+
+`STREAM` returns one or more length-prefixed frames:
+
+```text
+[binary batch frame]
+[00 00 00 00]                                  # zero-length keepalive
+STREAM_CONTROL type=CLOSE reason=<stopped|removed|timeout|error|offset_out_of_range> offset=<nextOffset>
+```
+
+Clients must treat zero-length frames as keepalive. Like `CONSUME`, `STREAM` is a stateless partition-leader data path and does not validate group ownership or generation on every read. A `STREAM_CONTROL type=CLOSE` frame is a graceful terminator; `reason=offset_out_of_range` means the requested stream offset is older than the retained log. Clients should close the socket and resume through the consumer group offset contract or reset according to policy. Raw TCP disconnect without a close control frame remains possible on broker crash or network failure and should be treated as retryable.
 
 Common errors:
 
@@ -245,7 +259,7 @@ OK member=<assigned-member-id> generation=<N> assignments=<partition-list>
 ### HEARTBEAT
 
 ```text
-HEARTBEAT topic=<name> group=<group> member=<assigned-member-id>
+HEARTBEAT topic=<name> group=<group> member=<assigned-member-id> [generation=<N>]
 ```
 
 Success:
@@ -283,26 +297,29 @@ When no offset has been committed, the broker returns `OK offset=0`.
 ### COMMIT_OFFSET
 
 ```text
-COMMIT_OFFSET topic=<name> group=<group> partition=<N> offset=<nextOffset>
+COMMIT_OFFSET topic=<name> group=<group> partition=<N> offset=<nextOffset> [member=<member-id> generation=<N>]
 ```
 
-The offset is the next offset to read after successful processing. Commits are monotonic per `(topic, group, partition)`: a commit lower than the current offset fails and does not rewind the group.
+The offset is the next offset to read after successful processing. Commits are monotonic per `(topic, group, partition)`: a commit lower than the current offset fails and does not rewind the group. When `member` or `generation` is supplied, both must be present and the member must own the partition in that generation. Legacy clients may omit both fields, but group-aware SDKs should send them.
 
 Success:
 
 ```text
-OK offset=<nextOffset>
+OK
 ```
 
 Common errors:
 
 ```text
 ERROR: invalid_offset
-ERROR: offset_regression current=<N> attempted=<N>
+ERROR: invalid_generation command=COMMIT_OFFSET
+ERROR: offset_regression reason="..."
+ERROR: GEN_MISMATCH current=<N> requested=<N> group=<group> member=<member-id>
+ERROR: NOT_OWNER partition=<N> member=<member-id> group=<group> generation=<N>
+ERROR: member_not_found member=<member-id> group=<group>
 ERROR: offset_manager_not_available
 ERROR: commit_offset_failed reason="..."
 ```
-
 ### BATCH_COMMIT
 
 ```text
@@ -315,14 +332,21 @@ Success:
 OK batched=<N>
 ```
 
+The `P` prefix in each partition entry is required. The broker validates `member` and `generation` before applying the batch and rejects the whole batch if any partition is no longer owned by that member.
+
 Common errors:
 
 ```text
 ERROR: invalid_batch_commit_format
+ERROR: invalid_generation command=BATCH_COMMIT
 ERROR: no_valid_offsets
+ERROR: offset_regression reason="..."
+ERROR: GEN_MISMATCH current=<N> requested=<N> group=<group> member=<member-id>
+ERROR: NOT_OWNER partition=<N> member=<member-id> group=<group> generation=<N>
+ERROR: member_not_found member=<member-id> group=<group>
+ERROR: offset_manager_not_available
 ERROR: bulk_commit_failed reason="..."
 ```
-
 ### GROUP_STATUS
 
 ```text
@@ -481,6 +505,13 @@ Success when no snapshot exists:
 ```text
 OK snapshot=null
 ```
+
+
+## Topic Policy Notes
+
+- Minimal per-topic authorization policy is part of topic metadata: `auth_policy=open|deny_write|deny_read`. It rejects unauthorized topic reads/writes with `ERROR: NOT_AUTHORIZED_FOR_TOPIC ...`, but it is not caller identity-aware ACL/SASL yet. Use TLS and external network/application controls for authentication boundaries.
+- Topics expose `retention_hours` and `retention_bytes` policy metadata. `0` means broker default. Reads before the earliest retained offset fail with `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>`. SDKs should apply `auto_offset_reset` (`earliest`, `latest`, or `error`) to decide whether to reset or fail.
+- `partitioner=hash_key` uses FNV-1a 64-bit hash modulo partition count for keyed messages and round-robin for missing keys. `partitioner=round_robin` ignores keys. Increasing partition count can remap future records for an existing key.
 
 ## Server-Level Errors
 

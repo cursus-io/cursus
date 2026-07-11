@@ -3,10 +3,12 @@ package stream
 import (
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -78,4 +80,42 @@ func TestStreamConnection_Keepalive(t *testing.T) {
 	assert.Equal(t, []byte{0, 0, 0, 0}, buf)
 
 	sc.Stop()
+}
+
+func TestStreamConnection_StopSendsCloseControlFrame(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer func() { _ = c2.Close() }()
+
+	sc := NewStreamConnection(c1, "t1", 0, "g1", 42)
+	sc.SetInterval(10 * time.Second)
+	sc.SetKeepaliveInterval(10 * time.Second)
+
+	readFn := func(offset uint64, max int) ([]types.Message, error) {
+		return []types.Message{}, nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		sc.Run(readFn, 10*time.Second)
+		close(done)
+	}()
+
+	sc.StopWithReason("test_stop")
+
+	err := c2.SetReadDeadline(time.Now().Add(1 * time.Second))
+	assert.NoError(t, err)
+	data, err := util.ReadWithLength(c2)
+	assert.NoError(t, err)
+
+	frame := string(data)
+	assert.True(t, strings.HasPrefix(frame, StreamControlPrefix))
+	assert.Contains(t, frame, "type=CLOSE")
+	assert.Contains(t, frame, "reason=test_stop")
+	assert.Contains(t, frame, "offset=42")
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("stream did not stop")
+	}
 }

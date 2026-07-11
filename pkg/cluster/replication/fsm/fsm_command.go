@@ -3,10 +3,11 @@ package fsm
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -20,12 +21,13 @@ type PartitionMetadata struct {
 }
 
 type TopicCommand struct {
-	Name              string `json:"name"`
-	Partitions        int    `json:"partitions"`
-	Idempotent        bool   `json:"idempotent"`
-	EventSourcing     bool   `json:"event_sourcing"`
-	LeaderID          string `json:"leader_id"`
-	ReplicationFactor int    `json:"replication_factor,omitempty"`
+	Name              string       `json:"name"`
+	Partitions        int          `json:"partitions"`
+	Idempotent        bool         `json:"idempotent"`
+	EventSourcing     bool         `json:"event_sourcing"`
+	LeaderID          string       `json:"leader_id"`
+	ReplicationFactor int          `json:"replication_factor,omitempty"`
+	Policy            topic.Policy `json:"policy,omitempty"`
 }
 
 func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
@@ -129,7 +131,7 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	f.mu.Unlock()
 
 	if tm != nil {
-		if err := tm.CreateTopic(topicCmd.Name, topicCmd.Partitions, topicCmd.Idempotent, topicCmd.EventSourcing); err != nil {
+		if err := tm.CreateTopicWithPolicy(topicCmd.Name, topicCmd.Partitions, topicCmd.Idempotent, topicCmd.EventSourcing, topicCmd.Policy); err != nil {
 			util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicCmd.Name, err)
 		}
 	}

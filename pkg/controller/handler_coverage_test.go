@@ -28,6 +28,7 @@ func (m *testMockStorage) ReadMessages(offset uint64, max int) ([]types.Message,
 	return []types.Message{}, nil
 }
 func (m *testMockStorage) GetAbsoluteOffset() uint64               { return 0 }
+func (m *testMockStorage) GetFirstOffset() uint64                  { return 0 }
 func (m *testMockStorage) GetFlushedOffset() uint64                { return 0 }
 func (m *testMockStorage) GetLatestOffset() uint64                 { return 0 }
 func (m *testMockStorage) GetSegmentPath(baseOffset uint64) string { return "" }
@@ -877,7 +878,7 @@ func TestHandleHeartbeat_WithCoordinator(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("HEARTBEAT topic=hb-topic group=hb-g1 member=hb-m1", ctx)
-	assert.Equal(t, "OK", resp)
+	assert.Contains(t, resp, "OK member=")
 }
 
 func TestHandleHeartbeat_InvalidMember(t *testing.T) {
@@ -903,6 +904,53 @@ func TestHandleCommitOffset_WithCoordinator(t *testing.T) {
 	assert.Equal(t, "OK offset=50", resp)
 }
 
+func TestHandleCommitOffset_ValidatesMemberGenerationAndOwnership(t *testing.T) {
+	ch, tm, coord := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopic("commit-validated-topic", 4, false, false))
+	require.NoError(t, coord.RegisterGroup("commit-validated-topic", "commit-validated-g1", 4))
+	_, err := coord.AddConsumer("commit-validated-g1", "commit-m1")
+	require.NoError(t, err)
+	_, err = coord.AddConsumer("commit-validated-g1", "commit-m2")
+	require.NoError(t, err)
+	coord.Rebalance("commit-validated-g1")
+	gen := coord.GetGeneration("commit-validated-g1")
+	ctx := NewClientContext("", 0)
+
+	owned := coord.GetMemberAssignments("commit-validated-g1", "commit-m1")
+	require.NotEmpty(t, owned)
+
+	valid := fmt.Sprintf("COMMIT_OFFSET topic=commit-validated-topic partition=%d group=commit-validated-g1 offset=10 member=commit-m1 generation=%d", owned[0], gen)
+	resp := ch.HandleCommand(valid, ctx)
+	assert.Equal(t, "OK", resp)
+
+	stale := fmt.Sprintf("COMMIT_OFFSET topic=commit-validated-topic partition=%d group=commit-validated-g1 offset=11 member=commit-m1 generation=%d", owned[0], gen+1)
+	resp = ch.HandleCommand(stale, ctx)
+	assert.Contains(t, resp, "GEN_MISMATCH")
+
+	unknown := fmt.Sprintf("COMMIT_OFFSET topic=commit-validated-topic partition=%d group=commit-validated-g1 offset=11 member=ghost generation=%d", owned[0], gen)
+	resp = ch.HandleCommand(unknown, ctx)
+	assert.Contains(t, resp, "member_not_found")
+
+	notOwned := -1
+	for p := 0; p < 4; p++ {
+		ownedByM1 := false
+		for _, assigned := range owned {
+			if assigned == p {
+				ownedByM1 = true
+				break
+			}
+		}
+		if !ownedByM1 {
+			notOwned = p
+			break
+		}
+	}
+	require.NotEqual(t, -1, notOwned)
+
+	notOwner := fmt.Sprintf("COMMIT_OFFSET topic=commit-validated-topic partition=%d group=commit-validated-g1 offset=11 member=commit-m1 generation=%d", notOwned, gen)
+	resp = ch.HandleCommand(notOwner, ctx)
+	assert.Contains(t, resp, "NOT_OWNER")
+}
 func TestHandleLeaveGroup_WithCoordinator(t *testing.T) {
 	ch, tm, coord := newTestHandlerWithCoordinator(t)
 	_ = tm.CreateTopic("leave-topic", 2, false, false)
@@ -961,7 +1009,7 @@ func TestHandleBatchCommit_StaleGeneration(t *testing.T) {
 
 	cmd := "BATCH_COMMIT topic=bc5-topic group=bc5-g1 generation=999 member=bc5-m1 P0:100"
 	resp := ch.HandleCommand(cmd, ctx)
-	assert.Contains(t, resp, "no_valid_offsets")
+	assert.Contains(t, resp, "GEN_MISMATCH")
 }
 
 func TestHandleCreate_WithCoordinatorDefaultGroup(t *testing.T) {
@@ -1181,4 +1229,112 @@ func TestHandleReplicateSnapshot_SavesFollowerSnapshot(t *testing.T) {
 	resp = ch.HandleCommand("READ_SNAPSHOT topic=snap-rep-topic key=agg-1", ctx)
 	assert.Contains(t, resp, `"version":2`)
 	assert.Contains(t, resp, `state`)
+}
+
+func TestHandleCreate_TopicPolicy(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("CREATE topic=policy-topic partitions=2 retention_hours=24 retention_bytes=4096 partitioner=round_robin auth_policy=open", ctx)
+	assert.Contains(t, resp, "partitioner=round_robin")
+	assert.Contains(t, resp, "retention_hours=24")
+
+	tObj := tm.GetTopic("policy-topic")
+	require.NotNil(t, tObj)
+	assert.Equal(t, topic.PartitionerRoundRobin, tObj.Policy.Partitioner)
+	assert.Equal(t, 24, tObj.Policy.RetentionHours)
+	assert.Equal(t, int64(4096), tObj.Policy.RetentionBytes)
+
+	metaResp := ch.HandleCommand("METADATA topic=policy-topic", ctx)
+	assert.Contains(t, metaResp, "partitioner=round_robin")
+	assert.Contains(t, metaResp, "retention_bytes=4096")
+}
+
+func TestHandleCreate_InvalidTopicPolicy(t *testing.T) {
+	ch, _ := newTestHandler(t)
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("CREATE topic=bad-policy partitioner=random", ctx)
+	assert.Contains(t, resp, "invalid_topic_policy")
+
+	resp = ch.HandleCommand("CREATE topic=bad-retention retention_hours=-1", ctx)
+	assert.Contains(t, resp, "invalid_topic_policy")
+}
+
+func TestHandleCreate_ShrinkDoesNotUpdateTopicPolicy(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("CREATE topic=stable-policy partitions=2 auth_policy=open", ctx)
+	assert.Contains(t, resp, "auth_policy=open")
+
+	resp = ch.HandleCommand("CREATE topic=stable-policy partitions=1 auth_policy=deny_write", ctx)
+	assert.Contains(t, resp, "create_topic_failed")
+
+	tObj := tm.GetTopic("stable-policy")
+	require.NotNil(t, tObj)
+	assert.Equal(t, topic.AuthPolicyOpen, tObj.Policy.AuthPolicy)
+}
+func TestHandlePublish_DenyWriteTopicPolicy(t *testing.T) {
+	ch, _ := newTestHandler(t)
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("CREATE topic=deny-write partitions=1 auth_policy=deny_write", ctx)
+	assert.Contains(t, resp, "auth_policy=deny_write")
+
+	resp = ch.HandleCommand("PUBLISH topic=deny-write acks=1 producerId=p1 message=blocked", ctx)
+	assert.Contains(t, resp, "NOT_AUTHORIZED_FOR_TOPIC")
+	assert.Contains(t, resp, "operation=write")
+}
+
+func TestReadFromTopic_DenyReadTopicPolicy(t *testing.T) {
+	ch, tm, _ := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopicWithPolicy("deny-read", 1, false, false, topic.Policy{AuthPolicy: topic.AuthPolicyDenyRead}))
+
+	ctx := NewClientContext("", 0)
+	cArgs := CommonArgs{TopicName: "deny-read", PartitionID: 0, GroupName: "g1", HasOffset: true, Offset: 0}
+	_, err := ch.readFromTopic("deny-read", cArgs, ctx, 10)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "NOT_AUTHORIZED_FOR_TOPIC")
+}
+
+func TestTopicPolicy_RoundRobinIgnoresMessageKey(t *testing.T) {
+	_, tm := newTestHandler(t)
+	require.NoError(t, tm.CreateTopicWithPolicy("rr-topic", 2, false, false, topic.Policy{Partitioner: topic.PartitionerRoundRobin}))
+	tObj := tm.GetTopic("rr-topic")
+	require.NotNil(t, tObj)
+
+	msg := types.Message{Key: "same-key", ProducerID: "p1"}
+	first := tObj.GetPartitionForMessage(msg)
+	second := tObj.GetPartitionForMessage(msg)
+	assert.NotEqual(t, first, second)
+}
+
+func TestHandlePublish_IdempotentExplicitPartitionUsesPartitionSequences(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	require.NoError(t, tm.CreateTopic("idem-explicit-partition", 2, true, false))
+	ctx := NewClientContext("", 0)
+
+	commands := []string{
+		"PUBLISH topic=idem-explicit-partition partition=0 acks=1 producerId=p1 isIdempotent=true seqNum=1 epoch=1 message=p0-1",
+		"PUBLISH topic=idem-explicit-partition partition=1 acks=1 producerId=p1 isIdempotent=true seqNum=1 epoch=1 message=p1-1",
+		"PUBLISH topic=idem-explicit-partition partition=0 acks=1 producerId=p1 isIdempotent=true seqNum=2 epoch=1 message=p0-2",
+		"PUBLISH topic=idem-explicit-partition partition=1 acks=1 producerId=p1 isIdempotent=true seqNum=2 epoch=1 message=p1-2",
+	}
+
+	for _, cmd := range commands {
+		resp := ch.HandleCommand(cmd, ctx)
+		var ack types.AckResponse
+		require.NoError(t, json.Unmarshal([]byte(resp), &ack), resp)
+		assert.Equal(t, "OK", ack.Status)
+	}
+}
+
+func TestHandlePublish_InvalidExplicitPartition(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	require.NoError(t, tm.CreateTopic("invalid-publish-partition", 1, false, false))
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("PUBLISH topic=invalid-publish-partition partition=99 acks=1 producerId=p1 message=bad", ctx)
+	assert.Contains(t, resp, "partition_not_found")
 }

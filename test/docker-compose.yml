@@ -7,6 +7,8 @@ services:
     command: ./broker
     volumes:
       - ./config.yaml:/root/config.yaml
+    tmpfs:
+      - /root/broker-logs
     environment:
       - CONFIG_PATH=/root/config.yaml
     ports:
@@ -57,7 +59,6 @@ services:
   
 networks:
   test_network:
-    name: test_network
     driver: bridge
 
 volumes:

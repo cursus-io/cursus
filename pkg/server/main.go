@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -372,11 +373,6 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 
 	payload = strings.Trim(payload, "\x00 \t\n\r")
 
-	if strings.HasPrefix(strings.ToUpper(payload), "HEARTBEAT") {
-		writeResponseWithTimeout(conn, "OK", 10*time.Second)
-		return false, nil
-	}
-
 	if strings.HasPrefix(strings.ToUpper(payload), "JOIN_GROUP") ||
 		strings.HasPrefix(strings.ToUpper(payload), "SYNC_GROUP") ||
 		strings.HasPrefix(strings.ToUpper(payload), "LEAVE_GROUP") {
@@ -405,6 +401,9 @@ func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler,
 	if resp == controller.STREAM_DATA_SIGNAL {
 		if strings.HasPrefix(strings.ToUpper(payload), "STREAM ") {
 			if err := cmdHandler.HandleStreamCommand(conn, payload, ctx); err != nil {
+				if errors.Is(err, controller.ErrStreamRejected) {
+					return false, nil
+				}
 				writeResponse(conn, fmt.Sprintf("ERROR: command_failed reason=%q", err.Error()))
 				return false, nil
 			}

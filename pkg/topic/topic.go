@@ -16,19 +16,29 @@ const DefaultConsumerBufSize = 1000
 
 // Topic represents a logical message stream divided into partitions and consumer groups.
 type Topic struct {
-	Name           string
-	Partitions     []*Partition
-	counter        uint64
-	consumerGroups map[string]*types.ConsumerGroup
-	mu             sync.RWMutex
-	cfg            *config.Config
-	streamManager    StreamManager
-	IsIdempotent     bool
-	IsEventSourcing  bool
+	Name            string
+	Partitions      []*Partition
+	counter         uint64
+	consumerGroups  map[string]*types.ConsumerGroup
+	mu              sync.RWMutex
+	cfg             *config.Config
+	streamManager   StreamManager
+	IsIdempotent    bool
+	IsEventSourcing bool
+	Policy          Policy
 }
 
 // NewTopic initializes a topic with partitions.
 func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager, idempotent bool, eventSourcing bool) (*Topic, error) {
+	return NewTopicWithPolicy(name, partitionCount, hp, cfg, sm, idempotent, eventSourcing, DefaultPolicy())
+}
+
+func NewTopicWithPolicy(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager, idempotent bool, eventSourcing bool, policy Policy) (*Topic, error) {
+	normalizedPolicy, err := policy.Normalize()
+	if err != nil {
+		return nil, err
+	}
+
 	partitions := make([]*Partition, partitionCount)
 	for i := 0; i < partitionCount; i++ {
 		dh, err := hp.GetHandler(name, i)
@@ -43,13 +53,14 @@ func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.C
 		partitions[i] = p
 	}
 	return &Topic{
-		Name:           name,
-		Partitions:     partitions,
-		consumerGroups: make(map[string]*types.ConsumerGroup),
+		Name:            name,
+		Partitions:      partitions,
+		consumerGroups:  make(map[string]*types.ConsumerGroup),
 		cfg:             cfg,
 		streamManager:   sm,
 		IsIdempotent:    idempotent,
 		IsEventSourcing: eventSourcing,
+		Policy:          normalizedPolicy,
 	}, nil
 }
 
@@ -60,7 +71,7 @@ func (t *Topic) getPartitionIndex(msg types.Message, partitionsLen int) int {
 		return -1
 	}
 
-	if msg.Key != "" {
+	if t.Policy.Partitioner == PartitionerHashKey && msg.Key != "" {
 		keyID := util.GenerateID(msg.Key)
 		return int(keyID % uint64(partitionsLen))
 	}
@@ -156,6 +167,18 @@ func (t *Topic) Publish(msg types.Message) error {
 	return nil
 }
 
+func (t *Topic) PublishToPartition(partition int, msg types.Message) error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if partition < 0 || partition >= len(t.Partitions) {
+		return fmt.Errorf("partition %d out of range for topic '%s' (0-%d)", partition, t.Name, len(t.Partitions)-1)
+	}
+
+	t.Partitions[partition].Enqueue(msg)
+	return nil
+}
+
 // PublishSync sends a message synchronously to one partition.
 // Partition selection and enqueue happen under a single RLock to prevent
 // TOCTOU races with AddPartitions.
@@ -169,6 +192,17 @@ func (t *Topic) PublishSync(msg types.Message) error {
 	}
 
 	return t.Partitions[idx].EnqueueSync(msg)
+}
+
+func (t *Topic) PublishToPartitionSync(partition int, msg types.Message) error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if partition < 0 || partition >= len(t.Partitions) {
+		return fmt.Errorf("partition %d out of range for topic '%s' (0-%d)", partition, t.Name, len(t.Partitions)-1)
+	}
+
+	return t.Partitions[partition].EnqueueSync(msg)
 }
 
 // PublishBatchSync sends a batch of messages synchronously, grouping by partition.

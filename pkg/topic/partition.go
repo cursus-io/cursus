@@ -1,7 +1,9 @@
 package topic
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,10 +20,16 @@ import (
 	"github.com/cursus-io/cursus/util"
 )
 
-// producerEntry tracks the last sequence number and activity time for a producer.
+// producerEntry tracks the last producer epoch, sequence number, and activity time for a producer.
 type producerEntry struct {
-	lastSeq  uint64
-	lastSeen time.Time
+	lastEpoch int64
+	lastSeq   uint64
+	lastSeen  time.Time
+}
+
+type stagedProducerEntry struct {
+	lastEpoch int64
+	lastSeq   uint64
 }
 
 // Partition handles messages for one shard of a topic.
@@ -39,6 +47,10 @@ type Partition struct {
 	hwmCheckpointCh   chan struct{}
 	hwmCheckpointMu   sync.Mutex
 	hwmCheckpointWG   sync.WaitGroup
+	producerStatePath string
+	producerStateCh   chan struct{}
+	producerStateMu   sync.Mutex
+	producerStateWG   sync.WaitGroup
 	producerState     sync.Map // map[string]*producerEntry
 	isIdempotent      bool
 	closeCh           chan struct{}
@@ -64,6 +76,8 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	if handler, ok := dh.(*disk.DiskHandler); ok {
 		p.hwmCheckpointPath = hwmCheckpointPath(handler, id)
 		p.hwmCheckpointCh = make(chan struct{}, 1)
+		p.producerStatePath = producerStateCheckpointPath(handler, id)
+		p.producerStateCh = make(chan struct{}, 1)
 		durableTail := handler.GetAbsoluteOffset()
 		if persistedHWM, ok := loadHWMCheckpoint(p.hwmCheckpointPath); ok {
 			if persistedHWM > durableTail {
@@ -88,29 +102,65 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		p.hwmCheckpointWG.Add(1)
 		go p.runHWMCheckpointLoop()
 	}
+	if p.producerStateCh != nil {
+		p.loadProducerStateCheckpoint()
+		p.producerStateWG.Add(1)
+		go p.runProducerStateCheckpointLoop()
+	}
 
 	return p
 }
 
-func (p *Partition) isDuplicate(msg *types.Message) bool {
+func (p *Partition) validateProducerMessage(msg *types.Message) (bool, error) {
+	return p.validateProducerMessageWithStage(msg, nil)
+}
+
+func (p *Partition) validateProducerMessageWithStage(msg *types.Message, staged map[string]stagedProducerEntry) (bool, error) {
 	if !p.isIdempotent {
-		return false
+		return false, nil
 	}
 	// SeqNum == 0 means the producer did not explicitly set a sequence number;
 	// skip dedup to avoid incorrectly rejecting every message after the first.
 	if msg.ProducerID == "" || msg.SeqNum == 0 {
-		return false
+		return false, nil
 	}
 
-	val, ok := p.producerState.Load(msg.ProducerID)
-	if ok {
-		entry := val.(*producerEntry)
-		if msg.SeqNum <= entry.lastSeq {
-			metrics.SeqNumDuplicateTotal.WithLabelValues(p.topic, fmt.Sprintf("%d", p.id)).Inc()
-			return true
+	if staged != nil {
+		if entry, ok := staged[msg.ProducerID]; ok {
+			return p.validateAgainstProducerState(msg, entry.lastEpoch, entry.lastSeq, true)
 		}
 	}
-	return false
+
+	if val, ok := p.producerState.Load(msg.ProducerID); ok {
+		entry := val.(*producerEntry)
+		return p.validateAgainstProducerState(msg, entry.lastEpoch, entry.lastSeq, true)
+	}
+
+	if msg.SeqNum != 1 {
+		return false, fmt.Errorf("idempotency error: first message for producer %s must have seqNum 1, got %d", msg.ProducerID, msg.SeqNum)
+	}
+
+	return false, nil
+}
+
+func (p *Partition) validateAgainstProducerState(msg *types.Message, lastEpoch int64, lastSeq uint64, allowDuplicate bool) (bool, error) {
+	if msg.Epoch < lastEpoch {
+		return false, fmt.Errorf("stale_producer_epoch producer=%s current=%d got=%d", msg.ProducerID, lastEpoch, msg.Epoch)
+	}
+	if msg.Epoch == lastEpoch {
+		if allowDuplicate && msg.SeqNum <= lastSeq {
+			metrics.SeqNumDuplicateTotal.WithLabelValues(p.topic, fmt.Sprintf("%d", p.id)).Inc()
+			return true, nil
+		}
+		if msg.SeqNum != lastSeq+1 {
+			return false, fmt.Errorf("idempotency gap for producer %s: expected %d, got %d", msg.ProducerID, lastSeq+1, msg.SeqNum)
+		}
+		return false, nil
+	}
+	if msg.SeqNum != 1 {
+		return false, fmt.Errorf("idempotency error: first message in new producer epoch for producer %s must have seqNum 1, got %d", msg.ProducerID, msg.SeqNum)
+	}
+	return false, nil
 }
 
 func (p *Partition) updateProducerState(msg *types.Message) {
@@ -120,7 +170,7 @@ func (p *Partition) updateProducerState(msg *types.Message) {
 	if msg.SeqNum > 0 {
 		if val, ok := p.producerState.Load(msg.ProducerID); ok {
 			entry := val.(*producerEntry)
-			if msg.SeqNum > entry.lastSeq+1 {
+			if msg.Epoch == entry.lastEpoch && msg.SeqNum > entry.lastSeq+1 {
 				gap := msg.SeqNum - entry.lastSeq - 1
 				metrics.SeqNumGapTotal.WithLabelValues(p.topic, fmt.Sprintf("%d", p.id), msg.ProducerID).Add(float64(gap))
 				util.Warn("Partition %d: seqNum gap detected for producer %s: expected %d, got %d (gap=%d)",
@@ -129,9 +179,11 @@ func (p *Partition) updateProducerState(msg *types.Message) {
 		}
 	}
 	p.producerState.Store(msg.ProducerID, &producerEntry{
-		lastSeq:  msg.SeqNum,
-		lastSeen: time.Now(),
+		lastEpoch: msg.Epoch,
+		lastSeq:   msg.SeqNum,
+		lastSeen:  time.Now(),
 	})
+	p.signalProducerStateCheckpoint()
 }
 
 // Enqueue pushes a message into the partition queue.
@@ -144,8 +196,13 @@ func (p *Partition) Enqueue(msg types.Message) {
 		return
 	}
 
-	if p.isDuplicate(&msg) {
-		util.Debug("Partition %d: skipping duplicate message from producer %s (seq %d)", p.id, msg.ProducerID, msg.SeqNum)
+	duplicate, err := p.validateProducerMessage(&msg)
+	if err != nil {
+		util.Warn("Partition %d: rejecting message from producer %s: %v", p.id, msg.ProducerID, err)
+		return
+	}
+	if duplicate {
+		util.Debug("Partition %d: skipping duplicate message from producer %s (epoch %d seq %d)", p.id, msg.ProducerID, msg.Epoch, msg.SeqNum)
 		return
 	}
 
@@ -170,8 +227,12 @@ func (p *Partition) EnqueueSync(msg types.Message) error {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
 
-	if p.isDuplicate(&msg) {
-		util.Debug("Partition %d: skipping duplicate message from producer %s (seq %d)", p.id, msg.ProducerID, msg.SeqNum)
+	duplicate, err := p.validateProducerMessage(&msg)
+	if err != nil {
+		return err
+	}
+	if duplicate {
+		util.Debug("Partition %d: skipping duplicate message from producer %s (epoch %d seq %d)", p.id, msg.ProducerID, msg.Epoch, msg.SeqNum)
 		return nil
 	}
 
@@ -199,8 +260,12 @@ func (p *Partition) EnqueueBatchSync(msgs []types.Message) error {
 	}
 
 	for i := range msgs {
-		if p.isDuplicate(&msgs[i]) {
-			util.Debug("Partition %d: skipping duplicate message from producer %s (seq %d) in batch sync", p.id, msgs[i].ProducerID, msgs[i].SeqNum)
+		duplicate, err := p.validateProducerMessage(&msgs[i])
+		if err != nil {
+			return err
+		}
+		if duplicate {
+			util.Debug("Partition %d: skipping duplicate message from producer %s (epoch %d seq %d) in batch sync", p.id, msgs[i].ProducerID, msgs[i].Epoch, msgs[i].SeqNum)
 			continue
 		}
 
@@ -228,8 +293,12 @@ func (p *Partition) EnqueueBatch(msgs []types.Message) error {
 	}
 
 	for i := range msgs {
-		if p.isDuplicate(&msgs[i]) {
-			util.Debug("Partition %d: skipping duplicate message from producer %s (seq %d) in batch", p.id, msgs[i].ProducerID, msgs[i].SeqNum)
+		duplicate, err := p.validateProducerMessage(&msgs[i])
+		if err != nil {
+			return err
+		}
+		if duplicate {
+			util.Debug("Partition %d: skipping duplicate message from producer %s (epoch %d seq %d) in batch", p.id, msgs[i].ProducerID, msgs[i].Epoch, msgs[i].SeqNum)
 			continue
 		}
 
@@ -257,22 +326,74 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 	if p.closed {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
+	if p.id > math.MaxInt32 {
+		return fmt.Errorf("partition ID %d exceeds int32 range", p.id)
+	}
+	partitionID := int32(p.id) // #nosec G115 -- p.id is validated against math.MaxInt32 before narrowing.
+
+	type pendingLeaderMessage struct {
+		index int
+	}
+
+	nextOffset := p.LEO.Load()
+	pending := make([]pendingLeaderMessage, 0, len(msgs))
+	diskBatch := make([]types.DiskMessage, 0, len(msgs))
+	staged := make(map[string]stagedProducerEntry)
 
 	for i := range msgs {
-		if p.isDuplicate(&msgs[i]) {
+		duplicate, err := p.validateProducerMessageWithStage(&msgs[i], staged)
+		if err != nil {
+			return err
+		}
+		if duplicate {
 			continue
 		}
-
-		offset, err := p.dh.AppendMessage(p.topic, p.id, &msgs[i])
-		if err != nil {
-			p.NotifyNewMessage()
-			return fmt.Errorf("batch enqueue failed at index %d: %w", i, err)
+		if p.isIdempotent && msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
+			staged[msgs[i].ProducerID] = stagedProducerEntry{
+				lastEpoch: msgs[i].Epoch,
+				lastSeq:   msgs[i].SeqNum,
+			}
 		}
 
-		p.updateProducerState(&msgs[i])
+		offset := nextOffset
+		nextOffset++
 		msgs[i].Offset = offset
-		p.LEO.Store(offset + 1)
+		pending = append(pending, pendingLeaderMessage{
+			index: i,
+		})
+		diskBatch = append(diskBatch, types.DiskMessage{
+			Topic:            p.topic,
+			Partition:        partitionID,
+			Offset:           offset,
+			ProducerID:       msgs[i].ProducerID,
+			SeqNum:           msgs[i].SeqNum,
+			Epoch:            msgs[i].Epoch,
+			Payload:          msgs[i].Payload,
+			Key:              msgs[i].Key,
+			EventType:        msgs[i].EventType,
+			SchemaVersion:    msgs[i].SchemaVersion,
+			AggregateVersion: msgs[i].AggregateVersion,
+			Metadata:         msgs[i].Metadata,
+		})
 	}
+
+	if len(diskBatch) == 0 {
+		p.NotifyNewMessage()
+		return nil
+	}
+
+	if err := p.dh.WriteBatch(diskBatch); err != nil {
+		for _, msg := range pending {
+			msgs[msg.index].Offset = 0
+		}
+		p.NotifyNewMessage()
+		return fmt.Errorf("leader batch write failed: %w", err)
+	}
+
+	for _, msg := range pending {
+		p.updateProducerState(&msgs[msg.index])
+	}
+	p.LEO.Store(nextOffset)
 	p.NotifyNewMessage()
 	return nil
 }
@@ -324,22 +445,28 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 	hwm := p.HWM
 	p.mu.RUnlock()
 
-	if offset >= hwm {
-		return nil, nil
-	}
-
-	// Cap at flushed offset to avoid reading data not yet on disk
+	// Cap at flushed offset to avoid reading data not yet on disk.
 	flushed := p.dh.GetFlushedOffset()
 	if flushed < hwm {
 		hwm = flushed
 	}
+
+	earliest := p.dh.GetFirstOffset()
+	if offset < earliest {
+		return nil, &types.OffsetOutOfRangeError{
+			Requested: offset,
+			Earliest:  earliest,
+			Latest:    hwm,
+		}
+	}
+
 	if offset >= hwm {
 		return nil, nil
 	}
 
-	canRead := int(hwm - offset)
-	if max > canRead {
-		max = canRead
+	canRead := hwm - offset
+	if canRead <= math.MaxInt && max > int(canRead) { // #nosec G115 -- canRead is bounded by math.MaxInt before narrowing.
+		max = int(canRead) // #nosec G115 -- canRead is bounded by math.MaxInt before narrowing.
 	}
 
 	return p.ReadMessages(offset, max)
@@ -349,8 +476,15 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 func (p *Partition) FlushDisk() {
 	p.dh.Flush()
 	p.persistHWMCheckpoint()
+	p.persistProducerStateCheckpoint()
 }
 
+func (p *Partition) GetFirstOffset() uint64 {
+	if p.dh == nil {
+		return 0
+	}
+	return p.dh.GetFirstOffset()
+}
 func (p *Partition) GetLatestOffset() uint64 {
 	if p.dh == nil {
 		return 0
@@ -367,8 +501,20 @@ func (p *Partition) NextOffset() uint64 {
 	return p.LEO.Load()
 }
 
-func (p *Partition) ReserveOffsets(count int) uint64 {
-	return p.LEO.Add(uint64(count)) - uint64(count)
+func (p *Partition) ReserveOffsets(count int) (uint64, error) {
+	if count <= 0 {
+		return p.LEO.Load(), nil
+	}
+	delta := uint64(count) // #nosec G115 -- count is positive before widening.
+	for {
+		current := p.LEO.Load()
+		if delta > math.MaxUint64-current {
+			return current, fmt.Errorf("offset reservation overflow: current=%d count=%d", current, count)
+		}
+		if p.LEO.CompareAndSwap(current, current+delta) {
+			return current, nil
+		}
+	}
 }
 
 func (p *Partition) SetHWM(hwm uint64) {
@@ -507,6 +653,144 @@ func loadHWMCheckpoint(path string) (uint64, bool) {
 	return hwm, true
 }
 
+type producerStateCheckpoint map[string]producerStateCheckpointEntry
+
+type producerStateCheckpointEntry struct {
+	Epoch int64  `json:"epoch"`
+	Seq   uint64 `json:"seq"`
+}
+
+func (p *Partition) signalProducerStateCheckpoint() {
+	if p.producerStateCh == nil {
+		return
+	}
+	select {
+	case p.producerStateCh <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Partition) runProducerStateCheckpointLoop() {
+	defer p.producerStateWG.Done()
+
+	ticker := time.NewTicker(producerStateCheckpointInterval)
+	defer ticker.Stop()
+
+	dirty := false
+	for {
+		select {
+		case <-p.producerStateCh:
+			dirty = true
+		case <-ticker.C:
+			if dirty {
+				p.persistProducerStateCheckpoint()
+				dirty = false
+			}
+		case <-p.closeCh:
+			p.persistProducerStateCheckpoint()
+			return
+		}
+	}
+}
+
+func (p *Partition) loadProducerStateCheckpoint() {
+	if p.producerStatePath == "" {
+		return
+	}
+	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
+	data, err := os.ReadFile(p.producerStatePath)
+	if err != nil {
+		return
+	}
+	var checkpoint producerStateCheckpoint
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		var legacy map[string]uint64
+		if legacyErr := json.Unmarshal(data, &legacy); legacyErr != nil {
+			util.Warn("ignoring invalid producer state checkpoint %s: %v", p.producerStatePath, err)
+			return
+		}
+		checkpoint = make(producerStateCheckpoint, len(legacy))
+		for producerID, lastSeq := range legacy {
+			checkpoint[producerID] = producerStateCheckpointEntry{Seq: lastSeq}
+		}
+	}
+	now := time.Now()
+	for producerID, entry := range checkpoint {
+		if producerID == "" || entry.Seq == 0 {
+			continue
+		}
+		p.producerState.Store(producerID, &producerEntry{lastEpoch: entry.Epoch, lastSeq: entry.Seq, lastSeen: now})
+	}
+}
+
+func (p *Partition) persistProducerStateCheckpoint() {
+	if p.producerStatePath == "" {
+		return
+	}
+
+	checkpoint := make(producerStateCheckpoint)
+	p.producerState.Range(func(key, value any) bool {
+		producerID, ok := key.(string)
+		if !ok || producerID == "" {
+			return true
+		}
+		entry, ok := value.(*producerEntry)
+		if !ok || entry.lastSeq == 0 {
+			return true
+		}
+		checkpoint[producerID] = producerStateCheckpointEntry{Epoch: entry.lastEpoch, Seq: entry.lastSeq}
+		return true
+	})
+
+	p.producerStateMu.Lock()
+	defer p.producerStateMu.Unlock()
+
+	tmp := p.producerStatePath + ".tmp"
+	data, err := json.Marshal(checkpoint)
+	if err != nil {
+		util.Warn("failed to marshal producer state checkpoint %s: %v", p.producerStatePath, err)
+		return
+	}
+	data = append(data, '\n')
+
+	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		util.Warn("failed to open producer state checkpoint %s: %v", tmp, err)
+		return
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		util.Warn("failed to write producer state checkpoint %s: %v", tmp, err)
+		return
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		util.Warn("failed to sync producer state checkpoint %s: %v", tmp, err)
+		return
+	}
+	if err := f.Close(); err != nil {
+		util.Warn("failed to close producer state checkpoint %s: %v", tmp, err)
+		return
+	}
+	if err := replaceCheckpointFile(tmp, p.producerStatePath); err != nil {
+		util.Warn("failed to rename producer state checkpoint %s: %v", p.producerStatePath, err)
+		return
+	}
+	syncParentDir(filepath.Dir(p.producerStatePath))
+}
+
+func producerStateCheckpointPath(dh types.StorageHandler, partitionID int) string {
+	if dh == nil {
+		return ""
+	}
+	segmentPath := dh.GetSegmentPath(0)
+	if segmentPath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(segmentPath), fmt.Sprintf("partition_%d.producers", partitionID))
+}
+
 // GetHWM returns the high water mark in a thread-safe manner.
 func (p *Partition) GetHWM() uint64 {
 	p.mu.RLock()
@@ -529,9 +813,12 @@ func (p *Partition) Close() {
 	close(p.closeCh)
 	p.mu.Unlock()
 	p.hwmCheckpointWG.Wait()
+	p.producerStateWG.Wait()
 }
 
 const hwmCheckpointInterval = 250 * time.Millisecond
+
+const producerStateCheckpointInterval = 250 * time.Millisecond
 
 const producerStateTTL = 30 * time.Minute
 

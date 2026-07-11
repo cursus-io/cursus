@@ -61,6 +61,9 @@ func (p *Producer) sendBatch(part int, batch []Message) {
 			producerSendErrors.WithLabelValues(p.config.Topic).Add(float64(len(batch)))
 		}
 		p.cleanupBatchState(part, batchID)
+		if isNonRetryableProducerError(err) {
+			return
+		}
 		p.handleSendFailure(part, batch)
 		return
 	}
@@ -95,6 +98,14 @@ func (p *Producer) sendBatch(part int, batch []Message) {
 		}
 		p.cleanupBatchState(part, batchID)
 	}
+}
+
+func isNonRetryableProducerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "stale_producer_epoch") || strings.Contains(msg, "stale producer epoch")
 }
 
 func (p *Producer) cleanupBatchState(part int, batchID string) {

@@ -34,9 +34,10 @@ type ConsumerConfig struct {
 
 	WorkerChannelSize int `yaml:"worker_channel_size" json:"worker_channel_size"`
 
-	PollInterval  time.Duration `yaml:"poll_interval" json:"poll_interval"`
-	PollTimeoutMS int           `yaml:"poll_timeout_ms" json:"poll_timeout_ms"`
-	BatchSize     int           `yaml:"batch_size" json:"batch_size"`
+	PollInterval    time.Duration `yaml:"poll_interval" json:"poll_interval"`
+	PollTimeoutMS   int           `yaml:"poll_timeout_ms" json:"poll_timeout_ms"`
+	BatchSize       int           `yaml:"batch_size" json:"batch_size"`
+	AutoOffsetReset string        `yaml:"auto_offset_reset" json:"auto_offset_reset"`
 
 	SessionTimeoutMS         int `yaml:"session_timeout_ms" json:"session_timeout_ms"`
 	MaxPollRecords           int `yaml:"max_poll_records" json:"max_poll_records"`
@@ -90,6 +91,7 @@ func LoadConsumerConfig(explicitPath string) (*ConsumerConfig, error) {
 
 	flag.IntVar(&cfg.BatchSize, "batch-size", 100, "Batch size for consuming")
 	flag.IntVar(&cfg.MaxPollRecords, "max-poll-records", 500, "Max records per poll")
+	flag.StringVar(&cfg.AutoOffsetReset, "auto-offset-reset", "earliest", "Offset reset policy after retention gap: earliest, latest, or error")
 
 	flag.BoolVar(&cfg.EnableAutoCommit, "enable-auto-commit", true, "Enable auto commit")
 	flag.DurationVar(&cfg.AutoCommitInterval, "auto-commit-interval", 5*time.Second, "Auto commit interval")
@@ -163,6 +165,14 @@ func LoadConsumerConfig(explicitPath string) (*ConsumerConfig, error) {
 	}
 	if cfg.PollTimeoutMS == 0 {
 		cfg.PollTimeoutMS = 30000
+	}
+	if cfg.AutoOffsetReset == "" {
+		cfg.AutoOffsetReset = "earliest"
+	}
+	switch cfg.AutoOffsetReset {
+	case "earliest", "latest", "error":
+	default:
+		return nil, fmt.Errorf("invalid auto_offset_reset %q: expected earliest, latest, or error", cfg.AutoOffsetReset)
 	}
 	if cfg.BatchSize == 0 {
 		cfg.BatchSize = 100

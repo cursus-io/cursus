@@ -123,7 +123,7 @@ func (c *Consumer) Start(handler func(Message) error) error {
 	// Fetch offsets BEFORE holding the lock (fetchOffset calls getCoordinatorConn which needs mu.RLock)
 	offsetMap := make(map[int]uint64)
 	for _, pid := range assignments {
-		offset, err := c.fetchOffset(pid)
+		offset, err := c.fetchOffsetWithRetry(pid)
 		if err != nil {
 			return fmt.Errorf("fetch offset for P%d failed: %w", pid, err)
 		}
@@ -357,7 +357,7 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 		c.config.Topic, c.config.GroupID, generation, memberID)
 	parts := make([]string, 0, len(offsets))
 	for pid, off := range offsets {
-		parts = append(parts, fmt.Sprintf("%d:%d", pid, off))
+		parts = append(parts, fmt.Sprintf("P%d:%d", pid, off))
 	}
 	sb.WriteString(strings.Join(parts, ","))
 
@@ -389,6 +389,12 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 		return true
 	}
 
+	if c.handleNotCoordinator(respStr) {
+		c.closeCommitConn(conn)
+		LogWarn("Batch commit coordinator moved: %s", respStr)
+		return false
+	}
+
 	c.handleLeaderRedirection(respStr)
 
 	if strings.Contains(respStr, "NOT_OWNER") ||
@@ -402,6 +408,15 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 
 	LogError("Batch commit rejected: %s", respStr)
 	return false
+}
+
+func (c *Consumer) closeCommitConn(conn net.Conn) {
+	c.commitMu.Lock()
+	if c.commitConn == conn {
+		_ = conn.Close()
+		c.commitConn = nil
+	}
+	c.commitMu.Unlock()
 }
 
 func (c *Consumer) directCommit(partition int, offset uint64) error {
@@ -430,7 +445,10 @@ func (c *Consumer) directCommit(partition int, offset uint64) error {
 
 	respStr := string(resp)
 	if strings.Contains(respStr, "ERROR") {
-		if strings.Contains(respStr, "GEN_MISMATCH") {
+		if c.handleNotCoordinator(respStr) {
+			return fmt.Errorf("coordinator moved: %s", respStr)
+		}
+		if strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "NOT_OWNER") || strings.Contains(respStr, "member_not_found") {
 			go c.handleRebalanceSignal()
 		}
 		return fmt.Errorf("direct commit error: %s", respStr)
@@ -662,6 +680,29 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	return assigned, nil
 }
 
+func (c *Consumer) fetchOffsetWithRetry(partition int) (uint64, error) {
+	var lastErr error
+	for attempt := 1; attempt <= 5; attempt++ {
+		offset, err := c.fetchOffset(partition)
+		if err == nil {
+			return offset, nil
+		}
+		lastErr = err
+		if !isRetryableFetchOffsetError(err) {
+			return 0, err
+		}
+		if attempt == 5 {
+			break
+		}
+		select {
+		case <-c.mainCtx.Done():
+			return 0, c.mainCtx.Err()
+		case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+		}
+	}
+	return 0, lastErr
+}
+
 func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 	if err := c.mainCtx.Err(); err != nil {
 		return 0, err
@@ -686,7 +727,20 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
+	if c.handleNotCoordinator(respStr) {
+		return 0, fmt.Errorf("NOT_COORDINATOR during fetch offset")
+	}
 	return parseFetchOffsetResponse(respStr)
+}
+
+func isRetryableFetchOffsetError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "group_not_found") ||
+		strings.Contains(msg, "member_not_found") ||
+		strings.Contains(msg, "NOT_COORDINATOR")
 }
 
 func parseFetchOffsetResponse(respStr string) (uint64, error) {
@@ -818,7 +872,7 @@ func (c *Consumer) findCoordinator() (string, error) {
 	if host == "" || port == "" {
 		return "", fmt.Errorf("find_coordinator: missing host/port in response: %s", respStr)
 	}
-	return net.JoinHostPort(host, port), nil
+	return c.coordinatorAddrFromHostPort(host, port), nil
 }
 
 func (c *Consumer) getCoordinatorConn() (net.Conn, error) {
@@ -850,6 +904,24 @@ func (c *Consumer) getCoordinatorConn() (net.Conn, error) {
 	return conn, nil
 }
 
+func (c *Consumer) coordinatorAddrFromHostPort(host, port string) string {
+	if isLoopbackCoordinatorHost(host) && len(c.config.BrokerAddrs) > 0 {
+		if bootstrapHost, _, err := net.SplitHostPort(c.config.BrokerAddrs[0]); err == nil && !isLoopbackCoordinatorHost(bootstrapHost) {
+			host = bootstrapHost
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func isLoopbackCoordinatorHost(host string) bool {
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case "localhost", "127.0.0.1", "::1", "[::1]":
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Consumer) handleNotCoordinator(respStr string) bool {
 	if !strings.Contains(respStr, "NOT_COORDINATOR") {
 		return false
@@ -863,7 +935,7 @@ func (c *Consumer) handleNotCoordinator(respStr string) bool {
 		}
 	}
 	if host != "" && port != "" {
-		newAddr := net.JoinHostPort(host, port)
+		newAddr := c.coordinatorAddrFromHostPort(host, port)
 		c.mu.Lock()
 		c.coordinatorAddr = newAddr
 		c.mu.Unlock()

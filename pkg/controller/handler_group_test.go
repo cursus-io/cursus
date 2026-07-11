@@ -52,7 +52,7 @@ func TestCommandHandler_GroupOps(t *testing.T) {
 
 	t.Run("HEARTBEAT", func(t *testing.T) {
 		resp := ch.HandleCommand("HEARTBEAT topic=topic1 group=g1 member="+ctx.MemberID, ctx)
-		assert.Equal(t, "OK", resp)
+		assert.Contains(t, resp, "OK member=")
 	})
 
 	t.Run("GROUP_STATUS", func(t *testing.T) {
@@ -61,7 +61,7 @@ func TestCommandHandler_GroupOps(t *testing.T) {
 	})
 
 	t.Run("handleBatchCommit", func(t *testing.T) {
-		cmd := fmt.Sprintf("BATCH_COMMIT topic=topic1 group=g1 generation=%d member=%s 0:150,1:250", ctx.Generation, ctx.MemberID)
+		cmd := fmt.Sprintf("BATCH_COMMIT topic=topic1 group=g1 generation=%d member=%s P0:150,P1:250", ctx.Generation, ctx.MemberID)
 		resp := ch.HandleCommand(cmd, ctx)
 		assert.Contains(t, resp, "OK batched=2")
 

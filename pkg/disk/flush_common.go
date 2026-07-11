@@ -271,6 +271,7 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 		Topic:            topic,
 		Partition:        int32(partition),
 		Offset:           msg.Offset,
+		ProducerID:       msg.ProducerID,
 		SeqNum:           msg.SeqNum,
 		Epoch:            msg.Epoch,
 		Payload:          msg.Payload,

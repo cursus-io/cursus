@@ -1,12 +1,24 @@
 package stream
 
 import (
+	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
+)
+
+const (
+	StreamControlPrefix                 = "STREAM_CONTROL"
+	StreamControlTypeClose              = "CLOSE"
+	StreamControlReasonStopped          = "stopped"
+	StreamControlReasonRemoved          = "removed"
+	StreamControlReasonTimeout          = "timeout"
+	StreamControlReasonError            = "error"
+	StreamControlReasonOffsetOutOfRange = "offset_out_of_range"
 )
 
 // OffsetCommitter abstracts offset commit operations to break the
@@ -25,8 +37,13 @@ type StreamConnection struct {
 	offset     uint64
 	lastActive time.Time
 
-	stopCh   chan struct{}
-	stopOnce sync.Once
+	stopCh             chan struct{}
+	stopOnce           sync.Once
+	stopReason         string
+	stopRequested      uint64
+	stopEarliest       uint64
+	stopLatest         uint64
+	stopHasOffsetRange bool
 
 	batchSize         int
 	interval          time.Duration
@@ -39,13 +56,13 @@ type StreamConnection struct {
 // NewStreamConnection creates a new stream connection
 func NewStreamConnection(conn net.Conn, topic string, partition int, group string, offset uint64) *StreamConnection {
 	sc := &StreamConnection{
-		conn:       conn,
-		topic:      topic,
-		partition:  partition,
-		group:      group,
-		offset:     offset,
-		lastActive: time.Now(),
-		stopCh:     make(chan struct{}),
+		conn:              conn,
+		topic:             topic,
+		partition:         partition,
+		group:             group,
+		offset:            offset,
+		lastActive:        time.Now(),
+		stopCh:            make(chan struct{}),
 		batchSize:         10,
 		interval:          100 * time.Millisecond,
 		keepaliveInterval: 5 * time.Second,
@@ -91,6 +108,8 @@ func (sc *StreamConnection) Run(
 		if sc.committer != nil {
 			_ = sc.committer.CommitOffset(sc.group, sc.topic, sc.partition, sc.Offset())
 		}
+		sc.sendCloseControlFrame()
+		sc.closeConn()
 	}()
 
 	pollTicker := time.NewTicker(sc.interval)
@@ -115,6 +134,12 @@ func (sc *StreamConnection) Run(
 		msgs, err := readFn(currentOffset, bs)
 		if err != nil {
 			util.Error("Stream read error for %s/%d: %v", sc.topic, sc.partition, err)
+			var offsetErr *types.OffsetOutOfRangeError
+			if errors.As(err, &offsetErr) {
+				sc.setOffsetOutOfRange(offsetErr.Requested, offsetErr.Earliest, offsetErr.Latest)
+			} else {
+				sc.setStopReason(StreamControlReasonError)
+			}
 			return false
 		}
 
@@ -132,12 +157,13 @@ func (sc *StreamConnection) Run(
 		batchData, err := util.EncodeBatchMessages(sc.topic, sc.partition, "1", false, msgs)
 		if err != nil {
 			util.Error("Failed to encode batch messages: %v", err)
+			sc.setStopReason(StreamControlReasonError)
 			return false
 		}
 
 		if err := util.WriteWithLength(conn, batchData); err != nil {
 			util.Debug("Batch write error in stream: %v", err)
-			sc.closeConn()
+			sc.setStopReason(StreamControlReasonError)
 			return false
 		}
 
@@ -159,13 +185,13 @@ func (sc *StreamConnection) Run(
 
 		case <-sc.newMessageCh:
 			if !sendMessages() {
-				sc.Stop()
+				sc.StopWithReason(StreamControlReasonError)
 				return
 			}
 
 		case <-pollTicker.C:
 			if !sendMessages() {
-				sc.Stop()
+				sc.StopWithReason(StreamControlReasonError)
 				return
 			}
 
@@ -176,8 +202,7 @@ func (sc *StreamConnection) Run(
 			if conn != nil {
 				if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
 					util.Debug("Keepalive write error: %v", err)
-					sc.closeConn()
-					sc.Stop()
+					sc.StopWithReason(StreamControlReasonError)
 					return
 				}
 				sc.SetLastActive(time.Now())
@@ -223,9 +248,68 @@ func (sc *StreamConnection) LastActive() time.Time {
 func (sc *StreamConnection) StopCh() <-chan struct{} { return sc.stopCh }
 
 func (sc *StreamConnection) Stop() {
+	sc.StopWithReason(StreamControlReasonStopped)
+}
+
+func (sc *StreamConnection) StopWithReason(reason string) {
+	if reason == "" {
+		reason = StreamControlReasonStopped
+	}
+	sc.setStopReason(reason)
 	sc.stopOnce.Do(func() {
 		close(sc.stopCh)
 	})
+}
+
+func (sc *StreamConnection) setStopReason(reason string) {
+	if reason == "" {
+		return
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.stopReason == "" {
+		sc.stopReason = reason
+	}
+}
+
+func (sc *StreamConnection) setOffsetOutOfRange(requested, earliest, latest uint64) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.stopReason == "" {
+		sc.stopReason = StreamControlReasonOffsetOutOfRange
+	}
+	sc.stopRequested = requested
+	sc.stopEarliest = earliest
+	sc.stopLatest = latest
+	sc.stopHasOffsetRange = true
+}
+func (sc *StreamConnection) sendCloseControlFrame() {
+	sc.mu.RLock()
+	conn := sc.conn
+	reason := sc.stopReason
+	offset := sc.offset
+	requested := sc.stopRequested
+	earliest := sc.stopEarliest
+	latest := sc.stopLatest
+	hasOffsetRange := sc.stopHasOffsetRange
+	sc.mu.RUnlock()
+
+	if conn == nil {
+		return
+	}
+	if reason == "" {
+		reason = StreamControlReasonStopped
+	}
+
+	frame := fmt.Sprintf("%s type=%s reason=%s offset=%d", StreamControlPrefix, StreamControlTypeClose, reason, offset)
+	if hasOffsetRange {
+		frame = fmt.Sprintf("%s requested=%d earliest=%d latest=%d", frame, requested, earliest, latest)
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
+	if err := util.WriteWithLength(conn, []byte(frame)); err != nil {
+		util.Debug("Stream close control write error: %v", err)
+	}
+	_ = conn.SetWriteDeadline(time.Time{})
 }
 
 func (sc *StreamConnection) closeConn() {

@@ -1,6 +1,7 @@
 package e2e_benchmark
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,7 +14,11 @@ import (
 	"time"
 )
 
-const benchmarkTimeout = 5 * time.Minute
+const (
+	benchmarkTimeout      = 5 * time.Minute
+	composeCommandTimeout = 10 * time.Minute
+	dockerCommandTimeout  = 30 * time.Second
+)
 
 var severeBenchmarkLogPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(^|[\s|])(?:panic:|\[fatal\]|fatal:|fatal error:|level=fatal)(\s|$)`),
@@ -22,10 +27,10 @@ var severeBenchmarkLogPatterns = []*regexp.Regexp{
 }
 
 func getComposeCommand() []string {
-	if _, err := exec.LookPath("docker-compose"); err == nil {
-		return []string{"docker-compose"}
+	if _, err := exec.LookPath("docker"); err == nil {
+		return []string{"docker", "compose"}
 	}
-	return []string{"docker", "compose"}
+	return []string{"docker-compose"}
 }
 
 func composeFile(rel string) string {
@@ -37,11 +42,15 @@ func composeFile(rel string) string {
 }
 
 func runCompose(args ...string) *exec.Cmd {
+	return runComposeContext(context.Background(), args...)
+}
+
+func runComposeContext(ctx context.Context, args ...string) *exec.Cmd {
 	base := getComposeCommand()
 	fullArgs := append([]string{}, base[1:]...)
 	fullArgs = append(fullArgs, "--project-name", "cursus-benchmark")
 	fullArgs = append(fullArgs, args...)
-	cmd := exec.Command(base[0], fullArgs...)
+	cmd := exec.CommandContext(ctx, base[0], fullArgs...)
 	return cmd
 }
 
@@ -80,6 +89,26 @@ func TestBenchmarkFailurePatternsAvoidBroadFatalMatches(t *testing.T) {
 	}
 }
 
+func TestBenchmarkContainerLabelsMatchSameRepoTestCompose(t *testing.T) {
+	composePath := filepath.Join("repo", "test", "cluster", "docker-compose.yml")
+	labels := strings.Join([]string{
+		"e2e-cluster",
+		filepath.ToSlash(filepath.Join("repo", "test", "e2e-cluster", "docker-compose.yml")),
+		filepath.ToSlash(filepath.Join("repo", "test", "e2e-cluster")),
+	}, "\n")
+
+	if !benchmarkContainerLabelsMatch(labels, composePath) {
+		t.Fatal("expected same-repo test compose labels to be removable for fixed benchmark names")
+	}
+
+	otherRepoLabels := strings.Join([]string{
+		"e2e-cluster",
+		filepath.ToSlash(filepath.Join("other", "test", "e2e-cluster", "docker-compose.yml")),
+	}, "\n")
+	if benchmarkContainerLabelsMatch(otherRepoLabels, composePath) {
+		t.Fatal("did not expect another repository's fixed-name container to match")
+	}
+}
 func TestBenchmarkCounterParsesMultiDigitFailures(t *testing.T) {
 	logs := "bench-consumer | Message missing       : 12\nbench-consumer | Duplicate (Offset)    : 0"
 	missing, ok := benchmarkCounter(logs, "Message missing")
@@ -100,15 +129,19 @@ func composeDown(t *testing.T, file string) {
 		removeFixedBenchmarkContainer(t, file, name)
 	}
 
-	cmd := runCompose("-f", file, "rm", "-f", "-s", "-v")
+	ctx, cancel := context.WithTimeout(context.Background(), composeCommandTimeout)
+	cmd := runComposeContext(ctx, "-f", file, "rm", "-f", "-s", "-v")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Logf("compose rm warning: %v\n%s", err, string(output))
 	}
+	cancel()
 
-	cmd = runCompose("-f", file, "down", "-v", "--remove-orphans")
+	ctx, cancel = context.WithTimeout(context.Background(), composeCommandTimeout)
+	cmd = runComposeContext(ctx, "-f", file, "down", "-v", "--remove-orphans")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Logf("compose down warning: %v\n%s", err, string(output))
 	}
+	cancel()
 }
 
 func fixedBenchmarkContainers(file string) []string {
@@ -123,7 +156,9 @@ func removeFixedBenchmarkContainer(t *testing.T, file, name string) {
 		return
 	}
 
-	cmd := exec.Command("docker", "rm", "-f", "-v", name)
+	ctx, cancel := context.WithTimeout(context.Background(), dockerCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "rm", "-f", "-v", name)
 	if output, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(output), "No such container") {
 		t.Logf("docker rm warning for %s: %v\n%s", name, err, string(output))
 	}
@@ -135,7 +170,9 @@ func isFixedBenchmarkContainer(t *testing.T, file, name string) bool {
 		`{{ index .Config.Labels "com.docker.compose.project.config_files" }}`,
 		`{{ index .Config.Labels "com.docker.compose.project.working_dir" }}`,
 	}, "\n")
-	cmd := exec.Command("docker", "inspect", "-f", format, name)
+	ctx, cancel := context.WithTimeout(context.Background(), dockerCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "inspect", "-f", format, name)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return false
@@ -147,17 +184,63 @@ func isFixedBenchmarkContainer(t *testing.T, file, name string) bool {
 		return false
 	}
 
-	labels := filepath.ToSlash(string(output))
+	return benchmarkContainerLabelsMatch(string(output), absFile)
+}
+
+func benchmarkContainerLabelsMatch(labels, absFile string) bool {
+	normalizedLabels := filepath.ToSlash(labels)
 	expectedFile := filepath.ToSlash(absFile)
 	expectedDir := filepath.ToSlash(filepath.Dir(absFile))
-	return strings.Contains(labels, "cursus-benchmark") ||
-		strings.Contains(labels, expectedFile) ||
-		strings.Contains(labels, expectedDir)
+	testRoot := benchmarkTestRoot(filepath.Dir(absFile))
+
+	if strings.Contains(normalizedLabels, "cursus-benchmark") ||
+		strings.Contains(normalizedLabels, expectedFile) ||
+		strings.Contains(normalizedLabels, expectedDir) {
+		return true
+	}
+	if testRoot == "" {
+		return false
+	}
+
+	// Cluster benchmark compose files use fixed container_name values that can
+	// collide with other Cursus test compose stacks, such as test/e2e-cluster.
+	return strings.Contains(normalizedLabels, filepath.ToSlash(testRoot)+"/")
+}
+
+func benchmarkTestRoot(dir string) string {
+	for {
+		if filepath.Base(dir) == "test" {
+			return filepath.Clean(dir)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
 }
 
 func composeUp(t *testing.T, file string) {
-	cmd := runCompose("-f", file, "up", "-d", "--build", "--force-recreate")
+	ctx, cancel := context.WithTimeout(context.Background(), composeCommandTimeout)
+	cmd := runComposeContext(ctx, "-f", file, "build", "--progress", "plain")
 	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		cancel()
+		t.Fatalf("compose build timed out after %s\n%s", composeCommandTimeout, string(output))
+	}
+	cancel()
+	if err != nil {
+		t.Fatalf("compose build failed: %v\n%s", err, string(output))
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), composeCommandTimeout)
+	cmd = runComposeContext(ctx, "-f", file, "up", "-d", "--no-build", "--force-recreate")
+	output, err = cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		cancel()
+		t.Fatalf("compose up timed out after %s\n%s", composeCommandTimeout, string(output))
+	}
+	cancel()
 	if err != nil {
 		t.Fatalf("compose up failed: %v\n%s", err, string(output))
 	}
@@ -172,27 +255,32 @@ func waitForContainerExit(t *testing.T, file, service, container string, timeout
 		select {
 		case <-deadline:
 			// Dump logs for debugging (compose logs uses service name)
-			logsCmd := runCompose("-f", file, "logs", "--tail", "50", service)
+			ctx, cancel := context.WithTimeout(context.Background(), dockerCommandTimeout)
+			logsCmd := runComposeContext(ctx, "-f", file, "logs", "--tail", "50", service)
 			logs, _ := logsCmd.CombinedOutput()
+			cancel()
 			t.Logf("Timeout waiting for %s. Last logs:\n%s", container, string(logs))
 			return string(logs), false
 		case <-ticker.C:
 			// Check if container has exited (docker inspect uses container name)
-			inspectCmd := exec.Command("docker", "inspect", "-f", "{{.State.Status}}", container)
+			ctx, cancel := context.WithTimeout(context.Background(), dockerCommandTimeout)
+			inspectCmd := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Status}}", container)
 			out, err := inspectCmd.Output()
+			cancel()
 			if err != nil {
 				continue
 			}
 			status := strings.TrimSpace(string(out))
 			if status == "exited" {
-				logsCmd := runCompose("-f", file, "logs", service)
+				ctx, cancel := context.WithTimeout(context.Background(), dockerCommandTimeout)
+				logsCmd := runComposeContext(ctx, "-f", file, "logs", service)
 				logs, _ := logsCmd.CombinedOutput()
+				cancel()
 				return string(logs), true
 			}
 		}
 	}
 }
-
 func assertBenchmarkSuccess(t *testing.T, logs string, component string) {
 	t.Helper()
 
@@ -225,9 +313,45 @@ func assertBenchmarkSuccess(t *testing.T, logs string, component string) {
 		}
 	}
 
-	t.Logf("%s benchmark completed successfully", component)
+	summary := benchmarkResultSummary(logs)
+	if summary != "" {
+		t.Logf("%s benchmark result:\n%s", component, summary)
+	} else {
+		t.Logf("%s benchmark completed successfully", component)
+	}
 }
 
+func benchmarkResultSummary(logs string) string {
+	wanted := []string{
+		"PRODUCER BENCHMARK SUMMARY",
+		"CONSUMER BENCHMARK SUMMARY",
+		"Partitions",
+		"Total Batches",
+		"Total Messages",
+		"Failed messages",
+		"Retry Count",
+		"Publish elapsed Time",
+		"Publish Message Throughput",
+		"Latency P95",
+		"Latency P99",
+		"Elapsed Time",
+		"Overall TPS",
+		"Duplicate (MessageID)",
+		"Duplicate (Offset)",
+		"Message missing",
+	}
+
+	var out []string
+	for _, line := range strings.Split(logs, "\n") {
+		for _, token := range wanted {
+			if strings.Contains(line, token) {
+				out = append(out, strings.TrimSpace(line))
+				break
+			}
+		}
+	}
+	return strings.Join(out, "\n")
+}
 func benchmarkCounter(logs, label string) (int, bool) {
 	pattern := regexp.MustCompile(fmt.Sprintf(`(?im)%s[[:space:]]*:[[:space:]]*([0-9]+)`, regexp.QuoteMeta(label)))
 	match := pattern.FindStringSubmatch(logs)
@@ -251,6 +375,9 @@ func lastLines(s string, n int) string {
 
 // TestStandaloneBenchmark runs the standalone benchmark and verifies produce/consume complete.
 func TestStandaloneBenchmark(t *testing.T) {
+	if os.Getenv("RUN_E2E_BENCHMARK") != "1" {
+		t.Skip("set RUN_E2E_BENCHMARK=1 to run docker-compose benchmark")
+	}
 	if testing.Short() {
 		t.Skip("skipping benchmark test in short mode")
 	}
@@ -280,6 +407,9 @@ func TestStandaloneBenchmark(t *testing.T) {
 
 // TestClusterBenchmark runs the 3-node cluster benchmark and verifies produce/consume complete.
 func TestClusterBenchmark(t *testing.T) {
+	if os.Getenv("RUN_E2E_BENCHMARK") != "1" {
+		t.Skip("set RUN_E2E_BENCHMARK=1 to run docker-compose benchmark")
+	}
 	if testing.Short() {
 		t.Skip("skipping benchmark test in short mode")
 	}

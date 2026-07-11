@@ -376,7 +376,7 @@ func TestProcessMessage_HeartbeatEncoded(t *testing.T) {
 	}()
 
 	msg := readFramed(t, client)
-	assert.Equal(t, "OK", msg)
+	assert.Contains(t, msg, "ERROR:")
 	<-done
 }
 
@@ -803,7 +803,7 @@ func TestProcessMessage_HeartbeatWithPadding(t *testing.T) {
 	}()
 
 	msg := readFramed(t, client)
-	assert.Equal(t, "OK", msg)
+	assert.Contains(t, msg, "ERROR:")
 	<-done
 }
 

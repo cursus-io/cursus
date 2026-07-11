@@ -13,13 +13,13 @@ type BrokerFSMSnapshot struct {
 	logs              map[uint64]*ReplicationEntry
 	brokers           map[string]*BrokerInfo
 	partitionMetadata map[string]*PartitionMetadata
-	producerState     map[string]map[int]map[string]int64
+	producerState     map[string]map[int]map[string]ProducerSequence
 	groupState        map[string]*coordinator.GroupStateSnapshot
 }
 
 func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	state := BrokerFSMState{
-		Version:           2,
+		Version:           3,
 		Applied:           s.applied,
 		Logs:              s.logs,
 		Brokers:           s.brokers,

@@ -15,7 +15,7 @@ buffer_size: 100000
 
 # Reliability
 acks: "1"
-enable_idempotence: false
+enable_idempotence: true
 
 max_retries: 5
 retry_backoff_ms: 200

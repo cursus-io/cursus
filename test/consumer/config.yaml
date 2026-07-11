@@ -11,6 +11,7 @@ consumer_id: "consumer-1"
 mode: "polling" # polling, streaming
 poll_interval: 100ms
 poll_timeout_ms: 3000
+auto_offset_reset: earliest
 batch_size: 5000
 max_poll_records: 5000
 
