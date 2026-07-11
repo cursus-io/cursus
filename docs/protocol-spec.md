@@ -718,6 +718,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - Broker tracks the last seen `(epoch, seqNum)` per `(producerId)` per partition
 - Disk-backed partitions persist producer sequence checkpoints and restore them on broker restart
 - Distributed FSM snapshots also include producer sequence state for replicated message commands
+- FSM snapshots that encode producer epochs use snapshot version 3. Do not run mixed-version rolling upgrades across brokers that cannot decode producer-epoch snapshot state; upgrade the cluster together or drain snapshots before introducing older binaries.
 - Producer state expires from memory after 30 minutes of inactivity; durable checkpoints retain the last persisted sequence until the partition data is removed
 
 ---

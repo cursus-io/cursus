@@ -169,6 +169,11 @@ func LoadConsumerConfig(explicitPath string) (*ConsumerConfig, error) {
 	if cfg.AutoOffsetReset == "" {
 		cfg.AutoOffsetReset = "earliest"
 	}
+	switch cfg.AutoOffsetReset {
+	case "earliest", "latest", "error":
+	default:
+		return nil, fmt.Errorf("invalid auto_offset_reset %q: expected earliest, latest, or error", cfg.AutoOffsetReset)
+	}
 	if cfg.BatchSize == 0 {
 		cfg.BatchSize = 100
 	}

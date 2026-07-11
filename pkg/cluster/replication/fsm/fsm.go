@@ -31,14 +31,16 @@ type BrokerInfo struct {
 }
 
 type ProducerSequence struct {
-	Epoch int64 `json:"epoch"`
-	Seq   int64 `json:"seq"`
+	Epoch int64  `json:"epoch"`
+	Seq   uint64 `json:"seq"`
 }
 
 func (s *ProducerSequence) UnmarshalJSON(data []byte) error {
 	var legacySeq int64
 	if err := json.Unmarshal(data, &legacySeq); err == nil {
-		s.Seq = legacySeq
+		if legacySeq > 0 {
+			s.Seq = uint64(legacySeq)
+		}
 		return nil
 	}
 	type alias ProducerSequence
@@ -196,6 +198,8 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Info("FSM Restore: Validating snapshot Version 1")
 	case 2:
 		util.Info("FSM Restore: Validating snapshot Version 2 (with group state)")
+	case 3:
+		util.Info("FSM Restore: Validating snapshot Version 3 (with producer epochs)")
 	default:
 		return fmt.Errorf("unknown snapshot version: %d", state.Version)
 	}

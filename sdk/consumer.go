@@ -688,8 +688,11 @@ func (c *Consumer) fetchOffsetWithRetry(partition int) (uint64, error) {
 			return offset, nil
 		}
 		lastErr = err
-		if !strings.Contains(err.Error(), "group_not_found") && !strings.Contains(err.Error(), "member_not_found") {
+		if !isRetryableFetchOffsetError(err) {
 			return 0, err
+		}
+		if attempt == 5 {
+			break
 		}
 		select {
 		case <-c.mainCtx.Done():
@@ -724,7 +727,20 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
+	if c.handleNotCoordinator(respStr) {
+		return 0, fmt.Errorf("NOT_COORDINATOR during fetch offset")
+	}
 	return parseFetchOffsetResponse(respStr)
+}
+
+func isRetryableFetchOffsetError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "group_not_found") ||
+		strings.Contains(msg, "member_not_found") ||
+		strings.Contains(msg, "NOT_COORDINATOR")
 }
 
 func parseFetchOffsetResponse(respStr string) (uint64, error) {

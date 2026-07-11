@@ -274,6 +274,10 @@ func (c *Coordinator) ValidateMemberGeneration(groupName, memberID string, gener
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	return c.validateMemberGenerationLocked(groupName, memberID, generation)
+}
+
+func (c *Coordinator) validateMemberGenerationLocked(groupName, memberID string, generation int) string {
 	group := c.groups[groupName]
 	if group == nil {
 		return fmt.Sprintf("ERROR: group_not_found group=%s", groupName)
@@ -293,12 +297,13 @@ func (c *Coordinator) ValidateMemberGeneration(groupName, memberID string, gener
 // ValidateOwnershipFailure returns a wire-ready error code when a member does
 // not own a partition in the supplied generation. Empty string means valid.
 func (c *Coordinator) ValidateOwnershipFailure(groupName, memberID string, generation int, partition int) string {
-	if errResp := c.ValidateMemberGeneration(groupName, memberID, generation); errResp != "" {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
 		return errResp
 	}
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	group := c.groups[groupName]
 	member := group.Members[memberID]
 	if !contains(member.Assignments, partition) {

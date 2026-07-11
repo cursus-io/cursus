@@ -52,7 +52,7 @@ func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
 		}
 
 		exists, state := f.getProducerSequence(cmd.Topic, trackPartition, first.ProducerID)
-		if exists && first.Epoch == state.Epoch && int64(last.SeqNum) <= state.Seq {
+		if exists && first.Epoch == state.Epoch && last.SeqNum <= state.Seq {
 			f.mu.Unlock()
 			util.Debug("FSM: Duplicate detected for idempotent producer %s (Topic: %s, Scope: %s, Partition: %d), skipping", first.ProducerID, cmd.Topic, cmd.SequenceScope, trackPartition)
 			return f.makeSuccessAck(&last, first.SeqNum)
@@ -84,7 +84,7 @@ func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
 		if cmd.SequenceScope == "partition" {
 			trackPartition = cmd.Partition
 		}
-		f.updateProducerState(cmd.Topic, trackPartition, first.ProducerID, last.Epoch, int64(last.SeqNum))
+		f.updateProducerState(cmd.Topic, trackPartition, first.ProducerID, last.Epoch, last.SeqNum)
 	}
 	f.mu.Unlock()
 
@@ -107,10 +107,10 @@ func (f *BrokerFSM) getProducerSequence(topic string, partition int, pID string)
 			}
 		}
 	}
-	return false, ProducerSequence{Seq: -1}
+	return false, ProducerSequence{}
 }
 
-func (f *BrokerFSM) updateProducerState(topic string, partition int, pID string, epoch int64, seq int64) {
+func (f *BrokerFSM) updateProducerState(topic string, partition int, pID string, epoch int64, seq uint64) {
 	if f.producerState[topic] == nil {
 		f.producerState[topic] = make(map[int]map[string]ProducerSequence)
 	}
@@ -165,17 +165,17 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 				return fmt.Errorf("stale_producer_epoch producer=%s current=%d got=%d", firstMsg.ProducerID, state.Epoch, firstMsg.Epoch)
 			}
 			if firstMsg.Epoch == state.Epoch {
-				if int64(lastMsg.SeqNum) <= state.Seq {
+				if lastMsg.SeqNum <= state.Seq {
 					return nil
 				}
-				if int64(firstMsg.SeqNum) <= state.Seq {
+				if firstMsg.SeqNum <= state.Seq {
 					scope := "global"
 					if cmd.SequenceScope == "partition" {
 						scope = "partition"
 					}
 					return fmt.Errorf("out-of-order sequence (overlap) in %s scope: lastSeq %d, firstMsg.SeqNum %d", scope, state.Seq, firstMsg.SeqNum)
 				}
-				if firstMsg.SeqNum > uint64(state.Seq+1) {
+				if state.Seq == ^uint64(0) || firstMsg.SeqNum > state.Seq+1 {
 					scope := "global"
 					if cmd.SequenceScope == "partition" {
 						scope = "partition"

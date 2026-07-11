@@ -558,6 +558,12 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	if err != nil {
 		return "ERROR: invalid_offset"
 	}
+	if ch.isDistributed() {
+		coordAddr, isCoord := ch.checkCoordinator(groupID)
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
+		}
+	}
 	offsetTopic, offsetTopicErr := ch.resolveGroupOffsetTopic(groupID, topicName)
 	if offsetTopicErr != "" {
 		return offsetTopicErr
@@ -574,12 +580,8 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 			return errResp
 		}
 	}
-	if ch.isDistributed() {
-		coordAddr, isCoord := ch.checkCoordinator(groupID)
-		if !isCoord {
-			return notCoordinatorResponse(coordAddr)
-		}
 
+	if ch.isDistributed() {
 		payload := map[string]interface{}{
 			"type":      "COMMIT",
 			"group":     groupID,

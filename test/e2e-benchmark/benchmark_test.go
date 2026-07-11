@@ -375,6 +375,9 @@ func lastLines(s string, n int) string {
 
 // TestStandaloneBenchmark runs the standalone benchmark and verifies produce/consume complete.
 func TestStandaloneBenchmark(t *testing.T) {
+	if os.Getenv("RUN_E2E_BENCHMARK") != "1" {
+		t.Skip("set RUN_E2E_BENCHMARK=1 to run docker-compose benchmark")
+	}
 	if testing.Short() {
 		t.Skip("skipping benchmark test in short mode")
 	}
@@ -404,6 +407,9 @@ func TestStandaloneBenchmark(t *testing.T) {
 
 // TestClusterBenchmark runs the 3-node cluster benchmark and verifies produce/consume complete.
 func TestClusterBenchmark(t *testing.T) {
+	if os.Getenv("RUN_E2E_BENCHMARK") != "1" {
+		t.Skip("set RUN_E2E_BENCHMARK=1 to run docker-compose benchmark")
+	}
 	if testing.Short() {
 		t.Skip("skipping benchmark test in short mode")
 	}

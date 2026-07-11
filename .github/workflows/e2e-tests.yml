@@ -48,5 +48,7 @@ jobs:
 
       - name: Run E2E benchmark tests
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          RUN_E2E_BENCHMARK: "1"
         run: |
           go test -v -timeout 30m ./test/e2e-benchmark/...

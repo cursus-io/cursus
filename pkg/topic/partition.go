@@ -3,6 +3,7 @@ package topic
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -124,6 +125,9 @@ func (p *Partition) validateProducerMessage(msg *types.Message) (bool, error) {
 		if msg.Epoch == entry.lastEpoch && msg.SeqNum <= entry.lastSeq {
 			metrics.SeqNumDuplicateTotal.WithLabelValues(p.topic, fmt.Sprintf("%d", p.id)).Inc()
 			return true, nil
+		}
+		if msg.Epoch > entry.lastEpoch && msg.SeqNum > 1 {
+			return false, fmt.Errorf("idempotency error: first message in new producer epoch for producer %s must have seqNum 1, got %d", msg.ProducerID, msg.SeqNum)
 		}
 	}
 	return false, nil
@@ -292,6 +296,10 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 	if p.closed {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
+	if p.id > math.MaxInt32 {
+		return fmt.Errorf("partition ID %d exceeds int32 range", p.id)
+	}
+	partitionID := int32(p.id) // #nosec G115 -- p.id is validated against math.MaxInt32 before narrowing.
 
 	type pendingLeaderMessage struct {
 		index int
@@ -318,7 +326,7 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 		})
 		diskBatch = append(diskBatch, types.DiskMessage{
 			Topic:            p.topic,
-			Partition:        int32(p.id),
+			Partition:        partitionID,
 			Offset:           offset,
 			ProducerID:       msgs[i].ProducerID,
 			SeqNum:           msgs[i].SeqNum,
@@ -419,9 +427,9 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 		return nil, nil
 	}
 
-	canRead := int(hwm - offset)
-	if max > canRead {
-		max = canRead
+	canRead := hwm - offset
+	if canRead <= math.MaxInt && max > int(canRead) { // #nosec G115 -- canRead is bounded by math.MaxInt before narrowing.
+		max = int(canRead) // #nosec G115 -- canRead is bounded by math.MaxInt before narrowing.
 	}
 
 	return p.ReadMessages(offset, max)
@@ -457,7 +465,15 @@ func (p *Partition) NextOffset() uint64 {
 }
 
 func (p *Partition) ReserveOffsets(count int) uint64 {
-	return p.LEO.Add(uint64(count)) - uint64(count)
+	if count <= 0 {
+		return p.LEO.Load()
+	}
+	current := p.LEO.Load()
+	if uint64(count) > math.MaxUint64-current { // #nosec G115 -- count is positive before widening.
+		return current
+	}
+	delta := uint64(count) // #nosec G115 -- count is positive and overflow-checked before widening.
+	return p.LEO.Add(delta) - delta
 }
 
 func (p *Partition) SetHWM(hwm uint64) {

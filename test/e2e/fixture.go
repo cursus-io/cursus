@@ -38,6 +38,7 @@ type TestContext struct {
 
 	// Producer state
 	producerID       string
+	producerEpoch    int64
 	seqNum           uint64
 	publishedSeqNums []uint64
 	acks             string
@@ -68,6 +69,7 @@ func Given(t *testing.T) *TestContext {
 		memberID:       fmt.Sprintf("e2e-consumer-%s", uniqueID),
 		generation:     0,
 		producerID:     uuid.New().String(),
+		producerEpoch:  time.Now().UnixNano(),
 		seqNum:         0,
 		acks:           "1",
 		client:         nil, // lazily initialized
