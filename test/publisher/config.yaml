@@ -13,7 +13,7 @@ linger_ms: 50
 
 # Idempotency
 acks: "1" # "0" (no ack), "1" (leader only), "all" or "-1" (quorum)
-enable_idempotence: false
+enable_idempotence: true
 
 # Retry
 max_retries: 5

@@ -1,0 +1,23 @@
+.git
+.github
+.idea
+.vscode
+
+# Local broker/runtime data
+broker-logs
+cluster-logs
+**/broker-logs
+**/cluster-logs
+**/*.log
+
+# Build/test artifacts
+bin
+build
+dist
+coverage.out
+*.test
+*.prof
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

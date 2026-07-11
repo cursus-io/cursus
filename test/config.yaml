@@ -5,12 +5,13 @@ exporter_port: 9100
 log_level: "info" # debug, info, warn, error
 
 # Idempotency
-enable_idempotence: false # exactly-once, at-Least-once
+enable_idempotence: true # exactly-once, at-Least-once
 
 # Storage
 log_dir: "broker-logs"
 linger_ms: 50
 disk_flush_batch_size: 500
+batch_size: 500
 log_cleanup_interval: 60            
 log_segment_bytes: 10485760 # 10MB
 
