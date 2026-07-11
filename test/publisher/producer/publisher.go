@@ -306,7 +306,7 @@ func (p *Publisher) sendBatch(part int, batch []types.Message) {
 
 	shortEpoch := p.producer.Epoch % 1000
 	batchID := fmt.Sprintf("%s-%03d-p%d-%d-%d", shortID, shortEpoch, part, batchStart, batchEnd)
-	util.Info("Sending batch %s: partition=%d, messages=%d, epoch=%d, seqRange=%d-%d", batchID, part, len(batch), p.producer.Epoch, batchStart, batchEnd)
+	util.Debug("Sending batch %s: partition=%d, messages=%d, epoch=%d, seqRange=%d-%d", batchID, part, len(batch), p.producer.Epoch, batchStart, batchEnd)
 
 	p.partitionBatchMus[part].Lock()
 	p.partitionBatchStates[part][batchID] = &BatchState{
