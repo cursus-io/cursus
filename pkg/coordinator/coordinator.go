@@ -268,6 +268,44 @@ func (c *Coordinator) GetGeneration(groupName string) int {
 	return 0
 }
 
+// ValidateMemberGeneration returns a wire-ready error code when a member is not
+// valid for the supplied group generation. Empty string means valid.
+func (c *Coordinator) ValidateMemberGeneration(groupName, memberID string, generation int) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	group := c.groups[groupName]
+	if group == nil {
+		return fmt.Sprintf("ERROR: group_not_found group=%s", groupName)
+	}
+	if memberID == "" {
+		return "ERROR: missing_member"
+	}
+	if group.Members[memberID] == nil {
+		return fmt.Sprintf("ERROR: member_not_found member=%s group=%s", memberID, groupName)
+	}
+	if generation >= 0 && group.Generation != generation {
+		return fmt.Sprintf("ERROR: GEN_MISMATCH current=%d requested=%d group=%s member=%s", group.Generation, generation, groupName, memberID)
+	}
+	return ""
+}
+
+// ValidateOwnershipFailure returns a wire-ready error code when a member does
+// not own a partition in the supplied generation. Empty string means valid.
+func (c *Coordinator) ValidateOwnershipFailure(groupName, memberID string, generation int, partition int) string {
+	if errResp := c.ValidateMemberGeneration(groupName, memberID, generation); errResp != "" {
+		return errResp
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	group := c.groups[groupName]
+	member := group.Members[memberID]
+	if !contains(member.Assignments, partition) {
+		return fmt.Sprintf("ERROR: NOT_OWNER partition=%d member=%s group=%s generation=%d", partition, memberID, groupName, generation)
+	}
+	return ""
+}
 func contains(slice []int, item int) bool {
 	for _, s := range slice {
 		if s == item {

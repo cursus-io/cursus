@@ -258,21 +258,58 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
 
+	type pendingLeaderMessage struct {
+		index int
+	}
+
+	nextOffset := p.LEO.Load()
+	pending := make([]pendingLeaderMessage, 0, len(msgs))
+	diskBatch := make([]types.DiskMessage, 0, len(msgs))
+
 	for i := range msgs {
 		if p.isDuplicate(&msgs[i]) {
 			continue
 		}
 
-		offset, err := p.dh.AppendMessage(p.topic, p.id, &msgs[i])
-		if err != nil {
-			p.NotifyNewMessage()
-			return fmt.Errorf("batch enqueue failed at index %d: %w", i, err)
-		}
-
-		p.updateProducerState(&msgs[i])
+		offset := nextOffset
+		nextOffset++
 		msgs[i].Offset = offset
-		p.LEO.Store(offset + 1)
+		pending = append(pending, pendingLeaderMessage{
+			index: i,
+		})
+		diskBatch = append(diskBatch, types.DiskMessage{
+			Topic:            p.topic,
+			Partition:        int32(p.id),
+			Offset:           offset,
+			ProducerID:       msgs[i].ProducerID,
+			SeqNum:           msgs[i].SeqNum,
+			Epoch:            msgs[i].Epoch,
+			Payload:          msgs[i].Payload,
+			Key:              msgs[i].Key,
+			EventType:        msgs[i].EventType,
+			SchemaVersion:    msgs[i].SchemaVersion,
+			AggregateVersion: msgs[i].AggregateVersion,
+			Metadata:         msgs[i].Metadata,
+		})
 	}
+
+	if len(diskBatch) == 0 {
+		p.NotifyNewMessage()
+		return nil
+	}
+
+	if err := p.dh.WriteBatch(diskBatch); err != nil {
+		for _, msg := range pending {
+			msgs[msg.index].Offset = 0
+		}
+		p.NotifyNewMessage()
+		return fmt.Errorf("leader batch write failed: %w", err)
+	}
+
+	for _, msg := range pending {
+		p.updateProducerState(&msgs[msg.index])
+	}
+	p.LEO.Store(nextOffset)
 	p.NotifyNewMessage()
 	return nil
 }
@@ -324,15 +361,21 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 	hwm := p.HWM
 	p.mu.RUnlock()
 
-	if offset >= hwm {
-		return nil, nil
-	}
-
-	// Cap at flushed offset to avoid reading data not yet on disk
+	// Cap at flushed offset to avoid reading data not yet on disk.
 	flushed := p.dh.GetFlushedOffset()
 	if flushed < hwm {
 		hwm = flushed
 	}
+
+	earliest := p.dh.GetFirstOffset()
+	if offset < earliest && earliest < hwm {
+		return nil, &types.OffsetOutOfRangeError{
+			Requested: offset,
+			Earliest:  earliest,
+			Latest:    hwm,
+		}
+	}
+
 	if offset >= hwm {
 		return nil, nil
 	}
@@ -351,6 +394,12 @@ func (p *Partition) FlushDisk() {
 	p.persistHWMCheckpoint()
 }
 
+func (p *Partition) GetFirstOffset() uint64 {
+	if p.dh == nil {
+		return 0
+	}
+	return p.dh.GetFirstOffset()
+}
 func (p *Partition) GetLatestOffset() uint64 {
 	if p.dh == nil {
 		return 0

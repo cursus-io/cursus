@@ -40,6 +40,7 @@ func (m *MockStorageHandler) ReadMessages(offset uint64, max int) ([]types.Messa
 	return nil, nil
 }
 func (m *MockStorageHandler) GetAbsoluteOffset() uint64 { return m.offset }
+func (m *MockStorageHandler) GetFirstOffset() uint64    { return 0 }
 func (m *MockStorageHandler) GetFlushedOffset() uint64  { return m.offset }
 func (m *MockStorageHandler) GetLatestOffset() uint64   { return m.offset }
 func (m *MockStorageHandler) ReserveOffsets(n int) uint64 {

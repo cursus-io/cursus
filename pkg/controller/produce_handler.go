@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
@@ -72,28 +73,10 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 	}
 
 	var ackResp types.AckResponse
-	tm := ch.TopicManager
-	t := tm.GetTopic(topicName)
+	t := ch.waitForTopic(topicName)
 	if t == nil {
-		const maxRetries = 5
-		const retryDelay = 100 * time.Millisecond
-
-		util.Warn("Topic '%s' not found. Checking if creation is pending...", topicName)
-
-		found := false
-		for i := 0; i < maxRetries; i++ {
-			t = tm.GetTopic(topicName)
-			if t != nil {
-				found = true
-				break
-			}
-			time.Sleep(retryDelay)
-		}
-
-		if !found {
-			util.Warn("ch publish: topic '%s' does not exist after retries", topicName)
-			return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
-		}
+		util.Warn("ch publish: topic '%s' does not exist after retries", topicName)
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
 
 	msg := &types.Message{
@@ -118,7 +101,7 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 
 		effectiveIdempotent := isIdempotent || ch.Config.EnableIdempotence
 
-		scope := "global"
+		scope := "partition"
 		messageData := types.MessageCommand{
 			Topic:         topicName,
 			Partition:     partition,
@@ -209,6 +192,25 @@ Respond:
 	return string(respBytes)
 }
 
+func (ch *CommandHandler) waitForTopic(topicName string) *topic.Topic {
+	t := ch.TopicManager.GetTopic(topicName)
+	if t != nil {
+		return t
+	}
+
+	const maxRetries = 5
+	const retryDelay = 100 * time.Millisecond
+	util.Warn("Topic '%s' not found. Checking if creation is pending...", topicName)
+	for i := 0; i < maxRetries; i++ {
+		t = ch.TopicManager.GetTopic(topicName)
+		if t != nil {
+			return t
+		}
+		time.Sleep(retryDelay)
+	}
+	return nil
+}
+
 func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 	// Format: REPLICATE_MESSAGE payload=<json_MessageCommand>
 	idx := strings.Index(cmd, "payload=")
@@ -267,6 +269,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 
 	var respAck types.AckResponse
 	var lastMsg *types.Message
+	var lastOffset uint64
 	if ch.Config.EnabledDistribution && ch.Cluster != nil {
 		if !ch.Cluster.IsAuthorized(batch.Topic, batch.Partition) {
 			const maxRetries = 3
@@ -293,7 +296,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 
 		util.Debug("Processing BATCH locally as Partition leader for %s:%d", batch.Topic, batch.Partition)
 
-		t := ch.TopicManager.GetTopic(batch.Topic)
+		t := ch.waitForTopic(batch.Topic)
 		if t == nil {
 			util.Error("Batch process failed: topic '%s' not found", batch.Topic)
 			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
@@ -310,7 +313,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 		}
 
 		effectiveIdempotent := batch.IsIdempotent || ch.Config.EnableIdempotence
-		scope := "global"
+		scope := "partition"
 
 		// 1. Append locally (LEO advances, HWM stays until replication succeeds)
 		if err := p.EnqueueBatchLeader(batch.Messages); err != nil {
@@ -318,7 +321,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 		}
 
 		// Read offsets assigned by EnqueueBatch
-		lastOffset := batch.Messages[len(batch.Messages)-1].Offset
+		lastOffset = batch.Messages[len(batch.Messages)-1].Offset
 
 		// 2. Replicate to followers if acks != 0
 		if acksLower != "0" {
@@ -360,31 +363,46 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 	}
 
 	// stand-alone
-	if acks == "0" {
-		err = ch.TopicManager.PublishBatchAsync(batch.Topic, batch.Messages)
-		if err != nil {
-			return ch.errorResponse(fmt.Sprintf("acks=0 batch publish failed: %v", err)), err
+	{
+		t := ch.waitForTopic(batch.Topic)
+		if t == nil {
+			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
 		}
-		return "OK", nil
-	}
-	err = ch.TopicManager.PublishBatchSync(batch.Topic, batch.Messages)
-	if err != nil {
-		return ch.errorResponse(fmt.Sprintf("acks=1 batch publish failed: %v", err)), err
-	}
+		p, err := t.GetPartition(batch.Partition)
+		if err != nil {
+			return fmt.Sprintf("ERROR: partition_not_found partition=%d", batch.Partition), nil
+		}
 
-	if len(batch.Messages) > 0 {
-		lastMsg = &batch.Messages[len(batch.Messages)-1]
-	} else {
-		return ch.errorResponse("empty batch messages"), nil
-	}
+		if acks == "0" {
+			err = p.EnqueueBatch(batch.Messages)
+			if err != nil {
+				return ch.errorResponse(fmt.Sprintf("acks=0 batch publish failed: %v", err)), err
+			}
+			return "OK", nil
+		}
+		err = p.EnqueueBatchSync(batch.Messages)
+		if err != nil {
+			return ch.errorResponse(fmt.Sprintf("acks=1 batch publish failed: %v", err)), err
+		}
 
-	respAck = types.AckResponse{
-		Status:        "OK",
-		LastOffset:    ch.TopicManager.GetLastOffset(batch.Topic, batch.Partition),
-		SeqStart:      batch.Messages[0].SeqNum,
-		SeqEnd:        lastMsg.SeqNum,
-		ProducerID:    lastMsg.ProducerID,
-		ProducerEpoch: lastMsg.Epoch,
+		if len(batch.Messages) > 0 {
+			lastMsg = &batch.Messages[len(batch.Messages)-1]
+		} else {
+			return ch.errorResponse("empty batch messages"), nil
+		}
+
+		lastOffset = 0
+		if nextOffset := p.NextOffset(); nextOffset > 0 {
+			lastOffset = nextOffset - 1
+		}
+		respAck = types.AckResponse{
+			Status:        "OK",
+			LastOffset:    lastOffset,
+			SeqStart:      batch.Messages[0].SeqNum,
+			SeqEnd:        lastMsg.SeqNum,
+			ProducerID:    lastMsg.ProducerID,
+			ProducerEpoch: lastMsg.Epoch,
+		}
 	}
 
 Respond:

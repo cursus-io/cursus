@@ -5,6 +5,15 @@ import (
 	"os"
 )
 
+func (dh *DiskHandler) GetFirstOffset() uint64 {
+	dh.mu.Lock()
+	defer dh.mu.Unlock()
+
+	if len(dh.segments) == 0 {
+		return dh.CurrentSegment
+	}
+	return dh.segments[0]
+}
 func (dh *DiskHandler) GetLatestOffset() uint64 {
 	dh.mu.Lock()
 	defer dh.mu.Unlock()

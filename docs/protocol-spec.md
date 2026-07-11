@@ -276,14 +276,14 @@ Response: `OK group=<name> member=<actual-id> left=true`
 ```
 HEARTBEAT topic=<name> group=<name> member=<actual-id> [generation=<N>]
 ```
-Response: `OK`
+Response: `OK member=<actual-id> generation=<N>`
 
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
 | topic | Yes | - | Topic name |
 | group | Yes | - | Consumer group name |
 | member | Yes | - | Consumer member ID (with suffix) |
-| generation | No | - | Current generation number (for future validation) |
+| generation | No | - | Current generation number; if supplied, stale generations return ERROR: GEN_MISMATCH ... |
 
 Recommended interval: 3 seconds. Server session timeout: configurable (default ~30s).
 
@@ -337,14 +337,27 @@ used. If the command omits a usable explicit offset in a future protocol
 revision, `autoOffsetReset=earliest` starts at `0` and `autoOffsetReset=latest`
 starts at the partition high-water mark.
 
+`CONSUME` is a stateless partition-leader read, analogous to Kafka `FETCH`. The
+partition leader does not validate consumer group ownership, member liveness, or
+generation on the data path. Ownership and generation fencing are enforced by
+coordinator commands such as `HEARTBEAT`, `COMMIT_OFFSET`, and `BATCH_COMMIT`.
+
 **STREAM** (continuous push)
 ```
 STREAM topic=<name> partition=<N> member=<id> group=<name> [batch=<N>]
 ```
 
-Opens a continuous stream. Server pushes binary batches at ~100ms intervals. Connection stays open until client disconnects.
+Opens a continuous stream. Server pushes binary batches at ~100ms intervals. The connection stays open until the client disconnects, the broker removes the stream, the stream times out, or an unrecoverable stream error occurs. Like `CONSUME`, `STREAM` is a stateless partition-leader data path and does not validate group ownership or generation on every read.
 
-Keepalive: Server sends `[00 00 00 00]` (4 zero bytes as length prefix) when no messages are available.
+Keepalive: Server sends `[00 00 00 00]` (4 zero bytes as length prefix) when no messages are available. Clients MUST treat zero-length frames as keepalive and continue reading.
+
+Control frames: The broker may send UTF-8 text frames with the prefix `STREAM_CONTROL` on the same length-prefixed connection. Clients MUST inspect text control frames before binary batch decoding.
+
+```text
+STREAM_CONTROL type=CLOSE reason=<stopped|removed|timeout|error|offset_out_of_range> offset=<nextOffset>
+```
+
+`type=CLOSE` is a graceful stream terminator. `offset` is the broker's next stream offset at close time. `reason=offset_out_of_range` means the requested stream offset is older than the retained log. Clients SHOULD close the socket, keep or refresh their committed offset, and reconnect or rejoin according to the consumer group lifecycle. A broker crash, process kill, or network failure can still close the TCP connection without a terminator; clients MUST treat raw disconnect as retryable and resume from the broker committed offset.
 
 #### Offset Management
 
@@ -359,7 +372,7 @@ and every partition.
 
 **COMMIT_OFFSET**
 ```
-COMMIT_OFFSET topic=<name> partition=<N> group=<name> offset=<N>
+COMMIT_OFFSET topic=<name> partition=<N> group=<name> offset=<N> [member=<actual-id> generation=<N>]
 ```
 Response: `OK`
 
@@ -380,7 +393,10 @@ Response: `OK batched=<N>`
 > The `P` prefix before partition numbers is required.
 
 Batch commits follow the same monotonic rule as `COMMIT_OFFSET` for each
-included partition.
+included partition. The broker validates `member` and `generation` before applying
+the batch. If any partition is not owned by that member in that generation, the
+entire batch is rejected with `ERROR: NOT_OWNER ...`. Stale generations return
+`ERROR: GEN_MISMATCH ...`, and unknown members return `ERROR: member_not_found ...`.
 
 #### Event Sourcing Commands
 
@@ -551,15 +567,15 @@ Rebalance is triggered when:
 - Partitions are added to the topic
 
 Detection:
-- HEARTBEAT returns `ERROR` or generation changes
-- CONSUME returns ownership validation failure
+- `HEARTBEAT` returns `ERROR: GEN_MISMATCH ...`, `ERROR: member_not_found ...`, or another `ERROR:` response
+- `COMMIT_OFFSET` or `BATCH_COMMIT` returns `ERROR: NOT_OWNER ...`, `ERROR: GEN_MISMATCH ...`, or `ERROR: member_not_found ...`
 
 Client action:
-1. Stop consuming
-2. Commit current offsets
-3. Re-execute JOIN_GROUP → SYNC_GROUP
-4. Resume consuming with new assignments
-
+1. Stop consuming.
+2. Commit already processed offsets only while the member still owns those partitions.
+3. Re-execute `JOIN_GROUP` then `SYNC_GROUP`.
+4. Fetch broker committed offsets for the new assignments.
+5. Resume consuming from those offsets.
 ### Offset Resolution Priority
 
 ```
@@ -569,6 +585,18 @@ Client action:
 4. autoOffsetReset = "earliest" → 0
 ```
 
+### SDK Offset and Group Contract
+
+All SDKs should implement the same consumer group resume behavior:
+
+- After `JOIN_GROUP` and `SYNC_GROUP`, fetch `FETCH_OFFSET` for every assigned partition before consuming.
+- Treat the broker committed offset as the source of truth on reconnect, rejoin, and broker restart. SDK-local offset caches must not override a broker committed offset.
+- Commit only after records have been processed. The committed value is `lastProcessedOffset + 1`.
+- Send `member=<actual-id>` and `generation=<N>` on `COMMIT_OFFSET` when the SDK has group membership state.
+- Send `BATCH_COMMIT` entries as `P<partition>:<nextOffset>` and include `member` plus `generation`.
+- Treat `ERROR: offset_regression ...` as a failed commit; do not update local committed state from it.
+- Treat `ERROR: GEN_MISMATCH ...`, `ERROR: NOT_OWNER ...`, and `ERROR: member_not_found ...` from `HEARTBEAT`, `COMMIT_OFFSET`, or `BATCH_COMMIT` as group membership failures that require stopping consumption and rejoining.
+- On `ERROR: OFFSET_OUT_OF_RANGE ...`, apply the SDK `auto_offset_reset` policy: `earliest` resumes from the broker-reported earliest retained offset, `latest` resumes from the broker-reported latest offset, and `error` fails the consumer instead of silently skipping or replaying data.
 ### Offset Lifecycle and Delivery Guarantees
 
 Consumer group offsets are stored by the broker in the internal
@@ -583,7 +611,7 @@ Recommended client loop:
 1. Fetch or join/sync assignments.
 2. Consume from the broker-selected resume offset.
 3. Process the returned records.
-4. Commit `lastProcessedOffset + 1`.
+4. Commit `lastProcessedOffset + 1` using `COMMIT_OFFSET ... member=<id> generation=<N>` or `BATCH_COMMIT ... P<partition>:<nextOffset>`.
 
 This gives at-least-once delivery when the client commits after processing. If a
 client commits before processing and then crashes, it may skip unprocessed
@@ -625,10 +653,13 @@ ERROR: <code> [key=value ...]
 | `TOPIC_NOT_FOUND <X>` | Topic not found | CREATE topic first |
 | `NOT_AUTHORIZED_FOR_PARTITION <T>:<P>` | Not partition leader | Redirect to correct leader |
 | `NOT_LEADER LEADER_IS <addr>` | Not Raft leader | Reconnect to specified address |
-| `group_not_found: <X>` | Group not registered | JOIN_GROUP or REGISTER_GROUP |
+| `group_not_found group=<X>` | Group not registered | JOIN_GROUP or REGISTER_GROUP |
 | `topic_not_assigned_to_group` | Topic mismatch | Verify group registration |
-| `generation mismatch` | Stale generation | Re-join group |
-| `not partition owner` | Assignment changed | Re-join group |
+| `GEN_MISMATCH current=N requested=N group=<G> member=<M>` | Stale generation | Re-join group |
+| `NOT_OWNER partition=N member=<M> group=<G> generation=N` | Assignment changed | Re-join group |
+| `member_not_found member=<M> group=<G>` | Member is no longer active | Re-join group |
+| `offset_regression reason="..."` | Commit lower than current stored offset | Treat commit as failed; refetch offset |
+| `OFFSET_OUT_OF_RANGE requested=N earliest=N latest=N` | Requested offset is older than retained log or beyond available range | Treat as data loss or reset according to policy |
 | `no_valid_offsets` | BATCH_COMMIT parse failure | Check format: `P<N>:<offset>` |
 | `version_conflict current=N expected=N` | Optimistic concurrency failure | Reload aggregate and retry |
 | `event_sourcing_not_enabled topic=<X>` | ES command on non-ES topic | CREATE topic with `event_sourcing=true` |
@@ -646,7 +677,23 @@ Client should reconnect to the specified address and retry.
 
 ---
 
-## 8. Idempotent Producer
+## 8. Topic Policy Contract
+
+### Authorization
+
+The current wire protocol does not define per-topic ACLs, SASL, or topic-level authorization errors. Deployments should use TLS plus network, service-mesh, or application-level controls for authorization boundaries. `ERROR: NOT_LEADER ...` and `ERROR: NOT_COORDINATOR ...` are routing errors, not authorization decisions.
+
+### Retention
+
+Retention is broker-level today: `log_retention_hours`, `log_retention_bytes`, and `log_retention_check_interval_ms`. The protocol does not expose per-topic retention overrides yet. If a requested or committed consumer offset is older than the earliest retained record, `CONSUME` returns `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>` instead of an empty batch. Clients should treat this as data loss for that group and recover according to application policy, such as alerting, resetting to `earliest`, or rebuilding from another source.
+
+### Partition Keys
+
+When a message key is present, the broker routes with FNV-1a 64-bit hash modulo the topic partition count. The same key maps to the same partition while the partition count is unchanged. Messages without a key use round-robin routing. Increasing partition count can remap future records for an existing key.
+
+---
+
+## 9. Idempotent Producer
 
 ### Enable
 
@@ -667,7 +714,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 
 ---
 
-## 9. SDK Implementation Checklist
+## 10. SDK Implementation Checklist
 
 ### Required
 

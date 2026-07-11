@@ -51,7 +51,7 @@ func (sm *StreamManager) RemoveStream(key string) {
 
 	if stream, ok := sm.streams[key]; ok {
 		delete(sm.streams, key)
-		stream.Stop()
+		stream.StopWithReason(StreamControlReasonRemoved)
 	}
 }
 
@@ -65,12 +65,13 @@ func (sm *StreamManager) monitorConnection(key string, stream *StreamConnection)
 			sm.mu.Lock()
 			delete(sm.streams, key)
 			sm.mu.Unlock()
-			stream.closeConn()
 			return
 		case <-ticker.C:
 			if time.Since(stream.LastActive()) > sm.timeout {
-				sm.RemoveStream(key)
-				stream.closeConn()
+				sm.mu.Lock()
+				delete(sm.streams, key)
+				sm.mu.Unlock()
+				stream.StopWithReason(StreamControlReasonTimeout)
 				return
 			}
 		}
@@ -91,7 +92,7 @@ func (sm *StreamManager) StopStream(key string) {
 		return
 	}
 
-	stream.Stop()
+	stream.StopWithReason(StreamControlReasonStopped)
 }
 
 func (sm *StreamManager) GetStreamsForPartition(topic string, partitionID int) []*StreamConnection {

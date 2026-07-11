@@ -28,6 +28,7 @@ func (m *testMockStorage) ReadMessages(offset uint64, max int) ([]types.Message,
 	return []types.Message{}, nil
 }
 func (m *testMockStorage) GetAbsoluteOffset() uint64               { return 0 }
+func (m *testMockStorage) GetFirstOffset() uint64                  { return 0 }
 func (m *testMockStorage) GetFlushedOffset() uint64                { return 0 }
 func (m *testMockStorage) GetLatestOffset() uint64                 { return 0 }
 func (m *testMockStorage) GetSegmentPath(baseOffset uint64) string { return "" }
@@ -877,7 +878,7 @@ func TestHandleHeartbeat_WithCoordinator(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("HEARTBEAT topic=hb-topic group=hb-g1 member=hb-m1", ctx)
-	assert.Equal(t, "OK", resp)
+	assert.Contains(t, resp, "OK member=")
 }
 
 func TestHandleHeartbeat_InvalidMember(t *testing.T) {
@@ -903,6 +904,53 @@ func TestHandleCommitOffset_WithCoordinator(t *testing.T) {
 	assert.Equal(t, "OK offset=50", resp)
 }
 
+func TestHandleCommitOffset_ValidatesMemberGenerationAndOwnership(t *testing.T) {
+	ch, tm, coord := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopic("commit-validated-topic", 4, false, false))
+	require.NoError(t, coord.RegisterGroup("commit-validated-topic", "commit-validated-g1", 4))
+	_, err := coord.AddConsumer("commit-validated-g1", "commit-m1")
+	require.NoError(t, err)
+	_, err = coord.AddConsumer("commit-validated-g1", "commit-m2")
+	require.NoError(t, err)
+	coord.Rebalance("commit-validated-g1")
+	gen := coord.GetGeneration("commit-validated-g1")
+	ctx := NewClientContext("", 0)
+
+	owned := coord.GetMemberAssignments("commit-validated-g1", "commit-m1")
+	require.NotEmpty(t, owned)
+
+	valid := fmt.Sprintf("COMMIT_OFFSET topic=commit-validated-topic partition=%d group=commit-validated-g1 offset=10 member=commit-m1 generation=%d", owned[0], gen)
+	resp := ch.HandleCommand(valid, ctx)
+	assert.Equal(t, "OK", resp)
+
+	stale := fmt.Sprintf("COMMIT_OFFSET topic=commit-validated-topic partition=%d group=commit-validated-g1 offset=11 member=commit-m1 generation=%d", owned[0], gen+1)
+	resp = ch.HandleCommand(stale, ctx)
+	assert.Contains(t, resp, "GEN_MISMATCH")
+
+	unknown := fmt.Sprintf("COMMIT_OFFSET topic=commit-validated-topic partition=%d group=commit-validated-g1 offset=11 member=ghost generation=%d", owned[0], gen)
+	resp = ch.HandleCommand(unknown, ctx)
+	assert.Contains(t, resp, "member_not_found")
+
+	notOwned := -1
+	for p := 0; p < 4; p++ {
+		ownedByM1 := false
+		for _, assigned := range owned {
+			if assigned == p {
+				ownedByM1 = true
+				break
+			}
+		}
+		if !ownedByM1 {
+			notOwned = p
+			break
+		}
+	}
+	require.NotEqual(t, -1, notOwned)
+
+	notOwner := fmt.Sprintf("COMMIT_OFFSET topic=commit-validated-topic partition=%d group=commit-validated-g1 offset=11 member=commit-m1 generation=%d", notOwned, gen)
+	resp = ch.HandleCommand(notOwner, ctx)
+	assert.Contains(t, resp, "NOT_OWNER")
+}
 func TestHandleLeaveGroup_WithCoordinator(t *testing.T) {
 	ch, tm, coord := newTestHandlerWithCoordinator(t)
 	_ = tm.CreateTopic("leave-topic", 2, false, false)
@@ -961,7 +1009,7 @@ func TestHandleBatchCommit_StaleGeneration(t *testing.T) {
 
 	cmd := "BATCH_COMMIT topic=bc5-topic group=bc5-g1 generation=999 member=bc5-m1 P0:100"
 	resp := ch.HandleCommand(cmd, ctx)
-	assert.Contains(t, resp, "no_valid_offsets")
+	assert.Contains(t, resp, "GEN_MISMATCH")
 }
 
 func TestHandleCreate_WithCoordinatorDefaultGroup(t *testing.T) {

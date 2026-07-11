@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -14,6 +15,8 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
+
+var ErrStreamRejected = errors.New("stream rejected")
 
 // HandleConsumeCommand is responsible for parsing the CONSUME command and streaming messages.
 func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx *ClientContext) (int, error) {
@@ -53,6 +56,9 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 		remainingBatch := cArgs.BatchSize - totalStreamed
 		messages, err := ch.readFromTopic(tName, cArgs, ctx, remainingBatch)
 		if err != nil {
+			if ch.writeConsumeReadError(conn, err) {
+				return totalStreamed, nil
+			}
 			return totalStreamed, err
 		}
 		if len(messages) > 0 {
@@ -71,6 +77,9 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 			for _, tName := range matchedTopics {
 				messages, err := ch.readFromTopic(tName, cArgs, ctx, cArgs.BatchSize)
 				if err != nil {
+					if ch.writeConsumeReadError(conn, err) {
+						return 0, nil
+					}
 					return 0, err
 				}
 				if len(messages) > 0 {
@@ -95,6 +104,18 @@ sendBatch:
 	return totalStreamed, nil
 }
 
+func (ch *CommandHandler) writeConsumeReadError(conn net.Conn, err error) bool {
+	var offsetErr *types.OffsetOutOfRangeError
+	if !errors.As(err, &offsetErr) {
+		return false
+	}
+
+	resp := fmt.Sprintf("ERROR: OFFSET_OUT_OF_RANGE requested=%d earliest=%d latest=%d", offsetErr.Requested, offsetErr.Earliest, offsetErr.Latest)
+	if writeErr := util.WriteWithLength(conn, []byte(resp)); writeErr != nil {
+		util.Error("failed to send offset out-of-range response: %v", writeErr)
+	}
+	return true
+}
 func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx *ClientContext, batchSize int) ([]types.Message, error) {
 	_, p, err := ch.getTopicAndPartition(topicName, cArgs.PartitionID)
 	if err != nil {
@@ -181,13 +202,9 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 
 	if err := ch.checkPartitionLeaderOrRedirect(conn, cArgs.TopicName, cArgs.PartitionID); err != nil {
 		if err.Error() == "not partition leader" {
-			return nil
+			return ErrStreamRejected
 		}
 		return err
-	}
-
-	if !ch.ValidateOwnership(ctx.ConsumerGroup, cArgs.MemberID, cArgs.Generation, cArgs.PartitionID) {
-		return fmt.Errorf("not partition owner or generation mismatch")
 	}
 
 	ctx.Generation = cArgs.Generation
@@ -295,6 +312,10 @@ func (ch *CommandHandler) checkLeaderOrRedirect(conn net.Conn) error {
 }
 
 func (ch *CommandHandler) getTopicAndPartition(topicName string, partitionID int) (*topic.Topic, *topic.Partition, error) {
+	if ch.TopicManager == nil {
+		return nil, nil, fmt.Errorf("topic_manager_not_available")
+	}
+
 	t := ch.TopicManager.GetTopic(topicName)
 	if t == nil {
 		return nil, nil, fmt.Errorf("topic '%s' does not exist", topicName)

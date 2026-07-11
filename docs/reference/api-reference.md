@@ -170,7 +170,7 @@ ERROR: replica_append_failed reason="..."
 CONSUME topic=<name> group=<group> partition=<N> offset=<N> member=<member-id> [batch=<N>]
 ```
 
-`CONSUME` returns binary message frames. For consumer groups, the broker uses the committed offset for `(topic, group, partition)` as the authoritative resume point when one exists; otherwise the earliest offset policy is `0`.
+`CONSUME` returns binary message frames. For consumer groups, the broker uses the committed offset for `(topic, group, partition)` as the authoritative resume point when one exists; otherwise the earliest offset policy is `0`. `CONSUME` is a stateless partition-leader read: ownership, liveness, and generation fencing are enforced by coordinator commands, not on the data path.
 
 Common errors:
 
@@ -183,6 +183,7 @@ ERROR: missing_member command=CONSUME
 ERROR: invalid_partition
 ERROR: invalid_offset
 ERROR: NOT_LEADER LEADER_IS <host:port>
+ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>
 ```
 
 ### STREAM
@@ -192,6 +193,16 @@ Continuous push-mode consume command.
 ```text
 STREAM topic=<name> group=<group> partition=<N> offset=<N> member=<member-id>
 ```
+
+`STREAM` returns one or more length-prefixed frames:
+
+```text
+[binary batch frame]
+[00 00 00 00]                                  # zero-length keepalive
+STREAM_CONTROL type=CLOSE reason=<stopped|removed|timeout|error|offset_out_of_range> offset=<nextOffset>
+```
+
+Clients must treat zero-length frames as keepalive. Like `CONSUME`, `STREAM` is a stateless partition-leader data path and does not validate group ownership or generation on every read. A `STREAM_CONTROL type=CLOSE` frame is a graceful terminator; `reason=offset_out_of_range` means the requested stream offset is older than the retained log. Clients should close the socket and resume through the consumer group offset contract or reset according to policy. Raw TCP disconnect without a close control frame remains possible on broker crash or network failure and should be treated as retryable.
 
 Common errors:
 
@@ -245,7 +256,7 @@ OK member=<assigned-member-id> generation=<N> assignments=<partition-list>
 ### HEARTBEAT
 
 ```text
-HEARTBEAT topic=<name> group=<group> member=<assigned-member-id>
+HEARTBEAT topic=<name> group=<group> member=<assigned-member-id> [generation=<N>]
 ```
 
 Success:
@@ -283,26 +294,29 @@ When no offset has been committed, the broker returns `OK offset=0`.
 ### COMMIT_OFFSET
 
 ```text
-COMMIT_OFFSET topic=<name> group=<group> partition=<N> offset=<nextOffset>
+COMMIT_OFFSET topic=<name> group=<group> partition=<N> offset=<nextOffset> [member=<member-id> generation=<N>]
 ```
 
-The offset is the next offset to read after successful processing. Commits are monotonic per `(topic, group, partition)`: a commit lower than the current offset fails and does not rewind the group.
+The offset is the next offset to read after successful processing. Commits are monotonic per `(topic, group, partition)`: a commit lower than the current offset fails and does not rewind the group. When `member` or `generation` is supplied, both must be present and the member must own the partition in that generation. Legacy clients may omit both fields, but group-aware SDKs should send them.
 
 Success:
 
 ```text
-OK offset=<nextOffset>
+OK
 ```
 
 Common errors:
 
 ```text
 ERROR: invalid_offset
-ERROR: offset_regression current=<N> attempted=<N>
+ERROR: invalid_generation command=COMMIT_OFFSET
+ERROR: offset_regression reason="..."
+ERROR: GEN_MISMATCH current=<N> requested=<N> group=<group> member=<member-id>
+ERROR: NOT_OWNER partition=<N> member=<member-id> group=<group> generation=<N>
+ERROR: member_not_found member=<member-id> group=<group>
 ERROR: offset_manager_not_available
 ERROR: commit_offset_failed reason="..."
 ```
-
 ### BATCH_COMMIT
 
 ```text
@@ -315,14 +329,21 @@ Success:
 OK batched=<N>
 ```
 
+The `P` prefix in each partition entry is required. The broker validates `member` and `generation` before applying the batch and rejects the whole batch if any partition is no longer owned by that member.
+
 Common errors:
 
 ```text
 ERROR: invalid_batch_commit_format
+ERROR: invalid_generation command=BATCH_COMMIT
 ERROR: no_valid_offsets
+ERROR: offset_regression reason="..."
+ERROR: GEN_MISMATCH current=<N> requested=<N> group=<group> member=<member-id>
+ERROR: NOT_OWNER partition=<N> member=<member-id> group=<group> generation=<N>
+ERROR: member_not_found member=<member-id> group=<group>
+ERROR: offset_manager_not_available
 ERROR: bulk_commit_failed reason="..."
 ```
-
 ### GROUP_STATUS
 
 ```text
@@ -481,6 +502,13 @@ Success when no snapshot exists:
 ```text
 OK snapshot=null
 ```
+
+
+## Topic Policy Notes
+
+- Per-topic ACLs are not part of the current broker contract. Use TLS and external network/application controls for authorization boundaries.
+- Retention is broker-level (`log_retention_hours`, `log_retention_bytes`, `log_retention_check_interval_ms`); the wire protocol does not yet expose per-topic retention overrides. Reads before the earliest retained offset fail with `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>`. SDKs should apply `auto_offset_reset` (`earliest`, `latest`, or `error`) to decide whether to reset or fail.
+- Partition keys use FNV-1a 64-bit hash modulo partition count. Same key stays on the same partition while partition count is unchanged; missing keys use round-robin routing. Increasing partition count can remap future records for an existing key.
 
 ## Server-Level Errors
 
