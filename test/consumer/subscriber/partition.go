@@ -189,7 +189,7 @@ func (pc *PartitionConsumer) pollAndProcess() {
 
 			newOffset := lastMsg.Offset + 1
 			atomic.StoreUint64(&pc.fetchOffset, newOffset)
-			util.Debug("Partition [%d] batch: range [%d - %d], count=%d, nextFetch=%d", pc.partitionID, firstMsg.Offset, lastMsg.Offset, len(batch.Messages), lastMsg.Offset+1)
+			util.Info("Partition [%d] batch: range [%d - %d], count=%d, nextFetch=%d", pc.partitionID, firstMsg.Offset, lastMsg.Offset, len(batch.Messages), lastMsg.Offset+1)
 		}
 	case <-c.doneCh:
 		pc.closeDataCh()

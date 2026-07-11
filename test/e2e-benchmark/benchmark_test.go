@@ -313,9 +313,45 @@ func assertBenchmarkSuccess(t *testing.T, logs string, component string) {
 		}
 	}
 
-	t.Logf("%s benchmark completed successfully", component)
+	summary := benchmarkResultSummary(logs)
+	if summary != "" {
+		t.Logf("%s benchmark result:\n%s", component, summary)
+	} else {
+		t.Logf("%s benchmark completed successfully", component)
+	}
 }
 
+func benchmarkResultSummary(logs string) string {
+	wanted := []string{
+		"PRODUCER BENCHMARK SUMMARY",
+		"CONSUMER BENCHMARK SUMMARY",
+		"Partitions",
+		"Total Batches",
+		"Total Messages",
+		"Failed messages",
+		"Retry Count",
+		"Publish elapsed Time",
+		"Publish Message Throughput",
+		"Latency P95",
+		"Latency P99",
+		"Elapsed Time",
+		"Overall TPS",
+		"Duplicate (MessageID)",
+		"Duplicate (Offset)",
+		"Message missing",
+	}
+
+	var out []string
+	for _, line := range strings.Split(logs, "\n") {
+		for _, token := range wanted {
+			if strings.Contains(line, token) {
+				out = append(out, strings.TrimSpace(line))
+				break
+			}
+		}
+	}
+	return strings.Join(out, "\n")
+}
 func benchmarkCounter(logs, label string) (int, bool) {
 	pattern := regexp.MustCompile(fmt.Sprintf(`(?im)%s[[:space:]]*:[[:space:]]*([0-9]+)`, regexp.QuoteMeta(label)))
 	match := pattern.FindStringSubmatch(logs)
