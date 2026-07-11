@@ -72,6 +72,15 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 		}
 	}
 
+	partition := -1
+	if partitionStr, ok := args["partition"]; ok {
+		parsedPartition, parseErr := strconv.Atoi(partitionStr)
+		if parseErr != nil {
+			return fmt.Sprintf("ERROR: invalid_partition reason=%q", parseErr.Error())
+		}
+		partition = parsedPartition
+	}
+
 	var ackResp types.AckResponse
 	t := ch.waitForTopic(topicName)
 	if t == nil {
@@ -89,10 +98,23 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 		Epoch:      epoch,
 	}
 
-	partition := t.GetPartitionForMessage(*msg)
+	if partition < 0 {
+		partition = t.GetPartitionForMessage(*msg)
+	}
+	if _, err := t.GetPartition(partition); err != nil {
+		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
+	}
 
 	if ch.Config.EnabledDistribution && ch.Cluster != nil {
-		if resp, forwarded, _ := ch.isPartitionLeaderAndForward(topicName, partition, cmd); forwarded {
+		forwardCmd := cmd
+		if _, explicitPartition := args["partition"]; !explicitPartition {
+			forwardCmd = fmt.Sprintf("PUBLISH topic=%s acks=%s producerId=%s partition=%d seqNum=%d epoch=%d", topicName, acks, producerID, partition, seqNum, epoch)
+			if _, explicitIdempotent := args["isIdempotent"]; explicitIdempotent {
+				forwardCmd += fmt.Sprintf(" isIdempotent=%t", isIdempotent)
+			}
+			forwardCmd += " message=" + message
+		}
+		if resp, forwarded, _ := ch.isPartitionLeaderAndForward(topicName, partition, forwardCmd); forwarded {
 			return resp
 		}
 
@@ -159,13 +181,13 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 		goto Respond
 	} else { // stand-alone
 		if acks == "0" {
-			err = ch.TopicManager.Publish(topicName, msg)
+			err = ch.TopicManager.PublishToPartition(topicName, partition, msg)
 			if err != nil {
 				util.Error("acks=0 publish failed (stand-alone): %v", err)
 			}
 			return "OK"
 		}
-		err = ch.TopicManager.PublishWithAck(topicName, msg)
+		err = ch.TopicManager.PublishToPartitionWithAck(topicName, partition, msg)
 		if err != nil {
 			return ch.errorResponse(fmt.Sprintf("acks=1 publish failed: %v", err))
 		}

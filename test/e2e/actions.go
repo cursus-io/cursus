@@ -42,15 +42,21 @@ func (a *Actions) PublishMessages() *Actions {
 	a.ctx.t.Logf("Publishing %d messages to topic '%s'...", a.ctx.numMessages, a.ctx.topic)
 
 	a.ctx.publishedSeqNums = make([]uint64, 0, a.ctx.numMessages)
+	a.ctx.publishedMessages = make([]PublishedMessage, 0, a.ctx.numMessages)
 
 	for i := 0; i < a.ctx.numMessages; i++ {
-		a.ctx.seqNum++
+		partition := -1
+		if a.ctx.isIdempotent && a.ctx.partitions > 0 {
+			partition = i % a.ctx.partitions
+		}
+		seqNum := a.ctx.nextSeqNum(partition)
 		payload := fmt.Sprintf("test-message-%d", i)
 
-		err := a.ctx.getClient().PublishIdempotent(
+		err := a.ctx.getClient().PublishIdempotentToPartition(
 			a.ctx.topic,
 			a.ctx.producerID,
-			a.ctx.seqNum,
+			partition,
+			seqNum,
 			a.ctx.producerEpoch,
 			payload,
 			a.ctx.acks,
@@ -63,7 +69,8 @@ func (a *Actions) PublishMessages() *Actions {
 			return a
 		}
 
-		a.ctx.publishedSeqNums = append(a.ctx.publishedSeqNums, a.ctx.seqNum)
+		a.ctx.publishedSeqNums = append(a.ctx.publishedSeqNums, seqNum)
+		a.ctx.publishedMessages = append(a.ctx.publishedMessages, PublishedMessage{Partition: partition, SeqNum: seqNum})
 		a.ctx.publishedCount++
 
 		if a.ctx.publishDelayMS > 0 {
@@ -78,14 +85,15 @@ func (a *Actions) PublishMessages() *Actions {
 func (a *Actions) RetryPublishMessages() *Actions {
 	a.ctx.t.Log("Retrying published messages (idempotence test)...")
 
-	for i := 0; i < len(a.ctx.publishedSeqNums); i++ {
+	for i := 0; i < len(a.ctx.publishedMessages); i++ {
 		payload := fmt.Sprintf("test-message-%d", i)
-		seqNum := a.ctx.publishedSeqNums[i]
+		published := a.ctx.publishedMessages[i]
 
-		err := a.ctx.getClient().PublishIdempotent(
+		err := a.ctx.getClient().PublishIdempotentToPartition(
 			a.ctx.topic,
 			a.ctx.producerID,
-			seqNum,
+			published.Partition,
+			published.SeqNum,
 			a.ctx.producerEpoch,
 			payload,
 			a.ctx.acks,

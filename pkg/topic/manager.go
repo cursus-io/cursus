@@ -145,6 +145,10 @@ func (tm *TopicManager) Publish(topicName string, msg *types.Message) error {
 	return tm.publishInternal(topicName, partition, msg, false)
 }
 
+func (tm *TopicManager) PublishToPartition(topicName string, partition int, msg *types.Message) error {
+	return tm.publishInternal(topicName, partition, msg, false)
+}
+
 // Sync (acks=1)
 func (tm *TopicManager) PublishWithAck(topicName string, msg *types.Message) error {
 	t := tm.GetTopic(topicName)
@@ -153,6 +157,10 @@ func (tm *TopicManager) PublishWithAck(topicName string, msg *types.Message) err
 	}
 
 	partition := t.GetPartitionForMessage(*msg)
+	return tm.publishInternal(topicName, partition, msg, true)
+}
+
+func (tm *TopicManager) PublishToPartitionWithAck(topicName string, partition int, msg *types.Message) error {
 	return tm.publishInternal(topicName, partition, msg, true)
 }
 
@@ -246,7 +254,7 @@ func (tm *TopicManager) PublishBatchAsync(topicName string, messages []types.Mes
 	return tm.processBatchMessages(topicName, messages, true)
 }
 
-func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Message, requireAck bool) error {
+func (tm *TopicManager) publishInternal(topicName string, partition int, msg *types.Message, requireAck bool) error {
 	util.Debug("Starting publish. Topic: %s, RequireAck: %v, ProducerID: %s, SeqNum: %d", topicName, requireAck, msg.ProducerID, msg.SeqNum)
 	start := time.Now()
 
@@ -257,11 +265,11 @@ func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Mess
 	}
 
 	if requireAck {
-		if err := t.PublishSync(*msg); err != nil {
+		if err := t.PublishToPartitionSync(partition, *msg); err != nil {
 			return fmt.Errorf("sync publish failed: %w", err)
 		}
 	} else {
-		if err := t.Publish(*msg); err != nil {
+		if err := t.PublishToPartition(partition, *msg); err != nil {
 			return fmt.Errorf("async publish failed: %w", err)
 		}
 	}

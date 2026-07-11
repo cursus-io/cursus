@@ -19,6 +19,11 @@ var (
 	StandAloneHealthCheckAddr = []string{"http://localhost:10080/health"}
 )
 
+type PublishedMessage struct {
+	Partition int
+	SeqNum    uint64
+}
+
 // TestContext holds all test state and configuration
 type TestContext struct {
 	t              *testing.T
@@ -37,12 +42,14 @@ type TestContext struct {
 	lastError        error
 
 	// Producer state
-	producerID       string
-	producerEpoch    int64
-	seqNum           uint64
-	publishedSeqNums []uint64
-	acks             string
-	isIdempotent     bool
+	producerID        string
+	producerEpoch     int64
+	seqNum            uint64
+	partitionSeqNums  map[int]uint64
+	publishedSeqNums  []uint64
+	publishedMessages []PublishedMessage
+	acks              string
+	isIdempotent      bool
 
 	// Consumer state
 	memberID           string
@@ -58,21 +65,22 @@ type TestContext struct {
 func Given(t *testing.T) *TestContext {
 	uniqueID := uuid.New().String()[:8]
 	return &TestContext{
-		t:              t,
-		brokerAddrs:    defaultBrokerAddrs,
-		topic:          "test-topic",
-		partitions:     1,
-		numMessages:    10,
-		publishDelayMS: 0,
-		startTime:      time.Now(),
-		consumerGroup:  fmt.Sprintf("test-group-%s", uniqueID),
-		memberID:       fmt.Sprintf("e2e-consumer-%s", uniqueID),
-		generation:     0,
-		producerID:     uuid.New().String(),
-		producerEpoch:  time.Now().UnixNano(),
-		seqNum:         0,
-		acks:           "1",
-		client:         nil, // lazily initialized
+		t:                t,
+		brokerAddrs:      defaultBrokerAddrs,
+		topic:            "test-topic",
+		partitions:       1,
+		numMessages:      10,
+		publishDelayMS:   0,
+		startTime:        time.Now(),
+		consumerGroup:    fmt.Sprintf("test-group-%s", uniqueID),
+		memberID:         fmt.Sprintf("e2e-consumer-%s", uniqueID),
+		generation:       0,
+		producerID:       uuid.New().String(),
+		producerEpoch:    time.Now().UnixNano(),
+		seqNum:           0,
+		partitionSeqNums: make(map[int]uint64),
+		acks:             "1",
+		client:           nil, // lazily initialized
 	}
 }
 
@@ -187,6 +195,7 @@ func (ctx *TestContext) GetPublishedCount() int {
 func (ctx *TestContext) ResetPublishedCount() *TestContext {
 	ctx.publishedCount = 0
 	ctx.publishedSeqNums = []uint64{}
+	ctx.publishedMessages = []PublishedMessage{}
 	return ctx
 }
 
@@ -274,6 +283,15 @@ func (ctx *TestContext) WithConsumerGroup(group string) *TestContext {
 func (ctx *TestContext) WithIdempotent(enabled bool) *TestContext {
 	ctx.isIdempotent = enabled
 	return ctx
+}
+
+func (ctx *TestContext) nextSeqNum(partition int) uint64 {
+	if ctx.isIdempotent && partition >= 0 {
+		ctx.partitionSeqNums[partition]++
+		return ctx.partitionSeqNums[partition]
+	}
+	ctx.seqNum++
+	return ctx.seqNum
 }
 
 // When returns Actions for test execution

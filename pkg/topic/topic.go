@@ -167,6 +167,18 @@ func (t *Topic) Publish(msg types.Message) error {
 	return nil
 }
 
+func (t *Topic) PublishToPartition(partition int, msg types.Message) error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if partition < 0 || partition >= len(t.Partitions) {
+		return fmt.Errorf("partition %d out of range for topic '%s' (0-%d)", partition, t.Name, len(t.Partitions)-1)
+	}
+
+	t.Partitions[partition].Enqueue(msg)
+	return nil
+}
+
 // PublishSync sends a message synchronously to one partition.
 // Partition selection and enqueue happen under a single RLock to prevent
 // TOCTOU races with AddPartitions.
@@ -180,6 +192,17 @@ func (t *Topic) PublishSync(msg types.Message) error {
 	}
 
 	return t.Partitions[idx].EnqueueSync(msg)
+}
+
+func (t *Topic) PublishToPartitionSync(partition int, msg types.Message) error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if partition < 0 || partition >= len(t.Partitions) {
+		return fmt.Errorf("partition %d out of range for topic '%s' (0-%d)", partition, t.Name, len(t.Partitions)-1)
+	}
+
+	return t.Partitions[partition].EnqueueSync(msg)
 }
 
 // PublishBatchSync sends a batch of messages synchronously, grouping by partition.

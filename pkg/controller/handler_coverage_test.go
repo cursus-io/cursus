@@ -1309,3 +1309,32 @@ func TestTopicPolicy_RoundRobinIgnoresMessageKey(t *testing.T) {
 	second := tObj.GetPartitionForMessage(msg)
 	assert.NotEqual(t, first, second)
 }
+
+func TestHandlePublish_IdempotentExplicitPartitionUsesPartitionSequences(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	require.NoError(t, tm.CreateTopic("idem-explicit-partition", 2, true, false))
+	ctx := NewClientContext("", 0)
+
+	commands := []string{
+		"PUBLISH topic=idem-explicit-partition partition=0 acks=1 producerId=p1 isIdempotent=true seqNum=1 epoch=1 message=p0-1",
+		"PUBLISH topic=idem-explicit-partition partition=1 acks=1 producerId=p1 isIdempotent=true seqNum=1 epoch=1 message=p1-1",
+		"PUBLISH topic=idem-explicit-partition partition=0 acks=1 producerId=p1 isIdempotent=true seqNum=2 epoch=1 message=p0-2",
+		"PUBLISH topic=idem-explicit-partition partition=1 acks=1 producerId=p1 isIdempotent=true seqNum=2 epoch=1 message=p1-2",
+	}
+
+	for _, cmd := range commands {
+		resp := ch.HandleCommand(cmd, ctx)
+		var ack types.AckResponse
+		require.NoError(t, json.Unmarshal([]byte(resp), &ack), resp)
+		assert.Equal(t, "OK", ack.Status)
+	}
+}
+
+func TestHandlePublish_InvalidExplicitPartition(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	require.NoError(t, tm.CreateTopic("invalid-publish-partition", 1, false, false))
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("PUBLISH topic=invalid-publish-partition partition=99 acks=1 producerId=p1 message=bad", ctx)
+	assert.Contains(t, resp, "partition_not_found")
+}

@@ -186,7 +186,7 @@ Response (JSON):
 
 **PUBLISH**
 ```
-PUBLISH topic=<name> acks=<0|1|-1|all> producerId=<id> message=<text> [seqNum=<N>] [epoch=<N>] [isIdempotent=<true|false>]
+PUBLISH topic=<name> acks=<0|1|-1|all> producerId=<id> [partition=<N>] [seqNum=<N>] [epoch=<N>] [isIdempotent=<true|false>] message=<text>
 ```
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
@@ -194,9 +194,12 @@ PUBLISH topic=<name> acks=<0|1|-1|all> producerId=<id> message=<text> [seqNum=<N
 | acks | No | 1 | Durability level |
 | producerId | Yes | - | Unique producer ID |
 | message | Yes | - | Message payload (captures rest of line) |
+| partition | No | round-robin/key policy | Explicit target partition for text PUBLISH. Idempotent producers should use per-partition sequence numbers. |
 | seqNum | No | 0 | Sequence number (for idempotent mode) |
 | epoch | No | 0 | Producer epoch |
 | isIdempotent | No | false | Enable dedup for this message |
+
+Because `message=` captures the rest of the line, optional parameters such as `partition`, `seqNum`, `epoch`, and `isIdempotent` must appear before `message=` in text commands.
 
 Response (JSON — `AckResponse`):
 ```json
@@ -707,7 +710,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 ### Requirements
 
 - Each idempotent message must have a unique `(producerId, epoch, seqNum)` tuple within a partition
-- `seqNum` must be monotonically increasing within the current producer epoch
+- `seqNum` must be monotonically increasing within the current producer epoch for each partition
 - A new `(producerId, epoch)` sequence starts at `seqNum=1`; starting above 1 is rejected as a gap
 - A higher `epoch` fences the previous producer session and may restart `seqNum` from 1
 - A lower `epoch` is rejected as stale producer state

@@ -121,10 +121,12 @@ OK commands=<comma-separated-command-names>
 ### PUBLISH
 
 ```text
-PUBLISH topic=<name> message=<payload> [key=<routing-key>] [producer_id=<id>] [seq_num=<N>] [epoch=<N>] [is_idempotent=<bool>] [acks=0|1|all]
+PUBLISH topic=<name> [partition=<N>] [key=<routing-key>] [producerId=<id>] [seqNum=<N>] [epoch=<N>] [isIdempotent=<bool>] [acks=0|1|all] message=<payload>
 ```
 
-For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Distributed FSM snapshots that include producer epochs use snapshot version 3; avoid mixed-version rolling upgrades with binaries that cannot decode that snapshot state. For `acks=0`, success is:
+Because `message=` captures the rest of the line, put optional parameters before `message=`.
+
+For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Distributed FSM snapshots that include producer epochs use snapshot version 3; avoid mixed-version rolling upgrades with binaries that cannot decode that snapshot state. For `acks=0`, success is:
 
 ```text
 OK
