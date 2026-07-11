@@ -117,9 +117,12 @@ func (ch *CommandHandler) writeConsumeReadError(conn net.Conn, err error) bool {
 	return true
 }
 func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx *ClientContext, batchSize int) ([]types.Message, error) {
-	_, p, err := ch.getTopicAndPartition(topicName, cArgs.PartitionID)
+	t, p, err := ch.getTopicAndPartition(topicName, cArgs.PartitionID)
 	if err != nil {
 		return nil, err
+	}
+	if !t.Policy.CanRead() {
+		return nil, fmt.Errorf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=read", topicName)
 	}
 
 	cacheKey := fmt.Sprintf("%s-%d", topicName, cArgs.PartitionID)
@@ -213,6 +216,9 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	t, p, err := ch.getTopicAndPartition(cArgs.TopicName, cArgs.PartitionID)
 	if err != nil {
 		return err
+	}
+	if !t.Policy.CanRead() {
+		return fmt.Errorf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=read", cArgs.TopicName)
 	}
 
 	actualOffset, err := ch.resolveOffset(p, cArgs.TopicName, cArgs)

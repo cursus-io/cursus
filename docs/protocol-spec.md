@@ -127,16 +127,20 @@ Text command responses are machine-readable.
 
 **CREATE**
 ```
-CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [replication_factor=<N>]
+CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [replication_factor=<N>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read>]
 ```
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
 | topic | Yes | - | Topic name |
 | partitions | No | 4 | Number of partitions |
 | idempotent | No | false | Enable producer dedup |
+| retention_hours | No | 0 | Per-topic retention hours override metadata; 0 means broker default |
+| retention_bytes | No | 0 | Per-topic retention bytes override metadata; 0 means broker default |
+| partitioner | No | hash_key | `hash_key` uses message key hash, `round_robin` ignores keys |
+| auth_policy | No | open | `open`, `deny_write`, or `deny_read` topic policy |
 | replication_factor | No | 3 | Replica count (distributed mode) |
 
-Response: `OK topic=<name> partitions=<N>`
+Response: `OK topic=<name> partitions=<N> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read> retention_hours=<N> retention_bytes=<N>`
 
 **DELETE**
 ```
@@ -681,15 +685,15 @@ Client should reconnect to the specified address and retry.
 
 ### Authorization
 
-The current wire protocol does not define per-topic ACLs, SASL, or topic-level authorization errors. Deployments should use TLS plus network, service-mesh, or application-level controls for authorization boundaries. `ERROR: NOT_LEADER ...` and `ERROR: NOT_COORDINATOR ...` are routing errors, not authorization decisions.
+The wire protocol now exposes a minimal per-topic `auth_policy` metadata contract: `open`, `deny_write`, and `deny_read`. `deny_write` rejects `PUBLISH`/batch publish with `ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=<T> operation=write`; `deny_read` rejects `CONSUME`/`STREAM` with `ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=<T> operation=read`. This is not SASL or identity-aware ACL yet; deployments should still use TLS plus network, service-mesh, or application-level controls for caller authentication.
 
 ### Retention
 
-Retention is broker-level today: `log_retention_hours`, `log_retention_bytes`, and `log_retention_check_interval_ms`. The protocol does not expose per-topic retention overrides yet. If a requested or committed consumer offset is older than the earliest retained record, `CONSUME` returns `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>` instead of an empty batch. Clients should treat this as data loss for that group and recover according to application policy, such as alerting, resetting to `earliest`, or rebuilding from another source.
+Topics store `retention_hours` and `retention_bytes` policy metadata. A value of `0` means the broker-level default applies. Enforcement is still performed by the broker storage/retention loop, and retention-gap reads return `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>` instead of an empty batch. Clients should treat this as data loss for that group and recover according to application policy, such as alerting, resetting to `earliest`, or rebuilding from another source.
 
 ### Partition Keys
 
-When a message key is present, the broker routes with FNV-1a 64-bit hash modulo the topic partition count. The same key maps to the same partition while the partition count is unchanged. Messages without a key use round-robin routing. Increasing partition count can remap future records for an existing key.
+`partitioner=hash_key` routes keyed messages with FNV-1a 64-bit hash modulo the topic partition count and routes unkeyed messages round-robin. `partitioner=round_robin` ignores message keys and routes every publish by round-robin. Increasing partition count can remap future records for an existing key.
 
 ---
 

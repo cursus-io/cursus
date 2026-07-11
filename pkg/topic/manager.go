@@ -58,6 +58,15 @@ func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *
 }
 
 func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent bool, eventSourcing bool) error {
+	return tm.CreateTopicWithPolicy(name, partitionCount, idempotent, eventSourcing, DefaultPolicy())
+}
+
+func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, idempotent bool, eventSourcing bool, policy Policy) error {
+	normalizedPolicy, err := policy.Normalize()
+	if err != nil {
+		return err
+	}
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -71,15 +80,17 @@ func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent 
 			if err := existing.AddPartitions(partitionCount-current, tm.hp); err != nil {
 				return fmt.Errorf("failed to add partitions to topic '%s': %w", name, err)
 			}
+			existing.Policy = normalizedPolicy
 			util.Info("topic '%s' partitions increased: %d -> %d", name, current, len(existing.Partitions))
 			return nil
 		default:
+			existing.Policy = normalizedPolicy
 			util.Info("topic '%s' already exists with %d partitions", name, current)
 			return nil
 		}
 	}
 
-	t, err := NewTopic(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager, idempotent, eventSourcing)
+	t, err := NewTopicWithPolicy(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager, idempotent, eventSourcing, normalizedPolicy)
 	if err != nil {
 		util.Error("failed to create topic '%s': %v", name, err)
 		return fmt.Errorf("failed to create topic '%s': %w", name, err)

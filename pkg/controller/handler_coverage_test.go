@@ -1230,3 +1230,82 @@ func TestHandleReplicateSnapshot_SavesFollowerSnapshot(t *testing.T) {
 	assert.Contains(t, resp, `"version":2`)
 	assert.Contains(t, resp, `state`)
 }
+
+func TestHandleCreate_TopicPolicy(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("CREATE topic=policy-topic partitions=2 retention_hours=24 retention_bytes=4096 partitioner=round_robin auth_policy=open", ctx)
+	assert.Contains(t, resp, "partitioner=round_robin")
+	assert.Contains(t, resp, "retention_hours=24")
+
+	tObj := tm.GetTopic("policy-topic")
+	require.NotNil(t, tObj)
+	assert.Equal(t, topic.PartitionerRoundRobin, tObj.Policy.Partitioner)
+	assert.Equal(t, 24, tObj.Policy.RetentionHours)
+	assert.Equal(t, int64(4096), tObj.Policy.RetentionBytes)
+
+	metaResp := ch.HandleCommand("METADATA topic=policy-topic", ctx)
+	assert.Contains(t, metaResp, "partitioner=round_robin")
+	assert.Contains(t, metaResp, "retention_bytes=4096")
+}
+
+func TestHandleCreate_InvalidTopicPolicy(t *testing.T) {
+	ch, _ := newTestHandler(t)
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("CREATE topic=bad-policy partitioner=random", ctx)
+	assert.Contains(t, resp, "invalid_topic_policy")
+
+	resp = ch.HandleCommand("CREATE topic=bad-retention retention_hours=-1", ctx)
+	assert.Contains(t, resp, "invalid_topic_policy")
+}
+
+func TestHandleCreate_ShrinkDoesNotUpdateTopicPolicy(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("CREATE topic=stable-policy partitions=2 auth_policy=open", ctx)
+	assert.Contains(t, resp, "auth_policy=open")
+
+	resp = ch.HandleCommand("CREATE topic=stable-policy partitions=1 auth_policy=deny_write", ctx)
+	assert.Contains(t, resp, "create_topic_failed")
+
+	tObj := tm.GetTopic("stable-policy")
+	require.NotNil(t, tObj)
+	assert.Equal(t, topic.AuthPolicyOpen, tObj.Policy.AuthPolicy)
+}
+func TestHandlePublish_DenyWriteTopicPolicy(t *testing.T) {
+	ch, _ := newTestHandler(t)
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("CREATE topic=deny-write partitions=1 auth_policy=deny_write", ctx)
+	assert.Contains(t, resp, "auth_policy=deny_write")
+
+	resp = ch.HandleCommand("PUBLISH topic=deny-write acks=1 producerId=p1 message=blocked", ctx)
+	assert.Contains(t, resp, "NOT_AUTHORIZED_FOR_TOPIC")
+	assert.Contains(t, resp, "operation=write")
+}
+
+func TestReadFromTopic_DenyReadTopicPolicy(t *testing.T) {
+	ch, tm, _ := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopicWithPolicy("deny-read", 1, false, false, topic.Policy{AuthPolicy: topic.AuthPolicyDenyRead}))
+
+	ctx := NewClientContext("", 0)
+	cArgs := CommonArgs{TopicName: "deny-read", PartitionID: 0, GroupName: "g1", HasOffset: true, Offset: 0}
+	_, err := ch.readFromTopic("deny-read", cArgs, ctx, 10)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "NOT_AUTHORIZED_FOR_TOPIC")
+}
+
+func TestTopicPolicy_RoundRobinIgnoresMessageKey(t *testing.T) {
+	_, tm := newTestHandler(t)
+	require.NoError(t, tm.CreateTopicWithPolicy("rr-topic", 2, false, false, topic.Policy{Partitioner: topic.PartitionerRoundRobin}))
+	tObj := tm.GetTopic("rr-topic")
+	require.NotNil(t, tObj)
+
+	msg := types.Message{Key: "same-key", ProducerID: "p1"}
+	first := tObj.GetPartitionForMessage(msg)
+	second := tObj.GetPartitionForMessage(msg)
+	assert.NotEqual(t, first, second)
+}

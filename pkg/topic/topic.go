@@ -16,19 +16,29 @@ const DefaultConsumerBufSize = 1000
 
 // Topic represents a logical message stream divided into partitions and consumer groups.
 type Topic struct {
-	Name           string
-	Partitions     []*Partition
-	counter        uint64
-	consumerGroups map[string]*types.ConsumerGroup
-	mu             sync.RWMutex
-	cfg            *config.Config
-	streamManager    StreamManager
-	IsIdempotent     bool
-	IsEventSourcing  bool
+	Name            string
+	Partitions      []*Partition
+	counter         uint64
+	consumerGroups  map[string]*types.ConsumerGroup
+	mu              sync.RWMutex
+	cfg             *config.Config
+	streamManager   StreamManager
+	IsIdempotent    bool
+	IsEventSourcing bool
+	Policy          Policy
 }
 
 // NewTopic initializes a topic with partitions.
 func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager, idempotent bool, eventSourcing bool) (*Topic, error) {
+	return NewTopicWithPolicy(name, partitionCount, hp, cfg, sm, idempotent, eventSourcing, DefaultPolicy())
+}
+
+func NewTopicWithPolicy(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager, idempotent bool, eventSourcing bool, policy Policy) (*Topic, error) {
+	normalizedPolicy, err := policy.Normalize()
+	if err != nil {
+		return nil, err
+	}
+
 	partitions := make([]*Partition, partitionCount)
 	for i := 0; i < partitionCount; i++ {
 		dh, err := hp.GetHandler(name, i)
@@ -43,13 +53,14 @@ func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.C
 		partitions[i] = p
 	}
 	return &Topic{
-		Name:           name,
-		Partitions:     partitions,
-		consumerGroups: make(map[string]*types.ConsumerGroup),
+		Name:            name,
+		Partitions:      partitions,
+		consumerGroups:  make(map[string]*types.ConsumerGroup),
 		cfg:             cfg,
 		streamManager:   sm,
 		IsIdempotent:    idempotent,
 		IsEventSourcing: eventSourcing,
+		Policy:          normalizedPolicy,
 	}, nil
 }
 
@@ -60,7 +71,7 @@ func (t *Topic) getPartitionIndex(msg types.Message, partitionsLen int) int {
 		return -1
 	}
 
-	if msg.Key != "" {
+	if t.Policy.Partitioner == PartitionerHashKey && msg.Key != "" {
 		keyID := util.GenerateID(msg.Key)
 		return int(keyID % uint64(partitionsLen))
 	}

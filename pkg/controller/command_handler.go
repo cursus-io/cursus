@@ -61,6 +61,11 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 		eventSourcing = strings.ToLower(esStr) == "true"
 	}
 
+	policy, policyErr := parseTopicPolicy(args)
+	if policyErr != "" {
+		return policyErr
+	}
+
 	replicationFactor := ch.Config.DefaultReplicationFactor
 	if rfStr, ok := args["replication_factor"]; ok {
 		n, err := strconv.Atoi(rfStr)
@@ -82,13 +87,14 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			"idempotent":         idempotent,
 			"event_sourcing":     eventSourcing,
 			"replication_factor": replicationFactor,
+			"policy":             policy,
 		}
 		_, err := ch.applyAndWait("TOPIC", payload)
 		if err != nil {
 			return fmt.Sprintf("ERROR: create_topic_failed reason=%q", err.Error())
 		}
 	} else {
-		if err := tm.CreateTopic(topicName, partitions, idempotent, eventSourcing); err != nil {
+		if err := tm.CreateTopicWithPolicy(topicName, partitions, idempotent, eventSourcing, policy); err != nil {
 			return fmt.Sprintf("ERROR: create_topic_failed topic=%s reason=%q", topicName, err.Error())
 		}
 	}
@@ -104,7 +110,36 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			util.Warn("Failed to register default group with coordinator: %v", err)
 		}
 	}
-	return fmt.Sprintf("OK topic=%s partitions=%d", topicName, len(t.Partitions))
+	return fmt.Sprintf("OK topic=%s partitions=%d partitioner=%s auth_policy=%s retention_hours=%d retention_bytes=%d", topicName, len(t.Partitions), t.Policy.Partitioner, t.Policy.AuthPolicy, t.Policy.RetentionHours, t.Policy.RetentionBytes)
+}
+
+func parseTopicPolicy(args map[string]string) (topic.Policy, string) {
+	policy := topic.DefaultPolicy()
+	if v := args["retention_hours"]; v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil {
+			return policy, fmt.Sprintf("ERROR: invalid_retention_hours value=%s", v)
+		}
+		policy.RetentionHours = parsed
+	}
+	if v := args["retention_bytes"]; v != "" {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return policy, fmt.Sprintf("ERROR: invalid_retention_bytes value=%s", v)
+		}
+		policy.RetentionBytes = parsed
+	}
+	if v := args["partitioner"]; v != "" {
+		policy.Partitioner = v
+	}
+	if v := args["auth_policy"]; v != "" {
+		policy.AuthPolicy = v
+	}
+	policy, err := policy.Normalize()
+	if err != nil {
+		return policy, fmt.Sprintf("ERROR: invalid_topic_policy reason=%q", err.Error())
+	}
+	return policy, ""
 }
 
 // handleDelete processes DELETE command
@@ -837,11 +872,13 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 		Status     string              `json:"status"`
 		Topic      string              `json:"topic"`
 		Partitions []PartitionMetadata `json:"partitions"`
+		Policy     topic.Policy        `json:"policy"`
 	}
 
 	meta := TopicMetadata{
 		Status: "OK",
 		Topic:  topicName,
+		Policy: t.Policy,
 	}
 
 	var raftLeader string
@@ -916,8 +953,8 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 		}
 	}
 
-	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s",
-		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","))
+	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s partitioner=%s auth_policy=%s retention_hours=%d retention_bytes=%d",
+		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), t.Policy.Partitioner, t.Policy.AuthPolicy, t.Policy.RetentionHours, t.Policy.RetentionBytes)
 }
 
 func (ch *CommandHandler) handleFindCoordinator(cmd string) string {

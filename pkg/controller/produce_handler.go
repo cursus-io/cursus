@@ -78,6 +78,9 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 		util.Warn("ch publish: topic '%s' does not exist after retries", topicName)
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
+	if !t.Policy.CanWrite() {
+		return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", topicName)
+	}
 
 	msg := &types.Message{
 		Payload:    message,
@@ -301,6 +304,9 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 			util.Error("Batch process failed: topic '%s' not found", batch.Topic)
 			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
 		}
+		if !t.Policy.CanWrite() {
+			return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", batch.Topic), nil
+		}
 
 		p, err := t.GetPartition(batch.Partition)
 		if err != nil {
@@ -367,6 +373,9 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 		t := ch.waitForTopic(batch.Topic)
 		if t == nil {
 			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
+		}
+		if !t.Policy.CanWrite() {
+			return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", batch.Topic), nil
 		}
 		p, err := t.GetPartition(batch.Partition)
 		if err != nil {

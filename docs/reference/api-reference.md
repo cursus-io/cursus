@@ -30,7 +30,7 @@ Legacy natural-language responses such as `Topic '<name>' now has <N> partitions
 ### CREATE
 
 ```text
-CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>]
+CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read>]
 ```
 
 Creates a topic or increases its partition count when the topic already exists.
@@ -506,9 +506,9 @@ OK snapshot=null
 
 ## Topic Policy Notes
 
-- Per-topic ACLs are not part of the current broker contract. Use TLS and external network/application controls for authorization boundaries.
-- Retention is broker-level (`log_retention_hours`, `log_retention_bytes`, `log_retention_check_interval_ms`); the wire protocol does not yet expose per-topic retention overrides. Reads before the earliest retained offset fail with `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>`. SDKs should apply `auto_offset_reset` (`earliest`, `latest`, or `error`) to decide whether to reset or fail.
-- Partition keys use FNV-1a 64-bit hash modulo partition count. Same key stays on the same partition while partition count is unchanged; missing keys use round-robin routing. Increasing partition count can remap future records for an existing key.
+- Minimal per-topic authorization policy is part of topic metadata: `auth_policy=open|deny_write|deny_read`. It rejects unauthorized topic reads/writes with `ERROR: NOT_AUTHORIZED_FOR_TOPIC ...`, but it is not caller identity-aware ACL/SASL yet. Use TLS and external network/application controls for authentication boundaries.
+- Topics expose `retention_hours` and `retention_bytes` policy metadata. `0` means broker default. Reads before the earliest retained offset fail with `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>`. SDKs should apply `auto_offset_reset` (`earliest`, `latest`, or `error`) to decide whether to reset or fail.
+- `partitioner=hash_key` uses FNV-1a 64-bit hash modulo partition count for keyed messages and round-robin for missing keys. `partitioner=round_robin` ignores keys. Increasing partition count can remap future records for an existing key.
 
 ## Server-Level Errors
 
