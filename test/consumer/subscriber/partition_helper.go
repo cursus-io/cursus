@@ -2,7 +2,9 @@ package subscriber
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
@@ -60,6 +62,146 @@ func (pc *PartitionConsumer) ensureConnection() error {
 	return fmt.Errorf("failed to connect after retries: %w", err)
 }
 
+type offsetOutOfRangeFrame struct {
+	Requested uint64
+	Earliest  uint64
+	Latest    uint64
+}
+
+func parseOffsetOutOfRangeFrame(respStr string) (offsetOutOfRangeFrame, bool) {
+	if !strings.Contains(respStr, "OFFSET_OUT_OF_RANGE") {
+		return offsetOutOfRangeFrame{}, false
+	}
+	frame := offsetOutOfRangeFrame{}
+	hasEarliest := false
+	hasLatest := false
+	for _, field := range strings.Fields(respStr) {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			continue
+		}
+		switch key {
+		case "requested":
+			frame.Requested = parsed
+		case "earliest":
+			frame.Earliest = parsed
+			hasEarliest = true
+		case "latest":
+			frame.Latest = parsed
+			hasLatest = true
+		}
+	}
+	return frame, hasEarliest && hasLatest
+}
+
+type streamControlFrame struct {
+	Type           string
+	Reason         string
+	Offset         uint64
+	HasOffset      bool
+	Requested      uint64
+	Earliest       uint64
+	Latest         uint64
+	HasOffsetRange bool
+}
+
+func parseStreamControlFrame(data []byte) (streamControlFrame, bool) {
+	respStr := string(data)
+	if !strings.HasPrefix(respStr, "STREAM_CONTROL") {
+		return streamControlFrame{}, false
+	}
+
+	frame := streamControlFrame{}
+	for _, field := range strings.Fields(respStr) {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "type":
+			frame.Type = value
+		case "reason":
+			frame.Reason = value
+		case "offset":
+			offset, err := strconv.ParseUint(value, 10, 64)
+			if err == nil {
+				frame.Offset = offset
+				frame.HasOffset = true
+			}
+		case "requested":
+			if parsed, err := strconv.ParseUint(value, 10, 64); err == nil {
+				frame.Requested = parsed
+			}
+		case "earliest":
+			if parsed, err := strconv.ParseUint(value, 10, 64); err == nil {
+				frame.Earliest = parsed
+				frame.HasOffsetRange = true
+			}
+		case "latest":
+			if parsed, err := strconv.ParseUint(value, 10, 64); err == nil {
+				frame.Latest = parsed
+			}
+		}
+	}
+	return frame, true
+}
+
+func (pc *PartitionConsumer) handleOffsetOutOfRange(frame offsetOutOfRangeFrame) bool {
+	policy := strings.ToLower(pc.consumer.config.AutoOffsetReset)
+	if policy == "" {
+		policy = "earliest"
+	}
+
+	var next uint64
+	switch policy {
+	case "earliest":
+		next = frame.Earliest
+	case "latest":
+		next = frame.Latest
+	case "error":
+		util.Error("Partition [%d] offset out of range requested=%d earliest=%d latest=%d", pc.partitionID, frame.Requested, frame.Earliest, frame.Latest)
+		pc.consumer.mainCancel()
+		pc.closeConnection()
+		return true
+	default:
+		util.Warn("Partition [%d] unknown auto_offset_reset=%q, defaulting to earliest", pc.partitionID, policy)
+		next = frame.Earliest
+	}
+
+	atomic.StoreUint64(&pc.fetchOffset, next)
+	pc.consumer.mu.Lock()
+	pc.consumer.offsets[pc.partitionID] = next
+	pc.consumer.mu.Unlock()
+	util.Warn("Partition [%d] offset out of range requested=%d earliest=%d latest=%d; reset fetch offset to %d (%s)", pc.partitionID, frame.Requested, frame.Earliest, frame.Latest, next, policy)
+	pc.closeConnection()
+	return true
+}
+func (pc *PartitionConsumer) handleStreamControl(data []byte) bool {
+	frame, ok := parseStreamControlFrame(data)
+	if !ok {
+		return false
+	}
+
+	switch frame.Type {
+	case "CLOSE":
+		if frame.Reason == "offset_out_of_range" && frame.HasOffsetRange {
+			return pc.handleOffsetOutOfRange(offsetOutOfRangeFrame{Requested: frame.Requested, Earliest: frame.Earliest, Latest: frame.Latest})
+		}
+		if frame.HasOffset {
+			atomic.StoreUint64(&pc.fetchOffset, frame.Offset)
+		}
+		util.Info("Partition [%d] stream closed by broker reason=%s offset=%d", pc.partitionID, frame.Reason, frame.Offset)
+		pc.closeConnection()
+		return true
+	default:
+		util.Warn("Partition [%d] unknown stream control frame: %s", pc.partitionID, string(data))
+		return true
+	}
+}
 func (pc *PartitionConsumer) handleBrokerError(data []byte) bool {
 	respStr := string(data)
 	if !strings.HasPrefix(respStr, "ERROR:") {
@@ -68,11 +210,15 @@ func (pc *PartitionConsumer) handleBrokerError(data []byte) bool {
 
 	util.Warn("Partition [%d] broker error: %s", pc.partitionID, respStr)
 
+	if frame, ok := parseOffsetOutOfRangeFrame(respStr); ok {
+		return pc.handleOffsetOutOfRange(frame)
+	}
+
 	if strings.Contains(respStr, "NOT_LEADER") {
 		pc.consumer.handleLeaderRedirection(respStr)
 	}
 
-	if strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "REBALANCE_REQUIRED") {
+	if strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "REBALANCE_REQUIRED") || strings.Contains(respStr, "NOT_OWNER") {
 		pc.close()
 		pc.consumer.handleRebalanceSignal()
 		return true

@@ -1,4 +1,5 @@
 package sdk
+
 import (
 	"encoding/json"
 	"os"
@@ -81,6 +82,14 @@ const (
 	ModeStreaming ConsumerMode = "streaming"
 )
 
+type AutoOffsetResetPolicy string
+
+const (
+	AutoOffsetResetEarliest AutoOffsetResetPolicy = "earliest"
+	AutoOffsetResetLatest   AutoOffsetResetPolicy = "latest"
+	AutoOffsetResetError    AutoOffsetResetPolicy = "error"
+)
+
 type ConsumerConfig struct {
 	BrokerAddrs        []string `yaml:"broker_addrs" json:"broker_addrs"`
 	CurrentBrokerIndex int      `yaml:"-" json:"-"`
@@ -96,9 +105,10 @@ type ConsumerConfig struct {
 
 	WorkerChannelSize int `yaml:"worker_channel_size" json:"worker_channel_size"`
 
-	PollInterval  time.Duration `yaml:"poll_interval" json:"poll_interval"`
-	PollTimeoutMS int           `yaml:"poll_timeout_ms" json:"poll_timeout_ms"`
-	BatchSize     int           `yaml:"batch_size" json:"batch_size"`
+	PollInterval    time.Duration         `yaml:"poll_interval" json:"poll_interval"`
+	PollTimeoutMS   int                   `yaml:"poll_timeout_ms" json:"poll_timeout_ms"`
+	BatchSize       int                   `yaml:"batch_size" json:"batch_size"`
+	AutoOffsetReset AutoOffsetResetPolicy `yaml:"auto_offset_reset" json:"auto_offset_reset"`
 
 	SessionTimeoutMS         int `yaml:"session_timeout_ms" json:"session_timeout_ms"`
 	MaxPollRecords           int `yaml:"max_poll_records" json:"max_poll_records"`
@@ -142,6 +152,7 @@ func NewDefaultConsumerConfig() *ConsumerConfig {
 		PollInterval:             500 * time.Millisecond,
 		PollTimeoutMS:            30000,
 		BatchSize:                100,
+		AutoOffsetReset:          AutoOffsetResetEarliest,
 		MaxPollRecords:           500,
 		EnableAutoCommit:         true,
 		AutoCommitInterval:       5 * time.Second,

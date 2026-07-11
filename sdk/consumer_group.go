@@ -43,7 +43,7 @@ func (c *Consumer) heartbeatLoop() {
 			}
 
 			respStr := string(resp)
-			if strings.Contains(respStr, "REBALANCE_REQUIRED") || strings.Contains(respStr, "GEN_MISMATCH") {
+			if strings.Contains(respStr, "REBALANCE_REQUIRED") || strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "NOT_OWNER") || strings.Contains(respStr, "member_not_found") {
 				LogWarn("Heartbeat: rebalance triggered: %s", respStr)
 				select {
 				case c.rebalanceSig <- struct{}{}:

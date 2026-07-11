@@ -160,7 +160,7 @@ func (pc *PartitionConsumer) pollAndProcess() {
 
 	util.Debug("Partition [%d] pollAndProcess: received %d bytes", pc.partitionID, len(batchData))
 
-	if pc.handleBrokerError(batchData) || len(batchData) == 0 {
+	if pc.handleBrokerError(batchData) || pc.handleStreamControl(batchData) || len(batchData) == 0 {
 		util.Debug("Partition [%d] pollAndProcess: broker error or empty response", pc.partitionID)
 		if !pc.waitWithBackoff(bo) {
 			return
@@ -278,7 +278,7 @@ func (pc *PartitionConsumer) startStreamLoop() {
 				break
 			}
 
-			if len(batchData) == 0 || pc.handleBrokerError(batchData) {
+			if len(batchData) == 0 || pc.handleBrokerError(batchData) || pc.handleStreamControl(batchData) {
 				if !pc.waitWithBackoff(bo) {
 					return
 				}

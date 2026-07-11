@@ -568,3 +568,92 @@ func TestEffectiveStreamBatchSize(t *testing.T) {
 	assert.Equal(t, 500, effectiveStreamBatchSize(&ConsumerConfig{BatchSize: 500}))
 	assert.Equal(t, 100, effectiveStreamBatchSize(&ConsumerConfig{}))
 }
+
+func TestParseStreamControlFrameClose(t *testing.T) {
+	frame, ok := parseStreamControlFrame([]byte("STREAM_CONTROL type=CLOSE reason=timeout offset=123"))
+	require.True(t, ok)
+	assert.Equal(t, "CLOSE", frame.Type)
+	assert.Equal(t, "timeout", frame.Reason)
+	assert.True(t, frame.HasOffset)
+	assert.Equal(t, uint64(123), frame.Offset)
+}
+
+func TestPartitionConsumer_HandleStreamControlClose(t *testing.T) {
+	c := newTestConsumer(t)
+	server, client := createPipe()
+	defer func() { _ = server.Close() }()
+
+	pc := &PartitionConsumer{
+		partitionID: 0,
+		consumer:    c,
+		conn:        client,
+	}
+
+	assert.True(t, pc.handleStreamControl([]byte("STREAM_CONTROL type=CLOSE reason=removed offset=456")))
+	assert.Nil(t, pc.conn)
+	assert.Equal(t, uint64(456), atomic.LoadUint64(&pc.fetchOffset))
+}
+
+func TestPartitionConsumer_HandleBrokerError_NotOwner(t *testing.T) {
+	c := newTestConsumer(t)
+
+	pc := &PartitionConsumer{
+		partitionID: 0,
+		consumer:    c,
+	}
+
+	result := pc.handleBrokerError([]byte("ERROR: NOT_OWNER partition=0 member=m1 group=g1 generation=2"))
+	assert.True(t, result)
+	assert.True(t, pc.closed)
+}
+
+func TestParseOffsetOutOfRangeFrame(t *testing.T) {
+	frame, ok := parseOffsetOutOfRangeFrame("ERROR: OFFSET_OUT_OF_RANGE requested=1 earliest=5 latest=9")
+	require.True(t, ok)
+	assert.Equal(t, uint64(1), frame.Requested)
+	assert.Equal(t, uint64(5), frame.Earliest)
+	assert.Equal(t, uint64(9), frame.Latest)
+}
+
+func TestPartitionConsumer_HandleBrokerError_OffsetOutOfRangeEarliest(t *testing.T) {
+	c := newTestConsumer(t)
+	c.config.AutoOffsetReset = AutoOffsetResetEarliest
+	pc := &PartitionConsumer{partitionID: 0, consumer: c, fetchOffset: 1}
+
+	result := pc.handleBrokerError([]byte("ERROR: OFFSET_OUT_OF_RANGE requested=1 earliest=5 latest=9"))
+	assert.True(t, result)
+	assert.Equal(t, uint64(5), atomic.LoadUint64(&pc.fetchOffset))
+	c.mu.RLock()
+	assert.Equal(t, uint64(5), c.offsets[0])
+	c.mu.RUnlock()
+}
+
+func TestPartitionConsumer_HandleBrokerError_OffsetOutOfRangeLatest(t *testing.T) {
+	c := newTestConsumer(t)
+	c.config.AutoOffsetReset = AutoOffsetResetLatest
+	pc := &PartitionConsumer{partitionID: 0, consumer: c, fetchOffset: 1}
+
+	result := pc.handleBrokerError([]byte("ERROR: OFFSET_OUT_OF_RANGE requested=1 earliest=5 latest=9"))
+	assert.True(t, result)
+	assert.Equal(t, uint64(9), atomic.LoadUint64(&pc.fetchOffset))
+}
+
+func TestPartitionConsumer_HandleBrokerError_OffsetOutOfRangeError(t *testing.T) {
+	c := newTestConsumer(t)
+	c.config.AutoOffsetReset = AutoOffsetResetError
+	pc := &PartitionConsumer{partitionID: 0, consumer: c, fetchOffset: 1}
+
+	result := pc.handleBrokerError([]byte("ERROR: OFFSET_OUT_OF_RANGE requested=1 earliest=5 latest=9"))
+	assert.True(t, result)
+	assert.Error(t, c.mainCtx.Err())
+}
+
+func TestPartitionConsumer_HandleStreamControl_OffsetOutOfRange(t *testing.T) {
+	c := newTestConsumer(t)
+	c.config.AutoOffsetReset = AutoOffsetResetEarliest
+	pc := &PartitionConsumer{partitionID: 0, consumer: c, fetchOffset: 1}
+
+	result := pc.handleStreamControl([]byte("STREAM_CONTROL type=CLOSE reason=offset_out_of_range offset=1 requested=1 earliest=5 latest=9"))
+	assert.True(t, result)
+	assert.Equal(t, uint64(5), atomic.LoadUint64(&pc.fetchOffset))
+}
