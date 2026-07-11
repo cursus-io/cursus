@@ -712,9 +712,10 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 
 ### Sequence Tracking
 
-- Broker tracks last seen sequence per `(producerId)` per partition
-- State survives across batches but not broker restarts (tracked in memory + FSM for distributed)
-- Producer state expires after 30 minutes of inactivity
+- Broker tracks the last seen sequence per `(producerId)` per partition
+- Disk-backed partitions persist producer sequence checkpoints and restore them on broker restart
+- Distributed FSM snapshots also include producer sequence state for replicated message commands
+- Producer state expires from memory after 30 minutes of inactivity; durable checkpoints retain the last persisted sequence until the partition data is removed
 
 ---
 

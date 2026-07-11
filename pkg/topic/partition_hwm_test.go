@@ -67,6 +67,40 @@ func TestPartition_ReplacesPersistedHWMCheckpoint(t *testing.T) {
 	require.Equal(t, uint64(2), restarted.GetHWM())
 }
 
+func TestPartition_RestoresProducerStateCheckpoint(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 1
+
+	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.isIdempotent = true
+
+	require.NoError(t, p.EnqueueSync(types.Message{Payload: "first", ProducerID: "producer-1", SeqNum: 1}))
+	p.FlushDisk()
+	p.Close()
+	require.NoError(t, dh.Close())
+
+	restartedDH, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { _ = restartedDH.Close() }()
+	restarted := NewPartition(0, "orders", restartedDH, nil, cfg)
+	defer restarted.Close()
+	restarted.isIdempotent = true
+
+	require.NoError(t, restarted.EnqueueSync(types.Message{Payload: "duplicate", ProducerID: "producer-1", SeqNum: 1}))
+	msgs, err := restarted.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Equal(t, "first", msgs[0].Payload)
+
+	require.NoError(t, restarted.EnqueueSync(types.Message{Payload: "second", ProducerID: "producer-1", SeqNum: 2}))
+	msgs, err = restarted.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	require.Equal(t, "second", msgs[1].Payload)
+}
 func TestPartition_EnqueueBatchLeaderUsesSingleBatchWrite(t *testing.T) {
 	cfg := config.DefaultConfig()
 	dh := new(MockStorageHandler)

@@ -1,6 +1,7 @@
 package topic
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,6 +40,10 @@ type Partition struct {
 	hwmCheckpointCh   chan struct{}
 	hwmCheckpointMu   sync.Mutex
 	hwmCheckpointWG   sync.WaitGroup
+	producerStatePath string
+	producerStateCh   chan struct{}
+	producerStateMu   sync.Mutex
+	producerStateWG   sync.WaitGroup
 	producerState     sync.Map // map[string]*producerEntry
 	isIdempotent      bool
 	closeCh           chan struct{}
@@ -64,6 +69,8 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	if handler, ok := dh.(*disk.DiskHandler); ok {
 		p.hwmCheckpointPath = hwmCheckpointPath(handler, id)
 		p.hwmCheckpointCh = make(chan struct{}, 1)
+		p.producerStatePath = producerStateCheckpointPath(handler, id)
+		p.producerStateCh = make(chan struct{}, 1)
 		durableTail := handler.GetAbsoluteOffset()
 		if persistedHWM, ok := loadHWMCheckpoint(p.hwmCheckpointPath); ok {
 			if persistedHWM > durableTail {
@@ -87,6 +94,11 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	if p.hwmCheckpointCh != nil {
 		p.hwmCheckpointWG.Add(1)
 		go p.runHWMCheckpointLoop()
+	}
+	if p.producerStateCh != nil {
+		p.loadProducerStateCheckpoint()
+		p.producerStateWG.Add(1)
+		go p.runProducerStateCheckpointLoop()
 	}
 
 	return p
@@ -132,6 +144,7 @@ func (p *Partition) updateProducerState(msg *types.Message) {
 		lastSeq:  msg.SeqNum,
 		lastSeen: time.Now(),
 	})
+	p.signalProducerStateCheckpoint()
 }
 
 // Enqueue pushes a message into the partition queue.
@@ -392,6 +405,7 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 func (p *Partition) FlushDisk() {
 	p.dh.Flush()
 	p.persistHWMCheckpoint()
+	p.persistProducerStateCheckpoint()
 }
 
 func (p *Partition) GetFirstOffset() uint64 {
@@ -556,6 +570,132 @@ func loadHWMCheckpoint(path string) (uint64, bool) {
 	return hwm, true
 }
 
+type producerStateCheckpoint map[string]uint64
+
+func (p *Partition) signalProducerStateCheckpoint() {
+	if p.producerStateCh == nil {
+		return
+	}
+	select {
+	case p.producerStateCh <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Partition) runProducerStateCheckpointLoop() {
+	defer p.producerStateWG.Done()
+
+	ticker := time.NewTicker(producerStateCheckpointInterval)
+	defer ticker.Stop()
+
+	dirty := false
+	for {
+		select {
+		case <-p.producerStateCh:
+			dirty = true
+		case <-ticker.C:
+			if dirty {
+				p.persistProducerStateCheckpoint()
+				dirty = false
+			}
+		case <-p.closeCh:
+			p.persistProducerStateCheckpoint()
+			return
+		}
+	}
+}
+
+func (p *Partition) loadProducerStateCheckpoint() {
+	if p.producerStatePath == "" {
+		return
+	}
+	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
+	data, err := os.ReadFile(p.producerStatePath)
+	if err != nil {
+		return
+	}
+	var checkpoint producerStateCheckpoint
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		util.Warn("ignoring invalid producer state checkpoint %s: %v", p.producerStatePath, err)
+		return
+	}
+	now := time.Now()
+	for producerID, lastSeq := range checkpoint {
+		if producerID == "" || lastSeq == 0 {
+			continue
+		}
+		p.producerState.Store(producerID, &producerEntry{lastSeq: lastSeq, lastSeen: now})
+	}
+}
+
+func (p *Partition) persistProducerStateCheckpoint() {
+	if p.producerStatePath == "" {
+		return
+	}
+
+	checkpoint := make(producerStateCheckpoint)
+	p.producerState.Range(func(key, value any) bool {
+		producerID, ok := key.(string)
+		if !ok || producerID == "" {
+			return true
+		}
+		entry, ok := value.(*producerEntry)
+		if !ok || entry.lastSeq == 0 {
+			return true
+		}
+		checkpoint[producerID] = entry.lastSeq
+		return true
+	})
+
+	p.producerStateMu.Lock()
+	defer p.producerStateMu.Unlock()
+
+	tmp := p.producerStatePath + ".tmp"
+	data, err := json.Marshal(checkpoint)
+	if err != nil {
+		util.Warn("failed to marshal producer state checkpoint %s: %v", p.producerStatePath, err)
+		return
+	}
+	data = append(data, '\n')
+
+	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		util.Warn("failed to open producer state checkpoint %s: %v", tmp, err)
+		return
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		util.Warn("failed to write producer state checkpoint %s: %v", tmp, err)
+		return
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		util.Warn("failed to sync producer state checkpoint %s: %v", tmp, err)
+		return
+	}
+	if err := f.Close(); err != nil {
+		util.Warn("failed to close producer state checkpoint %s: %v", tmp, err)
+		return
+	}
+	if err := replaceCheckpointFile(tmp, p.producerStatePath); err != nil {
+		util.Warn("failed to rename producer state checkpoint %s: %v", p.producerStatePath, err)
+		return
+	}
+	syncParentDir(filepath.Dir(p.producerStatePath))
+}
+
+func producerStateCheckpointPath(dh types.StorageHandler, partitionID int) string {
+	if dh == nil {
+		return ""
+	}
+	segmentPath := dh.GetSegmentPath(0)
+	if segmentPath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(segmentPath), fmt.Sprintf("partition_%d.producers", partitionID))
+}
+
 // GetHWM returns the high water mark in a thread-safe manner.
 func (p *Partition) GetHWM() uint64 {
 	p.mu.RLock()
@@ -578,9 +718,12 @@ func (p *Partition) Close() {
 	close(p.closeCh)
 	p.mu.Unlock()
 	p.hwmCheckpointWG.Wait()
+	p.producerStateWG.Wait()
 }
 
 const hwmCheckpointInterval = 250 * time.Millisecond
+
+const producerStateCheckpointInterval = 250 * time.Millisecond
 
 const producerStateTTL = 30 * time.Minute
 
