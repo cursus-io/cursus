@@ -268,18 +268,21 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	defer d.ioMu.Unlock()
 
 	diskMsg := types.DiskMessage{
-		Topic:            topic,
-		Partition:        int32(partition),
-		Offset:           msg.Offset,
-		ProducerID:       msg.ProducerID,
-		SeqNum:           msg.SeqNum,
-		Epoch:            msg.Epoch,
-		Payload:          msg.Payload,
-		Key:              msg.Key,
-		EventType:        msg.EventType,
-		SchemaVersion:    msg.SchemaVersion,
-		AggregateVersion: msg.AggregateVersion,
-		Metadata:         msg.Metadata,
+		Topic:             topic,
+		Partition:         int32(partition),
+		Offset:            msg.Offset,
+		ProducerID:        msg.ProducerID,
+		SeqNum:            msg.SeqNum,
+		Epoch:             msg.Epoch,
+		Payload:           msg.Payload,
+		Key:               msg.Key,
+		EventType:         msg.EventType,
+		SchemaVersion:     msg.SchemaVersion,
+		AggregateVersion:  msg.AggregateVersion,
+		Metadata:          msg.Metadata,
+		TransactionalID:   msg.TransactionalID,
+		TransactionState:  msg.TransactionState,
+		TransactionMarker: msg.TransactionMarker,
 	}
 
 	serialized, err := util.SerializeDiskMessage(diskMsg)

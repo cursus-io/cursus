@@ -462,7 +462,7 @@ Starts a broker-managed transaction. In distributed mode, route transaction comm
 TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> [seqNum=<N>] epoch=<N> [key=<key>] message=<payload>
 ```
 
-Stages one record in the transaction. The record is not published until `END_TXN ... result=commit` succeeds. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
+Stages one record in the transaction. The record is not published until `END_TXN ... result=commit` succeeds. Committed records are stamped with transaction metadata before they enter the normal publish path. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
 
 ### SEND_OFFSETS_TO_TXN
 
@@ -478,7 +478,7 @@ Stages consumer offsets in the transaction. The broker validates group member, g
 END_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> result=<commit|abort>
 ```
 
-Commits or aborts staged records and offsets. Transaction state is replicated in the metadata FSM and included in snapshots, and committed records use the normal partition-leader publish path. Kafka-style transaction markers, crash recovery of in-flight commit markers, and `read_committed` isolation remain follow-up work.
+Commits or aborts staged records and offsets. Transaction state is replicated in the metadata FSM and included in snapshots, committed records use the normal partition-leader publish path, finalization retries are idempotent for the same producer epoch, and committed reads hide transaction marker records plus open or aborted transactional records. Cursus still does not provide Kafka-compatible partition-log control batches or full two-phase transaction-log recovery.
 
 ### TXN_STATUS
 

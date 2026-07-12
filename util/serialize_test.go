@@ -141,8 +141,8 @@ func TestDeserializeDiskMessage_OldFormatNoEventSourcing(t *testing.T) {
 	data, err := SerializeDiskMessage(msg)
 	assert.NoError(t, err)
 
-	// ES + Key trailer for empty fields: 2 (eventType len) + 4 (schema) + 8 (aggVer) + 2 (metadata len) + 2 (key len) = 18 bytes
-	oldData := data[:len(data)-18]
+	// ES + Key + transaction trailer for empty fields: 18 bytes + 6 transaction length bytes = 24 bytes
+	oldData := data[:len(data)-24]
 
 	got, err := DeserializeDiskMessage(oldData)
 	assert.NoError(t, err)
@@ -177,4 +177,31 @@ func TestDiskMessageSerialization_EmptyFields(t *testing.T) {
 	assert.Equal(t, "", got.Payload)
 	assert.Equal(t, "", got.EventType)
 	assert.Equal(t, "", got.Metadata)
+}
+func TestDiskMessageTransactionMetadataRoundTrip(t *testing.T) {
+	msg := types.DiskMessage{
+		Topic:             "txn-topic",
+		Partition:         0,
+		Offset:            7,
+		ProducerID:        "producer-1",
+		SeqNum:            3,
+		Epoch:             2,
+		Payload:           "payload",
+		Key:               "key",
+		TransactionalID:   "tx-1",
+		TransactionState:  types.TransactionStateCommitted,
+		TransactionMarker: types.TransactionMarkerCommit,
+	}
+
+	data, err := SerializeDiskMessage(msg)
+	if err != nil {
+		t.Fatalf("serialize failed: %v", err)
+	}
+	got, err := DeserializeDiskMessage(data)
+	if err != nil {
+		t.Fatalf("deserialize failed: %v", err)
+	}
+	if got.TransactionalID != msg.TransactionalID || got.TransactionState != msg.TransactionState || got.TransactionMarker != msg.TransactionMarker {
+		t.Fatalf("transaction metadata mismatch: %+v", got)
+	}
 }

@@ -151,7 +151,7 @@ var diskMsgBufPool = sync.Pool{
 func EstimateDiskMessageSize(msg types.DiskMessage) int {
 	return 2 + len(msg.Topic) + 4 + 8 + 2 + len(msg.ProducerID) + 8 + 8 +
 		4 + len(msg.Payload) + 2 + len(msg.Key) +
-		2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata)
+		2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata) + 2 + len(msg.TransactionalID) + 2 + len(msg.TransactionState) + 2 + len(msg.TransactionMarker)
 }
 
 // SerializeDiskMessage serializes a DiskMessage for disk storage
@@ -183,6 +183,18 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	keyLen, ok := SafeIntToUint16(len(msg.Key))
 	if !ok {
 		return nil, fmt.Errorf("key too long: %d", len(msg.Key))
+	}
+	txnIDLen, ok := SafeIntToUint16(len(msg.TransactionalID))
+	if !ok {
+		return nil, fmt.Errorf("transactionalID too long: %d", len(msg.TransactionalID))
+	}
+	txnStateLen, ok := SafeIntToUint16(len(msg.TransactionState))
+	if !ok {
+		return nil, fmt.Errorf("transactionState too long: %d", len(msg.TransactionState))
+	}
+	txnMarkerLen, ok := SafeIntToUint16(len(msg.TransactionMarker))
+	if !ok {
+		return nil, fmt.Errorf("transactionMarker too long: %d", len(msg.TransactionMarker))
 	}
 	epochVal, ok := SafeInt64ToUint64(msg.Epoch)
 	if !ok {
@@ -251,6 +263,19 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	binary.BigEndian.PutUint16(tmp[:2], keyLen)
 	buf = append(buf, tmp[:2]...)
 	buf = append(buf, msg.Key...)
+
+	// Transaction metadata (optional trailer; empty for non-transactional records)
+	binary.BigEndian.PutUint16(tmp[:2], txnIDLen)
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.TransactionalID...)
+
+	binary.BigEndian.PutUint16(tmp[:2], txnStateLen)
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.TransactionState...)
+
+	binary.BigEndian.PutUint16(tmp[:2], txnMarkerLen)
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.TransactionMarker...)
 
 	// Return a copy so the pooled buffer can be reused
 	result := make([]byte, len(buf))
@@ -342,7 +367,7 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	msg.Payload = string(data[offset : offset+payloadLen])
 	offset += payloadLen
 
-	// Event sourcing fields (optional — backward compatible with old messages)
+	// Event sourcing fields (optional - backward compatible with old messages)
 	// If event-sourcing trailer is present, all fields must be complete.
 	if offset < len(data) {
 		if offset+2 > len(data) {
@@ -379,15 +404,43 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 		msg.Metadata = string(data[offset : offset+metadataLen])
 		offset += metadataLen
 
-		// Key (optional — backward compatible with messages before Key was added)
+		// Key (optional - backward compatible with messages before Key was added)
 		if offset+2 <= len(data) {
 			keyLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 			offset += 2
-			if offset+keyLen <= len(data) {
-				msg.Key = string(data[offset : offset+keyLen])
+			if offset+keyLen > len(data) {
+				return msg, fmt.Errorf("incomplete key field: truncated key")
+			}
+			msg.Key = string(data[offset : offset+keyLen])
+			offset += keyLen
+		}
+
+		if offset < len(data) {
+			if err := readDiskString(data, &offset, &msg.TransactionalID, "transactional ID"); err != nil {
+				return msg, err
+			}
+			if err := readDiskString(data, &offset, &msg.TransactionState, "transaction state"); err != nil {
+				return msg, err
+			}
+			if err := readDiskString(data, &offset, &msg.TransactionMarker, "transaction marker"); err != nil {
+				return msg, err
 			}
 		}
 	}
 
 	return msg, nil
+}
+
+func readDiskString(data []byte, offset *int, out *string, field string) error {
+	if *offset+2 > len(data) {
+		return fmt.Errorf("incomplete %s field: truncated length", field)
+	}
+	fieldLen := int(binary.BigEndian.Uint16(data[*offset : *offset+2]))
+	*offset += 2
+	if *offset+fieldLen > len(data) {
+		return fmt.Errorf("incomplete %s field: truncated value", field)
+	}
+	*out = string(data[*offset : *offset+fieldLen])
+	*offset += fieldLen
+	return nil
 }

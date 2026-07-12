@@ -136,16 +136,27 @@ func (m *Manager) PrepareCommit(id, producer string, epoch int64) (*Transaction,
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	tx, err := m.activeLocked(id)
-	if err != nil {
-		return nil, err
+	tx, ok := m.txns[id]
+	if !ok {
+		return nil, fmt.Errorf("transaction %s not found", id)
 	}
 	if err := validateOwner(tx, producer, epoch); err != nil {
 		return nil, err
 	}
-	tx.State = StateCommitting
-	tx.UpdatedAt = time.Now()
-	return clone(tx), nil
+	switch tx.State {
+	case StateOpen:
+		tx.State = StateCommitting
+		tx.UpdatedAt = time.Now()
+		return clone(tx), nil
+	case StateCommitting:
+		return clone(tx), nil
+	case StateCommitted:
+		return clone(tx), nil
+	case StateAborted:
+		return nil, fmt.Errorf("transaction %s is aborted", id)
+	default:
+		return nil, fmt.Errorf("transaction %s is %s", id, tx.State)
+	}
 }
 
 func (m *Manager) Commit(id string) error {
@@ -164,7 +175,7 @@ func (m *Manager) Commit(id string) error {
 	return nil
 }
 
-func (m *Manager) Abort(id string) error {
+func (m *Manager) Abort(id, producer string, epoch int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -172,8 +183,14 @@ func (m *Manager) Abort(id string) error {
 	if !ok {
 		return fmt.Errorf("transaction %s not found", id)
 	}
+	if err := validateOwner(tx, producer, epoch); err != nil {
+		return err
+	}
 	if tx.State == StateCommitted {
 		return fmt.Errorf("transaction %s is already committed", id)
+	}
+	if tx.State == StateAborted {
+		return nil
 	}
 	tx.State = StateAborted
 	tx.Messages = nil
@@ -182,6 +199,19 @@ func (m *Manager) Abort(id string) error {
 	return nil
 }
 
+func (m *Manager) ValidateOwner(id, producer string, epoch int64) (*Transaction, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	tx, ok := m.txns[id]
+	if !ok {
+		return nil, fmt.Errorf("transaction %s not found", id)
+	}
+	if err := validateOwner(tx, producer, epoch); err != nil {
+		return nil, err
+	}
+	return clone(tx), nil
+}
 func (m *Manager) Status(id string) (*Transaction, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

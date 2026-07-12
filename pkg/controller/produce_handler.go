@@ -92,10 +92,13 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 	}
 
 	msg := &types.Message{
-		Payload:    message,
-		ProducerID: producerID,
-		SeqNum:     seqNum,
-		Epoch:      epoch,
+		Payload:           message,
+		ProducerID:        producerID,
+		SeqNum:            seqNum,
+		Epoch:             epoch,
+		TransactionalID:   args["transactional_id"],
+		TransactionState:  args["transaction_state"],
+		TransactionMarker: args["transaction_marker"],
 	}
 
 	if partition < 0 {
@@ -111,6 +114,15 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 			forwardCmd = fmt.Sprintf("PUBLISH topic=%s acks=%s producerId=%s partition=%d seqNum=%d epoch=%d", topicName, acks, producerID, partition, seqNum, epoch)
 			if _, explicitIdempotent := args["isIdempotent"]; explicitIdempotent {
 				forwardCmd += fmt.Sprintf(" isIdempotent=%t", isIdempotent)
+			}
+			if msg.TransactionalID != "" {
+				forwardCmd += fmt.Sprintf(" transactional_id=%s", msg.TransactionalID)
+			}
+			if msg.TransactionState != "" {
+				forwardCmd += fmt.Sprintf(" transaction_state=%s", msg.TransactionState)
+			}
+			if msg.TransactionMarker != "" {
+				forwardCmd += fmt.Sprintf(" transaction_marker=%s", msg.TransactionMarker)
 			}
 			forwardCmd += " message=" + message
 		}
@@ -132,15 +144,8 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 			Partition:     partition,
 			IsIdempotent:  effectiveIdempotent,
 			SequenceScope: scope,
-			Messages: []types.Message{
-				{
-					Payload:    message,
-					ProducerID: producerID,
-					SeqNum:     seqNum,
-					Epoch:      epoch,
-				},
-			},
-			Acks: acks,
+			Messages:      []types.Message{*msg},
+			Acks:          acks,
 		}
 
 		// 1. Append locally (LEO advances, HWM stays until replication succeeds)

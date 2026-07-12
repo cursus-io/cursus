@@ -288,18 +288,21 @@ func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Mess
 
 	msg.Offset = offset
 	diskMsg := types.DiskMessage{
-		Topic:            topic,
-		Partition:        int32(partition),
-		Offset:           offset,
-		ProducerID:       msg.ProducerID,
-		SeqNum:           msg.SeqNum,
-		Epoch:            msg.Epoch,
-		Payload:          msg.Payload,
-		Key:              msg.Key,
-		EventType:        msg.EventType,
-		SchemaVersion:    msg.SchemaVersion,
-		AggregateVersion: msg.AggregateVersion,
-		Metadata:         msg.Metadata,
+		Topic:             topic,
+		Partition:         int32(partition),
+		Offset:            offset,
+		ProducerID:        msg.ProducerID,
+		SeqNum:            msg.SeqNum,
+		Epoch:             msg.Epoch,
+		Payload:           msg.Payload,
+		Key:               msg.Key,
+		EventType:         msg.EventType,
+		SchemaVersion:     msg.SchemaVersion,
+		AggregateVersion:  msg.AggregateVersion,
+		Metadata:          msg.Metadata,
+		TransactionalID:   msg.TransactionalID,
+		TransactionState:  msg.TransactionState,
+		TransactionMarker: msg.TransactionMarker,
 	}
 
 	if d.writeTimeout > 0 {
@@ -473,16 +476,19 @@ func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position 
 		}
 
 		messages = append(messages, types.Message{
-			Offset:           diskMsg.Offset,
-			Payload:          diskMsg.Payload,
-			ProducerID:       diskMsg.ProducerID,
-			SeqNum:           diskMsg.SeqNum,
-			Epoch:            diskMsg.Epoch,
-			Key:              diskMsg.Key,
-			EventType:        diskMsg.EventType,
-			SchemaVersion:    diskMsg.SchemaVersion,
-			AggregateVersion: diskMsg.AggregateVersion,
-			Metadata:         diskMsg.Metadata,
+			Offset:            diskMsg.Offset,
+			Payload:           diskMsg.Payload,
+			ProducerID:        diskMsg.ProducerID,
+			SeqNum:            diskMsg.SeqNum,
+			Epoch:             diskMsg.Epoch,
+			Key:               diskMsg.Key,
+			EventType:         diskMsg.EventType,
+			SchemaVersion:     diskMsg.SchemaVersion,
+			AggregateVersion:  diskMsg.AggregateVersion,
+			Metadata:          diskMsg.Metadata,
+			TransactionalID:   diskMsg.TransactionalID,
+			TransactionState:  diskMsg.TransactionState,
+			TransactionMarker: diskMsg.TransactionMarker,
 		})
 		pos += 4 + int(msgLen)
 	}

@@ -251,3 +251,27 @@ func TestPartition_ReadCommittedReturnsOutOfRangeWhenEarliestEqualsHWM(t *testin
 	var offsetErr *types.OffsetOutOfRangeError
 	require.ErrorAs(t, err, &offsetErr)
 }
+func TestPartition_ReadCommittedFiltersTransactionalRecords(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	dh.On("GetFlushedOffset").Return(uint64(5)).Once()
+	dh.On("GetFirstOffset").Return(uint64(0)).Once()
+	dh.On("ReadMessages", uint64(0), 5).Return([]types.Message{
+		{Offset: 0, Payload: "plain"},
+		{Offset: 1, Payload: "open", TransactionalID: "tx-open", TransactionState: types.TransactionStateOpen},
+		{Offset: 2, Payload: "committed", TransactionalID: "tx-commit", TransactionState: types.TransactionStateCommitted},
+		{Offset: 3, Payload: "marker", TransactionalID: "tx-commit", TransactionMarker: types.TransactionMarkerCommit},
+		{Offset: 4, Payload: "aborted", TransactionalID: "tx-abort", TransactionState: types.TransactionStateAborted},
+	}, nil).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.SetHWM(5)
+
+	msgs, err := p.ReadCommitted(0, 5)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	require.Equal(t, "plain", msgs[0].Payload)
+	require.Equal(t, "committed", msgs[1].Payload)
+	dh.AssertExpectations(t)
+}

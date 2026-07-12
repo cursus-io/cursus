@@ -11,7 +11,7 @@ func TestManagerFencesLowerProducerEpoch(t *testing.T) {
 	if err := m.Begin("tx-1", "producer-1", 3); err != nil {
 		t.Fatalf("begin failed: %v", err)
 	}
-	if err := m.Abort("tx-1"); err != nil {
+	if err := m.Abort("tx-1", "producer-1", 3); err != nil {
 		t.Fatalf("abort failed: %v", err)
 	}
 	if err := m.Begin("tx-1", "producer-1", 2); err == nil {
@@ -51,5 +51,23 @@ func TestManagerExportImportState(t *testing.T) {
 	}
 	if tx.Producer != "producer-1" || tx.Epoch != 1 || len(tx.Offsets) != 1 || tx.Offsets[0].Offset != 9 {
 		t.Fatalf("unexpected restored transaction: %+v", tx)
+	}
+}
+func TestManagerFinalStateIsIdempotentForSameOwner(t *testing.T) {
+	m := NewManager()
+	if err := m.Begin("tx-1", "producer-1", 1); err != nil {
+		t.Fatalf("begin failed: %v", err)
+	}
+	if _, err := m.PrepareCommit("tx-1", "producer-1", 1); err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+	if err := m.Commit("tx-1"); err != nil {
+		t.Fatalf("commit failed: %v", err)
+	}
+	if _, err := m.PrepareCommit("tx-1", "producer-1", 1); err != nil {
+		t.Fatalf("same-owner retry should be idempotent: %v", err)
+	}
+	if _, err := m.PrepareCommit("tx-1", "producer-1", 0); err == nil {
+		t.Fatal("expected stale epoch retry to be fenced")
 	}
 }

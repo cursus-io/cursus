@@ -77,7 +77,7 @@ func (ch *CommandHandler) handleTxnPublish(cmd string) string {
 	if !t.Policy.CanWrite() {
 		return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", topicName)
 	}
-	msg := types.Message{Payload: message, ProducerID: producerID, SeqNum: seqNum, Epoch: epoch, Key: args["key"]}
+	msg := types.Message{Payload: message, ProducerID: producerID, SeqNum: seqNum, Epoch: epoch, Key: args["key"], TransactionalID: txnID, TransactionState: types.TransactionStateOpen}
 	if partition < 0 {
 		partition = t.GetPartitionForMessage(msg)
 	}
@@ -166,8 +166,18 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 	if result == "" {
 		result = "commit"
 	}
+	current, statusErr := ch.TxnManager.ValidateOwner(txnID, producerID, epoch)
+	if statusErr != nil {
+		return fmt.Sprintf("ERROR: transaction_not_found reason=%q", statusErr.Error())
+	}
 	if result == "abort" {
-		if err := ch.TxnManager.Abort(txnID); err != nil {
+		if current.State == transaction.StateCommitted {
+			return fmt.Sprintf("ERROR: transaction_already_committed transactional_id=%s", txnID)
+		}
+		if current.State == transaction.StateAborted {
+			return fmt.Sprintf("OK transactional_id=%s state=aborted", txnID)
+		}
+		if err := ch.TxnManager.Abort(txnID, producerID, epoch); err != nil {
 			return fmt.Sprintf("ERROR: transaction_abort_failed reason=%q", err.Error())
 		}
 		if err := ch.syncTransactionState(txnID); err != nil {
@@ -179,6 +189,13 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 		return fmt.Sprintf("ERROR: invalid_transaction_result value=%s", result)
 	}
 
+	if current.State == transaction.StateCommitted {
+		return fmt.Sprintf("OK transactional_id=%s state=committed messages=%d offsets=%d", txnID, len(current.Messages), len(current.Offsets))
+	}
+	if current.State == transaction.StateAborted {
+		return fmt.Sprintf("ERROR: transaction_aborted transactional_id=%s", txnID)
+	}
+
 	tx, err := ch.TxnManager.PrepareCommit(txnID, producerID, epoch)
 	if err != nil {
 		return fmt.Sprintf("ERROR: transaction_prepare_failed reason=%q", err.Error())
@@ -187,7 +204,7 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	if err := ch.applyTransaction(tx); err != nil {
-		_ = ch.TxnManager.Abort(txnID)
+		_ = ch.TxnManager.Abort(txnID, producerID, epoch)
 		_ = ch.syncTransactionState(txnID)
 		return fmt.Sprintf("ERROR: transaction_commit_failed reason=%q", err.Error())
 	}
@@ -258,10 +275,15 @@ func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
 
 func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.MessageOperation) error {
 	msg := op.Message
+	msg.TransactionState = types.TransactionStateCommitted
+	msg.TransactionMarker = types.TransactionMarkerNone
 	if ch.isDistributed() {
 		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d", op.Topic, msg.ProducerID, op.Partition, msg.SeqNum, msg.Epoch)
 		if msg.Key != "" {
 			cmd += fmt.Sprintf(" key=%s", msg.Key)
+		}
+		if msg.TransactionalID != "" {
+			cmd += fmt.Sprintf(" transactional_id=%s transaction_state=%s", msg.TransactionalID, msg.TransactionState)
 		}
 		cmd += " message=" + msg.Payload
 		resp := ch.handlePublish(cmd)

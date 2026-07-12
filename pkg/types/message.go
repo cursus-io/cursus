@@ -2,6 +2,17 @@ package types
 
 import "fmt"
 
+const (
+	TransactionStateNone      = ""
+	TransactionStateOpen      = "open"
+	TransactionStateCommitted = "committed"
+	TransactionStateAborted   = "aborted"
+
+	TransactionMarkerNone   = ""
+	TransactionMarkerCommit = "commit"
+	TransactionMarkerAbort  = "abort"
+)
+
 // Message represents a single message
 type Message struct {
 	Offset     uint64
@@ -15,6 +26,10 @@ type Message struct {
 	SchemaVersion    uint32
 	AggregateVersion uint64
 	Metadata         string
+
+	TransactionalID   string
+	TransactionState  string
+	TransactionMarker string
 
 	RetryCount int
 	Retry      bool
@@ -50,6 +65,10 @@ type DiskMessage struct {
 	SchemaVersion    uint32
 	AggregateVersion uint64
 	Metadata         string
+
+	TransactionalID   string
+	TransactionState  string
+	TransactionMarker string
 }
 
 // AppendResult represents the result of appending a message to storage

@@ -1398,6 +1398,11 @@ func TestTransactionCommitStagesMessagesAndOffsets(t *testing.T) {
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=txn-topic partition=0 group=txn-group", ctx)
 	assert.Equal(t, "OK offset=4", resp)
+
+	resp = ch.HandleCommand("END_TXN transactional_id=tx-1 producerId=producer-1 epoch=1 result=commit", ctx)
+	assert.Contains(t, resp, "state=committed")
+	resp = ch.HandleCommand("FETCH_OFFSET topic=txn-topic partition=0 group=txn-group", ctx)
+	assert.Equal(t, "OK offset=4", resp)
 }
 
 func TestTransactionAbortDiscardsOffsets(t *testing.T) {

@@ -478,7 +478,66 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 		max = int(canRead) // #nosec G115 -- canRead is bounded by math.MaxInt before narrowing.
 	}
 
-	return p.ReadMessages(offset, max)
+	return p.readVisibleCommitted(offset, max, hwm)
+}
+
+func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm uint64) ([]types.Message, error) {
+	if max <= 0 {
+		return nil, nil
+	}
+
+	visible := make([]types.Message, 0, max)
+	current := offset
+	for current < hwm && len(visible) < max {
+		remaining := hwm - current
+		readMax := max - len(visible)
+		if readMax < 1 {
+			readMax = 1
+		}
+		if readMax < max {
+			readMax = max
+		}
+		if remaining <= math.MaxInt && readMax > int(remaining) { // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
+			readMax = int(remaining) // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
+		}
+
+		messages, err := p.ReadMessages(current, readMax)
+		if err != nil {
+			return nil, err
+		}
+		if len(messages) == 0 {
+			break
+		}
+
+		for _, msg := range messages {
+			next := msg.Offset + 1
+			if next <= current {
+				next = current + 1
+			}
+			current = next
+			if msg.Offset >= hwm {
+				break
+			}
+			if !isReadCommittedVisible(msg) {
+				continue
+			}
+			visible = append(visible, msg)
+			if len(visible) == max {
+				break
+			}
+		}
+	}
+	return visible, nil
+}
+
+func isReadCommittedVisible(msg types.Message) bool {
+	if msg.TransactionMarker != types.TransactionMarkerNone {
+		return false
+	}
+	if msg.TransactionalID == "" {
+		return true
+	}
+	return msg.TransactionState == types.TransactionStateCommitted
 }
 
 // FlushDisk forces all pending async writes to disk.
