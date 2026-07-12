@@ -454,31 +454,31 @@ Clients and SDKs should reconnect to that leader and retry. Followers index repl
 BEGIN_TXN transactional_id=<id> producerId=<producer-id> [epoch=<N>]
 ```
 
-Starts a broker-managed transaction. Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`.
+Starts a broker-managed transaction. In distributed mode, route transaction commands to `FIND_COORDINATOR transactional_id=<id>`; the coordinator key is `txn:<id>`. Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`.
 
 ### TXN_PUBLISH
 
 ```text
-TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> [seqNum=<N>] [epoch=<N>] [key=<key>] message=<payload>
+TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> [seqNum=<N>] epoch=<N> [key=<key>] message=<payload>
 ```
 
-Stages one record in the transaction. The record is not published until `END_TXN ... result=commit` succeeds.
+Stages one record in the transaction. The record is not published until `END_TXN ... result=commit` succeeds. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
 
 ### SEND_OFFSETS_TO_TXN
 
 ```text
-SEND_OFFSETS_TO_TXN transactional_id=<id> topic=<topic> group=<group> P<partition>:<nextOffset>,P<partition>:<nextOffset>
+SEND_OFFSETS_TO_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> topic=<topic> group=<group> member=<member> generation=<N> P<partition>:<nextOffset>,P<partition>:<nextOffset>
 ```
 
-Stages consumer offsets in the transaction. Commit rejects offset regression before applying staged records.
+Stages consumer offsets in the transaction. The broker validates group member, generation, partition ownership, and monotonic offsets before commit.
 
 ### END_TXN
 
 ```text
-END_TXN transactional_id=<id> result=<commit|abort>
+END_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> result=<commit|abort>
 ```
 
-Commits or aborts staged records and offsets. Current scope is broker-side staged record plus offset atomicity; Kafka-style transaction markers and crash recovery of in-flight commit markers remain follow-up work.
+Commits or aborts staged records and offsets. Transaction state is replicated in the metadata FSM and included in snapshots, and committed records use the normal partition-leader publish path. Kafka-style transaction markers, crash recovery of in-flight commit markers, and `read_committed` isolation remain follow-up work.
 
 ### TXN_STATUS
 

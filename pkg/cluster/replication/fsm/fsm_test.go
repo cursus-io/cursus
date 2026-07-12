@@ -12,6 +12,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
 )
@@ -894,5 +895,45 @@ func TestBrokerFSM_Snapshot_Restore_GroupState(t *testing.T) {
 	}
 	if group.Generation != cd.GetGeneration("test-group") {
 		t.Errorf("Generation mismatch: expected %d, got %d", cd.GetGeneration("test-group"), group.Generation)
+	}
+}
+
+func TestBrokerFSM_Snapshot_Restore_TransactionState(t *testing.T) {
+	cfg := &config.Config{LogDir: t.TempDir()}
+	tm := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+	txnManager := transaction.NewManager()
+	f := NewBrokerFSM(tm, nil)
+	f.SetTransactionManager(txnManager)
+
+	if err := txnManager.Begin("tx-restore", "producer-1", 7); err != nil {
+		t.Fatalf("begin failed: %v", err)
+	}
+	if err := txnManager.AddOffsets("tx-restore", "producer-1", 7, []transaction.OffsetOperation{{Topic: "orders", Group: "workers", Member: "member-1", Generation: 3, Partition: 0, Offset: 12}}); err != nil {
+		t.Fatalf("add offsets failed: %v", err)
+	}
+
+	snapshot, err := f.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	buf := new(bytes.Buffer)
+	sink := &MockSnapshotSink{Writer: buf}
+	if err := snapshot.Persist(sink); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+
+	restoredTxnManager := transaction.NewManager()
+	newFSM := NewBrokerFSM(tm, nil)
+	newFSM.SetTransactionManager(restoredTxnManager)
+	if err := newFSM.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatalf("Restore failed: %v", err)
+	}
+
+	tx, err := restoredTxnManager.Status("tx-restore")
+	if err != nil {
+		t.Fatalf("restored transaction missing: %v", err)
+	}
+	if tx.Producer != "producer-1" || tx.Epoch != 7 || len(tx.Offsets) != 1 || tx.Offsets[0].Offset != 12 {
+		t.Fatalf("unexpected restored transaction: %+v", tx)
 	}
 }

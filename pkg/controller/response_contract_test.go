@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -24,9 +25,9 @@ func TestTextCommandResponseContract(t *testing.T) {
 	assertContractSuccess(t, ch.HandleCommand("FETCH_OFFSET topic=contract-topic partition=0 group=contract-group", ctx), "FETCH_OFFSET")
 	assertContractSuccess(t, ch.HandleCommand("BEGIN_TXN transactional_id=contract-tx producerId=contract-producer", ctx), "BEGIN_TXN")
 	assertContractSuccess(t, ch.HandleCommand("TXN_PUBLISH transactional_id=contract-tx topic=contract-topic partition=0 producerId=contract-producer seqNum=1 message=tx", ctx), "TXN_PUBLISH")
-	assertContractSuccess(t, ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=contract-tx topic=contract-topic group=contract-group P0:2", ctx), "SEND_OFFSETS_TO_TXN")
+	assertContractSuccess(t, ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=contract-tx producerId=contract-producer epoch=0 topic=contract-topic group=contract-group member="+ctx.MemberID+" generation="+strconv.Itoa(ctx.Generation)+" P0:2", ctx), "SEND_OFFSETS_TO_TXN")
 	assertContractSuccess(t, ch.HandleCommand("TXN_STATUS transactional_id=contract-tx", ctx), "TXN_STATUS")
-	assertContractSuccess(t, ch.HandleCommand("END_TXN transactional_id=contract-tx result=abort", ctx), "END_TXN")
+	assertContractSuccess(t, ch.HandleCommand("END_TXN transactional_id=contract-tx producerId=contract-producer epoch=0 result=abort", ctx), "END_TXN")
 	assertContractSuccess(t, ch.HandleCommand("LIST_OFFSETS topic=contract-topic", ctx), "LIST_OFFSETS")
 
 	batchCmd := fmt.Sprintf("BATCH_COMMIT topic=contract-topic group=contract-group generation=%d member=%s P0:3", ctx.Generation, ctx.MemberID)

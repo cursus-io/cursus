@@ -22,7 +22,7 @@ func (c *ConsumerClient) TransactionalPublish(transactionalID, topic string, par
 	return err
 }
 
-func (c *ConsumerClient) SendOffsetsToTransaction(transactionalID, topic, group string, offsets map[int]uint64) error {
+func (c *ConsumerClient) SendOffsetsToTransaction(transactionalID, producerID, topic, group, member string, generation int, epoch int64, offsets map[int]uint64) error {
 	pairs := make([]string, 0, len(offsets))
 	partitions := make([]int, 0, len(offsets))
 	for partition := range offsets {
@@ -32,17 +32,17 @@ func (c *ConsumerClient) SendOffsetsToTransaction(transactionalID, topic, group 
 	for _, partition := range partitions {
 		pairs = append(pairs, fmt.Sprintf("P%d:%d", partition, offsets[partition]))
 	}
-	cmd := fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=%s topic=%s group=%s %s", transactionalID, topic, group, strings.Join(pairs, ","))
+	cmd := fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=%s producerId=%s epoch=%d topic=%s group=%s member=%s generation=%d %s", transactionalID, producerID, epoch, topic, group, member, generation, strings.Join(pairs, ","))
 	_, err := c.execTxnCommand(cmd)
 	return err
 }
 
-func (c *ConsumerClient) EndTransaction(transactionalID string, commit bool) error {
+func (c *ConsumerClient) EndTransaction(transactionalID, producerID string, epoch int64, commit bool) error {
 	result := "abort"
 	if commit {
 		result = "commit"
 	}
-	cmd := fmt.Sprintf("END_TXN transactional_id=%s result=%s", transactionalID, result)
+	cmd := fmt.Sprintf("END_TXN transactional_id=%s producerId=%s epoch=%d result=%s", transactionalID, producerID, epoch, result)
 	_, err := c.execTxnCommand(cmd)
 	return err
 }

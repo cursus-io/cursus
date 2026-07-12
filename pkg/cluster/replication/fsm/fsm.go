@@ -10,6 +10,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
@@ -60,6 +61,7 @@ type BrokerFSMState struct {
 	PartitionMetadata map[string]*PartitionMetadata                  `json:"partitionMetadata"`
 	ProducerState     map[string]map[int]map[string]ProducerSequence `json:"producerState"`
 	GroupState        map[string]*coordinator.GroupStateSnapshot     `json:"groupState,omitempty"`
+	TransactionState  map[string]*transaction.Snapshot               `json:"transactionState,omitempty"`
 }
 
 type BrokerFSM struct {
@@ -72,8 +74,9 @@ type BrokerFSM struct {
 	producerState     map[string]map[int]map[string]ProducerSequence // Topic -> Partition -> ProducerID -> Last Epoch/Seq
 	applied           uint64
 
-	tm *topic.TopicManager
-	cd *coordinator.Coordinator
+	tm  *topic.TopicManager
+	cd  *coordinator.Coordinator
+	txn *transaction.Manager
 }
 
 func NewBrokerFSM(tm *topic.TopicManager, cd *coordinator.Coordinator) *BrokerFSM {
@@ -114,6 +117,12 @@ func (f *BrokerFSM) SetCoordinator(cd *coordinator.Coordinator) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cd = cd
+}
+
+func (f *BrokerFSM) SetTransactionManager(txn *transaction.Manager) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.txn = txn
 }
 
 func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
@@ -161,6 +170,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyOffsetSyncCommand(strings.TrimPrefix(data, "OFFSET_SYNC:"))
 	case strings.HasPrefix(data, "BATCH_OFFSET:"):
 		res = f.applyBatchOffsetSyncCommand(strings.TrimPrefix(data, "BATCH_OFFSET:"))
+	case strings.HasPrefix(data, "TXN_SYNC:"):
+		res = f.applyTransactionSyncCommand(strings.TrimPrefix(data, "TXN_SYNC:"))
 	default:
 		res = f.handleUnknownCommand(data)
 	}
@@ -200,6 +211,8 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Info("FSM Restore: Validating snapshot Version 2 (with group state)")
 	case 3:
 		util.Info("FSM Restore: Validating snapshot Version 3 (with producer epochs)")
+	case 4:
+		util.Info("FSM Restore: Validating snapshot Version 4 (with transaction state)")
 	default:
 		return fmt.Errorf("unknown snapshot version: %d", state.Version)
 	}
@@ -220,6 +233,11 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	if state.GroupState != nil && f.cd != nil {
 		f.cd.ImportState(state.GroupState)
 		util.Info("FSM Restore: Restored %d consumer groups from snapshot", len(state.GroupState))
+	}
+
+	if state.TransactionState != nil && f.txn != nil {
+		f.txn.ImportState(state.TransactionState)
+		util.Info("FSM Restore: Restored %d transactions from snapshot", len(state.TransactionState))
 	}
 
 	util.Info("FSM restore completed: %d logs, %d brokers, %d partitions", len(state.Logs), len(state.Brokers), len(state.PartitionMetadata))
@@ -270,6 +288,10 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	if f.cd != nil {
 		groupState = f.cd.ExportState()
 	}
+	var transactionState map[string]*transaction.Snapshot
+	if f.txn != nil {
+		transactionState = f.txn.ExportState()
+	}
 
 	util.Debug("Creating FSM snapshot")
 	return &BrokerFSMSnapshot{
@@ -279,6 +301,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		partitionMetadata: metadataCopy,
 		producerState:     producerStateCopy,
 		groupState:        groupState,
+		transactionState:  transactionState,
 	}, nil
 }
 

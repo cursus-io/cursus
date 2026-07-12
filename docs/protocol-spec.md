@@ -432,7 +432,9 @@ entire batch is rejected with `ERROR: NOT_OWNER ...`. Stale generations return
 
 #### Transaction Coordinator
 
-Cursus exposes a broker-managed transaction coordinator for consume-process-produce workflows. A transaction stages produced records and consumer offsets, then applies them together when `END_TXN ... result=commit` succeeds. Aborted transactions discard staged records and offsets.
+Cursus exposes a broker-managed transaction coordinator for consume-process-produce workflows. In distributed mode, transaction commands are routed by `transactional_id` using the coordinator key `txn:<transactional_id>`. Clients can discover the owner with `FIND_COORDINATOR transactional_id=<id>` and must retry on `ERROR: NOT_COORDINATOR host=<host> port=<port>`.
+
+Transaction state is replicated through the Raft FSM as `TXN_SYNC` and included in FSM snapshot version 4. The coordinator fences stale producers by `(transactional_id, producerId, epoch)`: lower epochs are rejected, and staged operations must use the same producer and epoch that opened the transaction.
 
 **BEGIN_TXN**
 
@@ -445,23 +447,27 @@ Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>
 **TXN_PUBLISH**
 
 ```text
-TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> [seqNum=<N>] [epoch=<N>] [key=<key>] message=<payload>
+TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> [seqNum=<N>] epoch=<N> [key=<key>] message=<payload>
 ```
 
 Success: `OK transactional_id=<id> staged_messages=1 topic=<topic> partition=<N>`.
 
+The record is staged in the transaction coordinator and is not published until `END_TXN ... result=commit`. On commit, the broker uses the normal publish path, including partition-leader routing in distributed mode.
+
 **SEND_OFFSETS_TO_TXN**
 
 ```text
-SEND_OFFSETS_TO_TXN transactional_id=<id> topic=<topic> group=<group> P<partition>:<nextOffset>,P<partition>:<nextOffset>
+SEND_OFFSETS_TO_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> topic=<topic> group=<group> member=<member> generation=<N> P<partition>:<nextOffset>,P<partition>:<nextOffset>
 ```
 
-Success: `OK transactional_id=<id> staged_offsets=<N>`. Offsets keep the same monotonic rule as `COMMIT_OFFSET`; an `END_TXN ... result=commit` fails before publishing records if any staged offset would regress.
+Success: `OK transactional_id=<id> staged_offsets=<N>`.
+
+The broker validates `member`, `generation`, and partition ownership before staging offsets, then validates them again before commit. Offsets keep the same monotonic rule as `COMMIT_OFFSET`; `END_TXN ... result=commit` fails before publishing records if any staged offset would regress.
 
 **END_TXN**
 
 ```text
-END_TXN transactional_id=<id> result=<commit|abort>
+END_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> result=<commit|abort>
 ```
 
 Success: `OK transactional_id=<id> state=<committed|aborted> messages=<N> offsets=<N>`.
@@ -474,7 +480,7 @@ TXN_STATUS transactional_id=<id>
 
 Success: `OK transactional_id=<id> state=<open|committing|committed|aborted> messages=<N> offsets=<N>`.
 
-Current guarantee: a successful transaction commit makes staged records visible and commits staged offsets in one broker-side critical section. This closes the common consume-process-produce gap for a single broker process. Full Kafka-style transaction markers, recovery of in-flight commit markers after broker crash, and `read_committed` isolation over interleaved transactional log records remain follow-up work; clients should still use idempotent producers and idempotent processors until those marker/recovery contracts are complete.
+Current guarantee: a successful transaction commit stages records and offsets behind a broker transaction coordinator, fences stale producer epochs, persists transaction state through the distributed metadata FSM, uses the normal partition-leader publish path, and commits offsets through the consumer-group coordinator. This is stronger than a client-side offset fallback, but it is still not Kafka-level EOS. Full Kafka-style transaction log markers, recovery of in-flight commit markers after broker crash, and `read_committed` isolation over interleaved transactional log records remain follow-up work. Clients should continue to use idempotent producers and idempotent processors until those marker/recovery/isolation contracts are complete.
 
 #### Event Sourcing Commands
 
@@ -693,9 +699,7 @@ Recommended client loop:
 
 This gives at-least-once delivery when the client commits after processing. If a
 client commits before processing and then crashes, it may skip unprocessed
-records, which is at-most-once behavior for that client. Cursus does not provide
-exactly-once processing semantics; applications that need exactly-once effects
-must make their processing idempotent or transactional outside the broker.
+records, which is at-most-once behavior for that client. Cursus provides broker-managed transaction commands for consume-process-produce workflows, but it does not yet provide Kafka-level exactly-once processing semantics with transaction markers and read_committed isolation. Applications that need exactly-once external effects must still make their processors idempotent or transactional outside the broker.
 
 Example for a game server such as wargame-IOCP:
 

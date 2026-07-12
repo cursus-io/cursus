@@ -1003,16 +1003,22 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 
 func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 	args := parseKeyValueArgs(cmd[17:]) // len("FIND_COORDINATOR ") = 17
-	groupName, ok := args["group"]
-	if !ok || groupName == "" {
-		return "ERROR: missing_group command=FIND_COORDINATOR"
+	coordKey := args["group"]
+	coordType := "group"
+	if coordKey == "" {
+		txnID := firstNonEmpty(args["transactional_id"], args["txn"], args["transaction"])
+		if txnID == "" {
+			return "ERROR: missing_coordinator_key command=FIND_COORDINATOR"
+		}
+		coordKey = transactionCoordinatorKey(txnID)
+		coordType = "transaction"
 	}
 
 	host := "localhost"
 	port := ch.Config.BrokerPort
 
 	if ch.isDistributed() {
-		coordID, _, err := ch.Cluster.Router.FindCoordinator(groupName)
+		coordID, _, err := ch.Cluster.Router.FindCoordinator(coordKey)
 		if err != nil {
 			return fmt.Sprintf("ERROR: find_coordinator_failed reason=%q", err.Error())
 		}
@@ -1024,12 +1030,11 @@ func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 			if ch.Config.AdvertisedBrokerPort > 0 {
 				port = ch.Config.AdvertisedBrokerPort
 			}
-			return fmt.Sprintf("OK coordinator_id=%s host=%s port=%d", coordID, host, port)
+			return fmt.Sprintf("OK coordinator_id=%s coordinator_type=%s host=%s port=%d", coordID, coordType, host, port)
 		}
 
-		// Forward to coordinator to get its own advertised address
 		encodedCmd := util.EncodeMessage("", cmd)
-		resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(groupName, string(encodedCmd))
+		resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, string(encodedCmd))
 		if fwdErr != nil {
 			return fmt.Sprintf("ERROR: forward_to_coordinator_failed reason=%q", fwdErr.Error())
 		}
@@ -1042,5 +1047,5 @@ func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 	if ch.Config.AdvertisedBrokerPort > 0 {
 		port = ch.Config.AdvertisedBrokerPort
 	}
-	return fmt.Sprintf("OK coordinator_id=standalone host=%s port=%d", host, port)
+	return fmt.Sprintf("OK coordinator_id=standalone coordinator_type=%s host=%s port=%d", coordType, host, port)
 }

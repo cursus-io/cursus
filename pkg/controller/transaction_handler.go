@@ -7,6 +7,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 func (ch *CommandHandler) handleBeginTxn(cmd string) string {
@@ -14,6 +15,9 @@ func (ch *CommandHandler) handleBeginTxn(cmd string) string {
 	txnID := firstNonEmpty(args["transactional_id"], args["txn"], args["transaction"])
 	if txnID == "" {
 		return "ERROR: missing_transactional_id command=BEGIN_TXN"
+	}
+	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
+		return resp
 	}
 	producerID := firstNonEmpty(args["producerId"], args["producer_id"])
 	if producerID == "" {
@@ -26,6 +30,9 @@ func (ch *CommandHandler) handleBeginTxn(cmd string) string {
 	if err := ch.TxnManager.Begin(txnID, producerID, epoch); err != nil {
 		return fmt.Sprintf("ERROR: transaction_begin_failed reason=%q", err.Error())
 	}
+	if err := ch.syncTransactionState(txnID); err != nil {
+		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
+	}
 	return fmt.Sprintf("OK transactional_id=%s state=open producerId=%s epoch=%d", txnID, producerID, epoch)
 }
 
@@ -35,6 +42,9 @@ func (ch *CommandHandler) handleTxnPublish(cmd string) string {
 	if txnID == "" {
 		return "ERROR: missing_transactional_id command=TXN_PUBLISH"
 	}
+	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
+		return resp
+	}
 	topicName := args["topic"]
 	if topicName == "" {
 		return "ERROR: missing_topic command=TXN_PUBLISH"
@@ -43,9 +53,9 @@ func (ch *CommandHandler) handleTxnPublish(cmd string) string {
 	if message == "" {
 		return "ERROR: missing_message command=TXN_PUBLISH"
 	}
-	producerID := firstNonEmpty(args["producerId"], args["producer_id"])
-	if producerID == "" {
-		return "ERROR: missing_producer_id command=TXN_PUBLISH"
+	producerID, epoch, errResp := parseTxnProducerEpoch(args, "TXN_PUBLISH")
+	if errResp != "" {
+		return errResp
 	}
 	partition := -1
 	if partitionStr := args["partition"]; partitionStr != "" {
@@ -58,10 +68,6 @@ func (ch *CommandHandler) handleTxnPublish(cmd string) string {
 	seqNum, err := parseOptionalUint64(args["seqNum"])
 	if err != nil {
 		return fmt.Sprintf("ERROR: invalid_seq_num reason=%q", err.Error())
-	}
-	epoch, err := parseOptionalInt64(args["epoch"])
-	if err != nil {
-		return fmt.Sprintf("ERROR: invalid_epoch reason=%q", err.Error())
 	}
 
 	t := ch.TopicManager.GetTopic(topicName)
@@ -78,8 +84,11 @@ func (ch *CommandHandler) handleTxnPublish(cmd string) string {
 	if _, err := t.GetPartition(partition); err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 	}
-	if err := ch.TxnManager.AddMessage(txnID, transaction.MessageOperation{Topic: topicName, Partition: partition, Message: msg}); err != nil {
+	if err := ch.TxnManager.AddMessage(txnID, producerID, epoch, transaction.MessageOperation{Topic: topicName, Partition: partition, Message: msg}); err != nil {
 		return fmt.Sprintf("ERROR: transaction_publish_failed reason=%q", err.Error())
+	}
+	if err := ch.syncTransactionState(txnID); err != nil {
+		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s staged_messages=1 topic=%s partition=%d", txnID, topicName, partition)
 }
@@ -90,6 +99,9 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string) string {
 	if txnID == "" {
 		return "ERROR: missing_transactional_id command=SEND_OFFSETS_TO_TXN"
 	}
+	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
+		return resp
+	}
 	topicName := args["topic"]
 	if topicName == "" {
 		return "ERROR: missing_topic command=SEND_OFFSETS_TO_TXN"
@@ -97,6 +109,18 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string) string {
 	groupID := args["group"]
 	if groupID == "" {
 		return "ERROR: missing_group command=SEND_OFFSETS_TO_TXN"
+	}
+	producerID, epoch, errResp := parseTxnProducerEpoch(args, "SEND_OFFSETS_TO_TXN")
+	if errResp != "" {
+		return errResp
+	}
+	memberID := args["member"]
+	if memberID == "" {
+		return "ERROR: missing_member command=SEND_OFFSETS_TO_TXN"
+	}
+	generation, genErr := strconv.Atoi(args["generation"])
+	if genErr != nil {
+		return "ERROR: invalid_generation command=SEND_OFFSETS_TO_TXN"
 	}
 	if ch.Coordinator == nil {
 		return "ERROR: offset_manager_not_available"
@@ -111,10 +135,16 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string) string {
 	}
 	ops := make([]transaction.OffsetOperation, 0, len(offsets))
 	for partition, offset := range offsets {
-		ops = append(ops, transaction.OffsetOperation{Topic: offsetTopic, Group: groupID, Partition: partition, Offset: offset})
+		if errResp := ch.Coordinator.ValidateOwnershipFailure(groupID, memberID, generation, partition); errResp != "" {
+			return errResp
+		}
+		ops = append(ops, transaction.OffsetOperation{Topic: offsetTopic, Group: groupID, Member: memberID, Generation: generation, Partition: partition, Offset: offset})
 	}
-	if err := ch.TxnManager.AddOffsets(txnID, ops); err != nil {
+	if err := ch.TxnManager.AddOffsets(txnID, producerID, epoch, ops); err != nil {
 		return fmt.Sprintf("ERROR: transaction_offsets_failed reason=%q", err.Error())
+	}
+	if err := ch.syncTransactionState(txnID); err != nil {
+		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s staged_offsets=%d", txnID, len(ops))
 }
@@ -125,6 +155,13 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 	if txnID == "" {
 		return "ERROR: missing_transactional_id command=END_TXN"
 	}
+	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
+		return resp
+	}
+	producerID, epoch, errResp := parseTxnProducerEpoch(args, "END_TXN")
+	if errResp != "" {
+		return errResp
+	}
 	result := strings.ToLower(firstNonEmpty(args["result"], args["action"], args["state"]))
 	if result == "" {
 		result = "commit"
@@ -133,22 +170,32 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 		if err := ch.TxnManager.Abort(txnID); err != nil {
 			return fmt.Sprintf("ERROR: transaction_abort_failed reason=%q", err.Error())
 		}
+		if err := ch.syncTransactionState(txnID); err != nil {
+			return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
+		}
 		return fmt.Sprintf("OK transactional_id=%s state=aborted", txnID)
 	}
 	if result != "commit" {
 		return fmt.Sprintf("ERROR: invalid_transaction_result value=%s", result)
 	}
 
-	tx, err := ch.TxnManager.PrepareCommit(txnID)
+	tx, err := ch.TxnManager.PrepareCommit(txnID, producerID, epoch)
 	if err != nil {
 		return fmt.Sprintf("ERROR: transaction_prepare_failed reason=%q", err.Error())
 	}
+	if err := ch.syncTransactionState(txnID); err != nil {
+		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
+	}
 	if err := ch.applyTransaction(tx); err != nil {
 		_ = ch.TxnManager.Abort(txnID)
+		_ = ch.syncTransactionState(txnID)
 		return fmt.Sprintf("ERROR: transaction_commit_failed reason=%q", err.Error())
 	}
 	if err := ch.TxnManager.Commit(txnID); err != nil {
 		return fmt.Sprintf("ERROR: transaction_commit_failed reason=%q", err.Error())
+	}
+	if err := ch.syncTransactionState(txnID); err != nil {
+		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s state=committed messages=%d offsets=%d", txnID, len(tx.Messages), len(tx.Offsets))
 }
@@ -158,6 +205,9 @@ func (ch *CommandHandler) handleTxnStatus(cmd string) string {
 	txnID := firstNonEmpty(args["transactional_id"], args["txn"], args["transaction"])
 	if txnID == "" {
 		return "ERROR: missing_transactional_id command=TXN_STATUS"
+	}
+	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
+		return resp
 	}
 	tx, err := ch.TxnManager.Status(txnID)
 	if err != nil {
@@ -186,23 +236,101 @@ func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
 		if ch.Coordinator == nil {
 			return fmt.Errorf("offset manager not available")
 		}
+		if errResp := ch.Coordinator.ValidateOwnershipFailure(op.Group, op.Member, op.Generation, op.Partition); errResp != "" {
+			return fmt.Errorf("%s", errResp)
+		}
 		if current, ok := ch.Coordinator.GetOffset(op.Group, op.Topic, op.Partition); ok && op.Offset < current {
 			return fmt.Errorf("offset regression group=%s topic=%s partition=%d current=%d got=%d", op.Group, op.Topic, op.Partition, current, op.Offset)
 		}
 	}
 	for _, op := range tx.Messages {
-		msg := op.Message
-		if err := ch.TopicManager.PublishToPartitionWithAck(op.Topic, op.Partition, &msg); err != nil {
+		if err := ch.publishCommittedTransactionMessage(op); err != nil {
 			return err
 		}
 	}
 	for _, op := range tx.Offsets {
-		if err := ch.Coordinator.CommitOffset(op.Group, op.Topic, op.Partition, op.Offset); err != nil {
+		if err := ch.commitTransactionOffset(op); err != nil {
 			return err
 		}
-		ch.recordConsumerLag(op.Topic, op.Partition, op.Offset, op.Group)
 	}
 	return nil
+}
+
+func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.MessageOperation) error {
+	msg := op.Message
+	if ch.isDistributed() {
+		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d", op.Topic, msg.ProducerID, op.Partition, msg.SeqNum, msg.Epoch)
+		if msg.Key != "" {
+			cmd += fmt.Sprintf(" key=%s", msg.Key)
+		}
+		cmd += " message=" + msg.Payload
+		resp := ch.handlePublish(cmd)
+		if !strings.HasPrefix(resp, "OK") && !strings.HasPrefix(resp, "{") {
+			return fmt.Errorf("%s", resp)
+		}
+		return nil
+	}
+	return ch.TopicManager.PublishToPartitionWithAck(op.Topic, op.Partition, &msg)
+}
+
+func (ch *CommandHandler) commitTransactionOffset(op transaction.OffsetOperation) error {
+	if ch.isDistributed() && ch.Cluster != nil && ch.Cluster.Router != nil {
+		cmd := fmt.Sprintf("COMMIT_OFFSET topic=%s partition=%d group=%s offset=%d member=%s generation=%d", op.Topic, op.Partition, op.Group, op.Offset, op.Member, op.Generation)
+		encodedCmd := util.EncodeMessage("", cmd)
+		resp, err := ch.Cluster.Router.ForwardToCoordinator(op.Group, string(encodedCmd))
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(resp, "OK") {
+			return fmt.Errorf("%s", resp)
+		}
+		return nil
+	}
+	if err := ch.Coordinator.CommitOffset(op.Group, op.Topic, op.Partition, op.Offset); err != nil {
+		return err
+	}
+	ch.recordConsumerLag(op.Topic, op.Partition, op.Offset, op.Group)
+	return nil
+}
+
+func (ch *CommandHandler) ensureTransactionCoordinator(txnID string) string {
+	if !ch.isDistributed() {
+		return ""
+	}
+	coordAddr, isCoord := ch.checkCoordinator(transactionCoordinatorKey(txnID))
+	if !isCoord {
+		return notCoordinatorResponse(coordAddr)
+	}
+	return ""
+}
+
+func (ch *CommandHandler) syncTransactionState(txnID string) error {
+	if !ch.isDistributed() {
+		return nil
+	}
+	snapshots := ch.TxnManager.ExportState()
+	snap := snapshots[txnID]
+	if snap == nil {
+		return fmt.Errorf("transaction %s not found", txnID)
+	}
+	_, err := ch.applyViaLeader("TXN_SYNC", map[string]interface{}{"transaction": snap})
+	return err
+}
+
+func transactionCoordinatorKey(txnID string) string {
+	return "txn:" + txnID
+}
+
+func parseTxnProducerEpoch(args map[string]string, command string) (string, int64, string) {
+	producerID := firstNonEmpty(args["producerId"], args["producer_id"])
+	if producerID == "" {
+		return "", 0, fmt.Sprintf("ERROR: missing_producer_id command=%s", command)
+	}
+	epoch, err := parseOptionalInt64(args["epoch"])
+	if err != nil {
+		return "", 0, fmt.Sprintf("ERROR: invalid_epoch reason=%q", err.Error())
+	}
+	return producerID, epoch, ""
 }
 
 func parseTxnOffsetPairs(cmd string) (map[int]uint64, error) {

@@ -63,6 +63,11 @@ func NewCommandHandler(
 		ESHandler:     eventsource.NewHandler(tm),
 		TxnManager:    transaction.NewManager(),
 	}
+	if cc != nil && cc.RaftManager != nil {
+		if fsm := cc.RaftManager.GetFSM(); fsm != nil {
+			fsm.SetTransactionManager(ch.TxnManager)
+		}
+	}
 	ch.commands = []commandEntry{
 		{prefix: "HELP", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHelp() }},
 		{prefix: "LIST_CLUSTER", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListCluster() }},
