@@ -2,6 +2,7 @@ package transaction
 
 import (
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
 )
@@ -160,5 +161,30 @@ func TestManagerDeleteRemovesOneTransaction(t *testing.T) {
 	}
 	if tx.Producer != keepProducer || tx.Epoch != keepEpoch {
 		t.Fatalf("unexpected remaining transaction: %+v", tx)
+	}
+}
+
+func TestManagerPruneExpiredKeepsActiveTransactions(t *testing.T) {
+	m := NewManagerWithExpiration(time.Hour)
+	old := time.Now().Add(-2 * time.Hour)
+	m.ApplySnapshot(&Snapshot{ID: "committed", Producer: "p1", Epoch: 0, State: StateCommitted, CreatedAt: old, UpdatedAt: old})
+	m.ApplySnapshot(&Snapshot{ID: "aborted", Producer: "p2", Epoch: 0, State: StateAborted, CreatedAt: old, UpdatedAt: old})
+	m.ApplySnapshot(&Snapshot{ID: "open", Producer: "p3", Epoch: 0, State: StateOpen, CreatedAt: old, UpdatedAt: old})
+	m.ApplySnapshot(&Snapshot{ID: "committing", Producer: "p4", Epoch: 0, State: StateCommitting, CreatedAt: old, UpdatedAt: old})
+
+	if removed := m.PruneExpired(time.Now()); removed != 2 {
+		t.Fatalf("expected 2 terminal transactions to expire, got %d", removed)
+	}
+	if _, err := m.Status("committed"); err == nil {
+		t.Fatal("expected committed transaction to expire")
+	}
+	if _, err := m.Status("aborted"); err == nil {
+		t.Fatal("expected aborted transaction to expire")
+	}
+	if _, err := m.Status("open"); err != nil {
+		t.Fatalf("expected open transaction to remain: %v", err)
+	}
+	if _, err := m.Status("committing"); err != nil {
+		t.Fatalf("expected committing transaction to remain: %v", err)
 	}
 }

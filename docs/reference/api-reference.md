@@ -30,7 +30,7 @@ Legacy natural-language responses such as `Topic '<name>' now has <N> partitions
 ### CREATE
 
 ```text
-CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read>]
+CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
 ```
 
 Creates a topic or increases its partition count when the topic already exists.
@@ -460,7 +460,7 @@ Clients and SDKs should reconnect to that leader and retry. Followers index repl
 INIT_PRODUCER_ID transactional_id=<id>
 ```
 
-Initializes or reinitializes a broker-managed producer session for a transactional id. Success: `OK transactional_id=<id> producerId=<producer-id> epoch=<N>`. Reinitialization bumps `epoch` and fences older producers for that `transactional_id`. If the transaction is already `committing`, the broker rejects reinitialization so the prepared commit can be retried or recovered.
+Initializes or reinitializes a broker-managed producer session for a transactional id. Success: `OK transactional_id=<id> producerId=<producer-id> epoch=<N>`. Reinitialization bumps `epoch` and fences older producers for that `transactional_id`. If the transaction is already `committing`, the broker rejects reinitialization so the prepared commit can be retried or recovered. Completed transactional ids expire after `transactional_id_expiration_ms`; active `open` and `committing` transactions are retained for recovery.
 
 ### BEGIN_TXN
 
@@ -492,7 +492,7 @@ Stages consumer offsets in the transaction. The broker validates group member, g
 END_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> result=<commit|abort>
 ```
 
-Commits or aborts staged records and offsets. Transaction state is replicated in the metadata FSM and included in snapshots, `INIT_PRODUCER_ID` provides broker-owned producer epoch allocation, committed records use the normal partition-leader publish path with forced idempotent sequence validation, finalization retries are idempotent for the same producer epoch, hidden Cursus transaction markers are appended to touched partition logs after staged offsets are committed, startup recovery finalizes restored `committing` transactions, producer sequence state is rebuilt from partition logs, and committed reads use transaction markers to expose committed transactions, skip aborted transactions, and stop at the first unresolved open transaction as a last-stable-offset boundary. Cursus still does not provide Kafka-compatible partition-log control batches or exactly-once external side effects.
+Commits or aborts staged records and offsets. Transaction state is replicated in the metadata FSM and included in snapshots, `INIT_PRODUCER_ID` provides broker-owned producer epoch allocation, committed records use the normal partition-leader publish path with forced idempotent sequence validation, finalization retries are idempotent for the same producer epoch, hidden Cursus transaction markers with durable Kafka transaction control-record key/value bytes and Cursus control-batch metadata are appended to touched partition logs before staged offsets are committed, startup recovery finalizes restored `committing` transactions, producer sequence state is rebuilt from partition logs, and committed reads use a partition transaction marker index to expose committed transactions, skip aborted transactions, and stop at the first unresolved open transaction as a last-stable-offset boundary. Cursus stores Kafka transaction control-record key/value bytes (`key: int16 version, int16 markerType`; `value: int16 version, int32 coordinatorEpoch`) alongside Cursus control-batch metadata (`control_batch_type=transaction`, `control_batch_version=2`, `control_batch_coordinator_epoch=<epoch>`). The transaction marker payload schema is Kafka-compatible, while the surrounding Cursus log segment is still Cursus-owned rather than Kafka broker network-protocol byte compatibility; external side effects are not made exactly-once by the broker.
 
 ### TXN_STATUS
 
@@ -588,7 +588,7 @@ OK snapshot=null
 
 ## Topic Policy Notes
 
-- Minimal per-topic authorization policy is part of topic metadata: `auth_policy=open|deny_write|deny_read`. It rejects unauthorized topic reads/writes with `ERROR: NOT_AUTHORIZED_FOR_TOPIC ...`, but it is not caller identity-aware ACL/SASL yet. Use TLS and external network/application controls for authentication boundaries.
+- Per-topic authorization policy is part of topic metadata: `auth_policy=open|deny_write|deny_read|acl`. `AUTH principal=<principal> token=<token>` authenticates a connection when `enable_sasl=true`; commands can also include `principal=<principal> auth_token=<token>` for inline authentication. `auth_policy=acl` checks `read_acl` for reads and `write_acl` for writes, returning `ERROR: NOT_AUTHORIZED_FOR_TOPIC ...` on denial. This is a simple SASL-PLAIN-style token contract, not Kafka SASL mechanism byte compatibility; use TLS/mTLS and network controls for broker exposure.
 - Topics expose `retention_hours` and `retention_bytes` policy metadata. `0` means broker default. Reads before the earliest retained offset fail with `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>`. SDKs should apply `auto_offset_reset` (`earliest`, `latest`, or `error`) to decide whether to reset or fail; `latest` should use `LIST_OFFSETS latest`, the next readable committed offset.
 - `partitioner=hash_key` uses FNV-1a 64-bit hash modulo partition count for keyed messages and round-robin for missing keys. `partitioner=round_robin` ignores keys. Increasing partition count can remap future records for an existing key.
 

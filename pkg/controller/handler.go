@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/config"
@@ -31,6 +32,13 @@ type CommandHandler struct {
 	coordCache   map[string]coordCacheEntry
 	coordCacheMu sync.RWMutex
 	txnApplyMu   sync.Mutex
+}
+
+func transactionalIDExpiration(cfg *config.Config) time.Duration {
+	if cfg == nil || cfg.TransactionalIDExpirationMS <= 0 {
+		return 7 * 24 * time.Hour
+	}
+	return time.Duration(cfg.TransactionalIDExpirationMS) * time.Millisecond
 }
 
 // commandEntry defines a single command routing rule.
@@ -61,7 +69,7 @@ func NewCommandHandler(
 		coordCache:    make(map[string]coordCacheEntry),
 		Cluster:       cc,
 		ESHandler:     eventsource.NewHandler(tm),
-		TxnManager:    transaction.NewManager(),
+		TxnManager:    transaction.NewManagerWithExpiration(transactionalIDExpiration(cfg)),
 	}
 	if cc != nil && cc.RaftManager != nil {
 		if fsm := cc.RaftManager.GetFSM(); fsm != nil {
@@ -69,12 +77,13 @@ func NewCommandHandler(
 		}
 	}
 	ch.commands = []commandEntry{
+		{prefix: "AUTH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAuth(cmd, ctx) }},
 		{prefix: "HELP", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHelp() }},
 		{prefix: "LIST_CLUSTER", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListCluster() }},
 		{prefix: "LIST", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList() }},
 		{prefix: "CREATE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd) }},
 		{prefix: "DELETE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd) }},
-		{prefix: "PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd) }},
+		{prefix: "PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd, ctx) }},
 		{prefix: "REGISTER_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRegisterGroup(cmd) }},
 		{prefix: "JOIN_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleJoinGroup(cmd, ctx) }},
 		{prefix: "SYNC_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSyncGroup(cmd) }},
@@ -89,7 +98,7 @@ func NewCommandHandler(
 		{prefix: "BATCH_COMMIT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd) }},
 		{prefix: "INIT_PRODUCER_ID ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleInitProducerID(cmd) }},
 		{prefix: "BEGIN_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBeginTxn(cmd) }},
-		{prefix: "TXN_PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnPublish(cmd) }},
+		{prefix: "TXN_PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnPublish(cmd, ctx) }},
 		{prefix: "SEND_OFFSETS_TO_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSendOffsetsToTxn(cmd) }},
 		{prefix: "END_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleEndTxn(cmd) }},
 		{prefix: "TXN_STATUS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnStatus(cmd) }},
@@ -134,7 +143,14 @@ func (ch *CommandHandler) logCommandResult(cmd, response string) {
 }
 
 func redactCommandSecrets(s string) string {
-	const key = "internal_token="
+	keys := []string{"internal_token=", "auth_token=", "token="}
+	for _, key := range keys {
+		s = redactOneCommandSecret(s, key)
+	}
+	return s
+}
+
+func redactOneCommandSecret(s, key string) string {
 	idx := strings.Index(s, key)
 	if idx == -1 {
 		return s

@@ -46,6 +46,16 @@ broker:
   use_tls: false
   tls_cert_path: "certs/server.crt"
   tls_key_path: "certs/server.key"
+  internal_broker_port: 19000
+  internal_use_tls: false
+  internal_tls_cert_path: "certs/broker.crt"
+  internal_tls_key_path: "certs/broker.key"
+  internal_tls_ca_path: "certs/ca.crt"
+  internal_tls_server_name: "broker.internal"
+  enable_sasl: false
+  sasl_users:
+    - principal: "game-server"
+      token: "change-me"
   
   # Compression
   enable_gzip: false
@@ -111,9 +121,17 @@ The configuration is represented by the Config struct in the codebase, which org
 | `use_tls`        | bool   | false   | Enable TLS for TCP connections               |
 | `tls_cert_path`  | string | ""      | Path to TLS certificate file                 |
 | `tls_key_path`  | string | ""      | Path to TLS private key file                 |
+| `internal_broker_port` | int | 0 | Optional dedicated broker-to-broker command port |
+| `internal_use_tls` | bool | false | Require mutual TLS on the internal broker listener |
+| `internal_tls_cert_path` | string | "" | Broker certificate for internal mTLS |
+| `internal_tls_key_path` | string | "" | Broker private key for internal mTLS |
+| `internal_tls_ca_path` | string | "" | CA used to verify peer broker certificates |
+| `internal_tls_server_name` | string | "" | Server name used by broker-to-broker mTLS clients |
+| `enable_sasl` | bool | false | Enable SASL-PLAIN-style token authentication for text commands |
+| `sasl_users` | list | [] | Principal/token pairs accepted by `AUTH` and inline `principal`/`auth_token` |
 | `enable_gzip`    | bool   | false   | Enable gzip compression for messages        |
 
-When `use_tls` is enabled and certificate paths are provided, the broker loads the certificate using `tls.LoadX509KeyPair()` during initialization 
+When `use_tls` is enabled and certificate paths are provided, the broker loads the certificate using `tls.LoadX509KeyPair()` during initialization. In distributed mode, `internal_broker_port` moves broker-to-broker text commands away from the public client listener. If `internal_use_tls` is enabled, the internal listener requires client certificates signed by `internal_tls_ca_path`, and peer routers dial the internal port with mTLS using `internal_tls_server_name` for certificate verification. If `enable_sasl` is enabled, clients authenticate with `AUTH principal=<principal> token=<token>` or inline `principal=<principal> auth_token=<token>` on protected commands; topic `auth_policy=acl` then checks `read_acl`/`write_acl`.
 
 # DiskHandler Performance Tuning
 
@@ -265,6 +283,15 @@ The Config struct uses both YAML and JSON tags to support both formats. Here's h
 | TLSCertPath               | `tls_cert_path`              | `tls.cert_path`               | --tls-cert               |
 | TLSKeyPath                | `tls_key_path`               | `tls.key_path`                | --tls-key                |
 | EnableGzip                | `enable_gzip`                | `gzip.enable`                 | --gzip                   |
+| InternalBrokerPort        | `internal_broker_port`       | `distribution.internal_broker_port` | --internal-broker-port |
+| InternalUseTLS            | `internal_use_tls`           | `internal_tls.enable`         | --internal-tls           |
+| InternalTLSCertPath        | `internal_tls_cert_path`     | `internal_tls.cert_path`      | --internal-tls-cert      |
+| InternalTLSKeyPath         | `internal_tls_key_path`      | `internal_tls.key_path`       | --internal-tls-key       |
+| InternalTLSCAPath          | `internal_tls_ca_path`       | `internal_tls.ca_path`        | --internal-tls-ca        |
+| InternalTLSServerName      | `internal_tls_server_name`   | `internal_tls.server_name`    | --internal-tls-server-name |
+| EnableSASL                 | `enable_sasl`                | `sasl.enable`                 | --enable-sasl            |
+| ProducerStateTTLMS        | `producer_state_ttl_ms`      | `producer.state.ttl.ms`       | --producer-state-ttl-ms  |
+| TransactionalIDExpirationMS | `transactional_id_expiration_ms` | `transactional.id.expiration.ms` | --transactional-id-expiration-ms |
 | DiskFlushBatchSize        | `disk_flush_batch_size`      | `disk.flush.batch.size`       | --disk-flush-batch       |
 | LingerMS                  | `linger_ms`                  | `linger.ms`                   | --linger-ms              |
 | ChannelBufferSize         | `channel_buffer_size`        | `channel.buffer.size`         | --channel-buffer         |

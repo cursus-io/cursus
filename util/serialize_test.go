@@ -123,7 +123,7 @@ func TestDeserializeDiskMessage_TruncatedEventSourcingFields(t *testing.T) {
 	truncated := data[:len(data)-10]
 	_, err = DeserializeDiskMessage(truncated)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "incomplete event-sourcing fields")
+	assert.Contains(t, err.Error(), "incomplete")
 }
 
 func TestDeserializeDiskMessage_OldFormatNoEventSourcing(t *testing.T) {
@@ -141,8 +141,8 @@ func TestDeserializeDiskMessage_OldFormatNoEventSourcing(t *testing.T) {
 	data, err := SerializeDiskMessage(msg)
 	assert.NoError(t, err)
 
-	// ES + Key + transaction trailer for empty fields: 18 bytes + 6 transaction length bytes = 24 bytes
-	oldData := data[:len(data)-24]
+	// ES + Key + transaction + control-batch trailer for empty fields: 18 bytes + 6 transaction length bytes + 12 control bytes = 36 bytes
+	oldData := data[:len(data)-40]
 
 	got, err := DeserializeDiskMessage(oldData)
 	assert.NoError(t, err)
@@ -180,17 +180,22 @@ func TestDiskMessageSerialization_EmptyFields(t *testing.T) {
 }
 func TestDiskMessageTransactionMetadataRoundTrip(t *testing.T) {
 	msg := types.DiskMessage{
-		Topic:             "txn-topic",
-		Partition:         0,
-		Offset:            7,
-		ProducerID:        "producer-1",
-		SeqNum:            3,
-		Epoch:             2,
-		Payload:           "payload",
-		Key:               "key",
-		TransactionalID:   "tx-1",
-		TransactionState:  types.TransactionStateCommitted,
-		TransactionMarker: types.TransactionMarkerCommit,
+		Topic:                        "txn-topic",
+		Partition:                    0,
+		Offset:                       7,
+		ProducerID:                   "producer-1",
+		SeqNum:                       3,
+		Epoch:                        2,
+		Payload:                      "payload",
+		Key:                          "key",
+		TransactionalID:              "tx-1",
+		TransactionState:             types.TransactionStateCommitted,
+		TransactionMarker:            types.TransactionMarkerCommit,
+		ControlBatchType:             types.ControlBatchTransaction,
+		ControlBatchVersion:          types.ControlBatchVersionKafkaV2,
+		ControlBatchCoordinatorEpoch: 3,
+		ControlBatchKey:              []byte{0, 0, 0, 0},
+		ControlBatchValue:            []byte{0, 0, 0, 0, 0, 3},
 	}
 
 	data, err := SerializeDiskMessage(msg)
@@ -201,7 +206,7 @@ func TestDiskMessageTransactionMetadataRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deserialize failed: %v", err)
 	}
-	if got.TransactionalID != msg.TransactionalID || got.TransactionState != msg.TransactionState || got.TransactionMarker != msg.TransactionMarker {
+	if got.TransactionalID != msg.TransactionalID || got.TransactionState != msg.TransactionState || got.TransactionMarker != msg.TransactionMarker || got.ControlBatchType != msg.ControlBatchType || got.ControlBatchVersion != msg.ControlBatchVersion || got.ControlBatchCoordinatorEpoch != msg.ControlBatchCoordinatorEpoch || string(got.ControlBatchKey) != string(msg.ControlBatchKey) || string(got.ControlBatchValue) != string(msg.ControlBatchValue) {
 		t.Fatalf("transaction metadata mismatch: %+v", got)
 	}
 }

@@ -1,6 +1,9 @@
 package controller
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"sort"
 	"strconv"
@@ -65,8 +68,15 @@ func (ch *CommandHandler) handleBeginTxn(cmd string) string {
 	return fmt.Sprintf("OK transactional_id=%s state=open producerId=%s epoch=%d", txnID, producerID, epoch)
 }
 
-func (ch *CommandHandler) handleTxnPublish(cmd string) string {
+func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) string {
+	var clientCtx *ClientContext
+	if len(ctx) > 0 {
+		clientCtx = ctx[0]
+	}
 	args := parseKeyValueArgs(cmd[len("TXN_PUBLISH "):])
+	if authResp := ch.authenticateInline(args, clientCtx); authResp != "" {
+		return authResp
+	}
 	txnID := firstNonEmpty(args["transactional_id"], args["txn"], args["transaction"])
 	if txnID == "" {
 		return "ERROR: missing_transactional_id command=TXN_PUBLISH"
@@ -103,8 +113,8 @@ func (ch *CommandHandler) handleTxnPublish(cmd string) string {
 	if t == nil {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	if !t.Policy.CanWrite() {
-		return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", topicName)
+	if authResp := ch.authorizeTopicWrite(t.Policy, clientCtx); authResp != "" {
+		return fmt.Sprintf("%s topic=%s", authResp, topicName)
 	}
 	msg := types.Message{Payload: message, ProducerID: producerID, SeqNum: seqNum, Epoch: epoch, Key: args["key"], TransactionalID: txnID, TransactionState: types.TransactionStateOpen}
 	if partition < 0 {
@@ -323,13 +333,13 @@ func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
 				return err
 			}
 		}
+		if err := ch.appendTransactionMarkers(tx, types.TransactionMarkerCommit); err != nil {
+			return err
+		}
 		for _, op := range tx.Offsets {
 			if err := ch.commitTransactionOffset(op); err != nil {
 				return err
 			}
-		}
-		if err := ch.appendTransactionMarkers(tx, types.TransactionMarkerCommit); err != nil {
-			return err
 		}
 		return nil
 	}
@@ -427,14 +437,23 @@ func (ch *CommandHandler) appendTransactionMarkers(tx *transaction.Transaction, 
 
 	partitions := touchedTransactionPartitions(tx)
 	for _, partition := range partitions {
+		controlKey, controlValue, err := kafkaTransactionMarkerBytes(marker, tx.Epoch)
+		if err != nil {
+			return err
+		}
 		msg := types.Message{
-			Payload:           transactionControlMarkerPayload,
-			ProducerID:        transactionMarkerProducerID(tx, marker),
-			SeqNum:            1,
-			Epoch:             tx.Epoch,
-			TransactionalID:   tx.ID,
-			TransactionState:  state,
-			TransactionMarker: marker,
+			Payload:                      transactionControlMarkerPayload,
+			ProducerID:                   transactionMarkerProducerID(tx, marker),
+			SeqNum:                       1,
+			Epoch:                        tx.Epoch,
+			TransactionalID:              tx.ID,
+			TransactionState:             state,
+			TransactionMarker:            marker,
+			ControlBatchType:             types.ControlBatchTransaction,
+			ControlBatchVersion:          types.ControlBatchVersionKafkaV2,
+			ControlBatchCoordinatorEpoch: tx.Epoch,
+			ControlBatchKey:              controlKey,
+			ControlBatchValue:            controlValue,
 		}
 		if err := ch.publishTransactionMarker(partition.Topic, partition.Partition, msg); err != nil {
 			return err
@@ -474,7 +493,7 @@ func touchedTransactionPartitions(tx *transaction.Transaction) []transactionPart
 
 func (ch *CommandHandler) publishTransactionMarker(topicName string, partition int, msg types.Message) error {
 	if ch.isDistributed() {
-		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true transactional_id=%s transaction_state=%s transaction_marker=%s internal_txn_publish=true message=%s", topicName, msg.ProducerID, partition, msg.SeqNum, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.Payload)
+		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true transactional_id=%s transaction_state=%s transaction_marker=%s control_batch_type=%s control_batch_version=%d control_batch_coordinator_epoch=%d control_batch_key=%s control_batch_value=%s internal_txn_publish=true message=%s", topicName, msg.ProducerID, partition, msg.SeqNum, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.ControlBatchType, msg.ControlBatchVersion, msg.ControlBatchCoordinatorEpoch, base64.StdEncoding.EncodeToString(msg.ControlBatchKey), base64.StdEncoding.EncodeToString(msg.ControlBatchValue), msg.Payload)
 		resp := ch.handlePublish(cmd)
 		if !strings.HasPrefix(resp, "OK") && !strings.HasPrefix(resp, "{") {
 			return fmt.Errorf("%s", resp)
@@ -554,6 +573,19 @@ func (ch *CommandHandler) validateTransactionRecordPublish(tx *transaction.Trans
 }
 
 func (ch *CommandHandler) validateTransactionMarkerPublish(tx *transaction.Transaction, topicName string, partition int, msg *types.Message) string {
+	if msg.ControlBatchType != types.ControlBatchTransaction || msg.ControlBatchVersion != types.ControlBatchVersionKafkaV2 {
+		return fmt.Sprintf("ERROR: invalid_transaction_control_batch transactional_id=%s type=%s version=%d", tx.ID, msg.ControlBatchType, msg.ControlBatchVersion)
+	}
+	if msg.ControlBatchCoordinatorEpoch != tx.Epoch {
+		return fmt.Sprintf("ERROR: invalid_transaction_control_epoch transactional_id=%s current_epoch=%d control_epoch=%d", tx.ID, tx.Epoch, msg.ControlBatchCoordinatorEpoch)
+	}
+	expectedKey, expectedValue, err := kafkaTransactionMarkerBytes(msg.TransactionMarker, tx.Epoch)
+	if err != nil {
+		return fmt.Sprintf("ERROR: invalid_transaction_control_epoch transactional_id=%s reason=%q", tx.ID, err.Error())
+	}
+	if !bytes.Equal(msg.ControlBatchKey, expectedKey) || !bytes.Equal(msg.ControlBatchValue, expectedValue) {
+		return fmt.Sprintf("ERROR: invalid_transaction_control_record transactional_id=%s", tx.ID)
+	}
 	if msg.TransactionMarker != types.TransactionMarkerCommit && msg.TransactionMarker != types.TransactionMarkerAbort {
 		return fmt.Sprintf("ERROR: invalid_transaction_marker marker=%s", msg.TransactionMarker)
 	}
@@ -722,4 +754,26 @@ func parseOptionalInt64(value string) (int64, error) {
 		return 0, nil
 	}
 	return strconv.ParseInt(value, 10, 64)
+}
+
+func kafkaTransactionMarkerBytes(marker string, coordinatorEpoch int64) ([]byte, []byte, error) {
+	if coordinatorEpoch < -(1<<31) || coordinatorEpoch > (1<<31)-1 {
+		return nil, nil, fmt.Errorf("coordinator epoch out of int32 range: %d", coordinatorEpoch)
+	}
+	var markerType int16
+	switch marker {
+	case types.TransactionMarkerCommit:
+		markerType = 0
+	case types.TransactionMarkerAbort:
+		markerType = 1
+	default:
+		return nil, nil, fmt.Errorf("invalid transaction marker %q", marker)
+	}
+	key := make([]byte, 4)
+	binary.BigEndian.PutUint16(key[0:2], 0)
+	binary.BigEndian.PutUint16(key[2:4], uint16(markerType))
+	value := make([]byte, 6)
+	binary.BigEndian.PutUint16(value[0:2], 0)
+	binary.BigEndian.PutUint32(value[2:6], uint32(int32(coordinatorEpoch)))
+	return key, value, nil
 }

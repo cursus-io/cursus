@@ -11,13 +11,16 @@ const (
 	AuthPolicyOpen        = "open"
 	AuthPolicyDenyWrite   = "deny_write"
 	AuthPolicyDenyRead    = "deny_read"
+	AuthPolicyACL         = "acl"
 )
 
 type Policy struct {
-	RetentionHours int    `json:"retention_hours,omitempty"`
-	RetentionBytes int64  `json:"retention_bytes,omitempty"`
-	Partitioner    string `json:"partitioner"`
-	AuthPolicy     string `json:"auth_policy"`
+	RetentionHours int      `json:"retention_hours,omitempty"`
+	RetentionBytes int64    `json:"retention_bytes,omitempty"`
+	Partitioner    string   `json:"partitioner"`
+	AuthPolicy     string   `json:"auth_policy"`
+	ReadACL        []string `json:"read_acl,omitempty"`
+	WriteACL       []string `json:"write_acl,omitempty"`
 }
 
 func DefaultPolicy() Policy {
@@ -43,7 +46,7 @@ func (p Policy) Normalize() (Policy, error) {
 	}
 	p.AuthPolicy = strings.ToLower(strings.TrimSpace(p.AuthPolicy))
 	switch p.AuthPolicy {
-	case AuthPolicyOpen, AuthPolicyDenyWrite, AuthPolicyDenyRead:
+	case AuthPolicyOpen, AuthPolicyDenyWrite, AuthPolicyDenyRead, AuthPolicyACL:
 	default:
 		return p, fmt.Errorf("invalid auth policy %q", p.AuthPolicy)
 	}
@@ -63,4 +66,38 @@ func (p Policy) CanRead() bool {
 
 func (p Policy) CanWrite() bool {
 	return p.AuthPolicy != AuthPolicyDenyWrite
+}
+
+func (p Policy) CanReadPrincipal(principal string) bool {
+	if p.AuthPolicy == AuthPolicyDenyRead {
+		return false
+	}
+	if p.AuthPolicy != AuthPolicyACL {
+		return true
+	}
+	return aclContains(p.ReadACL, principal)
+}
+
+func (p Policy) CanWritePrincipal(principal string) bool {
+	if p.AuthPolicy == AuthPolicyDenyWrite {
+		return false
+	}
+	if p.AuthPolicy != AuthPolicyACL {
+		return true
+	}
+	return aclContains(p.WriteACL, principal)
+}
+
+func aclContains(acl []string, principal string) bool {
+	principal = strings.TrimSpace(principal)
+	if principal == "" {
+		return false
+	}
+	for _, item := range acl {
+		item = strings.TrimSpace(item)
+		if item == "*" || item == principal {
+			return true
+		}
+	}
+	return false
 }

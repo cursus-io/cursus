@@ -57,14 +57,50 @@ type Snapshot struct {
 }
 
 type Manager struct {
-	mu   sync.Mutex
-	txns map[string]*Transaction
+	mu         sync.Mutex
+	txns       map[string]*Transaction
+	expiration time.Duration
 }
 
 func NewManager() *Manager {
-	return &Manager{txns: make(map[string]*Transaction)}
+	return NewManagerWithExpiration(7 * 24 * time.Hour)
 }
 
+func NewManagerWithExpiration(expiration time.Duration) *Manager {
+	if expiration <= 0 {
+		expiration = 7 * 24 * time.Hour
+	}
+	return &Manager{txns: make(map[string]*Transaction), expiration: expiration}
+}
+
+func (m *Manager) PruneExpired(now time.Time) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pruneExpiredLocked(now)
+}
+
+func (m *Manager) pruneExpiredLocked(now time.Time) int {
+	if m.expiration <= 0 {
+		return 0
+	}
+	cutoff := now.Add(-m.expiration)
+	removed := 0
+	for id, tx := range m.txns {
+		if tx == nil {
+			delete(m.txns, id)
+			removed++
+			continue
+		}
+		switch tx.State {
+		case StateCommitted, StateAborted:
+			if tx.UpdatedAt.Before(cutoff) {
+				delete(m.txns, id)
+				removed++
+			}
+		}
+	}
+	return removed
+}
 func (m *Manager) InitProducer(id string) (string, int64, error) {
 	if id == "" {
 		return "", 0, fmt.Errorf("missing transaction id")
@@ -72,6 +108,7 @@ func (m *Manager) InitProducer(id string) (string, int64, error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.pruneExpiredLocked(time.Now())
 
 	producer := producerIDForTransactionalID(id)
 	epoch := int64(0)

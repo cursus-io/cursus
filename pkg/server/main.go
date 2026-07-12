@@ -179,6 +179,11 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	if cc != nil {
 		cc.SetLocalProcessor(globalCH)
 	}
+	if cfg.EnabledDistribution && cfg.InternalBrokerPort > 0 {
+		if err := startInternalBrokerListener(ctx, cfg, globalCH); err != nil {
+			return err
+		}
+	}
 	go func() {
 		time.Sleep(2 * time.Second)
 		if err := globalCH.RecoverPreparedTransactions(); err != nil {
@@ -210,6 +215,42 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 		}
 		workerCh <- conn
 	}
+}
+
+func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHandler *controller.CommandHandler) error {
+	addr := fmt.Sprintf(":%d", cfg.InternalBrokerPort)
+	var ln net.Listener
+	var err error
+	if cfg.InternalUseTLS {
+		ln, err = tls.Listen("tcp", addr, cfg.InternalServerTLSConfig())
+	} else {
+		ln, err = net.Listen("tcp", addr)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to start internal broker listener on %s: %w", addr, err)
+	}
+
+	util.Info("🔒 Internal broker listener started on %s (mTLS=%v)", addr, cfg.InternalUseTLS)
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					util.Error("⚠️ Internal accept error: %v", err)
+					continue
+				}
+			}
+			go handleConn(ctx, conn, cmdHandler)
+		}
+	}()
+	return nil
 }
 
 // handleConn processes a connection using a shared CommandHandler.

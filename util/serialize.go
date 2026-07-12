@@ -151,7 +151,7 @@ var diskMsgBufPool = sync.Pool{
 func EstimateDiskMessageSize(msg types.DiskMessage) int {
 	return 2 + len(msg.Topic) + 4 + 8 + 2 + len(msg.ProducerID) + 8 + 8 +
 		4 + len(msg.Payload) + 2 + len(msg.Key) +
-		2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata) + 2 + len(msg.TransactionalID) + 2 + len(msg.TransactionState) + 2 + len(msg.TransactionMarker)
+		2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata) + 2 + len(msg.TransactionalID) + 2 + len(msg.TransactionState) + 2 + len(msg.TransactionMarker) + 2 + len(msg.ControlBatchType) + 2 + 8 + 2 + len(msg.ControlBatchKey) + 2 + len(msg.ControlBatchValue)
 }
 
 // SerializeDiskMessage serializes a DiskMessage for disk storage
@@ -195,6 +195,18 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	txnMarkerLen, ok := SafeIntToUint16(len(msg.TransactionMarker))
 	if !ok {
 		return nil, fmt.Errorf("transactionMarker too long: %d", len(msg.TransactionMarker))
+	}
+	controlBatchTypeLen, ok := SafeIntToUint16(len(msg.ControlBatchType))
+	if !ok {
+		return nil, fmt.Errorf("controlBatchType too long: %d", len(msg.ControlBatchType))
+	}
+	controlBatchKeyLen, ok := SafeIntToUint16(len(msg.ControlBatchKey))
+	if !ok {
+		return nil, fmt.Errorf("controlBatchKey too long: %d", len(msg.ControlBatchKey))
+	}
+	controlBatchValueLen, ok := SafeIntToUint16(len(msg.ControlBatchValue))
+	if !ok {
+		return nil, fmt.Errorf("controlBatchValue too long: %d", len(msg.ControlBatchValue))
 	}
 	epochVal, ok := SafeInt64ToUint64(msg.Epoch)
 	if !ok {
@@ -276,6 +288,29 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	binary.BigEndian.PutUint16(tmp[:2], txnMarkerLen)
 	buf = append(buf, tmp[:2]...)
 	buf = append(buf, msg.TransactionMarker...)
+
+	// Control batch metadata (optional trailer; Kafka-compatible transaction marker semantics)
+	binary.BigEndian.PutUint16(tmp[:2], controlBatchTypeLen)
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.ControlBatchType...)
+
+	binary.BigEndian.PutUint16(tmp[:2], uint16(msg.ControlBatchVersion))
+	buf = append(buf, tmp[:2]...)
+
+	controlEpochVal, ok := SafeInt64ToUint64(msg.ControlBatchCoordinatorEpoch)
+	if !ok {
+		return nil, fmt.Errorf("negative control batch coordinator epoch: %d", msg.ControlBatchCoordinatorEpoch)
+	}
+	binary.BigEndian.PutUint64(tmp[:8], controlEpochVal)
+	buf = append(buf, tmp[:8]...)
+
+	binary.BigEndian.PutUint16(tmp[:2], controlBatchKeyLen)
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.ControlBatchKey...)
+
+	binary.BigEndian.PutUint16(tmp[:2], controlBatchValueLen)
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.ControlBatchValue...)
 
 	// Return a copy so the pooled buffer can be reused
 	result := make([]byte, len(buf))
@@ -425,6 +460,34 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 			if err := readDiskString(data, &offset, &msg.TransactionMarker, "transaction marker"); err != nil {
 				return msg, err
 			}
+			if offset < len(data) {
+				if err := readDiskString(data, &offset, &msg.ControlBatchType, "control batch type"); err != nil {
+					return msg, err
+				}
+				if offset+2 > len(data) {
+					return msg, fmt.Errorf("incomplete control batch version field: truncated value")
+				}
+				msg.ControlBatchVersion = int16(binary.BigEndian.Uint16(data[offset : offset+2]))
+				offset += 2
+				if offset+8 > len(data) {
+					return msg, fmt.Errorf("incomplete control batch coordinator epoch field: truncated value")
+				}
+				controlEpochRaw := binary.BigEndian.Uint64(data[offset : offset+8])
+				controlEpochVal, ok := SafeUint64ToInt64(controlEpochRaw)
+				if !ok {
+					return msg, fmt.Errorf("control batch coordinator epoch value %d exceeds int64 max", controlEpochRaw)
+				}
+				msg.ControlBatchCoordinatorEpoch = controlEpochVal
+				offset += 8
+				if offset < len(data) {
+					if err := readDiskBytes(data, &offset, &msg.ControlBatchKey, "control batch key"); err != nil {
+						return msg, err
+					}
+					if err := readDiskBytes(data, &offset, &msg.ControlBatchValue, "control batch value"); err != nil {
+						return msg, err
+					}
+				}
+			}
 		}
 	}
 
@@ -442,5 +505,23 @@ func readDiskString(data []byte, offset *int, out *string, field string) error {
 	}
 	*out = string(data[*offset : *offset+fieldLen])
 	*offset += fieldLen
+	return nil
+}
+
+func readDiskBytes(data []byte, offset *int, dest *[]byte, field string) error {
+	if *offset+2 > len(data) {
+		return fmt.Errorf("incomplete %s length field: truncated value", field)
+	}
+	length := int(binary.BigEndian.Uint16(data[*offset : *offset+2]))
+	*offset += 2
+	if *offset+length > len(data) {
+		return fmt.Errorf("incomplete %s field: expected %d bytes", field, length)
+	}
+	if length == 0 {
+		*dest = nil
+	} else {
+		*dest = append((*dest)[:0], data[*offset:*offset+length]...)
+	}
+	*offset += length
 	return nil
 }

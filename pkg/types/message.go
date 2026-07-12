@@ -11,6 +11,10 @@ const (
 	TransactionMarkerNone   = ""
 	TransactionMarkerCommit = "commit"
 	TransactionMarkerAbort  = "abort"
+
+	ControlBatchNone           = ""
+	ControlBatchTransaction    = "transaction"
+	ControlBatchVersionKafkaV2 = 2
 )
 
 // Message represents a single message
@@ -27,9 +31,14 @@ type Message struct {
 	AggregateVersion uint64
 	Metadata         string
 
-	TransactionalID   string
-	TransactionState  string
-	TransactionMarker string
+	TransactionalID              string
+	TransactionState             string
+	TransactionMarker            string
+	ControlBatchType             string
+	ControlBatchVersion          int16
+	ControlBatchCoordinatorEpoch int64
+	ControlBatchKey              []byte
+	ControlBatchValue            []byte
 
 	RetryCount int
 	Retry      bool
@@ -66,9 +75,14 @@ type DiskMessage struct {
 	AggregateVersion uint64
 	Metadata         string
 
-	TransactionalID   string
-	TransactionState  string
-	TransactionMarker string
+	TransactionalID              string
+	TransactionState             string
+	TransactionMarker            string
+	ControlBatchType             string
+	ControlBatchVersion          int16
+	ControlBatchCoordinatorEpoch int64
+	ControlBatchKey              []byte
+	ControlBatchValue            []byte
 }
 
 // AppendResult represents the result of appending a message to storage

@@ -127,7 +127,7 @@ Text command responses are machine-readable.
 
 **CREATE**
 ```
-CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [replication_factor=<N>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read>]
+CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [replication_factor=<N>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
 ```
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
@@ -137,10 +137,12 @@ CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [replication_fact
 | retention_hours | No | 0 | Per-topic retention hours override metadata; 0 means broker default |
 | retention_bytes | No | 0 | Per-topic retention bytes override metadata; 0 means broker default |
 | partitioner | No | hash_key | `hash_key` uses message key hash, `round_robin` ignores keys |
-| auth_policy | No | open | `open`, `deny_write`, or `deny_read` topic policy |
+| auth_policy | No | open | `open`, `deny_write`, `deny_read`, or `acl` topic policy |
+| read_acl | No | - | Comma-separated principals allowed to read when `auth_policy=acl`; `*` allows any authenticated principal |
+| write_acl | No | - | Comma-separated principals allowed to write when `auth_policy=acl`; `*` allows any authenticated principal |
 | replication_factor | No | 3 | Replica count (distributed mode) |
 
-Response: `OK topic=<name> partitions=<N> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read> retention_hours=<N> retention_bytes=<N>`
+Response: `OK topic=<name> partitions=<N> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>`
 
 **DELETE**
 ```
@@ -436,7 +438,7 @@ entire batch is rejected with `ERROR: NOT_OWNER ...`. Stale generations return
 
 Cursus exposes a broker-managed transaction coordinator for consume-process-produce workflows. In distributed mode, transaction commands are routed by `transactional_id` using the coordinator key `txn:<transactional_id>`. Clients can discover the owner with `FIND_COORDINATOR transactional_id=<id>` and must retry on `ERROR: NOT_COORDINATOR host=<host> port=<port>`.
 
-Transaction state is replicated through the Raft FSM as `TXN_SYNC` and included in FSM snapshot version 4. Clients should first call `INIT_PRODUCER_ID` for a `transactional_id`; the broker returns the authoritative `(producerId, epoch)` session and bumps `epoch` on re-initialization to fence older producers. The coordinator fences stale producers by `(transactional_id, producerId, epoch)`: lower epochs are rejected, and staged operations must use the same producer and epoch that opened the transaction.
+Transaction state is replicated through the Raft FSM as `TXN_SYNC` and included in FSM snapshot version 4. Clients should first call `INIT_PRODUCER_ID` for a `transactional_id`; the broker returns the authoritative `(producerId, epoch)` session and bumps `epoch` on re-initialization to fence older producers. The coordinator fences stale producers by `(transactional_id, producerId, epoch)`: lower epochs are rejected, and staged operations must use the same producer and epoch that opened the transaction. Completed transactional ids are retained for `transactional_id_expiration_ms` so retry/fencing state survives normal restarts, while active `open` and `committing` transactions are not expired by the cleanup path.
 
 **INIT_PRODUCER_ID**
 
@@ -490,7 +492,7 @@ TXN_STATUS transactional_id=<id>
 
 Success: `OK transactional_id=<id> state=<open|committing|committed|aborted> messages=<N> offsets=<N>`.
 
-Current guarantee: a successful transaction commit stages records and offsets behind a broker transaction coordinator, fences stale producer epochs, persists transaction state through the distributed metadata FSM, writes hidden Cursus transaction control markers to touched partition logs, uses the normal partition-leader publish path, commits offsets through the consumer-group coordinator, and makes `ReadCommitted`/`CONSUME` use transaction markers to expose committed transactions, skip aborted transactions, and stop at the first unresolved open transaction as a last-stable-offset boundary. `INIT_PRODUCER_ID` provides broker-owned producer epoch allocation for transactional ids. Retried `END_TXN` requests for an already committed or aborted transaction are idempotent for the same producer epoch. On broker start, restored `committing` transactions are recovered by replaying the prepared transaction and finalizing it as committed on the transaction coordinator; producer sequence state is rebuilt from partition logs so replay does not append duplicate transactional records after a lost producer-state checkpoint. This is stronger than a client-side offset fallback, but it is still not byte-compatible with Kafka transaction control batches and does not make external side effects exactly-once; clients should continue to use idempotent processors for external systems.
+Current guarantee: a successful transaction commit stages records and offsets behind a broker transaction coordinator, fences stale producer epochs, persists transaction state through the distributed metadata FSM, writes hidden Cursus transaction control markers with durable Kafka transaction control-record key/value bytes and Cursus control-batch metadata to touched partition logs, uses the normal partition-leader publish path, appends commit markers before applying staged offsets, commits offsets through the consumer-group coordinator, and makes `ReadCommitted`/`CONSUME` use transaction markers to expose committed transactions, skip aborted transactions, and stop at the first unresolved open transaction as a last-stable-offset boundary. Partitions maintain an in-memory transaction marker index rebuilt from durable logs on startup, so `read_committed` does not need to rediscover every later marker by scanning from the requested offset. `INIT_PRODUCER_ID` provides broker-owned producer epoch allocation for transactional ids. Retried `END_TXN` requests for an already committed or aborted transaction are idempotent for the same producer epoch. On broker start, restored `committing` transactions are recovered by replaying the prepared transaction and finalizing it as committed on the transaction coordinator; producer sequence state is rebuilt from partition logs so replay does not append duplicate transactional records after a lost producer-state checkpoint. The marker contract is stored in Cursus log records (`control_batch_type=transaction`, `control_batch_version=2`, `control_batch_coordinator_epoch=<epoch>`) plus Kafka transaction control-record key/value bytes (`key: int16 version, int16 markerType`; `value: int16 version, int32 coordinatorEpoch`). This makes the transaction marker payload schema Kafka-compatible while the surrounding Cursus log segment remains Cursus-owned, not a Kafka broker network-protocol byte stream. Cursus does not make external side effects exactly-once. Clients should continue to use idempotent processors for external systems.
 
 #### Event Sourcing Commands
 
@@ -514,7 +516,7 @@ APPEND_STREAM topic=<name> key=<aggregate_key> version=<N> event_type=<type> [sc
 
 Success response: `OK version=<N> offset=<N> partition=<N>`
 
-Internal broker catch-up commands: `LIST_SNAPSHOTS topic=<name> partition=<N>`, `FETCH_SNAPSHOT topic=<name> partition=<N> key=<aggregate_key>`, and `CATCHUP_SNAPSHOTS topic=<name> partition=<N> [leader=<host:port>]`. These commands are for broker-to-broker recovery only. In distributed mode, internal broker commands require `internal_token=<shared-token>` and brokers must be configured with `internal_auth_token`; clients and SDKs must not send these commands directly.
+Internal broker catch-up commands: `LIST_SNAPSHOTS topic=<name> partition=<N>`, `FETCH_SNAPSHOT topic=<name> partition=<N> key=<aggregate_key>`, and `CATCHUP_SNAPSHOTS topic=<name> partition=<N> [leader=<host:port>]`. These commands are for broker-to-broker recovery only. In distributed mode, internal broker commands require `internal_token=<shared-token>` and brokers must be configured with `internal_auth_token`; clients and SDKs must not send these commands directly. Operators can additionally set `internal_broker_port` to move broker-to-broker command forwarding off the public client listener. When `internal_use_tls=true`, that internal listener requires mutual TLS using `internal_tls_cert_path`, `internal_tls_key_path`, and `internal_tls_ca_path`; the router dials peer brokers on the internal port with the same CA trust. The shared internal token remains a command-level guard, but mTLS/internal listener separation is the stronger network boundary.
 
 Error responses:
 - `ERROR: version_conflict current=<N> expected=<N>` — optimistic concurrency failure
@@ -709,7 +711,7 @@ Recommended client loop:
 
 This gives at-least-once delivery when the client commits after processing. If a
 client commits before processing and then crashes, it may skip unprocessed
-records, which is at-most-once behavior for that client. Cursus provides broker-managed transaction commands for consume-process-produce workflows, including producer fencing, durable transaction state, idempotent finalization, hidden partition transaction markers, startup recovery for prepared commits, and read-committed filtering with a last-stable-offset style boundary for unresolved open transactions. It is still not Kafka-level exactly-once for external effects or Kafka-compatible transaction control batches, so applications that need exactly-once external effects must still make their processors idempotent or transactional outside the broker.
+records, which is at-most-once behavior for that client. Cursus provides broker-managed transaction commands for consume-process-produce workflows, including producer fencing, durable transaction state, idempotent finalization, hidden partition transaction markers with durable Kafka transaction control-record key/value bytes and Cursus control-batch metadata, startup recovery for prepared commits, and read-committed filtering with a last-stable-offset style boundary for unresolved open transactions. It is still not exactly-once for external effects, so applications that need exactly-once external effects must still make their processors idempotent or transactional outside the broker.
 
 Example for a game server such as wargame-IOCP:
 
@@ -774,7 +776,7 @@ Client should reconnect to the specified address and retry.
 
 ### Authorization
 
-The wire protocol now exposes a minimal per-topic `auth_policy` metadata contract: `open`, `deny_write`, and `deny_read`. `deny_write` rejects `PUBLISH`/batch publish with `ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=<T> operation=write`; `deny_read` rejects `CONSUME`/`STREAM` with `ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=<T> operation=read`. This is not SASL or identity-aware ACL yet; deployments should still use TLS plus network, service-mesh, or application-level controls for caller authentication.
+The wire protocol exposes per-topic `auth_policy` metadata: `open`, `deny_write`, `deny_read`, and `acl`. `AUTH principal=<principal> token=<token>` authenticates a client connection when `enable_sasl=true`, and individual commands may also provide `principal=<principal> auth_token=<token>` for inline authentication. `auth_policy=acl` checks `read_acl` for `CONSUME`/`STREAM` and `write_acl` for `PUBLISH`/`TXN_PUBLISH`; unauthorized operations return `ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=<T> operation=<read|write>`. This is a simple SASL-PLAIN-style token contract, not Kafka SASL mechanism byte compatibility. Deployments that expose brokers across trust boundaries should still use TLS/mTLS and network controls.
 
 ### Retention
 
@@ -808,7 +810,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - Disk-backed partitions persist producer sequence checkpoints, rebuild producer state from partition logs on broker restart, and use that state to make transactional commit recovery idempotent
 - Distributed FSM snapshots also include producer sequence state for replicated message commands
 - FSM snapshots that encode producer epochs use snapshot version 3. Do not run mixed-version rolling upgrades across brokers that cannot decode producer-epoch snapshot state; upgrade the cluster together or drain snapshots before introducing older binaries.
-- Producer state expires from memory after 30 minutes of inactivity; durable checkpoints retain the last persisted sequence until the partition data is removed
+- Producer state expires from memory after `producer_state_ttl_ms` of inactivity (default 30 minutes); durable checkpoints retain the last persisted sequence until the partition data is removed
 
 ---
 

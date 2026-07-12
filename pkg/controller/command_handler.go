@@ -110,7 +110,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			util.Warn("Failed to register default group with coordinator: %v", err)
 		}
 	}
-	return fmt.Sprintf("OK topic=%s partitions=%d partitioner=%s auth_policy=%s retention_hours=%d retention_bytes=%d", topicName, len(t.Partitions), t.Policy.Partitioner, t.Policy.AuthPolicy, t.Policy.RetentionHours, t.Policy.RetentionBytes)
+	return fmt.Sprintf("OK topic=%s partitions=%d partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d", topicName, len(t.Partitions), t.Policy.Partitioner, t.Policy.AuthPolicy, strings.Join(t.Policy.ReadACL, ","), strings.Join(t.Policy.WriteACL, ","), t.Policy.RetentionHours, t.Policy.RetentionBytes)
 }
 
 func parseTopicPolicy(args map[string]string) (topic.Policy, string) {
@@ -135,11 +135,28 @@ func parseTopicPolicy(args map[string]string) (topic.Policy, string) {
 	if v := args["auth_policy"]; v != "" {
 		policy.AuthPolicy = v
 	}
+	policy.ReadACL = parseACLArg(args["read_acl"])
+	policy.WriteACL = parseACLArg(args["write_acl"])
 	policy, err := policy.Normalize()
 	if err != nil {
 		return policy, fmt.Sprintf("ERROR: invalid_topic_policy reason=%q", err.Error())
 	}
 	return policy, ""
+}
+
+func parseACLArg(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	acl := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			acl = append(acl, part)
+		}
+	}
+	return acl
 }
 
 // handleDelete processes DELETE command
@@ -1008,8 +1025,8 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 		}
 	}
 
-	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s partitioner=%s auth_policy=%s retention_hours=%d retention_bytes=%d",
-		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), t.Policy.Partitioner, t.Policy.AuthPolicy, t.Policy.RetentionHours, t.Policy.RetentionBytes)
+	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d",
+		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), t.Policy.Partitioner, t.Policy.AuthPolicy, strings.Join(t.Policy.ReadACL, ","), strings.Join(t.Policy.WriteACL, ","), t.Policy.RetentionHours, t.Policy.RetentionBytes)
 }
 
 func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
