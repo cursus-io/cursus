@@ -139,7 +139,7 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 							"id": brokerID, "addr": localAddr, "client_addr": clientAddr,
 							"status": "active",
 						})
-						raftCmd := fmt.Sprintf("RAFT_APPLY type=REGISTER payload=%s", string(brokerJSON))
+						raftCmd := fmt.Sprintf("RAFT_APPLY %stype=REGISTER payload=%s", internalAuthPrefix(cfg), string(brokerJSON))
 						encodedCmd := util.EncodeMessage("", raftCmd)
 						if resp, err := cc.Router.ForwardToLeader(string(encodedCmd)); err == nil && !strings.HasPrefix(resp, "ERROR") {
 							util.Info("✅ Registered via leader with client address %s", clientAddr)
@@ -321,6 +321,13 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 			return
 		}
 	}
+}
+
+func internalAuthPrefix(cfg *config.Config) string {
+	if cfg != nil && cfg.InternalAuthToken != "" {
+		return "internal_token=" + cfg.InternalAuthToken + " "
+	}
+	return ""
 }
 
 func initializeConnection(cfg *config.Config, tm *topic.TopicManager, cd *coordinator.Coordinator, sm *stream.StreamManager, cc *clusterController.ClusterController) (*controller.CommandHandler, *controller.ClientContext) {

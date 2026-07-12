@@ -376,3 +376,47 @@ func TestPartition_ReadCommittedRequiresMarkerForTransactionalRecord(t *testing.
 	require.Equal(t, "plain", msgs[0].Payload)
 	dh.AssertExpectations(t)
 }
+
+func TestPartition_ReadCommittedSeparatesMarkersByEpoch(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	dh.On("GetFlushedOffset").Return(uint64(4)).Once()
+	dh.On("GetFirstOffset").Return(uint64(0)).Once()
+	dh.On("ReadMessages", uint64(0), 4).Return([]types.Message{
+		{Offset: 0, Payload: "epoch0", TransactionalID: "tx-reused", TransactionState: types.TransactionStateOpen, Epoch: 0},
+		{Offset: 1, Payload: "epoch0-marker", TransactionalID: "tx-reused", TransactionMarker: types.TransactionMarkerCommit, Epoch: 0},
+		{Offset: 2, Payload: "epoch1-open", TransactionalID: "tx-reused", TransactionState: types.TransactionStateOpen, Epoch: 1},
+		{Offset: 3, Payload: "after"},
+	}, nil).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.SetHWM(4)
+
+	msgs, err := p.ReadCommitted(0, 10)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Equal(t, "epoch0", msgs[0].Payload)
+	dh.AssertExpectations(t)
+}
+
+func TestPartition_ReadCommittedIgnoresMarkerBeforeRecord(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	dh.On("GetFlushedOffset").Return(uint64(3)).Once()
+	dh.On("GetFirstOffset").Return(uint64(0)).Once()
+	dh.On("ReadMessages", uint64(0), 3).Return([]types.Message{
+		{Offset: 0, Payload: "early-marker", TransactionalID: "tx-order", TransactionMarker: types.TransactionMarkerCommit, Epoch: 0},
+		{Offset: 1, Payload: "late-record", TransactionalID: "tx-order", TransactionState: types.TransactionStateOpen, Epoch: 0},
+		{Offset: 2, Payload: "after"},
+	}, nil).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.SetHWM(3)
+
+	msgs, err := p.ReadCommitted(0, 10)
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+	dh.AssertExpectations(t)
+}

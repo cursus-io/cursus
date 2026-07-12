@@ -474,7 +474,7 @@ func touchedTransactionPartitions(tx *transaction.Transaction) []transactionPart
 
 func (ch *CommandHandler) publishTransactionMarker(topicName string, partition int, msg types.Message) error {
 	if ch.isDistributed() {
-		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true transactional_id=%s transaction_state=%s transaction_marker=%s message=%s", topicName, msg.ProducerID, partition, msg.SeqNum, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.Payload)
+		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true transactional_id=%s transaction_state=%s transaction_marker=%s internal_txn_publish=true message=%s", topicName, msg.ProducerID, partition, msg.SeqNum, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.Payload)
 		resp := ch.handlePublish(cmd)
 		if !strings.HasPrefix(resp, "OK") && !strings.HasPrefix(resp, "{") {
 			return fmt.Errorf("%s", resp)
@@ -488,7 +488,7 @@ func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.Mess
 	msg.TransactionState = types.TransactionStateOpen
 	msg.TransactionMarker = types.TransactionMarkerNone
 	if ch.isDistributed() {
-		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true", op.Topic, msg.ProducerID, op.Partition, msg.SeqNum, msg.Epoch)
+		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true internal_txn_publish=true", op.Topic, msg.ProducerID, op.Partition, msg.SeqNum, msg.Epoch)
 		if msg.Key != "" {
 			cmd += fmt.Sprintf(" key=%s", msg.Key)
 		}
@@ -505,6 +505,103 @@ func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.Mess
 	return ch.TopicManager.PublishToPartitionWithAckIdempotent(op.Topic, op.Partition, &msg)
 }
 
+func (ch *CommandHandler) validateTransactionPublishMetadata(args map[string]string, topicName string, partition int, msg *types.Message) string {
+	if msg == nil {
+		return ""
+	}
+	hasTxnMetadata := msg.TransactionalID != "" || msg.TransactionState != "" || msg.TransactionMarker != ""
+	if !hasTxnMetadata {
+		return ""
+	}
+	if !strings.EqualFold(args["internal_txn_publish"], "true") {
+		return "ERROR: transaction_metadata_forbidden command=PUBLISH"
+	}
+	if msg.TransactionalID == "" {
+		return "ERROR: missing_transactional_id command=PUBLISH"
+	}
+	if ch.TxnManager == nil {
+		return "ERROR: transaction_manager_not_available command=PUBLISH"
+	}
+	tx, err := ch.TxnManager.Status(msg.TransactionalID)
+	if err != nil {
+		return fmt.Sprintf("ERROR: transaction_not_found transactional_id=%s", msg.TransactionalID)
+	}
+	if tx.Epoch != msg.Epoch {
+		return fmt.Sprintf("ERROR: producer_fenced transactional_id=%s current_epoch=%d requested_epoch=%d", msg.TransactionalID, tx.Epoch, msg.Epoch)
+	}
+	if msg.TransactionMarker != types.TransactionMarkerNone {
+		return ch.validateTransactionMarkerPublish(tx, topicName, partition, msg)
+	}
+	if tx.Producer != msg.ProducerID {
+		return fmt.Sprintf("ERROR: producer_fenced transactional_id=%s current_epoch=%d requested_epoch=%d", msg.TransactionalID, tx.Epoch, msg.Epoch)
+	}
+	return ch.validateTransactionRecordPublish(tx, topicName, partition, msg)
+}
+
+func (ch *CommandHandler) validateTransactionRecordPublish(tx *transaction.Transaction, topicName string, partition int, msg *types.Message) string {
+	if tx.State != transaction.StateCommitting {
+		return fmt.Sprintf("ERROR: transaction_not_committing transactional_id=%s state=%s", tx.ID, tx.State)
+	}
+	if msg.TransactionState != types.TransactionStateOpen {
+		return fmt.Sprintf("ERROR: invalid_transaction_state state=%s", msg.TransactionState)
+	}
+	for _, op := range tx.Messages {
+		if op.Topic == topicName && op.Partition == partition && op.Message.ProducerID == msg.ProducerID && op.Message.SeqNum == msg.SeqNum && op.Message.Epoch == msg.Epoch && op.Message.Payload == msg.Payload && op.Message.Key == msg.Key {
+			return ""
+		}
+	}
+	return fmt.Sprintf("ERROR: transaction_record_not_staged transactional_id=%s", tx.ID)
+}
+
+func (ch *CommandHandler) validateTransactionMarkerPublish(tx *transaction.Transaction, topicName string, partition int, msg *types.Message) string {
+	if msg.TransactionMarker != types.TransactionMarkerCommit && msg.TransactionMarker != types.TransactionMarkerAbort {
+		return fmt.Sprintf("ERROR: invalid_transaction_marker marker=%s", msg.TransactionMarker)
+	}
+	if msg.ProducerID != transactionMarkerProducerID(tx, msg.TransactionMarker) || msg.SeqNum != 1 {
+		return fmt.Sprintf("ERROR: invalid_transaction_marker_producer transactional_id=%s", tx.ID)
+	}
+	if msg.TransactionMarker == types.TransactionMarkerCommit && tx.State != transaction.StateCommitting {
+		return fmt.Sprintf("ERROR: transaction_not_committing transactional_id=%s state=%s", tx.ID, tx.State)
+	}
+	if msg.TransactionMarker == types.TransactionMarkerAbort && tx.State != transaction.StateOpen && tx.State != transaction.StateAborted {
+		return fmt.Sprintf("ERROR: transaction_not_abortable transactional_id=%s state=%s", tx.ID, tx.State)
+	}
+	for _, touched := range touchedTransactionPartitions(tx) {
+		if touched.Topic == topicName && touched.Partition == partition {
+			return ""
+		}
+	}
+	return fmt.Sprintf("ERROR: transaction_marker_partition_not_touched transactional_id=%s topic=%s partition=%d", tx.ID, topicName, partition)
+}
+func (ch *CommandHandler) validateReplicatedTransactionMessage(topicName string, partition int, msg *types.Message) string {
+	if msg == nil {
+		return ""
+	}
+	hasTxnMetadata := msg.TransactionalID != "" || msg.TransactionState != "" || msg.TransactionMarker != ""
+	if !hasTxnMetadata {
+		return ""
+	}
+	if msg.TransactionalID == "" {
+		return "ERROR: missing_transactional_id command=REPLICATE_MESSAGE"
+	}
+	if ch.TxnManager == nil {
+		return "ERROR: transaction_manager_not_available command=REPLICATE_MESSAGE"
+	}
+	tx, err := ch.TxnManager.Status(msg.TransactionalID)
+	if err != nil {
+		return fmt.Sprintf("ERROR: transaction_not_found transactional_id=%s", msg.TransactionalID)
+	}
+	if tx.Epoch != msg.Epoch {
+		return fmt.Sprintf("ERROR: producer_fenced transactional_id=%s current_epoch=%d requested_epoch=%d", msg.TransactionalID, tx.Epoch, msg.Epoch)
+	}
+	if msg.TransactionMarker != types.TransactionMarkerNone {
+		return ch.validateTransactionMarkerPublish(tx, topicName, partition, msg)
+	}
+	if tx.Producer != msg.ProducerID {
+		return fmt.Sprintf("ERROR: producer_fenced transactional_id=%s current_epoch=%d requested_epoch=%d", msg.TransactionalID, tx.Epoch, msg.Epoch)
+	}
+	return ch.validateTransactionRecordPublish(tx, topicName, partition, msg)
+}
 func (ch *CommandHandler) commitTransactionOffset(op transaction.OffsetOperation) error {
 	if ch.isDistributed() && ch.Cluster != nil && ch.Cluster.Router != nil {
 		cmd := fmt.Sprintf("COMMIT_OFFSET topic=%s partition=%d group=%s offset=%d member=%s generation=%d", op.Topic, op.Partition, op.Group, op.Offset, op.Member, op.Generation)

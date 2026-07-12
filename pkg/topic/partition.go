@@ -518,13 +518,13 @@ func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm uint64) ([]
 		return nil, err
 	}
 
-	markers := make(map[string]string)
+	markers := make(map[transactionMarkerKey]transactionMarkerInfo)
 	for _, msg := range messages {
 		if msg.Offset >= hwm {
 			break
 		}
 		if msg.TransactionMarker != types.TransactionMarkerNone && msg.TransactionalID != "" {
-			markers[msg.TransactionalID] = msg.TransactionMarker
+			markers[messageTransactionMarkerKey(msg)] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset}
 		}
 	}
 
@@ -536,7 +536,7 @@ func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm uint64) ([]
 		if msg.TransactionalID == "" || msg.TransactionState != types.TransactionStateOpen {
 			continue
 		}
-		if _, ok := markers[msg.TransactionalID]; !ok && msg.Offset < firstUnresolved {
+		if !hasResolvingMarkerAfter(msg, markers) && msg.Offset < firstUnresolved {
 			firstUnresolved = msg.Offset
 		}
 	}
@@ -603,13 +603,13 @@ func readCommittedScanHasEnoughVisible(messages []types.Message, hwm uint64, max
 	if maxVisible <= 0 {
 		return true
 	}
-	markers := make(map[string]string)
+	markers := make(map[transactionMarkerKey]transactionMarkerInfo)
 	for _, msg := range messages {
 		if msg.Offset >= hwm {
 			break
 		}
 		if msg.TransactionMarker != types.TransactionMarkerNone && msg.TransactionalID != "" {
-			markers[msg.TransactionalID] = msg.TransactionMarker
+			markers[messageTransactionMarkerKey(msg)] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset}
 		}
 	}
 
@@ -621,7 +621,7 @@ func readCommittedScanHasEnoughVisible(messages []types.Message, hwm uint64, max
 		if msg.TransactionalID == "" || msg.TransactionState != types.TransactionStateOpen {
 			continue
 		}
-		if _, ok := markers[msg.TransactionalID]; !ok && msg.Offset < firstUnresolved {
+		if !hasResolvingMarkerAfter(msg, markers) && msg.Offset < firstUnresolved {
 			firstUnresolved = msg.Offset
 		}
 	}
@@ -644,7 +644,26 @@ func readCommittedScanHasEnoughVisible(messages []types.Message, hwm uint64, max
 	return false
 }
 
-func isReadCommittedVisible(msg types.Message, markers map[string]string) bool {
+type transactionMarkerKey struct {
+	transactionalID string
+	epoch           int64
+}
+
+type transactionMarkerInfo struct {
+	marker string
+	offset uint64
+}
+
+func messageTransactionMarkerKey(msg types.Message) transactionMarkerKey {
+	return transactionMarkerKey{transactionalID: msg.TransactionalID, epoch: msg.Epoch}
+}
+
+func hasResolvingMarkerAfter(msg types.Message, markers map[transactionMarkerKey]transactionMarkerInfo) bool {
+	marker, ok := markers[messageTransactionMarkerKey(msg)]
+	return ok && marker.offset > msg.Offset
+}
+
+func isReadCommittedVisible(msg types.Message, markers map[transactionMarkerKey]transactionMarkerInfo) bool {
 	if msg.TransactionMarker != types.TransactionMarkerNone {
 		return false
 	}
@@ -654,7 +673,8 @@ func isReadCommittedVisible(msg types.Message, markers map[string]string) bool {
 	if msg.TransactionState == types.TransactionStateAborted {
 		return false
 	}
-	return markers[msg.TransactionalID] == types.TransactionMarkerCommit
+	marker, ok := markers[messageTransactionMarkerKey(msg)]
+	return ok && marker.offset > msg.Offset && marker.marker == types.TransactionMarkerCommit
 }
 
 func (p *Partition) RecoverProducerStateFromLog() {

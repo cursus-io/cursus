@@ -126,6 +126,8 @@ PUBLISH topic=<name> [partition=<N>] [key=<routing-key>] [producerId=<id>] [seqN
 
 Because `message=` captures the rest of the line, put optional parameters before `message=`.
 
+Transaction metadata fields are not accepted on client `PUBLISH`; use the transaction commands for transactional records. Direct `transactional_id`, `transaction_state`, or `transaction_marker` injection returns `ERROR: transaction_metadata_forbidden command=PUBLISH`.
+
 For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Distributed FSM snapshots that include producer epochs use snapshot version 3; avoid mixed-version rolling upgrades with binaries that cannot decode that snapshot state. For `acks=0`, success is:
 
 ```text
@@ -147,7 +149,7 @@ ERROR: stale_producer_epoch reason="..."
 
 ### REPLICATE_MESSAGE
 
-Internal replication command used between brokers.
+Internal replication command used between brokers. In distributed mode this command requires `internal_token=<shared-token>` before `payload=`. External clients and SDKs must not call it directly.
 
 Success:
 
@@ -158,6 +160,8 @@ OK
 Common errors:
 
 ```text
+ERROR: internal_auth_not_configured command=REPLICATE_MESSAGE
+ERROR: internal_command_unauthorized command=REPLICATE_MESSAGE
 ERROR: missing_payload command=REPLICATE_MESSAGE
 ERROR: unmarshal_failed reason="..."
 ERROR: topic_not_found topic=<name>
@@ -418,7 +422,7 @@ ERROR: distribution_not_enabled
 
 ### RAFT_APPLY
 
-Internal replication command used by distributed brokers.
+Internal replication command used by distributed brokers. In distributed mode this command requires `internal_token=<shared-token>` before `type=`. External clients and SDKs must not call it directly.
 
 Success:
 
@@ -429,6 +433,8 @@ OK
 Common errors:
 
 ```text
+ERROR: internal_auth_not_configured command=RAFT_APPLY
+ERROR: internal_command_unauthorized command=RAFT_APPLY
 ERROR: missing_required_params command=RAFT_APPLY params=type,payload
 ERROR: empty_required_params command=RAFT_APPLY params=type,payload
 ERROR: distribution_required command=RAFT_APPLY
@@ -444,7 +450,7 @@ Event-sourcing commands are routed by aggregate `key`. In distributed mode, the 
 ERROR: NOT_LEADER LEADER_IS <host:port>
 ```
 
-Clients and SDKs should reconnect to that leader and retry. Followers index replicated event-sourcing records, apply quorum-replicated snapshots, and can pull missing snapshots from the partition leader with internal catch-up commands after restart. Partitions restore a synced high-watermark checkpoint with durable-tail clamping, so committed reads remain bounded by the last successful committed tail.
+Clients and SDKs should reconnect to that leader and retry. Followers index replicated event-sourcing records, apply quorum-replicated snapshots, and can pull missing snapshots from the partition leader with token-authenticated internal catch-up commands after restart. Partitions restore a synced high-watermark checkpoint with durable-tail clamping, so committed reads remain bounded by the last successful committed tail.
 
 
 
@@ -470,7 +476,7 @@ Starts a broker-managed transaction using the `producerId` and `epoch` returned 
 TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> seqNum=<N> epoch=<N> [key=<key>] message=<payload>
 ```
 
-Stages one record in the transaction. `seqNum` is required and must be greater than zero; Cursus uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even on non-idempotent topics. The record is not published until `END_TXN ... result=commit` succeeds. Committed records are written with transaction metadata before they enter the normal publish path, but they remain `transaction_state=open` until a hidden Cursus commit marker on the touched partition makes them visible to `read_committed` consumers; marker presence is the visibility authority for transactional records. Commit/abort writes hidden Cursus transaction control markers to touched partition logs. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
+Stages one record in the transaction. `seqNum` is required and must be greater than zero; Cursus uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even on non-idempotent topics. The record is not published until `END_TXN ... result=commit` succeeds. Committed records are written with transaction metadata before they enter the normal publish path, but they remain `transaction_state=open` until a hidden Cursus commit marker on the touched partition makes them visible to `read_committed` consumers; a later marker for the same `(transactional_id, epoch)` is the visibility authority for transactional records. Commit/abort writes hidden Cursus transaction control markers to touched partition logs. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
 
 ### SEND_OFFSETS_TO_TXN
 

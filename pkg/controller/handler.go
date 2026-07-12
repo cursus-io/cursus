@@ -114,13 +114,47 @@ func NewCommandHandler(
 	return ch
 }
 
+var internalCommandPrefixes = []string{
+	"REPLICATE_MESSAGE ",
+	"REPLICATE_SNAPSHOT ",
+	"LIST_SNAPSHOTS ",
+	"FETCH_SNAPSHOT ",
+	"CATCHUP_SNAPSHOTS ",
+	"RAFT_APPLY ",
+}
+
 func (ch *CommandHandler) logCommandResult(cmd, response string) {
 	status := "SUCCESS"
 	if strings.HasPrefix(response, "ERROR:") {
 		status = "FAILURE"
 	}
-	cleanResponse := strings.ReplaceAll(response, "\n", " ")
-	util.Debug("status: '%s', command: '%s' to Response '%s'", status, cmd, cleanResponse)
+	cleanCmd := redactCommandSecrets(cmd)
+	cleanResponse := redactCommandSecrets(strings.ReplaceAll(response, "\n", " "))
+	util.Debug("status: '%s', command: '%s' to Response '%s'", status, cleanCmd, cleanResponse)
+}
+
+func redactCommandSecrets(s string) string {
+	const key = "internal_token="
+	idx := strings.Index(s, key)
+	if idx == -1 {
+		return s
+	}
+
+	var b strings.Builder
+	for idx != -1 {
+		b.WriteString(s[:idx])
+		b.WriteString(key)
+		b.WriteString("<redacted>")
+		rest := s[idx+len(key):]
+		end := 0
+		for end < len(rest) && rest[end] > ' ' {
+			end++
+		}
+		s = rest[end:]
+		idx = strings.Index(s, key)
+	}
+	b.WriteString(s)
+	return b.String()
 }
 
 // HandleCommand processes non-streaming commands and returns a signal for streaming commands.
@@ -137,6 +171,11 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) strin
 	}
 	if strings.HasPrefix(upper, "CONSUME ") {
 		return ch.validateConsumeSyntax(cmd, rawCmd)
+	}
+	if name, ok := internalCommandName(upper); ok {
+		if resp := ch.authorizeInternalCommand(name, cmd); resp != "" {
+			return ch.fail(rawCmd, resp)
+		}
 	}
 
 	resp := ch.handleCommandByType(cmd, upper, ctx)
@@ -158,6 +197,37 @@ func (ch *CommandHandler) handleCommandByType(cmd, upper string, ctx *ClientCont
 		}
 	}
 	return fmt.Sprintf("ERROR: unknown_command command=%s", cmd)
+}
+
+func internalCommandName(upper string) (string, bool) {
+	for _, prefix := range internalCommandPrefixes {
+		if strings.HasPrefix(upper, prefix) {
+			return strings.TrimSpace(prefix), true
+		}
+	}
+	return "", false
+}
+
+func (ch *CommandHandler) authorizeInternalCommand(name, cmd string) string {
+	if ch == nil || ch.Config == nil || !ch.Config.EnabledDistribution {
+		return ""
+	}
+	token := ch.Config.InternalAuthToken
+	if token == "" {
+		return fmt.Sprintf("ERROR: internal_auth_not_configured command=%s", name)
+	}
+	args := parseKeyValueArgs(strings.TrimPrefix(cmd, name+" "))
+	if args["internal_token"] != token {
+		return fmt.Sprintf("ERROR: internal_command_unauthorized command=%s", name)
+	}
+	return ""
+}
+
+func (ch *CommandHandler) internalAuthPrefix() string {
+	if ch != nil && ch.Config != nil && ch.Config.InternalAuthToken != "" {
+		return "internal_token=" + ch.Config.InternalAuthToken + " "
+	}
+	return ""
 }
 
 func (ch *CommandHandler) fail(raw, msg string) string {

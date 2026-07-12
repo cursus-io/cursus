@@ -298,7 +298,7 @@ func (ch *CommandHandler) applyViaLeader(cmdType string, payload map[string]inte
 		return nil, fmt.Errorf("marshal payload: %w", jsonErr)
 	}
 
-	forwardCmd := fmt.Sprintf("RAFT_APPLY type=%s payload=%s", cmdType, string(data))
+	forwardCmd := fmt.Sprintf("RAFT_APPLY %stype=%s payload=%s", ch.internalAuthPrefix(), cmdType, string(data))
 	encodedCmd := util.EncodeMessage("", forwardCmd)
 	resp, fwdErr := ch.Cluster.Router.ForwardToLeader(string(encodedCmd))
 	if fwdErr != nil {

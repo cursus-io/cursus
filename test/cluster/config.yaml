@@ -6,6 +6,7 @@ log_level: "info"
 
 # Distributed Clustering
 enabled_distribution: true
+internal_auth_token: "cursus-test-internal-token"
 raft_port: 9001
 discovery_port: 8000
 min_insync_replicas: 2

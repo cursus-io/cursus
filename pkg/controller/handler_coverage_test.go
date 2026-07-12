@@ -623,6 +623,14 @@ func TestHandlePublish_InvalidEpoch(t *testing.T) {
 	assert.Contains(t, resp, "invalid_epoch")
 }
 
+func TestHandlePublishRejectsExternalTransactionMetadata(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	require.NoError(t, tm.CreateTopic("txn-spoof-topic", 1, false, false))
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("PUBLISH topic=txn-spoof-topic partition=0 acks=1 producerId=p1 seqNum=1 epoch=0 transactional_id=tx-spoof transaction_state=open transaction_marker=commit message=spoof", ctx)
+	assert.Contains(t, resp, "transaction_metadata_forbidden")
+}
 func TestHandlePublish_IdempotentTrue(t *testing.T) {
 	ch, tm := newTestHandler(t)
 	_ = tm.CreateTopic("idem-pub-topic", 1, true, false)
@@ -663,6 +671,15 @@ func TestHandleReplicateMessage_InvalidJSON(t *testing.T) {
 	assert.Contains(t, resp, "unmarshal_failed")
 }
 
+func TestHandleReplicateMessageRejectsUnownedTransactionMetadata(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	require.NoError(t, tm.CreateTopic("rep-spoof-topic", 1, false, false))
+	ctx := NewClientContext("", 0)
+
+	payload := `{"topic":"rep-spoof-topic","partition":0,"messages":[{"Payload":"spoof","ProducerID":"p1","SeqNum":1,"Epoch":0,"TransactionalID":"tx-spoof","TransactionState":"open"}]}`
+	resp := ch.HandleCommand("REPLICATE_MESSAGE payload="+payload, ctx)
+	assert.Contains(t, resp, "transaction_not_found")
+}
 func TestHandleReplicateMessage_TopicNotFound(t *testing.T) {
 	ch, _ := newTestHandler(t)
 	ctx := NewClientContext("", 0)
@@ -1616,4 +1633,53 @@ func TestRecoverPreparedTransactionsCommitsCommittingState(t *testing.T) {
 	offset, ok := coord.GetOffset("txn-recover-group", "txn-recover-topic", 0)
 	require.True(t, ok)
 	assert.Equal(t, uint64(6), offset)
+}
+
+func TestInternalCommandsRequireTokenInDistributedMode(t *testing.T) {
+	ch, _ := newTestHandler(t)
+	ch.Config.EnabledDistribution = true
+	ch.Config.InternalAuthToken = "secret-token"
+	ctx := NewClientContext("", 0)
+
+	for _, cmd := range []string{
+		"REPLICATE_MESSAGE payload={}",
+		"REPLICATE_SNAPSHOT payload={}",
+		"LIST_SNAPSHOTS topic=t partition=0",
+		"FETCH_SNAPSHOT topic=t partition=0 key=k",
+		"CATCHUP_SNAPSHOTS topic=t partition=0",
+		"RAFT_APPLY type=REGISTER payload={}",
+	} {
+		resp := ch.HandleCommand(cmd, ctx)
+		assert.Contains(t, resp, "internal_command_unauthorized", cmd)
+	}
+}
+
+func TestInternalCommandsRejectMissingTokenConfigInDistributedMode(t *testing.T) {
+	ch, _ := newTestHandler(t)
+	ch.Config.EnabledDistribution = true
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("REPLICATE_MESSAGE payload={}", ctx)
+	assert.Contains(t, resp, "internal_auth_not_configured")
+}
+
+func TestInternalCommandTokenAllowsHandlerDispatch(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	ch.Config.EnabledDistribution = true
+	ch.Config.InternalAuthToken = "secret-token"
+	require.NoError(t, tm.CreateTopic("secure-rep-topic", 1, false, false))
+	ctx := NewClientContext("", 0)
+
+	payload := `{"topic":"secure-rep-topic","partition":0,"messages":[{"payload":"hello","producer_id":"p1"}]}`
+	resp := ch.HandleCommand("REPLICATE_MESSAGE internal_token=secret-token payload="+payload, ctx)
+	assert.Equal(t, "OK", resp)
+}
+
+func TestRedactCommandSecrets(t *testing.T) {
+	input := "REPLICATE_MESSAGE internal_token=super-secret payload={\"internal_token\":\"payload-value\"}"
+	redacted := redactCommandSecrets(input)
+
+	assert.NotContains(t, redacted, "super-secret")
+	assert.Contains(t, redacted, "internal_token=<redacted>")
+	assert.Contains(t, redacted, "payload-value")
 }

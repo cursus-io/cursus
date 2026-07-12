@@ -201,6 +201,8 @@ PUBLISH topic=<name> acks=<0|1|-1|all> producerId=<id> [partition=<N>] [seqNum=<
 
 Because `message=` captures the rest of the line, optional parameters such as `partition`, `seqNum`, `epoch`, and `isIdempotent` must appear before `message=` in text commands.
 
+Transaction metadata fields such as `transactional_id`, `transaction_state`, and `transaction_marker` are broker-internal on `PUBLISH`. Clients must use `INIT_PRODUCER_ID`, `BEGIN_TXN`, `TXN_PUBLISH`, and `END_TXN`; direct metadata injection is rejected with `ERROR: transaction_metadata_forbidden command=PUBLISH`.
+
 Response (JSON — `AckResponse`):
 ```json
 {
@@ -460,7 +462,7 @@ TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<prod
 
 Success: `OK transactional_id=<id> staged_messages=1 topic=<topic> partition=<N>`.
 
-The record is staged in the transaction coordinator and is not published until `END_TXN ... result=commit`. `seqNum` is required and must be greater than zero; the broker uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even when the target topic is not globally idempotent. On commit, the broker writes the record with `transactional_id` and `transaction_state=open`, then uses the normal publish path, including partition-leader routing in distributed mode. After records are written and staged offsets are committed, the broker appends a hidden Cursus transaction commit marker to each touched partition; `read_committed` visibility is controlled by that marker, so transactional records are not visible if marker append fails before retry/recovery completes, even if they carry transaction metadata. Uncommitted staged records are not published by this staging path, and abort writes hidden abort markers for touched partitions that already contain transaction records from a retry/recovery path.
+The record is staged in the transaction coordinator and is not published until `END_TXN ... result=commit`. `seqNum` is required and must be greater than zero; the broker uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even when the target topic is not globally idempotent. On commit, the broker writes the record with `transactional_id` and `transaction_state=open`, then uses the normal publish path, including partition-leader routing in distributed mode. After records are written and staged offsets are committed, the broker appends a hidden Cursus transaction commit marker to each touched partition; `read_committed` visibility is controlled by a later marker for the same `(transactional_id, epoch)`, so transactional records are not visible if marker append fails before retry/recovery completes, even if they carry transaction metadata or an older epoch marker exists. Uncommitted staged records are not published by this staging path, and abort writes hidden abort markers for touched partitions that already contain transaction records from a retry/recovery path.
 
 **SEND_OFFSETS_TO_TXN**
 
@@ -512,7 +514,7 @@ APPEND_STREAM topic=<name> key=<aggregate_key> version=<N> event_type=<type> [sc
 
 Success response: `OK version=<N> offset=<N> partition=<N>`
 
-Internal broker catch-up commands: LIST_SNAPSHOTS topic=<name> partition=<N>, FETCH_SNAPSHOT topic=<name> partition=<N> key=<aggregate_key>, and CATCHUP_SNAPSHOTS topic=<name> partition=<N> [leader=<host:port>]. These commands are for broker-to-broker recovery only.
+Internal broker catch-up commands: `LIST_SNAPSHOTS topic=<name> partition=<N>`, `FETCH_SNAPSHOT topic=<name> partition=<N> key=<aggregate_key>`, and `CATCHUP_SNAPSHOTS topic=<name> partition=<N> [leader=<host:port>]`. These commands are for broker-to-broker recovery only. In distributed mode, internal broker commands require `internal_token=<shared-token>` and brokers must be configured with `internal_auth_token`; clients and SDKs must not send these commands directly.
 
 Error responses:
 - `ERROR: version_conflict current=<N> expected=<N>` — optimistic concurrency failure
@@ -571,7 +573,7 @@ SAVE_SNAPSHOT topic=<name> key=<aggregate_key> version=<N> message=<payload>
 
 Success response: `OK version=<N> partition=<N>`
 
-In distributed mode, success means the leader stored the snapshot and replicated it to the configured in-sync replica quorum through the internal `REPLICATE_SNAPSHOT` broker-to-broker command. Clients should not send `REPLICATE_SNAPSHOT` directly.
+In distributed mode, success means the leader stored the snapshot and replicated it to the configured in-sync replica quorum through the internal `REPLICATE_SNAPSHOT internal_token=<shared-token> payload=<json>` broker-to-broker command. Clients should not send `REPLICATE_SNAPSHOT` directly. Brokers reject internal commands without the configured token with `ERROR: internal_command_unauthorized ...`, and reject distributed-mode internal commands when no token is configured with `ERROR: internal_auth_not_configured ...`.
 
 Error responses:
 - `ERROR: snapshot_version_exceeds_stream version=<N> current=<N>`

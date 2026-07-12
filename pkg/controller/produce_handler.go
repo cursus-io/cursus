@@ -93,6 +93,7 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 
 	msg := &types.Message{
 		Payload:           message,
+		Key:               args["key"],
 		ProducerID:        producerID,
 		SeqNum:            seqNum,
 		Epoch:             epoch,
@@ -106,6 +107,9 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 	}
 	if _, err := t.GetPartition(partition); err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
+	}
+	if errResp := ch.validateTransactionPublishMetadata(args, topicName, partition, msg); errResp != "" {
+		return errResp
 	}
 
 	if ch.Config.EnabledDistribution && ch.Cluster != nil {
@@ -123,6 +127,9 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 			}
 			if msg.TransactionMarker != "" {
 				forwardCmd += fmt.Sprintf(" transaction_marker=%s", msg.TransactionMarker)
+			}
+			if strings.EqualFold(args["internal_txn_publish"], "true") {
+				forwardCmd += " internal_txn_publish=true"
 			}
 			forwardCmd += " message=" + message
 		}
@@ -242,7 +249,7 @@ func (ch *CommandHandler) waitForTopic(topicName string) *topic.Topic {
 }
 
 func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
-	// Format: REPLICATE_MESSAGE payload=<json_MessageCommand>
+	// Format: REPLICATE_MESSAGE [internal_token=<token>] payload=<json_MessageCommand>
 	idx := strings.Index(cmd, "payload=")
 	if idx == -1 {
 		return "ERROR: missing_payload command=REPLICATE_MESSAGE"
@@ -267,6 +274,11 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 	// Guard against empty messages to prevent index-out-of-range panic
 	if len(msgCmd.Messages) == 0 {
 		return "ERROR: empty_messages command=REPLICATE_MESSAGE"
+	}
+	for i := range msgCmd.Messages {
+		if errResp := ch.validateReplicatedTransactionMessage(msgCmd.Topic, msgCmd.Partition, &msgCmd.Messages[i]); errResp != "" {
+			return errResp
+		}
 	}
 
 	if err := p.ReplicaAppend(msgCmd.Messages); err != nil {

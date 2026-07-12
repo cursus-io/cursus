@@ -62,15 +62,16 @@ type Config struct {
 
 	// distributed cluster
 	EnabledDistribution  bool     `yaml:"enabled_distribution" json:"distribution.enabled"`
+	InternalAuthToken    string   `yaml:"internal_auth_token" json:"distribution.internal_auth_token"`
 	RaftPort             int      `yaml:"raft_port" json:"distribution.raft.port"`
 	DiscoveryPort        int      `yaml:"discovery_port" json:"distribution.discovery.port"`
 	RaftPeers            []string `yaml:"raft_peers" json:"distribution.raft.peers"`
 	StaticClusterMembers []string `yaml:"static_cluster_members" json:"distribution.static_cluster_members"`
 	BootstrapCluster     bool     `yaml:"bootstrap_cluster" json:"distribution.bootstrap"`
 
-	AdvertisedHost       string `yaml:"advertised_host" json:"distribution.advertised_host"`
-	AdvertisedBrokerPort int    `yaml:"advertised_broker_port" json:"distribution.advertised_broker_port"`
-	AdvertisedClientHost string `yaml:"advertised_client_host" json:"distribution.advertised_client_host"`
+	AdvertisedHost           string `yaml:"advertised_host" json:"distribution.advertised_host"`
+	AdvertisedBrokerPort     int    `yaml:"advertised_broker_port" json:"distribution.advertised_broker_port"`
+	AdvertisedClientHost     string `yaml:"advertised_client_host" json:"distribution.advertised_client_host"`
 	MinInSyncReplicas        int    `yaml:"min_insync_replicas" json:"min.insync.replicas"`
 	DefaultReplicationFactor int    `yaml:"default_replication_factor" json:"default.replication.factor"`
 
@@ -133,6 +134,7 @@ func DefaultConfig() *Config {
 
 			// distributed cluster
 			EnabledDistribution:      false,
+			InternalAuthToken:        "",
 			RaftPort:                 9001,
 			DiscoveryPort:            8000,
 			RaftPeers:                []string{},
@@ -215,6 +217,7 @@ func LoadConfig() (*Config, error) {
 
 	// distributed cluster
 	flag.BoolVar(&cfg.EnabledDistribution, "enable-distribution", cfg.EnabledDistribution, "Enable distributed clustering")
+	flag.StringVar(&cfg.InternalAuthToken, "internal-auth-token", cfg.InternalAuthToken, "Shared token for broker-to-broker internal text commands")
 	flag.IntVar(&cfg.RaftPort, "raft-port", cfg.RaftPort, "Raft port for replication")
 	flag.IntVar(&cfg.DiscoveryPort, "discovery-port", cfg.DiscoveryPort, "Discovery service port")
 	raftPeersFlag := flag.String("raft-peers", "", "Raft peer addresses (comma-separated)")
@@ -325,6 +328,7 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.BroadcastChannelBufferSize, "BROADCAST_CH_BUFFER")
 
 	overrideEnvBool(&cfg.EnabledDistribution, "ENABLE_DISTRIBUTION")
+	overrideEnvString(&cfg.InternalAuthToken, "INTERNAL_AUTH_TOKEN")
 	overrideEnvString(&cfg.AdvertisedHost, "ADVERTISED_HOST")
 	overrideEnvInt(&cfg.AdvertisedBrokerPort, "ADVERTISED_BROKER_PORT")
 	overrideEnvString(&cfg.AdvertisedClientHost, "ADVERTISED_CLIENT_HOST")
@@ -343,6 +347,15 @@ func LoadConfig() (*Config, error) {
 
 	cfg.Normalize()
 	util.SetLevel(cfg.LogLevel)
+
+	if cfg.EnabledDistribution {
+		if strings.TrimSpace(cfg.InternalAuthToken) == "" {
+			return nil, fmt.Errorf("internal_auth_token is required when enabled_distribution=true")
+		}
+		if strings.ContainsAny(cfg.InternalAuthToken, " \t\r\n") {
+			return nil, fmt.Errorf("internal_auth_token must not contain whitespace")
+		}
+	}
 
 	if cfg.UseTLS {
 		if cfg.TLSCertPath == "" || cfg.TLSKeyPath == "" {

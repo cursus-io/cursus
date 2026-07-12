@@ -57,7 +57,7 @@ func (ch *CommandHandler) handleSaveSnapshot(cmd string) string {
 			if err != nil {
 				return err
 			}
-			replicateCmd := fmt.Sprintf("REPLICATE_SNAPSHOT payload=%s", string(payload))
+			replicateCmd := fmt.Sprintf("REPLICATE_SNAPSHOT %spayload=%s", ch.internalAuthPrefix(), string(payload))
 			return ch.Cluster.ReplicateCommandToFollowers(result.Topic, result.Partition, replicateCmd, ch.Config.MinInSyncReplicas)
 		})
 		if errResp != "" {
@@ -137,7 +137,7 @@ func (ch *CommandHandler) handleCatchupSnapshots(cmd string) string {
 	if ch.Cluster == nil {
 		return "ERROR: cluster_not_available"
 	}
-	resp, err := ch.Cluster.ForwardCommandToBroker(leaderAddr, fmt.Sprintf("LIST_SNAPSHOTS topic=%s partition=%d", topicName, partition))
+	resp, err := ch.Cluster.ForwardCommandToBroker(leaderAddr, fmt.Sprintf("LIST_SNAPSHOTS %stopic=%s partition=%d", ch.internalAuthPrefix(), topicName, partition))
 	if err != nil {
 		return fmt.Sprintf("ERROR: snapshot_catchup_failed reason=%q", err.Error())
 	}
