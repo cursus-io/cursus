@@ -323,13 +323,13 @@ func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
 				return err
 			}
 		}
-		if err := ch.appendTransactionMarkers(tx, types.TransactionMarkerCommit); err != nil {
-			return err
-		}
 		for _, op := range tx.Offsets {
 			if err := ch.commitTransactionOffset(op); err != nil {
 				return err
 			}
+		}
+		if err := ch.appendTransactionMarkers(tx, types.TransactionMarkerCommit); err != nil {
+			return err
 		}
 		return nil
 	}
