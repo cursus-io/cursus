@@ -452,7 +452,7 @@ TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<prod
 
 Success: `OK transactional_id=<id> staged_messages=1 topic=<topic> partition=<N>`.
 
-The record is staged in the transaction coordinator and is not published until `END_TXN ... result=commit`. On commit, the broker stamps the record with `transactional_id` and `transaction_state=committed`, then uses the normal publish path, including partition-leader routing in distributed mode. Aborted or open transaction records are not published by this staging path.
+The record is staged in the transaction coordinator and is not published until `END_TXN ... result=commit`. On commit, the broker stamps the record with `transactional_id` and `transaction_state=committed`, then uses the normal publish path, including partition-leader routing in distributed mode. After records are written, the broker appends a hidden Cursus transaction control marker to each touched partition. Aborted or open transaction records are not published by this staging path, and abort writes hidden abort markers for touched partitions.
 
 **SEND_OFFSETS_TO_TXN**
 
@@ -480,7 +480,7 @@ TXN_STATUS transactional_id=<id>
 
 Success: `OK transactional_id=<id> state=<open|committing|committed|aborted> messages=<N> offsets=<N>`.
 
-Current guarantee: a successful transaction commit stages records and offsets behind a broker transaction coordinator, fences stale producer epochs, persists transaction state through the distributed metadata FSM, writes committed transaction metadata as a durable transaction marker, uses the normal partition-leader publish path, commits offsets through the consumer-group coordinator, and makes `ReadCommitted`/`CONSUME` hide transaction marker records plus open or aborted transactional records. Retried `END_TXN` requests for an already committed or aborted transaction are idempotent for the same producer epoch. This is stronger than a client-side offset fallback, but it is still not full Kafka-level EOS: Cursus does not yet write Kafka-compatible partition-log control batches, and recovery of a crash in the middle of applying a prepared transaction still depends on the metadata FSM state plus idempotent retry rather than a full two-phase transaction log replay contract. Clients should continue to use idempotent producers and idempotent processors for external side effects.
+Current guarantee: a successful transaction commit stages records and offsets behind a broker transaction coordinator, fences stale producer epochs, persists transaction state through the distributed metadata FSM, writes hidden Cursus transaction control markers to touched partition logs, uses the normal partition-leader publish path, commits offsets through the consumer-group coordinator, and makes `ReadCommitted`/`CONSUME` hide transaction marker records plus open or aborted transactional records. Retried `END_TXN` requests for an already committed or aborted transaction are idempotent for the same producer epoch. On broker start, restored `committing` transactions are recovered by replaying the prepared transaction and finalizing it as committed on the transaction coordinator. This is stronger than a client-side offset fallback, but it is still not byte-compatible with Kafka transaction control batches and does not make external side effects exactly-once; clients should continue to use idempotent processors for external systems.
 
 #### Event Sourcing Commands
 
@@ -699,7 +699,7 @@ Recommended client loop:
 
 This gives at-least-once delivery when the client commits after processing. If a
 client commits before processing and then crashes, it may skip unprocessed
-records, which is at-most-once behavior for that client. Cursus provides broker-managed transaction commands for consume-process-produce workflows, including producer fencing, durable transaction state, idempotent finalization, committed transaction metadata, and read-committed filtering. It is still not Kafka-level exactly-once for external effects or Kafka-compatible transaction control batches, so applications that need exactly-once external effects must still make their processors idempotent or transactional outside the broker.
+records, which is at-most-once behavior for that client. Cursus provides broker-managed transaction commands for consume-process-produce workflows, including producer fencing, durable transaction state, idempotent finalization, hidden partition transaction markers, startup recovery for prepared commits, and read-committed filtering. It is still not Kafka-level exactly-once for external effects or Kafka-compatible transaction control batches, so applications that need exactly-once external effects must still make their processors idempotent or transactional outside the broker.
 
 Example for a game server such as wargame-IOCP:
 

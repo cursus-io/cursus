@@ -13,6 +13,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1448,4 +1449,37 @@ func TestTransactionRejectsOffsetRegressionBeforePublishing(t *testing.T) {
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=txn-regression-topic partition=0 group=txn-regression-group", ctx)
 	assert.Equal(t, "OK offset=10", resp)
+}
+func TestRecoverPreparedTransactionsCommitsCommittingState(t *testing.T) {
+	ch, tm, coord := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopic("txn-recover-topic", 1, false, false))
+	require.NoError(t, coord.RegisterGroup("txn-recover-topic", "txn-recover-group", 1))
+	_, err := coord.AddConsumer("txn-recover-group", "txn-recover-member")
+	require.NoError(t, err)
+	generation := coord.GetGeneration("txn-recover-group")
+
+	require.NoError(t, ch.TxnManager.Begin("tx-recover", "producer-1", 1))
+	require.NoError(t, ch.TxnManager.AddMessage("tx-recover", "producer-1", 1, transaction.MessageOperation{
+		Topic:     "txn-recover-topic",
+		Partition: 0,
+		Message: types.Message{
+			Payload:          "recover-me",
+			ProducerID:       "producer-1",
+			SeqNum:           1,
+			Epoch:            1,
+			TransactionalID:  "tx-recover",
+			TransactionState: types.TransactionStateOpen,
+		},
+	}))
+	require.NoError(t, ch.TxnManager.AddOffsets("tx-recover", "producer-1", 1, []transaction.OffsetOperation{{Topic: "txn-recover-topic", Group: "txn-recover-group", Member: "txn-recover-member", Generation: generation, Partition: 0, Offset: 6}}))
+	_, err = ch.TxnManager.PrepareCommit("tx-recover", "producer-1", 1)
+	require.NoError(t, err)
+
+	require.NoError(t, ch.RecoverPreparedTransactions())
+	tx, err := ch.TxnManager.Status("tx-recover")
+	require.NoError(t, err)
+	assert.Equal(t, transaction.StateCommitted, tx.State)
+	offset, ok := coord.GetOffset("txn-recover-group", "txn-recover-topic", 0)
+	require.True(t, ok)
+	assert.Equal(t, uint64(6), offset)
 }

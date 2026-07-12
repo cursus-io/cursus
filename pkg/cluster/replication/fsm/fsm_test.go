@@ -426,7 +426,7 @@ func TestBrokerFSM_TopicCreation_ReplicaSubset(t *testing.T) {
 func TestBrokerFSM_TopicCreation_DefaultRF_Capped(t *testing.T) {
 	fsm := newTestFSM()
 
-	// Register only 2 brokers — default RF=3 should be capped to 2.
+	// Register only 2 brokers - default RF=3 should be capped to 2.
 	for i := 1; i <= 2; i++ {
 		data, _ := json.Marshal(BrokerInfo{
 			ID:     fmt.Sprintf("broker-%d", i),
@@ -458,7 +458,7 @@ func TestBrokerFSM_TopicCreation_DefaultRF_Capped(t *testing.T) {
 func TestBrokerFSM_TopicCreation_DefaultRF_Satisfied(t *testing.T) {
 	fsm := newTestFSM()
 
-	// Register 5 brokers — enough to satisfy the default RF=3 without capping.
+	// Register 5 brokers - enough to satisfy the default RF=3 without capping.
 	// This proves that the default is actually 3 and not just "all available brokers".
 	for i := 1; i <= 5; i++ {
 		data, _ := json.Marshal(BrokerInfo{
@@ -934,6 +934,45 @@ func TestBrokerFSM_Snapshot_Restore_TransactionState(t *testing.T) {
 		t.Fatalf("restored transaction missing: %v", err)
 	}
 	if tx.Producer != "producer-1" || tx.Epoch != 7 || len(tx.Offsets) != 1 || tx.Offsets[0].Offset != 12 {
+		t.Fatalf("unexpected restored transaction: %+v", tx)
+	}
+}
+func TestBrokerFSM_RestoreDefersTransactionStateUntilManagerAttached(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	hp := &MockHandlerProvider{}
+	tm := topic.NewTopicManager(cfg, hp, nil)
+	manager := transaction.NewManager()
+	f := NewBrokerFSM(tm, nil)
+	f.SetTransactionManager(manager)
+	if err := manager.Begin("tx-deferred", "producer-1", 4); err != nil {
+		t.Fatalf("begin failed: %v", err)
+	}
+	if _, err := manager.PrepareCommit("tx-deferred", "producer-1", 4); err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+
+	snapshot, err := f.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	buf := &bytes.Buffer{}
+	sink := &MockSnapshotSink{Writer: buf}
+	if err := snapshot.Persist(sink); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+
+	restored := NewBrokerFSM(tm, nil)
+	if err := restored.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatalf("Restore failed: %v", err)
+	}
+	restoredManager := transaction.NewManager()
+	restored.SetTransactionManager(restoredManager)
+	tx, err := restoredManager.Status("tx-deferred")
+	if err != nil {
+		t.Fatalf("restored transaction missing: %v", err)
+	}
+	if tx.State != transaction.StateCommitting || tx.Epoch != 4 {
 		t.Fatalf("unexpected restored transaction: %+v", tx)
 	}
 }

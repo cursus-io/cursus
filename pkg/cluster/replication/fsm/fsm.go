@@ -74,9 +74,10 @@ type BrokerFSM struct {
 	producerState     map[string]map[int]map[string]ProducerSequence // Topic -> Partition -> ProducerID -> Last Epoch/Seq
 	applied           uint64
 
-	tm  *topic.TopicManager
-	cd  *coordinator.Coordinator
-	txn *transaction.Manager
+	tm                       *topic.TopicManager
+	cd                       *coordinator.Coordinator
+	txn                      *transaction.Manager
+	restoredTransactionState map[string]*transaction.Snapshot
 }
 
 func NewBrokerFSM(tm *topic.TopicManager, cd *coordinator.Coordinator) *BrokerFSM {
@@ -123,6 +124,11 @@ func (f *BrokerFSM) SetTransactionManager(txn *transaction.Manager) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.txn = txn
+	if f.txn != nil && f.restoredTransactionState != nil {
+		f.txn.ImportState(f.restoredTransactionState)
+		util.Info("FSM: Imported %d deferred restored transactions", len(f.restoredTransactionState))
+		f.restoredTransactionState = nil
+	}
 }
 
 func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
@@ -235,9 +241,14 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Info("FSM Restore: Restored %d consumer groups from snapshot", len(state.GroupState))
 	}
 
-	if state.TransactionState != nil && f.txn != nil {
-		f.txn.ImportState(state.TransactionState)
-		util.Info("FSM Restore: Restored %d transactions from snapshot", len(state.TransactionState))
+	if state.TransactionState != nil {
+		if f.txn != nil {
+			f.txn.ImportState(state.TransactionState)
+			util.Info("FSM Restore: Restored %d transactions from snapshot", len(state.TransactionState))
+		} else {
+			f.restoredTransactionState = state.TransactionState
+			util.Info("FSM Restore: Deferred %d transactions until transaction manager is attached", len(state.TransactionState))
+		}
 	}
 
 	util.Info("FSM restore completed: %d logs, %d brokers, %d partitions", len(state.Logs), len(state.Brokers), len(state.PartitionMetadata))

@@ -180,6 +180,13 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 		cc.SetLocalProcessor(globalCH)
 	}
 	go func() {
+		time.Sleep(2 * time.Second)
+		if err := globalCH.RecoverPreparedTransactions(); err != nil {
+			util.Error("Failed to recover prepared transactions: %v", err)
+		}
+	}()
+
+	go func() {
 		<-ctx.Done()
 		if err := globalCH.Close(); err != nil {
 			util.Error("Failed to close command handler: %v", err)

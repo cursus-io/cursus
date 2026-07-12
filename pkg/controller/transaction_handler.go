@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -9,6 +10,8 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
+
+const transactionControlMarkerPayload = "__cursus_txn_control_marker__"
 
 func (ch *CommandHandler) handleBeginTxn(cmd string) string {
 	args := parseKeyValueArgs(cmd[len("BEGIN_TXN "):])
@@ -177,6 +180,9 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 		if current.State == transaction.StateAborted {
 			return fmt.Sprintf("OK transactional_id=%s state=aborted", txnID)
 		}
+		if err := ch.appendTransactionMarkers(current, types.TransactionMarkerAbort); err != nil {
+			return fmt.Sprintf("ERROR: transaction_abort_marker_failed reason=%q", err.Error())
+		}
 		if err := ch.TxnManager.Abort(txnID, producerID, epoch); err != nil {
 			return fmt.Sprintf("ERROR: transaction_abort_failed reason=%q", err.Error())
 		}
@@ -217,6 +223,35 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 	return fmt.Sprintf("OK transactional_id=%s state=committed messages=%d offsets=%d", txnID, len(tx.Messages), len(tx.Offsets))
 }
 
+func (ch *CommandHandler) RecoverPreparedTransactions() error {
+	if ch.TxnManager == nil {
+		return nil
+	}
+	pending := ch.TxnManager.TransactionsByState(transaction.StateCommitting)
+	if len(pending) == 0 {
+		return nil
+	}
+	for _, tx := range pending {
+		if tx == nil {
+			continue
+		}
+		if resp := ch.ensureTransactionCoordinator(tx.ID); resp != "" {
+			util.Debug("Skipping transaction recovery for %s on non-coordinator: %s", tx.ID, resp)
+			continue
+		}
+		if err := ch.applyTransaction(tx); err != nil {
+			return fmt.Errorf("recover transaction %s: %w", tx.ID, err)
+		}
+		if err := ch.TxnManager.Commit(tx.ID); err != nil {
+			return fmt.Errorf("mark recovered transaction %s committed: %w", tx.ID, err)
+		}
+		if err := ch.syncTransactionState(tx.ID); err != nil {
+			return fmt.Errorf("sync recovered transaction %s: %w", tx.ID, err)
+		}
+		util.Info("Recovered prepared transaction %s", tx.ID)
+	}
+	return nil
+}
 func (ch *CommandHandler) handleTxnStatus(cmd string) string {
 	args := parseKeyValueArgs(cmd[len("TXN_STATUS "):])
 	txnID := firstNonEmpty(args["transactional_id"], args["txn"], args["transaction"])
@@ -265,6 +300,9 @@ func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
 			return err
 		}
 	}
+	if err := ch.appendTransactionMarkers(tx, types.TransactionMarkerCommit); err != nil {
+		return err
+	}
 	for _, op := range tx.Offsets {
 		if err := ch.commitTransactionOffset(op); err != nil {
 			return err
@@ -273,6 +311,66 @@ func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
 	return nil
 }
 
+func (ch *CommandHandler) appendTransactionMarkers(tx *transaction.Transaction, marker string) error {
+	if tx == nil || len(tx.Messages) == 0 {
+		return nil
+	}
+	state := types.TransactionStateCommitted
+	if marker == types.TransactionMarkerAbort {
+		state = types.TransactionStateAborted
+	}
+
+	partitions := touchedTransactionPartitions(tx)
+	for _, partition := range partitions {
+		msg := types.Message{
+			Payload:           transactionControlMarkerPayload,
+			ProducerID:        tx.Producer,
+			Epoch:             tx.Epoch,
+			TransactionalID:   tx.ID,
+			TransactionState:  state,
+			TransactionMarker: marker,
+		}
+		if err := ch.publishTransactionMarker(partition.Topic, partition.Partition, msg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type transactionPartition struct {
+	Topic     string
+	Partition int
+}
+
+func touchedTransactionPartitions(tx *transaction.Transaction) []transactionPartition {
+	seen := make(map[transactionPartition]struct{})
+	for _, op := range tx.Messages {
+		seen[transactionPartition{Topic: op.Topic, Partition: op.Partition}] = struct{}{}
+	}
+	out := make([]transactionPartition, 0, len(seen))
+	for partition := range seen {
+		out = append(out, partition)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Topic == out[j].Topic {
+			return out[i].Partition < out[j].Partition
+		}
+		return out[i].Topic < out[j].Topic
+	})
+	return out
+}
+
+func (ch *CommandHandler) publishTransactionMarker(topicName string, partition int, msg types.Message) error {
+	if ch.isDistributed() {
+		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d epoch=%d transactional_id=%s transaction_state=%s transaction_marker=%s message=%s", topicName, msg.ProducerID, partition, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.Payload)
+		resp := ch.handlePublish(cmd)
+		if !strings.HasPrefix(resp, "OK") && !strings.HasPrefix(resp, "{") {
+			return fmt.Errorf("%s", resp)
+		}
+		return nil
+	}
+	return ch.TopicManager.PublishToPartitionWithAck(topicName, partition, &msg)
+}
 func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.MessageOperation) error {
 	msg := op.Message
 	msg.TransactionState = types.TransactionStateCommitted

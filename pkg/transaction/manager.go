@@ -223,6 +223,23 @@ func (m *Manager) Status(id string) (*Transaction, error) {
 	return clone(tx), nil
 }
 
+func (m *Manager) TransactionsByState(states ...State) []*Transaction {
+	wanted := make(map[State]struct{}, len(states))
+	for _, state := range states {
+		wanted[state] = struct{}{}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]*Transaction, 0)
+	for _, tx := range m.txns {
+		if _, ok := wanted[tx.State]; ok {
+			out = append(out, clone(tx))
+		}
+	}
+	return out
+}
 func (m *Manager) ExportState() map[string]*Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
