@@ -513,41 +513,40 @@ func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm uint64) ([]
 		return nil, nil
 	}
 
-	visible := make([]types.Message, 0, max)
-	current := offset
-	for current < hwm && len(visible) < max {
-		remaining := hwm - current
-		readMax := max - len(visible)
-		if readMax < 1 {
-			readMax = 1
-		}
-		if readMax < max {
-			readMax = max
-		}
-		if remaining <= math.MaxInt && readMax > int(remaining) { // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
-			readMax = int(remaining) // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
-		}
+	messages, err := p.readCommittedScanRange(offset, hwm, max)
+	if err != nil {
+		return nil, err
+	}
 
-		messages, err := p.ReadMessages(current, readMax)
-		if err != nil {
-			return nil, err
-		}
-		if len(messages) == 0 {
+	markers := make(map[string]string)
+	for _, msg := range messages {
+		if msg.Offset >= hwm {
 			break
 		}
+		if msg.TransactionMarker != types.TransactionMarkerNone && msg.TransactionalID != "" {
+			markers[msg.TransactionalID] = msg.TransactionMarker
+		}
+	}
 
-		for _, msg := range messages {
-			next := msg.Offset + 1
-			if next <= current {
-				next = current + 1
-			}
-			current = next
-			if msg.Offset >= hwm {
-				break
-			}
-			if !isReadCommittedVisible(msg) {
-				continue
-			}
+	firstUnresolved := hwm
+	for _, msg := range messages {
+		if msg.Offset >= hwm {
+			break
+		}
+		if msg.TransactionalID == "" || msg.TransactionState != types.TransactionStateOpen {
+			continue
+		}
+		if _, ok := markers[msg.TransactionalID]; !ok && msg.Offset < firstUnresolved {
+			firstUnresolved = msg.Offset
+		}
+	}
+
+	visible := make([]types.Message, 0, max)
+	for _, msg := range messages {
+		if msg.Offset >= hwm || msg.Offset >= firstUnresolved {
+			break
+		}
+		if isReadCommittedVisible(msg, markers) {
 			visible = append(visible, msg)
 			if len(visible) == max {
 				break
@@ -557,14 +556,114 @@ func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm uint64) ([]
 	return visible, nil
 }
 
-func isReadCommittedVisible(msg types.Message) bool {
+func (p *Partition) readCommittedScanRange(offset uint64, hwm uint64, maxVisible int) ([]types.Message, error) {
+	if offset >= hwm {
+		return nil, nil
+	}
+
+	messages := make([]types.Message, 0)
+	current := offset
+	const scanBatchSize = 1024
+	for current < hwm {
+		remaining := hwm - current
+		readMax := scanBatchSize
+		if len(messages) == 0 && maxVisible > 0 && maxVisible < readMax {
+			readMax = maxVisible
+		}
+		if remaining <= math.MaxInt && readMax > int(remaining) { // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
+			readMax = int(remaining) // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
+		}
+		if readMax <= 0 {
+			break
+		}
+
+		batch, err := p.ReadMessages(current, readMax)
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, msg := range batch {
+			if msg.Offset >= hwm {
+				break
+			}
+			messages = append(messages, msg)
+			next := msg.Offset + 1
+			if next <= current {
+				next = current + 1
+			}
+			current = next
+		}
+		if len(batch) < readMax || readCommittedScanHasEnoughVisible(messages, hwm, maxVisible) {
+			break
+		}
+	}
+	return messages, nil
+}
+
+func readCommittedScanHasEnoughVisible(messages []types.Message, hwm uint64, maxVisible int) bool {
+	if maxVisible <= 0 {
+		return true
+	}
+	markers := make(map[string]string)
+	for _, msg := range messages {
+		if msg.Offset >= hwm {
+			break
+		}
+		if msg.TransactionMarker != types.TransactionMarkerNone && msg.TransactionalID != "" {
+			markers[msg.TransactionalID] = msg.TransactionMarker
+		}
+	}
+
+	firstUnresolved := hwm
+	for _, msg := range messages {
+		if msg.Offset >= hwm {
+			break
+		}
+		if msg.TransactionalID == "" || msg.TransactionState != types.TransactionStateOpen {
+			continue
+		}
+		if _, ok := markers[msg.TransactionalID]; !ok && msg.Offset < firstUnresolved {
+			firstUnresolved = msg.Offset
+		}
+	}
+	if firstUnresolved != hwm {
+		return false
+	}
+
+	visible := 0
+	for _, msg := range messages {
+		if msg.Offset >= hwm {
+			break
+		}
+		if isReadCommittedVisible(msg, markers) {
+			visible++
+			if visible >= maxVisible {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isReadCommittedVisible(msg types.Message, markers map[string]string) bool {
 	if msg.TransactionMarker != types.TransactionMarkerNone {
 		return false
 	}
 	if msg.TransactionalID == "" {
 		return true
 	}
-	return msg.TransactionState == types.TransactionStateCommitted
+	if msg.TransactionState == types.TransactionStateCommitted {
+		return true
+	}
+	if msg.TransactionState == types.TransactionStateAborted {
+		return false
+	}
+	if msg.TransactionState == types.TransactionStateOpen {
+		return markers[msg.TransactionalID] == types.TransactionMarkerCommit
+	}
+	return false
 }
 
 func (p *Partition) RecoverProducerStateFromLog() {
