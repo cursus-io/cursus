@@ -22,6 +22,7 @@ func TestTextCommandResponseContract(t *testing.T) {
 	assertContractSuccess(t, ch.HandleCommand("HEARTBEAT topic=contract-topic group=contract-group member="+ctx.MemberID, ctx), "HEARTBEAT")
 	assertContractSuccess(t, ch.HandleCommand("COMMIT_OFFSET topic=contract-topic partition=0 group=contract-group offset=2", ctx), "COMMIT_OFFSET")
 	assertContractSuccess(t, ch.HandleCommand("FETCH_OFFSET topic=contract-topic partition=0 group=contract-group", ctx), "FETCH_OFFSET")
+	assertContractSuccess(t, ch.HandleCommand("LIST_OFFSETS topic=contract-topic", ctx), "LIST_OFFSETS")
 
 	batchCmd := fmt.Sprintf("BATCH_COMMIT topic=contract-topic group=contract-group generation=%d member=%s P0:3", ctx.Generation, ctx.MemberID)
 	assertContractSuccess(t, ch.HandleCommand(batchCmd, ctx), "BATCH_COMMIT")
@@ -39,6 +40,7 @@ func TestTextCommandErrorContract(t *testing.T) {
 		"REGISTER_GROUP topic=missing-topic group=g1",
 		"JOIN_GROUP topic=missing-topic group=g1 member=m1",
 		"FETCH_OFFSET topic=t1 partition=0 group=g1",
+		"LIST_OFFSETS topic=missing-topic",
 		"COMMIT_OFFSET topic=t1 partition=0 group=g1 offset=1",
 		"DESCRIBE topic=missing-topic",
 	}

@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -136,4 +138,108 @@ func (c *ConsumerClient) ConnectWithFailover() (net.Conn, string, error) {
 		return nil, "", fmt.Errorf("all brokers unreachable: %w", lastErr)
 	}
 	return nil, "", fmt.Errorf("all brokers unreachable")
+}
+
+// ListOffsets queries the broker for retained and readable offsets on a topic.
+func (c *ConsumerClient) ListOffsets(topic string, partition ...int) ([]PartitionOffsetRange, error) {
+	if topic == "" {
+		return nil, fmt.Errorf("topic is required")
+	}
+	if len(partition) > 1 {
+		return nil, fmt.Errorf("at most one partition can be requested")
+	}
+
+	conn, _, err := c.ConnectWithFailover()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+
+	cmd := fmt.Sprintf("LIST_OFFSETS topic=%s", topic)
+	if len(partition) == 1 {
+		cmd = fmt.Sprintf("%s partition=%d", cmd, partition[0])
+	}
+	if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
+		return nil, fmt.Errorf("send list offsets: %w", err)
+	}
+
+	resp, err := ReadWithLength(conn)
+	if err != nil {
+		return nil, fmt.Errorf("read list offsets: %w", err)
+	}
+	return parseListOffsetsResponse(strings.TrimSpace(string(resp)))
+}
+
+func parseListOffsetsResponse(resp string) ([]PartitionOffsetRange, error) {
+	if strings.HasPrefix(resp, "ERROR:") {
+		return nil, fmt.Errorf("list offsets broker error: %s", resp)
+	}
+	if !strings.HasPrefix(resp, "OK") {
+		return nil, fmt.Errorf("unexpected list offsets response: %s", resp)
+	}
+
+	var offsetsValue string
+	for _, field := range strings.Fields(resp) {
+		if strings.HasPrefix(field, "offsets=") {
+			offsetsValue = strings.TrimPrefix(field, "offsets=")
+			break
+		}
+	}
+	if offsetsValue == "" {
+		return nil, fmt.Errorf("missing offsets in response: %s", resp)
+	}
+
+	entries := strings.Split(offsetsValue, ",")
+	ranges := make([]PartitionOffsetRange, 0, len(entries))
+	for _, entry := range entries {
+		r, err := parseListOffsetEntry(entry)
+		if err != nil {
+			return nil, err
+		}
+		ranges = append(ranges, r)
+	}
+	return ranges, nil
+}
+
+func parseListOffsetEntry(entry string) (PartitionOffsetRange, error) {
+	parts := strings.Split(entry, ":")
+	if len(parts) != 5 || !strings.HasPrefix(parts[0], "P") {
+		return PartitionOffsetRange{}, fmt.Errorf("invalid list offsets entry: %s", entry)
+	}
+	partition, err := strconv.Atoi(strings.TrimPrefix(parts[0], "P"))
+	if err != nil {
+		return PartitionOffsetRange{}, fmt.Errorf("invalid list offsets partition: %s", entry)
+	}
+
+	r := PartitionOffsetRange{Partition: partition}
+	seen := map[string]bool{}
+	for _, part := range parts[1:] {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			return PartitionOffsetRange{}, fmt.Errorf("invalid list offsets field: %s", part)
+		}
+		value, err := strconv.ParseUint(kv[1], 10, 64)
+		if err != nil {
+			return PartitionOffsetRange{}, fmt.Errorf("invalid list offsets value: %s", part)
+		}
+		switch kv[0] {
+		case "earliest":
+			r.Earliest = value
+		case "latest":
+			r.Latest = value
+		case "leo":
+			r.LEO = value
+		case "hwm":
+			r.HWM = value
+		default:
+			return PartitionOffsetRange{}, fmt.Errorf("unknown list offsets field: %s", kv[0])
+		}
+		seen[kv[0]] = true
+	}
+	for _, key := range []string{"earliest", "latest", "leo", "hwm"} {
+		if !seen[key] {
+			return PartitionOffsetRange{}, fmt.Errorf("missing list offsets field %s: %s", key, entry)
+		}
+	}
+	return r, nil
 }

@@ -32,6 +32,15 @@ type stagedProducerEntry struct {
 	lastSeq   uint64
 }
 
+// PartitionOffsetRange describes the retained and committed offsets for a partition.
+// Latest is the next readable committed offset, capped by the flushed disk tail.
+type PartitionOffsetRange struct {
+	Earliest uint64
+	Latest   uint64
+	LEO      uint64
+	HWM      uint64
+}
+
 // Partition handles messages for one shard of a topic.
 type Partition struct {
 	id                int
@@ -492,6 +501,28 @@ func (p *Partition) GetLatestOffset() uint64 {
 	return p.dh.GetLatestOffset()
 }
 
+func (p *Partition) OffsetRange() PartitionOffsetRange {
+	if p.dh == nil {
+		return PartitionOffsetRange{}
+	}
+
+	p.mu.RLock()
+	hwm := p.HWM
+	p.mu.RUnlock()
+
+	latest := hwm
+	flushed := p.dh.GetFlushedOffset()
+	if flushed < latest {
+		latest = flushed
+	}
+
+	return PartitionOffsetRange{
+		Earliest: p.dh.GetFirstOffset(),
+		Latest:   latest,
+		LEO:      p.LEO.Load(),
+		HWM:      hwm,
+	}
+}
 func (p *Partition) ID() int {
 	return p.id
 }

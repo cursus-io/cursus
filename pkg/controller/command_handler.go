@@ -27,7 +27,7 @@ var (
 func (ch *CommandHandler) handleHelp() string {
 	commands := []string{
 		"CREATE", "DELETE", "LIST", "PUBLISH", "CONSUME", "STREAM", "JOIN_GROUP", "SYNC_GROUP",
-		"LEAVE_GROUP", "HEARTBEAT", "COMMIT_OFFSET", "BATCH_COMMIT", "FETCH_OFFSET", "REGISTER_GROUP",
+		"LEAVE_GROUP", "HEARTBEAT", "COMMIT_OFFSET", "BATCH_COMMIT", "FETCH_OFFSET", "LIST_OFFSETS", "REGISTER_GROUP",
 		"GROUP_STATUS", "DESCRIBE", "APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT",
 		"READ_SNAPSHOT", "STREAM_VERSION", "METADATA", "FIND_COORDINATOR", "HELP", "EXIT",
 	}
@@ -400,6 +400,48 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 		}
 	}
 	return fmt.Sprintf("OK group=%s member=%s left=true", groupName, consumerID)
+}
+
+// handleListOffsets processes LIST_OFFSETS topic=<name> [partition=<N>].
+func (ch *CommandHandler) handleListOffsets(cmd string) string {
+	argsText := ""
+	if len(cmd) > len("LIST_OFFSETS") {
+		argsText = strings.TrimSpace(cmd[len("LIST_OFFSETS"):])
+	}
+	args := parseKeyValueArgs(argsText)
+	topicName, ok := args["topic"]
+	if !ok || topicName == "" {
+		return "ERROR: missing_topic command=LIST_OFFSETS"
+	}
+
+	t := ch.TopicManager.GetTopic(topicName)
+	if t == nil {
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+
+	format := func(p *topic.Partition) string {
+		r := p.OffsetRange()
+		return fmt.Sprintf("P%d:earliest=%d:latest=%d:leo=%d:hwm=%d", p.ID(), r.Earliest, r.Latest, r.LEO, r.HWM)
+	}
+
+	entries := make([]string, 0, len(t.Partitions))
+	if partitionStr := args["partition"]; partitionStr != "" {
+		partition, err := strconv.Atoi(partitionStr)
+		if err != nil {
+			return "ERROR: invalid_partition command=LIST_OFFSETS"
+		}
+		p, err := t.GetPartition(partition)
+		if err != nil {
+			return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
+		}
+		entries = append(entries, format(p))
+	} else {
+		for _, p := range t.Partitions {
+			entries = append(entries, format(p))
+		}
+	}
+
+	return fmt.Sprintf("OK topic=%s partitions=%d offsets=%s", topicName, len(entries), strings.Join(entries, ","))
 }
 
 // handleFetchOffset processes FETCH_OFFSET command
@@ -783,7 +825,7 @@ func (ch *CommandHandler) resolveOffset(p *topic.Partition, topicName string, cA
 	}
 
 	if cArgs.AutoOffsetReset == "latest" {
-		latest := p.GetLatestOffset()
+		latest := p.OffsetRange().Latest
 		util.Debug("Reset policy 'latest': starting at %d", latest)
 		return latest, nil
 	}

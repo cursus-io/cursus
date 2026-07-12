@@ -1338,3 +1338,35 @@ func TestHandlePublish_InvalidExplicitPartition(t *testing.T) {
 	resp := ch.HandleCommand("PUBLISH topic=invalid-publish-partition partition=99 acks=1 producerId=p1 message=bad", ctx)
 	assert.Contains(t, resp, "partition_not_found")
 }
+
+func TestHandleListOffsets(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	require.NoError(t, tm.CreateTopic("offsets-topic", 2, false, false))
+	tObj := tm.GetTopic("offsets-topic")
+	p0, err := tObj.GetPartition(0)
+	require.NoError(t, err)
+	p0.SetHWM(7)
+	p1, err := tObj.GetPartition(1)
+	require.NoError(t, err)
+	p1.SetHWM(3)
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("LIST_OFFSETS topic=offsets-topic", ctx)
+	assert.Contains(t, resp, "OK topic=offsets-topic partitions=2 offsets=")
+	assert.Contains(t, resp, "P0:earliest=0:latest=0:leo=1:hwm=7")
+	assert.Contains(t, resp, "P1:earliest=0:latest=0:leo=1:hwm=3")
+
+	resp = ch.HandleCommand("LIST_OFFSETS topic=offsets-topic partition=1", ctx)
+	assert.Equal(t, "OK topic=offsets-topic partitions=1 offsets=P1:earliest=0:latest=0:leo=1:hwm=3", resp)
+}
+
+func TestHandleListOffsetsErrors(t *testing.T) {
+	ch, tm := newTestHandler(t)
+	require.NoError(t, tm.CreateTopic("offsets-error-topic", 1, false, false))
+	ctx := NewClientContext("", 0)
+
+	assert.Contains(t, ch.HandleCommand("LIST_OFFSETS", ctx), "missing_topic")
+	assert.Contains(t, ch.HandleCommand("LIST_OFFSETS topic=missing", ctx), "topic_not_found")
+	assert.Contains(t, ch.HandleCommand("LIST_OFFSETS topic=offsets-error-topic partition=abc", ctx), "invalid_partition")
+	assert.Contains(t, ch.HandleCommand("LIST_OFFSETS topic=offsets-error-topic partition=9", ctx), "partition_not_found")
+}

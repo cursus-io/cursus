@@ -368,6 +368,30 @@ STREAM_CONTROL type=CLOSE reason=<stopped|removed|timeout|error|offset_out_of_ra
 
 #### Offset Management
 
+
+**LIST_OFFSETS**
+
+```text
+LIST_OFFSETS topic=<name> [partition=<N>]
+```
+
+Success response:
+
+```text
+OK topic=<name> partitions=<N> offsets=P0:earliest=<N>:latest=<N>:leo=<N>:hwm=<N>,P1:earliest=<N>:latest=<N>:leo=<N>:hwm=<N>
+```
+
+`LIST_OFFSETS` is the broker-side equivalent of Kafka's ListOffsets query. `earliest` is the first retained offset. `latest` is the next readable committed offset and is the value clients should use for `autoOffsetReset=latest`. `leo` is the partition log end offset, and `hwm` is the high-water mark before the broker caps reads to the flushed durable tail. A single `partition=` returns only that partition.
+
+Errors:
+
+```text
+ERROR: missing_topic command=LIST_OFFSETS
+ERROR: topic_not_found topic=<name>
+ERROR: invalid_partition command=LIST_OFFSETS
+ERROR: partition_not_found partition=<N>
+```
+
 **FETCH_OFFSET**
 ```
 FETCH_OFFSET topic=<name> partition=<N> group=<name>
@@ -588,7 +612,7 @@ Client action:
 ```
 1. Saved offset from coordinator for (topic, group, partition)
 2. Explicit offset from request parameter
-3. autoOffsetReset = "latest" → partition HWM
+3. autoOffsetReset = "latest" → partition `LIST_OFFSETS latest` value
 4. autoOffsetReset = "earliest" → 0
 ```
 

@@ -280,6 +280,30 @@ Success:
 OK group=<group> member=<assigned-member-id> left=true
 ```
 
+
+### LIST_OFFSETS
+
+```text
+LIST_OFFSETS topic=<name> [partition=<N>]
+```
+
+Returns retained and readable offset bounds for all partitions or one partition.
+
+```text
+OK topic=<name> partitions=<N> offsets=P0:earliest=<N>:latest=<N>:leo=<N>:hwm=<N>,P1:earliest=<N>:latest=<N>:leo=<N>:hwm=<N>
+```
+
+`latest` is the next readable committed offset and is the value SDKs should use for `auto_offset_reset=latest`. `leo` is the log end offset, and `hwm` is the high-water mark before the broker caps reads to the flushed durable tail.
+
+Errors:
+
+```text
+ERROR: missing_topic command=LIST_OFFSETS
+ERROR: topic_not_found topic=<name>
+ERROR: invalid_partition command=LIST_OFFSETS
+ERROR: partition_not_found partition=<N>
+```
+
 ### FETCH_OFFSET
 
 ```text
@@ -510,7 +534,7 @@ OK snapshot=null
 ## Topic Policy Notes
 
 - Minimal per-topic authorization policy is part of topic metadata: `auth_policy=open|deny_write|deny_read`. It rejects unauthorized topic reads/writes with `ERROR: NOT_AUTHORIZED_FOR_TOPIC ...`, but it is not caller identity-aware ACL/SASL yet. Use TLS and external network/application controls for authentication boundaries.
-- Topics expose `retention_hours` and `retention_bytes` policy metadata. `0` means broker default. Reads before the earliest retained offset fail with `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>`. SDKs should apply `auto_offset_reset` (`earliest`, `latest`, or `error`) to decide whether to reset or fail.
+- Topics expose `retention_hours` and `retention_bytes` policy metadata. `0` means broker default. Reads before the earliest retained offset fail with `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>`. SDKs should apply `auto_offset_reset` (`earliest`, `latest`, or `error`) to decide whether to reset or fail; `latest` should use `LIST_OFFSETS latest`, the next readable committed offset.
 - `partitioner=hash_key` uses FNV-1a 64-bit hash modulo partition count for keyed messages and round-robin for missing keys. `partitioner=round_robin` ignores keys. Increasing partition count can remap future records for an existing key.
 
 ## Server-Level Errors
