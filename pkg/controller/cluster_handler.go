@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -127,7 +128,7 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 	if !ch.hasRouter() {
 		return AdvertisedAddr{}, true
 	}
-	id, _, err := ch.Cluster.Router.FindCoordinator(coordKey)
+	id, raftAddr, err := ch.Cluster.Router.FindCoordinator(coordKey)
 	if err != nil {
 		return AdvertisedAddr{}, true
 	}
@@ -141,6 +142,20 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 		return cached.addr, false
 	}
 	ch.coordCacheMu.RUnlock()
+
+	if fsm := ch.Cluster.RaftManager.GetFSM(); fsm != nil {
+		if broker := fsm.GetBroker(id); broker != nil && broker.ClientAddr != "" {
+			if host, portStr, splitErr := net.SplitHostPort(broker.ClientAddr); splitErr == nil {
+				if port, scanErr := strconv.Atoi(portStr); scanErr == nil && host != "" && port > 0 {
+					addr := AdvertisedAddr{Host: host, Port: port}
+					ch.coordCacheMu.Lock()
+					ch.coordCache[id] = coordCacheEntry{addr: addr, updated: time.Now()}
+					ch.coordCacheMu.Unlock()
+					return addr, false
+				}
+			}
+		}
+	}
 
 	encodedCmd := util.EncodeMessage("", findCmd)
 	resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, string(encodedCmd))
@@ -163,6 +178,9 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 	}
 
 	host := ch.Config.AdvertisedClientHost
+	if host == "" {
+		host, _, _ = net.SplitHostPort(raftAddr)
+	}
 	if host == "" {
 		host = "localhost"
 	}
