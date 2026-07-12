@@ -429,6 +429,53 @@ the batch. If any partition is not owned by that member in that generation, the
 entire batch is rejected with `ERROR: NOT_OWNER ...`. Stale generations return
 `ERROR: GEN_MISMATCH ...`, and unknown members return `ERROR: member_not_found ...`.
 
+
+#### Transaction Coordinator
+
+Cursus exposes a broker-managed transaction coordinator for consume-process-produce workflows. A transaction stages produced records and consumer offsets, then applies them together when `END_TXN ... result=commit` succeeds. Aborted transactions discard staged records and offsets.
+
+**BEGIN_TXN**
+
+```text
+BEGIN_TXN transactional_id=<id> producerId=<producer-id> [epoch=<N>]
+```
+
+Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`.
+
+**TXN_PUBLISH**
+
+```text
+TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> [seqNum=<N>] [epoch=<N>] [key=<key>] message=<payload>
+```
+
+Success: `OK transactional_id=<id> staged_messages=1 topic=<topic> partition=<N>`.
+
+**SEND_OFFSETS_TO_TXN**
+
+```text
+SEND_OFFSETS_TO_TXN transactional_id=<id> topic=<topic> group=<group> P<partition>:<nextOffset>,P<partition>:<nextOffset>
+```
+
+Success: `OK transactional_id=<id> staged_offsets=<N>`. Offsets keep the same monotonic rule as `COMMIT_OFFSET`; an `END_TXN ... result=commit` fails before publishing records if any staged offset would regress.
+
+**END_TXN**
+
+```text
+END_TXN transactional_id=<id> result=<commit|abort>
+```
+
+Success: `OK transactional_id=<id> state=<committed|aborted> messages=<N> offsets=<N>`.
+
+**TXN_STATUS**
+
+```text
+TXN_STATUS transactional_id=<id>
+```
+
+Success: `OK transactional_id=<id> state=<open|committing|committed|aborted> messages=<N> offsets=<N>`.
+
+Current guarantee: a successful transaction commit makes staged records visible and commits staged offsets in one broker-side critical section. This closes the common consume-process-produce gap for a single broker process. Full Kafka-style transaction markers, recovery of in-flight commit markers after broker crash, and `read_committed` isolation over interleaved transactional log records remain follow-up work; clients should still use idempotent producers and idempotent processors until those marker/recovery contracts are complete.
+
 #### Event Sourcing Commands
 
 These commands are available only on topics created with `event_sourcing=true`.
@@ -771,6 +818,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - [ ] Exponential backoff on reconnect
 - [ ] Async offset commits (BATCH_COMMIT)
 - [ ] Idempotent producer with sequence numbers
+- [ ] Transaction coordinator commands (BEGIN_TXN, TXN_PUBLISH, SEND_OFFSETS_TO_TXN, END_TXN)
 - [ ] Wildcard topic subscription
 - [ ] Stream mode (continuous push)
 - [ ] Read/write buffer tuning (2MB recommended)

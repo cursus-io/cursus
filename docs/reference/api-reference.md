@@ -447,6 +447,47 @@ ERROR: NOT_LEADER LEADER_IS <host:port>
 Clients and SDKs should reconnect to that leader and retry. Followers index replicated event-sourcing records, apply quorum-replicated snapshots, and can pull missing snapshots from the partition leader with internal catch-up commands after restart. Partitions restore a synced high-watermark checkpoint with durable-tail clamping, so committed reads remain bounded by the last successful committed tail.
 
 
+
+### BEGIN_TXN
+
+```text
+BEGIN_TXN transactional_id=<id> producerId=<producer-id> [epoch=<N>]
+```
+
+Starts a broker-managed transaction. Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`.
+
+### TXN_PUBLISH
+
+```text
+TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> [seqNum=<N>] [epoch=<N>] [key=<key>] message=<payload>
+```
+
+Stages one record in the transaction. The record is not published until `END_TXN ... result=commit` succeeds.
+
+### SEND_OFFSETS_TO_TXN
+
+```text
+SEND_OFFSETS_TO_TXN transactional_id=<id> topic=<topic> group=<group> P<partition>:<nextOffset>,P<partition>:<nextOffset>
+```
+
+Stages consumer offsets in the transaction. Commit rejects offset regression before applying staged records.
+
+### END_TXN
+
+```text
+END_TXN transactional_id=<id> result=<commit|abort>
+```
+
+Commits or aborts staged records and offsets. Current scope is broker-side staged record plus offset atomicity; Kafka-style transaction markers and crash recovery of in-flight commit markers remain follow-up work.
+
+### TXN_STATUS
+
+```text
+TXN_STATUS transactional_id=<id>
+```
+
+Returns transaction state and staged operation counts.
+
 ### APPEND_STREAM
 
 ```text

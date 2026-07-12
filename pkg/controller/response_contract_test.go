@@ -22,6 +22,11 @@ func TestTextCommandResponseContract(t *testing.T) {
 	assertContractSuccess(t, ch.HandleCommand("HEARTBEAT topic=contract-topic group=contract-group member="+ctx.MemberID, ctx), "HEARTBEAT")
 	assertContractSuccess(t, ch.HandleCommand("COMMIT_OFFSET topic=contract-topic partition=0 group=contract-group offset=2", ctx), "COMMIT_OFFSET")
 	assertContractSuccess(t, ch.HandleCommand("FETCH_OFFSET topic=contract-topic partition=0 group=contract-group", ctx), "FETCH_OFFSET")
+	assertContractSuccess(t, ch.HandleCommand("BEGIN_TXN transactional_id=contract-tx producerId=contract-producer", ctx), "BEGIN_TXN")
+	assertContractSuccess(t, ch.HandleCommand("TXN_PUBLISH transactional_id=contract-tx topic=contract-topic partition=0 producerId=contract-producer seqNum=1 message=tx", ctx), "TXN_PUBLISH")
+	assertContractSuccess(t, ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=contract-tx topic=contract-topic group=contract-group P0:2", ctx), "SEND_OFFSETS_TO_TXN")
+	assertContractSuccess(t, ch.HandleCommand("TXN_STATUS transactional_id=contract-tx", ctx), "TXN_STATUS")
+	assertContractSuccess(t, ch.HandleCommand("END_TXN transactional_id=contract-tx result=abort", ctx), "END_TXN")
 	assertContractSuccess(t, ch.HandleCommand("LIST_OFFSETS topic=contract-topic", ctx), "LIST_OFFSETS")
 
 	batchCmd := fmt.Sprintf("BATCH_COMMIT topic=contract-topic group=contract-group generation=%d member=%s P0:3", ctx.Generation, ctx.MemberID)
@@ -42,6 +47,10 @@ func TestTextCommandErrorContract(t *testing.T) {
 		"FETCH_OFFSET topic=t1 partition=0 group=g1",
 		"LIST_OFFSETS topic=missing-topic",
 		"COMMIT_OFFSET topic=t1 partition=0 group=g1 offset=1",
+		"BEGIN_TXN producerId=p1",
+		"TXN_PUBLISH transactional_id=missing topic=t1 producerId=p1 message=x",
+		"SEND_OFFSETS_TO_TXN transactional_id=missing topic=t1 group=g1 P0:1",
+		"END_TXN transactional_id=missing result=commit",
 		"DESCRIBE topic=missing-topic",
 	}
 

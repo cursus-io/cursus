@@ -11,6 +11,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/eventsource"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -24,10 +25,12 @@ type CommandHandler struct {
 	StreamManager *stream.StreamManager
 	Cluster       *clusterController.ClusterController
 	ESHandler     *eventsource.Handler
+	TxnManager    *transaction.Manager
 	commands      []commandEntry
 
 	coordCache   map[string]coordCacheEntry
 	coordCacheMu sync.RWMutex
+	txnApplyMu   sync.Mutex
 }
 
 // commandEntry defines a single command routing rule.
@@ -58,6 +61,7 @@ func NewCommandHandler(
 		coordCache:    make(map[string]coordCacheEntry),
 		Cluster:       cc,
 		ESHandler:     eventsource.NewHandler(tm),
+		TxnManager:    transaction.NewManager(),
 	}
 	ch.commands = []commandEntry{
 		{prefix: "HELP", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHelp() }},
@@ -78,6 +82,11 @@ func NewCommandHandler(
 		{prefix: "HEARTBEAT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHeartbeat(cmd) }},
 		{prefix: "COMMIT_OFFSET ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCommitOffset(cmd) }},
 		{prefix: "BATCH_COMMIT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd) }},
+		{prefix: "BEGIN_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBeginTxn(cmd) }},
+		{prefix: "TXN_PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnPublish(cmd) }},
+		{prefix: "SEND_OFFSETS_TO_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSendOffsetsToTxn(cmd) }},
+		{prefix: "END_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleEndTxn(cmd) }},
+		{prefix: "TXN_STATUS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnStatus(cmd) }},
 		{prefix: "APPEND_STREAM ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAppendStream(cmd) }},
 		{prefix: "STREAM_VERSION ", exact: false, handler: func(cmd string, ctx *ClientContext) string {
 			return ch.handleEventSourceRoutedCommand(cmd, "STREAM_VERSION ", ch.ESHandler.HandleStreamVersion)
