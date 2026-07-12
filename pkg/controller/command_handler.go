@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1059,6 +1060,17 @@ func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 				port = ch.Config.AdvertisedBrokerPort
 			}
 			return fmt.Sprintf("OK coordinator_id=%s coordinator_type=%s host=%s port=%d", coordID, coordType, host, port)
+		}
+
+		if fsm := ch.Cluster.RaftManager.GetFSM(); fsm != nil {
+			if broker := fsm.GetBroker(coordID); broker != nil && broker.ClientAddr != "" {
+				if brokerHost, brokerPort, err := net.SplitHostPort(broker.ClientAddr); err == nil {
+					parsedPort, _ := strconv.Atoi(brokerPort)
+					if brokerHost != "" && parsedPort > 0 {
+						return fmt.Sprintf("OK coordinator_id=%s coordinator_type=%s host=%s port=%d", coordID, coordType, brokerHost, parsedPort)
+					}
+				}
+			}
 		}
 
 		encodedCmd := util.EncodeMessage("", cmd)
