@@ -1373,6 +1373,16 @@ func TestHandleListOffsetsErrors(t *testing.T) {
 	assert.Contains(t, ch.HandleCommand("LIST_OFFSETS topic=offsets-error-topic partition=9", ctx), "partition_not_found")
 }
 
+func TestTransactionPublishRequiresSeqNum(t *testing.T) {
+	ch, tm, _ := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopic("txn-seq-topic", 1, false, false))
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("BEGIN_TXN transactional_id=tx-seq producerId=producer-1 epoch=1", ctx)
+	assert.Contains(t, resp, "state=open")
+	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-seq topic=txn-seq-topic partition=0 producerId=producer-1 epoch=1 message=missing-seq", ctx)
+	assert.Contains(t, resp, "invalid_seq_num")
+}
 func TestTransactionCommitStagesMessagesAndOffsets(t *testing.T) {
 	ch, tm, coord := newTestHandlerWithCoordinator(t)
 	require.NoError(t, tm.CreateTopic("txn-topic", 1, false, false))

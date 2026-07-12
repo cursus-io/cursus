@@ -68,9 +68,9 @@ func (ch *CommandHandler) handleTxnPublish(cmd string) string {
 		}
 		partition = parsed
 	}
-	seqNum, err := parseOptionalUint64(args["seqNum"])
+	seqNum, err := parseRequiredPositiveUint64(args["seqNum"])
 	if err != nil {
-		return fmt.Sprintf("ERROR: invalid_seq_num reason=%q", err.Error())
+		return fmt.Sprintf("ERROR: invalid_seq_num command=TXN_PUBLISH reason=%q", err.Error())
 	}
 
 	t := ch.TopicManager.GetTopic(topicName)
@@ -376,7 +376,7 @@ func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.Mess
 	msg.TransactionState = types.TransactionStateCommitted
 	msg.TransactionMarker = types.TransactionMarkerNone
 	if ch.isDistributed() {
-		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d", op.Topic, msg.ProducerID, op.Partition, msg.SeqNum, msg.Epoch)
+		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true", op.Topic, msg.ProducerID, op.Partition, msg.SeqNum, msg.Epoch)
 		if msg.Key != "" {
 			cmd += fmt.Sprintf(" key=%s", msg.Key)
 		}
@@ -390,7 +390,7 @@ func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.Mess
 		}
 		return nil
 	}
-	return ch.TopicManager.PublishToPartitionWithAck(op.Topic, op.Partition, &msg)
+	return ch.TopicManager.PublishToPartitionWithAckIdempotent(op.Topic, op.Partition, &msg)
 }
 
 func (ch *CommandHandler) commitTransactionOffset(op transaction.OffsetOperation) error {
@@ -494,11 +494,18 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func parseOptionalUint64(value string) (uint64, error) {
+func parseRequiredPositiveUint64(value string) (uint64, error) {
 	if value == "" {
-		return 0, nil
+		return 0, fmt.Errorf("missing seqNum")
 	}
-	return strconv.ParseUint(value, 10, 64)
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if parsed == 0 {
+		return 0, fmt.Errorf("seqNum must be greater than zero")
+	}
+	return parsed, nil
 }
 
 func parseOptionalInt64(value string) (int64, error) {

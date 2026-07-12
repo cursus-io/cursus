@@ -2,6 +2,7 @@ package topic
 
 import (
 	"errors"
+	"os"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -102,6 +103,37 @@ func TestPartition_RestoresProducerStateCheckpoint(t *testing.T) {
 	require.Equal(t, "second", msgs[1].Payload)
 }
 
+func TestPartition_RecoversProducerStateFromLogWithoutCheckpoint(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 1
+
+	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	p := NewPartition(0, "orders", dh, nil, cfg)
+
+	msg := types.Message{Payload: "first", ProducerID: "producer-1", SeqNum: 1, TransactionalID: "tx-1", TransactionState: types.TransactionStateCommitted}
+	require.NoError(t, p.EnqueueSyncIdempotent(msg))
+	p.FlushDisk()
+	checkpointPath := p.producerStatePath
+	p.Close()
+	require.NoError(t, dh.Close())
+	require.NoError(t, os.Remove(checkpointPath))
+
+	restartedDH, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { _ = restartedDH.Close() }()
+	restarted := NewPartition(0, "orders", restartedDH, nil, cfg)
+	defer restarted.Close()
+	restarted.RecoverProducerStateFromLog()
+
+	retry := types.Message{Payload: "duplicate", ProducerID: "producer-1", SeqNum: 1, TransactionalID: "tx-1", TransactionState: types.TransactionStateCommitted}
+	require.NoError(t, restarted.EnqueueSyncIdempotent(retry))
+	msgs, err := restarted.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Equal(t, "first", msgs[0].Payload)
+}
 func TestPartition_ProducerEpochFencing(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

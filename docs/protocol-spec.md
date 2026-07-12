@@ -447,12 +447,12 @@ Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>
 **TXN_PUBLISH**
 
 ```text
-TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> [seqNum=<N>] epoch=<N> [key=<key>] message=<payload>
+TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> seqNum=<N> epoch=<N> [key=<key>] message=<payload>
 ```
 
 Success: `OK transactional_id=<id> staged_messages=1 topic=<topic> partition=<N>`.
 
-The record is staged in the transaction coordinator and is not published until `END_TXN ... result=commit`. On commit, the broker stamps the record with `transactional_id` and `transaction_state=committed`, then uses the normal publish path, including partition-leader routing in distributed mode. After records are written, the broker appends a hidden Cursus transaction control marker to each touched partition. Aborted or open transaction records are not published by this staging path, and abort writes hidden abort markers for touched partitions.
+The record is staged in the transaction coordinator and is not published until `END_TXN ... result=commit`. `seqNum` is required and must be greater than zero; the broker uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even when the target topic is not globally idempotent. On commit, the broker stamps the record with `transactional_id` and `transaction_state=committed`, then uses the normal publish path, including partition-leader routing in distributed mode. After records are written, the broker appends a hidden Cursus transaction control marker to each touched partition. Aborted or open transaction records are not published by this staging path, and abort writes hidden abort markers for touched partitions.
 
 **SEND_OFFSETS_TO_TXN**
 
@@ -480,7 +480,7 @@ TXN_STATUS transactional_id=<id>
 
 Success: `OK transactional_id=<id> state=<open|committing|committed|aborted> messages=<N> offsets=<N>`.
 
-Current guarantee: a successful transaction commit stages records and offsets behind a broker transaction coordinator, fences stale producer epochs, persists transaction state through the distributed metadata FSM, writes hidden Cursus transaction control markers to touched partition logs, uses the normal partition-leader publish path, commits offsets through the consumer-group coordinator, and makes `ReadCommitted`/`CONSUME` hide transaction marker records plus open or aborted transactional records. Retried `END_TXN` requests for an already committed or aborted transaction are idempotent for the same producer epoch. On broker start, restored `committing` transactions are recovered by replaying the prepared transaction and finalizing it as committed on the transaction coordinator. This is stronger than a client-side offset fallback, but it is still not byte-compatible with Kafka transaction control batches and does not make external side effects exactly-once; clients should continue to use idempotent processors for external systems.
+Current guarantee: a successful transaction commit stages records and offsets behind a broker transaction coordinator, fences stale producer epochs, persists transaction state through the distributed metadata FSM, writes hidden Cursus transaction control markers to touched partition logs, uses the normal partition-leader publish path, commits offsets through the consumer-group coordinator, and makes `ReadCommitted`/`CONSUME` hide transaction marker records plus open or aborted transactional records. Retried `END_TXN` requests for an already committed or aborted transaction are idempotent for the same producer epoch. On broker start, restored `committing` transactions are recovered by replaying the prepared transaction and finalizing it as committed on the transaction coordinator; producer sequence state is rebuilt from partition logs so replay does not append duplicate transactional records after a lost producer-state checkpoint. This is stronger than a client-side offset fallback, but it is still not byte-compatible with Kafka transaction control batches and does not make external side effects exactly-once; clients should continue to use idempotent processors for external systems.
 
 #### Event Sourcing Commands
 
@@ -789,13 +789,13 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - A new `(producerId, epoch)` sequence starts at `seqNum=1`; starting above 1 is rejected as a gap
 - A higher `epoch` fences the previous producer session and may restart `seqNum` from 1
 - A lower `epoch` is rejected as stale producer state
-- `seqNum` = 0 disables dedup for that message
+- `seqNum` = 0 disables dedup for non-transactional publish messages; transactional `TXN_PUBLISH` requires `seqNum > 0`
 - Broker rejects duplicates silently (returns OK)
 
 ### Sequence Tracking
 
 - Broker tracks the last seen `(epoch, seqNum)` per `(producerId)` per partition
-- Disk-backed partitions persist producer sequence checkpoints and restore them on broker restart
+- Disk-backed partitions persist producer sequence checkpoints, rebuild producer state from partition logs on broker restart, and use that state to make transactional commit recovery idempotent
 - Distributed FSM snapshots also include producer sequence state for replicated message commands
 - FSM snapshots that encode producer epochs use snapshot version 3. Do not run mixed-version rolling upgrades across brokers that cannot decode producer-epoch snapshot state; upgrade the cluster together or drain snapshots before introducing older binaries.
 - Producer state expires from memory after 30 minutes of inactivity; durable checkpoints retain the last persisted sequence until the partition data is removed

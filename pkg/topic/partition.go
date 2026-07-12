@@ -113,24 +113,28 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	}
 	if p.producerStateCh != nil {
 		p.loadProducerStateCheckpoint()
-		p.producerStateWG.Add(1)
-		go p.runProducerStateCheckpointLoop()
 	}
 
 	return p
 }
 
 func (p *Partition) validateProducerMessage(msg *types.Message) (bool, error) {
-	return p.validateProducerMessageWithStage(msg, nil)
+	return p.validateProducerMessageWithStage(msg, nil, false)
 }
 
-func (p *Partition) validateProducerMessageWithStage(msg *types.Message, staged map[string]stagedProducerEntry) (bool, error) {
-	if !p.isIdempotent {
+func (p *Partition) validateProducerMessageWithStage(msg *types.Message, staged map[string]stagedProducerEntry, force bool) (bool, error) {
+	if !p.isIdempotent && !force {
 		return false, nil
 	}
-	// SeqNum == 0 means the producer did not explicitly set a sequence number;
-	// skip dedup to avoid incorrectly rejecting every message after the first.
-	if msg.ProducerID == "" || msg.SeqNum == 0 {
+	if msg.ProducerID == "" {
+		return false, nil
+	}
+	if msg.SeqNum == 0 {
+		if force {
+			return false, fmt.Errorf("idempotency error: producer %s must set seqNum > 0", msg.ProducerID)
+		}
+		// SeqNum == 0 means a non-transactional producer did not explicitly set a sequence number;
+		// skip dedup to avoid incorrectly rejecting every message after the first.
 		return false, nil
 	}
 
@@ -151,7 +155,6 @@ func (p *Partition) validateProducerMessageWithStage(msg *types.Message, staged 
 
 	return false, nil
 }
-
 func (p *Partition) validateAgainstProducerState(msg *types.Message, lastEpoch int64, lastSeq uint64, allowDuplicate bool) (bool, error) {
 	if msg.Epoch < lastEpoch {
 		return false, fmt.Errorf("stale_producer_epoch producer=%s current=%d got=%d", msg.ProducerID, lastEpoch, msg.Epoch)
@@ -173,7 +176,11 @@ func (p *Partition) validateAgainstProducerState(msg *types.Message, lastEpoch i
 }
 
 func (p *Partition) updateProducerState(msg *types.Message) {
-	if !p.isIdempotent || msg.ProducerID == "" {
+	p.updateProducerStateWithMode(msg, false)
+}
+
+func (p *Partition) updateProducerStateWithMode(msg *types.Message, force bool) {
+	if (!p.isIdempotent && !force) || msg.ProducerID == "" {
 		return
 	}
 	if msg.SeqNum > 0 {
@@ -230,13 +237,21 @@ func (p *Partition) Enqueue(msg types.Message) {
 }
 
 func (p *Partition) EnqueueSync(msg types.Message) error {
+	return p.enqueueSync(msg, false)
+}
+
+func (p *Partition) EnqueueSyncIdempotent(msg types.Message) error {
+	return p.enqueueSync(msg, true)
+}
+
+func (p *Partition) enqueueSync(msg types.Message, forceIdempotent bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
 
-	duplicate, err := p.validateProducerMessage(&msg)
+	duplicate, err := p.validateProducerMessageWithStage(&msg, nil, forceIdempotent)
 	if err != nil {
 		return err
 	}
@@ -250,13 +265,21 @@ func (p *Partition) EnqueueSync(msg types.Message) error {
 		return fmt.Errorf("disk write failed: %w", err)
 	}
 
-	p.updateProducerState(&msg)
+	p.updateProducerStateWithMode(&msg, forceIdempotent)
 	msg.Offset = offset
 	p.LEO.Store(offset + 1)
 	p.setHWMLocked(offset + 1)
 
 	p.NotifyNewMessage()
 	return nil
+}
+func batchHasTransactionalMessages(msgs []types.Message) bool {
+	for _, msg := range msgs {
+		if msg.TransactionalID != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // EnqueueBatchSync pushes multiple messages into the partition queue synchronously.
@@ -348,16 +371,17 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 	pending := make([]pendingLeaderMessage, 0, len(msgs))
 	diskBatch := make([]types.DiskMessage, 0, len(msgs))
 	staged := make(map[string]stagedProducerEntry)
+	forceIdempotent := batchHasTransactionalMessages(msgs)
 
 	for i := range msgs {
-		duplicate, err := p.validateProducerMessageWithStage(&msgs[i], staged)
+		duplicate, err := p.validateProducerMessageWithStage(&msgs[i], staged, forceIdempotent)
 		if err != nil {
 			return err
 		}
 		if duplicate {
 			continue
 		}
-		if p.isIdempotent && msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
+		if (p.isIdempotent || forceIdempotent) && msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
 			staged[msgs[i].ProducerID] = stagedProducerEntry{
 				lastEpoch: msgs[i].Epoch,
 				lastSeq:   msgs[i].SeqNum,
@@ -371,18 +395,21 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 			index: i,
 		})
 		diskBatch = append(diskBatch, types.DiskMessage{
-			Topic:            p.topic,
-			Partition:        partitionID,
-			Offset:           offset,
-			ProducerID:       msgs[i].ProducerID,
-			SeqNum:           msgs[i].SeqNum,
-			Epoch:            msgs[i].Epoch,
-			Payload:          msgs[i].Payload,
-			Key:              msgs[i].Key,
-			EventType:        msgs[i].EventType,
-			SchemaVersion:    msgs[i].SchemaVersion,
-			AggregateVersion: msgs[i].AggregateVersion,
-			Metadata:         msgs[i].Metadata,
+			Topic:             p.topic,
+			Partition:         partitionID,
+			Offset:            offset,
+			ProducerID:        msgs[i].ProducerID,
+			SeqNum:            msgs[i].SeqNum,
+			Epoch:             msgs[i].Epoch,
+			Payload:           msgs[i].Payload,
+			Key:               msgs[i].Key,
+			EventType:         msgs[i].EventType,
+			SchemaVersion:     msgs[i].SchemaVersion,
+			AggregateVersion:  msgs[i].AggregateVersion,
+			Metadata:          msgs[i].Metadata,
+			TransactionalID:   msgs[i].TransactionalID,
+			TransactionState:  msgs[i].TransactionState,
+			TransactionMarker: msgs[i].TransactionMarker,
 		})
 	}
 
@@ -400,7 +427,7 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 	}
 
 	for _, msg := range pending {
-		p.updateProducerState(&msgs[msg.index])
+		p.updateProducerStateWithMode(&msgs[msg.index], forceIdempotent)
 	}
 	p.LEO.Store(nextOffset)
 	p.NotifyNewMessage()
@@ -538,6 +565,51 @@ func isReadCommittedVisible(msg types.Message) bool {
 		return true
 	}
 	return msg.TransactionState == types.TransactionStateCommitted
+}
+
+func (p *Partition) RecoverProducerStateFromLog() {
+	if p.dh == nil || p.producerStateCh == nil {
+		return
+	}
+
+	first := p.dh.GetFirstOffset()
+	durableTail := p.dh.GetAbsoluteOffset()
+	if durableTail <= first {
+		return
+	}
+	offset := first
+	const batchSize = 1024
+	now := time.Now()
+
+	for {
+		msgs, err := p.dh.ReadMessages(offset, batchSize)
+		if err != nil || len(msgs) == 0 {
+			break
+		}
+		for _, msg := range msgs {
+			if msg.ProducerID != "" && msg.SeqNum > 0 {
+				p.producerState.Store(msg.ProducerID, &producerEntry{lastEpoch: msg.Epoch, lastSeq: msg.SeqNum, lastSeen: now})
+			}
+			next := msg.Offset + 1
+			if next <= offset {
+				next = offset + 1
+			}
+			offset = next
+		}
+		if len(msgs) < batchSize || offset >= durableTail {
+			break
+		}
+	}
+	p.signalProducerStateCheckpoint()
+}
+
+func (p *Partition) StartProducerStateMaintenance() {
+	if p.producerStateCh == nil {
+		return
+	}
+	p.producerStateWG.Add(1)
+	go p.runProducerStateCheckpointLoop()
+	go p.runProducerCleanup()
 }
 
 // FlushDisk forces all pending async writes to disk.

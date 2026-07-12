@@ -459,10 +459,10 @@ Starts a broker-managed transaction. In distributed mode, route transaction comm
 ### TXN_PUBLISH
 
 ```text
-TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> [seqNum=<N>] epoch=<N> [key=<key>] message=<payload>
+TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> seqNum=<N> epoch=<N> [key=<key>] message=<payload>
 ```
 
-Stages one record in the transaction. The record is not published until `END_TXN ... result=commit` succeeds. Committed records are stamped with transaction metadata before they enter the normal publish path, and commit/abort writes hidden Cursus transaction control markers to touched partition logs. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
+Stages one record in the transaction. `seqNum` is required and must be greater than zero; Cursus uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even on non-idempotent topics. The record is not published until `END_TXN ... result=commit` succeeds. Committed records are stamped with transaction metadata before they enter the normal publish path, and commit/abort writes hidden Cursus transaction control markers to touched partition logs. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
 
 ### SEND_OFFSETS_TO_TXN
 
@@ -478,7 +478,7 @@ Stages consumer offsets in the transaction. The broker validates group member, g
 END_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> result=<commit|abort>
 ```
 
-Commits or aborts staged records and offsets. Transaction state is replicated in the metadata FSM and included in snapshots, committed records use the normal partition-leader publish path, finalization retries are idempotent for the same producer epoch, hidden Cursus transaction markers are appended to touched partition logs, startup recovery finalizes restored `committing` transactions, and committed reads hide transaction marker records plus open or aborted transactional records. Cursus still does not provide Kafka-compatible partition-log control batches or exactly-once external side effects.
+Commits or aborts staged records and offsets. Transaction state is replicated in the metadata FSM and included in snapshots, committed records use the normal partition-leader publish path with forced idempotent sequence validation, finalization retries are idempotent for the same producer epoch, hidden Cursus transaction markers are appended to touched partition logs, startup recovery finalizes restored `committing` transactions, producer sequence state is rebuilt from partition logs, and committed reads hide transaction marker records plus open or aborted transactional records. Cursus still does not provide Kafka-compatible partition-log control batches or exactly-once external side effects.
 
 ### TXN_STATUS
 
