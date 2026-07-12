@@ -1,11 +1,12 @@
 package transaction
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
@@ -64,6 +65,37 @@ func NewManager() *Manager {
 	return &Manager{txns: make(map[string]*Transaction)}
 }
 
+func (m *Manager) InitProducer(id string) (string, int64, error) {
+	if id == "" {
+		return "", 0, fmt.Errorf("missing transaction id")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	producer := producerIDForTransactionalID(id)
+	epoch := int64(0)
+	if tx, ok := m.txns[id]; ok {
+		if tx.State == StateCommitting {
+			return "", 0, fmt.Errorf("transaction %s is committing; retry END_TXN before reinitializing producer", id)
+		}
+		if tx.Producer != "" {
+			producer = tx.Producer
+		}
+		epoch = tx.Epoch + 1
+	}
+
+	now := time.Now()
+	m.txns[id] = &Transaction{
+		ID:        id,
+		Producer:  producer,
+		Epoch:     epoch,
+		State:     StateAborted,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	return producer, epoch, nil
+}
 func (m *Manager) Begin(id, producer string, epoch int64) error {
 	if id == "" {
 		return fmt.Errorf("missing transaction id")
@@ -75,13 +107,21 @@ func (m *Manager) Begin(id, producer string, epoch int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if tx, ok := m.txns[id]; ok {
-		if epoch < tx.Epoch {
-			return fmt.Errorf("producer fenced transactional_id=%s current_epoch=%d requested_epoch=%d", id, tx.Epoch, epoch)
-		}
-		if tx.State != StateCommitted && tx.State != StateAborted {
-			return fmt.Errorf("transaction %s is already active", id)
-		}
+	tx, ok := m.txns[id]
+	if !ok {
+		return fmt.Errorf("transaction %s is not initialized; call INIT_PRODUCER_ID first", id)
+	}
+	if tx.Producer != "" && tx.Producer != producer {
+		return fmt.Errorf("transaction owner mismatch transactional_id=%s producer=%s requested=%s", id, tx.Producer, producer)
+	}
+	if epoch < tx.Epoch {
+		return fmt.Errorf("producer fenced transactional_id=%s current_epoch=%d requested_epoch=%d", id, tx.Epoch, epoch)
+	}
+	if epoch > tx.Epoch {
+		return fmt.Errorf("producer epoch not initialized transactional_id=%s current_epoch=%d requested_epoch=%d", id, tx.Epoch, epoch)
+	}
+	if tx.State != StateCommitted && tx.State != StateAborted {
+		return fmt.Errorf("transaction %s is already active", id)
 	}
 
 	now := time.Now()
@@ -273,6 +313,12 @@ func (m *Manager) ApplySnapshot(snap *Snapshot) {
 	m.txns[snap.ID] = transactionFromSnapshot(snap)
 }
 
+func (m *Manager) Delete(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.txns, id)
+}
+
 func (m *Manager) activeLocked(id string) (*Transaction, error) {
 	tx, ok := m.txns[id]
 	if !ok {
@@ -336,10 +382,7 @@ func transactionFromSnapshot(snap *Snapshot) *Transaction {
 	}
 }
 
-func ToCoordinatorOffsets(ops []OffsetOperation) []coordinator.OffsetItem {
-	out := make([]coordinator.OffsetItem, 0, len(ops))
-	for _, op := range ops {
-		out = append(out, coordinator.OffsetItem{Partition: op.Partition, Offset: op.Offset})
-	}
-	return out
+func producerIDForTransactionalID(id string) string {
+	sum := sha256.Sum256([]byte(id))
+	return "txn-" + hex.EncodeToString(sum[:8])
 }

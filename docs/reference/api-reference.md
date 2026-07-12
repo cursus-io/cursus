@@ -448,13 +448,21 @@ Clients and SDKs should reconnect to that leader and retry. Followers index repl
 
 
 
+### INIT_PRODUCER_ID
+
+```text
+INIT_PRODUCER_ID transactional_id=<id>
+```
+
+Initializes or reinitializes a broker-managed producer session for a transactional id. Success: `OK transactional_id=<id> producerId=<producer-id> epoch=<N>`. Reinitialization bumps `epoch` and fences older producers for that `transactional_id`. If the transaction is already `committing`, the broker rejects reinitialization so the prepared commit can be retried or recovered.
+
 ### BEGIN_TXN
 
 ```text
-BEGIN_TXN transactional_id=<id> producerId=<producer-id> [epoch=<N>]
+BEGIN_TXN transactional_id=<id> producerId=<producer-id> epoch=<N>
 ```
 
-Starts a broker-managed transaction. In distributed mode, route transaction commands to `FIND_COORDINATOR transactional_id=<id>`; the coordinator key is `txn:<id>`. Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`.
+Starts a broker-managed transaction using the `producerId` and `epoch` returned by `INIT_PRODUCER_ID`. In distributed mode, route transaction commands to `FIND_COORDINATOR transactional_id=<id>`; the coordinator key is `txn:<id>`. Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`.
 
 ### TXN_PUBLISH
 
@@ -462,7 +470,7 @@ Starts a broker-managed transaction. In distributed mode, route transaction comm
 TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> seqNum=<N> epoch=<N> [key=<key>] message=<payload>
 ```
 
-Stages one record in the transaction. `seqNum` is required and must be greater than zero; Cursus uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even on non-idempotent topics. The record is not published until `END_TXN ... result=commit` succeeds. Committed records are stamped with transaction metadata before they enter the normal publish path, and commit/abort writes hidden Cursus transaction control markers to touched partition logs. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
+Stages one record in the transaction. `seqNum` is required and must be greater than zero; Cursus uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even on non-idempotent topics. The record is not published until `END_TXN ... result=commit` succeeds. Committed records are written with transaction metadata before they enter the normal publish path, but they remain `transaction_state=open` until a hidden Cursus commit marker on the touched partition makes them visible to `read_committed` consumers; marker presence is the visibility authority for transactional records. Commit/abort writes hidden Cursus transaction control markers to touched partition logs. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
 
 ### SEND_OFFSETS_TO_TXN
 
@@ -470,7 +478,7 @@ Stages one record in the transaction. `seqNum` is required and must be greater t
 SEND_OFFSETS_TO_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> topic=<topic> group=<group> member=<member> generation=<N> P<partition>:<nextOffset>,P<partition>:<nextOffset>
 ```
 
-Stages consumer offsets in the transaction. The broker validates group member, generation, partition ownership, and monotonic offsets before commit.
+Stages consumer offsets in the transaction. The broker validates group member, generation, and partition ownership when offsets are staged, then revalidates ownership and monotonic offsets during commit before publishing records.
 
 ### END_TXN
 
@@ -478,7 +486,7 @@ Stages consumer offsets in the transaction. The broker validates group member, g
 END_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> result=<commit|abort>
 ```
 
-Commits or aborts staged records and offsets. Transaction state is replicated in the metadata FSM and included in snapshots, committed records use the normal partition-leader publish path with forced idempotent sequence validation, finalization retries are idempotent for the same producer epoch, hidden Cursus transaction markers are appended to touched partition logs, startup recovery finalizes restored `committing` transactions, producer sequence state is rebuilt from partition logs, and committed reads use transaction markers to expose committed transactions, skip aborted transactions, and stop at the first unresolved open transaction as a last-stable-offset boundary. Cursus still does not provide Kafka-compatible partition-log control batches or exactly-once external side effects.
+Commits or aborts staged records and offsets. Transaction state is replicated in the metadata FSM and included in snapshots, `INIT_PRODUCER_ID` provides broker-owned producer epoch allocation, committed records use the normal partition-leader publish path with forced idempotent sequence validation, finalization retries are idempotent for the same producer epoch, hidden Cursus transaction markers are appended to touched partition logs, startup recovery finalizes restored `committing` transactions, producer sequence state is rebuilt from partition logs, and committed reads use transaction markers to expose committed transactions, skip aborted transactions, and stop at the first unresolved open transaction as a last-stable-offset boundary. Cursus still does not provide Kafka-compatible partition-log control batches or exactly-once external side effects.
 
 ### TXN_STATUS
 

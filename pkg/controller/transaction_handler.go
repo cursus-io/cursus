@@ -13,6 +13,32 @@ import (
 
 const transactionControlMarkerPayload = "__cursus_txn_control_marker__"
 
+func (ch *CommandHandler) handleInitProducerID(cmd string) string {
+	args := parseKeyValueArgs(cmd[len("INIT_PRODUCER_ID "):])
+	txnID := firstNonEmpty(args["transactional_id"], args["txn"], args["transaction"])
+	if txnID == "" {
+		return "ERROR: missing_transactional_id command=INIT_PRODUCER_ID"
+	}
+	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
+		return resp
+	}
+	previousState := ch.TxnManager.ExportState()
+	previousSnap, hadPrevious := previousState[txnID]
+	producerID, epoch, err := ch.TxnManager.InitProducer(txnID)
+	if err != nil {
+		return fmt.Sprintf("ERROR: init_producer_failed reason=%q", err.Error())
+	}
+	if err := ch.syncTransactionState(txnID); err != nil {
+		if hadPrevious {
+			ch.TxnManager.ApplySnapshot(previousSnap)
+		} else {
+			ch.TxnManager.Delete(txnID)
+		}
+		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
+	}
+	return fmt.Sprintf("OK transactional_id=%s producerId=%s epoch=%d", txnID, producerID, epoch)
+}
+
 func (ch *CommandHandler) handleBeginTxn(cmd string) string {
 	args := parseKeyValueArgs(cmd[len("BEGIN_TXN "):])
 	txnID := firstNonEmpty(args["transactional_id"], args["txn"], args["transaction"])
@@ -138,10 +164,11 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string) string {
 	}
 	ops := make([]transaction.OffsetOperation, 0, len(offsets))
 	for partition, offset := range offsets {
-		if errResp := ch.Coordinator.ValidateOwnershipFailure(groupID, memberID, generation, partition); errResp != "" {
-			return errResp
+		op := transaction.OffsetOperation{Topic: offsetTopic, Group: groupID, Member: memberID, Generation: generation, Partition: partition, Offset: offset}
+		if err := ch.validateTransactionOffset(op, false); err != nil {
+			return err.Error()
 		}
-		ops = append(ops, transaction.OffsetOperation{Topic: offsetTopic, Group: groupID, Member: memberID, Generation: generation, Partition: partition, Offset: offset})
+		ops = append(ops, op)
 	}
 	if err := ch.TxnManager.AddOffsets(txnID, producerID, epoch, ops); err != nil {
 		return fmt.Sprintf("ERROR: transaction_offsets_failed reason=%q", err.Error())
@@ -210,9 +237,10 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	if err := ch.applyTransaction(tx); err != nil {
-		_ = ch.TxnManager.Abort(txnID, producerID, epoch)
-		_ = ch.syncTransactionState(txnID)
-		return fmt.Sprintf("ERROR: transaction_commit_failed reason=%q", err.Error())
+		if syncErr := ch.syncTransactionState(txnID); syncErr != nil {
+			return fmt.Sprintf("ERROR: transaction_commit_failed reason=%q sync_reason=%q", err.Error(), syncErr.Error())
+		}
+		return fmt.Sprintf("ERROR: transaction_commit_failed state=committing reason=%q", err.Error())
 	}
 	if err := ch.TxnManager.Commit(txnID); err != nil {
 		return fmt.Sprintf("ERROR: transaction_commit_failed reason=%q", err.Error())
@@ -285,32 +313,109 @@ func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
 		}
 	}
 	for _, op := range tx.Offsets {
-		if ch.Coordinator == nil {
-			return fmt.Errorf("offset manager not available")
+		if err := ch.validateTransactionOffset(op, true); err != nil {
+			return err
 		}
-		if errResp := ch.Coordinator.ValidateOwnershipFailure(op.Group, op.Member, op.Generation, op.Partition); errResp != "" {
-			return fmt.Errorf("%s", errResp)
+	}
+	apply := func() error {
+		for _, op := range tx.Messages {
+			if err := ch.publishCommittedTransactionMessage(op); err != nil {
+				return err
+			}
 		}
+		if err := ch.appendTransactionMarkers(tx, types.TransactionMarkerCommit); err != nil {
+			return err
+		}
+		for _, op := range tx.Offsets {
+			if err := ch.commitTransactionOffset(op); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return ch.withTransactionOffsetFences(tx.Offsets, apply)
+}
+
+type transactionOffsetFence struct {
+	Group      string
+	Member     string
+	Generation int
+	Partitions []int
+}
+
+func (ch *CommandHandler) withTransactionOffsetFences(ops []transaction.OffsetOperation, apply func() error) error {
+	if ch.Coordinator == nil || len(ops) == 0 || ch.isDistributed() {
+		return apply()
+	}
+	fences := buildTransactionOffsetFences(ops)
+	var run func(int) error
+	run = func(idx int) error {
+		if idx >= len(fences) {
+			return apply()
+		}
+		fence := fences[idx]
+		return ch.Coordinator.WithOwnershipFence(fence.Group, fence.Member, fence.Generation, fence.Partitions, func() error {
+			return run(idx + 1)
+		})
+	}
+	return run(0)
+}
+
+func (ch *CommandHandler) validateTransactionOffset(op transaction.OffsetOperation, checkRegression bool) error {
+	if ch.Coordinator == nil {
+		return fmt.Errorf("ERROR: offset_manager_not_available")
+	}
+	if ch.isDistributed() && ch.Cluster != nil && ch.Cluster.Router != nil {
+		cmd := fmt.Sprintf("COMMIT_OFFSET topic=%s partition=%d group=%s offset=%d member=%s generation=%d validate_only=true", op.Topic, op.Partition, op.Group, op.Offset, op.Member, op.Generation)
+		if !checkRegression {
+			cmd += " ownership_only=true"
+		}
+		encodedCmd := util.EncodeMessage("", cmd)
+		resp, err := ch.Cluster.Router.ForwardToCoordinator(op.Group, string(encodedCmd))
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(resp, "OK") {
+			return fmt.Errorf("%s", resp)
+		}
+		return nil
+	}
+	if errResp := ch.Coordinator.ValidateOwnershipFailure(op.Group, op.Member, op.Generation, op.Partition); errResp != "" {
+		return fmt.Errorf("%s", errResp)
+	}
+	if checkRegression {
 		if current, ok := ch.Coordinator.GetOffset(op.Group, op.Topic, op.Partition); ok && op.Offset < current {
 			return fmt.Errorf("offset regression group=%s topic=%s partition=%d current=%d got=%d", op.Group, op.Topic, op.Partition, current, op.Offset)
 		}
 	}
-	for _, op := range tx.Messages {
-		if err := ch.publishCommittedTransactionMessage(op); err != nil {
-			return err
-		}
-	}
-	if err := ch.appendTransactionMarkers(tx, types.TransactionMarkerCommit); err != nil {
-		return err
-	}
-	for _, op := range tx.Offsets {
-		if err := ch.commitTransactionOffset(op); err != nil {
-			return err
-		}
-	}
 	return nil
 }
-
+func buildTransactionOffsetFences(ops []transaction.OffsetOperation) []transactionOffsetFence {
+	type key struct {
+		group      string
+		member     string
+		generation int
+	}
+	index := make(map[key]int)
+	partitionSeen := make(map[key]map[int]struct{})
+	fences := make([]transactionOffsetFence, 0)
+	for _, op := range ops {
+		k := key{group: op.Group, member: op.Member, generation: op.Generation}
+		idx, ok := index[k]
+		if !ok {
+			idx = len(fences)
+			index[k] = idx
+			partitionSeen[k] = make(map[int]struct{})
+			fences = append(fences, transactionOffsetFence{Group: op.Group, Member: op.Member, Generation: op.Generation})
+		}
+		if _, ok := partitionSeen[k][op.Partition]; ok {
+			continue
+		}
+		partitionSeen[k][op.Partition] = struct{}{}
+		fences[idx].Partitions = append(fences[idx].Partitions, op.Partition)
+	}
+	return fences
+}
 func (ch *CommandHandler) appendTransactionMarkers(tx *transaction.Transaction, marker string) error {
 	if tx == nil || len(tx.Messages) == 0 {
 		return nil
@@ -324,7 +429,8 @@ func (ch *CommandHandler) appendTransactionMarkers(tx *transaction.Transaction, 
 	for _, partition := range partitions {
 		msg := types.Message{
 			Payload:           transactionControlMarkerPayload,
-			ProducerID:        tx.Producer,
+			ProducerID:        transactionMarkerProducerID(tx, marker),
+			SeqNum:            1,
 			Epoch:             tx.Epoch,
 			TransactionalID:   tx.ID,
 			TransactionState:  state,
@@ -342,6 +448,12 @@ type transactionPartition struct {
 	Partition int
 }
 
+func transactionMarkerProducerID(tx *transaction.Transaction, marker string) string {
+	if tx == nil {
+		return "txn-marker:unknown"
+	}
+	return fmt.Sprintf("txn-marker:%s:%s", tx.ID, marker)
+}
 func touchedTransactionPartitions(tx *transaction.Transaction) []transactionPartition {
 	seen := make(map[transactionPartition]struct{})
 	for _, op := range tx.Messages {
@@ -362,18 +474,18 @@ func touchedTransactionPartitions(tx *transaction.Transaction) []transactionPart
 
 func (ch *CommandHandler) publishTransactionMarker(topicName string, partition int, msg types.Message) error {
 	if ch.isDistributed() {
-		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d epoch=%d transactional_id=%s transaction_state=%s transaction_marker=%s message=%s", topicName, msg.ProducerID, partition, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.Payload)
+		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true transactional_id=%s transaction_state=%s transaction_marker=%s message=%s", topicName, msg.ProducerID, partition, msg.SeqNum, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.Payload)
 		resp := ch.handlePublish(cmd)
 		if !strings.HasPrefix(resp, "OK") && !strings.HasPrefix(resp, "{") {
 			return fmt.Errorf("%s", resp)
 		}
 		return nil
 	}
-	return ch.TopicManager.PublishToPartitionWithAck(topicName, partition, &msg)
+	return ch.TopicManager.PublishToPartitionWithAckIdempotent(topicName, partition, &msg)
 }
 func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.MessageOperation) error {
 	msg := op.Message
-	msg.TransactionState = types.TransactionStateCommitted
+	msg.TransactionState = types.TransactionStateOpen
 	msg.TransactionMarker = types.TransactionMarkerNone
 	if ch.isDistributed() {
 		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true", op.Topic, msg.ProducerID, op.Partition, msg.SeqNum, msg.Epoch)
@@ -406,7 +518,7 @@ func (ch *CommandHandler) commitTransactionOffset(op transaction.OffsetOperation
 		}
 		return nil
 	}
-	if err := ch.Coordinator.CommitOffset(op.Group, op.Topic, op.Partition, op.Offset); err != nil {
+	if err := ch.Coordinator.ValidateAndCommit(op.Group, op.Topic, op.Partition, op.Offset, op.Generation, op.Member); err != nil {
 		return err
 	}
 	ch.recordConsumerLag(op.Topic, op.Partition, op.Offset, op.Group)
@@ -417,7 +529,7 @@ func (ch *CommandHandler) ensureTransactionCoordinator(txnID string) string {
 	if !ch.isDistributed() {
 		return ""
 	}
-	coordAddr, isCoord := ch.checkCoordinator(transactionCoordinatorKey(txnID))
+	coordAddr, isCoord := ch.checkTransactionCoordinator(txnID)
 	if !isCoord {
 		return notCoordinatorResponse(coordAddr)
 	}

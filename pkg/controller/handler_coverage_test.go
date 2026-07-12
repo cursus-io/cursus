@@ -953,6 +953,33 @@ func TestHandleCommitOffset_ValidatesMemberGenerationAndOwnership(t *testing.T) 
 	resp = ch.HandleCommand(notOwner, ctx)
 	assert.Contains(t, resp, "NOT_OWNER")
 }
+func TestHandleCommitOffsetValidateOnlyDoesNotMutateOffset(t *testing.T) {
+	ch, tm, coord := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopic("commit-validate-only-topic", 2, false, false))
+	require.NoError(t, coord.RegisterGroup("commit-validate-only-topic", "commit-validate-only-g1", 2))
+	_, err := coord.AddConsumer("commit-validate-only-g1", "commit-validate-only-m1")
+	require.NoError(t, err)
+	coord.Rebalance("commit-validate-only-g1")
+	gen := coord.GetGeneration("commit-validate-only-g1")
+	owned := coord.GetMemberAssignments("commit-validate-only-g1", "commit-validate-only-m1")
+	require.NotEmpty(t, owned)
+	ctx := NewClientContext("", 0)
+
+	validate := fmt.Sprintf("COMMIT_OFFSET topic=commit-validate-only-topic partition=%d group=commit-validate-only-g1 offset=10 member=commit-validate-only-m1 generation=%d validate_only=true", owned[0], gen)
+	resp := ch.HandleCommand(validate, ctx)
+	assert.Equal(t, "OK validated=true", resp)
+
+	resp = ch.HandleCommand(fmt.Sprintf("FETCH_OFFSET topic=commit-validate-only-topic partition=%d group=commit-validate-only-g1", owned[0]), ctx)
+	assert.Equal(t, "OK offset=0", resp)
+
+	commit := fmt.Sprintf("COMMIT_OFFSET topic=commit-validate-only-topic partition=%d group=commit-validate-only-g1 offset=10 member=commit-validate-only-m1 generation=%d", owned[0], gen)
+	resp = ch.HandleCommand(commit, ctx)
+	assert.Equal(t, "OK", resp)
+
+	regression := fmt.Sprintf("COMMIT_OFFSET topic=commit-validate-only-topic partition=%d group=commit-validate-only-g1 offset=9 member=commit-validate-only-m1 generation=%d validate_only=true", owned[0], gen)
+	resp = ch.HandleCommand(regression, ctx)
+	assert.Contains(t, resp, "offset_regression")
+}
 func TestHandleLeaveGroup_WithCoordinator(t *testing.T) {
 	ch, tm, coord := newTestHandlerWithCoordinator(t)
 	_ = tm.CreateTopic("leave-topic", 2, false, false)
@@ -1373,14 +1400,56 @@ func TestHandleListOffsetsErrors(t *testing.T) {
 	assert.Contains(t, ch.HandleCommand("LIST_OFFSETS topic=offsets-error-topic partition=9", ctx), "partition_not_found")
 }
 
+func TestInitProducerIDFencesPreviousEpoch(t *testing.T) {
+	ch, _, _ := newTestHandlerWithCoordinator(t)
+	ctx := NewClientContext("", 0)
+
+	resp := ch.HandleCommand("INIT_PRODUCER_ID transactional_id=tx-init", ctx)
+	assert.Contains(t, resp, "producerId=")
+	assert.Contains(t, resp, "epoch=0")
+	producerID := valueFromOKResponse(resp, "producerId")
+	require.NotEmpty(t, producerID)
+
+	resp = ch.HandleCommand("BEGIN_TXN transactional_id=tx-init producerId="+producerID+" epoch=0", ctx)
+	assert.Contains(t, resp, "state=open")
+	resp = ch.HandleCommand("INIT_PRODUCER_ID transactional_id=tx-init", ctx)
+	assert.Contains(t, resp, "epoch=1")
+	resp = ch.HandleCommand("TXN_STATUS transactional_id=tx-init", ctx)
+	assert.Contains(t, resp, "state=aborted")
+	resp = ch.HandleCommand("BEGIN_TXN transactional_id=tx-init producerId="+producerID+" epoch=0", ctx)
+	assert.Contains(t, resp, "transaction_begin_failed")
+	resp = ch.HandleCommand("BEGIN_TXN transactional_id=tx-init producerId="+producerID+" epoch=1", ctx)
+	assert.Contains(t, resp, "state=open")
+}
+
+func valueFromOKResponse(resp string, key string) string {
+	for _, field := range strings.Fields(resp) {
+		prefix := key + "="
+		if strings.HasPrefix(field, prefix) {
+			return strings.TrimPrefix(field, prefix)
+		}
+	}
+	return ""
+}
+func initTransactionSession(t *testing.T, ch *CommandHandler, ctx *ClientContext, txnID string) (string, string) {
+	t.Helper()
+	resp := ch.HandleCommand("INIT_PRODUCER_ID transactional_id="+txnID, ctx)
+	require.Contains(t, resp, "producerId=")
+	producerID := valueFromOKResponse(resp, "producerId")
+	epoch := valueFromOKResponse(resp, "epoch")
+	require.NotEmpty(t, producerID)
+	require.NotEmpty(t, epoch)
+	return producerID, epoch
+}
 func TestTransactionPublishRequiresSeqNum(t *testing.T) {
 	ch, tm, _ := newTestHandlerWithCoordinator(t)
 	require.NoError(t, tm.CreateTopic("txn-seq-topic", 1, false, false))
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("BEGIN_TXN transactional_id=tx-seq producerId=producer-1 epoch=1", ctx)
+	producerID, epoch := initTransactionSession(t, ch, ctx, "tx-seq")
+	resp := ch.HandleCommand("BEGIN_TXN transactional_id=tx-seq producerId="+producerID+" epoch="+epoch, ctx)
 	assert.Contains(t, resp, "state=open")
-	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-seq topic=txn-seq-topic partition=0 producerId=producer-1 epoch=1 message=missing-seq", ctx)
+	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-seq topic=txn-seq-topic partition=0 producerId="+producerID+" epoch="+epoch+" message=missing-seq", ctx)
 	assert.Contains(t, resp, "invalid_seq_num")
 }
 func TestTransactionCommitStagesMessagesAndOffsets(t *testing.T) {
@@ -1392,28 +1461,34 @@ func TestTransactionCommitStagesMessagesAndOffsets(t *testing.T) {
 	generation := coord.GetGeneration("txn-group")
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("BEGIN_TXN transactional_id=tx-1 producerId=producer-1 epoch=1", ctx)
+	producerID, epoch := initTransactionSession(t, ch, ctx, "tx-1")
+	resp := ch.HandleCommand("BEGIN_TXN transactional_id=tx-1 producerId="+producerID+" epoch="+epoch, ctx)
 	assert.Contains(t, resp, "state=open")
 
-	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-1 topic=txn-topic partition=0 producerId=producer-1 seqNum=1 epoch=1 message=created", ctx)
+	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-1 topic=txn-topic partition=0 producerId="+producerID+" seqNum=1 epoch="+epoch+" message=created", ctx)
 	assert.Contains(t, resp, "staged_messages=1")
 
-	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=producer-1 epoch=1 topic=txn-topic group=txn-group member=txn-member generation="+strconv.Itoa(generation)+" P0:4", ctx)
+	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId="+producerID+" epoch="+epoch+" topic=txn-topic group=txn-group member=txn-member generation="+strconv.Itoa(generation)+" P0:4", ctx)
 	assert.Contains(t, resp, "staged_offsets=1")
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=txn-topic partition=0 group=txn-group", ctx)
 	assert.Equal(t, "OK offset=0", resp)
 
-	resp = ch.HandleCommand("END_TXN transactional_id=tx-1 producerId=producer-1 epoch=1 result=commit", ctx)
+	resp = ch.HandleCommand("END_TXN transactional_id=tx-1 producerId="+producerID+" epoch="+epoch+" result=commit", ctx)
 	assert.Contains(t, resp, "state=committed")
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=txn-topic partition=0 group=txn-group", ctx)
 	assert.Equal(t, "OK offset=4", resp)
 
-	resp = ch.HandleCommand("END_TXN transactional_id=tx-1 producerId=producer-1 epoch=1 result=commit", ctx)
+	p, err := tm.GetTopic("txn-topic").GetPartition(0)
+	require.NoError(t, err)
+	nextOffsetAfterCommit := p.NextOffset()
+	resp = ch.HandleCommand("END_TXN transactional_id=tx-1 producerId="+producerID+" epoch="+epoch+" result=commit", ctx)
 	assert.Contains(t, resp, "state=committed")
 	resp = ch.HandleCommand("FETCH_OFFSET topic=txn-topic partition=0 group=txn-group", ctx)
 	assert.Equal(t, "OK offset=4", resp)
+	assert.Equal(t, nextOffsetAfterCommit, p.NextOffset())
+
 }
 
 func TestTransactionAbortDiscardsOffsets(t *testing.T) {
@@ -1425,15 +1500,25 @@ func TestTransactionAbortDiscardsOffsets(t *testing.T) {
 	generation := coord.GetGeneration("txn-abort-group")
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("BEGIN_TXN transactional_id=tx-abort producerId=producer-1 epoch=1", ctx)
+	producerID, epoch := initTransactionSession(t, ch, ctx, "tx-abort")
+	resp := ch.HandleCommand("BEGIN_TXN transactional_id=tx-abort producerId="+producerID+" epoch="+epoch, ctx)
 	assert.Contains(t, resp, "state=open")
-	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-abort producerId=producer-1 epoch=1 topic=txn-abort-topic group=txn-abort-group member=txn-abort-member generation="+strconv.Itoa(generation)+" P0:9", ctx)
+	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-abort topic=txn-abort-topic partition=0 producerId="+producerID+" seqNum=1 epoch="+epoch+" message=discarded", ctx)
+	assert.Contains(t, resp, "staged_messages=1")
+	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-abort producerId="+producerID+" epoch="+epoch+" topic=txn-abort-topic group=txn-abort-group member=txn-abort-member generation="+strconv.Itoa(generation)+" P0:9", ctx)
 	assert.Contains(t, resp, "staged_offsets=1")
-	resp = ch.HandleCommand("END_TXN transactional_id=tx-abort producerId=producer-1 epoch=1 result=abort", ctx)
+	resp = ch.HandleCommand("END_TXN transactional_id=tx-abort producerId="+producerID+" epoch="+epoch+" result=abort", ctx)
 	assert.Contains(t, resp, "state=aborted")
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=txn-abort-topic partition=0 group=txn-abort-group", ctx)
 	assert.Equal(t, "OK offset=0", resp)
+
+	p, err := tm.GetTopic("txn-abort-topic").GetPartition(0)
+	require.NoError(t, err)
+	nextOffsetAfterAbort := p.NextOffset()
+	resp = ch.HandleCommand("END_TXN transactional_id=tx-abort producerId="+producerID+" epoch="+epoch+" result=abort", ctx)
+	assert.Contains(t, resp, "state=aborted")
+	assert.Equal(t, nextOffsetAfterAbort, p.NextOffset())
 }
 
 func TestTransactionRejectsOffsetRegressionBeforePublishing(t *testing.T) {
@@ -1446,19 +1531,56 @@ func TestTransactionRejectsOffsetRegressionBeforePublishing(t *testing.T) {
 	require.NoError(t, coord.CommitOffset("txn-regression-group", "txn-regression-topic", 0, 10))
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("BEGIN_TXN transactional_id=tx-regression producerId=producer-1 epoch=1", ctx)
+	producerID, epoch := initTransactionSession(t, ch, ctx, "tx-regression")
+	resp := ch.HandleCommand("BEGIN_TXN transactional_id=tx-regression producerId="+producerID+" epoch="+epoch, ctx)
 	assert.Contains(t, resp, "state=open")
-	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-regression topic=txn-regression-topic partition=0 producerId=producer-1 seqNum=1 epoch=1 message=should-not-commit", ctx)
+	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-regression topic=txn-regression-topic partition=0 producerId="+producerID+" seqNum=1 epoch="+epoch+" message=should-not-commit", ctx)
 	assert.Contains(t, resp, "staged_messages=1")
-	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-regression producerId=producer-1 epoch=1 topic=txn-regression-topic group=txn-regression-group member=txn-regression-member generation="+strconv.Itoa(generation)+" P0:5", ctx)
+	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-regression producerId="+producerID+" epoch="+epoch+" topic=txn-regression-topic group=txn-regression-group member=txn-regression-member generation="+strconv.Itoa(generation)+" P0:5", ctx)
 	assert.Contains(t, resp, "staged_offsets=1")
 
-	resp = ch.HandleCommand("END_TXN transactional_id=tx-regression producerId=producer-1 epoch=1 result=commit", ctx)
+	resp = ch.HandleCommand("END_TXN transactional_id=tx-regression producerId="+producerID+" epoch="+epoch+" result=commit", ctx)
 	assert.Contains(t, resp, "transaction_commit_failed")
 	assert.Contains(t, resp, "offset regression")
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=txn-regression-topic partition=0 group=txn-regression-group", ctx)
 	assert.Equal(t, "OK offset=10", resp)
+	resp = ch.HandleCommand("TXN_STATUS transactional_id=tx-regression", ctx)
+	assert.Contains(t, resp, "state=committing")
+	resp = ch.HandleCommand("INIT_PRODUCER_ID transactional_id=tx-regression", ctx)
+	assert.Contains(t, resp, "init_producer_failed")
+}
+func TestTransactionCommitRejectsStaleGroupGenerationBeforePublishing(t *testing.T) {
+	ch, tm, coord := newTestHandlerWithCoordinator(t)
+	require.NoError(t, tm.CreateTopic("txn-stale-generation-topic", 1, false, false))
+	require.NoError(t, coord.RegisterGroup("txn-stale-generation-topic", "txn-stale-generation-group", 1))
+	_, err := coord.AddConsumer("txn-stale-generation-group", "txn-stale-generation-member")
+	require.NoError(t, err)
+	generation := coord.GetGeneration("txn-stale-generation-group")
+	ctx := NewClientContext("", 0)
+
+	producerID, epoch := initTransactionSession(t, ch, ctx, "tx-stale-generation")
+	resp := ch.HandleCommand("BEGIN_TXN transactional_id=tx-stale-generation producerId="+producerID+" epoch="+epoch, ctx)
+	assert.Contains(t, resp, "state=open")
+	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-stale-generation topic=txn-stale-generation-topic partition=0 producerId="+producerID+" seqNum=1 epoch="+epoch+" message=must-not-publish", ctx)
+	assert.Contains(t, resp, "staged_messages=1")
+	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-stale-generation producerId="+producerID+" epoch="+epoch+" topic=txn-stale-generation-topic group=txn-stale-generation-group member=txn-stale-generation-member generation="+strconv.Itoa(generation)+" P0:3", ctx)
+	assert.Contains(t, resp, "staged_offsets=1")
+
+	p, err := tm.GetTopic("txn-stale-generation-topic").GetPartition(0)
+	require.NoError(t, err)
+	nextOffsetBeforeCommit := p.NextOffset()
+	require.NoError(t, coord.RemoveConsumer("txn-stale-generation-group", "txn-stale-generation-member"))
+
+	resp = ch.HandleCommand("END_TXN transactional_id=tx-stale-generation producerId="+producerID+" epoch="+epoch+" result=commit", ctx)
+	assert.Contains(t, resp, "transaction_commit_failed")
+	assert.Contains(t, resp, "member_not_found")
+	assert.Equal(t, nextOffsetBeforeCommit, p.NextOffset())
+
+	resp = ch.HandleCommand("FETCH_OFFSET topic=txn-stale-generation-topic partition=0 group=txn-stale-generation-group", ctx)
+	assert.Equal(t, "OK offset=0", resp)
+	resp = ch.HandleCommand("TXN_STATUS transactional_id=tx-stale-generation", ctx)
+	assert.Contains(t, resp, "state=committing")
 }
 func TestRecoverPreparedTransactionsCommitsCommittingState(t *testing.T) {
 	ch, tm, coord := newTestHandlerWithCoordinator(t)
@@ -1468,21 +1590,23 @@ func TestRecoverPreparedTransactionsCommitsCommittingState(t *testing.T) {
 	require.NoError(t, err)
 	generation := coord.GetGeneration("txn-recover-group")
 
-	require.NoError(t, ch.TxnManager.Begin("tx-recover", "producer-1", 1))
-	require.NoError(t, ch.TxnManager.AddMessage("tx-recover", "producer-1", 1, transaction.MessageOperation{
+	producerID, epoch, initErr := ch.TxnManager.InitProducer("tx-recover")
+	require.NoError(t, initErr)
+	require.NoError(t, ch.TxnManager.Begin("tx-recover", producerID, epoch))
+	require.NoError(t, ch.TxnManager.AddMessage("tx-recover", producerID, epoch, transaction.MessageOperation{
 		Topic:     "txn-recover-topic",
 		Partition: 0,
 		Message: types.Message{
 			Payload:          "recover-me",
-			ProducerID:       "producer-1",
+			ProducerID:       producerID,
 			SeqNum:           1,
-			Epoch:            1,
+			Epoch:            epoch,
 			TransactionalID:  "tx-recover",
 			TransactionState: types.TransactionStateOpen,
 		},
 	}))
-	require.NoError(t, ch.TxnManager.AddOffsets("tx-recover", "producer-1", 1, []transaction.OffsetOperation{{Topic: "txn-recover-topic", Group: "txn-recover-group", Member: "txn-recover-member", Generation: generation, Partition: 0, Offset: 6}}))
-	_, err = ch.TxnManager.PrepareCommit("tx-recover", "producer-1", 1)
+	require.NoError(t, ch.TxnManager.AddOffsets("tx-recover", producerID, epoch, []transaction.OffsetOperation{{Topic: "txn-recover-topic", Group: "txn-recover-group", Member: "txn-recover-member", Generation: generation, Partition: 0, Offset: 6}}))
+	_, err = ch.TxnManager.PrepareCommit("tx-recover", producerID, epoch)
 	require.NoError(t, err)
 
 	require.NoError(t, ch.RecoverPreparedTransactions())

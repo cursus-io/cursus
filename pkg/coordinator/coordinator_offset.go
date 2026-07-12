@@ -252,21 +252,15 @@ func (c *Coordinator) updateOffsetPartitionCount() {
 }
 
 func (c *Coordinator) ValidateAndCommit(groupName, topic string, partition int, offset uint64, generation int, memberID string) error {
-	// Validate membership under global lock (membership is managed globally)
 	c.mu.RLock()
 	group := c.groups[groupName]
-
-	if group == nil || group.Members[memberID] == nil {
+	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
 		c.mu.RUnlock()
-		return fmt.Errorf("group/member not found")
-	}
-	if group.Generation != generation {
-		c.mu.RUnlock()
-		return fmt.Errorf("generation mismatch")
+		return fmt.Errorf("%s", errResp)
 	}
 	if !contains(group.Members[memberID].Assignments, partition) {
 		c.mu.RUnlock()
-		return fmt.Errorf("not partition owner")
+		return fmt.Errorf("ERROR: NOT_OWNER partition=%d member=%s group=%s generation=%d", partition, memberID, groupName, generation)
 	}
 	c.mu.RUnlock()
 

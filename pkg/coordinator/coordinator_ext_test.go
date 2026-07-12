@@ -177,6 +177,43 @@ func (p *persistentOffsetLog) ReadTopicPartition(_ string, partitionID int, offs
 	return out, nil
 }
 
+func TestCoordinatorValidateAndCommitReturnsWireErrors(t *testing.T) {
+	cfg := &config.Config{}
+	c := NewCoordinator(context.Background(), cfg, &DummyPublisher{})
+	require.NoError(t, c.RegisterGroup("topic1", "group1", 2))
+	assignments, err := c.AddConsumer("group1", "member-1")
+	require.NoError(t, err)
+	require.NotEmpty(t, assignments)
+	generation := c.GetGeneration("group1")
+
+	require.NoError(t, c.ValidateAndCommit("group1", "topic1", assignments[0], 10, generation, "member-1"))
+	offset, ok := c.GetOffset("group1", "topic1", assignments[0])
+	require.True(t, ok)
+	assert.Equal(t, uint64(10), offset)
+
+	err = c.ValidateAndCommit("group1", "topic1", assignments[0], 11, generation+1, "member-1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ERROR: GEN_MISMATCH")
+
+	err = c.ValidateAndCommit("group1", "topic1", assignments[0], 11, generation, "missing-member")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ERROR: member_not_found")
+
+	unownedPartition := 1
+	if assignments[0] == 1 {
+		unownedPartition = 0
+	}
+	require.NoError(t, c.RegisterGroup("single-topic", "single-group", 2))
+	_, err = c.AddConsumer("single-group", "single-member")
+	require.NoError(t, err)
+	singleGeneration := c.GetGeneration("single-group")
+	c.mu.Lock()
+	c.groups["single-group"].Members["single-member"].Assignments = []int{assignments[0]}
+	c.mu.Unlock()
+	err = c.ValidateAndCommit("single-group", "single-topic", unownedPartition, 1, singleGeneration, "single-member")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ERROR: NOT_OWNER")
+}
 func TestCoordinator_MemberAssignments(t *testing.T) {
 	cfg := &config.Config{}
 	c := NewCoordinator(context.Background(), cfg, &DummyPublisher{})

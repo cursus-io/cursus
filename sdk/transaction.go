@@ -3,8 +3,39 @@ package sdk
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
+
+type ProducerSession struct {
+	TransactionalID string
+	ProducerID      string
+	Epoch           int64
+}
+
+func (c *ConsumerClient) InitProducerID(transactionalID string) (ProducerSession, error) {
+	resp, err := c.execTxnCommand(fmt.Sprintf("INIT_PRODUCER_ID transactional_id=%s", transactionalID))
+	if err != nil {
+		return ProducerSession{}, err
+	}
+	return parseProducerSession(resp)
+}
+func parseProducerSession(resp string) (ProducerSession, error) {
+	fields := parseOKFields(resp)
+	txnID := fields["transactional_id"]
+	producerID := fields["producerId"]
+	if producerID == "" {
+		producerID = fields["producer_id"]
+	}
+	if txnID == "" || producerID == "" {
+		return ProducerSession{}, fmt.Errorf("producer session response missing transactional_id or producerId: %s", resp)
+	}
+	epoch, err := strconv.ParseInt(fields["epoch"], 10, 64)
+	if err != nil {
+		return ProducerSession{}, fmt.Errorf("invalid producer session epoch %q: %w", fields["epoch"], err)
+	}
+	return ProducerSession{TransactionalID: txnID, ProducerID: producerID, Epoch: epoch}, nil
+}
 
 func (c *ConsumerClient) BeginTransaction(transactionalID, producerID string, epoch int64) error {
 	cmd := fmt.Sprintf("BEGIN_TXN transactional_id=%s producerId=%s epoch=%d", transactionalID, producerID, epoch)

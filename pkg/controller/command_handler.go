@@ -27,7 +27,7 @@ var (
 func (ch *CommandHandler) handleHelp() string {
 	commands := []string{
 		"CREATE", "DELETE", "LIST", "PUBLISH", "CONSUME", "STREAM", "JOIN_GROUP", "SYNC_GROUP",
-		"LEAVE_GROUP", "HEARTBEAT", "COMMIT_OFFSET", "BATCH_COMMIT", "FETCH_OFFSET", "LIST_OFFSETS", "BEGIN_TXN", "TXN_PUBLISH", "SEND_OFFSETS_TO_TXN", "END_TXN", "TXN_STATUS", "REGISTER_GROUP",
+		"LEAVE_GROUP", "HEARTBEAT", "COMMIT_OFFSET", "BATCH_COMMIT", "FETCH_OFFSET", "LIST_OFFSETS", "INIT_PRODUCER_ID", "BEGIN_TXN", "TXN_PUBLISH", "SEND_OFFSETS_TO_TXN", "END_TXN", "TXN_STATUS", "REGISTER_GROUP",
 		"GROUP_STATUS", "DESCRIBE", "APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT",
 		"READ_SNAPSHOT", "STREAM_VERSION", "METADATA", "FIND_COORDINATOR", "HELP", "EXIT",
 	}
@@ -575,6 +575,8 @@ func (ch *CommandHandler) handleHeartbeat(cmd string) string {
 // handleCommitOffset processes COMMIT_OFFSET command
 func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	args := parseKeyValueArgs(cmd[14:])
+	validateOnly := strings.EqualFold(args["validate_only"], "true")
+	ownershipOnly := strings.EqualFold(args["ownership_only"], "true")
 
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
@@ -621,6 +623,15 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 		if errResp := ch.Coordinator.ValidateOwnershipFailure(groupID, memberID, generation, partition); errResp != "" {
 			return errResp
 		}
+	}
+	if validateOnly && ownershipOnly {
+		return "OK validated=true"
+	}
+	if current, ok := ch.Coordinator.GetOffset(groupID, offsetTopic, partition); ok && offset < current {
+		return formatCoordinatorError(fmt.Errorf("offset regression group=%s topic=%s partition=%d current=%d got=%d", groupID, offsetTopic, partition, current, offset))
+	}
+	if validateOnly {
+		return "OK validated=true"
 	}
 
 	if ch.isDistributed() {

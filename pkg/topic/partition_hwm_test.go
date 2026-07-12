@@ -311,27 +311,68 @@ func TestPartition_ReadCommittedUsesTransactionMarkers(t *testing.T) {
 	cfg := config.DefaultConfig()
 	dh := new(MockStorageHandler)
 	dh.On("GetLatestOffset").Return(uint64(0)).Once()
-	dh.On("GetFlushedOffset").Return(uint64(7)).Once()
+	dh.On("GetFlushedOffset").Return(uint64(6)).Once()
 	dh.On("GetFirstOffset").Return(uint64(0)).Once()
-	dh.On("ReadMessages", uint64(0), 7).Return([]types.Message{
+	dh.On("ReadMessages", uint64(0), 6).Return([]types.Message{
 		{Offset: 0, Payload: "before"},
 		{Offset: 1, Payload: "committed-by-marker", TransactionalID: "tx-commit", TransactionState: types.TransactionStateOpen},
 		{Offset: 2, Payload: "commit-marker", TransactionalID: "tx-commit", TransactionMarker: types.TransactionMarkerCommit},
 		{Offset: 3, Payload: "aborted-by-marker", TransactionalID: "tx-abort", TransactionState: types.TransactionStateOpen},
 		{Offset: 4, Payload: "abort-marker", TransactionalID: "tx-abort", TransactionMarker: types.TransactionMarkerAbort},
 		{Offset: 5, Payload: "after"},
-		{Offset: 6, Payload: "committed-state", TransactionalID: "tx-state", TransactionState: types.TransactionStateCommitted},
 	}, nil).Once()
 
 	p := NewPartition(0, "orders", dh, nil, cfg)
-	p.SetHWM(7)
+	p.SetHWM(6)
 
 	msgs, err := p.ReadCommitted(0, 10)
 	require.NoError(t, err)
-	require.Len(t, msgs, 4)
+	require.Len(t, msgs, 3)
 	require.Equal(t, "before", msgs[0].Payload)
 	require.Equal(t, "committed-by-marker", msgs[1].Payload)
 	require.Equal(t, "after", msgs[2].Payload)
-	require.Equal(t, "committed-state", msgs[3].Payload)
+	dh.AssertExpectations(t)
+}
+
+func TestPartition_ReadCommittedScansPastSmallVisibleBatchToFindMarker(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	dh.On("GetFlushedOffset").Return(uint64(3)).Once()
+	dh.On("GetFirstOffset").Return(uint64(0)).Once()
+	dh.On("ReadMessages", uint64(0), 3).Return([]types.Message{
+		{Offset: 0, Payload: "committed-by-marker", TransactionalID: "tx-commit", TransactionState: types.TransactionStateOpen},
+		{Offset: 1, Payload: "commit-marker", TransactionalID: "tx-commit", TransactionMarker: types.TransactionMarkerCommit},
+		{Offset: 2, Payload: "after"},
+	}, nil).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.SetHWM(3)
+
+	msgs, err := p.ReadCommitted(0, 1)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Equal(t, "committed-by-marker", msgs[0].Payload)
+	dh.AssertExpectations(t)
+}
+
+func TestPartition_ReadCommittedRequiresMarkerForTransactionalRecord(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	dh.On("GetFlushedOffset").Return(uint64(2)).Once()
+	dh.On("GetFirstOffset").Return(uint64(0)).Once()
+	dh.On("ReadMessages", uint64(0), 2).Return([]types.Message{
+		{Offset: 0, Payload: "committed-state-without-marker", TransactionalID: "tx-state", TransactionState: types.TransactionStateCommitted},
+		{Offset: 1, Payload: "plain"},
+	}, nil).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.SetHWM(2)
+
+	msgs, err := p.ReadCommitted(0, 10)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Equal(t, "plain", msgs[0].Payload)
 	dh.AssertExpectations(t)
 }

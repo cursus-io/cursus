@@ -567,9 +567,6 @@ func (p *Partition) readCommittedScanRange(offset uint64, hwm uint64, maxVisible
 	for current < hwm {
 		remaining := hwm - current
 		readMax := scanBatchSize
-		if len(messages) == 0 && maxVisible > 0 && maxVisible < readMax {
-			readMax = maxVisible
-		}
 		if remaining <= math.MaxInt && readMax > int(remaining) { // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
 			readMax = int(remaining) // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
 		}
@@ -654,16 +651,10 @@ func isReadCommittedVisible(msg types.Message, markers map[string]string) bool {
 	if msg.TransactionalID == "" {
 		return true
 	}
-	if msg.TransactionState == types.TransactionStateCommitted {
-		return true
-	}
 	if msg.TransactionState == types.TransactionStateAborted {
 		return false
 	}
-	if msg.TransactionState == types.TransactionStateOpen {
-		return markers[msg.TransactionalID] == types.TransactionMarkerCommit
-	}
-	return false
+	return markers[msg.TransactionalID] == types.TransactionMarkerCommit
 }
 
 func (p *Partition) RecoverProducerStateFromLog() {

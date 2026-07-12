@@ -311,6 +311,25 @@ func (c *Coordinator) ValidateOwnershipFailure(groupName, memberID string, gener
 	}
 	return ""
 }
+func (c *Coordinator) WithOwnershipFence(groupName, memberID string, generation int, partitions []int, fn func() error) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
+		return fmt.Errorf("%s", errResp)
+	}
+	group := c.groups[groupName]
+	member := group.Members[memberID]
+	for _, partition := range partitions {
+		if !contains(member.Assignments, partition) {
+			return fmt.Errorf("ERROR: NOT_OWNER partition=%d member=%s group=%s generation=%d", partition, memberID, groupName, generation)
+		}
+	}
+	if fn == nil {
+		return nil
+	}
+	return fn()
+}
 func contains(slice []int, item int) bool {
 	for _, s := range slice {
 		if s == item {

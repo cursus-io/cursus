@@ -905,10 +905,14 @@ func TestBrokerFSM_Snapshot_Restore_TransactionState(t *testing.T) {
 	f := NewBrokerFSM(tm, nil)
 	f.SetTransactionManager(txnManager)
 
-	if err := txnManager.Begin("tx-restore", "producer-1", 7); err != nil {
+	producerID, epoch, initErr := txnManager.InitProducer("tx-restore")
+	if initErr != nil {
+		t.Fatalf("init producer failed: %v", initErr)
+	}
+	if err := txnManager.Begin("tx-restore", producerID, epoch); err != nil {
 		t.Fatalf("begin failed: %v", err)
 	}
-	if err := txnManager.AddOffsets("tx-restore", "producer-1", 7, []transaction.OffsetOperation{{Topic: "orders", Group: "workers", Member: "member-1", Generation: 3, Partition: 0, Offset: 12}}); err != nil {
+	if err := txnManager.AddOffsets("tx-restore", producerID, epoch, []transaction.OffsetOperation{{Topic: "orders", Group: "workers", Member: "member-1", Generation: 3, Partition: 0, Offset: 12}}); err != nil {
 		t.Fatalf("add offsets failed: %v", err)
 	}
 
@@ -933,7 +937,7 @@ func TestBrokerFSM_Snapshot_Restore_TransactionState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restored transaction missing: %v", err)
 	}
-	if tx.Producer != "producer-1" || tx.Epoch != 7 || len(tx.Offsets) != 1 || tx.Offsets[0].Offset != 12 {
+	if tx.Producer != producerID || tx.Epoch != epoch || len(tx.Offsets) != 1 || tx.Offsets[0].Offset != 12 {
 		t.Fatalf("unexpected restored transaction: %+v", tx)
 	}
 }
@@ -945,10 +949,14 @@ func TestBrokerFSM_RestoreDefersTransactionStateUntilManagerAttached(t *testing.
 	manager := transaction.NewManager()
 	f := NewBrokerFSM(tm, nil)
 	f.SetTransactionManager(manager)
-	if err := manager.Begin("tx-deferred", "producer-1", 4); err != nil {
+	producerID, epoch, initErr := manager.InitProducer("tx-deferred")
+	if initErr != nil {
+		t.Fatalf("init producer failed: %v", initErr)
+	}
+	if err := manager.Begin("tx-deferred", producerID, epoch); err != nil {
 		t.Fatalf("begin failed: %v", err)
 	}
-	if _, err := manager.PrepareCommit("tx-deferred", "producer-1", 4); err != nil {
+	if _, err := manager.PrepareCommit("tx-deferred", producerID, epoch); err != nil {
 		t.Fatalf("prepare failed: %v", err)
 	}
 
@@ -972,7 +980,7 @@ func TestBrokerFSM_RestoreDefersTransactionStateUntilManagerAttached(t *testing.
 	if err != nil {
 		t.Fatalf("restored transaction missing: %v", err)
 	}
-	if tx.State != transaction.StateCommitting || tx.Epoch != 4 {
+	if tx.State != transaction.StateCommitting || tx.Epoch != epoch {
 		t.Fatalf("unexpected restored transaction: %+v", tx)
 	}
 }

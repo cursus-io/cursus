@@ -178,13 +178,7 @@ func parseListOffsetsResponse(resp string) ([]PartitionOffsetRange, error) {
 		return nil, fmt.Errorf("unexpected list offsets response: %s", resp)
 	}
 
-	var offsetsValue string
-	for _, field := range strings.Fields(resp) {
-		if strings.HasPrefix(field, "offsets=") {
-			offsetsValue = strings.TrimPrefix(field, "offsets=")
-			break
-		}
-	}
+	offsetsValue := parseOKFields(resp)["offsets"]
 	if offsetsValue == "" {
 		return nil, fmt.Errorf("missing offsets in response: %s", resp)
 	}

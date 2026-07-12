@@ -87,6 +87,7 @@ func NewCommandHandler(
 		{prefix: "HEARTBEAT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHeartbeat(cmd) }},
 		{prefix: "COMMIT_OFFSET ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCommitOffset(cmd) }},
 		{prefix: "BATCH_COMMIT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd) }},
+		{prefix: "INIT_PRODUCER_ID ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleInitProducerID(cmd) }},
 		{prefix: "BEGIN_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBeginTxn(cmd) }},
 		{prefix: "TXN_PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnPublish(cmd) }},
 		{prefix: "SEND_OFFSETS_TO_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSendOffsetsToTxn(cmd) }},
