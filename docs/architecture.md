@@ -67,7 +67,7 @@ flowchart TB
 
 ## What is cursus?
 
-cursus is a lightweight message broker inspired by Kafka's design philosophy of **logically separated but physically distributed data management**. 
+cursus is a lightweight message broker built around **logically separated but physically distributed data management**.
 
 It provides publish-subscribe messaging with topic partitioning, consumer groups, and durable disk persistence, designed for single-node deployments with minimal operational complexity.
 
@@ -122,7 +122,7 @@ sequenceDiagram
 
     Note over CONS,DISK: Disk-based replay (CONSUME)
     CONS->>SRV: [4-byte len][CONSUME topic partition offset]
-    SRV->>PART: ReadCommitted(offset)
+    SRV->>PART: ReadCommitted(offset) by default
     PART->>DISK: mmap read (up to 8192 bytes)
     DISK-->>SRV: message batch
     SRV-->>CONS: [4-byte len][msg1][4-byte len][msg2]...
@@ -142,7 +142,7 @@ graph LR
     Part -->|notify| SM[StreamManager]
     SM -->|push| C[Consumer]
     C -->|CONSUME/STREAM| Part
-    Part -->|ReadCommitted| Seg
+    Part -->|ReadCommitted / ReadMessages| Seg
 ```
 
 ### Key flow characteristics:
@@ -169,7 +169,7 @@ This architecture enables parallel I/O across partitions and efficient sequentia
 
 ## Cluster Architecture
 
-cursus supports a 3-node Raft-based cluster with Kafka-style routing.
+cursus supports a 3-node Raft-based cluster with coordinator and partition-leader routing.
 
 ### Cluster Topology
 
@@ -237,7 +237,7 @@ graph TB
 | Coordinator | Per-group (consistent hash) | `FIND_COORDINATOR` | `JOIN_GROUP`, `SYNC_GROUP`, `LEAVE_GROUP`, `HEARTBEAT`, `COMMIT_OFFSET`, `FETCH_OFFSET` |
 | Partition leader | Per-partition | `METADATA` | `CONSUME`, `STREAM`, `PUBLISH` |
 
-### Coordinator Pattern (Kafka Model)
+### Coordinator Pattern
 
 ```mermaid
 sequenceDiagram
@@ -310,4 +310,3 @@ broker-1:
     - ADVERTISED_CLIENT_HOST=localhost
     - ADVERTISED_BROKER_PORT=9001
 ```
-

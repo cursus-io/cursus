@@ -76,7 +76,7 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 
 	replicationFactor := topicCmd.ReplicationFactor
 	if replicationFactor <= 0 {
-		replicationFactor = 3 // default, same as Kafka
+		replicationFactor = 3 // default small-cluster replication factor
 	}
 	if replicationFactor > len(brokers) {
 		util.Warn("FSM: Requested RF %d exceeds active brokers %d. Capping to %d", replicationFactor, len(brokers), len(brokers))

@@ -4,7 +4,7 @@ Consumer가 클러스터 환경에서 메시지를 소비하기 위한 FindCoord
 
 ## Overview
 
-Kafka와 동일한 패턴으로, Consumer Group 관련 커맨드는 Coordinator 브로커로, 데이터 커맨드는 파티션 리더로 라우팅합니다.
+Consumer Group 관련 커맨드는 Coordinator 브로커로, 데이터 커맨드는 파티션 리더로 라우팅합니다.
 
 ## Command Routing
 

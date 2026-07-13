@@ -4,7 +4,7 @@ This document compares **cursus** with other popular messaging systems to help y
 
 ## High-Level Comparison Matrix
 
-| Feature | **cursus** | **Apache Kafka** | **NATS (JetStream)** | **RabbitMQ** | **Redis Streams** |
+| Feature | **cursus** | **Large log platforms** | **NATS (JetStream)** | **RabbitMQ** | **Redis Streams** |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Model** | Log-based (Pull/Stream) | Log-based (Pull) | Pub/Sub & Log | Queue-based (Push) | Log-based (Pull) |
 | **Storage** | Disk (mmap, Async) | Disk (Sequential) | Memory/Disk | Memory/Disk | In-memory (Optional Disk) |
@@ -16,20 +16,20 @@ This document compares **cursus** with other popular messaging systems to help y
 
 ---
 
-## cursus vs. Apache Kafka
+## cursus vs. large log platforms
 
-**cursus** is heavily inspired by Kafka's partitioned log architecture but aims for a much smaller operational footprint.
+**cursus** uses a partitioned log architecture while aiming for a much smaller operational footprint.
 
-*   **Simplicity:** Kafka is a massive ecosystem requiring JVM and complex configuration. Cursus is a single Go binary with minimal dependencies, ideal for edge computing or small-to-medium-scale environments.
-*   **Built-in Deduplication:** Cursus provides a native 30-minute deduplication window, whereas Kafka requires idempotent producers or external state management for exactly-once processing.
-*   **Performance:** While Kafka scales to petabytes, Cursus optimizes for single-node or small cluster performance using Linux-specific optimizations like `sendfile` and `fadvise`.
+*   **Simplicity:** Cursus is a single Go binary with minimal dependencies, ideal for edge computing or small-to-medium-scale environments.
+*   **Built-in Deduplication:** Cursus provides a native 30-minute deduplication window plus producer idempotency support for reliable processing.
+*   **Performance:** Cursus optimizes for single-node or small cluster performance using Linux-specific optimizations like `sendfile` and `fadvise`.
 
 ## cursus vs. NATS (JetStream & Core)
 
 NATS distinguishes between **Core NATS** (ephemeral, at-most-once) and **JetStream** (persistent, at-least-once). Cursus takes a unified approach that combines elements of both.
 
 *   **Unified Model:** Unlike NATS which requires choosing between Core and JetStream, Cursus is built from the ground up as a persistent log-based broker. However, it provides "Core-like" performance by using dual-path delivery: messages are dispatched to active consumers immediately (like Core) while simultaneously being batched for disk persistence (like JetStream).
-*   **Streaming Semantics:** Cursus follows the Kafka/JetStream "streaming" model where messages are stored in an ordered log. This allows for features like **Replay** (consuming from a specific offset) and **Retention policies**, which are not available in Core NATS.
+*   **Streaming Semantics:** Cursus follows a durable streaming model where messages are stored in an ordered log. This allows for features like **Replay** (consuming from a specific offset) and **Retention policies**, which are not available in Core NATS.
 *   **Push vs. Pull:** 
     *   **NATS Core** is predominantly push-based.
     *   **NATS JetStream** supports both push and pull.
@@ -69,12 +69,12 @@ Redis Streams provides a log-like data structure within an in-memory database.
 ## Summary: When to use cursus?
 
 **Choose cursus if you need:**
-1.  **Kafka-like semantics** (partitioning, log-based persistence) without the operational complexity of Kafka.
+1.  **Partitioned-log semantics** with a lightweight operational model.
 2.  **Lightweight footprint** for edge deployments or microservices where resource efficiency is critical.
 3.  **High-performance disk I/O** on Linux environments.
 4.  **Built-in idempotency** and deduplication for reliable message delivery.
 
 **Choose something else if you need:**
--   Massive, enterprise-wide event streaming (use Kafka).
+-   Massive, enterprise-wide event streaming where a heavyweight platform is already required.
 -   Complex routing patterns like header-based or topic-exchange routing (use RabbitMQ).
 -   Simple, transient in-memory messaging (use Core NATS or Redis).

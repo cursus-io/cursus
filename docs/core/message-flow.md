@@ -30,7 +30,7 @@ sequenceDiagram
 
     Note over CONS,DISK: Polling consumption (CONSUME command)
     CONS->>BROKER: CONSUME topic partition offset
-    BROKER->>PART: ReadCommitted(offset)
+    BROKER->>PART: ReadCommitted(offset) by default
     PART->>DISK: mmap read
     DISK-->>BROKER: raw bytes
     BROKER-->>CONS: length-prefixed messages
@@ -66,7 +66,7 @@ graph TD
     SM -->|push to active| CONS[Consumer]
 
     CONS2[Consumer] -->|CONSUME| CMD2[CommandHandler]
-    CMD2 -->|ReadCommitted| PART2[Partition]
+    CMD2 -->|ReadCommitted / ReadMessages| PART2[Partition]
     PART2 -->|mmap read| DISK2[(Segment File)]
 ```
 
@@ -99,7 +99,7 @@ Used by Consumer Groups for real-time processing:
 
 ### Disk-based Replay (`CONSUME`)
 Used for batch processing or catching up:
-1. The `CONSUME` command triggers a direct read from disk segments via `DiskHandler`.
+1. The `CONSUME` command triggers a direct read from disk segments via `DiskHandler`. By default it uses `read_committed`; callers may request `isolation=read_uncommitted` to read the raw committed log, including unresolved transactional records and control markers.
 2. Uses **Memory-mapped I/O (mmap)** for efficient random access.
 3. Supports offset-based positioning to resume from any point in the log.
 
