@@ -67,7 +67,7 @@ flowchart TB
 
 ## What is cursus?
 
-cursus is a lightweight message broker inspired by Kafka's design philosophy of **logically separated but physically distributed data management**. 
+cursus is a lightweight message broker built around **logically separated but physically distributed data management**.
 
 It provides publish-subscribe messaging with topic partitioning, consumer groups, and durable disk persistence, designed for single-node deployments with minimal operational complexity.
 
@@ -169,7 +169,7 @@ This architecture enables parallel I/O across partitions and efficient sequentia
 
 ## Cluster Architecture
 
-cursus supports a 3-node Raft-based cluster with Kafka-style routing.
+cursus supports a 3-node Raft-based cluster with coordinator and partition-leader routing.
 
 ### Cluster Topology
 
@@ -237,7 +237,7 @@ graph TB
 | Coordinator | Per-group (consistent hash) | `FIND_COORDINATOR` | `JOIN_GROUP`, `SYNC_GROUP`, `LEAVE_GROUP`, `HEARTBEAT`, `COMMIT_OFFSET`, `FETCH_OFFSET` |
 | Partition leader | Per-partition | `METADATA` | `CONSUME`, `STREAM`, `PUBLISH` |
 
-### Coordinator Pattern (Kafka Model)
+### Coordinator Pattern
 
 ```mermaid
 sequenceDiagram
