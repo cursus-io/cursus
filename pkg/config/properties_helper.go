@@ -230,10 +230,16 @@ func overrideEnvSASLUsers(target *[]SASLUser, key string) {
 		users := make([]SASLUser, 0, len(entries))
 		for _, entry := range entries {
 			parts := strings.SplitN(strings.TrimSpace(entry), ":", 2)
-			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			principal := strings.TrimSpace(parts[0])
+			token := ""
+			if len(parts) == 2 {
+				token = strings.TrimSpace(parts[1])
+			}
+			if len(parts) != 2 || principal == "" || token == "" {
+				util.Warn("Skipping invalid %s entry %q (expected principal:token)", key, entry)
 				continue
 			}
-			users = append(users, SASLUser{Principal: parts[0], Token: parts[1]})
+			users = append(users, SASLUser{Principal: principal, Token: token})
 		}
 		*target = users
 	}

@@ -224,4 +224,12 @@ func TestClusterRouterBrokerCommandAddrPrefersInternalPort(t *testing.T) {
 	if got := fallback.brokerCommandAddr("broker-2"); got != "broker-2:7000" {
 		t.Fatalf("expected client port fallback, got %s", got)
 	}
+
+	if got := router.brokerCommandAddr("2001:db8::1"); got != "[2001:db8::1]:19000" {
+		t.Fatalf("expected bracketed IPv6 internal address, got %s", got)
+	}
+
+	if got := fallback.brokerCommandAddr("2001:db8::2"); got != "[2001:db8::2]:7000" {
+		t.Fatalf("expected bracketed IPv6 client address, got %s", got)
+	}
 }

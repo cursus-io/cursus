@@ -59,10 +59,12 @@ func (ch *CommandHandler) handleBeginTxn(cmd string) string {
 	if err != nil {
 		return fmt.Sprintf("ERROR: invalid_epoch reason=%q", err.Error())
 	}
+	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
 	if err := ch.TxnManager.Begin(txnID, producerID, epoch); err != nil {
 		return fmt.Sprintf("ERROR: transaction_begin_failed reason=%q", err.Error())
 	}
 	if err := ch.syncTransactionState(txnID); err != nil {
+		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s state=open producerId=%s epoch=%d", txnID, producerID, epoch)
@@ -123,10 +125,12 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 	if _, err := t.GetPartition(partition); err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 	}
+	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
 	if err := ch.TxnManager.AddMessage(txnID, producerID, epoch, transaction.MessageOperation{Topic: topicName, Partition: partition, Message: msg}); err != nil {
 		return fmt.Sprintf("ERROR: transaction_publish_failed reason=%q", err.Error())
 	}
 	if err := ch.syncTransactionState(txnID); err != nil {
+		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s staged_messages=1 topic=%s partition=%d", txnID, topicName, partition)
@@ -180,10 +184,12 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string) string {
 		}
 		ops = append(ops, op)
 	}
+	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
 	if err := ch.TxnManager.AddOffsets(txnID, producerID, epoch, ops); err != nil {
 		return fmt.Sprintf("ERROR: transaction_offsets_failed reason=%q", err.Error())
 	}
 	if err := ch.syncTransactionState(txnID); err != nil {
+		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s staged_offsets=%d", txnID, len(ops))
@@ -494,7 +500,7 @@ func touchedTransactionPartitions(tx *transaction.Transaction) []transactionPart
 func (ch *CommandHandler) publishTransactionMarker(topicName string, partition int, msg types.Message) error {
 	if ch.isDistributed() {
 		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true transactional_id=%s transaction_state=%s transaction_marker=%s control_batch_type=%s control_batch_version=%d control_batch_coordinator_epoch=%d control_batch_key=%s control_batch_value=%s internal_txn_publish=true message=%s", topicName, msg.ProducerID, partition, msg.SeqNum, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.ControlBatchType, msg.ControlBatchVersion, msg.ControlBatchCoordinatorEpoch, base64.StdEncoding.EncodeToString(msg.ControlBatchKey), base64.StdEncoding.EncodeToString(msg.ControlBatchValue), msg.Payload)
-		resp := ch.handlePublish(cmd)
+		resp := ch.handlePublish(cmd, NewInternalClientContext("default-group", 0))
 		if !strings.HasPrefix(resp, "OK") && !strings.HasPrefix(resp, "{") {
 			return fmt.Errorf("%s", resp)
 		}
@@ -515,7 +521,7 @@ func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.Mess
 			cmd += fmt.Sprintf(" transactional_id=%s transaction_state=%s", msg.TransactionalID, msg.TransactionState)
 		}
 		cmd += " message=" + msg.Payload
-		resp := ch.handlePublish(cmd)
+		resp := ch.handlePublish(cmd, NewInternalClientContext("default-group", 0))
 		if !strings.HasPrefix(resp, "OK") && !strings.HasPrefix(resp, "{") {
 			return fmt.Errorf("%s", resp)
 		}
@@ -665,6 +671,19 @@ func (ch *CommandHandler) ensureTransactionCoordinator(txnID string) string {
 	return ""
 }
 
+func (ch *CommandHandler) snapshotTransaction(txnID string) (*transaction.Snapshot, bool) {
+	state := ch.TxnManager.ExportState()
+	snap, ok := state[txnID]
+	return snap, ok
+}
+
+func (ch *CommandHandler) restoreTransaction(txnID string, snap *transaction.Snapshot, hadPrevious bool) {
+	if hadPrevious {
+		ch.TxnManager.ApplySnapshot(snap)
+		return
+	}
+	ch.TxnManager.Delete(txnID)
+}
 func (ch *CommandHandler) syncTransactionState(txnID string) error {
 	if !ch.isDistributed() {
 		return nil

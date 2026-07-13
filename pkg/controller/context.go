@@ -9,6 +9,7 @@ type ClientContext struct {
 	OffsetCache   map[string]uint64
 	Principal     string
 	Authenticated bool
+	Internal      bool
 }
 
 func NewClientContext(group string, idx int) *ClientContext {
@@ -20,6 +21,12 @@ func NewClientContext(group string, idx int) *ClientContext {
 		Generation:    0,
 		OffsetCache:   make(map[string]uint64),
 	}
+}
+
+func NewInternalClientContext(group string, idx int) *ClientContext {
+	ctx := NewClientContext(group, idx)
+	ctx.Internal = true
+	return ctx
 }
 
 func (ctx *ClientContext) SetConsumerGroup(groupName string) {

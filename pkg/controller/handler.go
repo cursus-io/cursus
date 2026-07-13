@@ -89,8 +89,8 @@ func NewCommandHandler(
 		{prefix: "SYNC_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSyncGroup(cmd) }},
 		{prefix: "LEAVE_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleLeaveGroup(cmd) }},
 		{prefix: "FETCH_OFFSET ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchOffset(cmd) }},
-		{prefix: "LIST_OFFSETS", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListOffsets(cmd) }},
-		{prefix: "LIST_OFFSETS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListOffsets(cmd) }},
+		{prefix: "LIST_OFFSETS", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListOffsets(cmd, ctx) }},
+		{prefix: "LIST_OFFSETS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListOffsets(cmd, ctx) }},
 		{prefix: "GROUP_STATUS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleGroupStatus(cmd) }},
 		{prefix: "DESCRIBE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDescribeTopic(cmd) }},
 		{prefix: "HEARTBEAT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHeartbeat(cmd) }},
@@ -233,7 +233,7 @@ func (ch *CommandHandler) authorizeInternalCommand(name, cmd string) string {
 		return fmt.Sprintf("ERROR: internal_auth_not_configured command=%s", name)
 	}
 	args := parseKeyValueArgs(strings.TrimPrefix(cmd, name+" "))
-	if args["internal_token"] != token {
+	if !constantTimeStringEqual(args["internal_token"], token) {
 		return fmt.Sprintf("ERROR: internal_command_unauthorized command=%s", name)
 	}
 	return ""

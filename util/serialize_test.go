@@ -141,7 +141,7 @@ func TestDeserializeDiskMessage_OldFormatNoEventSourcing(t *testing.T) {
 	data, err := SerializeDiskMessage(msg)
 	assert.NoError(t, err)
 
-	// ES + Key + transaction + control-batch trailer for empty fields: 18 bytes + 6 transaction length bytes + 12 control bytes = 36 bytes
+	// Empty-field trailer: ES(16) + Key(2) + transaction(6) + control-batch(16) = 40 bytes
 	oldData := data[:len(data)-40]
 
 	got, err := DeserializeDiskMessage(oldData)

@@ -81,6 +81,72 @@ func TestSASLACLGuardsPublishAndConsume(t *testing.T) {
 	}
 }
 
+func TestListOffsetsRequiresReadACL(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnableSASL = true
+	cfg.SASLUsers = []config.SASLUser{{Principal: "alice", Token: "secret"}}
+
+	storage := &authTestStorage{}
+	tm := topic.NewTopicManager(cfg, &authStorageProvider{storage: storage}, nil)
+	if err := tm.CreateTopicWithPolicy("offset-acl-topic", 1, false, false, topic.Policy{
+		AuthPolicy: topic.AuthPolicyACL,
+		ReadACL:    []string{"alice"},
+		WriteACL:   []string{"alice"},
+	}); err != nil {
+		t.Fatalf("CreateTopicWithPolicy failed: %v", err)
+	}
+
+	ch := NewCommandHandler(tm, cfg, nil, nil, nil)
+	unauth := ch.HandleCommand("LIST_OFFSETS topic=offset-acl-topic", NewClientContext("", 0))
+	if !strings.Contains(unauth, "NOT_AUTHORIZED_FOR_TOPIC") {
+		t.Fatalf("expected unauthenticated LIST_OFFSETS to be denied, got %q", unauth)
+	}
+
+	auth := ch.HandleCommand("LIST_OFFSETS topic=offset-acl-topic principal=alice auth_token=secret", NewClientContext("", 0))
+	if !strings.HasPrefix(auth, "OK") {
+		t.Fatalf("expected authenticated LIST_OFFSETS success, got %q", auth)
+	}
+}
+
+func TestPublicPublishCannotUseInternalTxnFlag(t *testing.T) {
+	cfg := config.DefaultConfig()
+	storage := &authTestStorage{}
+	tm := topic.NewTopicManager(cfg, &authStorageProvider{storage: storage}, nil)
+	if err := tm.CreateTopicWithPolicy("txn-internal-topic", 1, false, false, topic.DefaultPolicy()); err != nil {
+		t.Fatalf("CreateTopicWithPolicy failed: %v", err)
+	}
+
+	ch := NewCommandHandler(tm, cfg, nil, nil, nil)
+	resp := ch.HandleCommand("PUBLISH topic=txn-internal-topic producerId=p1 internal_txn_publish=true message=blocked", NewClientContext("", 0))
+	if !strings.Contains(resp, "internal_txn_publish_forbidden") {
+		t.Fatalf("expected public internal transaction publish to be rejected, got %q", resp)
+	}
+}
+func TestCommitOffsetOwnershipOnlyRequiresMemberGeneration(t *testing.T) {
+	cfg := config.DefaultConfig()
+	coord := coordinator.NewCoordinator(context.Background(), cfg, &dummyPublisher{})
+	ch := NewCommandHandler(nil, cfg, coord, nil, nil)
+
+	resp := ch.HandleCommand("COMMIT_OFFSET topic=t1 group=g1 partition=0 offset=1 validate_only=true ownership_only=true", NewClientContext("", 0))
+	if !strings.Contains(resp, "missing_ownership_params") {
+		t.Fatalf("expected missing ownership params, got %q", resp)
+	}
+}
+
+func TestPublishRejectsMalformedControlBatchMetadata(t *testing.T) {
+	cfg := config.DefaultConfig()
+	storage := &authTestStorage{}
+	tm := topic.NewTopicManager(cfg, &authStorageProvider{storage: storage}, nil)
+	if err := tm.CreateTopicWithPolicy("txn-control-topic", 1, false, false, topic.DefaultPolicy()); err != nil {
+		t.Fatalf("CreateTopicWithPolicy failed: %v", err)
+	}
+
+	ch := NewCommandHandler(tm, cfg, nil, nil, nil)
+	resp := ch.HandleCommand("PUBLISH topic=txn-control-topic producerId=p1 partition=0 seqNum=1 epoch=0 internal_txn_publish=true control_batch_version=oops message=blocked", NewInternalClientContext("", 0))
+	if !strings.Contains(resp, "invalid_control_batch_version") {
+		t.Fatalf("expected invalid control batch version, got %q", resp)
+	}
+}
 func TestTransactionMarkerRequiresControlBatchMetadata(t *testing.T) {
 	tx := &transaction.Transaction{
 		ID:       "txn-1",

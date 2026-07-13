@@ -96,11 +96,31 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
 	if strings.EqualFold(args["internal_txn_publish"], "true") {
+		if clientCtx == nil || !clientCtx.Internal {
+			return "ERROR: internal_txn_publish_forbidden command=PUBLISH"
+		}
 		if !t.Policy.CanWrite() {
 			return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", topicName)
 		}
 	} else if authResp := ch.authorizeTopicWrite(t.Policy, clientCtx); authResp != "" {
 		return fmt.Sprintf("%s topic=%s", authResp, topicName)
+	}
+
+	controlBatchVersion, errResp := parseControlBatchVersion(args["control_batch_version"])
+	if errResp != "" {
+		return errResp
+	}
+	controlBatchCoordinatorEpoch, errResp := parseControlBatchCoordinatorEpoch(args["control_batch_coordinator_epoch"])
+	if errResp != "" {
+		return errResp
+	}
+	controlBatchKey, errResp := parseControlBatchBytes(args["control_batch_key"], "key")
+	if errResp != "" {
+		return errResp
+	}
+	controlBatchValue, errResp := parseControlBatchBytes(args["control_batch_value"], "value")
+	if errResp != "" {
+		return errResp
 	}
 
 	msg := &types.Message{
@@ -113,10 +133,10 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 		TransactionState:             args["transaction_state"],
 		TransactionMarker:            args["transaction_marker"],
 		ControlBatchType:             args["control_batch_type"],
-		ControlBatchVersion:          parseInt16Default(args["control_batch_version"], 0),
-		ControlBatchCoordinatorEpoch: parseInt64Default(args["control_batch_coordinator_epoch"], 0),
-		ControlBatchKey:              parseBase64Default(args["control_batch_key"]),
-		ControlBatchValue:            parseBase64Default(args["control_batch_value"]),
+		ControlBatchVersion:          controlBatchVersion,
+		ControlBatchCoordinatorEpoch: controlBatchCoordinatorEpoch,
+		ControlBatchKey:              controlBatchKey,
+		ControlBatchValue:            controlBatchValue,
 	}
 
 	if partition < 0 {
@@ -318,7 +338,11 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 }
 
 // HandleBatchMessage processes PUBLISH of multiple messages.
-func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string, error) {
+func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...*ClientContext) (string, error) {
+	var clientCtx *ClientContext
+	if len(ctx) > 0 {
+		clientCtx = ctx[0]
+	}
 	batch, err := util.DecodeBatchMessages(data)
 	if err != nil {
 		util.Error("Batch message decoding failed: %v", err)
@@ -369,8 +393,8 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 			util.Error("Batch process failed: topic '%s' not found", batch.Topic)
 			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
 		}
-		if !t.Policy.CanWritePrincipal("") {
-			return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", batch.Topic), nil
+		if authResp := ch.authorizeTopicWrite(t.Policy, clientCtx); authResp != "" {
+			return fmt.Sprintf("%s topic=%s", authResp, batch.Topic), nil
 		}
 
 		p, err := t.GetPartition(batch.Partition)
@@ -439,8 +463,8 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 		if t == nil {
 			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
 		}
-		if !t.Policy.CanWritePrincipal("") {
-			return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", batch.Topic), nil
+		if authResp := ch.authorizeTopicWrite(t.Policy, clientCtx); authResp != "" {
+			return fmt.Sprintf("%s topic=%s", authResp, batch.Topic), nil
 		}
 		p, err := t.GetPartition(batch.Partition)
 		if err != nil {
@@ -497,35 +521,35 @@ Respond:
 	return responseStr, nil
 }
 
-func parseInt16Default(value string, fallback int16) int16 {
+func parseControlBatchVersion(value string) (int16, string) {
 	if value == "" {
-		return fallback
+		return 0, ""
 	}
 	parsed, err := strconv.ParseInt(value, 10, 16)
 	if err != nil {
-		return fallback
+		return 0, fmt.Sprintf("ERROR: invalid_control_batch_version reason=%q", err.Error())
 	}
-	return int16(parsed)
+	return int16(parsed), ""
 }
 
-func parseInt64Default(value string, fallback int64) int64 {
+func parseControlBatchCoordinatorEpoch(value string) (int64, string) {
 	if value == "" {
-		return fallback
+		return 0, ""
 	}
 	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
-		return fallback
+		return 0, fmt.Sprintf("ERROR: invalid_control_batch_coordinator_epoch reason=%q", err.Error())
 	}
-	return parsed
+	return parsed, ""
 }
 
-func parseBase64Default(value string) []byte {
+func parseControlBatchBytes(value, field string) ([]byte, string) {
 	if value == "" {
-		return nil
+		return nil, ""
 	}
 	decoded, err := base64.StdEncoding.DecodeString(value)
 	if err != nil {
-		return nil
+		return nil, fmt.Sprintf("ERROR: invalid_control_batch_%s reason=%q", field, err.Error())
 	}
-	return decoded
+	return decoded, ""
 }

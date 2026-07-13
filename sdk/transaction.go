@@ -46,6 +46,9 @@ func (c *ConsumerClient) BeginTransaction(transactionalID, producerID string, ep
 func (c *ConsumerClient) TransactionalPublish(transactionalID, topic string, partition int, msg Message) error {
 	cmd := fmt.Sprintf("TXN_PUBLISH transactional_id=%s topic=%s partition=%d producerId=%s seqNum=%d epoch=%d", transactionalID, topic, partition, msg.ProducerID, msg.SeqNum, msg.Epoch)
 	if msg.Key != "" {
+		if strings.ContainsAny(msg.Key, " \t\r\n") {
+			return fmt.Errorf("transactional publish key must not contain whitespace")
+		}
 		cmd += fmt.Sprintf(" key=%s", msg.Key)
 	}
 	cmd += " message=" + msg.Payload

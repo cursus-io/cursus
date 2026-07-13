@@ -40,7 +40,7 @@ func (ch *CommandHandler) hasRouter() bool {
 }
 
 func (ch *CommandHandler) ProcessCommand(cmd string) string {
-	ctx := NewClientContext("default-group", 0)
+	ctx := NewInternalClientContext("default-group", 0)
 
 	// Forwarded commands arrive wrapped in a binary envelope
 	// (2-byte topic length + topic + payload). Decode it first.

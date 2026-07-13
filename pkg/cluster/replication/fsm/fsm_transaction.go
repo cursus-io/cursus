@@ -19,9 +19,12 @@ func (f *BrokerFSM) applyTransactionSyncCommand(jsonData string) interface{} {
 	if cmd.Transaction == nil || cmd.Transaction.ID == "" {
 		return fmt.Errorf("invalid transaction sync payload")
 	}
-	if f.txn == nil {
+	f.mu.RLock()
+	txn := f.txn
+	f.mu.RUnlock()
+	if txn == nil {
 		return fmt.Errorf("transaction manager not available")
 	}
-	f.txn.ApplySnapshot(cmd.Transaction)
+	txn.ApplySnapshot(cmd.Transaction)
 	return nil
 }

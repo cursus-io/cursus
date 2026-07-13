@@ -421,12 +421,15 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 }
 
 // handleListOffsets processes LIST_OFFSETS topic=<name> [partition=<N>].
-func (ch *CommandHandler) handleListOffsets(cmd string) string {
+func (ch *CommandHandler) handleListOffsets(cmd string, ctx *ClientContext) string {
 	argsText := ""
 	if len(cmd) > len("LIST_OFFSETS") {
 		argsText = strings.TrimSpace(cmd[len("LIST_OFFSETS"):])
 	}
 	args := parseKeyValueArgs(argsText)
+	if authResp := ch.authenticateInline(args, ctx); authResp != "" {
+		return authResp
+	}
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
 		return "ERROR: missing_topic command=LIST_OFFSETS"
@@ -435,6 +438,9 @@ func (ch *CommandHandler) handleListOffsets(cmd string) string {
 	t := ch.TopicManager.GetTopic(topicName)
 	if t == nil {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+	if authResp := ch.authorizeTopicRead(t.Policy, ctx); authResp != "" {
+		return fmt.Sprintf("%s topic=%s", authResp, topicName)
 	}
 
 	format := func(p *topic.Partition) string {
@@ -633,6 +639,7 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	if ch.Coordinator == nil {
 		return "ERROR: offset_manager_not_available"
 	}
+	ownershipChecked := false
 	if memberID := args["member"]; memberID != "" || args["generation"] != "" {
 		generation, genErr := strconv.Atoi(args["generation"])
 		if genErr != nil {
@@ -641,8 +648,12 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 		if errResp := ch.Coordinator.ValidateOwnershipFailure(groupID, memberID, generation, partition); errResp != "" {
 			return errResp
 		}
+		ownershipChecked = true
 	}
 	if validateOnly && ownershipOnly {
+		if !ownershipChecked {
+			return "ERROR: missing_ownership_params command=COMMIT_OFFSET"
+		}
 		return "OK validated=true"
 	}
 	if current, ok := ch.Coordinator.GetOffset(groupID, offsetTopic, partition); ok && offset < current {

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"strings"
 
@@ -48,13 +49,16 @@ func (ch *CommandHandler) validateSASLToken(principal, token string) bool {
 		return false
 	}
 	for _, user := range ch.Config.SASLUsers {
-		if user.Principal == principal && user.Token == token {
+		if user.Principal == principal && constantTimeStringEqual(user.Token, token) {
 			return true
 		}
 	}
 	return false
 }
 
+func constantTimeStringEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
 func principalFromContext(ctx *ClientContext) string {
 	if ctx == nil || !ctx.Authenticated {
 		return ""
