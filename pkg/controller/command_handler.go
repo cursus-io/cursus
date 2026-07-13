@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,7 +28,7 @@ var (
 func (ch *CommandHandler) handleHelp() string {
 	commands := []string{
 		"CREATE", "DELETE", "LIST", "PUBLISH", "CONSUME", "STREAM", "JOIN_GROUP", "SYNC_GROUP",
-		"LEAVE_GROUP", "HEARTBEAT", "COMMIT_OFFSET", "BATCH_COMMIT", "FETCH_OFFSET", "REGISTER_GROUP",
+		"LEAVE_GROUP", "HEARTBEAT", "COMMIT_OFFSET", "BATCH_COMMIT", "FETCH_OFFSET", "LIST_OFFSETS", "INIT_PRODUCER_ID", "BEGIN_TXN", "TXN_PUBLISH", "SEND_OFFSETS_TO_TXN", "END_TXN", "TXN_STATUS", "REGISTER_GROUP",
 		"GROUP_STATUS", "DESCRIBE", "APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT",
 		"READ_SNAPSHOT", "STREAM_VERSION", "METADATA", "FIND_COORDINATOR", "HELP", "EXIT",
 	}
@@ -110,7 +111,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			util.Warn("Failed to register default group with coordinator: %v", err)
 		}
 	}
-	return fmt.Sprintf("OK topic=%s partitions=%d partitioner=%s auth_policy=%s retention_hours=%d retention_bytes=%d", topicName, len(t.Partitions), t.Policy.Partitioner, t.Policy.AuthPolicy, t.Policy.RetentionHours, t.Policy.RetentionBytes)
+	return fmt.Sprintf("OK topic=%s partitions=%d partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d", topicName, len(t.Partitions), t.Policy.Partitioner, t.Policy.AuthPolicy, strings.Join(t.Policy.ReadACL, ","), strings.Join(t.Policy.WriteACL, ","), t.Policy.RetentionHours, t.Policy.RetentionBytes)
 }
 
 func parseTopicPolicy(args map[string]string) (topic.Policy, string) {
@@ -135,11 +136,28 @@ func parseTopicPolicy(args map[string]string) (topic.Policy, string) {
 	if v := args["auth_policy"]; v != "" {
 		policy.AuthPolicy = v
 	}
+	policy.ReadACL = parseACLArg(args["read_acl"])
+	policy.WriteACL = parseACLArg(args["write_acl"])
 	policy, err := policy.Normalize()
 	if err != nil {
 		return policy, fmt.Sprintf("ERROR: invalid_topic_policy reason=%q", err.Error())
 	}
 	return policy, ""
+}
+
+func parseACLArg(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	acl := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			acl = append(acl, part)
+		}
+	}
+	return acl
 }
 
 // handleDelete processes DELETE command
@@ -402,6 +420,48 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 	return fmt.Sprintf("OK group=%s member=%s left=true", groupName, consumerID)
 }
 
+// handleListOffsets processes LIST_OFFSETS topic=<name> [partition=<N>].
+func (ch *CommandHandler) handleListOffsets(cmd string) string {
+	argsText := ""
+	if len(cmd) > len("LIST_OFFSETS") {
+		argsText = strings.TrimSpace(cmd[len("LIST_OFFSETS"):])
+	}
+	args := parseKeyValueArgs(argsText)
+	topicName, ok := args["topic"]
+	if !ok || topicName == "" {
+		return "ERROR: missing_topic command=LIST_OFFSETS"
+	}
+
+	t := ch.TopicManager.GetTopic(topicName)
+	if t == nil {
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+
+	format := func(p *topic.Partition) string {
+		r := p.OffsetRange()
+		return fmt.Sprintf("P%d:earliest=%d:latest=%d:leo=%d:hwm=%d", p.ID(), r.Earliest, r.Latest, r.LEO, r.HWM)
+	}
+
+	entries := make([]string, 0, len(t.Partitions))
+	if partitionStr := args["partition"]; partitionStr != "" {
+		partition, err := strconv.Atoi(partitionStr)
+		if err != nil {
+			return "ERROR: invalid_partition command=LIST_OFFSETS"
+		}
+		p, err := t.GetPartition(partition)
+		if err != nil {
+			return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
+		}
+		entries = append(entries, format(p))
+	} else {
+		for _, p := range t.Partitions {
+			entries = append(entries, format(p))
+		}
+	}
+
+	return fmt.Sprintf("OK topic=%s partitions=%d offsets=%s", topicName, len(entries), strings.Join(entries, ","))
+}
+
 // handleFetchOffset processes FETCH_OFFSET command
 func (ch *CommandHandler) handleFetchOffset(cmd string) string {
 	args := parseKeyValueArgs(cmd[13:])
@@ -533,6 +593,8 @@ func (ch *CommandHandler) handleHeartbeat(cmd string) string {
 // handleCommitOffset processes COMMIT_OFFSET command
 func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	args := parseKeyValueArgs(cmd[14:])
+	validateOnly := strings.EqualFold(args["validate_only"], "true")
+	ownershipOnly := strings.EqualFold(args["ownership_only"], "true")
 
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
@@ -579,6 +641,15 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 		if errResp := ch.Coordinator.ValidateOwnershipFailure(groupID, memberID, generation, partition); errResp != "" {
 			return errResp
 		}
+	}
+	if validateOnly && ownershipOnly {
+		return "OK validated=true"
+	}
+	if current, ok := ch.Coordinator.GetOffset(groupID, offsetTopic, partition); ok && offset < current {
+		return formatCoordinatorError(fmt.Errorf("offset regression group=%s topic=%s partition=%d current=%d got=%d", groupID, offsetTopic, partition, current, offset))
+	}
+	if validateOnly {
+		return "OK validated=true"
 	}
 
 	if ch.isDistributed() {
@@ -783,7 +854,7 @@ func (ch *CommandHandler) resolveOffset(p *topic.Partition, topicName string, cA
 	}
 
 	if cArgs.AutoOffsetReset == "latest" {
-		latest := p.GetLatestOffset()
+		latest := p.OffsetRange().Latest
 		util.Debug("Reset policy 'latest': starting at %d", latest)
 		return latest, nil
 	}
@@ -955,22 +1026,28 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 		}
 	}
 
-	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s partitioner=%s auth_policy=%s retention_hours=%d retention_bytes=%d",
-		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), t.Policy.Partitioner, t.Policy.AuthPolicy, t.Policy.RetentionHours, t.Policy.RetentionBytes)
+	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d",
+		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), t.Policy.Partitioner, t.Policy.AuthPolicy, strings.Join(t.Policy.ReadACL, ","), strings.Join(t.Policy.WriteACL, ","), t.Policy.RetentionHours, t.Policy.RetentionBytes)
 }
 
 func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 	args := parseKeyValueArgs(cmd[17:]) // len("FIND_COORDINATOR ") = 17
-	groupName, ok := args["group"]
-	if !ok || groupName == "" {
-		return "ERROR: missing_group command=FIND_COORDINATOR"
+	coordKey := args["group"]
+	coordType := "group"
+	if coordKey == "" {
+		txnID := firstNonEmpty(args["transactional_id"], args["txn"], args["transaction"])
+		if txnID == "" {
+			return "ERROR: missing_coordinator_key command=FIND_COORDINATOR"
+		}
+		coordKey = transactionCoordinatorKey(txnID)
+		coordType = "transaction"
 	}
 
 	host := "localhost"
 	port := ch.Config.BrokerPort
 
 	if ch.isDistributed() {
-		coordID, _, err := ch.Cluster.Router.FindCoordinator(groupName)
+		coordID, _, err := ch.Cluster.Router.FindCoordinator(coordKey)
 		if err != nil {
 			return fmt.Sprintf("ERROR: find_coordinator_failed reason=%q", err.Error())
 		}
@@ -982,12 +1059,22 @@ func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 			if ch.Config.AdvertisedBrokerPort > 0 {
 				port = ch.Config.AdvertisedBrokerPort
 			}
-			return fmt.Sprintf("OK coordinator_id=%s host=%s port=%d", coordID, host, port)
+			return fmt.Sprintf("OK coordinator_id=%s coordinator_type=%s host=%s port=%d", coordID, coordType, host, port)
 		}
 
-		// Forward to coordinator to get its own advertised address
+		if fsm := ch.Cluster.RaftManager.GetFSM(); fsm != nil {
+			if broker := fsm.GetBroker(coordID); broker != nil && broker.ClientAddr != "" {
+				if brokerHost, brokerPort, err := net.SplitHostPort(broker.ClientAddr); err == nil {
+					parsedPort, _ := strconv.Atoi(brokerPort)
+					if brokerHost != "" && parsedPort > 0 {
+						return fmt.Sprintf("OK coordinator_id=%s coordinator_type=%s host=%s port=%d", coordID, coordType, brokerHost, parsedPort)
+					}
+				}
+			}
+		}
+
 		encodedCmd := util.EncodeMessage("", cmd)
-		resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(groupName, string(encodedCmd))
+		resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, string(encodedCmd))
 		if fwdErr != nil {
 			return fmt.Sprintf("ERROR: forward_to_coordinator_failed reason=%q", fwdErr.Error())
 		}
@@ -1000,5 +1087,5 @@ func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 	if ch.Config.AdvertisedBrokerPort > 0 {
 		port = ch.Config.AdvertisedBrokerPort
 	}
-	return fmt.Sprintf("OK coordinator_id=standalone host=%s port=%d", host, port)
+	return fmt.Sprintf("OK coordinator_id=standalone coordinator_type=%s host=%s port=%d", coordType, host, port)
 }

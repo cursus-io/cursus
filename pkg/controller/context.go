@@ -7,6 +7,8 @@ type ClientContext struct {
 	MemberID      string
 	Generation    int
 	OffsetCache   map[string]uint64
+	Principal     string
+	Authenticated bool
 }
 
 func NewClientContext(group string, idx int) *ClientContext {

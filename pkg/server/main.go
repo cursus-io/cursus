@@ -139,7 +139,7 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 							"id": brokerID, "addr": localAddr, "client_addr": clientAddr,
 							"status": "active",
 						})
-						raftCmd := fmt.Sprintf("RAFT_APPLY type=REGISTER payload=%s", string(brokerJSON))
+						raftCmd := fmt.Sprintf("RAFT_APPLY %stype=REGISTER payload=%s", internalAuthPrefix(cfg), string(brokerJSON))
 						encodedCmd := util.EncodeMessage("", raftCmd)
 						if resp, err := cc.Router.ForwardToLeader(string(encodedCmd)); err == nil && !strings.HasPrefix(resp, "ERROR") {
 							util.Info("✅ Registered via leader with client address %s", clientAddr)
@@ -179,6 +179,18 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	if cc != nil {
 		cc.SetLocalProcessor(globalCH)
 	}
+	if cfg.EnabledDistribution && cfg.InternalBrokerPort > 0 {
+		if err := startInternalBrokerListener(ctx, cfg, globalCH); err != nil {
+			return err
+		}
+	}
+	go func() {
+		time.Sleep(2 * time.Second)
+		if err := globalCH.RecoverPreparedTransactions(); err != nil {
+			util.Error("Failed to recover prepared transactions: %v", err)
+		}
+	}()
+
 	go func() {
 		<-ctx.Done()
 		if err := globalCH.Close(); err != nil {
@@ -203,6 +215,42 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 		}
 		workerCh <- conn
 	}
+}
+
+func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHandler *controller.CommandHandler) error {
+	addr := fmt.Sprintf(":%d", cfg.InternalBrokerPort)
+	var ln net.Listener
+	var err error
+	if cfg.InternalUseTLS {
+		ln, err = tls.Listen("tcp", addr, cfg.InternalServerTLSConfig())
+	} else {
+		ln, err = net.Listen("tcp", addr)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to start internal broker listener on %s: %w", addr, err)
+	}
+
+	util.Info("🔒 Internal broker listener started on %s (mTLS=%v)", addr, cfg.InternalUseTLS)
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					util.Error("⚠️ Internal accept error: %v", err)
+					continue
+				}
+			}
+			go handleConn(ctx, conn, cmdHandler)
+		}
+	}()
+	return nil
 }
 
 // handleConn processes a connection using a shared CommandHandler.
@@ -314,6 +362,13 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 			return
 		}
 	}
+}
+
+func internalAuthPrefix(cfg *config.Config) string {
+	if cfg != nil && cfg.InternalAuthToken != "" {
+		return "internal_token=" + cfg.InternalAuthToken + " "
+	}
+	return ""
 }
 
 func initializeConnection(cfg *config.Config, tm *topic.TopicManager, cd *coordinator.Coordinator, sm *stream.StreamManager, cc *clusterController.ClusterController) (*controller.CommandHandler, *controller.ClientContext) {
@@ -443,7 +498,7 @@ func isCommand(s string) bool {
 		"HEARTBEAT", "JOIN_GROUP", "LEAVE_GROUP", "COMMIT_OFFSET", "BATCH_COMMIT", "REGISTER_GROUP",
 		"GROUP_STATUS", "FETCH_OFFSET", "LIST_GROUPS", "SYNC_GROUP", "DESCRIBE",
 		"APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT", "READ_SNAPSHOT", "STREAM_VERSION",
-		"REPLICATE_SNAPSHOT", "LIST_SNAPSHOTS", "FETCH_SNAPSHOT", "CATCHUP_SNAPSHOTS",
+		"REPLICATE_MESSAGE", "REPLICATE_SNAPSHOT", "LIST_SNAPSHOTS", "FETCH_SNAPSHOT", "CATCHUP_SNAPSHOTS",
 		"FIND_COORDINATOR", "RAFT_APPLY", "METADATA"}
 	for _, k := range keywords {
 		if strings.HasPrefix(strings.ToUpper(s), k) {

@@ -32,6 +32,15 @@ type stagedProducerEntry struct {
 	lastSeq   uint64
 }
 
+// PartitionOffsetRange describes the retained and committed offsets for a partition.
+// Latest is the next readable committed offset, capped by the flushed disk tail.
+type PartitionOffsetRange struct {
+	Earliest uint64
+	Latest   uint64
+	LEO      uint64
+	HWM      uint64
+}
+
 // Partition handles messages for one shard of a topic.
 type Partition struct {
 	id                int
@@ -53,6 +62,9 @@ type Partition struct {
 	producerStateWG   sync.WaitGroup
 	producerState     sync.Map // map[string]*producerEntry
 	isIdempotent      bool
+	producerStateTTL  time.Duration
+	txnMarkerMu       sync.RWMutex
+	txnMarkers        map[transactionMarkerKey]transactionMarkerInfo
 	closeCh           chan struct{}
 }
 
@@ -62,12 +74,14 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	initialOffset := latest + 1
 
 	p := &Partition{
-		id:            id,
-		topic:         topic,
-		dh:            dh,
-		streamManager: sm,
-		newMessageCh:  make(chan struct{}, 1),
-		closeCh:       make(chan struct{}),
+		id:               id,
+		topic:            topic,
+		dh:               dh,
+		streamManager:    sm,
+		newMessageCh:     make(chan struct{}, 1),
+		closeCh:          make(chan struct{}),
+		txnMarkers:       make(map[transactionMarkerKey]transactionMarkerInfo),
+		producerStateTTL: producerStateTTLFromConfig(cfg),
 	}
 
 	p.LEO.Store(initialOffset)
@@ -104,24 +118,31 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	}
 	if p.producerStateCh != nil {
 		p.loadProducerStateCheckpoint()
-		p.producerStateWG.Add(1)
-		go p.runProducerStateCheckpointLoop()
+	}
+	if _, ok := dh.(*disk.DiskHandler); ok {
+		p.rebuildTransactionMarkerIndex()
 	}
 
 	return p
 }
 
 func (p *Partition) validateProducerMessage(msg *types.Message) (bool, error) {
-	return p.validateProducerMessageWithStage(msg, nil)
+	return p.validateProducerMessageWithStage(msg, nil, false)
 }
 
-func (p *Partition) validateProducerMessageWithStage(msg *types.Message, staged map[string]stagedProducerEntry) (bool, error) {
-	if !p.isIdempotent {
+func (p *Partition) validateProducerMessageWithStage(msg *types.Message, staged map[string]stagedProducerEntry, force bool) (bool, error) {
+	if !p.isIdempotent && !force {
 		return false, nil
 	}
-	// SeqNum == 0 means the producer did not explicitly set a sequence number;
-	// skip dedup to avoid incorrectly rejecting every message after the first.
-	if msg.ProducerID == "" || msg.SeqNum == 0 {
+	if msg.ProducerID == "" {
+		return false, nil
+	}
+	if msg.SeqNum == 0 {
+		if force {
+			return false, fmt.Errorf("idempotency error: producer %s must set seqNum > 0", msg.ProducerID)
+		}
+		// SeqNum == 0 means a non-transactional producer did not explicitly set a sequence number;
+		// skip dedup to avoid incorrectly rejecting every message after the first.
 		return false, nil
 	}
 
@@ -142,7 +163,6 @@ func (p *Partition) validateProducerMessageWithStage(msg *types.Message, staged 
 
 	return false, nil
 }
-
 func (p *Partition) validateAgainstProducerState(msg *types.Message, lastEpoch int64, lastSeq uint64, allowDuplicate bool) (bool, error) {
 	if msg.Epoch < lastEpoch {
 		return false, fmt.Errorf("stale_producer_epoch producer=%s current=%d got=%d", msg.ProducerID, lastEpoch, msg.Epoch)
@@ -164,7 +184,11 @@ func (p *Partition) validateAgainstProducerState(msg *types.Message, lastEpoch i
 }
 
 func (p *Partition) updateProducerState(msg *types.Message) {
-	if !p.isIdempotent || msg.ProducerID == "" {
+	p.updateProducerStateWithMode(msg, false)
+}
+
+func (p *Partition) updateProducerStateWithMode(msg *types.Message, force bool) {
+	if (!p.isIdempotent && !force) || msg.ProducerID == "" {
 		return
 	}
 	if msg.SeqNum > 0 {
@@ -214,6 +238,7 @@ func (p *Partition) Enqueue(msg types.Message) {
 
 	p.updateProducerState(&msg)
 	msg.Offset = offset
+	p.indexTransactionMarker(msg)
 	p.LEO.Store(offset + 1)
 	p.setHWMLocked(offset + 1)
 
@@ -221,13 +246,21 @@ func (p *Partition) Enqueue(msg types.Message) {
 }
 
 func (p *Partition) EnqueueSync(msg types.Message) error {
+	return p.enqueueSync(msg, false)
+}
+
+func (p *Partition) EnqueueSyncIdempotent(msg types.Message) error {
+	return p.enqueueSync(msg, true)
+}
+
+func (p *Partition) enqueueSync(msg types.Message, forceIdempotent bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
 
-	duplicate, err := p.validateProducerMessage(&msg)
+	duplicate, err := p.validateProducerMessageWithStage(&msg, nil, forceIdempotent)
 	if err != nil {
 		return err
 	}
@@ -241,13 +274,22 @@ func (p *Partition) EnqueueSync(msg types.Message) error {
 		return fmt.Errorf("disk write failed: %w", err)
 	}
 
-	p.updateProducerState(&msg)
+	p.updateProducerStateWithMode(&msg, forceIdempotent)
 	msg.Offset = offset
+	p.indexTransactionMarker(msg)
 	p.LEO.Store(offset + 1)
 	p.setHWMLocked(offset + 1)
 
 	p.NotifyNewMessage()
 	return nil
+}
+func batchHasTransactionalMessages(msgs []types.Message) bool {
+	for _, msg := range msgs {
+		if msg.TransactionalID != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // EnqueueBatchSync pushes multiple messages into the partition queue synchronously.
@@ -277,6 +319,7 @@ func (p *Partition) EnqueueBatchSync(msgs []types.Message) error {
 
 		p.updateProducerState(&msgs[i])
 		msgs[i].Offset = offset
+		p.indexTransactionMarker(msgs[i])
 		p.LEO.Store(offset + 1)
 		p.setHWMLocked(offset + 1)
 	}
@@ -310,6 +353,7 @@ func (p *Partition) EnqueueBatch(msgs []types.Message) error {
 
 		p.updateProducerState(&msgs[i])
 		msgs[i].Offset = offset
+		p.indexTransactionMarker(msgs[i])
 		p.LEO.Store(offset + 1)
 		p.setHWMLocked(offset + 1)
 	}
@@ -339,16 +383,17 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 	pending := make([]pendingLeaderMessage, 0, len(msgs))
 	diskBatch := make([]types.DiskMessage, 0, len(msgs))
 	staged := make(map[string]stagedProducerEntry)
+	forceIdempotent := batchHasTransactionalMessages(msgs)
 
 	for i := range msgs {
-		duplicate, err := p.validateProducerMessageWithStage(&msgs[i], staged)
+		duplicate, err := p.validateProducerMessageWithStage(&msgs[i], staged, forceIdempotent)
 		if err != nil {
 			return err
 		}
 		if duplicate {
 			continue
 		}
-		if p.isIdempotent && msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
+		if (p.isIdempotent || forceIdempotent) && msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
 			staged[msgs[i].ProducerID] = stagedProducerEntry{
 				lastEpoch: msgs[i].Epoch,
 				lastSeq:   msgs[i].SeqNum,
@@ -362,18 +407,26 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 			index: i,
 		})
 		diskBatch = append(diskBatch, types.DiskMessage{
-			Topic:            p.topic,
-			Partition:        partitionID,
-			Offset:           offset,
-			ProducerID:       msgs[i].ProducerID,
-			SeqNum:           msgs[i].SeqNum,
-			Epoch:            msgs[i].Epoch,
-			Payload:          msgs[i].Payload,
-			Key:              msgs[i].Key,
-			EventType:        msgs[i].EventType,
-			SchemaVersion:    msgs[i].SchemaVersion,
-			AggregateVersion: msgs[i].AggregateVersion,
-			Metadata:         msgs[i].Metadata,
+			Topic:                        p.topic,
+			Partition:                    partitionID,
+			Offset:                       offset,
+			ProducerID:                   msgs[i].ProducerID,
+			SeqNum:                       msgs[i].SeqNum,
+			Epoch:                        msgs[i].Epoch,
+			Payload:                      msgs[i].Payload,
+			Key:                          msgs[i].Key,
+			EventType:                    msgs[i].EventType,
+			SchemaVersion:                msgs[i].SchemaVersion,
+			AggregateVersion:             msgs[i].AggregateVersion,
+			Metadata:                     msgs[i].Metadata,
+			TransactionalID:              msgs[i].TransactionalID,
+			TransactionState:             msgs[i].TransactionState,
+			TransactionMarker:            msgs[i].TransactionMarker,
+			ControlBatchType:             msgs[i].ControlBatchType,
+			ControlBatchVersion:          msgs[i].ControlBatchVersion,
+			ControlBatchCoordinatorEpoch: msgs[i].ControlBatchCoordinatorEpoch,
+			ControlBatchKey:              msgs[i].ControlBatchKey,
+			ControlBatchValue:            msgs[i].ControlBatchValue,
 		})
 	}
 
@@ -391,7 +444,8 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 	}
 
 	for _, msg := range pending {
-		p.updateProducerState(&msgs[msg.index])
+		p.updateProducerStateWithMode(&msgs[msg.index], forceIdempotent)
+		p.indexTransactionMarker(msgs[msg.index])
 	}
 	p.LEO.Store(nextOffset)
 	p.NotifyNewMessage()
@@ -424,6 +478,7 @@ func (p *Partition) ReplicaAppend(msgs []types.Message) error {
 			p.LEO.Store(newLEO)
 		}
 		p.setHWMLocked(newLEO)
+		p.indexTransactionMarker(msgs[i])
 	}
 	p.NotifyNewMessage()
 	return nil
@@ -469,7 +524,289 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 		max = int(canRead) // #nosec G115 -- canRead is bounded by math.MaxInt before narrowing.
 	}
 
-	return p.ReadMessages(offset, max)
+	return p.readVisibleCommitted(offset, max, hwm)
+}
+
+func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm uint64) ([]types.Message, error) {
+	if max <= 0 {
+		return nil, nil
+	}
+
+	markers := p.transactionMarkersBefore(hwm)
+	messages, err := p.readCommittedScanRange(offset, hwm, max, markers)
+	if err != nil {
+		return nil, err
+	}
+	markers = mergeScannedTransactionMarkers(markers, messages, hwm)
+
+	firstUnresolved := hwm
+	for _, msg := range messages {
+		if msg.Offset >= hwm {
+			break
+		}
+		if msg.TransactionalID == "" || msg.TransactionState != types.TransactionStateOpen {
+			continue
+		}
+		if !hasResolvingMarkerAfter(msg, markers) && msg.Offset < firstUnresolved {
+			firstUnresolved = msg.Offset
+		}
+	}
+
+	visible := make([]types.Message, 0, max)
+	for _, msg := range messages {
+		if msg.Offset >= hwm || msg.Offset >= firstUnresolved {
+			break
+		}
+		if isReadCommittedVisible(msg, markers) {
+			visible = append(visible, msg)
+			if len(visible) == max {
+				break
+			}
+		}
+	}
+	return visible, nil
+}
+
+func (p *Partition) readCommittedScanRange(offset uint64, hwm uint64, maxVisible int, markers map[transactionMarkerKey]transactionMarkerInfo) ([]types.Message, error) {
+	if offset >= hwm {
+		return nil, nil
+	}
+
+	messages := make([]types.Message, 0)
+	current := offset
+	const scanBatchSize = 1024
+	for current < hwm {
+		remaining := hwm - current
+		readMax := scanBatchSize
+		if remaining <= math.MaxInt && readMax > int(remaining) { // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
+			readMax = int(remaining) // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
+		}
+		if readMax <= 0 {
+			break
+		}
+
+		batch, err := p.ReadMessages(current, readMax)
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, msg := range batch {
+			if msg.Offset >= hwm {
+				break
+			}
+			messages = append(messages, msg)
+			next := msg.Offset + 1
+			if next <= current {
+				next = current + 1
+			}
+			current = next
+		}
+		if len(batch) < readMax || readCommittedScanHasEnoughVisible(messages, hwm, maxVisible, markers) {
+			break
+		}
+	}
+	return messages, nil
+}
+
+func readCommittedScanHasEnoughVisible(messages []types.Message, hwm uint64, maxVisible int, markers map[transactionMarkerKey]transactionMarkerInfo) bool {
+	if maxVisible <= 0 {
+		return true
+	}
+	markers = mergeScannedTransactionMarkers(markers, messages, hwm)
+	firstUnresolved := hwm
+	for _, msg := range messages {
+		if msg.Offset >= hwm {
+			break
+		}
+		if msg.TransactionalID == "" || msg.TransactionState != types.TransactionStateOpen {
+			continue
+		}
+		if !hasResolvingMarkerAfter(msg, markers) && msg.Offset < firstUnresolved {
+			firstUnresolved = msg.Offset
+		}
+	}
+	if firstUnresolved != hwm {
+		return false
+	}
+
+	visible := 0
+	for _, msg := range messages {
+		if msg.Offset >= hwm {
+			break
+		}
+		if isReadCommittedVisible(msg, markers) {
+			visible++
+			if visible >= maxVisible {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func mergeScannedTransactionMarkers(base map[transactionMarkerKey]transactionMarkerInfo, messages []types.Message, hwm uint64) map[transactionMarkerKey]transactionMarkerInfo {
+	markers := make(map[transactionMarkerKey]transactionMarkerInfo, len(base))
+	for key, marker := range base {
+		markers[key] = marker
+	}
+	for _, msg := range messages {
+		if msg.Offset >= hwm {
+			break
+		}
+		if msg.TransactionMarker == types.TransactionMarkerNone || msg.TransactionalID == "" {
+			continue
+		}
+		key := messageTransactionMarkerKey(msg)
+		if existing, ok := markers[key]; !ok || msg.Offset >= existing.offset {
+			markers[key] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset}
+		}
+	}
+	return markers
+}
+func (p *Partition) indexTransactionMarker(msg types.Message) {
+	if msg.TransactionalID == "" || msg.TransactionMarker == types.TransactionMarkerNone {
+		return
+	}
+	key := messageTransactionMarkerKey(msg)
+	p.txnMarkerMu.Lock()
+	defer p.txnMarkerMu.Unlock()
+	if p.txnMarkers == nil {
+		p.txnMarkers = make(map[transactionMarkerKey]transactionMarkerInfo)
+	}
+	if existing, ok := p.txnMarkers[key]; !ok || msg.Offset >= existing.offset {
+		p.txnMarkers[key] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset}
+	}
+}
+
+func (p *Partition) transactionMarkersBefore(hwm uint64) map[transactionMarkerKey]transactionMarkerInfo {
+	p.txnMarkerMu.RLock()
+	defer p.txnMarkerMu.RUnlock()
+	markers := make(map[transactionMarkerKey]transactionMarkerInfo, len(p.txnMarkers))
+	for key, marker := range p.txnMarkers {
+		if marker.offset < hwm {
+			markers[key] = marker
+		}
+	}
+	return markers
+}
+
+func (p *Partition) rebuildTransactionMarkerIndex() {
+	if p.dh == nil {
+		return
+	}
+	first := p.dh.GetFirstOffset()
+	durableTail := p.dh.GetAbsoluteOffset()
+	if durableTail <= first {
+		return
+	}
+	markers := make(map[transactionMarkerKey]transactionMarkerInfo)
+	offset := first
+	const batchSize = 1024
+	for offset < durableTail {
+		msgs, err := p.dh.ReadMessages(offset, batchSize)
+		if err != nil || len(msgs) == 0 {
+			break
+		}
+		for _, msg := range msgs {
+			if msg.TransactionalID != "" && msg.TransactionMarker != types.TransactionMarkerNone {
+				key := messageTransactionMarkerKey(msg)
+				if existing, ok := markers[key]; !ok || msg.Offset >= existing.offset {
+					markers[key] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset}
+				}
+			}
+			next := msg.Offset + 1
+			if next <= offset {
+				next = offset + 1
+			}
+			offset = next
+		}
+		if len(msgs) < batchSize {
+			break
+		}
+	}
+	p.txnMarkerMu.Lock()
+	p.txnMarkers = markers
+	p.txnMarkerMu.Unlock()
+}
+
+type transactionMarkerKey struct {
+	transactionalID string
+	epoch           int64
+}
+
+type transactionMarkerInfo struct {
+	marker string
+	offset uint64
+}
+
+func messageTransactionMarkerKey(msg types.Message) transactionMarkerKey {
+	return transactionMarkerKey{transactionalID: msg.TransactionalID, epoch: msg.Epoch}
+}
+
+func hasResolvingMarkerAfter(msg types.Message, markers map[transactionMarkerKey]transactionMarkerInfo) bool {
+	marker, ok := markers[messageTransactionMarkerKey(msg)]
+	return ok && marker.offset > msg.Offset
+}
+
+func isReadCommittedVisible(msg types.Message, markers map[transactionMarkerKey]transactionMarkerInfo) bool {
+	if msg.TransactionMarker != types.TransactionMarkerNone {
+		return false
+	}
+	if msg.TransactionalID == "" {
+		return true
+	}
+	if msg.TransactionState == types.TransactionStateAborted {
+		return false
+	}
+	marker, ok := markers[messageTransactionMarkerKey(msg)]
+	return ok && marker.offset > msg.Offset && marker.marker == types.TransactionMarkerCommit
+}
+
+func (p *Partition) RecoverProducerStateFromLog() {
+	if p.dh == nil || p.producerStateCh == nil {
+		return
+	}
+
+	first := p.dh.GetFirstOffset()
+	durableTail := p.dh.GetAbsoluteOffset()
+	if durableTail <= first {
+		return
+	}
+	offset := first
+	const batchSize = 1024
+	now := time.Now()
+
+	for {
+		msgs, err := p.dh.ReadMessages(offset, batchSize)
+		if err != nil || len(msgs) == 0 {
+			break
+		}
+		for _, msg := range msgs {
+			if msg.ProducerID != "" && msg.SeqNum > 0 {
+				p.producerState.Store(msg.ProducerID, &producerEntry{lastEpoch: msg.Epoch, lastSeq: msg.SeqNum, lastSeen: now})
+			}
+			next := msg.Offset + 1
+			if next <= offset {
+				next = offset + 1
+			}
+			offset = next
+		}
+		if len(msgs) < batchSize || offset >= durableTail {
+			break
+		}
+	}
+	p.signalProducerStateCheckpoint()
+}
+
+func (p *Partition) StartProducerStateMaintenance() {
+	if p.producerStateCh == nil {
+		return
+	}
+	p.producerStateWG.Add(1)
+	go p.runProducerStateCheckpointLoop()
+	go p.runProducerCleanup()
 }
 
 // FlushDisk forces all pending async writes to disk.
@@ -492,6 +829,28 @@ func (p *Partition) GetLatestOffset() uint64 {
 	return p.dh.GetLatestOffset()
 }
 
+func (p *Partition) OffsetRange() PartitionOffsetRange {
+	if p.dh == nil {
+		return PartitionOffsetRange{}
+	}
+
+	p.mu.RLock()
+	hwm := p.HWM
+	p.mu.RUnlock()
+
+	latest := hwm
+	flushed := p.dh.GetFlushedOffset()
+	if flushed < latest {
+		latest = flushed
+	}
+
+	return PartitionOffsetRange{
+		Earliest: p.dh.GetFirstOffset(),
+		Latest:   latest,
+		LEO:      p.LEO.Load(),
+		HWM:      hwm,
+	}
+}
 func (p *Partition) ID() int {
 	return p.id
 }
@@ -820,11 +1179,22 @@ const hwmCheckpointInterval = 250 * time.Millisecond
 
 const producerStateCheckpointInterval = 250 * time.Millisecond
 
-const producerStateTTL = 30 * time.Minute
+const defaultProducerStateTTL = 30 * time.Minute
+
+func producerStateTTLFromConfig(cfg *config.Config) time.Duration {
+	if cfg == nil || cfg.ProducerStateTTLMS <= 0 {
+		return defaultProducerStateTTL
+	}
+	return time.Duration(cfg.ProducerStateTTLMS) * time.Millisecond
+}
 
 // cleanStaleProducers removes producer entries that have not been seen within the TTL.
 func (p *Partition) cleanStaleProducers() {
-	cutoff := time.Now().Add(-producerStateTTL)
+	ttl := p.producerStateTTL
+	if ttl <= 0 {
+		ttl = defaultProducerStateTTL
+	}
+	cutoff := time.Now().Add(-ttl)
 	p.producerState.Range(func(key, value any) bool {
 		if entry := value.(*producerEntry); entry.lastSeen.Before(cutoff) {
 			p.producerState.Delete(key)

@@ -30,7 +30,7 @@ Legacy natural-language responses such as `Topic '<name>' now has <N> partitions
 ### CREATE
 
 ```text
-CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read>]
+CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
 ```
 
 Creates a topic or increases its partition count when the topic already exists.
@@ -126,6 +126,8 @@ PUBLISH topic=<name> [partition=<N>] [key=<routing-key>] [producerId=<id>] [seqN
 
 Because `message=` captures the rest of the line, put optional parameters before `message=`.
 
+Transaction metadata fields are not accepted on client `PUBLISH`; use the transaction commands for transactional records. Direct `transactional_id`, `transaction_state`, or `transaction_marker` injection returns `ERROR: transaction_metadata_forbidden command=PUBLISH`.
+
 For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Distributed FSM snapshots that include producer epochs use snapshot version 3; avoid mixed-version rolling upgrades with binaries that cannot decode that snapshot state. For `acks=0`, success is:
 
 ```text
@@ -147,7 +149,7 @@ ERROR: stale_producer_epoch reason="..."
 
 ### REPLICATE_MESSAGE
 
-Internal replication command used between brokers.
+Internal replication command used between brokers. In distributed mode this command requires `internal_token=<shared-token>` before `payload=`. External clients and SDKs must not call it directly.
 
 Success:
 
@@ -158,6 +160,8 @@ OK
 Common errors:
 
 ```text
+ERROR: internal_auth_not_configured command=REPLICATE_MESSAGE
+ERROR: internal_command_unauthorized command=REPLICATE_MESSAGE
 ERROR: missing_payload command=REPLICATE_MESSAGE
 ERROR: unmarshal_failed reason="..."
 ERROR: topic_not_found topic=<name>
@@ -280,6 +284,30 @@ Success:
 OK group=<group> member=<assigned-member-id> left=true
 ```
 
+
+### LIST_OFFSETS
+
+```text
+LIST_OFFSETS topic=<name> [partition=<N>]
+```
+
+Returns retained and readable offset bounds for all partitions or one partition.
+
+```text
+OK topic=<name> partitions=<N> offsets=P0:earliest=<N>:latest=<N>:leo=<N>:hwm=<N>,P1:earliest=<N>:latest=<N>:leo=<N>:hwm=<N>
+```
+
+`latest` is the next readable committed offset and is the value SDKs should use for `auto_offset_reset=latest`. `leo` is the log end offset, and `hwm` is the high-water mark before the broker caps reads to the flushed durable tail.
+
+Errors:
+
+```text
+ERROR: missing_topic command=LIST_OFFSETS
+ERROR: topic_not_found topic=<name>
+ERROR: invalid_partition command=LIST_OFFSETS
+ERROR: partition_not_found partition=<N>
+```
+
 ### FETCH_OFFSET
 
 ```text
@@ -394,7 +422,7 @@ ERROR: distribution_not_enabled
 
 ### RAFT_APPLY
 
-Internal replication command used by distributed brokers.
+Internal replication command used by distributed brokers. In distributed mode this command requires `internal_token=<shared-token>` before `type=`. External clients and SDKs must not call it directly.
 
 Success:
 
@@ -405,6 +433,8 @@ OK
 Common errors:
 
 ```text
+ERROR: internal_auth_not_configured command=RAFT_APPLY
+ERROR: internal_command_unauthorized command=RAFT_APPLY
 ERROR: missing_required_params command=RAFT_APPLY params=type,payload
 ERROR: empty_required_params command=RAFT_APPLY params=type,payload
 ERROR: distribution_required command=RAFT_APPLY
@@ -420,8 +450,57 @@ Event-sourcing commands are routed by aggregate `key`. In distributed mode, the 
 ERROR: NOT_LEADER LEADER_IS <host:port>
 ```
 
-Clients and SDKs should reconnect to that leader and retry. Followers index replicated event-sourcing records, apply quorum-replicated snapshots, and can pull missing snapshots from the partition leader with internal catch-up commands after restart. Partitions restore a synced high-watermark checkpoint with durable-tail clamping, so committed reads remain bounded by the last successful committed tail.
+Clients and SDKs should reconnect to that leader and retry. Followers index replicated event-sourcing records, apply quorum-replicated snapshots, and can pull missing snapshots from the partition leader with token-authenticated internal catch-up commands after restart. Partitions restore a synced high-watermark checkpoint with durable-tail clamping, so committed reads remain bounded by the last successful committed tail.
 
+
+
+### INIT_PRODUCER_ID
+
+```text
+INIT_PRODUCER_ID transactional_id=<id>
+```
+
+Initializes or reinitializes a broker-managed producer session for a transactional id. Success: `OK transactional_id=<id> producerId=<producer-id> epoch=<N>`. Reinitialization bumps `epoch` and fences older producers for that `transactional_id`. If the transaction is already `committing`, the broker rejects reinitialization so the prepared commit can be retried or recovered. Completed transactional ids expire after `transactional_id_expiration_ms`; active `open` and `committing` transactions are retained for recovery.
+
+### BEGIN_TXN
+
+```text
+BEGIN_TXN transactional_id=<id> producerId=<producer-id> epoch=<N>
+```
+
+Starts a broker-managed transaction using the `producerId` and `epoch` returned by `INIT_PRODUCER_ID`. In distributed mode, route transaction commands to `FIND_COORDINATOR transactional_id=<id>`; the coordinator key is `txn:<id>`. Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`.
+
+### TXN_PUBLISH
+
+```text
+TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> seqNum=<N> epoch=<N> [key=<key>] message=<payload>
+```
+
+Stages one record in the transaction. `seqNum` is required and must be greater than zero; Cursus uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even on non-idempotent topics. The record is not published until `END_TXN ... result=commit` succeeds. Committed records are written with transaction metadata before they enter the normal publish path, but they remain `transaction_state=open` until a hidden Cursus commit marker on the touched partition makes them visible to `read_committed` consumers; a later marker for the same `(transactional_id, epoch)` is the visibility authority for transactional records. Commit/abort writes hidden Cursus transaction control markers to touched partition logs. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
+
+### SEND_OFFSETS_TO_TXN
+
+```text
+SEND_OFFSETS_TO_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> topic=<topic> group=<group> member=<member> generation=<N> P<partition>:<nextOffset>,P<partition>:<nextOffset>
+```
+
+Stages consumer offsets in the transaction. The broker validates group member, generation, and partition ownership when offsets are staged, then revalidates ownership and monotonic offsets during commit before publishing records.
+
+### END_TXN
+
+```text
+END_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> result=<commit|abort>
+```
+
+Commits or aborts staged records and offsets. Transaction state is replicated in the metadata FSM and included in snapshots, `INIT_PRODUCER_ID` provides broker-owned producer epoch allocation, committed records use the normal partition-leader publish path with forced idempotent sequence validation, finalization retries are idempotent for the same producer epoch, hidden Cursus transaction markers with durable transaction control-record key/value bytes and Cursus control-batch metadata are appended to touched partition logs before staged offsets are committed, startup recovery finalizes restored `committing` transactions, producer sequence state is rebuilt from partition logs, and committed reads use a partition transaction marker index to expose committed transactions, skip aborted transactions, and stop at the first unresolved open transaction as a last-stable-offset boundary. Cursus stores transaction control-record key/value bytes (`key: int16 version, int16 markerType`; `value: int16 version, int32 coordinatorEpoch`) alongside Cursus control-batch metadata (`control_batch_type=transaction`, `control_batch_version=2`, `control_batch_coordinator_epoch=<epoch>`). The transaction marker payload schema is Cursus-compatible, while the surrounding Cursus log segment is still Cursus-owned rather than Cursus broker network-protocol byte compatibility; external side effects are not made exactly-once by the broker.
+
+### TXN_STATUS
+
+```text
+TXN_STATUS transactional_id=<id>
+```
+
+Returns transaction state and staged operation counts.
 
 ### APPEND_STREAM
 
@@ -509,8 +588,8 @@ OK snapshot=null
 
 ## Topic Policy Notes
 
-- Minimal per-topic authorization policy is part of topic metadata: `auth_policy=open|deny_write|deny_read`. It rejects unauthorized topic reads/writes with `ERROR: NOT_AUTHORIZED_FOR_TOPIC ...`, but it is not caller identity-aware ACL/SASL yet. Use TLS and external network/application controls for authentication boundaries.
-- Topics expose `retention_hours` and `retention_bytes` policy metadata. `0` means broker default. Reads before the earliest retained offset fail with `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>`. SDKs should apply `auto_offset_reset` (`earliest`, `latest`, or `error`) to decide whether to reset or fail.
+- Per-topic authorization policy is part of topic metadata: `auth_policy=open|deny_write|deny_read|acl`. `AUTH principal=<principal> token=<token>` authenticates a connection when `enable_sasl=true`; commands can also include `principal=<principal> auth_token=<token>` for inline authentication. `auth_policy=acl` checks `read_acl` for reads and `write_acl` for writes, returning `ERROR: NOT_AUTHORIZED_FOR_TOPIC ...` on denial. This is a simple token contract, not a mechanism-specific SASL byte protocol; use TLS/mTLS and network controls for broker exposure.
+- Topics expose `retention_hours` and `retention_bytes` policy metadata. `0` means broker default. Reads before the earliest retained offset fail with `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>`. SDKs should apply `auto_offset_reset` (`earliest`, `latest`, or `error`) to decide whether to reset or fail; `latest` should use `LIST_OFFSETS latest`, the next readable committed offset.
 - `partitioner=hash_key` uses FNV-1a 64-bit hash modulo partition count for keyed messages and round-robin for missing keys. `partitioner=round_robin` ignores keys. Increasing partition count can remap future records for an existing key.
 
 ## Server-Level Errors

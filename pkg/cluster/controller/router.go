@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -25,6 +27,8 @@ type ClusterRouter struct {
 	rm             RaftManager
 	clientPort     int
 	clientHost     string
+	internalPort   int
+	internalTLS    *tls.Config
 	timeout        time.Duration
 	localProcessor LocalProcessor
 
@@ -33,13 +37,21 @@ type ClusterRouter struct {
 	coordBrokerHash string // hash of active broker IDs to detect changes
 }
 
-func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm RaftManager, clientPort int, clientHost string) *ClusterRouter {
+func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm RaftManager, clientPort int, clientHost string, cfg *config.Config) *ClusterRouter {
+	internalPort := 0
+	var internalTLS *tls.Config
+	if cfg != nil {
+		internalPort = cfg.InternalBrokerPort
+		internalTLS = cfg.InternalClientTLSConfig()
+	}
 	return &ClusterRouter{
 		brokerID:       brokerID,
 		LocalAddr:      localAddr,
 		rm:             rm,
 		clientPort:     clientPort,
 		clientHost:     clientHost,
+		internalPort:   internalPort,
+		internalTLS:    internalTLS,
 		timeout:        5 * time.Second,
 		localProcessor: processor,
 	}
@@ -170,7 +182,7 @@ func (r *ClusterRouter) forwardWithTimeout(addr, req string) (string, error) {
 		return "", fmt.Errorf("invalid address format %s: %w", addr, splitErr)
 	}
 
-	clientAddr := fmt.Sprintf("%s:%d", host, r.clientPort)
+	clientAddr := r.brokerCommandAddr(host)
 	resp, err := r.sendRequest(clientAddr, req)
 	if err != nil {
 		return "", fmt.Errorf("failed to forward request to %s: %w", clientAddr, err)
@@ -221,8 +233,16 @@ func (r *ClusterRouter) forwardDataWithTimeout(addr string, data []byte) (string
 		return "", fmt.Errorf("invalid address format %s: %w", addr, splitErr)
 	}
 
-	clientAddr := fmt.Sprintf("%s:%d", host, r.clientPort)
+	clientAddr := r.brokerCommandAddr(host)
 	return r.sendDataRequest(clientAddr, data)
+}
+
+func (r *ClusterRouter) brokerCommandAddr(host string) string {
+	port := r.clientPort
+	if r.internalPort > 0 {
+		port = r.internalPort
+	}
+	return fmt.Sprintf("%s:%d", host, port)
 }
 
 func (r *ClusterRouter) processLocally(req string) string {
@@ -237,7 +257,14 @@ func (r *ClusterRouter) sendRequest(addr, command string) (string, error) {
 }
 
 func (r *ClusterRouter) sendDataRequest(addr string, data []byte) (string, error) {
-	conn, err := net.DialTimeout("tcp", addr, r.timeout)
+	dialer := &net.Dialer{Timeout: r.timeout}
+	var conn net.Conn
+	var err error
+	if r.internalTLS != nil {
+		conn, err = tls.DialWithDialer(dialer, "tcp", addr, r.internalTLS)
+	} else {
+		conn, err = dialer.Dial("tcp", addr)
+	}
 	if err != nil {
 		return "", err
 	}

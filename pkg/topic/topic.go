@@ -47,9 +47,8 @@ func NewTopicWithPolicy(name string, partitionCount int, hp HandlerProvider, cfg
 		}
 		p := NewPartition(i, name, dh, sm, cfg)
 		p.isIdempotent = idempotent
-		if idempotent {
-			go p.runProducerCleanup()
-		}
+		p.RecoverProducerStateFromLog()
+		p.StartProducerStateMaintenance()
 		partitions[i] = p
 	}
 	return &Topic{
@@ -105,9 +104,8 @@ func (t *Topic) AddPartitions(extra int, hp HandlerProvider) error {
 		}
 		newP := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
 		newP.isIdempotent = t.IsIdempotent
-		if t.IsIdempotent {
-			go newP.runProducerCleanup()
-		}
+		newP.RecoverProducerStateFromLog()
+		newP.StartProducerStateMaintenance()
 		t.Partitions = append(t.Partitions, newP)
 	}
 	return nil
@@ -203,6 +201,16 @@ func (t *Topic) PublishToPartitionSync(partition int, msg types.Message) error {
 	}
 
 	return t.Partitions[partition].EnqueueSync(msg)
+}
+func (t *Topic) PublishToPartitionSyncIdempotent(partition int, msg types.Message) error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if partition < 0 || partition >= len(t.Partitions) {
+		return fmt.Errorf("partition %d out of range for topic '%s' (0-%d)", partition, t.Name, len(t.Partitions)-1)
+	}
+
+	return t.Partitions[partition].EnqueueSyncIdempotent(msg)
 }
 
 // PublishBatchSync sends a batch of messages synchronously, grouping by partition.

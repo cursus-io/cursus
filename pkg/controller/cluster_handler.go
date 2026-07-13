@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -116,10 +117,18 @@ const coordCacheTTL = 30 * time.Second
 // checkCoordinator checks if this broker is the coordinator for the given group.
 // Returns (addr, false) if another broker is coordinator, or (_, true) if we are.
 func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bool) {
+	return ch.checkCoordinatorKey(groupName, fmt.Sprintf("FIND_COORDINATOR group=%s", groupName))
+}
+
+func (ch *CommandHandler) checkTransactionCoordinator(txnID string) (AdvertisedAddr, bool) {
+	return ch.checkCoordinatorKey(transactionCoordinatorKey(txnID), fmt.Sprintf("FIND_COORDINATOR transactional_id=%s", txnID))
+}
+
+func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (AdvertisedAddr, bool) {
 	if !ch.hasRouter() {
 		return AdvertisedAddr{}, true
 	}
-	id, _, err := ch.Cluster.Router.FindCoordinator(groupName)
+	id, raftAddr, err := ch.Cluster.Router.FindCoordinator(coordKey)
 	if err != nil {
 		return AdvertisedAddr{}, true
 	}
@@ -127,7 +136,6 @@ func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bo
 		return AdvertisedAddr{}, true
 	}
 
-	// Check cache
 	ch.coordCacheMu.RLock()
 	if cached, ok := ch.coordCache[id]; ok && time.Since(cached.updated) < coordCacheTTL {
 		ch.coordCacheMu.RUnlock()
@@ -135,10 +143,22 @@ func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bo
 	}
 	ch.coordCacheMu.RUnlock()
 
-	// Get coordinator's advertised address by forwarding FIND_COORDINATOR to it
-	findCmd := fmt.Sprintf("FIND_COORDINATOR group=%s", groupName)
+	if fsm := ch.Cluster.RaftManager.GetFSM(); fsm != nil {
+		if broker := fsm.GetBroker(id); broker != nil && broker.ClientAddr != "" {
+			if host, portStr, splitErr := net.SplitHostPort(broker.ClientAddr); splitErr == nil {
+				if port, scanErr := strconv.Atoi(portStr); scanErr == nil && host != "" && port > 0 {
+					addr := AdvertisedAddr{Host: host, Port: port}
+					ch.coordCacheMu.Lock()
+					ch.coordCache[id] = coordCacheEntry{addr: addr, updated: time.Now()}
+					ch.coordCacheMu.Unlock()
+					return addr, false
+				}
+			}
+		}
+	}
+
 	encodedCmd := util.EncodeMessage("", findCmd)
-	resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(groupName, string(encodedCmd))
+	resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, string(encodedCmd))
 	if fwdErr == nil && strings.HasPrefix(resp, "OK") {
 		host, port := "", 0
 		for _, part := range strings.Fields(resp) {
@@ -157,8 +177,10 @@ func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bo
 		}
 	}
 
-	// Fallback
 	host := ch.Config.AdvertisedClientHost
+	if host == "" {
+		host, _, _ = net.SplitHostPort(raftAddr)
+	}
 	if host == "" {
 		host = "localhost"
 	}
@@ -294,7 +316,7 @@ func (ch *CommandHandler) applyViaLeader(cmdType string, payload map[string]inte
 		return nil, fmt.Errorf("marshal payload: %w", jsonErr)
 	}
 
-	forwardCmd := fmt.Sprintf("RAFT_APPLY type=%s payload=%s", cmdType, string(data))
+	forwardCmd := fmt.Sprintf("RAFT_APPLY %stype=%s payload=%s", ch.internalAuthPrefix(), cmdType, string(data))
 	encodedCmd := util.EncodeMessage("", forwardCmd)
 	resp, fwdErr := ch.Cluster.Router.ForwardToLeader(string(encodedCmd))
 	if fwdErr != nil {

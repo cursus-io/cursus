@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/config"
@@ -11,6 +12,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/eventsource"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -24,10 +26,19 @@ type CommandHandler struct {
 	StreamManager *stream.StreamManager
 	Cluster       *clusterController.ClusterController
 	ESHandler     *eventsource.Handler
+	TxnManager    *transaction.Manager
 	commands      []commandEntry
 
 	coordCache   map[string]coordCacheEntry
 	coordCacheMu sync.RWMutex
+	txnApplyMu   sync.Mutex
+}
+
+func transactionalIDExpiration(cfg *config.Config) time.Duration {
+	if cfg == nil || cfg.TransactionalIDExpirationMS <= 0 {
+		return 7 * 24 * time.Hour
+	}
+	return time.Duration(cfg.TransactionalIDExpirationMS) * time.Millisecond
 }
 
 // commandEntry defines a single command routing rule.
@@ -58,24 +69,39 @@ func NewCommandHandler(
 		coordCache:    make(map[string]coordCacheEntry),
 		Cluster:       cc,
 		ESHandler:     eventsource.NewHandler(tm),
+		TxnManager:    transaction.NewManagerWithExpiration(transactionalIDExpiration(cfg)),
+	}
+	if cc != nil && cc.RaftManager != nil {
+		if fsm := cc.RaftManager.GetFSM(); fsm != nil {
+			fsm.SetTransactionManager(ch.TxnManager)
+		}
 	}
 	ch.commands = []commandEntry{
+		{prefix: "AUTH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAuth(cmd, ctx) }},
 		{prefix: "HELP", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHelp() }},
 		{prefix: "LIST_CLUSTER", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListCluster() }},
 		{prefix: "LIST", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList() }},
 		{prefix: "CREATE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd) }},
 		{prefix: "DELETE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd) }},
-		{prefix: "PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd) }},
+		{prefix: "PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd, ctx) }},
 		{prefix: "REGISTER_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRegisterGroup(cmd) }},
 		{prefix: "JOIN_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleJoinGroup(cmd, ctx) }},
 		{prefix: "SYNC_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSyncGroup(cmd) }},
 		{prefix: "LEAVE_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleLeaveGroup(cmd) }},
 		{prefix: "FETCH_OFFSET ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchOffset(cmd) }},
+		{prefix: "LIST_OFFSETS", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListOffsets(cmd) }},
+		{prefix: "LIST_OFFSETS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListOffsets(cmd) }},
 		{prefix: "GROUP_STATUS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleGroupStatus(cmd) }},
 		{prefix: "DESCRIBE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDescribeTopic(cmd) }},
 		{prefix: "HEARTBEAT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHeartbeat(cmd) }},
 		{prefix: "COMMIT_OFFSET ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCommitOffset(cmd) }},
 		{prefix: "BATCH_COMMIT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd) }},
+		{prefix: "INIT_PRODUCER_ID ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleInitProducerID(cmd) }},
+		{prefix: "BEGIN_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBeginTxn(cmd) }},
+		{prefix: "TXN_PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnPublish(cmd, ctx) }},
+		{prefix: "SEND_OFFSETS_TO_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSendOffsetsToTxn(cmd) }},
+		{prefix: "END_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleEndTxn(cmd) }},
+		{prefix: "TXN_STATUS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnStatus(cmd) }},
 		{prefix: "APPEND_STREAM ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAppendStream(cmd) }},
 		{prefix: "STREAM_VERSION ", exact: false, handler: func(cmd string, ctx *ClientContext) string {
 			return ch.handleEventSourceRoutedCommand(cmd, "STREAM_VERSION ", ch.ESHandler.HandleStreamVersion)
@@ -97,13 +123,54 @@ func NewCommandHandler(
 	return ch
 }
 
+var internalCommandPrefixes = []string{
+	"REPLICATE_MESSAGE ",
+	"REPLICATE_SNAPSHOT ",
+	"LIST_SNAPSHOTS ",
+	"FETCH_SNAPSHOT ",
+	"CATCHUP_SNAPSHOTS ",
+	"RAFT_APPLY ",
+}
+
 func (ch *CommandHandler) logCommandResult(cmd, response string) {
 	status := "SUCCESS"
 	if strings.HasPrefix(response, "ERROR:") {
 		status = "FAILURE"
 	}
-	cleanResponse := strings.ReplaceAll(response, "\n", " ")
-	util.Debug("status: '%s', command: '%s' to Response '%s'", status, cmd, cleanResponse)
+	cleanCmd := redactCommandSecrets(cmd)
+	cleanResponse := redactCommandSecrets(strings.ReplaceAll(response, "\n", " "))
+	util.Debug("status: '%s', command: '%s' to Response '%s'", status, cleanCmd, cleanResponse)
+}
+
+func redactCommandSecrets(s string) string {
+	keys := []string{"internal_token=", "auth_token=", "token="}
+	for _, key := range keys {
+		s = redactOneCommandSecret(s, key)
+	}
+	return s
+}
+
+func redactOneCommandSecret(s, key string) string {
+	idx := strings.Index(s, key)
+	if idx == -1 {
+		return s
+	}
+
+	var b strings.Builder
+	for idx != -1 {
+		b.WriteString(s[:idx])
+		b.WriteString(key)
+		b.WriteString("<redacted>")
+		rest := s[idx+len(key):]
+		end := 0
+		for end < len(rest) && rest[end] > ' ' {
+			end++
+		}
+		s = rest[end:]
+		idx = strings.Index(s, key)
+	}
+	b.WriteString(s)
+	return b.String()
 }
 
 // HandleCommand processes non-streaming commands and returns a signal for streaming commands.
@@ -120,6 +187,11 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) strin
 	}
 	if strings.HasPrefix(upper, "CONSUME ") {
 		return ch.validateConsumeSyntax(cmd, rawCmd)
+	}
+	if name, ok := internalCommandName(upper); ok {
+		if resp := ch.authorizeInternalCommand(name, cmd); resp != "" {
+			return ch.fail(rawCmd, resp)
+		}
 	}
 
 	resp := ch.handleCommandByType(cmd, upper, ctx)
@@ -141,6 +213,37 @@ func (ch *CommandHandler) handleCommandByType(cmd, upper string, ctx *ClientCont
 		}
 	}
 	return fmt.Sprintf("ERROR: unknown_command command=%s", cmd)
+}
+
+func internalCommandName(upper string) (string, bool) {
+	for _, prefix := range internalCommandPrefixes {
+		if strings.HasPrefix(upper, prefix) {
+			return strings.TrimSpace(prefix), true
+		}
+	}
+	return "", false
+}
+
+func (ch *CommandHandler) authorizeInternalCommand(name, cmd string) string {
+	if ch == nil || ch.Config == nil || !ch.Config.EnabledDistribution {
+		return ""
+	}
+	token := ch.Config.InternalAuthToken
+	if token == "" {
+		return fmt.Sprintf("ERROR: internal_auth_not_configured command=%s", name)
+	}
+	args := parseKeyValueArgs(strings.TrimPrefix(cmd, name+" "))
+	if args["internal_token"] != token {
+		return fmt.Sprintf("ERROR: internal_command_unauthorized command=%s", name)
+	}
+	return ""
+}
+
+func (ch *CommandHandler) internalAuthPrefix() string {
+	if ch != nil && ch.Config != nil && ch.Config.InternalAuthToken != "" {
+		return "internal_token=" + ch.Config.InternalAuthToken + " "
+	}
+	return ""
 }
 
 func (ch *CommandHandler) fail(raw, msg string) string {

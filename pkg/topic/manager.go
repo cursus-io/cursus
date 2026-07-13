@@ -142,11 +142,11 @@ func (tm *TopicManager) Publish(topicName string, msg *types.Message) error {
 	}
 
 	partition := t.GetPartitionForMessage(*msg)
-	return tm.publishInternal(topicName, partition, msg, false)
+	return tm.publishInternal(topicName, partition, msg, false, false)
 }
 
 func (tm *TopicManager) PublishToPartition(topicName string, partition int, msg *types.Message) error {
-	return tm.publishInternal(topicName, partition, msg, false)
+	return tm.publishInternal(topicName, partition, msg, false, false)
 }
 
 // Sync (acks=1)
@@ -157,11 +157,14 @@ func (tm *TopicManager) PublishWithAck(topicName string, msg *types.Message) err
 	}
 
 	partition := t.GetPartitionForMessage(*msg)
-	return tm.publishInternal(topicName, partition, msg, true)
+	return tm.publishInternal(topicName, partition, msg, true, false)
 }
 
 func (tm *TopicManager) PublishToPartitionWithAck(topicName string, partition int, msg *types.Message) error {
-	return tm.publishInternal(topicName, partition, msg, true)
+	return tm.publishInternal(topicName, partition, msg, true, false)
+}
+func (tm *TopicManager) PublishToPartitionWithAckIdempotent(topicName string, partition int, msg *types.Message) error {
+	return tm.publishInternal(topicName, partition, msg, true, true)
 }
 
 func (tm *TopicManager) processBatchMessages(topicName string, messages []types.Message, async bool) error {
@@ -254,8 +257,8 @@ func (tm *TopicManager) PublishBatchAsync(topicName string, messages []types.Mes
 	return tm.processBatchMessages(topicName, messages, true)
 }
 
-func (tm *TopicManager) publishInternal(topicName string, partition int, msg *types.Message, requireAck bool) error {
-	util.Debug("Starting publish. Topic: %s, RequireAck: %v, ProducerID: %s, SeqNum: %d", topicName, requireAck, msg.ProducerID, msg.SeqNum)
+func (tm *TopicManager) publishInternal(topicName string, partition int, msg *types.Message, requireAck bool, forceIdempotent bool) error {
+	util.Debug("Starting publish. Topic: %s, RequireAck: %v, ForceIdempotent: %v, ProducerID: %s, SeqNum: %d", topicName, requireAck, forceIdempotent, msg.ProducerID, msg.SeqNum)
 	start := time.Now()
 
 	t := tm.GetTopic(topicName)
@@ -264,8 +267,16 @@ func (tm *TopicManager) publishInternal(topicName string, partition int, msg *ty
 		return fmt.Errorf("topic '%s' does not exist", topicName)
 	}
 
+	if forceIdempotent && !requireAck {
+		return fmt.Errorf("forced idempotent publish requires acknowledgements")
+	}
+
 	if requireAck {
-		if err := t.PublishToPartitionSync(partition, *msg); err != nil {
+		if forceIdempotent {
+			if err := t.PublishToPartitionSyncIdempotent(partition, *msg); err != nil {
+				return fmt.Errorf("sync idempotent publish failed: %w", err)
+			}
+		} else if err := t.PublishToPartitionSync(partition, *msg); err != nil {
 			return fmt.Errorf("sync publish failed: %w", err)
 		}
 	} else {

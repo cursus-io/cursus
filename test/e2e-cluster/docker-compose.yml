@@ -8,6 +8,8 @@ services:
     environment:
       - CONFIG_PATH=/root/config.yaml
       - ADVERTISED_HOST=broker-1
+      - ADVERTISED_CLIENT_HOST=localhost
+      - ADVERTISED_BROKER_PORT=9001
       - RAFT_PORT=9001
       - DISCOVERY_PORT=8000
     ports:
@@ -33,6 +35,8 @@ services:
     environment:
       - CONFIG_PATH=/root/config.yaml
       - ADVERTISED_HOST=broker-2
+      - ADVERTISED_CLIENT_HOST=localhost
+      - ADVERTISED_BROKER_PORT=9002
       - RAFT_PORT=9001
       - DISCOVERY_PORT=8000
     ports:
@@ -61,6 +65,8 @@ services:
     environment:
       - CONFIG_PATH=/root/config.yaml
       - ADVERTISED_HOST=broker-3
+      - ADVERTISED_CLIENT_HOST=localhost
+      - ADVERTISED_BROKER_PORT=9003
       - RAFT_PORT=9001
       - DISCOVERY_PORT=8000
     ports:

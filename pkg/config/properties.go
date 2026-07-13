@@ -2,6 +2,7 @@ package config
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,6 +19,11 @@ var (
 	defaultConfig *Config
 	defaultOnce   sync.Once
 )
+
+type SASLUser struct {
+	Principal string `yaml:"principal" json:"principal"`
+	Token     string `yaml:"token" json:"token"`
+}
 
 type ConsumerGroupConfig struct {
 	Name            string         `yaml:"name" json:"name"`
@@ -62,20 +68,24 @@ type Config struct {
 
 	// distributed cluster
 	EnabledDistribution  bool     `yaml:"enabled_distribution" json:"distribution.enabled"`
+	InternalAuthToken    string   `yaml:"internal_auth_token" json:"distribution.internal_auth_token"`
+	InternalBrokerPort   int      `yaml:"internal_broker_port" json:"distribution.internal_broker_port"`
 	RaftPort             int      `yaml:"raft_port" json:"distribution.raft.port"`
 	DiscoveryPort        int      `yaml:"discovery_port" json:"distribution.discovery.port"`
 	RaftPeers            []string `yaml:"raft_peers" json:"distribution.raft.peers"`
 	StaticClusterMembers []string `yaml:"static_cluster_members" json:"distribution.static_cluster_members"`
 	BootstrapCluster     bool     `yaml:"bootstrap_cluster" json:"distribution.bootstrap"`
 
-	AdvertisedHost       string `yaml:"advertised_host" json:"distribution.advertised_host"`
-	AdvertisedBrokerPort int    `yaml:"advertised_broker_port" json:"distribution.advertised_broker_port"`
-	AdvertisedClientHost string `yaml:"advertised_client_host" json:"distribution.advertised_client_host"`
+	AdvertisedHost           string `yaml:"advertised_host" json:"distribution.advertised_host"`
+	AdvertisedBrokerPort     int    `yaml:"advertised_broker_port" json:"distribution.advertised_broker_port"`
+	AdvertisedClientHost     string `yaml:"advertised_client_host" json:"distribution.advertised_client_host"`
 	MinInSyncReplicas        int    `yaml:"min_insync_replicas" json:"min.insync.replicas"`
 	DefaultReplicationFactor int    `yaml:"default_replication_factor" json:"default.replication.factor"`
 
 	// idempotency
-	EnableIdempotence bool `yaml:"enable_idempotence" json:"enable.idempotence"`
+	EnableIdempotence           bool `yaml:"enable_idempotence" json:"enable.idempotence"`
+	ProducerStateTTLMS          int  `yaml:"producer_state_ttl_ms" json:"producer.state.ttl.ms"`
+	TransactionalIDExpirationMS int  `yaml:"transactional_id_expiration_ms" json:"transactional.id.expiration.ms"`
 
 	// consumer
 	ConsumerSessionTimeoutMS int                   `yaml:"consumer_session_timeout_ms" json:"consumer.session.timeout.ms"`
@@ -89,10 +99,20 @@ type Config struct {
 	StreamCommitInterval    time.Duration `yaml:"stream_commit_interval" json:"stream.commit.interval"`
 
 	// security
-	UseTLS      bool `yaml:"use_tls" json:"tls.enable"`
-	TLSCert     tls.Certificate
-	TLSCertPath string `yaml:"tls_cert_path" json:"tls.cert_path"`
-	TLSKeyPath  string `yaml:"tls_key_path" json:"tls.key_path"`
+	UseTLS                  bool `yaml:"use_tls" json:"tls.enable"`
+	TLSCert                 tls.Certificate
+	TLSCertPath             string `yaml:"tls_cert_path" json:"tls.cert_path"`
+	TLSKeyPath              string `yaml:"tls_key_path" json:"tls.key_path"`
+	InternalUseTLS          bool   `yaml:"internal_use_tls" json:"internal_tls.enable"`
+	InternalTLSCertPath     string `yaml:"internal_tls_cert_path" json:"internal_tls.cert_path"`
+	InternalTLSKeyPath      string `yaml:"internal_tls_key_path" json:"internal_tls.key_path"`
+	InternalTLSCAPath       string `yaml:"internal_tls_ca_path" json:"internal_tls.ca_path"`
+	InternalTLSServerName   string `yaml:"internal_tls_server_name" json:"internal_tls.server_name"`
+	InternalTLSCert         tls.Certificate
+	InternalTLSClientCAPool *x509.CertPool
+	InternalTLSRootCAPool   *x509.CertPool
+	EnableSASL              bool       `yaml:"enable_sasl" json:"sasl.enable"`
+	SASLUsers               []SASLUser `yaml:"sasl_users" json:"sasl.users"`
 }
 
 func DefaultConfig() *Config {
@@ -133,6 +153,8 @@ func DefaultConfig() *Config {
 
 			// distributed cluster
 			EnabledDistribution:      false,
+			InternalAuthToken:        "",
+			InternalBrokerPort:       0,
 			RaftPort:                 9001,
 			DiscoveryPort:            8000,
 			RaftPeers:                []string{},
@@ -144,7 +166,9 @@ func DefaultConfig() *Config {
 			DefaultReplicationFactor: 3,
 
 			// idempotency
-			EnableIdempotence: false,
+			EnableIdempotence:           false,
+			ProducerStateTTLMS:          30 * 60 * 1000,
+			TransactionalIDExpirationMS: 7 * 24 * 60 * 60 * 1000,
 
 			// consumer
 			ConsumerSessionTimeoutMS: 10000,
@@ -166,6 +190,10 @@ func DefaultConfig() *Config {
 	if defaultConfig.StaticClusterMembers != nil {
 		cfgCopy.StaticClusterMembers = make([]string, len(defaultConfig.StaticClusterMembers))
 		copy(cfgCopy.StaticClusterMembers, defaultConfig.StaticClusterMembers)
+	}
+	if defaultConfig.SASLUsers != nil {
+		cfgCopy.SASLUsers = make([]SASLUser, len(defaultConfig.SASLUsers))
+		copy(cfgCopy.SASLUsers, defaultConfig.SASLUsers)
 	}
 	if defaultConfig.StaticConsumerGroups != nil {
 		cfgCopy.StaticConsumerGroups = make([]ConsumerGroupConfig, len(defaultConfig.StaticConsumerGroups))
@@ -215,6 +243,8 @@ func LoadConfig() (*Config, error) {
 
 	// distributed cluster
 	flag.BoolVar(&cfg.EnabledDistribution, "enable-distribution", cfg.EnabledDistribution, "Enable distributed clustering")
+	flag.StringVar(&cfg.InternalAuthToken, "internal-auth-token", cfg.InternalAuthToken, "Shared token for broker-to-broker internal text commands")
+	flag.IntVar(&cfg.InternalBrokerPort, "internal-broker-port", cfg.InternalBrokerPort, "Dedicated broker-to-broker internal command port")
 	flag.IntVar(&cfg.RaftPort, "raft-port", cfg.RaftPort, "Raft port for replication")
 	flag.IntVar(&cfg.DiscoveryPort, "discovery-port", cfg.DiscoveryPort, "Discovery service port")
 	raftPeersFlag := flag.String("raft-peers", "", "Raft peer addresses (comma-separated)")
@@ -225,6 +255,8 @@ func LoadConfig() (*Config, error) {
 
 	// idempotency
 	flag.BoolVar(&cfg.EnableIdempotence, "enable-idempotence", cfg.EnableIdempotence, "Enable producer idempotency")
+	flag.IntVar(&cfg.ProducerStateTTLMS, "producer-state-ttl-ms", cfg.ProducerStateTTLMS, "Producer idempotency state TTL in milliseconds")
+	flag.IntVar(&cfg.TransactionalIDExpirationMS, "transactional-id-expiration-ms", cfg.TransactionalIDExpirationMS, "Completed transactional.id expiration in milliseconds")
 
 	// consumer
 	flag.IntVar(&cfg.ConsumerSessionTimeoutMS, "consumer-session-timeout", cfg.ConsumerSessionTimeoutMS, "Session timeout")
@@ -240,6 +272,12 @@ func LoadConfig() (*Config, error) {
 	flag.BoolVar(&cfg.UseTLS, "tls", cfg.UseTLS, "Enable TLS")
 	flag.StringVar(&cfg.TLSCertPath, "tls-cert", cfg.TLSCertPath, "TLS cert")
 	flag.StringVar(&cfg.TLSKeyPath, "tls-key", cfg.TLSKeyPath, "TLS key")
+	flag.BoolVar(&cfg.InternalUseTLS, "internal-tls", cfg.InternalUseTLS, "Enable mutual TLS on the internal broker listener")
+	flag.StringVar(&cfg.InternalTLSCertPath, "internal-tls-cert", cfg.InternalTLSCertPath, "Internal listener TLS certificate")
+	flag.StringVar(&cfg.InternalTLSKeyPath, "internal-tls-key", cfg.InternalTLSKeyPath, "Internal listener TLS private key")
+	flag.StringVar(&cfg.InternalTLSCAPath, "internal-tls-ca", cfg.InternalTLSCAPath, "CA used to verify internal broker certificates")
+	flag.StringVar(&cfg.InternalTLSServerName, "internal-tls-server-name", cfg.InternalTLSServerName, "Server name used by broker-to-broker mTLS clients")
+	flag.BoolVar(&cfg.EnableSASL, "enable-sasl", cfg.EnableSASL, "Enable SASL-style token authentication for client commands")
 
 	flag.Parse()
 
@@ -325,6 +363,8 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.BroadcastChannelBufferSize, "BROADCAST_CH_BUFFER")
 
 	overrideEnvBool(&cfg.EnabledDistribution, "ENABLE_DISTRIBUTION")
+	overrideEnvString(&cfg.InternalAuthToken, "INTERNAL_AUTH_TOKEN")
+	overrideEnvInt(&cfg.InternalBrokerPort, "INTERNAL_BROKER_PORT")
 	overrideEnvString(&cfg.AdvertisedHost, "ADVERTISED_HOST")
 	overrideEnvInt(&cfg.AdvertisedBrokerPort, "ADVERTISED_BROKER_PORT")
 	overrideEnvString(&cfg.AdvertisedClientHost, "ADVERTISED_CLIENT_HOST")
@@ -337,12 +377,33 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.DefaultReplicationFactor, "DEFAULT_REPLICATION_FACTOR")
 
 	overrideEnvBool(&cfg.EnableIdempotence, "ENABLE_IDEMPOTENCE")
+	overrideEnvInt(&cfg.ProducerStateTTLMS, "PRODUCER_STATE_TTL_MS")
+	overrideEnvInt(&cfg.TransactionalIDExpirationMS, "TRANSACTIONAL_ID_EXPIRATION_MS")
 
 	overrideEnvInt(&cfg.ConsumerSessionTimeoutMS, "CONSUMER_SESSION_TIMEOUT")
 	overrideEnvInt(&cfg.ConsumerHeartbeatCheckMS, "CONSUMER_HEARTBEAT_CHECK")
+	overrideEnvBool(&cfg.InternalUseTLS, "INTERNAL_USE_TLS")
+	overrideEnvString(&cfg.InternalTLSCertPath, "INTERNAL_TLS_CERT_PATH")
+	overrideEnvString(&cfg.InternalTLSKeyPath, "INTERNAL_TLS_KEY_PATH")
+	overrideEnvString(&cfg.InternalTLSCAPath, "INTERNAL_TLS_CA_PATH")
+	overrideEnvString(&cfg.InternalTLSServerName, "INTERNAL_TLS_SERVER_NAME")
+	overrideEnvBool(&cfg.EnableSASL, "ENABLE_SASL")
+	overrideEnvSASLUsers(&cfg.SASLUsers, "SASL_USERS")
 
 	cfg.Normalize()
 	util.SetLevel(cfg.LogLevel)
+
+	if cfg.EnabledDistribution {
+		if strings.TrimSpace(cfg.InternalAuthToken) == "" {
+			return nil, fmt.Errorf("internal_auth_token is required when enabled_distribution=true")
+		}
+		if strings.ContainsAny(cfg.InternalAuthToken, " \t\r\n") {
+			return nil, fmt.Errorf("internal_auth_token must not contain whitespace")
+		}
+	}
+	if err := cfg.loadInternalTLSConfig(); err != nil {
+		return nil, err
+	}
 
 	if cfg.UseTLS {
 		if cfg.TLSCertPath == "" || cfg.TLSKeyPath == "" {
@@ -356,4 +417,61 @@ func LoadConfig() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func (cfg *Config) loadInternalTLSConfig() error {
+	if !cfg.InternalUseTLS {
+		return nil
+	}
+	if cfg.InternalBrokerPort <= 0 {
+		return fmt.Errorf("internal_use_tls requires internal_broker_port")
+	}
+	if cfg.InternalTLSCertPath == "" || cfg.InternalTLSKeyPath == "" || cfg.InternalTLSCAPath == "" {
+		return fmt.Errorf("internal TLS enabled but missing cert/key/ca path")
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.InternalTLSCertPath, cfg.InternalTLSKeyPath)
+	if err != nil {
+		return fmt.Errorf("failed to load internal TLS cert: %w", err)
+	}
+	// #nosec G304 -- internal CA path is broker operator supplied configuration.
+	caPEM, err := os.ReadFile(cfg.InternalTLSCAPath)
+	if err != nil {
+		return fmt.Errorf("failed to read internal TLS CA: %w", err)
+	}
+	clientCAPool := x509.NewCertPool()
+	if !clientCAPool.AppendCertsFromPEM(caPEM) {
+		return fmt.Errorf("failed to parse internal TLS CA")
+	}
+	rootCAPool := x509.NewCertPool()
+	if !rootCAPool.AppendCertsFromPEM(caPEM) {
+		return fmt.Errorf("failed to parse internal TLS root CA")
+	}
+	cfg.InternalTLSCert = cert
+	cfg.InternalTLSClientCAPool = clientCAPool
+	cfg.InternalTLSRootCAPool = rootCAPool
+	return nil
+}
+
+func (cfg *Config) InternalServerTLSConfig() *tls.Config {
+	if cfg == nil || !cfg.InternalUseTLS {
+		return nil
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cfg.InternalTLSCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    cfg.InternalTLSClientCAPool,
+		MinVersion:   tls.VersionTLS12,
+	}
+}
+
+func (cfg *Config) InternalClientTLSConfig() *tls.Config {
+	if cfg == nil || !cfg.InternalUseTLS {
+		return nil
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cfg.InternalTLSCert},
+		RootCAs:      cfg.InternalTLSRootCAPool,
+		ServerName:   cfg.InternalTLSServerName,
+		MinVersion:   tls.VersionTLS12,
+	}
 }

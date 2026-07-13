@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -14,8 +15,15 @@ import (
 )
 
 // handlePublish processes PUBLISH command
-func (ch *CommandHandler) handlePublish(cmd string) string {
+func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) string {
+	var clientCtx *ClientContext
+	if len(ctx) > 0 {
+		clientCtx = ctx[0]
+	}
 	args := parseKeyValueArgs(cmd[8:])
+	if authResp := ch.authenticateInline(args, clientCtx); authResp != "" {
+		return authResp
+	}
 	var err error
 
 	topicName, ok := args["topic"]
@@ -87,15 +95,28 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 		util.Warn("ch publish: topic '%s' does not exist after retries", topicName)
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	if !t.Policy.CanWrite() {
-		return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", topicName)
+	if strings.EqualFold(args["internal_txn_publish"], "true") {
+		if !t.Policy.CanWrite() {
+			return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", topicName)
+		}
+	} else if authResp := ch.authorizeTopicWrite(t.Policy, clientCtx); authResp != "" {
+		return fmt.Sprintf("%s topic=%s", authResp, topicName)
 	}
 
 	msg := &types.Message{
-		Payload:    message,
-		ProducerID: producerID,
-		SeqNum:     seqNum,
-		Epoch:      epoch,
+		Payload:                      message,
+		Key:                          args["key"],
+		ProducerID:                   producerID,
+		SeqNum:                       seqNum,
+		Epoch:                        epoch,
+		TransactionalID:              args["transactional_id"],
+		TransactionState:             args["transaction_state"],
+		TransactionMarker:            args["transaction_marker"],
+		ControlBatchType:             args["control_batch_type"],
+		ControlBatchVersion:          parseInt16Default(args["control_batch_version"], 0),
+		ControlBatchCoordinatorEpoch: parseInt64Default(args["control_batch_coordinator_epoch"], 0),
+		ControlBatchKey:              parseBase64Default(args["control_batch_key"]),
+		ControlBatchValue:            parseBase64Default(args["control_batch_value"]),
 	}
 
 	if partition < 0 {
@@ -104,6 +125,9 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 	if _, err := t.GetPartition(partition); err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 	}
+	if errResp := ch.validateTransactionPublishMetadata(args, topicName, partition, msg); errResp != "" {
+		return errResp
+	}
 
 	if ch.Config.EnabledDistribution && ch.Cluster != nil {
 		forwardCmd := cmd
@@ -111,6 +135,27 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 			forwardCmd = fmt.Sprintf("PUBLISH topic=%s acks=%s producerId=%s partition=%d seqNum=%d epoch=%d", topicName, acks, producerID, partition, seqNum, epoch)
 			if _, explicitIdempotent := args["isIdempotent"]; explicitIdempotent {
 				forwardCmd += fmt.Sprintf(" isIdempotent=%t", isIdempotent)
+			}
+			if msg.TransactionalID != "" {
+				forwardCmd += fmt.Sprintf(" transactional_id=%s", msg.TransactionalID)
+			}
+			if msg.TransactionState != "" {
+				forwardCmd += fmt.Sprintf(" transaction_state=%s", msg.TransactionState)
+			}
+			if msg.TransactionMarker != "" {
+				forwardCmd += fmt.Sprintf(" transaction_marker=%s", msg.TransactionMarker)
+			}
+			if msg.ControlBatchType != "" {
+				forwardCmd += fmt.Sprintf(" control_batch_type=%s control_batch_version=%d control_batch_coordinator_epoch=%d", msg.ControlBatchType, msg.ControlBatchVersion, msg.ControlBatchCoordinatorEpoch)
+				if len(msg.ControlBatchKey) > 0 {
+					forwardCmd += fmt.Sprintf(" control_batch_key=%s", base64.StdEncoding.EncodeToString(msg.ControlBatchKey))
+				}
+				if len(msg.ControlBatchValue) > 0 {
+					forwardCmd += fmt.Sprintf(" control_batch_value=%s", base64.StdEncoding.EncodeToString(msg.ControlBatchValue))
+				}
+			}
+			if strings.EqualFold(args["internal_txn_publish"], "true") {
+				forwardCmd += " internal_txn_publish=true"
 			}
 			forwardCmd += " message=" + message
 		}
@@ -132,15 +177,8 @@ func (ch *CommandHandler) handlePublish(cmd string) string {
 			Partition:     partition,
 			IsIdempotent:  effectiveIdempotent,
 			SequenceScope: scope,
-			Messages: []types.Message{
-				{
-					Payload:    message,
-					ProducerID: producerID,
-					SeqNum:     seqNum,
-					Epoch:      epoch,
-				},
-			},
-			Acks: acks,
+			Messages:      []types.Message{*msg},
+			Acks:          acks,
 		}
 
 		// 1. Append locally (LEO advances, HWM stays until replication succeeds)
@@ -237,7 +275,7 @@ func (ch *CommandHandler) waitForTopic(topicName string) *topic.Topic {
 }
 
 func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
-	// Format: REPLICATE_MESSAGE payload=<json_MessageCommand>
+	// Format: REPLICATE_MESSAGE [internal_token=<token>] payload=<json_MessageCommand>
 	idx := strings.Index(cmd, "payload=")
 	if idx == -1 {
 		return "ERROR: missing_payload command=REPLICATE_MESSAGE"
@@ -262,6 +300,11 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 	// Guard against empty messages to prevent index-out-of-range panic
 	if len(msgCmd.Messages) == 0 {
 		return "ERROR: empty_messages command=REPLICATE_MESSAGE"
+	}
+	for i := range msgCmd.Messages {
+		if errResp := ch.validateReplicatedTransactionMessage(msgCmd.Topic, msgCmd.Partition, &msgCmd.Messages[i]); errResp != "" {
+			return errResp
+		}
 	}
 
 	if err := p.ReplicaAppend(msgCmd.Messages); err != nil {
@@ -326,7 +369,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 			util.Error("Batch process failed: topic '%s' not found", batch.Topic)
 			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
 		}
-		if !t.Policy.CanWrite() {
+		if !t.Policy.CanWritePrincipal("") {
 			return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", batch.Topic), nil
 		}
 
@@ -396,7 +439,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn) (string
 		if t == nil {
 			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
 		}
-		if !t.Policy.CanWrite() {
+		if !t.Policy.CanWritePrincipal("") {
 			return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", batch.Topic), nil
 		}
 		p, err := t.GetPartition(batch.Partition)
@@ -452,4 +495,37 @@ Respond:
 	responseStr := string(ackBytes)
 	util.Debug("Broker Sending Batch Ack (Topic: %s): %s", batch.Topic, responseStr)
 	return responseStr, nil
+}
+
+func parseInt16Default(value string, fallback int16) int16 {
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 16)
+	if err != nil {
+		return fallback
+	}
+	return int16(parsed)
+}
+
+func parseInt64Default(value string, fallback int64) int64 {
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func parseBase64Default(value string) []byte {
+	if value == "" {
+		return nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		return nil
+	}
+	return decoded
 }
