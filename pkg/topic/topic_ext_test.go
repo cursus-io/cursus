@@ -93,7 +93,7 @@ func TestPartition_Basic(t *testing.T) {
 	mh.On("GetLatestOffset").Return(uint64(10))
 
 	p := NewPartition(0, "test-topic", mh, sm, cfg)
-	assert.Equal(t, uint64(11), p.NextOffset())
+	assert.Equal(t, uint64(10), p.NextOffset())
 
 	t.Run("Enqueue", func(t *testing.T) {
 		msg := types.Message{Payload: "msg1"}

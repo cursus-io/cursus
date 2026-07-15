@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -170,6 +171,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyTopicDeleteCommand(strings.TrimPrefix(data, "TOPIC_DELETE:"))
 	case strings.HasPrefix(data, "PARTITION:"):
 		res = f.applyPartitionCommand(strings.TrimPrefix(data, "PARTITION:"))
+	case strings.HasPrefix(data, "PARTITION_COMMIT:"):
+		res = f.applyPartitionCommitCommand(strings.TrimPrefix(data, "PARTITION_COMMIT:"))
 	case strings.HasPrefix(data, "GROUP_SYNC:"):
 		res = f.applyGroupSyncCommand(strings.TrimPrefix(data, "GROUP_SYNC:"))
 	case strings.HasPrefix(data, "OFFSET_SYNC:"):
@@ -219,12 +222,13 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Info("FSM Restore: Validating snapshot Version 3 (with producer epochs)")
 	case 4:
 		util.Info("FSM Restore: Validating snapshot Version 4 (with transaction state)")
+	case 5:
+		util.Info("FSM Restore: Validating snapshot Version 5 (with committed partition watermarks)")
 	default:
 		return fmt.Errorf("unknown snapshot version: %d", state.Version)
 	}
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	f.logs = state.Logs
 	f.brokers = state.Brokers
@@ -251,8 +255,49 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		}
 	}
 
+	f.mu.Unlock()
+	if state.Version >= 5 {
+		f.reconcileCommittedPartitions()
+	}
 	util.Info("FSM restore completed: %d logs, %d brokers, %d partitions", len(state.Logs), len(state.Brokers), len(state.PartitionMetadata))
 	return nil
+}
+
+func (f *BrokerFSM) reconcileCommittedPartitions() {
+	f.mu.RLock()
+	metadata := make(map[string]PartitionMetadata, len(f.partitionMetadata))
+	for key, value := range f.partitionMetadata {
+		if value != nil {
+			metadata[key] = *value
+		}
+	}
+	tm := f.tm
+	f.mu.RUnlock()
+	if tm == nil {
+		return
+	}
+	for key, meta := range metadata {
+		idx := strings.LastIndex(key, "-")
+		if idx < 0 {
+			continue
+		}
+		partition, err := strconv.Atoi(key[idx+1:])
+		if err != nil {
+			continue
+		}
+		t := tm.GetTopic(key[:idx])
+		if t == nil {
+			continue
+		}
+		p, err := t.GetPartition(partition)
+		if err == nil {
+			if err := p.ReconcileCommittedHWM(meta.CommittedHWM); err != nil {
+				util.Warn("FSM: Failed to reconcile committed HWM for %s: %v", key, err)
+			} else {
+				p.FlushDisk()
+			}
+		}
+	}
 }
 
 func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {

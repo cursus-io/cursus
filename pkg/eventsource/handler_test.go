@@ -61,6 +61,7 @@ func (f *fakeStorageHandler) AppendMessageWithOffset(t string, p int, msg *types
 }
 
 func (f *fakeStorageHandler) WriteBatch(_ []types.DiskMessage) error { return nil }
+func (f *fakeStorageHandler) TruncateTo(_ uint64) error              { return nil }
 func (f *fakeStorageHandler) Flush()                                 {}
 func (f *fakeStorageHandler) Close() error                           { return nil }
 

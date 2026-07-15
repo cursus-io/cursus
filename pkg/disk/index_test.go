@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"encoding/binary"
 	"os"
 	"testing"
 
@@ -98,5 +99,43 @@ func TestFindOffsetPosition(t *testing.T) {
 
 	if len(messagesRead) != 1 || messagesRead[0].Offset != targetOffset {
 		t.Errorf("Index pointed to wrong position. Expected offset %d, got %v", targetOffset, messagesRead)
+	}
+}
+
+func TestSeekLastValidIndexEntryScansSparseFileInBlocks(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "sparse-index-*.idx")
+	if err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	const fileSize = uint64(10 * 1024 * 1024)
+	if err := f.Truncate(int64(fileSize)); err != nil {
+		t.Fatalf("truncate index: %v", err)
+	}
+
+	entryPos := uint64(3 * types.IndexEntrySize)
+	entry := make([]byte, types.IndexEntrySize)
+	binary.BigEndian.PutUint64(entry[0:8], 42)
+	binary.BigEndian.PutUint64(entry[8:16], 1024)
+	if _, err := f.WriteAt(entry, int64(entryPos)); err != nil {
+		t.Fatalf("write index entry: %v", err)
+	}
+
+	dh := &DiskHandler{}
+	want := entryPos + uint64(types.IndexEntrySize)
+	if got := dh.seekLastValidIndexEntry(f, fileSize); got != want {
+		t.Fatalf("seekLastValidIndexEntry() = %d, want %d", got, want)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync index: %v", err)
+	}
+
+	lastOffset, count, err := getLastOffsetFromIndex(f.Name(), 0)
+	if err != nil {
+		t.Fatalf("getLastOffsetFromIndex() error = %v", err)
+	}
+	if lastOffset != 42 || count != 43 {
+		t.Fatalf("getLastOffsetFromIndex() = (%d, %d), want (42, 43)", lastOffset, count)
 	}
 }

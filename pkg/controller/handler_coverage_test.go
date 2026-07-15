@@ -44,6 +44,7 @@ func (m *testMockStorage) AppendMessageWithOffset(topic string, partition int, m
 	return nil
 }
 func (m *testMockStorage) WriteBatch(batch []types.DiskMessage) error { return nil }
+func (m *testMockStorage) TruncateTo(uint64) error                    { return nil }
 func (m *testMockStorage) Flush()                                     {}
 func (m *testMockStorage) Close() error                               { return nil }
 
@@ -704,9 +705,9 @@ func TestHandleReplicateMessage_Success(t *testing.T) {
 	_ = tm.CreateTopic("rep-topic2", 1, false, false)
 	ctx := NewClientContext("", 0)
 
-	payload := `{"topic":"rep-topic2","partition":0,"messages":[{"payload":"hello","producer_id":"p1"}]}`
+	payload := `{"topic":"rep-topic2","partition":0,"messages":[{"offset":0,"payload":"hello","producer_id":"p1"}]}`
 	resp := ch.HandleCommand("REPLICATE_MESSAGE payload="+payload, ctx)
-	assert.Equal(t, "OK", resp)
+	assert.Equal(t, "OK leo=1 hwm=0", resp)
 }
 
 func TestHandleReplicateMessage_InvalidPartition(t *testing.T) {
@@ -1391,19 +1392,21 @@ func TestHandleListOffsets(t *testing.T) {
 	tObj := tm.GetTopic("offsets-topic")
 	p0, err := tObj.GetPartition(0)
 	require.NoError(t, err)
+	p0.UpdateLEO(7)
 	p0.SetHWM(7)
 	p1, err := tObj.GetPartition(1)
 	require.NoError(t, err)
+	p1.UpdateLEO(3)
 	p1.SetHWM(3)
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("LIST_OFFSETS topic=offsets-topic", ctx)
 	assert.Contains(t, resp, "OK topic=offsets-topic partitions=2 offsets=")
-	assert.Contains(t, resp, "P0:earliest=0:latest=0:leo=1:hwm=7")
-	assert.Contains(t, resp, "P1:earliest=0:latest=0:leo=1:hwm=3")
+	assert.Contains(t, resp, "P0:earliest=0:latest=0:leo=7:hwm=7")
+	assert.Contains(t, resp, "P1:earliest=0:latest=0:leo=3:hwm=3")
 
 	resp = ch.HandleCommand("LIST_OFFSETS topic=offsets-topic partition=1", ctx)
-	assert.Equal(t, "OK topic=offsets-topic partitions=1 offsets=P1:earliest=0:latest=0:leo=1:hwm=3", resp)
+	assert.Equal(t, "OK topic=offsets-topic partitions=1 offsets=P1:earliest=0:latest=0:leo=3:hwm=3", resp)
 }
 
 func TestHandleListOffsetsErrors(t *testing.T) {
@@ -1670,9 +1673,9 @@ func TestInternalCommandTokenAllowsHandlerDispatch(t *testing.T) {
 	require.NoError(t, tm.CreateTopic("secure-rep-topic", 1, false, false))
 	ctx := NewClientContext("", 0)
 
-	payload := `{"topic":"secure-rep-topic","partition":0,"messages":[{"payload":"hello","producer_id":"p1"}]}`
+	payload := `{"topic":"secure-rep-topic","partition":0,"messages":[{"offset":0,"payload":"hello","producer_id":"p1"}]}`
 	resp := ch.HandleCommand("REPLICATE_MESSAGE internal_token=secret-token payload="+payload, ctx)
-	assert.Equal(t, "OK", resp)
+	assert.Equal(t, "OK leo=1 hwm=0", resp)
 }
 
 func TestRedactCommandSecrets(t *testing.T) {

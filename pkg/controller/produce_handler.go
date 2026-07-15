@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -13,6 +14,24 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
+
+const unassignedLeaderOffset = uint64(math.MaxUint64)
+
+func markLeaderOffsetsUnassigned(messages []types.Message) {
+	for i := range messages {
+		messages[i].Offset = unassignedLeaderOffset
+	}
+}
+
+func appendedLeaderMessages(messages []types.Message) []types.Message {
+	appended := make([]types.Message, 0, len(messages))
+	for i := range messages {
+		if messages[i].Offset != unassignedLeaderOffset {
+			appended = append(appended, messages[i])
+		}
+	}
+	return appended
+}
 
 // handlePublish processes PUBLISH command
 func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) string {
@@ -191,6 +210,12 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 
 		effectiveIdempotent := isIdempotent || ch.Config.EnableIdempotence
 
+		releaseWrite, err := ch.preparePartitionLeader(topicName, partition, p)
+		if err != nil {
+			return ch.errorResponse(err.Error())
+		}
+		defer releaseWrite()
+
 		scope := "partition"
 		messageData := types.MessageCommand{
 			Topic:         topicName,
@@ -201,32 +226,50 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 			Acks:          acks,
 		}
 
-		// 1. Append locally (LEO advances, HWM stays until replication succeeds)
+		markLeaderOffsetsUnassigned(messageData.Messages)
+		// Duplicate producer sequences remain unassigned and must not be
+		// replicated or committed again.
 		if err := p.EnqueueBatchLeader(messageData.Messages); err != nil {
 			return ch.errorResponse(fmt.Sprintf("failed to append locally: %v", err))
 		}
-
-		// Read the offset assigned by EnqueueBatch
-		assignedOffset := messageData.Messages[0].Offset
-
-		// 2. Replicate to followers if acks != 0
-		if acksLower != "0" {
-			minISR := 1
-			if acksLower == "-1" || acksLower == "all" {
-				minISR = ch.Config.MinInSyncReplicas
+		appended := appendedLeaderMessages(messageData.Messages)
+		if len(appended) == 0 {
+			lastOffset := uint64(0)
+			if nextOffset := p.NextOffset(); nextOffset > 0 {
+				lastOffset = nextOffset - 1
 			}
-
-			err = ch.Cluster.ReplicateToFollowers(topicName, partition, messageData, minISR)
-			if err != nil {
-				return ch.errorResponse(fmt.Sprintf("replication failed (offset=%d): %v", assignedOffset, err))
+			ackResp = types.AckResponse{
+				Status:        "OK",
+				LastOffset:    lastOffset,
+				ProducerEpoch: epoch,
+				ProducerID:    producerID,
+				SeqStart:      seqNum,
+				SeqEnd:        seqNum,
 			}
+			goto Respond
 		}
 
-		// Ensure data is on disk before ACK
+		messageData.Messages = appended
+		assignedOffset := appended[len(appended)-1].Offset
 		p.FlushDisk()
 
-		// Advance HWM now that replication and flush are complete
-		p.AdvanceHWM()
+		minISR := ch.Config.MinInSyncReplicas
+		if minISR < 1 {
+			minISR = 1
+		}
+		err = ch.Cluster.ReplicateToFollowers(topicName, partition, messageData, minISR)
+		if err != nil {
+			return ch.errorResponse(fmt.Sprintf("replication failed (offset=%d): %v", assignedOffset, err))
+		}
+
+		commitHWM := p.NextOffset()
+		if err := ch.commitPartitionHWM(topicName, partition, commitHWM); err != nil {
+			return ch.errorResponse(fmt.Sprintf("commit watermark failed (offset=%d): %v", assignedOffset, err))
+		}
+		if err := p.ApplyReplicaHWM(commitHWM); err != nil {
+			return ch.errorResponse(fmt.Sprintf("local commit watermark failed: %v", err))
+		}
+		p.FlushDisk()
 
 		ackResp = types.AckResponse{
 			Status:        "OK",
@@ -307,6 +350,9 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 		return fmt.Sprintf("ERROR: unmarshal_failed reason=%q", err.Error())
 	}
 
+	if errResp := ch.validateReplicaLeader(msgCmd); errResp != "" {
+		return errResp
+	}
 	t := ch.TopicManager.GetTopic(msgCmd.Topic)
 	if t == nil {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", msgCmd.Topic)
@@ -317,8 +363,7 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", msgCmd.Partition)
 	}
 
-	// Guard against empty messages to prevent index-out-of-range panic
-	if len(msgCmd.Messages) == 0 {
+	if len(msgCmd.Messages) == 0 && msgCmd.CommitHWM == nil {
 		return "ERROR: empty_messages command=REPLICATE_MESSAGE"
 	}
 	for i := range msgCmd.Messages {
@@ -327,14 +372,22 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 		}
 	}
 
-	if err := p.ReplicaAppend(msgCmd.Messages); err != nil {
-		return fmt.Sprintf("ERROR: replica_append_failed reason=%q", err.Error())
+	if len(msgCmd.Messages) > 0 {
+		if err := p.ReplicaAppend(msgCmd.Messages); err != nil {
+			return fmt.Sprintf("ERROR: replica_append_failed reason=%q", err.Error())
+		}
+		p.FlushDisk()
+		if err := ch.indexReplicatedEventSourceMessages(msgCmd.Topic, msgCmd.Partition, msgCmd.Messages); err != nil {
+			return fmt.Sprintf("ERROR: replica_index_failed reason=%q", err.Error())
+		}
 	}
-	if err := ch.indexReplicatedEventSourceMessages(msgCmd.Topic, msgCmd.Partition, msgCmd.Messages); err != nil {
-		return fmt.Sprintf("ERROR: replica_index_failed reason=%q", err.Error())
+	if msgCmd.CommitHWM != nil {
+		if err := p.ApplyReplicaHWM(*msgCmd.CommitHWM); err != nil {
+			return fmt.Sprintf("ERROR: invalid_commit_watermark reason=%q", err.Error())
+		}
+		p.FlushDisk()
 	}
-
-	return "OK"
+	return fmt.Sprintf("OK leo=%d hwm=%d", p.NextOffset(), p.GetHWM())
 }
 
 // HandleBatchMessage processes PUBLISH of multiple messages.
@@ -410,41 +463,63 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		effectiveIdempotent := batch.IsIdempotent || ch.Config.EnableIdempotence
 		scope := "partition"
 
-		// 1. Append locally (LEO advances, HWM stays until replication succeeds)
+		releaseWrite, err := ch.preparePartitionLeader(batch.Topic, batch.Partition, p)
+		if err != nil {
+			return ch.errorResponse(err.Error()), nil
+		}
+		defer releaseWrite()
+
+		markLeaderOffsetsUnassigned(batch.Messages)
+		// Duplicate producer sequences remain unassigned and are acknowledged
+		// without another replication round.
 		if err := p.EnqueueBatchLeader(batch.Messages); err != nil {
 			return ch.errorResponse(fmt.Sprintf("failed to append batch locally: %v", err)), nil
 		}
-
-		// Read offsets assigned by EnqueueBatch
-		lastOffset = batch.Messages[len(batch.Messages)-1].Offset
-
-		// 2. Replicate to followers if acks != 0
-		if acksLower != "0" {
-			minISR := 1
-			if acksLower == "-1" || acksLower == "all" {
-				minISR = ch.Config.MinInSyncReplicas
+		appended := appendedLeaderMessages(batch.Messages)
+		if len(appended) == 0 {
+			if nextOffset := p.NextOffset(); nextOffset > 0 {
+				lastOffset = nextOffset - 1
 			}
-
-			msgCmd := types.MessageCommand{
-				Topic:         batch.Topic,
-				Partition:     batch.Partition,
-				IsIdempotent:  effectiveIdempotent,
-				SequenceScope: scope,
-				Messages:      batch.Messages,
-				Acks:          acks,
+			respAck = types.AckResponse{
+				Status:        "OK",
+				LastOffset:    lastOffset,
+				SeqStart:      batch.Messages[0].SeqNum,
+				SeqEnd:        batch.Messages[len(batch.Messages)-1].SeqNum,
+				ProducerID:    batch.Messages[len(batch.Messages)-1].ProducerID,
+				ProducerEpoch: batch.Messages[len(batch.Messages)-1].Epoch,
 			}
-
-			err = ch.Cluster.ReplicateToFollowers(batch.Topic, batch.Partition, msgCmd, minISR)
-			if err != nil {
-				return ch.errorResponse(fmt.Sprintf("batch replication failed (offset=%d): %v", lastOffset, err)), nil
-			}
+			goto Respond
 		}
 
-		// Ensure data is on disk before ACK
-		p.FlushDisk()
+		lastOffset = appended[len(appended)-1].Offset
 
-		// Advance HWM now that replication and flush are complete
-		p.AdvanceHWM()
+		p.FlushDisk()
+		minISR := ch.Config.MinInSyncReplicas
+		if minISR < 1 {
+			minISR = 1
+		}
+
+		msgCmd := types.MessageCommand{
+			Topic:         batch.Topic,
+			Partition:     batch.Partition,
+			IsIdempotent:  effectiveIdempotent,
+			SequenceScope: scope,
+			Messages:      appended,
+			Acks:          acks,
+		}
+
+		err = ch.Cluster.ReplicateToFollowers(batch.Topic, batch.Partition, msgCmd, minISR)
+		if err != nil {
+			return ch.errorResponse(fmt.Sprintf("batch replication failed (offset=%d): %v", lastOffset, err)), nil
+		}
+		commitHWM := p.NextOffset()
+		if err := ch.commitPartitionHWM(batch.Topic, batch.Partition, commitHWM); err != nil {
+			return ch.errorResponse(fmt.Sprintf("batch commit watermark failed (offset=%d): %v", lastOffset, err)), nil
+		}
+		if err := p.ApplyReplicaHWM(commitHWM); err != nil {
+			return ch.errorResponse(fmt.Sprintf("local commit watermark failed: %v", err)), nil
+		}
+		p.FlushDisk()
 
 		respAck = types.AckResponse{
 			Status:        "OK",

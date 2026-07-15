@@ -28,6 +28,7 @@ type Handler struct {
 type AppendOptions struct {
 	LeaderAppend bool
 	AfterAppend  func(topic string, partition int, msg types.Message) error
+	AfterCommit  func(topic string, partition int, hwm uint64) error
 }
 
 type AppendResult struct {
@@ -289,6 +290,9 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 			appendedMsg.Offset = appendedOffset
 		}
 
+		if opts.LeaderAppend {
+			p.FlushDisk()
+		}
 		if opts.AfterAppend != nil {
 			if err := opts.AfterAppend(topicName, partitionID, appendedMsg); err != nil {
 				return 0, err
@@ -296,8 +300,14 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 		}
 
 		if opts.LeaderAppend {
-			p.FlushDisk()
-			p.AdvanceHWM()
+			hwm := p.NextOffset()
+			if opts.AfterCommit != nil {
+				if err := opts.AfterCommit(topicName, partitionID, hwm); err != nil {
+					return 0, err
+				}
+			} else {
+				p.AdvanceHWM()
+			}
 		}
 		return appendedOffset, nil
 	})

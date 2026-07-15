@@ -76,30 +76,40 @@ func (d *DiskHandler) openIndexFiles() error {
 }
 
 func (d *DiskHandler) seekLastValidIndexEntry(f *os.File, fileSize uint64) uint64 {
+	return seekLastValidIndexEntry(f, fileSize)
+}
+
+func seekLastValidIndexEntry(f *os.File, fileSize uint64) uint64 {
 	const entrySize = uint64(types.IndexEntrySize)
 	if fileSize < entrySize {
 		return 0
 	}
 
-	buf := make([]byte, entrySize)
-	for pos := fileSize - entrySize; ; pos -= entrySize {
-		if pos > math.MaxInt64 {
-			break
+	const scanBlockSize = uint64(64 * 1024)
+	end := fileSize - fileSize%entrySize
+	for end > 0 {
+		start := uint64(0)
+		if end > scanBlockSize {
+			start = end - scanBlockSize
 		}
-		_, err := f.ReadAt(buf, int64(pos))
-		if err != nil {
-			break
+		start -= start % entrySize
+		if start > math.MaxInt64 || end-start > math.MaxInt {
+			return 0
 		}
 
-		if binary.BigEndian.Uint64(buf[0:8]) != 0 || binary.BigEndian.Uint64(buf[8:16]) != 0 {
-			return pos + entrySize
+		buf := make([]byte, int(end-start))
+		n, err := f.ReadAt(buf, int64(start))
+		if err != nil && n == 0 {
+			return 0
 		}
-		if pos == 0 {
-			break
+		usable := n - n%int(entrySize)
+		for pos := usable - int(entrySize); pos >= 0; pos -= int(entrySize) {
+			entry := buf[pos : pos+int(entrySize)]
+			if binary.BigEndian.Uint64(entry[0:8]) != 0 || binary.BigEndian.Uint64(entry[8:16]) != 0 {
+				return start + uint64(pos) + entrySize
+			}
 		}
-		if pos < entrySize {
-			break
-		}
+		end = start
 	}
 	return 0
 }
@@ -174,31 +184,19 @@ func getLastOffsetFromIndex(indexPath string, baseOffset uint64) (lastOffset uin
 		return 0, 0, fmt.Errorf("negative file size")
 	}
 	fileSize := uint64(info.Size())
-	buf := make([]byte, entrySize)
-	found := false
-
-	for pos := fileSize - entrySize; ; pos -= entrySize {
-		if pos > math.MaxInt64 {
-			break
-		}
-		_, err := f.ReadAt(buf, int64(pos))
-		if err != nil {
-			break
-		}
-
-		if binary.BigEndian.Uint64(buf[0:8]) != 0 || binary.BigEndian.Uint64(buf[8:16]) != 0 {
-			lastOffset = binary.BigEndian.Uint64(buf[0:8])
-			found = true
-			break
-		}
-		if pos < entrySize {
-			break
-		}
-	}
-
-	if !found {
+	end := seekLastValidIndexEntry(f, fileSize)
+	if end == 0 {
 		return 0, 0, fmt.Errorf("index empty (contains only zeros)")
 	}
+	buf := make([]byte, entrySize)
+	entryPos := end - entrySize
+	if entryPos > math.MaxInt64 {
+		return 0, 0, fmt.Errorf("index entry position exceeds int64 max")
+	}
+	if _, err := f.ReadAt(buf, int64(entryPos)); err != nil {
+		return 0, 0, fmt.Errorf("read last index entry: %w", err)
+	}
+	lastOffset = binary.BigEndian.Uint64(buf[0:8])
 	if lastOffset < baseOffset {
 		return 0, 0, fmt.Errorf("index empty or corrupt")
 	}

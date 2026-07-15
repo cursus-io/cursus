@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 
 	"github.com/google/uuid"
@@ -365,4 +367,82 @@ func (ch *CommandHandler) applyAndWait(cmdType string, payload map[string]interf
 	case <-time.After(DefaultFSMApplyTimeout):
 		return nil, fmt.Errorf("timeout waiting for FSM")
 	}
+}
+
+func (ch *CommandHandler) preparePartitionLeader(topicName string, partitionID int, p *topic.Partition) (func(), error) {
+	writeLock := ch.partitionWriteLock(topicName, partitionID)
+	writeLock.Lock()
+	release := writeLock.Unlock
+	fail := func(err error) (func(), error) {
+		release()
+		return nil, err
+	}
+	if ch.Cluster == nil || ch.Cluster.RaftManager == nil {
+		return fail(fmt.Errorf("cluster metadata unavailable"))
+	}
+	fsmRef := ch.Cluster.RaftManager.GetFSM()
+	if fsmRef == nil {
+		return fail(fmt.Errorf("cluster metadata unavailable"))
+	}
+	metadata := fsmRef.GetPartitionMetadata(fmt.Sprintf("%s-%d", topicName, partitionID))
+	if metadata == nil {
+		return fail(fmt.Errorf("partition metadata not found"))
+	}
+	if !ch.Cluster.IsAuthorized(topicName, partitionID) {
+		return fail(fmt.Errorf("partition leader fenced: current=%s epoch=%d", metadata.Leader, metadata.LeaderEpoch))
+	}
+	committedHWM := metadata.CommittedHWM
+	if localHWM := p.GetHWM(); localHWM > committedHWM {
+		committedHWM = localHWM
+	}
+	if err := p.ReconcileCommittedHWM(committedHWM); err != nil {
+		return fail(fmt.Errorf("partition is not ready for leadership: %w", err))
+	}
+	p.FlushDisk()
+	return release, nil
+}
+
+func (ch *CommandHandler) commitPartitionHWM(topicName string, partitionID int, hwm uint64) error {
+	if ch.Cluster == nil || ch.Cluster.RaftManager == nil {
+		return fmt.Errorf("cluster metadata unavailable")
+	}
+	fsmRef := ch.Cluster.RaftManager.GetFSM()
+	if fsmRef == nil {
+		return fmt.Errorf("cluster metadata unavailable")
+	}
+	metadata := fsmRef.GetPartitionMetadata(fmt.Sprintf("%s-%d", topicName, partitionID))
+	if metadata == nil {
+		return fmt.Errorf("partition metadata not found")
+	}
+	_, err := ch.applyViaLeader("PARTITION_COMMIT", map[string]interface{}{
+		"topic":        topicName,
+		"partition":    partitionID,
+		"leader":       metadata.Leader,
+		"leader_epoch": metadata.LeaderEpoch,
+		"hwm":          hwm,
+	})
+	return err
+}
+
+func (ch *CommandHandler) validateReplicaLeader(cmd types.MessageCommand) string {
+	if !ch.isDistributed() {
+		return ""
+	}
+	if ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.Cluster.RaftManager.GetFSM() == nil {
+		return "ERROR: cluster_metadata_unavailable command=REPLICATE_MESSAGE"
+	}
+	metadata := ch.Cluster.RaftManager.GetFSM().GetPartitionMetadata(fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition))
+	if metadata == nil {
+		return fmt.Sprintf("ERROR: partition_metadata_not_found topic=%s partition=%d", cmd.Topic, cmd.Partition)
+	}
+	if cmd.LeaderID == "" || cmd.LeaderEpoch == 0 {
+		return "ERROR: missing_leader_fence command=REPLICATE_MESSAGE"
+	}
+	if cmd.LeaderID != metadata.Leader {
+		return fmt.Sprintf("ERROR: NOT_PARTITION_LEADER leader=%s requested_leader=%s", metadata.Leader, cmd.LeaderID)
+	}
+	if cmd.LeaderEpoch != metadata.LeaderEpoch {
+		return fmt.Sprintf("ERROR: STALE_LEADER_EPOCH current=%d requested=%d", metadata.LeaderEpoch, cmd.LeaderEpoch)
+	}
+	return ""
 }

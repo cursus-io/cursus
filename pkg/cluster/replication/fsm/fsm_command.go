@@ -16,6 +16,7 @@ type PartitionMetadata struct {
 	Replicas       []string `json:"replicas"`
 	ISR            []string `json:"isr"`
 	LeaderEpoch    int      `json:"leader_epoch"`
+	CommittedHWM   uint64   `json:"committed_hwm"`
 	PartitionCount int      `json:"partition_count"`
 	Idempotent     bool     `json:"idempotent"`
 }
@@ -184,8 +185,75 @@ func (f *BrokerFSM) applyPartitionCommand(jsonData string) interface{} {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if current := f.partitionMetadata[key]; current != nil {
+		if metadata.LeaderEpoch < current.LeaderEpoch {
+			return fmt.Errorf("stale leader epoch for %s: current=%d requested=%d", key, current.LeaderEpoch, metadata.LeaderEpoch)
+		}
+		if metadata.Leader != current.Leader && metadata.LeaderEpoch <= current.LeaderEpoch {
+			return fmt.Errorf("leader change for %s must advance epoch: current=%d requested=%d", key, current.LeaderEpoch, metadata.LeaderEpoch)
+		}
+		if metadata.CommittedHWM < current.CommittedHWM {
+			return fmt.Errorf("committed HWM regression for %s: current=%d requested=%d", key, current.CommittedHWM, metadata.CommittedHWM)
+		}
+	}
 	f.partitionMetadata[key] = &metadata
 	util.Debug("FSM: Updated partition metadata for %s", key)
+	return nil
+}
+
+type partitionCommitCommand struct {
+	Topic       string `json:"topic"`
+	Partition   int    `json:"partition"`
+	Leader      string `json:"leader"`
+	LeaderEpoch int    `json:"leader_epoch"`
+	HWM         uint64 `json:"hwm"`
+}
+
+func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
+	var cmd partitionCommitCommand
+	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
+		return fmt.Errorf("unmarshal partition commit: %w", err)
+	}
+	key := fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition)
+
+	f.mu.Lock()
+	metadata := f.partitionMetadata[key]
+	if metadata == nil {
+		f.mu.Unlock()
+		return fmt.Errorf("partition metadata %s not found", key)
+	}
+	if cmd.Leader != metadata.Leader {
+		f.mu.Unlock()
+		return fmt.Errorf("partition leader fenced for %s: current=%s requested=%s", key, metadata.Leader, cmd.Leader)
+	}
+	if cmd.LeaderEpoch != metadata.LeaderEpoch {
+		f.mu.Unlock()
+		return fmt.Errorf("stale leader epoch for %s: current=%d requested=%d", key, metadata.LeaderEpoch, cmd.LeaderEpoch)
+	}
+	if cmd.HWM < metadata.CommittedHWM {
+		f.mu.Unlock()
+		return fmt.Errorf("committed HWM regression for %s: current=%d requested=%d", key, metadata.CommittedHWM, cmd.HWM)
+	}
+	metadata.CommittedHWM = cmd.HWM
+	tm := f.tm
+	f.mu.Unlock()
+
+	if tm == nil {
+		return nil
+	}
+	t := tm.GetTopic(cmd.Topic)
+	if t == nil {
+		return nil
+	}
+	p, err := t.GetPartition(cmd.Partition)
+	if err != nil {
+		return nil
+	}
+	if err := p.ApplyReplicaHWM(cmd.HWM); err != nil {
+		util.Warn("FSM: Replica has not caught up to committed HWM for %s: %v", key, err)
+		return nil
+	}
+	p.FlushDisk()
 	return nil
 }
 

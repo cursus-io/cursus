@@ -480,6 +480,7 @@ func (p *Partition) ReplicaAppend(msgs []types.Message) error {
 			p.LEO.Store(newLEO)
 		}
 		p.setHWMLocked(newLEO)
+		p.updateProducerStateWithMode(&msgs[i], msgs[i].TransactionalID != "")
 		p.indexTransactionMessage(msgs[i])
 	}
 	p.NotifyNewMessage()

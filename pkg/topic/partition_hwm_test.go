@@ -35,6 +35,7 @@ func TestPartition_RestoresPersistedHWMCheckpoint(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = restartedDH.Close() }()
 	restarted := NewPartition(0, "orders", restartedDH, nil, cfg)
+	defer restarted.Close()
 
 	require.Equal(t, uint64(1), restarted.GetHWM())
 	msgs, err := restarted.ReadCommitted(0, 10)
@@ -171,16 +172,116 @@ func TestPartition_EnqueueBatchLeaderUsesSingleBatchWrite(t *testing.T) {
 	}
 	require.NoError(t, p.EnqueueBatchLeader(batch))
 
-	require.Equal(t, uint64(1), batch[0].Offset)
-	require.Equal(t, uint64(2), batch[1].Offset)
-	require.Equal(t, uint64(3), p.NextOffset())
-	require.Equal(t, uint64(1), p.GetHWM(), "leader append must not advance HWM before replication commit")
+	require.Equal(t, uint64(0), batch[0].Offset)
+	require.Equal(t, uint64(1), batch[1].Offset)
+	require.Equal(t, uint64(2), p.NextOffset())
+	require.Equal(t, uint64(0), p.GetHWM(), "leader append must not advance HWM before replication commit")
 
 	diskBatch := dh.Calls[1].Arguments.Get(0).([]types.DiskMessage)
 	require.Len(t, diskBatch, 2)
-	require.Equal(t, uint64(1), diskBatch[0].Offset)
-	require.Equal(t, uint64(2), diskBatch[1].Offset)
+	require.Equal(t, uint64(0), diskBatch[0].Offset)
+	require.Equal(t, uint64(1), diskBatch[1].Offset)
 	dh.AssertNotCalled(t, "AppendMessage", mock.Anything, mock.Anything, mock.Anything)
+}
+
+func TestPartition_InitialLEOMatchesStorageNextOffset(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(7)).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	require.Equal(t, uint64(7), p.NextOffset())
+	require.Equal(t, uint64(7), p.GetHWM())
+	dh.AssertExpectations(t)
+}
+
+func TestPartition_ReplicaAppendSeparatesDurableTailFromCommitWatermark(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	msg := types.Message{Offset: 0, Payload: "replicated", ProducerID: "producer-1", SeqNum: 1}
+	dh.On("AppendMessageWithOffset", "orders", 0, mock.MatchedBy(func(got *types.Message) bool {
+		return got.Offset == 0 && got.Payload == "replicated"
+	})).Return(nil).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	require.NoError(t, p.ReplicaAppend([]types.Message{msg}))
+	require.Equal(t, uint64(1), p.NextOffset())
+	require.Equal(t, uint64(0), p.GetHWM(), "replica append must remain invisible until commit metadata arrives")
+
+	require.Error(t, p.ApplyReplicaHWM(2))
+	require.NoError(t, p.ApplyReplicaHWM(1))
+	require.Equal(t, uint64(1), p.GetHWM())
+	dh.AssertExpectations(t)
+}
+
+func TestPartition_ReplicaAppendRetryIsIdempotentAndRejectsConflictOrGap(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	msg := types.Message{Offset: 0, Payload: "replicated", ProducerID: "producer-1", SeqNum: 1}
+	dh.On("AppendMessageWithOffset", "orders", 0, mock.Anything).Return(nil).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	require.NoError(t, p.ReplicaAppend([]types.Message{msg}))
+
+	dh.On("ReadMessages", uint64(0), 1).Return([]types.Message{msg}, nil).Once()
+	require.NoError(t, p.ReplicaAppend([]types.Message{msg}), "an identical retry must be a no-op")
+	dh.AssertNumberOfCalls(t, "AppendMessageWithOffset", 1)
+
+	dh.On("ReadMessages", uint64(0), 1).Return([]types.Message{{Offset: 0, Payload: "different"}}, nil).Once()
+	require.ErrorContains(t, p.ReplicaAppend([]types.Message{msg}), "offset conflict")
+	require.ErrorContains(t, p.ReplicaAppend([]types.Message{{Offset: 2, Payload: "gap"}}), "offset gap")
+	dh.AssertExpectations(t)
+}
+
+func TestPartition_ReconcileCommittedHWMTruncatesUncommittedTail(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 1
+
+	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	p := NewPartition(0, "orders", dh, nil, cfg)
+
+	require.NoError(t, p.EnqueueSync(types.Message{Payload: "committed"}))
+	p.FlushDisk()
+	uncommitted := []types.Message{
+		{Payload: "open", ProducerID: "txn-producer", SeqNum: 1, TransactionalID: "tx-tail", TransactionState: types.TransactionStateOpen},
+		{Payload: "marker", ProducerID: "txn-producer", SeqNum: 2, TransactionalID: "tx-tail", TransactionMarker: types.TransactionMarkerCommit},
+	}
+	require.NoError(t, p.EnqueueBatchLeader(uncommitted))
+	p.FlushDisk()
+	require.Equal(t, uint64(3), p.NextOffset())
+	require.Equal(t, uint64(1), p.GetHWM())
+
+	require.NoError(t, p.ReconcileCommittedHWM(1))
+	p.FlushDisk()
+	require.Equal(t, uint64(1), p.NextOffset())
+	require.Equal(t, uint64(1), p.GetHWM())
+	msgs, err := p.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Equal(t, "committed", msgs[0].Payload)
+
+	replacement := []types.Message{{Payload: "replacement"}}
+	require.NoError(t, p.EnqueueBatchLeader(replacement))
+	require.Equal(t, uint64(1), replacement[0].Offset)
+	require.NoError(t, p.ApplyReplicaHWM(2))
+	p.FlushDisk()
+	p.Close()
+	require.NoError(t, dh.Close())
+
+	restartedDH, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, restartedDH.Close()) }()
+	restarted := NewPartition(0, "orders", restartedDH, nil, cfg)
+	defer restarted.Close()
+	require.Equal(t, uint64(2), restarted.GetHWM())
+	msgs, err = restarted.ReadCommitted(0, 10)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	require.Equal(t, "replacement", msgs[1].Payload)
 }
 
 func TestPartition_EnqueueBatchLeaderDoesNotAdvanceStateOnWriteFailure(t *testing.T) {
@@ -196,12 +297,12 @@ func TestPartition_EnqueueBatchLeaderDoesNotAdvanceStateOnWriteFailure(t *testin
 	failedBatch := []types.Message{{Payload: "one", ProducerID: "producer-1", SeqNum: 1}}
 	require.Error(t, p.EnqueueBatchLeader(failedBatch))
 	require.Equal(t, uint64(0), failedBatch[0].Offset)
-	require.Equal(t, uint64(1), p.NextOffset())
+	require.Equal(t, uint64(0), p.NextOffset())
 
 	retryBatch := []types.Message{{Payload: "one", ProducerID: "producer-1", SeqNum: 1}}
 	require.NoError(t, p.EnqueueBatchLeader(retryBatch))
-	require.Equal(t, uint64(1), retryBatch[0].Offset)
-	require.Equal(t, uint64(2), p.NextOffset())
+	require.Equal(t, uint64(0), retryBatch[0].Offset)
+	require.Equal(t, uint64(1), p.NextOffset())
 }
 
 func TestPartition_RejectsNewProducerSequenceGap(t *testing.T) {

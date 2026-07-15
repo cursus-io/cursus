@@ -18,11 +18,28 @@ func (ch *CommandHandler) handleAppendStream(cmd string) string {
 		return errResp
 	}
 	if ch.Config != nil && ch.Config.EnabledDistribution && ch.Cluster != nil {
-		if resp, forwarded, _ := ch.isPartitionLeaderAndForward(eventStreamTopic(cmd, "APPEND_STREAM "), partition, cmd); forwarded {
+		topicName := eventStreamTopic(cmd, "APPEND_STREAM ")
+		if resp, forwarded, _ := ch.isPartitionLeaderAndForward(topicName, partition, cmd); forwarded {
 			return resp
 		}
+		t := ch.waitForTopic(topicName)
+		if t == nil {
+			return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+		}
+		p, err := t.GetPartition(partition)
+		if err != nil {
+			return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
+		}
+		releaseWrite, err := ch.preparePartitionLeader(topicName, partition, p)
+		if err != nil {
+			return ch.errorResponse(err.Error())
+		}
+		defer releaseWrite()
 		result, errResp := ch.ESHandler.AppendStream(cmd, eventsource.AppendOptions{
 			LeaderAppend: true,
+			AfterCommit: func(topic string, partition int, hwm uint64) error {
+				return ch.commitPartitionHWM(topic, partition, hwm)
+			},
 			AfterAppend: func(topic string, partition int, msg types.Message) error {
 				msgCmd := types.MessageCommand{
 					Topic:         topic,
