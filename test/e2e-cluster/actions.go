@@ -142,6 +142,7 @@ func (a *ClusterActions) SimulateFollowerFailure(nodeIndex int) *ClusterActions 
 	containerName := fmt.Sprintf("broker-%d", nodeIndex)
 	a.ctx.GetT().Log("Simulating follower failure")
 
+	// #nosec G204 -- nodeIndex is range-checked above and forms a fixed broker-N container name.
 	cmd := exec.Command("docker", "stop", containerName)
 	if err := cmd.Run(); err != nil {
 		a.ctx.GetT().Fatalf("Failed to stop follower: %v", err)
@@ -163,6 +164,7 @@ func (a *ClusterActions) RecoverFollower(nodeIndex int) *ClusterActions {
 	containerName := fmt.Sprintf("broker-%d", nodeIndex)
 	a.ctx.GetT().Log("Recovering follower")
 
+	// #nosec G204 -- nodeIndex is range-checked above and forms a fixed broker-N container name.
 	cmd := exec.Command("docker", "start", containerName)
 	if err := cmd.Run(); err != nil {
 		a.ctx.GetT().Fatalf("Failed to recover follower: %v", err)
@@ -268,6 +270,7 @@ func (a *ClusterActions) SimulateLeaderFailure() (int, *ClusterActions) {
 	containerName := fmt.Sprintf("broker-%d", leaderNode)
 	a.ctx.GetT().Logf("Stopping leader container: %s", containerName)
 
+	// #nosec G204 -- leaderNode is parsed and range-checked against the configured cluster size.
 	stopCmd := exec.Command("docker", "stop", containerName)
 	if err := stopCmd.Run(); err != nil {
 		a.ctx.GetT().Fatalf("Failed to stop leader %s: %v", containerName, err)
