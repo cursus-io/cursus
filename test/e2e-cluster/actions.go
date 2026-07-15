@@ -35,8 +35,9 @@ func (a *ClusterActions) StartCluster() *ClusterActions {
 		resp, err := a.actions.SendCommand("LIST_CLUSTER")
 		if err == nil {
 			a.ctx.GetT().Logf("DEBUG: LIST_CLUSTER raw response: %s", resp)
+			payload := strings.TrimPrefix(strings.TrimSpace(resp), "OK brokers=")
 			var brokers []fsm.BrokerInfo
-			if err := json.Unmarshal([]byte(resp), &brokers); err == nil {
+			if err := json.Unmarshal([]byte(payload), &brokers); err == nil {
 				activeCount := 0
 				for _, b := range brokers {
 					if b.Status == "active" {
@@ -53,7 +54,7 @@ func (a *ClusterActions) StartCluster() *ClusterActions {
 		time.Sleep(1 * time.Second)
 	}
 
-	a.ctx.GetT().Log("Cluster sync verified (with potential timeout)")
+	a.ctx.GetT().Fatalf("cluster did not report %d active nodes after %d attempts", a.ctx.clusterSize, maxRetries)
 	return a
 }
 
@@ -176,6 +177,29 @@ func (a *ClusterActions) RecoverFollower(nodeIndex int) *ClusterActions {
 	return a
 }
 
+func (a *ClusterActions) StopBroker(nodeIndex int) {
+	if nodeIndex <= 0 || nodeIndex > a.ctx.clusterSize {
+		a.ctx.GetT().Fatalf("invalid broker index %d: cluster size is %d", nodeIndex, a.ctx.clusterSize)
+	}
+	containerName := fmt.Sprintf("broker-%d", nodeIndex)
+	if err := exec.Command("docker", "stop", containerName).Run(); err != nil {
+		a.ctx.GetT().Fatalf("failed to stop %s: %v", containerName, err)
+	}
+	a.ctx.GetClient().Close()
+}
+
+func (a *ClusterActions) StartBroker(nodeIndex int) {
+	if nodeIndex <= 0 || nodeIndex > a.ctx.clusterSize {
+		a.ctx.GetT().Fatalf("invalid broker index %d: cluster size is %d", nodeIndex, a.ctx.clusterSize)
+	}
+	containerName := fmt.Sprintf("broker-%d", nodeIndex)
+	if err := exec.Command("docker", "start", containerName).Run(); err != nil {
+		a.ctx.GetT().Fatalf("failed to start %s: %v", containerName, err)
+	}
+	if err := a.waitForNodeHealth(nodeIndex, clusterHealthCheckAddrs(a.ctx.clusterSize)[nodeIndex-1]); err != nil {
+		a.ctx.GetT().Fatalf("broker %d did not recover: %v", nodeIndex, err)
+	}
+}
 func (a *ClusterActions) DescribeTopic() *ClusterActions {
 	topic := a.ctx.GetTopic()
 	a.ctx.GetT().Logf("Describing topic: %s", topic)

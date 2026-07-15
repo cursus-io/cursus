@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -500,11 +501,7 @@ func touchedTransactionPartitions(tx *transaction.Transaction) []transactionPart
 func (ch *CommandHandler) publishTransactionMarker(topicName string, partition int, msg types.Message) error {
 	if ch.isDistributed() {
 		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true transactional_id=%s transaction_state=%s transaction_marker=%s control_batch_type=%s control_batch_version=%d control_batch_coordinator_epoch=%d control_batch_key=%s control_batch_value=%s internal_txn_publish=true message=%s", topicName, msg.ProducerID, partition, msg.SeqNum, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.ControlBatchType, msg.ControlBatchVersion, msg.ControlBatchCoordinatorEpoch, base64.StdEncoding.EncodeToString(msg.ControlBatchKey), base64.StdEncoding.EncodeToString(msg.ControlBatchValue), msg.Payload)
-		resp := ch.handlePublish(cmd, NewInternalClientContext("default-group", 0))
-		if !strings.HasPrefix(resp, "OK") && !strings.HasPrefix(resp, "{") {
-			return fmt.Errorf("%s", resp)
-		}
-		return nil
+		return ch.publishInternalTransactionCommand(cmd)
 	}
 	return ch.TopicManager.PublishToPartitionWithAckIdempotent(topicName, partition, &msg)
 }
@@ -521,15 +518,43 @@ func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.Mess
 			cmd += fmt.Sprintf(" transactional_id=%s transaction_state=%s", msg.TransactionalID, msg.TransactionState)
 		}
 		cmd += " message=" + msg.Payload
-		resp := ch.handlePublish(cmd, NewInternalClientContext("default-group", 0))
-		if !strings.HasPrefix(resp, "OK") && !strings.HasPrefix(resp, "{") {
-			return fmt.Errorf("%s", resp)
-		}
-		return nil
+		return ch.publishInternalTransactionCommand(cmd)
 	}
 	return ch.TopicManager.PublishToPartitionWithAckIdempotent(op.Topic, op.Partition, &msg)
 }
 
+func (ch *CommandHandler) publishInternalTransactionCommand(cmd string) error {
+	deadline := time.Now().Add(DefaultFSMApplyTimeout)
+	var lastResp string
+	for {
+		lastResp = ch.handlePublish(cmd, NewInternalClientContext("default-group", 0))
+		if strings.HasPrefix(lastResp, "OK") || strings.HasPrefix(lastResp, "{") {
+			return nil
+		}
+		if !isRetryableTransactionStateLag(lastResp) || !time.Now().Before(deadline) {
+			return fmt.Errorf("%s", lastResp)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func isRetryableTransactionStateLag(resp string) bool {
+	fields := strings.Fields(strings.TrimSpace(resp))
+	if len(fields) < 2 || fields[0] != "ERROR:" {
+		return false
+	}
+	switch strings.ToLower(fields[1]) {
+	case "transaction_not_found",
+		"transaction_not_committing",
+		"transaction_record_not_staged",
+		"transaction_marker_partition_not_touched",
+		"transaction_not_abortable",
+		"producer_fenced":
+		return true
+	default:
+		return false
+	}
+}
 func (ch *CommandHandler) validateTransactionPublishMetadata(args map[string]string, topicName string, partition int, msg *types.Message) string {
 	if msg == nil {
 		return ""

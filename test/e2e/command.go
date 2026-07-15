@@ -4,11 +4,121 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cursus-io/cursus/util"
 )
+
+type TransactionProducer struct {
+	ProducerID string
+	Epoch      int64
+}
+
+type TransactionStatus struct {
+	State    string
+	Messages int
+	Offsets  int
+}
+
+func (bc *BrokerClient) InitTransactionProducer(transactionalID string) (TransactionProducer, error) {
+	resp, err := bc.transactionCommand(fmt.Sprintf("INIT_PRODUCER_ID transactional_id=%s", transactionalID))
+	if err != nil {
+		return TransactionProducer{}, err
+	}
+	fields := responseFields(resp)
+	epoch, err := strconv.ParseInt(fields["epoch"], 10, 64)
+	if err != nil || fields["producerId"] == "" {
+		return TransactionProducer{}, fmt.Errorf("invalid producer response: %s", resp)
+	}
+	return TransactionProducer{ProducerID: fields["producerId"], Epoch: epoch}, nil
+}
+
+func (bc *BrokerClient) BeginTransaction(transactionalID string, producer TransactionProducer) error {
+	_, err := bc.transactionCommand(fmt.Sprintf("BEGIN_TXN transactional_id=%s producerId=%s epoch=%d", transactionalID, producer.ProducerID, producer.Epoch))
+	return err
+}
+
+func (bc *BrokerClient) TransactionalPublish(transactionalID, topic string, partition int, producer TransactionProducer, sequence uint64, payload string) error {
+	_, err := bc.transactionCommand(fmt.Sprintf("TXN_PUBLISH transactional_id=%s topic=%s partition=%d producerId=%s epoch=%d seqNum=%d message=%s", transactionalID, topic, partition, producer.ProducerID, producer.Epoch, sequence, payload))
+	return err
+}
+
+func (bc *BrokerClient) SendOffsetsToTransaction(transactionalID, topic, group, member string, generation int, producer TransactionProducer, offsets map[int]uint64) error {
+	partitions := make([]int, 0, len(offsets))
+	for partition := range offsets {
+		partitions = append(partitions, partition)
+	}
+	sort.Ints(partitions)
+	pairs := make([]string, 0, len(partitions))
+	for _, partition := range partitions {
+		pairs = append(pairs, fmt.Sprintf("P%d:%d", partition, offsets[partition]))
+	}
+	cmd := fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=%s producerId=%s epoch=%d topic=%s group=%s member=%s generation=%d %s", transactionalID, producer.ProducerID, producer.Epoch, topic, group, member, generation, strings.Join(pairs, ","))
+	_, err := bc.transactionCommand(cmd)
+	return err
+}
+
+func (bc *BrokerClient) EndTransaction(transactionalID string, producer TransactionProducer, result string) error {
+	_, err := bc.transactionCommand(fmt.Sprintf("END_TXN transactional_id=%s producerId=%s epoch=%d result=%s", transactionalID, producer.ProducerID, producer.Epoch, result))
+	return err
+}
+
+func (bc *BrokerClient) GetTransactionStatus(transactionalID string) (TransactionStatus, error) {
+	resp, err := bc.transactionCommand(fmt.Sprintf("TXN_STATUS transactional_id=%s", transactionalID))
+	if err != nil {
+		return TransactionStatus{}, err
+	}
+	fields := responseFields(resp)
+	messages, msgErr := strconv.Atoi(fields["messages"])
+	offsets, offsetErr := strconv.Atoi(fields["offsets"])
+	if fields["state"] == "" || msgErr != nil || offsetErr != nil {
+		return TransactionStatus{}, fmt.Errorf("invalid transaction status response: %s", resp)
+	}
+	return TransactionStatus{State: fields["state"], Messages: messages, Offsets: offsets}, nil
+}
+
+func (bc *BrokerClient) FindTransactionCoordinator(transactionalID string) (string, error) {
+	resp, err := bc.SendCommand("", fmt.Sprintf("FIND_COORDINATOR transactional_id=%s", transactionalID), 5*time.Second)
+	if err != nil {
+		return "", err
+	}
+	if strings.HasPrefix(resp, "ERROR:") {
+		return "", fmt.Errorf("broker error: %s", resp)
+	}
+	coordinatorID := responseFields(resp)["coordinator_id"]
+	if coordinatorID == "" {
+		return "", fmt.Errorf("missing coordinator_id in response: %s", resp)
+	}
+	return coordinatorID, nil
+}
+
+func (bc *BrokerClient) transactionCommand(command string) (string, error) {
+	resp, err := bc.SendCommand("", command, 10*time.Second)
+	if err != nil {
+		return "", err
+	}
+	if strings.HasPrefix(resp, "ERROR:") {
+		return "", fmt.Errorf("broker error: %s", resp)
+	}
+	if resp != "OK" && !strings.HasPrefix(resp, "OK ") {
+		return "", fmt.Errorf("unexpected transaction response: %s", resp)
+	}
+	return resp, nil
+}
+
+func responseFields(resp string) map[string]string {
+	fields := make(map[string]string)
+	for _, field := range strings.Fields(resp) {
+		key, value, ok := strings.Cut(field, "=")
+		if ok {
+			fields[key] = value
+		}
+	}
+	return fields
+}
 
 // CreateTopic sends CREATE command to broker
 func (bc *BrokerClient) CreateTopic(topic string, partitions int, idempotent bool) error {

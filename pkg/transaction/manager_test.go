@@ -71,6 +71,53 @@ func TestManagerExportImportState(t *testing.T) {
 	}
 }
 
+func TestManagerApplySnapshotDoesNotRegressReplicatedState(t *testing.T) {
+	m := NewManager()
+	producer, epoch := beginInitialized(t, m, "tx-out-of-order")
+	open := m.ExportState()["tx-out-of-order"]
+
+	stale := *open
+	stale.Revision--
+	stale.State = StateAborted
+	stale.UpdatedAt = open.UpdatedAt.Add(-time.Second)
+	if err := m.ApplyReplicatedSnapshot(&stale); err == nil {
+		t.Fatal("expected stale replicated snapshot to be rejected")
+	}
+
+	tx, err := m.Status("tx-out-of-order")
+	if err != nil {
+		t.Fatalf("status failed: %v", err)
+	}
+	if tx.State != StateOpen || tx.Revision != open.Revision {
+		t.Fatalf("stale replicated state regressed transaction: %+v", tx)
+	}
+	if err := m.AddMessage("tx-out-of-order", producer, epoch, MessageOperation{Topic: "t1", Message: types.Message{Payload: "still-open"}}); err != nil {
+		t.Fatalf("open transaction should remain usable: %v", err)
+	}
+}
+
+func TestManagerApplySnapshotUsesTimestampForLegacyRevisions(t *testing.T) {
+	m := NewManager()
+	base := time.Now().UTC()
+	if err := m.ApplyReplicatedSnapshot(&Snapshot{ID: "legacy", Producer: "p1", Epoch: 0, State: StateAborted, UpdatedAt: base}); err != nil {
+		t.Fatalf("apply initial legacy snapshot: %v", err)
+	}
+	if err := m.ApplyReplicatedSnapshot(&Snapshot{ID: "legacy", Producer: "p1", Epoch: 0, State: StateOpen, UpdatedAt: base.Add(time.Second)}); err != nil {
+		t.Fatalf("apply newer legacy snapshot: %v", err)
+	}
+	if err := m.ApplyReplicatedSnapshot(&Snapshot{ID: "legacy", Producer: "p1", Epoch: 0, State: StateAborted, UpdatedAt: base}); err == nil {
+		t.Fatal("expected older legacy snapshot to be rejected")
+	}
+
+	tx, err := m.Status("legacy")
+	if err != nil {
+		t.Fatalf("status failed: %v", err)
+	}
+	if tx.State != StateOpen {
+		t.Fatalf("older legacy snapshot regressed state: %+v", tx)
+	}
+}
+
 func TestManagerFinalStateIsIdempotentForSameOwner(t *testing.T) {
 	m := NewManager()
 	producer, epoch := beginInitialized(t, m, "tx-1")
