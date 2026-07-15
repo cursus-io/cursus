@@ -462,6 +462,30 @@ ERROR: fsm_not_available
 ERROR: distribution_not_enabled
 ```
 
+### CLUSTER_STATUS
+
+`CLUSTER_STATUS` returns `OK cluster=<json>` in distributed mode. The JSON document contains the Raft leader address, active/inactive broker counts, partition leader epochs and committed HWMs, plus leaderless and under-replicated partition totals. A leader is considered available only when its registered broker is active.
+
+### ELECT_LEADER
+
+`ELECT_LEADER topic=<name> partition=<N> broker=<broker-id>` performs a controlled preferred-leader change through the Raft metadata log. The target must be an active replica already present in the partition ISR. The broker records the current leader epoch in the command and the FSM rejects stale concurrent changes. A successful change increments `leader_epoch` while preserving `committed_hwm`, replicas, and ISR. Retrying an election whose target is already leader succeeds with `changed=false` and does not advance the epoch again.
+
+Success:
+
+```text
+OK topic=<name> partition=<N> previous_leader=<broker-id> leader=<broker-id> leader_epoch=<N> changed=<true|false>
+```
+
+Common errors:
+
+```text
+ERROR: distribution_required command=ELECT_LEADER
+ERROR: partition_not_found topic=<name> partition=<N>
+ERROR: leader_election_rejected topic=<name> partition=<N> broker=<id> reason="..."
+```
+
+This command does not add replicas, expand ISR, or perform data movement. Reassignment and broker draining require a separate catch-up-aware workflow.
+
 ### RAFT_APPLY
 
 Internal replication command used by distributed brokers. In distributed mode this command requires `internal_token=<shared-token>` before `type=`. External clients and SDKs must not call it directly.
