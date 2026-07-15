@@ -97,7 +97,8 @@ type Config struct {
 	MaxStreamConnections    int           `yaml:"max_stream_connections" json:"max.stream.connections"`
 	StreamTimeout           time.Duration `yaml:"stream_timeout" json:"stream.timeout"`
 	StreamHeartbeatInterval time.Duration `yaml:"stream_heartbeat_interval" json:"stream.heartbeat.interval"`
-	StreamCommitInterval    time.Duration `yaml:"stream_commit_interval" json:"stream.commit.interval"`
+	// Deprecated: stream delivery never commits consumer offsets; clients commit after processing.
+	StreamCommitInterval time.Duration `yaml:"stream_commit_interval" json:"stream.commit.interval"`
 
 	// security
 	UseTLS                  bool `yaml:"use_tls" json:"tls.enable"`
@@ -270,7 +271,7 @@ func LoadConfig() (*Config, error) {
 	flag.IntVar(&cfg.MaxStreamConnections, "max-stream-connections", cfg.MaxStreamConnections, "Max stream connections")
 	flag.DurationVar(&cfg.StreamTimeout, "stream-timeout", cfg.StreamTimeout, "Stream timeout")
 	flag.DurationVar(&cfg.StreamHeartbeatInterval, "stream-heartbeat-interval", cfg.StreamHeartbeatInterval, "Stream heartbeat")
-	flag.DurationVar(&cfg.StreamCommitInterval, "stream-commit-interval", cfg.StreamCommitInterval, "Stream commit interval")
+	flag.DurationVar(&cfg.StreamCommitInterval, "stream-commit-interval", cfg.StreamCommitInterval, "Deprecated and ignored; clients commit stream offsets after processing")
 
 	// security
 	flag.BoolVar(&cfg.UseTLS, "tls", cfg.UseTLS, "Enable TLS")

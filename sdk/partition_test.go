@@ -657,3 +657,43 @@ func TestPartitionConsumer_HandleStreamControl_OffsetOutOfRange(t *testing.T) {
 	assert.True(t, result)
 	assert.Equal(t, uint64(5), atomic.LoadUint64(&pc.fetchOffset))
 }
+
+func TestPartitionConsumer_HandlerFailureDoesNotCommitAndRequestsRedelivery(t *testing.T) {
+	c := newTestConsumer(t)
+	c.mu.Lock()
+	c.offsets[0] = 3
+	c.mu.Unlock()
+	c.MessageHandler = func(Message) error {
+		return assert.AnError
+	}
+
+	pc := &PartitionConsumer{
+		partitionID: 0,
+		consumer:    c,
+		fetchOffset: 6,
+		dataCh:      make(chan *messageBatch, 1),
+	}
+	c.wg.Add(1)
+	go pc.runWorker()
+	pc.dataCh <- &messageBatch{
+		topic: "test-topic",
+		messages: []Message{
+			{Offset: 3, Payload: "first"},
+			{Offset: 4, Payload: "second"},
+		},
+	}
+
+	select {
+	case <-c.rebalanceSig:
+	case <-time.After(time.Second):
+		t.Fatal("handler failure did not request a rebalance")
+	}
+	c.wg.Wait()
+
+	assert.Equal(t, uint64(3), atomic.LoadUint64(&pc.fetchOffset))
+	select {
+	case commit := <-c.commitCh:
+		t.Fatalf("handler failure unexpectedly queued commit: %+v", commit)
+	default:
+	}
+}

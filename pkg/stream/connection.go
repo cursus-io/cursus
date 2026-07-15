@@ -21,8 +21,8 @@ const (
 	StreamControlReasonOffsetOutOfRange = "offset_out_of_range"
 )
 
-// OffsetCommitter abstracts offset commit operations to break the
-// circular dependency between stream and coordinator packages.
+// OffsetCommitter is retained for source compatibility.
+// Deprecated: stream delivery never commits consumer offsets.
 type OffsetCommitter interface {
 	CommitOffset(group, topic string, partition int, offset uint64) error
 }
@@ -50,7 +50,6 @@ type StreamConnection struct {
 	keepaliveInterval time.Duration
 	newMessageCh      <-chan struct{} // signal from partition when new messages arrive
 
-	committer OffsetCommitter
 }
 
 // NewStreamConnection creates a new stream connection
@@ -82,11 +81,9 @@ func (sc *StreamConnection) SetInterval(interval time.Duration) {
 	sc.interval = interval
 }
 
-func (sc *StreamConnection) SetCommitter(c OffsetCommitter) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	sc.committer = c
-}
+// SetCommitter is retained for source compatibility.
+// Deprecated: stream delivery never commits consumer offsets.
+func (sc *StreamConnection) SetCommitter(OffsetCommitter) {}
 
 func (sc *StreamConnection) SetKeepaliveInterval(d time.Duration) {
 	sc.mu.Lock()
@@ -100,23 +97,19 @@ func (sc *StreamConnection) SetNewMessageCh(ch <-chan struct{}) {
 	sc.newMessageCh = ch
 }
 
+// Run accepts the legacy commit interval for source compatibility but ignores
+// it because delivery is not a processing acknowledgement.
 func (sc *StreamConnection) Run(
-	readFn func(offset uint64, max int) ([]types.Message, error),
-	commitInterval time.Duration,
+	readFn func(offset uint64, max int) ([]types.Message, error), _ time.Duration,
 ) {
 	defer func() {
-		if sc.committer != nil {
-			_ = sc.committer.CommitOffset(sc.group, sc.topic, sc.partition, sc.Offset())
-		}
 		sc.sendCloseControlFrame()
 		sc.closeConn()
 	}()
 
 	pollTicker := time.NewTicker(sc.interval)
-	commitTicker := time.NewTicker(commitInterval)
 	keepaliveTicker := time.NewTicker(sc.keepaliveInterval)
 	defer pollTicker.Stop()
-	defer commitTicker.Stop()
 	defer keepaliveTicker.Stop()
 
 	// sendMessages reads and sends available messages. Returns false on fatal error.
@@ -177,11 +170,6 @@ func (sc *StreamConnection) Run(
 		select {
 		case <-sc.stopCh:
 			return
-
-		case <-commitTicker.C:
-			if sc.committer != nil {
-				_ = sc.committer.CommitOffset(sc.group, sc.topic, sc.partition, sc.Offset())
-			}
 
 		case <-sc.newMessageCh:
 			if !sendMessages() {

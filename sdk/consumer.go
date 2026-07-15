@@ -585,12 +585,19 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 
+	c.mu.RLock()
 	mID := c.memberID
+	generation := c.generation
+	c.mu.RUnlock()
+	resuming := mID != "" && generation > 0
 	if mID == "" {
 		mID = c.config.ConsumerID
 	}
 
 	joinCmd := fmt.Sprintf("JOIN_GROUP topic=%s group=%s member=%s", c.config.Topic, c.config.GroupID, mID)
+	if resuming {
+		joinCmd += fmt.Sprintf(" generation=%d", generation)
+	}
 	if err := WriteWithLength(conn, EncodeMessage("", joinCmd)); err != nil {
 		return 0, "", nil, fmt.Errorf("send join: %w", err)
 	}
@@ -606,12 +613,30 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 		return 0, "", nil, fmt.Errorf("coordinator moved, retry")
 	}
 	if !strings.HasPrefix(respStr, "OK") {
+		if resuming && strings.Contains(respStr, "GEN_MISMATCH") {
+			currentText := parseOKFields(respStr)["current"]
+			current, parseErr := strconv.ParseInt(currentText, 10, 64)
+			if parseErr == nil {
+				assignments, syncErr := c.syncGroup(current, mID)
+				if syncErr == nil {
+					return current, mID, assignments, nil
+				}
+			}
+		}
+		if resuming && strings.Contains(respStr, "member_not_found") {
+			c.mu.Lock()
+			if c.memberID == mID {
+				c.memberID = ""
+				c.generation = 0
+			}
+			c.mu.Unlock()
+			return c.joinGroup()
+		}
 		return 0, "", nil, fmt.Errorf("join rejected: %s", respStr)
 	}
 
 	var gen int64
 	var mid string
-	var assigned []int
 
 	for _, part := range strings.Fields(respStr) {
 		if strings.HasPrefix(part, "generation=") {
@@ -621,21 +646,7 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 		}
 	}
 
-	if strings.Contains(respStr, "assignments=") {
-		start := strings.Index(respStr, "[")
-		end := strings.Index(respStr, "]")
-		if start != -1 && end != -1 {
-			partStr := strings.ReplaceAll(respStr[start+1:end], ",", " ")
-			for _, p := range strings.Fields(partStr) {
-				pid, err := strconv.Atoi(strings.TrimSpace(p))
-				if err == nil {
-					assigned = append(assigned, pid)
-				}
-			}
-		}
-	}
-
-	return gen, mid, assigned, nil
+	return gen, mid, parseGroupAssignments(respStr), nil
 }
 
 func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
@@ -666,18 +677,25 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	c.memberID = memberID
 	c.mu.Unlock()
 
-	var assigned []int
-	if strings.Contains(respStr, "[") && strings.Contains(respStr, "]") {
-		start := strings.Index(respStr, "[")
-		end := strings.Index(respStr, "]")
-		for _, p := range strings.Fields(respStr[start+1 : end]) {
-			var pid int
-			if _, err := fmt.Sscanf(p, "%d", &pid); err == nil {
-				assigned = append(assigned, pid)
-			}
+	return parseGroupAssignments(respStr), nil
+}
+
+func parseGroupAssignments(resp string) []int {
+	start := strings.Index(resp, "[")
+	end := strings.Index(resp, "]")
+	if start == -1 || end <= start {
+		return nil
+	}
+
+	partitionText := strings.ReplaceAll(resp[start+1:end], ",", " ")
+	assignments := make([]int, 0)
+	for _, field := range strings.Fields(partitionText) {
+		partition, err := strconv.Atoi(field)
+		if err == nil {
+			assignments = append(assignments, partition)
 		}
 	}
-	return assigned, nil
+	return assignments
 }
 
 func (c *Consumer) fetchOffsetWithRetry(partition int) (uint64, error) {
@@ -780,10 +798,14 @@ func (c *Consumer) Close() error {
 	close(c.commitCh)
 	c.commitWg.Wait()
 
-	if c.memberID != "" {
+	c.mu.RLock()
+	memberID := c.memberID
+	generation := c.generation
+	c.mu.RUnlock()
+	if memberID != "" && generation > 0 {
 		if conn, err := c.getCoordinatorConn(); err == nil {
-			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s",
-				c.config.Topic, c.config.GroupID, c.memberID)
+			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
+				c.config.Topic, c.config.GroupID, memberID, generation)
 			_ = WriteWithLength(conn, EncodeMessage("", leaveCmd))
 			_ = conn.Close()
 		}

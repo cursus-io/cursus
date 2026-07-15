@@ -249,17 +249,19 @@ sequenceDiagram
     C->>B1: FIND_COORDINATOR group=G1
     B1-->>C: OK host=B2 port=9002
 
-    C->>B2: JOIN_GROUP topic=T group=G1
-    B2-->>C: OK generation=1 assignments=[0,1]
+    C->>B2: JOIN_GROUP topic=T group=G1 member=M
+    B2-->>C: OK generation=1 member=M-1234 assignments=[0,1]
+    C->>B2: SYNC_GROUP topic=T group=G1 member=M-1234 generation=1
+    B2-->>C: OK generation=1 member=M-1234 assignments=[0,1]
 
-    C->>B2: HEARTBEAT group=G1
-    B2-->>C: OK
+    C->>B2: HEARTBEAT topic=T group=G1 member=M-1234 generation=1
+    B2-->>C: OK member=M-1234 generation=1
 
     Note over C,B3: If coordinator changes...
-    C->>B2: HEARTBEAT group=G1
+    C->>B2: HEARTBEAT topic=T group=G1 member=M-1234 generation=1
     B2-->>C: ERROR: NOT_COORDINATOR host=B3 port=9003
-    C->>B3: HEARTBEAT group=G1
-    B3-->>C: OK
+    C->>B3: HEARTBEAT topic=T group=G1 member=M-1234 generation=1
+    B3-->>C: OK member=M-1234 generation=1
 ```
 
 ### Partition Leader Routing

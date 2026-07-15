@@ -17,7 +17,7 @@ import (
 )
 
 type StreamManager interface {
-	AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), commitInterval time.Duration) error
+	AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), legacyCommitInterval time.Duration) error
 	RemoveStream(key string)
 	GetStreamsForPartition(topic string, partition int) []*stream.StreamConnection
 	StopStream(key string)
@@ -36,6 +36,10 @@ type TopicManager struct {
 // HandlerProvider defines an interface to provide disk handlers.
 type HandlerProvider interface {
 	GetHandler(topic string, partitionID int) (types.StorageHandler, error)
+}
+
+type existingPartitionProvider interface {
+	ExistingPartitionCount(topic string) (int, error)
 }
 
 type topicHandlerCloser interface {
@@ -103,6 +107,23 @@ func (tm *TopicManager) GetTopic(name string) *Topic {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 	return tm.topics[name]
+}
+
+// ExistingPartitionCount reports the partition count already known in memory or
+// persisted by the storage provider without creating new partitions.
+func (tm *TopicManager) ExistingPartitionCount(name string) (int, error) {
+	tm.mu.RLock()
+	if existing := tm.topics[name]; existing != nil {
+		count := len(existing.Partitions)
+		tm.mu.RUnlock()
+		return count, nil
+	}
+	provider := tm.hp
+	tm.mu.RUnlock()
+	if discovery, ok := provider.(existingPartitionProvider); ok {
+		return discovery.ExistingPartitionCount(name)
+	}
+	return 0, nil
 }
 
 func (tm *TopicManager) GetLastOffset(topicName string, partitionID int) uint64 {

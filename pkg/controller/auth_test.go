@@ -122,14 +122,19 @@ func TestPublicPublishCannotUseInternalTxnFlag(t *testing.T) {
 		t.Fatalf("expected public internal transaction publish to be rejected, got %q", resp)
 	}
 }
-func TestCommitOffsetOwnershipOnlyRequiresMemberGeneration(t *testing.T) {
+func TestCommitOffsetRequiresMemberGeneration(t *testing.T) {
 	cfg := config.DefaultConfig()
 	coord := coordinator.NewCoordinator(context.Background(), cfg, &dummyPublisher{})
 	ch := NewCommandHandler(nil, cfg, coord, nil, nil)
 
 	resp := ch.HandleCommand("COMMIT_OFFSET topic=t1 group=g1 partition=0 offset=1 validate_only=true ownership_only=true", NewClientContext("", 0))
-	if !strings.Contains(resp, "missing_ownership_params") {
-		t.Fatalf("expected missing ownership params, got %q", resp)
+	if !strings.Contains(resp, "missing_member") {
+		t.Fatalf("expected missing member, got %q", resp)
+	}
+
+	resp = ch.HandleCommand("COMMIT_OFFSET topic=t1 group=g1 partition=0 offset=1 member=m1 validate_only=true", NewClientContext("", 0))
+	if !strings.Contains(resp, "missing_generation") {
+		t.Fatalf("expected missing generation, got %q", resp)
 	}
 }
 

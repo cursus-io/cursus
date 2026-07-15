@@ -361,6 +361,8 @@ STREAM topic=<name> partition=<N> member=<id> group=<name> [isolation=<read_comm
 
 Opens a continuous stream. Server pushes binary batches at ~100ms intervals. The connection stays open until the client disconnects, the broker removes the stream, the stream times out, or an unrecoverable stream error occurs. Like `CONSUME`, `STREAM` is a stateless partition-leader data path and does not validate group ownership or generation on every read. `STREAM` uses the same `isolation` contract as `CONSUME`; the default is `read_committed`.
 
+Stream delivery never advances the consumer group's committed offset. Delivery to a TCP connection is not processing acknowledgement. After processing a batch, the client must explicitly send `COMMIT_OFFSET` or `BATCH_COMMIT` with its current member and generation.
+
 Keepalive: Server sends `[00 00 00 00]` (4 zero bytes as length prefix) when no messages are available. Clients MUST treat zero-length frames as keepalive and continue reading.
 
 Control frames: The broker may send UTF-8 text frames with the prefix `STREAM_CONTROL` on the same length-prefixed connection. Clients MUST inspect text control frames before binary batch decoding.

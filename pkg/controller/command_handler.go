@@ -276,6 +276,38 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 		return "ERROR: missing_member command=JOIN_GROUP"
 	}
 
+	if ch.isDistributed() {
+		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
+		}
+	}
+	if _, topicErr := ch.resolveGroupOffsetTopic(groupName, topicName); topicErr != "" {
+		return topicErr
+	}
+
+	if generationText := args["generation"]; generationText != "" {
+		generation, parseErr := strconv.Atoi(generationText)
+		if parseErr != nil {
+			return "ERROR: invalid_generation command=JOIN_GROUP"
+		}
+		if ch.Coordinator == nil {
+			return "ERROR: coordinator_not_available"
+		}
+		assignments, resumeErr := ch.Coordinator.ResumeConsumer(groupName, consumerID, generation)
+		if resumeErr != nil {
+			return formatCoordinatorError(resumeErr)
+		}
+		ctx.MemberID = consumerID
+		ctx.Generation = generation
+		return fmt.Sprintf(
+			"OK generation=%d member=%s assignments=%v resumed=true",
+			generation,
+			consumerID,
+			assignments,
+		)
+	}
+
 	n, err := rand.Int(rand.Reader, big.NewInt(10000))
 	var randSuffix string
 	if err != nil {
@@ -288,11 +320,6 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 
 	var assignments []int
 	if ch.isDistributed() {
-		coordAddr, isCoord := ch.checkCoordinator(groupName)
-		if !isCoord {
-			return notCoordinatorResponse(coordAddr)
-		}
-
 		joinPayload := map[string]interface{}{
 			"type":   "JOIN",
 			"group":  groupName,
@@ -369,12 +396,23 @@ func (ch *CommandHandler) handleSyncGroup(cmd string) string {
 			return notCoordinatorResponse(coordAddr)
 		}
 	}
-
-	assignments := ch.Coordinator.GetMemberAssignments(groupName, memberID)
-	if assignments == nil {
-		return fmt.Sprintf("ERROR: member_not_found member=%s group=%s", memberID, groupName)
+	if _, topicErr := ch.resolveGroupOffsetTopic(groupName, topicName); topicErr != "" {
+		return topicErr
 	}
-	return fmt.Sprintf("OK assignments=%v", assignments)
+
+	generationText := args["generation"]
+	if generationText == "" {
+		return "ERROR: missing_generation command=SYNC_GROUP"
+	}
+	generation, parseErr := strconv.Atoi(generationText)
+	if parseErr != nil {
+		return "ERROR: invalid_generation command=SYNC_GROUP"
+	}
+	assignments, syncErr := ch.Coordinator.ResumeConsumer(groupName, memberID, generation)
+	if syncErr != nil {
+		return formatCoordinatorError(syncErr)
+	}
+	return fmt.Sprintf("OK generation=%d member=%s assignments=%v", generation, memberID, assignments)
 }
 
 // handleLeaveGroup processes LEAVE_GROUP command
@@ -394,26 +432,47 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 		return "ERROR: missing_member command=LEAVE_GROUP"
 	}
 
+	generationText := args["generation"]
+	if generationText == "" {
+		return "ERROR: missing_generation command=LEAVE_GROUP"
+	}
+	generation, parseErr := strconv.Atoi(generationText)
+	if parseErr != nil {
+		return "ERROR: invalid_generation command=LEAVE_GROUP"
+	}
+	if ch.Coordinator == nil {
+		return "ERROR: coordinator_not_available"
+	}
+
 	if ch.isDistributed() {
 		coordAddr, isCoord := ch.checkCoordinator(groupName)
 		if !isCoord {
 			return notCoordinatorResponse(coordAddr)
 		}
 
+	}
+	if _, topicErr := ch.resolveGroupOffsetTopic(groupName, topicName); topicErr != "" {
+		return topicErr
+	}
+	if errResp := ch.Coordinator.ValidateMemberGeneration(groupName, consumerID, generation); errResp != "" {
+		return errResp
+	}
+	if ch.isDistributed() {
 		payload := map[string]interface{}{
-			"type":   "LEAVE",
-			"group":  groupName,
-			"member": consumerID,
+			"type":       "LEAVE",
+			"group":      groupName,
+			"member":     consumerID,
+			"generation": generation,
 		}
 
 		_, err := ch.applyViaLeader("GROUP_SYNC", payload)
 		if err != nil {
-			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
+			return formatReplicatedGroupError(err, "register_group_failed")
 		}
 	} else {
 		if ch.Coordinator != nil {
-			if err := ch.Coordinator.RemoveConsumer(groupName, consumerID); err != nil {
-				return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
+			if err := ch.Coordinator.RemoveConsumerForGeneration(groupName, consumerID, generation); err != nil {
+				return formatCoordinatorError(err)
 			}
 		}
 	}
@@ -578,30 +637,30 @@ func (ch *CommandHandler) handleHeartbeat(cmd string) string {
 	if ch.Coordinator == nil {
 		return "ERROR: coordinator_not_available"
 	}
+	if _, topicErr := ch.resolveGroupOffsetTopic(groupName, topicName); topicErr != "" {
+		return topicErr
+	}
 
-	generation := -1
-	if genStr := args["generation"]; genStr != "" {
-		parsed, parseErr := strconv.Atoi(genStr)
-		if parseErr != nil {
-			return "ERROR: invalid_generation command=HEARTBEAT"
-		}
-		generation = parsed
+	generationText := args["generation"]
+	if generationText == "" {
+		return "ERROR: missing_generation command=HEARTBEAT"
 	}
-	if errResp := ch.Coordinator.ValidateMemberGeneration(groupName, consumerID, generation); errResp != "" {
-		return errResp
+	generation, parseErr := strconv.Atoi(generationText)
+	if parseErr != nil {
+		return "ERROR: invalid_generation command=HEARTBEAT"
 	}
-	if err := ch.Coordinator.RecordHeartbeat(groupName, consumerID); err != nil {
+	if err := ch.Coordinator.RecordHeartbeatForGeneration(groupName, consumerID, generation); err != nil {
 		return formatCoordinatorError(err)
 	}
-	return fmt.Sprintf("OK member=%s generation=%d", consumerID, ch.Coordinator.GetGeneration(groupName))
+	return fmt.Sprintf("OK member=%s generation=%d", consumerID, generation)
 }
 
 // handleCommitOffset processes COMMIT_OFFSET command
 func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	args := parseKeyValueArgs(cmd[14:])
 	validateOnly := strings.EqualFold(args["validate_only"], "true")
-	ownershipOnly := strings.EqualFold(args["ownership_only"], "true")
 
+	ownershipOnly := strings.EqualFold(args["ownership_only"], "true")
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
 		return "ERROR: missing_topic command=COMMIT_OFFSET"
@@ -611,7 +670,7 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 		return "ERROR: missing_partition command=COMMIT_OFFSET"
 	}
 	partition, err := strconv.Atoi(partitionStr)
-	if err != nil {
+	if err != nil || partition < 0 {
 		return "ERROR: invalid_partition"
 	}
 	groupID, ok := args["group"]
@@ -639,21 +698,22 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	if ch.Coordinator == nil {
 		return "ERROR: offset_manager_not_available"
 	}
-	ownershipChecked := false
-	if memberID := args["member"]; memberID != "" || args["generation"] != "" {
-		generation, genErr := strconv.Atoi(args["generation"])
-		if genErr != nil {
-			return "ERROR: invalid_generation command=COMMIT_OFFSET"
-		}
-		if errResp := ch.Coordinator.ValidateOwnershipFailure(groupID, memberID, generation, partition); errResp != "" {
-			return errResp
-		}
-		ownershipChecked = true
+	memberID := args["member"]
+	if memberID == "" {
+		return "ERROR: missing_member command=COMMIT_OFFSET"
+	}
+	generationText := args["generation"]
+	if generationText == "" {
+		return "ERROR: missing_generation command=COMMIT_OFFSET"
+	}
+	generation, genErr := strconv.Atoi(generationText)
+	if genErr != nil {
+		return "ERROR: invalid_generation command=COMMIT_OFFSET"
+	}
+	if errResp := ch.Coordinator.ValidateOwnershipFailure(groupID, memberID, generation, partition); errResp != "" {
+		return errResp
 	}
 	if validateOnly && ownershipOnly {
-		if !ownershipChecked {
-			return "ERROR: missing_ownership_params command=COMMIT_OFFSET"
-		}
 		return "OK validated=true"
 	}
 	if current, ok := ch.Coordinator.GetOffset(groupID, offsetTopic, partition); ok && offset < current {
@@ -665,20 +725,22 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 
 	if ch.isDistributed() {
 		payload := map[string]interface{}{
-			"type":      "COMMIT",
-			"group":     groupID,
-			"topic":     offsetTopic,
-			"partition": partition,
-			"offset":    offset,
+			"type":       "COMMIT",
+			"group":      groupID,
+			"topic":      offsetTopic,
+			"member":     memberID,
+			"generation": generation,
+			"partition":  partition,
+			"offset":     offset,
 		}
 		_, err := ch.applyViaLeader("OFFSET_SYNC", payload)
 		if err != nil {
-			return fmt.Sprintf("ERROR: offset_sync_failed reason=%q", err.Error())
+			return formatReplicatedGroupError(err, "offset_sync_failed")
 		}
 		return "OK"
 	}
 
-	err = ch.Coordinator.CommitOffset(groupID, offsetTopic, partition, offset)
+	err = ch.Coordinator.ValidateAndCommit(groupID, offsetTopic, partition, offset, generation, memberID)
 	if err != nil {
 		return formatCoordinatorError(err)
 	}
@@ -702,7 +764,11 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 	if memberID == "" {
 		return "ERROR: missing_member command=BATCH_COMMIT"
 	}
-	generation, genErr := strconv.Atoi(args["generation"])
+	generationText := args["generation"]
+	if generationText == "" {
+		return "ERROR: missing_generation command=BATCH_COMMIT"
+	}
+	generation, genErr := strconv.Atoi(generationText)
 	if genErr != nil {
 		return "ERROR: invalid_generation command=BATCH_COMMIT"
 	}
@@ -731,24 +797,22 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 
 	var offsetList []coordinator.OffsetItem
 	for _, pair := range partitionPairs {
+		pair = strings.TrimSpace(pair)
 		kv := strings.Split(pair, ":")
 		if len(kv) != 2 {
-			continue
+			return fmt.Sprintf("ERROR: invalid_batch_commit_entry entry=%q", pair)
 		}
 		if !strings.HasPrefix(kv[0], "P") {
-			util.Warn("Invalid partition in batch commit: missing P prefix: %s", kv[0])
-			continue
+			return fmt.Sprintf("ERROR: invalid_partition entry=%q", pair)
 		}
 		partStr := strings.TrimPrefix(kv[0], "P")
 		p, err := strconv.Atoi(partStr)
-		if err != nil {
-			util.Warn("Invalid partition in batch commit: %s", kv[0])
-			continue
+		if err != nil || p < 0 {
+			return fmt.Sprintf("ERROR: invalid_partition entry=%q", pair)
 		}
 		o, err := strconv.ParseUint(kv[1], 10, 64)
 		if err != nil {
-			util.Warn("Invalid offset in batch commit: %s", kv[1])
-			continue
+			return fmt.Sprintf("ERROR: invalid_offset entry=%q", pair)
 		}
 		if errResp := ch.ValidateOwnershipFailure(groupID, memberID, generation, p); errResp != "" {
 			util.Warn("Batch commit ownership rejected for partition %d: %s", p, errResp)
@@ -764,18 +828,20 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 
 	if ch.isDistributed() {
 		batchCommitData := map[string]interface{}{
-			"type":    "BATCH_COMMIT",
-			"group":   groupID,
-			"topic":   offsetTopic,
-			"offsets": offsetList,
+			"type":       "BATCH_COMMIT",
+			"group":      groupID,
+			"topic":      offsetTopic,
+			"member":     memberID,
+			"generation": generation,
+			"offsets":    offsetList,
 		}
 		_, err := ch.applyViaLeader("BATCH_OFFSET", batchCommitData)
 		if err != nil {
 			util.Error("Raft batch apply failed: %v", err)
-			return fmt.Sprintf("ERROR: raft_batch_apply_failed reason=%q", err.Error())
+			return formatReplicatedGroupError(err, "raft_batch_apply_failed")
 		}
 	} else if ch.Coordinator != nil {
-		err := ch.Coordinator.CommitOffsetsBulk(groupID, offsetTopic, offsetList)
+		err := ch.Coordinator.ValidateAndCommitOffsetsBulk(groupID, offsetTopic, memberID, generation, offsetList)
 		if err != nil {
 			return formatCoordinatorError(err)
 		}
@@ -815,6 +881,14 @@ func resolveOffsetTopic(groupTopic, requestedTopic string) (string, bool) {
 		return groupTopic, true
 	}
 	return "", false
+}
+
+func formatReplicatedGroupError(err error, fallbackCode string) string {
+	msg := err.Error()
+	if idx := strings.Index(msg, "ERROR:"); idx >= 0 {
+		return msg[idx:]
+	}
+	return fmt.Sprintf("ERROR: %s reason=%q", fallbackCode, msg)
 }
 
 func formatCoordinatorError(err error) string {

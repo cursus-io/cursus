@@ -3,6 +3,7 @@ package disk
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +47,45 @@ func (dm *DiskManager) GetHandler(topic string, partitionID int) (types.StorageH
 
 	dm.handlers[key] = dh
 	return dh, nil
+}
+
+// ExistingPartitionCount discovers the highest persisted partition for a topic
+// without creating handlers or files.
+func (dm *DiskManager) ExistingPartitionCount(topic string) (int, error) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	entries, err := os.ReadDir(filepath.Join(dm.cfg.LogDir, topic))
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read topic directory: %w", err)
+	}
+
+	maxPartition := -1
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "partition_") {
+			continue
+		}
+		remainder := strings.TrimPrefix(name, "partition_")
+		separator := strings.Index(remainder, "_segment_")
+		if separator <= 0 || !strings.HasSuffix(name, ".log") {
+			continue
+		}
+		partition, parseErr := strconv.Atoi(remainder[:separator])
+		if parseErr != nil || partition < 0 {
+			continue
+		}
+		if partition > maxPartition {
+			maxPartition = partition
+		}
+	}
+	return maxPartition + 1, nil
 }
 
 // CloseAllHandlers should be implemented to ensure all DiskHandlers are closed properly

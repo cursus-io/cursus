@@ -105,10 +105,6 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 
 		cc = clusterController.NewClusterController(ctx, cfg, rm, sd, brokerID, localAddr)
 
-		if cd != nil {
-			cd.SetLeaderChecker(cc.IsLeader)
-		}
-
 		// Start background heartbeats to all cluster members
 		clusterClient.StartHeartbeat(ctx, cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort)
 
@@ -176,6 +172,9 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	startHealthCheckServer(healthPort, brokerReady)
 
 	globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
+	if cd != nil {
+		cd.SetGroupSessionCallbacks(globalCH.IsGroupCoordinator, globalCH.ExpireGroupMembers)
+	}
 	if cc != nil {
 		cc.SetLocalProcessor(globalCH)
 	}

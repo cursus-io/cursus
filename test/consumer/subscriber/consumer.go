@@ -1130,9 +1130,13 @@ func (c *Consumer) Close() error {
 	close(c.commitCh)
 	c.resetHeartbeatConn()
 
-	if c.memberID != "" {
+	c.mu.RLock()
+	memberID, generation := c.memberID, c.generation
+	c.mu.RUnlock()
+	if memberID != "" {
 		if conn, err := c.getCoordinatorConn(); err == nil {
-			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s", c.config.Topic, c.config.GroupID, c.memberID)
+			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
+				c.config.Topic, c.config.GroupID, memberID, generation)
 			_ = util.WriteWithLength(conn, util.EncodeMessage("", leaveCmd))
 			_ = conn.Close()
 		}

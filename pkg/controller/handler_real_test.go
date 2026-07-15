@@ -134,7 +134,7 @@ func TestCommandHandler_GroupCommands(t *testing.T) {
 		{"REGISTER_GROUP topic=topic1 group=g1", "coordinator_not_available"},
 		{"JOIN_GROUP topic=topic1 group=g1 member=m1", "coordinator_not_available"},
 		{"HEARTBEAT topic=topic1 group=g1 member=m1", "coordinator_not_available"},
-		{"LEAVE_GROUP topic=topic1 group=g1 member=m1", "left=true"},
+		{"LEAVE_GROUP topic=topic1 group=g1 member=m1 generation=1", "coordinator_not_available"},
 		{"COMMIT_OFFSET topic=topic1 partition=0 group=g1 offset=10", "offset_manager_not_available"},
 		{"FETCH_OFFSET topic=topic1 partition=0 group=g1", "offset_manager_not_available"},
 	}

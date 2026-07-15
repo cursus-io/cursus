@@ -19,8 +19,13 @@ func NewStreamManagerAdapter(sm *stream.StreamManager) (*StreamManagerAdapter, e
 	return &StreamManagerAdapter{sm: sm}, nil
 }
 
-func (a *StreamManagerAdapter) AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), commitInterval time.Duration) error {
-	return a.sm.AddStream(key, streamConn, readFn, commitInterval)
+func (a *StreamManagerAdapter) AddStream(
+	key string,
+	streamConn *stream.StreamConnection,
+	readFn func(offset uint64, max int) ([]types.Message, error),
+	legacyCommitInterval time.Duration,
+) error {
+	return a.sm.AddStream(key, streamConn, readFn, legacyCommitInterval)
 }
 
 func (a *StreamManagerAdapter) RemoveStream(key string) {

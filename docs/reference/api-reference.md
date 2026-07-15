@@ -212,6 +212,8 @@ STREAM_CONTROL type=CLOSE reason=<stopped|removed|timeout|error|offset_out_of_ra
 
 Clients must treat zero-length frames as keepalive. Like `CONSUME`, `STREAM` is a stateless partition-leader data path and does not validate group ownership or generation on every read. `STREAM` uses the same `isolation` contract as `CONSUME`; the default is `read_committed`. A `STREAM_CONTROL type=CLOSE` frame is a graceful terminator; `reason=offset_out_of_range` means the requested stream offset is older than the retained log. Clients should close the socket and resume through the consumer group offset contract or reset according to policy. Raw TCP disconnect without a close control frame remains possible on broker crash or network failure and should be treated as retryable.
 
+The broker does not commit offsets when records are written to a stream socket or when the stream closes. The client must commit the next offset explicitly after processing, using its current member and generation. This keeps stream delivery consistent with the at-least-once consumer-group contract.
+
 Common errors:
 
 ```text

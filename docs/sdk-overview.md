@@ -85,8 +85,10 @@ sequenceDiagram
     SDK->>ANY: FIND_COORDINATOR group=G
     ANY-->>SDK: OK host=H port=P
 
-    SDK->>COORD: JOIN_GROUP / SYNC_GROUP
-    COORD-->>SDK: OK assignments=[0,1,2]
+    SDK->>COORD: JOIN_GROUP topic=T group=G member=M
+    COORD-->>SDK: OK member=M-1234 generation=N assignments=[0,1,2]
+    SDK->>COORD: SYNC_GROUP topic=T group=G member=M-1234 generation=N
+    COORD-->>SDK: OK member=M-1234 generation=N assignments=[0,1,2]
 
     SDK->>ANY: METADATA topic=T
     ANY-->>SDK: OK leaders=L0,L1,L2
@@ -97,7 +99,7 @@ sequenceDiagram
     end
 
     loop Heartbeat
-        SDK->>COORD: HEARTBEAT
-        COORD-->>SDK: OK
+        SDK->>COORD: HEARTBEAT topic=T group=G member=M-1234 generation=N
+        COORD-->>SDK: OK member=M-1234 generation=N
     end
 ```

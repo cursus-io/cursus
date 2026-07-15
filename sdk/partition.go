@@ -85,12 +85,27 @@ func (pc *PartitionConsumer) runWorker() {
 
 		// Deliver messages to user handler.
 		handler := pc.consumer.MessageHandler
+		processingFailed := false
 		if handler != nil {
 			for _, msg := range batch.messages {
 				if err := handler(msg); err != nil {
 					LogError("Partition [%d] handler error at offset %d: %v", pc.partitionID, msg.Offset, err)
+					processingFailed = true
+					break
 				}
 			}
+		}
+		if processingFailed {
+			pc.consumer.mu.RLock()
+			committed := pc.consumer.offsets[pc.partitionID]
+			pc.consumer.mu.RUnlock()
+			atomic.StoreUint64(&pc.fetchOffset, committed)
+			pc.closeConnection()
+			select {
+			case pc.consumer.rebalanceSig <- struct{}{}:
+			default:
+			}
+			return
 		}
 
 		if pc.consumer.mainCtx.Err() != nil {
