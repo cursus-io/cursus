@@ -2,9 +2,11 @@ package sdk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -355,9 +357,14 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "BATCH_COMMIT topic=%s group=%s generation=%d member=%s ",
 		c.config.Topic, c.config.GroupID, generation, memberID)
-	parts := make([]string, 0, len(offsets))
-	for pid, off := range offsets {
-		parts = append(parts, fmt.Sprintf("P%d:%d", pid, off))
+	partitions := make([]int, 0, len(offsets))
+	for pid := range offsets {
+		partitions = append(partitions, pid)
+	}
+	sort.Ints(partitions)
+	parts := make([]string, 0, len(partitions))
+	for _, pid := range partitions {
+		parts = append(parts, fmt.Sprintf("P%d:%d", pid, offsets[pid]))
 	}
 	sb.WriteString(strings.Join(parts, ","))
 
@@ -385,7 +392,7 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 	}
 
 	respStr := string(resp)
-	if strings.HasPrefix(respStr, "OK") {
+	if hasOKStatus(respStr) {
 		return true
 	}
 
@@ -443,15 +450,19 @@ func (c *Consumer) directCommit(partition int, offset uint64) error {
 		return fmt.Errorf("direct commit response: %w", err)
 	}
 
-	respStr := string(resp)
-	if strings.Contains(respStr, "ERROR") {
+	respStr := strings.TrimSpace(string(resp))
+	if brokerErr, ok := ParseBrokerError(respStr); ok {
 		if c.handleNotCoordinator(respStr) {
-			return fmt.Errorf("coordinator moved: %s", respStr)
+			return brokerErr
 		}
-		if strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "NOT_OWNER") || strings.Contains(respStr, "member_not_found") {
+		switch strings.ToUpper(brokerErr.Code) {
+		case "GEN_MISMATCH", "NOT_OWNER", "REBALANCE_REQUIRED", "MEMBER_NOT_FOUND":
 			go c.handleRebalanceSignal()
 		}
-		return fmt.Errorf("direct commit error: %s", respStr)
+		return brokerErr
+	}
+	if !hasOKStatus(respStr) {
+		return fmt.Errorf("unexpected direct commit response: %s", respStr)
 	}
 	return nil
 }
@@ -491,7 +502,7 @@ func (c *Consumer) fetchMetadata() error {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if !strings.HasPrefix(respStr, "OK") {
+	if !hasOKStatus(respStr) {
 		return fmt.Errorf("metadata failed: %s", respStr)
 	}
 
@@ -612,9 +623,10 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 	if c.handleNotCoordinator(respStr) {
 		return 0, "", nil, fmt.Errorf("coordinator moved, retry")
 	}
-	if !strings.HasPrefix(respStr, "OK") {
-		if resuming && strings.Contains(respStr, "GEN_MISMATCH") {
-			currentText := parseOKFields(respStr)["current"]
+	if !hasOKStatus(respStr) {
+		brokerErr, hasBrokerErr := ParseBrokerError(respStr)
+		if resuming && hasBrokerErr && strings.EqualFold(brokerErr.Code, "GEN_MISMATCH") {
+			currentText := brokerErr.Fields["current"]
 			current, parseErr := strconv.ParseInt(currentText, 10, 64)
 			if parseErr == nil {
 				assignments, syncErr := c.syncGroup(current, mID)
@@ -623,7 +635,7 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 				}
 			}
 		}
-		if resuming && strings.Contains(respStr, "member_not_found") {
+		if resuming && hasBrokerErr && strings.EqualFold(brokerErr.Code, "member_not_found") {
 			c.mu.Lock()
 			if c.memberID == mID {
 				c.memberID = ""
@@ -668,7 +680,7 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if !strings.HasPrefix(respStr, "OK") {
+	if !hasOKStatus(respStr) {
 		return nil, fmt.Errorf("sync rejected: %s", respStr)
 	}
 
@@ -745,40 +757,46 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if c.handleNotCoordinator(respStr) {
-		return 0, fmt.Errorf("NOT_COORDINATOR during fetch offset")
+	if brokerErr, ok := ParseBrokerError(respStr); ok {
+		_ = c.handleNotCoordinator(respStr)
+		return 0, brokerErr
 	}
 	return parseFetchOffsetResponse(respStr)
 }
 
 func isRetryableFetchOffsetError(err error) bool {
-	if err == nil {
+	var brokerErr *BrokerError
+	if !errors.As(err, &brokerErr) {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "group_not_found") ||
-		strings.Contains(msg, "member_not_found") ||
-		strings.Contains(msg, "NOT_COORDINATOR")
+	if brokerErr.Retryable {
+		return true
+	}
+	switch strings.ToLower(brokerErr.Code) {
+	case "group_not_found", "member_not_found", "not_coordinator":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseFetchOffsetResponse(respStr string) (uint64, error) {
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return 0, fmt.Errorf("fetch offset broker error: %s", respStr)
+	if brokerErr, ok := ParseBrokerError(respStr); ok {
+		return 0, brokerErr
 	}
-
-	if !strings.HasPrefix(respStr, "OK") {
+	fields, err := parseOKResponse(respStr)
+	if err != nil {
 		return 0, fmt.Errorf("unexpected offset response: %s", respStr)
 	}
-	for _, part := range strings.Fields(respStr) {
-		if strings.HasPrefix(part, "offset=") {
-			offset, err := strconv.ParseUint(strings.TrimPrefix(part, "offset="), 10, 64)
-			if err != nil {
-				return 0, fmt.Errorf("invalid offset response: %s", respStr)
-			}
-			return offset, nil
-		}
+	offsetValue := fields["offset"]
+	if offsetValue == "" {
+		return 0, fmt.Errorf("missing offset in response: %s", respStr)
 	}
-	return 0, fmt.Errorf("missing offset in response: %s", respStr)
+	offset, err := strconv.ParseUint(offsetValue, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid offset response: %s", respStr)
+	}
+	return offset, nil
 }
 
 // ─── Close ────────────────────────────────────────────────────────────────────
@@ -879,18 +897,15 @@ func (c *Consumer) findCoordinator() (string, error) {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if !strings.HasPrefix(respStr, "OK") {
+	if brokerErr, ok := ParseBrokerError(respStr); ok {
+		return "", brokerErr
+	}
+	fields, err := parseOKResponse(respStr)
+	if err != nil {
 		return "", fmt.Errorf("find_coordinator failed: %s", respStr)
 	}
 
-	var host, port string
-	for _, part := range strings.Fields(respStr) {
-		if strings.HasPrefix(part, "host=") {
-			host = strings.TrimPrefix(part, "host=")
-		} else if strings.HasPrefix(part, "port=") {
-			port = strings.TrimPrefix(part, "port=")
-		}
-	}
+	host, port := fields["host"], fields["port"]
 	if host == "" || port == "" {
 		return "", fmt.Errorf("find_coordinator: missing host/port in response: %s", respStr)
 	}
@@ -945,17 +960,11 @@ func isLoopbackCoordinatorHost(host string) bool {
 }
 
 func (c *Consumer) handleNotCoordinator(respStr string) bool {
-	if !strings.Contains(respStr, "NOT_COORDINATOR") {
+	brokerErr, ok := ParseBrokerError(strings.TrimSpace(respStr))
+	if !ok || !strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
 		return false
 	}
-	var host, port string
-	for _, part := range strings.Fields(respStr) {
-		if strings.HasPrefix(part, "host=") {
-			host = strings.TrimPrefix(part, "host=")
-		} else if strings.HasPrefix(part, "port=") {
-			port = strings.TrimPrefix(part, "port=")
-		}
-	}
+	host, port := brokerErr.Fields["host"], brokerErr.Fields["port"]
 	if host != "" && port != "" {
 		newAddr := c.coordinatorAddrFromHostPort(host, port)
 		c.mu.Lock()

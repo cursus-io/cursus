@@ -166,8 +166,8 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	memberID, generation := c.memberID, c.generation
 	c.mu.RUnlock()
 
-	consumeCmd := fmt.Sprintf("CONSUME topic=%s partition=%d offset=%d group=%s generation=%d member=%s batch=%d",
-		c.config.Topic, pc.partitionID, currentOffset, c.config.GroupID, generation, memberID, effectivePollBatchSize(c.config))
+	consumeCmd := fmt.Sprintf("CONSUME topic=%s partition=%d offset=%d group=%s generation=%d member=%s%s batch=%d",
+		c.config.Topic, pc.partitionID, currentOffset, c.config.GroupID, generation, memberID, autoOffsetResetArgument(c.config.AutoOffsetReset), effectivePollBatchSize(c.config))
 
 	if err := WriteWithLength(conn, EncodeMessage("", consumeCmd)); err != nil {
 		LogError("Partition [%d] send CONSUME failed: %v", pc.partitionID, err)
@@ -291,8 +291,8 @@ func (pc *PartitionConsumer) startStreamLoop() {
 		memberID, generation := c.memberID, c.generation
 		c.mu.RUnlock()
 
-		streamCmd := fmt.Sprintf("STREAM topic=%s partition=%d group=%s offset=%d generation=%d member=%s batch=%d",
-			c.config.Topic, pid, c.config.GroupID, currentOffset, generation, memberID, effectiveStreamBatchSize(c.config))
+		streamCmd := fmt.Sprintf("STREAM topic=%s partition=%d group=%s offset=%d generation=%d member=%s%s batch=%d",
+			c.config.Topic, pid, c.config.GroupID, currentOffset, generation, memberID, autoOffsetResetArgument(c.config.AutoOffsetReset), effectiveStreamBatchSize(c.config))
 
 		if err := WriteWithLength(conn, EncodeMessage("", streamCmd)); err != nil {
 			LogError("Partition [%d] STREAM send failed: %v", pid, err)
@@ -814,5 +814,18 @@ func (pc *PartitionConsumer) closeConnection() {
 	if pc.conn != nil {
 		_ = pc.conn.Close()
 		pc.conn = nil
+	}
+}
+
+func autoOffsetResetArgument(policy AutoOffsetResetPolicy) string {
+	switch policy {
+	case AutoOffsetResetLatest:
+		return " autoOffsetReset=latest"
+	case AutoOffsetResetError:
+		return ""
+	case "", AutoOffsetResetEarliest:
+		return " autoOffsetReset=earliest"
+	default:
+		return " autoOffsetReset=earliest"
 	}
 }
