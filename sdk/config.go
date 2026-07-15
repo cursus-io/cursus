@@ -39,6 +39,9 @@ type PublisherConfig struct {
 	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
 	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
 
+	Principal string `yaml:"principal" json:"principal"`
+	AuthToken string `yaml:"auth_token" json:"auth_token"`
+
 	ProtocolVersion              int      `yaml:"protocol_version" json:"protocol_version"`
 	ProtocolFeatures             []string `yaml:"protocol_features" json:"protocol_features"`
 	RequireProtocolFeatures      bool     `yaml:"require_protocol_features" json:"require_protocol_features"`
@@ -137,6 +140,9 @@ type ConsumerConfig struct {
 	UseTLS      bool   `yaml:"use_tls" json:"use_tls"`
 	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
 	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
+
+	Principal string `yaml:"principal" json:"principal"`
+	AuthToken string `yaml:"auth_token" json:"auth_token"`
 
 	ProtocolVersion              int      `yaml:"protocol_version" json:"protocol_version"`
 	ProtocolFeatures             []string `yaml:"protocol_features" json:"protocol_features"`

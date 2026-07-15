@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -292,18 +293,14 @@ func TestParseFetchOffsetResponse_StrictContract(t *testing.T) {
 }
 
 func TestIsRetryableFetchOffsetError(t *testing.T) {
-	assert.True(t, isRetryableFetchOffsetError(&fetchOffsetTestError{msg: "fetch offset broker error: ERROR: NOT_COORDINATOR host=broker-2 port=9000"}))
-	assert.True(t, isRetryableFetchOffsetError(&fetchOffsetTestError{msg: "fetch offset broker error: ERROR: group_not_found group=g1"}))
-	assert.True(t, isRetryableFetchOffsetError(&fetchOffsetTestError{msg: "fetch offset broker error: ERROR: member_not_found member=m1"}))
-	assert.False(t, isRetryableFetchOffsetError(&fetchOffsetTestError{msg: "fetch offset broker error: ERROR: offset_manager_not_available"}))
+	assert.True(t, isRetryableFetchOffsetError(&BrokerError{Code: "NOT_COORDINATOR"}))
+	assert.True(t, isRetryableFetchOffsetError(&BrokerError{Code: "group_not_found"}))
+	assert.True(t, isRetryableFetchOffsetError(&BrokerError{Code: "member_not_found"}))
+	assert.True(t, isRetryableFetchOffsetError(&BrokerError{Code: "broker_busy", Retryable: true}))
+	assert.False(t, isRetryableFetchOffsetError(&BrokerError{Code: "offset_manager_not_available"}))
+	assert.False(t, isRetryableFetchOffsetError(errors.New("NOT_COORDINATOR in unstructured text")))
 	assert.False(t, isRetryableFetchOffsetError(nil))
 }
-
-type fetchOffsetTestError struct {
-	msg string
-}
-
-func (e *fetchOffsetTestError) Error() string { return e.msg }
 
 func TestParseListOffsetsResponse(t *testing.T) {
 	ranges, err := parseListOffsetsResponse("OK topic=t partitions=2 offsets=P0:earliest=0:latest=10:leo=12:hwm=11,P1:earliest=3:latest=7:leo=8:hwm=7")

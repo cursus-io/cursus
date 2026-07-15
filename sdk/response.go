@@ -15,3 +15,8 @@ func parseOKFields(resp string) map[string]string {
 	}
 	return out
 }
+
+func hasOKStatus(resp string) bool {
+	fields := strings.Fields(strings.TrimSpace(resp))
+	return len(fields) > 0 && fields[0] == "OK"
+}

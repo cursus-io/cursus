@@ -72,6 +72,8 @@ flowchart TB
 | Partition Leader Routing | ✅ | ✅ | ✅ |
 | Protocol capability negotiation | ✅ | pending | pending |
 | Typed structured broker errors | ✅ | pending | pending |
+| Broker-managed transactions | ✅ | pending | pending |
+| Connection authentication | ✅ | pending | pending |
 | Framework Integration | — | Spring Boot | FastAPI |
 | Iterator Pattern | — | — | ✅ for/async for |
 
@@ -130,3 +132,88 @@ if errors.As(err, &brokerErr) {
 ```
 
 `BrokerError` exposes `Code`, `Class`, `Retryable`, `Fields`, and the raw response. It also remains compatible with existing Go SDK sentinels such as `ErrTopicNotFound`, `ErrInvalidPartition`, and `ErrNotLeader` through `errors.Is`.
+
+## Go Transactional Producer
+
+The Go SDK exposes both the existing low-level transaction commands and a
+session-preserving `TransactionalProducer`:
+
+```go
+cfg := sdk.NewDefaultConsumerConfig()
+cfg.BrokerAddrs = []string{"broker-1:9000", "broker-2:9000"}
+
+client, err := sdk.NewConsumerClient(cfg)
+if err != nil {
+    return err
+}
+producer, err := client.NewTransactionalProducer("game-server-events")
+if err != nil {
+    return err
+}
+if err := producer.Begin(); err != nil {
+    return err
+}
+if err := producer.Publish("events", -1, sdk.Message{
+    SeqNum:  1,
+    Key:     "match-42",
+    Payload: payload,
+}); err != nil {
+    _ = producer.Abort()
+    return err
+}
+if err := producer.SendOffsets(
+    "events",
+    groupID,
+    memberID,
+    generation,
+    map[int]uint64{partition: lastProcessedOffset + 1},
+); err != nil {
+    _ = producer.Abort()
+    return err
+}
+return producer.Commit()
+```
+
+The broker allocates and fences the producer ID and epoch. The high-level
+producer retains that session across reconnects and serializes lifecycle calls.
+`NOT_COORDINATOR` responses update a per-transaction coordinator cache and are
+retried with a bounded delay. Fencing, authorization, validation, and ambiguous
+network failures are returned to the caller as errors rather than retried.
+
+`Commit` and `Abort` may be called again with the same session after an
+uncertain response. The broker is authoritative for final transaction state;
+`Describe` returns the typed state, message count, and offset count.
+
+## Go Consumer Resume Contract
+
+The Go consumer fetches the broker-owned committed `nextOffset` after
+assignment and rejoin. Applications that commit after processing should commit
+`lastProcessedOffset + 1`. Reconnects roll back the local fetch position to the
+last broker-committed offset, providing at-least-once processing.
+
+`AutoOffsetResetEarliest` and `AutoOffsetResetLatest` are sent as
+`autoOffsetReset=earliest|latest` in polling and streaming commands.
+`AutoOffsetResetError` leaves reset selection disabled and surfaces an
+out-of-range condition.
+
+The current broker data path is committed-only: transactional records remain
+hidden until a commit marker is durable, open transactions form the visibility
+boundary, and aborted records are skipped. The Go SDK does not expose a
+`read_uncommitted` option because that is not part of the current broker wire
+contract.
+
+## Go Client Authentication
+
+Publisher and consumer configs accept connection credentials:
+
+```go
+cfg.Principal = "game-server"
+cfg.AuthToken = os.Getenv("CURSUS_AUTH_TOKEN")
+```
+
+When both fields are set, every new or reconnected SDK connection performs
+`AUTH principal=<principal> token=<token>` after protocol negotiation and
+before application commands. The two fields must be configured together.
+Authentication and authorization failures are returned as typed
+`*sdk.BrokerError` values. TLS remains required when credentials cross an
+untrusted network.

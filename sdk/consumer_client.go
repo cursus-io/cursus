@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,10 +20,11 @@ type consumerLeaderInfo struct {
 
 // ConsumerClient manages broker connections with leader-aware failover.
 type ConsumerClient struct {
-	ID        string
-	config    *ConsumerConfig
-	leader    atomic.Pointer[consumerLeaderInfo]
-	tlsConfig *tls.Config
+	ID                      string
+	config                  *ConsumerConfig
+	leader                  atomic.Pointer[consumerLeaderInfo]
+	tlsConfig               *tls.Config
+	transactionCoordinators sync.Map // transactional_id -> advertised client address
 }
 
 func NewConsumerClient(cfg *ConsumerConfig) (*ConsumerClient, error) {
@@ -92,6 +94,10 @@ func (c *ConsumerClient) Connect(addr string) (net.Conn, error) {
 	if err := negotiateConfiguredProtocol(conn, c.config.ProtocolVersion, c.config.ProtocolFeatures, c.config.RequireProtocolFeatures, c.config.ProtocolNegotiationTimeoutMS); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("protocol negotiation with %s failed: %w", addr, err)
+	}
+	if err := authenticateConfiguredClient(conn, c.config.Principal, c.config.AuthToken); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("authenticate with %s: %w", addr, err)
 	}
 	return conn, nil
 }

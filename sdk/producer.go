@@ -145,6 +145,10 @@ func (p *Producer) fetchMetadata() {
 			_ = conn.Close()
 			continue
 		}
+		if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {
+			_ = conn.Close()
+			continue
+		}
 		cmd := fmt.Sprintf("METADATA topic=%s", p.config.Topic)
 		if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
 			_ = conn.Close()
@@ -200,6 +204,9 @@ func (p *Producer) CreateTopic(topic string, partitions int) error {
 
 	if err := negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS); err != nil {
 		return fmt.Errorf("protocol negotiation: %w", err)
+	}
+	if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {
+		return fmt.Errorf("authentication: %w", err)
 	}
 	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, partitions, p.config.EnableIdempotence)
 	cmdBytes := EncodeMessage("admin", createCmd)
