@@ -132,6 +132,56 @@ func (d *DiskHandler) validIndexPrefix(f *os.File, fileSize uint64) (uint64, uin
 	return validBytes, lastPosition
 }
 
+func (d *DiskHandler) seekLastValidIndexEntry(f *os.File, fileSize uint64) uint64 {
+	const entrySize = uint64(types.IndexEntrySize)
+	if fileSize < entrySize {
+		return 0
+	}
+
+	const scanBlockSize = uint64(64 * 1024)
+	end := fileSize - fileSize%entrySize
+	for end > 0 {
+		start := uint64(0)
+		if end > scanBlockSize {
+			start = end - scanBlockSize
+		}
+		start -= start % entrySize
+		if start > math.MaxInt64 || end-start > math.MaxInt {
+			return 0
+		}
+
+		buf := make([]byte, int(end-start))
+		n, err := f.ReadAt(buf, int64(start))
+		if err != nil && n == 0 {
+			return 0
+		}
+		usable := n - n%int(entrySize)
+		for pos := usable - int(entrySize); pos >= 0; pos -= int(entrySize) {
+			entry := buf[pos : pos+int(entrySize)]
+			if binary.BigEndian.Uint64(entry[0:8]) != 0 || binary.BigEndian.Uint64(entry[8:16]) != 0 {
+				return start + uint64(pos) + entrySize
+			}
+		}
+		end = start
+	}
+	return 0
+}
+
+func getLastOffsetFromIndex(indexPath string, baseOffset uint64) (lastOffset uint64, count int, err error) {
+	entry, found := lastUsableIndexEntry(indexPath, math.MaxUint64)
+	if !found {
+		return 0, 0, fmt.Errorf("index empty (contains only zeros)")
+	}
+	if entry.Offset < baseOffset {
+		return 0, 0, fmt.Errorf("index empty or corrupt")
+	}
+	diff := entry.Offset - baseOffset + 1
+	if diff > math.MaxInt {
+		return 0, 0, fmt.Errorf("offset range too large: %d", diff)
+	}
+	return entry.Offset, int(diff), nil
+}
+
 func lastUsableIndexEntry(indexPath string, logSize uint64) (types.IndexEntry, bool) {
 	// #nosec G304 -- indexPath is derived from the broker-owned log directory.
 	f, err := os.Open(indexPath)
