@@ -4,9 +4,11 @@ import "fmt"
 
 type StorageHandler interface {
 	ReadMessages(offset uint64, max int) ([]Message, error)
+	// GetFirstOffset returns the earliest retained offset.
 	GetFirstOffset() uint64
 	GetAbsoluteOffset() uint64
 	GetFlushedOffset() uint64
+	// GetLatestOffset returns the next offset that can be assigned, not the last record offset.
 	GetLatestOffset() uint64
 	GetSegmentPath(baseOffset uint64) string
 

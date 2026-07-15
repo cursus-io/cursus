@@ -56,6 +56,11 @@ type DiskHandler struct {
 	segmentRollTime  time.Duration
 	segmentCreatedAt time.Time
 
+	retentionMu         sync.RWMutex
+	retentionDefaults   retentionLimits
+	retentionPolicy     retentionLimits
+	retentionConfigured bool
+
 	mu   sync.Mutex // metadata(offset, segment), file handler(d.file)
 	ioMu sync.Mutex // bufio.Writer, flush
 
@@ -92,13 +97,17 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 	}
 
 	tempDh := &DiskHandler{BaseName: base}
+	if err := cleanupDeletedSegments(base); err != nil {
+		return nil, fmt.Errorf("cleanup deleted segment tombstones: %w", err)
+	}
 	pattern := base + "_segment_*.log"
 	files, _ := filepath.Glob(pattern)
 	sort.Strings(files)
 
-	var lastAbsoluteOffset uint64
 	var currentSegmentBase uint64
+	var err error
 	prefix := fmt.Sprintf("partition_%d_segment_", partitionID)
+	var recovery segmentRecovery
 
 	if len(files) > 0 {
 		lastFile := files[len(files)-1]
@@ -106,26 +115,14 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 
 		if strings.HasPrefix(fileName, prefix) {
 			numStr := fileName[len(prefix) : len(fileName)-4]
-
-			var err error
 			currentSegmentBase, err = strconv.ParseUint(numStr, 10, 64)
 			if err != nil {
 				return nil, fmt.Errorf("critical: failed to parse last segment filename %s: %w", fileName, err)
 			}
 		}
-
-		indexPath := tempDh.GetIndexPath(currentSegmentBase)
-		lastOffset, _, err := getLastOffsetFromIndex(indexPath, currentSegmentBase)
-		if err == nil {
-			lastAbsoluteOffset = lastOffset + 1
-		} else {
-			c, countErr := countMessagesInFile(lastFile) // fallback
-			if countErr != nil {
-				util.Error("failed to count messages in last segment %s: %v", lastFile, countErr)
-			}
-			if c >= 0 {
-				lastAbsoluteOffset = currentSegmentBase + uint64(c)
-			}
+		recovery, err = recoverActiveSegment(lastFile, tempDh.GetIndexPath(currentSegmentBase), currentSegmentBase)
+		if err != nil {
+			return nil, fmt.Errorf("recover active segment %s: %w", lastFile, err)
 		}
 	}
 
@@ -134,15 +131,9 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 	if err != nil {
 		return nil, err
 	}
-
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("failed to stat file: %w", err)
+	if len(files) == 0 {
+		recovery.nextOffset = currentSegmentBase
 	}
-	if fileInfo.Size() < 0 {
-		return nil, fmt.Errorf("negative file size: %d", fileInfo.Size())
-	}
-	currentOffset := uint64(fileInfo.Size())
 
 	dh := &DiskHandler{
 		BaseName:       base,
@@ -150,9 +141,9 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 		IndexSize:      uint64(cfg.IndexSize),
 		CurrentSegment: currentSegmentBase,
 		segments:       make([]uint64, 0),
-		CurrentOffset:  currentOffset,
-		AbsoluteOffset: lastAbsoluteOffset,
-		FlushedOffset:  lastAbsoluteOffset,
+		CurrentOffset:  recovery.validBytes,
+		AbsoluteOffset: recovery.nextOffset,
+		FlushedOffset:  recovery.nextOffset,
 
 		indexInterval: safeIntToUint64(cfg.IndexIntervalBytes),
 
@@ -164,10 +155,16 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 		writeTimeout:   time.Duration(cfg.DiskWriteTimeoutMS) * time.Millisecond,
 		syncIntervalMS: cfg.DiskFlushIntervalMS,
 
-		segmentRollTime:  time.Duration(cfg.SegmentRollTimeMS) * time.Millisecond,
-		segmentCreatedAt: time.Now(),
-		file:             file,
-		writer:           bufio.NewWriter(file),
+		segmentRollTime:     time.Duration(cfg.SegmentRollTimeMS) * time.Millisecond,
+		segmentCreatedAt:    time.Now(),
+		retentionDefaults:   retentionLimits{hours: cfg.RetentionHours, bytes: cfg.RetentionBytes},
+		retentionPolicy:     retentionLimits{hours: cfg.RetentionHours, bytes: cfg.RetentionBytes},
+		retentionConfigured: true,
+		file:                file,
+		writer:              bufio.NewWriter(file),
+	}
+	if recovery.modTime != 0 {
+		dh.segmentCreatedAt = time.Unix(0, recovery.modTime)
 	}
 
 	if err := dh.openIndexFiles(); err != nil {
@@ -210,44 +207,6 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 	}()
 
 	return dh, nil
-}
-
-func countMessagesInFile(filePath string) (int, error) {
-	reader, err := mmap.Open(filePath)
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		if err := reader.Close(); err != nil {
-			util.Error("failed to close: %v", err)
-		}
-	}()
-
-	count := 0
-	pos := 0
-	for pos+4 <= reader.Len() {
-		lenBytes := make([]byte, 4)
-		_, err := reader.ReadAt(lenBytes, int64(pos))
-		if err != nil {
-			return count, fmt.Errorf("failed to read length at pos %d: %w", pos, err)
-		}
-
-		msgLen := binary.BigEndian.Uint32(lenBytes)
-		if msgLen == 0 || msgLen > MaxMessageSize {
-			util.Error("Corrupted data: invalid msgLen %d at pos %d", msgLen, pos)
-			break
-		}
-
-		if pos+4+int(msgLen) > reader.Len() {
-			util.Error("⚠️ Incomplete message at pos %d in %s (expected %d bytes, file ends at %d)",
-				pos, filePath, msgLen, reader.Len())
-			break
-		}
-
-		pos += 4 + int(msgLen)
-		count++
-	}
-	return count, nil
 }
 
 func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.Message) (uint64, error) {
@@ -339,13 +298,16 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 	atomic.AddInt32(&dh.activeReaders, 1)
 	defer atomic.AddInt32(&dh.activeReaders, -1)
 
+	if max <= 0 {
+		return nil, nil
+	}
 	_, targetSeg, err := dh.findSegmentForOffset(offset)
 	if err != nil {
 		util.Error("Segment not found for offset %d", offset)
 		return nil, err
 	}
 
-	position, err := dh.findOffsetPosition(offset)
+	position, err := dh.findOffsetPosition(offset, targetSeg)
 	if err != nil {
 		util.Error("Position not found for offset %d", offset)
 		return nil, err
@@ -374,8 +336,7 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 		currentFile := dh.GetSegmentPath(segBase)
 		fi, err := os.Stat(currentFile)
 		if err != nil {
-			util.Debug("stat failed for %s: %v", currentFile, err)
-			continue
+			return nil, fmt.Errorf("stat segment %d: %w", segBase, err)
 		}
 
 		actualSize := fi.Size()
@@ -386,8 +347,7 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 
 		reader, err := mmap.Open(currentFile)
 		if err != nil {
-			util.Debug("mmap open failed: %v", err)
-			continue
+			return nil, fmt.Errorf("open segment %d: %w", segBase, err)
 		}
 
 		remaining := max - len(messages)
@@ -396,7 +356,11 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 			readPos = position
 		}
 
-		batch := dh.readMessagesFromPosition(reader, readPos, remaining, offset)
+		batch, readErr := dh.readMessagesFromPosition(reader, readPos, remaining, offset, segBase == dh.CurrentSegment)
+		if readErr != nil {
+			_ = reader.Close()
+			return nil, fmt.Errorf("read segment %d: %w", segBase, readErr)
+		}
 		if len(batch) == 0 && actualSize > 0 && uint64(actualSize) > readPos+4 {
 			if err := reader.Close(); err != nil {
 				util.Debug("error closing reader: %v", err)
@@ -405,11 +369,14 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 			var reErr error
 			reader, reErr = mmap.Open(currentFile)
 			if reErr != nil {
-				util.Error("mmap re-open failed for %s: %v", currentFile, reErr)
-				continue
+				return nil, fmt.Errorf("reopen segment %d: %w", segBase, reErr)
 			}
 
-			batch = dh.readMessagesFromPosition(reader, readPos, remaining, offset)
+			batch, readErr = dh.readMessagesFromPosition(reader, readPos, remaining, offset, segBase == dh.CurrentSegment)
+			if readErr != nil {
+				_ = reader.Close()
+				return nil, fmt.Errorf("reread segment %d: %w", segBase, readErr)
+			}
 		}
 
 		messages = append(messages, batch...)
@@ -434,29 +401,32 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 }
 
 // readMessagesFromPosition reads messages starting from a specific byte position
-func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position uint64, max int, targetOffset uint64) []types.Message {
+func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position uint64, max int, targetOffset uint64, allowPartialTail bool) ([]types.Message, error) {
 	if position > math.MaxInt {
-		return nil
+		return nil, fmt.Errorf("read position %d exceeds int range", position)
 	}
 	messages := make([]types.Message, 0, max)
 	pos := int(position)
 	var lenBuf [4]byte
 	var dataBuf []byte
+	var previousOffset uint64
+	havePreviousOffset := false
 
 	for len(messages) < max && pos+4 <= reader.Len() {
 		if _, err := reader.ReadAt(lenBuf[:], int64(pos)); err != nil {
-			break
+			return nil, fmt.Errorf("read length at byte %d: %w", pos, err)
 		}
 
 		msgLen := binary.BigEndian.Uint32(lenBuf[:])
 		if msgLen == 0 || msgLen > MaxMessageSize {
-			util.Error("Corrupted message length detected at pos %d: %d bytes (limit: %d)", pos, msgLen, MaxMessageSize)
-			break
+			return nil, fmt.Errorf("corrupt message length %d at byte %d", msgLen, pos)
 		}
 
 		if pos+4+int(msgLen) > reader.Len() {
-			util.Error("Incomplete message at pos %d: expected %d bytes but reached EOF", pos, msgLen)
-			break
+			if allowPartialTail {
+				return messages, nil
+			}
+			return nil, fmt.Errorf("truncated message at byte %d: expected %d payload bytes", pos, msgLen)
 		}
 
 		if cap(dataBuf) < int(msgLen) {
@@ -465,15 +435,18 @@ func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position 
 			dataBuf = dataBuf[:msgLen]
 		}
 		if _, err := reader.ReadAt(dataBuf, int64(pos+4)); err != nil {
-			break
+			return nil, fmt.Errorf("read payload at byte %d: %w", pos, err)
 		}
 
 		diskMsg, err := util.DeserializeDiskMessage(dataBuf)
 		if err != nil {
-			util.Error("failed to deserialize disk message at pos %d: %v", pos, err)
-			pos += 4 + int(msgLen)
-			continue
+			return nil, fmt.Errorf("decode message at byte %d: %w", pos, err)
 		}
+		if havePreviousOffset && diskMsg.Offset != previousOffset+1 {
+			return nil, fmt.Errorf("non-contiguous offset at byte %d: got %d after %d", pos, diskMsg.Offset, previousOffset)
+		}
+		previousOffset = diskMsg.Offset
+		havePreviousOffset = true
 
 		if diskMsg.Offset < targetOffset {
 			pos += 4 + int(msgLen)
@@ -502,7 +475,13 @@ func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position 
 		})
 		pos += 4 + int(msgLen)
 	}
-	return messages
+	if len(messages) < max && pos < reader.Len() {
+		if allowPartialTail {
+			return messages, nil
+		}
+		return nil, fmt.Errorf("truncated record length at byte %d", pos)
+	}
+	return messages, nil
 }
 
 func (d *DiskHandler) countMessagesInSegment() (int, error) {

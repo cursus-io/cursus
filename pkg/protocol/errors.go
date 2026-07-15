@@ -58,15 +58,15 @@ func buildErrorRegistry() map[string]ErrorClassification {
 	}
 
 	register(ErrorClassRouting, true,
-		"NOT_COORDINATOR", "NOT_LEADER",
+		"NOT_COORDINATOR", "NOT_LEADER", "NOT_PARTITION_LEADER",
 	)
 	register(ErrorClassAvailability, true,
-		"cluster_not_available", "coordinator_not_available", "fsm_not_available",
+		"cluster_metadata_unavailable", "cluster_not_available", "coordinator_not_available", "fsm_not_available",
 		"leader_not_found", "no_raft_leader", "offset_manager_not_available", "router_not_available",
 		"transaction_abort_marker_failed", "transaction_commit_failed", "transaction_manager_not_available", "transaction_sync_failed",
 	)
 	register(ErrorClassFencing, false,
-		"GEN_MISMATCH", "NOT_OWNER", "member_not_found", "producer_fenced", "stale_producer_epoch",
+		"GEN_MISMATCH", "NOT_OWNER", "STALE_LEADER_EPOCH", "member_not_found", "producer_fenced", "stale_producer_epoch",
 	)
 	register(ErrorClassConflict, false,
 		"OFFSET_OUT_OF_RANGE", "offset_regression", "snapshot_version_exceeds_stream",
@@ -80,14 +80,14 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"internal_txn_publish_forbidden", "transaction_metadata_forbidden",
 	)
 	register(ErrorClassNotFound, false,
-		"group_not_found", "partition_not_found", "topic_not_found", "transaction_not_found",
+		"group_not_found", "partition_metadata_not_found", "partition_not_found", "topic_not_found", "transaction_not_found",
 	)
 	register(ErrorClassValidation, false,
 		"UNSUPPORTED_FEATURE", "UNSUPPORTED_PROTOCOL_VERSION", "batch_decode_failed", "decode_failed",
-		"distribution_not_enabled", "distribution_required", "empty_command", "empty_messages",
-		"empty_required_params", "event_sourcing_not_enabled", "invalid_acks", "invalid_batch_commit_format",
+		"distribution_not_enabled", "distribution_required", "duplicate_partition", "empty_command", "empty_messages",
+		"empty_required_params", "event_sourcing_not_enabled", "invalid_acks", "invalid_batch_commit_entry", "invalid_batch_commit_format",
 		"invalid_auth", "invalid_consume_syntax", "invalid_control_batch_bytes", "invalid_control_batch_coordinator_epoch",
-		"invalid_control_batch_version", "invalid_epoch", "invalid_generation", "invalid_is_idempotent",
+		"invalid_control_batch_version", "invalid_commit_watermark", "invalid_epoch", "invalid_generation", "invalid_is_idempotent",
 		"invalid_offset", "invalid_partition", "invalid_partitions", "invalid_payload", "invalid_payload_json",
 		"invalid_protocol_features", "invalid_protocol_version", "invalid_replication_factor", "invalid_require_features",
 		"invalid_transaction_control_batch", "invalid_transaction_control_epoch", "invalid_transaction_control_record",
@@ -95,8 +95,8 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"invalid_transaction_state", "invalid_txn_offsets",
 		"invalid_retention_bytes", "invalid_retention_hours", "invalid_schema_version", "invalid_seq_num",
 		"invalid_snapshot_catchup_response", "invalid_snapshot_payload", "invalid_stream_syntax",
-		"invalid_topic_policy", "invalid_version", "malformed_input", "missing_group", "missing_key",
-		"missing_member", "missing_message", "missing_offset", "missing_partition", "missing_payload",
+		"invalid_topic_policy", "invalid_version", "malformed_input", "missing_generation", "missing_group", "missing_key",
+		"missing_leader_fence", "missing_member", "missing_message", "missing_offset", "missing_partition", "missing_payload",
 		"missing_coordinator_key", "missing_ownership_params", "missing_producer_id", "missing_protocol_version",
 		"missing_required_params", "missing_topic", "missing_transactional_id",
 		"missing_version", "no_valid_offsets", "unknown_command", "unmarshal_failed",

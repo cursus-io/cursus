@@ -28,6 +28,16 @@ type Topic struct {
 	Policy          Policy
 }
 
+type retentionPolicySetter interface {
+	SetRetentionPolicy(hours int, bytes int64)
+}
+
+func applyRetentionPolicy(handler types.StorageHandler, policy Policy) {
+	if setter, ok := handler.(retentionPolicySetter); ok {
+		setter.SetRetentionPolicy(policy.RetentionHours, policy.RetentionBytes)
+	}
+}
+
 // NewTopic initializes a topic with partitions.
 func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager, idempotent bool, eventSourcing bool) (*Topic, error) {
 	return NewTopicWithPolicy(name, partitionCount, hp, cfg, sm, idempotent, eventSourcing, DefaultPolicy())
@@ -45,6 +55,7 @@ func NewTopicWithPolicy(name string, partitionCount int, hp HandlerProvider, cfg
 		if err != nil {
 			return nil, fmt.Errorf("open handler for %s[%d]: %w", name, i, err)
 		}
+		applyRetentionPolicy(dh, normalizedPolicy)
 		p := NewPartition(i, name, dh, sm, cfg)
 		p.isIdempotent = idempotent
 		p.RecoverProducerStateFromLog()
@@ -102,6 +113,7 @@ func (t *Topic) AddPartitions(extra int, hp HandlerProvider) error {
 		if err != nil {
 			return fmt.Errorf("failed to attach partition %d for topic '%s': %w", idx, t.Name, err)
 		}
+		applyRetentionPolicy(dh, t.Policy)
 		newP := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
 		newP.isIdempotent = t.IsIdempotent
 		newP.RecoverProducerStateFromLog()
@@ -109,6 +121,16 @@ func (t *Topic) AddPartitions(extra int, hp HandlerProvider) error {
 		t.Partitions = append(t.Partitions, newP)
 	}
 	return nil
+}
+
+func (t *Topic) ApplyPolicy(policy Policy) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.Policy = policy
+	for _, partition := range t.Partitions {
+		applyRetentionPolicy(partition.dh, policy)
+	}
 }
 
 // RegisterConsumerGroup registers a consumer group to the topic.

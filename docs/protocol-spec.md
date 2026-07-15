@@ -457,7 +457,7 @@ and every partition.
 
 **COMMIT_OFFSET**
 ```
-COMMIT_OFFSET topic=<name> partition=<N> group=<name> offset=<N> [member=<actual-id> generation=<N>]
+COMMIT_OFFSET topic=<name> partition=<N> group=<name> offset=<N> member=<actual-id> generation=<N>
 ```
 Response: `OK`
 
@@ -465,7 +465,9 @@ The `offset` value is the next offset to read after the client has processed
 records. Commits are durable and monotonic per `(topic, group, partition)`.
 Committing the same offset is idempotent. Committing an offset lower than the
 current committed offset returns an error and does not move the stored offset
-backward.
+backward. `member` and `generation` are required and must identify the current
+partition owner; missing values are validation errors and stale values are fencing
+errors.
 
 **BATCH_COMMIT**
 ```
@@ -482,6 +484,8 @@ included partition. The broker validates `member` and `generation` before applyi
 the batch. If any partition is not owned by that member in that generation, the
 entire batch is rejected with `ERROR: NOT_OWNER ...`. Stale generations return
 `ERROR: GEN_MISMATCH ...`, and unknown members return `ERROR: member_not_found ...`.
+The whole batch is also rejected before any offset changes when `generation` is
+missing, an entry is malformed, or the same partition appears more than once.
 
 
 #### Transaction Coordinator
@@ -828,7 +832,16 @@ SDKs should parse the code and fields first, use `class` for broad handling, and
 | `offset_regression reason="..."` | Commit lower than current stored offset | Treat commit as failed; refetch offset |
 | `stale_producer_epoch producer=<id> current=<N> got=<N>` | Idempotent producer request uses an older fenced epoch | Treat as fatal for that producer instance; create a new producer session |
 | `OFFSET_OUT_OF_RANGE requested=N earliest=N latest=N` | Requested offset is older than retained log or beyond available range | Treat as data loss or reset according to policy |
-| `no_valid_offsets` | BATCH_COMMIT parse failure | Check format: `P<N>:<offset>` |
+| `no_valid_offsets` | BATCH_COMMIT contains no usable offsets | Supply at least one `P<N>:<offset>` entry |
+| `missing_generation command=<command>` | Group command omitted its generation | Rejoin if needed and send the current generation |
+| `invalid_batch_commit_entry entry=<entry>` | BATCH_COMMIT entry is not `P<N>:<offset>` | Correct the malformed entry and retry |
+| `duplicate_partition partition=N group=<G> topic=<T>` | BATCH_COMMIT repeats a partition | Send one next offset per partition; no offsets were committed |
+| `NOT_PARTITION_LEADER leader=<id> requested_leader=<id>` | Replication reached a broker that is not the current partition leader | Refresh partition metadata and retry against the leader |
+| `STALE_LEADER_EPOCH current=N requested=N` | Replication request carries a fenced leader epoch | Discard the stale leader session and refresh metadata |
+| `cluster_metadata_unavailable command=REPLICATE_MESSAGE` | Cluster metadata subsystem is temporarily unavailable | Back off and retry |
+| `partition_metadata_not_found topic=<T> partition=N` | Partition metadata does not exist | Refresh metadata and verify topic/partition |
+| `missing_leader_fence command=REPLICATE_MESSAGE` | Internal replication omitted leader ID or epoch | Correct the broker request; do not retry unchanged |
+| `invalid_commit_watermark reason="..."` | Commit watermark is ahead of local durable data or otherwise invalid | Repair/catch up the replica before retrying |
 | invalid_control_batch_bytes field=<key|value> | Broker-internal transaction control bytes are not valid base64 | Reject the internal publish and inspect broker compatibility |
 | `version_conflict current=N expected=N` | Optimistic concurrency failure | Reload aggregate and retry |
 | `event_sourcing_not_enabled topic=<X>` | ES command on non-ES topic | CREATE topic with `event_sourcing=true` |

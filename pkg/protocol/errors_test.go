@@ -45,7 +45,16 @@ func TestClassifyFencingAndAvailability(t *testing.T) {
 		{"transaction_manager_not_available", ErrorClassAvailability, true},
 		{"authentication_failed", ErrorClassAuthorization, false},
 		{"coordinator_not_available", ErrorClassAvailability, true},
+		{"cluster_metadata_unavailable", ErrorClassAvailability, true},
+		{"NOT_PARTITION_LEADER", ErrorClassRouting, true},
+		{"STALE_LEADER_EPOCH", ErrorClassFencing, false},
+		{"partition_metadata_not_found", ErrorClassNotFound, false},
+		{"invalid_commit_watermark", ErrorClassValidation, false},
+		{"missing_leader_fence", ErrorClassValidation, false},
+		{"duplicate_partition", ErrorClassValidation, false},
+		{"invalid_batch_commit_entry", ErrorClassValidation, false},
 		{"invalid_partition", ErrorClassValidation, false},
+		{"missing_generation", ErrorClassValidation, false},
 	}
 	for _, test := range tests {
 		got := ClassifyErrorCode(test.code)

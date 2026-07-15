@@ -194,6 +194,12 @@ ERROR: missing_payload command=REPLICATE_MESSAGE
 ERROR: unmarshal_failed reason="..."
 ERROR: topic_not_found topic=<name>
 ERROR: partition_not_found partition=<N>
+ERROR: cluster_metadata_unavailable command=REPLICATE_MESSAGE
+ERROR: partition_metadata_not_found topic=<name> partition=<N>
+ERROR: missing_leader_fence command=REPLICATE_MESSAGE
+ERROR: NOT_PARTITION_LEADER leader=<broker-id> requested_leader=<broker-id>
+ERROR: STALE_LEADER_EPOCH current=<N> requested=<N>
+ERROR: invalid_commit_watermark reason="..."
 ERROR: replica_append_failed reason="..."
 ```
 
@@ -357,10 +363,10 @@ When no offset has been committed, the broker returns `OK offset=0`.
 ### COMMIT_OFFSET
 
 ```text
-COMMIT_OFFSET topic=<name> group=<group> partition=<N> offset=<nextOffset> [member=<member-id> generation=<N>]
+COMMIT_OFFSET topic=<name> group=<group> partition=<N> offset=<nextOffset> member=<member-id> generation=<N>
 ```
 
-The offset is the next offset to read after successful processing. Commits are monotonic per `(topic, group, partition)`: a commit lower than the current offset fails and does not rewind the group. When `member` or `generation` is supplied, both must be present and the member must own the partition in that generation. Legacy clients may omit both fields, but group-aware SDKs should send them.
+The offset is the next offset to read after successful processing. Commits are monotonic per `(topic, group, partition)`: a commit lower than the current offset fails and does not rewind the group. `member` and `generation` are required, and the member must own the partition in that generation.
 
 Success:
 
@@ -372,6 +378,7 @@ Common errors:
 
 ```text
 ERROR: invalid_offset
+ERROR: missing_generation command=COMMIT_OFFSET
 ERROR: invalid_generation command=COMMIT_OFFSET
 ERROR: offset_regression reason="..."
 ERROR: GEN_MISMATCH current=<N> requested=<N> group=<group> member=<member-id>
@@ -398,7 +405,10 @@ Common errors:
 
 ```text
 ERROR: invalid_batch_commit_format
+ERROR: invalid_batch_commit_entry entry=<entry>
+ERROR: missing_generation command=BATCH_COMMIT
 ERROR: invalid_generation command=BATCH_COMMIT
+ERROR: duplicate_partition partition=<N> group=<group> topic=<topic>
 ERROR: no_valid_offsets
 ERROR: offset_regression reason="..."
 ERROR: GEN_MISMATCH current=<N> requested=<N> group=<group> member=<member-id>
