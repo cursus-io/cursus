@@ -12,8 +12,8 @@ import (
 
 func TestConfiguredNegotiationHasBoundedTimeout(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 	release := make(chan struct{})
 	requestRead := make(chan struct{})
 	go func() {
@@ -36,8 +36,8 @@ func TestConfiguredNegotiationHasBoundedTimeout(t *testing.T) {
 
 func TestConfiguredNegotiationClearsDeadlineAfterSuccess(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 	serverDone := make(chan error, 1)
 	go func() {
 		first, err := ReadWithLength(server)
@@ -89,8 +89,8 @@ func TestConfiguredNegotiationClearsDeadlineAfterSuccess(t *testing.T) {
 
 func TestFetchProtocolInfoRejectsInvalidVersionRange(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 	go func() {
 		_, _ = ReadWithLength(server)
 		_ = WriteWithLength(server, []byte("OK protocol=cursus min_version=2 max_version=1 default_version=1 features= error_classes="))

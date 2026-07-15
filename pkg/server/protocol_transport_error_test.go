@@ -11,8 +11,8 @@ import (
 
 func TestNegotiatedTransportErrorsAreStructured(t *testing.T) {
 	client, server := newTestConnPair(t)
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	handler := controller.NewCommandHandler(nil, config.DefaultConfig(), nil, nil, nil)
 	ctx := controller.NewClientContext("default-group", 0)

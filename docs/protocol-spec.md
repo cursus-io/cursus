@@ -827,6 +827,7 @@ SDKs should parse the code and fields first, use `class` for broad handling, and
 | `stale_producer_epoch producer=<id> current=<N> got=<N>` | Idempotent producer request uses an older fenced epoch | Treat as fatal for that producer instance; create a new producer session |
 | `OFFSET_OUT_OF_RANGE requested=N earliest=N latest=N` | Requested offset is older than retained log or beyond available range | Treat as data loss or reset according to policy |
 | `no_valid_offsets` | BATCH_COMMIT parse failure | Check format: `P<N>:<offset>` |
+| invalid_control_batch_bytes field=<key|value> | Broker-internal transaction control bytes are not valid base64 | Reject the internal publish and inspect broker compatibility |
 | `version_conflict current=N expected=N` | Optimistic concurrency failure | Reload aggregate and retry |
 | `event_sourcing_not_enabled topic=<X>` | ES command on non-ES topic | CREATE topic with `event_sourcing=true` |
 | `snapshot_version_exceeds_stream version=N current=N` | Invalid snapshot version | Use version <= current stream version |

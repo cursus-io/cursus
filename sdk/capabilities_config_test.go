@@ -7,8 +7,8 @@ import (
 
 func TestConfiguredNegotiationRejectsEmptyRequiredFeatures(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 	if err := negotiateConfiguredProtocol(client, 0, nil, true, 10); err == nil {
 		t.Fatal("empty required negotiation was accepted")
 	}

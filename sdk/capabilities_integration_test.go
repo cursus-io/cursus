@@ -76,7 +76,7 @@ func startProtocolTestServer(t *testing.T, response string) (string, <-chan stri
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		data, err := ReadWithLength(conn)
 		if err != nil {
 			return

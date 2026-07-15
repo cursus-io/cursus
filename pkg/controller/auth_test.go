@@ -147,6 +147,12 @@ func TestPublishRejectsMalformedControlBatchMetadata(t *testing.T) {
 		t.Fatalf("expected invalid control batch version, got %q", resp)
 	}
 }
+func TestParseControlBatchBytesUsesStableErrorCode(t *testing.T) {
+	_, resp := parseControlBatchBytes("%%%", "key")
+	if !strings.Contains(resp, "ERROR: invalid_control_batch_bytes field=key") {
+		t.Fatalf("expected stable control batch bytes error, got %q", resp)
+	}
+}
 func TestTransactionMarkerRequiresControlBatchMetadata(t *testing.T) {
 	tx := &transaction.Transaction{
 		ID:       "txn-1",

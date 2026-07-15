@@ -11,8 +11,8 @@ import (
 
 func TestFetchProtocolInfo(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	serverDone := make(chan error, 1)
 	go func() {
@@ -50,8 +50,8 @@ func TestFetchProtocolInfo(t *testing.T) {
 
 func TestNegotiateProtocolSortsFeaturesAndParsesResult(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	serverDone := make(chan error, 1)
 	go func() {
@@ -89,8 +89,8 @@ func TestNegotiateProtocolSortsFeaturesAndParsesResult(t *testing.T) {
 
 func TestNegotiateProtocolReturnsTypedBrokerError(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	go func() {
 		_, _ = ReadWithLength(server)

@@ -41,6 +41,9 @@ func TestClassifyFencingAndAvailability(t *testing.T) {
 		retryable bool
 	}{
 		{"GEN_MISMATCH", ErrorClassFencing, false},
+		{"producer_fenced", ErrorClassFencing, false},
+		{"transaction_manager_not_available", ErrorClassAvailability, true},
+		{"authentication_failed", ErrorClassAuthorization, false},
 		{"coordinator_not_available", ErrorClassAvailability, true},
 		{"invalid_partition", ErrorClassValidation, false},
 	}
