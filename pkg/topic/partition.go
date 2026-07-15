@@ -1,6 +1,7 @@
 package topic
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -71,8 +72,8 @@ type Partition struct {
 
 // NewPartition creates a partition instance.
 func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManager, cfg *config.Config) *Partition {
-	latest := dh.GetLatestOffset()
-	initialOffset := latest + 1
+	// Storage exposes the next assignable offset, not the last record offset.
+	initialOffset := dh.GetLatestOffset()
 
 	p := &Partition{
 		id:               id,
@@ -471,15 +472,24 @@ func (p *Partition) ReplicaAppend(msgs []types.Message) error {
 	}
 
 	for i := range msgs {
+		currentLEO := p.LEO.Load()
+		switch {
+		case msgs[i].Offset < currentLEO:
+			existing, err := p.dh.ReadMessages(msgs[i].Offset, 1)
+			if err != nil || len(existing) != 1 || !sameReplicatedMessage(existing[0], msgs[i]) {
+				return fmt.Errorf("replica offset conflict at offset %d", msgs[i].Offset)
+			}
+			continue
+		case msgs[i].Offset > currentLEO:
+			return fmt.Errorf("replica offset gap: expected %d, got %d", currentLEO, msgs[i].Offset)
+		}
+
 		if err := p.dh.AppendMessageWithOffset(p.topic, p.id, &msgs[i]); err != nil {
 			return fmt.Errorf("replica append failed at index %d: %w", i, err)
 		}
 
 		newLEO := msgs[i].Offset + 1
-		if currentLEO := p.LEO.Load(); newLEO > currentLEO {
-			p.LEO.Store(newLEO)
-		}
-		p.setHWMLocked(newLEO)
+		p.LEO.Store(newLEO)
 		p.updateProducerStateWithMode(&msgs[i], msgs[i].TransactionalID != "")
 		p.indexTransactionMessage(msgs[i])
 	}
@@ -487,6 +497,17 @@ func (p *Partition) ReplicaAppend(msgs []types.Message) error {
 	return nil
 }
 
+func sameReplicatedMessage(a, b types.Message) bool {
+	return a.Offset == b.Offset && a.ProducerID == b.ProducerID && a.SeqNum == b.SeqNum &&
+		a.Payload == b.Payload && a.Key == b.Key && a.Epoch == b.Epoch &&
+		a.EventType == b.EventType && a.SchemaVersion == b.SchemaVersion &&
+		a.AggregateVersion == b.AggregateVersion && a.Metadata == b.Metadata &&
+		a.TransactionalID == b.TransactionalID && a.TransactionState == b.TransactionState &&
+		a.TransactionMarker == b.TransactionMarker && a.ControlBatchType == b.ControlBatchType &&
+		a.ControlBatchVersion == b.ControlBatchVersion &&
+		a.ControlBatchCoordinatorEpoch == b.ControlBatchCoordinatorEpoch &&
+		bytes.Equal(a.ControlBatchKey, b.ControlBatchKey) && bytes.Equal(a.ControlBatchValue, b.ControlBatchValue)
+}
 func (p *Partition) NotifyNewMessage() {
 	select {
 	case p.newMessageCh <- struct{}{}:
@@ -932,6 +953,60 @@ func (p *Partition) ReserveOffsets(count int) (uint64, error) {
 	}
 }
 
+// ApplyReplicaHWM advances the local committed watermark only when the data is present.
+func (p *Partition) ApplyReplicaHWM(hwm uint64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if hwm > p.LEO.Load() {
+		return fmt.Errorf("commit watermark %d is ahead of local LEO %d", hwm, p.LEO.Load())
+	}
+	if p.setHWMLocked(hwm) {
+		p.NotifyNewMessage()
+	}
+	return nil
+}
+
+// ReconcileCommittedHWM prepares a replica for leadership using the durable cluster watermark.
+// Any local tail beyond that watermark was never committed and must not survive leader promotion.
+func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	leo := p.LEO.Load()
+	if leo < hwm {
+		return fmt.Errorf("replica is behind committed watermark: leo=%d hwm=%d", leo, hwm)
+	}
+	if leo == hwm && p.HWM == hwm {
+		return nil
+	}
+	truncated := false
+	if leo > hwm {
+		if err := p.dh.TruncateTo(hwm); err != nil {
+			return fmt.Errorf("truncate uncommitted tail to %d: %w", hwm, err)
+		}
+		p.LEO.Store(hwm)
+		truncated = true
+	}
+	if p.HWM != hwm {
+		p.HWM = hwm
+		p.signalHWMCheckpointLocked()
+	}
+	if !truncated {
+		return nil
+	}
+
+	p.txnMarkerMu.Lock()
+	p.txnMarkers = make(map[transactionMarkerKey]transactionMarkerInfo)
+	p.txnOpenOffsets = make(map[transactionMarkerKey]uint64)
+	p.txnMarkerMu.Unlock()
+	p.rebuildTransactionMarkerIndex()
+	p.producerState.Range(func(key, _ any) bool {
+		p.producerState.Delete(key)
+		return true
+	})
+	p.RecoverProducerStateFromLog()
+	return nil
+}
 func (p *Partition) SetHWM(hwm uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
