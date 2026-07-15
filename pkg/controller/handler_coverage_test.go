@@ -56,6 +56,7 @@ func (m *testMockHandlerProvider) GetHandler(topic string, partitionID int) (typ
 func newTestHandler(t *testing.T) (*CommandHandler, *topic.TopicManager) {
 	t.Helper()
 	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
 	hp := &testMockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
 	ch := NewCommandHandler(tm, cfg, nil, nil, nil)
@@ -66,6 +67,7 @@ func newTestHandler(t *testing.T) (*CommandHandler, *topic.TopicManager) {
 func newTestHandlerWithCoordinator(t *testing.T) (*CommandHandler, *topic.TopicManager, *coordinator.Coordinator) {
 	t.Helper()
 	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
 	hp := &testMockHandlerProvider{}
 	tm := topic.NewTopicManager(cfg, hp, nil)
 	coord := coordinator.NewCoordinator(context.Background(), cfg, &dummyPublisher{})

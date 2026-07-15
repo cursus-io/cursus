@@ -99,6 +99,11 @@ func (pc *ProducerClient) connectPartitionLocked(idx int, addr string) error {
 		_ = tcpConn.SetWriteBuffer(2 * 1024 * 1024)
 	}
 
+	if err := negotiateConfiguredProtocol(conn, pc.config.ProtocolVersion, pc.config.ProtocolFeatures, pc.config.RequireProtocolFeatures, pc.config.ProtocolNegotiationTimeoutMS); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("protocol negotiation with %s failed: %w", addr, err)
+	}
+
 	var currentConns []net.Conn
 	if ptr := pc.conns.Load(); ptr != nil {
 		currentConns = *ptr

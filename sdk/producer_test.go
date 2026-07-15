@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -402,8 +403,11 @@ func TestProducer_ParseAckResponse_ErrorPrefix(t *testing.T) {
 	}
 
 	_, err := p.parseAckResponse([]byte("ERROR: broker busy"))
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "broker error")
+	var brokerErr *BrokerError
+	require.True(t, errors.As(err, &brokerErr))
+	assert.Equal(t, "broker", brokerErr.Code)
+	assert.Equal(t, ErrorClassInternal, brokerErr.Class)
+	assert.False(t, brokerErr.Retryable)
 }
 
 func TestProducer_ParseAckResponse_InvalidJSON(t *testing.T) {

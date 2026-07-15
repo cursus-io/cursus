@@ -198,7 +198,7 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) strin
 		return ch.fail(rawCmd, resp)
 	}
 
-	resp := ch.handleCommandByType(cmd, upper, ctx)
+	resp := decorateProtocolResponse(ch.handleCommandByType(cmd, upper, ctx), ctx)
 	ch.logCommandResult(rawCmd, resp)
 	return resp
 }
