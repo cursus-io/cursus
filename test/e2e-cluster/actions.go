@@ -182,6 +182,7 @@ func (a *ClusterActions) StopBroker(nodeIndex int) {
 		a.ctx.GetT().Fatalf("invalid broker index %d: cluster size is %d", nodeIndex, a.ctx.clusterSize)
 	}
 	containerName := fmt.Sprintf("broker-%d", nodeIndex)
+	// #nosec G204 -- nodeIndex is range-checked above and forms a fixed broker-N container name.
 	if err := exec.Command("docker", "stop", containerName).Run(); err != nil {
 		a.ctx.GetT().Fatalf("failed to stop %s: %v", containerName, err)
 	}
@@ -193,6 +194,7 @@ func (a *ClusterActions) StartBroker(nodeIndex int) {
 		a.ctx.GetT().Fatalf("invalid broker index %d: cluster size is %d", nodeIndex, a.ctx.clusterSize)
 	}
 	containerName := fmt.Sprintf("broker-%d", nodeIndex)
+	// #nosec G204 -- nodeIndex is range-checked above and forms a fixed broker-N container name.
 	if err := exec.Command("docker", "start", containerName).Run(); err != nil {
 		a.ctx.GetT().Fatalf("failed to start %s: %v", containerName, err)
 	}
