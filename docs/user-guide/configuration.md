@@ -56,6 +56,7 @@ broker:
   sasl_users:
     - principal: "game-server"
       token: "change-me"
+      permissions: ["topic.read", "topic.write", "group", "transaction"]
   
   # Compression
   enable_gzip: false
@@ -128,10 +129,12 @@ The configuration is represented by the Config struct in the codebase, which org
 | `internal_tls_ca_path` | string | "" | CA used to verify peer broker certificates |
 | `internal_tls_server_name` | string | "" | Server name used by broker-to-broker mTLS clients |
 | `enable_sasl` | bool | false | Enable SASL-PLAIN-style token authentication for text commands |
-| `sasl_users` | list | [] | Principal/token pairs accepted by `AUTH` and inline `principal`/`auth_token` |
+| `sasl_users` | list | [] | Principal/token/permissions entries accepted by `AUTH` and inline authentication |
 | `enable_gzip`    | bool   | false   | Enable gzip compression for messages        |
 
-When `use_tls` is enabled and certificate paths are provided, the broker loads the certificate using `tls.LoadX509KeyPair()` during initialization. In distributed mode, `internal_broker_port` moves broker-to-broker text commands away from the public client listener. If `internal_use_tls` is enabled, the internal listener requires client certificates signed by `internal_tls_ca_path`, and peer routers dial the internal port with mTLS using `internal_tls_server_name` for certificate verification. If `enable_sasl` is enabled, clients authenticate with `AUTH principal=<principal> token=<token>` or inline `principal=<principal> auth_token=<token>` on protected commands; topic `auth_policy=acl` then checks `read_acl`/`write_acl`.
+When `use_tls` is enabled and certificate paths are provided, the broker loads the certificate using `tls.LoadX509KeyPair()` during initialization. In distributed mode, `internal_broker_port` moves broker-to-broker text commands away from the public client listener. If `internal_use_tls` is enabled, the internal listener requires client certificates signed by `internal_tls_ca_path`, and peer routers dial the internal port with mTLS using `internal_tls_server_name` for certificate verification.
+
+When `enable_sasl` is enabled, protected commands require `AUTH principal=<principal> token=<token>` or inline `principal=<principal> auth_token=<token>`. A user can declare `permissions` from `admin`, `topic.read`, `topic.write`, `group`, `transaction`, and `*`. `CONSUME`/`STREAM` require both `topic.read` and `group`; `TXN_PUBLISH` requires `transaction` and `topic.write`; `SEND_OFFSETS_TO_TXN` requires `transaction` and `group`. Topic `auth_policy=acl` is evaluated after the coarse permission check. Omitting `permissions` preserves the legacy authenticated-user access model; declare an explicit list for least privilege. The `SASL_USERS=principal:token` environment form creates legacy users without a restricted permission list, so use YAML or JSON configuration when least privilege is required.
 
 # DiskHandler Performance Tuning
 
