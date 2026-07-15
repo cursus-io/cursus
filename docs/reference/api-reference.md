@@ -174,10 +174,10 @@ ERROR: replica_append_failed reason="..."
 ### CONSUME
 
 ```text
-CONSUME topic=<name> group=<group> partition=<N> offset=<N> member=<member-id> [batch=<N>]
+CONSUME topic=<name> group=<group> partition=<N> offset=<N> member=<member-id> [isolation=<read_committed|read_uncommitted>] [batch=<N>]
 ```
 
-`CONSUME` returns binary message frames. For consumer groups, the broker uses the committed offset for `(topic, group, partition)` as the authoritative resume point when one exists; otherwise the earliest offset policy is `0`. `CONSUME` is a stateless partition-leader read: ownership, liveness, and generation fencing are enforced by coordinator commands, not on the data path.
+`CONSUME` returns binary message frames. For consumer groups, the broker uses the committed offset for `(topic, group, partition)` as the authoritative resume point when one exists; otherwise the earliest offset policy is `0`. `CONSUME` is a stateless partition-leader read: ownership, liveness, and generation fencing are enforced by coordinator commands, not on the data path. The default isolation is `read_committed`, which hides unresolved and aborted transactional records. `isolation=read_uncommitted` returns the raw committed log, including transaction metadata and control markers.
 
 Common errors:
 
@@ -189,6 +189,7 @@ ERROR: missing_offset command=CONSUME
 ERROR: missing_member command=CONSUME
 ERROR: invalid_partition
 ERROR: invalid_offset
+ERROR: invalid_isolation isolation=<value>
 ERROR: NOT_LEADER LEADER_IS <host:port>
 ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>
 ```
@@ -198,7 +199,7 @@ ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>
 Continuous push-mode consume command.
 
 ```text
-STREAM topic=<name> group=<group> partition=<N> offset=<N> member=<member-id>
+STREAM topic=<name> group=<group> partition=<N> offset=<N> member=<member-id> [isolation=<read_committed|read_uncommitted>]
 ```
 
 `STREAM` returns one or more length-prefixed frames:
@@ -209,7 +210,7 @@ STREAM topic=<name> group=<group> partition=<N> offset=<N> member=<member-id>
 STREAM_CONTROL type=CLOSE reason=<stopped|removed|timeout|error|offset_out_of_range> offset=<nextOffset>
 ```
 
-Clients must treat zero-length frames as keepalive. Like `CONSUME`, `STREAM` is a stateless partition-leader data path and does not validate group ownership or generation on every read. A `STREAM_CONTROL type=CLOSE` frame is a graceful terminator; `reason=offset_out_of_range` means the requested stream offset is older than the retained log. Clients should close the socket and resume through the consumer group offset contract or reset according to policy. Raw TCP disconnect without a close control frame remains possible on broker crash or network failure and should be treated as retryable.
+Clients must treat zero-length frames as keepalive. Like `CONSUME`, `STREAM` is a stateless partition-leader data path and does not validate group ownership or generation on every read. `STREAM` uses the same `isolation` contract as `CONSUME`; the default is `read_committed`. A `STREAM_CONTROL type=CLOSE` frame is a graceful terminator; `reason=offset_out_of_range` means the requested stream offset is older than the retained log. Clients should close the socket and resume through the consumer group offset contract or reset according to policy. Raw TCP disconnect without a close control frame remains possible on broker crash or network failure and should be treated as retryable.
 
 Common errors:
 
@@ -219,6 +220,7 @@ ERROR: missing_topic command=STREAM
 ERROR: missing_partition command=STREAM
 ERROR: missing_offset command=STREAM
 ERROR: missing_member command=STREAM
+ERROR: invalid_isolation isolation=<value>
 ERROR: NOT_LEADER LEADER_IS <host:port>
 ```
 

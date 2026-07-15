@@ -122,7 +122,7 @@ sequenceDiagram
 
     Note over CONS,DISK: Disk-based replay (CONSUME)
     CONS->>SRV: [4-byte len][CONSUME topic partition offset]
-    SRV->>PART: ReadCommitted(offset)
+    SRV->>PART: ReadCommitted(offset) by default
     PART->>DISK: mmap read (up to 8192 bytes)
     DISK-->>SRV: message batch
     SRV-->>CONS: [4-byte len][msg1][4-byte len][msg2]...
@@ -142,7 +142,7 @@ graph LR
     Part -->|notify| SM[StreamManager]
     SM -->|push| C[Consumer]
     C -->|CONSUME/STREAM| Part
-    Part -->|ReadCommitted| Seg
+    Part -->|ReadCommitted / ReadMessages| Seg
 ```
 
 ### Key flow characteristics:
@@ -310,4 +310,3 @@ broker-1:
     - ADVERTISED_CLIENT_HOST=localhost
     - ADVERTISED_BROKER_PORT=9001
 ```
-

@@ -107,6 +107,9 @@ func TestCommandHandler_StreamSyntax(t *testing.T) {
 
 	resp = ch.HandleCommand("STREAM topic=t1", nil)
 	assert.Contains(t, resp, "ERROR: invalid_stream_syntax")
+
+	resp = ch.HandleCommand("STREAM topic=t1 partition=0 group=g1 isolation=dirty", nil)
+	assert.Contains(t, resp, "ERROR: invalid_isolation isolation=dirty")
 }
 
 func TestCommandHandler_ConsumeUsesCommittedOffsetBeforeExplicitOffset(t *testing.T) {
@@ -321,4 +324,78 @@ func TestCommandHandler_ConsumeWritesOffsetOutOfRangeFrame(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "ERROR: OFFSET_OUT_OF_RANGE requested=0 earliest=2 latest=4", string(data))
 	require.NoError(t, <-errCh)
+}
+
+func TestCommandHandler_ConsumeReadIsolationModes(t *testing.T) {
+	cfg := config.DefaultConfig()
+	storage := &sequenceStorage{messages: []types.Message{
+		{Offset: 0, Payload: "plain"},
+		{Offset: 1, Payload: "open", TransactionalID: "tx-open", TransactionState: types.TransactionStateOpen},
+		{Offset: 2, Payload: "committed", TransactionalID: "tx-commit", TransactionState: types.TransactionStateOpen},
+		{Offset: 3, Payload: "commit-marker", TransactionalID: "tx-commit", TransactionMarker: types.TransactionMarkerCommit},
+		{Offset: 4, Payload: "after"},
+	}}
+	tm := topic.NewTopicManager(cfg, &singleStorageProvider{storage: storage}, nil)
+	require.NoError(t, tm.CreateTopic("isolation-topic", 1, false, false))
+	p, err := tm.GetTopic("isolation-topic").GetPartition(0)
+	require.NoError(t, err)
+	p.SetHWM(5)
+
+	coord := coordinator.NewCoordinator(context.Background(), cfg, &DummyPublisher{})
+	require.NoError(t, coord.RegisterGroup("isolation-topic", "isolation-group", 1))
+
+	ch := controller.NewCommandHandler(tm, cfg, coord, nil, nil)
+
+	committed := consumeTestBatch(t, ch, "CONSUME topic=isolation-topic partition=0 offset=0 group=isolation-group member=m1 batch=10", controller.NewClientContext("isolation-group", 0))
+	require.Len(t, committed.Messages, 1)
+	assert.Equal(t, "plain", committed.Messages[0].Payload)
+
+	uncommitted := consumeTestBatch(t, ch, "CONSUME topic=isolation-topic partition=0 offset=0 group=isolation-group member=m1 batch=10 isolation=read_uncommitted", controller.NewClientContext("isolation-group", 0))
+	require.Len(t, uncommitted.Messages, 5)
+	assert.Equal(t, "plain", uncommitted.Messages[0].Payload)
+	assert.Equal(t, "open", uncommitted.Messages[1].Payload)
+	assert.Equal(t, "committed", uncommitted.Messages[2].Payload)
+	assert.Equal(t, "commit-marker", uncommitted.Messages[3].Payload)
+	assert.Equal(t, "after", uncommitted.Messages[4].Payload)
+}
+
+func TestCommandHandler_ConsumeRejectsInvalidIsolation(t *testing.T) {
+	cfg := config.DefaultConfig()
+	ch := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
+	server, client := net.Pipe()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
+
+	_, err := ch.HandleConsumeCommand(server, "CONSUME topic=t partition=0 offset=0 group=g member=m isolation=dirty", controller.NewClientContext("g", 0))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid_isolation isolation=dirty")
+
+	resp := ch.HandleCommand("CONSUME topic=t partition=0 offset=0 member=m isolation=dirty", controller.NewClientContext("g", 0))
+	assert.Contains(t, resp, "ERROR: invalid_isolation isolation=dirty")
+}
+
+func consumeTestBatch(t *testing.T, ch *controller.CommandHandler, cmd string, ctx *controller.ClientContext) *types.Batch {
+	t.Helper()
+	server, client := net.Pipe()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ch.HandleConsumeCommand(server, cmd, ctx)
+		errCh <- err
+	}()
+
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	data, err := util.ReadWithLength(client)
+	require.NoError(t, err)
+	batch, err := util.DecodeBatchMessages(data)
+	require.NoError(t, err)
+
+	_ = client.Close()
+	err = <-errCh
+	if err != nil && !strings.Contains(err.Error(), "closed pipe") && !strings.Contains(err.Error(), "EOF") {
+		t.Fatalf("HandleConsumeCommand failed: %v", err)
+	}
+	return batch
 }
