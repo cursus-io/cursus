@@ -789,11 +789,6 @@ func messageTransactionMarkerKey(msg types.Message) transactionMarkerKey {
 	return transactionMarkerKey{transactionalID: msg.TransactionalID, epoch: msg.Epoch}
 }
 
-func hasResolvingMarkerAfter(msg types.Message, markers map[transactionMarkerKey]transactionMarkerInfo) bool {
-	marker, ok := markers[messageTransactionMarkerKey(msg)]
-	return ok && marker.offset > msg.Offset
-}
-
 func firstUnresolvedOpenOffset(hwm uint64, openOffsets map[transactionMarkerKey]uint64, markers map[transactionMarkerKey]transactionMarkerInfo) uint64 {
 	firstUnresolved := hwm
 	for key, offset := range openOffsets {
