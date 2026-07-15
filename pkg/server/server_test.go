@@ -128,6 +128,12 @@ func TestIsCommand_AllKeywords(t *testing.T) {
 		"FETCH_OFFSET t", "LIST_GROUPS", "SYNC_GROUP g", "DESCRIBE t",
 		"APPEND_STREAM t", "READ_STREAM t", "SAVE_SNAPSHOT t",
 		"READ_SNAPSHOT t", "STREAM_VERSION t",
+		"INIT_PRODUCER_ID transactional_id=tx-1",
+		"BEGIN_TXN transactional_id=tx-1 producerId=p1 epoch=0",
+		"TXN_PUBLISH transactional_id=tx-1 topic=t1 partition=0 producerId=p1 seqNum=1 epoch=0 message=value",
+		"SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=p1 epoch=0 topic=t1 group=g1 member=m1 generation=1 P0:1",
+		"END_TXN transactional_id=tx-1 producerId=p1 epoch=0 result=commit",
+		"TXN_STATUS transactional_id=tx-1",
 	}
 	for _, kw := range keywords {
 		assert.True(t, isCommand(kw), "expected %q to be a command", kw)

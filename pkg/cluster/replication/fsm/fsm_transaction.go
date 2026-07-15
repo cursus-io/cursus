@@ -25,6 +25,5 @@ func (f *BrokerFSM) applyTransactionSyncCommand(jsonData string) interface{} {
 	if txn == nil {
 		return fmt.Errorf("transaction manager not available")
 	}
-	txn.ApplySnapshot(cmd.Transaction)
-	return nil
+	return txn.ApplyReplicatedSnapshot(cmd.Transaction)
 }

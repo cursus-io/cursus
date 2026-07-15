@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -38,6 +39,7 @@ type Transaction struct {
 	ID        string
 	Producer  string
 	Epoch     int64
+	Revision  uint64
 	State     State
 	Messages  []MessageOperation
 	Offsets   []OffsetOperation
@@ -49,6 +51,7 @@ type Snapshot struct {
 	ID        string             `json:"id"`
 	Producer  string             `json:"producer"`
 	Epoch     int64              `json:"epoch"`
+	Revision  uint64             `json:"revision,omitempty"`
 	State     State              `json:"state"`
 	Messages  []MessageOperation `json:"messages,omitempty"`
 	Offsets   []OffsetOperation  `json:"offsets,omitempty"`
@@ -112,6 +115,7 @@ func (m *Manager) InitProducer(id string) (string, int64, error) {
 
 	producer := producerIDForTransactionalID(id)
 	epoch := int64(0)
+	revision := uint64(1)
 	if tx, ok := m.txns[id]; ok {
 		if tx.State == StateCommitting {
 			return "", 0, fmt.Errorf("transaction %s is committing; retry END_TXN before reinitializing producer", id)
@@ -120,6 +124,7 @@ func (m *Manager) InitProducer(id string) (string, int64, error) {
 			producer = tx.Producer
 		}
 		epoch = tx.Epoch + 1
+		revision = tx.Revision + 1
 	}
 
 	now := time.Now()
@@ -127,6 +132,7 @@ func (m *Manager) InitProducer(id string) (string, int64, error) {
 		ID:        id,
 		Producer:  producer,
 		Epoch:     epoch,
+		Revision:  revision,
 		State:     StateAborted,
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -166,6 +172,7 @@ func (m *Manager) Begin(id, producer string, epoch int64) error {
 		ID:        id,
 		Producer:  producer,
 		Epoch:     epoch,
+		Revision:  tx.Revision + 1,
 		State:     StateOpen,
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -185,6 +192,7 @@ func (m *Manager) AddMessage(id, producer string, epoch int64, op MessageOperati
 		return err
 	}
 	tx.Messages = append(tx.Messages, op)
+	tx.Revision++
 	tx.UpdatedAt = time.Now()
 	return nil
 }
@@ -205,6 +213,7 @@ func (m *Manager) AddOffsets(id, producer string, epoch int64, offsets []OffsetO
 		return err
 	}
 	tx.Offsets = append(tx.Offsets, offsets...)
+	tx.Revision++
 	tx.UpdatedAt = time.Now()
 	return nil
 }
@@ -223,6 +232,7 @@ func (m *Manager) PrepareCommit(id, producer string, epoch int64) (*Transaction,
 	switch tx.State {
 	case StateOpen:
 		tx.State = StateCommitting
+		tx.Revision++
 		tx.UpdatedAt = time.Now()
 		return clone(tx), nil
 	case StateCommitting:
@@ -248,6 +258,7 @@ func (m *Manager) Commit(id string) error {
 		return fmt.Errorf("transaction %s is not prepared for commit", id)
 	}
 	tx.State = StateCommitted
+	tx.Revision++
 	tx.UpdatedAt = time.Now()
 	return nil
 }
@@ -272,6 +283,7 @@ func (m *Manager) Abort(id, producer string, epoch int64) error {
 	tx.State = StateAborted
 	tx.Messages = nil
 	tx.Offsets = nil
+	tx.Revision++
 	tx.UpdatedAt = time.Now()
 	return nil
 }
@@ -350,6 +362,49 @@ func (m *Manager) ApplySnapshot(snap *Snapshot) {
 	m.txns[snap.ID] = transactionFromSnapshot(snap)
 }
 
+func (m *Manager) ApplyReplicatedSnapshot(snap *Snapshot) error {
+	if snap == nil || snap.ID == "" {
+		return fmt.Errorf("invalid transaction snapshot")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	current, ok := m.txns[snap.ID]
+	if !ok || snapshotIsNewer(current, snap) {
+		m.txns[snap.ID] = transactionFromSnapshot(snap)
+		return nil
+	}
+	if snapshotsEqual(current, snap) {
+		return nil
+	}
+	return fmt.Errorf("stale transaction snapshot transactional_id=%s current_epoch=%d current_revision=%d incoming_epoch=%d incoming_revision=%d", snap.ID, current.Epoch, current.Revision, snap.Epoch, snap.Revision)
+}
+
+func snapshotIsNewer(current *Transaction, incoming *Snapshot) bool {
+	if incoming.Epoch != current.Epoch {
+		return incoming.Epoch > current.Epoch
+	}
+	if incoming.Revision != current.Revision {
+		return incoming.Revision > current.Revision
+	}
+	if incoming.Revision == 0 {
+		return incoming.UpdatedAt.After(current.UpdatedAt)
+	}
+	return false
+}
+
+func snapshotsEqual(current *Transaction, incoming *Snapshot) bool {
+	return current.ID == incoming.ID &&
+		current.Producer == incoming.Producer &&
+		current.Epoch == incoming.Epoch &&
+		current.Revision == incoming.Revision &&
+		current.State == incoming.State &&
+		current.CreatedAt.Equal(incoming.CreatedAt) &&
+		current.UpdatedAt.Equal(incoming.UpdatedAt) &&
+		reflect.DeepEqual(current.Messages, incoming.Messages) &&
+		reflect.DeepEqual(current.Offsets, incoming.Offsets)
+}
+
 func (m *Manager) Delete(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -398,6 +453,7 @@ func snapshot(tx *Transaction) *Snapshot {
 		ID:        tx.ID,
 		Producer:  tx.Producer,
 		Epoch:     tx.Epoch,
+		Revision:  tx.Revision,
 		State:     tx.State,
 		Messages:  append([]MessageOperation(nil), tx.Messages...),
 		Offsets:   append([]OffsetOperation(nil), tx.Offsets...),
@@ -411,6 +467,7 @@ func transactionFromSnapshot(snap *Snapshot) *Transaction {
 		ID:        snap.ID,
 		Producer:  snap.Producer,
 		Epoch:     snap.Epoch,
+		Revision:  snap.Revision,
 		State:     snap.State,
 		Messages:  append([]MessageOperation(nil), snap.Messages...),
 		Offsets:   append([]OffsetOperation(nil), snap.Offsets...),
