@@ -656,7 +656,6 @@ func (ch *CommandHandler) commitTransactionOffset(op transaction.OffsetOperation
 	if err := ch.Coordinator.ValidateAndCommit(op.Group, op.Topic, op.Partition, op.Offset, op.Generation, op.Member); err != nil {
 		return err
 	}
-	ch.recordConsumerLag(op.Topic, op.Partition, op.Offset, op.Group)
 	return nil
 }
 

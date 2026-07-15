@@ -87,8 +87,8 @@ cursus exposes three network ports, each serving a distinct purpose:
 | Port | Protocol | Handler | Purpose |
 |------|----------|---------|---------|
 | 9000 | TCP      | `server.RunServer()` | Main broker operations (`PUBLISH`, `CONSUME`, `CREATE`, etc.) |
-| 9080 | HTTP     | `startHealthCheckServer()` | Health check endpoint for load balancers |
-| 9100 | HTTP     | `metrics.StartMetricsServer()` | Prometheus metrics exporter |
+| 9080 | HTTP     | `startHealthCheckServer()` | `/live`, `/ready`, and compatible `/health` probes |
+| 9100 | HTTP     | `metrics.StartMetricsServer()` | Prometheus exporter with scrape-time broker state |
 
 
 ## Core Data Flow
