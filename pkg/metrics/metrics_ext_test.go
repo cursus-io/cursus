@@ -6,9 +6,9 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestAllMetricsRegistered(t *testing.T) {
-	// If any of these are not nil, it means they were initialized.
-	// Since init() calls MustRegister, they should be valid.
+func TestAllMetricsInitialized(t *testing.T) {
+	// Exported metric handles remain initialized even when a runtime collector
+	// owns the corresponding scrape-time metric name.
 	assert.NotNil(t, MessagesProcessed)
 	assert.NotNil(t, MessagesPerSec)
 	assert.NotNil(t, LatencyHist)
@@ -17,7 +17,11 @@ func TestAllMetricsRegistered(t *testing.T) {
 	assert.NotNil(t, SeqNumGapTotal)
 	assert.NotNil(t, SeqNumDuplicateTotal)
 	assert.NotNil(t, ConsumerLag)
-
+	assert.NotNil(t, ClientConnectionsTotal)
+	assert.NotNil(t, ClientConnectionsActive)
+	assert.NotNil(t, CommandsTotal)
+	assert.NotNil(t, CommandDuration)
+	assert.NotNil(t, CommandErrors)
 	assert.NotNil(t, ClusterBrokersTotal)
 	assert.NotNil(t, PartitionLeadersTotal)
 	assert.NotNil(t, ClusterReplicationLag)

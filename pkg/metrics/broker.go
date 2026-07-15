@@ -39,8 +39,37 @@ var (
 		Help: "Total number of duplicate sequence numbers detected",
 	}, []string{"topic", "partition"})
 
+	// ConsumerLag is retained for Go API compatibility. The broker exporter
+	// serves this name from its scrape-time runtime collector.
+	// Deprecated: use cursus_consumer_group_lag from the broker exporter.
 	ConsumerLag = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "broker_consumer_lag",
-		Help: "Consumer lag per partition (LEO - committed offset)",
+		Help: "Deprecated consumer lag compatibility gauge",
 	}, []string{"topic", "partition", "group"})
+
+	ClientConnectionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "cursus_broker_client_connections_total",
+		Help: "Total client TCP connections accepted by the broker",
+	})
+
+	ClientConnectionsActive = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "cursus_broker_client_connections_active",
+		Help: "Client TCP connections currently handled by the broker",
+	})
+
+	CommandsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "cursus_broker_commands_total",
+		Help: "Broker text commands completed by command and result",
+	}, []string{"command", "result"})
+
+	CommandDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "cursus_broker_command_duration_seconds",
+		Help:    "Broker text command handling latency before streamed payload transfer",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"command"})
+
+	CommandErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "cursus_broker_command_errors_total",
+		Help: "Broker text command errors by bounded command and wire error code",
+	}, []string{"command", "code"})
 )

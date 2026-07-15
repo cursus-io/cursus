@@ -20,7 +20,7 @@ services:
     networks:    
       - test_network  
     healthcheck:    
-      test: ["CMD", "curl", "-f", "http://localhost:9080/health"]    
+      test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
       interval: 10s    
       timeout: 5s    
       retries: 5    

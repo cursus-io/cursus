@@ -10,6 +10,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/eventsource"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
@@ -184,8 +185,14 @@ func redactOneCommandSecret(s, key string) string {
 }
 
 // HandleCommand processes non-streaming commands and returns a signal for streaming commands.
-func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) string {
+func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (response string) {
+	started := time.Now()
 	cmd := strings.TrimSpace(rawCmd)
+	commandName := ch.metricCommandName(cmd)
+	defer func() {
+		metrics.RecordCommand(commandName, response, time.Since(started))
+	}()
+
 	if cmd == "" {
 		resp := decorateProtocolResponse("ERROR: empty_command", ctx)
 		ch.logCommandResult(rawCmd, resp)
@@ -218,9 +225,26 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) strin
 		return ch.fail(rawCmd, resp)
 	}
 
-	resp := decorateProtocolResponse(ch.handleCommandByType(cmd, upper, ctx), ctx)
-	ch.logCommandResult(rawCmd, resp)
-	return resp
+	response = decorateProtocolResponse(ch.handleCommandByType(cmd, upper, ctx), ctx)
+	ch.logCommandResult(rawCmd, response)
+	return response
+}
+
+func (ch *CommandHandler) metricCommandName(cmd string) string {
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return "EMPTY"
+	}
+	name := strings.ToUpper(fields[0])
+	if name == "STREAM" || name == "CONSUME" {
+		return name
+	}
+	for _, entry := range ch.commands {
+		if name == strings.TrimSpace(entry.prefix) {
+			return name
+		}
+	}
+	return "UNKNOWN"
 }
 
 // handleCommandByType dispatches to the matching command handler from the registry.

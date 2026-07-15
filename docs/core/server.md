@@ -132,23 +132,20 @@ This ensures clients can read responses using the same protocol as sending reque
 
 ## Health Check System
 
-The health check server runs on a separate HTTP port and provides endpoints for load balancers and orchestration systems.
+The health server binds synchronously on a separate HTTP port. A bind failure aborts broker startup.
 
 ### Endpoints
 
-- `/health`: Primary health check endpoint
-- `/`: Root path also serves health check (convenience)
+| Endpoint | Meaning | Success |
+|---|---|---|
+| `/live` | The broker process and health handler are running | `200` JSON |
+| `/ready` | Startup completed and dynamic dependency checks pass | `200` JSON |
+| `/health` | Backward-compatible readiness check | `200 OK` plain text |
+| `/` | Alias of `/health` | `200 OK` plain text |
 
-### Health Check Logic
+Readiness becomes true only after the TCP listener, command handler, worker pool, and enabled HTTP services are initialized. Distributed brokers also require a resolvable cluster leader. Leader election can therefore produce `/live = 200` and `/ready = 503`, which keeps the process alive while removing it from client traffic.
 
-The health handler in `pkg/server/main.go` checks the `brokerReady` atomic boolean.
-
-| Condition | HTTP Status | Response Body |
-|-----------|-------------|----------------|
-| `brokerReady.Load() == false` | 503 Service Unavailable | `"Broker not ready: Main listener not active"` |
-| `brokerReady.Load() == true` | 200 OK | `"OK"` |
-
-The `brokerReady` flag is set to `true` immediately after the TCP listener starts successfully, ensuring that health checks pass only when the server can accept connections.
+See [Broker Observability](../reference/observability.md) for response bodies, metrics, and probe examples.
 
 ## Integration with Other Systems
 

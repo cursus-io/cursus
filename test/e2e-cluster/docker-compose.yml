@@ -19,7 +19,7 @@ services:
     volumes:
       - ../cluster/config.yaml:/root/config.yaml
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
       interval: 3s
       timeout: 1s
       retries: 3
@@ -46,13 +46,13 @@ services:
     volumes:
       - ../cluster/config.yaml:/root/config.yaml
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
       interval: 3s
       timeout: 1s
       retries: 3
     depends_on:
       broker-1:
-        condition: service_healthy
+        condition: service_started
     networks:
       - cluster_network
 
@@ -76,13 +76,13 @@ services:
     volumes:
       - ../cluster/config.yaml:/root/config.yaml
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
       interval: 3s
       timeout: 1s
       retries: 3
     depends_on:
       broker-1:
-        condition: service_healthy
+        condition: service_started
     networks:
       - cluster_network
 

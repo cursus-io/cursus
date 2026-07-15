@@ -10,9 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster"
@@ -24,6 +23,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/metrics"
+	"github.com/cursus-io/cursus/pkg/observability"
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
@@ -35,19 +35,10 @@ const (
 	DefaultHealthCheckPort = 9080
 )
 
-var brokerReady = &atomic.Bool{}
-
 // RunServer starts the broker with optional TLS and gzip
 func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager, cd *coordinator.Coordinator, sm *stream.StreamManager) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	if cfg.EnableExporter {
-		metrics.StartMetricsServer(cfg.ExporterPort)
-		util.Info("📈 Prometheus exporter started on port %d", cfg.ExporterPort)
-	} else {
-		util.Info("📉 Exporter disabled")
-	}
 
 	addr := fmt.Sprintf(":%d", cfg.BrokerPort)
 	var ln net.Listener
@@ -65,6 +56,7 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 		return err
 	}
 
+	defer func() { _ = ln.Close() }()
 	util.Info("🧩 Broker listening on %s (TLS=%v, Compression=%v)", addr, cfg.UseTLS, cfg.CompressionType)
 
 	if cd != nil {
@@ -166,12 +158,6 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 		util.Info("🌐 Distributed clustering enabled (brokerID=%s, localAddr=%s)", brokerID, localAddr)
 	}
 
-	healthPort := cfg.HealthCheckPort
-	if healthPort == 0 {
-		healthPort = DefaultHealthCheckPort
-	}
-	startHealthCheckServer(healthPort, brokerReady)
-
 	globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
 	if cd != nil {
 		cd.SetGroupSessionCallbacks(globalCH.IsGroupCoordinator, globalCH.ExpireGroupMembers)
@@ -187,30 +173,89 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	if err := globalCH.RecoverPreparedTransactions(); err != nil {
 		return fmt.Errorf("failed to recover prepared transactions: %w", err)
 	}
-	brokerReady.Store(true)
 
-	go func() {
-		<-ctx.Done()
-		if err := globalCH.Close(); err != nil {
-			util.Error("Failed to close command handler: %v", err)
+	healthState := NewHealthState()
+	healthState.AddCheck("storage", func(context.Context) error {
+		if tm == nil || dm == nil {
+			return fmt.Errorf("storage subsystem unavailable")
 		}
-	}()
+		return dm.Ready()
+	})
+	if cfg.EnabledDistribution {
+		healthState.AddCheck("cluster_leader", func(context.Context) error {
+			if cc == nil {
+				return fmt.Errorf("cluster controller unavailable")
+			}
+			_, leaderErr := cc.GetClusterLeader()
+			return leaderErr
+		})
+	}
+
+	runtimeCollector := observability.NewCollector(tm, cd, dm, sm, cc, healthState)
+	if cfg.EnableExporter {
+		metricsServer, startErr := metrics.StartMetricsServer(cfg.ExporterPort, runtimeCollector)
+		if startErr != nil {
+			return fmt.Errorf("start metrics exporter: %w", startErr)
+		}
+		defer shutdownHTTPServer(metricsServer)
+		util.Info("📈 Prometheus exporter started on port %d", cfg.ExporterPort)
+	} else {
+		util.Info("📉 Exporter disabled")
+	}
+
+	healthPort := cfg.HealthCheckPort
+	if healthPort == 0 {
+		healthPort = DefaultHealthCheckPort
+	}
+	healthServer, healthErr := startHealthCheckServer(healthPort, healthState)
+	if healthErr != nil {
+		return fmt.Errorf("start health server: %w", healthErr)
+	}
+	defer shutdownHTTPServer(healthServer)
 
 	workerCh := make(chan net.Conn, maxWorkers)
+	var workerWG sync.WaitGroup
 	for i := 0; i < maxWorkers; i++ {
+		workerWG.Add(1)
 		go func() {
+			defer workerWG.Done()
 			for conn := range workerCh {
 				handleConn(ctx, conn, globalCH)
 			}
 		}()
 	}
+	defer func() {
+		healthState.SetReady(false)
+		cancel()
+		close(workerCh)
+		workerWG.Wait()
+		if err := globalCH.Close(); err != nil {
+			util.Error("Failed to close command handler: %v", err)
+		}
+	}()
 
+	var temporaryDelay time.Duration
 	for {
+		healthState.SetReady(true)
 		conn, err := ln.Accept()
 		if err != nil {
-			util.Error("⚠️ Accept error: %v", err)
+			if errors.Is(err, net.ErrClosed) {
+				return fmt.Errorf("broker listener closed: %w", err)
+			}
+			healthState.SetReady(false)
+			if temporaryDelay == 0 {
+				temporaryDelay = 5 * time.Millisecond
+			} else {
+				temporaryDelay *= 2
+			}
+			if maximum := time.Second; temporaryDelay > maximum {
+				temporaryDelay = maximum
+			}
+			util.Warn("accept error; retrying in %s: %v", temporaryDelay, err)
+			time.Sleep(temporaryDelay)
 			continue
 		}
+		temporaryDelay = 0
 		workerCh <- conn
 	}
 }
@@ -269,8 +314,15 @@ func handleInternalConn(ctx context.Context, conn net.Conn, cmdHandler *controll
 	handleConnWithContext(ctx, conn, cmdHandler, controller.NewInternalClientContext("default-group", 0))
 }
 
+func observeClientConnection() func() {
+	metrics.ClientConnectionsTotal.Inc()
+	metrics.ClientConnectionsActive.Inc()
+	return metrics.ClientConnectionsActive.Dec
+}
+
 // handleConn processes a connection using a shared CommandHandler.
 func handleConn(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler) {
+	defer observeClientConnection()()
 	handleConnWithContext(ctx, conn, cmdHandler, controller.NewClientContext("default-group", 0))
 }
 
@@ -286,6 +338,11 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 	defer cancel()
 
 	for {
+		select {
+		case <-clientCtx.Done():
+			return
+		default:
+		}
 		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 			util.Error("⚠️ SetReadDeadline error: %v", err)
 			return
@@ -328,6 +385,7 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 // HandleConnection processes a single client connection (creates a new CommandHandler per call).
 // Deprecated: prefer handleConn with a shared CommandHandler to avoid file descriptor leaks.
 func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager, cfg *config.Config, cd *coordinator.Coordinator, sm *stream.StreamManager, cc *clusterController.ClusterController) {
+	defer observeClientConnection()()
 	isStreamed := false
 	defer func() {
 		if !isStreamed {
@@ -342,6 +400,11 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 	defer func() { _ = cmdHandler.Close() }()
 
 	for {
+		select {
+		case <-clientCtx.Done():
+			return
+		default:
+		}
 		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 			util.Error("⚠️ SetReadDeadline error: %v", err)
 			return
@@ -405,6 +468,9 @@ func readMessage(conn net.Conn, compressionType string) ([]byte, error) {
 	}
 
 	msgLen := binary.BigEndian.Uint32(lenBuf)
+	if msgLen > uint32(util.MaxMessageSize) {
+		return nil, fmt.Errorf("message size %d exceeds maximum %d", msgLen, util.MaxMessageSize)
+	}
 	msgBuf := make([]byte, msgLen)
 	if _, err := io.ReadFull(conn, msgBuf); err != nil {
 		if err != io.EOF {
@@ -652,35 +718,4 @@ func writeResponse(conn net.Conn, msg string) {
 		util.Error("⚠️ Write response error: %v", err)
 		return
 	}
-}
-
-// startHealthCheckServer starts a simple HTTP server for health checks
-func startHealthCheckServer(port int, brokerReady *atomic.Bool) {
-	mux := http.NewServeMux()
-	healthHandler := func(w http.ResponseWriter, r *http.Request) {
-		if !brokerReady.Load() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			if _, err := w.Write([]byte("Broker not ready: Main listener not active")); err != nil {
-				util.Error("⚠️ Health check response write error: %v", err)
-			}
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte("OK")); err != nil {
-			util.Error("⚠️ Health check response write error: %v", err)
-		}
-	}
-
-	mux.HandleFunc("/health", healthHandler)
-	mux.HandleFunc("/", healthHandler)
-
-	addr := fmt.Sprintf(":%d", port)
-
-	go func() {
-		if err := http.ListenAndServe(addr, mux); err != nil {
-			util.Error("❌ Health check server failed: %v", err)
-		}
-	}()
-	util.Info("🩺 Health check endpoint started on port %d", port)
 }

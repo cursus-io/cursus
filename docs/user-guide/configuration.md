@@ -107,13 +107,14 @@ The configuration is represented by the Config struct in the codebase, which org
 | Parameter           | Type       | Default        | Description                                      |
 |--------------------|------------|----------------|--------------------------------------------------|
 | `broker_port`        | int        | 9000           | Main broker TCP port for client connections     |
-| `health_check_port`  | int        | 9080           | HTTP port for health check endpoint             |
+| `health_check_port`  | int        | 9080           | HTTP port for `/live`, `/ready`, and `/health`             |
 | `log_dir`            | string     | "broker-logs"  | Directory path for persistent log segments      |
 | `enable_exporter`    | bool       | true           | Enable Prometheus metrics exporter              |
-| `exporter_port`      | int        | 9100           | HTTP port for Prometheus metrics endpoint       |
+| `exporter_port`      | int        | 9100           | HTTP port for the Prometheus `/metrics` endpoint       |
 | `enable_benchmark`   | bool       | false          | Enable benchmark mode for testing               |
 | `cleanup_interval`   | int        | 300            | Log cleanup interval (seconds)                 |
 
+The health and metrics listeners are unauthenticated operations endpoints. Restrict both ports to a trusted network. `/live` reports process liveness, while `/ready` and the compatible `/health` endpoint include storage and distributed leader checks. See [Broker Observability](../reference/observability.md).
 
 # Security and Compression
 
