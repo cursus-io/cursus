@@ -307,6 +307,22 @@ Any broker can answer this command. Addresses are the advertised client addresse
 > In cluster mode, `CONSUME` and `STREAM` should be sent to the partition leader. If sent to a non-leader broker, the response will be:
 > `ERROR: NOT_LEADER LEADER_IS <host:port>`
 
+**CLUSTER_STATUS**
+```
+CLUSTER_STATUS
+```
+Response: `OK cluster=<json>`. The JSON payload reports active and inactive brokers, the Raft leader, per-partition leader/epoch/HWM/replica/ISR state, and aggregate leaderless and under-replicated counts. Serialization failure returns `ERROR: marshal_cluster_status_failed reason="..."`.
+
+**ELECT_LEADER**
+```
+ELECT_LEADER topic=<name> partition=<N> broker=<broker-id>
+```
+Response: `OK topic=<name> partition=<N> previous_leader=<broker-id> leader=<broker-id> leader_epoch=<N> changed=<true|false>`.
+
+The target must be an active broker in both the replica set and ISR. The Raft FSM compares the expected current leader epoch before changing leaders, increments the epoch exactly once, and preserves the committed HWM and replica membership. A retry against the already selected leader is idempotent. `ELECT_LEADER` is not a partition reassignment or broker-drain command and never promotes an out-of-sync replica.
+
+Missing targets return `ERROR: missing_broker command=ELECT_LEADER`; rejected state changes return `ERROR: leader_election_rejected ...`; an unavailable apply result returns `ERROR: leader_election_result_unavailable ...` and may be retried because election is idempotent.
+
 #### Consumer Group Coordination
 
 **JOIN_GROUP**

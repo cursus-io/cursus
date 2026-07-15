@@ -173,6 +173,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyPartitionCommand(strings.TrimPrefix(data, "PARTITION:"))
 	case strings.HasPrefix(data, "PARTITION_COMMIT:"):
 		res = f.applyPartitionCommitCommand(strings.TrimPrefix(data, "PARTITION_COMMIT:"))
+	case strings.HasPrefix(data, "LEADER_ELECTION:"):
+		res = f.applyLeaderElectionCommand(strings.TrimPrefix(data, "LEADER_ELECTION:"))
 	case strings.HasPrefix(data, "GROUP_SYNC:"):
 		res = f.applyGroupSyncCommand(strings.TrimPrefix(data, "GROUP_SYNC:"))
 	case strings.HasPrefix(data, "OFFSET_SYNC:"):

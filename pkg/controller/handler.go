@@ -91,6 +91,8 @@ func NewCommandHandler(
 		{prefix: "NEGOTIATE", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleNegotiate(cmd, ctx) }},
 		{prefix: "NEGOTIATE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleNegotiate(cmd, ctx) }},
 		{prefix: "LIST_CLUSTER", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListCluster() }},
+		{prefix: "CLUSTER_STATUS", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleClusterStatus() }},
+		{prefix: "ELECT_LEADER ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleElectLeader(cmd) }},
 		{prefix: "LIST", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList() }},
 		{prefix: "CREATE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd) }},
 		{prefix: "DELETE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd) }},
