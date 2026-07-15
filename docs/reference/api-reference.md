@@ -25,6 +25,34 @@ Clients should treat `OK`, `OK ...`, and JSON responses with `status:"OK"` as su
 
 Legacy natural-language responses such as `Topic '<name>' now has <N> partitions`, `(no topics)`, or plain integer offsets are deprecated. SDKs may keep narrow fallback parsers for older brokers, but new client code should use the structured contract above.
 
+## Protocol Commands
+
+### PROTOCOL_INFO
+
+```text
+PROTOCOL_INFO
+```
+
+Returns the supported wire protocol range, default version, feature names, and structured error classes without changing connection state:
+
+```text
+OK protocol=cursus min_version=1 max_version=1 default_version=1 features=<csv> error_classes=<csv>
+```
+
+### NEGOTIATE
+
+```text
+NEGOTIATE version=<N> [features=<csv|*>] [require_features=<true|false>]
+```
+
+Negotiation applies only to the current TCP connection. Success returns:
+
+```text
+OK protocol_version=<N> enabled=<csv> unsupported=<csv>
+```
+
+With `structured_errors_v1` enabled, subsequent text errors use `ERROR: <code> class=<class> retryable=<bool> ...`. Existing clients that do not negotiate retain the previous response shape. Clients opening multiple data, coordinator, or partition connections must negotiate each connection independently.
+
 ## Topic Commands
 
 ### CREATE

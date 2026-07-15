@@ -24,6 +24,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/metrics"
+	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/util"
@@ -431,7 +432,7 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 		if err != nil {
 			return false, err
 		}
-		writeResponse(conn, resp)
+		writeResponse(conn, decorateServerResponse(resp, ctx))
 		return false, nil
 	}
 
@@ -450,7 +451,7 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 			return handleCommandMessage(rawInput, cmdHandler, ctx, conn)
 		}
 		util.Error("⚠️ Decode error and not a raw command: %v [%s]", err, string(data))
-		writeResponse(conn, fmt.Sprintf("ERROR: decode_failed reason=%q", err.Error()))
+		writeResponse(conn, decorateServerResponse(fmt.Sprintf("ERROR: decode_failed reason=%q", err.Error()), ctx))
 		return false, nil
 	}
 
@@ -477,7 +478,7 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 
 	rawInput := strings.TrimSpace(string(data))
 	util.Debug("[%s] Received unrecognized input: %s", conn.RemoteAddr().String(), rawInput)
-	writeResponse(conn, "ERROR: malformed_input reason=missing_topic_or_payload")
+	writeResponse(conn, decorateServerResponse("ERROR: malformed_input reason=missing_topic_or_payload", ctx))
 	return true, nil
 }
 
@@ -548,13 +549,13 @@ func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler,
 				if errors.Is(err, controller.ErrStreamRejected) {
 					return false, nil
 				}
-				writeResponse(conn, fmt.Sprintf("ERROR: command_failed reason=%q", err.Error()))
+				writeResponse(conn, commandErrorResponse(err, ctx))
 				return false, nil
 			}
 			return true, nil
 		} else {
 			if _, err := cmdHandler.HandleConsumeCommand(conn, payload, ctx); err != nil {
-				writeResponse(conn, fmt.Sprintf("ERROR: command_failed reason=%q", err.Error()))
+				writeResponse(conn, commandErrorResponse(err, ctx))
 			}
 			return false, nil
 		}
@@ -562,8 +563,23 @@ func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler,
 	if resp == "" {
 		resp = "ERROR: empty_command_response"
 	}
-	writeResponse(conn, resp)
+	writeResponse(conn, decorateServerResponse(resp, ctx))
 	return false, nil
+}
+
+func commandErrorResponse(err error, ctx *controller.ClientContext) string {
+	resp := err.Error()
+	if !strings.HasPrefix(resp, "ERROR:") {
+		resp = fmt.Sprintf("ERROR: command_failed reason=%q", resp)
+	}
+	return decorateServerResponse(resp, ctx)
+}
+
+func decorateServerResponse(resp string, ctx *controller.ClientContext) string {
+	if ctx == nil || !ctx.HasFeature(wireprotocol.FeatureStructuredErrorsV1) {
+		return resp
+	}
+	return wireprotocol.EnrichErrorResponse(resp)
 }
 
 // isBatchMessage checks if the data is in binary batch format
@@ -588,7 +604,7 @@ func isCommand(s string) bool {
 		"GROUP_STATUS", "FETCH_OFFSET", "LIST_GROUPS", "SYNC_GROUP", "DESCRIBE",
 		"APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT", "READ_SNAPSHOT", "STREAM_VERSION",
 		"REPLICATE_MESSAGE", "REPLICATE_SNAPSHOT", "LIST_SNAPSHOTS", "FETCH_SNAPSHOT", "CATCHUP_SNAPSHOTS",
-		"FIND_COORDINATOR", "RAFT_APPLY", "METADATA", "INTERNAL_BATCH"}
+		"FIND_COORDINATOR", "RAFT_APPLY", "METADATA", "INTERNAL_BATCH", "PROTOCOL_INFO", "NEGOTIATE"}
 	for _, k := range keywords {
 		if strings.HasPrefix(strings.ToUpper(s), k) {
 			return true

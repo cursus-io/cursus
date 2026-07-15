@@ -141,6 +141,10 @@ func (p *Producer) fetchMetadata() {
 		if err != nil {
 			continue
 		}
+		if err := negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS); err != nil {
+			_ = conn.Close()
+			continue
+		}
 		cmd := fmt.Sprintf("METADATA topic=%s", p.config.Topic)
 		if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
 			_ = conn.Close()
@@ -194,6 +198,9 @@ func (p *Producer) CreateTopic(topic string, partitions int) error {
 	}
 	defer func() { _ = conn.Close() }()
 
+	if err := negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS); err != nil {
+		return fmt.Errorf("protocol negotiation: %w", err)
+	}
 	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, partitions, p.config.EnableIdempotence)
 	cmdBytes := EncodeMessage("admin", createCmd)
 
@@ -207,8 +214,8 @@ func (p *Producer) CreateTopic(topic string, partitions int) error {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return fmt.Errorf("broker error: %s", respStr)
+	if brokerErr, ok := ParseBrokerError(respStr); ok {
+		return brokerErr
 	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return fmt.Errorf("unexpected create response: %s", respStr)

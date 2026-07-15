@@ -39,6 +39,11 @@ type PublisherConfig struct {
 	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
 	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
 
+	ProtocolVersion              int      `yaml:"protocol_version" json:"protocol_version"`
+	ProtocolFeatures             []string `yaml:"protocol_features" json:"protocol_features"`
+	RequireProtocolFeatures      bool     `yaml:"require_protocol_features" json:"require_protocol_features"`
+	ProtocolNegotiationTimeoutMS int      `yaml:"protocol_negotiation_timeout_ms" json:"protocol_negotiation_timeout_ms"`
+
 	CompressionType string `yaml:"compression_type" json:"compression_type"` // "none", "gzip", "snappy", "lz4"
 
 	EnableMetrics bool `yaml:"enable_metrics" json:"enable_metrics"`
@@ -132,6 +137,11 @@ type ConsumerConfig struct {
 	UseTLS      bool   `yaml:"use_tls" json:"use_tls"`
 	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
 	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
+
+	ProtocolVersion              int      `yaml:"protocol_version" json:"protocol_version"`
+	ProtocolFeatures             []string `yaml:"protocol_features" json:"protocol_features"`
+	RequireProtocolFeatures      bool     `yaml:"require_protocol_features" json:"require_protocol_features"`
+	ProtocolNegotiationTimeoutMS int      `yaml:"protocol_negotiation_timeout_ms" json:"protocol_negotiation_timeout_ms"`
 
 	LeaderStaleness         time.Duration `yaml:"leader_staleness" json:"leader_staleness"`
 	MetadataRefreshInterval time.Duration `yaml:"metadata_refresh_interval" json:"metadata_refresh_interval"`

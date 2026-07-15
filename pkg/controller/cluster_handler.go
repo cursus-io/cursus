@@ -240,7 +240,10 @@ func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition in
 	for i := 0; i < maxRetries; i++ {
 		resp, err := ch.Cluster.Router.ForwardToPartitionLeader(topic, partition, string(encodedCmd))
 		if err == nil {
-			if !strings.HasPrefix(resp, "ERROR: not the partition leader") {
+			const legacyNotLeaderPrefix = "ERROR:" + " not the partition leader"
+			isLeaderRedirect := strings.HasPrefix(resp, "ERROR: NOT_LEADER") ||
+				strings.HasPrefix(resp, legacyNotLeaderPrefix)
+			if !isLeaderRedirect {
 				return resp, true, nil
 			}
 			lastErr = fmt.Errorf("%s", resp)

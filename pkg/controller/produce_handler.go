@@ -624,7 +624,7 @@ func parseControlBatchBytes(value, field string) ([]byte, string) {
 	}
 	decoded, err := base64.StdEncoding.DecodeString(value)
 	if err != nil {
-		return nil, fmt.Sprintf("ERROR: invalid_control_batch_%s reason=%q", field, err.Error())
+		return nil, fmt.Sprintf("ERROR: invalid_control_batch_bytes field=%s reason=%q", field, err.Error())
 	}
 	return decoded, ""
 }

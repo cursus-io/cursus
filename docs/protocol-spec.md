@@ -1,6 +1,7 @@
 # Cursus Wire Protocol Specification
 
-> Version: 1.0
+> Specification revision: 1.1
+> Supported wire protocol versions: 1
 > Target audience: SDK implementors (C++, Java, Python, Go)
 
 ---
@@ -24,6 +25,8 @@
 Client              Broker
   |--- TCP connect --->|
   |                    | (worker assigned)
+  |--- PROTOCOL_INFO ->| (optional discovery)
+  |--- NEGOTIATE ----->| (optional, once per connection)
   |--- command/batch ->| (length-prefixed frame)
   |<-- response -------|
   |--- command ------->|
@@ -120,6 +123,50 @@ Text command responses are machine-readable.
 - Failure responses MUST be `ERROR: <code> [key=value ...]`.
 - Clients SHOULD branch on the `OK` / JSON status / `ERROR:` contract instead of matching natural-language phrases.
 - Legacy bare responses, such as the old CREATE phrase or plain integer offsets, are deprecated and should only be accepted by clients as narrow backward-compatible fallbacks.
+
+### Protocol Discovery and Negotiation
+
+Negotiation is optional and connection-scoped. A client that sends neither command remains on wire protocol version 1 with legacy-compatible text errors. Clients should negotiate immediately after opening every TCP connection, before sending application commands.
+
+**PROTOCOL_INFO**
+
+```text
+PROTOCOL_INFO
+```
+
+Response:
+
+```text
+OK protocol=cursus min_version=1 max_version=1 default_version=1 features=<csv> error_classes=<csv>
+```
+
+The response is safe to query without changing connection state.
+
+**NEGOTIATE**
+
+```text
+NEGOTIATE version=<N> [features=<csv|*>] [require_features=<true|false>]
+```
+
+Success response:
+
+```text
+OK protocol_version=<N> enabled=<csv> unsupported=<csv>
+```
+
+`features=*` enables every feature advertised by `PROTOCOL_INFO`. Named features use lowercase ASCII letters, digits, and underscores, with at most 64 names of 64 bytes each. Unknown valid optional features are returned in `unsupported=`. When `require_features=true`, any unknown feature rejects the negotiation with `ERROR: UNSUPPORTED_FEATURE ...` and leaves the connection context unchanged. An unsupported version returns `ERROR: UNSUPPORTED_PROTOCOL_VERSION ...`.
+
+Version 1 features currently advertised by the broker are:
+
+| Feature | Contract |
+|---------|----------|
+| `structured_errors_v1` | Adds `class=<class> retryable=<bool>` to text `ERROR:` responses on this connection |
+| `stream_control_v1` | Supports documented `STREAM_CONTROL` close frames |
+| `offset_resume_v1` | Supports broker-owned `FETCH_OFFSET`/commit resume semantics |
+| `idempotent_producer_v1` | Supports producer ID, epoch, and sequence fencing |
+| `event_sourcing_v1` | Supports event stream and snapshot commands |
+
+Feature names describe independent contracts; clients must not infer support for an unadvertised feature from the protocol version alone.
 
 ### Command Reference
 
@@ -737,9 +784,32 @@ last successful broker commit.
 
 ### Error Response Format
 
-```
+Without feature negotiation, the backward-compatible response is:
+
+```text
 ERROR: <code> [key=value ...]
 ```
+
+After negotiating `structured_errors_v1`, every text error generated for that connection includes classification metadata directly after the code:
+
+```text
+ERROR: <code> class=<class> retryable=<true|false> [key=value ...]
+```
+
+`retryable=true` means the same logical operation may be attempted again after applying the response instructions, such as reconnecting to the advertised leader or waiting for coordinator availability. `retryable=false` means blindly repeating the same request is not valid; the client may still recover by changing state, rejoining a group, correcting input, or obtaining authorization.
+
+| Class | Meaning | Typical client action |
+|-------|---------|-----------------------|
+| `routing` | Request reached the wrong broker | Follow redirect metadata and retry |
+| `availability` | Required broker subsystem is temporarily unavailable | Back off and retry |
+| `fencing` | Producer epoch, group generation, member, or ownership is stale | Recreate producer state or rejoin; do not repeat unchanged request |
+| `conflict` | Request conflicts with authoritative state | Refresh state and decide whether to issue a changed request |
+| `authorization` | Principal or topic policy denied the operation | Fail closed |
+| `not_found` | Requested resource does not exist | Create or select a valid resource |
+| `validation` | Command syntax or value is invalid | Correct the request |
+| `internal` | Broker could not classify a safe recovery action | Fail closed and surface diagnostics |
+
+SDKs should parse the code and fields first, use `class` for broad handling, and use `retryable` only as a retry eligibility signal. They must still apply bounded backoff and must never retry a non-idempotent operation unless its command contract makes the retry safe. The broker's authoritative code-to-class registry is implemented in `pkg/protocol`; a coverage test fails when a new static `ERROR:` emission is added without a registry entry.
 
 ### Error Codes
 
@@ -759,6 +829,7 @@ ERROR: <code> [key=value ...]
 | `stale_producer_epoch producer=<id> current=<N> got=<N>` | Idempotent producer request uses an older fenced epoch | Treat as fatal for that producer instance; create a new producer session |
 | `OFFSET_OUT_OF_RANGE requested=N earliest=N latest=N` | Requested offset is older than retained log or beyond available range | Treat as data loss or reset according to policy |
 | `no_valid_offsets` | BATCH_COMMIT parse failure | Check format: `P<N>:<offset>` |
+| invalid_control_batch_bytes field=<key|value> | Broker-internal transaction control bytes are not valid base64 | Reject the internal publish and inspect broker compatibility |
 | `version_conflict current=N expected=N` | Optimistic concurrency failure | Reload aggregate and retry |
 | `event_sourcing_not_enabled topic=<X>` | ES command on non-ES topic | CREATE topic with `event_sourcing=true` |
 | `snapshot_version_exceeds_stream version=N current=N` | Invalid snapshot version | Use version <= current stream version |
@@ -830,7 +901,9 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - [ ] Text command formatting
 - [ ] JSON response parsing (AckResponse, DESCRIBE, GROUP_STATUS)
 - [ ] Consumer group lifecycle (JOIN → SYNC → HEARTBEAT → CONSUME → COMMIT)
-- [ ] Error response parsing
+- [ ] Error response parsing, including quoted values
+- [ ] `PROTOCOL_INFO` discovery and connection-scoped `NEGOTIATE`
+- [ ] Structured error class and retry eligibility handling
 - [ ] Leader redirect handling
 
 ### Recommended

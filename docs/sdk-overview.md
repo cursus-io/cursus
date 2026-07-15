@@ -70,6 +70,8 @@ flowchart TB
 | TLS | ✅ | ✅ | ✅ |
 | FindCoordinator | ✅ | ✅ | ✅ |
 | Partition Leader Routing | ✅ | ✅ | ✅ |
+| Protocol capability negotiation | ✅ | pending | pending |
+| Typed structured broker errors | ✅ | pending | pending |
 | Framework Integration | — | Spring Boot | FastAPI |
 | Iterator Pattern | — | — | ✅ for/async for |
 
@@ -103,3 +105,28 @@ sequenceDiagram
         COORD-->>SDK: OK member=M-1234 generation=N
     end
 ```
+## Protocol Capability Negotiation
+
+The Go SDK can query broker capabilities with `sdk.FetchProtocolInfo(conn)` and negotiate a connection with `sdk.NegotiateProtocol(conn, request)`. High-level producer and consumer clients perform the same handshake automatically when protocol settings are configured:
+
+```go
+cfg := sdk.NewDefaultConsumerConfig()
+cfg.ProtocolVersion = 1
+cfg.ProtocolFeatures = []string{"structured_errors_v1", "offset_resume_v1"}
+cfg.RequireProtocolFeatures = true
+```
+
+The default configuration leaves automatic negotiation disabled for compatibility with older brokers. Set `ProtocolVersion` or at least one `ProtocolFeatures` entry to enable it. Negotiation then runs once for every newly opened or reconnected TCP connection. A failed required negotiation closes the connection before it can be used, and `RequireProtocolFeatures=true` requires at least one configured feature. `ProtocolNegotiationTimeoutMS` bounds the handshake; values less than or equal to zero use 5000 ms.
+
+Broker failures returned by negotiation are available as `*sdk.BrokerError`:
+
+```go
+var brokerErr *sdk.BrokerError
+if errors.As(err, &brokerErr) {
+    if brokerErr.Retryable {
+        // Apply bounded backoff or redirect handling before retrying.
+    }
+}
+```
+
+`BrokerError` exposes `Code`, `Class`, `Retryable`, `Fields`, and the raw response. It also remains compatible with existing Go SDK sentinels such as `ErrTopicNotFound`, `ErrInvalidPartition`, and `ErrNotLeader` through `errors.Is`.
