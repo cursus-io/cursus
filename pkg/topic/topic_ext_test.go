@@ -97,34 +97,34 @@ func TestPartition_Basic(t *testing.T) {
 
 	t.Run("Enqueue", func(t *testing.T) {
 		msg := types.Message{Payload: "msg1"}
-		mh.On("AppendMessage", "test-topic", 0, mock.Anything).Return(uint64(11), nil).Once()
+		mh.On("AppendMessage", "test-topic", 0, mock.Anything).Return(uint64(10), nil).Once()
 		p.Enqueue(msg)
 
 		assert.Eventually(t, func() bool {
-			return p.NextOffset() == 12
+			return p.NextOffset() == 11
 		}, 500*time.Millisecond, 5*time.Millisecond, "offset should increment after enqueue")
 	})
 
 	t.Run("EnqueueSync", func(t *testing.T) {
 		msg := types.Message{Payload: "msg-sync"}
-		mh.On("AppendMessageSync", "test-topic", 0, mock.Anything).Return(uint64(12), nil).Once()
+		mh.On("AppendMessageSync", "test-topic", 0, mock.Anything).Return(uint64(11), nil).Once()
 		err := p.EnqueueSync(msg)
 		assert.NoError(t, err)
-		assert.Equal(t, uint64(13), p.NextOffset())
+		assert.Equal(t, uint64(12), p.NextOffset())
 	})
 
 	t.Run("Idempotence", func(t *testing.T) {
 		p.isIdempotent = true
 		msg := types.Message{Payload: "idemp", ProducerID: "p1", SeqNum: 1}
 
-		mh.On("AppendMessageSync", "test-topic", 0, mock.Anything).Return(uint64(13), nil).Once()
+		mh.On("AppendMessageSync", "test-topic", 0, mock.Anything).Return(uint64(12), nil).Once()
 		err := p.EnqueueSync(msg)
 		assert.NoError(t, err)
 
 		// Duplicate
 		err = p.EnqueueSync(msg)
 		assert.NoError(t, err)                      // Should skip without error
-		assert.Equal(t, uint64(14), p.NextOffset()) // Offset didn't increase
+		assert.Equal(t, uint64(13), p.NextOffset()) // Offset didn't increase
 	})
 
 	t.Run("ProducerStateOnlyTracksIdempotentTopics", func(t *testing.T) {

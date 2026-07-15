@@ -84,11 +84,11 @@ func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, i
 			if err := existing.AddPartitions(partitionCount-current, tm.hp); err != nil {
 				return fmt.Errorf("failed to add partitions to topic '%s': %w", name, err)
 			}
-			existing.Policy = normalizedPolicy
+			existing.ApplyPolicy(normalizedPolicy)
 			util.Info("topic '%s' partitions increased: %d -> %d", name, current, len(existing.Partitions))
 			return nil
 		default:
-			existing.Policy = normalizedPolicy
+			existing.ApplyPolicy(normalizedPolicy)
 			util.Info("topic '%s' already exists with %d partitions", name, current)
 			return nil
 		}
