@@ -33,6 +33,7 @@ func (d *DiskHandler) openIndexFiles() error {
 	}
 
 	isReadOnly := false
+	// #nosec G304 -- indexPath is generated from this handler's broker-owned base name and numeric segment ID.
 	f, err := os.OpenFile(indexPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		if os.IsPermission(err) {
