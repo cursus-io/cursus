@@ -304,3 +304,23 @@ type fetchOffsetTestError struct {
 }
 
 func (e *fetchOffsetTestError) Error() string { return e.msg }
+
+func TestParseListOffsetsResponse(t *testing.T) {
+	ranges, err := parseListOffsetsResponse("OK topic=t partitions=2 offsets=P0:earliest=0:latest=10:leo=12:hwm=11,P1:earliest=3:latest=7:leo=8:hwm=7")
+	require.NoError(t, err)
+	require.Len(t, ranges, 2)
+	assert.Equal(t, PartitionOffsetRange{Partition: 0, Earliest: 0, Latest: 10, LEO: 12, HWM: 11}, ranges[0])
+	assert.Equal(t, PartitionOffsetRange{Partition: 1, Earliest: 3, Latest: 7, LEO: 8, HWM: 7}, ranges[1])
+
+	_, err = parseListOffsetsResponse("42")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected list offsets response")
+
+	_, err = parseListOffsetsResponse("OK topic=t partitions=1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing offsets")
+
+	_, err = parseListOffsetsResponse("ERROR: topic_not_found topic=t")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list offsets broker error")
+}

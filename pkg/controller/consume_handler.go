@@ -22,6 +22,9 @@ var ErrStreamRejected = errors.New("stream rejected")
 func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx *ClientContext) (int, error) {
 	// CONSUME topic=<name> partition=<N> offset=<N> group=<name> [autoOffsetReset=<earliest|latest>]
 	argsMap := parseKeyValueArgs(rawCmd[8:])
+	if authResp := ch.authenticateInline(argsMap, ctx); authResp != "" {
+		return 0, fmt.Errorf("%s", authResp)
+	}
 	if err := ch.validateConsumeArgs(argsMap); err != nil {
 		return 0, err
 	}
@@ -121,8 +124,8 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 	if err != nil {
 		return nil, err
 	}
-	if !t.Policy.CanRead() {
-		return nil, fmt.Errorf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=read", topicName)
+	if authResp := ch.authorizeTopicRead(t.Policy, ctx); authResp != "" {
+		return nil, fmt.Errorf("%s topic=%s", authResp, topicName)
 	}
 
 	cacheKey := fmt.Sprintf("%s-%d", topicName, cArgs.PartitionID)
@@ -194,6 +197,9 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	}
 
 	argsMap := parseKeyValueArgs(rawCmd[7:])
+	if authResp := ch.authenticateInline(argsMap, ctx); authResp != "" {
+		return fmt.Errorf("%s", authResp)
+	}
 	if err := ch.validateStreamArgs(argsMap); err != nil {
 		return err
 	}
@@ -217,8 +223,8 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	if err != nil {
 		return err
 	}
-	if !t.Policy.CanRead() {
-		return fmt.Errorf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=read", cArgs.TopicName)
+	if authResp := ch.authorizeTopicRead(t.Policy, ctx); authResp != "" {
+		return fmt.Errorf("%s topic=%s", authResp, cArgs.TopicName)
 	}
 
 	actualOffset, err := ch.resolveOffset(p, cArgs.TopicName, cArgs)

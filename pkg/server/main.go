@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -64,7 +65,6 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	}
 
 	util.Info("🧩 Broker listening on %s (TLS=%v, Compression=%v)", addr, cfg.UseTLS, cfg.CompressionType)
-	brokerReady.Store(true)
 
 	if cd != nil {
 		cd.Start()
@@ -139,7 +139,7 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 							"id": brokerID, "addr": localAddr, "client_addr": clientAddr,
 							"status": "active",
 						})
-						raftCmd := fmt.Sprintf("RAFT_APPLY type=REGISTER payload=%s", string(brokerJSON))
+						raftCmd := fmt.Sprintf("RAFT_APPLY %stype=REGISTER payload=%s", internalAuthPrefix(cfg), string(brokerJSON))
 						encodedCmd := util.EncodeMessage("", raftCmd)
 						if resp, err := cc.Router.ForwardToLeader(string(encodedCmd)); err == nil && !strings.HasPrefix(resp, "ERROR") {
 							util.Info("✅ Registered via leader with client address %s", clientAddr)
@@ -179,6 +179,16 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	if cc != nil {
 		cc.SetLocalProcessor(globalCH)
 	}
+	if cfg.EnabledDistribution && cfg.InternalBrokerPort > 0 {
+		if err := startInternalBrokerListener(ctx, cfg, globalCH); err != nil {
+			return err
+		}
+	}
+	if err := globalCH.RecoverPreparedTransactions(); err != nil {
+		return fmt.Errorf("failed to recover prepared transactions: %w", err)
+	}
+	brokerReady.Store(true)
+
 	go func() {
 		<-ctx.Done()
 		if err := globalCH.Close(); err != nil {
@@ -205,8 +215,66 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	}
 }
 
+func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHandler *controller.CommandHandler) error {
+	addr := fmt.Sprintf(":%d", cfg.InternalBrokerPort)
+	var ln net.Listener
+	var err error
+	if cfg.InternalUseTLS {
+		ln, err = tls.Listen("tcp", addr, cfg.InternalServerTLSConfig())
+	} else {
+		ln, err = net.Listen("tcp", addr)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to start internal broker listener on %s: %w", addr, err)
+	}
+
+	util.Info("🔒 Internal broker listener started on %s (mTLS=%v)", addr, cfg.InternalUseTLS)
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+	workerCh := make(chan net.Conn, maxWorkers)
+	for i := 0; i < maxWorkers; i++ {
+		go func() {
+			for conn := range workerCh {
+				handleInternalConn(ctx, conn, cmdHandler)
+			}
+		}()
+	}
+	go func() {
+		defer close(workerCh)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					util.Error("⚠️ Internal accept error: %v", err)
+					continue
+				}
+			}
+			select {
+			case workerCh <- conn:
+			default:
+				util.Warn("⚠️ Internal worker pool saturated; closing connection from %s", conn.RemoteAddr())
+				_ = conn.Close()
+			}
+		}
+	}()
+	return nil
+}
+
+func handleInternalConn(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler) {
+	handleConnWithContext(ctx, conn, cmdHandler, controller.NewInternalClientContext("default-group", 0))
+}
+
 // handleConn processes a connection using a shared CommandHandler.
 func handleConn(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler) {
+	handleConnWithContext(ctx, conn, cmdHandler, controller.NewClientContext("default-group", 0))
+}
+
+func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler, cmdCtx *controller.ClientContext) {
 	isStreamed := false
 	defer func() {
 		if !isStreamed {
@@ -216,8 +284,6 @@ func handleConn(ctx context.Context, conn net.Conn, cmdHandler *controller.Comma
 
 	clientCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
-	cmdCtx := controller.NewClientContext("default-group", 0)
 
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -316,6 +382,13 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 	}
 }
 
+func internalAuthPrefix(cfg *config.Config) string {
+	if cfg != nil && cfg.InternalAuthToken != "" {
+		return "internal_token=" + cfg.InternalAuthToken + " "
+	}
+	return ""
+}
+
 func initializeConnection(cfg *config.Config, tm *topic.TopicManager, cd *coordinator.Coordinator, sm *stream.StreamManager, cc *clusterController.ClusterController) (*controller.CommandHandler, *controller.ClientContext) {
 	cmdHandler := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
 	ctx := controller.NewClientContext("default-group", 0)
@@ -351,7 +424,11 @@ func readMessage(conn net.Conn, compressionType string) ([]byte, error) {
 
 func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *controller.ClientContext, conn net.Conn) (bool, error) {
 	if isBatchMessage(data) {
-		resp, err := cmdHandler.HandleBatchMessage(data, conn)
+		if ctx != nil && ctx.Internal && cmdHandler.Config != nil && cmdHandler.Config.InternalAuthToken != "" && !cmdHandler.Config.InternalUseTLS {
+			writeResponse(conn, "ERROR: internal_batch_requires_token_wrapper")
+			return false, nil
+		}
+		resp, err := cmdHandler.HandleBatchMessage(data, conn, ctx)
 		if err != nil {
 			return false, err
 		}
@@ -363,7 +440,14 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 	if err != nil {
 		rawInput := string(data)
 		rawInput = strings.Trim(rawInput, "\x00 \t\n\r")
+		if strings.HasPrefix(strings.ToUpper(rawInput), "INTERNAL_BATCH ") {
+			return handleInternalBatchMessage(rawInput, cmdHandler, ctx, conn)
+		}
 		if isCommand(rawInput) {
+			if resp := authorizeInternalListenerCommand(rawInput, cmdHandler, ctx); resp != "" {
+				writeResponse(conn, resp)
+				return false, nil
+			}
 			return handleCommandMessage(rawInput, cmdHandler, ctx, conn)
 		}
 		util.Error("⚠️ Decode error and not a raw command: %v [%s]", err, string(data))
@@ -381,7 +465,14 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 		return false, nil
 	}
 
+	if strings.HasPrefix(strings.ToUpper(payload), "INTERNAL_BATCH ") {
+		return handleInternalBatchMessage(payload, cmdHandler, ctx, conn)
+	}
 	if isCommand(payload) {
+		if resp := authorizeInternalListenerCommand(payload, cmdHandler, ctx); resp != "" {
+			writeResponse(conn, resp)
+			return false, nil
+		}
 		return handleCommandMessage(payload, cmdHandler, ctx, conn)
 	}
 
@@ -391,6 +482,60 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 	return true, nil
 }
 
+func authorizeInternalListenerCommand(payload string, cmdHandler *controller.CommandHandler, ctx *controller.ClientContext) string {
+	if ctx == nil || !ctx.Internal || cmdHandler == nil || cmdHandler.Config == nil {
+		return ""
+	}
+	if cmdHandler.Config.InternalUseTLS {
+		return ""
+	}
+	token := strings.TrimSpace(cmdHandler.Config.InternalAuthToken)
+	if token == "" {
+		return "ERROR: internal_auth_not_configured command=INTERNAL_LISTENER"
+	}
+	if parseInternalCommandArgs(payload)["internal_token"] != token {
+		return "ERROR: internal_command_unauthorized command=INTERNAL_LISTENER"
+	}
+	return ""
+}
+
+func handleInternalBatchMessage(payload string, cmdHandler *controller.CommandHandler, ctx *controller.ClientContext, conn net.Conn) (bool, error) {
+	if ctx == nil || !ctx.Internal {
+		writeResponse(conn, "ERROR: internal_command_unauthorized command=INTERNAL_BATCH")
+		return false, nil
+	}
+	if resp := authorizeInternalListenerCommand(payload, cmdHandler, ctx); resp != "" {
+		writeResponse(conn, resp)
+		return false, nil
+	}
+	encoded := parseInternalCommandArgs(payload)["payload"]
+	if encoded == "" {
+		writeResponse(conn, "ERROR: missing_payload command=INTERNAL_BATCH")
+		return false, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		writeResponse(conn, fmt.Sprintf("ERROR: invalid_payload command=INTERNAL_BATCH reason=%q", err.Error()))
+		return false, nil
+	}
+	resp, err := cmdHandler.HandleBatchMessage(data, conn, ctx)
+	if err != nil {
+		return false, err
+	}
+	writeResponse(conn, resp)
+	return false, nil
+}
+
+func parseInternalCommandArgs(payload string) map[string]string {
+	args := map[string]string{}
+	for _, field := range strings.Fields(payload) {
+		key, value, ok := strings.Cut(field, "=")
+		if ok {
+			args[key] = value
+		}
+	}
+	return args
+}
 func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler, ctx *controller.ClientContext, conn net.Conn) (bool, error) {
 	if strings.HasPrefix(strings.ToUpper(payload), "READ_STREAM ") {
 		cmdHandler.HandleReadStreamCommand(conn, payload)
@@ -443,8 +588,8 @@ func isCommand(s string) bool {
 		"HEARTBEAT", "JOIN_GROUP", "LEAVE_GROUP", "COMMIT_OFFSET", "BATCH_COMMIT", "REGISTER_GROUP",
 		"GROUP_STATUS", "FETCH_OFFSET", "LIST_GROUPS", "SYNC_GROUP", "DESCRIBE",
 		"APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT", "READ_SNAPSHOT", "STREAM_VERSION",
-		"REPLICATE_SNAPSHOT", "LIST_SNAPSHOTS", "FETCH_SNAPSHOT", "CATCHUP_SNAPSHOTS",
-		"FIND_COORDINATOR", "RAFT_APPLY", "METADATA"}
+		"REPLICATE_MESSAGE", "REPLICATE_SNAPSHOT", "LIST_SNAPSHOTS", "FETCH_SNAPSHOT", "CATCHUP_SNAPSHOTS",
+		"FIND_COORDINATOR", "RAFT_APPLY", "METADATA", "INTERNAL_BATCH"}
 	for _, k := range keywords {
 		if strings.HasPrefix(strings.ToUpper(s), k) {
 			return true

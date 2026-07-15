@@ -70,6 +70,7 @@ type ClusterController struct {
 	Discovery   ServiceDiscovery
 	Election    *ControllerElection
 	Router      *ClusterRouter
+	Config      *config.Config
 	brokerID    string
 }
 
@@ -78,7 +79,8 @@ func NewClusterController(ctx context.Context, cfg *config.Config, rm RaftManage
 		RaftManager: rm,
 		Discovery:   sd,
 		Election:    NewControllerElection(rm),
-		Router:      NewClusterRouter(brokerID, localAddr, nil, rm, cfg.BrokerPort, cfg.AdvertisedClientHost),
+		Router:      NewClusterRouter(brokerID, localAddr, nil, rm, cfg.BrokerPort, cfg.AdvertisedClientHost, cfg),
+		Config:      cfg,
 		brokerID:    brokerID,
 	}
 
@@ -138,6 +140,13 @@ func (cc *ClusterController) IsAuthorized(topic string, partition int) bool {
 	}
 
 	return meta.Leader == cc.brokerID
+}
+
+func (cc *ClusterController) internalAuthPrefix() string {
+	if cc != nil && cc.Config != nil && cc.Config.InternalAuthToken != "" {
+		return "internal_token=" + cc.Config.InternalAuthToken + " "
+	}
+	return ""
 }
 
 func (cc *ClusterController) ForwardCommandToBroker(addr, command string) (string, error) {
@@ -242,7 +251,7 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 	if err != nil {
 		return err
 	}
-	replicateCmd := fmt.Sprintf("REPLICATE_MESSAGE payload=%s", string(data))
+	replicateCmd := fmt.Sprintf("REPLICATE_MESSAGE %spayload=%s", cc.internalAuthPrefix(), string(data))
 
 	var wg sync.WaitGroup
 	var successCount int32 = 1 // Count self (leader)
