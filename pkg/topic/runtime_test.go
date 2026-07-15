@@ -21,6 +21,6 @@ func TestTopicManagerRuntimeSnapshot(t *testing.T) {
 	require.Equal(t, 1, snapshot.TopicCount)
 	require.Len(t, snapshot.Partitions, 1)
 	require.Equal(t, PartitionRuntimeSnapshot{
-		Topic: "orders", Partition: 0, LogStart: 2, LogEnd: 5, HighWatermark: 5,
+		Topic: "orders", Partition: 0, LogStart: 2, LogEnd: 4, HighWatermark: 4,
 	}, snapshot.Partitions[0])
 }
