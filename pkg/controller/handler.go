@@ -194,6 +194,10 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) strin
 		}
 	}
 
+	if resp := ch.authorizeClientCommand(cmd, upper, ctx); resp != "" {
+		return ch.fail(rawCmd, resp)
+	}
+
 	resp := ch.handleCommandByType(cmd, upper, ctx)
 	ch.logCommandResult(rawCmd, resp)
 	return resp

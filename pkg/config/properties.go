@@ -21,8 +21,9 @@ var (
 )
 
 type SASLUser struct {
-	Principal string `yaml:"principal" json:"principal"`
-	Token     string `yaml:"token" json:"token"`
+	Principal   string   `yaml:"principal" json:"principal"`
+	Token       string   `yaml:"token" json:"token"`
+	Permissions []string `yaml:"permissions,omitempty" json:"permissions,omitempty"`
 }
 
 type ConsumerGroupConfig struct {
@@ -194,6 +195,9 @@ func DefaultConfig() *Config {
 	if defaultConfig.SASLUsers != nil {
 		cfgCopy.SASLUsers = make([]SASLUser, len(defaultConfig.SASLUsers))
 		copy(cfgCopy.SASLUsers, defaultConfig.SASLUsers)
+		for i := range cfgCopy.SASLUsers {
+			cfgCopy.SASLUsers[i].Permissions = append([]string(nil), defaultConfig.SASLUsers[i].Permissions...)
+		}
 	}
 	if defaultConfig.StaticConsumerGroups != nil {
 		cfgCopy.StaticConsumerGroups = make([]ConsumerGroupConfig, len(defaultConfig.StaticConsumerGroups))

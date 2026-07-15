@@ -777,7 +777,11 @@ Client should reconnect to the specified address and retry.
 
 ### Authorization
 
-The wire protocol exposes per-topic `auth_policy` metadata: `open`, `deny_write`, `deny_read`, and `acl`. `AUTH principal=<principal> token=<token>` authenticates a client connection when `enable_sasl=true`, and individual commands may also provide `principal=<principal> auth_token=<token>` for inline authentication. `auth_policy=acl` checks `read_acl` for `CONSUME`/`STREAM` and `write_acl` for `PUBLISH`/`TXN_PUBLISH`; unauthorized operations return `ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=<T> operation=<read|write>`. This is a simple token contract, not a mechanism-specific SASL byte protocol. Deployments that expose brokers across trust boundaries should still use TLS/mTLS and network controls.
+The wire protocol exposes per-topic `auth_policy` metadata: `open`, `deny_write`, `deny_read`, and `acl`. When `enable_sasl=true`, all protected admin, topic, group, and transaction commands require connection authentication with `AUTH principal=<principal> token=<token>` or inline `principal=<principal> auth_token=<token>`.
+
+Configured users may receive `admin`, `topic.read`, `topic.write`, `group`, `transaction`, or wildcard `*` permissions. Commands that cross boundaries require every applicable permission: `CONSUME`/`STREAM` require `topic.read` plus `group`, `TXN_PUBLISH` requires `transaction` plus `topic.write`, and `SEND_OFFSETS_TO_TXN` requires `transaction` plus `group`. Missing authentication returns `ERROR: authentication_required command=<COMMAND>`; insufficient coarse permission returns `ERROR: NOT_AUTHORIZED_FOR_OPERATION command=<COMMAND> permission=<permission>`.
+
+After coarse authorization, `auth_policy=acl` checks `read_acl` for topic reads and `write_acl` for topic writes, returning `ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=<T> operation=<read|write>` on denial. Internal broker contexts bypass client permissions but remain subject to the separate internal-listener/token boundary. This is a token authentication contract, not a mechanism-specific SASL byte protocol; use TLS/mTLS and network controls across trust boundaries. An omitted `permissions` list retains legacy full access for an authenticated user and should be avoided in least-privilege deployments.
 
 ### Retention
 

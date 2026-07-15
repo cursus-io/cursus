@@ -39,7 +39,7 @@ func TestSASLACLGuardsPublishAndConsume(t *testing.T) {
 	ctx := NewClientContext("acl-group", 0)
 
 	unauth := ch.HandleCommand("PUBLISH topic=acl-topic producerId=p1 message=nope", NewClientContext("", 0))
-	if !strings.Contains(unauth, "NOT_AUTHORIZED_FOR_TOPIC") {
+	if !strings.Contains(unauth, "authentication_required") {
 		t.Fatalf("expected unauthenticated publish to be denied, got %q", unauth)
 	}
 
@@ -98,7 +98,7 @@ func TestListOffsetsRequiresReadACL(t *testing.T) {
 
 	ch := NewCommandHandler(tm, cfg, nil, nil, nil)
 	unauth := ch.HandleCommand("LIST_OFFSETS topic=offset-acl-topic", NewClientContext("", 0))
-	if !strings.Contains(unauth, "NOT_AUTHORIZED_FOR_TOPIC") {
+	if !strings.Contains(unauth, "authentication_required") {
 		t.Fatalf("expected unauthenticated LIST_OFFSETS to be denied, got %q", unauth)
 	}
 
