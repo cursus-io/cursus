@@ -420,3 +420,78 @@ func TestPartition_ReadCommittedIgnoresMarkerBeforeRecord(t *testing.T) {
 	require.Empty(t, msgs)
 	dh.AssertExpectations(t)
 }
+
+func TestPartition_LastStableOffsetUsesTransactionIndex(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	dh.On("GetFlushedOffset").Return(uint64(6)).Once()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.SetHWM(6)
+	p.indexTransactionMessage(types.Message{
+		Offset:           1,
+		TransactionalID:  "tx-open",
+		TransactionState: types.TransactionStateOpen,
+	})
+	p.indexTransactionMessage(types.Message{
+		Offset:           3,
+		TransactionalID:  "tx-committed",
+		TransactionState: types.TransactionStateOpen,
+	})
+	p.indexTransactionMessage(types.Message{
+		Offset:            4,
+		TransactionalID:   "tx-committed",
+		TransactionMarker: types.TransactionMarkerCommit,
+	})
+
+	require.Equal(t, uint64(1), p.LastStableOffset())
+	dh.AssertExpectations(t)
+}
+
+func TestPartition_LastStableOffsetRestoresTransactionIndexFromLog(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 1
+
+	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	p := NewPartition(0, "orders", dh, nil, cfg)
+
+	require.NoError(t, p.EnqueueSync(types.Message{Payload: "plain"}))
+	require.NoError(t, p.EnqueueSyncIdempotent(types.Message{
+		Payload:          "open",
+		TransactionalID:  "tx-open",
+		TransactionState: types.TransactionStateOpen,
+		ProducerID:       "producer-open",
+		Epoch:            1,
+		SeqNum:           1,
+	}))
+	require.NoError(t, p.EnqueueSyncIdempotent(types.Message{
+		Payload:          "committed",
+		TransactionalID:  "tx-committed",
+		TransactionState: types.TransactionStateOpen,
+		ProducerID:       "producer-committed",
+		Epoch:            2,
+		SeqNum:           1,
+	}))
+	require.NoError(t, p.EnqueueSyncIdempotent(types.Message{
+		Payload:           "commit-marker",
+		TransactionalID:   "tx-committed",
+		TransactionMarker: types.TransactionMarkerCommit,
+		ProducerID:        "producer-committed",
+		Epoch:             2,
+		SeqNum:            2,
+	}))
+	p.FlushDisk()
+	p.Close()
+	require.NoError(t, dh.Close())
+
+	restartedDH, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { _ = restartedDH.Close() }()
+	restarted := NewPartition(0, "orders", restartedDH, nil, cfg)
+	defer restarted.Close()
+
+	require.Equal(t, uint64(1), restarted.LastStableOffset())
+}
