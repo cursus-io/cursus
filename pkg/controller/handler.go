@@ -79,6 +79,9 @@ func NewCommandHandler(
 	ch.commands = []commandEntry{
 		{prefix: "AUTH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAuth(cmd, ctx) }},
 		{prefix: "HELP", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHelp() }},
+		{prefix: "PROTOCOL_INFO", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleProtocolInfo() }},
+		{prefix: "NEGOTIATE", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleNegotiate(cmd, ctx) }},
+		{prefix: "NEGOTIATE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleNegotiate(cmd, ctx) }},
 		{prefix: "LIST_CLUSTER", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListCluster() }},
 		{prefix: "LIST", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList() }},
 		{prefix: "CREATE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd) }},
@@ -177,16 +180,26 @@ func redactOneCommandSecret(s, key string) string {
 func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) string {
 	cmd := strings.TrimSpace(rawCmd)
 	if cmd == "" {
-		return ch.fail(rawCmd, "ERROR: empty_command")
+		resp := decorateProtocolResponse("ERROR: empty_command", ctx)
+		ch.logCommandResult(rawCmd, resp)
+		return resp
 	}
 
 	upper := strings.ToUpper(cmd)
 
 	if strings.HasPrefix(upper, "STREAM ") {
-		return ch.validateStreamSyntax(cmd, rawCmd)
+		resp := decorateProtocolResponse(ch.validateStreamSyntax(cmd, rawCmd), ctx)
+		if resp != STREAM_DATA_SIGNAL {
+			ch.logCommandResult(rawCmd, resp)
+		}
+		return resp
 	}
 	if strings.HasPrefix(upper, "CONSUME ") {
-		return ch.validateConsumeSyntax(cmd, rawCmd)
+		resp := decorateProtocolResponse(ch.validateConsumeSyntax(cmd, rawCmd), ctx)
+		if resp != STREAM_DATA_SIGNAL {
+			ch.logCommandResult(rawCmd, resp)
+		}
+		return resp
 	}
 	if name, ok := internalCommandName(upper); ok {
 		if resp := ch.authorizeInternalCommand(name, cmd); resp != "" {
@@ -216,7 +229,7 @@ func (ch *CommandHandler) handleCommandByType(cmd, upper string, ctx *ClientCont
 			}
 		}
 	}
-	return fmt.Sprintf("ERROR: unknown_command command=%s", cmd)
+	return fmt.Sprintf("ERROR: unknown_command command=%q", cmd)
 }
 
 func internalCommandName(upper string) (string, bool) {

@@ -75,7 +75,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"transaction_record_not_staged", "version_conflict",
 	)
 	register(ErrorClassAuthorization, false,
-		"NOT_AUTHORIZED_FOR_PARTITION", "NOT_AUTHORIZED_FOR_TOPIC", "authentication_failed",
+		"NOT_AUTHORIZED_FOR_OPERATION", "NOT_AUTHORIZED_FOR_PARTITION", "NOT_AUTHORIZED_FOR_TOPIC", "authentication_failed", "authentication_required",
 		"internal_auth_not_configured", "internal_batch_requires_token_wrapper", "internal_command_unauthorized",
 		"internal_txn_publish_forbidden", "transaction_metadata_forbidden",
 	)
