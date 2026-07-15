@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -261,6 +262,9 @@ func (r *ClusterRouter) processLocally(req string) string {
 func (r *ClusterRouter) withInternalToken(command string) string {
 	if r.internalToken == "" {
 		return command
+	}
+	if wireprotocol.IsTextCommand(command) {
+		return injectInternalToken(command, r.internalToken)
 	}
 	if _, payload, err := util.DecodeMessage([]byte(command)); err == nil {
 		return string(util.EncodeMessage("", injectInternalToken(payload, r.internalToken)))
