@@ -466,6 +466,8 @@ ERROR: distribution_not_enabled
 
 `CLUSTER_STATUS` returns `OK cluster=<json>` in distributed mode. The JSON document contains the Raft leader address, active/inactive broker counts, partition leader epochs and committed HWMs, plus leaderless and under-replicated partition totals. A leader is considered available only when its registered broker is active.
 
+Common errors are `ERROR: distribution_required command=CLUSTER_STATUS`, `ERROR: fsm_not_available command=CLUSTER_STATUS`, and `ERROR: marshal_cluster_status_failed reason="..."`.
+
 ### ELECT_LEADER
 
 `ELECT_LEADER topic=<name> partition=<N> broker=<broker-id>` performs a controlled preferred-leader change through the Raft metadata log. The target must be an active replica already present in the partition ISR. The broker records the current leader epoch in the command and the FSM rejects stale concurrent changes. A successful change increments `leader_epoch` while preserving `committed_hwm`, replicas, and ISR. Retrying an election whose target is already leader succeeds with `changed=false` and does not advance the epoch again.
@@ -480,8 +482,10 @@ Common errors:
 
 ```text
 ERROR: distribution_required command=ELECT_LEADER
+ERROR: missing_broker command=ELECT_LEADER
 ERROR: partition_not_found topic=<name> partition=<N>
 ERROR: leader_election_rejected topic=<name> partition=<N> broker=<id> reason="..."
+ERROR: leader_election_result_unavailable topic=<name> partition=<N>
 ```
 
 This command does not add replicas, expand ISR, or perform data movement. Reassignment and broker draining require a separate catch-up-aware workflow.
