@@ -162,7 +162,7 @@ func (d *DiskHandler) markAsDeleted(logPath string) error {
 	renamedIndex := false
 
 	if _, err := os.Stat(indexPath); err == nil {
-		_ = os.Chmod(indexPath, 0o644)
+		_ = os.Chmod(indexPath, 0o600)
 		if err := os.Rename(indexPath, deletedIndexPath); err != nil {
 			return fmt.Errorf("rename index tombstone: %w", err)
 		}
@@ -171,7 +171,7 @@ func (d *DiskHandler) markAsDeleted(logPath string) error {
 		return fmt.Errorf("stat index for deletion: %w", err)
 	}
 
-	_ = os.Chmod(logPath, 0o644)
+	_ = os.Chmod(logPath, 0o600)
 	if err := os.Rename(logPath, deletedLogPath); err != nil {
 		if renamedIndex {
 			_ = os.Rename(deletedIndexPath, indexPath)
@@ -189,7 +189,7 @@ func (d *DiskHandler) markAsDeleted(logPath string) error {
 	directory := filepath.Dir(logPath)
 	syncErr := syncDirectory(directory)
 	for _, tombstone := range []string{deletedLogPath, deletedIndexPath} {
-		_ = os.Chmod(tombstone, 0o644)
+		_ = os.Chmod(tombstone, 0o600)
 		if err := os.Remove(tombstone); err != nil && !os.IsNotExist(err) {
 			util.Warn("failed to purge segment tombstone %s: %v", tombstone, err)
 		}
@@ -209,7 +209,7 @@ func cleanupDeletedSegments(base string) error {
 		return nil
 	}
 	for _, path := range paths {
-		_ = os.Chmod(path, 0o644)
+		_ = os.Chmod(path, 0o600)
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove tombstone %s: %w", path, err)
 		}

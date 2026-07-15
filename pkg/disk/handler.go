@@ -209,44 +209,6 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 	return dh, nil
 }
 
-func countMessagesInFile(filePath string) (int, error) {
-	reader, err := mmap.Open(filePath)
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		if err := reader.Close(); err != nil {
-			util.Error("failed to close: %v", err)
-		}
-	}()
-
-	count := 0
-	pos := 0
-	for pos+4 <= reader.Len() {
-		lenBytes := make([]byte, 4)
-		_, err := reader.ReadAt(lenBytes, int64(pos))
-		if err != nil {
-			return count, fmt.Errorf("failed to read length at pos %d: %w", pos, err)
-		}
-
-		msgLen := binary.BigEndian.Uint32(lenBytes)
-		if msgLen == 0 || msgLen > MaxMessageSize {
-			util.Error("Corrupted data: invalid msgLen %d at pos %d", msgLen, pos)
-			break
-		}
-
-		if pos+4+int(msgLen) > reader.Len() {
-			util.Error("⚠️ Incomplete message at pos %d in %s (expected %d bytes, file ends at %d)",
-				pos, filePath, msgLen, reader.Len())
-			break
-		}
-
-		pos += 4 + int(msgLen)
-		count++
-	}
-	return count, nil
-}
-
 func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.Message) (uint64, error) {
 	offset := atomic.AddUint64(&d.AbsoluteOffset, 1) - 1
 

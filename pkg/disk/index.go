@@ -33,10 +33,11 @@ func (d *DiskHandler) openIndexFiles() error {
 	}
 
 	isReadOnly := false
-	f, err := os.OpenFile(indexPath, os.O_CREATE|os.O_RDWR, 0644)
+	f, err := os.OpenFile(indexPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		if os.IsPermission(err) {
 			util.Debug("Index file %s is read-only, opening in read-only mode", indexPath)
+			// #nosec G304 -- indexPath is derived from the broker-owned log directory.
 			f, err = os.Open(indexPath)
 			if err != nil {
 				return fmt.Errorf("failed to open read-only index: %w", err)
@@ -51,6 +52,7 @@ func (d *DiskHandler) openIndexFiles() error {
 		if d.IndexSize > math.MaxInt64 {
 			return fmt.Errorf("index size %d exceeds int64 max", d.IndexSize)
 		}
+		// #nosec G115 -- d.IndexSize is bounded by math.MaxInt64 above.
 		if err := f.Truncate(int64(d.IndexSize)); err != nil {
 			if err := f.Close(); err != nil {
 				util.Error("failed to close file: %v", err)
@@ -76,13 +78,16 @@ func (d *DiskHandler) openIndexFiles() error {
 			return fmt.Errorf("valid index prefix %d exceeds int64 max", validBytes)
 		}
 		if existingSize > validBytes {
+			// #nosec G115 -- validBytes is bounded by math.MaxInt64 above.
 			if err := f.Truncate(int64(validBytes)); err != nil {
 				return fmt.Errorf("discard invalid index suffix: %w", err)
 			}
+			// #nosec G115 -- d.IndexSize is bounded by math.MaxInt64 above.
 			if err := f.Truncate(int64(d.IndexSize)); err != nil {
 				return fmt.Errorf("restore index capacity: %w", err)
 			}
 		}
+		// #nosec G115 -- validBytes is bounded by math.MaxInt64 above.
 		if _, err := f.Seek(int64(validBytes), io.SeekStart); err != nil {
 			return fmt.Errorf("seek index append position: %w", err)
 		}
@@ -104,6 +109,7 @@ func (d *DiskHandler) validIndexPrefix(f *os.File, fileSize uint64) (uint64, uin
 		if position > math.MaxInt64 {
 			break
 		}
+		// #nosec G115 -- position is bounded by math.MaxInt64 above.
 		if _, err := f.ReadAt(entryBytes[:], int64(position)); err != nil {
 			break
 		}
@@ -125,12 +131,8 @@ func (d *DiskHandler) validIndexPrefix(f *os.File, fileSize uint64) (uint64, uin
 	return validBytes, lastPosition
 }
 
-func (d *DiskHandler) seekLastValidIndexEntry(f *os.File, fileSize uint64) uint64 {
-	validBytes, _ := d.validIndexPrefix(f, fileSize)
-	return validBytes
-}
-
 func lastUsableIndexEntry(indexPath string, logSize uint64) (types.IndexEntry, bool) {
+	// #nosec G304 -- indexPath is derived from the broker-owned log directory.
 	f, err := os.Open(indexPath)
 	if err != nil {
 		return types.IndexEntry{}, false
@@ -218,24 +220,6 @@ func (d *DiskHandler) closeIndexFiles() error {
 		return fmt.Errorf("closeIndexFiles errors: %v", errs)
 	}
 	return nil
-}
-
-func getLastOffsetFromIndex(indexPath string, baseOffset uint64) (lastOffset uint64, count int, err error) {
-	entry, found := lastUsableIndexEntry(indexPath, math.MaxUint64)
-	if !found {
-		return 0, 0, fmt.Errorf("index empty (contains only zeros)")
-	}
-	lastOffset = entry.Offset
-	if lastOffset < baseOffset {
-		return 0, 0, fmt.Errorf("index empty or corrupt")
-	}
-
-	diff := lastOffset - baseOffset + 1
-	if diff > math.MaxInt {
-		return 0, 0, fmt.Errorf("offset range too large: %d", diff)
-	}
-	count = int(diff)
-	return lastOffset, count, nil
 }
 
 // findSegmentForOffset finds which segment contains the given offset

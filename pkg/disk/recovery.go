@@ -3,6 +3,7 @@ package disk
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 
@@ -26,10 +27,12 @@ func recoverActiveSegment(logPath, indexPath string, baseOffset uint64) (segment
 	if info.Size() < 0 {
 		return segmentRecovery{}, fmt.Errorf("negative segment size for %s", logPath)
 	}
+	// #nosec G115 -- negative sizes are rejected above.
+	logSize := uint64(info.Size())
 
 	startPosition := uint64(0)
 	expectedOffset := baseOffset
-	if entry, ok := lastUsableIndexEntry(indexPath, uint64(info.Size())); ok {
+	if entry, ok := lastUsableIndexEntry(indexPath, logSize); ok {
 		valid, validateErr := indexEntryMatchesRecord(logPath, entry)
 		if validateErr == nil && valid {
 			startPosition = entry.Position
@@ -59,6 +62,7 @@ func recoverActiveSegment(logPath, indexPath string, baseOffset uint64) (segment
 }
 
 func scanSegmentTail(logPath string, startPosition, expectedOffset uint64) (uint64, uint64, bool, error) {
+	// #nosec G304 -- logPath is derived from the broker-owned log directory.
 	f, err := os.Open(logPath)
 	if err != nil {
 		return 0, 0, false, err
@@ -69,18 +73,24 @@ func scanSegmentTail(logPath string, startPosition, expectedOffset uint64) (uint
 	if err != nil {
 		return 0, 0, false, err
 	}
-	if info.Size() < 0 || startPosition > uint64(info.Size()) {
+	if info.Size() < 0 {
+		return 0, 0, false, fmt.Errorf("negative segment size %d", info.Size())
+	}
+	// #nosec G115 -- negative sizes are rejected above.
+	logSize := uint64(info.Size())
+	if startPosition > logSize {
 		return 0, 0, false, fmt.Errorf("invalid scan position %d for segment size %d", startPosition, info.Size())
 	}
 
 	position := startPosition
 	nextOffset := expectedOffset
 	var lengthBytes [4]byte
-	for position < uint64(info.Size()) {
-		remaining := uint64(info.Size()) - position
+	for position < logSize {
+		remaining := logSize - position
 		if remaining < uint64(len(lengthBytes)) {
 			return position, nextOffset, true, nil
 		}
+		// #nosec G115 -- position is bounded by the int64-backed file size.
 		if _, err := f.ReadAt(lengthBytes[:], int64(position)); err != nil {
 			return 0, 0, false, fmt.Errorf("read record length at byte %d: %w", position, err)
 		}
@@ -89,13 +99,15 @@ func scanSegmentTail(logPath string, startPosition, expectedOffset uint64) (uint
 			return 0, 0, false, fmt.Errorf("corrupt record length %d at byte %d", messageLength, position)
 		}
 		recordEnd := position + 4 + messageLength
-		if recordEnd > uint64(info.Size()) {
+		if recordEnd > logSize {
 			return position, nextOffset, true, nil
 		}
 		if messageLength > uint64(^uint(0)>>1) {
 			return 0, 0, false, fmt.Errorf("record length %d exceeds addressable memory", messageLength)
 		}
+		// #nosec G115 -- messageLength is capped at MaxMessageSize (16 MiB).
 		data := make([]byte, int(messageLength))
+		// #nosec G115 -- recordEnd was checked against the int64-backed file size.
 		if _, err := f.ReadAt(data, int64(position+4)); err != nil {
 			return 0, 0, false, fmt.Errorf("read record at byte %d: %w", position, err)
 		}
@@ -113,22 +125,30 @@ func scanSegmentTail(logPath string, startPosition, expectedOffset uint64) (uint
 }
 
 func indexEntryMatchesRecord(logPath string, entry types.IndexEntry) (bool, error) {
+	// #nosec G304 -- logPath is derived from the broker-owned log directory.
 	f, err := os.Open(logPath)
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = f.Close() }()
 
+	if entry.Position > math.MaxInt64-4 {
+		return false, nil
+	}
+	// #nosec G115 -- entry.Position is bounded above before conversion.
+	recordPosition := int64(entry.Position)
+
 	var lengthBytes [4]byte
-	if _, err := f.ReadAt(lengthBytes[:], int64(entry.Position)); err != nil {
+	if _, err := f.ReadAt(lengthBytes[:], recordPosition); err != nil {
 		return false, err
 	}
 	messageLength := binary.BigEndian.Uint32(lengthBytes[:])
 	if messageLength == 0 || messageLength > MaxMessageSize {
 		return false, nil
 	}
+	// #nosec G115 -- messageLength is capped at MaxMessageSize (16 MiB).
 	data := make([]byte, int(messageLength))
-	if _, err := f.ReadAt(data, int64(entry.Position)+4); err != nil {
+	if _, err := f.ReadAt(data, recordPosition+4); err != nil {
 		return false, err
 	}
 	message, err := util.DeserializeDiskMessage(data)
@@ -139,13 +159,15 @@ func indexEntryMatchesRecord(logPath string, entry types.IndexEntry) (bool, erro
 }
 
 func truncateAndSync(path string, size uint64) error {
-	if size > uint64(^uint64(0)>>1) {
+	if size > math.MaxInt64 {
 		return fmt.Errorf("truncate size %d exceeds int64", size)
 	}
+	// #nosec G304 -- path is derived from the broker-owned log directory.
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
+	// #nosec G115 -- size is bounded by math.MaxInt64 above.
 	if err := f.Truncate(int64(size)); err != nil {
 		_ = f.Close()
 		return err
