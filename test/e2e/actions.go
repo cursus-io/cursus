@@ -84,6 +84,7 @@ func (a *Actions) PublishMessages() *Actions {
 
 func (a *Actions) RetryPublishMessages() *Actions {
 	a.ctx.t.Log("Retrying published messages (idempotence test)...")
+	a.ctx.SetLastError(nil)
 
 	for i := 0; i < len(a.ctx.publishedMessages); i++ {
 		payload := fmt.Sprintf("test-message-%d", i)
@@ -102,6 +103,7 @@ func (a *Actions) RetryPublishMessages() *Actions {
 
 		if err != nil {
 			a.ctx.t.Logf("Retry message %d: %v", i, err)
+			a.ctx.SetLastError(err)
 		}
 	}
 

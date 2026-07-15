@@ -29,9 +29,16 @@ type CommandHandler struct {
 	TxnManager    *transaction.Manager
 	commands      []commandEntry
 
-	coordCache   map[string]coordCacheEntry
-	coordCacheMu sync.RWMutex
-	txnApplyMu   sync.Mutex
+	coordCache          map[string]coordCacheEntry
+	coordCacheMu        sync.RWMutex
+	txnApplyMu          sync.Mutex
+	partitionWriteLocks sync.Map // map[string]*sync.Mutex
+}
+
+func (ch *CommandHandler) partitionWriteLock(topicName string, partitionID int) *sync.Mutex {
+	key := fmt.Sprintf("%s-%d", topicName, partitionID)
+	lock, _ := ch.partitionWriteLocks.LoadOrStore(key, &sync.Mutex{})
+	return lock.(*sync.Mutex)
 }
 
 func transactionalIDExpiration(cfg *config.Config) time.Duration {

@@ -254,5 +254,6 @@ func (s *authTestStorage) AppendMessageWithOffset(string, int, *types.Message) e
 	return nil
 }
 func (s *authTestStorage) WriteBatch([]types.DiskMessage) error { return nil }
+func (s *authTestStorage) TruncateTo(uint64) error              { return nil }
 func (s *authTestStorage) Flush()                               {}
 func (s *authTestStorage) Close() error                         { return nil }

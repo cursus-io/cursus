@@ -20,6 +20,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
 
 type RaftInterface interface {
@@ -51,6 +52,7 @@ type RaftReplicationManager struct {
 	localAddr string
 	peers     map[string]string // brokerID -> addr
 	mu        sync.RWMutex
+	raftStore *raftboltdb.BoltStore
 
 	isLeader atomic.Bool
 	leaderCh chan bool
@@ -83,17 +85,21 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 		return nil, fmt.Errorf("failed to create raft data directory: %w", err)
 	}
 
-	logStore := raft.NewInmemStore()
-	stableStore := raft.NewInmemStore()
+	raftStore, err := newDurableRaftStore(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open durable raft store: %w", err)
+	}
 
 	snapshots, err := raft.NewFileSnapshotStore(dataDir, 3, os.Stderr)
 	if err != nil {
+		_ = raftStore.Close()
 		util.Error("Failed to create snapshot store: %v", err)
 		return nil, fmt.Errorf("failed to create snapshot store: %w", err)
 	}
 
 	advertiseTCPAddr, err := net.ResolveTCPAddr("tcp", localAddr)
 	if err != nil {
+		_ = raftStore.Close()
 		util.Error("Failed to resolve advertised address %s: %v", localAddr, err)
 		return nil, fmt.Errorf("failed to resolve advertised address: %w", err)
 	}
@@ -101,12 +107,14 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	bindAddr := fmt.Sprintf("0.0.0.0:%d", cfg.RaftPort)
 	transport, err := raft.NewTCPTransport(bindAddr, advertiseTCPAddr, 3, 10*time.Second, os.Stderr)
 	if err != nil {
+		_ = raftStore.Close()
 		util.Error("Failed to create raft transport: %v", err)
 		return nil, fmt.Errorf("failed to create transport: %w", err)
 	}
 
-	r, err := raft.NewRaft(raftCfg, brokerFSM, logStore, stableStore, snapshots, transport)
+	r, err := raft.NewRaft(raftCfg, brokerFSM, raftStore, raftStore, snapshots, transport)
 	if err != nil {
+		_ = raftStore.Close()
 		util.Error("Failed to create raft instance: %v", err)
 		return nil, fmt.Errorf("failed to create raft: %w", err)
 	}
@@ -170,6 +178,7 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 		localAddr: localAddr,
 		peers:     make(map[string]string),
 		leaderCh:  make(chan bool, 10),
+		raftStore: raftStore,
 	}
 
 	rm.isrManager = NewISRManager(ctx, brokerFSM, brokerID, 5*time.Second, rm)
@@ -320,11 +329,24 @@ func (rm *RaftReplicationManager) ApplyResponse(prefix string, data []byte, time
 	return resp, nil
 }
 
+func newDurableRaftStore(dataDir string) (*raftboltdb.BoltStore, error) {
+	return raftboltdb.NewBoltStore(filepath.Join(dataDir, "raft.db"))
+}
+
 func (rm *RaftReplicationManager) Shutdown() error {
+	var shutdownErr error
 	if rm.raft != nil {
 		if err := rm.raft.Shutdown().Error(); err != nil {
-			return err
+			shutdownErr = err
 		}
 	}
-	return nil
+	if rm.raftStore != nil {
+		if err := rm.raftStore.Close(); err != nil {
+			if shutdownErr != nil {
+				return fmt.Errorf("raft shutdown failed: %v; store close failed: %w", shutdownErr, err)
+			}
+			return fmt.Errorf("close raft store: %w", err)
+		}
+	}
+	return shutdownErr
 }

@@ -228,6 +228,10 @@ func (s *sequenceStorage) WriteBatch([]types.DiskMessage) error {
 	return nil
 }
 
+func (s *sequenceStorage) TruncateTo(uint64) error {
+	return nil
+}
+
 func (s *sequenceStorage) Flush() {}
 
 func (s *sequenceStorage) Close() error {

@@ -33,6 +33,7 @@ func (m *mockStorage) AppendMessageWithOffset(topic string, partition int, msg *
 	return nil
 }
 func (m *mockStorage) WriteBatch(batch []types.DiskMessage) error { return nil }
+func (m *mockStorage) TruncateTo(uint64) error                    { return nil }
 
 func (m *mockStorage) Flush()       {}
 func (m *mockStorage) Close() error { return nil }

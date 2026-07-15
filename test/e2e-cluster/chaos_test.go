@@ -3,7 +3,8 @@ package e2e_cluster
 import (
 	"os"
 	"testing"
-	"time"
+
+	"github.com/cursus-io/cursus/test/e2e"
 )
 
 // TestChaosLeaderFailoverRetryAndOffsetDurability is intentionally opt-in because
@@ -21,6 +22,7 @@ func TestChaosLeaderFailoverRetryAndOffsetDurability(t *testing.T) {
 		WithNumMessages(100).
 		WithAcks("all").
 		WithMinInSyncReplicas(2)
+	ctx.WithIdempotent(true)
 	defer ctx.Cleanup()
 
 	leaderNode, actions := ctx.WhenCluster().
@@ -31,12 +33,21 @@ func TestChaosLeaderFailoverRetryAndOffsetDurability(t *testing.T) {
 		CommitOffset(0, 50).
 		SimulateLeaderFailure()
 
-	time.Sleep(10 * time.Second)
-
 	actions.RetryPublishMessages().
-		RecoverFollower(leaderNode).
-		Then().
+		RecoverFollower(leaderNode)
+	actions.Then().
 		Expect(MessagesPublishedWithQuorum()).
 		And(ExpectDataConsistent()).
-		And(ExpectOffsetMatched(0, 50))
+		And(ExpectOffsetMatched(0, 50)).
+		And(ExpectPartitionWatermarks(0, 100, 100)).
+		And(e2e.PublisherRetriedSuccessfully())
+
+	ctx.WithConsumerGroup("chaos-readback-group")
+	ctx.WhenCluster().
+		JoinGroup().
+		SyncGroup().
+		ConsumeMessages().
+		Then().
+		Expect(e2e.MessagesConsumed(100)).
+		And(e2e.NoDuplicateMessages())
 }

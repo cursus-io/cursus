@@ -15,6 +15,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
+	"github.com/stretchr/testify/require"
 )
 
 type MockStorageHandler struct {
@@ -49,8 +50,9 @@ func (m *MockStorageHandler) ReserveOffsets(n int) uint64 {
 	m.offset += uint64(n)
 	return start
 }
-func (m *MockStorageHandler) Flush()       {}
-func (m *MockStorageHandler) Close() error { return nil }
+func (m *MockStorageHandler) TruncateTo(uint64) error { return nil }
+func (m *MockStorageHandler) Flush()                  {}
+func (m *MockStorageHandler) Close() error            { return nil }
 
 type MockHandlerProvider struct{}
 
@@ -156,6 +158,57 @@ func TestBrokerFSM_Apply_Partition(t *testing.T) {
 	if meta == nil || meta.Leader != "l1" {
 		t.Errorf("Partition metadata not updated correctly: %+v", meta)
 	}
+}
+
+func TestBrokerFSM_PartitionCommitIsMonotonicAndEpochFenced(t *testing.T) {
+	f := newTestFSM()
+	require.NoError(t, f.tm.CreateTopic("orders", 1, false, false))
+	metadata := PartitionMetadata{
+		Leader:      "node-1",
+		LeaderEpoch: 4,
+		Replicas:    []string{"node-1", "node-2"},
+		ISR:         []string{"node-1", "node-2"},
+	}
+	data, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + string(data))}))
+
+	commit := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":4,"hwm":1}`
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + commit)}))
+	require.Equal(t, uint64(1), f.GetPartitionMetadata("orders-0").CommittedHWM)
+
+	stale := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":3,"hwm":2}`
+	staleResult := f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + stale)})
+	staleErr, ok := staleResult.(error)
+	require.True(t, ok)
+	require.Error(t, staleErr)
+	regression := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":4,"hwm":0}`
+	regressionResult := f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + regression)})
+	regressionErr, ok := regressionResult.(error)
+	require.True(t, ok)
+	require.Error(t, regressionErr)
+	require.Equal(t, uint64(1), f.GetPartitionMetadata("orders-0").CommittedHWM)
+}
+
+func TestBrokerFSM_SnapshotRestoresCommittedPartitionWatermark(t *testing.T) {
+	f := newTestFSM()
+	metadata := PartitionMetadata{Leader: "node-1", LeaderEpoch: 2, CommittedHWM: 19}
+	data, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + string(data)), Index: 7}))
+
+	snapshot, err := f.Snapshot()
+	require.NoError(t, err)
+	buf := new(bytes.Buffer)
+	sink := &MockSnapshotSink{Writer: buf}
+	require.NoError(t, snapshot.Persist(sink))
+
+	restored := newTestFSM()
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))))
+	restoredMetadata := restored.GetPartitionMetadata("orders-0")
+	require.NotNil(t, restoredMetadata)
+	require.Equal(t, uint64(19), restoredMetadata.CommittedHWM)
+	require.Equal(t, 2, restoredMetadata.LeaderEpoch)
 }
 
 func TestBrokerFSM_Apply_UnknownCommand(t *testing.T) {

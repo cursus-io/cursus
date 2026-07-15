@@ -236,10 +236,25 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 	partitionKey := topic + "-" + strconv.Itoa(partition)
 	meta := fsm.GetPartitionMetadata(partitionKey)
 	if meta == nil {
-		return fmt.Errorf("partition metadata not found")
+		return fmt.Errorf("partition metadata not found: %s", partitionKey)
 	}
+	if meta.Leader != cc.brokerID {
+		return fmt.Errorf("partition leader fenced: current=%s local=%s epoch=%d", meta.Leader, cc.brokerID, meta.LeaderEpoch)
+	}
+	if len(meta.ISR) < minISR {
+		return fmt.Errorf("insufficient in-sync replicas: got %d, want minISR %d", len(meta.ISR), minISR)
+	}
+	isr := make(map[string]struct{}, len(meta.ISR))
+	for _, brokerID := range meta.ISR {
+		isr[brokerID] = struct{}{}
+	}
+	if _, ok := isr[cc.brokerID]; !ok {
+		return fmt.Errorf("partition leader %s is not in ISR", cc.brokerID)
+	}
+	msgCmd.LeaderID = meta.Leader
+	msgCmd.LeaderEpoch = meta.LeaderEpoch
 
-	// Fan out to all replicas, not just ISR
+	// Fan out to all replicas for catch-up, but only current ISR acknowledgements commit data.
 	targets := []string{}
 	for _, replica := range meta.Replicas {
 		if replica != cc.brokerID {
@@ -254,7 +269,7 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 	replicateCmd := fmt.Sprintf("REPLICATE_MESSAGE %spayload=%s", cc.internalAuthPrefix(), string(data))
 
 	var wg sync.WaitGroup
-	var successCount int32 = 1 // Count self (leader)
+	var successCount int32 = 1 // The local leader is durable before replication begins.
 	var mu sync.Mutex
 	errCh := make(chan error, len(targets))
 
@@ -262,23 +277,32 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 	for _, targetID := range targets {
 		broker := fsm.GetBroker(targetID)
 		if broker == nil {
+			if _, required := isr[targetID]; required {
+				errCh <- fmt.Errorf("ISR broker %s metadata not found", targetID)
+			}
 			continue
 		}
 
 		wg.Add(1)
 		go func(addr, brokerID string) {
 			defer wg.Done()
-			_, err := cc.Router.forwardWithTimeout(addr, replicateCmd)
-			if err == nil {
-				mu.Lock()
-				successCount++
-				mu.Unlock()
+			resp, err := cc.Router.forwardWithTimeout(addr, replicateCmd)
+			if err == nil && strings.HasPrefix(resp, "OK") {
+				if _, required := isr[brokerID]; required {
+					mu.Lock()
+					successCount++
+					mu.Unlock()
+				}
 				metrics.ClusterReplicationLag.WithLabelValues(topic, partitionStr, brokerID).Observe(time.Since(replicationStart).Seconds())
 				if isrMgr := cc.RaftManager.GetISRManager(); isrMgr != nil {
 					isrMgr.UpdateHeartbeat(brokerID)
 				}
-			} else {
+				return
+			}
+			if err != nil {
 				errCh <- err
+			} else {
+				errCh <- fmt.Errorf("replica %s rejected append: %s", brokerID, resp)
 			}
 		}(broker.Addr, targetID)
 	}
@@ -286,8 +310,12 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 	wg.Wait()
 	close(errCh)
 
-	if int(successCount) < minISR {
-		return fmt.Errorf("insufficient successful acknowledgements: got %d, want minISR %d", successCount, minISR)
+	if int(successCount) < len(meta.ISR) {
+		reasons := make([]string, 0, len(errCh))
+		for err := range errCh {
+			reasons = append(reasons, err.Error())
+		}
+		return fmt.Errorf("not all ISR replicas acknowledged: got %d, want %d: %s", successCount, len(meta.ISR), strings.Join(reasons, "; "))
 	}
 
 	return nil

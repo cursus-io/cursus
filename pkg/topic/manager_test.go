@@ -92,6 +92,11 @@ func (m *MockStorageHandler) WriteBatch(batch []types.DiskMessage) error {
 	return args.Error(0)
 }
 
+func (m *MockStorageHandler) TruncateTo(nextOffset uint64) error {
+	args := m.Called(nextOffset)
+	return args.Error(0)
+}
+
 func (m *MockStorageHandler) Flush() {
 	m.Called()
 }
