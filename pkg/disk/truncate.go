@@ -133,7 +133,7 @@ func findTruncatePosition(path string, nextOffset uint64) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("open segment for truncation scan: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	reader := bufio.NewReader(f)
 	var position int64
