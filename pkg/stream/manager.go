@@ -26,9 +26,10 @@ func NewStreamManager(maxConn int, timeout, heartbeat time.Duration) *StreamMana
 	}
 }
 
+// AddStream accepts a legacy commit interval that is intentionally ignored.
 func (sm *StreamManager) AddStream(key string, stream *StreamConnection,
 	readFn func(offset uint64, max int) ([]types.Message, error),
-	commitInterval time.Duration,
+	legacyCommitInterval time.Duration,
 ) error {
 
 	sm.mu.Lock()
@@ -39,7 +40,7 @@ func (sm *StreamManager) AddStream(key string, stream *StreamConnection,
 	}
 
 	sm.streams[key] = stream
-	go stream.Run(readFn, commitInterval)
+	go stream.Run(readFn, legacyCommitInterval)
 	go sm.monitorConnection(key, stream)
 
 	return nil

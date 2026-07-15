@@ -212,10 +212,12 @@ func (f *BrokerFSM) applyJoinGroupCommand(jsonData string) interface{} {
 
 func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 	var cmd struct {
-		Type   string `json:"type"`
-		Group  string `json:"group"`
-		Member string `json:"member"`
-		Topic  string `json:"topic"`
+		Type       string   `json:"type"`
+		Group      string   `json:"group"`
+		Member     string   `json:"member"`
+		Members    []string `json:"members"`
+		Topic      string   `json:"topic"`
+		Generation *int     `json:"generation"`
 	}
 
 	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
@@ -250,7 +252,20 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 			return err
 		}
 	case "LEAVE":
-		_ = f.cd.RemoveConsumer(cmd.Group, cmd.Member)
+		if cmd.Generation == nil {
+			// Compatibility with metadata entries written before generation
+			// fencing was introduced.
+			return f.cd.RemoveConsumer(cmd.Group, cmd.Member)
+		}
+		return f.cd.RemoveConsumerForGeneration(cmd.Group, cmd.Member, *cmd.Generation)
+	case "EXPIRE":
+		if cmd.Generation == nil {
+			return fmt.Errorf("missing generation for group expiration")
+		}
+		if len(cmd.Members) == 0 {
+			return fmt.Errorf("missing members for group expiration")
+		}
+		return f.cd.ExpireConsumers(cmd.Group, *cmd.Generation, cmd.Members)
 	}
 
 	return nil

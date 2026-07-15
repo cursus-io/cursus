@@ -984,3 +984,82 @@ func TestBrokerFSM_RestoreDefersTransactionStateUntilManagerAttached(t *testing.
 		t.Fatalf("unexpected restored transaction: %+v", tx)
 	}
 }
+func TestBrokerFSMOffsetSyncRejectsStaleGeneration(t *testing.T) {
+	cfg := config.DefaultConfig()
+	tm := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
+	if err := cd.RegisterGroup("events", "workers", 2); err != nil {
+		t.Fatalf("register group: %v", err)
+	}
+	if _, err := cd.AddConsumer("workers", "member-1"); err != nil {
+		t.Fatalf("add member: %v", err)
+	}
+	f := NewBrokerFSM(tm, cd)
+
+	valid := &raft.Log{Data: []byte(`OFFSET_SYNC:{"group":"workers","topic":"events","member":"member-1","generation":1,"partition":0,"offset":5}`)}
+	if result := f.Apply(valid); result != nil {
+		t.Fatalf("valid fenced offset apply failed: %v", result)
+	}
+
+	if _, err := cd.AddConsumer("workers", "member-2"); err != nil {
+		t.Fatalf("add second member: %v", err)
+	}
+	stale := &raft.Log{Data: []byte(`OFFSET_SYNC:{"group":"workers","topic":"events","member":"member-1","generation":1,"partition":0,"offset":6}`)}
+	result := f.Apply(stale)
+	err, ok := result.(error)
+	if !ok {
+		t.Fatalf("expected stale generation error, got %T %v", result, result)
+	}
+	if got, want := err.Error(), "ERROR: GEN_MISMATCH current=2 requested=1 group=workers member=member-1"; got != want {
+		t.Fatalf("unexpected stale generation error: got %q want %q", got, want)
+	}
+
+	offset, found := cd.GetOffset("workers", "events", 0)
+	if !found || offset != 5 {
+		t.Fatalf("stale replicated commit changed offset: found=%v offset=%d", found, offset)
+	}
+}
+
+func TestBrokerFSMGroupExpirationIsGenerationFenced(t *testing.T) {
+	cfg := config.DefaultConfig()
+	tm := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
+	if err := cd.RegisterGroup("events", "workers", 2); err != nil {
+		t.Fatalf("register group: %v", err)
+	}
+	if _, err := cd.AddConsumer("workers", "member-1"); err != nil {
+		t.Fatalf("add first member: %v", err)
+	}
+	if _, err := cd.AddConsumer("workers", "member-2"); err != nil {
+		t.Fatalf("add second member: %v", err)
+	}
+	f := NewBrokerFSM(tm, cd)
+
+	expire := &raft.Log{Data: []byte(`GROUP_SYNC:{"type":"EXPIRE","group":"workers","generation":2,"members":["member-1"]}`)}
+	if result := f.Apply(expire); result != nil {
+		t.Fatalf("group expiration failed: %v", result)
+	}
+	status, err := cd.GetGroupStatus("workers")
+	if err != nil {
+		t.Fatalf("group status: %v", err)
+	}
+	if status.Generation != 3 || status.MemberCount != 1 {
+		t.Fatalf("unexpected status after expiration: generation=%d members=%d", status.Generation, status.MemberCount)
+	}
+
+	result := f.Apply(expire)
+	applyErr, ok := result.(error)
+	if !ok {
+		t.Fatalf("expected retry to be generation fenced, got %T %v", result, result)
+	}
+	if got, want := applyErr.Error(), "ERROR: GEN_MISMATCH current=3 requested=2 group=workers"; got != want {
+		t.Fatalf("unexpected expiration retry error: got %q want %q", got, want)
+	}
+	status, err = cd.GetGroupStatus("workers")
+	if err != nil {
+		t.Fatalf("group status after retry: %v", err)
+	}
+	if status.Generation != 3 || status.MemberCount != 1 {
+		t.Fatalf("expiration retry changed state: generation=%d members=%d", status.Generation, status.MemberCount)
+	}
+}

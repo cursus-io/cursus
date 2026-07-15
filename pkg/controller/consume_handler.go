@@ -247,9 +247,6 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	streamConn := stream.NewStreamConnection(conn, cArgs.TopicName, cArgs.PartitionID, cArgs.GroupName, actualOffset)
 	streamConn.SetBatchSize(cArgs.BatchSize)
 	streamConn.SetInterval(100 * time.Millisecond)
-	if ch.Coordinator != nil {
-		streamConn.SetCommitter(ch.Coordinator)
-	}
 
 	// Pass partition's message signal for event-driven streaming
 	signalCh := t.NewMessageSignal(cArgs.PartitionID)
@@ -261,7 +258,7 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 		return readPartitionMessages(p, offset, max, cArgs.ReadIsolation)
 	}
 
-	return ch.StreamManager.AddStream(streamKey, streamConn, readFn, ch.Config.StreamCommitInterval)
+	return ch.StreamManager.AddStream(streamKey, streamConn, readFn, 0)
 }
 
 func readPartitionMessages(p *topic.Partition, offset uint64, max int, isolation string) ([]types.Message, error) {

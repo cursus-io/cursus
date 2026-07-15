@@ -19,9 +19,11 @@ func TestTextCommandResponseContract(t *testing.T) {
 		t.Fatalf("REGISTER_GROUP response missing registered=true: %s", registerResp)
 	}
 	assertContractSuccess(t, ch.HandleCommand("JOIN_GROUP topic=contract-topic group=contract-group member=contract-member", ctx), "JOIN_GROUP")
-	assertContractSuccess(t, ch.HandleCommand("SYNC_GROUP topic=contract-topic group=contract-group member="+ctx.MemberID, ctx), "SYNC_GROUP")
-	assertContractSuccess(t, ch.HandleCommand("HEARTBEAT topic=contract-topic group=contract-group member="+ctx.MemberID, ctx), "HEARTBEAT")
-	assertContractSuccess(t, ch.HandleCommand("COMMIT_OFFSET topic=contract-topic partition=0 group=contract-group offset=2", ctx), "COMMIT_OFFSET")
+	member := ctx.MemberID
+	generation := strconv.Itoa(ctx.Generation)
+	assertContractSuccess(t, ch.HandleCommand("SYNC_GROUP topic=contract-topic group=contract-group member="+member+" generation="+generation, ctx), "SYNC_GROUP")
+	assertContractSuccess(t, ch.HandleCommand("HEARTBEAT topic=contract-topic group=contract-group member="+member+" generation="+generation, ctx), "HEARTBEAT")
+	assertContractSuccess(t, ch.HandleCommand("COMMIT_OFFSET topic=contract-topic partition=0 group=contract-group offset=2 member="+member+" generation="+generation, ctx), "COMMIT_OFFSET")
 	assertContractSuccess(t, ch.HandleCommand("FETCH_OFFSET topic=contract-topic partition=0 group=contract-group", ctx), "FETCH_OFFSET")
 	initResp := ch.HandleCommand("INIT_PRODUCER_ID transactional_id=contract-tx", ctx)
 	assertContractSuccess(t, initResp, "INIT_PRODUCER_ID")

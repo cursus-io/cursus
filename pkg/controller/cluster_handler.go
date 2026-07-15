@@ -114,6 +114,35 @@ type coordCacheEntry struct {
 
 const coordCacheTTL = 30 * time.Second
 
+// IsGroupCoordinator is the strict ownership check used by session expiration.
+// Discovery failures return false so multiple brokers cannot expire the same
+// group while the coordinator ring is unavailable.
+func (ch *CommandHandler) IsGroupCoordinator(groupName string) bool {
+	if !ch.isDistributed() {
+		return true
+	}
+	if !ch.hasRouter() {
+		return false
+	}
+	id, _, err := ch.Cluster.Router.FindCoordinator(groupName)
+	return err == nil && id == ch.Cluster.Router.BrokerID()
+}
+
+// ExpireGroupMembers serializes timeout-driven membership removal through the
+// replicated metadata log.
+func (ch *CommandHandler) ExpireGroupMembers(groupName string, generation int, memberIDs []string) error {
+	if !ch.isDistributed() {
+		return ch.Coordinator.ExpireConsumers(groupName, generation, memberIDs)
+	}
+	_, err := ch.applyViaLeader("GROUP_SYNC", map[string]interface{}{
+		"type":       "EXPIRE",
+		"group":      groupName,
+		"generation": generation,
+		"members":    memberIDs,
+	})
+	return err
+}
+
 // checkCoordinator checks if this broker is the coordinator for the given group.
 // Returns (addr, false) if another broker is coordinator, or (_, true) if we are.
 func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bool) {
@@ -295,7 +324,7 @@ func (ch *CommandHandler) handleRaftApply(cmd string) string {
 
 	_, err := ch.applyAndWait(cmdType, payload)
 	if err != nil {
-		return fmt.Sprintf("ERROR: raft_apply_failed reason=%q", err.Error())
+		return formatReplicatedGroupError(err, "raft_apply_failed")
 	}
 	return "OK"
 }

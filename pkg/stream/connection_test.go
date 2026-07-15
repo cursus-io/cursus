@@ -12,6 +12,15 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+type countingOffsetCommitter struct {
+	commits int
+}
+
+func (c *countingOffsetCommitter) CommitOffset(string, string, int, uint64) error {
+	c.commits++
+	return nil
+}
+
 func TestStreamConnection_Basic(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer func() { _ = c1.Close() }()
@@ -89,6 +98,8 @@ func TestStreamConnection_StopSendsCloseControlFrame(t *testing.T) {
 	sc := NewStreamConnection(c1, "t1", 0, "g1", 42)
 	sc.SetInterval(10 * time.Second)
 	sc.SetKeepaliveInterval(10 * time.Second)
+	committer := &countingOffsetCommitter{}
+	sc.SetCommitter(committer)
 
 	readFn := func(offset uint64, max int) ([]types.Message, error) {
 		return []types.Message{}, nil
@@ -118,4 +129,5 @@ func TestStreamConnection_StopSendsCloseControlFrame(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatal("stream did not stop")
 	}
+	assert.Zero(t, committer.commits, "delivery and close must not commit consumer offsets")
 }

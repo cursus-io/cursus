@@ -413,8 +413,8 @@ func TestHandleSyncGroup_MemberNotFound(t *testing.T) {
 	_ = coord.RegisterGroup("sync-topic", "sg1", 2)
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("SYNC_GROUP topic=sync-topic group=sg1 member=nonexistent", ctx)
-	assert.Contains(t, resp, "assignments=[]")
+	resp := ch.HandleCommand("SYNC_GROUP topic=sync-topic group=sg1 member=nonexistent generation=0", ctx)
+	assert.Contains(t, resp, "member_not_found")
 }
 
 func TestHandleLeaveGroup_MissingParams(t *testing.T) {
@@ -727,7 +727,7 @@ func TestHandleBatchCommit_NoValidOffsets(t *testing.T) {
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("BATCH_COMMIT topic=bc-topic group=bc-g1 generation=1 member=bc-m1 invalid", ctx)
-	assert.Contains(t, resp, "no_valid_offsets")
+	assert.Contains(t, resp, "invalid_batch_commit_entry")
 }
 
 func TestHandleBatchCommit_ValidBulk(t *testing.T) {
@@ -896,7 +896,7 @@ func TestHandleHeartbeat_WithCoordinator(t *testing.T) {
 	_, _ = coord.AddConsumer("hb-g1", "hb-m1")
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("HEARTBEAT topic=hb-topic group=hb-g1 member=hb-m1", ctx)
+	resp := ch.HandleCommand(fmt.Sprintf("HEARTBEAT topic=hb-topic group=hb-g1 member=hb-m1 generation=%d", coord.GetGeneration("hb-g1")), ctx)
 	assert.Contains(t, resp, "OK member=")
 }
 
@@ -906,7 +906,7 @@ func TestHandleHeartbeat_InvalidMember(t *testing.T) {
 	_ = coord.RegisterGroup("hb-topic2", "hb-g2", 2)
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("HEARTBEAT topic=hb-topic2 group=hb-g2 member=nonexistent", ctx)
+	resp := ch.HandleCommand("HEARTBEAT topic=hb-topic2 group=hb-g2 member=nonexistent generation=0", ctx)
 	assert.Contains(t, resp, "ERROR")
 }
 
@@ -914,9 +914,12 @@ func TestHandleCommitOffset_WithCoordinator(t *testing.T) {
 	ch, tm, coord := newTestHandlerWithCoordinator(t)
 	_ = tm.CreateTopic("commit-topic", 2, false, false)
 	_ = coord.RegisterGroup("commit-topic", "commit-g1", 2)
+	assignments, err := coord.AddConsumer("commit-g1", "commit-m1")
+	require.NoError(t, err)
+	require.Contains(t, assignments, 0)
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("COMMIT_OFFSET topic=commit-topic partition=0 group=commit-g1 offset=50", ctx)
+	resp := ch.HandleCommand(fmt.Sprintf("COMMIT_OFFSET topic=commit-topic partition=0 group=commit-g1 offset=50 member=commit-m1 generation=%d", coord.GetGeneration("commit-g1")), ctx)
 	assert.Equal(t, "OK", resp)
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=commit-topic partition=0 group=commit-g1", ctx)
@@ -1004,7 +1007,7 @@ func TestHandleLeaveGroup_WithCoordinator(t *testing.T) {
 	_, _ = coord.AddConsumer("leave-g1", "leave-m1")
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("LEAVE_GROUP topic=leave-topic group=leave-g1 member=leave-m1", ctx)
+	resp := ch.HandleCommand(fmt.Sprintf("LEAVE_GROUP topic=leave-topic group=leave-g1 member=leave-m1 generation=%d", coord.GetGeneration("leave-g1")), ctx)
 	assert.Contains(t, resp, "left=true")
 }
 
@@ -1013,8 +1016,8 @@ func TestHandleLeaveGroup_NilCoordinator(t *testing.T) {
 	_ = tm.CreateTopic("leave-topic2", 2, false, false)
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("LEAVE_GROUP topic=leave-topic2 group=leave-g2 member=m1", ctx)
-	assert.Contains(t, resp, "left=true")
+	resp := ch.HandleCommand("LEAVE_GROUP topic=leave-topic2 group=leave-g2 member=m1 generation=1", ctx)
+	assert.Contains(t, resp, "coordinator_not_available")
 }
 
 func TestHandleBatchCommit_InvalidPartitionFormat(t *testing.T) {
@@ -1028,7 +1031,7 @@ func TestHandleBatchCommit_InvalidPartitionFormat(t *testing.T) {
 
 	cmd := fmt.Sprintf("BATCH_COMMIT topic=bc3-topic group=bc3-g1 generation=%d member=bc3-m1 Pabc:100", gen)
 	resp := ch.HandleCommand(cmd, ctx)
-	assert.Contains(t, resp, "no_valid_offsets")
+	assert.Contains(t, resp, "invalid_partition")
 }
 
 func TestHandleBatchCommit_InvalidOffsetFormat(t *testing.T) {
@@ -1042,7 +1045,7 @@ func TestHandleBatchCommit_InvalidOffsetFormat(t *testing.T) {
 
 	cmd := fmt.Sprintf("BATCH_COMMIT topic=bc4-topic group=bc4-g1 generation=%d member=bc4-m1 P0:abc", gen)
 	resp := ch.HandleCommand(cmd, ctx)
-	assert.Contains(t, resp, "no_valid_offsets")
+	assert.Contains(t, resp, "invalid_offset")
 }
 
 func TestHandleBatchCommit_StaleGeneration(t *testing.T) {
@@ -1241,9 +1244,12 @@ func TestHandleCommitAndFetchOffset_AllowsWildcardGroupTopic(t *testing.T) {
 	ch, tm, coord := newTestHandlerWithCoordinator(t)
 	require.NoError(t, tm.CreateTopic("wild-alpha", 1, false, false))
 	require.NoError(t, coord.RegisterGroup("wild-*", "wild-group", 1))
+	assignments, err := coord.AddConsumer("wild-group", "wild-member")
+	require.NoError(t, err)
+	require.Equal(t, []int{0}, assignments)
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("COMMIT_OFFSET topic=wild-alpha partition=0 group=wild-group offset=7", ctx)
+	resp := ch.HandleCommand(fmt.Sprintf("COMMIT_OFFSET topic=wild-alpha partition=0 group=wild-group offset=7 member=wild-member generation=%d", coord.GetGeneration("wild-group")), ctx)
 	assert.Equal(t, "OK", resp)
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=wild-alpha partition=0 group=wild-group", ctx)
@@ -1254,9 +1260,12 @@ func TestHandleCommitAndFetchOffset_AllowsQuestionMarkGroupTopic(t *testing.T) {
 	ch, tm, coord := newTestHandlerWithCoordinator(t)
 	require.NoError(t, tm.CreateTopic("q-1", 1, false, false))
 	require.NoError(t, coord.RegisterGroup("q-?", "question-group", 1))
+	assignments, err := coord.AddConsumer("question-group", "question-member")
+	require.NoError(t, err)
+	require.Equal(t, []int{0}, assignments)
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("COMMIT_OFFSET topic=q-1 partition=0 group=question-group offset=3", ctx)
+	resp := ch.HandleCommand(fmt.Sprintf("COMMIT_OFFSET topic=q-1 partition=0 group=question-group offset=3 member=question-member generation=%d", coord.GetGeneration("question-group")), ctx)
 	assert.Equal(t, "OK", resp)
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=q-1 partition=0 group=question-group", ctx)
@@ -1682,4 +1691,12 @@ func TestRedactCommandSecrets(t *testing.T) {
 	assert.NotContains(t, redacted, "super-secret")
 	assert.Contains(t, redacted, "internal_token=<redacted>")
 	assert.Contains(t, redacted, "payload-value")
+}
+
+func TestFormatReplicatedGroupErrorPreservesWireCode(t *testing.T) {
+	err := fmt.Errorf("leader raft apply: ERROR: GEN_MISMATCH current=3 requested=2 group=g1")
+	assert.Equal(t, "ERROR: GEN_MISMATCH current=3 requested=2 group=g1", formatReplicatedGroupError(err, "offset_sync_failed"))
+
+	err = fmt.Errorf("raft apply failed: unavailable")
+	assert.Equal(t, `ERROR: offset_sync_failed reason="raft apply failed: unavailable"`, formatReplicatedGroupError(err, "offset_sync_failed"))
 }

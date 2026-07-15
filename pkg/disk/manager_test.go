@@ -131,3 +131,21 @@ func TestDiskManager_CloseTopicHandlers_DoesNotCloseTopicPrefix(t *testing.T) {
 		t.Fatalf("expected orders_v2 handler to remain open when closing orders")
 	}
 }
+
+func TestDiskManagerExistingPartitionCount(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	dm := disk.NewDiskManager(cfg)
+	defer dm.CloseAllHandlers()
+
+	if _, err := dm.GetHandler("__consumer_offsets", 7); err != nil {
+		t.Fatalf("create persisted partition: %v", err)
+	}
+	count, err := dm.ExistingPartitionCount("__consumer_offsets")
+	if err != nil {
+		t.Fatalf("discover persisted partitions: %v", err)
+	}
+	if count != 8 {
+		t.Fatalf("unexpected partition count: got %d want 8", count)
+	}
+}

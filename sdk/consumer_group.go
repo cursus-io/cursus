@@ -26,8 +26,12 @@ func (c *Consumer) heartbeatLoop() {
 			}
 
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			c.mu.RLock()
+			memberID := c.memberID
+			generation := c.generation
+			c.mu.RUnlock()
 			hb := fmt.Sprintf("HEARTBEAT topic=%s group=%s member=%s generation=%d",
-				c.config.Topic, c.config.GroupID, c.memberID, c.generation)
+				c.config.Topic, c.config.GroupID, memberID, generation)
 			if err := WriteWithLength(conn, EncodeMessage("", hb)); err != nil {
 				LogError("Heartbeat send failed: %v", err)
 				c.cleanupHbConn(conn)
@@ -195,6 +199,27 @@ func (c *Consumer) rebalanceMonitorLoop() {
 	}
 }
 
+func (c *Consumer) scheduleRebalanceRetry() {
+	delay := time.Duration(c.config.ConnectRetryBackoffMS) * time.Millisecond
+	if delay < 100*time.Millisecond {
+		delay = 100 * time.Millisecond
+	}
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-c.doneCh:
+			return
+		case <-timer.C:
+		}
+		select {
+		case <-c.doneCh:
+		case c.rebalanceSig <- struct{}{}:
+		default:
+		}
+	}()
+}
+
 func (c *Consumer) handleRebalanceSignal() {
 	if !atomic.CompareAndSwapInt32(&c.rebalancing, 0, 1) {
 		return
@@ -251,25 +276,34 @@ drainDone:
 	gen, mid, assignments, err := c.joinGroupWithRetry()
 	if err != nil {
 		LogError("Rebalance join failed: %v", err)
+		c.scheduleRebalanceRetry()
 		return
 	}
 	if len(assignments) == 0 {
 		assignments, err = c.syncGroup(gen, mid)
 		if err != nil {
 			LogError("Rebalance sync failed: %v", err)
+			c.scheduleRebalanceRetry()
 			return
 		}
+	}
+
+	offsetMap := make(map[int]uint64, len(assignments))
+	for _, pid := range assignments {
+		offset, err := c.fetchOffsetWithRetry(pid)
+		if err != nil {
+			LogError("Rebalance: offset fetch failed for P%d: %v", pid, err)
+			c.scheduleRebalanceRetry()
+			return
+		}
+		offsetMap[pid] = offset
 	}
 
 	c.mu.Lock()
 	c.generation = gen
 	c.memberID = mid
 	for _, pid := range assignments {
-		offset, err := c.fetchOffset(pid)
-		if err != nil {
-			LogError("Rebalance: offset fetch failed for P%d: %v", pid, err)
-			return
-		}
+		offset := offsetMap[pid]
 		c.partitionConsumers[pid] = &PartitionConsumer{
 			partitionID:  pid,
 			consumer:     c,
@@ -277,9 +311,11 @@ drainDone:
 			commitOffset: offset,
 		}
 		c.offsets[pid] = offset
-		LogInfo("Rebalance: P%d assigned at offset %d (gen=%d)", pid, offset, gen)
 	}
 	c.mu.Unlock()
+	for _, pid := range assignments {
+		LogInfo("Rebalance: P%d assigned at offset %d (gen=%d)", pid, offsetMap[pid], gen)
+	}
 
 	if err := c.fetchMetadata(); err != nil {
 		LogWarn("Rebalance: failed to fetch metadata: %v", err)

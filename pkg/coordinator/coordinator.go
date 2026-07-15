@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -23,8 +24,12 @@ type Coordinator struct {
 	offsetTopic               string
 	offsetTopicPartitionCount int
 
-	// ensure only the active GroupCoordinator handles session expiration.
-	leaderChecker func() bool
+	// Session expiration is decided by the broker that owns each group. In a
+	// cluster, the expiration callback serializes removals through the metadata
+	// log so every broker observes the same generation and assignments.
+	groupOwnerChecker func(groupName string) bool
+	expirationHandler func(groupName string, generation int, memberIDs []string) error
+	ownershipSince    map[string]time.Time
 }
 
 type TopicHandler interface {
@@ -36,6 +41,10 @@ type OffsetLogReader interface {
 	ReadTopicPartition(topic string, partitionID int, offset uint64, max int) ([]types.Message, error)
 }
 
+type offsetTopicPartitionProvider interface {
+	ExistingPartitionCount(topic string) (int, error)
+}
+
 type syncPublisher interface {
 	PublishWithAck(topic string, msg *types.Message) error
 }
@@ -45,7 +54,7 @@ type GroupMetadata struct {
 	mu            sync.RWMutex               // Per-group lock for offset operations
 	TopicName     string                     // Topic this group consumes
 	Members       map[string]*MemberMetadata // Active members
-	Generation    int                        // Current generation (unused but reserved)
+	Generation    int                        // Current membership generation
 	Partitions    []int                      // All partitions of the topic
 	LastRebalance time.Time                  // Timestamp of last rebalance
 	Offsets       map[string]map[int]uint64  // topic -> partition -> offset
@@ -60,10 +69,12 @@ type MemberMetadata struct {
 
 // GroupStateSnapshot is a serializable snapshot of a consumer group's state.
 type GroupStateSnapshot struct {
-	TopicName  string                    `json:"topic"`
-	Generation int                       `json:"generation"`
-	Members    map[string][]int          `json:"members"`
-	Offsets    map[string]map[int]uint64 `json:"offsets"`
+	TopicName     string                    `json:"topic"`
+	Generation    int                       `json:"generation"`
+	Members       map[string][]int          `json:"members"`
+	Partitions    []int                     `json:"partitions,omitempty"`
+	LastRebalance time.Time                 `json:"last_rebalance,omitempty"`
+	Offsets       map[string]map[int]uint64 `json:"offsets"`
 }
 
 // GroupStatus represents the status of a consumer group
@@ -122,6 +133,16 @@ func NewCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandle
 		topicHandler:              handler,
 		offsetTopic:               "__consumer_offsets",
 		offsetTopicPartitionCount: 4, // init. dynamic
+		ownershipSince:            make(map[string]time.Time),
+	}
+
+	if provider, ok := handler.(offsetTopicPartitionProvider); ok {
+		partitionCount, err := provider.ExistingPartitionCount(c.offsetTopic)
+		if err != nil {
+			util.Warn("Coordinator: failed to discover offset topic partitions: %v", err)
+		} else if partitionCount > c.offsetTopicPartitionCount {
+			c.offsetTopicPartitionCount = partitionCount
+		}
 	}
 
 	if err := handler.CreateTopic(c.offsetTopic, c.offsetTopicPartitionCount, false, false); err != nil {
@@ -135,10 +156,15 @@ func NewCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandle
 	return c
 }
 
-func (c *Coordinator) SetLeaderChecker(f func() bool) {
+func (c *Coordinator) SetGroupSessionCallbacks(
+	ownerChecker func(groupName string) bool,
+	expirationHandler func(groupName string, generation int, memberIDs []string) error,
+) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.leaderChecker = f
+	c.groupOwnerChecker = ownerChecker
+	c.expirationHandler = expirationHandler
+	c.ownershipSince = make(map[string]time.Time)
 }
 
 // Start launches background monitoring processes (e.g., heartbeat monitor).
@@ -294,6 +320,20 @@ func (c *Coordinator) validateMemberGenerationLocked(groupName, memberID string,
 	return ""
 }
 
+// ResumeConsumer refreshes a known member session without changing membership,
+// generation, or assignments. It is used after a transient reconnect.
+func (c *Coordinator) ResumeConsumer(groupName, memberID string, generation int) ([]int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
+		return nil, fmt.Errorf("%s", errResp)
+	}
+	member := c.groups[groupName].Members[memberID]
+	member.LastHeartbeat = time.Now()
+	return append([]int(nil), member.Assignments...), nil
+}
+
 // ValidateOwnershipFailure returns a wire-ready error code when a member does
 // not own a partition in the supplied generation. Empty string means valid.
 func (c *Coordinator) ValidateOwnershipFailure(groupName, memberID string, generation int, partition int) string {
@@ -390,10 +430,12 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 	for name, group := range c.groups {
 		group.mu.RLock()
 		snap := &GroupStateSnapshot{
-			TopicName:  group.TopicName,
-			Generation: group.Generation,
-			Members:    make(map[string][]int, len(group.Members)),
-			Offsets:    make(map[string]map[int]uint64),
+			TopicName:     group.TopicName,
+			Generation:    group.Generation,
+			Members:       make(map[string][]int, len(group.Members)),
+			Partitions:    append([]int(nil), group.Partitions...),
+			LastRebalance: group.LastRebalance,
+			Offsets:       make(map[string]map[int]uint64),
 		}
 		for mid, member := range group.Members {
 			assignments := make([]int, len(member.Assignments))
@@ -417,20 +459,23 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.groups = make(map[string]*GroupMetadata, len(state))
+	c.ownershipSince = make(map[string]time.Time)
 	for name, snap := range state {
 		group := &GroupMetadata{
-			TopicName:  snap.TopicName,
-			Generation: snap.Generation,
-			Members:    make(map[string]*MemberMetadata, len(snap.Members)),
-			Partitions: make([]int, 0),
-			Offsets:    make(map[string]map[int]uint64),
+			TopicName:     snap.TopicName,
+			Generation:    snap.Generation,
+			Members:       make(map[string]*MemberMetadata, len(snap.Members)),
+			Partitions:    append([]int(nil), snap.Partitions...),
+			LastRebalance: snap.LastRebalance,
+			Offsets:       make(map[string]map[int]uint64),
 		}
 
 		for mid, assignments := range snap.Members {
 			group.Members[mid] = &MemberMetadata{
 				ID:            mid,
 				LastHeartbeat: time.Now(),
-				Assignments:   assignments,
+				Assignments:   append([]int(nil), assignments...),
 			}
 		}
 
@@ -441,12 +486,30 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) {
 			}
 		}
 
-		if topicOffsets, ok := snap.Offsets[snap.TopicName]; ok {
-			for pid := range topicOffsets {
-				group.Partitions = append(group.Partitions, pid)
-			}
+		if len(group.Partitions) == 0 {
+			group.Partitions = inferSnapshotPartitions(snap)
 		}
 
 		c.groups[name] = group
 	}
+}
+
+func inferSnapshotPartitions(snap *GroupStateSnapshot) []int {
+	seen := make(map[int]struct{})
+	for _, assignments := range snap.Members {
+		for _, partition := range assignments {
+			seen[partition] = struct{}{}
+		}
+	}
+	if topicOffsets := snap.Offsets[snap.TopicName]; topicOffsets != nil {
+		for partition := range topicOffsets {
+			seen[partition] = struct{}{}
+		}
+	}
+	partitions := make([]int, 0, len(seen))
+	for partition := range seen {
+		partitions = append(partitions, partition)
+	}
+	sort.Ints(partitions)
+	return partitions
 }
