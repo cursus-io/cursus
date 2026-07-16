@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -62,16 +61,12 @@ func (j *Journal) Append(snap *Snapshot) (err error) {
 	if payloadLen == 0 || payloadLen > maxJournalRecordBytes {
 		return fmt.Errorf("transaction snapshot size %d exceeds journal limit", payloadLen)
 	}
-	if payloadLen > math.MaxInt-journalRecordOverhead {
-		return fmt.Errorf("transaction snapshot size %d overflows journal frame", payloadLen)
-	}
 
-	recordSize := payloadLen + journalRecordOverhead
-	record := make([]byte, recordSize)
+	var header [4]byte
 	payloadSize := uint32(payloadLen) // #nosec G115 -- bounded by maxJournalRecordBytes above.
-	binary.BigEndian.PutUint32(record[:4], payloadSize)
-	copy(record[4:], payload)
-	binary.BigEndian.PutUint32(record[4+payloadLen:], crc32.ChecksumIEEE(payload))
+	binary.BigEndian.PutUint32(header[:], payloadSize)
+	var checksum [4]byte
+	binary.BigEndian.PutUint32(checksum[:], crc32.ChecksumIEEE(payload))
 
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -95,13 +90,19 @@ func (j *Journal) Append(snap *Snapshot) (err error) {
 	if _, err := file.Seek(j.validEnd, io.SeekStart); err != nil {
 		return fmt.Errorf("seek transaction journal append position: %w", err)
 	}
-	if err := writeFull(file, record); err != nil {
-		return fmt.Errorf("append transaction journal: %w", err)
+	if err := writeFull(file, header[:]); err != nil {
+		return fmt.Errorf("append transaction journal header: %w", err)
+	}
+	if err := writeFull(file, payload); err != nil {
+		return fmt.Errorf("append transaction journal payload: %w", err)
+	}
+	if err := writeFull(file, checksum[:]); err != nil {
+		return fmt.Errorf("append transaction journal checksum: %w", err)
 	}
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("sync transaction journal: %w", err)
 	}
-	j.validEnd += int64(len(record))
+	j.validEnd += int64(journalRecordOverhead) + int64(payloadLen)
 	return nil
 }
 
