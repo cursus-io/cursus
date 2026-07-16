@@ -12,6 +12,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type testTransactionDecisionResolver struct {
+	state string
+	known bool
+}
+
+func (r *testTransactionDecisionResolver) TransactionDecision(string, int64) (string, bool) {
+	return r.state, r.known
+}
+
 func TestPartition_RestoresPersistedHWMCheckpoint(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
@@ -432,6 +441,40 @@ func TestPartition_ReadCommittedUsesTransactionMarkers(t *testing.T) {
 	require.Equal(t, "before", msgs[0].Payload)
 	require.Equal(t, "committed-by-marker", msgs[1].Payload)
 	require.Equal(t, "after", msgs[2].Payload)
+	dh.AssertExpectations(t)
+}
+
+func TestPartition_ReadCommittedWaitsForCoordinatorCommitDecision(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	dh.On("GetFlushedOffset").Return(uint64(3)).Times(4)
+	dh.On("ReadMessages", uint64(0), 3).Return([]types.Message{
+		{Offset: 0, Payload: "transactional", TransactionalID: "tx-decision", TransactionState: types.TransactionStateOpen, Epoch: 4},
+		{Offset: 1, Payload: "commit-marker", TransactionalID: "tx-decision", TransactionMarker: types.TransactionMarkerCommit, Epoch: 4},
+		{Offset: 2, Payload: "after"},
+	}, nil).Once()
+	dh.On("GetFirstOffset").Return(uint64(0)).Twice()
+
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.SetHWM(3)
+	p.indexTransactionMessage(types.Message{Offset: 0, TransactionalID: "tx-decision", TransactionState: types.TransactionStateOpen, Epoch: 4})
+	p.indexTransactionMessage(types.Message{Offset: 1, TransactionalID: "tx-decision", TransactionMarker: types.TransactionMarkerCommit, Epoch: 4})
+	resolver := &testTransactionDecisionResolver{state: "committing", known: true}
+	p.SetTransactionDecisionResolver(resolver)
+
+	require.Equal(t, uint64(0), p.LastStableOffset())
+	msgs, err := p.ReadCommitted(0, 10)
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+
+	resolver.state = types.TransactionStateCommitted
+	require.Equal(t, uint64(3), p.LastStableOffset())
+	msgs, err = p.ReadCommitted(0, 10)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	require.Equal(t, "transactional", msgs[0].Payload)
+	require.Equal(t, "after", msgs[1].Payload)
 	dh.AssertExpectations(t)
 }
 

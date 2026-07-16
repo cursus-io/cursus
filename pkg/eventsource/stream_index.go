@@ -3,6 +3,7 @@ package eventsource
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -315,6 +316,36 @@ func (si *StreamIndex) Lookup(key string, fromVersion uint64) ([]StreamIndexEntr
 		}
 	}
 	return result, nil
+}
+
+// Reset clears the derived index so it can be rebuilt from the committed log.
+func (si *StreamIndex) Reset() error {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+
+	if err := si.indexFile.Truncate(0); err != nil {
+		return fmt.Errorf("truncate index file: %w", err)
+	}
+	if _, err := si.indexFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek index file: %w", err)
+	}
+	if err := si.sidecarFile.Truncate(0); err != nil {
+		return fmt.Errorf("truncate sidecar file: %w", err)
+	}
+	if _, err := si.sidecarFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek sidecar file: %w", err)
+	}
+	if err := si.indexFile.Sync(); err != nil {
+		return fmt.Errorf("sync index file: %w", err)
+	}
+	if err := si.sidecarFile.Sync(); err != nil {
+		return fmt.Errorf("sync sidecar file: %w", err)
+	}
+
+	si.states = make(map[string]*streamState)
+	si.entries = make(map[string][]StreamIndexEntry)
+	si.knownKeys = make(map[string]bool)
+	return nil
 }
 
 // Close closes the underlying index and sidecar files.

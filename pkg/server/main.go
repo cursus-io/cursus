@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -159,6 +160,12 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	}
 
 	globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
+	if !cfg.EnabledDistribution {
+		journalPath := filepath.Join(cfg.LogDir, "__transaction_state.journal")
+		if err := globalCH.ConfigureTransactionJournal(journalPath); err != nil {
+			return fmt.Errorf("initialize standalone transaction journal: %w", err)
+		}
+	}
 	if cd != nil {
 		cd.SetGroupSessionCallbacks(globalCH.IsGroupCoordinator, globalCH.ExpireGroupMembers)
 	}

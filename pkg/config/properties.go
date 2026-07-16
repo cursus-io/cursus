@@ -54,7 +54,7 @@ type Config struct {
 	SegmentRollTimeMS         int     `yaml:"log_segment_roll_ms" json:"log.segment.roll.ms"`
 	IndexSize                 uint64  `yaml:"log_index_size_bytes" json:"log.index.size.bytes"`
 	IndexIntervalBytes        int     `yaml:"log_index_interval_bytes" json:"log.index.interval.bytes"`
-	CleanupPolicy             string  `yaml:"log_cleanup_policy" json:"log.cleanup.policy"` // delete, compact
+	CleanupPolicy             string  `yaml:"log_cleanup_policy" json:"log.cleanup.policy"` // delete; compaction is not implemented
 	RetentionHours            int     `yaml:"log_retention_hours" json:"log.retention.hours"`
 	RetentionBytes            int64   `yaml:"log_retention_bytes" json:"log.retention.bytes"`
 	RetentionCheckIntervalMS  int     `yaml:"log_retention_check_interval_ms" json:"log.retention.check.interval.ms"`
@@ -140,7 +140,7 @@ func DefaultConfig() *Config {
 			SegmentRollTimeMS:         7 * 24 * 60 * 60 * 1000, // 7day
 			IndexSize:                 10 * 1024 * 1024,        // 10MB
 			IndexIntervalBytes:        4096,
-			CleanupPolicy:             "delete", // delete, compact
+			CleanupPolicy:             "delete",
 			RetentionHours:            168,
 			RetentionBytes:            -1,
 			RetentionCheckIntervalMS:  300000,
@@ -233,7 +233,7 @@ func LoadConfig() (*Config, error) {
 	var indexSizeInt64 int64
 	flag.Int64Var(&indexSizeInt64, "index-size", int64(cfg.IndexSize), "Max index file size")
 	flag.IntVar(&cfg.IndexIntervalBytes, "index-interval-bytes", cfg.IndexIntervalBytes, "Index interval bytes")
-	flag.StringVar(&cfg.CleanupPolicy, "cleanup-policy", cfg.CleanupPolicy, "Cleanup policy (delete/compact)")
+	flag.StringVar(&cfg.CleanupPolicy, "cleanup-policy", cfg.CleanupPolicy, "Cleanup policy (delete)")
 	flag.IntVar(&cfg.RetentionHours, "retention-hours", cfg.RetentionHours, "Retention hours")
 	flag.Int64Var(&cfg.RetentionBytes, "retention-bytes", cfg.RetentionBytes, "Retention bytes")
 	flag.IntVar(&cfg.RetentionCheckIntervalMS, "retention-check-interval", cfg.RetentionCheckIntervalMS, "Retention check interval")

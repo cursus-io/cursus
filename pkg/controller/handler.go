@@ -19,6 +19,7 @@ import (
 
 const DefaultMaxPollRecords = 8192
 const STREAM_DATA_SIGNAL = "STREAM_DATA"
+const transactionStateLockStripes = 256
 
 type CommandHandler struct {
 	TopicManager  *topic.TopicManager
@@ -30,10 +31,17 @@ type CommandHandler struct {
 	TxnManager    *transaction.Manager
 	commands      []commandEntry
 
-	coordCache          map[string]coordCacheEntry
-	coordCacheMu        sync.RWMutex
-	txnApplyMu          sync.Mutex
-	partitionWriteLocks sync.Map // map[string]*sync.Mutex
+	coordCache            map[string]coordCacheEntry
+	coordCacheMu          sync.RWMutex
+	txnApplyMu            sync.Mutex
+	txnJournal            *transaction.Journal
+	transactionStateLocks [transactionStateLockStripes]sync.Mutex
+	partitionWriteLocks   sync.Map // map[string]*sync.Mutex
+}
+
+func (ch *CommandHandler) transactionStateLock(transactionalID string) *sync.Mutex {
+	stripe := util.GenerateID(transactionalID) % transactionStateLockStripes
+	return &ch.transactionStateLocks[stripe]
 }
 
 func (ch *CommandHandler) partitionWriteLock(topicName string, partitionID int) *sync.Mutex {
@@ -78,6 +86,9 @@ func NewCommandHandler(
 		Cluster:       cc,
 		ESHandler:     eventsource.NewHandler(tm),
 		TxnManager:    transaction.NewManagerWithExpiration(transactionalIDExpiration(cfg)),
+	}
+	if tm != nil {
+		tm.SetTransactionDecisionResolver(ch.TxnManager)
 	}
 	if cc != nil && cc.RaftManager != nil {
 		if fsm := cc.RaftManager.GetFSM(); fsm != nil {

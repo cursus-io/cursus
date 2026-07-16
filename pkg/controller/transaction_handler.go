@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -26,6 +28,10 @@ func (ch *CommandHandler) handleInitProducerID(cmd string) string {
 	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
 		return resp
 	}
+	stateLock := ch.transactionStateLock(txnID)
+	stateLock.Lock()
+	defer stateLock.Unlock()
+
 	previousState := ch.TxnManager.ExportState()
 	previousSnap, hadPrevious := previousState[txnID]
 	producerID, epoch, err := ch.TxnManager.InitProducer(txnID)
@@ -52,6 +58,10 @@ func (ch *CommandHandler) handleBeginTxn(cmd string) string {
 	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
 		return resp
 	}
+	stateLock := ch.transactionStateLock(txnID)
+	stateLock.Lock()
+	defer stateLock.Unlock()
+
 	producerID := firstNonEmpty(args["producerId"], args["producer_id"])
 	if producerID == "" {
 		return "ERROR: missing_producer_id command=BEGIN_TXN"
@@ -62,6 +72,9 @@ func (ch *CommandHandler) handleBeginTxn(cmd string) string {
 	}
 	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
 	if err := ch.TxnManager.Begin(txnID, producerID, epoch); err != nil {
+		if errors.Is(err, transaction.ErrProducerReinitializationRequired) {
+			return fmt.Sprintf("ERROR: producer_reinitialization_required transactional_id=%s epoch=%d", txnID, epoch)
+		}
 		return fmt.Sprintf("ERROR: transaction_begin_failed reason=%q", err.Error())
 	}
 	if err := ch.syncTransactionState(txnID); err != nil {
@@ -87,6 +100,10 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
 		return resp
 	}
+	stateLock := ch.transactionStateLock(txnID)
+	stateLock.Lock()
+	defer stateLock.Unlock()
+
 	topicName := args["topic"]
 	if topicName == "" {
 		return "ERROR: missing_topic command=TXN_PUBLISH"
@@ -146,6 +163,10 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string) string {
 	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
 		return resp
 	}
+	stateLock := ch.transactionStateLock(txnID)
+	stateLock.Lock()
+	defer stateLock.Unlock()
+
 	topicName := args["topic"]
 	if topicName == "" {
 		return "ERROR: missing_topic command=SEND_OFFSETS_TO_TXN"
@@ -205,6 +226,10 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
 		return resp
 	}
+	stateLock := ch.transactionStateLock(txnID)
+	stateLock.Lock()
+	defer stateLock.Unlock()
+
 	producerID, epoch, errResp := parseTxnProducerEpoch(args, "END_TXN")
 	if errResp != "" {
 		return errResp
@@ -224,14 +249,11 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 		if current.State == transaction.StateAborted {
 			return fmt.Sprintf("OK transactional_id=%s state=aborted", txnID)
 		}
-		if err := ch.appendTransactionMarkers(current, types.TransactionMarkerAbort); err != nil {
-			return fmt.Sprintf("ERROR: transaction_abort_marker_failed reason=%q", err.Error())
+		if current.State == transaction.StateCommitting {
+			return fmt.Sprintf("ERROR: transaction_not_abortable transactional_id=%s state=%s", txnID, current.State)
 		}
-		if err := ch.TxnManager.Abort(txnID, producerID, epoch); err != nil {
+		if err := ch.abortTransactionDecision(txnID, producerID, epoch); err != nil {
 			return fmt.Sprintf("ERROR: transaction_abort_failed reason=%q", err.Error())
-		}
-		if err := ch.syncTransactionState(txnID); err != nil {
-			return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 		}
 		return fmt.Sprintf("OK transactional_id=%s state=aborted", txnID)
 	}
@@ -244,6 +266,11 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 	}
 	if current.State == transaction.StateAborted {
 		return fmt.Sprintf("ERROR: transaction_aborted transactional_id=%s", txnID)
+	}
+	if current.State == transaction.StateOpen {
+		if err := ch.validateTransaction(current); err != nil {
+			return fmt.Sprintf("ERROR: transaction_commit_failed state=open reason=%q", err.Error())
+		}
 	}
 
 	tx, err := ch.TxnManager.PrepareCommit(txnID, producerID, epoch)
@@ -259,11 +286,8 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 		}
 		return fmt.Sprintf("ERROR: transaction_commit_failed state=committing reason=%q", err.Error())
 	}
-	if err := ch.TxnManager.Commit(txnID); err != nil {
+	if err := ch.commitTransactionDecision(txnID); err != nil {
 		return fmt.Sprintf("ERROR: transaction_commit_failed reason=%q", err.Error())
-	}
-	if err := ch.syncTransactionState(txnID); err != nil {
-		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s state=committed messages=%d offsets=%d", txnID, len(tx.Messages), len(tx.Offsets))
 }
@@ -276,23 +300,36 @@ func (ch *CommandHandler) RecoverPreparedTransactions() error {
 	if len(pending) == 0 {
 		return nil
 	}
-	for _, tx := range pending {
-		if tx == nil {
+	for _, pendingTx := range pending {
+		if pendingTx == nil {
+			continue
+		}
+		stateLock := ch.transactionStateLock(pendingTx.ID)
+		stateLock.Lock()
+
+		tx, err := ch.TxnManager.Status(pendingTx.ID)
+		if err != nil {
+			stateLock.Unlock()
+			return fmt.Errorf("reload transaction %s for recovery: %w", pendingTx.ID, err)
+		}
+		if tx.State != transaction.StateCommitting {
+			stateLock.Unlock()
 			continue
 		}
 		if resp := ch.ensureTransactionCoordinator(tx.ID); resp != "" {
+			stateLock.Unlock()
 			util.Debug("Skipping transaction recovery for %s on non-coordinator: %s", tx.ID, resp)
 			continue
 		}
 		if err := ch.applyTransaction(tx); err != nil {
+			stateLock.Unlock()
 			return fmt.Errorf("recover transaction %s: %w", tx.ID, err)
 		}
-		if err := ch.TxnManager.Commit(tx.ID); err != nil {
+		if err := ch.commitTransactionDecision(tx.ID); err != nil {
+			stateLock.Unlock()
 			return fmt.Errorf("mark recovered transaction %s committed: %w", tx.ID, err)
 		}
-		if err := ch.syncTransactionState(tx.ID); err != nil {
-			return fmt.Errorf("sync recovered transaction %s: %w", tx.ID, err)
-		}
+		stateLock.Unlock()
 		util.Info("Recovered prepared transaction %s", tx.ID)
 	}
 	return nil
@@ -317,6 +354,27 @@ func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
 	ch.txnApplyMu.Lock()
 	defer ch.txnApplyMu.Unlock()
 
+	if err := ch.validateTransaction(tx); err != nil {
+		return err
+	}
+	apply := func() error {
+		for _, op := range tx.Messages {
+			if err := ch.publishCommittedTransactionMessage(op); err != nil {
+				return err
+			}
+		}
+		if err := ch.appendTransactionMarkers(tx, types.TransactionMarkerCommit); err != nil {
+			return err
+		}
+		if err := ch.commitTransactionOffsets(tx.Offsets); err != nil {
+			return err
+		}
+		return nil
+	}
+	return ch.withTransactionOffsetFences(tx.Offsets, apply)
+}
+
+func (ch *CommandHandler) validateTransaction(tx *transaction.Transaction) error {
 	for _, op := range tx.Messages {
 		t := ch.TopicManager.GetTopic(op.Topic)
 		if t == nil {
@@ -334,23 +392,7 @@ func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
 			return err
 		}
 	}
-	apply := func() error {
-		for _, op := range tx.Messages {
-			if err := ch.publishCommittedTransactionMessage(op); err != nil {
-				return err
-			}
-		}
-		if err := ch.appendTransactionMarkers(tx, types.TransactionMarkerCommit); err != nil {
-			return err
-		}
-		for _, op := range tx.Offsets {
-			if err := ch.commitTransactionOffset(op); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	return ch.withTransactionOffsetFences(tx.Offsets, apply)
+	return nil
 }
 
 type transactionOffsetFence struct {
@@ -665,11 +707,36 @@ func (ch *CommandHandler) validateReplicatedTransactionMessage(topicName string,
 	}
 	return ch.validateTransactionRecordPublish(tx, topicName, partition, msg)
 }
-func (ch *CommandHandler) commitTransactionOffset(op transaction.OffsetOperation) error {
+func (ch *CommandHandler) commitTransactionOffsets(ops []transaction.OffsetOperation) error {
+	if len(ops) == 0 {
+		return nil
+	}
+
+	ordered := append([]transaction.OffsetOperation(nil), ops...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].Partition < ordered[j].Partition
+	})
+	scope := ordered[0]
+	items := make([]coordinator.OffsetItem, 0, len(ordered))
+	pairs := make([]string, 0, len(ordered))
+	for _, op := range ordered {
+		if op.Topic != scope.Topic || op.Group != scope.Group || op.Member != scope.Member || op.Generation != scope.Generation {
+			return fmt.Errorf(
+				"transaction offset scope mismatch: expected topic=%s group=%s member=%s generation=%d",
+				scope.Topic, scope.Group, scope.Member, scope.Generation,
+			)
+		}
+		items = append(items, coordinator.OffsetItem{Partition: op.Partition, Offset: op.Offset})
+		pairs = append(pairs, fmt.Sprintf("P%d:%d", op.Partition, op.Offset))
+	}
+
 	if ch.isDistributed() && ch.Cluster != nil && ch.Cluster.Router != nil {
-		cmd := fmt.Sprintf("COMMIT_OFFSET topic=%s partition=%d group=%s offset=%d member=%s generation=%d", op.Topic, op.Partition, op.Group, op.Offset, op.Member, op.Generation)
+		cmd := fmt.Sprintf(
+			"BATCH_COMMIT topic=%s group=%s member=%s generation=%d %s",
+			scope.Topic, scope.Group, scope.Member, scope.Generation, strings.Join(pairs, ","),
+		)
 		encodedCmd := util.EncodeMessage("", cmd)
-		resp, err := ch.Cluster.Router.ForwardToCoordinator(op.Group, string(encodedCmd))
+		resp, err := ch.Cluster.Router.ForwardToCoordinator(scope.Group, string(encodedCmd))
 		if err != nil {
 			return err
 		}
@@ -678,10 +745,9 @@ func (ch *CommandHandler) commitTransactionOffset(op transaction.OffsetOperation
 		}
 		return nil
 	}
-	if err := ch.Coordinator.ValidateAndCommit(op.Group, op.Topic, op.Partition, op.Offset, op.Generation, op.Member); err != nil {
-		return err
-	}
-	return nil
+	return ch.Coordinator.ValidateAndCommitOffsetsBulk(
+		scope.Group, scope.Topic, scope.Member, scope.Generation, items,
+	)
 }
 
 func (ch *CommandHandler) ensureTransactionCoordinator(txnID string) string {
@@ -708,17 +774,66 @@ func (ch *CommandHandler) restoreTransaction(txnID string, snap *transaction.Sna
 	}
 	ch.TxnManager.Delete(txnID)
 }
-func (ch *CommandHandler) syncTransactionState(txnID string) error {
-	if !ch.isDistributed() {
-		return nil
+func (ch *CommandHandler) ConfigureTransactionJournal(path string) error {
+	if ch.isDistributed() {
+		return fmt.Errorf("standalone transaction journal cannot be enabled in distributed mode")
 	}
+	journal, err := transaction.OpenJournal(path)
+	if err != nil {
+		return err
+	}
+	state, err := journal.Load()
+	if err != nil {
+		return err
+	}
+	ch.TxnManager.ImportState(state)
+	ch.txnJournal = journal
+	return nil
+}
+
+func (ch *CommandHandler) syncTransactionState(txnID string) error {
 	snapshots := ch.TxnManager.ExportState()
 	snap := snapshots[txnID]
 	if snap == nil {
 		return fmt.Errorf("transaction %s not found", txnID)
 	}
+	if !ch.isDistributed() {
+		if ch.txnJournal == nil {
+			return nil
+		}
+		return ch.txnJournal.Append(snap)
+	}
 	_, err := ch.applyViaLeader("TXN_SYNC", map[string]interface{}{"transaction": snap})
 	return err
+}
+
+func (ch *CommandHandler) commitTransactionDecision(txnID string) error {
+	snap, err := ch.TxnManager.BuildCommittedSnapshot(txnID)
+	if err != nil {
+		return err
+	}
+	return ch.persistFinalTransactionDecision(snap)
+}
+
+func (ch *CommandHandler) abortTransactionDecision(txnID, producerID string, epoch int64) error {
+	snap, err := ch.TxnManager.BuildAbortedSnapshot(txnID, producerID, epoch)
+	if err != nil {
+		return err
+	}
+	return ch.persistFinalTransactionDecision(snap)
+}
+
+func (ch *CommandHandler) persistFinalTransactionDecision(snap *transaction.Snapshot) error {
+	if ch.isDistributed() {
+		_, err := ch.applyViaLeader("TXN_SYNC", map[string]interface{}{"transaction": snap})
+		return err
+	}
+	if ch.txnJournal != nil {
+		if err := ch.txnJournal.Append(snap); err != nil {
+			return err
+		}
+	}
+	return ch.TxnManager.ApplyReplicatedSnapshot(snap)
 }
 
 func transactionCoordinatorKey(txnID string) string {

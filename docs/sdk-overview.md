@@ -1,6 +1,6 @@
 # SDK Overview
 
-Cursus broker에 연결하는 3개 SDK의 아키텍처 개요.
+Cursus maintains one wire contract across the in-repository Go SDK and the separately released Java and Python SDKs. Broker changes are SDK-complete only after each affected client has matching contract tests and a compatible release.
 
 ## SDK Ecosystem
 
@@ -70,10 +70,12 @@ flowchart TB
 | TLS | ✅ | ✅ | ✅ |
 | FindCoordinator | ✅ | ✅ | ✅ |
 | Partition Leader Routing | ✅ | ✅ | ✅ |
-| Protocol capability negotiation | ✅ | pending | pending |
-| Typed structured broker errors | ✅ | pending | pending |
-| Broker-managed transactions | ✅ | pending | pending |
-| Connection authentication | ✅ | pending | pending |
+| Broker-owned offset resume / `auto_offset_reset` | ✅ | ✅ merged in SDK repo | ✅ merged in SDK repo |
+| Explicit `read_committed` / `read_uncommitted` | ✅ | follow-up required | follow-up required |
+| Protocol capability negotiation | ✅ | verify before requiring features | verify before requiring features |
+| Typed structured broker errors | ✅ | verify against SDK version | verify against SDK version |
+| High-level broker transactions | ✅ | follow-up required | follow-up required |
+| Connection authentication | ✅ | verify against SDK version | verify against SDK version |
 | Framework Integration | — | Spring Boot | FastAPI |
 | Iterator Pattern | — | — | ✅ for/async for |
 
@@ -176,13 +178,25 @@ return producer.Commit()
 
 The broker allocates and fences the producer ID and epoch. The high-level
 producer retains that session across reconnects and serializes lifecycle calls.
+A successful `Commit` or `Abort` consumes the current epoch; the next `Begin`
+automatically reinitializes the session and obtains a higher epoch. Retrying an
+uncertain finalization continues to use the same epoch, preserving idempotency. Once the broker reports `state=committing`, retry `Commit`; do not switch that epoch to abort.
+
 `NOT_COORDINATOR` responses update a per-transaction coordinator cache and are
 retried with a bounded delay. Fencing, authorization, validation, and ambiguous
-network failures are returned to the caller as errors rather than retried.
+network failures are returned to the caller as errors rather than retried. The
+broker is authoritative for final transaction state; `Describe` returns the
+typed state, message count, and offset count.
 
-`Commit` and `Abort` may be called again with the same session after an
-uncertain response. The broker is authoritative for final transaction state;
-`Describe` returns the typed state, message count, and offset count.
+One transaction may publish to multiple output partitions, but staged consumer
+offsets must share one `(topic, group, member, generation)` scope. Duplicate
+partition entries merge monotonically and the scope commits through one fenced
+bulk offset update. Use separate transactions for separate consumer scopes.
+
+Commit writes idempotent output records, appends partition transaction markers,
+applies the bulk source offset update, then persists the final coordinator
+decision. `read_committed` requires both marker and decision, so output stays
+hidden during a recoverable crash window before finalization.
 
 ## Go Consumer Resume Contract
 
@@ -196,11 +210,13 @@ last broker-committed offset, providing at-least-once processing.
 `AutoOffsetResetError` leaves reset selection disabled and surfaces an
 out-of-range condition.
 
-The current broker data path is committed-only: transactional records remain
-hidden until a commit marker is durable, open transactions form the visibility
-boundary, and aborted records are skipped. The Go SDK does not expose a
-`read_uncommitted` option because that is not part of the current broker wire
-contract.
+`ConsumerConfig.ReadIsolation` selects `sdk.ReadCommitted` or
+`sdk.ReadUncommitted`; the default is `ReadCommitted`. The SDK sends the value
+explicitly on both `CONSUME` and `STREAM`. Committed reads expose
+non-transactional records and transaction records only after both the matching
+partition marker and final coordinator decision are durable. They skip aborted
+transactions and stop at the earliest unresolved transaction. Uncommitted reads
+return the raw committed partition log, including transaction control records.
 
 ## Go Client Authentication
 

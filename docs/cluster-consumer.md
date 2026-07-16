@@ -4,7 +4,7 @@ Consumer가 클러스터 환경에서 메시지를 소비하기 위한 FindCoord
 
 ## Overview
 
-Consumer Group 관련 커맨드는 group coordinator로, 데이터 커맨드는 partition leader로 라우팅합니다.
+Consumer group commands are routed to the group coordinator, while `CONSUME` and `STREAM` are routed to the partition leader. The broker-owned committed `nextOffset` remains authoritative across both routes.
 
 ## Command Routing
 
@@ -86,7 +86,7 @@ sequenceDiagram
     B-->>C: OK leaders=H1:P1,H2:P2
 
     loop Poll Loop
-        C->>PL: CONSUME topic=T partition=0 offset=0 member=M-1234 group=G generation=1
+        C->>PL: CONSUME topic=T partition=0 offset=<committed> member=M-1234 group=G generation=1 isolation=read_committed
         PL-->>C: batch(messages)
     end
 
@@ -103,6 +103,15 @@ generation is synchronized for an existing member; `member_not_found` causes a
 fresh join. When group coordinator ownership changes, the new owner waits one
 session timeout before expiring members, while clients rediscover it and resume
 heartbeats.
+
+## Resume And Isolation Rules
+
+- After every assignment or rejoin, fetch `FETCH_OFFSET` for each assigned partition before reading.
+- When a committed offset exists, the data path starts there even if the request carries a lower explicit offset.
+- If no offset exists, `autoOffsetReset=earliest` starts at the earliest retained offset, `latest` starts at the next committed tail, and `error` surfaces the gap.
+- Commit only `lastProcessedOffset + 1`. Regressions fail and do not change broker state.
+- `read_committed` is the SDK default and hides unresolved/aborted transaction records. `read_uncommitted` returns the raw committed log, including transaction control records.
+- A graceful `STREAM_CONTROL type=CLOSE` is a terminator. A socket loss without that frame is retryable and must resume through the group offset contract.
 
 ## Error Recovery
 
@@ -137,3 +146,5 @@ flowchart TD
 - `handleNotCoordinator()` — re-discovers coordinator from response or via FIND_COORDINATOR
 - `joinGroup()` — resumes the current member and generation before creating a fresh member
 - `fetchOffset()` — uses a bounded, per-request coordinator connection and parses `OK offset=<N>`
+- `ReadIsolation` — sends explicit `isolation=read_committed|read_uncommitted` on polling and streaming reads
+- offset commits — send the broker-assigned member and generation, reject regressions, and stop/rejoin on fencing errors

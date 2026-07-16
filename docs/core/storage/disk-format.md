@@ -1,223 +1,123 @@
-# Disk-format
+# Disk Format
 
-This document describes the on-disk storage format used by cursus to persist messages. It covers the segment file structure, message encoding scheme, write and read mechanics, and platform-specific optimizations.
+This document describes the Cursus partition-log files. The format is Cursus-owned and may evolve only with compatible recovery and upgrade handling.
 
-For details on the asynchronous write path and batching behavior, see [DiskHandler and Write Path](./disk-persistence.md).
+## Layout
 
-## Purpose and Scope
+Each topic partition has independent segment and sparse offset-index files:
 
-cursus stores messages in append-only log files organized into segments. Each topic-partition pair maintains its own set of segment files, allowing for parallel I/O operations and independent management. This document specifies:
-
-- Segment file naming conventions and directory layout
-- Message encoding format (length-prefixed binary)
-- Write mechanics (batching, buffering, sync policy)
-- Read mechanics (memory-mapped I/O, offset resolution)
-- Segment rotation and management
-- Directory Structure and File Naming
-
-## Directory Layout
-
-Messages are organized in a hierarchical directory structure based on topic and partition:
-
-```
-{LogDir}/
-  {topicName}/
-    partition_{partitionID}_segment_0.log
-    partition_{partitionID}_segment_1.log
-    partition_{partitionID}_segment_N.log
+```text
+{log_dir}/{topic}/
+  partition_{partition}_segment_{baseOffset:020d}.log
+  partition_{partition}_segment_{baseOffset:020d}.index
 ```
 
-Example:
+The segment number is the first logical record offset in that segment, not an ordinal file number. The default `log_segment_bytes` is 1 GiB and is configurable. A segment also rolls when its index would exceed `log_index_size_bytes` or when the configured time-based roll interval expires.
 
-```
-./logs/
-  orders/
-    partition_0_segment_0.log
-    partition_0_segment_1.log
-    partition_0_segment_2.log
-  users/
-    partition_0_segment_0.log
-    partition_1_segment_0.log
+## Segment Record
+
+A log segment is a sequence of length-prefixed records:
+
+```text
+uint32_be serializedLength
+byte[serializedLength] serializedDiskMessage
 ```
 
-## File Naming Convention
+The maximum accepted serialized record size is 16 MiB. The serialized message uses big-endian fixed-width integers and length-prefixed strings/bytes in this order:
 
-| Component     | Format                                           | Example                     |
-|---------------|--------------------------------------------------|------------------------------|
-| Base path     | `{LogDir}/{topicName}/partition_{partitionID}`     | `./logs/orders/partition_0`    |
-| Segment file  | `{base}_segment_{segmentNumber}.log`               | `partition_0_segment_0.log`    |
+| Field | Encoding |
+|---|---|
+| topic | `uint16` length + UTF-8 bytes |
+| partition | `uint32` |
+| logical offset | `uint64` |
+| producer id | `uint16` length + bytes |
+| producer sequence | `uint64` |
+| producer epoch | `uint64` representation of non-negative `int64` |
+| payload | `uint32` length + bytes |
+| event type | `uint16` length + bytes |
+| schema version | `uint32` |
+| aggregate version | `uint64` |
+| metadata | `uint16` length + bytes |
+| key | `uint16` length + bytes |
+| transactional id/state/marker | three `uint16` length-prefixed values |
+| control batch type | `uint16` length + bytes |
+| control batch version | `int16` |
+| control coordinator epoch | `int64` |
+| control key/value | two `uint16` length-prefixed byte arrays |
 
+The transaction/control fields are empty for ordinary records. Control records remain in the raw log and are filtered by `read_committed`.
 
+## Sparse Offset Index
 
-The base path is constructed using platform-specific path separators (`os.PathSeparator`) to ensure cross-platform compatibility.
+Each `.index` file contains fixed 16-byte entries:
 
-# Segment Management
-
-## Segment Size and Rotation
-
-Each segment file has a maximum size of 1 MB (1,048,576 bytes). 
-
-When the current segment would exceed this limit after writing a message, the DiskHandler automatically rotates to a new segment.
-
-## Segment Metadata
-
-The DiskHandler tracks segment state using the following fields:
-
-| Field           | Type   | Purpose                                         |
-|-----------------|--------|-------------------------------------------------|
-| CurrentSegment  | int    | Active segment number (0, 1, 2, ...)           |
-| CurrentOffset   | int    | Write position within current segment (bytes)   |
-| SegmentSize     | int    | Maximum segment size (1 MB)                     |
-| BaseName        | string | Base path for segment files                     |
-
-
-# Message Encoding Format
-
-## Length-Prefixed Binary Format
-
-Messages are stored using a simple length-prefixed binary format. Each message consists of:
-
-## 4-byte length prefix (big-endian uint32)
-
-### Message payload (variable length bytes)
-
-```
-┌─────────────┬──────────────────┬─────────────┬──────────────────┐
-│ Length (4B) │ Message Data (N) │ Length (4B) │ Message Data (M) │ ...
-└─────────────┴──────────────────┴─────────────┴──────────────────┘
+```text
+uint64_be logicalOffset
+uint64_be bytePosition
 ```
 
-Example:
+An entry is written after the configured byte interval (default 4096 bytes). Reads locate the segment and nearest indexed byte position, then scan and validate contiguous logical offsets. Segment data is opened through mmap for reads.
 
-```
-Message 1: "Hello"
-  [0x00, 0x00, 0x00, 0x05] [0x48, 0x65, 0x6C, 0x6C, 0x6F]
-   ^--- Length = 5          ^--- "Hello" in ASCII
-```
+## Write And Sync Contract
 
-```
-Message 2: "World!"
-  [0x00, 0x00, 0x00, 0x06] [0x57, 0x6F, 0x72, 0x6C, 0x64, 0x21]
-   ^--- Length = 6          ^--- "World!" in ASCII
-```
+Asynchronous writes enter a buffered `writeCh` (default capacity 1024). `flushLoop` serializes and writes a batch when any of these occurs:
 
-## Encoding Implementation
+- `disk_flush_batch_size` records are ready (default 50),
+- `linger_ms` expires (default 50 ms),
+- an explicit flush or shutdown drains pending records,
+- a segment roll is required.
 
-The encoding process follows these steps:
+`WriteBatch` flushes the Go buffered data and index writers to the operating-system file descriptors. `syncLoop` calls `Sync` for data and index files at `disk_flush_interval_ms` (default 500 ms) and advances the partition durability callback after a successful sync. Explicit `Flush`, segment rotation, and shutdown also sync data.
 
-1. Convert message string to []byte
-2. Calculate message length
-3. Encode length as 4-byte big-endian uint32 using `binary.BigEndian.PutUint32()`
-4. Write length prefix to `bufio.Writer`
-5. Write message data to `bufio.Writer`
-6. Update CurrentOffset by (4 + messageLength)
+A write being visible in the process page cache is different from surviving power loss. Client acknowledgements and replicated HWM advancement must be interpreted according to the selected publish/replication path and the synced committed-tail contract, not merely successful channel enqueue.
 
-### Byte Order
+## Recovery
 
-The length prefix uses big-endian (network byte order) encoding. 
+Startup recovery scans the active segment, validates every length and decoded record, checks contiguous offsets, and truncates an invalid or partial tail. It rebuilds or opens the sparse index and clamps recovered committed high watermarks to the durable tail.
 
-This ensures consistent interpretation across different hardware architectures and allows for straightforward binary inspection.
+Partition-owned side checkpoints include:
 
-### Batching and Buffering
+- synced high-watermark state,
+- producer epoch/sequence state (also rebuildable from records),
+- event-stream indexes and snapshots where enabled.
 
-The write path employs a multi-level buffering strategy to optimize disk I/O:
+Transaction visibility indexes are rebuilt from durable transaction records and markers. The durable transaction coordinator decision remains a separate metadata authority.
 
-## Write Mechanics
+## Standalone Transaction Journal
 
-| Stage    | Component           | Configuration            | Behavior                                 |
-|----------|----------------------|---------------------------|-------------------------------------------|
-| Enqueue  | writeCh channel      | ChannelBufferSize         | Non-blocking with timeout retry           |
-| Batch    | flushLoop goroutine  | DiskFlushBatchSize (500)  | Accumulates messages up to batch size     |
-| Linger   | `time.Ticker`          | LingerMS (100ms)          | Flushes partial batches after timeout     |
-| Buffer   | `bufio.Writer`         | Default (4KB)             | In-memory buffering before syscall        |
-| Sync     | `file.Sync()`          | After each batch          | Forces kernel flush to disk               |
+A standalone broker stores coordinator snapshots in `{log_dir}/__transaction_state.journal`. This file is separate from partition segments. Each record uses the following versioned frame:
 
+    uint32_be payloadLength
+    byte[payloadLength] JSON {"version":1,"transaction":{...}}
+    uint32_be crc32(payload)
 
-## Flush Triggers
+The encoded payload is limited to 32 MiB. Every accepted transition is appended and fsynced. Before appending, the broker truncates bytes beyond the last validated record so a failed partial write cannot hide later acknowledged state. Startup repairs only a torn or checksum-corrupt final frame and rejects corruption before the tail. The decoder accepts the earlier bare-snapshot JSON payload for recovery compatibility, but all new writes use version 1.
 
-The flushLoop goroutine flushes accumulated messages under three conditions:
+The journal is append-only and currently has no automatic compaction. Backups must keep it consistent with partition logs and the standalone consumer offset store.
 
-- **Batch size reached**: When len(batch) >= batchSize
-- **Linger timeout**: Every linger duration (100ms default)
-- **Shutdown signal**: On done channel close, draining remaining messages
+## Retention And Deletion
 
-# Durability Guarantees
+Time/size retention removes eligible closed segments through the retention loop. The active segment is preserved. `log_cleanup_policy=delete` is the only implemented cleanup policy; compaction is not implemented and unsupported values normalize to `delete`.
 
-After writing each batch, the system ensures durability through:
+Readers can hold references while retention runs. Deletion uses the storage lifecycle to avoid removing an actively read segment and returns `OFFSET_OUT_OF_RANGE` when a requested logical offset predates the earliest retained segment.
 
-- `bufio.Writer.Flush()` - Writes buffered data to file descriptor
-- `file.Sync()` - Invokes `fsync()` syscall to flush kernel page cache
+## Concurrency
 
-This guarantees that messages are physically written to disk before acknowledging completion.
+`DiskHandler` separates metadata/file ownership (`mu`), serialized writer operations (`ioMu`), and index reader/writer state (`indexMu`). Write paths acquire metadata before I/O locks. Readers copy the segment list under a short lock and release it before mmap scanning.
 
-## Memory-Mapped I/O
+## Platform Notes
 
-cursus uses memory-mapped I/O for reading messages, leveraging the `golang.org/x/exp/mmap` package. 
+Linux builds can apply sequential-access advice and zero-copy transfer where the selected path supports it. Windows uses portable file operations. The broker does not rely on `O_DIRECT` or per-batch `O_SYNC` as a universal format guarantee.
 
-This approach provides efficient random access to segment files without requiring explicit read syscalls for each message.
+## Defaults
 
-## Offset Resolution
-
-The ReadMessages function implements logical offset handling:
-
-1. Start reading from the beginning of the segment file (`pos = 0`)
-2. Parse each message sequentially
-3. If `offset > 0`, skip the message and decrement offset
-4. Once `offset == 0`, begin collecting messages
-5. Continue until max messages collected or end of file
-
-This approach trades some read efficiency for simplicity, as it doesn't maintain an index structure. For workloads with small offsets relative to segment size, the cost is minimal due to memory-mapped I/O.
-
-# Concurrency Control
-
-## Dual Mutex Strategy
-
-The DiskHandler uses two mutexes to allow concurrent reads while protecting critical sections:
-
-| Mutex | Protects                     | Acquired By         | Purpose            |
-|-------|-------------------------------|----------------------|--------------------|
-| mu    | CurrentSegment, CurrentOffset | Read/Write operations| Metadata consistency |
-| ioMu  | file, writer                  | Write operations only| I/O serialization    |
-
-## Lock Ordering
-
-Write operations acquire locks in this order to prevent deadlocks:
-
-- mu (metadata lock)
-- ioMu (I/O lock)
-
-Read operations only acquire mu briefly to read CurrentSegment, then release it before opening the mmap reader.
-
-# Platform-Specific Implementations
-
-## Linux Optimizations
-
-On Linux builds, the segment opening includes platform-specific optimizations:
-
-From `flush_linux.go` (not shown in provided files)
-- Uses `O_DIRECT` or `O_SYNC` flags for write-through
-- Applies fadvise(SEQUENTIAL) for read-ahead hints
-- Can leverage `sendfile(2)` for zero-copy transfers
-
-## Windows Implementation
-
-The Windows implementation (`flush_window.go`) uses standard file operations without advanced optimizations:
-
-- Standard flags (`os.O_CREATE`, `os.O_RDWR`, `os.O_APPEND`)
-- No `sendfile()` equivalent (uses `io.Copy()` instead)
-- No `fadvise()` hints available
-
-# Summary Table
-
-| Aspect             | Specification                                   |
-|--------------------|--------------------------------------------------|
-| Segment size       | 1 MB (1,048,576 bytes)                           |
-| File naming        | `{topic}/partition_{id}_segment_{n}.log`           |
-| Message format     | 4-byte big-endian length + payload               |
-| Write buffering    | `bufio.Writer` + batch accumulation                |
-| Batch size         | Configurable (default: 500 messages)             |
-| Linger time        | Configurable (default: 100ms)                    |
-| Read mechanism     | Memory-mapped I/O (mmap)                         |
-| Durability         | `fsync()` after each batch                         |
-| Concurrency        | Dual mutex (mu + ioMu)                           |
-| Segment rotation   | Automatic at 1 MB boundary                       |
+| Setting | Default |
+|---|---:|
+| Segment size | 1 GiB |
+| Index size | 10 MiB |
+| Sparse index interval | 4096 bytes |
+| Async channel capacity | 1024 records |
+| Flush batch | 50 records |
+| Linger | 50 ms |
+| File sync interval | 500 ms |
+| Cleanup policy | `delete` |

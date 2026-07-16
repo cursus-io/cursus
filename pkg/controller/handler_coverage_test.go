@@ -1577,9 +1577,9 @@ func TestTransactionRejectsOffsetRegressionBeforePublishing(t *testing.T) {
 	resp = ch.HandleCommand("FETCH_OFFSET topic=txn-regression-topic partition=0 group=txn-regression-group", ctx)
 	assert.Equal(t, "OK offset=10", resp)
 	resp = ch.HandleCommand("TXN_STATUS transactional_id=tx-regression", ctx)
-	assert.Contains(t, resp, "state=committing")
-	resp = ch.HandleCommand("INIT_PRODUCER_ID transactional_id=tx-regression", ctx)
-	assert.Contains(t, resp, "init_producer_failed")
+	assert.Contains(t, resp, "state=open")
+	resp = ch.HandleCommand("END_TXN transactional_id=tx-regression producerId="+producerID+" epoch="+epoch+" result=abort", ctx)
+	assert.Contains(t, resp, "state=aborted")
 }
 func TestTransactionCommitRejectsStaleGroupGenerationBeforePublishing(t *testing.T) {
 	ch, tm, coord := newTestHandlerWithCoordinator(t)
@@ -1611,7 +1611,9 @@ func TestTransactionCommitRejectsStaleGroupGenerationBeforePublishing(t *testing
 	resp = ch.HandleCommand("FETCH_OFFSET topic=txn-stale-generation-topic partition=0 group=txn-stale-generation-group", ctx)
 	assert.Equal(t, "OK offset=0", resp)
 	resp = ch.HandleCommand("TXN_STATUS transactional_id=tx-stale-generation", ctx)
-	assert.Contains(t, resp, "state=committing")
+	assert.Contains(t, resp, "state=open")
+	resp = ch.HandleCommand("END_TXN transactional_id=tx-stale-generation producerId="+producerID+" epoch="+epoch+" result=abort", ctx)
+	assert.Contains(t, resp, "state=aborted")
 }
 func TestRecoverPreparedTransactionsCommitsCommittingState(t *testing.T) {
 	ch, tm, coord := newTestHandlerWithCoordinator(t)

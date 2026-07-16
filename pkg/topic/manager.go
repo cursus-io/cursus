@@ -31,6 +31,7 @@ type TopicManager struct {
 	cfg           *config.Config
 	StreamManager StreamManager
 	coordinator   *coordinator.Coordinator
+	txnResolver   TransactionDecisionResolver
 }
 
 // HandlerProvider defines an interface to provide disk handlers.
@@ -48,6 +49,16 @@ type topicHandlerCloser interface {
 
 func (tm *TopicManager) SetCoordinator(cd *coordinator.Coordinator) {
 	tm.coordinator = cd
+}
+
+func (tm *TopicManager) SetTransactionDecisionResolver(resolver TransactionDecisionResolver) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	tm.txnResolver = resolver
+	for _, t := range tm.topics {
+		t.SetTransactionDecisionResolver(resolver)
+	}
 }
 
 func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *TopicManager {
@@ -99,6 +110,7 @@ func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, i
 		util.Error("failed to create topic '%s': %v", name, err)
 		return fmt.Errorf("failed to create topic '%s': %w", name, err)
 	}
+	t.SetTransactionDecisionResolver(tm.txnResolver)
 	tm.topics[name] = t
 	return nil
 }

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -111,6 +112,70 @@ func TestRecoverPreparedTransactionsLeavesOpenTransactionsInvisible(t *testing.T
 	require.False(t, ok)
 }
 
+func TestPreparedTransactionRemainsInvisibleUntilDurableDecision(t *testing.T) {
+	ch, tm, coord, _ := newDiskBackedTransactionHandler(t)
+	topicName := "txn-decision-gate-topic"
+	groupName := "txn-decision-gate-group"
+	memberID := "txn-decision-gate-member"
+	generation := prepareTransactionGroup(t, tm, coord, topicName, groupName, memberID)
+
+	producerID, epoch := initAndStageTransaction(t, ch, "tx-decision-gate", topicName, groupName, memberID, generation, 13)
+	tx, err := ch.TxnManager.PrepareCommit("tx-decision-gate", producerID, epoch)
+	require.NoError(t, err)
+
+	require.NoError(t, ch.applyTransaction(tx))
+
+	require.Empty(t, readCommittedPayloads(t, tm, topicName))
+	offset, ok := coord.GetOffset(groupName, topicName, 0)
+	require.True(t, ok)
+	require.Equal(t, uint64(13), offset)
+
+	abortResp := ch.HandleCommand(
+		fmt.Sprintf("END_TXN transactional_id=tx-decision-gate producerId=%s epoch=%d result=abort", producerID, epoch),
+		NewClientContext("", 0),
+	)
+	require.Contains(t, abortResp, "ERROR: transaction_not_abortable")
+	require.Empty(t, readCommittedPayloads(t, tm, topicName))
+
+	require.NoError(t, ch.commitTransactionDecision("tx-decision-gate"))
+	require.Equal(t, []string{"payload-tx-decision-gate"}, readCommittedPayloads(t, tm, topicName))
+}
+
+func TestStandaloneJournalRecoversPreparedTransactionAfterRestart(t *testing.T) {
+	ch, tm, coord, _ := newDiskBackedTransactionHandler(t)
+	journalPath := filepath.Join(t.TempDir(), "transactions.journal")
+	require.NoError(t, ch.ConfigureTransactionJournal(journalPath))
+
+	topicName := "txn-journal-recovery-topic"
+	groupName := "txn-journal-recovery-group"
+	memberID := "txn-journal-recovery-member"
+	generation := prepareTransactionGroup(t, tm, coord, topicName, groupName, memberID)
+
+	producerID, epoch := initAndStageTransaction(t, ch, "tx-journal-recovery", topicName, groupName, memberID, generation, 17)
+	tx, err := ch.TxnManager.PrepareCommit("tx-journal-recovery", producerID, epoch)
+	require.NoError(t, err)
+	require.NoError(t, ch.syncTransactionState("tx-journal-recovery"))
+	require.NoError(t, ch.applyTransaction(tx))
+	require.Empty(t, readCommittedPayloads(t, tm, topicName))
+
+	restarted := NewCommandHandler(tm, ch.Config, coord, nil, nil)
+	require.NoError(t, restarted.ConfigureTransactionJournal(journalPath))
+	status, err := restarted.TxnManager.Status("tx-journal-recovery")
+	require.NoError(t, err)
+	require.Equal(t, transaction.StateCommitting, status.State)
+
+	require.NoError(t, restarted.RecoverPreparedTransactions())
+	require.Equal(t, []string{"payload-tx-journal-recovery"}, readCommittedPayloads(t, tm, topicName))
+	offset, ok := coord.GetOffset(groupName, topicName, 0)
+	require.True(t, ok)
+	require.Equal(t, uint64(17), offset)
+
+	reloaded := NewCommandHandler(tm, ch.Config, coord, nil, nil)
+	require.NoError(t, reloaded.ConfigureTransactionJournal(journalPath))
+	finalStatus, err := reloaded.TxnManager.Status("tx-journal-recovery")
+	require.NoError(t, err)
+	require.Equal(t, transaction.StateCommitted, finalStatus.State)
+}
 func TestRecoverPreparedTransactionsIsIdempotentAfterCommitWindow(t *testing.T) {
 	ch, tm, coord, _ := newDiskBackedTransactionHandler(t)
 	topicName := "txn-commit-recovery-topic"
@@ -166,6 +231,7 @@ func TestTransactionAbortRetryDoesNotMoveOffsetsOrAppendAgain(t *testing.T) {
 	p, err := tm.GetTopic(topicName).GetPartition(0)
 	require.NoError(t, err)
 	nextOffsetAfterAbort := p.NextOffset()
+	require.Equal(t, uint64(0), nextOffsetAfterAbort)
 
 	resp = ch.HandleCommand(cmd, ctx)
 	require.Contains(t, resp, "state=aborted")

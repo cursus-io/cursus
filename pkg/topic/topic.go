@@ -26,6 +26,17 @@ type Topic struct {
 	IsIdempotent    bool
 	IsEventSourcing bool
 	Policy          Policy
+	txnResolver     TransactionDecisionResolver
+}
+
+func (t *Topic) SetTransactionDecisionResolver(resolver TransactionDecisionResolver) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.txnResolver = resolver
+	for _, partition := range t.Partitions {
+		partition.SetTransactionDecisionResolver(resolver)
+	}
 }
 
 type retentionPolicySetter interface {
@@ -115,6 +126,7 @@ func (t *Topic) AddPartitions(extra int, hp HandlerProvider) error {
 		}
 		applyRetentionPolicy(dh, t.Policy)
 		newP := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
+		newP.SetTransactionDecisionResolver(t.txnResolver)
 		newP.isIdempotent = t.IsIdempotent
 		newP.RecoverProducerStateFromLog()
 		newP.StartProducerStateMaintenance()

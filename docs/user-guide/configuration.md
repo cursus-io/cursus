@@ -114,6 +114,8 @@ The configuration is represented by the Config struct in the codebase, which org
 | `enable_benchmark`   | bool       | false          | Enable benchmark mode for testing               |
 | `cleanup_interval`   | int        | 300            | Log cleanup interval (seconds)                 |
 
+In standalone mode, `log_dir` also contains `__transaction_state.journal`. The broker fsyncs this append-only coordinator journal before acknowledging transaction state transitions and repairs only a torn or checksum-corrupt final record during startup. One encoded snapshot record is limited to 32 MiB, so transaction batches must remain bounded. Include the journal in backup and restore procedures.
+
 The health and metrics listeners are unauthenticated operations endpoints. Restrict both ports to a trusted network. `/live` reports process liveness, while `/ready` and the compatible `/health` endpoint include storage and distributed leader checks. See [Broker Observability](../reference/observability.md).
 
 # Security and Compression
@@ -146,18 +148,22 @@ These parameters directly affect the write path performance and batching behavio
 | `disk_flush_batch_size` | int  | 50      | Number of messages to batch before flushing to disk       |
 | `linger_ms`             | int  | 50      | Maximum time to wait before flushing (milliseconds)       |
 | `channel_buffer_size`   | int  | 1024    | Buffer size for DiskHandler's writeCh channel             |
-| `disk_write_timeout_ms` | int  | 10      | Timeout for synchronous writes when channel is full (ms)  |
+| `disk_write_timeout_ms` | int  | 10      | Timeout while enqueueing an asynchronous write (ms)       |
 | `disk_flush_interval_ms`| int  | 500     | Periodic fsync interval (milliseconds)                    |
 | `log_segment_bytes`     | uint64 | 1073741824 | Maximum segment file size (1GB default)                |
 | `log_index_size_bytes`  | uint64 | 10485760   | Maximum index file size (10MB default)                 |
 | `log_index_interval_bytes` | int | 4096    | Index entry interval in bytes                            |
 | `log_retention_hours`   | int  | 168     | Log retention period in hours (7 days default)            |
+| `log_retention_bytes`   | int64 | -1     | Retained byte limit; `-1` means unlimited                 |
+| `log_segment_roll_ms`   | int  | 604800000 | Time-based roll interval (7 days)                       |
+| `log_cleanup_policy`    | string | "delete" | Only implemented cleanup policy; compaction is unsupported |
+| `log_retention_check_interval_ms` | int | 300000 | Retention evaluation interval                          |
 | `compression_type`      | string | "none" | Compression type: "none", "gzip", "snappy", "lz4"       |
 
 
 Trade-offs:
 
-- Higher `disk_flush_batch_size`: Better throughput, higher latency, more data loss risk on crash
+- Higher `disk_flush_batch_size`: Better throughput, higher queueing latency, and more records waiting for flush/sync
 - Lower `linger_ms`: Lower latency, more frequent I/O operations, reduced throughput
 - Larger `channel_buffer_size`: Better handling of burst traffic, higher memory usage
 
@@ -170,21 +176,23 @@ These parameters control the in-memory channel buffer sizes for message distribu
 | `partition_channel_buffer_size` | int  | 10000   | Buffer size for each Partition's input channel  |
 | `consumer_channel_buffer_size`  | int  | 1000    | Buffer size for each Consumer's message channel |
 
-# Broker-Specific Parameters
+# Broker And Cluster Parameters
 
-These parameters are available in the Config struct but are primarily used in client/producer contexts rather than the broker itself:
+These values participate in active broker behavior:
 
-| Parameter                      | Type      | Default | Description                                        |
-|--------------------------------|-----------|---------|----------------------------------------------------|
-| `bootstrap_servers`              | []string  | nil     | List of broker addresses for client connections   |
-| `acks`                           | string    | ""      | Acknowledgment mode (client-side setting)        |
-| `min_insync_replicas`            | int       | 0       | Minimum replicas for writes (future replication support) |
-| `buffer_size`                    | int       | 0       | Generic buffer size                               |
-| `batch_size`                     | int       | 0       | Batch size for producers                           |
-| `max_inflight_requests_per_conn` | int       | 0       | Maximum concurrent requests per connection        |
+| Parameter | Default | Purpose |
+|---|---:|---|
+| `bootstrap_servers` | empty | Initial broker addresses for distributed discovery. |
+| `acks` | empty/default path | Broker publish acknowledgement selection. |
+| `min_insync_replicas` | 2 | Minimum in-sync replicas required by quorum writes. |
+| `replication_factor` | 3 | Requested topic replica count when distribution is enabled. |
+| `internal_broker_port` | 0 | Dedicated broker-to-broker command listener; configure in production clusters. |
+| `internal_auth_token` | empty | Shared internal command credential; required unless mTLS identity is authoritative. |
+| `internal_use_tls` | false | Enables broker-internal TLS and client-certificate verification. |
+| `transactional_id_expiration_ms` | 604800000 | Retention for completed transaction payloads. Epoch tombstones remain for fencing; active transactions are not expired. |
+| `producer_state_ttl_ms` | 1800000 | In-memory producer state cleanup window; durable records/checkpoints remain recovery sources. |
 
-These parameters are defined in the struct for future extensibility but are not actively used by the current broker implementation.
-
+Distribution is disabled by default. Production clusters should use a dedicated internal listener, mTLS, least-privilege client users, and explicit advertised addresses.
 # Using Configuration in Different Scenarios
 
 ## Scenario 1: Development with Defaults
@@ -302,6 +310,12 @@ The Config struct uses both YAML and JSON tags to support both formats. Here's h
 | DiskWriteTimeoutMS        | `disk_write_timeout_ms`      | `disk.write.timeout.ms`       | --disk-write-timeout     |
 | PartitionChannelBufSize   | `partition_channel_buffer_size` | `partition.channel.buffer.size` | --partition-ch-buffer |
 | ConsumerChannelBufSize    | `consumer_channel_buffer_size` | `consumer.channel.buffer.size` | --consumer-ch-buffer   |
+| SegmentSize              | `log_segment_bytes`          | `log.segment.bytes`            | --segment-size         |
+| SegmentRollTimeMS        | `log_segment_roll_ms`        | `log.segment.roll.ms`          | --segment-roll-time-ms |
+| IndexSize                | `log_index_size_bytes`       | `log.index.size.bytes`         | --index-size           |
+| CleanupPolicy            | `log_cleanup_policy`         | `log.cleanup.policy`           | --cleanup-policy       |
+| RetentionHours           | `log_retention_hours`        | `log.retention.hours`          | --retention-hours      |
+| RetentionBytes           | `log_retention_bytes`        | `log.retention.bytes`          | --retention-bytes      |
 
 # Special Configuration Handling
 
@@ -368,6 +382,8 @@ Both `PublisherConfig` and `ConsumerConfig` support an `enable_metrics` field to
 | Parameter       | Type | Default | Description                              |
 |----------------|------|---------|------------------------------------------|
 | `enable_metrics`| bool | false   | Enable Prometheus runtime metric collection |
+| `auto_offset_reset` | string | `earliest` | Missing/out-of-range offset policy: `earliest`, `latest`, or `error` |
+| `read_isolation` | string | `read_committed` | Consumer visibility: `read_committed` or `read_uncommitted` |
 
 When enabled, the SDK registers the following metrics in a dedicated Prometheus registry:
 
@@ -400,11 +416,8 @@ log.Fatal(http.ListenAndServe(":2112", nil))
 
 ## Configuration Validation
 
-The current implementation performs minimal validation during configuration loading. The following validations are implicit:
+`Config.Normalize()` applies safe fallbacks for invalid or non-positive values, including write batching, sync intervals, segment/index sizes, retention intervals, channel capacities, replica settings, and transaction/producer retention. TLS certificate loading still fails startup when configured files are invalid.
 
-- **Port numbers**: Must be valid integers
-- **Boolean flags**: Must parse as boolean values
-- **File paths**: Checked only when TLS is enabled and certificate loading is attempted
-- **Numeric parameters**: Must parse as integers
+Unsupported `log_cleanup_policy` values, including `compact`, normalize to `delete` with a warning because compaction is not implemented. Operators should treat normalization warnings as configuration errors in production and verify the effective startup configuration.
 
-Missing configuration values fall back to defaults defined in `pkg/config/properties.go`
+Missing values fall back to defaults in `pkg/config/properties.go`. Configuration precedence is defaults, file, environment, then CLI overrides where a flag is exposed.
