@@ -5,6 +5,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
+	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -50,9 +51,32 @@ func TestProcessMessageNegotiatesAndDecoratesSubsequentErrors(t *testing.T) {
 }
 
 func TestProtocolCommandsAreRecognizedAsRawCommands(t *testing.T) {
-	for _, command := range []string{"PROTOCOL_INFO", "NEGOTIATE version=1"} {
+	for _, command := range []string{
+		"AUTH principal=alice token=secret",
+		"LIST_OFFSETS topic=events",
+		"PROTOCOL_INFO",
+		"NEGOTIATE version=1",
+	} {
 		if !isCommand(command) {
 			t.Fatalf("%s was not recognized", command)
 		}
+	}
+}
+
+func TestDecorateServerResponsePreservesGroupSuccess(t *testing.T) {
+	ctx := controller.NewClientContext("group", 0)
+	ctx.SetProtocol(wireprotocol.CurrentVersion, []wireprotocol.Feature{wireprotocol.FeatureStructuredErrorsV1})
+	response := "OK generation=2 member=member-1 assignments=[0]"
+	if got := decorateServerResponse(response, ctx); got != response {
+		t.Fatalf("decorated success = %q, want %q", got, response)
+	}
+}
+
+func TestDecorateServerResponseEnrichesNegotiatedGroupError(t *testing.T) {
+	ctx := controller.NewClientContext("group", 0)
+	ctx.SetProtocol(wireprotocol.CurrentVersion, []wireprotocol.Feature{wireprotocol.FeatureStructuredErrorsV1})
+	want := "ERROR: GEN_MISMATCH class=fencing retryable=false expected=2 actual=1"
+	if got := decorateServerResponse("ERROR: GEN_MISMATCH expected=2 actual=1", ctx); got != want {
+		t.Fatalf("decorated error = %q, want %q", got, want)
 	}
 }

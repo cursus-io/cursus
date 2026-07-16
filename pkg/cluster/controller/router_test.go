@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -8,8 +9,50 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
 )
+
+func TestWithInternalTokenPreservesLongRawCommand(t *testing.T) {
+	router := &ClusterRouter{internalToken: "secret"}
+	command := "REPLICATE_MESSAGE payload=" + strings.Repeat("x", 22000)
+
+	got := router.withInternalToken(command)
+	wantPrefix := "REPLICATE_MESSAGE internal_token=secret payload="
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Fatalf("command prefix = %q, want %q", got[:min(len(got), len(wantPrefix))], wantPrefix)
+	}
+}
+
+func TestInjectInternalTokenOnlyInspectsCommandArguments(t *testing.T) {
+	command := "REPLICATE_MESSAGE payload=message internal_token=payload-value"
+	got := injectInternalToken(command, "secret")
+	want := "REPLICATE_MESSAGE internal_token=secret payload=message internal_token=payload-value"
+	if got != want {
+		t.Fatalf("command = %q, want %q", got, want)
+	}
+}
+
+func TestInjectInternalTokenPreservesExistingFirstArgument(t *testing.T) {
+	command := "REPLICATE_MESSAGE internal_token=secret payload=value"
+	if got := injectInternalToken(command, "secret"); got != command {
+		t.Fatalf("command = %q, want unchanged", got)
+	}
+}
+
+func TestWithInternalTokenPreservesLegacyEnvelope(t *testing.T) {
+	router := &ClusterRouter{internalToken: "secret"}
+	encoded := util.EncodeMessage("", "HELP")
+
+	got := router.withInternalToken(string(encoded))
+	_, payload, err := util.DecodeMessage([]byte(got))
+	if err != nil {
+		t.Fatalf("decode forwarded envelope: %v", err)
+	}
+	if payload != "HELP internal_token=secret" {
+		t.Fatalf("payload = %q", payload)
+	}
+}
 
 type MockRaftManager struct {
 	isLeader bool

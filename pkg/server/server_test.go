@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -435,6 +436,19 @@ func TestProcessMessage_RawCommand(t *testing.T) {
 	msg := readFramed(t, client)
 	assert.NotEmpty(t, msg)
 	<-done
+}
+
+func TestParseRawTextCommandPreservesLongCommand(t *testing.T) {
+	rawData := []byte("REPLICATE_MESSAGE payload=" + strings.Repeat("x", 22000))
+	got, ok := parseRawTextCommand(rawData)
+	assert.True(t, ok)
+	assert.Equal(t, string(rawData), got)
+}
+
+func TestParseRawTextCommandRejectsLegacyEnvelope(t *testing.T) {
+	encoded := util.EncodeMessage("", "HELP")
+	_, ok := parseRawTextCommand(encoded)
+	assert.False(t, ok)
 }
 
 func TestProcessMessage_EncodedCommand(t *testing.T) {

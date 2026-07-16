@@ -502,20 +502,20 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 		return false, nil
 	}
 
+	rawInput, isRawCommand := parseRawTextCommand(data)
+	if strings.HasPrefix(strings.ToUpper(rawInput), "INTERNAL_BATCH ") {
+		return handleInternalBatchMessage(rawInput, cmdHandler, ctx, conn)
+	}
+	if isRawCommand {
+		if resp := authorizeInternalListenerCommand(rawInput, cmdHandler, ctx); resp != "" {
+			writeResponse(conn, resp)
+			return false, nil
+		}
+		return handleCommandMessage(rawInput, cmdHandler, ctx, conn)
+	}
+
 	_, payload, err := util.DecodeMessage(data)
 	if err != nil {
-		rawInput := string(data)
-		rawInput = strings.Trim(rawInput, "\x00 \t\n\r")
-		if strings.HasPrefix(strings.ToUpper(rawInput), "INTERNAL_BATCH ") {
-			return handleInternalBatchMessage(rawInput, cmdHandler, ctx, conn)
-		}
-		if isCommand(rawInput) {
-			if resp := authorizeInternalListenerCommand(rawInput, cmdHandler, ctx); resp != "" {
-				writeResponse(conn, resp)
-				return false, nil
-			}
-			return handleCommandMessage(rawInput, cmdHandler, ctx, conn)
-		}
 		util.Error("⚠️ Decode error and not a raw command: %v [%s]", err, string(data))
 		writeResponse(conn, decorateServerResponse(fmt.Sprintf("ERROR: decode_failed reason=%q", err.Error()), ctx))
 		return false, nil
@@ -542,10 +542,14 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 		return handleCommandMessage(payload, cmdHandler, ctx, conn)
 	}
 
-	rawInput := strings.TrimSpace(string(data))
 	util.Debug("[%s] Received unrecognized input: %s", conn.RemoteAddr().String(), rawInput)
 	writeResponse(conn, decorateServerResponse("ERROR: malformed_input reason=missing_topic_or_payload", ctx))
 	return true, nil
+}
+
+func parseRawTextCommand(data []byte) (string, bool) {
+	rawInput := strings.Trim(string(data), " \t\n\r")
+	return rawInput, isCommand(rawInput)
 }
 
 func authorizeInternalListenerCommand(payload string, cmdHandler *controller.CommandHandler, ctx *controller.ClientContext) string {
@@ -665,19 +669,7 @@ func isBatchMessage(data []byte) bool {
 }
 
 func isCommand(s string) bool {
-	keywords := []string{"CREATE", "DELETE", "LIST", "LIST_CLUSTER", "CLUSTER_STATUS", "ELECT_LEADER", "PUBLISH", "CONSUME", "STREAM", "HELP",
-		"HEARTBEAT", "JOIN_GROUP", "LEAVE_GROUP", "COMMIT_OFFSET", "BATCH_COMMIT", "REGISTER_GROUP",
-		"GROUP_STATUS", "FETCH_OFFSET", "LIST_GROUPS", "SYNC_GROUP", "DESCRIBE",
-		"INIT_PRODUCER_ID", "BEGIN_TXN", "TXN_PUBLISH", "SEND_OFFSETS_TO_TXN", "END_TXN", "TXN_STATUS",
-		"APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT", "READ_SNAPSHOT", "STREAM_VERSION",
-		"REPLICATE_MESSAGE", "REPLICATE_SNAPSHOT", "LIST_SNAPSHOTS", "FETCH_SNAPSHOT", "CATCHUP_SNAPSHOTS",
-		"FIND_COORDINATOR", "RAFT_APPLY", "METADATA", "INTERNAL_BATCH", "PROTOCOL_INFO", "NEGOTIATE"}
-	for _, k := range keywords {
-		if strings.HasPrefix(strings.ToUpper(s), k) {
-			return true
-		}
-	}
-	return false
+	return wireprotocol.IsTextCommand(s)
 }
 
 // writeResponseWithTimeout adds write timeout
