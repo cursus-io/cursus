@@ -377,15 +377,22 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 			return fmt.Sprintf("ERROR: replica_append_failed reason=%q", err.Error())
 		}
 		p.FlushDisk()
-		if err := ch.indexReplicatedEventSourceMessages(msgCmd.Topic, msgCmd.Partition, msgCmd.Messages); err != nil {
-			return fmt.Sprintf("ERROR: replica_index_failed reason=%q", err.Error())
-		}
 	}
 	if msgCmd.CommitHWM != nil {
+		if t.IsEventSourcing && ch.ESHandler != nil {
+			if err := ch.ESHandler.PrepareCommittedIndex(msgCmd.Topic, msgCmd.Partition); err != nil {
+				return fmt.Sprintf("ERROR: replica_index_prepare_failed reason=%q", err.Error())
+			}
+		}
 		if err := p.ApplyReplicaHWM(*msgCmd.CommitHWM); err != nil {
 			return fmt.Sprintf("ERROR: invalid_commit_watermark reason=%q", err.Error())
 		}
 		p.FlushDisk()
+		if t.IsEventSourcing && ch.ESHandler != nil {
+			if err := ch.ESHandler.IndexCommittedToHWM(msgCmd.Topic, msgCmd.Partition, *msgCmd.CommitHWM); err != nil {
+				return fmt.Sprintf("ERROR: replica_index_failed reason=%q", err.Error())
+			}
+		}
 	}
 	return fmt.Sprintf("OK leo=%d hwm=%d", p.NextOffset(), p.GetHWM())
 }

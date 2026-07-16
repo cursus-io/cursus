@@ -2,6 +2,7 @@ package eventsource
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -60,10 +62,39 @@ func (f *fakeStorageHandler) AppendMessageWithOffset(t string, p int, msg *types
 	return nil
 }
 
-func (f *fakeStorageHandler) WriteBatch(_ []types.DiskMessage) error { return nil }
-func (f *fakeStorageHandler) TruncateTo(_ uint64) error              { return nil }
-func (f *fakeStorageHandler) Flush()                                 {}
-func (f *fakeStorageHandler) Close() error                           { return nil }
+func (f *fakeStorageHandler) WriteBatch(batch []types.DiskMessage) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, diskMsg := range batch {
+		f.msgs = append(f.msgs, types.Message{
+			Offset:                       diskMsg.Offset,
+			ProducerID:                   diskMsg.ProducerID,
+			SeqNum:                       diskMsg.SeqNum,
+			Epoch:                        diskMsg.Epoch,
+			Payload:                      diskMsg.Payload,
+			Key:                          diskMsg.Key,
+			EventType:                    diskMsg.EventType,
+			SchemaVersion:                diskMsg.SchemaVersion,
+			AggregateVersion:             diskMsg.AggregateVersion,
+			Metadata:                     diskMsg.Metadata,
+			TransactionalID:              diskMsg.TransactionalID,
+			TransactionState:             diskMsg.TransactionState,
+			TransactionMarker:            diskMsg.TransactionMarker,
+			ControlBatchType:             diskMsg.ControlBatchType,
+			ControlBatchVersion:          diskMsg.ControlBatchVersion,
+			ControlBatchCoordinatorEpoch: diskMsg.ControlBatchCoordinatorEpoch,
+			ControlBatchKey:              append([]byte(nil), diskMsg.ControlBatchKey...),
+			ControlBatchValue:            append([]byte(nil), diskMsg.ControlBatchValue...),
+		})
+		if next := diskMsg.Offset + 1; next > f.offset {
+			f.offset = next
+		}
+	}
+	return nil
+}
+func (f *fakeStorageHandler) TruncateTo(_ uint64) error { return nil }
+func (f *fakeStorageHandler) Flush()                    {}
+func (f *fakeStorageHandler) Close() error              { return nil }
 
 type fakeHandlerProvider struct {
 	handlers map[string]*fakeStorageHandler
@@ -372,6 +403,23 @@ func TestHandler_HandleStreamVersion_Validation(t *testing.T) {
 	}
 }
 
+func TestHandler_HandleReadStreamRejectsInvalidFromVersion(t *testing.T) {
+	h := NewHandler(nil)
+	client, server := net.Pipe()
+	defer client.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer server.Close()
+		h.HandleReadStream("READ_STREAM topic=orders key=order-1 from_version=invalid", server)
+	}()
+
+	payload, err := util.ReadWithLength(client)
+	require.NoError(t, err)
+	require.JSONEq(t, "{\"status\":\"ERROR\",\"error\":\"invalid_from_version\"}", string(payload))
+	<-done
+}
 func TestHandler_HandleSaveSnapshot_Validation(t *testing.T) {
 	h := newTestHandler(t)
 	defer func() { _ = h.Close() }()
@@ -523,24 +571,44 @@ func TestParseKeyValueArgs(t *testing.T) {
 	})
 }
 
-func TestHandler_IndexReplicatedMessages(t *testing.T) {
+func TestHandler_IndexesReplicatedMessagesOnlyAfterHWMCommit(t *testing.T) {
 	h := newTestHandler(t)
 	defer func() { _ = h.Close() }()
 
-	err := h.IndexReplicatedMessages("orders", 0, []types.Message{{
-		Offset:           0,
+	require.NoError(t, h.PrepareCommittedIndex("orders", 0))
+	topic := h.tm.GetTopic("orders")
+	require.NotNil(t, topic)
+	p, err := topic.GetPartition(0)
+	require.NoError(t, err)
+
+	messages := []types.Message{{
 		Key:              "replicated-key",
 		Payload:          "event1",
 		EventType:        "Replicated",
 		SchemaVersion:    1,
 		AggregateVersion: 1,
-	}})
-	assert.NoError(t, err)
+	}}
+	require.NoError(t, p.EnqueueBatchLeader(messages))
+	p.FlushDisk()
 
-	result := h.HandleStreamVersion("STREAM_VERSION topic=orders key=replicated-key")
-	assert.Equal(t, "OK version=1", result)
+	assert.Equal(t, "OK version=0", h.HandleStreamVersion("STREAM_VERSION topic=orders key=replicated-key"))
+
+	require.NoError(t, p.ApplyReplicaHWM(1))
+	require.NoError(t, h.IndexCommittedToHWM("orders", 0, 1))
+	assert.Equal(t, "OK version=1", h.HandleStreamVersion("STREAM_VERSION topic=orders key=replicated-key"))
 }
 
+func TestHandler_RecoverIndexDiscardsEntriesBeyondCommittedHWM(t *testing.T) {
+	h := newTestHandler(t)
+	idx, err := h.getIndex("orders", 0)
+	require.NoError(t, err)
+	require.NoError(t, idx.Append("uncommitted-key", 1, 0, 0))
+	require.NoError(t, h.Close())
+
+	h2 := NewHandler(h.tm)
+	defer func() { _ = h2.Close() }()
+	assert.Equal(t, "OK version=0", h2.HandleStreamVersion("STREAM_VERSION topic=orders key=uncommitted-key"))
+}
 func TestHandler_HandleAppendStream_DefaultSchemaVersion(t *testing.T) {
 	h := newTestHandler(t)
 	defer func() { _ = h.Close() }()

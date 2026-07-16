@@ -161,6 +161,15 @@ The historical `cluster_*` vectors that are not listed above are compatibility
 surfaces and may have no series unless their corresponding operation occurs.
 Use the `cursus_cluster_*` scrape-time metrics for current topology and health.
 
+### Transaction State
+
+Transaction-state gauges are not exported yet. Operators can inspect a known
+transaction with `TXN_STATUS`, and command failures are counted by
+`cursus_broker_command_errors_total{command,code}`. Until bounded transaction
+state, recovery, and age metrics are added, alerting cannot directly detect a
+transaction that remains in `committing`; recovery logs and command errors are
+the current operational signals.
+
 ## Configuration
 
 ```yaml

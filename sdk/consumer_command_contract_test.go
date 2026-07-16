@@ -20,6 +20,23 @@ func TestAutoOffsetResetArgumentMatchesBrokerContract(t *testing.T) {
 	}
 }
 
+func TestReadIsolationArgument(t *testing.T) {
+	tests := []struct {
+		isolation ReadIsolation
+		want      string
+	}{
+		{isolation: "", want: " isolation=read_committed"},
+		{isolation: ReadCommitted, want: " isolation=read_committed"},
+		{isolation: ReadUncommitted, want: " isolation=read_uncommitted"},
+		{isolation: "unsupported", want: " isolation=read_committed"},
+	}
+	for _, test := range tests {
+		if got := readIsolationArgument(test.isolation); got != test.want {
+			t.Fatalf("isolation %q: want %q, got %q", test.isolation, test.want, got)
+		}
+	}
+}
+
 func TestHasOKStatusRequiresExactToken(t *testing.T) {
 	if !hasOKStatus("OK state=ready") {
 		t.Fatal("valid OK response was rejected")

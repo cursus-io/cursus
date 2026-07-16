@@ -35,6 +35,9 @@ func (ch *CommandHandler) handleAppendStream(cmd string) string {
 			return ch.errorResponse(err.Error())
 		}
 		defer releaseWrite()
+		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
+			return indexResp
+		}
 		result, errResp := ch.ESHandler.AppendStream(cmd, eventsource.AppendOptions{
 			LeaderAppend: true,
 			AfterCommit: func(topic string, partition int, hwm uint64) error {
@@ -68,6 +71,9 @@ func (ch *CommandHandler) handleSaveSnapshot(cmd string) string {
 		topicName := eventStreamTopic(cmd, "SAVE_SNAPSHOT ")
 		if resp, forwarded, _ := ch.isPartitionLeaderAndForward(topicName, partition, cmd); forwarded {
 			return resp
+		}
+		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
+			return indexResp
 		}
 		result, errResp := ch.ESHandler.SaveSnapshot(cmd, func(result eventsource.SnapshotResult) error {
 			payload, err := json.Marshal(result)
@@ -209,9 +215,13 @@ func (ch *CommandHandler) handleEventSourceRoutedCommand(cmd, prefix string, loc
 	if errResp != "" {
 		return errResp
 	}
+	topicName := eventStreamTopic(cmd, prefix)
 	if ch.Config != nil && ch.Config.EnabledDistribution && ch.Cluster != nil {
-		if resp, forwarded, _ := ch.isPartitionLeaderAndForward(eventStreamTopic(cmd, prefix), partition, cmd); forwarded {
+		if resp, forwarded, _ := ch.isPartitionLeaderAndForward(topicName, partition, cmd); forwarded {
 			return resp
+		}
+		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
+			return indexResp
 		}
 	}
 	return local(cmd)
@@ -223,22 +233,38 @@ func (ch *CommandHandler) HandleReadStreamCommand(conn net.Conn, cmd string) {
 		writeReadStreamError(conn, errResp)
 		return
 	}
-	if ch.Config != nil && ch.Config.EnabledDistribution && ch.Cluster != nil && !ch.Cluster.IsAuthorized(eventStreamTopic(cmd, "READ_STREAM "), partition) {
-		leaderAddr := ch.resolvePartitionLeaderAddr(eventStreamTopic(cmd, "READ_STREAM "), partition)
-		writeReadStreamError(conn, fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", leaderAddr))
-		return
+	topicName := eventStreamTopic(cmd, "READ_STREAM ")
+	if ch.Config != nil && ch.Config.EnabledDistribution && ch.Cluster != nil {
+		if !ch.Cluster.IsAuthorized(topicName, partition) {
+			leaderAddr := ch.resolvePartitionLeaderAddr(topicName, partition)
+			writeReadStreamError(conn, fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", leaderAddr))
+			return
+		}
+		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
+			writeReadStreamError(conn, indexResp)
+			return
+		}
 	}
 	ch.ESHandler.HandleReadStream(cmd, conn)
 }
 
-func (ch *CommandHandler) indexReplicatedEventSourceMessages(topic string, partition int, messages []types.Message) error {
-	t := ch.TopicManager.GetTopic(topic)
-	if t == nil || !t.IsEventSourcing {
-		return nil
+func (ch *CommandHandler) reconcileEventSourceIndex(topicName string, partition int) string {
+	t := ch.TopicManager.GetTopic(topicName)
+	if t == nil {
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	return ch.ESHandler.IndexReplicatedMessages(topic, partition, messages)
+	p, err := t.GetPartition(partition)
+	if err != nil {
+		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
+	}
+	if err := ch.ESHandler.PrepareCommittedIndex(topicName, partition); err != nil {
+		return fmt.Sprintf("ERROR: stream_index_failed reason=%q", err.Error())
+	}
+	if err := ch.ESHandler.IndexCommittedToHWM(topicName, partition, p.GetHWM()); err != nil {
+		return fmt.Sprintf("ERROR: stream_index_failed reason=%q", err.Error())
+	}
+	return ""
 }
-
 func (ch *CommandHandler) eventStreamPartition(cmd, prefix string) (int, string) {
 	topicName := eventStreamTopic(cmd, prefix)
 	if topicName == "" {

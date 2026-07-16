@@ -508,7 +508,9 @@ missing, an entry is malformed, or the same partition appears more than once.
 
 Cursus exposes a broker-managed transaction coordinator for consume-process-produce workflows. In distributed mode, transaction commands are routed by `transactional_id` using the coordinator key `txn:<transactional_id>`. Clients can discover the owner with `FIND_COORDINATOR transactional_id=<id>` and must retry on `ERROR: NOT_COORDINATOR host=<host> port=<port>`.
 
-Transaction state is replicated through the Raft FSM as `TXN_SYNC` and included in FSM snapshot version 4. Clients should first call `INIT_PRODUCER_ID` for a `transactional_id`; the broker returns the authoritative `(producerId, epoch)` session and bumps `epoch` on re-initialization to fence older producers. The coordinator fences stale producers by `(transactional_id, producerId, epoch)`: lower epochs are rejected, and staged operations must use the same producer and epoch that opened the transaction. Completed transactional ids are retained for `transactional_id_expiration_ms` so retry/fencing state survives normal restarts, while active `open` and `committing` transactions are not expired by the cleanup path.
+Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Transaction state entered the schema in version 4; current brokers write FSM snapshot version 5, which also carries committed partition watermarks.
+
+Clients should first call `INIT_PRODUCER_ID` for a `transactional_id`; the broker returns the authoritative `(producerId, epoch)` session and bumps `epoch` on re-initialization to fence older producers. The coordinator fences stale producers by `(transactional_id, producerId, epoch)`: lower epochs are rejected, and staged operations must use the same producer and epoch that opened the transaction. After `transactional_id_expiration_ms`, completed transactions discard staged message/offset payloads but retain a compact epoch tombstone. The tombstone participates in standalone journal and distributed metadata snapshots, preventing an older producer session from being revived. Active `open` and `committing` transactions are not expired by the cleanup path.
 
 **INIT_PRODUCER_ID**
 
@@ -524,7 +526,7 @@ Success: `OK transactional_id=<id> producerId=<producer-id> epoch=<N>`. Re-initi
 BEGIN_TXN transactional_id=<id> producerId=<producer-id> epoch=<N>
 ```
 
-Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`.
+Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`. One initialized epoch may begin one transaction. After a successful commit or abort, another `BEGIN_TXN` with that epoch returns `ERROR: producer_reinitialization_required ...`; call `INIT_PRODUCER_ID` to obtain the next epoch. This does not prevent retrying an uncertain `END_TXN` with the original epoch.
 
 **TXN_PUBLISH**
 
@@ -534,7 +536,7 @@ TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<prod
 
 Success: `OK transactional_id=<id> staged_messages=1 topic=<topic> partition=<N>`.
 
-The record is staged in the transaction coordinator and is not published until `END_TXN ... result=commit`. `seqNum` is required and must be greater than zero; the broker uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even when the target topic is not globally idempotent. On commit, the broker writes the record with `transactional_id` and `transaction_state=open`, then uses the normal publish path, including partition-leader routing in distributed mode. After records are written and staged offsets are committed, the broker appends a hidden Cursus transaction commit marker to each touched partition; `read_committed` visibility is controlled by a later marker for the same `(transactional_id, epoch)`, so transactional records are not visible if marker append fails before retry/recovery completes, even if they carry transaction metadata or an older epoch marker exists. Uncommitted staged records are not published by this staging path, and abort writes hidden abort markers for touched partitions that already contain transaction records from a retry/recovery path.
+The record is staged in the transaction coordinator and is not published until `END_TXN ... result=commit`. `seqNum` is required and must be greater than zero; the broker uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even when the target topic is not globally idempotent. Commit publishes records through the normal partition-leader and replication path with `transaction_state=open`, then appends a hidden Cursus transaction marker to every touched partition. A matching marker resolves the partition log, but `read_committed` also requires the coordinator decision for the current transaction epoch to be `committed`; marker append alone cannot expose output while the transaction is still `committing`. Aborting an `open` transaction writes no output or control records. Once durable commit preparation begins, abort is fenced and recovery must finish the commit; readers still understand abort markers already present in older logs.
 
 **SEND_OFFSETS_TO_TXN**
 
@@ -544,7 +546,7 @@ SEND_OFFSETS_TO_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> top
 
 Success: `OK transactional_id=<id> staged_offsets=<N>`.
 
-The broker validates `member`, `generation`, and partition ownership before staging offsets, then validates them again before commit. Offsets keep the same monotonic rule as `COMMIT_OFFSET`; `END_TXN ... result=commit` fails before publishing records if any staged offset would regress.
+The broker validates `member`, `generation`, partition ownership, and monotonic offsets before staging, then revalidates them before commit. Every offset in one transaction must share exactly one `(topic, group, member, generation)` scope. Repeating a partition replaces only an equal or higher staged `nextOffset`; a lower value is rejected. Commit applies the scope with one fenced `BATCH_COMMIT`, so either every partition offset in that scope advances or none does. Use separate transactions for different consumer scopes.
 
 **END_TXN**
 
@@ -552,7 +554,7 @@ The broker validates `member`, `generation`, and partition ownership before stag
 END_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> result=<commit|abort>
 ```
 
-Success: `OK transactional_id=<id> state=<committed|aborted> messages=<N> offsets=<N>`. Retrying the same final result with the same `producerId` and `epoch` is idempotent; a lower epoch is rejected as fenced, and trying to abort a committed transaction or commit an aborted transaction returns an error.
+Success: `OK transactional_id=<id> state=<committed|aborted> messages=<N> offsets=<N>`. Retrying the same final result with the same `producerId` and `epoch` is idempotent; a lower epoch is rejected as fenced, and trying to abort a committed transaction or commit an aborted transaction returns an error. Once commit preparation has durably entered `committing`, abort is rejected because output markers or source offsets may already have been applied; clients must retry commit with the same producer session.
 
 **TXN_STATUS**
 
@@ -562,8 +564,19 @@ TXN_STATUS transactional_id=<id>
 
 Success: `OK transactional_id=<id> state=<open|committing|committed|aborted> messages=<N> offsets=<N>`.
 
-Current guarantee: a successful transaction commit stages records and offsets behind a broker transaction coordinator, fences stale producer epochs, persists transaction state through the distributed metadata FSM, writes hidden Cursus transaction control markers with durable transaction control-record key/value bytes and Cursus control-batch metadata to touched partition logs, uses the normal partition-leader publish path, appends commit markers before applying staged offsets, commits offsets through the consumer-group coordinator, and makes `ReadCommitted`/`CONSUME` use transaction markers to expose committed transactions, skip aborted transactions, and stop at the first unresolved open transaction as a stable visibility boundary. Partitions maintain an in-memory transaction visibility index rebuilt from durable logs on startup. The index tracks resolving markers and the earliest unresolved open record per transaction epoch, so `read_committed` can compute the stable visibility boundary without rediscovering every later marker by scanning from the requested offset. `INIT_PRODUCER_ID` provides broker-owned producer epoch allocation for transactional ids. Retried `END_TXN` requests for an already committed or aborted transaction are idempotent for the same producer epoch. On broker start, restored `committing` transactions are recovered by replaying the prepared transaction and finalizing it as committed on the transaction coordinator; producer sequence state is rebuilt from partition logs so replay does not append duplicate transactional records after a lost producer-state checkpoint. The marker contract is stored in Cursus log records (`control_batch_type=transaction`, `control_batch_version=2`, `control_batch_coordinator_epoch=<epoch>`) plus transaction control-record key/value bytes (`key: int16 version, int16 markerType`; `value: int16 version, int32 coordinatorEpoch`). This makes the transaction marker payload schema Cursus-compatible while the surrounding Cursus log segment remains Cursus-owned, not a Cursus broker network-protocol byte stream. Cursus does not make external side effects exactly-once. Clients should continue to use idempotent processors for external systems.
+Current guarantee: a successful transaction commit has one durable coordinator decision and follows this order:
 
+1. validate the staged output records and the single consumer offset scope while the transaction is still `open`,
+2. persist the prepared `committing` state,
+3. revalidate current topic, ownership, generation, and monotonic-offset fences,
+4. publish output records idempotently through partition leaders and replication,
+5. append hidden transaction commit markers to all touched partitions,
+6. apply the staged offsets with one generation/ownership-fenced bulk commit,
+7. persist the final `committed` coordinator decision.
+
+`read_committed` exposes a transaction only when its partition commit marker and current-epoch coordinator decision agree. Aborted records and control markers are skipped; the earliest unresolved transaction defines the stable visibility boundary. Partitions maintain an in-memory transaction index rebuilt from durable logs. For records created before durable coordinator decisions were stored, or for epochs no longer retained in the current coordinator snapshot, the durable partition marker remains the compatibility authority; every currently tracked epoch requires marker/decision agreement. Coordinator state is restored from the standalone fsynced journal or, in distributed mode, from `TXN_SYNC` and Raft metadata snapshots. A broker that restores `committing` state retries the prepared work; producer sequence state rebuilt from logs prevents duplicate records. Retried finalization with the same epoch is idempotent.
+
+The marker uses Cursus control metadata (`control_batch_type=transaction`, `control_batch_version=2`, `control_batch_coordinator_epoch=<epoch>`) and control-record bytes (`key: int16 version, int16 markerType`; `value: int16 version, int32 coordinatorEpoch`). The surrounding segment and network protocol remain Cursus-owned. The transaction covers broker output records and one consumer offset scope; external database, HTTP, filesystem, or service effects remain outside it and require application-level idempotency or their own transaction.
 #### Event Sourcing Commands
 
 These commands are available only on topics created with `event_sourcing=true`.
@@ -602,13 +615,14 @@ READ_STREAM topic=<name> key=<aggregate_key> [from_version=<N>]
 |-------|----------|---------|-------------|
 | topic | Yes | - | Topic name |
 | key | Yes | - | Aggregate ID |
-| from_version | No | 1 (or snapshot version + 1 if snapshot exists) | Starting version |
+| from_version | No | 1 | Positive starting version; a usable snapshot advances the event batch to snapshot version + 1 |
 
 Response: Two length-prefixed frames sent sequentially.
 
 Frame 1 — JSON envelope:
 ```json
 {
+  "status": "OK",
   "topic": "orders",
   "key": "order-123",
   "partition": 2,
@@ -619,7 +633,7 @@ Frame 1 — JSON envelope:
 
 The `snapshot` field is included only when a snapshot exists at or after `from_version`. `count` reflects the number of events in Frame 2 (not including the snapshot).
 
-Frame 2 — Binary batch (standard 0xBA7C format) containing the events. If no events exist after the snapshot, the batch has message count 0.
+Frame 2 — Binary batch (standard 0xBA7C format) containing the events. If no events exist after the snapshot, the batch has message count 0. A missing, zero, or non-numeric `from_version` is handled as follows: missing defaults to `1`; zero or non-numeric values return a JSON error envelope with `error:"invalid_from_version"` and no batch frame.
 
 **STREAM_VERSION**
 ```
@@ -847,6 +861,7 @@ SDKs should parse the code and fields first, use `class` for broad handling, and
 | `member_not_found member=<M> group=<G>` | Member is no longer active | Re-join group |
 | `offset_regression reason="..."` | Commit lower than current stored offset | Treat commit as failed; refetch offset |
 | `stale_producer_epoch producer=<id> current=<N> got=<N>` | Idempotent producer request uses an older fenced epoch | Treat as fatal for that producer instance; create a new producer session |
+| `producer_reinitialization_required transactional_id=<id> epoch=<N>` | A completed epoch attempted to begin another transaction | Call `INIT_PRODUCER_ID`, then begin with the returned higher epoch; retain the old epoch only for uncertain finalization retry |
 | `OFFSET_OUT_OF_RANGE requested=N earliest=N latest=N` | Requested offset is older than retained log or beyond available range | Treat as data loss or reset according to policy |
 | `no_valid_offsets` | BATCH_COMMIT contains no usable offsets | Supply at least one `P<N>:<offset>` entry |
 | `missing_generation command=<command>` | Group command omitted its generation | Rejoin if needed and send the current generation |
@@ -858,6 +873,7 @@ SDKs should parse the code and fields first, use `class` for broad handling, and
 | `partition_metadata_not_found topic=<T> partition=N` | Partition metadata does not exist | Refresh metadata and verify topic/partition |
 | `missing_leader_fence command=REPLICATE_MESSAGE` | Internal replication omitted leader ID or epoch | Correct the broker request; do not retry unchanged |
 | `invalid_commit_watermark reason="..."` | Commit watermark is ahead of local durable data or otherwise invalid | Repair/catch up the replica before retrying |
+| `replica_index_prepare_failed reason="..."` | The follower could not prepare its committed event-stream index before HWM advancement | Repair the local index/storage error and retry the HWM commit |
 | invalid_control_batch_bytes field=<key|value> | Broker-internal transaction control bytes are not valid base64 | Reject the internal publish and inspect broker compatibility |
 | `version_conflict current=N expected=N` | Optimistic concurrency failure | Reload aggregate and retry |
 | `event_sourcing_not_enabled topic=<X>` | ES command on non-ES topic | CREATE topic with `event_sourcing=true` |
@@ -916,7 +932,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - Broker tracks the last seen `(epoch, seqNum)` per `(producerId)` per partition
 - Disk-backed partitions persist producer sequence checkpoints, rebuild producer state from partition logs on broker restart, and use that state to make transactional commit recovery idempotent
 - Distributed FSM snapshots also include producer sequence state for replicated message commands
-- FSM snapshots that encode producer epochs use snapshot version 3. Do not run mixed-version rolling upgrades across brokers that cannot decode producer-epoch snapshot state; upgrade the cluster together or drain snapshots before introducing older binaries.
+- Producer epochs entered FSM snapshot version 3, transaction state version 4, and committed partition watermarks version 5. Current brokers write version 5. Do not run a mixed-version rolling upgrade with binaries that cannot decode version 5; upgrade the cluster together or use an explicitly documented compatibility procedure.
 - Producer state expires from memory after `producer_state_ttl_ms` of inactivity (default 30 minutes); durable checkpoints retain the last persisted sequence until the partition data is removed
 
 ---
@@ -930,6 +946,8 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - [ ] Text command formatting
 - [ ] JSON response parsing (AckResponse, DESCRIBE, GROUP_STATUS)
 - [ ] Consumer group lifecycle (JOIN → SYNC → HEARTBEAT → CONSUME → COMMIT)
+- [ ] Broker-owned offset resume, monotonic `nextOffset` commits, and `auto_offset_reset` gap handling
+- [ ] Explicit `read_committed` / `read_uncommitted` on `CONSUME` and `STREAM`
 - [ ] Error response parsing, including quoted values
 - [ ] `PROTOCOL_INFO` discovery and connection-scoped `NEGOTIATE`
 - [ ] Structured error class and retry eligibility handling
@@ -943,7 +961,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - [ ] Exponential backoff on reconnect
 - [ ] Async offset commits (BATCH_COMMIT)
 - [ ] Idempotent producer with sequence numbers
-- [x] Transaction coordinator commands (BEGIN_TXN, TXN_PUBLISH, SEND_OFFSETS_TO_TXN, END_TXN)
+- [ ] Transaction lifecycle (`INIT_PRODUCER_ID`, one transaction per epoch, retryable finalization, and automatic reinitialization)
 - [ ] Wildcard topic subscription
 - [ ] Stream mode (continuous push)
 - [ ] Read/write buffer tuning (2MB recommended)

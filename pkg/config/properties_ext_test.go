@@ -34,6 +34,15 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	}
 }
 
+func TestConfigNormalizeFallsBackFromUnimplementedCompaction(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.CleanupPolicy = "compact"
+	cfg.Normalize()
+	if cfg.CleanupPolicy != "delete" {
+		t.Fatalf("expected unsupported compaction to normalize to delete, got %q", cfg.CleanupPolicy)
+	}
+}
+
 func TestConfig_Normalize(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.BrokerPort = -1

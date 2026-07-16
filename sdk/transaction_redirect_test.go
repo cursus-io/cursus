@@ -121,6 +121,69 @@ func TestTransactionCoordinatorRedirectRejectsInvalidAddress(t *testing.T) {
 	}
 }
 
+func TestTransactionalProducerReinitializesBeforeNextTransaction(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	commands := make(chan string, 5)
+	serverErrors := make(chan error, 1)
+	initCalls := 0
+	go serveTransactionConnections(listener, 5, func(command string) string {
+		commands <- command
+		switch {
+		case strings.HasPrefix(command, "INIT_PRODUCER_ID "):
+			initCalls++
+			return fmt.Sprintf("OK transactional_id=tx-sequential producerId=producer-session epoch=%d", initCalls)
+		case strings.HasPrefix(command, "END_TXN "):
+			return "OK transactional_id=tx-sequential state=committed messages=0 offsets=0"
+		default:
+			return "OK transactional_id=tx-sequential state=open"
+		}
+	}, serverErrors)
+
+	cfg := NewDefaultConsumerConfig()
+	cfg.BrokerAddrs = []string{listener.Addr().String()}
+	client, err := NewConsumerClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, err := client.NewTransactionalProducer("tx-sequential")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.Begin(); err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.Begin(); err != nil {
+		t.Fatal(err)
+	}
+	if got := producer.Session().Epoch; got != 2 {
+		t.Fatalf("expected second transaction epoch 2, got %d", got)
+	}
+
+	got := make([]string, 0, 5)
+	for len(got) < 5 {
+		select {
+		case command := <-commands:
+			got = append(got, command)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for sequential commands: %v", got)
+		}
+	}
+	if !strings.HasPrefix(got[3], "INIT_PRODUCER_ID ") || !strings.Contains(got[4], "epoch=2") {
+		t.Fatalf("second transaction did not reinitialize producer: %v", got)
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTransactionalProducerPreservesSessionAcrossLifecycle(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

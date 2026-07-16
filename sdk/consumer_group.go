@@ -15,6 +15,16 @@ func (c *Consumer) heartbeatLoop() {
 	ticker := time.NewTicker(time.Duration(c.config.HeartbeatIntervalMS) * time.Millisecond)
 	defer ticker.Stop()
 
+	stopConnCloser := make(chan struct{})
+	go func() {
+		select {
+		case <-c.doneCh:
+			c.resetHeartbeatConn()
+		case <-stopConnCloser:
+		}
+	}()
+	defer close(stopConnCloser)
+
 	for {
 		select {
 		case <-c.doneCh:
@@ -70,6 +80,16 @@ func (c *Consumer) cleanupHbConn(bad net.Conn) {
 
 func (c *Consumer) getOrDialHeartbeatConn() net.Conn {
 	c.hbMu.Lock()
+	select {
+	case <-c.doneCh:
+		if c.hbConn != nil {
+			_ = c.hbConn.Close()
+			c.hbConn = nil
+		}
+		c.hbMu.Unlock()
+		return nil
+	default:
+	}
 	conn := c.hbConn
 	if conn != nil {
 		c.hbMu.Unlock()
@@ -84,6 +104,13 @@ func (c *Consumer) getOrDialHeartbeatConn() net.Conn {
 	}
 
 	c.hbMu.Lock()
+	select {
+	case <-c.doneCh:
+		c.hbMu.Unlock()
+		_ = newConn.Close()
+		return nil
+	default:
+	}
 	if c.hbConn != nil {
 		_ = newConn.Close()
 		conn = c.hbConn

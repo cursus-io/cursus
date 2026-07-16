@@ -29,9 +29,10 @@ type TransactionStatusInfo struct {
 // TransactionalProducer preserves the broker-owned producer session and
 // serializes lifecycle calls for one transactional ID.
 type TransactionalProducer struct {
-	mu      sync.Mutex
-	client  *ConsumerClient
-	session ProducerSession
+	mu                    sync.Mutex
+	client                *ConsumerClient
+	session               ProducerSession
+	needsReinitialization bool
 }
 
 func (c *ConsumerClient) NewTransactionalProducer(transactionalID string) (*TransactionalProducer, error) {
@@ -57,12 +58,21 @@ func (p *TransactionalProducer) Reinitialize() (ProducerSession, error) {
 		return ProducerSession{}, err
 	}
 	p.session = session
+	p.needsReinitialization = false
 	return session, nil
 }
 
 func (p *TransactionalProducer) Begin() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.needsReinitialization {
+		session, err := p.client.InitProducerID(p.session.TransactionalID)
+		if err != nil {
+			return err
+		}
+		p.session = session
+		p.needsReinitialization = false
+	}
 	return p.client.BeginTransaction(p.session.TransactionalID, p.session.ProducerID, p.session.Epoch)
 }
 
@@ -83,13 +93,21 @@ func (p *TransactionalProducer) SendOffsets(topic, group, member string, generat
 func (p *TransactionalProducer) Commit() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.client.EndTransaction(p.session.TransactionalID, p.session.ProducerID, p.session.Epoch, true)
+	if err := p.client.EndTransaction(p.session.TransactionalID, p.session.ProducerID, p.session.Epoch, true); err != nil {
+		return err
+	}
+	p.needsReinitialization = true
+	return nil
 }
 
 func (p *TransactionalProducer) Abort() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.client.EndTransaction(p.session.TransactionalID, p.session.ProducerID, p.session.Epoch, false)
+	if err := p.client.EndTransaction(p.session.TransactionalID, p.session.ProducerID, p.session.Epoch, false); err != nil {
+		return err
+	}
+	p.needsReinitialization = true
+	return nil
 }
 
 func (p *TransactionalProducer) Describe() (TransactionStatusInfo, error) {

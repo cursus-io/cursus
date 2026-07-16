@@ -212,9 +212,18 @@ uncommitted and resumes from the last broker committed offset.
 
 Committing before processing gives at-most-once behavior for that client: a crash
 after the commit can skip unprocessed records. Consumer-group commits alone do
-not make external side effects exactly once. Use broker transactions for
-consume-process-produce workflows, and keep non-broker effects idempotent or
-transactional in their own system.
+not make external side effects exactly once.
+
+For a consume-process-produce workflow, `SEND_OFFSETS_TO_TXN` may stage several
+partitions only when they all share one `(topic, group, member, generation)`
+scope. The transaction applies those offsets through one fenced bulk commit and
+keeps output hidden until the partition markers and durable coordinator decision
+agree. Use separate transactions for separate consumer scopes, and keep
+non-broker effects idempotent or transactional in their own system.
+
+Network consumers should use `read_committed` unless they intentionally need the
+raw committed partition log. `read_uncommitted` can include unresolved
+transaction records and transaction control records.
 
 ### Game Server Example
 
@@ -226,7 +235,7 @@ JOIN_GROUP topic=match-events group=wargame-iocp member=game-01
 # broker returns an actual member ID and generation
 SYNC_GROUP topic=match-events group=wargame-iocp member=<actual-id> generation=<N>
 FETCH_OFFSET topic=match-events partition=0 group=wargame-iocp
-CONSUME topic=match-events partition=0 offset=0 group=wargame-iocp member=<actual-id> generation=<N> batch=128
+CONSUME topic=match-events partition=0 offset=<nextOffset> group=wargame-iocp member=<actual-id> generation=<N> isolation=read_committed batch=128
 COMMIT_OFFSET topic=match-events partition=0 group=wargame-iocp offset=<lastProcessedOffset+1> member=<actual-id> generation=<N>
 ```
 
@@ -270,7 +279,8 @@ expected generation. Members found in the same scan are removed together and
 advance the generation once.
 
 Coordinator snapshots preserve the registered partition set, assignments,
-generation, offsets, and last rebalance time. This allows assignment and fencing
+generation, offsets, and last rebalance time. This restores authoritative
+assignment and fencing state after broker restart.
 
 ### Locking Strategy
 

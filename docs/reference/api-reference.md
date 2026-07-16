@@ -156,7 +156,7 @@ Because `message=` captures the rest of the line, put optional parameters before
 
 Transaction metadata fields are not accepted on client `PUBLISH`; use the transaction commands for transactional records. Direct `transactional_id`, `transaction_state`, or `transaction_marker` injection returns `ERROR: transaction_metadata_forbidden command=PUBLISH`.
 
-For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Distributed FSM snapshots that include producer epochs use snapshot version 3; avoid mixed-version rolling upgrades with binaries that cannot decode that snapshot state. For `acks=0`, success is:
+For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Producer epochs entered FSM snapshot version 3; current brokers write version 5 with transaction state and committed partition watermarks. Avoid mixed-version rolling upgrades with binaries that cannot decode version 5. For `acks=0`, success is:
 
 ```text
 OK
@@ -201,6 +201,8 @@ ERROR: NOT_PARTITION_LEADER leader=<broker-id> requested_leader=<broker-id>
 ERROR: STALE_LEADER_EPOCH current=<N> requested=<N>
 ERROR: invalid_commit_watermark reason="..."
 ERROR: replica_append_failed reason="..."
+ERROR: replica_index_prepare_failed reason="..."
+ERROR: replica_index_failed reason="..."
 ```
 
 ## Consume Commands
@@ -530,7 +532,7 @@ Clients and SDKs should reconnect to that leader and retry. Followers index repl
 INIT_PRODUCER_ID transactional_id=<id>
 ```
 
-Initializes or reinitializes a broker-managed producer session for a transactional id. Success: `OK transactional_id=<id> producerId=<producer-id> epoch=<N>`. Reinitialization bumps `epoch` and fences older producers for that `transactional_id`. If the transaction is already `committing`, the broker rejects reinitialization so the prepared commit can be retried or recovered. Completed transactional ids expire after `transactional_id_expiration_ms`; active `open` and `committing` transactions are retained for recovery.
+Initializes or reinitializes a broker-managed producer session for a transactional id. Success: `OK transactional_id=<id> producerId=<producer-id> epoch=<N>`. Reinitialization bumps `epoch` and fences older producers for that `transactional_id`. If the transaction is already `committing`, the broker rejects reinitialization so the prepared commit can be retried or recovered. After `transactional_id_expiration_ms`, completed transactions discard staged payloads but retain a compact producer-epoch tombstone in coordinator snapshots. Active `open` and `committing` transactions remain available for recovery.
 
 ### BEGIN_TXN
 
@@ -538,7 +540,7 @@ Initializes or reinitializes a broker-managed producer session for a transaction
 BEGIN_TXN transactional_id=<id> producerId=<producer-id> epoch=<N>
 ```
 
-Starts a broker-managed transaction using the `producerId` and `epoch` returned by `INIT_PRODUCER_ID`. In distributed mode, route transaction commands to `FIND_COORDINATOR transactional_id=<id>`; the coordinator key is `txn:<id>`. Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`.
+Starts a broker-managed transaction using the `producerId` and `epoch` returned by `INIT_PRODUCER_ID`. In distributed mode, route transaction commands to `FIND_COORDINATOR transactional_id=<id>`; the coordinator key is `txn:<id>`. Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`. One initialized epoch may begin one transaction. After commit or abort, call `INIT_PRODUCER_ID` before the next begin; otherwise the broker returns `producer_reinitialization_required`. An uncertain `END_TXN` may still be retried with the completed epoch.
 
 ### TXN_PUBLISH
 
@@ -546,7 +548,7 @@ Starts a broker-managed transaction using the `producerId` and `epoch` returned 
 TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> seqNum=<N> epoch=<N> [key=<key>] message=<payload>
 ```
 
-Stages one record in the transaction. `seqNum` is required and must be greater than zero; Cursus uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even on non-idempotent topics. The record is not published until `END_TXN ... result=commit` succeeds. Committed records are written with transaction metadata before they enter the normal publish path, but they remain `transaction_state=open` until a hidden Cursus commit marker on the touched partition makes them visible to `read_committed` consumers; a later marker for the same `(transactional_id, epoch)` is the visibility authority for transactional records. Commit/abort writes hidden Cursus transaction control markers to touched partition logs. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
+Stages one record in the transaction. `seqNum` is required and must be greater than zero; Cursus uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even on non-idempotent topics. The record is not published until commit finalization begins. Output uses the normal partition-leader and replication path and remains `transaction_state=open` in the log. A hidden partition commit marker resolves that log entry, but `read_committed` also requires the final coordinator decision for the current epoch; marker append alone does not expose the record. Abort markers resolve records from interrupted retries. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
 
 ### SEND_OFFSETS_TO_TXN
 
@@ -554,7 +556,7 @@ Stages one record in the transaction. `seqNum` is required and must be greater t
 SEND_OFFSETS_TO_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> topic=<topic> group=<group> member=<member> generation=<N> P<partition>:<nextOffset>,P<partition>:<nextOffset>
 ```
 
-Stages consumer offsets in the transaction. The broker validates group member, generation, and partition ownership when offsets are staged, then revalidates ownership and monotonic offsets during commit before publishing records.
+Stages consumer offsets in the transaction. The broker validates group member, generation, partition ownership, and monotonic offsets at stage and commit time. All entries in one transaction must share one `(topic, group, member, generation)` scope. Repeated partition entries may only stay equal or advance. Finalization applies the scope through one fenced `BATCH_COMMIT`; different consumer scopes require separate transactions.
 
 ### END_TXN
 
@@ -562,7 +564,7 @@ Stages consumer offsets in the transaction. The broker validates group member, g
 END_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> result=<commit|abort>
 ```
 
-Commits or aborts staged records and offsets. Transaction state is replicated in the metadata FSM and included in snapshots, `INIT_PRODUCER_ID` provides broker-owned producer epoch allocation, committed records use the normal partition-leader publish path with forced idempotent sequence validation, finalization retries are idempotent for the same producer epoch, hidden Cursus transaction markers with durable transaction control-record key/value bytes and Cursus control-batch metadata are appended to touched partition logs before staged offsets are committed, startup recovery finalizes restored `committing` transactions, producer sequence state is rebuilt from partition logs, and committed reads use a partition transaction visibility index to expose committed transactions, skip aborted transactions, and stop at the first unresolved open transaction as a stable visibility boundary. Cursus stores transaction control-record key/value bytes (`key: int16 version, int16 markerType`; `value: int16 version, int32 coordinatorEpoch`) alongside Cursus control-batch metadata (`control_batch_type=transaction`, `control_batch_version=2`, `control_batch_coordinator_epoch=<epoch>`). The transaction marker payload schema is Cursus-compatible, while the surrounding Cursus log segment is still Cursus-owned rather than Cursus broker network-protocol byte compatibility; external side effects are not made exactly-once by the broker.
+Commits staged records and offsets, or aborts an `open` transaction without writing partition records. Commit validates records and the one consumer offset scope before preparation, persists `committing`, revalidates current fences, publishes idempotent output through partition leaders, appends hidden markers, applies one fenced bulk offset update, and persists the final coordinator decision. `read_committed` requires the marker and current-epoch decision to agree, skips aborted records/control markers, and stops at the earliest unresolved transaction. Restored `committing` transactions are retried; finalization with the same epoch is idempotent. A `committing` transaction cannot be changed to abort, because commit-side records, markers, or source offsets may already have been applied. Cursus stores control-record key/value bytes (`key: int16 version, int16 markerType`; `value: int16 version, int32 coordinatorEpoch`) with Cursus control metadata (`control_batch_type=transaction`, `control_batch_version=2`, `control_batch_coordinator_epoch=<epoch>`). The transaction covers broker records and one consumer offset scope, not external side effects.
 
 ### TXN_STATUS
 
@@ -604,7 +606,7 @@ ERROR: append_stream_failed reason="..."
 READ_STREAM topic=<name> key=<aggregate-key> [from_version=<N>]
 ```
 
-Success returns a JSON envelope frame with `status:"OK"`, followed by a binary batch frame containing committed events. Error envelopes use JSON with `status:"ERROR"`.
+Success returns a JSON envelope frame with `status:"OK"`, followed by a binary batch frame containing committed events. Error envelopes use JSON with `status:"ERROR"`. `from_version` must be a positive integer; invalid values return `invalid_from_version`.
 
 ### STREAM_VERSION
 

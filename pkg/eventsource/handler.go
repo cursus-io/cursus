@@ -18,11 +18,13 @@ import (
 type Handler struct {
 	tm *topic.TopicManager
 
-	mu        sync.RWMutex
-	closed    bool
-	wg        sync.WaitGroup
-	indexes   map[string]*StreamIndex   // key: "topic:partition"
-	snapshots map[string]*SnapshotStore // key: "topic:partition"
+	mu          sync.RWMutex
+	indexSyncMu sync.Mutex
+	closed      bool
+	wg          sync.WaitGroup
+	indexes     map[string]*StreamIndex   // key: "topic:partition"
+	indexedHWM  map[string]uint64         // committed log tail represented by each index
+	snapshots   map[string]*SnapshotStore // key: "topic:partition"
 }
 
 type AppendOptions struct {
@@ -51,9 +53,10 @@ type SnapshotResult struct {
 // NewHandler creates a new event sourcing command handler.
 func NewHandler(tm *topic.TopicManager) *Handler {
 	return &Handler{
-		tm:        tm,
-		indexes:   make(map[string]*StreamIndex),
-		snapshots: make(map[string]*SnapshotStore),
+		tm:         tm,
+		indexes:    make(map[string]*StreamIndex),
+		indexedHWM: make(map[string]uint64),
+		snapshots:  make(map[string]*SnapshotStore),
 	}
 }
 
@@ -92,7 +95,18 @@ func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, err
 		_ = idx.Close()
 		return nil, err
 	}
+	t := h.tm.GetTopic(topicName)
+	if t == nil {
+		_ = idx.Close()
+		return nil, fmt.Errorf("topic %s not found during stream index recovery", topicName)
+	}
+	p, err := t.GetPartition(partitionID)
+	if err != nil {
+		_ = idx.Close()
+		return nil, fmt.Errorf("partition lookup for stream index %s:%d: %w", topicName, partitionID, err)
+	}
 	h.indexes[key] = idx
+	h.indexedHWM[key] = p.GetHWM()
 	return idx, nil
 }
 
@@ -130,17 +144,87 @@ func (h *Handler) getSnapshot(topicName string, partitionID int) (*SnapshotStore
 	return ss, nil
 }
 
-// IndexReplicatedMessages records event-sourcing messages that arrived through
-// follower replication. It is idempotent for already-indexed versions.
-func (h *Handler) IndexReplicatedMessages(topicName string, partitionID int, messages []types.Message) error {
+// PrepareCommittedIndex captures the currently indexed committed tail before a
+// follower advances its HWM.
+func (h *Handler) PrepareCommittedIndex(topicName string, partitionID int) error {
+	_, err := h.getIndex(topicName, partitionID)
+	return err
+}
+
+// IndexCommittedToHWM advances the derived stream index only through records
+// visible below the partition's stable committed boundary.
+func (h *Handler) IndexCommittedToHWM(topicName string, partitionID int, targetHWM uint64) error {
+	h.indexSyncMu.Lock()
+	defer h.indexSyncMu.Unlock()
+
 	idx, err := h.getIndex(topicName, partitionID)
 	if err != nil {
 		return err
 	}
-	return h.indexMessages(idx, messages)
+	t := h.tm.GetTopic(topicName)
+	if t == nil || !t.IsEventSourcing {
+		return nil
+	}
+	p, err := t.GetPartition(partitionID)
+	if err != nil {
+		return fmt.Errorf("partition lookup for committed index topic=%s partition=%d: %w", topicName, partitionID, err)
+	}
+
+	key := topicName + ":" + strconv.Itoa(partitionID)
+	h.mu.RLock()
+	start := h.indexedHWM[key]
+	h.mu.RUnlock()
+
+	scanEnd := targetHWM
+	if stable := p.LastStableOffset(); stable < scanEnd {
+		scanEnd = stable
+	}
+	if scanEnd <= start {
+		return nil
+	}
+
+	const batchSize = 256
+	for offset := start; offset < scanEnd; {
+		msgs, err := p.ReadCommitted(offset, batchSize)
+		if err != nil {
+			return fmt.Errorf("read committed stream index range offset=%d: %w", offset, err)
+		}
+		if len(msgs) == 0 {
+			break
+		}
+
+		bounded := msgs[:0]
+		for _, msg := range msgs {
+			if msg.Offset >= scanEnd {
+				break
+			}
+			bounded = append(bounded, msg)
+		}
+		if len(bounded) == 0 {
+			break
+		}
+		if err := h.indexMessages(idx, bounded); err != nil {
+			return err
+		}
+		next := bounded[len(bounded)-1].Offset + 1
+		if next <= offset {
+			return fmt.Errorf("stream index scan did not advance from offset %d", offset)
+		}
+		offset = next
+	}
+
+	h.mu.Lock()
+	if h.indexedHWM[key] < scanEnd {
+		h.indexedHWM[key] = scanEnd
+	}
+	h.mu.Unlock()
+	return nil
 }
 
 func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *StreamIndex) error {
+	if err := idx.Reset(); err != nil {
+		return fmt.Errorf("reset stream index topic=%s partition=%d: %w", topicName, partitionID, err)
+	}
 	t := h.tm.GetTopic(topicName)
 	if t == nil || !t.IsEventSourcing {
 		return nil
@@ -311,12 +395,28 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 		}
 		return appendedOffset, nil
 	})
+	recoveredCommit := false
 	if err != nil {
-		return nil, fmt.Sprintf("ERROR: append_stream_failed reason=%q", err.Error())
+		if recoveryErr := h.RecoverIndexFromLog(topicName, partitionID, idx); recoveryErr != nil {
+			return nil, fmt.Sprintf("ERROR: append_stream_failed reason=%q recovery_reason=%q", err.Error(), recoveryErr.Error())
+		}
+		if idx.GetVersion(key) != expectedVersion {
+			return nil, fmt.Sprintf("ERROR: append_stream_failed reason=%q", err.Error())
+		}
+		// The log and HWM commit succeeded even though the derived index append
+		// failed. Recovery found the committed event, so report its success.
+		recoveredCommit = true
 	}
-	if !ok {
+	if !ok && !recoveredCommit {
 		return nil, fmt.Sprintf("ERROR: version_conflict current=%d expected=%d", current, expectedVersion)
 	}
+
+	indexKey := topicName + ":" + strconv.Itoa(partitionID)
+	h.mu.Lock()
+	if committed := p.GetHWM(); h.indexedHWM[indexKey] < committed {
+		h.indexedHWM[indexKey] = committed
+	}
+	h.mu.Unlock()
 
 	return &AppendResult{Topic: topicName, Key: key, Version: expectedVersion, Offset: appendedOffset, Partition: partitionID, Message: appendedMsg}, ""
 }
@@ -342,9 +442,11 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 	fromVersion := uint64(1)
 	if fv := args["from_version"]; fv != "" {
 		v, err := strconv.ParseUint(fv, 10, 64)
-		if err == nil {
-			fromVersion = v
+		if err != nil || v == 0 {
+			writeError(conn, "invalid_from_version")
+			return
 		}
+		fromVersion = v
 	}
 
 	t := h.tm.GetTopic(topicName)

@@ -1,6 +1,7 @@
 package transaction
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -40,6 +41,86 @@ func TestManagerFencesLowerProducerEpoch(t *testing.T) {
 	}
 }
 
+func TestManagerRequiresNewEpochForSequentialTransactions(t *testing.T) {
+	m := NewManager()
+	producer, epoch := beginInitialized(t, m, "tx-sequential")
+	if err := m.Abort("tx-sequential", producer, epoch); err != nil {
+		t.Fatalf("abort first transaction: %v", err)
+	}
+	if err := m.Begin("tx-sequential", producer, epoch); !errors.Is(err, ErrProducerReinitializationRequired) {
+		t.Fatalf("expected producer reinitialization error, got %v", err)
+	}
+
+	producer2, epoch2, err := m.InitProducer("tx-sequential")
+	if err != nil {
+		t.Fatalf("reinitialize producer: %v", err)
+	}
+	if producer2 != producer || epoch2 != epoch+1 {
+		t.Fatalf("unexpected next producer session producer=%s epoch=%d", producer2, epoch2)
+	}
+	if err := m.Begin("tx-sequential", producer2, epoch2); err != nil {
+		t.Fatalf("begin second transaction: %v", err)
+	}
+}
+
+func TestManagerPreservesProducerEpochWhenExpiredIDIsReinitialized(t *testing.T) {
+	m := NewManagerWithExpiration(time.Hour)
+	old := time.Now().Add(-2 * time.Hour)
+	m.ApplySnapshot(&Snapshot{
+		ID:        "tx-expired",
+		Producer:  "producer-tx-expired",
+		Epoch:     7,
+		Revision:  20,
+		State:     StateCommitted,
+		Messages:  []MessageOperation{{Topic: "orders"}},
+		Offsets:   []OffsetOperation{{Topic: "orders", Group: "workers", Partition: 0, Offset: 8}},
+		CreatedAt: old,
+		UpdatedAt: old,
+	})
+
+	if removed := m.PruneExpired(time.Now()); removed != 1 {
+		t.Fatalf("expected one expired transaction payload, got %d", removed)
+	}
+	if removed := m.PruneExpired(time.Now()); removed != 0 {
+		t.Fatalf("expected epoch tombstone not to expire twice, got %d", removed)
+	}
+	tombstone := m.ExportState()["tx-expired"]
+	if tombstone == nil || !tombstone.Expired || len(tombstone.Messages) != 0 || len(tombstone.Offsets) != 0 {
+		t.Fatalf("unexpected expiration tombstone: %+v", tombstone)
+	}
+
+	producer, epoch, err := m.InitProducer("tx-expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if producer != "producer-tx-expired" || epoch != 8 {
+		t.Fatalf("expired transactional ID reused stale identity producer=%s epoch=%d", producer, epoch)
+	}
+}
+func TestManagerInitializationDoesNotExpireUnrelatedTransactionalIDs(t *testing.T) {
+	m := NewManagerWithExpiration(time.Hour)
+	old := time.Now().Add(-2 * time.Hour)
+	for _, id := range []string{"tx-target", "tx-unrelated"} {
+		m.ApplySnapshot(&Snapshot{
+			ID:        id,
+			Producer:  "producer-" + id,
+			Epoch:     3,
+			Revision:  4,
+			State:     StateCommitted,
+			Messages:  []MessageOperation{{Topic: "orders"}},
+			CreatedAt: old,
+			UpdatedAt: old,
+		})
+	}
+
+	if _, _, err := m.InitProducer("tx-target"); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := m.ExportState()["tx-unrelated"]
+	if unrelated == nil || unrelated.Expired || len(unrelated.Messages) != 1 {
+		t.Fatalf("unrelated transaction was compacted by initialization: %+v", unrelated)
+	}
+}
 func TestManagerRejectsNonOwnerOperations(t *testing.T) {
 	m := NewManager()
 	producer, epoch := beginInitialized(t, m, "tx-1")
@@ -50,6 +131,47 @@ func TestManagerRejectsNonOwnerOperations(t *testing.T) {
 	err = m.AddMessage("tx-1", producer, epoch-1, MessageOperation{Topic: "t1", Message: types.Message{Payload: "x"}})
 	if err == nil {
 		t.Fatal("expected stale epoch to fail")
+	}
+}
+
+func TestManagerMergesOneTransactionalOffsetScopeMonotonically(t *testing.T) {
+	m := NewManager()
+	producer, epoch := beginInitialized(t, m, "tx-offsets")
+	if err := m.AddOffsets("tx-offsets", producer, epoch, nil); err == nil {
+		t.Fatal("expected an empty offset batch to fail")
+	}
+	first := OffsetOperation{Topic: "orders", Group: "workers", Member: "member-1", Generation: 3, Partition: 0, Offset: 8}
+	if err := m.AddOffsets("tx-offsets", producer, epoch, []OffsetOperation{first}); err != nil {
+		t.Fatalf("stage first offset: %v", err)
+	}
+	advanced := first
+	advanced.Offset = 11
+	if err := m.AddOffsets("tx-offsets", producer, epoch, []OffsetOperation{advanced}); err != nil {
+		t.Fatalf("advance staged offset: %v", err)
+	}
+	regressed := first
+	regressed.Offset = 10
+	if err := m.AddOffsets("tx-offsets", producer, epoch, []OffsetOperation{regressed}); err == nil {
+		t.Fatal("expected staged offset regression to fail")
+	}
+	otherGroup := first
+	otherGroup.Group = "other-workers"
+	if err := m.AddOffsets("tx-offsets", producer, epoch, []OffsetOperation{otherGroup}); err == nil {
+		t.Fatal("expected mixed consumer scope to fail")
+	}
+
+	fresh := NewManager()
+	freshProducer, freshEpoch := beginInitialized(t, fresh, "tx-mixed-initial-offsets")
+	if err := fresh.AddOffsets("tx-mixed-initial-offsets", freshProducer, freshEpoch, []OffsetOperation{first, otherGroup}); err == nil {
+		t.Fatal("expected a mixed scope in the initial offset batch to fail")
+	}
+
+	tx, err := m.Status("tx-offsets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tx.Offsets) != 1 || tx.Offsets[0].Offset != 11 {
+		t.Fatalf("unexpected staged offsets: %+v", tx.Offsets)
 	}
 }
 
@@ -118,6 +240,48 @@ func TestManagerApplySnapshotUsesTimestampForLegacyRevisions(t *testing.T) {
 	}
 }
 
+func TestManagerBuildCommittedSnapshotDoesNotExposeBeforeApply(t *testing.T) {
+	m := NewManager()
+	producer, epoch := beginInitialized(t, m, "tx-decision")
+	if _, err := m.PrepareCommit("tx-decision", producer, epoch); err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+
+	snap, err := m.BuildCommittedSnapshot("tx-decision")
+	if err != nil {
+		t.Fatalf("build committed snapshot: %v", err)
+	}
+	if state, known := m.TransactionDecision("tx-decision", epoch); !known || state != string(StateCommitting) {
+		t.Fatalf("transaction became visible before durable apply: state=%s known=%v", state, known)
+	}
+	if err := m.ApplyReplicatedSnapshot(snap); err != nil {
+		t.Fatalf("apply committed snapshot: %v", err)
+	}
+	if state, known := m.TransactionDecision("tx-decision", epoch); !known || state != string(StateCommitted) {
+		t.Fatalf("committed decision missing after apply: state=%s known=%v", state, known)
+	}
+}
+
+func TestManagerRejectsAbortAfterCommitPreparation(t *testing.T) {
+	m := NewManager()
+	producer, epoch := beginInitialized(t, m, "tx-prepared-abort")
+	if _, err := m.PrepareCommit("tx-prepared-abort", producer, epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Abort("tx-prepared-abort", producer, epoch); err == nil {
+		t.Fatal("expected prepared transaction abort to fail")
+	}
+	if _, err := m.BuildAbortedSnapshot("tx-prepared-abort", producer, epoch); err == nil {
+		t.Fatal("expected prepared abort snapshot to fail")
+	}
+	tx, err := m.Status("tx-prepared-abort")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.State != StateCommitting {
+		t.Fatalf("prepared transaction changed state: %s", tx.State)
+	}
+}
 func TestManagerFinalStateIsIdempotentForSameOwner(t *testing.T) {
 	m := NewManager()
 	producer, epoch := beginInitialized(t, m, "tx-1")

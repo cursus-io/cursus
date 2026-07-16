@@ -8,11 +8,11 @@ Cursus provides native event sourcing support at the broker level. Aggregates ar
 
 ### Why Native Support Matters
 
-Without broker-level support, applications must implement concurrency control, version tracking, and stream indexing on top of a general-purpose message log. This leads to duplicated effort across SDKs and introduces race conditions that are difficult to resolve without coordination at the storage layer. By moving these concerns into the broker, Cursus guarantees linearizable writes per aggregate and eliminates an entire class of concurrency bugs.
+Without broker-level support, applications must implement concurrency control, version tracking, and stream indexing on top of a general-purpose message log. This leads to duplicated effort across SDKs and introduces race conditions that are difficult to resolve without coordination at the storage layer. By moving these concerns into the broker, Cursus serializes optimistic writes for one aggregate on its current partition leader. In distributed mode, a successful append also follows the configured in-sync replica quorum and leader-epoch checks.
 
 ### Design Principles
 
-- **Reuse existing primitives.** Events are stored as regular messages in the append-only partition log. Consumer groups, replication, retention, and all existing features apply without modification.
+- **Reuse existing primitives.** Events are stored as regular messages in the append-only partition log and use partition replication, HWM, retention, and consumer groups. Retention can remove replay history, and the transaction command family does not automatically wrap `APPEND_STREAM`.
 - **Opt-in per topic.** The `event_sourcing=true` flag on CREATE enables event sourcing behavior. Non-event-sourcing topics are completely unaffected.
 - **Broker owns storage, SDK owns domain logic.** The broker handles versioning, indexing, and snapshots. Schema evolution (upcasting) is the SDK's responsibility.
 
@@ -86,6 +86,7 @@ Frame 1 (JSON envelope):
 
 ```json
 {
+  "status": "OK",
   "topic": "orders",
   "key": "order-123",
   "partition": 2,
@@ -202,6 +203,7 @@ Frame 1:
 
 ```json
 {
+  "status": "OK",
   "topic": "orders",
   "key": "order-123",
   "partition": 2,
@@ -217,7 +219,7 @@ Frame 2: Binary batch with events at versions 4 and 5 only.
 
 ### Snapshot Frequency Recommendation
 
-Save a snapshot every 500 events. This keeps aggregate load times bounded while avoiding excessive snapshot writes. SDKs should implement auto-snapshot logic:
+Choose a snapshot interval from measured replay cost, snapshot size, and aggregate write rate. Five hundred events can be a starting point, not a broker guarantee. SDKs may implement workload-specific auto-snapshot logic:
 
 ```
 // Pseudocode
@@ -248,7 +250,7 @@ In distributed mode, `APPEND_STREAM` is routed to the leader for the aggregate p
 4. indexes the event only after the append/replication path succeeds, and
 5. returns `OK version=<N> offset=<N> partition=<N>`.
 
-Followers index replicated event-sourcing messages as they arrive, preserving the leader-assigned offset and aggregate version. If a follower restarts or loses its local stream index files, it rebuilds the stream index from the committed partition log before answering stream commands.
+Followers append replicated event-sourcing messages without treating the uncommitted tail as part of the stream index. Before a broker serves leader-side append, read, version, or snapshot validation, it advances its derived index only through the stable committed HWM. This preserves the leader-assigned offset and aggregate version without allowing an uncommitted tail to influence optimistic version checks, including after leadership changes. On restart, each broker rebuilds the derived stream index from the committed partition log before answering stream commands, discarding index entries beyond the recovered HWM.
 
 ### Read Path
 
@@ -270,12 +272,13 @@ Because event sourcing relies on replay, retention must be configured carefully.
 
 ### Guarantees
 
-- Append ordering is linearizable per aggregate key on the partition leader.
+- The current partition leader serializes successful appends per aggregate key; optimistic version checks define their logical order.
 - Optimistic concurrency is enforced by requiring `version = currentVersion + 1`.
-- Replicated followers maintain their own stream index from the replicated log.
+- Replicated followers maintain their own derived stream index, but advance it only through the stable committed HWM.
 - Snapshot writes are quorum-replicated before success.
 - Reads return committed events only, bounded by the recovered HWM after restart.
-- Exactly-once side effects are not provided by the broker; projection handlers should remain idempotent.
+- An append error after a network or broker failure can leave the client uncertain whether the event reached the committed log. Retry the identical `(topic, key, version, payload)` command and keep projection handlers idempotent.
+- Exactly-once external side effects are not provided by the broker.
 
 ---
 ## Schema Evolution
@@ -330,7 +333,10 @@ Cursus does not provide a built-in projection engine. Instead, projections are b
 
 ```
 JOIN_GROUP topic=orders group=order-projections member=projector-1
-CONSUME topic=orders partition=0 offset=0 member=projector-1-8374 group=order-projections
+SYNC_GROUP topic=orders group=order-projections member=<assigned-member-id> generation=<N>
+FETCH_OFFSET topic=orders partition=0 group=order-projections
+CONSUME topic=orders partition=0 offset=<nextOffset> member=<assigned-member-id> group=order-projections generation=<N> isolation=read_committed
+COMMIT_OFFSET topic=orders partition=0 group=order-projections offset=<lastProcessedOffset+1> member=<assigned-member-id> generation=<N>
 ```
 
 Because event-sourcing topics are regular Cursus topics, all consumer group features work: rebalancing, offset management, wildcard subscriptions, and batch commits.
@@ -393,12 +399,13 @@ READ_STREAM topic=<name> key=<aggregate_key> [from_version=<N>]
 |-----------|----------|---------|-------------|
 | topic | Yes | - | Topic name |
 | key | Yes | - | Aggregate ID |
-| from_version | No | 1 (or snapshot version + 1) | Starting version |
+| from_version | No | 1 | Positive starting version; a usable snapshot advances the returned event batch |
 
 Frame 1 -- JSON envelope:
 
 ```json
 {
+  "status": "OK",
   "topic": "...",
   "key": "...",
   "partition": 0,
@@ -407,7 +414,7 @@ Frame 1 -- JSON envelope:
 }
 ```
 
-The `snapshot` field is present only when a snapshot exists at or after `from_version`.
+The `snapshot` field is present only when a snapshot exists at or after `from_version`. Zero or non-numeric `from_version` values return a JSON `invalid_from_version` error envelope.
 
 Frame 2 -- Binary batch (0xBA7C format) containing the events.
 
@@ -492,7 +499,7 @@ OK snapshot=null
 
 ### Snapshot Frequency
 
-- Save a snapshot every 500 events as a starting point.
+- Use 500 events only as an initial snapshot interval; measure replay latency and snapshot write cost for the aggregate.
 - Adjust based on aggregate load time requirements. If aggregates rarely exceed 100 events, snapshots may not be necessary.
 - Never skip snapshots entirely for high-traffic aggregates. Without snapshots, loading an aggregate with 100,000 events requires replaying all of them.
 
@@ -511,5 +518,5 @@ OK snapshot=null
 ### Projections
 
 - Use separate consumer groups for each projection. This allows independent progress and failure isolation.
-- Projections should be rebuildable. If a projection gets corrupted, reset its consumer group offsets to zero and replay from the beginning.
+- Projections should be rebuildable. Because committed offsets are monotonic, rebuild with a new consumer group id (or a future explicit administrative reset workflow) rather than attempting to commit an older offset to the existing group.
 - For time-sensitive projections, use `STREAM` (continuous push mode) instead of polling with `CONSUME`.

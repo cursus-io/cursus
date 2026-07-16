@@ -98,6 +98,13 @@ const (
 	AutoOffsetResetError    AutoOffsetResetPolicy = "error"
 )
 
+type ReadIsolation string
+
+const (
+	ReadCommitted   ReadIsolation = "read_committed"
+	ReadUncommitted ReadIsolation = "read_uncommitted"
+)
+
 type ConsumerConfig struct {
 	BrokerAddrs        []string `yaml:"broker_addrs" json:"broker_addrs"`
 	CurrentBrokerIndex int      `yaml:"-" json:"-"`
@@ -117,6 +124,7 @@ type ConsumerConfig struct {
 	PollTimeoutMS   int                   `yaml:"poll_timeout_ms" json:"poll_timeout_ms"`
 	BatchSize       int                   `yaml:"batch_size" json:"batch_size"`
 	AutoOffsetReset AutoOffsetResetPolicy `yaml:"auto_offset_reset" json:"auto_offset_reset"`
+	ReadIsolation   ReadIsolation         `yaml:"read_isolation" json:"read_isolation"`
 
 	SessionTimeoutMS         int `yaml:"session_timeout_ms" json:"session_timeout_ms"`
 	MaxPollRecords           int `yaml:"max_poll_records" json:"max_poll_records"`
@@ -169,6 +177,7 @@ func NewDefaultConsumerConfig() *ConsumerConfig {
 		PollTimeoutMS:            30000,
 		BatchSize:                100,
 		AutoOffsetReset:          AutoOffsetResetEarliest,
+		ReadIsolation:            ReadCommitted,
 		MaxPollRecords:           500,
 		EnableAutoCommit:         true,
 		AutoCommitInterval:       5 * time.Second,

@@ -50,7 +50,7 @@ func (cfg *Config) Normalize() {
 	// log segment & retention
 	cfg.CleanupPolicy = strings.ToLower(strings.TrimSpace(cfg.CleanupPolicy))
 	switch cfg.CleanupPolicy {
-	case "delete", "compact":
+	case "delete":
 	default:
 		util.Warn("Invalid cleanup_policy '%s', defaulting to 'delete'", cfg.CleanupPolicy)
 		cfg.CleanupPolicy = "delete"

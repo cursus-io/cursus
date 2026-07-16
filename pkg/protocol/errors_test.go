@@ -50,6 +50,7 @@ func TestClassifyFencingAndAvailability(t *testing.T) {
 		{"STALE_LEADER_EPOCH", ErrorClassFencing, false},
 		{"partition_metadata_not_found", ErrorClassNotFound, false},
 		{"invalid_commit_watermark", ErrorClassValidation, false},
+		{"replica_index_prepare_failed", ErrorClassInternal, false},
 		{"missing_leader_fence", ErrorClassValidation, false},
 		{"leader_election_rejected", ErrorClassConflict, false},
 		{"leader_election_result_unavailable", ErrorClassAvailability, true},
@@ -58,6 +59,7 @@ func TestClassifyFencingAndAvailability(t *testing.T) {
 		{"duplicate_partition", ErrorClassValidation, false},
 		{"invalid_batch_commit_entry", ErrorClassValidation, false},
 		{"invalid_partition", ErrorClassValidation, false},
+		{"invalid_from_version", ErrorClassValidation, false},
 		{"missing_generation", ErrorClassValidation, false},
 	}
 	for _, test := range tests {
