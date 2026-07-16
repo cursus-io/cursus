@@ -2,7 +2,10 @@ package protocol
 
 import "strings"
 
+const maxTextCommandLength = len("SEND_OFFSETS_TO_TXN")
+
 var textCommands = map[string]struct{}{
+	"AUTH":                {},
 	"CREATE":              {},
 	"DELETE":              {},
 	"LIST":                {},
@@ -22,6 +25,7 @@ var textCommands = map[string]struct{}{
 	"GROUP_STATUS":        {},
 	"FETCH_OFFSET":        {},
 	"LIST_GROUPS":         {},
+	"LIST_OFFSETS":        {},
 	"SYNC_GROUP":          {},
 	"DESCRIBE":            {},
 	"INIT_PRODUCER_ID":    {},
@@ -60,8 +64,15 @@ func IsTextCommand(value string) bool {
 	if (first < 'A' || first > 'Z') && (first < 'a' || first > 'z') {
 		return false
 	}
-	end := strings.IndexAny(trimmed, " \t\r\n")
+	searchEnd := len(trimmed)
+	if searchEnd > maxTextCommandLength+1 {
+		searchEnd = maxTextCommandLength + 1
+	}
+	end := strings.IndexAny(trimmed[:searchEnd], " \t\r\n")
 	if end == -1 {
+		if len(trimmed) > maxTextCommandLength {
+			return false
+		}
 		end = len(trimmed)
 	}
 	_, ok := textCommands[strings.ToUpper(trimmed[:end])]

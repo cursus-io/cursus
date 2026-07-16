@@ -274,17 +274,25 @@ func (r *ClusterRouter) withInternalToken(command string) string {
 
 func injectInternalToken(command, token string) string {
 	trimmed := strings.TrimSpace(command)
-	if trimmed == "" || strings.Contains(trimmed, " internal_token=") || strings.HasPrefix(trimmed, "internal_token=") {
+	if trimmed == "" {
 		return command
 	}
-	parts := strings.Fields(trimmed)
-	if len(parts) == 0 {
-		return command
+	commandEnd := strings.IndexAny(trimmed, " \t\r\n")
+	if commandEnd == -1 {
+		return trimmed + " internal_token=" + token
 	}
-	commandName := parts[0]
-	rest := strings.TrimSpace(trimmed[len(commandName):])
+	commandName := trimmed[:commandEnd]
+	rest := strings.TrimLeft(trimmed[commandEnd:], " \t\r\n")
 	if rest == "" {
 		return commandName + " internal_token=" + token
+	}
+	firstArgEnd := strings.IndexAny(rest, " \t\r\n")
+	firstArg := rest
+	if firstArgEnd >= 0 {
+		firstArg = rest[:firstArgEnd]
+	}
+	if strings.HasPrefix(firstArg, "internal_token=") {
+		return command
 	}
 	return commandName + " internal_token=" + token + " " + rest
 }

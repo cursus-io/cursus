@@ -24,6 +24,22 @@ func TestWithInternalTokenPreservesLongRawCommand(t *testing.T) {
 	}
 }
 
+func TestInjectInternalTokenOnlyInspectsCommandArguments(t *testing.T) {
+	command := "REPLICATE_MESSAGE payload=message internal_token=payload-value"
+	got := injectInternalToken(command, "secret")
+	want := "REPLICATE_MESSAGE internal_token=secret payload=message internal_token=payload-value"
+	if got != want {
+		t.Fatalf("command = %q, want %q", got, want)
+	}
+}
+
+func TestInjectInternalTokenPreservesExistingFirstArgument(t *testing.T) {
+	command := "REPLICATE_MESSAGE internal_token=secret payload=value"
+	if got := injectInternalToken(command, "secret"); got != command {
+		t.Fatalf("command = %q, want unchanged", got)
+	}
+}
+
 func TestWithInternalTokenPreservesLegacyEnvelope(t *testing.T) {
 	router := &ClusterRouter{internalToken: "secret"}
 	encoded := util.EncodeMessage("", "HELP")
