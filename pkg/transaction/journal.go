@@ -56,14 +56,16 @@ func (j *Journal) Append(snap *Snapshot) (err error) {
 	if err != nil {
 		return fmt.Errorf("marshal transaction snapshot: %w", err)
 	}
-	if len(payload) == 0 || len(payload) > maxJournalRecordBytes {
-		return fmt.Errorf("transaction snapshot size %d exceeds journal limit", len(payload))
+	payloadLen := len(payload)
+	if payloadLen == 0 || payloadLen > maxJournalRecordBytes {
+		return fmt.Errorf("transaction snapshot size %d exceeds journal limit", payloadLen)
 	}
 
-	record := make([]byte, 4+len(payload)+4)
-	binary.BigEndian.PutUint32(record[:4], uint32(len(payload)))
+	record := make([]byte, 4+payloadLen+4)
+	payloadSize := uint32(payloadLen) // #nosec G115 -- bounded by maxJournalRecordBytes above.
+	binary.BigEndian.PutUint32(record[:4], payloadSize)
 	copy(record[4:], payload)
-	binary.BigEndian.PutUint32(record[4+len(payload):], crc32.ChecksumIEEE(payload))
+	binary.BigEndian.PutUint32(record[4+payloadLen:], crc32.ChecksumIEEE(payload))
 
 	j.mu.Lock()
 	defer j.mu.Unlock()
