@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -15,6 +16,7 @@ import (
 const (
 	maxJournalRecordBytes = 32 << 20
 	journalFormatVersion  = 1
+	journalRecordOverhead = 8
 )
 
 type journalRecord struct {
@@ -60,8 +62,12 @@ func (j *Journal) Append(snap *Snapshot) (err error) {
 	if payloadLen == 0 || payloadLen > maxJournalRecordBytes {
 		return fmt.Errorf("transaction snapshot size %d exceeds journal limit", payloadLen)
 	}
+	if payloadLen > math.MaxInt-journalRecordOverhead {
+		return fmt.Errorf("transaction snapshot size %d overflows journal frame", payloadLen)
+	}
 
-	record := make([]byte, 4+payloadLen+4)
+	recordSize := payloadLen + journalRecordOverhead
+	record := make([]byte, recordSize)
 	payloadSize := uint32(payloadLen) // #nosec G115 -- bounded by maxJournalRecordBytes above.
 	binary.BigEndian.PutUint32(record[:4], payloadSize)
 	copy(record[4:], payload)
