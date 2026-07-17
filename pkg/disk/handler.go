@@ -121,7 +121,7 @@ func newDiskHandlerWithPolicy(cfg *config.Config, topicName string, partitionID 
 
 func newDiskHandler(cfg *config.Config, topicName string, partitionID int, cleanupPolicy string, initialRetention retentionLimits) (*DiskHandler, error) {
 	base := fmt.Sprintf("%s%c%s%cpartition_%d", cfg.LogDir, os.PathSeparator, topicName, os.PathSeparator, partitionID)
-	if err := os.MkdirAll(filepath.Dir(base), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(base), 0o750); err != nil {
 		return nil, err
 	}
 

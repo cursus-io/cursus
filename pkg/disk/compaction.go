@@ -313,7 +313,7 @@ func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool,
 		if _, err := logFile.Write(frame.raw); err != nil {
 			return fmt.Errorf("write compacted log: %w", err)
 		}
-		outputPosition += uint64(frame.size)
+		outputPosition += safeIntToUint64(frame.size)
 		after += int64(frame.size)
 		return nil
 	})

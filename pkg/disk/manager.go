@@ -64,7 +64,7 @@ func (dm *DiskManager) getHandlerLocked(topic string, partitionID int, policy *i
 		return handler, nil
 	}
 
-	if err := os.MkdirAll(dm.cfg.LogDir, 0o755); err != nil {
+	if err := os.MkdirAll(dm.cfg.LogDir, 0o750); err != nil {
 		return nil, fmt.Errorf("failed to create log directory %s: %w", dm.cfg.LogDir, err)
 	}
 
