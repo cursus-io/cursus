@@ -110,7 +110,7 @@ A standalone broker stores the authoritative topic registry in `{log_dir}/__topi
 }
 ```
 
-The encoded manifest is limited to 16 MiB. Updates write a mode-`0600` same-directory temporary file, sync it, atomically replace the committed manifest, and sync the parent directory where supported. Startup reads only the committed path; abandoned `.tmp` files are not authoritative. Parsing disallows unknown fields and rejects duplicate names, invalid definitions, trailing content, and unsupported versions. The broker does not infer ACL or event-sourcing mode from segment filenames when a manifest is absent or invalid.
+The encoded manifest is limited to 16 MiB. Updates write a mode-`0600` same-directory temporary file, sync it, atomically replace the committed manifest, and sync the parent directory where supported. Startup reads only the committed path; abandoned `.tmp` files are not authoritative. Parsing disallows unknown fields and rejects duplicate names, invalid definitions, trailing content, and unsupported versions. A missing manifest with persisted topic logs, or a valid manifest that omits a persisted topic directory, is an integrity error. The broker does not infer ACL or event-sourcing mode from segment filenames when a manifest is absent or invalid.
 
 Backups of a standalone broker must keep this manifest with topic partition directories, `__transaction_state.journal`, and the consumer offset log. Restoring only segment files cannot reconstruct the full topic policy.
 

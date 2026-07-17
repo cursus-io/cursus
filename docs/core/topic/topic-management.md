@@ -38,7 +38,9 @@ For standalone create/update, new partition handlers are staged while the topic 
 
 Standalone brokers load `{log_dir}/__topic_metadata.json` before coordinator initialization and static-group registration. The versioned manifest restores partition count, idempotent/event-sourcing flags, cleanup/retention, partitioner, auth policy, and ACLs. Unknown fields, duplicate topics, unsupported versions, invalid names, and malformed policy fail broker startup instead of silently weakening authorization or cleanup behavior.
 
-Brokers upgraded from versions without the manifest do not guess security or event-sourcing policy from segment filenames. Existing applications must issue their normal idempotent `CREATE` declarations once; each successful declaration adds the authoritative definition. The internal offset topic is recreated by the coordinator and then enters the manifest.
+Brokers upgraded from versions without the manifest do not guess security or event-sourcing policy from segment filenames. If persisted partition logs exist without a manifest, or a manifest omits a persisted topic directory, startup fails and lists the orphaned topics. Operators must migrate or archive those directories and provide authoritative definitions before restart. A normal `CREATE` also rejects a name whose orphaned logs remain, preventing deleted data from being silently resurrected.
+
+The internal offset topic is recreated by the coordinator and then enters the manifest on a new data directory. Existing pre-manifest offset logs require the same explicit migration as application topics.
 
 Distributed brokers keep topic definitions in the FSM and snapshot format version 6. Snapshot restore rebuilds the topic registry before committed HWM reconciliation. Version 5 and older snapshots can reconstruct partition count/idempotent mode from partition metadata, using the historical default topic policy because those snapshots did not retain the richer definition.
 

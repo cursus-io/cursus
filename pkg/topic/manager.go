@@ -1,6 +1,7 @@
 package topic
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,8 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
+
+var ErrTopicNotFound = errors.New("topic not found")
 
 type StreamManager interface {
 	AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), legacyCommitInterval time.Duration) error
@@ -120,6 +123,9 @@ func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, i
 			util.Info("topic '%s' already exists with %d partitions", name, current.Partitions)
 		}
 		return nil
+	}
+	if err := tm.rejectOrphanedStorageLocked(name); err != nil {
+		return err
 	}
 
 	created, err := NewTopicWithPolicy(

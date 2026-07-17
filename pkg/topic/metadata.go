@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/util"
 )
 
 const (
@@ -108,6 +109,16 @@ func (s *topicMetadataStore) Load() (_ []Definition, err error) {
 	// #nosec G304 -- the path is supplied by the broker-owned storage provider.
 	file, err := os.Open(s.path)
 	if errors.Is(err, os.ErrNotExist) {
+		orphaned, scanErr := s.orphanedTopicDirectories(nil)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if len(orphaned) > 0 {
+			return nil, fmt.Errorf(
+				"topic metadata manifest is missing while persisted topic storage exists: %s",
+				strings.Join(orphaned, ","),
+			)
+		}
 		return nil, nil
 	}
 	if err != nil {
@@ -156,6 +167,16 @@ func (s *topicMetadataStore) Load() (_ []Definition, err error) {
 		definitions = append(definitions, definition)
 	}
 	sort.Slice(definitions, func(i, j int) bool { return definitions[i].Name < definitions[j].Name })
+	orphaned, err := s.orphanedTopicDirectories(seen)
+	if err != nil {
+		return nil, err
+	}
+	if len(orphaned) > 0 {
+		return nil, fmt.Errorf(
+			"topic metadata manifest omits persisted topic storage: %s",
+			strings.Join(orphaned, ","),
+		)
+	}
 	return definitions, nil
 }
 
@@ -216,8 +237,11 @@ func (s *topicMetadataStore) Save(definitions []Definition) (err error) {
 	if err := replaceCheckpointFile(tmp, s.path); err != nil {
 		return fmt.Errorf("replace topic metadata: %w", err)
 	}
-	if err := syncTopicMetadataDirectory(dir); err != nil {
-		return fmt.Errorf("sync topic metadata directory: %w", err)
+	if err := syncTopicMetadataDirectoryFn(dir); err != nil {
+		return &topicMetadataSaveError{
+			committed: true,
+			err:       fmt.Errorf("sync topic metadata directory: %w", err),
+		}
 	}
 	return nil
 }
@@ -238,6 +262,8 @@ func writeMetadataFile(file *os.File, data []byte) error {
 	}
 	return nil
 }
+
+var syncTopicMetadataDirectoryFn = syncTopicMetadataDirectory
 
 func syncTopicMetadataDirectory(path string) error {
 	if runtime.GOOS == "windows" {
@@ -373,6 +399,10 @@ func (tm *TopicManager) persistDefinitionLocked(override Definition) error {
 	}
 	definitions := tm.definitionsLocked(&override, "")
 	if err := tm.metadataStore.Save(definitions); err != nil {
+		if topicMetadataWriteCommitted(err) {
+			util.Warn("Topic metadata definition %q committed with durability uncertainty: %v", override.Name, err)
+			return nil
+		}
 		return fmt.Errorf("persist topic definition %q: %w", override.Name, err)
 	}
 	return nil
@@ -383,6 +413,10 @@ func (tm *TopicManager) persistRemovalLocked(name string) error {
 		return nil
 	}
 	if err := tm.metadataStore.Save(tm.definitionsLocked(nil, name)); err != nil {
+		if topicMetadataWriteCommitted(err) {
+			util.Warn("Topic metadata deletion %q committed with durability uncertainty: %v", name, err)
+			return nil
+		}
 		return fmt.Errorf("persist topic deletion %q: %w", name, err)
 	}
 	return nil

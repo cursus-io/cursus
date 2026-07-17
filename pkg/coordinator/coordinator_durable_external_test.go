@@ -33,6 +33,7 @@ func TestCoordinator_DurableOffsetReplayFromDisk(t *testing.T) {
 
 	restartedDM := disk.NewDiskManager(cfg)
 	restartedTM := topic.NewTopicManager(cfg, restartedDM, nil)
+	require.NoError(t, restartedTM.RestoreTopics())
 	restarted := coordinator.NewCoordinator(ctx, cfg, restartedTM)
 	defer restartedDM.CloseAllHandlers()
 

@@ -76,7 +76,7 @@ HWM is persisted through a synced temporary checkpoint and restored with a clamp
 
 ## Startup Recovery
 
-Standalone startup first loads the versioned `__topic_metadata.json` manifest and recreates topic definitions/partition handlers before coordinator initialization. Corrupt, duplicate, unknown-version, or semantically invalid metadata fails startup. Distributed snapshot version 6 restores the same topic definitions from FSM state before committed HWM reconciliation; older snapshots reconstruct only the metadata those formats retained.
+Standalone startup first loads the versioned `__topic_metadata.json` manifest and recreates topic definitions/partition handlers before coordinator initialization. Corrupt, duplicate, unknown-version, or semantically invalid metadata fails startup. A missing manifest with persisted topic logs, or a manifest that omits a persisted topic directory, also fails startup rather than silently losing or recreating data; restore the compatible manifest or archive the orphaned storage before retrying. Distributed snapshot version 6 restores the same topic definitions from FSM state before committed HWM reconciliation; older snapshots reconstruct only the metadata those formats retained.
 
 For the active segment, recovery scans length prefixes and serialized records. Invalid lengths, decode failures, non-contiguous offsets, and partial tails stop recovery at the last valid boundary. The file is truncated and synced to that boundary before writes resume.
 

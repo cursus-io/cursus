@@ -3,6 +3,7 @@ package controller
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -204,6 +205,9 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 			"topic": topicName,
 		}
 		if _, err := ch.applyAndWait("TOPIC_DELETE", payload); err != nil {
+			if errors.Is(err, topic.ErrTopicNotFound) {
+				return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+			}
 			return fmt.Sprintf("ERROR: delete_topic_failed reason=%q", err.Error())
 		}
 		ch.closeEventSourcingTopic(topicName)

@@ -27,6 +27,21 @@ func copyTopicState(state map[string]*topic.Definition) map[string]*topic.Defini
 	return cloned
 }
 
+func copyPartitionMetadataState(metadata map[string]*PartitionMetadata) map[string]*PartitionMetadata {
+	cloned := make(map[string]*PartitionMetadata, len(metadata))
+	for key, current := range metadata {
+		if current == nil {
+			cloned[key] = nil
+			continue
+		}
+		copy := *current
+		copy.Replicas = append([]string(nil), current.Replicas...)
+		copy.ISR = append([]string(nil), current.ISR...)
+		cloned[key] = &copy
+	}
+	return cloned
+}
+
 func topicDefinitionsFromState(state map[string]*topic.Definition) ([]topic.Definition, error) {
 	definitions := make([]topic.Definition, 0, len(state))
 	for name, raw := range state {
@@ -82,6 +97,22 @@ func validateTopicState(
 		definition, exists := byName[name]
 		if !exists {
 			return nil, fmt.Errorf("partition metadata %q has no topic definition", key)
+		}
+		if partitionMetadata.PartitionCount != definition.Partitions {
+			return nil, fmt.Errorf(
+				"partition metadata %q declares partition count %d; topic %q declares %d",
+				key,
+				partitionMetadata.PartitionCount,
+				name,
+				definition.Partitions,
+			)
+		}
+		if partitionMetadata.Idempotent != definition.Idempotent {
+			return nil, fmt.Errorf(
+				"partition metadata %q idempotent mode conflicts with topic %q",
+				key,
+				name,
+			)
 		}
 		if partition >= definition.Partitions {
 			return nil, fmt.Errorf(

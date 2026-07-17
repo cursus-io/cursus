@@ -242,14 +242,13 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		}
 		restoredTopicState = legacyTopicState(state.PartitionMetadata)
 	}
-	definitions, err := topicDefinitionsFromState(restoredTopicState)
+	definitions, err := validateTopicState(restoredTopicState, state.PartitionMetadata)
 	if err != nil {
 		return fmt.Errorf("restore topic definitions: %w", err)
 	}
-	if state.Version >= 6 {
-		definitions, err = validateTopicState(restoredTopicState, state.PartitionMetadata)
-		if err != nil {
-			return fmt.Errorf("restore topic definitions: %w", err)
+	if f.tm != nil {
+		if err := f.tm.RestoreDefinitions(definitions); err != nil {
+			return fmt.Errorf("restore topic registry: %w", err)
 		}
 	}
 
@@ -282,12 +281,6 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	}
 
 	f.mu.Unlock()
-
-	if f.tm != nil {
-		if err := f.tm.RestoreDefinitions(definitions); err != nil {
-			return fmt.Errorf("restore topic registry: %w", err)
-		}
-	}
 	if state.Version >= 5 {
 		f.reconcileCommittedPartitions()
 	}
