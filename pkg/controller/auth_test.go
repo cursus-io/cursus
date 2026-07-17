@@ -54,8 +54,16 @@ func TestSASLACLGuardsPublishAndConsume(t *testing.T) {
 	}
 
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("close consume server pipe: %v", err)
+		}
+	})
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("close consume client pipe: %v", err)
+		}
+	})
 
 	errCh := make(chan error, 1)
 	go func() {

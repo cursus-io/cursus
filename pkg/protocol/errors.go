@@ -96,7 +96,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"invalid_transaction_state", "invalid_txn_offsets",
 		"invalid_retention_bytes", "invalid_retention_hours", "invalid_schema_version", "invalid_seq_num",
 		"invalid_snapshot_catchup_response", "invalid_snapshot_payload", "invalid_stream_syntax",
-		"invalid_topic_policy", "invalid_version", "invalid_from_version", "malformed_input", "missing_generation", "missing_group", "missing_key",
+		"invalid_topic_name", "invalid_topic_policy", "invalid_version", "invalid_from_version", "malformed_input", "missing_generation", "missing_group", "missing_key",
 		"unsupported_topic_policy",
 		"missing_broker", "missing_leader_fence", "missing_member", "missing_message", "missing_offset", "missing_partition", "missing_payload",
 		"missing_coordinator_key", "missing_ownership_params", "missing_producer_id", "missing_protocol_version",

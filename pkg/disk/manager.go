@@ -32,6 +32,14 @@ func NewDiskManager(cfg *config.Config) *DiskManager {
 	}
 }
 
+// TopicMetadataPath returns the broker-owned standalone topic manifest path.
+func (dm *DiskManager) TopicMetadataPath() string {
+	if dm == nil || dm.cfg == nil || strings.TrimSpace(dm.cfg.LogDir) == "" {
+		return ""
+	}
+	return filepath.Join(dm.cfg.LogDir, config.TopicMetadataFileName)
+}
+
 // GetHandler returns a StorageHandler for a given name or creates one if missing.
 func (dm *DiskManager) GetHandler(topic string, partitionID int) (types.StorageHandler, error) {
 	dm.mu.Lock()
@@ -151,6 +159,22 @@ func (dm *DiskManager) CloseTopicHandlers(topic string) {
 		}
 		delete(dm.handlers, name)
 	}
+}
+
+// ClosePartitionHandler closes and evicts one staged partition handler.
+func (dm *DiskManager) ClosePartitionHandler(topic string, partitionID int) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	key := diskHandlerKey(topic, partitionID)
+	handler := dm.handlers[key]
+	if handler == nil {
+		return
+	}
+	if err := handler.Close(); err != nil {
+		util.Warn("Failed to close DiskHandler for %s: %v", key, err)
+	}
+	delete(dm.handlers, key)
 }
 
 func diskHandlerKey(topic string, partitionID int) string {

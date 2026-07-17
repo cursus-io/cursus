@@ -179,7 +179,7 @@ CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [event_sourcing=<
 ```
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
-| topic | Yes | - | Topic name |
+| topic | Yes | - | Portable topic name: 1-249 ASCII bytes using letters, digits, `.`, `_`, `-`, or `=` |
 | partitions | No | 4 | Number of partitions |
 | idempotent | No | false | Enable producer dedup |
 | event_sourcing | No | false | Enable aggregate stream commands; requires non-compacted history |
@@ -194,13 +194,19 @@ CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [event_sourcing=<
 
 Response: `OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>`
 
-`compact` and `delete,compact` are accepted only by standalone, non-event-sourcing topics. Unsupported combinations return `ERROR: invalid_topic_policy ...` or `ERROR: unsupported_topic_policy ...`. Repeating `CREATE` for an existing event-sourcing topic cannot use a false `event_sourcing` argument to bypass this validation.
+Topic names are a portable on-disk identifier: 1-249 ASCII bytes containing only letters, digits, `.`, `_`, `-`, or `=`; `.` and `..` are reserved. Invalid names return `ERROR: invalid_topic_name ...`.
+
+A successful standalone `CREATE` means the versioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. Broker restart restores partition count, idempotent/event-sourcing mode, partitioner, retention, cleanup policy, auth policy, and ACLs from this manifest. Distributed mode commits the same definition through the cluster FSM and includes it in snapshot version 6.
+
+`compact` and `delete,compact` are accepted only by standalone, non-event-sourcing topics. Unsupported combinations return `ERROR: invalid_topic_policy ...` or `ERROR: unsupported_topic_policy ...`. Repeating `CREATE` for an existing event-sourcing topic cannot use a false `event_sourcing` argument to bypass this validation. Repeating `CREATE` also preserves existing partition leader epochs and committed HWMs; only newly added partitions receive new assignments.
 
 **DELETE**
 ```
 DELETE topic=<name>
 ```
 Response: `OK topic=<name> deleted=true`
+
+Standalone deletion first commits removal from the durable manifest, then closes partition workers/handlers and removes topic data. A manifest failure returns `ERROR: delete_topic_failed ...` and leaves the topic registered. After the manifest commit, physical cleanup errors are logged but the response remains successful because the topic is no longer authoritative. Distributed deletion is committed through the FSM.
 
 **LIST**
 ```
@@ -305,7 +311,7 @@ METADATA topic=<name>
 
 Response: `OK topic=<name> partitions=<N> leaders=<host:port>,<host:port>,... epochs=<csv> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>`
 
-Returns partition leaders/epochs and the authoritative in-memory topic policy. Leader addresses are in partition order (P0, P1, P2, ...).
+Returns partition leaders/epochs and the authoritative durable topic policy restored from the standalone manifest or cluster FSM. Leader addresses are in partition order (P0, P1, P2, ...).
 
 Any broker can answer this command. Addresses are the advertised client addresses from the FSM broker registry.
 
@@ -359,7 +365,7 @@ Response: `OK member=<actual-id> generation=<N>`
 
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
-| topic | Yes | - | Topic name |
+| topic | Yes | - | Portable topic name: 1-249 ASCII bytes using letters, digits, `.`, `_`, `-`, or `=` |
 | group | Yes | - | Consumer group name |
 | member | Yes | - | Consumer member ID (with suffix) |
 | generation | No | - | Current generation number; if supplied, stale generations return ERROR: GEN_MISMATCH ... |
@@ -513,7 +519,7 @@ missing, an entry is malformed, or the same partition appears more than once.
 
 Cursus exposes a broker-managed transaction coordinator for consume-process-produce workflows. In distributed mode, transaction commands are routed by `transactional_id` using the coordinator key `txn:<transactional_id>`. Clients can discover the owner with `FIND_COORDINATOR transactional_id=<id>` and must retry on `ERROR: NOT_COORDINATOR host=<host> port=<port>`.
 
-Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Transaction state entered the schema in version 4; current brokers write FSM snapshot version 5, which also carries committed partition watermarks.
+Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Transaction state entered the schema in version 4, committed partition watermarks in version 5, and durable topic definitions in the current version 6.
 
 Clients should first call `INIT_PRODUCER_ID` for a `transactional_id`; the broker returns the authoritative `(producerId, epoch)` session and bumps `epoch` on re-initialization to fence older producers. The coordinator fences stale producers by `(transactional_id, producerId, epoch)`: lower epochs are rejected, and staged operations must use the same producer and epoch that opened the transaction. After `transactional_id_expiration_ms`, completed transactions discard staged message/offset payloads but retain a compact epoch tombstone. The tombstone participates in standalone journal and distributed metadata snapshots, preventing an older producer session from being revived. Active `open` and `committing` transactions are not expired by the cleanup path.
 
@@ -618,7 +624,7 @@ READ_STREAM topic=<name> key=<aggregate_key> [from_version=<N>]
 ```
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
-| topic | Yes | - | Topic name |
+| topic | Yes | - | Portable topic name: 1-249 ASCII bytes using letters, digits, `.`, `_`, `-`, or `=` |
 | key | Yes | - | Aggregate ID |
 | from_version | No | 1 | Positive starting version; a usable snapshot advances the event batch to snapshot version + 1 |
 
@@ -646,7 +652,7 @@ STREAM_VERSION topic=<name> key=<aggregate_key>
 ```
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
-| topic | Yes | - | Topic name |
+| topic | Yes | - | Portable topic name: 1-249 ASCII bytes using letters, digits, `.`, `_`, `-`, or `=` |
 | key | Yes | - | Aggregate ID |
 
 Response: `OK version=<N>` (for example, `OK version=6`). Returns `OK version=0` if the aggregate does not exist. Older brokers returned a plain integer; clients may keep that only as a legacy fallback.
@@ -657,7 +663,7 @@ SAVE_SNAPSHOT topic=<name> key=<aggregate_key> version=<N> message=<payload>
 ```
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
-| topic | Yes | - | Topic name |
+| topic | Yes | - | Portable topic name: 1-249 ASCII bytes using letters, digits, `.`, `_`, `-`, or `=` |
 | key | Yes | - | Aggregate ID |
 | version | Yes | - | Aggregate version this snapshot represents (must be <= current version) |
 | message | Yes | - | Serialized aggregate state (captures rest of line) |
@@ -676,7 +682,7 @@ READ_SNAPSHOT topic=<name> key=<aggregate_key>
 ```
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
-| topic | Yes | - | Topic name |
+| topic | Yes | - | Portable topic name: 1-249 ASCII bytes using letters, digits, `.`, `_`, `-`, or `=` |
 | key | Yes | - | Aggregate ID |
 
 Success response: `OK snapshot=<json>`
@@ -854,6 +860,7 @@ SDKs should parse the code and fields first, use `class` for broad handling, and
 
 | Error | Cause | Client Action |
 |-------|-------|---------------|
+| `invalid_topic_name topic=<X>` | Topic name violates the portable storage contract | Use 1-249 ASCII bytes containing letters, digits, `.`, `_`, `-`, or `=` |
 | `topic_not_found topic=<X>` | Topic not created | CREATE topic first |
 | `PARTITION_NOT_FOUND <N>` | Invalid partition ID | Check DESCRIBE for valid IDs |
 | `TOPIC_NOT_FOUND <X>` | Topic not found | CREATE topic first |
@@ -937,7 +944,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - Broker tracks the last seen `(epoch, seqNum)` per `(producerId)` per partition
 - Disk-backed partitions persist producer sequence checkpoints, rebuild producer state from partition logs on broker restart, and use that state to make transactional commit recovery idempotent
 - Distributed FSM snapshots also include producer sequence state for replicated message commands
-- Producer epochs entered FSM snapshot version 3, transaction state version 4, and committed partition watermarks version 5. Current brokers write version 5. Do not run a mixed-version rolling upgrade with binaries that cannot decode version 5; upgrade the cluster together or use an explicitly documented compatibility procedure.
+- Producer epochs entered FSM snapshot version 3, transaction state version 4, committed partition watermarks version 5, and durable topic definitions version 6. Current brokers write version 6. Do not run a mixed-version rolling upgrade with binaries that cannot decode version 6; upgrade the cluster together or use an explicitly documented compatibility procedure.
 - Producer state expires from memory after `producer_state_ttl_ms` of inactivity (default 30 minutes); durable checkpoints retain the last persisted sequence until the partition data is removed
 
 ---

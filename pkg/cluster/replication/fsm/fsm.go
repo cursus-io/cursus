@@ -63,6 +63,7 @@ type BrokerFSMState struct {
 	ProducerState     map[string]map[int]map[string]ProducerSequence `json:"producerState"`
 	GroupState        map[string]*coordinator.GroupStateSnapshot     `json:"groupState,omitempty"`
 	TransactionState  map[string]*transaction.Snapshot               `json:"transactionState,omitempty"`
+	TopicState        map[string]*topic.Definition                   `json:"topicState,omitempty"`
 }
 
 type BrokerFSM struct {
@@ -79,6 +80,7 @@ type BrokerFSM struct {
 	cd                       *coordinator.Coordinator
 	txn                      *transaction.Manager
 	restoredTransactionState map[string]*transaction.Snapshot
+	topicState               map[string]*topic.Definition
 }
 
 func NewBrokerFSM(tm *topic.TopicManager, cd *coordinator.Coordinator) *BrokerFSM {
@@ -88,6 +90,7 @@ func NewBrokerFSM(tm *topic.TopicManager, cd *coordinator.Coordinator) *BrokerFS
 		brokers:           make(map[string]*BrokerInfo),
 		partitionMetadata: make(map[string]*PartitionMetadata),
 		producerState:     make(map[string]map[int]map[string]ProducerSequence),
+		topicState:        make(map[string]*topic.Definition),
 		tm:                tm,
 		cd:                cd,
 	}
@@ -226,8 +229,27 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Info("FSM Restore: Validating snapshot Version 4 (with transaction state)")
 	case 5:
 		util.Info("FSM Restore: Validating snapshot Version 5 (with committed partition watermarks)")
+	case 6:
+		util.Info("FSM Restore: Validating snapshot Version 6 (with durable topic definitions)")
 	default:
 		return fmt.Errorf("unknown snapshot version: %d", state.Version)
+	}
+
+	restoredTopicState := copyTopicState(state.TopicState)
+	if len(restoredTopicState) == 0 && len(state.PartitionMetadata) > 0 {
+		if state.Version >= 6 {
+			return fmt.Errorf("snapshot version %d is missing topic state", state.Version)
+		}
+		restoredTopicState = legacyTopicState(state.PartitionMetadata)
+	}
+	definitions, err := validateTopicState(restoredTopicState, state.PartitionMetadata)
+	if err != nil {
+		return fmt.Errorf("restore topic definitions: %w", err)
+	}
+	if f.tm != nil {
+		if err := f.tm.RestoreDefinitions(definitions); err != nil {
+			return fmt.Errorf("restore topic registry: %w", err)
+		}
 	}
 
 	f.mu.Lock()
@@ -235,6 +257,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	f.logs = state.Logs
 	f.brokers = state.Brokers
 	f.partitionMetadata = state.PartitionMetadata
+	f.topicState = restoredTopicState
 	f.applied = state.Applied
 
 	f.producerState = state.ProducerState
@@ -342,6 +365,14 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		producerStateCopy[topic] = partitionMap
 	}
 
+	topicStateCopy := copyTopicState(f.topicState)
+	if len(topicStateCopy) == 0 && len(metadataCopy) > 0 {
+		topicStateCopy = legacyTopicState(metadataCopy)
+	}
+	if _, err := validateTopicState(topicStateCopy, metadataCopy); err != nil {
+		return nil, fmt.Errorf("snapshot topic definitions: %w", err)
+	}
+
 	var groupState map[string]*coordinator.GroupStateSnapshot
 	if f.cd != nil {
 		groupState = f.cd.ExportState()
@@ -360,6 +391,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		producerState:     producerStateCopy,
 		groupState:        groupState,
 		transactionState:  transactionState,
+		topicState:        topicStateCopy,
 	}, nil
 }
 

@@ -70,6 +70,12 @@ type Producer struct {
 }
 
 func NewProducer(cfg *PublisherConfig) (*Producer, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("publisher config is required")
+	}
+	if err := validateSDKTopicName(cfg.Topic); err != nil {
+		return nil, err
+	}
 	if cfg.EnableMetrics {
 		initMetrics()
 	}
@@ -262,8 +268,8 @@ func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) er
 }
 
 func buildCreateTopicCommand(topic string, options TopicOptions, idempotent bool) (string, error) {
-	if !isSafeTopicOptionValue(topic, false) {
-		return "", fmt.Errorf("invalid topic name %q", topic)
+	if err := validateSDKTopicName(topic); err != nil {
+		return "", err
 	}
 	if options.Partitions <= 0 {
 		return "", fmt.Errorf("partitions must be positive")
@@ -318,6 +324,23 @@ func buildCreateTopicCommand(topic string, options TopicOptions, idempotent bool
 		command += " write_acl=" + strings.Join(options.WriteACL, ",")
 	}
 	return command, nil
+}
+
+func validateSDKTopicName(name string) error {
+	if name == "" || len(name) > 249 || name == "." || name == ".." {
+		return fmt.Errorf("invalid topic name %q", name)
+	}
+	for _, char := range name {
+		switch {
+		case char >= 'a' && char <= 'z':
+		case char >= 'A' && char <= 'Z':
+		case char >= '0' && char <= '9':
+		case char == '.', char == '_', char == '-', char == '=':
+		default:
+			return fmt.Errorf("invalid topic name %q", name)
+		}
+	}
+	return nil
 }
 
 func normalizeSDKCleanupPolicy(value TopicCleanupPolicy) (string, error) {

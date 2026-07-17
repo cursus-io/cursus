@@ -192,7 +192,7 @@ func TestBrokerFSM_PartitionCommitIsMonotonicAndEpochFenced(t *testing.T) {
 
 func TestBrokerFSM_SnapshotRestoresCommittedPartitionWatermark(t *testing.T) {
 	f := newTestFSM()
-	metadata := PartitionMetadata{Leader: "node-1", LeaderEpoch: 2, CommittedHWM: 19}
+	metadata := PartitionMetadata{Leader: "node-1", LeaderEpoch: 2, CommittedHWM: 19, PartitionCount: 1}
 	data, err := json.Marshal(metadata)
 	require.NoError(t, err)
 	require.Nil(t, f.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + string(data)), Index: 7}))
@@ -245,7 +245,7 @@ func TestBrokerFSM_Apply_UpdatesAppliedIndex(t *testing.T) {
 func TestBrokerFSM_Snapshot_Restore(t *testing.T) {
 	fsm := newTestFSM()
 	fsm.brokers["b1"] = &BrokerInfo{ID: "b1", Addr: "a1"}
-	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{Leader: "l1"}
+	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{Leader: "l1", PartitionCount: 1}
 	fsm.logs[5] = &ReplicationEntry{Topic: "t1"}
 	fsm.applied = 5
 

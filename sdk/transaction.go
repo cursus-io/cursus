@@ -160,7 +160,7 @@ func (c *ConsumerClient) TransactionalPublish(transactionalID, topic string, par
 	if err := validateTransactionOwner(transactionalID, msg.ProducerID); err != nil {
 		return err
 	}
-	if err := validateTransactionToken("topic", topic); err != nil {
+	if err := validateSDKTopicName(topic); err != nil {
 		return err
 	}
 	if partition < -1 {
@@ -201,7 +201,7 @@ func buildSendOffsetsToTransactionCommand(transactionalID, producerID, topic, gr
 	if err := validateTransactionOwner(transactionalID, producerID); err != nil {
 		return "", err
 	}
-	if err := validateTransactionToken("topic", topic); err != nil {
+	if err := validateSDKTopicName(topic); err != nil {
 		return "", err
 	}
 	if err := validateTransactionToken("group", group); err != nil {

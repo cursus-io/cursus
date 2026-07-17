@@ -31,6 +31,10 @@ func main() {
 		os.Exit(1)
 	}
 	tm := topic.NewTopicManager(cfg, dm, smAdapter)
+	if err := tm.RestoreTopics(); err != nil {
+		fmt.Println("❌ Failed to restore durable topic metadata:", err)
+		os.Exit(1)
+	}
 	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
 	tm.SetCoordinator(cd)
 

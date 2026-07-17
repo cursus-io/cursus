@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/util"
 )
@@ -37,8 +38,43 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		util.Error("FSM: Failed to unmarshal topic command: %v", err)
 		return err
 	}
+	definition, err := (topic.Definition{
+		Name:          topicCmd.Name,
+		Partitions:    topicCmd.Partitions,
+		Idempotent:    topicCmd.Idempotent,
+		EventSourcing: topicCmd.EventSourcing,
+		Policy:        topicCmd.Policy,
+	}).Normalize()
+	if err != nil {
+		return fmt.Errorf("invalid topic definition: %w", err)
+	}
+	if config.HasCleanupPolicy(definition.Policy.CleanupPolicy, config.CleanupPolicyCompact) {
+		return fmt.Errorf("cleanup policy compact is not supported in distributed mode")
+	}
+	topicCmd.Name = definition.Name
+	topicCmd.Partitions = definition.Partitions
+	topicCmd.Idempotent = definition.Idempotent
+	topicCmd.EventSourcing = definition.EventSourcing
+	topicCmd.Policy = definition.Policy
 
 	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	stagedTopics := copyTopicState(f.topicState)
+	stagedPartitions := copyPartitionMetadataState(f.partitionMetadata)
+	currentPartitions := 0
+	currentTopic := stagedTopics[topicCmd.Name]
+	if currentTopic == nil {
+		currentTopic = legacyTopicState(stagedPartitions)[topicCmd.Name]
+	}
+	if currentTopic != nil {
+		if topicCmd.Partitions < currentTopic.Partitions {
+			return fmt.Errorf("cannot decrease partition count for topic %q: %d -> %d", topicCmd.Name, currentTopic.Partitions, topicCmd.Partitions)
+		}
+		currentPartitions = currentTopic.Partitions
+		topicCmd.Idempotent = currentTopic.Idempotent
+		topicCmd.EventSourcing = currentTopic.EventSourcing
+	}
 
 	var brokers []string
 	for id, info := range f.brokers {
@@ -49,13 +85,11 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	sort.Strings(brokers)
 
 	if len(brokers) == 0 {
-		f.mu.Unlock()
 		util.Error("FSM: No active brokers available for topic creation")
 		return fmt.Errorf("no active brokers")
 	}
 
 	if topicCmd.Partitions <= 0 {
-		f.mu.Unlock()
 		util.Error("FSM: Invalid partition count %d for topic %s", topicCmd.Partitions, topicCmd.Name)
 		return fmt.Errorf("invalid partition count: %d", topicCmd.Partitions)
 	}
@@ -69,7 +103,6 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			}
 		}
 		if !found {
-			f.mu.Unlock()
 			util.Error("FSM: Explicit leader %s not in active broker set %v", topicCmd.LeaderID, brokers)
 			return fmt.Errorf("leader %s not in active broker set", topicCmd.LeaderID)
 		}
@@ -83,11 +116,23 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		util.Warn("FSM: Requested RF %d exceeds active brokers %d. Capping to %d", replicationFactor, len(brokers), len(brokers))
 		replicationFactor = len(brokers)
 	}
+	topicCmd.ReplicationFactor = replicationFactor
 
 	ring := util.NewConsistentHashRing(150, nil)
 	ring.Add(brokers...)
 
-	for i := 0; i < topicCmd.Partitions; i++ {
+	for i := 0; i < currentPartitions; i++ {
+		key := topicCmd.Name + "-" + strconv.Itoa(i)
+		if stagedPartitions[key] == nil {
+			return fmt.Errorf("topic %q is missing partition metadata %d", topicCmd.Name, i)
+		}
+	}
+	for i := 0; i < currentPartitions; i++ {
+		key := topicCmd.Name + "-" + strconv.Itoa(i)
+		stagedPartitions[key].PartitionCount = topicCmd.Partitions
+	}
+
+	for i := currentPartitions; i < topicCmd.Partitions; i++ {
 		key := topicCmd.Name + "-" + strconv.Itoa(i)
 
 		assignedLeader := topicCmd.LeaderID
@@ -95,7 +140,6 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		if assignedLeader == "" {
 			replicas = ring.GetN(key, replicationFactor)
 			if len(replicas) == 0 {
-				f.mu.Unlock()
 				return fmt.Errorf("no replicas assigned for partition %s", key)
 			}
 			assignedLeader = replicas[0]
@@ -117,7 +161,7 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 
 		isrCopy := append([]string(nil), replicas...)
 
-		f.partitionMetadata[key] = &PartitionMetadata{
+		stagedPartitions[key] = &PartitionMetadata{
 			PartitionCount: topicCmd.Partitions,
 			Leader:         assignedLeader,
 			LeaderEpoch:    1,
@@ -128,14 +172,19 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		util.Info("FSM: Assigned leader %s to partition %s (replicas=%v)", assignedLeader, key, replicas)
 	}
 
+	definition.Idempotent = topicCmd.Idempotent
+	definition.EventSourcing = topicCmd.EventSourcing
+	stagedTopics[topicCmd.Name] = copyTopicDefinition(&definition)
 	tm := f.tm
-	f.mu.Unlock()
 
 	if tm != nil {
 		if err := tm.CreateTopicWithPolicy(topicCmd.Name, topicCmd.Partitions, topicCmd.Idempotent, topicCmd.EventSourcing, topicCmd.Policy); err != nil {
 			util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicCmd.Name, err)
+			return err
 		}
 	}
+	f.partitionMetadata = stagedPartitions
+	f.topicState = stagedTopics
 	util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, topicCmd.Partitions)
 
 	return nil
@@ -149,21 +198,42 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 		util.Error("FSM: Failed to unmarshal topic delete command: %v", err)
 		return err
 	}
+	if err := topic.ValidateName(payload.Topic); err != nil {
+		return fmt.Errorf("invalid topic name: %w", err)
+	}
 
 	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	found := f.topicState[payload.Topic] != nil
+	for key := range f.partitionMetadata {
+		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
+	}
+
+	tm := f.tm
+	if tm != nil {
+		deleted, err := tm.DeleteTopicDurable(payload.Topic)
+		if err != nil {
+			return fmt.Errorf("delete local topic %q: %w", payload.Topic, err)
+		}
+		if !deleted {
+			return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
+		}
+	} else if !found {
+		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
+	}
 
 	for key := range f.partitionMetadata {
 		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
 			delete(f.partitionMetadata, key)
 		}
 	}
-
-	tm := f.tm
-	f.mu.Unlock()
-
-	if tm != nil {
-		tm.DeleteTopic(payload.Topic)
-	}
+	delete(f.topicState, payload.Topic)
 	util.Info("FSM: Deleted topic '%s'", payload.Topic)
 
 	return nil
