@@ -55,6 +55,10 @@ type policyHandlerProvider interface {
 	GetHandlerWithPolicy(topic string, partitionID int, cleanupPolicy string, retentionHours int, retentionBytes int64) (types.StorageHandler, error)
 }
 
+type partitionHandlerCloser interface {
+	ClosePartitionHandler(topic string, partitionID int)
+}
+
 func getHandlerWithStoragePolicy(provider HandlerProvider, topic string, partitionID int, policy Policy) (types.StorageHandler, error) {
 	if policyProvider, ok := provider.(policyHandlerProvider); ok {
 		return policyProvider.GetHandlerWithPolicy(topic, partitionID, policy.CleanupPolicy, policy.RetentionHours, policy.RetentionBytes)
@@ -164,27 +168,100 @@ func (t *Topic) GetPartitionForMessage(msg types.Message) int {
 	return t.getPartitionIndex(msg, len(t.Partitions))
 }
 
-// AddPartitions extends the topic with new partitions.
-// Returns an error if any partition fails to initialize; partitions created
-// before the failure are kept.
+// AddPartitions atomically extends the topic with new partitions.
+// A staging failure closes every newly prepared partition and leaves the
+// visible partition count unchanged.
 func (t *Topic) AddPartitions(extra int, hp HandlerProvider) error {
+	if extra < 0 {
+		return fmt.Errorf("partition increment must be >= 0")
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.applyDefinitionLocked(len(t.Partitions)+extra, t.Policy, hp, nil)
+}
 
-	for i := 0; i < extra; i++ {
-		idx := len(t.Partitions)
-		dh, err := getHandlerWithStoragePolicy(hp, t.Name, idx, t.Policy)
+// Definition returns a detached durable definition for the topic.
+func (t *Topic) Definition() Definition {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.definitionLocked()
+}
+
+func (t *Topic) definitionLocked() Definition {
+	policy := t.Policy
+	policy.ReadACL = append([]string(nil), policy.ReadACL...)
+	policy.WriteACL = append([]string(nil), policy.WriteACL...)
+	return Definition{
+		Name:          t.Name,
+		Partitions:    len(t.Partitions),
+		Idempotent:    t.IsIdempotent,
+		EventSourcing: t.IsEventSourcing,
+		Policy:        policy,
+	}
+}
+
+// applyDefinition stages new partitions and commits durable metadata before
+// exposing the new policy or partition count to publishers.
+func (t *Topic) applyDefinition(partitionCount int, policy Policy, hp HandlerProvider, persist func(Definition) error) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.applyDefinitionLocked(partitionCount, policy, hp, persist)
+}
+
+func (t *Topic) applyDefinitionLocked(partitionCount int, policy Policy, hp HandlerProvider, persist func(Definition) error) error {
+	current := len(t.Partitions)
+	if partitionCount < current {
+		return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", t.Name, current, partitionCount)
+	}
+
+	staged := make([]*Partition, 0, partitionCount-current)
+	for idx := current; idx < partitionCount; idx++ {
+		dh, err := getHandlerWithStoragePolicy(hp, t.Name, idx, policy)
 		if err != nil {
+			closePreparedPartitions(t.Name, hp, staged)
 			return fmt.Errorf("failed to attach partition %d for topic '%s': %w", idx, t.Name, err)
 		}
-		newP := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
-		newP.SetTransactionDecisionResolver(t.txnResolver)
-		newP.isIdempotent = t.IsIdempotent
-		newP.RecoverProducerStateFromLog()
-		newP.StartProducerStateMaintenance()
-		t.Partitions = append(t.Partitions, newP)
+		partition := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
+		partition.SetTransactionDecisionResolver(t.txnResolver)
+		partition.isIdempotent = t.IsIdempotent
+		partition.RecoverProducerStateFromLog()
+		partition.StartProducerStateMaintenance()
+		staged = append(staged, partition)
 	}
+
+	definition := t.definitionLocked()
+	definition.Partitions = partitionCount
+	definition.Policy = policy
+	if persist != nil {
+		if err := persist(definition); err != nil {
+			closePreparedPartitions(t.Name, hp, staged)
+			return err
+		}
+	}
+
+	for _, partition := range t.Partitions {
+		applyStoragePolicy(partition.dh, policy)
+	}
+	t.Policy = policy
+	t.Partitions = append(t.Partitions, staged...)
 	return nil
+}
+
+func closePreparedPartitions(topicName string, provider HandlerProvider, partitions []*Partition) {
+	for _, partition := range partitions {
+		partition.Close()
+	}
+	if closer, ok := provider.(partitionHandlerCloser); ok {
+		for _, partition := range partitions {
+			closer.ClosePartitionHandler(topicName, partition.ID())
+		}
+		return
+	}
+	for _, partition := range partitions {
+		if err := partition.dh.Close(); err != nil {
+			util.Warn("Failed to close staged storage handler for %s[%d]: %v", topicName, partition.ID(), err)
+		}
+	}
 }
 
 func (t *Topic) ApplyPolicy(policy Policy) {

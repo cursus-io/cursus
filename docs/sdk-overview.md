@@ -148,7 +148,7 @@ err := producer.CreateTopicWithOptions("player-state", sdk.TopicOptions{
 })
 ```
 
-The SDK canonicalizes `compact,delete` to `delete,compact` and rejects unsafe command values, negative retention, or unknown policy enums before opening the command connection. Compact policies require a standalone, non-event-sourcing topic. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
+The SDK canonicalizes `compact,delete` to `delete,compact` and validates the portable topic-name contract and rejects unsafe command values, negative retention, or unknown policy enums before opening a broker connection. Compact policies require a standalone, non-event-sourcing topic. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
 
 ## Go Transactional Producer
 

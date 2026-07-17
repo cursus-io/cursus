@@ -44,6 +44,10 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 		return "ERROR: missing_topic expected=\"CREATE topic=<name> [partitions=<N>]\""
 	}
 
+	if err := topic.ValidateName(topicName); err != nil {
+		return fmt.Sprintf("ERROR: invalid_topic_name topic=%q reason=%q", topicName, err.Error())
+	}
+
 	partitions := 4 // default
 	if partStr, ok := args["partitions"]; ok {
 		n, err := strconv.Atoi(partStr)
@@ -187,37 +191,43 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 		return "ERROR: missing_topic expected=\"DELETE topic=<name>\""
 	}
 
+	if err := topic.ValidateName(topicName); err != nil {
+		return fmt.Sprintf("ERROR: invalid_topic_name topic=%q reason=%q", topicName, err.Error())
+	}
+
 	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
 			return resp
 		}
 
-		if ch.ESHandler != nil {
-			if err := ch.ESHandler.DeleteTopic(topicName); err != nil {
-				util.Warn("Failed to close event sourcing metadata for deleted topic %s: %v", topicName, err)
-			}
-		}
-
 		payload := map[string]interface{}{
 			"topic": topicName,
 		}
-
-		_, err := ch.applyAndWait("TOPIC_DELETE", payload)
-		if err != nil {
+		if _, err := ch.applyAndWait("TOPIC_DELETE", payload); err != nil {
 			return fmt.Sprintf("ERROR: delete_topic_failed reason=%q", err.Error())
 		}
+		ch.closeEventSourcingTopic(topicName)
 		return fmt.Sprintf("OK topic=%s deleted=true", topicName)
 	}
 
-	if ch.ESHandler != nil {
-		if err := ch.ESHandler.DeleteTopic(topicName); err != nil {
-			util.Warn("Failed to close event sourcing metadata for deleted topic %s: %v", topicName, err)
-		}
+	deleted, err := ch.TopicManager.DeleteTopicDurable(topicName)
+	if err != nil {
+		return fmt.Sprintf("ERROR: delete_topic_failed topic=%s reason=%q", topicName, err.Error())
 	}
-	if ch.TopicManager.DeleteTopic(topicName) {
-		return fmt.Sprintf("OK topic=%s deleted=true", topicName)
+	if !deleted {
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	ch.closeEventSourcingTopic(topicName)
+	return fmt.Sprintf("OK topic=%s deleted=true", topicName)
+}
+
+func (ch *CommandHandler) closeEventSourcingTopic(topicName string) {
+	if ch.ESHandler == nil {
+		return
+	}
+	if err := ch.ESHandler.DeleteTopic(topicName); err != nil {
+		util.Warn("Failed to close event sourcing metadata for deleted topic %s: %v", topicName, err)
+	}
 }
 
 // handleList processes LIST command

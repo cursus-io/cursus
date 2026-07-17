@@ -152,8 +152,8 @@ func (c *ConsumerClient) ConnectWithFailover() (net.Conn, string, error) {
 
 // ListOffsets queries the broker for retained and readable offsets on a topic.
 func (c *ConsumerClient) ListOffsets(topic string, partition ...int) ([]PartitionOffsetRange, error) {
-	if topic == "" {
-		return nil, fmt.Errorf("topic is required")
+	if err := validateSDKTopicName(topic); err != nil {
+		return nil, err
 	}
 	if len(partition) > 1 {
 		return nil, fmt.Errorf("at most one partition can be requested")

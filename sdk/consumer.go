@@ -98,6 +98,9 @@ func (c *Consumer) Done() <-chan struct{} {
 
 // Start joins the consumer group, begins consuming, and blocks until Close is called.
 func (c *Consumer) Start(handler func(Message) error) error {
+	if err := validateSDKTopicName(c.config.Topic); err != nil {
+		return err
+	}
 	c.MessageHandler = handler
 
 	if coordAddr, err := c.findCoordinator(); err == nil {

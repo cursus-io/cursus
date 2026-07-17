@@ -32,6 +32,7 @@ type TopicManager struct {
 	StreamManager StreamManager
 	coordinator   *coordinator.Coordinator
 	txnResolver   TransactionDecisionResolver
+	metadataStore *topicMetadataStore
 }
 
 // HandlerProvider defines an interface to provide disk handlers.
@@ -68,6 +69,7 @@ func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *
 		hp:            hp,
 		cfg:           cfg,
 		StreamManager: sm,
+		metadataStore: newTopicMetadataStore(cfg, hp),
 	}
 	return tm
 }
@@ -81,11 +83,17 @@ func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent 
 }
 
 func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, idempotent bool, eventSourcing bool, policy Policy) error {
-	normalizedPolicy, err := policy.Normalize()
+	definition, err := (Definition{
+		Name:          name,
+		Partitions:    partitionCount,
+		Idempotent:    idempotent,
+		EventSourcing: eventSourcing,
+		Policy:        policy,
+	}).Normalize()
 	if err != nil {
 		return err
 	}
-	if err := validateCleanupPolicyForTopic(normalizedPolicy, tm.cfg, eventSourcing); err != nil {
+	if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, eventSourcing); err != nil {
 		return err
 	}
 
@@ -93,38 +101,49 @@ func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, i
 	defer tm.mu.Unlock()
 
 	if existing, ok := tm.topics[name]; ok {
-		if err := validateCleanupPolicyForTopic(normalizedPolicy, tm.cfg, existing.IsEventSourcing); err != nil {
+		current := existing.Definition()
+		definition.Idempotent = current.Idempotent
+		definition.EventSourcing = current.EventSourcing
+		if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, current.EventSourcing); err != nil {
 			return err
 		}
-		current := len(existing.Partitions)
-		switch {
-		case partitionCount < current:
-			util.Error("cannot decrease partitions for topic '%s' (%d -> %d)", name, current, partitionCount)
-			return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", name, current, partitionCount)
-		case partitionCount > current:
-			existing.ApplyPolicy(normalizedPolicy)
-			if err := existing.AddPartitions(partitionCount-current, tm.hp); err != nil {
-				return fmt.Errorf("failed to add partitions to topic '%s': %w", name, err)
-			}
-			util.Info("topic '%s' partitions increased: %d -> %d", name, current, len(existing.Partitions))
-			return nil
-		default:
-			existing.ApplyPolicy(normalizedPolicy)
-			util.Info("topic '%s' already exists with %d partitions", name, current)
-			return nil
+		if partitionCount < current.Partitions {
+			util.Error("cannot decrease partitions for topic '%s' (%d -> %d)", name, current.Partitions, partitionCount)
+			return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", name, current.Partitions, partitionCount)
 		}
+		if err := existing.applyDefinition(partitionCount, definition.Policy, tm.hp, tm.persistDefinitionLocked); err != nil {
+			return fmt.Errorf("update topic '%s': %w", name, err)
+		}
+		if partitionCount > current.Partitions {
+			util.Info("topic '%s' partitions increased: %d -> %d", name, current.Partitions, partitionCount)
+		} else {
+			util.Info("topic '%s' already exists with %d partitions", name, current.Partitions)
+		}
+		return nil
 	}
 
-	t, err := NewTopicWithPolicy(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager, idempotent, eventSourcing, normalizedPolicy)
+	created, err := NewTopicWithPolicy(
+		name,
+		partitionCount,
+		tm.hp,
+		tm.cfg,
+		tm.StreamManager,
+		idempotent,
+		eventSourcing,
+		definition.Policy,
+	)
 	if err != nil {
 		util.Error("failed to create topic '%s': %v", name, err)
 		return fmt.Errorf("failed to create topic '%s': %w", name, err)
 	}
-	t.SetTransactionDecisionResolver(tm.txnResolver)
-	tm.topics[name] = t
+	created.SetTransactionDecisionResolver(tm.txnResolver)
+	if err := tm.persistDefinitionLocked(definition); err != nil {
+		closePartiallyInitializedTopic(name, tm.hp, created.Partitions)
+		return err
+	}
+	tm.topics[name] = created
 	return nil
 }
-
 func (tm *TopicManager) GetTopic(name string) *Topic {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
@@ -377,22 +396,52 @@ func (tm *TopicManager) Stop() {
 }
 
 func (tm *TopicManager) DeleteTopic(name string) bool {
+	deleted, err := tm.DeleteTopicDurable(name)
+	if err != nil {
+		util.Warn("Failed to durably delete topic %s: %v", name, err)
+		return false
+	}
+	return deleted
+}
+
+// DeleteTopicDurable commits the metadata deletion before removing local data.
+func (tm *TopicManager) DeleteTopicDurable(name string) (bool, error) {
+	if err := ValidateName(name); err != nil {
+		return false, fmt.Errorf("invalid topic name: %w", err)
+	}
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	if _, ok := tm.topics[name]; !ok {
-		return false
+
+	current := tm.topics[name]
+	if current == nil {
+		return false, nil
+	}
+	if err := tm.persistRemovalLocked(name); err != nil {
+		return false, err
 	}
 
 	delete(tm.topics, name)
+	for _, partition := range current.Partitions {
+		partition.Close()
+	}
 	if closer, ok := tm.hp.(topicHandlerCloser); ok {
 		closer.CloseTopicHandlers(name)
+	} else {
+		for _, partition := range current.Partitions {
+			if err := partition.dh.Close(); err != nil {
+				util.Warn("Failed to close storage handler for deleted topic %s[%d]: %v", name, partition.ID(), err)
+			}
+		}
 	}
 	if err := tm.deleteTopicLogDirLocked(name); err != nil {
-		util.Warn("Failed to delete topic log directory for %s: %v", name, err)
+		// The durable definition removal is already committed. Keep the command
+		// result aligned with the logical state and leave physical cleanup for an
+		// operator or a later retry instead of reporting a false rollback.
+		util.Warn("Failed to clean log directory for deleted topic %s: %v", name, err)
 	}
-	return true
+	return true, nil
 }
-
 func (tm *TopicManager) deleteTopicLogDirLocked(name string) error {
 	if tm.cfg == nil || strings.TrimSpace(tm.cfg.LogDir) == "" {
 		return nil

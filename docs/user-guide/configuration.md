@@ -114,7 +114,9 @@ The configuration is represented by the Config struct in the codebase, which org
 | `enable_benchmark`   | bool       | false          | Enable benchmark mode for testing               |
 | `cleanup_interval`   | int        | 300            | Log cleanup interval (seconds)                 |
 
-In standalone mode, `log_dir` also contains `__transaction_state.journal`. The broker fsyncs this append-only coordinator journal before acknowledging transaction state transitions and repairs only a torn or checksum-corrupt final record during startup. One encoded snapshot record is limited to 32 MiB, so transaction batches must remain bounded. Include the journal in backup and restore procedures.
+In standalone mode, `log_dir` also contains `__topic_metadata.json` and `__transaction_state.journal`. The versioned topic manifest is atomically replaced before create/update success exposes a new topic definition and is loaded before coordinator/static-group initialization. Invalid or unsupported manifest content fails startup; the broker does not fall back to guessed ACL, event-sourcing, retention, or cleanup settings. Brokers upgraded from an older release write definitions as applications reissue their idempotent `CREATE` declarations.
+
+The broker fsyncs the append-only transaction coordinator journal before acknowledging transaction state transitions and repairs only a torn or checksum-corrupt final record during startup. One encoded snapshot record is limited to 32 MiB, so transaction batches must remain bounded. Include the topic manifest, journal, consumer offset log, and partition directories in one backup and restore procedure.
 
 The health and metrics listeners are unauthenticated operations endpoints. Restrict both ports to a trusted network. `/live` reports process liveness, while `/ready` and the compatible `/health` endpoint include storage and distributed leader checks. See [Broker Observability](../reference/observability.md).
 

@@ -68,6 +68,10 @@ func NewEventStore(addr, topic, producerID string) *EventStore {
 
 // getConn returns an existing or new TCP connection.
 func (es *EventStore) getConn() (net.Conn, error) {
+	if err := validateSDKTopicName(es.topic); err != nil {
+		return nil, err
+	}
+
 	es.mu.Lock()
 	if es.conn != nil {
 		c := es.conn

@@ -51,6 +51,9 @@ func main() {
 	}
 
 	tm := topic.NewTopicManager(cfg, dm, smAdapter)
+	if err := tm.RestoreTopics(); err != nil {
+		util.Fatal("❌ Failed to restore durable topic metadata: %v", err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	cd := coordinator.NewCoordinator(ctx, cfg, tm)

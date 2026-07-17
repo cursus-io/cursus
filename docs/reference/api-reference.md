@@ -73,6 +73,7 @@ Common errors:
 
 ```text
 ERROR: missing_topic expected="CREATE topic=<name> [partitions=<N>]"
+ERROR: invalid_topic_name topic=<name> reason="..."
 ERROR: invalid_partitions reason="must be a positive integer"
 ERROR: invalid_replication_factor reason="must be a positive integer"
 ERROR: invalid_topic_policy field=cleanup_policy reason="..."
@@ -96,6 +97,7 @@ Common errors:
 
 ```text
 ERROR: missing_topic expected="DELETE topic=<name>"
+ERROR: invalid_topic_name topic=<name> reason="..."
 ERROR: topic_not_found topic=<name>
 ERROR: delete_topic_failed reason="..."
 ```
@@ -158,7 +160,7 @@ Because `message=` captures the rest of the line, put optional parameters before
 
 Transaction metadata fields are not accepted on client `PUBLISH`; use the transaction commands for transactional records. Direct `transactional_id`, `transaction_state`, or `transaction_marker` injection returns `ERROR: transaction_metadata_forbidden command=PUBLISH`.
 
-For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Producer epochs entered FSM snapshot version 3; current brokers write version 5 with transaction state and committed partition watermarks. Avoid mixed-version rolling upgrades with binaries that cannot decode version 5. For `acks=0`, success is:
+For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Producer epochs entered FSM snapshot version 3; current brokers write version 6 with transaction state, committed partition watermarks, and durable topic definitions. Avoid mixed-version rolling upgrades with binaries that cannot decode version 6. For `acks=0`, success is:
 
 ```text
 OK

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/util"
 )
@@ -37,8 +38,43 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		util.Error("FSM: Failed to unmarshal topic command: %v", err)
 		return err
 	}
+	definition, err := (topic.Definition{
+		Name:          topicCmd.Name,
+		Partitions:    topicCmd.Partitions,
+		Idempotent:    topicCmd.Idempotent,
+		EventSourcing: topicCmd.EventSourcing,
+		Policy:        topicCmd.Policy,
+	}).Normalize()
+	if err != nil {
+		return fmt.Errorf("invalid topic definition: %w", err)
+	}
+	if config.HasCleanupPolicy(definition.Policy.CleanupPolicy, config.CleanupPolicyCompact) {
+		return fmt.Errorf("cleanup policy compact is not supported in distributed mode")
+	}
+	topicCmd.Name = definition.Name
+	topicCmd.Partitions = definition.Partitions
+	topicCmd.Idempotent = definition.Idempotent
+	topicCmd.EventSourcing = definition.EventSourcing
+	topicCmd.Policy = definition.Policy
 
 	f.mu.Lock()
+	if f.topicState == nil {
+		f.topicState = make(map[string]*topic.Definition)
+	}
+	currentPartitions := 0
+	currentTopic := f.topicState[topicCmd.Name]
+	if currentTopic == nil {
+		currentTopic = legacyTopicState(f.partitionMetadata)[topicCmd.Name]
+	}
+	if currentTopic != nil {
+		if topicCmd.Partitions < currentTopic.Partitions {
+			f.mu.Unlock()
+			return fmt.Errorf("cannot decrease partition count for topic %q: %d -> %d", topicCmd.Name, currentTopic.Partitions, topicCmd.Partitions)
+		}
+		currentPartitions = currentTopic.Partitions
+		topicCmd.Idempotent = currentTopic.Idempotent
+		topicCmd.EventSourcing = currentTopic.EventSourcing
+	}
 
 	var brokers []string
 	for id, info := range f.brokers {
@@ -83,11 +119,24 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		util.Warn("FSM: Requested RF %d exceeds active brokers %d. Capping to %d", replicationFactor, len(brokers), len(brokers))
 		replicationFactor = len(brokers)
 	}
+	topicCmd.ReplicationFactor = replicationFactor
 
 	ring := util.NewConsistentHashRing(150, nil)
 	ring.Add(brokers...)
 
-	for i := 0; i < topicCmd.Partitions; i++ {
+	for i := 0; i < currentPartitions; i++ {
+		key := topicCmd.Name + "-" + strconv.Itoa(i)
+		if f.partitionMetadata[key] == nil {
+			f.mu.Unlock()
+			return fmt.Errorf("topic %q is missing partition metadata %d", topicCmd.Name, i)
+		}
+	}
+	for i := 0; i < currentPartitions; i++ {
+		key := topicCmd.Name + "-" + strconv.Itoa(i)
+		f.partitionMetadata[key].PartitionCount = topicCmd.Partitions
+	}
+
+	for i := currentPartitions; i < topicCmd.Partitions; i++ {
 		key := topicCmd.Name + "-" + strconv.Itoa(i)
 
 		assignedLeader := topicCmd.LeaderID
@@ -128,12 +177,16 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		util.Info("FSM: Assigned leader %s to partition %s (replicas=%v)", assignedLeader, key, replicas)
 	}
 
+	definition.Idempotent = topicCmd.Idempotent
+	definition.EventSourcing = topicCmd.EventSourcing
+	f.topicState[topicCmd.Name] = copyTopicDefinition(&definition)
 	tm := f.tm
 	f.mu.Unlock()
 
 	if tm != nil {
 		if err := tm.CreateTopicWithPolicy(topicCmd.Name, topicCmd.Partitions, topicCmd.Idempotent, topicCmd.EventSourcing, topicCmd.Policy); err != nil {
 			util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicCmd.Name, err)
+			return err
 		}
 	}
 	util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, topicCmd.Partitions)
@@ -157,6 +210,7 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 			delete(f.partitionMetadata, key)
 		}
 	}
+	delete(f.topicState, payload.Topic)
 
 	tm := f.tm
 	f.mu.Unlock()
