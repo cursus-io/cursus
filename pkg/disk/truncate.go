@@ -90,16 +90,16 @@ func (d *DiskHandler) TruncateTo(nextOffset uint64) error {
 			kept = append(kept, base)
 			continue
 		}
-		if err := cleanupCompactionMarkersForLog(d.GetSegmentPath(base), -1); err != nil {
-			return fmt.Errorf("remove truncated compaction marker %d: %w", base, err)
-		}
-		d.forgetCompactedSegment(base)
 		if err := os.Remove(d.GetSegmentPath(base)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove truncated segment %d: %w", base, err)
 		}
 		if err := os.Remove(d.GetIndexPath(base)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove truncated index %d: %w", base, err)
 		}
+		if err := cleanupCompactionMarkersForLog(d.GetSegmentPath(base), -1); err != nil {
+			return fmt.Errorf("remove truncated compaction marker %d: %w", base, err)
+		}
+		d.forgetCompactedSegment(base)
 	}
 
 	// The target index is rebuilt lazily from offset zero within the retained segment.

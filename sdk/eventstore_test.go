@@ -181,12 +181,12 @@ func TestParseStreamVersionResponse_StrictContract(t *testing.T) {
 func TestEventStoreCreateTopicDeclaresDeleteCleanupPolicy(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()
-	defer func() { _ = server.Close() }()
 
 	store := NewEventStore("unused", "orders", "producer-1")
 	store.conn = client
 	done := make(chan error, 1)
 	go func() {
+		defer func() { _ = server.Close() }()
 		data, err := ReadWithLength(server)
 		if err != nil {
 			done <- err

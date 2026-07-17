@@ -452,3 +452,35 @@ func TestDiskManagerPolicyCanReturnToBrokerRetentionDefaults(t *testing.T) {
 	require.Equal(t, cfg.RetentionBytes, bytes)
 	require.Equal(t, config.CleanupPolicyDelete, handler.CleanupPolicy())
 }
+
+func TestStoragePolicyUpdateWaitsForMaintenance(t *testing.T) {
+	cfg := compactionTestConfig(t)
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, handler.Close()) }()
+
+	handler.maintenanceMu.Lock()
+	updated := make(chan struct{})
+	go func() {
+		handler.SetStoragePolicy(config.CleanupPolicyDelete, 24, 1024)
+		close(updated)
+	}()
+
+	select {
+	case <-updated:
+		handler.maintenanceMu.Unlock()
+		t.Fatal("storage policy update completed during active maintenance")
+	case <-time.After(50 * time.Millisecond):
+	}
+	handler.maintenanceMu.Unlock()
+
+	select {
+	case <-updated:
+	case <-time.After(time.Second):
+		t.Fatal("storage policy update did not complete after maintenance")
+	}
+	require.Equal(t, config.CleanupPolicyDelete, handler.CleanupPolicy())
+	hours, bytes := handler.RetentionPolicy()
+	require.Equal(t, 24, hours)
+	require.Equal(t, int64(1024), bytes)
+}

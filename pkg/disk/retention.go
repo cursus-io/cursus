@@ -57,6 +57,9 @@ func (d *DiskHandler) OpenForRead(offset uint64) (*ReadSession, error) {
 
 // SetRetentionPolicy applies topic-level limits. Zero means inherit the broker default.
 func (d *DiskHandler) SetRetentionPolicy(hours int, bytes int64) {
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+
 	d.retentionMu.Lock()
 	defer d.retentionMu.Unlock()
 
@@ -76,6 +79,9 @@ func (d *DiskHandler) SetCleanupPolicy(policy string) {
 	if !ok {
 		normalized = config.CleanupPolicyDelete
 	}
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+
 	d.retentionMu.Lock()
 	d.cleanupPolicy = normalized
 	d.retentionMu.Unlock()
@@ -87,6 +93,9 @@ func (d *DiskHandler) SetStoragePolicy(cleanupPolicy string, hours int, bytes in
 	if !ok {
 		normalized = config.CleanupPolicyDelete
 	}
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+
 	d.retentionMu.Lock()
 	defer d.retentionMu.Unlock()
 	if hours == 0 {
@@ -128,11 +137,11 @@ func (d *DiskHandler) effectiveRetention(cfg *config.Config) retentionLimits {
 }
 
 func (d *DiskHandler) EnforceRetention(cfg *config.Config) {
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
 	if !config.HasCleanupPolicy(d.CleanupPolicy(), config.CleanupPolicyDelete) {
 		return
 	}
-	d.maintenanceMu.Lock()
-	defer d.maintenanceMu.Unlock()
 	if atomic.LoadInt32(&d.activeReaders) > 0 {
 		util.Debug("Retention skipped: %d active readers", atomic.LoadInt32(&d.activeReaders))
 		return

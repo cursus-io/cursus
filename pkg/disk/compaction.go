@@ -40,16 +40,16 @@ type compactionFrame struct {
 // EnforceCompaction rewrites eligible closed segments for compacted topics.
 func (d *DiskHandler) EnforceCompaction() (CompactionResult, error) {
 	var result CompactionResult
-	if !config.HasCleanupPolicy(d.CleanupPolicy(), config.CleanupPolicyCompact) {
-		result.SkippedReason = "policy_disabled"
-		return result, nil
-	}
 	if d.distributed {
 		return result, fmt.Errorf("log compaction is not supported in distributed mode")
 	}
 
 	d.maintenanceMu.Lock()
 	defer d.maintenanceMu.Unlock()
+	if !config.HasCleanupPolicy(d.CleanupPolicy(), config.CleanupPolicyCompact) {
+		result.SkippedReason = "policy_disabled"
+		return result, nil
+	}
 	if atomic.LoadInt32(&d.activeReaders) > 0 {
 		result.SkippedReason = "active_readers"
 		return result, nil

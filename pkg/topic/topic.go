@@ -102,6 +102,7 @@ func NewTopicWithPolicy(name string, partitionCount int, hp HandlerProvider, cfg
 	for i := 0; i < partitionCount; i++ {
 		dh, err := getHandlerWithStoragePolicy(hp, name, i, normalizedPolicy)
 		if err != nil {
+			closePartiallyInitializedTopic(name, hp, partitions[:i])
 			return nil, fmt.Errorf("open handler for %s[%d]: %w", name, i, err)
 		}
 		p := NewPartition(i, name, dh, sm, cfg)
@@ -120,6 +121,21 @@ func NewTopicWithPolicy(name string, partitionCount int, hp HandlerProvider, cfg
 		IsEventSourcing: eventSourcing,
 		Policy:          normalizedPolicy,
 	}, nil
+}
+
+func closePartiallyInitializedTopic(name string, provider HandlerProvider, partitions []*Partition) {
+	for _, partition := range partitions {
+		partition.Close()
+	}
+	if closer, ok := provider.(topicHandlerCloser); ok {
+		closer.CloseTopicHandlers(name)
+		return
+	}
+	for _, partition := range partitions {
+		if err := partition.dh.Close(); err != nil {
+			util.Warn("Failed to close storage handler for partially initialized topic %s[%d]: %v", name, partition.ID, err)
+		}
+	}
 }
 
 // getPartitionIndex computes the target partition index without acquiring any lock.
