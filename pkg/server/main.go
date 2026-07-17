@@ -331,6 +331,9 @@ func readMessage(conn net.Conn, compressionType string) ([]byte, error) {
 	}
 
 	msgLen := binary.BigEndian.Uint32(lenBuf)
+	if msgLen > util.MaxMessageSize {
+		return nil, fmt.Errorf("message size %d exceeds maximum %d", msgLen, util.MaxMessageSize)
+	}
 	msgBuf := make([]byte, msgLen)
 	if _, err := io.ReadFull(conn, msgBuf); err != nil {
 		if err != io.EOF {

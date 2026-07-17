@@ -324,6 +324,19 @@ func TestReadMessage_PartialBody(t *testing.T) {
 	_, err := readMessage(client, "none")
 	assert.Error(t, err)
 }
+func TestReadMessage_RejectsOversizedFrameBeforeReadingBody(t *testing.T) {
+	client, server := newTestConnPair(t)
+
+	go func() {
+		lenBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(lenBuf, uint32(util.MaxMessageSize+1))
+		_, _ = server.Write(lenBuf)
+	}()
+
+	_, err := readMessage(client, "none")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds maximum")
+}
 
 func TestReadMessage_WithGzipCompression(t *testing.T) {
 	client, server := newTestConnPair(t)
