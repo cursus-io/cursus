@@ -1142,7 +1142,11 @@ func syncParentDir(path string) {
 		util.Warn("failed to open HWM checkpoint directory %s: %v", path, err)
 		return
 	}
-	defer dir.Close()
+	defer func() {
+		if closeErr := dir.Close(); closeErr != nil {
+			util.Warn("failed to close HWM checkpoint directory %s: %v", path, closeErr)
+		}
+	}()
 	if err := dir.Sync(); err != nil {
 		util.Warn("failed to sync HWM checkpoint directory %s: %v", path, err)
 	}
