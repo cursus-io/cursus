@@ -39,19 +39,54 @@ func (t *Topic) SetTransactionDecisionResolver(resolver TransactionDecisionResol
 	}
 }
 
+type storagePolicySetter interface {
+	SetStoragePolicy(cleanupPolicy string, hours int, bytes int64)
+}
+
 type retentionPolicySetter interface {
 	SetRetentionPolicy(hours int, bytes int64)
 }
 
-func applyRetentionPolicy(handler types.StorageHandler, policy Policy) {
+type cleanupPolicySetter interface {
+	SetCleanupPolicy(policy string)
+}
+
+type policyHandlerProvider interface {
+	GetHandlerWithPolicy(topic string, partitionID int, cleanupPolicy string, retentionHours int, retentionBytes int64) (types.StorageHandler, error)
+}
+
+func getHandlerWithStoragePolicy(provider HandlerProvider, topic string, partitionID int, policy Policy) (types.StorageHandler, error) {
+	if policyProvider, ok := provider.(policyHandlerProvider); ok {
+		return policyProvider.GetHandlerWithPolicy(topic, partitionID, policy.CleanupPolicy, policy.RetentionHours, policy.RetentionBytes)
+	}
+	handler, err := provider.GetHandler(topic, partitionID)
+	if err != nil {
+		return nil, err
+	}
+	applyStoragePolicy(handler, policy)
+	return handler, nil
+}
+
+func applyStoragePolicy(handler types.StorageHandler, policy Policy) {
+	if setter, ok := handler.(storagePolicySetter); ok {
+		setter.SetStoragePolicy(policy.CleanupPolicy, policy.RetentionHours, policy.RetentionBytes)
+		return
+	}
 	if setter, ok := handler.(retentionPolicySetter); ok {
 		setter.SetRetentionPolicy(policy.RetentionHours, policy.RetentionBytes)
+	}
+	if setter, ok := handler.(cleanupPolicySetter); ok {
+		setter.SetCleanupPolicy(policy.CleanupPolicy)
 	}
 }
 
 // NewTopic initializes a topic with partitions.
 func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager, idempotent bool, eventSourcing bool) (*Topic, error) {
-	return NewTopicWithPolicy(name, partitionCount, hp, cfg, sm, idempotent, eventSourcing, DefaultPolicy())
+	policy := DefaultPolicy()
+	if cfg != nil && cfg.CleanupPolicy != "" {
+		policy.CleanupPolicy = cfg.CleanupPolicy
+	}
+	return NewTopicWithPolicy(name, partitionCount, hp, cfg, sm, idempotent, eventSourcing, policy)
 }
 
 func NewTopicWithPolicy(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager, idempotent bool, eventSourcing bool, policy Policy) (*Topic, error) {
@@ -59,14 +94,16 @@ func NewTopicWithPolicy(name string, partitionCount int, hp HandlerProvider, cfg
 	if err != nil {
 		return nil, err
 	}
+	if err := validateCleanupPolicyForTopic(normalizedPolicy, cfg, eventSourcing); err != nil {
+		return nil, err
+	}
 
 	partitions := make([]*Partition, partitionCount)
 	for i := 0; i < partitionCount; i++ {
-		dh, err := hp.GetHandler(name, i)
+		dh, err := getHandlerWithStoragePolicy(hp, name, i, normalizedPolicy)
 		if err != nil {
 			return nil, fmt.Errorf("open handler for %s[%d]: %w", name, i, err)
 		}
-		applyRetentionPolicy(dh, normalizedPolicy)
 		p := NewPartition(i, name, dh, sm, cfg)
 		p.isIdempotent = idempotent
 		p.RecoverProducerStateFromLog()
@@ -120,11 +157,10 @@ func (t *Topic) AddPartitions(extra int, hp HandlerProvider) error {
 
 	for i := 0; i < extra; i++ {
 		idx := len(t.Partitions)
-		dh, err := hp.GetHandler(t.Name, idx)
+		dh, err := getHandlerWithStoragePolicy(hp, t.Name, idx, t.Policy)
 		if err != nil {
 			return fmt.Errorf("failed to attach partition %d for topic '%s': %w", idx, t.Name, err)
 		}
-		applyRetentionPolicy(dh, t.Policy)
 		newP := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
 		newP.SetTransactionDecisionResolver(t.txnResolver)
 		newP.isIdempotent = t.IsIdempotent
@@ -141,7 +177,7 @@ func (t *Topic) ApplyPolicy(policy Policy) {
 
 	t.Policy = policy
 	for _, partition := range t.Partitions {
-		applyRetentionPolicy(partition.dh, policy)
+		applyStoragePolicy(partition.dh, policy)
 	}
 }
 

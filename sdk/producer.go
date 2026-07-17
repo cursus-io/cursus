@@ -191,7 +191,37 @@ func (p *Producer) nextPartition() int {
 	return idx
 }
 
+// TopicCleanupPolicy selects broker maintenance for a topic.
+type TopicCleanupPolicy string
+
+const (
+	TopicCleanupDelete        TopicCleanupPolicy = "delete"
+	TopicCleanupCompact       TopicCleanupPolicy = "compact"
+	TopicCleanupDeleteCompact TopicCleanupPolicy = "delete,compact"
+)
+
+// TopicOptions defines optional CREATE settings for a topic.
+type TopicOptions struct {
+	Partitions     int
+	CleanupPolicy  TopicCleanupPolicy
+	RetentionHours int
+	RetentionBytes int64
+	Partitioner    string
+	AuthPolicy     string
+	ReadACL        []string
+	WriteACL       []string
+}
+
 func (p *Producer) CreateTopic(topic string, partitions int) error {
+	return p.CreateTopicWithOptions(topic, TopicOptions{Partitions: partitions})
+}
+
+// CreateTopicWithOptions creates or updates a topic with explicit policy options.
+func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) error {
+	createCmd, err := buildCreateTopicCommand(topic, options, p.config.EnableIdempotence)
+	if err != nil {
+		return err
+	}
 	if len(p.config.BrokerAddrs) == 0 {
 		return fmt.Errorf("no broker addresses available")
 	}
@@ -208,7 +238,6 @@ func (p *Producer) CreateTopic(topic string, partitions int) error {
 	if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {
 		return fmt.Errorf("authentication: %w", err)
 	}
-	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, partitions, p.config.EnableIdempotence)
 	cmdBytes := EncodeMessage("admin", createCmd)
 
 	if err := WriteWithLength(conn, cmdBytes); err != nil {
@@ -228,8 +257,94 @@ func (p *Producer) CreateTopic(topic string, partitions int) error {
 		return fmt.Errorf("unexpected create response: %s", respStr)
 	}
 
-	LogInfo("create topic %s partition %d", topic, partitions)
+	LogInfo("create topic %s partition %d", topic, options.Partitions)
 	return nil
+}
+
+func buildCreateTopicCommand(topic string, options TopicOptions, idempotent bool) (string, error) {
+	if !isSafeTopicOptionValue(topic, false) {
+		return "", fmt.Errorf("invalid topic name %q", topic)
+	}
+	if options.Partitions <= 0 {
+		return "", fmt.Errorf("partitions must be positive")
+	}
+	if options.RetentionHours < 0 {
+		return "", fmt.Errorf("retention hours must be non-negative")
+	}
+	if options.RetentionBytes < 0 {
+		return "", fmt.Errorf("retention bytes must be non-negative")
+	}
+
+	cleanupPolicy, err := normalizeSDKCleanupPolicy(options.CleanupPolicy)
+	if err != nil {
+		return "", err
+	}
+	switch options.Partitioner {
+	case "", "hash_key", "round_robin":
+	default:
+		return "", fmt.Errorf("invalid partitioner %q", options.Partitioner)
+	}
+	switch options.AuthPolicy {
+	case "", "open", "deny_write", "deny_read", "acl":
+	default:
+		return "", fmt.Errorf("invalid auth policy %q", options.AuthPolicy)
+	}
+	for _, acl := range append(append([]string(nil), options.ReadACL...), options.WriteACL...) {
+		if !isSafeTopicOptionValue(acl, false) || strings.Contains(acl, ",") {
+			return "", fmt.Errorf("invalid ACL principal %q", acl)
+		}
+	}
+
+	command := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, options.Partitions, idempotent)
+	if cleanupPolicy != "" {
+		command += " cleanup_policy=" + cleanupPolicy
+	}
+	if options.RetentionHours != 0 {
+		command += fmt.Sprintf(" retention_hours=%d", options.RetentionHours)
+	}
+	if options.RetentionBytes != 0 {
+		command += fmt.Sprintf(" retention_bytes=%d", options.RetentionBytes)
+	}
+	if options.Partitioner != "" {
+		command += " partitioner=" + options.Partitioner
+	}
+	if options.AuthPolicy != "" {
+		command += " auth_policy=" + options.AuthPolicy
+	}
+	if len(options.ReadACL) > 0 {
+		command += " read_acl=" + strings.Join(options.ReadACL, ",")
+	}
+	if len(options.WriteACL) > 0 {
+		command += " write_acl=" + strings.Join(options.WriteACL, ",")
+	}
+	return command, nil
+}
+
+func normalizeSDKCleanupPolicy(value TopicCleanupPolicy) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(string(value))) {
+	case "":
+		return "", nil
+	case "delete":
+		return "delete", nil
+	case "compact":
+		return "compact", nil
+	case "delete,compact", "compact,delete":
+		return "delete,compact", nil
+	default:
+		return "", fmt.Errorf("invalid cleanup policy %q", value)
+	}
+}
+
+func isSafeTopicOptionValue(value string, allowEmpty bool) bool {
+	if value == "" {
+		return allowEmpty
+	}
+	for _, r := range value {
+		if r <= ' ' || r == '=' || r == '"' || r == '\\' {
+			return false
+		}
+	}
+	return true
 }
 
 // Send enqueues payload for delivery and returns the assigned sequence number.

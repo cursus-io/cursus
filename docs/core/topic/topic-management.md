@@ -26,7 +26,9 @@ It does not use a global payload-hash deduplication map. Retry safety comes from
 | exists | greater | append new partitions and update policy |
 | exists | lower | reject; partition count never shrinks |
 
-New and existing partitions receive the current transaction decision resolver so `read_committed` uses coordinator authority.
+New and existing partitions receive the current transaction decision resolver so `read_committed` uses coordinator authority. Retention and cleanup policy are propagated to every partition handler. An existing event-sourcing topic remains protected even if a later idempotent create request omits or clears `event_sourcing`.
+
+`cleanup_policy` accepts `delete`, `compact`, and `delete,compact`. Compact policies are rejected when distribution is enabled or the topic is event-sourcing. Standalone compaction details are in [Log Compaction](../storage/log-compaction.md).
 
 ## Delete
 
@@ -45,7 +47,7 @@ Distributed command handling routes to the partition leader and applies replicat
 
 ## Topic
 
-A `Topic` owns partition selection, its partition slice, policy, and embedded consumer groups. `hash_key` uses key hashing and falls back to round-robin for empty keys; `round_robin` ignores keys. Policy controls retention overrides, read/write authorization, replication metadata, idempotent mode, and event-sourcing mode.
+A `Topic` owns partition selection, its partition slice, policy, and embedded consumer groups. `hash_key` uses key hashing and falls back to round-robin for empty keys; `round_robin` ignores keys. Policy controls cleanup/retention overrides and read/write authorization. Replication, idempotent mode, and event-sourcing mode are separate topic metadata.
 
 ## Partition
 

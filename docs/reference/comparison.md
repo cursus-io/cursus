@@ -7,7 +7,7 @@ Cursus is a Cursus-native partitioned-log broker. Its goal is to provide durable
 | Area | Cursus today | Contract boundary |
 |---|---|---|
 | Deployment | Single Go binary; standalone or Raft-backed cluster | Cluster operation still requires deliberate storage, certificate, and quorum management. |
-| Storage | Append-only segments, offset index, mmap reads, configurable rolling, time/size deletion, corruption recovery | Log compaction and a general timestamp index are not implemented. |
+| Storage | Append-only segments, sparse offset index, mmap reads, configurable rolling, time/size deletion, standalone keyed compaction, corruption recovery | Compacted-segment replication and a general timestamp index are not implemented. |
 | Ordering | Stable order within one partition | No cross-partition total order. |
 | Consumer groups | Dynamic membership, generation/owner fencing, monotonic durable offsets, restart resume | Assignment strategy is intentionally simpler than mature multi-assignor ecosystems. |
 | Replication | Partition leaders, ISR/quorum checks, high-watermark recovery, follower catch-up | Long-running fault injection across every topology remains an ongoing validation area. |
@@ -30,7 +30,7 @@ Cursus is a Cursus-native partitioned-log broker. Its goal is to provide durable
 
 Cursus is a strong fit when a team wants a partitioned durable log, consumer-group resume, event streams, and transactional broker processing without operating a large runtime stack. It is especially useful for Go services, game backends, edge deployments, and focused event-processing systems where the compact text/binary protocol is an advantage.
 
-A more mature or specialized platform may be a better fit when the deployment requires a very large connector ecosystem, multi-datacenter replication with established operational tooling, many assignment strategies, log compaction, tiered storage, or independently audited long-duration failure evidence today.
+A more mature or specialized platform may be a better fit when the deployment requires a very large connector ecosystem, multi-datacenter compacted-log replication, established multi-datacenter tooling, many assignment strategies, tiered storage, or independently audited long-duration failure evidence today.
 
 ## Evaluation Rule
 

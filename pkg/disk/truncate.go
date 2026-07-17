@@ -18,6 +18,9 @@ import (
 func (d *DiskHandler) TruncateTo(nextOffset uint64) error {
 	d.Flush()
 
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.ioMu.Lock()
@@ -46,6 +49,13 @@ func (d *DiskHandler) TruncateTo(nextOffset uint64) error {
 		targetBase = base
 	}
 	targetPath := d.GetSegmentPath(targetBase)
+	targetInfo, err := os.Stat(targetPath)
+	if err != nil {
+		return fmt.Errorf("stat truncate target segment %d: %w", targetBase, err)
+	}
+	if d.segmentAllowsOffsetGaps(targetBase, targetInfo.Size()) {
+		return fmt.Errorf("cannot truncate compacted segment %d", targetBase)
+	}
 	position, err := findTruncatePosition(targetPath, nextOffset)
 	if err != nil {
 		return err
@@ -80,6 +90,10 @@ func (d *DiskHandler) TruncateTo(nextOffset uint64) error {
 			kept = append(kept, base)
 			continue
 		}
+		if err := cleanupCompactionMarkersForLog(d.GetSegmentPath(base), -1); err != nil {
+			return fmt.Errorf("remove truncated compaction marker %d: %w", base, err)
+		}
+		d.forgetCompactedSegment(base)
 		if err := os.Remove(d.GetSegmentPath(base)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove truncated segment %d: %w", base, err)
 		}

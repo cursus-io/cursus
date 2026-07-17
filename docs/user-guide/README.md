@@ -101,8 +101,9 @@ RUN_E2E_BENCHMARK=1 go test -v -timeout 30m ./test/e2e-benchmark/...
 - one broker transaction may commit offsets for one `(topic, group, member, generation)` scope,
 - initialize a new producer epoch before each new transaction; finalization retry keeps the old epoch,
 - ordering is per partition,
-- retention deletion can create offset gaps,
-- log compaction is not implemented.
+- retention deletion can move the earliest offset,
+- standalone keyed compaction creates physical holes without renumbering logical offsets,
+- compaction is rejected for distributed and event-sourcing topics.
 
 ## Next Steps
 

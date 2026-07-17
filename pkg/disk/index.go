@@ -333,11 +333,20 @@ func (d *DiskHandler) findOffsetPosition(offset uint64, segmentBase ...uint64) (
 }
 
 func (d *DiskHandler) findOffsetPositionInIndex(offset, base uint64) (uint64, error) {
-	mapper, err := mmap.Open(d.GetIndexPath(base))
+	indexPath := d.GetIndexPath(base)
+	info, err := os.Stat(indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
 		}
+		return 0, err
+	}
+	if info.Size() == 0 {
+		return 0, nil
+	}
+
+	mapper, err := mmap.Open(indexPath)
+	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = mapper.Close() }()

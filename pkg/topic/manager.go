@@ -73,7 +73,11 @@ func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *
 }
 
 func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent bool, eventSourcing bool) error {
-	return tm.CreateTopicWithPolicy(name, partitionCount, idempotent, eventSourcing, DefaultPolicy())
+	policy := DefaultPolicy()
+	if tm.cfg != nil && tm.cfg.CleanupPolicy != "" {
+		policy.CleanupPolicy = tm.cfg.CleanupPolicy
+	}
+	return tm.CreateTopicWithPolicy(name, partitionCount, idempotent, eventSourcing, policy)
 }
 
 func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, idempotent bool, eventSourcing bool, policy Policy) error {
@@ -81,21 +85,27 @@ func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, i
 	if err != nil {
 		return err
 	}
+	if err := validateCleanupPolicyForTopic(normalizedPolicy, tm.cfg, eventSourcing); err != nil {
+		return err
+	}
 
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	if existing, ok := tm.topics[name]; ok {
+		if err := validateCleanupPolicyForTopic(normalizedPolicy, tm.cfg, existing.IsEventSourcing); err != nil {
+			return err
+		}
 		current := len(existing.Partitions)
 		switch {
 		case partitionCount < current:
 			util.Error("cannot decrease partitions for topic '%s' (%d -> %d)", name, current, partitionCount)
 			return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", name, current, partitionCount)
 		case partitionCount > current:
+			existing.ApplyPolicy(normalizedPolicy)
 			if err := existing.AddPartitions(partitionCount-current, tm.hp); err != nil {
 				return fmt.Errorf("failed to add partitions to topic '%s': %w", name, err)
 			}
-			existing.ApplyPolicy(normalizedPolicy)
 			util.Info("topic '%s' partitions increased: %d -> %d", name, current, len(existing.Partitions))
 			return nil
 		default:

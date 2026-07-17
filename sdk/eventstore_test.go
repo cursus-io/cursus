@@ -2,10 +2,13 @@ package sdk
 
 import (
 	"encoding/json"
+	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -140,6 +143,7 @@ func TestAppendCommandFormat(t *testing.T) {
 	assert.Contains(t, cmd, "producerId=p-1")
 	assert.Contains(t, cmd, `message={"id":1}`)
 }
+
 func TestParseSnapshotResponse_StrictContract(t *testing.T) {
 	snapshotJSON, ok, err := parseSnapshotResponse(`OK snapshot={"version":1,"payload":"x"}`)
 	require.NoError(t, err)
@@ -172,4 +176,35 @@ func TestParseStreamVersionResponse_StrictContract(t *testing.T) {
 	_, err = parseStreamVersionResponse("OK")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing version")
+}
+
+func TestEventStoreCreateTopicDeclaresDeleteCleanupPolicy(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
+
+	store := NewEventStore("unused", "orders", "producer-1")
+	store.conn = client
+	done := make(chan error, 1)
+	go func() {
+		data, err := ReadWithLength(server)
+		if err != nil {
+			done <- err
+			return
+		}
+		_, command, err := util.DecodeMessage(data)
+		if err != nil {
+			done <- err
+			return
+		}
+		want := "CREATE topic=orders partitions=4 event_sourcing=true cleanup_policy=delete"
+		if command != want {
+			done <- fmt.Errorf("command = %q, want %q", command, want)
+			return
+		}
+		done <- WriteWithLength(server, []byte("OK topic=orders partitions=4 cleanup_policy=delete"))
+	}()
+
+	require.NoError(t, store.CreateTopic(4))
+	require.NoError(t, <-done)
 }

@@ -25,7 +25,7 @@ Rotation flushes and syncs the old data file, flushes/closes its index, resets b
 
 On open, the handler:
 
-1. removes completed deletion tombstones,
+1. removes completed deletion tombstones, abandoned `.compacting` files, and stale compaction sidecars,
 2. lists and sorts segment files,
 3. parses base offsets from filenames,
 4. scans and repairs the active tail,
@@ -36,13 +36,13 @@ Malformed filenames are skipped with an error log; an invalid active tail is tru
 
 ## Read Safety
 
-Reads copy the current ordered segment list and mmap each selected file. Active-reader accounting and the retention deletion lifecycle prevent a segment from disappearing while a read is using it. Sparse index entries map logical offsets to byte positions, after which the reader validates contiguous offsets.
+Reads copy the current ordered segment list and mmap each selected file. Active-reader accounting prevents retention or compaction from replacing a segment while a read is using it. Sparse index entries map logical offsets to byte positions and are validated against the log before use. Active and ordinary closed segments require contiguous offsets. A closed segment may contain physical holes only when its durable compaction sidecar matches the current log size.
 
-## Retention
+## Retention And Compaction
 
-Retention evaluates closed segments by age and total retained bytes. The active segment is never selected. Deletion is the only supported cleanup policy; log compaction is not implemented.
+Delete retention evaluates closed segments by age and total retained bytes. After deletion, `GetFirstOffset` exposes the new earliest base offset. A client requesting older data receives `OFFSET_OUT_OF_RANGE` and must follow its configured reset/error policy.
 
-After retention, `GetFirstOffset` exposes the new earliest base offset. A client requesting older data receives `OFFSET_OUT_OF_RANGE` and must follow its configured reset/error policy.
+Standalone compaction rewrites only closed segments and removes superseded keyed ordinary records. It preserves logical offsets, unkeyed records, transaction/control records, and the latest producer record. It does not move LEO/HWM or the logical segment base. The active segment is never rewritten. See [Log Compaction](log-compaction.md).
 
 ## Concurrency
 

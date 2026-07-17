@@ -56,7 +56,7 @@ uint64_be logicalOffset
 uint64_be bytePosition
 ```
 
-An entry is written after the configured byte interval (default 4096 bytes). Reads locate the segment and nearest indexed byte position, then scan and validate contiguous logical offsets. Segment data is opened through mmap for reads.
+An entry is written after the configured byte interval (default 4096 bytes). Reads locate the segment and nearest indexed byte position, validate that entry against the log, then scan records. Active segments require contiguous logical offsets. Compacted closed segments retain original offsets in strictly increasing order and may contain holes. Segment data is opened through mmap for reads.
 
 ## Write And Sync Contract
 
@@ -95,11 +95,13 @@ The encoded payload is limited to 32 MiB. Every accepted transition is appended 
 
 The journal is append-only and currently has no automatic compaction. Backups must keep it consistent with partition logs and the standalone consumer offset store.
 
-## Retention And Deletion
+## Retention And Compaction
 
-Time/size retention removes eligible closed segments through the retention loop. The active segment is preserved. `log_cleanup_policy=delete` is the only implemented cleanup policy; compaction is not implemented and unsupported values normalize to `delete`.
+`log_cleanup_policy` accepts `delete`, `compact`, or `delete,compact`. Time/size deletion removes complete eligible closed segments. Standalone compaction rewrites closed segments with same-directory `.compacting` files, fsyncs them, and atomically replaces the authoritative log followed by its rebuilt sparse index. Parent-directory metadata is synced where the platform supports it.
 
-Readers can hold references while retention runs. Deletion uses the storage lifecycle to avoid removing an actively read segment and returns `OFFSET_OUT_OF_RANGE` when a requested logical offset predates the earliest retained segment.
+The active segment is preserved by both operations. Active readers defer maintenance. A compacted closed log has a versioned `.log.compacted-<size>` sidecar; offset holes are accepted only when the sidecar is valid and its size matches the log. Backups must preserve the log, its matching sidecar, and its index as one generation. A stale sparse index after an interrupted replacement is correctness-safe because every candidate entry is validated and invalid entries fall back to a scan. Startup removes abandoned compaction temporary files and stale sidecars.
+
+Compaction preserves logical offsets and therefore permits holes only in closed segments. It is rejected for distributed and event-sourcing topics. The full selection and recovery contract is documented in [Log Compaction](log-compaction.md).
 
 ## Concurrency
 
@@ -121,3 +123,5 @@ Linux builds can apply sequential-access advice and zero-copy transfer where the
 | Linger | 50 ms |
 | File sync interval | 500 ms |
 | Cleanup policy | `delete` |
+| Compaction check interval | 300000 ms |
+| Minimum cleanable dirty ratio | 0.5 |

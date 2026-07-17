@@ -135,6 +135,21 @@ if errors.As(err, &brokerErr) {
 
 `BrokerError` exposes `Code`, `Class`, `Retryable`, `Fields`, and the raw response. It also remains compatible with existing Go SDK sentinels such as `ErrTopicNotFound`, `ErrInvalidPartition`, and `ErrNotLeader` through `errors.Is`.
 
+## Go Topic Policy
+
+`CreateTopic` remains the compatibility API and inherits broker policy defaults. Use `CreateTopicWithOptions` for an explicit cleanup contract:
+
+```go
+err := producer.CreateTopicWithOptions("player-state", sdk.TopicOptions{
+    Partitions:     12,
+    CleanupPolicy:  sdk.TopicCleanupCompact,
+    RetentionHours: 168,
+    Partitioner:    "hash_key",
+})
+```
+
+The SDK canonicalizes `compact,delete` to `delete,compact` and rejects unsafe command values, negative retention, or unknown policy enums before opening the command connection. Compact policies require a standalone, non-event-sourcing topic. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
+
 ## Go Transactional Producer
 
 The Go SDK exposes both the existing low-level transaction commands and a

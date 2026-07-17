@@ -22,6 +22,7 @@ const (
 	FeatureOffsetResumeV1       Feature = "offset_resume_v1"
 	FeatureStreamControlV1      Feature = "stream_control_v1"
 	FeatureStructuredErrorsV1   Feature = "structured_errors_v1"
+	FeatureTopicCompactionV1    Feature = "topic_compaction_v1"
 )
 
 var supportedFeatures = []Feature{
@@ -30,6 +31,7 @@ var supportedFeatures = []Feature{
 	FeatureOffsetResumeV1,
 	FeatureStreamControlV1,
 	FeatureStructuredErrorsV1,
+	FeatureTopicCompactionV1,
 }
 
 func SupportedFeatures() []Feature {

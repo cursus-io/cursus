@@ -7,7 +7,7 @@ Cursus stores every topic partition in an independent append-only segment log ma
 | Component | Responsibility |
 |---|---|
 | `DiskManager` | Handler registry keyed by topic/partition, shared configuration, close-all lifecycle, runtime storage metrics. |
-| `DiskHandler` | Offset allocation, buffered writes, segment/index files, mmap reads, recovery, sync callback, retention. |
+| `DiskHandler` | Offset allocation, buffered writes, segment/index files, mmap reads, recovery, sync callback, retention, and standalone compaction. |
 | `Partition` | HWM/LSO visibility, producer sequence state, transaction index, and broker-level read semantics. |
 
 The [disk format](disk-format.md) defines the record and sparse index bytes.
@@ -58,8 +58,8 @@ The old data file is flushed and synced, its index is flushed/closed, and the ne
 1. locates the segment containing the logical offset,
 2. uses the sparse `.index` file to choose a byte position,
 3. mmaps readable segments,
-4. validates record lengths and contiguous offsets,
-5. returns at most `max` decoded records.
+4. validates record lengths and offset order; active segments are contiguous while compacted closed segments may have holes,
+5. returns at most `max` decoded retained records.
 
 The raw storage read does not decide transaction visibility. `Partition.ReadCommitted` bounds records by HWM and LSO, hides control/aborted records, and requires matching partition and coordinator transaction decisions. `ReadMessages`/read-uncommitted callers receive raw committed-log content.
 
@@ -80,11 +80,13 @@ For the active segment, recovery scans length prefixes and serialized records. I
 
 After storage opens, higher layers rebuild producer sequence, event-stream, and transaction visibility indexes from durable state as needed. The consumer group coordinator restores offsets from the internal offset log. The transaction coordinator restores standalone state from `__transaction_state.journal` or distributed state from Raft metadata; neither coordinator infers its final decision from output record payloads alone.
 
-## Retention
+## Retention And Compaction
 
-The retention loop periodically evaluates closed segments against effective time and byte limits. Per-topic values override broker defaults. Deleted history changes the earliest readable offset; stale consumer reads receive `OFFSET_OUT_OF_RANGE` with earliest/latest boundaries.
+The maintenance loop evaluates delete retention and compaction on independent intervals. Per-topic retention and cleanup policy values override broker defaults.
 
-Only deletion cleanup is supported. Compaction settings are retained for configuration compatibility but do not activate compaction; `log_cleanup_policy` normalizes to `delete`.
+Delete retention removes complete closed segments and changes the earliest readable offset. Stale reads receive `OFFSET_OUT_OF_RANGE` with earliest/latest boundaries.
+
+Standalone compaction atomically rewrites eligible closed log/index files when the removable-byte ratio reaches the configured threshold. A durable size-bound sidecar distinguishes compacted holes from unmarked offset gaps in ordinary closed segments. Backups and restores must keep each compacted log, its matching sidecar, and its index together. Removed keyed records leave logical offset holes; reads continue at the first retained offset. Transaction/control records and the latest producer recovery record are protected. Distributed and event-sourcing topics reject compaction. See [Log Compaction](log-compaction.md).
 
 ## Shutdown
 
@@ -98,5 +100,6 @@ Only deletion cleanup is supported. Compaction settings are retained for configu
 | Lower latency | smaller batch/linger, shorter sync interval | More syscalls and lower aggregate throughput. |
 | Faster sparse seek | smaller index interval | Larger index files and more index writes. |
 | Shorter recovery | smaller segments/time roll | More files and metadata operations. |
+| More frequent compaction | shorter compaction interval or lower dirty ratio | More scans, rewrite I/O, and temporary disk usage. |
 
 Always validate tuning with restart and failure tests, not throughput alone.

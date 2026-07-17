@@ -165,6 +165,7 @@ Version 1 features currently advertised by the broker are:
 | `offset_resume_v1` | Supports broker-owned `FETCH_OFFSET`/commit resume semantics |
 | `idempotent_producer_v1` | Supports producer ID, epoch, and sequence fencing |
 | `event_sourcing_v1` | Supports event stream and snapshot commands |
+| `topic_compaction_v1` | Supports per-topic cleanup policy declaration and standalone keyed closed-segment compaction |
 
 Feature names describe independent contracts; clients must not infer support for an unadvertised feature from the protocol version alone.
 
@@ -174,13 +175,15 @@ Feature names describe independent contracts; clients must not infer support for
 
 **CREATE**
 ```
-CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [replication_factor=<N>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
+CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [event_sourcing=<true|false>] [replication_factor=<N>] [cleanup_policy=<delete|compact|delete,compact>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
 ```
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
 | topic | Yes | - | Topic name |
 | partitions | No | 4 | Number of partitions |
 | idempotent | No | false | Enable producer dedup |
+| event_sourcing | No | false | Enable aggregate stream commands; requires non-compacted history |
+| cleanup_policy | No | broker default | `delete`, `compact`, or canonical combined policy `delete,compact` |
 | retention_hours | No | 0 | Per-topic retention hours override metadata; 0 means broker default |
 | retention_bytes | No | 0 | Per-topic retention bytes override metadata; 0 means broker default |
 | partitioner | No | hash_key | `hash_key` uses message key hash, `round_robin` ignores keys |
@@ -189,7 +192,9 @@ CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [replication_fact
 | write_acl | No | - | Comma-separated principals allowed to write when `auth_policy=acl`; `*` allows any authenticated principal |
 | replication_factor | No | 3 | Replica count (distributed mode) |
 
-Response: `OK topic=<name> partitions=<N> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>`
+Response: `OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>`
+
+`compact` and `delete,compact` are accepted only by standalone, non-event-sourcing topics. Unsupported combinations return `ERROR: invalid_topic_policy ...` or `ERROR: unsupported_topic_policy ...`. Repeating `CREATE` for an existing event-sourcing topic cannot use a false `event_sourcing` argument to bypass this validation.
 
 **DELETE**
 ```
@@ -298,9 +303,9 @@ METADATA topic=<name>
 |-------|----------|-------------|
 | topic | Yes | Topic name |
 
-Response: `OK topic=<name> partitions=<N> leaders=<host:port>,<host:port>,...`
+Response: `OK topic=<name> partitions=<N> leaders=<host:port>,<host:port>,... epochs=<csv> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>`
 
-Returns the client-facing address of each partition's leader broker, in partition order (P0, P1, P2, ...).
+Returns partition leaders/epochs and the authoritative in-memory topic policy. Leader addresses are in partition order (P0, P1, P2, ...).
 
 Any broker can answer this command. Addresses are the advertised client addresses from the FSM broker registry.
 
