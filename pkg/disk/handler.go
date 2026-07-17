@@ -56,13 +56,19 @@ type DiskHandler struct {
 	segmentRollTime  time.Duration
 	segmentCreatedAt time.Time
 
-	retentionMu         sync.RWMutex
-	retentionDefaults   retentionLimits
-	retentionPolicy     retentionLimits
-	retentionConfigured bool
+	retentionMu            sync.RWMutex
+	retentionDefaults      retentionLimits
+	retentionPolicy        retentionLimits
+	retentionConfigured    bool
+	cleanupPolicy          string
+	minCleanableDirtyRatio float64
+	distributed            bool
 
-	mu   sync.Mutex // metadata(offset, segment), file handler(d.file)
-	ioMu sync.Mutex // bufio.Writer, flush
+	maintenanceMu     sync.Mutex
+	compactionMu      sync.RWMutex
+	compactedSegments map[uint64]int64
+	mu                sync.Mutex // metadata(offset, segment), file handler(d.file)
+	ioMu              sync.Mutex // bufio.Writer, flush
 
 	file   *os.File
 	writer *bufio.Writer
@@ -91,14 +97,44 @@ func (d *DiskHandler) GetActiveReaders() int32 {
 }
 
 func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*DiskHandler, error) {
+	return newDiskHandler(cfg, topicName, partitionID, cfg.CleanupPolicy, retentionLimits{
+		hours: cfg.RetentionHours,
+		bytes: cfg.RetentionBytes,
+	})
+}
+
+func newDiskHandlerWithPolicy(cfg *config.Config, topicName string, partitionID int, cleanupPolicy string, retentionHours int, retentionBytes int64) (*DiskHandler, error) {
+	if cleanupPolicy == "" {
+		cleanupPolicy = cfg.CleanupPolicy
+	}
+	if retentionHours == 0 {
+		retentionHours = cfg.RetentionHours
+	}
+	if retentionBytes == 0 {
+		retentionBytes = cfg.RetentionBytes
+	}
+	return newDiskHandler(cfg, topicName, partitionID, cleanupPolicy, retentionLimits{
+		hours: retentionHours,
+		bytes: retentionBytes,
+	})
+}
+
+func newDiskHandler(cfg *config.Config, topicName string, partitionID int, cleanupPolicy string, initialRetention retentionLimits) (*DiskHandler, error) {
 	base := fmt.Sprintf("%s%c%s%cpartition_%d", cfg.LogDir, os.PathSeparator, topicName, os.PathSeparator, partitionID)
-	if err := os.MkdirAll(filepath.Dir(base), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(base), 0o750); err != nil {
 		return nil, err
 	}
 
 	tempDh := &DiskHandler{BaseName: base}
 	if err := cleanupDeletedSegments(base); err != nil {
 		return nil, fmt.Errorf("cleanup deleted segment tombstones: %w", err)
+	}
+	if err := cleanupCompactionTemps(base); err != nil {
+		return nil, fmt.Errorf("cleanup compaction temporary files: %w", err)
+	}
+	compactedSegments, markerErr := loadCompactionMarkers(base)
+	if markerErr != nil {
+		return nil, fmt.Errorf("load compaction markers: %w", markerErr)
 	}
 	pattern := base + "_segment_*.log"
 	files, _ := filepath.Glob(pattern)
@@ -134,6 +170,14 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 	if len(files) == 0 {
 		recovery.nextOffset = currentSegmentBase
 	}
+	normalizedCleanupPolicy, ok := config.NormalizeCleanupPolicy(cleanupPolicy)
+	if !ok {
+		normalizedCleanupPolicy = config.CleanupPolicyDelete
+	}
+	minCleanableDirtyRatio := cfg.MinCleanableDirtyRatio
+	if minCleanableDirtyRatio <= 0 || minCleanableDirtyRatio >= 1 {
+		minCleanableDirtyRatio = 0.5
+	}
 
 	dh := &DiskHandler{
 		BaseName:       base,
@@ -155,13 +199,17 @@ func NewDiskHandler(cfg *config.Config, topicName string, partitionID int) (*Dis
 		writeTimeout:   time.Duration(cfg.DiskWriteTimeoutMS) * time.Millisecond,
 		syncIntervalMS: cfg.DiskFlushIntervalMS,
 
-		segmentRollTime:     time.Duration(cfg.SegmentRollTimeMS) * time.Millisecond,
-		segmentCreatedAt:    time.Now(),
-		retentionDefaults:   retentionLimits{hours: cfg.RetentionHours, bytes: cfg.RetentionBytes},
-		retentionPolicy:     retentionLimits{hours: cfg.RetentionHours, bytes: cfg.RetentionBytes},
-		retentionConfigured: true,
-		file:                file,
-		writer:              bufio.NewWriter(file),
+		segmentRollTime:        time.Duration(cfg.SegmentRollTimeMS) * time.Millisecond,
+		segmentCreatedAt:       time.Now(),
+		retentionDefaults:      retentionLimits{hours: cfg.RetentionHours, bytes: cfg.RetentionBytes},
+		retentionPolicy:        initialRetention,
+		retentionConfigured:    true,
+		cleanupPolicy:          normalizedCleanupPolicy,
+		minCleanableDirtyRatio: minCleanableDirtyRatio,
+		distributed:            cfg.EnabledDistribution,
+		compactedSegments:      compactedSegments,
+		file:                   file,
+		writer:                 bufio.NewWriter(file),
 	}
 	if recovery.modTime != 0 {
 		dh.segmentCreatedAt = time.Unix(0, recovery.modTime)
@@ -314,10 +362,11 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 	}
 
 	dh.mu.Lock()
+	currentSegment := dh.CurrentSegment
 	readableSegments := make([]uint64, len(dh.segments))
 	copy(readableSegments, dh.segments)
-	if len(readableSegments) == 0 || readableSegments[len(readableSegments)-1] != dh.CurrentSegment {
-		readableSegments = append(readableSegments, dh.CurrentSegment)
+	if len(readableSegments) == 0 || readableSegments[len(readableSegments)-1] != currentSegment {
+		readableSegments = append(readableSegments, currentSegment)
 	}
 	dh.mu.Unlock()
 
@@ -356,7 +405,9 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 			readPos = position
 		}
 
-		batch, readErr := dh.readMessagesFromPosition(reader, readPos, remaining, offset, segBase == dh.CurrentSegment)
+		activeSegment := segBase == currentSegment
+		allowOffsetGaps := !activeSegment && dh.segmentAllowsOffsetGaps(segBase, actualSize)
+		batch, readErr := dh.readMessagesFromPosition(reader, readPos, remaining, offset, segBase, activeSegment, allowOffsetGaps)
 		if readErr != nil {
 			_ = reader.Close()
 			return nil, fmt.Errorf("read segment %d: %w", segBase, readErr)
@@ -372,7 +423,7 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 				return nil, fmt.Errorf("reopen segment %d: %w", segBase, reErr)
 			}
 
-			batch, readErr = dh.readMessagesFromPosition(reader, readPos, remaining, offset, segBase == dh.CurrentSegment)
+			batch, readErr = dh.readMessagesFromPosition(reader, readPos, remaining, offset, segBase, activeSegment, allowOffsetGaps)
 			if readErr != nil {
 				_ = reader.Close()
 				return nil, fmt.Errorf("reread segment %d: %w", segBase, readErr)
@@ -401,7 +452,7 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 }
 
 // readMessagesFromPosition reads messages starting from a specific byte position
-func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position uint64, max int, targetOffset uint64, allowPartialTail bool) ([]types.Message, error) {
+func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position uint64, max int, targetOffset, segmentBase uint64, allowPartialTail, allowOffsetGaps bool) ([]types.Message, error) {
 	if position > math.MaxInt {
 		return nil, fmt.Errorf("read position %d exceeds int range", position)
 	}
@@ -442,7 +493,13 @@ func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position 
 		if err != nil {
 			return nil, fmt.Errorf("decode message at byte %d: %w", pos, err)
 		}
-		if havePreviousOffset && diskMsg.Offset != previousOffset+1 {
+		if !havePreviousOffset && pos == 0 && !allowOffsetGaps && diskMsg.Offset != segmentBase {
+			return nil, fmt.Errorf("unexpected first offset at byte %d: got %d for segment base %d", pos, diskMsg.Offset, segmentBase)
+		}
+		if havePreviousOffset && diskMsg.Offset <= previousOffset {
+			return nil, fmt.Errorf("non-increasing offset at byte %d: got %d after %d", pos, diskMsg.Offset, previousOffset)
+		}
+		if havePreviousOffset && !allowOffsetGaps && diskMsg.Offset != previousOffset+1 {
 			return nil, fmt.Errorf("non-contiguous offset at byte %d: got %d after %d", pos, diskMsg.Offset, previousOffset)
 		}
 		previousOffset = diskMsg.Offset

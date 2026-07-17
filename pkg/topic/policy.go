@@ -3,6 +3,8 @@ package topic
 import (
 	"fmt"
 	"strings"
+
+	"github.com/cursus-io/cursus/pkg/config"
 )
 
 const (
@@ -17,6 +19,7 @@ const (
 type Policy struct {
 	RetentionHours int      `json:"retention_hours,omitempty"`
 	RetentionBytes int64    `json:"retention_bytes,omitempty"`
+	CleanupPolicy  string   `json:"cleanup_policy"`
 	Partitioner    string   `json:"partitioner"`
 	AuthPolicy     string   `json:"auth_policy"`
 	ReadACL        []string `json:"read_acl,omitempty"`
@@ -25,12 +28,22 @@ type Policy struct {
 
 func DefaultPolicy() Policy {
 	return Policy{
-		Partitioner: PartitionerHashKey,
-		AuthPolicy:  AuthPolicyOpen,
+		CleanupPolicy: config.CleanupPolicyDelete,
+		Partitioner:   PartitionerHashKey,
+		AuthPolicy:    AuthPolicyOpen,
 	}
 }
 
 func (p Policy) Normalize() (Policy, error) {
+	if p.CleanupPolicy == "" {
+		p.CleanupPolicy = config.CleanupPolicyDelete
+	}
+	normalizedCleanup, ok := config.NormalizeCleanupPolicy(p.CleanupPolicy)
+	if !ok {
+		return p, fmt.Errorf("invalid cleanup policy %q", p.CleanupPolicy)
+	}
+	p.CleanupPolicy = normalizedCleanup
+
 	if p.Partitioner == "" {
 		p.Partitioner = PartitionerHashKey
 	}
@@ -58,6 +71,19 @@ func (p Policy) Normalize() (Policy, error) {
 		return p, fmt.Errorf("retention_bytes must be >= 0")
 	}
 	return p, nil
+}
+
+func validateCleanupPolicyForTopic(policy Policy, cfg *config.Config, eventSourcing bool) error {
+	if !config.HasCleanupPolicy(policy.CleanupPolicy, config.CleanupPolicyCompact) {
+		return nil
+	}
+	if eventSourcing {
+		return fmt.Errorf("cleanup policy compact is not supported for event-sourcing topics")
+	}
+	if cfg != nil && cfg.EnabledDistribution {
+		return fmt.Errorf("cleanup policy compact is not supported in distributed mode")
+	}
+	return nil
 }
 
 func (p Policy) CanRead() bool {

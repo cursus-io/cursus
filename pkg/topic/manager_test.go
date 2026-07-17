@@ -195,3 +195,19 @@ func TestTopicManagerCreateTopic(t *testing.T) {
 
 	tm.Stop()
 }
+
+func TestNewTopicClosesInitializedHandlersOnPartialFailure(t *testing.T) {
+	cfg := config.DefaultConfig()
+	hp := new(MockHandlerProvider)
+	first := new(MockStorageHandler)
+	first.On("GetLatestOffset").Return(uint64(0)).Once()
+	first.On("Close").Return(nil).Once()
+	hp.On("GetHandler", "partial-topic", 0).Return(first, nil).Once()
+	hp.On("GetHandler", "partial-topic", 1).Return(nil, assert.AnError).Once()
+
+	created, err := NewTopicWithPolicy("partial-topic", 2, hp, cfg, nil, false, false, DefaultPolicy())
+	assert.Error(t, err)
+	assert.Nil(t, created)
+	hp.AssertExpectations(t)
+	first.AssertExpectations(t)
+}

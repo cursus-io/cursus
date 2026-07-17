@@ -35,7 +35,7 @@ A transaction does not collapse those owners into one in-memory object. The tran
 | Partition / consumer / broadcast buffers | `10000` / `1000` / `10000` |
 | Distribution | disabled unless configured |
 
-Configuration validation normalizes invalid values. Log compaction is not implemented; cleanup policy is `delete`.
+Configuration validation normalizes invalid values. Cleanup policy accepts `delete`, `compact`, or `delete,compact`; compaction is standalone-only and is rejected for event-sourcing topics.
 
 ## Concurrency
 

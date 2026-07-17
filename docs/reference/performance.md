@@ -60,6 +60,12 @@ Batch related records and offsets into a meaningful transaction, but avoid unbou
 
 Coordinator synchronization currently persists the complete staged transaction snapshot after each mutation. Very large transactions therefore amplify standalone journal and distributed metadata traffic; keep transaction batches bounded and measure coordinator latency as well as partition throughput. A standalone encoded snapshot record is limited to 32 MiB. The standalone journal is append-only and does not yet compact superseded snapshots automatically.
 
+## Compaction Cost
+
+Standalone keyed compaction scans a snapshot of closed segments twice before rewriting only segments that contain removable records. Cleaner memory is proportional to the number of distinct keys and producer IDs in that closed snapshot, not just the active segment. Temporary disk demand can approach the retained size of the largest segment being rewritten.
+
+Producer appends continue during scanning and temporary-file construction. The partition metadata lock is held only while a prepared log/index pair replaces the closed segment and the directory entry is synced. Larger segments reduce roll frequency but increase cleaner scan time, peak temporary space, and the delay before an active key update becomes eligible.
+
 ## Example Profiles
 
 ### Throughput-oriented starting point

@@ -23,7 +23,7 @@ Without broker-level support, applications must implement concurrency control, v
 ### 1. Create an Event-Sourcing Topic
 
 ```
-CREATE topic=orders partitions=4 event_sourcing=true
+CREATE topic=orders partitions=4 event_sourcing=true cleanup_policy=delete
 ```
 
 Response:

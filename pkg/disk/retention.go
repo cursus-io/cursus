@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,27 +21,33 @@ type retentionLimits struct {
 }
 
 type ReadSession struct {
-	File    *os.File
-	handler *DiskHandler
+	File      *os.File
+	handler   *DiskHandler
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (s *ReadSession) Close() error {
-	atomic.AddInt32(&s.handler.activeReaders, -1)
-	return s.File.Close()
+	s.closeOnce.Do(func() {
+		atomic.AddInt32(&s.handler.activeReaders, -1)
+		s.closeErr = s.File.Close()
+	})
+	return s.closeErr
 }
 
 func (d *DiskHandler) OpenForRead(offset uint64) (*ReadSession, error) {
+	atomic.AddInt32(&d.activeReaders, 1)
 	path, _, err := d.findSegmentForOffset(offset)
 	if err != nil {
+		atomic.AddInt32(&d.activeReaders, -1)
 		return nil, err
 	}
 
 	f, err := os.Open(path)
 	if err != nil {
+		atomic.AddInt32(&d.activeReaders, -1)
 		return nil, err
 	}
-
-	atomic.AddInt32(&d.activeReaders, 1)
 
 	return &ReadSession{
 		File:    f,
@@ -50,6 +57,9 @@ func (d *DiskHandler) OpenForRead(offset uint64) (*ReadSession, error) {
 
 // SetRetentionPolicy applies topic-level limits. Zero means inherit the broker default.
 func (d *DiskHandler) SetRetentionPolicy(hours int, bytes int64) {
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+
 	d.retentionMu.Lock()
 	defer d.retentionMu.Unlock()
 
@@ -61,6 +71,51 @@ func (d *DiskHandler) SetRetentionPolicy(hours int, bytes int64) {
 	}
 	d.retentionPolicy = retentionLimits{hours: hours, bytes: bytes}
 	d.retentionConfigured = true
+}
+
+// SetCleanupPolicy changes the maintenance policy for this partition.
+func (d *DiskHandler) SetCleanupPolicy(policy string) {
+	normalized, ok := config.NormalizeCleanupPolicy(policy)
+	if !ok {
+		normalized = config.CleanupPolicyDelete
+	}
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+
+	d.retentionMu.Lock()
+	d.cleanupPolicy = normalized
+	d.retentionMu.Unlock()
+}
+
+// SetStoragePolicy atomically applies topic cleanup and retention settings.
+func (d *DiskHandler) SetStoragePolicy(cleanupPolicy string, hours int, bytes int64) {
+	normalized, ok := config.NormalizeCleanupPolicy(cleanupPolicy)
+	if !ok {
+		normalized = config.CleanupPolicyDelete
+	}
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+
+	d.retentionMu.Lock()
+	defer d.retentionMu.Unlock()
+	if hours == 0 {
+		hours = d.retentionDefaults.hours
+	}
+	if bytes == 0 {
+		bytes = d.retentionDefaults.bytes
+	}
+	d.retentionPolicy = retentionLimits{hours: hours, bytes: bytes}
+	d.retentionConfigured = true
+	d.cleanupPolicy = normalized
+}
+
+func (d *DiskHandler) CleanupPolicy() string {
+	d.retentionMu.RLock()
+	defer d.retentionMu.RUnlock()
+	if d.cleanupPolicy == "" {
+		return config.CleanupPolicyDelete
+	}
+	return d.cleanupPolicy
 }
 
 func (d *DiskHandler) RetentionPolicy() (int, int64) {
@@ -82,6 +137,11 @@ func (d *DiskHandler) effectiveRetention(cfg *config.Config) retentionLimits {
 }
 
 func (d *DiskHandler) EnforceRetention(cfg *config.Config) {
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+	if !config.HasCleanupPolicy(d.CleanupPolicy(), config.CleanupPolicyDelete) {
+		return
+	}
 	if atomic.LoadInt32(&d.activeReaders) > 0 {
 		util.Debug("Retention skipped: %d active readers", atomic.LoadInt32(&d.activeReaders))
 		return
@@ -178,6 +238,10 @@ func (d *DiskHandler) markAsDeleted(logPath string) error {
 		}
 		return err
 	}
+	if err := cleanupCompactionMarkersForLog(logPath, -1); err != nil {
+		util.Warn("failed to remove compaction marker for %s: %v", logPath, err)
+	}
+	d.forgetCompactedSegment(segmentOffset)
 
 	for i, s := range d.segments {
 		if s == segmentOffset {
@@ -218,19 +282,27 @@ func cleanupDeletedSegments(base string) error {
 }
 
 func (d *DiskHandler) retentionLoop(cfg *config.Config) {
-	interval := cfg.RetentionCheckIntervalMS
-	if interval <= 0 {
-		interval = 300000
+	retentionInterval := cfg.RetentionCheckIntervalMS
+	if retentionInterval <= 0 {
+		retentionInterval = 300000
+	}
+	compactionInterval := cfg.CompactionCheckIntervalMS
+	if compactionInterval <= 0 {
+		compactionInterval = 300000
 	}
 
-	ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
-	defer ticker.Stop()
+	retentionTicker := time.NewTicker(time.Duration(retentionInterval) * time.Millisecond)
+	compactionTicker := time.NewTicker(time.Duration(compactionInterval) * time.Millisecond)
+	defer retentionTicker.Stop()
+	defer compactionTicker.Stop()
 
 	for {
 		select {
-		case <-ticker.C:
-			if cfg.CleanupPolicy == "delete" {
-				d.EnforceRetention(cfg)
+		case <-retentionTicker.C:
+			d.EnforceRetention(cfg)
+		case <-compactionTicker.C:
+			if _, err := d.EnforceCompaction(); err != nil {
+				util.Error("log compaction failed for %s: %v", d.BaseName, err)
 			}
 		case <-d.done:
 			return

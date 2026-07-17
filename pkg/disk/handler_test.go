@@ -335,6 +335,9 @@ func TestReadSession_Close(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Fatalf("ReadSession.Close failed: %v", err)
 	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("second ReadSession.Close failed: %v", err)
+	}
 	if dh.GetActiveReaders() != 0 {
 		t.Errorf("Expected 0 active readers after close, got %d", dh.GetActiveReaders())
 	}

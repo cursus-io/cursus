@@ -58,7 +58,7 @@ With `structured_errors_v1` enabled, subsequent text errors use `ERROR: <code> c
 ### CREATE
 
 ```text
-CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
+CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>] [cleanup_policy=<delete|compact|delete,compact>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
 ```
 
 Creates a topic or increases its partition count when the topic already exists.
@@ -66,7 +66,7 @@ Creates a topic or increases its partition count when the topic already exists.
 Success:
 
 ```text
-OK topic=<name> partitions=<N>
+OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>
 ```
 
 Common errors:
@@ -75,6 +75,8 @@ Common errors:
 ERROR: missing_topic expected="CREATE topic=<name> [partitions=<N>]"
 ERROR: invalid_partitions reason="must be a positive integer"
 ERROR: invalid_replication_factor reason="must be a positive integer"
+ERROR: invalid_topic_policy field=cleanup_policy reason="..."
+ERROR: unsupported_topic_policy field=cleanup_policy reason="..."
 ERROR: create_topic_failed reason="..."
 ```
 
@@ -453,7 +455,11 @@ ERROR: NOT_COORDINATOR host=<host> port=<port>
 METADATA topic=<name>
 ```
 
-Success is a JSON metadata response with `status:"OK"`.
+Success is a text response:
+
+```text
+OK topic=<name> partitions=<N> leaders=<csv> epochs=<csv> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>
+```
 
 Common errors:
 

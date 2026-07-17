@@ -156,8 +156,10 @@ These parameters directly affect the write path performance and batching behavio
 | `log_retention_hours`   | int  | 168     | Log retention period in hours (7 days default)            |
 | `log_retention_bytes`   | int64 | -1     | Retained byte limit; `-1` means unlimited                 |
 | `log_segment_roll_ms`   | int  | 604800000 | Time-based roll interval (7 days)                       |
-| `log_cleanup_policy`    | string | "delete" | Only implemented cleanup policy; compaction is unsupported |
-| `log_retention_check_interval_ms` | int | 300000 | Retention evaluation interval                          |
+| `log_cleanup_policy`    | string | "delete" | `delete`, `compact`, or `delete,compact`; compact policies are standalone-only |
+| `log_retention_check_interval_ms` | int | 300000 | Delete-retention evaluation interval                  |
+| `log_compaction_check_interval_ms` | int | 300000 | Closed-segment compaction evaluation interval         |
+| `log_min_cleanable_dirty_ratio` | float64 | 0.5 | Minimum removable-byte ratio before compaction         |
 | `compression_type`      | string | "none" | Compression type: "none", "gzip", "snappy", "lz4"       |
 
 
@@ -418,6 +420,6 @@ log.Fatal(http.ListenAndServe(":2112", nil))
 
 `Config.Normalize()` applies safe fallbacks for invalid or non-positive values, including write batching, sync intervals, segment/index sizes, retention intervals, channel capacities, replica settings, and transaction/producer retention. TLS certificate loading still fails startup when configured files are invalid.
 
-Unsupported `log_cleanup_policy` values, including `compact`, normalize to `delete` with a warning because compaction is not implemented. Operators should treat normalization warnings as configuration errors in production and verify the effective startup configuration.
+Cleanup policy values normalize to `delete`, `compact`, or canonical `delete,compact`; unknown values fall back to `delete` with a warning. A broker configured for distribution rejects compact topic creation, and event-sourcing topics always require `delete`. Operators should treat normalization and policy errors as configuration/provisioning failures and verify the effective topic policy with `METADATA`.
 
 Missing values fall back to defaults in `pkg/config/properties.go`. Configuration precedence is defaults, file, environment, then CLI overrides where a flag is exposed.

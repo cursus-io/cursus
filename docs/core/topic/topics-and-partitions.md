@@ -58,7 +58,7 @@ Idempotent records use `(producerId, epoch, seqNum)` per partition. Higher epoch
 
 ## Storage
 
-Each partition has one `DiskHandler` with base-offset segment/index files. Async writes use a buffered channel and batch/linger policy; direct and follower writes preserve assigned offsets. Default data segments roll at 1 GiB, index capacity, or seven days. Retention deletes closed segments by time/size; compaction is not implemented.
+Each partition has one `DiskHandler` with base-offset segment/index files. Async writes use a buffered channel and batch/linger policy; direct and follower writes preserve assigned offsets. Default data segments roll at 1 GiB, index capacity, or seven days. Retention can delete closed segments by time/size. Standalone keyed topics can also compact closed segments while preserving logical offsets, unkeyed records, transaction/control records, and producer recovery anchors.
 
 ## Cluster Ownership
 

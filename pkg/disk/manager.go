@@ -13,6 +13,12 @@ import (
 	"github.com/cursus-io/cursus/util"
 )
 
+type initialStoragePolicy struct {
+	cleanupPolicy  string
+	retentionHours int
+	retentionBytes int64
+}
+
 type DiskManager struct {
 	mu       sync.Mutex
 	handlers map[string]*DiskHandler
@@ -26,27 +32,54 @@ func NewDiskManager(cfg *config.Config) *DiskManager {
 	}
 }
 
-// GetHandler returns a StorageHandler for a given name or creates one if missing
+// GetHandler returns a StorageHandler for a given name or creates one if missing.
 func (dm *DiskManager) GetHandler(topic string, partitionID int) (types.StorageHandler, error) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	return dm.getHandlerLocked(topic, partitionID, nil)
+}
+
+// GetHandlerWithPolicy initializes maintenance with the topic policy before its
+// background loops can run.
+func (dm *DiskManager) GetHandlerWithPolicy(topic string, partitionID int, cleanupPolicy string, retentionHours int, retentionBytes int64) (types.StorageHandler, error) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
 	key := diskHandlerKey(topic, partitionID)
-	if dh, ok := dm.handlers[key]; ok {
-		return dh, nil
+	if handler, ok := dm.handlers[key]; ok {
+		handler.SetStoragePolicy(cleanupPolicy, retentionHours, retentionBytes)
+		return handler, nil
 	}
 
-	if err := os.MkdirAll(dm.cfg.LogDir, 0755); err != nil {
+	return dm.getHandlerLocked(topic, partitionID, &initialStoragePolicy{
+		cleanupPolicy:  cleanupPolicy,
+		retentionHours: retentionHours,
+		retentionBytes: retentionBytes,
+	})
+}
+
+func (dm *DiskManager) getHandlerLocked(topic string, partitionID int, policy *initialStoragePolicy) (types.StorageHandler, error) {
+	key := diskHandlerKey(topic, partitionID)
+	if handler, ok := dm.handlers[key]; ok {
+		return handler, nil
+	}
+
+	if err := os.MkdirAll(dm.cfg.LogDir, 0o750); err != nil {
 		return nil, fmt.Errorf("failed to create log directory %s: %w", dm.cfg.LogDir, err)
 	}
 
-	dh, err := NewDiskHandler(dm.cfg, topic, partitionID)
+	var handler *DiskHandler
+	var err error
+	if policy == nil {
+		handler, err = NewDiskHandler(dm.cfg, topic, partitionID)
+	} else {
+		handler, err = newDiskHandlerWithPolicy(dm.cfg, topic, partitionID, policy.cleanupPolicy, policy.retentionHours, policy.retentionBytes)
+	}
 	if err != nil {
 		return nil, err
 	}
-
-	dm.handlers[key] = dh
-	return dh, nil
+	dm.handlers[key] = handler
+	return handler, nil
 }
 
 // ExistingPartitionCount discovers the highest persisted partition for a topic

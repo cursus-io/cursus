@@ -37,7 +37,7 @@ Cursus is a lightweight, partitioned-log message broker written in Go. It runs a
 | Consumer delivery | At-least-once when processing finishes before committing `lastProcessedOffset + 1`. Committing first can produce at-most-once behavior. |
 | Transactions | Atomic broker visibility for staged output records plus one fenced consumer offset scope `(topic, group, member, generation)`. External database or service side effects are outside the broker transaction. |
 | Read isolation | `read_committed` is the default and hides open/aborted transactions. `read_uncommitted` exposes the raw committed partition log, including control records. |
-| Retention | Time/size deletion is supported. Log compaction is not implemented; `log_cleanup_policy` is normalized to `delete`. |
+| Retention | Time/size deletion and standalone keyed log compaction are supported. Compaction preserves offsets and transaction/control records; distributed and event-sourcing topics reject it. |
 | Protocol | Cursus-native TCP framing and commands. This project does not claim byte compatibility with another broker protocol. |
 
 ## Quick Start

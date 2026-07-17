@@ -127,7 +127,7 @@ func (es *EventStore) sendCommand(cmd string) (string, error) {
 
 // CreateTopic creates an event-sourcing-enabled topic if it doesn't exist.
 func (es *EventStore) CreateTopic(partitions int) error {
-	resp, err := es.sendCommand(fmt.Sprintf("CREATE topic=%s partitions=%d event_sourcing=true", es.topic, partitions))
+	resp, err := es.sendCommand(fmt.Sprintf("CREATE topic=%s partitions=%d event_sourcing=true cleanup_policy=delete", es.topic, partitions))
 	if err != nil {
 		return err
 	}

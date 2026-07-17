@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/util"
@@ -62,9 +63,21 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 		eventSourcing = strings.ToLower(esStr) == "true"
 	}
 
-	policy, policyErr := parseTopicPolicy(args)
+	policy, policyErr := parseTopicPolicy(args, ch.Config.CleanupPolicy)
 	if policyErr != "" {
 		return policyErr
+	}
+	effectiveEventSourcing := eventSourcing
+	if existing := ch.TopicManager.GetTopic(topicName); existing != nil && existing.IsEventSourcing {
+		effectiveEventSourcing = true
+	}
+	if config.HasCleanupPolicy(policy.CleanupPolicy, config.CleanupPolicyCompact) {
+		if effectiveEventSourcing {
+			return `ERROR: invalid_topic_policy field=cleanup_policy reason="compaction is not supported for event-sourcing topics"`
+		}
+		if ch.Config.EnabledDistribution {
+			return `ERROR: unsupported_topic_policy field=cleanup_policy reason="compaction is not supported in distributed mode"`
+		}
 	}
 
 	replicationFactor := ch.Config.DefaultReplicationFactor
@@ -111,11 +124,17 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			util.Warn("Failed to register default group with coordinator: %v", err)
 		}
 	}
-	return fmt.Sprintf("OK topic=%s partitions=%d partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d", topicName, len(t.Partitions), t.Policy.Partitioner, t.Policy.AuthPolicy, strings.Join(t.Policy.ReadACL, ","), strings.Join(t.Policy.WriteACL, ","), t.Policy.RetentionHours, t.Policy.RetentionBytes)
+	return fmt.Sprintf("OK topic=%s partitions=%d cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d", topicName, len(t.Partitions), t.Policy.CleanupPolicy, t.Policy.Partitioner, t.Policy.AuthPolicy, strings.Join(t.Policy.ReadACL, ","), strings.Join(t.Policy.WriteACL, ","), t.Policy.RetentionHours, t.Policy.RetentionBytes)
 }
 
-func parseTopicPolicy(args map[string]string) (topic.Policy, string) {
+func parseTopicPolicy(args map[string]string, defaultCleanupPolicy string) (topic.Policy, string) {
 	policy := topic.DefaultPolicy()
+	if defaultCleanupPolicy != "" {
+		policy.CleanupPolicy = defaultCleanupPolicy
+	}
+	if v := args["cleanup_policy"]; v != "" {
+		policy.CleanupPolicy = v
+	}
 	if v := args["retention_hours"]; v != "" {
 		parsed, err := strconv.Atoi(v)
 		if err != nil {
@@ -1090,8 +1109,8 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 		}
 	}
 
-	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d",
-		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), t.Policy.Partitioner, t.Policy.AuthPolicy, strings.Join(t.Policy.ReadACL, ","), strings.Join(t.Policy.WriteACL, ","), t.Policy.RetentionHours, t.Policy.RetentionBytes)
+	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d",
+		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), t.Policy.CleanupPolicy, t.Policy.Partitioner, t.Policy.AuthPolicy, strings.Join(t.Policy.ReadACL, ","), strings.Join(t.Policy.WriteACL, ","), t.Policy.RetentionHours, t.Policy.RetentionBytes)
 }
 
 func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
