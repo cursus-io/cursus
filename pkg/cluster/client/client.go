@@ -113,7 +113,13 @@ func (c *TCPClusterClient) joinClusterWithContext(ctx context.Context, peers []s
 			}
 			targetAddr := net.JoinHostPort(hostOnly, fmt.Sprintf("%d", apiPort))
 
-			if err := c.sendJoinCommand(ctx, targetAddr, nodeID, addr); err == nil {
+			// A single unresponsive seed must not consume the complete cluster join
+			// deadline. Keep each connection attempt bounded while retaining the
+			// caller's cancellation and overall deadline as the outer limit.
+			attemptCtx, cancel := context.WithTimeout(ctx, c.timeout)
+			err := c.sendJoinCommand(attemptCtx, targetAddr, nodeID, addr)
+			cancel()
+			if err == nil {
 				return nil
 			}
 		}
