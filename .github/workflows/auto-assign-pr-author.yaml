@@ -1,0 +1,50 @@
+name: auto-assign-pr-author
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  issues: write
+
+jobs:
+  assign-author:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assign pull request author
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const { number, user } = context.payload.pull_request;
+            const { data: issue } = await github.rest.issues.addAssignees({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: number,
+              assignees: [user.login],
+            });
+
+            const isAssigned = issue.assignees.some(
+              ({ login }) => login === user.login,
+            );
+
+            if (!isAssigned) {
+              const marker = "<!-- auto-assign-pr-author -->";
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: number,
+                  per_page: 100,
+                },
+              );
+
+              if (!comments.some(({ body }) => body?.includes(marker))) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: number,
+                  body: `${marker}\n@${user.login} GitHub could not assign you because you do not have repository access.`,
+                });
+              }
+            }
