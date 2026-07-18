@@ -38,6 +38,46 @@ func TestAddRemoveStream(t *testing.T) {
 	}
 }
 
+func TestAddStreamReplacesSameKeyWithoutOldMonitorDeletingReplacement(t *testing.T) {
+	sm := NewStreamManager(2, time.Hour, 5*time.Millisecond)
+
+	conn1, peer1 := net.Pipe()
+	defer func() { _ = peer1.Close() }()
+	stream1 := NewStreamConnection(conn1, "topic", 0, "group", 0)
+
+	const key = "topic:0:group"
+	if err := sm.AddStream(key, stream1, readFn, DefaultStreamCommitInterval); err != nil {
+		t.Fatalf("failed to add initial stream: %v", err)
+	}
+
+	conn2, peer2 := net.Pipe()
+	defer func() { _ = peer2.Close() }()
+	stream2 := NewStreamConnection(conn2, "topic", 0, "group", 0)
+	if err := sm.AddStream(key, stream2, readFn, DefaultStreamCommitInterval); err != nil {
+		t.Fatalf("failed to replace stream: %v", err)
+	}
+	defer sm.RemoveStream(key)
+
+	select {
+	case <-stream1.stopCh:
+	case <-time.After(time.Second):
+		t.Fatal("replaced stream was not stopped")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for stream1.Conn() != nil && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if stream1.Conn() != nil {
+		t.Fatal("replaced stream connection was not closed")
+	}
+
+	streams := sm.GetStreamsForPartition("topic", 0)
+	if len(streams) != 1 || streams[0] != stream2 {
+		t.Fatalf("expected replacement stream to remain registered, got %v", streams)
+	}
+}
+
 func TestMaxConnections(t *testing.T) {
 	sm := NewStreamManager(1, time.Second, 100*time.Millisecond)
 

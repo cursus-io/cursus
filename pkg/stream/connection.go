@@ -15,6 +15,7 @@ const (
 	StreamControlPrefix                 = "STREAM_CONTROL"
 	StreamControlTypeClose              = "CLOSE"
 	StreamControlReasonStopped          = "stopped"
+	StreamControlReasonReplaced         = "replaced"
 	StreamControlReasonRemoved          = "removed"
 	StreamControlReasonTimeout          = "timeout"
 	StreamControlReasonError            = "error"
