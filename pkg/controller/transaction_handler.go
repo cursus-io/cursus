@@ -754,7 +754,10 @@ func (ch *CommandHandler) ensureTransactionCoordinator(txnID string) string {
 	if !ch.isDistributed() {
 		return ""
 	}
-	coordAddr, isCoord := ch.checkTransactionCoordinator(txnID)
+	coordAddr, isCoord, coordErr := ch.checkTransactionCoordinator(txnID)
+	if coordErr != nil {
+		return coordinatorUnavailableResponse
+	}
 	if !isCoord {
 		return notCoordinatorResponse(coordAddr)
 	}

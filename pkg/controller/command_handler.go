@@ -310,7 +310,10 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 	}
 
 	if ch.isDistributed() {
-		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		coordAddr, isCoord, coordErr := ch.checkCoordinator(groupName)
+		if coordErr != nil {
+			return coordinatorUnavailableResponse
+		}
 		if !isCoord {
 			return notCoordinatorResponse(coordAddr)
 		}
@@ -424,7 +427,10 @@ func (ch *CommandHandler) handleSyncGroup(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		coordAddr, isCoord, coordErr := ch.checkCoordinator(groupName)
+		if coordErr != nil {
+			return coordinatorUnavailableResponse
+		}
 		if !isCoord {
 			return notCoordinatorResponse(coordAddr)
 		}
@@ -478,7 +484,10 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		coordAddr, isCoord, coordErr := ch.checkCoordinator(groupName)
+		if coordErr != nil {
+			return coordinatorUnavailableResponse
+		}
 		if !isCoord {
 			return notCoordinatorResponse(coordAddr)
 		}
@@ -582,7 +591,10 @@ func (ch *CommandHandler) handleFetchOffset(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		coordAddr, isCoord, coordErr := ch.checkCoordinator(groupName)
+		if coordErr != nil {
+			return coordinatorUnavailableResponse
+		}
 		if !isCoord {
 			return notCoordinatorResponse(coordAddr)
 		}
@@ -623,7 +635,10 @@ func (ch *CommandHandler) handleGroupStatus(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		coordAddr, isCoord, coordErr := ch.checkCoordinator(groupName)
+		if coordErr != nil {
+			return coordinatorUnavailableResponse
+		}
 		if !isCoord {
 			return notCoordinatorResponse(coordAddr)
 		}
@@ -661,7 +676,10 @@ func (ch *CommandHandler) handleHeartbeat(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		coordAddr, isCoord := ch.checkCoordinator(groupName)
+		coordAddr, isCoord, coordErr := ch.checkCoordinator(groupName)
+		if coordErr != nil {
+			return coordinatorUnavailableResponse
+		}
 		if !isCoord {
 			return notCoordinatorResponse(coordAddr)
 		}
@@ -719,7 +737,10 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 		return "ERROR: invalid_offset"
 	}
 	if ch.isDistributed() {
-		coordAddr, isCoord := ch.checkCoordinator(groupID)
+		coordAddr, isCoord, coordErr := ch.checkCoordinator(groupID)
+		if coordErr != nil {
+			return coordinatorUnavailableResponse
+		}
 		if !isCoord {
 			return notCoordinatorResponse(coordAddr)
 		}
@@ -813,7 +834,10 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		coordAddr, isCoord := ch.checkCoordinator(groupID)
+		coordAddr, isCoord, coordErr := ch.checkCoordinator(groupID)
+		if coordErr != nil {
+			return coordinatorUnavailableResponse
+		}
 		if !isCoord {
 			return notCoordinatorResponse(coordAddr)
 		}
