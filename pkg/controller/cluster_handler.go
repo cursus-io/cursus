@@ -115,6 +115,7 @@ type coordCacheEntry struct {
 }
 
 const coordCacheTTL = 30 * time.Second
+const coordinatorUnavailableResponse = "ERROR: coordinator_not_available"
 
 // IsGroupCoordinator is the strict ownership check used by session expiration.
 // Discovery failures return false so multiple brokers cannot expire the same
@@ -147,30 +148,30 @@ func (ch *CommandHandler) ExpireGroupMembers(groupName string, generation int, m
 
 // checkCoordinator checks if this broker is the coordinator for the given group.
 // Returns (addr, false) if another broker is coordinator, or (_, true) if we are.
-func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bool) {
+func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bool, error) {
 	return ch.checkCoordinatorKey(groupName, fmt.Sprintf("FIND_COORDINATOR group=%s", groupName))
 }
 
-func (ch *CommandHandler) checkTransactionCoordinator(txnID string) (AdvertisedAddr, bool) {
+func (ch *CommandHandler) checkTransactionCoordinator(txnID string) (AdvertisedAddr, bool, error) {
 	return ch.checkCoordinatorKey(transactionCoordinatorKey(txnID), fmt.Sprintf("FIND_COORDINATOR transactional_id=%s", txnID))
 }
 
-func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (AdvertisedAddr, bool) {
+func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (AdvertisedAddr, bool, error) {
 	if !ch.hasRouter() {
-		return AdvertisedAddr{}, true
+		return AdvertisedAddr{}, true, nil
 	}
 	id, raftAddr, err := ch.Cluster.Router.FindCoordinator(coordKey)
 	if err != nil {
-		return AdvertisedAddr{}, true
+		return AdvertisedAddr{}, false, fmt.Errorf("coordinator unavailable: %w", err)
 	}
 	if id == ch.Cluster.Router.BrokerID() {
-		return AdvertisedAddr{}, true
+		return AdvertisedAddr{}, true, nil
 	}
 
 	ch.coordCacheMu.RLock()
 	if cached, ok := ch.coordCache[id]; ok && time.Since(cached.updated) < coordCacheTTL {
 		ch.coordCacheMu.RUnlock()
-		return cached.addr, false
+		return cached.addr, false, nil
 	}
 	ch.coordCacheMu.RUnlock()
 
@@ -182,7 +183,7 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 					ch.coordCacheMu.Lock()
 					ch.coordCache[id] = coordCacheEntry{addr: addr, updated: time.Now()}
 					ch.coordCacheMu.Unlock()
-					return addr, false
+					return addr, false, nil
 				}
 			}
 		}
@@ -204,7 +205,7 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 			ch.coordCacheMu.Lock()
 			ch.coordCache[id] = coordCacheEntry{addr: addr, updated: time.Now()}
 			ch.coordCacheMu.Unlock()
-			return addr, false
+			return addr, false, nil
 		}
 	}
 
@@ -215,7 +216,7 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 	if host == "" {
 		host = "localhost"
 	}
-	return AdvertisedAddr{Host: host, Port: ch.Cluster.Router.ClientPort()}, false
+	return AdvertisedAddr{Host: host, Port: ch.Cluster.Router.ClientPort()}, false, nil
 }
 
 // notCoordinatorResponse builds the NOT_COORDINATOR error response.
