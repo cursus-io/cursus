@@ -40,7 +40,15 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	defer cancel()
 
 	if cfg.EnableExporter {
-		metrics.StartMetricsServer(cfg.ExporterPort)
+		exporter, err := metrics.StartMetricsServer(cfg.ExporterPort)
+		if err != nil {
+			return fmt.Errorf("start metrics exporter: %w", err)
+		}
+		defer func() {
+			if err := exporter.Close(); err != nil {
+				util.Error("Failed to close metrics exporter: %v", err)
+			}
+		}()
 		util.Info("📈 Prometheus exporter started on port %d", cfg.ExporterPort)
 	} else {
 		util.Info("📉 Exporter disabled")
