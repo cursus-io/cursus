@@ -33,6 +33,7 @@ type Partition struct {
 	producerState sync.Map // map[string]*producerEntry
 	isIdempotent  bool
 	closeCh       chan struct{}
+	cleanupWG     sync.WaitGroup
 }
 
 // NewPartition creates a partition instance.
@@ -379,12 +380,14 @@ func (p *Partition) UpdateLEO(leo uint64) {
 // Close shuts down the partition.
 func (p *Partition) Close() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed {
+		p.mu.Unlock()
 		return
 	}
 	p.closed = true
 	close(p.closeCh)
+	p.mu.Unlock()
+	p.cleanupWG.Wait()
 }
 
 const producerStateTTL = 30 * time.Minute
@@ -402,6 +405,7 @@ func (p *Partition) cleanStaleProducers() {
 
 // runProducerCleanup periodically evicts stale producer state to bound memory usage.
 func (p *Partition) runProducerCleanup() {
+	defer p.cleanupWG.Done()
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
@@ -412,4 +416,9 @@ func (p *Partition) runProducerCleanup() {
 			return
 		}
 	}
+}
+
+func (p *Partition) startProducerCleanup() {
+	p.cleanupWG.Add(1)
+	go p.runProducerCleanup()
 }

@@ -146,7 +146,11 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 		return fmt.Sprintf("🗑️ Topic '%s' deleted across cluster", topicName)
 	}
 
-	if ch.TopicManager.DeleteTopic(topicName) {
+	deleted, err := ch.TopicManager.DeleteTopic(topicName)
+	if err != nil {
+		return fmt.Sprintf("ERROR: %v", err)
+	}
+	if deleted {
 		return fmt.Sprintf("🗑️ Topic '%s' deleted", topicName)
 	}
 	return fmt.Sprintf("topic '%s' not found", topicName)

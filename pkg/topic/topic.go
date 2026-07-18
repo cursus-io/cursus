@@ -16,15 +16,16 @@ const DefaultConsumerBufSize = 1000
 
 // Topic represents a logical message stream divided into partitions and consumer groups.
 type Topic struct {
-	Name           string
-	Partitions     []*Partition
-	counter        uint64
-	consumerGroups map[string]*types.ConsumerGroup
-	mu             sync.RWMutex
-	cfg            *config.Config
-	streamManager    StreamManager
-	IsIdempotent     bool
-	IsEventSourcing  bool
+	Name            string
+	Partitions      []*Partition
+	counter         uint64
+	consumerGroups  map[string]*types.ConsumerGroup
+	mu              sync.RWMutex
+	cfg             *config.Config
+	streamManager   StreamManager
+	IsIdempotent    bool
+	IsEventSourcing bool
+	closed          bool
 }
 
 // NewTopic initializes a topic with partitions.
@@ -38,14 +39,14 @@ func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.C
 		p := NewPartition(i, name, dh, sm, cfg)
 		p.isIdempotent = idempotent
 		if idempotent {
-			go p.runProducerCleanup()
+			p.startProducerCleanup()
 		}
 		partitions[i] = p
 	}
 	return &Topic{
-		Name:           name,
-		Partitions:     partitions,
-		consumerGroups: make(map[string]*types.ConsumerGroup),
+		Name:            name,
+		Partitions:      partitions,
+		consumerGroups:  make(map[string]*types.ConsumerGroup),
 		cfg:             cfg,
 		streamManager:   sm,
 		IsIdempotent:    idempotent,
@@ -76,6 +77,9 @@ func (t *Topic) GetPartitionForMessage(msg types.Message) int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
+	if t.closed {
+		return -1
+	}
 	return t.getPartitionIndex(msg, len(t.Partitions))
 }
 
@@ -86,6 +90,9 @@ func (t *Topic) AddPartitions(extra int, hp HandlerProvider) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if t.closed {
+		return fmt.Errorf("topic '%s' is closed", t.Name)
+	}
 	for i := 0; i < extra; i++ {
 		idx := len(t.Partitions)
 		dh, err := hp.GetHandler(t.Name, idx)
@@ -95,7 +102,7 @@ func (t *Topic) AddPartitions(extra int, hp HandlerProvider) error {
 		newP := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
 		newP.isIdempotent = t.IsIdempotent
 		if t.IsIdempotent {
-			go newP.runProducerCleanup()
+			newP.startProducerCleanup()
 		}
 		t.Partitions = append(t.Partitions, newP)
 	}
@@ -148,6 +155,9 @@ func (t *Topic) Publish(msg types.Message) error {
 	defer t.mu.RUnlock()
 
 	idx := t.getPartitionIndex(msg, len(t.Partitions))
+	if t.closed {
+		return fmt.Errorf("topic '%s' is closed", t.Name)
+	}
 	if idx == -1 {
 		return fmt.Errorf("no partitions available for topic '%s'", t.Name)
 	}
@@ -164,6 +174,9 @@ func (t *Topic) PublishSync(msg types.Message) error {
 	defer t.mu.RUnlock()
 
 	idx := t.getPartitionIndex(msg, len(t.Partitions))
+	if t.closed {
+		return fmt.Errorf("topic '%s' is closed", t.Name)
+	}
 	if idx == -1 {
 		return fmt.Errorf("no partitions available for topic '%s'", t.Name)
 	}
@@ -183,6 +196,9 @@ func (t *Topic) PublishBatchSync(msgs []types.Message) error {
 	defer t.mu.RUnlock()
 
 	partitionsLen := len(t.Partitions)
+	if t.closed {
+		return fmt.Errorf("topic '%s' is closed", t.Name)
+	}
 	partitioned := make(map[int][]types.Message)
 	for _, msg := range msgs {
 		idx := t.getPartitionIndex(msg, partitionsLen)
@@ -203,6 +219,9 @@ func (t *Topic) GetPartition(partitionID int) (*Partition, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
+	if t.closed {
+		return nil, fmt.Errorf("topic '%s' is closed", t.Name)
+	}
 	if partitionID < 0 || partitionID >= len(t.Partitions) {
 		return nil, fmt.Errorf("partition %d out of range for topic '%s' (0-%d)", partitionID, t.Name, len(t.Partitions)-1)
 	}
@@ -237,4 +256,29 @@ func (t *Topic) NewMessageSignal(partition int) <-chan struct{} {
 		return nil
 	}
 	return t.Partitions[partition].newMessageCh
+}
+
+// Close prevents new topic operations and waits for partition maintenance
+// goroutines to stop. Storage ownership remains with the HandlerProvider.
+func (t *Topic) Close() {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.closed = true
+	partitions := append([]*Partition(nil), t.Partitions...)
+	t.mu.Unlock()
+
+	for _, partition := range partitions {
+		if partition != nil {
+			partition.Close()
+		}
+	}
+}
+
+func (t *Topic) IsClosed() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.closed
 }

@@ -36,6 +36,10 @@ type HandlerProvider interface {
 	GetHandler(topic string, partitionID int) (types.StorageHandler, error)
 }
 
+type topicStorageLifecycle interface {
+	DeleteTopic(topic string) error
+}
+
 func (tm *TopicManager) SetCoordinator(cd *coordinator.Coordinator) {
 	tm.coordinator = cd
 }
@@ -56,6 +60,9 @@ func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent 
 	defer tm.mu.Unlock()
 
 	if existing, ok := tm.topics[name]; ok {
+		if existing.IsClosed() {
+			return fmt.Errorf("topic '%s' is closed pending successful deletion", name)
+		}
 		current := len(existing.Partitions)
 		switch {
 		case partitionCount < current:
@@ -285,14 +292,23 @@ func (tm *TopicManager) Stop() {
 	close(tm.stopCh)
 }
 
-func (tm *TopicManager) DeleteTopic(name string) bool {
+func (tm *TopicManager) DeleteTopic(name string) (bool, error) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	if _, ok := tm.topics[name]; ok {
-		delete(tm.topics, name)
-		return true
+
+	current, ok := tm.topics[name]
+	if !ok {
+		return false, nil
 	}
-	return false
+
+	current.Close()
+	if lifecycle, ok := tm.hp.(topicStorageLifecycle); ok {
+		if err := lifecycle.DeleteTopic(name); err != nil {
+			return false, fmt.Errorf("delete storage for topic '%s': %w", name, err)
+		}
+	}
+	delete(tm.topics, name)
+	return true, nil
 }
 
 func (tm *TopicManager) ListTopics() []string {

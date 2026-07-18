@@ -3,8 +3,8 @@ package fsm
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cursus-io/cursus/util"
@@ -148,19 +148,22 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 	}
 
 	f.mu.Lock()
+	tm := f.tm
+	f.mu.Unlock()
 
+	if tm != nil {
+		if _, err := tm.DeleteTopic(payload.Topic); err != nil {
+			return err
+		}
+	}
+
+	f.mu.Lock()
 	for key := range f.partitionMetadata {
 		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
 			delete(f.partitionMetadata, key)
 		}
 	}
-
-	tm := f.tm
 	f.mu.Unlock()
-
-	if tm != nil {
-		tm.DeleteTopic(payload.Topic)
-	}
 	util.Info("FSM: Deleted topic '%s'", payload.Topic)
 
 	return nil

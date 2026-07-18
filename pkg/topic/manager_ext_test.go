@@ -148,11 +148,14 @@ func TestTopicManager_DeleteAndList(t *testing.T) {
 	assert.Contains(t, topics, "t1")
 	assert.Contains(t, topics, "t2")
 
-	assert.True(t, tm.DeleteTopic("t1"))
-	assert.False(t, tm.DeleteTopic("non-existent"))
+	deleted, err := tm.DeleteTopic("t1")
+	assert.NoError(t, err)
+	assert.True(t, deleted)
+	deleted, err = tm.DeleteTopic("non-existent")
+	assert.NoError(t, err)
+	assert.False(t, deleted)
 	assert.Len(t, tm.ListTopics(), 1)
 }
-
 
 func TestTopicManager_Flush(t *testing.T) {
 	hp := new(MockHandlerProvider)
