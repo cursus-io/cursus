@@ -3,10 +3,12 @@ package util_test
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/cursus-io/cursus/util"
+	xerialsnappy "github.com/eapache/go-xerial-snappy"
 )
 
 // TestCompressMessage_AllTypes tests all supported compression types
@@ -226,5 +228,65 @@ func TestConcurrentCompression(t *testing.T) {
 
 	for err := range errCh {
 		t.Error(err)
+	}
+}
+
+func TestDecompressMessageOutputLimit(t *testing.T) {
+	compressors := map[string]func([]byte) ([]byte, error){
+		"gzip": func(data []byte) ([]byte, error) {
+			return util.CompressMessage(data, "gzip")
+		},
+		"lz4": func(data []byte) ([]byte, error) {
+			return util.CompressMessage(data, "lz4")
+		},
+		"snappy": func(data []byte) ([]byte, error) {
+			return util.CompressMessage(data, "snappy")
+		},
+		"snappy-xerial": func(data []byte) ([]byte, error) {
+			return xerialsnappy.EncodeStream(nil, data), nil
+		},
+		"none": func(data []byte) ([]byte, error) {
+			return data, nil
+		},
+	}
+
+	for name, compress := range compressors {
+		name, compress := name, compress
+		compressionType := name
+		if name == "snappy-xerial" {
+			compressionType = "snappy"
+		}
+
+		t.Run(name+"/at-limit", func(t *testing.T) {
+			original := bytes.Repeat([]byte{'x'}, util.MaxMessageSize)
+			compressed, err := compress(original)
+			if err != nil {
+				t.Fatalf("compress at limit: %v", err)
+			}
+
+			decompressed, err := util.DecompressMessage(compressed, compressionType)
+			if err != nil {
+				t.Fatalf("decompress at limit: %v", err)
+			}
+			if !bytes.Equal(decompressed, original) {
+				t.Fatalf("decompressed data mismatch: got %d bytes, want %d", len(decompressed), len(original))
+			}
+		})
+
+		t.Run(name+"/over-limit", func(t *testing.T) {
+			original := bytes.Repeat([]byte{'x'}, util.MaxMessageSize+1)
+			compressed, err := compress(original)
+			if err != nil {
+				t.Fatalf("compress over limit: %v", err)
+			}
+
+			decompressed, err := util.DecompressMessage(compressed, compressionType)
+			if err == nil {
+				t.Fatalf("expected over-limit error, got %d decoded bytes", len(decompressed))
+			}
+			if !strings.Contains(err.Error(), "exceeds maximum") {
+				t.Fatalf("unexpected over-limit error: %v", err)
+			}
+		})
 	}
 }
