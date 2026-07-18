@@ -60,6 +60,41 @@ func TestStreamIndex_LoadFromDisk(t *testing.T) {
 	assert.Equal(t, uint64(3), entries[2].AggregateVersion)
 }
 
+func TestStreamIndex_ReopenAppendPreservesExistingEntries(t *testing.T) {
+	dir := t.TempDir()
+
+	idx, err := NewStreamIndex(dir, 0)
+	require.NoError(t, err)
+	require.NoError(t, idx.Append("a", 1, 10, 0))
+	require.NoError(t, idx.Close())
+
+	// Reopen before appending a new key. Both the index and sidecar must append
+	// at EOF rather than overwrite their first persisted records.
+	idx, err = NewStreamIndex(dir, 0)
+	require.NoError(t, err)
+	require.NoError(t, idx.Append("b", 1, 20, 1))
+	require.NoError(t, idx.Close())
+
+	idx, err = NewStreamIndex(dir, 0)
+	require.NoError(t, err)
+	defer func() { _ = idx.Close() }()
+
+	for _, tc := range []struct {
+		key    string
+		offset uint64
+	}{
+		{key: "a", offset: 10},
+		{key: "b", offset: 20},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			assert.Equal(t, uint64(1), idx.GetVersion(tc.key))
+			entries, err := idx.Lookup(tc.key, 1)
+			require.NoError(t, err)
+			require.Len(t, entries, 1)
+			assert.Equal(t, tc.offset, entries[0].Offset)
+		})
+	}
+}
 func TestStreamIndex_MultipleKeys(t *testing.T) {
 	dir := t.TempDir()
 

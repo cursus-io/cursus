@@ -3,6 +3,7 @@ package eventsource
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -157,6 +158,17 @@ func (si *StreamIndex) loadFromDisk() error {
 			st.lastOffset = entry.Offset
 			st.entryCount++
 		}
+	}
+
+	// os.ReadFile above uses separate file descriptors, so neither open file's
+	// cursor advances while rebuilding the in-memory cache. Move both cursors
+	// to EOF before future Write calls; otherwise the first append after a
+	// restart overwrites the first persisted record.
+	if _, err := si.indexFile.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("seek index to end: %w", err)
+	}
+	if _, err := si.sidecarFile.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("seek sidecar to end: %w", err)
 	}
 
 	return nil
