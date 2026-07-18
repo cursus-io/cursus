@@ -129,6 +129,113 @@ func TestJoinCluster_Fail(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestJoinCluster_FailsOverFromUnresponsiveSeed(t *testing.T) {
+	stallListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stallListener.Close() }()
+
+	_, portStr, err := net.SplitHostPort(stallListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var port int
+	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
+		t.Fatalf("parse port %q: %v", portStr, err)
+	}
+
+	// Cluster membership stores hosts while the discovery port is shared by all
+	// seeds, so bind the healthy seed to a second loopback address on the same
+	// port.
+	healthyListener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.2", portStr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = healthyListener.Close() }()
+
+	stalled := make(chan struct{})
+	stallDone := make(chan struct{})
+	go func() {
+		defer close(stallDone)
+		conn, err := stallListener.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		lenBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return
+		}
+		msgBuf := make([]byte, binary.BigEndian.Uint32(lenBuf))
+		if _, err := io.ReadFull(conn, msgBuf); err != nil {
+			return
+		}
+		close(stalled)
+		// Keep the connection open until the client's per-seed deadline closes it.
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	healthyAccepted := make(chan struct{})
+	go func() {
+		conn, err := healthyListener.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		lenBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return
+		}
+		msgBuf := make([]byte, binary.BigEndian.Uint32(lenBuf))
+		if _, err := io.ReadFull(conn, msgBuf); err != nil {
+			return
+		}
+		close(healthyAccepted)
+
+		respData, err := json.Marshal(map[string]bool{"success": true})
+		if err != nil {
+			return
+		}
+		respLenBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(respLenBuf, uint32(len(respData)))
+		_, _ = conn.Write(respLenBuf)
+		_, _ = conn.Write(respData)
+	}()
+
+	client := NewTCPClusterClient()
+	client.timeout = 75 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err = client.joinClusterWithContext(
+		ctx,
+		[]string{"127.0.0.1:ignored", "127.0.0.2:ignored"},
+		"test-node",
+		"127.0.0.3:9000",
+		port,
+	)
+	assert.NoError(t, err)
+
+	select {
+	case <-stalled:
+	case <-time.After(time.Second):
+		t.Fatal("unresponsive seed was not attempted")
+	}
+	select {
+	case <-healthyAccepted:
+	case <-time.After(time.Second):
+		t.Fatal("healthy seed was not attempted after the stalled seed")
+	}
+	select {
+	case <-stallDone:
+	case <-time.After(time.Second):
+		t.Fatal("stalled connection did not close after its attempt timed out")
+	}
+}
+
 func TestStartHeartbeat(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
