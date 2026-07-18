@@ -26,9 +26,10 @@ func NewStreamManager(maxConn int, timeout, heartbeat time.Duration) *StreamMana
 	}
 }
 
+// AddStream accepts a legacy commit interval that is intentionally ignored.
 func (sm *StreamManager) AddStream(key string, stream *StreamConnection,
 	readFn func(offset uint64, max int) ([]types.Message, error),
-	commitInterval time.Duration,
+	legacyCommitInterval time.Duration,
 ) error {
 
 	sm.mu.Lock()
@@ -39,7 +40,7 @@ func (sm *StreamManager) AddStream(key string, stream *StreamConnection,
 	}
 
 	sm.streams[key] = stream
-	go stream.Run(readFn, commitInterval)
+	go stream.Run(readFn, legacyCommitInterval)
 	go sm.monitorConnection(key, stream)
 
 	return nil
@@ -51,7 +52,7 @@ func (sm *StreamManager) RemoveStream(key string) {
 
 	if stream, ok := sm.streams[key]; ok {
 		delete(sm.streams, key)
-		stream.Stop()
+		stream.StopWithReason(StreamControlReasonRemoved)
 	}
 }
 
@@ -65,12 +66,13 @@ func (sm *StreamManager) monitorConnection(key string, stream *StreamConnection)
 			sm.mu.Lock()
 			delete(sm.streams, key)
 			sm.mu.Unlock()
-			stream.closeConn()
 			return
 		case <-ticker.C:
 			if time.Since(stream.LastActive()) > sm.timeout {
-				sm.RemoveStream(key)
-				stream.closeConn()
+				sm.mu.Lock()
+				delete(sm.streams, key)
+				sm.mu.Unlock()
+				stream.StopWithReason(StreamControlReasonTimeout)
 				return
 			}
 		}
@@ -91,7 +93,7 @@ func (sm *StreamManager) StopStream(key string) {
 		return
 	}
 
-	stream.Stop()
+	stream.StopWithReason(StreamControlReasonStopped)
 }
 
 func (sm *StreamManager) GetStreamsForPartition(topic string, partitionID int) []*StreamConnection {

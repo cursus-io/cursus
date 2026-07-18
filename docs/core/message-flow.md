@@ -1,139 +1,92 @@
 # Message Flow
 
-This document explains how messages flow through Cursus from publication to consumption.
+Cursus has a durable partition-log data path and separate coordinator control paths. The in-process subscription channels are an optimization/API for embedded consumers; network consumers use `CONSUME` or `STREAM` against partition logs.
 
-## Message Flow Sequence
+## Normal Publish
 
 ```mermaid
 sequenceDiagram
-    participant PROD as Producer
-    participant BROKER as Broker (CommandHandler)
-    participant TM as TopicManager
-    participant PART as Partition
-    participant DH as DiskHandler
-    participant DISK as Disk (Segment Files)
-    participant SM as StreamManager
-    participant CONS as Consumer
+    participant C as Producer
+    participant B as Broker controller
+    participant T as Topic/Partition leader
+    participant D as DiskHandler
+    participant R as Replicas
 
-    PROD->>BROKER: PUBLISH topic message
-    BROKER->>TM: Publish(topic, msg)
-    TM->>TM: dedup check (FNV-1a hash)
-    TM->>PART: select partition\n(key-hash or round-robin)
-
-    par Persistence path
-        PART->>DH: EnqueueBatch → writeCh
-        DH->>DISK: flushLoop: WriteBatch\n(50 msgs / 50ms linger)
-    and Real-time dispatch path
-        PART->>SM: NotifyNewMessage
-        SM->>CONS: push to Consumer.MsgCh
-    end
-
-    Note over CONS,DISK: Polling consumption (CONSUME command)
-    CONS->>BROKER: CONSUME topic partition offset
-    BROKER->>PART: ReadCommitted(offset)
-    PART->>DISK: mmap read
-    DISK-->>BROKER: raw bytes
-    BROKER-->>CONS: length-prefixed messages
+    C->>B: PUBLISH topic=... key=... message=...
+    B->>B: authenticate, authorize, parse policy
+    B->>T: route to partition leader
+    T->>T: producer epoch/sequence and dedup checks
+    T->>D: append assigned offset
+    D-->>T: local write result
+    T->>R: replicate with leader/epoch fence
+    R-->>T: ISR/quorum result
+    T->>T: advance committed HWM
+    T-->>C: OK/ack with assigned offset
 ```
 
-## Architecture: Persistent Log with Real-time Fan-out
+Keyed records use FNV-1a 64-bit hash modulo partition count when the topic policy is `hash_key`; unkeyed records use round-robin. `round_robin` policy ignores keys. Ordering is defined only within one partition.
 
-Cursus is a log-centric message broker designed for high-throughput persistence with low-latency real-time delivery. Unlike brokers that treat memory and disk as separate modes, Cursus employs a unified path where every message is destined for a persistent log, while simultaneously being dispatched to active consumers.
+Acknowledgement strength depends on `acks` and distribution settings. Async enqueue, buffered-writer flush, file sync, replica append, and committed HWM are distinct milestones.
 
-### 1. The Persistence Path (Durability First)
-When a message is published, it is immediately handed off to the `DiskHandler` for the target partition. 
-- **Asynchronous Batching:** Messages are queued in a `writeCh` and flushed to disk in batches (default 50 messages or 50ms) to maximize I/O efficiency.
-- **Segmented Storage:** Data is stored in immutable segment files (default 1GB, configurable), enabling efficient retention and historical replay.
-
-### 2. The Real-time Dispatch Path (Low Latency)
-Simultaneously, the message is enqueued into the partition's in-memory channel.
-- **Push-based Delivery:** A dedicated `run` goroutine for each partition fans out messages to registered Consumer Groups.
-- **Zero-Disk Read for Active Consumers:** Active subscribers receive messages directly from memory, avoiding disk I/O latency for real-time processing.
-
----
+## Consumer Group Read
 
 ```mermaid
-graph TD
-    PUB[Publisher] -->|PUBLISH| CMD[CommandHandler]
-    CMD -->|Publish| TM[TopicManager]
-    TM -->|dedup check| DM{Duplicate?}
-    DM -->|yes| REJ[Reject]
-    DM -->|no| TOP[Topic]
-    TOP -->|partition select| PART[Partition]
-    PART -->|EnqueueBatch| DH[DiskHandler.writeCh]
-    DH -->|flushLoop| DISK[(Segment File)]
-    PART -->|NotifyNewMessage| SM[StreamManager]
-    SM -->|push to active| CONS[Consumer]
+sequenceDiagram
+    participant C as Consumer
+    participant G as Group coordinator
+    participant L as Partition leader
 
-    CONS2[Consumer] -->|CONSUME| CMD2[CommandHandler]
-    CMD2 -->|ReadCommitted| PART2[Partition]
-    PART2 -->|mmap read| DISK2[(Segment File)]
+    C->>G: JOIN_GROUP / SYNC_GROUP
+    G-->>C: member, generation, assignments
+    C->>G: FETCH_OFFSET per assignment
+    G-->>C: committed nextOffset
+    C->>L: CONSUME or STREAM isolation=read_committed
+    L-->>C: records bounded by HWM/LSO
+    C->>C: process records
+    C->>G: BATCH_COMMIT lastProcessedOffset+1
+    G-->>C: OK or fencing/error
 ```
 
-## Detailed Message Journey
+The broker committed offset is authoritative. A lower request offset does not replay records before an existing commit. A missing offset follows `autoOffsetReset`; an offset removed by retention returns `OFFSET_OUT_OF_RANGE`.
 
-### Wire Protocol
-All communication uses a TCP-based length-prefixed protocol:
-1. **Length Prefix:** 4-byte big-endian `uint32` indicating the payload size.
-2. **Payload:** The actual message or command data.
+`read_committed` is the default: it returns ordinary records and committed transaction output, skips aborted/control records, and stops at the earliest unresolved transaction. `read_uncommitted` exposes the raw committed partition log.
 
-### Deduplication
-Cursus implements an optional deduplication mechanism in `TopicManager`:
-- A `dedupMap` (sync.Map) tracks message IDs (FNV-1a hash of the payload).
-- Duplicate messages within the `CleanupInterval` (default 30 mins) are rejected.
+## Transactional Consume-Process-Produce
 
-### Partition Selection
-Messages are routed to partitions within a topic based on:
-- **Key-based Routing:** If a `Key` is provided, `hash(Key) % PartitionCount` ensures ordering for related messages.
-- **Round-robin Routing:** If no key is provided, messages are distributed evenly to maximize throughput.
+```mermaid
+sequenceDiagram
+    participant C as Transactional client
+    participant X as Transaction coordinator
+    participant P as Output partition leaders
+    participant G as Group coordinator
 
----
+    C->>X: INIT_PRODUCER_ID, BEGIN_TXN
+    C->>X: TXN_PUBLISH (staged)
+    C->>X: SEND_OFFSETS_TO_TXN (one consumer scope)
+    C->>X: END_TXN result=commit
+    X->>X: persist committing state
+    X->>P: append idempotent records and markers
+    X->>G: fenced bulk offset commit
+    X->>X: persist committed decision
+    X-->>C: OK state=committed
+```
 
-## Distribution Mechanism
+Output records remain invisible to `read_committed` until the partition marker and final coordinator decision agree. A restored `committing` transaction is retried. Each completed epoch must be reinitialized before the next transaction; uncertain finalization retry keeps the old epoch.
 
-### In-Memory Fan-out (`SUBSCRIBE`)
-Used by Consumer Groups for real-time processing:
-1. Partition's `run` loop reads from the internal buffer.
-2. Message is forwarded to the `MsgCh` of the assigned consumer in each group.
-3. Distribution follows `PartitionID % ConsumerCount` within a group.
+## Event Sourcing
 
-### Disk-based Replay (`CONSUME`)
-Used for batch processing or catching up:
-1. The `CONSUME` command triggers a direct read from disk segments via `DiskHandler`.
-2. Uses **Memory-mapped I/O (mmap)** for efficient random access.
-3. Supports offset-based positioning to resume from any point in the log.
+`APPEND_STREAM` hashes the aggregate key to a partition leader, checks `version = current + 1`, appends/replicates the event, advances committed state, and updates the stream index. `READ_STREAM` and `STREAM_VERSION` are leader-routed and bounded by committed HWM. Snapshots are quorum-replicated optimizations; committed event replay remains authoritative.
 
----
+## Embedded Fan-out
 
+`TopicManager.RegisterConsumerGroup` creates in-process partition/group/consumer channels using configured capacities. It provides low-latency fan-out inside the broker process, but it is not the dynamic network group coordinator and does not replace durable offset commits, generation fencing, or log replay.
 
-## Performance Characteristics
+## Failure Handling
 
-| Feature | Mechanism | Benefit |
-|---------|-----------|---------|
-| **Write Performance** | Asynchronous Batching & `fsync` | High throughput with durability guarantees. |
-| **Read Latency** | In-memory bypass for active subs | Sub-millisecond delivery for real-time apps. |
-| **Scalability** | Partition-level concurrency | Parallel processing across CPU cores. |
-| **Reliability** | Immutable Segmented Logs | Safe recovery and historical auditability. |
-
----
-
-## Summary of Consumption Patterns
-
-| Pattern | Command | Data Source | Delivery Mode | Use Case |
-|---------|---------|-------------|---------------|----------|
-| **Real-time Push** | `SUBSCRIBE` | In-memory Buffer | **Streaming** | Stream processing, real-time alerts. |
-| **Historical Pull** | `CONSUME` | Disk Segments | **Polling** | Batch jobs, data analysis, specific offset lookup. |
-| **Log Streaming** | `CONSUME` | Disk Segments | **Streaming** | Catching up from offset and continuing to listen. |
-
-### Consumption Modes for `CONSUME`
-
-Cursus supports two modes when reading from the persistent log:
-
-1. **Polling Mode (Standard):**
-   - The client requests a specific range of messages from an offset.
-   - The server reads the available segments, streams the results, and completes the command.
-   - Ideal for batch processing or indexing.
-
-2. **Streaming Mode (Follow):**
-   - When requested with a "follow" or "tail" intent (implementation via connection persistence), the server continues to stream new messages as they are flushed to disk.
-   - This bridges the gap between historical replay and real-time processing.
+- routing failures return `NOT_LEADER` or `NOT_COORDINATOR` with redirect data,
+- stale group members/generations and producer epochs are fenced,
+- malformed/unauthorized commands fail before mutation,
+- partial active-segment tails are truncated during restart recovery,
+- HWM is clamped to durable tail,
+- stream socket loss without a close-control frame is retryable through the committed offset,
+- retention gaps require explicit earliest/latest/error handling.

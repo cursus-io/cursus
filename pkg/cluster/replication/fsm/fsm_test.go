@@ -12,8 +12,10 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
+	"github.com/stretchr/testify/require"
 )
 
 type MockStorageHandler struct {
@@ -30,10 +32,17 @@ func (m *MockStorageHandler) AppendMessage(topic string, partition int, msg *typ
 	msg.Offset = m.offset
 	return m.offset, nil
 }
+func (m *MockStorageHandler) AppendMessageSync(topic string, partition int, msg *types.Message) (uint64, error) {
+	return m.AppendMessage(topic, partition, msg)
+}
 func (m *MockStorageHandler) AppendMessageWithOffset(topic string, partition int, msg *types.Message) error {
 	return nil
 }
+func (m *MockStorageHandler) ReadMessages(offset uint64, max int) ([]types.Message, error) {
+	return nil, nil
+}
 func (m *MockStorageHandler) GetAbsoluteOffset() uint64 { return m.offset }
+func (m *MockStorageHandler) GetFirstOffset() uint64    { return 0 }
 func (m *MockStorageHandler) GetFlushedOffset() uint64  { return m.offset }
 func (m *MockStorageHandler) GetLatestOffset() uint64   { return m.offset }
 func (m *MockStorageHandler) ReserveOffsets(n int) uint64 {
@@ -41,7 +50,9 @@ func (m *MockStorageHandler) ReserveOffsets(n int) uint64 {
 	m.offset += uint64(n)
 	return start
 }
-func (m *MockStorageHandler) Close() error { return nil }
+func (m *MockStorageHandler) TruncateTo(uint64) error { return nil }
+func (m *MockStorageHandler) Flush()                  {}
+func (m *MockStorageHandler) Close() error            { return nil }
 
 type MockHandlerProvider struct{}
 
@@ -149,6 +160,57 @@ func TestBrokerFSM_Apply_Partition(t *testing.T) {
 	}
 }
 
+func TestBrokerFSM_PartitionCommitIsMonotonicAndEpochFenced(t *testing.T) {
+	f := newTestFSM()
+	require.NoError(t, f.tm.CreateTopic("orders", 1, false, false))
+	metadata := PartitionMetadata{
+		Leader:      "node-1",
+		LeaderEpoch: 4,
+		Replicas:    []string{"node-1", "node-2"},
+		ISR:         []string{"node-1", "node-2"},
+	}
+	data, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + string(data))}))
+
+	commit := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":4,"hwm":1}`
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + commit)}))
+	require.Equal(t, uint64(1), f.GetPartitionMetadata("orders-0").CommittedHWM)
+
+	stale := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":3,"hwm":2}`
+	staleResult := f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + stale)})
+	staleErr, ok := staleResult.(error)
+	require.True(t, ok)
+	require.Error(t, staleErr)
+	regression := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":4,"hwm":0}`
+	regressionResult := f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + regression)})
+	regressionErr, ok := regressionResult.(error)
+	require.True(t, ok)
+	require.Error(t, regressionErr)
+	require.Equal(t, uint64(1), f.GetPartitionMetadata("orders-0").CommittedHWM)
+}
+
+func TestBrokerFSM_SnapshotRestoresCommittedPartitionWatermark(t *testing.T) {
+	f := newTestFSM()
+	metadata := PartitionMetadata{Leader: "node-1", LeaderEpoch: 2, CommittedHWM: 19, PartitionCount: 1}
+	data, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + string(data)), Index: 7}))
+
+	snapshot, err := f.Snapshot()
+	require.NoError(t, err)
+	buf := new(bytes.Buffer)
+	sink := &MockSnapshotSink{Writer: buf}
+	require.NoError(t, snapshot.Persist(sink))
+
+	restored := newTestFSM()
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))))
+	restoredMetadata := restored.GetPartitionMetadata("orders-0")
+	require.NotNil(t, restoredMetadata)
+	require.Equal(t, uint64(19), restoredMetadata.CommittedHWM)
+	require.Equal(t, 2, restoredMetadata.LeaderEpoch)
+}
+
 func TestBrokerFSM_Apply_UnknownCommand(t *testing.T) {
 	fsm := newTestFSM()
 
@@ -183,7 +245,7 @@ func TestBrokerFSM_Apply_UpdatesAppliedIndex(t *testing.T) {
 func TestBrokerFSM_Snapshot_Restore(t *testing.T) {
 	fsm := newTestFSM()
 	fsm.brokers["b1"] = &BrokerInfo{ID: "b1", Addr: "a1"}
-	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{Leader: "l1"}
+	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{Leader: "l1", PartitionCount: 1}
 	fsm.logs[5] = &ReplicationEntry{Topic: "t1"}
 	fsm.applied = 5
 
@@ -266,7 +328,7 @@ func TestBrokerFSM_ValidateIdempotency(t *testing.T) {
 		t.Error("Expected error for first message with SeqNum 2, got nil")
 	}
 
-	fsm.updateProducerState("t1", -1, "p1", 1)
+	fsm.updateProducerState("t1", -1, "p1", 0, 1)
 
 	cmd.Partition = 0
 	cmd.Messages[0].SeqNum = 2
@@ -275,6 +337,42 @@ func TestBrokerFSM_ValidateIdempotency(t *testing.T) {
 	}
 }
 
+func TestBrokerFSM_ProducerEpochFencing(t *testing.T) {
+	fsm := newTestFSM()
+	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{PartitionCount: 1, Idempotent: true}
+	if err := fsm.tm.CreateTopic("t1", 1, true, false); err != nil {
+		t.Fatalf("CreateTopic failed: %v", err)
+	}
+
+	cmd := &types.MessageCommand{
+		Topic:     "t1",
+		Partition: 0,
+		Messages:  []types.Message{{ProducerID: "p1", Epoch: 10, SeqNum: 1, Payload: "m1"}},
+	}
+	if err := fsm.validateMessageCommand(cmd); err != nil {
+		t.Fatalf("initial epoch should be valid: %v", err)
+	}
+	fsm.applyMessageBatch(cmd)
+
+	nextEpoch := &types.MessageCommand{
+		Topic:     "t1",
+		Partition: 0,
+		Messages:  []types.Message{{ProducerID: "p1", Epoch: 11, SeqNum: 1, Payload: "m2"}},
+	}
+	if err := fsm.validateMessageCommand(nextEpoch); err != nil {
+		t.Fatalf("higher epoch should fence previous producer and restart sequence: %v", err)
+	}
+	fsm.applyMessageBatch(nextEpoch)
+
+	staleEpoch := &types.MessageCommand{
+		Topic:     "t1",
+		Partition: 0,
+		Messages:  []types.Message{{ProducerID: "p1", Epoch: 10, SeqNum: 2, Payload: "stale"}},
+	}
+	if err := fsm.validateMessageCommand(staleEpoch); err == nil {
+		t.Fatal("expected stale producer epoch to be rejected")
+	}
+}
 func TestBrokerFSM_SequenceScope_Partition(t *testing.T) {
 	fsm := newTestFSM()
 	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{PartitionCount: 2, Idempotent: true}
@@ -381,7 +479,7 @@ func TestBrokerFSM_TopicCreation_ReplicaSubset(t *testing.T) {
 func TestBrokerFSM_TopicCreation_DefaultRF_Capped(t *testing.T) {
 	fsm := newTestFSM()
 
-	// Register only 2 brokers — default RF=3 should be capped to 2.
+	// Register only 2 brokers - default RF=3 should be capped to 2.
 	for i := 1; i <= 2; i++ {
 		data, _ := json.Marshal(BrokerInfo{
 			ID:     fmt.Sprintf("broker-%d", i),
@@ -413,7 +511,7 @@ func TestBrokerFSM_TopicCreation_DefaultRF_Capped(t *testing.T) {
 func TestBrokerFSM_TopicCreation_DefaultRF_Satisfied(t *testing.T) {
 	fsm := newTestFSM()
 
-	// Register 5 brokers — enough to satisfy the default RF=3 without capping.
+	// Register 5 brokers - enough to satisfy the default RF=3 without capping.
 	// This proves that the default is actually 3 and not just "all available brokers".
 	for i := 1; i <= 5; i++ {
 		data, _ := json.Marshal(BrokerInfo{
@@ -850,5 +948,171 @@ func TestBrokerFSM_Snapshot_Restore_GroupState(t *testing.T) {
 	}
 	if group.Generation != cd.GetGeneration("test-group") {
 		t.Errorf("Generation mismatch: expected %d, got %d", cd.GetGeneration("test-group"), group.Generation)
+	}
+}
+
+func TestBrokerFSM_Snapshot_Restore_TransactionState(t *testing.T) {
+	cfg := &config.Config{LogDir: t.TempDir()}
+	tm := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+	txnManager := transaction.NewManager()
+	f := NewBrokerFSM(tm, nil)
+	f.SetTransactionManager(txnManager)
+
+	producerID, epoch, initErr := txnManager.InitProducer("tx-restore")
+	if initErr != nil {
+		t.Fatalf("init producer failed: %v", initErr)
+	}
+	if err := txnManager.Begin("tx-restore", producerID, epoch); err != nil {
+		t.Fatalf("begin failed: %v", err)
+	}
+	if err := txnManager.AddOffsets("tx-restore", producerID, epoch, []transaction.OffsetOperation{{Topic: "orders", Group: "workers", Member: "member-1", Generation: 3, Partition: 0, Offset: 12}}); err != nil {
+		t.Fatalf("add offsets failed: %v", err)
+	}
+
+	snapshot, err := f.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	buf := new(bytes.Buffer)
+	sink := &MockSnapshotSink{Writer: buf}
+	if err := snapshot.Persist(sink); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+
+	restoredTxnManager := transaction.NewManager()
+	newFSM := NewBrokerFSM(tm, nil)
+	newFSM.SetTransactionManager(restoredTxnManager)
+	if err := newFSM.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatalf("Restore failed: %v", err)
+	}
+
+	tx, err := restoredTxnManager.Status("tx-restore")
+	if err != nil {
+		t.Fatalf("restored transaction missing: %v", err)
+	}
+	if tx.Producer != producerID || tx.Epoch != epoch || len(tx.Offsets) != 1 || tx.Offsets[0].Offset != 12 {
+		t.Fatalf("unexpected restored transaction: %+v", tx)
+	}
+}
+func TestBrokerFSM_RestoreDefersTransactionStateUntilManagerAttached(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	hp := &MockHandlerProvider{}
+	tm := topic.NewTopicManager(cfg, hp, nil)
+	manager := transaction.NewManager()
+	f := NewBrokerFSM(tm, nil)
+	f.SetTransactionManager(manager)
+	producerID, epoch, initErr := manager.InitProducer("tx-deferred")
+	if initErr != nil {
+		t.Fatalf("init producer failed: %v", initErr)
+	}
+	if err := manager.Begin("tx-deferred", producerID, epoch); err != nil {
+		t.Fatalf("begin failed: %v", err)
+	}
+	if _, err := manager.PrepareCommit("tx-deferred", producerID, epoch); err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+
+	snapshot, err := f.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	buf := &bytes.Buffer{}
+	sink := &MockSnapshotSink{Writer: buf}
+	if err := snapshot.Persist(sink); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+
+	restored := NewBrokerFSM(tm, nil)
+	if err := restored.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatalf("Restore failed: %v", err)
+	}
+	restoredManager := transaction.NewManager()
+	restored.SetTransactionManager(restoredManager)
+	tx, err := restoredManager.Status("tx-deferred")
+	if err != nil {
+		t.Fatalf("restored transaction missing: %v", err)
+	}
+	if tx.State != transaction.StateCommitting || tx.Epoch != epoch {
+		t.Fatalf("unexpected restored transaction: %+v", tx)
+	}
+}
+func TestBrokerFSMOffsetSyncRejectsStaleGeneration(t *testing.T) {
+	cfg := config.DefaultConfig()
+	tm := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
+	if err := cd.RegisterGroup("events", "workers", 2); err != nil {
+		t.Fatalf("register group: %v", err)
+	}
+	if _, err := cd.AddConsumer("workers", "member-1"); err != nil {
+		t.Fatalf("add member: %v", err)
+	}
+	f := NewBrokerFSM(tm, cd)
+
+	valid := &raft.Log{Data: []byte(`OFFSET_SYNC:{"group":"workers","topic":"events","member":"member-1","generation":1,"partition":0,"offset":5}`)}
+	if result := f.Apply(valid); result != nil {
+		t.Fatalf("valid fenced offset apply failed: %v", result)
+	}
+
+	if _, err := cd.AddConsumer("workers", "member-2"); err != nil {
+		t.Fatalf("add second member: %v", err)
+	}
+	stale := &raft.Log{Data: []byte(`OFFSET_SYNC:{"group":"workers","topic":"events","member":"member-1","generation":1,"partition":0,"offset":6}`)}
+	result := f.Apply(stale)
+	err, ok := result.(error)
+	if !ok {
+		t.Fatalf("expected stale generation error, got %T %v", result, result)
+	}
+	if got, want := err.Error(), "ERROR: GEN_MISMATCH current=2 requested=1 group=workers member=member-1"; got != want {
+		t.Fatalf("unexpected stale generation error: got %q want %q", got, want)
+	}
+
+	offset, found := cd.GetOffset("workers", "events", 0)
+	if !found || offset != 5 {
+		t.Fatalf("stale replicated commit changed offset: found=%v offset=%d", found, offset)
+	}
+}
+
+func TestBrokerFSMGroupExpirationIsGenerationFenced(t *testing.T) {
+	cfg := config.DefaultConfig()
+	tm := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
+	if err := cd.RegisterGroup("events", "workers", 2); err != nil {
+		t.Fatalf("register group: %v", err)
+	}
+	if _, err := cd.AddConsumer("workers", "member-1"); err != nil {
+		t.Fatalf("add first member: %v", err)
+	}
+	if _, err := cd.AddConsumer("workers", "member-2"); err != nil {
+		t.Fatalf("add second member: %v", err)
+	}
+	f := NewBrokerFSM(tm, cd)
+
+	expire := &raft.Log{Data: []byte(`GROUP_SYNC:{"type":"EXPIRE","group":"workers","generation":2,"members":["member-1"]}`)}
+	if result := f.Apply(expire); result != nil {
+		t.Fatalf("group expiration failed: %v", result)
+	}
+	status, err := cd.GetGroupStatus("workers")
+	if err != nil {
+		t.Fatalf("group status: %v", err)
+	}
+	if status.Generation != 3 || status.MemberCount != 1 {
+		t.Fatalf("unexpected status after expiration: generation=%d members=%d", status.Generation, status.MemberCount)
+	}
+
+	result := f.Apply(expire)
+	applyErr, ok := result.(error)
+	if !ok {
+		t.Fatalf("expected retry to be generation fenced, got %T %v", result, result)
+	}
+	if got, want := applyErr.Error(), "ERROR: GEN_MISMATCH current=3 requested=2 group=workers"; got != want {
+		t.Fatalf("unexpected expiration retry error: got %q want %q", got, want)
+	}
+	status, err = cd.GetGroupStatus("workers")
+	if err != nil {
+		t.Fatalf("group status after retry: %v", err)
+	}
+	if status.Generation != 3 || status.MemberCount != 1 {
+		t.Fatalf("expiration retry changed state: generation=%d members=%d", status.Generation, status.MemberCount)
 	}
 }

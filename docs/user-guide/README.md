@@ -1,179 +1,115 @@
 # Getting Started
 
-This page provides a quick start guide to get cursus running on your system. 
+This guide starts one local broker and exercises it with the in-repository Go SDK examples. See [Installation](installation.md) for build/container details and [Configuration](configuration.md) before production use.
 
-It covers the basic prerequisites, installation methods, and initial verification steps to ensure the broker is operational. For detailed configuration options, see [Configuration](../user-guide/configuration.md).
+## Start With Docker
 
-## Prerequisites
-
-Before running cursus, ensure you have the following installed:
-
-| Requirement | Version | Purpose |
-|------------|---------|---------|
-| Go  | 1.21+ | Required for building from source |
-| Docker  | 20.10+ | Required for containerized deployment |
-| Make  | 3.81+ | For using Makefile commands (Optional) |
-
-# Quick Start with Docker
-
-The fastest way to get cursus running is using Docker Compose:
-
-## Clone the repository
-
+```bash
+docker pull ghcr.io/cursus-io/cursus:latest
+docker run --rm --name cursus \
+  -p 9000:9000 -p 9080:9080 -p 9100:9100 \
+  -v cursus-data:/root/broker-logs \
+  ghcr.io/cursus-io/cursus:latest
 ```
-git clone https://github.com/cursus-io/cursus
+
+The default ports are:
+
+| Port | Purpose |
+|---:|---|
+| 9000 | length-prefixed TCP client protocol |
+| 9080 | `/live`, `/ready`, `/health` |
+| 9100 | Prometheus `/metrics` |
+
+In another terminal:
+
+```bash
+curl -f http://localhost:9080/live
+curl -f http://localhost:9080/ready
+curl -f http://localhost:9100/metrics
+```
+
+For production, mount a configuration, enable client TLS/auth, configure a separate broker-internal mTLS listener for clusters, and use durable storage.
+
+## Start From Source
+
+Cursus requires Go 1.25.0 or newer.
+
+```bash
+git clone https://github.com/cursus-io/cursus.git
 cd cursus
-```
-
-## Start the broker
-
-This starts a container with:
-
-```
-docker-compose -f manifests/docker-compose.yml up -d
-```
-
-- Main broker on port 9000 (TCP)
-- Health check endpoint on port 9080 (HTTP)
-- Prometheus metrics on port 9100 (HTTP)
-
-The container uses the configuration at 
-`manifests/config.yaml` and mounts a volume for persistent storage at `./logs`.
-
-
-# Quick Start from Source
-
-To build and run cursus from source:
-
-## Build all binaries
-
-```
 make build
-```
-
-## Run the broker
-
-```
 ./bin/cursus
-
-// Or run in development mode:
-// make run
-```
-The make build target invokes three sub-targets:
-
-- `build-api` → builds `./bin/cursus` 
-- `build-cli` → builds `./bin/cursus-cli`
-- `build-bench` → builds `./bin/cursus-bench` 
-
-All builds use `CGO_ENABLED=0` and target Linux with static linking via `-ldflags="-s -w`".
-
-
-# Verifying the Installation
-
-After starting cursus, verify it's running correctly:
-
-1. **Health Check**
-
-   ```
-   curl http://localhost:9080/health
-   ```
-   Expected response: OK with HTTP 200 status.
-
-2. **Metrics Endpoint**
-
-    ```
-    curl http://localhost:9100/metrics
-    ```
-    Expected response: Prometheus-formatted metrics including:
-    - `broker_messages_published_total`
-    - `broker_messages_consumed_total`
-    - `broker_active_consumers`
-
-3. **TCP Connection Test**
-
-    Connect to the broker using `netcat`:
-
-    ```
-    nc localhost 9000
-    ```
-
-    Then send a command like `LIST` to verify command processing.
-
-
-# Running Modes
-
-cursus can run in two modes:
-
-## Broker Mode (Server)
-
-This is the standard mode that starts the TCP server:
-
-```
-./bin/cursus
-
-// Or using make:
-// make run
 ```
 
-The broker process:
+Development mode:
 
-1. Loads configuration 
-2. Initializes DiskManager for persistence
-3. Initializes TopicManager for routing
-4. Starts TCP listener on port specified in `cfg.BrokerPort`
-5. Starts health check HTTP server on port 9080
-6. If enabled, starts Prometheus exporter on `cfg.ExporterPort`
-
-
-## CLI Mode (Interactive)
-
-This mode provides an interactive command-line interface:
-
+```bash
+make run
 ```
+
+`make build` creates `bin/cursus` and `bin/cursus-cli`. Benchmarks are Docker/Go test workloads rather than a third binary.
+
+## Publish And Consume With Go Examples
+
+With the broker running:
+
+```bash
+cd examples
+go run ./publisher
+```
+
+Then run the consumer:
+
+```bash
+cd examples
+go run ./consumer
+```
+
+`examples/config.yaml` uses `localhost:9000`, topic `example-topic`, and group `example-group`. The default Go consumer uses broker-owned offset resume and `read_committed`; after successful processing it commits the next offset. Edit the example configuration or construct `sdk.ConsumerConfig` directly for `auto_offset_reset`, TLS/auth, and other settings.
+
+## CLI Scope
+
+```bash
 ./bin/cursus-cli
-
-// Or using make:
-// make cli
 ```
 
-The CLI process:
+The current CLI creates local broker components and executes commands in-process. It is useful for command exploration, but it is not a remote network administration client for an already running broker. Use the Go/Java/Python SDKs or a framed protocol client for remote operations.
 
-1. Loads the same configuration
-2. Initializes DiskManager and TopicManager
-3. Creates a CommandHandler for processing commands
-4. Enters interactive mode accepting `stdin` commands
+Raw `nc localhost 9000` text is not valid because every TCP payload requires a 4-byte big-endian length prefix.
 
-Supports commands: `CREATE`, `DELETE`, `LIST`, `SUBSCRIBE`, `PUBLISH`, `CONSUME`, `EXIT` 
+## Standalone And Cluster Modes
 
-# Common Makefile Commands
+Standalone mode is the default. Cluster mode adds Raft metadata, partition leaders, group/transaction coordinator routing, replication quorum, and broker-internal authentication/mTLS. Client commands remain the same and redirects identify the correct owner.
 
-The repository includes a comprehensive Makefile for development tasks:
+Use the checked-in E2E compose topology as a development reference:
 
-## Command	Purpose
-| Command | Description |
-|---------|-------------|
-| `make build` | Build all binaries (broker, CLI, benchmark) |
-| `make run` | Run broker in development mode |
-| `make cli` | Run CLI in development mode |
-| `make test` | Run unit tests with race detection |
-| `make bench` | Run performance benchmarks |
-| `make lint` | Run `golangci-lint` |
-| `make docker` | Build Docker image |
-| `make compose-up` | Start docker-compose stack |
-| `make compose-down` | Stop docker-compose stack |
-| `make clean` | Remove build artifacts and test data |
-| `make coverage` | Generate test coverage report |
+```bash
+make e2e
+```
 
+The 100000-record standalone/cluster benchmark is intentionally opt-in:
 
-# Next Steps
+```bash
+RUN_E2E_BENCHMARK=1 go test -v -timeout 30m ./test/e2e-benchmark/...
+```
 
-Now that you have cursus running, you can:
+## Essential Semantics
 
-- Configure the broker - Learn about [configuration options in Configuration](./configuration.md)
-- Create topics and publish messages - See [Running the Broker for basic operations](../core/server.md)
-- Understand the architecture - Review [Architecture Overview for system design](../architecture.md)
-- Monitor the broker - Learn about [metrics in Monitoring and Observability](../reference/observability.md)
-- Tune performance - See [Performance Tuning for optimization parameters](../reference/performance.md)
+- offsets are `nextOffset`; commit `lastProcessedOffset + 1`,
+- process before commit for at-least-once delivery,
+- `read_committed` is the default; `read_uncommitted` exposes raw control records,
+- one broker transaction may commit offsets for one `(topic, group, member, generation)` scope,
+- initialize a new producer epoch before each new transaction; finalization retry keeps the old epoch,
+- ordering is per partition,
+- retention deletion can move the earliest offset,
+- standalone keyed compaction creates physical holes without renumbering logical offsets,
+- compaction is rejected for distributed and event-sourcing topics.
 
-For production deployments, refer to Deployment for [best practices](../reference/performance.md) and [operational considerations](../reference/observability.md)
+## Next Steps
 
+- [Wire Protocol](../protocol-spec.md)
+- [SDK Overview](../sdk-overview.md)
+- [Consumer Groups](../core/topic/consumer-groups.md)
+- [Event Sourcing](event-sourcing.md)
+- [Observability](../reference/observability.md)
+- [Performance](../reference/performance.md)

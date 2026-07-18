@@ -43,6 +43,7 @@ graph TD
 - **Ordering guarantees**: All messages from a single partition go to the same consumer
 - **Independent consumption**: Multiple consumer groups can consume the same topic independently
 - **Static assignment**: Partition-to-consumer mapping is established at registration time
+- **Durable offset resume**: The broker stores committed next offsets per topic, group, and partition
 
 ## Data Structures
 
@@ -145,11 +146,141 @@ This design enables multiple independent consumer groups to consume the same top
 
 Multiple consumer groups can consume the same topic simultaneously. Each group maintains:
 
-- Independent offset tracking (via direct channel consumption or disk reads)
+- Independent committed offsets for each partition
 - Separate partition-to-consumer mappings
 - Isolated message delivery
 
+## Durable Consumer Group Offsets
+
+Cursus stores consumer group offsets in the broker, keyed by:
+
+```
+(topic, consumerGroup, partition) -> nextOffset
+```
+
+`nextOffset` is the offset the group should read next after processing a record
+or batch. For example, after processing records with offsets `10` through `14`,
+commit `15`.
+
+Offsets are written to the internal `__consumer_offsets` topic. The coordinator
+replays that topic during broker startup, so committed offsets survive broker
+restart. In distributed mode, offset updates also flow through the Raft FSM and
+are included in FSM snapshots.
+
+### Commit and Resume Contract
+A group is bound to the topic supplied at registration. `JOIN_GROUP`,
+`SYNC_GROUP`, `HEARTBEAT`, and `LEAVE_GROUP` must name that topic (or a topic
+accepted by the registered topic pattern). A mismatch returns
+`ERROR: topic_not_assigned_to_group ...` without changing membership.
+
+
+Use these broker commands:
+
+```
+FETCH_OFFSET topic=<topic> group=<group> partition=<partition>
+COMMIT_OFFSET topic=<topic> group=<group> partition=<partition> offset=<nextOffset> member=<actual-id> generation=<N>
+BATCH_COMMIT topic=<topic> group=<group> member=<member> generation=<N> P0:<nextOffset>,P1:<nextOffset>
+```
+
+If no offset has been committed for the key, `FETCH_OFFSET` returns `OK offset=0`. This is
+the default earliest policy. A consumer may request `autoOffsetReset=latest` on
+`CONSUME`/`STREAM` for groups with no saved offset when it wants to skip retained
+history.
+
+When a committed offset exists, `CONSUME` and `STREAM` resume from that offset.
+Retained records before the committed offset are not delivered again to the same
+group/partition, even if the request includes a lower explicit `offset=`.
+
+Commits are monotonic. A commit lower than the current offset is rejected and the
+stored offset is left unchanged. Recommitting the same offset is idempotent.
+Every commit is fenced by the current member, generation, and partition
+assignment. In distributed mode this validation runs again when the replicated
+metadata entry is applied, so a rebalance between request parsing and state
+application cannot commit an offset for a stale owner. A rejected batch applies
+none of its offsets. Batch entries are parsed strictly, so malformed entries,
+invalid partitions or offsets, and duplicate partitions also reject the whole
+batch.
+
+### Recommended Commit Timing
+
+For at-least-once delivery, process the records first, then commit
+`lastProcessedOffset + 1`. If the process crashes after handling a record but
+before committing, the record may be delivered again after restart.
+
+If a record handler returns an error, the SDK leaves the failed batch
+uncommitted and resumes from the last broker committed offset.
+
+Committing before processing gives at-most-once behavior for that client: a crash
+after the commit can skip unprocessed records. Consumer-group commits alone do
+not make external side effects exactly once.
+
+For a consume-process-produce workflow, `SEND_OFFSETS_TO_TXN` may stage several
+partitions only when they all share one `(topic, group, member, generation)`
+scope. The transaction applies those offsets through one fenced bulk commit and
+keeps output hidden until the partition markers and durable coordinator decision
+agree. Use separate transactions for separate consumer scopes, and keep
+non-broker effects idempotent or transactional in their own system.
+
+Network consumers should use `read_committed` unless they intentionally need the
+raw committed partition log. `read_uncommitted` can include unresolved
+transaction records and transaction control records.
+
+### Game Server Example
+
+A server such as wargame-IOCP should use Cursus as the source of truth for group
+offsets:
+
+```
+JOIN_GROUP topic=match-events group=wargame-iocp member=game-01
+# broker returns an actual member ID and generation
+SYNC_GROUP topic=match-events group=wargame-iocp member=<actual-id> generation=<N>
+FETCH_OFFSET topic=match-events partition=0 group=wargame-iocp
+CONSUME topic=match-events partition=0 offset=<nextOffset> group=wargame-iocp member=<actual-id> generation=<N> isolation=read_committed batch=128
+COMMIT_OFFSET topic=match-events partition=0 group=wargame-iocp offset=<lastProcessedOffset+1> member=<actual-id> generation=<N>
+```
+
+After this migration, the game server should not need an external
+`cursus_consumer_offsets` table for resume. Different game server groups can use
+different group names and will receive independent offsets.
+
 ## Concurrency and Thread Safety
+
+## Coordinator Membership Lifecycle
+
+The broker coordinator owns dynamic group membership for pull and stream
+consumers:
+
+1. `REGISTER_GROUP` establishes the topic and partition set.
+2. A fresh `JOIN_GROUP` creates a broker-assigned member ID, increments the
+   generation, and runs deterministic range assignment.
+3. `SYNC_GROUP` confirms assignments for that member and generation.
+4. `HEARTBEAT` refreshes the session only when both values are current.
+5. `COMMIT_OFFSET` and `BATCH_COMMIT` apply only to partitions owned by
+   that member in the current generation.
+6. `LEAVE_GROUP` or session expiration removes membership, increments the
+   generation once, and reassigns partitions.
+
+After a transient connection failure, a client should first send:
+
+```text
+JOIN_GROUP topic=<topic> group=<group> member=<actual-id> generation=<N>
+```
+
+If the member is still active and the generation is current, the broker returns
+`resumed=true` with unchanged assignments. `GEN_MISMATCH` tells the client
+to sync the authoritative generation when the member still exists.
+`member_not_found` requires a fresh join.
+
+In a cluster, only the broker selected by the group coordinator ring evaluates
+session expiration. A broker that newly acquires a group waits one full session
+timeout before expiring members, allowing redirected clients to heartbeat.
+Timeout removals are written through the replicated metadata log with the
+expected generation. Members found in the same scan are removed together and
+advance the generation once.
+
+Coordinator snapshots preserve the registered partition set, assignments,
+generation, offsets, and last rebalance time. This restores authoritative
+assignment and fencing state after broker restart.
 
 ### Locking Strategy
 
@@ -171,26 +302,30 @@ The locking hierarchy ensures:
 
 ## Key Characteristics
 
-### Behavior Summary
+### Embedded Channel Layer Behavior
+
+The table below describes the in-process `TopicManager.RegisterConsumerGroup`
+channel layer. It is separate from the network protocol coordinator described
+above.
 
 | Aspect                  | Behavior                                           |
 |-------------------------|---------------------------------------------------|
-| Partition assignment     | Static, established at registration             |
-| Distribution algorithm   | Modulo: partition_id % consumer_count           |
-| Ordering guarantee       | Per-partition ordering maintained               |
-| Group isolation          | Groups consume independently                     |
-| Rebalancing              | Not supported (static assignment)               |
-| Consumer failure         | Channel blocks, may lead to backpressure        |
-| Buffer overflow          | Goroutine blocks if consumer channel full       |
+| Partition assignment     | Static at direct channel registration            |
+| Distribution algorithm   | Modulo: partition_id % consumer_count            |
+| Ordering guarantee       | Per-partition ordering maintained                |
+| Group isolation          | Groups receive independent channels              |
+| Rebalancing              | Owned by the protocol coordinator, not this layer|
+| Consumer failure         | Channel blocks and propagates backpressure       |
+| Buffer overflow          | Goroutine blocks if the consumer channel is full |
+| Offset storage           | Owned by the broker coordinator                  |
 
-### Limitations
+### Embedded Channel Layer Limitations
 
-- **Static assignment**: Consumers cannot be added/removed without re-registration
-- **No automatic rebalancing**: Partition distribution doesn't adjust to consumer changes
-- **No offset management**: Applications must track their own offsets for disk reads
-- **Channel-based only**: Active consumption through channels, no pull-based API in this layer
+- **Static direct registration**: In-process consumers cannot be added or removed without re-registration.
+- **Coordinator boundary**: Dynamic membership and range rebalancing belong to the text protocol coordinator.
+- **Channel-only layer**: Network consumers use `CONSUME` or `STREAM` instead.
 
-## Consumer Group Lifecycle
+## Embedded Channel Registration Lifecycle
 
 ```mermaid
 sequenceDiagram
@@ -225,7 +360,7 @@ sequenceDiagram
     APP->>CONS: receive from Consumer.MsgCh
 ```
 
-## Rebalance Flow
+## Embedded Channel Registration Flow
 
 ```mermaid
 flowchart TD
@@ -250,8 +385,9 @@ flowchart TD
 
 # Summary
 
-Consumer groups in cursus provide load balancing and ordering guarantees through a deterministic partition assignment mechanism. The modulo-based distribution ensures even load across consumers while maintaining per-partition message ordering.
-
-Multiple consumer groups can independently consume the same topic, each with its own partition-to-consumer mapping and isolated message delivery channels.
-
-The implementation uses goroutines to bridge partition group channels to consumer message channels, with buffering at multiple levels (partition: 10000, group channel: 10000, consumer: 1000) to handle bursts and provide backpressure protection.
+Network consumers use the broker coordinator for generation-fenced membership,
+range assignment, replicated timeout removal, and durable offsets. Separate
+groups retain independent offsets and assignments. The in-process TopicManager
+channel layer uses static modulo distribution and buffered goroutines; its
+registration lifecycle should not be confused with the dynamic protocol
+coordinator lifecycle.

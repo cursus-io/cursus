@@ -10,10 +10,12 @@ import (
 
 func (f *BrokerFSM) applyOffsetSyncCommand(jsonData string) interface{} {
 	var cmd struct {
-		Group     string `json:"group"`
-		Topic     string `json:"topic"`
-		Partition int    `json:"partition"`
-		Offset    uint64 `json:"offset"`
+		Group      string `json:"group"`
+		Topic      string `json:"topic"`
+		Member     string `json:"member"`
+		Generation *int   `json:"generation"`
+		Partition  int    `json:"partition"`
+		Offset     uint64 `json:"offset"`
 	}
 
 	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
@@ -27,6 +29,13 @@ func (f *BrokerFSM) applyOffsetSyncCommand(jsonData string) interface{} {
 		return err
 	}
 
+	if cmd.Member != "" && cmd.Generation != nil {
+		return f.cd.ApplyFencedOffsetUpdateFromFSM(cmd.Group, cmd.Topic, cmd.Member, *cmd.Generation,
+			[]coordinator.OffsetItem{{
+				Partition: cmd.Partition,
+				Offset:    cmd.Offset,
+			}})
+	}
 	err := f.cd.ApplyOffsetUpdateFromFSM(cmd.Group, cmd.Topic,
 		[]coordinator.OffsetItem{
 			{
@@ -43,9 +52,11 @@ func (f *BrokerFSM) applyOffsetSyncCommand(jsonData string) interface{} {
 
 func (f *BrokerFSM) applyBatchOffsetSyncCommand(jsonData string) interface{} {
 	var cmd struct {
-		Group   string                   `json:"group"`
-		Topic   string                   `json:"topic"`
-		Offsets []coordinator.OffsetItem `json:"offsets"`
+		Group      string                   `json:"group"`
+		Topic      string                   `json:"topic"`
+		Member     string                   `json:"member"`
+		Generation *int                     `json:"generation"`
+		Offsets    []coordinator.OffsetItem `json:"offsets"`
 	}
 
 	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
@@ -59,6 +70,9 @@ func (f *BrokerFSM) applyBatchOffsetSyncCommand(jsonData string) interface{} {
 		return err
 	}
 
+	if cmd.Member != "" && cmd.Generation != nil {
+		return f.cd.ApplyFencedOffsetUpdateFromFSM(cmd.Group, cmd.Topic, cmd.Member, *cmd.Generation, cmd.Offsets)
+	}
 	err := f.cd.ApplyOffsetUpdateFromFSM(cmd.Group, cmd.Topic, cmd.Offsets)
 	if err != nil {
 		util.Error("FSM: Failed to update coordinator state: %v", err)

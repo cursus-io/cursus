@@ -3,11 +3,12 @@ package server
 import (
 	"context"
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"io"
 	"net"
 	"net/http"
-	"sync/atomic"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,6 +129,12 @@ func TestIsCommand_AllKeywords(t *testing.T) {
 		"FETCH_OFFSET t", "LIST_GROUPS", "SYNC_GROUP g", "DESCRIBE t",
 		"APPEND_STREAM t", "READ_STREAM t", "SAVE_SNAPSHOT t",
 		"READ_SNAPSHOT t", "STREAM_VERSION t",
+		"INIT_PRODUCER_ID transactional_id=tx-1",
+		"BEGIN_TXN transactional_id=tx-1 producerId=p1 epoch=0",
+		"TXN_PUBLISH transactional_id=tx-1 topic=t1 partition=0 producerId=p1 seqNum=1 epoch=0 message=value",
+		"SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=p1 epoch=0 topic=t1 group=g1 member=m1 generation=1 P0:1",
+		"END_TXN transactional_id=tx-1 producerId=p1 epoch=0 result=commit",
+		"TXN_STATUS transactional_id=tx-1",
 	}
 	for _, kw := range keywords {
 		assert.True(t, isCommand(kw), "expected %q to be a command", kw)
@@ -141,64 +148,59 @@ func TestIsCommand_CaseInsensitive(t *testing.T) {
 	assert.True(t, isCommand("stream t"))
 }
 
-func TestHealthCheckServer(t *testing.T) {
-	ready := &atomic.Bool{}
-	ready.Store(false)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	assert.NoError(t, err)
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-
-	startHealthCheckServer(port, ready)
-
-	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
-	var resp *http.Response
-	for i := 0; i < 20; i++ {
-		resp, err = http.Get(url)
-		if err == nil {
-			break
+func TestHealthHandlerSeparatesLivenessAndReadiness(t *testing.T) {
+	state := NewHealthState()
+	dependencyReady := false
+	state.AddCheck("cluster_leader", func(context.Context) error {
+		if !dependencyReady {
+			return errors.New("no leader")
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	assert.NoError(t, err)
-	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
-	body, _ := io.ReadAll(resp.Body)
-	assert.Contains(t, string(body), "Broker not ready")
-	_ = resp.Body.Close()
+		return nil
+	})
+	handler := newHealthHandler(state)
 
-	ready.Store(true)
-	resp, err = http.Get(url)
-	assert.NoError(t, err)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	body, _ = io.ReadAll(resp.Body)
-	assert.Equal(t, "OK", string(body))
-	_ = resp.Body.Close()
+	live := httptest.NewRecorder()
+	handler.ServeHTTP(live, httptest.NewRequest(http.MethodGet, "/live", nil))
+	assert.Equal(t, http.StatusOK, live.Code)
+
+	legacy := httptest.NewRecorder()
+	handler.ServeHTTP(legacy, httptest.NewRequest(http.MethodGet, "/health", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, legacy.Code)
+	assert.Contains(t, legacy.Body.String(), "broker=starting")
+
+	state.SetReady(true)
+	ready := httptest.NewRecorder()
+	handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, ready.Code)
+	assert.Contains(t, ready.Body.String(), `"cluster_leader":"no leader"`)
+
+	dependencyReady = true
+	ready = httptest.NewRecorder()
+	handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	assert.Equal(t, http.StatusOK, ready.Code)
+	assert.Contains(t, ready.Body.String(), `"status":"ready"`)
+
+	legacy = httptest.NewRecorder()
+	handler.ServeHTTP(legacy, httptest.NewRequest(http.MethodGet, "/", nil))
+	assert.Equal(t, http.StatusOK, legacy.Code)
+	assert.Equal(t, "OK", legacy.Body.String())
 }
 
-func TestHealthCheckServer_RootEndpoint(t *testing.T) {
-	ready := &atomic.Bool{}
-	ready.Store(true)
+func TestHealthHandlerRejectsMutationMethods(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	newHealthHandler(NewHealthState()).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/ready", nil))
+	assert.Equal(t, http.StatusMethodNotAllowed, recorder.Code)
+	assert.Equal(t, "GET, HEAD", recorder.Header().Get("Allow"))
+}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+func TestHealthCheckServerReportsBindFailure(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
+	defer func() { _ = listener.Close() }()
 
-	startHealthCheckServer(port, ready)
-
-	url := fmt.Sprintf("http://127.0.0.1:%d/", port)
-	var resp *http.Response
-	for i := 0; i < 20; i++ {
-		resp, err = http.Get(url)
-		if err == nil {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	_ = resp.Body.Close()
+	server, err := startHealthCheckServerAddress(listener.Addr().String(), NewHealthState())
+	assert.Error(t, err)
+	assert.Nil(t, server)
 }
 
 func TestWriteResponse(t *testing.T) {
@@ -338,6 +340,20 @@ func TestReadMessage_RejectsOversizedFrameBeforeReadingBody(t *testing.T) {
 	assert.Contains(t, err.Error(), "exceeds maximum")
 }
 
+func TestReadMessage_RejectsOversizedFrameBeforeReadingBody(t *testing.T) {
+	client, server := newTestConnPair(t)
+
+	go func() {
+		lenBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(lenBuf, uint32(util.MaxMessageSize+1))
+		_, _ = server.Write(lenBuf)
+	}()
+
+	_, err := readMessage(client, "none")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds maximum")
+}
+
 func TestReadMessage_WithGzipCompression(t *testing.T) {
 	client, server := newTestConnPair(t)
 
@@ -389,7 +405,7 @@ func TestProcessMessage_HeartbeatEncoded(t *testing.T) {
 	}()
 
 	msg := readFramed(t, client)
-	assert.Equal(t, "OK", msg)
+	assert.Contains(t, msg, "ERROR:")
 	<-done
 }
 
@@ -433,6 +449,19 @@ func TestProcessMessage_RawCommand(t *testing.T) {
 	msg := readFramed(t, client)
 	assert.NotEmpty(t, msg)
 	<-done
+}
+
+func TestParseRawTextCommandPreservesLongCommand(t *testing.T) {
+	rawData := []byte("REPLICATE_MESSAGE payload=" + strings.Repeat("x", 22000))
+	got, ok := parseRawTextCommand(rawData)
+	assert.True(t, ok)
+	assert.Equal(t, string(rawData), got)
+}
+
+func TestParseRawTextCommandRejectsLegacyEnvelope(t *testing.T) {
+	encoded := util.EncodeMessage("", "HELP")
+	_, ok := parseRawTextCommand(encoded)
+	assert.False(t, ok)
 }
 
 func TestProcessMessage_EncodedCommand(t *testing.T) {
@@ -816,7 +845,7 @@ func TestProcessMessage_HeartbeatWithPadding(t *testing.T) {
 	}()
 
 	msg := readFramed(t, client)
-	assert.Equal(t, "OK", msg)
+	assert.Contains(t, msg, "ERROR:")
 	<-done
 }
 

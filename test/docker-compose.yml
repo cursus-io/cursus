@@ -7,6 +7,8 @@ services:
     command: ./broker
     volumes:
       - ./config.yaml:/root/config.yaml
+    tmpfs:
+      - /root/broker-logs
     environment:
       - CONFIG_PATH=/root/config.yaml
     ports:
@@ -18,7 +20,7 @@ services:
     networks:
       - test_network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
       interval: 2s
       timeout: 1s
       retries: 3
@@ -57,7 +59,6 @@ services:
   
 networks:
   test_network:
-    name: test_network
     driver: bridge
 
 volumes:

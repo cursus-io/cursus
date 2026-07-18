@@ -1,264 +1,136 @@
 # Installation
 
-This page covers the installation of cursus using different methods: building from source or using Docker. 
+## Requirements
 
-For configuration options after installation, see [Configuration](./configuration.md). For instructions on running the broker once installed, see [Running the Broker](../core/server.md).
+- Go 1.25.0 or newer for source builds (`go.mod` is authoritative).
+- Docker Engine with Compose for containerized E2E and benchmark workloads.
+- GNU Make and Bash for Makefile convenience targets on Unix-like systems.
 
-## Prerequisites
+## Build From Source
 
-### Go Version Requirement
-
-cursus requires `Go 1.25.0` or higher. This is specified in `go.mod`
-
-### Dependencies
-
-The project has minimal external dependencies:
-
-| Dependency                                 | Purpose                                  |
-|--------------------------------------------|-----------------------------------------|
-| `github.com/prometheus/client_golang v1.23.2` | Metrics exporter                        |
-| `gopkg.in/yaml.v3 v3.0.1`                  | Configuration file parsing               |
-| `golang.org/x/exp`                         | Extended Go libraries                    |
-| `golang.org/x/sys`                         | System-level calls (Linux optimizations)|
-
-All dependencies are managed via Go modules and will be automatically downloaded during the build process.
-
-# Installation Methods
-
-## Method 1: Building from Source
-
-The Makefile provides convenient build targets for all components. 
-
-The primary command builds all binaries:
-
-```
+```bash
+git clone https://github.com/cursus-io/cursus.git
+cd cursus
+go mod download
 make build
 ```
 
-This executes three sub-targets defined in Makefile
+`make build` creates two binaries for the current OS:
 
-- `make build-api` - Builds the broker server
-- `make build-cli` - Builds the CLI tool
-- `make build-bench` - Builds the benchmarking tool
-
-### Individual Build Commands:
-
-| Target           | Output                  | Command              |
-|-----------------|------------------------|--------------------|
-| API Server       | `bin/cursus`        | `make build-api`    |
-| CLI Tool         | `bin/cursus-cli`    | `make build-cli`    |
-| Benchmark Tool   | `bin/cursus-bench`  | `make build-bench`  |
-
-### Build Flags
-
-
-All builds use the following flags, as specified in Makefile
-
-```
-CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w"
+```text
+bin/cursus
+bin/cursus-cli
 ```
 
-### Flag Explanation:
+Build individually:
 
-| Flag                | Purpose                                                      |
-|--------------------|--------------------------------------------------------------|
-| `CGO_ENABLED=0`     | Produces static binaries without C dependencies             |
-| `GOOS=linux`        | Targets Linux platform                                       |
-| `-ldflags="-s -w"`  | Strips debug information and symbol tables to reduce binary size |
-
-### Direct Go Build
-
-Alternatively, build directly using go build:
-
-- Build broker
-    ```
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bin/cursus ./cmd/broker/main.go
-    ```
-- Build CLI
-    ```
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bin/cursus-cli ./cmd/cli/main.go
-    ```
-- Build benchmark
-    ```
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bin/cursus-bench ./cmd/bench/main.go
-    ```
-### Development Build
-
-For local development with faster builds (without optimization flags):
-
-```
-make run    # Build and run broker
-make cli    # Build and run CLI
+```bash
+make build-api
+make build-cli
 ```
 
-These commands use go run which compiles and executes in one step.
+Cross-compile both for Linux:
 
-## Method 2: Docker Installation (Multi-Stage Build)
-
-The build process is defined in Dockerfile:
-
-### Stage 1: Builder 
-
-- Base: `golang:1.25.0`
-- Downloads dependencies via `go mod download`
-- Builds broker and cli binaries with `CGO_ENABLED=0`
-- Uses `-ldflags="-s -w"` for size optimization
-
-### Stage 2: Runtime
-
-- Base: alpine:3.20 (minimal Linux distribution)
-- Copies only compiled binaries from builder stage
-- Installs bash and curl for operational needs
-- Sets executable permissions on binaries
-- Configures entrypoint.sh as the entry point
-
-Building the Docker Image:
-
-```
-make docker
-docker build -t cursus:latest .
+```bash
+make build-linux
 ```
 
-Alternatively, build directly with docker:
+Direct broker build:
 
-```
-docker build -t cursus:latest .
-```
-
-### Container Contents
-
-The resulting Docker image contains:
-
-| Path                 | Description                          |
-|---------------------|--------------------------------------|
-| `/root/broker`       | Main broker executable               |
-| `/root/cli`          | CLI tool executable                  |
-| `/root/entrypoint.sh`| Container startup script             |
-| `/root/logs/`        | Default log directory (created at runtime) |
-
-
-### Image Size Optimization
-
-The multi-stage build significantly reduces image size:
-
-- **Builder stage**: ~1GB (includes Go toolchain)
-- **Final image**: ~50MB (only runtime dependencies + binaries)
-
-This is achieved by copying only the compiled binaries from the builder stage to a minimal Alpine base.
-
-## Binary Artifacts
-
-### Output Directory Structure
-
-After building from source, the `bin/` directory contains:
-
-```
-bin/
-├── cursus          # Main broker server
-├── cursus-cli      # Administrative CLI tool
-└── cursus-bench    # Performance benchmarking tool
+```bash
+CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/cursus ./cmd/broker
 ```
 
-## Binary Descriptions
+There is no standalone `cmd/bench` binary. End-to-end benchmarks use Docker Compose and `test/e2e-benchmark`; storage microbenchmarks use `go test -bench`. See [Benchmark Verification](../benchmark-verification.md).
 
-| Binary            | Entry Point      | Purpose                                                                                     |
-|-------------------|------------------|---------------------------------------------------------------------------------------------|
-| **cursus**     | `cursus`      | Starts the broker server with TCP listener, health check endpoint, and metrics exporter     |
-| **cursus-cli** | `cursus-cli`  | Interactive CLI for administrative commands (`CREATE`, `DELETE`, `LIST`, `SUBSCRIBE`, `PUBLISH`, `CONSUME`) |
-| **cursus-bench** | `cursus-bench` | Runs performance benchmarks and load testing                                                |
+## Run From Source
 
-
-# Broker Binary Initialization
-
-The broker binary performs the following initialization sequence.
-
-## Initialization Order:
-
-1. Load configuration from file or environment variables
-2. Display startup banner with port and feature flags
-3. Create DiskManager for persistence layer
-4. Create TopicManager with reference to DiskManager
-5. Start server with all components
-6. CLI Binary Initialization
-
-The CLI binary initializes similarly but for interactive command processing, as shown in `cmd/cli/main.go`
-
-1. Loads configuration via `config.LoadConfig()`
-2. Creates DiskManager and TopicManager instances
-3. Creates a ClientContext with group "cli-group"
-4. Initializes CommandHandler for processing user input
-5. Enters interactive loop reading from stdin
-
-# Verification
-
-## Check Binary Existence
-
-After building, verify the binaries exist:
-
-```
-ls -lh bin/
+```bash
+./bin/cursus
 ```
 
-Expected output:
+or:
 
-```
--rwxr-xr-x  1 user  group   15M  cursus
--rwxr-xr-x  1 user  group   12M  cursus-cli
--rwxr-xr-x  1 user  group   13M  cursus-bench
+```bash
+make run
 ```
 
-## Check Binary Execution
+Without `-config`/`CONFIG_PATH`, built-in defaults are used. A missing explicitly named file logs a warning and falls back to effective flag defaults; malformed readable configuration fails startup.
 
+## Container Image
 
-Test that binaries are executable:
+Pull the published GHCR image:
 
-```
-./bin/cursus --help
-./bin/cursus-cli --help
-```
-
-## Docker Image Verification
-
-For Docker installations, verify the image was built:
-
-```
-docker images | grep cursus
+```bash
+docker pull ghcr.io/cursus-io/cursus:latest
+docker run --rm \
+  -p 9000:9000 -p 9080:9080 -p 9100:9100 \
+  -v cursus-data:/root/broker-logs \
+  ghcr.io/cursus-io/cursus:latest
 ```
 
-Expected output:
+Use a version tag for repeatable deployment:
 
-```
-cursus    latest    <image-id>    <timestamp>    ~50MB
-```
-
-Run a quick test container:
-
-```
-docker run --rm cursus --help
+```bash
+docker pull ghcr.io/cursus-io/cursus:<version>
 ```
 
-## Cleaning Build Artifacts
+Build locally:
 
-To remove all built binaries and test data:
-
+```bash
+docker build -t cursus:local .
 ```
+
+The multi-stage Dockerfile builds `/root/broker` and `/root/cli` with Go 1.25.0 on Alpine 3.20. `entrypoint.sh` executes the broker with `-config ./config.yaml`; if no file is mounted, the broker uses defaults after warning. Production deployments should mount a configuration and durable log volume explicitly.
+
+Example configuration mount:
+
+```bash
+docker run --rm \
+  -p 9000:9000 -p 9080:9080 -p 9100:9100 \
+  -v "$PWD/config.yaml:/root/config.yaml:ro" \
+  -v cursus-data:/root/broker-logs \
+  ghcr.io/cursus-io/cursus:latest
+```
+
+## Helm
+
+A Helm chart is available under `manifests/helm`. Review `values.yaml`, persistent volume settings, TLS/internal mTLS secrets, advertised addresses, replica/quorum values, and resource limits before installing. Do not treat chart defaults as a production security profile.
+
+## Verify
+
+```bash
+curl -f http://localhost:9080/live
+curl -f http://localhost:9080/ready
+curl -f http://localhost:9100/metrics
+```
+
+The client port is a length-prefixed TCP protocol, so raw `nc` text without the 4-byte frame is not a valid protocol check. Use `bin/cursus-cli`, a supported SDK, or the E2E client helpers.
+
+Run local validation:
+
+```bash
+go test ./...
+make e2e
+```
+
+Docker benchmark tests are opt-in and main-push-only in CI:
+
+```bash
+RUN_E2E_BENCHMARK=1 go test -v -timeout 30m ./test/e2e-benchmark/...
+```
+
+## Clean
+
+```bash
 make clean
 ```
 
-This removes:
-- All binaries in `bin/`
-- Test topic directories in `pkg/topic/`
-- Test connection data in `pkg/server/`
+The current target removes files under `bin/` and local coverage outputs. It does not delete arbitrary broker log directories or Docker volumes; remove those intentionally with the matching Compose/volume command.
 
-As defined in Makefile,the clean target executes:
+## Next Steps
 
-```
-rm -rf bin/* pkg/topic/test-topic/* pkg/topic/topic1/* pkg/server/testconn/*
-```
-
-# Next Steps
-
-After installation, proceed to:
-
-- [Configuration](./configuration.md) - Configure broker settings, ports, and tuning parameters
-- [Running the Broker](../core/server.md) - Start the broker and verify it's operational
+- [Configuration](configuration.md)
+- [Getting Started](README.md)
+- [Architecture](../architecture.md)
+- [Security And Observability](../reference/observability.md)

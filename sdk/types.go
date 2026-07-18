@@ -28,6 +28,15 @@ func (m Message) String() string {
 		m.ProducerID, m.SeqNum, m.Payload, m.Offset, m.Key, m.Epoch, m.RetryCount)
 }
 
+// PartitionOffsetRange describes broker-reported offsets for one partition.
+type PartitionOffsetRange struct {
+	Partition int
+	Earliest  uint64
+	Latest    uint64
+	LEO       uint64
+	HWM       uint64
+}
+
 // AckResponse represents the broker's response to a produce request
 type AckResponse struct {
 	Status        string `json:"status"`

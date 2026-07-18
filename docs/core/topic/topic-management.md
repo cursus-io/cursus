@@ -1,213 +1,97 @@
 # Topic Management
 
-## Purpose and Scope
+`TopicManager` is the in-process registry and entry point for topic/partition operations. Its topic definitions are durable in the standalone manifest or cluster FSM. Durable group membership belongs to `Coordinator`; transaction lifecycle belongs to `transaction.Manager`; partition leader ownership belongs to the cluster subsystem.
 
-The Topic Management System is the core routing and distribution layer of cursus. It orchestrates how messages flow from publishers to consumers through topics, partitions, and consumer groups. 
+## TopicManager
 
-This system handles partition selection, message deduplication, consumer group registration, and in-memory message distribution to active consumers.
+`TopicManager` owns:
 
-For detailed information about partition selection strategies and ordering guarantees, see [Topics and Partitions](topics-and-partitions.md). For consumer group mechanics and load balancing, see [Consumer Groups](./consumer-groups.md). For disk persistence of messages, see [Disk Persistence System](../storage/disk-persistence.md).
+- the topic map and create/update/delete lifecycle,
+- storage handler acquisition for each partition,
+- normal/sync/batch publish entry points,
+- raw partition reads and explicit flush,
+- connection to the stream manager,
+- propagation of group and transaction decision resolvers.
 
-## Core Components
+It does not use a global payload-hash deduplication map. Retry safety comes from idempotent producer `(producerId, epoch, seqNum)` state and broker transactions where requested.
 
-### TopicManager
+## Create And Update
 
-The TopicManager serves as the central registry and coordinator for all topics in the system. It maintains the global deduplication map and periodically cleans expired entries.
+`CreateTopicWithPolicy` normalizes policy before mutation.
 
-| Field   | Type           | Purpose                                                                 |
-|---------|----------------|-------------------------------------------------------------------------|
-| topics  | map[string]*Topic | Registry of all topics by name                                         |
-| dedupMap| sync.Map       | Global message deduplication (30-minute window)                         |
-| cleanupInt | time.Duration | Interval for cleanup loop (default: 60s)                                |
-| stopCh  | chan struct{}  | Signal channel to stop cleanup goroutine                                 |
-| hp      | HandlerProvider| Provides disk handlers for partitions                                    |
-| mu      | sync.RWMutex   | Protects topics map                                                      |
+| Existing state | Requested partitions | Result |
+|---|---:|---|
+| missing | positive | create topic and partitions |
+| exists | equal | update normalized policy, no partition change |
+| exists | greater | append new partitions and update policy |
+| exists | lower | reject; partition count never shrinks |
 
-The TopicManager is initialized with a HandlerProvider interface that supplies DiskHandler instances for each topic-partition combination. 
+New and existing partitions receive the current transaction decision resolver so `read_committed` uses coordinator authority. Retention and cleanup policy are propagated to every partition handler. An existing event-sourcing topic remains protected even if a later idempotent create request omits or clears `event_sourcing`.
 
-Key operations:
+Topic names use a portable storage contract: 1-249 ASCII bytes containing letters, digits, `.`, `_`, `-`, or `=`; `.` and `..` are reserved. This prevents a protocol topic identifier from escaping the broker-owned log root.
 
-- **CreateTopic**: Creates new topics or adds partitions to existing topics 
-- **Publish**: Performs deduplication check before routing to topic 
-- **RegisterConsumerGroup**: Delegates to topic for consumer registration 
-- **CleanupDedup**: Removes entries older than 30 minutes from dedupMap 
+`cleanup_policy` accepts `delete`, `compact`, and `delete,compact`. Compact policies are rejected when distribution is enabled or the topic is event-sourcing. Standalone compaction details are in [Log Compaction](../storage/log-compaction.md).
 
-### Topic
+For standalone create/update, new partition handlers are staged while the topic lock excludes publishers. The complete target definition is atomically persisted before policy or partition count becomes visible. A persistence failure closes/evicts staged handlers and leaves the live definition unchanged. In distributed mode the FSM retains existing partition leader epoch/HWM state on repeated create and allocates metadata only for newly added partitions.
 
-A Topic represents a logical message stream divided into multiple partitions. It handles partition selection during message publication and maintains consumer group registrations.
+## Startup Recovery
 
-| Field          | Type                   | Purpose                                        |
-|----------------|-----------------------|------------------------------------------------|
-| Name           | string                | Topic identifier                               |
-| Partitions     | []*Partition          | Array of partition instances                   |
-| counter        | uint64                | Round-robin counter for partition selection   |
-| consumerGroups | map[string]*ConsumerGroup | Registered consumer groups by name          |
-| mu             | sync.RWMutex          | Protects counter and consumer groups          |
+Standalone brokers load `{log_dir}/__topic_metadata.json` before coordinator initialization and static-group registration. The versioned manifest restores partition count, idempotent/event-sourcing flags, cleanup/retention, partitioner, auth policy, and ACLs. Unknown fields, duplicate topics, unsupported versions, invalid names, and malformed policy fail broker startup instead of silently weakening authorization or cleanup behavior.
 
+Brokers upgraded from versions without the manifest do not guess security or event-sourcing policy from segment filenames. If persisted partition logs exist without a manifest, or a manifest omits a persisted topic directory, startup fails and lists the orphaned topics. Operators must migrate or archive those directories and provide authoritative definitions before restart. A normal `CREATE` also rejects a name whose orphaned logs remain, preventing deleted data from being silently resurrected.
 
-The `Topic.Publish()` method implements two partition selection strategies 
+The internal offset topic is recreated by the coordinator and then enters the manifest on a new data directory. Existing pre-manifest offset logs require the same explicit migration as application topics.
 
-- **Key-based**: If `msg.Key != ""`, uses `util.GenerateID(msg.Key)`
-- **Round-robin**: If no key, uses `counter % partitionCount` and increments counter
+Distributed brokers keep topic definitions in the FSM and snapshot format version 6. Snapshot restore rebuilds the topic registry before committed HWM reconciliation. Version 5 and older snapshots can reconstruct partition count/idempotent mode from partition metadata, using the historical default topic policy because those snapshots did not retain the richer definition.
 
-### Partition
+## Delete
 
-Each Partition represents an independent message queue within a topic. It runs a dedicated goroutine that distributes incoming messages to registered consumer groups.
+`DeleteTopicDurable` first commits removal from standalone metadata. It then removes the topic from the registry, stops partition workers, closes storage handlers, and removes the broker-owned topic log directory after verifying the target remains under the configured log root. A manifest failure leaves the topic live. Once the manifest removal commits, physical cleanup failures are logged for operator remediation but do not turn the logically successful deletion into an error response. Deletion is destructive and must remain an authenticated admin operation.
 
-| Field  | Type                     | Purpose                                 |
-|--------|--------------------------|-----------------------------------------|
-| id     | int                      | Partition identifier (0-based index)    |
-| topic  | string                   | Parent topic name                        |
-| ch     | chan types.Message       | Message queue (capacity: 10,000)       |
-| subs   | map[string]chan types.Message | Per-group distribution channels     |
-| mu     | sync.RWMutex             | Protects subs map                        |
-| dh     | interface{}              | DiskHandler for persistence              |
-| closed | bool                     | Partition state flag                     |
+## Publish Entry Points
 
+| Method family | Behavior |
+|---|---|
+| `Publish` / `PublishToPartition` | asynchronous local append path (`acks=0` semantics at this layer) |
+| `PublishWithAck` / `PublishToPartitionWithAck` | synchronous local write path |
+| idempotent variants | force producer epoch/sequence validation |
+| batch variants | group records by partition before append |
 
-The partition's `run()` goroutine continuously reads from ch and distributes to all registered group channels 
+Distributed command handling routes to the partition leader and applies replication/quorum logic before returning the corresponding client acknowledgement. Calling `TopicManager` directly is not a substitute for cluster routing.
 
-```
-for msg := range p.ch {
-    for _, subCh := range p.subs {
-        subCh <- msg  // Fan-out to all consumer groups
-    }
-}
-```
+## Topic
 
-### ConsumerGroup and Consumer
+A `Topic` owns partition selection, its partition slice, policy, and embedded consumer groups. `hash_key` uses key hashing and falls back to round-robin for empty keys; `round_robin` ignores keys. Policy controls cleanup/retention overrides and read/write authorization. Replication, idempotent mode, and event-sourcing mode are separate topic metadata.
 
-A ConsumerGroup contains multiple Consumer instances that collectively consume messages from a topic. Each partition is assigned to exactly one consumer within a group using modulo arithmetic.
+## Partition
 
+A `Partition` owns:
 
-**ConsumerGroup Structure:**
+- the storage handler and logical offset sequence,
+- HWM/LSO and retained offset range,
+- idempotent producer state and checkpoints,
+- transaction marker/open indexes and coordinator decision resolver,
+- stream notifications and embedded fan-out channels,
+- event-stream indexing hooks.
 
-| Field      | Type                       | Purpose                               |
-|------------|----------------------------|---------------------------------------|
-| Name       | string                     | Group identifier                       |
-| Consumers  | []*Consumer                | Slice of Consumer pointers             |
+Only the partition data path may decide record visibility. Raw disk reads do not enforce transaction isolation.
 
-**Consumer Structure:**
+## Embedded Consumer Groups
 
-| Field  | Type               | Purpose                                  |
-|--------|------------------|------------------------------------------|
-| ID     | int               | Consumer index within the group (0-based)|
-| MsgCh  | chan types.Message | Buffered channel (capacity: 1,000) for receiving messages |
-
-
-Partition-to-consumer assignment uses: `consumerID = partitionID % consumerCount` 
-
-## Deduplication Mechanism
-
-The TopicManager implements a global deduplication system using a sync.Map to track message IDs. This prevents duplicate processing when messages are retransmitted due to network issues or client retries.
-
-### Deduplication Flow
-
-- **ID Generation**: Each message receives a 64-bit FNV-1a hash of its payload via `util.GenerateID()`
-- **Atomic Check**: `dedupMap.LoadOrStore(msg.ID, time.Now())` atomically checks and stores 
-- **Drop if Duplicate**: If loaded=true, the message is silently dropped 
-- **Periodic Cleanup**: Background goroutine removes entries older than 30 minutes 
-
-## Cleanup Configuration
-
-
-The cleanup loop runs at an interval specified by `config.CleanupInterval` (default: 60 seconds) 
-
-```
-expireBefore := time.Now().Add(-30 * time.Minute)
-dedupMap.Range(func(key, value any) bool {
-    if ts, ok := value.(time.Time); ok && ts.Before(expireBefore) {
-        dedupMap.Delete(key)
-        metrics.CleanupCount.Inc()
-    }
-    return true
-})
-```
-
-## Topic Lifecycle Management
-
-### Topic Creation
-
-Topics are created via `TopicManager.CreateTopic(name, partitionCount)` 
-
-The method handles three scenarios:
-
-| Scenario                    | Action        | Result                                           |
-|-----------------------------|---------------|-------------------------------------------------|
-| New topic                   | Create with N partitions | New Topic with partition array              |
-| Existing topic, same count  | No-op          | Return existing topic                           |
-| Existing topic, increase count | Add partitions | Expanded partition array                       |
-| Existing topic, decrease count | Reject       | Warning printed, no change                      |
-
-
-### Topic Deletion
-
-The DeleteTopic(name) method removes a topic from the registry 
-
-Note that this only removes the topic from memory; it does not clean up disk files or close partition goroutines.
-
-## Consumer Group Registration
-
-Consumer groups are registered per-topic using `Topic.RegisterConsumerGroup(groupName, consumerCount)` 
-
-The registration process:
-
-1. **Group Creation**: Allocate ConsumerGroup with N Consumer instances
-2. **Channel Allocation**: Each consumer gets a buffered channel (capacity: 1,000)
-3. **Partition Binding**: For each partition, create a group-specific channel
-4. **Distribution Goroutines**: Start goroutines to forward messages to assigned consumers
-5. **Partition-to-Consumer Mapping**
-
-The system uses deterministic modulo arithmetic to assign partitions to consumers:
-
-```
-for pid, p := range t.Partitions {
-    groupCh := p.RegisterGroup(groupName)
-    target := pid % consumerCount  // Deterministic assignment
-    go func(ch <-chan types.Message, consumer *Consumer) {
-        for msg := range ch {
-            consumer.MsgCh <- msg
-        }
-    }(groupCh, group.Consumers[target])
-}
-```
-
-This ensures:
-
-- Each partition sends to exactly one consumer per group
-- Load is balanced when partitionCount >= consumerCount
-- Assignment is stable unless consumer count changes
-
-## Channel Capacities
-
-The system uses buffered channels extensively to prevent blocking during message distribution. Channel capacities are hard-coded throughout the topic management layer:
-
-| Channel                     | Capacity | Purpose                           |
-|-----------------------------|----------|-----------------------------------|
-| Partition channel           | 10,000   | Partition message queue           |
-| Group distribution channel  | 10,000   | Per-group message buffer in partition |
-| Consumer message channel    | 1,000    | Consumer's message receive buffer |
-
-## Individual consumer receive buffer
-
-These capacities provide backpressure tolerance but can fill up if consumers fall behind. Once full, the sending goroutine will block until space is available.
-
-
-## Integration with Other Systems
-
-The Topic Management System integrates with:
-
-- Disk Persistence: Each partition holds a DiskHandler interface and calls AppendMessage() on enqueue 
-- Metrics: TopicManager records metrics via metrics.MessagesProcessed and metrics.LatencyHist 
-- Server Layer: Command handlers call TopicManager methods for PUBLISH, SUBSCRIBE, and CONSUME operations (see [Server System](../server.md))
-- Configuration: TopicManager reads config.CleanupInterval for deduplication cleanup 
+`RegisterConsumerGroup` creates in-process consumers and modulo assignments using configured channel capacities. This layer is static and channel-based. Network clients instead use `JOIN_GROUP`, `SYNC_GROUP`, heartbeats, generation fencing, durable offsets, and log reads through the protocol coordinator.
 
 ## Thread Safety
 
-All components in the topic management system are designed for concurrent access:
+- `TopicManager.mu` protects the topic registry, resolver propagation, and whole-manifest definition snapshots.
+- `Topic.mu` protects partition/policy/embedded-group state and round-robin selection.
+- `Partition` uses dedicated locks for lifecycle/channels, producer state, transaction index, and disk operations.
+- storage handlers serialize metadata and I/O separately.
 
-- **TopicManager**: Uses sync.RWMutex to protect the topics map and sync.Map for lock-free deduplication
-- **Topic**: Uses sync.RWMutex to protect the counter and consumer groups map
-- **Partition**: Uses sync.RWMutex to protect the subs map and closed flag
+Do not hold manager/topic locks across network forwarding or Raft apply. Coordinator and cluster mutations have their own authority and locking.
 
-The `run()` goroutine in each partition holds a read lock only while iterating over subscriber channels, allowing concurrent message enqueuing.
+## Related Contracts
+
+- [Topics And Partitions](topics-and-partitions.md)
+- [Consumer Groups](consumer-groups.md)
+- [Disk Persistence](../storage/disk-persistence.md)
+- [Protocol Specification](../../protocol-spec.md)

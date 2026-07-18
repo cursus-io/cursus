@@ -123,7 +123,7 @@ func TestDeserializeDiskMessage_TruncatedEventSourcingFields(t *testing.T) {
 	truncated := data[:len(data)-10]
 	_, err = DeserializeDiskMessage(truncated)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "incomplete event-sourcing fields")
+	assert.Contains(t, err.Error(), "incomplete")
 }
 
 func TestDeserializeDiskMessage_OldFormatNoEventSourcing(t *testing.T) {
@@ -141,8 +141,8 @@ func TestDeserializeDiskMessage_OldFormatNoEventSourcing(t *testing.T) {
 	data, err := SerializeDiskMessage(msg)
 	assert.NoError(t, err)
 
-	// ES + Key trailer for empty fields: 2 (eventType len) + 4 (schema) + 8 (aggVer) + 2 (metadata len) + 2 (key len) = 18 bytes
-	oldData := data[:len(data)-18]
+	// Empty-field trailer: ES(16) + Key(2) + transaction(6) + control-batch(16) = 40 bytes
+	oldData := data[:len(data)-40]
 
 	got, err := DeserializeDiskMessage(oldData)
 	assert.NoError(t, err)
@@ -177,4 +177,36 @@ func TestDiskMessageSerialization_EmptyFields(t *testing.T) {
 	assert.Equal(t, "", got.Payload)
 	assert.Equal(t, "", got.EventType)
 	assert.Equal(t, "", got.Metadata)
+}
+func TestDiskMessageTransactionMetadataRoundTrip(t *testing.T) {
+	msg := types.DiskMessage{
+		Topic:                        "txn-topic",
+		Partition:                    0,
+		Offset:                       7,
+		ProducerID:                   "producer-1",
+		SeqNum:                       3,
+		Epoch:                        2,
+		Payload:                      "payload",
+		Key:                          "key",
+		TransactionalID:              "tx-1",
+		TransactionState:             types.TransactionStateCommitted,
+		TransactionMarker:            types.TransactionMarkerCommit,
+		ControlBatchType:             types.ControlBatchTransaction,
+		ControlBatchVersion:          types.ControlBatchVersionCursusV2,
+		ControlBatchCoordinatorEpoch: 3,
+		ControlBatchKey:              []byte{0, 0, 0, 0},
+		ControlBatchValue:            []byte{0, 0, 0, 0, 0, 3},
+	}
+
+	data, err := SerializeDiskMessage(msg)
+	if err != nil {
+		t.Fatalf("serialize failed: %v", err)
+	}
+	got, err := DeserializeDiskMessage(data)
+	if err != nil {
+		t.Fatalf("deserialize failed: %v", err)
+	}
+	if got.TransactionalID != msg.TransactionalID || got.TransactionState != msg.TransactionState || got.TransactionMarker != msg.TransactionMarker || got.ControlBatchType != msg.ControlBatchType || got.ControlBatchVersion != msg.ControlBatchVersion || got.ControlBatchCoordinatorEpoch != msg.ControlBatchCoordinatorEpoch || string(got.ControlBatchKey) != string(msg.ControlBatchKey) || string(got.ControlBatchValue) != string(msg.ControlBatchValue) {
+		t.Fatalf("transaction metadata mismatch: %+v", got)
+	}
 }

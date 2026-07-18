@@ -6,6 +6,8 @@ log_level: "info"
 
 # Distributed Clustering
 enabled_distribution: true
+internal_auth_token: "cursus-test-internal-token"
+internal_broker_port: 19000
 raft_port: 9001
 discovery_port: 8000
 min_insync_replicas: 2
@@ -16,12 +18,13 @@ static_cluster_members:
   - "broker-3-9000@broker-3:9001"
 
 # Idempotency
-enable_idempotence: false
+enable_idempotence: true
 
 # Disk storage and performance
 log_dir: "cluster-logs"
 linger_ms: 100
-disk_flush_batch_size: 10000            
+disk_flush_batch_size: 10000
+batch_size: 10000
 channel_buffer_size: 100000
 partition_channel_buffer_size: 100000
 broadcast_channel_buffer_size: 100000

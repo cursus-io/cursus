@@ -1,0 +1,263 @@
+package disk
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/stretchr/testify/require"
+)
+
+func recoveryTestConfig(logDir string) *config.Config {
+	return &config.Config{
+		LogDir:                   logDir,
+		DiskFlushBatchSize:       32,
+		DiskFlushIntervalMS:      25,
+		DiskWriteTimeoutMS:       500,
+		LingerMS:                 5,
+		SegmentSize:              1 << 20,
+		SegmentRollTimeMS:        0,
+		IndexSize:                1 << 20,
+		IndexIntervalBytes:       64,
+		RetentionHours:           168,
+		RetentionBytes:           -1,
+		RetentionCheckIntervalMS: 60_000,
+		CleanupPolicy:            "delete",
+		ChannelBufferSize:        128,
+	}
+}
+
+func appendRecoveryMessages(t *testing.T, handler *DiskHandler, start, count int, payloadSize int) {
+	t.Helper()
+	for i := start; i < start+count; i++ {
+		message := &types.Message{
+			ProducerID: "recovery-producer",
+			SeqNum:     uint64(i + 1),
+			Epoch:      1,
+			Payload:    fmt.Sprintf("%06d:%s", i, strings.Repeat("x", payloadSize)),
+		}
+		offset, err := handler.AppendMessageSync("orders", 0, message)
+		require.NoError(t, err)
+		require.Equal(t, uint64(i), offset)
+	}
+}
+
+func readIndexEntries(t *testing.T, path string) []types.IndexEntry {
+	t.Helper()
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, f.Close()) }()
+
+	entries := make([]types.IndexEntry, 0)
+	var raw [types.IndexEntrySize]byte
+	for {
+		_, err := f.Read(raw[:])
+		if err != nil {
+			break
+		}
+		entry := types.IndexEntry{
+			Offset:   binary.BigEndian.Uint64(raw[0:8]),
+			Position: binary.BigEndian.Uint64(raw[8:16]),
+		}
+		if entry.Offset == 0 && entry.Position == 0 {
+			break
+		}
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
+func TestDiskHandlerRestartRecoversSparseTailAndPreservesIndex(t *testing.T) {
+	cfg := recoveryTestConfig(t.TempDir())
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	appendRecoveryMessages(t, handler, 0, 50, 96)
+	require.NoError(t, handler.Close())
+
+	indexPath := handler.GetIndexPath(0)
+	before := readIndexEntries(t, indexPath)
+	require.Greater(t, len(before), 2)
+
+	restarted, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), restarted.GetAbsoluteOffset())
+	appendRecoveryMessages(t, restarted, 50, 1, 96)
+	require.NoError(t, restarted.Close())
+
+	after := readIndexEntries(t, indexPath)
+	require.GreaterOrEqual(t, len(after), len(before))
+	require.Equal(t, before[:2], after[:2], "restart append must not overwrite existing index entries")
+
+	verified, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, verified.Close()) }()
+	require.Equal(t, uint64(51), verified.GetAbsoluteOffset())
+	messages, err := verified.ReadMessages(0, 100)
+	require.NoError(t, err)
+	require.Len(t, messages, 51)
+	for i := range messages {
+		require.Equal(t, uint64(i), messages[i].Offset)
+	}
+}
+
+func TestNewDiskHandlerTruncatesOnlyPartialActiveTail(t *testing.T) {
+	cfg := recoveryTestConfig(t.TempDir())
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	appendRecoveryMessages(t, handler, 0, 3, 32)
+	logPath := handler.GetSegmentPath(0)
+	require.NoError(t, handler.Close())
+
+	info, err := os.Stat(logPath)
+	require.NoError(t, err)
+	validSize := info.Size()
+
+	f, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0)
+	require.NoError(t, err)
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], 128)
+	_, err = f.Write(append(length[:], []byte("partial")...))
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+
+	restarted, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), restarted.GetAbsoluteOffset())
+	repaired, err := os.Stat(logPath)
+	require.NoError(t, err)
+	require.Equal(t, validSize, repaired.Size())
+	appendRecoveryMessages(t, restarted, 3, 1, 32)
+	require.NoError(t, restarted.Close())
+}
+
+func TestNewDiskHandlerRejectsCompleteCorruptRecord(t *testing.T) {
+	cfg := recoveryTestConfig(t.TempDir())
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	appendRecoveryMessages(t, handler, 0, 1, 16)
+	logPath := handler.GetSegmentPath(0)
+	require.NoError(t, handler.Close())
+
+	f, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0)
+	require.NoError(t, err)
+	_, err = f.Write([]byte{0, 0, 0, 4, 0xff, 0xff, 0xff, 0xff})
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+
+	_, err = NewDiskHandler(cfg, "orders", 0)
+	require.ErrorContains(t, err, "decode record")
+}
+
+func TestReadMessagesUsesIndexForOwningHistoricalSegment(t *testing.T) {
+	cfg := recoveryTestConfig(t.TempDir())
+	cfg.SegmentSize = 700
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, handler.Close()) }()
+	appendRecoveryMessages(t, handler, 0, 30, 120)
+	require.GreaterOrEqual(t, len(handler.segments), 3)
+
+	for _, base := range handler.segments[:len(handler.segments)-1] {
+		target := base + 1
+		messages, err := handler.ReadMessages(target, 1)
+		require.NoError(t, err)
+		require.Len(t, messages, 1)
+		require.Equal(t, target, messages[0].Offset)
+	}
+}
+
+func TestReadMessagesRejectsOffsetBeforeRetentionFloor(t *testing.T) {
+	cfg := recoveryTestConfig(t.TempDir())
+	cfg.SegmentSize = 700
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, handler.Close()) }()
+	appendRecoveryMessages(t, handler, 0, 24, 120)
+	require.GreaterOrEqual(t, len(handler.segments), 3)
+
+	handler.SetRetentionPolicy(0, 1)
+	handler.EnforceRetention(cfg)
+	earliest := handler.GetFirstOffset()
+	require.Greater(t, earliest, uint64(0))
+
+	_, err = handler.ReadMessages(0, 1)
+	var rangeErr *types.OffsetOutOfRangeError
+	require.True(t, errors.As(err, &rangeErr))
+	require.Equal(t, earliest, rangeErr.Earliest)
+}
+
+func TestReadMessagesRejectsCorruptClosedSegment(t *testing.T) {
+	cfg := recoveryTestConfig(t.TempDir())
+	cfg.SegmentSize = 700
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, handler.Close()) }()
+	appendRecoveryMessages(t, handler, 0, 12, 120)
+	require.GreaterOrEqual(t, len(handler.segments), 2)
+
+	firstSegment := handler.GetSegmentPath(handler.segments[0])
+	f, err := os.OpenFile(firstSegment, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{0xff, 0xff}, 4)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+
+	_, err = handler.ReadMessages(handler.segments[0], 1)
+	require.ErrorContains(t, err, "decode message")
+}
+
+func TestOpenIndexFilesDiscardsInvalidSuffix(t *testing.T) {
+	cfg := recoveryTestConfig(t.TempDir())
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	appendRecoveryMessages(t, handler, 0, 10, 96)
+	indexPath := handler.GetIndexPath(0)
+	require.NoError(t, handler.Close())
+
+	f, err := os.OpenFile(indexPath, os.O_RDWR, 0)
+	require.NoError(t, err)
+	var fake [types.IndexEntrySize]byte
+	binary.BigEndian.PutUint64(fake[0:8], 9_999)
+	binary.BigEndian.PutUint64(fake[8:16], 1)
+	const fakePosition = int64(64 * types.IndexEntrySize)
+	_, err = f.WriteAt(fake[:], fakePosition)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+
+	restarted, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	require.NoError(t, restarted.Close())
+
+	f, err = os.Open(indexPath)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, f.Close()) }()
+	cleared := make([]byte, types.IndexEntrySize)
+	_, err = f.ReadAt(cleared, fakePosition)
+	require.NoError(t, err)
+	require.Equal(t, make([]byte, types.IndexEntrySize), cleared)
+}
+
+func TestSparsePreallocatedIndexRecoveryIsBounded(t *testing.T) {
+	cfg := recoveryTestConfig(t.TempDir())
+	cfg.IndexSize = 10 << 20
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	appendRecoveryMessages(t, handler, 0, 2, 96)
+	require.NoError(t, handler.Close())
+
+	started := time.Now()
+	restarted, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	require.NoError(t, restarted.Close())
+	require.Less(t, time.Since(started), 2*time.Second)
+}

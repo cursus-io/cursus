@@ -53,6 +53,15 @@ func (m *MockStorageHandler) ReadMessages(offset uint64, max int) ([]types.Messa
 	return msgs.([]types.Message), args.Error(1)
 }
 
+func (m *MockStorageHandler) GetFirstOffset() uint64 {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "GetFirstOffset" {
+			args := m.Called()
+			return args.Get(0).(uint64)
+		}
+	}
+	return 0
+}
 func (m *MockStorageHandler) GetAbsoluteOffset() uint64 {
 	args := m.Called()
 	return args.Get(0).(uint64)
@@ -80,6 +89,11 @@ func (m *MockStorageHandler) GetSegmentPath(baseOffset uint64) string {
 
 func (m *MockStorageHandler) WriteBatch(batch []types.DiskMessage) error {
 	args := m.Called(batch)
+	return args.Error(0)
+}
+
+func (m *MockStorageHandler) TruncateTo(nextOffset uint64) error {
+	args := m.Called(nextOffset)
 	return args.Error(0)
 }
 
@@ -180,4 +194,20 @@ func TestTopicManagerCreateTopic(t *testing.T) {
 	hp.AssertExpectations(t)
 
 	tm.Stop()
+}
+
+func TestNewTopicClosesInitializedHandlersOnPartialFailure(t *testing.T) {
+	cfg := config.DefaultConfig()
+	hp := new(MockHandlerProvider)
+	first := new(MockStorageHandler)
+	first.On("GetLatestOffset").Return(uint64(0)).Once()
+	first.On("Close").Return(nil).Once()
+	hp.On("GetHandler", "partial-topic", 0).Return(first, nil).Once()
+	hp.On("GetHandler", "partial-topic", 1).Return(nil, assert.AnError).Once()
+
+	created, err := NewTopicWithPolicy("partial-topic", 2, hp, cfg, nil, false, false, DefaultPolicy())
+	assert.Error(t, err)
+	assert.Nil(t, created)
+	hp.AssertExpectations(t)
+	first.AssertExpectations(t)
 }

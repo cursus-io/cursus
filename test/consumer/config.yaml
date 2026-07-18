@@ -11,12 +11,14 @@ consumer_id: "consumer-1"
 mode: "polling" # polling, streaming
 poll_interval: 100ms
 poll_timeout_ms: 3000
-batch_size: 10000
-max_poll_records: 10000
+auto_offset_reset: earliest
+batch_size: 5000
+max_poll_records: 5000
 
 # Timeout
-session_timeout_ms: 30000
-streaming_read_deadline_ms: 10000
+session_timeout_ms: 120000
+heartbeat_interval_ms: 5000
+streaming_read_deadline_ms: 30000
 
 # Benchmark, Validation
 enable_benchmark: true

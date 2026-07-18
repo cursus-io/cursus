@@ -70,6 +70,12 @@ type Producer struct {
 }
 
 func NewProducer(cfg *PublisherConfig) (*Producer, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("publisher config is required")
+	}
+	if err := validateSDKTopicName(cfg.Topic); err != nil {
+		return nil, err
+	}
 	if cfg.EnableMetrics {
 		initMetrics()
 	}
@@ -80,14 +86,14 @@ func NewProducer(cfg *PublisherConfig) (*Producer, error) {
 	}
 
 	p := &Producer{
-		config:       cfg,
-		client:       client,
-		partitions:   cfg.Partitions,
-		buffers:      make([]*partitionBuffer, cfg.Partitions),
-		done:         make(chan struct{}),
-		bmTotalTime:  make(map[int]time.Duration),
-		bmTotalCount: make(map[int]int),
-		bmLatencies:  make([]time.Duration, 0),
+		config:           cfg,
+		client:           client,
+		partitions:       cfg.Partitions,
+		buffers:          make([]*partitionBuffer, cfg.Partitions),
+		done:             make(chan struct{}),
+		bmTotalTime:      make(map[int]time.Duration),
+		bmTotalCount:     make(map[int]int),
+		bmLatencies:      make([]time.Duration, 0),
 		inFlight:         make([]int32, cfg.Partitions),
 		gcTicker:         time.NewTicker(1 * time.Minute),
 		partitionLeaders: make(map[int]string),
@@ -141,6 +147,14 @@ func (p *Producer) fetchMetadata() {
 		if err != nil {
 			continue
 		}
+		if err := negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS); err != nil {
+			_ = conn.Close()
+			continue
+		}
+		if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {
+			_ = conn.Close()
+			continue
+		}
 		cmd := fmt.Sprintf("METADATA topic=%s", p.config.Topic)
 		if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
 			_ = conn.Close()
@@ -183,7 +197,37 @@ func (p *Producer) nextPartition() int {
 	return idx
 }
 
+// TopicCleanupPolicy selects broker maintenance for a topic.
+type TopicCleanupPolicy string
+
+const (
+	TopicCleanupDelete        TopicCleanupPolicy = "delete"
+	TopicCleanupCompact       TopicCleanupPolicy = "compact"
+	TopicCleanupDeleteCompact TopicCleanupPolicy = "delete,compact"
+)
+
+// TopicOptions defines optional CREATE settings for a topic.
+type TopicOptions struct {
+	Partitions     int
+	CleanupPolicy  TopicCleanupPolicy
+	RetentionHours int
+	RetentionBytes int64
+	Partitioner    string
+	AuthPolicy     string
+	ReadACL        []string
+	WriteACL       []string
+}
+
 func (p *Producer) CreateTopic(topic string, partitions int) error {
+	return p.CreateTopicWithOptions(topic, TopicOptions{Partitions: partitions})
+}
+
+// CreateTopicWithOptions creates or updates a topic with explicit policy options.
+func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) error {
+	createCmd, err := buildCreateTopicCommand(topic, options, p.config.EnableIdempotence)
+	if err != nil {
+		return err
+	}
 	if len(p.config.BrokerAddrs) == 0 {
 		return fmt.Errorf("no broker addresses available")
 	}
@@ -194,7 +238,12 @@ func (p *Producer) CreateTopic(topic string, partitions int) error {
 	}
 	defer func() { _ = conn.Close() }()
 
-	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d", topic, partitions)
+	if err := negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS); err != nil {
+		return fmt.Errorf("protocol negotiation: %w", err)
+	}
+	if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {
+		return fmt.Errorf("authentication: %w", err)
+	}
 	cmdBytes := EncodeMessage("admin", createCmd)
 
 	if err := WriteWithLength(conn, cmdBytes); err != nil {
@@ -206,12 +255,119 @@ func (p *Producer) CreateTopic(topic string, partitions int) error {
 		return fmt.Errorf("read response: %w", err)
 	}
 
-	if strings.Contains(string(resp), "ERROR:") {
-		return fmt.Errorf("broker error: %s", string(resp))
+	respStr := strings.TrimSpace(string(resp))
+	if brokerErr, ok := ParseBrokerError(respStr); ok {
+		return brokerErr
+	}
+	if !strings.HasPrefix(respStr, "OK") {
+		return fmt.Errorf("unexpected create response: %s", respStr)
 	}
 
-	LogInfo("create topic %s partition %d", topic, partitions)
+	LogInfo("create topic %s partition %d", topic, options.Partitions)
 	return nil
+}
+
+func buildCreateTopicCommand(topic string, options TopicOptions, idempotent bool) (string, error) {
+	if err := validateSDKTopicName(topic); err != nil {
+		return "", err
+	}
+	if options.Partitions <= 0 {
+		return "", fmt.Errorf("partitions must be positive")
+	}
+	if options.RetentionHours < 0 {
+		return "", fmt.Errorf("retention hours must be non-negative")
+	}
+	if options.RetentionBytes < 0 {
+		return "", fmt.Errorf("retention bytes must be non-negative")
+	}
+
+	cleanupPolicy, err := normalizeSDKCleanupPolicy(options.CleanupPolicy)
+	if err != nil {
+		return "", err
+	}
+	switch options.Partitioner {
+	case "", "hash_key", "round_robin":
+	default:
+		return "", fmt.Errorf("invalid partitioner %q", options.Partitioner)
+	}
+	switch options.AuthPolicy {
+	case "", "open", "deny_write", "deny_read", "acl":
+	default:
+		return "", fmt.Errorf("invalid auth policy %q", options.AuthPolicy)
+	}
+	for _, acl := range append(append([]string(nil), options.ReadACL...), options.WriteACL...) {
+		if !isSafeTopicOptionValue(acl, false) || strings.Contains(acl, ",") {
+			return "", fmt.Errorf("invalid ACL principal %q", acl)
+		}
+	}
+
+	command := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, options.Partitions, idempotent)
+	if cleanupPolicy != "" {
+		command += " cleanup_policy=" + cleanupPolicy
+	}
+	if options.RetentionHours != 0 {
+		command += fmt.Sprintf(" retention_hours=%d", options.RetentionHours)
+	}
+	if options.RetentionBytes != 0 {
+		command += fmt.Sprintf(" retention_bytes=%d", options.RetentionBytes)
+	}
+	if options.Partitioner != "" {
+		command += " partitioner=" + options.Partitioner
+	}
+	if options.AuthPolicy != "" {
+		command += " auth_policy=" + options.AuthPolicy
+	}
+	if len(options.ReadACL) > 0 {
+		command += " read_acl=" + strings.Join(options.ReadACL, ",")
+	}
+	if len(options.WriteACL) > 0 {
+		command += " write_acl=" + strings.Join(options.WriteACL, ",")
+	}
+	return command, nil
+}
+
+func validateSDKTopicName(name string) error {
+	if name == "" || len(name) > 249 || name == "." || name == ".." {
+		return fmt.Errorf("invalid topic name %q", name)
+	}
+	for _, char := range name {
+		switch {
+		case char >= 'a' && char <= 'z':
+		case char >= 'A' && char <= 'Z':
+		case char >= '0' && char <= '9':
+		case char == '.', char == '_', char == '-', char == '=':
+		default:
+			return fmt.Errorf("invalid topic name %q", name)
+		}
+	}
+	return nil
+}
+
+func normalizeSDKCleanupPolicy(value TopicCleanupPolicy) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(string(value))) {
+	case "":
+		return "", nil
+	case "delete":
+		return "delete", nil
+	case "compact":
+		return "compact", nil
+	case "delete,compact", "compact,delete":
+		return "delete,compact", nil
+	default:
+		return "", fmt.Errorf("invalid cleanup policy %q", value)
+	}
+}
+
+func isSafeTopicOptionValue(value string, allowEmpty bool) bool {
+	if value == "" {
+		return allowEmpty
+	}
+	for _, r := range value {
+		if r <= ' ' || r == '=' || r == '"' || r == '\\' {
+			return false
+		}
+	}
+	return true
 }
 
 // Send enqueues payload for delivery and returns the assigned sequence number.
@@ -237,10 +393,14 @@ func (p *Producer) Send(payload string) (uint64, error) {
 	}
 
 	seqNum := p.client.NextSeqNum(part)
+	producerID := p.client.ID
+	if p.config.EnableIdempotence {
+		producerID = fmt.Sprintf("%s-p%d", p.client.ID, part)
+	}
 	bm := Message{
 		SeqNum:     seqNum,
 		Payload:    payload,
-		ProducerID: p.client.ID,
+		ProducerID: producerID,
 		Epoch:      p.client.Epoch,
 	}
 

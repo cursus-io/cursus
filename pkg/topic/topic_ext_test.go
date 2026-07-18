@@ -93,44 +93,56 @@ func TestPartition_Basic(t *testing.T) {
 	mh.On("GetLatestOffset").Return(uint64(10))
 
 	p := NewPartition(0, "test-topic", mh, sm, cfg)
-	assert.Equal(t, uint64(11), p.NextOffset())
+	assert.Equal(t, uint64(10), p.NextOffset())
 
 	t.Run("Enqueue", func(t *testing.T) {
 		msg := types.Message{Payload: "msg1"}
-		mh.On("AppendMessage", "test-topic", 0, mock.Anything).Return(uint64(11), nil).Once()
+		mh.On("AppendMessage", "test-topic", 0, mock.Anything).Return(uint64(10), nil).Once()
 		p.Enqueue(msg)
 
 		assert.Eventually(t, func() bool {
-			return p.NextOffset() == 12
+			return p.NextOffset() == 11
 		}, 500*time.Millisecond, 5*time.Millisecond, "offset should increment after enqueue")
 	})
 
 	t.Run("EnqueueSync", func(t *testing.T) {
 		msg := types.Message{Payload: "msg-sync"}
-		mh.On("AppendMessageSync", "test-topic", 0, mock.Anything).Return(uint64(12), nil).Once()
+		mh.On("AppendMessageSync", "test-topic", 0, mock.Anything).Return(uint64(11), nil).Once()
 		err := p.EnqueueSync(msg)
 		assert.NoError(t, err)
-		assert.Equal(t, uint64(13), p.NextOffset())
+		assert.Equal(t, uint64(12), p.NextOffset())
 	})
 
 	t.Run("Idempotence", func(t *testing.T) {
 		p.isIdempotent = true
-		msg := types.Message{Payload: "idemp", ProducerID: "p1", SeqNum: 10}
+		msg := types.Message{Payload: "idemp", ProducerID: "p1", SeqNum: 1}
 
-		mh.On("AppendMessageSync", "test-topic", 0, mock.Anything).Return(uint64(13), nil).Once()
+		mh.On("AppendMessageSync", "test-topic", 0, mock.Anything).Return(uint64(12), nil).Once()
 		err := p.EnqueueSync(msg)
 		assert.NoError(t, err)
 
 		// Duplicate
 		err = p.EnqueueSync(msg)
 		assert.NoError(t, err)                      // Should skip without error
-		assert.Equal(t, uint64(14), p.NextOffset()) // Offset didn't increase
+		assert.Equal(t, uint64(13), p.NextOffset()) // Offset didn't increase
 	})
 
+	t.Run("ProducerStateOnlyTracksIdempotentTopics", func(t *testing.T) {
+		nonIdempotent := NewPartition(1, "bench-topic", mh, sm, cfg)
+		nonIdempotent.updateProducerState(&types.Message{ProducerID: "producer-1", SeqNum: 10})
+		_, found := nonIdempotent.producerState.Load("producer-1")
+		assert.False(t, found)
+
+		idempotent := NewPartition(2, "idem-topic", mh, sm, cfg)
+		idempotent.isIdempotent = true
+		idempotent.updateProducerState(&types.Message{ProducerID: "producer-1", SeqNum: 10})
+		_, found = idempotent.producerState.Load("producer-1")
+		assert.True(t, found)
+	})
 	t.Run("ReadCommitted", func(t *testing.T) {
 		p.SetHWM(20)
 		mh.On("GetFlushedOffset").Return(uint64(20)).Maybe()
-		mh.On("ReadMessages", uint64(11), 2).Return([]types.Message{{Payload: "m1"}, {Payload: "m2"}}, nil).Once()
+		mh.On("ReadMessages", uint64(11), 9).Return([]types.Message{{Offset: 11, Payload: "m1"}, {Offset: 12, Payload: "m2"}}, nil).Once()
 		msgs, err := p.ReadCommitted(11, 2)
 		assert.NoError(t, err)
 		assert.Equal(t, 2, len(msgs))

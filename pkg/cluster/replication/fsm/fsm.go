@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
@@ -30,14 +32,38 @@ type BrokerInfo struct {
 	LastSeen   time.Time `json:"last_seen"`
 }
 
+type ProducerSequence struct {
+	Epoch int64  `json:"epoch"`
+	Seq   uint64 `json:"seq"`
+}
+
+func (s *ProducerSequence) UnmarshalJSON(data []byte) error {
+	var legacySeq int64
+	if err := json.Unmarshal(data, &legacySeq); err == nil {
+		if legacySeq > 0 {
+			s.Seq = uint64(legacySeq)
+		}
+		return nil
+	}
+	type alias ProducerSequence
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*s = ProducerSequence(decoded)
+	return nil
+}
+
 type BrokerFSMState struct {
-	Version           int                                        `json:"version"`
-	Applied           uint64                                     `json:"applied"`
-	Logs              map[uint64]*ReplicationEntry               `json:"logs"`
-	Brokers           map[string]*BrokerInfo                     `json:"brokers"`
-	PartitionMetadata map[string]*PartitionMetadata              `json:"partitionMetadata"`
-	ProducerState     map[string]map[int]map[string]int64        `json:"producerState"`
-	GroupState        map[string]*coordinator.GroupStateSnapshot `json:"groupState,omitempty"`
+	Version           int                                            `json:"version"`
+	Applied           uint64                                         `json:"applied"`
+	Logs              map[uint64]*ReplicationEntry                   `json:"logs"`
+	Brokers           map[string]*BrokerInfo                         `json:"brokers"`
+	PartitionMetadata map[string]*PartitionMetadata                  `json:"partitionMetadata"`
+	ProducerState     map[string]map[int]map[string]ProducerSequence `json:"producerState"`
+	GroupState        map[string]*coordinator.GroupStateSnapshot     `json:"groupState,omitempty"`
+	TransactionState  map[string]*transaction.Snapshot               `json:"transactionState,omitempty"`
+	TopicState        map[string]*topic.Definition                   `json:"topicState,omitempty"`
 }
 
 type BrokerFSM struct {
@@ -47,11 +73,14 @@ type BrokerFSM struct {
 	logs              map[uint64]*ReplicationEntry
 	brokers           map[string]*BrokerInfo
 	partitionMetadata map[string]*PartitionMetadata
-	producerState     map[string]map[int]map[string]int64 // Topic -> Partition -> ProducerID -> LastSeq
+	producerState     map[string]map[int]map[string]ProducerSequence // Topic -> Partition -> ProducerID -> Last Epoch/Seq
 	applied           uint64
 
-	tm *topic.TopicManager
-	cd *coordinator.Coordinator
+	tm                       *topic.TopicManager
+	cd                       *coordinator.Coordinator
+	txn                      *transaction.Manager
+	restoredTransactionState map[string]*transaction.Snapshot
+	topicState               map[string]*topic.Definition
 }
 
 func NewBrokerFSM(tm *topic.TopicManager, cd *coordinator.Coordinator) *BrokerFSM {
@@ -60,7 +89,8 @@ func NewBrokerFSM(tm *topic.TopicManager, cd *coordinator.Coordinator) *BrokerFS
 		logs:              make(map[uint64]*ReplicationEntry),
 		brokers:           make(map[string]*BrokerInfo),
 		partitionMetadata: make(map[string]*PartitionMetadata),
-		producerState:     make(map[string]map[int]map[string]int64),
+		producerState:     make(map[string]map[int]map[string]ProducerSequence),
+		topicState:        make(map[string]*topic.Definition),
 		tm:                tm,
 		cd:                cd,
 	}
@@ -92,6 +122,17 @@ func (f *BrokerFSM) SetCoordinator(cd *coordinator.Coordinator) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cd = cd
+}
+
+func (f *BrokerFSM) SetTransactionManager(txn *transaction.Manager) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.txn = txn
+	if f.txn != nil && f.restoredTransactionState != nil {
+		f.txn.ImportState(f.restoredTransactionState)
+		util.Info("FSM: Imported %d deferred restored transactions", len(f.restoredTransactionState))
+		f.restoredTransactionState = nil
+	}
 }
 
 func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
@@ -133,12 +174,18 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyTopicDeleteCommand(strings.TrimPrefix(data, "TOPIC_DELETE:"))
 	case strings.HasPrefix(data, "PARTITION:"):
 		res = f.applyPartitionCommand(strings.TrimPrefix(data, "PARTITION:"))
+	case strings.HasPrefix(data, "PARTITION_COMMIT:"):
+		res = f.applyPartitionCommitCommand(strings.TrimPrefix(data, "PARTITION_COMMIT:"))
+	case strings.HasPrefix(data, "LEADER_ELECTION:"):
+		res = f.applyLeaderElectionCommand(strings.TrimPrefix(data, "LEADER_ELECTION:"))
 	case strings.HasPrefix(data, "GROUP_SYNC:"):
 		res = f.applyGroupSyncCommand(strings.TrimPrefix(data, "GROUP_SYNC:"))
 	case strings.HasPrefix(data, "OFFSET_SYNC:"):
 		res = f.applyOffsetSyncCommand(strings.TrimPrefix(data, "OFFSET_SYNC:"))
 	case strings.HasPrefix(data, "BATCH_OFFSET:"):
 		res = f.applyBatchOffsetSyncCommand(strings.TrimPrefix(data, "BATCH_OFFSET:"))
+	case strings.HasPrefix(data, "TXN_SYNC:"):
+		res = f.applyTransactionSyncCommand(strings.TrimPrefix(data, "TXN_SYNC:"))
 	default:
 		res = f.handleUnknownCommand(data)
 	}
@@ -176,21 +223,46 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Info("FSM Restore: Validating snapshot Version 1")
 	case 2:
 		util.Info("FSM Restore: Validating snapshot Version 2 (with group state)")
+	case 3:
+		util.Info("FSM Restore: Validating snapshot Version 3 (with producer epochs)")
+	case 4:
+		util.Info("FSM Restore: Validating snapshot Version 4 (with transaction state)")
+	case 5:
+		util.Info("FSM Restore: Validating snapshot Version 5 (with committed partition watermarks)")
+	case 6:
+		util.Info("FSM Restore: Validating snapshot Version 6 (with durable topic definitions)")
 	default:
 		return fmt.Errorf("unknown snapshot version: %d", state.Version)
 	}
 
+	restoredTopicState := copyTopicState(state.TopicState)
+	if len(restoredTopicState) == 0 && len(state.PartitionMetadata) > 0 {
+		if state.Version >= 6 {
+			return fmt.Errorf("snapshot version %d is missing topic state", state.Version)
+		}
+		restoredTopicState = legacyTopicState(state.PartitionMetadata)
+	}
+	definitions, err := validateTopicState(restoredTopicState, state.PartitionMetadata)
+	if err != nil {
+		return fmt.Errorf("restore topic definitions: %w", err)
+	}
+	if f.tm != nil {
+		if err := f.tm.RestoreDefinitions(definitions); err != nil {
+			return fmt.Errorf("restore topic registry: %w", err)
+		}
+	}
+
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	f.logs = state.Logs
 	f.brokers = state.Brokers
 	f.partitionMetadata = state.PartitionMetadata
+	f.topicState = restoredTopicState
 	f.applied = state.Applied
 
 	f.producerState = state.ProducerState
 	if f.producerState == nil {
-		f.producerState = make(map[string]map[int]map[string]int64)
+		f.producerState = make(map[string]map[int]map[string]ProducerSequence)
 	}
 
 	if state.GroupState != nil && f.cd != nil {
@@ -198,8 +270,59 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Info("FSM Restore: Restored %d consumer groups from snapshot", len(state.GroupState))
 	}
 
+	if state.TransactionState != nil {
+		if f.txn != nil {
+			f.txn.ImportState(state.TransactionState)
+			util.Info("FSM Restore: Restored %d transactions from snapshot", len(state.TransactionState))
+		} else {
+			f.restoredTransactionState = state.TransactionState
+			util.Info("FSM Restore: Deferred %d transactions until transaction manager is attached", len(state.TransactionState))
+		}
+	}
+
+	f.mu.Unlock()
+	if state.Version >= 5 {
+		f.reconcileCommittedPartitions()
+	}
 	util.Info("FSM restore completed: %d logs, %d brokers, %d partitions", len(state.Logs), len(state.Brokers), len(state.PartitionMetadata))
 	return nil
+}
+
+func (f *BrokerFSM) reconcileCommittedPartitions() {
+	f.mu.RLock()
+	metadata := make(map[string]PartitionMetadata, len(f.partitionMetadata))
+	for key, value := range f.partitionMetadata {
+		if value != nil {
+			metadata[key] = *value
+		}
+	}
+	tm := f.tm
+	f.mu.RUnlock()
+	if tm == nil {
+		return
+	}
+	for key, meta := range metadata {
+		idx := strings.LastIndex(key, "-")
+		if idx < 0 {
+			continue
+		}
+		partition, err := strconv.Atoi(key[idx+1:])
+		if err != nil {
+			continue
+		}
+		t := tm.GetTopic(key[:idx])
+		if t == nil {
+			continue
+		}
+		p, err := t.GetPartition(partition)
+		if err == nil {
+			if err := p.ReconcileCommittedHWM(meta.CommittedHWM); err != nil {
+				util.Warn("FSM: Failed to reconcile committed HWM for %s: %v", key, err)
+			} else {
+				p.FlushDisk()
+			}
+		}
+	}
 }
 
 func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
@@ -229,11 +352,11 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		}
 		metadataCopy[k] = &metaCopy
 	}
-	producerStateCopy := make(map[string]map[int]map[string]int64, len(f.producerState))
+	producerStateCopy := make(map[string]map[int]map[string]ProducerSequence, len(f.producerState))
 	for topic, partitions := range f.producerState {
-		partitionMap := make(map[int]map[string]int64, len(partitions))
+		partitionMap := make(map[int]map[string]ProducerSequence, len(partitions))
 		for pID, producers := range partitions {
-			producerMap := make(map[string]int64, len(producers))
+			producerMap := make(map[string]ProducerSequence, len(producers))
 			for prodID, seq := range producers {
 				producerMap[prodID] = seq
 			}
@@ -242,9 +365,21 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		producerStateCopy[topic] = partitionMap
 	}
 
+	topicStateCopy := copyTopicState(f.topicState)
+	if len(topicStateCopy) == 0 && len(metadataCopy) > 0 {
+		topicStateCopy = legacyTopicState(metadataCopy)
+	}
+	if _, err := validateTopicState(topicStateCopy, metadataCopy); err != nil {
+		return nil, fmt.Errorf("snapshot topic definitions: %w", err)
+	}
+
 	var groupState map[string]*coordinator.GroupStateSnapshot
 	if f.cd != nil {
 		groupState = f.cd.ExportState()
+	}
+	var transactionState map[string]*transaction.Snapshot
+	if f.txn != nil {
+		transactionState = f.txn.ExportState()
 	}
 
 	util.Debug("Creating FSM snapshot")
@@ -255,6 +390,8 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		partitionMetadata: metadataCopy,
 		producerState:     producerStateCopy,
 		groupState:        groupState,
+		transactionState:  transactionState,
+		topicState:        topicStateCopy,
 	}, nil
 }
 

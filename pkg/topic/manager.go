@@ -1,8 +1,11 @@
 package topic
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,8 +17,10 @@ import (
 	"github.com/cursus-io/cursus/util"
 )
 
+var ErrTopicNotFound = errors.New("topic not found")
+
 type StreamManager interface {
-	AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), commitInterval time.Duration) error
+	AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), legacyCommitInterval time.Duration) error
 	RemoveStream(key string)
 	GetStreamsForPartition(topic string, partition int) []*stream.StreamConnection
 	StopStream(key string)
@@ -29,6 +34,8 @@ type TopicManager struct {
 	cfg           *config.Config
 	StreamManager StreamManager
 	coordinator   *coordinator.Coordinator
+	txnResolver   TransactionDecisionResolver
+	metadataStore *topicMetadataStore
 }
 
 // HandlerProvider defines an interface to provide disk handlers.
@@ -36,8 +43,26 @@ type HandlerProvider interface {
 	GetHandler(topic string, partitionID int) (types.StorageHandler, error)
 }
 
+type existingPartitionProvider interface {
+	ExistingPartitionCount(topic string) (int, error)
+}
+
+type topicHandlerCloser interface {
+	CloseTopicHandlers(topic string)
+}
+
 func (tm *TopicManager) SetCoordinator(cd *coordinator.Coordinator) {
 	tm.coordinator = cd
+}
+
+func (tm *TopicManager) SetTransactionDecisionResolver(resolver TransactionDecisionResolver) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	tm.txnResolver = resolver
+	for _, t := range tm.topics {
+		t.SetTransactionDecisionResolver(resolver)
+	}
 }
 
 func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *TopicManager {
@@ -47,45 +72,105 @@ func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *
 		hp:            hp,
 		cfg:           cfg,
 		StreamManager: sm,
+		metadataStore: newTopicMetadataStore(cfg, hp),
 	}
 	return tm
 }
 
 func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent bool, eventSourcing bool) error {
+	policy := DefaultPolicy()
+	if tm.cfg != nil && tm.cfg.CleanupPolicy != "" {
+		policy.CleanupPolicy = tm.cfg.CleanupPolicy
+	}
+	return tm.CreateTopicWithPolicy(name, partitionCount, idempotent, eventSourcing, policy)
+}
+
+func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, idempotent bool, eventSourcing bool, policy Policy) error {
+	definition, err := (Definition{
+		Name:          name,
+		Partitions:    partitionCount,
+		Idempotent:    idempotent,
+		EventSourcing: eventSourcing,
+		Policy:        policy,
+	}).Normalize()
+	if err != nil {
+		return err
+	}
+	if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, eventSourcing); err != nil {
+		return err
+	}
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	if existing, ok := tm.topics[name]; ok {
-		current := len(existing.Partitions)
-		switch {
-		case partitionCount < current:
-			util.Error("cannot decrease partitions for topic '%s' (%d -> %d)", name, current, partitionCount)
-			return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", name, current, partitionCount)
-		case partitionCount > current:
-			if err := existing.AddPartitions(partitionCount-current, tm.hp); err != nil {
-				return fmt.Errorf("failed to add partitions to topic '%s': %w", name, err)
-			}
-			util.Info("topic '%s' partitions increased: %d -> %d", name, current, len(existing.Partitions))
-			return nil
-		default:
-			util.Info("topic '%s' already exists with %d partitions", name, current)
-			return nil
+		current := existing.Definition()
+		definition.Idempotent = current.Idempotent
+		definition.EventSourcing = current.EventSourcing
+		if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, current.EventSourcing); err != nil {
+			return err
 		}
+		if partitionCount < current.Partitions {
+			util.Error("cannot decrease partitions for topic '%s' (%d -> %d)", name, current.Partitions, partitionCount)
+			return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", name, current.Partitions, partitionCount)
+		}
+		if err := existing.applyDefinition(partitionCount, definition.Policy, tm.hp, tm.persistDefinitionLocked); err != nil {
+			return fmt.Errorf("update topic '%s': %w", name, err)
+		}
+		if partitionCount > current.Partitions {
+			util.Info("topic '%s' partitions increased: %d -> %d", name, current.Partitions, partitionCount)
+		} else {
+			util.Info("topic '%s' already exists with %d partitions", name, current.Partitions)
+		}
+		return nil
+	}
+	if err := tm.rejectOrphanedStorageLocked(name); err != nil {
+		return err
 	}
 
-	t, err := NewTopic(name, partitionCount, tm.hp, tm.cfg, tm.StreamManager, idempotent, eventSourcing)
+	created, err := NewTopicWithPolicy(
+		name,
+		partitionCount,
+		tm.hp,
+		tm.cfg,
+		tm.StreamManager,
+		idempotent,
+		eventSourcing,
+		definition.Policy,
+	)
 	if err != nil {
 		util.Error("failed to create topic '%s': %v", name, err)
 		return fmt.Errorf("failed to create topic '%s': %w", name, err)
 	}
-	tm.topics[name] = t
+	created.SetTransactionDecisionResolver(tm.txnResolver)
+	if err := tm.persistDefinitionLocked(definition); err != nil {
+		closePartiallyInitializedTopic(name, tm.hp, created.Partitions)
+		return err
+	}
+	tm.topics[name] = created
 	return nil
 }
-
 func (tm *TopicManager) GetTopic(name string) *Topic {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 	return tm.topics[name]
+}
+
+// ExistingPartitionCount reports the partition count already known in memory or
+// persisted by the storage provider without creating new partitions.
+func (tm *TopicManager) ExistingPartitionCount(name string) (int, error) {
+	tm.mu.RLock()
+	if existing := tm.topics[name]; existing != nil {
+		count := len(existing.Partitions)
+		tm.mu.RUnlock()
+		return count, nil
+	}
+	provider := tm.hp
+	tm.mu.RUnlock()
+	if discovery, ok := provider.(existingPartitionProvider); ok {
+		return discovery.ExistingPartitionCount(name)
+	}
+	return 0, nil
 }
 
 func (tm *TopicManager) GetLastOffset(topicName string, partitionID int) uint64 {
@@ -105,6 +190,18 @@ func (tm *TopicManager) GetLastOffset(topicName string, partitionID int) uint64 
 	return p.dh.GetAbsoluteOffset()
 }
 
+func (tm *TopicManager) ReadTopicPartition(topicName string, partitionID int, offset uint64, max int) ([]types.Message, error) {
+	t := tm.GetTopic(topicName)
+	if t == nil {
+		return nil, fmt.Errorf("topic '%s' does not exist", topicName)
+	}
+	p, err := t.GetPartition(partitionID)
+	if err != nil {
+		return nil, err
+	}
+	return p.dh.ReadMessages(offset, max)
+}
+
 // Async (acks=0)
 func (tm *TopicManager) Publish(topicName string, msg *types.Message) error {
 	t := tm.GetTopic(topicName)
@@ -113,7 +210,11 @@ func (tm *TopicManager) Publish(topicName string, msg *types.Message) error {
 	}
 
 	partition := t.GetPartitionForMessage(*msg)
-	return tm.publishInternal(topicName, partition, msg, false)
+	return tm.publishInternal(topicName, partition, msg, false, false)
+}
+
+func (tm *TopicManager) PublishToPartition(topicName string, partition int, msg *types.Message) error {
+	return tm.publishInternal(topicName, partition, msg, false, false)
 }
 
 // Sync (acks=1)
@@ -124,7 +225,14 @@ func (tm *TopicManager) PublishWithAck(topicName string, msg *types.Message) err
 	}
 
 	partition := t.GetPartitionForMessage(*msg)
-	return tm.publishInternal(topicName, partition, msg, true)
+	return tm.publishInternal(topicName, partition, msg, true, false)
+}
+
+func (tm *TopicManager) PublishToPartitionWithAck(topicName string, partition int, msg *types.Message) error {
+	return tm.publishInternal(topicName, partition, msg, true, false)
+}
+func (tm *TopicManager) PublishToPartitionWithAckIdempotent(topicName string, partition int, msg *types.Message) error {
+	return tm.publishInternal(topicName, partition, msg, true, true)
 }
 
 func (tm *TopicManager) processBatchMessages(topicName string, messages []types.Message, async bool) error {
@@ -217,8 +325,8 @@ func (tm *TopicManager) PublishBatchAsync(topicName string, messages []types.Mes
 	return tm.processBatchMessages(topicName, messages, true)
 }
 
-func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Message, requireAck bool) error {
-	util.Debug("Starting publish. Topic: %s, RequireAck: %v, ProducerID: %s, SeqNum: %d", topicName, requireAck, msg.ProducerID, msg.SeqNum)
+func (tm *TopicManager) publishInternal(topicName string, partition int, msg *types.Message, requireAck bool, forceIdempotent bool) error {
+	util.Debug("Starting publish. Topic: %s, RequireAck: %v, ForceIdempotent: %v, ProducerID: %s, SeqNum: %d", topicName, requireAck, forceIdempotent, msg.ProducerID, msg.SeqNum)
 	start := time.Now()
 
 	t := tm.GetTopic(topicName)
@@ -227,12 +335,20 @@ func (tm *TopicManager) publishInternal(topicName string, _ int, msg *types.Mess
 		return fmt.Errorf("topic '%s' does not exist", topicName)
 	}
 
+	if forceIdempotent && !requireAck {
+		return fmt.Errorf("forced idempotent publish requires acknowledgements")
+	}
+
 	if requireAck {
-		if err := t.PublishSync(*msg); err != nil {
+		if forceIdempotent {
+			if err := t.PublishToPartitionSyncIdempotent(partition, *msg); err != nil {
+				return fmt.Errorf("sync idempotent publish failed: %w", err)
+			}
+		} else if err := t.PublishToPartitionSync(partition, *msg); err != nil {
 			return fmt.Errorf("sync publish failed: %w", err)
 		}
 	} else {
-		if err := t.Publish(*msg); err != nil {
+		if err := t.PublishToPartition(partition, *msg); err != nil {
 			return fmt.Errorf("async publish failed: %w", err)
 		}
 	}
@@ -286,13 +402,73 @@ func (tm *TopicManager) Stop() {
 }
 
 func (tm *TopicManager) DeleteTopic(name string) bool {
+	deleted, err := tm.DeleteTopicDurable(name)
+	if err != nil {
+		util.Warn("Failed to durably delete topic %s: %v", name, err)
+		return false
+	}
+	return deleted
+}
+
+// DeleteTopicDurable commits the metadata deletion before removing local data.
+func (tm *TopicManager) DeleteTopicDurable(name string) (bool, error) {
+	if err := ValidateName(name); err != nil {
+		return false, fmt.Errorf("invalid topic name: %w", err)
+	}
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	if _, ok := tm.topics[name]; ok {
-		delete(tm.topics, name)
-		return true
+
+	current := tm.topics[name]
+	if current == nil {
+		return false, nil
 	}
-	return false
+	if err := tm.persistRemovalLocked(name); err != nil {
+		return false, err
+	}
+
+	delete(tm.topics, name)
+	for _, partition := range current.Partitions {
+		partition.Close()
+	}
+	if closer, ok := tm.hp.(topicHandlerCloser); ok {
+		closer.CloseTopicHandlers(name)
+	} else {
+		for _, partition := range current.Partitions {
+			if err := partition.dh.Close(); err != nil {
+				util.Warn("Failed to close storage handler for deleted topic %s[%d]: %v", name, partition.ID(), err)
+			}
+		}
+	}
+	if err := tm.deleteTopicLogDirLocked(name); err != nil {
+		// The durable definition removal is already committed. Keep the command
+		// result aligned with the logical state and leave physical cleanup for an
+		// operator or a later retry instead of reporting a false rollback.
+		util.Warn("Failed to clean log directory for deleted topic %s: %v", name, err)
+	}
+	return true, nil
+}
+func (tm *TopicManager) deleteTopicLogDirLocked(name string) error {
+	if tm.cfg == nil || strings.TrimSpace(tm.cfg.LogDir) == "" {
+		return nil
+	}
+
+	root, err := filepath.Abs(tm.cfg.LogDir)
+	if err != nil {
+		return err
+	}
+	target, err := filepath.Abs(filepath.Join(tm.cfg.LogDir, name))
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return err
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("refusing to delete topic path outside log root: %s", target)
+	}
+	return os.RemoveAll(target)
 }
 
 func (tm *TopicManager) ListTopics() []string {

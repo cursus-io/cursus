@@ -59,6 +59,9 @@ func MessagesConsumed(expected int) Expectation {
 // PublisherRetriedSuccessfully verifies that at least some messages were published.
 func PublisherRetriedSuccessfully() Expectation {
 	return func(ctx *TestContext) error {
+		if ctx.lastError != nil {
+			return fmt.Errorf("publisher retry failed: %w", ctx.lastError)
+		}
 		if ctx.publishedCount == 0 {
 			return fmt.Errorf("no messages were published")
 		}

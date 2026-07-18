@@ -151,10 +151,10 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 		return nil
 	}
 
-	// Calculate who is alive based on heartbeats and broker status.
-	// Skip brokers that have been deregistered (Status != "active").
+	// A heartbeat proves liveness, not log synchronization. Only existing ISR
+	// members may remain in ISR; catch-up must explicitly re-admit a replica.
 	i.mu.RLock()
-	for _, replica := range metadata.Replicas {
+	for _, replica := range metadata.ISR {
 		if broker := i.fsm.GetBroker(replica); broker != nil && broker.Status != "active" {
 			continue
 		}
@@ -165,27 +165,6 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 		}
 	}
 	i.mu.RUnlock()
-
-	// Ensure self is in ISR if we are part of replicas
-	selfInReplicas := false
-	for _, r := range metadata.Replicas {
-		if r == i.brokerID {
-			selfInReplicas = true
-			break
-		}
-	}
-	if selfInReplicas {
-		alreadyIn := false
-		for _, node := range currentISR {
-			if node == i.brokerID {
-				alreadyIn = true
-				break
-			}
-		}
-		if !alreadyIn {
-			currentISR = append(currentISR, i.brokerID)
-		}
-	}
 
 	// If we are Raft leader, propose changes if needed
 	if i.applier != nil && i.applier.IsLeader() {
@@ -226,35 +205,15 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 				newMetadata.Leader = currentISR[0]
 				newMetadata.LeaderEpoch++
 				util.Info("ISRManager: Failover for %s: %s -> %s", key, metadata.Leader, newMetadata.Leader)
-			} else if !leaderAlive && len(currentISR) == 0 && len(metadata.Replicas) > 0 {
-				// ISR is empty: fallback to any available replica (unclean leader election)
-				found := false
-				for _, replica := range metadata.Replicas {
-					// Fallback to the first alive replica
-					if i.isBrokerAlive(replica) {
-						newMetadata.Leader = replica
-						newMetadata.LeaderEpoch++
-						newMetadata.ISR = []string{replica}
-						util.Warn("ISRManager: Unclean leader election for %s: %s -> %s (ISR was empty, fell back to replica)", key, metadata.Leader, replica)
-						found = true
-						break
-					}
-				}
-				// If no alive, fallback to the very first replica in metadata regardless
-				if !found {
-					replica := metadata.Replicas[0]
-					newMetadata.Leader = replica
-					newMetadata.LeaderEpoch++
-					newMetadata.ISR = []string{replica}
-					util.Warn("ISRManager: Unclean leader election (emergency fallback) for %s: %s -> %s", key, metadata.Leader, replica)
-				}
+			} else if !leaderAlive && len(currentISR) == 0 {
+				util.Warn("ISRManager: No clean leader candidate for %s; partition remains unavailable", key)
 			}
 
 			data, err := json.Marshal(newMetadata)
-		if err != nil {
-			util.Error("ISRManager: Failed to marshal metadata for %s: %v", key, err)
-			return currentISR
-		}
+			if err != nil {
+				util.Error("ISRManager: Failed to marshal metadata for %s: %v", key, err)
+				return currentISR
+			}
 			// The FSM expects PARTITION:<topic>-<partition>:<json>
 			// ApplyCommand(prefix, data) results in "prefix:data"
 			payload := []byte(fmt.Sprintf("%s:%s", key, string(data)))
@@ -265,15 +224,6 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 	}
 
 	return currentISR
-}
-
-func (i *ISRManager) isBrokerAlive(brokerID string) bool {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	if lastSeen, ok := i.lastSeen[brokerID]; ok {
-		return time.Since(lastSeen) < i.heartbeatTimeout
-	}
-	return false
 }
 
 func (i *ISRManager) GetISR(topic string, partition int) []string {

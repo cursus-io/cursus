@@ -1,16 +1,21 @@
 package controller
 
 import (
+	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	"strconv"
 	"io"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
+	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -25,6 +30,9 @@ type ClusterRouter struct {
 	rm             RaftManager
 	clientPort     int
 	clientHost     string
+	internalPort   int
+	internalTLS    *tls.Config
+	internalToken  string
 	timeout        time.Duration
 	localProcessor LocalProcessor
 
@@ -33,13 +41,24 @@ type ClusterRouter struct {
 	coordBrokerHash string // hash of active broker IDs to detect changes
 }
 
-func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm RaftManager, clientPort int, clientHost string) *ClusterRouter {
+func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm RaftManager, clientPort int, clientHost string, cfg *config.Config) *ClusterRouter {
+	internalPort := 0
+	var internalTLS *tls.Config
+	internalToken := ""
+	if cfg != nil {
+		internalPort = cfg.InternalBrokerPort
+		internalTLS = cfg.InternalClientTLSConfig()
+		internalToken = cfg.InternalAuthToken
+	}
 	return &ClusterRouter{
 		brokerID:       brokerID,
 		LocalAddr:      localAddr,
 		rm:             rm,
 		clientPort:     clientPort,
 		clientHost:     clientHost,
+		internalPort:   internalPort,
+		internalTLS:    internalTLS,
+		internalToken:  internalToken,
 		timeout:        5 * time.Second,
 		localProcessor: processor,
 	}
@@ -170,7 +189,7 @@ func (r *ClusterRouter) forwardWithTimeout(addr, req string) (string, error) {
 		return "", fmt.Errorf("invalid address format %s: %w", addr, splitErr)
 	}
 
-	clientAddr := fmt.Sprintf("%s:%d", host, r.clientPort)
+	clientAddr := r.brokerCommandAddr(host)
 	resp, err := r.sendRequest(clientAddr, req)
 	if err != nil {
 		return "", fmt.Errorf("failed to forward request to %s: %w", clientAddr, err)
@@ -221,23 +240,85 @@ func (r *ClusterRouter) forwardDataWithTimeout(addr string, data []byte) (string
 		return "", fmt.Errorf("invalid address format %s: %w", addr, splitErr)
 	}
 
-	clientAddr := fmt.Sprintf("%s:%d", host, r.clientPort)
-	return r.sendDataRequest(clientAddr, data)
+	clientAddr := r.brokerCommandAddr(host)
+	return r.sendDataRequest(clientAddr, r.wrapInternalBatch(data))
+}
+
+func (r *ClusterRouter) brokerCommandAddr(host string) string {
+	port := r.clientPort
+	if r.internalPort > 0 {
+		port = r.internalPort
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 func (r *ClusterRouter) processLocally(req string) string {
 	if r.localProcessor != nil {
 		return r.localProcessor.ProcessCommand(req)
 	}
-	return "ERROR: no local processor configured"
+	return "ERROR: local_processor_not_configured"
 }
 
+func (r *ClusterRouter) withInternalToken(command string) string {
+	if r.internalToken == "" {
+		return command
+	}
+	if wireprotocol.IsTextCommand(command) {
+		return injectInternalToken(command, r.internalToken)
+	}
+	if _, payload, err := util.DecodeMessage([]byte(command)); err == nil {
+		return string(util.EncodeMessage("", injectInternalToken(payload, r.internalToken)))
+	}
+	return injectInternalToken(command, r.internalToken)
+}
+
+func injectInternalToken(command, token string) string {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return command
+	}
+	commandEnd := strings.IndexAny(trimmed, " \t\r\n")
+	if commandEnd == -1 {
+		return trimmed + " internal_token=" + token
+	}
+	commandName := trimmed[:commandEnd]
+	rest := strings.TrimLeft(trimmed[commandEnd:], " \t\r\n")
+	if rest == "" {
+		return commandName + " internal_token=" + token
+	}
+	firstArgEnd := strings.IndexAny(rest, " \t\r\n")
+	firstArg := rest
+	if firstArgEnd >= 0 {
+		firstArg = rest[:firstArgEnd]
+	}
+	if strings.HasPrefix(firstArg, "internal_token=") {
+		return command
+	}
+	return commandName + " internal_token=" + token + " " + rest
+}
+
+func (r *ClusterRouter) wrapInternalBatch(data []byte) []byte {
+	if r.internalToken == "" {
+		return data
+	}
+	payload := base64.StdEncoding.EncodeToString(data)
+	return []byte("INTERNAL_BATCH internal_token=" + r.internalToken + " payload=" + payload)
+}
 func (r *ClusterRouter) sendRequest(addr, command string) (string, error) {
-	return r.sendDataRequest(addr, []byte(command))
+	return r.sendDataRequest(addr, []byte(r.withInternalToken(command)))
 }
 
 func (r *ClusterRouter) sendDataRequest(addr string, data []byte) (string, error) {
-	conn, err := net.DialTimeout("tcp", addr, r.timeout)
+	var conn net.Conn
+	var err error
+	if r.internalTLS != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+		defer cancel()
+		tlsDialer := &tls.Dialer{NetDialer: &net.Dialer{}, Config: r.internalTLS}
+		conn, err = tlsDialer.DialContext(ctx, "tcp", addr)
+	} else {
+		conn, err = (&net.Dialer{Timeout: r.timeout}).Dial("tcp", addr)
+	}
 	if err != nil {
 		return "", err
 	}

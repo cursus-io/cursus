@@ -9,7 +9,6 @@ import (
 	"github.com/cursus-io/cursus/sdk"
 )
 
-
 type OrderCreated struct {
 	OrderID  string `json:"order_id"`
 	Customer string `json:"customer"`
@@ -36,12 +35,12 @@ type PartialRefund struct {
 // --- Order Aggregate (for snapshot) ---
 
 type Order struct {
-	ID       string            `json:"id"`
-	Customer string            `json:"customer"`
-	Items    map[string]Item   `json:"items"`
-	Total    float64           `json:"total"`
-	Status   string            `json:"status"`
-	Tracking string            `json:"tracking,omitempty"`
+	ID       string          `json:"id"`
+	Customer string          `json:"customer"`
+	Items    map[string]Item `json:"items"`
+	Total    float64         `json:"total"`
+	Status   string          `json:"status"`
+	Tracking string          `json:"tracking,omitempty"`
 }
 
 type Item struct {
@@ -78,7 +77,7 @@ func main() {
 
 	// 2. Create order
 	fmt.Println("[Command] CreateOrder")
-	r, err := store.Append(orderID, 1, &sdk.Event{
+	r, err := store.Append(orderID, 0, &sdk.Event{
 		Type: "OrderCreated",
 		Payload: toJSON(OrderCreated{
 			OrderID:  orderID,
@@ -92,8 +91,8 @@ func main() {
 
 	// 3. Add items
 	fmt.Println("[Command] AddItem (Mechanical Keyboard)")
-	r, err = store.Append(orderID, 2, &sdk.Event{
-		Type: "ItemAdded",
+	r, err = store.Append(orderID, 1, &sdk.Event{
+		Type:    "ItemAdded",
 		Payload: toJSON(ItemAdded{SKU: "KB-MX01", Name: "Mechanical Keyboard", Qty: 1, Price: 89.99}),
 	})
 	if err != nil {
@@ -102,8 +101,8 @@ func main() {
 	fmt.Printf("  -> version=%d\n", r.Version)
 
 	fmt.Println("[Command] AddItem (USB-C Cable x3)")
-	r, err = store.Append(orderID, 3, &sdk.Event{
-		Type: "ItemAdded",
+	r, err = store.Append(orderID, 2, &sdk.Event{
+		Type:    "ItemAdded",
 		Payload: toJSON(ItemAdded{SKU: "CBL-UC3", Name: "USB-C Cable", Qty: 3, Price: 9.99}),
 	})
 	if err != nil {
@@ -120,7 +119,7 @@ func main() {
 
 	// 5. Version conflict demo
 	fmt.Println("[Command] AddItem with stale version (expecting conflict)")
-	_, err = store.Append(orderID, 2, &sdk.Event{
+	_, err = store.Append(orderID, 1, &sdk.Event{
 		Type:    "ItemAdded",
 		Payload: toJSON(ItemAdded{SKU: "STALE", Name: "Should Fail", Qty: 1, Price: 0}),
 	})
@@ -128,8 +127,8 @@ func main() {
 
 	// 6. Ship order
 	fmt.Println("[Command] ShipOrder")
-	r, err = store.Append(orderID, 4, &sdk.Event{
-		Type: "OrderShipped",
+	r, err = store.Append(orderID, 3, &sdk.Event{
+		Type:    "OrderShipped",
 		Payload: toJSON(OrderShipped{Carrier: "FedEx", Tracking: "TRK-98765"}),
 	})
 	if err != nil {
@@ -175,8 +174,8 @@ func main() {
 
 	// 9. Append after snapshot
 	fmt.Println("[Command] PartialRefund")
-	r, err = store.Append(orderID, 5, &sdk.Event{
-		Type: "PartialRefund",
+	r, err = store.Append(orderID, 4, &sdk.Event{
+		Type:    "PartialRefund",
 		Payload: toJSON(PartialRefund{SKU: "CBL-UC3", Amount: 9.99, Reason: "defective"}),
 	})
 	if err != nil {

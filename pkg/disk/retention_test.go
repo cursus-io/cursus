@@ -85,8 +85,12 @@ func TestDiskHandler_EnforceRetention(t *testing.T) {
 			}
 
 			for _, segNum := range tt.expectedDelete {
-				assert.FileExists(t, dh.GetSegmentPath(uint64(segNum))+".deleted", "Log %d should be marked as deleted", segNum)
-				assert.FileExists(t, dh.GetIndexPath(uint64(segNum))+".deleted", "Index %d should be marked as deleted", segNum)
+				logPath := dh.GetSegmentPath(uint64(segNum))
+				indexPath := dh.GetIndexPath(uint64(segNum))
+				assert.NoFileExists(t, logPath, "Log %d should be removed", segNum)
+				assert.NoFileExists(t, indexPath, "Index %d should be removed", segNum)
+				assert.NoFileExists(t, logPath+".deleted", "Log tombstone %d should be purged", segNum)
+				assert.NoFileExists(t, indexPath+".deleted", "Index tombstone %d should be purged", segNum)
 			}
 			for _, segNum := range tt.expectedKeep {
 				logPath := dh.GetSegmentPath(uint64(segNum))

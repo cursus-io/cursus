@@ -21,6 +21,7 @@ func (m *MockStorageHandler) ReadMessages(o uint64, max int) ([]types.Message, e
 	return nil, nil
 }
 func (m *MockStorageHandler) GetAbsoluteOffset() uint64      { return 0 }
+func (m *MockStorageHandler) GetFirstOffset() uint64         { return 0 }
 func (m *MockStorageHandler) GetFlushedOffset() uint64       { return 0 }
 func (m *MockStorageHandler) GetLatestOffset() uint64        { return 0 }
 func (m *MockStorageHandler) GetSegmentPath(b uint64) string { return "" }
@@ -34,6 +35,7 @@ func (m *MockStorageHandler) AppendMessageWithOffset(t string, p int, msg *types
 	return nil
 }
 func (m *MockStorageHandler) WriteBatch(b []types.DiskMessage) error { return nil }
+func (m *MockStorageHandler) TruncateTo(uint64) error                { return nil }
 func (m *MockStorageHandler) Flush()                                 {}
 func (m *MockStorageHandler) Close() error                           { return nil }
 
@@ -102,6 +104,8 @@ func TestISRManager_Quorum(t *testing.T) {
 	}
 
 	partitionMetadata := fsm.PartitionMetadata{
+		Leader:         "node1",
+		LeaderEpoch:    1,
 		Replicas:       []string{"node1", "node2", "node3"},
 		ISR:            []string{"node1", "node2", "node3"},
 		PartitionCount: 1,
@@ -249,14 +253,16 @@ func TestISRManager_UncleanLeaderElection(t *testing.T) {
 	isrManager.CleanStaleHeartbeats()
 	isrManager.ComputeISR("topic", 0)
 
-	// After compute, the partition should have elected a new leader via unclean election
+	// A live replica outside ISR must not be promoted without an explicit catch-up.
 	updatedMeta := brokerFSM.GetPartitionMetadata(key)
 	if updatedMeta == nil {
 		t.Fatal("Partition metadata not found after ISR compute")
 	}
 
-	// Leader should no longer be node1 (it's dead)
-	if updatedMeta.Leader == "node1" {
-		t.Logf("Note: leader is still node1 — ISR compute may not have triggered unclean election if node1 is self-reported as alive by ISR manager")
+	if updatedMeta.Leader != "node1" {
+		t.Fatalf("unclean leader election changed leader to %s", updatedMeta.Leader)
+	}
+	if len(updatedMeta.ISR) != 0 {
+		t.Fatalf("expected empty ISR while no clean candidate exists, got %v", updatedMeta.ISR)
 	}
 }

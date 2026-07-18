@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -402,8 +403,11 @@ func TestProducer_ParseAckResponse_ErrorPrefix(t *testing.T) {
 	}
 
 	_, err := p.parseAckResponse([]byte("ERROR: broker busy"))
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "broker error")
+	var brokerErr *BrokerError
+	require.True(t, errors.As(err, &brokerErr))
+	assert.Equal(t, "broker", brokerErr.Code)
+	assert.Equal(t, ErrorClassInternal, brokerErr.Class)
+	assert.False(t, brokerErr.Retryable)
 }
 
 func TestProducer_ParseAckResponse_InvalidJSON(t *testing.T) {
@@ -514,6 +518,19 @@ func TestProducer_ParseAckResponse_Idempotence_Valid(t *testing.T) {
 	assert.Equal(t, "OK", resp.Status)
 }
 
+func TestProducer_NonRetryableProducerError(t *testing.T) {
+	assert.False(t, isNonRetryableProducerError(assert.AnError))
+	assert.True(t, isNonRetryableProducerError(&staticError{msg: "broker error: ERROR: stale_producer_epoch producer=p1"}))
+	assert.False(t, isNonRetryableProducerError(&staticError{msg: "broker error: ERROR: NOT_LEADER"}))
+}
+
+type staticError struct {
+	msg string
+}
+
+func (e *staticError) Error() string {
+	return e.msg
+}
 func TestProducer_GetPartitionCount(t *testing.T) {
 	p := &Producer{partitions: 5}
 	assert.Equal(t, 5, p.GetPartitionCount())
@@ -548,8 +565,8 @@ func TestProducer_GetLatencies_ReturnsCopy(t *testing.T) {
 
 func TestProducer_GetPartitionStats(t *testing.T) {
 	p := &Producer{
-		partitions:  2,
-		bmTotalTime: map[int]time.Duration{0: 10 * time.Millisecond, 1: 20 * time.Millisecond},
+		partitions:   2,
+		bmTotalTime:  map[int]time.Duration{0: 10 * time.Millisecond, 1: 20 * time.Millisecond},
 		bmTotalCount: map[int]int{0: 2, 1: 4},
 	}
 

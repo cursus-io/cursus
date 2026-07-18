@@ -137,7 +137,7 @@ func (p *Publisher) CreateTopic(topic string, partitions int) error {
 	}
 	defer func() { _ = conn.Close() }()
 
-	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d", topic, partitions)
+	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, partitions, p.config.EnableIdempotence)
 	cmdBytes := util.EncodeMessage("admin", createCmd)
 
 	if err := util.WriteWithLength(conn, cmdBytes); err != nil {
@@ -149,8 +149,12 @@ func (p *Publisher) CreateTopic(topic string, partitions int) error {
 		return fmt.Errorf("read response: %w", err)
 	}
 
-	if strings.Contains(string(resp), "ERROR:") {
-		return fmt.Errorf("broker error: %s", string(resp))
+	respStr := strings.TrimSpace(string(resp))
+	if strings.HasPrefix(respStr, "ERROR:") {
+		return fmt.Errorf("broker error: %s", respStr)
+	}
+	if !strings.HasPrefix(respStr, "OK") {
+		return fmt.Errorf("unexpected create response: %s", respStr)
 	}
 
 	util.Info("create topic %s partition %d", topic, partitions)
@@ -179,10 +183,14 @@ func (p *Publisher) PublishMessage(message string) (uint64, error) {
 	}
 
 	seqNum := p.producer.NextSeqNum(part)
+	producerID := p.producer.ID
+	if p.config.EnableIdempotence {
+		producerID = fmt.Sprintf("%s-p%d", p.producer.ID, part)
+	}
 	bm := types.Message{
 		SeqNum:     seqNum,
 		Payload:    message,
-		ProducerID: p.producer.ID,
+		ProducerID: producerID,
 		Epoch:      p.producer.Epoch,
 	}
 
