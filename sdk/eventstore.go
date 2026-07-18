@@ -53,6 +53,7 @@ type EventStore struct {
 	topic      string
 	producerID string
 	addr       string
+	requestMu  sync.Mutex
 	mu         sync.Mutex
 	conn       net.Conn
 }
@@ -88,9 +89,10 @@ func (es *EventStore) getConn() (net.Conn, error) {
 	es.mu.Lock()
 	if es.conn != nil {
 		// Another goroutine connected while we were dialing.
+		existing := es.conn
 		es.mu.Unlock()
 		_ = conn.Close()
-		return es.conn, nil
+		return existing, nil
 	}
 	es.conn = conn
 	es.mu.Unlock()
@@ -109,6 +111,9 @@ func (es *EventStore) resetConn() {
 
 // sendCommand sends a text command and returns the response string.
 func (es *EventStore) sendCommand(cmd string) (string, error) {
+	es.requestMu.Lock()
+	defer es.requestMu.Unlock()
+
 	conn, err := es.getConn()
 	if err != nil {
 		return "", err
@@ -234,6 +239,9 @@ func (es *EventStore) ReadStream(key string) (*StreamData, error) {
 // ReadStreamFrom reads events starting from a specific version.
 // If fromVersion is 0, the broker auto-resolves using snapshots.
 func (es *EventStore) ReadStreamFrom(key string, fromVersion uint64) (*StreamData, error) {
+	es.requestMu.Lock()
+	defer es.requestMu.Unlock()
+
 	cmd := fmt.Sprintf("READ_STREAM topic=%s key=%s", es.topic, key)
 	if fromVersion > 0 {
 		cmd += fmt.Sprintf(" from_version=%d", fromVersion)
@@ -392,6 +400,9 @@ func parseStreamVersionResponse(respStr string) (uint64, error) {
 
 // Close closes the underlying connection.
 func (es *EventStore) Close() error {
+	es.requestMu.Lock()
+	defer es.requestMu.Unlock()
+
 	es.mu.Lock()
 	defer es.mu.Unlock()
 	if es.conn != nil {
