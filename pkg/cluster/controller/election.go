@@ -37,7 +37,11 @@ func (ce *ControllerElection) monitorLeadership() {
 		case <-ce.ctx.Done():
 			util.Info("Leadership monitor stopping")
 			return
-		case isLeader := <-notifyCh:
+		case isLeader, ok := <-notifyCh:
+			if !ok {
+				util.Info("Leadership notification channel closed")
+				return
+			}
 			if isLeader {
 				util.Info("This node is now the Cluster Leader")
 			} else {
