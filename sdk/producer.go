@@ -19,15 +19,18 @@ type BatchState struct {
 }
 
 type partitionBuffer struct {
-	mu     sync.Mutex
-	msgs   []Message
-	cond   *sync.Cond
-	closed bool
+	mu           sync.Mutex
+	msgs         []Message
+	cond         *sync.Cond
+	drainWake    chan struct{}
+	drainWaiters []chan struct{}
+	closed       bool
 }
 
 func newPartitionBuffer() *partitionBuffer {
 	p := &partitionBuffer{
-		msgs: make([]Message, 0),
+		msgs:      make([]Message, 0),
+		drainWake: make(chan struct{}, 1),
 	}
 	p.cond = sync.NewCond(&p.mu)
 	return p
@@ -80,14 +83,14 @@ func NewProducer(cfg *PublisherConfig) (*Producer, error) {
 	}
 
 	p := &Producer{
-		config:       cfg,
-		client:       client,
-		partitions:   cfg.Partitions,
-		buffers:      make([]*partitionBuffer, cfg.Partitions),
-		done:         make(chan struct{}),
-		bmTotalTime:  make(map[int]time.Duration),
-		bmTotalCount: make(map[int]int),
-		bmLatencies:  make([]time.Duration, 0),
+		config:           cfg,
+		client:           client,
+		partitions:       cfg.Partitions,
+		buffers:          make([]*partitionBuffer, cfg.Partitions),
+		done:             make(chan struct{}),
+		bmTotalTime:      make(map[int]time.Duration),
+		bmTotalCount:     make(map[int]int),
+		bmLatencies:      make([]time.Duration, 0),
 		inFlight:         make([]int32, cfg.Partitions),
 		gcTicker:         time.NewTicker(1 * time.Minute),
 		partitionLeaders: make(map[int]string),
@@ -272,23 +275,48 @@ func (p *Producer) partitionSender(part int) {
 	}
 
 	for {
-		buf.mu.Lock()
+		select {
+		case <-p.done:
+			return
+		default:
+		}
 
-		for len(buf.msgs) == 0 && !buf.closed && atomic.LoadInt32(&p.closed) == 0 {
+		buf.mu.Lock()
+		for len(buf.msgs) == 0 && len(buf.drainWaiters) == 0 && !buf.closed {
 			buf.cond.Wait()
 		}
 
-		if (buf.closed || atomic.LoadInt32(&p.closed) == 1) && len(buf.msgs) == 0 {
+		if len(buf.msgs) == 0 {
+			waiters := buf.drainWaiters
+			buf.drainWaiters = nil
+			select {
+			case <-buf.drainWake:
+			default:
+			}
+			closed := buf.closed
 			buf.mu.Unlock()
-			return
+
+			for _, waiter := range waiters {
+				close(waiter)
+			}
+			if closed {
+				return
+			}
+			continue
 		}
 
 		var batch []Message
-		if len(buf.msgs) >= p.config.BatchSize {
+		if len(buf.msgs) >= p.config.BatchSize || len(buf.drainWaiters) > 0 || buf.closed {
 			batch = p.extract(buf)
 			buf.mu.Unlock()
 		} else {
 			buf.mu.Unlock()
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			timer.Reset(linger)
 
 			select {
@@ -296,6 +324,12 @@ func (p *Producer) partitionSender(part int) {
 				buf.mu.Lock()
 				if len(buf.msgs) > 0 {
 					batch = p.extractAny(buf)
+				}
+				buf.mu.Unlock()
+			case <-buf.drainWake:
+				buf.mu.Lock()
+				if len(buf.msgs) > 0 {
+					batch = p.extract(buf)
 				}
 				buf.mu.Unlock()
 			case <-p.done:
@@ -342,35 +376,63 @@ func (p *Producer) extractAny(buf *partitionBuffer) []Message {
 // ─── Flush / Stats ────────────────────────────────────────────────────────────
 
 func (p *Producer) Flush() {
-	for _, buf := range p.buffers {
-		buf.mu.Lock()
-		buf.cond.Broadcast()
-		buf.mu.Unlock()
-	}
+	timeout := p.flushTimeout()
 
+	p.closeMu.Lock()
+	if atomic.LoadInt32(&p.closed) == 1 {
+		p.closeMu.Unlock()
+		return
+	}
+	waiters := p.requestDrain(false)
+	p.closeMu.Unlock()
+
+	if !waitForDrain(waiters, timeout) {
+		LogWarn("Flush timeout after %v", timeout)
+	}
+}
+
+func (p *Producer) flushTimeout() time.Duration {
 	timeout := time.Duration(p.config.FlushTimeoutMS) * time.Millisecond
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		return 30 * time.Second
 	}
+	return timeout
+}
 
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		allClear := true
-		for part := 0; part < p.partitions; part++ {
-			if atomic.LoadInt32(&p.inFlight[part]) > 0 {
-				allClear = false
-				break
-			}
+// requestDrain must be called while closeMu is held so a concurrent Close cannot
+// let a sender exit before its drain waiter is registered.
+func (p *Producer) requestDrain(markClosed bool) []chan struct{} {
+	waiters := make([]chan struct{}, 0, len(p.buffers))
+	for _, buf := range p.buffers {
+		waiter := make(chan struct{})
+		buf.mu.Lock()
+		if markClosed {
+			buf.closed = true
 		}
-
-		if allClear {
-			return
+		buf.drainWaiters = append(buf.drainWaiters, waiter)
+		buf.cond.Broadcast()
+		select {
+		case buf.drainWake <- struct{}{}:
+		default:
 		}
-
-		time.Sleep(10 * time.Millisecond)
+		buf.mu.Unlock()
+		waiters = append(waiters, waiter)
 	}
+	return waiters
+}
 
-	LogWarn("Flush timeout after %v", timeout)
+func waitForDrain(waiters []chan struct{}, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for _, waiter := range waiters {
+		select {
+		case <-waiter:
+		case <-timer.C:
+			return false
+		}
+	}
+	return true
 }
 
 // FlushBenchmark waits until all expectedTotal messages are acknowledged or timeout expires.
@@ -513,18 +575,25 @@ func (p *Producer) Close() error {
 		return nil
 	}
 	atomic.StoreInt32(&p.closed, 1)
-	close(p.done)
-
-	for _, buf := range p.buffers {
-		buf.mu.Lock()
-		buf.closed = true
-		buf.cond.Broadcast()
-		buf.mu.Unlock()
-	}
+	waiters := p.requestDrain(true)
 	p.closeMu.Unlock()
 
+	timeout := p.flushTimeout()
+	drained := waitForDrain(waiters, timeout)
+	if !drained {
+		LogWarn("Close drain timeout after %v", timeout)
+	}
+
 	p.gcTicker.Stop()
+	close(p.done)
+	clientErr := p.client.Close()
 	p.sendersWG.Wait()
 
-	return p.client.Close()
+	if !drained {
+		if clientErr != nil {
+			return fmt.Errorf("producer close: drain timeout after %v; close client: %w", timeout, clientErr)
+		}
+		return fmt.Errorf("producer close: drain timeout after %v", timeout)
+	}
+	return clientErr
 }
