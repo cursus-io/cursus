@@ -76,6 +76,15 @@ func (s *SnapshotStore) loadFromDisk() error {
 		return err
 	}
 
+	fileInfo, err := s.file.Stat()
+	if err != nil {
+		return err
+	}
+	if fileInfo.Size() < 0 {
+		return fmt.Errorf("negative snapshot file size: %d", fileInfo.Size())
+	}
+	fileSize := uint64(fileInfo.Size())
+
 	var offset uint64
 	var lastGoodOffset uint64
 	for {
@@ -131,12 +140,18 @@ func (s *SnapshotStore) loadFromDisk() error {
 		}
 		offset += 4
 
-		// Skip Payload bytes.
-		if _, err := s.file.Seek(int64(payloadLen), io.SeekCurrent); err != nil {
+		// Check that the declared payload fits in the file before seeking. Seeking
+		// beyond EOF succeeds, so it cannot be used to detect a partial payload.
+		if offset > fileSize || uint64(payloadLen) > fileSize-offset {
 			if truncErr := s.file.Truncate(int64(lastGoodOffset)); truncErr != nil {
 				return fmt.Errorf("snapshot store: truncate after partial payload: %w", truncErr)
 			}
 			break
+		}
+
+		// Skip the validated payload bytes.
+		if _, err := s.file.Seek(int64(payloadLen), io.SeekCurrent); err != nil {
+			return fmt.Errorf("snapshot store: seek payload: %w", err)
 		}
 		offset += uint64(payloadLen)
 

@@ -265,3 +265,57 @@ func TestSnapshotStore_PartialWriteRecovery(t *testing.T) {
 	require.NotNil(t, snap)
 	assert.Equal(t, uint64(1), snap.Version)
 }
+
+func TestSnapshotStore_PartialPayloadRecovery(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewSnapshotStore(dir, 0)
+	require.NoError(t, err)
+	require.NoError(t, store.Save("good-key", 3, `{"ok":true}`))
+	require.NoError(t, store.Close())
+
+	path := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots.dat", 0))
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)
+	require.NoError(t, err)
+
+	key := []byte("partial-key")
+	require.NoError(t, binary.Write(f, binary.BigEndian, uint16(len(key))))
+	_, err = f.Write(key)
+	require.NoError(t, err)
+	require.NoError(t, binary.Write(f, binary.BigEndian, uint64(4)))
+	require.NoError(t, binary.Write(f, binary.BigEndian, uint32(100)))
+	_, err = f.Write([]byte("short"))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// Reopening must discard the incomplete record instead of indexing it or
+	// leaving a write offset past EOF.
+	store, err = NewSnapshotStore(dir, 0)
+	require.NoError(t, err)
+	snap, err := store.Read("good-key")
+	require.NoError(t, err)
+	require.NotNil(t, snap)
+	assert.Equal(t, `{"ok":true}`, snap.Payload)
+
+	snap, err = store.Read("partial-key")
+	require.NoError(t, err)
+	assert.Nil(t, snap)
+
+	require.NoError(t, store.Save("new-key", 1, `{"recovered":true}`))
+	require.NoError(t, store.Close())
+
+	store, err = NewSnapshotStore(dir, 0)
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	snap, err = store.Read("good-key")
+	require.NoError(t, err)
+	require.NotNil(t, snap)
+	assert.Equal(t, uint64(3), snap.Version)
+
+	snap, err = store.Read("new-key")
+	require.NoError(t, err)
+	require.NotNil(t, snap)
+	assert.Equal(t, uint64(1), snap.Version)
+	assert.Equal(t, `{"recovered":true}`, snap.Payload)
+}
