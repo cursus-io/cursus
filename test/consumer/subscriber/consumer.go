@@ -23,8 +23,9 @@ type Consumer struct {
 	client             *client.ConsumerClient
 	partitionConsumers map[int]*PartitionConsumer
 
-	generation int64
-	memberID   string
+	generation      int64
+	memberID        string
+	coordinatorAddr string
 
 	commitConn     net.Conn
 	commitCh       chan commitEntry
@@ -111,6 +112,122 @@ func (c *Consumer) getLeaderConn() (net.Conn, error) {
 	return conn, nil
 }
 
+func (c *Consumer) findCoordinator() (string, error) {
+	conn, err := c.getLeaderConn()
+	if err != nil {
+		return "", fmt.Errorf("connect for find_coordinator: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	cmd := fmt.Sprintf("FIND_COORDINATOR group=%s", c.config.GroupID)
+	if err := util.WriteWithLength(conn, util.EncodeMessage("", cmd)); err != nil {
+		return "", fmt.Errorf("send find_coordinator: %w", err)
+	}
+
+	resp, err := util.ReadWithLength(conn)
+	_ = conn.SetDeadline(time.Time{})
+	if err != nil {
+		return "", fmt.Errorf("read find_coordinator: %w", err)
+	}
+
+	respStr := strings.TrimSpace(string(resp))
+	if !strings.HasPrefix(respStr, "OK") {
+		return "", fmt.Errorf("find_coordinator failed: %s", respStr)
+	}
+
+	var host, port string
+	for _, part := range strings.Fields(respStr) {
+		if strings.HasPrefix(part, "host=") {
+			host = strings.TrimPrefix(part, "host=")
+		} else if strings.HasPrefix(part, "port=") {
+			port = strings.TrimPrefix(part, "port=")
+		}
+	}
+	if host == "" || port == "" {
+		return "", fmt.Errorf("find_coordinator: missing host/port in response: %s", respStr)
+	}
+	return c.coordinatorAddrFromHostPort(host, port), nil
+}
+
+func (c *Consumer) getCoordinatorConn() (net.Conn, error) {
+	c.mu.RLock()
+	addr := c.coordinatorAddr
+	c.mu.RUnlock()
+
+	if addr != "" {
+		conn, err := c.client.Connect(addr)
+		if err == nil {
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+			return conn, nil
+		}
+		util.Warn("Coordinator %s unreachable: %v, rediscovering", addr, err)
+	}
+
+	newAddr, err := c.findCoordinator()
+	if err != nil {
+		return c.getLeaderConn()
+	}
+	c.mu.Lock()
+	c.coordinatorAddr = newAddr
+	c.mu.Unlock()
+
+	conn, err := c.client.Connect(newAddr)
+	if err != nil {
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	return conn, nil
+}
+
+func (c *Consumer) coordinatorAddrFromHostPort(host, port string) string {
+	if isLoopbackCoordinatorHost(host) && len(c.config.BrokerAddrs) > 0 {
+		if bootstrapHost, _, err := net.SplitHostPort(c.config.BrokerAddrs[0]); err == nil && !isLoopbackCoordinatorHost(bootstrapHost) {
+			host = bootstrapHost
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func isLoopbackCoordinatorHost(host string) bool {
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case "localhost", "127.0.0.1", "::1", "[::1]":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Consumer) handleNotCoordinator(respStr string) bool {
+	if !strings.Contains(respStr, "NOT_COORDINATOR") {
+		return false
+	}
+	var host, port string
+	for _, part := range strings.Fields(respStr) {
+		if strings.HasPrefix(part, "host=") {
+			host = strings.TrimPrefix(part, "host=")
+		} else if strings.HasPrefix(part, "port=") {
+			port = strings.TrimPrefix(part, "port=")
+		}
+	}
+	if host != "" && port != "" {
+		newAddr := c.coordinatorAddrFromHostPort(host, port)
+		c.mu.Lock()
+		c.coordinatorAddr = newAddr
+		c.mu.Unlock()
+		util.Info("Coordinator moved to %s", newAddr)
+	}
+	return true
+}
+
+func (c *Consumer) closeCommitConn(conn net.Conn) {
+	c.commitMu.Lock()
+	if c.commitConn == conn {
+		_ = conn.Close()
+		c.commitConn = nil
+	}
+	c.commitMu.Unlock()
+}
 func (c *Consumer) validateCommitConn() bool {
 	if c.commitConn == nil {
 		return false
@@ -139,6 +256,11 @@ func (c *Consumer) validateCommitConn() bool {
 }
 
 func (c *Consumer) Start() error {
+	if coordAddr, err := c.findCoordinator(); err == nil {
+		c.coordinatorAddr = coordAddr
+		util.Info("Coordinator for group '%s': %s", c.config.GroupID, coordAddr)
+	}
+
 	gen, mid, assignments, err := c.joinGroupWithRetry()
 	if err != nil {
 		return fmt.Errorf("join group failed: %w", err)
@@ -158,7 +280,7 @@ func (c *Consumer) Start() error {
 
 	c.partitionConsumers = make(map[int]*PartitionConsumer)
 	for _, pid := range assignments {
-		offset, err := c.fetchOffset(pid)
+		offset, err := c.fetchOffsetWithRetry(pid)
 		if err != nil {
 			util.Warn("Failed to fetch offset for P%d: %v", pid, err)
 			offset = 0
@@ -411,7 +533,7 @@ func (c *Consumer) heartbeatLoop() {
 			c.hbMu.Unlock()
 
 			if conn == nil {
-				newConn, err := c.getLeaderConn()
+				newConn, err := c.getCoordinatorConn()
 				if err != nil {
 					util.Error("heartbeat could not get connection: %v", err)
 					continue
@@ -441,6 +563,10 @@ func (c *Consumer) heartbeatLoop() {
 			}
 
 			respStr := string(resp)
+			if c.handleNotCoordinator(respStr) {
+				c.cleanupHbConn(conn)
+				continue
+			}
 			if strings.Contains(respStr, "REBALANCE_REQUIRED") || strings.Contains(respStr, "GEN_MISMATCH") {
 				util.Warn("heartbeat indicated rebalance/mismatch: %s", respStr)
 				select {
@@ -532,7 +658,7 @@ func (c *Consumer) handleRebalanceSignal() {
 	c.memberID = mid
 
 	for _, pid := range assignments {
-		offset, err := c.fetchOffset(pid)
+		offset, err := c.fetchOffsetWithRetry(pid)
 		if err != nil {
 			util.Warn("⚠️ Partition %d offset fetch failed, starting from 0: %v", pid, err)
 			offset = 0
@@ -656,7 +782,7 @@ func (c *Consumer) joinGroupWithRetry() (int64, string, []int, error) {
 }
 
 func (c *Consumer) joinGroup() (generation int64, memberID string, assignments []int, err error) {
-	conn, err := c.getLeaderConn()
+	conn, err := c.getCoordinatorConn()
 	if err != nil {
 		return 0, "", nil, err
 	}
@@ -678,6 +804,9 @@ func (c *Consumer) joinGroup() (generation int64, memberID string, assignments [
 	}
 
 	respStr := strings.TrimSpace(string(resp))
+	if c.handleNotCoordinator(respStr) {
+		return 0, "", nil, fmt.Errorf("coordinator moved, retry")
+	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return 0, "", nil, fmt.Errorf("join group rejected: %s", respStr)
 	}
@@ -729,7 +858,7 @@ func (c *Consumer) joinGroup() (generation int64, memberID string, assignments [
 }
 
 func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
-	conn, err := c.getLeaderConn()
+	conn, err := c.getCoordinatorConn()
 	if err != nil {
 		return nil, err
 	}
@@ -746,6 +875,9 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
+	if c.handleNotCoordinator(respStr) {
+		return nil, fmt.Errorf("coordinator moved, retry")
+	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return nil, fmt.Errorf("sync group rejected: %s", respStr)
 	}
@@ -773,12 +905,32 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	return assigned, nil
 }
 
+func (c *Consumer) fetchOffsetWithRetry(partition int) (uint64, error) {
+	var lastErr error
+	for attempt := 1; attempt <= 5; attempt++ {
+		offset, err := c.fetchOffset(partition)
+		if err == nil {
+			return offset, nil
+		}
+		lastErr = err
+		if !strings.Contains(err.Error(), "group_not_found") && !strings.Contains(err.Error(), "member_not_found") {
+			return 0, err
+		}
+		select {
+		case <-c.mainCtx.Done():
+			return 0, c.mainCtx.Err()
+		case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+		}
+	}
+	return 0, lastErr
+}
+
 func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 	if err := c.mainCtx.Err(); err != nil {
 		return 0, err
 	}
 
-	conn, err := c.getLeaderConn()
+	conn, err := c.getCoordinatorConn()
 	if err != nil {
 		return 0, err
 	}
@@ -795,16 +947,31 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 		return 0, fmt.Errorf("fetch offset response failed: %v", err)
 	}
 
-	respStr := string(resp)
-	if strings.HasPrefix(respStr, "ERROR") {
+	respStr := strings.TrimSpace(string(resp))
+	if c.handleNotCoordinator(respStr) {
+		return 0, fmt.Errorf("coordinator moved, retry")
+	}
+	if strings.HasPrefix(respStr, "ERROR:") {
 		return 0, fmt.Errorf("fetch offset error: %s", respStr)
 	}
 
-	offset, err := strconv.ParseUint(strings.TrimSpace(respStr), 10, 64)
+	if strings.HasPrefix(respStr, "OK") {
+		for _, part := range strings.Fields(respStr) {
+			if strings.HasPrefix(part, "offset=") {
+				offset, err := strconv.ParseUint(strings.TrimPrefix(part, "offset="), 10, 64)
+				if err != nil {
+					return 0, fmt.Errorf("invalid offset response: %s", respStr)
+				}
+				return offset, nil
+			}
+		}
+		return 0, fmt.Errorf("missing offset in response: %s", respStr)
+	}
+
+	offset, err := strconv.ParseUint(respStr, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid offset response: %s", respStr)
 	}
-
 	return offset, nil
 }
 
@@ -837,7 +1004,7 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 	c.commitMu.Unlock()
 
 	if needsNewConn {
-		newConn, err := c.getLeaderConn()
+		newConn, err := c.getCoordinatorConn()
 		if err != nil {
 			util.Error("Batch commit failed to get connection: %v", err)
 			return false
@@ -888,6 +1055,12 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 		return true
 	}
 
+	if c.handleNotCoordinator(respStr) {
+		c.closeCommitConn(conn)
+		util.Warn("Batch commit coordinator moved: %s", respStr)
+		return false
+	}
+
 	if strings.Contains(respStr, "ERROR") || strings.Contains(respStr, "STALE_METADATA") {
 		util.Error("Batch commit rejected: %s", respStr)
 
@@ -908,7 +1081,7 @@ func (c *Consumer) directCommit(partition int, offset uint64) error {
 	memberID := c.memberID
 	c.mu.RUnlock()
 
-	conn, err := c.getLeaderConn()
+	conn, err := c.getCoordinatorConn()
 	if err != nil {
 		return err
 	}
@@ -928,6 +1101,9 @@ func (c *Consumer) directCommit(partition int, offset uint64) error {
 
 	respStr := string(resp)
 	if strings.Contains(respStr, "ERROR") {
+		if c.handleNotCoordinator(respStr) {
+			return fmt.Errorf("coordinator moved: %s", respStr)
+		}
 		if strings.Contains(respStr, "GEN_MISMATCH") {
 			go c.handleRebalanceSignal()
 		}
@@ -954,9 +1130,13 @@ func (c *Consumer) Close() error {
 	close(c.commitCh)
 	c.resetHeartbeatConn()
 
-	if c.memberID != "" {
-		if conn, err := c.getLeaderConn(); err == nil {
-			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s", c.config.Topic, c.config.GroupID, c.memberID)
+	c.mu.RLock()
+	memberID, generation := c.memberID, c.generation
+	c.mu.RUnlock()
+	if memberID != "" {
+		if conn, err := c.getCoordinatorConn(); err == nil {
+			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
+				c.config.Topic, c.config.GroupID, memberID, generation)
 			_ = util.WriteWithLength(conn, util.EncodeMessage("", leaveCmd))
 			_ = conn.Close()
 		}

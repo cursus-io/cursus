@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: docker.io/downfa11/cursus
+  repository: ghcr.io/cursus-io/cursus
   tag: "0.1.0"
   pullPolicy: IfNotPresent
 

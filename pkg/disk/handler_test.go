@@ -196,12 +196,18 @@ func TestDiskHandlerRotation(t *testing.T) {
 		}
 	}
 
-	time.Sleep(200 * time.Millisecond)
-
 	pattern := filepath.Join(cfg.LogDir, topic, "partition_0_segment_*.log")
-	files, err := filepath.Glob(pattern)
-	if err != nil {
-		t.Fatalf("glob %s: %v", pattern, err)
+	deadline := time.Now().Add(2 * time.Second)
+	var files []string
+	for {
+		files, err = filepath.Glob(pattern)
+		if err != nil {
+			t.Fatalf("glob %s: %v", pattern, err)
+		}
+		if len(files) >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if len(files) < 2 {
 		t.Errorf("Expected multiple segment files, got %d", len(files))
@@ -328,6 +334,9 @@ func TestReadSession_Close(t *testing.T) {
 	}
 	if err := session.Close(); err != nil {
 		t.Fatalf("ReadSession.Close failed: %v", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("second ReadSession.Close failed: %v", err)
 	}
 	if dh.GetActiveReaders() != 0 {
 		t.Errorf("Expected 0 active readers after close, got %d", dh.GetActiveReaders())

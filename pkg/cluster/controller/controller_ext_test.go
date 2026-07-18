@@ -6,9 +6,11 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 type MockServiceDiscovery struct {
@@ -90,10 +92,36 @@ func TestClusterController_Basic(t *testing.T) {
 	})
 }
 
+func TestReplicateToFollowersRejectsStalePartitionLeader(t *testing.T) {
+	brokerFSM := fsm.NewBrokerFSM(nil, nil)
+	metadata := `{"leader":"node2","leader_epoch":7,"replicas":["node1","node2"],"isr":["node1","node2"]}`
+	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + metadata)}))
+	rm := &MockRaftManager{mockFSM: brokerFSM}
+	cc := NewClusterController(context.Background(), config.DefaultConfig(), rm, nil, "node1", "localhost:9001")
+
+	err := cc.ReplicateToFollowers("orders", 0, types.MessageCommand{
+		Topic: "orders", Partition: 0, Messages: []types.Message{{Offset: 1, Payload: "stale"}},
+	}, 1)
+	require.ErrorContains(t, err, "leader fenced")
+}
+
+func TestReplicateToFollowersRequiresConfiguredMinimumISR(t *testing.T) {
+	brokerFSM := fsm.NewBrokerFSM(nil, nil)
+	metadata := `{"leader":"node1","leader_epoch":7,"replicas":["node1","node2"],"isr":["node1"]}`
+	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + metadata)}))
+	rm := &MockRaftManager{mockFSM: brokerFSM}
+	cc := NewClusterController(context.Background(), config.DefaultConfig(), rm, nil, "node1", "localhost:9001")
+
+	err := cc.ReplicateToFollowers("orders", 0, types.MessageCommand{
+		Topic: "orders", Partition: 0, Messages: []types.Message{{Offset: 1, Payload: "write"}},
+	}, 2)
+	require.ErrorContains(t, err, "insufficient in-sync replicas")
+}
+
 func TestClusterRouter_Forwarding(t *testing.T) {
 	rm := &MockRaftManager{isLeader: false}
 	lp := &MockLocalProcessor{}
-	router := NewClusterRouter("node1", "localhost:9001", lp, rm, 9000, "")
+	router := NewClusterRouter("node1", "localhost:9001", lp, rm, 9000, "", nil)
 
 	t.Run("ForwardToLeader - Leader is self (error case)", func(t *testing.T) {
 		rm.isLeader = false

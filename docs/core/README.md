@@ -1,147 +1,81 @@
 # Core Systems
 
-This document provides a detailed technical overview of the three major subsystems that comprise cursus's core functionality:
-- the Server System, Topic Management System, and Disk Persistence System.
+Cursus separates client handling, partition data, coordinator metadata, storage, and cluster ownership while preserving one wire contract in standalone and distributed modes.
 
-Each system operates semi-independently while integrating through well-defined interfaces to provide a complete message broker implementation
+## Component Map
 
-For details about message flow through these systems, see [Message Flow](./message-flow.md). For information about getting started with cursus, see [Getting Started](../user-guide/README.md).
+| Area | Primary packages | Authority |
+|---|---|---|
+| Server and protocol | `pkg/server`, `pkg/controller`, `pkg/protocol` | Framing, authentication, command dispatch, structured responses, redirects. |
+| Topics and partitions | `pkg/topic` | Partition selection, producer fencing, HWM/LSO, transaction visibility, in-process fan-out. |
+| Consumer groups | `pkg/coordinator` | Membership, generation, assignment, ownership fencing, durable monotonic offsets. |
+| Transactions | `pkg/transaction`, controller transaction handlers | Transactional-id sessions, producer epochs, staging, prepared/final decisions, recovery. |
+| Storage | `pkg/disk` | Segment/index files, buffering, sync, mmap reads, retention, active-tail repair. |
+| Cluster | `pkg/cluster` | Raft metadata, broker registry, coordinator/leader routing, replication and internal transport. |
+| Event sourcing | `pkg/eventsource`, controller/topic integration | Aggregate version checks, stream indexes, snapshots, committed replay. |
+| SDK | `sdk` | Go producer/consumer, redirects, offsets, read isolation, transactions, auth, event store. |
 
-## System Architecture Overview
+## Data And Control Paths
 
-The cursus architecture consists of three primary systems that work together to provide message broker functionality:
+Normal records are owned by a partition leader. Consumer membership/offsets are owned by the selected group coordinator. Transaction lifecycle state is owned by the selected transaction coordinator. Distributed metadata mutations are replicated through the Raft FSM; standalone transaction state is appended to the broker transaction journal before acknowledgement.
 
-| System                   | Primary Component                                      | Responsibility                                       |
-|--------------------------|---------------------------------------------------------|------------------------------------------------------|
-| Server System            | `pkg/server/main.go`                                      | TCP connection handling, worker pool management, command routing |
-| Topic Management System  | `pkg/topic/manager.go`, `pkg/topic/topic.go`               | Message routing, partition management, consumer group coordination |
-| Disk Persistence System  | `pkg/disk/flush_common.go`, `pkg/disk/manager.go`          | Asynchronous disk writes, segment management, message durability |
+A transaction does not collapse those owners into one in-memory object. The transaction coordinator stages intent, partition leaders append idempotent output and markers, the group coordinator applies one fenced bulk source-offset scope, and the final transaction decision gates `read_committed` visibility.
 
+## Configuration Defaults
 
-## Core System Integration
+| Area | Default |
+|---|---:|
+| Client TCP / health / metrics ports | `9000` / `9080` / `9100` |
+| Disk flush batch / linger | `50` records / `50ms` |
+| Disk sync interval | `500ms` |
+| Disk write channel | buffered, capacity `1024` |
+| Segment / sparse index size | `1GiB` / `10MiB` |
+| Sparse index interval | `4096` bytes |
+| Retention | `168h`, unlimited bytes, delete policy |
+| Partition / consumer / broadcast buffers | `10000` / `1000` / `10000` |
+| Distribution | disabled unless configured |
 
-### Key Data Structures and Their Roles
+Configuration validation normalizes invalid values. Cleanup policy accepts `delete`, `compact`, or `delete,compact`; compaction is standalone-only and is rejected for event-sourcing topics.
 
-The following table maps the primary data structures to their locations in the codebase:
+## Concurrency
 
-| Structure     | Key Fields                                         | Purpose                                               |
-|---------------|----------------------------------------------------|-------------------------------------------------------|
-| TopicManager  | topics, dedupMap, hp                               | Central registry for all topics, handles deduplication |
-| Topic         | Name, Partitions, consumerGroups, counter          | Manages partitions and consumer groups for a topic     |
-| Partition     | id, ch, subs, dh                                   | Handles message distribution for one partition         |
-| DiskManager   | handlers, cfg                                      | Registry for DiskHandler instances                     |
-| DiskHandler   | writeCh, file, writer, CurrentSegment              | Manages writes to a single topic-partition             |
-
-### Inter-System Communication Interfaces
-
-The three systems communicate through well-defined interfaces. The following table documents the key integration points:
-
-| From System     | To System            | Interface/Method                     | Purpose                           |
-|-----------------|--------------------|-------------------------------------|-----------------------------------|
-| Server          | Topic Management    | `TopicManager.Publish()`              | Submit message for routing        |
-| Server          | Topic Management    | `TopicManager.RegisterConsumerGroup()`| Register consumer group            |
-| Server          | Disk Persistence    | `DiskHandler.ReadMessages()`          | Read messages from disk           |
-| Topic Management| Disk Persistence    | `HandlerProvider.GetHandler()`        | Obtain DiskHandler instance       |
-| Partition       | DiskHandler         | `DiskAppender.AppendMessage()`        | Write message to disk             |
-
-
-## Configuration Integration
-
-All three systems are configured through the central config.Config structure. The following table shows which configuration parameters affect each system:
-
-| System             | Configuration Parameters                             | Purpose                                      |
-|-------------------|-------------------------------------------------------|----------------------------------------------|
-| Server System      | BrokerPort (default: 9000)                            | TCP listener port                             |
-| Server System      | HealthCheckPort (default: 9080)                       | Health check HTTP endpoint                    |
-| Server System      | ExporterPort (default: 9100)                          | Prometheus metrics endpoint                   |
-| Server System      | UseTLS, TLSCert                                       | TLS encryption configuration                  |
-| Server System      | EnableGzip                                            | Message compression                           |
-| Topic Management   | CleanupInterval (default: 60s)                        | Deduplication map cleanup frequency           |
-| Topic Management   | N/A                                                   | Partition buffer size is hardcoded to 10000  |
-| Topic Management   | N/A                                                   | Consumer channel buffer is hardcoded to 1000 |
-| Disk Persistence   | LogDir                                                | Directory for segment files                   |
-| Disk Persistence   | BatchSize                                             | Messages per batch before flush               |
-| Disk Persistence   | Linger                                                | Max time to wait before flushing partial batch|
-| Disk Persistence   | SegmentSize                                           | Max segment file size (default: 1MB)         |
-
-
-## Concurrency and Thread Safety
-
-Each system employs different concurrency patterns:
-
-### Server System Concurrency
-
-- **Worker Pool Pattern**: 1000 goroutines pre-spawned to handle connections
-- **Channel-based Distribution**: `workerCh := make(chan net.Conn, maxWorkers)` distributes connections to workers
-- **Per-Connection Goroutine**: Each `HandleConnection()` call runs in its own goroutine
-
-### Topic Management Concurrency
-
-- **TopicManager.mu**: `sync.RWMutex` protects the topics map during create/delete operations
-- **Topic.mu**: `sync.RWMutex` protects partition counter and consumer groups
-- **Partition.mu**: `sync.RWMutex` protects subscriber map and closed flag
-- **dedupMap**: `sync.Map` for lock-free concurrent deduplication checks
-- **Per-Partition Goroutine**: Each partition runs a goroutine executing `run()` to distribute messages
-
-### Disk Persistence Concurrency
-
-- **DiskHandler.mu**: `sync.Mutex` protects metadata (segment numbers, offsets)
-- **DiskHandler.ioMu**: `sync.Mutex` serializes file I/O operations
-- **Asynchronous Write Path**: Each DiskHandler runs `flushLoop()` in a dedicated goroutine
-- **Channel-based Writes**: writeCh (unbuffered) passes messages from `AppendMessage()` to `flushLoop()`
-- **Dual Lock Strategy***: Separate locks prevent deadlock between metadata updates and I/O operations
-
-# System Lifecycle Management
+- `TopicManager` and `Topic` use read/write locks for registries and partition metadata.
+- Each partition has its own channels, storage handler, producer state, and transaction visibility index.
+- `DiskHandler.writeCh` is buffered; `flushLoop`, `syncLoop`, and the retention loop are independent goroutines.
+- Disk metadata, file I/O, and index lifecycle use separate locks with a documented acquisition order.
+- Group and transaction managers serialize authoritative state. Transactions recover from the standalone journal or distributed replicated revisions/snapshots.
+- Cluster forwarding must cross the broker-internal authentication/mTLS boundary; internal commands are not client APIs.
 
 ## Startup
 
-- DiskManager initialized first (creates handler registry)
-- TopicManager initialized with DiskManager as HandlerProvider
-- `TopicManager.cleanupLoop()` goroutine started for deduplication cleanup
-- `RunServer()` starts TCP listener and worker pool
+1. load and normalize configuration,
+2. initialize storage and topic managers,
+3. restore coordinator/Raft snapshots and durable offsets,
+4. recover partition tails, HWM, producer, stream, and transaction indexes,
+5. retry durable `committing` transactions,
+6. start client, internal, health, and metrics listeners,
+7. report readiness only after required cluster/storage authority is available.
 
 ## Shutdown
 
-- `TopicManager.Stop()` closes stopCh, stopping cleanup loop
-- Each `DiskHandler.Close()` closes done channel, triggering drain logic in `flushLoop()`
-- `flushLoop()` drains writeCh, flushes remaining batches, syncs and closes files
+The broker stops accepting work, closes client/stream activity, drains partition/storage channels, flushes and syncs active files, persists checkpoints, stops coordinator loops, and closes cluster resources. Shutdown is best-effort under process kill; restart recovery is the correctness path for abrupt failure.
 
-# Performance Characteristics
+## Guarantees
 
-Each system has different performance characteristics based on its design:
+- per-partition ordering, not global ordering,
+- durable group `nextOffset` and generation/owner fencing,
+- at-least-once consumer processing when commit follows processing,
+- idempotent producer retries within the producer epoch/sequence contract,
+- transaction output visibility gated by partition markers and the durable current-epoch coordinator decision,
+- event-stream optimistic concurrency per aggregate partition,
+- retained committed reads bounded by recovered HWM/LSO.
 
-| System             | Throughput Bottleneck                                     | Latency Characteristics                                    |
-|-------------------|------------------------------------------------------------|------------------------------------------------------------|
-| Server             | Worker pool size (1000) and connection accept rate       | Bounded by TCP round-trip time                             |
-| Topic Management   | Partition channel buffer (10000) and distribution logic | O(1) partition selection, O(n) fan-out to subscribers     |
-| Disk Persistence   | Disk I/O bandwidth and fsync latency                     | Batching amortizes fsync cost across up to 500 messages   |
+External side effects are never part of a broker transaction. Time/size retention can remove replay history, so applications must monitor offset gaps and choose reset/rebuild policy explicitly.
 
+## Detailed Documents
 
-# Error Handling and Resilience
-
-Each system has specific error handling strategies:
-
-## Server System
-
-- **Connection Errors**: Logged and connection closed, does not crash broker
-- **Read Deadline**: 5-minute timeout on idle connections
-- **Write Errors**: Logged, connection closed, client must reconnect
-
-## Topic Management
-
-- **Missing Topic**: `GetTopic()` returns nil, caller checks before use
-- **Duplicate Messages**: Silently dropped via `dedupMap.LoadOrStore()`
-- **Closed Partition**: `Enqueue()` checks closed flag before enqueuing
-
-## Disk Persistence
-
-- **Write Errors**: Logged with `log.Printf("ERROR: ...")`, batch operation continues
-- **Segment Rotation Errors**: Accumulated in error slice, returned to caller
-- **Shutdown Drain**: Best-effort flush of pending messages before close
-
-
-For detailed information about each individual system, see:
-
-[Server System](server.md) - TCP server implementation details
-[Topic Management System](./topic/topic-management.md) - Topics, partitions, and consumer groups
-[Disk Persistence System](./storage/disk-persistence.md) - Write path, segment management, and optimizations
+- [Message Flow](message-flow.md)
+- [Server](server.md)
+- [Consumer Groups](topic/consumer-groups.md)
+- [Disk Persistence](storage/disk-persistence.md)
+- [Wire Protocol](../protocol-spec.md)

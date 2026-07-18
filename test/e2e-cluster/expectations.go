@@ -54,6 +54,31 @@ func ExpectDataConsistent() e2e.Expectation {
 	}
 }
 
+func ExpectPartitionWatermarks(partition int, expectedLEO, expectedHWM uint64) e2e.Expectation {
+	return func(ctx *e2e.TestContext) error {
+		resp, err := ctx.GetClient().SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", ctx.GetTopic()), 5*time.Second)
+		if err != nil {
+			return err
+		}
+
+		var meta topicMetadata
+		if err := json.Unmarshal([]byte(resp), &meta); err != nil {
+			return fmt.Errorf("failed to parse metadata: %w", err)
+		}
+		for _, p := range meta.Partitions {
+			if p.ID != partition {
+				continue
+			}
+			if p.LEO != expectedLEO || p.HWM != expectedHWM {
+				return fmt.Errorf("partition %d watermark mismatch: expected leo=%d hwm=%d, got leo=%d hwm=%d",
+					partition, expectedLEO, expectedHWM, p.LEO, p.HWM)
+			}
+			return nil
+		}
+		return fmt.Errorf("partition %d not found", partition)
+	}
+}
+
 func ExpectOffsetMatched(partition int, expected uint64) e2e.Expectation {
 	return func(ctx *e2e.TestContext) error {
 		topic := ctx.GetTopic()

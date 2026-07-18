@@ -2,9 +2,11 @@ package sdk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -96,6 +98,9 @@ func (c *Consumer) Done() <-chan struct{} {
 
 // Start joins the consumer group, begins consuming, and blocks until Close is called.
 func (c *Consumer) Start(handler func(Message) error) error {
+	if err := validateSDKTopicName(c.config.Topic); err != nil {
+		return err
+	}
 	c.MessageHandler = handler
 
 	if coordAddr, err := c.findCoordinator(); err == nil {
@@ -123,10 +128,9 @@ func (c *Consumer) Start(handler func(Message) error) error {
 	// Fetch offsets BEFORE holding the lock (fetchOffset calls getCoordinatorConn which needs mu.RLock)
 	offsetMap := make(map[int]uint64)
 	for _, pid := range assignments {
-		offset, err := c.fetchOffset(pid)
+		offset, err := c.fetchOffsetWithRetry(pid)
 		if err != nil {
-			LogWarn("Failed to fetch offset for P%d: %v, starting from 0", pid, err)
-			offset = 0
+			return fmt.Errorf("fetch offset for P%d failed: %w", pid, err)
 		}
 		offsetMap[pid] = offset
 	}
@@ -356,9 +360,14 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "BATCH_COMMIT topic=%s group=%s generation=%d member=%s ",
 		c.config.Topic, c.config.GroupID, generation, memberID)
-	parts := make([]string, 0, len(offsets))
-	for pid, off := range offsets {
-		parts = append(parts, fmt.Sprintf("%d:%d", pid, off))
+	partitions := make([]int, 0, len(offsets))
+	for pid := range offsets {
+		partitions = append(partitions, pid)
+	}
+	sort.Ints(partitions)
+	parts := make([]string, 0, len(partitions))
+	for _, pid := range partitions {
+		parts = append(parts, fmt.Sprintf("P%d:%d", pid, offsets[pid]))
 	}
 	sb.WriteString(strings.Join(parts, ","))
 
@@ -386,8 +395,14 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 	}
 
 	respStr := string(resp)
-	if strings.HasPrefix(respStr, "OK") {
+	if hasOKStatus(respStr) {
 		return true
+	}
+
+	if c.handleNotCoordinator(respStr) {
+		c.closeCommitConn(conn)
+		LogWarn("Batch commit coordinator moved: %s", respStr)
+		return false
 	}
 
 	c.handleLeaderRedirection(respStr)
@@ -403,6 +418,15 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 
 	LogError("Batch commit rejected: %s", respStr)
 	return false
+}
+
+func (c *Consumer) closeCommitConn(conn net.Conn) {
+	c.commitMu.Lock()
+	if c.commitConn == conn {
+		_ = conn.Close()
+		c.commitConn = nil
+	}
+	c.commitMu.Unlock()
 }
 
 func (c *Consumer) directCommit(partition int, offset uint64) error {
@@ -429,12 +453,19 @@ func (c *Consumer) directCommit(partition int, offset uint64) error {
 		return fmt.Errorf("direct commit response: %w", err)
 	}
 
-	respStr := string(resp)
-	if strings.Contains(respStr, "ERROR") {
-		if strings.Contains(respStr, "GEN_MISMATCH") {
+	respStr := strings.TrimSpace(string(resp))
+	if brokerErr, ok := ParseBrokerError(respStr); ok {
+		if c.handleNotCoordinator(respStr) {
+			return brokerErr
+		}
+		switch strings.ToUpper(brokerErr.Code) {
+		case "GEN_MISMATCH", "NOT_OWNER", "REBALANCE_REQUIRED", "MEMBER_NOT_FOUND":
 			go c.handleRebalanceSignal()
 		}
-		return fmt.Errorf("direct commit error: %s", respStr)
+		return brokerErr
+	}
+	if !hasOKStatus(respStr) {
+		return fmt.Errorf("unexpected direct commit response: %s", respStr)
 	}
 	return nil
 }
@@ -474,7 +505,7 @@ func (c *Consumer) fetchMetadata() error {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if !strings.HasPrefix(respStr, "OK") {
+	if !hasOKStatus(respStr) {
 		return fmt.Errorf("metadata failed: %s", respStr)
 	}
 
@@ -568,12 +599,19 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 
+	c.mu.RLock()
 	mID := c.memberID
+	generation := c.generation
+	c.mu.RUnlock()
+	resuming := mID != "" && generation > 0
 	if mID == "" {
 		mID = c.config.ConsumerID
 	}
 
 	joinCmd := fmt.Sprintf("JOIN_GROUP topic=%s group=%s member=%s", c.config.Topic, c.config.GroupID, mID)
+	if resuming {
+		joinCmd += fmt.Sprintf(" generation=%d", generation)
+	}
 	if err := WriteWithLength(conn, EncodeMessage("", joinCmd)); err != nil {
 		return 0, "", nil, fmt.Errorf("send join: %w", err)
 	}
@@ -588,13 +626,32 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 	if c.handleNotCoordinator(respStr) {
 		return 0, "", nil, fmt.Errorf("coordinator moved, retry")
 	}
-	if !strings.HasPrefix(respStr, "OK") {
+	if !hasOKStatus(respStr) {
+		brokerErr, hasBrokerErr := ParseBrokerError(respStr)
+		if resuming && hasBrokerErr && strings.EqualFold(brokerErr.Code, "GEN_MISMATCH") {
+			currentText := brokerErr.Fields["current"]
+			current, parseErr := strconv.ParseInt(currentText, 10, 64)
+			if parseErr == nil {
+				assignments, syncErr := c.syncGroup(current, mID)
+				if syncErr == nil {
+					return current, mID, assignments, nil
+				}
+			}
+		}
+		if resuming && hasBrokerErr && strings.EqualFold(brokerErr.Code, "member_not_found") {
+			c.mu.Lock()
+			if c.memberID == mID {
+				c.memberID = ""
+				c.generation = 0
+			}
+			c.mu.Unlock()
+			return c.joinGroup()
+		}
 		return 0, "", nil, fmt.Errorf("join rejected: %s", respStr)
 	}
 
 	var gen int64
 	var mid string
-	var assigned []int
 
 	for _, part := range strings.Fields(respStr) {
 		if strings.HasPrefix(part, "generation=") {
@@ -604,21 +661,7 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 		}
 	}
 
-	if strings.Contains(respStr, "assignments=") {
-		start := strings.Index(respStr, "[")
-		end := strings.Index(respStr, "]")
-		if start != -1 && end != -1 {
-			partStr := strings.ReplaceAll(respStr[start+1:end], ",", " ")
-			for _, p := range strings.Fields(partStr) {
-				pid, err := strconv.Atoi(strings.TrimSpace(p))
-				if err == nil {
-					assigned = append(assigned, pid)
-				}
-			}
-		}
-	}
-
-	return gen, mid, assigned, nil
+	return gen, mid, parseGroupAssignments(respStr), nil
 }
 
 func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
@@ -640,7 +683,7 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if !strings.HasPrefix(respStr, "OK") {
+	if !hasOKStatus(respStr) {
 		return nil, fmt.Errorf("sync rejected: %s", respStr)
 	}
 
@@ -649,18 +692,48 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	c.memberID = memberID
 	c.mu.Unlock()
 
-	var assigned []int
-	if strings.Contains(respStr, "[") && strings.Contains(respStr, "]") {
-		start := strings.Index(respStr, "[")
-		end := strings.Index(respStr, "]")
-		for _, p := range strings.Fields(respStr[start+1 : end]) {
-			var pid int
-			if _, err := fmt.Sscanf(p, "%d", &pid); err == nil {
-				assigned = append(assigned, pid)
-			}
+	return parseGroupAssignments(respStr), nil
+}
+
+func parseGroupAssignments(resp string) []int {
+	start := strings.Index(resp, "[")
+	end := strings.Index(resp, "]")
+	if start == -1 || end <= start {
+		return nil
+	}
+
+	partitionText := strings.ReplaceAll(resp[start+1:end], ",", " ")
+	assignments := make([]int, 0)
+	for _, field := range strings.Fields(partitionText) {
+		partition, err := strconv.Atoi(field)
+		if err == nil {
+			assignments = append(assignments, partition)
 		}
 	}
-	return assigned, nil
+	return assignments
+}
+
+func (c *Consumer) fetchOffsetWithRetry(partition int) (uint64, error) {
+	var lastErr error
+	for attempt := 1; attempt <= 5; attempt++ {
+		offset, err := c.fetchOffset(partition)
+		if err == nil {
+			return offset, nil
+		}
+		lastErr = err
+		if !isRetryableFetchOffsetError(err) {
+			return 0, err
+		}
+		if attempt == 5 {
+			break
+		}
+		select {
+		case <-c.mainCtx.Done():
+			return 0, c.mainCtx.Err()
+		case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+		}
+	}
+	return 0, lastErr
 }
 
 func (c *Consumer) fetchOffset(partition int) (uint64, error) {
@@ -686,12 +759,43 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 		return 0, fmt.Errorf("fetch offset response: %w", err)
 	}
 
-	respStr := string(resp)
-	if strings.HasPrefix(respStr, "ERROR") {
-		return 0, fmt.Errorf("fetch offset broker error: %s", respStr)
+	respStr := strings.TrimSpace(string(resp))
+	if brokerErr, ok := ParseBrokerError(respStr); ok {
+		_ = c.handleNotCoordinator(respStr)
+		return 0, brokerErr
 	}
+	return parseFetchOffsetResponse(respStr)
+}
 
-	offset, err := strconv.ParseUint(strings.TrimSpace(respStr), 10, 64)
+func isRetryableFetchOffsetError(err error) bool {
+	var brokerErr *BrokerError
+	if !errors.As(err, &brokerErr) {
+		return false
+	}
+	if brokerErr.Retryable {
+		return true
+	}
+	switch strings.ToLower(brokerErr.Code) {
+	case "group_not_found", "member_not_found", "not_coordinator":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseFetchOffsetResponse(respStr string) (uint64, error) {
+	if brokerErr, ok := ParseBrokerError(respStr); ok {
+		return 0, brokerErr
+	}
+	fields, err := parseOKResponse(respStr)
+	if err != nil {
+		return 0, fmt.Errorf("unexpected offset response: %s", respStr)
+	}
+	offsetValue := fields["offset"]
+	if offsetValue == "" {
+		return 0, fmt.Errorf("missing offset in response: %s", respStr)
+	}
+	offset, err := strconv.ParseUint(offsetValue, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid offset response: %s", respStr)
 	}
@@ -706,17 +810,23 @@ func (c *Consumer) Close() error {
 	}
 
 	close(c.doneCh)
-	c.wg.Wait()
+	// Cancel the active consume context and close live sockets so blocked I/O exits promptly.
 	c.mainCancel()
+	c.closeActiveConnections()
+	c.wg.Wait()
 
 	c.flushOffsets()
 	close(c.commitCh)
 	c.commitWg.Wait()
 
-	if c.memberID != "" {
+	c.mu.RLock()
+	memberID := c.memberID
+	generation := c.generation
+	c.mu.RUnlock()
+	if memberID != "" && generation > 0 {
 		if conn, err := c.getCoordinatorConn(); err == nil {
-			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s",
-				c.config.Topic, c.config.GroupID, c.memberID)
+			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
+				c.config.Topic, c.config.GroupID, memberID, generation)
 			_ = WriteWithLength(conn, EncodeMessage("", leaveCmd))
 			_ = conn.Close()
 		}
@@ -739,6 +849,28 @@ func (c *Consumer) Close() error {
 	c.mu.Unlock()
 
 	return nil
+}
+
+func (c *Consumer) closeActiveConnections() {
+	c.mu.RLock()
+	pcs := make([]*PartitionConsumer, 0, len(c.partitionConsumers))
+	for _, pc := range c.partitionConsumers {
+		pcs = append(pcs, pc)
+	}
+	c.mu.RUnlock()
+
+	for _, pc := range pcs {
+		pc.closeConnection()
+	}
+
+	c.resetHeartbeatConn()
+
+	c.commitMu.Lock()
+	if c.commitConn != nil {
+		_ = c.commitConn.Close()
+		c.commitConn = nil
+	}
+	c.commitMu.Unlock()
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -768,22 +900,19 @@ func (c *Consumer) findCoordinator() (string, error) {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if !strings.HasPrefix(respStr, "OK") {
+	if brokerErr, ok := ParseBrokerError(respStr); ok {
+		return "", brokerErr
+	}
+	fields, err := parseOKResponse(respStr)
+	if err != nil {
 		return "", fmt.Errorf("find_coordinator failed: %s", respStr)
 	}
 
-	var host, port string
-	for _, part := range strings.Fields(respStr) {
-		if strings.HasPrefix(part, "host=") {
-			host = strings.TrimPrefix(part, "host=")
-		} else if strings.HasPrefix(part, "port=") {
-			port = strings.TrimPrefix(part, "port=")
-		}
-	}
+	host, port := fields["host"], fields["port"]
 	if host == "" || port == "" {
 		return "", fmt.Errorf("find_coordinator: missing host/port in response: %s", respStr)
 	}
-	return net.JoinHostPort(host, port), nil
+	return c.coordinatorAddrFromHostPort(host, port), nil
 }
 
 func (c *Consumer) getCoordinatorConn() (net.Conn, error) {
@@ -815,20 +944,32 @@ func (c *Consumer) getCoordinatorConn() (net.Conn, error) {
 	return conn, nil
 }
 
-func (c *Consumer) handleNotCoordinator(respStr string) bool {
-	if !strings.Contains(respStr, "NOT_COORDINATOR") {
-		return false
-	}
-	var host, port string
-	for _, part := range strings.Fields(respStr) {
-		if strings.HasPrefix(part, "host=") {
-			host = strings.TrimPrefix(part, "host=")
-		} else if strings.HasPrefix(part, "port=") {
-			port = strings.TrimPrefix(part, "port=")
+func (c *Consumer) coordinatorAddrFromHostPort(host, port string) string {
+	if isLoopbackCoordinatorHost(host) && len(c.config.BrokerAddrs) > 0 {
+		if bootstrapHost, _, err := net.SplitHostPort(c.config.BrokerAddrs[0]); err == nil && !isLoopbackCoordinatorHost(bootstrapHost) {
+			host = bootstrapHost
 		}
 	}
+	return net.JoinHostPort(host, port)
+}
+
+func isLoopbackCoordinatorHost(host string) bool {
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case "localhost", "127.0.0.1", "::1", "[::1]":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Consumer) handleNotCoordinator(respStr string) bool {
+	brokerErr, ok := ParseBrokerError(strings.TrimSpace(respStr))
+	if !ok || !strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
+		return false
+	}
+	host, port := brokerErr.Fields["host"], brokerErr.Fields["port"]
 	if host != "" && port != "" {
-		newAddr := net.JoinHostPort(host, port)
+		newAddr := c.coordinatorAddrFromHostPort(host, port)
 		c.mu.Lock()
 		c.coordinatorAddr = newAddr
 		c.mu.Unlock()

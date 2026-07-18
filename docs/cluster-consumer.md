@@ -4,7 +4,7 @@ Consumer가 클러스터 환경에서 메시지를 소비하기 위한 FindCoord
 
 ## Overview
 
-Kafka와 동일한 패턴으로, Consumer Group 관련 커맨드는 Coordinator 브로커로, 데이터 커맨드는 파티션 리더로 라우팅합니다.
+Consumer group commands are routed to the group coordinator, while `CONSUME` and `STREAM` are routed to the partition leader. The broker-owned committed `nextOffset` remains authoritative across both routes.
 
 ## Command Routing
 
@@ -76,14 +76,17 @@ sequenceDiagram
     C->>CO: JOIN_GROUP topic=T group=G member=M
     CO-->>C: OK generation=1 member=M-1234 assignments=[0,1]
 
+    C->>CO: SYNC_GROUP topic=T group=G member=M-1234 generation=1
+    CO-->>C: OK generation=1 member=M-1234 assignments=[0,1]
+
     C->>CO: FETCH_OFFSET topic=T partition=0 group=G
-    CO-->>C: 0
+    CO-->>C: OK offset=0
 
     C->>B: METADATA topic=T
     B-->>C: OK leaders=H1:P1,H2:P2
 
     loop Poll Loop
-        C->>PL: CONSUME topic=T partition=0 offset=0 member=M-1234 group=G generation=1
+        C->>PL: CONSUME topic=T partition=0 offset=<committed> member=M-1234 group=G generation=1 isolation=read_committed
         PL-->>C: batch(messages)
     end
 
@@ -92,6 +95,23 @@ sequenceDiagram
         CO-->>C: OK
     end
 ```
+
+Transient connection failures do not require a new member. The SDK first retries
+`JOIN_GROUP` with the broker-assigned member ID and generation. A successful
+resume preserves assignments and does not advance the generation. A stale
+generation is synchronized for an existing member; `member_not_found` causes a
+fresh join. When group coordinator ownership changes, the new owner waits one
+session timeout before expiring members, while clients rediscover it and resume
+heartbeats.
+
+## Resume And Isolation Rules
+
+- After every assignment or rejoin, fetch `FETCH_OFFSET` for each assigned partition before reading.
+- When a committed offset exists, the data path starts there even if the request carries a lower explicit offset.
+- If no offset exists, `autoOffsetReset=earliest` starts at the earliest retained offset, `latest` starts at the next committed tail, and `error` surfaces the gap.
+- Commit only `lastProcessedOffset + 1`. Regressions fail and do not change broker state.
+- `read_committed` is the SDK default and hides unresolved/aborted transaction records. `read_uncommitted` returns the raw committed log, including transaction control records.
+- A graceful `STREAM_CONTROL type=CLOSE` is a terminator. A socket loss without that frame is retryable and must resume through the group offset contract.
 
 ## Error Recovery
 
@@ -124,10 +144,7 @@ flowchart TD
 - `ensureConnection()` — prefers partition leader address, falls back to any broker
 - `handleBrokerError()` — parses NOT_LEADER, updates partition leader, triggers rebalance on GEN_MISMATCH
 - `handleNotCoordinator()` — re-discovers coordinator from response or via FIND_COORDINATOR
-
-### Known Issue: Cluster Consumer Blocking
-
-Go SDK의 Consumer가 클러스터에서 `FETCH_OFFSET` 응답을 기다리면서 블로킹되는 문제가 있습니다.
-Python/Java SDK는 매 커맨드마다 새 TCP 연결을 사용하여 이 문제를 회피합니다.
-Go SDK는 persistent 연결을 사용하기 때문에, 브로커가 같은 coordinator 주소의 다른 TCP 연결에서 온
-FETCH_OFFSET을 처리하지 못하는 것으로 추정됩니다.
+- `joinGroup()` — resumes the current member and generation before creating a fresh member
+- `fetchOffset()` — uses a bounded, per-request coordinator connection and parses `OK offset=<N>`
+- `ReadIsolation` — sends explicit `isolation=read_committed|read_uncommitted` on polling and streaming reads
+- offset commits — send the broker-assigned member and generation, reject regressions, and stop/rejoin on fencing errors

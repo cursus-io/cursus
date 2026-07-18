@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 
 	"github.com/google/uuid"
@@ -39,7 +42,7 @@ func (ch *CommandHandler) hasRouter() bool {
 }
 
 func (ch *CommandHandler) ProcessCommand(cmd string) string {
-	ctx := NewClientContext("default-group", 0)
+	ctx := NewInternalClientContext("default-group", 0)
 
 	// Forwarded commands arrive wrapped in a binary envelope
 	// (2-byte topic length + topic + payload). Decode it first.
@@ -70,7 +73,7 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 			break
 		}
 		if i == maxRetries-1 {
-			return "ERROR: no Raft leader elected after retries", true, fmt.Errorf("no leader elected")
+			return "ERROR: no_raft_leader", true, fmt.Errorf("no leader elected")
 		}
 		util.Debug("Waiting for Raft leader to be elected... (attempt %d/%d)", i+1, maxRetries)
 		time.Sleep(backoffDelay(i, 100*time.Millisecond))
@@ -78,7 +81,7 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 
 	if !ch.Cluster.RaftManager.IsLeader() {
 		if ch.Cluster.Router == nil {
-			return "ERROR: not the leader, and router is nil", true, nil
+			return "ERROR: router_not_available", true, nil
 		}
 
 		encodedCmd := util.EncodeMessage("", cmd)
@@ -95,7 +98,7 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 			}
 		}
 		leaderAddr := ch.Cluster.RaftManager.GetLeaderAddress()
-		return fmt.Sprintf("ERROR: failed to forward command to leader (Leader: %s, Error: %v)", leaderAddr, lastErr), true, nil
+		return fmt.Sprintf("ERROR: forward_to_leader_failed leader=%s reason=%q", leaderAddr, lastErr.Error()), true, nil
 	}
 	return "", false, nil
 }
@@ -113,13 +116,50 @@ type coordCacheEntry struct {
 
 const coordCacheTTL = 30 * time.Second
 
+// IsGroupCoordinator is the strict ownership check used by session expiration.
+// Discovery failures return false so multiple brokers cannot expire the same
+// group while the coordinator ring is unavailable.
+func (ch *CommandHandler) IsGroupCoordinator(groupName string) bool {
+	if !ch.isDistributed() {
+		return true
+	}
+	if !ch.hasRouter() {
+		return false
+	}
+	id, _, err := ch.Cluster.Router.FindCoordinator(groupName)
+	return err == nil && id == ch.Cluster.Router.BrokerID()
+}
+
+// ExpireGroupMembers serializes timeout-driven membership removal through the
+// replicated metadata log.
+func (ch *CommandHandler) ExpireGroupMembers(groupName string, generation int, memberIDs []string) error {
+	if !ch.isDistributed() {
+		return ch.Coordinator.ExpireConsumers(groupName, generation, memberIDs)
+	}
+	_, err := ch.applyViaLeader("GROUP_SYNC", map[string]interface{}{
+		"type":       "EXPIRE",
+		"group":      groupName,
+		"generation": generation,
+		"members":    memberIDs,
+	})
+	return err
+}
+
 // checkCoordinator checks if this broker is the coordinator for the given group.
 // Returns (addr, false) if another broker is coordinator, or (_, true) if we are.
 func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bool) {
+	return ch.checkCoordinatorKey(groupName, fmt.Sprintf("FIND_COORDINATOR group=%s", groupName))
+}
+
+func (ch *CommandHandler) checkTransactionCoordinator(txnID string) (AdvertisedAddr, bool) {
+	return ch.checkCoordinatorKey(transactionCoordinatorKey(txnID), fmt.Sprintf("FIND_COORDINATOR transactional_id=%s", txnID))
+}
+
+func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (AdvertisedAddr, bool) {
 	if !ch.hasRouter() {
 		return AdvertisedAddr{}, true
 	}
-	id, _, err := ch.Cluster.Router.FindCoordinator(groupName)
+	id, raftAddr, err := ch.Cluster.Router.FindCoordinator(coordKey)
 	if err != nil {
 		return AdvertisedAddr{}, true
 	}
@@ -127,7 +167,6 @@ func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bo
 		return AdvertisedAddr{}, true
 	}
 
-	// Check cache
 	ch.coordCacheMu.RLock()
 	if cached, ok := ch.coordCache[id]; ok && time.Since(cached.updated) < coordCacheTTL {
 		ch.coordCacheMu.RUnlock()
@@ -135,10 +174,22 @@ func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bo
 	}
 	ch.coordCacheMu.RUnlock()
 
-	// Get coordinator's advertised address by forwarding FIND_COORDINATOR to it
-	findCmd := fmt.Sprintf("FIND_COORDINATOR group=%s", groupName)
+	if fsm := ch.Cluster.RaftManager.GetFSM(); fsm != nil {
+		if broker := fsm.GetBroker(id); broker != nil && broker.ClientAddr != "" {
+			if host, portStr, splitErr := net.SplitHostPort(broker.ClientAddr); splitErr == nil {
+				if port, scanErr := strconv.Atoi(portStr); scanErr == nil && host != "" && port > 0 {
+					addr := AdvertisedAddr{Host: host, Port: port}
+					ch.coordCacheMu.Lock()
+					ch.coordCache[id] = coordCacheEntry{addr: addr, updated: time.Now()}
+					ch.coordCacheMu.Unlock()
+					return addr, false
+				}
+			}
+		}
+	}
+
 	encodedCmd := util.EncodeMessage("", findCmd)
-	resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(groupName, string(encodedCmd))
+	resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, string(encodedCmd))
 	if fwdErr == nil && strings.HasPrefix(resp, "OK") {
 		host, port := "", 0
 		for _, part := range strings.Fields(resp) {
@@ -157,8 +208,10 @@ func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bo
 		}
 	}
 
-	// Fallback
 	host := ch.Config.AdvertisedClientHost
+	if host == "" {
+		host, _, _ = net.SplitHostPort(raftAddr)
+	}
 	if host == "" {
 		host = "localhost"
 	}
@@ -187,7 +240,10 @@ func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition in
 	for i := 0; i < maxRetries; i++ {
 		resp, err := ch.Cluster.Router.ForwardToPartitionLeader(topic, partition, string(encodedCmd))
 		if err == nil {
-			if !strings.HasPrefix(resp, "ERROR: not the partition leader") {
+			const legacyNotLeaderPrefix = "ERROR:" + " not the partition leader"
+			isLeaderRedirect := strings.HasPrefix(resp, "ERROR: NOT_LEADER") ||
+				strings.HasPrefix(resp, legacyNotLeaderPrefix)
+			if !isLeaderRedirect {
 				return resp, true, nil
 			}
 			lastErr = fmt.Errorf("%s", resp)
@@ -197,7 +253,7 @@ func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition in
 		time.Sleep(backoffDelay(i, 100*time.Millisecond))
 	}
 
-	return fmt.Sprintf("ERROR: failed to forward command to partition leader for %s:%d: %v", topic, partition, lastErr), true, nil
+	return fmt.Sprintf("ERROR: forward_to_partition_leader_failed topic=%s partition=%d reason=%q", topic, partition, lastErr.Error()), true, nil
 }
 
 // resolvePartitionLeaderAddr returns the client-facing address of the partition leader.
@@ -252,28 +308,28 @@ func (ch *CommandHandler) handleRaftApply(cmd string) string {
 	typeIdx := strings.Index(rest, "type=")
 	payloadIdx := strings.Index(rest, "payload=")
 	if typeIdx == -1 || payloadIdx == -1 {
-		return "ERROR: RAFT_APPLY requires type and payload parameters"
+		return "ERROR: missing_required_params command=RAFT_APPLY params=type,payload"
 	}
 
 	cmdType := strings.TrimSpace(rest[typeIdx+5 : payloadIdx])
 	payloadStr := strings.TrimSpace(rest[payloadIdx+8:])
 
 	if cmdType == "" || payloadStr == "" {
-		return "ERROR: RAFT_APPLY requires non-empty type and payload"
+		return "ERROR: empty_required_params command=RAFT_APPLY params=type,payload"
 	}
 
 	if !ch.isDistributed() {
-		return "ERROR: RAFT_APPLY requires distributed mode"
+		return "ERROR: distribution_required command=RAFT_APPLY"
 	}
 
 	var payload map[string]interface{}
 	if err := json.Unmarshal([]byte(payloadStr), &payload); err != nil {
-		return fmt.Sprintf("ERROR: invalid payload JSON: %v", err)
+		return fmt.Sprintf("ERROR: invalid_payload_json reason=%q", err.Error())
 	}
 
 	_, err := ch.applyAndWait(cmdType, payload)
 	if err != nil {
-		return fmt.Sprintf("ERROR: %v", err)
+		return formatReplicatedGroupError(err, "raft_apply_failed")
 	}
 	return "OK"
 }
@@ -294,7 +350,7 @@ func (ch *CommandHandler) applyViaLeader(cmdType string, payload map[string]inte
 		return nil, fmt.Errorf("marshal payload: %w", jsonErr)
 	}
 
-	forwardCmd := fmt.Sprintf("RAFT_APPLY type=%s payload=%s", cmdType, string(data))
+	forwardCmd := fmt.Sprintf("RAFT_APPLY %stype=%s payload=%s", ch.internalAuthPrefix(), cmdType, string(data))
 	encodedCmd := util.EncodeMessage("", forwardCmd)
 	resp, fwdErr := ch.Cluster.Router.ForwardToLeader(string(encodedCmd))
 	if fwdErr != nil {
@@ -343,4 +399,82 @@ func (ch *CommandHandler) applyAndWait(cmdType string, payload map[string]interf
 	case <-time.After(DefaultFSMApplyTimeout):
 		return nil, fmt.Errorf("timeout waiting for FSM")
 	}
+}
+
+func (ch *CommandHandler) preparePartitionLeader(topicName string, partitionID int, p *topic.Partition) (func(), error) {
+	writeLock := ch.partitionWriteLock(topicName, partitionID)
+	writeLock.Lock()
+	release := writeLock.Unlock
+	fail := func(err error) (func(), error) {
+		release()
+		return nil, err
+	}
+	if ch.Cluster == nil || ch.Cluster.RaftManager == nil {
+		return fail(fmt.Errorf("cluster metadata unavailable"))
+	}
+	fsmRef := ch.Cluster.RaftManager.GetFSM()
+	if fsmRef == nil {
+		return fail(fmt.Errorf("cluster metadata unavailable"))
+	}
+	metadata := fsmRef.GetPartitionMetadata(fmt.Sprintf("%s-%d", topicName, partitionID))
+	if metadata == nil {
+		return fail(fmt.Errorf("partition metadata not found"))
+	}
+	if !ch.Cluster.IsAuthorized(topicName, partitionID) {
+		return fail(fmt.Errorf("partition leader fenced: current=%s epoch=%d", metadata.Leader, metadata.LeaderEpoch))
+	}
+	committedHWM := metadata.CommittedHWM
+	if localHWM := p.GetHWM(); localHWM > committedHWM {
+		committedHWM = localHWM
+	}
+	if err := p.ReconcileCommittedHWM(committedHWM); err != nil {
+		return fail(fmt.Errorf("partition is not ready for leadership: %w", err))
+	}
+	p.FlushDisk()
+	return release, nil
+}
+
+func (ch *CommandHandler) commitPartitionHWM(topicName string, partitionID int, hwm uint64) error {
+	if ch.Cluster == nil || ch.Cluster.RaftManager == nil {
+		return fmt.Errorf("cluster metadata unavailable")
+	}
+	fsmRef := ch.Cluster.RaftManager.GetFSM()
+	if fsmRef == nil {
+		return fmt.Errorf("cluster metadata unavailable")
+	}
+	metadata := fsmRef.GetPartitionMetadata(fmt.Sprintf("%s-%d", topicName, partitionID))
+	if metadata == nil {
+		return fmt.Errorf("partition metadata not found")
+	}
+	_, err := ch.applyViaLeader("PARTITION_COMMIT", map[string]interface{}{
+		"topic":        topicName,
+		"partition":    partitionID,
+		"leader":       metadata.Leader,
+		"leader_epoch": metadata.LeaderEpoch,
+		"hwm":          hwm,
+	})
+	return err
+}
+
+func (ch *CommandHandler) validateReplicaLeader(cmd types.MessageCommand) string {
+	if !ch.isDistributed() {
+		return ""
+	}
+	if ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.Cluster.RaftManager.GetFSM() == nil {
+		return "ERROR: cluster_metadata_unavailable command=REPLICATE_MESSAGE"
+	}
+	metadata := ch.Cluster.RaftManager.GetFSM().GetPartitionMetadata(fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition))
+	if metadata == nil {
+		return fmt.Sprintf("ERROR: partition_metadata_not_found topic=%s partition=%d", cmd.Topic, cmd.Partition)
+	}
+	if cmd.LeaderID == "" || cmd.LeaderEpoch == 0 {
+		return "ERROR: missing_leader_fence command=REPLICATE_MESSAGE"
+	}
+	if cmd.LeaderID != metadata.Leader {
+		return fmt.Sprintf("ERROR: NOT_PARTITION_LEADER leader=%s requested_leader=%s", metadata.Leader, cmd.LeaderID)
+	}
+	if cmd.LeaderEpoch != metadata.LeaderEpoch {
+		return fmt.Sprintf("ERROR: STALE_LEADER_EPOCH current=%d requested=%d", metadata.LeaderEpoch, cmd.LeaderEpoch)
+	}
+	return ""
 }

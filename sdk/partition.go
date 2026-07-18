@@ -3,6 +3,7 @@ package sdk
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,12 +85,27 @@ func (pc *PartitionConsumer) runWorker() {
 
 		// Deliver messages to user handler.
 		handler := pc.consumer.MessageHandler
+		processingFailed := false
 		if handler != nil {
 			for _, msg := range batch.messages {
 				if err := handler(msg); err != nil {
 					LogError("Partition [%d] handler error at offset %d: %v", pc.partitionID, msg.Offset, err)
+					processingFailed = true
+					break
 				}
 			}
+		}
+		if processingFailed {
+			pc.consumer.mu.RLock()
+			committed := pc.consumer.offsets[pc.partitionID]
+			pc.consumer.mu.RUnlock()
+			atomic.StoreUint64(&pc.fetchOffset, committed)
+			pc.closeConnection()
+			select {
+			case pc.consumer.rebalanceSig <- struct{}{}:
+			default:
+			}
+			return
 		}
 
 		if pc.consumer.mainCtx.Err() != nil {
@@ -150,8 +166,8 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	memberID, generation := c.memberID, c.generation
 	c.mu.RUnlock()
 
-	consumeCmd := fmt.Sprintf("CONSUME topic=%s partition=%d offset=%d group=%s generation=%d member=%s",
-		c.config.Topic, pc.partitionID, currentOffset, c.config.GroupID, generation, memberID)
+	consumeCmd := fmt.Sprintf("CONSUME topic=%s partition=%d offset=%d group=%s generation=%d member=%s%s%s batch=%d",
+		c.config.Topic, pc.partitionID, currentOffset, c.config.GroupID, generation, memberID, autoOffsetResetArgument(c.config.AutoOffsetReset), readIsolationArgument(c.config.ReadIsolation), effectivePollBatchSize(c.config))
 
 	if err := WriteWithLength(conn, EncodeMessage("", consumeCmd)); err != nil {
 		LogError("Partition [%d] send CONSUME failed: %v", pc.partitionID, err)
@@ -178,7 +194,7 @@ func (pc *PartitionConsumer) pollAndProcess() {
 		return
 	}
 
-	if pc.handleBrokerError(batchData) {
+	if pc.handleBrokerError(batchData) || pc.handleStreamControl(batchData) {
 		pc.waitWithBackoff(bo)
 		return
 	}
@@ -275,8 +291,8 @@ func (pc *PartitionConsumer) startStreamLoop() {
 		memberID, generation := c.memberID, c.generation
 		c.mu.RUnlock()
 
-		streamCmd := fmt.Sprintf("STREAM topic=%s partition=%d group=%s offset=%d generation=%d member=%s",
-			c.config.Topic, pid, c.config.GroupID, currentOffset, generation, memberID)
+		streamCmd := fmt.Sprintf("STREAM topic=%s partition=%d group=%s offset=%d generation=%d member=%s%s%s batch=%d",
+			c.config.Topic, pid, c.config.GroupID, currentOffset, generation, memberID, autoOffsetResetArgument(c.config.AutoOffsetReset), readIsolationArgument(c.config.ReadIsolation), effectiveStreamBatchSize(c.config))
 
 		if err := WriteWithLength(conn, EncodeMessage("", streamCmd)); err != nil {
 			LogError("Partition [%d] STREAM send failed: %v", pid, err)
@@ -305,6 +321,14 @@ func (pc *PartitionConsumer) startStreamLoop() {
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
 					continue // idle timeout — retry read
 				}
+				if c.mainCtx.Err() != nil {
+					return
+				}
+				select {
+				case <-c.doneCh:
+					return
+				default:
+				}
 				LogError("Partition [%d] stream read error: %v", pid, err)
 				pc.closeConnection()
 				if !pc.waitWithBackoff(bo) {
@@ -313,7 +337,7 @@ func (pc *PartitionConsumer) startStreamLoop() {
 				break
 			}
 
-			if pc.handleBrokerError(batchData) {
+			if pc.handleBrokerError(batchData) || pc.handleStreamControl(batchData) {
 				if !pc.waitWithBackoff(bo) {
 					return
 				}
@@ -361,6 +385,24 @@ func (pc *PartitionConsumer) startStreamLoop() {
 			}
 		}
 	}
+}
+
+func effectivePollBatchSize(cfg *ConsumerConfig) int {
+	batchSize := cfg.BatchSize
+	if cfg.MaxPollRecords > 0 && (batchSize <= 0 || cfg.MaxPollRecords < batchSize) {
+		batchSize = cfg.MaxPollRecords
+	}
+	if batchSize <= 0 {
+		return 100
+	}
+	return batchSize
+}
+
+func effectiveStreamBatchSize(cfg *ConsumerConfig) int {
+	if cfg.BatchSize > 0 {
+		return cfg.BatchSize
+	}
+	return 100
 }
 
 // ensureConnection establishes a connection to the broker with retries and backoff.
@@ -437,6 +479,148 @@ func (pc *PartitionConsumer) ensureConnection() error {
 	return fmt.Errorf("partition [%d] failed to connect after %d retries: %w", pc.partitionID, maxRetries, lastErr)
 }
 
+type offsetOutOfRangeFrame struct {
+	Requested uint64
+	Earliest  uint64
+	Latest    uint64
+}
+
+func parseOffsetOutOfRangeFrame(respStr string) (offsetOutOfRangeFrame, bool) {
+	if !strings.Contains(respStr, "OFFSET_OUT_OF_RANGE") {
+		return offsetOutOfRangeFrame{}, false
+	}
+
+	frame := offsetOutOfRangeFrame{}
+	hasEarliest := false
+	hasLatest := false
+	for _, field := range strings.Fields(respStr) {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			continue
+		}
+		switch key {
+		case "requested":
+			frame.Requested = parsed
+		case "earliest":
+			frame.Earliest = parsed
+			hasEarliest = true
+		case "latest":
+			frame.Latest = parsed
+			hasLatest = true
+		}
+	}
+	return frame, hasEarliest && hasLatest
+}
+
+type streamControlFrame struct {
+	Type           string
+	Reason         string
+	Offset         uint64
+	HasOffset      bool
+	Requested      uint64
+	Earliest       uint64
+	Latest         uint64
+	HasOffsetRange bool
+}
+
+func parseStreamControlFrame(data []byte) (streamControlFrame, bool) {
+	respStr := string(data)
+	if !strings.HasPrefix(respStr, "STREAM_CONTROL") {
+		return streamControlFrame{}, false
+	}
+
+	frame := streamControlFrame{}
+	for _, field := range strings.Fields(respStr) {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "type":
+			frame.Type = value
+		case "reason":
+			frame.Reason = value
+		case "offset":
+			offset, err := strconv.ParseUint(value, 10, 64)
+			if err == nil {
+				frame.Offset = offset
+				frame.HasOffset = true
+			}
+		case "requested":
+			if parsed, err := strconv.ParseUint(value, 10, 64); err == nil {
+				frame.Requested = parsed
+			}
+		case "earliest":
+			if parsed, err := strconv.ParseUint(value, 10, 64); err == nil {
+				frame.Earliest = parsed
+				frame.HasOffsetRange = true
+			}
+		case "latest":
+			if parsed, err := strconv.ParseUint(value, 10, 64); err == nil {
+				frame.Latest = parsed
+			}
+		}
+	}
+	return frame, true
+}
+
+func (pc *PartitionConsumer) handleOffsetOutOfRange(frame offsetOutOfRangeFrame) bool {
+	policy := pc.consumer.config.AutoOffsetReset
+	if policy == "" {
+		policy = AutoOffsetResetEarliest
+	}
+
+	var next uint64
+	switch policy {
+	case AutoOffsetResetEarliest:
+		next = frame.Earliest
+	case AutoOffsetResetLatest:
+		next = frame.Latest
+	case AutoOffsetResetError:
+		LogError("Partition [%d] offset out of range requested=%d earliest=%d latest=%d", pc.partitionID, frame.Requested, frame.Earliest, frame.Latest)
+		pc.consumer.mainCancel()
+		pc.closeConnection()
+		return true
+	default:
+		LogWarn("Partition [%d] unknown auto_offset_reset=%q, defaulting to earliest", pc.partitionID, policy)
+		next = frame.Earliest
+	}
+
+	atomic.StoreUint64(&pc.fetchOffset, next)
+	pc.consumer.mu.Lock()
+	pc.consumer.offsets[pc.partitionID] = next
+	pc.consumer.mu.Unlock()
+	LogWarn("Partition [%d] offset out of range requested=%d earliest=%d latest=%d; reset fetch offset to %d (%s)", pc.partitionID, frame.Requested, frame.Earliest, frame.Latest, next, policy)
+	pc.closeConnection()
+	return true
+}
+func (pc *PartitionConsumer) handleStreamControl(data []byte) bool {
+	frame, ok := parseStreamControlFrame(data)
+	if !ok {
+		return false
+	}
+
+	switch frame.Type {
+	case "CLOSE":
+		if frame.Reason == "offset_out_of_range" && frame.HasOffsetRange {
+			return pc.handleOffsetOutOfRange(offsetOutOfRangeFrame{Requested: frame.Requested, Earliest: frame.Earliest, Latest: frame.Latest})
+		}
+		if frame.HasOffset {
+			atomic.StoreUint64(&pc.fetchOffset, frame.Offset)
+		}
+		LogInfo("Partition [%d] stream closed by broker reason=%s offset=%d", pc.partitionID, frame.Reason, frame.Offset)
+		pc.closeConnection()
+		return true
+	default:
+		LogWarn("Partition [%d] unknown stream control frame: %s", pc.partitionID, string(data))
+		return true
+	}
+}
+
 // handleBrokerError returns true if data is a recognised broker error string.
 func (pc *PartitionConsumer) handleBrokerError(data []byte) bool {
 	respStr := string(data)
@@ -445,6 +629,10 @@ func (pc *PartitionConsumer) handleBrokerError(data []byte) bool {
 	}
 
 	LogWarn("Partition [%d] broker error: %s", pc.partitionID, respStr)
+
+	if frame, ok := parseOffsetOutOfRangeFrame(respStr); ok {
+		return pc.handleOffsetOutOfRange(frame)
+	}
 
 	if strings.Contains(respStr, "NOT_LEADER") {
 		fields := strings.Fields(respStr)
@@ -462,7 +650,7 @@ func (pc *PartitionConsumer) handleBrokerError(data []byte) bool {
 		}()
 	}
 
-	if strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "REBALANCE_REQUIRED") {
+	if strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "REBALANCE_REQUIRED") || strings.Contains(respStr, "NOT_OWNER") {
 		pc.close()
 		go pc.consumer.handleRebalanceSignal()
 		return true
@@ -626,5 +814,29 @@ func (pc *PartitionConsumer) closeConnection() {
 	if pc.conn != nil {
 		_ = pc.conn.Close()
 		pc.conn = nil
+	}
+}
+
+func readIsolationArgument(isolation ReadIsolation) string {
+	switch isolation {
+	case ReadUncommitted:
+		return " isolation=read_uncommitted"
+	case "", ReadCommitted:
+		return " isolation=read_committed"
+	default:
+		return " isolation=read_committed"
+	}
+}
+
+func autoOffsetResetArgument(policy AutoOffsetResetPolicy) string {
+	switch policy {
+	case AutoOffsetResetLatest:
+		return " autoOffsetReset=latest"
+	case AutoOffsetResetError:
+		return ""
+	case "", AutoOffsetResetEarliest:
+		return " autoOffsetReset=earliest"
+	default:
+		return " autoOffsetReset=earliest"
 	}
 }

@@ -125,8 +125,8 @@ func (d *DiskHandler) syncLoop() {
 			currentOffset := atomic.LoadUint64(&d.AbsoluteOffset)
 			d.ioMu.Unlock()
 
-			if syncSuccess && d.OnSync != nil {
-				d.OnSync(currentOffset)
+			if syncSuccess {
+				d.notifySync(currentOffset)
 			}
 		case <-d.done:
 			return
@@ -268,17 +268,26 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	defer d.ioMu.Unlock()
 
 	diskMsg := types.DiskMessage{
-		Topic:            topic,
-		Partition:        int32(partition),
-		Offset:           msg.Offset,
-		SeqNum:           msg.SeqNum,
-		Epoch:            msg.Epoch,
-		Payload:          msg.Payload,
-		Key:              msg.Key,
-		EventType:        msg.EventType,
-		SchemaVersion:    msg.SchemaVersion,
-		AggregateVersion: msg.AggregateVersion,
-		Metadata:         msg.Metadata,
+		Topic:                        topic,
+		Partition:                    int32(partition),
+		Offset:                       msg.Offset,
+		ProducerID:                   msg.ProducerID,
+		SeqNum:                       msg.SeqNum,
+		Epoch:                        msg.Epoch,
+		Payload:                      msg.Payload,
+		Key:                          msg.Key,
+		EventType:                    msg.EventType,
+		SchemaVersion:                msg.SchemaVersion,
+		AggregateVersion:             msg.AggregateVersion,
+		Metadata:                     msg.Metadata,
+		TransactionalID:              msg.TransactionalID,
+		TransactionState:             msg.TransactionState,
+		TransactionMarker:            msg.TransactionMarker,
+		ControlBatchType:             msg.ControlBatchType,
+		ControlBatchVersion:          msg.ControlBatchVersion,
+		ControlBatchCoordinatorEpoch: msg.ControlBatchCoordinatorEpoch,
+		ControlBatchKey:              msg.ControlBatchKey,
+		ControlBatchValue:            msg.ControlBatchValue,
 	}
 
 	serialized, err := util.SerializeDiskMessage(diskMsg)

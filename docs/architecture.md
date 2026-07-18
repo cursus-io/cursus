@@ -26,7 +26,6 @@ flowchart TB
     subgraph "Broker Core"
         CMD[CommandHandler]
         TM[TopicManager]
-        DM[DedupMap\n30-min window]
 
         subgraph "Topic"
             T[Topic]
@@ -52,8 +51,7 @@ flowchart TB
     C -->|TCP| TCP
     TCP --> CMD
     CMD --> TM
-    TM --> DM
-    DM -->|unique| T
+    TM --> T
     T --> P0 & P1 & PN
     P0 --> DH0
     P1 --> DH1
@@ -67,16 +65,18 @@ flowchart TB
 
 ## What is cursus?
 
-cursus is a lightweight message broker inspired by Kafka's design philosophy of **logically separated but physically distributed data management**. 
+cursus is a lightweight message broker built around **logically separated but physically distributed data management**.
 
-It provides publish-subscribe messaging with topic partitioning, consumer groups, and durable disk persistence, designed for single-node deployments with minimal operational complexity.
+It provides publish-subscribe messaging with topic partitioning, durable consumer groups, broker transactions, event streams, and disk persistence. The same client protocol runs in standalone mode or in a Raft-backed cluster.
 
 ## Key characteristics:
 
 - **Topic-based messaging**: Messages are organized into named topics with configurable partitions
 - **Durable persistence**: All messages are persisted to disk using segment-based log files
 - **Consumer groups**: Multiple consumer groups can independently consume the same topic
-- **Deduplication**: Built-in 30-minute message deduplication window
+- **Transactions**: Durable transaction coordinator state, producer fencing, partition markers, recovery, and explicit read isolation
+- **Cluster ownership**: Raft-backed metadata, group/transaction coordinator routing, partition leaders, and quorum checks
+- **Security**: TLS, client authentication/authorization, topic ACLs, and a separate broker-internal command boundary
 - **Observable**: Prometheus metrics, health checks, and structured logging
 
 
@@ -87,8 +87,8 @@ cursus exposes three network ports, each serving a distinct purpose:
 | Port | Protocol | Handler | Purpose |
 |------|----------|---------|---------|
 | 9000 | TCP      | `server.RunServer()` | Main broker operations (`PUBLISH`, `CONSUME`, `CREATE`, etc.) |
-| 9080 | HTTP     | `startHealthCheckServer()` | Health check endpoint for load balancers |
-| 9100 | HTTP     | `metrics.StartMetricsServer()` | Prometheus metrics exporter |
+| 9080 | HTTP     | `startHealthCheckServer()` | `/live`, `/ready`, and compatible `/health` probes |
+| 9100 | HTTP     | `metrics.StartMetricsServer()` | Prometheus exporter with scrape-time broker state |
 
 
 ## Core Data Flow
@@ -108,21 +108,16 @@ sequenceDiagram
 
     PROD->>SRV: [4-byte len][PUBLISH topic msg]
     SRV->>TM: Publish(topic, message)
-    TM->>TM: dedup check (FNV hash)
-    alt duplicate within 30min
-        TM-->>PROD: ERROR: duplicate
-    else unique message
-        TM->>PART: Enqueue(message)\nkey-hash or round-robin
-        PART->>DH: AppendMessage(writeCh)
-        DH-->>DISK: flushLoop batch write\n(50 msgs or 50ms)
-        PART->>SM: NotifyNewMessage
-        SM->>CONS: push to MsgCh
-        CONS-->>PROD: (async delivery)
-    end
+    TM->>PART: select partition\nkey-hash or round-robin
+    PART->>PART: validate producer epoch/sequence when enabled
+    PART->>DH: AppendMessage(writeCh)
+    DH-->>DISK: flushLoop batch write\n(50 records or 50ms)
+    PART->>SM: NotifyNewMessage
+    SM->>CONS: embedded fan-out notification
 
     Note over CONS,DISK: Disk-based replay (CONSUME)
     CONS->>SRV: [4-byte len][CONSUME topic partition offset]
-    SRV->>PART: ReadCommitted(offset)
+    SRV->>PART: ReadCommitted(offset) by default
     PART->>DISK: mmap read (up to 8192 bytes)
     DISK-->>SRV: message batch
     SRV-->>CONS: [4-byte len][msg1][4-byte len][msg2]...
@@ -134,7 +129,7 @@ sequenceDiagram
 graph LR
     P[Publisher] -->|TCP| S[Server :9000]
     S --> TM[TopicManager]
-    TM -->|dedup check| T[Topic]
+    TM --> T[Topic]
     T -->|hash/round-robin| Part[Partition]
     Part -->|async| DH[DiskHandler]
     DH -->|writeCh| FL[flushLoop]
@@ -142,12 +137,12 @@ graph LR
     Part -->|notify| SM[StreamManager]
     SM -->|push| C[Consumer]
     C -->|CONSUME/STREAM| Part
-    Part -->|ReadCommitted| Seg
+    Part -->|ReadCommitted / ReadMessages| Seg
 ```
 
 ### Key flow characteristics:
 
-- **Deduplication**: `TopicManager.Publish()` checks dedupMap using message ID (hash of payload) to prevent duplicate processing within 30 minutes 
+- **Retry safety**: idempotent topics validate producer ID, epoch, and sequence per partition; transactions add staged commit/recovery semantics
 - **Partition Selection**: `Topic.Publish()` uses key-based hashing for ordered delivery or round-robin counter for load balancing
 - **Dual-path delivery**: `Partition.Enqueue()` sends to both disk (via DiskHandler) and consumer channels
 - **Asynchronous writes**: DiskHandler batches up to 50 messages or flushes after 50ms linger timeout (configurable)
@@ -169,7 +164,7 @@ This architecture enables parallel I/O across partitions and efficient sequentia
 
 ## Cluster Architecture
 
-cursus supports a 3-node Raft-based cluster with Kafka-style routing.
+cursus supports a configured Raft-based cluster with coordinator and partition-leader routing. The common deployment and test topology uses three brokers so a majority remains available after one node failure; the protocol contract is not hard-coded to exactly three nodes.
 
 ### Cluster Topology
 
@@ -229,15 +224,22 @@ graph TB
     SDK -->|4. CONSUME P2| B2
 ```
 
-### Three Connection Types
+### Connection Types
 
 | Connection | Target | Discovery | Commands |
 |---|---|---|---|
 | Any broker | Any node | Config | `FIND_COORDINATOR`, `METADATA`, `CREATE`, `LIST` |
-| Coordinator | Per-group (consistent hash) | `FIND_COORDINATOR` | `JOIN_GROUP`, `SYNC_GROUP`, `LEAVE_GROUP`, `HEARTBEAT`, `COMMIT_OFFSET`, `FETCH_OFFSET` |
+| Group coordinator | Per group | `FIND_COORDINATOR group=<group>` | `JOIN_GROUP`, `SYNC_GROUP`, `LEAVE_GROUP`, `HEARTBEAT`, `COMMIT_OFFSET`, `BATCH_COMMIT`, `FETCH_OFFSET` |
+| Transaction coordinator | Per transactional id | `FIND_COORDINATOR transactional_id=<id>` | `INIT_PRODUCER_ID`, `BEGIN_TXN`, `TXN_PUBLISH`, `SEND_OFFSETS_TO_TXN`, `END_TXN`, `TXN_STATUS` |
 | Partition leader | Per-partition | `METADATA` | `CONSUME`, `STREAM`, `PUBLISH` |
 
-### Coordinator Pattern (Kafka Model)
+### Transaction Visibility Boundary
+
+Transactional output follows the normal partition-leader publish and replication path. A prepared commit writes idempotent records, appends a marker to every touched partition, applies one fenced bulk consumer offset scope, and then persists the final transaction decision. `read_committed` requires both the marker and matching final coordinator decision. A restored `committing` transaction is retried during startup recovery from the standalone journal or distributed metadata snapshot; records remain hidden until recovery completes.
+
+This contract covers broker records and one source consumer scope. It does not include external database, HTTP, or filesystem side effects.
+
+### Coordinator Pattern
 
 ```mermaid
 sequenceDiagram
@@ -249,17 +251,19 @@ sequenceDiagram
     C->>B1: FIND_COORDINATOR group=G1
     B1-->>C: OK host=B2 port=9002
 
-    C->>B2: JOIN_GROUP topic=T group=G1
-    B2-->>C: OK generation=1 assignments=[0,1]
+    C->>B2: JOIN_GROUP topic=T group=G1 member=M
+    B2-->>C: OK generation=1 member=M-1234 assignments=[0,1]
+    C->>B2: SYNC_GROUP topic=T group=G1 member=M-1234 generation=1
+    B2-->>C: OK generation=1 member=M-1234 assignments=[0,1]
 
-    C->>B2: HEARTBEAT group=G1
-    B2-->>C: OK
+    C->>B2: HEARTBEAT topic=T group=G1 member=M-1234 generation=1
+    B2-->>C: OK member=M-1234 generation=1
 
     Note over C,B3: If coordinator changes...
-    C->>B2: HEARTBEAT group=G1
+    C->>B2: HEARTBEAT topic=T group=G1 member=M-1234 generation=1
     B2-->>C: ERROR: NOT_COORDINATOR host=B3 port=9003
-    C->>B3: HEARTBEAT group=G1
-    B3-->>C: OK
+    C->>B3: HEARTBEAT topic=T group=G1 member=M-1234 generation=1
+    B3-->>C: OK member=M-1234 generation=1
 ```
 
 ### Partition Leader Routing
@@ -289,7 +293,7 @@ sequenceDiagram
 
 ### Raft Consensus
 
-Group state changes (JOIN, LEAVE, COMMIT) are persisted via Raft. The coordinator may not be the Raft leader — in that case, `applyViaLeader` forwards the Raft log entry to the leader internally via `RAFT_APPLY`.
+In distributed mode, authoritative group and transaction metadata changes are persisted through the Raft FSM and snapshots. A logical group or transaction coordinator may differ from the Raft leader; `applyViaLeader` forwards the metadata mutation through the authenticated broker-internal path before it is considered durable. Standalone consumer offsets use the internal offset log, while standalone transaction snapshots use an append-only fsynced journal under `log_dir`. The final transaction snapshot is persisted before the in-memory decision opens `read_committed` visibility.
 
 ```mermaid
 graph LR
@@ -310,4 +314,3 @@ broker-1:
     - ADVERTISED_CLIENT_HOST=localhost
     - ADVERTISED_BROKER_PORT=9001
 ```
-

@@ -34,6 +34,29 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	}
 }
 
+func TestConfigNormalizeCleanupPolicies(t *testing.T) {
+	for input, expected := range map[string]string{
+		"compact":        config.CleanupPolicyCompact,
+		"delete":         config.CleanupPolicyDelete,
+		"compact,delete": config.CleanupPolicyDeleteCompact,
+		"delete,compact": config.CleanupPolicyDeleteCompact,
+	} {
+		cfg := config.DefaultConfig()
+		cfg.CleanupPolicy = input
+		cfg.Normalize()
+		if cfg.CleanupPolicy != expected {
+			t.Fatalf("cleanup policy %q normalized to %q, want %q", input, cfg.CleanupPolicy, expected)
+		}
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.CleanupPolicy = "unknown"
+	cfg.Normalize()
+	if cfg.CleanupPolicy != config.CleanupPolicyDelete {
+		t.Fatalf("invalid cleanup policy normalized to %q", cfg.CleanupPolicy)
+	}
+}
+
 func TestConfig_Normalize(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.BrokerPort = -1

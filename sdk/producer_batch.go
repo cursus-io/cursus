@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -61,6 +62,9 @@ func (p *Producer) sendBatch(part int, batch []Message) {
 			producerSendErrors.WithLabelValues(p.config.Topic).Add(float64(len(batch)))
 		}
 		p.cleanupBatchState(part, batchID)
+		if isNonRetryableProducerError(err) {
+			return
+		}
 		p.handleSendFailure(part, batch)
 		return
 	}
@@ -95,6 +99,18 @@ func (p *Producer) sendBatch(part int, batch []Message) {
 		}
 		p.cleanupBatchState(part, batchID)
 	}
+}
+
+func isNonRetryableProducerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var brokerErr *BrokerError
+	if errors.As(err, &brokerErr) {
+		return !brokerErr.Retryable
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "stale_producer_epoch") || strings.Contains(msg, "stale producer epoch")
 }
 
 func (p *Producer) cleanupBatchState(part int, batchID string) {
@@ -272,9 +288,9 @@ func (p *Producer) markBatchAckedByID(part int, batchID string, batchLen int) {
 }
 
 func (p *Producer) parseAckResponse(resp []byte) (*AckResponse, error) {
-	respStr := string(resp)
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return nil, fmt.Errorf("broker error: %s", strings.TrimSpace(respStr))
+	respStr := strings.TrimSpace(string(resp))
+	if brokerErr, ok := ParseBrokerError(respStr); ok {
+		return nil, brokerErr
 	}
 
 	var ackResp AckResponse

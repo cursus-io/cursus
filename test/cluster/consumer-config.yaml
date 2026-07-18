@@ -12,6 +12,7 @@ consumer_id: "cluster-consumer-1"
 mode: "polling"
 poll_interval: 100ms
 poll_timeout_ms: 5000
+auto_offset_reset: earliest
 batch_size: 5000
 
 session_timeout_ms: 30000

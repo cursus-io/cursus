@@ -1,14 +1,58 @@
 package controller
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
 )
+
+func TestWithInternalTokenPreservesLongRawCommand(t *testing.T) {
+	router := &ClusterRouter{internalToken: "secret"}
+	command := "REPLICATE_MESSAGE payload=" + strings.Repeat("x", 22000)
+
+	got := router.withInternalToken(command)
+	wantPrefix := "REPLICATE_MESSAGE internal_token=secret payload="
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Fatalf("command prefix = %q, want %q", got[:min(len(got), len(wantPrefix))], wantPrefix)
+	}
+}
+
+func TestInjectInternalTokenOnlyInspectsCommandArguments(t *testing.T) {
+	command := "REPLICATE_MESSAGE payload=message internal_token=payload-value"
+	got := injectInternalToken(command, "secret")
+	want := "REPLICATE_MESSAGE internal_token=secret payload=message internal_token=payload-value"
+	if got != want {
+		t.Fatalf("command = %q, want %q", got, want)
+	}
+}
+
+func TestInjectInternalTokenPreservesExistingFirstArgument(t *testing.T) {
+	command := "REPLICATE_MESSAGE internal_token=secret payload=value"
+	if got := injectInternalToken(command, "secret"); got != command {
+		t.Fatalf("command = %q, want unchanged", got)
+	}
+}
+
+func TestWithInternalTokenPreservesLegacyEnvelope(t *testing.T) {
+	router := &ClusterRouter{internalToken: "secret"}
+	encoded := util.EncodeMessage("", "HELP")
+
+	got := router.withInternalToken(string(encoded))
+	_, payload, err := util.DecodeMessage([]byte(got))
+	if err != nil {
+		t.Fatalf("decode forwarded envelope: %v", err)
+	}
+	if payload != "HELP internal_token=secret" {
+		t.Fatalf("payload = %q", payload)
+	}
+}
 
 type MockRaftManager struct {
 	isLeader bool
@@ -57,7 +101,7 @@ func TestClusterRouter_LocalProcess(t *testing.T) {
 	processor := &MockLocalProcessor{}
 
 	rm := &MockRaftManager{isLeader: true}
-	router := NewClusterRouter("node1", "localhost:7000", processor, rm, 9000, "")
+	router := NewClusterRouter("node1", "localhost:7000", processor, rm, 9000, "", nil)
 
 	if router.processLocally("CREATE topic=t1") != "OK" {
 		t.Fatal("Expected local processing to succeed")
@@ -75,7 +119,7 @@ func TestClusterRouter_FindCoordinator(t *testing.T) {
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"node3\",\"addr\":\"localhost:7003\",\"status\":\"active\"}")})
 
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
-	router := NewClusterRouter("node1", "localhost:7001", nil, rm, 7000, "")
+	router := NewClusterRouter("node1", "localhost:7001", nil, rm, 7000, "", nil)
 
 	group1 := "group-a"
 	id1, addr1, err := router.FindCoordinator(group1)
@@ -112,7 +156,7 @@ func TestClusterRouter_FindCoordinator_CacheRebuild(t *testing.T) {
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n2\",\"addr\":\"localhost:7002\",\"status\":\"active\"}")})
 
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
-	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "")
+	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "", nil)
 
 	// First call builds ring
 	id1, _, err := router.FindCoordinator("group-x")
@@ -138,7 +182,7 @@ func TestClusterRouter_FindCoordinator_CacheRebuild(t *testing.T) {
 func TestClusterRouter_FindCoordinator_NoActiveBrokers(t *testing.T) {
 	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
-	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "")
+	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "", nil)
 
 	_, _, err := router.FindCoordinator("group-x")
 	if err == nil {
@@ -148,7 +192,7 @@ func TestClusterRouter_FindCoordinator_NoActiveBrokers(t *testing.T) {
 
 func TestClusterRouter_FindCoordinator_NilFSM(t *testing.T) {
 	rm := &MockRaftManager{isLeader: true, mockFSM: nil}
-	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "")
+	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "", nil)
 
 	_, _, err := router.FindCoordinator("group-x")
 	if err == nil {
@@ -162,7 +206,7 @@ func TestClusterRouter_ForwardToCoordinator_Local(t *testing.T) {
 
 	processor := &MockLocalProcessor{}
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
-	router := NewClusterRouter("n1", "localhost:7001", processor, rm, 7000, "")
+	router := NewClusterRouter("n1", "localhost:7001", processor, rm, 7000, "", nil)
 
 	// With only one broker, all groups map to n1 -> local processing
 	resp, err := router.ForwardToCoordinator("any-group", "HEARTBEAT group=any-group member=m1")
@@ -187,7 +231,7 @@ func TestClusterRouter_ForwardToPartitionLeader_Local(t *testing.T) {
 
 	processor := &MockLocalProcessor{}
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
-	router := NewClusterRouter("n1", "localhost:7001", processor, rm, 7000, "")
+	router := NewClusterRouter("n1", "localhost:7001", processor, rm, 7000, "", nil)
 
 	resp, err := router.ForwardToPartitionLeader("t1", 0, "PUBLISH topic=t1 message=hello")
 	if err != nil {
@@ -201,7 +245,7 @@ func TestClusterRouter_ForwardToPartitionLeader_Local(t *testing.T) {
 func TestClusterRouter_ForwardToLeader_IsLeader(t *testing.T) {
 	processor := &MockLocalProcessor{}
 	rm := &MockRaftManager{isLeader: true}
-	router := NewClusterRouter("n1", "localhost:7001", processor, rm, 7000, "")
+	router := NewClusterRouter("n1", "localhost:7001", processor, rm, 7000, "", nil)
 
 	resp, err := router.ForwardToLeader("LIST")
 	if err != nil {
@@ -209,5 +253,26 @@ func TestClusterRouter_ForwardToLeader_IsLeader(t *testing.T) {
 	}
 	if resp != "OK" {
 		t.Fatalf("Expected OK, got %s", resp)
+	}
+}
+
+func TestClusterRouterBrokerCommandAddrPrefersInternalPort(t *testing.T) {
+	rm := &MockRaftManager{isLeader: true}
+	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "", &config.Config{InternalBrokerPort: 19000})
+	if got := router.brokerCommandAddr("broker-2"); got != "broker-2:19000" {
+		t.Fatalf("expected internal broker port, got %s", got)
+	}
+
+	fallback := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "", nil)
+	if got := fallback.brokerCommandAddr("broker-2"); got != "broker-2:7000" {
+		t.Fatalf("expected client port fallback, got %s", got)
+	}
+
+	if got := router.brokerCommandAddr("2001:db8::1"); got != "[2001:db8::1]:19000" {
+		t.Fatalf("expected bracketed IPv6 internal address, got %s", got)
+	}
+
+	if got := fallback.brokerCommandAddr("2001:db8::2"); got != "[2001:db8::2]:7000" {
+		t.Fatalf("expected bracketed IPv6 client address, got %s", got)
 	}
 }

@@ -35,8 +35,9 @@ func (a *ClusterActions) StartCluster() *ClusterActions {
 		resp, err := a.actions.SendCommand("LIST_CLUSTER")
 		if err == nil {
 			a.ctx.GetT().Logf("DEBUG: LIST_CLUSTER raw response: %s", resp)
+			payload := strings.TrimPrefix(strings.TrimSpace(resp), "OK brokers=")
 			var brokers []fsm.BrokerInfo
-			if err := json.Unmarshal([]byte(resp), &brokers); err == nil {
+			if err := json.Unmarshal([]byte(payload), &brokers); err == nil {
 				activeCount := 0
 				for _, b := range brokers {
 					if b.Status == "active" {
@@ -53,7 +54,7 @@ func (a *ClusterActions) StartCluster() *ClusterActions {
 		time.Sleep(1 * time.Second)
 	}
 
-	a.ctx.GetT().Log("Cluster sync verified (with potential timeout)")
+	a.ctx.GetT().Fatalf("cluster did not report %d active nodes after %d attempts", a.ctx.clusterSize, maxRetries)
 	return a
 }
 
@@ -141,6 +142,7 @@ func (a *ClusterActions) SimulateFollowerFailure(nodeIndex int) *ClusterActions 
 	containerName := fmt.Sprintf("broker-%d", nodeIndex)
 	a.ctx.GetT().Log("Simulating follower failure")
 
+	// #nosec G204 -- nodeIndex is range-checked above and forms a fixed broker-N container name.
 	cmd := exec.Command("docker", "stop", containerName)
 	if err := cmd.Run(); err != nil {
 		a.ctx.GetT().Fatalf("Failed to stop follower: %v", err)
@@ -162,6 +164,7 @@ func (a *ClusterActions) RecoverFollower(nodeIndex int) *ClusterActions {
 	containerName := fmt.Sprintf("broker-%d", nodeIndex)
 	a.ctx.GetT().Log("Recovering follower")
 
+	// #nosec G204 -- nodeIndex is range-checked above and forms a fixed broker-N container name.
 	cmd := exec.Command("docker", "start", containerName)
 	if err := cmd.Run(); err != nil {
 		a.ctx.GetT().Fatalf("Failed to recover follower: %v", err)
@@ -176,6 +179,31 @@ func (a *ClusterActions) RecoverFollower(nodeIndex int) *ClusterActions {
 	return a
 }
 
+func (a *ClusterActions) StopBroker(nodeIndex int) {
+	if nodeIndex <= 0 || nodeIndex > a.ctx.clusterSize {
+		a.ctx.GetT().Fatalf("invalid broker index %d: cluster size is %d", nodeIndex, a.ctx.clusterSize)
+	}
+	containerName := fmt.Sprintf("broker-%d", nodeIndex)
+	// #nosec G204 -- nodeIndex is range-checked above and forms a fixed broker-N container name.
+	if err := exec.Command("docker", "stop", containerName).Run(); err != nil {
+		a.ctx.GetT().Fatalf("failed to stop %s: %v", containerName, err)
+	}
+	a.ctx.GetClient().Close()
+}
+
+func (a *ClusterActions) StartBroker(nodeIndex int) {
+	if nodeIndex <= 0 || nodeIndex > a.ctx.clusterSize {
+		a.ctx.GetT().Fatalf("invalid broker index %d: cluster size is %d", nodeIndex, a.ctx.clusterSize)
+	}
+	containerName := fmt.Sprintf("broker-%d", nodeIndex)
+	// #nosec G204 -- nodeIndex is range-checked above and forms a fixed broker-N container name.
+	if err := exec.Command("docker", "start", containerName).Run(); err != nil {
+		a.ctx.GetT().Fatalf("failed to start %s: %v", containerName, err)
+	}
+	if err := a.waitForNodeHealth(nodeIndex, clusterHealthCheckAddrs(a.ctx.clusterSize)[nodeIndex-1]); err != nil {
+		a.ctx.GetT().Fatalf("broker %d did not recover: %v", nodeIndex, err)
+	}
+}
 func (a *ClusterActions) DescribeTopic() *ClusterActions {
 	topic := a.ctx.GetTopic()
 	a.ctx.GetT().Logf("Describing topic: %s", topic)
@@ -230,31 +258,19 @@ func (a *ClusterActions) SimulateLeaderFailure() (int, *ClusterActions) {
 		a.ctx.GetT().Fatalf("Failed to find leader for topic %s: %v", topic, err)
 	}
 
-	var leaderNode int
-	// "leader": "broker-X:9000"
-	for i := 1; i <= a.ctx.clusterSize; i++ {
-		target := fmt.Sprintf("\"leader\": \"broker-%d:9000\"", i)
-		if strings.Contains(resp, target) {
-			leaderNode = i
-			break
-		}
+	oldLeader, err := leaderAddressFromDescribe(resp)
+	if err != nil {
+		a.ctx.GetT().Fatalf("Could not identify leader for topic %s: %v; response: %s", topic, err, resp)
 	}
-	if leaderNode == 0 {
-		for i := 1; i <= a.ctx.clusterSize; i++ {
-			if strings.Contains(resp, fmt.Sprintf("broker-%d", i)) {
-				leaderNode = i
-				break
-			}
-		}
-	}
-
-	if leaderNode == 0 {
-		a.ctx.GetT().Fatalf("Could not identify leader for topic %s from response: %s", topic, resp)
+	leaderNode, err := leaderNodeFromDescribe(resp, a.ctx.clusterSize)
+	if err != nil {
+		a.ctx.GetT().Fatalf("Could not identify leader for topic %s: %v; response: %s", topic, err, resp)
 	}
 
 	containerName := fmt.Sprintf("broker-%d", leaderNode)
 	a.ctx.GetT().Logf("Stopping leader container: %s", containerName)
 
+	// #nosec G204 -- leaderNode is parsed and range-checked against the configured cluster size.
 	stopCmd := exec.Command("docker", "stop", containerName)
 	if err := stopCmd.Run(); err != nil {
 		a.ctx.GetT().Fatalf("Failed to stop leader %s: %v", containerName, err)
@@ -262,6 +278,72 @@ func (a *ClusterActions) SimulateLeaderFailure() (int, *ClusterActions) {
 
 	a.ctx.GetClient().Close()
 
-	time.Sleep(5 * time.Second)
+	if err := a.waitForPartitionLeaderChange(topic, oldLeader, 45*time.Second); err != nil {
+		a.ctx.GetT().Fatal(err)
+	}
+
 	return leaderNode, a
+}
+
+func leaderNodeFromDescribe(resp string, clusterSize int) (int, error) {
+	var metadata struct {
+		Partitions []struct {
+			Leader string `json:"leader"`
+		} `json:"partitions"`
+	}
+	if err := json.Unmarshal([]byte(resp), &metadata); err != nil {
+		return 0, fmt.Errorf("decode topic metadata: %w", err)
+	}
+	if len(metadata.Partitions) == 0 || metadata.Partitions[0].Leader == "" {
+		return 0, fmt.Errorf("topic metadata has no partition leader")
+	}
+
+	leaderHost := strings.SplitN(metadata.Partitions[0].Leader, ":", 2)[0]
+	var leaderNode int
+	if _, err := fmt.Sscanf(leaderHost, "broker-%d", &leaderNode); err != nil {
+		return 0, fmt.Errorf("invalid leader address %q", metadata.Partitions[0].Leader)
+	}
+	if leaderNode < 1 || leaderNode > clusterSize || leaderHost != fmt.Sprintf("broker-%d", leaderNode) {
+		return 0, fmt.Errorf("leader %q is outside the %d-node test cluster", leaderHost, clusterSize)
+	}
+	return leaderNode, nil
+}
+
+func leaderAddressFromDescribe(resp string) (string, error) {
+	var metadata struct {
+		Partitions []struct {
+			Leader string `json:"leader"`
+		} `json:"partitions"`
+	}
+	if err := json.Unmarshal([]byte(resp), &metadata); err != nil {
+		return "", fmt.Errorf("decode topic metadata: %w", err)
+	}
+	if len(metadata.Partitions) == 0 || metadata.Partitions[0].Leader == "" {
+		return "", fmt.Errorf("topic metadata has no partition leader")
+	}
+	return metadata.Partitions[0].Leader, nil
+}
+
+func (a *ClusterActions) waitForPartitionLeaderChange(topic, oldLeader string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := a.actions.SendCommand(fmt.Sprintf("DESCRIBE topic=%s", topic))
+		if err == nil {
+			leader, parseErr := leaderAddressFromDescribe(resp)
+			switch {
+			case parseErr != nil:
+				lastErr = parseErr
+			case leader != oldLeader:
+				a.ctx.GetT().Logf("Partition leader changed from %s to %s", oldLeader, leader)
+				return nil
+			default:
+				lastErr = fmt.Errorf("partition leader is still %s", oldLeader)
+			}
+		} else {
+			lastErr = err
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("partition leader did not change from %s within %s: %w", oldLeader, timeout, lastErr)
 }

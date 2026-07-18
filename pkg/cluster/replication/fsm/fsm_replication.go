@@ -51,8 +51,8 @@ func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
 			trackPartition = cmd.Partition
 		}
 
-		exists, lastSeq := f.getProducerSequence(cmd.Topic, trackPartition, first.ProducerID)
-		if exists && int64(last.SeqNum) <= lastSeq {
+		exists, state := f.getProducerSequence(cmd.Topic, trackPartition, first.ProducerID)
+		if exists && first.Epoch == state.Epoch && last.SeqNum <= state.Seq {
 			f.mu.Unlock()
 			util.Debug("FSM: Duplicate detected for idempotent producer %s (Topic: %s, Scope: %s, Partition: %d), skipping", first.ProducerID, cmd.Topic, cmd.SequenceScope, trackPartition)
 			return f.makeSuccessAck(&last, first.SeqNum)
@@ -84,14 +84,14 @@ func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
 		if cmd.SequenceScope == "partition" {
 			trackPartition = cmd.Partition
 		}
-		f.updateProducerState(cmd.Topic, trackPartition, first.ProducerID, int64(last.SeqNum))
+		f.updateProducerState(cmd.Topic, trackPartition, first.ProducerID, last.Epoch, last.SeqNum)
 	}
 	f.mu.Unlock()
 
 	return f.makeSuccessAck(&last, first.SeqNum)
 }
 
-func (f *BrokerFSM) getProducerSequence(topic string, partition int, pID string) (bool, int64) {
+func (f *BrokerFSM) getProducerSequence(topic string, partition int, pID string) (bool, ProducerSequence) {
 	if pMap, ok := f.producerState[topic]; ok {
 		if sMap, ok := pMap[partition]; ok {
 			if seq, ok := sMap[pID]; ok {
@@ -107,19 +107,18 @@ func (f *BrokerFSM) getProducerSequence(topic string, partition int, pID string)
 			}
 		}
 	}
-	return false, -1
+	return false, ProducerSequence{}
 }
 
-func (f *BrokerFSM) updateProducerState(topic string, partition int, pID string, seq int64) {
+func (f *BrokerFSM) updateProducerState(topic string, partition int, pID string, epoch int64, seq uint64) {
 	if f.producerState[topic] == nil {
-		f.producerState[topic] = make(map[int]map[string]int64)
+		f.producerState[topic] = make(map[int]map[string]ProducerSequence)
 	}
 	if f.producerState[topic][partition] == nil {
-		f.producerState[topic][partition] = make(map[string]int64)
+		f.producerState[topic][partition] = make(map[string]ProducerSequence)
 	}
-	f.producerState[topic][partition][pID] = seq
+	f.producerState[topic][partition][pID] = ProducerSequence{Epoch: epoch, Seq: seq}
 }
-
 func (f *BrokerFSM) makeSuccessAck(msg *types.Message, seqStart uint64) types.AckResponse {
 	return types.AckResponse{
 		Status:        "OK",
@@ -153,7 +152,7 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 	if cmd.SequenceScope == "partition" {
 		trackPartition = cmd.Partition
 	}
-	exists, lastSeq := f.getProducerSequence(cmd.Topic, trackPartition, firstMsg.ProducerID)
+	exists, state := f.getProducerSequence(cmd.Topic, trackPartition, firstMsg.ProducerID)
 	f.mu.Unlock()
 
 	if !topicExists {
@@ -161,34 +160,33 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 	}
 
 	if effectiveIdempotent {
-		if cmd.SequenceScope == "partition" {
-			if exists {
-				if int64(lastMsg.SeqNum) <= lastSeq {
+		if exists {
+			if firstMsg.Epoch < state.Epoch {
+				return fmt.Errorf("stale_producer_epoch producer=%s current=%d got=%d", firstMsg.ProducerID, state.Epoch, firstMsg.Epoch)
+			}
+			if firstMsg.Epoch == state.Epoch {
+				if lastMsg.SeqNum <= state.Seq {
 					return nil
 				}
-				if int64(firstMsg.SeqNum) <= lastSeq {
-					return fmt.Errorf("out-of-order sequence (overlap) in partition scope: lastSeq %d, firstMsg.SeqNum %d", lastSeq, firstMsg.SeqNum)
-				}
-				if firstMsg.SeqNum > uint64(lastSeq+1) {
-					return fmt.Errorf("idempotency gap in partition scope for producer %s: expected %d, got %d", firstMsg.ProducerID, lastSeq+1, firstMsg.SeqNum)
-				}
-			} else if firstMsg.SeqNum > 1 {
-				return fmt.Errorf("idempotency error: first message in partition scope for producer %s must have seqNum 1, got %d", firstMsg.ProducerID, firstMsg.SeqNum)
-			}
-		} else {
-			if exists {
-				if int64(firstMsg.SeqNum) <= lastSeq {
-					if int64(lastMsg.SeqNum) <= lastSeq {
-						return nil // entire batch is duplicate
+				if firstMsg.SeqNum <= state.Seq {
+					scope := "global"
+					if cmd.SequenceScope == "partition" {
+						scope = "partition"
 					}
-					return fmt.Errorf("out-of-order sequence (overlap) in global scope: lastSeq %d, firstMsg.SeqNum %d", lastSeq, firstMsg.SeqNum)
+					return fmt.Errorf("out-of-order sequence (overlap) in %s scope: lastSeq %d, firstMsg.SeqNum %d", scope, state.Seq, firstMsg.SeqNum)
 				}
-				if firstMsg.SeqNum > uint64(lastSeq+1) {
-					return fmt.Errorf("idempotency gap in global scope for producer %s: expected %d, got %d", firstMsg.ProducerID, lastSeq+1, firstMsg.SeqNum)
+				if state.Seq == ^uint64(0) || firstMsg.SeqNum > state.Seq+1 {
+					scope := "global"
+					if cmd.SequenceScope == "partition" {
+						scope = "partition"
+					}
+					return fmt.Errorf("idempotency gap in %s scope for producer %s: expected %d, got %d", scope, firstMsg.ProducerID, state.Seq+1, firstMsg.SeqNum)
 				}
 			} else if firstMsg.SeqNum > 1 {
-				return fmt.Errorf("idempotency error: first message in global scope for producer %s must have seqNum 1, got %d", firstMsg.ProducerID, firstMsg.SeqNum)
+				return fmt.Errorf("idempotency error: first message in new producer epoch for producer %s must have seqNum 1, got %d", firstMsg.ProducerID, firstMsg.SeqNum)
 			}
+		} else if firstMsg.SeqNum > 1 {
+			return fmt.Errorf("idempotency error: first message for producer %s must have seqNum 1, got %d", firstMsg.ProducerID, firstMsg.SeqNum)
 		}
 	}
 
@@ -207,7 +205,6 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 	}
 	return nil
 }
-
 func (f *BrokerFSM) validateSequence(isIdempotent bool, prev, curr types.Message, idx int) error {
 	if isIdempotent && curr.SeqNum != prev.SeqNum+1 {
 		return fmt.Errorf("seq gap within batch at %d: %d->%d", idx, prev.SeqNum, curr.SeqNum)

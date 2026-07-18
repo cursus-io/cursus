@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -275,4 +276,48 @@ func TestConsumer_GetOrDialHeartbeatConn_NilConnGetLeaderFails(t *testing.T) {
 
 	conn := c.getOrDialHeartbeatConn()
 	assert.Nil(t, conn)
+}
+
+func TestParseFetchOffsetResponse_StrictContract(t *testing.T) {
+	offset, err := parseFetchOffsetResponse("OK offset=42")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(42), offset)
+
+	_, err = parseFetchOffsetResponse("42")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected offset response")
+
+	_, err = parseFetchOffsetResponse("OK")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing offset")
+}
+
+func TestIsRetryableFetchOffsetError(t *testing.T) {
+	assert.True(t, isRetryableFetchOffsetError(&BrokerError{Code: "NOT_COORDINATOR"}))
+	assert.True(t, isRetryableFetchOffsetError(&BrokerError{Code: "group_not_found"}))
+	assert.True(t, isRetryableFetchOffsetError(&BrokerError{Code: "member_not_found"}))
+	assert.True(t, isRetryableFetchOffsetError(&BrokerError{Code: "broker_busy", Retryable: true}))
+	assert.False(t, isRetryableFetchOffsetError(&BrokerError{Code: "offset_manager_not_available"}))
+	assert.False(t, isRetryableFetchOffsetError(errors.New("NOT_COORDINATOR in unstructured text")))
+	assert.False(t, isRetryableFetchOffsetError(nil))
+}
+
+func TestParseListOffsetsResponse(t *testing.T) {
+	ranges, err := parseListOffsetsResponse("OK topic=t partitions=2 offsets=P0:earliest=0:latest=10:leo=12:hwm=11,P1:earliest=3:latest=7:leo=8:hwm=7")
+	require.NoError(t, err)
+	require.Len(t, ranges, 2)
+	assert.Equal(t, PartitionOffsetRange{Partition: 0, Earliest: 0, Latest: 10, LEO: 12, HWM: 11}, ranges[0])
+	assert.Equal(t, PartitionOffsetRange{Partition: 1, Earliest: 3, Latest: 7, LEO: 8, HWM: 7}, ranges[1])
+
+	_, err = parseListOffsetsResponse("42")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected list offsets response")
+
+	_, err = parseListOffsetsResponse("OK topic=t partitions=1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing offsets")
+
+	_, err = parseListOffsetsResponse("ERROR: topic_not_found topic=t")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list offsets broker error")
 }

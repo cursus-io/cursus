@@ -3,10 +3,12 @@ package fsm
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -15,17 +17,19 @@ type PartitionMetadata struct {
 	Replicas       []string `json:"replicas"`
 	ISR            []string `json:"isr"`
 	LeaderEpoch    int      `json:"leader_epoch"`
+	CommittedHWM   uint64   `json:"committed_hwm"`
 	PartitionCount int      `json:"partition_count"`
 	Idempotent     bool     `json:"idempotent"`
 }
 
 type TopicCommand struct {
-	Name              string `json:"name"`
-	Partitions        int    `json:"partitions"`
-	Idempotent        bool   `json:"idempotent"`
-	EventSourcing     bool   `json:"event_sourcing"`
-	LeaderID          string `json:"leader_id"`
-	ReplicationFactor int    `json:"replication_factor,omitempty"`
+	Name              string       `json:"name"`
+	Partitions        int          `json:"partitions"`
+	Idempotent        bool         `json:"idempotent"`
+	EventSourcing     bool         `json:"event_sourcing"`
+	LeaderID          string       `json:"leader_id"`
+	ReplicationFactor int          `json:"replication_factor,omitempty"`
+	Policy            topic.Policy `json:"policy,omitempty"`
 }
 
 func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
@@ -34,8 +38,43 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		util.Error("FSM: Failed to unmarshal topic command: %v", err)
 		return err
 	}
+	definition, err := (topic.Definition{
+		Name:          topicCmd.Name,
+		Partitions:    topicCmd.Partitions,
+		Idempotent:    topicCmd.Idempotent,
+		EventSourcing: topicCmd.EventSourcing,
+		Policy:        topicCmd.Policy,
+	}).Normalize()
+	if err != nil {
+		return fmt.Errorf("invalid topic definition: %w", err)
+	}
+	if config.HasCleanupPolicy(definition.Policy.CleanupPolicy, config.CleanupPolicyCompact) {
+		return fmt.Errorf("cleanup policy compact is not supported in distributed mode")
+	}
+	topicCmd.Name = definition.Name
+	topicCmd.Partitions = definition.Partitions
+	topicCmd.Idempotent = definition.Idempotent
+	topicCmd.EventSourcing = definition.EventSourcing
+	topicCmd.Policy = definition.Policy
 
 	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	stagedTopics := copyTopicState(f.topicState)
+	stagedPartitions := copyPartitionMetadataState(f.partitionMetadata)
+	currentPartitions := 0
+	currentTopic := stagedTopics[topicCmd.Name]
+	if currentTopic == nil {
+		currentTopic = legacyTopicState(stagedPartitions)[topicCmd.Name]
+	}
+	if currentTopic != nil {
+		if topicCmd.Partitions < currentTopic.Partitions {
+			return fmt.Errorf("cannot decrease partition count for topic %q: %d -> %d", topicCmd.Name, currentTopic.Partitions, topicCmd.Partitions)
+		}
+		currentPartitions = currentTopic.Partitions
+		topicCmd.Idempotent = currentTopic.Idempotent
+		topicCmd.EventSourcing = currentTopic.EventSourcing
+	}
 
 	var brokers []string
 	for id, info := range f.brokers {
@@ -46,13 +85,11 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	sort.Strings(brokers)
 
 	if len(brokers) == 0 {
-		f.mu.Unlock()
 		util.Error("FSM: No active brokers available for topic creation")
 		return fmt.Errorf("no active brokers")
 	}
 
 	if topicCmd.Partitions <= 0 {
-		f.mu.Unlock()
 		util.Error("FSM: Invalid partition count %d for topic %s", topicCmd.Partitions, topicCmd.Name)
 		return fmt.Errorf("invalid partition count: %d", topicCmd.Partitions)
 	}
@@ -66,7 +103,6 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			}
 		}
 		if !found {
-			f.mu.Unlock()
 			util.Error("FSM: Explicit leader %s not in active broker set %v", topicCmd.LeaderID, brokers)
 			return fmt.Errorf("leader %s not in active broker set", topicCmd.LeaderID)
 		}
@@ -74,17 +110,29 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 
 	replicationFactor := topicCmd.ReplicationFactor
 	if replicationFactor <= 0 {
-		replicationFactor = 3 // default, same as Kafka
+		replicationFactor = 3 // default small-cluster replication factor
 	}
 	if replicationFactor > len(brokers) {
 		util.Warn("FSM: Requested RF %d exceeds active brokers %d. Capping to %d", replicationFactor, len(brokers), len(brokers))
 		replicationFactor = len(brokers)
 	}
+	topicCmd.ReplicationFactor = replicationFactor
 
 	ring := util.NewConsistentHashRing(150, nil)
 	ring.Add(brokers...)
 
-	for i := 0; i < topicCmd.Partitions; i++ {
+	for i := 0; i < currentPartitions; i++ {
+		key := topicCmd.Name + "-" + strconv.Itoa(i)
+		if stagedPartitions[key] == nil {
+			return fmt.Errorf("topic %q is missing partition metadata %d", topicCmd.Name, i)
+		}
+	}
+	for i := 0; i < currentPartitions; i++ {
+		key := topicCmd.Name + "-" + strconv.Itoa(i)
+		stagedPartitions[key].PartitionCount = topicCmd.Partitions
+	}
+
+	for i := currentPartitions; i < topicCmd.Partitions; i++ {
 		key := topicCmd.Name + "-" + strconv.Itoa(i)
 
 		assignedLeader := topicCmd.LeaderID
@@ -92,7 +140,6 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		if assignedLeader == "" {
 			replicas = ring.GetN(key, replicationFactor)
 			if len(replicas) == 0 {
-				f.mu.Unlock()
 				return fmt.Errorf("no replicas assigned for partition %s", key)
 			}
 			assignedLeader = replicas[0]
@@ -114,7 +161,7 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 
 		isrCopy := append([]string(nil), replicas...)
 
-		f.partitionMetadata[key] = &PartitionMetadata{
+		stagedPartitions[key] = &PartitionMetadata{
 			PartitionCount: topicCmd.Partitions,
 			Leader:         assignedLeader,
 			LeaderEpoch:    1,
@@ -125,14 +172,19 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		util.Info("FSM: Assigned leader %s to partition %s (replicas=%v)", assignedLeader, key, replicas)
 	}
 
+	definition.Idempotent = topicCmd.Idempotent
+	definition.EventSourcing = topicCmd.EventSourcing
+	stagedTopics[topicCmd.Name] = copyTopicDefinition(&definition)
 	tm := f.tm
-	f.mu.Unlock()
 
 	if tm != nil {
-		if err := tm.CreateTopic(topicCmd.Name, topicCmd.Partitions, topicCmd.Idempotent, topicCmd.EventSourcing); err != nil {
+		if err := tm.CreateTopicWithPolicy(topicCmd.Name, topicCmd.Partitions, topicCmd.Idempotent, topicCmd.EventSourcing, topicCmd.Policy); err != nil {
 			util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicCmd.Name, err)
+			return err
 		}
 	}
+	f.partitionMetadata = stagedPartitions
+	f.topicState = stagedTopics
 	util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, topicCmd.Partitions)
 
 	return nil
@@ -146,21 +198,42 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 		util.Error("FSM: Failed to unmarshal topic delete command: %v", err)
 		return err
 	}
+	if err := topic.ValidateName(payload.Topic); err != nil {
+		return fmt.Errorf("invalid topic name: %w", err)
+	}
 
 	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	found := f.topicState[payload.Topic] != nil
+	for key := range f.partitionMetadata {
+		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
+	}
+
+	tm := f.tm
+	if tm != nil {
+		deleted, err := tm.DeleteTopicDurable(payload.Topic)
+		if err != nil {
+			return fmt.Errorf("delete local topic %q: %w", payload.Topic, err)
+		}
+		if !deleted {
+			return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
+		}
+	} else if !found {
+		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
+	}
 
 	for key := range f.partitionMetadata {
 		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
 			delete(f.partitionMetadata, key)
 		}
 	}
-
-	tm := f.tm
-	f.mu.Unlock()
-
-	if tm != nil {
-		tm.DeleteTopic(payload.Topic)
-	}
+	delete(f.topicState, payload.Topic)
 	util.Info("FSM: Deleted topic '%s'", payload.Topic)
 
 	return nil
@@ -182,8 +255,75 @@ func (f *BrokerFSM) applyPartitionCommand(jsonData string) interface{} {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if current := f.partitionMetadata[key]; current != nil {
+		if metadata.LeaderEpoch < current.LeaderEpoch {
+			return fmt.Errorf("stale leader epoch for %s: current=%d requested=%d", key, current.LeaderEpoch, metadata.LeaderEpoch)
+		}
+		if metadata.Leader != current.Leader && metadata.LeaderEpoch <= current.LeaderEpoch {
+			return fmt.Errorf("leader change for %s must advance epoch: current=%d requested=%d", key, current.LeaderEpoch, metadata.LeaderEpoch)
+		}
+		if metadata.CommittedHWM < current.CommittedHWM {
+			return fmt.Errorf("committed HWM regression for %s: current=%d requested=%d", key, current.CommittedHWM, metadata.CommittedHWM)
+		}
+	}
 	f.partitionMetadata[key] = &metadata
 	util.Debug("FSM: Updated partition metadata for %s", key)
+	return nil
+}
+
+type partitionCommitCommand struct {
+	Topic       string `json:"topic"`
+	Partition   int    `json:"partition"`
+	Leader      string `json:"leader"`
+	LeaderEpoch int    `json:"leader_epoch"`
+	HWM         uint64 `json:"hwm"`
+}
+
+func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
+	var cmd partitionCommitCommand
+	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
+		return fmt.Errorf("unmarshal partition commit: %w", err)
+	}
+	key := fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition)
+
+	f.mu.Lock()
+	metadata := f.partitionMetadata[key]
+	if metadata == nil {
+		f.mu.Unlock()
+		return fmt.Errorf("partition metadata %s not found", key)
+	}
+	if cmd.Leader != metadata.Leader {
+		f.mu.Unlock()
+		return fmt.Errorf("partition leader fenced for %s: current=%s requested=%s", key, metadata.Leader, cmd.Leader)
+	}
+	if cmd.LeaderEpoch != metadata.LeaderEpoch {
+		f.mu.Unlock()
+		return fmt.Errorf("stale leader epoch for %s: current=%d requested=%d", key, metadata.LeaderEpoch, cmd.LeaderEpoch)
+	}
+	if cmd.HWM < metadata.CommittedHWM {
+		f.mu.Unlock()
+		return fmt.Errorf("committed HWM regression for %s: current=%d requested=%d", key, metadata.CommittedHWM, cmd.HWM)
+	}
+	metadata.CommittedHWM = cmd.HWM
+	tm := f.tm
+	f.mu.Unlock()
+
+	if tm == nil {
+		return nil
+	}
+	t := tm.GetTopic(cmd.Topic)
+	if t == nil {
+		return nil
+	}
+	p, err := t.GetPartition(cmd.Partition)
+	if err != nil {
+		return nil
+	}
+	if err := p.ApplyReplicaHWM(cmd.HWM); err != nil {
+		util.Warn("FSM: Replica has not caught up to committed HWM for %s: %v", key, err)
+		return nil
+	}
+	p.FlushDisk()
 	return nil
 }
 
@@ -210,10 +350,12 @@ func (f *BrokerFSM) applyJoinGroupCommand(jsonData string) interface{} {
 
 func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 	var cmd struct {
-		Type   string `json:"type"`
-		Group  string `json:"group"`
-		Member string `json:"member"`
-		Topic  string `json:"topic"`
+		Type       string   `json:"type"`
+		Group      string   `json:"group"`
+		Member     string   `json:"member"`
+		Members    []string `json:"members"`
+		Topic      string   `json:"topic"`
+		Generation *int     `json:"generation"`
 	}
 
 	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
@@ -248,7 +390,20 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 			return err
 		}
 	case "LEAVE":
-		_ = f.cd.RemoveConsumer(cmd.Group, cmd.Member)
+		if cmd.Generation == nil {
+			// Compatibility with metadata entries written before generation
+			// fencing was introduced.
+			return f.cd.RemoveConsumer(cmd.Group, cmd.Member)
+		}
+		return f.cd.RemoveConsumerForGeneration(cmd.Group, cmd.Member, *cmd.Generation)
+	case "EXPIRE":
+		if cmd.Generation == nil {
+			return fmt.Errorf("missing generation for group expiration")
+		}
+		if len(cmd.Members) == 0 {
+			return fmt.Errorf("missing members for group expiration")
+		}
+		return f.cd.ExpireConsumers(cmd.Group, *cmd.Generation, cmd.Members)
 	}
 
 	return nil

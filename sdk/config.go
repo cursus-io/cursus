@@ -1,4 +1,5 @@
 package sdk
+
 import (
 	"encoding/json"
 	"os"
@@ -37,6 +38,14 @@ type PublisherConfig struct {
 	UseTLS      bool   `yaml:"use_tls" json:"use_tls"`
 	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
 	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
+
+	Principal string `yaml:"principal" json:"principal"`
+	AuthToken string `yaml:"auth_token" json:"auth_token"`
+
+	ProtocolVersion              int      `yaml:"protocol_version" json:"protocol_version"`
+	ProtocolFeatures             []string `yaml:"protocol_features" json:"protocol_features"`
+	RequireProtocolFeatures      bool     `yaml:"require_protocol_features" json:"require_protocol_features"`
+	ProtocolNegotiationTimeoutMS int      `yaml:"protocol_negotiation_timeout_ms" json:"protocol_negotiation_timeout_ms"`
 
 	CompressionType string `yaml:"compression_type" json:"compression_type"` // "none", "gzip", "snappy", "lz4"
 
@@ -81,6 +90,21 @@ const (
 	ModeStreaming ConsumerMode = "streaming"
 )
 
+type AutoOffsetResetPolicy string
+
+const (
+	AutoOffsetResetEarliest AutoOffsetResetPolicy = "earliest"
+	AutoOffsetResetLatest   AutoOffsetResetPolicy = "latest"
+	AutoOffsetResetError    AutoOffsetResetPolicy = "error"
+)
+
+type ReadIsolation string
+
+const (
+	ReadCommitted   ReadIsolation = "read_committed"
+	ReadUncommitted ReadIsolation = "read_uncommitted"
+)
+
 type ConsumerConfig struct {
 	BrokerAddrs        []string `yaml:"broker_addrs" json:"broker_addrs"`
 	CurrentBrokerIndex int      `yaml:"-" json:"-"`
@@ -96,9 +120,11 @@ type ConsumerConfig struct {
 
 	WorkerChannelSize int `yaml:"worker_channel_size" json:"worker_channel_size"`
 
-	PollInterval  time.Duration `yaml:"poll_interval" json:"poll_interval"`
-	PollTimeoutMS int           `yaml:"poll_timeout_ms" json:"poll_timeout_ms"`
-	BatchSize     int           `yaml:"batch_size" json:"batch_size"`
+	PollInterval    time.Duration         `yaml:"poll_interval" json:"poll_interval"`
+	PollTimeoutMS   int                   `yaml:"poll_timeout_ms" json:"poll_timeout_ms"`
+	BatchSize       int                   `yaml:"batch_size" json:"batch_size"`
+	AutoOffsetReset AutoOffsetResetPolicy `yaml:"auto_offset_reset" json:"auto_offset_reset"`
+	ReadIsolation   ReadIsolation         `yaml:"read_isolation" json:"read_isolation"`
 
 	SessionTimeoutMS         int `yaml:"session_timeout_ms" json:"session_timeout_ms"`
 	MaxPollRecords           int `yaml:"max_poll_records" json:"max_poll_records"`
@@ -123,6 +149,14 @@ type ConsumerConfig struct {
 	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
 	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
 
+	Principal string `yaml:"principal" json:"principal"`
+	AuthToken string `yaml:"auth_token" json:"auth_token"`
+
+	ProtocolVersion              int      `yaml:"protocol_version" json:"protocol_version"`
+	ProtocolFeatures             []string `yaml:"protocol_features" json:"protocol_features"`
+	RequireProtocolFeatures      bool     `yaml:"require_protocol_features" json:"require_protocol_features"`
+	ProtocolNegotiationTimeoutMS int      `yaml:"protocol_negotiation_timeout_ms" json:"protocol_negotiation_timeout_ms"`
+
 	LeaderStaleness         time.Duration `yaml:"leader_staleness" json:"leader_staleness"`
 	MetadataRefreshInterval time.Duration `yaml:"metadata_refresh_interval" json:"metadata_refresh_interval"`
 
@@ -142,6 +176,8 @@ func NewDefaultConsumerConfig() *ConsumerConfig {
 		PollInterval:             500 * time.Millisecond,
 		PollTimeoutMS:            30000,
 		BatchSize:                100,
+		AutoOffsetReset:          AutoOffsetResetEarliest,
+		ReadIsolation:            ReadCommitted,
 		MaxPollRecords:           500,
 		EnableAutoCommit:         true,
 		AutoCommitInterval:       5 * time.Second,

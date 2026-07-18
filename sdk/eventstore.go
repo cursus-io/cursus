@@ -19,9 +19,7 @@ type Event struct {
 }
 
 // StreamEvent is an event read from a stream, with version and offset.
-// NOTE: Type, SchemaVersion, and Metadata are not yet populated by ReadStream
-// because the current batch wire format (EncodeBatchMessages) does not carry
-// event sourcing fields. These will be filled once the batch protocol is extended.
+// StreamEvent metadata is populated from the broker batch wire format.
 type StreamEvent struct {
 	Version       uint64
 	Offset        uint64
@@ -70,6 +68,10 @@ func NewEventStore(addr, topic, producerID string) *EventStore {
 
 // getConn returns an existing or new TCP connection.
 func (es *EventStore) getConn() (net.Conn, error) {
+	if err := validateSDKTopicName(es.topic); err != nil {
+		return nil, err
+	}
+
 	es.mu.Lock()
 	if es.conn != nil {
 		c := es.conn
@@ -129,12 +131,16 @@ func (es *EventStore) sendCommand(cmd string) (string, error) {
 
 // CreateTopic creates an event-sourcing-enabled topic if it doesn't exist.
 func (es *EventStore) CreateTopic(partitions int) error {
-	resp, err := es.sendCommand(fmt.Sprintf("CREATE topic=%s partitions=%d event_sourcing=true", es.topic, partitions))
+	resp, err := es.sendCommand(fmt.Sprintf("CREATE topic=%s partitions=%d event_sourcing=true cleanup_policy=delete", es.topic, partitions))
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(resp, "ERROR") {
-		return fmt.Errorf("broker: %s", resp)
+	respStr := strings.TrimSpace(resp)
+	if strings.HasPrefix(respStr, "ERROR:") {
+		return fmt.Errorf("broker: %s", respStr)
+	}
+	if !strings.HasPrefix(respStr, "OK") {
+		return fmt.Errorf("unexpected create response: %s", respStr)
 	}
 	return nil
 }
@@ -147,8 +153,9 @@ func (es *EventStore) Append(key string, expectedVersion uint64, event *Event) (
 		sv = 1
 	}
 
+	nextVersion := expectedVersion + 1
 	cmd := fmt.Sprintf("APPEND_STREAM topic=%s key=%s version=%d event_type=%s schema_version=%d producerId=%s",
-		es.topic, key, expectedVersion, event.Type, sv, es.producerID)
+		es.topic, key, nextVersion, event.Type, sv, es.producerID)
 	if event.Metadata != "" {
 		cmd += fmt.Sprintf(" metadata=%s", event.Metadata)
 	}
@@ -163,28 +170,60 @@ func (es *EventStore) Append(key string, expectedVersion uint64, event *Event) (
 		return nil, fmt.Errorf("broker: %s", resp)
 	}
 
-	return parseAppendResponse(resp), nil
+	result, err := parseAppendResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // parseAppendResponse parses "OK version=N offset=N partition=N" into AppendResult.
-func parseAppendResponse(resp string) *AppendResult {
+func parseAppendResponse(resp string) (*AppendResult, error) {
+	respStr := strings.TrimSpace(resp)
+	if strings.HasPrefix(respStr, "ERROR:") {
+		return nil, fmt.Errorf("broker: %s", respStr)
+	}
+	if !strings.HasPrefix(respStr, "OK") {
+		return nil, fmt.Errorf("unexpected append response: %s", respStr)
+	}
+
 	result := &AppendResult{}
-	parts := strings.Fields(resp)
-	for _, p := range parts {
+	hasVersion := false
+	hasOffset := false
+	hasPartition := false
+	for _, p := range strings.Fields(respStr) {
 		kv := strings.SplitN(p, "=", 2)
 		if len(kv) != 2 {
 			continue
 		}
 		switch kv[0] {
 		case "version":
-			result.Version, _ = strconv.ParseUint(kv[1], 10, 64)
+			v, err := strconv.ParseUint(kv[1], 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid append version in response: %s", respStr)
+			}
+			result.Version = v
+			hasVersion = true
 		case "offset":
-			result.Offset, _ = strconv.ParseUint(kv[1], 10, 64)
+			o, err := strconv.ParseUint(kv[1], 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid append offset in response: %s", respStr)
+			}
+			result.Offset = o
+			hasOffset = true
 		case "partition":
-			result.Partition, _ = strconv.Atoi(kv[1])
+			partition, err := strconv.Atoi(kv[1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid append partition in response: %s", respStr)
+			}
+			result.Partition = partition
+			hasPartition = true
 		}
 	}
-	return result
+	if !hasVersion || !hasOffset || !hasPartition {
+		return nil, fmt.Errorf("missing append fields in response: %s", respStr)
+	}
+	return result, nil
 }
 
 // ReadStream reads all events for an aggregate, automatically using snapshots.
@@ -219,11 +258,22 @@ func (es *EventStore) ReadStreamFrom(key string, fromVersion uint64) (*StreamDat
 	}
 
 	var envelope struct {
+		Status   string    `json:"status"`
+		Error    string    `json:"error"`
 		Snapshot *Snapshot `json:"snapshot"`
 		Count    int       `json:"count"`
 	}
 	if err := json.Unmarshal(envData, &envelope); err != nil {
 		return nil, fmt.Errorf("unmarshal envelope: %w", err)
+	}
+	if envelope.Status == "ERROR" {
+		if envelope.Error == "" {
+			envelope.Error = "read stream failed"
+		}
+		return nil, fmt.Errorf("broker: %s", envelope.Error)
+	}
+	if envelope.Status != "OK" {
+		return nil, fmt.Errorf("unexpected read stream status: %s", envelope.Status)
 	}
 
 	// Frame 2: Binary batch
@@ -266,8 +316,12 @@ func (es *EventStore) SaveSnapshot(key string, version uint64, payload string) e
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(resp, "ERROR") {
-		return fmt.Errorf("broker: %s", resp)
+	respStr := strings.TrimSpace(resp)
+	if strings.HasPrefix(respStr, "ERROR:") {
+		return fmt.Errorf("broker: %s", respStr)
+	}
+	if !strings.HasPrefix(respStr, "OK") {
+		return fmt.Errorf("unexpected save snapshot response: %s", respStr)
 	}
 	return nil
 }
@@ -278,15 +332,17 @@ func (es *EventStore) ReadSnapshot(key string) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	if resp == "NULL" || strings.Contains(resp, "NOT_FOUND") {
-		return nil, nil
+	respStr := strings.TrimSpace(resp)
+	snapshotJSON, ok, err := parseSnapshotResponse(respStr)
+	if err != nil {
+		return nil, err
 	}
-	if strings.HasPrefix(resp, "ERROR") {
-		return nil, fmt.Errorf("broker: %s", resp)
+	if !ok {
+		return nil, nil
 	}
 
 	var snap Snapshot
-	if err := json.Unmarshal([]byte(resp), &snap); err != nil {
+	if err := json.Unmarshal([]byte(snapshotJSON), &snap); err != nil {
 		return nil, fmt.Errorf("unmarshal snapshot: %w", err)
 	}
 	return &snap, nil
@@ -298,11 +354,40 @@ func (es *EventStore) StreamVersion(key string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	v, err := strconv.ParseUint(strings.TrimSpace(resp), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse version: %w", err)
+	respStr := strings.TrimSpace(resp)
+	return parseStreamVersionResponse(respStr)
+}
+
+func parseSnapshotResponse(respStr string) (string, bool, error) {
+	if strings.HasPrefix(respStr, "ERROR:") {
+		return "", false, fmt.Errorf("broker: %s", respStr)
 	}
-	return v, nil
+	if respStr == "OK snapshot=null" {
+		return "", false, nil
+	}
+	if strings.HasPrefix(respStr, "OK snapshot=") {
+		return strings.TrimPrefix(respStr, "OK snapshot="), true, nil
+	}
+	return "", false, fmt.Errorf("unexpected snapshot response: %s", respStr)
+}
+
+func parseStreamVersionResponse(respStr string) (uint64, error) {
+	if strings.HasPrefix(respStr, "ERROR:") {
+		return 0, fmt.Errorf("broker: %s", respStr)
+	}
+	if !strings.HasPrefix(respStr, "OK") {
+		return 0, fmt.Errorf("unexpected version response: %s", respStr)
+	}
+	for _, part := range strings.Fields(respStr) {
+		if strings.HasPrefix(part, "version=") {
+			v, err := strconv.ParseUint(strings.TrimPrefix(part, "version="), 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("parse version: %w", err)
+			}
+			return v, nil
+		}
+	}
+	return 0, fmt.Errorf("missing version in response: %s", respStr)
 }
 
 // Close closes the underlying connection.

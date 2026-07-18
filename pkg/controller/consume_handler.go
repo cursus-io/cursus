@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -15,10 +16,23 @@ import (
 	"github.com/cursus-io/cursus/util"
 )
 
+var ErrStreamRejected = errors.New("stream rejected")
+
+const (
+	ReadIsolationCommitted   = "read_committed"
+	ReadIsolationUncommitted = "read_uncommitted"
+)
+
 // HandleConsumeCommand is responsible for parsing the CONSUME command and streaming messages.
 func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx *ClientContext) (int, error) {
 	// CONSUME topic=<name> partition=<N> offset=<N> group=<name> [autoOffsetReset=<earliest|latest>]
 	argsMap := parseKeyValueArgs(rawCmd[8:])
+	if authResp := ch.authenticateInline(argsMap, ctx); authResp != "" {
+		return 0, fmt.Errorf("%s", authResp)
+	}
+	if authResp := ch.authorizeClientPermissions("CONSUME", argsMap, ctx, PermissionTopicRead, PermissionGroup); authResp != "" {
+		return 0, fmt.Errorf("%s", authResp)
+	}
 	if err := ch.validateConsumeArgs(argsMap); err != nil {
 		return 0, err
 	}
@@ -53,6 +67,9 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 		remainingBatch := cArgs.BatchSize - totalStreamed
 		messages, err := ch.readFromTopic(tName, cArgs, ctx, remainingBatch)
 		if err != nil {
+			if ch.writeConsumeReadError(conn, err) {
+				return totalStreamed, nil
+			}
 			return totalStreamed, err
 		}
 		if len(messages) > 0 {
@@ -71,6 +88,9 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 			for _, tName := range matchedTopics {
 				messages, err := ch.readFromTopic(tName, cArgs, ctx, cArgs.BatchSize)
 				if err != nil {
+					if ch.writeConsumeReadError(conn, err) {
+						return 0, nil
+					}
 					return 0, err
 				}
 				if len(messages) > 0 {
@@ -95,17 +115,30 @@ sendBatch:
 	return totalStreamed, nil
 }
 
+func (ch *CommandHandler) writeConsumeReadError(conn net.Conn, err error) bool {
+	var offsetErr *types.OffsetOutOfRangeError
+	if !errors.As(err, &offsetErr) {
+		return false
+	}
+
+	resp := fmt.Sprintf("ERROR: OFFSET_OUT_OF_RANGE requested=%d earliest=%d latest=%d", offsetErr.Requested, offsetErr.Earliest, offsetErr.Latest)
+	if writeErr := util.WriteWithLength(conn, []byte(resp)); writeErr != nil {
+		util.Error("failed to send offset out-of-range response: %v", writeErr)
+	}
+	return true
+}
 func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx *ClientContext, batchSize int) ([]types.Message, error) {
-	_, p, err := ch.getTopicAndPartition(topicName, cArgs.PartitionID)
+	t, p, err := ch.getTopicAndPartition(topicName, cArgs.PartitionID)
 	if err != nil {
 		return nil, err
+	}
+	if authResp := ch.authorizeTopicRead(t.Policy, ctx); authResp != "" {
+		return nil, fmt.Errorf("%s topic=%s", authResp, topicName)
 	}
 
 	cacheKey := fmt.Sprintf("%s-%d", topicName, cArgs.PartitionID)
 	var currentOffset uint64
-	if cArgs.HasOffset {
-		currentOffset = cArgs.Offset
-	} else if cached, ok := ctx.OffsetCache[cacheKey]; ok {
+	if cached, ok := ctx.OffsetCache[cacheKey]; ok {
 		currentOffset = cached
 	} else {
 		actualOffset, err := ch.resolveOffset(p, topicName, cArgs)
@@ -115,7 +148,7 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 		currentOffset = actualOffset
 	}
 
-	messages, err := p.ReadCommitted(currentOffset, batchSize)
+	messages, err := readPartitionMessages(p, currentOffset, batchSize, cArgs.ReadIsolation)
 	if err != nil {
 		util.Error("Failed to read messages from topic %s: %v", topicName, err)
 		return nil, err
@@ -172,6 +205,12 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	}
 
 	argsMap := parseKeyValueArgs(rawCmd[7:])
+	if authResp := ch.authenticateInline(argsMap, ctx); authResp != "" {
+		return fmt.Errorf("%s", authResp)
+	}
+	if authResp := ch.authorizeClientPermissions("STREAM", argsMap, ctx, PermissionTopicRead, PermissionGroup); authResp != "" {
+		return fmt.Errorf("%s", authResp)
+	}
 	if err := ch.validateStreamArgs(argsMap); err != nil {
 		return err
 	}
@@ -183,13 +222,9 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 
 	if err := ch.checkPartitionLeaderOrRedirect(conn, cArgs.TopicName, cArgs.PartitionID); err != nil {
 		if err.Error() == "not partition leader" {
-			return nil
+			return ErrStreamRejected
 		}
 		return err
-	}
-
-	if !ch.ValidateOwnership(ctx.ConsumerGroup, cArgs.MemberID, cArgs.Generation, cArgs.PartitionID) {
-		return fmt.Errorf("not partition owner or generation mismatch")
 	}
 
 	ctx.Generation = cArgs.Generation
@@ -198,6 +233,9 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	t, p, err := ch.getTopicAndPartition(cArgs.TopicName, cArgs.PartitionID)
 	if err != nil {
 		return err
+	}
+	if authResp := ch.authorizeTopicRead(t.Policy, ctx); authResp != "" {
+		return fmt.Errorf("%s topic=%s", authResp, cArgs.TopicName)
 	}
 
 	actualOffset, err := ch.resolveOffset(p, cArgs.TopicName, cArgs)
@@ -209,9 +247,6 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	streamConn := stream.NewStreamConnection(conn, cArgs.TopicName, cArgs.PartitionID, cArgs.GroupName, actualOffset)
 	streamConn.SetBatchSize(cArgs.BatchSize)
 	streamConn.SetInterval(100 * time.Millisecond)
-	if ch.Coordinator != nil {
-		streamConn.SetCommitter(ch.Coordinator)
-	}
 
 	// Pass partition's message signal for event-driven streaming
 	signalCh := t.NewMessageSignal(cArgs.PartitionID)
@@ -220,16 +255,26 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	}
 
 	readFn := func(offset uint64, max int) ([]types.Message, error) {
-		return p.ReadCommitted(offset, max)
+		return readPartitionMessages(p, offset, max, cArgs.ReadIsolation)
 	}
 
-	return ch.StreamManager.AddStream(streamKey, streamConn, readFn, ch.Config.StreamCommitInterval)
+	return ch.StreamManager.AddStream(streamKey, streamConn, readFn, 0)
+}
+
+func readPartitionMessages(p *topic.Partition, offset uint64, max int, isolation string) ([]types.Message, error) {
+	if isolation == ReadIsolationUncommitted {
+		return p.ReadMessages(offset, max)
+	}
+	return p.ReadCommitted(offset, max)
 }
 
 func (ch *CommandHandler) validateStreamSyntax(cmd, raw string) string {
 	args := parseKeyValueArgs(cmd[7:])
 	if args["topic"] == "" || args["partition"] == "" || args["group"] == "" {
-		return ch.fail(raw, "ERROR: invalid STREAM syntax")
+		return ch.fail(raw, "ERROR: invalid_stream_syntax")
+	}
+	if err := validateReadIsolation(args["isolation"]); err != nil {
+		return ch.fail(raw, "ERROR: "+err.Error())
 	}
 	return STREAM_DATA_SIGNAL
 }
@@ -237,7 +282,10 @@ func (ch *CommandHandler) validateStreamSyntax(cmd, raw string) string {
 func (ch *CommandHandler) validateConsumeSyntax(cmd, raw string) string {
 	args := parseKeyValueArgs(cmd[8:])
 	if args["topic"] == "" || args["partition"] == "" || args["offset"] == "" || args["member"] == "" {
-		return ch.fail(raw, "ERROR: invalid CONSUME syntax")
+		return ch.fail(raw, "ERROR: invalid_consume_syntax")
+	}
+	if err := validateReadIsolation(args["isolation"]); err != nil {
+		return ch.fail(raw, "ERROR: "+err.Error())
 	}
 	return STREAM_DATA_SIGNAL
 }
@@ -297,6 +345,10 @@ func (ch *CommandHandler) checkLeaderOrRedirect(conn net.Conn) error {
 }
 
 func (ch *CommandHandler) getTopicAndPartition(topicName string, partitionID int) (*topic.Topic, *topic.Partition, error) {
+	if ch.TopicManager == nil {
+		return nil, nil, fmt.Errorf("topic_manager_not_available")
+	}
+
 	t := ch.TopicManager.GetTopic(topicName)
 	if t == nil {
 		return nil, nil, fmt.Errorf("topic '%s' does not exist", topicName)
@@ -328,6 +380,7 @@ type CommonArgs struct {
 	BatchSize       int
 	WaitTimeout     time.Duration
 	AutoOffsetReset string
+	ReadIsolation   string
 }
 
 func (ch *CommandHandler) parseCommonArgs(args map[string]string) (CommonArgs, error) {
@@ -377,31 +430,55 @@ func (ch *CommandHandler) parseCommonArgs(args map[string]string) (CommonArgs, e
 		BatchSize:       batch,
 		WaitTimeout:     wait,
 		AutoOffsetReset: strings.ToLower(args["autoOffsetReset"]),
+		ReadIsolation:   normalizeReadIsolation(args["isolation"]),
 	}, nil
+}
+
+func normalizeReadIsolation(value string) string {
+	value = strings.ToLower(value)
+	if value == "" {
+		return ReadIsolationCommitted
+	}
+	return value
 }
 
 func (ch *CommandHandler) validateConsumeArgs(args map[string]string) error {
 	if args["topic"] == "" {
-		return fmt.Errorf("missing topic parameter")
+		return fmt.Errorf("missing_topic")
 	}
 	if args["partition"] == "" {
-		return fmt.Errorf("missing partition parameter")
+		return fmt.Errorf("missing_partition")
 	}
 	if args["offset"] == "" {
-		return fmt.Errorf("missing offset parameter")
+		return fmt.Errorf("missing_offset")
 	}
 	if args["member"] == "" {
-		return fmt.Errorf("missing member parameter")
+		return fmt.Errorf("missing_member")
+	}
+	if err := validateReadIsolation(args["isolation"]); err != nil {
+		return err
 	}
 	return nil
 }
 
 func (ch *CommandHandler) validateStreamArgs(args map[string]string) error {
 	if args["topic"] == "" {
-		return fmt.Errorf("missing topic parameter")
+		return fmt.Errorf("missing_topic")
 	}
 	if args["partition"] == "" {
-		return fmt.Errorf("missing partition parameter")
+		return fmt.Errorf("missing_partition")
+	}
+	if err := validateReadIsolation(args["isolation"]); err != nil {
+		return err
 	}
 	return nil
+}
+
+func validateReadIsolation(value string) error {
+	switch normalizeReadIsolation(value) {
+	case ReadIsolationCommitted, ReadIsolationUncommitted:
+		return nil
+	default:
+		return fmt.Errorf("invalid_isolation isolation=%s", value)
+	}
 }

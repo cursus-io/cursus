@@ -48,12 +48,11 @@ func (cfg *Config) Normalize() {
 	}
 
 	// log segment & retention
-	cfg.CleanupPolicy = strings.ToLower(strings.TrimSpace(cfg.CleanupPolicy))
-	switch cfg.CleanupPolicy {
-	case "delete", "compact":
-	default:
+	if normalized, ok := NormalizeCleanupPolicy(cfg.CleanupPolicy); ok {
+		cfg.CleanupPolicy = normalized
+	} else {
 		util.Warn("Invalid cleanup_policy '%s', defaulting to 'delete'", cfg.CleanupPolicy)
-		cfg.CleanupPolicy = "delete"
+		cfg.CleanupPolicy = CleanupPolicyDelete
 	}
 	if cfg.CleanupInterval <= 0 {
 		cfg.CleanupInterval = 300
@@ -101,6 +100,9 @@ func (cfg *Config) Normalize() {
 	}
 
 	// distributed cluster
+	if cfg.InternalBrokerPort < 0 {
+		cfg.InternalBrokerPort = 0
+	}
 	if cfg.RaftPort <= 0 {
 		cfg.RaftPort = 9001
 	}
@@ -112,6 +114,13 @@ func (cfg *Config) Normalize() {
 	}
 	if cfg.MinInSyncReplicas <= 0 {
 		cfg.MinInSyncReplicas = 2
+	}
+
+	if cfg.ProducerStateTTLMS <= 0 {
+		cfg.ProducerStateTTLMS = 30 * 60 * 1000
+	}
+	if cfg.TransactionalIDExpirationMS <= 0 {
+		cfg.TransactionalIDExpirationMS = 7 * 24 * 60 * 60 * 1000
 	}
 
 	// consumer
@@ -211,5 +220,26 @@ func overrideEnvStringSlice(target *[]string, key string) {
 			}
 		}
 		*target = result
+	}
+}
+
+func overrideEnvSASLUsers(target *[]SASLUser, key string) {
+	if v := os.Getenv(key); v != "" {
+		entries := strings.Split(v, ",")
+		users := make([]SASLUser, 0, len(entries))
+		for _, entry := range entries {
+			parts := strings.SplitN(strings.TrimSpace(entry), ":", 2)
+			principal := strings.TrimSpace(parts[0])
+			token := ""
+			if len(parts) == 2 {
+				token = strings.TrimSpace(parts[1])
+			}
+			if len(parts) != 2 || principal == "" || token == "" {
+				util.Warn("Skipping invalid %s entry %q (expected principal:token)", key, entry)
+				continue
+			}
+			users = append(users, SASLUser{Principal: principal, Token: token})
+		}
+		*target = users
 	}
 }

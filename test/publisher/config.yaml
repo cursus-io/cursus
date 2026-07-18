@@ -6,18 +6,20 @@ log_level: "info" # debug, info, warn, error
 # Performance
 num_messages: 100000
 partitions: 12
-max_inflight_requests: 10
-batch_size: 10000
-buffer_size: 70000
-linger_ms: 100
+max_inflight_requests: 20
+batch_size: 1000
+buffer_size: 100000
+linger_ms: 50
 
 # Idempotency
 acks: "1" # "0" (no ack), "1" (leader only), "all" or "-1" (quorum)
-enable_idempotence: false
+enable_idempotence: true
 
 # Retry
-max_retries: 3
-retry_backoff_ms: 100
+max_retries: 5
+retry_backoff_ms: 200
+ack_timeout_ms: 30000
 
 # Benchmark
 enable_benchmark: true
+flush_timeout_ms: 300000

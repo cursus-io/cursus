@@ -175,6 +175,14 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 		}
 
 		respStr := strings.TrimSpace(string(respBuf))
+		if redirectAddr, ok := parseNotCoordinator(respStr); ok {
+			bc.closeInternal()
+			bc.preferAddr(redirectAddr)
+			lastErr = fmt.Errorf("broker error: %s", respStr)
+			util.Debug("Coordinator moved to %s, retrying (%d/%d)", redirectAddr, i, maxRetries)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
 		if strings.Contains(respStr, "NOT_AUTHORIZED_FOR_PARTITION") {
 			bc.closeInternal()
 			bc.rotateAddrs()
@@ -187,6 +195,38 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 		return respStr, nil
 	}
 	return "", fmt.Errorf("command failed after retries: %w", lastErr)
+}
+
+func parseNotCoordinator(resp string) (string, bool) {
+	if !strings.Contains(resp, "NOT_COORDINATOR") {
+		return "", false
+	}
+	host := ""
+	port := ""
+	for _, part := range strings.Fields(resp) {
+		if strings.HasPrefix(part, "host=") {
+			host = strings.TrimPrefix(part, "host=")
+		} else if strings.HasPrefix(part, "port=") {
+			port = strings.TrimPrefix(part, "port=")
+		}
+	}
+	if host == "" || port == "" {
+		return "", false
+	}
+	return net.JoinHostPort(host, port), true
+}
+
+func (bc *BrokerClient) preferAddr(addr string) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	next := []string{addr}
+	for _, existing := range bc.addrs {
+		if existing != addr {
+			next = append(next, existing)
+		}
+	}
+	bc.addrs = next
 }
 
 func (bc *BrokerClient) closeInternal() {

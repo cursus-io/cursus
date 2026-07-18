@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -30,11 +31,26 @@ func main() {
 		os.Exit(1)
 	}
 	tm := topic.NewTopicManager(cfg, dm, smAdapter)
+	if err := tm.RestoreTopics(); err != nil {
+		fmt.Println("❌ Failed to restore durable topic metadata:", err)
+		os.Exit(1)
+	}
 	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
 	tm.SetCoordinator(cd)
 
 	ctx := controller.NewClientContext("default-group", 0)
 	ch := controller.NewCommandHandler(tm, cfg, cd, sm, nil)
+	if !cfg.EnabledDistribution {
+		journalPath := filepath.Join(cfg.LogDir, "__transaction_state.journal")
+		if err := ch.ConfigureTransactionJournal(journalPath); err != nil {
+			fmt.Println("❌ Failed to initialize transaction journal:", err)
+			os.Exit(1)
+		}
+	}
+	if err := ch.RecoverPreparedTransactions(); err != nil {
+		fmt.Println("❌ Failed to recover prepared transactions:", err)
+		os.Exit(1)
+	}
 
 	fmt.Println("🔹 Broker ready. Type HELP for commands.")
 	fmt.Println("")

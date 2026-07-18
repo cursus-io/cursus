@@ -89,3 +89,63 @@ func TestDiskManager_CloseAllHandlers(t *testing.T) {
 		}
 	}
 }
+
+func TestDiskManager_CloseTopicHandlers_DoesNotCloseTopicPrefix(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		LogDir:              tmpDir,
+		LingerMS:            50,
+		DiskFlushBatchSize:  10,
+		DiskFlushIntervalMS: 50,
+		DiskWriteTimeoutMS:  500,
+		SegmentRollTimeMS:   60000,
+		ChannelBufferSize:   100,
+	}
+
+	dm := disk.NewDiskManager(cfg)
+	orders, err := dm.GetHandler("orders", 0)
+	if err != nil {
+		t.Fatalf("GetHandler orders failed: %v", err)
+	}
+	ordersV2, err := dm.GetHandler("orders_v2", 0)
+	if err != nil {
+		t.Fatalf("GetHandler orders_v2 failed: %v", err)
+	}
+	defer dm.CloseAllHandlers()
+
+	dm.CloseTopicHandlers("orders")
+
+	ordersAfterClose, err := dm.GetHandler("orders", 0)
+	if err != nil {
+		t.Fatalf("GetHandler orders after close failed: %v", err)
+	}
+	if ordersAfterClose == orders {
+		t.Fatalf("expected orders handler to be closed and recreated")
+	}
+
+	ordersV2AfterClose, err := dm.GetHandler("orders_v2", 0)
+	if err != nil {
+		t.Fatalf("GetHandler orders_v2 after close failed: %v", err)
+	}
+	if ordersV2AfterClose != ordersV2 {
+		t.Fatalf("expected orders_v2 handler to remain open when closing orders")
+	}
+}
+
+func TestDiskManagerExistingPartitionCount(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	dm := disk.NewDiskManager(cfg)
+	defer dm.CloseAllHandlers()
+
+	if _, err := dm.GetHandler("__consumer_offsets", 7); err != nil {
+		t.Fatalf("create persisted partition: %v", err)
+	}
+	count, err := dm.ExistingPartitionCount("__consumer_offsets")
+	if err != nil {
+		t.Fatalf("discover persisted partitions: %v", err)
+	}
+	if count != 8 {
+		t.Fatalf("unexpected partition count: got %d want 8", count)
+	}
+}
