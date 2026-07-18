@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"encoding/json"
+	"net"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -1052,4 +1053,114 @@ func TestProducer_Extract_PreservesOrder(t *testing.T) {
 	assert.Equal(t, uint64(50), batch2[1].SeqNum)
 
 	assert.Empty(t, buf.msgs)
+}
+
+type producerDrainBrokerResult struct {
+	messages []Message
+	err      error
+}
+
+func newProducerDrainTestHarness(t *testing.T) (*Producer, <-chan producerDrainBrokerResult) {
+	t.Helper()
+
+	cfg := NewDefaultPublisherConfig()
+	cfg.Topic = "producer-drain-test"
+	cfg.Partitions = 1
+	cfg.BatchSize = 100
+	cfg.BufferSize = 10
+	cfg.LingerMS = int(time.Hour / time.Millisecond)
+	cfg.FlushTimeoutMS = 2_000
+	cfg.MaxRetries = 0
+	cfg.EnableIdempotence = false
+
+	client := mustNewProducerClient(cfg)
+	brokerConn, producerConn := net.Pipe()
+	connections := []net.Conn{producerConn}
+	client.conns.Store(&connections)
+
+	p := &Producer{
+		config:               cfg,
+		client:               client,
+		partitions:           1,
+		buffers:              []*partitionBuffer{newPartitionBuffer()},
+		inFlight:             make([]int32, 1),
+		partitionSentMus:     make([]sync.Mutex, 1),
+		partitionSentSeqs:    []map[uint64]struct{}{{}},
+		partitionBatchStates: []map[string]*BatchState{{}},
+		partitionBatchMus:    make([]sync.Mutex, 1),
+		gcTicker:             time.NewTicker(time.Hour),
+		partitionLeaders:     make(map[int]string),
+		done:                 make(chan struct{}),
+		bmTotalTime:          make(map[int]time.Duration),
+		bmTotalCount:         make(map[int]int),
+		bmLatencies:          make([]time.Duration, 0),
+	}
+
+	p.sendersWG.Add(1)
+	go p.partitionSender(0)
+
+	resultCh := make(chan producerDrainBrokerResult, 1)
+	go func() {
+		payload, err := ReadWithLength(brokerConn)
+		if err != nil {
+			resultCh <- producerDrainBrokerResult{err: err}
+			return
+		}
+		messages, _, _, err := DecodeBatchMessages(payload)
+		if err != nil {
+			resultCh <- producerDrainBrokerResult{err: err}
+			return
+		}
+		ack, err := json.Marshal(AckResponse{Status: "OK"})
+		if err == nil {
+			err = WriteWithLength(brokerConn, ack)
+		}
+		resultCh <- producerDrainBrokerResult{messages: messages, err: err}
+	}()
+
+	t.Cleanup(func() {
+		_ = p.Close()
+		_ = brokerConn.Close()
+	})
+	return p, resultCh
+}
+
+func TestProducerFlushDrainsPartialBatchWithoutWaitingForLinger(t *testing.T) {
+	p, resultCh := newProducerDrainTestHarness(t)
+
+	_, err := p.Send("flush-now")
+	require.NoError(t, err)
+
+	started := time.Now()
+	p.Flush()
+	require.Less(t, time.Since(started), 2*time.Second)
+
+	select {
+	case result := <-resultCh:
+		require.NoError(t, result.err)
+		require.Len(t, result.messages, 1)
+		assert.Equal(t, "flush-now", result.messages[0].Payload)
+	case <-time.After(time.Second):
+		t.Fatal("Flush returned before the broker acknowledged the partial batch")
+	}
+}
+
+func TestProducerCloseDrainsPartialBatchWithoutWaitingForLinger(t *testing.T) {
+	p, resultCh := newProducerDrainTestHarness(t)
+
+	_, err := p.Send("close-now")
+	require.NoError(t, err)
+
+	started := time.Now()
+	require.NoError(t, p.Close())
+	require.Less(t, time.Since(started), 2*time.Second)
+
+	select {
+	case result := <-resultCh:
+		require.NoError(t, result.err)
+		require.Len(t, result.messages, 1)
+		assert.Equal(t, "close-now", result.messages[0].Payload)
+	case <-time.After(time.Second):
+		t.Fatal("Close returned before the broker acknowledged the partial batch")
+	}
 }
