@@ -193,6 +193,18 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		f.producerState = make(map[string]map[int]map[string]int64)
 	}
 
+	if f.logs == nil {
+		f.logs = make(map[uint64]*ReplicationEntry)
+	}
+	if f.brokers == nil {
+		f.brokers = make(map[string]*BrokerInfo)
+	}
+	if f.partitionMetadata == nil {
+		f.partitionMetadata = make(map[string]*PartitionMetadata)
+	}
+	if f.notifiers == nil {
+		f.notifiers = make(map[string]chan interface{})
+	}
 	if state.GroupState != nil && f.cd != nil {
 		f.cd.ImportState(state.GroupState)
 		util.Info("FSM Restore: Restored %d consumer groups from snapshot", len(state.GroupState))
