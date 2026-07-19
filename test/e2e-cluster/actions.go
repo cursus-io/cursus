@@ -10,7 +10,6 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/test/e2e"
-	"github.com/cursus-io/cursus/util"
 )
 
 // ClusterActions represents cluster-specific test actions
@@ -210,34 +209,28 @@ func (a *ClusterActions) DescribeTopic() *ClusterActions {
 
 func (a *ClusterActions) WaitForTopicMetadata() *ClusterActions {
 	topic := a.ctx.GetTopic()
-	a.ctx.GetT().Logf("Waiting for topic metadata to propagate: %s", topic)
-
 	addrs := a.ctx.GetBrokerAddrs()
-
-	for i := 0; i < 60; i++ {
+	if err := eventually(a.ctx.GetT(), fmt.Sprintf("topic metadata for %s", topic), clusterReadyTimeout, func() (bool, string, error) {
+		lastDetail := "no broker returned metadata"
 		for _, addr := range addrs {
 			tempClient := e2e.NewBrokerClient([]string{addr})
-			cmd := fmt.Sprintf("DESCRIBE topic=%s", topic)
-			resp, err := tempClient.SendCommand("", cmd, 2*time.Second)
+			resp, err := tempClient.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topic), 2*time.Second)
 			tempClient.Close()
-
-			if err == nil &&
-				!strings.Contains(resp, "not found") &&
-				!strings.Contains(resp, "ERROR:") &&
-				strings.Contains(resp, topic) &&
-				strings.Contains(resp, "{") {
-				a.ctx.GetT().Logf("Topic metadata for '%s' is now available on node %s", topic, addr)
-				return a
+			if err != nil {
+				lastDetail = fmt.Sprintf("%s: %v", addr, err)
+				continue
 			}
-			util.Debug("Still waiting for metadata on %s: resp=%s, err=%v", addr, resp, err)
+			if !strings.Contains(resp, "not found") && !strings.Contains(resp, "ERROR:") && strings.Contains(resp, topic) && strings.Contains(resp, "{") {
+				return true, fmt.Sprintf("available on %s", addr), nil
+			}
+			lastDetail = fmt.Sprintf("%s: %s", addr, resp)
 		}
-		time.Sleep(1 * time.Second)
+		return false, lastDetail, nil
+	}); err != nil {
+		a.ctx.GetT().Fatal(err)
 	}
-
-	a.ctx.GetT().Fatalf("Timed out waiting for topic metadata to propagate for topic %s", topic)
 	return a
 }
-
 func (a *ClusterActions) SimulateLeaderFailure() (int, *ClusterActions) {
 	topic := a.ctx.GetTopic()
 	a.ctx.GetT().Logf("Simulating leader failure for topic: %s", topic)
