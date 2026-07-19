@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -62,9 +63,11 @@ type Producer struct {
 	partitionLeaders map[int]string
 	partitionMu      sync.RWMutex
 
-	done    chan struct{}
-	closed  int32
-	closeMu sync.Mutex
+	done      chan struct{}
+	closed    int32
+	closeMu   sync.Mutex
+	closeDone chan struct{}
+	closeErr  error
 
 	bmMu         sync.Mutex
 	bmTotalTime  map[int]time.Duration
@@ -73,6 +76,13 @@ type Producer struct {
 }
 
 func NewProducer(cfg *PublisherConfig) (*Producer, error) {
+	return NewProducerWithContext(context.Background(), cfg)
+}
+
+func NewProducerWithContext(ctx context.Context, cfg *PublisherConfig) (*Producer, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("producer context must not be nil")
+	}
 	if cfg == nil {
 		return nil, fmt.Errorf("publisher config is required")
 	}
@@ -94,6 +104,7 @@ func NewProducer(cfg *PublisherConfig) (*Producer, error) {
 		partitions:       cfg.Partitions,
 		buffers:          make([]*partitionBuffer, cfg.Partitions),
 		done:             make(chan struct{}),
+		closeDone:        make(chan struct{}),
 		bmTotalTime:      make(map[int]time.Duration),
 		bmTotalCount:     make(map[int]int),
 		bmLatencies:      make([]time.Duration, 0),
@@ -133,11 +144,25 @@ func NewProducer(cfg *PublisherConfig) (*Producer, error) {
 		go p.partitionSender(i)
 	}
 	if connectedCount == 0 {
+		if closeErr := p.Close(); closeErr != nil {
+			LogWarn("failed to clean up producer after connection failure: %v", closeErr)
+		}
 		return nil, fmt.Errorf("failed to connect to any partition")
 	}
 
 	go p.batchStateGC()
+	p.closeOnContext(ctx)
 	return p, nil
+}
+
+func (p *Producer) closeOnContext(ctx context.Context) {
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = p.Close()
+		case <-p.done:
+		}
+	}()
 }
 
 func (p *Producer) fetchMetadata() {
@@ -728,15 +753,28 @@ func (p *Producer) batchStateGC() {
 	}
 }
 
-func (p *Producer) Close() error {
+func (p *Producer) Close() (result error) {
 	p.closeMu.Lock()
+	if p.closeDone == nil {
+		p.closeDone = make(chan struct{})
+	}
 	if atomic.LoadInt32(&p.closed) == 1 {
+		closeDone := p.closeDone
 		p.closeMu.Unlock()
-		return nil
+		<-closeDone
+		p.closeMu.Lock()
+		defer p.closeMu.Unlock()
+		return p.closeErr
 	}
 	atomic.StoreInt32(&p.closed, 1)
 	waiters := p.requestDrain(true)
 	p.closeMu.Unlock()
+	defer func() {
+		p.closeMu.Lock()
+		p.closeErr = result
+		close(p.closeDone)
+		p.closeMu.Unlock()
+	}()
 
 	timeout := p.flushTimeout()
 	drained := waitForDrain(waiters, timeout)

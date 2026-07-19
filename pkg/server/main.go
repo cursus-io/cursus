@@ -38,7 +38,15 @@ const (
 
 // RunServer starts the broker with optional TLS and gzip
 func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager, cd *coordinator.Coordinator, sm *stream.StreamManager) error {
-	ctx, cancel := context.WithCancel(context.Background())
+	return RunServerContext(context.Background(), cfg, tm, dm, cd, sm)
+}
+
+// RunServerContext starts the broker and shuts it down when ctx is canceled.
+func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager, cd *coordinator.Coordinator, sm *stream.StreamManager) error {
+	if ctx == nil {
+		return fmt.Errorf("server context must not be nil")
+	}
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	addr := fmt.Sprintf(":%d", cfg.BrokerPort)
@@ -58,6 +66,7 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 	}
 
 	defer func() { _ = ln.Close() }()
+	go closeListenerOnDone(ctx, ln)
 	util.Info("🧩 Broker listening on %s (TLS=%v, Compression=%v)", addr, cfg.UseTLS, cfg.CompressionType)
 
 	if cd != nil {
@@ -246,6 +255,11 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 		healthState.SetReady(true)
 		conn, err := ln.Accept()
 		if err != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
 			if errors.Is(err, net.ErrClosed) {
 				return fmt.Errorf("broker listener closed: %w", err)
 			}
@@ -263,8 +277,18 @@ func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager,
 			continue
 		}
 		temporaryDelay = 0
-		workerCh <- conn
+		select {
+		case workerCh <- conn:
+		case <-ctx.Done():
+			_ = conn.Close()
+			return ctx.Err()
+		}
 	}
+}
+
+func closeListenerOnDone(ctx context.Context, ln net.Listener) {
+	<-ctx.Done()
+	_ = ln.Close()
 }
 
 func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHandler *controller.CommandHandler) error {

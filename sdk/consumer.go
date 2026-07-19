@@ -43,13 +43,15 @@ type Consumer struct {
 
 	mainCtx    context.Context
 	mainCancel context.CancelFunc
+	rootCtx    context.Context
 
 	rebalancing  int32
 	rebalanceSig chan struct{}
 
-	offsets map[int]uint64
-	doneCh  chan struct{}
-	mu      sync.RWMutex
+	offsets   map[int]uint64
+	doneCh    chan struct{}
+	closeDone chan struct{}
+	mu        sync.RWMutex
 
 	partitionLeaders map[int]string
 	partitionMu      sync.RWMutex
@@ -63,6 +65,15 @@ type Consumer struct {
 }
 
 func NewConsumer(cfg *ConsumerConfig) (*Consumer, error) {
+	return NewConsumerWithContext(context.Background(), cfg)
+}
+
+// NewConsumerWithContext creates a consumer whose worker lifecycle is bounded by ctx.
+// Rebalances derive replacement workers from the same root cancellation source.
+func NewConsumerWithContext(ctx context.Context, cfg *ConsumerConfig) (*Consumer, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("consumer context must not be nil")
+	}
 	if cfg.EnableMetrics {
 		initMetrics()
 	}
@@ -71,7 +82,7 @@ func NewConsumer(cfg *ConsumerConfig) (*Consumer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create consumer client: %w", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	workerCtx, cancel := context.WithCancel(ctx)
 
 	c := &Consumer{
 		config:             cfg,
@@ -83,7 +94,9 @@ func NewConsumer(cfg *ConsumerConfig) (*Consumer, error) {
 		commitRetryMap:     make(map[int]uint64),
 		rebalanceSig:       make(chan struct{}, 1),
 		doneCh:             make(chan struct{}),
-		mainCtx:            ctx,
+		closeDone:          make(chan struct{}),
+		mainCtx:            workerCtx,
+		rootCtx:            ctx,
 		mainCancel:         cancel,
 	}
 
@@ -806,8 +819,10 @@ func parseFetchOffsetResponse(respStr string) (uint64, error) {
 
 func (c *Consumer) Close() error {
 	if !atomic.CompareAndSwapInt32(&c.closed, 0, 1) {
-		return fmt.Errorf("%w", ErrConsumerClosed)
+		<-c.closeDone
+		return nil
 	}
+	defer close(c.closeDone)
 
 	close(c.doneCh)
 	// Cancel the active consume context and close live sockets so blocked I/O exits promptly.
