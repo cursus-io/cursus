@@ -70,6 +70,9 @@ type DiskHandler struct {
 	mu                sync.Mutex // metadata(offset, segment), file handler(d.file)
 	ioMu              sync.Mutex // bufio.Writer, flush
 
+	// appendMu serializes automatic offset allocation through its write.
+	appendMu sync.Mutex
+
 	file   *os.File
 	writer *bufio.Writer
 
@@ -258,18 +261,22 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 }
 
 func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.Message) (uint64, error) {
-	offset := atomic.AddUint64(&d.AbsoluteOffset, 1) - 1
-
+	d.appendMu.Lock()
+	defer d.appendMu.Unlock()
+	offset := atomic.LoadUint64(&d.AbsoluteOffset)
 	msg.Offset = offset
 	if err := d.WriteDirect(topic, partition, *msg); err != nil {
 		return 0, fmt.Errorf("WriteDirect failed: %w", err)
 	}
+	atomic.StoreUint64(&d.AbsoluteOffset, offset+1)
 	return offset, nil
 }
 
 // AppendMessageWithOffset writes a message with a pre-assigned offset (for follower replication).
 // Unlike AppendMessage/AppendMessageSync, it does NOT allocate a new offset.
 func (d *DiskHandler) AppendMessageWithOffset(topic string, partition int, msg *types.Message) error {
+	d.appendMu.Lock()
+	defer d.appendMu.Unlock()
 	if err := d.WriteDirect(topic, partition, *msg); err != nil {
 		return fmt.Errorf("WriteDirect failed: %w", err)
 	}
@@ -291,7 +298,9 @@ func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Mess
 	if partition < 0 || partition > math.MaxInt32 {
 		return 0, fmt.Errorf("partition out of int32 range: %d", partition)
 	}
+	d.appendMu.Lock()
 	offset := atomic.AddUint64(&d.AbsoluteOffset, 1) - 1
+	d.appendMu.Unlock()
 
 	msg.Offset = offset
 	diskMsg := types.DiskMessage{
