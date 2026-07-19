@@ -53,23 +53,19 @@ func (a *ClusterActions) StartCluster() *ClusterActions {
 }
 
 // waitForNodeHealth checks if a node is healthy
-func (a *ClusterActions) waitForNodeHealth(nodeIndex int, healthUrl string) error {
+func (a *ClusterActions) waitForNodeHealth(nodeIndex int, healthURL string) error {
 	a.ctx.GetT().Logf("Waiting for node %d health check", nodeIndex)
-
-	for retry := 0; retry < 30; retry++ {
-		resp, err := http.Get(healthUrl)
-		if err == nil && resp.StatusCode == 200 {
+	return eventually(a.ctx.GetT(), fmt.Sprintf("node %d health at %s", nodeIndex, healthURL), clusterReadyTimeout, func() (bool, string, error) {
+		resp, err := http.Get(healthURL)
+		if err == nil && resp.StatusCode == http.StatusOK {
 			_ = resp.Body.Close()
-			a.ctx.GetT().Logf("Node %d is healthy", nodeIndex)
-			return nil
+			return true, "healthy", nil
 		}
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
-		time.Sleep(2 * time.Second)
-	}
-
-	return fmt.Errorf("node %d failed to become healthy at %s after 30 retries", nodeIndex, healthUrl)
+		return false, "health endpoint not ready", err
+	})
 }
 
 // checkAllNodesHealth verifies all cluster nodes are healthy
