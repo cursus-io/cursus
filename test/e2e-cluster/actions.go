@@ -10,7 +10,6 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/test/e2e"
-	"github.com/cursus-io/cursus/util"
 )
 
 // ClusterActions represents cluster-specific test actions
@@ -29,53 +28,58 @@ func (c *ClusterTestContext) WhenCluster() *ClusterActions {
 
 func (a *ClusterActions) StartCluster() *ClusterActions {
 	a.ctx.GetT().Logf("Waiting for %d cluster nodes to register...", a.ctx.clusterSize)
-
-	maxRetries := 20
-	for i := 0; i < maxRetries; i++ {
+	if err := eventually(a.ctx.GetT(), "active cluster membership", clusterReadyTimeout, func() (bool, string, error) {
 		resp, err := a.actions.SendCommand("LIST_CLUSTER")
-		if err == nil {
-			a.ctx.GetT().Logf("DEBUG: LIST_CLUSTER raw response: %s", resp)
-			payload := strings.TrimPrefix(strings.TrimSpace(resp), "OK brokers=")
-			var brokers []fsm.BrokerInfo
-			if err := json.Unmarshal([]byte(payload), &brokers); err == nil {
-				activeCount := 0
-				for _, b := range brokers {
-					if b.Status == "active" {
-						activeCount++
-					}
-				}
-				a.ctx.GetT().Logf("LIST_CLUSTER (Attempt %d/%d): %d/%d active. Brokers: %+v", i+1, maxRetries, activeCount, a.ctx.clusterSize, brokers)
-				if activeCount >= a.ctx.clusterSize {
-					a.ctx.GetT().Logf("All %d cluster nodes registered and active", a.ctx.clusterSize)
-					return a
-				}
+		if err != nil {
+			return false, "LIST_CLUSTER failed", err
+		}
+		payload := strings.TrimPrefix(strings.TrimSpace(resp), "OK brokers=")
+		var brokers []fsm.BrokerInfo
+		if err := json.Unmarshal([]byte(payload), &brokers); err != nil {
+			return false, resp, err
+		}
+		activeCount := 0
+		for _, broker := range brokers {
+			if broker.Status == "active" {
+				activeCount++
 			}
 		}
-		time.Sleep(1 * time.Second)
+		return activeCount >= a.ctx.clusterSize, fmt.Sprintf("%d/%d active", activeCount, a.ctx.clusterSize), nil
+	}); err != nil {
+		a.ctx.GetT().Fatal(err)
 	}
-
-	a.ctx.GetT().Fatalf("cluster did not report %d active nodes after %d attempts", a.ctx.clusterSize, maxRetries)
 	return a
 }
 
 // waitForNodeHealth checks if a node is healthy
-func (a *ClusterActions) waitForNodeHealth(nodeIndex int, healthUrl string) error {
+func (a *ClusterActions) waitForNodeHealth(nodeIndex int, healthURL string) error {
+	if err := validateNodeHealthURL(nodeIndex, healthURL); err != nil {
+		return err
+	}
 	a.ctx.GetT().Logf("Waiting for node %d health check", nodeIndex)
-
-	for retry := 0; retry < 30; retry++ {
-		resp, err := http.Get(healthUrl)
-		if err == nil && resp.StatusCode == 200 {
+	return eventually(a.ctx.GetT(), fmt.Sprintf("node %d health at %s", nodeIndex, healthURL), clusterReadyTimeout, func() (bool, string, error) {
+		// #nosec G107 -- validateNodeHealthURL restricts requests to the expected loopback test endpoint.
+		resp, err := http.Get(healthURL)
+		if err == nil && resp.StatusCode == http.StatusOK {
 			_ = resp.Body.Close()
-			a.ctx.GetT().Logf("Node %d is healthy", nodeIndex)
-			return nil
+			return true, "healthy", nil
 		}
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
-		time.Sleep(2 * time.Second)
-	}
+		return false, "health endpoint not ready", err
+	})
+}
 
-	return fmt.Errorf("node %d failed to become healthy at %s after 30 retries", nodeIndex, healthUrl)
+func validateNodeHealthURL(nodeIndex int, healthURL string) error {
+	if nodeIndex <= 0 {
+		return fmt.Errorf("invalid broker index %d", nodeIndex)
+	}
+	expected := fmt.Sprintf("http://localhost:%d/health", healthPort(nodeIndex))
+	if healthURL != expected {
+		return fmt.Errorf("refusing unexpected node health URL %q", healthURL)
+	}
+	return nil
 }
 
 // checkAllNodesHealth verifies all cluster nodes are healthy
@@ -152,7 +156,6 @@ func (a *ClusterActions) SimulateFollowerFailure(nodeIndex int) *ClusterActions 
 	a.ctx.GetClient().Close()
 
 	a.ctx.GetT().Logf("Successfully stopped %s", containerName)
-	time.Sleep(2 * time.Second)
 	return a
 }
 
@@ -220,34 +223,28 @@ func (a *ClusterActions) DescribeTopic() *ClusterActions {
 
 func (a *ClusterActions) WaitForTopicMetadata() *ClusterActions {
 	topic := a.ctx.GetTopic()
-	a.ctx.GetT().Logf("Waiting for topic metadata to propagate: %s", topic)
-
 	addrs := a.ctx.GetBrokerAddrs()
-
-	for i := 0; i < 60; i++ {
+	if err := eventually(a.ctx.GetT(), fmt.Sprintf("topic metadata for %s", topic), clusterReadyTimeout, func() (bool, string, error) {
+		lastDetail := "no broker returned metadata"
 		for _, addr := range addrs {
 			tempClient := e2e.NewBrokerClient([]string{addr})
-			cmd := fmt.Sprintf("DESCRIBE topic=%s", topic)
-			resp, err := tempClient.SendCommand("", cmd, 2*time.Second)
+			resp, err := tempClient.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topic), 2*time.Second)
 			tempClient.Close()
-
-			if err == nil &&
-				!strings.Contains(resp, "not found") &&
-				!strings.Contains(resp, "ERROR:") &&
-				strings.Contains(resp, topic) &&
-				strings.Contains(resp, "{") {
-				a.ctx.GetT().Logf("Topic metadata for '%s' is now available on node %s", topic, addr)
-				return a
+			if err != nil {
+				lastDetail = fmt.Sprintf("%s: %v", addr, err)
+				continue
 			}
-			util.Debug("Still waiting for metadata on %s: resp=%s, err=%v", addr, resp, err)
+			if !strings.Contains(resp, "not found") && !strings.Contains(resp, "ERROR:") && strings.Contains(resp, topic) && strings.Contains(resp, "{") {
+				return true, fmt.Sprintf("available on %s", addr), nil
+			}
+			lastDetail = fmt.Sprintf("%s: %s", addr, resp)
 		}
-		time.Sleep(1 * time.Second)
+		return false, lastDetail, nil
+	}); err != nil {
+		a.ctx.GetT().Fatal(err)
 	}
-
-	a.ctx.GetT().Fatalf("Timed out waiting for topic metadata to propagate for topic %s", topic)
 	return a
 }
-
 func (a *ClusterActions) SimulateLeaderFailure() (int, *ClusterActions) {
 	topic := a.ctx.GetTopic()
 	a.ctx.GetT().Logf("Simulating leader failure for topic: %s", topic)
@@ -325,25 +322,15 @@ func leaderAddressFromDescribe(resp string) (string, error) {
 }
 
 func (a *ClusterActions) waitForPartitionLeaderChange(topic, oldLeader string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-	for time.Now().Before(deadline) {
+	return eventually(a.ctx.GetT(), fmt.Sprintf("partition leader change for %s", topic), timeout, func() (bool, string, error) {
 		resp, err := a.actions.SendCommand(fmt.Sprintf("DESCRIBE topic=%s", topic))
-		if err == nil {
-			leader, parseErr := leaderAddressFromDescribe(resp)
-			switch {
-			case parseErr != nil:
-				lastErr = parseErr
-			case leader != oldLeader:
-				a.ctx.GetT().Logf("Partition leader changed from %s to %s", oldLeader, leader)
-				return nil
-			default:
-				lastErr = fmt.Errorf("partition leader is still %s", oldLeader)
-			}
-		} else {
-			lastErr = err
+		if err != nil {
+			return false, "DESCRIBE failed", err
 		}
-		time.Sleep(time.Second)
-	}
-	return fmt.Errorf("partition leader did not change from %s within %s: %w", oldLeader, timeout, lastErr)
+		leader, err := leaderAddressFromDescribe(resp)
+		if err != nil {
+			return false, resp, err
+		}
+		return leader != oldLeader, fmt.Sprintf("leader=%s", leader), nil
+	})
 }

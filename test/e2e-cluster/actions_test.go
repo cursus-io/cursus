@@ -26,3 +26,18 @@ func TestLeaderNodeFromDescribeRejectsUnknownLeader(t *testing.T) {
 		t.Fatal("leaderNodeFromDescribe() error = nil, want out-of-range error")
 	}
 }
+
+func TestValidateNodeHealthURLRestrictsLoopbackEndpoint(t *testing.T) {
+	if err := validateNodeHealthURL(2, "http://localhost:9082/health"); err != nil {
+		t.Fatalf("expected cluster health URL to be accepted: %v", err)
+	}
+	for _, candidate := range []string{
+		"http://example.com:9082/health",
+		"http://localhost:9081/health",
+		"http://localhost:9082/other",
+	} {
+		if err := validateNodeHealthURL(2, candidate); err == nil {
+			t.Fatalf("validateNodeHealthURL(%q) error = nil, want rejection", candidate)
+		}
+	}
+}

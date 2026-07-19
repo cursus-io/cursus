@@ -26,139 +26,98 @@ func ExpectDataConsistent() e2e.Expectation {
 	return func(ctx *e2e.TestContext) error {
 		topic := ctx.GetTopic()
 		client := ctx.GetClient()
-
-		ctx.GetT().Logf("Verifying data consistency across cluster...")
-
-		resp, err := client.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topic), 5*time.Second)
-		if err != nil {
-			return err
-		}
-
-		var meta topicMetadata
-		if err := json.Unmarshal([]byte(resp), &meta); err != nil {
-			return fmt.Errorf("failed to parse metadata: %w", err)
-		}
-
-		for _, p := range meta.Partitions {
-			if len(p.ISR) < 1 {
-				ctx.GetT().Logf("DEBUG: ISR empty for partition %d. Metadata: %+v", p.ID, p)
-				return fmt.Errorf("ISR is empty for partition %d", p.ID)
+		return eventually(ctx.GetT(), fmt.Sprintf("consistent metadata for %s", topic), clusterReadyTimeout, func() (bool, string, error) {
+			resp, err := client.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topic), 5*time.Second)
+			if err != nil {
+				return false, "DESCRIBE failed", err
 			}
-			if p.Leader == "" {
-				return fmt.Errorf("leader is empty for partition %d", p.ID)
+			var meta topicMetadata
+			if err := json.Unmarshal([]byte(resp), &meta); err != nil {
+				return false, resp, err
 			}
-		}
-
-		ctx.GetT().Logf("Data consistency metadata verified")
-		return nil
+			for _, partition := range meta.Partitions {
+				if partition.Leader == "" || len(partition.ISR) < 1 {
+					return false, fmt.Sprintf("partition %d leader=%q isr=%v", partition.ID, partition.Leader, partition.ISR), nil
+				}
+			}
+			return len(meta.Partitions) > 0, "no partitions", nil
+		})
 	}
 }
-
-func ExpectPartitionWatermarks(partition int, expectedLEO, expectedHWM uint64) e2e.Expectation {
+func ExpectPartitionWatermarks(partitionID int, expectedLEO, expectedHWM uint64) e2e.Expectation {
 	return func(ctx *e2e.TestContext) error {
-		resp, err := ctx.GetClient().SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", ctx.GetTopic()), 5*time.Second)
-		if err != nil {
-			return err
-		}
-
-		var meta topicMetadata
-		if err := json.Unmarshal([]byte(resp), &meta); err != nil {
-			return fmt.Errorf("failed to parse metadata: %w", err)
-		}
-		for _, p := range meta.Partitions {
-			if p.ID != partition {
-				continue
+		return eventually(ctx.GetT(), fmt.Sprintf("watermarks for %s[%d]", ctx.GetTopic(), partitionID), clusterReadyTimeout, func() (bool, string, error) {
+			resp, err := ctx.GetClient().SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", ctx.GetTopic()), 5*time.Second)
+			if err != nil {
+				return false, "DESCRIBE failed", err
 			}
-			if p.LEO != expectedLEO || p.HWM != expectedHWM {
-				return fmt.Errorf("partition %d watermark mismatch: expected leo=%d hwm=%d, got leo=%d hwm=%d",
-					partition, expectedLEO, expectedHWM, p.LEO, p.HWM)
+			var meta topicMetadata
+			if err := json.Unmarshal([]byte(resp), &meta); err != nil {
+				return false, resp, err
 			}
-			return nil
-		}
-		return fmt.Errorf("partition %d not found", partition)
+			for _, partition := range meta.Partitions {
+				if partition.ID == partitionID {
+					return partition.LEO == expectedLEO && partition.HWM == expectedHWM, fmt.Sprintf("leo=%d hwm=%d", partition.LEO, partition.HWM), nil
+				}
+			}
+			return false, "partition not found", nil
+		})
 	}
 }
-
 func ExpectOffsetMatched(partition int, expected uint64) e2e.Expectation {
 	return func(ctx *e2e.TestContext) error {
 		topic := ctx.GetTopic()
 		group := ctx.GetConsumerGroup()
 		client := ctx.GetClient()
-
-		maxRetries := 15
-		var lastOffset uint64
-		var lastErr error
-
-		for i := 0; i < maxRetries; i++ {
-			lastOffset, lastErr = client.FetchCommittedOffset(topic, partition, group)
-			if lastErr == nil {
-				if lastOffset == expected {
-					ctx.GetT().Logf("Confirmed: Offset %d is correctly replicated and matched", lastOffset)
-					return nil
-				}
-				ctx.GetT().Logf("Offset mismatch (Attempt %d/%d): expected %d, got %d. Retrying...", i+1, maxRetries, expected, lastOffset)
-			} else {
-				// Retry on authorization errors as they usually indicate leader election is in progress
-				ctx.GetT().Logf("Fetch committed offset error (Attempt %d/%d): %v. Retrying...", i+1, maxRetries, lastErr)
+		return eventually(ctx.GetT(), fmt.Sprintf("committed offset %d for %s[%d]", expected, topic, partition), clusterReadyTimeout, func() (bool, string, error) {
+			offset, err := client.FetchCommittedOffset(topic, partition, group)
+			if err != nil {
+				return false, "fetch committed offset failed", err
 			}
-			time.Sleep(2 * time.Second)
-		}
-
-		if lastErr != nil {
-			return fmt.Errorf("failed to fetch offset after %d retries: %w", maxRetries, lastErr)
-		}
-		return fmt.Errorf("offset mismatch after %d retries: expected %d, got %d", maxRetries, expected, lastOffset)
+			return offset == expected, fmt.Sprintf("got %d, want %d", offset, expected), nil
+		})
 	}
 }
-
 func LeaderChanged(partitionID int, oldLeader string) e2e.Expectation {
 	return func(ctx *e2e.TestContext) error {
 		topic := ctx.GetTopic()
 		client := ctx.GetClient()
-
-		maxRetries := 20
-		for i := 0; i < maxRetries; i++ {
+		return eventually(ctx.GetT(), fmt.Sprintf("leader change for %s[%d]", topic, partitionID), clusterReadyTimeout, func() (bool, string, error) {
 			resp, err := client.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topic), 5*time.Second)
-			if err == nil {
-				var meta topicMetadata
-				if err := json.Unmarshal([]byte(resp), &meta); err == nil && len(meta.Partitions) > 0 {
-					for _, p := range meta.Partitions {
-						if p.ID == partitionID {
-							if p.Leader != "" && p.Leader != oldLeader {
-								ctx.GetT().Logf("Confirmed: Leader for %s:%d changed from %s to %s", topic, partitionID, oldLeader, p.Leader)
-								return nil
-							}
-						}
-					}
+			if err != nil {
+				return false, "DESCRIBE failed", err
+			}
+			var meta topicMetadata
+			if err := json.Unmarshal([]byte(resp), &meta); err != nil {
+				return false, resp, err
+			}
+			for _, partition := range meta.Partitions {
+				if partition.ID == partitionID {
+					return partition.Leader != "" && partition.Leader != oldLeader, fmt.Sprintf("leader=%s", partition.Leader), nil
 				}
 			}
-			time.Sleep(1 * time.Second)
-		}
-		return fmt.Errorf("leader for partition %d did not change from %s after %d retries", partitionID, oldLeader, maxRetries)
+			return false, "partition not found", nil
+		})
 	}
 }
-
 func ISRMaintained() e2e.Expectation {
 	return func(ctx *e2e.TestContext) error {
-		topic := ctx.GetTopic()
-		client := ctx.GetClient()
-
-		resp, err := client.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topic), 5*time.Second)
-		if err != nil {
-			return err
-		}
-
-		var meta topicMetadata
-		if err := json.Unmarshal([]byte(resp), &meta); err != nil {
-			return fmt.Errorf("failed to parse metadata: %w", err)
-		}
-
-		for _, p := range meta.Partitions {
-			if len(p.ISR) == 0 {
-				return fmt.Errorf("ISR is empty for partition %d", p.ID)
+		return eventually(ctx.GetT(), fmt.Sprintf("non-empty ISR for %s", ctx.GetTopic()), clusterReadyTimeout, func() (bool, string, error) {
+			resp, err := ctx.GetClient().SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", ctx.GetTopic()), 5*time.Second)
+			if err != nil {
+				return false, "DESCRIBE failed", err
 			}
-		}
-		return nil
+			var meta topicMetadata
+			if err := json.Unmarshal([]byte(resp), &meta); err != nil {
+				return false, resp, err
+			}
+			for _, partition := range meta.Partitions {
+				if len(partition.ISR) == 0 {
+					return false, fmt.Sprintf("partition %d ISR empty", partition.ID), nil
+				}
+			}
+			return len(meta.Partitions) > 0, "no partitions", nil
+		})
 	}
 }
 

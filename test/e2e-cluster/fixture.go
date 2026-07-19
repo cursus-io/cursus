@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cursus-io/cursus/test/e2e"
 )
@@ -87,18 +86,14 @@ func GivenClusterRestart(t *testing.T) *ClusterTestContext {
 	}
 
 	t.Log("Waiting for Raft leader to be elected...")
-	leaderElected := false
-	for i := 0; i < 20; i++ {
+	if err := eventually(t, "Raft leader election", clusterReadyTimeout, func() (bool, string, error) {
 		resp, err := actions.actions.SendCommand("LIST")
-		if err == nil && !strings.Contains(resp, "ERROR:") && !strings.Contains(resp, "unknown") {
-			leaderElected = true
-			break
+		if err != nil {
+			return false, "LIST failed", err
 		}
-		time.Sleep(1 * time.Second)
-	}
-
-	if !leaderElected {
-		t.Fatal("Cluster started but no leader was elected within 20 seconds")
+		return !strings.Contains(resp, "ERROR:") && !strings.Contains(resp, "unknown"), resp, nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	t.Log("Raft leader elected, cluster ready.")
 
