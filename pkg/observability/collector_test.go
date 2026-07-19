@@ -46,7 +46,11 @@ func (source fixedReadiness) IsReady() bool { return bool(source) }
 func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 	collector := NewCollector(
 		fixedTopics{snapshot: topic.RuntimeSnapshot{
-			TopicCount: 1,
+			TopicCount:                      1,
+			MetadataLoadFailure:             "decode failed",
+			MetadataOrphanTopicCount:        3,
+			MetadataDurabilityWarning:       "directory sync failed",
+			MetadataDurabilityWarningsTotal: 7,
 			Partitions: []topic.PartitionRuntimeSnapshot{{
 				Topic: "orders", Partition: 0, LogStart: 2, LogEnd: 10, HighWatermark: 8,
 			}},
@@ -81,6 +85,10 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 	}
 
 	assertGauge(t, families, "cursus_broker_ready", nil, 1)
+	assertGauge(t, families, "cursus_topic_metadata_manifest_load_failure", nil, 1)
+	assertGauge(t, families, "cursus_topic_metadata_orphan_topics", nil, 3)
+	assertGauge(t, families, "cursus_topic_metadata_durability_warning", nil, 1)
+	assertCounter(t, families, "cursus_topic_metadata_durability_warnings_total", 7)
 	assertGauge(t, families, "cursus_partition_high_watermark", map[string]string{"topic": "orders", "partition": "0"}, 8)
 	assertGauge(t, families, "cursus_consumer_group_committed_offset", map[string]string{"group": "workers", "topic": "orders", "partition": "0"}, 5)
 	assertGauge(t, families, "cursus_consumer_group_lag", map[string]string{"group": "workers", "topic": "orders", "partition": "0"}, 3)
@@ -109,6 +117,19 @@ func assertGauge(t *testing.T, families []*dto.MetricFamily, name string, labels
 		}
 	}
 	t.Fatalf("metric %s%v not found", name, labels)
+}
+
+func assertCounter(t *testing.T, families []*dto.MetricFamily, name string, want float64) {
+	t.Helper()
+	for _, family := range families {
+		if family.GetName() == name && family.GetType() == dto.MetricType_COUNTER && len(family.Metric) == 1 {
+			if got := family.Metric[0].GetCounter().GetValue(); got != want {
+				t.Fatalf("%s = %v, want %v", name, got, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("counter %s not found", name)
 }
 
 func labelsMatch(pairs []*dto.LabelPair, want map[string]string) bool {

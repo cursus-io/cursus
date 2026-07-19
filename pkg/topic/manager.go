@@ -36,6 +36,11 @@ type TopicManager struct {
 	coordinator   *coordinator.Coordinator
 	txnResolver   TransactionDecisionResolver
 	metadataStore *topicMetadataStore
+
+	metadataLoadFailure             string
+	metadataOrphanTopicCount        int
+	metadataDurabilityWarning       string
+	metadataDurabilityWarningsTotal uint64
 }
 
 // HandlerProvider defines an interface to provide disk handlers.
