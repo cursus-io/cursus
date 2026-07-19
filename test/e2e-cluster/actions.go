@@ -308,25 +308,15 @@ func leaderAddressFromDescribe(resp string) (string, error) {
 }
 
 func (a *ClusterActions) waitForPartitionLeaderChange(topic, oldLeader string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-	for time.Now().Before(deadline) {
+	return eventually(a.ctx.GetT(), fmt.Sprintf("partition leader change for %s", topic), timeout, func() (bool, string, error) {
 		resp, err := a.actions.SendCommand(fmt.Sprintf("DESCRIBE topic=%s", topic))
-		if err == nil {
-			leader, parseErr := leaderAddressFromDescribe(resp)
-			switch {
-			case parseErr != nil:
-				lastErr = parseErr
-			case leader != oldLeader:
-				a.ctx.GetT().Logf("Partition leader changed from %s to %s", oldLeader, leader)
-				return nil
-			default:
-				lastErr = fmt.Errorf("partition leader is still %s", oldLeader)
-			}
-		} else {
-			lastErr = err
+		if err != nil {
+			return false, "DESCRIBE failed", err
 		}
-		time.Sleep(time.Second)
-	}
-	return fmt.Errorf("partition leader did not change from %s within %s: %w", oldLeader, timeout, lastErr)
+		leader, err := leaderAddressFromDescribe(resp)
+		if err != nil {
+			return false, resp, err
+		}
+		return leader != oldLeader, fmt.Sprintf("leader=%s", leader), nil
+	})
 }
