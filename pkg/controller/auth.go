@@ -96,17 +96,16 @@ func (ch *CommandHandler) authorizeTopicWrite(policy topic.Policy, ctx *ClientCo
 	return "ERROR: NOT_AUTHORIZED_FOR_TOPIC operation=write"
 }
 
-func (ch *CommandHandler) authorizeClientCommand(cmd, upper string, ctx *ClientContext) string {
-	permissions := commandPermissions(cmd, upper)
+func (ch *CommandHandler) authorizeClientCommand(input commandInput, ctx *ClientContext) string {
+	permissions := commandPermissions(input)
 	if len(permissions) == 0 {
 		return ""
 	}
 
-	args := commandArguments(cmd)
-	if authResp := ch.authenticateInline(args, ctx); authResp != "" {
+	if authResp := ch.authenticateInline(input.Args, ctx); authResp != "" {
 		return authResp
 	}
-	return ch.authorizeClientPermissions(commandName(upper), args, ctx, permissions...)
+	return ch.authorizeClientPermissions(input.Name, input.Args, ctx, permissions...)
 }
 
 func (ch *CommandHandler) authorizeClientPermissions(command string, args map[string]string, ctx *ClientContext, permissions ...string) string {
@@ -162,18 +161,8 @@ func hasPermission(granted []string, required string) bool {
 	return false
 }
 
-func commandArguments(cmd string) map[string]string {
-	return decodeCommandInput(cmd).Args
-}
-
-func commandName(upper string) string {
-	if idx := strings.IndexByte(upper, ' '); idx >= 0 {
-		return upper[:idx]
-	}
-	return upper
-}
-
-func commandPermissions(cmd, upper string) []string {
+func commandPermissions(input commandInput) []string {
+	upper := input.Upper
 	switch {
 	case upper == "LIST_CLUSTER", upper == "CLUSTER_STATUS", strings.HasPrefix(upper, "ELECT_LEADER "), strings.HasPrefix(upper, "CREATE "), strings.HasPrefix(upper, "DELETE "):
 		return []string{PermissionAdmin}
@@ -193,7 +182,7 @@ func commandPermissions(cmd, upper string) []string {
 		strings.HasPrefix(upper, "END_TXN "), strings.HasPrefix(upper, "TXN_STATUS "):
 		return []string{PermissionTransaction}
 	case strings.HasPrefix(upper, "FIND_COORDINATOR "):
-		if args := commandArguments(cmd); args["transactional_id"] != "" || args["txn"] != "" || args["transaction"] != "" {
+		if input.Args["transactional_id"] != "" || input.Args["txn"] != "" || input.Args["transaction"] != "" {
 			return []string{PermissionTransaction}
 		}
 		return []string{PermissionGroup}

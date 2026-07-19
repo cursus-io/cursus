@@ -1,6 +1,9 @@
 package controller
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestDecodeCommandInput(t *testing.T) {
 	tests := []struct {
@@ -18,6 +21,12 @@ func TestDecodeCommandInput(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := decodeCommandInput(test.raw)
+			if got.Raw != strings.TrimSpace(test.raw) {
+				t.Errorf("raw = %q, want %q", got.Raw, strings.TrimSpace(test.raw))
+			}
+			if got.Upper != strings.ToUpper(strings.TrimSpace(test.raw)) {
+				t.Errorf("upper = %q, want %q", got.Upper, strings.ToUpper(strings.TrimSpace(test.raw)))
+			}
 			if got.Name != test.wantName {
 				t.Fatalf("name = %q, want %q", got.Name, test.wantName)
 			}

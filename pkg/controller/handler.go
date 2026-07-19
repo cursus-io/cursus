@@ -200,8 +200,9 @@ func redactOneCommandSecret(s, key string) string {
 // HandleCommand processes non-streaming commands and returns a signal for streaming commands.
 func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (response string) {
 	started := time.Now()
-	cmd := strings.TrimSpace(rawCmd)
-	commandName := ch.metricCommandName(cmd)
+	input := decodeCommandInput(rawCmd)
+	cmd := input.Raw
+	commandName := ch.metricCommandNameInput(input)
 	defer func() {
 		metrics.RecordCommand(commandName, response, time.Since(started))
 	}()
@@ -212,7 +213,7 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 		return resp
 	}
 
-	upper := strings.ToUpper(cmd)
+	upper := input.Upper
 
 	if strings.HasPrefix(upper, "STREAM ") {
 		resp := decorateProtocolResponse(ch.validateStreamSyntax(cmd, rawCmd), ctx)
@@ -229,22 +230,26 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 		return resp
 	}
 	if name, ok := internalCommandName(upper); ok {
-		if resp := ch.authorizeInternalCommand(name, cmd); resp != "" {
+		if resp := ch.authorizeInternalCommand(name, input); resp != "" {
 			return ch.fail(rawCmd, resp)
 		}
 	}
 
-	if resp := ch.authorizeClientCommand(cmd, upper, ctx); resp != "" {
+	if resp := ch.authorizeClientCommand(input, ctx); resp != "" {
 		return ch.fail(rawCmd, resp)
 	}
 
-	response = decorateProtocolResponse(ch.handleCommandByType(cmd, upper, ctx), ctx)
+	response = decorateProtocolResponse(ch.handleCommandByType(input, ctx), ctx)
 	ch.logCommandResult(rawCmd, response)
 	return response
 }
 
 func (ch *CommandHandler) metricCommandName(cmd string) string {
-	name := decodeCommandInput(cmd).Name
+	return ch.metricCommandNameInput(decodeCommandInput(cmd))
+}
+
+func (ch *CommandHandler) metricCommandNameInput(input commandInput) string {
+	name := input.Name
 	if name == "" {
 		return "EMPTY"
 	}
@@ -260,19 +265,19 @@ func (ch *CommandHandler) metricCommandName(cmd string) string {
 }
 
 // handleCommandByType dispatches to the matching command handler from the registry.
-func (ch *CommandHandler) handleCommandByType(cmd, upper string, ctx *ClientContext) string {
+func (ch *CommandHandler) handleCommandByType(input commandInput, ctx *ClientContext) string {
 	for _, entry := range ch.commands {
 		if entry.exact {
-			if strings.EqualFold(cmd, entry.prefix) {
-				return entry.handler(cmd, ctx)
+			if strings.EqualFold(input.Raw, entry.prefix) {
+				return entry.handler(input.Raw, ctx)
 			}
 		} else {
-			if strings.HasPrefix(upper, entry.prefix) {
-				return entry.handler(cmd, ctx)
+			if strings.HasPrefix(input.Upper, entry.prefix) {
+				return entry.handler(input.Raw, ctx)
 			}
 		}
 	}
-	return fmt.Sprintf("ERROR: unknown_command command=%q", cmd)
+	return fmt.Sprintf("ERROR: unknown_command command=%q", input.Raw)
 }
 
 func internalCommandName(upper string) (string, bool) {
@@ -284,7 +289,7 @@ func internalCommandName(upper string) (string, bool) {
 	return "", false
 }
 
-func (ch *CommandHandler) authorizeInternalCommand(name, cmd string) string {
+func (ch *CommandHandler) authorizeInternalCommand(name string, input commandInput) string {
 	if ch == nil || ch.Config == nil || !ch.Config.EnabledDistribution {
 		return ""
 	}
@@ -292,8 +297,7 @@ func (ch *CommandHandler) authorizeInternalCommand(name, cmd string) string {
 	if token == "" {
 		return fmt.Sprintf("ERROR: internal_auth_not_configured command=%s", name)
 	}
-	args := parseKeyValueArgs(strings.TrimPrefix(cmd, name+" "))
-	if !constantTimeStringEqual(args["internal_token"], token) {
+	if !constantTimeStringEqual(input.Args["internal_token"], token) {
 		return fmt.Sprintf("ERROR: internal_command_unauthorized command=%s", name)
 	}
 	return ""

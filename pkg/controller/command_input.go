@@ -3,13 +3,15 @@ package controller
 import "strings"
 
 type commandInput struct {
-	Name string
-	Args map[string]string
+	Raw   string
+	Upper string
+	Name  string
+	Args  map[string]string
 }
 
 func decodeCommandInput(raw string) commandInput {
 	cmd := strings.TrimSpace(raw)
-	input := commandInput{Args: map[string]string{}}
+	input := commandInput{Raw: cmd, Upper: strings.ToUpper(cmd), Args: map[string]string{}}
 	if cmd == "" {
 		return input
 	}
