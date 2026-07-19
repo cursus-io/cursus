@@ -53,8 +53,12 @@ func (a *ClusterActions) StartCluster() *ClusterActions {
 
 // waitForNodeHealth checks if a node is healthy
 func (a *ClusterActions) waitForNodeHealth(nodeIndex int, healthURL string) error {
+	if err := validateNodeHealthURL(nodeIndex, healthURL); err != nil {
+		return err
+	}
 	a.ctx.GetT().Logf("Waiting for node %d health check", nodeIndex)
 	return eventually(a.ctx.GetT(), fmt.Sprintf("node %d health at %s", nodeIndex, healthURL), clusterReadyTimeout, func() (bool, string, error) {
+		// #nosec G107 -- validateNodeHealthURL restricts requests to the expected loopback test endpoint.
 		resp, err := http.Get(healthURL)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			_ = resp.Body.Close()
@@ -65,6 +69,17 @@ func (a *ClusterActions) waitForNodeHealth(nodeIndex int, healthURL string) erro
 		}
 		return false, "health endpoint not ready", err
 	})
+}
+
+func validateNodeHealthURL(nodeIndex int, healthURL string) error {
+	if nodeIndex <= 0 {
+		return fmt.Errorf("invalid broker index %d", nodeIndex)
+	}
+	expected := fmt.Sprintf("http://localhost:%d/health", healthPort(nodeIndex))
+	if healthURL != expected {
+		return fmt.Errorf("refusing unexpected node health URL %q", healthURL)
+	}
+	return nil
 }
 
 // checkAllNodesHealth verifies all cluster nodes are healthy
