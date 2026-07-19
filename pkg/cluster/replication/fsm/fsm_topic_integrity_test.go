@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -17,14 +18,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type failingTopicHandlerProvider struct{}
-
-func (failingTopicHandlerProvider) GetHandler(string, int) (types.StorageHandler, error) {
-	return nil, errors.New("open partition failed")
+type recoverableTopicHandlerProvider struct {
+	fail atomic.Bool
 }
 
-func TestBrokerFSMTopicCreateFailureLeavesMetadataUnchanged(t *testing.T) {
-	manager := topic.NewTopicManager(config.DefaultConfig(), failingTopicHandlerProvider{}, nil)
+func (p *recoverableTopicHandlerProvider) GetHandler(string, int) (types.StorageHandler, error) {
+	if p.fail.Load() {
+		return nil, errors.New("open partition failed")
+	}
+	return &MockStorageHandler{}, nil
+}
+
+func TestBrokerFSMTopicCreateFailureCommitsDesiredStateAndReconciles(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	provider := &recoverableTopicHandlerProvider{}
+	provider.fail.Store(true)
+	manager := topic.NewTopicManager(cfg, provider, nil)
 	f := NewBrokerFSM(manager, nil)
 	registerActiveBroker(t, f, "broker-1")
 
@@ -40,12 +50,21 @@ func TestBrokerFSMTopicCreateFailureLeavesMetadataUnchanged(t *testing.T) {
 	applyErr, ok := result.(error)
 	require.True(t, ok)
 	require.ErrorContains(t, applyErr, "open partition failed")
-	require.Nil(t, f.GetPartitionMetadata("orders-0"))
-	require.Nil(t, f.topicState["orders"])
+	require.NotNil(t, f.GetPartitionMetadata("orders-0"))
+	require.NotNil(t, f.topicState["orders"])
 	require.Nil(t, manager.GetTopic("orders"))
+	require.Error(t, f.TopicMaterializationReadinessError())
+	require.Len(t, f.TopicMaterializationIssues(), 1)
+	require.Equal(t, TopicMaterializationCreate, f.TopicMaterializationIssues()[0].Operation)
+
+	provider.fail.Store(false)
+	require.NoError(t, f.ReconcileTopicMaterializations())
+	require.NotNil(t, manager.GetTopic("orders"))
+	require.NoError(t, f.TopicMaterializationReadinessError())
+	require.Empty(t, f.TopicMaterializationIssues())
 }
 
-func TestBrokerFSMDeleteFailurePreservesMetadataAndRegistry(t *testing.T) {
+func TestBrokerFSMDeleteFailureCommitsDesiredStateAndReconciles(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
 	require.NoError(t, os.Mkdir(filepath.Join(cfg.LogDir, topic.TopicMetadataFileName), 0o750))
@@ -73,9 +92,15 @@ func TestBrokerFSMDeleteFailurePreservesMetadataAndRegistry(t *testing.T) {
 	applyErr, ok := result.(error)
 	require.True(t, ok)
 	require.ErrorContains(t, applyErr, "delete local topic")
-	require.NotNil(t, f.GetPartitionMetadata("orders-0"))
-	require.NotNil(t, f.topicState["orders"])
+	require.Nil(t, f.GetPartitionMetadata("orders-0"))
+	require.Nil(t, f.topicState["orders"])
 	require.NotNil(t, manager.GetTopic("orders"))
+	require.Error(t, f.TopicMaterializationReadinessError())
+
+	require.NoError(t, os.RemoveAll(filepath.Join(cfg.LogDir, topic.TopicMetadataFileName)))
+	require.NoError(t, f.ReconcileTopicMaterializations())
+	require.Nil(t, manager.GetTopic("orders"))
+	require.NoError(t, f.TopicMaterializationReadinessError())
 }
 
 func TestBrokerFSMDeleteMissingTopicReturnsNotFound(t *testing.T) {
@@ -139,4 +164,57 @@ func TestBrokerFSMRestoreRejectsTopicMetadataConflicts(t *testing.T) {
 			require.ErrorContains(t, err, tt.want)
 		})
 	}
+}
+
+func TestBrokerFSMRestoreDefersLocalTopicMaterializationFailure(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	provider := &recoverableTopicHandlerProvider{}
+	provider.fail.Store(true)
+	manager := topic.NewTopicManager(cfg, provider, nil)
+	f := NewBrokerFSM(manager, nil)
+	state := BrokerFSMState{
+		Version: 6,
+		TopicState: map[string]*topic.Definition{
+			"orders": {Name: "orders", Partitions: 1, Policy: topic.DefaultPolicy()},
+		},
+		PartitionMetadata: map[string]*PartitionMetadata{
+			"orders-0": {PartitionCount: 1},
+		},
+	}
+	data, err := json.Marshal(state)
+	require.NoError(t, err)
+
+	require.NoError(t, f.Restore(io.NopCloser(bytes.NewReader(data))))
+	require.NotNil(t, f.GetPartitionMetadata("orders-0"))
+	require.Nil(t, manager.GetTopic("orders"))
+	require.Error(t, f.TopicMaterializationReadinessError())
+
+	provider.fail.Store(false)
+	require.NoError(t, f.ReconcileTopicMaterializations())
+	require.NotNil(t, manager.GetTopic("orders"))
+	require.NoError(t, f.TopicMaterializationReadinessError())
+}
+
+func TestBrokerFSMDeleteSupersedesPendingCreateWithoutLocalTopic(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	provider := &recoverableTopicHandlerProvider{}
+	provider.fail.Store(true)
+	manager := topic.NewTopicManager(cfg, provider, nil)
+	f := NewBrokerFSM(manager, nil)
+	registerActiveBroker(t, f, "broker-1")
+
+	command, err := json.Marshal(TopicCommand{
+		Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy(),
+	})
+	require.NoError(t, err)
+	require.Error(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(command)), Index: 2}).(error))
+	require.Error(t, f.TopicMaterializationReadinessError())
+
+	result := f.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders"}`), Index: 3})
+	require.Nil(t, result)
+	require.Nil(t, f.GetPartitionMetadata("orders-0"))
+	require.Nil(t, manager.GetTopic("orders"))
+	require.NoError(t, f.TopicMaterializationReadinessError())
 }
