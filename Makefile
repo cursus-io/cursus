@@ -163,18 +163,18 @@ build: build-api build-cli
 .PHONY: build-api
 build-api:
 	@echo "Building API server..."
-	CGO_ENABLED=0 $(GO) build $(BUILD_FLAGS) -o bin/$(APP_NAME) ./cmd/broker/main.go
+	CGO_ENABLED=0 $(GO) build $(BUILD_FLAGS) -o bin/$(APP_NAME) ./cmd/broker
 
 .PHONY: build-cli
 build-cli:
 	@echo "Building CLI..."
-	CGO_ENABLED=0 $(GO) build $(BUILD_FLAGS) -o bin/$(CLI_NAME) ./cmd/cli/main.go
+	CGO_ENABLED=0 $(GO) build $(BUILD_FLAGS) -o bin/$(CLI_NAME) ./cmd/cli
 
 .PHONY: build-linux
 build-linux:
 	@echo "Building for Linux..."
-	CGO_ENABLED=0 GOOS=linux $(GO) build $(BUILD_FLAGS) -o bin/$(APP_NAME)-linux ./cmd/broker/main.go
-	CGO_ENABLED=0 GOOS=linux $(GO) build $(BUILD_FLAGS) -o bin/$(CLI_NAME)-linux ./cmd/cli/main.go
+	CGO_ENABLED=0 GOOS=linux $(GO) build $(BUILD_FLAGS) -o bin/$(APP_NAME)-linux ./cmd/broker
+	CGO_ENABLED=0 GOOS=linux $(GO) build $(BUILD_FLAGS) -o bin/$(CLI_NAME)-linux ./cmd/cli
 
 .PHONY: clean
 clean:
@@ -185,12 +185,12 @@ clean:
 .PHONY: run
 run:
 	@echo "Running broker..."
-	$(GO) run ./cmd/broker/main.go
+	$(GO) run ./cmd/broker
 
 .PHONY: cli
 cli:
 	@echo "Running CLI..."
-	$(GO) run ./cmd/cli/main.go
+	$(GO) run ./cmd/cli
 
 .PHONY: tools
 tools:

@@ -50,7 +50,12 @@ func main() {
 		util.Fatal("❌ Failed to create stream manager adapter: %v", err)
 	}
 
-	tm := topic.NewTopicManager(cfg, dm, smAdapter)
+	storageProvider, err := newStorageProvider(dm, cfg.LogDir)
+	if err != nil {
+		util.Fatal("Failed to configure storage provider: %v", err)
+	}
+
+	tm := topic.NewTopicManager(cfg, storageProvider, smAdapter)
 	if err := tm.RestoreTopics(); err != nil {
 		util.Fatal("❌ Failed to restore durable topic metadata: %v", err)
 	}

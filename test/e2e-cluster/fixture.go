@@ -1,7 +1,9 @@
 package e2e_cluster
 
 import (
+	"encoding/json"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -9,9 +11,10 @@ import (
 )
 
 const (
-	composeFile    = "docker-compose.yml"
-	baseBrokerPort = 9000
-	baseHealthPort = 9080
+	composeFile      = "docker-compose.yml"
+	faultComposeFile = "docker-compose.faults.yml"
+	baseBrokerPort   = 9000
+	baseHealthPort   = 9080
 )
 
 // ClusterTestContext extends e2e.TestContext for cluster testing
@@ -64,14 +67,22 @@ func GivenCluster(t *testing.T) *ClusterTestContext {
 }
 
 func GivenClusterRestart(t *testing.T) *ClusterTestContext {
-	_ = e2e.RunCompose("-f", composeFile, "down", "-v", "--remove-orphans").Run()
-	cmd := e2e.RunCompose("-f", composeFile, "up", "-d", "--force-recreate", "--build")
+	return givenClusterRestart(t, composeFile)
+}
+
+func GivenFaultClusterRestart(t *testing.T) *ClusterTestContext {
+	return givenClusterRestart(t, composeFile, faultComposeFile)
+}
+
+func givenClusterRestart(t *testing.T, composeFiles ...string) *ClusterTestContext {
+	_ = runClusterCompose(composeFiles, "down", "-v", "--remove-orphans").Run()
+	cmd := runClusterCompose(composeFiles, "up", "-d", "--force-recreate", "--build")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("Failed to start docker compose: %v\nOutput: %s", err, string(output))
 	}
 
 	t.Cleanup(func() {
-		cmd := e2e.RunCompose("-f", composeFile, "down", "-v")
+		cmd := runClusterCompose(composeFiles, "down", "-v", "--remove-orphans")
 		if err := cmd.Run(); err != nil {
 			t.Logf("Cleanup warning: failed to bring down docker compose: %v", err)
 		}
@@ -87,17 +98,37 @@ func GivenClusterRestart(t *testing.T) *ClusterTestContext {
 
 	t.Log("Waiting for Raft leader to be elected...")
 	if err := eventually(t, "Raft leader election", clusterReadyTimeout, func() (bool, string, error) {
-		resp, err := actions.actions.SendCommand("LIST")
+		resp, err := actions.actions.SendCommand("LIST_CLUSTER")
 		if err != nil {
-			return false, "LIST failed", err
+			return false, "LIST_CLUSTER failed", err
 		}
-		return !strings.Contains(resp, "ERROR:") && !strings.Contains(resp, "unknown"), resp, nil
+		return listClusterReady(resp)
 	}); err != nil {
 		t.Fatal(err)
 	}
 	t.Log("Raft leader elected, cluster ready.")
 
 	return ctx
+}
+
+func listClusterReady(response string) (bool, string, error) {
+	const prefix = "OK brokers="
+	response = strings.TrimSpace(response)
+	if !strings.HasPrefix(response, prefix) {
+		return false, response, fmt.Errorf("unexpected LIST_CLUSTER response %q", response)
+	}
+	var brokers []struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(response, prefix)), &brokers); err != nil {
+		return false, response, fmt.Errorf("decode LIST_CLUSTER brokers: %w", err)
+	}
+	for _, broker := range brokers {
+		if broker.Status == "active" {
+			return true, fmt.Sprintf("%d broker(s), active member present", len(brokers)), nil
+		}
+	}
+	return false, fmt.Sprintf("%d broker(s), no active member", len(brokers)), nil
 }
 
 func (c *ClusterTestContext) WithTopic(topic string) *ClusterTestContext {
@@ -135,4 +166,13 @@ func (c *ClusterTestContext) WithClusterSize(size int) *ClusterTestContext {
 func (c *ClusterTestContext) WithMinInSyncReplicas(min int) *ClusterTestContext {
 	c.minInSyncReplicas = min
 	return c
+}
+
+func runClusterCompose(composeFiles []string, args ...string) *exec.Cmd {
+	composeArgs := make([]string, 0, len(composeFiles)*2+len(args))
+	for _, file := range composeFiles {
+		composeArgs = append(composeArgs, "-f", file)
+	}
+	composeArgs = append(composeArgs, args...)
+	return e2e.RunCompose(composeArgs...)
 }

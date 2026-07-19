@@ -2,7 +2,6 @@ package topic
 
 import (
 	"errors"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -11,24 +10,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type cleanupRetryProvider struct {
+	*disk.DiskManager
+	fail bool
+}
+
+func (provider *cleanupRetryProvider) RemoveTopicStorage(path string) error {
+	if provider.fail {
+		return errors.New("injected cleanup failure")
+	}
+	return provider.DiskManager.RemoveTopicStorage(path)
+}
+
 func TestTopicStorageCleanupFailureCanBeRetriedAfterLogicalDelete(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
 	cfg.LogDir = t.TempDir()
 	dm := disk.NewDiskManager(cfg)
 	t.Cleanup(dm.CloseAllHandlers)
-	manager := NewTopicManager(cfg, dm, nil)
+	provider := &cleanupRetryProvider{DiskManager: dm}
+	manager := NewTopicManager(cfg, provider, nil)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
 
-	originalRemove := removeTopicStorageFn
-	fail := true
-	removeTopicStorageFn = func(path string) error {
-		if fail {
-			return errors.New("injected cleanup failure")
-		}
-		return os.RemoveAll(path)
-	}
-	t.Cleanup(func() { removeTopicStorageFn = originalRemove })
+	provider.fail = true
 
 	deleted, err := manager.DeleteTopicDurable("orders")
 	require.True(t, deleted)
@@ -36,14 +40,14 @@ func TestTopicStorageCleanupFailureCanBeRetriedAfterLogicalDelete(t *testing.T) 
 	require.Nil(t, manager.GetTopic("orders"))
 	require.DirExists(t, filepath.Join(cfg.LogDir, "orders"))
 
-	fail = false
+	provider.fail = false
 	require.NoError(t, manager.CleanupTopicStorage("orders"))
 	require.NoDirExists(t, filepath.Join(cfg.LogDir, "orders"))
 	require.NoError(t, manager.CleanupTopicStorage("orders"))
 
 	require.NoError(t, manager.CreateTopic("payments", 1, false, false))
-	fail = true
+	provider.fail = true
 	require.True(t, manager.DeleteTopic("payments"), "logical deletion must remain visible when only cleanup fails")
-	fail = false
+	provider.fail = false
 	require.NoError(t, manager.CleanupTopicStorage("payments"))
 }
