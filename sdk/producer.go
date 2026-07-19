@@ -144,6 +144,9 @@ func NewProducerWithContext(ctx context.Context, cfg *PublisherConfig) (*Produce
 		go p.partitionSender(i)
 	}
 	if connectedCount == 0 {
+		if closeErr := p.Close(); closeErr != nil {
+			LogWarn("failed to clean up producer after connection failure: %v", closeErr)
+		}
 		return nil, fmt.Errorf("failed to connect to any partition")
 	}
 

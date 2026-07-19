@@ -1,7 +1,9 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -62,5 +64,31 @@ func TestProducerConcurrentCloseWaitsForShutdown(t *testing.T) {
 	}
 	if err := <-secondDone; err != nil {
 		t.Fatalf("second Close failed: %v", err)
+	}
+}
+
+func producerSenderGoroutines() int {
+	stack := make([]byte, 1<<20)
+	n := runtime.Stack(stack, true)
+	return bytes.Count(stack[:n], []byte("sdk.(*Producer).partitionSender"))
+}
+
+func TestNewProducerCleansUpWorkersWhenAllConnectionsFail(t *testing.T) {
+	before := producerSenderGoroutines()
+	cfg := NewDefaultPublisherConfig()
+	cfg.Topic = "producer-init-failure"
+	cfg.Partitions = 2
+	cfg.BrokerAddrs = []string{"127.0.0.1:0"}
+
+	if producer, err := NewProducer(cfg); err == nil || producer != nil {
+		t.Fatalf("expected connection failure, got producer=%v err=%v", producer, err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for producerSenderGoroutines() > before && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if after := producerSenderGoroutines(); after > before {
+		t.Fatalf("producer initialization leaked %d sender goroutines", after-before)
 	}
 }
