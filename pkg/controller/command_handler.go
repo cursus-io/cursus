@@ -25,18 +25,6 @@ var (
 	maxCacheSize = 1024
 )
 
-// handleHelp processes HELP command
-func (ch *CommandHandler) handleHelp() string {
-	commands := []string{
-		"CREATE", "DELETE", "LIST", "PUBLISH", "CONSUME", "STREAM", "JOIN_GROUP", "SYNC_GROUP",
-		"LEAVE_GROUP", "HEARTBEAT", "COMMIT_OFFSET", "BATCH_COMMIT", "FETCH_OFFSET", "LIST_OFFSETS", "INIT_PRODUCER_ID", "BEGIN_TXN", "TXN_PUBLISH", "SEND_OFFSETS_TO_TXN", "END_TXN", "TXN_STATUS", "REGISTER_GROUP",
-		"GROUP_STATUS", "LIST_GROUPS", "DESCRIBE", "APPEND_STREAM", "READ_STREAM", "SAVE_SNAPSHOT",
-		"READ_SNAPSHOT", "STREAM_VERSION", "METADATA", "FIND_COORDINATOR", "PROTOCOL_INFO", "NEGOTIATE",
-		"LIST_CLUSTER", "CLUSTER_STATUS", "ELECT_LEADER", "HELP", "EXIT",
-	}
-	return fmt.Sprintf("OK commands=%s", strings.Join(commands, ","))
-}
-
 // handleCreate processes CREATE command
 func (ch *CommandHandler) handleCreate(cmd string) string {
 	args := parseKeyValueArgs(cmd[7:])
