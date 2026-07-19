@@ -97,7 +97,7 @@ func (ch *CommandHandler) authorizeTopicWrite(policy topic.Policy, ctx *ClientCo
 }
 
 func (ch *CommandHandler) authorizeClientCommand(input commandInput, ctx *ClientContext) string {
-	permissions := commandPermissions(input)
+	permissions := ch.commandPermissions(input)
 	if len(permissions) == 0 {
 		return ""
 	}
@@ -161,38 +161,16 @@ func hasPermission(granted []string, required string) bool {
 	return false
 }
 
-func commandPermissions(input commandInput) []string {
-	upper := input.Upper
-	switch {
-	case upper == "LIST_CLUSTER", upper == "CLUSTER_STATUS", strings.HasPrefix(upper, "ELECT_LEADER "), strings.HasPrefix(upper, "CREATE "), strings.HasPrefix(upper, "DELETE "):
-		return []string{PermissionAdmin}
-	case upper == "LIST", strings.HasPrefix(upper, "DESCRIBE "), strings.HasPrefix(upper, "METADATA "),
-		upper == "LIST_OFFSETS", strings.HasPrefix(upper, "LIST_OFFSETS "),
-		strings.HasPrefix(upper, "READ_STREAM "), strings.HasPrefix(upper, "READ_SNAPSHOT "),
-		strings.HasPrefix(upper, "STREAM_VERSION "):
-		return []string{PermissionTopicRead}
-	case strings.HasPrefix(upper, "PUBLISH "), strings.HasPrefix(upper, "APPEND_STREAM "),
-		strings.HasPrefix(upper, "SAVE_SNAPSHOT "):
-		return []string{PermissionTopicWrite}
-	case strings.HasPrefix(upper, "TXN_PUBLISH "):
-		return []string{PermissionTransaction, PermissionTopicWrite}
-	case strings.HasPrefix(upper, "SEND_OFFSETS_TO_TXN "):
-		return []string{PermissionTransaction, PermissionGroup}
-	case strings.HasPrefix(upper, "INIT_PRODUCER_ID "), strings.HasPrefix(upper, "BEGIN_TXN "),
-		strings.HasPrefix(upper, "END_TXN "), strings.HasPrefix(upper, "TXN_STATUS "):
-		return []string{PermissionTransaction}
-	case strings.HasPrefix(upper, "FIND_COORDINATOR "):
-		if input.Args["transactional_id"] != "" || input.Args["txn"] != "" || input.Args["transaction"] != "" {
+func (ch *CommandHandler) commandPermissions(input commandInput) []string {
+	for _, entry := range ch.commands {
+		if !entry.matches(input) {
+			continue
+		}
+		if input.Name == "FIND_COORDINATOR" &&
+			(input.Args["transactional_id"] != "" || input.Args["txn"] != "" || input.Args["transaction"] != "") {
 			return []string{PermissionTransaction}
 		}
-		return []string{PermissionGroup}
-	case upper == "LIST_GROUPS", strings.HasPrefix(upper, "REGISTER_GROUP "), strings.HasPrefix(upper, "JOIN_GROUP "),
-		strings.HasPrefix(upper, "SYNC_GROUP "), strings.HasPrefix(upper, "LEAVE_GROUP "),
-		strings.HasPrefix(upper, "FETCH_OFFSET "), strings.HasPrefix(upper, "GROUP_STATUS "),
-		strings.HasPrefix(upper, "HEARTBEAT "), strings.HasPrefix(upper, "COMMIT_OFFSET "),
-		strings.HasPrefix(upper, "BATCH_COMMIT "):
-		return []string{PermissionGroup}
-	default:
-		return nil
+		return entry.permissions
 	}
+	return nil
 }
