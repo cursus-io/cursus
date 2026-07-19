@@ -30,3 +30,21 @@ func TestIsTextCommandRequiresCommandToken(t *testing.T) {
 		}
 	}
 }
+
+func TestIsTextCommandClusterObservationTokens(t *testing.T) {
+	for _, value := range []string{
+		"LIST_CLUSTER",
+		"list_cluster",
+		"  CLUSTER_STATUS",
+		"CLUSTER_STATUS extra=x",
+	} {
+		if !IsTextCommand(value) {
+			t.Errorf("cluster observation command was not recognized: %q", value)
+		}
+	}
+	for _, value := range []string{"LIST_CLUSTERED", "CLUSTER_STATUS_X"} {
+		if IsTextCommand(value) {
+			t.Errorf("similar token was recognized as a command: %q", value)
+		}
+	}
+}

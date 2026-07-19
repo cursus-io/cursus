@@ -59,9 +59,23 @@ func transactionalIDExpiration(cfg *config.Config) time.Duration {
 
 // commandEntry defines a single command routing rule.
 type commandEntry struct {
-	prefix  string
-	exact   bool
-	handler func(cmd string, ctx *ClientContext) string
+	prefix      string
+	exact       bool
+	helpOrder   int
+	internal    bool
+	permissions []string
+	handler     func(cmd string, ctx *ClientContext) string
+}
+
+func (entry commandEntry) name() string {
+	return strings.TrimSpace(entry.prefix)
+}
+
+func (entry commandEntry) matches(input commandInput) bool {
+	if entry.exact {
+		return strings.EqualFold(input.Raw, entry.prefix)
+	}
+	return strings.HasPrefix(input.Upper, entry.prefix)
 }
 
 type ConsumeArgs struct {
@@ -97,63 +111,57 @@ func NewCommandHandler(
 	}
 	ch.commands = []commandEntry{
 		{prefix: "AUTH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAuth(cmd, ctx) }},
-		{prefix: "HELP", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHelp() }},
-		{prefix: "PROTOCOL_INFO", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleProtocolInfo() }},
-		{prefix: "NEGOTIATE", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleNegotiate(cmd, ctx) }},
+		{prefix: "HELP", exact: true, helpOrder: 37, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHelp() }},
+		{prefix: "PROTOCOL_INFO", exact: true, helpOrder: 32, handler: func(cmd string, ctx *ClientContext) string { return ch.handleProtocolInfo() }},
+		{prefix: "NEGOTIATE", exact: true, helpOrder: 33, handler: func(cmd string, ctx *ClientContext) string { return ch.handleNegotiate(cmd, ctx) }},
 		{prefix: "NEGOTIATE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleNegotiate(cmd, ctx) }},
-		{prefix: "LIST_CLUSTER", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListCluster() }},
-		{prefix: "CLUSTER_STATUS", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleClusterStatus() }},
-		{prefix: "ELECT_LEADER ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleElectLeader(cmd) }},
-		{prefix: "LIST", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList() }},
-		{prefix: "CREATE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd) }},
-		{prefix: "DELETE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd) }},
-		{prefix: "PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd, ctx) }},
-		{prefix: "REGISTER_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRegisterGroup(cmd) }},
-		{prefix: "JOIN_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleJoinGroup(cmd, ctx) }},
-		{prefix: "SYNC_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSyncGroup(cmd) }},
-		{prefix: "LEAVE_GROUP ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleLeaveGroup(cmd) }},
-		{prefix: "FETCH_OFFSET ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchOffset(cmd) }},
-		{prefix: "LIST_OFFSETS", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListOffsets(cmd, ctx) }},
-		{prefix: "LIST_OFFSETS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListOffsets(cmd, ctx) }},
-		{prefix: "GROUP_STATUS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleGroupStatus(cmd) }},
-		{prefix: "DESCRIBE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDescribeTopic(cmd) }},
-		{prefix: "HEARTBEAT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHeartbeat(cmd) }},
-		{prefix: "COMMIT_OFFSET ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCommitOffset(cmd) }},
-		{prefix: "BATCH_COMMIT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd) }},
-		{prefix: "INIT_PRODUCER_ID ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleInitProducerID(cmd) }},
-		{prefix: "BEGIN_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBeginTxn(cmd) }},
-		{prefix: "TXN_PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnPublish(cmd, ctx) }},
-		{prefix: "SEND_OFFSETS_TO_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSendOffsetsToTxn(cmd) }},
-		{prefix: "END_TXN ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleEndTxn(cmd) }},
-		{prefix: "TXN_STATUS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnStatus(cmd) }},
-		{prefix: "APPEND_STREAM ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAppendStream(cmd) }},
-		{prefix: "STREAM_VERSION ", exact: false, handler: func(cmd string, ctx *ClientContext) string {
+		{prefix: "LIST_CLUSTER", exact: true, helpOrder: 34, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListCluster() }},
+		{prefix: "CLUSTER_STATUS", exact: true, helpOrder: 35, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleClusterStatus() }},
+		{prefix: "ELECT_LEADER ", exact: false, helpOrder: 36, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleElectLeader(cmd) }},
+		{prefix: "LIST", exact: true, helpOrder: 3, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList() }},
+		{prefix: "LIST_GROUPS", exact: true, helpOrder: 23, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListGroups() }},
+		{prefix: "CREATE ", exact: false, helpOrder: 1, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd) }},
+		{prefix: "DELETE ", exact: false, helpOrder: 2, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd) }},
+		{prefix: "PUBLISH ", exact: false, helpOrder: 4, permissions: []string{PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd, ctx) }},
+		{prefix: "CONSUME ", exact: false, helpOrder: 5, permissions: []string{PermissionTopicRead, PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.validateConsumeSyntax(cmd, cmd) }},
+		{prefix: "STREAM ", exact: false, helpOrder: 6, permissions: []string{PermissionTopicRead, PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.validateStreamSyntax(cmd, cmd) }},
+		{prefix: "REGISTER_GROUP ", exact: false, helpOrder: 21, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRegisterGroup(cmd) }},
+		{prefix: "JOIN_GROUP ", exact: false, helpOrder: 7, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleJoinGroup(cmd, ctx) }},
+		{prefix: "SYNC_GROUP ", exact: false, helpOrder: 8, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSyncGroup(cmd) }},
+		{prefix: "LEAVE_GROUP ", exact: false, helpOrder: 9, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleLeaveGroup(cmd) }},
+		{prefix: "FETCH_OFFSET ", exact: false, helpOrder: 13, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchOffset(cmd) }},
+		{prefix: "LIST_OFFSETS", exact: true, helpOrder: 14, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListOffsets(cmd, ctx) }},
+		{prefix: "LIST_OFFSETS ", exact: false, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListOffsets(cmd, ctx) }},
+		{prefix: "GROUP_STATUS ", exact: false, helpOrder: 22, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleGroupStatus(cmd) }},
+		{prefix: "DESCRIBE ", exact: false, helpOrder: 24, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDescribeTopic(cmd) }},
+		{prefix: "HEARTBEAT ", exact: false, helpOrder: 10, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHeartbeat(cmd) }},
+		{prefix: "COMMIT_OFFSET ", exact: false, helpOrder: 11, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCommitOffset(cmd) }},
+		{prefix: "BATCH_COMMIT ", exact: false, helpOrder: 12, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd) }},
+		{prefix: "INIT_PRODUCER_ID ", exact: false, helpOrder: 15, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleInitProducerID(cmd) }},
+		{prefix: "BEGIN_TXN ", exact: false, helpOrder: 16, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBeginTxn(cmd) }},
+		{prefix: "TXN_PUBLISH ", exact: false, helpOrder: 17, permissions: []string{PermissionTransaction, PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnPublish(cmd, ctx) }},
+		{prefix: "SEND_OFFSETS_TO_TXN ", exact: false, helpOrder: 18, permissions: []string{PermissionTransaction, PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSendOffsetsToTxn(cmd) }},
+		{prefix: "END_TXN ", exact: false, helpOrder: 19, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleEndTxn(cmd) }},
+		{prefix: "TXN_STATUS ", exact: false, helpOrder: 20, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnStatus(cmd) }},
+		{prefix: "APPEND_STREAM ", exact: false, helpOrder: 25, permissions: []string{PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAppendStream(cmd) }},
+		{prefix: "STREAM_VERSION ", exact: false, helpOrder: 29, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string {
 			return ch.handleEventSourceRoutedCommand(cmd, "STREAM_VERSION ", ch.ESHandler.HandleStreamVersion)
 		}},
-		{prefix: "SAVE_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSaveSnapshot(cmd) }},
-		{prefix: "READ_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string {
+		{prefix: "SAVE_SNAPSHOT ", exact: false, helpOrder: 27, permissions: []string{PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSaveSnapshot(cmd) }},
+		{prefix: "READ_SNAPSHOT ", exact: false, helpOrder: 28, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string {
 			return ch.handleEventSourceRoutedCommand(cmd, "READ_SNAPSHOT ", ch.ESHandler.HandleReadSnapshot)
 		}},
-		{prefix: "READ_STREAM ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return STREAM_DATA_SIGNAL }},
-		{prefix: "METADATA ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleMetadata(cmd) }},
-		{prefix: "FIND_COORDINATOR ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFindCoordinator(cmd) }},
-		{prefix: "REPLICATE_MESSAGE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateMessage(cmd) }},
-		{prefix: "REPLICATE_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateSnapshot(cmd) }},
-		{prefix: "LIST_SNAPSHOTS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListSnapshots(cmd) }},
-		{prefix: "FETCH_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchSnapshot(cmd) }},
-		{prefix: "CATCHUP_SNAPSHOTS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCatchupSnapshots(cmd) }},
-		{prefix: "RAFT_APPLY ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd) }},
+		{prefix: "READ_STREAM ", exact: false, helpOrder: 26, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return STREAM_DATA_SIGNAL }},
+		{prefix: "METADATA ", exact: false, helpOrder: 30, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleMetadata(cmd) }},
+		{prefix: "FIND_COORDINATOR ", exact: false, helpOrder: 31, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFindCoordinator(cmd) }},
+		{prefix: "REPLICATE_MESSAGE ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateMessage(cmd) }},
+		{prefix: "REPLICATE_SNAPSHOT ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateSnapshot(cmd) }},
+		{prefix: "LIST_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListSnapshots(cmd) }},
+		{prefix: "FETCH_SNAPSHOT ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchSnapshot(cmd) }},
+		{prefix: "CATCHUP_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCatchupSnapshots(cmd) }},
+		{prefix: "RAFT_APPLY ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd) }},
 	}
 	return ch
-}
-
-var internalCommandPrefixes = []string{
-	"REPLICATE_MESSAGE ",
-	"REPLICATE_SNAPSHOT ",
-	"LIST_SNAPSHOTS ",
-	"FETCH_SNAPSHOT ",
-	"CATCHUP_SNAPSHOTS ",
-	"RAFT_APPLY ",
 }
 
 func (ch *CommandHandler) logCommandResult(cmd, response string) {
@@ -200,8 +208,9 @@ func redactOneCommandSecret(s, key string) string {
 // HandleCommand processes non-streaming commands and returns a signal for streaming commands.
 func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (response string) {
 	started := time.Now()
-	cmd := strings.TrimSpace(rawCmd)
-	commandName := ch.metricCommandName(cmd)
+	input := decodeCommandInput(rawCmd)
+	cmd := input.Raw
+	commandName := ch.metricCommandNameInput(input)
 	defer func() {
 		metrics.RecordCommand(commandName, response, time.Since(started))
 	}()
@@ -212,48 +221,35 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 		return resp
 	}
 
-	upper := strings.ToUpper(cmd)
-
-	if strings.HasPrefix(upper, "STREAM ") {
-		resp := decorateProtocolResponse(ch.validateStreamSyntax(cmd, rawCmd), ctx)
-		if resp != STREAM_DATA_SIGNAL {
-			ch.logCommandResult(rawCmd, resp)
-		}
-		return resp
-	}
-	if strings.HasPrefix(upper, "CONSUME ") {
-		resp := decorateProtocolResponse(ch.validateConsumeSyntax(cmd, rawCmd), ctx)
-		if resp != STREAM_DATA_SIGNAL {
-			ch.logCommandResult(rawCmd, resp)
-		}
-		return resp
-	}
-	if name, ok := internalCommandName(upper); ok {
-		if resp := ch.authorizeInternalCommand(name, cmd); resp != "" {
+	if name, ok := ch.internalCommandName(input); ok {
+		if resp := ch.authorizeInternalCommand(name, input); resp != "" {
 			return ch.fail(rawCmd, resp)
 		}
 	}
 
-	if resp := ch.authorizeClientCommand(cmd, upper, ctx); resp != "" {
+	if resp := ch.authorizeClientCommand(input, ctx); resp != "" {
 		return ch.fail(rawCmd, resp)
 	}
 
-	response = decorateProtocolResponse(ch.handleCommandByType(cmd, upper, ctx), ctx)
+	response = decorateProtocolResponse(ch.handleCommandByType(input, ctx), ctx)
 	ch.logCommandResult(rawCmd, response)
 	return response
 }
 
 func (ch *CommandHandler) metricCommandName(cmd string) string {
-	fields := strings.Fields(cmd)
-	if len(fields) == 0 {
+	return ch.metricCommandNameInput(decodeCommandInput(cmd))
+}
+
+func (ch *CommandHandler) metricCommandNameInput(input commandInput) string {
+	name := input.Name
+	if name == "" {
 		return "EMPTY"
 	}
-	name := strings.ToUpper(fields[0])
 	if name == "STREAM" || name == "CONSUME" {
 		return name
 	}
 	for _, entry := range ch.commands {
-		if name == strings.TrimSpace(entry.prefix) {
+		if name == entry.name() {
 			return name
 		}
 	}
@@ -261,31 +257,25 @@ func (ch *CommandHandler) metricCommandName(cmd string) string {
 }
 
 // handleCommandByType dispatches to the matching command handler from the registry.
-func (ch *CommandHandler) handleCommandByType(cmd, upper string, ctx *ClientContext) string {
+func (ch *CommandHandler) handleCommandByType(input commandInput, ctx *ClientContext) string {
 	for _, entry := range ch.commands {
-		if entry.exact {
-			if strings.EqualFold(cmd, entry.prefix) {
-				return entry.handler(cmd, ctx)
-			}
-		} else {
-			if strings.HasPrefix(upper, entry.prefix) {
-				return entry.handler(cmd, ctx)
-			}
+		if entry.matches(input) {
+			return entry.handler(input.Raw, ctx)
 		}
 	}
-	return fmt.Sprintf("ERROR: unknown_command command=%q", cmd)
+	return fmt.Sprintf("ERROR: unknown_command command=%q", input.Raw)
 }
 
-func internalCommandName(upper string) (string, bool) {
-	for _, prefix := range internalCommandPrefixes {
-		if strings.HasPrefix(upper, prefix) {
-			return strings.TrimSpace(prefix), true
+func (ch *CommandHandler) internalCommandName(input commandInput) (string, bool) {
+	for _, entry := range ch.commands {
+		if entry.internal && entry.matches(input) {
+			return entry.name(), true
 		}
 	}
 	return "", false
 }
 
-func (ch *CommandHandler) authorizeInternalCommand(name, cmd string) string {
+func (ch *CommandHandler) authorizeInternalCommand(name string, input commandInput) string {
 	if ch == nil || ch.Config == nil || !ch.Config.EnabledDistribution {
 		return ""
 	}
@@ -293,8 +283,7 @@ func (ch *CommandHandler) authorizeInternalCommand(name, cmd string) string {
 	if token == "" {
 		return fmt.Sprintf("ERROR: internal_auth_not_configured command=%s", name)
 	}
-	args := parseKeyValueArgs(strings.TrimPrefix(cmd, name+" "))
-	if !constantTimeStringEqual(args["internal_token"], token) {
+	if !constantTimeStringEqual(input.Args["internal_token"], token) {
 		return fmt.Sprintf("ERROR: internal_command_unauthorized command=%s", name)
 	}
 	return ""

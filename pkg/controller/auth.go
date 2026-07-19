@@ -96,17 +96,16 @@ func (ch *CommandHandler) authorizeTopicWrite(policy topic.Policy, ctx *ClientCo
 	return "ERROR: NOT_AUTHORIZED_FOR_TOPIC operation=write"
 }
 
-func (ch *CommandHandler) authorizeClientCommand(cmd, upper string, ctx *ClientContext) string {
-	permissions := commandPermissions(cmd, upper)
+func (ch *CommandHandler) authorizeClientCommand(input commandInput, ctx *ClientContext) string {
+	permissions := ch.commandPermissions(input)
 	if len(permissions) == 0 {
 		return ""
 	}
 
-	args := commandArguments(cmd)
-	if authResp := ch.authenticateInline(args, ctx); authResp != "" {
+	if authResp := ch.authenticateInline(input.Args, ctx); authResp != "" {
 		return authResp
 	}
-	return ch.authorizeClientPermissions(commandName(upper), args, ctx, permissions...)
+	return ch.authorizeClientPermissions(input.Name, input.Args, ctx, permissions...)
 }
 
 func (ch *CommandHandler) authorizeClientPermissions(command string, args map[string]string, ctx *ClientContext, permissions ...string) string {
@@ -162,51 +161,16 @@ func hasPermission(granted []string, required string) bool {
 	return false
 }
 
-func commandArguments(cmd string) map[string]string {
-	if idx := strings.IndexByte(cmd, ' '); idx >= 0 && idx+1 < len(cmd) {
-		return parseKeyValueArgs(cmd[idx+1:])
-	}
-	return map[string]string{}
-}
-
-func commandName(upper string) string {
-	if idx := strings.IndexByte(upper, ' '); idx >= 0 {
-		return upper[:idx]
-	}
-	return upper
-}
-
-func commandPermissions(cmd, upper string) []string {
-	switch {
-	case upper == "LIST_CLUSTER", upper == "CLUSTER_STATUS", strings.HasPrefix(upper, "ELECT_LEADER "), strings.HasPrefix(upper, "CREATE "), strings.HasPrefix(upper, "DELETE "):
-		return []string{PermissionAdmin}
-	case upper == "LIST", strings.HasPrefix(upper, "DESCRIBE "), strings.HasPrefix(upper, "METADATA "),
-		upper == "LIST_OFFSETS", strings.HasPrefix(upper, "LIST_OFFSETS "),
-		strings.HasPrefix(upper, "READ_STREAM "), strings.HasPrefix(upper, "READ_SNAPSHOT "),
-		strings.HasPrefix(upper, "STREAM_VERSION "):
-		return []string{PermissionTopicRead}
-	case strings.HasPrefix(upper, "PUBLISH "), strings.HasPrefix(upper, "APPEND_STREAM "),
-		strings.HasPrefix(upper, "SAVE_SNAPSHOT "):
-		return []string{PermissionTopicWrite}
-	case strings.HasPrefix(upper, "TXN_PUBLISH "):
-		return []string{PermissionTransaction, PermissionTopicWrite}
-	case strings.HasPrefix(upper, "SEND_OFFSETS_TO_TXN "):
-		return []string{PermissionTransaction, PermissionGroup}
-	case strings.HasPrefix(upper, "INIT_PRODUCER_ID "), strings.HasPrefix(upper, "BEGIN_TXN "),
-		strings.HasPrefix(upper, "END_TXN "), strings.HasPrefix(upper, "TXN_STATUS "):
-		return []string{PermissionTransaction}
-	case strings.HasPrefix(upper, "FIND_COORDINATOR "):
-		if args := commandArguments(cmd); args["transactional_id"] != "" || args["txn"] != "" || args["transaction"] != "" {
+func (ch *CommandHandler) commandPermissions(input commandInput) []string {
+	for _, entry := range ch.commands {
+		if !entry.matches(input) {
+			continue
+		}
+		if input.Name == "FIND_COORDINATOR" &&
+			(input.Args["transactional_id"] != "" || input.Args["txn"] != "" || input.Args["transaction"] != "") {
 			return []string{PermissionTransaction}
 		}
-		return []string{PermissionGroup}
-	case strings.HasPrefix(upper, "REGISTER_GROUP "), strings.HasPrefix(upper, "JOIN_GROUP "),
-		strings.HasPrefix(upper, "SYNC_GROUP "), strings.HasPrefix(upper, "LEAVE_GROUP "),
-		strings.HasPrefix(upper, "FETCH_OFFSET "), strings.HasPrefix(upper, "GROUP_STATUS "),
-		strings.HasPrefix(upper, "HEARTBEAT "), strings.HasPrefix(upper, "COMMIT_OFFSET "),
-		strings.HasPrefix(upper, "BATCH_COMMIT "):
-		return []string{PermissionGroup}
-	default:
-		return nil
+		return entry.permissions
 	}
+	return nil
 }

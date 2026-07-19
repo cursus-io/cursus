@@ -18,6 +18,7 @@ import (
 type MockRaftManagerForForward struct {
 	isLeader      bool
 	leaderAddress atomic.Value
+	state         *fsm.BrokerFSM
 }
 
 func (m *MockRaftManagerForForward) IsLeader() bool { return m.isLeader }
@@ -30,7 +31,7 @@ func (m *MockRaftManagerForForward) GetLeaderAddress() string {
 }
 func (m *MockRaftManagerForForward) ApplyCommand(prefix string, data []byte) error { return nil }
 func (m *MockRaftManagerForForward) LeaderCh() <-chan bool                         { return nil }
-func (m *MockRaftManagerForForward) GetFSM() *fsm.BrokerFSM                        { return nil }
+func (m *MockRaftManagerForForward) GetFSM() *fsm.BrokerFSM                        { return m.state }
 func (m *MockRaftManagerForForward) GetConfiguration() raft.ConfigurationFuture    { return nil }
 func (m *MockRaftManagerForForward) ReplicateWithQuorum(t string, p int, msg types.Message, i int, idemp bool, scope string) (types.AckResponse, error) {
 	return types.AckResponse{}, nil

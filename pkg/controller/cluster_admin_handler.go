@@ -42,6 +42,24 @@ type clusterStatus struct {
 	Partitions      []clusterPartitionStatus `json:"partitions"`
 }
 
+// handleListCluster processes the read-only LIST_CLUSTER command.
+func (ch *CommandHandler) handleListCluster() string {
+	if !ch.isDistributed() {
+		return "ERROR: distribution_not_enabled"
+	}
+	state := ch.Cluster.RaftManager.GetFSM()
+	if state == nil {
+		return "ERROR: fsm_not_available"
+	}
+
+	brokers := state.GetBrokers()
+	data, err := json.Marshal(brokers)
+	if err != nil {
+		return fmt.Sprintf("ERROR: marshal_brokers_failed reason=%q", err.Error())
+	}
+	return fmt.Sprintf("OK brokers=%s", string(data))
+}
+
 func (ch *CommandHandler) handleClusterStatus() string {
 	if !ch.isDistributed() {
 		return "ERROR: distribution_required command=CLUSTER_STATUS"
