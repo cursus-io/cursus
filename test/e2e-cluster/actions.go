@@ -29,32 +29,26 @@ func (c *ClusterTestContext) WhenCluster() *ClusterActions {
 
 func (a *ClusterActions) StartCluster() *ClusterActions {
 	a.ctx.GetT().Logf("Waiting for %d cluster nodes to register...", a.ctx.clusterSize)
-
-	maxRetries := 20
-	for i := 0; i < maxRetries; i++ {
+	if err := eventually(a.ctx.GetT(), "active cluster membership", clusterReadyTimeout, func() (bool, string, error) {
 		resp, err := a.actions.SendCommand("LIST_CLUSTER")
-		if err == nil {
-			a.ctx.GetT().Logf("DEBUG: LIST_CLUSTER raw response: %s", resp)
-			payload := strings.TrimPrefix(strings.TrimSpace(resp), "OK brokers=")
-			var brokers []fsm.BrokerInfo
-			if err := json.Unmarshal([]byte(payload), &brokers); err == nil {
-				activeCount := 0
-				for _, b := range brokers {
-					if b.Status == "active" {
-						activeCount++
-					}
-				}
-				a.ctx.GetT().Logf("LIST_CLUSTER (Attempt %d/%d): %d/%d active. Brokers: %+v", i+1, maxRetries, activeCount, a.ctx.clusterSize, brokers)
-				if activeCount >= a.ctx.clusterSize {
-					a.ctx.GetT().Logf("All %d cluster nodes registered and active", a.ctx.clusterSize)
-					return a
-				}
+		if err != nil {
+			return false, "LIST_CLUSTER failed", err
+		}
+		payload := strings.TrimPrefix(strings.TrimSpace(resp), "OK brokers=")
+		var brokers []fsm.BrokerInfo
+		if err := json.Unmarshal([]byte(payload), &brokers); err != nil {
+			return false, resp, err
+		}
+		activeCount := 0
+		for _, broker := range brokers {
+			if broker.Status == "active" {
+				activeCount++
 			}
 		}
-		time.Sleep(1 * time.Second)
+		return activeCount >= a.ctx.clusterSize, fmt.Sprintf("%d/%d active", activeCount, a.ctx.clusterSize), nil
+	}); err != nil {
+		a.ctx.GetT().Fatal(err)
 	}
-
-	a.ctx.GetT().Fatalf("cluster did not report %d active nodes after %d attempts", a.ctx.clusterSize, maxRetries)
 	return a
 }
 
