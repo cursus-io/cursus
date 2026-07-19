@@ -29,3 +29,24 @@ func TestCommandDescriptorPermissions(t *testing.T) {
 		}
 	}
 }
+
+func TestInternalCommandDescriptors(t *testing.T) {
+	ch, _ := newTestHandler(t)
+	want := map[string]bool{
+		"REPLICATE_MESSAGE":  true,
+		"REPLICATE_SNAPSHOT": true,
+		"LIST_SNAPSHOTS":     true,
+		"FETCH_SNAPSHOT":     true,
+		"CATCHUP_SNAPSHOTS":  true,
+		"RAFT_APPLY":         true,
+	}
+	got := make(map[string]bool)
+	for _, entry := range ch.commands {
+		if entry.internal {
+			got[entry.name()] = true
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("internal command descriptors = %v, want %v", got, want)
+	}
+}

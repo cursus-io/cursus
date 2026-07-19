@@ -62,6 +62,7 @@ type commandEntry struct {
 	prefix      string
 	exact       bool
 	helpOrder   int
+	internal    bool
 	permissions []string
 	handler     func(cmd string, ctx *ClientContext) string
 }
@@ -151,23 +152,14 @@ func NewCommandHandler(
 		{prefix: "READ_STREAM ", exact: false, helpOrder: 26, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return STREAM_DATA_SIGNAL }},
 		{prefix: "METADATA ", exact: false, helpOrder: 30, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleMetadata(cmd) }},
 		{prefix: "FIND_COORDINATOR ", exact: false, helpOrder: 31, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFindCoordinator(cmd) }},
-		{prefix: "REPLICATE_MESSAGE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateMessage(cmd) }},
-		{prefix: "REPLICATE_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateSnapshot(cmd) }},
-		{prefix: "LIST_SNAPSHOTS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListSnapshots(cmd) }},
-		{prefix: "FETCH_SNAPSHOT ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchSnapshot(cmd) }},
-		{prefix: "CATCHUP_SNAPSHOTS ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCatchupSnapshots(cmd) }},
-		{prefix: "RAFT_APPLY ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd) }},
+		{prefix: "REPLICATE_MESSAGE ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateMessage(cmd) }},
+		{prefix: "REPLICATE_SNAPSHOT ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateSnapshot(cmd) }},
+		{prefix: "LIST_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListSnapshots(cmd) }},
+		{prefix: "FETCH_SNAPSHOT ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchSnapshot(cmd) }},
+		{prefix: "CATCHUP_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCatchupSnapshots(cmd) }},
+		{prefix: "RAFT_APPLY ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd) }},
 	}
 	return ch
-}
-
-var internalCommandPrefixes = []string{
-	"REPLICATE_MESSAGE ",
-	"REPLICATE_SNAPSHOT ",
-	"LIST_SNAPSHOTS ",
-	"FETCH_SNAPSHOT ",
-	"CATCHUP_SNAPSHOTS ",
-	"RAFT_APPLY ",
 }
 
 func (ch *CommandHandler) logCommandResult(cmd, response string) {
@@ -243,7 +235,7 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 		}
 		return resp
 	}
-	if name, ok := internalCommandName(upper); ok {
+	if name, ok := ch.internalCommandName(input); ok {
 		if resp := ch.authorizeInternalCommand(name, input); resp != "" {
 			return ch.fail(rawCmd, resp)
 		}
@@ -288,10 +280,10 @@ func (ch *CommandHandler) handleCommandByType(input commandInput, ctx *ClientCon
 	return fmt.Sprintf("ERROR: unknown_command command=%q", input.Raw)
 }
 
-func internalCommandName(upper string) (string, bool) {
-	for _, prefix := range internalCommandPrefixes {
-		if strings.HasPrefix(upper, prefix) {
-			return strings.TrimSpace(prefix), true
+func (ch *CommandHandler) internalCommandName(input commandInput) (string, bool) {
+	for _, entry := range ch.commands {
+		if entry.internal && entry.matches(input) {
+			return entry.name(), true
 		}
 	}
 	return "", false
