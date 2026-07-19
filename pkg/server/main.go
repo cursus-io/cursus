@@ -635,7 +635,7 @@ func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler,
 			cmdHandler.HandleReadStreamCommand(conn, payload)
 			return false, nil
 		default:
-			writeResponse(conn, "ERROR: unknown_command")
+			writeResponse(conn, decorateServerResponse("ERROR: unknown_command", ctx))
 			return false, nil
 		}
 	}
