@@ -1,7 +1,6 @@
 package sdk
 
 import (
-	"context"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -377,15 +376,9 @@ func TestConsumer_ProcessRetryQueue_DuringRebalance(t *testing.T) {
 
 func TestConsumer_Close_AlreadyClosed(t *testing.T) {
 	c := newTestConsumer(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	c.mainCtx = ctx
-	c.mainCancel = cancel
 
-	atomic.StoreInt32(&c.closed, 1)
-
-	err := c.Close()
-	assert.Error(t, err)
-	assert.ErrorIs(t, err, ErrConsumerClosed)
+	assert.NoError(t, c.Close())
+	assert.NoError(t, c.Close())
 }
 
 func TestPartitionConsumer_CloseWithConn(t *testing.T) {

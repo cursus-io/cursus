@@ -48,9 +48,10 @@ type Consumer struct {
 	rebalancing  int32
 	rebalanceSig chan struct{}
 
-	offsets map[int]uint64
-	doneCh  chan struct{}
-	mu      sync.RWMutex
+	offsets   map[int]uint64
+	doneCh    chan struct{}
+	closeDone chan struct{}
+	mu        sync.RWMutex
 
 	partitionLeaders map[int]string
 	partitionMu      sync.RWMutex
@@ -93,6 +94,7 @@ func NewConsumerWithContext(ctx context.Context, cfg *ConsumerConfig) (*Consumer
 		commitRetryMap:     make(map[int]uint64),
 		rebalanceSig:       make(chan struct{}, 1),
 		doneCh:             make(chan struct{}),
+		closeDone:          make(chan struct{}),
 		mainCtx:            workerCtx,
 		rootCtx:            ctx,
 		mainCancel:         cancel,
@@ -817,8 +819,10 @@ func parseFetchOffsetResponse(respStr string) (uint64, error) {
 
 func (c *Consumer) Close() error {
 	if !atomic.CompareAndSwapInt32(&c.closed, 0, 1) {
-		return fmt.Errorf("%w", ErrConsumerClosed)
+		<-c.closeDone
+		return nil
 	}
+	defer close(c.closeDone)
 
 	close(c.doneCh)
 	// Cancel the active consume context and close live sockets so blocked I/O exits promptly.
