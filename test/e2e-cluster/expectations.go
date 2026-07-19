@@ -84,60 +84,37 @@ func ExpectOffsetMatched(partition int, expected uint64) e2e.Expectation {
 		topic := ctx.GetTopic()
 		group := ctx.GetConsumerGroup()
 		client := ctx.GetClient()
-
-		maxRetries := 15
-		var lastOffset uint64
-		var lastErr error
-
-		for i := 0; i < maxRetries; i++ {
-			lastOffset, lastErr = client.FetchCommittedOffset(topic, partition, group)
-			if lastErr == nil {
-				if lastOffset == expected {
-					ctx.GetT().Logf("Confirmed: Offset %d is correctly replicated and matched", lastOffset)
-					return nil
-				}
-				ctx.GetT().Logf("Offset mismatch (Attempt %d/%d): expected %d, got %d. Retrying...", i+1, maxRetries, expected, lastOffset)
-			} else {
-				// Retry on authorization errors as they usually indicate leader election is in progress
-				ctx.GetT().Logf("Fetch committed offset error (Attempt %d/%d): %v. Retrying...", i+1, maxRetries, lastErr)
+		return eventually(ctx.GetT(), fmt.Sprintf("committed offset %d for %s[%d]", expected, topic, partition), clusterReadyTimeout, func() (bool, string, error) {
+			offset, err := client.FetchCommittedOffset(topic, partition, group)
+			if err != nil {
+				return false, "fetch committed offset failed", err
 			}
-			time.Sleep(2 * time.Second)
-		}
-
-		if lastErr != nil {
-			return fmt.Errorf("failed to fetch offset after %d retries: %w", maxRetries, lastErr)
-		}
-		return fmt.Errorf("offset mismatch after %d retries: expected %d, got %d", maxRetries, expected, lastOffset)
+			return offset == expected, fmt.Sprintf("got %d, want %d", offset, expected), nil
+		})
 	}
 }
-
 func LeaderChanged(partitionID int, oldLeader string) e2e.Expectation {
 	return func(ctx *e2e.TestContext) error {
 		topic := ctx.GetTopic()
 		client := ctx.GetClient()
-
-		maxRetries := 20
-		for i := 0; i < maxRetries; i++ {
+		return eventually(ctx.GetT(), fmt.Sprintf("leader change for %s[%d]", topic, partitionID), clusterReadyTimeout, func() (bool, string, error) {
 			resp, err := client.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topic), 5*time.Second)
-			if err == nil {
-				var meta topicMetadata
-				if err := json.Unmarshal([]byte(resp), &meta); err == nil && len(meta.Partitions) > 0 {
-					for _, p := range meta.Partitions {
-						if p.ID == partitionID {
-							if p.Leader != "" && p.Leader != oldLeader {
-								ctx.GetT().Logf("Confirmed: Leader for %s:%d changed from %s to %s", topic, partitionID, oldLeader, p.Leader)
-								return nil
-							}
-						}
-					}
+			if err != nil {
+				return false, "DESCRIBE failed", err
+			}
+			var meta topicMetadata
+			if err := json.Unmarshal([]byte(resp), &meta); err != nil {
+				return false, resp, err
+			}
+			for _, partition := range meta.Partitions {
+				if partition.ID == partitionID {
+					return partition.Leader != "" && partition.Leader != oldLeader, fmt.Sprintf("leader=%s", partition.Leader), nil
 				}
 			}
-			time.Sleep(1 * time.Second)
-		}
-		return fmt.Errorf("leader for partition %d did not change from %s after %d retries", partitionID, oldLeader, maxRetries)
+			return false, "partition not found", nil
+		})
 	}
 }
-
 func ISRMaintained() e2e.Expectation {
 	return func(ctx *e2e.TestContext) error {
 		topic := ctx.GetTopic()
