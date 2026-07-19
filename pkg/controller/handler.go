@@ -123,6 +123,8 @@ func NewCommandHandler(
 		{prefix: "CREATE ", exact: false, helpOrder: 1, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd) }},
 		{prefix: "DELETE ", exact: false, helpOrder: 2, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd) }},
 		{prefix: "PUBLISH ", exact: false, helpOrder: 4, permissions: []string{PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd, ctx) }},
+		{prefix: "CONSUME ", exact: false, helpOrder: 5, permissions: []string{PermissionTopicRead, PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.validateConsumeSyntax(cmd, cmd) }},
+		{prefix: "STREAM ", exact: false, helpOrder: 6, permissions: []string{PermissionTopicRead, PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.validateStreamSyntax(cmd, cmd) }},
 		{prefix: "REGISTER_GROUP ", exact: false, helpOrder: 21, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRegisterGroup(cmd) }},
 		{prefix: "JOIN_GROUP ", exact: false, helpOrder: 7, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleJoinGroup(cmd, ctx) }},
 		{prefix: "SYNC_GROUP ", exact: false, helpOrder: 8, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSyncGroup(cmd) }},
@@ -219,22 +221,6 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 		return resp
 	}
 
-	upper := input.Upper
-
-	if strings.HasPrefix(upper, "STREAM ") {
-		resp := decorateProtocolResponse(ch.validateStreamSyntax(cmd, rawCmd), ctx)
-		if resp != STREAM_DATA_SIGNAL {
-			ch.logCommandResult(rawCmd, resp)
-		}
-		return resp
-	}
-	if strings.HasPrefix(upper, "CONSUME ") {
-		resp := decorateProtocolResponse(ch.validateConsumeSyntax(cmd, rawCmd), ctx)
-		if resp != STREAM_DATA_SIGNAL {
-			ch.logCommandResult(rawCmd, resp)
-		}
-		return resp
-	}
 	if name, ok := ch.internalCommandName(input); ok {
 		if resp := ch.authorizeInternalCommand(name, input); resp != "" {
 			return ch.fail(rawCmd, resp)

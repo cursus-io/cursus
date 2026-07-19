@@ -14,6 +14,9 @@ func TestCommandDescriptorPermissions(t *testing.T) {
 		{command: "CREATE topic=orders", want: []string{PermissionAdmin}},
 		{command: "LIST", want: []string{PermissionTopicRead}},
 		{command: "PUBLISH topic=orders message=value", want: []string{PermissionTopicWrite}},
+		{command: "CONSUME topic=orders", want: []string{PermissionTopicRead, PermissionGroup}},
+		{command: "STREAM topic=orders", want: []string{PermissionTopicRead, PermissionGroup}},
+		{command: "READ_STREAM topic=orders", want: []string{PermissionTopicRead}},
 		{command: "LIST_GROUPS", want: []string{PermissionGroup}},
 		{command: "TXN_PUBLISH transactional_id=tx topic=orders", want: []string{PermissionTransaction, PermissionTopicWrite}},
 		{command: "SEND_OFFSETS_TO_TXN transactional_id=tx", want: []string{PermissionTransaction, PermissionGroup}},
@@ -48,5 +51,25 @@ func TestInternalCommandDescriptors(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("internal command descriptors = %v, want %v", got, want)
+	}
+}
+
+func TestCommandDescriptorVariantsShareMetadata(t *testing.T) {
+	ch, _ := newTestHandler(t)
+	type metadata struct {
+		internal    bool
+		permissions []string
+	}
+	seen := make(map[string]metadata)
+	for _, entry := range ch.commands {
+		current := metadata{internal: entry.internal, permissions: entry.permissions}
+		previous, ok := seen[entry.name()]
+		if !ok {
+			seen[entry.name()] = current
+			continue
+		}
+		if previous.internal != current.internal || !reflect.DeepEqual(previous.permissions, current.permissions) {
+			t.Errorf("descriptor variants for %s have inconsistent metadata: first=%+v current=%+v", entry.name(), previous, current)
+		}
 	}
 }

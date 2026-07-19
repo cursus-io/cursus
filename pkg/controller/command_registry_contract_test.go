@@ -15,16 +15,11 @@ func TestRegisteredCommandsAreRecognizedByTransport(t *testing.T) {
 			t.Errorf("registered command %s is not recognized by the transport", name)
 		}
 	}
-	for _, name := range []string{"STREAM", "CONSUME"} {
-		if !wireprotocol.IsTextCommand(name) {
-			t.Errorf("special command %s is not recognized by the transport", name)
-		}
-	}
 }
 
 func TestHelpOnlyListsRoutableOrClientLocalCommands(t *testing.T) {
 	ch, _ := newTestHandler(t)
-	routable := map[string]bool{"STREAM": true, "CONSUME": true, "EXIT": true}
+	routable := map[string]bool{"EXIT": true}
 	for _, entry := range ch.commands {
 		routable[strings.TrimSpace(entry.prefix)] = true
 	}

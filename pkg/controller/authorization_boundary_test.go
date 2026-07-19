@@ -35,6 +35,9 @@ func TestProtectedCommandsRequireAuthenticationWhenSASLIsEnabled(t *testing.T) {
 		"ELECT_LEADER topic=orders partition=0 broker=broker-2",
 		"JOIN_GROUP topic=missing group=workers member=m1",
 		"LIST_GROUPS",
+		"CONSUME topic=orders partition=0 offset=0 member=m1",
+		"STREAM topic=orders partition=0 group=workers",
+		"READ_STREAM topic=orders stream=aggregate key=id",
 		"INIT_PRODUCER_ID transactional_id=tx-1",
 	} {
 		resp := ch.HandleCommand(command, NewClientContext("", 0))

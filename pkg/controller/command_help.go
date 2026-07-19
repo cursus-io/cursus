@@ -12,8 +12,6 @@ type commandHelpEntry struct {
 }
 
 var standaloneHelpEntries = []commandHelpEntry{
-	{name: "CONSUME", order: 5},
-	{name: "STREAM", order: 6},
 	{name: "EXIT", order: 38},
 }
 

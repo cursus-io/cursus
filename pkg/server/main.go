@@ -614,14 +614,10 @@ func parseInternalCommandArgs(payload string) map[string]string {
 	return args
 }
 func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler, ctx *controller.ClientContext, conn net.Conn) (bool, error) {
-	if strings.HasPrefix(strings.ToUpper(payload), "READ_STREAM ") {
-		cmdHandler.HandleReadStreamCommand(conn, payload)
-		return false, nil
-	}
-
 	resp := cmdHandler.HandleCommand(payload, ctx)
 	if resp == controller.STREAM_DATA_SIGNAL {
-		if strings.HasPrefix(strings.ToUpper(payload), "STREAM ") {
+		switch {
+		case strings.HasPrefix(strings.ToUpper(payload), "STREAM "):
 			if err := cmdHandler.HandleStreamCommand(conn, payload, ctx); err != nil {
 				if errors.Is(err, controller.ErrStreamRejected) {
 					return false, nil
@@ -630,10 +626,16 @@ func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler,
 				return false, nil
 			}
 			return true, nil
-		} else {
+		case strings.HasPrefix(strings.ToUpper(payload), "CONSUME "):
 			if _, err := cmdHandler.HandleConsumeCommand(conn, payload, ctx); err != nil {
 				writeResponse(conn, commandErrorResponse(err, ctx))
 			}
+			return false, nil
+		case strings.HasPrefix(strings.ToUpper(payload), "READ_STREAM "):
+			cmdHandler.HandleReadStreamCommand(conn, payload)
+			return false, nil
+		default:
+			writeResponse(conn, "ERROR: unknown_command")
 			return false, nil
 		}
 	}
