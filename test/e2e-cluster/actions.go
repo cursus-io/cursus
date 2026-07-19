@@ -141,7 +141,6 @@ func (a *ClusterActions) SimulateFollowerFailure(nodeIndex int) *ClusterActions 
 	a.ctx.GetClient().Close()
 
 	a.ctx.GetT().Logf("Successfully stopped %s", containerName)
-	time.Sleep(2 * time.Second)
 	return a
 }
 
