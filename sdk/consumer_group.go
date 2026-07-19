@@ -292,7 +292,7 @@ drainDone:
 	c.offsets = make(map[int]uint64)
 	c.mu.Unlock()
 
-	c.mainCtx, c.mainCancel = context.WithCancel(context.Background())
+	c.mainCtx, c.mainCancel = context.WithCancel(c.rootCtx)
 
 	if coordAddr, err := c.findCoordinator(); err == nil {
 		c.mu.Lock()
