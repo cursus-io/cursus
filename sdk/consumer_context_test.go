@@ -21,7 +21,8 @@ func TestNewConsumerWithContextPropagatesCancellation(t *testing.T) {
 }
 
 func TestNewConsumerWithContextRejectsNilContext(t *testing.T) {
-	if _, err := NewConsumerWithContext(nil, NewDefaultConsumerConfig()); err == nil {
+	var nilContext context.Context
+	if _, err := NewConsumerWithContext(nilContext, NewDefaultConsumerConfig()); err == nil {
 		t.Fatal("expected nil context error")
 	}
 }

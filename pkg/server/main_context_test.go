@@ -38,7 +38,8 @@ func TestCloseListenerOnDone(t *testing.T) {
 }
 
 func TestRunServerContextRejectsNilContext(t *testing.T) {
-	if err := RunServerContext(nil, nil, nil, nil, nil, nil); err == nil {
+	var nilContext context.Context
+	if err := RunServerContext(nilContext, nil, nil, nil, nil, nil); err == nil {
 		t.Fatal("expected nil context error")
 	}
 }

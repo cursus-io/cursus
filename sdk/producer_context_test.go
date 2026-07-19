@@ -21,7 +21,8 @@ func newProducerLifecycleTestHarness(t *testing.T) *Producer {
 }
 
 func TestNewProducerWithContextRejectsNilContext(t *testing.T) {
-	if _, err := NewProducerWithContext(nil, NewDefaultPublisherConfig()); err == nil {
+	var nilContext context.Context
+	if _, err := NewProducerWithContext(nilContext, NewDefaultPublisherConfig()); err == nil {
 		t.Fatal("expected nil context error")
 	}
 }
