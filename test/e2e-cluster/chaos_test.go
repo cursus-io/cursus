@@ -123,18 +123,20 @@ func TestChaosTransactionCoordinatorRestartPreservesAtomicVisibility(t *testing.
 	}
 	txnClient.Close()
 	actions.StopBroker(coordinatorNode)
-	time.Sleep(5 * time.Second)
 	actions.StartBroker(coordinatorNode)
-	time.Sleep(5 * time.Second)
 
 	recoveryClient := e2e.NewBrokerClient(ctx.GetBrokerAddrs())
 	defer recoveryClient.Close()
-	status, err := recoveryClient.GetTransactionStatus(txnID)
-	if err != nil {
-		t.Fatalf("transaction state was not recovered: %v", err)
-	}
-	if status.State != "open" || status.Messages != 2 || status.Offsets != 2 {
-		t.Fatalf("unexpected recovered transaction state: %+v", status)
+	var status e2e.TransactionStatus
+	if err := eventually(t, "transaction coordinator recovery", clusterReadyTimeout, func() (bool, string, error) {
+		current, statusErr := recoveryClient.GetTransactionStatus(txnID)
+		if statusErr != nil {
+			return false, "TXN_STATUS failed", statusErr
+		}
+		status = current
+		return status.State == "open" && status.Messages == 2 && status.Offsets == 2, fmt.Sprintf("state=%s messages=%d offsets=%d", status.State, status.Messages, status.Offsets), nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if err := recoveryClient.EndTransaction(txnID, producer, "commit"); err != nil {
 		t.Fatalf("commit recovered transaction: %v", err)
