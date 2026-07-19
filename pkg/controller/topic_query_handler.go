@@ -24,7 +24,7 @@ func (ch *CommandHandler) handleList() string {
 
 // handleDescribeTopic processes DESCRIBE topic=<name> command
 func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
-	args := parseKeyValueArgs(cmd[9:])
+	args := decodeCommandInput(cmd).Args
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
 		return "ERROR: missing_topic expected=\"DESCRIBE topic=<name>\""
@@ -107,7 +107,7 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 }
 
 func (ch *CommandHandler) handleMetadata(cmd string) string {
-	args := parseKeyValueArgs(cmd[9:]) // len("METADATA ") = 9
+	args := decodeCommandInput(cmd).Args
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
 		return "ERROR: missing_topic command=METADATA"

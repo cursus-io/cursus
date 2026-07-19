@@ -163,10 +163,7 @@ func hasPermission(granted []string, required string) bool {
 }
 
 func commandArguments(cmd string) map[string]string {
-	if idx := strings.IndexByte(cmd, ' '); idx >= 0 && idx+1 < len(cmd) {
-		return parseKeyValueArgs(cmd[idx+1:])
-	}
-	return map[string]string{}
+	return decodeCommandInput(cmd).Args
 }
 
 func commandName(upper string) string {

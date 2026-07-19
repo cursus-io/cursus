@@ -244,11 +244,10 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 }
 
 func (ch *CommandHandler) metricCommandName(cmd string) string {
-	fields := strings.Fields(cmd)
-	if len(fields) == 0 {
+	name := decodeCommandInput(cmd).Name
+	if name == "" {
 		return "EMPTY"
 	}
-	name := strings.ToUpper(fields[0])
 	if name == "STREAM" || name == "CONSUME" {
 		return name
 	}
