@@ -31,48 +31,60 @@ func (sm *StreamManager) AddStream(key string, stream *StreamConnection,
 	readFn func(offset uint64, max int) ([]types.Message, error),
 	legacyCommitInterval time.Duration,
 ) error {
-
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	if len(sm.streams) >= sm.maxConn {
+	previous, exists := sm.streams[key]
+	if !exists && len(sm.streams) >= sm.maxConn {
+		sm.mu.Unlock()
 		return fmt.Errorf("maximum connections (%d) reached", sm.maxConn)
 	}
-
 	sm.streams[key] = stream
+	sm.mu.Unlock()
+
+	if previous != nil && previous != stream {
+		previous.StopWithReason(StreamControlReasonReplaced)
+	}
 	go stream.Run(readFn, legacyCommitInterval)
 	go sm.monitorConnection(key, stream)
-
 	return nil
 }
 
 func (sm *StreamManager) RemoveStream(key string) {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	if stream, ok := sm.streams[key]; ok {
+	stream, ok := sm.streams[key]
+	if ok {
 		delete(sm.streams, key)
+	}
+	sm.mu.Unlock()
+	if ok {
 		stream.StopWithReason(StreamControlReasonRemoved)
 	}
+}
+
+func (sm *StreamManager) removeStreamIfCurrent(key string, stream *StreamConnection) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	current, ok := sm.streams[key]
+	if !ok || current != stream {
+		return false
+	}
+	delete(sm.streams, key)
+	return true
 }
 
 func (sm *StreamManager) monitorConnection(key string, stream *StreamConnection) {
 	ticker := time.NewTicker(sm.heartbeat)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-stream.stopCh:
-			sm.mu.Lock()
-			delete(sm.streams, key)
-			sm.mu.Unlock()
+			sm.removeStreamIfCurrent(key, stream)
+			stream.closeConn()
 			return
 		case <-ticker.C:
 			if time.Since(stream.LastActive()) > sm.timeout {
-				sm.mu.Lock()
-				delete(sm.streams, key)
-				sm.mu.Unlock()
+				sm.removeStreamIfCurrent(key, stream)
 				stream.StopWithReason(StreamControlReasonTimeout)
+				stream.closeConn()
 				return
 			}
 		}
@@ -92,14 +104,12 @@ func (sm *StreamManager) StopStream(key string) {
 	if !ok {
 		return
 	}
-
 	stream.StopWithReason(StreamControlReasonStopped)
 }
 
 func (sm *StreamManager) GetStreamsForPartition(topic string, partitionID int) []*StreamConnection {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-
 	var streams []*StreamConnection
 	for _, stream := range sm.streams {
 		if stream.topic == topic && stream.partition == partitionID {
