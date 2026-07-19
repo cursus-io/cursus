@@ -105,6 +105,7 @@ func NewCommandHandler(
 		{prefix: "CLUSTER_STATUS", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleClusterStatus() }},
 		{prefix: "ELECT_LEADER ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleElectLeader(cmd) }},
 		{prefix: "LIST", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList() }},
+		{prefix: "LIST_GROUPS", exact: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListGroups() }},
 		{prefix: "CREATE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd) }},
 		{prefix: "DELETE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd) }},
 		{prefix: "PUBLISH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd, ctx) }},

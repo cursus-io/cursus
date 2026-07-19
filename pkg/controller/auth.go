@@ -186,7 +186,7 @@ func commandPermissions(input commandInput) []string {
 			return []string{PermissionTransaction}
 		}
 		return []string{PermissionGroup}
-	case strings.HasPrefix(upper, "REGISTER_GROUP "), strings.HasPrefix(upper, "JOIN_GROUP "),
+	case upper == "LIST_GROUPS", strings.HasPrefix(upper, "REGISTER_GROUP "), strings.HasPrefix(upper, "JOIN_GROUP "),
 		strings.HasPrefix(upper, "SYNC_GROUP "), strings.HasPrefix(upper, "LEAVE_GROUP "),
 		strings.HasPrefix(upper, "FETCH_OFFSET "), strings.HasPrefix(upper, "GROUP_STATUS "),
 		strings.HasPrefix(upper, "HEARTBEAT "), strings.HasPrefix(upper, "COMMIT_OFFSET "),

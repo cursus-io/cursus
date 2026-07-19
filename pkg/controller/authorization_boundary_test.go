@@ -34,6 +34,7 @@ func TestProtectedCommandsRequireAuthenticationWhenSASLIsEnabled(t *testing.T) {
 		"CLUSTER_STATUS",
 		"ELECT_LEADER topic=orders partition=0 broker=broker-2",
 		"JOIN_GROUP topic=missing group=workers member=m1",
+		"LIST_GROUPS",
 		"INIT_PRODUCER_ID transactional_id=tx-1",
 	} {
 		resp := ch.HandleCommand(command, NewClientContext("", 0))
@@ -60,6 +61,9 @@ func TestCommandPermissionsAreEnforcedByCategory(t *testing.T) {
 	if resp := ch.HandleCommand("INIT_PRODUCER_ID transactional_id=reader-tx", reader); !strings.Contains(resp, "permission=transaction") {
 		t.Fatalf("reader transaction command was not denied: %s", resp)
 	}
+	if resp := ch.HandleCommand("LIST_GROUPS", reader); !strings.Contains(resp, "permission=group") {
+		t.Fatalf("reader group query was not denied: %s", resp)
+	}
 
 	operator := authenticateTestUser(t, ch, "operator", "ops-secret")
 	if resp := ch.HandleCommand("CREATE topic=operator-topic partitions=1", operator); !strings.HasPrefix(resp, "OK ") {
@@ -67,6 +71,9 @@ func TestCommandPermissionsAreEnforcedByCategory(t *testing.T) {
 	}
 	if resp := ch.HandleCommand("FIND_COORDINATOR group=workers", operator); !strings.HasPrefix(resp, "OK ") {
 		t.Fatalf("operator could not discover group coordinator: %s", resp)
+	}
+	if resp := ch.HandleCommand("LIST_GROUPS", operator); resp != "ERROR: coordinator_not_available" {
+		t.Fatalf("operator did not pass LIST_GROUPS authorization: %s", resp)
 	}
 	if resp := ch.HandleCommand("INIT_PRODUCER_ID transactional_id=operator-tx", operator); !strings.Contains(resp, "permission=transaction") {
 		t.Fatalf("operator transaction command was not denied: %s", resp)
