@@ -68,14 +68,17 @@ type Config struct {
 	BroadcastChannelBufferSize int `yaml:"broadcast_channel_buffer_size" json:"broadcast.channel.buffer.size"`
 
 	// distributed cluster
-	EnabledDistribution  bool     `yaml:"enabled_distribution" json:"distribution.enabled"`
-	InternalAuthToken    string   `yaml:"internal_auth_token" json:"distribution.internal_auth_token"`
-	InternalBrokerPort   int      `yaml:"internal_broker_port" json:"distribution.internal_broker_port"`
-	RaftPort             int      `yaml:"raft_port" json:"distribution.raft.port"`
-	DiscoveryPort        int      `yaml:"discovery_port" json:"distribution.discovery.port"`
-	RaftPeers            []string `yaml:"raft_peers" json:"distribution.raft.peers"`
-	StaticClusterMembers []string `yaml:"static_cluster_members" json:"distribution.static_cluster_members"`
-	BootstrapCluster     bool     `yaml:"bootstrap_cluster" json:"distribution.bootstrap"`
+	EnabledDistribution    bool     `yaml:"enabled_distribution" json:"distribution.enabled"`
+	InternalAuthToken      string   `yaml:"internal_auth_token" json:"distribution.internal_auth_token"`
+	InternalBrokerPort     int      `yaml:"internal_broker_port" json:"distribution.internal_broker_port"`
+	RaftPort               int      `yaml:"raft_port" json:"distribution.raft.port"`
+	RaftSnapshotIntervalMS int      `yaml:"raft_snapshot_interval_ms" json:"distribution.raft.snapshot.interval.ms"`
+	RaftSnapshotThreshold  uint64   `yaml:"raft_snapshot_threshold" json:"distribution.raft.snapshot.threshold"`
+	RaftTrailingLogs       uint64   `yaml:"raft_trailing_logs" json:"distribution.raft.trailing.logs"`
+	DiscoveryPort          int      `yaml:"discovery_port" json:"distribution.discovery.port"`
+	RaftPeers              []string `yaml:"raft_peers" json:"distribution.raft.peers"`
+	StaticClusterMembers   []string `yaml:"static_cluster_members" json:"distribution.static_cluster_members"`
+	BootstrapCluster       bool     `yaml:"bootstrap_cluster" json:"distribution.bootstrap"`
 
 	AdvertisedHost           string `yaml:"advertised_host" json:"distribution.advertised_host"`
 	AdvertisedBrokerPort     int    `yaml:"advertised_broker_port" json:"distribution.advertised_broker_port"`
@@ -158,6 +161,9 @@ func DefaultConfig() *Config {
 			InternalAuthToken:        "",
 			InternalBrokerPort:       0,
 			RaftPort:                 9001,
+			RaftSnapshotIntervalMS:   120000,
+			RaftSnapshotThreshold:    8192,
+			RaftTrailingLogs:         10240,
 			DiscoveryPort:            8000,
 			RaftPeers:                []string{},
 			StaticClusterMembers:     []string{},
@@ -251,6 +257,9 @@ func LoadConfig() (*Config, error) {
 	flag.StringVar(&cfg.InternalAuthToken, "internal-auth-token", cfg.InternalAuthToken, "Shared token for broker-to-broker internal text commands")
 	flag.IntVar(&cfg.InternalBrokerPort, "internal-broker-port", cfg.InternalBrokerPort, "Dedicated broker-to-broker internal command port")
 	flag.IntVar(&cfg.RaftPort, "raft-port", cfg.RaftPort, "Raft port for replication")
+	flag.IntVar(&cfg.RaftSnapshotIntervalMS, "raft-snapshot-interval-ms", cfg.RaftSnapshotIntervalMS, "Raft snapshot check interval in milliseconds")
+	flag.Uint64Var(&cfg.RaftSnapshotThreshold, "raft-snapshot-threshold", cfg.RaftSnapshotThreshold, "Outstanding Raft log entries required before snapshotting")
+	flag.Uint64Var(&cfg.RaftTrailingLogs, "raft-trailing-logs", cfg.RaftTrailingLogs, "Raft log entries retained after snapshotting")
 	flag.IntVar(&cfg.DiscoveryPort, "discovery-port", cfg.DiscoveryPort, "Discovery service port")
 	raftPeersFlag := flag.String("raft-peers", "", "Raft peer addresses (comma-separated)")
 	flag.BoolVar(&cfg.BootstrapCluster, "bootstrap-cluster", cfg.BootstrapCluster, "Bootstrap Raft cluster")
@@ -374,6 +383,9 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.AdvertisedBrokerPort, "ADVERTISED_BROKER_PORT")
 	overrideEnvString(&cfg.AdvertisedClientHost, "ADVERTISED_CLIENT_HOST")
 	overrideEnvInt(&cfg.RaftPort, "RAFT_PORT")
+	overrideEnvInt(&cfg.RaftSnapshotIntervalMS, "RAFT_SNAPSHOT_INTERVAL_MS")
+	overrideEnvUint64(&cfg.RaftSnapshotThreshold, "RAFT_SNAPSHOT_THRESHOLD")
+	overrideEnvUint64(&cfg.RaftTrailingLogs, "RAFT_TRAILING_LOGS")
 	overrideEnvInt(&cfg.DiscoveryPort, "DISCOVERY_PORT")
 	overrideEnvStringSlice(&cfg.RaftPeers, "RAFT_PEERS")
 	overrideEnvStringSlice(&cfg.StaticClusterMembers, "STATIC_CLUSTER_MEMBERS")
