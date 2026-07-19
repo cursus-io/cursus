@@ -2,7 +2,6 @@ package e2e_cluster
 
 import (
 	"testing"
-	"time"
 )
 
 // TestISRWithAllAcks tests ISR behavior with acks=all
@@ -84,14 +83,11 @@ func TestDistributedOffsetResilience(t *testing.T) {
 		StartCluster().
 		CreateTopic()
 
-	time.Sleep(5 * time.Second) // allow ISR to stabilize
-
+	ctx.WhenCluster().WaitForTopicMetadata()
 	ctx.WhenCluster().
 		JoinGroup().
 		CommitOffset(0, 50)
 	ctx.WhenCluster().SimulateLeaderFailure()
-
-	time.Sleep(10 * time.Second) // wait for Raft election and partition leader failover
 
 	ctx.Then().
 		Expect(ExpectOffsetMatched(0, 50))
@@ -116,7 +112,7 @@ func TestRollingRestartNoDowntime(t *testing.T) {
 		ctx.WhenCluster().
 			SimulateFollowerFailure(i).
 			RecoverFollower(i)
-		time.Sleep(5 * time.Second) // allow node to rejoin Raft
+		ctx.WhenCluster().WaitForTopicMetadata()
 	}
 
 	ctx.ResetPublishedCount().
@@ -161,14 +157,11 @@ func TestConsumerGroupRebalanceFailover(t *testing.T) {
 		StartCluster().
 		CreateTopic()
 
-	time.Sleep(5 * time.Second) // allow ISR to stabilize
-
+	ctx.WhenCluster().WaitForTopicMetadata()
 	ctx.WhenCluster().
 		JoinGroup().
 		SyncGroup()
 	ctx.WhenCluster().SimulateLeaderFailure()
-
-	time.Sleep(10 * time.Second) // wait for Raft election and partition leader failover
 
 	ctx.Then().
 		Expect(ISRMaintained())
