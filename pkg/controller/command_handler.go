@@ -247,24 +247,6 @@ func (ch *CommandHandler) handleList() string {
 	return fmt.Sprintf("OK count=%d topics=%s", len(names), strings.Join(names, ","))
 }
 
-// handleListCluster processes LIST_CLUSTER command
-func (ch *CommandHandler) handleListCluster() string {
-	if ch.isDistributed() {
-		fsm := ch.Cluster.RaftManager.GetFSM()
-		if fsm == nil {
-			return "ERROR: fsm_not_available"
-		}
-
-		brokers := fsm.GetBrokers()
-		data, err := json.Marshal(brokers)
-		if err != nil {
-			return fmt.Sprintf("ERROR: marshal_brokers_failed reason=%q", err.Error())
-		}
-		return fmt.Sprintf("OK brokers=%s", string(data))
-	}
-	return "ERROR: distribution_not_enabled"
-}
-
 // handleRegisterGroup processes REGISTER_GROUP command
 func (ch *CommandHandler) handleRegisterGroup(cmd string) string {
 	args := parseKeyValueArgs(cmd[15:])
