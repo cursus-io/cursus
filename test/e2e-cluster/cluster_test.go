@@ -67,8 +67,6 @@ func TestClusterDataConsistency(t *testing.T) {
 		RecoverFollower(3).
 		DescribeTopic()
 
-	time.Sleep(5 * time.Second)
-
 	ctx.Then().
 		Expect(ExpectDataConsistent())
 }
@@ -143,8 +141,6 @@ func TestClusterWideDeduplication(t *testing.T) {
 		CreateTopic().
 		PublishMessages()
 	ctx.WhenCluster().SimulateLeaderFailure()
-
-	time.Sleep(7 * time.Second)
 
 	ctx.WhenCluster().
 		RetryPublishMessages().
