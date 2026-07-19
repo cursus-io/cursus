@@ -1,17 +1,21 @@
 package e2e_cluster
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/test/e2e"
 )
 
 const (
-	composeFile    = "docker-compose.yml"
-	baseBrokerPort = 9000
-	baseHealthPort = 9080
+	composeFile         = "docker-compose.yml"
+	snapshotComposeFile = "docker-compose.snapshot.yml"
+	snapshotProjectName = "cursus-snapshot-e2e"
+	baseBrokerPort      = 9000
+	baseHealthPort      = 9080
 )
 
 // ClusterTestContext extends e2e.TestContext for cluster testing
@@ -64,14 +68,24 @@ func GivenCluster(t *testing.T) *ClusterTestContext {
 }
 
 func GivenClusterRestart(t *testing.T) *ClusterTestContext {
-	_ = e2e.RunCompose("-f", composeFile, "down", "-v", "--remove-orphans").Run()
-	cmd := e2e.RunCompose("-f", composeFile, "up", "-d", "--force-recreate", "--build")
+	return givenClusterRestart(t, "", composeFile)
+}
+
+func GivenSnapshotClusterRestart(t *testing.T) *ClusterTestContext {
+	return givenClusterRestart(t, snapshotProjectName, composeFile, snapshotComposeFile)
+}
+
+func givenClusterRestart(t *testing.T, project string, composeFiles ...string) *ClusterTestContext {
+	downArgs := composeCommandArgs(project, composeFiles, "down", "-v", "--remove-orphans")
+	_ = e2e.RunCompose(downArgs...).Run()
+	upArgs := composeCommandArgs(project, composeFiles, "up", "-d", "--force-recreate", "--build")
+	cmd := e2e.RunCompose(upArgs...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("Failed to start docker compose: %v\nOutput: %s", err, string(output))
 	}
 
 	t.Cleanup(func() {
-		cmd := e2e.RunCompose("-f", composeFile, "down", "-v")
+		cmd := e2e.RunCompose(composeCommandArgs(project, composeFiles, "down", "-v", "--remove-orphans")...)
 		if err := cmd.Run(); err != nil {
 			t.Logf("Cleanup warning: failed to bring down docker compose: %v", err)
 		}
@@ -87,17 +101,49 @@ func GivenClusterRestart(t *testing.T) *ClusterTestContext {
 
 	t.Log("Waiting for Raft leader to be elected...")
 	if err := eventually(t, "Raft leader election", clusterReadyTimeout, func() (bool, string, error) {
-		resp, err := actions.actions.SendCommand("LIST")
+		resp, err := actions.actions.SendCommand("LIST_CLUSTER")
 		if err != nil {
-			return false, "LIST failed", err
+			return false, "LIST_CLUSTER failed", err
 		}
-		return !strings.Contains(resp, "ERROR:") && !strings.Contains(resp, "unknown"), resp, nil
+		return clusterReadinessFromListCluster(resp)
 	}); err != nil {
 		t.Fatal(err)
 	}
 	t.Log("Raft leader elected, cluster ready.")
 
 	return ctx
+}
+
+func clusterReadinessFromListCluster(resp string) (bool, string, error) {
+	const prefix = "OK brokers="
+	trimmed := strings.TrimSpace(resp)
+	if !strings.HasPrefix(trimmed, prefix) {
+		return false, trimmed, nil
+	}
+
+	var brokers []fsm.BrokerInfo
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(trimmed, prefix)), &brokers); err != nil {
+		return false, trimmed, fmt.Errorf("decode LIST_CLUSTER: %w", err)
+	}
+	active := 0
+	for _, broker := range brokers {
+		if strings.EqualFold(broker.Status, "active") {
+			active++
+		}
+	}
+	detail := fmt.Sprintf("%d/%d active", active, len(brokers))
+	return active > 0, detail, nil
+}
+
+func composeCommandArgs(project string, composeFiles []string, command ...string) []string {
+	args := make([]string, 0, len(composeFiles)*2+len(command)+2)
+	if project != "" {
+		args = append(args, "-p", project)
+	}
+	for _, file := range composeFiles {
+		args = append(args, "-f", file)
+	}
+	return append(args, command...)
 }
 
 func (c *ClusterTestContext) WithTopic(topic string) *ClusterTestContext {

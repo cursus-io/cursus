@@ -1,0 +1,18 @@
+services:
+  broker-1:
+    environment:
+      RAFT_SNAPSHOT_INTERVAL_MS: "50"
+      RAFT_SNAPSHOT_THRESHOLD: "8"
+      RAFT_TRAILING_LOGS: "0"
+
+  broker-2:
+    environment:
+      RAFT_SNAPSHOT_INTERVAL_MS: "50"
+      RAFT_SNAPSHOT_THRESHOLD: "8"
+      RAFT_TRAILING_LOGS: "0"
+
+  broker-3:
+    environment:
+      RAFT_SNAPSHOT_INTERVAL_MS: "50"
+      RAFT_SNAPSHOT_THRESHOLD: "8"
+      RAFT_TRAILING_LOGS: "0"
