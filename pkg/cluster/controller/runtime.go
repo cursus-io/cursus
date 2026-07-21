@@ -16,16 +16,25 @@ type PartitionRuntimeSnapshot struct {
 	InSync      int
 }
 
+// MaterializationAttemptsSnapshot counts local convergence attempts by result.
+type MaterializationAttemptsSnapshot struct {
+	Success uint64
+	Failure uint64
+}
+
 // RuntimeSnapshot is a point-in-time view of cluster control state.
 type RuntimeSnapshot struct {
-	Enabled          bool
-	BrokerID         string
-	BrokerCount      int
-	HasLeader        bool
-	IsLeader         bool
-	Offline          int
-	UnderReplicated  int
-	PartitionDetails []PartitionRuntimeSnapshot
+	Enabled                           bool
+	BrokerID                          string
+	BrokerCount                       int
+	HasLeader                         bool
+	IsLeader                          bool
+	Offline                           int
+	UnderReplicated                   int
+	TopicMaterializationsPending      map[string]int
+	TopicMaterializationAttempts      map[string]MaterializationAttemptsSnapshot
+	TopicMaterializationOldestPending float64
+	PartitionDetails                  []PartitionRuntimeSnapshot
 }
 
 // RuntimeSnapshot returns cluster metadata without exposing mutable FSM state.
@@ -46,6 +55,19 @@ func (cc *ClusterController) RuntimeSnapshot() RuntimeSnapshot {
 	}
 
 	snapshot.BrokerCount = len(fsmState.GetBrokers())
+	materialization := fsmState.TopicMaterializationRuntimeSnapshot()
+	snapshot.TopicMaterializationsPending = make(map[string]int, len(materialization.PendingByOperation))
+	for operation, count := range materialization.PendingByOperation {
+		snapshot.TopicMaterializationsPending[operation] = count
+	}
+	snapshot.TopicMaterializationAttempts = make(map[string]MaterializationAttemptsSnapshot, len(materialization.AttemptsByOperation))
+	for operation, attempts := range materialization.AttemptsByOperation {
+		snapshot.TopicMaterializationAttempts[operation] = MaterializationAttemptsSnapshot{
+			Success: attempts.Success,
+			Failure: attempts.Failure,
+		}
+	}
+	snapshot.TopicMaterializationOldestPending = materialization.OldestPending.Seconds()
 	keys := fsmState.GetAllPartitionKeys()
 	sort.Strings(keys)
 	for _, key := range keys {

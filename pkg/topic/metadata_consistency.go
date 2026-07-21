@@ -62,6 +62,16 @@ func (s *topicMetadataStore) orphanedTopicDirectories(manifestTopics map[string]
 	return orphaned, nil
 }
 
+// PersistedTopicStorageNames returns topic directories that contain partition
+// logs without opening handlers. Distributed snapshot restore uses this to
+// resume cleanup work even after an in-memory delete issue was lost on restart.
+func (tm *TopicManager) PersistedTopicStorageNames() ([]string, error) {
+	if tm == nil || tm.cfg == nil || strings.TrimSpace(tm.cfg.LogDir) == "" {
+		return nil, nil
+	}
+	store := &topicMetadataStore{path: filepath.Join(tm.cfg.LogDir, TopicMetadataFileName)}
+	return store.orphanedTopicDirectories(nil)
+}
 func hasPersistedPartitionLog(path string) (bool, error) {
 	entries, err := os.ReadDir(path)
 	if err != nil {

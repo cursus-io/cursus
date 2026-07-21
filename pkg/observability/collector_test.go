@@ -67,6 +67,11 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 		fixedStreams(2),
 		fixedCluster{snapshot: clustercontroller.RuntimeSnapshot{
 			Enabled: true, BrokerCount: 3, HasLeader: true, IsLeader: true, UnderReplicated: 1,
+			TopicMaterializationsPending: map[string]int{"create": 2},
+			TopicMaterializationAttempts: map[string]clustercontroller.MaterializationAttemptsSnapshot{
+				"create": {Success: 4, Failure: 3},
+			},
+			TopicMaterializationOldestPending: 12.5,
 			PartitionDetails: []clustercontroller.PartitionRuntimeSnapshot{{
 				Topic: "orders", Partition: 0, Leader: "broker-1", LeaderEpoch: 4, Replicas: 3, InSync: 2,
 			}},
@@ -90,9 +95,30 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 	assertGauge(t, families, "cursus_storage_bytes", nil, 4096)
 	assertGauge(t, families, "cursus_streams_active", nil, 2)
 	assertGauge(t, families, "cursus_cluster_under_replicated_partitions", nil, 1)
+	assertGauge(t, families, "cursus_cluster_topic_materializations_pending", map[string]string{"operation": "create"}, 2)
+	assertCounter(t, families, "cursus_cluster_topic_materialization_attempts_total", map[string]string{"operation": "create", "result": "success"}, 4)
+	assertCounter(t, families, "cursus_cluster_topic_materialization_attempts_total", map[string]string{"operation": "create", "result": "failure"}, 3)
+	assertGauge(t, families, "cursus_cluster_topic_materialization_oldest_pending_seconds", nil, 12.5)
 	assertGauge(t, families, "cursus_cluster_partition_leader", map[string]string{"topic": "orders", "partition": "0", "broker_id": "broker-1"}, 1)
 }
 
+func assertCounter(t *testing.T, families []*dto.MetricFamily, name string, labels map[string]string, want float64) {
+	t.Helper()
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.Metric {
+			if labelsMatch(metric.Label, labels) {
+				if got := metric.GetCounter().GetValue(); got != want {
+					t.Fatalf("%s%v = %v, want %v", name, labels, got, want)
+				}
+				return
+			}
+		}
+	}
+	t.Fatalf("metric %s%v not found", name, labels)
+}
 func assertGauge(t *testing.T, families []*dto.MetricFamily, name string, labels map[string]string, want float64) {
 	t.Helper()
 	for _, family := range families {

@@ -57,136 +57,138 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	topicCmd.EventSourcing = definition.EventSourcing
 	topicCmd.Policy = definition.Policy
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	stageResult := func() interface{} {
+		f.mu.Lock()
+		defer f.mu.Unlock()
 
-	stagedTopics := copyTopicState(f.topicState)
-	stagedPartitions := copyPartitionMetadataState(f.partitionMetadata)
-	currentPartitions := 0
-	currentTopic := stagedTopics[topicCmd.Name]
-	if currentTopic == nil {
-		currentTopic = legacyTopicState(stagedPartitions)[topicCmd.Name]
-	}
-	if currentTopic != nil {
-		if topicCmd.Partitions < currentTopic.Partitions {
-			return fmt.Errorf("cannot decrease partition count for topic %q: %d -> %d", topicCmd.Name, currentTopic.Partitions, topicCmd.Partitions)
+		stagedTopics := copyTopicState(f.topicState)
+		stagedPartitions := copyPartitionMetadataState(f.partitionMetadata)
+		currentPartitions := 0
+		currentTopic := stagedTopics[topicCmd.Name]
+		if currentTopic == nil {
+			currentTopic = legacyTopicState(stagedPartitions)[topicCmd.Name]
 		}
-		currentPartitions = currentTopic.Partitions
-		topicCmd.Idempotent = currentTopic.Idempotent
-		topicCmd.EventSourcing = currentTopic.EventSourcing
-	}
-
-	var brokers []string
-	for id, info := range f.brokers {
-		if info.Status == "active" {
-			brokers = append(brokers, id)
+		if currentTopic != nil {
+			if topicCmd.Partitions < currentTopic.Partitions {
+				return fmt.Errorf("cannot decrease partition count for topic %q: %d -> %d", topicCmd.Name, currentTopic.Partitions, topicCmd.Partitions)
+			}
+			currentPartitions = currentTopic.Partitions
+			topicCmd.Idempotent = currentTopic.Idempotent
+			topicCmd.EventSourcing = currentTopic.EventSourcing
 		}
-	}
-	sort.Strings(brokers)
 
-	if len(brokers) == 0 {
-		util.Error("FSM: No active brokers available for topic creation")
-		return fmt.Errorf("no active brokers")
-	}
-
-	if topicCmd.Partitions <= 0 {
-		util.Error("FSM: Invalid partition count %d for topic %s", topicCmd.Partitions, topicCmd.Name)
-		return fmt.Errorf("invalid partition count: %d", topicCmd.Partitions)
-	}
-
-	if topicCmd.LeaderID != "" {
-		found := false
-		for _, b := range brokers {
-			if b == topicCmd.LeaderID {
-				found = true
-				break
+		var brokers []string
+		for id, info := range f.brokers {
+			if info.Status == "active" {
+				brokers = append(brokers, id)
 			}
 		}
-		if !found {
-			util.Error("FSM: Explicit leader %s not in active broker set %v", topicCmd.LeaderID, brokers)
-			return fmt.Errorf("leader %s not in active broker set", topicCmd.LeaderID)
+		sort.Strings(brokers)
+
+		if len(brokers) == 0 {
+			util.Error("FSM: No active brokers available for topic creation")
+			return fmt.Errorf("no active brokers")
 		}
-	}
 
-	replicationFactor := topicCmd.ReplicationFactor
-	if replicationFactor <= 0 {
-		replicationFactor = 3 // default small-cluster replication factor
-	}
-	if replicationFactor > len(brokers) {
-		util.Warn("FSM: Requested RF %d exceeds active brokers %d. Capping to %d", replicationFactor, len(brokers), len(brokers))
-		replicationFactor = len(brokers)
-	}
-	topicCmd.ReplicationFactor = replicationFactor
-
-	ring := util.NewConsistentHashRing(150, nil)
-	ring.Add(brokers...)
-
-	for i := 0; i < currentPartitions; i++ {
-		key := topicCmd.Name + "-" + strconv.Itoa(i)
-		if stagedPartitions[key] == nil {
-			return fmt.Errorf("topic %q is missing partition metadata %d", topicCmd.Name, i)
+		if topicCmd.Partitions <= 0 {
+			util.Error("FSM: Invalid partition count %d for topic %s", topicCmd.Partitions, topicCmd.Name)
+			return fmt.Errorf("invalid partition count: %d", topicCmd.Partitions)
 		}
-	}
-	for i := 0; i < currentPartitions; i++ {
-		key := topicCmd.Name + "-" + strconv.Itoa(i)
-		stagedPartitions[key].PartitionCount = topicCmd.Partitions
-	}
 
-	for i := currentPartitions; i < topicCmd.Partitions; i++ {
-		key := topicCmd.Name + "-" + strconv.Itoa(i)
-
-		assignedLeader := topicCmd.LeaderID
-		var replicas []string
-		if assignedLeader == "" {
-			replicas = ring.GetN(key, replicationFactor)
-			if len(replicas) == 0 {
-				return fmt.Errorf("no replicas assigned for partition %s", key)
-			}
-			assignedLeader = replicas[0]
-		} else {
-			// Explicit leader: build replica set starting from leader
-			replicas = ring.GetN(key, replicationFactor)
-			// Ensure the explicit leader is in the replica set
-			leaderFound := false
-			for _, r := range replicas {
-				if r == assignedLeader {
-					leaderFound = true
+		if topicCmd.LeaderID != "" {
+			found := false
+			for _, b := range brokers {
+				if b == topicCmd.LeaderID {
+					found = true
 					break
 				}
 			}
-			if !leaderFound {
-				replicas[len(replicas)-1] = assignedLeader
+			if !found {
+				util.Error("FSM: Explicit leader %s not in active broker set %v", topicCmd.LeaderID, brokers)
+				return fmt.Errorf("leader %s not in active broker set", topicCmd.LeaderID)
 			}
 		}
 
-		isrCopy := append([]string(nil), replicas...)
-
-		stagedPartitions[key] = &PartitionMetadata{
-			PartitionCount: topicCmd.Partitions,
-			Leader:         assignedLeader,
-			LeaderEpoch:    1,
-			Idempotent:     topicCmd.Idempotent,
-			Replicas:       replicas,
-			ISR:            isrCopy,
+		replicationFactor := topicCmd.ReplicationFactor
+		if replicationFactor <= 0 {
+			replicationFactor = 3 // default small-cluster replication factor
 		}
-		util.Info("FSM: Assigned leader %s to partition %s (replicas=%v)", assignedLeader, key, replicas)
+		if replicationFactor > len(brokers) {
+			util.Warn("FSM: Requested RF %d exceeds active brokers %d. Capping to %d", replicationFactor, len(brokers), len(brokers))
+			replicationFactor = len(brokers)
+		}
+		topicCmd.ReplicationFactor = replicationFactor
+
+		ring := util.NewConsistentHashRing(150, nil)
+		ring.Add(brokers...)
+
+		for i := 0; i < currentPartitions; i++ {
+			key := topicCmd.Name + "-" + strconv.Itoa(i)
+			if stagedPartitions[key] == nil {
+				return fmt.Errorf("topic %q is missing partition metadata %d", topicCmd.Name, i)
+			}
+		}
+		for i := 0; i < currentPartitions; i++ {
+			key := topicCmd.Name + "-" + strconv.Itoa(i)
+			stagedPartitions[key].PartitionCount = topicCmd.Partitions
+		}
+
+		for i := currentPartitions; i < topicCmd.Partitions; i++ {
+			key := topicCmd.Name + "-" + strconv.Itoa(i)
+
+			assignedLeader := topicCmd.LeaderID
+			var replicas []string
+			if assignedLeader == "" {
+				replicas = ring.GetN(key, replicationFactor)
+				if len(replicas) == 0 {
+					return fmt.Errorf("no replicas assigned for partition %s", key)
+				}
+				assignedLeader = replicas[0]
+			} else {
+				// Explicit leader: build replica set starting from leader
+				replicas = ring.GetN(key, replicationFactor)
+				// Ensure the explicit leader is in the replica set
+				leaderFound := false
+				for _, r := range replicas {
+					if r == assignedLeader {
+						leaderFound = true
+						break
+					}
+				}
+				if !leaderFound {
+					replicas[len(replicas)-1] = assignedLeader
+				}
+			}
+
+			isrCopy := append([]string(nil), replicas...)
+
+			stagedPartitions[key] = &PartitionMetadata{
+				PartitionCount: topicCmd.Partitions,
+				Leader:         assignedLeader,
+				LeaderEpoch:    1,
+				Idempotent:     topicCmd.Idempotent,
+				Replicas:       replicas,
+				ISR:            isrCopy,
+			}
+			util.Info("FSM: Assigned leader %s to partition %s (replicas=%v)", assignedLeader, key, replicas)
+		}
+
+		definition.Idempotent = topicCmd.Idempotent
+		definition.EventSourcing = topicCmd.EventSourcing
+		stagedTopics[topicCmd.Name] = copyTopicDefinition(&definition)
+		f.partitionMetadata = stagedPartitions
+		f.topicState = stagedTopics
+		return nil
+	}()
+	if stageResult != nil {
+		return stageResult
 	}
 
-	definition.Idempotent = topicCmd.Idempotent
-	definition.EventSourcing = topicCmd.EventSourcing
-	stagedTopics[topicCmd.Name] = copyTopicDefinition(&definition)
-	tm := f.tm
-
-	if tm != nil {
-		if err := tm.CreateTopicWithPolicy(topicCmd.Name, topicCmd.Partitions, topicCmd.Idempotent, topicCmd.EventSourcing, topicCmd.Policy); err != nil {
-			util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicCmd.Name, err)
-			return err
-		}
+	if err := f.materializeTopicCreate(&definition); err != nil {
+		util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicCmd.Name, err)
+		return err
 	}
-	f.partitionMetadata = stagedPartitions
-	f.topicState = stagedTopics
 	util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, topicCmd.Partitions)
-
 	return nil
 }
 
@@ -202,40 +204,36 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 		return fmt.Errorf("invalid topic name: %w", err)
 	}
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	stageResult := func() interface{} {
+		f.mu.Lock()
+		defer f.mu.Unlock()
 
-	found := f.topicState[payload.Topic] != nil
-	for key := range f.partitionMetadata {
-		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
-			found = true
+		found := f.topicState[payload.Topic] != nil
+		for key := range f.partitionMetadata {
+			if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
+				found = true
+			}
 		}
-	}
-	if !found {
-		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
-	}
-
-	tm := f.tm
-	if tm != nil {
-		deleted, err := tm.DeleteTopicDurable(payload.Topic)
-		if err != nil {
-			return fmt.Errorf("delete local topic %q: %w", payload.Topic, err)
-		}
-		if !deleted {
+		if !found {
 			return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
 		}
-	} else if !found {
-		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
-	}
 
-	for key := range f.partitionMetadata {
-		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
-			delete(f.partitionMetadata, key)
+		for key := range f.partitionMetadata {
+			if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
+				delete(f.partitionMetadata, key)
+			}
 		}
+		delete(f.topicState, payload.Topic)
+		return nil
+	}()
+	if stageResult != nil {
+		return stageResult
 	}
-	delete(f.topicState, payload.Topic)
-	util.Info("FSM: Deleted topic '%s'", payload.Topic)
 
+	if err := f.materializeTopicDelete(payload.Topic); err != nil {
+		return err
+	}
+	util.Info("FSM: Deleted topic '%s'", payload.Topic)
 	return nil
 }
 
