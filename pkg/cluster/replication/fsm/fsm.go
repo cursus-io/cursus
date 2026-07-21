@@ -67,8 +67,9 @@ type BrokerFSMState struct {
 }
 
 type BrokerFSM struct {
-	notifiers map[string]chan interface{}
-	mu        sync.RWMutex
+	notifiers         map[string]chan interface{}
+	mu                sync.RWMutex
+	materializationMu sync.Mutex
 
 	logs              map[uint64]*ReplicationEntry
 	brokers           map[string]*BrokerInfo
@@ -81,18 +82,22 @@ type BrokerFSM struct {
 	txn                      *transaction.Manager
 	restoredTransactionState map[string]*transaction.Snapshot
 	topicState               map[string]*topic.Definition
+	topicMaterialization     map[string]TopicMaterializationIssue
+	topicMaterializationRuns map[string]TopicMaterializationAttempts
 }
 
 func NewBrokerFSM(tm *topic.TopicManager, cd *coordinator.Coordinator) *BrokerFSM {
 	return &BrokerFSM{
-		notifiers:         make(map[string]chan interface{}),
-		logs:              make(map[uint64]*ReplicationEntry),
-		brokers:           make(map[string]*BrokerInfo),
-		partitionMetadata: make(map[string]*PartitionMetadata),
-		producerState:     make(map[string]map[int]map[string]ProducerSequence),
-		topicState:        make(map[string]*topic.Definition),
-		tm:                tm,
-		cd:                cd,
+		notifiers:                make(map[string]chan interface{}),
+		logs:                     make(map[uint64]*ReplicationEntry),
+		brokers:                  make(map[string]*BrokerInfo),
+		partitionMetadata:        make(map[string]*PartitionMetadata),
+		producerState:            make(map[string]map[int]map[string]ProducerSequence),
+		topicState:               make(map[string]*topic.Definition),
+		topicMaterialization:     make(map[string]TopicMaterializationIssue),
+		topicMaterializationRuns: make(map[string]TopicMaterializationAttempts),
+		tm:                       tm,
+		cd:                       cd,
 	}
 }
 
@@ -242,24 +247,63 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		}
 		restoredTopicState = legacyTopicState(state.PartitionMetadata)
 	}
-	definitions, err := validateTopicState(restoredTopicState, state.PartitionMetadata)
+	_, err := validateTopicState(restoredTopicState, state.PartitionMetadata)
 	if err != nil {
 		return fmt.Errorf("restore topic definitions: %w", err)
 	}
+	f.materializationMu.Lock()
+	localDefinitions := []topic.Definition(nil)
+	persistedTopicStorage := []string(nil)
 	if f.tm != nil {
-		if err := f.tm.RestoreDefinitions(definitions); err != nil {
-			return fmt.Errorf("restore topic registry: %w", err)
+		localDefinitions = f.tm.ExportDefinitions()
+		persistedTopicStorage, err = f.tm.PersistedTopicStorageNames()
+		if err != nil {
+			f.materializationMu.Unlock()
+			return fmt.Errorf("inspect local topic storage before restore: %w", err)
 		}
 	}
 
 	f.mu.Lock()
+	previousMaterialization := f.topicMaterialization
 
 	f.logs = state.Logs
 	f.brokers = state.Brokers
 	f.partitionMetadata = state.PartitionMetadata
 	f.topicState = restoredTopicState
+	f.topicMaterialization = make(map[string]TopicMaterializationIssue, len(restoredTopicState))
+	now := time.Now()
+	for name := range restoredTopicState {
+		f.topicMaterialization[name] = TopicMaterializationIssue{
+			Topic: name, Operation: TopicMaterializationRestore, PendingSince: now,
+		}
+	}
+	for _, definition := range localDefinitions {
+		if restoredTopicState[definition.Name] == nil {
+			f.topicMaterialization[definition.Name] = TopicMaterializationIssue{
+				Topic: definition.Name, Operation: TopicMaterializationDelete, PendingSince: now,
+			}
+		}
+	}
+	for _, name := range persistedTopicStorage {
+		if restoredTopicState[name] == nil {
+			f.topicMaterialization[name] = TopicMaterializationIssue{
+				Topic: name, Operation: TopicMaterializationDelete, PendingSince: now,
+			}
+		}
+	}
+	for name, issue := range previousMaterialization {
+		if issue.Operation != TopicMaterializationDelete || restoredTopicState[name] != nil {
+			continue
+		}
+		if issue.PendingSince.IsZero() {
+			issue.PendingSince = now
+		}
+		f.topicMaterialization[name] = issue
+	}
+	if f.topicMaterializationRuns == nil {
+		f.topicMaterializationRuns = make(map[string]TopicMaterializationAttempts)
+	}
 	f.applied = state.Applied
-
 	f.producerState = state.ProducerState
 	if f.producerState == nil {
 		f.producerState = make(map[string]map[int]map[string]ProducerSequence)
@@ -293,6 +337,10 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	}
 
 	f.mu.Unlock()
+	f.materializationMu.Unlock()
+	if err := f.ReconcileTopicMaterializations(); err != nil {
+		util.Warn("FSM Restore: Topic materialization pending: %v", err)
+	}
 	if state.Version >= 5 {
 		f.reconcileCommittedPartitions()
 	}

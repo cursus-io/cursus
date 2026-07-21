@@ -19,6 +19,8 @@ import (
 
 var ErrTopicNotFound = errors.New("topic not found")
 
+var removeTopicStorageFn = os.RemoveAll
+
 type StreamManager interface {
 	AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), legacyCommitInterval time.Duration) error
 	RemoveStream(key string)
@@ -54,6 +56,10 @@ type existingPartitionProvider interface {
 
 type topicHandlerCloser interface {
 	CloseTopicHandlers(topic string)
+}
+
+type topicStorageRemover interface {
+	RemoveTopicStorage(path string) error
 }
 
 func (tm *TopicManager) SetCoordinator(cd *coordinator.Coordinator) {
@@ -410,7 +416,7 @@ func (tm *TopicManager) DeleteTopic(name string) bool {
 	deleted, err := tm.DeleteTopicDurable(name)
 	if err != nil {
 		util.Warn("Failed to durably delete topic %s: %v", name, err)
-		return false
+		return deleted
 	}
 	return deleted
 }
@@ -446,12 +452,33 @@ func (tm *TopicManager) DeleteTopicDurable(name string) (bool, error) {
 		}
 	}
 	if err := tm.deleteTopicLogDirLocked(name); err != nil {
-		// The durable definition removal is already committed. Keep the command
-		// result aligned with the logical state and leave physical cleanup for an
-		// operator or a later retry instead of reporting a false rollback.
-		util.Warn("Failed to clean log directory for deleted topic %s: %v", name, err)
+		return true, fmt.Errorf("clean topic storage %q: %w", name, err)
 	}
 	return true, nil
+}
+
+// CleanupTopicStorage retries the idempotent physical cleanup that follows a
+// logically committed topic deletion. It is safe to call after the topic has
+// already disappeared from the in-memory registry.
+func (tm *TopicManager) CleanupTopicStorage(name string) error {
+	if err := ValidateName(name); err != nil {
+		return fmt.Errorf("invalid topic name: %w", err)
+	}
+	if tm == nil {
+		return nil
+	}
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if tm.topics[name] != nil {
+		return fmt.Errorf("topic %q still has an active definition", name)
+	}
+	if closer, ok := tm.hp.(topicHandlerCloser); ok {
+		closer.CloseTopicHandlers(name)
+	}
+	if err := tm.deleteTopicLogDirLocked(name); err != nil {
+		return fmt.Errorf("clean topic storage %q: %w", name, err)
+	}
+	return nil
 }
 func (tm *TopicManager) deleteTopicLogDirLocked(name string) error {
 	if tm.cfg == nil || strings.TrimSpace(tm.cfg.LogDir) == "" {
@@ -473,7 +500,10 @@ func (tm *TopicManager) deleteTopicLogDirLocked(name string) error {
 	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
 		return fmt.Errorf("refusing to delete topic path outside log root: %s", target)
 	}
-	return os.RemoveAll(target)
+	if remover, ok := tm.hp.(topicStorageRemover); ok {
+		return remover.RemoveTopicStorage(target)
+	}
+	return removeTopicStorageFn(target)
 }
 
 func (tm *TopicManager) ListTopics() []string {

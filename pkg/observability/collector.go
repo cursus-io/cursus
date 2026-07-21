@@ -78,6 +78,9 @@ type Collector struct {
 	clusterIsLeader                 *prometheus.Desc
 	clusterOffline                  *prometheus.Desc
 	clusterUnderReplicated          *prometheus.Desc
+	topicMaterializationPending     *prometheus.Desc
+	topicMaterializationAttempts    *prometheus.Desc
+	topicMaterializationOldest      *prometheus.Desc
 	partitionReplicas               *prometheus.Desc
 	partitionInSync                 *prometheus.Desc
 	partitionLeaderEpoch            *prometheus.Desc
@@ -123,6 +126,9 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		clusterIsLeader:                 prometheus.NewDesc("cursus_cluster_is_leader", "Whether this broker is the current cluster leader.", nil, nil),
 		clusterOffline:                  prometheus.NewDesc("cursus_cluster_offline_partitions", "Partitions without an assigned leader.", nil, nil),
 		clusterUnderReplicated:          prometheus.NewDesc("cursus_cluster_under_replicated_partitions", "Partitions whose in-sync replica count is below their replica count.", nil, nil),
+		topicMaterializationPending:     prometheus.NewDesc("cursus_cluster_topic_materializations_pending", "Node-local topic materialization operations waiting to converge.", []string{"operation"}, nil),
+		topicMaterializationAttempts:    prometheus.NewDesc("cursus_cluster_topic_materialization_attempts_total", "Node-local topic materialization attempts by operation and result.", []string{"operation", "result"}, nil),
+		topicMaterializationOldest:      prometheus.NewDesc("cursus_cluster_topic_materialization_oldest_pending_seconds", "Age of the oldest pending node-local topic materialization.", nil, nil),
 		partitionReplicas:               prometheus.NewDesc("cursus_cluster_partition_replicas", "Configured replica count for a partition.", []string{"topic", "partition"}, nil),
 		partitionInSync:                 prometheus.NewDesc("cursus_cluster_partition_in_sync_replicas", "In-sync replica count for a partition.", []string{"topic", "partition"}, nil),
 		partitionLeaderEpoch:            prometheus.NewDesc("cursus_cluster_partition_leader_epoch", "Current partition leader epoch.", []string{"topic", "partition"}, nil),
@@ -136,7 +142,8 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		c.groupLag, c.legacyGroupLag, c.groupOffsetOutOfRange, c.activeStreams, c.storageHandlers,
 		c.storageSegments, c.storageBytes, c.storagePendingWrites, c.storageActiveReaders,
 		c.storageStatFailures, c.distributionEnabled, c.clusterBrokers, c.clusterHasLeader,
-		c.clusterIsLeader, c.clusterOffline, c.clusterUnderReplicated, c.partitionReplicas,
+		c.clusterIsLeader, c.clusterOffline, c.clusterUnderReplicated, c.topicMaterializationPending,
+		c.topicMaterializationAttempts, c.topicMaterializationOldest, c.partitionReplicas,
 		c.partitionInSync, c.partitionLeaderEpoch, c.partitionLeader,
 	}
 	return c
@@ -272,6 +279,13 @@ func (c *Collector) collectCluster(ch chan<- prometheus.Metric) {
 	ch <- gauge(c.clusterIsLeader, boolValue(state.IsLeader))
 	ch <- gauge(c.clusterOffline, float64(state.Offline))
 	ch <- gauge(c.clusterUnderReplicated, float64(state.UnderReplicated))
+	for _, operation := range []string{"create", "restore", "delete"} {
+		ch <- gauge(c.topicMaterializationPending, float64(state.TopicMaterializationsPending[operation]), operation)
+		attempts := state.TopicMaterializationAttempts[operation]
+		ch <- counter(c.topicMaterializationAttempts, float64(attempts.Success), operation, "success")
+		ch <- counter(c.topicMaterializationAttempts, float64(attempts.Failure), operation, "failure")
+	}
+	ch <- gauge(c.topicMaterializationOldest, state.TopicMaterializationOldestPending)
 	for _, partition := range state.PartitionDetails {
 		partitionLabel := strconv.Itoa(partition.Partition)
 		ch <- gauge(c.partitionReplicas, float64(partition.Replicas), partition.Topic, partitionLabel)
@@ -292,6 +306,10 @@ func boolValue(value bool) float64 {
 		return 1
 	}
 	return 0
+}
+
+func counter(desc *prometheus.Desc, value float64, labels ...string) prometheus.Metric {
+	return prometheus.MustNewConstMetric(desc, prometheus.CounterValue, value, labels...)
 }
 
 func gauge(desc *prometheus.Desc, value float64, labels ...string) prometheus.Metric {

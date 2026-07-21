@@ -71,6 +71,11 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 		fixedStreams(2),
 		fixedCluster{snapshot: clustercontroller.RuntimeSnapshot{
 			Enabled: true, BrokerCount: 3, HasLeader: true, IsLeader: true, UnderReplicated: 1,
+			TopicMaterializationsPending: map[string]int{"create": 2},
+			TopicMaterializationAttempts: map[string]clustercontroller.MaterializationAttemptsSnapshot{
+				"create": {Success: 4, Failure: 3},
+			},
+			TopicMaterializationOldestPending: 12.5,
 			PartitionDetails: []clustercontroller.PartitionRuntimeSnapshot{{
 				Topic: "orders", Partition: 0, Leader: "broker-1", LeaderEpoch: 4, Replicas: 3, InSync: 2,
 			}},
@@ -88,7 +93,7 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 	assertGauge(t, families, "cursus_topic_metadata_manifest_load_failure", nil, 1)
 	assertGauge(t, families, "cursus_topic_metadata_orphan_topics", nil, 3)
 	assertGauge(t, families, "cursus_topic_metadata_durability_warning", nil, 1)
-	assertCounter(t, families, "cursus_topic_metadata_durability_warnings_total", 7)
+	assertCounter(t, families, "cursus_topic_metadata_durability_warnings_total", nil, 7)
 	assertGauge(t, families, "cursus_partition_high_watermark", map[string]string{"topic": "orders", "partition": "0"}, 8)
 	assertGauge(t, families, "cursus_consumer_group_committed_offset", map[string]string{"group": "workers", "topic": "orders", "partition": "0"}, 5)
 	assertGauge(t, families, "cursus_consumer_group_lag", map[string]string{"group": "workers", "topic": "orders", "partition": "0"}, 3)
@@ -98,9 +103,30 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 	assertGauge(t, families, "cursus_storage_bytes", nil, 4096)
 	assertGauge(t, families, "cursus_streams_active", nil, 2)
 	assertGauge(t, families, "cursus_cluster_under_replicated_partitions", nil, 1)
+	assertGauge(t, families, "cursus_cluster_topic_materializations_pending", map[string]string{"operation": "create"}, 2)
+	assertCounter(t, families, "cursus_cluster_topic_materialization_attempts_total", map[string]string{"operation": "create", "result": "success"}, 4)
+	assertCounter(t, families, "cursus_cluster_topic_materialization_attempts_total", map[string]string{"operation": "create", "result": "failure"}, 3)
+	assertGauge(t, families, "cursus_cluster_topic_materialization_oldest_pending_seconds", nil, 12.5)
 	assertGauge(t, families, "cursus_cluster_partition_leader", map[string]string{"topic": "orders", "partition": "0", "broker_id": "broker-1"}, 1)
 }
 
+func assertCounter(t *testing.T, families []*dto.MetricFamily, name string, labels map[string]string, want float64) {
+	t.Helper()
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.Metric {
+			if labelsMatch(metric.Label, labels) {
+				if got := metric.GetCounter().GetValue(); got != want {
+					t.Fatalf("%s%v = %v, want %v", name, labels, got, want)
+				}
+				return
+			}
+		}
+	}
+	t.Fatalf("metric %s%v not found", name, labels)
+}
 func assertGauge(t *testing.T, families []*dto.MetricFamily, name string, labels map[string]string, want float64) {
 	t.Helper()
 	for _, family := range families {
@@ -117,19 +143,6 @@ func assertGauge(t *testing.T, families []*dto.MetricFamily, name string, labels
 		}
 	}
 	t.Fatalf("metric %s%v not found", name, labels)
-}
-
-func assertCounter(t *testing.T, families []*dto.MetricFamily, name string, want float64) {
-	t.Helper()
-	for _, family := range families {
-		if family.GetName() == name && family.GetType() == dto.MetricType_COUNTER && len(family.Metric) == 1 {
-			if got := family.Metric[0].GetCounter().GetValue(); got != want {
-				t.Fatalf("%s = %v, want %v", name, got, want)
-			}
-			return
-		}
-	}
-	t.Fatalf("counter %s not found", name)
 }
 
 func labelsMatch(pairs []*dto.LabelPair, want map[string]string) bool {

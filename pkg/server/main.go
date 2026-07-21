@@ -200,6 +200,12 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			_, leaderErr := cc.GetClusterLeader()
 			return leaderErr
 		})
+		healthState.AddCheck("topic_materialization", func(context.Context) error {
+			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
+				return fmt.Errorf("topic materialization state unavailable")
+			}
+			return cc.RaftManager.GetFSM().TopicMaterializationReadinessError()
+		})
 	}
 
 	runtimeCollector := observability.NewCollector(tm, cd, dm, sm, cc, healthState)
