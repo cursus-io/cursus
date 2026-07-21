@@ -20,11 +20,11 @@ import (
 )
 
 const (
-	runTopicStorageFaultE2E = "RUN_E2E_TOPIC_STORAGE_FAULTS"
-	baseExporterPort        = 9100
-	faultSentinelRoot       = "/run/cursus-e2e-faults"
-	containerLogRoot        = "/root/cluster-logs"
-	faultConvergenceTimeout = 90 * time.Second
+	runTopicStorageFaultE2E      = "RUN_E2E_TOPIC_STORAGE_FAULTS"
+	storageFaultBaseExporterPort = 9100
+	faultSentinelRoot            = "/run/cursus-e2e-faults"
+	containerLogRoot             = "/root/cluster-logs"
+	faultConvergenceTimeout      = 90 * time.Second
 )
 
 func TestTopicStorageFaultReconciliation(t *testing.T) {
@@ -33,7 +33,7 @@ func TestTopicStorageFaultReconciliation(t *testing.T) {
 	}
 
 	ctx := GivenFaultClusterRestart(t)
-	leader := waitForSingleRaftLeader(t, ctx.clusterSize)
+	leader := waitForStorageFaultRaftLeader(t, ctx.clusterSize)
 	target := firstFollower(leader, ctx.clusterSize)
 	topicName := "fault-materialization"
 	topicPath := filepath.ToSlash(filepath.Join(containerLogRoot, topicName))
@@ -71,7 +71,7 @@ func TestTopicStorageFaultReconciliation(t *testing.T) {
 	waitForContainerPath(t, target, topicPath, false)
 }
 
-func waitForSingleRaftLeader(t *testing.T, clusterSize int) int {
+func waitForStorageFaultRaftLeader(t *testing.T, clusterSize int) int {
 	t.Helper()
 	leader := 0
 	if err := eventually(t, "exactly one Raft leader metric", faultConvergenceTimeout, func() (bool, string, error) {
@@ -156,7 +156,7 @@ func waitForMetric(t *testing.T, node int, name string, labels map[string]string
 
 func readMetric(node int, name string, labels map[string]string) (float64, error) {
 	client := &http.Client{Timeout: 2 * time.Second}
-	response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", baseExporterPort+node)) // #nosec G107 -- fixed loopback test endpoint.
+	response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", storageFaultBaseExporterPort+node)) // #nosec G107 -- fixed loopback test endpoint.
 	if err != nil {
 		return 0, err
 	}
