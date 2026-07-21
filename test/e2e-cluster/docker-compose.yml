@@ -12,10 +12,14 @@ services:
       - ADVERTISED_BROKER_PORT=9001
       - RAFT_PORT=9001
       - DISCOVERY_PORT=8000
+      - ENABLE_EXPORTER=true
+      - EXPORTER_PORT=9100
+      - BOOTSTRAP_CLUSTER=true
     ports:
       - "9001:9000"
       - "8000:8000"
       - "9081:9080"
+      - "9101:9100"
     volumes:
       - ../cluster/config.yaml:/root/config.yaml
     healthcheck:
@@ -39,10 +43,14 @@ services:
       - ADVERTISED_BROKER_PORT=9002
       - RAFT_PORT=9001
       - DISCOVERY_PORT=8000
+      - ENABLE_EXPORTER=true
+      - EXPORTER_PORT=9100
+      - BOOTSTRAP_CLUSTER=true
     ports:
       - "9002:9000"
       - "8001:8000"
       - "9082:9080"
+      - "9102:9100"
     volumes:
       - ../cluster/config.yaml:/root/config.yaml
     healthcheck:
@@ -69,10 +77,14 @@ services:
       - ADVERTISED_BROKER_PORT=9003
       - RAFT_PORT=9001
       - DISCOVERY_PORT=8000
+      - ENABLE_EXPORTER=true
+      - EXPORTER_PORT=9100
+      - BOOTSTRAP_CLUSTER=true
     ports:
       - "9003:9000"
       - "8002:8000"
       - "9083:9080"
+      - "9103:9100"
     volumes:
       - ../cluster/config.yaml:/root/config.yaml
     healthcheck:

@@ -191,6 +191,7 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	go rm.isrManager.Start()
 
 	go rm.observeLeadership(notifyCh)
+	go rm.reconcileTopicMaterializations(ctx, 5*time.Second)
 
 	return rm, nil
 }
@@ -225,6 +226,20 @@ func buildRaftConfig(cfg *config.Config, brokerID string) (*raft.Config, error) 
 	return raftCfg, nil
 }
 
+func (rm *RaftReplicationManager) reconcileTopicMaterializations(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := rm.fsm.ReconcileTopicMaterializations(); err != nil {
+				util.Warn("Topic materialization reconcile pending on broker %s: %v", rm.brokerID, err)
+			}
+		}
+	}
+}
 func (rm *RaftReplicationManager) observeLeadership(notifyCh <-chan bool) {
 	for isLeader := range notifyCh {
 		rm.isLeader.Store(isLeader)
