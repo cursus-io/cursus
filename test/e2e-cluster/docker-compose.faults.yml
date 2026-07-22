@@ -1,0 +1,33 @@
+services:
+  broker-1:
+    build:
+      context: ../..
+      dockerfile: test/e2e-cluster/Dockerfile.e2e-faults
+    environment:
+      - CURSUS_E2E_FAULTS=1
+      - ENABLE_EXPORTER=true
+      - EXPORTER_PORT=9100
+    ports:
+      - "9101:9100"
+
+  broker-2:
+    build:
+      context: ../..
+      dockerfile: test/e2e-cluster/Dockerfile.e2e-faults
+    environment:
+      - CURSUS_E2E_FAULTS=1
+      - ENABLE_EXPORTER=true
+      - EXPORTER_PORT=9100
+    ports:
+      - "9102:9100"
+
+  broker-3:
+    build:
+      context: ../..
+      dockerfile: test/e2e-cluster/Dockerfile.e2e-faults
+    environment:
+      - CURSUS_E2E_FAULTS=1
+      - ENABLE_EXPORTER=true
+      - EXPORTER_PORT=9100
+    ports:
+      - "9103:9100"

@@ -129,6 +129,12 @@ func (dm *DiskManager) ExistingPartitionCount(topic string) (int, error) {
 	return maxPartition + 1, nil
 }
 
+// RemoveTopicStorage removes a topic directory after TopicManager has
+// validated that the path is contained by the configured log root.
+func (dm *DiskManager) RemoveTopicStorage(path string) error {
+	return os.RemoveAll(path)
+}
+
 // CloseAllHandlers should be implemented to ensure all DiskHandlers are closed properly
 func (dm *DiskManager) CloseAllHandlers() {
 	dm.mu.Lock()

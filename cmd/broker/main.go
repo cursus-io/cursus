@@ -61,7 +61,12 @@ func runBroker(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("create stream manager adapter: %w", err)
 	}
 
-	tm := topic.NewTopicManager(cfg, dm, smAdapter)
+	storageProvider, err := newStorageProvider(dm, cfg.LogDir)
+	if err != nil {
+		util.Fatal("Failed to configure storage provider: %v", err)
+	}
+
+	tm := topic.NewTopicManager(cfg, storageProvider, smAdapter)
 	if err := tm.RestoreTopics(); err != nil {
 		util.Error("Failed to restore durable topic metadata; serving diagnostics only: %v", err)
 		return runTopicMetadataDiagnostics(ctx, cfg, tm, dm)
