@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/signal"
 	"syscall"
@@ -15,6 +16,9 @@ import (
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/util"
 )
+
+var runServerContext = server.RunServerContext
+var runTopicMetadataDiagnostics = server.RunTopicMetadataDiagnostics
 
 func main() {
 	// Configuration
@@ -42,38 +46,46 @@ func main() {
 	util.Info("🚀 Starting broker on port %d\n", cfg.BrokerPort)
 	util.Info("📊 Exporter: %v\n", cfg.EnableExporter)
 
-	// Initialization
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := runBroker(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
+		util.Fatal("❌ Broker failed: %v", err)
+	}
+}
+
+func runBroker(ctx context.Context, cfg *config.Config) error {
 	dm := disk.NewDiskManager(cfg)
 	sm := stream.NewStreamManager(cfg.MaxStreamConnections, cfg.StreamTimeout, cfg.StreamHeartbeatInterval)
 	smAdapter, err := topic.NewStreamManagerAdapter(sm)
 	if err != nil {
-		util.Fatal("❌ Failed to create stream manager adapter: %v", err)
+		return fmt.Errorf("create stream manager adapter: %w", err)
 	}
 
-	tm := topic.NewTopicManager(cfg, dm, smAdapter)
-	if err := tm.RestoreTopics(); err != nil {
-		util.Fatal("❌ Failed to restore durable topic metadata: %v", err)
+	storageProvider, err := newStorageProvider(dm, cfg.LogDir)
+	if err != nil {
+		util.Fatal("Failed to configure storage provider: %v", err)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+
+	tm := topic.NewTopicManager(cfg, storageProvider, smAdapter)
+	if err := tm.RestoreTopics(); err != nil {
+		util.Error("Failed to restore durable topic metadata; serving diagnostics only: %v", err)
+		return runTopicMetadataDiagnostics(ctx, cfg, tm, dm)
+	}
+
 	cd := coordinator.NewCoordinator(ctx, cfg, tm)
 	tm.SetCoordinator(cd)
-
-	// Static consumer groups
 	for _, gcfg := range cfg.StaticConsumerGroups {
 		for _, topicName := range gcfg.Topics {
-			t := tm.GetTopic(topicName)
-			if t == nil {
+			current := tm.GetTopic(topicName)
+			if current == nil {
 				util.Error("⚠️ Topic %q does not exist; skipping static consumer group registration", topicName)
-			} else {
-				if _, err := tm.RegisterConsumerGroup(topicName, gcfg.Name, gcfg.ConsumerCount); err != nil {
-					util.Error("⚠️ Failed to register static consumer group %q on topic %q: %v", gcfg.Name, topicName, err)
-				}
+				continue
+			}
+			if _, err := tm.RegisterConsumerGroup(topicName, gcfg.Name, gcfg.ConsumerCount); err != nil {
+				util.Error("⚠️ Failed to register static consumer group %q on topic %q: %v", gcfg.Name, topicName, err)
 			}
 		}
 	}
 
-	if err := server.RunServer(cfg, tm, dm, cd, sm); err != nil {
-		util.Fatal("❌ Broker failed: %v", err)
-	}
+	return runServerContext(ctx, cfg, tm, dm, cd, sm)
 }

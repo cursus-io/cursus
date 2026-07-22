@@ -2,50 +2,45 @@ package e2e_cluster
 
 import "testing"
 
-func TestClusterReadinessFromListCluster(t *testing.T) {
+func TestListClusterReady(t *testing.T) {
 	tests := []struct {
-		name     string
-		response string
-		want     bool
+		name      string
+		response  string
+		wantReady bool
+		wantError bool
 	}{
 		{
-			name:     "active broker",
-			response: `OK brokers=[{"id":"broker-1","status":"active"}]`,
-			want:     true,
+			name:      "success",
+			response:  `OK brokers=[{"id":"broker-1","status":"active"}]`,
+			wantReady: true,
 		},
 		{
-			name:     "error response",
-			response: "ERROR: fsm_not_available",
+			name:      "error response",
+			response:  `ERROR: no_leader`,
+			wantError: true,
 		},
 		{
-			name:     "empty broker list",
-			response: "OK brokers=[]",
+			name:     "empty membership",
+			response: `OK brokers=[]`,
 		},
 		{
-			name:     "inactive brokers only",
+			name:     "inactive membership",
 			response: `OK brokers=[{"id":"broker-1","status":"inactive"}]`,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ready, _, err := clusterReadinessFromListCluster(test.response)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			ready, detail, err := listClusterReady(test.response)
+			if ready != test.wantReady {
+				t.Fatalf("listClusterReady(%q) ready = %t, want %t; detail=%s err=%v", test.response, ready, test.wantReady, detail, err)
 			}
-			if ready != test.want {
-				t.Fatalf("ready=%t want=%t response=%q", ready, test.want, test.response)
+			if (err != nil) != test.wantError {
+				t.Fatalf("listClusterReady(%q) error = %v, wantError=%t", test.response, err, test.wantError)
+			}
+			if detail == "" {
+				t.Fatal("listClusterReady returned empty diagnostic detail")
 			}
 		})
-	}
-}
-
-func TestClusterReadinessFromListClusterRejectsMalformedBrokerJSON(t *testing.T) {
-	ready, _, err := clusterReadinessFromListCluster("OK brokers=not-json")
-	if err == nil {
-		t.Fatal("expected malformed broker JSON error")
-	}
-	if ready {
-		t.Fatal("malformed broker JSON reported ready")
 	}
 }

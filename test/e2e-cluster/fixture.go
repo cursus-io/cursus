@@ -3,6 +3,7 @@ package e2e_cluster
 import (
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -14,6 +15,7 @@ const (
 	composeFile         = "docker-compose.yml"
 	snapshotComposeFile = "docker-compose.snapshot.yml"
 	snapshotProjectName = "cursus-snapshot-e2e"
+	faultComposeFile    = "docker-compose.faults.yml"
 	baseBrokerPort      = 9000
 	baseHealthPort      = 9080
 )
@@ -75,6 +77,10 @@ func GivenSnapshotClusterRestart(t *testing.T) *ClusterTestContext {
 	return givenClusterRestart(t, snapshotProjectName, composeFile, snapshotComposeFile)
 }
 
+func GivenFaultClusterRestart(t *testing.T) *ClusterTestContext {
+	return givenClusterRestart(t, "", composeFile, faultComposeFile)
+}
+
 func givenClusterRestart(t *testing.T, project string, composeFiles ...string) *ClusterTestContext {
 	downArgs := composeCommandArgs(project, composeFiles, "down", "-v", "--remove-orphans")
 	_ = e2e.RunCompose(downArgs...).Run()
@@ -105,7 +111,7 @@ func givenClusterRestart(t *testing.T, project string, composeFiles ...string) *
 		if err != nil {
 			return false, "LIST_CLUSTER failed", err
 		}
-		return clusterReadinessFromListCluster(resp)
+		return listClusterReady(resp)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -114,11 +120,11 @@ func givenClusterRestart(t *testing.T, project string, composeFiles ...string) *
 	return ctx
 }
 
-func clusterReadinessFromListCluster(resp string) (bool, string, error) {
+func listClusterReady(resp string) (bool, string, error) {
 	const prefix = "OK brokers="
 	trimmed := strings.TrimSpace(resp)
 	if !strings.HasPrefix(trimmed, prefix) {
-		return false, trimmed, nil
+		return false, trimmed, fmt.Errorf("unexpected LIST_CLUSTER response %q", trimmed)
 	}
 
 	var brokers []fsm.BrokerInfo
@@ -181,4 +187,13 @@ func (c *ClusterTestContext) WithClusterSize(size int) *ClusterTestContext {
 func (c *ClusterTestContext) WithMinInSyncReplicas(min int) *ClusterTestContext {
 	c.minInSyncReplicas = min
 	return c
+}
+
+func runClusterCompose(composeFiles []string, args ...string) *exec.Cmd {
+	composeArgs := make([]string, 0, len(composeFiles)*2+len(args))
+	for _, file := range composeFiles {
+		composeArgs = append(composeArgs, "-f", file)
+	}
+	composeArgs = append(composeArgs, args...)
+	return e2e.RunCompose(composeArgs...)
 }

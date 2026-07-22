@@ -191,12 +191,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	}
 
 	healthState := NewHealthState()
-	healthState.AddCheck("storage", func(context.Context) error {
-		if tm == nil || dm == nil {
-			return fmt.Errorf("storage subsystem unavailable")
-		}
-		return dm.Ready()
-	})
+	addStorageReadinessChecks(healthState, tm, dm)
 	if cfg.EnabledDistribution {
 		healthState.AddCheck("cluster_leader", func(context.Context) error {
 			if cc == nil {

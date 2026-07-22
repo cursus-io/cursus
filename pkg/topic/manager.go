@@ -19,8 +19,6 @@ import (
 
 var ErrTopicNotFound = errors.New("topic not found")
 
-var removeTopicStorageFn = os.RemoveAll
-
 type StreamManager interface {
 	AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), legacyCommitInterval time.Duration) error
 	RemoveStream(key string)
@@ -38,6 +36,11 @@ type TopicManager struct {
 	coordinator   *coordinator.Coordinator
 	txnResolver   TransactionDecisionResolver
 	metadataStore *topicMetadataStore
+
+	metadataLoadFailure             string
+	metadataOrphanTopicCount        int
+	metadataDurabilityWarning       string
+	metadataDurabilityWarningsTotal uint64
 }
 
 // HandlerProvider defines an interface to provide disk handlers.
@@ -498,7 +501,7 @@ func (tm *TopicManager) deleteTopicLogDirLocked(name string) error {
 	if remover, ok := tm.hp.(topicStorageRemover); ok {
 		return remover.RemoveTopicStorage(target)
 	}
-	return removeTopicStorageFn(target)
+	return os.RemoveAll(target)
 }
 
 func (tm *TopicManager) ListTopics() []string {
