@@ -114,10 +114,13 @@ func (s *topicMetadataStore) Load() (_ []Definition, err error) {
 			return nil, scanErr
 		}
 		if len(orphaned) > 0 {
-			return nil, fmt.Errorf(
-				"topic metadata manifest is missing while persisted topic storage exists: %s",
-				strings.Join(orphaned, ","),
-			)
+			return nil, &orphanedTopicMetadataError{
+				count: len(orphaned),
+				err: fmt.Errorf(
+					"topic metadata manifest is missing while persisted topic storage exists: %s",
+					strings.Join(orphaned, ","),
+				),
+			}
 		}
 		return nil, nil
 	}
@@ -172,10 +175,13 @@ func (s *topicMetadataStore) Load() (_ []Definition, err error) {
 		return nil, err
 	}
 	if len(orphaned) > 0 {
-		return nil, fmt.Errorf(
-			"topic metadata manifest omits persisted topic storage: %s",
-			strings.Join(orphaned, ","),
-		)
+		return nil, &orphanedTopicMetadataError{
+			count: len(orphaned),
+			err: fmt.Errorf(
+				"topic metadata manifest omits persisted topic storage: %s",
+				strings.Join(orphaned, ","),
+			),
+		}
 	}
 	return definitions, nil
 }
@@ -285,11 +291,16 @@ func (tm *TopicManager) RestoreTopics() error {
 	}
 	definitions, err := tm.metadataStore.Load()
 	if err != nil {
-		return fmt.Errorf("load durable topic metadata: %w", err)
+		restoreErr := fmt.Errorf("load durable topic metadata: %w", err)
+		tm.recordMetadataLoadResult(restoreErr, confirmedOrphanCount(err))
+		return restoreErr
 	}
 	if err := tm.RestoreDefinitions(definitions); err != nil {
-		return fmt.Errorf("restore durable topics: %w", err)
+		restoreErr := fmt.Errorf("restore durable topics: %w", err)
+		tm.recordMetadataLoadResult(restoreErr, 0)
+		return restoreErr
 	}
+	tm.recordMetadataLoadResult(nil, 0)
 	return nil
 }
 
@@ -400,11 +411,13 @@ func (tm *TopicManager) persistDefinitionLocked(override Definition) error {
 	definitions := tm.definitionsLocked(&override, "")
 	if err := tm.metadataStore.Save(definitions); err != nil {
 		if topicMetadataWriteCommitted(err) {
+			tm.recordMetadataDurabilityWarningLocked(err)
 			util.Warn("Topic metadata definition %q committed with durability uncertainty: %v", override.Name, err)
 			return nil
 		}
 		return fmt.Errorf("persist topic definition %q: %w", override.Name, err)
 	}
+	tm.metadataDurabilityWarning = ""
 	return nil
 }
 
@@ -414,11 +427,13 @@ func (tm *TopicManager) persistRemovalLocked(name string) error {
 	}
 	if err := tm.metadataStore.Save(tm.definitionsLocked(nil, name)); err != nil {
 		if topicMetadataWriteCommitted(err) {
+			tm.recordMetadataDurabilityWarningLocked(err)
 			util.Warn("Topic metadata deletion %q committed with durability uncertainty: %v", name, err)
 			return nil
 		}
 		return fmt.Errorf("persist topic deletion %q: %w", name, err)
 	}
+	tm.metadataDurabilityWarning = ""
 	return nil
 }
 
