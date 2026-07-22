@@ -15,11 +15,23 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.LogLevel != util.LogLevelInfo {
 		t.Errorf("Expected default LogLevel Info, got %v", cfg.LogLevel)
 	}
+	if cfg.RaftSnapshotIntervalMS != 120000 {
+		t.Errorf("Expected default RaftSnapshotIntervalMS 120000, got %d", cfg.RaftSnapshotIntervalMS)
+	}
+	if cfg.RaftSnapshotThreshold != 8192 {
+		t.Errorf("Expected default RaftSnapshotThreshold 8192, got %d", cfg.RaftSnapshotThreshold)
+	}
+	if cfg.RaftTrailingLogs != 10240 {
+		t.Errorf("Expected default RaftTrailingLogs 10240, got %d", cfg.RaftTrailingLogs)
+	}
 }
 
 func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("BROKER_PORT", "9999")
 	t.Setenv("LOG_RETENTION_HOURS", "24")
+	t.Setenv("RAFT_SNAPSHOT_INTERVAL_MS", "250")
+	t.Setenv("RAFT_SNAPSHOT_THRESHOLD", "16")
+	t.Setenv("RAFT_TRAILING_LOGS", "0")
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -31,6 +43,15 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	}
 	if cfg.RetentionHours != 24 {
 		t.Errorf("Expected RetentionHours 24 from env, got %d", cfg.RetentionHours)
+	}
+	if cfg.RaftSnapshotIntervalMS != 250 {
+		t.Errorf("Expected RaftSnapshotIntervalMS 250 from env, got %d", cfg.RaftSnapshotIntervalMS)
+	}
+	if cfg.RaftSnapshotThreshold != 16 {
+		t.Errorf("Expected RaftSnapshotThreshold 16 from env, got %d", cfg.RaftSnapshotThreshold)
+	}
+	if cfg.RaftTrailingLogs != 0 {
+		t.Errorf("Expected RaftTrailingLogs 0 from env, got %d", cfg.RaftTrailingLogs)
 	}
 }
 

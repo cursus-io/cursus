@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 )
 
@@ -31,15 +32,21 @@ type clusterPartitionStatus struct {
 }
 
 type clusterStatus struct {
-	RaftLeader      string                   `json:"raft_leader"`
-	BrokerCount     int                      `json:"broker_count"`
-	ActiveBrokers   int                      `json:"active_brokers"`
-	InactiveBrokers int                      `json:"inactive_brokers"`
-	PartitionCount  int                      `json:"partition_count"`
-	Leaderless      int                      `json:"leaderless_partitions"`
-	UnderReplicated int                      `json:"under_replicated_partitions"`
-	Brokers         []clusterBrokerStatus    `json:"brokers"`
-	Partitions      []clusterPartitionStatus `json:"partitions"`
+	RaftLeader            string                   `json:"raft_leader"`
+	RaftState             string                   `json:"raft_state"`
+	RaftAppliedIndex      uint64                   `json:"raft_applied_index"`
+	RaftCommitIndex       uint64                   `json:"raft_commit_index"`
+	RaftLastLogIndex      uint64                   `json:"raft_last_log_index"`
+	RaftLastSnapshotIndex uint64                   `json:"raft_last_snapshot_index"`
+	RaftLastSnapshotTerm  uint64                   `json:"raft_last_snapshot_term"`
+	BrokerCount           int                      `json:"broker_count"`
+	ActiveBrokers         int                      `json:"active_brokers"`
+	InactiveBrokers       int                      `json:"inactive_brokers"`
+	PartitionCount        int                      `json:"partition_count"`
+	Leaderless            int                      `json:"leaderless_partitions"`
+	UnderReplicated       int                      `json:"under_replicated_partitions"`
+	Brokers               []clusterBrokerStatus    `json:"brokers"`
+	Partitions            []clusterPartitionStatus `json:"partitions"`
 }
 
 // handleListCluster processes the read-only LIST_CLUSTER command.
@@ -70,6 +77,21 @@ func (ch *CommandHandler) handleClusterStatus() string {
 	}
 
 	status := buildClusterStatus(state, ch.Cluster.RaftManager.GetLeaderAddress())
+	if provider, ok := ch.Cluster.RaftManager.(interface {
+		GetRaftStatus() (replication.RaftStatus, error)
+	}); ok {
+		raftStatus, err := provider.GetRaftStatus()
+		if err != nil {
+			status.RaftState = "unavailable"
+		} else {
+			status.RaftState = raftStatus.State
+			status.RaftAppliedIndex = raftStatus.AppliedIndex
+			status.RaftCommitIndex = raftStatus.CommitIndex
+			status.RaftLastLogIndex = raftStatus.LastLogIndex
+			status.RaftLastSnapshotIndex = raftStatus.LastSnapshotIndex
+			status.RaftLastSnapshotTerm = raftStatus.LastSnapshotTerm
+		}
+	}
 	data, err := json.Marshal(status)
 	if err != nil {
 		return fmt.Sprintf("ERROR: marshal_cluster_status_failed reason=%q", err.Error())

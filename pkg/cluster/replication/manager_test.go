@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
@@ -49,6 +50,10 @@ func (m *MockRaft) Shutdown() raft.Future {
 	return m.Called().Get(0).(raft.Future)
 }
 
+func (m *MockRaft) Stats() map[string]string {
+	return m.Called().Get(0).(map[string]string)
+}
+
 type MockApplyFuture struct {
 	mock.Mock
 }
@@ -63,6 +68,101 @@ type MockIndexFuture struct {
 
 func (m *MockIndexFuture) Error() error  { return m.Called().Error(0) }
 func (m *MockIndexFuture) Index() uint64 { return 0 }
+
+func TestBuildRaftConfigMapsSnapshotSettings(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.RaftSnapshotIntervalMS = 250
+	cfg.RaftSnapshotThreshold = 16
+	cfg.RaftTrailingLogs = 0
+
+	got, err := buildRaftConfig(cfg, "broker-1")
+	assert.NoError(t, err)
+	assert.Equal(t, 250*time.Millisecond, got.SnapshotInterval)
+	assert.Equal(t, uint64(16), got.SnapshotThreshold)
+	assert.Equal(t, uint64(0), got.TrailingLogs)
+}
+
+func TestBuildRaftConfigDefaultsMatchHashicorp(t *testing.T) {
+	got, err := buildRaftConfig(config.DefaultConfig(), "broker-1")
+	assert.NoError(t, err)
+	want := raft.DefaultConfig()
+	assert.Equal(t, want.SnapshotInterval, got.SnapshotInterval)
+	assert.Equal(t, want.SnapshotThreshold, got.SnapshotThreshold)
+	assert.Equal(t, want.TrailingLogs, got.TrailingLogs)
+}
+
+func TestBuildRaftConfigRejectsUnsafeSnapshotSettings(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*config.Config)
+		want string
+	}{
+		{
+			name: "interval below library minimum",
+			edit: func(cfg *config.Config) { cfg.RaftSnapshotIntervalMS = 4 },
+			want: "raft_snapshot_interval_ms",
+		},
+		{
+			name: "zero threshold",
+			edit: func(cfg *config.Config) { cfg.RaftSnapshotThreshold = 0 },
+			want: "raft_snapshot_threshold",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			test.edit(cfg)
+			_, err := buildRaftConfig(cfg, "broker-1")
+			assert.ErrorContains(t, err, test.want)
+		})
+	}
+}
+
+func TestRaftReplicationManagerGetRaftStatus(t *testing.T) {
+	mr := new(MockRaft)
+	mr.On("Stats").Return(map[string]string{
+		"state":               "Follower",
+		"applied_index":       "41",
+		"commit_index":        "42",
+		"last_log_index":      "43",
+		"last_snapshot_index": "40",
+		"last_snapshot_term":  "3",
+	})
+	rm := &RaftReplicationManager{raft: mr}
+
+	got, err := rm.GetRaftStatus()
+	assert.NoError(t, err)
+	assert.Equal(t, RaftStatus{
+		State: "Follower", AppliedIndex: 41, CommitIndex: 42, LastLogIndex: 43,
+		LastSnapshotIndex: 40, LastSnapshotTerm: 3,
+	}, got)
+}
+
+func TestRaftReplicationManagerGetRaftStatusRejectsMissingOrBlankState(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		state map[string]string
+	}{
+		{name: "missing", state: map[string]string{}},
+		{name: "blank", state: map[string]string{"state": "  "}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mr := new(MockRaft)
+			mr.On("Stats").Return(test.state)
+			rm := &RaftReplicationManager{raft: mr}
+			_, err := rm.GetRaftStatus()
+			assert.ErrorContains(t, err, "state")
+		})
+	}
+}
+
+func TestRaftReplicationManagerGetRaftStatusRejectsInvalidStats(t *testing.T) {
+	mr := new(MockRaft)
+	mr.On("Stats").Return(map[string]string{"state": "Follower", "applied_index": "not-a-number"})
+	rm := &RaftReplicationManager{raft: mr}
+	_, err := rm.GetRaftStatus()
+	assert.ErrorContains(t, err, "applied_index")
+}
 
 func TestRaftReplicationManager_ApplyCommand(t *testing.T) {
 	mr := new(MockRaft)

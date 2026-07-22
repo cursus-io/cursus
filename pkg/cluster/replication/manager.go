@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,16 @@ type RaftInterface interface {
 	GetConfiguration() raft.ConfigurationFuture
 	BootstrapCluster(raft.Configuration) raft.Future
 	Shutdown() raft.Future
+	Stats() map[string]string
+}
+
+type RaftStatus struct {
+	State             string
+	AppliedIndex      uint64
+	CommitIndex       uint64
+	LastLogIndex      uint64
+	LastSnapshotIndex uint64
+	LastSnapshotTerm  uint64
 }
 
 type ISRManagerInterface interface {
@@ -62,15 +73,10 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	brokerFSM := fsm.NewBrokerFSM(topicManager, coordinator)
 
 	localAddr := fmt.Sprintf("%s:%d", cfg.AdvertisedHost, cfg.RaftPort)
-	raftCfg := raft.DefaultConfig()
-	raftCfg.LocalID = raft.ServerID(brokerID)
-
-	// Raft Security Rule: HeartbeatTimeout must be larger than LeaderLeaseTimeout
-	raftCfg.HeartbeatTimeout = 1000 * time.Millisecond
-	raftCfg.ElectionTimeout = 2000 * time.Millisecond
-	raftCfg.LeaderLeaseTimeout = 800 * time.Millisecond
-	raftCfg.CommitTimeout = 50 * time.Millisecond
-	raftCfg.LogLevel = "Info"
+	raftCfg, err := buildRaftConfig(cfg, brokerID)
+	if err != nil {
+		return nil, err
+	}
 
 	notifyCh := make(chan bool, 10)
 	raftCfg.NotifyCh = notifyCh
@@ -190,6 +196,36 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	return rm, nil
 }
 
+func buildRaftConfig(cfg *config.Config, brokerID string) (*raft.Config, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("raft config is required")
+	}
+	if cfg.RaftSnapshotIntervalMS < 5 {
+		return nil, fmt.Errorf("raft_snapshot_interval_ms must be at least 5")
+	}
+	if cfg.RaftSnapshotThreshold == 0 {
+		return nil, fmt.Errorf("raft_snapshot_threshold must be greater than zero")
+	}
+
+	raftCfg := raft.DefaultConfig()
+	raftCfg.LocalID = raft.ServerID(brokerID)
+	raftCfg.SnapshotInterval = time.Duration(cfg.RaftSnapshotIntervalMS) * time.Millisecond
+	raftCfg.SnapshotThreshold = cfg.RaftSnapshotThreshold
+	raftCfg.TrailingLogs = cfg.RaftTrailingLogs
+
+	// Raft Security Rule: HeartbeatTimeout must be larger than LeaderLeaseTimeout.
+	raftCfg.HeartbeatTimeout = 1000 * time.Millisecond
+	raftCfg.ElectionTimeout = 2000 * time.Millisecond
+	raftCfg.LeaderLeaseTimeout = 800 * time.Millisecond
+	raftCfg.CommitTimeout = 50 * time.Millisecond
+	raftCfg.LogLevel = "Info"
+
+	if err := raft.ValidateConfig(raftCfg); err != nil {
+		return nil, fmt.Errorf("invalid raft config: %w", err)
+	}
+	return raftCfg, nil
+}
+
 func (rm *RaftReplicationManager) reconcileTopicMaterializations(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -233,6 +269,40 @@ func (rm *RaftReplicationManager) LeaderCh() <-chan bool {
 
 func (rm *RaftReplicationManager) GetLeaderAddress() string {
 	return string(rm.raft.Leader())
+}
+
+func (rm *RaftReplicationManager) GetRaftStatus() (RaftStatus, error) {
+	if rm == nil || rm.raft == nil {
+		return RaftStatus{}, fmt.Errorf("raft is not available")
+	}
+	stats := rm.raft.Stats()
+	state := strings.TrimSpace(stats["state"])
+	if state == "" {
+		return RaftStatus{}, fmt.Errorf("raft stat %q is missing or blank", "state")
+	}
+	status := RaftStatus{State: state}
+	fields := []struct {
+		key    string
+		target *uint64
+	}{
+		{key: "applied_index", target: &status.AppliedIndex},
+		{key: "commit_index", target: &status.CommitIndex},
+		{key: "last_log_index", target: &status.LastLogIndex},
+		{key: "last_snapshot_index", target: &status.LastSnapshotIndex},
+		{key: "last_snapshot_term", target: &status.LastSnapshotTerm},
+	}
+	for _, field := range fields {
+		value, ok := stats[field.key]
+		if !ok {
+			return RaftStatus{}, fmt.Errorf("raft stat %q is missing", field.key)
+		}
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return RaftStatus{}, fmt.Errorf("parse raft stat %q: %w", field.key, err)
+		}
+		*field.target = parsed
+	}
+	return status, nil
 }
 
 func (rm *RaftReplicationManager) GetFSM() *fsm.BrokerFSM {
