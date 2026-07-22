@@ -7,14 +7,17 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/test/e2e"
 )
 
 const (
-	composeFile      = "docker-compose.yml"
-	faultComposeFile = "docker-compose.faults.yml"
-	baseBrokerPort   = 9000
-	baseHealthPort   = 9080
+	composeFile         = "docker-compose.yml"
+	snapshotComposeFile = "docker-compose.snapshot.yml"
+	snapshotProjectName = "cursus-snapshot-e2e"
+	faultComposeFile    = "docker-compose.faults.yml"
+	baseBrokerPort      = 9000
+	baseHealthPort      = 9080
 )
 
 // ClusterTestContext extends e2e.TestContext for cluster testing
@@ -67,22 +70,28 @@ func GivenCluster(t *testing.T) *ClusterTestContext {
 }
 
 func GivenClusterRestart(t *testing.T) *ClusterTestContext {
-	return givenClusterRestart(t, composeFile)
+	return givenClusterRestart(t, "", composeFile)
+}
+
+func GivenSnapshotClusterRestart(t *testing.T) *ClusterTestContext {
+	return givenClusterRestart(t, snapshotProjectName, composeFile, snapshotComposeFile)
 }
 
 func GivenFaultClusterRestart(t *testing.T) *ClusterTestContext {
-	return givenClusterRestart(t, composeFile, faultComposeFile)
+	return givenClusterRestart(t, "", composeFile, faultComposeFile)
 }
 
-func givenClusterRestart(t *testing.T, composeFiles ...string) *ClusterTestContext {
-	_ = runClusterCompose(composeFiles, "down", "-v", "--remove-orphans").Run()
-	cmd := runClusterCompose(composeFiles, "up", "-d", "--force-recreate", "--build")
+func givenClusterRestart(t *testing.T, project string, composeFiles ...string) *ClusterTestContext {
+	downArgs := composeCommandArgs(project, composeFiles, "down", "-v", "--remove-orphans")
+	_ = e2e.RunCompose(downArgs...).Run()
+	upArgs := composeCommandArgs(project, composeFiles, "up", "-d", "--force-recreate", "--build")
+	cmd := e2e.RunCompose(upArgs...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("Failed to start docker compose: %v\nOutput: %s", err, string(output))
 	}
 
 	t.Cleanup(func() {
-		cmd := runClusterCompose(composeFiles, "down", "-v", "--remove-orphans")
+		cmd := e2e.RunCompose(composeCommandArgs(project, composeFiles, "down", "-v", "--remove-orphans")...)
 		if err := cmd.Run(); err != nil {
 			t.Logf("Cleanup warning: failed to bring down docker compose: %v", err)
 		}
@@ -111,24 +120,36 @@ func givenClusterRestart(t *testing.T, composeFiles ...string) *ClusterTestConte
 	return ctx
 }
 
-func listClusterReady(response string) (bool, string, error) {
+func listClusterReady(resp string) (bool, string, error) {
 	const prefix = "OK brokers="
-	response = strings.TrimSpace(response)
-	if !strings.HasPrefix(response, prefix) {
-		return false, response, fmt.Errorf("unexpected LIST_CLUSTER response %q", response)
+	trimmed := strings.TrimSpace(resp)
+	if !strings.HasPrefix(trimmed, prefix) {
+		return false, trimmed, fmt.Errorf("unexpected LIST_CLUSTER response %q", trimmed)
 	}
-	var brokers []struct {
-		Status string `json:"status"`
+
+	var brokers []fsm.BrokerInfo
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(trimmed, prefix)), &brokers); err != nil {
+		return false, trimmed, fmt.Errorf("decode LIST_CLUSTER: %w", err)
 	}
-	if err := json.Unmarshal([]byte(strings.TrimPrefix(response, prefix)), &brokers); err != nil {
-		return false, response, fmt.Errorf("decode LIST_CLUSTER brokers: %w", err)
-	}
+	active := 0
 	for _, broker := range brokers {
-		if broker.Status == "active" {
-			return true, fmt.Sprintf("%d broker(s), active member present", len(brokers)), nil
+		if strings.EqualFold(broker.Status, "active") {
+			active++
 		}
 	}
-	return false, fmt.Sprintf("%d broker(s), no active member", len(brokers)), nil
+	detail := fmt.Sprintf("%d/%d active", active, len(brokers))
+	return active > 0, detail, nil
+}
+
+func composeCommandArgs(project string, composeFiles []string, command ...string) []string {
+	args := make([]string, 0, len(composeFiles)*2+len(command)+2)
+	if project != "" {
+		args = append(args, "-p", project)
+	}
+	for _, file := range composeFiles {
+		args = append(args, "-f", file)
+	}
+	return append(args, command...)
 }
 
 func (c *ClusterTestContext) WithTopic(topic string) *ClusterTestContext {
