@@ -116,6 +116,72 @@ func TestListOffsetsRequiresReadACL(t *testing.T) {
 	}
 }
 
+func TestListFiltersTopicsByReadACL(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnableSASL = true
+	cfg.SASLUsers = []config.SASLUser{
+		{Principal: "alice", Token: "alice-secret"},
+		{Principal: "bob", Token: "bob-secret"},
+	}
+
+	tm := topic.NewTopicManager(cfg, &authStorageProvider{storage: &authTestStorage{}}, nil)
+	policies := map[string]topic.Policy{
+		"open-topic": topic.DefaultPolicy(),
+		"alice-topic": {
+			AuthPolicy: topic.AuthPolicyACL,
+			ReadACL:    []string{"alice"},
+		},
+		"bob-topic": {
+			AuthPolicy: topic.AuthPolicyACL,
+			ReadACL:    []string{"bob"},
+		},
+		"denied-topic": {
+			AuthPolicy: topic.AuthPolicyDenyRead,
+		},
+	}
+	for name, policy := range policies {
+		if err := tm.CreateTopicWithPolicy(name, 1, false, false, policy); err != nil {
+			t.Fatalf("CreateTopicWithPolicy(%q) failed: %v", name, err)
+		}
+	}
+
+	ch := NewCommandHandler(tm, cfg, nil, nil, nil)
+	alice := NewClientContext("", 0)
+	if response := ch.HandleCommand("AUTH principal=alice token=alice-secret", alice); !strings.HasPrefix(response, "OK") {
+		t.Fatalf("AUTH failed: %q", response)
+	}
+
+	response := ch.HandleCommand("LIST", alice)
+	visible := listedTopics(t, response)
+	if len(visible) != 2 || !visible["open-topic"] || !visible["alice-topic"] {
+		t.Fatalf("alice LIST visibility = %v, want open-topic and alice-topic", visible)
+	}
+	if visible["bob-topic"] || visible["denied-topic"] {
+		t.Fatalf("alice LIST exposed unauthorized topics: %v", visible)
+	}
+
+	internal := listedTopics(t, ch.HandleCommand("LIST", NewInternalClientContext("", 0)))
+	if len(internal) != len(policies) {
+		t.Fatalf("internal LIST visibility = %v, want all topics", internal)
+	}
+}
+
+func listedTopics(t *testing.T, response string) map[string]bool {
+	t.Helper()
+	if !strings.HasPrefix(response, "OK ") {
+		t.Fatalf("LIST failed: %q", response)
+	}
+	visible := make(map[string]bool)
+	for _, field := range strings.Fields(response) {
+		if topics, ok := strings.CutPrefix(field, "topics="); ok && topics != "" {
+			for _, name := range strings.Split(topics, ",") {
+				visible[name] = true
+			}
+		}
+	}
+	return visible
+}
+
 func TestPublicPublishCannotUseInternalTxnFlag(t *testing.T) {
 	cfg := config.DefaultConfig()
 	storage := &authTestStorage{}

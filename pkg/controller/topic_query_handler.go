@@ -10,7 +10,11 @@ import (
 )
 
 // handleList processes LIST command
-func (ch *CommandHandler) handleList() string {
+func (ch *CommandHandler) handleList(ctx ...*ClientContext) string {
+	var clientCtx *ClientContext
+	if len(ctx) > 0 {
+		clientCtx = ctx[0]
+	}
 	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isLeaderAndForward("LIST"); forwarded {
 			return resp
@@ -19,6 +23,21 @@ func (ch *CommandHandler) handleList() string {
 
 	tm := ch.TopicManager
 	names := tm.ListTopics()
+	visible := names[:0]
+	for _, name := range names {
+		t := tm.GetTopic(name)
+		if t == nil {
+			continue
+		}
+		if clientCtx != nil && clientCtx.Internal {
+			visible = append(visible, name)
+			continue
+		}
+		if t.Policy.CanReadPrincipal(principalFromContext(clientCtx)) {
+			visible = append(visible, name)
+		}
+	}
+	names = visible
 	return fmt.Sprintf("OK count=%d topics=%s", len(names), strings.Join(names, ","))
 }
 

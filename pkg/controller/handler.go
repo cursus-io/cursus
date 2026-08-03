@@ -118,7 +118,7 @@ func NewCommandHandler(
 		{prefix: "LIST_CLUSTER", exact: true, helpOrder: 34, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListCluster() }},
 		{prefix: "CLUSTER_STATUS", exact: true, helpOrder: 35, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleClusterStatus() }},
 		{prefix: "ELECT_LEADER ", exact: false, helpOrder: 36, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleElectLeader(cmd) }},
-		{prefix: "LIST", exact: true, helpOrder: 3, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList() }},
+		{prefix: "LIST", exact: true, helpOrder: 3, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList(ctx) }},
 		{prefix: "LIST_GROUPS", exact: true, helpOrder: 23, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListGroups() }},
 		{prefix: "CREATE ", exact: false, helpOrder: 1, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd) }},
 		{prefix: "DELETE ", exact: false, helpOrder: 2, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd) }},
