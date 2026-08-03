@@ -163,11 +163,12 @@ func splitPartitionMetadataKey(key string) (string, int) {
 	return key[:idx], partition
 }
 
-func (ch *CommandHandler) handleElectLeader(cmd string) string {
+func (ch *CommandHandler) handleElectLeader(cmd string, ctx ...*ClientContext) string {
+	requestCtx := firstClientContext(ctx).RequestContext()
 	if !ch.isDistributed() {
 		return "ERROR: distribution_required command=ELECT_LEADER"
 	}
-	if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
+	if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, cmd); forwarded {
 		return resp
 	}
 
@@ -195,7 +196,7 @@ func (ch *CommandHandler) handleElectLeader(cmd string) string {
 		return fmt.Sprintf("ERROR: partition_not_found topic=%s partition=%d", topicName, partition)
 	}
 
-	result, err := ch.applyAndWait("LEADER_ELECTION", map[string]interface{}{
+	result, err := ch.applyAndWaitContext(requestCtx, "LEADER_ELECTION", map[string]interface{}{
 		"topic":                 topicName,
 		"partition":             partition,
 		"broker":                brokerID,
