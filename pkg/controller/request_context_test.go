@@ -20,6 +20,7 @@ func TestClientContextRequestContext(t *testing.T) {
 		t.Fatalf("request context error = %v, want context.Canceled", clientCtx.RequestContext().Err())
 	}
 
+	//nolint:staticcheck // Intentionally verify the defensive nil-context fallback.
 	clientCtx.SetRequestContext(nil)
 	if err := clientCtx.RequestContext().Err(); err != nil {
 		t.Fatalf("nil context should restore background context, got %v", err)
