@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,6 +66,54 @@ func TestProducerConcurrentCloseWaitsForShutdown(t *testing.T) {
 	}
 	if err := <-secondDone; err != nil {
 		t.Fatalf("second Close failed: %v", err)
+	}
+}
+
+func TestProducerClientClosePreventsReconnect(t *testing.T) {
+	cfg := NewDefaultPublisherConfig()
+	client := mustNewProducerClient(cfg)
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	err := client.ReconnectPartition(0, "127.0.0.1:1")
+	if err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("ReconnectPartition after Close error = %v, want closed error", err)
+	}
+	if conn := client.GetConn(0); conn != nil {
+		t.Fatal("ReconnectPartition installed a connection after Close")
+	}
+}
+
+func TestProducerRetryBackoffStopsOnClose(t *testing.T) {
+	producer := &Producer{done: make(chan struct{})}
+	result := make(chan bool, 1)
+	go func() {
+		result <- producer.waitForRetry(30_000)
+	}()
+	close(producer.done)
+
+	select {
+	case completed := <-result:
+		if completed {
+			t.Fatal("waitForRetry completed its timer after producer closed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitForRetry did not stop when producer closed")
+	}
+}
+
+func TestProducerSendRetryRejectsClosedClient(t *testing.T) {
+	cfg := NewDefaultPublisherConfig()
+	client := mustNewProducerClient(cfg)
+	if err := client.Close(); err != nil {
+		t.Fatalf("client Close failed: %v", err)
+	}
+	producer := &Producer{config: cfg, client: client, done: make(chan struct{})}
+	close(producer.done)
+
+	if _, err := producer.sendWithRetry([]byte("payload"), 0); err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("sendWithRetry error = %v, want closed error", err)
 	}
 }
 
