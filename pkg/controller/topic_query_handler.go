@@ -11,15 +11,57 @@ import (
 
 // handleList processes LIST command
 func (ch *CommandHandler) handleList(ctx ...*ClientContext) string {
-	requestCtx := firstClientContext(ctx).RequestContext()
+	clientCtx := firstClientContext(ctx)
+	requestCtx := clientCtx.RequestContext()
 	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, "LIST"); forwarded {
-			return resp
+			if clientCtx != nil && clientCtx.Internal {
+				return resp
+			}
+			return ch.filterListResponse(resp, clientCtx)
 		}
 	}
 
 	tm := ch.TopicManager
 	names := tm.ListTopics()
+	names = ch.filterVisibleTopics(names, clientCtx)
+	return formatTopicList(names)
+}
+
+func (ch *CommandHandler) filterListResponse(response string, clientCtx *ClientContext) string {
+	if !strings.HasPrefix(response, "OK ") {
+		return response
+	}
+	for _, field := range strings.Fields(response) {
+		if topics, ok := strings.CutPrefix(field, "topics="); ok {
+			if topics == "" {
+				return formatTopicList(nil)
+			}
+			return formatTopicList(ch.filterVisibleTopics(strings.Split(topics, ","), clientCtx))
+		}
+	}
+	return formatTopicList(nil)
+}
+
+func (ch *CommandHandler) filterVisibleTopics(names []string, clientCtx *ClientContext) []string {
+	visible := names[:0]
+	for _, name := range names {
+		t := ch.TopicManager.GetTopic(name)
+		if t == nil {
+			continue
+		}
+		if clientCtx != nil && clientCtx.Internal {
+			visible = append(visible, name)
+			continue
+		}
+		if t.Policy.CanReadPrincipal(principalFromContext(clientCtx)) {
+			visible = append(visible, name)
+		}
+	}
+	return visible
+}
+
+func formatTopicList(names []string) string {
 	return fmt.Sprintf("OK count=%d topics=%s", len(names), strings.Join(names, ","))
 }
 
