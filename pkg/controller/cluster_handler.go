@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -60,8 +61,26 @@ func (ch *CommandHandler) isAuthorizedForPartition(topic string, partition int) 
 	return ch.Cluster.IsAuthorized(topic, partition)
 }
 
+func waitForContext(ctx context.Context, delay time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // isLeaderAndForward checks if the current node is the cluster leader
 func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
+	return ch.isLeaderAndForwardContext(context.Background(), cmd)
+}
+
+func (ch *CommandHandler) isLeaderAndForwardContext(ctx context.Context, cmd string) (string, bool, error) {
 	if !ch.isDistributed() {
 		return "", false, nil
 	}
@@ -76,7 +95,9 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 			return "ERROR: no_raft_leader", true, fmt.Errorf("no leader elected")
 		}
 		util.Debug("Waiting for Raft leader to be elected... (attempt %d/%d)", i+1, maxRetries)
-		time.Sleep(backoffDelay(i, 100*time.Millisecond))
+		if err := waitForContext(ctx, backoffDelay(i, 100*time.Millisecond)); err != nil {
+			return "ERROR: request_cancelled", true, err
+		}
 	}
 
 	if !ch.Cluster.RaftManager.IsLeader() {
@@ -94,7 +115,9 @@ func (ch *CommandHandler) isLeaderAndForward(cmd string) (string, bool, error) {
 			lastErr = err
 			util.Debug("Retrying forward to leader (Target Leader %s)... attempt %d: %v", ch.Cluster.RaftManager.GetLeaderAddress(), i+1, err)
 			if i < maxRetries-1 {
-				time.Sleep(backoffDelay(i, 100*time.Millisecond))
+				if err := waitForContext(ctx, backoffDelay(i, 100*time.Millisecond)); err != nil {
+					return "ERROR: request_cancelled", true, err
+				}
 			}
 		}
 		leaderAddr := ch.Cluster.RaftManager.GetLeaderAddress()
@@ -225,6 +248,10 @@ func notCoordinatorResponse(addr AdvertisedAddr) string {
 }
 
 func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition int, cmd string) (string, bool, error) {
+	return ch.isPartitionLeaderAndForwardContext(context.Background(), topic, partition, cmd)
+}
+
+func (ch *CommandHandler) isPartitionLeaderAndForwardContext(ctx context.Context, topic string, partition int, cmd string) (string, bool, error) {
 	if !ch.hasRouter() {
 		return "", false, nil
 	}
@@ -251,7 +278,11 @@ func (ch *CommandHandler) isPartitionLeaderAndForward(topic string, partition in
 		} else {
 			lastErr = err
 		}
-		time.Sleep(backoffDelay(i, 100*time.Millisecond))
+		if i < maxRetries-1 {
+			if err := waitForContext(ctx, backoffDelay(i, 100*time.Millisecond)); err != nil {
+				return "ERROR: request_cancelled", true, err
+			}
+		}
 	}
 
 	return fmt.Sprintf("ERROR: forward_to_partition_leader_failed topic=%s partition=%d reason=%q", topic, partition, lastErr.Error()), true, nil
@@ -337,7 +368,14 @@ func (ch *CommandHandler) handleRaftApply(cmd string) string {
 
 // applyViaLeader tries local Raft apply first; if not leader, forwards to leader via RAFT_APPLY.
 func (ch *CommandHandler) applyViaLeader(cmdType string, payload map[string]interface{}) (interface{}, error) {
-	result, err := ch.applyAndWait(cmdType, payload)
+	return ch.applyViaLeaderContext(context.Background(), cmdType, payload)
+}
+
+func (ch *CommandHandler) applyViaLeaderContext(ctx context.Context, cmdType string, payload map[string]interface{}) (interface{}, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := ch.applyAndWaitContext(ctx, cmdType, payload)
 	if err == nil {
 		return result, nil
 	}
@@ -353,6 +391,11 @@ func (ch *CommandHandler) applyViaLeader(cmdType string, payload map[string]inte
 
 	forwardCmd := fmt.Sprintf("RAFT_APPLY %stype=%s payload=%s", ch.internalAuthPrefix(), cmdType, string(data))
 	encodedCmd := util.EncodeMessage("", forwardCmd)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
 	resp, fwdErr := ch.Cluster.Router.ForwardToLeader(string(encodedCmd))
 	if fwdErr != nil {
 		return nil, fmt.Errorf("forward raft apply to leader: %w", fwdErr)
@@ -364,6 +407,18 @@ func (ch *CommandHandler) applyViaLeader(cmdType string, payload map[string]inte
 }
 
 func (ch *CommandHandler) applyAndWait(cmdType string, payload map[string]interface{}) (interface{}, error) {
+	return ch.applyAndWaitContext(context.Background(), cmdType, payload)
+}
+
+func (ch *CommandHandler) applyAndWaitContext(ctx context.Context, cmdType string, payload map[string]interface{}) (interface{}, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
 	if ch.Cluster == nil {
 		return nil, fmt.Errorf("cluster controller is not initialized")
 	}
@@ -391,13 +446,18 @@ func (ch *CommandHandler) applyAndWait(cmdType string, payload map[string]interf
 		return nil, fmt.Errorf("raft apply failed: %w", err)
 	}
 
+	timer := time.NewTimer(DefaultFSMApplyTimeout)
+	defer timer.Stop()
+
 	select {
 	case res := <-respChan:
 		if err, ok := res.(error); ok && err != nil {
 			return nil, err
 		}
 		return res, nil
-	case <-time.After(DefaultFSMApplyTimeout):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
 		return nil, fmt.Errorf("timeout waiting for FSM")
 	}
 }

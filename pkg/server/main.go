@@ -368,6 +368,7 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 
 	clientCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	cmdCtx.SetRequestContext(clientCtx)
 
 	for {
 		select {
@@ -430,6 +431,7 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 
 	cmdHandler, cmdCtx := initializeConnection(cfg, tm, cd, sm, cc)
 	defer func() { _ = cmdHandler.Close() }()
+	cmdCtx.SetRequestContext(clientCtx)
 
 	for {
 		select {

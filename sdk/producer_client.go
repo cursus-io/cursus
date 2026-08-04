@@ -28,6 +28,7 @@ type ProducerClient struct {
 	tlsConfig *tls.Config
 
 	leader atomic.Pointer[leaderInfo]
+	closed atomic.Bool
 }
 
 func NewProducerClient(config *PublisherConfig) (*ProducerClient, error) {
@@ -66,6 +67,9 @@ func (pc *ProducerClient) NextSeqNum(partition int) uint64 {
 }
 
 func (pc *ProducerClient) connectPartitionLocked(idx int, addr string) error {
+	if pc.closed.Load() {
+		return fmt.Errorf("producer client is closed")
+	}
 	if idx < 0 {
 		return fmt.Errorf("invalid partition index: %d", idx)
 	}
@@ -141,6 +145,7 @@ func (pc *ProducerClient) GetConn(part int) net.Conn {
 func (pc *ProducerClient) Close() error {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
+	pc.closed.Store(true)
 
 	ptr := pc.conns.Swap(nil)
 	if ptr == nil {

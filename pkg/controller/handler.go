@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -117,11 +118,11 @@ func NewCommandHandler(
 		{prefix: "NEGOTIATE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleNegotiate(cmd, ctx) }},
 		{prefix: "LIST_CLUSTER", exact: true, helpOrder: 34, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListCluster() }},
 		{prefix: "CLUSTER_STATUS", exact: true, helpOrder: 35, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleClusterStatus() }},
-		{prefix: "ELECT_LEADER ", exact: false, helpOrder: 36, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleElectLeader(cmd) }},
+		{prefix: "ELECT_LEADER ", exact: false, helpOrder: 36, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleElectLeader(cmd, ctx) }},
 		{prefix: "LIST", exact: true, helpOrder: 3, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList(ctx) }},
 		{prefix: "LIST_GROUPS", exact: true, helpOrder: 23, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListGroups() }},
-		{prefix: "CREATE ", exact: false, helpOrder: 1, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd) }},
-		{prefix: "DELETE ", exact: false, helpOrder: 2, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd) }},
+		{prefix: "CREATE ", exact: false, helpOrder: 1, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd, ctx) }},
+		{prefix: "DELETE ", exact: false, helpOrder: 2, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd, ctx) }},
 		{prefix: "PUBLISH ", exact: false, helpOrder: 4, permissions: []string{PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd, ctx) }},
 		{prefix: "CONSUME ", exact: false, helpOrder: 5, permissions: []string{PermissionTopicRead, PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.validateConsumeSyntax(cmd, cmd) }},
 		{prefix: "STREAM ", exact: false, helpOrder: 6, permissions: []string{PermissionTopicRead, PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.validateStreamSyntax(cmd, cmd) }},
@@ -133,7 +134,7 @@ func NewCommandHandler(
 		{prefix: "LIST_OFFSETS", exact: true, helpOrder: 14, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListOffsets(cmd, ctx) }},
 		{prefix: "LIST_OFFSETS ", exact: false, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListOffsets(cmd, ctx) }},
 		{prefix: "GROUP_STATUS ", exact: false, helpOrder: 22, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleGroupStatus(cmd) }},
-		{prefix: "DESCRIBE ", exact: false, helpOrder: 24, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDescribeTopic(cmd) }},
+		{prefix: "DESCRIBE ", exact: false, helpOrder: 24, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDescribeTopic(cmd, ctx) }},
 		{prefix: "HEARTBEAT ", exact: false, helpOrder: 10, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHeartbeat(cmd) }},
 		{prefix: "COMMIT_OFFSET ", exact: false, helpOrder: 11, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCommitOffset(cmd) }},
 		{prefix: "BATCH_COMMIT ", exact: false, helpOrder: 12, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd) }},
@@ -203,6 +204,21 @@ func redactOneCommandSecret(s, key string) string {
 	}
 	b.WriteString(s)
 	return b.String()
+}
+
+// HandleCommandContext applies a request-scoped cancellation and deadline while
+// preserving the connection-level context for subsequent commands.
+func (ch *CommandHandler) HandleCommandContext(requestCtx context.Context, rawCmd string, clientCtx *ClientContext) string {
+	if requestCtx == nil {
+		requestCtx = context.Background()
+	}
+	if clientCtx == nil {
+		return ch.HandleCommand(rawCmd, nil)
+	}
+	previous := clientCtx.RequestContext()
+	clientCtx.SetRequestContext(requestCtx)
+	defer clientCtx.SetRequestContext(previous)
+	return ch.HandleCommand(rawCmd, clientCtx)
 }
 
 // HandleCommand processes non-streaming commands and returns a signal for streaming commands.

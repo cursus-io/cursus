@@ -11,12 +11,10 @@ import (
 
 // handleList processes LIST command
 func (ch *CommandHandler) handleList(ctx ...*ClientContext) string {
-	var clientCtx *ClientContext
-	if len(ctx) > 0 {
-		clientCtx = ctx[0]
-	}
+	clientCtx := firstClientContext(ctx)
+	requestCtx := clientCtx.RequestContext()
 	if ch.isDistributed() {
-		if resp, forwarded, _ := ch.isLeaderAndForward("LIST"); forwarded {
+		if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, "LIST"); forwarded {
 			if clientCtx != nil && clientCtx.Internal {
 				return resp
 			}
@@ -68,7 +66,8 @@ func formatTopicList(names []string) string {
 }
 
 // handleDescribeTopic processes DESCRIBE topic=<name> command
-func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
+func (ch *CommandHandler) handleDescribeTopic(cmd string, ctx ...*ClientContext) string {
+	requestCtx := firstClientContext(ctx).RequestContext()
 	args := decodeCommandInput(cmd).Args
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
@@ -76,7 +75,7 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
+		if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, cmd); forwarded {
 			return resp
 		}
 	}
