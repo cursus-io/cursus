@@ -183,19 +183,29 @@ func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error)
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		select {
+		case <-p.done:
+			return nil, fmt.Errorf("producer is closed")
+		default:
+		}
+
 		conn := p.client.GetConn(part)
 		if conn == nil {
 			brokerAddr := p.getPartitionLeaderAddr(part)
 			if err := p.client.ReconnectPartition(part, brokerAddr); err != nil {
 				lastErr = fmt.Errorf("reconnect failed: %w", err)
-				time.Sleep(time.Duration(backoff) * time.Millisecond)
+				if !p.waitForRetry(backoff) {
+					return nil, fmt.Errorf("producer is closed")
+				}
 				backoff = min(backoff*2, p.config.MaxBackoffMS)
 				continue
 			}
 			conn = p.client.GetConn(part)
 			if conn == nil {
 				lastErr = fmt.Errorf("no connection after reconnect")
-				time.Sleep(time.Duration(backoff) * time.Millisecond)
+				if !p.waitForRetry(backoff) {
+					return nil, fmt.Errorf("producer is closed")
+				}
 				backoff = min(backoff*2, p.config.MaxBackoffMS)
 				continue
 			}
@@ -203,7 +213,9 @@ func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error)
 
 		if err := conn.SetWriteDeadline(time.Now().Add(time.Duration(p.config.WriteTimeoutMS) * time.Millisecond)); err != nil {
 			lastErr = fmt.Errorf("set write deadline failed: %w", err)
-			time.Sleep(time.Duration(backoff) * time.Millisecond)
+			if !p.waitForRetry(backoff) {
+				return nil, fmt.Errorf("producer is closed")
+			}
 			backoff = min(backoff*2, p.config.MaxBackoffMS)
 			continue
 		}
@@ -212,7 +224,9 @@ func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error)
 			lastErr = fmt.Errorf("write failed: %w", err)
 			brokerAddr := p.getPartitionLeaderAddr(part)
 			_ = p.client.ReconnectPartition(part, brokerAddr)
-			time.Sleep(time.Duration(backoff) * time.Millisecond)
+			if !p.waitForRetry(backoff) {
+				return nil, fmt.Errorf("producer is closed")
+			}
 			backoff = min(backoff*2, p.config.MaxBackoffMS)
 			continue
 		}
@@ -227,7 +241,9 @@ func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error)
 
 		if err != nil {
 			lastErr = fmt.Errorf("read ack failed: %w", err)
-			time.Sleep(time.Duration(backoff) * time.Millisecond)
+			if !p.waitForRetry(backoff) {
+				return nil, fmt.Errorf("producer is closed")
+			}
 			backoff = min(backoff*2, p.config.MaxBackoffMS)
 			continue
 		}
@@ -235,7 +251,9 @@ func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error)
 		ackResp, err := p.parseAckResponse(resp)
 		if err != nil {
 			lastErr = err
-			time.Sleep(time.Duration(backoff) * time.Millisecond)
+			if !p.waitForRetry(backoff) {
+				return nil, fmt.Errorf("producer is closed")
+			}
 			backoff = min(backoff*2, p.config.MaxBackoffMS)
 			continue
 		}
@@ -243,6 +261,18 @@ func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error)
 		return ackResp, nil
 	}
 	return nil, lastErr
+}
+
+func (p *Producer) waitForRetry(backoffMS int) bool {
+	timer := time.NewTimer(time.Duration(backoffMS) * time.Millisecond)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-p.done:
+		return false
+	}
 }
 
 func (p *Producer) markBatchAckedByID(part int, batchID string, batchLen int) {

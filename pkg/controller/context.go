@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"sort"
 
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
@@ -18,6 +19,7 @@ type ClientContext struct {
 	Internal        bool
 	ProtocolVersion int
 	Features        map[wireprotocol.Feature]struct{}
+	requestContext  context.Context
 }
 
 func NewClientContext(group string, idx int) *ClientContext {
@@ -30,6 +32,7 @@ func NewClientContext(group string, idx int) *ClientContext {
 		OffsetCache:     make(map[string]uint64),
 		ProtocolVersion: wireprotocol.CurrentVersion,
 		Features:        make(map[wireprotocol.Feature]struct{}),
+		requestContext:  context.Background(),
 	}
 }
 
@@ -37,6 +40,30 @@ func NewInternalClientContext(group string, idx int) *ClientContext {
 	ctx := NewClientContext(group, idx)
 	ctx.Internal = true
 	return ctx
+}
+
+func firstClientContext(contexts []*ClientContext) *ClientContext {
+	if len(contexts) == 0 {
+		return nil
+	}
+	return contexts[0]
+}
+
+func (ctx *ClientContext) SetRequestContext(requestContext context.Context) {
+	if ctx == nil {
+		return
+	}
+	if requestContext == nil {
+		requestContext = context.Background()
+	}
+	ctx.requestContext = requestContext
+}
+
+func (ctx *ClientContext) RequestContext() context.Context {
+	if ctx == nil || ctx.requestContext == nil {
+		return context.Background()
+	}
+	return ctx.requestContext
 }
 
 func (ctx *ClientContext) SetConsumerGroup(groupName string) {

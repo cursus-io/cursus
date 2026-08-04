@@ -2,11 +2,14 @@ package controller
 
 import (
 	"context"
+	"encoding/binary"
+	"io"
 	"net"
 	"strings"
 	"testing"
 	"time"
 
+	clustercontroller "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
@@ -114,6 +117,152 @@ func TestListOffsetsRequiresReadACL(t *testing.T) {
 	if !strings.HasPrefix(auth, "OK") {
 		t.Fatalf("expected authenticated LIST_OFFSETS success, got %q", auth)
 	}
+}
+
+func TestListFiltersTopicsByReadACL(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnableSASL = true
+	cfg.SASLUsers = []config.SASLUser{
+		{Principal: "alice", Token: "alice-secret"},
+		{Principal: "bob", Token: "bob-secret"},
+	}
+
+	tm := topic.NewTopicManager(cfg, &authStorageProvider{storage: &authTestStorage{}}, nil)
+	policies := map[string]topic.Policy{
+		"open-topic": topic.DefaultPolicy(),
+		"alice-topic": {
+			AuthPolicy: topic.AuthPolicyACL,
+			ReadACL:    []string{"alice"},
+		},
+		"bob-topic": {
+			AuthPolicy: topic.AuthPolicyACL,
+			ReadACL:    []string{"bob"},
+		},
+		"denied-topic": {
+			AuthPolicy: topic.AuthPolicyDenyRead,
+		},
+	}
+	for name, policy := range policies {
+		if err := tm.CreateTopicWithPolicy(name, 1, false, false, policy); err != nil {
+			t.Fatalf("CreateTopicWithPolicy(%q) failed: %v", name, err)
+		}
+	}
+
+	ch := NewCommandHandler(tm, cfg, nil, nil, nil)
+	alice := NewClientContext("", 0)
+	if response := ch.HandleCommand("AUTH principal=alice token=alice-secret", alice); !strings.HasPrefix(response, "OK") {
+		t.Fatalf("AUTH failed: %q", response)
+	}
+
+	response := ch.HandleCommand("LIST", alice)
+	visible := listedTopics(t, response)
+	if len(visible) != 2 || !visible["open-topic"] || !visible["alice-topic"] {
+		t.Fatalf("alice LIST visibility = %v, want open-topic and alice-topic", visible)
+	}
+	if visible["bob-topic"] || visible["denied-topic"] {
+		t.Fatalf("alice LIST exposed unauthorized topics: %v", visible)
+	}
+
+	internal := listedTopics(t, ch.HandleCommand("LIST", NewInternalClientContext("", 0)))
+	if len(internal) != len(policies) {
+		t.Fatalf("internal LIST visibility = %v, want all topics", internal)
+	}
+}
+
+func TestListFiltersForwardedTopicsByReadACL(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnableSASL = true
+	cfg.EnabledDistribution = true
+	cfg.SASLUsers = []config.SASLUser{{Principal: "alice", Token: "alice-secret"}}
+
+	tm := topic.NewTopicManager(cfg, &authStorageProvider{storage: &authTestStorage{}}, nil)
+	policies := map[string]topic.Policy{
+		"open-topic": topic.DefaultPolicy(),
+		"alice-topic": {
+			AuthPolicy: topic.AuthPolicyACL,
+			ReadACL:    []string{"alice"},
+		},
+		"bob-topic": {
+			AuthPolicy: topic.AuthPolicyACL,
+			ReadACL:    []string{"bob"},
+		},
+		"denied-topic": {
+			AuthPolicy: topic.AuthPolicyDenyRead,
+		},
+	}
+	for name, policy := range policies {
+		if err := tm.CreateTopicWithPolicy(name, 1, false, false, policy); err != nil {
+			t.Fatalf("CreateTopicWithPolicy(%q) failed: %v", name, err)
+		}
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	cfg.BrokerPort = listener.Addr().(*net.TCPAddr).Port
+
+	rm := &MockRaftManagerForForward{isLeader: false}
+	rm.leaderAddress.Store("127.0.0.1:7001")
+	router := clustercontroller.NewClusterRouter("follower", "127.0.0.1:7002", nil, rm, cfg.BrokerPort, "", cfg)
+	cluster := &clustercontroller.ClusterController{RaftManager: rm, Router: router}
+	ch := NewCommandHandler(tm, cfg, nil, nil, cluster)
+	alice := NewClientContext("", 0)
+	if response := ch.HandleCommand("AUTH principal=alice token=alice-secret", alice); !strings.HasPrefix(response, "OK") {
+		t.Fatalf("AUTH failed: %q", response)
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		length := make([]byte, 4)
+		if _, readErr := io.ReadFull(conn, length); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		request := make([]byte, binary.BigEndian.Uint32(length))
+		if _, readErr := io.ReadFull(conn, request); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		response := []byte("OK count=4 topics=alice-topic,bob-topic,denied-topic,open-topic")
+		binary.BigEndian.PutUint32(length, uint32(len(response)))
+		if _, writeErr := conn.Write(append(length, response...)); writeErr != nil {
+			serverErr <- writeErr
+			return
+		}
+		serverErr <- nil
+	}()
+
+	visible := listedTopics(t, ch.HandleCommand("LIST", alice))
+	if err := <-serverErr; err != nil {
+		t.Fatalf("forwarded LIST server: %v", err)
+	}
+	if len(visible) != 2 || !visible["open-topic"] || !visible["alice-topic"] {
+		t.Fatalf("forwarded LIST visibility = %v, want open-topic and alice-topic", visible)
+	}
+}
+
+func listedTopics(t *testing.T, response string) map[string]bool {
+	t.Helper()
+	if !strings.HasPrefix(response, "OK ") {
+		t.Fatalf("LIST failed: %q", response)
+	}
+	visible := make(map[string]bool)
+	for _, field := range strings.Fields(response) {
+		if topics, ok := strings.CutPrefix(field, "topics="); ok && topics != "" {
+			for _, name := range strings.Split(topics, ",") {
+				visible[name] = true
+			}
+		}
+	}
+	return visible
 }
 
 func TestPublicPublishCannotUseInternalTxnFlag(t *testing.T) {
