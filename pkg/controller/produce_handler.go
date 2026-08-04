@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -39,6 +40,7 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 	if len(ctx) > 0 {
 		clientCtx = ctx[0]
 	}
+	requestCtx := clientCtx.RequestContext()
 	args := parseKeyValueArgs(cmd[8:])
 	if authResp := ch.authenticateInline(args, clientCtx); authResp != "" {
 		return authResp
@@ -109,7 +111,10 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 	}
 
 	var ackResp types.AckResponse
-	t := ch.waitForTopic(topicName)
+	t, waitErr := ch.waitForTopicContext(requestCtx, topicName)
+	if waitErr != nil {
+		return "ERROR: request_cancelled"
+	}
 	if t == nil {
 		util.Warn("ch publish: topic '%s' does not exist after retries", topicName)
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
@@ -198,7 +203,7 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 			}
 			forwardCmd += " message=" + message
 		}
-		if resp, forwarded, _ := ch.isPartitionLeaderAndForward(topicName, partition, forwardCmd); forwarded {
+		if resp, forwarded, _ := ch.isPartitionLeaderAndForwardContext(requestCtx, topicName, partition, forwardCmd); forwarded {
 			return resp
 		}
 
@@ -319,9 +324,14 @@ Respond:
 }
 
 func (ch *CommandHandler) waitForTopic(topicName string) *topic.Topic {
+	t, _ := ch.waitForTopicContext(context.Background(), topicName)
+	return t
+}
+
+func (ch *CommandHandler) waitForTopicContext(ctx context.Context, topicName string) (*topic.Topic, error) {
 	t := ch.TopicManager.GetTopic(topicName)
 	if t != nil {
-		return t
+		return t, nil
 	}
 
 	const maxRetries = 5
@@ -330,11 +340,13 @@ func (ch *CommandHandler) waitForTopic(topicName string) *topic.Topic {
 	for i := 0; i < maxRetries; i++ {
 		t = ch.TopicManager.GetTopic(topicName)
 		if t != nil {
-			return t
+			return t, nil
 		}
-		time.Sleep(retryDelay)
+		if err := waitForContext(ctx, retryDelay); err != nil {
+			return nil, err
+		}
 	}
-	return nil
+	return nil, nil
 }
 
 func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
@@ -403,6 +415,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 	if len(ctx) > 0 {
 		clientCtx = ctx[0]
 	}
+	requestCtx := clientCtx.RequestContext()
 	batch, err := util.DecodeBatchMessages(data)
 	if err != nil {
 		util.Error("Batch message decoding failed: %v", err)
@@ -438,7 +451,9 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 				util.Debug("Failed to forward batch to Partition leader: %v", forwardErr)
 
 				if i < maxRetries-1 {
-					time.Sleep(retryDelay)
+					if err := waitForContext(requestCtx, retryDelay); err != nil {
+						return "ERROR: request_cancelled", nil
+					}
 				}
 				lastErr = forwardErr
 			}
@@ -448,7 +463,10 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 
 		util.Debug("Processing BATCH locally as Partition leader for %s:%d", batch.Topic, batch.Partition)
 
-		t := ch.waitForTopic(batch.Topic)
+		t, waitErr := ch.waitForTopicContext(requestCtx, batch.Topic)
+		if waitErr != nil {
+			return "ERROR: request_cancelled", nil
+		}
 		if t == nil {
 			util.Error("Batch process failed: topic '%s' not found", batch.Topic)
 			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
@@ -541,7 +559,10 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 
 	// stand-alone
 	{
-		t := ch.waitForTopic(batch.Topic)
+		t, waitErr := ch.waitForTopicContext(requestCtx, batch.Topic)
+		if waitErr != nil {
+			return "ERROR: request_cancelled", nil
+		}
 		if t == nil {
 			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
 		}
