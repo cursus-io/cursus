@@ -26,7 +26,8 @@ var (
 )
 
 // handleCreate processes CREATE command
-func (ch *CommandHandler) handleCreate(cmd string) string {
+func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string {
+	requestCtx := firstClientContext(ctx).RequestContext()
 	args := parseKeyValueArgs(cmd[7:])
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
@@ -84,7 +85,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 
 	tm := ch.TopicManager
 	if ch.isDistributed() {
-		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
+		if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, cmd); forwarded {
 			return resp
 		}
 
@@ -96,7 +97,7 @@ func (ch *CommandHandler) handleCreate(cmd string) string {
 			"replication_factor": replicationFactor,
 			"policy":             policy,
 		}
-		_, err := ch.applyAndWait("TOPIC", payload)
+		_, err := ch.applyAndWaitContext(requestCtx, "TOPIC", payload)
 		if err != nil {
 			return fmt.Sprintf("ERROR: create_topic_failed reason=%q", err.Error())
 		}
@@ -173,7 +174,8 @@ func parseACLArg(value string) []string {
 }
 
 // handleDelete processes DELETE command
-func (ch *CommandHandler) handleDelete(cmd string) string {
+func (ch *CommandHandler) handleDelete(cmd string, ctx ...*ClientContext) string {
+	requestCtx := firstClientContext(ctx).RequestContext()
 	args := parseKeyValueArgs(cmd[7:])
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
@@ -185,14 +187,14 @@ func (ch *CommandHandler) handleDelete(cmd string) string {
 	}
 
 	if ch.isDistributed() {
-		if resp, forwarded, _ := ch.isLeaderAndForward(cmd); forwarded {
+		if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, cmd); forwarded {
 			return resp
 		}
 
 		payload := map[string]interface{}{
 			"topic": topicName,
 		}
-		if _, err := ch.applyAndWait("TOPIC_DELETE", payload); err != nil {
+		if _, err := ch.applyAndWaitContext(requestCtx, "TOPIC_DELETE", payload); err != nil {
 			if errors.Is(err, topic.ErrTopicNotFound) {
 				return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 			}
