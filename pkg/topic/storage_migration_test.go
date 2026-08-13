@@ -177,6 +177,7 @@ func TestPreManifestConsumerMetadataMigrationRequiresExplicitSelection(t *testin
 	dm := disk.NewDiskManager(cfg)
 	t.Cleanup(dm.CloseAllHandlers)
 	tm := NewTopicManager(cfg, dm, nil)
+	t.Cleanup(tm.Stop)
 	require.NoError(t, tm.RestoreTopics())
 	cd, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, tm)
 	require.NoError(t, err)
