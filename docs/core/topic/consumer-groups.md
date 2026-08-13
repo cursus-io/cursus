@@ -162,10 +162,9 @@ Cursus stores consumer group offsets in the broker, keyed by:
 or batch. For example, after processing records with offsets `10` through `14`,
 commit `15`.
 
-Offsets are written to the internal `__consumer_offsets` topic. The coordinator
-replays that topic during broker startup, so committed offsets survive broker
-restart. In distributed mode, offset updates also flow through the Raft FSM and
-are included in FSM snapshots.
+Standalone `REGISTER_GROUP` writes a versioned durable registration before returning success, so a group with no commit survives restart with its topic and partition mapping and `FETCH_OFFSET=0`. Offset commits write complete, monotonically revised next-offset snapshots; deletion writes a higher lifecycle tombstone before removing memory state. Startup replays lifecycle records before snapshots, independent of physical internal-partition order.
+
+The internal `__consumer_offsets` topic is compacted but is never subject to application time/size delete retention. Corrupt or inconsistent replay fails readiness rather than presenting a healthy empty coordinator. Earlier single/bulk offset payloads remain readable; pre-manifest storage and `.deleted` offset evidence require the explicit [standalone storage recovery procedure](../../standalone-storage-recovery.md). In distributed mode, offset updates also flow through the Raft FSM and are included in FSM snapshots.
 
 ### Commit and Resume Contract
 A group is bound to the topic supplied at registration. `JOIN_GROUP`,

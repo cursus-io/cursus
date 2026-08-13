@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -60,6 +61,9 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 	producerID, ok := args["producerId"]
 	if !ok || producerID == "" {
 		return "ERROR: missing_producer_id command=PUBLISH"
+	}
+	if topicName == config.ConsumerOffsetsTopicName {
+		return fmt.Sprintf("ERROR: internal_topic_write_forbidden topic=%s", topicName)
 	}
 
 	acks, ok := args["acks"]
@@ -420,6 +424,9 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 	if err != nil {
 		util.Error("Batch message decoding failed: %v", err)
 		return fmt.Sprintf("ERROR: batch_decode_failed reason=%q", err.Error()), nil
+	}
+	if batch.Topic == config.ConsumerOffsetsTopicName {
+		return fmt.Sprintf("ERROR: internal_topic_write_forbidden topic=%s", batch.Topic), nil
 	}
 
 	acks := batch.Acks

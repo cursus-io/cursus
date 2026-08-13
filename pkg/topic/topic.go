@@ -98,8 +98,10 @@ func NewTopicWithPolicy(name string, partitionCount int, hp HandlerProvider, cfg
 	if err != nil {
 		return nil, err
 	}
-	if err := validateCleanupPolicyForTopic(normalizedPolicy, cfg, eventSourcing); err != nil {
-		return nil, err
+	if name != config.ConsumerOffsetsTopicName {
+		if err := validateCleanupPolicyForTopic(normalizedPolicy, cfg, eventSourcing); err != nil {
+			return nil, err
+		}
 	}
 
 	partitions := make([]*Partition, partitionCount)

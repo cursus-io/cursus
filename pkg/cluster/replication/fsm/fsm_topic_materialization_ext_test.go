@@ -73,6 +73,32 @@ func TestBrokerFSMRestoreRemovesLocalTopicMissingFromSnapshot(t *testing.T) {
 	require.NoError(t, f.TopicMaterializationReadinessError())
 }
 
+func TestBrokerFSMRestorePreservesBrokerOwnedInternalTopic(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+	dm := disk.NewDiskManager(cfg)
+	t.Cleanup(dm.CloseAllHandlers)
+	manager := topic.NewTopicManager(cfg, dm, nil)
+	t.Cleanup(manager.Stop)
+	require.NoError(t, manager.CreateTopic(config.ConsumerOffsetsTopicName, 4, false, false))
+	f := NewBrokerFSM(manager, nil)
+	f.topicMaterialization[config.ConsumerOffsetsTopicName] = TopicMaterializationIssue{
+		Topic: config.ConsumerOffsetsTopicName, Operation: TopicMaterializationDelete, Error: "legacy pending delete",
+	}
+
+	require.NoError(t, f.Restore(emptyTopicSnapshot(t)))
+	require.NotNil(t, manager.GetTopic(config.ConsumerOffsetsTopicName))
+	require.NoError(t, f.TopicMaterializationReadinessError())
+
+	f.topicMaterialization[config.ConsumerOffsetsTopicName] = TopicMaterializationIssue{
+		Topic: config.ConsumerOffsetsTopicName, Operation: TopicMaterializationDelete, Error: "stale retry",
+	}
+	require.NoError(t, f.ReconcileTopicMaterializations())
+	require.NotNil(t, manager.GetTopic(config.ConsumerOffsetsTopicName))
+	require.NoError(t, f.TopicMaterializationReadinessError())
+}
+
 func TestBrokerFSMRestorePreservesPendingDeleteUntilRetrySucceeds(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

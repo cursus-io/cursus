@@ -23,6 +23,15 @@ func (source fixedGroups) ExportState() map[string]*coordinator.GroupStateSnapsh
 	return source.snapshot
 }
 
+type fixedRecoveryGroups struct {
+	fixedGroups
+	recovery coordinator.ConsumerMetadataRecoveryStatus
+}
+
+func (source fixedRecoveryGroups) RecoverySnapshot() coordinator.ConsumerMetadataRecoveryStatus {
+	return source.recovery
+}
+
 type fixedDisk struct{ snapshot disk.RuntimeSnapshot }
 
 func (source fixedDisk) RuntimeSnapshot() disk.RuntimeSnapshot { return source.snapshot }
@@ -48,6 +57,7 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 		fixedTopics{snapshot: topic.RuntimeSnapshot{
 			TopicCount:                      1,
 			MetadataLoadFailure:             "decode failed",
+			MetadataRestoredTopicCount:      2,
 			MetadataOrphanTopicCount:        3,
 			MetadataDurabilityWarning:       "directory sync failed",
 			MetadataDurabilityWarningsTotal: 7,
@@ -91,6 +101,7 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 
 	assertGauge(t, families, "cursus_broker_ready", nil, 1)
 	assertGauge(t, families, "cursus_topic_metadata_manifest_load_failure", nil, 1)
+	assertGauge(t, families, "cursus_topic_metadata_restored_topics", nil, 2)
 	assertGauge(t, families, "cursus_topic_metadata_orphan_topics", nil, 3)
 	assertGauge(t, families, "cursus_topic_metadata_durability_warning", nil, 1)
 	assertCounter(t, families, "cursus_topic_metadata_durability_warnings_total", nil, 7)
@@ -110,6 +121,28 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 	assertGauge(t, families, "cursus_cluster_partition_leader", map[string]string{"topic": "orders", "partition": "0", "broker_id": "broker-1"}, 1)
 }
 
+func TestCollectorExportsConsumerMetadataRecoveryStatus(t *testing.T) {
+	collector := NewCollector(
+		fixedTopics{},
+		fixedRecoveryGroups{recovery: coordinator.ConsumerMetadataRecoveryStatus{
+			Phase: "committed_offset_replay", Ready: false,
+			RestoredGroups: 3, RestoredOffsets: 9, ReplayedRecords: 14, OrphanRecords: 2, CorruptRecords: 1,
+		}},
+		fixedDisk{}, nil, nil, fixedReadiness(false),
+	)
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertGauge(t, families, "cursus_consumer_metadata_recovery_ready", map[string]string{"phase": "committed_offset_replay"}, 0)
+	assertGauge(t, families, "cursus_consumer_metadata_restored_groups", nil, 3)
+	assertGauge(t, families, "cursus_consumer_metadata_restored_offsets", nil, 9)
+	assertGauge(t, families, "cursus_consumer_metadata_replayed_records", nil, 14)
+	assertGauge(t, families, "cursus_consumer_metadata_orphan_records", nil, 2)
+	assertGauge(t, families, "cursus_consumer_metadata_corrupt_records", nil, 1)
+}
 func assertCounter(t *testing.T, families []*dto.MetricFamily, name string, labels map[string]string, want float64) {
 	t.Helper()
 	for _, family := range families {

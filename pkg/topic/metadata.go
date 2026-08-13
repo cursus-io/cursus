@@ -106,6 +106,9 @@ func (s *topicMetadataStore) Load() (_ []Definition, err error) {
 	if s == nil {
 		return nil, nil
 	}
+	if err := validateTopicStorageRoot(filepath.Dir(s.path)); err != nil {
+		return nil, err
+	}
 	// #nosec G304 -- the path is supplied by the broker-owned storage provider.
 	file, err := os.Open(s.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -182,6 +185,9 @@ func (s *topicMetadataStore) Load() (_ []Definition, err error) {
 				strings.Join(orphaned, ","),
 			),
 		}
+	}
+	if err := validateDeclaredTopicStorage(filepath.Dir(s.path), definitions); err != nil {
+		return nil, err
 	}
 	return definitions, nil
 }
@@ -292,15 +298,15 @@ func (tm *TopicManager) RestoreTopics() error {
 	definitions, err := tm.metadataStore.Load()
 	if err != nil {
 		restoreErr := fmt.Errorf("load durable topic metadata: %w", err)
-		tm.recordMetadataLoadResult(restoreErr, confirmedOrphanCount(err))
+		tm.recordMetadataLoadResult(restoreErr, confirmedOrphanCount(err), 0)
 		return restoreErr
 	}
 	if err := tm.RestoreDefinitions(definitions); err != nil {
 		restoreErr := fmt.Errorf("restore durable topics: %w", err)
-		tm.recordMetadataLoadResult(restoreErr, 0)
+		tm.recordMetadataLoadResult(restoreErr, 0, 0)
 		return restoreErr
 	}
-	tm.recordMetadataLoadResult(nil, 0)
+	tm.recordMetadataLoadResult(nil, 0, len(definitions))
 	return nil
 }
 
@@ -314,8 +320,16 @@ func (tm *TopicManager) RestoreDefinitions(definitions []Definition) error {
 		if err != nil {
 			return fmt.Errorf("invalid definition for %q: %w", raw.Name, err)
 		}
-		if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, definition.EventSourcing); err != nil {
-			return fmt.Errorf("invalid definition for %q: %w", definition.Name, err)
+		if definition.Name == config.ConsumerOffsetsTopicName {
+			if definition.Idempotent || definition.EventSourcing {
+				return fmt.Errorf("invalid definition for %q: internal consumer metadata mode must be non-idempotent and non-event-sourcing", definition.Name)
+			}
+			definition.Policy = ConsumerMetadataPolicy()
+		}
+		if definition.Name != config.ConsumerOffsetsTopicName {
+			if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, definition.EventSourcing); err != nil {
+				return fmt.Errorf("invalid definition for %q: %w", definition.Name, err)
+			}
 		}
 		if _, exists := seen[definition.Name]; exists {
 			return fmt.Errorf("duplicate definition for %q", definition.Name)

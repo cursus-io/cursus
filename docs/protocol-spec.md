@@ -790,12 +790,9 @@ All SDKs should implement the same consumer group resume behavior:
 - On `ERROR: OFFSET_OUT_OF_RANGE ...`, apply the SDK `auto_offset_reset` policy: `earliest` resumes from the broker-reported earliest retained offset, `latest` resumes from the broker-reported latest offset, and `error` fails the consumer instead of silently skipping or replaying data.
 ### Offset Lifecycle and Delivery Guarantees
 
-Consumer group offsets are stored by the broker in the internal
-`__consumer_offsets` topic and loaded again when the broker starts. In
-distributed mode, offset updates are also applied through the Raft FSM and
-included in FSM snapshots. A successful `COMMIT_OFFSET` or `BATCH_COMMIT`
-therefore survives broker restart according to the configured broker storage
-durability.
+Consumer group registrations, tombstones, and committed next offsets are stored by the standalone broker in versioned records in `__consumer_offsets` and loaded again before readiness. A successful registration survives without a commit; `FETCH_OFFSET` returns `0` for its uncommitted partitions. Successful commits are synchronously persisted as monotonic complete snapshots, and the internal topic is compacted with unlimited retention rather than inheriting application delete retention. Replay corruption or inconsistency keeps readiness false and never falls back to an empty coordinator. Earlier single/bulk offset records remain readable. See [Standalone Storage Recovery](standalone-storage-recovery.md) for record and pre-manifest migration details.
+
+In distributed mode, offset updates are also applied through the Raft FSM and included in FSM snapshots.
 
 Recommended client loop:
 

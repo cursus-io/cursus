@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/topic"
 )
 
@@ -193,6 +194,10 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 }
 
 func (f *BrokerFSM) materializeTopicDelete(name string) error {
+	if name == config.ConsumerOffsetsTopicName {
+		f.recordTopicMaterialization(name, TopicMaterializationDelete, nil)
+		return nil
+	}
 	if f.tm == nil {
 		f.recordTopicMaterialization(name, TopicMaterializationDelete, nil)
 		return nil

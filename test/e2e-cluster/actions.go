@@ -204,6 +204,14 @@ func (a *ClusterActions) StartBroker(nodeIndex int) {
 		a.ctx.GetT().Fatalf("failed to start %s: %v", containerName, err)
 	}
 	if err := a.waitForNodeHealth(nodeIndex, clusterHealthCheckAddrs(a.ctx.clusterSize)[nodeIndex-1]); err != nil {
+		// #nosec G204 -- nodeIndex is range-checked above and forms a fixed broker-N container name.
+		if output, logErr := exec.Command("docker", "inspect", "--format", "status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}", containerName).CombinedOutput(); logErr == nil {
+			a.ctx.GetT().Logf("%s state: %s", containerName, strings.TrimSpace(string(output)))
+		}
+		// #nosec G204 -- nodeIndex is range-checked above and forms a fixed broker-N container name.
+		if output, logErr := exec.Command("docker", "logs", "--tail", "200", containerName).CombinedOutput(); logErr == nil {
+			a.ctx.GetT().Logf("%s logs:\n%s", containerName, string(output))
+		}
 		a.ctx.GetT().Fatalf("broker %d did not recover: %v", nodeIndex, err)
 	}
 }

@@ -20,6 +20,7 @@ type RuntimeSnapshot struct {
 	TopicCount                      int
 	Partitions                      []PartitionRuntimeSnapshot
 	MetadataLoadFailure             string
+	MetadataRestoredTopicCount      int
 	MetadataOrphanTopicCount        int
 	MetadataDurabilityWarning       string
 	MetadataDurabilityWarningsTotal uint64
@@ -63,6 +64,7 @@ func (tm *TopicManager) RuntimeSnapshot() RuntimeSnapshot {
 		topics = append(topics, current)
 	}
 	metadataLoadFailure := tm.metadataLoadFailure
+	metadataRestoredTopicCount := tm.metadataRestoredTopicCount
 	metadataOrphanTopicCount := tm.metadataOrphanTopicCount
 	metadataDurabilityWarning := tm.metadataDurabilityWarning
 	metadataDurabilityWarningsTotal := tm.metadataDurabilityWarningsTotal
@@ -72,6 +74,7 @@ func (tm *TopicManager) RuntimeSnapshot() RuntimeSnapshot {
 	snapshot := RuntimeSnapshot{
 		TopicCount:                      len(topics),
 		MetadataLoadFailure:             metadataLoadFailure,
+		MetadataRestoredTopicCount:      metadataRestoredTopicCount,
 		MetadataOrphanTopicCount:        metadataOrphanTopicCount,
 		MetadataDurabilityWarning:       metadataDurabilityWarning,
 		MetadataDurabilityWarningsTotal: metadataDurabilityWarningsTotal,

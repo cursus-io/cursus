@@ -34,6 +34,17 @@ func DefaultPolicy() Policy {
 	}
 }
 
+// ConsumerMetadataPolicy is broker-owned and cannot inherit application retention.
+// Retention fields remain zero in the manifest for wire compatibility; DiskHandler
+// interprets the internal topic as infinite-retention compact storage.
+func ConsumerMetadataPolicy() Policy {
+	return Policy{
+		CleanupPolicy: config.CleanupPolicyCompact,
+		Partitioner:   PartitionerHashKey,
+		AuthPolicy:    AuthPolicyOpen,
+	}
+}
+
 func (p Policy) Normalize() (Policy, error) {
 	if p.CleanupPolicy == "" {
 		p.CleanupPolicy = config.CleanupPolicyDelete

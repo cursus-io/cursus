@@ -19,6 +19,7 @@ import (
 
 var runServerContext = server.RunServerContext
 var runTopicMetadataDiagnostics = server.RunTopicMetadataDiagnostics
+var runConsumerMetadataDiagnostics = server.RunConsumerMetadataDiagnostics
 
 func main() {
 	// Configuration
@@ -55,6 +56,7 @@ func main() {
 
 func runBroker(ctx context.Context, cfg *config.Config) error {
 	dm := disk.NewDiskManager(cfg)
+	defer dm.CloseAllHandlers()
 	sm := stream.NewStreamManager(cfg.MaxStreamConnections, cfg.StreamTimeout, cfg.StreamHeartbeatInterval)
 	smAdapter, err := topic.NewStreamManagerAdapter(sm)
 	if err != nil {
@@ -67,12 +69,20 @@ func runBroker(ctx context.Context, cfg *config.Config) error {
 	}
 
 	tm := topic.NewTopicManager(cfg, storageProvider, smAdapter)
+	defer tm.Stop()
 	if err := tm.RestoreTopics(); err != nil {
 		util.Error("Failed to restore durable topic metadata; serving diagnostics only: %v", err)
 		return runTopicMetadataDiagnostics(ctx, cfg, tm, dm)
 	}
 
-	cd := coordinator.NewCoordinator(ctx, cfg, tm)
+	cd, err := coordinator.NewCoordinatorWithRecovery(ctx, cfg, tm)
+	if cd != nil {
+		defer cd.Stop()
+	}
+	if err != nil {
+		util.Error("Failed to recover durable consumer metadata; serving diagnostics only: %v", err)
+		return runConsumerMetadataDiagnostics(ctx, cfg, tm, dm, cd)
+	}
 	tm.SetCoordinator(cd)
 	for _, gcfg := range cfg.StaticConsumerGroups {
 		for _, topicName := range gcfg.Topics {
