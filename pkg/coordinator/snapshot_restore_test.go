@@ -60,3 +60,24 @@ func TestCoordinatorImportStateInfersPartitionsFromLegacySnapshot(t *testing.T) 
 	require.ElementsMatch(t, []int{0, 1}, restored.GetMemberAssignments("workers", "worker-1"))
 	require.ElementsMatch(t, []int{2, 3}, restored.GetMemberAssignments("workers", "worker-2"))
 }
+
+func TestCoordinatorSnapshotPreservesDeletedGroupEpoch(t *testing.T) {
+	source := NewCoordinator(context.Background(), &config.Config{}, &DummyPublisher{})
+	t.Cleanup(source.Stop)
+	require.NoError(t, source.RegisterGroup("orders", "workers", 1))
+	require.NoError(t, source.DeleteGroup("workers"))
+
+	exported := source.ExportState()
+	require.True(t, exported["workers"].Deleted)
+	require.Equal(t, uint64(2), exported["workers"].RegistrationEpoch)
+
+	restored := NewCoordinator(context.Background(), &config.Config{}, &DummyPublisher{})
+	t.Cleanup(restored.Stop)
+	restored.ImportState(exported)
+	require.Empty(t, restored.ListGroups())
+	require.NoError(t, restored.RegisterGroup("orders", "workers", 1))
+
+	reregistered := restored.ExportState()["workers"]
+	require.False(t, reregistered.Deleted)
+	require.Equal(t, uint64(3), reregistered.RegistrationEpoch)
+}

@@ -28,6 +28,20 @@ func topicMetadataWriteCommitted(err error) bool {
 	return errors.As(err, &saveErr) && saveErr.committed
 }
 
+func validateTopicStorageRoot(root string) error {
+	info, err := os.Stat(root)
+	switch {
+	case err == nil && !info.IsDir():
+		return fmt.Errorf("scan topic storage root: log path is not a directory")
+	case err == nil:
+		return nil
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	default:
+		return fmt.Errorf("inspect topic storage root: %w", err)
+	}
+}
+
 func (s *topicMetadataStore) orphanedTopicDirectories(manifestTopics map[string]struct{}) ([]string, error) {
 	root := filepath.Dir(s.path)
 	entries, err := os.ReadDir(root)

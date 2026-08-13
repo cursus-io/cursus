@@ -105,6 +105,22 @@ func TestCreateStandaloneManifestRejectsIncompleteDefinitionsAndDryRunDoesNotWri
 	require.NoFileExists(t, filepath.Join(root, TopicMetadataFileName))
 }
 
+func TestCreateStandaloneManifestRejectsDeletedOnlyInternalPartition(t *testing.T) {
+	root := t.TempDir()
+	writeMigrationSegment(t, root, config.ConsumerOffsetsTopicName, 0, 0, nil)
+	activePath := filepath.Join(root, config.ConsumerOffsetsTopicName, "partition_0_segment_00000000000000000000.log")
+	deletedPath := activePath + ".deleted"
+	require.NoError(t, os.Rename(activePath, deletedPath))
+
+	result, err := CreateStandaloneManifest(root, []Definition{{
+		Name: config.ConsumerOffsetsTopicName, Partitions: 1, Policy: ConsumerMetadataPolicy(),
+	}}, false)
+	require.ErrorContains(t, err, "has no active log segment")
+	require.False(t, result.Changed)
+	require.NoFileExists(t, filepath.Join(root, TopicMetadataFileName))
+	require.FileExists(t, deletedPath)
+}
+
 func TestPreManifestConsumerMetadataMigrationRequiresExplicitSelection(t *testing.T) {
 	root := t.TempDir()
 	writeMigrationSegment(t, root, "orders", 0, 0, nil)
@@ -164,6 +180,7 @@ func TestPreManifestConsumerMetadataMigrationRequiresExplicitSelection(t *testin
 	require.NoError(t, tm.RestoreTopics())
 	cd, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, tm)
 	require.NoError(t, err)
+	t.Cleanup(cd.Stop)
 	offset, found := cd.GetOffset("workers", "orders", 0)
 	require.True(t, found)
 	require.Equal(t, uint64(5), offset, "unselected deleted record must not be revived")

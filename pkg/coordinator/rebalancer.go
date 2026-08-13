@@ -18,6 +18,9 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 		return fmt.Errorf("invalid partition count: %d", partitionCount)
 	}
 
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	c.mu.Lock()
 	existing := c.groups[groupName]
 	if existing != nil {
@@ -42,26 +45,60 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 		if existing.OffsetRevisions == nil {
 			existing.OffsetRevisions = make(map[string]uint64)
 		}
-		if existing.RegistrationEpoch == 0 {
-			epoch := c.groupEpochs[groupName] + 1
-			if epoch == 0 {
-				existing.mu.Unlock()
-				c.mu.Unlock()
-				return fmt.Errorf("group lifecycle epoch overflow")
+		if existing.RegistrationEpoch != 0 {
+			if existing.RegistrationEpoch > c.groupEpochs[groupName] {
+				c.groupEpochs[groupName] = existing.RegistrationEpoch
 			}
-			if err := c.writeGroupRegistration(groupName, topicName, partitionCount, epoch, registrationInitialOffsets(existing)); err != nil {
-				existing.mu.Unlock()
-				c.mu.Unlock()
-				return fmt.Errorf("persist group registration: %w", err)
+			existing.TopicName = topicName
+			if len(existing.Partitions) == 0 {
+				existing.Partitions = makePartitions(partitionCount)
 			}
-			existing.RegistrationEpoch = epoch
-			c.groupEpochs[groupName] = epoch
+			existing.mu.Unlock()
+			c.mu.Unlock()
+			return nil
 		}
+
+		epoch := c.groupEpochs[groupName] + 1
+		if epoch == 0 {
+			existing.mu.Unlock()
+			c.mu.Unlock()
+			return fmt.Errorf("group lifecycle epoch overflow")
+		}
+		initial := registrationInitialOffsets(existing)
+		for _, snapshot := range initial {
+			if !groupTopicMatches(topicName, snapshot.Topic) {
+				existing.mu.Unlock()
+				c.mu.Unlock()
+				return fmt.Errorf("group %q has legacy offsets for mismatched topic %q", groupName, snapshot.Topic)
+			}
+		}
+		if c.lifecyclePending == nil {
+			c.lifecyclePending = make(map[string]bool)
+		}
+		c.lifecyclePending[groupName] = true
+		existing.mu.Unlock()
+		c.mu.Unlock()
+
+		err := c.writeGroupRegistration(groupName, topicName, partitionCount, epoch, initial)
+
+		c.mu.Lock()
+		delete(c.lifecyclePending, groupName)
+		if err != nil {
+			c.mu.Unlock()
+			return fmt.Errorf("persist group registration: %w", err)
+		}
+		if c.groups[groupName] != existing {
+			c.mu.Unlock()
+			return fmt.Errorf("group %q changed during durable registration", groupName)
+		}
+		existing.mu.Lock()
+		existing.RegistrationEpoch = epoch
 		existing.TopicName = topicName
 		if len(existing.Partitions) == 0 {
 			existing.Partitions = makePartitions(partitionCount)
 		}
 		existing.mu.Unlock()
+		c.groupEpochs[groupName] = epoch
 		c.mu.Unlock()
 		return nil
 	}
@@ -79,9 +116,23 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 		RegistrationEpoch: epoch,
 		OffsetRevisions:   make(map[string]uint64),
 	}
-	if err := c.writeGroupRegistration(groupName, topicName, partitionCount, epoch, nil); err != nil {
+	if c.lifecyclePending == nil {
+		c.lifecyclePending = make(map[string]bool)
+	}
+	c.lifecyclePending[groupName] = true
+	c.mu.Unlock()
+
+	err := c.writeGroupRegistration(groupName, topicName, partitionCount, epoch, nil)
+
+	c.mu.Lock()
+	delete(c.lifecyclePending, groupName)
+	if err != nil {
 		c.mu.Unlock()
 		return fmt.Errorf("persist group registration: %w", err)
+	}
+	if c.groups[groupName] != nil {
+		c.mu.Unlock()
+		return fmt.Errorf("group %q changed during durable registration", groupName)
 	}
 	c.groups[groupName] = group
 	c.groupEpochs[groupName] = epoch
@@ -106,6 +157,10 @@ func (c *Coordinator) DeleteGroup(groupName string) error {
 	if groupName == "" {
 		return fmt.Errorf("group name must not be empty")
 	}
+
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	c.mu.Lock()
 	group := c.groups[groupName]
 	if group == nil {
@@ -128,15 +183,29 @@ func (c *Coordinator) DeleteGroup(groupName string) error {
 		c.mu.Unlock()
 		return fmt.Errorf("group lifecycle epoch overflow")
 	}
-	if err := c.writeGroupTombstone(groupName, group.TopicName, epoch); err != nil {
-		group.mu.Unlock()
+	topicName := group.TopicName
+	if c.lifecyclePending == nil {
+		c.lifecyclePending = make(map[string]bool)
+	}
+	c.lifecyclePending[groupName] = true
+	group.mu.Unlock()
+	c.mu.Unlock()
+
+	err := c.writeGroupTombstone(groupName, topicName, epoch)
+
+	c.mu.Lock()
+	delete(c.lifecyclePending, groupName)
+	if err != nil {
 		c.mu.Unlock()
 		return fmt.Errorf("persist group tombstone: %w", err)
+	}
+	if c.groups[groupName] != group {
+		c.mu.Unlock()
+		return fmt.Errorf("group %q changed during durable deletion", groupName)
 	}
 	delete(c.groups, groupName)
 	c.groupEpochs[groupName] = epoch
 	delete(c.ownershipSince, groupName)
-	group.mu.Unlock()
 	c.mu.Unlock()
 	c.updateOffsetPartitionCount()
 	return nil
@@ -145,6 +214,10 @@ func (c *Coordinator) DeleteGroup(groupName string) error {
 // AddConsumer registers a new consumer in the group and triggers a rebalance.
 func (c *Coordinator) AddConsumer(groupName, consumerID string) ([]int, error) {
 	c.mu.Lock()
+	if c.lifecyclePending[groupName] {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("group lifecycle update in progress")
+	}
 	group := c.groups[groupName]
 	if group == nil {
 		c.mu.Unlock()

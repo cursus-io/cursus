@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -43,6 +44,42 @@ func TestConsumerMetadataReplayRequiresMigrationForRetainedGap(t *testing.T) {
 	require.Equal(t, 1, coordinator.RecoverySnapshot().OrphanRecords)
 	require.Empty(t, coordinator.ListGroups())
 }
+
+func TestDistributedRecoveryPreservesLegacyBestEffortReplay(t *testing.T) {
+	first, err := json.Marshal(OffsetCommitMessage{
+		Group: "workers", Topic: "events", Partition: 0, Offset: 7, Timestamp: time.Now(),
+	})
+	require.NoError(t, err)
+	second, err := json.Marshal(OffsetCommitMessage{
+		Group: "auditors", Topic: "audit", Partition: 1, Offset: 9, Timestamp: time.Now(),
+	})
+	require.NoError(t, err)
+
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	handler := &metadataReplayHandler{
+		starts: map[int]uint64{0: 42},
+		messages: map[int][]types.Message{
+			0: {
+				{Offset: 42, Payload: "invalid legacy record"},
+				{Offset: 43, Payload: string(first)},
+			},
+			1: {{Offset: 0, Payload: string(second)}},
+		},
+	}
+
+	recovered, err := NewCoordinatorWithRecovery(context.Background(), cfg, handler)
+	require.NoError(t, err)
+	require.True(t, recovered.RecoverySnapshot().Ready)
+	require.Equal(t, 1, recovered.RecoverySnapshot().CorruptRecords)
+	offset, found := recovered.GetOffset("workers", "events", 0)
+	require.True(t, found)
+	require.Equal(t, uint64(7), offset)
+	offset, found = recovered.GetOffset("auditors", "audit", 1)
+	require.True(t, found)
+	require.Equal(t, uint64(9), offset)
+}
+
 func TestConsumerMetadataReplayIsDeterministicAcrossPartitions(t *testing.T) {
 	registration := ConsumerMetadataRecord{
 		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,

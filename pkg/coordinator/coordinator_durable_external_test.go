@@ -29,13 +29,19 @@ func TestCoordinator_DurableOffsetReplayFromDisk(t *testing.T) {
 	require.NoError(t, cd.CommitOffset("groupA", "topic1", 1, 11))
 	require.NoError(t, cd.CommitOffset("groupB", "topic1", 0, 3))
 	require.ErrorContains(t, cd.CommitOffset("groupA", "topic1", 0, 6), "offset regression")
+	cd.Stop()
+	tm.Stop()
 	dm.CloseAllHandlers()
 
 	restartedDM := disk.NewDiskManager(cfg)
 	restartedTM := topic.NewTopicManager(cfg, restartedDM, nil)
 	require.NoError(t, restartedTM.RestoreTopics())
 	restarted := coordinator.NewCoordinator(ctx, cfg, restartedTM)
-	defer restartedDM.CloseAllHandlers()
+	t.Cleanup(func() {
+		restarted.Stop()
+		restartedTM.Stop()
+		restartedDM.CloseAllHandlers()
+	})
 
 	offset, ok := restarted.GetOffset("groupA", "topic1", 0)
 	require.True(t, ok)

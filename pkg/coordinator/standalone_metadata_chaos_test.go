@@ -35,7 +35,7 @@ func TestStandaloneAckedOffsetSurvivesAbruptProcessExit(t *testing.T) {
 
 	root := t.TempDir()
 	readyPath := filepath.Join(root, "commit-acked")
-	command := exec.Command(os.Args[0], "-test.run=^TestStandaloneAckedOffsetSurvivesAbruptProcessExit$")
+	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestStandaloneAckedOffsetSurvivesAbruptProcessExit$")
 	command.Env = append(os.Environ(),
 		abruptChildEnv+"=1",
 		abruptLogDirEnv+"="+root,
@@ -59,7 +59,7 @@ func TestStandaloneAckedOffsetSurvivesAbruptProcessExit(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	require.NoError(t, command.Process.Kill(), output.String())
+	require.NoError(t, command.Process.Kill())
 	require.Error(t, command.Wait(), "the child must exit without graceful handler shutdown")
 
 	t.Setenv(wargameBootstrapEnv, "0")
@@ -105,6 +105,7 @@ func TestStandaloneConsumerMetadataCompactionKeepsLatestStateAcrossRestarts(t *t
 	firstCompaction := compactWorkerMetadata(t, dm, tm, 12, "first")
 	require.Greater(t, firstCompaction.RecordsRemoved, 0)
 	cd.Stop()
+	tm.Stop()
 	dm.CloseAllHandlers()
 
 	secondDM, secondTM, second := startStandaloneCoordinator(t, cfg, true)
@@ -118,6 +119,7 @@ func TestStandaloneConsumerMetadataCompactionKeepsLatestStateAcrossRestarts(t *t
 	secondCompaction := compactWorkerMetadata(t, secondDM, secondTM, 20, "second")
 	require.Greater(t, secondCompaction.RecordsRemoved, 0)
 	second.Stop()
+	secondTM.Stop()
 	secondDM.CloseAllHandlers()
 
 	finalDM, _, final := startStandaloneCoordinator(t, cfg, true)

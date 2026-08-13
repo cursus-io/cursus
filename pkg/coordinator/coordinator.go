@@ -14,11 +14,13 @@ import (
 
 // Coordinator manages consumer groups, membership, heartbeats, and partition assignment.
 type Coordinator struct {
-	groups map[string]*GroupMetadata // All consumer groups
-	mu     sync.RWMutex              // Global lock for coordinator state
-	cfg    *config.Config            // Configuration reference
-	ctx    context.Context
-	cancel context.CancelFunc
+	groups           map[string]*GroupMetadata // All consumer groups
+	mu               sync.RWMutex              // Global lock for coordinator state
+	lifecycleMu      sync.Mutex                // Serializes durable group lifecycle transitions
+	lifecyclePending map[string]bool           // Groups whose durable lifecycle write is in progress
+	cfg              *config.Config            // Configuration reference
+	ctx              context.Context
+	cancel           context.CancelFunc
 
 	topicHandler              TopicHandler
 	offsetTopic               string
@@ -94,6 +96,7 @@ type GroupStateSnapshot struct {
 	Offsets           map[string]map[int]uint64 `json:"offsets"`
 	RegistrationEpoch uint64                    `json:"registration_epoch,omitempty"`
 	OffsetRevisions   map[string]uint64         `json:"offset_revisions,omitempty"`
+	Deleted           bool                      `json:"deleted,omitempty"`
 }
 
 // GroupStatus represents the status of a consumer group
@@ -158,6 +161,7 @@ func NewCoordinatorWithRecovery(ctx context.Context, cfg *config.Config, handler
 	standalone := cfg == nil || !cfg.EnabledDistribution
 	c := &Coordinator{
 		groups:                    make(map[string]*GroupMetadata),
+		lifecyclePending:          make(map[string]bool),
 		cfg:                       cfg,
 		ctx:                       childCtx,
 		cancel:                    cancel,
@@ -171,6 +175,12 @@ func NewCoordinatorWithRecovery(ctx context.Context, cfg *config.Config, handler
 			Phase: "internal_topic_validation",
 		},
 	}
+	recoveryComplete := false
+	defer func() {
+		if !recoveryComplete {
+			cancel()
+		}
+	}()
 
 	if provider, ok := handler.(offsetTopicPartitionProvider); ok {
 		partitionCount, err := provider.ExistingPartitionCount(c.offsetTopic)
@@ -200,14 +210,25 @@ func NewCoordinatorWithRecovery(ctx context.Context, cfg *config.Config, handler
 		c.migrationAuthoritative = authoritative
 	}
 	if reader, ok := handler.(OffsetLogReader); ok {
-		if err := c.LoadOffsetsFromLog(reader); err != nil {
-			recoveryErr := fmt.Errorf("replay internal consumer metadata from %q: %w", c.offsetTopic, err)
-			c.setRecoveryFailure(recoveryErr)
-			return c, recoveryErr
+		var recoveryErr error
+		if c.standalone {
+			recoveryErr = c.LoadOffsetsFromLog(reader)
+		} else {
+			var status ConsumerMetadataRecoveryStatus
+			status, recoveryErr = c.loadDistributedOffsetsFromLog(reader)
+			if recoveryErr == nil {
+				c.markRecoveryComplete(status)
+			}
+		}
+		if recoveryErr != nil {
+			wrapped := fmt.Errorf("replay internal consumer metadata from %q: %w", c.offsetTopic, recoveryErr)
+			c.setRecoveryFailure(wrapped)
+			return c, wrapped
 		}
 	} else {
 		c.markRecoveryComplete(ConsumerMetadataRecoveryStatus{})
 	}
+	recoveryComplete = true
 	return c, nil
 }
 
@@ -481,7 +502,7 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	result := make(map[string]*GroupStateSnapshot, len(c.groups))
+	result := make(map[string]*GroupStateSnapshot, len(c.groupEpochs))
 	for name, group := range c.groups {
 		group.mu.RLock()
 		snap := &GroupStateSnapshot{
@@ -511,6 +532,15 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 		group.mu.RUnlock()
 		result[name] = snap
 	}
+	for name, epoch := range c.groupEpochs {
+		if _, live := c.groups[name]; live {
+			continue
+		}
+		result[name] = &GroupStateSnapshot{
+			RegistrationEpoch: epoch,
+			Deleted:           true,
+		}
+	}
 	return result
 }
 
@@ -521,8 +551,13 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) {
 
 	c.groups = make(map[string]*GroupMetadata, len(state))
 	c.groupEpochs = make(map[string]uint64, len(state))
+	c.lifecyclePending = make(map[string]bool)
 	c.ownershipSince = make(map[string]time.Time)
 	for name, snap := range state {
+		c.groupEpochs[name] = snap.RegistrationEpoch
+		if snap.Deleted {
+			continue
+		}
 		group := &GroupMetadata{
 			TopicName:         snap.TopicName,
 			Generation:        snap.Generation,
@@ -557,7 +592,6 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) {
 		}
 
 		c.groups[name] = group
-		c.groupEpochs[name] = group.RegistrationEpoch
 	}
 }
 

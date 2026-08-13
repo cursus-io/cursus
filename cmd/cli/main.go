@@ -24,6 +24,7 @@ func main() {
 	}
 
 	dm := disk.NewDiskManager(cfg)
+	defer dm.CloseAllHandlers()
 	sm := stream.NewStreamManager(cfg.MaxStreamConnections, cfg.StreamTimeout, cfg.StreamHeartbeatInterval)
 	smAdapter, err := topic.NewStreamManagerAdapter(sm)
 	if err != nil {
@@ -31,11 +32,15 @@ func main() {
 		os.Exit(1)
 	}
 	tm := topic.NewTopicManager(cfg, dm, smAdapter)
+	defer tm.Stop()
 	if err := tm.RestoreTopics(); err != nil {
 		fmt.Println("❌ Failed to restore durable topic metadata:", err)
 		os.Exit(1)
 	}
 	cd, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, tm)
+	if cd != nil {
+		defer cd.Stop()
+	}
 	if err != nil {
 		fmt.Println("❌ Failed to recover durable consumer metadata:", err)
 		os.Exit(1)

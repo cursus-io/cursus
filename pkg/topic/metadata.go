@@ -106,6 +106,9 @@ func (s *topicMetadataStore) Load() (_ []Definition, err error) {
 	if s == nil {
 		return nil, nil
 	}
+	if err := validateTopicStorageRoot(filepath.Dir(s.path)); err != nil {
+		return nil, err
+	}
 	// #nosec G304 -- the path is supplied by the broker-owned storage provider.
 	file, err := os.Open(s.path)
 	if errors.Is(err, os.ErrNotExist) {

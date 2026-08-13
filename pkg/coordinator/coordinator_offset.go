@@ -3,7 +3,10 @@ package coordinator
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
@@ -18,17 +21,31 @@ func (c *Coordinator) CommitOffset(groupName, topic string, partition int, offse
 	util.Debug("Committing offset: group='%s', topic='%s', partition=%d, offset=%d", groupName, topic, partition, offset)
 
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	if c.lifecyclePending[groupName] {
+		c.mu.RUnlock()
+		return fmt.Errorf("group %q lifecycle update in progress", groupName)
+	}
 	gm := c.groups[groupName]
 	if gm == nil {
+		c.mu.RUnlock()
 		return fmt.Errorf("group '%s' not found", groupName)
 	}
-	return c.commitOffsetForGroup(gm, groupName, topic, partition, offset)
+	gm.mu.Lock()
+	c.mu.RUnlock()
+	defer gm.mu.Unlock()
+	return c.commitOffsetForGroupLocked(gm, groupName, topic, partition, offset)
 }
 
 func (c *Coordinator) commitOffsetForGroup(gm *GroupMetadata, groupName, topic string, partition int, offset uint64) error {
 	gm.mu.Lock()
 	defer gm.mu.Unlock()
+	return c.commitOffsetForGroupLocked(gm, groupName, topic, partition, offset)
+}
+
+func (c *Coordinator) commitOffsetForGroupLocked(gm *GroupMetadata, groupName, topic string, partition int, offset uint64) error {
+	if err := validateGroupTopicLocked(gm, groupName, topic); err != nil {
+		return err
+	}
 
 	if partition < 0 || partition >= len(gm.Partitions) {
 		return fmt.Errorf("invalid partition %d for group=%s partition_count=%d", partition, groupName, len(gm.Partitions))
@@ -83,12 +100,19 @@ func (c *Coordinator) CommitOffsetsBulk(groupName, topic string, offsets []Offse
 	}
 
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	if c.lifecyclePending[groupName] {
+		c.mu.RUnlock()
+		return fmt.Errorf("group %q lifecycle update in progress", groupName)
+	}
 	gm := c.groups[groupName]
 	if gm == nil {
+		c.mu.RUnlock()
 		return fmt.Errorf("group '%s' not found", groupName)
 	}
-	return c.commitOffsetsBulkForGroup(gm, groupName, topic, offsets)
+	gm.mu.Lock()
+	c.mu.RUnlock()
+	defer gm.mu.Unlock()
+	return c.commitOffsetsBulkForGroupLocked(gm, groupName, topic, offsets)
 }
 
 // ValidateAndCommitOffsetsBulk keeps the membership generation stable until the
@@ -96,6 +120,9 @@ func (c *Coordinator) CommitOffsetsBulk(groupName, topic string, offsets []Offse
 func (c *Coordinator) ValidateAndCommitOffsetsBulk(groupName, topic, memberID string, generation int, offsets []OffsetItem) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.lifecyclePending[groupName] {
+		return fmt.Errorf("group %q lifecycle update in progress", groupName)
+	}
 
 	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
 		return fmt.Errorf("%s", errResp)
@@ -112,7 +139,10 @@ func (c *Coordinator) ValidateAndCommitOffsetsBulk(groupName, topic, memberID st
 func (c *Coordinator) commitOffsetsBulkForGroup(gm *GroupMetadata, groupName, topic string, offsets []OffsetItem) error {
 	gm.mu.Lock()
 	defer gm.mu.Unlock()
+	return c.commitOffsetsBulkForGroupLocked(gm, groupName, topic, offsets)
+}
 
+func (c *Coordinator) commitOffsetsBulkForGroupLocked(gm *GroupMetadata, groupName, topic string, offsets []OffsetItem) error {
 	if err := validateOffsetBatchLocked(gm, groupName, topic, offsets); err != nil {
 		return err
 	}
@@ -173,6 +203,8 @@ func (c *Coordinator) ApplyOffsetUpdateFromFSM(groupName, topic string, offsets 
 	if groupName == "" || topic == "" {
 		return fmt.Errorf("invalid group or topic name")
 	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
 
 	// FSM replay may arrive before RegisterGroup, so we need to get-or-create.
 	c.mu.Lock()
@@ -215,6 +247,9 @@ func (c *Coordinator) ApplyFencedOffsetUpdateFromFSM(
 ) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.lifecyclePending[groupName] {
+		return fmt.Errorf("group %q lifecycle update in progress", groupName)
+	}
 
 	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
 		return fmt.Errorf("%s", errResp)
@@ -238,6 +273,9 @@ func (c *Coordinator) ApplyFencedOffsetUpdateFromFSM(
 }
 
 func validateOffsetBatchLocked(group *GroupMetadata, groupName, topic string, offsets []OffsetItem) error {
+	if err := validateGroupTopicLocked(group, groupName, topic); err != nil {
+		return err
+	}
 	seen := make(map[int]struct{}, len(offsets))
 	for _, item := range offsets {
 		if _, exists := seen[item.Partition]; exists {
@@ -252,6 +290,26 @@ func validateOffsetBatchLocked(group *GroupMetadata, groupName, topic string, of
 		}
 	}
 	return nil
+}
+
+func validateGroupTopicLocked(group *GroupMetadata, groupName, topic string) error {
+	if group.TopicName != "" && !groupTopicMatches(group.TopicName, topic) {
+		return fmt.Errorf("topic mismatch for group=%s (existing: %s, requested: %s)", groupName, group.TopicName, topic)
+	}
+	return nil
+}
+
+func groupTopicMatches(pattern, topic string) bool {
+	if pattern == topic {
+		return true
+	}
+	if !strings.ContainsAny(pattern, "*?") {
+		return false
+	}
+	escaped := regexp.QuoteMeta(pattern)
+	expression := strings.ReplaceAll(strings.ReplaceAll(escaped, `\*`, ".*"), `\?`, ".")
+	matcher, err := regexp.Compile("^" + expression + "$")
+	return err == nil && matcher.MatchString(topic)
 }
 
 func mergedOffsetSnapshot(group *GroupMetadata, topic string, updates []OffsetItem) []OffsetItem {
@@ -295,6 +353,104 @@ func (c *Coordinator) LoadOffsetsFromLog(reader OffsetLogReader) error {
 		util.Info("Coordinator: restored groups=%d offsets=%d records=%d legacy=%d orphan=%d from %q", status.RestoredGroups, status.RestoredOffsets, status.ReplayedRecords, status.LegacyRecords, status.OrphanRecords, c.offsetTopic)
 	}
 	return nil
+}
+
+// loadDistributedOffsetsFromLog preserves the cluster coordinator's legacy
+// best-effort replay contract. Standalone recovery is intentionally stricter:
+// it requires complete lifecycle metadata and rejects retained-prefix gaps.
+func (c *Coordinator) loadDistributedOffsetsFromLog(reader OffsetLogReader) (ConsumerMetadataRecoveryStatus, error) {
+	const batchSize = 1024
+	status := ConsumerMetadataRecoveryStatus{Phase: "committed_offset_replay"}
+	var firstParseErr error
+	recovered := make(map[string]map[string]map[int]uint64)
+
+	for partition := 0; partition < c.offsetTopicPartitionCount; partition++ {
+		next := uint64(0)
+		for {
+			messages, err := reader.ReadTopicPartition(c.offsetTopic, partition, next, batchSize)
+			readOffset := next
+			if err != nil {
+				util.Warn("Coordinator: error reading distributed offset log partition=%d offset=%d: %v", partition, next, err)
+				break
+			}
+			if len(messages) == 0 {
+				break
+			}
+
+			for _, message := range messages {
+				candidate := message.Offset + 1
+				if candidate > next {
+					next = candidate
+				}
+				groupName, topicName, offsets, parseErr := parseOffsetLogPayload(message.Payload)
+				if parseErr != nil {
+					status.CorruptRecords++
+					if firstParseErr == nil {
+						firstParseErr = parseErr
+					}
+					continue
+				}
+				status.ReplayedRecords++
+				status.LegacyRecords++
+				if recovered[groupName] == nil {
+					recovered[groupName] = make(map[string]map[int]uint64)
+				}
+				if recovered[groupName][topicName] == nil {
+					recovered[groupName][topicName] = make(map[int]uint64)
+				}
+				for _, item := range offsets {
+					current, exists := recovered[groupName][topicName][item.Partition]
+					if !exists || item.Offset > current {
+						recovered[groupName][topicName][item.Partition] = item.Offset
+					}
+				}
+			}
+			if len(messages) < batchSize {
+				break
+			}
+			if next <= readOffset {
+				util.Warn("Coordinator: distributed offset log reader made no progress at partition=%d offset=%d", partition, readOffset)
+				break
+			}
+		}
+	}
+
+	if status.CorruptRecords > 0 {
+		util.Warn("Coordinator: skipped %d invalid distributed offset log records; first error: %v", status.CorruptRecords, firstParseErr)
+	}
+	groupNames := make([]string, 0, len(recovered))
+	for groupName := range recovered {
+		groupNames = append(groupNames, groupName)
+	}
+	sort.Strings(groupNames)
+	for _, groupName := range groupNames {
+		topics := make([]string, 0, len(recovered[groupName]))
+		for topicName := range recovered[groupName] {
+			topics = append(topics, topicName)
+		}
+		sort.Strings(topics)
+		for _, topicName := range topics {
+			partitionOffsets := recovered[groupName][topicName]
+			partitions := make([]int, 0, len(partitionOffsets))
+			for partition := range partitionOffsets {
+				partitions = append(partitions, partition)
+			}
+			sort.Ints(partitions)
+			offsets := make([]OffsetItem, 0, len(partitions))
+			for _, partition := range partitions {
+				offsets = append(offsets, OffsetItem{Partition: partition, Offset: partitionOffsets[partition]})
+			}
+			if err := c.ApplyOffsetUpdateFromFSM(groupName, topicName, offsets); err != nil {
+				return status, fmt.Errorf("restore distributed group=%s topic=%s offsets: %w", groupName, topicName, err)
+			}
+			status.RestoredOffsets += len(offsets)
+		}
+	}
+	status.RestoredGroups = len(groupNames)
+	if status.ReplayedRecords > 0 {
+		util.Info("Coordinator: loaded %d distributed committed offset records from %q", status.ReplayedRecords, c.offsetTopic)
+	}
+	return status, nil
 }
 
 func parseOffsetLogPayload(payload string) (string, string, []OffsetItem, error) {
@@ -356,6 +512,9 @@ func (c *Coordinator) updateOffsetPartitionCount() {
 func (c *Coordinator) ValidateAndCommit(groupName, topic string, partition int, offset uint64, generation int, memberID string) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.lifecyclePending[groupName] {
+		return fmt.Errorf("group %q lifecycle update in progress", groupName)
+	}
 	group := c.groups[groupName]
 	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
 		return fmt.Errorf("%s", errResp)

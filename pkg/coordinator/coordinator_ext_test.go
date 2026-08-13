@@ -228,3 +228,19 @@ func TestCoordinator_MemberAssignments(t *testing.T) {
 	assert.Nil(t, c.GetMemberAssignments("no-group", "m1"))
 	assert.Empty(t, c.GetMemberAssignments("g1", "no-member"))
 }
+
+func TestCoordinatorRejectsMismatchedOffsetTopics(t *testing.T) {
+	c := NewCoordinator(context.Background(), &config.Config{}, &DummyPublisher{})
+	t.Cleanup(c.Stop)
+	require.NoError(t, c.RegisterGroup("topic1", "group1", 2))
+
+	require.ErrorContains(t, c.CommitOffset("group1", "topic2", 0, 1), "topic mismatch")
+	require.ErrorContains(t, c.CommitOffsetsBulk("group1", "topic2", []OffsetItem{{
+		Partition: 0, Offset: 1,
+	}}), "topic mismatch")
+	require.ErrorContains(t, c.ApplyOffsetUpdateFromFSM("group1", "topic2", []OffsetItem{{
+		Partition: 0, Offset: 1,
+	}}), "topic mismatch")
+	_, found := c.GetOffset("group1", "topic2", 0)
+	require.False(t, found)
+}

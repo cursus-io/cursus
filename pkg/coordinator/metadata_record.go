@@ -161,6 +161,9 @@ func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
 			if snapshot.Topic == "" {
 				return fmt.Errorf("group registration contains an empty offset topic")
 			}
+			if !groupTopicMatches(record.Topic, snapshot.Topic) {
+				return fmt.Errorf("group registration offset topic %q does not match group topic %q", snapshot.Topic, record.Topic)
+			}
 			if _, exists := seenTopics[snapshot.Topic]; exists {
 				return fmt.Errorf("group registration contains duplicate offset topic %q", snapshot.Topic)
 			}
@@ -646,6 +649,9 @@ func materializeConsumerMetadata(
 		if group == nil || group.RegistrationEpoch != record.Epoch {
 			orphans++
 			continue
+		}
+		if !groupTopicMatches(group.TopicName, record.Topic) {
+			return nil, nil, orphans, fmt.Errorf("offset snapshot topic %q does not match group %q topic %q", record.Topic, record.Group, group.TopicName)
 		}
 		currentRevision := group.OffsetRevisions[record.Topic]
 		if record.Revision < currentRevision {

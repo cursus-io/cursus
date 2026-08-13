@@ -78,7 +78,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 	register(ErrorClassAuthorization, false,
 		"NOT_AUTHORIZED_FOR_OPERATION", "NOT_AUTHORIZED_FOR_PARTITION", "NOT_AUTHORIZED_FOR_TOPIC", "authentication_failed", "authentication_required",
 		"internal_auth_not_configured", "internal_batch_requires_token_wrapper", "internal_command_unauthorized",
-		"internal_txn_publish_forbidden", "transaction_metadata_forbidden",
+		"internal_topic_write_forbidden", "internal_txn_publish_forbidden", "transaction_metadata_forbidden",
 	)
 	register(ErrorClassNotFound, false,
 		"group_not_found", "partition_metadata_not_found", "partition_not_found", "topic_not_found", "transaction_not_found",

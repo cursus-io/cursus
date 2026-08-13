@@ -617,6 +617,9 @@ func definitionsMatchInventory(definitions []Definition, topics []PersistedTopic
 			if partition.ID != expected {
 				return fmt.Errorf("topic %q persisted partition IDs are not contiguous from zero", definition.Name)
 			}
+			if len(partition.Segments) == 0 {
+				return fmt.Errorf("topic %q partition %d has no active log segment; deleted segments require explicit operator recovery", definition.Name, partition.ID)
+			}
 		}
 	}
 	return nil

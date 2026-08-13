@@ -30,6 +30,7 @@ type TopicManager struct {
 	topics        map[string]*Topic
 	stopCh        chan struct{}
 	hp            HandlerProvider
+	stopOnce      sync.Once
 	mu            sync.RWMutex
 	cfg           *config.Config
 	StreamManager StreamManager
@@ -436,7 +437,21 @@ func (tm *TopicManager) Flush() {
 }
 
 func (tm *TopicManager) Stop() {
-	close(tm.stopCh)
+	if tm == nil {
+		return
+	}
+	tm.stopOnce.Do(func() {
+		close(tm.stopCh)
+		tm.mu.RLock()
+		partitions := make([]*Partition, 0)
+		for _, current := range tm.topics {
+			partitions = append(partitions, current.Partitions...)
+		}
+		tm.mu.RUnlock()
+		for _, partition := range partitions {
+			partition.Close()
+		}
+	})
 }
 
 func (tm *TopicManager) DeleteTopic(name string) bool {

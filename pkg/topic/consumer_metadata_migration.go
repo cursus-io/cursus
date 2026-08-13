@@ -60,7 +60,7 @@ func ReadConsumerMetadataSelection(path string) (ConsumerMetadataSelection, erro
 	if err != nil {
 		return ConsumerMetadataSelection{}, fmt.Errorf("open consumer metadata selection: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	info, err := file.Stat()
 	if err != nil {
 		return ConsumerMetadataSelection{}, fmt.Errorf("stat consumer metadata selection: %w", err)
@@ -113,7 +113,7 @@ func CreateConsumerMetadataMigration(logDir string, selection ConsumerMetadataSe
 		return result, err
 	}
 	if present {
-		if existing.Authoritative && reflect.DeepEqual(existing.Records, records) {
+		if existing.Authoritative && sameConsumerMetadataRecords(existing.Records, records) {
 			return result, nil
 		}
 		return result, fmt.Errorf("consumer metadata migration already exists with different selection")
@@ -144,6 +144,18 @@ func CreateConsumerMetadataMigration(logDir string, selection ConsumerMetadataSe
 	result.Committed = committed
 	result.Changed = committed
 	return result, err
+}
+
+func sameConsumerMetadataRecords(left, right []coordinator.ConsumerMetadataRecord) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	if leftErr != nil {
+		return false
+	}
+	rightJSON, rightErr := json.Marshal(right)
+	if rightErr != nil {
+		return false
+	}
+	return bytes.Equal(leftJSON, rightJSON)
 }
 
 func selectedConsumerMetadataRecords(selection ConsumerMetadataSelection, inventory StorageInventory) ([]coordinator.ConsumerMetadataRecord, error) {

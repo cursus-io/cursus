@@ -36,8 +36,7 @@ func TestStandaloneBrokerSamePVCRestartE2E(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	firstBrokerPort := reserveBrokerTestPort(t)
-	firstHealthPort := reserveBrokerTestPort(t)
+	firstBrokerPort, firstHealthPort := reserveBrokerTestPorts(t)
 	first, firstOutput := startBrokerRestartChild(t, root, firstBrokerPort, firstHealthPort)
 	waitForBrokerReady(t, firstHealthPort, firstOutput)
 
@@ -56,8 +55,7 @@ func TestStandaloneBrokerSamePVCRestartE2E(t *testing.T) {
 	require.NoError(t, first.Process.Kill())
 	require.Error(t, first.Wait(), "first broker must stop without graceful shutdown")
 
-	secondBrokerPort := reserveBrokerTestPort(t)
-	secondHealthPort := reserveBrokerTestPort(t)
+	secondBrokerPort, secondHealthPort := reserveBrokerTestPorts(t)
 	second, secondOutput := startBrokerRestartChild(t, root, secondBrokerPort, secondHealthPort)
 	t.Cleanup(func() {
 		if second.ProcessState == nil || !second.ProcessState.Exited() {
@@ -93,7 +91,7 @@ func runBrokerRestartChild(t *testing.T) {
 
 func startBrokerRestartChild(t *testing.T, root string, brokerPort, healthPort int) (*exec.Cmd, *bytes.Buffer) {
 	t.Helper()
-	command := exec.Command(os.Args[0], "-test.run=^TestStandaloneBrokerSamePVCRestartE2E$")
+	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestStandaloneBrokerSamePVCRestartE2E$")
 	command.Env = append(os.Environ(),
 		brokerRestartChildEnv+"=1",
 		brokerRestartLogEnv+"="+root,
@@ -117,9 +115,12 @@ func startBrokerRestartChild(t *testing.T, root string, brokerPort, healthPort i
 func waitForBrokerReady(t *testing.T, healthPort int, output *bytes.Buffer) {
 	t.Helper()
 	url := fmt.Sprintf("http://127.0.0.1:%d/ready", healthPort)
+	client := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		response, err := http.Get(url) // #nosec G107 -- loopback test child.
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil) // #nosec G107 -- loopback test child.
+		require.NoError(t, err)
+		response, err := client.Do(request)
 		if err == nil {
 			_ = response.Body.Close()
 			if response.StatusCode == http.StatusOK {
@@ -133,9 +134,10 @@ func waitForBrokerReady(t *testing.T, healthPort int, output *bytes.Buffer) {
 
 func brokerCommand(t *testing.T, port int, command string) string {
 	t.Helper()
-	connection, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 3*time.Second)
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	connection, err := dialer.DialContext(t.Context(), "tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	require.NoError(t, err)
-	defer connection.Close()
+	defer func() { _ = connection.Close() }()
 	require.NoError(t, connection.SetDeadline(time.Now().Add(5*time.Second)))
 	payload := []byte(command)
 	frame := make([]byte, 4+len(payload))
@@ -152,11 +154,19 @@ func brokerCommand(t *testing.T, port int, command string) string {
 	return string(response)
 }
 
-func reserveBrokerTestPort(t *testing.T) int {
+func reserveBrokerTestPorts(t *testing.T) (int, int) {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	var listenConfig net.ListenConfig
+	brokerListener, err := listenConfig.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	port := listener.Addr().(*net.TCPAddr).Port
-	require.NoError(t, listener.Close())
-	return port
+	defer func() { require.NoError(t, brokerListener.Close()) }()
+
+	healthListener, err := listenConfig.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, healthListener.Close()) }()
+
+	brokerPort := brokerListener.Addr().(*net.TCPAddr).Port
+	healthPort := healthListener.Addr().(*net.TCPAddr).Port
+	require.NotEqual(t, brokerPort, healthPort)
+	return brokerPort, healthPort
 }
