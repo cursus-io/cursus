@@ -63,6 +63,11 @@ func (d *DiskHandler) SetRetentionPolicy(hours int, bytes int64) {
 	d.retentionMu.Lock()
 	defer d.retentionMu.Unlock()
 
+	if d.internalMetadata {
+		d.retentionPolicy = retentionLimits{}
+		d.retentionConfigured = true
+		return
+	}
 	if hours == 0 {
 		hours = d.retentionDefaults.hours
 	}
@@ -79,6 +84,9 @@ func (d *DiskHandler) SetCleanupPolicy(policy string) {
 	if !ok {
 		normalized = config.CleanupPolicyDelete
 	}
+	if d.internalMetadata {
+		normalized = config.CleanupPolicyCompact
+	}
 	d.maintenanceMu.Lock()
 	defer d.maintenanceMu.Unlock()
 
@@ -93,11 +101,20 @@ func (d *DiskHandler) SetStoragePolicy(cleanupPolicy string, hours int, bytes in
 	if !ok {
 		normalized = config.CleanupPolicyDelete
 	}
+	if d.internalMetadata {
+		normalized = config.CleanupPolicyCompact
+	}
 	d.maintenanceMu.Lock()
 	defer d.maintenanceMu.Unlock()
 
 	d.retentionMu.Lock()
 	defer d.retentionMu.Unlock()
+	if d.internalMetadata {
+		d.retentionPolicy = retentionLimits{}
+		d.retentionConfigured = true
+		d.cleanupPolicy = config.CleanupPolicyCompact
+		return
+	}
 	if hours == 0 {
 		hours = d.retentionDefaults.hours
 	}
@@ -125,6 +142,9 @@ func (d *DiskHandler) RetentionPolicy() (int, int64) {
 }
 
 func (d *DiskHandler) effectiveRetention(cfg *config.Config) retentionLimits {
+	if d.internalMetadata {
+		return retentionLimits{}
+	}
 	d.retentionMu.RLock()
 	defer d.retentionMu.RUnlock()
 	if d.retentionConfigured {
@@ -137,6 +157,9 @@ func (d *DiskHandler) effectiveRetention(cfg *config.Config) retentionLimits {
 }
 
 func (d *DiskHandler) EnforceRetention(cfg *config.Config) {
+	if d.internalMetadata {
+		return
+	}
 	d.maintenanceMu.Lock()
 	defer d.maintenanceMu.Unlock()
 	if !config.HasCleanupPolicy(d.CleanupPolicy(), config.CleanupPolicyDelete) {

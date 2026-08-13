@@ -240,7 +240,7 @@ func TestLoadOffsetsFromLogIsIndependentOfInternalPartitionOrder(t *testing.T) {
 	assert.Equal(t, uint64(7), offset)
 }
 
-func TestLoadOffsetsFromLogAdvancesPastInvalidFullBatch(t *testing.T) {
+func TestLoadOffsetsFromLogFailsClosedOnInvalidRecord(t *testing.T) {
 	records := make([]types.Message, 1025)
 	for i := 0; i < 1024; i++ {
 		records[i] = types.Message{Offset: uint64(i), Payload: "invalid"}
@@ -256,12 +256,13 @@ func TestLoadOffsetsFromLogAdvancesPastInvalidFullBatch(t *testing.T) {
 	records[1024] = types.Message{Offset: 1024, Payload: string(valid)}
 
 	c := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
-	require.NoError(t, c.LoadOffsetsFromLog(&partitionedOffsetReader{
+	err = c.LoadOffsetsFromLog(&partitionedOffsetReader{
 		records: map[int][]types.Message{0: records},
-	}))
-	offset, ok := c.GetOffset("workers", "events", 2)
-	require.True(t, ok)
-	assert.Equal(t, uint64(19), offset)
+	})
+	require.ErrorContains(t, err, "decode internal metadata")
+	require.Error(t, c.RecoveryReadinessError())
+	_, ok := c.GetOffset("workers", "events", 2)
+	assert.False(t, ok)
 }
 
 func TestCommitOffsetsBulkRejectsDuplicatePartitionAtomically(t *testing.T) {

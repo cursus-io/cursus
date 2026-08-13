@@ -38,6 +38,7 @@ func TestStandaloneTopicMetadataRestoresDefinitionAndData(t *testing.T) {
 	defer restartedDM.CloseAllHandlers()
 	restarted := NewTopicManager(cfg, restartedDM, nil)
 	require.NoError(t, restarted.RestoreTopics())
+	require.Equal(t, 2, restarted.RuntimeSnapshot().MetadataRestoredTopicCount)
 	defer closeTopicManager(restarted)
 
 	restored := restarted.GetTopic("orders")

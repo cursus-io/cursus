@@ -51,6 +51,7 @@ type Collector struct {
 	ready                           *prometheus.Desc
 	topicCount                      *prometheus.Desc
 	metadataLoadFailure             *prometheus.Desc
+	metadataRestoredTopics          *prometheus.Desc
 	metadataOrphanTopics            *prometheus.Desc
 	metadataDurabilityWarning       *prometheus.Desc
 	metadataDurabilityWarningsTotal *prometheus.Desc
@@ -65,6 +66,12 @@ type Collector struct {
 	groupLag                        *prometheus.Desc
 	legacyGroupLag                  *prometheus.Desc
 	groupOffsetOutOfRange           *prometheus.Desc
+	consumerMetadataRecovery        *prometheus.Desc
+	consumerMetadataRestoredGroups  *prometheus.Desc
+	consumerMetadataRestoredOffsets *prometheus.Desc
+	consumerMetadataReplayedRecords *prometheus.Desc
+	consumerMetadataOrphanRecords   *prometheus.Desc
+	consumerMetadataCorruptRecords  *prometheus.Desc
 	activeStreams                   *prometheus.Desc
 	storageHandlers                 *prometheus.Desc
 	storageSegments                 *prometheus.Desc
@@ -99,6 +106,7 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		ready:                           prometheus.NewDesc("cursus_broker_ready", "Whether the broker is ready to accept client work.", nil, nil),
 		topicCount:                      prometheus.NewDesc("cursus_broker_topics", "Number of topics loaded by this broker.", nil, nil),
 		metadataLoadFailure:             prometheus.NewDesc("cursus_topic_metadata_manifest_load_failure", "Whether the current durable topic manifest load failed.", nil, nil),
+		metadataRestoredTopics:          prometheus.NewDesc("cursus_topic_metadata_restored_topics", "Topics restored from the durable standalone manifest during startup.", nil, nil),
 		metadataOrphanTopics:            prometheus.NewDesc("cursus_topic_metadata_orphan_topics", "Persisted topic directories confirmed absent from the durable manifest.", nil, nil),
 		metadataDurabilityWarning:       prometheus.NewDesc("cursus_topic_metadata_durability_warning", "Whether the latest committed topic metadata update has directory-sync durability uncertainty.", nil, nil),
 		metadataDurabilityWarningsTotal: prometheus.NewDesc("cursus_topic_metadata_durability_warnings_total", "Topic metadata updates committed with directory-sync durability uncertainty.", nil, nil),
@@ -113,6 +121,12 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		groupLag:                        prometheus.NewDesc("cursus_consumer_group_lag", "Committed-reader lag, max(high watermark - committed next offset, 0).", []string{"group", "topic", "partition"}, nil),
 		legacyGroupLag:                  prometheus.NewDesc("broker_consumer_lag", "Deprecated alias of cursus_consumer_group_lag.", []string{"topic", "partition", "group"}, nil),
 		groupOffsetOutOfRange:           prometheus.NewDesc("cursus_consumer_group_offset_out_of_range", "Whether a committed offset is outside the retained committed-readable range.", []string{"group", "topic", "partition"}, nil),
+		consumerMetadataRecovery:        prometheus.NewDesc("cursus_consumer_metadata_recovery_ready", "Whether durable consumer metadata recovery completed without error.", []string{"phase"}, nil),
+		consumerMetadataRestoredGroups:  prometheus.NewDesc("cursus_consumer_metadata_restored_groups", "Consumer groups restored during startup.", nil, nil),
+		consumerMetadataRestoredOffsets: prometheus.NewDesc("cursus_consumer_metadata_restored_offsets", "Committed next-offset keys restored during startup.", nil, nil),
+		consumerMetadataReplayedRecords: prometheus.NewDesc("cursus_consumer_metadata_replayed_records", "Internal metadata records scanned during startup.", nil, nil),
+		consumerMetadataOrphanRecords:   prometheus.NewDesc("cursus_consumer_metadata_orphan_records", "Internal records fenced by a newer lifecycle or tombstone.", nil, nil),
+		consumerMetadataCorruptRecords:  prometheus.NewDesc("cursus_consumer_metadata_corrupt_records", "Corrupt or inconsistent internal records found during startup.", nil, nil),
 		activeStreams:                   prometheus.NewDesc("cursus_streams_active", "Currently registered streaming consumers.", nil, nil),
 		storageHandlers:                 prometheus.NewDesc("cursus_storage_handlers", "Open partition storage handlers.", nil, nil),
 		storageSegments:                 prometheus.NewDesc("cursus_storage_segments", "Open storage segments including active segments.", nil, nil),
@@ -135,11 +149,14 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		partitionLeader:                 prometheus.NewDesc("cursus_cluster_partition_leader", "Current partition leader identity.", []string{"topic", "partition", "broker_id"}, nil),
 	}
 	c.descriptors = []*prometheus.Desc{
-		c.ready, c.topicCount, c.metadataLoadFailure, c.metadataOrphanTopics,
+		c.ready, c.topicCount, c.metadataLoadFailure, c.metadataRestoredTopics, c.metadataOrphanTopics,
 		c.metadataDurabilityWarning, c.metadataDurabilityWarningsTotal,
 		c.partitionCount, c.logStart, c.logEnd, c.highWatermark,
 		c.groupMembers, c.groupGeneration, c.groupAssignments, c.groupCommittedOffset,
-		c.groupLag, c.legacyGroupLag, c.groupOffsetOutOfRange, c.activeStreams, c.storageHandlers,
+		c.groupLag, c.legacyGroupLag, c.groupOffsetOutOfRange,
+		c.consumerMetadataRecovery, c.consumerMetadataRestoredGroups, c.consumerMetadataRestoredOffsets,
+		c.consumerMetadataReplayedRecords, c.consumerMetadataOrphanRecords, c.consumerMetadataCorruptRecords,
+		c.activeStreams, c.storageHandlers,
 		c.storageSegments, c.storageBytes, c.storagePendingWrites, c.storageActiveReaders,
 		c.storageStatFailures, c.distributionEnabled, c.clusterBrokers, c.clusterHasLeader,
 		c.clusterIsLeader, c.clusterOffline, c.clusterUnderReplicated, c.topicMaterializationPending,
@@ -168,6 +185,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	ch <- gauge(c.topicCount, float64(topicState.TopicCount))
 	ch <- gauge(c.metadataLoadFailure, boolValue(topicState.MetadataLoadFailure != ""))
+	ch <- gauge(c.metadataRestoredTopics, float64(topicState.MetadataRestoredTopicCount))
 	ch <- gauge(c.metadataOrphanTopics, float64(topicState.MetadataOrphanTopicCount))
 	ch <- gauge(c.metadataDurabilityWarning, boolValue(topicState.MetadataDurabilityWarning != ""))
 	ch <- prometheus.MustNewConstMetric(c.metadataDurabilityWarningsTotal, prometheus.CounterValue, float64(topicState.MetadataDurabilityWarningsTotal))
@@ -181,6 +199,21 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- gauge(c.highWatermark, float64(partition.HighWatermark), partition.Topic, partitionLabel)
 	}
 	c.collectGroups(ch, partitionState)
+	if recoverySource, ok := c.groups.(interface {
+		RecoverySnapshot() coordinator.ConsumerMetadataRecoveryStatus
+	}); ok {
+		status := recoverySource.RecoverySnapshot()
+		phase := status.Phase
+		if phase == "" {
+			phase = "unknown"
+		}
+		ch <- gauge(c.consumerMetadataRecovery, boolValue(status.Ready && status.Failure == ""), phase)
+		ch <- gauge(c.consumerMetadataRestoredGroups, float64(status.RestoredGroups))
+		ch <- gauge(c.consumerMetadataRestoredOffsets, float64(status.RestoredOffsets))
+		ch <- gauge(c.consumerMetadataReplayedRecords, float64(status.ReplayedRecords))
+		ch <- gauge(c.consumerMetadataOrphanRecords, float64(status.OrphanRecords))
+		ch <- gauge(c.consumerMetadataCorruptRecords, float64(status.CorruptRecords))
+	}
 
 	activeStreams := 0
 	if c.streams != nil {

@@ -35,7 +35,11 @@ func main() {
 		fmt.Println("❌ Failed to restore durable topic metadata:", err)
 		os.Exit(1)
 	}
-	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
+	cd, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, tm)
+	if err != nil {
+		fmt.Println("❌ Failed to recover durable consumer metadata:", err)
+		os.Exit(1)
+	}
 	tm.SetCoordinator(cd)
 
 	ctx := controller.NewClientContext("default-group", 0)

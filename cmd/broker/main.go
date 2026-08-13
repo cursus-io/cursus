@@ -19,6 +19,7 @@ import (
 
 var runServerContext = server.RunServerContext
 var runTopicMetadataDiagnostics = server.RunTopicMetadataDiagnostics
+var runConsumerMetadataDiagnostics = server.RunConsumerMetadataDiagnostics
 
 func main() {
 	// Configuration
@@ -72,7 +73,11 @@ func runBroker(ctx context.Context, cfg *config.Config) error {
 		return runTopicMetadataDiagnostics(ctx, cfg, tm, dm)
 	}
 
-	cd := coordinator.NewCoordinator(ctx, cfg, tm)
+	cd, err := coordinator.NewCoordinatorWithRecovery(ctx, cfg, tm)
+	if err != nil {
+		util.Error("Failed to recover durable consumer metadata; serving diagnostics only: %v", err)
+		return runConsumerMetadataDiagnostics(ctx, cfg, tm, dm, cd)
+	}
 	tm.SetCoordinator(cd)
 	for _, gcfg := range cfg.StaticConsumerGroups {
 		for _, topicName := range gcfg.Topics {

@@ -23,6 +23,13 @@ type Coordinator struct {
 	topicHandler              TopicHandler
 	offsetTopic               string
 	offsetTopicPartitionCount int
+	standalone                bool
+	groupEpochs               map[string]uint64
+	migrationRecords          []ConsumerMetadataRecord
+	migrationAuthoritative    bool
+
+	recoveryMu sync.RWMutex
+	recovery   ConsumerMetadataRecoveryStatus
 
 	// Session expiration is decided by the broker that owns each group. In a
 	// cluster, the expiration callback serializes removals through the metadata
@@ -45,19 +52,29 @@ type offsetTopicPartitionProvider interface {
 	ExistingPartitionCount(topic string) (int, error)
 }
 
+type offsetLogStartProvider interface {
+	EarliestTopicOffset(topic string, partition int) (uint64, error)
+}
+
+type consumerMetadataMigrationProvider interface {
+	ConsumerMetadataMigrationRecords() ([]ConsumerMetadataRecord, bool, error)
+}
+
 type syncPublisher interface {
 	PublishWithAck(topic string, msg *types.Message) error
 }
 
 // GroupMetadata holds metadata for a single consumer group.
 type GroupMetadata struct {
-	mu            sync.RWMutex               // Per-group lock for offset operations
-	TopicName     string                     // Topic this group consumes
-	Members       map[string]*MemberMetadata // Active members
-	Generation    int                        // Current membership generation
-	Partitions    []int                      // All partitions of the topic
-	LastRebalance time.Time                  // Timestamp of last rebalance
-	Offsets       map[string]map[int]uint64  // topic -> partition -> offset
+	mu                sync.RWMutex               // Per-group lock for offset operations
+	TopicName         string                     // Topic this group consumes
+	Members           map[string]*MemberMetadata // Active members
+	Generation        int                        // Current membership generation
+	Partitions        []int                      // All partitions of the topic
+	LastRebalance     time.Time                  // Timestamp of last rebalance
+	Offsets           map[string]map[int]uint64  // topic -> partition -> next offset
+	RegistrationEpoch uint64                     // durable lifecycle epoch; zero is legacy
+	OffsetRevisions   map[string]uint64          // topic -> durable snapshot revision
 }
 
 // MemberMetadata holds state for a single consumer instance.
@@ -69,12 +86,14 @@ type MemberMetadata struct {
 
 // GroupStateSnapshot is a serializable snapshot of a consumer group's state.
 type GroupStateSnapshot struct {
-	TopicName     string                    `json:"topic"`
-	Generation    int                       `json:"generation"`
-	Members       map[string][]int          `json:"members"`
-	Partitions    []int                     `json:"partitions,omitempty"`
-	LastRebalance time.Time                 `json:"last_rebalance,omitempty"`
-	Offsets       map[string]map[int]uint64 `json:"offsets"`
+	TopicName         string                    `json:"topic"`
+	Generation        int                       `json:"generation"`
+	Members           map[string][]int          `json:"members"`
+	Partitions        []int                     `json:"partitions,omitempty"`
+	LastRebalance     time.Time                 `json:"last_rebalance,omitempty"`
+	Offsets           map[string]map[int]uint64 `json:"offsets"`
+	RegistrationEpoch uint64                    `json:"registration_epoch,omitempty"`
+	OffsetRevisions   map[string]uint64         `json:"offset_revisions,omitempty"`
 }
 
 // GroupStatus represents the status of a consumer group
@@ -119,41 +138,77 @@ type BulkOffsetMsg struct {
 // NewCoordinator creates a new Coordinator instance.
 // The provided ctx controls the lifetime of background goroutines (e.g., heartbeat monitor).
 func NewCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandler) *Coordinator {
-	if handler == nil {
-		util.Fatal("Coordinator requires a non-nil TopicHandler")
+	coordinator, err := NewCoordinatorWithRecovery(ctx, cfg, handler)
+	if err != nil {
+		util.Error("Coordinator recovery failed: %v", err)
 	}
+	return coordinator
+}
 
+// NewCoordinatorWithRecovery initializes the internal metadata topic and
+// completes consumer metadata replay before returning success.
+func NewCoordinatorWithRecovery(ctx context.Context, cfg *config.Config, handler TopicHandler) (*Coordinator, error) {
+	if handler == nil {
+		return nil, fmt.Errorf("coordinator requires a non-nil topic handler")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	childCtx, cancel := context.WithCancel(ctx)
-
+	standalone := cfg == nil || !cfg.EnabledDistribution
 	c := &Coordinator{
 		groups:                    make(map[string]*GroupMetadata),
 		cfg:                       cfg,
 		ctx:                       childCtx,
 		cancel:                    cancel,
 		topicHandler:              handler,
-		offsetTopic:               "__consumer_offsets",
-		offsetTopicPartitionCount: 4, // init. dynamic
+		offsetTopic:               config.ConsumerOffsetsTopicName,
+		offsetTopicPartitionCount: 4,
+		standalone:                standalone,
+		groupEpochs:               make(map[string]uint64),
 		ownershipSince:            make(map[string]time.Time),
+		recovery: ConsumerMetadataRecoveryStatus{
+			Phase: "internal_topic_validation",
+		},
 	}
 
 	if provider, ok := handler.(offsetTopicPartitionProvider); ok {
 		partitionCount, err := provider.ExistingPartitionCount(c.offsetTopic)
 		if err != nil {
-			util.Warn("Coordinator: failed to discover offset topic partitions: %v", err)
-		} else if partitionCount > c.offsetTopicPartitionCount {
+			recoveryErr := fmt.Errorf("discover internal consumer metadata partitions: %w", err)
+			c.setRecoveryFailure(recoveryErr)
+			return c, recoveryErr
+		}
+		if partitionCount > c.offsetTopicPartitionCount {
 			c.offsetTopicPartitionCount = partitionCount
 		}
 	}
 
 	if err := handler.CreateTopic(c.offsetTopic, c.offsetTopicPartitionCount, false, false); err != nil {
-		util.Error("Coordinator: failed to create offset topic '%s': %v", c.offsetTopic, err)
+		recoveryErr := fmt.Errorf("validate internal consumer metadata topic %q: %w", c.offsetTopic, err)
+		c.setRecoveryFailure(recoveryErr)
+		return c, recoveryErr
+	}
+	if provider, ok := handler.(consumerMetadataMigrationProvider); ok {
+		records, authoritative, err := provider.ConsumerMetadataMigrationRecords()
+		if err != nil {
+			recoveryErr := fmt.Errorf("load consumer metadata migration: %w", err)
+			c.setRecoveryFailure(recoveryErr)
+			return c, recoveryErr
+		}
+		c.migrationRecords = append([]ConsumerMetadataRecord(nil), records...)
+		c.migrationAuthoritative = authoritative
 	}
 	if reader, ok := handler.(OffsetLogReader); ok {
 		if err := c.LoadOffsetsFromLog(reader); err != nil {
-			util.Error("Coordinator: failed to load committed offsets from '%s': %v", c.offsetTopic, err)
+			recoveryErr := fmt.Errorf("replay internal consumer metadata from %q: %w", c.offsetTopic, err)
+			c.setRecoveryFailure(recoveryErr)
+			return c, recoveryErr
 		}
+	} else {
+		c.markRecoveryComplete(ConsumerMetadataRecoveryStatus{})
 	}
-	return c
+	return c, nil
 }
 
 func (c *Coordinator) SetGroupSessionCallbacks(
@@ -430,12 +485,14 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 	for name, group := range c.groups {
 		group.mu.RLock()
 		snap := &GroupStateSnapshot{
-			TopicName:     group.TopicName,
-			Generation:    group.Generation,
-			Members:       make(map[string][]int, len(group.Members)),
-			Partitions:    append([]int(nil), group.Partitions...),
-			LastRebalance: group.LastRebalance,
-			Offsets:       make(map[string]map[int]uint64),
+			TopicName:         group.TopicName,
+			Generation:        group.Generation,
+			Members:           make(map[string][]int, len(group.Members)),
+			Partitions:        append([]int(nil), group.Partitions...),
+			LastRebalance:     group.LastRebalance,
+			Offsets:           make(map[string]map[int]uint64),
+			RegistrationEpoch: group.RegistrationEpoch,
+			OffsetRevisions:   make(map[string]uint64, len(group.OffsetRevisions)),
 		}
 		for mid, member := range group.Members {
 			assignments := make([]int, len(member.Assignments))
@@ -447,6 +504,9 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 			for pid, offset := range partitions {
 				snap.Offsets[topic][pid] = offset
 			}
+		}
+		for topic, revision := range group.OffsetRevisions {
+			snap.OffsetRevisions[topic] = revision
 		}
 		group.mu.RUnlock()
 		result[name] = snap
@@ -460,15 +520,18 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) {
 	defer c.mu.Unlock()
 
 	c.groups = make(map[string]*GroupMetadata, len(state))
+	c.groupEpochs = make(map[string]uint64, len(state))
 	c.ownershipSince = make(map[string]time.Time)
 	for name, snap := range state {
 		group := &GroupMetadata{
-			TopicName:     snap.TopicName,
-			Generation:    snap.Generation,
-			Members:       make(map[string]*MemberMetadata, len(snap.Members)),
-			Partitions:    append([]int(nil), snap.Partitions...),
-			LastRebalance: snap.LastRebalance,
-			Offsets:       make(map[string]map[int]uint64),
+			TopicName:         snap.TopicName,
+			Generation:        snap.Generation,
+			Members:           make(map[string]*MemberMetadata, len(snap.Members)),
+			Partitions:        append([]int(nil), snap.Partitions...),
+			LastRebalance:     snap.LastRebalance,
+			Offsets:           make(map[string]map[int]uint64),
+			RegistrationEpoch: snap.RegistrationEpoch,
+			OffsetRevisions:   make(map[string]uint64, len(snap.OffsetRevisions)),
 		}
 
 		for mid, assignments := range snap.Members {
@@ -485,12 +548,16 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) {
 				group.Offsets[topic][pid] = offset
 			}
 		}
+		for topic, revision := range snap.OffsetRevisions {
+			group.OffsetRevisions[topic] = revision
+		}
 
 		if len(group.Partitions) == 0 {
 			group.Partitions = inferSnapshotPartitions(snap)
 		}
 
 		c.groups[name] = group
+		c.groupEpochs[name] = group.RegistrationEpoch
 	}
 }
 

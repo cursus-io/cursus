@@ -1,0 +1,44 @@
+package disk
+
+import (
+	"encoding/binary"
+	"os"
+	"testing"
+
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/stretchr/testify/require"
+)
+
+func TestConsumerMetadataTruncatedTailFailsClosedWithoutRepair(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+
+	handler, err := NewDiskHandler(cfg, config.ConsumerOffsetsTopicName, 0)
+	require.NoError(t, err)
+	_, err = handler.AppendMessageSync(config.ConsumerOffsetsTopicName, 0, &types.Message{
+		Key:     "valid",
+		Payload: `{"group":"workers","topic":"events","partition":0,"offset":4}`,
+	})
+	require.NoError(t, err)
+	segmentPath := handler.GetSegmentPath(handler.CurrentSegment)
+	require.NoError(t, handler.Close())
+
+	file, err := os.OpenFile(segmentPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	require.NoError(t, err)
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], 32)
+	_, err = file.Write(append(length[:], []byte("torn")...))
+	require.NoError(t, err)
+	require.NoError(t, file.Sync())
+	require.NoError(t, file.Close())
+	before, err := os.Stat(segmentPath)
+	require.NoError(t, err)
+
+	restarted, err := NewDiskHandler(cfg, config.ConsumerOffsetsTopicName, 0)
+	require.Nil(t, restarted)
+	require.ErrorContains(t, err, "truncated internal metadata record")
+	after, statErr := os.Stat(segmentPath)
+	require.NoError(t, statErr)
+	require.Equal(t, before.Size(), after.Size(), "fail-closed recovery must preserve corrupt evidence")
+}

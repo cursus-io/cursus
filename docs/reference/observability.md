@@ -35,7 +35,7 @@ pool, and enabled HTTP services have initialized and all dynamic checks pass.
 Standalone response:
 
 ```json
-{"status":"ready","checks":{"storage":"ok"}}
+{"status":"ready","checks":{"consumer_metadata":"ok","storage":"ok","topic_metadata":"ok"}}
 ```
 
 In distributed mode, readiness also requires a resolvable cluster leader. A
@@ -104,6 +104,7 @@ the lifetime or payload transfer time of a stream.
 |---|---|
 | `cursus_broker_ready` | Current readiness result (`1` or `0`) |
 | `cursus_broker_topics` | Topics loaded on this broker |
+| `cursus_topic_metadata_restored_topics` | Topics restored from the durable standalone manifest during startup |
 | `cursus_broker_partitions` | Partitions loaded on this broker |
 | `cursus_partition_log_start_offset{topic,partition}` | Earliest retained offset |
 | `cursus_partition_log_end_offset{topic,partition}` | Next allocated offset |
@@ -119,6 +120,19 @@ the lifetime or payload transfer time of a stream.
 `cursus_storage_bytes` covers open topic handlers. It is not filesystem capacity
 or free-space telemetry; collect those values with the node or container
 runtime exporter.
+
+### Consumer Metadata Recovery
+
+| Metric | Meaning |
+|---|---|
+| `cursus_consumer_metadata_recovery_ready{phase}` | `1` only after durable group/offset replay completes without error |
+| `cursus_consumer_metadata_restored_groups` | Groups materialized during startup |
+| `cursus_consumer_metadata_restored_offsets` | Committed `(group,topic,partition)` next-offset keys restored |
+| `cursus_consumer_metadata_replayed_records` | Active internal log records scanned |
+| `cursus_consumer_metadata_orphan_records` | Records fenced or superseded by authoritative lifecycle/revision state |
+| `cursus_consumer_metadata_corrupt_records` | Malformed or inconsistent records that stopped recovery |
+
+In diagnostics-only mode, `/ready` includes the retained `consumer_metadata` failure and `cursus_consumer_metadata_recovery_ready` remains `0`; the client command listener is not opened. Use the restored counts together with the offline [standalone storage recovery inventory](../standalone-storage-recovery.md).
 
 ### Consumer Groups
 

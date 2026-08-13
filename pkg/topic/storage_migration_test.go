@@ -1,7 +1,9 @@
 package topic
 
 import (
+	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -102,6 +105,83 @@ func TestCreateStandaloneManifestRejectsIncompleteDefinitionsAndDryRunDoesNotWri
 	require.NoFileExists(t, filepath.Join(root, TopicMetadataFileName))
 }
 
+func TestPreManifestConsumerMetadataMigrationRequiresExplicitSelection(t *testing.T) {
+	root := t.TempDir()
+	writeMigrationSegment(t, root, "orders", 0, 0, nil)
+	activePayload, err := json.Marshal(coordinator.OffsetCommitMessage{
+		Group: "workers", Topic: "orders", Partition: 0, Offset: 5,
+	})
+	require.NoError(t, err)
+	writeMigrationSegment(t, root, config.ConsumerOffsetsTopicName, 0, 1, []types.DiskMessage{{
+		Topic: config.ConsumerOffsetsTopicName, Partition: 0, Offset: 1, Payload: string(activePayload),
+	}})
+	deletedPayload, err := json.Marshal(coordinator.OffsetCommitMessage{
+		Group: "workers", Topic: "orders", Partition: 0, Offset: 9,
+	})
+	require.NoError(t, err)
+	writeMigrationSegment(t, root, config.ConsumerOffsetsTopicName, 0, 0, []types.DiskMessage{{
+		Topic: config.ConsumerOffsetsTopicName, Partition: 0, Offset: 0, Payload: string(deletedPayload),
+	}})
+	deletedPath := filepath.Join(root, config.ConsumerOffsetsTopicName, "partition_0_segment_00000000000000000000.log")
+	require.NoError(t, os.Rename(deletedPath, deletedPath+".deleted"))
+
+	inventory, err := InspectStandaloneStorage(root)
+	require.NoError(t, err)
+	require.Len(t, inventory.ConsumerMetadataRecords, 2)
+	require.Equal(t, "active", inventory.ConsumerMetadataRecords[0].SegmentState)
+	require.Equal(t, "deleted", inventory.ConsumerMetadataRecords[1].SegmentState)
+	definitions := []Definition{
+		{Name: config.ConsumerOffsetsTopicName, Partitions: 1, Policy: ConsumerMetadataPolicy()},
+		{Name: "orders", Partitions: 1, Policy: DefaultPolicy()},
+	}
+	_, err = CreateStandaloneManifest(root, definitions, true)
+	require.ErrorContains(t, err, "explicit consumer-metadata migration selection")
+
+	selection := ConsumerMetadataSelection{Version: 1, Groups: []ConsumerMetadataGroupSelection{{
+		Group: "workers", Topic: "orders", PartitionCount: 1,
+		Records: []ConsumerMetadataRecordSelector{{
+			SegmentState: "active", LogPartition: 0, SegmentBase: 1, RecordOffset: 1,
+		}},
+	}}}
+	dryRun, err := CreateConsumerMetadataMigration(root, selection, true)
+	require.NoError(t, err)
+	require.False(t, dryRun.Changed)
+	require.NoFileExists(t, filepath.Join(root, config.ConsumerMetadataMigrationFileName))
+	result, err := CreateConsumerMetadataMigration(root, selection, false)
+	require.NoError(t, err)
+	require.True(t, result.Committed)
+	idempotent, err := CreateConsumerMetadataMigration(root, selection, false)
+	require.NoError(t, err)
+	require.False(t, idempotent.Changed)
+
+	_, err = CreateStandaloneManifest(root, definitions, false)
+	require.NoError(t, err)
+	cfg := config.DefaultConfig()
+	cfg.LogDir = root
+	dm := disk.NewDiskManager(cfg)
+	t.Cleanup(dm.CloseAllHandlers)
+	tm := NewTopicManager(cfg, dm, nil)
+	require.NoError(t, tm.RestoreTopics())
+	cd, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, tm)
+	require.NoError(t, err)
+	offset, found := cd.GetOffset("workers", "orders", 0)
+	require.True(t, found)
+	require.Equal(t, uint64(5), offset, "unselected deleted record must not be revived")
+	require.FileExists(t, deletedPath+".deleted")
+}
+func TestConsumerMetadataMigrationRejectsCorruptFingerprint(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, config.ConsumerMetadataMigrationFileName)
+	require.NoError(t, os.WriteFile(path, []byte(`{
+		"version":1,
+		"authoritative":true,
+		"inventory_sha256":"not-a-digest",
+		"records":[]
+	}`), 0o600))
+	_, present, err := readConsumerMetadataMigration(path)
+	require.False(t, present)
+	require.ErrorContains(t, err, "invalid inventory_sha256")
+}
 func TestArchiveOrphanTopicMovesExactlyOneDirectory(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "logs")

@@ -192,6 +192,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 
 	healthState := NewHealthState()
 	addStorageReadinessChecks(healthState, tm, dm)
+	if cd != nil {
+		addConsumerMetadataReadinessCheck(healthState, cd)
+	}
 	if cfg.EnabledDistribution {
 		healthState.AddCheck("cluster_leader", func(context.Context) error {
 			if cc == nil {

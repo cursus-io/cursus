@@ -114,6 +114,12 @@ The encoded manifest is limited to 16 MiB. Updates write a mode-`0600` same-dire
 
 Backups of a standalone broker must keep this manifest with topic partition directories, `__transaction_state.journal`, and the consumer offset log. Restoring only segment files cannot reconstruct the full topic policy.
 
+## Standalone Consumer Metadata
+
+`__consumer_offsets` stores version-1 group registration, complete committed-next-offset snapshot, and group tombstone JSON payloads inside ordinary segment frames. Stable semantic keys support compaction; lifecycle epochs fence delete/re-create, and snapshot revisions make replay deterministic across physical internal partitions. The decoder retains compatibility with the earlier single/bulk offset JSON records.
+
+The internal topic is forced to compact cleanup and unlimited time/size retention regardless of broker defaults, manifest input, or application `CREATE`. Registration/commit acknowledgement synchronously flushes and fsyncs its authoritative log. Corrupt, truncated, conflicting, regressing, or key-mismatched records fail readiness instead of being skipped. See [Standalone Storage Recovery](../../standalone-storage-recovery.md) for the record shapes and pre-manifest migration procedure.
+
 ## Standalone Transaction Journal
 
 A standalone broker stores coordinator snapshots in `{log_dir}/__transaction_state.journal`. This file is separate from partition segments. Each record uses the following versioned frame:

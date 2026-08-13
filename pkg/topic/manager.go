@@ -38,6 +38,7 @@ type TopicManager struct {
 	metadataStore *topicMetadataStore
 
 	metadataLoadFailure             string
+	metadataRestoredTopicCount      int
 	metadataOrphanTopicCount        int
 	metadataDurabilityWarning       string
 	metadataDurabilityWarningsTotal uint64
@@ -95,6 +96,12 @@ func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent 
 }
 
 func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, idempotent bool, eventSourcing bool, policy Policy) error {
+	internalMetadata := name == config.ConsumerOffsetsTopicName
+	if internalMetadata {
+		idempotent = false
+		eventSourcing = false
+		policy = ConsumerMetadataPolicy()
+	}
 	definition, err := (Definition{
 		Name:          name,
 		Partitions:    partitionCount,
@@ -105,8 +112,10 @@ func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, i
 	if err != nil {
 		return err
 	}
-	if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, eventSourcing); err != nil {
-		return err
+	if !internalMetadata {
+		if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, eventSourcing); err != nil {
+			return err
+		}
 	}
 
 	tm.mu.Lock()
@@ -114,10 +123,15 @@ func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, i
 
 	if existing, ok := tm.topics[name]; ok {
 		current := existing.Definition()
+		if internalMetadata && (current.Idempotent || current.EventSourcing) {
+			return fmt.Errorf("internal consumer metadata topic has incompatible mode")
+		}
 		definition.Idempotent = current.Idempotent
 		definition.EventSourcing = current.EventSourcing
-		if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, current.EventSourcing); err != nil {
-			return err
+		if !internalMetadata {
+			if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, current.EventSourcing); err != nil {
+				return err
+			}
 		}
 		if partitionCount < current.Partitions {
 			util.Error("cannot decrease partitions for topic '%s' (%d -> %d)", name, current.Partitions, partitionCount)
@@ -209,6 +223,21 @@ func (tm *TopicManager) ReadTopicPartition(topicName string, partitionID int, of
 		return nil, err
 	}
 	return p.dh.ReadMessages(offset, max)
+}
+
+// EarliestTopicOffset returns the earliest retained logical offset without
+// creating or mutating a topic. Consumer metadata recovery uses it only after
+// the internal topic has been validated and opened.
+func (tm *TopicManager) EarliestTopicOffset(topicName string, partitionID int) (uint64, error) {
+	t := tm.GetTopic(topicName)
+	if t == nil {
+		return 0, fmt.Errorf("topic %q does not exist", topicName)
+	}
+	partition, err := t.GetPartition(partitionID)
+	if err != nil {
+		return 0, err
+	}
+	return partition.GetFirstOffset(), nil
 }
 
 // Async (acks=0)
@@ -421,6 +450,9 @@ func (tm *TopicManager) DeleteTopic(name string) bool {
 
 // DeleteTopicDurable commits the metadata deletion before removing local data.
 func (tm *TopicManager) DeleteTopicDurable(name string) (bool, error) {
+	if name == config.ConsumerOffsetsTopicName {
+		return false, fmt.Errorf("cannot delete broker-owned internal consumer metadata topic")
+	}
 	if err := ValidateName(name); err != nil {
 		return false, fmt.Errorf("invalid topic name: %w", err)
 	}

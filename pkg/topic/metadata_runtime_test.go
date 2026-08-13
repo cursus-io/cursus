@@ -11,6 +11,50 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRestoreTopicsRejectsMissingInternalMetadataStorage(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		createPartOne bool
+	}{
+		{name: "missing topic directory"},
+		{name: "missing declared partition", createPartOne: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			_, manifest, err := normalizeAndMarshalManifest([]Definition{{
+				Name: config.ConsumerOffsetsTopicName, Partitions: 2, Policy: ConsumerMetadataPolicy(),
+			}})
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(root, TopicMetadataFileName), manifest, 0o600))
+			if test.createPartOne {
+				writePersistedTopicLog(t, root, config.ConsumerOffsetsTopicName)
+			}
+			cfg := config.DefaultConfig()
+			cfg.LogDir = root
+			dm := disk.NewDiskManager(cfg)
+			manager := NewTopicManager(cfg, dm, nil)
+
+			err = manager.RestoreTopics()
+			require.Error(t, err)
+			require.Error(t, manager.MetadataReadinessError())
+			require.Empty(t, manager.ListTopics(), "missing internal storage must not be recreated as an empty healthy topic")
+		})
+	}
+}
+func TestRestoreTopicsRejectsLogPathThatIsNotDirectory(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "not-a-directory")
+	require.NoError(t, os.WriteFile(logPath, []byte("blocked"), 0o600))
+	cfg := config.DefaultConfig()
+	cfg.LogDir = logPath
+	dm := disk.NewDiskManager(cfg)
+	manager := NewTopicManager(cfg, dm, nil)
+
+	err := manager.RestoreTopics()
+	require.ErrorContains(t, err, "scan topic storage root")
+	require.Error(t, manager.MetadataReadinessError())
+	require.Error(t, dm.Ready())
+}
 func TestTopicMetadataRuntimeReportsManifestFailureAndConfirmedOrphans(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

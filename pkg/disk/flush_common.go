@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"time"
 
@@ -328,6 +329,14 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	if err := d.writer.Flush(); err != nil {
 		return fmt.Errorf("flush failed: %w", err)
 	}
+	if d.internalMetadata {
+		// Consumer metadata acknowledgements are a durable contract: do not
+		// expose a successful registration/commit until the authoritative log
+		// bytes have reached the filesystem sync boundary.
+		if err := d.file.Sync(); err != nil {
+			return fmt.Errorf("sync internal metadata log: %w", err)
+		}
+	}
 
 	d.CurrentOffset += totalLen
 	newAbsOffset := msg.Offset + 1
@@ -347,6 +356,11 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 			}
 			if err := d.indexWriter.Flush(); err != nil {
 				return fmt.Errorf("failed to flush index writer: %w", err)
+			}
+			if d.internalMetadata && d.indexFile != nil {
+				if err := d.indexFile.Sync(); err != nil {
+					return fmt.Errorf("sync internal metadata index: %w", err)
+				}
 			}
 			d.lastIndexPosition = msgPosition
 			d.indexBytesWritten += uint64(types.IndexEntrySize)
@@ -372,6 +386,9 @@ func (d *DiskHandler) rotateSegment(nextBaseOffset uint64) error {
 	if d.file != nil {
 		if err := d.file.Sync(); err != nil {
 			util.Error("failed to sync disk file: %v", err)
+			if d.internalMetadata {
+				errs = append(errs, err)
+			}
 		}
 		if err := d.file.Close(); err != nil {
 			util.Error("close failed during rotation: %v", err)
@@ -409,7 +426,15 @@ func (d *DiskHandler) rotateSegment(nextBaseOffset uint64) error {
 		util.Error("Failed to open new segment: %v", err)
 		return err
 	}
-	return d.openIndexFiles()
+	if err := d.openIndexFiles(); err != nil {
+		return err
+	}
+	if d.internalMetadata {
+		if err := syncDirectory(filepath.Dir(d.BaseName)); err != nil {
+			return fmt.Errorf("sync internal metadata segment rotation: %w", err)
+		}
+	}
+	return nil
 }
 
 // openSegment opens or creates the current segment file for writing.

@@ -18,7 +18,7 @@ func confirmedOrphanCount(err error) int {
 	return 0
 }
 
-func (tm *TopicManager) recordMetadataLoadResult(err error, orphanCount int) {
+func (tm *TopicManager) recordMetadataLoadResult(err error, orphanCount, restoredCount int) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -27,6 +27,7 @@ func (tm *TopicManager) recordMetadataLoadResult(err error, orphanCount int) {
 		tm.metadataLoadFailure = err.Error()
 	}
 	tm.metadataOrphanTopicCount = orphanCount
+	tm.metadataRestoredTopicCount = restoredCount
 }
 
 // recordMetadataDurabilityWarningLocked requires tm.mu to be held for writing.

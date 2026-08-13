@@ -20,6 +20,14 @@ type segmentRecovery struct {
 // recoverActiveSegment validates the active log tail and removes only a
 // trailing partial record. Complete but malformed records fail startup.
 func recoverActiveSegment(logPath, indexPath string, baseOffset uint64) (segmentRecovery, error) {
+	return recoverActiveSegmentMode(logPath, indexPath, baseOffset, false)
+}
+
+func recoverActiveSegmentStrict(logPath, indexPath string, baseOffset uint64) (segmentRecovery, error) {
+	return recoverActiveSegmentMode(logPath, indexPath, baseOffset, true)
+}
+
+func recoverActiveSegmentMode(logPath, indexPath string, baseOffset uint64, rejectPartialTail bool) (segmentRecovery, error) {
 	info, err := os.Stat(logPath)
 	if err != nil {
 		return segmentRecovery{}, err
@@ -49,6 +57,9 @@ func recoverActiveSegment(logPath, indexPath string, baseOffset uint64) (segment
 		return segmentRecovery{}, err
 	}
 	if partial {
+		if rejectPartialTail {
+			return segmentRecovery{}, fmt.Errorf("truncated internal metadata record at byte %d", validBytes)
+		}
 		if err := truncateAndSync(logPath, validBytes); err != nil {
 			return segmentRecovery{}, fmt.Errorf("truncate partial segment tail: %w", err)
 		}

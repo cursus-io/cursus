@@ -41,6 +41,10 @@ type compactionFrame struct {
 func (d *DiskHandler) EnforceCompaction() (CompactionResult, error) {
 	var result CompactionResult
 	if d.distributed {
+		if d.internalMetadata {
+			result.SkippedReason = "distributed_internal_metadata"
+			return result, nil
+		}
 		return result, fmt.Errorf("log compaction is not supported in distributed mode")
 	}
 

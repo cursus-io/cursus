@@ -63,6 +63,7 @@ type DiskHandler struct {
 	cleanupPolicy          string
 	minCleanableDirtyRatio float64
 	distributed            bool
+	internalMetadata       bool
 
 	maintenanceMu     sync.Mutex
 	compactionMu      sync.RWMutex
@@ -128,9 +129,29 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		return nil, err
 	}
 
+	internalMetadata := topicName == config.ConsumerOffsetsTopicName
 	tempDh := &DiskHandler{BaseName: base}
-	if err := cleanupDeletedSegments(base); err != nil {
-		return nil, fmt.Errorf("cleanup deleted segment tombstones: %w", err)
+	preserveDeletedMetadata := false
+	if internalMetadata {
+		deleted, deletedErr := filepath.Glob(base + "_segment_*.deleted")
+		if deletedErr != nil {
+			return nil, fmt.Errorf("inspect internal metadata deleted segments: %w", deletedErr)
+		}
+		if len(deleted) > 0 {
+			migrationPath := filepath.Join(cfg.LogDir, config.ConsumerMetadataMigrationFileName)
+			if _, migrationErr := os.Stat(migrationPath); migrationErr != nil {
+				if os.IsNotExist(migrationErr) {
+					return nil, fmt.Errorf("internal metadata has %d deleted segment tombstone(s); explicit migration is required", len(deleted))
+				}
+				return nil, fmt.Errorf("inspect consumer metadata migration authorization: %w", migrationErr)
+			}
+			preserveDeletedMetadata = true
+		}
+	}
+	if !preserveDeletedMetadata {
+		if err := cleanupDeletedSegments(base); err != nil {
+			return nil, fmt.Errorf("cleanup deleted segment tombstones: %w", err)
+		}
 	}
 	if err := cleanupCompactionTemps(base); err != nil {
 		return nil, fmt.Errorf("cleanup compaction temporary files: %w", err)
@@ -159,7 +180,11 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 				return nil, fmt.Errorf("critical: failed to parse last segment filename %s: %w", fileName, err)
 			}
 		}
-		recovery, err = recoverActiveSegment(lastFile, tempDh.GetIndexPath(currentSegmentBase), currentSegmentBase)
+		if internalMetadata {
+			recovery, err = recoverActiveSegmentStrict(lastFile, tempDh.GetIndexPath(currentSegmentBase), currentSegmentBase)
+		} else {
+			recovery, err = recoverActiveSegment(lastFile, tempDh.GetIndexPath(currentSegmentBase), currentSegmentBase)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("recover active segment %s: %w", lastFile, err)
 		}
@@ -176,6 +201,10 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	normalizedCleanupPolicy, ok := config.NormalizeCleanupPolicy(cleanupPolicy)
 	if !ok {
 		normalizedCleanupPolicy = config.CleanupPolicyDelete
+	}
+	if internalMetadata {
+		normalizedCleanupPolicy = config.CleanupPolicyCompact
+		initialRetention = retentionLimits{}
 	}
 	minCleanableDirtyRatio := cfg.MinCleanableDirtyRatio
 	if minCleanableDirtyRatio <= 0 || minCleanableDirtyRatio >= 1 {
@@ -210,6 +239,7 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		cleanupPolicy:          normalizedCleanupPolicy,
 		minCleanableDirtyRatio: minCleanableDirtyRatio,
 		distributed:            cfg.EnabledDistribution,
+		internalMetadata:       internalMetadata,
 		compactedSegments:      compactedSegments,
 		file:                   file,
 		writer:                 bufio.NewWriter(file),
@@ -220,6 +250,16 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 
 	if err := dh.openIndexFiles(); err != nil {
 		return nil, err
+	}
+	if internalMetadata {
+		// A successful metadata append may be the first record in this
+		// partition. Persist the segment/index directory entries before the
+		// coordinator can acknowledge that record.
+		if err := syncDirectory(filepath.Dir(base)); err != nil {
+			_ = dh.closeIndexFiles()
+			_ = file.Close()
+			return nil, fmt.Errorf("sync internal metadata partition directory: %w", err)
+		}
 	}
 
 	for _, f := range files {

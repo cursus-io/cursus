@@ -32,7 +32,17 @@ func (s *topicMetadataStore) orphanedTopicDirectories(manifestTopics map[string]
 	root := filepath.Dir(s.path)
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		info, statErr := os.Stat(root)
+		switch {
+		case statErr == nil && !info.IsDir():
+			return nil, fmt.Errorf("scan topic storage root: log path is not a directory")
+		case statErr == nil:
+			return nil, nil
+		case errors.Is(statErr, os.ErrNotExist):
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("inspect topic storage root: %w", statErr)
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("scan topic storage root: %w", err)
@@ -60,6 +70,55 @@ func (s *topicMetadataStore) orphanedTopicDirectories(manifestTopics map[string]
 	}
 	sort.Strings(orphaned)
 	return orphaned, nil
+}
+
+func validateDeclaredTopicStorage(root string, definitions []Definition) error {
+	for _, definition := range definitions {
+		topicPath := filepath.Join(root, definition.Name)
+		info, err := os.Lstat(topicPath)
+		if err != nil {
+			return fmt.Errorf("manifest topic %q has missing or inaccessible persisted storage: %w", definition.Name, err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("manifest topic %q storage path is not a real directory", definition.Name)
+		}
+		entries, err := os.ReadDir(topicPath)
+		if err != nil {
+			return fmt.Errorf("read manifest topic %q storage: %w", definition.Name, err)
+		}
+		partitions := make(map[int]struct{}, definition.Partitions)
+		for _, entry := range entries {
+			name := entry.Name()
+			matches := persistedSegmentName.FindStringSubmatch(name)
+			if matches == nil {
+				if strings.HasPrefix(name, "partition_") && strings.HasSuffix(name, ".log") {
+					return fmt.Errorf("manifest topic %q has non-canonical persisted segment %q", definition.Name, name)
+				}
+				continue
+			}
+			if matches[3] != "" {
+				continue
+			}
+			entryInfo, statErr := entry.Info()
+			if statErr != nil {
+				return fmt.Errorf("inspect manifest topic %q segment %q: %w", definition.Name, name, statErr)
+			}
+			if !entryInfo.Mode().IsRegular() || entryInfo.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("manifest topic %q segment %q is not a regular file", definition.Name, name)
+			}
+			partition, parseErr := strconv.Atoi(matches[1])
+			if parseErr != nil || partition < 0 || partition >= definition.Partitions {
+				return fmt.Errorf("manifest topic %q has persisted partition outside [0,%d): %q", definition.Name, definition.Partitions, name)
+			}
+			partitions[partition] = struct{}{}
+		}
+		for partition := 0; partition < definition.Partitions; partition++ {
+			if _, exists := partitions[partition]; !exists {
+				return fmt.Errorf("manifest topic %q partition %d has no active persisted log", definition.Name, partition)
+			}
+		}
+	}
+	return nil
 }
 
 // PersistedTopicStorageNames returns topic directories that contain partition

@@ -1,5 +1,6 @@
 APP_NAME := cursus
 CLI_NAME := cursus-cli
+STORAGE_NAME := cursus-storage
 
 GO := go
 GOLINT := golangci-lint
@@ -158,7 +159,7 @@ bench-serialize:
 	$(GO) test ./pkg/disk/ -bench=BenchmarkSerializeDiskMessage -benchmem -count=5 -timeout=60s
 
 .PHONY: build
-build: build-api build-cli
+build: build-api build-cli build-storage
 
 .PHONY: build-api
 build-api:
@@ -170,11 +171,17 @@ build-cli:
 	@echo "Building CLI..."
 	CGO_ENABLED=0 $(GO) build $(BUILD_FLAGS) -o bin/$(CLI_NAME) ./cmd/cli
 
+.PHONY: build-storage
+build-storage:
+	@echo "Building storage maintenance CLI..."
+	CGO_ENABLED=0 $(GO) build $(BUILD_FLAGS) -o bin/$(STORAGE_NAME) ./cmd/storage
+
 .PHONY: build-linux
 build-linux:
 	@echo "Building for Linux..."
 	CGO_ENABLED=0 GOOS=linux $(GO) build $(BUILD_FLAGS) -o bin/$(APP_NAME)-linux ./cmd/broker
 	CGO_ENABLED=0 GOOS=linux $(GO) build $(BUILD_FLAGS) -o bin/$(CLI_NAME)-linux ./cmd/cli
+	CGO_ENABLED=0 GOOS=linux $(GO) build $(BUILD_FLAGS) -o bin/$(STORAGE_NAME)-linux ./cmd/storage
 
 .PHONY: clean
 clean:
@@ -220,6 +227,7 @@ help:
 	@echo "  make bench-disk      Run disk I/O benchmarks (Go test)"
 	@echo "  make bench-serialize Run serialization benchmarks"
 	@echo "  make build           Build all binaries for current OS"
+	@echo "  make build-storage   Build the storage maintenance CLI"
 	@echo "  make build-linux     Cross-compile for Linux amd64"
 	@echo "  make clean           Remove build artifacts"
 	@echo "  make run             Run broker in dev mode"
