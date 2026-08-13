@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
@@ -278,6 +279,9 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		}
 	}
 	for _, definition := range localDefinitions {
+		if definition.Name == config.ConsumerOffsetsTopicName {
+			continue
+		}
 		if restoredTopicState[definition.Name] == nil {
 			f.topicMaterialization[definition.Name] = TopicMaterializationIssue{
 				Topic: definition.Name, Operation: TopicMaterializationDelete, PendingSince: now,
@@ -285,6 +289,9 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		}
 	}
 	for _, name := range persistedTopicStorage {
+		if name == config.ConsumerOffsetsTopicName {
+			continue
+		}
 		if restoredTopicState[name] == nil {
 			f.topicMaterialization[name] = TopicMaterializationIssue{
 				Topic: name, Operation: TopicMaterializationDelete, PendingSince: now,
@@ -292,6 +299,9 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		}
 	}
 	for name, issue := range previousMaterialization {
+		if name == config.ConsumerOffsetsTopicName {
+			continue
+		}
 		if issue.Operation != TopicMaterializationDelete || restoredTopicState[name] != nil {
 			continue
 		}
