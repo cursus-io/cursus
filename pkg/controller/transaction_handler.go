@@ -790,6 +790,11 @@ func (ch *CommandHandler) ConfigureTransactionJournal(path string) error {
 		return err
 	}
 	ch.TxnManager.ImportState(state)
+	if ch.TxnManager.PruneExpired(time.Now()) > 0 {
+		if err := journal.Rewrite(ch.TxnManager.ExportState()); err != nil {
+			return fmt.Errorf("prune recovered transaction journal: %w", err)
+		}
+	}
 	ch.txnJournal = journal
 	return nil
 }
@@ -804,7 +809,13 @@ func (ch *CommandHandler) syncTransactionState(txnID string) error {
 		if ch.txnJournal == nil {
 			return nil
 		}
-		return ch.txnJournal.Append(snap)
+		if err := ch.txnJournal.Append(snap); err != nil {
+			return err
+		}
+		if ch.TxnManager.PruneExpired(time.Now()) > 0 {
+			return ch.txnJournal.Rewrite(ch.TxnManager.ExportState())
+		}
+		return nil
 	}
 	_, err := ch.applyViaLeader("TXN_SYNC", map[string]interface{}{"transaction": snap})
 	return err

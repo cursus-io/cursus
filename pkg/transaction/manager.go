@@ -101,14 +101,21 @@ func (m *Manager) pruneExpiredLocked(now time.Time) int {
 			removed++
 			continue
 		}
-		if expireTransactionLocked(tx, cutoff) {
+		if tx.Expired {
+			if tx.UpdatedAt.Before(cutoff) {
+				delete(m.txns, id)
+				removed++
+			}
+			continue
+		}
+		if expireTransactionLocked(tx, cutoff, now) {
 			removed++
 		}
 	}
 	return removed
 }
 
-func expireTransactionLocked(tx *Transaction, cutoff time.Time) bool {
+func expireTransactionLocked(tx *Transaction, cutoff, now time.Time) bool {
 	if tx == nil || tx.Expired || !tx.UpdatedAt.Before(cutoff) {
 		return false
 	}
@@ -120,6 +127,7 @@ func expireTransactionLocked(tx *Transaction, cutoff time.Time) bool {
 	tx.Ready = false
 	tx.Expired = true
 	tx.Revision++
+	tx.UpdatedAt = now
 	return true
 }
 
@@ -130,8 +138,9 @@ func (m *Manager) InitProducer(id string) (string, int64, error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := time.Now()
 	previous := m.txns[id]
-	expireTransactionLocked(previous, time.Now().Add(-m.expiration))
+	expireTransactionLocked(previous, now.Add(-m.expiration), now)
 
 	producer := producerIDForTransactionalID(id)
 	epoch := int64(0)
@@ -147,7 +156,6 @@ func (m *Manager) InitProducer(id string) (string, int64, error) {
 		revision = tx.Revision + 1
 	}
 
-	now := time.Now()
 	m.txns[id] = &Transaction{
 		ID:        id,
 		Producer:  producer,

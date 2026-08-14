@@ -97,6 +97,32 @@ func TestManagerPreservesProducerEpochWhenExpiredIDIsReinitialized(t *testing.T)
 		t.Fatalf("expired transactional ID reused stale identity producer=%s epoch=%d", producer, epoch)
 	}
 }
+
+func TestManagerDeletesExpiredEpochTombstoneAfterSecondRetentionWindow(t *testing.T) {
+	m := NewManagerWithExpiration(time.Hour)
+	old := time.Now().Add(-2 * time.Hour)
+	m.ApplySnapshot(&Snapshot{
+		ID:        "tx-expired",
+		Producer:  "producer-tx-expired",
+		Epoch:     7,
+		Revision:  20,
+		State:     StateCommitted,
+		CreatedAt: old,
+		UpdatedAt: old,
+	})
+
+	firstPrune := time.Now()
+	if changed := m.PruneExpired(firstPrune); changed != 1 {
+		t.Fatalf("first prune changed %d transactions, want 1", changed)
+	}
+	if changed := m.PruneExpired(firstPrune.Add(2 * time.Hour)); changed != 1 {
+		t.Fatalf("second prune changed %d transactions, want 1", changed)
+	}
+	if _, ok := m.ExportState()["tx-expired"]; ok {
+		t.Fatal("expired epoch tombstone was retained after its retention window")
+	}
+}
+
 func TestManagerInitializationDoesNotExpireUnrelatedTransactionalIDs(t *testing.T) {
 	m := NewManagerWithExpiration(time.Hour)
 	old := time.Now().Add(-2 * time.Hour)
