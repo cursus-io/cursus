@@ -98,7 +98,7 @@ func TestPartition_Basic(t *testing.T) {
 	t.Run("Enqueue", func(t *testing.T) {
 		msg := types.Message{Payload: "msg1"}
 		mh.On("AppendMessage", "test-topic", 0, mock.Anything).Return(uint64(10), nil).Once()
-		p.Enqueue(msg)
+		assert.NoError(t, p.Enqueue(msg))
 
 		assert.Eventually(t, func() bool {
 			return p.NextOffset() == 11

@@ -1,6 +1,14 @@
 {{- if ne (int .Values.replicaCount) 1 }}
 {{- fail "the Deployment chart supports exactly one standalone replica; use an explicit distributed StatefulSet topology for clustering" }}
 {{- end }}
+{{- if .Values.tls.enabled }}
+{{- if ne .Values.tls.certPath "/app/tls/cert.pem" }}
+{{- fail "tls.certPath must be /app/tls/cert.pem because the TLS Secret is mounted at /app/tls" }}
+{{- end }}
+{{- if ne .Values.tls.keyPath "/app/tls/key.pem" }}
+{{- fail "tls.keyPath must be /app/tls/key.pem because the TLS Secret is mounted at /app/tls" }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1  
 kind: Deployment  
 metadata:  

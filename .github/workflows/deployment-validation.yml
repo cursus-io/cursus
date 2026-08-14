@@ -10,14 +10,20 @@ on:
       - 'cmd/**'
       - 'pkg/**'
       - 'manifests/helm/**'
+      - 'test/**'
       - 'go.mod'
       - 'go.sum'
+
+permissions:
+  contents: read
 
 jobs:
   helm:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: azure/setup-helm@v4
       - name: Lint and render standalone chart
         run: |
@@ -27,10 +33,14 @@ jobs:
             echo 'rendered chart contains placeholder credentials'
             exit 1
           fi
-      - name: Reject unsafe shared-PVC replicas
+      - name: Reject unsafe deployment overrides
         run: |
           if helm template cursus manifests/helm --set replicaCount=2; then
             echo 'chart unexpectedly accepted more than one standalone replica'
+            exit 1
+          fi
+          if helm template cursus manifests/helm --set tls.enabled=true --set tls.certPath=/tmp/cert.pem; then
+            echo 'chart unexpectedly accepted a TLS certificate path outside the mounted Secret'
             exit 1
           fi
 
@@ -38,6 +48,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Build production image without publishing
         run: docker build --tag cursus:pr-validation .
 
@@ -46,6 +58,8 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v7
         with:
           go-version: '1.26.2'
