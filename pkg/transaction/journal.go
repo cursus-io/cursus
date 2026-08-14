@@ -291,7 +291,7 @@ func (j *Journal) loadLocked() (map[string]*Snapshot, error) {
 	j.loaded = true
 	j.latest = latest
 	j.records = records
-	return latest, nil
+	return cloneJournalState(latest), nil
 }
 
 func (j *Journal) repairTail(file *os.File, offset int64, latest map[string]*Snapshot, records int) (map[string]*Snapshot, error) {
@@ -302,7 +302,26 @@ func (j *Journal) repairTail(file *os.File, offset int64, latest map[string]*Sna
 	j.loaded = true
 	j.latest = latest
 	j.records = records
-	return latest, nil
+	return cloneJournalState(latest), nil
+}
+
+func cloneJournalState(state map[string]*Snapshot) map[string]*Snapshot {
+	cloned := make(map[string]*Snapshot, len(state))
+	for id, snap := range state {
+		if snap == nil {
+			continue
+		}
+		copySnapshot := *snap
+		copySnapshot.Messages = append([]MessageOperation(nil), snap.Messages...)
+		for i := range copySnapshot.Messages {
+			message := &copySnapshot.Messages[i].Message
+			message.ControlBatchKey = append([]byte(nil), message.ControlBatchKey...)
+			message.ControlBatchValue = append([]byte(nil), message.ControlBatchValue...)
+		}
+		copySnapshot.Offsets = append([]OffsetOperation(nil), snap.Offsets...)
+		cloned[id] = &copySnapshot
+	}
+	return cloned
 }
 
 func decodeJournalSnapshot(payload []byte) (*Snapshot, error) {

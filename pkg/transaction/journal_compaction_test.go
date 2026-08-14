@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/cursus-io/cursus/pkg/types"
 )
 
 func TestJournalCompactionKeepsLatestSnapshotPerID(t *testing.T) {
@@ -80,5 +82,43 @@ func TestJournalRewriteDoesNotResurrectRemovedTransactions(t *testing.T) {
 	}
 	if got := state["active"]; got == nil || got.Revision != keep.Revision {
 		t.Fatalf("active transaction = %+v, want revision %d", got, keep.Revision)
+	}
+}
+
+func TestJournalLoadReturnsIsolatedState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transactions.journal")
+	journal, err := OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := testJournalSnapshot("isolated", 3, StateOpen)
+	snapshot.Offsets = []OffsetOperation{{Topic: "orders", Group: "workers", Partition: 0, Offset: 11}}
+	snapshot.Messages = []MessageOperation{{
+		Topic:     "orders",
+		Partition: 0,
+		Message: types.Message{
+			Payload:           "original",
+			ControlBatchKey:   []byte{1, 2},
+			ControlBatchValue: []byte{3, 4},
+		},
+	}}
+	if err := journal.Append(snapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := journal.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded["isolated"].Revision = 99
+	loaded["isolated"].Offsets[0].Offset = 99
+	loaded["isolated"].Messages[0].Message.Payload = "mutated"
+	loaded["isolated"].Messages[0].Message.ControlBatchKey[0] = 99
+
+	private := journal.latest["isolated"]
+	if private.Revision != 3 || private.Offsets[0].Offset != 11 ||
+		private.Messages[0].Message.Payload != "original" ||
+		private.Messages[0].Message.ControlBatchKey[0] != 1 {
+		t.Fatalf("caller mutated private journal state: %+v", private)
 	}
 }

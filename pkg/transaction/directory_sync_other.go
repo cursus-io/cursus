@@ -9,6 +9,8 @@ import (
 )
 
 func syncJournalDirectory(path string) error {
+	// #nosec G304 -- path is the parent of the operator-configured journal
+	// opened by OpenJournal; this helper only fsyncs that already-selected directory.
 	dir, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open transaction journal directory for sync: %w", err)

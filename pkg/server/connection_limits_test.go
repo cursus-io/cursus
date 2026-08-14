@@ -68,3 +68,34 @@ func TestConnectionLimiterCapsAcceptedAndActiveConnections(t *testing.T) {
 	limiter.Release()
 	limiter.Release()
 }
+
+func TestLimitedConnectionHoldsSlotUntilSocketClose(t *testing.T) {
+	limiter := newConnectionLimiter(1)
+	if err := limiter.Acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() { _ = clientConn.Close() })
+	conn := newLimitedConnection(serverConn, limiter.Release)
+
+	blockedCtx, cancelBlocked := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelBlocked()
+	if err := limiter.Acquire(blockedCtx); err == nil {
+		t.Fatal("slot was released before the transferred socket closed")
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	availableCtx, cancelAvailable := context.WithTimeout(context.Background(), time.Second)
+	defer cancelAvailable()
+	if err := limiter.Acquire(availableCtx); err != nil {
+		t.Fatalf("slot was not released when socket closed: %v", err)
+	}
+	limiter.Release()
+}

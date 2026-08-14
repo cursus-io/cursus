@@ -184,6 +184,11 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	}
 
 	globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
+	defer func() {
+		if err := globalCH.Close(); err != nil {
+			util.Error("Failed to close command handler: %v", err)
+		}
+	}()
 	if !cfg.EnabledDistribution {
 		journalPath := filepath.Join(cfg.LogDir, "__transaction_state.journal")
 		if err := globalCH.ConfigureTransactionJournal(journalPath); err != nil {
@@ -197,9 +202,11 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		cc.SetLocalProcessor(globalCH)
 	}
 	if cfg.EnabledDistribution && cfg.InternalBrokerPort > 0 {
-		if err := startInternalBrokerListener(ctx, cfg, globalCH); err != nil {
+		shutdownInternal, err := startInternalBrokerListener(ctx, cfg, globalCH)
+		if err != nil {
 			return err
 		}
+		defer shutdownInternal()
 	}
 	if err := globalCH.RecoverPreparedTransactions(); err != nil {
 		return fmt.Errorf("failed to recover prepared transactions: %w", err)
@@ -258,7 +265,6 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			defer workerWG.Done()
 			for conn := range workerCh {
 				handleConn(ctx, conn, globalCH)
-				connectionSlots.Release()
 			}
 		}()
 	}
@@ -267,9 +273,6 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		cancel()
 		close(workerCh)
 		workerWG.Wait()
-		if err := globalCH.Close(); err != nil {
-			util.Error("Failed to close command handler: %v", err)
-		}
 	}()
 
 	var temporaryDelay time.Duration
@@ -303,6 +306,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			continue
 		}
 		temporaryDelay = 0
+		conn = newLimitedConnection(conn, connectionSlots.Release)
 		select {
 		case workerCh <- conn:
 		case <-ctx.Done():
@@ -318,7 +322,7 @@ func closeListenerOnDone(ctx context.Context, ln net.Listener) {
 	_ = ln.Close()
 }
 
-func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHandler *controller.CommandHandler) error {
+func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHandler *controller.CommandHandler) (func(), error) {
 	addr := fmt.Sprintf(":%d", cfg.InternalBrokerPort)
 	var ln net.Listener
 	var err error
@@ -328,52 +332,63 @@ func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHan
 		ln, err = net.Listen("tcp", addr)
 	}
 	if err != nil {
-		return fmt.Errorf("failed to start internal broker listener on %s: %w", addr, err)
+		return nil, fmt.Errorf("failed to start internal broker listener on %s: %w", addr, err)
 	}
 
 	util.Info("🔒 Internal broker listener started on %s (mTLS=%v)", addr, cfg.InternalUseTLS)
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-	}()
+	internalCtx, cancel := context.WithCancel(ctx)
 	workerCount := maxClientConnections(cfg)
 	workerCh := make(chan net.Conn, workerCount)
 	connectionSlots := newConnectionLimiter(workerCount)
+	var workerWG sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
+		workerWG.Add(1)
 		go func() {
+			defer workerWG.Done()
 			for conn := range workerCh {
-				handleInternalConn(ctx, conn, cmdHandler)
-				connectionSlots.Release()
+				handleInternalConn(internalCtx, conn, cmdHandler)
 			}
 		}()
 	}
+	var acceptWG sync.WaitGroup
+	acceptWG.Add(1)
 	go func() {
 		defer close(workerCh)
+		defer acceptWG.Done()
 		for {
-			if err := connectionSlots.Acquire(ctx); err != nil {
+			if err := connectionSlots.Acquire(internalCtx); err != nil {
 				return
 			}
 			conn, err := ln.Accept()
 			if err != nil {
 				connectionSlots.Release()
 				select {
-				case <-ctx.Done():
+				case <-internalCtx.Done():
 					return
 				default:
 					util.Error("⚠️ Internal accept error: %v", err)
 					continue
 				}
 			}
+			conn = newLimitedConnection(conn, connectionSlots.Release)
 			select {
 			case workerCh <- conn:
 			default:
 				util.Warn("⚠️ Internal worker pool saturated; closing connection from %s", conn.RemoteAddr())
 				_ = conn.Close()
-				connectionSlots.Release()
 			}
 		}
 	}()
-	return nil
+	var shutdownOnce sync.Once
+	shutdown := func() {
+		shutdownOnce.Do(func() {
+			cancel()
+			_ = ln.Close()
+			acceptWG.Wait()
+			workerWG.Wait()
+		})
+	}
+	return shutdown, nil
 }
 
 func handleInternalConn(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler) {
@@ -531,6 +546,29 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 
 type connectionLimiter struct {
 	slots chan struct{}
+}
+
+type limitedConnection struct {
+	net.Conn
+	release   func()
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newLimitedConnection(conn net.Conn, release func()) net.Conn {
+	return &limitedConnection{Conn: conn, release: release}
+}
+
+func (c *limitedConnection) Close() error {
+	c.closeOnce.Do(func() {
+		if c.Conn != nil {
+			c.closeErr = c.Conn.Close()
+		}
+		if c.release != nil {
+			c.release()
+		}
+	})
+	return c.closeErr
 }
 
 func newConnectionLimiter(limit int) *connectionLimiter {
