@@ -74,6 +74,10 @@ type DiskHandler struct {
 	// appendMu serializes automatic offset allocation through its write.
 	appendMu sync.Mutex
 
+	writeFailureMu sync.RWMutex
+	writeFailure   error
+	syncFileFn     func(*os.File) error
+
 	file   *os.File
 	writer *bufio.Writer
 
@@ -94,6 +98,36 @@ func (d *DiskHandler) notifySync(offset uint64) {
 	if callback != nil {
 		callback(offset)
 	}
+}
+
+func (d *DiskHandler) syncFile(file *os.File) error {
+	if d.syncFileFn != nil {
+		return d.syncFileFn(file)
+	}
+	return file.Sync()
+}
+
+func (d *DiskHandler) markWriteUnavailable(err error) error {
+	if err == nil {
+		return nil
+	}
+	d.writeFailureMu.Lock()
+	if d.writeFailure == nil {
+		d.writeFailure = err
+	}
+	failure := d.writeFailure
+	d.writeFailureMu.Unlock()
+	return fmt.Errorf("disk handler write unavailable until restart: %w", failure)
+}
+
+func (d *DiskHandler) writeAvailabilityError() error {
+	d.writeFailureMu.RLock()
+	failure := d.writeFailure
+	d.writeFailureMu.RUnlock()
+	if failure == nil {
+		return nil
+	}
+	return fmt.Errorf("disk handler write unavailable until restart: %w", failure)
 }
 
 func (d *DiskHandler) GetActiveReaders() int32 {
@@ -338,6 +372,9 @@ func (d *DiskHandler) AppendMessageWithOffset(topic string, partition int, msg *
 func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Message) (uint64, error) {
 	if partition < 0 || partition > math.MaxInt32 {
 		return 0, fmt.Errorf("partition out of int32 range: %d", partition)
+	}
+	if err := d.writeAvailabilityError(); err != nil {
+		return 0, err
 	}
 	d.appendMu.Lock()
 	defer d.appendMu.Unlock()

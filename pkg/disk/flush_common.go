@@ -64,10 +64,14 @@ func (d *DiskHandler) flushLoop() {
 			}
 			d.ioMu.Lock()
 			if d.writer != nil {
-				_ = d.writer.Flush()
+				if err := d.writer.Flush(); err != nil {
+					_ = d.markWriteUnavailable(fmt.Errorf("flush on request: %w", err))
+				}
 			}
 			if d.file != nil {
-				_ = d.file.Sync()
+				if err := d.syncFile(d.file); err != nil {
+					_ = d.markWriteUnavailable(fmt.Errorf("sync on request: %w", err))
+				}
 			}
 			d.ioMu.Unlock()
 			close(done)
@@ -108,10 +112,11 @@ func (d *DiskHandler) syncLoop() {
 			syncSuccess := false
 
 			if d.file != nil {
-				if err := d.file.Sync(); err == nil {
+				if err := d.syncFile(d.file); err == nil {
 					syncSuccess = true
 				} else {
 					util.Error("failed to sync data file: %v", err)
+					_ = d.markWriteUnavailable(fmt.Errorf("periodic data sync: %w", err))
 					syncSuccess = false
 				}
 			}
@@ -119,6 +124,7 @@ func (d *DiskHandler) syncLoop() {
 			if d.indexFile != nil {
 				if err := d.indexFile.Sync(); err != nil {
 					util.Error("failed to sync index file: %v", err)
+					_ = d.markWriteUnavailable(fmt.Errorf("periodic index sync: %w", err))
 					syncSuccess = false
 				}
 			}
@@ -139,6 +145,9 @@ func (d *DiskHandler) syncLoop() {
 func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 	if len(batch) == 0 {
 		return nil
+	}
+	if err := d.writeAvailabilityError(); err != nil {
+		return err
 	}
 
 	interval := d.indexInterval
@@ -260,6 +269,9 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	if partition < 0 || partition > math.MaxInt32 {
 		return fmt.Errorf("partition out of int32 range: %d", partition)
 	}
+	if err := d.writeAvailabilityError(); err != nil {
+		return err
+	}
 
 	interval := d.indexInterval
 	if interval == 0 {
@@ -337,8 +349,8 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	}
 	// WriteDirect backs acknowledged application writes, follower replication,
 	// and consumer metadata. All must cross the filesystem sync boundary.
-	if err := d.file.Sync(); err != nil {
-		return fmt.Errorf("sync disk log: %w", err)
+	if err := d.syncFile(d.file); err != nil {
+		return d.markWriteUnavailable(fmt.Errorf("sync disk log: %w", err))
 	}
 
 	d.CurrentOffset += totalLen
@@ -362,7 +374,7 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 			}
 			if d.internalMetadata && d.indexFile != nil {
 				if err := d.indexFile.Sync(); err != nil {
-					return fmt.Errorf("sync internal metadata index: %w", err)
+					return d.markWriteUnavailable(fmt.Errorf("sync internal metadata index: %w", err))
 				}
 			}
 			d.lastIndexPosition = msgPosition
