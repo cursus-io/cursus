@@ -122,7 +122,7 @@ func TestChaosTransactionCoordinatorRestartPreservesAtomicVisibility(t *testing.
 		t.Fatalf("unexpected transaction coordinator %q", coordinatorID)
 	}
 	txnClient.Close()
-	actions.StopBroker(coordinatorNode)
+	actions.KillBroker(coordinatorNode)
 	actions.StartBroker(coordinatorNode)
 
 	recoveryClient := e2e.NewBrokerClient(ctx.GetBrokerAddrs())
