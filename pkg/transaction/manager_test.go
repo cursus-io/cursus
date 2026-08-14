@@ -432,3 +432,33 @@ func TestManagerPruneExpiredKeepsActiveTransactions(t *testing.T) {
 		t.Fatalf("expected committing transaction to remain: %v", err)
 	}
 }
+
+func TestManagerTreatsExactCommittingPredecessorAsIdempotent(t *testing.T) {
+	m := NewManager()
+	producer, epoch := beginInitialized(t, m, "tx-predecessor-retry")
+	if _, err := m.PrepareCommit("tx-predecessor-retry", producer, epoch); err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+	prepared := m.ExportState()["tx-predecessor-retry"]
+	committed, err := m.BuildCommittedSnapshot("tx-predecessor-retry")
+	if err != nil {
+		t.Fatalf("build committed snapshot: %v", err)
+	}
+	if err := m.ApplyReplicatedSnapshot(committed); err != nil {
+		t.Fatalf("apply committed snapshot: %v", err)
+	}
+	if err := m.ApplyReplicatedSnapshot(prepared); err != nil {
+		t.Fatalf("exact committing predecessor should be idempotent: %v", err)
+	}
+	tx, err := m.Status("tx-predecessor-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.State != StateCommitted || tx.Revision != committed.Revision {
+		t.Fatalf("predecessor retry regressed committed state: %+v", tx)
+	}
+	prepared.Offsets = append(prepared.Offsets, OffsetOperation{Topic: "other", Partition: 0, Offset: 1})
+	if err := m.ApplyReplicatedSnapshot(prepared); err == nil {
+		t.Fatal("different committing predecessor was accepted")
+	}
+}

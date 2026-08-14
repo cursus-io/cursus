@@ -280,6 +280,8 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 		if err != nil {
 			return fmt.Sprintf("ERROR: transaction_prepare_failed reason=%q", err.Error())
 		}
+	}
+	if tx.State == transaction.StateCommitting {
 		if err := ch.syncTransactionState(txnID); err != nil {
 			return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 		}
@@ -734,9 +736,9 @@ func (ch *CommandHandler) commitTransactionOffsets(ops []transaction.OffsetOpera
 		pairs = append(pairs, fmt.Sprintf("P%d:%d", op.Partition, op.Offset))
 	}
 
-	if ch.isDistributed() {
-		if ch.Cluster == nil || ch.Cluster.Router == nil {
-			return fmt.Errorf("distributed transaction offset commit requires coordinator router")
+	if ch.Config != nil && ch.Config.EnabledDistribution {
+		if ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.Cluster.Router == nil {
+			return fmt.Errorf("distributed transaction offset commit requires cluster coordinator router")
 		}
 		cmd := fmt.Sprintf(
 			"BATCH_COMMIT topic=%s group=%s member=%s generation=%d %s",
@@ -751,6 +753,9 @@ func (ch *CommandHandler) commitTransactionOffsets(ops []transaction.OffsetOpera
 			return fmt.Errorf("%s", resp)
 		}
 		return nil
+	}
+	if ch.Coordinator == nil {
+		return fmt.Errorf("transaction offset commit requires coordinator")
 	}
 	return ch.Coordinator.ValidateAndCommitOffsetsBulk(
 		scope.Group, scope.Topic, scope.Member, scope.Generation, items,
@@ -807,6 +812,9 @@ func (ch *CommandHandler) ConfigureTransactionJournal(path string) error {
 }
 
 func (ch *CommandHandler) syncTransactionState(txnID string) error {
+	if ch.transactionStateSyncHook != nil {
+		return ch.transactionStateSyncHook(txnID)
+	}
 	snapshots := ch.TxnManager.ExportState()
 	snap := snapshots[txnID]
 	if snap == nil {

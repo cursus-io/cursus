@@ -510,7 +510,29 @@ func (m *Manager) ApplyReplicatedSnapshot(snap *Snapshot) error {
 	if snapshotsEqual(current, snap) {
 		return nil
 	}
+	// A retried coordinator must re-propose its durable committing snapshot
+	// before applying records. If this replica has already applied the exact
+	// successor committed decision, the predecessor is an idempotent no-op;
+	// it must never regress the terminal state.
+	if committedSnapshotSucceeds(current, snap) {
+		return nil
+	}
 	return fmt.Errorf("stale transaction snapshot transactional_id=%s current_epoch=%d current_revision=%d incoming_epoch=%d incoming_revision=%d", snap.ID, current.Epoch, current.Revision, snap.Epoch, snap.Revision)
+}
+
+func committedSnapshotSucceeds(current *Transaction, incoming *Snapshot) bool {
+	return current != nil && incoming != nil &&
+		current.ID == incoming.ID &&
+		current.Producer == incoming.Producer &&
+		current.Epoch == incoming.Epoch &&
+		current.State == StateCommitted &&
+		incoming.State == StateCommitting &&
+		current.Revision == incoming.Revision+1 &&
+		current.Ready == incoming.Ready &&
+		current.Expired == incoming.Expired &&
+		current.CreatedAt.Equal(incoming.CreatedAt) &&
+		reflect.DeepEqual(current.Messages, incoming.Messages) &&
+		reflect.DeepEqual(current.Offsets, incoming.Offsets)
 }
 
 func snapshotIsNewer(current *Transaction, incoming *Snapshot) bool {

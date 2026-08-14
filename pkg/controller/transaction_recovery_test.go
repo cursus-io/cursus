@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -246,22 +247,56 @@ func TestTransactionAbortRetryDoesNotMoveOffsetsOrAppendAgain(t *testing.T) {
 func TestCommitTransactionOffsetsFailsClosedWithoutRouter(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
-	ch := NewCommandHandler(
-		nil,
-		cfg,
-		nil,
-		nil,
-		&clusterController.ClusterController{RaftManager: &replication.RaftReplicationManager{}},
-	)
-	t.Cleanup(func() { require.NoError(t, ch.Close()) })
-
-	err := ch.commitTransactionOffsets([]transaction.OffsetOperation{{
+	ops := []transaction.OffsetOperation{{
 		Topic:      "orders",
 		Group:      "workers",
 		Member:     "member-1",
 		Generation: 1,
 		Partition:  0,
 		Offset:     7,
-	}})
-	require.ErrorContains(t, err, "requires coordinator router")
+	}}
+
+	for name, cluster := range map[string]*clusterController.ClusterController{
+		"nil cluster":      nil,
+		"nil raft manager": {},
+		"nil router":       {RaftManager: &replication.RaftReplicationManager{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ch := NewCommandHandler(nil, cfg, nil, nil, cluster)
+			t.Cleanup(func() { require.NoError(t, ch.Close()) })
+			err := ch.commitTransactionOffsets(ops)
+			require.ErrorContains(t, err, "requires cluster coordinator router")
+		})
+	}
+}
+
+func TestEndTxnRetriesDurableCommittingSyncBeforeApply(t *testing.T) {
+	ch, tm, coord, _ := newDiskBackedTransactionHandler(t)
+	topicName := "txn-sync-retry-topic"
+	groupName := "txn-sync-retry-group"
+	memberID := "txn-sync-retry-member"
+	generation := prepareTransactionGroup(t, tm, coord, topicName, groupName, memberID)
+	producerID, epoch := initAndStageTransaction(t, ch, "tx-sync-retry", topicName, groupName, memberID, generation, 19)
+
+	syncCalls := 0
+	ch.transactionStateSyncHook = func(txnID string) error {
+		syncCalls++
+		tx, err := ch.TxnManager.Status(txnID)
+		require.NoError(t, err)
+		require.Equal(t, transaction.StateCommitting, tx.State)
+		if syncCalls == 1 {
+			return errors.New("injected durable sync failure")
+		}
+		return nil
+	}
+
+	cmd := fmt.Sprintf("END_TXN transactional_id=tx-sync-retry producerId=%s epoch=%d result=commit", producerID, epoch)
+	first := ch.HandleCommand(cmd, NewClientContext("", 0))
+	require.Contains(t, first, "transaction_sync_failed")
+	require.Empty(t, readCommittedPayloads(t, tm, topicName))
+
+	second := ch.HandleCommand(cmd, NewClientContext("", 0))
+	require.True(t, strings.HasPrefix(second, "OK "), second)
+	require.Equal(t, 2, syncCalls)
+	require.Equal(t, []string{"payload-tx-sync-retry"}, readCommittedPayloads(t, tm, topicName))
 }
