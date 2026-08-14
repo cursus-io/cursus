@@ -1,10 +1,12 @@
 package cluster
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/util"
@@ -35,20 +37,24 @@ type heartbeatRequest struct {
 }
 
 type ClusterServer struct {
-	sd controller.ServiceDiscovery
+	sd             controller.ServiceDiscovery
+	authToken      string
+	tlsConfig      *tls.Config
+	connectionSlot chan struct{}
+	requestTimeout time.Duration
 }
 
 func NewClusterServer(sd controller.ServiceDiscovery) *ClusterServer {
-	return &ClusterServer{sd: sd}
+	return NewSecureClusterServer(sd, "", nil)
 }
 
 func (h *ClusterServer) Start(addr string) (net.Listener, error) {
-	listener, err := net.Listen("tcp", addr)
+	listener, err := listenCluster(addr, h.tlsConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	util.Info("TCP cluster server listening at %s", addr)
+	util.Info("TCP cluster server listening at %s (TLS=%v)", addr, h.tlsConfig != nil)
 
 	go func() {
 		for {
@@ -60,7 +66,15 @@ func (h *ClusterServer) Start(addr string) (net.Listener, error) {
 				util.Error("cluster accept error: %v", err)
 				continue
 			}
-			go h.handleConnection(conn)
+			select {
+			case h.connectionSlot <- struct{}{}:
+				go func() {
+					defer func() { <-h.connectionSlot }()
+					h.handleConnection(conn)
+				}()
+			default:
+				_ = conn.Close()
+			}
 		}
 	}()
 	return listener, nil
@@ -70,6 +84,10 @@ func (h *ClusterServer) handleConnection(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
 	for {
+		if err := conn.SetDeadline(time.Now().Add(h.requestTimeout)); err != nil {
+			return
+		}
+
 		data, err := util.ReadWithLength(conn)
 		if err != nil {
 			return
@@ -81,7 +99,12 @@ func (h *ClusterServer) handleConnection(conn net.Conn) {
 			return
 		}
 
-		util.Debug("cluster-server received connection: topic %s, payload %s", topic, payload)
+		payload, authorized := h.authenticate(payload)
+		if !authorized {
+			h.writeErrorResponse(conn, "unauthorized")
+			return
+		}
+		util.Debug("cluster-server received command: topic=%s command=%s", topic, clusterCommandName(payload))
 
 		if strings.HasPrefix(payload, "JOIN_CLUSTER ") {
 			h.handleJoinCluster(conn, payload)

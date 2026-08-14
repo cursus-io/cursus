@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -72,25 +70,8 @@ func (c *Coordinator) commitOffsetForGroupLocked(gm *GroupMetadata, groupName, t
 		gm.OffsetRevisions[topic] = revision
 		return nil
 	}
-
-	offsetMsg := OffsetCommitMessage{
-		Group:     groupName,
-		Topic:     topic,
-		Partition: partition,
-		Offset:    offset,
-		Timestamp: time.Now(),
-	}
-	payload, err := json.Marshal(offsetMsg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal offset commit: %w", err)
-	}
-	if err := c.publishOffsetMessage(&types.Message{
-		ProducerID: "broker",
-		Payload:    string(payload),
-		Key:        groupName + "-" + topic + "-" + strconv.Itoa(partition),
-	}); err != nil {
-		return err
-	}
+	// Distributed commits are already durable in the Raft log and snapshot.
+	// Do not mirror them into an unbounded local compatibility log.
 	return gm.storeOffsetMonotonic(groupName, topic, partition, offset)
 }
 
@@ -180,19 +161,8 @@ func (c *Coordinator) commitOffsetsBulkForGroupLocked(gm *GroupMetadata, groupNa
 		gm.OffsetRevisions[topic] = revision
 		return nil
 	}
-
-	bulkMsg := BulkOffsetMsg{Group: groupName, Topic: topic, Offsets: offsets, Timestamp: time.Now()}
-	payload, err := json.Marshal(bulkMsg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal: %w", err)
-	}
-	if err := c.publishOffsetMessage(&types.Message{
-		ProducerID: "broker",
-		Payload:    string(payload),
-		Key:        fmt.Sprintf("%s-%s-bulk", groupName, topic),
-	}); err != nil {
-		return err
-	}
+	// Raft is authoritative in distributed mode; keep the local compatibility
+	// topic read-only so it cannot grow without bound.
 	for _, item := range offsets {
 		gm.storeOffset(topic, item.Partition, item.Offset)
 	}

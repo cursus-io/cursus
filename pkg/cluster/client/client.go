@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -12,13 +13,37 @@ import (
 )
 
 type TCPClusterClient struct {
-	timeout time.Duration
+	timeout   time.Duration
+	authToken string
+	tlsConfig *tls.Config
 }
 
 func NewTCPClusterClient() *TCPClusterClient {
+	return NewSecureTCPClusterClient("", nil)
+}
+
+func NewSecureTCPClusterClient(authToken string, tlsConfig *tls.Config) *TCPClusterClient {
 	return &TCPClusterClient{
-		timeout: 5 * time.Second,
+		timeout:   5 * time.Second,
+		authToken: authToken,
+		tlsConfig: tlsConfig,
 	}
+}
+
+func (c *TCPClusterClient) secureCommand(command string) string {
+	if c.authToken == "" {
+		return command
+	}
+	return "AUTH " + c.authToken + " " + command
+}
+
+func (c *TCPClusterClient) dialContext(ctx context.Context, address string) (net.Conn, error) {
+	dialer := &net.Dialer{}
+	if c.tlsConfig == nil {
+		return dialer.DialContext(ctx, "tcp", address)
+	}
+	tlsDialer := &tls.Dialer{NetDialer: dialer, Config: c.tlsConfig.Clone()}
+	return tlsDialer.DialContext(ctx, "tcp", address)
 }
 
 func (c *TCPClusterClient) StartHeartbeat(ctx context.Context, peers []string, nodeID, localAddr string, discoveryPort int) {
@@ -31,13 +56,13 @@ func (c *TCPClusterClient) StartHeartbeat(ctx context.Context, peers []string, n
 				return
 			case <-ticker.C:
 				// sendHeartbeat internal loop uses goroutines now
-				_ = c.sendHeartbeat(peers, nodeID, localAddr, discoveryPort)
+				_ = c.sendHeartbeat(ctx, peers, nodeID, localAddr, discoveryPort)
 			}
 		}
 	}()
 }
 
-func (c *TCPClusterClient) sendHeartbeat(peers []string, nodeID, localAddr string, discoveryPort int) error {
+func (c *TCPClusterClient) sendHeartbeat(ctx context.Context, peers []string, nodeID, localAddr string, discoveryPort int) error {
 	apiPort := discoveryPort
 	if apiPort == 0 {
 		apiPort = 8000
@@ -71,7 +96,9 @@ func (c *TCPClusterClient) sendHeartbeat(peers []string, nodeID, localAddr strin
 			target := net.JoinHostPort(host, fmt.Sprintf("%d", apiPort))
 
 			// Use short timeout for heartbeat connection
-			conn, err := net.DialTimeout("tcp", target, 1*time.Second)
+			heartbeatCtx, cancel := context.WithTimeout(ctx, time.Second)
+			conn, err := c.dialContext(heartbeatCtx, target)
+			cancel()
 			if err != nil {
 				return
 			}
@@ -79,7 +106,7 @@ func (c *TCPClusterClient) sendHeartbeat(peers []string, nodeID, localAddr strin
 
 			// Set a write deadline to prevent goroutine buildup on slow connections
 			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-			_ = util.WriteWithLength(conn, util.EncodeMessage("cluster", cmd))
+			_ = util.WriteWithLength(conn, util.EncodeMessage("cluster", c.secureCommand(cmd)))
 		}(peer)
 	}
 	return nil
@@ -142,8 +169,7 @@ func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, lo
 	body, _ := json.Marshal(payload)
 	joinCmd := fmt.Sprintf("JOIN_CLUSTER %s", string(body))
 
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	conn, err := c.dialContext(ctx, addr)
 	if err != nil {
 		return err
 	}
@@ -156,7 +182,7 @@ func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, lo
 		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	}
 
-	if err := util.WriteWithLength(conn, util.EncodeMessage("cluster", joinCmd)); err != nil {
+	if err := util.WriteWithLength(conn, util.EncodeMessage("cluster", c.secureCommand(joinCmd))); err != nil {
 		return err
 	}
 

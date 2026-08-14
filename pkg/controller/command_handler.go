@@ -242,6 +242,18 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string) string {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
 
+	if ch.isDistributed() {
+		_, err := ch.applyViaLeader("GROUP_SYNC", map[string]interface{}{
+			"type":            "REGISTER",
+			"group":           groupName,
+			"topic":           topicName,
+			"partition_count": len(t.Partitions),
+		})
+		if err != nil {
+			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
+		}
+		return fmt.Sprintf("OK group=%s topic=%s registered=true", groupName, topicName)
+	}
 	if ch.Coordinator != nil {
 		if err := ch.Coordinator.RegisterGroup(topicName, groupName, len(t.Partitions)); err != nil {
 			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())

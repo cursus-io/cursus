@@ -111,7 +111,7 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	}
 
 	bindAddr := fmt.Sprintf("0.0.0.0:%d", cfg.RaftPort)
-	transport, err := raft.NewTCPTransport(bindAddr, advertiseTCPAddr, 3, 10*time.Second, os.Stderr)
+	transport, err := newRaftNetworkTransport(cfg, bindAddr, advertiseTCPAddr)
 	if err != nil {
 		_ = raftStore.Close()
 		util.Error("Failed to create raft transport: %v", err)
@@ -121,6 +121,7 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	r, err := raft.NewRaft(raftCfg, brokerFSM, raftStore, raftStore, snapshots, transport)
 	if err != nil {
 		_ = raftStore.Close()
+		_ = transport.Close()
 		util.Error("Failed to create raft instance: %v", err)
 		return nil, fmt.Errorf("failed to create raft: %w", err)
 	}

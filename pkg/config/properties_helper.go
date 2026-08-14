@@ -133,6 +133,12 @@ func (cfg *Config) Normalize() {
 	if cfg.ConsumerHeartbeatCheckMS >= cfg.ConsumerSessionTimeoutMS {
 		cfg.ConsumerHeartbeatCheckMS = cfg.ConsumerSessionTimeoutMS / 2
 	}
+	if cfg.MaxClientConnections <= 0 {
+		cfg.MaxClientConnections = 1000
+	}
+	if cfg.ClientIdleTimeoutMS <= 0 {
+		cfg.ClientIdleTimeoutMS = 60000
+	}
 	for i := range cfg.StaticConsumerGroups {
 		g := &cfg.StaticConsumerGroups[i]
 		if strings.TrimSpace(g.Name) == "" {
