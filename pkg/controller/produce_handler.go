@@ -260,7 +260,6 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 
 		messageData.Messages = appended
 		assignedOffset := appended[len(appended)-1].Offset
-		p.FlushDisk()
 
 		minISR := ch.Config.MinInSyncReplicas
 		if minISR < 1 {
@@ -392,7 +391,6 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 		if err := p.ReplicaAppend(msgCmd.Messages); err != nil {
 			return fmt.Sprintf("ERROR: replica_append_failed reason=%q", err.Error())
 		}
-		p.FlushDisk()
 	}
 	if msgCmd.CommitHWM != nil {
 		if t.IsEventSourcing && ch.ESHandler != nil {
@@ -525,7 +523,6 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 
 		lastOffset = appended[len(appended)-1].Offset
 
-		p.FlushDisk()
 		minISR := ch.Config.MinInSyncReplicas
 		if minISR < 1 {
 			minISR = 1
