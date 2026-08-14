@@ -154,6 +154,9 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 		if err != nil {
 			return fmt.Errorf("serialize failed at index %d: %w", i, err)
 		}
+		if err := validateSerializedDiskMessageSize(serialized); err != nil {
+			return fmt.Errorf("message at index %d: %w", i, err)
+		}
 		if _, ok := util.SafeIntToUint32(len(serialized)); !ok {
 			return fmt.Errorf("message too large at index %d: %d bytes", i, len(serialized))
 		}
@@ -295,6 +298,9 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	if err != nil {
 		return fmt.Errorf("serialize failed: %w", err)
 	}
+	if err := validateSerializedDiskMessageSize(serialized); err != nil {
+		return err
+	}
 
 	serLen, ok := util.SafeIntToUint32(len(serialized))
 	if !ok {
@@ -329,13 +335,10 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	if err := d.writer.Flush(); err != nil {
 		return fmt.Errorf("flush failed: %w", err)
 	}
-	if d.internalMetadata {
-		// Consumer metadata acknowledgements are a durable contract: do not
-		// expose a successful registration/commit until the authoritative log
-		// bytes have reached the filesystem sync boundary.
-		if err := d.file.Sync(); err != nil {
-			return fmt.Errorf("sync internal metadata log: %w", err)
-		}
+	// WriteDirect backs acknowledged application writes, follower replication,
+	// and consumer metadata. All must cross the filesystem sync boundary.
+	if err := d.file.Sync(); err != nil {
+		return fmt.Errorf("sync disk log: %w", err)
 	}
 
 	d.CurrentOffset += totalLen

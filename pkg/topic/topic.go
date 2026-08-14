@@ -326,8 +326,7 @@ func (t *Topic) Publish(msg types.Message) error {
 		return fmt.Errorf("no partitions available for topic '%s'", t.Name)
 	}
 
-	t.Partitions[idx].Enqueue(msg)
-	return nil
+	return t.Partitions[idx].Enqueue(msg)
 }
 
 func (t *Topic) PublishToPartition(partition int, msg types.Message) error {
@@ -338,8 +337,7 @@ func (t *Topic) PublishToPartition(partition int, msg types.Message) error {
 		return fmt.Errorf("partition %d out of range for topic '%s' (0-%d)", partition, t.Name, len(t.Partitions)-1)
 	}
 
-	t.Partitions[partition].Enqueue(msg)
-	return nil
+	return t.Partitions[partition].Enqueue(msg)
 }
 
 // PublishSync sends a message synchronously to one partition.

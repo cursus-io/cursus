@@ -8,7 +8,9 @@ import (
 	"net"
 )
 
-const MaxMessageSize = 64 * 1024 * 1024 // 64MB
+// MaxMessageSize is shared by wire framing and durable-record validation so a
+// broker never accepts a frame that its recovery path would reject.
+const MaxMessageSize = 16 * 1024 * 1024 // 16 MiB
 
 // WriteWithLength writes data with a 4-byte length prefix.
 func WriteWithLength(conn net.Conn, data []byte) error {

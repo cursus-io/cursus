@@ -20,7 +20,7 @@ import (
 	"golang.org/x/exp/mmap"
 )
 
-const MaxMessageSize = 16 * 1024 * 1024 // 16MB
+const MaxMessageSize = util.MaxMessageSize
 
 type DiskHandler struct {
 	BaseName       string
@@ -130,9 +130,10 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	}
 
 	internalMetadata := topicName == config.ConsumerOffsetsTopicName
+	standaloneInternalMetadata := internalMetadata && !cfg.EnabledDistribution
 	tempDh := &DiskHandler{BaseName: base}
 	preserveDeletedMetadata := false
-	if internalMetadata {
+	if standaloneInternalMetadata {
 		deleted, deletedErr := filepath.Glob(base + "_segment_*.deleted")
 		if deletedErr != nil {
 			return nil, fmt.Errorf("inspect internal metadata deleted segments: %w", deletedErr)
@@ -180,7 +181,7 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 				return nil, fmt.Errorf("critical: failed to parse last segment filename %s: %w", fileName, err)
 			}
 		}
-		if internalMetadata {
+		if standaloneInternalMetadata {
 			recovery, err = recoverActiveSegmentStrict(lastFile, tempDh.GetIndexPath(currentSegmentBase), currentSegmentBase)
 		} else {
 			recovery, err = recoverActiveSegment(lastFile, tempDh.GetIndexPath(currentSegmentBase), currentSegmentBase)
@@ -339,8 +340,8 @@ func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Mess
 		return 0, fmt.Errorf("partition out of int32 range: %d", partition)
 	}
 	d.appendMu.Lock()
-	offset := atomic.AddUint64(&d.AbsoluteOffset, 1) - 1
-	d.appendMu.Unlock()
+	defer d.appendMu.Unlock()
+	offset := atomic.LoadUint64(&d.AbsoluteOffset)
 
 	msg.Offset = offset
 	diskMsg := types.DiskMessage{
@@ -365,6 +366,9 @@ func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Mess
 		ControlBatchKey:              msg.ControlBatchKey,
 		ControlBatchValue:            msg.ControlBatchValue,
 	}
+	if err := validateDiskMessageSize(diskMsg); err != nil {
+		return 0, err
+	}
 
 	if d.writeTimeout > 0 {
 		timer := time.NewTimer(d.writeTimeout)
@@ -375,6 +379,7 @@ func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Mess
 			util.Debug("done channel closed for %s", d.BaseName)
 			return 0, fmt.Errorf("disk handler is shutting down")
 		case d.writeCh <- diskMsg:
+			atomic.StoreUint64(&d.AbsoluteOffset, offset+1)
 			return diskMsg.Offset, nil
 		case <-timer.C:
 			util.Error("enqueue timed out after %s for topic %s", d.writeTimeout, topic)
@@ -385,6 +390,7 @@ func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Mess
 		case <-d.done:
 			return 0, fmt.Errorf("disk handler is shutting down")
 		case d.writeCh <- diskMsg:
+			atomic.StoreUint64(&d.AbsoluteOffset, offset+1)
 			return diskMsg.Offset, nil
 		}
 	}
