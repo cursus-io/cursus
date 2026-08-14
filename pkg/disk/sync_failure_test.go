@@ -56,3 +56,39 @@ func segmentSize(t *testing.T, path string) int64 {
 	}
 	return info.Size()
 }
+
+func TestPostWriteFlushFailureMakesHandlerTerminalUntilRestart(t *testing.T) {
+	writes := map[string]func(*DiskHandler) error{
+		"direct": func(handler *DiskHandler) error {
+			return handler.WriteDirect("orders", 0, types.Message{Offset: 0, Payload: "first"})
+		},
+		"batch": func(handler *DiskHandler) error {
+			return handler.WriteBatch([]types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 0, Payload: "first"}})
+		},
+	}
+
+	for name, write := range writes {
+		t.Run(name, func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			cfg.LogDir = t.TempDir()
+			cfg.DiskFlushIntervalMS = 60_000
+			handler, err := NewDiskHandler(cfg, "orders", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = handler.Close() })
+			if err := handler.file.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			firstErr := write(handler)
+			if firstErr == nil || !strings.Contains(firstErr.Error(), "unavailable until restart") {
+				t.Fatalf("post-write failure = %v, want terminal unavailable error", firstErr)
+			}
+			secondErr := write(handler)
+			if secondErr == nil || !strings.Contains(secondErr.Error(), "unavailable until restart") {
+				t.Fatalf("retry after post-write failure = %v, want terminal unavailable error", secondErr)
+			}
+		})
+	}
+}

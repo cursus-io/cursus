@@ -215,7 +215,7 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 				}
 
 				if err := binary.Write(d.indexWriter, binary.BigEndian, entry); err != nil {
-					return fmt.Errorf("failed to write index entry for offset %d: %w", msg.Offset, err)
+					return d.markWriteUnavailable(fmt.Errorf("failed to write index entry for offset %d: %w", msg.Offset, err))
 				}
 
 				d.indexBytesWritten += entrySize
@@ -226,21 +226,21 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 		sLen, _ := util.SafeIntToUint32(len(serialized)) // validated in pre-loop
 		binary.BigEndian.PutUint32(lenBuf[:], sLen)
 		if _, err := d.writer.Write(lenBuf[:]); err != nil {
-			return fmt.Errorf("write length failed: %w", err)
+			return d.markWriteUnavailable(fmt.Errorf("write length failed: %w", err))
 		}
 		if _, err := d.writer.Write(serialized); err != nil {
-			return fmt.Errorf("write payload failed: %w", err)
+			return d.markWriteUnavailable(fmt.Errorf("write payload failed: %w", err))
 		}
 		accumulatedLen += uint64(4 + len(serialized))
 	}
 
 	if err := d.writer.Flush(); err != nil {
-		return fmt.Errorf("flush failed after batch: %w", err)
+		return d.markWriteUnavailable(fmt.Errorf("flush failed after batch: %w", err))
 	}
 
 	if d.indexWriter != nil {
 		if err := d.indexWriter.Flush(); err != nil {
-			return fmt.Errorf("flush index writer failed: %w", err)
+			return d.markWriteUnavailable(fmt.Errorf("flush index writer failed: %w", err))
 		}
 	}
 
@@ -339,13 +339,13 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	binary.BigEndian.PutUint32(lenBuf[:], serLen)
 
 	if _, err := d.writer.Write(lenBuf[:]); err != nil {
-		return err
+		return d.markWriteUnavailable(fmt.Errorf("write record length: %w", err))
 	}
 	if _, err := d.writer.Write(serialized); err != nil {
-		return err
+		return d.markWriteUnavailable(fmt.Errorf("write record payload: %w", err))
 	}
 	if err := d.writer.Flush(); err != nil {
-		return fmt.Errorf("flush failed: %w", err)
+		return d.markWriteUnavailable(fmt.Errorf("flush failed: %w", err))
 	}
 	// WriteDirect backs acknowledged application writes, follower replication,
 	// and consumer metadata. All must cross the filesystem sync boundary.
@@ -367,10 +367,10 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 		}
 		if d.indexWriter != nil {
 			if err := binary.Write(d.indexWriter, binary.BigEndian, indexEntry); err != nil {
-				return fmt.Errorf("failed to write index entry for offset %d: %w", msg.Offset, err)
+				return d.markWriteUnavailable(fmt.Errorf("failed to write index entry for offset %d: %w", msg.Offset, err))
 			}
 			if err := d.indexWriter.Flush(); err != nil {
-				return fmt.Errorf("failed to flush index writer: %w", err)
+				return d.markWriteUnavailable(fmt.Errorf("failed to flush index writer: %w", err))
 			}
 			if d.internalMetadata && d.indexFile != nil {
 				if err := d.indexFile.Sync(); err != nil {
