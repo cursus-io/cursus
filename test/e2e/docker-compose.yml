@@ -6,9 +6,9 @@ services:
     container_name: broker    
     command: ./broker    
     volumes:    
-      - ../config.yaml:/root/config.yaml    
+      - ../config.yaml:/app/config.yaml
     environment:    
-      - CONFIG_PATH=/root/config.yaml    
+      - CONFIG_PATH=/app/config.yaml
       - ADVERTISED_CLIENT_HOST=localhost
       - ADVERTISED_BROKER_PORT=10000
     ports:    

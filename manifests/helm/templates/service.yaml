@@ -2,20 +2,14 @@ apiVersion: v1
 kind: Service  
 metadata:  
   name: {{ include "cursus.fullname" . }}  
-spec:  
+  labels:
+    {{- include "cursus.labels" . | nindent 4 }}
+spec:
   type: {{ .Values.service.type }}  
   ports:  
     - port: {{ .Values.service.port }}  
       targetPort: broker  
       protocol: TCP  
       name: broker  
-    - port: {{ .Values.service.healthPort }}  
-      targetPort: health  
-      protocol: TCP  
-      name: health  
-    - port: {{ .Values.service.metricsPort }}  
-      targetPort: metrics  
-      protocol: TCP  
-      name: metrics  
   selector:  
      {{- include "cursus.selectorLabels" . | nindent 4 }}

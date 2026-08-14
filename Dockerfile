@@ -13,17 +13,17 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o 
 # Stage 2:
 FROM alpine:3.20
 
-WORKDIR /root/
-COPY --from=builder /app/broker .
-COPY --from=builder /app/cli .
-COPY --from=builder /app/cursus-storage .
-
 RUN apk add --no-cache bash curl
+RUN addgroup -g 1000 cursus && adduser -D -u 1000 -G cursus cursus
 
-RUN chmod +x broker cli cursus-storage
+WORKDIR /app
+COPY --from=builder --chown=cursus:cursus /app/broker /app/broker
+COPY --from=builder --chown=cursus:cursus /app/cli /app/cli
+COPY --from=builder --chown=cursus:cursus /app/cursus-storage /app/cursus-storage
+COPY --chown=cursus:cursus entrypoint.sh /app/entrypoint.sh
 
-COPY entrypoint.sh .
-RUN chmod +x entrypoint.sh
+RUN mkdir -p /data/logs && chown -R cursus:cursus /app /data && chmod +x /app/broker /app/cli /app/cursus-storage /app/entrypoint.sh
+USER cursus
 
-ENTRYPOINT ["/root/entrypoint.sh"]
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD []

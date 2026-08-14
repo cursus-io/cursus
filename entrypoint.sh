@@ -1,4 +1,8 @@
 #!/bin/bash
-set -e
+set -eu
 
-exec ./broker -config ./config.yaml
+if [ "${1:-}" = "./broker" ] || [ "${1:-}" = "broker" ]; then
+  shift
+fi
+
+exec /app/broker "$@"

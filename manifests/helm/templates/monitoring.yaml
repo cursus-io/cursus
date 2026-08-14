@@ -1,13 +1,34 @@
-{{- if .Values.monitoring.enabled }}  
-apiVersion: monitoring.coreos.com/v1  
-kind: ServiceMonitor  
-metadata:  
-  name: {{ include "cursus.fullname" . }}  
-spec:  
-  selector:  
-    matchLabels:  
-      app.kubernetes.io/name: {{ include "cursus.name" . }}  
-  endpoints:  
-    - port: metrics  
-      interval: 30s  
+{{- if .Values.monitoring.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cursus.fullname" . }}-monitoring
+  labels:
+    {{- include "cursus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: monitoring
+spec:
+  ports:
+    - name: health
+      port: {{ .Values.service.healthPort }}
+      targetPort: health
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+  selector:
+    {{- include "cursus.selectorLabels" . | nindent 4 }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "cursus.fullname" . }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "cursus.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: monitoring
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.monitoring.serviceMonitor.scrapeTimeout }}
 {{- end }}

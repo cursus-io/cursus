@@ -6,11 +6,11 @@ services:
     container_name: bench-broker
     command: ./broker
     volumes:
-      - ./config.yaml:/root/config.yaml
+      - ./config.yaml:/app/config.yaml
     tmpfs:
-      - /root/broker-logs
+      - /app/broker-logs
     environment:
-      - CONFIG_PATH=/root/config.yaml
+      - CONFIG_PATH=/app/config.yaml
     ports:
       - "9000:9000"
       - "9100:9100"

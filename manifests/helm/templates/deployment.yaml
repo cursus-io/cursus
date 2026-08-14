@@ -1,3 +1,6 @@
+{{- if ne (int .Values.replicaCount) 1 }}
+{{- fail "the Deployment chart supports exactly one standalone replica; use an explicit distributed StatefulSet topology for clustering" }}
+{{- end }}
 apiVersion: apps/v1  
 kind: Deployment  
 metadata:  
@@ -15,11 +18,9 @@ spec:
         {{- include "cursus.selectorLabels" . | nindent 8 }}  
       annotations:  
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}  
-        {{- if .Values.tls.enabled }}  
-        checksum/tls: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}  
-        {{- end }}  
     spec:  
       serviceAccountName: {{ include "cursus.serviceAccountName" . }}  
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:  
         {{- toYaml .Values.podSecurityContext | nindent 8 }}  
       containers:  
@@ -52,12 +53,22 @@ spec:
             - name: LOG_DIR  
               value: {{ .Values.persistence.logDir.path }}  
             {{- if .Values.tls.enabled }}  
+            - name: USE_TLS
+              value: "true"
             - name: TLS_CERT_PATH  
               value: {{ .Values.tls.certPath }}  
             - name: TLS_KEY_PATH  
               value: {{ .Values.tls.keyPath }}  
             {{- end }}  
-          livenessProbe:  
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: health
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: {{ .Values.startupProbeFailureThreshold }}
+
+          livenessProbe:
             httpGet:  
               path: /live
               port: health  
@@ -81,7 +92,7 @@ spec:
               subPath: config.yaml  
             {{- if .Values.tls.enabled }}  
             - name: tls  
-              mountPath: /root/tls  
+              mountPath: /app/tls
               readOnly: true  
             {{- end }}  
           resources:  
