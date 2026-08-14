@@ -231,29 +231,29 @@ func (p *Partition) updateProducerStateWithMode(msg *types.Message, force bool) 
 }
 
 // Enqueue pushes a message into the partition queue.
-func (p *Partition) Enqueue(msg types.Message) {
+func (p *Partition) Enqueue(msg types.Message) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.closed {
 		util.Warn("⚠️ Partition closed, dropping message [partition-%d]", p.id)
-		return
+		return fmt.Errorf("partition %d is closed", p.id)
 	}
 
 	duplicate, err := p.validateProducerMessage(&msg)
 	if err != nil {
 		util.Warn("Partition %d: rejecting message from producer %s: %v", p.id, msg.ProducerID, err)
-		return
+		return err
 	}
 	if duplicate {
 		util.Debug("Partition %d: skipping duplicate message from producer %s (epoch %d seq %d)", p.id, msg.ProducerID, msg.Epoch, msg.SeqNum)
-		return
+		return nil
 	}
 
 	offset, err := p.dh.AppendMessage(p.topic, p.id, &msg)
 	if err != nil {
 		util.Error("❌ Failed to enqueue message to disk [partition-%d]: %v", p.id, err)
-		return
+		return err
 	}
 
 	p.updateProducerState(&msg)
@@ -263,6 +263,7 @@ func (p *Partition) Enqueue(msg types.Message) {
 	p.setHWMLocked(offset + 1)
 
 	p.NotifyNewMessage()
+	return nil
 }
 
 func (p *Partition) EnqueueSync(msg types.Message) error {

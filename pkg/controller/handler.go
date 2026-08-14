@@ -32,12 +32,13 @@ type CommandHandler struct {
 	TxnManager    *transaction.Manager
 	commands      []commandEntry
 
-	coordCache            map[string]coordCacheEntry
-	coordCacheMu          sync.RWMutex
-	txnApplyMu            sync.Mutex
-	txnJournal            *transaction.Journal
-	transactionStateLocks [transactionStateLockStripes]sync.Mutex
-	partitionWriteLocks   sync.Map // map[string]*sync.Mutex
+	coordCache               map[string]coordCacheEntry
+	coordCacheMu             sync.RWMutex
+	txnApplyMu               sync.Mutex
+	txnJournal               *transaction.Journal
+	transactionStateSyncHook func(string) error
+	transactionStateLocks    [transactionStateLockStripes]sync.Mutex
+	partitionWriteLocks      sync.Map // map[string]*sync.Mutex
 }
 
 func (ch *CommandHandler) transactionStateLock(transactionalID string) *sync.Mutex {

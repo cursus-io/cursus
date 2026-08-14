@@ -10,6 +10,7 @@ func TestRetryableTransactionStateLagUsesStructuredCodes(t *testing.T) {
 		"ERROR: transaction_marker_partition_not_touched transactional_id=tx-1",
 		"ERROR: transaction_not_abortable transactional_id=tx-1",
 		"ERROR: producer_fenced transactional_id=tx-1",
+		"ERROR: broker_error reason=\"replication failed: replica broker-3 rejected append: ERROR: transaction_not_committing transactional_id=tx-1 state=open\"",
 	} {
 		if !isRetryableTransactionStateLag(response) {
 			t.Fatalf("state-lag response was not retryable: %s", response)
@@ -20,6 +21,7 @@ func TestRetryableTransactionStateLagUsesStructuredCodes(t *testing.T) {
 		"ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=t",
 		"ERROR: invalid_transaction_state state=committed",
 		"prefix transaction_not_committing",
+		"ERROR: broker_error reason=transaction_not_committing",
 	} {
 		if isRetryableTransactionStateLag(response) {
 			t.Fatalf("non-state-lag response was retryable: %s", response)

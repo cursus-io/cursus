@@ -348,12 +348,13 @@ func (f *BrokerFSM) applyJoinGroupCommand(jsonData string) interface{} {
 
 func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 	var cmd struct {
-		Type       string   `json:"type"`
-		Group      string   `json:"group"`
-		Member     string   `json:"member"`
-		Members    []string `json:"members"`
-		Topic      string   `json:"topic"`
-		Generation *int     `json:"generation"`
+		Type           string   `json:"type"`
+		Group          string   `json:"group"`
+		Member         string   `json:"member"`
+		Members        []string `json:"members"`
+		Topic          string   `json:"topic"`
+		Generation     *int     `json:"generation"`
+		PartitionCount int      `json:"partition_count"`
 	}
 
 	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
@@ -366,6 +367,23 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 	}
 
 	switch cmd.Type {
+	case "REGISTER":
+		if f.tm == nil {
+			return fmt.Errorf("topic manager not available in FSM")
+		}
+		t := f.tm.GetTopic(cmd.Topic)
+		if t == nil {
+			return fmt.Errorf("topic '%s' not found during group registration", cmd.Topic)
+		}
+		partitionCount := len(t.Partitions)
+		if cmd.PartitionCount > 0 && cmd.PartitionCount != partitionCount {
+			return fmt.Errorf("partition count mismatch for topic %s: requested=%d actual=%d", cmd.Topic, cmd.PartitionCount, partitionCount)
+		}
+		if err := f.cd.RegisterGroup(cmd.Topic, cmd.Group, partitionCount); err != nil {
+			return err
+		}
+		util.Info("FSM: Registered group %s for topic %s", cmd.Group, cmd.Topic)
+		return nil
 	case "JOIN":
 		if f.cd.GetGroup(cmd.Group) == nil {
 			if f.tm == nil {

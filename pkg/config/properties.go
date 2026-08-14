@@ -96,6 +96,10 @@ type Config struct {
 	ConsumerHeartbeatCheckMS int                   `yaml:"consumer_heartbeat_check_ms" json:"consumer.heartbeat.check.ms"`
 	StaticConsumerGroups     []ConsumerGroupConfig `yaml:"static_consumer_groups" json:"static_consumer_groups"`
 
+	// network
+	MaxClientConnections int `yaml:"max_client_connections" json:"max.client.connections"`
+	ClientIdleTimeoutMS  int `yaml:"client_idle_timeout_ms" json:"client.idle.timeout.ms"`
+
 	// stream
 	MaxStreamConnections    int           `yaml:"max_stream_connections" json:"max.stream.connections"`
 	StreamTimeout           time.Duration `yaml:"stream_timeout" json:"stream.timeout"`
@@ -104,20 +108,21 @@ type Config struct {
 	StreamCommitInterval time.Duration `yaml:"stream_commit_interval" json:"stream.commit.interval"`
 
 	// security
-	UseTLS                  bool `yaml:"use_tls" json:"tls.enable"`
-	TLSCert                 tls.Certificate
-	TLSCertPath             string `yaml:"tls_cert_path" json:"tls.cert_path"`
-	TLSKeyPath              string `yaml:"tls_key_path" json:"tls.key_path"`
-	InternalUseTLS          bool   `yaml:"internal_use_tls" json:"internal_tls.enable"`
-	InternalTLSCertPath     string `yaml:"internal_tls_cert_path" json:"internal_tls.cert_path"`
-	InternalTLSKeyPath      string `yaml:"internal_tls_key_path" json:"internal_tls.key_path"`
-	InternalTLSCAPath       string `yaml:"internal_tls_ca_path" json:"internal_tls.ca_path"`
-	InternalTLSServerName   string `yaml:"internal_tls_server_name" json:"internal_tls.server_name"`
-	InternalTLSCert         tls.Certificate
-	InternalTLSClientCAPool *x509.CertPool
-	InternalTLSRootCAPool   *x509.CertPool
-	EnableSASL              bool       `yaml:"enable_sasl" json:"sasl.enable"`
-	SASLUsers               []SASLUser `yaml:"sasl_users" json:"sasl.users"`
+	UseTLS                        bool `yaml:"use_tls" json:"tls.enable"`
+	TLSCert                       tls.Certificate
+	TLSCertPath                   string `yaml:"tls_cert_path" json:"tls.cert_path"`
+	TLSKeyPath                    string `yaml:"tls_key_path" json:"tls.key_path"`
+	InternalUseTLS                bool   `yaml:"internal_use_tls" json:"internal_tls.enable"`
+	AllowInsecureClusterTransport bool   `yaml:"allow_insecure_cluster_transport" json:"distribution.allow_insecure_transport"`
+	InternalTLSCertPath           string `yaml:"internal_tls_cert_path" json:"internal_tls.cert_path"`
+	InternalTLSKeyPath            string `yaml:"internal_tls_key_path" json:"internal_tls.key_path"`
+	InternalTLSCAPath             string `yaml:"internal_tls_ca_path" json:"internal_tls.ca_path"`
+	InternalTLSServerName         string `yaml:"internal_tls_server_name" json:"internal_tls.server_name"`
+	InternalTLSCert               tls.Certificate
+	InternalTLSClientCAPool       *x509.CertPool
+	InternalTLSRootCAPool         *x509.CertPool
+	EnableSASL                    bool       `yaml:"enable_sasl" json:"sasl.enable"`
+	SASLUsers                     []SASLUser `yaml:"sasl_users" json:"sasl.users"`
 }
 
 func DefaultConfig() *Config {
@@ -181,6 +186,10 @@ func DefaultConfig() *Config {
 			// consumer
 			ConsumerSessionTimeoutMS: 10000,
 			ConsumerHeartbeatCheckMS: 5000,
+
+			// network
+			MaxClientConnections: 1000,
+			ClientIdleTimeoutMS:  60000,
 
 			// stream
 			MaxStreamConnections:    1000,
@@ -275,6 +284,8 @@ func LoadConfig() (*Config, error) {
 	// consumer
 	flag.IntVar(&cfg.ConsumerSessionTimeoutMS, "consumer-session-timeout", cfg.ConsumerSessionTimeoutMS, "Session timeout")
 	flag.IntVar(&cfg.ConsumerHeartbeatCheckMS, "consumer-heartbeat-check", cfg.ConsumerHeartbeatCheckMS, "Heartbeat check")
+	flag.IntVar(&cfg.MaxClientConnections, "max-client-connections", cfg.MaxClientConnections, "Maximum concurrently serviced client connections")
+	flag.IntVar(&cfg.ClientIdleTimeoutMS, "client-idle-timeout-ms", cfg.ClientIdleTimeoutMS, "Idle client connection timeout in milliseconds")
 
 	// stream
 	flag.IntVar(&cfg.MaxStreamConnections, "max-stream-connections", cfg.MaxStreamConnections, "Max stream connections")
@@ -287,6 +298,7 @@ func LoadConfig() (*Config, error) {
 	flag.StringVar(&cfg.TLSCertPath, "tls-cert", cfg.TLSCertPath, "TLS cert")
 	flag.StringVar(&cfg.TLSKeyPath, "tls-key", cfg.TLSKeyPath, "TLS key")
 	flag.BoolVar(&cfg.InternalUseTLS, "internal-tls", cfg.InternalUseTLS, "Enable mutual TLS on the internal broker listener")
+	flag.BoolVar(&cfg.AllowInsecureClusterTransport, "allow-insecure-cluster-transport", cfg.AllowInsecureClusterTransport, "Explicitly allow plaintext Raft and discovery transport")
 	flag.StringVar(&cfg.InternalTLSCertPath, "internal-tls-cert", cfg.InternalTLSCertPath, "Internal listener TLS certificate")
 	flag.StringVar(&cfg.InternalTLSKeyPath, "internal-tls-key", cfg.InternalTLSKeyPath, "Internal listener TLS private key")
 	flag.StringVar(&cfg.InternalTLSCAPath, "internal-tls-ca", cfg.InternalTLSCAPath, "CA used to verify internal broker certificates")
@@ -314,7 +326,7 @@ func LoadConfig() (*Config, error) {
 		data, err := os.ReadFile(*configPath)
 		if err != nil {
 			if os.IsNotExist(err) {
-				util.Warn("Config file %s not found, using flag defaults", *configPath)
+				return nil, fmt.Errorf("configured file %s does not exist", *configPath)
 			} else {
 				return nil, fmt.Errorf("failed to read config file %s: %w", *configPath, err)
 			}
@@ -355,6 +367,7 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.BrokerPort, "BROKER_PORT")
 	overrideEnvInt(&cfg.HealthCheckPort, "HEALTH_CHECK_PORT")
 	overrideEnvBool(&cfg.EnableExporter, "ENABLE_EXPORTER")
+	overrideEnvString(&cfg.LogDir, "LOG_DIR")
 	overrideEnvInt(&cfg.ExporterPort, "EXPORTER_PORT")
 
 	overrideEnvInt(&cfg.DiskFlushBatchSize, "DISK_FLUSH_BATCH")
@@ -375,6 +388,8 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.PartitionChannelBufSize, "PARTITION_CH_BUFFER")
 	overrideEnvInt(&cfg.ConsumerChannelBufSize, "CONSUMER_CH_BUFFER")
 	overrideEnvInt(&cfg.BroadcastChannelBufferSize, "BROADCAST_CH_BUFFER")
+	overrideEnvInt(&cfg.MaxClientConnections, "MAX_CLIENT_CONNECTIONS")
+	overrideEnvInt(&cfg.ClientIdleTimeoutMS, "CLIENT_IDLE_TIMEOUT_MS")
 
 	overrideEnvBool(&cfg.EnabledDistribution, "ENABLE_DISTRIBUTION")
 	overrideEnvString(&cfg.InternalAuthToken, "INTERNAL_AUTH_TOKEN")
@@ -399,7 +414,11 @@ func LoadConfig() (*Config, error) {
 
 	overrideEnvInt(&cfg.ConsumerSessionTimeoutMS, "CONSUMER_SESSION_TIMEOUT")
 	overrideEnvInt(&cfg.ConsumerHeartbeatCheckMS, "CONSUMER_HEARTBEAT_CHECK")
+	overrideEnvBool(&cfg.UseTLS, "USE_TLS")
+	overrideEnvString(&cfg.TLSCertPath, "TLS_CERT_PATH")
+	overrideEnvString(&cfg.TLSKeyPath, "TLS_KEY_PATH")
 	overrideEnvBool(&cfg.InternalUseTLS, "INTERNAL_USE_TLS")
+	overrideEnvBool(&cfg.AllowInsecureClusterTransport, "ALLOW_INSECURE_CLUSTER_TRANSPORT")
 	overrideEnvString(&cfg.InternalTLSCertPath, "INTERNAL_TLS_CERT_PATH")
 	overrideEnvString(&cfg.InternalTLSKeyPath, "INTERNAL_TLS_KEY_PATH")
 	overrideEnvString(&cfg.InternalTLSCAPath, "INTERNAL_TLS_CA_PATH")
@@ -410,13 +429,8 @@ func LoadConfig() (*Config, error) {
 	cfg.Normalize()
 	util.SetLevel(cfg.LogLevel)
 
-	if cfg.EnabledDistribution {
-		if strings.TrimSpace(cfg.InternalAuthToken) == "" {
-			return nil, fmt.Errorf("internal_auth_token is required when enabled_distribution=true")
-		}
-		if strings.ContainsAny(cfg.InternalAuthToken, " \t\r\n") {
-			return nil, fmt.Errorf("internal_auth_token must not contain whitespace")
-		}
+	if err := cfg.ValidateClusterTransport(); err != nil {
+		return nil, err
 	}
 	if err := cfg.loadInternalTLSConfig(); err != nil {
 		return nil, err
@@ -434,6 +448,23 @@ func LoadConfig() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// ValidateClusterTransport rejects accidental plaintext cluster deployments.
+func (cfg *Config) ValidateClusterTransport() error {
+	if cfg == nil || !cfg.EnabledDistribution {
+		return nil
+	}
+	if strings.TrimSpace(cfg.InternalAuthToken) == "" {
+		return fmt.Errorf("internal_auth_token is required when enabled_distribution=true")
+	}
+	if strings.ContainsAny(cfg.InternalAuthToken, " \t\r\n") {
+		return fmt.Errorf("internal_auth_token must not contain whitespace")
+	}
+	if !cfg.InternalUseTLS && !cfg.AllowInsecureClusterTransport {
+		return fmt.Errorf("distributed mode requires internal TLS; set allow_insecure_cluster_transport only for isolated test environments")
+	}
+	return nil
 }
 
 func (cfg *Config) loadInternalTLSConfig() error {

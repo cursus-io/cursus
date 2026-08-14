@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os/signal"
@@ -28,7 +27,7 @@ func main() {
 		util.Fatal("❌ Failed to load config: %v", err)
 	}
 
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	data, err := config.MarshalRedactedJSON(cfg)
 	if err != nil {
 		util.Error("Failed to marshal config: %v", err)
 	} else {

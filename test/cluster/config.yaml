@@ -6,6 +6,7 @@ log_level: "info"
 
 # Distributed Clustering
 enabled_distribution: true
+allow_insecure_cluster_transport: true
 internal_auth_token: "cursus-test-internal-token"
 internal_broker_port: 19000
 raft_port: 9001

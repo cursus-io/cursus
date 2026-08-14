@@ -15,16 +15,17 @@ persistence:
   enabled: true
   storageClass: ""
   config:
-    path: /root/config.yaml
+    path: /app/config.yaml
     size: 1Gi
   logDir:
-    path: /root/logs
+    path: /data/logs
+    size: 10Gi
 
 tls:
   enabled: false
   secretName: cursus-tls
-  certPath: /root/tls/cert.pem
-  keyPath: /root/tls/key.pem
+  certPath: /app/tls/cert.pem
+  keyPath: /app/tls/key.pem
 
 podSecurityContext:
   fsGroup: 1000
@@ -33,7 +34,6 @@ podSecurityContext:
 securityContext:
   runAsNonRoot: true
   runAsUser: 1000
-  fsGroup: 1000
 
 serviceAccount:
   create: true
@@ -48,6 +48,9 @@ nodeSelector: {}
 affinity: {}
 resources: {}
 tolerations: []
+terminationGracePeriodSeconds: 60
+startupProbeFailureThreshold: 30
+
 
 monitoring:
   enabled: false

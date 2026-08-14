@@ -97,6 +97,32 @@ func TestManagerPreservesProducerEpochWhenExpiredIDIsReinitialized(t *testing.T)
 		t.Fatalf("expired transactional ID reused stale identity producer=%s epoch=%d", producer, epoch)
 	}
 }
+
+func TestManagerDeletesExpiredEpochTombstoneAfterSecondRetentionWindow(t *testing.T) {
+	m := NewManagerWithExpiration(time.Hour)
+	old := time.Now().Add(-2 * time.Hour)
+	m.ApplySnapshot(&Snapshot{
+		ID:        "tx-expired",
+		Producer:  "producer-tx-expired",
+		Epoch:     7,
+		Revision:  20,
+		State:     StateCommitted,
+		CreatedAt: old,
+		UpdatedAt: old,
+	})
+
+	firstPrune := time.Now()
+	if changed := m.PruneExpired(firstPrune); changed != 1 {
+		t.Fatalf("first prune changed %d transactions, want 1", changed)
+	}
+	if changed := m.PruneExpired(firstPrune.Add(2 * time.Hour)); changed != 1 {
+		t.Fatalf("second prune changed %d transactions, want 1", changed)
+	}
+	if _, ok := m.ExportState()["tx-expired"]; ok {
+		t.Fatal("expired epoch tombstone was retained after its retention window")
+	}
+}
+
 func TestManagerInitializationDoesNotExpireUnrelatedTransactionalIDs(t *testing.T) {
 	m := NewManagerWithExpiration(time.Hour)
 	old := time.Now().Add(-2 * time.Hour)
@@ -260,6 +286,13 @@ func TestManagerBuildCommittedSnapshotDoesNotExposeBeforeApply(t *testing.T) {
 	if state, known := m.TransactionDecision("tx-decision", epoch); !known || state != string(StateCommitted) {
 		t.Fatalf("committed decision missing after apply: state=%s known=%v", state, known)
 	}
+	retry, err := m.BuildCommittedSnapshot("tx-decision")
+	if err != nil {
+		t.Fatalf("build committed snapshot retry: %v", err)
+	}
+	if retry.State != StateCommitted || retry.Revision != snap.Revision {
+		t.Fatalf("committed snapshot retry changed decision: %+v", retry)
+	}
 }
 
 func TestManagerRejectsAbortAfterCommitPreparation(t *testing.T) {
@@ -397,5 +430,35 @@ func TestManagerPruneExpiredKeepsActiveTransactions(t *testing.T) {
 	}
 	if _, err := m.Status("committing"); err != nil {
 		t.Fatalf("expected committing transaction to remain: %v", err)
+	}
+}
+
+func TestManagerTreatsExactCommittingPredecessorAsIdempotent(t *testing.T) {
+	m := NewManager()
+	producer, epoch := beginInitialized(t, m, "tx-predecessor-retry")
+	if _, err := m.PrepareCommit("tx-predecessor-retry", producer, epoch); err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+	prepared := m.ExportState()["tx-predecessor-retry"]
+	committed, err := m.BuildCommittedSnapshot("tx-predecessor-retry")
+	if err != nil {
+		t.Fatalf("build committed snapshot: %v", err)
+	}
+	if err := m.ApplyReplicatedSnapshot(committed); err != nil {
+		t.Fatalf("apply committed snapshot: %v", err)
+	}
+	if err := m.ApplyReplicatedSnapshot(prepared); err != nil {
+		t.Fatalf("exact committing predecessor should be idempotent: %v", err)
+	}
+	tx, err := m.Status("tx-predecessor-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.State != StateCommitted || tx.Revision != committed.Revision {
+		t.Fatalf("predecessor retry regressed committed state: %+v", tx)
+	}
+	prepared.Offsets = append(prepared.Offsets, OffsetOperation{Topic: "other", Partition: 0, Offset: 1})
+	if err := m.ApplyReplicatedSnapshot(prepared); err == nil {
+		t.Fatal("different committing predecessor was accepted")
 	}
 }

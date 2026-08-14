@@ -11,17 +11,19 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o 
 FROM alpine:3.20
 
 LABEL io.cursus.test-faults="true"
-WORKDIR /root/
-COPY --from=builder /app/broker .
-COPY --from=builder /app/cli .
-
 RUN apk add --no-cache bash curl \
+    && addgroup -g 1000 cursus \
+    && adduser -D -u 1000 -G cursus cursus \
     && mkdir -p /run/cursus-e2e-faults \
-    && chmod 0700 /run/cursus-e2e-faults \
-    && chmod +x broker cli
+    && chown cursus:cursus /run/cursus-e2e-faults
 
-COPY entrypoint.sh .
-RUN chmod +x entrypoint.sh
+WORKDIR /app
+COPY --from=builder --chown=cursus:cursus /app/broker /app/broker
+COPY --from=builder --chown=cursus:cursus /app/cli /app/cli
+COPY --chown=cursus:cursus entrypoint.sh /app/entrypoint.sh
 
-ENTRYPOINT ["/root/entrypoint.sh"]
+RUN chown -R cursus:cursus /app && chmod +x /app/broker /app/cli /app/entrypoint.sh
+USER cursus
+
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD []

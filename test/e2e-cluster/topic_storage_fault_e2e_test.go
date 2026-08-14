@@ -23,8 +23,10 @@ const (
 	runTopicStorageFaultE2E      = "RUN_E2E_TOPIC_STORAGE_FAULTS"
 	storageFaultBaseExporterPort = 9100
 	faultSentinelRoot            = "/run/cursus-e2e-faults"
-	containerLogRoot             = "/root/cluster-logs"
-	faultConvergenceTimeout      = 90 * time.Second
+	// The image WORKDIR is /app and test/cluster/config.yaml configures the
+	// relative log_dir "cluster-logs", so this path is container-local.
+	containerLogRoot        = "/app/cluster-logs"
+	faultConvergenceTimeout = 90 * time.Second
 )
 
 func TestTopicStorageFaultReconciliation(t *testing.T) {

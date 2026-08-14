@@ -194,6 +194,18 @@ func (a *ClusterActions) StopBroker(nodeIndex int) {
 	a.ctx.GetClient().Close()
 }
 
+func (a *ClusterActions) KillBroker(nodeIndex int) {
+	if nodeIndex <= 0 || nodeIndex > a.ctx.clusterSize {
+		a.ctx.GetT().Fatalf("invalid broker index %d: cluster size is %d", nodeIndex, a.ctx.clusterSize)
+	}
+	containerName := fmt.Sprintf("broker-%d", nodeIndex)
+	// #nosec G204 -- nodeIndex is range-checked above and forms a fixed broker-N container name.
+	if err := exec.Command("docker", "kill", "--signal=KILL", containerName).Run(); err != nil {
+		a.ctx.GetT().Fatalf("failed to hard-kill %s: %v", containerName, err)
+	}
+	a.ctx.GetClient().Close()
+}
+
 func (a *ClusterActions) StartBroker(nodeIndex int) {
 	if nodeIndex <= 0 || nodeIndex > a.ctx.clusterSize {
 		a.ctx.GetT().Fatalf("invalid broker index %d: cluster size is %d", nodeIndex, a.ctx.clusterSize)

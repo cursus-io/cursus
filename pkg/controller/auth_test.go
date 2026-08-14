@@ -360,6 +360,20 @@ func TestTransactionMarkerRequiresControlBatchMetadata(t *testing.T) {
 	if resp := ch.validateTransactionMarkerPublish(tx, "txn-topic", 0, &msg); resp != "" {
 		t.Fatalf("expected valid transaction marker, got %q", resp)
 	}
+
+	tx.State = transaction.StateCommitted
+	if resp := ch.validateTransactionMarkerPublish(tx, "txn-topic", 0, &msg); resp != "" {
+		t.Fatalf("expected committed marker retry to be idempotent, got %q", resp)
+	}
+	record := tx.Messages[0].Message
+	record.TransactionState = types.TransactionStateOpen
+	if resp := ch.validateTransactionRecordPublish(tx, "txn-topic", 0, &record); resp != "" {
+		t.Fatalf("expected committed record retry to be idempotent, got %q", resp)
+	}
+	record.Payload = "not-staged"
+	if resp := ch.validateTransactionRecordPublish(tx, "txn-topic", 0, &record); !strings.Contains(resp, "transaction_record_not_staged") {
+		t.Fatalf("committed retry accepted a different record: %q", resp)
+	}
 }
 
 type authStorageProvider struct {

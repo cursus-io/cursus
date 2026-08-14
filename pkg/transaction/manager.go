@@ -101,14 +101,21 @@ func (m *Manager) pruneExpiredLocked(now time.Time) int {
 			removed++
 			continue
 		}
-		if expireTransactionLocked(tx, cutoff) {
+		if tx.Expired {
+			if tx.UpdatedAt.Before(cutoff) {
+				delete(m.txns, id)
+				removed++
+			}
+			continue
+		}
+		if expireTransactionLocked(tx, cutoff, now) {
 			removed++
 		}
 	}
 	return removed
 }
 
-func expireTransactionLocked(tx *Transaction, cutoff time.Time) bool {
+func expireTransactionLocked(tx *Transaction, cutoff, now time.Time) bool {
 	if tx == nil || tx.Expired || !tx.UpdatedAt.Before(cutoff) {
 		return false
 	}
@@ -120,6 +127,7 @@ func expireTransactionLocked(tx *Transaction, cutoff time.Time) bool {
 	tx.Ready = false
 	tx.Expired = true
 	tx.Revision++
+	tx.UpdatedAt = now
 	return true
 }
 
@@ -130,8 +138,9 @@ func (m *Manager) InitProducer(id string) (string, int64, error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := time.Now()
 	previous := m.txns[id]
-	expireTransactionLocked(previous, time.Now().Add(-m.expiration))
+	expireTransactionLocked(previous, now.Add(-m.expiration), now)
 
 	producer := producerIDForTransactionalID(id)
 	epoch := int64(0)
@@ -147,7 +156,6 @@ func (m *Manager) InitProducer(id string) (string, int64, error) {
 		revision = tx.Revision + 1
 	}
 
-	now := time.Now()
 	m.txns[id] = &Transaction{
 		ID:        id,
 		Producer:  producer,
@@ -392,7 +400,11 @@ func (m *Manager) BuildCommittedSnapshot(id string) (*Snapshot, error) {
 	if !ok {
 		return nil, fmt.Errorf("transaction %s not found", id)
 	}
-	if tx.State != StateCommitting {
+	switch tx.State {
+	case StateCommitted:
+		return snapshot(tx), nil
+	case StateCommitting:
+	default:
 		return nil, fmt.Errorf("transaction %s is not prepared for commit", id)
 	}
 	committed := snapshot(tx)
@@ -498,7 +510,29 @@ func (m *Manager) ApplyReplicatedSnapshot(snap *Snapshot) error {
 	if snapshotsEqual(current, snap) {
 		return nil
 	}
+	// A retried coordinator must re-propose its durable committing snapshot
+	// before applying records. If this replica has already applied the exact
+	// successor committed decision, the predecessor is an idempotent no-op;
+	// it must never regress the terminal state.
+	if committedSnapshotSucceeds(current, snap) {
+		return nil
+	}
 	return fmt.Errorf("stale transaction snapshot transactional_id=%s current_epoch=%d current_revision=%d incoming_epoch=%d incoming_revision=%d", snap.ID, current.Epoch, current.Revision, snap.Epoch, snap.Revision)
+}
+
+func committedSnapshotSucceeds(current *Transaction, incoming *Snapshot) bool {
+	return current != nil && incoming != nil &&
+		current.ID == incoming.ID &&
+		current.Producer == incoming.Producer &&
+		current.Epoch == incoming.Epoch &&
+		current.State == StateCommitted &&
+		incoming.State == StateCommitting &&
+		current.Revision == incoming.Revision+1 &&
+		current.Ready == incoming.Ready &&
+		current.Expired == incoming.Expired &&
+		current.CreatedAt.Equal(incoming.CreatedAt) &&
+		reflect.DeepEqual(current.Messages, incoming.Messages) &&
+		reflect.DeepEqual(current.Offsets, incoming.Offsets)
 }
 
 func snapshotIsNewer(current *Transaction, incoming *Snapshot) bool {

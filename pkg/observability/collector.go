@@ -10,6 +10,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -33,6 +34,10 @@ type clusterSource interface {
 	RuntimeSnapshot() clustercontroller.RuntimeSnapshot
 }
 
+type transactionSource interface {
+	RuntimeSnapshot() transaction.RuntimeSnapshot
+}
+
 // ReadinessSource reports whether the broker is ready to accept client work.
 type ReadinessSource interface {
 	IsReady() bool
@@ -40,13 +45,14 @@ type ReadinessSource interface {
 
 // Collector exports scrape-time state rather than retaining stale gauge labels.
 type Collector struct {
-	topics      topicSource
-	groups      groupSource
-	disk        diskSource
-	streams     streamSource
-	cluster     clusterSource
-	readiness   ReadinessSource
-	descriptors []*prometheus.Desc
+	topics       topicSource
+	groups       groupSource
+	disk         diskSource
+	streams      streamSource
+	cluster      clusterSource
+	readiness    ReadinessSource
+	descriptors  []*prometheus.Desc
+	transactions transactionSource
 
 	ready                           *prometheus.Desc
 	topicCount                      *prometheus.Desc
@@ -92,10 +98,14 @@ type Collector struct {
 	partitionInSync                 *prometheus.Desc
 	partitionLeaderEpoch            *prometheus.Desc
 	partitionLeader                 *prometheus.Desc
+	transactionRecovery             *prometheus.Desc
+	transactionStates               *prometheus.Desc
+	transactionExpired              *prometheus.Desc
+	transactionOldestActive         *prometheus.Desc
 }
 
 // NewCollector creates a broker runtime collector. Nil sources are supported.
-func NewCollector(topics topicSource, groups groupSource, diskState diskSource, streams streamSource, cluster clusterSource, readiness ReadinessSource) *Collector {
+func NewCollector(topics topicSource, groups groupSource, diskState diskSource, streams streamSource, cluster clusterSource, readiness ReadinessSource, transactions ...transactionSource) *Collector {
 	c := &Collector{
 		topics:                          topics,
 		groups:                          groups,
@@ -147,6 +157,13 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		partitionInSync:                 prometheus.NewDesc("cursus_cluster_partition_in_sync_replicas", "In-sync replica count for a partition.", []string{"topic", "partition"}, nil),
 		partitionLeaderEpoch:            prometheus.NewDesc("cursus_cluster_partition_leader_epoch", "Current partition leader epoch.", []string{"topic", "partition"}, nil),
 		partitionLeader:                 prometheus.NewDesc("cursus_cluster_partition_leader", "Current partition leader identity.", []string{"topic", "partition", "broker_id"}, nil),
+		transactionRecovery:             prometheus.NewDesc("cursus_transaction_recovery_ready", "Whether transaction state recovery completed before serving.", nil, nil),
+		transactionStates:               prometheus.NewDesc("cursus_transactions", "Transactions retained by coordinator state.", []string{"state"}, nil),
+		transactionExpired:              prometheus.NewDesc("cursus_transactions_expired", "Expired transaction identities awaiting replacement or compaction.", nil, nil),
+		transactionOldestActive:         prometheus.NewDesc("cursus_transaction_oldest_active_seconds", "Age of the oldest open or committing transaction.", nil, nil),
+	}
+	if len(transactions) > 0 {
+		c.transactions = transactions[0]
 	}
 	c.descriptors = []*prometheus.Desc{
 		c.ready, c.topicCount, c.metadataLoadFailure, c.metadataRestoredTopics, c.metadataOrphanTopics,
@@ -162,6 +179,7 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		c.clusterIsLeader, c.clusterOffline, c.clusterUnderReplicated, c.topicMaterializationPending,
 		c.topicMaterializationAttempts, c.topicMaterializationOldest, c.partitionReplicas,
 		c.partitionInSync, c.partitionLeaderEpoch, c.partitionLeader,
+		c.transactionRecovery, c.transactionStates, c.transactionExpired, c.transactionOldestActive,
 	}
 	return c
 }
@@ -222,8 +240,21 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	ch <- gauge(c.activeStreams, float64(activeStreams))
 	c.collectStorage(ch)
 	c.collectCluster(ch)
+	c.collectTransactions(ch)
 }
 
+func (c *Collector) collectTransactions(ch chan<- prometheus.Metric) {
+	state := transaction.RuntimeSnapshot{}
+	if c.transactions != nil {
+		state = c.transactions.RuntimeSnapshot()
+	}
+	ch <- gauge(c.transactionRecovery, boolValue(state.RecoveryReady))
+	for _, transactionState := range []transaction.State{transaction.StateOpen, transaction.StateCommitting, transaction.StateCommitted, transaction.StateAborted} {
+		ch <- gauge(c.transactionStates, float64(state.ByState[transactionState]), string(transactionState))
+	}
+	ch <- gauge(c.transactionExpired, float64(state.Expired))
+	ch <- gauge(c.transactionOldestActive, state.OldestActiveAgeSeconds)
+}
 func (c *Collector) collectGroups(ch chan<- prometheus.Metric, partitions map[string]topic.PartitionRuntimeSnapshot) {
 	if c.groups == nil {
 		return

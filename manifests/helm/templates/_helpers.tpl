@@ -38,6 +38,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if .Values.serviceAccount.create }}
 {{- default (include "cursus.fullname" .) .Values.serviceAccount.name }}
 {{- else }}
-default
+{{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}

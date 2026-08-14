@@ -64,10 +64,14 @@ func (d *DiskHandler) flushLoop() {
 			}
 			d.ioMu.Lock()
 			if d.writer != nil {
-				_ = d.writer.Flush()
+				if err := d.writer.Flush(); err != nil {
+					_ = d.markWriteUnavailable(fmt.Errorf("flush on request: %w", err))
+				}
 			}
 			if d.file != nil {
-				_ = d.file.Sync()
+				if err := d.syncFile(d.file); err != nil {
+					_ = d.markWriteUnavailable(fmt.Errorf("sync on request: %w", err))
+				}
 			}
 			d.ioMu.Unlock()
 			close(done)
@@ -108,10 +112,11 @@ func (d *DiskHandler) syncLoop() {
 			syncSuccess := false
 
 			if d.file != nil {
-				if err := d.file.Sync(); err == nil {
+				if err := d.syncFile(d.file); err == nil {
 					syncSuccess = true
 				} else {
 					util.Error("failed to sync data file: %v", err)
+					_ = d.markWriteUnavailable(fmt.Errorf("periodic data sync: %w", err))
 					syncSuccess = false
 				}
 			}
@@ -119,6 +124,7 @@ func (d *DiskHandler) syncLoop() {
 			if d.indexFile != nil {
 				if err := d.indexFile.Sync(); err != nil {
 					util.Error("failed to sync index file: %v", err)
+					_ = d.markWriteUnavailable(fmt.Errorf("periodic index sync: %w", err))
 					syncSuccess = false
 				}
 			}
@@ -140,6 +146,9 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 	if len(batch) == 0 {
 		return nil
 	}
+	if err := d.writeAvailabilityError(); err != nil {
+		return err
+	}
 
 	interval := d.indexInterval
 	if interval == 0 {
@@ -153,6 +162,9 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 		serialized, err := util.SerializeDiskMessage(msg)
 		if err != nil {
 			return fmt.Errorf("serialize failed at index %d: %w", i, err)
+		}
+		if err := validateSerializedDiskMessageSize(serialized); err != nil {
+			return fmt.Errorf("message at index %d: %w", i, err)
 		}
 		if _, ok := util.SafeIntToUint32(len(serialized)); !ok {
 			return fmt.Errorf("message too large at index %d: %d bytes", i, len(serialized))
@@ -203,7 +215,7 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 				}
 
 				if err := binary.Write(d.indexWriter, binary.BigEndian, entry); err != nil {
-					return fmt.Errorf("failed to write index entry for offset %d: %w", msg.Offset, err)
+					return d.markWriteUnavailable(fmt.Errorf("failed to write index entry for offset %d: %w", msg.Offset, err))
 				}
 
 				d.indexBytesWritten += entrySize
@@ -214,21 +226,21 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 		sLen, _ := util.SafeIntToUint32(len(serialized)) // validated in pre-loop
 		binary.BigEndian.PutUint32(lenBuf[:], sLen)
 		if _, err := d.writer.Write(lenBuf[:]); err != nil {
-			return fmt.Errorf("write length failed: %w", err)
+			return d.markWriteUnavailable(fmt.Errorf("write length failed: %w", err))
 		}
 		if _, err := d.writer.Write(serialized); err != nil {
-			return fmt.Errorf("write payload failed: %w", err)
+			return d.markWriteUnavailable(fmt.Errorf("write payload failed: %w", err))
 		}
 		accumulatedLen += uint64(4 + len(serialized))
 	}
 
 	if err := d.writer.Flush(); err != nil {
-		return fmt.Errorf("flush failed after batch: %w", err)
+		return d.markWriteUnavailable(fmt.Errorf("flush failed after batch: %w", err))
 	}
 
 	if d.indexWriter != nil {
 		if err := d.indexWriter.Flush(); err != nil {
-			return fmt.Errorf("flush index writer failed: %w", err)
+			return d.markWriteUnavailable(fmt.Errorf("flush index writer failed: %w", err))
 		}
 	}
 
@@ -256,6 +268,9 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message) error {
 	if partition < 0 || partition > math.MaxInt32 {
 		return fmt.Errorf("partition out of int32 range: %d", partition)
+	}
+	if err := d.writeAvailabilityError(); err != nil {
+		return err
 	}
 
 	interval := d.indexInterval
@@ -295,6 +310,9 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	if err != nil {
 		return fmt.Errorf("serialize failed: %w", err)
 	}
+	if err := validateSerializedDiskMessageSize(serialized); err != nil {
+		return err
+	}
 
 	serLen, ok := util.SafeIntToUint32(len(serialized))
 	if !ok {
@@ -321,21 +339,18 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	binary.BigEndian.PutUint32(lenBuf[:], serLen)
 
 	if _, err := d.writer.Write(lenBuf[:]); err != nil {
-		return err
+		return d.markWriteUnavailable(fmt.Errorf("write record length: %w", err))
 	}
 	if _, err := d.writer.Write(serialized); err != nil {
-		return err
+		return d.markWriteUnavailable(fmt.Errorf("write record payload: %w", err))
 	}
 	if err := d.writer.Flush(); err != nil {
-		return fmt.Errorf("flush failed: %w", err)
+		return d.markWriteUnavailable(fmt.Errorf("flush failed: %w", err))
 	}
-	if d.internalMetadata {
-		// Consumer metadata acknowledgements are a durable contract: do not
-		// expose a successful registration/commit until the authoritative log
-		// bytes have reached the filesystem sync boundary.
-		if err := d.file.Sync(); err != nil {
-			return fmt.Errorf("sync internal metadata log: %w", err)
-		}
+	// WriteDirect backs acknowledged application writes, follower replication,
+	// and consumer metadata. All must cross the filesystem sync boundary.
+	if err := d.syncFile(d.file); err != nil {
+		return d.markWriteUnavailable(fmt.Errorf("sync disk log: %w", err))
 	}
 
 	d.CurrentOffset += totalLen
@@ -352,14 +367,14 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 		}
 		if d.indexWriter != nil {
 			if err := binary.Write(d.indexWriter, binary.BigEndian, indexEntry); err != nil {
-				return fmt.Errorf("failed to write index entry for offset %d: %w", msg.Offset, err)
+				return d.markWriteUnavailable(fmt.Errorf("failed to write index entry for offset %d: %w", msg.Offset, err))
 			}
 			if err := d.indexWriter.Flush(); err != nil {
-				return fmt.Errorf("failed to flush index writer: %w", err)
+				return d.markWriteUnavailable(fmt.Errorf("failed to flush index writer: %w", err))
 			}
 			if d.internalMetadata && d.indexFile != nil {
 				if err := d.indexFile.Sync(); err != nil {
-					return fmt.Errorf("sync internal metadata index: %w", err)
+					return d.markWriteUnavailable(fmt.Errorf("sync internal metadata index: %w", err))
 				}
 			}
 			d.lastIndexPosition = msgPosition

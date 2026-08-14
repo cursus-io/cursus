@@ -3,11 +3,13 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/controller"
 )
 
 func TestCloseListenerOnDone(t *testing.T) {
@@ -65,5 +67,54 @@ func TestRunServerContextReturnsCancellation(t *testing.T) {
 	cancel()
 	if err := RunServerContext(ctx, cfg, nil, nil, nil, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context cancellation, got %v", err)
+	}
+}
+
+func TestInternalBrokerShutdownWaitsForWorkers(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.InternalBrokerPort = port
+	cfg.InternalUseTLS = false
+	cfg.MaxClientConnections = 1
+	cfg.ClientIdleTimeoutMS = 25
+	handler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
+	defer func() {
+		if closeErr := handler.Close(); closeErr != nil {
+			t.Errorf("close command handler: %v", closeErr)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	shutdown, err := startInternalBrokerListener(ctx, cfg, handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), time.Second)
+	defer dialCancel()
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		shutdown()
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("internal listener shutdown did not wait for and stop workers")
 	}
 }

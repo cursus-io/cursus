@@ -273,12 +273,18 @@ func (ch *CommandHandler) handleEndTxn(cmd string) string {
 		}
 	}
 
-	tx, err := ch.TxnManager.PrepareCommit(txnID, producerID, epoch)
-	if err != nil {
-		return fmt.Sprintf("ERROR: transaction_prepare_failed reason=%q", err.Error())
+	tx := current
+	if current.State == transaction.StateOpen {
+		var err error
+		tx, err = ch.TxnManager.PrepareCommit(txnID, producerID, epoch)
+		if err != nil {
+			return fmt.Sprintf("ERROR: transaction_prepare_failed reason=%q", err.Error())
+		}
 	}
-	if err := ch.syncTransactionState(txnID); err != nil {
-		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
+	if tx.State == transaction.StateCommitting {
+		if err := ch.syncTransactionState(txnID); err != nil {
+			return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
+		}
 	}
 	if err := ch.applyTransaction(tx); err != nil {
 		if syncErr := ch.syncTransactionState(txnID); syncErr != nil {
@@ -581,21 +587,21 @@ func (ch *CommandHandler) publishInternalTransactionCommand(cmd string) error {
 }
 
 func isRetryableTransactionStateLag(resp string) bool {
-	fields := strings.Fields(strings.TrimSpace(resp))
-	if len(fields) < 2 || fields[0] != "ERROR:" {
-		return false
-	}
-	switch strings.ToLower(fields[1]) {
-	case "transaction_not_found",
+	normalized := strings.ToLower(strings.TrimSpace(resp))
+	for _, code := range []string{
+		"transaction_not_found",
 		"transaction_not_committing",
 		"transaction_record_not_staged",
 		"transaction_marker_partition_not_touched",
 		"transaction_not_abortable",
-		"producer_fenced":
-		return true
-	default:
-		return false
+		"producer_fenced",
+	} {
+		marker := "error: " + code
+		if strings.HasPrefix(normalized, marker+" ") || strings.Contains(normalized, " "+marker+" ") {
+			return true
+		}
 	}
+	return false
 }
 func (ch *CommandHandler) validateTransactionPublishMetadata(args map[string]string, topicName string, partition int, msg *types.Message) string {
 	if msg == nil {
@@ -631,7 +637,7 @@ func (ch *CommandHandler) validateTransactionPublishMetadata(args map[string]str
 }
 
 func (ch *CommandHandler) validateTransactionRecordPublish(tx *transaction.Transaction, topicName string, partition int, msg *types.Message) string {
-	if tx.State != transaction.StateCommitting {
+	if tx.State != transaction.StateCommitting && tx.State != transaction.StateCommitted {
 		return fmt.Sprintf("ERROR: transaction_not_committing transactional_id=%s state=%s", tx.ID, tx.State)
 	}
 	if msg.TransactionState != types.TransactionStateOpen {
@@ -665,7 +671,7 @@ func (ch *CommandHandler) validateTransactionMarkerPublish(tx *transaction.Trans
 	if msg.ProducerID != transactionMarkerProducerID(tx, msg.TransactionMarker) || msg.SeqNum != 1 {
 		return fmt.Sprintf("ERROR: invalid_transaction_marker_producer transactional_id=%s", tx.ID)
 	}
-	if msg.TransactionMarker == types.TransactionMarkerCommit && tx.State != transaction.StateCommitting {
+	if msg.TransactionMarker == types.TransactionMarkerCommit && tx.State != transaction.StateCommitting && tx.State != transaction.StateCommitted {
 		return fmt.Sprintf("ERROR: transaction_not_committing transactional_id=%s state=%s", tx.ID, tx.State)
 	}
 	if msg.TransactionMarker == types.TransactionMarkerAbort && tx.State != transaction.StateOpen && tx.State != transaction.StateAborted {
@@ -730,7 +736,10 @@ func (ch *CommandHandler) commitTransactionOffsets(ops []transaction.OffsetOpera
 		pairs = append(pairs, fmt.Sprintf("P%d:%d", op.Partition, op.Offset))
 	}
 
-	if ch.isDistributed() && ch.Cluster != nil && ch.Cluster.Router != nil {
+	if ch.Config != nil && ch.Config.EnabledDistribution {
+		if ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.Cluster.Router == nil {
+			return fmt.Errorf("distributed transaction offset commit requires cluster coordinator router")
+		}
 		cmd := fmt.Sprintf(
 			"BATCH_COMMIT topic=%s group=%s member=%s generation=%d %s",
 			scope.Topic, scope.Group, scope.Member, scope.Generation, strings.Join(pairs, ","),
@@ -744,6 +753,9 @@ func (ch *CommandHandler) commitTransactionOffsets(ops []transaction.OffsetOpera
 			return fmt.Errorf("%s", resp)
 		}
 		return nil
+	}
+	if ch.Coordinator == nil {
+		return fmt.Errorf("transaction offset commit requires coordinator")
 	}
 	return ch.Coordinator.ValidateAndCommitOffsetsBulk(
 		scope.Group, scope.Topic, scope.Member, scope.Generation, items,
@@ -790,11 +802,19 @@ func (ch *CommandHandler) ConfigureTransactionJournal(path string) error {
 		return err
 	}
 	ch.TxnManager.ImportState(state)
+	if ch.TxnManager.PruneExpired(time.Now()) > 0 {
+		if err := journal.Rewrite(ch.TxnManager.ExportState()); err != nil {
+			return fmt.Errorf("prune recovered transaction journal: %w", err)
+		}
+	}
 	ch.txnJournal = journal
 	return nil
 }
 
 func (ch *CommandHandler) syncTransactionState(txnID string) error {
+	if ch.transactionStateSyncHook != nil {
+		return ch.transactionStateSyncHook(txnID)
+	}
 	snapshots := ch.TxnManager.ExportState()
 	snap := snapshots[txnID]
 	if snap == nil {
@@ -804,7 +824,13 @@ func (ch *CommandHandler) syncTransactionState(txnID string) error {
 		if ch.txnJournal == nil {
 			return nil
 		}
-		return ch.txnJournal.Append(snap)
+		if err := ch.txnJournal.Append(snap); err != nil {
+			return err
+		}
+		if ch.TxnManager.PruneExpired(time.Now()) > 0 {
+			return ch.txnJournal.Rewrite(ch.TxnManager.ExportState())
+		}
+		return nil
 	}
 	_, err := ch.applyViaLeader("TXN_SYNC", map[string]interface{}{"transaction": snap})
 	return err

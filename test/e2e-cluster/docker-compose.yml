@@ -6,7 +6,7 @@ services:
     container_name: broker-1
     command: ./broker
     environment:
-      - CONFIG_PATH=/root/config.yaml
+      - CONFIG_PATH=/app/config.yaml
       - ADVERTISED_HOST=broker-1
       - ADVERTISED_CLIENT_HOST=localhost
       - ADVERTISED_BROKER_PORT=9001
@@ -21,7 +21,7 @@ services:
       - "9081:9080"
       - "9101:9100"
     volumes:
-      - ../cluster/config.yaml:/root/config.yaml
+      - ../cluster/config.yaml:/app/config.yaml
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
       interval: 3s
@@ -37,7 +37,7 @@ services:
     container_name: broker-2
     command: ./broker
     environment:
-      - CONFIG_PATH=/root/config.yaml
+      - CONFIG_PATH=/app/config.yaml
       - ADVERTISED_HOST=broker-2
       - ADVERTISED_CLIENT_HOST=localhost
       - ADVERTISED_BROKER_PORT=9002
@@ -52,7 +52,7 @@ services:
       - "9082:9080"
       - "9102:9100"
     volumes:
-      - ../cluster/config.yaml:/root/config.yaml
+      - ../cluster/config.yaml:/app/config.yaml
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
       interval: 3s
@@ -71,7 +71,7 @@ services:
     container_name: broker-3
     command: ./broker
     environment:
-      - CONFIG_PATH=/root/config.yaml
+      - CONFIG_PATH=/app/config.yaml
       - ADVERTISED_HOST=broker-3
       - ADVERTISED_CLIENT_HOST=localhost
       - ADVERTISED_BROKER_PORT=9003
@@ -86,7 +86,7 @@ services:
       - "9083:9080"
       - "9103:9100"
     volumes:
-      - ../cluster/config.yaml:/root/config.yaml
+      - ../cluster/config.yaml:/app/config.yaml
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
       interval: 3s

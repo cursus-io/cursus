@@ -7,16 +7,16 @@ services:
     command: ./broker
     restart: on-failure:3
     environment:
-      - CONFIG_PATH=/root/config.yaml
+      - CONFIG_PATH=/app/config.yaml
       - ADVERTISED_HOST=broker-1
       - ADVERTISED_BROKER_PORT=9000
       - ADVERTISED_CLIENT_HOST=broker-1
       - BOOTSTRAP_CLUSTER=true
       - RAFT_PEERS=
     volumes:
-      - ./config.yaml:/root/config.yaml:ro
+      - ./config.yaml:/app/config.yaml:ro
     tmpfs:
-      - /root/broker-logs
+      - /app/broker-logs
     ports:
       - "9001:9000"
       - "9081:9080"
@@ -38,7 +38,7 @@ services:
     command: ./broker
     restart: on-failure:3
     environment:
-      - CONFIG_PATH=/root/config.yaml
+      - CONFIG_PATH=/app/config.yaml
       - ADVERTISED_HOST=broker-2
       - ADVERTISED_BROKER_PORT=9000
       - ADVERTISED_CLIENT_HOST=broker-2
@@ -47,9 +47,9 @@ services:
       broker-1:
         condition: service_started
     volumes:
-      - ./config.yaml:/root/config.yaml:ro
+      - ./config.yaml:/app/config.yaml:ro
     tmpfs:
-      - /root/broker-logs
+      - /app/broker-logs
     ports:
       - "9002:9000"
       - "9082:9080"
@@ -71,7 +71,7 @@ services:
     command: ./broker
     restart: on-failure:3
     environment:
-      - CONFIG_PATH=/root/config.yaml
+      - CONFIG_PATH=/app/config.yaml
       - ADVERTISED_HOST=broker-3
       - ADVERTISED_BROKER_PORT=9000
       - ADVERTISED_CLIENT_HOST=broker-3
@@ -80,9 +80,9 @@ services:
       broker-1:
         condition: service_started
     volumes:
-      - ./config.yaml:/root/config.yaml:ro
+      - ./config.yaml:/app/config.yaml:ro
     tmpfs:
-      - /root/broker-logs
+      - /app/broker-logs
     ports:
       - "9003:9000"
       - "9083:9080"

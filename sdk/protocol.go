@@ -8,11 +8,13 @@ import (
 	"io"
 	"net"
 
-	"github.com/pierrec/lz4/v4"
 	snappy "github.com/eapache/go-xerial-snappy"
+	"github.com/pierrec/lz4/v4"
 )
 
-const MaxMessageSize = 64 * 1024 * 1024 // 64MB
+// MaxMessageSize mirrors the broker durable-record limit without importing
+// broker-internal packages into the SDK.
+const MaxMessageSize = 16 * 1024 * 1024 // 16 MiB
 
 // EncodeMessage serializes topic and payload into bytes.
 func EncodeMessage(topic string, payload string) []byte {
@@ -408,5 +410,3 @@ func DecodeBatchMessages(data []byte) ([]Message, string, int, error) {
 
 	return messages, string(topicBytes), int(partition), nil
 }
-
-

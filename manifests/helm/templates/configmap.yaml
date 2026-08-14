@@ -4,7 +4,7 @@ metadata:
   name: {{ include "cursus.fullname" . }}-config
 data:
   config.yaml: |
-    logLevel: {{ .Values.logLevel | default "info" }}
+    log_level: {{ .Values.logLevel | default "info" }}
     log_dir: {{ .Values.persistence.logDir.path }} 
 
     disk_flush_batch_size: {{ .Values.performance.custom.diskFlushBatchSize | default (index .Values.performance .Values.performanceProfile "diskFlushBatchSize") }}  
