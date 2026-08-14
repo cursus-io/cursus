@@ -97,7 +97,9 @@ func TestInternalBrokerShutdownWaitsForWorkers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), time.Second)
+	defer dialCancel()
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		shutdown()
 		t.Fatal(err)
