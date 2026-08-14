@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
+	"github.com/cursus-io/cursus/pkg/cluster/replication"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
@@ -239,4 +241,27 @@ func TestTransactionAbortRetryDoesNotMoveOffsetsOrAppendAgain(t *testing.T) {
 	require.Empty(t, readCommittedPayloads(t, tm, topicName))
 	_, ok = coord.GetOffset(groupName, topicName, 0)
 	require.False(t, ok)
+}
+
+func TestCommitTransactionOffsetsFailsClosedWithoutRouter(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	ch := NewCommandHandler(
+		nil,
+		cfg,
+		nil,
+		nil,
+		&clusterController.ClusterController{RaftManager: &replication.RaftReplicationManager{}},
+	)
+	t.Cleanup(func() { require.NoError(t, ch.Close()) })
+
+	err := ch.commitTransactionOffsets([]transaction.OffsetOperation{{
+		Topic:      "orders",
+		Group:      "workers",
+		Member:     "member-1",
+		Generation: 1,
+		Partition:  0,
+		Offset:     7,
+	}})
+	require.ErrorContains(t, err, "requires coordinator router")
 }

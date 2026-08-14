@@ -400,7 +400,11 @@ func (m *Manager) BuildCommittedSnapshot(id string) (*Snapshot, error) {
 	if !ok {
 		return nil, fmt.Errorf("transaction %s not found", id)
 	}
-	if tx.State != StateCommitting {
+	switch tx.State {
+	case StateCommitted:
+		return snapshot(tx), nil
+	case StateCommitting:
+	default:
 		return nil, fmt.Errorf("transaction %s is not prepared for commit", id)
 	}
 	committed := snapshot(tx)

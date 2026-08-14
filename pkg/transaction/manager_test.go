@@ -286,6 +286,13 @@ func TestManagerBuildCommittedSnapshotDoesNotExposeBeforeApply(t *testing.T) {
 	if state, known := m.TransactionDecision("tx-decision", epoch); !known || state != string(StateCommitted) {
 		t.Fatalf("committed decision missing after apply: state=%s known=%v", state, known)
 	}
+	retry, err := m.BuildCommittedSnapshot("tx-decision")
+	if err != nil {
+		t.Fatalf("build committed snapshot retry: %v", err)
+	}
+	if retry.State != StateCommitted || retry.Revision != snap.Revision {
+		t.Fatalf("committed snapshot retry changed decision: %+v", retry)
+	}
 }
 
 func TestManagerRejectsAbortAfterCommitPreparation(t *testing.T) {
