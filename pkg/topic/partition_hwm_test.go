@@ -209,8 +209,8 @@ func TestPartition_ReplicaAppendSeparatesDurableTailFromCommitWatermark(t *testi
 	dh := new(MockStorageHandler)
 	dh.On("GetLatestOffset").Return(uint64(0)).Once()
 	msg := types.Message{Offset: 0, Payload: "replicated", ProducerID: "producer-1", SeqNum: 1}
-	dh.On("AppendMessageWithOffset", "orders", 0, mock.MatchedBy(func(got *types.Message) bool {
-		return got.Offset == 0 && got.Payload == "replicated"
+	dh.On("WriteBatch", mock.MatchedBy(func(got []types.DiskMessage) bool {
+		return len(got) == 1 && got[0].Offset == 0 && got[0].Payload == "replicated"
 	})).Return(nil).Once()
 
 	p := NewPartition(0, "orders", dh, nil, cfg)
@@ -229,14 +229,14 @@ func TestPartition_ReplicaAppendRetryIsIdempotentAndRejectsConflictOrGap(t *test
 	dh := new(MockStorageHandler)
 	dh.On("GetLatestOffset").Return(uint64(0)).Once()
 	msg := types.Message{Offset: 0, Payload: "replicated", ProducerID: "producer-1", SeqNum: 1}
-	dh.On("AppendMessageWithOffset", "orders", 0, mock.Anything).Return(nil).Once()
+	dh.On("WriteBatch", mock.Anything).Return(nil).Once()
 
 	p := NewPartition(0, "orders", dh, nil, cfg)
 	require.NoError(t, p.ReplicaAppend([]types.Message{msg}))
 
 	dh.On("ReadMessages", uint64(0), 1).Return([]types.Message{msg}, nil).Once()
 	require.NoError(t, p.ReplicaAppend([]types.Message{msg}), "an identical retry must be a no-op")
-	dh.AssertNumberOfCalls(t, "AppendMessageWithOffset", 1)
+	dh.AssertNumberOfCalls(t, "WriteBatch", 1)
 
 	dh.On("ReadMessages", uint64(0), 1).Return([]types.Message{{Offset: 0, Payload: "different"}}, nil).Once()
 	require.ErrorContains(t, p.ReplicaAppend([]types.Message{msg}), "offset conflict")
@@ -638,4 +638,58 @@ func TestPartition_LastStableOffsetRestoresTransactionIndexFromLog(t *testing.T)
 	defer restarted.Close()
 
 	require.Equal(t, uint64(1), restarted.LastStableOffset())
+}
+
+type durableBatchMockStorage struct {
+	*MockStorageHandler
+}
+
+func (m *durableBatchMockStorage) WriteBatchSync(batch []types.DiskMessage) error {
+	args := m.Called(batch)
+	return args.Error(0)
+}
+
+func TestPartition_ReplicaAppendUsesOneDurableWriteForLargeBatch(t *testing.T) {
+	cfg := config.DefaultConfig()
+	base := new(MockStorageHandler)
+	base.On("GetLatestOffset").Return(uint64(0)).Once()
+	storage := &durableBatchMockStorage{MockStorageHandler: base}
+	messages := make([]types.Message, 1000)
+	for i := range messages {
+		messages[i] = types.Message{
+			Offset:     uint64(i),
+			Payload:    "replicated",
+			ProducerID: "producer-1",
+			SeqNum:     uint64(i + 1),
+		}
+	}
+	storage.On("WriteBatchSync", mock.MatchedBy(func(batch []types.DiskMessage) bool {
+		return len(batch) == len(messages) && batch[0].Offset == 0 && batch[len(batch)-1].Offset == 999
+	})).Return(nil).Once()
+
+	p := NewPartition(0, "orders", storage, nil, cfg)
+	require.NoError(t, p.ReplicaAppend(messages))
+	require.Equal(t, uint64(1000), p.NextOffset())
+	require.Equal(t, uint64(0), p.GetHWM(), "replication must not advance the commit watermark")
+	storage.AssertNumberOfCalls(t, "WriteBatchSync", 1)
+	storage.AssertNotCalled(t, "WriteBatch", mock.Anything)
+	storage.AssertNotCalled(t, "AppendMessageWithOffset", mock.Anything, mock.Anything, mock.Anything)
+	storage.AssertExpectations(t)
+}
+
+func TestPartition_ReplicaAppendDoesNotAdvanceStateWhenDurableBatchFails(t *testing.T) {
+	cfg := config.DefaultConfig()
+	base := new(MockStorageHandler)
+	base.On("GetLatestOffset").Return(uint64(0)).Once()
+	storage := &durableBatchMockStorage{MockStorageHandler: base}
+	storage.On("WriteBatchSync", mock.Anything).Return(errors.New("disk unavailable")).Once()
+
+	p := NewPartition(0, "orders", storage, nil, cfg)
+	err := p.ReplicaAppend([]types.Message{{
+		Offset: 0, Payload: "replicated", ProducerID: "producer-1", SeqNum: 1,
+	}})
+	require.ErrorContains(t, err, "replica batch append failed")
+	require.Equal(t, uint64(0), p.NextOffset())
+	require.Equal(t, uint64(0), p.GetHWM())
+	storage.AssertExpectations(t)
 }

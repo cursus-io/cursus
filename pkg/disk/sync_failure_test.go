@@ -92,3 +92,67 @@ func TestPostWriteFlushFailureMakesHandlerTerminalUntilRestart(t *testing.T) {
 		})
 	}
 }
+
+func TestWriteBatchSyncUsesSingleFilesystemSync(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 60_000
+
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		handler.syncFileFn = nil
+		_ = handler.Close()
+	})
+
+	syncCalls := 0
+	handler.syncFileFn = func(*os.File) error {
+		syncCalls++
+		return nil
+	}
+	batch := make([]types.DiskMessage, 1000)
+	for i := range batch {
+		batch[i] = types.DiskMessage{
+			Topic:      "orders",
+			Partition:  0,
+			Offset:     uint64(i),
+			ProducerID: "producer-1",
+			SeqNum:     uint64(i + 1),
+			Payload:    "payload",
+		}
+	}
+
+	if err := handler.WriteBatchSync(batch); err != nil {
+		t.Fatalf("WriteBatchSync failed: %v", err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("filesystem sync calls = %d, want 1 for the whole batch", syncCalls)
+	}
+}
+
+func TestWriteBatchSyncFailureMakesHandlerTerminal(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 60_000
+
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		handler.syncFileFn = nil
+		_ = handler.Close()
+	})
+	handler.syncFileFn = func(*os.File) error { return errors.New("injected batch fsync failure") }
+
+	batch := []types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 0, Payload: "first"}}
+	if err := handler.WriteBatchSync(batch); err == nil || !strings.Contains(err.Error(), "sync disk batch") {
+		t.Fatalf("durable batch error = %v, want sync failure", err)
+	}
+	handler.syncFileFn = nil
+	if err := handler.WriteBatchSync(batch); err == nil || !strings.Contains(err.Error(), "unavailable until restart") {
+		t.Fatalf("durable batch retry = %v, want terminal unavailable error", err)
+	}
+}

@@ -143,6 +143,17 @@ func (d *DiskHandler) syncLoop() {
 
 // WriteBatch writes a batch of messages into the current segment file.
 func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
+	return d.writeBatch(batch, false)
+}
+
+// WriteBatchSync writes a batch and waits for one filesystem sync boundary.
+// It is used for acknowledged leader and follower replication so a large batch
+// remains durable without issuing one fsync per message.
+func (d *DiskHandler) WriteBatchSync(batch []types.DiskMessage) error {
+	return d.writeBatch(batch, true)
+}
+
+func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error {
 	if len(batch) == 0 {
 		return nil
 	}
@@ -241,6 +252,11 @@ func (d *DiskHandler) WriteBatch(batch []types.DiskMessage) error {
 	if d.indexWriter != nil {
 		if err := d.indexWriter.Flush(); err != nil {
 			return d.markWriteUnavailable(fmt.Errorf("flush index writer failed: %w", err))
+		}
+	}
+	if syncData {
+		if err := d.syncFile(d.file); err != nil {
+			return d.markWriteUnavailable(fmt.Errorf("sync disk batch: %w", err))
 		}
 	}
 

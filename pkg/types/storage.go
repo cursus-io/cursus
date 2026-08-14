@@ -22,6 +22,15 @@ type StorageHandler interface {
 	Close() error
 }
 
+// DurableBatchStorage extends StorageHandler with a batch append that does not
+// return until the batch has crossed the filesystem sync boundary. Production
+// disk handlers implement this contract; lightweight test or alternate storage
+// implementations may continue to use StorageHandler alone.
+type DurableBatchStorage interface {
+	StorageHandler
+	WriteBatchSync(batch []DiskMessage) error
+}
+
 // OffsetOutOfRangeError indicates that the requested offset is outside the retained committed log range.
 type OffsetOutOfRangeError struct {
 	Requested uint64

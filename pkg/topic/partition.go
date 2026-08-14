@@ -456,7 +456,7 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 		return nil
 	}
 
-	if err := p.dh.WriteBatch(diskBatch); err != nil {
+	if err := writeBatchDurably(p.dh, diskBatch); err != nil {
 		for _, msg := range pending {
 			msgs[msg.index].Offset = 0
 		}
@@ -488,31 +488,88 @@ func (p *Partition) ReplicaAppend(msgs []types.Message) error {
 	if p.closed {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
+	if p.id > math.MaxInt32 {
+		return fmt.Errorf("partition ID %d exceeds int32 range", p.id)
+	}
+
+	partitionID := int32(p.id) // #nosec G115 -- p.id is validated before narrowing.
+	initialLEO := p.LEO.Load()
+	nextOffset := initialLEO
+	pending := make([]int, 0, len(msgs))
+	diskBatch := make([]types.DiskMessage, 0, len(msgs))
+	stagedByOffset := make(map[uint64]types.Message)
 
 	for i := range msgs {
-		currentLEO := p.LEO.Load()
 		switch {
-		case msgs[i].Offset < currentLEO:
+		case msgs[i].Offset < initialLEO:
 			existing, err := p.dh.ReadMessages(msgs[i].Offset, 1)
 			if err != nil || len(existing) != 1 || !sameReplicatedMessage(existing[0], msgs[i]) {
 				return fmt.Errorf("replica offset conflict at offset %d", msgs[i].Offset)
 			}
 			continue
-		case msgs[i].Offset > currentLEO:
-			return fmt.Errorf("replica offset gap: expected %d, got %d", currentLEO, msgs[i].Offset)
+		case msgs[i].Offset < nextOffset:
+			existing, ok := stagedByOffset[msgs[i].Offset]
+			if !ok || !sameReplicatedMessage(existing, msgs[i]) {
+				return fmt.Errorf("replica offset conflict at offset %d", msgs[i].Offset)
+			}
+			continue
+		case msgs[i].Offset > nextOffset:
+			return fmt.Errorf("replica offset gap: expected %d, got %d", nextOffset, msgs[i].Offset)
 		}
 
-		if err := p.dh.AppendMessageWithOffset(p.topic, p.id, &msgs[i]); err != nil {
-			return fmt.Errorf("replica append failed at index %d: %w", i, err)
-		}
+		pending = append(pending, i)
+		diskBatch = append(diskBatch, diskMessageFromMessage(p.topic, partitionID, msgs[i]))
+		stagedByOffset[msgs[i].Offset] = msgs[i]
+		nextOffset++
+	}
 
-		newLEO := msgs[i].Offset + 1
-		p.LEO.Store(newLEO)
+	if err := writeBatchDurably(p.dh, diskBatch); err != nil {
+		return fmt.Errorf("replica batch append failed: %w", err)
+	}
+	for _, i := range pending {
 		p.updateProducerStateWithMode(&msgs[i], msgs[i].TransactionalID != "")
 		p.indexTransactionMessage(msgs[i])
 	}
-	p.NotifyNewMessage()
+	if len(pending) > 0 {
+		p.LEO.Store(nextOffset)
+		p.NotifyNewMessage()
+	}
 	return nil
+}
+
+func writeBatchDurably(storage types.StorageHandler, batch []types.DiskMessage) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	if durable, ok := storage.(types.DurableBatchStorage); ok {
+		return durable.WriteBatchSync(batch)
+	}
+	return storage.WriteBatch(batch)
+}
+
+func diskMessageFromMessage(topic string, partition int32, msg types.Message) types.DiskMessage {
+	return types.DiskMessage{
+		Topic:                        topic,
+		Partition:                    partition,
+		Offset:                       msg.Offset,
+		ProducerID:                   msg.ProducerID,
+		SeqNum:                       msg.SeqNum,
+		Epoch:                        msg.Epoch,
+		Payload:                      msg.Payload,
+		Key:                          msg.Key,
+		EventType:                    msg.EventType,
+		SchemaVersion:                msg.SchemaVersion,
+		AggregateVersion:             msg.AggregateVersion,
+		Metadata:                     msg.Metadata,
+		TransactionalID:              msg.TransactionalID,
+		TransactionState:             msg.TransactionState,
+		TransactionMarker:            msg.TransactionMarker,
+		ControlBatchType:             msg.ControlBatchType,
+		ControlBatchVersion:          msg.ControlBatchVersion,
+		ControlBatchCoordinatorEpoch: msg.ControlBatchCoordinatorEpoch,
+		ControlBatchKey:              msg.ControlBatchKey,
+		ControlBatchValue:            msg.ControlBatchValue,
+	}
 }
 
 func sameReplicatedMessage(a, b types.Message) bool {
