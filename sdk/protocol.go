@@ -18,6 +18,10 @@ const MaxMessageSize = 64 * 1024 * 1024 // 64MB
 func EncodeMessage(topic string, payload string) []byte {
 	topicBytes := []byte(topic)
 	payloadBytes := []byte(payload)
+	const maxTopicLength = 1<<16 - 1
+	if len(topicBytes) > maxTopicLength || len(topicBytes) > MaxMessageSize-2 || len(payloadBytes) > MaxMessageSize-2-len(topicBytes) {
+		return nil
+	}
 	data := make([]byte, 2+len(topicBytes)+len(payloadBytes))
 	binary.BigEndian.PutUint16(data[:2], uint16(len(topicBytes)))
 	copy(data[2:2+len(topicBytes)], topicBytes)
