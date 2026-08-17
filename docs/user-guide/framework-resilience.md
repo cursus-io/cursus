@@ -50,3 +50,25 @@ Call `RunDue` from a service worker. Persist deadlines in the service database w
 ## Client help
 
 `sdk.FrameworkHelp()` provides a compact list of the framework entry points. Go uses explicit registration APIs rather than Java-style annotations; a future code generator can produce those registrations from project metadata without changing the broker protocol.
+
+
+## Effect idempotency and durable compensation
+
+Retry identity has two levels:
+
+- event retry uses the same event ID
+- command retry uses a stable Command.EffectID
+
+Store SagaState.Effects by effect ID. A successful effect must not be enqueued again when a later delivery produces the same logical step. The outbox should enforce the same invariant with a unique effect key.
+
+Compensation state is stored in SagaState.Compensation. Use the manager lifecycle methods instead of only changing Status in memory:
+
+~~~go
+_, err := manager.StartCompensation(ctx, state.AssociationKey, "rollback-elo", cause)
+if err != nil {
+    return err
+}
+return manager.CompleteCompensation(ctx, state.AssociationKey)
+~~~
+
+Use FailCompensation when the rollback itself fails. Its last error and attempt count are durable inputs to the next worker attempt.
