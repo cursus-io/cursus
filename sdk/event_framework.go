@@ -18,6 +18,7 @@ type EventEnvelope struct {
 	AggregateVersion uint64          `json:"aggregate_version"`
 	OccurredAt       time.Time       `json:"occurred_at"`
 	CorrelationID    string          `json:"correlation_id,omitempty"`
+	AssociationKey   string          `json:"association_key,omitempty"`
 	CausationID      string          `json:"causation_id,omitempty"`
 	Payload          json.RawMessage `json:"payload"`
 }

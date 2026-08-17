@@ -18,6 +18,8 @@ type SagaState struct {
 	RetryCount     int
 	LastError      string
 	UpdatedAt      time.Time
+	Effects        map[string]EffectState
+	Compensation   *CompensationState
 }
 
 const (
@@ -31,6 +33,7 @@ const (
 // Command is an application command emitted by a saga.
 type Command struct {
 	ID            string
+	EffectID      string
 	Type          string
 	SagaID        string
 	CorrelationID string
@@ -97,7 +100,10 @@ func (m *SagaManager) Handle(ctx context.Context, event EventEnvelope) error {
 	if event.EventID == "" || event.EventType == "" {
 		return fmt.Errorf("saga event identity is incomplete")
 	}
-	associationKey := event.CorrelationID
+	associationKey := event.AssociationKey
+	if associationKey == "" {
+		associationKey = event.CorrelationID
+	}
 	if associationKey == "" {
 		associationKey = event.AggregateID
 	}
@@ -116,6 +122,9 @@ func (m *SagaManager) Handle(ctx context.Context, event EventEnvelope) error {
 	if state == nil {
 		state = &SagaState{ID: associationKey, Type: m.definition.Type, AssociationKey: associationKey, CorrelationID: event.CorrelationID, Status: SagaRunning}
 	}
+	if state.Effects == nil {
+		state.Effects = make(map[string]EffectState)
+	}
 	handler, ok := m.definition.Handlers[event.EventType]
 	if !ok {
 		return m.complete(ctx, associationKey, event.EventID, state)
@@ -130,7 +139,14 @@ func (m *SagaManager) Handle(ctx context.Context, event EventEnvelope) error {
 	if err := m.state.Save(ctx, state); err != nil {
 		return m.fail(ctx, associationKey, event.EventID, state, fmt.Errorf("save saga state: %w", err))
 	}
-	for _, command := range commands {
+	for index, command := range commands {
+		effectID := command.EffectID
+		if effectID == "" {
+			effectID = fmt.Sprintf("%s:%d", event.EventID, index)
+		}
+		if effect, ok := state.Effects[effectID]; ok && effect.Status == EffectSucceeded {
+			continue
+		}
 		if command.SagaID == "" {
 			command.SagaID = state.ID
 		}
@@ -143,8 +159,28 @@ func (m *SagaManager) Handle(ctx context.Context, event EventEnvelope) error {
 		if command.ID == "" {
 			command = NewCommand(command.Type, command.SagaID, command.CorrelationID, command.CausationID, command.Payload)
 		}
+		command.EffectID = effectID
+		effect := state.Effects[effectID]
+		effect.ID = effectID
+		effect.Step = command.Type
+		effect.Attempts++
+		effect.Status = EffectPending
+		effect.CommandID = command.ID
+		effect.UpdatedAt = m.now().UTC()
+		state.Effects[effectID] = effect
 		if err := m.outbox.Enqueue(ctx, command); err != nil {
+			effect.Status = EffectFailed
+			effect.LastError = err.Error()
+			effect.UpdatedAt = m.now().UTC()
+			state.Effects[effectID] = effect
 			return m.fail(ctx, associationKey, event.EventID, state, fmt.Errorf("enqueue saga command: %w", err))
+		}
+		effect.Status = EffectSucceeded
+		effect.LastError = ""
+		effect.UpdatedAt = m.now().UTC()
+		state.Effects[effectID] = effect
+		if err := m.state.Save(ctx, state); err != nil {
+			return m.fail(ctx, associationKey, event.EventID, state, fmt.Errorf("save saga effect: %w", err))
 		}
 	}
 	return m.complete(ctx, associationKey, event.EventID, state)
