@@ -12,6 +12,9 @@ const MaxMessageSize = 64 * 1024 * 1024 // 64MB
 
 // WriteWithLength writes data with a 4-byte length prefix.
 func WriteWithLength(conn net.Conn, data []byte) error {
+	if data == nil {
+		return fmt.Errorf("data must not be nil")
+	}
 	if len(data) > MaxMessageSize {
 		return fmt.Errorf("data size %d exceeds maximum %d", len(data), MaxMessageSize)
 	}

@@ -77,8 +77,17 @@ func decodeEventEnvelope(streamEvent StreamEvent) (EventEnvelope, error) {
 	if envelope.SchemaVersion == 0 {
 		envelope.SchemaVersion = streamEvent.SchemaVersion
 	}
+	if envelope.EventType != streamEvent.Type {
+		return EventEnvelope{}, fmt.Errorf("event envelope type %q does not match stream type %q", envelope.EventType, streamEvent.Type)
+	}
+	if envelope.SchemaVersion != streamEvent.SchemaVersion {
+		return EventEnvelope{}, fmt.Errorf("event envelope schema version %d does not match stream schema version %d", envelope.SchemaVersion, streamEvent.SchemaVersion)
+	}
 	if envelope.AggregateVersion == 0 {
 		envelope.AggregateVersion = streamEvent.Version
+	}
+	if envelope.AggregateVersion != streamEvent.Version {
+		return EventEnvelope{}, fmt.Errorf("event envelope version %d does not match stream version %d", envelope.AggregateVersion, streamEvent.Version)
 	}
 	if envelope.AggregateID == "" {
 		return EventEnvelope{}, fmt.Errorf("event envelope at offset %d has no aggregate_id", streamEvent.Offset)
@@ -91,6 +100,12 @@ func decodeEventEnvelope(streamEvent StreamEvent) (EventEnvelope, error) {
 
 // AppendEnvelope appends a framework event to an aggregate stream.
 func (es *EventStore) AppendEnvelope(key string, expectedVersion uint64, envelope EventEnvelope) (*AppendResult, error) {
+	if envelope.AggregateID != "" && envelope.AggregateID != key {
+		return nil, fmt.Errorf("event aggregate id %q does not match stream key %q", envelope.AggregateID, key)
+	}
+	if envelope.AggregateVersion != 0 && envelope.AggregateVersion != expectedVersion+1 {
+		return nil, fmt.Errorf("event aggregate version %d does not match expected version %d", envelope.AggregateVersion, expectedVersion+1)
+	}
 	if envelope.AggregateID == "" {
 		envelope.AggregateID = key
 	}
@@ -202,6 +217,9 @@ func (r *AggregateRepository) Save(aggregate Aggregate, events []EventEnvelope) 
 	if aggregate == nil {
 		return fmt.Errorf("aggregate is required")
 	}
+	if len(events) > 1 {
+		return fmt.Errorf("saving multiple events is not supported without atomic batch append")
+	}
 	expected := aggregate.Version()
 	for _, event := range events {
 		expected++
@@ -210,6 +228,9 @@ func (r *AggregateRepository) Save(aggregate Aggregate, events []EventEnvelope) 
 		}
 		if event.AggregateID == "" {
 			event.AggregateID = aggregate.ID()
+		}
+		if event.AggregateID != aggregate.ID() {
+			return fmt.Errorf("event aggregate id %q does not match aggregate %q", event.AggregateID, aggregate.ID())
 		}
 		event.AggregateVersion = expected
 		wireEvent, err := event.wireEvent()

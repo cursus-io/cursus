@@ -86,3 +86,18 @@ func TestAggregateRepositoryRejectsMalformedStreamEnvelope(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, strings.Contains(err.Error(), "decode event envelope"))
 }
+
+func TestAggregateRepositoryRejectsMultipleEventsWithoutAtomicStore(t *testing.T) {
+	store := &repositoryStore{}
+	repository, err := NewAggregateRepository(store, func(id string) Aggregate { return &repositoryAggregate{id: id} })
+	require.NoError(t, err)
+	aggregate := &repositoryAggregate{id: "game-1"}
+	first, err := NewEventEnvelope("game", "game-1", "GameCreated", map[string]any{"status": "open"})
+	require.NoError(t, err)
+	second, err := NewEventEnvelope("game", "game-1", "GameFinished", map[string]any{"winner": "p1"})
+	require.NoError(t, err)
+	err = repository.Save(aggregate, []EventEnvelope{first, second})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "atomic batch append")
+	require.Empty(t, store.events)
+}

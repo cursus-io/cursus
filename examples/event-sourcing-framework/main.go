@@ -64,8 +64,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := repository.Save(aggregate, []sdk.EventEnvelope{created, finished}); err != nil {
-		log.Fatal(err)
+	if aggregate.Version() == 0 {
+		if err := repository.Save(aggregate, []sdk.EventEnvelope{created}); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if aggregate.Version() == 1 {
+		if err := repository.Save(aggregate, []sdk.EventEnvelope{finished}); err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	reloaded, err := repository.Load(gameID)

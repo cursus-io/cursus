@@ -40,4 +40,8 @@ func TestBufferErrorCases(t *testing.T) {
 	err = WriteWithLength(c1, largeData)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "exceeds maximum")
+
+	err = WriteWithLength(c1, nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "must not be nil")
 }

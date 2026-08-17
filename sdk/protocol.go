@@ -8,20 +8,22 @@ import (
 	"io"
 	"net"
 
-	"github.com/pierrec/lz4/v4"
 	snappy "github.com/eapache/go-xerial-snappy"
+	"github.com/pierrec/lz4/v4"
 )
 
 const MaxMessageSize = 64 * 1024 * 1024 // 64MB
 
 // EncodeMessage serializes topic and payload into bytes.
 func EncodeMessage(topic string, payload string) []byte {
-	topicBytes := []byte(topic)
-	payloadBytes := []byte(payload)
 	const maxTopicLength = 1<<16 - 1
-	if len(topicBytes) > maxTopicLength || len(topicBytes) > MaxMessageSize-2 || len(payloadBytes) > MaxMessageSize-2-len(topicBytes) {
+	topicLength := len(topic)
+	payloadLength := len(payload)
+	if topicLength > maxTopicLength || topicLength > MaxMessageSize-2 || payloadLength > MaxMessageSize-2-topicLength {
 		return nil
 	}
+	topicBytes := []byte(topic)
+	payloadBytes := []byte(payload)
 	data := make([]byte, 2+len(topicBytes)+len(payloadBytes))
 	binary.BigEndian.PutUint16(data[:2], uint16(len(topicBytes)))
 	copy(data[2:2+len(topicBytes)], topicBytes)
@@ -166,6 +168,9 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 
 // WriteWithLength writes data with a 4-byte length prefix.
 func WriteWithLength(conn net.Conn, data []byte) error {
+	if data == nil {
+		return fmt.Errorf("data must not be nil")
+	}
 	if len(data) > MaxMessageSize {
 		return fmt.Errorf("data size %d exceeds maximum %d", len(data), MaxMessageSize)
 	}
@@ -412,5 +417,3 @@ func DecodeBatchMessages(data []byte) ([]Message, string, int, error) {
 
 	return messages, string(topicBytes), int(partition), nil
 }
-
-
