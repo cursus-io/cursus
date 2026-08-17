@@ -24,10 +24,10 @@ func EncodeMessage(topic string, payload string) []byte {
 	}
 	topicBytes := []byte(topic)
 	payloadBytes := []byte(payload)
-	data := make([]byte, 2+len(topicBytes)+len(payloadBytes))
-	binary.BigEndian.PutUint16(data[:2], uint16(len(topicBytes)))
-	copy(data[2:2+len(topicBytes)], topicBytes)
-	copy(data[2+len(topicBytes):], payloadBytes)
+	data := make([]byte, 2, 2+topicLength)
+	binary.BigEndian.PutUint16(data[:2], uint16(topicLength))
+	data = append(data, topicBytes...)
+	data = append(data, payloadBytes...)
 	return data
 }
 
