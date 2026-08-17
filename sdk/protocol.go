@@ -18,12 +18,18 @@ const MaxMessageSize = 16 * 1024 * 1024 // 16 MiB
 
 // EncodeMessage serializes topic and payload into bytes.
 func EncodeMessage(topic string, payload string) []byte {
+	const maxTopicLength = 1<<16 - 1
+	topicLength := len(topic)
+	payloadLength := len(payload)
+	if topicLength > maxTopicLength || topicLength > MaxMessageSize-2 || payloadLength > MaxMessageSize-2-topicLength {
+		return nil
+	}
 	topicBytes := []byte(topic)
 	payloadBytes := []byte(payload)
-	data := make([]byte, 2+len(topicBytes)+len(payloadBytes))
-	binary.BigEndian.PutUint16(data[:2], uint16(len(topicBytes)))
-	copy(data[2:2+len(topicBytes)], topicBytes)
-	copy(data[2+len(topicBytes):], payloadBytes)
+	data := make([]byte, 2, 2+topicLength)
+	binary.BigEndian.PutUint16(data[:2], uint16(topicLength))
+	data = append(data, topicBytes...)
+	data = append(data, payloadBytes...)
 	return data
 }
 
@@ -164,6 +170,9 @@ func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent 
 
 // WriteWithLength writes data with a 4-byte length prefix.
 func WriteWithLength(conn net.Conn, data []byte) error {
+	if data == nil {
+		return fmt.Errorf("data must not be nil")
+	}
 	if len(data) > MaxMessageSize {
 		return fmt.Errorf("data size %d exceeds maximum %d", len(data), MaxMessageSize)
 	}
