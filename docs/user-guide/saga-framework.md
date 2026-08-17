@@ -50,3 +50,43 @@ Run the example with:
 ```bash
 go run ./examples/saga-framework
 ```
+
+
+## Durable effects, association, and compensation
+
+Each logical command-producing step should use a stable effect identity. Store effect state with the Saga state and enforce a database uniqueness constraint on (saga type, association key, effect ID).
+
+The effect lifecycle is:
+
+~~~text
+PENDING -> SUCCEEDED
+        \-> FAILED -> retry or compensation
+~~~
+
+When a redelivery produces an effect already marked SUCCEEDED, the Saga Manager skips the outbox enqueue. The outbox adapter must also deduplicate by effect ID because a process may crash after publishing and before persisting SUCCEEDED.
+
+Set EventEnvelope.AssociationKey when the Saga instance is not identified by the aggregate:
+
+~~~go
+event, err := sdk.NewEventEnvelope("game", "game-123", "GameFinished", payload)
+event.AssociationKey = "membership:player-1"
+~~~
+
+Saga association resolution is AssociationKey, then CorrelationID, then AggregateID.
+
+Compensation is durable and resumable:
+
+~~~go
+state, err := manager.StartCompensation(ctx, associationKey, "rollback-elo", cause)
+if err != nil {
+    return err
+}
+if err := rollback(ctx); err != nil {
+    return manager.FailCompensation(ctx, associationKey, err)
+}
+return manager.CompleteCompensation(ctx, associationKey)
+~~~
+
+StartCompensation, CompleteCompensation, and FailCompensation persist the compensation step, status, attempt count, and last error. A restarted worker can load SagaState and resume the recorded step.
+
+The in-memory example is instructional only. Production adapters must make inbox claim, saga state, effect state, and outbox enqueue part of one local transaction.

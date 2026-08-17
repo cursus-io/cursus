@@ -81,3 +81,28 @@ go run ./examples/event-sourcing-framework
 ```
 
 The example creates an event-sourcing topic, saves `GameCreated` and `GameFinished`, reloads the aggregate, and prints the reconstructed state.
+
+
+## Saga reliability contract
+
+The client framework does not create Saga tables in the broker. The service database should persist:
+
+- inbox claim and failure state
+- SagaState and its Effects map
+- CompensationState
+- outbox commands keyed by EffectID
+
+For Saga identity, EventEnvelope.AssociationKey has priority over CorrelationID and AggregateID. This allows a game aggregate event to be associated with a player membership Saga.
+
+For command-producing handlers, set a stable EffectID:
+
+~~~go
+return []sdk.Command{{
+    EffectID: "update-player-elo",
+    Type: "UpdatePlayerElo",
+}}, nil
+~~~
+
+The manager persists successful effect state and skips that effect on a later delivery. This is application-level idempotency; the outbox database must still provide a unique constraint to cover the publish/state-write crash window.
+
+Use StartCompensation, CompleteCompensation, and FailCompensation for restart-safe rollback progress. Do not rely only on an in-memory SagaState status.
