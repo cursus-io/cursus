@@ -89,7 +89,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"empty_required_params", "event_sourcing_not_enabled", "invalid_acks", "invalid_batch_commit_entry", "invalid_batch_commit_format",
 		"invalid_auth", "invalid_consume_syntax", "invalid_control_batch_bytes", "invalid_control_batch_coordinator_epoch",
 		"invalid_control_batch_version", "invalid_commit_watermark", "invalid_epoch", "invalid_generation", "invalid_is_idempotent",
-		"invalid_offset", "invalid_partition", "invalid_partitions", "invalid_payload", "invalid_payload_json",
+		"invalid_event_sourcing", "invalid_idempotent", "invalid_offset", "invalid_partition", "invalid_partitions", "invalid_payload", "invalid_payload_json",
 		"invalid_protocol_features", "invalid_protocol_version", "invalid_replication_factor", "invalid_require_features",
 		"invalid_transaction_control_batch", "invalid_transaction_control_epoch", "invalid_transaction_control_record",
 		"invalid_transaction_marker", "invalid_transaction_marker_producer", "invalid_transaction_result",

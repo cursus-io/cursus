@@ -23,13 +23,15 @@ type PartitionMetadata struct {
 }
 
 type TopicCommand struct {
-	Name              string       `json:"name"`
-	Partitions        int          `json:"partitions"`
-	Idempotent        bool         `json:"idempotent"`
-	EventSourcing     bool         `json:"event_sourcing"`
-	LeaderID          string       `json:"leader_id"`
-	ReplicationFactor int          `json:"replication_factor,omitempty"`
-	Policy            topic.Policy `json:"policy,omitempty"`
+	Name              string                 `json:"name,omitempty"`
+	Partitions        int                    `json:"partitions,omitempty"`
+	Idempotent        bool                   `json:"idempotent,omitempty"`
+	EventSourcing     bool                   `json:"event_sourcing,omitempty"`
+	LeaderID          string                 `json:"leader_id,omitempty"`
+	ReplicationFactor int                    `json:"replication_factor,omitempty"`
+	Policy            topic.Policy           `json:"policy,omitempty"`
+	Definition        *topic.Definition      `json:"definition,omitempty"`
+	Patch             *topic.DefinitionPatch `json:"patch,omitempty"`
 }
 
 func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
@@ -38,24 +40,28 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		util.Error("FSM: Failed to unmarshal topic command: %v", err)
 		return err
 	}
-	definition, err := (topic.Definition{
-		Name:          topicCmd.Name,
-		Partitions:    topicCmd.Partitions,
-		Idempotent:    topicCmd.Idempotent,
-		EventSourcing: topicCmd.EventSourcing,
-		Policy:        topicCmd.Policy,
-	}).Normalize()
+	patchCommand := topicCmd.Definition != nil || topicCmd.Patch != nil
+	if patchCommand && topicCmd.Definition == nil {
+		return fmt.Errorf("topic patch command is missing the default definition")
+	}
+
+	base := topic.Definition{
+		Name:              topicCmd.Name,
+		Partitions:        topicCmd.Partitions,
+		ReplicationFactor: topicCmd.ReplicationFactor,
+		Idempotent:        topicCmd.Idempotent,
+		EventSourcing:     topicCmd.EventSourcing,
+		Policy:            topicCmd.Policy,
+	}
+	if topicCmd.Definition != nil {
+		base = *topicCmd.Definition
+	}
+	base, err := base.Normalize()
 	if err != nil {
 		return fmt.Errorf("invalid topic definition: %w", err)
 	}
-	if config.HasCleanupPolicy(definition.Policy.CleanupPolicy, config.CleanupPolicyCompact) {
-		return fmt.Errorf("cleanup policy compact is not supported in distributed mode")
-	}
-	topicCmd.Name = definition.Name
-	topicCmd.Partitions = definition.Partitions
-	topicCmd.Idempotent = definition.Idempotent
-	topicCmd.EventSourcing = definition.EventSourcing
-	topicCmd.Policy = definition.Policy
+	topicCmd.Name = base.Name
+	var appliedDefinition topic.Definition
 
 	stageResult := func() interface{} {
 		f.mu.Lock()
@@ -68,13 +74,34 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		if currentTopic == nil {
 			currentTopic = legacyTopicState(stagedPartitions)[topicCmd.Name]
 		}
+
+		definition := base
 		if currentTopic != nil {
-			if topicCmd.Partitions < currentTopic.Partitions {
-				return fmt.Errorf("cannot decrease partition count for topic %q: %d -> %d", topicCmd.Name, currentTopic.Partitions, topicCmd.Partitions)
-			}
 			currentPartitions = currentTopic.Partitions
-			topicCmd.Idempotent = currentTopic.Idempotent
-			topicCmd.EventSourcing = currentTopic.EventSourcing
+			var patch topic.DefinitionPatch
+			if patchCommand {
+				if topicCmd.Patch != nil {
+					patch = *topicCmd.Patch
+				}
+			} else {
+				patch = legacyTopicDefinitionPatch(base, topicCmd.ReplicationFactor > 0)
+			}
+			definition, err = topic.MergeDefinitionPatch(*currentTopic, patch, true)
+			if err != nil {
+				return err
+			}
+		} else if patchCommand {
+			var patch topic.DefinitionPatch
+			if topicCmd.Patch != nil {
+				patch = *topicCmd.Patch
+			}
+			definition, err = topic.MergeDefinitionPatch(base, patch, false)
+			if err != nil {
+				return err
+			}
+		}
+		if config.HasCleanupPolicy(definition.Policy.CleanupPolicy, config.CleanupPolicyCompact) {
+			return fmt.Errorf("cleanup policy compact is not supported in distributed mode")
 		}
 
 		var brokers []string
@@ -90,9 +117,9 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			return fmt.Errorf("no active brokers")
 		}
 
-		if topicCmd.Partitions <= 0 {
-			util.Error("FSM: Invalid partition count %d for topic %s", topicCmd.Partitions, topicCmd.Name)
-			return fmt.Errorf("invalid partition count: %d", topicCmd.Partitions)
+		if definition.Partitions <= 0 {
+			util.Error("FSM: Invalid partition count %d for topic %s", definition.Partitions, topicCmd.Name)
+			return fmt.Errorf("invalid partition count: %d", definition.Partitions)
 		}
 
 		if topicCmd.LeaderID != "" {
@@ -109,15 +136,11 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			}
 		}
 
-		replicationFactor := topicCmd.ReplicationFactor
-		if replicationFactor <= 0 {
-			replicationFactor = 3 // default small-cluster replication factor
-		}
+		replicationFactor := definition.ReplicationFactor
 		if replicationFactor > len(brokers) {
 			util.Warn("FSM: Requested RF %d exceeds active brokers %d. Capping to %d", replicationFactor, len(brokers), len(brokers))
 			replicationFactor = len(brokers)
 		}
-		topicCmd.ReplicationFactor = replicationFactor
 
 		ring := util.NewConsistentHashRing(150, nil)
 		ring.Add(brokers...)
@@ -130,10 +153,10 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		}
 		for i := 0; i < currentPartitions; i++ {
 			key := topicCmd.Name + "-" + strconv.Itoa(i)
-			stagedPartitions[key].PartitionCount = topicCmd.Partitions
+			stagedPartitions[key].PartitionCount = definition.Partitions
 		}
 
-		for i := currentPartitions; i < topicCmd.Partitions; i++ {
+		for i := currentPartitions; i < definition.Partitions; i++ {
 			key := topicCmd.Name + "-" + strconv.Itoa(i)
 
 			assignedLeader := topicCmd.LeaderID
@@ -163,33 +186,58 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			isrCopy := append([]string(nil), replicas...)
 
 			stagedPartitions[key] = &PartitionMetadata{
-				PartitionCount: topicCmd.Partitions,
+				PartitionCount: definition.Partitions,
 				Leader:         assignedLeader,
 				LeaderEpoch:    1,
-				Idempotent:     topicCmd.Idempotent,
+				Idempotent:     definition.Idempotent,
 				Replicas:       replicas,
 				ISR:            isrCopy,
 			}
 			util.Info("FSM: Assigned leader %s to partition %s (replicas=%v)", assignedLeader, key, replicas)
 		}
 
-		definition.Idempotent = topicCmd.Idempotent
-		definition.EventSourcing = topicCmd.EventSourcing
 		stagedTopics[topicCmd.Name] = copyTopicDefinition(&definition)
 		f.partitionMetadata = stagedPartitions
 		f.topicState = stagedTopics
+		appliedDefinition = definition
 		return nil
 	}()
 	if stageResult != nil {
 		return stageResult
 	}
 
-	if err := f.materializeTopicCreate(&definition); err != nil {
+	if err := f.materializeTopicCreate(&appliedDefinition); err != nil {
 		util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicCmd.Name, err)
 		return err
 	}
-	util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, topicCmd.Partitions)
+	util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, appliedDefinition.Partitions)
 	return nil
+}
+
+func legacyTopicDefinitionPatch(definition topic.Definition, includeReplicationFactor bool) topic.DefinitionPatch {
+	partitions := definition.Partitions
+	cleanupPolicy := definition.Policy.CleanupPolicy
+	retentionHours := definition.Policy.RetentionHours
+	retentionBytes := definition.Policy.RetentionBytes
+	partitioner := definition.Policy.Partitioner
+	authPolicy := definition.Policy.AuthPolicy
+	readACL := append([]string(nil), definition.Policy.ReadACL...)
+	writeACL := append([]string(nil), definition.Policy.WriteACL...)
+	patch := topic.DefinitionPatch{
+		Partitions:     &partitions,
+		CleanupPolicy:  &cleanupPolicy,
+		RetentionHours: &retentionHours,
+		RetentionBytes: &retentionBytes,
+		Partitioner:    &partitioner,
+		AuthPolicy:     &authPolicy,
+		ReadACL:        &readACL,
+		WriteACL:       &writeACL,
+	}
+	if includeReplicationFactor {
+		replicationFactor := definition.ReplicationFactor
+		patch.ReplicationFactor = &replicationFactor
+	}
+	return patch
 }
 
 func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {

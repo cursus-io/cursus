@@ -97,14 +97,16 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string, ctx ...*ClientContext)
 	type TopicMetadata struct {
 		Status     string              `json:"status"`
 		Topic      string              `json:"topic"`
+		Definition topic.Definition    `json:"definition"`
 		Partitions []PartitionMetadata `json:"partitions"`
 		Policy     topic.Policy        `json:"policy"`
 	}
 
 	meta := TopicMetadata{
-		Status: "OK",
-		Topic:  topicName,
-		Policy: t.Policy,
+		Status:     "OK",
+		Topic:      topicName,
+		Definition: t.Definition(),
+		Policy:     t.Policy,
 	}
 
 	var raftLeader string
@@ -179,6 +181,9 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 		}
 	}
 
-	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d",
-		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), t.Policy.CleanupPolicy, t.Policy.Partitioner, t.Policy.AuthPolicy, strings.Join(t.Policy.ReadACL, ","), strings.Join(t.Policy.WriteACL, ","), t.Policy.RetentionHours, t.Policy.RetentionBytes)
+	definition := t.Definition()
+	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s revision=%d replication_factor=%d idempotent=%t event_sourcing=%t cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d",
+		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), definition.Revision, definition.ReplicationFactor,
+		definition.Idempotent, definition.EventSourcing, definition.Policy.CleanupPolicy, definition.Policy.Partitioner, definition.Policy.AuthPolicy,
+		strings.Join(definition.Policy.ReadACL, ","), strings.Join(definition.Policy.WriteACL, ","), definition.Policy.RetentionHours, definition.Policy.RetentionBytes)
 }

@@ -38,50 +38,11 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 		return fmt.Sprintf("ERROR: invalid_topic_name topic=%q reason=%q", topicName, err.Error())
 	}
 
-	partitions := 4 // default
-	if partStr, ok := args["partitions"]; ok {
-		n, err := strconv.Atoi(partStr)
-		if err != nil || n <= 0 {
-			return "ERROR: invalid_partitions reason=\"must be a positive integer\""
-		}
-		partitions = n
+	patch, patchErr := parseTopicDefinitionPatch(args)
+	if patchErr != "" {
+		return patchErr
 	}
-
-	idempotent := false
-	if idempStr, ok := args["idempotent"]; ok {
-		idempotent = strings.ToLower(idempStr) == "true"
-	}
-
-	eventSourcing := false
-	if esStr, ok := args["event_sourcing"]; ok {
-		eventSourcing = strings.ToLower(esStr) == "true"
-	}
-
-	policy, policyErr := parseTopicPolicy(args, ch.Config.CleanupPolicy)
-	if policyErr != "" {
-		return policyErr
-	}
-	effectiveEventSourcing := eventSourcing
-	if existing := ch.TopicManager.GetTopic(topicName); existing != nil && existing.IsEventSourcing {
-		effectiveEventSourcing = true
-	}
-	if config.HasCleanupPolicy(policy.CleanupPolicy, config.CleanupPolicyCompact) {
-		if effectiveEventSourcing {
-			return `ERROR: invalid_topic_policy field=cleanup_policy reason="compaction is not supported for event-sourcing topics"`
-		}
-		if ch.Config.EnabledDistribution {
-			return `ERROR: unsupported_topic_policy field=cleanup_policy reason="compaction is not supported in distributed mode"`
-		}
-	}
-
-	replicationFactor := ch.Config.DefaultReplicationFactor
-	if rfStr, ok := args["replication_factor"]; ok {
-		n, err := strconv.Atoi(rfStr)
-		if err != nil || n <= 0 {
-			return "ERROR: invalid_replication_factor reason=\"must be a positive integer\""
-		}
-		replicationFactor = n
-	}
+	defaults := topic.DefaultDefinition(topicName, ch.Config)
 
 	tm := ch.TopicManager
 	if ch.isDistributed() {
@@ -90,20 +51,16 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 		}
 
 		payload := map[string]interface{}{
-			"name":               topicName,
-			"partitions":         partitions,
-			"idempotent":         idempotent,
-			"event_sourcing":     eventSourcing,
-			"replication_factor": replicationFactor,
-			"policy":             policy,
+			"definition": defaults,
+			"patch":      patch,
 		}
 		_, err := ch.applyAndWaitContext(requestCtx, "TOPIC", payload)
 		if err != nil {
-			return fmt.Sprintf("ERROR: create_topic_failed reason=%q", err.Error())
+			return formatCreateTopicError(topicName, err)
 		}
 	} else {
-		if err := tm.CreateTopicWithPolicy(topicName, partitions, idempotent, eventSourcing, policy); err != nil {
-			return fmt.Sprintf("ERROR: create_topic_failed topic=%s reason=%q", topicName, err.Error())
+		if _, err := tm.CreateTopicWithPatch(defaults, patch); err != nil {
+			return formatCreateTopicError(topicName, err)
 		}
 	}
 
@@ -113,54 +70,144 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 	}
 
 	if ch.Coordinator != nil {
-		err := ch.Coordinator.RegisterGroup(topicName, "default-group", partitions)
+		err := ch.Coordinator.RegisterGroup(topicName, "default-group", len(t.Partitions))
 		if err != nil {
 			util.Warn("Failed to register default group with coordinator: %v", err)
 		}
 	}
-	return fmt.Sprintf("OK topic=%s partitions=%d cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d", topicName, len(t.Partitions), t.Policy.CleanupPolicy, t.Policy.Partitioner, t.Policy.AuthPolicy, strings.Join(t.Policy.ReadACL, ","), strings.Join(t.Policy.WriteACL, ","), t.Policy.RetentionHours, t.Policy.RetentionBytes)
+	return formatTopicDefinitionResponse(t.Definition())
 }
 
-func parseTopicPolicy(args map[string]string, defaultCleanupPolicy string) (topic.Policy, string) {
-	policy := topic.DefaultPolicy()
-	if defaultCleanupPolicy != "" {
-		policy.CleanupPolicy = defaultCleanupPolicy
-	}
-	if v := args["cleanup_policy"]; v != "" {
-		policy.CleanupPolicy = v
-	}
-	if v := args["retention_hours"]; v != "" {
-		parsed, err := strconv.Atoi(v)
-		if err != nil {
-			return policy, fmt.Sprintf("ERROR: invalid_retention_hours value=%s", v)
+func parseTopicDefinitionPatch(args map[string]string) (topic.DefinitionPatch, string) {
+	var patch topic.DefinitionPatch
+	if value, ok := args["partitions"]; ok {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			return patch, "ERROR: invalid_partitions reason=\"must be a positive integer\""
 		}
-		policy.RetentionHours = parsed
+		patch.Partitions = &parsed
 	}
-	if v := args["retention_bytes"]; v != "" {
-		parsed, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			return policy, fmt.Sprintf("ERROR: invalid_retention_bytes value=%s", v)
+	if value, ok := args["replication_factor"]; ok {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			return patch, "ERROR: invalid_replication_factor reason=\"must be a positive integer\""
 		}
-		policy.RetentionBytes = parsed
+		patch.ReplicationFactor = &parsed
 	}
-	if v := args["partitioner"]; v != "" {
-		policy.Partitioner = v
+	if value, ok := args["idempotent"]; ok {
+		parsed, valid := parseCreateBool(value)
+		if !valid {
+			return patch, fmt.Sprintf("ERROR: invalid_idempotent value=%q", value)
+		}
+		patch.Idempotent = &parsed
 	}
-	if v := args["auth_policy"]; v != "" {
-		policy.AuthPolicy = v
+	if value, ok := args["event_sourcing"]; ok {
+		parsed, valid := parseCreateBool(value)
+		if !valid {
+			return patch, fmt.Sprintf("ERROR: invalid_event_sourcing value=%q", value)
+		}
+		patch.EventSourcing = &parsed
 	}
-	policy.ReadACL = parseACLArg(args["read_acl"])
-	policy.WriteACL = parseACLArg(args["write_acl"])
-	policy, err := policy.Normalize()
-	if err != nil {
-		return policy, fmt.Sprintf("ERROR: invalid_topic_policy reason=%q", err.Error())
+	if value, ok := args["cleanup_policy"]; ok {
+		if _, valid := config.NormalizeCleanupPolicy(value); !valid {
+			return patch, fmt.Sprintf("ERROR: invalid_topic_policy field=cleanup_policy reason=%q", "invalid cleanup policy "+value)
+		}
+		patch.CleanupPolicy = &value
 	}
-	return policy, ""
+	if value, ok := args["retention_hours"]; ok {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return patch, fmt.Sprintf("ERROR: invalid_retention_hours value=%s", value)
+		}
+		patch.RetentionHours = &parsed
+	}
+	if value, ok := args["retention_bytes"]; ok {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return patch, fmt.Sprintf("ERROR: invalid_retention_bytes value=%s", value)
+		}
+		patch.RetentionBytes = &parsed
+	}
+	if value, ok := args["partitioner"]; ok {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case topic.PartitionerHashKey, topic.PartitionerRoundRobin:
+			patch.Partitioner = &value
+		default:
+			return patch, fmt.Sprintf("ERROR: invalid_topic_policy field=partitioner reason=%q", "invalid partitioner "+value)
+		}
+	}
+	if value, ok := args["auth_policy"]; ok {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case topic.AuthPolicyOpen, topic.AuthPolicyDenyWrite, topic.AuthPolicyDenyRead, topic.AuthPolicyACL:
+			patch.AuthPolicy = &value
+		default:
+			return patch, fmt.Sprintf("ERROR: invalid_topic_policy field=auth_policy reason=%q", "invalid auth policy "+value)
+		}
+	}
+	if value, ok := args["read_acl"]; ok {
+		parsed := parseACLArg(value)
+		patch.ReadACL = &parsed
+	}
+	if value, ok := args["write_acl"]; ok {
+		parsed := parseACLArg(value)
+		patch.WriteACL = &parsed
+	}
+	return patch, ""
+}
+
+func parseCreateBool(value string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func formatCreateTopicError(topicName string, err error) string {
+	reason := err.Error()
+	switch {
+	case strings.Contains(reason, "cleanup policy compact is not supported in distributed mode"):
+		return `ERROR: unsupported_topic_policy field=cleanup_policy reason="compaction is not supported in distributed mode"`
+	case strings.Contains(reason, "cleanup policy compact is not supported for event-sourcing topics"):
+		return `ERROR: invalid_topic_policy field=cleanup_policy reason="compaction is not supported for event-sourcing topics"`
+	case strings.Contains(reason, "invalid cleanup policy"),
+		strings.Contains(reason, "invalid partitioner"),
+		strings.Contains(reason, "invalid auth policy"),
+		strings.Contains(reason, "retention_hours"),
+		strings.Contains(reason, "retention_bytes"):
+		return fmt.Sprintf("ERROR: invalid_topic_policy reason=%q", reason)
+	default:
+		return fmt.Sprintf("ERROR: create_topic_failed topic=%s reason=%q", topicName, reason)
+	}
+}
+
+func formatTopicDefinitionResponse(definition topic.Definition) string {
+	return fmt.Sprintf(
+		"OK topic=%s partitions=%d revision=%d replication_factor=%d idempotent=%t event_sourcing=%t cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d",
+		definition.Name,
+		definition.Partitions,
+		definition.Revision,
+		definition.ReplicationFactor,
+		definition.Idempotent,
+		definition.EventSourcing,
+		definition.Policy.CleanupPolicy,
+		definition.Policy.Partitioner,
+		definition.Policy.AuthPolicy,
+		strings.Join(definition.Policy.ReadACL, ","),
+		strings.Join(definition.Policy.WriteACL, ","),
+		definition.Policy.RetentionHours,
+		definition.Policy.RetentionBytes,
+	)
 }
 
 func parseACLArg(value string) []string {
 	if strings.TrimSpace(value) == "" {
-		return nil
+		// Keep an allocated empty slice so the distributed JSON command encodes
+		// [] rather than null. Decoding null into *[]string loses field presence.
+		return []string{}
 	}
 	parts := strings.Split(value, ",")
 	acl := make([]string, 0, len(parts))

@@ -158,7 +158,7 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 		return nil
 	}
 
-	err := f.tm.CreateTopicWithPolicy(definition.Name, definition.Partitions, definition.Idempotent, definition.EventSourcing, definition.Policy)
+	err := f.tm.ApplyDefinition(*definition)
 	f.recordTopicMaterialization(definition.Name, TopicMaterializationCreate, err)
 	if err != nil {
 		return fmt.Errorf("materialize topic %q: %w", definition.Name, err)

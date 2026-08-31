@@ -23,7 +23,7 @@ type BrokerFSMSnapshot struct {
 
 func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	state := BrokerFSMState{
-		Version:           6,
+		Version:           7,
 		Applied:           s.applied,
 		Logs:              s.logs,
 		Brokers:           s.brokers,

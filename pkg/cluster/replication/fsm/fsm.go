@@ -237,6 +237,8 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Info("FSM Restore: Validating snapshot Version 5 (with committed partition watermarks)")
 	case 6:
 		util.Info("FSM Restore: Validating snapshot Version 6 (with durable topic definitions)")
+	case 7:
+		util.Info("FSM Restore: Validating snapshot Version 7 (with revisioned topic definitions)")
 	default:
 		return fmt.Errorf("unknown snapshot version: %d", state.Version)
 	}
@@ -248,10 +250,14 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		}
 		restoredTopicState = legacyTopicState(state.PartitionMetadata)
 	}
-	_, err := validateTopicState(restoredTopicState, state.PartitionMetadata)
+	if err := migrateSnapshotTopicDefinitionFields(state.Version, restoredTopicState, state.PartitionMetadata); err != nil {
+		return fmt.Errorf("restore topic definitions: %w", err)
+	}
+	definitions, err := validateTopicState(restoredTopicState, state.PartitionMetadata)
 	if err != nil {
 		return fmt.Errorf("restore topic definitions: %w", err)
 	}
+	restoredTopicState = topicStateFromDefinitions(definitions)
 	f.materializationMu.Lock()
 	localDefinitions := []topic.Definition(nil)
 	persistedTopicStorage := []string(nil)
@@ -439,9 +445,11 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	if len(topicStateCopy) == 0 && len(metadataCopy) > 0 {
 		topicStateCopy = legacyTopicState(metadataCopy)
 	}
-	if _, err := validateTopicState(topicStateCopy, metadataCopy); err != nil {
+	definitions, err := validateTopicState(topicStateCopy, metadataCopy)
+	if err != nil {
 		return nil, fmt.Errorf("snapshot topic definitions: %w", err)
 	}
+	topicStateCopy = topicStateFromDefinitions(definitions)
 
 	var groupState map[string]*coordinator.GroupStateSnapshot
 	if f.cd != nil {
