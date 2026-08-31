@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -82,4 +83,42 @@ func TestDeleteRewritesStandaloneTransactionJournalWithoutTopicReferences(t *tes
 	require.NoError(t, reloaded.ConfigureTransactionJournal(journalPath))
 	state := reloaded.TxnManager.ExportState()["tx-orders"]
 	require.Equal(t, []transaction.MessageOperation{{Topic: "audit", Partition: 0}}, state.Messages)
+}
+
+func TestDeleteDoesNotPruneDependenciesBeforeLogicalCommit(t *testing.T) {
+	handler, _, groupCoordinator := newTestHandlerWithCoordinator(t)
+	ctx := NewClientContext("", 0)
+	require.True(t, strings.HasPrefix(handler.HandleCommand("CREATE topic=orders partitions=1", ctx), "OK "))
+	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
+	require.NoError(t, groupCoordinator.CommitOffset("workers", "orders", 0, 17))
+	handler.TxnManager.ApplySnapshot(&transaction.Snapshot{
+		ID: "tx-orders", State: transaction.StateCommitted, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		Messages: []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
+	})
+	handler.TopicManager.SetDeleteHook(func(string) error { return errors.New("injected pre-commit failure") })
+
+	response := handler.HandleCommand("DELETE topic=orders", ctx)
+	require.Contains(t, response, "delete_topic_failed")
+	require.NotNil(t, handler.TopicManager.GetTopic("orders"))
+	require.NotNil(t, groupCoordinator.GetGroup("workers"))
+	_, found := groupCoordinator.GetOffset("workers", "orders", 0)
+	require.True(t, found)
+	require.Len(t, handler.TxnManager.ExportState()["tx-orders"].Messages, 1)
+}
+
+func TestCreateBlocksStaleLifecycleReferencesUntilIdempotentDeleteCleanup(t *testing.T) {
+	handler, _, groupCoordinator := newTestHandlerWithCoordinator(t)
+	ctx := NewClientContext("", 0)
+	require.True(t, strings.HasPrefix(handler.HandleCommand("CREATE topic=orders partitions=1", ctx), "OK "))
+	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
+	require.NoError(t, groupCoordinator.CommitOffset("workers", "orders", 0, 17))
+
+	deleted, err := handler.TopicManager.DeleteTopicDurable("orders")
+	require.NoError(t, err)
+	require.True(t, deleted)
+	require.Contains(t, handler.HandleCommand("CREATE topic=orders partitions=1", ctx), "lifecycle cleanup is pending")
+	require.Equal(t, "OK topic=orders deleted=false", handler.HandleCommand("DELETE topic=orders if_exists=true", ctx))
+	require.True(t, strings.HasPrefix(handler.HandleCommand("CREATE topic=orders partitions=1", ctx), "OK "))
+	_, found := groupCoordinator.GetOffset("workers", "orders", 0)
+	require.False(t, found)
 }

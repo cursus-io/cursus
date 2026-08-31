@@ -74,6 +74,22 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		if currentTopic == nil {
 			currentTopic = legacyTopicState(stagedPartitions)[topicCmd.Name]
 		}
+		if currentTopic == nil {
+			if f.cd != nil {
+				if references := f.cd.TopicGroupReferences(topicCmd.Name); len(references) != 0 {
+					return fmt.Errorf("topic %q lifecycle cleanup is pending for consumer group %q", topicCmd.Name, references[0].Name)
+				}
+			}
+			if f.txn != nil {
+				_, affected, stateErr := f.txn.StateWithoutTopicReferences(topicCmd.Name)
+				if stateErr != nil {
+					return fmt.Errorf("topic %q lifecycle cleanup is pending: %w", topicCmd.Name, stateErr)
+				}
+				if len(affected) != 0 {
+					return fmt.Errorf("topic %q lifecycle cleanup is pending for transaction %q", topicCmd.Name, affected[0])
+				}
+			}
+		}
 
 		definition := base
 		if currentTopic != nil {

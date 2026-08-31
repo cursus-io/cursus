@@ -108,3 +108,30 @@ func TestBrokerFSMTopicDeleteReportsCommittedDeletionWhenLocalCleanupIsPending(t
 	require.Equal(t, topic.DeleteResult{Deleted: true, CleanupPending: true}, result)
 	require.Nil(t, manager.GetTopic("orders"))
 }
+
+func TestBrokerFSMCreateWaitsForStaleLifecycleCleanup(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+	manager := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+	groupCoordinator := coordinator.NewCoordinator(context.Background(), cfg, manager)
+	transactions := transaction.NewManager()
+	fsm := NewBrokerFSM(manager, groupCoordinator)
+	fsm.SetTransactionManager(transactions)
+	registerActiveBroker(t, fsm, "broker-1")
+
+	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
+	transactions.ApplySnapshot(&transaction.Snapshot{
+		ID: "tx-orders", State: transaction.StateCommitted,
+		Messages: []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
+	})
+	create, err := json.Marshal(TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()})
+	require.NoError(t, err)
+	result := fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 2})
+	require.ErrorContains(t, result.(error), "lifecycle cleanup is pending")
+
+	require.Equal(t, topic.DeleteResult{Deleted: false}, fsm.Apply(&raft.Log{
+		Data: []byte(`TOPIC_DELETE:{"topic":"orders","if_exists":true}`), Index: 3,
+	}))
+	require.Nil(t, fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 4}))
+}

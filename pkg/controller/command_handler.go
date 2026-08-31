@@ -66,6 +66,11 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 			return formatCreateTopicError(topicName, err)
 		}
 	} else {
+		if tm.GetTopic(topicName) == nil {
+			if err := ch.ensureTopicRecreationIsClean(topicName); err != nil {
+				return formatCreateTopicError(topicName, err)
+			}
+		}
 		if _, err := tm.CreateTopicWithPatch(defaults, patch); err != nil {
 			return formatCreateTopicError(topicName, err)
 		}
@@ -310,48 +315,73 @@ func (ch *CommandHandler) handleDelete(cmd string, ctx ...*ClientContext) string
 	if !exists && !ifExists {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	if err := ch.cleanupStandaloneTopicDependencies(topicName); err != nil {
+	transactionState, err := ch.prepareStandaloneTopicDependencies(topicName)
+	if err != nil {
 		if errors.Is(err, topic.ErrTopicDeleteBlocked) {
 			return fmt.Sprintf("ERROR: topic_delete_blocked topic=%s reason=%q", topicName, err.Error())
 		}
 		return fmt.Sprintf("ERROR: delete_topic_failed topic=%s reason=%q", topicName, err.Error())
 	}
 	if !exists {
+		if err := ch.applyStandaloneTopicDependencyCleanup(topicName, transactionState); err != nil {
+			util.Warn("Topic %s is absent with pending dependency cleanup: %v", topicName, err)
+			return fmt.Sprintf("OK topic=%s deleted=false cleanup_pending=true", topicName)
+		}
 		return fmt.Sprintf("OK topic=%s deleted=false", topicName)
 	}
-	deleted, err := ch.TopicManager.DeleteTopicDurable(topicName)
-	if err != nil {
-		if deleted {
-			util.Warn("Topic %s was logically deleted with pending storage cleanup: %v", topicName, err)
-			return fmt.Sprintf("OK topic=%s deleted=true cleanup_pending=true", topicName)
-		}
-		return fmt.Sprintf("ERROR: delete_topic_failed topic=%s reason=%q", topicName, err.Error())
+	deleted, deleteErr := ch.TopicManager.DeleteTopicDurable(topicName)
+	if deleteErr != nil && !deleted {
+		return fmt.Sprintf("ERROR: delete_topic_failed topic=%s reason=%q", topicName, deleteErr.Error())
 	}
 	if !deleted {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	ch.closeEventSourcingTopic(topicName)
+	cleanupErr := ch.applyStandaloneTopicDependencyCleanup(topicName, transactionState)
+	if deleteErr != nil || cleanupErr != nil {
+		util.Warn("Topic %s was logically deleted with pending cleanup: storage=%v dependencies=%v", topicName, deleteErr, cleanupErr)
+		return fmt.Sprintf("OK topic=%s deleted=true cleanup_pending=true", topicName)
+	}
 	return fmt.Sprintf("OK topic=%s deleted=true", topicName)
 }
 
-func (ch *CommandHandler) cleanupStandaloneTopicDependencies(topicName string) error {
+func (ch *CommandHandler) ensureTopicRecreationIsClean(topicName string) error {
+	if ch.Coordinator != nil {
+		if references := ch.Coordinator.TopicGroupReferences(topicName); len(references) != 0 {
+			return fmt.Errorf("topic %q lifecycle cleanup is pending for consumer group %q", topicName, references[0].Name)
+		}
+	}
+	if ch.TxnManager != nil {
+		_, affected, err := ch.TxnManager.StateWithoutTopicReferences(topicName)
+		if err != nil {
+			return fmt.Errorf("topic %q lifecycle cleanup is pending: %w", topicName, err)
+		}
+		if len(affected) != 0 {
+			return fmt.Errorf("topic %q lifecycle cleanup is pending for transaction %q", topicName, affected[0])
+		}
+	}
+	return nil
+}
+
+func (ch *CommandHandler) prepareStandaloneTopicDependencies(topicName string) (map[string]*transaction.Snapshot, error) {
 	if ch.Coordinator != nil {
 		for _, reference := range ch.Coordinator.TopicGroupReferences(topicName) {
 			if reference.MemberCount != 0 {
-				return fmt.Errorf("%w: consumer group %q has %d active member(s)", topic.ErrTopicDeleteBlocked, reference.Name, reference.MemberCount)
+				return nil, fmt.Errorf("%w: consumer group %q has %d active member(s)", topic.ErrTopicDeleteBlocked, reference.Name, reference.MemberCount)
 			}
 		}
 	}
 
-	var transactionState map[string]*transaction.Snapshot
-	if ch.TxnManager != nil {
-		state, _, err := ch.TxnManager.StateWithoutTopicReferences(topicName)
-		if err != nil {
-			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
-		}
-		transactionState = state
+	if ch.TxnManager == nil {
+		return nil, nil
 	}
+	state, _, err := ch.TxnManager.StateWithoutTopicReferences(topicName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
+	}
+	return state, nil
+}
 
+func (ch *CommandHandler) applyStandaloneTopicDependencyCleanup(topicName string, transactionState map[string]*transaction.Snapshot) error {
 	if ch.Coordinator != nil {
 		if _, err := ch.Coordinator.DeleteInactiveGroupsForTopic(topicName); err != nil {
 			return fmt.Errorf("delete inactive consumer groups for topic %q: %w", topicName, err)
