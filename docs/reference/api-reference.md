@@ -61,12 +61,12 @@ With `structured_errors_v1` enabled, subsequent text errors use `ERROR: <code> c
 CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>] [cleanup_policy=<delete|compact|delete,compact>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
 ```
 
-Creates a topic or increases its partition count when the topic already exists.
+Creates a topic or patches an existing definition. Defaults apply only when the topic is missing. On an existing topic, omitted fields are preserved and explicit `0`, `false`, or empty ACL values are authoritative. Partitions can only increase; replication factor, idempotent mode, and event-sourcing mode are immutable after creation.
 
 Success:
 
 ```text
-OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>
+OK topic=<name> partitions=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>
 ```
 
 Common errors:
@@ -126,7 +126,7 @@ OK count=0 topics=
 DESCRIBE topic=<name>
 ```
 
-Success is a JSON topic metadata object with `status:"OK"`.
+Success is a JSON topic metadata object with `status:"OK"`. Its additive `definition` object contains the same revision, replication factor, modes, partition count, and policy returned by `CREATE`; the existing `partitions` and `policy` fields remain available.
 
 Common errors:
 
@@ -160,7 +160,7 @@ Because `message=` captures the rest of the line, put optional parameters before
 
 Transaction metadata fields are not accepted on client `PUBLISH`; use the transaction commands for transactional records. Direct `transactional_id`, `transaction_state`, or `transaction_marker` injection returns `ERROR: transaction_metadata_forbidden command=PUBLISH`.
 
-For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Producer epochs entered FSM snapshot version 3; current brokers write version 6 with transaction state, committed partition watermarks, and durable topic definitions. Avoid mixed-version rolling upgrades with binaries that cannot decode version 6. For `acks=0`, success is:
+For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Producer epochs entered FSM snapshot version 3; current brokers write version 7 with transaction state, committed partition watermarks, and revisioned durable topic definitions. Avoid mixed-version rolling upgrades with binaries that cannot decode version 7. For `acks=0`, success is:
 
 ```text
 OK
@@ -460,7 +460,7 @@ METADATA topic=<name>
 Success is a text response:
 
 ```text
-OK topic=<name> partitions=<N> leaders=<csv> epochs=<csv> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>
+OK topic=<name> partitions=<N> leaders=<csv> epochs=<csv> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>
 ```
 
 Common errors:

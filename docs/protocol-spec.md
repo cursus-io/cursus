@@ -180,10 +180,10 @@ CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [event_sourcing=<
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
 | topic | Yes | - | Portable topic name: 1-249 ASCII bytes using letters, digits, `.`, `_`, `-`, or `=` |
-| partitions | No | 4 | Number of partitions |
-| idempotent | No | false | Enable producer dedup |
-| event_sourcing | No | false | Enable aggregate stream commands; requires non-compacted history |
-| cleanup_policy | No | broker default | `delete`, `compact`, or canonical combined policy `delete,compact` |
+| partitions | No | 4 for a new topic | Number of partitions; existing topics can only increase |
+| idempotent | No | false for a new topic | Enable producer dedup; immutable after creation |
+| event_sourcing | No | false for a new topic | Enable aggregate stream commands; immutable after creation and requires non-compacted history |
+| cleanup_policy | No | broker default for a new topic | `delete`, `compact`, or canonical combined policy `delete,compact` |
 | retention_hours | No | 0 | Per-topic retention hours override metadata; 0 means broker default |
 | retention_bytes | No | 0 | Per-topic retention bytes override metadata; 0 means broker default |
 | partitioner | No | hash_key | `hash_key` uses message key hash, `round_robin` ignores keys |
@@ -192,11 +192,13 @@ CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [event_sourcing=<
 | write_acl | No | - | Comma-separated principals allowed to write when `auth_policy=acl`; `*` allows any authenticated principal |
 | replication_factor | No | 3 | Replica count (distributed mode) |
 
-Response: `OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>`
+Response: `OK topic=<name> partitions=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> cleanup_policy=<policy> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>`
 
 Topic names are a portable on-disk identifier: 1-249 ASCII bytes containing only letters, digits, `.`, `_`, `-`, or `=`; `.` and `..` are reserved. Invalid names return `ERROR: invalid_topic_name ...`.
 
-A successful standalone `CREATE` means the versioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. Broker restart restores partition count, idempotent/event-sourcing mode, partitioner, retention, cleanup policy, auth policy, and ACLs from this manifest. Distributed mode commits the same definition through the cluster FSM and includes it in snapshot version 6.
+A missing topic is built from broker defaults and the supplied fields. For an existing topic, `CREATE` is a presence-aware patch: omitted fields retain their authoritative value, while explicit `0`, `false`, and empty `read_acl=`/`write_acl=` values are applied. Partition count can only increase. `replication_factor`, `idempotent`, and `event_sourcing` may be restated with the current value but cannot be changed. A no-op keeps the current `revision`; every effective definition change increments it.
+
+A successful standalone `CREATE` means the revisioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. Broker restart restores revision, replication factor, partition count, idempotent/event-sourcing mode, partitioner, retention, cleanup policy, auth policy, and ACLs from manifest version 2. Version 1 manifests load with `revision=1` and `replication_factor=3`, then upgrade on the next metadata write. Distributed mode merges the patch inside serialized FSM apply and includes the complete definition in snapshot version 7. Version 6 snapshots receive revision 1 and infer replication factor from consistent partition replica metadata, falling back to 3 only when legacy metadata has no replica set. Version 7 and manifest version 2 fail closed if their required fields are absent.
 
 `compact` and `delete,compact` are accepted only by standalone, non-event-sourcing topics. Unsupported combinations return `ERROR: invalid_topic_policy ...` or `ERROR: unsupported_topic_policy ...`. Repeating `CREATE` for an existing event-sourcing topic cannot use a false `event_sourcing` argument to bypass this validation. Repeating `CREATE` also preserves existing partition leader epochs and committed HWMs; only newly added partitions receive new assignments.
 
@@ -229,6 +231,19 @@ Response (JSON):
 {
   "status": "OK",
   "topic": "mytopic",
+  "definition": {
+    "name": "mytopic",
+    "revision": 2,
+    "partitions": 1,
+    "replication_factor": 3,
+    "idempotent": false,
+    "event_sourcing": false,
+    "policy": {
+      "cleanup_policy": "delete",
+      "partitioner": "hash_key",
+      "auth_policy": "open"
+    }
+  },
   "partitions": [
     {
       "id": 0,
@@ -309,7 +324,7 @@ METADATA topic=<name>
 |-------|----------|-------------|
 | topic | Yes | Topic name |
 
-Response: `OK topic=<name> partitions=<N> leaders=<host:port>,<host:port>,... epochs=<csv> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>`
+Response: `OK topic=<name> partitions=<N> leaders=<host:port>,<host:port>,... epochs=<csv> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>`
 
 Returns partition leaders/epochs and the authoritative durable topic policy restored from the standalone manifest or cluster FSM. Leader addresses are in partition order (P0, P1, P2, ...).
 
@@ -519,7 +534,7 @@ missing, an entry is malformed, or the same partition appears more than once.
 
 Cursus exposes a broker-managed transaction coordinator for consume-process-produce workflows. In distributed mode, transaction commands are routed by `transactional_id` using the coordinator key `txn:<transactional_id>`. Clients can discover the owner with `FIND_COORDINATOR transactional_id=<id>` and must retry on `ERROR: NOT_COORDINATOR host=<host> port=<port>`.
 
-Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Transaction state entered the schema in version 4, committed partition watermarks in version 5, and durable topic definitions in the current version 6.
+Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Transaction state entered the schema in version 4, committed partition watermarks in version 5, durable topic definitions in version 6, and revisioned definitions in the current version 7.
 
 Clients should first call `INIT_PRODUCER_ID` for a `transactional_id`; the broker returns the authoritative `(producerId, epoch)` session and bumps `epoch` on re-initialization to fence older producers. The coordinator fences stale producers by `(transactional_id, producerId, epoch)`: lower epochs are rejected, and staged operations must use the same producer and epoch that opened the transaction. After `transactional_id_expiration_ms`, completed transactions discard staged message/offset payloads but retain a compact epoch tombstone. The tombstone participates in standalone journal and distributed metadata snapshots, preventing an older producer session from being revived. Active `open` and `committing` transactions are not expired by the cleanup path.
 
@@ -941,7 +956,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - Broker tracks the last seen `(epoch, seqNum)` per `(producerId)` per partition
 - Disk-backed partitions persist producer sequence checkpoints, rebuild producer state from partition logs on broker restart, and use that state to make transactional commit recovery idempotent
 - Distributed FSM snapshots also include producer sequence state for replicated message commands
-- Producer epochs entered FSM snapshot version 3, transaction state version 4, committed partition watermarks version 5, and durable topic definitions version 6. Current brokers write version 6. Do not run a mixed-version rolling upgrade with binaries that cannot decode version 6; upgrade the cluster together or use an explicitly documented compatibility procedure.
+- Producer epochs entered FSM snapshot version 3, transaction state version 4, committed partition watermarks version 5, durable topic definitions version 6, and revision/replication fields version 7. Current brokers write version 7. Do not run a mixed-version rolling upgrade with binaries that cannot decode version 7; upgrade the cluster together or use an explicitly documented compatibility procedure.
 - Producer state expires from memory after `producer_state_ttl_ms` of inactivity (default 30 minutes); durable checkpoints retain the last persisted sequence until the partition data is removed
 
 ---

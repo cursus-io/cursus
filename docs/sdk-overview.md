@@ -137,7 +137,7 @@ if errors.As(err, &brokerErr) {
 
 ## Go Topic Policy
 
-`CreateTopic` remains the compatibility API and inherits broker policy defaults. Use `CreateTopicWithOptions` for an explicit cleanup contract:
+`Producer.CreateTopic` remains the compatibility API. Disabled idempotence and unspecified policy values are omitted so repeated provisioning does not clear an existing definition. Use `CreateTopicWithOptions` for an explicit non-zero producer provisioning contract:
 
 ```go
 err := producer.CreateTopicWithOptions("player-state", sdk.TopicOptions{
@@ -148,7 +148,25 @@ err := producer.CreateTopicWithOptions("player-state", sdk.TopicOptions{
 })
 ```
 
-The SDK canonicalizes `compact,delete` to `delete,compact` and validates the portable topic-name contract and rejects unsafe command values, negative retention, or unknown policy enums before opening a broker connection. Compact policies require a standalone, non-event-sourcing topic. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
+For administrative create/update flows, use `AdminClient`. `TopicDefinitionPatch` uses pointers so callers can intentionally send zero, false, or an empty ACL while leaving nil fields unchanged:
+
+```go
+cfg := sdk.NewDefaultAdminConfig()
+cfg.BrokerAddrs = []string{"broker-1:9000", "broker-2:9000", "broker-3:9000"}
+admin, err := sdk.NewAdminClient(cfg)
+if err != nil {
+    return err
+}
+
+retentionHours := 0
+emptyReaders := []string{}
+definition, err := admin.UpdateTopic("player-state", sdk.TopicDefinitionPatch{
+    RetentionHours: &retentionHours,
+    ReadACL:        &emptyReaders,
+})
+```
+
+`AdminClient` validates values locally, returns the broker's complete `TopicDefinition`, and retries only retryable routing/availability or transport failures. Attempts are bounded by `MaxRetries + 1` and rotate across configured brokers. The SDK canonicalizes `compact,delete` to `delete,compact`, enforces the portable topic-name contract, and rejects unsafe command values, negative retention, or unknown policy enums before opening a broker connection. Compact policies require a standalone, non-event-sourcing topic. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
 
 ## Go Transactional Producer
 

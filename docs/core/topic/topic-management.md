@@ -17,32 +17,32 @@ It does not use a global payload-hash deduplication map. Retry safety comes from
 
 ## Create And Update
 
-`CreateTopicWithPolicy` normalizes policy before mutation.
+Protocol `CREATE` is implemented as a `DefinitionPatch`. Pointer presence distinguishes omission from an explicit zero, false, or empty ACL. Defaults are evaluated only when the topic is absent; an existing definition is read and merged while `TopicManager.mu` is held.
 
 | Existing state | Requested partitions | Result |
 |---|---:|---|
 | missing | positive | create topic and partitions |
-| exists | equal | update normalized policy, no partition change |
-| exists | greater | append new partitions and update policy |
+| exists | omitted/equal | preserve partitions; patch only supplied fields |
+| exists | greater | append new partitions and patch supplied fields |
 | exists | lower | reject; partition count never shrinks |
 
-New and existing partitions receive the current transaction decision resolver so `read_committed` uses coordinator authority. Retention and cleanup policy are propagated to every partition handler. An existing event-sourcing topic remains protected even if a later idempotent create request omits or clears `event_sourcing`.
+`replication_factor`, `idempotent`, and `event_sourcing` are immutable after creation. Restating the current value is accepted; a conflicting explicit value is rejected. Effective changes increment the durable definition revision and no-op patches retain it. New and existing partitions receive the current transaction decision resolver so `read_committed` uses coordinator authority. Retention and cleanup policy are propagated to every partition handler.
 
 Topic names use a portable storage contract: 1-249 ASCII bytes containing letters, digits, `.`, `_`, `-`, or `=`; `.` and `..` are reserved. This prevents a protocol topic identifier from escaping the broker-owned log root.
 
 `cleanup_policy` accepts `delete`, `compact`, and `delete,compact`. Compact policies are rejected when distribution is enabled or the topic is event-sourcing. Standalone compaction details are in [Log Compaction](../storage/log-compaction.md).
 
-For standalone create/update, new partition handlers are staged while the topic lock excludes publishers. The complete target definition is atomically persisted before policy or partition count becomes visible. A persistence failure closes/evicts staged handlers and leaves the live definition unchanged. In distributed mode the FSM retains existing partition leader epoch/HWM state on repeated create and allocates metadata only for newly added partitions.
+For standalone create/update, new partition handlers are staged while the topic lock excludes publishers. The complete target definition is atomically persisted before policy or partition count becomes visible. A persistence failure closes/evicts staged handlers and leaves the live definition unchanged. In distributed mode the Raft command carries the complete new-topic defaults plus the presence-aware patch. The FSM merges against its current authoritative definition while holding the FSM lock, preventing serialized disjoint updates from losing one another. Existing partition leader epoch/HWM state is retained and metadata is allocated only for newly added partitions.
 
 ## Startup Recovery
 
-Standalone brokers load `{log_dir}/__topic_metadata.json` before coordinator initialization and static-group registration. The versioned manifest restores partition count, idempotent/event-sourcing flags, cleanup/retention, partitioner, auth policy, and ACLs. Unknown fields, duplicate topics, unsupported versions, invalid names, and malformed policy fail broker startup instead of silently weakening authorization or cleanup behavior.
+Standalone brokers load `{log_dir}/__topic_metadata.json` before coordinator initialization and static-group registration. Manifest version 2 restores revision, replication factor, partition count, idempotent/event-sourcing flags, cleanup/retention, partitioner, auth policy, and ACLs. Version 1 definitions are normalized to revision 1 and replication factor 3 and are written as version 2 on the next mutation. Unknown fields, duplicate topics, unsupported versions, invalid names, and malformed policy fail broker startup instead of silently weakening authorization or cleanup behavior.
 
 Brokers upgraded from versions without the manifest do not guess security or event-sourcing policy from segment filenames. If persisted partition logs exist without a manifest, or a manifest omits a persisted topic directory, startup fails and lists the orphaned topics. Operators must migrate or archive those directories and provide authoritative definitions before restart. A normal `CREATE` also rejects a name whose orphaned logs remain, preventing deleted data from being silently resurrected.
 
 The internal offset topic is recreated by the coordinator and then enters the manifest on a new data directory. Existing pre-manifest offset logs require the same explicit migration as application topics.
 
-Distributed brokers keep topic definitions in the FSM and snapshot format version 6. Snapshot restore rebuilds the topic registry before committed HWM reconciliation. Version 5 and older snapshots can reconstruct partition count/idempotent mode from partition metadata, using the historical default topic policy because those snapshots did not retain the richer definition.
+Distributed brokers keep topic definitions in the FSM and snapshot format version 7. Snapshot restore normalizes older definitions, rebuilds the topic registry, and then reconciles committed HWMs. Version 6 definitions receive revision 1 and infer replication factor from consistent replica metadata, with 3 as the fallback when old metadata has no replicas. Version 5 and older snapshots can reconstruct partition count/idempotent mode from partition metadata and use the historical default topic policy. Version 7 fails closed when revision or replication factor is absent.
 
 ## Delete
 
