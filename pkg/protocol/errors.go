@@ -70,14 +70,14 @@ func buildErrorRegistry() map[string]ErrorClassification {
 	)
 	register(ErrorClassConflict, false,
 		"OFFSET_OUT_OF_RANGE", "leader_election_rejected", "offset_regression", "snapshot_version_exceeds_stream",
-		"producer_reinitialization_required",
+		"producer_reinitialization_required", "topic_delete_blocked",
 		"topic_not_assigned_to_group", "transaction_aborted", "transaction_already_committed",
 		"transaction_marker_partition_not_touched", "transaction_not_abortable", "transaction_not_committing",
 		"transaction_record_not_staged", "version_conflict",
 	)
 	register(ErrorClassAuthorization, false,
 		"NOT_AUTHORIZED_FOR_OPERATION", "NOT_AUTHORIZED_FOR_PARTITION", "NOT_AUTHORIZED_FOR_TOPIC", "authentication_failed", "authentication_required",
-		"internal_auth_not_configured", "internal_batch_requires_token_wrapper", "internal_command_unauthorized",
+		"internal_auth_not_configured", "internal_batch_requires_token_wrapper", "internal_command_unauthorized", "internal_topic_delete_forbidden",
 		"internal_topic_write_forbidden", "internal_txn_publish_forbidden", "transaction_metadata_forbidden",
 	)
 	register(ErrorClassNotFound, false,
@@ -89,7 +89,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"empty_required_params", "event_sourcing_not_enabled", "invalid_acks", "invalid_batch_commit_entry", "invalid_batch_commit_format",
 		"invalid_auth", "invalid_consume_syntax", "invalid_control_batch_bytes", "invalid_control_batch_coordinator_epoch",
 		"invalid_control_batch_version", "invalid_commit_watermark", "invalid_epoch", "invalid_generation", "invalid_is_idempotent",
-		"invalid_event_sourcing", "invalid_idempotent", "invalid_offset", "invalid_partition", "invalid_partitions", "invalid_payload", "invalid_payload_json",
+		"invalid_event_sourcing", "invalid_idempotent", "invalid_if_exists", "invalid_offset", "invalid_partition", "invalid_partitions", "invalid_payload", "invalid_payload_json",
 		"invalid_protocol_features", "invalid_protocol_version", "invalid_replication_factor", "invalid_require_features",
 		"invalid_transaction_control_batch", "invalid_transaction_control_epoch", "invalid_transaction_control_record",
 		"invalid_transaction_marker", "invalid_transaction_marker_producer", "invalid_transaction_result",

@@ -16,6 +16,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -50,9 +51,15 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 			return resp
 		}
 
-		payload := map[string]interface{}{
-			"definition": defaults,
-			"patch":      patch,
+		var current *topic.Definition
+		if fsmRef := ch.Cluster.RaftManager.GetFSM(); fsmRef != nil {
+			if definition, found := fsmRef.GetTopicDefinition(topicName); found {
+				current = &definition
+			}
+		}
+		payload, payloadErr := distributedTopicCommandPayload(defaults, patch, current)
+		if payloadErr != nil {
+			return formatCreateTopicError(topicName, payloadErr)
 		}
 		_, err := ch.applyAndWaitContext(requestCtx, "TOPIC", payload)
 		if err != nil {
@@ -76,6 +83,29 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 		}
 	}
 	return formatTopicDefinitionResponse(t.Definition())
+}
+
+func distributedTopicCommandPayload(defaults topic.Definition, patch topic.DefinitionPatch, current *topic.Definition) (map[string]interface{}, error) {
+	base := defaults
+	existing := false
+	if current != nil {
+		base = *current
+		existing = true
+	}
+	legacyDefinition, err := topic.MergeDefinitionPatch(base, patch, existing)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"name":               legacyDefinition.Name,
+		"partitions":         legacyDefinition.Partitions,
+		"idempotent":         legacyDefinition.Idempotent,
+		"event_sourcing":     legacyDefinition.EventSourcing,
+		"replication_factor": legacyDefinition.ReplicationFactor,
+		"policy":             legacyDefinition.Policy,
+		"definition":         defaults,
+		"patch":              patch,
+	}, nil
 }
 
 func parseTopicDefinitionPatch(args map[string]string) (topic.DefinitionPatch, string) {
@@ -186,13 +216,9 @@ func formatCreateTopicError(topicName string, err error) string {
 
 func formatTopicDefinitionResponse(definition topic.Definition) string {
 	return fmt.Sprintf(
-		"OK topic=%s partitions=%d revision=%d replication_factor=%d idempotent=%t event_sourcing=%t cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d",
+		"OK topic=%s partitions=%d cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d revision=%d replication_factor=%d idempotent=%t event_sourcing=%t",
 		definition.Name,
 		definition.Partitions,
-		definition.Revision,
-		definition.ReplicationFactor,
-		definition.Idempotent,
-		definition.EventSourcing,
 		definition.Policy.CleanupPolicy,
 		definition.Policy.Partitioner,
 		definition.Policy.AuthPolicy,
@@ -200,6 +226,10 @@ func formatTopicDefinitionResponse(definition topic.Definition) string {
 		strings.Join(definition.Policy.WriteACL, ","),
 		definition.Policy.RetentionHours,
 		definition.Policy.RetentionBytes,
+		definition.Revision,
+		definition.ReplicationFactor,
+		definition.Idempotent,
+		definition.EventSourcing,
 	)
 }
 
@@ -232,6 +262,17 @@ func (ch *CommandHandler) handleDelete(cmd string, ctx ...*ClientContext) string
 	if err := topic.ValidateName(topicName); err != nil {
 		return fmt.Sprintf("ERROR: invalid_topic_name topic=%q reason=%q", topicName, err.Error())
 	}
+	if topicName == config.ConsumerOffsetsTopicName {
+		return fmt.Sprintf("ERROR: internal_topic_delete_forbidden topic=%s", topicName)
+	}
+	ifExists := false
+	if value, present := args["if_exists"]; present {
+		parsed, valid := parseCreateBool(value)
+		if !valid {
+			return fmt.Sprintf("ERROR: invalid_if_exists value=%q", value)
+		}
+		ifExists = parsed
+	}
 
 	if ch.isDistributed() {
 		if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, cmd); forwarded {
@@ -239,20 +280,51 @@ func (ch *CommandHandler) handleDelete(cmd string, ctx ...*ClientContext) string
 		}
 
 		payload := map[string]interface{}{
-			"topic": topicName,
+			"topic":     topicName,
+			"if_exists": ifExists,
 		}
-		if _, err := ch.applyAndWaitContext(requestCtx, "TOPIC_DELETE", payload); err != nil {
+		result, err := ch.applyAndWaitContext(requestCtx, "TOPIC_DELETE", payload)
+		if err != nil {
 			if errors.Is(err, topic.ErrTopicNotFound) {
 				return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+			}
+			if errors.Is(err, topic.ErrTopicDeleteBlocked) {
+				return fmt.Sprintf("ERROR: topic_delete_blocked topic=%s reason=%q", topicName, err.Error())
 			}
 			return fmt.Sprintf("ERROR: delete_topic_failed reason=%q", err.Error())
 		}
 		ch.closeEventSourcingTopic(topicName)
-		return fmt.Sprintf("OK topic=%s deleted=true", topicName)
+		deleted := true
+		cleanupPending := false
+		if deleteResult, ok := result.(topic.DeleteResult); ok {
+			deleted = deleteResult.Deleted
+			cleanupPending = deleteResult.CleanupPending
+		}
+		if cleanupPending {
+			return fmt.Sprintf("OK topic=%s deleted=%t cleanup_pending=true", topicName, deleted)
+		}
+		return fmt.Sprintf("OK topic=%s deleted=%t", topicName, deleted)
 	}
 
+	exists := ch.TopicManager.GetTopic(topicName) != nil
+	if !exists && !ifExists {
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+	if err := ch.cleanupStandaloneTopicDependencies(topicName); err != nil {
+		if errors.Is(err, topic.ErrTopicDeleteBlocked) {
+			return fmt.Sprintf("ERROR: topic_delete_blocked topic=%s reason=%q", topicName, err.Error())
+		}
+		return fmt.Sprintf("ERROR: delete_topic_failed topic=%s reason=%q", topicName, err.Error())
+	}
+	if !exists {
+		return fmt.Sprintf("OK topic=%s deleted=false", topicName)
+	}
 	deleted, err := ch.TopicManager.DeleteTopicDurable(topicName)
 	if err != nil {
+		if deleted {
+			util.Warn("Topic %s was logically deleted with pending storage cleanup: %v", topicName, err)
+			return fmt.Sprintf("OK topic=%s deleted=true cleanup_pending=true", topicName)
+		}
 		return fmt.Sprintf("ERROR: delete_topic_failed topic=%s reason=%q", topicName, err.Error())
 	}
 	if !deleted {
@@ -260,6 +332,40 @@ func (ch *CommandHandler) handleDelete(cmd string, ctx ...*ClientContext) string
 	}
 	ch.closeEventSourcingTopic(topicName)
 	return fmt.Sprintf("OK topic=%s deleted=true", topicName)
+}
+
+func (ch *CommandHandler) cleanupStandaloneTopicDependencies(topicName string) error {
+	if ch.Coordinator != nil {
+		for _, reference := range ch.Coordinator.TopicGroupReferences(topicName) {
+			if reference.MemberCount != 0 {
+				return fmt.Errorf("%w: consumer group %q has %d active member(s)", topic.ErrTopicDeleteBlocked, reference.Name, reference.MemberCount)
+			}
+		}
+	}
+
+	var transactionState map[string]*transaction.Snapshot
+	if ch.TxnManager != nil {
+		state, _, err := ch.TxnManager.StateWithoutTopicReferences(topicName)
+		if err != nil {
+			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
+		}
+		transactionState = state
+	}
+
+	if ch.Coordinator != nil {
+		if _, err := ch.Coordinator.DeleteInactiveGroupsForTopic(topicName); err != nil {
+			return fmt.Errorf("delete inactive consumer groups for topic %q: %w", topicName, err)
+		}
+	}
+	if transactionState != nil {
+		if ch.txnJournal != nil {
+			if err := ch.txnJournal.Rewrite(transactionState); err != nil {
+				return fmt.Errorf("rewrite transaction journal for topic deletion: %w", err)
+			}
+		}
+		ch.TxnManager.ImportState(transactionState)
+	}
+	return nil
 }
 
 func (ch *CommandHandler) closeEventSourcingTopic(topicName string) {

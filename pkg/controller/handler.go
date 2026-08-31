@@ -35,6 +35,8 @@ type CommandHandler struct {
 	coordCache               map[string]coordCacheEntry
 	coordCacheMu             sync.RWMutex
 	txnApplyMu               sync.Mutex
+	topicLifecycleMu         sync.RWMutex
+	topicCreateMu            sync.Mutex
 	txnJournal               *transaction.Journal
 	transactionStateSyncHook func(string) error
 	transactionStateLocks    [transactionStateLockStripes]sync.Mutex
@@ -105,6 +107,7 @@ func NewCommandHandler(
 	}
 	if tm != nil {
 		tm.SetTransactionDecisionResolver(ch.TxnManager)
+		tm.SetDeleteHook(ch.ESHandler.DeleteTopic)
 	}
 	if cc != nil && cc.RaftManager != nil {
 		if fsm := cc.RaftManager.GetFSM(); fsm != nil {
@@ -226,6 +229,17 @@ func (ch *CommandHandler) HandleCommandContext(requestCtx context.Context, rawCm
 func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (response string) {
 	started := time.Now()
 	input := decodeCommandInput(rawCmd)
+	if input.Name == "DELETE" {
+		ch.topicLifecycleMu.Lock()
+		defer ch.topicLifecycleMu.Unlock()
+	} else {
+		ch.topicLifecycleMu.RLock()
+		defer ch.topicLifecycleMu.RUnlock()
+	}
+	if input.Name == "CREATE" {
+		ch.topicCreateMu.Lock()
+		defer ch.topicCreateMu.Unlock()
+	}
 	cmd := input.Raw
 	commandName := ch.metricCommandNameInput(input)
 	defer func() {

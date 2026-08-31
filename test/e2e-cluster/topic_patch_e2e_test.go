@@ -89,6 +89,30 @@ func TestRepeatedCreatePatchPreservesDefinitionAcrossThreeNodes(t *testing.T) {
 		"revision": "4", "partitions": "2", "replication_factor": "3", "idempotent": "true",
 		"retention_hours": "0", "retention_bytes": "8192", "read_acl": "", "write_acl": "writer-2",
 	})
+
+	deleted := sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "DELETE topic="+topicName)
+	requireDefinitionFields(t, deleted, map[string]string{"topic": topicName, "deleted": "true"})
+	require.Contains(t, sendClusterTopicCommandRaw(t, ctx.GetBrokerAddrs(), "DELETE topic="+topicName), "topic_not_found")
+	idempotentDelete := sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "DELETE topic="+topicName+" if_exists=true")
+	requireDefinitionFields(t, idempotentDelete, map[string]string{"topic": topicName, "deleted": "false"})
+	require.Contains(t, sendClusterTopicCommandRaw(t, ctx.GetBrokerAddrs(), "DELETE topic=__consumer_offsets if_exists=true"), "internal_topic_delete_forbidden")
+	requireClusterTopicMissingEventually(t, ctx.GetBrokerAddrs(), topicName)
+
+	actions.StopBroker(follower)
+	actions.StartBroker(follower)
+	requireClusterTopicMissingEventually(t, ctx.GetBrokerAddrs(), topicName)
+
+	recreated := sendClusterTopicCommand(t, ctx.GetBrokerAddrs(),
+		"CREATE topic="+topicName+" partitions=1 replication_factor=3 retention_hours=24",
+	)
+	requireDefinitionFields(t, recreated, map[string]string{
+		"topic": topicName, "revision": "1", "partitions": "1", "replication_factor": "3",
+		"retention_hours": "24", "retention_bytes": "0", "read_acl": "", "write_acl": "",
+	})
+	requireClusterDefinitionEventually(t, ctx.GetBrokerAddrs(), topicName, map[string]string{
+		"revision": "1", "partitions": "1", "replication_factor": "3",
+		"retention_hours": "24", "retention_bytes": "0", "read_acl": "", "write_acl": "",
+	})
 }
 
 func sendClusterTopicCommand(t *testing.T, addrs []string, command string) string {
@@ -125,6 +149,24 @@ func requireClusterDefinitionEventually(t *testing.T, addrs []string, topicName 
 			}
 		}
 		return true, "definition converged", nil
+	}))
+}
+
+func requireClusterTopicMissingEventually(t *testing.T, addrs []string, topicName string) {
+	t.Helper()
+	require.NoError(t, eventually(t, "topic deletion on all brokers", clusterReadyTimeout, func() (bool, string, error) {
+		for _, addr := range addrs {
+			client := e2e.NewBrokerClient([]string{addr})
+			response, err := client.SendCommand("", "METADATA topic="+topicName, 5*time.Second)
+			client.Close()
+			if err != nil {
+				return false, addr + ": request failed", nil
+			}
+			if !strings.Contains(response, "topic_not_found") {
+				return false, fmt.Sprintf("%s: topic still present (%s)", addr, response), nil
+			}
+		}
+		return true, "topic deletion converged", nil
 	}))
 }
 

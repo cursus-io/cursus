@@ -803,6 +803,7 @@ func (h *Handler) DeleteTopic(topicName string) error {
 			firstErr = fmt.Errorf("close index %s: %w", key, err)
 		}
 		delete(h.indexes, key)
+		delete(h.indexedHWM, key)
 	}
 	for key, ss := range h.snapshots {
 		if !strings.HasPrefix(key, prefix) {

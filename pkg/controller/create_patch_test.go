@@ -25,6 +25,64 @@ func TestExplicitEmptyACLSurvivesDistributedPatchEncoding(t *testing.T) {
 	require.Empty(t, *restored.ReadACL)
 }
 
+func TestDistributedTopicCommandPayloadKeepsLegacyFields(t *testing.T) {
+	current := topic.DefaultDefinition("orders", nil)
+	current.Partitions = 2
+	current.Policy.RetentionHours = 168
+	current.Policy.ReadACL = []string{"reader"}
+	retentionBytes := int64(8192)
+	payload, err := distributedTopicCommandPayload(
+		topic.DefaultDefinition("orders", nil),
+		topic.DefinitionPatch{RetentionBytes: &retentionBytes},
+		&current,
+	)
+	require.NoError(t, err)
+
+	encoded, err := json.Marshal(payload)
+	require.NoError(t, err)
+	var legacy struct {
+		Name              string       `json:"name"`
+		Partitions        int          `json:"partitions"`
+		ReplicationFactor int          `json:"replication_factor"`
+		Policy            topic.Policy `json:"policy"`
+	}
+	require.NoError(t, json.Unmarshal(encoded, &legacy))
+	require.Equal(t, "orders", legacy.Name)
+	require.Equal(t, 2, legacy.Partitions)
+	require.Equal(t, topic.DefaultReplicationFactor, legacy.ReplicationFactor)
+	require.Equal(t, 168, legacy.Policy.RetentionHours)
+	require.Equal(t, int64(8192), legacy.Policy.RetentionBytes)
+	require.Equal(t, []string{"reader"}, legacy.Policy.ReadACL)
+	require.NotNil(t, payload["definition"])
+	require.NotNil(t, payload["patch"])
+}
+
+func TestTopicDefinitionResponsesAppendFieldsAfterLegacyPrefix(t *testing.T) {
+	handler, _ := newTestHandler(t)
+	ctx := NewClientContext("", 0)
+	create := handler.HandleCommand("CREATE topic=compat partitions=1", ctx)
+	require.Equal(t, []string{
+		"OK", "topic", "partitions", "cleanup_policy", "partitioner", "auth_policy", "read_acl", "write_acl",
+		"retention_hours", "retention_bytes", "revision", "replication_factor", "idempotent", "event_sourcing",
+	}, responseFieldNames(create))
+
+	metadata := handler.HandleCommand("METADATA topic=compat", ctx)
+	require.Equal(t, []string{
+		"OK", "topic", "partitions", "leaders", "epochs", "cleanup_policy", "partitioner", "auth_policy", "read_acl",
+		"write_acl", "retention_hours", "retention_bytes", "revision", "replication_factor", "idempotent", "event_sourcing",
+	}, responseFieldNames(metadata))
+}
+
+func responseFieldNames(response string) []string {
+	fields := strings.Fields(response)
+	result := make([]string, 0, len(fields))
+	for _, field := range fields {
+		name, _, _ := strings.Cut(field, "=")
+		result = append(result, name)
+	}
+	return result
+}
+
 func TestRepeatedCreatePreservesOmittedTopicDefinitionFields(t *testing.T) {
 	ch, _ := newTestHandler(t)
 	ctx := NewClientContext("", 0)

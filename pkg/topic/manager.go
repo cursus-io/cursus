@@ -18,6 +18,14 @@ import (
 )
 
 var ErrTopicNotFound = errors.New("topic not found")
+var ErrTopicDeleteBlocked = errors.New("topic delete blocked")
+
+// DeleteResult reports the committed logical deletion and whether node-local
+// physical cleanup still needs reconciliation.
+type DeleteResult struct {
+	Deleted        bool
+	CleanupPending bool
+}
 
 type StreamManager interface {
 	AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), legacyCommitInterval time.Duration) error
@@ -28,6 +36,7 @@ type StreamManager interface {
 
 type TopicManager struct {
 	topics        map[string]*Topic
+	deleting      map[string]bool
 	stopCh        chan struct{}
 	hp            HandlerProvider
 	stopOnce      sync.Once
@@ -37,12 +46,24 @@ type TopicManager struct {
 	coordinator   *coordinator.Coordinator
 	txnResolver   TransactionDecisionResolver
 	metadataStore *topicMetadataStore
+	deleteHook    func(string) error
 
 	metadataLoadFailure             string
 	metadataRestoredTopicCount      int
 	metadataOrphanTopicCount        int
 	metadataDurabilityWarning       string
 	metadataDurabilityWarningsTotal uint64
+}
+
+// SetDeleteHook registers cleanup for derived per-topic state that must be
+// closed before physical topic storage is removed.
+func (tm *TopicManager) SetDeleteHook(hook func(string) error) {
+	if tm == nil {
+		return
+	}
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.deleteHook = hook
 }
 
 // HandlerProvider defines an interface to provide disk handlers.
@@ -79,6 +100,7 @@ func (tm *TopicManager) SetTransactionDecisionResolver(resolver TransactionDecis
 func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *TopicManager {
 	tm := &TopicManager{
 		topics:        make(map[string]*Topic),
+		deleting:      make(map[string]bool),
 		stopCh:        make(chan struct{}),
 		hp:            hp,
 		cfg:           cfg,
@@ -137,6 +159,9 @@ func (tm *TopicManager) CreateTopicWithPatch(defaults Definition, patch Definiti
 
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
+	if tm.deleting[defaults.Name] {
+		return Definition{}, fmt.Errorf("topic %q is being deleted", defaults.Name)
+	}
 
 	if existing := tm.topics[defaults.Name]; existing != nil {
 		current := existing.Definition()
@@ -221,6 +246,9 @@ func (tm *TopicManager) ApplyDefinition(raw Definition) error {
 
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
+	if tm.deleting[definition.Name] {
+		return fmt.Errorf("topic %q is being deleted", definition.Name)
+	}
 	if existing := tm.topics[definition.Name]; existing != nil {
 		current := existing.Definition()
 		if definition.Partitions < current.Partitions {
@@ -249,6 +277,9 @@ func (tm *TopicManager) ApplyDefinition(raw Definition) error {
 func (tm *TopicManager) GetTopic(name string) *Topic {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
+	if tm.deleting[name] {
+		return nil
+	}
 	return tm.topics[name]
 }
 
@@ -545,9 +576,32 @@ func (tm *TopicManager) DeleteTopicDurable(name string) (bool, error) {
 	}
 
 	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
 	current := tm.topics[name]
+	if current == nil {
+		tm.mu.Unlock()
+		return false, nil
+	}
+	if tm.deleting[name] {
+		tm.mu.Unlock()
+		return false, fmt.Errorf("topic %q deletion is already in progress", name)
+	}
+	tm.deleting[name] = true
+	deleteHook := tm.deleteHook
+	tm.mu.Unlock()
+
+	if deleteHook != nil {
+		if err := deleteHook(name); err != nil {
+			tm.mu.Lock()
+			delete(tm.deleting, name)
+			tm.mu.Unlock()
+			return false, fmt.Errorf("close derived topic state %q: %w", name, err)
+		}
+	}
+
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	defer delete(tm.deleting, name)
+	current = tm.topics[name]
 	if current == nil {
 		return false, nil
 	}

@@ -70,6 +70,7 @@ type BrokerFSMState struct {
 type BrokerFSM struct {
 	notifiers         map[string]chan interface{}
 	mu                sync.RWMutex
+	transitionMu      sync.Mutex
 	materializationMu sync.Mutex
 
 	logs              map[uint64]*ReplicationEntry
@@ -124,6 +125,18 @@ func (f *BrokerFSM) GetAllPartitionKeys() []string {
 	return keys
 }
 
+// GetTopicDefinition returns a detached copy of the authoritative replicated
+// topic definition, including when node-local materialization is pending.
+func (f *BrokerFSM) GetTopicDefinition(name string) (topic.Definition, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	definition := f.topicState[name]
+	if definition == nil {
+		return topic.Definition{}, false
+	}
+	return *copyTopicDefinition(definition), true
+}
+
 func (f *BrokerFSM) SetCoordinator(cd *coordinator.Coordinator) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -142,6 +155,9 @@ func (f *BrokerFSM) SetTransactionManager(txn *transaction.Manager) {
 }
 
 func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
+
 	data := string(log.Data)
 	var reqID string
 
@@ -208,6 +224,9 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 }
 
 func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
+
 	defer func() {
 		if err := rc.Close(); err != nil {
 			util.Error("failed to close rc: %v", err)
@@ -402,6 +421,9 @@ func (f *BrokerFSM) reconcileCommittedPartitions() {
 }
 
 func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
+
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 

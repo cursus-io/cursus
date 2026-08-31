@@ -156,5 +156,16 @@ func MergeDefinitionPatch(current Definition, patch DefinitionPatch, existing bo
 func definitionsEqualWithoutRevision(left, right Definition) bool {
 	left.Revision = 0
 	right.Revision = 0
+	left.Policy.ReadACL = canonicalACL(left.Policy.ReadACL)
+	left.Policy.WriteACL = canonicalACL(left.Policy.WriteACL)
+	right.Policy.ReadACL = canonicalACL(right.Policy.ReadACL)
+	right.Policy.WriteACL = canonicalACL(right.Policy.WriteACL)
 	return reflect.DeepEqual(left, right)
+}
+
+func canonicalACL(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	return values
 }

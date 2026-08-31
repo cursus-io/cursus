@@ -182,8 +182,9 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 	}
 
 	definition := t.Definition()
-	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s revision=%d replication_factor=%d idempotent=%t event_sourcing=%t cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d",
-		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), definition.Revision, definition.ReplicationFactor,
-		definition.Idempotent, definition.EventSourcing, definition.Policy.CleanupPolicy, definition.Policy.Partitioner, definition.Policy.AuthPolicy,
-		strings.Join(definition.Policy.ReadACL, ","), strings.Join(definition.Policy.WriteACL, ","), definition.Policy.RetentionHours, definition.Policy.RetentionBytes)
+	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d revision=%d replication_factor=%d idempotent=%t event_sourcing=%t",
+		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), definition.Policy.CleanupPolicy, definition.Policy.Partitioner,
+		definition.Policy.AuthPolicy, strings.Join(definition.Policy.ReadACL, ","), strings.Join(definition.Policy.WriteACL, ","),
+		definition.Policy.RetentionHours, definition.Policy.RetentionBytes, definition.Revision, definition.ReplicationFactor,
+		definition.Idempotent, definition.EventSourcing)
 }

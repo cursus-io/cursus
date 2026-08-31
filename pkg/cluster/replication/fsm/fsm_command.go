@@ -242,7 +242,8 @@ func legacyTopicDefinitionPatch(definition topic.Definition, includeReplicationF
 
 func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 	var payload struct {
-		Topic string `json:"topic"`
+		Topic    string `json:"topic"`
+		IfExists bool   `json:"if_exists,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(jsonData), &payload); err != nil {
 		util.Error("FSM: Failed to unmarshal topic delete command: %v", err)
@@ -251,37 +252,70 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 	if err := topic.ValidateName(payload.Topic); err != nil {
 		return fmt.Errorf("invalid topic name: %w", err)
 	}
-
-	stageResult := func() interface{} {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-
-		found := f.topicState[payload.Topic] != nil
-		for key := range f.partitionMetadata {
-			if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
-				found = true
-			}
-		}
-		if !found {
-			return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
-		}
-
-		for key := range f.partitionMetadata {
-			if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
-				delete(f.partitionMetadata, key)
-			}
-		}
-		delete(f.topicState, payload.Topic)
-		return nil
-	}()
-	if stageResult != nil {
-		return stageResult
+	if payload.Topic == config.ConsumerOffsetsTopicName {
+		return fmt.Errorf("cannot delete broker-owned internal consumer metadata topic")
 	}
+
+	f.mu.RLock()
+	found := f.topicState[payload.Topic] != nil
+	for key := range f.partitionMetadata {
+		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
+			found = true
+		}
+	}
+	coordinatorRef := f.cd
+	transactionManager := f.txn
+	f.mu.RUnlock()
+	if !found && !payload.IfExists {
+		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
+	}
+	if coordinatorRef != nil {
+		for _, reference := range coordinatorRef.TopicGroupReferences(payload.Topic) {
+			if reference.MemberCount != 0 {
+				return fmt.Errorf(
+					"%w: topic %q has active consumer group %q with %d member(s)",
+					topic.ErrTopicDeleteBlocked,
+					payload.Topic,
+					reference.Name,
+					reference.MemberCount,
+				)
+			}
+		}
+	}
+	if transactionManager != nil {
+		if _, _, err := transactionManager.StateWithoutTopicReferences(payload.Topic); err != nil {
+			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
+		}
+	}
+	if coordinatorRef != nil {
+		if _, err := coordinatorRef.DeleteInactiveGroupsForTopic(payload.Topic); err != nil {
+			return fmt.Errorf("delete consumer groups for topic %q: %w", payload.Topic, err)
+		}
+	}
+	if transactionManager != nil {
+		if _, err := transactionManager.PruneTopicReferences(payload.Topic); err != nil {
+			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
+		}
+	}
+
+	f.mu.Lock()
+	for key := range f.partitionMetadata {
+		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
+			delete(f.partitionMetadata, key)
+		}
+	}
+	delete(f.topicState, payload.Topic)
+	delete(f.producerState, payload.Topic)
+	f.mu.Unlock()
 
 	if err := f.materializeTopicDelete(payload.Topic); err != nil {
-		return err
+		util.Warn("FSM: Topic '%s' was logically deleted with pending local storage cleanup: %v", payload.Topic, err)
+		return topic.DeleteResult{Deleted: found, CleanupPending: true}
 	}
 	util.Info("FSM: Deleted topic '%s'", payload.Topic)
+	if !found {
+		return topic.DeleteResult{Deleted: false}
+	}
 	return nil
 }
 

@@ -187,9 +187,7 @@ func TestBrokerFSMPhysicalCleanupFailureRemainsPendingUntilRetry(t *testing.T) {
 	f.partitionMetadata["orders-0"] = &PartitionMetadata{PartitionCount: 1}
 
 	result := f.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders"}`), Index: 1})
-	applyErr, ok := result.(error)
-	require.True(t, ok)
-	require.ErrorContains(t, applyErr, "injected physical cleanup failure")
+	require.Equal(t, topic.DeleteResult{Deleted: true, CleanupPending: true}, result)
 	require.Nil(t, f.topicState["orders"])
 	require.Nil(t, manager.GetTopic("orders"))
 	require.Error(t, f.TopicMaterializationReadinessError())
