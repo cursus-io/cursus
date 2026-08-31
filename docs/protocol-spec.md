@@ -192,7 +192,7 @@ CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [event_sourcing=<
 | write_acl | No | - | Comma-separated principals allowed to write when `auth_policy=acl`; `*` allows any authenticated principal |
 | replication_factor | No | 3 | Replica count (distributed mode) |
 
-Response: `OK topic=<name> partitions=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> cleanup_policy=<policy> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>`
+Response: `OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool>`. The original field order remains intact and the revisioned-definition fields are appended for positional legacy parsers.
 
 Topic names are a portable on-disk identifier: 1-249 ASCII bytes containing only letters, digits, `.`, `_`, `-`, or `=`; `.` and `..` are reserved. Invalid names return `ERROR: invalid_topic_name ...`.
 
@@ -204,11 +204,21 @@ A successful standalone `CREATE` means the revisioned topic definition has been 
 
 **DELETE**
 ```
-DELETE topic=<name>
+DELETE topic=<name> [if_exists=<true|false>]
 ```
-Response: `OK topic=<name> deleted=true`
+Responses:
 
-Standalone deletion first commits removal from the durable manifest, then closes partition workers/handlers and removes topic data. A manifest failure returns `ERROR: delete_topic_failed ...` and leaves the topic registered. After the manifest commit, physical cleanup errors are logged but the response remains successful because the topic is no longer authoritative. Distributed deletion is committed through the FSM.
+- `OK topic=<name> deleted=true` when an existing topic is logically deleted.
+- `OK topic=<name> deleted=false` when `if_exists=true` observes an already missing topic.
+- Either response can include `cleanup_pending=true` when the durable logical state is committed but node-local storage cleanup must be retried by reconciliation.
+
+`if_exists` defaults to `false`, preserving the legacy `ERROR: topic_not_found topic=<name>` response for a missing topic. Invalid boolean values return `ERROR: invalid_if_exists ...`. `DELETE` requires the admin permission; topic read/write permission is insufficient. Broker-owned `__consumer_offsets` returns `ERROR: internal_topic_delete_forbidden ...` even with `if_exists=true`.
+
+Deletion fails closed with `ERROR: topic_delete_blocked ...` while a consumer group for the topic has active members or an open/committing transaction references it. Successful deletion writes lifecycle tombstones for inactive groups and removes their offsets, removes producer sequence state, and removes target-topic operations from terminal transactions. Event-sourcing indexes and snapshot handles are closed before topic storage is removed. Recreating the same name starts at definition revision 1 and must not restore old logs, offsets, producer state, transaction operations, or event-sourcing metadata.
+
+Standalone deletion first commits removal from the durable manifest, then removes the topic from the registry, stops partition workers, closes storage handlers, and removes topic data. A manifest failure returns `ERROR: delete_topic_failed ...` and leaves the topic registered. After the manifest commit, physical cleanup failure returns success with `cleanup_pending=true` because the topic is no longer authoritative; the orphan guard rejects same-name recreation until an idempotent cleanup retry or operator remediation removes the old storage. Distributed deletion is routed to the current leader and serialized in Raft; topic, partition, group, transaction, and producer state remain absent after replay and snapshot restore. Node-local cleanup failures remain visible to the topic materialization reconciler and metrics.
+
+`DELETE` followed by `CREATE` is not a truncate/reset operation and must not be generated implicitly by applications or reconcilers. Cursus does not currently expose `TRUNCATE` or `PURGE`: safely retaining a definition while atomically resetting partition records, log start/end/HWM, group lifecycle epochs, producer/transaction fences, event-sourcing state, standalone metadata, and distributed FSM snapshots requires a guarded first-class protocol. A future operation must require an expected topic revision (or equivalent optimistic guard) and fail closed or fence active producers and consumers. Until that contract exists, GitOps controllers should retain desired topics by default and require an explicit `state=absent` tombstone plus a separate approval boundary before issuing `DELETE`.
 
 **LIST**
 ```

@@ -66,8 +66,10 @@ Creates a topic or patches an existing definition. Defaults apply only when the 
 Success:
 
 ```text
-OK topic=<name> partitions=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>
+OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool>
 ```
+
+The pre-revision response fields keep their original order. New fields are appended so legacy key/value and positional readers can continue consuming the established prefix.
 
 Common errors:
 
@@ -84,23 +86,34 @@ ERROR: create_topic_failed reason="..."
 ### DELETE
 
 ```text
-DELETE topic=<name>
+DELETE topic=<name> [if_exists=<true|false>]
 ```
+
+Deletes a topic through the admin-only lifecycle path. The default `if_exists=false` preserves the legacy missing-topic error. Use `if_exists=true` only when an explicitly approved GitOps deletion must be safely retried. Active consumer-group members and open/committing transactions block deletion. Inactive groups and offsets, producer sequence state, target-topic operations in terminal transactions, and event-sourcing state are removed with the topic lifecycle. `__consumer_offsets` cannot be deleted.
 
 Success:
 
 ```text
 OK topic=<name> deleted=true
+OK topic=<name> deleted=false
+OK topic=<name> deleted=true cleanup_pending=true
 ```
+
+`cleanup_pending=true` means the durable logical deletion succeeded and node-local physical cleanup is queued for reconciliation; it is not permission to recreate the name until every broker has converged.
 
 Common errors:
 
 ```text
 ERROR: missing_topic expected="DELETE topic=<name>"
 ERROR: invalid_topic_name topic=<name> reason="..."
+ERROR: invalid_if_exists value="..."
 ERROR: topic_not_found topic=<name>
+ERROR: topic_delete_blocked topic=<name> reason="..."
+ERROR: internal_topic_delete_forbidden topic=<name>
 ERROR: delete_topic_failed reason="..."
 ```
+
+There is no `TRUNCATE`/`PURGE` command. Do not emulate one with `DELETE` plus `CREATE`: that changes topic identity and cannot atomically fence records, offsets, producer/transaction state, event-sourcing metadata, and cluster snapshots. Desired-state controllers should not infer deletion from an omitted list item; require an explicit absent/tombstone state and a separate approval boundary.
 
 ### LIST
 

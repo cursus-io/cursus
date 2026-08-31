@@ -164,9 +164,15 @@ definition, err := admin.UpdateTopic("player-state", sdk.TopicDefinitionPatch{
     RetentionHours: &retentionHours,
     ReadACL:        &emptyReaders,
 })
+
+deleted, err := admin.DeleteTopic("retired-player-state", sdk.DeleteTopicOptions{
+    IfExists: true,
+})
 ```
 
-`AdminClient` validates values locally, returns the broker's complete `TopicDefinition`, and retries only retryable routing/availability or transport failures. Attempts are bounded by `MaxRetries + 1` and rotate across configured brokers. The SDK canonicalizes `compact,delete` to `delete,compact`, enforces the portable topic-name contract, and rejects unsafe command values, negative retention, or unknown policy enums before opening a broker connection. Compact policies require a standalone, non-event-sourcing topic. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
+`AdminClient` validates values locally, returns the broker's complete `TopicDefinition` for create/update and a `DeleteTopicResult` for delete, and retries only retryable routing/availability or transport failures. Attempts are bounded by `MaxRetries + 1` and rotate across configured brokers, including when a broker drops the connection during protocol negotiation or authentication. The SDK canonicalizes `compact,delete` to `delete,compact`, enforces the portable topic-name contract, and rejects unsafe command values, negative retention, or unknown policy enums before opening a broker connection. Compact policies require a standalone, non-event-sourcing topic. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
+
+`DeleteTopic` exists only on the admin client; producer and consumer clients do not expose destructive lifecycle methods. `IfExists` makes an explicit deletion retry idempotent without changing legacy `topic_not_found` behavior. The admin client retries a dropped connection after command submission only for `IfExists=true`; a legacy delete stops with an unknown-outcome error rather than hiding a successful first deletion behind a retry's `topic_not_found`. `DeleteTopicResult.CleanupPending` means logical deletion committed while broker-local storage cleanup is still converging. Kubernetes reconcilers should call it only for an explicit absent/tombstone resource that crossed a separate approval boundary, never because a topic disappeared from a desired list. The SDK intentionally has no `TruncateTopic` shortcut and applications must not emulate truncation with delete-and-create.
 
 ## Go Transactional Producer
 

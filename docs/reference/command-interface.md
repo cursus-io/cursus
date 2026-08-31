@@ -27,6 +27,7 @@ Cursus clients use 4-byte big-endian length-prefixed frames over TCP. Most reque
 ```text
 CREATE topic=orders partitions=12
 CREATE topic=orders retention_hours=168
+DELETE topic=retired-orders if_exists=true
 PUBLISH topic=orders key=customer-42 message={"orderId":"o-1"}
 FIND_COORDINATOR group=order-workers
 JOIN_GROUP topic=orders group=order-workers member=worker-1
@@ -36,5 +37,7 @@ COMMIT_OFFSET topic=orders group=order-workers partition=0 offset=<lastProcessed
 ```
 
 The second `CREATE` is a patch: omitted fields retain their current values. Explicit `retention_hours=0`, `idempotent=false`, or `read_acl=` are distinct from omission. Immutable mode or replication changes are rejected, while effective mutable changes advance the definition revision returned by `CREATE`, `METADATA`, and `DESCRIBE`.
+
+`DELETE` is admin-only and `if_exists=true` is an explicit idempotency choice for approved retries. Do not derive it from a topic missing from desired state and do not use delete-and-create as a data-reset substitute; there is no `TRUNCATE`/`PURGE` contract.
 
 `COMMIT_OFFSET` values are next offsets, not last processed offsets. Stored offsets are monotonic and authoritative for resume. Refer to the [API reference](api-reference.md) for complete parameters and responses; internal replication commands are intentionally excluded from the client interface.
