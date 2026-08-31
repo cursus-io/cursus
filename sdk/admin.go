@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -74,6 +75,21 @@ type TopicDefinition struct {
 	WriteACL          []string
 }
 
+// DeleteTopicOptions controls the explicit idempotency contract for deletion.
+// IfExists=false preserves the legacy topic_not_found error.
+type DeleteTopicOptions struct {
+	IfExists bool
+}
+
+// DeleteTopicResult reports whether this request removed an existing topic.
+// CleanupPending means logical deletion committed but broker-local storage
+// cleanup still requires reconciliation or operator remediation.
+type DeleteTopicResult struct {
+	Topic          string
+	Deleted        bool
+	CleanupPending bool
+}
+
 // AdminClient performs bounded, broker-aware administrative requests.
 type AdminClient struct {
 	config    AdminConfig
@@ -86,6 +102,13 @@ type terminalAdminError struct {
 
 func (e *terminalAdminError) Error() string { return e.err.Error() }
 func (e *terminalAdminError) Unwrap() error { return e.err }
+
+type ambiguousAdminError struct {
+	err error
+}
+
+func (e *ambiguousAdminError) Error() string { return e.err.Error() }
+func (e *ambiguousAdminError) Unwrap() error { return e.err }
 
 func NewAdminClient(config *AdminConfig) (*AdminClient, error) {
 	if config == nil {
@@ -141,6 +164,25 @@ func (c *AdminClient) UpdateTopicContext(ctx context.Context, topic string, patc
 	return c.applyTopicPatch(ctx, topic, patch)
 }
 
+func (c *AdminClient) DeleteTopic(topic string, options DeleteTopicOptions) (DeleteTopicResult, error) {
+	return c.DeleteTopicContext(context.Background(), topic, options)
+}
+
+func (c *AdminClient) DeleteTopicContext(ctx context.Context, topic string, options DeleteTopicOptions) (DeleteTopicResult, error) {
+	if ctx == nil {
+		return DeleteTopicResult{}, fmt.Errorf("admin context is nil")
+	}
+	command, err := buildAdminDeleteTopicCommand(topic, options)
+	if err != nil {
+		return DeleteTopicResult{}, err
+	}
+	response, err := c.execute(ctx, command, options.IfExists)
+	if err != nil {
+		return DeleteTopicResult{}, err
+	}
+	return parseDeleteTopicResponse(response)
+}
+
 func (c *AdminClient) applyTopicPatch(ctx context.Context, topic string, patch TopicDefinitionPatch) (TopicDefinition, error) {
 	if ctx == nil {
 		return TopicDefinition{}, fmt.Errorf("admin context is nil")
@@ -149,14 +191,14 @@ func (c *AdminClient) applyTopicPatch(ctx context.Context, topic string, patch T
 	if err != nil {
 		return TopicDefinition{}, err
 	}
-	response, err := c.execute(ctx, command)
+	response, err := c.execute(ctx, command, true)
 	if err != nil {
 		return TopicDefinition{}, err
 	}
 	return parseTopicDefinitionResponse(response)
 }
 
-func (c *AdminClient) execute(ctx context.Context, command string) (string, error) {
+func (c *AdminClient) execute(ctx context.Context, command string, retryAmbiguous bool) (string, error) {
 	var lastErr error
 	attempts := c.config.MaxRetries + 1
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -176,6 +218,10 @@ func (c *AdminClient) execute(ctx context.Context, command string) (string, erro
 		var terminalErr *terminalAdminError
 		if errors.As(err, &terminalErr) {
 			return "", terminalErr.err
+		}
+		var ambiguousErr *ambiguousAdminError
+		if errors.As(err, &ambiguousErr) && !retryAmbiguous {
+			return "", fmt.Errorf("admin request outcome is unknown and was not retried: %w", ambiguousErr.err)
 		}
 		if attempt+1 == attempts {
 			break
@@ -215,16 +261,28 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 	defer stopCancellation()
 
 	if err := negotiateConfiguredProtocol(conn, c.config.ProtocolVersion, c.config.ProtocolFeatures, c.config.RequireProtocolFeatures, c.config.ProtocolNegotiationTimeoutMS); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		var brokerErr *BrokerError
 		if errors.As(err, &brokerErr) {
 			return "", brokerErr
 		}
+		if isRetryableAdminTransportError(err) {
+			return "", fmt.Errorf("protocol negotiation with %s: %w", addr, err)
+		}
 		return "", &terminalAdminError{err: fmt.Errorf("protocol negotiation with %s: %w", addr, err)}
 	}
 	if err := authenticateConfiguredClient(conn, c.config.Principal, c.config.AuthToken); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		var brokerErr *BrokerError
 		if errors.As(err, &brokerErr) {
 			return "", brokerErr
+		}
+		if isRetryableAdminTransportError(err) {
+			return "", fmt.Errorf("authentication with %s: %w", addr, err)
 		}
 		return "", &terminalAdminError{err: fmt.Errorf("authentication with %s: %w", addr, err)}
 	}
@@ -232,14 +290,14 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 		return "", fmt.Errorf("restore admin request deadline: %w", err)
 	}
 	if err := WriteWithLength(conn, EncodeMessage("admin", command)); err != nil {
-		return "", fmt.Errorf("send admin command to %s: %w", addr, err)
+		return "", &ambiguousAdminError{err: fmt.Errorf("send admin command to %s: %w", addr, err)}
 	}
 	response, err := ReadWithLength(conn)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
 		}
-		return "", fmt.Errorf("read admin response from %s: %w", addr, err)
+		return "", &ambiguousAdminError{err: fmt.Errorf("read admin response from %s: %w", addr, err)}
 	}
 	value := strings.TrimSpace(string(response))
 	if brokerErr, ok := ParseBrokerError(value); ok {
@@ -249,6 +307,17 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 		return "", &terminalAdminError{err: fmt.Errorf("unexpected admin response: %s", value)}
 	}
 	return value, nil
+}
+
+func isRetryableAdminTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 func (c *AdminClient) dial(ctx context.Context, addr string) (net.Conn, error) {
@@ -346,6 +415,17 @@ func buildAdminCreateTopicCommand(topic string, patch TopicDefinitionPatch) (str
 	return strings.Join(fields, " "), nil
 }
 
+func buildAdminDeleteTopicCommand(topic string, options DeleteTopicOptions) (string, error) {
+	if err := validateSDKTopicName(topic); err != nil {
+		return "", err
+	}
+	command := "DELETE topic=" + topic
+	if options.IfExists {
+		command += " if_exists=true"
+	}
+	return command, nil
+}
+
 func appendAdminACLField(fields []string, name string, values *[]string) ([]string, error) {
 	if values == nil {
 		return fields, nil
@@ -397,6 +477,27 @@ func parseTopicDefinitionResponse(response string) (TopicDefinition, error) {
 	definition.ReadACL = splitAdminACL(fields["read_acl"])
 	definition.WriteACL = splitAdminACL(fields["write_acl"])
 	return definition, nil
+}
+
+func parseDeleteTopicResponse(response string) (DeleteTopicResult, error) {
+	fields, err := parseOKResponse(response)
+	if err != nil {
+		return DeleteTopicResult{}, err
+	}
+	result := DeleteTopicResult{Topic: fields["topic"]}
+	if result.Topic == "" {
+		return DeleteTopicResult{}, fmt.Errorf("missing topic")
+	}
+	if result.Deleted, err = parseAdminBool(fields, "deleted"); err != nil {
+		return DeleteTopicResult{}, err
+	}
+	if value, present := fields["cleanup_pending"]; present {
+		result.CleanupPending, err = strconv.ParseBool(value)
+		if err != nil {
+			return DeleteTopicResult{}, fmt.Errorf("invalid cleanup_pending: %w", err)
+		}
+	}
+	return result, nil
 }
 
 func parseAdminInt(fields map[string]string, name string) (int, error) {
