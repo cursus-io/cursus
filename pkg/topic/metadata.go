@@ -45,8 +45,7 @@ func (d Definition) Normalize() (Definition, error) {
 		return d, err
 	}
 	d.Policy = policy
-	d.Policy.ReadACL = append([]string(nil), policy.ReadACL...)
-	d.Policy.WriteACL = append([]string(nil), policy.WriteACL...)
+	d.Policy = policy.Clone()
 	return d, nil
 }
 

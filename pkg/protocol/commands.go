@@ -7,6 +7,7 @@ const maxTextCommandLength = len("SEND_OFFSETS_TO_TXN")
 var textCommands = map[string]struct{}{
 	"AUTH":                {},
 	"CREATE":              {},
+	"ALTER_TOPIC_CONFIG":  {},
 	"DELETE":              {},
 	"LIST":                {},
 	"LIST_CLUSTER":        {},

@@ -14,7 +14,7 @@ linger_ms: 50
 buffer_size: 100000
 
 # Reliability
-acks: "1"
+acks: "all"
 enable_idempotence: true
 
 max_retries: 5

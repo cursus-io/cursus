@@ -19,7 +19,7 @@ static_cluster_members:
   - "broker-3-9000@broker-3:9001"
 
 # Idempotency
-enable_idempotence: true
+enable_idempotence: false # enabled per topic/request by idempotence tests
 
 # Disk storage and performance
 log_dir: "cluster-logs"

@@ -176,6 +176,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyMessageCommand(strings.TrimPrefix(data, "BATCH:"))
 	case strings.HasPrefix(data, "TOPIC:"):
 		res = f.applyTopicCommand(strings.TrimPrefix(data, "TOPIC:"))
+	case strings.HasPrefix(data, "TOPIC_CONFIG:"):
+		res = f.applyTopicConfigCommand(strings.TrimPrefix(data, "TOPIC_CONFIG:"))
 	case strings.HasPrefix(data, "TOPIC_DELETE:"):
 		res = f.applyTopicDeleteCommand(strings.TrimPrefix(data, "TOPIC_DELETE:"))
 	case strings.HasPrefix(data, "PARTITION:"):
@@ -372,6 +374,12 @@ func (f *BrokerFSM) reconcileCommittedPartitions() {
 		return
 	}
 	for key, meta := range metadata {
+		if !meta.CommittedHWMKnown {
+			// Metadata written before committed watermarks existed has no safe
+			// numeric boundary to apply. The partition leader migrates that
+			// legacy boundary through Raft before accepting a new append.
+			continue
+		}
 		idx := strings.LastIndex(key, "-")
 		if idx < 0 {
 			continue

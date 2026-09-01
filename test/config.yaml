@@ -3,9 +3,10 @@ health_check_port: 9080
 enable_exporter: true
 exporter_port: 9100
 log_level: "info" # debug, info, warn, error
+min_insync_replicas: 1 # standalone broker has only its leader replica
 
 # Idempotency
-enable_idempotence: true # exactly-once, at-Least-once
+enable_idempotence: false # enabled per topic/request by idempotence tests
 
 # Storage
 log_dir: "broker-logs"

@@ -87,27 +87,27 @@ successful append to be followed by a queue-full error.
 
 The request path holds the existing partition append lock while it:
 
-1. validates leadership and reconciles the committed HWM;
-2. captures leader ID, leader epoch, replica set, and ISR;
-3. checks `effectiveMinISR` when the mode is `all`;
+1. validates leadership and captures leader ID, leader epoch, replica set, and
+   ISR;
+2. checks `effectiveMinISR` when the mode is `all`, before reconciliation or
+   any other state change;
+3. reconciles the committed HWM;
 4. reserves queue capacity;
 5. performs the durable leader append; and
 6. enqueues a replication task with an exact commit HWM of last offset plus one.
 
 The ordered lane replicates tasks sequentially so followers never observe an
-offset gap caused by concurrent requests. Replica RPC fan-out uses a bounded
-worker pool rather than request-scoped unbounded goroutines. Completion is based
-only on the captured ISR; non-ISR catch-up work is best effort and never delays a
-strong acknowledgement.
+offset gap caused by concurrent requests. Each materialized partition owns one
+worker and a fixed-capacity lane rather than creating request-scoped goroutines.
+Completion is based only on the captured ISR; non-ISR catch-up work is best
+effort and never delays a strong acknowledgement.
 
 Before commit, the worker confirms that the local broker is still the leader at
-the captured epoch, that the commit ISR contains at least `effectiveMinISR`
-members, and that every member of that ISR has acknowledged. An `acks=1` task
-that was accepted while ISR was below the effective minimum remains uncommitted
-and is retried or abandoned on fencing; it is never made visible as a
-leader-only commit. The Raft partition-commit command carries the captured
-leader and epoch. The FSM rejects stale or fenced commits. The local HWM advances
-only after the durable cluster commit succeeds.
+the captured epoch and that every member of the task's ISR has acknowledged.
+`effectiveMinISR` is an admission condition only for `all`/`-1`; it is never
+retroactively imposed on an accepted `acks=1` task. The Raft partition-commit
+command carries the captured leader and epoch. The FSM rejects stale or fenced
+commits. The local HWM advances only after the durable cluster commit succeeds.
 
 ## ACK completion contracts
 
@@ -157,6 +157,14 @@ truncating any uncommitted tail. Async tasks are canceled on fencing or shutdown
 their records stay uncommitted and are eligible for truncation rather than being
 promoted implicitly.
 
+Partition metadata written before this contract has no committed-HWM field. It
+is not decoded as an explicit zero: field absence remains a legacy/unknown
+marker, so upgrade recovery does not truncate previously accepted data. Before
+the partition leader accepts its first new append, it preserves the legacy local
+committed boundary and commits that exact value through Raft at the current
+leader epoch. New metadata always records even an explicit zero, allowing later
+restart and failover to distinguish a safe empty HWM from legacy absence.
+
 ## Backpressure and shutdown
 
 Queue admission observes the request context and handler shutdown. The handler
@@ -178,6 +186,9 @@ redacted or omitted.
 - The SDK default remains `acks="1"`.
 - Missing topic overrides continue to use the broker default.
 - Old standalone manifests and FSM snapshots decode without the new field.
+- Old partition metadata without `committed_hwm` preserves its prior recovery
+  semantics and is promoted once through an epoch-fenced Raft commit before a
+  new publish append.
 - Snapshot restore, topic materialization, topic/group/offset recovery, and
   existing HWM checkpoints retain their current formats and invariants.
 - A snapshot format bump is only required if restore validation cannot safely

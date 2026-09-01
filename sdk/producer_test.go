@@ -2,8 +2,8 @@ package sdk
 
 import (
 	"encoding/json"
-	"net"
 	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -78,6 +78,7 @@ func TestNextSeqNum_GlobalIncrement(t *testing.T) {
 func TestNextSeqNum_PerPartitionWithIdempotence(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	cfg.EnableIdempotence = true
+	cfg.Acks = "all"
 	client, _ := NewProducerClient(cfg)
 
 	// Partition 0
@@ -463,6 +464,7 @@ func TestProducer_ParseAckResponse_LeaderUpdate(t *testing.T) {
 func TestProducer_ParseAckResponse_Idempotence_MissingProducerID(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	cfg.EnableIdempotence = true
+	cfg.Acks = "all"
 	p := &Producer{
 		config: cfg,
 		client: mustNewProducerClient(cfg),
@@ -482,6 +484,7 @@ func TestProducer_ParseAckResponse_Idempotence_MissingProducerID(t *testing.T) {
 func TestProducer_ParseAckResponse_Idempotence_EpochMismatch(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	cfg.EnableIdempotence = true
+	cfg.Acks = "all"
 	p := &Producer{
 		config: cfg,
 		client: mustNewProducerClient(cfg),
@@ -502,6 +505,7 @@ func TestProducer_ParseAckResponse_Idempotence_EpochMismatch(t *testing.T) {
 func TestProducer_ParseAckResponse_Idempotence_Valid(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	cfg.EnableIdempotence = true
+	cfg.Acks = "all"
 	p := &Producer{
 		config: cfg,
 		client: mustNewProducerClient(cfg),

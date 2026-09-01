@@ -244,6 +244,25 @@ func TestPartition_ReplicaAppendRetryIsIdempotentAndRejectsConflictOrGap(t *test
 	dh.AssertExpectations(t)
 }
 
+func TestPartition_ReplicaAppendPreservesRequestIdempotenceForPromotion(t *testing.T) {
+	cfg := config.DefaultConfig()
+	dh := new(MockStorageHandler)
+	dh.On("GetLatestOffset").Return(uint64(0)).Once()
+	dh.On("WriteBatch", mock.Anything).Return(nil).Once()
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	replicated := []types.Message{{
+		Offset: 0, Payload: "replicated", ProducerID: "producer-1", SeqNum: 1, Epoch: 7,
+	}}
+	require.NoError(t, p.ReplicaAppendWithMode(replicated, true))
+
+	retry := []types.Message{{
+		Payload: "replicated", ProducerID: "producer-1", SeqNum: 1, Epoch: 7,
+	}}
+	require.NoError(t, p.EnqueueBatchLeaderWithMode(retry, true))
+	require.Equal(t, uint64(1), p.NextOffset(), "promoted follower appended an idempotent retry")
+	dh.AssertNumberOfCalls(t, "WriteBatch", 1)
+}
+
 func TestPartition_ReconcileCommittedHWMTruncatesUncommittedTail(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

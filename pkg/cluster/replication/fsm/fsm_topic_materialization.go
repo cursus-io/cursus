@@ -159,6 +159,9 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 	}
 
 	err := f.tm.CreateTopicWithPolicy(definition.Name, definition.Partitions, definition.Idempotent, definition.EventSourcing, definition.Policy)
+	if err == nil {
+		err = f.reconcileMaterializedTopicHWM(definition.Name)
+	}
 	f.recordTopicMaterialization(definition.Name, TopicMaterializationCreate, err)
 	if err != nil {
 		return fmt.Errorf("materialize topic %q: %w", definition.Name, err)
@@ -186,9 +189,57 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 	}
 
 	err := f.tm.RestoreDefinitions([]topic.Definition{*definition})
+	if err == nil {
+		err = f.reconcileMaterializedTopicHWM(definition.Name)
+	}
 	f.recordTopicMaterialization(definition.Name, TopicMaterializationRestore, err)
 	if err != nil {
 		return fmt.Errorf("restore local topic %q: %w", definition.Name, err)
+	}
+	return nil
+}
+
+func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string) error {
+	if f.tm == nil {
+		return nil
+	}
+	f.mu.RLock()
+	definition := copyTopicDefinition(f.topicState[topicName])
+	metadata := make(map[int]PartitionMetadata)
+	if definition != nil {
+		for partition := 0; partition < definition.Partitions; partition++ {
+			if current := f.partitionMetadata[fmt.Sprintf("%s-%d", topicName, partition)]; current != nil {
+				metadata[partition] = *current
+			}
+		}
+	}
+	f.mu.RUnlock()
+	if definition == nil {
+		return nil
+	}
+	currentTopic := f.tm.GetTopic(topicName)
+	if currentTopic == nil {
+		return fmt.Errorf("topic is not materialized")
+	}
+	for partition := 0; partition < definition.Partitions; partition++ {
+		partitionMetadata, ok := metadata[partition]
+		if !ok {
+			// Authoritative restore/apply validation requires this metadata.
+			// A missing entry here can only be a concurrently superseded local
+			// materialization attempt, so leave it to the next desired state.
+			continue
+		}
+		if !partitionMetadata.CommittedHWMKnown {
+			continue
+		}
+		currentPartition, err := currentTopic.GetPartition(partition)
+		if err != nil {
+			return err
+		}
+		if err := currentPartition.ReconcileCommittedHWM(partitionMetadata.CommittedHWM); err != nil {
+			return fmt.Errorf("reconcile partition %d committed HWM: %w", partition, err)
+		}
+		currentPartition.FlushDisk()
 	}
 	return nil
 }

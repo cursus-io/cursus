@@ -139,11 +139,11 @@ func (ch *CommandHandler) authorizeClientPermissions(command string, args map[st
 	for _, permission := range permissions {
 		switch permission {
 		case PermissionTopicRead:
-			if resp := ch.authorizeTopicRead(t.Policy, ctx); resp != "" {
+			if resp := ch.authorizeTopicRead(t.PolicySnapshot(), ctx); resp != "" {
 				return fmt.Sprintf("%s topic=%s", resp, topicName)
 			}
 		case PermissionTopicWrite:
-			if resp := ch.authorizeTopicWrite(t.Policy, ctx); resp != "" {
+			if resp := ch.authorizeTopicWrite(t.PolicySnapshot(), ctx); resp != "" {
 				return fmt.Sprintf("%s topic=%s", resp, topicName)
 			}
 		}

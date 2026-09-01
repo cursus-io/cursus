@@ -2,7 +2,6 @@ package e2e
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -119,19 +118,6 @@ func initEnvironment(t testing.TB) {
 func GivenStandalone(t *testing.T) *TestContext {
 	initEnvironment(t)
 	return Given(t)
-}
-
-func TestMain(m *testing.M) {
-	code := m.Run()
-
-	fmt.Println("All tests finished. Cleaning up docker compose environment...")
-	cmd := RunCompose("-f", composeFile, "down", "-v")
-
-	if err := cmd.Run(); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Warning: docker compose down failed: %v\n", err)
-	}
-
-	os.Exit(code)
 }
 
 func (ctx *TestContext) GetT() *testing.T {

@@ -39,6 +39,8 @@ type CommandHandler struct {
 	transactionStateSyncHook func(string) error
 	transactionStateLocks    [transactionStateLockStripes]sync.Mutex
 	partitionWriteLocks      sync.Map // map[string]*sync.Mutex
+	partitionPreparedEpochs  sync.Map // map[string]partitionLeadershipFence
+	replication              *partitionReplicationCoordinator
 }
 
 func (ch *CommandHandler) transactionStateLock(transactionalID string) *sync.Mutex {
@@ -111,6 +113,13 @@ func NewCommandHandler(
 			fsm.SetTransactionManager(ch.TxnManager)
 		}
 	}
+	if cc != nil {
+		capacity := 1
+		if cfg != nil && cfg.ChannelBufferSize > 0 {
+			capacity = cfg.ChannelBufferSize
+		}
+		ch.replication = newPartitionReplicationCoordinator(capacity, clusterPartitionReplicationExecutor{handler: ch})
+	}
 	ch.commands = []commandEntry{
 		{prefix: "AUTH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAuth(cmd, ctx) }},
 		{prefix: "HELP", exact: true, helpOrder: 37, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHelp() }},
@@ -123,6 +132,7 @@ func NewCommandHandler(
 		{prefix: "LIST", exact: true, helpOrder: 3, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList(ctx) }},
 		{prefix: "LIST_GROUPS", exact: true, helpOrder: 23, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListGroups() }},
 		{prefix: "CREATE ", exact: false, helpOrder: 1, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd, ctx) }},
+		{prefix: "ALTER_TOPIC_CONFIG ", exact: false, helpOrder: 39, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAlterTopicConfig(cmd, ctx) }},
 		{prefix: "DELETE ", exact: false, helpOrder: 2, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd, ctx) }},
 		{prefix: "PUBLISH ", exact: false, helpOrder: 4, permissions: []string{PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd, ctx) }},
 		{prefix: "CONSUME ", exact: false, helpOrder: 5, permissions: []string{PermissionTopicRead, PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.validateConsumeSyntax(cmd, cmd) }},
@@ -177,11 +187,21 @@ func (ch *CommandHandler) logCommandResult(cmd, response string) {
 }
 
 func redactCommandSecrets(s string) string {
+	s = redactCommandTailValue(s, "message=")
+	s = redactCommandTailValue(s, "payload=")
 	keys := []string{"internal_token=", "auth_token=", "token="}
 	for _, key := range keys {
 		s = redactOneCommandSecret(s, key)
 	}
 	return s
+}
+
+func redactCommandTailValue(s, key string) string {
+	idx := strings.Index(strings.ToLower(s), strings.ToLower(key))
+	if idx == -1 {
+		return s
+	}
+	return s[:idx] + key + "<redacted>"
 }
 
 func redactOneCommandSecret(s, key string) string {
@@ -324,6 +344,9 @@ func (ch *CommandHandler) errorResponse(msg string) string {
 
 // Close releases resources held by the command handler (e.g., event-sourcing indexes and snapshots).
 func (ch *CommandHandler) Close() error {
+	if ch.replication != nil {
+		ch.replication.close()
+	}
 	if ch.ESHandler != nil {
 		return ch.ESHandler.Close()
 	}

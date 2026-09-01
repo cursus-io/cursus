@@ -31,9 +31,18 @@ func (m *MockRaftManagerForForward) GetLeaderAddress() string {
 	}
 	return addr.(string)
 }
-func (m *MockRaftManagerForForward) ApplyCommand(prefix string, data []byte) error { return nil }
-func (m *MockRaftManagerForForward) LeaderCh() <-chan bool                         { return nil }
-func (m *MockRaftManagerForForward) GetFSM() *fsm.BrokerFSM                        { return m.state }
+func (m *MockRaftManagerForForward) ApplyCommand(prefix string, data []byte) error {
+	if m.state == nil {
+		return nil
+	}
+	result := m.state.Apply(&raft.Log{Data: append([]byte(prefix+":"), data...)})
+	if err, ok := result.(error); ok {
+		return err
+	}
+	return nil
+}
+func (m *MockRaftManagerForForward) LeaderCh() <-chan bool  { return nil }
+func (m *MockRaftManagerForForward) GetFSM() *fsm.BrokerFSM { return m.state }
 func (m *MockRaftManagerForForward) GetRaftStatus() (replication.RaftStatus, error) {
 	return m.raftStatus, m.raftStatusErr
 }

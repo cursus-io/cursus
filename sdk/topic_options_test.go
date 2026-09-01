@@ -3,26 +3,37 @@ package sdk
 import (
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestBuildCreateTopicCommandWithOptions(t *testing.T) {
 	command, err := buildCreateTopicCommand("state", TopicOptions{
-		Partitions:     3,
-		CleanupPolicy:  "compact,delete",
-		RetentionHours: 24,
-		RetentionBytes: 1024,
-		Partitioner:    "hash_key",
-		AuthPolicy:     "acl",
-		ReadACL:        []string{"reader"},
-		WriteACL:       []string{"writer"},
+		Partitions:        3,
+		CleanupPolicy:     "compact,delete",
+		RetentionHours:    24,
+		RetentionBytes:    1024,
+		MinInSyncReplicas: 2,
+		Partitioner:       "hash_key",
+		AuthPolicy:        "acl",
+		ReadACL:           []string{"reader"},
+		WriteACL:          []string{"writer"},
 	}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "CREATE topic=state partitions=3 idempotent=true cleanup_policy=delete,compact retention_hours=24 retention_bytes=1024 partitioner=hash_key auth_policy=acl read_acl=reader write_acl=writer"
+	want := "CREATE topic=state partitions=3 idempotent=true cleanup_policy=delete,compact retention_hours=24 retention_bytes=1024 min_in_sync_replicas=2 partitioner=hash_key auth_policy=acl read_acl=reader write_acl=writer"
 	if command != want {
 		t.Fatalf("command = %q, want %q", command, want)
 	}
+}
+
+func TestBuildCreateTopicCommandRejectsNegativeMinInSyncReplicas(t *testing.T) {
+	_, err := buildCreateTopicCommand("orders", TopicOptions{
+		Partitions:        1,
+		MinInSyncReplicas: -1,
+	}, false)
+	require.ErrorContains(t, err, "min in-sync replicas")
 }
 
 func TestBuildCreateTopicCommandRejectsUnsafeOrInvalidOptions(t *testing.T) {

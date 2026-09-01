@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewDefaultPublisherConfig(t *testing.T) {
@@ -64,6 +65,38 @@ func TestNewDefaultPublisherConfig(t *testing.T) {
 	if cfg.LogLevel != LogLevelInfo {
 		t.Errorf("expected LogLevel=Info, got %d", cfg.LogLevel)
 	}
+}
+
+func TestPublisherConfigValidatesAcknowledgementsAndIdempotence(t *testing.T) {
+	for _, value := range []string{"0", "1", "all", "-1", " ALL "} {
+		cfg := NewDefaultPublisherConfig()
+		cfg.Acks = value
+		require.NoError(t, cfg.Validate(), value)
+	}
+	for _, value := range []string{"2", "leader", "-2"} {
+		cfg := NewDefaultPublisherConfig()
+		cfg.Acks = value
+		require.ErrorContains(t, cfg.Validate(), "invalid acks", value)
+	}
+	for _, value := range []string{"0", "1"} {
+		cfg := NewDefaultPublisherConfig()
+		cfg.Acks = value
+		cfg.EnableIdempotence = true
+		require.ErrorContains(t, cfg.Validate(), "requires acks=all", value)
+	}
+	for _, value := range []string{"all", "-1"} {
+		cfg := NewDefaultPublisherConfig()
+		cfg.Acks = value
+		cfg.EnableIdempotence = true
+		require.NoError(t, cfg.Validate(), value)
+	}
+}
+
+func TestLoadConfigRejectsWeakIdempotentPublisherAcknowledgements(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "publisher.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("acks: \"1\"\nenable_idempotence: true\n"), 0o600))
+	var cfg PublisherConfig
+	require.ErrorContains(t, LoadConfig(path, &cfg), "requires acks=all")
 }
 
 func TestNewDefaultConsumerConfig(t *testing.T) {

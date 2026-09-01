@@ -58,7 +58,7 @@ With `structured_errors_v1` enabled, subsequent text errors use `ERROR: <code> c
 ### CREATE
 
 ```text
-CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>] [cleanup_policy=<delete|compact|delete,compact>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
+CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>] [min_in_sync_replicas=<N>] [cleanup_policy=<delete|compact|delete,compact>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
 ```
 
 Creates a topic or increases its partition count when the topic already exists.
@@ -66,7 +66,7 @@ Creates a topic or increases its partition count when the topic already exists.
 Success:
 
 ```text
-OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>
+OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> min_in_sync_replicas=<N|default> effective_min_in_sync_replicas=<N>
 ```
 
 Common errors:
@@ -76,6 +76,7 @@ ERROR: missing_topic expected="CREATE topic=<name> [partitions=<N>]"
 ERROR: invalid_topic_name topic=<name> reason="..."
 ERROR: invalid_partitions reason="must be a positive integer"
 ERROR: invalid_replication_factor reason="must be a positive integer"
+ERROR: invalid_min_in_sync_replicas value=<N> replication_factor=<N>
 ERROR: invalid_topic_policy field=cleanup_policy reason="..."
 ERROR: unsupported_topic_policy field=cleanup_policy reason="..."
 ERROR: create_topic_failed reason="..."
@@ -100,6 +101,20 @@ ERROR: missing_topic expected="DELETE topic=<name>"
 ERROR: invalid_topic_name topic=<name> reason="..."
 ERROR: topic_not_found topic=<name>
 ERROR: delete_topic_failed reason="..."
+```
+
+### ALTER_TOPIC_CONFIG
+
+```text
+ALTER_TOPIC_CONFIG topic=<name> min_in_sync_replicas=<N|default>
+```
+
+The integer must be between 1 and the topic replication factor. `default` removes the durable topic override and uses the broker value. Omitting the optional field from an existing manifest or snapshot has the same fallback meaning.
+
+Success:
+
+```text
+OK topic=<name> min_in_sync_replicas=<N|default> effective_min_in_sync_replicas=<N>
 ```
 
 ### LIST
@@ -153,18 +168,16 @@ OK commands=<comma-separated-command-names>
 ### PUBLISH
 
 ```text
-PUBLISH topic=<name> [partition=<N>] [key=<routing-key>] [producerId=<id>] [seqNum=<N>] [epoch=<N>] [isIdempotent=<bool>] [acks=0|1|all] message=<payload>
+PUBLISH topic=<name> [partition=<N>] [key=<routing-key>] [producerId=<id>] [seqNum=<N>] [epoch=<N>] [isIdempotent=<bool>] [acks=0|1|all|-1] message=<payload>
 ```
 
 Because `message=` captures the rest of the line, put optional parameters before `message=`.
 
 Transaction metadata fields are not accepted on client `PUBLISH`; use the transaction commands for transactional records. Direct `transactional_id`, `transaction_state`, or `transaction_marker` injection returns `ERROR: transaction_metadata_forbidden command=PUBLISH`.
 
-For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Producer epochs entered FSM snapshot version 3; current brokers write version 6 with transaction state, committed partition watermarks, and durable topic definitions. Avoid mixed-version rolling upgrades with binaries that cannot decode version 6. For `acks=0`, success is:
+`acks` belongs to the publish request or publisher configuration; it is not topic metadata. `acks=0` emits no external response frame. `acks=1` responds after the leader's durable local append while bounded ordered follower replication continues; a leader failure before commit can lose the record. `acks=all` and `acks=-1` are aliases: the broker first requires the current ISR to meet the topic-effective minimum, then waits for the captured ISR and fenced committed HWM. Read-committed consumers remain bounded by committed HWM. Non-ISR failures do not delay the success response.
 
-```text
-OK
-```
+The effective minimum is the topic `min_in_sync_replicas` override when present and broker `min_insync_replicas` otherwise. Standalone has one replica, so `1`, `all`, and `-1` share the local durable-append completion point when the effective minimum is 1; `all`/`-1` reject when it is greater than 1. Idempotent publishers must use `all` or `-1`; `0` and `1` fail before append or sequence mutation.
 
 Common errors:
 

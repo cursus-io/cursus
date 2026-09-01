@@ -26,7 +26,9 @@ sequenceDiagram
 
 Keyed records use FNV-1a 64-bit hash modulo partition count when the topic policy is `hash_key`; unkeyed records use round-robin. `round_robin` policy ignores keys. Ordering is defined only within one partition.
 
-Acknowledgement strength depends on `acks` and distribution settings. Async enqueue, buffered-writer flush, file sync, replica append, and committed HWM are distinct milestones.
+Acknowledgement strength depends on the publish request's `acks` setting and distribution mode. `acks=0` emits no external response frame. `acks=1` completes after the leader's durable append and schedules follower work on a bounded, partition-ordered lane; the record is not visible to read-committed consumers and can be lost on failover until that lane commits it. `acks=all` and `acks=-1` first require the current ISR to meet the topic-effective minimum, then complete only after the captured ISR acknowledges and the fenced HWM commit succeeds. Non-ISR catch-up runs outside that completion condition. Async enqueue, buffered-writer flush, file sync, replica append, and committed HWM are distinct milestones.
+
+The topic-effective minimum is `min_in_sync_replicas` from durable topic policy when present and the broker `min_insync_replicas` fallback otherwise. `acks` itself is never persisted in topic metadata. Idempotent publishing requires `all` or `-1`.
 
 ## Consumer Group Read
 

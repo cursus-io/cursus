@@ -12,7 +12,7 @@ buffer_size: 100000
 linger_ms: 50
 
 # Idempotency
-acks: "1" # "0" (no ack), "1" (leader only), "all" or "-1" (quorum)
+acks: "all" # idempotence requires "all" or "-1"
 enable_idempotence: true
 
 # Retry

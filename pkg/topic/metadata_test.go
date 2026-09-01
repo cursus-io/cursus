@@ -20,13 +20,14 @@ func TestStandaloneTopicMetadataRestoresDefinitionAndData(t *testing.T) {
 	dm := disk.NewDiskManager(cfg)
 	manager := NewTopicManager(cfg, dm, nil)
 	policy := Policy{
-		CleanupPolicy:  config.CleanupPolicyCompact,
-		Partitioner:    PartitionerRoundRobin,
-		AuthPolicy:     AuthPolicyACL,
-		ReadACL:        []string{"reader"},
-		WriteACL:       []string{"writer"},
-		RetentionHours: 12,
-		RetentionBytes: 4096,
+		CleanupPolicy:     config.CleanupPolicyCompact,
+		Partitioner:       PartitionerRoundRobin,
+		AuthPolicy:        AuthPolicyACL,
+		ReadACL:           []string{"reader"},
+		WriteACL:          []string{"writer"},
+		RetentionHours:    12,
+		RetentionBytes:    4096,
+		MinInSyncReplicas: intPtr(1),
 	}
 	require.NoError(t, manager.CreateTopicWithPolicy("orders", 2, true, false, policy))
 	require.NoError(t, manager.CreateTopic("events", 1, false, true))
@@ -53,6 +54,8 @@ func TestStandaloneTopicMetadataRestoresDefinitionAndData(t *testing.T) {
 	require.Equal(t, []string{"writer"}, restored.Policy.WriteACL)
 	require.Equal(t, 12, restored.Policy.RetentionHours)
 	require.Equal(t, int64(4096), restored.Policy.RetentionBytes)
+	require.NotNil(t, restored.Policy.MinInSyncReplicas)
+	require.Equal(t, 1, *restored.Policy.MinInSyncReplicas)
 	require.True(t, restarted.GetTopic("events").IsEventSourcing)
 	require.Equal(t, config.CleanupPolicyDelete, restarted.GetTopic("events").Policy.CleanupPolicy)
 
@@ -64,6 +67,29 @@ func TestStandaloneTopicMetadataRestoresDefinitionAndData(t *testing.T) {
 	handler, err := restartedDM.GetHandler("orders", 1)
 	require.NoError(t, err)
 	require.Equal(t, config.CleanupPolicyCompact, handler.(*disk.DiskHandler).CleanupPolicy())
+}
+
+func TestStandaloneLegacyManifestWithoutMinInSyncReplicasRestoresBrokerFallback(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.MinInSyncReplicas = 2
+	dm := disk.NewDiskManager(cfg)
+	manager := NewTopicManager(cfg, dm, nil)
+	require.NoError(t, manager.CreateTopic("legacy", 1, false, false))
+	manifest, err := os.ReadFile(filepath.Join(cfg.LogDir, TopicMetadataFileName))
+	require.NoError(t, err)
+	require.NotContains(t, string(manifest), "min_in_sync_replicas")
+	closeTopicManager(manager)
+	dm.CloseAllHandlers()
+
+	restartedDM := disk.NewDiskManager(cfg)
+	defer restartedDM.CloseAllHandlers()
+	restarted := NewTopicManager(cfg, restartedDM, nil)
+	require.NoError(t, restarted.RestoreTopics())
+	defer closeTopicManager(restarted)
+	policy := restarted.GetTopic("legacy").Policy
+	require.Nil(t, policy.MinInSyncReplicas)
+	require.Equal(t, 2, policy.EffectiveMinInSyncReplicas(cfg.MinInSyncReplicas))
 }
 
 func TestStandaloneTopicMetadataPersistsGrowthAndDeletion(t *testing.T) {

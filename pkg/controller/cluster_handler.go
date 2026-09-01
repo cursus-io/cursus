@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -18,6 +19,11 @@ import (
 )
 
 const DefaultFSMApplyTimeout = 5 * time.Second
+
+type partitionLeadershipFence struct {
+	leader string
+	epoch  int
+}
 
 func backoffDelay(attempt int, base time.Duration) time.Duration {
 	if attempt > 30 {
@@ -462,7 +468,75 @@ func (ch *CommandHandler) applyAndWaitContext(ctx context.Context, cmdType strin
 	}
 }
 
-func (ch *CommandHandler) preparePartitionLeader(topicName string, partitionID int, p *topic.Partition) (func(), error) {
+func (ch *CommandHandler) preparePartitionLeaderSnapshot(topicName string, partitionID int, p *topic.Partition, requiredISR int) (func(), clusterController.PartitionReplicationSnapshot, error) {
+	writeLock := ch.partitionWriteLock(topicName, partitionID)
+	writeLock.Lock()
+	release := writeLock.Unlock
+	fail := func(err error) (func(), clusterController.PartitionReplicationSnapshot, error) {
+		release()
+		return nil, clusterController.PartitionReplicationSnapshot{}, err
+	}
+	if ch.Cluster == nil || ch.Cluster.RaftManager == nil {
+		return fail(fmt.Errorf("cluster metadata unavailable"))
+	}
+	fsmRef := ch.Cluster.RaftManager.GetFSM()
+	if fsmRef == nil {
+		return fail(fmt.Errorf("cluster metadata unavailable"))
+	}
+	metadata := fsmRef.GetPartitionMetadata(fmt.Sprintf("%s-%d", topicName, partitionID))
+	if metadata == nil {
+		return fail(fmt.Errorf("partition metadata not found"))
+	}
+	if !ch.Cluster.IsAuthorized(topicName, partitionID) {
+		return fail(fmt.Errorf("partition leader fenced: current=%s epoch=%d", metadata.Leader, metadata.LeaderEpoch))
+	}
+	snapshot, err := ch.Cluster.GetPartitionReplicationSnapshot(topicName, partitionID)
+	if err != nil {
+		return fail(err)
+	}
+	if requiredISR > 0 && len(snapshot.ISR) < requiredISR {
+		return fail(fmt.Errorf("insufficient_in_sync_replicas current=%d required=%d", len(snapshot.ISR), requiredISR))
+	}
+	if !metadata.CommittedHWMKnown {
+		// Pre-watermark metadata treated the durable local tail as committed on
+		// restart. Preserve that compatibility boundary exactly once, but make
+		// it authoritative through the current leader epoch before any new
+		// acknowledgement mode can append beyond it.
+		legacyHWM := p.GetHWM()
+		if err := ch.commitPartitionHWMAtEpoch(topicName, partitionID, legacyHWM, snapshot.Leader, snapshot.LeaderEpoch); err != nil {
+			return fail(fmt.Errorf("migrate legacy committed HWM: %w", err))
+		}
+		metadata.CommittedHWM = legacyHWM
+		metadata.CommittedHWMKnown = true
+	}
+	key := fmt.Sprintf("%s-%d", topicName, partitionID)
+	wantedFence := partitionLeadershipFence{leader: snapshot.Leader, epoch: snapshot.LeaderEpoch}
+	preparedFence, prepared := ch.partitionPreparedEpochs.Load(key)
+	if !prepared || preparedFence.(partitionLeadershipFence) != wantedFence {
+		if err := p.ReconcileCommittedHWM(metadata.CommittedHWM); err != nil {
+			return fail(fmt.Errorf("partition is not ready for leadership: %w", err))
+		}
+		p.FlushDisk()
+		ch.partitionPreparedEpochs.Store(key, wantedFence)
+	}
+	return release, snapshot, nil
+}
+
+func (ch *CommandHandler) partitionPreparationErrorResponse(err error) string {
+	if err == nil {
+		return ""
+	}
+	if strings.HasPrefix(err.Error(), "insufficient_in_sync_replicas") {
+		return "ERROR: " + err.Error()
+	}
+	return ch.errorResponse(err.Error())
+}
+
+// preparePartitionReplica serializes a follower append with local leadership
+// changes. The first request for a new leader epoch discards any tail beyond
+// the Raft-authoritative committed HWM before accepting offsets from that
+// leader.
+func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID int, p *topic.Partition, leader string, leaderEpoch int) (func(), error) {
 	writeLock := ch.partitionWriteLock(topicName, partitionID)
 	writeLock.Lock()
 	release := writeLock.Unlock
@@ -481,37 +555,34 @@ func (ch *CommandHandler) preparePartitionLeader(topicName string, partitionID i
 	if metadata == nil {
 		return fail(fmt.Errorf("partition metadata not found"))
 	}
-	if !ch.Cluster.IsAuthorized(topicName, partitionID) {
-		return fail(fmt.Errorf("partition leader fenced: current=%s epoch=%d", metadata.Leader, metadata.LeaderEpoch))
+	if metadata.Leader != leader || metadata.LeaderEpoch != leaderEpoch {
+		return fail(fmt.Errorf(
+			"partition leader fenced: current=%s/%d requested=%s/%d",
+			metadata.Leader,
+			metadata.LeaderEpoch,
+			leader,
+			leaderEpoch,
+		))
 	}
-	committedHWM := metadata.CommittedHWM
-	if localHWM := p.GetHWM(); localHWM > committedHWM {
-		committedHWM = localHWM
+	key := fmt.Sprintf("%s-%d", topicName, partitionID)
+	wantedFence := partitionLeadershipFence{leader: leader, epoch: leaderEpoch}
+	preparedFence, prepared := ch.partitionPreparedEpochs.Load(key)
+	if !prepared || preparedFence.(partitionLeadershipFence) != wantedFence {
+		if err := p.ReconcileCommittedHWM(metadata.CommittedHWM); err != nil {
+			return fail(fmt.Errorf("partition is not ready for replica append: %w", err))
+		}
+		p.FlushDisk()
+		ch.partitionPreparedEpochs.Store(key, wantedFence)
 	}
-	if err := p.ReconcileCommittedHWM(committedHWM); err != nil {
-		return fail(fmt.Errorf("partition is not ready for leadership: %w", err))
-	}
-	p.FlushDisk()
 	return release, nil
 }
 
-func (ch *CommandHandler) commitPartitionHWM(topicName string, partitionID int, hwm uint64) error {
-	if ch.Cluster == nil || ch.Cluster.RaftManager == nil {
-		return fmt.Errorf("cluster metadata unavailable")
-	}
-	fsmRef := ch.Cluster.RaftManager.GetFSM()
-	if fsmRef == nil {
-		return fmt.Errorf("cluster metadata unavailable")
-	}
-	metadata := fsmRef.GetPartitionMetadata(fmt.Sprintf("%s-%d", topicName, partitionID))
-	if metadata == nil {
-		return fmt.Errorf("partition metadata not found")
-	}
+func (ch *CommandHandler) commitPartitionHWMAtEpoch(topicName string, partitionID int, hwm uint64, leader string, leaderEpoch int) error {
 	_, err := ch.applyViaLeader("PARTITION_COMMIT", map[string]interface{}{
 		"topic":        topicName,
 		"partition":    partitionID,
-		"leader":       metadata.Leader,
-		"leader_epoch": metadata.LeaderEpoch,
+		"leader":       leader,
+		"leader_epoch": leaderEpoch,
 		"hwm":          hwm,
 	})
 	return err

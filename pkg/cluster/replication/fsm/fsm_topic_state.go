@@ -14,8 +14,7 @@ func copyTopicDefinition(definition *topic.Definition) *topic.Definition {
 		return nil
 	}
 	cloned := *definition
-	cloned.Policy.ReadACL = append([]string(nil), definition.Policy.ReadACL...)
-	cloned.Policy.WriteACL = append([]string(nil), definition.Policy.WriteACL...)
+	cloned.Policy = definition.Policy.Clone()
 	return &cloned
 }
 

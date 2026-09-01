@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/ackpolicy"
 	"github.com/cursus-io/cursus/util"
 	"gopkg.in/yaml.v3"
 )
@@ -180,16 +181,13 @@ func LoadPublisherConfig(explicitPath string) (*PublisherConfig, error) {
 	if cfg.FlushTimeoutMS < 0 {
 		cfg.FlushTimeoutMS = 30000
 	}
-	if cfg.Acks != "0" && cfg.Acks != "1" && cfg.Acks != "all" {
-		cfg.Acks = "1"
+	selection, err := ackpolicy.Parse(cfg.Acks)
+	if err != nil {
+		return nil, fmt.Errorf("invalid acks %q: %w", cfg.Acks, err)
 	}
-	if cfg.Acks == "all" {
-		cfg.Acks = "-1"
-	}
-
-	if cfg.EnableIdempotence && cfg.Acks == "0" {
-		util.Warn("Idempotence requires acks >= 1, setting acks=1")
-		cfg.Acks = "1"
+	cfg.Acks = selection.Requested
+	if cfg.EnableIdempotence && !selection.SupportsIdempotence() {
+		return nil, fmt.Errorf("enable_idempotence requires acks=all or acks=-1")
 	}
 	if strings.TrimSpace(cfg.Topic) == "" {
 		cfg.Topic = "default-topic"

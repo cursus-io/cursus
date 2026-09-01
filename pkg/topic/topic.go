@@ -189,10 +189,16 @@ func (t *Topic) Definition() Definition {
 	return t.definitionLocked()
 }
 
+// PolicySnapshot returns a detached, concurrency-safe view of the current
+// topic policy.
+func (t *Topic) PolicySnapshot() Policy {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.Policy.Clone()
+}
+
 func (t *Topic) definitionLocked() Definition {
-	policy := t.Policy
-	policy.ReadACL = append([]string(nil), policy.ReadACL...)
-	policy.WriteACL = append([]string(nil), policy.WriteACL...)
+	policy := t.Policy.Clone()
 	return Definition{
 		Name:          t.Name,
 		Partitions:    len(t.Partitions),

@@ -72,4 +72,14 @@ var (
 		Name: "cursus_broker_command_errors_total",
 		Help: "Broker text command errors by bounded command and wire error code",
 	}, []string{"command", "code"})
+
+	PublishAcknowledgements = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "cursus_broker_publish_acknowledgements_total",
+		Help: "Publish requests by normalized acknowledgement mode and result",
+	}, []string{"ack_mode", "result"})
+
+	AsyncReplicationFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "cursus_broker_async_replication_failures_total",
+		Help: "Asynchronous partition replication failures by topic and bounded error class",
+	}, []string{"topic", "error_class"})
 )

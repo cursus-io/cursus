@@ -65,6 +65,11 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 	if existing := ch.TopicManager.GetTopic(topicName); existing != nil && existing.IsEventSourcing {
 		effectiveEventSourcing = true
 	}
+	if existing := ch.TopicManager.GetTopic(topicName); existing != nil {
+		if _, supplied := args["min_in_sync_replicas"]; !supplied {
+			policy.MinInSyncReplicas = existing.PolicySnapshot().MinInSyncReplicas
+		}
+	}
 	if config.HasCleanupPolicy(policy.CleanupPolicy, config.CleanupPolicyCompact) {
 		if effectiveEventSourcing {
 			return `ERROR: invalid_topic_policy field=cleanup_policy reason="compaction is not supported for event-sourcing topics"`
@@ -81,6 +86,15 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 			return "ERROR: invalid_replication_factor reason=\"must be a positive integer\""
 		}
 		replicationFactor = n
+	}
+	validationReplicationFactor := replicationFactor
+	if existing := ch.TopicManager.GetTopic(topicName); existing != nil {
+		validationReplicationFactor = ch.topicReplicationFactor(topicName)
+	} else if !ch.isDistributed() {
+		validationReplicationFactor = 1
+	}
+	if policy.MinInSyncReplicas != nil && *policy.MinInSyncReplicas > validationReplicationFactor {
+		return fmt.Sprintf("ERROR: invalid_min_in_sync_replicas value=%d replication_factor=%d", *policy.MinInSyncReplicas, validationReplicationFactor)
 	}
 
 	tm := ch.TopicManager
@@ -118,7 +132,8 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 			util.Warn("Failed to register default group with coordinator: %v", err)
 		}
 	}
-	return fmt.Sprintf("OK topic=%s partitions=%d cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d", topicName, len(t.Partitions), t.Policy.CleanupPolicy, t.Policy.Partitioner, t.Policy.AuthPolicy, strings.Join(t.Policy.ReadACL, ","), strings.Join(t.Policy.WriteACL, ","), t.Policy.RetentionHours, t.Policy.RetentionBytes)
+	definition := t.Definition()
+	return fmt.Sprintf("OK topic=%s partitions=%d cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d %s", topicName, definition.Partitions, definition.Policy.CleanupPolicy, definition.Policy.Partitioner, definition.Policy.AuthPolicy, strings.Join(definition.Policy.ReadACL, ","), strings.Join(definition.Policy.WriteACL, ","), definition.Policy.RetentionHours, definition.Policy.RetentionBytes, ch.topicMinISRMetadata(t))
 }
 
 func parseTopicPolicy(args map[string]string, defaultCleanupPolicy string) (topic.Policy, string) {
@@ -151,6 +166,13 @@ func parseTopicPolicy(args map[string]string, defaultCleanupPolicy string) (topi
 	}
 	policy.ReadACL = parseACLArg(args["read_acl"])
 	policy.WriteACL = parseACLArg(args["write_acl"])
+	if value, supplied := args["min_in_sync_replicas"]; supplied {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			return policy, fmt.Sprintf("ERROR: invalid_min_in_sync_replicas value=%s", value)
+		}
+		policy.MinInSyncReplicas = &parsed
+	}
 	policy, err := policy.Normalize()
 	if err != nil {
 		return policy, fmt.Sprintf("ERROR: invalid_topic_policy reason=%q", err.Error())
@@ -511,7 +533,7 @@ func (ch *CommandHandler) handleListOffsets(cmd string, ctx *ClientContext) stri
 	if t == nil {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	if authResp := ch.authorizeTopicRead(t.Policy, ctx); authResp != "" {
+	if authResp := ch.authorizeTopicRead(t.PolicySnapshot(), ctx); authResp != "" {
 		return fmt.Sprintf("%s topic=%s", authResp, topicName)
 	}
 

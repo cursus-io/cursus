@@ -74,6 +74,15 @@ type ClusterController struct {
 	brokerID    string
 }
 
+// PartitionReplicationSnapshot is an immutable view of the replication fence
+// and replica sets used by one partition append.
+type PartitionReplicationSnapshot struct {
+	Leader      string
+	LeaderEpoch int
+	ISR         []string
+	Replicas    []string
+}
+
 func NewClusterController(ctx context.Context, cfg *config.Config, rm RaftManager, sd ServiceDiscovery, brokerID, localAddr string) *ClusterController {
 	cc := &ClusterController{
 		RaftManager: rm,
@@ -226,97 +235,122 @@ func (cc *ClusterController) ReplicateCommandToFollowers(topic string, partition
 }
 
 func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, msgCmd types.MessageCommand, minISR int) error {
-	replicationStart := time.Now()
-
-	fsm := cc.RaftManager.GetFSM()
-	if fsm == nil {
-		return fmt.Errorf("FSM not available")
+	snapshot, err := cc.GetPartitionReplicationSnapshot(topic, partition)
+	if err != nil {
+		return err
 	}
+	if len(snapshot.ISR) < minISR {
+		return fmt.Errorf("insufficient in-sync replicas: got %d, want minISR %d", len(snapshot.ISR), minISR)
+	}
+	if err := cc.ReplicateToISR(topic, partition, msgCmd, snapshot); err != nil {
+		return err
+	}
+	cc.ReplicateToNonISR(topic, partition, msgCmd, snapshot)
+	return nil
+}
 
+func (cc *ClusterController) GetPartitionReplicationSnapshot(topic string, partition int) (PartitionReplicationSnapshot, error) {
+	if cc == nil || cc.RaftManager == nil {
+		return PartitionReplicationSnapshot{}, fmt.Errorf("cluster metadata unavailable")
+	}
+	fsmRef := cc.RaftManager.GetFSM()
+	if fsmRef == nil {
+		return PartitionReplicationSnapshot{}, fmt.Errorf("FSM not available")
+	}
 	partitionKey := topic + "-" + strconv.Itoa(partition)
-	meta := fsm.GetPartitionMetadata(partitionKey)
+	meta := fsmRef.GetPartitionMetadata(partitionKey)
 	if meta == nil {
-		return fmt.Errorf("partition metadata not found: %s", partitionKey)
+		return PartitionReplicationSnapshot{}, fmt.Errorf("partition metadata not found: %s", partitionKey)
 	}
 	if meta.Leader != cc.brokerID {
-		return fmt.Errorf("partition leader fenced: current=%s local=%s epoch=%d", meta.Leader, cc.brokerID, meta.LeaderEpoch)
+		return PartitionReplicationSnapshot{}, fmt.Errorf("partition leader fenced: current=%s local=%s epoch=%d", meta.Leader, cc.brokerID, meta.LeaderEpoch)
 	}
-	if len(meta.ISR) < minISR {
-		return fmt.Errorf("insufficient in-sync replicas: got %d, want minISR %d", len(meta.ISR), minISR)
+	if !containsBroker(meta.ISR, cc.brokerID) {
+		return PartitionReplicationSnapshot{}, fmt.Errorf("partition leader %s is not in ISR", cc.brokerID)
 	}
-	isr := make(map[string]struct{}, len(meta.ISR))
-	for _, brokerID := range meta.ISR {
+	return PartitionReplicationSnapshot{
+		Leader:      meta.Leader,
+		LeaderEpoch: meta.LeaderEpoch,
+		ISR:         append([]string(nil), meta.ISR...),
+		Replicas:    append([]string(nil), meta.Replicas...),
+	}, nil
+}
+
+// ReplicateToISR sends an append only to the ISR captured for this task. It is
+// deliberately sequential: the partition replication lane already provides
+// concurrency, so a publish never creates an unbounded set of goroutines.
+func (cc *ClusterController) ReplicateToISR(topic string, partition int, msgCmd types.MessageCommand, snapshot PartitionReplicationSnapshot) error {
+	return cc.replicateToReplicaSet(topic, partition, msgCmd, snapshot, snapshot.ISR, true)
+}
+
+// ReplicateToNonISR makes one best-effort catch-up pass after the committed HWM
+// is visible. Failures here never change the producer acknowledgement.
+func (cc *ClusterController) ReplicateToNonISR(topic string, partition int, msgCmd types.MessageCommand, snapshot PartitionReplicationSnapshot) {
+	isr := make(map[string]struct{}, len(snapshot.ISR))
+	for _, brokerID := range snapshot.ISR {
 		isr[brokerID] = struct{}{}
 	}
-	if _, ok := isr[cc.brokerID]; !ok {
-		return fmt.Errorf("partition leader %s is not in ISR", cc.brokerID)
-	}
-	msgCmd.LeaderID = meta.Leader
-	msgCmd.LeaderEpoch = meta.LeaderEpoch
-
-	// Fan out to all replicas for catch-up, but only current ISR acknowledgements commit data.
-	targets := []string{}
-	for _, replica := range meta.Replicas {
-		if replica != cc.brokerID {
-			targets = append(targets, replica)
+	targets := make([]string, 0, len(snapshot.Replicas))
+	for _, brokerID := range snapshot.Replicas {
+		if _, required := isr[brokerID]; !required {
+			targets = append(targets, brokerID)
 		}
 	}
+	_ = cc.replicateToReplicaSet(topic, partition, msgCmd, snapshot, targets, false)
+}
 
+func (cc *ClusterController) replicateToReplicaSet(topic string, partition int, msgCmd types.MessageCommand, snapshot PartitionReplicationSnapshot, targets []string, required bool) error {
+	current, err := cc.GetPartitionReplicationSnapshot(topic, partition)
+	if err != nil {
+		return err
+	}
+	if current.Leader != snapshot.Leader || current.LeaderEpoch != snapshot.LeaderEpoch {
+		return fmt.Errorf("partition leader fenced: current=%s/%d requested=%s/%d", current.Leader, current.LeaderEpoch, snapshot.Leader, snapshot.LeaderEpoch)
+	}
+	msgCmd.LeaderID = snapshot.Leader
+	msgCmd.LeaderEpoch = snapshot.LeaderEpoch
 	data, err := json.Marshal(msgCmd)
 	if err != nil {
 		return err
 	}
 	replicateCmd := fmt.Sprintf("REPLICATE_MESSAGE %spayload=%s", cc.internalAuthPrefix(), string(data))
-
-	var wg sync.WaitGroup
-	var successCount int32 = 1 // The local leader is durable before replication begins.
-	var mu sync.Mutex
-	errCh := make(chan error, len(targets))
-
-	partitionStr := fmt.Sprintf("%d", partition)
-	for _, targetID := range targets {
-		broker := fsm.GetBroker(targetID)
+	fsmRef := cc.RaftManager.GetFSM()
+	partitionStr := strconv.Itoa(partition)
+	for _, brokerID := range targets {
+		if brokerID == cc.brokerID {
+			continue
+		}
+		broker := fsmRef.GetBroker(brokerID)
 		if broker == nil {
-			if _, required := isr[targetID]; required {
-				errCh <- fmt.Errorf("ISR broker %s metadata not found", targetID)
+			if required {
+				return fmt.Errorf("ISR broker %s metadata not found", brokerID)
 			}
 			continue
 		}
-
-		wg.Add(1)
-		go func(addr, brokerID string) {
-			defer wg.Done()
-			resp, err := cc.Router.forwardWithTimeout(addr, replicateCmd)
-			if err == nil && strings.HasPrefix(resp, "OK") {
-				if _, required := isr[brokerID]; required {
-					mu.Lock()
-					successCount++
-					mu.Unlock()
-				}
-				metrics.ClusterReplicationLag.WithLabelValues(topic, partitionStr, brokerID).Observe(time.Since(replicationStart).Seconds())
-				if isrMgr := cc.RaftManager.GetISRManager(); isrMgr != nil {
-					isrMgr.UpdateHeartbeat(brokerID)
-				}
-				return
+		started := time.Now()
+		resp, forwardErr := cc.Router.forwardWithTimeout(broker.Addr, replicateCmd)
+		if forwardErr != nil || !strings.HasPrefix(resp, "OK") {
+			if !required {
+				continue
 			}
-			if err != nil {
-				errCh <- err
-			} else {
-				errCh <- fmt.Errorf("replica %s rejected append: %s", brokerID, resp)
+			if forwardErr != nil {
+				return fmt.Errorf("replica %s append failed: %w", brokerID, forwardErr)
 			}
-		}(broker.Addr, targetID)
-	}
-
-	wg.Wait()
-	close(errCh)
-
-	if int(successCount) < len(meta.ISR) {
-		reasons := make([]string, 0, len(errCh))
-		for err := range errCh {
-			reasons = append(reasons, err.Error())
+			return fmt.Errorf("replica %s rejected append: %s", brokerID, resp)
 		}
-		return fmt.Errorf("not all ISR replicas acknowledged: got %d, want %d: %s", successCount, len(meta.ISR), strings.Join(reasons, "; "))
+		metrics.ClusterReplicationLag.WithLabelValues(topic, partitionStr, brokerID).Observe(time.Since(started).Seconds())
+		if isrMgr := cc.RaftManager.GetISRManager(); isrMgr != nil {
+			isrMgr.UpdateHeartbeat(brokerID)
+		}
 	}
-
 	return nil
+}
+
+func containsBroker(brokers []string, wanted string) bool {
+	for _, brokerID := range brokers {
+		if brokerID == wanted {
+			return true
+		}
+	}
+	return false
 }
