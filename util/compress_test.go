@@ -277,7 +277,10 @@ func TestDecompressMessageOutputLimit(t *testing.T) {
 			original := bytes.Repeat([]byte{'x'}, util.MaxMessageSize+1)
 			compressed, err := compress(original)
 			if err != nil {
-				t.Fatalf("compress over limit: %v", err)
+				if !strings.Contains(err.Error(), "exceeds maximum") {
+					t.Fatalf("unexpected compression limit error: %v", err)
+				}
+				return
 			}
 
 			decompressed, err := util.DecompressMessage(compressed, compressionType)

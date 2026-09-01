@@ -173,46 +173,21 @@ func TestEncodeDecode_SingleMessage(t *testing.T) {
 	assert.Equal(t, "{}", decoded[0].Metadata)
 }
 
-func TestEncodeBatch_TopicTooLong(t *testing.T) {
+func TestEncodeBatch_UsesUint32FieldLengths(t *testing.T) {
 	longTopic := strings.Repeat("x", 0x10000)
-	_, err := EncodeBatchMessages(longTopic, 0, "", false, nil)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "topic too long")
-}
-
-func TestEncodeBatch_AcksTooLong(t *testing.T) {
-	longAcks := strings.Repeat("a", 256)
-	_, err := EncodeBatchMessages("t", 0, longAcks, false, nil)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "acks value too long")
-}
-
-func TestEncodeBatch_ProducerIDTooLong(t *testing.T) {
-	msgs := []Message{{ProducerID: strings.Repeat("p", 0x10000)}}
-	_, err := EncodeBatchMessages("t", 0, "", false, msgs)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "producerID too long")
-}
-
-func TestEncodeBatch_KeyTooLong(t *testing.T) {
-	msgs := []Message{{Key: strings.Repeat("k", 0x10000)}}
-	_, err := EncodeBatchMessages("t", 0, "", false, msgs)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "key too long")
-}
-
-func TestEncodeBatch_EventTypeTooLong(t *testing.T) {
-	msgs := []Message{{EventType: strings.Repeat("e", 0x10000)}}
-	_, err := EncodeBatchMessages("t", 0, "", false, msgs)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "eventType too long")
-}
-
-func TestEncodeBatch_MetadataTooLong(t *testing.T) {
-	msgs := []Message{{Metadata: strings.Repeat("m", 0x10000)}}
-	_, err := EncodeBatchMessages("t", 0, "", false, msgs)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "metadata too long")
+	encoded, err := EncodeBatchMessages(longTopic, 0, "1", false, []Message{{
+		ProducerID: strings.Repeat("p", 0x10000),
+		Key:        strings.Repeat("k", 0x10000),
+		EventType:  strings.Repeat("e", 0x10000),
+		Metadata:   strings.Repeat("m", 0x10000),
+	}})
+	require.NoError(t, err)
+	decoded, topicName, _, err := DecodeBatchMessages(encoded)
+	require.NoError(t, err)
+	require.Equal(t, longTopic, topicName)
+	require.Len(t, decoded, 1)
+	require.Len(t, decoded[0].ProducerID, 0x10000)
+	require.Len(t, decoded[0].Key, 0x10000)
 }
 
 // ---------------------------------------------------------------------------
@@ -222,62 +197,44 @@ func TestEncodeBatch_MetadataTooLong(t *testing.T) {
 func TestDecode_TooShort(t *testing.T) {
 	_, _, _, err := DecodeBatchMessages([]byte{0xBA})
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "data too short")
+	assert.Contains(t, err.Error(), "truncated")
 }
 
 func TestDecode_InvalidMagic(t *testing.T) {
-	_, _, _, err := DecodeBatchMessages([]byte{0xFF, 0xFF})
+	_, _, _, err := DecodeBatchMessages([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0, 2, 0, 0})
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid magic number")
+	assert.Contains(t, err.Error(), "invalid Wire v2 batch magic")
 }
 
-func TestDecode_NegativeMessageCount(t *testing.T) {
-	// Build a minimal valid header with a negative message count.
-	var buf bytes.Buffer
-	buf.Write([]byte{0xBA, 0x7C})                                       // magic
-	_ = binary.Write(&buf, binary.BigEndian, uint16(1))                   // topic len
-	buf.WriteByte('t')                                                   // topic
-	_ = binary.Write(&buf, binary.BigEndian, int32(0))                   // partition
-	_ = binary.Write(&buf, binary.BigEndian, uint8(0))                   // acks len
-	_ = binary.Write(&buf, binary.BigEndian, false)                      // isIdempotent
-	_ = binary.Write(&buf, binary.BigEndian, uint64(0))                  // batchStart
-	_ = binary.Write(&buf, binary.BigEndian, uint64(0))                  // batchEnd
-	_ = binary.Write(&buf, binary.BigEndian, int32(-1))                  // msgCount = -1
-	_, _, _, err := DecodeBatchMessages(buf.Bytes())
+func TestDecode_RejectsLegacyBatchMagic(t *testing.T) {
+	_, _, _, err := DecodeBatchMessages([]byte{0xBA, 0x7C, 0, 0, 0, 0})
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid negative message count")
+	assert.Contains(t, err.Error(), "invalid Wire v2 batch magic")
 }
 
 func TestDecode_ExcessiveMessageCount(t *testing.T) {
 	var buf bytes.Buffer
-	buf.Write([]byte{0xBA, 0x7C})
-	_ = binary.Write(&buf, binary.BigEndian, uint16(1))
+	_ = binary.Write(&buf, binary.BigEndian, uint32(0x43425632))
+	_ = binary.Write(&buf, binary.BigEndian, uint16(2))
+	_ = binary.Write(&buf, binary.BigEndian, uint16(0))
+	_ = binary.Write(&buf, binary.BigEndian, uint32(1))
 	buf.WriteByte('t')
 	_ = binary.Write(&buf, binary.BigEndian, int32(0))
-	_ = binary.Write(&buf, binary.BigEndian, uint8(0))
-	_ = binary.Write(&buf, binary.BigEndian, false)
+	_ = binary.Write(&buf, binary.BigEndian, uint32(0))
 	_ = binary.Write(&buf, binary.BigEndian, uint64(0))
 	_ = binary.Write(&buf, binary.BigEndian, uint64(0))
-	_ = binary.Write(&buf, binary.BigEndian, int32(100001))
+	_ = binary.Write(&buf, binary.BigEndian, uint32(100001))
 	_, _, _, err := DecodeBatchMessages(buf.Bytes())
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "message count too high")
+	assert.Contains(t, err.Error(), "message count 100001 exceeds maximum")
 }
 
 func TestDecode_TruncatedBody(t *testing.T) {
-	// Valid header but claims 1 message, body is empty.
-	var buf bytes.Buffer
-	buf.Write([]byte{0xBA, 0x7C})
-	_ = binary.Write(&buf, binary.BigEndian, uint16(1))
-	buf.WriteByte('t')
-	_ = binary.Write(&buf, binary.BigEndian, int32(0))
-	_ = binary.Write(&buf, binary.BigEndian, uint8(0))
-	_ = binary.Write(&buf, binary.BigEndian, false)
-	_ = binary.Write(&buf, binary.BigEndian, uint64(0))
-	_ = binary.Write(&buf, binary.BigEndian, uint64(0))
-	_ = binary.Write(&buf, binary.BigEndian, int32(1))
-	_, _, _, err := DecodeBatchMessages(buf.Bytes())
-	assert.Error(t, err) // should fail reading the first message's offset
+	encoded, err := EncodeBatchMessages("t", 0, "1", false, []Message{{Payload: "value"}})
+	require.NoError(t, err)
+	_, _, _, err = DecodeBatchMessages(encoded[:len(encoded)-1])
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "field length")
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +314,7 @@ func TestReadWithLength_TruncatedLength(t *testing.T) {
 
 	_, err := ReadWithLength(client)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "read length")
+	assert.Contains(t, err.Error(), "read payload length")
 }
 
 func TestReadWithLength_TruncatedBody(t *testing.T) {
@@ -375,7 +332,7 @@ func TestReadWithLength_TruncatedBody(t *testing.T) {
 
 	_, err := ReadWithLength(client)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "read body")
+	assert.Contains(t, err.Error(), "read payload")
 }
 
 func TestReadWithLength_OversizedLength(t *testing.T) {

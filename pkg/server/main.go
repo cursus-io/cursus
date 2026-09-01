@@ -30,6 +30,7 @@ import (
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -879,18 +880,7 @@ func decorateServerResponse(resp string, ctx *controller.ClientContext) string {
 
 // isBatchMessage checks if the data is in binary batch format
 func isBatchMessage(data []byte) bool {
-	if len(data) < 6 {
-		return false
-	}
-	if data[0] != 0xBA || data[1] != 0x7C {
-		return false
-	}
-
-	topicLen := binary.BigEndian.Uint16(data[2:4])
-	if topicLen == 0 || int(topicLen)+2 > len(data) {
-		return false
-	}
-	return true
+	return wire.IsBatch(data)
 }
 
 func isCommand(s string) bool {

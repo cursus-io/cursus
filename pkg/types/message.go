@@ -1,63 +1,25 @@
 package types
 
-import "fmt"
+import "github.com/cursus-io/cursus/pkg/wire"
 
 const (
-	TransactionStateNone      = ""
-	TransactionStateOpen      = "open"
-	TransactionStateCommitted = "committed"
-	TransactionStateAborted   = "aborted"
+	TransactionStateNone      = wire.TransactionStateNone
+	TransactionStateOpen      = wire.TransactionStateOpen
+	TransactionStateCommitted = wire.TransactionStateCommitted
+	TransactionStateAborted   = wire.TransactionStateAborted
 
-	TransactionMarkerNone   = ""
-	TransactionMarkerCommit = "commit"
-	TransactionMarkerAbort  = "abort"
+	TransactionMarkerNone   = wire.TransactionMarkerNone
+	TransactionMarkerCommit = wire.TransactionMarkerCommit
+	TransactionMarkerAbort  = wire.TransactionMarkerAbort
 
-	ControlBatchNone            = ""
-	ControlBatchTransaction     = "transaction"
-	ControlBatchVersionCursusV2 = 2
+	ControlBatchNone            = wire.ControlBatchNone
+	ControlBatchTransaction     = wire.ControlBatchTransaction
+	ControlBatchVersionCursusV2 = wire.ControlBatchVersionCursusV2
 )
 
-// Message represents a single message
-type Message struct {
-	Offset     uint64
-	ProducerID string
-	SeqNum     uint64
-	Payload    string
-	Key        string // optional: partition routing key
-	Epoch      int64
+type Message = wire.Message
 
-	EventType        string
-	SchemaVersion    uint32
-	AggregateVersion uint64
-	Metadata         string
-
-	TransactionalID              string
-	TransactionState             string
-	TransactionMarker            string
-	ControlBatchType             string
-	ControlBatchVersion          int16
-	ControlBatchCoordinatorEpoch int64
-	ControlBatchKey              []byte
-	ControlBatchValue            []byte
-
-	RetryCount int
-	Retry      bool
-}
-
-func (m Message) String() string {
-	return fmt.Sprintf("Message { ID: %s-%d, Payload:%s, Offset:%d, Key:%s, Epoch:%d, RetryCount:%d, EventType:%s, AggregateVersion:%d }",
-		m.ProducerID, m.SeqNum, m.Payload, m.Offset, m.Key, m.Epoch, m.RetryCount, m.EventType, m.AggregateVersion)
-}
-
-type Batch struct {
-	Topic        string
-	Partition    int
-	BatchStart   uint64
-	BatchEnd     uint64
-	Acks         string // "0", "1", "-1(=all)"
-	IsIdempotent bool
-	Messages     []Message
-}
+type Batch = wire.Batch
 
 // DiskMessage represents a message stored on disk with full metadata
 type DiskMessage struct {

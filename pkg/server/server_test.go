@@ -18,6 +18,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,45 +81,23 @@ func readFramed(t *testing.T, conn net.Conn) string {
 }
 
 func TestIsBatchMessage(t *testing.T) {
-	data := make([]byte, 10)
-	data[0] = 0xBA
-	data[1] = 0x7C
-	binary.BigEndian.PutUint16(data[2:4], 2)
+	data, err := wire.EncodeBatch(wire.Batch{Topic: "orders", Partition: 2, Acks: "all"})
+	require.NoError(t, err)
 	assert.True(t, isBatchMessage(data))
 
 	data[0] = 0x00
 	assert.False(t, isBatchMessage(data))
-
-	assert.False(t, isBatchMessage([]byte{0xBA, 0x7C}))
+	assert.False(t, isBatchMessage([]byte{0x43, 0x42, 0x56, 0x32, 0x00}))
 }
 
-func TestIsBatchMessage_ZeroTopicLen(t *testing.T) {
-	data := make([]byte, 10)
-	data[0] = 0xBA
-	data[1] = 0x7C
-	binary.BigEndian.PutUint16(data[2:4], 0)
-	assert.False(t, isBatchMessage(data))
-}
-
-func TestIsBatchMessage_TopicLenExceedsData(t *testing.T) {
-	data := make([]byte, 6)
-	data[0] = 0xBA
-	data[1] = 0x7C
-	binary.BigEndian.PutUint16(data[2:4], 200)
-	assert.False(t, isBatchMessage(data))
-}
-
-func TestIsBatchMessage_ExactlySixBytes(t *testing.T) {
-	data := []byte{0xBA, 0x7C, 0x00, 0x01, 0x41, 0x00}
+func TestIsBatchMessage_HeaderOnly(t *testing.T) {
+	data := []byte{0x43, 0x42, 0x56, 0x32, 0x00, 0x02}
 	assert.True(t, isBatchMessage(data))
 }
 
-func TestIsBatchMessage_SecondMagicByteMismatch(t *testing.T) {
-	data := make([]byte, 10)
-	data[0] = 0xBA
-	data[1] = 0x00
-	binary.BigEndian.PutUint16(data[2:4], 2)
-	assert.False(t, isBatchMessage(data))
+func TestIsBatchMessage_RejectsWrongVersionAndLegacyMagic(t *testing.T) {
+	assert.False(t, isBatchMessage([]byte{0x43, 0x42, 0x56, 0x32, 0x00, 0x01}))
+	assert.False(t, isBatchMessage([]byte{0xBA, 0x7C, 0x00, 0x02, 0x00, 0x00}))
 }
 
 func TestIsCommand(t *testing.T) {
