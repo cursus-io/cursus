@@ -20,7 +20,7 @@ services:
       - "8000:8000"
       - "9081:9080"
       - "9101:9100"
-      - "19001:19000"
+      - "127.0.0.1:19001:19000"
     volumes:
       - ../cluster/config.yaml:/app/config.yaml
     healthcheck:
@@ -52,7 +52,7 @@ services:
       - "8001:8000"
       - "9082:9080"
       - "9102:9100"
-      - "19002:19000"
+      - "127.0.0.1:19002:19000"
     volumes:
       - ../cluster/config.yaml:/app/config.yaml
     healthcheck:
@@ -87,7 +87,7 @@ services:
       - "8002:8000"
       - "9083:9080"
       - "9103:9100"
-      - "19003:19000"
+      - "127.0.0.1:19003:19000"
     volumes:
       - ../cluster/config.yaml:/app/config.yaml
     healthcheck:
