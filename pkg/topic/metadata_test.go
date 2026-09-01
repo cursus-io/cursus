@@ -142,7 +142,7 @@ func TestStandaloneTopicMetadataMigratesVersionOneDefinitionDefaults(t *testing.
 	require.NoError(t, err)
 	var migrated topicMetadataManifest
 	require.NoError(t, json.Unmarshal(raw, &migrated))
-	require.Equal(t, topicMetadataFormatVersion, migrated.Version)
+	require.Equal(t, 2, migrated.Version, "first-generation metadata remains readable by the previous release")
 	require.Equal(t, uint64(2), migrated.Topics[0].Revision)
 	require.Equal(t, DefaultReplicationFactor, migrated.Topics[0].ReplicationFactor)
 }

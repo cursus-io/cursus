@@ -42,7 +42,7 @@ func TestBrokerFSMSnapshotRestoresTopicDefinition(t *testing.T) {
 	require.NoError(t, snapshot.Persist(&MockSnapshotSink{Writer: buffer}))
 	var persisted BrokerFSMState
 	require.NoError(t, json.Unmarshal(buffer.Bytes(), &persisted))
-	require.Equal(t, 7, persisted.Version)
+	require.Equal(t, 7, persisted.Version, "first-generation snapshots stay rolling-upgrade compatible")
 
 	restored := newTestFSM()
 	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(buffer.Bytes()))))
@@ -59,6 +59,7 @@ func TestBrokerFSMSnapshotRestoresTopicDefinition(t *testing.T) {
 	require.Equal(t, int64(8192), restoredTopic.Policy.RetentionBytes)
 	require.Equal(t, 1, restoredTopic.ReplicationFactor)
 	require.Equal(t, uint64(1), restoredTopic.Revision)
+	require.Equal(t, uint64(topic.InitialLifecycleEpoch), restoredTopic.LifecycleEpoch)
 }
 
 func TestBrokerFSMPatchCommandsMergeAgainstSerializedAuthoritativeState(t *testing.T) {

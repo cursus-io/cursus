@@ -38,17 +38,26 @@ func TestBuildAdminCreateTopicCommandPreservesExplicitZeroFalseAndEmptyACL(t *te
 
 func TestParseTopicDefinitionResponse(t *testing.T) {
 	definition, err := parseTopicDefinitionResponse(
-		"OK topic=orders partitions=3 revision=7 replication_factor=3 idempotent=true event_sourcing=false cleanup_policy=delete partitioner=round_robin auth_policy=acl read_acl=reader write_acl=writer retention_hours=24 retention_bytes=8192",
+		"OK topic=orders partitions=3 revision=7 replication_factor=3 idempotent=true event_sourcing=false cleanup_policy=delete partitioner=round_robin auth_policy=acl read_acl=reader write_acl=writer retention_hours=24 retention_bytes=8192 lifecycle_epoch=3",
 	)
 	require.NoError(t, err)
 	require.Equal(t, "orders", definition.Topic)
 	require.Equal(t, uint64(7), definition.Revision)
+	require.Equal(t, uint64(3), definition.LifecycleEpoch)
 	require.Equal(t, 3, definition.Partitions)
 	require.Equal(t, 3, definition.ReplicationFactor)
 	require.True(t, definition.Idempotent)
 	require.False(t, definition.EventSourcing)
 	require.Equal(t, []string{"reader"}, definition.ReadACL)
 	require.Equal(t, []string{"writer"}, definition.WriteACL)
+}
+
+func TestParseLegacyTopicDefinitionDefaultsLifecycleEpoch(t *testing.T) {
+	definition, err := parseTopicDefinitionResponse(
+		"OK topic=orders partitions=1 revision=1 replication_factor=1 idempotent=false event_sourcing=false cleanup_policy=delete partitioner=hash_key auth_policy=open read_acl= write_acl= retention_hours=0 retention_bytes=0",
+	)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), definition.LifecycleEpoch)
 }
 
 func TestBuildAndParseAdminDeleteTopic(t *testing.T) {
@@ -59,6 +68,61 @@ func TestBuildAndParseAdminDeleteTopic(t *testing.T) {
 	result, err := parseDeleteTopicResponse("OK topic=orders deleted=false cleanup_pending=false")
 	require.NoError(t, err)
 	require.Equal(t, DeleteTopicResult{Topic: "orders", Deleted: false}, result)
+}
+
+func TestBuildAndParseAdminTruncateTopic(t *testing.T) {
+	command, err := buildAdminTruncateTopicCommand("orders", TruncateTopicOptions{ExpectedRevision: 7})
+	require.NoError(t, err)
+	require.Equal(t, "TRUNCATE topic=orders expected_revision=7", command)
+
+	_, err = buildAdminTruncateTopicCommand("orders", TruncateTopicOptions{})
+	require.ErrorContains(t, err, "expected revision")
+
+	result, err := parseTruncateTopicResponse(
+		"OK topic=orders truncated=true revision=8 lifecycle_epoch=3 leo=0 hwm=0 cleanup_pending=true",
+	)
+	require.NoError(t, err)
+	require.Equal(t, TruncateTopicResult{
+		Topic: "orders", Truncated: true, Revision: 8, LifecycleEpoch: 3, CleanupPending: true,
+	}, result)
+}
+
+func TestAdminClientRoutesTruncateAndParsesLifecycleResult(t *testing.T) {
+	firstAddr, firstResult := startAdminTestServer(t, "ERROR: no_raft_leader class=availability retryable=true")
+	secondAddr, secondResult := startAdminTestServer(t,
+		"OK topic=orders truncated=true revision=8 lifecycle_epoch=3 leo=0 hwm=0",
+	)
+	client, err := NewAdminClient(&AdminConfig{
+		BrokerAddrs: []string{firstAddr, secondAddr}, MaxRetries: 1, RequestTimeoutMS: 1000,
+	})
+	require.NoError(t, err)
+
+	result, err := client.TruncateTopic("orders", TruncateTopicOptions{ExpectedRevision: 7})
+	require.NoError(t, err)
+	require.Equal(t, uint64(8), result.Revision)
+	require.Equal(t, uint64(3), result.LifecycleEpoch)
+	require.Equal(t, "TRUNCATE topic=orders expected_revision=7", receiveAdminTestCommand(t, firstResult))
+	require.Equal(t, "TRUNCATE topic=orders expected_revision=7", receiveAdminTestCommand(t, secondResult))
+}
+
+func TestAdminClientDoesNotReplayAmbiguousTruncate(t *testing.T) {
+	firstAddr, firstResult := startAdminCommandDropServer(t)
+	secondAddr, secondResult := startAdminTestServer(t,
+		"OK topic=orders truncated=true revision=8 lifecycle_epoch=3 leo=0 hwm=0",
+	)
+	client, err := NewAdminClient(&AdminConfig{
+		BrokerAddrs: []string{firstAddr, secondAddr}, MaxRetries: 1, RequestTimeoutMS: 1000,
+	})
+	require.NoError(t, err)
+
+	_, err = client.TruncateTopic("orders", TruncateTopicOptions{ExpectedRevision: 7})
+	require.ErrorContains(t, err, "outcome is unknown and was not retried")
+	require.Equal(t, "TRUNCATE topic=orders expected_revision=7", receiveAdminTestCommand(t, firstResult))
+	select {
+	case result := <-secondResult:
+		t.Fatalf("ambiguous truncate unexpectedly retried on the second broker: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
 }
 
 func TestAdminClientRetriesRetryableFailureOnNextBroker(t *testing.T) {

@@ -1,18 +1,23 @@
 package e2e_cluster
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/test/e2e"
 	"github.com/stretchr/testify/require"
 )
 
 func TestRepeatedCreatePatchPreservesDefinitionAcrossThreeNodes(t *testing.T) {
-	const topicName = "topic-patch-contract"
+	const (
+		topicName         = "topic-patch-contract"
+		truncateTopicName = "topic-truncate-contract"
+	)
 	ctx := GivenClusterRestart(t).
 		WithClusterSize(3).
 		WithTopic(topicName)
@@ -89,6 +94,49 @@ func TestRepeatedCreatePatchPreservesDefinitionAcrossThreeNodes(t *testing.T) {
 		"revision": "4", "partitions": "2", "replication_factor": "3", "idempotent": "true",
 		"retention_hours": "0", "retention_bytes": "8192", "read_acl": "", "write_acl": "writer-2",
 	})
+	requireClusterLifecycleProtocolEventually(t, ctx.GetBrokerAddrs(), fsm.TopicLifecycleProtocolVersion)
+
+	truncateCreated := sendClusterTopicCommand(t, ctx.GetBrokerAddrs(),
+		"CREATE topic="+truncateTopicName+" partitions=2 replication_factor=3 idempotent=true retention_hours=48 retention_bytes=4096",
+	)
+	requireDefinitionFields(t, truncateCreated, map[string]string{
+		"topic": truncateTopicName, "revision": "1", "lifecycle_epoch": "1", "partitions": "2",
+		"replication_factor": "3", "idempotent": "true", "retention_hours": "48", "retention_bytes": "4096",
+	})
+	requireClusterDefinitionEventually(t, ctx.GetBrokerAddrs(), truncateTopicName, map[string]string{
+		"revision": "1", "lifecycle_epoch": "1", "partitions": "2", "replication_factor": "3",
+	})
+
+	client := e2e.NewBrokerClient(ctx.GetBrokerAddrs())
+	require.NoError(t, client.PublishIdempotentToPartition(truncateTopicName, "truncate-producer", 0, 1, 0, "before-truncate", "all", true))
+	client.Close()
+	requireClusterPartitionOffsetsEventually(t, ctx.GetBrokerAddrs(), truncateTopicName, 0, false)
+
+	truncated := sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "TRUNCATE topic="+truncateTopicName+" expected_revision=1")
+	requireDefinitionFields(t, truncated, map[string]string{
+		"topic": truncateTopicName, "truncated": "true", "revision": "2", "lifecycle_epoch": "2", "leo": "0", "hwm": "0",
+	})
+	requireClusterDefinitionEventually(t, ctx.GetBrokerAddrs(), truncateTopicName, map[string]string{
+		"revision": "2", "lifecycle_epoch": "2", "partitions": "2", "replication_factor": "3",
+		"idempotent": "true", "retention_hours": "48", "retention_bytes": "4096",
+	})
+	requireClusterPartitionOffsetsEventually(t, ctx.GetBrokerAddrs(), truncateTopicName, 0, true)
+	conflictingTruncate := sendClusterTopicCommandRaw(t, ctx.GetBrokerAddrs(), "TRUNCATE topic="+truncateTopicName+" expected_revision=1")
+	require.Contains(t, conflictingTruncate, "topic_revision_conflict")
+
+	actions.StopBroker(follower)
+	actions.StartBroker(follower)
+	requireClusterDefinitionEventually(t, ctx.GetBrokerAddrs(), truncateTopicName, map[string]string{
+		"revision": "2", "lifecycle_epoch": "2", "partitions": "2", "replication_factor": "3",
+	})
+	requireClusterPartitionOffsetsEventually(t, ctx.GetBrokerAddrs(), truncateTopicName, 0, true)
+
+	client = e2e.NewBrokerClient(ctx.GetBrokerAddrs())
+	require.NoError(t, client.PublishIdempotentToPartition(truncateTopicName, "truncate-producer", 0, 1, 0, "after-truncate", "all", true))
+	client.Close()
+	truncateDeleted := sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "DELETE topic="+truncateTopicName)
+	requireDefinitionFields(t, truncateDeleted, map[string]string{"topic": truncateTopicName, "deleted": "true"})
+	requireClusterTopicMissingEventually(t, ctx.GetBrokerAddrs(), truncateTopicName)
 
 	deleted := sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "DELETE topic="+topicName)
 	requireDefinitionFields(t, deleted, map[string]string{"topic": topicName, "deleted": "true"})
@@ -167,6 +215,56 @@ func requireClusterTopicMissingEventually(t *testing.T, addrs []string, topicNam
 			}
 		}
 		return true, "topic deletion converged", nil
+	}))
+}
+
+func requireClusterPartitionOffsetsEventually(t *testing.T, addrs []string, topicName string, partition int, empty bool) {
+	t.Helper()
+	require.NoError(t, eventually(t, "partition offsets on all brokers", clusterReadyTimeout, func() (bool, string, error) {
+		for _, addr := range addrs {
+			client := e2e.NewBrokerClient([]string{addr})
+			response, err := client.SendCommand("", fmt.Sprintf("LIST_OFFSETS topic=%s partition=%d", topicName, partition), 5*time.Second)
+			client.Close()
+			if err != nil {
+				return false, addr + ": request failed", nil
+			}
+			isEmpty := strings.Contains(response, "leo=0:hwm=0")
+			if isEmpty != empty {
+				return false, fmt.Sprintf("%s: unexpected offsets (%s)", addr, response), nil
+			}
+		}
+		return true, "offsets converged", nil
+	}))
+}
+
+func requireClusterLifecycleProtocolEventually(t *testing.T, addrs []string, minimum int) {
+	t.Helper()
+	require.NoError(t, eventually(t, "lifecycle protocol on all brokers", clusterReadyTimeout, func() (bool, string, error) {
+		client := e2e.NewBrokerClient(addrs)
+		response, err := client.SendCommand("", "LIST_CLUSTER", 5*time.Second)
+		client.Close()
+		if err != nil {
+			return false, "LIST_CLUSTER request failed", nil
+		}
+		const prefix = "OK brokers="
+		if !strings.HasPrefix(response, prefix) {
+			return false, response, nil
+		}
+		var brokers []fsm.BrokerInfo
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(response, prefix)), &brokers); err != nil {
+			return false, "invalid LIST_CLUSTER response", err
+		}
+		active := 0
+		for _, broker := range brokers {
+			if !strings.EqualFold(broker.Status, "active") {
+				continue
+			}
+			active++
+			if broker.LifecycleProtocol < minimum {
+				return false, fmt.Sprintf("%s advertises lifecycle protocol %d", broker.ID, broker.LifecycleProtocol), nil
+			}
+		}
+		return active == len(addrs), fmt.Sprintf("%d/%d active brokers advertise lifecycle protocol %d", active, len(addrs), minimum), nil
 	}))
 }
 

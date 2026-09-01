@@ -19,6 +19,7 @@ import (
 	client "github.com/cursus-io/cursus/pkg/cluster/client"
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/cluster/replication"
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
 	"github.com/cursus-io/cursus/pkg/coordinator"
@@ -151,7 +152,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 					if cc != nil && cc.Router != nil {
 						brokerJSON, _ := json.Marshal(map[string]interface{}{
 							"id": brokerID, "addr": localAddr, "client_addr": clientAddr,
-							"status": "active",
+							"status": "active", "lifecycle_protocol": fsm.TopicLifecycleProtocolVersion,
 						})
 						raftCmd := fmt.Sprintf("RAFT_APPLY %stype=REGISTER payload=%s", internalAuthPrefix(cfg), string(brokerJSON))
 						encodedCmd := util.EncodeMessage("", raftCmd)

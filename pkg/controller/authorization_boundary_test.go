@@ -31,6 +31,7 @@ func TestProtectedCommandsRequireAuthenticationWhenSASLIsEnabled(t *testing.T) {
 	for _, command := range []string{
 		"LIST",
 		"CREATE topic=blocked partitions=1",
+		"TRUNCATE topic=blocked expected_revision=1",
 		"CLUSTER_STATUS",
 		"ELECT_LEADER topic=orders partition=0 broker=broker-2",
 		"JOIN_GROUP topic=missing group=workers member=m1",
@@ -61,6 +62,9 @@ func TestCommandPermissionsAreEnforcedByCategory(t *testing.T) {
 	if resp := ch.HandleCommand("CREATE topic=reader-blocked partitions=1", reader); !strings.Contains(resp, "permission=admin") {
 		t.Fatalf("reader admin command was not denied: %s", resp)
 	}
+	if resp := ch.HandleCommand("TRUNCATE topic=reader-blocked expected_revision=1", reader); !strings.Contains(resp, "permission=admin") {
+		t.Fatalf("reader truncate command was not denied: %s", resp)
+	}
 	if resp := ch.HandleCommand("INIT_PRODUCER_ID transactional_id=reader-tx", reader); !strings.Contains(resp, "permission=transaction") {
 		t.Fatalf("reader transaction command was not denied: %s", resp)
 	}
@@ -71,6 +75,9 @@ func TestCommandPermissionsAreEnforcedByCategory(t *testing.T) {
 	operator := authenticateTestUser(t, ch, "operator", "ops-secret")
 	if resp := ch.HandleCommand("CREATE topic=operator-topic partitions=1", operator); !strings.HasPrefix(resp, "OK ") {
 		t.Fatalf("operator could not create topic: %s", resp)
+	}
+	if resp := ch.HandleCommand("TRUNCATE topic=operator-topic expected_revision=1", operator); !strings.HasPrefix(resp, "OK ") {
+		t.Fatalf("operator could not truncate topic: %s", resp)
 	}
 	if resp := ch.HandleCommand("FIND_COORDINATOR group=workers", operator); !strings.HasPrefix(resp, "OK ") {
 		t.Fatalf("operator could not discover group coordinator: %s", resp)

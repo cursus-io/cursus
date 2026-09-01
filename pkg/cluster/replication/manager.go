@@ -350,12 +350,13 @@ func (rm *RaftReplicationManager) ReplicateWithQuorum(topic string, partition in
 	}
 
 	cmd := types.MessageCommand{
-		Topic:         topic,
-		Partition:     partition,
-		Messages:      []types.Message{msg},
-		Acks:          "-1",
-		IsIdempotent:  isIdempotent,
-		SequenceScope: sequenceScope,
+		Topic:          topic,
+		Partition:      partition,
+		LifecycleEpoch: rm.partitionLifecycleEpoch(topic, partition),
+		Messages:       []types.Message{msg},
+		Acks:           "-1",
+		IsIdempotent:   isIdempotent,
+		SequenceScope:  sequenceScope,
 	}
 
 	data, err := json.Marshal(cmd)
@@ -378,12 +379,13 @@ func (rm *RaftReplicationManager) ReplicateBatchWithQuorum(topic string, partiti
 	}
 
 	batchData := types.MessageCommand{
-		Topic:         topic,
-		Partition:     partition,
-		IsIdempotent:  isIdempotent,
-		SequenceScope: sequenceScope,
-		Messages:      messages,
-		Acks:          acks,
+		Topic:          topic,
+		Partition:      partition,
+		LifecycleEpoch: rm.partitionLifecycleEpoch(topic, partition),
+		IsIdempotent:   isIdempotent,
+		SequenceScope:  sequenceScope,
+		Messages:       messages,
+		Acks:           acks,
 	}
 
 	data, err := json.Marshal(batchData)
@@ -392,6 +394,15 @@ func (rm *RaftReplicationManager) ReplicateBatchWithQuorum(topic string, partiti
 	}
 
 	return rm.ApplyResponse("MESSAGE", data, 5*time.Second)
+}
+
+func (rm *RaftReplicationManager) partitionLifecycleEpoch(topicName string, partition int) uint64 {
+	if rm != nil && rm.fsm != nil {
+		if metadata := rm.fsm.GetPartitionMetadata(topicName + "-" + strconv.Itoa(partition)); metadata != nil && metadata.LifecycleEpoch != 0 {
+			return metadata.LifecycleEpoch
+		}
+	}
+	return topic.InitialLifecycleEpoch
 }
 
 func (rm *RaftReplicationManager) ApplyResponse(prefix string, data []byte, timeout time.Duration) (types.AckResponse, error) {

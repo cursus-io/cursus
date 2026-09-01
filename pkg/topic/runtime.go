@@ -37,7 +37,12 @@ func (tm *TopicManager) MetadataReadinessError() error {
 	loadFailure := tm.metadataLoadFailure
 	orphanCount := tm.metadataOrphanTopicCount
 	durabilityWarning := tm.metadataDurabilityWarning
+	pendingTruncations := make([]string, 0, len(tm.pendingTruncations))
+	for name := range tm.pendingTruncations {
+		pendingTruncations = append(pendingTruncations, name)
+	}
 	tm.mu.RUnlock()
+	sort.Strings(pendingTruncations)
 
 	var readinessErr error
 	if loadFailure != "" {
@@ -48,6 +53,12 @@ func (tm *TopicManager) MetadataReadinessError() error {
 	}
 	if durabilityWarning != "" {
 		readinessErr = errors.Join(readinessErr, fmt.Errorf("metadata durability warning: %s", durabilityWarning))
+	}
+	if len(pendingTruncations) > 0 {
+		readinessErr = errors.Join(readinessErr, fmt.Errorf(
+			"%d topic truncation(s) pending local cleanup: %s",
+			len(pendingTruncations), pendingTruncations[0],
+		))
 	}
 	return readinessErr
 }

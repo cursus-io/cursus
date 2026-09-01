@@ -52,11 +52,30 @@ func migrateSnapshotTopicDefinitionFields(
 			if definition.ReplicationFactor == 0 {
 				return fmt.Errorf("topic state %q is missing replication_factor in snapshot version %d", name, version)
 			}
+			if version >= 8 && definition.LifecycleEpoch == 0 {
+				return fmt.Errorf("topic state %q is missing lifecycle_epoch in snapshot version %d", name, version)
+			}
+			if definition.LifecycleEpoch == 0 {
+				definition.LifecycleEpoch = topic.InitialLifecycleEpoch
+			}
+			for partition := 0; partition < definition.Partitions; partition++ {
+				if partitionMetadata := metadata[name+"-"+strconv.Itoa(partition)]; partitionMetadata != nil && partitionMetadata.LifecycleEpoch == 0 {
+					partitionMetadata.LifecycleEpoch = definition.LifecycleEpoch
+				}
+			}
 			continue
 		}
 
 		if definition.Revision == 0 {
 			definition.Revision = topic.InitialDefinitionRevision
+		}
+		if definition.LifecycleEpoch == 0 {
+			definition.LifecycleEpoch = topic.InitialLifecycleEpoch
+		}
+		for partition := 0; partition < definition.Partitions; partition++ {
+			if partitionMetadata := metadata[name+"-"+strconv.Itoa(partition)]; partitionMetadata != nil && partitionMetadata.LifecycleEpoch == 0 {
+				partitionMetadata.LifecycleEpoch = definition.LifecycleEpoch
+			}
 		}
 		if definition.ReplicationFactor != 0 {
 			continue
@@ -171,6 +190,17 @@ func validateTopicState(
 				"partition metadata %q idempotent mode conflicts with topic %q",
 				key,
 				name,
+			)
+		}
+		metadataLifecycleEpoch := partitionMetadata.LifecycleEpoch
+		if metadataLifecycleEpoch == 0 {
+			metadataLifecycleEpoch = topic.InitialLifecycleEpoch
+			partitionMetadata.LifecycleEpoch = metadataLifecycleEpoch
+		}
+		if metadataLifecycleEpoch != definition.LifecycleEpoch {
+			return nil, fmt.Errorf(
+				"partition metadata %q lifecycle epoch %d conflicts with topic %q epoch %d",
+				key, metadataLifecycleEpoch, name, definition.LifecycleEpoch,
 			)
 		}
 		if partition >= definition.Partitions {

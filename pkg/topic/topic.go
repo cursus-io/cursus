@@ -27,6 +27,7 @@ type Topic struct {
 	IsEventSourcing   bool
 	ReplicationFactor int
 	Revision          uint64
+	LifecycleEpoch    uint64
 	Policy            Policy
 	txnResolver       TransactionDecisionResolver
 }
@@ -138,6 +139,7 @@ func newTopicWithDefinition(definition Definition, hp HandlerProvider, cfg *conf
 		IsEventSourcing:   definition.EventSourcing,
 		ReplicationFactor: definition.ReplicationFactor,
 		Revision:          definition.Revision,
+		LifecycleEpoch:    definition.LifecycleEpoch,
 		Policy:            definition.Policy,
 	}, nil
 }
@@ -214,6 +216,7 @@ func (t *Topic) definitionLocked() Definition {
 	return Definition{
 		Name:              t.Name,
 		Revision:          t.Revision,
+		LifecycleEpoch:    t.LifecycleEpoch,
 		Partitions:        len(t.Partitions),
 		ReplicationFactor: t.ReplicationFactor,
 		Idempotent:        t.IsIdempotent,
@@ -241,6 +244,9 @@ func (t *Topic) applyFullDefinitionLocked(definition Definition, hp HandlerProvi
 	}
 	if definition.EventSourcing != t.IsEventSourcing {
 		return fmt.Errorf("event_sourcing mode is immutable for existing topic %q", t.Name)
+	}
+	if definition.LifecycleEpoch != t.LifecycleEpoch {
+		return fmt.Errorf("lifecycle epoch is immutable outside truncate for topic %q: current=%d requested=%d", t.Name, t.LifecycleEpoch, definition.LifecycleEpoch)
 	}
 	partitionCount := definition.Partitions
 	policy := definition.Policy
@@ -277,6 +283,7 @@ func (t *Topic) applyFullDefinitionLocked(definition Definition, hp HandlerProvi
 	t.Policy = policy
 	t.ReplicationFactor = definition.ReplicationFactor
 	t.Revision = definition.Revision
+	t.LifecycleEpoch = definition.LifecycleEpoch
 	t.Partitions = append(t.Partitions, staged...)
 	return nil
 }

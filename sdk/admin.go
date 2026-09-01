@@ -62,6 +62,7 @@ type TopicDefinitionPatch struct {
 type TopicDefinition struct {
 	Topic             string
 	Revision          uint64
+	LifecycleEpoch    uint64
 	Partitions        int
 	ReplicationFactor int
 	Idempotent        bool
@@ -87,6 +88,25 @@ type DeleteTopicOptions struct {
 type DeleteTopicResult struct {
 	Topic          string
 	Deleted        bool
+	CleanupPending bool
+}
+
+// TruncateTopicOptions requires the caller's last observed definition
+// revision so a delayed or duplicated request cannot erase a newer lifecycle.
+type TruncateTopicOptions struct {
+	ExpectedRevision uint64
+}
+
+// TruncateTopicResult reports the newly committed empty topic lifecycle.
+// CleanupPending means the logical transition is committed while one or more
+// broker-local cleanup operations remain fenced for reconciliation.
+type TruncateTopicResult struct {
+	Topic          string
+	Truncated      bool
+	Revision       uint64
+	LifecycleEpoch uint64
+	LEO            uint64
+	HWM            uint64
 	CleanupPending bool
 }
 
@@ -181,6 +201,28 @@ func (c *AdminClient) DeleteTopicContext(ctx context.Context, topic string, opti
 		return DeleteTopicResult{}, err
 	}
 	return parseDeleteTopicResponse(response)
+}
+
+func (c *AdminClient) TruncateTopic(topic string, options TruncateTopicOptions) (TruncateTopicResult, error) {
+	return c.TruncateTopicContext(context.Background(), topic, options)
+}
+
+func (c *AdminClient) TruncateTopicContext(ctx context.Context, topic string, options TruncateTopicOptions) (TruncateTopicResult, error) {
+	if ctx == nil {
+		return TruncateTopicResult{}, fmt.Errorf("admin context is nil")
+	}
+	command, err := buildAdminTruncateTopicCommand(topic, options)
+	if err != nil {
+		return TruncateTopicResult{}, err
+	}
+	// Retry connection/routing failures, but never retry after the command may
+	// have been written: expected_revision makes a replay safe, yet a committed
+	// first attempt would correctly return a conflict rather than the result.
+	response, err := c.execute(ctx, command, false)
+	if err != nil {
+		return TruncateTopicResult{}, err
+	}
+	return parseTruncateTopicResponse(response)
 }
 
 func (c *AdminClient) applyTopicPatch(ctx context.Context, topic string, patch TopicDefinitionPatch) (TopicDefinition, error) {
@@ -426,6 +468,16 @@ func buildAdminDeleteTopicCommand(topic string, options DeleteTopicOptions) (str
 	return command, nil
 }
 
+func buildAdminTruncateTopicCommand(topic string, options TruncateTopicOptions) (string, error) {
+	if err := validateSDKTopicName(topic); err != nil {
+		return "", err
+	}
+	if options.ExpectedRevision == 0 {
+		return "", fmt.Errorf("expected revision must be greater than zero")
+	}
+	return "TRUNCATE topic=" + topic + " expected_revision=" + strconv.FormatUint(options.ExpectedRevision, 10), nil
+}
+
 func appendAdminACLField(fields []string, name string, values *[]string) ([]string, error) {
 	if values == nil {
 		return fields, nil
@@ -462,6 +514,12 @@ func parseTopicDefinitionResponse(response string) (TopicDefinition, error) {
 	if definition.Revision, err = parseAdminUint64(fields, "revision"); err != nil {
 		return TopicDefinition{}, err
 	}
+	definition.LifecycleEpoch = 1
+	if _, present := fields["lifecycle_epoch"]; present {
+		if definition.LifecycleEpoch, err = parseAdminUint64(fields, "lifecycle_epoch"); err != nil {
+			return TopicDefinition{}, err
+		}
+	}
 	if definition.Idempotent, err = parseAdminBool(fields, "idempotent"); err != nil {
 		return TopicDefinition{}, err
 	}
@@ -495,6 +553,39 @@ func parseDeleteTopicResponse(response string) (DeleteTopicResult, error) {
 		result.CleanupPending, err = strconv.ParseBool(value)
 		if err != nil {
 			return DeleteTopicResult{}, fmt.Errorf("invalid cleanup_pending: %w", err)
+		}
+	}
+	return result, nil
+}
+
+func parseTruncateTopicResponse(response string) (TruncateTopicResult, error) {
+	fields, err := parseOKResponse(response)
+	if err != nil {
+		return TruncateTopicResult{}, err
+	}
+	result := TruncateTopicResult{Topic: fields["topic"]}
+	if result.Topic == "" {
+		return TruncateTopicResult{}, fmt.Errorf("missing topic")
+	}
+	if result.Truncated, err = parseAdminBool(fields, "truncated"); err != nil {
+		return TruncateTopicResult{}, err
+	}
+	if result.Revision, err = parseAdminUint64(fields, "revision"); err != nil {
+		return TruncateTopicResult{}, err
+	}
+	if result.LifecycleEpoch, err = parseAdminUint64(fields, "lifecycle_epoch"); err != nil {
+		return TruncateTopicResult{}, err
+	}
+	if result.LEO, err = parseAdminUint64(fields, "leo"); err != nil {
+		return TruncateTopicResult{}, err
+	}
+	if result.HWM, err = parseAdminUint64(fields, "hwm"); err != nil {
+		return TruncateTopicResult{}, err
+	}
+	if value, present := fields["cleanup_pending"]; present {
+		result.CleanupPending, err = strconv.ParseBool(value)
+		if err != nil {
+			return TruncateTopicResult{}, fmt.Errorf("invalid cleanup_pending: %w", err)
 		}
 	}
 	return result, nil

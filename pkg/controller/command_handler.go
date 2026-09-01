@@ -221,7 +221,7 @@ func formatCreateTopicError(topicName string, err error) string {
 
 func formatTopicDefinitionResponse(definition topic.Definition) string {
 	return fmt.Sprintf(
-		"OK topic=%s partitions=%d cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d revision=%d replication_factor=%d idempotent=%t event_sourcing=%t",
+		"OK topic=%s partitions=%d cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d revision=%d replication_factor=%d idempotent=%t event_sourcing=%t lifecycle_epoch=%d",
 		definition.Name,
 		definition.Partitions,
 		definition.Policy.CleanupPolicy,
@@ -235,6 +235,7 @@ func formatTopicDefinitionResponse(definition topic.Definition) string {
 		definition.ReplicationFactor,
 		definition.Idempotent,
 		definition.EventSourcing,
+		definition.LifecycleEpoch,
 	)
 }
 
@@ -342,6 +343,123 @@ func (ch *CommandHandler) handleDelete(cmd string, ctx ...*ClientContext) string
 		return fmt.Sprintf("OK topic=%s deleted=true cleanup_pending=true", topicName)
 	}
 	return fmt.Sprintf("OK topic=%s deleted=true", topicName)
+}
+
+// handleTruncate resets topic data while retaining its definition. The
+// required expected_revision is an optimistic guard and is consumed exactly
+// once by the lifecycle epoch transition.
+func (ch *CommandHandler) handleTruncate(cmd string, ctx ...*ClientContext) string {
+	requestCtx := firstClientContext(ctx).RequestContext()
+	args := parseKeyValueArgs(strings.TrimPrefix(cmd, "TRUNCATE "))
+	topicName := args["topic"]
+	if topicName == "" {
+		return "ERROR: missing_topic expected=\"TRUNCATE topic=<name> expected_revision=<N>\""
+	}
+	if err := topic.ValidateName(topicName); err != nil {
+		return fmt.Sprintf("ERROR: invalid_topic_name topic=%q reason=%q", topicName, err.Error())
+	}
+	if topicName == config.ConsumerOffsetsTopicName {
+		return fmt.Sprintf("ERROR: internal_topic_truncate_forbidden topic=%s", topicName)
+	}
+	expectedValue := args["expected_revision"]
+	if expectedValue == "" {
+		return "ERROR: missing_expected_revision command=TRUNCATE"
+	}
+	expectedRevision, err := strconv.ParseUint(expectedValue, 10, 64)
+	if err != nil || expectedRevision == 0 {
+		return fmt.Sprintf("ERROR: invalid_expected_revision value=%q", expectedValue)
+	}
+
+	if ch.isDistributed() {
+		if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, cmd); forwarded {
+			return resp
+		}
+		result, applyErr := ch.applyAndWaitContext(requestCtx, "TOPIC_TRUNCATE", map[string]interface{}{
+			"topic":             topicName,
+			"expected_revision": expectedRevision,
+		})
+		if applyErr != nil {
+			return formatTruncateError(topicName, expectedRevision, applyErr)
+		}
+		truncateResult, ok := result.(topic.TruncateResult)
+		if !ok {
+			return fmt.Sprintf("ERROR: truncate_topic_failed topic=%s reason=%q", topicName, "invalid replicated truncate result")
+		}
+		return formatTruncateResult(truncateResult)
+	}
+
+	transactionState, err := ch.prepareStandaloneTopicDependencies(topicName)
+	if err != nil {
+		if errors.Is(err, topic.ErrTopicDeleteBlocked) {
+			return fmt.Sprintf("ERROR: topic_truncate_blocked topic=%s reason=%q", topicName, err.Error())
+		}
+		return fmt.Sprintf("ERROR: truncate_topic_failed topic=%s reason=%q", topicName, err.Error())
+	}
+	result, truncateErr := ch.TopicManager.TruncateTopicDurable(topicName, expectedRevision)
+	if truncateErr != nil && !result.Truncated {
+		return formatTruncateError(topicName, expectedRevision, truncateErr)
+	}
+	dependencyErr := ch.applyStandaloneTopicDependencyCleanup(topicName, transactionState)
+	completeErr := ch.TopicManager.CompleteTruncation(topicName)
+	if truncateErr != nil || dependencyErr != nil || completeErr != nil {
+		util.Warn("Topic %s truncate committed with pending cleanup: storage=%v dependencies=%v completion=%v", topicName, truncateErr, dependencyErr, completeErr)
+		result.CleanupPending = true
+		return formatTruncateResult(result)
+	}
+	result.CleanupPending = false
+	return formatTruncateResult(result)
+}
+
+func formatTruncateError(topicName string, expectedRevision uint64, err error) string {
+	switch {
+	case errors.Is(err, topic.ErrTopicNotFound):
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	case errors.Is(err, topic.ErrTopicRevisionConflict):
+		return fmt.Sprintf("ERROR: topic_revision_conflict topic=%s expected=%d reason=%q", topicName, expectedRevision, err.Error())
+	case errors.Is(err, topic.ErrTopicDeleteBlocked):
+		return fmt.Sprintf("ERROR: topic_truncate_blocked topic=%s reason=%q", topicName, err.Error())
+	default:
+		return fmt.Sprintf("ERROR: truncate_topic_failed topic=%s reason=%q", topicName, err.Error())
+	}
+}
+
+func formatTruncateResult(result topic.TruncateResult) string {
+	response := fmt.Sprintf(
+		"OK topic=%s truncated=%t revision=%d lifecycle_epoch=%d leo=0 hwm=0",
+		result.Topic, result.Truncated, result.Definition.Revision, result.Definition.LifecycleEpoch,
+	)
+	if result.CleanupPending {
+		response += " cleanup_pending=true"
+	}
+	return response
+}
+
+// RecoverPendingTruncations resumes a standalone lifecycle transition found
+// in the manifest before the broker begins serving requests.
+func (ch *CommandHandler) RecoverPendingTruncations() error {
+	if ch == nil || ch.TopicManager == nil || ch.isDistributed() {
+		return nil
+	}
+	for _, definition := range ch.TopicManager.PendingTruncations() {
+		if definition.Revision <= topic.InitialDefinitionRevision {
+			return fmt.Errorf("invalid pending truncate revision for topic %q", definition.Name)
+		}
+		transactionState, err := ch.prepareStandaloneTopicDependencies(definition.Name)
+		if err != nil {
+			return err
+		}
+		result, truncateErr := ch.TopicManager.TruncateTopicDurable(definition.Name, definition.Revision-1)
+		if truncateErr != nil && !result.Truncated {
+			return truncateErr
+		}
+		if err := ch.applyStandaloneTopicDependencyCleanup(definition.Name, transactionState); err != nil {
+			return err
+		}
+		if err := ch.TopicManager.CompleteTruncation(definition.Name); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (ch *CommandHandler) ensureTopicRecreationIsClean(topicName string) error {

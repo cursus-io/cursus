@@ -12,6 +12,7 @@ const (
 	DefaultPartitionCount     = 4
 	DefaultReplicationFactor  = 3
 	InitialDefinitionRevision = 1
+	InitialLifecycleEpoch     = 1
 )
 
 // DefinitionPatch represents only fields explicitly supplied by a CREATE
@@ -47,6 +48,7 @@ func DefaultDefinition(name string, cfg *config.Config) Definition {
 	return Definition{
 		Name:              name,
 		Revision:          InitialDefinitionRevision,
+		LifecycleEpoch:    InitialLifecycleEpoch,
 		Partitions:        DefaultPartitionCount,
 		ReplicationFactor: replicationFactor,
 		Policy:            policy,

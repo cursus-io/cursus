@@ -122,3 +122,44 @@ func TestCreateBlocksStaleLifecycleReferencesUntilIdempotentDeleteCleanup(t *tes
 	_, found := groupCoordinator.GetOffset("workers", "orders", 0)
 	require.False(t, found)
 }
+
+func TestStandaloneTruncateRequiresRevisionAndResetsLifecycleState(t *testing.T) {
+	handler, _, groupCoordinator := newTestHandlerWithCoordinator(t)
+	ctx := NewClientContext("", 0)
+	create := handler.HandleCommand("CREATE topic=orders partitions=1 retention_hours=168 read_acl=reader", ctx)
+	require.Contains(t, create, "revision=1")
+	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
+	require.NoError(t, groupCoordinator.CommitOffset("workers", "orders", 0, 17))
+	handler.TxnManager.ApplySnapshot(&transaction.Snapshot{
+		ID: "tx-orders", State: transaction.StateCommitted, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		Messages: []transaction.MessageOperation{{Topic: "orders", Partition: 0}, {Topic: "audit", Partition: 0}},
+	})
+
+	require.Contains(t, handler.HandleCommand("TRUNCATE topic=orders", ctx), "missing_expected_revision")
+	require.Contains(t, handler.HandleCommand("TRUNCATE topic=orders expected_revision=9", ctx), "topic_revision_conflict")
+	response := handler.HandleCommand("TRUNCATE topic=orders expected_revision=1", ctx)
+	require.Equal(t, "OK topic=orders truncated=true revision=2 lifecycle_epoch=2 leo=0 hwm=0", response)
+
+	definition := handler.TopicManager.GetTopic("orders").Definition()
+	require.Equal(t, uint64(2), definition.Revision)
+	require.Equal(t, uint64(2), definition.LifecycleEpoch)
+	require.Equal(t, 168, definition.Policy.RetentionHours)
+	require.Equal(t, []string{"reader"}, definition.Policy.ReadACL)
+	require.Nil(t, groupCoordinator.GetGroup("workers"))
+	_, found := groupCoordinator.GetOffset("workers", "orders", 0)
+	require.False(t, found)
+	require.Equal(t, []transaction.MessageOperation{{Topic: "audit", Partition: 0}}, handler.TxnManager.ExportState()["tx-orders"].Messages)
+	require.Contains(t, handler.HandleCommand("TRUNCATE topic=orders expected_revision=1", ctx), "topic_revision_conflict")
+}
+
+func TestStandaloneTruncateFailsClosedForActiveStateAndInternalTopic(t *testing.T) {
+	handler, _, groupCoordinator := newTestHandlerWithCoordinator(t)
+	ctx := NewClientContext("", 0)
+	require.Contains(t, handler.HandleCommand("TRUNCATE topic="+config.ConsumerOffsetsTopicName+" expected_revision=1", ctx), "internal_topic_truncate_forbidden")
+	require.True(t, strings.HasPrefix(handler.HandleCommand("CREATE topic=orders partitions=1", ctx), "OK "))
+	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
+	_, err := groupCoordinator.AddConsumer("workers", "member-1")
+	require.NoError(t, err)
+	require.Contains(t, handler.HandleCommand("TRUNCATE topic=orders expected_revision=1", ctx), "topic_truncate_blocked")
+	require.Equal(t, uint64(1), handler.TopicManager.GetTopic("orders").LifecycleEpoch)
+}

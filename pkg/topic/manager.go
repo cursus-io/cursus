@@ -35,18 +35,19 @@ type StreamManager interface {
 }
 
 type TopicManager struct {
-	topics        map[string]*Topic
-	deleting      map[string]bool
-	stopCh        chan struct{}
-	hp            HandlerProvider
-	stopOnce      sync.Once
-	mu            sync.RWMutex
-	cfg           *config.Config
-	StreamManager StreamManager
-	coordinator   *coordinator.Coordinator
-	txnResolver   TransactionDecisionResolver
-	metadataStore *topicMetadataStore
-	deleteHook    func(string) error
+	topics             map[string]*Topic
+	deleting           map[string]bool
+	pendingTruncations map[string]Definition
+	stopCh             chan struct{}
+	hp                 HandlerProvider
+	stopOnce           sync.Once
+	mu                 sync.RWMutex
+	cfg                *config.Config
+	StreamManager      StreamManager
+	coordinator        *coordinator.Coordinator
+	txnResolver        TransactionDecisionResolver
+	metadataStore      *topicMetadataStore
+	deleteHook         func(string) error
 
 	metadataLoadFailure             string
 	metadataRestoredTopicCount      int
@@ -99,13 +100,14 @@ func (tm *TopicManager) SetTransactionDecisionResolver(resolver TransactionDecis
 
 func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *TopicManager {
 	tm := &TopicManager{
-		topics:        make(map[string]*Topic),
-		deleting:      make(map[string]bool),
-		stopCh:        make(chan struct{}),
-		hp:            hp,
-		cfg:           cfg,
-		StreamManager: sm,
-		metadataStore: newTopicMetadataStore(cfg, hp),
+		topics:             make(map[string]*Topic),
+		deleting:           make(map[string]bool),
+		pendingTruncations: make(map[string]Definition),
+		stopCh:             make(chan struct{}),
+		hp:                 hp,
+		cfg:                cfg,
+		StreamManager:      sm,
+		metadataStore:      newTopicMetadataStore(cfg, hp),
 	}
 	return tm
 }
@@ -161,6 +163,9 @@ func (tm *TopicManager) CreateTopicWithPatch(defaults Definition, patch Definiti
 	defer tm.mu.Unlock()
 	if tm.deleting[defaults.Name] {
 		return Definition{}, fmt.Errorf("topic %q is being deleted", defaults.Name)
+	}
+	if _, pending := tm.pendingTruncations[defaults.Name]; pending {
+		return Definition{}, fmt.Errorf("topic %q lifecycle cleanup is pending", defaults.Name)
 	}
 
 	if existing := tm.topics[defaults.Name]; existing != nil {
@@ -249,8 +254,14 @@ func (tm *TopicManager) ApplyDefinition(raw Definition) error {
 	if tm.deleting[definition.Name] {
 		return fmt.Errorf("topic %q is being deleted", definition.Name)
 	}
+	if _, pending := tm.pendingTruncations[definition.Name]; pending {
+		return fmt.Errorf("topic %q lifecycle cleanup is pending", definition.Name)
+	}
 	if existing := tm.topics[definition.Name]; existing != nil {
 		current := existing.Definition()
+		if definition.LifecycleEpoch != current.LifecycleEpoch {
+			return fmt.Errorf("topic %q lifecycle epoch change requires truncate materialization: current=%d requested=%d", definition.Name, current.LifecycleEpoch, definition.LifecycleEpoch)
+		}
 		if definition.Partitions < current.Partitions {
 			return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", definition.Name, current.Partitions, definition.Partitions)
 		}
@@ -278,6 +289,9 @@ func (tm *TopicManager) GetTopic(name string) *Topic {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 	if tm.deleting[name] {
+		return nil
+	}
+	if _, pending := tm.pendingTruncations[name]; pending {
 		return nil
 	}
 	return tm.topics[name]

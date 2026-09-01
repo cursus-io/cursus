@@ -3,6 +3,7 @@ package fsm
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ type PartitionMetadata struct {
 	CommittedHWM   uint64   `json:"committed_hwm"`
 	PartitionCount int      `json:"partition_count"`
 	Idempotent     bool     `json:"idempotent"`
+	LifecycleEpoch uint64   `json:"lifecycle_epoch,omitempty"`
 }
 
 type TopicCommand struct {
@@ -170,6 +172,7 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		for i := 0; i < currentPartitions; i++ {
 			key := topicCmd.Name + "-" + strconv.Itoa(i)
 			stagedPartitions[key].PartitionCount = definition.Partitions
+			stagedPartitions[key].LifecycleEpoch = definition.LifecycleEpoch
 		}
 
 		for i := currentPartitions; i < definition.Partitions; i++ {
@@ -206,6 +209,7 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 				Leader:         assignedLeader,
 				LeaderEpoch:    1,
 				Idempotent:     definition.Idempotent,
+				LifecycleEpoch: definition.LifecycleEpoch,
 				Replicas:       replicas,
 				ISR:            isrCopy,
 			}
@@ -335,6 +339,129 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 	return nil
 }
 
+func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
+	var payload struct {
+		Topic            string `json:"topic"`
+		ExpectedRevision uint64 `json:"expected_revision"`
+	}
+	if err := json.Unmarshal([]byte(jsonData), &payload); err != nil {
+		return err
+	}
+	if err := topic.ValidateName(payload.Topic); err != nil {
+		return fmt.Errorf("invalid topic name: %w", err)
+	}
+	if payload.Topic == config.ConsumerOffsetsTopicName {
+		return fmt.Errorf("cannot truncate broker-owned internal consumer metadata topic")
+	}
+	if payload.ExpectedRevision == 0 {
+		return fmt.Errorf("expected_revision must be greater than zero")
+	}
+
+	f.mu.RLock()
+	current := copyTopicDefinition(f.topicState[payload.Topic])
+	coordinatorRef := f.cd
+	transactionManager := f.txn
+	for _, broker := range f.brokers {
+		if broker.Status == "active" && broker.LifecycleProtocol < TopicLifecycleProtocolVersion {
+			f.mu.RUnlock()
+			return fmt.Errorf(
+				"topic truncate requires lifecycle protocol %d on every active broker; broker %q advertises %d",
+				TopicLifecycleProtocolVersion, broker.ID, broker.LifecycleProtocol,
+			)
+		}
+	}
+	for key, metadata := range f.partitionMetadata {
+		idx := strings.LastIndex(key, "-")
+		if idx != -1 && key[:idx] == payload.Topic && metadata != nil && metadata.LeaderEpoch == math.MaxInt {
+			f.mu.RUnlock()
+			return fmt.Errorf("leader epoch overflow for partition %q", key)
+		}
+	}
+	f.mu.RUnlock()
+	if current == nil {
+		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
+	}
+	if current.Revision != payload.ExpectedRevision {
+		return fmt.Errorf(
+			"%w for topic %q: current=%d expected=%d",
+			topic.ErrTopicRevisionConflict, payload.Topic, current.Revision, payload.ExpectedRevision,
+		)
+	}
+	if current.Revision == math.MaxUint64 || current.LifecycleEpoch == math.MaxUint64 {
+		return fmt.Errorf("topic lifecycle counter overflow for %q", payload.Topic)
+	}
+
+	if coordinatorRef != nil {
+		for _, reference := range coordinatorRef.TopicGroupReferences(payload.Topic) {
+			if reference.MemberCount != 0 {
+				return fmt.Errorf(
+					"%w: topic %q has active consumer group %q with %d member(s)",
+					topic.ErrTopicDeleteBlocked, payload.Topic, reference.Name, reference.MemberCount,
+				)
+			}
+		}
+	}
+	if transactionManager != nil {
+		if _, _, err := transactionManager.StateWithoutTopicReferences(payload.Topic); err != nil {
+			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
+		}
+	}
+	if coordinatorRef != nil {
+		if _, err := coordinatorRef.DeleteInactiveGroupsForTopic(payload.Topic); err != nil {
+			return fmt.Errorf("delete consumer groups for topic %q: %w", payload.Topic, err)
+		}
+	}
+	if transactionManager != nil {
+		if _, err := transactionManager.PruneTopicReferences(payload.Topic); err != nil {
+			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
+		}
+	}
+
+	target := *current
+	target.Revision++
+	target.LifecycleEpoch++
+	f.mu.Lock()
+	latest := f.topicState[payload.Topic]
+	if latest == nil || latest.Revision != current.Revision || latest.LifecycleEpoch != current.LifecycleEpoch {
+		f.mu.Unlock()
+		return fmt.Errorf("%w for topic %q: authoritative definition changed during truncate", topic.ErrTopicRevisionConflict, payload.Topic)
+	}
+	stagedPartitions := copyPartitionMetadataState(f.partitionMetadata)
+	for key, metadata := range stagedPartitions {
+		idx := strings.LastIndex(key, "-")
+		if idx == -1 || key[:idx] != payload.Topic || metadata == nil {
+			continue
+		}
+		if metadata.LeaderEpoch == math.MaxInt {
+			f.mu.Unlock()
+			return fmt.Errorf("leader epoch overflow for partition %q", key)
+		}
+		metadata.CommittedHWM = 0
+		metadata.LeaderEpoch++
+		metadata.LifecycleEpoch = target.LifecycleEpoch
+	}
+	stagedLogs := make(map[uint64]*ReplicationEntry, len(f.logs))
+	for index, entry := range f.logs {
+		if entry != nil && entry.Topic == payload.Topic {
+			continue
+		}
+		stagedLogs[index] = entry
+	}
+	f.partitionMetadata = stagedPartitions
+	f.logs = stagedLogs
+	delete(f.producerState, payload.Topic)
+	f.topicState[payload.Topic] = copyTopicDefinition(&target)
+	f.mu.Unlock()
+
+	result := topic.TruncateResult{Topic: payload.Topic, Truncated: true, Definition: target}
+	if err := f.materializeTopicTruncate(&target); err != nil {
+		util.Warn("FSM: Topic %q truncate committed with pending local materialization: %v", payload.Topic, err)
+		result.CleanupPending = true
+		return result
+	}
+	return result
+}
+
 func (f *BrokerFSM) applyPartitionCommand(jsonData string) interface{} {
 	parts := strings.SplitN(jsonData, ":", 2)
 	if len(parts) != 2 {
@@ -368,11 +495,12 @@ func (f *BrokerFSM) applyPartitionCommand(jsonData string) interface{} {
 }
 
 type partitionCommitCommand struct {
-	Topic       string `json:"topic"`
-	Partition   int    `json:"partition"`
-	Leader      string `json:"leader"`
-	LeaderEpoch int    `json:"leader_epoch"`
-	HWM         uint64 `json:"hwm"`
+	Topic          string `json:"topic"`
+	Partition      int    `json:"partition"`
+	Leader         string `json:"leader"`
+	LeaderEpoch    int    `json:"leader_epoch"`
+	HWM            uint64 `json:"hwm"`
+	LifecycleEpoch uint64 `json:"lifecycle_epoch,omitempty"`
 }
 
 func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
@@ -399,6 +527,19 @@ func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
 	if cmd.HWM < metadata.CommittedHWM {
 		f.mu.Unlock()
 		return fmt.Errorf("committed HWM regression for %s: current=%d requested=%d", key, metadata.CommittedHWM, cmd.HWM)
+	}
+	metadataLifecycleEpoch := metadata.LifecycleEpoch
+	if metadataLifecycleEpoch == 0 {
+		metadataLifecycleEpoch = topic.InitialLifecycleEpoch
+	}
+	if cmd.LifecycleEpoch == 0 {
+		if metadataLifecycleEpoch > topic.InitialLifecycleEpoch {
+			f.mu.Unlock()
+			return fmt.Errorf("missing topic lifecycle epoch for %s", key)
+		}
+	} else if cmd.LifecycleEpoch != metadataLifecycleEpoch {
+		f.mu.Unlock()
+		return fmt.Errorf("stale topic lifecycle epoch for %s: current=%d requested=%d", key, metadataLifecycleEpoch, cmd.LifecycleEpoch)
 	}
 	metadata.CommittedHWM = cmd.HWM
 	tm := f.tm

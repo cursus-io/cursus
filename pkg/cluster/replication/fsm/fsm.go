@@ -18,6 +18,8 @@ import (
 	"github.com/hashicorp/raft"
 )
 
+const TopicLifecycleProtocolVersion = 1
+
 type ReplicationEntry struct {
 	Topic     string
 	Partition int
@@ -26,11 +28,12 @@ type ReplicationEntry struct {
 }
 
 type BrokerInfo struct {
-	ID         string    `json:"id"`
-	Addr       string    `json:"addr"`
-	ClientAddr string    `json:"client_addr,omitempty"`
-	Status     string    `json:"status"`
-	LastSeen   time.Time `json:"last_seen"`
+	ID                string    `json:"id"`
+	Addr              string    `json:"addr"`
+	ClientAddr        string    `json:"client_addr,omitempty"`
+	Status            string    `json:"status"`
+	LastSeen          time.Time `json:"last_seen"`
+	LifecycleProtocol int       `json:"lifecycle_protocol,omitempty"`
 }
 
 type ProducerSequence struct {
@@ -194,6 +197,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyTopicCommand(strings.TrimPrefix(data, "TOPIC:"))
 	case strings.HasPrefix(data, "TOPIC_DELETE:"):
 		res = f.applyTopicDeleteCommand(strings.TrimPrefix(data, "TOPIC_DELETE:"))
+	case strings.HasPrefix(data, "TOPIC_TRUNCATE:"):
+		res = f.applyTopicTruncateCommand(strings.TrimPrefix(data, "TOPIC_TRUNCATE:"))
 	case strings.HasPrefix(data, "PARTITION:"):
 		res = f.applyPartitionCommand(strings.TrimPrefix(data, "PARTITION:"))
 	case strings.HasPrefix(data, "PARTITION_COMMIT:"):
@@ -258,6 +263,8 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Info("FSM Restore: Validating snapshot Version 6 (with durable topic definitions)")
 	case 7:
 		util.Info("FSM Restore: Validating snapshot Version 7 (with revisioned topic definitions)")
+	case 8:
+		util.Info("FSM Restore: Validating snapshot Version 8 (with topic lifecycle epochs)")
 	default:
 		return fmt.Errorf("unknown snapshot version: %d", state.Version)
 	}
