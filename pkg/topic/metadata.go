@@ -17,7 +17,8 @@ import (
 )
 
 const (
-	topicMetadataFormatVersion = 1
+	topicMetadataFormatVersion = 3
+	oldestTopicMetadataVersion = 1
 	maxTopicMetadataBytes      = 16 << 20
 	maxTopicNameBytes          = 249
 	TopicMetadataFileName      = config.TopicMetadataFileName
@@ -25,11 +26,14 @@ const (
 
 // Definition is the durable broker contract required to recreate a topic.
 type Definition struct {
-	Name          string `json:"name"`
-	Partitions    int    `json:"partitions"`
-	Idempotent    bool   `json:"idempotent"`
-	EventSourcing bool   `json:"event_sourcing"`
-	Policy        Policy `json:"policy"`
+	Name              string `json:"name"`
+	Revision          uint64 `json:"revision"`
+	LifecycleEpoch    uint64 `json:"lifecycle_epoch"`
+	Partitions        int    `json:"partitions"`
+	ReplicationFactor int    `json:"replication_factor"`
+	Idempotent        bool   `json:"idempotent"`
+	EventSourcing     bool   `json:"event_sourcing"`
+	Policy            Policy `json:"policy"`
 }
 
 // Normalize validates and canonicalizes a durable topic definition.
@@ -40,6 +44,18 @@ func (d Definition) Normalize() (Definition, error) {
 	if d.Partitions <= 0 {
 		return d, fmt.Errorf("partitions must be > 0")
 	}
+	if d.ReplicationFactor == 0 {
+		d.ReplicationFactor = DefaultReplicationFactor
+	}
+	if d.ReplicationFactor < 0 {
+		return d, fmt.Errorf("replication_factor must be > 0")
+	}
+	if d.Revision == 0 {
+		d.Revision = InitialDefinitionRevision
+	}
+	if d.LifecycleEpoch == 0 {
+		d.LifecycleEpoch = InitialLifecycleEpoch
+	}
 	policy, err := d.Policy.Normalize()
 	if err != nil {
 		return d, err
@@ -47,6 +63,22 @@ func (d Definition) Normalize() (Definition, error) {
 	d.Policy = policy
 	d.Policy = policy.Clone()
 	return d, nil
+}
+
+func validateDefinitionVersionFields(version int, definition Definition) error {
+	if version < 2 {
+		return nil
+	}
+	if definition.Revision == 0 {
+		return fmt.Errorf("revision must be present in topic metadata version %d", version)
+	}
+	if definition.ReplicationFactor == 0 {
+		return fmt.Errorf("replication_factor must be present in topic metadata version %d", version)
+	}
+	if version >= 3 && definition.LifecycleEpoch == 0 {
+		return fmt.Errorf("lifecycle_epoch must be present in topic metadata version %d", version)
+	}
+	return nil
 }
 
 // ValidateName restricts topic names to the portable on-disk name contract.
@@ -154,13 +186,16 @@ func (s *topicMetadataStore) Load() (_ []Definition, err error) {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("decode topic metadata trailing content")
 	}
-	if manifest.Version != topicMetadataFormatVersion {
+	if manifest.Version < oldestTopicMetadataVersion || manifest.Version > topicMetadataFormatVersion {
 		return nil, fmt.Errorf("unsupported topic metadata version %d", manifest.Version)
 	}
 
 	seen := make(map[string]struct{}, len(manifest.Topics))
 	definitions := make([]Definition, 0, len(manifest.Topics))
 	for _, raw := range manifest.Topics {
+		if err := validateDefinitionVersionFields(manifest.Version, raw); err != nil {
+			return nil, fmt.Errorf("invalid topic metadata for %q: %w", raw.Name, err)
+		}
 		definition, err := raw.Normalize()
 		if err != nil {
 			return nil, fmt.Errorf("invalid topic metadata for %q: %w", raw.Name, err)
@@ -211,7 +246,7 @@ func (s *topicMetadataStore) Save(definitions []Definition) (err error) {
 	sort.Slice(normalized, func(i, j int) bool { return normalized[i].Name < normalized[j].Name })
 
 	data, err := json.MarshalIndent(topicMetadataManifest{
-		Version: topicMetadataFormatVersion,
+		Version: topicMetadataWriteVersion(normalized),
 		Topics:  normalized,
 	}, "", "  ")
 	if err != nil {
@@ -255,6 +290,17 @@ func (s *topicMetadataStore) Save(definitions []Definition) (err error) {
 		}
 	}
 	return nil
+}
+
+func topicMetadataWriteVersion(definitions []Definition) int {
+	for _, definition := range definitions {
+		if definition.LifecycleEpoch > InitialLifecycleEpoch {
+			return topicMetadataFormatVersion
+		}
+	}
+	// Keep first-generation manifests readable by the previous release during
+	// a rolling upgrade. The first truncate is the irreversible format boundary.
+	return 2
 }
 
 func writeMetadataFile(file *os.File, data []byte) error {
@@ -367,24 +413,19 @@ func (tm *TopicManager) RestoreDefinitions(definitions []Definition) error {
 
 	created := make([]string, 0, len(normalized))
 	for _, definition := range normalized {
+		if err := tm.prepareTruncationRecoveryLocked(definition); err != nil {
+			tm.rollbackRestoredTopicsLocked(created)
+			return fmt.Errorf("restore topic %q lifecycle: %w", definition.Name, err)
+		}
 		if existing := tm.topics[definition.Name]; existing != nil {
-			if err := existing.applyDefinition(definition.Partitions, definition.Policy, tm.hp, nil); err != nil {
+			if err := existing.applyFullDefinition(definition, tm.hp, nil); err != nil {
 				tm.rollbackRestoredTopicsLocked(created)
 				return fmt.Errorf("restore topic %q: %w", definition.Name, err)
 			}
 			continue
 		}
 
-		restored, err := NewTopicWithPolicy(
-			definition.Name,
-			definition.Partitions,
-			tm.hp,
-			tm.cfg,
-			tm.StreamManager,
-			definition.Idempotent,
-			definition.EventSourcing,
-			definition.Policy,
-		)
+		restored, err := newTopicWithDefinition(definition, tm.hp, tm.cfg, tm.StreamManager)
 		if err != nil {
 			tm.rollbackRestoredTopicsLocked(created)
 			return fmt.Errorf("restore topic %q: %w", definition.Name, err)
@@ -452,6 +493,7 @@ func (tm *TopicManager) persistRemovalLocked(name string) error {
 
 func (tm *TopicManager) definitionsLocked(override *Definition, removed string) []Definition {
 	definitions := make([]Definition, 0, len(tm.topics)+1)
+	seen := make(map[string]struct{}, len(tm.topics)+len(tm.pendingTruncations))
 	overrideAdded := false
 	for name, current := range tm.topics {
 		if name == removed {
@@ -459,10 +501,27 @@ func (tm *TopicManager) definitionsLocked(override *Definition, removed string) 
 		}
 		if override != nil && name == override.Name {
 			definitions = append(definitions, *override)
+			seen[name] = struct{}{}
 			overrideAdded = true
 			continue
 		}
 		definitions = append(definitions, current.Definition())
+		seen[name] = struct{}{}
+	}
+	for name, pending := range tm.pendingTruncations {
+		if name == removed {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		if override != nil && name == override.Name {
+			definitions = append(definitions, *override)
+			overrideAdded = true
+		} else {
+			definitions = append(definitions, pending)
+		}
+		seen[name] = struct{}{}
 	}
 	if override != nil && !overrideAdded && override.Name != removed {
 		definitions = append(definitions, *override)

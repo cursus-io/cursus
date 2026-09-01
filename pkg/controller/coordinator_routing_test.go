@@ -38,6 +38,7 @@ func newCoordinatorRoutingHandler(
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
 	rm := &coordinatorRoutingRaftManager{brokerFSM: brokerFSM}
+	rm.leaderAddress.Store("127.0.0.1:7000")
 	router := clusterController.NewClusterRouter(
 		brokerID,
 		"127.0.0.1:7000",
@@ -82,6 +83,76 @@ func TestCheckCoordinatorNormalLocalAndRemoteRoutes(t *testing.T) {
 		require.False(t, isCoordinator)
 		require.Equal(t, expected, addr)
 	})
+}
+
+func TestResolveGroupCoordinatorAcrossThreeBrokersAndMovement(t *testing.T) {
+	brokerFSM := fsm.NewBrokerFSM(nil, nil)
+	brokerIDs := []string{"node-1", "node-2", "node-3"}
+	for _, brokerID := range brokerIDs {
+		registerRoutingBroker(t, brokerFSM, brokerID)
+	}
+
+	handlers := make(map[string]*CommandHandler, len(brokerIDs))
+	for _, brokerID := range brokerIDs {
+		handlers[brokerID] = newCoordinatorRoutingHandler(brokerID, brokerFSM, nil)
+	}
+	groupName := "distributed-observation-group"
+	ownerID, _, err := handlers[brokerIDs[0]].Cluster.Router.FindCoordinator(groupName)
+	require.NoError(t, err)
+	require.Equal(t, 1, resolvedCoordinatorCount(t, handlers, groupName))
+	require.True(t, mustResolveGroupCoordinator(t, handlers[ownerID], groupName))
+
+	result := brokerFSM.Apply(&raft.Log{
+		Index: 2,
+		Data:  []byte(`DEREGISTER:{"id":"` + ownerID + `"}`),
+	})
+	require.Nil(t, result)
+	newOwnerID, _, err := handlers[brokerIDs[0]].Cluster.Router.FindCoordinator(groupName)
+	require.NoError(t, err)
+	require.NotEqual(t, ownerID, newOwnerID)
+	require.Equal(t, 1, resolvedCoordinatorCount(t, handlers, groupName))
+	require.True(t, mustResolveGroupCoordinator(t, handlers[newOwnerID], groupName))
+	require.False(t, mustResolveGroupCoordinator(t, handlers[ownerID], groupName))
+}
+
+func TestResolveGroupCoordinatorsFailsClosedWithoutCurrentLeader(t *testing.T) {
+	brokerFSM := fsm.NewBrokerFSM(nil, nil)
+	registerRoutingBroker(t, brokerFSM, "node-1")
+	handler := newCoordinatorRoutingHandler("node-1", brokerFSM, nil)
+	rm := handler.Cluster.RaftManager.(*coordinatorRoutingRaftManager)
+	rm.leaderAddress.Store("")
+
+	resolved, err := handler.ResolveGroupCoordinators([]string{"workers"})
+	require.ErrorContains(t, err, "cluster leader unavailable")
+	require.Nil(t, resolved)
+}
+
+func TestResolveGroupCoordinatorsFailsClosedWhenDistributedControlPlaneIsMissing(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	handler := NewCommandHandler(nil, cfg, nil, nil, nil)
+
+	resolved, err := handler.ResolveGroupCoordinators([]string{"workers"})
+	require.ErrorContains(t, err, "raft manager unavailable")
+	require.Nil(t, resolved)
+}
+
+func resolvedCoordinatorCount(t *testing.T, handlers map[string]*CommandHandler, groupName string) int {
+	t.Helper()
+	count := 0
+	for _, handler := range handlers {
+		if mustResolveGroupCoordinator(t, handler, groupName) {
+			count++
+		}
+	}
+	return count
+}
+
+func mustResolveGroupCoordinator(t *testing.T, handler *CommandHandler, groupName string) bool {
+	t.Helper()
+	resolved, err := handler.ResolveGroupCoordinator(groupName)
+	require.NoError(t, err)
+	return resolved
 }
 
 func TestGroupCommandsFailClosedWhenCoordinatorDiscoveryFails(t *testing.T) {

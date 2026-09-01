@@ -85,15 +85,17 @@ Transaction visibility indexes are rebuilt from durable transaction records and 
 
 ## Standalone Topic Manifest
 
-A standalone broker stores the authoritative topic registry in `{log_dir}/__topic_metadata.json`. The current version 1 shape is:
+A standalone broker stores the authoritative topic registry in `{log_dir}/__topic_metadata.json`. The current version 2 shape is:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "topics": [
     {
       "name": "orders",
+      "revision": 3,
       "partitions": 4,
+      "replication_factor": 3,
       "idempotent": true,
       "event_sourcing": false,
       "policy": {
@@ -110,7 +112,7 @@ A standalone broker stores the authoritative topic registry in `{log_dir}/__topi
 }
 ```
 
-The encoded manifest is limited to 16 MiB. Updates write a mode-`0600` same-directory temporary file, sync it, atomically replace the committed manifest, and sync the parent directory where supported. Startup reads only the committed path; abandoned `.tmp` files are not authoritative. Parsing disallows unknown fields and rejects duplicate names, invalid definitions, trailing content, and unsupported versions. A missing manifest with persisted topic logs, or a valid manifest that omits a persisted topic directory, is an integrity error. The broker does not infer ACL or event-sourcing mode from segment filenames when a manifest is absent or invalid.
+The encoded manifest is limited to 16 MiB. Updates write a mode-`0600` same-directory temporary file, sync it, atomically replace the committed manifest, and sync the parent directory where supported. Startup reads only the committed path; abandoned `.tmp` files are not authoritative. Parsing disallows unknown fields and rejects duplicate names, invalid definitions, trailing content, and unsupported versions. Version 1 remains readable and supplies `revision=1` and `replication_factor=3`; the next definition write emits version 2. A version 2 entry missing either field is corrupt and fails closed. A missing manifest with persisted topic logs, or a valid manifest that omits a persisted topic directory, is an integrity error. The broker does not infer ACL or event-sourcing mode from segment filenames when a manifest is absent or invalid.
 
 Backups of a standalone broker must keep this manifest with topic partition directories, `__transaction_state.journal`, and the consumer offset log. Restoring only segment files cannot reconstruct the full topic policy.
 

@@ -21,6 +21,18 @@ func (f *BrokerFSM) applyTransactionSyncCommand(jsonData string) interface{} {
 	}
 	f.mu.RLock()
 	txn := f.txn
+	for _, operation := range cmd.Transaction.Messages {
+		if f.topicState[operation.Topic] == nil {
+			f.mu.RUnlock()
+			return fmt.Errorf("transaction topic %q is not present in cluster state", operation.Topic)
+		}
+	}
+	for _, operation := range cmd.Transaction.Offsets {
+		if f.topicState[operation.Topic] == nil {
+			f.mu.RUnlock()
+			return fmt.Errorf("transaction offset topic %q is not present in cluster state", operation.Topic)
+		}
+	}
 	f.mu.RUnlock()
 	if txn == nil {
 		return fmt.Errorf("transaction manager not available")

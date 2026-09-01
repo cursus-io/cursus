@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/cursus-io/cursus/pkg/eventsource"
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
@@ -42,15 +43,16 @@ func (ch *CommandHandler) handleAppendStream(cmd string) string {
 		result, errResp := ch.ESHandler.AppendStream(cmd, eventsource.AppendOptions{
 			LeaderAppend: true,
 			AfterCommit: func(topic string, partition int, hwm uint64) error {
-				return ch.commitPartitionHWMAtEpoch(topic, partition, hwm, replicationSnapshot.Leader, replicationSnapshot.LeaderEpoch)
+				return ch.commitPartitionHWMAtEpoch(topic, partition, hwm, replicationSnapshot.Leader, replicationSnapshot.LeaderEpoch, replicationSnapshot.LifecycleEpoch)
 			},
 			AfterAppend: func(topic string, partition int, msg types.Message) error {
 				msgCmd := types.MessageCommand{
-					Topic:         topic,
-					Partition:     partition,
-					Messages:      []types.Message{msg},
-					Acks:          "all",
-					SequenceScope: "partition",
+					Topic:          topic,
+					Partition:      partition,
+					LifecycleEpoch: t.LifecycleEpoch,
+					Messages:       []types.Message{msg},
+					Acks:           "all",
+					SequenceScope:  "partition",
 				}
 				return ch.Cluster.ReplicateToFollowers(topic, partition, msgCmd, effectiveMinISR)
 			},
@@ -82,6 +84,7 @@ func (ch *CommandHandler) handleSaveSnapshot(cmd string) string {
 			return indexResp
 		}
 		result, errResp := ch.ESHandler.SaveSnapshot(cmd, func(result eventsource.SnapshotResult) error {
+			result.LifecycleEpoch = t.LifecycleEpoch
 			payload, err := json.Marshal(result)
 			if err != nil {
 				return err
@@ -110,6 +113,11 @@ func (ch *CommandHandler) handleListSnapshots(cmd string) string {
 	snaps, errResp := ch.ESHandler.ListSnapshots(topicName, partition)
 	if errResp != "" {
 		return errResp
+	}
+	if t := ch.TopicManager.GetTopic(topicName); t != nil {
+		for i := range snaps {
+			snaps[i].LifecycleEpoch = t.LifecycleEpoch
+		}
 	}
 	payload, err := json.Marshal(snaps)
 	if err != nil {
@@ -189,6 +197,9 @@ func (ch *CommandHandler) handleCatchupSnapshots(cmd string) string {
 		if snap.Partition == 0 {
 			snap.Partition = partition
 		}
+		if errResp := ch.validateEventSnapshotLifecycle(snap); errResp != "" {
+			return errResp
+		}
 		if errResp := ch.ESHandler.SaveSnapshotReplica(snap); errResp != "" {
 			return errResp
 		}
@@ -210,10 +221,37 @@ func (ch *CommandHandler) handleReplicateSnapshot(cmd string) string {
 	if snap.Topic == "" || snap.Key == "" {
 		return "ERROR: invalid_snapshot_payload"
 	}
+	if errResp := ch.validateEventSnapshotLifecycle(snap); errResp != "" {
+		return errResp
+	}
 	if errResp := ch.ESHandler.SaveSnapshotReplica(snap); errResp != "" {
 		return errResp
 	}
 	return "OK"
+}
+
+func (ch *CommandHandler) validateEventSnapshotLifecycle(snap eventsource.SnapshotResult) string {
+	if !ch.isDistributed() || ch.Cluster == nil || ch.Cluster.RaftManager == nil {
+		return ""
+	}
+	fsmRef := ch.Cluster.RaftManager.GetFSM()
+	if fsmRef == nil {
+		return "ERROR: cluster_metadata_unavailable command=REPLICATE_SNAPSHOT"
+	}
+	definition, found := fsmRef.GetTopicDefinition(snap.Topic)
+	if !found {
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", snap.Topic)
+	}
+	if snap.LifecycleEpoch == 0 {
+		if definition.LifecycleEpoch > topic.InitialLifecycleEpoch {
+			return "ERROR: missing_topic_lifecycle_epoch command=REPLICATE_SNAPSHOT"
+		}
+		return ""
+	}
+	if snap.LifecycleEpoch != definition.LifecycleEpoch {
+		return fmt.Sprintf("ERROR: STALE_TOPIC_LIFECYCLE_EPOCH current=%d requested=%d", definition.LifecycleEpoch, snap.LifecycleEpoch)
+	}
+	return ""
 }
 
 func (ch *CommandHandler) handleEventSourceRoutedCommand(cmd, prefix string, local func(string) string) string {

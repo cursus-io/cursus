@@ -9,6 +9,7 @@ var textCommands = map[string]struct{}{
 	"CREATE":              {},
 	"ALTER_TOPIC_CONFIG":  {},
 	"DELETE":              {},
+	"TRUNCATE":            {},
 	"LIST":                {},
 	"LIST_CLUSTER":        {},
 	"CLUSTER_STATUS":      {},

@@ -126,6 +126,7 @@ func TestServiceDiscovery_RegisterDeregister(t *testing.T) {
 		brokers := rm.mockFSM.GetBrokers()
 		assert.Len(t, brokers, 1)
 		assert.Equal(t, "node1", brokers[0].ID)
+		assert.Equal(t, fsm.TopicLifecycleProtocolVersion, brokers[0].LifecycleProtocol)
 		rm.AssertExpectations(t)
 	})
 

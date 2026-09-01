@@ -14,6 +14,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/metrics"
+	topicpkg "github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
@@ -80,10 +81,11 @@ type ClusterController struct {
 // PartitionReplicationSnapshot is an immutable view of the replication fence
 // and replica sets used by one partition append.
 type PartitionReplicationSnapshot struct {
-	Leader      string
-	LeaderEpoch int
-	ISR         []string
-	Replicas    []string
+	Leader         string
+	LeaderEpoch    int
+	LifecycleEpoch uint64
+	ISR            []string
+	Replicas       []string
 }
 
 func NewClusterController(ctx context.Context, cfg *config.Config, rm RaftManager, sd ServiceDiscovery, brokerID, localAddr string) *ClusterController {
@@ -271,11 +273,16 @@ func (cc *ClusterController) GetPartitionReplicationSnapshot(topic string, parti
 	if !containsBroker(meta.ISR, cc.brokerID) {
 		return PartitionReplicationSnapshot{}, fmt.Errorf("partition leader %s is not in ISR", cc.brokerID)
 	}
+	lifecycleEpoch := meta.LifecycleEpoch
+	if lifecycleEpoch == 0 {
+		lifecycleEpoch = topicpkg.InitialLifecycleEpoch
+	}
 	return PartitionReplicationSnapshot{
-		Leader:      meta.Leader,
-		LeaderEpoch: meta.LeaderEpoch,
-		ISR:         append([]string(nil), meta.ISR...),
-		Replicas:    append([]string(nil), meta.Replicas...),
+		Leader:         meta.Leader,
+		LeaderEpoch:    meta.LeaderEpoch,
+		LifecycleEpoch: lifecycleEpoch,
+		ISR:            append([]string(nil), meta.ISR...),
+		Replicas:       append([]string(nil), meta.Replicas...),
 	}, nil
 }
 
@@ -309,6 +316,17 @@ func (cc *ClusterController) replicateToReplicaSet(topic string, partition int, 
 	}
 	if current.Leader != snapshot.Leader || current.LeaderEpoch != snapshot.LeaderEpoch {
 		return fmt.Errorf("%w: current=%s/%d requested=%s/%d", ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, snapshot.Leader, snapshot.LeaderEpoch)
+	}
+	if current.LifecycleEpoch != snapshot.LifecycleEpoch {
+		return fmt.Errorf("%w: current lifecycle=%d requested=%d", ErrPartitionLeaderFenced, current.LifecycleEpoch, snapshot.LifecycleEpoch)
+	}
+	if msgCmd.LifecycleEpoch == 0 {
+		if current.LifecycleEpoch > topicpkg.InitialLifecycleEpoch {
+			return fmt.Errorf("missing topic lifecycle epoch for %s-%d", topic, partition)
+		}
+		msgCmd.LifecycleEpoch = current.LifecycleEpoch
+	} else if msgCmd.LifecycleEpoch != current.LifecycleEpoch {
+		return fmt.Errorf("stale topic lifecycle epoch for %s-%d: current=%d requested=%d", topic, partition, current.LifecycleEpoch, msgCmd.LifecycleEpoch)
 	}
 	msgCmd.LeaderID = snapshot.Leader
 	msgCmd.LeaderEpoch = snapshot.LeaderEpoch
@@ -363,7 +381,8 @@ func replicaFenceResponse(response string) bool {
 		return false
 	}
 	code := strings.ToUpper(fields[1])
-	return code == "NOT_PARTITION_LEADER" || code == "STALE_LEADER_EPOCH"
+	return code == "NOT_PARTITION_LEADER" || code == "STALE_LEADER_EPOCH" ||
+		code == "STALE_TOPIC_LIFECYCLE_EPOCH" || code == "MISSING_TOPIC_LIFECYCLE_EPOCH"
 }
 
 func containsBroker(brokers []string, wanted string) bool {

@@ -97,14 +97,17 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string, ctx ...*ClientContext)
 	type TopicMetadata struct {
 		Status     string              `json:"status"`
 		Topic      string              `json:"topic"`
+		Definition topic.Definition    `json:"definition"`
 		Partitions []PartitionMetadata `json:"partitions"`
 		Policy     topic.Policy        `json:"policy"`
 	}
 
+	definition := t.Definition()
 	meta := TopicMetadata{
-		Status: "OK",
-		Topic:  topicName,
-		Policy: t.PolicySnapshot(),
+		Status:     "OK",
+		Topic:      topicName,
+		Definition: definition,
+		Policy:     definition.Policy,
 	}
 
 	var raftLeader string
@@ -180,6 +183,9 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 		}
 	}
 
-	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d %s",
-		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), definition.Policy.CleanupPolicy, definition.Policy.Partitioner, definition.Policy.AuthPolicy, strings.Join(definition.Policy.ReadACL, ","), strings.Join(definition.Policy.WriteACL, ","), definition.Policy.RetentionHours, definition.Policy.RetentionBytes, ch.topicMinISRMetadata(definition.Policy))
+	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d revision=%d replication_factor=%d idempotent=%t event_sourcing=%t lifecycle_epoch=%d %s",
+		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), definition.Policy.CleanupPolicy, definition.Policy.Partitioner,
+		definition.Policy.AuthPolicy, strings.Join(definition.Policy.ReadACL, ","), strings.Join(definition.Policy.WriteACL, ","),
+		definition.Policy.RetentionHours, definition.Policy.RetentionBytes, definition.Revision, definition.ReplicationFactor,
+		definition.Idempotent, definition.EventSourcing, definition.LifecycleEpoch, ch.topicMinISRMetadata(definition.Policy))
 }

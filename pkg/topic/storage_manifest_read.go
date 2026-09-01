@@ -51,8 +51,13 @@ func readStandaloneManifest(path string) ([]Definition, error) {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("decode topic metadata trailing content")
 	}
-	if manifest.Version != topicMetadataFormatVersion {
+	if manifest.Version < oldestTopicMetadataVersion || manifest.Version > topicMetadataFormatVersion {
 		return nil, fmt.Errorf("unsupported topic metadata version %d", manifest.Version)
+	}
+	for _, definition := range manifest.Topics {
+		if err := validateDefinitionVersionFields(manifest.Version, definition); err != nil {
+			return nil, fmt.Errorf("invalid topic metadata for %q: %w", definition.Name, err)
+		}
 	}
 	definitions, _, err := normalizeAndMarshalManifest(manifest.Topics)
 	if err != nil {

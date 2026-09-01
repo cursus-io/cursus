@@ -54,15 +54,19 @@ func TestAlterTopicMinInSyncReplicasAndResetToBrokerDefault(t *testing.T) {
 
 	require.Contains(t, handler.HandleCommand("CREATE topic=orders partitions=1", ctx), "OK ")
 	require.Contains(t, handler.HandleCommand("CREATE topic=audit partitions=1", ctx), "OK ")
+	require.Equal(t, uint64(1), manager.GetTopic("orders").Revision)
 
 	response := handler.HandleCommand("ALTER_TOPIC_CONFIG topic=orders min_in_sync_replicas=1", ctx)
 	require.True(t, strings.HasPrefix(response, "OK "), response)
 	require.Equal(t, 1, *manager.GetTopic("orders").Policy.MinInSyncReplicas)
+	require.Equal(t, uint64(2), manager.GetTopic("orders").Revision)
 	require.Nil(t, manager.GetTopic("audit").Policy.MinInSyncReplicas)
+	require.Equal(t, uint64(1), manager.GetTopic("audit").Revision)
 
 	response = handler.HandleCommand("ALTER_TOPIC_CONFIG topic=orders min_in_sync_replicas=default", ctx)
 	require.True(t, strings.HasPrefix(response, "OK "), response)
 	require.Nil(t, manager.GetTopic("orders").Policy.MinInSyncReplicas)
+	require.Equal(t, uint64(3), manager.GetTopic("orders").Revision)
 	require.Contains(t, response, "effective_min_in_sync_replicas=2")
 }
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,9 +26,10 @@ type PartitionMetadata struct {
 	// watermark existed from a real committed watermark of zero. It is an
 	// in-memory compatibility marker; the presence of committed_hwm on the
 	// wire is authoritative.
-	CommittedHWMKnown bool `json:"-"`
-	PartitionCount    int  `json:"partition_count"`
-	Idempotent        bool `json:"idempotent"`
+	CommittedHWMKnown bool   `json:"-"`
+	PartitionCount    int    `json:"partition_count"`
+	Idempotent        bool   `json:"idempotent"`
+	LifecycleEpoch    uint64 `json:"lifecycle_epoch,omitempty"`
 }
 
 type partitionMetadataJSON struct {
@@ -38,6 +40,7 @@ type partitionMetadataJSON struct {
 	CommittedHWM   *uint64  `json:"committed_hwm,omitempty"`
 	PartitionCount int      `json:"partition_count"`
 	Idempotent     bool     `json:"idempotent"`
+	LifecycleEpoch uint64   `json:"lifecycle_epoch,omitempty"`
 }
 
 func (m PartitionMetadata) MarshalJSON() ([]byte, error) {
@@ -54,6 +57,7 @@ func (m PartitionMetadata) MarshalJSON() ([]byte, error) {
 		CommittedHWM:   committed,
 		PartitionCount: m.PartitionCount,
 		Idempotent:     m.Idempotent,
+		LifecycleEpoch: m.LifecycleEpoch,
 	})
 }
 
@@ -69,6 +73,7 @@ func (m *PartitionMetadata) UnmarshalJSON(data []byte) error {
 		LeaderEpoch:       decoded.LeaderEpoch,
 		PartitionCount:    decoded.PartitionCount,
 		Idempotent:        decoded.Idempotent,
+		LifecycleEpoch:    decoded.LifecycleEpoch,
 		CommittedHWMKnown: decoded.CommittedHWM != nil,
 	}
 	if decoded.CommittedHWM != nil {
@@ -78,13 +83,15 @@ func (m *PartitionMetadata) UnmarshalJSON(data []byte) error {
 }
 
 type TopicCommand struct {
-	Name              string       `json:"name"`
-	Partitions        int          `json:"partitions"`
-	Idempotent        bool         `json:"idempotent"`
-	EventSourcing     bool         `json:"event_sourcing"`
-	LeaderID          string       `json:"leader_id"`
-	ReplicationFactor int          `json:"replication_factor,omitempty"`
-	Policy            topic.Policy `json:"policy,omitempty"`
+	Name              string                 `json:"name,omitempty"`
+	Partitions        int                    `json:"partitions,omitempty"`
+	Idempotent        bool                   `json:"idempotent,omitempty"`
+	EventSourcing     bool                   `json:"event_sourcing,omitempty"`
+	LeaderID          string                 `json:"leader_id,omitempty"`
+	ReplicationFactor int                    `json:"replication_factor,omitempty"`
+	Policy            topic.Policy           `json:"policy,omitempty"`
+	Definition        *topic.Definition      `json:"definition,omitempty"`
+	Patch             *topic.DefinitionPatch `json:"patch,omitempty"`
 }
 
 type TopicConfigCommand struct {
@@ -99,24 +106,28 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		util.Error("FSM: Failed to unmarshal topic command: %v", err)
 		return err
 	}
-	definition, err := (topic.Definition{
-		Name:          topicCmd.Name,
-		Partitions:    topicCmd.Partitions,
-		Idempotent:    topicCmd.Idempotent,
-		EventSourcing: topicCmd.EventSourcing,
-		Policy:        topicCmd.Policy,
-	}).Normalize()
+	patchCommand := topicCmd.Definition != nil || topicCmd.Patch != nil
+	if patchCommand && topicCmd.Definition == nil {
+		return fmt.Errorf("topic patch command is missing the default definition")
+	}
+
+	base := topic.Definition{
+		Name:              topicCmd.Name,
+		Partitions:        topicCmd.Partitions,
+		ReplicationFactor: topicCmd.ReplicationFactor,
+		Idempotent:        topicCmd.Idempotent,
+		EventSourcing:     topicCmd.EventSourcing,
+		Policy:            topicCmd.Policy,
+	}
+	if topicCmd.Definition != nil {
+		base = *topicCmd.Definition
+	}
+	base, err := base.Normalize()
 	if err != nil {
 		return fmt.Errorf("invalid topic definition: %w", err)
 	}
-	if config.HasCleanupPolicy(definition.Policy.CleanupPolicy, config.CleanupPolicyCompact) {
-		return fmt.Errorf("cleanup policy compact is not supported in distributed mode")
-	}
-	topicCmd.Name = definition.Name
-	topicCmd.Partitions = definition.Partitions
-	topicCmd.Idempotent = definition.Idempotent
-	topicCmd.EventSourcing = definition.EventSourcing
-	topicCmd.Policy = definition.Policy
+	topicCmd.Name = base.Name
+	var appliedDefinition topic.Definition
 
 	stageResult := func() interface{} {
 		f.mu.Lock()
@@ -129,17 +140,50 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		if currentTopic == nil {
 			currentTopic = legacyTopicState(stagedPartitions)[topicCmd.Name]
 		}
+		if currentTopic == nil {
+			if f.cd != nil {
+				if references := f.cd.TopicGroupReferences(topicCmd.Name); len(references) != 0 {
+					return fmt.Errorf("topic %q lifecycle cleanup is pending for consumer group %q", topicCmd.Name, references[0].Name)
+				}
+			}
+			if f.txn != nil {
+				_, affected, stateErr := f.txn.StateWithoutTopicReferences(topicCmd.Name)
+				if stateErr != nil {
+					return fmt.Errorf("topic %q lifecycle cleanup is pending: %w", topicCmd.Name, stateErr)
+				}
+				if len(affected) != 0 {
+					return fmt.Errorf("topic %q lifecycle cleanup is pending for transaction %q", topicCmd.Name, affected[0])
+				}
+			}
+		}
+
+		definition := base
 		if currentTopic != nil {
-			if topicCmd.Partitions < currentTopic.Partitions {
-				return fmt.Errorf("cannot decrease partition count for topic %q: %d -> %d", topicCmd.Name, currentTopic.Partitions, topicCmd.Partitions)
-			}
 			currentPartitions = currentTopic.Partitions
-			topicCmd.Idempotent = currentTopic.Idempotent
-			topicCmd.EventSourcing = currentTopic.EventSourcing
-			if topicCmd.Policy.MinInSyncReplicas == nil {
-				topicCmd.Policy.MinInSyncReplicas = currentTopic.Policy.Clone().MinInSyncReplicas
-				definition.Policy.MinInSyncReplicas = topicCmd.Policy.MinInSyncReplicas
+			var patch topic.DefinitionPatch
+			if patchCommand {
+				if topicCmd.Patch != nil {
+					patch = *topicCmd.Patch
+				}
+			} else {
+				patch = legacyTopicDefinitionPatch(base, topicCmd.ReplicationFactor > 0)
 			}
+			definition, err = topic.MergeDefinitionPatch(*currentTopic, patch, true)
+			if err != nil {
+				return err
+			}
+		} else if patchCommand {
+			var patch topic.DefinitionPatch
+			if topicCmd.Patch != nil {
+				patch = *topicCmd.Patch
+			}
+			definition, err = topic.MergeDefinitionPatch(base, patch, false)
+			if err != nil {
+				return err
+			}
+		}
+		if config.HasCleanupPolicy(definition.Policy.CleanupPolicy, config.CleanupPolicyCompact) {
+			return fmt.Errorf("cleanup policy compact is not supported in distributed mode")
 		}
 
 		var brokers []string
@@ -155,9 +199,9 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			return fmt.Errorf("no active brokers")
 		}
 
-		if topicCmd.Partitions <= 0 {
-			util.Error("FSM: Invalid partition count %d for topic %s", topicCmd.Partitions, topicCmd.Name)
-			return fmt.Errorf("invalid partition count: %d", topicCmd.Partitions)
+		if definition.Partitions <= 0 {
+			util.Error("FSM: Invalid partition count %d for topic %s", definition.Partitions, topicCmd.Name)
+			return fmt.Errorf("invalid partition count: %d", definition.Partitions)
 		}
 
 		if topicCmd.LeaderID != "" {
@@ -174,15 +218,11 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			}
 		}
 
-		replicationFactor := topicCmd.ReplicationFactor
-		if replicationFactor <= 0 {
-			replicationFactor = 3 // default small-cluster replication factor
-		}
+		replicationFactor := definition.ReplicationFactor
 		if replicationFactor > len(brokers) {
 			util.Warn("FSM: Requested RF %d exceeds active brokers %d. Capping to %d", replicationFactor, len(brokers), len(brokers))
 			replicationFactor = len(brokers)
 		}
-		topicCmd.ReplicationFactor = replicationFactor
 		if definition.Policy.MinInSyncReplicas != nil && *definition.Policy.MinInSyncReplicas > replicationFactor {
 			return fmt.Errorf(
 				"min_in_sync_replicas %d exceeds replication factor %d",
@@ -202,10 +242,11 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		}
 		for i := 0; i < currentPartitions; i++ {
 			key := topicCmd.Name + "-" + strconv.Itoa(i)
-			stagedPartitions[key].PartitionCount = topicCmd.Partitions
+			stagedPartitions[key].PartitionCount = definition.Partitions
+			stagedPartitions[key].LifecycleEpoch = definition.LifecycleEpoch
 		}
 
-		for i := currentPartitions; i < topicCmd.Partitions; i++ {
+		for i := currentPartitions; i < definition.Partitions; i++ {
 			key := topicCmd.Name + "-" + strconv.Itoa(i)
 
 			assignedLeader := topicCmd.LeaderID
@@ -235,33 +276,33 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			isrCopy := append([]string(nil), replicas...)
 
 			stagedPartitions[key] = &PartitionMetadata{
-				PartitionCount:    topicCmd.Partitions,
+				PartitionCount:    definition.Partitions,
 				Leader:            assignedLeader,
 				LeaderEpoch:       1,
 				CommittedHWMKnown: true,
-				Idempotent:        topicCmd.Idempotent,
+				Idempotent:        definition.Idempotent,
+				LifecycleEpoch:    definition.LifecycleEpoch,
 				Replicas:          replicas,
 				ISR:               isrCopy,
 			}
 			util.Info("FSM: Assigned leader %s to partition %s (replicas=%v)", assignedLeader, key, replicas)
 		}
 
-		definition.Idempotent = topicCmd.Idempotent
-		definition.EventSourcing = topicCmd.EventSourcing
 		stagedTopics[topicCmd.Name] = copyTopicDefinition(&definition)
 		f.partitionMetadata = stagedPartitions
 		f.topicState = stagedTopics
+		appliedDefinition = definition
 		return nil
 	}()
 	if stageResult != nil {
 		return stageResult
 	}
 
-	if err := f.materializeTopicCreate(&definition); err != nil {
+	if err := f.materializeTopicCreate(&appliedDefinition); err != nil {
 		util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicCmd.Name, err)
 		return err
 	}
-	util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, topicCmd.Partitions)
+	util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, appliedDefinition.Partitions)
 	return nil
 }
 
@@ -314,27 +355,56 @@ func (f *BrokerFSM) applyTopicConfigCommand(jsonData string) interface{} {
 		}
 		value = &valueCopy
 	}
-	updated := copyTopicDefinition(current)
-	updated.Policy.MinInSyncReplicas = value
-	normalized, err := updated.Normalize()
+	updated, err := topic.UpdateDefinitionMinInSyncReplicas(*current, value)
 	if err != nil {
 		return fmt.Errorf("invalid topic definition: %w", err)
 	}
 
 	if f.tm != nil {
-		if err := f.tm.AlterTopicMinInSyncReplicas(command.Name, value, replicationFactor); err != nil {
+		if err := f.tm.ApplyDefinition(updated); err != nil {
 			return fmt.Errorf("materialize topic config: %w", err)
 		}
 	}
 	f.mu.Lock()
-	f.topicState[command.Name] = copyTopicDefinition(&normalized)
+	f.topicState[command.Name] = copyTopicDefinition(&updated)
 	f.mu.Unlock()
 	return nil
 }
 
+func legacyTopicDefinitionPatch(definition topic.Definition, includeReplicationFactor bool) topic.DefinitionPatch {
+	partitions := definition.Partitions
+	cleanupPolicy := definition.Policy.CleanupPolicy
+	retentionHours := definition.Policy.RetentionHours
+	retentionBytes := definition.Policy.RetentionBytes
+	partitioner := definition.Policy.Partitioner
+	authPolicy := definition.Policy.AuthPolicy
+	readACL := append([]string(nil), definition.Policy.ReadACL...)
+	writeACL := append([]string(nil), definition.Policy.WriteACL...)
+	patch := topic.DefinitionPatch{
+		Partitions:     &partitions,
+		CleanupPolicy:  &cleanupPolicy,
+		RetentionHours: &retentionHours,
+		RetentionBytes: &retentionBytes,
+		Partitioner:    &partitioner,
+		AuthPolicy:     &authPolicy,
+		ReadACL:        &readACL,
+		WriteACL:       &writeACL,
+	}
+	if includeReplicationFactor {
+		replicationFactor := definition.ReplicationFactor
+		patch.ReplicationFactor = &replicationFactor
+	}
+	if definition.Policy.MinInSyncReplicas != nil {
+		minInSyncReplicas := *definition.Policy.MinInSyncReplicas
+		patch.MinInSyncReplicas = &minInSyncReplicas
+	}
+	return patch
+}
+
 func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 	var payload struct {
-		Topic string `json:"topic"`
+		Topic    string `json:"topic"`
+		IfExists bool   `json:"if_exists,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(jsonData), &payload); err != nil {
 		util.Error("FSM: Failed to unmarshal topic delete command: %v", err)
@@ -343,38 +413,195 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 	if err := topic.ValidateName(payload.Topic); err != nil {
 		return fmt.Errorf("invalid topic name: %w", err)
 	}
-
-	stageResult := func() interface{} {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-
-		found := f.topicState[payload.Topic] != nil
-		for key := range f.partitionMetadata {
-			if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
-				found = true
-			}
-		}
-		if !found {
-			return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
-		}
-
-		for key := range f.partitionMetadata {
-			if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
-				delete(f.partitionMetadata, key)
-			}
-		}
-		delete(f.topicState, payload.Topic)
-		return nil
-	}()
-	if stageResult != nil {
-		return stageResult
+	if payload.Topic == config.ConsumerOffsetsTopicName {
+		return fmt.Errorf("cannot delete broker-owned internal consumer metadata topic")
 	}
+
+	f.mu.RLock()
+	found := f.topicState[payload.Topic] != nil
+	for key := range f.partitionMetadata {
+		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
+			found = true
+		}
+	}
+	coordinatorRef := f.cd
+	transactionManager := f.txn
+	f.mu.RUnlock()
+	if !found && !payload.IfExists {
+		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
+	}
+	if coordinatorRef != nil {
+		for _, reference := range coordinatorRef.TopicGroupReferences(payload.Topic) {
+			if reference.MemberCount != 0 {
+				return fmt.Errorf(
+					"%w: topic %q has active consumer group %q with %d member(s)",
+					topic.ErrTopicDeleteBlocked,
+					payload.Topic,
+					reference.Name,
+					reference.MemberCount,
+				)
+			}
+		}
+	}
+	if transactionManager != nil {
+		if _, _, err := transactionManager.StateWithoutTopicReferences(payload.Topic); err != nil {
+			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
+		}
+	}
+	if coordinatorRef != nil {
+		if _, err := coordinatorRef.DeleteInactiveGroupsForTopic(payload.Topic); err != nil {
+			return fmt.Errorf("delete consumer groups for topic %q: %w", payload.Topic, err)
+		}
+	}
+	if transactionManager != nil {
+		if _, err := transactionManager.PruneTopicReferences(payload.Topic); err != nil {
+			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
+		}
+	}
+
+	f.mu.Lock()
+	for key := range f.partitionMetadata {
+		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
+			delete(f.partitionMetadata, key)
+		}
+	}
+	delete(f.topicState, payload.Topic)
+	delete(f.producerState, payload.Topic)
+	f.mu.Unlock()
 
 	if err := f.materializeTopicDelete(payload.Topic); err != nil {
-		return err
+		util.Warn("FSM: Topic '%s' was logically deleted with pending local storage cleanup: %v", payload.Topic, err)
+		return topic.DeleteResult{Deleted: found, CleanupPending: true}
 	}
 	util.Info("FSM: Deleted topic '%s'", payload.Topic)
+	if !found {
+		return topic.DeleteResult{Deleted: false}
+	}
 	return nil
+}
+
+func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
+	var payload struct {
+		Topic            string `json:"topic"`
+		ExpectedRevision uint64 `json:"expected_revision"`
+	}
+	if err := json.Unmarshal([]byte(jsonData), &payload); err != nil {
+		return err
+	}
+	if err := topic.ValidateName(payload.Topic); err != nil {
+		return fmt.Errorf("invalid topic name: %w", err)
+	}
+	if payload.Topic == config.ConsumerOffsetsTopicName {
+		return fmt.Errorf("cannot truncate broker-owned internal consumer metadata topic")
+	}
+	if payload.ExpectedRevision == 0 {
+		return fmt.Errorf("expected_revision must be greater than zero")
+	}
+
+	f.mu.RLock()
+	current := copyTopicDefinition(f.topicState[payload.Topic])
+	coordinatorRef := f.cd
+	transactionManager := f.txn
+	for _, broker := range f.brokers {
+		if broker.Status == "active" && broker.LifecycleProtocol < TopicLifecycleProtocolVersion {
+			f.mu.RUnlock()
+			return fmt.Errorf(
+				"topic truncate requires lifecycle protocol %d on every active broker; broker %q advertises %d",
+				TopicLifecycleProtocolVersion, broker.ID, broker.LifecycleProtocol,
+			)
+		}
+	}
+	for key, metadata := range f.partitionMetadata {
+		idx := strings.LastIndex(key, "-")
+		if idx != -1 && key[:idx] == payload.Topic && metadata != nil && metadata.LeaderEpoch == math.MaxInt {
+			f.mu.RUnlock()
+			return fmt.Errorf("leader epoch overflow for partition %q", key)
+		}
+	}
+	f.mu.RUnlock()
+	if current == nil {
+		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
+	}
+	if current.Revision != payload.ExpectedRevision {
+		return fmt.Errorf(
+			"%w for topic %q: current=%d expected=%d",
+			topic.ErrTopicRevisionConflict, payload.Topic, current.Revision, payload.ExpectedRevision,
+		)
+	}
+	if current.Revision == math.MaxUint64 || current.LifecycleEpoch == math.MaxUint64 {
+		return fmt.Errorf("topic lifecycle counter overflow for %q", payload.Topic)
+	}
+
+	if coordinatorRef != nil {
+		for _, reference := range coordinatorRef.TopicGroupReferences(payload.Topic) {
+			if reference.MemberCount != 0 {
+				return fmt.Errorf(
+					"%w: topic %q has active consumer group %q with %d member(s)",
+					topic.ErrTopicDeleteBlocked, payload.Topic, reference.Name, reference.MemberCount,
+				)
+			}
+		}
+	}
+	if transactionManager != nil {
+		if _, _, err := transactionManager.StateWithoutTopicReferences(payload.Topic); err != nil {
+			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
+		}
+	}
+	if coordinatorRef != nil {
+		if _, err := coordinatorRef.DeleteInactiveGroupsForTopic(payload.Topic); err != nil {
+			return fmt.Errorf("delete consumer groups for topic %q: %w", payload.Topic, err)
+		}
+	}
+	if transactionManager != nil {
+		if _, err := transactionManager.PruneTopicReferences(payload.Topic); err != nil {
+			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
+		}
+	}
+
+	target := *current
+	target.Revision++
+	target.LifecycleEpoch++
+	f.mu.Lock()
+	latest := f.topicState[payload.Topic]
+	if latest == nil || latest.Revision != current.Revision || latest.LifecycleEpoch != current.LifecycleEpoch {
+		f.mu.Unlock()
+		return fmt.Errorf("%w for topic %q: authoritative definition changed during truncate", topic.ErrTopicRevisionConflict, payload.Topic)
+	}
+	stagedPartitions := copyPartitionMetadataState(f.partitionMetadata)
+	for key, metadata := range stagedPartitions {
+		idx := strings.LastIndex(key, "-")
+		if idx == -1 || key[:idx] != payload.Topic || metadata == nil {
+			continue
+		}
+		if metadata.LeaderEpoch == math.MaxInt {
+			f.mu.Unlock()
+			return fmt.Errorf("leader epoch overflow for partition %q", key)
+		}
+		metadata.CommittedHWM = 0
+		metadata.CommittedHWMKnown = true
+		metadata.LeaderEpoch++
+		metadata.LifecycleEpoch = target.LifecycleEpoch
+	}
+	stagedLogs := make(map[uint64]*ReplicationEntry, len(f.logs))
+	for index, entry := range f.logs {
+		if entry != nil && entry.Topic == payload.Topic {
+			continue
+		}
+		stagedLogs[index] = entry
+	}
+	f.partitionMetadata = stagedPartitions
+	f.logs = stagedLogs
+	delete(f.producerState, payload.Topic)
+	f.topicState[payload.Topic] = copyTopicDefinition(&target)
+	f.mu.Unlock()
+
+	result := topic.TruncateResult{Topic: payload.Topic, Truncated: true, Definition: target}
+	if err := f.materializeTopicTruncate(&target); err != nil {
+		util.Warn("FSM: Topic %q truncate committed with pending local materialization: %v", payload.Topic, err)
+		result.CleanupPending = true
+		return result
+	}
+	return result
 }
 
 func (f *BrokerFSM) applyPartitionCommand(jsonData string) interface{} {
@@ -407,6 +634,23 @@ func (f *BrokerFSM) applyPartitionCommand(jsonData string) interface{} {
 		if metadata.CommittedHWMKnown && current.CommittedHWMKnown && metadata.CommittedHWM < current.CommittedHWM {
 			return fmt.Errorf("committed HWM regression for %s: current=%d requested=%d", key, current.CommittedHWM, metadata.CommittedHWM)
 		}
+		currentLifecycleEpoch := current.LifecycleEpoch
+		if currentLifecycleEpoch == 0 {
+			currentLifecycleEpoch = topic.InitialLifecycleEpoch
+		}
+		requestedLifecycleEpoch := metadata.LifecycleEpoch
+		if requestedLifecycleEpoch == 0 {
+			if currentLifecycleEpoch > topic.InitialLifecycleEpoch {
+				return fmt.Errorf("missing topic lifecycle epoch for %s", key)
+			}
+			requestedLifecycleEpoch = topic.InitialLifecycleEpoch
+		}
+		if requestedLifecycleEpoch != currentLifecycleEpoch {
+			return fmt.Errorf("stale topic lifecycle epoch for %s: current=%d requested=%d", key, currentLifecycleEpoch, requestedLifecycleEpoch)
+		}
+		metadata.LifecycleEpoch = requestedLifecycleEpoch
+	} else if metadata.LifecycleEpoch == 0 {
+		metadata.LifecycleEpoch = topic.InitialLifecycleEpoch
 	}
 	f.partitionMetadata[key] = &metadata
 	util.Debug("FSM: Updated partition metadata for %s", key)
@@ -414,11 +658,12 @@ func (f *BrokerFSM) applyPartitionCommand(jsonData string) interface{} {
 }
 
 type partitionCommitCommand struct {
-	Topic       string `json:"topic"`
-	Partition   int    `json:"partition"`
-	Leader      string `json:"leader"`
-	LeaderEpoch int    `json:"leader_epoch"`
-	HWM         uint64 `json:"hwm"`
+	Topic          string `json:"topic"`
+	Partition      int    `json:"partition"`
+	Leader         string `json:"leader"`
+	LeaderEpoch    int    `json:"leader_epoch"`
+	HWM            uint64 `json:"hwm"`
+	LifecycleEpoch uint64 `json:"lifecycle_epoch,omitempty"`
 }
 
 func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
@@ -445,6 +690,19 @@ func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
 	if cmd.HWM < metadata.CommittedHWM {
 		f.mu.Unlock()
 		return fmt.Errorf("committed HWM regression for %s: current=%d requested=%d", key, metadata.CommittedHWM, cmd.HWM)
+	}
+	metadataLifecycleEpoch := metadata.LifecycleEpoch
+	if metadataLifecycleEpoch == 0 {
+		metadataLifecycleEpoch = topic.InitialLifecycleEpoch
+	}
+	if cmd.LifecycleEpoch == 0 {
+		if metadataLifecycleEpoch > topic.InitialLifecycleEpoch {
+			f.mu.Unlock()
+			return fmt.Errorf("missing topic lifecycle epoch for %s", key)
+		}
+	} else if cmd.LifecycleEpoch != metadataLifecycleEpoch {
+		f.mu.Unlock()
+		return fmt.Errorf("stale topic lifecycle epoch for %s: current=%d requested=%d", key, metadataLifecycleEpoch, cmd.LifecycleEpoch)
 	}
 	metadata.CommittedHWM = cmd.HWM
 	metadata.CommittedHWMKnown = true

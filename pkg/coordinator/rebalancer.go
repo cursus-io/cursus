@@ -20,6 +20,7 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
+	now := time.Now()
 
 	c.mu.Lock()
 	existing := c.groups[groupName]
@@ -50,6 +51,7 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 				c.groupEpochs[groupName] = existing.RegistrationEpoch
 			}
 			existing.TopicName = topicName
+			existing.LastActivity = now
 			if len(existing.Partitions) == 0 {
 				existing.Partitions = makePartitions(partitionCount)
 			}
@@ -94,6 +96,7 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 		existing.mu.Lock()
 		existing.RegistrationEpoch = epoch
 		existing.TopicName = topicName
+		existing.LastActivity = now
 		if len(existing.Partitions) == 0 {
 			existing.Partitions = makePartitions(partitionCount)
 		}
@@ -113,6 +116,7 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 		Members:           make(map[string]*MemberMetadata),
 		Partitions:        makePartitions(partitionCount),
 		Offsets:           make(map[string]map[int]uint64),
+		LastActivity:      now,
 		RegistrationEpoch: epoch,
 		OffsetRevisions:   make(map[string]uint64),
 	}
@@ -224,9 +228,10 @@ func (c *Coordinator) AddConsumer(groupName, consumerID string) ([]int, error) {
 		return nil, fmt.Errorf("group not found")
 	}
 
+	now := time.Now()
 	group.Members[consumerID] = &MemberMetadata{
 		ID:            consumerID,
-		LastHeartbeat: time.Now(),
+		LastHeartbeat: now,
 	}
 	group.Generation++
 
@@ -336,6 +341,9 @@ func (c *Coordinator) rebalanceRange(groupName string) {
 		members = append(members, id)
 	}
 	sort.Strings(members)
+	now := time.Now()
+	group.LastActivity = now
+	group.LastRebalance = now
 
 	if len(members) == 0 {
 		util.Warn("⚠️ No active members in group '%s', skipping rebalance", groupName)
@@ -370,5 +378,4 @@ func (c *Coordinator) rebalanceRange(groupName string) {
 
 		util.Info("📋 Assigned %v to %s", newAssignments, memberID)
 	}
-	group.LastRebalance = time.Now()
 }

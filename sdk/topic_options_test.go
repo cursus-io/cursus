@@ -93,4 +93,7 @@ func TestBuildCreateTopicCommandOmitsInheritedValues(t *testing.T) {
 	if strings.Contains(command, "cleanup_policy=") || strings.Contains(command, "retention_") {
 		t.Fatalf("inherited options unexpectedly serialized: %s", command)
 	}
+	if strings.Contains(command, "idempotent=") {
+		t.Fatalf("disabled idempotence should be omitted instead of restated: %s", command)
+	}
 }

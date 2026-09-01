@@ -14,6 +14,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
+	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -21,6 +22,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type readinessTopicHandler struct{}
+
+func (readinessTopicHandler) CreateTopic(string, int, bool, bool) error { return nil }
+func (readinessTopicHandler) Publish(string, *types.Message) error      { return nil }
 
 // newTestConnPair creates a connected pair of net.Conn for testing.
 func newTestConnPair(t *testing.T) (client, server net.Conn) {
@@ -187,6 +193,28 @@ func TestHealthHandlerSeparatesLivenessAndReadiness(t *testing.T) {
 	handler.ServeHTTP(legacy, httptest.NewRequest(http.MethodGet, "/", nil))
 	assert.Equal(t, http.StatusOK, legacy.Code)
 	assert.Equal(t, "OK", legacy.Body.String())
+}
+
+func TestReadinessDoesNotDependOnConsumerGroupMembers(t *testing.T) {
+	groupCoordinator := coordinator.NewCoordinator(context.Background(), config.DefaultConfig(), readinessTopicHandler{})
+	t.Cleanup(groupCoordinator.Stop)
+	require.NoError(t, groupCoordinator.RegisterGroup("empty-topic", "lazy-group", 1))
+	require.Zero(t, requireGroupMembers(t, groupCoordinator, "lazy-group"))
+
+	state := NewHealthState()
+	addConsumerMetadataReadinessCheck(state, groupCoordinator)
+	state.SetReady(true)
+	recorder := httptest.NewRecorder()
+	newHealthHandler(state).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	require.Equal(t, http.StatusOK, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), `"status":"ready"`)
+}
+
+func requireGroupMembers(t *testing.T, groupCoordinator *coordinator.Coordinator, groupName string) int {
+	t.Helper()
+	status, err := groupCoordinator.GetGroupStatus(groupName)
+	require.NoError(t, err)
+	return status.MemberCount
 }
 
 func TestHealthHandlerRejectsMutationMethods(t *testing.T) {

@@ -152,14 +152,59 @@ const coordinatorUnavailableResponse = "ERROR: coordinator_not_available"
 // Discovery failures return false so multiple brokers cannot expire the same
 // group while the coordinator ring is unavailable.
 func (ch *CommandHandler) IsGroupCoordinator(groupName string) bool {
-	if !ch.isDistributed() {
-		return true
+	owned, err := ch.ResolveGroupCoordinator(groupName)
+	return err == nil && owned
+}
+
+// ResolveGroupCoordinator reports whether this broker is the current group
+// coordinator. Exporter observation uses the error to fail closed instead of
+// presenting a non-authoritative local snapshot.
+func (ch *CommandHandler) ResolveGroupCoordinator(groupName string) (bool, error) {
+	resolved, err := ch.ResolveGroupCoordinators([]string{groupName})
+	if err != nil {
+		return false, err
 	}
-	if !ch.hasRouter() {
-		return false
+	owned, ok := resolved[groupName]
+	if !ok {
+		return false, fmt.Errorf("coordinator result missing for group %q", groupName)
 	}
-	id, _, err := ch.Cluster.Router.FindCoordinator(groupName)
-	return err == nil && id == ch.Cluster.Router.BrokerID()
+	return owned, nil
+}
+
+// ResolveGroupCoordinators resolves scrape-time ownership from one validated
+// control-plane snapshot. Distributed observation fails closed when this
+// broker cannot currently resolve a Raft leader, even if its local FSM still
+// contains an older active-broker view.
+func (ch *CommandHandler) ResolveGroupCoordinators(groupNames []string) (map[string]bool, error) {
+	resolved := make(map[string]bool, len(groupNames))
+	if ch == nil || ch.Config == nil || !ch.Config.EnabledDistribution {
+		for _, groupName := range groupNames {
+			resolved[groupName] = true
+		}
+		return resolved, nil
+	}
+	if ch.Cluster == nil || ch.Cluster.RaftManager == nil {
+		return nil, fmt.Errorf("raft manager unavailable")
+	}
+	if ch.Cluster.Router == nil {
+		return nil, fmt.Errorf("coordinator router unavailable")
+	}
+	if ch.Cluster.RaftManager.GetLeaderAddress() == "" {
+		return nil, fmt.Errorf("cluster leader unavailable")
+	}
+	owners, err := ch.Cluster.Router.FindCoordinatorOwners(groupNames)
+	if err != nil {
+		return nil, err
+	}
+	localID := ch.Cluster.Router.BrokerID()
+	for _, groupName := range groupNames {
+		ownerID, ok := owners[groupName]
+		if !ok {
+			return nil, fmt.Errorf("coordinator result missing for group %q", groupName)
+		}
+		resolved[groupName] = ownerID == localID
+	}
+	return resolved, nil
 }
 
 // ExpireGroupMembers serializes timeout-driven membership removal through the
@@ -510,6 +555,11 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshot(topicName string, parti
 	if err != nil {
 		return fail(err)
 	}
+	if currentTopic := ch.TopicManager.GetTopic(topicName); currentTopic == nil {
+		return fail(fmt.Errorf("topic lifecycle pending or topic not found"))
+	} else if currentTopic.LifecycleEpoch != snapshot.LifecycleEpoch {
+		return fail(fmt.Errorf("stale topic lifecycle epoch: current=%d local=%d", snapshot.LifecycleEpoch, currentTopic.LifecycleEpoch))
+	}
 	if requiredISR > 0 && len(snapshot.ISR) < requiredISR {
 		return fail(fmt.Errorf("insufficient_in_sync_replicas current=%d required=%d", len(snapshot.ISR), requiredISR))
 	}
@@ -519,7 +569,7 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshot(topicName string, parti
 		// it authoritative through the current leader epoch before any new
 		// acknowledgement mode can append beyond it.
 		legacyHWM := p.GetHWM()
-		if err := ch.commitPartitionHWMAtEpoch(topicName, partitionID, legacyHWM, snapshot.Leader, snapshot.LeaderEpoch); err != nil {
+		if err := ch.commitPartitionHWMAtEpoch(topicName, partitionID, legacyHWM, snapshot.Leader, snapshot.LeaderEpoch, snapshot.LifecycleEpoch); err != nil {
 			return fail(fmt.Errorf("migrate legacy committed HWM: %w", err))
 		}
 		metadata.CommittedHWM = legacyHWM
@@ -581,6 +631,15 @@ func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID 
 			leaderEpoch,
 		))
 	}
+	metadataLifecycleEpoch := metadata.LifecycleEpoch
+	if metadataLifecycleEpoch == 0 {
+		metadataLifecycleEpoch = topic.InitialLifecycleEpoch
+	}
+	if pTopic := ch.TopicManager.GetTopic(topicName); pTopic == nil {
+		return fail(fmt.Errorf("topic lifecycle pending or topic not found"))
+	} else if pTopic.LifecycleEpoch != metadataLifecycleEpoch {
+		return fail(fmt.Errorf("stale topic lifecycle epoch: current=%d local=%d", metadataLifecycleEpoch, pTopic.LifecycleEpoch))
+	}
 	if !metadata.CommittedHWMKnown {
 		return fail(fmt.Errorf("partition committed HWM is not known; wait for the current leader to migrate legacy metadata"))
 	}
@@ -597,13 +656,14 @@ func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID 
 	return release, nil
 }
 
-func (ch *CommandHandler) commitPartitionHWMAtEpoch(topicName string, partitionID int, hwm uint64, leader string, leaderEpoch int) error {
+func (ch *CommandHandler) commitPartitionHWMAtEpoch(topicName string, partitionID int, hwm uint64, leader string, leaderEpoch int, lifecycleEpoch uint64) error {
 	_, err := ch.applyViaLeader("PARTITION_COMMIT", map[string]interface{}{
-		"topic":        topicName,
-		"partition":    partitionID,
-		"leader":       leader,
-		"leader_epoch": leaderEpoch,
-		"hwm":          hwm,
+		"topic":           topicName,
+		"partition":       partitionID,
+		"leader":          leader,
+		"leader_epoch":    leaderEpoch,
+		"hwm":             hwm,
+		"lifecycle_epoch": lifecycleEpoch,
 	})
 	if errors.Is(err, replicationFSM.ErrPartitionCommitFenced) {
 		return fmt.Errorf("%w: %v", clusterController.ErrPartitionLeaderFenced, err)
@@ -630,6 +690,17 @@ func (ch *CommandHandler) validateReplicaLeader(cmd types.MessageCommand) string
 	}
 	if cmd.LeaderEpoch != metadata.LeaderEpoch {
 		return fmt.Sprintf("ERROR: STALE_LEADER_EPOCH current=%d requested=%d", metadata.LeaderEpoch, cmd.LeaderEpoch)
+	}
+	metadataLifecycleEpoch := metadata.LifecycleEpoch
+	if metadataLifecycleEpoch == 0 {
+		metadataLifecycleEpoch = topic.InitialLifecycleEpoch
+	}
+	if cmd.LifecycleEpoch == 0 {
+		if metadataLifecycleEpoch > topic.InitialLifecycleEpoch {
+			return "ERROR: missing_topic_lifecycle_epoch command=REPLICATE_MESSAGE"
+		}
+	} else if cmd.LifecycleEpoch != metadataLifecycleEpoch {
+		return fmt.Sprintf("ERROR: STALE_TOPIC_LIFECYCLE_EPOCH current=%d requested=%d", metadataLifecycleEpoch, cmd.LifecycleEpoch)
 	}
 	return ""
 }

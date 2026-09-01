@@ -66,6 +66,7 @@ func (e clusterPartitionReplicationExecutor) Commit(task partitionReplicationTas
 		task.commitHWM,
 		task.snapshot.Leader,
 		task.snapshot.LeaderEpoch,
+		task.snapshot.LifecycleEpoch,
 	); err != nil {
 		return err
 	}
@@ -271,8 +272,8 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			current, snapshotErr := l.owner.executor.Snapshot(task.topic, task.partition)
 			if snapshotErr != nil {
 				err = snapshotErr
-			} else if current.Leader != task.snapshot.Leader || current.LeaderEpoch != task.snapshot.LeaderEpoch {
-				err = fmt.Errorf("%w before commit: current=%s/%d requested=%s/%d", clusterController.ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch)
+			} else if !sameReplicationFence(current, task.snapshot) {
+				err = fmt.Errorf("%w before commit: current=%s/%d/%d requested=%s/%d/%d", clusterController.ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, current.LifecycleEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch, task.snapshot.LifecycleEpoch)
 			}
 		}
 		if err == nil {
@@ -282,8 +283,8 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			current, snapshotErr := l.owner.executor.Snapshot(task.topic, task.partition)
 			if snapshotErr != nil {
 				err = snapshotErr
-			} else if current.Leader != task.snapshot.Leader || current.LeaderEpoch != task.snapshot.LeaderEpoch {
-				err = fmt.Errorf("%w after commit: current=%s/%d requested=%s/%d", clusterController.ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch)
+			} else if !sameReplicationFence(current, task.snapshot) {
+				err = fmt.Errorf("%w after commit: current=%s/%d/%d requested=%s/%d/%d", clusterController.ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, current.LifecycleEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch, task.snapshot.LifecycleEpoch)
 			}
 		}
 		if err == nil {
@@ -327,13 +328,19 @@ func (l *partitionReplicationLane) replicationSnapshot(task partitionReplication
 	if err != nil {
 		return clusterController.PartitionReplicationSnapshot{}, err
 	}
-	if current.Leader != task.snapshot.Leader || current.LeaderEpoch != task.snapshot.LeaderEpoch {
-		return clusterController.PartitionReplicationSnapshot{}, fmt.Errorf("%w: current=%s/%d requested=%s/%d", clusterController.ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch)
+	if !sameReplicationFence(current, task.snapshot) {
+		return clusterController.PartitionReplicationSnapshot{}, fmt.Errorf("%w: current=%s/%d/%d requested=%s/%d/%d", clusterController.ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, current.LifecycleEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch, task.snapshot.LifecycleEpoch)
 	}
 	if task.ackMode == ackpolicy.All {
 		return task.snapshot, nil
 	}
 	return current, nil
+}
+
+func sameReplicationFence(left, right clusterController.PartitionReplicationSnapshot) bool {
+	return left.Leader == right.Leader &&
+		left.LeaderEpoch == right.LeaderEpoch &&
+		left.LifecycleEpoch == right.LifecycleEpoch
 }
 
 func completeReplicationTask(task partitionReplicationTask, err error) {

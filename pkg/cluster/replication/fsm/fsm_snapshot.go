@@ -23,7 +23,7 @@ type BrokerFSMSnapshot struct {
 
 func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	state := BrokerFSMState{
-		Version:           6,
+		Version:           s.writeVersion(),
 		Applied:           s.applied,
 		Logs:              s.logs,
 		Brokers:           s.brokers,
@@ -44,6 +44,17 @@ func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 		return err
 	}
 	return sink.Close()
+}
+
+func (s *BrokerFSMSnapshot) writeVersion() int {
+	for _, definition := range s.topicState {
+		if definition != nil && definition.LifecycleEpoch > topic.InitialLifecycleEpoch {
+			return 8
+		}
+	}
+	// A first-generation snapshot carries additive epoch fields but retains the
+	// previous version so old followers can keep participating while upgrading.
+	return 7
 }
 
 func (s *BrokerFSMSnapshot) Release() {}

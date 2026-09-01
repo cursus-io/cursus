@@ -39,9 +39,13 @@ func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
 
 	f.mu.Lock()
 	meta, topicExists := f.partitionMetadata[partitionKey]
+	var metadata PartitionMetadata
+	if topicExists && meta != nil {
+		metadata = *meta
+	}
 
 	effectiveIdempotent := cmd.IsIdempotent
-	if topicExists && meta.Idempotent {
+	if topicExists && metadata.Idempotent {
 		effectiveIdempotent = true
 	}
 
@@ -142,9 +146,13 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 
 	f.mu.Lock()
 	meta, topicExists := f.partitionMetadata[partitionKey]
+	var metadata PartitionMetadata
+	if topicExists && meta != nil {
+		metadata = *meta
+	}
 
 	effectiveIdempotent := cmd.IsIdempotent
-	if topicExists && meta.Idempotent {
+	if topicExists && metadata.Idempotent {
 		effectiveIdempotent = true
 	}
 
@@ -157,6 +165,17 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 
 	if !topicExists {
 		return fmt.Errorf("partition metadata '%s' not found (topic=%s, partition=%d)", partitionKey, cmd.Topic, cmd.Partition)
+	}
+	metadataLifecycleEpoch := metadata.LifecycleEpoch
+	if metadataLifecycleEpoch == 0 {
+		metadataLifecycleEpoch = 1
+	}
+	if cmd.LifecycleEpoch == 0 {
+		if metadataLifecycleEpoch > 1 {
+			return fmt.Errorf("missing topic lifecycle epoch for %s", partitionKey)
+		}
+	} else if cmd.LifecycleEpoch != metadataLifecycleEpoch {
+		return fmt.Errorf("stale topic lifecycle epoch for %s: current=%d requested=%d", partitionKey, metadataLifecycleEpoch, cmd.LifecycleEpoch)
 	}
 
 	if effectiveIdempotent {

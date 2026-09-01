@@ -275,12 +275,13 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 
 		scope := "partition"
 		messageData := types.MessageCommand{
-			Topic:         topicName,
-			Partition:     partition,
-			IsIdempotent:  effectiveIdempotent,
-			SequenceScope: scope,
-			Messages:      []types.Message{*msg},
-			Acks:          acks,
+			Topic:          topicName,
+			Partition:      partition,
+			LifecycleEpoch: t.LifecycleEpoch,
+			IsIdempotent:   effectiveIdempotent,
+			SequenceScope:  scope,
+			Messages:       []types.Message{*msg},
+			Acks:           acks,
 		}
 
 		markLeaderOffsetsUnassigned(messageData.Messages)
@@ -358,7 +359,6 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 				return "ERROR: request_cancelled"
 			}
 		}
-
 		ackResp = types.AckResponse{
 			Status:        "OK",
 			LastOffset:    assignedOffset,
@@ -516,6 +516,8 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 
 // HandleBatchMessage processes PUBLISH of multiple messages.
 func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...*ClientContext) (response string, returnErr error) {
+	ch.topicLifecycleMu.RLock()
+	defer ch.topicLifecycleMu.RUnlock()
 	var clientCtx *ClientContext
 	if len(ctx) > 0 {
 		clientCtx = ctx[0]
@@ -528,6 +530,9 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 	}
 	if batch.Topic == config.ConsumerOffsetsTopicName {
 		return fmt.Sprintf("ERROR: internal_topic_write_forbidden topic=%s", batch.Topic), nil
+	}
+	if ch.TopicManager != nil && ch.TopicManager.IsTruncationPending(batch.Topic) {
+		return fmt.Sprintf("ERROR: topic_lifecycle_pending topic=%s operation=truncate", batch.Topic), nil
 	}
 
 	acks := batch.Acks
@@ -683,12 +688,13 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		lastOffset = appended[len(appended)-1].Offset
 
 		msgCmd := types.MessageCommand{
-			Topic:         batch.Topic,
-			Partition:     batch.Partition,
-			IsIdempotent:  effectiveIdempotent,
-			SequenceScope: scope,
-			Messages:      appended,
-			Acks:          acks,
+			Topic:          batch.Topic,
+			Partition:      batch.Partition,
+			LifecycleEpoch: t.LifecycleEpoch,
+			IsIdempotent:   effectiveIdempotent,
+			SequenceScope:  scope,
+			Messages:       appended,
+			Acks:           acks,
 		}
 
 		commitHWM := lastOffset + 1

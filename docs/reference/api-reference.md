@@ -61,13 +61,15 @@ With `structured_errors_v1` enabled, subsequent text errors use `ERROR: <code> c
 CREATE topic=<name> [partitions=<N>] [idempotent=<bool>] [event_sourcing=<bool>] [replication_factor=<N>] [min_in_sync_replicas=<N>] [cleanup_policy=<delete|compact|delete,compact>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
 ```
 
-Creates a topic or increases its partition count when the topic already exists.
+Creates a topic or patches an existing definition. Defaults apply only when the topic is missing. On an existing topic, omitted fields are preserved and explicit `0`, `false`, or empty ACL values are authoritative. Partitions can only increase; replication factor, idempotent mode, and event-sourcing mode are immutable after creation.
 
 Success:
 
 ```text
-OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> min_in_sync_replicas=<N|default> effective_min_in_sync_replicas=<N>
+OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> lifecycle_epoch=<N> min_in_sync_replicas=<N|default> effective_min_in_sync_replicas=<N>
 ```
+
+The pre-revision response fields keep their original order. New fields are appended so legacy key/value and positional readers can continue consuming the established prefix.
 
 Common errors:
 
@@ -85,21 +87,30 @@ ERROR: create_topic_failed reason="..."
 ### DELETE
 
 ```text
-DELETE topic=<name>
+DELETE topic=<name> [if_exists=<true|false>]
 ```
+
+Deletes a topic through the admin-only lifecycle path. The default `if_exists=false` preserves the legacy missing-topic error. Use `if_exists=true` only when an explicitly approved GitOps deletion must be safely retried. Active consumer-group members and open/committing transactions block deletion. Inactive groups and offsets, producer sequence state, target-topic operations in terminal transactions, and event-sourcing state are removed with the topic lifecycle. `__consumer_offsets` cannot be deleted.
 
 Success:
 
 ```text
 OK topic=<name> deleted=true
+OK topic=<name> deleted=false
+OK topic=<name> deleted=true cleanup_pending=true
 ```
+
+`cleanup_pending=true` means the durable logical deletion succeeded and node-local physical cleanup is queued for reconciliation; it is not permission to recreate the name until every broker has converged.
 
 Common errors:
 
 ```text
 ERROR: missing_topic expected="DELETE topic=<name>"
 ERROR: invalid_topic_name topic=<name> reason="..."
+ERROR: invalid_if_exists value="..."
 ERROR: topic_not_found topic=<name>
+ERROR: topic_delete_blocked topic=<name> reason="..."
+ERROR: internal_topic_delete_forbidden topic=<name>
 ERROR: delete_topic_failed reason="..."
 ```
 
@@ -116,6 +127,36 @@ Success:
 ```text
 OK topic=<name> min_in_sync_replicas=<N|default> effective_min_in_sync_replicas=<N>
 ```
+
+### TRUNCATE
+
+```text
+TRUNCATE topic=<name> expected_revision=<N>
+```
+
+Resets the topic's data while retaining its definition and identity. This command is admin-only and requires the last observed non-zero definition revision. A mismatch fails with `topic_revision_conflict`; there is no unguarded form.
+
+Success:
+
+```text
+OK topic=<name> truncated=true revision=<N> lifecycle_epoch=<N> leo=0 hwm=0
+OK topic=<name> truncated=true revision=<N> lifecycle_epoch=<N> leo=0 hwm=0 cleanup_pending=true
+```
+
+Success advances both definition revision and lifecycle epoch, empties all partitions, removes inactive groups and offsets, clears producer sequence and terminal transaction references, and resets event-sourcing state. Active group members and open/committing transactions block the operation. `cleanup_pending=true` means the new logical lifecycle is committed but the topic remains fenced on a broker until local cleanup converges.
+
+Common errors:
+
+```text
+ERROR: missing_expected_revision command=TRUNCATE
+ERROR: invalid_expected_revision value="..."
+ERROR: topic_revision_conflict topic=<name> expected=<N> reason="..."
+ERROR: topic_truncate_blocked topic=<name> reason="..."
+ERROR: internal_topic_truncate_forbidden topic=<name>
+ERROR: truncate_topic_failed topic=<name> reason="..."
+```
+
+Do not emulate truncation with `DELETE` plus `CREATE`: deletion changes topic identity and does not provide lifecycle-epoch fencing.
 
 ### LIST
 
@@ -141,7 +182,7 @@ OK count=0 topics=
 DESCRIBE topic=<name>
 ```
 
-Success is a JSON topic metadata object with `status:"OK"`.
+Success is a JSON topic metadata object with `status:"OK"`. Its additive `definition` object contains the same revision, replication factor, modes, partition count, and policy returned by `CREATE`; the existing `partitions` and `policy` fields remain available.
 
 Common errors:
 
@@ -175,7 +216,9 @@ Because `message=` captures the rest of the line, put optional parameters before
 
 Transaction metadata fields are not accepted on client `PUBLISH`; use the transaction commands for transactional records. Direct `transactional_id`, `transaction_state`, or `transaction_marker` injection returns `ERROR: transaction_metadata_forbidden command=PUBLISH`.
 
-`acks` belongs to the publish request or publisher configuration; it is not topic metadata. `acks=0` emits no external response frame. `acks=1` responds after the leader's durable local append while bounded ordered follower replication continues; a leader failure before commit can lose the record. `acks=all` and `acks=-1` are aliases: the broker first requires the current ISR to meet the topic-effective minimum, then waits for the captured ISR and fenced committed HWM. Read-committed consumers remain bounded by committed HWM. Non-ISR failures do not delay the success response.
+`acks` belongs to the publish request or publisher configuration; it is not topic metadata. For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. `acks=0` emits no external response frame. `acks=1` responds after the leader's durable local append while bounded ordered follower replication continues; a leader failure before commit can lose the record. `acks=all` and `acks=-1` are aliases: the broker first requires the current ISR to meet the topic-effective minimum, then waits for the captured ISR and lifecycle-fenced committed HWM. Read-committed consumers remain bounded by committed HWM. Non-ISR failures do not delay the success response.
+
+Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Producer epochs entered FSM snapshot version 3; current brokers write version 7 while topics remain in their first lifecycle and version 8 after a truncate. Avoid mixed-version rolling upgrades with binaries that cannot decode the active snapshot version.
 
 The effective minimum is the topic `min_in_sync_replicas` override when present and broker `min_insync_replicas` otherwise. Standalone has one replica, so `1`, `all`, and `-1` share the local durable-append completion point when the effective minimum is 1; `all`/`-1` reject when it is greater than 1. Idempotent publishers must use `all` or `-1`; `0` and `1` fail before append or sequence mutation.
 
@@ -473,7 +516,7 @@ METADATA topic=<name>
 Success is a text response:
 
 ```text
-OK topic=<name> partitions=<N> leaders=<csv> epochs=<csv> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>
+OK topic=<name> partitions=<N> leaders=<csv> epochs=<csv> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> lifecycle_epoch=<N>
 ```
 
 Common errors:

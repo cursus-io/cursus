@@ -91,10 +91,11 @@ func (e *barrierReplicationExecutor) committed() uint64 {
 func newBarrierReplicationExecutor() *barrierReplicationExecutor {
 	return &barrierReplicationExecutor{
 		snapshot: clusterController.PartitionReplicationSnapshot{
-			Leader:      "broker-1",
-			LeaderEpoch: 7,
-			ISR:         []string{"broker-1", "broker-2"},
-			Replicas:    []string{"broker-1", "broker-2", "broker-3"},
+			Leader:         "broker-1",
+			LeaderEpoch:    7,
+			LifecycleEpoch: topic.InitialLifecycleEpoch,
+			ISR:            []string{"broker-1", "broker-2"},
+			Replicas:       []string{"broker-1", "broker-2", "broker-3"},
 		},
 		started: make(chan struct{}, 1),
 		barrier: make(chan struct{}),

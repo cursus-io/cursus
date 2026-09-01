@@ -31,6 +31,9 @@ not check topic storage, consumer groups, or cluster quorum.
 
 `/ready` returns `200` only after the client listener, command handler, worker
 pool, and enabled HTTP services have initialized and all dynamic checks pass.
+Consumer group member counts are not readiness checks. A registered group with
+zero members leaves the broker ready; only broker-owned consumer metadata
+recovery participates in readiness.
 
 Standalone response:
 
@@ -136,14 +139,77 @@ In diagnostics-only mode, `/ready` includes the retained `consumer_metadata` fai
 
 ### Consumer Groups
 
-| Metric | Meaning |
-|---|---|
-| `cursus_consumer_group_members{group,topic}` | Active group members |
-| `cursus_consumer_group_generation{group,topic}` | Current group generation |
-| `cursus_consumer_group_assigned_partitions{group,topic}` | Assignments held by active members |
-| `cursus_consumer_group_committed_offset{group,topic,partition}` | Durable next offset |
-| `cursus_consumer_group_lag{group,topic,partition}` | `max(HWM - committedNextOffset, 0)` |
-| `cursus_consumer_group_offset_out_of_range{group,topic,partition}` | Commit is below log start or above the high watermark |
+| Metric | Type / unit | Meaning |
+|---|---|---|
+| `cursus_consumer_group_members{topic,group}` | Gauge / members | Current member count, emitted only by the authoritative coordinator |
+| `cursus_consumer_group_state{topic,group,state}` | Gauge / boolean | One-hot authoritative state: `stable` or `empty` |
+| `cursus_consumer_group_coordinator_up{topic,group}` | Gauge / boolean | `1` only on the broker that successfully resolves itself as current coordinator; every broker emits `0` or `1` |
+| `cursus_consumer_group_last_activity_timestamp_seconds{topic,group}` | Gauge / Unix seconds | Latest accepted heartbeat or group lifecycle activity known by the authoritative coordinator; `0` means unknown, including after standalone durable recovery |
+| `cursus_consumer_group_last_rebalance_timestamp_seconds{topic,group}` | Gauge / Unix seconds | Latest completed membership rebalance known by the authoritative coordinator; `0` means unavailable or no rebalance has completed since recovery |
+| `cursus_consumer_group_observation_failures_total{topic,group,reason}` | Counter / failures | Per-broker observation failures; reason is one of `coordinator_lookup`, `group_lookup`, or `topic_lookup`, and a series appears only after its first failure |
+| `cursus_consumer_group_generation{group,topic}` | Gauge / generation | Current group generation |
+| `cursus_consumer_group_assigned_partitions{group,topic}` | Gauge / partitions | Assignments held by active members |
+| `cursus_consumer_group_committed_offset{group,topic,partition}` | Gauge / offsets | Durable next offset |
+| `cursus_consumer_group_lag{group,topic,partition}` | Gauge / messages | `max(HWM - committedNextOffset, 0)` |
+| `cursus_consumer_group_offset_out_of_range{group,topic,partition}` | Gauge / boolean | Commit is below log start or above the high watermark |
+
+In standalone mode the local coordinator is authoritative. In distributed
+mode, replicated membership can remain present on a broker that no longer owns
+the group, while heartbeat activity is coordinator-local. Such a broker emits
+`coordinator_up = 0` and omits the authoritative lifecycle gauges. It does not
+present its retained snapshot as healthy.
+
+For a converged three-broker scrape, exactly one target emits authoritative
+lifecycle gauges and the sum of `coordinator_up` is one. Gate each `max` by
+that exact authority count; an unguarded `max` can retain an old positive value
+during an overlapping coordinator view. Use `sum` for the per-broker failure
+counters:
+
+```promql
+max by (topic, group) (cursus_consumer_group_members)
+and on (topic, group)
+sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
+
+max by (topic, group, state) (cursus_consumer_group_state)
+and on (topic, group)
+sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
+
+max by (topic, group) (
+  cursus_consumer_group_last_activity_timestamp_seconds
+)
+and on (topic, group)
+sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
+
+max by (topic, group) (
+  cursus_consumer_group_last_rebalance_timestamp_seconds
+)
+and on (topic, group)
+sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
+
+sum by (topic, group) (cursus_consumer_group_coordinator_up)
+
+sum by (topic, group, reason) (
+  rate(cursus_consumer_group_observation_failures_total[5m])
+)
+```
+
+`sum` of an authoritative lifecycle gauge is also exact after coordinator ring
+convergence because only one broker emits it. A `coordinator_up` sum of zero
+means no scraped target currently claims authority; a value above one reveals
+an overlapping ring view. Both cases remove the gated lifecycle value instead
+of allowing a stale value to mask a member-count decrease.
+
+Heartbeat and rebalance timestamps are runtime lifecycle observations, not a
+durable heartbeat journal. Cluster snapshots can carry them across coordinator
+materialization, but standalone metadata recovery intentionally restores no
+members and reports `0` until a new lifecycle event occurs. Persisting every
+heartbeat would add storage write amplification to the consumer hot path.
+
+An unknown group has no Cursus series. Cursus does not fabricate a zero-valued
+group because it does not know which application groups are required. Use an
+external cluster-config catalog to fill that missing actual state with zero.
+See the [consumer lifecycle alert runbook](../operations/consumer-lifecycle-alerts.md)
+for the catalog contract, alert rules, and a `1 -> 0 -> 1` canary procedure.
 
 Lag uses the high watermark rather than the local log end so uncommitted replica
 tail data is not reported as consumable work. For an exact-topic group with no
@@ -222,6 +288,9 @@ cursus_cluster_under_replicated_partitions > 0
 
 # Group commit no longer points into retained data
 cursus_consumer_group_offset_out_of_range == 1
+
+# The converged broker set has no single authoritative group coordinator
+sum by (topic, group) (cursus_consumer_group_coordinator_up) != 1
 
 # Sustained consumer backlog
 max_over_time(cursus_consumer_group_lag[10m]) > 10000

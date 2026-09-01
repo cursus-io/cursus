@@ -89,9 +89,7 @@ func TestBrokerFSMDeleteFailureCommitsDesiredStateAndReconciles(t *testing.T) {
 	require.NoError(t, err)
 
 	result := f.Apply(&raft.Log{Data: []byte("TOPIC_DELETE:" + string(payload)), Index: 1})
-	applyErr, ok := result.(error)
-	require.True(t, ok)
-	require.ErrorContains(t, applyErr, "delete local topic")
+	require.Equal(t, topic.DeleteResult{Deleted: true, CleanupPending: true}, result)
 	require.Nil(t, f.GetPartitionMetadata("orders-0"))
 	require.Nil(t, f.topicState["orders"])
 	require.NotNil(t, manager.GetTopic("orders"))
