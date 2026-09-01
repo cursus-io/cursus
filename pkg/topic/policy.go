@@ -17,13 +17,14 @@ const (
 )
 
 type Policy struct {
-	RetentionHours int      `json:"retention_hours,omitempty"`
-	RetentionBytes int64    `json:"retention_bytes,omitempty"`
-	CleanupPolicy  string   `json:"cleanup_policy"`
-	Partitioner    string   `json:"partitioner"`
-	AuthPolicy     string   `json:"auth_policy"`
-	ReadACL        []string `json:"read_acl,omitempty"`
-	WriteACL       []string `json:"write_acl,omitempty"`
+	RetentionHours    int      `json:"retention_hours,omitempty"`
+	RetentionBytes    int64    `json:"retention_bytes,omitempty"`
+	CleanupPolicy     string   `json:"cleanup_policy"`
+	Partitioner       string   `json:"partitioner"`
+	AuthPolicy        string   `json:"auth_policy"`
+	ReadACL           []string `json:"read_acl,omitempty"`
+	WriteACL          []string `json:"write_acl,omitempty"`
+	MinInSyncReplicas *int     `json:"min_in_sync_replicas,omitempty"`
 }
 
 func DefaultPolicy() Policy {
@@ -46,6 +47,7 @@ func ConsumerMetadataPolicy() Policy {
 }
 
 func (p Policy) Normalize() (Policy, error) {
+	p = p.Clone()
 	if p.CleanupPolicy == "" {
 		p.CleanupPolicy = config.CleanupPolicyDelete
 	}
@@ -81,7 +83,34 @@ func (p Policy) Normalize() (Policy, error) {
 	if p.RetentionBytes < 0 {
 		return p, fmt.Errorf("retention_bytes must be >= 0")
 	}
+	if p.MinInSyncReplicas != nil && *p.MinInSyncReplicas < 1 {
+		return p, fmt.Errorf("min_in_sync_replicas must be >= 1")
+	}
 	return p, nil
+}
+
+// Clone returns a detached policy so optional values and ACL slices cannot
+// alias durable topic state.
+func (p Policy) Clone() Policy {
+	p.ReadACL = append([]string(nil), p.ReadACL...)
+	p.WriteACL = append([]string(nil), p.WriteACL...)
+	if p.MinInSyncReplicas != nil {
+		value := *p.MinInSyncReplicas
+		p.MinInSyncReplicas = &value
+	}
+	return p
+}
+
+// EffectiveMinInSyncReplicas resolves the topic override against the broker
+// default. Invalid broker defaults are treated as one at the usage boundary.
+func (p Policy) EffectiveMinInSyncReplicas(brokerDefault int) int {
+	if p.MinInSyncReplicas != nil {
+		return *p.MinInSyncReplicas
+	}
+	if brokerDefault < 1 {
+		return 1
+	}
+	return brokerDefault
 }
 
 func validateCleanupPolicyForTopic(policy Policy, cfg *config.Config, eventSourcing bool) error {

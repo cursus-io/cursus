@@ -7,7 +7,10 @@ import (
 	"io"
 	"testing"
 
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
@@ -24,6 +27,8 @@ func TestBrokerFSMSnapshotRestoresTopicDefinition(t *testing.T) {
 		RetentionHours: 48,
 		RetentionBytes: 8192,
 	}
+	minISR := 1
+	policy.MinInSyncReplicas = &minISR
 	command := TopicCommand{
 		Name:              "orders",
 		Partitions:        2,
@@ -57,9 +62,116 @@ func TestBrokerFSMSnapshotRestoresTopicDefinition(t *testing.T) {
 	require.Equal(t, []string{"writer"}, restoredTopic.Policy.WriteACL)
 	require.Equal(t, 48, restoredTopic.Policy.RetentionHours)
 	require.Equal(t, int64(8192), restoredTopic.Policy.RetentionBytes)
+	require.NotNil(t, restoredTopic.Policy.MinInSyncReplicas)
+	require.Equal(t, 1, *restoredTopic.Policy.MinInSyncReplicas)
 	require.Equal(t, 1, restoredTopic.ReplicationFactor)
 	require.Equal(t, uint64(1), restoredTopic.Revision)
 	require.Equal(t, uint64(topic.InitialLifecycleEpoch), restoredTopic.LifecycleEpoch)
+}
+
+func TestBrokerFSMSnapshotRestoresAlteredTopicMinInSyncReplicas(t *testing.T) {
+	f := newTestFSM()
+	for _, brokerID := range []string{"broker-1", "broker-2", "broker-3"} {
+		registerActiveBroker(t, f, brokerID)
+	}
+	create, err := json.Marshal(TopicCommand{
+		Name:              "orders",
+		Partitions:        1,
+		ReplicationFactor: 3,
+		Policy:            topic.DefaultPolicy(),
+	})
+	require.NoError(t, err)
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 4}))
+	configured := 2
+	alter, err := json.Marshal(TopicConfigCommand{Name: "orders", MinInSyncReplicas: &configured})
+	require.NoError(t, err)
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte("TOPIC_CONFIG:" + string(alter)), Index: 5}))
+
+	snapshot, err := f.Snapshot()
+	require.NoError(t, err)
+	buffer := new(bytes.Buffer)
+	require.NoError(t, snapshot.Persist(&MockSnapshotSink{Writer: buffer}))
+	restored := newTestFSM()
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(buffer.Bytes()))))
+	restoredTopic := restored.tm.GetTopic("orders")
+	require.NotNil(t, restoredTopic.Policy.MinInSyncReplicas)
+	require.Equal(t, 2, *restoredTopic.Policy.MinInSyncReplicas)
+}
+
+func TestBrokerFSMRestorePreservesLegacyTailWithoutCommittedHWMField(t *testing.T) {
+	manager, partition := newDurableFSMTopic(t, "legacy-orders")
+	require.NoError(t, partition.EnqueueSync(types.Message{Payload: "legacy-committed"}))
+	partition.FlushDisk()
+
+	definition := manager.GetTopic("legacy-orders").Definition()
+	state := BrokerFSMState{
+		Version:    6,
+		TopicState: map[string]*topic.Definition{"legacy-orders": &definition},
+		PartitionMetadata: map[string]*PartitionMetadata{
+			"legacy-orders-0": {
+				Leader: "broker-1", LeaderEpoch: 7, PartitionCount: 1,
+				Replicas: []string{"broker-1"}, ISR: []string{"broker-1"},
+			},
+		},
+	}
+	data, err := json.Marshal(state)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "committed_hwm")
+
+	restored := NewBrokerFSM(manager, nil)
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(data))))
+	require.Equal(t, uint64(1), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM())
+	messages, err := partition.ReadCommitted(0, 10)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+}
+
+func TestBrokerFSMRestoreTruncatesTailBeyondExplicitCommittedHWMZero(t *testing.T) {
+	manager, partition := newDurableFSMTopic(t, "current-orders")
+	uncommitted := []types.Message{{Payload: "uncommitted"}}
+	require.NoError(t, partition.EnqueueBatchLeader(uncommitted))
+	partition.FlushDisk()
+	require.Equal(t, uint64(1), partition.NextOffset())
+
+	definition := manager.GetTopic("current-orders").Definition()
+	state := BrokerFSMState{
+		Version:    6,
+		TopicState: map[string]*topic.Definition{"current-orders": &definition},
+		PartitionMetadata: map[string]*PartitionMetadata{
+			"current-orders-0": {
+				Leader: "broker-1", LeaderEpoch: 7, CommittedHWMKnown: true, PartitionCount: 1,
+				Replicas: []string{"broker-1"}, ISR: []string{"broker-1"},
+			},
+		},
+	}
+	data, err := json.Marshal(state)
+	require.NoError(t, err)
+	require.Contains(t, string(data), `"committed_hwm":0`)
+
+	restored := NewBrokerFSM(manager, nil)
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(data))))
+	require.Zero(t, partition.NextOffset())
+	require.Zero(t, partition.GetHWM())
+	messages, err := partition.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Empty(t, messages)
+}
+
+func newDurableFSMTopic(t *testing.T, name string) (*topic.TopicManager, *topic.Partition) {
+	t.Helper()
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 1
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	manager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, manager.CreateTopic(name, 1, false, false))
+	partition, err := manager.GetTopic(name).GetPartition(0)
+	require.NoError(t, err)
+	t.Cleanup(partition.Close)
+	return manager, partition
 }
 
 func TestBrokerFSMPatchCommandsMergeAgainstSerializedAuthoritativeState(t *testing.T) {
@@ -122,6 +234,9 @@ func TestBrokerFSMRepeatedCreatePreservesExistingPartitionState(t *testing.T) {
 	f.partitionMetadata["orders-0"].CommittedHWM = 41
 	f.partitionMetadata["orders-0"].LeaderEpoch = 7
 	f.mu.Unlock()
+	partition, err := f.tm.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	partition.UpdateLEO(41)
 
 	updated := initial
 	updated.Partitions = 2

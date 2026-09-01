@@ -54,7 +54,7 @@ func (ch *CommandHandler) filterVisibleTopics(names []string, clientCtx *ClientC
 			visible = append(visible, name)
 			continue
 		}
-		if t.Policy.CanReadPrincipal(principalFromContext(clientCtx)) {
+		if t.PolicySnapshot().CanReadPrincipal(principalFromContext(clientCtx)) {
 			visible = append(visible, name)
 		}
 	}
@@ -102,11 +102,12 @@ func (ch *CommandHandler) handleDescribeTopic(cmd string, ctx ...*ClientContext)
 		Policy     topic.Policy        `json:"policy"`
 	}
 
+	definition := t.Definition()
 	meta := TopicMetadata{
 		Status:     "OK",
 		Topic:      topicName,
-		Definition: t.Definition(),
-		Policy:     t.Policy,
+		Definition: definition,
+		Policy:     definition.Policy,
 	}
 
 	var raftLeader string
@@ -164,7 +165,8 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
 
-	partitionCount := len(t.Partitions)
+	definition := t.Definition()
+	partitionCount := definition.Partitions
 	leaders := make([]string, partitionCount)
 	epochs := make([]string, partitionCount)
 
@@ -181,10 +183,9 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 		}
 	}
 
-	definition := t.Definition()
-	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d revision=%d replication_factor=%d idempotent=%t event_sourcing=%t lifecycle_epoch=%d",
+	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d revision=%d replication_factor=%d idempotent=%t event_sourcing=%t lifecycle_epoch=%d %s",
 		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), definition.Policy.CleanupPolicy, definition.Policy.Partitioner,
 		definition.Policy.AuthPolicy, strings.Join(definition.Policy.ReadACL, ","), strings.Join(definition.Policy.WriteACL, ","),
 		definition.Policy.RetentionHours, definition.Policy.RetentionBytes, definition.Revision, definition.ReplicationFactor,
-		definition.Idempotent, definition.EventSourcing, definition.LifecycleEpoch)
+		definition.Idempotent, definition.EventSourcing, definition.LifecycleEpoch, ch.topicMinISRMetadata(definition.Policy))
 }

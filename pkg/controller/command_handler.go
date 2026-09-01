@@ -44,6 +44,18 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 		return patchErr
 	}
 	defaults := topic.DefaultDefinition(topicName, ch.Config)
+	validationReplicationFactor := defaults.ReplicationFactor
+	if patch.ReplicationFactor != nil {
+		validationReplicationFactor = *patch.ReplicationFactor
+	}
+	if existing := ch.TopicManager.GetTopic(topicName); existing != nil {
+		validationReplicationFactor = ch.topicReplicationFactor(topicName)
+	} else if !ch.isDistributed() {
+		validationReplicationFactor = 1
+	}
+	if patch.MinInSyncReplicas != nil && *patch.MinInSyncReplicas > validationReplicationFactor {
+		return fmt.Sprintf("ERROR: invalid_min_in_sync_replicas value=%d replication_factor=%d", *patch.MinInSyncReplicas, validationReplicationFactor)
+	}
 
 	tm := ch.TopicManager
 	if ch.isDistributed() {
@@ -87,7 +99,8 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 			util.Warn("Failed to register default group with coordinator: %v", err)
 		}
 	}
-	return formatTopicDefinitionResponse(t.Definition())
+	definition := t.Definition()
+	return formatTopicDefinitionResponse(definition) + " " + ch.topicMinISRMetadata(definition.Policy)
 }
 
 func distributedTopicCommandPayload(defaults topic.Definition, patch topic.DefinitionPatch, current *topic.Definition) (map[string]interface{}, error) {
@@ -100,6 +113,9 @@ func distributedTopicCommandPayload(defaults topic.Definition, patch topic.Defin
 	legacyDefinition, err := topic.MergeDefinitionPatch(base, patch, existing)
 	if err != nil {
 		return nil, err
+	}
+	if legacyDefinition.Policy.MinInSyncReplicas != nil && *legacyDefinition.Policy.MinInSyncReplicas > legacyDefinition.ReplicationFactor {
+		return nil, fmt.Errorf("min_in_sync_replicas %d exceeds replication factor %d", *legacyDefinition.Policy.MinInSyncReplicas, legacyDefinition.ReplicationFactor)
 	}
 	return map[string]interface{}{
 		"name":               legacyDefinition.Name,
@@ -142,6 +158,13 @@ func parseTopicDefinitionPatch(args map[string]string) (topic.DefinitionPatch, s
 			return patch, fmt.Sprintf("ERROR: invalid_event_sourcing value=%q", value)
 		}
 		patch.EventSourcing = &parsed
+	}
+	if value, ok := args["min_in_sync_replicas"]; ok {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			return patch, fmt.Sprintf("ERROR: invalid_min_in_sync_replicas value=%s", value)
+		}
+		patch.MinInSyncReplicas = &parsed
 	}
 	if value, ok := args["cleanup_policy"]; ok {
 		if _, valid := config.NormalizeCleanupPolicy(value); !valid {
@@ -208,6 +231,8 @@ func formatCreateTopicError(topicName string, err error) string {
 		return `ERROR: unsupported_topic_policy field=cleanup_policy reason="compaction is not supported in distributed mode"`
 	case strings.Contains(reason, "cleanup policy compact is not supported for event-sourcing topics"):
 		return `ERROR: invalid_topic_policy field=cleanup_policy reason="compaction is not supported for event-sourcing topics"`
+	case strings.Contains(reason, "min_in_sync_replicas"):
+		return fmt.Sprintf("ERROR: invalid_min_in_sync_replicas reason=%q", reason)
 	case strings.Contains(reason, "invalid cleanup policy"),
 		strings.Contains(reason, "invalid partitioner"),
 		strings.Contains(reason, "invalid auth policy"),
@@ -812,7 +837,7 @@ func (ch *CommandHandler) handleListOffsets(cmd string, ctx *ClientContext) stri
 	if t == nil {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	if authResp := ch.authorizeTopicRead(t.Policy, ctx); authResp != "" {
+	if authResp := ch.authorizeTopicRead(t.PolicySnapshot(), ctx); authResp != "" {
 		return fmt.Sprintf("%s topic=%s", authResp, topicName)
 	}
 

@@ -31,9 +31,18 @@ func (m *MockRaftManagerForForward) GetLeaderAddress() string {
 	}
 	return addr.(string)
 }
-func (m *MockRaftManagerForForward) ApplyCommand(prefix string, data []byte) error { return nil }
-func (m *MockRaftManagerForForward) LeaderCh() <-chan bool                         { return nil }
-func (m *MockRaftManagerForForward) GetFSM() *fsm.BrokerFSM                        { return m.state }
+func (m *MockRaftManagerForForward) ApplyCommand(prefix string, data []byte) error {
+	if m.state == nil {
+		return nil
+	}
+	result := m.state.Apply(&raft.Log{Data: append([]byte(prefix+":"), data...)})
+	if err, ok := result.(error); ok {
+		return err
+	}
+	return nil
+}
+func (m *MockRaftManagerForForward) LeaderCh() <-chan bool  { return nil }
+func (m *MockRaftManagerForForward) GetFSM() *fsm.BrokerFSM { return m.state }
 func (m *MockRaftManagerForForward) GetRaftStatus() (replication.RaftStatus, error) {
 	return m.raftStatus, m.raftStatusErr
 }
@@ -78,5 +87,14 @@ func TestCommandHandler_isLeaderAndForward_WaitRetry(t *testing.T) {
 	}
 	if err != nil {
 		t.Errorf("Expected nil error (handled via response string), got %v", err)
+	}
+}
+
+func TestWireErrorCodeRequiresExactErrorToken(t *testing.T) {
+	if got := wireErrorCode("ERROR: PARTITION_LEADER_FENCED current=node2"); got != "PARTITION_LEADER_FENCED" {
+		t.Fatalf("wireErrorCode() = %q", got)
+	}
+	if got := wireErrorCode("ERROR: raft_apply_failed reason=PARTITION_LEADER_FENCED"); got != "RAFT_APPLY_FAILED" {
+		t.Fatalf("wireErrorCode() matched an embedded reason: %q", got)
 	}
 }

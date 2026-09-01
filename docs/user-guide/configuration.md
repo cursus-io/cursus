@@ -187,8 +187,8 @@ These values participate in active broker behavior:
 | Parameter | Default | Purpose |
 |---|---:|---|
 | `bootstrap_servers` | empty | Initial broker addresses for distributed discovery. |
-| `acks` | empty/default path | Broker publish acknowledgement selection. |
-| `min_insync_replicas` | 2 | Minimum in-sync replicas required by quorum writes. |
+| `acks` | empty/default path | Publish request/publisher acknowledgement selection; not topic metadata. |
+| `min_insync_replicas` | 2 | Broker fallback minimum for `acks=all`/`-1` when a topic has no `min_in_sync_replicas` override. |
 | `replication_factor` | 3 | Requested topic replica count when distribution is enabled. |
 | `internal_broker_port` | 0 | Dedicated broker-to-broker command listener; configure in production clusters. |
 | `internal_auth_token` | empty | Shared internal command credential; required unless mTLS identity is authoritative. |
@@ -197,6 +197,8 @@ These values participate in active broker behavior:
 | `producer_state_ttl_ms` | 1800000 | In-memory producer state cleanup window; durable records/checkpoints remain recovery sources. |
 
 Distribution is disabled by default. Production clusters should use a dedicated internal listener, mTLS, least-privilege client users, and explicit advertised addresses.
+
+Topic creation can set `min_in_sync_replicas=<N>` with `1 <= N <= replication_factor`. `ALTER_TOPIC_CONFIG topic=<name> min_in_sync_replicas=<N|default>` changes or removes that optional durable override. Old topic metadata without the field continues to use the broker fallback. Idempotent publishers require `acks=all` or `acks=-1`; the SDK and broker reject weaker combinations rather than silently changing them.
 # Using Configuration in Different Scenarios
 
 ## Scenario 1: Development with Defaults

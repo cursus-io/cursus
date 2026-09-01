@@ -315,6 +315,12 @@ func batchHasTransactionalMessages(msgs []types.Message) bool {
 
 // EnqueueBatchSync pushes multiple messages into the partition queue synchronously.
 func (p *Partition) EnqueueBatchSync(msgs []types.Message) error {
+	return p.EnqueueBatchSyncWithMode(msgs, false)
+}
+
+// EnqueueBatchSyncWithMode durably appends a standalone batch and can enforce
+// producer sequencing even when the topic itself is not idempotent.
+func (p *Partition) EnqueueBatchSyncWithMode(msgs []types.Message, forceIdempotent bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -323,7 +329,7 @@ func (p *Partition) EnqueueBatchSync(msgs []types.Message) error {
 	}
 
 	for i := range msgs {
-		duplicate, err := p.validateProducerMessage(&msgs[i])
+		duplicate, err := p.validateProducerMessageWithStage(&msgs[i], nil, forceIdempotent)
 		if err != nil {
 			return err
 		}
@@ -338,7 +344,7 @@ func (p *Partition) EnqueueBatchSync(msgs []types.Message) error {
 			return fmt.Errorf("disk write failed for partition %d: %w", p.id, err)
 		}
 
-		p.updateProducerState(&msgs[i])
+		p.updateProducerStateWithMode(&msgs[i], forceIdempotent)
 		msgs[i].Offset = offset
 		p.indexTransactionMessage(msgs[i])
 		p.LEO.Store(offset + 1)
@@ -386,6 +392,12 @@ func (p *Partition) EnqueueBatch(msgs []types.Message) error {
 // Used by the partition leader in cluster mode. HWM is updated separately after
 // successful replication, ensuring consumers never read unreplicated messages.
 func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
+	return p.EnqueueBatchLeaderWithMode(msgs, false)
+}
+
+// EnqueueBatchLeaderWithMode appends leader records without advancing HWM and
+// can enforce producer sequencing for request-level idempotence.
+func (p *Partition) EnqueueBatchLeaderWithMode(msgs []types.Message, forceIdempotent bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -404,7 +416,7 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 	pending := make([]pendingLeaderMessage, 0, len(msgs))
 	diskBatch := make([]types.DiskMessage, 0, len(msgs))
 	staged := make(map[string]stagedProducerEntry)
-	forceIdempotent := batchHasTransactionalMessages(msgs)
+	forceIdempotent = forceIdempotent || batchHasTransactionalMessages(msgs)
 
 	for i := range msgs {
 		duplicate, err := p.validateProducerMessageWithStage(&msgs[i], staged, forceIdempotent)
@@ -480,9 +492,17 @@ func (p *Partition) AdvanceHWM() {
 	p.setHWMLocked(p.LEO.Load())
 }
 
-// ReplicaAppend writes messages with pre-assigned offsets from the leader (follower replication).
-// It preserves the leader's offset assignments and updates LEO/HWM accordingly.
+// ReplicaAppend writes messages with pre-assigned offsets from the leader
+// (follower replication). It preserves the leader's offset assignments and
+// updates LEO; committed HWM advances separately.
 func (p *Partition) ReplicaAppend(msgs []types.Message) error {
+	return p.ReplicaAppendWithMode(msgs, false)
+}
+
+// ReplicaAppendWithMode preserves request-level producer sequencing on a
+// follower so promotion does not forget idempotent records from a
+// non-idempotent topic.
+func (p *Partition) ReplicaAppendWithMode(msgs []types.Message, forceIdempotent bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -527,7 +547,7 @@ func (p *Partition) ReplicaAppend(msgs []types.Message) error {
 		return fmt.Errorf("replica batch append failed: %w", err)
 	}
 	for _, i := range pending {
-		p.updateProducerStateWithMode(&msgs[i], msgs[i].TransactionalID != "")
+		p.updateProducerStateWithMode(&msgs[i], forceIdempotent || msgs[i].TransactionalID != "")
 		p.indexTransactionMessage(msgs[i])
 	}
 	if len(pending) > 0 {
@@ -592,6 +612,48 @@ func (p *Partition) NotifyNewMessage() {
 
 func (p *Partition) ReadMessages(offset uint64, max int) ([]types.Message, error) {
 	return p.dh.ReadMessages(offset, max)
+}
+
+// ProducerSequenceOffset resolves the durable offset originally assigned to an
+// idempotent producer sequence. It is used only on duplicate acknowledgements,
+// where returning the current log tail would acknowledge the wrong record.
+func (p *Partition) ProducerSequenceOffset(producerID string, epoch int64, seqNum uint64) (uint64, bool, error) {
+	if producerID == "" || seqNum == 0 {
+		return 0, false, nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	first := p.dh.GetFirstOffset()
+	limit := p.LEO.Load()
+	offset := first
+	const batchSize = 1024
+	for offset < limit {
+		messages, err := p.dh.ReadMessages(offset, batchSize)
+		if err != nil {
+			return 0, false, err
+		}
+		if len(messages) == 0 {
+			break
+		}
+		for _, message := range messages {
+			if message.Offset >= limit {
+				return 0, false, nil
+			}
+			if message.ProducerID == producerID && message.Epoch == epoch && message.SeqNum == seqNum {
+				return message.Offset, true, nil
+			}
+			next := message.Offset + 1
+			if next <= offset {
+				next = offset + 1
+			}
+			offset = next
+		}
+		if len(messages) < batchSize {
+			break
+		}
+	}
+	return 0, false, nil
 }
 
 // LastStableOffset returns the first offset that may still be blocked by an

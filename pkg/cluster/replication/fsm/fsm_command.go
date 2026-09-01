@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -13,15 +14,72 @@ import (
 	"github.com/cursus-io/cursus/util"
 )
 
+var ErrPartitionCommitFenced = errors.New("partition commit fenced")
+
 type PartitionMetadata struct {
+	Leader       string   `json:"leader"`
+	Replicas     []string `json:"replicas"`
+	ISR          []string `json:"isr"`
+	LeaderEpoch  int      `json:"leader_epoch"`
+	CommittedHWM uint64   `json:"-"`
+	// CommittedHWMKnown distinguishes metadata written before the committed
+	// watermark existed from a real committed watermark of zero. It is an
+	// in-memory compatibility marker; the presence of committed_hwm on the
+	// wire is authoritative.
+	CommittedHWMKnown bool   `json:"-"`
+	PartitionCount    int    `json:"partition_count"`
+	Idempotent        bool   `json:"idempotent"`
+	LifecycleEpoch    uint64 `json:"lifecycle_epoch,omitempty"`
+}
+
+type partitionMetadataJSON struct {
 	Leader         string   `json:"leader"`
 	Replicas       []string `json:"replicas"`
 	ISR            []string `json:"isr"`
 	LeaderEpoch    int      `json:"leader_epoch"`
-	CommittedHWM   uint64   `json:"committed_hwm"`
+	CommittedHWM   *uint64  `json:"committed_hwm,omitempty"`
 	PartitionCount int      `json:"partition_count"`
 	Idempotent     bool     `json:"idempotent"`
 	LifecycleEpoch uint64   `json:"lifecycle_epoch,omitempty"`
+}
+
+func (m PartitionMetadata) MarshalJSON() ([]byte, error) {
+	var committed *uint64
+	if m.CommittedHWMKnown || m.CommittedHWM != 0 {
+		value := m.CommittedHWM
+		committed = &value
+	}
+	return json.Marshal(partitionMetadataJSON{
+		Leader:         m.Leader,
+		Replicas:       m.Replicas,
+		ISR:            m.ISR,
+		LeaderEpoch:    m.LeaderEpoch,
+		CommittedHWM:   committed,
+		PartitionCount: m.PartitionCount,
+		Idempotent:     m.Idempotent,
+		LifecycleEpoch: m.LifecycleEpoch,
+	})
+}
+
+func (m *PartitionMetadata) UnmarshalJSON(data []byte) error {
+	var decoded partitionMetadataJSON
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*m = PartitionMetadata{
+		Leader:            decoded.Leader,
+		Replicas:          decoded.Replicas,
+		ISR:               decoded.ISR,
+		LeaderEpoch:       decoded.LeaderEpoch,
+		PartitionCount:    decoded.PartitionCount,
+		Idempotent:        decoded.Idempotent,
+		LifecycleEpoch:    decoded.LifecycleEpoch,
+		CommittedHWMKnown: decoded.CommittedHWM != nil,
+	}
+	if decoded.CommittedHWM != nil {
+		m.CommittedHWM = *decoded.CommittedHWM
+	}
+	return nil
 }
 
 type TopicCommand struct {
@@ -34,6 +92,12 @@ type TopicCommand struct {
 	Policy            topic.Policy           `json:"policy,omitempty"`
 	Definition        *topic.Definition      `json:"definition,omitempty"`
 	Patch             *topic.DefinitionPatch `json:"patch,omitempty"`
+}
+
+type TopicConfigCommand struct {
+	Name                   string `json:"name"`
+	MinInSyncReplicas      *int   `json:"min_in_sync_replicas,omitempty"`
+	ResetMinInSyncReplicas bool   `json:"reset_min_in_sync_replicas,omitempty"`
 }
 
 func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
@@ -159,6 +223,13 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			util.Warn("FSM: Requested RF %d exceeds active brokers %d. Capping to %d", replicationFactor, len(brokers), len(brokers))
 			replicationFactor = len(brokers)
 		}
+		if definition.Policy.MinInSyncReplicas != nil && *definition.Policy.MinInSyncReplicas > replicationFactor {
+			return fmt.Errorf(
+				"min_in_sync_replicas %d exceeds replication factor %d",
+				*definition.Policy.MinInSyncReplicas,
+				replicationFactor,
+			)
+		}
 
 		ring := util.NewConsistentHashRing(150, nil)
 		ring.Add(brokers...)
@@ -205,13 +276,14 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			isrCopy := append([]string(nil), replicas...)
 
 			stagedPartitions[key] = &PartitionMetadata{
-				PartitionCount: definition.Partitions,
-				Leader:         assignedLeader,
-				LeaderEpoch:    1,
-				Idempotent:     definition.Idempotent,
-				LifecycleEpoch: definition.LifecycleEpoch,
-				Replicas:       replicas,
-				ISR:            isrCopy,
+				PartitionCount:    definition.Partitions,
+				Leader:            assignedLeader,
+				LeaderEpoch:       1,
+				CommittedHWMKnown: true,
+				Idempotent:        definition.Idempotent,
+				LifecycleEpoch:    definition.LifecycleEpoch,
+				Replicas:          replicas,
+				ISR:               isrCopy,
 			}
 			util.Info("FSM: Assigned leader %s to partition %s (replicas=%v)", assignedLeader, key, replicas)
 		}
@@ -231,6 +303,74 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		return err
 	}
 	util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, appliedDefinition.Partitions)
+	return nil
+}
+
+func (f *BrokerFSM) applyTopicConfigCommand(jsonData string) interface{} {
+	var command TopicConfigCommand
+	if err := json.Unmarshal([]byte(jsonData), &command); err != nil {
+		return fmt.Errorf("unmarshal topic config: %w", err)
+	}
+	if err := topic.ValidateName(command.Name); err != nil {
+		return fmt.Errorf("invalid topic name: %w", err)
+	}
+	if command.ResetMinInSyncReplicas && command.MinInSyncReplicas != nil {
+		return fmt.Errorf("min_in_sync_replicas set and reset are mutually exclusive")
+	}
+	if !command.ResetMinInSyncReplicas && command.MinInSyncReplicas == nil {
+		return fmt.Errorf("min_in_sync_replicas is required")
+	}
+
+	f.mu.RLock()
+	current := copyTopicDefinition(f.topicState[command.Name])
+	replicationFactor := 0
+	if current != nil {
+		for partition := 0; partition < current.Partitions; partition++ {
+			metadata := f.partitionMetadata[command.Name+"-"+strconv.Itoa(partition)]
+			if metadata == nil || len(metadata.Replicas) == 0 {
+				replicationFactor = 0
+				break
+			}
+			if replicationFactor == 0 || len(metadata.Replicas) < replicationFactor {
+				replicationFactor = len(metadata.Replicas)
+			}
+		}
+	}
+	f.mu.RUnlock()
+	if current == nil {
+		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, command.Name)
+	}
+	if replicationFactor < 1 {
+		return fmt.Errorf("replication factor unavailable for topic %q", command.Name)
+	}
+
+	var value *int
+	if !command.ResetMinInSyncReplicas {
+		valueCopy := *command.MinInSyncReplicas
+		if valueCopy < 1 || valueCopy > replicationFactor {
+			return fmt.Errorf(
+				"min_in_sync_replicas must be between 1 and replication factor %d",
+				replicationFactor,
+			)
+		}
+		value = &valueCopy
+	}
+	updated, err := topic.UpdateDefinitionMinInSyncReplicas(*current, value)
+	if err != nil {
+		return fmt.Errorf("invalid topic definition: %w", err)
+	}
+
+	f.mu.Lock()
+	latest := f.topicState[command.Name]
+	if latest == nil || latest.Revision != current.Revision || latest.LifecycleEpoch != current.LifecycleEpoch {
+		f.mu.Unlock()
+		return fmt.Errorf("%w for topic %q: authoritative definition changed during config update", topic.ErrTopicRevisionConflict, command.Name)
+	}
+	f.topicState[command.Name] = copyTopicDefinition(&updated)
+	f.mu.Unlock()
+	if err := f.materializeTopicCreate(&updated); err != nil {
+		return fmt.Errorf("materialize topic config: %w", err)
+	}
 	return nil
 }
 
@@ -256,6 +396,10 @@ func legacyTopicDefinitionPatch(definition topic.Definition, includeReplicationF
 	if includeReplicationFactor {
 		replicationFactor := definition.ReplicationFactor
 		patch.ReplicationFactor = &replicationFactor
+	}
+	if definition.Policy.MinInSyncReplicas != nil {
+		minInSyncReplicas := *definition.Policy.MinInSyncReplicas
+		patch.MinInSyncReplicas = &minInSyncReplicas
 	}
 	return patch
 }
@@ -307,17 +451,6 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
 		}
 	}
-	if coordinatorRef != nil {
-		if _, err := coordinatorRef.DeleteInactiveGroupsForTopic(payload.Topic); err != nil {
-			return fmt.Errorf("delete consumer groups for topic %q: %w", payload.Topic, err)
-		}
-	}
-	if transactionManager != nil {
-		if _, err := transactionManager.PruneTopicReferences(payload.Topic); err != nil {
-			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
-		}
-	}
-
 	f.mu.Lock()
 	for key := range f.partitionMetadata {
 		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
@@ -406,17 +539,6 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
 		}
 	}
-	if coordinatorRef != nil {
-		if _, err := coordinatorRef.DeleteInactiveGroupsForTopic(payload.Topic); err != nil {
-			return fmt.Errorf("delete consumer groups for topic %q: %w", payload.Topic, err)
-		}
-	}
-	if transactionManager != nil {
-		if _, err := transactionManager.PruneTopicReferences(payload.Topic); err != nil {
-			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
-		}
-	}
-
 	target := *current
 	target.Revision++
 	target.LifecycleEpoch++
@@ -437,6 +559,7 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 			return fmt.Errorf("leader epoch overflow for partition %q", key)
 		}
 		metadata.CommittedHWM = 0
+		metadata.CommittedHWMKnown = true
 		metadata.LeaderEpoch++
 		metadata.LifecycleEpoch = target.LifecycleEpoch
 	}
@@ -485,9 +608,30 @@ func (f *BrokerFSM) applyPartitionCommand(jsonData string) interface{} {
 		if metadata.Leader != current.Leader && metadata.LeaderEpoch <= current.LeaderEpoch {
 			return fmt.Errorf("leader change for %s must advance epoch: current=%d requested=%d", key, current.LeaderEpoch, metadata.LeaderEpoch)
 		}
-		if metadata.CommittedHWM < current.CommittedHWM {
+		if current.CommittedHWMKnown && !metadata.CommittedHWMKnown {
+			metadata.CommittedHWM = current.CommittedHWM
+			metadata.CommittedHWMKnown = true
+		}
+		if metadata.CommittedHWMKnown && current.CommittedHWMKnown && metadata.CommittedHWM < current.CommittedHWM {
 			return fmt.Errorf("committed HWM regression for %s: current=%d requested=%d", key, current.CommittedHWM, metadata.CommittedHWM)
 		}
+		currentLifecycleEpoch := current.LifecycleEpoch
+		if currentLifecycleEpoch == 0 {
+			currentLifecycleEpoch = topic.InitialLifecycleEpoch
+		}
+		requestedLifecycleEpoch := metadata.LifecycleEpoch
+		if requestedLifecycleEpoch == 0 {
+			if currentLifecycleEpoch > topic.InitialLifecycleEpoch {
+				return fmt.Errorf("missing topic lifecycle epoch for %s", key)
+			}
+			requestedLifecycleEpoch = topic.InitialLifecycleEpoch
+		}
+		if requestedLifecycleEpoch != currentLifecycleEpoch {
+			return fmt.Errorf("stale topic lifecycle epoch for %s: current=%d requested=%d", key, currentLifecycleEpoch, requestedLifecycleEpoch)
+		}
+		metadata.LifecycleEpoch = requestedLifecycleEpoch
+	} else if metadata.LifecycleEpoch == 0 {
+		metadata.LifecycleEpoch = topic.InitialLifecycleEpoch
 	}
 	f.partitionMetadata[key] = &metadata
 	util.Debug("FSM: Updated partition metadata for %s", key)
@@ -518,11 +662,11 @@ func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
 	}
 	if cmd.Leader != metadata.Leader {
 		f.mu.Unlock()
-		return fmt.Errorf("partition leader fenced for %s: current=%s requested=%s", key, metadata.Leader, cmd.Leader)
+		return fmt.Errorf("%w for %s: current=%s requested=%s", ErrPartitionCommitFenced, key, metadata.Leader, cmd.Leader)
 	}
 	if cmd.LeaderEpoch != metadata.LeaderEpoch {
 		f.mu.Unlock()
-		return fmt.Errorf("stale leader epoch for %s: current=%d requested=%d", key, metadata.LeaderEpoch, cmd.LeaderEpoch)
+		return fmt.Errorf("%w for %s: current_epoch=%d requested_epoch=%d", ErrPartitionCommitFenced, key, metadata.LeaderEpoch, cmd.LeaderEpoch)
 	}
 	if cmd.HWM < metadata.CommittedHWM {
 		f.mu.Unlock()
@@ -542,6 +686,7 @@ func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
 		return fmt.Errorf("stale topic lifecycle epoch for %s: current=%d requested=%d", key, metadataLifecycleEpoch, cmd.LifecycleEpoch)
 	}
 	metadata.CommittedHWM = cmd.HWM
+	metadata.CommittedHWMKnown = true
 	tm := f.tm
 	f.mu.Unlock()
 

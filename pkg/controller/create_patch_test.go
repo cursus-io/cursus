@@ -64,12 +64,14 @@ func TestTopicDefinitionResponsesAppendFieldsAfterLegacyPrefix(t *testing.T) {
 	require.Equal(t, []string{
 		"OK", "topic", "partitions", "cleanup_policy", "partitioner", "auth_policy", "read_acl", "write_acl",
 		"retention_hours", "retention_bytes", "revision", "replication_factor", "idempotent", "event_sourcing", "lifecycle_epoch",
+		"min_in_sync_replicas", "effective_min_in_sync_replicas",
 	}, responseFieldNames(create))
 
 	metadata := handler.HandleCommand("METADATA topic=compat", ctx)
 	require.Equal(t, []string{
 		"OK", "topic", "partitions", "leaders", "epochs", "cleanup_policy", "partitioner", "auth_policy", "read_acl",
 		"write_acl", "retention_hours", "retention_bytes", "revision", "replication_factor", "idempotent", "event_sourcing", "lifecycle_epoch",
+		"min_in_sync_replicas", "effective_min_in_sync_replicas",
 	}, responseFieldNames(metadata))
 }
 

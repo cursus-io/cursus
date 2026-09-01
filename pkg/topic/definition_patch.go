@@ -23,6 +23,7 @@ type DefinitionPatch struct {
 	ReplicationFactor *int      `json:"replication_factor,omitempty"`
 	Idempotent        *bool     `json:"idempotent,omitempty"`
 	EventSourcing     *bool     `json:"event_sourcing,omitempty"`
+	MinInSyncReplicas *int      `json:"min_in_sync_replicas,omitempty"`
 	CleanupPolicy     *string   `json:"cleanup_policy,omitempty"`
 	RetentionHours    *int      `json:"retention_hours,omitempty"`
 	RetentionBytes    *int64    `json:"retention_bytes,omitempty"`
@@ -114,6 +115,10 @@ func MergeDefinitionPatch(current Definition, patch DefinitionPatch, existing bo
 		}
 		next.EventSourcing = *patch.EventSourcing
 	}
+	if patch.MinInSyncReplicas != nil {
+		value := *patch.MinInSyncReplicas
+		next.Policy.MinInSyncReplicas = &value
+	}
 	if patch.CleanupPolicy != nil {
 		next.Policy.CleanupPolicy = *patch.CleanupPolicy
 	}
@@ -143,6 +148,34 @@ func MergeDefinitionPatch(current Definition, patch DefinitionPatch, existing bo
 	if !existing {
 		next.Revision = InitialDefinitionRevision
 		return next, nil
+	}
+	if definitionsEqualWithoutRevision(base, next) {
+		next.Revision = base.Revision
+		return next, nil
+	}
+	if base.Revision == math.MaxUint64 {
+		return current, fmt.Errorf("topic definition revision overflow for %q", base.Name)
+	}
+	next.Revision = base.Revision + 1
+	return next, nil
+}
+
+// UpdateDefinitionMinInSyncReplicas updates or clears the optional durable
+// override while preserving the definition revision contract.
+func UpdateDefinitionMinInSyncReplicas(current Definition, value *int) (Definition, error) {
+	base, err := current.Normalize()
+	if err != nil {
+		return current, err
+	}
+	next := base
+	next.Policy.MinInSyncReplicas = nil
+	if value != nil {
+		copyValue := *value
+		next.Policy.MinInSyncReplicas = &copyValue
+	}
+	next, err = next.Normalize()
+	if err != nil {
+		return current, err
 	}
 	if definitionsEqualWithoutRevision(base, next) {
 		next.Revision = base.Revision

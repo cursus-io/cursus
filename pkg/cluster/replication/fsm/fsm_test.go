@@ -35,6 +35,25 @@ func (m *MockStorageHandler) AppendMessage(topic string, partition int, msg *typ
 func (m *MockStorageHandler) AppendMessageSync(topic string, partition int, msg *types.Message) (uint64, error) {
 	return m.AppendMessage(topic, partition, msg)
 }
+
+func TestPartitionMetadataDistinguishesLegacyMissingHWMFromExplicitZero(t *testing.T) {
+	legacyJSON, err := json.Marshal(PartitionMetadata{Leader: "broker-1", PartitionCount: 1})
+	require.NoError(t, err)
+	require.NotContains(t, string(legacyJSON), "committed_hwm")
+	var legacy PartitionMetadata
+	require.NoError(t, json.Unmarshal(legacyJSON, &legacy))
+	require.False(t, legacy.CommittedHWMKnown)
+
+	currentJSON, err := json.Marshal(PartitionMetadata{
+		Leader: "broker-1", PartitionCount: 1, CommittedHWMKnown: true,
+	})
+	require.NoError(t, err)
+	require.Contains(t, string(currentJSON), `"committed_hwm":0`)
+	var current PartitionMetadata
+	require.NoError(t, json.Unmarshal(currentJSON, &current))
+	require.True(t, current.CommittedHWMKnown)
+	require.Zero(t, current.CommittedHWM)
+}
 func (m *MockStorageHandler) AppendMessageWithOffset(topic string, partition int, msg *types.Message) error {
 	return nil
 }
@@ -181,7 +200,7 @@ func TestBrokerFSM_PartitionCommitIsMonotonicAndEpochFenced(t *testing.T) {
 	staleResult := f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + stale)})
 	staleErr, ok := staleResult.(error)
 	require.True(t, ok)
-	require.Error(t, staleErr)
+	require.ErrorIs(t, staleErr, ErrPartitionCommitFenced)
 	regression := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":4,"hwm":0}`
 	regressionResult := f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + regression)})
 	regressionErr, ok := regressionResult.(error)

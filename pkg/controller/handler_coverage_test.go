@@ -15,6 +15,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -636,10 +637,11 @@ func TestHandlePublishRejectsExternalTransactionMetadata(t *testing.T) {
 }
 func TestHandlePublish_IdempotentTrue(t *testing.T) {
 	ch, tm := newTestHandler(t)
+	ch.Config.MinInSyncReplicas = 1
 	_ = tm.CreateTopic("idem-pub-topic", 1, true, false)
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("PUBLISH topic=idem-pub-topic acks=1 producerId=p1 isIdempotent=true seqNum=1 epoch=1 message=hello", ctx)
+	resp := ch.HandleCommand("PUBLISH topic=idem-pub-topic acks=all producerId=p1 isIdempotent=true seqNum=1 epoch=1 message=hello", ctx)
 	var ack types.AckResponse
 	err := json.Unmarshal([]byte(resp), &ack)
 	require.NoError(t, err)
@@ -1118,6 +1120,7 @@ func TestValidateOwnership_WithCoordinator(t *testing.T) {
 
 func TestHandlePublish_AcksAllVariants(t *testing.T) {
 	ch, tm := newTestHandler(t)
+	ch.Config.MinInSyncReplicas = 1
 	_ = tm.CreateTopic("acks-topic", 1, false, false)
 	ctx := NewClientContext("", 0)
 
@@ -1233,14 +1236,7 @@ func TestHandleBatchMessage_InvalidAcks(t *testing.T) {
 }
 
 func encodeBatchWithCustomAcks(topicName string, partition int, acks string, isIdempotent bool, msgs []types.Message) ([]byte, error) {
-	batch := types.Batch{
-		Topic:        topicName,
-		Partition:    partition,
-		Acks:         acks,
-		IsIdempotent: isIdempotent,
-		Messages:     msgs,
-	}
-	return json.Marshal(batch)
+	return util.EncodeBatchMessages(topicName, partition, acks, isIdempotent, msgs)
 }
 
 func TestHandleCommitAndFetchOffset_AllowsWildcardGroupTopic(t *testing.T) {
@@ -1370,14 +1366,15 @@ func TestTopicPolicy_RoundRobinIgnoresMessageKey(t *testing.T) {
 
 func TestHandlePublish_IdempotentExplicitPartitionUsesPartitionSequences(t *testing.T) {
 	ch, tm := newTestHandler(t)
+	ch.Config.MinInSyncReplicas = 1
 	require.NoError(t, tm.CreateTopic("idem-explicit-partition", 2, true, false))
 	ctx := NewClientContext("", 0)
 
 	commands := []string{
-		"PUBLISH topic=idem-explicit-partition partition=0 acks=1 producerId=p1 isIdempotent=true seqNum=1 epoch=1 message=p0-1",
-		"PUBLISH topic=idem-explicit-partition partition=1 acks=1 producerId=p1 isIdempotent=true seqNum=1 epoch=1 message=p1-1",
-		"PUBLISH topic=idem-explicit-partition partition=0 acks=1 producerId=p1 isIdempotent=true seqNum=2 epoch=1 message=p0-2",
-		"PUBLISH topic=idem-explicit-partition partition=1 acks=1 producerId=p1 isIdempotent=true seqNum=2 epoch=1 message=p1-2",
+		"PUBLISH topic=idem-explicit-partition partition=0 acks=all producerId=p1 isIdempotent=true seqNum=1 epoch=1 message=p0-1",
+		"PUBLISH topic=idem-explicit-partition partition=1 acks=all producerId=p1 isIdempotent=true seqNum=1 epoch=1 message=p1-1",
+		"PUBLISH topic=idem-explicit-partition partition=0 acks=all producerId=p1 isIdempotent=true seqNum=2 epoch=1 message=p0-2",
+		"PUBLISH topic=idem-explicit-partition partition=1 acks=all producerId=p1 isIdempotent=true seqNum=2 epoch=1 message=p1-2",
 	}
 
 	for _, cmd := range commands {
@@ -1697,7 +1694,10 @@ func TestRedactCommandSecrets(t *testing.T) {
 
 	assert.NotContains(t, redacted, "super-secret")
 	assert.Contains(t, redacted, "internal_token=<redacted>")
-	assert.Contains(t, redacted, "payload-value")
+	assert.NotContains(t, redacted, "payload-value")
+	assert.Contains(t, redacted, "payload=<redacted>")
+	assert.Equal(t, "PUBLISH topic=orders message=<redacted>", redactCommandSecrets("PUBLISH topic=orders message=private value with spaces"))
+	assert.Equal(t, "PUBLISH topic=orders message=<redacted>", redactCommandSecrets("PUBLISH topic=orders MESSAGE=private value"))
 }
 
 func TestFormatReplicatedGroupErrorPreservesWireCode(t *testing.T) {

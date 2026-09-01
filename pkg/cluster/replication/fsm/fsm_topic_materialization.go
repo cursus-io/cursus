@@ -173,6 +173,9 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 	} else {
 		err = f.tm.ApplyDefinition(*definition)
 	}
+	if err == nil {
+		err = f.reconcileMaterializedTopicHWM(definition.Name)
+	}
 	f.recordTopicMaterialization(definition.Name, TopicMaterializationCreate, err)
 	if err != nil {
 		return fmt.Errorf("materialize topic %q: %w", definition.Name, err)
@@ -203,6 +206,9 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 	if err == nil && f.tm.IsTruncationPending(definition.Name) {
 		err = f.tm.CompleteTruncation(definition.Name)
 	}
+	if err == nil {
+		err = f.reconcileMaterializedTopicHWM(definition.Name)
+	}
 	f.recordTopicMaterialization(definition.Name, TopicMaterializationRestore, err)
 	if err != nil {
 		return fmt.Errorf("restore local topic %q: %w", definition.Name, err)
@@ -210,12 +216,53 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 	return nil
 }
 
-func (f *BrokerFSM) materializeTopicTruncate(definition *topic.Definition) error {
+func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string) error {
+	if f.tm == nil {
+		return nil
+	}
+	f.mu.RLock()
+	definition := copyTopicDefinition(f.topicState[topicName])
+	metadata := make(map[int]PartitionMetadata)
+	if definition != nil {
+		for partition := 0; partition < definition.Partitions; partition++ {
+			if current := f.partitionMetadata[fmt.Sprintf("%s-%d", topicName, partition)]; current != nil {
+				metadata[partition] = *current
+			}
+		}
+	}
+	f.mu.RUnlock()
 	if definition == nil {
 		return nil
 	}
-	if f.tm == nil {
-		f.recordTopicMaterialization(definition.Name, TopicMaterializationTruncate, nil)
+	currentTopic := f.tm.GetTopic(topicName)
+	if currentTopic == nil {
+		return fmt.Errorf("topic is not materialized")
+	}
+	for partition := 0; partition < definition.Partitions; partition++ {
+		partitionMetadata, ok := metadata[partition]
+		if !ok {
+			// Authoritative restore/apply validation requires this metadata.
+			// A missing entry here can only be a concurrently superseded local
+			// materialization attempt, so leave it to the next desired state.
+			continue
+		}
+		if !partitionMetadata.CommittedHWMKnown {
+			continue
+		}
+		currentPartition, err := currentTopic.GetPartition(partition)
+		if err != nil {
+			return err
+		}
+		if err := currentPartition.ReconcileCommittedHWM(partitionMetadata.CommittedHWM); err != nil {
+			return fmt.Errorf("reconcile partition %d committed HWM: %w", partition, err)
+		}
+		currentPartition.FlushDisk()
+	}
+	return nil
+}
+
+func (f *BrokerFSM) materializeTopicTruncate(definition *topic.Definition) error {
+	if definition == nil {
 		return nil
 	}
 
@@ -228,8 +275,14 @@ func (f *BrokerFSM) materializeTopicTruncate(definition *topic.Definition) error
 		return nil
 	}
 
-	_, err := f.tm.ApplyTruncateDefinition(*definition)
+	var err error
+	if f.tm != nil {
+		_, err = f.tm.ApplyTruncateDefinition(*definition)
+	}
 	if err == nil {
+		err = f.cleanupTopicDependencies(definition.Name)
+	}
+	if err == nil && f.tm != nil {
 		err = f.tm.CompleteTruncation(definition.Name)
 	}
 	f.recordTopicMaterialization(definition.Name, TopicMaterializationTruncate, err)
@@ -244,10 +297,6 @@ func (f *BrokerFSM) materializeTopicDelete(name string) error {
 		f.recordTopicMaterialization(name, TopicMaterializationDelete, nil)
 		return nil
 	}
-	if f.tm == nil {
-		f.recordTopicMaterialization(name, TopicMaterializationDelete, nil)
-		return nil
-	}
 
 	f.materializationMu.Lock()
 	defer f.materializationMu.Unlock()
@@ -259,13 +308,39 @@ func (f *BrokerFSM) materializeTopicDelete(name string) error {
 		return nil
 	}
 
-	deleted, err := f.tm.DeleteTopicDurable(name)
-	if err == nil && !deleted {
-		err = f.tm.CleanupTopicStorage(name)
+	var err error
+	if f.tm != nil {
+		var deleted bool
+		deleted, err = f.tm.DeleteTopicDurable(name)
+		if err == nil && !deleted {
+			err = f.tm.CleanupTopicStorage(name)
+		}
+	}
+	if err == nil {
+		err = f.cleanupTopicDependencies(name)
 	}
 	f.recordTopicMaterialization(name, TopicMaterializationDelete, err)
 	if err != nil {
 		return fmt.Errorf("delete local topic %q: %w", name, err)
+	}
+	return nil
+}
+
+func (f *BrokerFSM) cleanupTopicDependencies(name string) error {
+	f.mu.RLock()
+	coordinatorRef := f.cd
+	transactionManager := f.txn
+	f.mu.RUnlock()
+
+	if coordinatorRef != nil {
+		if _, err := coordinatorRef.DeleteInactiveGroupsForTopic(name); err != nil {
+			return fmt.Errorf("delete consumer groups for topic %q: %w", name, err)
+		}
+	}
+	if transactionManager != nil {
+		if _, err := transactionManager.PruneTopicReferences(name); err != nil {
+			return fmt.Errorf("prune transaction references for topic %q: %w", name, err)
+		}
 	}
 	return nil
 }

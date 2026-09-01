@@ -285,6 +285,34 @@ func (tm *TopicManager) ApplyDefinition(raw Definition) error {
 	tm.topics[definition.Name] = created
 	return nil
 }
+
+// AlterTopicMinInSyncReplicas atomically updates or clears the durable topic
+// override. A nil value clears the override and restores broker fallback.
+func (tm *TopicManager) AlterTopicMinInSyncReplicas(name string, value *int, replicationFactor int) error {
+	if err := ValidateName(name); err != nil {
+		return err
+	}
+	if replicationFactor < 1 {
+		return fmt.Errorf("replication factor must be >= 1")
+	}
+	if value != nil {
+		if *value < 1 || *value > replicationFactor {
+			return fmt.Errorf("min_in_sync_replicas must be between 1 and replication factor %d", replicationFactor)
+		}
+	}
+
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	existing := tm.topics[name]
+	if existing == nil {
+		return fmt.Errorf("%w: %s", ErrTopicNotFound, name)
+	}
+	definition, err := UpdateDefinitionMinInSyncReplicas(existing.Definition(), value)
+	if err != nil {
+		return err
+	}
+	return existing.applyFullDefinition(definition, tm.hp, tm.persistDefinitionLocked)
+}
 func (tm *TopicManager) GetTopic(name string) *Topic {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()

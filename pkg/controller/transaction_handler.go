@@ -133,7 +133,7 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 	if t == nil {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	if authResp := ch.authorizeTopicWrite(t.Policy, clientCtx); authResp != "" {
+	if authResp := ch.authorizeTopicWrite(t.PolicySnapshot(), clientCtx); authResp != "" {
 		return fmt.Sprintf("%s topic=%s", authResp, topicName)
 	}
 	msg := types.Message{Payload: message, ProducerID: producerID, SeqNum: seqNum, Epoch: epoch, Key: args["key"], TransactionalID: txnID, TransactionState: types.TransactionStateOpen}
@@ -386,7 +386,7 @@ func (ch *CommandHandler) validateTransaction(tx *transaction.Transaction) error
 		if t == nil {
 			return fmt.Errorf("topic %s not found", op.Topic)
 		}
-		if !t.Policy.CanWrite() {
+		if !t.PolicySnapshot().CanWrite() {
 			return fmt.Errorf("NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", op.Topic)
 		}
 		if _, err := t.GetPartition(op.Partition); err != nil {
@@ -548,7 +548,7 @@ func touchedTransactionPartitions(tx *transaction.Transaction) []transactionPart
 
 func (ch *CommandHandler) publishTransactionMarker(topicName string, partition int, msg types.Message) error {
 	if ch.isDistributed() {
-		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true transactional_id=%s transaction_state=%s transaction_marker=%s control_batch_type=%s control_batch_version=%d control_batch_coordinator_epoch=%d control_batch_key=%s control_batch_value=%s internal_txn_publish=true message=%s", topicName, msg.ProducerID, partition, msg.SeqNum, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.ControlBatchType, msg.ControlBatchVersion, msg.ControlBatchCoordinatorEpoch, base64.StdEncoding.EncodeToString(msg.ControlBatchKey), base64.StdEncoding.EncodeToString(msg.ControlBatchValue), msg.Payload)
+		cmd := fmt.Sprintf("PUBLISH topic=%s acks=all producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true transactional_id=%s transaction_state=%s transaction_marker=%s control_batch_type=%s control_batch_version=%d control_batch_coordinator_epoch=%d control_batch_key=%s control_batch_value=%s internal_txn_publish=true message=%s", topicName, msg.ProducerID, partition, msg.SeqNum, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.ControlBatchType, msg.ControlBatchVersion, msg.ControlBatchCoordinatorEpoch, base64.StdEncoding.EncodeToString(msg.ControlBatchKey), base64.StdEncoding.EncodeToString(msg.ControlBatchValue), msg.Payload)
 		return ch.publishInternalTransactionCommand(cmd)
 	}
 	return ch.TopicManager.PublishToPartitionWithAckIdempotent(topicName, partition, &msg)
@@ -558,7 +558,7 @@ func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.Mess
 	msg.TransactionState = types.TransactionStateOpen
 	msg.TransactionMarker = types.TransactionMarkerNone
 	if ch.isDistributed() {
-		cmd := fmt.Sprintf("PUBLISH topic=%s acks=1 producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true internal_txn_publish=true", op.Topic, msg.ProducerID, op.Partition, msg.SeqNum, msg.Epoch)
+		cmd := fmt.Sprintf("PUBLISH topic=%s acks=all producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true internal_txn_publish=true", op.Topic, msg.ProducerID, op.Partition, msg.SeqNum, msg.Epoch)
 		if msg.Key != "" {
 			cmd += fmt.Sprintf(" key=%s", msg.Key)
 		}

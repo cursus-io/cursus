@@ -13,7 +13,7 @@ import (
 
 func init() {
 	prometheus.MustRegister(MessagesProcessed, MessagesPerSec, LatencyHist, QueueSize, CleanupCount, SeqNumGapTotal, SeqNumDuplicateTotal)
-	prometheus.MustRegister(ClientConnectionsTotal, ClientConnectionsActive, CommandsTotal, CommandDuration, CommandErrors)
+	prometheus.MustRegister(ClientConnectionsTotal, ClientConnectionsActive, CommandsTotal, CommandDuration, CommandErrors, PublishAcknowledgements, AsyncReplicationFailures)
 	prometheus.MustRegister(ClusterBrokersTotal, PartitionLeadersTotal, ClusterReplicationLag, LeaderElectionTotal, ISRSize)
 	prometheus.MustRegister(ReplicationLagBytes, ISRChangesTotal, LeaderElectionFailures, BrokerHealthStatus, QuorumOperations, PartitionReassignments)
 }

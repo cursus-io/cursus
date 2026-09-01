@@ -31,9 +31,10 @@ func (ch *CommandHandler) handleAppendStream(cmd string) string {
 		if err != nil {
 			return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 		}
-		releaseWrite, err := ch.preparePartitionLeader(topicName, partition, p)
+		effectiveMinISR := t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas)
+		releaseWrite, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(topicName, partition, p, effectiveMinISR)
 		if err != nil {
-			return ch.errorResponse(err.Error())
+			return ch.partitionPreparationErrorResponse(err)
 		}
 		defer releaseWrite()
 		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
@@ -42,7 +43,7 @@ func (ch *CommandHandler) handleAppendStream(cmd string) string {
 		result, errResp := ch.ESHandler.AppendStream(cmd, eventsource.AppendOptions{
 			LeaderAppend: true,
 			AfterCommit: func(topic string, partition int, hwm uint64) error {
-				return ch.commitPartitionHWM(topic, partition, hwm, t.LifecycleEpoch)
+				return ch.commitPartitionHWMAtEpoch(topic, partition, hwm, replicationSnapshot.Leader, replicationSnapshot.LeaderEpoch, replicationSnapshot.LifecycleEpoch)
 			},
 			AfterAppend: func(topic string, partition int, msg types.Message) error {
 				msgCmd := types.MessageCommand{
@@ -53,7 +54,7 @@ func (ch *CommandHandler) handleAppendStream(cmd string) string {
 					Acks:           "all",
 					SequenceScope:  "partition",
 				}
-				return ch.Cluster.ReplicateToFollowers(topic, partition, msgCmd, ch.Config.MinInSyncReplicas)
+				return ch.Cluster.ReplicateToFollowers(topic, partition, msgCmd, effectiveMinISR)
 			},
 		})
 		if errResp != "" {
@@ -74,12 +75,13 @@ func (ch *CommandHandler) handleSaveSnapshot(cmd string) string {
 		if resp, forwarded, _ := ch.isPartitionLeaderAndForward(topicName, partition, cmd); forwarded {
 			return resp
 		}
-		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
-			return indexResp
-		}
-		t := ch.TopicManager.GetTopic(topicName)
+		t := ch.waitForTopic(topicName)
 		if t == nil {
 			return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+		}
+		effectiveMinISR := t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas)
+		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
+			return indexResp
 		}
 		result, errResp := ch.ESHandler.SaveSnapshot(cmd, func(result eventsource.SnapshotResult) error {
 			result.LifecycleEpoch = t.LifecycleEpoch
@@ -88,7 +90,7 @@ func (ch *CommandHandler) handleSaveSnapshot(cmd string) string {
 				return err
 			}
 			replicateCmd := fmt.Sprintf("REPLICATE_SNAPSHOT %spayload=%s", ch.internalAuthPrefix(), string(payload))
-			return ch.Cluster.ReplicateCommandToFollowers(result.Topic, result.Partition, replicateCmd, ch.Config.MinInSyncReplicas)
+			return ch.Cluster.ReplicateCommandToFollowers(result.Topic, result.Partition, replicateCmd, effectiveMinISR)
 		})
 		if errResp != "" {
 			return errResp

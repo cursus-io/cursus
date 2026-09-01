@@ -11,6 +11,7 @@ services:
       - CONFIG_PATH=/app/config.yaml
       - ADVERTISED_CLIENT_HOST=localhost
       - ADVERTISED_BROKER_PORT=10000
+      - MIN_INSYNC_REPLICAS=1
     ports:    
       - "10000:9000"    
       - "10100:9100"    

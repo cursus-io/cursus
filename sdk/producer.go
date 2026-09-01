@@ -86,6 +86,9 @@ func NewProducerWithContext(ctx context.Context, cfg *PublisherConfig) (*Produce
 	if cfg == nil {
 		return nil, fmt.Errorf("publisher config is required")
 	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	if err := validateSDKTopicName(cfg.Topic); err != nil {
 		return nil, err
 	}
@@ -236,14 +239,15 @@ const (
 
 // TopicOptions defines optional CREATE settings for a topic.
 type TopicOptions struct {
-	Partitions     int
-	CleanupPolicy  TopicCleanupPolicy
-	RetentionHours int
-	RetentionBytes int64
-	Partitioner    string
-	AuthPolicy     string
-	ReadACL        []string
-	WriteACL       []string
+	Partitions        int
+	CleanupPolicy     TopicCleanupPolicy
+	RetentionHours    int
+	RetentionBytes    int64
+	MinInSyncReplicas int
+	Partitioner       string
+	AuthPolicy        string
+	ReadACL           []string
+	WriteACL          []string
 }
 
 func (p *Producer) CreateTopic(topic string, partitions int) error {
@@ -308,6 +312,9 @@ func buildCreateTopicCommand(topic string, options TopicOptions, idempotent bool
 	if options.RetentionBytes < 0 {
 		return "", fmt.Errorf("retention bytes must be non-negative")
 	}
+	if options.MinInSyncReplicas < 0 {
+		return "", fmt.Errorf("min in-sync replicas must be positive when set")
+	}
 
 	cleanupPolicy, err := normalizeSDKCleanupPolicy(options.CleanupPolicy)
 	if err != nil {
@@ -341,6 +348,9 @@ func buildCreateTopicCommand(topic string, options TopicOptions, idempotent bool
 	}
 	if options.RetentionBytes != 0 {
 		command += fmt.Sprintf(" retention_bytes=%d", options.RetentionBytes)
+	}
+	if options.MinInSyncReplicas != 0 {
+		command += fmt.Sprintf(" min_in_sync_replicas=%d", options.MinInSyncReplicas)
 	}
 	if options.Partitioner != "" {
 		command += " partitioner=" + options.Partitioner

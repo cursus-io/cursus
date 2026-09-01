@@ -2,10 +2,12 @@ package sdk
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/ackpolicy"
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 )
@@ -59,6 +61,23 @@ type PublisherConfig struct {
 	FlushTimeoutMS int `yaml:"flush_timeout_ms" json:"flush_timeout_ms"`
 
 	LogLevel LogLevel `yaml:"log_level" json:"log_level"`
+}
+
+// Validate checks publisher contracts that must fail before network or producer
+// sequence state is created.
+func (c *PublisherConfig) Validate() error {
+	if c == nil {
+		return fmt.Errorf("publisher config is required")
+	}
+	selection, err := ackpolicy.Parse(c.Acks)
+	if err != nil {
+		return fmt.Errorf("invalid acks %q: %w", c.Acks, err)
+	}
+	c.Acks = selection.Requested
+	if c.EnableIdempotence && !selection.SupportsIdempotence() {
+		return fmt.Errorf("enable_idempotence requires acks=all or acks=-1")
+	}
+	return nil
 }
 
 func NewDefaultPublisherConfig() *PublisherConfig {
@@ -210,7 +229,15 @@ func LoadConfig(path string, cfg interface{}) error {
 		return err
 	}
 	if strings.HasSuffix(path, ".json") {
-		return json.Unmarshal(data, cfg)
+		err = json.Unmarshal(data, cfg)
+	} else {
+		err = yaml.Unmarshal(data, cfg)
 	}
-	return yaml.Unmarshal(data, cfg)
+	if err != nil {
+		return err
+	}
+	if publisher, ok := cfg.(*PublisherConfig); ok {
+		return publisher.Validate()
+	}
+	return nil
 }

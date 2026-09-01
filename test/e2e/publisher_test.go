@@ -47,6 +47,7 @@ func TestExactlyOnceSemantics(t *testing.T) {
 	ctx.WithTopic("exactly-once-test").
 		WithPartitions(1).
 		WithNumMessages(10).
+		WithAcks("all").
 		WithIdempotent(true).
 		When().
 		StartBroker().
@@ -68,6 +69,7 @@ func TestIdempotentProducer(t *testing.T) {
 	ctx.WithTopic("idempotent-test").
 		WithPartitions(1).
 		WithNumMessages(5).
+		WithAcks("all").
 		WithIdempotent(true).
 		When().
 		StartBroker().
@@ -122,7 +124,7 @@ func TestExactlyOnceWithFailures(t *testing.T) {
 		expectLoss   bool
 		isIdempotent bool
 	}{
-		{"acks=1_network_failure", "1", []string{"network"}, false, false, true},
+		{"acks=all_network_failure", "all", []string{"network"}, false, false, true},
 		{"acks=all_broker_failure", "all", []string{"broker"}, false, false, true},
 		{"acks=0_no_guarantee", "0", []string{"network"}, true, true, false},
 	}

@@ -11,7 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/ackpolicy"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -35,8 +37,28 @@ func appendedLeaderMessages(messages []types.Message) []types.Message {
 	return appended
 }
 
+func duplicateAcknowledgementOffset(p *topic.Partition, messages []types.Message) (uint64, error) {
+	if len(messages) == 0 {
+		return 0, fmt.Errorf("duplicate acknowledgement has no messages")
+	}
+	last := messages[len(messages)-1]
+	offset, found, err := p.ProducerSequenceOffset(last.ProducerID, last.Epoch, last.SeqNum)
+	if err != nil {
+		return 0, fmt.Errorf("resolve duplicate producer sequence: %w", err)
+	}
+	if !found {
+		return 0, fmt.Errorf(
+			"duplicate producer sequence offset is unavailable: producer=%s epoch=%d seq=%d",
+			last.ProducerID,
+			last.Epoch,
+			last.SeqNum,
+		)
+	}
+	return offset, nil
+}
+
 // handlePublish processes PUBLISH command
-func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) string {
+func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (response string) {
 	var clientCtx *ClientContext
 	if len(ctx) > 0 {
 		clientCtx = ctx[0]
@@ -84,10 +106,21 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 		}
 	}
 
-	acksLower := strings.ToLower(acks)
-	if acksLower != "0" && acksLower != "1" && acksLower != "-1" && acksLower != "all" {
+	ackSelection, ackErr := ackpolicy.Parse(acks)
+	if ackErr != nil {
 		return fmt.Sprintf("ERROR: invalid_acks value=%s", acks)
 	}
+	acks = ackSelection.Requested
+	defer func() {
+		if clientCtx != nil && clientCtx.Internal {
+			return
+		}
+		result := "success"
+		if strings.HasPrefix(response, "ERROR:") {
+			result = "failure"
+		}
+		metrics.PublishAcknowledgements.WithLabelValues(string(ackSelection.Mode), result).Inc()
+	}()
 
 	var seqNum uint64
 	if seqNumStr, ok := args["seqNum"]; ok {
@@ -127,11 +160,15 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 		if clientCtx == nil || !clientCtx.Internal {
 			return "ERROR: internal_txn_publish_forbidden command=PUBLISH"
 		}
-		if !t.Policy.CanWrite() {
+		if !t.PolicySnapshot().CanWrite() {
 			return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", topicName)
 		}
-	} else if authResp := ch.authorizeTopicWrite(t.Policy, clientCtx); authResp != "" {
+	} else if authResp := ch.authorizeTopicWrite(t.PolicySnapshot(), clientCtx); authResp != "" {
 		return fmt.Sprintf("%s topic=%s", authResp, topicName)
+	}
+	effectiveIdempotent := isIdempotent || ch.Config.EnableIdempotence || t.IsIdempotent
+	if effectiveIdempotent && !ackSelection.SupportsIdempotence() {
+		return "ERROR: invalid_acks reason=\"idempotent publish requires acks=all or acks=-1\""
 	}
 
 	controlBatchVersion, errResp := parseControlBatchVersion(args["control_batch_version"])
@@ -170,7 +207,8 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 	if partition < 0 {
 		partition = t.GetPartitionForMessage(*msg)
 	}
-	if _, err := t.GetPartition(partition); err != nil {
+	p, err := t.GetPartition(partition)
+	if err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 	}
 	if errResp := ch.validateTransactionPublishMetadata(args, topicName, partition, msg); errResp != "" {
@@ -211,19 +249,29 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 			return resp
 		}
 
-		p, err := t.GetPartition(partition)
-		if err != nil {
-			util.Error("Publish failed: partition %d not found in topic %s: %v", partition, topicName, err)
-			return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
+		effectiveMinISR := t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas)
+		requiredISR := 0
+		if ackSelection.Mode == ackpolicy.All {
+			requiredISR = effectiveMinISR
 		}
-
-		effectiveIdempotent := isIdempotent || ch.Config.EnableIdempotence
-
-		releaseWrite, err := ch.preparePartitionLeader(topicName, partition, p)
+		releaseWrite, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(topicName, partition, p, requiredISR)
 		if err != nil {
-			return ch.errorResponse(err.Error())
+			return ch.partitionPreparationErrorResponse(err)
 		}
 		defer releaseWrite()
+		if ch.replication == nil {
+			return "ERROR: cluster_metadata_unavailable command=PUBLISH"
+		}
+		reservation, reserveErr := ch.replication.reserve(requestCtx, topicName, partition)
+		if reserveErr != nil {
+			return ch.errorResponse(fmt.Sprintf("replication backpressure: %v", reserveErr))
+		}
+		submitted := false
+		defer func() {
+			if !submitted {
+				reservation.release()
+			}
+		}()
 
 		scope := "partition"
 		messageData := types.MessageCommand{
@@ -239,14 +287,37 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 		markLeaderOffsetsUnassigned(messageData.Messages)
 		// Duplicate producer sequences remain unassigned and must not be
 		// replicated or committed again.
-		if err := p.EnqueueBatchLeader(messageData.Messages); err != nil {
+		if err := p.EnqueueBatchLeaderWithMode(messageData.Messages, effectiveIdempotent); err != nil {
 			return ch.errorResponse(fmt.Sprintf("failed to append locally: %v", err))
 		}
 		appended := appendedLeaderMessages(messageData.Messages)
 		if len(appended) == 0 {
-			lastOffset := uint64(0)
-			if nextOffset := p.NextOffset(); nextOffset > 0 {
-				lastOffset = nextOffset - 1
+			lastOffset, resolveErr := duplicateAcknowledgementOffset(p, messageData.Messages)
+			if resolveErr != nil {
+				return ch.errorResponse(resolveErr.Error())
+			}
+			if ackSelection.Mode == ackpolicy.All {
+				result := make(chan error, 1)
+				reservation.submit(partitionReplicationTask{
+					topic:       topicName,
+					partition:   partition,
+					ackMode:     ackSelection.Mode,
+					barrierOnly: true,
+					snapshot:    replicationSnapshot,
+					result:      result,
+				})
+				submitted = true
+				select {
+				case replicationErr := <-result:
+					if replicationErr != nil {
+						return ch.errorResponse(fmt.Sprintf("replication failed (offset=%d): %v", lastOffset, replicationErr))
+					}
+				case <-requestCtx.Done():
+					return "ERROR: request_cancelled"
+				}
+			} else {
+				reservation.release()
+				submitted = true
 			}
 			ackResp = types.AckResponse{
 				Status:        "OK",
@@ -262,24 +333,32 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 		messageData.Messages = appended
 		assignedOffset := appended[len(appended)-1].Offset
 
-		minISR := ch.Config.MinInSyncReplicas
-		if minISR < 1 {
-			minISR = 1
+		commitHWM := assignedOffset + 1
+		var replicationResult chan error
+		if ackSelection.Mode == ackpolicy.All {
+			replicationResult = make(chan error, 1)
 		}
-		err = ch.Cluster.ReplicateToFollowers(topicName, partition, messageData, minISR)
-		if err != nil {
-			return ch.errorResponse(fmt.Sprintf("replication failed (offset=%d): %v", assignedOffset, err))
+		reservation.submit(partitionReplicationTask{
+			topic:        topicName,
+			partition:    partition,
+			command:      messageData,
+			commitHWM:    commitHWM,
+			ackMode:      ackSelection.Mode,
+			snapshot:     replicationSnapshot,
+			partitionRef: p,
+			result:       replicationResult,
+		})
+		submitted = true
+		if replicationResult != nil {
+			select {
+			case replicationErr := <-replicationResult:
+				if replicationErr != nil {
+					return ch.errorResponse(fmt.Sprintf("replication failed (offset=%d): %v", assignedOffset, replicationErr))
+				}
+			case <-requestCtx.Done():
+				return "ERROR: request_cancelled"
+			}
 		}
-
-		commitHWM := p.NextOffset()
-		if err := ch.commitPartitionHWM(topicName, partition, commitHWM, t.LifecycleEpoch); err != nil {
-			return ch.errorResponse(fmt.Sprintf("commit watermark failed (offset=%d): %v", assignedOffset, err))
-		}
-		if err := p.ApplyReplicaHWM(commitHWM); err != nil {
-			return ch.errorResponse(fmt.Sprintf("local commit watermark failed: %v", err))
-		}
-		p.FlushDisk()
-
 		ackResp = types.AckResponse{
 			Status:        "OK",
 			LastOffset:    assignedOffset,
@@ -290,27 +369,43 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 		}
 		goto Respond
 	} else { // stand-alone
-		if acks == "0" {
+		if ackSelection.Mode == ackpolicy.None {
 			err = ch.TopicManager.PublishToPartition(topicName, partition, msg)
 			if err != nil {
 				util.Error("acks=0 publish failed (stand-alone): %v", err)
+				return ch.errorResponse(fmt.Sprintf("acks=0 publish failed: %v", err))
 			}
 			return "OK"
 		}
-		err = ch.TopicManager.PublishToPartitionWithAck(topicName, partition, msg)
+		if ackSelection.Mode == ackpolicy.All && t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas) > 1 {
+			return "ERROR: insufficient_in_sync_replicas current=1"
+		}
+		standaloneMessages := []types.Message{*msg}
+		markLeaderOffsetsUnassigned(standaloneMessages)
+		appendStarted := time.Now()
+		err = p.EnqueueBatchSyncWithMode(standaloneMessages, effectiveIdempotent)
 		if err != nil {
 			return ch.errorResponse(fmt.Sprintf("acks=1 publish failed: %v", err))
 		}
+		metrics.MessagesProcessed.Inc()
+		metrics.LatencyHist.Observe(time.Since(appendStarted).Seconds())
+		appended := appendedLeaderMessages(standaloneMessages)
+		if len(appended) == 0 {
+			lastOffset, resolveErr := duplicateAcknowledgementOffset(p, standaloneMessages)
+			if resolveErr != nil {
+				return ch.errorResponse(resolveErr.Error())
+			}
+			ackResp.LastOffset = lastOffset
+		} else {
+			ackResp.LastOffset = appended[len(appended)-1].Offset
+		}
 	}
 
-	ackResp = types.AckResponse{
-		Status:        "OK",
-		LastOffset:    ch.TopicManager.GetLastOffset(topicName, partition),
-		ProducerEpoch: epoch,
-		ProducerID:    producerID,
-		SeqStart:      seqNum,
-		SeqEnd:        seqNum,
-	}
+	ackResp.Status = "OK"
+	ackResp.ProducerEpoch = epoch
+	ackResp.ProducerID = producerID
+	ackResp.SeqStart = seqNum
+	ackResp.SeqEnd = seqNum
 
 Respond:
 	if ch.isDistributed() {
@@ -378,6 +473,13 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 	if err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", msgCmd.Partition)
 	}
+	if ch.isDistributed() {
+		releaseWrite, prepareErr := ch.preparePartitionReplica(msgCmd.Topic, msgCmd.Partition, p, msgCmd.LeaderID, msgCmd.LeaderEpoch)
+		if prepareErr != nil {
+			return ch.errorResponse(prepareErr.Error())
+		}
+		defer releaseWrite()
+	}
 
 	if len(msgCmd.Messages) == 0 && msgCmd.CommitHWM == nil {
 		return "ERROR: empty_messages command=REPLICATE_MESSAGE"
@@ -389,7 +491,7 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 	}
 
 	if len(msgCmd.Messages) > 0 {
-		if err := p.ReplicaAppend(msgCmd.Messages); err != nil {
+		if err := p.ReplicaAppendWithMode(msgCmd.Messages, msgCmd.IsIdempotent); err != nil {
 			return fmt.Sprintf("ERROR: replica_append_failed reason=%q", err.Error())
 		}
 	}
@@ -413,10 +515,9 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 }
 
 // HandleBatchMessage processes PUBLISH of multiple messages.
-func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...*ClientContext) (string, error) {
+func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...*ClientContext) (response string, returnErr error) {
 	ch.topicLifecycleMu.RLock()
 	defer ch.topicLifecycleMu.RUnlock()
-
 	var clientCtx *ClientContext
 	if len(ctx) > 0 {
 		clientCtx = ctx[0]
@@ -439,10 +540,21 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		acks = "1"
 	}
 
-	acksLower := strings.ToLower(acks)
-	if acksLower != "0" && acksLower != "1" && acksLower != "-1" && acksLower != "all" {
+	ackSelection, ackErr := ackpolicy.Parse(acks)
+	if ackErr != nil {
 		return fmt.Sprintf("ERROR: invalid_acks value=%s", acks), nil
 	}
+	acks = ackSelection.Requested
+	defer func() {
+		if clientCtx != nil && clientCtx.Internal {
+			return
+		}
+		result := "success"
+		if strings.HasPrefix(response, "ERROR:") || returnErr != nil {
+			result = "failure"
+		}
+		metrics.PublishAcknowledgements.WithLabelValues(string(ackSelection.Mode), result).Inc()
+	}()
 
 	var respAck types.AckResponse
 	var lastMsg *types.Message
@@ -483,7 +595,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			util.Error("Batch process failed: topic '%s' not found", batch.Topic)
 			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
 		}
-		if authResp := ch.authorizeTopicWrite(t.Policy, clientCtx); authResp != "" {
+		if authResp := ch.authorizeTopicWrite(t.PolicySnapshot(), clientCtx); authResp != "" {
 			return fmt.Sprintf("%s topic=%s", authResp, batch.Topic), nil
 		}
 
@@ -497,25 +609,70 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			return ch.errorResponse("empty batch messages"), nil
 		}
 
-		effectiveIdempotent := batch.IsIdempotent || ch.Config.EnableIdempotence
+		effectiveIdempotent := batch.IsIdempotent || ch.Config.EnableIdempotence || t.IsIdempotent
+		if effectiveIdempotent && !ackSelection.SupportsIdempotence() {
+			return "ERROR: invalid_acks reason=\"idempotent publish requires acks=all or acks=-1\"", nil
+		}
 		scope := "partition"
 
-		releaseWrite, err := ch.preparePartitionLeader(batch.Topic, batch.Partition, p)
+		effectiveMinISR := t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas)
+		requiredISR := 0
+		if ackSelection.Mode == ackpolicy.All {
+			requiredISR = effectiveMinISR
+		}
+		releaseWrite, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(batch.Topic, batch.Partition, p, requiredISR)
 		if err != nil {
-			return ch.errorResponse(err.Error()), nil
+			return ch.partitionPreparationErrorResponse(err), nil
 		}
 		defer releaseWrite()
+		if ch.replication == nil {
+			return "ERROR: cluster_metadata_unavailable command=BATCH", nil
+		}
+		reservation, reserveErr := ch.replication.reserve(requestCtx, batch.Topic, batch.Partition)
+		if reserveErr != nil {
+			return ch.errorResponse(fmt.Sprintf("replication backpressure: %v", reserveErr)), nil
+		}
+		submitted := false
+		defer func() {
+			if !submitted {
+				reservation.release()
+			}
+		}()
 
 		markLeaderOffsetsUnassigned(batch.Messages)
 		// Duplicate producer sequences remain unassigned and are acknowledged
 		// without another replication round.
-		if err := p.EnqueueBatchLeader(batch.Messages); err != nil {
+		if err := p.EnqueueBatchLeaderWithMode(batch.Messages, effectiveIdempotent); err != nil {
 			return ch.errorResponse(fmt.Sprintf("failed to append batch locally: %v", err)), nil
 		}
 		appended := appendedLeaderMessages(batch.Messages)
 		if len(appended) == 0 {
-			if nextOffset := p.NextOffset(); nextOffset > 0 {
-				lastOffset = nextOffset - 1
+			lastOffset, err = duplicateAcknowledgementOffset(p, batch.Messages)
+			if err != nil {
+				return ch.errorResponse(err.Error()), nil
+			}
+			if ackSelection.Mode == ackpolicy.All {
+				result := make(chan error, 1)
+				reservation.submit(partitionReplicationTask{
+					topic:       batch.Topic,
+					partition:   batch.Partition,
+					ackMode:     ackSelection.Mode,
+					barrierOnly: true,
+					snapshot:    replicationSnapshot,
+					result:      result,
+				})
+				submitted = true
+				select {
+				case replicationErr := <-result:
+					if replicationErr != nil {
+						return ch.errorResponse(fmt.Sprintf("batch replication failed (offset=%d): %v", lastOffset, replicationErr)), nil
+					}
+				case <-requestCtx.Done():
+					return "ERROR: request_cancelled", nil
+				}
+			} else {
+				reservation.release()
+				submitted = true
 			}
 			respAck = types.AckResponse{
 				Status:        "OK",
@@ -530,11 +687,6 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 
 		lastOffset = appended[len(appended)-1].Offset
 
-		minISR := ch.Config.MinInSyncReplicas
-		if minISR < 1 {
-			minISR = 1
-		}
-
 		msgCmd := types.MessageCommand{
 			Topic:          batch.Topic,
 			Partition:      batch.Partition,
@@ -545,18 +697,32 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			Acks:           acks,
 		}
 
-		err = ch.Cluster.ReplicateToFollowers(batch.Topic, batch.Partition, msgCmd, minISR)
-		if err != nil {
-			return ch.errorResponse(fmt.Sprintf("batch replication failed (offset=%d): %v", lastOffset, err)), nil
+		commitHWM := lastOffset + 1
+		var replicationResult chan error
+		if ackSelection.Mode == ackpolicy.All {
+			replicationResult = make(chan error, 1)
 		}
-		commitHWM := p.NextOffset()
-		if err := ch.commitPartitionHWM(batch.Topic, batch.Partition, commitHWM, t.LifecycleEpoch); err != nil {
-			return ch.errorResponse(fmt.Sprintf("batch commit watermark failed (offset=%d): %v", lastOffset, err)), nil
+		reservation.submit(partitionReplicationTask{
+			topic:        batch.Topic,
+			partition:    batch.Partition,
+			command:      msgCmd,
+			commitHWM:    commitHWM,
+			ackMode:      ackSelection.Mode,
+			snapshot:     replicationSnapshot,
+			partitionRef: p,
+			result:       replicationResult,
+		})
+		submitted = true
+		if replicationResult != nil {
+			select {
+			case replicationErr := <-replicationResult:
+				if replicationErr != nil {
+					return ch.errorResponse(fmt.Sprintf("batch replication failed (offset=%d): %v", lastOffset, replicationErr)), nil
+				}
+			case <-requestCtx.Done():
+				return "ERROR: request_cancelled", nil
+			}
 		}
-		if err := p.ApplyReplicaHWM(commitHWM); err != nil {
-			return ch.errorResponse(fmt.Sprintf("local commit watermark failed: %v", err)), nil
-		}
-		p.FlushDisk()
 
 		respAck = types.AckResponse{
 			Status:        "OK",
@@ -578,7 +744,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		if t == nil {
 			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
 		}
-		if authResp := ch.authorizeTopicWrite(t.Policy, clientCtx); authResp != "" {
+		if authResp := ch.authorizeTopicWrite(t.PolicySnapshot(), clientCtx); authResp != "" {
 			return fmt.Sprintf("%s topic=%s", authResp, batch.Topic), nil
 		}
 		p, err := t.GetPartition(batch.Partition)
@@ -586,14 +752,23 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			return fmt.Sprintf("ERROR: partition_not_found partition=%d", batch.Partition), nil
 		}
 
-		if acks == "0" {
+		effectiveIdempotent := batch.IsIdempotent || ch.Config.EnableIdempotence || t.IsIdempotent
+		if effectiveIdempotent && !ackSelection.SupportsIdempotence() {
+			return "ERROR: invalid_acks reason=\"idempotent publish requires acks=all or acks=-1\"", nil
+		}
+		if ackSelection.Mode == ackpolicy.None {
 			err = p.EnqueueBatch(batch.Messages)
 			if err != nil {
-				return ch.errorResponse(fmt.Sprintf("acks=0 batch publish failed: %v", err)), err
+				util.Error("acks=0 batch publish failed (stand-alone): %v", err)
+				return ch.errorResponse(fmt.Sprintf("acks=0 batch publish failed: %v", err)), nil
 			}
 			return "OK", nil
 		}
-		err = p.EnqueueBatchSync(batch.Messages)
+		if ackSelection.Mode == ackpolicy.All && t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas) > 1 {
+			return "ERROR: insufficient_in_sync_replicas current=1", nil
+		}
+		markLeaderOffsetsUnassigned(batch.Messages)
+		err = p.EnqueueBatchSyncWithMode(batch.Messages, effectiveIdempotent)
 		if err != nil {
 			return ch.errorResponse(fmt.Sprintf("acks=1 batch publish failed: %v", err)), err
 		}
@@ -604,9 +779,14 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			return ch.errorResponse("empty batch messages"), nil
 		}
 
-		lastOffset = 0
-		if nextOffset := p.NextOffset(); nextOffset > 0 {
-			lastOffset = nextOffset - 1
+		appended := appendedLeaderMessages(batch.Messages)
+		if len(appended) == 0 {
+			lastOffset, err = duplicateAcknowledgementOffset(p, batch.Messages)
+			if err != nil {
+				return ch.errorResponse(err.Error()), nil
+			}
+		} else {
+			lastOffset = appended[len(appended)-1].Offset
 		}
 		respAck = types.AckResponse{
 			Status:        "OK",

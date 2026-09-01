@@ -132,7 +132,7 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 	if err != nil {
 		return nil, err
 	}
-	if authResp := ch.authorizeTopicRead(t.Policy, ctx); authResp != "" {
+	if authResp := ch.authorizeTopicRead(t.PolicySnapshot(), ctx); authResp != "" {
 		return nil, fmt.Errorf("%s topic=%s", authResp, topicName)
 	}
 
@@ -234,7 +234,7 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	if err != nil {
 		return err
 	}
-	if authResp := ch.authorizeTopicRead(t.Policy, ctx); authResp != "" {
+	if authResp := ch.authorizeTopicRead(t.PolicySnapshot(), ctx); authResp != "" {
 		return fmt.Errorf("%s topic=%s", authResp, cArgs.TopicName)
 	}
 

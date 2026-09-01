@@ -32,6 +32,9 @@ type ProducerClient struct {
 }
 
 func NewProducerClient(config *PublisherConfig) (*ProducerClient, error) {
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
 	pc := &ProducerClient{
 		ID:     uuid.New().String(),
 		Epoch:  time.Now().UnixNano(),

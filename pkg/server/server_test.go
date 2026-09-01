@@ -15,6 +15,8 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
@@ -1017,6 +1019,113 @@ func TestProcessMessage_BatchMessage(t *testing.T) {
 	msg := readFramed(t, client)
 	assert.Contains(t, msg, "ERROR")
 	<-done
+}
+
+func TestAcksZeroDoesNotLeaveTextResponseForNextRequest(t *testing.T) {
+	client, server := newTestConnPair(t)
+	cmdHandler := newPublishTestHandler(t)
+	cmdCtx := controller.NewClientContext("default-group", 0)
+
+	shouldExit, err := processMessage(
+		[]byte("PUBLISH topic=ack-zero partition=0 acks=0 producerId=p1 message=value"),
+		cmdHandler,
+		cmdCtx,
+		server,
+	)
+	require.NoError(t, err)
+	require.False(t, shouldExit)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = processMessage([]byte("HELP"), cmdHandler, cmdCtx, server)
+		close(done)
+	}()
+	response := readFramed(t, client)
+	require.Contains(t, response, "OK commands=")
+	<-done
+}
+
+func TestPayloadAcksTokenDoesNotSuppressDefaultAcknowledgement(t *testing.T) {
+	client, server := newTestConnPair(t)
+	cmdHandler := newPublishTestHandler(t)
+	cmdCtx := controller.NewClientContext("default-group", 0)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = processMessage(
+			[]byte("PUBLISH topic=ack-zero partition=0 producerId=p1 message=value acks=0"),
+			cmdHandler,
+			cmdCtx,
+			server,
+		)
+		close(done)
+	}()
+	response := readFramed(t, client)
+	require.Contains(t, response, `"status":"OK"`)
+	<-done
+}
+
+func TestAcksZeroDoesNotLeaveBatchResponseForNextRequest(t *testing.T) {
+	client, server := newTestConnPair(t)
+	cmdHandler := newPublishTestHandler(t)
+	cmdCtx := controller.NewClientContext("default-group", 0)
+	batch, err := util.EncodeBatchMessages(
+		"ack-zero",
+		0,
+		"0",
+		false,
+		[]types.Message{{Payload: "value", ProducerID: "p1"}},
+	)
+	require.NoError(t, err)
+
+	shouldExit, err := processMessage(batch, cmdHandler, cmdCtx, server)
+	require.NoError(t, err)
+	require.False(t, shouldExit)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = processMessage([]byte("HELP"), cmdHandler, cmdCtx, server)
+		close(done)
+	}()
+	response := readFramed(t, client)
+	require.Contains(t, response, "OK commands=")
+	<-done
+}
+
+func TestInternalAcksZeroStillReturnsForwardingResponse(t *testing.T) {
+	client, server := newTestConnPair(t)
+	cmdHandler := newPublishTestHandler(t)
+	cmdCtx := controller.NewInternalClientContext("default-group", 0)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = processMessage(
+			[]byte("PUBLISH topic=ack-zero partition=0 acks=0 producerId=p1 message=value"),
+			cmdHandler,
+			cmdCtx,
+			server,
+		)
+		close(done)
+	}()
+	require.Equal(t, "OK", readFramed(t, client))
+	<-done
+}
+
+func newPublishTestHandler(t *testing.T) *controller.CommandHandler {
+	t.Helper()
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.MinInSyncReplicas = 1
+	cfg.InternalUseTLS = true
+	dm := disk.NewDiskManager(cfg)
+	tm := topic.NewTopicManager(cfg, dm, nil)
+	require.NoError(t, tm.CreateTopic("ack-zero", 1, false, false))
+	handler := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
+	t.Cleanup(func() {
+		_ = handler.Close()
+		dm.CloseAllHandlers()
+	})
+	return handler
 }
 
 func TestInitializeConnection(t *testing.T) {

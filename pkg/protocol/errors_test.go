@@ -48,6 +48,7 @@ func TestClassifyFencingAndAvailability(t *testing.T) {
 		{"cluster_metadata_unavailable", ErrorClassAvailability, true},
 		{"request_cancelled", ErrorClassAvailability, true},
 		{"NOT_PARTITION_LEADER", ErrorClassRouting, true},
+		{"PARTITION_LEADER_FENCED", ErrorClassFencing, false},
 		{"STALE_LEADER_EPOCH", ErrorClassFencing, false},
 		{"partition_metadata_not_found", ErrorClassNotFound, false},
 		{"invalid_commit_watermark", ErrorClassValidation, false},

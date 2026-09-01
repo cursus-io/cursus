@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/ackpolicy"
 	"github.com/cursus-io/cursus/pkg/cluster"
 	client "github.com/cursus-io/cursus/pkg/cluster/client"
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
@@ -669,7 +670,9 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 		if err != nil {
 			return false, err
 		}
-		writeResponse(conn, decorateServerResponse(resp, ctx))
+		if !suppressBatchPublishResponse(data, ctx) {
+			writeResponse(conn, decorateServerResponse(resp, ctx))
+		}
 		return false, nil
 	}
 
@@ -687,7 +690,7 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 
 	_, payload, err := util.DecodeMessage(data)
 	if err != nil {
-		util.Error("⚠️ Decode error and not a raw command: %v [%s]", err, string(data))
+		util.Error("⚠️ Decode error and not a raw command: %v (len=%d)", err, len(data))
 		writeResponse(conn, decorateServerResponse(fmt.Sprintf("ERROR: decode_failed reason=%q", err.Error()), ctx))
 		return false, nil
 	}
@@ -713,7 +716,7 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 		return handleCommandMessage(payload, cmdHandler, ctx, conn)
 	}
 
-	util.Debug("[%s] Received unrecognized input: %s", conn.RemoteAddr().String(), rawInput)
+	util.Debug("[%s] Received unrecognized input (len=%d)", conn.RemoteAddr().String(), len(rawInput))
 	writeResponse(conn, decorateServerResponse("ERROR: malformed_input reason=missing_topic_or_payload", ctx))
 	return true, nil
 }
@@ -806,8 +809,45 @@ func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler,
 	if resp == "" {
 		resp = "ERROR: empty_command_response"
 	}
-	writeResponse(conn, decorateServerResponse(resp, ctx))
+	if !suppressPublishResponse(payload, ctx) {
+		writeResponse(conn, decorateServerResponse(resp, ctx))
+	}
 	return false, nil
+}
+
+func suppressPublishResponse(payload string, ctx *controller.ClientContext) bool {
+	if ctx != nil && ctx.Internal {
+		return false
+	}
+	requestHeader := payload
+	if messageIndex := strings.Index(requestHeader, "message="); messageIndex >= 0 {
+		requestHeader = requestHeader[:messageIndex]
+	}
+	fields := strings.Fields(strings.TrimSpace(requestHeader))
+	if len(fields) == 0 || !strings.EqualFold(fields[0], "PUBLISH") {
+		return false
+	}
+	for _, field := range fields[1:] {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok || key != "acks" {
+			continue
+		}
+		selection, err := ackpolicy.Parse(value)
+		return err == nil && selection.Mode == ackpolicy.None
+	}
+	return false
+}
+
+func suppressBatchPublishResponse(data []byte, ctx *controller.ClientContext) bool {
+	if ctx != nil && ctx.Internal {
+		return false
+	}
+	batch, err := util.DecodeBatchMessages(data)
+	if err != nil {
+		return false
+	}
+	selection, err := ackpolicy.Parse(batch.Acks)
+	return err == nil && selection.Mode == ackpolicy.None
 }
 
 func commandErrorResponse(err error, ctx *controller.ClientContext) string {

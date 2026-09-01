@@ -176,7 +176,7 @@ Feature names describe independent contracts; clients must not infer support for
 
 **CREATE**
 ```
-CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [event_sourcing=<true|false>] [replication_factor=<N>] [cleanup_policy=<delete|compact|delete,compact>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
+CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [event_sourcing=<true|false>] [replication_factor=<N>] [min_in_sync_replicas=<N>] [cleanup_policy=<delete|compact|delete,compact>] [retention_hours=<N>] [retention_bytes=<N>] [partitioner=<hash_key|round_robin>] [auth_policy=<open|deny_write|deny_read|acl>] [read_acl=<principal[,principal]>] [write_acl=<principal[,principal]>]
 ```
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
@@ -192,14 +192,21 @@ CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [event_sourcing=<
 | read_acl | No | - | Comma-separated principals allowed to read when `auth_policy=acl`; `*` allows any authenticated principal |
 | write_acl | No | - | Comma-separated principals allowed to write when `auth_policy=acl`; `*` allows any authenticated principal |
 | replication_factor | No | 3 | Replica count (distributed mode) |
+| min_in_sync_replicas | No | broker default | Optional durable topic override; must be between 1 and the topic replication factor |
 
-Response: `OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> lifecycle_epoch=<N>`. The original field order remains intact and new definition fields are appended for positional legacy parsers.
+Response: `OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> lifecycle_epoch=<N> min_in_sync_replicas=<N|default> effective_min_in_sync_replicas=<N>`. The original field order remains intact and new definition and ISR-policy fields are appended for positional legacy parsers.
 
 Topic names are a portable on-disk identifier: 1-249 ASCII bytes containing only letters, digits, `.`, `_`, `-`, or `=`; `.` and `..` are reserved. Invalid names return `ERROR: invalid_topic_name ...`.
 
 A missing topic is built from broker defaults and the supplied fields. For an existing topic, `CREATE` is a presence-aware patch: omitted fields retain their authoritative value, while explicit `0`, `false`, and empty `read_acl=`/`write_acl=` values are applied. Partition count can only increase. `replication_factor`, `idempotent`, and `event_sourcing` may be restated with the current value but cannot be changed. A no-op keeps the current `revision`; every effective definition change increments it.
 
-A successful standalone `CREATE` means the revisioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. First-generation topics continue to write manifest version 2 during a rolling upgrade; the additive `lifecycle_epoch=1` field is ignored by older readers. Version 1 manifests load with `revision=1`, `replication_factor=3`, and lifecycle epoch 1. The first successful truncate advances the manifest to version 3, which requires the epoch field and is intentionally rejected by older binaries. Distributed mode follows the same boundary: snapshot version 7 remains in use while every topic is at epoch 1, and the first retained epoch greater than 1 requires snapshot version 8. Version 7 snapshots without the additive field receive `lifecycle_epoch=1`; version 6 also receives revision 1 and infers replication factor from consistent partition replica metadata, falling back to 3 only when legacy metadata has no replica set.
+A successful standalone `CREATE` means the revisioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. Broker restart also restores the optional `min_in_sync_replicas` override; manifests without it use the broker `min_insync_replicas` fallback. First-generation topics continue to write manifest version 2 during a rolling upgrade; the additive `lifecycle_epoch=1` field is ignored by older readers. Version 1 manifests load with `revision=1`, `replication_factor=3`, and lifecycle epoch 1. The first successful truncate advances the manifest to version 3, which requires the epoch field and is intentionally rejected by older binaries. Distributed mode follows the same boundary: snapshot version 7 remains in use while every topic is at epoch 1, and the first retained epoch greater than 1 requires snapshot version 8. Version 7 snapshots without the additive field receive `lifecycle_epoch=1`; version 6 also receives revision 1 and infers replication factor from consistent partition replica metadata, falling back to 3 only when legacy metadata has no replica set. Snapshots without `min_in_sync_replicas` remain valid and use the broker fallback. Repeating `CREATE` without the field preserves an existing override.
+
+**ALTER_TOPIC_CONFIG**
+```
+ALTER_TOPIC_CONFIG topic=<name> min_in_sync_replicas=<N|default>
+```
+This command atomically replaces only the topic override. `default` removes the override and restores broker fallback; it does not rewrite older metadata with an arbitrary value.
 
 `compact` and `delete,compact` are accepted only by standalone, non-event-sourcing topics. Unsupported combinations return `ERROR: invalid_topic_policy ...` or `ERROR: unsupported_topic_policy ...`. Repeating `CREATE` for an existing event-sourcing topic cannot use a false `event_sourcing` argument to bypass this validation. Repeating `CREATE` also preserves existing partition leader epochs and committed HWMs; only newly added partitions receive new assignments.
 
@@ -323,9 +330,13 @@ Response (JSON — `AckResponse`):
 
 | Value | Behavior |
 |-------|----------|
-| `0` | Fire-and-forget. Broker returns `OK` immediately |
-| `1` | Leader writes to local disk, then responds |
-| `-1` / `all` | Leader waits for `min_in_sync_replicas` acknowledgments |
+| `0` | Fire-and-forget. The external connection receives no response frame and replication continues asynchronously without a delivery guarantee. |
+| `1` | Respond after the partition leader's durable local append. Ordered bounded replication continues after the response; a leader failure before commit can lose this record. |
+| `-1` / `all` | Aliases. Reject before append when the current ISR is smaller than the effective minimum, then wait for every broker in the captured ISR and a fenced committed-HWM update. Non-ISR replicas are not part of completion. |
+
+`acks` is a publisher/request setting and is never stored in topic metadata. The effective minimum is the topic `min_in_sync_replicas` override when present, otherwise broker `min_insync_replicas`. Read-committed consumers never read beyond committed HWM, so a leader-only `acks=1` tail remains invisible until asynchronous replication commits it. `enable_idempotence=true` requires `acks=all` or `acks=-1`; other combinations fail before append and producer sequence mutation.
+
+In standalone mode the local broker is the sole replica. `acks=1`, `all`, and `-1` complete after the same durable local append when the effective minimum is 1; `all` and `-1` reject before append when it is greater than 1. `acks=0` still receives no response frame.
 
 #### Cluster Discovery
 
@@ -562,7 +573,7 @@ missing, an entry is malformed, or the same partition appears more than once.
 
 Cursus exposes a broker-managed transaction coordinator for consume-process-produce workflows. In distributed mode, transaction commands are routed by `transactional_id` using the coordinator key `txn:<transactional_id>`. Clients can discover the owner with `FIND_COORDINATOR transactional_id=<id>` and must retry on `ERROR: NOT_COORDINATOR host=<host> port=<port>`.
 
-Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Transaction state entered the schema in version 4, committed partition watermarks in version 5, durable topic definitions in version 6, revisioned definitions in version 7, and post-truncate lifecycle epochs in version 8.
+Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Transaction state entered the schema in version 4, committed partition watermarks in version 5, durable topic definitions in version 6, revisioned definitions in version 7, and post-truncate lifecycle epochs in version 8. Legacy partition metadata that omits `committed_hwm` is distinct from an explicit zero: it keeps the previous durable-tail recovery behavior and is promoted through an epoch- and lifecycle-fenced Raft HWM commit before the next publish append. Current metadata serializes explicit zero, so later recovery can safely truncate a new uncommitted tail.
 
 Clients should first call `INIT_PRODUCER_ID` for a `transactional_id`; the broker returns the authoritative `(producerId, epoch)` session and bumps `epoch` on re-initialization to fence older producers. The coordinator fences stale producers by `(transactional_id, producerId, epoch)`: lower epochs are rejected, and staged operations must use the same producer and epoch that opened the transaction. After `transactional_id_expiration_ms`, completed transactions discard staged message/offset payloads but retain a compact epoch tombstone. The tombstone participates in standalone journal and distributed metadata snapshots, preventing an older producer session from being revived. Active `open` and `committing` transactions are not expired by the cleanup path.
 
@@ -775,7 +786,7 @@ Offset  Size  Type     Field
 
 ### Batch Response
 
-Server responds with the same binary batch format for CONSUME. PUBLISH with `acks=1` or `acks=all` returns JSON `AckResponse` with `status="OK"`; PUBLISH with `acks=0` returns `OK`.
+Server responds with the same binary batch format for CONSUME. PUBLISH with `acks=1`, `acks=all`, or `acks=-1` returns JSON `AckResponse` with `status="OK"`. External PUBLISH with `acks=0` emits no response frame; internal forwarding still receives a private response so routing can complete safely.
 
 ---
 
@@ -920,6 +931,7 @@ SDKs should parse the code and fields first, use `class` for broad handling, and
 | `invalid_batch_commit_entry entry=<entry>` | BATCH_COMMIT entry is not `P<N>:<offset>` | Correct the malformed entry and retry |
 | `duplicate_partition partition=N group=<G> topic=<T>` | BATCH_COMMIT repeats a partition | Send one next offset per partition; no offsets were committed |
 | `NOT_PARTITION_LEADER leader=<id> requested_leader=<id>` | Replication reached a broker that is not the current partition leader | Refresh partition metadata and retry against the leader |
+| `PARTITION_LEADER_FENCED` | An internal partition commit no longer matches the current leader or epoch | Do not acknowledge success; refresh partition metadata before retrying |
 | `STALE_LEADER_EPOCH current=N requested=N` | Replication request carries a fenced leader epoch | Discard the stale leader session and refresh metadata |
 | `cluster_metadata_unavailable command=REPLICATE_MESSAGE` | Cluster metadata subsystem is temporarily unavailable | Back off and retry |
 | `partition_metadata_not_found topic=<T> partition=N` | Partition metadata does not exist | Refresh metadata and verify topic/partition |
@@ -971,6 +983,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 
 ### Requirements
 
+- Idempotent publishing requires `acks=all` or `acks=-1`; weaker modes are rejected before append and sequence mutation
 - Each idempotent message must have a unique `(producerId, epoch, seqNum)` tuple within a partition
 - `seqNum` must be monotonically increasing within the current producer epoch for each partition
 - A new `(producerId, epoch)` sequence starts at `seqNum=1`; starting above 1 is rejected as a gap
