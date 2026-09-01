@@ -41,23 +41,6 @@ type ProducerSequence struct {
 	Seq   uint64 `json:"seq"`
 }
 
-func (s *ProducerSequence) UnmarshalJSON(data []byte) error {
-	var legacySeq int64
-	if err := json.Unmarshal(data, &legacySeq); err == nil {
-		if legacySeq > 0 {
-			s.Seq = uint64(legacySeq)
-		}
-		return nil
-	}
-	type alias ProducerSequence
-	var decoded alias
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	*s = ProducerSequence(decoded)
-	return nil
-}
-
 type BrokerFSMState struct {
 	Version           int                                            `json:"version"`
 	Applied           uint64                                         `json:"applied"`
@@ -205,6 +188,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyPartitionCommand(strings.TrimPrefix(data, "PARTITION:"))
 	case strings.HasPrefix(data, "PARTITION_COMMIT:"):
 		res = f.applyPartitionCommitCommand(strings.TrimPrefix(data, "PARTITION_COMMIT:"))
+	case strings.HasPrefix(data, "ISR_CATCHUP:"):
+		res = f.applyISRCatchupCommand(strings.TrimPrefix(data, "ISR_CATCHUP:"))
 	case strings.HasPrefix(data, "LEADER_ELECTION:"):
 		res = f.applyLeaderElectionCommand(strings.TrimPrefix(data, "LEADER_ELECTION:"))
 	case strings.HasPrefix(data, "GROUP_SYNC:"):
@@ -242,43 +227,33 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 
 	util.Info("Starting FSM restore from snapshot")
 
-	var state BrokerFSMState
-	if err := json.NewDecoder(rc).Decode(&state); err != nil {
+	snapshotData, err := io.ReadAll(rc)
+	if err != nil {
+		return fmt.Errorf("read snapshot: %w", err)
+	}
+	var header struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(snapshotData, &header); err != nil {
 		util.Error("Failed to decode snapshot: %v", err)
 		return fmt.Errorf("failed to restore snapshot: %w", err)
 	}
-
-	switch state.Version {
-	case 0:
-		util.Warn("FSM Restore: Legacy snapshot detected (Version 0).")
-	case 1:
-		util.Info("FSM Restore: Validating snapshot Version 1")
-	case 2:
-		util.Info("FSM Restore: Validating snapshot Version 2 (with group state)")
-	case 3:
-		util.Info("FSM Restore: Validating snapshot Version 3 (with producer epochs)")
-	case 4:
-		util.Info("FSM Restore: Validating snapshot Version 4 (with transaction state)")
-	case 5:
-		util.Info("FSM Restore: Validating snapshot Version 5 (with committed partition watermarks)")
-	case 6:
-		util.Info("FSM Restore: Validating snapshot Version 6 (with durable topic definitions)")
-	case 7:
-		util.Info("FSM Restore: Validating snapshot Version 7 (with revisioned topic definitions)")
-	case 8:
-		util.Info("FSM Restore: Validating snapshot Version 8 (with topic lifecycle epochs)")
-	default:
-		return fmt.Errorf("unknown snapshot version: %d", state.Version)
+	if header.Version != SnapshotVersionCurrent {
+		return fmt.Errorf("%w: snapshot version %d is not supported; remove all Cursus persistent state and clean bootstrap version %d", ErrUnsupportedRecoveryProtocol, header.Version, SnapshotVersionCurrent)
 	}
+
+	var state BrokerFSMState
+	if err := decodeStrictJSON(snapshotData, &state); err != nil {
+		util.Error("Failed to decode snapshot version %d: %v", header.Version, err)
+		return fmt.Errorf("failed to restore snapshot version %d: %w", header.Version, err)
+	}
+	util.Info("FSM Restore: Validating snapshot Version %d", state.Version)
 
 	restoredTopicState := copyTopicState(state.TopicState)
 	if len(restoredTopicState) == 0 && len(state.PartitionMetadata) > 0 {
-		if state.Version >= 6 {
-			return fmt.Errorf("snapshot version %d is missing topic state", state.Version)
-		}
-		restoredTopicState = legacyTopicState(state.PartitionMetadata)
+		return fmt.Errorf("snapshot version %d is missing topic state", state.Version)
 	}
-	if err := migrateSnapshotTopicDefinitionFields(state.Version, restoredTopicState, state.PartitionMetadata); err != nil {
+	if err := validateSnapshotTopicDefinitionFields(restoredTopicState, state.PartitionMetadata); err != nil {
 		return fmt.Errorf("restore topic definitions: %w", err)
 	}
 	definitions, err := validateTopicState(restoredTopicState, state.PartitionMetadata)
@@ -385,14 +360,14 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	if err := f.ReconcileTopicMaterializations(); err != nil {
 		util.Warn("FSM Restore: Topic materialization pending: %v", err)
 	}
-	if state.Version >= 5 {
-		f.reconcileCommittedPartitions()
+	if err := f.reconcileCommittedPartitions(); err != nil {
+		return err
 	}
 	util.Info("FSM restore completed: %d logs, %d brokers, %d partitions", len(state.Logs), len(state.Brokers), len(state.PartitionMetadata))
 	return nil
 }
 
-func (f *BrokerFSM) reconcileCommittedPartitions() {
+func (f *BrokerFSM) reconcileCommittedPartitions() error {
 	f.mu.RLock()
 	metadata := make(map[string]PartitionMetadata, len(f.partitionMetadata))
 	for key, value := range f.partitionMetadata {
@@ -403,14 +378,11 @@ func (f *BrokerFSM) reconcileCommittedPartitions() {
 	tm := f.tm
 	f.mu.RUnlock()
 	if tm == nil {
-		return
+		return nil
 	}
 	for key, meta := range metadata {
 		if !meta.CommittedHWMKnown {
-			// Metadata written before committed watermarks existed has no safe
-			// numeric boundary to apply. The partition leader migrates that
-			// legacy boundary through Raft before accepting a new append.
-			continue
+			return fmt.Errorf("%w: partition %s has no authoritative committed HWM", ErrUnsupportedRecoveryProtocol, key)
 		}
 		idx := strings.LastIndex(key, "-")
 		if idx < 0 {
@@ -427,12 +399,12 @@ func (f *BrokerFSM) reconcileCommittedPartitions() {
 		p, err := t.GetPartition(partition)
 		if err == nil {
 			if err := p.ReconcileCommittedHWM(meta.CommittedHWM); err != nil {
-				util.Warn("FSM: Failed to reconcile committed HWM for %s: %v", key, err)
-			} else {
-				p.FlushDisk()
+				return fmt.Errorf("reconcile committed HWM for %s: %w", key, err)
 			}
+			p.FlushDisk()
 		}
 	}
+	return nil
 }
 
 func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
@@ -454,6 +426,9 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	}
 	metadataCopy := make(map[string]*PartitionMetadata, len(f.partitionMetadata))
 	for k, v := range f.partitionMetadata {
+		if !v.CommittedHWMKnown {
+			return nil, fmt.Errorf("%w: partition %s has no authoritative committed HWM", ErrUnsupportedRecoveryProtocol, k)
+		}
 		metaCopy := *v
 		if v.Replicas != nil {
 			metaCopy.Replicas = make([]string, len(v.Replicas))
@@ -480,7 +455,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 
 	topicStateCopy := copyTopicState(f.topicState)
 	if len(topicStateCopy) == 0 && len(metadataCopy) > 0 {
-		topicStateCopy = legacyTopicState(metadataCopy)
+		return nil, fmt.Errorf("snapshot version %d requires durable topic state", SnapshotVersionCurrent)
 	}
 	definitions, err := validateTopicState(topicStateCopy, metadataCopy)
 	if err != nil {

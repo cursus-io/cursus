@@ -126,7 +126,19 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		cc = clusterController.NewClusterController(ctx, cfg, rm, sd, brokerID, localAddr)
 
 		// Start background heartbeats to all cluster members
-		clusterClient.StartHeartbeat(ctx, cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort)
+		clusterClient.StartHeartbeat(
+			ctx,
+			cfg.StaticClusterMembers,
+			brokerID,
+			localAddr,
+			cfg.DiscoveryPort,
+			func() []fsm.ISRCatchupProof {
+				if manager := rm.GetISRManager(); manager != nil {
+					return manager.BuildCatchupProofs()
+				}
+				return nil
+			},
+		)
 
 		// Every node should attempt to join the cluster via seeds
 		go func() {

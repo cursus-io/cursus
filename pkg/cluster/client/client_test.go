@@ -49,25 +49,25 @@ func TestJoinCluster_Success(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 
-			// Read length
-			lenBuf := make([]byte, 4)
-			_, _ = io.ReadFull(conn, lenBuf)
-			length := binary.BigEndian.Uint32(lenBuf)
+		// Read length
+		lenBuf := make([]byte, 4)
+		_, _ = io.ReadFull(conn, lenBuf)
+		length := binary.BigEndian.Uint32(lenBuf)
 
-			// Read message
-			msgBuf := make([]byte, length)
-			_, _ = io.ReadFull(conn, msgBuf)
+		// Read message
+		msgBuf := make([]byte, length)
+		_, _ = io.ReadFull(conn, msgBuf)
 
-			// Send success response
-			resp := map[string]interface{}{
-				"success": true,
-			}
-			respData, _ := json.Marshal(resp)
+		// Send success response
+		resp := map[string]interface{}{
+			"success": true,
+		}
+		respData, _ := json.Marshal(resp)
 
-			respLenBuf := make([]byte, 4)
-			binary.BigEndian.PutUint32(respLenBuf, uint32(len(respData)))
-			_, _ = conn.Write(respLenBuf)
-			_, _ = conn.Write(respData)
+		respLenBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(respLenBuf, uint32(len(respData)))
+		_, _ = conn.Write(respLenBuf)
+		_, _ = conn.Write(respData)
 
 	}()
 
@@ -262,7 +262,7 @@ func TestStartHeartbeat(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	client.StartHeartbeat(ctx, []string{addr}, "node-hb", "127.0.0.1:9001", port)
+	client.StartHeartbeat(ctx, nil, "node-hb", addr, port, nil)
 
 	select {
 	case <-received:

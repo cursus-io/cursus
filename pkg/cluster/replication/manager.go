@@ -48,6 +48,8 @@ type RaftStatus struct {
 type ISRManagerInterface interface {
 	HasQuorum(topic string, partition int, minISR int) bool
 	UpdateHeartbeat(brokerID string)
+	BuildCatchupProofs() []fsm.ISRCatchupProof
+	SubmitCatchupProofs(nodeID string, proofs []fsm.ISRCatchupProof) error
 	GetISR(topic string, partition int) []string
 	ComputeISR(topic string, partition int) []string
 	SetLeader(isLeader bool)
@@ -89,6 +91,9 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		util.Error("Failed to create raft data directory %s: %v", dataDir, err)
 		return nil, fmt.Errorf("failed to create raft data directory: %w", err)
+	}
+	if err := ensureRaftRecoveryFormat(dataDir); err != nil {
+		return nil, err
 	}
 
 	raftStore, err := newDurableRaftStore(dataDir)

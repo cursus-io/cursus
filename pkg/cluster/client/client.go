@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -46,7 +48,13 @@ func (c *TCPClusterClient) dialContext(ctx context.Context, address string) (net
 	return tlsDialer.DialContext(ctx, "tcp", address)
 }
 
-func (c *TCPClusterClient) StartHeartbeat(ctx context.Context, peers []string, nodeID, localAddr string, discoveryPort int) {
+func (c *TCPClusterClient) StartHeartbeat(
+	ctx context.Context,
+	peers []string,
+	nodeID, localAddr string,
+	discoveryPort int,
+	proofProvider func() []fsm.ISRCatchupProof,
+) {
 	ticker := time.NewTicker(1 * time.Second)
 	go func() {
 		defer ticker.Stop()
@@ -55,46 +63,51 @@ func (c *TCPClusterClient) StartHeartbeat(ctx context.Context, peers []string, n
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				var proofs []fsm.ISRCatchupProof
+				if proofProvider != nil {
+					proofs = proofProvider()
+				}
 				// sendHeartbeat internal loop uses goroutines now
-				_ = c.sendHeartbeat(ctx, peers, nodeID, localAddr, discoveryPort)
+				_ = c.sendHeartbeat(ctx, peers, nodeID, localAddr, discoveryPort, proofs)
 			}
 		}
 	}()
 }
 
-func (c *TCPClusterClient) sendHeartbeat(ctx context.Context, peers []string, nodeID, localAddr string, discoveryPort int) error {
+func (c *TCPClusterClient) sendHeartbeat(
+	ctx context.Context,
+	peers []string,
+	nodeID, localAddr string,
+	discoveryPort int,
+	proofs []fsm.ISRCatchupProof,
+) error {
 	apiPort := discoveryPort
 	if apiPort == 0 {
 		apiPort = 8000
 	}
 
-	payload := map[string]string{"node_id": nodeID}
-	body, _ := json.Marshal(payload)
+	payload := struct {
+		NodeID        string                `json:"node_id"`
+		CatchupProofs []fsm.ISRCatchupProof `json:"catchup_proofs,omitempty"`
+	}{NodeID: nodeID, CatchupProofs: proofs}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal heartbeat: %w", err)
+	}
 	cmd := fmt.Sprintf("HEARTBEAT_CLUSTER %s", string(body))
 
-	for _, peer := range peers {
+	targets := make([]string, 0, len(peers)+1)
+	targets = append(targets, peers...)
+	targets = append(targets, localAddr)
+	seen := make(map[string]struct{}, len(targets))
+	for _, peer := range targets {
+		target := heartbeatTarget(peer, apiPort)
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		seen[target] = struct{}{}
 		// Launch each heartbeat in a separate goroutine to avoid blocking on DNS/Connection
-		go func(p string) {
-			addrOnly := p
-			if strings.Contains(p, "@") {
-				addrOnly = strings.Split(p, "@")[1]
-			}
-
-			if addrOnly == localAddr {
-				return
-			}
-
-			host := addrOnly
-			if strings.Contains(addrOnly, ":") {
-				var err error
-				host, _, err = net.SplitHostPort(addrOnly)
-				if err != nil {
-					host = addrOnly
-				}
-			}
-
-			target := net.JoinHostPort(host, fmt.Sprintf("%d", apiPort))
-
+		go func(target string) {
 			// Use short timeout for heartbeat connection
 			heartbeatCtx, cancel := context.WithTimeout(ctx, time.Second)
 			conn, err := c.dialContext(heartbeatCtx, target)
@@ -107,9 +120,21 @@ func (c *TCPClusterClient) sendHeartbeat(ctx context.Context, peers []string, no
 			// Set a write deadline to prevent goroutine buildup on slow connections
 			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 			_ = util.WriteWithLength(conn, util.EncodeMessage("cluster", c.secureCommand(cmd)))
-		}(peer)
+		}(target)
 	}
 	return nil
+}
+
+func heartbeatTarget(peer string, discoveryPort int) string {
+	address := peer
+	if _, suffix, ok := strings.Cut(peer, "@"); ok {
+		address = suffix
+	}
+	host := address
+	if parsedHost, _, err := net.SplitHostPort(address); err == nil {
+		host = parsedHost
+	}
+	return net.JoinHostPort(host, strconv.Itoa(discoveryPort))
 }
 
 func (c *TCPClusterClient) JoinCluster(peers []string, nodeID, addr string, discoveryPort int) error {

@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
@@ -214,11 +215,13 @@ type MockISRManager struct {
 func (m *MockISRManager) HasQuorum(topic string, partition int, minISR int) bool {
 	return m.Called(topic, partition, minISR).Bool(0)
 }
-func (m *MockISRManager) UpdateHeartbeat(id string)           { m.Called(id) }
-func (m *MockISRManager) GetISR(t string, p int) []string     { return nil }
-func (m *MockISRManager) ComputeISR(t string, p int) []string { return nil }
-func (m *MockISRManager) SetLeader(l bool)                    { m.Called(l) }
-func (m *MockISRManager) Start()                              { m.Called() }
+func (m *MockISRManager) UpdateHeartbeat(id string)                               { m.Called(id) }
+func (m *MockISRManager) BuildCatchupProofs() []fsm.ISRCatchupProof               { return nil }
+func (m *MockISRManager) SubmitCatchupProofs(string, []fsm.ISRCatchupProof) error { return nil }
+func (m *MockISRManager) GetISR(t string, p int) []string                         { return nil }
+func (m *MockISRManager) ComputeISR(t string, p int) []string                     { return nil }
+func (m *MockISRManager) SetLeader(l bool)                                        { m.Called(l) }
+func (m *MockISRManager) Start()                                                  { m.Called() }
 
 func TestRaftReplicationManager_ReplicateWithQuorum(t *testing.T) {
 	mr := new(MockRaft)

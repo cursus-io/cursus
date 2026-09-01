@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/hashicorp/raft"
 )
 
@@ -26,10 +27,12 @@ func TestBuildClusterStatusReportsAvailabilityAndReplication(t *testing.T) {
 		"orders-eu-0": {
 			Leader: "broker-1", LeaderEpoch: 2, CommittedHWM: 11,
 			Replicas: []string{"broker-1", "broker-2", "broker-3"}, ISR: []string{"broker-1", "broker-2"},
+			LifecycleEpoch: topic.InitialLifecycleEpoch,
 		},
 		"orders-eu-1": {
 			Leader: "broker-3", LeaderEpoch: 4, CommittedHWM: 9,
 			Replicas: []string{"broker-3"}, ISR: []string{"broker-3"},
+			LifecycleEpoch: topic.InitialLifecycleEpoch,
 		},
 	}
 	for key, metadata := range partitions {

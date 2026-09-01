@@ -396,21 +396,18 @@ func TestDistributedLeaderAcknowledgementDoesNotRequireEffectiveMinimumISR(t *te
 	require.Eventually(t, func() bool { return executor.committed() == 1 }, time.Second, time.Millisecond)
 }
 
-func TestDistributedPublishMigratesLegacyUnknownHWMBeforeAppend(t *testing.T) {
+func TestDistributedPublishRejectsMarkerlessHWMMetadata(t *testing.T) {
 	handler, manager, executor := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
-	legacyMetadata := `{"leader":"broker-1","leader_epoch":7,"replicas":["broker-1","broker-2"],"isr":["broker-1","broker-2"],"partition_count":1}`
-	result := handler.Cluster.RaftManager.GetFSM().Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + legacyMetadata)})
-	require.Nil(t, result)
-	require.False(t, handler.Cluster.RaftManager.GetFSM().GetPartitionMetadata("orders-0").CommittedHWMKnown)
+	markerlessMetadata := `{"leader":"broker-1","leader_epoch":7,"lifecycle_epoch":1,"replicas":["broker-1","broker-2"],"isr":["broker-1","broker-2"],"partition_count":1}`
+	result := handler.Cluster.RaftManager.GetFSM().Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + markerlessMetadata)})
+	require.ErrorIs(t, result.(error), fsm.ErrUnsupportedRecoveryProtocol)
 
 	response := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=value", NewClientContext("", 0))
-	require.Contains(t, response, `"status":"OK"`)
-	metadata := handler.Cluster.RaftManager.GetFSM().GetPartitionMetadata("orders-0")
-	require.True(t, metadata.CommittedHWMKnown)
-	require.Zero(t, metadata.CommittedHWM, "legacy boundary was migrated after the new append")
-
-	<-executor.started
+	require.Contains(t, response, "ERROR:")
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.Zero(t, partition.NextOffset())
 	close(executor.barrier)
 }
 
@@ -458,50 +455,6 @@ func TestDistributedIdempotentDuplicateBatchReturnsOriginalOffset(t *testing.T) 
 	executor.mu.Lock()
 	require.Equal(t, 2, executor.replicateCalls)
 	executor.mu.Unlock()
-}
-
-func TestReplicaPreservesLegacyTailUntilCommittedHWMIsKnown(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.LogDir = t.TempDir()
-	cfg.EnabledDistribution = true
-	diskManager := disk.NewDiskManager(cfg)
-	manager := topic.NewTopicManager(cfg, diskManager, nil)
-	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
-	state := fsm.NewBrokerFSM(manager, nil)
-	raftManager := &MockRaftManagerForForward{isLeader: true, state: state}
-	cluster := clusterController.NewClusterController(context.Background(), cfg, raftManager, nil, "broker-2", "broker-2:9001")
-	handler := NewCommandHandler(manager, cfg, nil, nil, cluster)
-	t.Cleanup(func() {
-		_ = handler.Close()
-		for _, name := range manager.ListTopics() {
-			for _, partition := range manager.GetTopic(name).Partitions {
-				partition.Close()
-			}
-		}
-		diskManager.CloseAllHandlers()
-	})
-
-	legacyMetadata := `{"leader":"broker-1","leader_epoch":7,"replicas":["broker-1","broker-2"],"isr":["broker-1","broker-2"],"partition_count":1}`
-	require.Nil(t, state.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + legacyMetadata)}))
-	partition, err := manager.GetTopic("orders").GetPartition(0)
-	require.NoError(t, err)
-	legacyTail := []types.Message{{Payload: "legacy"}}
-	require.NoError(t, partition.EnqueueBatchLeader(legacyTail))
-	require.Equal(t, uint64(1), partition.NextOffset())
-
-	replication := types.MessageCommand{
-		Topic: "orders", Partition: 0, LeaderID: "broker-1", LeaderEpoch: 7,
-		Messages: []types.Message{{Offset: 1, Payload: "new"}},
-	}
-	payload, err := json.Marshal(replication)
-	require.NoError(t, err)
-	response := handler.handleReplicateMessage("REPLICATE_MESSAGE payload=" + string(payload))
-	require.Contains(t, response, "committed HWM is not known")
-	require.Equal(t, uint64(1), partition.NextOffset())
-	messages, err := partition.ReadMessages(0, 2)
-	require.NoError(t, err)
-	require.Len(t, messages, 1)
-	require.Equal(t, "legacy", messages[0].Payload)
 }
 
 func TestReplicaNewLeaderEpochReconcilesUncommittedOldLeaderTail(t *testing.T) {
@@ -765,7 +718,7 @@ func newDistributedAckTestHandler(t *testing.T, brokerMinISR int) (*CommandHandl
 
 func installPartitionMetadata(t *testing.T, handler *CommandHandler, topicName string, isr []string) {
 	t.Helper()
-	metadata := fmt.Sprintf(`{"leader":"broker-1","leader_epoch":7,"committed_hwm":0,"replicas":["broker-1","broker-2"],"isr":["%s"],"partition_count":1}`, strings.Join(isr, `","`))
+	metadata := fmt.Sprintf(`{"leader":"broker-1","leader_epoch":7,"lifecycle_epoch":1,"committed_hwm_version":1,"committed_hwm":0,"replicas":["broker-1","broker-2"],"isr":["%s"],"partition_count":1}`, strings.Join(isr, `","`))
 	result := handler.Cluster.RaftManager.GetFSM().Apply(&raft.Log{Data: []byte("PARTITION:" + topicName + "-0:" + metadata)})
 	require.Nil(t, result)
 }
@@ -773,6 +726,9 @@ func installPartitionMetadata(t *testing.T, handler *CommandHandler, topicName s
 func applyPartitionMetadata(t *testing.T, state *fsm.BrokerFSM, topicName string, partition int, metadata fsm.PartitionMetadata) {
 	t.Helper()
 	metadata.CommittedHWMKnown = true
+	if metadata.LifecycleEpoch == 0 {
+		metadata.LifecycleEpoch = topic.InitialLifecycleEpoch
+	}
 	encoded, err := json.Marshal(metadata)
 	require.NoError(t, err)
 	result := state.Apply(&raft.Log{Data: []byte(fmt.Sprintf("PARTITION:%s-%d:%s", topicName, partition, encoded))})

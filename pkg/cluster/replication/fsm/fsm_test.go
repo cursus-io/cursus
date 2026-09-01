@@ -36,18 +36,16 @@ func (m *MockStorageHandler) AppendMessageSync(topic string, partition int, msg 
 	return m.AppendMessage(topic, partition, msg)
 }
 
-func TestPartitionMetadataDistinguishesLegacyMissingHWMFromExplicitZero(t *testing.T) {
-	legacyJSON, err := json.Marshal(PartitionMetadata{Leader: "broker-1", PartitionCount: 1})
-	require.NoError(t, err)
-	require.NotContains(t, string(legacyJSON), "committed_hwm")
+func TestPartitionMetadataRequiresAuthoritativeHWMMarker(t *testing.T) {
 	var legacy PartitionMetadata
-	require.NoError(t, json.Unmarshal(legacyJSON, &legacy))
-	require.False(t, legacy.CommittedHWMKnown)
+	err := json.Unmarshal([]byte(`{"leader":"broker-1","committed_hwm":0}`), &legacy)
+	require.ErrorIs(t, err, ErrUnsupportedRecoveryProtocol)
 
 	currentJSON, err := json.Marshal(PartitionMetadata{
-		Leader: "broker-1", PartitionCount: 1, CommittedHWMKnown: true,
+		Leader: "broker-1", PartitionCount: 1, LifecycleEpoch: topic.InitialLifecycleEpoch,
 	})
 	require.NoError(t, err)
+	require.Contains(t, string(currentJSON), `"committed_hwm_version":1`)
 	require.Contains(t, string(currentJSON), `"committed_hwm":0`)
 	var current PartitionMetadata
 	require.NoError(t, json.Unmarshal(currentJSON, &current))
@@ -94,6 +92,21 @@ func newTestFSM() *BrokerFSM {
 	}
 
 	return fsm
+}
+
+func snapshotTopicDefinition(name string, partitions int) *topic.Definition {
+	definition := topic.DefaultDefinition(name, nil)
+	definition.Partitions = partitions
+	definition.ReplicationFactor = 1
+	return &definition
+}
+
+func authoritativePartitionMetadata(partitions int) *PartitionMetadata {
+	return &PartitionMetadata{
+		PartitionCount:    partitions,
+		CommittedHWMKnown: true,
+		LifecycleEpoch:    topic.InitialLifecycleEpoch,
+	}
 }
 
 func TestBrokerFSM_Apply_Register(t *testing.T) {
@@ -162,7 +175,10 @@ func TestBrokerFSM_Apply_Deregister_ReturnsNil(t *testing.T) {
 
 func TestBrokerFSM_Apply_Partition(t *testing.T) {
 	fsm := newTestFSM()
-	metadata := PartitionMetadata{Leader: "l1", Replicas: []string{"r1"}, LeaderEpoch: 1}
+	metadata := PartitionMetadata{
+		Leader: "l1", Replicas: []string{"r1"}, LeaderEpoch: 1,
+		LifecycleEpoch: topic.InitialLifecycleEpoch,
+	}
 	data, _ := json.Marshal(metadata)
 	key := "t1-0"
 
@@ -183,25 +199,26 @@ func TestBrokerFSM_PartitionCommitIsMonotonicAndEpochFenced(t *testing.T) {
 	f := newTestFSM()
 	require.NoError(t, f.tm.CreateTopic("orders", 1, false, false))
 	metadata := PartitionMetadata{
-		Leader:      "node-1",
-		LeaderEpoch: 4,
-		Replicas:    []string{"node-1", "node-2"},
-		ISR:         []string{"node-1", "node-2"},
+		Leader:         "node-1",
+		LeaderEpoch:    4,
+		Replicas:       []string{"node-1", "node-2"},
+		ISR:            []string{"node-1", "node-2"},
+		LifecycleEpoch: topic.InitialLifecycleEpoch,
 	}
 	data, err := json.Marshal(metadata)
 	require.NoError(t, err)
 	require.Nil(t, f.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + string(data))}))
 
-	commit := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":4,"hwm":1}`
+	commit := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":4,"lifecycle_epoch":1,"hwm":1}`
 	require.Nil(t, f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + commit)}))
 	require.Equal(t, uint64(1), f.GetPartitionMetadata("orders-0").CommittedHWM)
 
-	stale := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":3,"hwm":2}`
+	stale := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":3,"lifecycle_epoch":1,"hwm":2}`
 	staleResult := f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + stale)})
 	staleErr, ok := staleResult.(error)
 	require.True(t, ok)
 	require.ErrorIs(t, staleErr, ErrPartitionCommitFenced)
-	regression := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":4,"hwm":0}`
+	regression := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":4,"lifecycle_epoch":1,"hwm":0}`
 	regressionResult := f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + regression)})
 	regressionErr, ok := regressionResult.(error)
 	require.True(t, ok)
@@ -209,9 +226,17 @@ func TestBrokerFSM_PartitionCommitIsMonotonicAndEpochFenced(t *testing.T) {
 	require.Equal(t, uint64(1), f.GetPartitionMetadata("orders-0").CommittedHWM)
 }
 
-func TestBrokerFSM_SnapshotRestoresCommittedPartitionWatermark(t *testing.T) {
+func TestBrokerFSM_SnapshotRestoresAuthoritativeZeroWatermark(t *testing.T) {
 	f := newTestFSM()
-	metadata := PartitionMetadata{Leader: "node-1", LeaderEpoch: 2, CommittedHWM: 19, PartitionCount: 1}
+	registerActiveBroker(t, f, "node-1")
+	command, err := json.Marshal(TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()})
+	require.NoError(t, err)
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(command)), Index: 6}))
+	metadata := PartitionMetadata{
+		Leader: "node-1", LeaderEpoch: 2, CommittedHWM: 0, CommittedHWMKnown: true,
+		PartitionCount: 1, Replicas: []string{"node-1"}, ISR: []string{"node-1"},
+		LifecycleEpoch: topic.InitialLifecycleEpoch,
+	}
 	data, err := json.Marshal(metadata)
 	require.NoError(t, err)
 	require.Nil(t, f.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + string(data)), Index: 7}))
@@ -226,7 +251,7 @@ func TestBrokerFSM_SnapshotRestoresCommittedPartitionWatermark(t *testing.T) {
 	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))))
 	restoredMetadata := restored.GetPartitionMetadata("orders-0")
 	require.NotNil(t, restoredMetadata)
-	require.Equal(t, uint64(19), restoredMetadata.CommittedHWM)
+	require.Equal(t, uint64(0), restoredMetadata.CommittedHWM)
 	require.Equal(t, 2, restoredMetadata.LeaderEpoch)
 }
 
@@ -264,7 +289,11 @@ func TestBrokerFSM_Apply_UpdatesAppliedIndex(t *testing.T) {
 func TestBrokerFSM_Snapshot_Restore(t *testing.T) {
 	fsm := newTestFSM()
 	fsm.brokers["b1"] = &BrokerInfo{ID: "b1", Addr: "a1"}
-	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{Leader: "l1", PartitionCount: 1}
+	fsm.partitionMetadata["t1-0"] = &PartitionMetadata{
+		Leader: "l1", PartitionCount: 1, CommittedHWMKnown: true,
+		LifecycleEpoch: topic.InitialLifecycleEpoch,
+	}
+	fsm.topicState["t1"] = snapshotTopicDefinition("t1", 1)
 	fsm.logs[5] = &ReplicationEntry{Topic: "t1"}
 	fsm.applied = 5
 

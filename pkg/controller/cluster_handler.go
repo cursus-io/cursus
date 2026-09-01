@@ -564,16 +564,7 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshot(topicName string, parti
 		return fail(fmt.Errorf("insufficient_in_sync_replicas current=%d required=%d", len(snapshot.ISR), requiredISR))
 	}
 	if !metadata.CommittedHWMKnown {
-		// Pre-watermark metadata treated the durable local tail as committed on
-		// restart. Preserve that compatibility boundary exactly once, but make
-		// it authoritative through the current leader epoch before any new
-		// acknowledgement mode can append beyond it.
-		legacyHWM := p.GetHWM()
-		if err := ch.commitPartitionHWMAtEpoch(topicName, partitionID, legacyHWM, snapshot.Leader, snapshot.LeaderEpoch, snapshot.LifecycleEpoch); err != nil {
-			return fail(fmt.Errorf("migrate legacy committed HWM: %w", err))
-		}
-		metadata.CommittedHWM = legacyHWM
-		metadata.CommittedHWMKnown = true
+		return fail(fmt.Errorf("partition committed HWM is not initialized; clean bootstrap required"))
 	}
 	key := fmt.Sprintf("%s-%d", topicName, partitionID)
 	wantedFence := partitionLeadershipFence{leader: snapshot.Leader, epoch: snapshot.LeaderEpoch}
@@ -633,7 +624,7 @@ func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID 
 	}
 	metadataLifecycleEpoch := metadata.LifecycleEpoch
 	if metadataLifecycleEpoch == 0 {
-		metadataLifecycleEpoch = topic.InitialLifecycleEpoch
+		return fail(fmt.Errorf("partition lifecycle epoch is not initialized; clean bootstrap required"))
 	}
 	if pTopic := ch.TopicManager.GetTopic(topicName); pTopic == nil {
 		return fail(fmt.Errorf("topic lifecycle pending or topic not found"))
@@ -641,7 +632,7 @@ func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID 
 		return fail(fmt.Errorf("stale topic lifecycle epoch: current=%d local=%d", metadataLifecycleEpoch, pTopic.LifecycleEpoch))
 	}
 	if !metadata.CommittedHWMKnown {
-		return fail(fmt.Errorf("partition committed HWM is not known; wait for the current leader to migrate legacy metadata"))
+		return fail(fmt.Errorf("partition committed HWM is not initialized; clean bootstrap required"))
 	}
 	key := fmt.Sprintf("%s-%d", topicName, partitionID)
 	wantedFence := partitionLeadershipFence{leader: leader, epoch: leaderEpoch}

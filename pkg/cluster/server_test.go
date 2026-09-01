@@ -11,6 +11,7 @@ import (
 	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 type MockServiceDiscovery struct {
@@ -31,7 +32,10 @@ func (m *MockServiceDiscovery) RemoveNode(nodeID string) (string, error) {
 	args := m.Called(nodeID)
 	return args.String(0), args.Error(1)
 }
-func (m *MockServiceDiscovery) UpdateHeartbeat(nodeID string)       { m.Called(nodeID) }
+func (m *MockServiceDiscovery) UpdateHeartbeat(nodeID string) { m.Called(nodeID) }
+func (m *MockServiceDiscovery) HandleHeartbeat(nodeID string, proofs []fsm.ISRCatchupProof) error {
+	return m.Called(nodeID, proofs).Error(0)
+}
 func (m *MockServiceDiscovery) StartReconciler(ctx context.Context) { m.Called(ctx) }
 func (m *MockServiceDiscovery) Reconcile()                          { m.Called() }
 
@@ -105,7 +109,7 @@ func TestClusterServer_Heartbeat(t *testing.T) {
 
 	addr := ln.Addr().String()
 
-	msd.On("UpdateHeartbeat", "node-hb").Return().Once()
+	msd.On("HandleHeartbeat", "node-hb", []fsm.ISRCatchupProof(nil)).Return(nil).Once()
 
 	conn, err := net.Dial("tcp", addr)
 	assert.NoError(t, err)
@@ -119,6 +123,31 @@ func TestClusterServer_Heartbeat(t *testing.T) {
 	respData, err := util.ReadWithLength(conn)
 	assert.NoError(t, err)
 	assert.Contains(t, string(respData), "true")
+	msd.AssertExpectations(t)
+}
+
+func TestClusterServer_HeartbeatCarriesCatchupProofs(t *testing.T) {
+	msd := new(MockServiceDiscovery)
+	server := NewClusterServer(msd)
+	listener, err := server.Start("127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	proofs := []fsm.ISRCatchupProof{{
+		Topic: "orders", Partition: 0, BrokerID: "node-hb",
+		CommittedHWM: 3, LocalLEO: 3, LocalHWM: 3, LeaderEpoch: 2, LifecycleEpoch: 1,
+	}}
+	msd.On("HandleHeartbeat", "node-hb", proofs).Return(nil).Once()
+	connection, err := net.Dial("tcp", listener.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = connection.Close() }()
+	payload, err := json.Marshal(heartbeatRequest{NodeID: "node-hb", CatchupProofs: proofs})
+	require.NoError(t, err)
+	require.NoError(t, util.WriteWithLength(connection, util.EncodeMessage("cluster", "HEARTBEAT_CLUSTER "+string(payload))))
+
+	response, err := util.ReadWithLength(connection)
+	require.NoError(t, err)
+	require.Contains(t, string(response), `"success":true`)
 	msd.AssertExpectations(t)
 }
 

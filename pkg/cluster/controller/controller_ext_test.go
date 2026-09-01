@@ -44,6 +44,10 @@ func (m *MockServiceDiscovery) UpdateHeartbeat(nodeID string) {
 	m.Called(nodeID)
 }
 
+func (m *MockServiceDiscovery) HandleHeartbeat(nodeID string, proofs []fsm.ISRCatchupProof) error {
+	return m.Called(nodeID, proofs).Error(0)
+}
+
 func (m *MockServiceDiscovery) StartReconciler(ctx context.Context) {
 	m.Called(ctx)
 }
@@ -94,7 +98,8 @@ func TestClusterController_Basic(t *testing.T) {
 
 func TestReplicateToFollowersRejectsStalePartitionLeader(t *testing.T) {
 	brokerFSM := fsm.NewBrokerFSM(nil, nil)
-	metadata := `{"leader":"node2","leader_epoch":7,"replicas":["node1","node2"],"isr":["node1","node2"]}`
+	metadata := `{"leader":"node2","leader_epoch":7,"replicas":["node1","node2"],"isr":["node1","node2"],` +
+		`"committed_hwm_version":1,"committed_hwm":0,"lifecycle_epoch":1}`
 	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + metadata)}))
 	rm := &MockRaftManager{mockFSM: brokerFSM}
 	cc := NewClusterController(context.Background(), config.DefaultConfig(), rm, nil, "node1", "localhost:9001")
@@ -113,7 +118,8 @@ func TestReplicaFenceResponseMatchesExactWireCodes(t *testing.T) {
 
 func TestReplicateToFollowersRequiresConfiguredMinimumISR(t *testing.T) {
 	brokerFSM := fsm.NewBrokerFSM(nil, nil)
-	metadata := `{"leader":"node1","leader_epoch":7,"replicas":["node1","node2"],"isr":["node1"]}`
+	metadata := `{"leader":"node1","leader_epoch":7,"replicas":["node1","node2"],"isr":["node1"],` +
+		`"committed_hwm_version":1,"committed_hwm":0,"lifecycle_epoch":1}`
 	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + metadata)}))
 	rm := &MockRaftManager{mockFSM: brokerFSM}
 	cc := NewClusterController(context.Background(), config.DefaultConfig(), rm, nil, "node1", "localhost:9001")
@@ -168,7 +174,7 @@ func TestClusterRouter_Forwarding(t *testing.T) {
 		rm.mockFSM.Apply(&raft.Log{Data: append([]byte("REGISTER:"), []byte(brokerJSON)...), Index: 1})
 
 		// set partition leader to that broker
-		metaJSON := `{"leader":"node2"}`
+		metaJSON := `{"leader":"node2","committed_hwm_version":1,"committed_hwm":0,"lifecycle_epoch":1}`
 		rm.mockFSM.Apply(&raft.Log{Data: append([]byte("PARTITION:topic1-0:"), []byte(metaJSON)...), Index: 2})
 
 		router.brokerID = "node1"

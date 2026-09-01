@@ -35,8 +35,7 @@ func topicStateFromDefinitions(definitions []topic.Definition) map[string]*topic
 	return state
 }
 
-func migrateSnapshotTopicDefinitionFields(
-	version int,
+func validateSnapshotTopicDefinitionFields(
 	state map[string]*topic.Definition,
 	metadata map[string]*PartitionMetadata,
 ) error {
@@ -44,62 +43,30 @@ func migrateSnapshotTopicDefinitionFields(
 		if definition == nil {
 			continue
 		}
-		if version >= 7 {
-			if definition.Revision == 0 {
-				return fmt.Errorf("topic state %q is missing revision in snapshot version %d", name, version)
-			}
-			if definition.ReplicationFactor == 0 {
-				return fmt.Errorf("topic state %q is missing replication_factor in snapshot version %d", name, version)
-			}
-			if version >= 8 && definition.LifecycleEpoch == 0 {
-				return fmt.Errorf("topic state %q is missing lifecycle_epoch in snapshot version %d", name, version)
-			}
-			if definition.LifecycleEpoch == 0 {
-				definition.LifecycleEpoch = topic.InitialLifecycleEpoch
-			}
-			for partition := 0; partition < definition.Partitions; partition++ {
-				if partitionMetadata := metadata[name+"-"+strconv.Itoa(partition)]; partitionMetadata != nil && partitionMetadata.LifecycleEpoch == 0 {
-					partitionMetadata.LifecycleEpoch = definition.LifecycleEpoch
-				}
-			}
-			continue
-		}
-
 		if definition.Revision == 0 {
-			definition.Revision = topic.InitialDefinitionRevision
+			return fmt.Errorf("topic state %q is missing revision in snapshot version %d", name, SnapshotVersionCurrent)
+		}
+		if definition.ReplicationFactor == 0 {
+			return fmt.Errorf("topic state %q is missing replication_factor in snapshot version %d", name, SnapshotVersionCurrent)
 		}
 		if definition.LifecycleEpoch == 0 {
-			definition.LifecycleEpoch = topic.InitialLifecycleEpoch
+			return fmt.Errorf("topic state %q is missing lifecycle_epoch in snapshot version %d", name, SnapshotVersionCurrent)
 		}
-		for partition := 0; partition < definition.Partitions; partition++ {
-			if partitionMetadata := metadata[name+"-"+strconv.Itoa(partition)]; partitionMetadata != nil && partitionMetadata.LifecycleEpoch == 0 {
-				partitionMetadata.LifecycleEpoch = definition.LifecycleEpoch
-			}
-		}
-		if definition.ReplicationFactor != 0 {
-			continue
-		}
-		inferred := 0
 		for partition := 0; partition < definition.Partitions; partition++ {
 			partitionMetadata := metadata[name+"-"+strconv.Itoa(partition)]
-			if partitionMetadata == nil || len(partitionMetadata.Replicas) == 0 {
+			if partitionMetadata == nil {
 				continue
 			}
-			candidate := len(partitionMetadata.Replicas)
-			if inferred != 0 && inferred != candidate {
+			if partitionMetadata.LifecycleEpoch == 0 {
+				return fmt.Errorf("partition metadata %q is missing lifecycle_epoch in snapshot version %d", name+"-"+strconv.Itoa(partition), SnapshotVersionCurrent)
+			}
+			if partitionMetadata.LifecycleEpoch != definition.LifecycleEpoch {
 				return fmt.Errorf(
-					"topic state %q has inconsistent legacy replica counts: %d and %d",
-					name,
-					inferred,
-					candidate,
+					"partition metadata %q lifecycle epoch %d conflicts with topic %q epoch %d",
+					name+"-"+strconv.Itoa(partition), partitionMetadata.LifecycleEpoch, name, definition.LifecycleEpoch,
 				)
 			}
-			inferred = candidate
 		}
-		if inferred == 0 {
-			inferred = topic.DefaultReplicationFactor
-		}
-		definition.ReplicationFactor = inferred
 	}
 	return nil
 }
@@ -191,15 +158,13 @@ func validateTopicState(
 				name,
 			)
 		}
-		metadataLifecycleEpoch := partitionMetadata.LifecycleEpoch
-		if metadataLifecycleEpoch == 0 {
-			metadataLifecycleEpoch = topic.InitialLifecycleEpoch
-			partitionMetadata.LifecycleEpoch = metadataLifecycleEpoch
+		if partitionMetadata.LifecycleEpoch == 0 {
+			return nil, fmt.Errorf("partition metadata %q is missing lifecycle epoch", key)
 		}
-		if metadataLifecycleEpoch != definition.LifecycleEpoch {
+		if partitionMetadata.LifecycleEpoch != definition.LifecycleEpoch {
 			return nil, fmt.Errorf(
 				"partition metadata %q lifecycle epoch %d conflicts with topic %q epoch %d",
-				key, metadataLifecycleEpoch, name, definition.LifecycleEpoch,
+				key, partitionMetadata.LifecycleEpoch, name, definition.LifecycleEpoch,
 			)
 		}
 		if partition >= definition.Partitions {
@@ -213,42 +178,4 @@ func validateTopicState(
 	}
 
 	return definitions, nil
-}
-
-func legacyTopicState(metadata map[string]*PartitionMetadata) map[string]*topic.Definition {
-	state := make(map[string]*topic.Definition)
-	for key, partitionMetadata := range metadata {
-		if partitionMetadata == nil {
-			continue
-		}
-		separator := strings.LastIndex(key, "-")
-		if separator <= 0 {
-			continue
-		}
-		partition, err := strconv.Atoi(key[separator+1:])
-		if err != nil || partition < 0 {
-			continue
-		}
-		name := key[:separator]
-		partitions := partitionMetadata.PartitionCount
-		if partitions <= partition {
-			partitions = partition + 1
-		}
-		current := state[name]
-		if current == nil {
-			current = &topic.Definition{
-				Name:       name,
-				Partitions: partitions,
-				Idempotent: partitionMetadata.Idempotent,
-				Policy:     topic.DefaultPolicy(),
-			}
-			state[name] = current
-			continue
-		}
-		if partitions > current.Partitions {
-			current.Partitions = partitions
-		}
-		current.Idempotent = current.Idempotent || partitionMetadata.Idempotent
-	}
-	return state
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/controller"
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -33,7 +34,8 @@ type leaveResp struct {
 }
 
 type heartbeatRequest struct {
-	NodeID string `json:"node_id"`
+	NodeID        string                `json:"node_id"`
+	CatchupProofs []fsm.ISRCatchupProof `json:"catchup_proofs,omitempty"`
 }
 
 type ClusterServer struct {
@@ -133,7 +135,10 @@ func (h *ClusterServer) handleHeartbeatCluster(conn net.Conn, payload string) {
 	}
 
 	util.Debug("ClusterServer: Received heartbeat from %s", req.NodeID)
-	h.sd.UpdateHeartbeat(req.NodeID)
+	if err := h.sd.HandleHeartbeat(req.NodeID, req.CatchupProofs); err != nil {
+		h.writeErrorResponse(conn, err.Error())
+		return
+	}
 	h.writeResponse(conn, map[string]bool{"success": true})
 }
 

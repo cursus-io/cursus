@@ -309,7 +309,7 @@ func TestBrokerFSMTopicTruncateResetsStateAndFencesOldLifecycle(t *testing.T) {
 	require.NoError(t, snapshot.Persist(&MockSnapshotSink{Writer: &encoded}))
 	var persisted BrokerFSMState
 	require.NoError(t, json.Unmarshal(encoded.Bytes(), &persisted))
-	require.Equal(t, 8, persisted.Version, "truncated lifecycle requires the epoch-aware snapshot format")
+	require.Equal(t, SnapshotVersionCurrent, persisted.Version, "truncated lifecycle requires the clean-bootstrap snapshot format")
 	restoredCfg := *cfg
 	restoredCfg.LogDir = t.TempDir()
 	restoredManager := topic.NewTopicManager(&restoredCfg, &MockHandlerProvider{}, nil)

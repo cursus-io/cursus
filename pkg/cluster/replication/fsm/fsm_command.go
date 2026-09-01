@@ -22,10 +22,8 @@ type PartitionMetadata struct {
 	ISR          []string `json:"isr"`
 	LeaderEpoch  int      `json:"leader_epoch"`
 	CommittedHWM uint64   `json:"-"`
-	// CommittedHWMKnown distinguishes metadata written before the committed
-	// watermark existed from a real committed watermark of zero. It is an
-	// in-memory compatibility marker; the presence of committed_hwm on the
-	// wire is authoritative.
+	// CommittedHWMKnown is an internal initialization invariant. Current wire
+	// data always carries an explicit version and numeric committed watermark.
 	CommittedHWMKnown bool   `json:"-"`
 	PartitionCount    int    `json:"partition_count"`
 	Idempotent        bool   `json:"idempotent"`
@@ -33,31 +31,30 @@ type PartitionMetadata struct {
 }
 
 type partitionMetadataJSON struct {
-	Leader         string   `json:"leader"`
-	Replicas       []string `json:"replicas"`
-	ISR            []string `json:"isr"`
-	LeaderEpoch    int      `json:"leader_epoch"`
-	CommittedHWM   *uint64  `json:"committed_hwm,omitempty"`
-	PartitionCount int      `json:"partition_count"`
-	Idempotent     bool     `json:"idempotent"`
-	LifecycleEpoch uint64   `json:"lifecycle_epoch,omitempty"`
+	Leader              string   `json:"leader"`
+	Replicas            []string `json:"replicas"`
+	ISR                 []string `json:"isr"`
+	LeaderEpoch         int      `json:"leader_epoch"`
+	CommittedHWMVersion *int     `json:"committed_hwm_version,omitempty"`
+	CommittedHWM        *uint64  `json:"committed_hwm,omitempty"`
+	PartitionCount      int      `json:"partition_count"`
+	Idempotent          bool     `json:"idempotent"`
+	LifecycleEpoch      uint64   `json:"lifecycle_epoch,omitempty"`
 }
 
 func (m PartitionMetadata) MarshalJSON() ([]byte, error) {
-	var committed *uint64
-	if m.CommittedHWMKnown || m.CommittedHWM != 0 {
-		value := m.CommittedHWM
-		committed = &value
-	}
+	version := CommittedHWMVersionCurrent
+	committed := m.CommittedHWM
 	return json.Marshal(partitionMetadataJSON{
-		Leader:         m.Leader,
-		Replicas:       m.Replicas,
-		ISR:            m.ISR,
-		LeaderEpoch:    m.LeaderEpoch,
-		CommittedHWM:   committed,
-		PartitionCount: m.PartitionCount,
-		Idempotent:     m.Idempotent,
-		LifecycleEpoch: m.LifecycleEpoch,
+		Leader:              m.Leader,
+		Replicas:            m.Replicas,
+		ISR:                 m.ISR,
+		LeaderEpoch:         m.LeaderEpoch,
+		CommittedHWMVersion: &version,
+		CommittedHWM:        &committed,
+		PartitionCount:      m.PartitionCount,
+		Idempotent:          m.Idempotent,
+		LifecycleEpoch:      m.LifecycleEpoch,
 	})
 }
 
@@ -65,6 +62,18 @@ func (m *PartitionMetadata) UnmarshalJSON(data []byte) error {
 	var decoded partitionMetadataJSON
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return err
+	}
+	if decoded.CommittedHWMVersion == nil {
+		return fmt.Errorf("%w: partition metadata is missing committed_hwm_version; clean bootstrap required", ErrUnsupportedRecoveryProtocol)
+	}
+	if *decoded.CommittedHWMVersion != CommittedHWMVersionCurrent {
+		return fmt.Errorf("%w: committed_hwm_version %d is not supported", ErrUnsupportedRecoveryProtocol, *decoded.CommittedHWMVersion)
+	}
+	if decoded.CommittedHWM == nil {
+		return fmt.Errorf("%w: committed_hwm_version requires a numeric committed_hwm", ErrUnsupportedRecoveryProtocol)
+	}
+	if decoded.LifecycleEpoch == 0 {
+		return fmt.Errorf("%w: partition metadata is missing lifecycle_epoch; clean bootstrap required", ErrUnsupportedRecoveryProtocol)
 	}
 	*m = PartitionMetadata{
 		Leader:            decoded.Leader,
@@ -74,24 +83,33 @@ func (m *PartitionMetadata) UnmarshalJSON(data []byte) error {
 		PartitionCount:    decoded.PartitionCount,
 		Idempotent:        decoded.Idempotent,
 		LifecycleEpoch:    decoded.LifecycleEpoch,
-		CommittedHWMKnown: decoded.CommittedHWM != nil,
-	}
-	if decoded.CommittedHWM != nil {
-		m.CommittedHWM = *decoded.CommittedHWM
+		CommittedHWMKnown: true,
+		CommittedHWM:      *decoded.CommittedHWM,
 	}
 	return nil
 }
 
 type TopicCommand struct {
-	Name              string                 `json:"name,omitempty"`
-	Partitions        int                    `json:"partitions,omitempty"`
-	Idempotent        bool                   `json:"idempotent,omitempty"`
-	EventSourcing     bool                   `json:"event_sourcing,omitempty"`
-	LeaderID          string                 `json:"leader_id,omitempty"`
-	ReplicationFactor int                    `json:"replication_factor,omitempty"`
-	Policy            topic.Policy           `json:"policy,omitempty"`
-	Definition        *topic.Definition      `json:"definition,omitempty"`
-	Patch             *topic.DefinitionPatch `json:"patch,omitempty"`
+	Name                string                 `json:"name,omitempty"`
+	Partitions          int                    `json:"partitions,omitempty"`
+	Idempotent          bool                   `json:"idempotent,omitempty"`
+	EventSourcing       bool                   `json:"event_sourcing,omitempty"`
+	LeaderID            string                 `json:"leader_id,omitempty"`
+	ReplicationFactor   int                    `json:"replication_factor,omitempty"`
+	Policy              topic.Policy           `json:"policy,omitempty"`
+	Definition          *topic.Definition      `json:"definition,omitempty"`
+	Patch               *topic.DefinitionPatch `json:"patch,omitempty"`
+	CommittedHWMVersion *int                   `json:"committed_hwm_version,omitempty"`
+}
+
+func (c TopicCommand) MarshalJSON() ([]byte, error) {
+	type alias TopicCommand
+	copy := c
+	if copy.CommittedHWMVersion == nil {
+		version := CommittedHWMVersionCurrent
+		copy.CommittedHWMVersion = &version
+	}
+	return json.Marshal(alias(copy))
 }
 
 type TopicConfigCommand struct {
@@ -105,6 +123,12 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	if err := json.Unmarshal([]byte(jsonData), &topicCmd); err != nil {
 		util.Error("FSM: Failed to unmarshal topic command: %v", err)
 		return err
+	}
+	if topicCmd.CommittedHWMVersion == nil {
+		return fmt.Errorf("%w: TOPIC command is missing committed_hwm_version; clean bootstrap required", ErrUnsupportedRecoveryProtocol)
+	}
+	if *topicCmd.CommittedHWMVersion != CommittedHWMVersionCurrent {
+		return fmt.Errorf("%w: TOPIC committed_hwm_version %d is not supported", ErrUnsupportedRecoveryProtocol, *topicCmd.CommittedHWMVersion)
 	}
 	patchCommand := topicCmd.Definition != nil || topicCmd.Patch != nil
 	if patchCommand && topicCmd.Definition == nil {
@@ -137,9 +161,6 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		stagedPartitions := copyPartitionMetadataState(f.partitionMetadata)
 		currentPartitions := 0
 		currentTopic := stagedTopics[topicCmd.Name]
-		if currentTopic == nil {
-			currentTopic = legacyTopicState(stagedPartitions)[topicCmd.Name]
-		}
 		if currentTopic == nil {
 			if f.cd != nil {
 				if references := f.cd.TopicGroupReferences(topicCmd.Name); len(references) != 0 {
@@ -608,30 +629,12 @@ func (f *BrokerFSM) applyPartitionCommand(jsonData string) interface{} {
 		if metadata.Leader != current.Leader && metadata.LeaderEpoch <= current.LeaderEpoch {
 			return fmt.Errorf("leader change for %s must advance epoch: current=%d requested=%d", key, current.LeaderEpoch, metadata.LeaderEpoch)
 		}
-		if current.CommittedHWMKnown && !metadata.CommittedHWMKnown {
-			metadata.CommittedHWM = current.CommittedHWM
-			metadata.CommittedHWMKnown = true
-		}
 		if metadata.CommittedHWMKnown && current.CommittedHWMKnown && metadata.CommittedHWM < current.CommittedHWM {
 			return fmt.Errorf("committed HWM regression for %s: current=%d requested=%d", key, current.CommittedHWM, metadata.CommittedHWM)
 		}
-		currentLifecycleEpoch := current.LifecycleEpoch
-		if currentLifecycleEpoch == 0 {
-			currentLifecycleEpoch = topic.InitialLifecycleEpoch
+		if metadata.LifecycleEpoch != current.LifecycleEpoch {
+			return fmt.Errorf("stale topic lifecycle epoch for %s: current=%d requested=%d", key, current.LifecycleEpoch, metadata.LifecycleEpoch)
 		}
-		requestedLifecycleEpoch := metadata.LifecycleEpoch
-		if requestedLifecycleEpoch == 0 {
-			if currentLifecycleEpoch > topic.InitialLifecycleEpoch {
-				return fmt.Errorf("missing topic lifecycle epoch for %s", key)
-			}
-			requestedLifecycleEpoch = topic.InitialLifecycleEpoch
-		}
-		if requestedLifecycleEpoch != currentLifecycleEpoch {
-			return fmt.Errorf("stale topic lifecycle epoch for %s: current=%d requested=%d", key, currentLifecycleEpoch, requestedLifecycleEpoch)
-		}
-		metadata.LifecycleEpoch = requestedLifecycleEpoch
-	} else if metadata.LifecycleEpoch == 0 {
-		metadata.LifecycleEpoch = topic.InitialLifecycleEpoch
 	}
 	f.partitionMetadata[key] = &metadata
 	util.Debug("FSM: Updated partition metadata for %s", key)
@@ -672,18 +675,13 @@ func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
 		f.mu.Unlock()
 		return fmt.Errorf("committed HWM regression for %s: current=%d requested=%d", key, metadata.CommittedHWM, cmd.HWM)
 	}
-	metadataLifecycleEpoch := metadata.LifecycleEpoch
-	if metadataLifecycleEpoch == 0 {
-		metadataLifecycleEpoch = topic.InitialLifecycleEpoch
-	}
 	if cmd.LifecycleEpoch == 0 {
-		if metadataLifecycleEpoch > topic.InitialLifecycleEpoch {
-			f.mu.Unlock()
-			return fmt.Errorf("missing topic lifecycle epoch for %s", key)
-		}
-	} else if cmd.LifecycleEpoch != metadataLifecycleEpoch {
 		f.mu.Unlock()
-		return fmt.Errorf("stale topic lifecycle epoch for %s: current=%d requested=%d", key, metadataLifecycleEpoch, cmd.LifecycleEpoch)
+		return fmt.Errorf("missing topic lifecycle epoch for %s", key)
+	}
+	if cmd.LifecycleEpoch != metadata.LifecycleEpoch {
+		f.mu.Unlock()
+		return fmt.Errorf("stale topic lifecycle epoch for %s: current=%d requested=%d", key, metadata.LifecycleEpoch, cmd.LifecycleEpoch)
 	}
 	metadata.CommittedHWM = cmd.HWM
 	metadata.CommittedHWMKnown = true

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	replicationFSM "github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
@@ -118,14 +119,15 @@ func distributedTopicCommandPayload(defaults topic.Definition, patch topic.Defin
 		return nil, fmt.Errorf("min_in_sync_replicas %d exceeds replication factor %d", *legacyDefinition.Policy.MinInSyncReplicas, legacyDefinition.ReplicationFactor)
 	}
 	return map[string]interface{}{
-		"name":               legacyDefinition.Name,
-		"partitions":         legacyDefinition.Partitions,
-		"idempotent":         legacyDefinition.Idempotent,
-		"event_sourcing":     legacyDefinition.EventSourcing,
-		"replication_factor": legacyDefinition.ReplicationFactor,
-		"policy":             legacyDefinition.Policy,
-		"definition":         defaults,
-		"patch":              patch,
+		"name":                  legacyDefinition.Name,
+		"partitions":            legacyDefinition.Partitions,
+		"idempotent":            legacyDefinition.Idempotent,
+		"event_sourcing":        legacyDefinition.EventSourcing,
+		"replication_factor":    legacyDefinition.ReplicationFactor,
+		"policy":                legacyDefinition.Policy,
+		"definition":            defaults,
+		"patch":                 patch,
+		"committed_hwm_version": replicationFSM.CommittedHWMVersionCurrent,
 	}, nil
 }
 

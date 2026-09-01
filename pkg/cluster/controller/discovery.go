@@ -17,6 +17,7 @@ type ServiceDiscovery interface {
 	AddNode(nodeID string, addr string) (string, error)
 	RemoveNode(nodeID string) (string, error)
 	UpdateHeartbeat(nodeID string)
+	HandleHeartbeat(nodeID string, proofs []fsm.ISRCatchupProof) error
 	StartReconciler(ctx context.Context)
 	Reconcile()
 }
@@ -96,6 +97,15 @@ func (sd *serviceDiscovery) UpdateHeartbeat(nodeID string) {
 	if sd.rm != nil && sd.rm.GetISRManager() != nil {
 		sd.rm.GetISRManager().UpdateHeartbeat(nodeID)
 	}
+}
+
+func (sd *serviceDiscovery) HandleHeartbeat(nodeID string, proofs []fsm.ISRCatchupProof) error {
+	if sd.rm == nil || sd.rm.GetISRManager() == nil {
+		return nil
+	}
+	manager := sd.rm.GetISRManager()
+	manager.UpdateHeartbeat(nodeID)
+	return manager.SubmitCatchupProofs(nodeID, proofs)
 }
 
 func (sd *serviceDiscovery) AddNode(nodeID string, addr string) (string, error) {

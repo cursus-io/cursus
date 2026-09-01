@@ -47,7 +47,7 @@ func TestBrokerFSMSnapshotRestoresTopicDefinition(t *testing.T) {
 	require.NoError(t, snapshot.Persist(&MockSnapshotSink{Writer: buffer}))
 	var persisted BrokerFSMState
 	require.NoError(t, json.Unmarshal(buffer.Bytes(), &persisted))
-	require.Equal(t, 7, persisted.Version, "first-generation snapshots stay rolling-upgrade compatible")
+	require.Equal(t, SnapshotVersionCurrent, persisted.Version)
 
 	restored := newTestFSM()
 	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(buffer.Bytes()))))
@@ -98,33 +98,15 @@ func TestBrokerFSMSnapshotRestoresAlteredTopicMinInSyncReplicas(t *testing.T) {
 	require.Equal(t, 2, *restoredTopic.Policy.MinInSyncReplicas)
 }
 
-func TestBrokerFSMRestorePreservesLegacyTailWithoutCommittedHWMField(t *testing.T) {
+func TestBrokerFSMRestoreRejectsLegacySnapshotBeforeReconciliation(t *testing.T) {
 	manager, partition := newDurableFSMTopic(t, "legacy-orders")
-	require.NoError(t, partition.EnqueueSync(types.Message{Payload: "legacy-committed"}))
+	require.NoError(t, partition.EnqueueSync(types.Message{Payload: "durable"}))
 	partition.FlushDisk()
 
-	definition := manager.GetTopic("legacy-orders").Definition()
-	state := BrokerFSMState{
-		Version:    6,
-		TopicState: map[string]*topic.Definition{"legacy-orders": &definition},
-		PartitionMetadata: map[string]*PartitionMetadata{
-			"legacy-orders-0": {
-				Leader: "broker-1", LeaderEpoch: 7, PartitionCount: 1,
-				Replicas: []string{"broker-1"}, ISR: []string{"broker-1"},
-			},
-		},
-	}
-	data, err := json.Marshal(state)
-	require.NoError(t, err)
-	require.NotContains(t, string(data), "committed_hwm")
-
-	restored := NewBrokerFSM(manager, nil)
-	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(data))))
+	err := NewBrokerFSM(manager, nil).Restore(io.NopCloser(bytes.NewBufferString(`{"version":8}`)))
+	require.ErrorIs(t, err, ErrUnsupportedRecoveryProtocol)
 	require.Equal(t, uint64(1), partition.NextOffset())
 	require.Equal(t, uint64(1), partition.GetHWM())
-	messages, err := partition.ReadCommitted(0, 10)
-	require.NoError(t, err)
-	require.Len(t, messages, 1)
 }
 
 func TestBrokerFSMRestoreTruncatesTailBeyondExplicitCommittedHWMZero(t *testing.T) {
@@ -136,11 +118,12 @@ func TestBrokerFSMRestoreTruncatesTailBeyondExplicitCommittedHWMZero(t *testing.
 
 	definition := manager.GetTopic("current-orders").Definition()
 	state := BrokerFSMState{
-		Version:    6,
+		Version:    SnapshotVersionCurrent,
 		TopicState: map[string]*topic.Definition{"current-orders": &definition},
 		PartitionMetadata: map[string]*PartitionMetadata{
 			"current-orders-0": {
-				Leader: "broker-1", LeaderEpoch: 7, CommittedHWMKnown: true, PartitionCount: 1,
+				Leader: "broker-1", LeaderEpoch: 7, LifecycleEpoch: definition.LifecycleEpoch,
+				CommittedHWMKnown: true, PartitionCount: 1,
 				Replicas: []string{"broker-1"}, ISR: []string{"broker-1"},
 			},
 		},
@@ -156,6 +139,53 @@ func TestBrokerFSMRestoreTruncatesTailBeyondExplicitCommittedHWMZero(t *testing.
 	messages, err := partition.ReadMessages(0, 10)
 	require.NoError(t, err)
 	require.Empty(t, messages)
+}
+
+func TestBrokerFSMRestoreTruncatesTailToAuthoritativeCommittedHWM(t *testing.T) {
+	manager, partition := newDurableFSMTopic(t, "bounded-orders")
+	require.NoError(t, partition.EnqueueBatchLeader([]types.Message{
+		{Payload: "committed"},
+		{Payload: "uncommitted"},
+	}))
+	partition.FlushDisk()
+
+	data := currentSnapshotData(t, manager, "bounded-orders", 1)
+	require.NoError(t, NewBrokerFSM(manager, nil).Restore(io.NopCloser(bytes.NewReader(data))))
+	require.Equal(t, uint64(1), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM())
+	messages, err := partition.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	require.Equal(t, "committed", messages[0].Payload)
+}
+
+func TestBrokerFSMRestoreRejectsCommittedHWMAboveLocalLEO(t *testing.T) {
+	manager, partition := newDurableFSMTopic(t, "behind-orders")
+	data := currentSnapshotData(t, manager, "behind-orders", 1)
+
+	err := NewBrokerFSM(manager, nil).Restore(io.NopCloser(bytes.NewReader(data)))
+	require.ErrorContains(t, err, "replica is behind committed watermark")
+	require.Zero(t, partition.NextOffset())
+	require.Zero(t, partition.GetHWM())
+}
+
+func currentSnapshotData(t *testing.T, manager *topic.TopicManager, name string, committedHWM uint64) []byte {
+	t.Helper()
+	definition := manager.GetTopic(name).Definition()
+	state := BrokerFSMState{
+		Version:    SnapshotVersionCurrent,
+		TopicState: map[string]*topic.Definition{name: &definition},
+		PartitionMetadata: map[string]*PartitionMetadata{
+			name + "-0": {
+				Leader: "broker-1", LeaderEpoch: 7, LifecycleEpoch: definition.LifecycleEpoch,
+				CommittedHWM: committedHWM, CommittedHWMKnown: true, PartitionCount: 1,
+				Replicas: []string{"broker-1"}, ISR: []string{"broker-1"},
+			},
+		},
+	}
+	data, err := json.Marshal(state)
+	require.NoError(t, err)
+	return data
 }
 
 func newDurableFSMTopic(t *testing.T, name string) (*topic.TopicManager, *topic.Partition) {
@@ -253,62 +283,33 @@ func TestBrokerFSMRepeatedCreatePreservesExistingPartitionState(t *testing.T) {
 	require.Equal(t, 24, f.tm.GetTopic("orders").Policy.RetentionHours)
 }
 
-func TestBrokerFSMRestoreMigratesLegacyPartitionMetadata(t *testing.T) {
-	state := BrokerFSMState{
-		Version: 5,
-		PartitionMetadata: map[string]*PartitionMetadata{
-			"legacy-topic-0": {PartitionCount: 2, Idempotent: true},
-			"legacy-topic-1": {PartitionCount: 2, Idempotent: true},
-		},
+func TestBrokerFSMRestoreRejectsLegacyPartitionMetadataSnapshot(t *testing.T) {
+	for _, version := range []int{5, 7, 8} {
+		data := []byte(fmt.Sprintf(`{"version":%d}`, version))
+		err := newTestFSM().Restore(io.NopCloser(bytes.NewReader(data)))
+		require.ErrorIs(t, err, ErrUnsupportedRecoveryProtocol)
 	}
-	data, err := json.Marshal(state)
-	require.NoError(t, err)
-
-	restored := newTestFSM()
-	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(data))))
-	restoredTopic := restored.tm.GetTopic("legacy-topic")
-	require.NotNil(t, restoredTopic)
-	require.Len(t, restoredTopic.Partitions, 2)
-	require.True(t, restoredTopic.IsIdempotent)
-	require.Equal(t, topic.DefaultPolicy(), restoredTopic.Policy)
 }
 
-func TestBrokerFSMRestoreVersionSixInfersDefinitionFields(t *testing.T) {
-	state := BrokerFSMState{
-		Version: 6,
-		TopicState: map[string]*topic.Definition{
-			"orders": {Name: "orders", Partitions: 1, Policy: topic.DefaultPolicy()},
-		},
-		PartitionMetadata: map[string]*PartitionMetadata{
-			"orders-0": {PartitionCount: 1, Replicas: []string{"broker-1", "broker-2"}},
-		},
-	}
-	data, err := json.Marshal(state)
-	require.NoError(t, err)
-
-	restored := newTestFSM()
-	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(data))))
-	definition := restored.tm.GetTopic("orders").Definition()
-	require.Equal(t, uint64(1), definition.Revision)
-	require.Equal(t, 2, definition.ReplicationFactor)
-}
-
-func TestBrokerFSMRestoreVersionSevenRequiresDefinitionFields(t *testing.T) {
-	for _, missing := range []string{"revision", "replication_factor"} {
+func TestBrokerFSMRestoreVersionNineRequiresDefinitionFields(t *testing.T) {
+	for _, missing := range []string{"revision", "replication_factor", "lifecycle_epoch"} {
 		t.Run(missing, func(t *testing.T) {
 			definition := &topic.Definition{
-				Name: "orders", Revision: 1, Partitions: 1, ReplicationFactor: 3, Policy: topic.DefaultPolicy(),
+				Name: "orders", Revision: 1, LifecycleEpoch: topic.InitialLifecycleEpoch,
+				Partitions: 1, ReplicationFactor: 3, Policy: topic.DefaultPolicy(),
 			}
 			if missing == "revision" {
 				definition.Revision = 0
-			} else {
+			} else if missing == "replication_factor" {
 				definition.ReplicationFactor = 0
+			} else {
+				definition.LifecycleEpoch = 0
 			}
 			state := BrokerFSMState{
-				Version:    7,
+				Version:    SnapshotVersionCurrent,
 				TopicState: map[string]*topic.Definition{"orders": definition},
 				PartitionMetadata: map[string]*PartitionMetadata{
-					"orders-0": {PartitionCount: 1},
+					"orders-0": authoritativePartitionMetadata(1),
 				},
 			}
 			data, err := json.Marshal(state)
@@ -320,11 +321,11 @@ func TestBrokerFSMRestoreVersionSevenRequiresDefinitionFields(t *testing.T) {
 	}
 }
 
-func TestBrokerFSMRestoreRejectsVersionSixWithoutTopicState(t *testing.T) {
+func TestBrokerFSMRestoreRejectsVersionNineWithoutTopicState(t *testing.T) {
 	state := BrokerFSMState{
-		Version: 6,
+		Version: SnapshotVersionCurrent,
 		PartitionMetadata: map[string]*PartitionMetadata{
-			"orders-0": {PartitionCount: 1},
+			"orders-0": authoritativePartitionMetadata(1),
 		},
 	}
 	data, err := json.Marshal(state)
@@ -336,16 +337,12 @@ func TestBrokerFSMRestoreRejectsVersionSixWithoutTopicState(t *testing.T) {
 
 func TestBrokerFSMRestoreRejectsMissingPartitionMetadata(t *testing.T) {
 	state := BrokerFSMState{
-		Version: 6,
+		Version: SnapshotVersionCurrent,
 		TopicState: map[string]*topic.Definition{
-			"orders": {
-				Name:       "orders",
-				Partitions: 2,
-				Policy:     topic.DefaultPolicy(),
-			},
+			"orders": snapshotTopicDefinition("orders", 2),
 		},
 		PartitionMetadata: map[string]*PartitionMetadata{
-			"orders-0": {PartitionCount: 2},
+			"orders-0": authoritativePartitionMetadata(2),
 		},
 	}
 	data, err := json.Marshal(state)
@@ -357,17 +354,13 @@ func TestBrokerFSMRestoreRejectsMissingPartitionMetadata(t *testing.T) {
 
 func TestBrokerFSMRestoreRejectsPartitionWithoutTopicDefinition(t *testing.T) {
 	state := BrokerFSMState{
-		Version: 6,
+		Version: SnapshotVersionCurrent,
 		TopicState: map[string]*topic.Definition{
-			"orders": {
-				Name:       "orders",
-				Partitions: 1,
-				Policy:     topic.DefaultPolicy(),
-			},
+			"orders": snapshotTopicDefinition("orders", 1),
 		},
 		PartitionMetadata: map[string]*PartitionMetadata{
-			"orders-0": {PartitionCount: 1},
-			"audit-0":  {PartitionCount: 1},
+			"orders-0": authoritativePartitionMetadata(1),
+			"audit-0":  authoritativePartitionMetadata(1),
 		},
 	}
 	data, err := json.Marshal(state)
