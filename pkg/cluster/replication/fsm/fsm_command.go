@@ -360,14 +360,17 @@ func (f *BrokerFSM) applyTopicConfigCommand(jsonData string) interface{} {
 		return fmt.Errorf("invalid topic definition: %w", err)
 	}
 
-	if f.tm != nil {
-		if err := f.tm.ApplyDefinition(updated); err != nil {
-			return fmt.Errorf("materialize topic config: %w", err)
-		}
-	}
 	f.mu.Lock()
+	latest := f.topicState[command.Name]
+	if latest == nil || latest.Revision != current.Revision || latest.LifecycleEpoch != current.LifecycleEpoch {
+		f.mu.Unlock()
+		return fmt.Errorf("%w for topic %q: authoritative definition changed during config update", topic.ErrTopicRevisionConflict, command.Name)
+	}
 	f.topicState[command.Name] = copyTopicDefinition(&updated)
 	f.mu.Unlock()
+	if err := f.materializeTopicCreate(&updated); err != nil {
+		return fmt.Errorf("materialize topic config: %w", err)
+	}
 	return nil
 }
 
@@ -448,17 +451,6 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
 		}
 	}
-	if coordinatorRef != nil {
-		if _, err := coordinatorRef.DeleteInactiveGroupsForTopic(payload.Topic); err != nil {
-			return fmt.Errorf("delete consumer groups for topic %q: %w", payload.Topic, err)
-		}
-	}
-	if transactionManager != nil {
-		if _, err := transactionManager.PruneTopicReferences(payload.Topic); err != nil {
-			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
-		}
-	}
-
 	f.mu.Lock()
 	for key := range f.partitionMetadata {
 		if idx := strings.LastIndex(key, "-"); idx != -1 && key[:idx] == payload.Topic {
@@ -547,17 +539,6 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
 		}
 	}
-	if coordinatorRef != nil {
-		if _, err := coordinatorRef.DeleteInactiveGroupsForTopic(payload.Topic); err != nil {
-			return fmt.Errorf("delete consumer groups for topic %q: %w", payload.Topic, err)
-		}
-	}
-	if transactionManager != nil {
-		if _, err := transactionManager.PruneTopicReferences(payload.Topic); err != nil {
-			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
-		}
-	}
-
 	target := *current
 	target.Revision++
 	target.LifecycleEpoch++

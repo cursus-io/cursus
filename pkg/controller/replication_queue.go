@@ -245,9 +245,7 @@ func (l *partitionReplicationLane) runCatchup() {
 func (l *partitionReplicationLane) enqueueCatchup(task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) {
 	select {
 	case l.catchup <- partitionCatchupTask{task: task, snapshot: snapshot}:
-	default:
-		metrics.AsyncReplicationFailures.WithLabelValues(task.topic, "backpressure").Inc()
-		util.Error("async non-ISR replication queue full topic=%s partition=%d ack_mode=%s error_class=backpressure", task.topic, task.partition, task.ackMode)
+	case <-l.owner.ctx.Done():
 	}
 }
 

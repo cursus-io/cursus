@@ -64,6 +64,49 @@ func TestBrokerFSMTopicCreateFailureCommitsDesiredStateAndReconciles(t *testing.
 	require.Empty(t, f.TopicMaterializationIssues())
 }
 
+func TestBrokerFSMTopicConfigFailureCommitsDesiredStateAndReconciles(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	dm := disk.NewDiskManager(cfg)
+	t.Cleanup(dm.CloseAllHandlers)
+	manager := topic.NewTopicManager(cfg, dm, nil)
+	t.Cleanup(manager.Stop)
+	f := NewBrokerFSM(manager, nil)
+	registerActiveBroker(t, f, "broker-1")
+
+	create, err := json.Marshal(TopicCommand{
+		Name:              "orders",
+		Partitions:        1,
+		ReplicationFactor: 1,
+		Policy:            topic.DefaultPolicy(),
+	})
+	require.NoError(t, err)
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 2}))
+
+	metadataPath := filepath.Join(cfg.LogDir, topic.TopicMetadataFileName)
+	require.NoError(t, os.Remove(metadataPath))
+	require.NoError(t, os.Mkdir(metadataPath, 0o750))
+	one := 1
+	configCommand, err := json.Marshal(TopicConfigCommand{Name: "orders", MinInSyncReplicas: &one})
+	require.NoError(t, err)
+
+	result := f.Apply(&raft.Log{Data: []byte("TOPIC_CONFIG:" + string(configCommand)), Index: 3})
+	require.Error(t, result.(error))
+	authoritative, found := f.GetTopicDefinition("orders")
+	require.True(t, found)
+	require.Equal(t, uint64(2), authoritative.Revision)
+	require.Equal(t, 1, *authoritative.Policy.MinInSyncReplicas)
+	require.Equal(t, uint64(1), manager.GetTopic("orders").Revision)
+	require.Nil(t, manager.GetTopic("orders").Policy.MinInSyncReplicas)
+	require.Equal(t, TopicMaterializationCreate, f.TopicMaterializationIssues()[0].Operation)
+
+	require.NoError(t, os.RemoveAll(metadataPath))
+	require.NoError(t, f.ReconcileTopicMaterializations())
+	require.Equal(t, uint64(2), manager.GetTopic("orders").Revision)
+	require.Equal(t, 1, *manager.GetTopic("orders").Policy.MinInSyncReplicas)
+	require.Empty(t, f.TopicMaterializationIssues())
+}
+
 func TestBrokerFSMDeleteFailureCommitsDesiredStateAndReconciles(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

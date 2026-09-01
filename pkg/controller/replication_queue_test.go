@@ -330,6 +330,37 @@ func TestBlockedNonISRReplicaDoesNotDelayNextPartitionTask(t *testing.T) {
 	coordinator.close()
 }
 
+func TestCommittedNonISRTasksAreNotDroppedWhenCatchupQueueIsFull(t *testing.T) {
+	executor := newBarrierReplicationExecutor()
+	executor.nonISRBarrier = make(chan struct{})
+	close(executor.barrier)
+	coordinator := newPartitionReplicationCoordinator(1, executor)
+
+	for commitHWM := uint64(1); commitHWM <= 3; commitHWM++ {
+		reservation, err := coordinator.reserve(context.Background(), "orders", 0)
+		require.NoError(t, err)
+		task := replicationTaskForMode(executor, ackpolicy.All)
+		task.commitHWM = commitHWM
+		reservation.submit(task)
+		require.NoError(t, <-task.result)
+		if commitHWM == 1 {
+			require.Eventually(t, func() bool {
+				executor.mu.Lock()
+				defer executor.mu.Unlock()
+				return executor.nonISRCalls == 1
+			}, time.Second, time.Millisecond)
+		}
+	}
+
+	close(executor.nonISRBarrier)
+	require.Eventually(t, func() bool {
+		executor.mu.Lock()
+		defer executor.mu.Unlock()
+		return executor.nonISRCalls == 3
+	}, time.Second, time.Millisecond)
+	coordinator.close()
+}
+
 func TestDistributedLeaderAcknowledgementReturnsBeforeFollowerAndKeepsReplicating(t *testing.T) {
 	handler, manager, executor := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))

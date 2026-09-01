@@ -38,6 +38,21 @@ func (p *recoverableTopicCleanupProvider) RemoveTopicStorage(string) error {
 	return nil
 }
 
+type recoverableLifecyclePublisher struct {
+	fail bool
+}
+
+func (p *recoverableLifecyclePublisher) Publish(string, *types.Message) error {
+	if p.fail {
+		return errors.New("injected lifecycle persistence failure")
+	}
+	return nil
+}
+
+func (*recoverableLifecyclePublisher) CreateTopic(string, int, bool, bool) error {
+	return nil
+}
+
 func TestBrokerFSMTopicDeleteCleansLifecycleStateAndIsExplicitlyIdempotent(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
@@ -121,6 +136,69 @@ func TestBrokerFSMTopicDeleteReportsCommittedDeletionWhenLocalCleanupIsPending(t
 	result := fsm.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders"}`), Index: 2})
 	require.Equal(t, topic.DeleteResult{Deleted: true, CleanupPending: true}, result)
 	require.Nil(t, manager.GetTopic("orders"))
+}
+
+func TestBrokerFSMLifecycleDependencyCleanupRunsAfterCommitAndReconciles(t *testing.T) {
+	newFSM := func(t *testing.T) (*BrokerFSM, *topic.TopicManager, *coordinator.Coordinator, *recoverableLifecyclePublisher) {
+		t.Helper()
+		cfg := config.DefaultConfig()
+		cfg.LogDir = t.TempDir()
+		manager := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+		t.Cleanup(manager.Stop)
+		publisher := &recoverableLifecyclePublisher{}
+		groupCoordinator, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, publisher)
+		require.NoError(t, err)
+		t.Cleanup(groupCoordinator.Stop)
+		fsm := NewBrokerFSM(manager, groupCoordinator)
+		fsm.SetTransactionManager(transaction.NewManager())
+		registerLifecycleBroker(t, fsm, "broker-1", TopicLifecycleProtocolVersion)
+		create, err := json.Marshal(TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()})
+		require.NoError(t, err)
+		require.Nil(t, fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 2}))
+		require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
+		return fsm, manager, groupCoordinator, publisher
+	}
+
+	t.Run("delete", func(t *testing.T) {
+		fsm, manager, groupCoordinator, publisher := newFSM(t)
+		publisher.fail = true
+
+		result := fsm.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders"}`), Index: 3})
+		require.Equal(t, topic.DeleteResult{Deleted: true, CleanupPending: true}, result)
+		_, found := fsm.GetTopicDefinition("orders")
+		require.False(t, found, "replicated delete must commit before dependency cleanup")
+		require.Nil(t, manager.GetTopic("orders"), "the deleted local topic must be fenced")
+		require.NotNil(t, groupCoordinator.GetGroup("workers"), "failed cleanup must remain retryable")
+		require.Equal(t, TopicMaterializationDelete, fsm.TopicMaterializationIssues()[0].Operation)
+
+		publisher.fail = false
+		require.NoError(t, fsm.ReconcileTopicMaterializations())
+		require.Nil(t, groupCoordinator.GetGroup("workers"))
+		require.Empty(t, fsm.TopicMaterializationIssues())
+	})
+
+	t.Run("truncate", func(t *testing.T) {
+		fsm, manager, groupCoordinator, publisher := newFSM(t)
+		publisher.fail = true
+
+		result := fsm.Apply(&raft.Log{Data: []byte(`TOPIC_TRUNCATE:{"topic":"orders","expected_revision":1}`), Index: 3})
+		truncate := result.(topic.TruncateResult)
+		require.True(t, truncate.Truncated)
+		require.True(t, truncate.CleanupPending)
+		definition, found := fsm.GetTopicDefinition("orders")
+		require.True(t, found)
+		require.Equal(t, uint64(2), definition.LifecycleEpoch)
+		require.Nil(t, manager.GetTopic("orders"), "the old local generation must be fenced")
+		require.NotNil(t, groupCoordinator.GetGroup("workers"), "failed cleanup must remain retryable")
+		require.Equal(t, TopicMaterializationTruncate, fsm.TopicMaterializationIssues()[0].Operation)
+
+		publisher.fail = false
+		require.NoError(t, fsm.ReconcileTopicMaterializations())
+		require.Nil(t, groupCoordinator.GetGroup("workers"))
+		require.NotNil(t, manager.GetTopic("orders"))
+		require.Equal(t, uint64(2), manager.GetTopic("orders").LifecycleEpoch)
+		require.Empty(t, fsm.TopicMaterializationIssues())
+	})
 }
 
 func TestBrokerFSMCreateWaitsForStaleLifecycleCleanup(t *testing.T) {

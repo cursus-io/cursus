@@ -265,10 +265,6 @@ func (f *BrokerFSM) materializeTopicTruncate(definition *topic.Definition) error
 	if definition == nil {
 		return nil
 	}
-	if f.tm == nil {
-		f.recordTopicMaterialization(definition.Name, TopicMaterializationTruncate, nil)
-		return nil
-	}
 
 	f.materializationMu.Lock()
 	defer f.materializationMu.Unlock()
@@ -279,8 +275,14 @@ func (f *BrokerFSM) materializeTopicTruncate(definition *topic.Definition) error
 		return nil
 	}
 
-	_, err := f.tm.ApplyTruncateDefinition(*definition)
+	var err error
+	if f.tm != nil {
+		_, err = f.tm.ApplyTruncateDefinition(*definition)
+	}
 	if err == nil {
+		err = f.cleanupTopicDependencies(definition.Name)
+	}
+	if err == nil && f.tm != nil {
 		err = f.tm.CompleteTruncation(definition.Name)
 	}
 	f.recordTopicMaterialization(definition.Name, TopicMaterializationTruncate, err)
@@ -295,10 +297,6 @@ func (f *BrokerFSM) materializeTopicDelete(name string) error {
 		f.recordTopicMaterialization(name, TopicMaterializationDelete, nil)
 		return nil
 	}
-	if f.tm == nil {
-		f.recordTopicMaterialization(name, TopicMaterializationDelete, nil)
-		return nil
-	}
 
 	f.materializationMu.Lock()
 	defer f.materializationMu.Unlock()
@@ -310,13 +308,39 @@ func (f *BrokerFSM) materializeTopicDelete(name string) error {
 		return nil
 	}
 
-	deleted, err := f.tm.DeleteTopicDurable(name)
-	if err == nil && !deleted {
-		err = f.tm.CleanupTopicStorage(name)
+	var err error
+	if f.tm != nil {
+		var deleted bool
+		deleted, err = f.tm.DeleteTopicDurable(name)
+		if err == nil && !deleted {
+			err = f.tm.CleanupTopicStorage(name)
+		}
+	}
+	if err == nil {
+		err = f.cleanupTopicDependencies(name)
 	}
 	f.recordTopicMaterialization(name, TopicMaterializationDelete, err)
 	if err != nil {
 		return fmt.Errorf("delete local topic %q: %w", name, err)
+	}
+	return nil
+}
+
+func (f *BrokerFSM) cleanupTopicDependencies(name string) error {
+	f.mu.RLock()
+	coordinatorRef := f.cd
+	transactionManager := f.txn
+	f.mu.RUnlock()
+
+	if coordinatorRef != nil {
+		if _, err := coordinatorRef.DeleteInactiveGroupsForTopic(name); err != nil {
+			return fmt.Errorf("delete consumer groups for topic %q: %w", name, err)
+		}
+	}
+	if transactionManager != nil {
+		if _, err := transactionManager.PruneTopicReferences(name); err != nil {
+			return fmt.Errorf("prune transaction references for topic %q: %w", name, err)
+		}
 	}
 	return nil
 }
