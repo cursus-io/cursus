@@ -125,7 +125,9 @@ func (c *Coordinator) RecordHeartbeatForGeneration(groupName, consumerID string,
 	}
 
 	member := c.groups[groupName].Members[consumerID]
-	member.LastHeartbeat = time.Now()
+	now := time.Now()
+	member.LastHeartbeat = now
+	c.groups[groupName].LastActivity = now
 	util.Debug("Heartbeat from %s/%s generation=%d", groupName, consumerID, generation)
 	return nil
 }

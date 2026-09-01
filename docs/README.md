@@ -34,6 +34,7 @@ This index separates normative contracts from implementation notes. When prose c
 ## Operations And Evaluation
 
 - [Observability](reference/observability.md): health, readiness, metrics, alerts, and security boundaries.
+- [Consumer Lifecycle Alerts](operations/consumer-lifecycle-alerts.md): external minimum-member contracts and canary validation.
 - [Performance](reference/performance.md): tuning knobs and durability/latency trade-offs.
 - [Benchmarks](reference/benchmark.md): tools, workload model, and result interpretation.
 - [Benchmark Verification](benchmark-verification.md): local standalone and cluster verification.

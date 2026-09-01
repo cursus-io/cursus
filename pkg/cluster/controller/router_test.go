@@ -179,6 +179,33 @@ func TestClusterRouter_FindCoordinator_CacheRebuild(t *testing.T) {
 	t.Logf("group-x: before=%s, after=%s", id1, id3)
 }
 
+func TestClusterRouter_FindCoordinatorOwnersUsesOneMembershipSnapshot(t *testing.T) {
+	mockFSM := fsm.NewBrokerFSM(nil, nil)
+	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n1\",\"addr\":\"localhost:7001\",\"status\":\"active\"}")})
+	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n2\",\"addr\":\"localhost:7002\",\"status\":\"active\"}")})
+
+	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
+	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "", nil)
+	groups := []string{"alpha", "beta", "gamma"}
+	owners, err := router.FindCoordinatorOwners(groups)
+	if err != nil {
+		t.Fatalf("FindCoordinatorOwners failed: %v", err)
+	}
+	for _, groupName := range groups {
+		owner, ok := owners[groupName]
+		if !ok || (owner != "n1" && owner != "n2") {
+			t.Fatalf("invalid owner for %s: %q", groupName, owner)
+		}
+		singleOwner, _, singleErr := router.FindCoordinator(groupName)
+		if singleErr != nil {
+			t.Fatalf("FindCoordinator(%s) failed: %v", groupName, singleErr)
+		}
+		if owner != singleOwner {
+			t.Fatalf("batch owner %q differs from single owner %q for %s", owner, singleOwner, groupName)
+		}
+	}
+}
+
 func TestClusterRouter_FindCoordinator_NoActiveBrokers(t *testing.T) {
 	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
