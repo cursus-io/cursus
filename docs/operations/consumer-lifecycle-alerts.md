@@ -27,10 +27,14 @@ that application's availability contract.
 
 ## Recording And Alert Rules
 
-Collapse the three broker targets to one actual member value:
+Collapse the three broker targets only while exactly one broker claims
+authority. This prevents an overlapping old coordinator from masking a `1 ->
+0` transition through `max`:
 
 ```promql
 max by (topic, group) (cursus_consumer_group_members)
+and on (topic, group)
+sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
 ```
 
 A required group might never have been registered, so a direct comparison
@@ -40,7 +44,11 @@ from the catalog before comparing:
 ```promql
 (
   (
-    max by (topic, group) (cursus_consumer_group_members)
+    (
+      max by (topic, group) (cursus_consumer_group_members)
+      and on (topic, group)
+      sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
+    )
     or on (topic, group)
     (0 * cursus_required_consumer_group_min_members)
   )
@@ -81,7 +89,8 @@ sum by (topic, group, reason) (
 
 The `reason` label is bounded to `coordinator_lookup`, `group_lookup`, and
 `topic_lookup`. Member IDs, client addresses, broker endpoints, and raw errors
-are never metric labels.
+are never metric labels. A failure-counter series is created on its first
+failure rather than emitting three zero-valued reason series for every group.
 
 ## Canary Firing And Resolution Check
 
@@ -100,8 +109,16 @@ members, because its aggregate would not reach zero.
    and the state is stable:
 
    ```promql
-   max by (topic, group) (cursus_consumer_group_members) == 1
-   max by (topic, group) (cursus_consumer_group_state{state="stable"}) == 1
+   (
+     max by (topic, group) (cursus_consumer_group_members) == 1
+     and on (topic, group)
+     sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
+   )
+   (
+     max by (topic, group) (cursus_consumer_group_state{state="stable"}) == 1
+     and on (topic, group)
+     sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
+   )
    ```
 
 3. Stop the canary. Use graceful leave for the fast path, then repeat once with
@@ -109,8 +126,16 @@ members, because its aggregate would not reach zero.
    state `empty`:
 
    ```promql
-   max by (topic, group) (cursus_consumer_group_members) == 0
-   max by (topic, group) (cursus_consumer_group_state{state="empty"}) == 1
+   (
+     max by (topic, group) (cursus_consumer_group_members) == 0
+     and on (topic, group)
+     sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
+   )
+   (
+     max by (topic, group) (cursus_consumer_group_state{state="empty"}) == 1
+     and on (topic, group)
+     sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
+   )
    ```
 
 4. Verify the required-member alert reaches `firing` after its configured
@@ -128,9 +153,13 @@ members, because its aggregate would not reach zero.
    max by (topic, group) (
      cursus_consumer_group_last_activity_timestamp_seconds
    )
+   and on (topic, group)
+   sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
    max by (topic, group) (
      cursus_consumer_group_last_rebalance_timestamp_seconds
    )
+   and on (topic, group)
+   sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
    ```
 
 This procedure validates actual Cursus state and the external expectation join

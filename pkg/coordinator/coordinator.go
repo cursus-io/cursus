@@ -40,6 +40,7 @@ type Coordinator struct {
 	expirationHandler func(groupName string, generation int, memberIDs []string) error
 	ownershipSince    map[string]time.Time
 	observationOwner  func(groupName string) (bool, error)
+	observationOwners func(groupNames []string) (map[string]bool, error)
 }
 
 type TopicHandler interface {
@@ -279,6 +280,17 @@ func (c *Coordinator) SetGroupSessionCallbacks(
 func (c *Coordinator) SetGroupObservationResolver(resolver func(groupName string) (bool, error)) {
 	c.mu.Lock()
 	c.observationOwner = resolver
+	c.observationOwners = nil
+	c.mu.Unlock()
+}
+
+// SetGroupObservationBatchResolver configures a scrape-scoped distributed
+// exporter ownership lookup. The resolver receives every known group so the
+// cluster membership and coordinator ring only need to be inspected once.
+func (c *Coordinator) SetGroupObservationBatchResolver(resolver func(groupNames []string) (map[string]bool, error)) {
+	c.mu.Lock()
+	c.observationOwner = nil
+	c.observationOwners = resolver
 	c.mu.Unlock()
 }
 
@@ -300,6 +312,7 @@ func (c *Coordinator) ObserveConsumerGroups() []ConsumerGroupObservation {
 	}
 	standalone := c.standalone
 	resolver := c.observationOwner
+	batchResolver := c.observationOwners
 	c.mu.RUnlock()
 	sort.Slice(refs, func(i, j int) bool {
 		if refs[i].topic != refs[j].topic {
@@ -308,50 +321,69 @@ func (c *Coordinator) ObserveConsumerGroups() []ConsumerGroupObservation {
 		return refs[i].group < refs[j].group
 	})
 
-	observations := make([]ConsumerGroupObservation, 0, len(refs))
-	for _, ref := range refs {
-		observation := ConsumerGroupObservation{TopicName: ref.topic, GroupName: ref.group}
+	var (
+		authoritativeByGroup map[string]bool
+		batchErr             error
+	)
+	if !standalone && batchResolver != nil && len(refs) > 0 {
+		groupNames := make([]string, len(refs))
+		for i, ref := range refs {
+			groupNames[i] = ref.group
+		}
+		authoritativeByGroup, batchErr = batchResolver(groupNames)
+	}
+
+	observations := make([]ConsumerGroupObservation, len(refs))
+	for i, ref := range refs {
+		observation := &observations[i]
+		observation.TopicName = ref.topic
+		observation.GroupName = ref.group
 		authoritative := standalone
 		if !standalone {
-			if resolver == nil {
+			if batchResolver != nil {
+				var found bool
+				authoritative, found = authoritativeByGroup[ref.group]
+				if batchErr != nil || !found {
+					observation.ObservationError = ObservationFailureCoordinatorLookup
+					continue
+				}
+			} else if resolver == nil {
 				observation.ObservationError = ObservationFailureCoordinatorLookup
-				observations = append(observations, observation)
 				continue
-			}
-			var err error
-			authoritative, err = resolver(ref.group)
-			if err != nil {
-				observation.ObservationError = ObservationFailureCoordinatorLookup
-				observations = append(observations, observation)
-				continue
+			} else {
+				var err error
+				authoritative, err = resolver(ref.group)
+				if err != nil {
+					observation.ObservationError = ObservationFailureCoordinatorLookup
+					continue
+				}
 			}
 		}
 		observation.CoordinatorUp = authoritative
-		if !authoritative {
-			observations = append(observations, observation)
+	}
+
+	c.mu.RLock()
+	for i, ref := range refs {
+		observation := &observations[i]
+		if !observation.CoordinatorUp {
 			continue
 		}
-
-		c.mu.RLock()
 		group := c.groups[ref.group]
 		if group == nil || group.TopicName != ref.topic {
-			c.mu.RUnlock()
 			observation.CoordinatorUp = false
 			observation.ObservationError = ObservationFailureGroupLookup
-			observations = append(observations, observation)
 			continue
 		}
 		observation.MemberCount = len(group.Members)
 		observation.LastActivity = group.LastActivity
 		observation.LastRebalance = group.LastRebalance
-		c.mu.RUnlock()
 
 		observation.State = ConsumerGroupStateStable
 		if observation.MemberCount == 0 {
 			observation.State = ConsumerGroupStateEmpty
 		}
-		observations = append(observations, observation)
 	}
+	c.mu.RUnlock()
 	return observations
 }
 

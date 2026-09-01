@@ -94,6 +94,43 @@ func TestObserveConsumerGroupsFailsClosedOnCoordinatorLookup(t *testing.T) {
 	assert.Empty(t, observation.State)
 }
 
+func TestObserveConsumerGroupsResolvesAllGroupsInOneBatch(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	coordinator := NewCoordinator(context.Background(), cfg, &DummyPublisher{})
+	t.Cleanup(coordinator.Stop)
+	require.NoError(t, coordinator.RegisterGroup("events", "alpha", 1))
+	require.NoError(t, coordinator.RegisterGroup("events", "beta", 1))
+
+	calls := 0
+	coordinator.SetGroupObservationBatchResolver(func(groupNames []string) (map[string]bool, error) {
+		calls++
+		assert.ElementsMatch(t, []string{"alpha", "beta"}, groupNames)
+		return map[string]bool{"alpha": true, "beta": false}, nil
+	})
+
+	observations := coordinator.ObserveConsumerGroups()
+	require.Len(t, observations, 2)
+	assert.Equal(t, 1, calls)
+	assert.True(t, observations[0].CoordinatorUp)
+	assert.False(t, observations[1].CoordinatorUp)
+}
+
+func TestObserveConsumerGroupsFailsClosedOnIncompleteBatchResult(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	coordinator := NewCoordinator(context.Background(), cfg, &DummyPublisher{})
+	t.Cleanup(coordinator.Stop)
+	require.NoError(t, coordinator.RegisterGroup("events", "workers", 1))
+	coordinator.SetGroupObservationBatchResolver(func([]string) (map[string]bool, error) {
+		return map[string]bool{}, nil
+	})
+
+	observation := requireSingleObservation(t, coordinator)
+	assert.False(t, observation.CoordinatorUp)
+	assert.Equal(t, ObservationFailureCoordinatorLookup, observation.ObservationError)
+}
+
 func TestObserveConsumerGroupsReportsConcurrentGroupDeletion(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true

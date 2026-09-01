@@ -122,21 +122,58 @@ func (r *ClusterRouter) ForwardToPartitionLeader(topic string, partition int, re
 }
 
 func (r *ClusterRouter) FindCoordinator(groupName string) (string, string, error) {
+	routes, err := r.coordinatorRoutes([]string{groupName})
+	if err != nil {
+		return "", "", err
+	}
+	route, ok := routes[groupName]
+	if !ok {
+		return "", "", fmt.Errorf("coordinator route for group %q not found", groupName)
+	}
+	return route.id, route.addr, nil
+}
+
+// FindCoordinatorOwners resolves a set of groups from one broker-membership
+// snapshot. It is used by scrape-time observation to avoid rebuilding and
+// validating the coordinator ring once per group.
+func (r *ClusterRouter) FindCoordinatorOwners(groupNames []string) (map[string]string, error) {
+	routes, err := r.coordinatorRoutes(groupNames)
+	if err != nil {
+		return nil, err
+	}
+	owners := make(map[string]string, len(routes))
+	for groupName, route := range routes {
+		owners[groupName] = route.id
+	}
+	return owners, nil
+}
+
+type coordinatorRoute struct {
+	id   string
+	addr string
+}
+
+func (r *ClusterRouter) coordinatorRoutes(groupNames []string) (map[string]coordinatorRoute, error) {
+	if r == nil || r.rm == nil {
+		return nil, fmt.Errorf("raft manager not available")
+	}
 	fsmRef := r.rm.GetFSM()
 	if fsmRef == nil {
-		return "", "", fmt.Errorf("FSM not available")
+		return nil, fmt.Errorf("FSM not available")
 	}
 
 	brokers := fsmRef.GetBrokers()
-	var activeBrokerIDs []string
+	activeBrokerIDs := make([]string, 0, len(brokers))
+	activeBrokerAddrs := make(map[string]string, len(brokers))
 	for _, info := range brokers {
 		if info.Status == "active" {
 			activeBrokerIDs = append(activeBrokerIDs, info.ID)
+			activeBrokerAddrs[info.ID] = info.Addr
 		}
 	}
 
 	if len(activeBrokerIDs) == 0 {
-		return "", "", fmt.Errorf("no active brokers available")
+		return nil, fmt.Errorf("no active brokers available")
 	}
 
 	sort.Strings(activeBrokerIDs)
@@ -158,16 +195,20 @@ func (r *ClusterRouter) FindCoordinator(groupName string) (string, string, error
 		r.mu.Unlock()
 	}
 
+	routes := make(map[string]coordinatorRoute, len(groupNames))
 	r.mu.RLock()
-	coordID := r.coordRing.Get(groupName)
+	for _, groupName := range groupNames {
+		coordID := r.coordRing.Get(groupName)
+		addr, ok := activeBrokerAddrs[coordID]
+		if !ok {
+			r.mu.RUnlock()
+			return nil, fmt.Errorf("coordinator broker %s not found in active registry", coordID)
+		}
+		routes[groupName] = coordinatorRoute{id: coordID, addr: addr}
+	}
 	r.mu.RUnlock()
 
-	broker := fsmRef.GetBroker(coordID)
-	if broker == nil {
-		return "", "", fmt.Errorf("coordinator broker %s not found in registry", coordID)
-	}
-
-	return coordID, broker.Addr, nil
+	return routes, nil
 }
 
 func (r *ClusterRouter) ForwardToCoordinator(groupName, req string) (string, error) {

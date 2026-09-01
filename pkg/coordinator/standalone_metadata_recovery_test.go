@@ -43,6 +43,11 @@ func TestStandaloneGroupRegistrationSurvivesRestartWithoutCommit(t *testing.T) {
 		controller.NewClientContext("", 0),
 	))
 	require.Equal(t, 1, restarted.RecoverySnapshot().RestoredGroups)
+	observations := restarted.ObserveConsumerGroups()
+	require.Len(t, observations, 1)
+	require.Zero(t, observations[0].MemberCount)
+	require.True(t, observations[0].LastActivity.IsZero(), "volatile heartbeat and lifecycle time is unknown after standalone recovery")
+	require.True(t, observations[0].LastRebalance.IsZero(), "member assignments are not restored in standalone mode")
 }
 
 func TestStandaloneOffsetAndTombstoneRecovery(t *testing.T) {

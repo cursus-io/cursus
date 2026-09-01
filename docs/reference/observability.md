@@ -144,9 +144,9 @@ In diagnostics-only mode, `/ready` includes the retained `consumer_metadata` fai
 | `cursus_consumer_group_members{topic,group}` | Gauge / members | Current member count, emitted only by the authoritative coordinator |
 | `cursus_consumer_group_state{topic,group,state}` | Gauge / boolean | One-hot authoritative state: `stable` or `empty` |
 | `cursus_consumer_group_coordinator_up{topic,group}` | Gauge / boolean | `1` only on the broker that successfully resolves itself as current coordinator; every broker emits `0` or `1` |
-| `cursus_consumer_group_last_activity_timestamp_seconds{topic,group}` | Gauge / Unix seconds | Latest accepted heartbeat or group lifecycle activity on the authoritative coordinator; `0` means unavailable from a legacy snapshot |
-| `cursus_consumer_group_last_rebalance_timestamp_seconds{topic,group}` | Gauge / Unix seconds | Latest completed membership rebalance; `0` means no rebalance has completed |
-| `cursus_consumer_group_observation_failures_total{topic,group,reason}` | Counter / failures | Per-broker observation failures; reason is one of `coordinator_lookup`, `group_lookup`, or `topic_lookup` |
+| `cursus_consumer_group_last_activity_timestamp_seconds{topic,group}` | Gauge / Unix seconds | Latest accepted heartbeat or group lifecycle activity known by the authoritative coordinator; `0` means unknown, including after standalone durable recovery |
+| `cursus_consumer_group_last_rebalance_timestamp_seconds{topic,group}` | Gauge / Unix seconds | Latest completed membership rebalance known by the authoritative coordinator; `0` means unavailable or no rebalance has completed since recovery |
+| `cursus_consumer_group_observation_failures_total{topic,group,reason}` | Counter / failures | Per-broker observation failures; reason is one of `coordinator_lookup`, `group_lookup`, or `topic_lookup`, and a series appears only after its first failure |
 | `cursus_consumer_group_generation{group,topic}` | Gauge / generation | Current group generation |
 | `cursus_consumer_group_assigned_partitions{group,topic}` | Gauge / partitions | Assignments held by active members |
 | `cursus_consumer_group_committed_offset{group,topic,partition}` | Gauge / offsets | Durable next offset |
@@ -160,22 +160,31 @@ the group, while heartbeat activity is coordinator-local. Such a broker emits
 present its retained snapshot as healthy.
 
 For a converged three-broker scrape, exactly one target emits authoritative
-lifecycle gauges and the sum of `coordinator_up` is one. Use `max` across
-`instance` for lifecycle gauges, and `sum` for authority validation and the
-per-broker failure counters:
+lifecycle gauges and the sum of `coordinator_up` is one. Gate each `max` by
+that exact authority count; an unguarded `max` can retain an old positive value
+during an overlapping coordinator view. Use `sum` for the per-broker failure
+counters:
 
 ```promql
 max by (topic, group) (cursus_consumer_group_members)
+and on (topic, group)
+sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
 
 max by (topic, group, state) (cursus_consumer_group_state)
+and on (topic, group)
+sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
 
 max by (topic, group) (
   cursus_consumer_group_last_activity_timestamp_seconds
 )
+and on (topic, group)
+sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
 
 max by (topic, group) (
   cursus_consumer_group_last_rebalance_timestamp_seconds
 )
+and on (topic, group)
+sum by (topic, group) (cursus_consumer_group_coordinator_up) == 1
 
 sum by (topic, group) (cursus_consumer_group_coordinator_up)
 
@@ -185,10 +194,16 @@ sum by (topic, group, reason) (
 ```
 
 `sum` of an authoritative lifecycle gauge is also exact after coordinator ring
-convergence because only one broker emits it. `max` is preferred while a
-coordinator move propagates. A `coordinator_up` sum of zero means no scraped
-target currently claims authority; a value above one reveals an overlapping
-ring view instead of silently triple-counting members.
+convergence because only one broker emits it. A `coordinator_up` sum of zero
+means no scraped target currently claims authority; a value above one reveals
+an overlapping ring view. Both cases remove the gated lifecycle value instead
+of allowing a stale value to mask a member-count decrease.
+
+Heartbeat and rebalance timestamps are runtime lifecycle observations, not a
+durable heartbeat journal. Cluster snapshots can carry them across coordinator
+materialization, but standalone metadata recovery intentionally restores no
+members and reports `0` until a new lifecycle event occurs. Persisting every
+heartbeat would add storage write amplification to the consumer hot path.
 
 An unknown group has no Cursus series. Cursus does not fabricate a zero-valued
 group because it does not know which application groups are required. Use an

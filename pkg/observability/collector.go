@@ -124,10 +124,14 @@ type observationFailureKey struct {
 	reason string
 }
 
-var observationFailureReasons = []string{
-	coordinator.ObservationFailureCoordinatorLookup,
-	coordinator.ObservationFailureGroupLookup,
-	coordinator.ObservationFailureTopicLookup,
+type observationGroupKey struct {
+	topic string
+	group string
+}
+
+type observationFailureSample struct {
+	key   observationFailureKey
+	value uint64
 }
 
 // NewCollector creates a broker runtime collector. Nil sources are supported.
@@ -243,15 +247,18 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.metadataDurabilityWarningsTotal, prometheus.CounterValue, float64(topicState.MetadataDurabilityWarningsTotal))
 	ch <- gauge(c.partitionCount, float64(len(topicState.Partitions)))
 	partitionState := make(map[string]topic.PartitionRuntimeSnapshot, len(topicState.Partitions))
+	partitionKeysByTopic := make(map[string][]string, topicState.TopicCount)
 	for _, partition := range topicState.Partitions {
 		partitionLabel := strconv.Itoa(partition.Partition)
-		partitionState[partitionKey(partition.Topic, partition.Partition)] = partition
+		key := partitionKey(partition.Topic, partition.Partition)
+		partitionState[key] = partition
+		partitionKeysByTopic[partition.Topic] = append(partitionKeysByTopic[partition.Topic], key)
 		ch <- gauge(c.logStart, float64(partition.LogStart), partition.Topic, partitionLabel)
 		ch <- gauge(c.logEnd, float64(partition.LogEnd), partition.Topic, partitionLabel)
 		ch <- gauge(c.highWatermark, float64(partition.HighWatermark), partition.Topic, partitionLabel)
 	}
-	c.collectGroupLifecycle(ch, partitionState)
-	c.collectGroups(ch, partitionState)
+	c.collectGroupLifecycle(ch, partitionKeysByTopic)
+	c.collectGroups(ch, partitionState, partitionKeysByTopic)
 	if recoverySource, ok := c.groups.(interface {
 		RecoverySnapshot() coordinator.ConsumerMetadataRecoveryStatus
 	}); ok {
@@ -290,7 +297,11 @@ func (c *Collector) collectTransactions(ch chan<- prometheus.Metric) {
 	ch <- gauge(c.transactionExpired, float64(state.Expired))
 	ch <- gauge(c.transactionOldestActive, state.OldestActiveAgeSeconds)
 }
-func (c *Collector) collectGroups(ch chan<- prometheus.Metric, partitions map[string]topic.PartitionRuntimeSnapshot) {
+func (c *Collector) collectGroups(
+	ch chan<- prometheus.Metric,
+	partitions map[string]topic.PartitionRuntimeSnapshot,
+	partitionKeysByTopic map[string][]string,
+) {
 	if c.groups == nil {
 		return
 	}
@@ -315,11 +326,8 @@ func (c *Collector) collectGroups(ch chan<- prometheus.Metric, partitions map[st
 
 		positions := make(map[string]uint64)
 		if !strings.ContainsAny(state.TopicName, "*?") {
-			prefix := state.TopicName + "\x00"
-			for key := range partitions {
-				if strings.HasPrefix(key, prefix) {
-					positions[key] = 0
-				}
+			for _, key := range partitionKeysByTopic[state.TopicName] {
+				positions[key] = 0
 			}
 		}
 		for topicName, offsets := range state.Offsets {
@@ -353,21 +361,19 @@ func (c *Collector) collectGroups(ch chan<- prometheus.Metric, partitions map[st
 	}
 }
 
-func (c *Collector) collectGroupLifecycle(ch chan<- prometheus.Metric, partitions map[string]topic.PartitionRuntimeSnapshot) {
+func (c *Collector) collectGroupLifecycle(ch chan<- prometheus.Metric, partitionKeysByTopic map[string][]string) {
 	if c.groups == nil {
 		return
 	}
 
 	observations := c.consumerGroupObservations()
 	failed := make([]observationFailureKey, 0)
-	active := make(map[observationFailureKey]struct{}, len(observations)*len(observationFailureReasons))
+	active := make(map[observationGroupKey]struct{}, len(observations))
 	for _, observation := range observations {
-		for _, reason := range observationFailureReasons {
-			active[observationFailureKey{topic: observation.TopicName, group: observation.GroupName, reason: reason}] = struct{}{}
-		}
+		active[observationGroupKey{topic: observation.TopicName, group: observation.GroupName}] = struct{}{}
 
-		failureReason := observation.ObservationError
-		if failureReason == "" && !topicObserved(observation.TopicName, partitions) {
+		failureReason := boundedObservationFailureReason(observation.ObservationError)
+		if failureReason == "" && !topicObserved(observation.TopicName, partitionKeysByTopic) {
 			failureReason = coordinator.ObservationFailureTopicLookup
 		}
 		if failureReason != "" {
@@ -377,7 +383,7 @@ func (c *Collector) collectGroupLifecycle(ch chan<- prometheus.Metric, partition
 		}
 
 		ch <- gauge(c.groupCoordinatorUp, boolValue(observation.CoordinatorUp), observation.TopicName, observation.GroupName)
-		if !observation.CoordinatorUp {
+		if !observation.CoordinatorUp || failureReason != "" {
 			continue
 		}
 
@@ -427,55 +433,61 @@ func (c *Collector) consumerGroupObservations() []coordinator.ConsumerGroupObser
 
 func (c *Collector) collectObservationFailureCounters(
 	ch chan<- prometheus.Metric,
-	active map[observationFailureKey]struct{},
+	active map[observationGroupKey]struct{},
 	failed []observationFailureKey,
 ) {
 	c.observationMu.Lock()
-	next := make(map[observationFailureKey]uint64, len(active))
-	for key := range active {
-		next[key] = c.observationFailures[key]
+	for key := range c.observationFailures {
+		if _, ok := active[observationGroupKey{topic: key.topic, group: key.group}]; !ok {
+			delete(c.observationFailures, key)
+		}
 	}
 	for _, key := range failed {
-		if _, ok := active[key]; ok {
-			next[key]++
+		if _, ok := active[observationGroupKey{topic: key.topic, group: key.group}]; ok {
+			c.observationFailures[key]++
 		}
 	}
-	c.observationFailures = next
-	keys := make([]observationFailureKey, 0, len(next))
-	for key := range next {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].topic != keys[j].topic {
-			return keys[i].topic < keys[j].topic
-		}
-		if keys[i].group != keys[j].group {
-			return keys[i].group < keys[j].group
-		}
-		return keys[i].reason < keys[j].reason
-	})
-	values := make([]uint64, len(keys))
-	for i, key := range keys {
-		values[i] = next[key]
+	samples := make([]observationFailureSample, 0, len(c.observationFailures))
+	for key, value := range c.observationFailures {
+		samples = append(samples, observationFailureSample{key: key, value: value})
 	}
 	c.observationMu.Unlock()
 
-	for i, key := range keys {
-		ch <- counter(c.groupObservationFailures, float64(values[i]), key.topic, key.group, key.reason)
+	sort.Slice(samples, func(i, j int) bool {
+		if samples[i].key.topic != samples[j].key.topic {
+			return samples[i].key.topic < samples[j].key.topic
+		}
+		if samples[i].key.group != samples[j].key.group {
+			return samples[i].key.group < samples[j].key.group
+		}
+		return samples[i].key.reason < samples[j].key.reason
+	})
+
+	for _, sample := range samples {
+		key := sample.key
+		ch <- counter(c.groupObservationFailures, float64(sample.value), key.topic, key.group, key.reason)
 	}
 }
 
-func topicObserved(topicName string, partitions map[string]topic.PartitionRuntimeSnapshot) bool {
+func topicObserved(topicName string, partitionKeysByTopic map[string][]string) bool {
 	if topicName == "" || strings.ContainsAny(topicName, "*?") {
 		return true
 	}
-	prefix := topicName + "\x00"
-	for key := range partitions {
-		if strings.HasPrefix(key, prefix) {
-			return true
-		}
+	_, ok := partitionKeysByTopic[topicName]
+	return ok
+}
+
+func boundedObservationFailureReason(reason string) string {
+	switch reason {
+	case "":
+		return ""
+	case coordinator.ObservationFailureCoordinatorLookup,
+		coordinator.ObservationFailureGroupLookup,
+		coordinator.ObservationFailureTopicLookup:
+		return reason
+	default:
+		return coordinator.ObservationFailureCoordinatorLookup
 	}
-	return false
 }
 
 func timestampSeconds(value time.Time) float64 {

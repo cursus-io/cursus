@@ -152,17 +152,51 @@ func (ch *CommandHandler) IsGroupCoordinator(groupName string) bool {
 // coordinator. Exporter observation uses the error to fail closed instead of
 // presenting a non-authoritative local snapshot.
 func (ch *CommandHandler) ResolveGroupCoordinator(groupName string) (bool, error) {
-	if !ch.isDistributed() {
-		return true, nil
-	}
-	if !ch.hasRouter() {
-		return false, fmt.Errorf("coordinator router unavailable")
-	}
-	id, _, err := ch.Cluster.Router.FindCoordinator(groupName)
+	resolved, err := ch.ResolveGroupCoordinators([]string{groupName})
 	if err != nil {
 		return false, err
 	}
-	return id == ch.Cluster.Router.BrokerID(), nil
+	owned, ok := resolved[groupName]
+	if !ok {
+		return false, fmt.Errorf("coordinator result missing for group %q", groupName)
+	}
+	return owned, nil
+}
+
+// ResolveGroupCoordinators resolves scrape-time ownership from one validated
+// control-plane snapshot. Distributed observation fails closed when this
+// broker cannot currently resolve a Raft leader, even if its local FSM still
+// contains an older active-broker view.
+func (ch *CommandHandler) ResolveGroupCoordinators(groupNames []string) (map[string]bool, error) {
+	resolved := make(map[string]bool, len(groupNames))
+	if ch == nil || ch.Config == nil || !ch.Config.EnabledDistribution {
+		for _, groupName := range groupNames {
+			resolved[groupName] = true
+		}
+		return resolved, nil
+	}
+	if ch.Cluster == nil || ch.Cluster.RaftManager == nil {
+		return nil, fmt.Errorf("raft manager unavailable")
+	}
+	if ch.Cluster.Router == nil {
+		return nil, fmt.Errorf("coordinator router unavailable")
+	}
+	if ch.Cluster.RaftManager.GetLeaderAddress() == "" {
+		return nil, fmt.Errorf("cluster leader unavailable")
+	}
+	owners, err := ch.Cluster.Router.FindCoordinatorOwners(groupNames)
+	if err != nil {
+		return nil, err
+	}
+	localID := ch.Cluster.Router.BrokerID()
+	for _, groupName := range groupNames {
+		ownerID, ok := owners[groupName]
+		if !ok {
+			return nil, fmt.Errorf("coordinator result missing for group %q", groupName)
+		}
+		resolved[groupName] = ownerID == localID
+	}
+	return resolved, nil
 }
 
 // ExpireGroupMembers serializes timeout-driven membership removal through the

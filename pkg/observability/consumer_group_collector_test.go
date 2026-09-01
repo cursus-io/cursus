@@ -45,11 +45,7 @@ func TestCollectorExportsAuthoritativeConsumerLifecycle(t *testing.T) {
 	assertGauge(t, families, "cursus_consumer_group_coordinator_up", map[string]string{"topic": "events", "group": "workers"}, 1)
 	assertPositiveGauge(t, families, "cursus_consumer_group_last_activity_timestamp_seconds", map[string]string{"topic": "events", "group": "workers"})
 	assertPositiveGauge(t, families, "cursus_consumer_group_last_rebalance_timestamp_seconds", map[string]string{"topic": "events", "group": "workers"})
-	for _, reason := range observationFailureReasons {
-		assertCounter(t, families, "cursus_consumer_group_observation_failures_total", map[string]string{
-			"topic": "events", "group": "workers", "reason": reason,
-		}, 0)
-	}
+	assertMetricFamilyMissing(t, families, "cursus_consumer_group_observation_failures_total")
 }
 
 func TestCollectorCountsBoundedObservationFailuresAndOmitsStaleState(t *testing.T) {
@@ -104,6 +100,8 @@ func TestCollectorCountsTopicLookupFailuresWithoutInventingExpectedGroups(t *tes
 	assertCounter(t, families, "cursus_consumer_group_observation_failures_total", map[string]string{
 		"topic": "missing-topic", "group": "known-group", "reason": "topic_lookup",
 	}, 1)
+	assertGauge(t, families, "cursus_consumer_group_coordinator_up", map[string]string{"topic": "missing-topic", "group": "known-group"}, 1)
+	assertMetricMissing(t, families, "cursus_consumer_group_members", map[string]string{"topic": "missing-topic", "group": "known-group"})
 	assertMetricMissing(t, families, "cursus_consumer_group_members", map[string]string{"topic": "absent-topic", "group": "absent-group"})
 }
 
@@ -126,7 +124,13 @@ func TestCollectorThreeBrokerCoordinatorMovementConvergesWithoutDuplicateMembers
 	collectors := make([]*Collector, len(brokers))
 	for index, broker := range brokers {
 		brokerIndex := index
-		broker.SetGroupObservationResolver(func(string) (bool, error) { return brokerIndex == owner, nil })
+		broker.SetGroupObservationBatchResolver(func(groupNames []string) (map[string]bool, error) {
+			resolved := make(map[string]bool, len(groupNames))
+			for _, groupName := range groupNames {
+				resolved[groupName] = brokerIndex == owner
+			}
+			return resolved, nil
+		})
 		collectors[index] = NewCollector(
 			fixedTopics{snapshot: topic.RuntimeSnapshot{TopicCount: 1, Partitions: []topic.PartitionRuntimeSnapshot{{Topic: "events", Partition: 0}}}},
 			broker, fixedDisk{}, nil, nil, fixedReadiness(true),
@@ -143,6 +147,7 @@ func TestConsumerLifecycleMetricLabelsAreBounded(t *testing.T) {
 	groups := coordinator.NewCoordinator(context.Background(), config.DefaultConfig(), lifecycleTopicHandler{})
 	t.Cleanup(groups.Stop)
 	require.NoError(t, groups.RegisterGroup("events", "workers", 1))
+	require.NoError(t, groups.RegisterGroup("missing-topic", "broken", 1))
 	_, err := groups.AddConsumer("workers", "member-sensitive-id")
 	require.NoError(t, err)
 	registry := prometheus.NewRegistry()
@@ -235,4 +240,13 @@ func metricFamily(t *testing.T, families []*dto.MetricFamily, name string) *dto.
 	}
 	t.Fatalf("metric family %s not found", name)
 	return nil
+}
+
+func assertMetricFamilyMissing(t *testing.T, families []*dto.MetricFamily, name string) {
+	t.Helper()
+	for _, family := range families {
+		if family.GetName() == name {
+			t.Fatalf("metric family %s unexpectedly present", name)
+		}
+	}
 }
