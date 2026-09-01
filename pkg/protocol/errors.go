@@ -66,7 +66,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"transaction_abort_marker_failed", "transaction_commit_failed", "transaction_manager_not_available", "transaction_sync_failed",
 	)
 	register(ErrorClassFencing, false,
-		"GEN_MISMATCH", "NOT_OWNER", "STALE_LEADER_EPOCH", "member_not_found", "producer_fenced", "stale_producer_epoch",
+		"GEN_MISMATCH", "NOT_OWNER", "PARTITION_LEADER_FENCED", "STALE_LEADER_EPOCH", "member_not_found", "producer_fenced", "stale_producer_epoch",
 	)
 	register(ErrorClassConflict, false,
 		"OFFSET_OUT_OF_RANGE", "leader_election_rejected", "offset_regression", "snapshot_version_exceeds_stream",

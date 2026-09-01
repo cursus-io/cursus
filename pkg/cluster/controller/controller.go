@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -17,6 +18,8 @@ import (
 	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
 )
+
+var ErrPartitionLeaderFenced = errors.New("partition leader fenced")
 
 // LeaderChecker provides leadership status queries.
 type LeaderChecker interface {
@@ -245,7 +248,7 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 	if err := cc.ReplicateToISR(topic, partition, msgCmd, snapshot); err != nil {
 		return err
 	}
-	cc.ReplicateToNonISR(topic, partition, msgCmd, snapshot)
+	_ = cc.ReplicateToNonISR(topic, partition, msgCmd, snapshot)
 	return nil
 }
 
@@ -263,7 +266,7 @@ func (cc *ClusterController) GetPartitionReplicationSnapshot(topic string, parti
 		return PartitionReplicationSnapshot{}, fmt.Errorf("partition metadata not found: %s", partitionKey)
 	}
 	if meta.Leader != cc.brokerID {
-		return PartitionReplicationSnapshot{}, fmt.Errorf("partition leader fenced: current=%s local=%s epoch=%d", meta.Leader, cc.brokerID, meta.LeaderEpoch)
+		return PartitionReplicationSnapshot{}, fmt.Errorf("%w: current=%s local=%s epoch=%d", ErrPartitionLeaderFenced, meta.Leader, cc.brokerID, meta.LeaderEpoch)
 	}
 	if !containsBroker(meta.ISR, cc.brokerID) {
 		return PartitionReplicationSnapshot{}, fmt.Errorf("partition leader %s is not in ISR", cc.brokerID)
@@ -285,7 +288,7 @@ func (cc *ClusterController) ReplicateToISR(topic string, partition int, msgCmd 
 
 // ReplicateToNonISR makes one best-effort catch-up pass after the committed HWM
 // is visible. Failures here never change the producer acknowledgement.
-func (cc *ClusterController) ReplicateToNonISR(topic string, partition int, msgCmd types.MessageCommand, snapshot PartitionReplicationSnapshot) {
+func (cc *ClusterController) ReplicateToNonISR(topic string, partition int, msgCmd types.MessageCommand, snapshot PartitionReplicationSnapshot) error {
 	isr := make(map[string]struct{}, len(snapshot.ISR))
 	for _, brokerID := range snapshot.ISR {
 		isr[brokerID] = struct{}{}
@@ -296,7 +299,7 @@ func (cc *ClusterController) ReplicateToNonISR(topic string, partition int, msgC
 			targets = append(targets, brokerID)
 		}
 	}
-	_ = cc.replicateToReplicaSet(topic, partition, msgCmd, snapshot, targets, false)
+	return cc.replicateToReplicaSet(topic, partition, msgCmd, snapshot, targets, false)
 }
 
 func (cc *ClusterController) replicateToReplicaSet(topic string, partition int, msgCmd types.MessageCommand, snapshot PartitionReplicationSnapshot, targets []string, required bool) error {
@@ -305,7 +308,7 @@ func (cc *ClusterController) replicateToReplicaSet(topic string, partition int, 
 		return err
 	}
 	if current.Leader != snapshot.Leader || current.LeaderEpoch != snapshot.LeaderEpoch {
-		return fmt.Errorf("partition leader fenced: current=%s/%d requested=%s/%d", current.Leader, current.LeaderEpoch, snapshot.Leader, snapshot.LeaderEpoch)
+		return fmt.Errorf("%w: current=%s/%d requested=%s/%d", ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, snapshot.Leader, snapshot.LeaderEpoch)
 	}
 	msgCmd.LeaderID = snapshot.Leader
 	msgCmd.LeaderEpoch = snapshot.LeaderEpoch
@@ -316,6 +319,7 @@ func (cc *ClusterController) replicateToReplicaSet(topic string, partition int, 
 	replicateCmd := fmt.Sprintf("REPLICATE_MESSAGE %spayload=%s", cc.internalAuthPrefix(), string(data))
 	fsmRef := cc.RaftManager.GetFSM()
 	partitionStr := strconv.Itoa(partition)
+	var replicationErr error
 	for _, brokerID := range targets {
 		if brokerID == cc.brokerID {
 			continue
@@ -325,25 +329,41 @@ func (cc *ClusterController) replicateToReplicaSet(topic string, partition int, 
 			if required {
 				return fmt.Errorf("ISR broker %s metadata not found", brokerID)
 			}
+			replicationErr = errors.Join(replicationErr, fmt.Errorf("replica %s metadata not found", brokerID))
 			continue
 		}
 		started := time.Now()
 		resp, forwardErr := cc.Router.forwardWithTimeout(broker.Addr, replicateCmd)
 		if forwardErr != nil || !strings.HasPrefix(resp, "OK") {
-			if !required {
-				continue
-			}
+			var targetErr error
 			if forwardErr != nil {
-				return fmt.Errorf("replica %s append failed: %w", brokerID, forwardErr)
+				targetErr = fmt.Errorf("replica %s append failed: %w", brokerID, forwardErr)
+			} else if replicaFenceResponse(resp) {
+				targetErr = fmt.Errorf("%w: replica %s rejected append: %s", ErrPartitionLeaderFenced, brokerID, resp)
+			} else {
+				targetErr = fmt.Errorf("replica %s rejected append: %s", brokerID, resp)
 			}
-			return fmt.Errorf("replica %s rejected append: %s", brokerID, resp)
+			if required {
+				return targetErr
+			}
+			replicationErr = errors.Join(replicationErr, targetErr)
+			continue
 		}
 		metrics.ClusterReplicationLag.WithLabelValues(topic, partitionStr, brokerID).Observe(time.Since(started).Seconds())
 		if isrMgr := cc.RaftManager.GetISRManager(); isrMgr != nil {
 			isrMgr.UpdateHeartbeat(brokerID)
 		}
 	}
-	return nil
+	return replicationErr
+}
+
+func replicaFenceResponse(response string) bool {
+	fields := strings.Fields(strings.TrimSpace(response))
+	if len(fields) < 2 || !strings.EqualFold(fields[0], "ERROR:") {
+		return false
+	}
+	code := strings.ToUpper(fields[1])
+	return code == "NOT_PARTITION_LEADER" || code == "STALE_LEADER_EPOCH"
 }
 
 func containsBroker(brokers []string, wanted string) bool {

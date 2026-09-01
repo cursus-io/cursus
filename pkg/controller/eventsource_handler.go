@@ -73,6 +73,11 @@ func (ch *CommandHandler) handleSaveSnapshot(cmd string) string {
 		if resp, forwarded, _ := ch.isPartitionLeaderAndForward(topicName, partition, cmd); forwarded {
 			return resp
 		}
+		t := ch.waitForTopic(topicName)
+		if t == nil {
+			return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+		}
+		effectiveMinISR := t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas)
 		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
 			return indexResp
 		}
@@ -82,7 +87,7 @@ func (ch *CommandHandler) handleSaveSnapshot(cmd string) string {
 				return err
 			}
 			replicateCmd := fmt.Sprintf("REPLICATE_SNAPSHOT %spayload=%s", ch.internalAuthPrefix(), string(payload))
-			return ch.Cluster.ReplicateCommandToFollowers(result.Topic, result.Partition, replicateCmd, ch.Config.MinInSyncReplicas)
+			return ch.Cluster.ReplicateCommandToFollowers(result.Topic, result.Partition, replicateCmd, effectiveMinISR)
 		})
 		if errResp != "" {
 			return errResp

@@ -33,7 +33,7 @@ type partitionReplicationTask struct {
 type partitionReplicationExecutor interface {
 	Snapshot(topic string, partition int) (clusterController.PartitionReplicationSnapshot, error)
 	ReplicateISR(ctx context.Context, task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) error
-	ReplicateNonISR(task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot)
+	ReplicateNonISR(task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) error
 	Commit(task partitionReplicationTask) error
 }
 
@@ -52,11 +52,11 @@ func (e clusterPartitionReplicationExecutor) ReplicateISR(ctx context.Context, t
 	return e.handler.Cluster.ReplicateToISR(task.topic, task.partition, task.command, snapshot)
 }
 
-func (e clusterPartitionReplicationExecutor) ReplicateNonISR(task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) {
+func (e clusterPartitionReplicationExecutor) ReplicateNonISR(task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) error {
 	commitHWM := task.commitHWM
 	command := task.command
 	command.CommitHWM = &commitHWM
-	e.handler.Cluster.ReplicateToNonISR(task.topic, task.partition, command, snapshot)
+	return e.handler.Cluster.ReplicateToNonISR(task.topic, task.partition, command, snapshot)
 }
 
 func (e clusterPartitionReplicationExecutor) Commit(task partitionReplicationTask) error {
@@ -91,9 +91,15 @@ type partitionReplicationCoordinator struct {
 }
 
 type partitionReplicationLane struct {
-	owner *partitionReplicationCoordinator
-	queue chan partitionReplicationTask
-	slots chan struct{}
+	owner   *partitionReplicationCoordinator
+	queue   chan partitionReplicationTask
+	catchup chan partitionCatchupTask
+	slots   chan struct{}
+}
+
+type partitionCatchupTask struct {
+	task     partitionReplicationTask
+	snapshot clusterController.PartitionReplicationSnapshot
 }
 
 type partitionReplicationReservation struct {
@@ -131,13 +137,15 @@ func (c *partitionReplicationCoordinator) reserve(ctx context.Context, topicName
 	lane := c.lanes[key]
 	if lane == nil {
 		lane = &partitionReplicationLane{
-			owner: c,
-			queue: make(chan partitionReplicationTask, c.capacity),
-			slots: make(chan struct{}, c.capacity),
+			owner:   c,
+			queue:   make(chan partitionReplicationTask, c.capacity),
+			catchup: make(chan partitionCatchupTask, c.capacity),
+			slots:   make(chan struct{}, c.capacity),
 		}
 		c.lanes[key] = lane
-		c.workers.Add(1)
+		c.workers.Add(2)
 		go lane.run()
+		go lane.runCatchup()
 	}
 	c.submissions.Add(1)
 	c.mu.Unlock()
@@ -214,6 +222,34 @@ func (l *partitionReplicationLane) run() {
 	}
 }
 
+func (l *partitionReplicationLane) runCatchup() {
+	defer l.owner.workers.Done()
+	for {
+		if l.owner.ctx.Err() != nil {
+			return
+		}
+		select {
+		case catchup := <-l.catchup:
+			if err := l.owner.executor.ReplicateNonISR(catchup.task, catchup.snapshot); err != nil {
+				class := replicationErrorClass(err)
+				metrics.AsyncReplicationFailures.WithLabelValues(catchup.task.topic, class).Inc()
+				util.Error("async non-ISR replication failed topic=%s partition=%d ack_mode=%s error_class=%s error=%v", catchup.task.topic, catchup.task.partition, catchup.task.ackMode, class, err)
+			}
+		case <-l.owner.ctx.Done():
+			return
+		}
+	}
+}
+
+func (l *partitionReplicationLane) enqueueCatchup(task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) {
+	select {
+	case l.catchup <- partitionCatchupTask{task: task, snapshot: snapshot}:
+	default:
+		metrics.AsyncReplicationFailures.WithLabelValues(task.topic, "backpressure").Inc()
+		util.Error("async non-ISR replication queue full topic=%s partition=%d ack_mode=%s error_class=backpressure", task.topic, task.partition, task.ackMode)
+	}
+}
+
 func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 	backoff := 25 * time.Millisecond
 	reported := false
@@ -236,7 +272,7 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			if snapshotErr != nil {
 				err = snapshotErr
 			} else if current.Leader != task.snapshot.Leader || current.LeaderEpoch != task.snapshot.LeaderEpoch {
-				err = fmt.Errorf("partition leader fenced before commit: current=%s/%d requested=%s/%d", current.Leader, current.LeaderEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch)
+				err = fmt.Errorf("%w before commit: current=%s/%d requested=%s/%d", clusterController.ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch)
 			}
 		}
 		if err == nil {
@@ -247,12 +283,12 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			if snapshotErr != nil {
 				err = snapshotErr
 			} else if current.Leader != task.snapshot.Leader || current.LeaderEpoch != task.snapshot.LeaderEpoch {
-				err = fmt.Errorf("partition leader fenced after commit: current=%s/%d requested=%s/%d", current.Leader, current.LeaderEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch)
+				err = fmt.Errorf("%w after commit: current=%s/%d requested=%s/%d", clusterController.ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch)
 			}
 		}
 		if err == nil {
 			completeReplicationTask(task, nil)
-			l.owner.executor.ReplicateNonISR(task, snapshot)
+			l.enqueueCatchup(task, snapshot)
 			return
 		}
 		if l.owner.ctx.Err() != nil {
@@ -292,7 +328,7 @@ func (l *partitionReplicationLane) replicationSnapshot(task partitionReplication
 		return clusterController.PartitionReplicationSnapshot{}, err
 	}
 	if current.Leader != task.snapshot.Leader || current.LeaderEpoch != task.snapshot.LeaderEpoch {
-		return clusterController.PartitionReplicationSnapshot{}, fmt.Errorf("partition leader fenced: current=%s/%d requested=%s/%d", current.Leader, current.LeaderEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch)
+		return clusterController.PartitionReplicationSnapshot{}, fmt.Errorf("%w: current=%s/%d requested=%s/%d", clusterController.ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch)
 	}
 	if task.ackMode == ackpolicy.All {
 		return task.snapshot, nil
@@ -311,11 +347,7 @@ func completeReplicationTask(task partitionReplicationTask, err error) {
 }
 
 func isReplicationFenceError(err error) bool {
-	if err == nil {
-		return false
-	}
-	value := strings.ToLower(err.Error())
-	return strings.Contains(value, "fenced") || strings.Contains(value, "leader epoch") || strings.Contains(value, "not partition leader")
+	return errors.Is(err, clusterController.ErrPartitionLeaderFenced)
 }
 
 func replicationErrorClass(err error) string {

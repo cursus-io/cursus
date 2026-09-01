@@ -614,6 +614,48 @@ func (p *Partition) ReadMessages(offset uint64, max int) ([]types.Message, error
 	return p.dh.ReadMessages(offset, max)
 }
 
+// ProducerSequenceOffset resolves the durable offset originally assigned to an
+// idempotent producer sequence. It is used only on duplicate acknowledgements,
+// where returning the current log tail would acknowledge the wrong record.
+func (p *Partition) ProducerSequenceOffset(producerID string, epoch int64, seqNum uint64) (uint64, bool, error) {
+	if producerID == "" || seqNum == 0 {
+		return 0, false, nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	first := p.dh.GetFirstOffset()
+	limit := p.LEO.Load()
+	offset := first
+	const batchSize = 1024
+	for offset < limit {
+		messages, err := p.dh.ReadMessages(offset, batchSize)
+		if err != nil {
+			return 0, false, err
+		}
+		if len(messages) == 0 {
+			break
+		}
+		for _, message := range messages {
+			if message.Offset >= limit {
+				return 0, false, nil
+			}
+			if message.ProducerID == producerID && message.Epoch == epoch && message.SeqNum == seqNum {
+				return message.Offset, true, nil
+			}
+			next := message.Offset + 1
+			if next <= offset {
+				next = offset + 1
+			}
+			offset = next
+		}
+		if len(messages) < batchSize {
+			break
+		}
+	}
+	return 0, false, nil
+}
+
 // LastStableOffset returns the first offset that may still be blocked by an
 // unresolved transaction, capped by the committed and flushed partition tail.
 func (p *Partition) LastStableOffset() uint64 {

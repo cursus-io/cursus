@@ -60,7 +60,7 @@ func (e *barrierReplicationExecutor) ReplicateISR(ctx context.Context, _ partiti
 	}
 }
 
-func (e *barrierReplicationExecutor) ReplicateNonISR(partitionReplicationTask, clusterController.PartitionReplicationSnapshot) {
+func (e *barrierReplicationExecutor) ReplicateNonISR(partitionReplicationTask, clusterController.PartitionReplicationSnapshot) error {
 	e.mu.Lock()
 	e.nonISRCalls++
 	barrier := e.nonISRBarrier
@@ -68,6 +68,7 @@ func (e *barrierReplicationExecutor) ReplicateNonISR(partitionReplicationTask, c
 	if barrier != nil {
 		<-barrier
 	}
+	return nil
 }
 
 func (e *barrierReplicationExecutor) Commit(task partitionReplicationTask) error {
@@ -295,6 +296,39 @@ func TestAllAcknowledgementDoesNotWaitForNonISRReplica(t *testing.T) {
 	coordinator.close()
 }
 
+func TestBlockedNonISRReplicaDoesNotDelayNextPartitionTask(t *testing.T) {
+	executor := newBarrierReplicationExecutor()
+	executor.nonISRBarrier = make(chan struct{})
+	coordinator := newPartitionReplicationCoordinator(1, executor)
+	firstReservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	first := replicationTaskForMode(executor, ackpolicy.All)
+	firstReservation.submit(first)
+	<-executor.started
+	close(executor.barrier)
+	require.NoError(t, <-first.result)
+	require.Eventually(t, func() bool {
+		executor.mu.Lock()
+		defer executor.mu.Unlock()
+		return executor.nonISRCalls == 1
+	}, time.Second, time.Millisecond)
+
+	secondReservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	second := replicationTaskForMode(executor, ackpolicy.All)
+	second.commitHWM = 2
+	secondReservation.submit(second)
+	select {
+	case err := <-second.result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("non-ISR catch-up blocked the next partition task")
+	}
+
+	close(executor.nonISRBarrier)
+	coordinator.close()
+}
+
 func TestDistributedLeaderAcknowledgementReturnsBeforeFollowerAndKeepsReplicating(t *testing.T) {
 	handler, manager, executor := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
@@ -353,16 +387,89 @@ func TestDistributedIdempotentDuplicateAllUsesFenceBarrierOnly(t *testing.T) {
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
 	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
 	close(executor.barrier)
-	command := "PUBLISH topic=orders partition=0 acks=all producerId=p1 isIdempotent=true seqNum=1 epoch=7 message=value"
+	firstCommand := "PUBLISH topic=orders partition=0 acks=all producerId=p1 isIdempotent=true seqNum=1 epoch=7 message=value"
 
-	first := handler.HandleCommand(command, NewClientContext("", 0))
+	first := handler.HandleCommand(firstCommand, NewClientContext("", 0))
 	require.Contains(t, first, `"status":"OK"`)
-	second := handler.HandleCommand(command, NewClientContext("", 0))
+	second := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=all producerId=p1 isIdempotent=true seqNum=2 epoch=7 message=later", NewClientContext("", 0))
 	require.Contains(t, second, `"status":"OK"`)
+	duplicate := handler.HandleCommand(firstCommand, NewClientContext("", 0))
+	require.Contains(t, duplicate, `"status":"OK"`)
+	require.Contains(t, duplicate, `"last_offset":0`)
 	executor.mu.Lock()
-	require.Equal(t, 1, executor.replicateCalls)
+	require.Equal(t, 2, executor.replicateCalls)
 	executor.mu.Unlock()
-	require.Equal(t, uint64(1), executor.committed())
+	require.Equal(t, uint64(2), executor.committed())
+}
+
+func TestDistributedIdempotentDuplicateBatchReturnsOriginalOffset(t *testing.T) {
+	handler, manager, executor := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
+	close(executor.barrier)
+	publish := func(seq uint64, payload string) string {
+		data, err := util.EncodeBatchMessages("orders", 0, "all", true, []types.Message{{
+			ProducerID: "p1",
+			Epoch:      7,
+			SeqNum:     seq,
+			Payload:    payload,
+		}})
+		require.NoError(t, err)
+		response, err := handler.HandleBatchMessage(data, nil, NewClientContext("", 0))
+		require.NoError(t, err)
+		return response
+	}
+
+	require.Contains(t, publish(1, "value"), `"last_offset":0`)
+	require.Contains(t, publish(2, "later"), `"last_offset":1`)
+	require.Contains(t, publish(1, "value"), `"last_offset":0`)
+	executor.mu.Lock()
+	require.Equal(t, 2, executor.replicateCalls)
+	executor.mu.Unlock()
+}
+
+func TestReplicaPreservesLegacyTailUntilCommittedHWMIsKnown(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	diskManager := disk.NewDiskManager(cfg)
+	manager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	state := fsm.NewBrokerFSM(manager, nil)
+	raftManager := &MockRaftManagerForForward{isLeader: true, state: state}
+	cluster := clusterController.NewClusterController(context.Background(), cfg, raftManager, nil, "broker-2", "broker-2:9001")
+	handler := NewCommandHandler(manager, cfg, nil, nil, cluster)
+	t.Cleanup(func() {
+		_ = handler.Close()
+		for _, name := range manager.ListTopics() {
+			for _, partition := range manager.GetTopic(name).Partitions {
+				partition.Close()
+			}
+		}
+		diskManager.CloseAllHandlers()
+	})
+
+	legacyMetadata := `{"leader":"broker-1","leader_epoch":7,"replicas":["broker-1","broker-2"],"isr":["broker-1","broker-2"],"partition_count":1}`
+	require.Nil(t, state.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + legacyMetadata)}))
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	legacyTail := []types.Message{{Payload: "legacy"}}
+	require.NoError(t, partition.EnqueueBatchLeader(legacyTail))
+	require.Equal(t, uint64(1), partition.NextOffset())
+
+	replication := types.MessageCommand{
+		Topic: "orders", Partition: 0, LeaderID: "broker-1", LeaderEpoch: 7,
+		Messages: []types.Message{{Offset: 1, Payload: "new"}},
+	}
+	payload, err := json.Marshal(replication)
+	require.NoError(t, err)
+	response := handler.handleReplicateMessage("REPLICATE_MESSAGE payload=" + string(payload))
+	require.Contains(t, response, "committed HWM is not known")
+	require.Equal(t, uint64(1), partition.NextOffset())
+	messages, err := partition.ReadMessages(0, 2)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	require.Equal(t, "legacy", messages[0].Payload)
 }
 
 func TestReplicaNewLeaderEpochReconcilesUncommittedOldLeaderTail(t *testing.T) {
@@ -602,7 +709,8 @@ func newDistributedAckTestHandler(t *testing.T, brokerMinISR int) (*CommandHandl
 	cfg.EnabledDistribution = true
 	cfg.MinInSyncReplicas = brokerMinISR
 	cfg.ChannelBufferSize = 2
-	manager := topic.NewTopicManager(cfg, &testMockHandlerProvider{}, nil)
+	diskManager := disk.NewDiskManager(cfg)
+	manager := topic.NewTopicManager(cfg, diskManager, nil)
 	state := fsm.NewBrokerFSM(manager, nil)
 	raftManager := &MockRaftManagerForForward{isLeader: true, state: state}
 	raftManager.leaderAddress.Store("broker-1:9001")
@@ -611,7 +719,15 @@ func newDistributedAckTestHandler(t *testing.T, brokerMinISR int) (*CommandHandl
 	handler.replication.close()
 	executor := newBarrierReplicationExecutor()
 	handler.replication = newPartitionReplicationCoordinator(2, executor)
-	t.Cleanup(func() { _ = handler.Close() })
+	t.Cleanup(func() {
+		_ = handler.Close()
+		for _, name := range manager.ListTopics() {
+			for _, partition := range manager.GetTopic(name).Partitions {
+				partition.Close()
+			}
+		}
+		diskManager.CloseAllHandlers()
+	})
 	return handler, manager, executor
 }
 
@@ -624,6 +740,7 @@ func installPartitionMetadata(t *testing.T, handler *CommandHandler, topicName s
 
 func applyPartitionMetadata(t *testing.T, state *fsm.BrokerFSM, topicName string, partition int, metadata fsm.PartitionMetadata) {
 	t.Helper()
+	metadata.CommittedHWMKnown = true
 	encoded, err := json.Marshal(metadata)
 	require.NoError(t, err)
 	result := state.Apply(&raft.Log{Data: []byte(fmt.Sprintf("PARTITION:%s-%d:%s", topicName, partition, encoded))})

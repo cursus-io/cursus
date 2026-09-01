@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
+	replicationFSM "github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -367,6 +369,9 @@ func (ch *CommandHandler) handleRaftApply(cmd string) string {
 
 	_, err := ch.applyAndWait(cmdType, payload)
 	if err != nil {
+		if errors.Is(err, replicationFSM.ErrPartitionCommitFenced) {
+			return "ERROR: PARTITION_LEADER_FENCED"
+		}
 		return formatReplicatedGroupError(err, "raft_apply_failed")
 	}
 	return "OK"
@@ -407,9 +412,20 @@ func (ch *CommandHandler) applyViaLeaderContext(ctx context.Context, cmdType str
 		return nil, fmt.Errorf("forward raft apply to leader: %w", fwdErr)
 	}
 	if strings.HasPrefix(resp, "ERROR") {
+		if wireErrorCode(resp) == "PARTITION_LEADER_FENCED" {
+			return nil, fmt.Errorf("%w: remote partition commit rejected", clusterController.ErrPartitionLeaderFenced)
+		}
 		return nil, fmt.Errorf("leader raft apply: %s", resp)
 	}
 	return resp, nil
+}
+
+func wireErrorCode(response string) string {
+	fields := strings.Fields(strings.TrimSpace(response))
+	if len(fields) < 2 || !strings.EqualFold(fields[0], "ERROR:") {
+		return ""
+	}
+	return strings.ToUpper(fields[1])
 }
 
 func (ch *CommandHandler) applyAndWait(cmdType string, payload map[string]interface{}) (interface{}, error) {
@@ -488,7 +504,7 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshot(topicName string, parti
 		return fail(fmt.Errorf("partition metadata not found"))
 	}
 	if !ch.Cluster.IsAuthorized(topicName, partitionID) {
-		return fail(fmt.Errorf("partition leader fenced: current=%s epoch=%d", metadata.Leader, metadata.LeaderEpoch))
+		return fail(fmt.Errorf("%w: current=%s epoch=%d", clusterController.ErrPartitionLeaderFenced, metadata.Leader, metadata.LeaderEpoch))
 	}
 	snapshot, err := ch.Cluster.GetPartitionReplicationSnapshot(topicName, partitionID)
 	if err != nil {
@@ -557,12 +573,16 @@ func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID 
 	}
 	if metadata.Leader != leader || metadata.LeaderEpoch != leaderEpoch {
 		return fail(fmt.Errorf(
-			"partition leader fenced: current=%s/%d requested=%s/%d",
+			"%w: current=%s/%d requested=%s/%d",
+			clusterController.ErrPartitionLeaderFenced,
 			metadata.Leader,
 			metadata.LeaderEpoch,
 			leader,
 			leaderEpoch,
 		))
+	}
+	if !metadata.CommittedHWMKnown {
+		return fail(fmt.Errorf("partition committed HWM is not known; wait for the current leader to migrate legacy metadata"))
 	}
 	key := fmt.Sprintf("%s-%d", topicName, partitionID)
 	wantedFence := partitionLeadershipFence{leader: leader, epoch: leaderEpoch}
@@ -585,6 +605,9 @@ func (ch *CommandHandler) commitPartitionHWMAtEpoch(topicName string, partitionI
 		"leader_epoch": leaderEpoch,
 		"hwm":          hwm,
 	})
+	if errors.Is(err, replicationFSM.ErrPartitionCommitFenced) {
+		return fmt.Errorf("%w: %v", clusterController.ErrPartitionLeaderFenced, err)
+	}
 	return err
 }
 

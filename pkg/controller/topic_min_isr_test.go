@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/stretchr/testify/require"
 )
 
@@ -75,4 +76,28 @@ func TestRepeatedCreateWithoutMinInSyncReplicasPreservesOverride(t *testing.T) {
 	response := handler.HandleCommand("CREATE topic=orders partitions=1 retention_hours=24", ctx)
 	require.True(t, strings.HasPrefix(response, "OK "), response)
 	require.Equal(t, 1, *manager.GetTopic("orders").Policy.MinInSyncReplicas)
+}
+
+func TestSnapshotReplicationUsesTopicEffectiveMinInSyncReplicas(t *testing.T) {
+	handler, manager, _ := newDistributedAckTestHandler(t, 2)
+	one := 1
+	require.NoError(t, manager.CreateTopicWithPolicy(
+		"available-snapshots", 1, false, true, topic.Policy{MinInSyncReplicas: &one},
+	))
+	require.NoError(t, manager.CreateTopic("strict-snapshots", 1, false, true))
+	installPartitionMetadata(t, handler, "available-snapshots", []string{"broker-1", "broker-2"})
+	installPartitionMetadata(t, handler, "strict-snapshots", []string{"broker-1", "broker-2"})
+
+	available := handler.HandleCommand(
+		`SAVE_SNAPSHOT topic=available-snapshots key=aggregate-1 version=0 message={}`,
+		NewClientContext("", 0),
+	)
+	require.True(t, strings.HasPrefix(available, "OK "), available)
+
+	strict := handler.HandleCommand(
+		`SAVE_SNAPSHOT topic=strict-snapshots key=aggregate-1 version=0 message={}`,
+		NewClientContext("", 0),
+	)
+	require.Contains(t, strict, "ERROR: snapshot_replicate_failed")
+	require.Contains(t, strict, "want minISR 2")
 }

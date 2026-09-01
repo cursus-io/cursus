@@ -102,7 +102,13 @@ func TestReplicateToFollowersRejectsStalePartitionLeader(t *testing.T) {
 	err := cc.ReplicateToFollowers("orders", 0, types.MessageCommand{
 		Topic: "orders", Partition: 0, Messages: []types.Message{{Offset: 1, Payload: "stale"}},
 	}, 1)
-	require.ErrorContains(t, err, "leader fenced")
+	require.ErrorIs(t, err, ErrPartitionLeaderFenced)
+}
+
+func TestReplicaFenceResponseMatchesExactWireCodes(t *testing.T) {
+	require.True(t, replicaFenceResponse("ERROR: NOT_PARTITION_LEADER current=node2"))
+	require.True(t, replicaFenceResponse("ERROR: STALE_LEADER_EPOCH current=8"))
+	require.False(t, replicaFenceResponse("ERROR: replica failed because NOT_PARTITION_LEADER was logged"))
 }
 
 func TestReplicateToFollowersRequiresConfiguredMinimumISR(t *testing.T) {

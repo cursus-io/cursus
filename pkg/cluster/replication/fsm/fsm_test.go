@@ -200,7 +200,7 @@ func TestBrokerFSM_PartitionCommitIsMonotonicAndEpochFenced(t *testing.T) {
 	staleResult := f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + stale)})
 	staleErr, ok := staleResult.(error)
 	require.True(t, ok)
-	require.Error(t, staleErr)
+	require.ErrorIs(t, staleErr, ErrPartitionCommitFenced)
 	regression := `{"topic":"orders","partition":0,"leader":"node-1","leader_epoch":4,"hwm":0}`
 	regressionResult := f.Apply(&raft.Log{Data: []byte("PARTITION_COMMIT:" + regression)})
 	regressionErr, ok := regressionResult.(error)

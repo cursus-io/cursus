@@ -888,6 +888,7 @@ SDKs should parse the code and fields first, use `class` for broad handling, and
 | `invalid_batch_commit_entry entry=<entry>` | BATCH_COMMIT entry is not `P<N>:<offset>` | Correct the malformed entry and retry |
 | `duplicate_partition partition=N group=<G> topic=<T>` | BATCH_COMMIT repeats a partition | Send one next offset per partition; no offsets were committed |
 | `NOT_PARTITION_LEADER leader=<id> requested_leader=<id>` | Replication reached a broker that is not the current partition leader | Refresh partition metadata and retry against the leader |
+| `PARTITION_LEADER_FENCED` | An internal partition commit no longer matches the current leader or epoch | Do not acknowledge success; refresh partition metadata before retrying |
 | `STALE_LEADER_EPOCH current=N requested=N` | Replication request carries a fenced leader epoch | Discard the stale leader session and refresh metadata |
 | `cluster_metadata_unavailable command=REPLICATE_MESSAGE` | Cluster metadata subsystem is temporarily unavailable | Back off and retry |
 | `partition_metadata_not_found topic=<T> partition=N` | Partition metadata does not exist | Refresh metadata and verify topic/partition |

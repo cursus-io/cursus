@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -11,6 +12,8 @@ import (
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/util"
 )
+
+var ErrPartitionCommitFenced = errors.New("partition commit fenced")
 
 type PartitionMetadata struct {
 	Leader       string   `json:"leader"`
@@ -433,11 +436,11 @@ func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
 	}
 	if cmd.Leader != metadata.Leader {
 		f.mu.Unlock()
-		return fmt.Errorf("partition leader fenced for %s: current=%s requested=%s", key, metadata.Leader, cmd.Leader)
+		return fmt.Errorf("%w for %s: current=%s requested=%s", ErrPartitionCommitFenced, key, metadata.Leader, cmd.Leader)
 	}
 	if cmd.LeaderEpoch != metadata.LeaderEpoch {
 		f.mu.Unlock()
-		return fmt.Errorf("stale leader epoch for %s: current=%d requested=%d", key, metadata.LeaderEpoch, cmd.LeaderEpoch)
+		return fmt.Errorf("%w for %s: current_epoch=%d requested_epoch=%d", ErrPartitionCommitFenced, key, metadata.LeaderEpoch, cmd.LeaderEpoch)
 	}
 	if cmd.HWM < metadata.CommittedHWM {
 		f.mu.Unlock()

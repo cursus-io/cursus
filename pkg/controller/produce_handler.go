@@ -37,6 +37,26 @@ func appendedLeaderMessages(messages []types.Message) []types.Message {
 	return appended
 }
 
+func duplicateAcknowledgementOffset(p *topic.Partition, messages []types.Message) (uint64, error) {
+	if len(messages) == 0 {
+		return 0, fmt.Errorf("duplicate acknowledgement has no messages")
+	}
+	last := messages[len(messages)-1]
+	offset, found, err := p.ProducerSequenceOffset(last.ProducerID, last.Epoch, last.SeqNum)
+	if err != nil {
+		return 0, fmt.Errorf("resolve duplicate producer sequence: %w", err)
+	}
+	if !found {
+		return 0, fmt.Errorf(
+			"duplicate producer sequence offset is unavailable: producer=%s epoch=%d seq=%d",
+			last.ProducerID,
+			last.Epoch,
+			last.SeqNum,
+		)
+	}
+	return offset, nil
+}
+
 // handlePublish processes PUBLISH command
 func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (response string) {
 	var clientCtx *ClientContext
@@ -187,7 +207,8 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 	if partition < 0 {
 		partition = t.GetPartitionForMessage(*msg)
 	}
-	if _, err := t.GetPartition(partition); err != nil {
+	p, err := t.GetPartition(partition)
+	if err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 	}
 	if errResp := ch.validateTransactionPublishMetadata(args, topicName, partition, msg); errResp != "" {
@@ -226,12 +247,6 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		}
 		if resp, forwarded, _ := ch.isPartitionLeaderAndForwardContext(requestCtx, topicName, partition, forwardCmd); forwarded {
 			return resp
-		}
-
-		p, err := t.GetPartition(partition)
-		if err != nil {
-			util.Error("Publish failed: partition %d not found in topic %s: %v", partition, topicName, err)
-			return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 		}
 
 		effectiveMinISR := t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas)
@@ -276,10 +291,9 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		}
 		appended := appendedLeaderMessages(messageData.Messages)
 		if len(appended) == 0 {
-			lastOffset := uint64(0)
-			nextOffset := p.NextOffset()
-			if nextOffset > 0 {
-				lastOffset = nextOffset - 1
+			lastOffset, resolveErr := duplicateAcknowledgementOffset(p, messageData.Messages)
+			if resolveErr != nil {
+				return ch.errorResponse(resolveErr.Error())
 			}
 			if ackSelection.Mode == ackpolicy.All {
 				result := make(chan error, 1)
@@ -366,24 +380,32 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		if ackSelection.Mode == ackpolicy.All && t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas) > 1 {
 			return "ERROR: insufficient_in_sync_replicas current=1"
 		}
-		if effectiveIdempotent {
-			err = ch.TopicManager.PublishToPartitionWithAckIdempotent(topicName, partition, msg)
-		} else {
-			err = ch.TopicManager.PublishToPartitionWithAck(topicName, partition, msg)
-		}
+		standaloneMessages := []types.Message{*msg}
+		markLeaderOffsetsUnassigned(standaloneMessages)
+		appendStarted := time.Now()
+		err = p.EnqueueBatchSyncWithMode(standaloneMessages, effectiveIdempotent)
 		if err != nil {
 			return ch.errorResponse(fmt.Sprintf("acks=1 publish failed: %v", err))
 		}
+		metrics.MessagesProcessed.Inc()
+		metrics.LatencyHist.Observe(time.Since(appendStarted).Seconds())
+		appended := appendedLeaderMessages(standaloneMessages)
+		if len(appended) == 0 {
+			lastOffset, resolveErr := duplicateAcknowledgementOffset(p, standaloneMessages)
+			if resolveErr != nil {
+				return ch.errorResponse(resolveErr.Error())
+			}
+			ackResp.LastOffset = lastOffset
+		} else {
+			ackResp.LastOffset = appended[len(appended)-1].Offset
+		}
 	}
 
-	ackResp = types.AckResponse{
-		Status:        "OK",
-		LastOffset:    ch.TopicManager.GetLastOffset(topicName, partition),
-		ProducerEpoch: epoch,
-		ProducerID:    producerID,
-		SeqStart:      seqNum,
-		SeqEnd:        seqNum,
-	}
+	ackResp.Status = "OK"
+	ackResp.ProducerEpoch = epoch
+	ackResp.ProducerID = producerID
+	ackResp.SeqStart = seqNum
+	ackResp.SeqEnd = seqNum
 
 Respond:
 	if ch.isDistributed() {
@@ -620,9 +642,9 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		}
 		appended := appendedLeaderMessages(batch.Messages)
 		if len(appended) == 0 {
-			nextOffset := p.NextOffset()
-			if nextOffset > 0 {
-				lastOffset = nextOffset - 1
+			lastOffset, err = duplicateAcknowledgementOffset(p, batch.Messages)
+			if err != nil {
+				return ch.errorResponse(err.Error()), nil
 			}
 			if ackSelection.Mode == ackpolicy.All {
 				result := make(chan error, 1)
@@ -739,6 +761,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		if ackSelection.Mode == ackpolicy.All && t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas) > 1 {
 			return "ERROR: insufficient_in_sync_replicas current=1", nil
 		}
+		markLeaderOffsetsUnassigned(batch.Messages)
 		err = p.EnqueueBatchSyncWithMode(batch.Messages, effectiveIdempotent)
 		if err != nil {
 			return ch.errorResponse(fmt.Sprintf("acks=1 batch publish failed: %v", err)), err
@@ -750,9 +773,14 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			return ch.errorResponse("empty batch messages"), nil
 		}
 
-		lastOffset = 0
-		if nextOffset := p.NextOffset(); nextOffset > 0 {
-			lastOffset = nextOffset - 1
+		appended := appendedLeaderMessages(batch.Messages)
+		if len(appended) == 0 {
+			lastOffset, err = duplicateAcknowledgementOffset(p, batch.Messages)
+			if err != nil {
+				return ch.errorResponse(err.Error()), nil
+			}
+		} else {
+			lastOffset = appended[len(appended)-1].Offset
 		}
 		respAck = types.AckResponse{
 			Status:        "OK",

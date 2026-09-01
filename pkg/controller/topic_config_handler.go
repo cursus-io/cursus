@@ -8,23 +8,16 @@ import (
 	"github.com/cursus-io/cursus/pkg/topic"
 )
 
-func (ch *CommandHandler) topicMinISRMetadata(current *topic.Topic) string {
+func (ch *CommandHandler) topicMinISRMetadata(policy topic.Policy) string {
 	configured := "default"
-	var currentPolicy topic.Policy
-	if current != nil {
-		currentPolicy = current.PolicySnapshot()
-	}
-	if currentPolicy.MinInSyncReplicas != nil {
-		configured = strconv.Itoa(*currentPolicy.MinInSyncReplicas)
+	if policy.MinInSyncReplicas != nil {
+		configured = strconv.Itoa(*policy.MinInSyncReplicas)
 	}
 	brokerDefault := 1
 	if ch != nil && ch.Config != nil {
 		brokerDefault = ch.Config.MinInSyncReplicas
 	}
-	effective := topic.DefaultPolicy().EffectiveMinInSyncReplicas(brokerDefault)
-	if current != nil {
-		effective = currentPolicy.EffectiveMinInSyncReplicas(brokerDefault)
-	}
+	effective := policy.EffectiveMinInSyncReplicas(brokerDefault)
 	return fmt.Sprintf("min_in_sync_replicas=%s effective_min_in_sync_replicas=%d", configured, effective)
 }
 
@@ -110,5 +103,8 @@ func (ch *CommandHandler) handleAlterTopicConfig(cmd string, ctx ...*ClientConte
 	}
 
 	current = ch.TopicManager.GetTopic(topicName)
-	return fmt.Sprintf("OK topic=%s %s", topicName, ch.topicMinISRMetadata(current))
+	if current == nil {
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+	return fmt.Sprintf("OK topic=%s %s", topicName, ch.topicMinISRMetadata(current.Definition().Policy))
 }

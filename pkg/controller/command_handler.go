@@ -133,7 +133,7 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 		}
 	}
 	definition := t.Definition()
-	return fmt.Sprintf("OK topic=%s partitions=%d cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d %s", topicName, definition.Partitions, definition.Policy.CleanupPolicy, definition.Policy.Partitioner, definition.Policy.AuthPolicy, strings.Join(definition.Policy.ReadACL, ","), strings.Join(definition.Policy.WriteACL, ","), definition.Policy.RetentionHours, definition.Policy.RetentionBytes, ch.topicMinISRMetadata(t))
+	return fmt.Sprintf("OK topic=%s partitions=%d cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d %s", topicName, definition.Partitions, definition.Policy.CleanupPolicy, definition.Policy.Partitioner, definition.Policy.AuthPolicy, strings.Join(definition.Policy.ReadACL, ","), strings.Join(definition.Policy.WriteACL, ","), definition.Policy.RetentionHours, definition.Policy.RetentionBytes, ch.topicMinISRMetadata(definition.Policy))
 }
 
 func parseTopicPolicy(args map[string]string, defaultCleanupPolicy string) (topic.Policy, string) {

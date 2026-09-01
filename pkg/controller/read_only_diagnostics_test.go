@@ -17,19 +17,26 @@ func TestGroupAndOffsetDiagnosticsAreStrictlyReadOnly(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
 	dm := disk.NewDiskManager(cfg)
-	t.Cleanup(dm.CloseAllHandlers)
 	tm := topic.NewTopicManager(cfg, dm, nil)
 	require.NoError(t, tm.RestoreTopics())
 	cd, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, tm)
 	require.NoError(t, err)
-	t.Cleanup(cd.Stop)
 	tm.SetCoordinator(cd)
 	require.NoError(t, tm.CreateTopic("events", 2, false, false))
 	require.NoError(t, cd.RegisterGroup("events", "workers", 2))
 	require.NoError(t, cd.CommitOffset("workers", "events", 0, 7))
 
 	handler := controller.NewCommandHandler(tm, cfg, cd, nil, nil)
-	t.Cleanup(func() { require.NoError(t, handler.Close()) })
+	t.Cleanup(func() {
+		require.NoError(t, handler.Close())
+		cd.Stop()
+		for _, name := range tm.ListTopics() {
+			for _, partition := range tm.GetTopic(name).Partitions {
+				partition.Close()
+			}
+		}
+		dm.CloseAllHandlers()
+	})
 	beforeState := cd.ExportState()
 	beforeDefinitions := tm.ExportDefinitions()
 	beforeRecovery := cd.RecoverySnapshot()

@@ -89,3 +89,12 @@ func TestCommandHandler_isLeaderAndForward_WaitRetry(t *testing.T) {
 		t.Errorf("Expected nil error (handled via response string), got %v", err)
 	}
 }
+
+func TestWireErrorCodeRequiresExactErrorToken(t *testing.T) {
+	if got := wireErrorCode("ERROR: PARTITION_LEADER_FENCED current=node2"); got != "PARTITION_LEADER_FENCED" {
+		t.Fatalf("wireErrorCode() = %q", got)
+	}
+	if got := wireErrorCode("ERROR: raft_apply_failed reason=PARTITION_LEADER_FENCED"); got != "RAFT_APPLY_FAILED" {
+		t.Fatalf("wireErrorCode() matched an embedded reason: %q", got)
+	}
+}
