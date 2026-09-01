@@ -178,7 +178,8 @@ func (p *Producer) fetchMetadata() {
 		if err != nil {
 			continue
 		}
-		if err := negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS); err != nil {
+		conn, err = negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS, p.config.CompressionType)
+		if err != nil {
 			_ = conn.Close()
 			continue
 		}
@@ -270,7 +271,8 @@ func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) er
 	}
 	defer func() { _ = conn.Close() }()
 
-	if err := negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS); err != nil {
+	conn, err = negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS, p.config.CompressionType)
+	if err != nil {
 		return fmt.Errorf("protocol negotiation: %w", err)
 	}
 	if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {

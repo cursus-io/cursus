@@ -1,13 +1,12 @@
 package sdk
 
 import (
-	"fmt"
 	"net"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/cursus-io/cursus/util"
+	"github.com/cursus-io/cursus/pkg/wire"
 )
 
 func TestConfiguredNegotiationHasBoundedTimeout(t *testing.T) {
@@ -15,15 +14,10 @@ func TestConfiguredNegotiationHasBoundedTimeout(t *testing.T) {
 	defer func() { _ = client.Close() }()
 	defer func() { _ = server.Close() }()
 	release := make(chan struct{})
-	requestRead := make(chan struct{})
-	go func() {
-		_, _ = ReadWithLength(server)
-		close(requestRead)
-		<-release
-	}()
+	go func() { <-release }()
 
 	start := time.Now()
-	err := negotiateConfiguredProtocol(client, 1, []string{"structured_errors_v1"}, false, 25)
+	_, err := negotiateConfiguredProtocol(client, 2, nil, false, 25, "none")
 	close(release)
 	if err == nil || !strings.Contains(err.Error(), "timeout") {
 		t.Fatalf("expected timeout, got %v", err)
@@ -31,7 +25,6 @@ func TestConfiguredNegotiationHasBoundedTimeout(t *testing.T) {
 	if time.Since(start) > time.Second {
 		t.Fatalf("negotiation timeout was not bounded: %v", time.Since(start))
 	}
-	<-requestRead
 }
 
 func TestConfiguredNegotiationClearsDeadlineAfterSuccess(t *testing.T) {
@@ -40,46 +33,28 @@ func TestConfiguredNegotiationClearsDeadlineAfterSuccess(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	serverDone := make(chan error, 1)
 	go func() {
-		first, err := ReadWithLength(server)
+		connection, err := wire.ServerHandshake(server, []wire.Compression{wire.CompressionNone})
 		if err != nil {
 			serverDone <- err
 			return
 		}
-		_, command, err := util.DecodeMessage(first)
+		request, err := connection.ReadFrame()
 		if err != nil {
 			serverDone <- err
 			return
 		}
-		if !strings.HasPrefix(command, "NEGOTIATE ") {
-			serverDone <- fmt.Errorf("unexpected command: %s", command)
-			return
-		}
-		if err := WriteWithLength(server, []byte("OK protocol_version=1 enabled=structured_errors_v1 unsupported=")); err != nil {
-			serverDone <- err
-			return
-		}
-		second, err := ReadWithLength(server)
-		if err != nil {
-			serverDone <- err
-			return
-		}
-		_, command, err = util.DecodeMessage(second)
-		if err != nil {
-			serverDone <- err
-			return
-		}
-		if command != "PROTOCOL_INFO" {
-			serverDone <- fmt.Errorf("unexpected command: %s", command)
-			return
-		}
-		serverDone <- WriteWithLength(server, []byte("OK protocol=cursus min_version=1 max_version=1 default_version=1 features=structured_errors_v1 error_classes=validation"))
+		serverDone <- connection.WriteFrame(wire.Frame{
+			Kind: wire.KindResponse, Command: request.Command, Status: wire.StatusOK, RequestID: request.RequestID,
+			Payload: []byte("OK protocol=cursus min_version=2 max_version=2 default_version=2 features= error_classes=validation"),
+		})
 	}()
 
-	if err := negotiateConfiguredProtocol(client, 1, []string{"structured_errors_v1"}, false, 25); err != nil {
+	framed, err := negotiateConfiguredProtocol(client, 2, nil, false, 25, "none")
+	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if _, err := FetchProtocolInfo(client); err != nil {
+	if _, err := FetchProtocolInfo(framed); err != nil {
 		t.Fatalf("cleared connection deadline was not reusable: %v", err)
 	}
 	if err := <-serverDone; err != nil {

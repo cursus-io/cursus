@@ -214,6 +214,9 @@ func validateFrameSemantics(frame Frame) error {
 		if frame.Status != StatusOK && frame.Status != StatusError {
 			return fmt.Errorf("%w: response status must be OK or error", ErrInvalidFrame)
 		}
+		if frame.Kind == KindResponse && frame.RequestID == 0 {
+			return fmt.Errorf("%w: response request id is required", ErrInvalidFrame)
+		}
 	case KindRequest:
 		if frame.Status != StatusNone {
 			return fmt.Errorf("%w: request status must be zero", ErrInvalidFrame)
@@ -224,6 +227,9 @@ func validateFrameSemantics(frame Frame) error {
 	case KindStream:
 		if !frame.Status.valid() {
 			return fmt.Errorf("%w: invalid stream status %d", ErrInvalidFrame, frame.Status)
+		}
+		if frame.RequestID == 0 {
+			return fmt.Errorf("%w: stream request id is required", ErrInvalidFrame)
 		}
 	}
 	if frame.Kind.negotiation() && frame.Command != CommandNegotiate {

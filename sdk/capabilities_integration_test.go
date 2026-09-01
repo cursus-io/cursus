@@ -1,21 +1,20 @@
 package sdk
 
 import (
-	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/cursus-io/cursus/util"
+	"github.com/cursus-io/cursus/pkg/wire"
 )
 
 func TestConsumerClientNegotiatesConfiguredProtocol(t *testing.T) {
-	addr, commands, closeServer := startProtocolTestServer(t, "OK protocol_version=1 enabled=structured_errors_v1 unsupported=")
+	addr, commands, closeServer := startProtocolTestServer(t)
 	defer closeServer()
 
 	cfg := NewDefaultConsumerConfig()
-	cfg.ProtocolVersion = 1
-	cfg.ProtocolFeatures = []string{"structured_errors_v1"}
+	cfg.ProtocolVersion = 2
 	client, err := NewConsumerClient(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -28,7 +27,7 @@ func TestConsumerClientNegotiatesConfiguredProtocol(t *testing.T) {
 
 	select {
 	case command := <-commands:
-		want := "NEGOTIATE version=1 features=structured_errors_v1 require_features=false"
+		want := "NEGOTIATE"
 		if command != want {
 			t.Fatalf("command = %q, want %q", command, want)
 		}
@@ -37,12 +36,12 @@ func TestConsumerClientNegotiatesConfiguredProtocol(t *testing.T) {
 	}
 }
 
-func TestProducerClientRejectsFailedRequiredNegotiation(t *testing.T) {
-	addr, _, closeServer := startProtocolTestServer(t, "ERROR: UNSUPPORTED_FEATURE class=validation retryable=false features=required_v1")
+func TestProducerClientRejectsLegacyProtocolFeatures(t *testing.T) {
+	addr, _, closeServer := startProtocolTestServer(t)
 	defer closeServer()
 
 	cfg := NewDefaultPublisherConfig()
-	cfg.ProtocolVersion = 1
+	cfg.ProtocolVersion = 2
 	cfg.ProtocolFeatures = []string{"required_v1"}
 	cfg.RequireProtocolFeatures = true
 	client, err := NewProducerClient(cfg)
@@ -50,19 +49,15 @@ func TestProducerClientRejectsFailedRequiredNegotiation(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = client.ConnectPartition(0, addr)
-	var brokerErr *BrokerError
-	if !errors.As(err, &brokerErr) {
-		t.Fatalf("expected BrokerError, got %T: %v", err, err)
-	}
-	if brokerErr.Code != "UNSUPPORTED_FEATURE" || brokerErr.Retryable {
-		t.Fatalf("unexpected broker error: %+v", brokerErr)
+	if err == nil || !strings.Contains(err.Error(), "legacy protocol features") {
+		t.Fatalf("expected legacy feature rejection, got %v", err)
 	}
 	if client.GetConn(0) != nil {
 		t.Fatal("failed negotiation stored a partition connection")
 	}
 }
 
-func startProtocolTestServer(t *testing.T, response string) (string, <-chan string, func()) {
+func startProtocolTestServer(t *testing.T) (string, <-chan string, func()) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -77,16 +72,9 @@ func startProtocolTestServer(t *testing.T, response string) (string, <-chan stri
 			return
 		}
 		defer func() { _ = conn.Close() }()
-		data, err := ReadWithLength(conn)
-		if err != nil {
-			return
+		if _, err := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone}); err == nil {
+			commands <- "NEGOTIATE"
 		}
-		_, command, err := util.DecodeMessage(data)
-		if err != nil {
-			return
-		}
-		commands <- command
-		_ = WriteWithLength(conn, []byte(response))
 	}()
 	closeServer := func() {
 		_ = listener.Close()

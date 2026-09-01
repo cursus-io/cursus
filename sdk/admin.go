@@ -30,6 +30,7 @@ type AdminConfig struct {
 	ProtocolFeatures             []string `yaml:"protocol_features" json:"protocol_features"`
 	RequireProtocolFeatures      bool     `yaml:"require_protocol_features" json:"require_protocol_features"`
 	ProtocolNegotiationTimeoutMS int      `yaml:"protocol_negotiation_timeout_ms" json:"protocol_negotiation_timeout_ms"`
+	CompressionType              string   `yaml:"compression_type" json:"compression_type"`
 }
 
 // NewDefaultAdminConfig returns conservative defaults for a local broker.
@@ -39,6 +40,7 @@ func NewDefaultAdminConfig() *AdminConfig {
 		MaxRetries:       3,
 		RetryBackoffMS:   100,
 		RequestTimeoutMS: 5000,
+		CompressionType:  "none",
 	}
 }
 
@@ -302,7 +304,8 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
 	defer stopCancellation()
 
-	if err := negotiateConfiguredProtocol(conn, c.config.ProtocolVersion, c.config.ProtocolFeatures, c.config.RequireProtocolFeatures, c.config.ProtocolNegotiationTimeoutMS); err != nil {
+	conn, err = negotiateConfiguredProtocol(conn, c.config.ProtocolVersion, c.config.ProtocolFeatures, c.config.RequireProtocolFeatures, c.config.ProtocolNegotiationTimeoutMS, c.config.CompressionType)
+	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
 		}

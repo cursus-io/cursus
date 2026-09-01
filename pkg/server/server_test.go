@@ -80,6 +80,32 @@ func readFramed(t *testing.T, conn net.Conn) string {
 	return string(msgBuf)
 }
 
+func newWireTestClient(t *testing.T, conn net.Conn) *wire.Connection {
+	t.Helper()
+	client, err := wire.ClientHandshake(conn, []wire.Compression{wire.CompressionNone})
+	require.NoError(t, err)
+	return client
+}
+
+func wireRequest(t *testing.T, client *wire.Connection, command wire.Command, payload []byte) string {
+	t.Helper()
+	_, commandText, err := util.DecodeMessage(payload)
+	require.NoError(t, err)
+	parsedCommand, request, err := wire.ParseCommandText(commandText)
+	require.NoError(t, err)
+	require.Equal(t, command, parsedCommand)
+	payload, err = wire.EncodeCommandPayload(request)
+	require.NoError(t, err)
+	require.NoError(t, client.WriteFrame(wire.Frame{
+		Kind: wire.KindRequest, Command: command, RequestID: 1, Payload: payload,
+	}))
+	response, err := client.ReadFrame()
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), response.RequestID)
+	require.Equal(t, command, response.Command)
+	return string(response.Payload)
+}
+
 func TestIsBatchMessage(t *testing.T) {
 	data, err := wire.EncodeBatch(wire.Batch{Topic: "orders", Partition: 2, Acks: "all"})
 	require.NoError(t, err)
@@ -726,11 +752,10 @@ func TestHandleConn_HelpCommand(t *testing.T) {
 
 	conn, err := net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
+	client := newWireTestClient(t, conn)
 
 	encoded := util.EncodeMessage("t", "HELP")
-	sendFramed(t, conn, encoded)
-
-	msg := readFramed(t, conn)
+	msg := wireRequest(t, client, wire.CommandHelp, encoded)
 	assert.NotEmpty(t, msg)
 
 	_ = conn.Close()
@@ -866,11 +891,10 @@ func TestHandleConn_StreamCommandSetsIsStreamed(t *testing.T) {
 
 	conn, err := net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
+	client := newWireTestClient(t, conn)
 
 	encoded := util.EncodeMessage("t", "STREAM topic=test partition=0 group=g1")
-	sendFramed(t, conn, encoded)
-
-	msg := readFramed(t, conn)
+	msg := wireRequest(t, client, wire.CommandStream, encoded)
 	assert.Contains(t, msg, "ERROR")
 	_ = conn.Close()
 
@@ -900,11 +924,10 @@ func TestHandleConnection_StreamCommandSetsIsStreamed(t *testing.T) {
 
 	conn, err := net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
+	client := newWireTestClient(t, conn)
 
 	encoded := util.EncodeMessage("t", "STREAM topic=test partition=0 group=g1")
-	sendFramed(t, conn, encoded)
-
-	msg := readFramed(t, conn)
+	msg := wireRequest(t, client, wire.CommandStream, encoded)
 	assert.Contains(t, msg, "ERROR")
 	_ = conn.Close()
 

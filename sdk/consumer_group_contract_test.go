@@ -1,8 +1,6 @@
 package sdk
 
 import (
-	"encoding/binary"
-	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -33,29 +31,15 @@ func startSDKCommandServer(t *testing.T, responses ...string) (string, <-chan sc
 				return
 			}
 
-			request, readErr := ReadWithLength(conn)
+			connection, request, command, readErr := acceptWireTestRequest(conn)
 			if readErr != nil {
 				_ = conn.Close()
 				results <- scriptedSDKCommand{err: readErr}
 				return
 			}
-			if len(request) < 2 {
-				_ = conn.Close()
-				results <- scriptedSDKCommand{err: fmt.Errorf("short encoded command: %d bytes", len(request))}
-				return
-			}
-
-			topicLength := int(binary.BigEndian.Uint16(request[:2]))
-			commandStart := 2 + topicLength
-			if commandStart > len(request) {
-				_ = conn.Close()
-				results <- scriptedSDKCommand{err: fmt.Errorf("invalid topic length %d for %d-byte command", topicLength, len(request))}
-				return
-			}
-
-			results <- scriptedSDKCommand{command: string(request[commandStart:])}
+			results <- scriptedSDKCommand{command: command}
 			if response != "" {
-				if writeErr := WriteWithLength(conn, []byte(response)); writeErr != nil {
+				if writeErr := writeWireTestResponse(connection, request, response); writeErr != nil {
 					_ = conn.Close()
 					results <- scriptedSDKCommand{err: writeErr}
 					return

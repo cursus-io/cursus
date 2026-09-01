@@ -7,6 +7,7 @@ import (
 	"net"
 
 	"github.com/cursus-io/cursus/pkg/wire"
+	"github.com/cursus-io/cursus/sdk/internal/transport"
 )
 
 const MaxMessageSize = wire.MaxFramePayload
@@ -39,10 +40,16 @@ func DecodeBatchMessages(data []byte) ([]Message, string, int, error) {
 }
 
 func WriteWithLength(conn net.Conn, data []byte) error {
+	if framed, ok := conn.(*transport.Conn); ok {
+		return framed.Send(data)
+	}
 	return wire.WriteLengthPrefixed(conn, data)
 }
 
 func ReadWithLength(conn net.Conn) ([]byte, error) {
+	if framed, ok := conn.(*transport.Conn); ok {
+		return framed.Receive()
+	}
 	return wire.ReadLengthPrefixed(conn)
 }
 

@@ -3,9 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -17,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/stretchr/testify/require"
 )
 
@@ -139,19 +138,19 @@ func brokerCommand(t *testing.T, port int, command string) string {
 	require.NoError(t, err)
 	defer func() { _ = connection.Close() }()
 	require.NoError(t, connection.SetDeadline(time.Now().Add(5*time.Second)))
-	payload := []byte(command)
-	frame := make([]byte, 4+len(payload))
-	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
-	copy(frame[4:], payload)
-	_, err = connection.Write(frame)
+	commandID, commandPayload, err := wire.ParseCommandText(command)
 	require.NoError(t, err)
-	var length [4]byte
-	_, err = io.ReadFull(connection, length[:])
+	payload, err := wire.EncodeCommandPayload(commandPayload)
 	require.NoError(t, err)
-	response := make([]byte, binary.BigEndian.Uint32(length[:]))
-	_, err = io.ReadFull(connection, response)
+	framed, err := wire.ClientHandshake(connection, []wire.Compression{wire.CompressionNone})
 	require.NoError(t, err)
-	return string(response)
+	require.NoError(t, framed.WriteFrame(wire.Frame{
+		Kind: wire.KindRequest, Command: commandID, RequestID: 1, Payload: payload,
+	}))
+	response, err := framed.ReadFrame()
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), response.RequestID)
+	return string(response.Payload)
 }
 
 func reserveBrokerTestPorts(t *testing.T) (int, int) {

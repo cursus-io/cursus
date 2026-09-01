@@ -4,9 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"sort"
 	"strconv"
@@ -16,6 +14,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -369,30 +368,32 @@ func (r *ClusterRouter) sendDataRequest(addr string, data []byte) (string, error
 		return "", err
 	}
 
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
-
-	if _, err := conn.Write(lenBuf); err != nil {
-		return "", fmt.Errorf("failed to write length: %w", err)
+	connection, err := wire.ClientHandshake(conn, []wire.Compression{wire.CompressionNone})
+	if err != nil {
+		return "", fmt.Errorf("negotiate internal Wire v2 connection: %w", err)
 	}
-	if _, err := conn.Write(data); err != nil {
-		return "", fmt.Errorf("failed to write data: %w", err)
+	command := wire.CommandPublish
+	if !wire.IsBatch(data) {
+		var request wire.CommandPayload
+		command, request, err = wire.ParseCommandText(string(data))
+		if err != nil {
+			return "", err
+		}
+		data, err = wire.EncodeCommandPayload(request)
+		if err != nil {
+			return "", err
+		}
 	}
-
-	respLenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(conn, respLenBuf); err != nil {
-		return "", fmt.Errorf("failed to read response length: %w", err)
+	const requestID = 1
+	if err := connection.WriteFrame(wire.Frame{Kind: wire.KindRequest, Command: command, RequestID: requestID, Payload: data}); err != nil {
+		return "", fmt.Errorf("write internal Wire v2 request: %w", err)
 	}
-
-	respLen := binary.BigEndian.Uint32(respLenBuf)
-	if respLen == 0 {
-		return "", nil
+	response, err := connection.ReadFrame()
+	if err != nil {
+		return "", fmt.Errorf("read internal Wire v2 response: %w", err)
 	}
-
-	respBuf := make([]byte, respLen)
-	if _, err := io.ReadFull(conn, respBuf); err != nil {
-		return "", fmt.Errorf("failed to read full response body: %w", err)
+	if response.RequestID != requestID || response.Command != command {
+		return "", fmt.Errorf("internal Wire v2 response correlation mismatch")
 	}
-
-	return string(respBuf), nil
+	return string(response.Payload), nil
 }

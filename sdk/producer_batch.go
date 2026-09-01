@@ -46,16 +46,8 @@ func (p *Producer) sendBatch(part int, batch []Message) {
 		return
 	}
 
-	payload, err := CompressMessage(data, p.config.CompressionType)
-	if err != nil {
-		LogError("compress batch failed: %v", err)
-		p.cleanupBatchState(part, batchID)
-		p.handleSendFailure(part, batch)
-		return
-	}
-
 	sendStart := time.Now()
-	ackResp, err := p.sendWithRetry(payload, part)
+	ackResp, err := p.sendWithRetry(data, part)
 	if err != nil {
 		LogError("send failed: %v", err)
 		if p.config.EnableMetrics {

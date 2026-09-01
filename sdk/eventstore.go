@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cursus-io/cursus/sdk/internal/transport"
 )
 
 // Event represents a domain event to be appended to a stream.
@@ -85,6 +87,20 @@ func (es *EventStore) getConn() (net.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s: %w", es.addr, err)
 	}
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("set Wire v2 negotiation deadline: %w", err)
+	}
+	framed, err := transport.NewClient(conn, "none")
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("Wire v2 negotiation with %s: %w", es.addr, err)
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("clear Wire v2 negotiation deadline: %w", err)
+	}
+	conn = framed
 
 	es.mu.Lock()
 	if es.conn != nil {

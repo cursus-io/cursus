@@ -433,9 +433,19 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 
 	clientCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stopContextClose := context.AfterFunc(clientCtx, func() { _ = conn.Close() })
+	defer stopContextClose()
 	cmdCtx.SetRequestContext(clientCtx)
 	idleTimeout := clientIdleTimeout(cmdHandler.Config)
 	lastActivity := time.Now()
+	if err := conn.SetDeadline(lastActivity.Add(idleTimeout)); err != nil {
+		return
+	}
+	wireConnection, responseConn, err := negotiateServerConnection(conn)
+	if err != nil {
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
 
 	for {
 		select {
@@ -453,7 +463,7 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 			return
 		}
 
-		data, err := readMessage(conn, cmdHandler.Config.CompressionType)
+		request, err := readWireRequest(wireConnection)
 		if err != nil {
 			select {
 			case <-clientCtx.Done():
@@ -467,20 +477,13 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 		}
 
 		lastActivity = time.Now()
-		shouldExit, err := processMessage(data, cmdHandler, cmdCtx, conn)
+		responseConn.setRequest(request)
+		shouldExit, err := processMessage(request.Payload, cmdHandler, cmdCtx, responseConn)
 		if err != nil {
 			return
 		}
 		if shouldExit {
-			_, payload, decodeErr := util.DecodeMessage(data)
-			cmd := ""
-			if decodeErr == nil {
-				cmd = strings.TrimSpace(payload)
-			} else {
-				cmd = strings.TrimSpace(string(data))
-			}
-
-			if strings.HasPrefix(strings.ToUpper(cmd), "STREAM ") {
+			if request.Command == wire.CommandStream {
 				isStreamed = true
 			}
 			return
@@ -501,6 +504,8 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 
 	clientCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stopContextClose := context.AfterFunc(clientCtx, func() { _ = conn.Close() })
+	defer stopContextClose()
 
 	cmdHandler, cmdCtx := initializeConnection(cfg, tm, cd, sm, cc)
 	defer func() { _ = cmdHandler.Close() }()
@@ -508,6 +513,14 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 
 	idleTimeout := clientIdleTimeout(cfg)
 	lastActivity := time.Now()
+	if err := conn.SetDeadline(lastActivity.Add(idleTimeout)); err != nil {
+		return
+	}
+	wireConnection, responseConn, err := negotiateServerConnection(conn)
+	if err != nil {
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
 	for {
 		select {
 		case <-clientCtx.Done():
@@ -524,7 +537,7 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 			return
 		}
 
-		data, err := readMessage(conn, cfg.CompressionType)
+		request, err := readWireRequest(wireConnection)
 		if err != nil {
 			select {
 			case <-clientCtx.Done():
@@ -537,22 +550,14 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 			}
 		}
 
-		shouldExit, err := processMessage(data, cmdHandler, cmdCtx, conn)
+		responseConn.setRequest(request)
+		shouldExit, err := processMessage(request.Payload, cmdHandler, cmdCtx, responseConn)
 		lastActivity = time.Now()
 		if err != nil {
 			return
 		}
 		if shouldExit {
-			// Check if this was a STREAM command to prevent closing the connection
-			_, payload, decodeErr := util.DecodeMessage(data)
-			cmd := ""
-			if decodeErr == nil {
-				cmd = strings.TrimSpace(payload)
-			} else {
-				cmd = strings.TrimSpace(string(data))
-			}
-
-			if strings.HasPrefix(strings.ToUpper(cmd), "STREAM ") {
+			if request.Command == wire.CommandStream {
 				isStreamed = true
 			}
 			return

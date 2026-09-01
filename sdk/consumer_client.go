@@ -91,7 +91,8 @@ func (c *ConsumerClient) Connect(addr string) (net.Conn, error) {
 		_ = tcpConn.SetWriteBuffer(2 * 1024 * 1024)
 	}
 
-	if err := negotiateConfiguredProtocol(conn, c.config.ProtocolVersion, c.config.ProtocolFeatures, c.config.RequireProtocolFeatures, c.config.ProtocolNegotiationTimeoutMS); err != nil {
+	conn, err = negotiateConfiguredProtocol(conn, c.config.ProtocolVersion, c.config.ProtocolFeatures, c.config.RequireProtocolFeatures, c.config.ProtocolNegotiationTimeoutMS, c.config.CompressionType)
+	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("protocol negotiation with %s failed: %w", addr, err)
 	}

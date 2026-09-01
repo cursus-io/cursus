@@ -92,14 +92,9 @@ func serveTransactionConnections(listener net.Listener, count int, responder fun
 			result <- err
 			return
 		}
-		request, err := ReadWithLength(conn)
+		connection, request, command, err := acceptWireTestRequest(conn)
 		if err == nil {
-			if len(request) < 2 {
-				err = fmt.Errorf("short encoded command")
-			} else {
-				command := string(request[2:])
-				err = WriteWithLength(conn, []byte(responder(command)))
-			}
+			err = writeWireTestResponse(connection, request, responder(command))
 		}
 		_ = conn.Close()
 		if err != nil {
@@ -254,7 +249,7 @@ func TestTransactionalProducerPreservesSessionAcrossLifecycle(t *testing.T) {
 		!strings.Contains(got[2], "partition=-1") {
 		t.Fatalf("publish did not use preserved session: %s", got[2])
 	}
-	if !strings.HasSuffix(got[3], "P0:5,P1:8") {
+	if !strings.Contains(got[3], "P0:5,P1:8") {
 		t.Fatalf("offsets were not deterministic: %s", got[3])
 	}
 	if got[5] != got[6] {

@@ -2,12 +2,11 @@ package sdk
 
 import (
 	"context"
-	"encoding/binary"
-	"fmt"
 	"net"
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/stretchr/testify/require"
 )
 
@@ -152,14 +151,14 @@ func TestAdminClientRetriesNegotiationTransportFailureOnNextBroker(t *testing.T)
 		BrokerAddrs:      []string{firstAddr, secondAddr},
 		MaxRetries:       1,
 		RequestTimeoutMS: 1000,
-		ProtocolVersion:  1,
+		ProtocolVersion:  2,
 	})
 	require.NoError(t, err)
 
 	definition, err := client.CreateTopicContext(context.Background(), "orders", TopicDefinitionPatch{})
 	require.NoError(t, err)
 	require.Equal(t, "orders", definition.Topic)
-	require.Equal(t, "NEGOTIATE version=1 features= require_features=false", receiveAdminTestCommand(t, firstResult))
+	require.Equal(t, "NEGOTIATE", receiveAdminTestCommand(t, firstResult))
 	require.Equal(t, "CREATE topic=orders", receiveAdminTestCommand(t, secondResult))
 }
 
@@ -216,22 +215,12 @@ func startAdminTestServer(t *testing.T, response string) (string, <-chan adminTe
 			return
 		}
 		defer conn.Close()
-		payload, readErr := ReadWithLength(conn)
+		connection, request, command, readErr := acceptWireTestRequest(conn)
 		if readErr != nil {
 			result <- adminTestResult{err: readErr}
 			return
 		}
-		if len(payload) < 2 {
-			result <- adminTestResult{err: fmt.Errorf("encoded command is too short")}
-			return
-		}
-		topicLength := int(binary.BigEndian.Uint16(payload[:2]))
-		if 2+topicLength > len(payload) {
-			result <- adminTestResult{err: fmt.Errorf("encoded command topic length is invalid")}
-			return
-		}
-		command := string(payload[2+topicLength:])
-		if writeErr := WriteWithLength(conn, []byte(response)); writeErr != nil {
+		if writeErr := writeWireTestResponse(connection, request, response); writeErr != nil {
 			result <- adminTestResult{err: writeErr}
 			return
 		}
@@ -266,25 +255,22 @@ func startAdminNegotiationTestServer(t *testing.T, closeAfterNegotiation bool) (
 			return
 		}
 		defer conn.Close()
-		negotiation, readErr := readAdminTestCommand(conn)
-		if readErr != nil {
-			result <- adminTestResult{err: readErr}
-			return
-		}
 		if closeAfterNegotiation {
-			result <- adminTestResult{command: negotiation}
+			plain, _ := wire.NewCodec(wire.CompressionNone)
+			frame, readErr := plain.ReadFrame(conn)
+			if readErr != nil {
+				result <- adminTestResult{err: readErr}
+				return
+			}
+			result <- adminTestResult{command: frame.Command.String()}
 			return
 		}
-		if writeErr := WriteWithLength(conn, []byte("OK protocol_version=1 enabled= unsupported=")); writeErr != nil {
-			result <- adminTestResult{err: writeErr}
-			return
-		}
-		command, readErr := readAdminTestCommand(conn)
+		connection, request, command, readErr := acceptWireTestRequest(conn)
 		if readErr != nil {
 			result <- adminTestResult{err: readErr}
 			return
 		}
-		if writeErr := WriteWithLength(conn, []byte("OK topic=orders partitions=4 revision=1 replication_factor=3 idempotent=false event_sourcing=false cleanup_policy=delete partitioner=hash_key auth_policy=open read_acl= write_acl= retention_hours=0 retention_bytes=0")); writeErr != nil {
+		if writeErr := writeWireTestResponse(connection, request, "OK topic=orders partitions=4 revision=1 replication_factor=3 idempotent=false event_sourcing=false cleanup_policy=delete partitioner=hash_key auth_policy=open read_acl= write_acl= retention_hours=0 retention_bytes=0"); writeErr != nil {
 			result <- adminTestResult{err: writeErr}
 			return
 		}
@@ -307,24 +293,9 @@ func startAdminCommandDropServer(t *testing.T) (string, <-chan adminTestResult) 
 			return
 		}
 		defer conn.Close()
-		command, readErr := readAdminTestCommand(conn)
+		_, _, command, readErr := acceptWireTestRequest(conn)
 		result <- adminTestResult{command: command, err: readErr}
 	}()
 	t.Cleanup(func() { _ = listener.Close() })
 	return listener.Addr().String(), result
-}
-
-func readAdminTestCommand(conn net.Conn) (string, error) {
-	payload, err := ReadWithLength(conn)
-	if err != nil {
-		return "", err
-	}
-	if len(payload) < 2 {
-		return "", fmt.Errorf("encoded command is too short")
-	}
-	topicLength := int(binary.BigEndian.Uint16(payload[:2]))
-	if 2+topicLength > len(payload) {
-		return "", fmt.Errorf("encoded command topic length is invalid")
-	}
-	return string(payload[2+topicLength:]), nil
 }

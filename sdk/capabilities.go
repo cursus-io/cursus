@@ -9,6 +9,8 @@ import (
 	"time"
 
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/cursus-io/cursus/pkg/wire"
+	"github.com/cursus-io/cursus/sdk/internal/transport"
 )
 
 type ProtocolInfo struct {
@@ -123,26 +125,28 @@ func NegotiateProtocol(conn net.Conn, request ProtocolNegotiation) (*NegotiatedP
 	return result, nil
 }
 
-func negotiateConfiguredProtocol(conn net.Conn, version int, features []string, require bool, timeoutMS int) error {
-	if version == 0 && len(features) == 0 {
-		if require {
-			return fmt.Errorf("required protocol negotiation has no configured features")
-		}
-		return nil
+func negotiateConfiguredProtocol(conn net.Conn, version int, features []string, require bool, timeoutMS int, compression string) (net.Conn, error) {
+	if conn == nil {
+		return nil, fmt.Errorf("protocol negotiation connection is nil")
+	}
+	if version != 0 && version != int(wire.ProtocolVersion) {
+		return conn, fmt.Errorf("unsupported protocol version %d; Wire v2 is required", version)
+	}
+	if len(features) > 0 || require {
+		return conn, fmt.Errorf("legacy protocol features are not supported by Wire v2")
 	}
 	if timeoutMS <= 0 {
 		timeoutMS = 5000
 	}
 	if err := conn.SetDeadline(time.Now().Add(time.Duration(timeoutMS) * time.Millisecond)); err != nil {
-		return fmt.Errorf("set protocol negotiation deadline: %w", err)
+		return conn, fmt.Errorf("set protocol negotiation deadline: %w", err)
 	}
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
-	_, err := NegotiateProtocol(conn, ProtocolNegotiation{
-		Version:         version,
-		Features:        features,
-		RequireFeatures: require,
-	})
-	return err
+	framed, err := transport.NewClient(conn, compression)
+	if err != nil {
+		return conn, err
+	}
+	return framed, nil
 }
 
 func validateNegotiatedFeatures(requested []string, result *NegotiatedProtocol, require bool) error {
