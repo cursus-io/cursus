@@ -129,6 +129,10 @@ jobs:
         run: |
           go test -v -timeout 20m ./test/e2e-cluster/... -run '^TestRaftLeaderFailoverPropagatesDirectTopicMutations$' -count=1
 
+      - name: Run consumer lifecycle observability E2E
+        run: |
+          go test -v -timeout 20m ./test/e2e-cluster/... -run '^TestConsumerLifecycleMetricsAcrossThreeBrokerCluster$' -count=1
+
       - name: Show cluster logs on failure
         if: failure()
         working-directory: test/e2e-cluster

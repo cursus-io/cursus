@@ -39,6 +39,7 @@ type Coordinator struct {
 	groupOwnerChecker func(groupName string) bool
 	expirationHandler func(groupName string, generation int, memberIDs []string) error
 	ownershipSince    map[string]time.Time
+	observationOwner  func(groupName string) (bool, error)
 }
 
 type TopicHandler interface {
@@ -74,6 +75,7 @@ type GroupMetadata struct {
 	Generation        int                        // Current membership generation
 	Partitions        []int                      // All partitions of the topic
 	LastRebalance     time.Time                  // Timestamp of last rebalance
+	LastActivity      time.Time                  // Timestamp of last heartbeat or lifecycle activity
 	Offsets           map[string]map[int]uint64  // topic -> partition -> next offset
 	RegistrationEpoch uint64                     // durable lifecycle epoch; zero is legacy
 	OffsetRevisions   map[string]uint64          // topic -> durable snapshot revision
@@ -93,6 +95,7 @@ type GroupStateSnapshot struct {
 	Members           map[string][]int          `json:"members"`
 	Partitions        []int                     `json:"partitions,omitempty"`
 	LastRebalance     time.Time                 `json:"last_rebalance,omitempty"`
+	LastActivity      time.Time                 `json:"last_activity,omitempty"`
 	Offsets           map[string]map[int]uint64 `json:"offsets"`
 	RegistrationEpoch uint64                    `json:"registration_epoch,omitempty"`
 	OffsetRevisions   map[string]uint64         `json:"offset_revisions,omitempty"`
@@ -116,6 +119,33 @@ type MemberInfo struct {
 	MemberID      string    `json:"member_id"`
 	LastHeartbeat time.Time `json:"last_heartbeat"`
 	Assignments   []int     `json:"assignments"`
+}
+
+const (
+	ConsumerGroupStateStable = "stable"
+	ConsumerGroupStateEmpty  = "empty"
+
+	ObservationFailureCoordinatorLookup = "coordinator_lookup"
+	ObservationFailureGroupLookup       = "group_lookup"
+	ObservationFailureTopicLookup       = "topic_lookup"
+)
+
+// ConsumerGroupObservation is the bounded-cardinality lifecycle view used by
+// the broker exporter. It intentionally excludes member and broker identity.
+type ConsumerGroupObservation struct {
+	TopicName        string
+	GroupName        string
+	MemberCount      int
+	State            string
+	LastActivity     time.Time
+	LastRebalance    time.Time
+	CoordinatorUp    bool
+	ObservationError string
+}
+
+type consumerGroupObservationRef struct {
+	topic string
+	group string
 }
 
 type OffsetCommitMessage struct {
@@ -241,6 +271,88 @@ func (c *Coordinator) SetGroupSessionCallbacks(
 	c.groupOwnerChecker = ownerChecker
 	c.expirationHandler = expirationHandler
 	c.ownershipSince = make(map[string]time.Time)
+}
+
+// SetGroupObservationResolver configures distributed exporter ownership.
+// A failed lookup is treated as non-authoritative and reported with a bounded
+// reason; raw resolver errors never enter metric labels.
+func (c *Coordinator) SetGroupObservationResolver(resolver func(groupName string) (bool, error)) {
+	c.mu.Lock()
+	c.observationOwner = resolver
+	c.mu.Unlock()
+}
+
+// ObserveConsumerGroups returns a sanitized, scrape-time lifecycle view. In
+// distributed mode only the resolved local coordinator includes lifecycle
+// values; every broker still returns an authority result for each known group.
+func (c *Coordinator) ObserveConsumerGroups() []ConsumerGroupObservation {
+	if c == nil {
+		return nil
+	}
+
+	c.mu.RLock()
+	refs := make([]consumerGroupObservationRef, 0, len(c.groups))
+	for name, group := range c.groups {
+		if group == nil {
+			continue
+		}
+		refs = append(refs, consumerGroupObservationRef{topic: group.TopicName, group: name})
+	}
+	standalone := c.standalone
+	resolver := c.observationOwner
+	c.mu.RUnlock()
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].topic != refs[j].topic {
+			return refs[i].topic < refs[j].topic
+		}
+		return refs[i].group < refs[j].group
+	})
+
+	observations := make([]ConsumerGroupObservation, 0, len(refs))
+	for _, ref := range refs {
+		observation := ConsumerGroupObservation{TopicName: ref.topic, GroupName: ref.group}
+		authoritative := standalone
+		if !standalone {
+			if resolver == nil {
+				observation.ObservationError = ObservationFailureCoordinatorLookup
+				observations = append(observations, observation)
+				continue
+			}
+			var err error
+			authoritative, err = resolver(ref.group)
+			if err != nil {
+				observation.ObservationError = ObservationFailureCoordinatorLookup
+				observations = append(observations, observation)
+				continue
+			}
+		}
+		observation.CoordinatorUp = authoritative
+		if !authoritative {
+			observations = append(observations, observation)
+			continue
+		}
+
+		c.mu.RLock()
+		group := c.groups[ref.group]
+		if group == nil || group.TopicName != ref.topic {
+			c.mu.RUnlock()
+			observation.CoordinatorUp = false
+			observation.ObservationError = ObservationFailureGroupLookup
+			observations = append(observations, observation)
+			continue
+		}
+		observation.MemberCount = len(group.Members)
+		observation.LastActivity = group.LastActivity
+		observation.LastRebalance = group.LastRebalance
+		c.mu.RUnlock()
+
+		observation.State = ConsumerGroupStateStable
+		if observation.MemberCount == 0 {
+			observation.State = ConsumerGroupStateEmpty
+		}
+		observations = append(observations, observation)
+	}
+	return observations
 }
 
 // Start launches background monitoring processes (e.g., heartbeat monitor).
@@ -406,7 +518,9 @@ func (c *Coordinator) ResumeConsumer(groupName, memberID string, generation int)
 		return nil, fmt.Errorf("%s", errResp)
 	}
 	member := c.groups[groupName].Members[memberID]
-	member.LastHeartbeat = time.Now()
+	now := time.Now()
+	member.LastHeartbeat = now
+	c.groups[groupName].LastActivity = now
 	return append([]int(nil), member.Assignments...), nil
 }
 
@@ -511,6 +625,7 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 			Members:           make(map[string][]int, len(group.Members)),
 			Partitions:        append([]int(nil), group.Partitions...),
 			LastRebalance:     group.LastRebalance,
+			LastActivity:      group.LastActivity,
 			Offsets:           make(map[string]map[int]uint64),
 			RegistrationEpoch: group.RegistrationEpoch,
 			OffsetRevisions:   make(map[string]uint64, len(group.OffsetRevisions)),
@@ -564,9 +679,13 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) {
 			Members:           make(map[string]*MemberMetadata, len(snap.Members)),
 			Partitions:        append([]int(nil), snap.Partitions...),
 			LastRebalance:     snap.LastRebalance,
+			LastActivity:      snap.LastActivity,
 			Offsets:           make(map[string]map[int]uint64),
 			RegistrationEpoch: snap.RegistrationEpoch,
 			OffsetRevisions:   make(map[string]uint64, len(snap.OffsetRevisions)),
+		}
+		if group.LastActivity.IsZero() {
+			group.LastActivity = group.LastRebalance
 		}
 
 		for mid, assignments := range snap.Members {

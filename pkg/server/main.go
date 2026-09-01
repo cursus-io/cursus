@@ -197,6 +197,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	}
 	if cd != nil {
 		cd.SetGroupSessionCallbacks(globalCH.IsGroupCoordinator, globalCH.ExpireGroupMembers)
+		cd.SetGroupObservationResolver(globalCH.ResolveGroupCoordinator)
 	}
 	if cc != nil {
 		cc.SetLocalProcessor(globalCH)

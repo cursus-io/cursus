@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	clustercontroller "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/coordinator"
@@ -20,6 +22,10 @@ type topicSource interface {
 
 type groupSource interface {
 	ExportState() map[string]*coordinator.GroupStateSnapshot
+}
+
+type groupLifecycleSource interface {
+	ObserveConsumerGroups() []coordinator.ConsumerGroupObservation
 }
 
 type diskSource interface {
@@ -54,6 +60,9 @@ type Collector struct {
 	descriptors  []*prometheus.Desc
 	transactions transactionSource
 
+	observationMu       sync.Mutex
+	observationFailures map[observationFailureKey]uint64
+
 	ready                           *prometheus.Desc
 	topicCount                      *prometheus.Desc
 	metadataLoadFailure             *prometheus.Desc
@@ -66,6 +75,11 @@ type Collector struct {
 	logEnd                          *prometheus.Desc
 	highWatermark                   *prometheus.Desc
 	groupMembers                    *prometheus.Desc
+	groupState                      *prometheus.Desc
+	groupCoordinatorUp              *prometheus.Desc
+	groupLastActivity               *prometheus.Desc
+	groupLastRebalance              *prometheus.Desc
+	groupObservationFailures        *prometheus.Desc
 	groupGeneration                 *prometheus.Desc
 	groupAssignments                *prometheus.Desc
 	groupCommittedOffset            *prometheus.Desc
@@ -104,6 +118,18 @@ type Collector struct {
 	transactionOldestActive         *prometheus.Desc
 }
 
+type observationFailureKey struct {
+	topic  string
+	group  string
+	reason string
+}
+
+var observationFailureReasons = []string{
+	coordinator.ObservationFailureCoordinatorLookup,
+	coordinator.ObservationFailureGroupLookup,
+	coordinator.ObservationFailureTopicLookup,
+}
+
 // NewCollector creates a broker runtime collector. Nil sources are supported.
 func NewCollector(topics topicSource, groups groupSource, diskState diskSource, streams streamSource, cluster clusterSource, readiness ReadinessSource, transactions ...transactionSource) *Collector {
 	c := &Collector{
@@ -124,7 +150,12 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		logStart:                        prometheus.NewDesc("cursus_partition_log_start_offset", "Earliest retained offset for a partition.", []string{"topic", "partition"}, nil),
 		logEnd:                          prometheus.NewDesc("cursus_partition_log_end_offset", "Next offset allocated in a partition.", []string{"topic", "partition"}, nil),
 		highWatermark:                   prometheus.NewDesc("cursus_partition_high_watermark", "Next offset visible to committed readers.", []string{"topic", "partition"}, nil),
-		groupMembers:                    prometheus.NewDesc("cursus_consumer_group_members", "Active members in a consumer group.", []string{"group", "topic"}, nil),
+		groupMembers:                    prometheus.NewDesc("cursus_consumer_group_members", "Active members reported by the authoritative consumer group coordinator.", []string{"topic", "group"}, nil),
+		groupState:                      prometheus.NewDesc("cursus_consumer_group_state", "Current authoritative consumer group state as a one-hot gauge.", []string{"topic", "group", "state"}, nil),
+		groupCoordinatorUp:              prometheus.NewDesc("cursus_consumer_group_coordinator_up", "Whether this broker successfully resolved itself as the current group coordinator.", []string{"topic", "group"}, nil),
+		groupLastActivity:               prometheus.NewDesc("cursus_consumer_group_last_activity_timestamp_seconds", "Unix timestamp of the last authoritative heartbeat or group lifecycle activity.", []string{"topic", "group"}, nil),
+		groupLastRebalance:              prometheus.NewDesc("cursus_consumer_group_last_rebalance_timestamp_seconds", "Unix timestamp of the last authoritative completed group rebalance.", []string{"topic", "group"}, nil),
+		groupObservationFailures:        prometheus.NewDesc("cursus_consumer_group_observation_failures_total", "Failed consumer group observation attempts by bounded reason.", []string{"topic", "group", "reason"}, nil),
 		groupGeneration:                 prometheus.NewDesc("cursus_consumer_group_generation", "Current consumer group generation.", []string{"group", "topic"}, nil),
 		groupAssignments:                prometheus.NewDesc("cursus_consumer_group_assigned_partitions", "Partitions assigned to active group members.", []string{"group", "topic"}, nil),
 		groupCommittedOffset:            prometheus.NewDesc("cursus_consumer_group_committed_offset", "Committed next offset for a consumer group partition.", []string{"group", "topic", "partition"}, nil),
@@ -161,6 +192,7 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		transactionStates:               prometheus.NewDesc("cursus_transactions", "Transactions retained by coordinator state.", []string{"state"}, nil),
 		transactionExpired:              prometheus.NewDesc("cursus_transactions_expired", "Expired transaction identities awaiting replacement or compaction.", nil, nil),
 		transactionOldestActive:         prometheus.NewDesc("cursus_transaction_oldest_active_seconds", "Age of the oldest open or committing transaction.", nil, nil),
+		observationFailures:             make(map[observationFailureKey]uint64),
 	}
 	if len(transactions) > 0 {
 		c.transactions = transactions[0]
@@ -169,7 +201,9 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		c.ready, c.topicCount, c.metadataLoadFailure, c.metadataRestoredTopics, c.metadataOrphanTopics,
 		c.metadataDurabilityWarning, c.metadataDurabilityWarningsTotal,
 		c.partitionCount, c.logStart, c.logEnd, c.highWatermark,
-		c.groupMembers, c.groupGeneration, c.groupAssignments, c.groupCommittedOffset,
+		c.groupMembers, c.groupState, c.groupCoordinatorUp, c.groupLastActivity,
+		c.groupLastRebalance, c.groupObservationFailures,
+		c.groupGeneration, c.groupAssignments, c.groupCommittedOffset,
 		c.groupLag, c.legacyGroupLag, c.groupOffsetOutOfRange,
 		c.consumerMetadataRecovery, c.consumerMetadataRestoredGroups, c.consumerMetadataRestoredOffsets,
 		c.consumerMetadataReplayedRecords, c.consumerMetadataOrphanRecords, c.consumerMetadataCorruptRecords,
@@ -216,6 +250,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- gauge(c.logEnd, float64(partition.LogEnd), partition.Topic, partitionLabel)
 		ch <- gauge(c.highWatermark, float64(partition.HighWatermark), partition.Topic, partitionLabel)
 	}
+	c.collectGroupLifecycle(ch, partitionState)
 	c.collectGroups(ch, partitionState)
 	if recoverySource, ok := c.groups.(interface {
 		RecoverySnapshot() coordinator.ConsumerMetadataRecoveryStatus
@@ -275,7 +310,6 @@ func (c *Collector) collectGroups(ch chan<- prometheus.Metric, partitions map[st
 		for _, memberAssignments := range state.Members {
 			assignments += len(memberAssignments)
 		}
-		ch <- gauge(c.groupMembers, float64(len(state.Members)), name, state.TopicName)
 		ch <- gauge(c.groupGeneration, float64(state.Generation), name, state.TopicName)
 		ch <- gauge(c.groupAssignments, float64(assignments), name, state.TopicName)
 
@@ -317,6 +351,138 @@ func (c *Collector) collectGroups(ch chan<- prometheus.Metric, partitions map[st
 			ch <- gauge(c.groupOffsetOutOfRange, boolValue(outOfRange), name, partition.Topic, partitionLabel)
 		}
 	}
+}
+
+func (c *Collector) collectGroupLifecycle(ch chan<- prometheus.Metric, partitions map[string]topic.PartitionRuntimeSnapshot) {
+	if c.groups == nil {
+		return
+	}
+
+	observations := c.consumerGroupObservations()
+	failed := make([]observationFailureKey, 0)
+	active := make(map[observationFailureKey]struct{}, len(observations)*len(observationFailureReasons))
+	for _, observation := range observations {
+		for _, reason := range observationFailureReasons {
+			active[observationFailureKey{topic: observation.TopicName, group: observation.GroupName, reason: reason}] = struct{}{}
+		}
+
+		failureReason := observation.ObservationError
+		if failureReason == "" && !topicObserved(observation.TopicName, partitions) {
+			failureReason = coordinator.ObservationFailureTopicLookup
+		}
+		if failureReason != "" {
+			failed = append(failed, observationFailureKey{
+				topic: observation.TopicName, group: observation.GroupName, reason: failureReason,
+			})
+		}
+
+		ch <- gauge(c.groupCoordinatorUp, boolValue(observation.CoordinatorUp), observation.TopicName, observation.GroupName)
+		if !observation.CoordinatorUp {
+			continue
+		}
+
+		ch <- gauge(c.groupMembers, float64(observation.MemberCount), observation.TopicName, observation.GroupName)
+		for _, state := range []string{coordinator.ConsumerGroupStateStable, coordinator.ConsumerGroupStateEmpty} {
+			ch <- gauge(c.groupState, boolValue(observation.State == state), observation.TopicName, observation.GroupName, state)
+		}
+		ch <- gauge(c.groupLastActivity, timestampSeconds(observation.LastActivity), observation.TopicName, observation.GroupName)
+		ch <- gauge(c.groupLastRebalance, timestampSeconds(observation.LastRebalance), observation.TopicName, observation.GroupName)
+	}
+	c.collectObservationFailureCounters(ch, active, failed)
+}
+
+func (c *Collector) consumerGroupObservations() []coordinator.ConsumerGroupObservation {
+	if source, ok := c.groups.(groupLifecycleSource); ok {
+		return source.ObserveConsumerGroups()
+	}
+
+	groups := c.groups.ExportState()
+	names := make([]string, 0, len(groups))
+	for name := range groups {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	observations := make([]coordinator.ConsumerGroupObservation, 0, len(names))
+	for _, name := range names {
+		state := groups[name]
+		if state == nil || state.Deleted {
+			continue
+		}
+		groupState := coordinator.ConsumerGroupStateStable
+		if len(state.Members) == 0 {
+			groupState = coordinator.ConsumerGroupStateEmpty
+		}
+		observations = append(observations, coordinator.ConsumerGroupObservation{
+			TopicName:     state.TopicName,
+			GroupName:     name,
+			MemberCount:   len(state.Members),
+			State:         groupState,
+			LastActivity:  state.LastActivity,
+			LastRebalance: state.LastRebalance,
+			CoordinatorUp: true,
+		})
+	}
+	return observations
+}
+
+func (c *Collector) collectObservationFailureCounters(
+	ch chan<- prometheus.Metric,
+	active map[observationFailureKey]struct{},
+	failed []observationFailureKey,
+) {
+	c.observationMu.Lock()
+	next := make(map[observationFailureKey]uint64, len(active))
+	for key := range active {
+		next[key] = c.observationFailures[key]
+	}
+	for _, key := range failed {
+		if _, ok := active[key]; ok {
+			next[key]++
+		}
+	}
+	c.observationFailures = next
+	keys := make([]observationFailureKey, 0, len(next))
+	for key := range next {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].topic != keys[j].topic {
+			return keys[i].topic < keys[j].topic
+		}
+		if keys[i].group != keys[j].group {
+			return keys[i].group < keys[j].group
+		}
+		return keys[i].reason < keys[j].reason
+	})
+	values := make([]uint64, len(keys))
+	for i, key := range keys {
+		values[i] = next[key]
+	}
+	c.observationMu.Unlock()
+
+	for i, key := range keys {
+		ch <- counter(c.groupObservationFailures, float64(values[i]), key.topic, key.group, key.reason)
+	}
+}
+
+func topicObserved(topicName string, partitions map[string]topic.PartitionRuntimeSnapshot) bool {
+	if topicName == "" || strings.ContainsAny(topicName, "*?") {
+		return true
+	}
+	prefix := topicName + "\x00"
+	for key := range partitions {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func timestampSeconds(value time.Time) float64 {
+	if value.IsZero() {
+		return 0
+	}
+	return float64(value.Unix())
 }
 
 func (c *Collector) collectStorage(ch chan<- prometheus.Metric) {

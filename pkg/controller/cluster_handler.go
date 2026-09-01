@@ -144,14 +144,25 @@ const coordinatorUnavailableResponse = "ERROR: coordinator_not_available"
 // Discovery failures return false so multiple brokers cannot expire the same
 // group while the coordinator ring is unavailable.
 func (ch *CommandHandler) IsGroupCoordinator(groupName string) bool {
+	owned, err := ch.ResolveGroupCoordinator(groupName)
+	return err == nil && owned
+}
+
+// ResolveGroupCoordinator reports whether this broker is the current group
+// coordinator. Exporter observation uses the error to fail closed instead of
+// presenting a non-authoritative local snapshot.
+func (ch *CommandHandler) ResolveGroupCoordinator(groupName string) (bool, error) {
 	if !ch.isDistributed() {
-		return true
+		return true, nil
 	}
 	if !ch.hasRouter() {
-		return false
+		return false, fmt.Errorf("coordinator router unavailable")
 	}
 	id, _, err := ch.Cluster.Router.FindCoordinator(groupName)
-	return err == nil && id == ch.Cluster.Router.BrokerID()
+	if err != nil {
+		return false, err
+	}
+	return id == ch.Cluster.Router.BrokerID(), nil
 }
 
 // ExpireGroupMembers serializes timeout-driven membership removal through the
