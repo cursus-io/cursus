@@ -103,6 +103,11 @@ func wireRequest(t *testing.T, client *wire.Connection, command wire.Command, pa
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), response.RequestID)
 	require.Equal(t, command, response.Command)
+	if response.Status == wire.StatusError {
+		payload, err := wire.DecodeError(response.Payload)
+		require.NoError(t, err)
+		return "ERROR: " + payload.Code
+	}
 	return string(response.Payload)
 }
 

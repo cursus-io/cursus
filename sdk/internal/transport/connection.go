@@ -4,6 +4,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -91,6 +94,16 @@ func (c *Conn) Receive() ([]byte, error) {
 			activeID, activeCommand, frame.RequestID, frame.Command,
 		)
 	}
+	if frame.Status == wire.StatusError {
+		payload, err := wire.DecodeError(frame.Payload)
+		if err != nil {
+			return nil, fmt.Errorf("decode Wire v2 broker error: %w", err)
+		}
+		return []byte(renderBrokerError(payload)), nil
+	}
+	if frame.Status != wire.StatusOK && frame.Status != wire.StatusStreamEnd {
+		return nil, fmt.Errorf("unexpected Wire v2 response status %d", frame.Status)
+	}
 	return frame.Payload, nil
 }
 
@@ -136,4 +149,31 @@ func responseSuppressed(payload []byte) bool {
 		return false
 	}
 	return request.Fields["acks"] == "0" || request.Fields["acks"] == "none"
+}
+
+func renderBrokerError(payload wire.ErrorPayload) string {
+	parts := []string{
+		"ERROR:", payload.Code,
+		"class=" + payload.Class.String(),
+		"retryable=" + strconv.FormatBool(payload.Retryable),
+	}
+	if payload.Message != "" {
+		parts = append(parts, "message="+quoteErrorField(payload.Message))
+	}
+	keys := make([]string, 0, len(payload.Fields))
+	for key := range payload.Fields {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		parts = append(parts, key+"="+quoteErrorField(payload.Fields[key]))
+	}
+	return strings.Join(parts, " ")
+}
+
+func quoteErrorField(value string) string {
+	if strings.ContainsAny(value, " \t\r\n\"") {
+		return strconv.Quote(value)
+	}
+	return value
 }

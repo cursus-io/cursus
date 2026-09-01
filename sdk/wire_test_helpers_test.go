@@ -55,6 +55,28 @@ func writeWireTestResponse(connection *wire.Connection, request wire.Frame, resp
 	status := wire.StatusOK
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(response)), "ERROR:") {
 		status = wire.StatusError
+		brokerError, ok := ParseBrokerError(response)
+		if !ok {
+			return fmt.Errorf("invalid test broker error %q", response)
+		}
+		class, err := wire.ParseErrorClass(string(brokerError.Class))
+		if err != nil {
+			return err
+		}
+		fields := make(map[string]string, len(brokerError.Fields))
+		for key, value := range brokerError.Fields {
+			if key != "class" && key != "retryable" {
+				fields[key] = value
+			}
+		}
+		encoded, err := wire.EncodeError(wire.ErrorPayload{
+			Code: brokerError.Code, Class: class, Retryable: brokerError.Retryable,
+			Message: strings.Join(brokerError.Details, " "), Fields: fields,
+		})
+		if err != nil {
+			return err
+		}
+		response = string(encoded)
 	}
 	return connection.WriteFrame(wire.Frame{
 		Kind: wire.KindResponse, Command: request.Command, Status: status, RequestID: request.RequestID, Payload: []byte(response),

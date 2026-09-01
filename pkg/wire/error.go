@@ -3,6 +3,7 @@ package wire
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 type ErrorClass uint8
@@ -17,6 +18,52 @@ const (
 	ErrorClassNotFound
 	ErrorClassInternal
 )
+
+func ParseErrorClass(value string) (ErrorClass, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "validation":
+		return ErrorClassValidation, nil
+	case "authorization":
+		return ErrorClassAuthorization, nil
+	case "routing":
+		return ErrorClassRouting, nil
+	case "availability":
+		return ErrorClassAvailability, nil
+	case "conflict":
+		return ErrorClassConflict, nil
+	case "fencing":
+		return ErrorClassFencing, nil
+	case "not_found":
+		return ErrorClassNotFound, nil
+	case "internal":
+		return ErrorClassInternal, nil
+	default:
+		return 0, fmt.Errorf("unknown Wire v2 error class %q", value)
+	}
+}
+
+func (c ErrorClass) String() string {
+	switch c {
+	case ErrorClassValidation:
+		return "validation"
+	case ErrorClassAuthorization:
+		return "authorization"
+	case ErrorClassRouting:
+		return "routing"
+	case ErrorClassAvailability:
+		return "availability"
+	case ErrorClassConflict:
+		return "conflict"
+	case ErrorClassFencing:
+		return "fencing"
+	case ErrorClassNotFound:
+		return "not_found"
+	case ErrorClassInternal:
+		return "internal"
+	default:
+		return fmt.Sprintf("unknown(%d)", c)
+	}
+}
 
 type ErrorPayload struct {
 	Code      string

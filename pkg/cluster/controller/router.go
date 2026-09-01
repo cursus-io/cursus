@@ -395,5 +395,24 @@ func (r *ClusterRouter) sendDataRequest(addr string, data []byte) (string, error
 	if response.RequestID != requestID || response.Command != command {
 		return "", fmt.Errorf("internal Wire v2 response correlation mismatch")
 	}
+	if response.Status == wire.StatusError {
+		payload, err := wire.DecodeError(response.Payload)
+		if err != nil {
+			return "", fmt.Errorf("decode internal Wire v2 error: %w", err)
+		}
+		parts := []string{
+			"ERROR:", payload.Code, "class=" + payload.Class.String(),
+			"retryable=" + strconv.FormatBool(payload.Retryable),
+		}
+		keys := make([]string, 0, len(payload.Fields))
+		for key := range payload.Fields {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			parts = append(parts, key+"="+strconv.Quote(payload.Fields[key]))
+		}
+		return strings.Join(parts, " "), nil
+	}
 	return string(response.Payload), nil
 }

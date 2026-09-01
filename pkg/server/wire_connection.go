@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/wire"
 )
 
@@ -76,6 +77,27 @@ func (c *serverWireConn) writeMessage(payload []byte) error {
 	status := wire.StatusOK
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(string(payload))), "ERROR:") {
 		status = wire.StatusError
+		parsed, ok := wireprotocol.ParseErrorResponse(string(payload))
+		if !ok {
+			return fmt.Errorf("invalid broker error response")
+		}
+		class, err := wire.ParseErrorClass(string(parsed.Class))
+		if err != nil {
+			return err
+		}
+		fields := make(map[string]string, len(parsed.Fields))
+		for key, value := range parsed.Fields {
+			if key != "class" && key != "retryable" {
+				fields[key] = value
+			}
+		}
+		payload, err = wire.EncodeError(wire.ErrorPayload{
+			Code: parsed.Code, Class: class, Retryable: parsed.Retryable,
+			Message: strings.Join(parsed.Details, " "), Fields: fields,
+		})
+		if err != nil {
+			return err
+		}
 	}
 	kind := wire.KindResponse
 	if c.request.Command == wire.CommandStream {
