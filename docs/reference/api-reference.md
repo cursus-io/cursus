@@ -66,7 +66,7 @@ Creates a topic or patches an existing definition. Defaults apply only when the 
 Success:
 
 ```text
-OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool>
+OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> lifecycle_epoch=<N>
 ```
 
 The pre-revision response fields keep their original order. New fields are appended so legacy key/value and positional readers can continue consuming the established prefix.
@@ -113,7 +113,35 @@ ERROR: internal_topic_delete_forbidden topic=<name>
 ERROR: delete_topic_failed reason="..."
 ```
 
-There is no `TRUNCATE`/`PURGE` command. Do not emulate one with `DELETE` plus `CREATE`: that changes topic identity and cannot atomically fence records, offsets, producer/transaction state, event-sourcing metadata, and cluster snapshots. Desired-state controllers should not infer deletion from an omitted list item; require an explicit absent/tombstone state and a separate approval boundary.
+### TRUNCATE
+
+```text
+TRUNCATE topic=<name> expected_revision=<N>
+```
+
+Resets the topic's data while retaining its definition and identity. This command is admin-only and requires the last observed non-zero definition revision. A mismatch fails with `topic_revision_conflict`; there is no unguarded form.
+
+Success:
+
+```text
+OK topic=<name> truncated=true revision=<N> lifecycle_epoch=<N> leo=0 hwm=0
+OK topic=<name> truncated=true revision=<N> lifecycle_epoch=<N> leo=0 hwm=0 cleanup_pending=true
+```
+
+Success advances both definition revision and lifecycle epoch, empties all partitions, removes inactive groups and offsets, clears producer sequence and terminal transaction references, and resets event-sourcing state. Active group members and open/committing transactions block the operation. `cleanup_pending=true` means the new logical lifecycle is committed but the topic remains fenced on a broker until local cleanup converges.
+
+Common errors:
+
+```text
+ERROR: missing_expected_revision command=TRUNCATE
+ERROR: invalid_expected_revision value="..."
+ERROR: topic_revision_conflict topic=<name> expected=<N> reason="..."
+ERROR: topic_truncate_blocked topic=<name> reason="..."
+ERROR: internal_topic_truncate_forbidden topic=<name>
+ERROR: truncate_topic_failed topic=<name> reason="..."
+```
+
+Do not emulate truncation with `DELETE` plus `CREATE`: deletion changes topic identity and does not provide lifecycle-epoch fencing.
 
 ### LIST
 
@@ -473,7 +501,7 @@ METADATA topic=<name>
 Success is a text response:
 
 ```text
-OK topic=<name> partitions=<N> leaders=<csv> epochs=<csv> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>
+OK topic=<name> partitions=<N> leaders=<csv> epochs=<csv> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> lifecycle_epoch=<N>
 ```
 
 Common errors:

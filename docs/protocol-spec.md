@@ -166,6 +166,7 @@ Version 1 features currently advertised by the broker are:
 | `idempotent_producer_v1` | Supports producer ID, epoch, and sequence fencing |
 | `event_sourcing_v1` | Supports event stream and snapshot commands |
 | `topic_compaction_v1` | Supports per-topic cleanup policy declaration and standalone keyed closed-segment compaction |
+| `topic_truncate_v1` | Supports revision-guarded topic reset with lifecycle-epoch fencing |
 
 Feature names describe independent contracts; clients must not infer support for an unadvertised feature from the protocol version alone.
 
@@ -192,13 +193,13 @@ CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [event_sourcing=<
 | write_acl | No | - | Comma-separated principals allowed to write when `auth_policy=acl`; `*` allows any authenticated principal |
 | replication_factor | No | 3 | Replica count (distributed mode) |
 
-Response: `OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool>`. The original field order remains intact and the revisioned-definition fields are appended for positional legacy parsers.
+Response: `OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> lifecycle_epoch=<N>`. The original field order remains intact and new definition fields are appended for positional legacy parsers.
 
 Topic names are a portable on-disk identifier: 1-249 ASCII bytes containing only letters, digits, `.`, `_`, `-`, or `=`; `.` and `..` are reserved. Invalid names return `ERROR: invalid_topic_name ...`.
 
 A missing topic is built from broker defaults and the supplied fields. For an existing topic, `CREATE` is a presence-aware patch: omitted fields retain their authoritative value, while explicit `0`, `false`, and empty `read_acl=`/`write_acl=` values are applied. Partition count can only increase. `replication_factor`, `idempotent`, and `event_sourcing` may be restated with the current value but cannot be changed. A no-op keeps the current `revision`; every effective definition change increments it.
 
-A successful standalone `CREATE` means the revisioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. Broker restart restores revision, replication factor, partition count, idempotent/event-sourcing mode, partitioner, retention, cleanup policy, auth policy, and ACLs from manifest version 2. Version 1 manifests load with `revision=1` and `replication_factor=3`, then upgrade on the next metadata write. Distributed mode merges the patch inside serialized FSM apply and includes the complete definition in snapshot version 7. Version 6 snapshots receive revision 1 and infer replication factor from consistent partition replica metadata, falling back to 3 only when legacy metadata has no replica set. Version 7 and manifest version 2 fail closed if their required fields are absent.
+A successful standalone `CREATE` means the revisioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. First-generation topics continue to write manifest version 2 during a rolling upgrade; the additive `lifecycle_epoch=1` field is ignored by older readers. Version 1 manifests load with `revision=1`, `replication_factor=3`, and lifecycle epoch 1. The first successful truncate advances the manifest to version 3, which requires the epoch field and is intentionally rejected by older binaries. Distributed mode follows the same boundary: snapshot version 7 remains in use while every topic is at epoch 1, and the first retained epoch greater than 1 requires snapshot version 8. Version 7 snapshots without the additive field receive `lifecycle_epoch=1`; version 6 also receives revision 1 and infers replication factor from consistent partition replica metadata, falling back to 3 only when legacy metadata has no replica set.
 
 `compact` and `delete,compact` are accepted only by standalone, non-event-sourcing topics. Unsupported combinations return `ERROR: invalid_topic_policy ...` or `ERROR: unsupported_topic_policy ...`. Repeating `CREATE` for an existing event-sourcing topic cannot use a false `event_sourcing` argument to bypass this validation. Repeating `CREATE` also preserves existing partition leader epochs and committed HWMs; only newly added partitions receive new assignments.
 
@@ -218,7 +219,24 @@ Deletion fails closed with `ERROR: topic_delete_blocked ...` while a consumer gr
 
 Standalone deletion first preflights active group and transaction references, then commits removal from the durable manifest before mutating their durable metadata. A manifest or pre-commit event-state failure returns `ERROR: delete_topic_failed ...` and leaves the topic, group offsets, and transaction references live. After the manifest commit, storage or dependency cleanup failure returns success with `cleanup_pending=true` because the topic is no longer authoritative; `if_exists=true` retries dependency cleanup. Stale group/transaction references and the orphan-storage guard reject same-name recreation until cleanup succeeds or an operator remediates the old storage. Distributed deletion is routed to the current leader and serialized in Raft; topic, partition, group, transaction, and producer state remain absent after replay and snapshot restore. Node-local cleanup failures remain visible to the topic materialization reconciler and metrics.
 
-`DELETE` followed by `CREATE` is not a truncate/reset operation and must not be generated implicitly by applications or reconcilers. Cursus does not currently expose `TRUNCATE` or `PURGE`: safely retaining a definition while atomically resetting partition records, log start/end/HWM, group lifecycle epochs, producer/transaction fences, event-sourcing state, standalone metadata, and distributed FSM snapshots requires a guarded first-class protocol. A future operation must require an expected topic revision (or equivalent optimistic guard) and fail closed or fence active producers and consumers. Until that contract exists, GitOps controllers should retain desired topics by default and require an explicit `state=absent` tombstone plus a separate approval boundary before issuing `DELETE`.
+`DELETE` followed by `CREATE` is not a truncate/reset operation and must not be generated implicitly by applications or reconcilers. Use the guarded `TRUNCATE` operation below when the topic definition and identity must be retained.
+
+**TRUNCATE**
+```
+TRUNCATE topic=<name> expected_revision=<N>
+```
+
+`TRUNCATE` is admin-only. `expected_revision` is required and must match the authoritative definition revision. Success increments both `revision` and `lifecycle_epoch`, retains the topic definition, and resets every partition to `LEO=0` and `HWM=0`:
+
+```
+OK topic=<name> truncated=true revision=<N> lifecycle_epoch=<N> leo=0 hwm=0 [cleanup_pending=true]
+```
+
+The operation fails closed while a consumer group has active members or an open/committing transaction references the topic. On success it deletes inactive groups and offsets, producer sequence state, terminal transaction references, event-sourcing indexes/snapshots, records, and committed watermarks. The broker-owned `__consumer_offsets` topic cannot be truncated.
+
+Standalone mode durably commits the new definition epoch before replacing storage. Until the matching local epoch marker is synced, all access to the topic is fenced and startup resumes cleanup instead of serving the old generation. Distributed mode commits one `TOPIC_TRUNCATE` Raft transition, advances partition leader epochs, and fences message replication, partition commits, and event snapshots whose lifecycle epoch is missing or stale. A node-local cleanup failure returns `cleanup_pending=true` and remains unavailable on that node until materialization converges.
+
+Every active broker must advertise lifecycle protocol version 1 before a distributed truncate is accepted, so rolling upgrades cannot commit a lifecycle transition through an older FSM. Public clients can discover the additive command through `topic_truncate_v1`. Older clients continue to use the unchanged protocol version and established response-field prefix; missing lifecycle fields from an older server are interpreted as epoch 1 by the Go SDK. Downgrading a broker after it has written manifest version 3 or snapshot version 8 is not supported.
 
 **LIST**
 ```
@@ -334,7 +352,7 @@ METADATA topic=<name>
 |-------|----------|-------------|
 | topic | Yes | Topic name |
 
-Response: `OK topic=<name> partitions=<N> leaders=<host:port>,<host:port>,... epochs=<csv> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N>`
+Response: `OK topic=<name> partitions=<N> leaders=<host:port>,<host:port>,... epochs=<csv> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> lifecycle_epoch=<N>`
 
 Returns partition leaders/epochs and the authoritative durable topic policy restored from the standalone manifest or cluster FSM. Leader addresses are in partition order (P0, P1, P2, ...).
 
@@ -544,7 +562,7 @@ missing, an entry is malformed, or the same partition appears more than once.
 
 Cursus exposes a broker-managed transaction coordinator for consume-process-produce workflows. In distributed mode, transaction commands are routed by `transactional_id` using the coordinator key `txn:<transactional_id>`. Clients can discover the owner with `FIND_COORDINATOR transactional_id=<id>` and must retry on `ERROR: NOT_COORDINATOR host=<host> port=<port>`.
 
-Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Transaction state entered the schema in version 4, committed partition watermarks in version 5, durable topic definitions in version 6, and revisioned definitions in the current version 7.
+Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Transaction state entered the schema in version 4, committed partition watermarks in version 5, durable topic definitions in version 6, revisioned definitions in version 7, and post-truncate lifecycle epochs in version 8.
 
 Clients should first call `INIT_PRODUCER_ID` for a `transactional_id`; the broker returns the authoritative `(producerId, epoch)` session and bumps `epoch` on re-initialization to fence older producers. The coordinator fences stale producers by `(transactional_id, producerId, epoch)`: lower epochs are rejected, and staged operations must use the same producer and epoch that opened the transaction. After `transactional_id_expiration_ms`, completed transactions discard staged message/offset payloads but retain a compact epoch tombstone. The tombstone participates in standalone journal and distributed metadata snapshots, preventing an older producer session from being revived. Active `open` and `committing` transactions are not expired by the cleanup path.
 

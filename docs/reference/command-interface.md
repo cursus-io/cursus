@@ -7,7 +7,7 @@ Cursus clients use 4-byte big-endian length-prefixed frames over TCP. Most reque
 | Area | Commands | Route |
 |---|---|---|
 | Protocol and auth | `PROTOCOL_INFO`, `NEGOTIATE`, `AUTH` | Any broker |
-| Topic admin | `CREATE`, `DELETE`, `LIST`, `DESCRIBE`, `HELP` | Any broker; distributed mutations use metadata consensus |
+| Topic admin | `CREATE`, `DELETE`, `TRUNCATE`, `LIST`, `DESCRIBE`, `HELP` | Any broker; distributed mutations use metadata consensus |
 | Produce and read | `PUBLISH`, `CONSUME`, `STREAM`, `LIST_OFFSETS` | Partition leader |
 | Consumer groups | `REGISTER_GROUP`, `FIND_COORDINATOR`, `JOIN_GROUP`, `SYNC_GROUP`, `HEARTBEAT`, `LEAVE_GROUP`, `GROUP_STATUS`, `FETCH_OFFSET`, `COMMIT_OFFSET`, `BATCH_COMMIT` | Group coordinator except discovery |
 | Transactions | `INIT_PRODUCER_ID`, `BEGIN_TXN`, `TXN_PUBLISH`, `SEND_OFFSETS_TO_TXN`, `END_TXN`, `TXN_STATUS` | Transaction coordinator selected by `transactional_id` |
@@ -28,6 +28,7 @@ Cursus clients use 4-byte big-endian length-prefixed frames over TCP. Most reque
 CREATE topic=orders partitions=12
 CREATE topic=orders retention_hours=168
 DELETE topic=retired-orders if_exists=true
+TRUNCATE topic=test-orders expected_revision=7
 PUBLISH topic=orders key=customer-42 message={"orderId":"o-1"}
 FIND_COORDINATOR group=order-workers
 JOIN_GROUP topic=orders group=order-workers member=worker-1
@@ -38,6 +39,6 @@ COMMIT_OFFSET topic=orders group=order-workers partition=0 offset=<lastProcessed
 
 The second `CREATE` is a patch: omitted fields retain their current values. Explicit `retention_hours=0`, `idempotent=false`, or `read_acl=` are distinct from omission. Immutable mode or replication changes are rejected, while effective mutable changes advance the definition revision returned by `CREATE`, `METADATA`, and `DESCRIBE`.
 
-`DELETE` is admin-only and `if_exists=true` is an explicit idempotency choice for approved retries. Do not derive it from a topic missing from desired state and do not use delete-and-create as a data-reset substitute; there is no `TRUNCATE`/`PURGE` contract.
+`DELETE` is admin-only and `if_exists=true` is an explicit idempotency choice for approved retries. Do not derive it from a topic missing from desired state or use delete-and-create as a reset substitute. `TRUNCATE` is also admin-only; it requires the current definition revision and returns a new revision and lifecycle epoch. Active groups or transactions block it, and old-epoch writes are fenced after it commits.
 
 `COMMIT_OFFSET` values are next offsets, not last processed offsets. Stored offsets are monotonic and authoritative for resume. Refer to the [API reference](api-reference.md) for complete parameters and responses; internal replication commands are intentionally excluded from the client interface.
