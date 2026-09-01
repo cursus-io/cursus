@@ -54,11 +54,13 @@ func TestConsumerLifecycleMetricsAcrossThreeBrokerCluster(t *testing.T) {
 	oldOwner := rejoined.owner
 	require.Contains(t, []int{1, 2, 3}, oldOwner)
 
-	deregisterLifecycleCoordinator(t, oldOwner)
-	moved := waitForLifecycleAggregate(t, []int{1, 2, 3}, ctx.GetTopic(), groupName, 1, "stable", clusterFailureWait)
+	stopComposeBroker(t, oldOwner)
+	survivors := survivorNodes(oldOwner)
+	deregisterLifecycleCoordinator(t, survivors, oldOwner)
+	moved := waitForLifecycleAggregate(t, survivors, ctx.GetTopic(), groupName, 1, "stable", clusterFailureWait)
 	require.NotEqual(t, oldOwner, moved.owner)
 
-	resume := e2e.NewBrokerClient(clusterBrokerAddrs(3))
+	resume := e2e.NewBrokerClient(lifecycleBrokerAddrs(survivors))
 	t.Cleanup(resume.Close)
 	response, err := resume.SendCommand("", fmt.Sprintf(
 		"JOIN_GROUP topic=%s group=%s member=%s generation=%d",
@@ -66,8 +68,8 @@ func TestConsumerLifecycleMetricsAcrossThreeBrokerCluster(t *testing.T) {
 	), 5*time.Second)
 	require.NoError(t, err)
 	require.Contains(t, response, "resumed=true")
-	waitForLifecycleAggregate(t, []int{1, 2, 3}, ctx.GetTopic(), groupName, 1, "stable", clusterFailureWait)
-	assertBrokerReadiness(t, []int{1, 2, 3})
+	waitForLifecycleAggregate(t, survivors, ctx.GetTopic(), groupName, 1, "stable", clusterFailureWait)
+	assertBrokerReadiness(t, survivors)
 }
 
 type lifecycleAggregate struct {
@@ -221,22 +223,33 @@ func assertBrokerReadiness(t *testing.T, nodes []int) {
 	}
 }
 
-func deregisterLifecycleCoordinator(t *testing.T, node int) {
+func lifecycleBrokerAddrs(nodes []int) []string {
+	addrs := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		addrs = append(addrs, fmt.Sprintf("127.0.0.1:%d", brokerPort(node)))
+	}
+	return addrs
+}
+
+func deregisterLifecycleCoordinator(t *testing.T, brokers []int, node int) {
 	t.Helper()
 	payload := fmt.Sprintf(`{"id":"broker-%d-9000"}`, node)
 	command := fmt.Sprintf(
 		"RAFT_APPLY internal_token=cursus-test-internal-token type=DEREGISTER payload=%s",
 		payload,
 	)
-	var failures []string
-	for broker := 1; broker <= 3; broker++ {
-		client := e2e.NewBrokerClient([]string{fmt.Sprintf("127.0.0.1:%d", 19000+broker)})
-		response, err := client.SendCommand("", command, 5*time.Second)
-		client.Close()
-		if err == nil && strings.HasPrefix(response, "OK") {
-			return
+	err := eventually(t, fmt.Sprintf("deregister coordinator broker-%d", node), clusterFailureWait, func() (bool, string, error) {
+		var failures []string
+		for _, broker := range brokers {
+			client := e2e.NewBrokerClient([]string{fmt.Sprintf("127.0.0.1:%d", 19000+broker)})
+			response, sendErr := client.SendCommand("", command, 5*time.Second)
+			client.Close()
+			if sendErr == nil && strings.HasPrefix(response, "OK") {
+				return true, fmt.Sprintf("broker-%d accepted deregistration", broker), nil
+			}
+			failures = append(failures, fmt.Sprintf("broker-%d response=%q err=%v", broker, response, sendErr))
 		}
-		failures = append(failures, fmt.Sprintf("broker-%d response=%q err=%v", broker, response, err))
-	}
-	t.Fatalf("failed to deregister coordinator broker-%d: %s", node, strings.Join(failures, "; "))
+		return false, strings.Join(failures, "; "), nil
+	})
+	require.NoError(t, err)
 }
