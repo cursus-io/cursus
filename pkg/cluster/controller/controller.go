@@ -13,6 +13,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/metrics"
+	topicpkg "github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
@@ -240,6 +241,17 @@ func (cc *ClusterController) ReplicateToFollowers(topic string, partition int, m
 	}
 	if meta.Leader != cc.brokerID {
 		return fmt.Errorf("partition leader fenced: current=%s local=%s epoch=%d", meta.Leader, cc.brokerID, meta.LeaderEpoch)
+	}
+	metadataLifecycleEpoch := meta.LifecycleEpoch
+	if metadataLifecycleEpoch == 0 {
+		metadataLifecycleEpoch = topicpkg.InitialLifecycleEpoch
+	}
+	if msgCmd.LifecycleEpoch == 0 {
+		if metadataLifecycleEpoch > topicpkg.InitialLifecycleEpoch {
+			return fmt.Errorf("missing topic lifecycle epoch for %s", partitionKey)
+		}
+	} else if msgCmd.LifecycleEpoch != metadataLifecycleEpoch {
+		return fmt.Errorf("stale topic lifecycle epoch for %s: current=%d requested=%d", partitionKey, metadataLifecycleEpoch, msgCmd.LifecycleEpoch)
 	}
 	if len(meta.ISR) < minISR {
 		return fmt.Errorf("insufficient in-sync replicas: got %d, want minISR %d", len(meta.ISR), minISR)

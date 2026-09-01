@@ -1,6 +1,7 @@
 package topic
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -53,6 +54,8 @@ func TestStandaloneTopicMetadataRestoresDefinitionAndData(t *testing.T) {
 	require.Equal(t, []string{"writer"}, restored.Policy.WriteACL)
 	require.Equal(t, 12, restored.Policy.RetentionHours)
 	require.Equal(t, int64(4096), restored.Policy.RetentionBytes)
+	require.Equal(t, DefaultReplicationFactor, restored.ReplicationFactor)
+	require.Equal(t, uint64(1), restored.Revision)
 	require.True(t, restarted.GetTopic("events").IsEventSourcing)
 	require.Equal(t, config.CleanupPolicyDelete, restarted.GetTopic("events").Policy.CleanupPolicy)
 
@@ -93,6 +96,55 @@ func TestStandaloneTopicMetadataPersistsGrowthAndDeletion(t *testing.T) {
 	require.Nil(t, restarted.GetTopic("deleted"))
 	require.Equal(t, 3, len(restarted.GetTopic("sessions").Partitions))
 	require.Equal(t, 24, restarted.GetTopic("sessions").Policy.RetentionHours)
+	require.Equal(t, uint64(2), restarted.GetTopic("sessions").Revision)
+}
+
+func TestStandaloneTopicMetadataMigratesVersionOneDefinitionDefaults(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.RetentionCheckIntervalMS = 60_000
+	cfg.CompactionCheckIntervalMS = 60_000
+
+	dm := disk.NewDiskManager(cfg)
+	manager := NewTopicManager(cfg, dm, nil)
+	require.NoError(t, manager.CreateTopic("legacy", 1, false, false))
+	closeTopicManager(manager)
+	dm.CloseAllHandlers()
+
+	manifestPath := filepath.Join(cfg.LogDir, TopicMetadataFileName)
+	raw, err := os.ReadFile(manifestPath)
+	require.NoError(t, err)
+	var legacy map[string]any
+	require.NoError(t, json.Unmarshal(raw, &legacy))
+	legacy["version"] = float64(1)
+	topics := legacy["topics"].([]any)
+	definition := topics[0].(map[string]any)
+	delete(definition, "revision")
+	delete(definition, "replication_factor")
+	raw, err = json.Marshal(legacy)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(manifestPath, raw, 0o600))
+
+	restartedDM := disk.NewDiskManager(cfg)
+	defer restartedDM.CloseAllHandlers()
+	restarted := NewTopicManager(cfg, restartedDM, nil)
+	require.NoError(t, restarted.RestoreTopics())
+	defer closeTopicManager(restarted)
+	restored := restarted.GetTopic("legacy")
+	require.NotNil(t, restored)
+	require.Equal(t, DefaultReplicationFactor, restored.ReplicationFactor)
+	require.Equal(t, uint64(InitialDefinitionRevision), restored.Revision)
+
+	policy := restored.Policy
+	policy.RetentionHours = 24
+	require.NoError(t, restarted.CreateTopicWithPolicy("legacy", 1, false, false, policy))
+	raw, err = os.ReadFile(manifestPath)
+	require.NoError(t, err)
+	var migrated topicMetadataManifest
+	require.NoError(t, json.Unmarshal(raw, &migrated))
+	require.Equal(t, 2, migrated.Version, "first-generation metadata remains readable by the previous release")
+	require.Equal(t, uint64(2), migrated.Topics[0].Revision)
+	require.Equal(t, DefaultReplicationFactor, migrated.Topics[0].ReplicationFactor)
 }
 
 func TestStandaloneTopicMetadataCorruptionFailsClosed(t *testing.T) {
@@ -110,6 +162,28 @@ func TestStandaloneTopicMetadataCorruptionFailsClosed(t *testing.T) {
 	err := manager.RestoreTopics()
 	require.ErrorContains(t, err, "unknown field")
 	require.Empty(t, manager.ListTopics())
+}
+
+func TestStandaloneTopicMetadataVersionTwoRequiresRevisionAndReplicationFactor(t *testing.T) {
+	for _, missing := range []string{"revision", "replication_factor"} {
+		t.Run(missing, func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			cfg.LogDir = t.TempDir()
+			definition := map[string]any{
+				"name": "orders", "revision": 1, "partitions": 1, "replication_factor": 3,
+				"idempotent": false, "event_sourcing": false, "policy": DefaultPolicy(),
+			}
+			delete(definition, missing)
+			manifest, err := json.Marshal(map[string]any{"version": 2, "topics": []any{definition}})
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(cfg.LogDir, TopicMetadataFileName), manifest, 0o600))
+
+			dm := disk.NewDiskManager(cfg)
+			defer dm.CloseAllHandlers()
+			err = NewTopicManager(cfg, dm, nil).RestoreTopics()
+			require.ErrorContains(t, err, missing+" must be present")
+		})
+	}
 }
 
 func TestTopicMetadataFailureDoesNotExposePolicyOrPartitionUpdate(t *testing.T) {

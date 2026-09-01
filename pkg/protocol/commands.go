@@ -8,6 +8,7 @@ var textCommands = map[string]struct{}{
 	"AUTH":                {},
 	"CREATE":              {},
 	"DELETE":              {},
+	"TRUNCATE":            {},
 	"LIST":                {},
 	"LIST_CLUSTER":        {},
 	"CLUSTER_STATUS":      {},

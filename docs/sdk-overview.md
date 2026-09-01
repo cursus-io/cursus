@@ -137,7 +137,7 @@ if errors.As(err, &brokerErr) {
 
 ## Go Topic Policy
 
-`CreateTopic` remains the compatibility API and inherits broker policy defaults. Use `CreateTopicWithOptions` for an explicit cleanup contract:
+`Producer.CreateTopic` remains the compatibility API. Disabled idempotence and unspecified policy values are omitted so repeated provisioning does not clear an existing definition. Use `CreateTopicWithOptions` for an explicit non-zero producer provisioning contract:
 
 ```go
 err := producer.CreateTopicWithOptions("player-state", sdk.TopicOptions{
@@ -148,7 +148,35 @@ err := producer.CreateTopicWithOptions("player-state", sdk.TopicOptions{
 })
 ```
 
-The SDK canonicalizes `compact,delete` to `delete,compact` and validates the portable topic-name contract and rejects unsafe command values, negative retention, or unknown policy enums before opening a broker connection. Compact policies require a standalone, non-event-sourcing topic. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
+For administrative create/update flows, use `AdminClient`. `TopicDefinitionPatch` uses pointers so callers can intentionally send zero, false, or an empty ACL while leaving nil fields unchanged:
+
+```go
+cfg := sdk.NewDefaultAdminConfig()
+cfg.BrokerAddrs = []string{"broker-1:9000", "broker-2:9000", "broker-3:9000"}
+admin, err := sdk.NewAdminClient(cfg)
+if err != nil {
+    return err
+}
+
+retentionHours := 0
+emptyReaders := []string{}
+definition, err := admin.UpdateTopic("player-state", sdk.TopicDefinitionPatch{
+    RetentionHours: &retentionHours,
+    ReadACL:        &emptyReaders,
+})
+
+deleted, err := admin.DeleteTopic("retired-player-state", sdk.DeleteTopicOptions{
+    IfExists: true,
+})
+
+truncated, err := admin.TruncateTopic("test-player-state", sdk.TruncateTopicOptions{
+    ExpectedRevision: definition.Revision,
+})
+```
+
+`AdminClient` validates values locally, returns the broker's complete `TopicDefinition` for create/update, a `DeleteTopicResult` for delete, and a `TruncateTopicResult` for reset. Attempts are bounded by `MaxRetries + 1` and rotate across configured brokers for retryable routing/availability and pre-submission transport failures. The SDK canonicalizes `compact,delete` to `delete,compact`, enforces the portable topic-name contract, and rejects unsafe command values, zero expected revisions, negative retention, or unknown policy enums before opening a broker connection. Compact policies require a standalone, non-event-sourcing topic. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
+
+`DeleteTopic` and `TruncateTopic` exist only on the admin client; producer and consumer clients do not expose destructive lifecycle methods. `IfExists` makes an explicit deletion retry idempotent without changing legacy `topic_not_found` behavior. The admin client retries a dropped connection after command submission only for `IfExists=true`; legacy delete and truncate stop with an unknown-outcome error. A truncate replay cannot erase a second generation because `ExpectedRevision` is mandatory, but a committed first attempt would return a conflict rather than the original result, so the SDK does not hide that ambiguity. `CleanupPending` means the logical lifecycle committed while broker-local storage cleanup is still converging. Kubernetes reconcilers should call delete only for an explicit absent/tombstone resource that crossed a separate approval boundary, and should never emulate truncation with delete-and-create.
 
 ## Go Transactional Producer
 

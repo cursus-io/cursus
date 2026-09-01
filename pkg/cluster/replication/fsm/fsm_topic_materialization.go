@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	TopicMaterializationCreate  = "create"
-	TopicMaterializationRestore = "restore"
-	TopicMaterializationDelete  = "delete"
+	TopicMaterializationCreate   = "create"
+	TopicMaterializationRestore  = "restore"
+	TopicMaterializationDelete   = "delete"
+	TopicMaterializationTruncate = "truncate"
 )
 
 // TopicMaterializationIssue describes node-local work that has not converged
@@ -105,7 +106,7 @@ func (f *BrokerFSM) ReconcileTopicMaterializations() error {
 	deletes := make([]string, 0)
 	for name, issue := range f.topicMaterialization {
 		switch issue.Operation {
-		case TopicMaterializationCreate, TopicMaterializationRestore:
+		case TopicMaterializationCreate, TopicMaterializationRestore, TopicMaterializationTruncate:
 			desired[name] = copyTopicDefinition(f.topicState[name])
 		case TopicMaterializationDelete:
 			deletes = append(deletes, name)
@@ -128,6 +129,8 @@ func (f *BrokerFSM) ReconcileTopicMaterializations() error {
 		var err error
 		if operation == TopicMaterializationRestore {
 			err = f.materializeTopicRestore(desired[name])
+		} else if operation == TopicMaterializationTruncate {
+			err = f.materializeTopicTruncate(desired[name])
 		} else {
 			err = f.materializeTopicCreate(desired[name])
 		}
@@ -158,7 +161,18 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 		return nil
 	}
 
-	err := f.tm.CreateTopicWithPolicy(definition.Name, definition.Partitions, definition.Idempotent, definition.EventSourcing, definition.Policy)
+	var err error
+	if f.tm.IsTruncationPending(definition.Name) {
+		// A later Raft definition update may supersede a truncate whose local
+		// reset is still pending. Rebuild the empty generation at the latest
+		// authoritative definition before publishing its epoch marker.
+		err = f.tm.RestoreDefinitions([]topic.Definition{*definition})
+		if err == nil {
+			err = f.tm.CompleteTruncation(definition.Name)
+		}
+	} else {
+		err = f.tm.ApplyDefinition(*definition)
+	}
 	f.recordTopicMaterialization(definition.Name, TopicMaterializationCreate, err)
 	if err != nil {
 		return fmt.Errorf("materialize topic %q: %w", definition.Name, err)
@@ -186,9 +200,41 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 	}
 
 	err := f.tm.RestoreDefinitions([]topic.Definition{*definition})
+	if err == nil && f.tm.IsTruncationPending(definition.Name) {
+		err = f.tm.CompleteTruncation(definition.Name)
+	}
 	f.recordTopicMaterialization(definition.Name, TopicMaterializationRestore, err)
 	if err != nil {
 		return fmt.Errorf("restore local topic %q: %w", definition.Name, err)
+	}
+	return nil
+}
+
+func (f *BrokerFSM) materializeTopicTruncate(definition *topic.Definition) error {
+	if definition == nil {
+		return nil
+	}
+	if f.tm == nil {
+		f.recordTopicMaterialization(definition.Name, TopicMaterializationTruncate, nil)
+		return nil
+	}
+
+	f.materializationMu.Lock()
+	defer f.materializationMu.Unlock()
+	f.mu.RLock()
+	current := copyTopicDefinition(f.topicState[definition.Name])
+	f.mu.RUnlock()
+	if !reflect.DeepEqual(current, definition) {
+		return nil
+	}
+
+	_, err := f.tm.ApplyTruncateDefinition(*definition)
+	if err == nil {
+		err = f.tm.CompleteTruncation(definition.Name)
+	}
+	f.recordTopicMaterialization(definition.Name, TopicMaterializationTruncate, err)
+	if err != nil {
+		return fmt.Errorf("truncate local topic %q: %w", definition.Name, err)
 	}
 	return nil
 }

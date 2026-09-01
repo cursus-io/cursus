@@ -329,7 +329,10 @@ func buildCreateTopicCommand(topic string, options TopicOptions, idempotent bool
 		}
 	}
 
-	command := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, options.Partitions, idempotent)
+	command := fmt.Sprintf("CREATE topic=%s partitions=%d", topic, options.Partitions)
+	if idempotent {
+		command += " idempotent=true"
+	}
 	if cleanupPolicy != "" {
 		command += " cleanup_policy=" + cleanupPolicy
 	}

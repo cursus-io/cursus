@@ -529,6 +529,15 @@ func (ch *CommandHandler) preparePartitionLeader(topicName string, partitionID i
 	if !ch.Cluster.IsAuthorized(topicName, partitionID) {
 		return fail(fmt.Errorf("partition leader fenced: current=%s epoch=%d", metadata.Leader, metadata.LeaderEpoch))
 	}
+	metadataLifecycleEpoch := metadata.LifecycleEpoch
+	if metadataLifecycleEpoch == 0 {
+		metadataLifecycleEpoch = topic.InitialLifecycleEpoch
+	}
+	if pTopic := ch.TopicManager.GetTopic(topicName); pTopic == nil {
+		return fail(fmt.Errorf("topic lifecycle pending or topic not found"))
+	} else if pTopic.LifecycleEpoch != metadataLifecycleEpoch {
+		return fail(fmt.Errorf("stale topic lifecycle epoch: current=%d local=%d", metadataLifecycleEpoch, pTopic.LifecycleEpoch))
+	}
 	committedHWM := metadata.CommittedHWM
 	if localHWM := p.GetHWM(); localHWM > committedHWM {
 		committedHWM = localHWM
@@ -540,7 +549,7 @@ func (ch *CommandHandler) preparePartitionLeader(topicName string, partitionID i
 	return release, nil
 }
 
-func (ch *CommandHandler) commitPartitionHWM(topicName string, partitionID int, hwm uint64) error {
+func (ch *CommandHandler) commitPartitionHWM(topicName string, partitionID int, hwm uint64, lifecycleEpoch uint64) error {
 	if ch.Cluster == nil || ch.Cluster.RaftManager == nil {
 		return fmt.Errorf("cluster metadata unavailable")
 	}
@@ -552,12 +561,20 @@ func (ch *CommandHandler) commitPartitionHWM(topicName string, partitionID int, 
 	if metadata == nil {
 		return fmt.Errorf("partition metadata not found")
 	}
+	metadataLifecycleEpoch := metadata.LifecycleEpoch
+	if metadataLifecycleEpoch == 0 {
+		metadataLifecycleEpoch = topic.InitialLifecycleEpoch
+	}
+	if lifecycleEpoch != metadataLifecycleEpoch {
+		return fmt.Errorf("stale topic lifecycle epoch: current=%d requested=%d", metadataLifecycleEpoch, lifecycleEpoch)
+	}
 	_, err := ch.applyViaLeader("PARTITION_COMMIT", map[string]interface{}{
-		"topic":        topicName,
-		"partition":    partitionID,
-		"leader":       metadata.Leader,
-		"leader_epoch": metadata.LeaderEpoch,
-		"hwm":          hwm,
+		"topic":           topicName,
+		"partition":       partitionID,
+		"leader":          metadata.Leader,
+		"leader_epoch":    metadata.LeaderEpoch,
+		"hwm":             hwm,
+		"lifecycle_epoch": lifecycleEpoch,
 	})
 	return err
 }
@@ -581,6 +598,17 @@ func (ch *CommandHandler) validateReplicaLeader(cmd types.MessageCommand) string
 	}
 	if cmd.LeaderEpoch != metadata.LeaderEpoch {
 		return fmt.Sprintf("ERROR: STALE_LEADER_EPOCH current=%d requested=%d", metadata.LeaderEpoch, cmd.LeaderEpoch)
+	}
+	metadataLifecycleEpoch := metadata.LifecycleEpoch
+	if metadataLifecycleEpoch == 0 {
+		metadataLifecycleEpoch = topic.InitialLifecycleEpoch
+	}
+	if cmd.LifecycleEpoch == 0 {
+		if metadataLifecycleEpoch > topic.InitialLifecycleEpoch {
+			return "ERROR: missing_topic_lifecycle_epoch command=REPLICATE_MESSAGE"
+		}
+	} else if cmd.LifecycleEpoch != metadataLifecycleEpoch {
+		return fmt.Sprintf("ERROR: STALE_TOPIC_LIFECYCLE_EPOCH current=%d requested=%d", metadataLifecycleEpoch, cmd.LifecycleEpoch)
 	}
 	return ""
 }

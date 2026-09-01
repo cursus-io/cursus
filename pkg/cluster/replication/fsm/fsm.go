@@ -18,6 +18,8 @@ import (
 	"github.com/hashicorp/raft"
 )
 
+const TopicLifecycleProtocolVersion = 1
+
 type ReplicationEntry struct {
 	Topic     string
 	Partition int
@@ -26,11 +28,12 @@ type ReplicationEntry struct {
 }
 
 type BrokerInfo struct {
-	ID         string    `json:"id"`
-	Addr       string    `json:"addr"`
-	ClientAddr string    `json:"client_addr,omitempty"`
-	Status     string    `json:"status"`
-	LastSeen   time.Time `json:"last_seen"`
+	ID                string    `json:"id"`
+	Addr              string    `json:"addr"`
+	ClientAddr        string    `json:"client_addr,omitempty"`
+	Status            string    `json:"status"`
+	LastSeen          time.Time `json:"last_seen"`
+	LifecycleProtocol int       `json:"lifecycle_protocol,omitempty"`
 }
 
 type ProducerSequence struct {
@@ -70,6 +73,7 @@ type BrokerFSMState struct {
 type BrokerFSM struct {
 	notifiers         map[string]chan interface{}
 	mu                sync.RWMutex
+	transitionMu      sync.Mutex
 	materializationMu sync.Mutex
 
 	logs              map[uint64]*ReplicationEntry
@@ -124,6 +128,18 @@ func (f *BrokerFSM) GetAllPartitionKeys() []string {
 	return keys
 }
 
+// GetTopicDefinition returns a detached copy of the authoritative replicated
+// topic definition, including when node-local materialization is pending.
+func (f *BrokerFSM) GetTopicDefinition(name string) (topic.Definition, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	definition := f.topicState[name]
+	if definition == nil {
+		return topic.Definition{}, false
+	}
+	return *copyTopicDefinition(definition), true
+}
+
 func (f *BrokerFSM) SetCoordinator(cd *coordinator.Coordinator) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -142,6 +158,9 @@ func (f *BrokerFSM) SetTransactionManager(txn *transaction.Manager) {
 }
 
 func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
+
 	data := string(log.Data)
 	var reqID string
 
@@ -178,6 +197,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyTopicCommand(strings.TrimPrefix(data, "TOPIC:"))
 	case strings.HasPrefix(data, "TOPIC_DELETE:"):
 		res = f.applyTopicDeleteCommand(strings.TrimPrefix(data, "TOPIC_DELETE:"))
+	case strings.HasPrefix(data, "TOPIC_TRUNCATE:"):
+		res = f.applyTopicTruncateCommand(strings.TrimPrefix(data, "TOPIC_TRUNCATE:"))
 	case strings.HasPrefix(data, "PARTITION:"):
 		res = f.applyPartitionCommand(strings.TrimPrefix(data, "PARTITION:"))
 	case strings.HasPrefix(data, "PARTITION_COMMIT:"):
@@ -208,6 +229,9 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 }
 
 func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
+
 	defer func() {
 		if err := rc.Close(); err != nil {
 			util.Error("failed to close rc: %v", err)
@@ -237,6 +261,10 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Info("FSM Restore: Validating snapshot Version 5 (with committed partition watermarks)")
 	case 6:
 		util.Info("FSM Restore: Validating snapshot Version 6 (with durable topic definitions)")
+	case 7:
+		util.Info("FSM Restore: Validating snapshot Version 7 (with revisioned topic definitions)")
+	case 8:
+		util.Info("FSM Restore: Validating snapshot Version 8 (with topic lifecycle epochs)")
 	default:
 		return fmt.Errorf("unknown snapshot version: %d", state.Version)
 	}
@@ -248,10 +276,14 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		}
 		restoredTopicState = legacyTopicState(state.PartitionMetadata)
 	}
-	_, err := validateTopicState(restoredTopicState, state.PartitionMetadata)
+	if err := migrateSnapshotTopicDefinitionFields(state.Version, restoredTopicState, state.PartitionMetadata); err != nil {
+		return fmt.Errorf("restore topic definitions: %w", err)
+	}
+	definitions, err := validateTopicState(restoredTopicState, state.PartitionMetadata)
 	if err != nil {
 		return fmt.Errorf("restore topic definitions: %w", err)
 	}
+	restoredTopicState = topicStateFromDefinitions(definitions)
 	f.materializationMu.Lock()
 	localDefinitions := []topic.Definition(nil)
 	persistedTopicStorage := []string(nil)
@@ -396,6 +428,9 @@ func (f *BrokerFSM) reconcileCommittedPartitions() {
 }
 
 func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
+
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
@@ -439,9 +474,11 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	if len(topicStateCopy) == 0 && len(metadataCopy) > 0 {
 		topicStateCopy = legacyTopicState(metadataCopy)
 	}
-	if _, err := validateTopicState(topicStateCopy, metadataCopy); err != nil {
+	definitions, err := validateTopicState(topicStateCopy, metadataCopy)
+	if err != nil {
 		return nil, fmt.Errorf("snapshot topic definitions: %w", err)
 	}
+	topicStateCopy = topicStateFromDefinitions(definitions)
 
 	var groupState map[string]*coordinator.GroupStateSnapshot
 	if f.cd != nil {

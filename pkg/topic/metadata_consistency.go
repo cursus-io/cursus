@@ -88,6 +88,16 @@ func (s *topicMetadataStore) orphanedTopicDirectories(manifestTopics map[string]
 
 func validateDeclaredTopicStorage(root string, definitions []Definition) error {
 	for _, definition := range definitions {
+		pendingReset, pendingErr := lifecycleEpochResetPendingConfig(root, definition)
+		if pendingErr != nil {
+			return fmt.Errorf("inspect manifest topic %q lifecycle epoch: %w", definition.Name, pendingErr)
+		}
+		if pendingReset {
+			// The manifest is authoritative. A missing or partial old generation
+			// is recoverable because restore will remove it before opening the
+			// topic and will keep the topic fenced until dependency cleanup ends.
+			continue
+		}
 		topicPath := filepath.Join(root, definition.Name)
 		info, err := os.Lstat(topicPath)
 		if err != nil {

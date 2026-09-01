@@ -43,11 +43,12 @@ type AppendResult struct {
 }
 
 type SnapshotResult struct {
-	Topic     string `json:"topic"`
-	Key       string `json:"key"`
-	Version   uint64 `json:"version"`
-	Partition int    `json:"partition"`
-	Payload   string `json:"payload"`
+	Topic          string `json:"topic"`
+	Key            string `json:"key"`
+	Version        uint64 `json:"version"`
+	Partition      int    `json:"partition"`
+	Payload        string `json:"payload"`
+	LifecycleEpoch uint64 `json:"lifecycle_epoch,omitempty"`
 }
 
 // NewHandler creates a new event sourcing command handler.
@@ -803,6 +804,7 @@ func (h *Handler) DeleteTopic(topicName string) error {
 			firstErr = fmt.Errorf("close index %s: %w", key, err)
 		}
 		delete(h.indexes, key)
+		delete(h.indexedHWM, key)
 	}
 	for key, ss := range h.snapshots {
 		if !strings.HasPrefix(key, prefix) {

@@ -136,15 +136,17 @@ cursus-storage consumer-metadata migrate \
 
 This exclusively creates `{log_dir}/__consumer_metadata_migration.json`, syncs its contents and parent directory, and never overwrites an existing migration authority. Repeating the same selection is idempotent; a different selection fails.
 
-6. Prepare a version-1 topic definition file that covers every persisted topic directory, including `__consumer_offsets`. The internal definition must be non-idempotent, non-event-sourcing, and compact; the migration command canonicalizes its retention to unlimited:
+6. Prepare a version-2 topic definition file that covers every persisted topic directory, including `__consumer_offsets`. The internal definition must be non-idempotent, non-event-sourcing, and compact; the migration command canonicalizes its retention to unlimited:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "topics": [
     {
       "name": "__consumer_offsets",
+      "revision": 1,
       "partitions": 4,
+      "replication_factor": 3,
       "idempotent": false,
       "event_sourcing": false,
       "policy": {

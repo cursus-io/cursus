@@ -808,6 +808,9 @@ func (ch *CommandHandler) ConfigureTransactionJournal(path string) error {
 		}
 	}
 	ch.txnJournal = journal
+	if err := ch.RecoverPendingTruncations(); err != nil {
+		return fmt.Errorf("recover pending topic truncation: %w", err)
+	}
 	return nil
 }
 

@@ -16,17 +16,20 @@ const DefaultConsumerBufSize = 1000
 
 // Topic represents a logical message stream divided into partitions and consumer groups.
 type Topic struct {
-	Name            string
-	Partitions      []*Partition
-	counter         uint64
-	consumerGroups  map[string]*types.ConsumerGroup
-	mu              sync.RWMutex
-	cfg             *config.Config
-	streamManager   StreamManager
-	IsIdempotent    bool
-	IsEventSourcing bool
-	Policy          Policy
-	txnResolver     TransactionDecisionResolver
+	Name              string
+	Partitions        []*Partition
+	counter           uint64
+	consumerGroups    map[string]*types.ConsumerGroup
+	mu                sync.RWMutex
+	cfg               *config.Config
+	streamManager     StreamManager
+	IsIdempotent      bool
+	IsEventSourcing   bool
+	ReplicationFactor int
+	Revision          uint64
+	LifecycleEpoch    uint64
+	Policy            Policy
+	txnResolver       TransactionDecisionResolver
 }
 
 func (t *Topic) SetTransactionDecisionResolver(resolver TransactionDecisionResolver) {
@@ -94,38 +97,50 @@ func NewTopic(name string, partitionCount int, hp HandlerProvider, cfg *config.C
 }
 
 func NewTopicWithPolicy(name string, partitionCount int, hp HandlerProvider, cfg *config.Config, sm StreamManager, idempotent bool, eventSourcing bool, policy Policy) (*Topic, error) {
-	normalizedPolicy, err := policy.Normalize()
+	definition := DefaultDefinition(name, cfg)
+	definition.Partitions = partitionCount
+	definition.Idempotent = idempotent
+	definition.EventSourcing = eventSourcing
+	definition.Policy = policy
+	return newTopicWithDefinition(definition, hp, cfg, sm)
+}
+
+func newTopicWithDefinition(definition Definition, hp HandlerProvider, cfg *config.Config, sm StreamManager) (*Topic, error) {
+	definition, err := definition.Normalize()
 	if err != nil {
 		return nil, err
 	}
-	if name != config.ConsumerOffsetsTopicName {
-		if err := validateCleanupPolicyForTopic(normalizedPolicy, cfg, eventSourcing); err != nil {
+	if definition.Name != config.ConsumerOffsetsTopicName {
+		if err := validateCleanupPolicyForTopic(definition.Policy, cfg, definition.EventSourcing); err != nil {
 			return nil, err
 		}
 	}
 
-	partitions := make([]*Partition, partitionCount)
-	for i := 0; i < partitionCount; i++ {
-		dh, err := getHandlerWithStoragePolicy(hp, name, i, normalizedPolicy)
+	partitions := make([]*Partition, definition.Partitions)
+	for i := 0; i < definition.Partitions; i++ {
+		dh, err := getHandlerWithStoragePolicy(hp, definition.Name, i, definition.Policy)
 		if err != nil {
-			closePartiallyInitializedTopic(name, hp, partitions[:i])
-			return nil, fmt.Errorf("open handler for %s[%d]: %w", name, i, err)
+			closePartiallyInitializedTopic(definition.Name, hp, partitions[:i])
+			return nil, fmt.Errorf("open handler for %s[%d]: %w", definition.Name, i, err)
 		}
-		p := NewPartition(i, name, dh, sm, cfg)
-		p.isIdempotent = idempotent
+		p := NewPartition(i, definition.Name, dh, sm, cfg)
+		p.isIdempotent = definition.Idempotent
 		p.RecoverProducerStateFromLog()
 		p.StartProducerStateMaintenance()
 		partitions[i] = p
 	}
 	return &Topic{
-		Name:            name,
-		Partitions:      partitions,
-		consumerGroups:  make(map[string]*types.ConsumerGroup),
-		cfg:             cfg,
-		streamManager:   sm,
-		IsIdempotent:    idempotent,
-		IsEventSourcing: eventSourcing,
-		Policy:          normalizedPolicy,
+		Name:              definition.Name,
+		Partitions:        partitions,
+		consumerGroups:    make(map[string]*types.ConsumerGroup),
+		cfg:               cfg,
+		streamManager:     sm,
+		IsIdempotent:      definition.Idempotent,
+		IsEventSourcing:   definition.EventSourcing,
+		ReplicationFactor: definition.ReplicationFactor,
+		Revision:          definition.Revision,
+		LifecycleEpoch:    definition.LifecycleEpoch,
+		Policy:            definition.Policy,
 	}, nil
 }
 
@@ -179,7 +194,12 @@ func (t *Topic) AddPartitions(extra int, hp HandlerProvider) error {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.applyDefinitionLocked(len(t.Partitions)+extra, t.Policy, hp, nil)
+	partitions := len(t.Partitions) + extra
+	definition, err := MergeDefinitionPatch(t.definitionLocked(), DefinitionPatch{Partitions: &partitions}, true)
+	if err != nil {
+		return err
+	}
+	return t.applyFullDefinitionLocked(definition, hp, nil)
 }
 
 // Definition returns a detached durable definition for the topic.
@@ -194,23 +214,42 @@ func (t *Topic) definitionLocked() Definition {
 	policy.ReadACL = append([]string(nil), policy.ReadACL...)
 	policy.WriteACL = append([]string(nil), policy.WriteACL...)
 	return Definition{
-		Name:          t.Name,
-		Partitions:    len(t.Partitions),
-		Idempotent:    t.IsIdempotent,
-		EventSourcing: t.IsEventSourcing,
-		Policy:        policy,
+		Name:              t.Name,
+		Revision:          t.Revision,
+		LifecycleEpoch:    t.LifecycleEpoch,
+		Partitions:        len(t.Partitions),
+		ReplicationFactor: t.ReplicationFactor,
+		Idempotent:        t.IsIdempotent,
+		EventSourcing:     t.IsEventSourcing,
+		Policy:            policy,
 	}
 }
 
-// applyDefinition stages new partitions and commits durable metadata before
-// exposing the new policy or partition count to publishers.
-func (t *Topic) applyDefinition(partitionCount int, policy Policy, hp HandlerProvider, persist func(Definition) error) error {
+func (t *Topic) applyFullDefinition(definition Definition, hp HandlerProvider, persist func(Definition) error) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.applyDefinitionLocked(partitionCount, policy, hp, persist)
+	return t.applyFullDefinitionLocked(definition, hp, persist)
 }
 
-func (t *Topic) applyDefinitionLocked(partitionCount int, policy Policy, hp HandlerProvider, persist func(Definition) error) error {
+func (t *Topic) applyFullDefinitionLocked(definition Definition, hp HandlerProvider, persist func(Definition) error) error {
+	definition, err := definition.Normalize()
+	if err != nil {
+		return err
+	}
+	if definition.Name != t.Name {
+		return fmt.Errorf("topic definition name mismatch: current=%q requested=%q", t.Name, definition.Name)
+	}
+	if definition.Idempotent != t.IsIdempotent {
+		return fmt.Errorf("idempotent mode is immutable for existing topic %q", t.Name)
+	}
+	if definition.EventSourcing != t.IsEventSourcing {
+		return fmt.Errorf("event_sourcing mode is immutable for existing topic %q", t.Name)
+	}
+	if definition.LifecycleEpoch != t.LifecycleEpoch {
+		return fmt.Errorf("lifecycle epoch is immutable outside truncate for topic %q: current=%d requested=%d", t.Name, t.LifecycleEpoch, definition.LifecycleEpoch)
+	}
+	partitionCount := definition.Partitions
+	policy := definition.Policy
 	current := len(t.Partitions)
 	if partitionCount < current {
 		return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", t.Name, current, partitionCount)
@@ -231,9 +270,6 @@ func (t *Topic) applyDefinitionLocked(partitionCount int, policy Policy, hp Hand
 		staged = append(staged, partition)
 	}
 
-	definition := t.definitionLocked()
-	definition.Partitions = partitionCount
-	definition.Policy = policy
 	if persist != nil {
 		if err := persist(definition); err != nil {
 			closePreparedPartitions(t.Name, hp, staged)
@@ -245,6 +281,9 @@ func (t *Topic) applyDefinitionLocked(partitionCount int, policy Policy, hp Hand
 		applyStoragePolicy(partition.dh, policy)
 	}
 	t.Policy = policy
+	t.ReplicationFactor = definition.ReplicationFactor
+	t.Revision = definition.Revision
+	t.LifecycleEpoch = definition.LifecycleEpoch
 	t.Partitions = append(t.Partitions, staged...)
 	return nil
 }

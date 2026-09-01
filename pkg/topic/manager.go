@@ -18,6 +18,14 @@ import (
 )
 
 var ErrTopicNotFound = errors.New("topic not found")
+var ErrTopicDeleteBlocked = errors.New("topic delete blocked")
+
+// DeleteResult reports the committed logical deletion and whether node-local
+// physical cleanup still needs reconciliation.
+type DeleteResult struct {
+	Deleted        bool
+	CleanupPending bool
+}
 
 type StreamManager interface {
 	AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), legacyCommitInterval time.Duration) error
@@ -27,22 +35,36 @@ type StreamManager interface {
 }
 
 type TopicManager struct {
-	topics        map[string]*Topic
-	stopCh        chan struct{}
-	hp            HandlerProvider
-	stopOnce      sync.Once
-	mu            sync.RWMutex
-	cfg           *config.Config
-	StreamManager StreamManager
-	coordinator   *coordinator.Coordinator
-	txnResolver   TransactionDecisionResolver
-	metadataStore *topicMetadataStore
+	topics             map[string]*Topic
+	deleting           map[string]bool
+	pendingTruncations map[string]Definition
+	stopCh             chan struct{}
+	hp                 HandlerProvider
+	stopOnce           sync.Once
+	mu                 sync.RWMutex
+	cfg                *config.Config
+	StreamManager      StreamManager
+	coordinator        *coordinator.Coordinator
+	txnResolver        TransactionDecisionResolver
+	metadataStore      *topicMetadataStore
+	deleteHook         func(string) error
 
 	metadataLoadFailure             string
 	metadataRestoredTopicCount      int
 	metadataOrphanTopicCount        int
 	metadataDurabilityWarning       string
 	metadataDurabilityWarningsTotal uint64
+}
+
+// SetDeleteHook registers cleanup for derived per-topic state that must be
+// closed before physical topic storage is removed.
+func (tm *TopicManager) SetDeleteHook(hook func(string) error) {
+	if tm == nil {
+		return
+	}
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.deleteHook = hook
 }
 
 // HandlerProvider defines an interface to provide disk handlers.
@@ -78,105 +100,200 @@ func (tm *TopicManager) SetTransactionDecisionResolver(resolver TransactionDecis
 
 func NewTopicManager(cfg *config.Config, hp HandlerProvider, sm StreamManager) *TopicManager {
 	tm := &TopicManager{
-		topics:        make(map[string]*Topic),
-		stopCh:        make(chan struct{}),
-		hp:            hp,
-		cfg:           cfg,
-		StreamManager: sm,
-		metadataStore: newTopicMetadataStore(cfg, hp),
+		topics:             make(map[string]*Topic),
+		deleting:           make(map[string]bool),
+		pendingTruncations: make(map[string]Definition),
+		stopCh:             make(chan struct{}),
+		hp:                 hp,
+		cfg:                cfg,
+		StreamManager:      sm,
+		metadataStore:      newTopicMetadataStore(cfg, hp),
 	}
 	return tm
 }
 
 func (tm *TopicManager) CreateTopic(name string, partitionCount int, idempotent bool, eventSourcing bool) error {
-	policy := DefaultPolicy()
-	if tm.cfg != nil && tm.cfg.CleanupPolicy != "" {
-		policy.CleanupPolicy = tm.cfg.CleanupPolicy
-	}
+	policy := DefaultDefinition(name, tm.cfg).Policy
 	return tm.CreateTopicWithPolicy(name, partitionCount, idempotent, eventSourcing, policy)
 }
 
 func (tm *TopicManager) CreateTopicWithPolicy(name string, partitionCount int, idempotent bool, eventSourcing bool, policy Policy) error {
-	internalMetadata := name == config.ConsumerOffsetsTopicName
-	if internalMetadata {
-		idempotent = false
-		eventSourcing = false
-		policy = ConsumerMetadataPolicy()
+	defaults := DefaultDefinition(name, tm.cfg)
+	defaults.Partitions = partitionCount
+	defaults.Idempotent = idempotent
+	defaults.EventSourcing = eventSourcing
+	defaults.Policy = policy
+	cleanupPolicy := policy.CleanupPolicy
+	retentionHours := policy.RetentionHours
+	retentionBytes := policy.RetentionBytes
+	partitioner := policy.Partitioner
+	authPolicy := policy.AuthPolicy
+	readACL := append([]string(nil), policy.ReadACL...)
+	writeACL := append([]string(nil), policy.WriteACL...)
+	patch := DefinitionPatch{
+		Partitions:     &partitionCount,
+		CleanupPolicy:  &cleanupPolicy,
+		RetentionHours: &retentionHours,
+		RetentionBytes: &retentionBytes,
+		Partitioner:    &partitioner,
+		AuthPolicy:     &authPolicy,
+		ReadACL:        &readACL,
+		WriteACL:       &writeACL,
 	}
-	definition, err := (Definition{
-		Name:          name,
-		Partitions:    partitionCount,
-		Idempotent:    idempotent,
-		EventSourcing: eventSourcing,
-		Policy:        policy,
-	}).Normalize()
+	_, err := tm.CreateTopicWithPatch(defaults, patch)
+	return err
+}
+
+// CreateTopicWithPatch creates a missing topic from defaults or atomically
+// patches an existing definition using only fields present in patch.
+func (tm *TopicManager) CreateTopicWithPatch(defaults Definition, patch DefinitionPatch) (Definition, error) {
+	defaults, err := defaults.Normalize()
 	if err != nil {
-		return err
+		return Definition{}, err
 	}
-	if !internalMetadata {
-		if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, eventSourcing); err != nil {
-			return err
-		}
+	internalMetadata := defaults.Name == config.ConsumerOffsetsTopicName
+	if internalMetadata {
+		defaults.Idempotent = false
+		defaults.EventSourcing = false
+		defaults.Policy = ConsumerMetadataPolicy()
+		patch = internalTopicPatch(patch)
 	}
 
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
+	if tm.deleting[defaults.Name] {
+		return Definition{}, fmt.Errorf("topic %q is being deleted", defaults.Name)
+	}
+	if _, pending := tm.pendingTruncations[defaults.Name]; pending {
+		return Definition{}, fmt.Errorf("topic %q lifecycle cleanup is pending", defaults.Name)
+	}
 
-	if existing, ok := tm.topics[name]; ok {
+	if existing := tm.topics[defaults.Name]; existing != nil {
 		current := existing.Definition()
 		if internalMetadata && (current.Idempotent || current.EventSourcing) {
-			return fmt.Errorf("internal consumer metadata topic has incompatible mode")
+			return Definition{}, fmt.Errorf("internal consumer metadata topic has incompatible mode")
 		}
-		definition.Idempotent = current.Idempotent
-		definition.EventSourcing = current.EventSourcing
+		target, mergeErr := MergeDefinitionPatch(current, patch, true)
+		if mergeErr != nil {
+			return Definition{}, mergeErr
+		}
+		if internalMetadata {
+			target.Idempotent = false
+			target.EventSourcing = false
+			target.Policy = ConsumerMetadataPolicy()
+		}
 		if !internalMetadata {
-			if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, current.EventSourcing); err != nil {
-				return err
+			if err := validateCleanupPolicyForTopic(target.Policy, tm.cfg, target.EventSourcing); err != nil {
+				return Definition{}, err
 			}
 		}
-		if partitionCount < current.Partitions {
-			util.Error("cannot decrease partitions for topic '%s' (%d -> %d)", name, current.Partitions, partitionCount)
-			return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", name, current.Partitions, partitionCount)
+		if err := existing.applyFullDefinition(target, tm.hp, tm.persistDefinitionLocked); err != nil {
+			return Definition{}, fmt.Errorf("update topic '%s': %w", defaults.Name, err)
 		}
-		if err := existing.applyDefinition(partitionCount, definition.Policy, tm.hp, tm.persistDefinitionLocked); err != nil {
-			return fmt.Errorf("update topic '%s': %w", name, err)
-		}
-		if partitionCount > current.Partitions {
-			util.Info("topic '%s' partitions increased: %d -> %d", name, current.Partitions, partitionCount)
+		if target.Partitions > current.Partitions {
+			util.Info("topic '%s' partitions increased: %d -> %d", defaults.Name, current.Partitions, target.Partitions)
 		} else {
-			util.Info("topic '%s' already exists with %d partitions", name, current.Partitions)
+			util.Info("topic '%s' already exists with %d partitions", defaults.Name, current.Partitions)
+		}
+		return target, nil
+	}
+
+	target, err := MergeDefinitionPatch(defaults, patch, false)
+	if err != nil {
+		return Definition{}, err
+	}
+	if internalMetadata {
+		target.Idempotent = false
+		target.EventSourcing = false
+		target.Policy = ConsumerMetadataPolicy()
+	}
+	if !internalMetadata {
+		if err := validateCleanupPolicyForTopic(target.Policy, tm.cfg, target.EventSourcing); err != nil {
+			return Definition{}, err
+		}
+	}
+	if err := tm.rejectOrphanedStorageLocked(target.Name); err != nil {
+		return Definition{}, err
+	}
+	created, err := newTopicWithDefinition(target, tm.hp, tm.cfg, tm.StreamManager)
+	if err != nil {
+		util.Error("failed to create topic '%s': %v", target.Name, err)
+		return Definition{}, fmt.Errorf("failed to create topic '%s': %w", target.Name, err)
+	}
+	created.SetTransactionDecisionResolver(tm.txnResolver)
+	if err := tm.persistDefinitionLocked(target); err != nil {
+		closePartiallyInitializedTopic(target.Name, tm.hp, created.Partitions)
+		return Definition{}, err
+	}
+	tm.topics[target.Name] = created
+	return target, nil
+}
+
+func internalTopicPatch(patch DefinitionPatch) DefinitionPatch {
+	return DefinitionPatch{Partitions: patch.Partitions}
+}
+
+// ApplyDefinition materializes an authoritative complete definition, such as
+// one already serialized by the Raft FSM.
+func (tm *TopicManager) ApplyDefinition(raw Definition) error {
+	definition, err := raw.Normalize()
+	if err != nil {
+		return err
+	}
+	internalMetadata := definition.Name == config.ConsumerOffsetsTopicName
+	if internalMetadata {
+		definition.Idempotent = false
+		definition.EventSourcing = false
+		definition.Policy = ConsumerMetadataPolicy()
+	} else if err := validateCleanupPolicyForTopic(definition.Policy, tm.cfg, definition.EventSourcing); err != nil {
+		return err
+	}
+
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if tm.deleting[definition.Name] {
+		return fmt.Errorf("topic %q is being deleted", definition.Name)
+	}
+	if _, pending := tm.pendingTruncations[definition.Name]; pending {
+		return fmt.Errorf("topic %q lifecycle cleanup is pending", definition.Name)
+	}
+	if existing := tm.topics[definition.Name]; existing != nil {
+		current := existing.Definition()
+		if definition.LifecycleEpoch != current.LifecycleEpoch {
+			return fmt.Errorf("topic %q lifecycle epoch change requires truncate materialization: current=%d requested=%d", definition.Name, current.LifecycleEpoch, definition.LifecycleEpoch)
+		}
+		if definition.Partitions < current.Partitions {
+			return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", definition.Name, current.Partitions, definition.Partitions)
+		}
+		if err := existing.applyFullDefinition(definition, tm.hp, tm.persistDefinitionLocked); err != nil {
+			return fmt.Errorf("update topic '%s': %w", definition.Name, err)
 		}
 		return nil
 	}
-	if err := tm.rejectOrphanedStorageLocked(name); err != nil {
+	if err := tm.rejectOrphanedStorageLocked(definition.Name); err != nil {
 		return err
 	}
-
-	created, err := NewTopicWithPolicy(
-		name,
-		partitionCount,
-		tm.hp,
-		tm.cfg,
-		tm.StreamManager,
-		idempotent,
-		eventSourcing,
-		definition.Policy,
-	)
+	created, err := newTopicWithDefinition(definition, tm.hp, tm.cfg, tm.StreamManager)
 	if err != nil {
-		util.Error("failed to create topic '%s': %v", name, err)
-		return fmt.Errorf("failed to create topic '%s': %w", name, err)
+		return fmt.Errorf("failed to create topic '%s': %w", definition.Name, err)
 	}
 	created.SetTransactionDecisionResolver(tm.txnResolver)
 	if err := tm.persistDefinitionLocked(definition); err != nil {
-		closePartiallyInitializedTopic(name, tm.hp, created.Partitions)
+		closePartiallyInitializedTopic(definition.Name, tm.hp, created.Partitions)
 		return err
 	}
-	tm.topics[name] = created
+	tm.topics[definition.Name] = created
 	return nil
 }
 func (tm *TopicManager) GetTopic(name string) *Topic {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
+	if tm.deleting[name] {
+		return nil
+	}
+	if _, pending := tm.pendingTruncations[name]; pending {
+		return nil
+	}
 	return tm.topics[name]
 }
 
@@ -473,9 +590,32 @@ func (tm *TopicManager) DeleteTopicDurable(name string) (bool, error) {
 	}
 
 	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
 	current := tm.topics[name]
+	if current == nil {
+		tm.mu.Unlock()
+		return false, nil
+	}
+	if tm.deleting[name] {
+		tm.mu.Unlock()
+		return false, fmt.Errorf("topic %q deletion is already in progress", name)
+	}
+	tm.deleting[name] = true
+	deleteHook := tm.deleteHook
+	tm.mu.Unlock()
+
+	if deleteHook != nil {
+		if err := deleteHook(name); err != nil {
+			tm.mu.Lock()
+			delete(tm.deleting, name)
+			tm.mu.Unlock()
+			return false, fmt.Errorf("close derived topic state %q: %w", name, err)
+		}
+	}
+
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	defer delete(tm.deleting, name)
+	current = tm.topics[name]
 	if current == nil {
 		return false, nil
 	}

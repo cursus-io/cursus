@@ -17,36 +17,48 @@ It does not use a global payload-hash deduplication map. Retry safety comes from
 
 ## Create And Update
 
-`CreateTopicWithPolicy` normalizes policy before mutation.
+Protocol `CREATE` is implemented as a `DefinitionPatch`. Pointer presence distinguishes omission from an explicit zero, false, or empty ACL. Defaults are evaluated only when the topic is absent; an existing definition is read and merged while `TopicManager.mu` is held.
 
 | Existing state | Requested partitions | Result |
 |---|---:|---|
 | missing | positive | create topic and partitions |
-| exists | equal | update normalized policy, no partition change |
-| exists | greater | append new partitions and update policy |
+| exists | omitted/equal | preserve partitions; patch only supplied fields |
+| exists | greater | append new partitions and patch supplied fields |
 | exists | lower | reject; partition count never shrinks |
 
-New and existing partitions receive the current transaction decision resolver so `read_committed` uses coordinator authority. Retention and cleanup policy are propagated to every partition handler. An existing event-sourcing topic remains protected even if a later idempotent create request omits or clears `event_sourcing`.
+`replication_factor`, `idempotent`, and `event_sourcing` are immutable after creation. Restating the current value is accepted; a conflicting explicit value is rejected. Effective changes increment the durable definition revision and no-op patches retain it. New and existing partitions receive the current transaction decision resolver so `read_committed` uses coordinator authority. Retention and cleanup policy are propagated to every partition handler.
 
 Topic names use a portable storage contract: 1-249 ASCII bytes containing letters, digits, `.`, `_`, `-`, or `=`; `.` and `..` are reserved. This prevents a protocol topic identifier from escaping the broker-owned log root.
 
 `cleanup_policy` accepts `delete`, `compact`, and `delete,compact`. Compact policies are rejected when distribution is enabled or the topic is event-sourcing. Standalone compaction details are in [Log Compaction](../storage/log-compaction.md).
 
-For standalone create/update, new partition handlers are staged while the topic lock excludes publishers. The complete target definition is atomically persisted before policy or partition count becomes visible. A persistence failure closes/evicts staged handlers and leaves the live definition unchanged. In distributed mode the FSM retains existing partition leader epoch/HWM state on repeated create and allocates metadata only for newly added partitions.
+For standalone create/update, new partition handlers are staged while the topic lock excludes publishers. The complete target definition is atomically persisted before policy or partition count becomes visible. A persistence failure closes/evicts staged handlers and leaves the live definition unchanged. In distributed mode the Raft command carries the complete new-topic defaults plus the presence-aware patch. It also carries the merged legacy topic fields so older FSM readers in a rolling upgrade can apply the same authoritative definition while ignoring the new JSON fields. CREATE command construction is serialized on the leader so these compatibility fields cannot lose disjoint concurrent patches. The new FSM still merges against its current authoritative definition while holding the FSM lock. Existing partition leader epoch/HWM state is retained and metadata is allocated only for newly added partitions.
 
 ## Startup Recovery
 
-Standalone brokers load `{log_dir}/__topic_metadata.json` before coordinator initialization and static-group registration. The versioned manifest restores partition count, idempotent/event-sourcing flags, cleanup/retention, partitioner, auth policy, and ACLs. Unknown fields, duplicate topics, unsupported versions, invalid names, and malformed policy fail broker startup instead of silently weakening authorization or cleanup behavior.
+Standalone brokers load `{log_dir}/__topic_metadata.json` before coordinator initialization and static-group registration. Manifest version 2 remains the write format while every topic is at lifecycle epoch 1, allowing the previous release to read metadata during a rolling upgrade. The additive epoch field is ignored by older readers. Version 1 definitions receive revision 1, replication factor 3, and lifecycle epoch 1. A successful truncate advances the write format to version 3, which requires lifecycle epochs. Unknown fields, duplicate topics, unsupported versions, invalid names, and malformed policy fail broker startup instead of silently weakening authorization or cleanup behavior.
 
 Brokers upgraded from versions without the manifest do not guess security or event-sourcing policy from segment filenames. If persisted partition logs exist without a manifest, or a manifest omits a persisted topic directory, startup fails and lists the orphaned topics. Operators must migrate or archive those directories and provide authoritative definitions before restart. A normal `CREATE` also rejects a name whose orphaned logs remain, preventing deleted data from being silently resurrected.
 
 The internal offset topic is recreated by the coordinator and then enters the manifest on a new data directory. Existing pre-manifest offset logs require the same explicit migration as application topics.
 
-Distributed brokers keep topic definitions in the FSM and snapshot format version 6. Snapshot restore rebuilds the topic registry before committed HWM reconciliation. Version 5 and older snapshots can reconstruct partition count/idempotent mode from partition metadata, using the historical default topic policy because those snapshots did not retain the richer definition.
+Distributed brokers keep topic definitions in the FSM. Snapshot version 7 remains the write format while all topics are at epoch 1; additive epoch fields are ignored by older readers. A retained epoch greater than 1 selects version 8. Snapshot restore normalizes older definitions, rebuilds the topic registry, and then reconciles committed HWMs. Version 7 definitions without the field receive lifecycle epoch 1. Version 6 definitions also receive revision 1 and infer replication factor from consistent replica metadata, with 3 as the fallback when old metadata has no replicas. Version 5 and older snapshots can reconstruct partition count/idempotent mode from partition metadata and use the historical default topic policy. Version 8 fails closed when revision, replication factor, or lifecycle epoch is absent.
 
 ## Delete
 
-`DeleteTopicDurable` first commits removal from standalone metadata. It then removes the topic from the registry, stops partition workers, closes storage handlers, and removes the broker-owned topic log directory after verifying the target remains under the configured log root. A manifest failure leaves the topic live. Once the manifest removal commits, physical cleanup failures are logged for operator remediation but do not turn the logically successful deletion into an error response. Deletion is destructive and must remain an authenticated admin operation.
+`DELETE topic=<name> [if_exists=true]` is an authenticated admin operation. The option is explicitly opt-in: legacy deletion of a missing topic still returns `topic_not_found`, while `if_exists=true` returns `deleted=false`. The broker-owned `__consumer_offsets` topic is always protected.
+
+Deletion takes an exclusive topic-lifecycle fence. It fails closed while any group for the topic has active members or while an open/committing transaction references the topic. Inactive groups receive normal lifecycle tombstones and their offsets are removed. Terminal transactions retain their decision and operations for other topics but drop operations for the deleted topic. Distributed producer sequence state is removed. Event-sourcing indexes and snapshot stores are closed before partition storage is removed. These rules prevent a same-name recreation from reviving old records, offsets, producer sequences, transaction operations, or event-sourcing state.
+
+In standalone mode the command preflights active references without mutation, then `DeleteTopicDurable` commits manifest removal before removing the topic from the registry, stopping partition workers, closing handlers, and deleting the broker-owned log directory after path validation. Only after that logical commit does the command write inactive-group tombstones and rewrite transaction state. A manifest or pre-commit event-state failure therefore leaves the topic, offsets, and transaction references live. Post-commit storage or dependency failures return `deleted=true cleanup_pending=true`; `if_exists=true` retries dependency cleanup. A missing topic with stale group/transaction references cannot be recreated, and orphan storage is also rejected, so old state cannot attach to a new definition. In distributed mode the leader serializes lifecycle cleanup and topic/partition removal in the Raft apply order. FSM replay and snapshots retain the absence of topic, group, transaction-reference, and producer state. Node-local storage failures are tracked by the materialization reconciler instead of rolling back the committed cluster state.
+
+## Truncate
+
+`TRUNCATE topic=<name> expected_revision=<N>` is the admin-only data-reset operation. It retains the complete definition, increments the definition revision and lifecycle epoch, empties every partition, and resets LEO/HWM to zero. It fails closed when a group has active members, an open/committing transaction references the topic, the revision is stale, or the target is broker-owned `__consumer_offsets`.
+
+Successful truncation removes inactive groups and offsets, producer sequence state, terminal transaction references, and event-sourcing indexes/snapshots. In standalone mode the version 3 manifest commits the new epoch before physical storage reset. A synced epoch marker is the publication boundary; an absent or mismatched marker fences all access, makes broker readiness fail, and restart resumes cleanup. In distributed mode one serialized `TOPIC_TRUNCATE` transition updates definition and partition metadata, advances partition leader epochs, drops replicated record/producer state, and records node-local failures for reconciliation. Message replication, HWM commits, and event snapshots carry the lifecycle epoch so delayed pre-truncate work cannot enter the empty generation.
+
+Distributed truncate is rejected until every active broker advertises lifecycle protocol version 1. This keeps rolling upgrades safe: old brokers may coexist and continue serving the old epoch, but the irreversible transition cannot commit until they understand it. Snapshot version 8 and manifest version 3 remain readable only by lifecycle-aware binaries, so downgrade after those formats are written is unsupported. `DELETE` followed by `CREATE` is still not a substitute because it changes topic identity and has a different retry contract.
 
 ## Publish Entry Points
 

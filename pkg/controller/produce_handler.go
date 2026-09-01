@@ -227,12 +227,13 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 
 		scope := "partition"
 		messageData := types.MessageCommand{
-			Topic:         topicName,
-			Partition:     partition,
-			IsIdempotent:  effectiveIdempotent,
-			SequenceScope: scope,
-			Messages:      []types.Message{*msg},
-			Acks:          acks,
+			Topic:          topicName,
+			Partition:      partition,
+			LifecycleEpoch: t.LifecycleEpoch,
+			IsIdempotent:   effectiveIdempotent,
+			SequenceScope:  scope,
+			Messages:       []types.Message{*msg},
+			Acks:           acks,
 		}
 
 		markLeaderOffsetsUnassigned(messageData.Messages)
@@ -271,7 +272,7 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) strin
 		}
 
 		commitHWM := p.NextOffset()
-		if err := ch.commitPartitionHWM(topicName, partition, commitHWM); err != nil {
+		if err := ch.commitPartitionHWM(topicName, partition, commitHWM, t.LifecycleEpoch); err != nil {
 			return ch.errorResponse(fmt.Sprintf("commit watermark failed (offset=%d): %v", assignedOffset, err))
 		}
 		if err := p.ApplyReplicaHWM(commitHWM); err != nil {
@@ -413,6 +414,9 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 
 // HandleBatchMessage processes PUBLISH of multiple messages.
 func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...*ClientContext) (string, error) {
+	ch.topicLifecycleMu.RLock()
+	defer ch.topicLifecycleMu.RUnlock()
+
 	var clientCtx *ClientContext
 	if len(ctx) > 0 {
 		clientCtx = ctx[0]
@@ -425,6 +429,9 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 	}
 	if batch.Topic == config.ConsumerOffsetsTopicName {
 		return fmt.Sprintf("ERROR: internal_topic_write_forbidden topic=%s", batch.Topic), nil
+	}
+	if ch.TopicManager != nil && ch.TopicManager.IsTruncationPending(batch.Topic) {
+		return fmt.Sprintf("ERROR: topic_lifecycle_pending topic=%s operation=truncate", batch.Topic), nil
 	}
 
 	acks := batch.Acks
@@ -529,12 +536,13 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		}
 
 		msgCmd := types.MessageCommand{
-			Topic:         batch.Topic,
-			Partition:     batch.Partition,
-			IsIdempotent:  effectiveIdempotent,
-			SequenceScope: scope,
-			Messages:      appended,
-			Acks:          acks,
+			Topic:          batch.Topic,
+			Partition:      batch.Partition,
+			LifecycleEpoch: t.LifecycleEpoch,
+			IsIdempotent:   effectiveIdempotent,
+			SequenceScope:  scope,
+			Messages:       appended,
+			Acks:           acks,
 		}
 
 		err = ch.Cluster.ReplicateToFollowers(batch.Topic, batch.Partition, msgCmd, minISR)
@@ -542,7 +550,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			return ch.errorResponse(fmt.Sprintf("batch replication failed (offset=%d): %v", lastOffset, err)), nil
 		}
 		commitHWM := p.NextOffset()
-		if err := ch.commitPartitionHWM(batch.Topic, batch.Partition, commitHWM); err != nil {
+		if err := ch.commitPartitionHWM(batch.Topic, batch.Partition, commitHWM, t.LifecycleEpoch); err != nil {
 			return ch.errorResponse(fmt.Sprintf("batch commit watermark failed (offset=%d): %v", lastOffset, err)), nil
 		}
 		if err := p.ApplyReplicaHWM(commitHWM); err != nil {

@@ -48,11 +48,12 @@ func NewServiceDiscovery(rm RaftManager, brokerID, addr, clientAddr string) Serv
 
 func (sd *serviceDiscovery) Register() error {
 	broker := &fsm.BrokerInfo{
-		ID:         sd.brokerID,
-		Addr:       sd.addr,
-		ClientAddr: sd.clientAddr,
-		Status:     "active",
-		LastSeen:   time.Now(),
+		ID:                sd.brokerID,
+		Addr:              sd.addr,
+		ClientAddr:        sd.clientAddr,
+		Status:            "active",
+		LastSeen:          time.Now(),
+		LifecycleProtocol: fsm.TopicLifecycleProtocolVersion,
 	}
 
 	data, err := json.Marshal(broker)
