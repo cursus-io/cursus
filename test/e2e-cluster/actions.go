@@ -245,25 +245,46 @@ func (a *ClusterActions) WaitForTopicMetadata() *ClusterActions {
 	topic := a.ctx.GetTopic()
 	addrs := a.ctx.GetBrokerAddrs()
 	if err := eventually(a.ctx.GetT(), fmt.Sprintf("topic metadata for %s", topic), clusterReadyTimeout, func() (bool, string, error) {
-		lastDetail := "no broker returned metadata"
-		for _, addr := range addrs {
+		return topicMetadataConverged(addrs, topic, func(addr string) (string, error) {
 			tempClient := e2e.NewBrokerClient([]string{addr})
-			resp, err := tempClient.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topic), 2*time.Second)
+			resp, err := tempClient.SendCommand("", fmt.Sprintf("METADATA topic=%s", topic), 2*time.Second)
 			tempClient.Close()
-			if err != nil {
-				lastDetail = fmt.Sprintf("%s: %v", addr, err)
-				continue
-			}
-			if !strings.Contains(resp, "not found") && !strings.Contains(resp, "ERROR:") && strings.Contains(resp, topic) && strings.Contains(resp, "{") {
-				return true, fmt.Sprintf("available on %s", addr), nil
-			}
-			lastDetail = fmt.Sprintf("%s: %s", addr, resp)
-		}
-		return false, lastDetail, nil
+			return resp, err
+		})
 	}); err != nil {
 		a.ctx.GetT().Fatal(err)
 	}
 	return a
+}
+
+func topicMetadataConverged(addrs []string, topic string, probe func(string) (string, error)) (bool, string, error) {
+	if len(addrs) == 0 {
+		return false, "no brokers configured", nil
+	}
+	for _, addr := range addrs {
+		response, err := probe(addr)
+		if err != nil {
+			return false, fmt.Sprintf("%s: %v", addr, err), nil
+		}
+		if !metadataResponseMatchesTopic(response, topic) {
+			return false, fmt.Sprintf("%s: %s", addr, response), nil
+		}
+	}
+	return true, fmt.Sprintf("available on all %d brokers", len(addrs)), nil
+}
+
+func metadataResponseMatchesTopic(response, topic string) bool {
+	fields := strings.Fields(response)
+	if len(fields) == 0 || fields[0] != "OK" {
+		return false
+	}
+	for _, field := range fields[1:] {
+		key, value, ok := strings.Cut(field, "=")
+		if ok && key == "topic" {
+			return value == topic
+		}
+	}
+	return false
 }
 func (a *ClusterActions) SimulateLeaderFailure() (int, *ClusterActions) {
 	topic := a.ctx.GetTopic()
