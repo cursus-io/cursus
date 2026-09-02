@@ -2,6 +2,22 @@
 
 Cursus clients use Wire v2 `CRS2` frames over TCP after a required binary handshake. The frame header carries the command ID and request ID; most payloads use the deterministic `CRQ2` field schema. The text forms in this document are readable representations of those fields. Binary batches and stream frames are documented in the [wire protocol specification](../protocol-spec.md).
 
+## Operator CLI
+
+The container image includes `/app/cursusctl` for one explicit Wire v2 command
+per invocation. It is intended for approved operational actions such as catalog
+creation, status inspection, and an explicit `REGISTER_GROUP`; it does not
+persist credentials or execute a command file.
+
+```text
+/app/cursusctl --broker cursus:9000 LIST
+/app/cursusctl --broker cursus:9000 CREATE topic=orders partitions=3
+/app/cursusctl --broker cursus:9000 REGISTER_GROUP topic=orders group=workers
+```
+
+When SASL is enabled, pass `--principal` plus `--auth-token-env NAME`. The
+token is read only from `NAME` and is never accepted as a command-line value.
+
 ## Command Map
 
 | Area | Commands | Route |
