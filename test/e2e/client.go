@@ -358,14 +358,20 @@ func sendOneWayWireCommand(address, commandText string) error {
 }
 
 func isIdempotent(payload string) bool {
-	p := strings.ToUpper(strings.TrimSpace(payload))
-	return strings.HasPrefix(p, "DESCRIBE") ||
-		strings.HasPrefix(p, "LIST") ||
-		strings.HasPrefix(p, "FETCH_OFFSET") ||
-		strings.HasPrefix(p, "GROUP_STATUS") ||
-		strings.HasPrefix(p, "HELP") ||
-		strings.HasPrefix(p, "CONSUME") ||
-		strings.HasPrefix(p, "LIST_GROUPS")
+	command, request, err := wire.ParseCommandText(payload)
+	if err != nil {
+		return false
+	}
+	switch command {
+	case wire.CommandDescribe, wire.CommandList, wire.CommandListCluster,
+		wire.CommandListGroups, wire.CommandListOffsets, wire.CommandFetchOffset,
+		wire.CommandGroupStatus, wire.CommandHelp, wire.CommandConsume:
+		return true
+	case wire.CommandPublish:
+		return strings.EqualFold(request.Fields["isIdempotent"], "true")
+	default:
+		return false
+	}
 }
 
 // executeCommand is a simplified wrapper for commands expected to return only "OK" or "ERROR:".
