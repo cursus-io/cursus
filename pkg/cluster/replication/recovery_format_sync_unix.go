@@ -8,7 +8,7 @@ import (
 )
 
 func syncRaftDirectory(dataDir string) error {
-	directory, err := os.Open(dataDir)
+	directory, err := os.Open(dataDir) // #nosec G304 -- dataDir is the broker-configured Raft directory.
 	if err != nil {
 		return err
 	}
