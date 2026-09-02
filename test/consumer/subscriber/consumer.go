@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/consumer/bench"
 	"github.com/cursus-io/cursus/util"
 
@@ -109,7 +110,16 @@ func (c *Consumer) getLeaderConn() (net.Conn, error) {
 		}
 	}
 
-	return conn, nil
+	return c.negotiateWire(conn)
+}
+
+func (c *Consumer) negotiateWire(conn net.Conn) (net.Conn, error) {
+	framed, err := wire.NewClientConn(conn, c.config.CompressionType)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return framed, nil
 }
 
 func (c *Consumer) findCoordinator() (string, error) {
@@ -121,7 +131,7 @@ func (c *Consumer) findCoordinator() (string, error) {
 
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	cmd := fmt.Sprintf("FIND_COORDINATOR group=%s", c.config.GroupID)
-	if err := util.WriteWithLength(conn, util.EncodeMessage("", cmd)); err != nil {
+	if err := util.WriteWithLength(conn, []byte(cmd)); err != nil {
 		return "", fmt.Errorf("send find_coordinator: %w", err)
 	}
 
@@ -158,6 +168,9 @@ func (c *Consumer) getCoordinatorConn() (net.Conn, error) {
 	if addr != "" {
 		conn, err := c.client.Connect(addr)
 		if err == nil {
+			conn, err = c.negotiateWire(conn)
+		}
+		if err == nil {
 			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 			return conn, nil
 		}
@@ -173,6 +186,10 @@ func (c *Consumer) getCoordinatorConn() (net.Conn, error) {
 	c.mu.Unlock()
 
 	conn, err := c.client.Connect(newAddr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err = c.negotiateWire(conn)
 	if err != nil {
 		return nil, err
 	}
@@ -547,7 +564,7 @@ func (c *Consumer) heartbeatLoop() {
 
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 			hb := fmt.Sprintf("HEARTBEAT topic=%s group=%s member=%s generation=%d", c.config.Topic, c.config.GroupID, c.memberID, c.generation)
-			if err := util.WriteWithLength(conn, util.EncodeMessage("", hb)); err != nil {
+			if err := util.WriteWithLength(conn, []byte(hb)); err != nil {
 				util.Error("heartbeat send failed: %v", err)
 				c.cleanupHbConn(conn)
 				continue
@@ -794,7 +811,7 @@ func (c *Consumer) joinGroup() (generation int64, memberID string, assignments [
 	}
 
 	joinCmd := fmt.Sprintf("JOIN_GROUP topic=%s group=%s member=%s", c.config.Topic, c.config.GroupID, mID)
-	if err := util.WriteWithLength(conn, util.EncodeMessage("", joinCmd)); err != nil {
+	if err := util.WriteWithLength(conn, []byte(joinCmd)); err != nil {
 		return 0, "", nil, fmt.Errorf("send join command: %w", err)
 	}
 
@@ -865,7 +882,7 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	defer func() { _ = conn.Close() }()
 
 	syncCmd := fmt.Sprintf("SYNC_GROUP topic=%s group=%s member=%s generation=%d", c.config.Topic, c.config.GroupID, memberID, generation)
-	if err := util.WriteWithLength(conn, util.EncodeMessage("", syncCmd)); err != nil {
+	if err := util.WriteWithLength(conn, []byte(syncCmd)); err != nil {
 		return nil, fmt.Errorf("send sync command: %w", err)
 	}
 
@@ -938,7 +955,7 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	fetchCmd := fmt.Sprintf("FETCH_OFFSET topic=%s partition=%d group=%s", c.config.Topic, partition, c.config.GroupID)
-	if err := util.WriteWithLength(conn, util.EncodeMessage("", fetchCmd)); err != nil {
+	if err := util.WriteWithLength(conn, []byte(fetchCmd)); err != nil {
 		return 0, fmt.Errorf("fetch offset send failed: %v", err)
 	}
 
@@ -1029,7 +1046,7 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 	}
 	sb.WriteString(strings.Join(parts, ","))
 
-	if err := util.WriteWithLength(conn, util.EncodeMessage("", sb.String())); err != nil {
+	if err := util.WriteWithLength(conn, []byte(sb.String())); err != nil {
 		util.Error("Batch commit send failed: %v", err)
 		c.commitMu.Lock()
 		if c.commitConn == conn {
@@ -1090,7 +1107,7 @@ func (c *Consumer) directCommit(partition int, offset uint64) error {
 	commitCmd := fmt.Sprintf("COMMIT_OFFSET topic=%s partition=%d group=%s offset=%d generation=%d member=%s",
 		c.config.Topic, partition, c.config.GroupID, offset, generation, memberID)
 
-	if err := util.WriteWithLength(conn, util.EncodeMessage("", commitCmd)); err != nil {
+	if err := util.WriteWithLength(conn, []byte(commitCmd)); err != nil {
 		return fmt.Errorf("direct commit send failed: %v", err)
 	}
 
@@ -1137,7 +1154,7 @@ func (c *Consumer) Close() error {
 		if conn, err := c.getCoordinatorConn(); err == nil {
 			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
 				c.config.Topic, c.config.GroupID, memberID, generation)
-			_ = util.WriteWithLength(conn, util.EncodeMessage("", leaveCmd))
+			_ = util.WriteWithLength(conn, []byte(leaveCmd))
 			_ = conn.Close()
 		}
 	}

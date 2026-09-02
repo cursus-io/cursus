@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/publisher/config"
 	"github.com/google/uuid"
 )
@@ -86,6 +87,12 @@ func (pc *ProducerClient) connectPartitionLocked(idx int, addr string, useTLS bo
 			return fmt.Errorf("TCP dial to %s failed: %w", addr, err)
 		}
 	}
+	framed, err := wire.NewClientConn(conn, pc.config.CompressionType)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("Wire v2 handshake with %s failed: %w", addr, err)
+	}
+	conn = framed
 
 	var currentConns []net.Conn
 	if ptr := pc.conns.Load(); ptr != nil {

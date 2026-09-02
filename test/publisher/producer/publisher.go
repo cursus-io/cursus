@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/publisher/bench"
 	"github.com/cursus-io/cursus/test/publisher/config"
 	"github.com/cursus-io/cursus/util"
@@ -135,16 +136,21 @@ func (p *Publisher) CreateTopic(topic string, partitions int) error {
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	defer func() { _ = conn.Close() }()
+	framed, err := wire.NewClientConn(conn, p.config.CompressionType)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("Wire v2 handshake: %w", err)
+	}
+	defer func() { _ = framed.Close() }()
 
 	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, partitions, p.config.EnableIdempotence)
-	cmdBytes := util.EncodeMessage("admin", createCmd)
+	cmdBytes := []byte(createCmd)
 
-	if err := util.WriteWithLength(conn, cmdBytes); err != nil {
+	if err := util.WriteWithLength(framed, cmdBytes); err != nil {
 		return fmt.Errorf("send command: %w", err)
 	}
 
-	resp, err := util.ReadWithLength(conn)
+	resp, err := util.ReadWithLength(framed)
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}

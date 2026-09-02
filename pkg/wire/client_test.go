@@ -1,20 +1,16 @@
-package transport
+package wire
 
-import (
-	"testing"
-
-	"github.com/cursus-io/cursus/pkg/wire"
-)
+import "testing"
 
 func TestRequestFramePayloadUsesCanonicalCommandPayload(t *testing.T) {
 	command, encoded, err := requestFramePayload([]byte("PUBLISH topic=orders partition=2 acks=all message=created"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if command != wire.CommandPublish {
-		t.Fatalf("command = %s, want %s", command, wire.CommandPublish)
+	if command != CommandPublish {
+		t.Fatalf("command = %s, want %s", command, CommandPublish)
 	}
-	payload, err := wire.DecodeCommandPayload(encoded)
+	payload, err := DecodeCommandPayload(encoded)
 	if err != nil {
 		t.Fatal(err)
 	}

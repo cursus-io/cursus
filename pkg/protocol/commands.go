@@ -54,9 +54,7 @@ var textCommands = map[string]struct{}{
 	"NEGOTIATE":           {},
 }
 
-// IsTextCommand distinguishes a raw command from the legacy topic envelope.
-// DecodeMessage alone is not sufficient because the first two ASCII bytes of
-// a long command can also form a valid uint16 topic length.
+// IsTextCommand reports whether input starts with a registered command token.
 func IsTextCommand(value string) bool {
 	trimmed := strings.TrimLeft(value, " \t\r\n")
 	if trimmed == "" {
