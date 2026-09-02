@@ -11,6 +11,7 @@ import (
 func TestSentinelErrors_Defined(t *testing.T) {
 	assert.NotNil(t, ErrProducerClosed)
 	assert.NotNil(t, ErrConsumerClosed)
+	assert.NotNil(t, ErrConsumerRebalancing)
 	assert.NotNil(t, ErrTopicNotFound)
 	assert.NotNil(t, ErrInvalidPartition)
 	assert.NotNil(t, ErrNotLeader)
@@ -19,6 +20,7 @@ func TestSentinelErrors_Defined(t *testing.T) {
 func TestSentinelErrors_Messages(t *testing.T) {
 	assert.Equal(t, "producer closed", ErrProducerClosed.Error())
 	assert.Equal(t, "consumer closed", ErrConsumerClosed.Error())
+	assert.Equal(t, "consumer assignment is rebalancing", ErrConsumerRebalancing.Error())
 	assert.Equal(t, "topic not found", ErrTopicNotFound.Error())
 	assert.Equal(t, "invalid partition", ErrInvalidPartition.Error())
 	assert.Equal(t, "not leader", ErrNotLeader.Error())

@@ -189,40 +189,48 @@ func TestConsumer_OwnsPartition_Empty(t *testing.T) {
 	consumer, err := NewConsumer(cfg)
 	require.NoError(t, err)
 
-	assert.False(t, consumer.ownsPartition(0))
-	assert.False(t, consumer.ownsPartition(1))
+	consumer.state.Store(uint32(ConsumerStateRunning))
+	generation := consumer.assignmentGeneration.Add(1)
+	assert.False(t, consumer.ownsPartition(0, generation))
+	assert.False(t, consumer.ownsPartition(1, generation))
 }
 
 func TestConsumer_OwnsPartition_WithAssignment(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	consumer, err := NewConsumer(cfg)
 	require.NoError(t, err)
+	consumer.state.Store(uint32(ConsumerStateRunning))
+	generation := consumer.assignmentGeneration.Add(1)
 
 	consumer.mu.Lock()
 	consumer.partitionConsumers[0] = &PartitionConsumer{
-		partitionID: 0,
-		consumer:    consumer,
+		partitionID:          0,
+		consumer:             consumer,
+		assignmentGeneration: generation,
 	}
 	consumer.mu.Unlock()
 
-	assert.True(t, consumer.ownsPartition(0))
-	assert.False(t, consumer.ownsPartition(1))
+	assert.True(t, consumer.ownsPartition(0, generation))
+	assert.False(t, consumer.ownsPartition(1, generation))
 }
 
 func TestConsumer_OwnsPartition_ClosedPartition(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	consumer, err := NewConsumer(cfg)
 	require.NoError(t, err)
+	consumer.state.Store(uint32(ConsumerStateRunning))
+	generation := consumer.assignmentGeneration.Add(1)
 
 	consumer.mu.Lock()
 	consumer.partitionConsumers[0] = &PartitionConsumer{
-		partitionID: 0,
-		consumer:    consumer,
-		closed:      true,
+		partitionID:          0,
+		consumer:             consumer,
+		closed:               true,
+		assignmentGeneration: generation,
 	}
 	consumer.mu.Unlock()
 
-	assert.False(t, consumer.ownsPartition(0))
+	assert.False(t, consumer.ownsPartition(0, generation))
 }
 
 func TestNewConsumerClient_TLSError(t *testing.T) {
@@ -264,7 +272,7 @@ func TestConsumer_GetOrDialHeartbeatConn_ExistingConn(t *testing.T) {
 	c.hbConn = client
 	c.hbMu.Unlock()
 
-	conn := c.getOrDialHeartbeatConn()
+	conn := c.getOrDialHeartbeatConn(c.assignmentContext())
 	assert.Equal(t, client, conn)
 }
 
@@ -274,7 +282,7 @@ func TestConsumer_GetOrDialHeartbeatConn_NilConnGetLeaderFails(t *testing.T) {
 	c, err := NewConsumer(cfg)
 	require.NoError(t, err)
 
-	conn := c.getOrDialHeartbeatConn()
+	conn := c.getOrDialHeartbeatConn(c.assignmentContext())
 	assert.Nil(t, conn)
 }
 

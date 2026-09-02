@@ -77,7 +77,7 @@ func newGroupContractConsumer(t *testing.T, addr string) *Consumer {
 	consumer, err := NewConsumer(cfg)
 	require.NoError(t, err)
 	consumer.coordinatorAddr = addr
-	t.Cleanup(consumer.mainCancel)
+	t.Cleanup(consumer.cancelAssignment)
 	return consumer
 }
 
@@ -146,13 +146,15 @@ func TestConsumerHeartbeatIncludesMemberAndGeneration(t *testing.T) {
 	consumer.config.HeartbeatIntervalMS = 5
 
 	finished := make(chan struct{})
+	consumer.state.Store(uint32(ConsumerStateRunning))
+	generation := consumer.assignmentGeneration.Add(1)
 	go func() {
-		consumer.heartbeatLoop()
+		consumer.heartbeatLoop(consumer.assignmentContext(), generation)
 		close(finished)
 	}()
 
 	assert.Equal(t, "HEARTBEAT topic=events group=workers member=worker-1234 generation=7", requireSDKCommand(t, commands))
-	close(consumer.doneCh)
+	consumer.cancelAssignment()
 
 	select {
 	case <-finished:

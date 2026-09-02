@@ -8,11 +8,12 @@ import (
 )
 
 var (
-	ErrProducerClosed   = errors.New("producer closed")
-	ErrConsumerClosed   = errors.New("consumer closed")
-	ErrTopicNotFound    = errors.New("topic not found")
-	ErrInvalidPartition = errors.New("invalid partition")
-	ErrNotLeader        = errors.New("not leader")
+	ErrProducerClosed      = errors.New("producer closed")
+	ErrConsumerClosed      = errors.New("consumer closed")
+	ErrConsumerRebalancing = errors.New("consumer assignment is rebalancing")
+	ErrTopicNotFound       = errors.New("topic not found")
+	ErrInvalidPartition    = errors.New("invalid partition")
+	ErrNotLeader           = errors.New("not leader")
 )
 
 type ErrorClass = wireprotocol.ErrorClass

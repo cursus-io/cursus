@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -18,10 +19,12 @@ type messageBatch struct {
 
 // PartitionConsumer handles consuming and committing for a single partition.
 type PartitionConsumer struct {
-	partitionID  int
-	consumer     *Consumer
-	fetchOffset  uint64
-	commitOffset uint64
+	partitionID          int
+	consumer             *Consumer
+	fetchOffset          uint64
+	commitOffset         uint64
+	assignmentGeneration uint64
+	ctx                  context.Context
 
 	conn   net.Conn
 	mu     sync.Mutex
@@ -31,6 +34,24 @@ type PartitionConsumer struct {
 	dataCh    chan *messageBatch
 	once      sync.Once
 	closeOnce sync.Once
+}
+
+func (pc *PartitionConsumer) workerContext() context.Context {
+	if pc.ctx != nil {
+		return pc.ctx
+	}
+	return pc.consumer.assignmentContext()
+}
+
+func (pc *PartitionConsumer) assignmentToken() uint64 {
+	if pc.assignmentGeneration != 0 {
+		return pc.assignmentGeneration
+	}
+	return pc.consumer.assignmentGeneration.Load()
+}
+
+func (pc *PartitionConsumer) assignmentActive() bool {
+	return pc.consumer.assignmentActive(pc.assignmentToken())
 }
 
 // initWorker lazily starts the per-partition worker goroutine (once).
@@ -68,7 +89,7 @@ func (pc *PartitionConsumer) runWorker() {
 
 	for batch := range pc.dataCh {
 		select {
-		case <-pc.consumer.mainCtx.Done():
+		case <-pc.workerContext().Done():
 			// Roll back fetchOffset to last committed so the next consumer picks up correctly.
 			pc.consumer.mu.RLock()
 			committed := pc.consumer.offsets[pc.partitionID]
@@ -108,7 +129,7 @@ func (pc *PartitionConsumer) runWorker() {
 			return
 		}
 
-		if pc.consumer.mainCtx.Err() != nil {
+		if !pc.assignmentActive() || pc.workerContext().Err() != nil {
 			// Ownership lost after handler — skip commit, roll back.
 			pc.consumer.mu.RLock()
 			committed := pc.consumer.offsets[pc.partitionID]
@@ -123,6 +144,9 @@ func (pc *PartitionConsumer) runWorker() {
 		if err := pc.commitOffsetWithRetry(commitOffset); err != nil {
 			LogError("Partition [%d] failed to commit offset %d: %v", pc.partitionID, commitOffset, err)
 		} else {
+			if !pc.assignmentActive() {
+				continue
+			}
 			atomic.StoreUint64(&pc.commitOffset, commitOffset)
 
 			pc.consumer.mu.Lock()
@@ -135,7 +159,7 @@ func (pc *PartitionConsumer) runWorker() {
 // pollAndProcess sends one CONSUME command and pushes the resulting batch to dataCh.
 func (pc *PartitionConsumer) pollAndProcess() {
 	select {
-	case <-pc.consumer.mainCtx.Done():
+	case <-pc.workerContext().Done():
 		return
 	default:
 	}
@@ -236,7 +260,7 @@ func (pc *PartitionConsumer) pollAndProcess() {
 
 	select {
 	case pc.dataCh <- &messageBatch{topic: topic, messages: messages}:
-	case <-c.doneCh:
+	case <-pc.workerContext().Done():
 		pc.closeDataCh()
 	}
 }
@@ -251,18 +275,15 @@ func (pc *PartitionConsumer) startStreamLoop() {
 
 	for {
 		select {
-		case <-c.doneCh:
+		case <-pc.workerContext().Done():
 			pc.closeConnection()
 			return
 		default:
 		}
 
-		if atomic.LoadInt32(&c.rebalancing) == 1 {
+		if !pc.assignmentActive() {
 			pc.closeConnection()
-			if !pc.waitWithBackoff(bo) {
-				return
-			}
-			continue
+			return
 		}
 
 		if err := pc.ensureConnection(); err != nil {
@@ -310,7 +331,7 @@ func (pc *PartitionConsumer) startStreamLoop() {
 			idleTimeout = 5 * time.Minute
 		}
 
-		for atomic.LoadInt32(&c.rebalancing) != 1 {
+		for pc.assignmentActive() {
 			if err := conn.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
 				pc.closeConnection()
 				break
@@ -321,11 +342,11 @@ func (pc *PartitionConsumer) startStreamLoop() {
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
 					continue // idle timeout — retry read
 				}
-				if c.mainCtx.Err() != nil {
+				if pc.workerContext().Err() != nil {
 					return
 				}
 				select {
-				case <-c.doneCh:
+				case <-pc.workerContext().Done():
 					return
 				default:
 				}
@@ -362,9 +383,7 @@ func (pc *PartitionConsumer) startStreamLoop() {
 				bo.reset()
 				select {
 				case <-time.After(100 * time.Millisecond):
-				case <-c.doneCh:
-					return
-				case <-c.mainCtx.Done():
+				case <-pc.workerContext().Done():
 					return
 				}
 				continue
@@ -380,7 +399,7 @@ func (pc *PartitionConsumer) startStreamLoop() {
 
 			select {
 			case pc.dataCh <- &messageBatch{topic: topic, messages: messages}:
-			case <-c.doneCh:
+			case <-pc.workerContext().Done():
 				return
 			}
 		}
@@ -407,7 +426,7 @@ func effectiveStreamBatchSize(cfg *ConsumerConfig) int {
 
 // ensureConnection establishes a connection to the broker with retries and backoff.
 func (pc *PartitionConsumer) ensureConnection() error {
-	if pc.consumer.mainCtx.Err() != nil {
+	if pc.workerContext().Err() != nil || !pc.assignmentActive() {
 		return fmt.Errorf("consumer shutting down")
 	}
 
@@ -582,7 +601,7 @@ func (pc *PartitionConsumer) handleOffsetOutOfRange(frame offsetOutOfRangeFrame)
 		next = frame.Latest
 	case AutoOffsetResetError:
 		LogError("Partition [%d] offset out of range requested=%d earliest=%d latest=%d", pc.partitionID, frame.Requested, frame.Earliest, frame.Latest)
-		pc.consumer.mainCancel()
+		pc.consumer.cancelAssignment()
 		pc.closeConnection()
 		return true
 	default:
@@ -642,17 +661,14 @@ func (pc *PartitionConsumer) handleBrokerError(data []byte) bool {
 				break
 			}
 		}
-		// Trigger full metadata refresh — other partitions may have moved too
-		go func() {
-			if err := pc.consumer.fetchMetadata(); err != nil {
-				LogDebug("Metadata refresh after NOT_LEADER failed: %v", err)
-			}
-		}()
 	}
 
 	if strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "REBALANCE_REQUIRED") || strings.Contains(respStr, "NOT_OWNER") {
 		pc.close()
-		go pc.consumer.handleRebalanceSignal()
+		select {
+		case pc.consumer.rebalanceSig <- struct{}{}:
+		default:
+		}
 		return true
 	}
 
@@ -673,7 +689,7 @@ func (pc *PartitionConsumer) commitOffsetWithRetry(offset uint64) error {
 
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		if pc.consumer.mainCtx.Err() != nil {
+		if pc.workerContext().Err() != nil || !pc.assignmentActive() {
 			return fmt.Errorf("commit cancelled: consumer context done")
 		}
 
@@ -681,23 +697,24 @@ func (pc *PartitionConsumer) commitOffsetWithRetry(offset uint64) error {
 		err := func() error {
 			select {
 			case pc.consumer.commitCh <- commitEntry{
-				partition: pc.partitionID,
-				offset:    offset,
-				respCh:    resultCh,
+				partition:            pc.partitionID,
+				offset:               offset,
+				assignmentGeneration: pc.assignmentToken(),
+				respCh:               resultCh,
 			}:
 				timer := time.NewTimer(5 * time.Second)
 				defer timer.Stop()
 				select {
 				case err := <-resultCh:
 					return err
-				case <-pc.consumer.mainCtx.Done():
+				case <-pc.workerContext().Done():
 					return fmt.Errorf("commit cancelled during wait")
 				case <-timer.C:
 					return fmt.Errorf("commit timeout")
 				}
 			default:
 				LogWarn("Partition [%d] commitCh full, falling back to directCommit", pc.partitionID)
-				return pc.consumer.directCommit(pc.partitionID, offset)
+				return pc.consumer.directCommit(pc.partitionID, offset, pc.assignmentToken())
 			}
 		}()
 
@@ -741,7 +758,7 @@ func (pc *PartitionConsumer) waitWithBackoff(bo *backoff) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
-	case <-pc.consumer.mainCtx.Done():
+	case <-pc.workerContext().Done():
 		return false
 	case <-pc.consumer.doneCh:
 		return false
@@ -754,7 +771,7 @@ func (pc *PartitionConsumer) waitDuration(d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
-	case <-pc.consumer.mainCtx.Done():
+	case <-pc.workerContext().Done():
 		return false
 	case <-pc.consumer.doneCh:
 		return false

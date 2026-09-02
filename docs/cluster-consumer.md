@@ -63,6 +63,23 @@ flowchart TB
 
 ## Consumer Lifecycle (Cluster)
 
+The Go SDK exposes one lifecycle through `Consumer.State()`:
+
+```text
+new -> running <-> rebalancing -> closing -> closed
+```
+
+`Close` wins over every in-progress transition and is idempotent. The root
+context owns the rebalance monitor, commit worker, metadata/heartbeat loops,
+partition readers, and handler workers. Rebalance cancels and joins the old
+assignment before installing its replacement.
+
+Every assignment has a local monotonically increasing generation in addition
+to the broker group generation. Poll, stream, handler, and commit paths carry
+that local generation. Once rebalancing begins, work from the prior assignment
+is rejected with `sdk.ErrConsumerRebalancing` before another commit is sent.
+This prevents a late worker from mutating the newly installed assignment.
+
 ```mermaid
 sequenceDiagram
     participant C as Consumer
@@ -148,3 +165,5 @@ flowchart TD
 - `fetchOffset()` — uses a bounded, per-request coordinator connection and parses `OK offset=<N>`
 - `ReadIsolation` — sends explicit `isolation=read_committed|read_uncommitted` on polling and streaming reads
 - offset commits — send the broker-assigned member and generation, reject regressions, and stop/rejoin on fencing errors
+- `Consumer.State()` — reports `new`, `running`, `rebalancing`, `closing`, or `closed`
+- local assignment generations — fence stale fetch and commit workers across rebalances

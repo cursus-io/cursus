@@ -19,6 +19,8 @@ func newTestConsumer(t *testing.T) *Consumer {
 	cfg := NewDefaultConsumerConfig()
 	c, err := NewConsumer(cfg)
 	require.NoError(t, err)
+	c.state.Store(uint32(ConsumerStateRunning))
+	c.assignmentGeneration.Store(1)
 	return c
 }
 
@@ -308,7 +310,7 @@ func TestConsumer_FlushOffsets_Empty(t *testing.T) {
 
 func TestConsumer_FlushOffsets_DuringRebalance(t *testing.T) {
 	c := newTestConsumer(t)
-	atomic.StoreInt32(&c.rebalancing, 1)
+	c.state.Store(uint32(ConsumerStateRebalancing))
 	c.offsetsMu.Lock()
 	c.currentOffsets[0] = 100
 	c.offsetsMu.Unlock()
@@ -362,15 +364,15 @@ func TestConsumer_ProcessRetryQueue_Empty(t *testing.T) {
 
 func TestConsumer_ProcessRetryQueue_DuringRebalance(t *testing.T) {
 	c := newTestConsumer(t)
-	atomic.StoreInt32(&c.rebalancing, 1)
+	c.state.Store(uint32(ConsumerStateRebalancing))
 	c.commitMu.Lock()
-	c.commitRetryMap[0] = 100
+	c.commitRetryMap[0] = retryCommit{offset: 100, assignmentGeneration: 1}
 	c.commitMu.Unlock()
 
 	c.processRetryQueue()
 
 	c.commitMu.Lock()
-	assert.Equal(t, uint64(100), c.commitRetryMap[0])
+	assert.Equal(t, uint64(100), c.commitRetryMap[0].offset)
 	c.commitMu.Unlock()
 }
 

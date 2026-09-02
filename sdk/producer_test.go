@@ -879,6 +879,8 @@ func TestProducer_CommitBatch_FailureNotifiesChannels(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	c, err := NewConsumer(cfg)
 	require.NoError(t, err)
+	c.state.Store(uint32(ConsumerStateRunning))
+	generation := c.assignmentGeneration.Add(1)
 
 	ch1 := make(chan error, 1)
 	ch2 := make(chan error, 1)
@@ -886,7 +888,7 @@ func TestProducer_CommitBatch_FailureNotifiesChannels(t *testing.T) {
 	offsets := map[int]uint64{0: 100}
 	respChannels := map[int][]chan error{0: {ch1, ch2}}
 
-	c.commitBatch(offsets, respChannels)
+	c.commitBatch(offsets, respChannels, generation)
 
 	err1 := <-ch1
 	err2 := <-ch2
