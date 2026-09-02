@@ -86,11 +86,10 @@ func TestConsumerClient_UpdateLeader_DifferentAddrUpdates(t *testing.T) {
 func TestConsumerClient_ConnectWithFailover_NoBrokers(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	cfg.BrokerAddrs = []string{}
-	client, _ := NewConsumerClient(cfg)
-
-	_, _, err := client.ConnectWithFailover()
+	client, err := NewConsumerClient(cfg)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "no broker addresses configured")
+	assert.Contains(t, err.Error(), "at least one broker address")
+	assert.Nil(t, client)
 }
 
 func TestConsumerClient_LeaderStaleness(t *testing.T) {
@@ -107,50 +106,6 @@ func TestConsumerClient_LeaderStaleness(t *testing.T) {
 	_, _, err := client.ConnectWithFailover()
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "all brokers unreachable")
-}
-
-func TestConsumer_HandleLeaderRedirection_WithLeaderIs(t *testing.T) {
-	cfg := NewDefaultConsumerConfig()
-	consumer, err := NewConsumer(cfg)
-	require.NoError(t, err)
-
-	consumer.handleLeaderRedirection("ERROR NOT_LEADER LEADER_IS broker-3:9000")
-
-	info := consumer.client.leader.Load()
-	assert.Equal(t, "broker-3:9000", info.addr)
-}
-
-func TestConsumer_HandleLeaderRedirection_NoLeaderIs(t *testing.T) {
-	cfg := NewDefaultConsumerConfig()
-	consumer, err := NewConsumer(cfg)
-	require.NoError(t, err)
-
-	consumer.handleLeaderRedirection("ERROR some other error")
-
-	info := consumer.client.leader.Load()
-	assert.Equal(t, "", info.addr)
-}
-
-func TestConsumer_HandleLeaderRedirection_LeaderIsAtEnd(t *testing.T) {
-	cfg := NewDefaultConsumerConfig()
-	consumer, err := NewConsumer(cfg)
-	require.NoError(t, err)
-
-	consumer.handleLeaderRedirection("LEADER_IS")
-
-	info := consumer.client.leader.Load()
-	assert.Equal(t, "", info.addr)
-}
-
-func TestConsumer_HandleLeaderRedirection_EmptyResponse(t *testing.T) {
-	cfg := NewDefaultConsumerConfig()
-	consumer, err := NewConsumer(cfg)
-	require.NoError(t, err)
-
-	consumer.handleLeaderRedirection("")
-
-	info := consumer.client.leader.Load()
-	assert.Equal(t, "", info.addr)
 }
 
 func TestNewConsumer_Construction(t *testing.T) {
@@ -189,40 +144,48 @@ func TestConsumer_OwnsPartition_Empty(t *testing.T) {
 	consumer, err := NewConsumer(cfg)
 	require.NoError(t, err)
 
-	assert.False(t, consumer.ownsPartition(0))
-	assert.False(t, consumer.ownsPartition(1))
+	consumer.state.Store(uint32(ConsumerStateRunning))
+	generation := consumer.assignmentGeneration.Add(1)
+	assert.False(t, consumer.ownsPartition(0, generation))
+	assert.False(t, consumer.ownsPartition(1, generation))
 }
 
 func TestConsumer_OwnsPartition_WithAssignment(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	consumer, err := NewConsumer(cfg)
 	require.NoError(t, err)
+	consumer.state.Store(uint32(ConsumerStateRunning))
+	generation := consumer.assignmentGeneration.Add(1)
 
 	consumer.mu.Lock()
 	consumer.partitionConsumers[0] = &PartitionConsumer{
-		partitionID: 0,
-		consumer:    consumer,
+		partitionID:          0,
+		consumer:             consumer,
+		assignmentGeneration: generation,
 	}
 	consumer.mu.Unlock()
 
-	assert.True(t, consumer.ownsPartition(0))
-	assert.False(t, consumer.ownsPartition(1))
+	assert.True(t, consumer.ownsPartition(0, generation))
+	assert.False(t, consumer.ownsPartition(1, generation))
 }
 
 func TestConsumer_OwnsPartition_ClosedPartition(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	consumer, err := NewConsumer(cfg)
 	require.NoError(t, err)
+	consumer.state.Store(uint32(ConsumerStateRunning))
+	generation := consumer.assignmentGeneration.Add(1)
 
 	consumer.mu.Lock()
 	consumer.partitionConsumers[0] = &PartitionConsumer{
-		partitionID: 0,
-		consumer:    consumer,
-		closed:      true,
+		partitionID:          0,
+		consumer:             consumer,
+		closed:               true,
+		assignmentGeneration: generation,
 	}
 	consumer.mu.Unlock()
 
-	assert.False(t, consumer.ownsPartition(0))
+	assert.False(t, consumer.ownsPartition(0, generation))
 }
 
 func TestNewConsumerClient_TLSError(t *testing.T) {
@@ -264,17 +227,17 @@ func TestConsumer_GetOrDialHeartbeatConn_ExistingConn(t *testing.T) {
 	c.hbConn = client
 	c.hbMu.Unlock()
 
-	conn := c.getOrDialHeartbeatConn()
+	conn := c.getOrDialHeartbeatConn(c.assignmentContext())
 	assert.Equal(t, client, conn)
 }
 
 func TestConsumer_GetOrDialHeartbeatConn_NilConnGetLeaderFails(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
-	cfg.BrokerAddrs = []string{}
 	c, err := NewConsumer(cfg)
 	require.NoError(t, err)
+	c.config.BrokerAddrs = nil
 
-	conn := c.getOrDialHeartbeatConn()
+	conn := c.getOrDialHeartbeatConn(c.assignmentContext())
 	assert.Nil(t, conn)
 }
 
@@ -319,5 +282,5 @@ func TestParseListOffsetsResponse(t *testing.T) {
 
 	_, err = parseListOffsetsResponse("ERROR: topic_not_found topic=t")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "list offsets broker error")
+	assert.Contains(t, err.Error(), "unexpected list offsets response")
 }

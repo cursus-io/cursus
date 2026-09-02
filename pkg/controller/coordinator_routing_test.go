@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -179,7 +180,7 @@ func TestGroupCommandsFailClosedWhenCoordinatorDiscoveryFails(t *testing.T) {
 		"GROUP_STATUS group=workers",
 		"HEARTBEAT topic=orders group=workers member=worker-1",
 		"COMMIT_OFFSET topic=orders partition=0 group=workers offset=1",
-		"BATCH_COMMIT topic=orders group=workers generation=1 member=worker-1 P0:1",
+		"BATCH_COMMIT topic=orders group=workers generation=1 member=worker-1 offsets=P0:1",
 	}
 	for _, command := range commands {
 		t.Run(command, func(t *testing.T) {
@@ -189,4 +190,51 @@ func TestGroupCommandsFailClosedWhenCoordinatorDiscoveryFails(t *testing.T) {
 	}
 
 	require.Equal(t, lastHeartbeat, member.LastHeartbeat)
+}
+
+func TestDistributedOffsetCommandsMatchStrictRaftSchema(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	groupCoordinator := coordinator.NewCoordinator(context.Background(), cfg, &coordinatorRoutingTopicHandler{})
+	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 2))
+	_, err := groupCoordinator.AddConsumer("workers", "worker-1")
+	require.NoError(t, err)
+	generation := groupCoordinator.GetGeneration("workers")
+
+	brokerFSM := fsm.NewBrokerFSM(nil, groupCoordinator)
+	registerRoutingBroker(t, brokerFSM, "node-1")
+	raftManager := &coordinatorRoutingRaftManager{brokerFSM: brokerFSM}
+	raftManager.state = brokerFSM
+	raftManager.isLeader = true
+	raftManager.leaderAddress.Store("127.0.0.1:7000")
+	router := clusterController.NewClusterRouter(
+		"node-1", "127.0.0.1:7000", nil, raftManager,
+		cfg.BrokerPort, cfg.AdvertisedClientHost, cfg,
+	)
+	handler := NewCommandHandler(nil, cfg, groupCoordinator, nil, &clusterController.ClusterController{
+		RaftManager: raftManager,
+		Router:      router,
+	})
+	requestContext := NewClientContext("workers", 0)
+
+	response := handler.HandleCommand(fmt.Sprintf(
+		"COMMIT_OFFSET topic=orders partition=0 group=workers offset=5 member=worker-1 generation=%d",
+		generation,
+	), requestContext)
+	require.Equal(t, "OK", response)
+
+	response = handler.HandleCommand(fmt.Sprintf(
+		"BATCH_COMMIT topic=orders group=workers member=worker-1 generation=%d offsets=P0:6,P1:7",
+		generation,
+	), requestContext)
+	require.Equal(t, "OK batched=2", response)
+	offset, ok := groupCoordinator.GetOffset("workers", "orders", 1)
+	require.True(t, ok)
+	require.Equal(t, uint64(7), offset)
+
+	legacyPositional := handler.HandleCommand(fmt.Sprintf(
+		"BATCH_COMMIT topic=orders group=workers member=worker-1 generation=%d P0:8",
+		generation,
+	), requestContext)
+	require.Equal(t, "ERROR: invalid_batch_commit_format", legacyPositional)
 }

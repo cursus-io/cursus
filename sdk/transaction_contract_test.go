@@ -9,24 +9,28 @@ import (
 
 func TestExecuteTransactionCommandPreservesStructuredBrokerError(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	t.Cleanup(func() { _ = client.Close() })
+	t.Cleanup(func() { _ = server.Close() })
 
 	serverDone := make(chan error, 1)
 	go func() {
-		request, err := ReadWithLength(server)
+		connection, request, command, err := acceptWireTestRequest(server)
 		if err != nil {
 			serverDone <- err
 			return
 		}
-		if got := string(request[2:]); got != "END_TXN transactional_id=tx-1 producerId=p-1 epoch=2 result=commit" {
-			serverDone <- errors.New("unexpected transaction command: " + got)
+		if command != "END_TXN transactional_id=tx-1 producerId=p-1 epoch=2 result=commit" {
+			serverDone <- errors.New("unexpected transaction command: " + command)
 			return
 		}
-		serverDone <- WriteWithLength(server, []byte("ERROR: producer_fenced class=fencing retryable=false current_epoch=3 requested_epoch=2"))
+		serverDone <- writeWireTestResponse(connection, request, "ERROR: producer_fenced class=fencing retryable=false current_epoch=3 requested_epoch=2")
 	}()
 
-	_, err := executeTransactionCommand(client, "END_TXN transactional_id=tx-1 producerId=p-1 epoch=2 result=commit")
+	framed, err := openWireConnection(client, 1000, "none")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = executeTransactionCommand(framed, "END_TXN transactional_id=tx-1 producerId=p-1 epoch=2 result=commit")
 	var brokerErr *BrokerError
 	if !errors.As(err, &brokerErr) {
 		t.Fatalf("expected typed BrokerError, got %T: %v", err, err)
@@ -41,16 +45,28 @@ func TestExecuteTransactionCommandPreservesStructuredBrokerError(t *testing.T) {
 
 func TestExecuteTransactionCommandRequiresExactOKToken(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	t.Cleanup(func() { _ = client.Close() })
+	t.Cleanup(func() { _ = server.Close() })
 
+	serverDone := make(chan error, 1)
 	go func() {
-		_, _ = ReadWithLength(server)
-		_ = WriteWithLength(server, []byte("OKAY state=committed"))
+		connection, request, _, err := acceptWireTestRequest(server)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- writeWireTestResponse(connection, request, "OKAY state=committed")
 	}()
 
-	if _, err := executeTransactionCommand(client, "TXN_STATUS transactional_id=tx-1"); err == nil {
+	framed, err := openWireConnection(client, 1000, "none")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executeTransactionCommand(framed, "TXN_STATUS transactional_id=tx-1"); err == nil {
 		t.Fatal("broad OK prefix was accepted")
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -62,7 +78,7 @@ func TestBuildSendOffsetsToTransactionCommandSortsPartitions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := "SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=producer-1 epoch=2 topic=orders group=workers member=member-1 generation=4 P0:11,P2:30,P10:90"
+	expected := "SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=producer-1 epoch=2 topic=orders group=workers member=member-1 generation=4 offsets=P0:11,P2:30,P10:90"
 	if cmd != expected {
 		t.Fatalf("command mismatch\nwant: %s\n got: %s", expected, cmd)
 	}

@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cursus-io/cursus/sdk/internal/transport"
 )
 
 // Event represents a domain event to be appended to a stream.
@@ -81,7 +84,9 @@ func (es *EventStore) getConn() (net.Conn, error) {
 	}
 	es.mu.Unlock()
 
-	conn, err := net.DialTimeout("tcp", es.addr, 5*time.Second)
+	conn, err := transport.Dial(context.Background(), es.addr, transport.DialConfig{
+		DialTimeout: 5 * time.Second, HandshakeTimeout: 5 * time.Second, Compression: "none",
+	})
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s: %w", es.addr, err)
 	}
@@ -119,7 +124,7 @@ func (es *EventStore) sendCommand(cmd string) (string, error) {
 		return "", err
 	}
 
-	data := EncodeMessage("", cmd)
+	data := []byte(cmd)
 	if err := WriteWithLength(conn, data); err != nil {
 		es.resetConn()
 		return "", fmt.Errorf("write: %w", err)
@@ -141,9 +146,6 @@ func (es *EventStore) CreateTopic(partitions int) error {
 		return err
 	}
 	respStr := strings.TrimSpace(resp)
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return fmt.Errorf("broker: %s", respStr)
-	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return fmt.Errorf("unexpected create response: %s", respStr)
 	}
@@ -171,10 +173,6 @@ func (es *EventStore) Append(key string, expectedVersion uint64, event *Event) (
 		return nil, err
 	}
 
-	if strings.HasPrefix(resp, "ERROR:") {
-		return nil, fmt.Errorf("broker: %s", resp)
-	}
-
 	result, err := parseAppendResponse(resp)
 	if err != nil {
 		return nil, err
@@ -185,9 +183,6 @@ func (es *EventStore) Append(key string, expectedVersion uint64, event *Event) (
 // parseAppendResponse parses "OK version=N offset=N partition=N" into AppendResult.
 func parseAppendResponse(resp string) (*AppendResult, error) {
 	respStr := strings.TrimSpace(resp)
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return nil, fmt.Errorf("broker: %s", respStr)
-	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return nil, fmt.Errorf("unexpected append response: %s", respStr)
 	}
@@ -252,7 +247,7 @@ func (es *EventStore) ReadStreamFrom(key string, fromVersion uint64) (*StreamDat
 		return nil, err
 	}
 
-	data := EncodeMessage("", cmd)
+	data := []byte(cmd)
 	if err := WriteWithLength(conn, data); err != nil {
 		es.resetConn()
 		return nil, fmt.Errorf("write: %w", err)
@@ -325,9 +320,6 @@ func (es *EventStore) SaveSnapshot(key string, version uint64, payload string) e
 		return err
 	}
 	respStr := strings.TrimSpace(resp)
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return fmt.Errorf("broker: %s", respStr)
-	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return fmt.Errorf("unexpected save snapshot response: %s", respStr)
 	}
@@ -367,9 +359,6 @@ func (es *EventStore) StreamVersion(key string) (uint64, error) {
 }
 
 func parseSnapshotResponse(respStr string) (string, bool, error) {
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return "", false, fmt.Errorf("broker: %s", respStr)
-	}
 	if respStr == "OK snapshot=null" {
 		return "", false, nil
 	}
@@ -380,9 +369,6 @@ func parseSnapshotResponse(respStr string) (string, bool, error) {
 }
 
 func parseStreamVersionResponse(respStr string) (uint64, error) {
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return 0, fmt.Errorf("broker: %s", respStr)
-	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return 0, fmt.Errorf("unexpected version response: %s", respStr)
 	}

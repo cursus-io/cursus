@@ -371,6 +371,9 @@ func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool,
 	if atomic.LoadInt32(&d.activeReaders) > 0 {
 		return 0, before, before, errCompactionReadersActive
 	}
+	if err := d.segmentReaders.invalidate(segment); err != nil {
+		return 0, before, before, fmt.Errorf("invalidate compacted segment %d reader: %w", segment, err)
+	}
 
 	directory := filepath.Dir(logPath)
 	if err := replaceCompactedFile(markerTemp, markerPath); err != nil {

@@ -27,6 +27,7 @@ func TestErrorRegistryCoversStaticBrokerEmissions(t *testing.T) {
 		if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
+		// #nosec G122,G304 -- path comes from a repository-controlled source file inventory.
 		data, readErr := os.ReadFile(path)
 		if readErr != nil {
 			return readErr

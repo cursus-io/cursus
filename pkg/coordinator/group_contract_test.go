@@ -2,13 +2,13 @@ package coordinator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -65,7 +65,7 @@ func TestGroupSnapshotRestoresPartitionsBeforeFirstOffsetCommit(t *testing.T) {
 	require.Len(t, assignments, 4)
 
 	restored := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
-	restored.ImportState(c.ExportState())
+	require.NoError(t, restored.ImportState(c.ExportState()))
 
 	status, err := restored.GetGroupStatus("workers")
 	require.NoError(t, err)
@@ -196,38 +196,38 @@ func (r *partitionedOffsetReader) ReadTopicPartition(_ string, partitionID int, 
 	if offset >= uint64(len(records)) {
 		return nil, nil
 	}
-	end := int(offset) + max
+	start, ok := util.SafeUint64ToInt(offset)
+	if !ok {
+		return nil, fmt.Errorf("offset %d exceeds platform index limit", offset)
+	}
+	end := start + max
 	if end > len(records) {
 		end = len(records)
 	}
-	result := make([]types.Message, end-int(offset))
-	copy(result, records[int(offset):end])
+	result := make([]types.Message, end-start)
+	copy(result, records[start:end])
 	return result, nil
 }
 
 func TestLoadOffsetsFromLogIsIndependentOfInternalPartitionOrder(t *testing.T) {
-	oldBulk, err := json.Marshal(BulkOffsetMsg{
-		Group: "workers",
-		Topic: "events",
-		Offsets: []OffsetItem{
-			{Partition: 0, Offset: 10},
-			{Partition: 1, Offset: 7},
-		},
-		Timestamp: time.Now().Add(-time.Minute),
-	})
-	require.NoError(t, err)
-	newSingle, err := json.Marshal(OffsetCommitMessage{
-		Group:     "workers",
-		Topic:     "events",
-		Partition: 0,
-		Offset:    12,
-		Timestamp: time.Now(),
-	})
-	require.NoError(t, err)
+	registration := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
+		Group: "workers", Topic: "events", PartitionCount: 2, Epoch: 1, Timestamp: time.Unix(1, 0).UTC(),
+	}
+	revision1 := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordOffsetSnapshot,
+		Group: "workers", Topic: "events", Epoch: 1, Revision: 1,
+		Offsets: []OffsetItem{{Partition: 0, Offset: 10}, {Partition: 1, Offset: 7}}, Timestamp: time.Unix(2, 0).UTC(),
+	}
+	revision2 := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordOffsetSnapshot,
+		Group: "workers", Topic: "events", Epoch: 1, Revision: 2,
+		Offsets: []OffsetItem{{Partition: 0, Offset: 12}, {Partition: 1, Offset: 7}}, Timestamp: time.Unix(3, 0).UTC(),
+	}
 
 	reader := &partitionedOffsetReader{records: map[int][]types.Message{
-		0: {{Offset: 0, Payload: string(newSingle)}},
-		1: {{Offset: 0, Payload: string(oldBulk)}},
+		0: {encodedMetadataMessage(t, registration, 0), encodedMetadataMessage(t, revision2, 1)},
+		1: {encodedMetadataMessage(t, revision1, 0)},
 	}}
 	c := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
 	require.NoError(t, c.LoadOffsetsFromLog(reader))
@@ -245,18 +245,10 @@ func TestLoadOffsetsFromLogFailsClosedOnInvalidRecord(t *testing.T) {
 	for i := 0; i < 1024; i++ {
 		records[i] = types.Message{Offset: uint64(i), Payload: "invalid"}
 	}
-	valid, err := json.Marshal(OffsetCommitMessage{
-		Group:     "workers",
-		Topic:     "events",
-		Partition: 2,
-		Offset:    19,
-		Timestamp: time.Now(),
-	})
-	require.NoError(t, err)
-	records[1024] = types.Message{Offset: 1024, Payload: string(valid)}
+	records[1024] = types.Message{Offset: 1024, Payload: `{"group":"workers","topic":"events","partition":2,"offset":19}`}
 
 	c := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
-	err = c.LoadOffsetsFromLog(&partitionedOffsetReader{
+	err := c.LoadOffsetsFromLog(&partitionedOffsetReader{
 		records: map[int][]types.Message{0: records},
 	})
 	require.ErrorContains(t, err, "decode internal metadata")
@@ -292,17 +284,18 @@ func (l *discoveringOffsetLog) ExistingPartitionCount(string) (int, error) {
 }
 
 func TestCoordinatorDiscoversExpandedOffsetTopicBeforeReplay(t *testing.T) {
-	payload, err := json.Marshal(OffsetCommitMessage{
-		Group:     "workers",
-		Topic:     "events",
-		Partition: 3,
-		Offset:    27,
-		Timestamp: time.Now(),
-	})
-	require.NoError(t, err)
+	registration := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
+		Group: "workers", Topic: "events", PartitionCount: 4, Epoch: 1, Timestamp: time.Unix(1, 0).UTC(),
+	}
+	snapshot := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordOffsetSnapshot,
+		Group: "workers", Topic: "events", Epoch: 1, Revision: 1,
+		Offsets: []OffsetItem{{Partition: 3, Offset: 27}}, Timestamp: time.Unix(2, 0).UTC(),
+	}
 	log := &discoveringOffsetLog{
 		partitionedOffsetReader: &partitionedOffsetReader{records: map[int][]types.Message{
-			5: {{Offset: 0, Payload: string(payload)}},
+			5: {encodedMetadataMessage(t, registration, 0), encodedMetadataMessage(t, snapshot, 1)},
 		}},
 		partitionCount: 6,
 	}

@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/wire"
 	sdk "github.com/cursus-io/cursus/sdk"
-	"github.com/cursus-io/cursus/util"
 )
 
 type readStreamEnvelope struct {
@@ -31,8 +31,8 @@ func (bc *BrokerClient) CreateEventSourcingTopic(topic string, partitions int) e
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(resp, "ERROR:") && !strings.Contains(resp, "already_exists") && !strings.Contains(resp, "topic_exists") {
-		return fmt.Errorf("broker error: %s", resp)
+	if resp != "OK" && !strings.HasPrefix(resp, "OK ") {
+		return fmt.Errorf("unexpected create response: %s", resp)
 	}
 	return nil
 }
@@ -43,9 +43,6 @@ func (bc *BrokerClient) AppendStream(topic, key string, expectedNextVersion uint
 	if err != nil {
 		return "", err
 	}
-	if strings.HasPrefix(resp, "ERROR:") {
-		return "", fmt.Errorf("broker error: %s", resp)
-	}
 	return resp, nil
 }
 
@@ -54,9 +51,6 @@ func (bc *BrokerClient) StreamVersion(topic, key string) (uint64, error) {
 	resp, err := bc.SendCommand(topic, cmd, 5*time.Second)
 	if err != nil {
 		return 0, err
-	}
-	if strings.HasPrefix(resp, "ERROR:") {
-		return 0, fmt.Errorf("broker error: %s", resp)
 	}
 	if strings.HasPrefix(resp, "OK") {
 		for _, part := range strings.Fields(resp) {
@@ -70,11 +64,7 @@ func (bc *BrokerClient) StreamVersion(topic, key string) (uint64, error) {
 		}
 		return 0, fmt.Errorf("missing version in response: %s", resp)
 	}
-	var version uint64
-	if n, scanErr := fmt.Sscanf(resp, "%d", &version); scanErr != nil || n != 1 {
-		return 0, fmt.Errorf("unexpected version response: %s", resp)
-	}
-	return version, nil
+	return 0, fmt.Errorf("unexpected version response: %s", resp)
 }
 
 func (bc *BrokerClient) ReadStream(topic, key string, fromVersion uint64) (*readStreamEnvelope, []types.Message, error) {
@@ -87,18 +77,37 @@ func (bc *BrokerClient) ReadStream(topic, key string, fromVersion uint64) (*read
 		return nil, nil, err
 	}
 	defer func() { _ = conn.Close() }()
-
-	cmd := fmt.Sprintf("READ_STREAM topic=%s key=%s from_version=%d", topic, key, fromVersion)
-	if err := util.WriteWithLength(conn, util.EncodeMessage(topic, cmd)); err != nil {
-		return nil, nil, fmt.Errorf("send read stream: %w", err)
-	}
-	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return nil, nil, err
 	}
-	envelopeBytes, err := util.ReadWithLength(conn)
+	connection, err := wire.ClientHandshake(conn, []wire.Compression{wire.CompressionNone})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cmd := fmt.Sprintf("READ_STREAM topic=%s key=%s from_version=%d", topic, key, fromVersion)
+	command, request, err := wire.ParseCommandText(cmd)
+	if err != nil {
+		return nil, nil, err
+	}
+	payload, err := wire.EncodeCommandPayload(request)
+	if err != nil {
+		return nil, nil, err
+	}
+	const requestID = 1
+	if err := connection.WriteFrame(wire.Frame{
+		Kind: wire.KindRequest, Command: command, RequestID: requestID, Payload: payload,
+	}); err != nil {
+		return nil, nil, fmt.Errorf("send read stream: %w", err)
+	}
+	envelopeFrame, err := connection.ReadFrame()
 	if err != nil {
 		return nil, nil, fmt.Errorf("read envelope: %w", err)
 	}
+	if envelopeFrame.Command != command || envelopeFrame.RequestID != requestID || envelopeFrame.Status != wire.StatusOK {
+		return nil, nil, fmt.Errorf("unexpected read-stream envelope frame: %+v", envelopeFrame)
+	}
+	envelopeBytes := envelopeFrame.Payload
 	var envelope readStreamEnvelope
 	if err := json.Unmarshal(envelopeBytes, &envelope); err != nil {
 		return nil, nil, fmt.Errorf("decode envelope %q: %w", string(envelopeBytes), err)
@@ -106,11 +115,14 @@ func (bc *BrokerClient) ReadStream(topic, key string, fromVersion uint64) (*read
 	if envelope.Status == "ERROR" {
 		return &envelope, nil, fmt.Errorf("broker error: %s", string(envelopeBytes))
 	}
-	batchBytes, err := util.ReadWithLength(conn)
+	batchFrame, err := connection.ReadFrame()
 	if err != nil {
 		return &envelope, nil, fmt.Errorf("read batch: %w", err)
 	}
-	batch, err := util.DecodeBatchMessages(batchBytes)
+	if batchFrame.Command != command || batchFrame.RequestID != requestID || batchFrame.Status != wire.StatusOK {
+		return &envelope, nil, fmt.Errorf("unexpected read-stream batch frame: %+v", batchFrame)
+	}
+	batch, err := wire.DecodeBatch(batchFrame.Payload)
 	if err != nil {
 		return &envelope, nil, fmt.Errorf("decode batch: %w", err)
 	}

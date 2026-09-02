@@ -6,8 +6,8 @@ The server package owns client/internal listeners, bounded connection handling, 
 
 | Interface | Default | Contract |
 |---|---:|---|
-| Client TCP | 9000 | 4-byte big-endian length-prefixed commands and binary frames; optional TLS. |
-| Health HTTP | 9080 | `/live`, `/ready`, backward-compatible `/health` and `/`. |
+| Client TCP | 9000 | Required Wire v2 handshake followed by correlated 32-byte-header `CRS2` frames; optional TLS. |
+| Health HTTP | 9080 | `/live` and `/ready`. |
 | Metrics HTTP | 9100 | Prometheus scrape endpoint when enabled. |
 | Internal broker TCP | configured separately | Broker-only replication/Raft/snapshot commands; token and/or mTLS authenticated. |
 
@@ -17,24 +17,23 @@ The client port is not an HTTP API. Health and metrics endpoints do not expose b
 
 The client listener uses a bounded pool of 1000 workers and a buffered connection queue. Each accepted connection can carry multiple framed requests until disconnect, deadline, stream handoff, context cancellation, or protocol error.
 
-For each frame the server:
+Each connection first completes the required Wire v2 negotiation. For every later frame the server:
 
-1. reads and validates the 4-byte length,
-2. reads the exact payload and applies configured decompression,
-3. establishes/updates `ClientContext` authentication and negotiation state,
-4. detects a documented command,
+1. validates the fixed 32-byte `CRS2` header, protocol version, request ID, lengths, and CRC32C,
+2. reads and decompresses the exact payload with the negotiated algorithm,
+3. establishes or updates the authenticated `ClientContext`,
+4. decodes the command ID and deterministic `CRQ2` fields or `CBV2` batch,
 5. dispatches through `CommandHandler`,
-6. writes a length-prefixed text/JSON response or hands off binary consume/stream frames.
+6. writes a correlated success, typed error, or consume/stream frame.
 
 Unknown commands return structured errors. The server does not expose the removed `SUBSCRIBE` text command; embedded fan-out registration is an in-process API, while network consumers use groups plus `CONSUME`/`STREAM`.
 
 ## Response Modes
 
-- Text successes: `OK` or `OK key=value ...`.
-- Text failures: `ERROR: <code> class=<class> retryable=<bool> ...` after enrichment.
-- JSON envelopes/acks: documented commands only.
-- Poll consume: binary record frames for the requested batch.
-- Stream: binary batches, keepalives, and `STREAM_CONTROL` close/error frames.
+- Command successes use the documented `CRQ2`, JSON, or batch payload for that command.
+- Failures use the Wire v2 typed error payload with explicit class and retryability.
+- Poll consume returns correlated binary record frames for the requested batch.
+- Streams use correlated batches, keepalives, and control/end frames.
 
 A broker/network crash can close TCP without a stream terminator. SDKs treat that as retryable and resume from the broker committed group offset.
 
@@ -62,7 +61,6 @@ Distributed production deployments should configure a dedicated internal broker 
 |---|---|
 | `/live` | Process and health handler are alive. |
 | `/ready` | Listener initialization and required dynamic broker/cluster dependencies are ready. |
-| `/health`, `/` | Compatibility readiness aliases. |
 
 A distributed broker can be live but not ready while it has no resolvable Raft leader or required authority. Metrics startup/bind errors are surfaced during initialization rather than silently ignored.
 

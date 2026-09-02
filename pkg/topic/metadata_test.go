@@ -72,13 +72,13 @@ func TestStandaloneTopicMetadataRestoresDefinitionAndData(t *testing.T) {
 	require.Equal(t, config.CleanupPolicyCompact, handler.(*disk.DiskHandler).CleanupPolicy())
 }
 
-func TestStandaloneLegacyManifestWithoutMinInSyncReplicasRestoresBrokerFallback(t *testing.T) {
+func TestStandaloneManifestWithoutMinInSyncReplicasUsesBrokerFallback(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
 	cfg.MinInSyncReplicas = 2
 	dm := disk.NewDiskManager(cfg)
 	manager := NewTopicManager(cfg, dm, nil)
-	require.NoError(t, manager.CreateTopic("legacy", 1, false, false))
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
 	manifest, err := os.ReadFile(filepath.Join(cfg.LogDir, TopicMetadataFileName))
 	require.NoError(t, err)
 	require.NotContains(t, string(manifest), "min_in_sync_replicas")
@@ -90,7 +90,7 @@ func TestStandaloneLegacyManifestWithoutMinInSyncReplicasRestoresBrokerFallback(
 	restarted := NewTopicManager(cfg, restartedDM, nil)
 	require.NoError(t, restarted.RestoreTopics())
 	defer closeTopicManager(restarted)
-	policy := restarted.GetTopic("legacy").Policy
+	policy := restarted.GetTopic("orders").Policy
 	require.Nil(t, policy.MinInSyncReplicas)
 	require.Equal(t, 2, policy.EffectiveMinInSyncReplicas(cfg.MinInSyncReplicas))
 }
@@ -125,7 +125,7 @@ func TestStandaloneTopicMetadataPersistsGrowthAndDeletion(t *testing.T) {
 	require.Equal(t, uint64(2), restarted.GetTopic("sessions").Revision)
 }
 
-func TestStandaloneTopicMetadataMigratesVersionOneDefinitionDefaults(t *testing.T) {
+func TestStandaloneTopicMetadataRejectsVersionOne(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
 	cfg.RetentionCheckIntervalMS = 60_000
@@ -133,44 +133,26 @@ func TestStandaloneTopicMetadataMigratesVersionOneDefinitionDefaults(t *testing.
 
 	dm := disk.NewDiskManager(cfg)
 	manager := NewTopicManager(cfg, dm, nil)
-	require.NoError(t, manager.CreateTopic("legacy", 1, false, false))
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
 	closeTopicManager(manager)
 	dm.CloseAllHandlers()
 
 	manifestPath := filepath.Join(cfg.LogDir, TopicMetadataFileName)
+	// #nosec G304 -- manifestPath is fixed beneath this test's temporary log directory.
 	raw, err := os.ReadFile(manifestPath)
 	require.NoError(t, err)
-	var legacy map[string]any
-	require.NoError(t, json.Unmarshal(raw, &legacy))
-	legacy["version"] = float64(1)
-	topics := legacy["topics"].([]any)
-	definition := topics[0].(map[string]any)
-	delete(definition, "revision")
-	delete(definition, "replication_factor")
-	raw, err = json.Marshal(legacy)
+	var manifest map[string]any
+	require.NoError(t, json.Unmarshal(raw, &manifest))
+	manifest["version"] = float64(1)
+	raw, err = json.Marshal(manifest)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(manifestPath, raw, 0o600))
 
 	restartedDM := disk.NewDiskManager(cfg)
 	defer restartedDM.CloseAllHandlers()
 	restarted := NewTopicManager(cfg, restartedDM, nil)
-	require.NoError(t, restarted.RestoreTopics())
-	defer closeTopicManager(restarted)
-	restored := restarted.GetTopic("legacy")
-	require.NotNil(t, restored)
-	require.Equal(t, DefaultReplicationFactor, restored.ReplicationFactor)
-	require.Equal(t, uint64(InitialDefinitionRevision), restored.Revision)
-
-	policy := restored.Policy
-	policy.RetentionHours = 24
-	require.NoError(t, restarted.CreateTopicWithPolicy("legacy", 1, false, false, policy))
-	raw, err = os.ReadFile(manifestPath)
-	require.NoError(t, err)
-	var migrated topicMetadataManifest
-	require.NoError(t, json.Unmarshal(raw, &migrated))
-	require.Equal(t, 2, migrated.Version, "first-generation metadata remains readable by the previous release")
-	require.Equal(t, uint64(2), migrated.Topics[0].Revision)
-	require.Equal(t, DefaultReplicationFactor, migrated.Topics[0].ReplicationFactor)
+	require.ErrorContains(t, restarted.RestoreTopics(), "clean bootstrap required")
+	require.Empty(t, restarted.ListTopics())
 }
 
 func TestStandaloneTopicMetadataCorruptionFailsClosed(t *testing.T) {
@@ -190,17 +172,17 @@ func TestStandaloneTopicMetadataCorruptionFailsClosed(t *testing.T) {
 	require.Empty(t, manager.ListTopics())
 }
 
-func TestStandaloneTopicMetadataVersionTwoRequiresRevisionAndReplicationFactor(t *testing.T) {
-	for _, missing := range []string{"revision", "replication_factor"} {
+func TestStandaloneTopicMetadataVersionThreeRequiresAuthoritativeFields(t *testing.T) {
+	for _, missing := range []string{"revision", "replication_factor", "lifecycle_epoch"} {
 		t.Run(missing, func(t *testing.T) {
 			cfg := config.DefaultConfig()
 			cfg.LogDir = t.TempDir()
 			definition := map[string]any{
-				"name": "orders", "revision": 1, "partitions": 1, "replication_factor": 3,
+				"name": "orders", "revision": 1, "lifecycle_epoch": 1, "partitions": 1, "replication_factor": 3,
 				"idempotent": false, "event_sourcing": false, "policy": DefaultPolicy(),
 			}
 			delete(definition, missing)
-			manifest, err := json.Marshal(map[string]any{"version": 2, "topics": []any{definition}})
+			manifest, err := json.Marshal(map[string]any{"version": topicMetadataFormatVersion, "topics": []any{definition}})
 			require.NoError(t, err)
 			require.NoError(t, os.WriteFile(filepath.Join(cfg.LogDir, TopicMetadataFileName), manifest, 0o600))
 

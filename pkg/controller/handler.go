@@ -12,6 +12,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/eventsource"
 	"github.com/cursus-io/cursus/pkg/metrics"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
@@ -126,9 +127,6 @@ func NewCommandHandler(
 	ch.commands = []commandEntry{
 		{prefix: "AUTH ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAuth(cmd, ctx) }},
 		{prefix: "HELP", exact: true, helpOrder: 38, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHelp() }},
-		{prefix: "PROTOCOL_INFO", exact: true, helpOrder: 33, handler: func(cmd string, ctx *ClientContext) string { return ch.handleProtocolInfo() }},
-		{prefix: "NEGOTIATE", exact: true, helpOrder: 34, handler: func(cmd string, ctx *ClientContext) string { return ch.handleNegotiate(cmd, ctx) }},
-		{prefix: "NEGOTIATE ", exact: false, handler: func(cmd string, ctx *ClientContext) string { return ch.handleNegotiate(cmd, ctx) }},
 		{prefix: "LIST_CLUSTER", exact: true, helpOrder: 35, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListCluster() }},
 		{prefix: "CLUSTER_STATUS", exact: true, helpOrder: 36, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleClusterStatus() }},
 		{prefix: "ELECT_LEADER ", exact: false, helpOrder: 37, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleElectLeader(cmd, ctx) }},
@@ -182,7 +180,7 @@ func NewCommandHandler(
 
 func (ch *CommandHandler) logCommandResult(cmd, response string) {
 	status := "SUCCESS"
-	if strings.HasPrefix(response, "ERROR:") {
+	if protocol.IsErrorResponse(response) {
 		status = "FAILURE"
 	}
 	cleanCmd := redactCommandSecrets(cmd)
@@ -268,7 +266,7 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 	}()
 
 	if cmd == "" {
-		resp := decorateProtocolResponse("ERROR: empty_command", ctx)
+		resp := "ERROR: empty_command"
 		ch.logCommandResult(rawCmd, resp)
 		return resp
 	}
@@ -290,7 +288,7 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 		}
 	}
 
-	response = decorateProtocolResponse(ch.handleCommandByType(input, ctx), ctx)
+	response = ch.handleCommandByType(input, ctx)
 	ch.logCommandResult(rawCmd, response)
 	return response
 }

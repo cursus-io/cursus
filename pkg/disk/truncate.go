@@ -20,6 +20,12 @@ func (d *DiskHandler) TruncateTo(nextOffset uint64) error {
 
 	d.maintenanceMu.Lock()
 	defer d.maintenanceMu.Unlock()
+	if readers := atomic.LoadInt32(&d.activeReaders); readers != 0 {
+		return fmt.Errorf("cannot truncate with %d active reader(s)", readers)
+	}
+	if err := d.segmentReaders.invalidateAll(); err != nil {
+		return fmt.Errorf("invalidate segment reader cache before truncation: %w", err)
+	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()

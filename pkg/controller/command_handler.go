@@ -7,23 +7,16 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
-)
-
-var (
-	regexMu      sync.RWMutex
-	regexCache   = make(map[string]*regexp.Regexp)
-	maxCacheSize = 1024
 )
 
 // handleCreate processes CREATE command
@@ -101,184 +94,6 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 	}
 	definition := t.Definition()
 	return formatTopicDefinitionResponse(definition) + " " + ch.topicMinISRMetadata(definition.Policy)
-}
-
-func distributedTopicCommandPayload(defaults topic.Definition, patch topic.DefinitionPatch, current *topic.Definition) (map[string]interface{}, error) {
-	base := defaults
-	existing := false
-	if current != nil {
-		base = *current
-		existing = true
-	}
-	legacyDefinition, err := topic.MergeDefinitionPatch(base, patch, existing)
-	if err != nil {
-		return nil, err
-	}
-	if legacyDefinition.Policy.MinInSyncReplicas != nil && *legacyDefinition.Policy.MinInSyncReplicas > legacyDefinition.ReplicationFactor {
-		return nil, fmt.Errorf("min_in_sync_replicas %d exceeds replication factor %d", *legacyDefinition.Policy.MinInSyncReplicas, legacyDefinition.ReplicationFactor)
-	}
-	return map[string]interface{}{
-		"name":               legacyDefinition.Name,
-		"partitions":         legacyDefinition.Partitions,
-		"idempotent":         legacyDefinition.Idempotent,
-		"event_sourcing":     legacyDefinition.EventSourcing,
-		"replication_factor": legacyDefinition.ReplicationFactor,
-		"policy":             legacyDefinition.Policy,
-		"definition":         defaults,
-		"patch":              patch,
-	}, nil
-}
-
-func parseTopicDefinitionPatch(args map[string]string) (topic.DefinitionPatch, string) {
-	var patch topic.DefinitionPatch
-	if value, ok := args["partitions"]; ok {
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed <= 0 {
-			return patch, "ERROR: invalid_partitions reason=\"must be a positive integer\""
-		}
-		patch.Partitions = &parsed
-	}
-	if value, ok := args["replication_factor"]; ok {
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed <= 0 {
-			return patch, "ERROR: invalid_replication_factor reason=\"must be a positive integer\""
-		}
-		patch.ReplicationFactor = &parsed
-	}
-	if value, ok := args["idempotent"]; ok {
-		parsed, valid := parseCreateBool(value)
-		if !valid {
-			return patch, fmt.Sprintf("ERROR: invalid_idempotent value=%q", value)
-		}
-		patch.Idempotent = &parsed
-	}
-	if value, ok := args["event_sourcing"]; ok {
-		parsed, valid := parseCreateBool(value)
-		if !valid {
-			return patch, fmt.Sprintf("ERROR: invalid_event_sourcing value=%q", value)
-		}
-		patch.EventSourcing = &parsed
-	}
-	if value, ok := args["min_in_sync_replicas"]; ok {
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 1 {
-			return patch, fmt.Sprintf("ERROR: invalid_min_in_sync_replicas value=%s", value)
-		}
-		patch.MinInSyncReplicas = &parsed
-	}
-	if value, ok := args["cleanup_policy"]; ok {
-		if _, valid := config.NormalizeCleanupPolicy(value); !valid {
-			return patch, fmt.Sprintf("ERROR: invalid_topic_policy field=cleanup_policy reason=%q", "invalid cleanup policy "+value)
-		}
-		patch.CleanupPolicy = &value
-	}
-	if value, ok := args["retention_hours"]; ok {
-		parsed, err := strconv.Atoi(value)
-		if err != nil {
-			return patch, fmt.Sprintf("ERROR: invalid_retention_hours value=%s", value)
-		}
-		patch.RetentionHours = &parsed
-	}
-	if value, ok := args["retention_bytes"]; ok {
-		parsed, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return patch, fmt.Sprintf("ERROR: invalid_retention_bytes value=%s", value)
-		}
-		patch.RetentionBytes = &parsed
-	}
-	if value, ok := args["partitioner"]; ok {
-		switch strings.ToLower(strings.TrimSpace(value)) {
-		case topic.PartitionerHashKey, topic.PartitionerRoundRobin:
-			patch.Partitioner = &value
-		default:
-			return patch, fmt.Sprintf("ERROR: invalid_topic_policy field=partitioner reason=%q", "invalid partitioner "+value)
-		}
-	}
-	if value, ok := args["auth_policy"]; ok {
-		switch strings.ToLower(strings.TrimSpace(value)) {
-		case topic.AuthPolicyOpen, topic.AuthPolicyDenyWrite, topic.AuthPolicyDenyRead, topic.AuthPolicyACL:
-			patch.AuthPolicy = &value
-		default:
-			return patch, fmt.Sprintf("ERROR: invalid_topic_policy field=auth_policy reason=%q", "invalid auth policy "+value)
-		}
-	}
-	if value, ok := args["read_acl"]; ok {
-		parsed := parseACLArg(value)
-		patch.ReadACL = &parsed
-	}
-	if value, ok := args["write_acl"]; ok {
-		parsed := parseACLArg(value)
-		patch.WriteACL = &parsed
-	}
-	return patch, ""
-}
-
-func parseCreateBool(value string) (bool, bool) {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "true":
-		return true, true
-	case "false":
-		return false, true
-	default:
-		return false, false
-	}
-}
-
-func formatCreateTopicError(topicName string, err error) string {
-	reason := err.Error()
-	switch {
-	case strings.Contains(reason, "cleanup policy compact is not supported in distributed mode"):
-		return `ERROR: unsupported_topic_policy field=cleanup_policy reason="compaction is not supported in distributed mode"`
-	case strings.Contains(reason, "cleanup policy compact is not supported for event-sourcing topics"):
-		return `ERROR: invalid_topic_policy field=cleanup_policy reason="compaction is not supported for event-sourcing topics"`
-	case strings.Contains(reason, "min_in_sync_replicas"):
-		return fmt.Sprintf("ERROR: invalid_min_in_sync_replicas reason=%q", reason)
-	case strings.Contains(reason, "invalid cleanup policy"),
-		strings.Contains(reason, "invalid partitioner"),
-		strings.Contains(reason, "invalid auth policy"),
-		strings.Contains(reason, "retention_hours"),
-		strings.Contains(reason, "retention_bytes"):
-		return fmt.Sprintf("ERROR: invalid_topic_policy reason=%q", reason)
-	default:
-		return fmt.Sprintf("ERROR: create_topic_failed topic=%s reason=%q", topicName, reason)
-	}
-}
-
-func formatTopicDefinitionResponse(definition topic.Definition) string {
-	return fmt.Sprintf(
-		"OK topic=%s partitions=%d cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d revision=%d replication_factor=%d idempotent=%t event_sourcing=%t lifecycle_epoch=%d",
-		definition.Name,
-		definition.Partitions,
-		definition.Policy.CleanupPolicy,
-		definition.Policy.Partitioner,
-		definition.Policy.AuthPolicy,
-		strings.Join(definition.Policy.ReadACL, ","),
-		strings.Join(definition.Policy.WriteACL, ","),
-		definition.Policy.RetentionHours,
-		definition.Policy.RetentionBytes,
-		definition.Revision,
-		definition.ReplicationFactor,
-		definition.Idempotent,
-		definition.EventSourcing,
-		definition.LifecycleEpoch,
-	)
-}
-
-func parseACLArg(value string) []string {
-	if strings.TrimSpace(value) == "" {
-		// Keep an allocated empty slice so the distributed JSON command encodes
-		// [] rather than null. Decoding null into *[]string loses field presence.
-		return []string{}
-	}
-	parts := strings.Split(value, ",")
-	acl := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			acl = append(acl, part)
-		}
-	}
-	return acl
 }
 
 // handleDelete processes DELETE command
@@ -536,7 +351,9 @@ func (ch *CommandHandler) applyStandaloneTopicDependencyCleanup(topicName string
 				return fmt.Errorf("rewrite transaction journal for topic deletion: %w", err)
 			}
 		}
-		ch.TxnManager.ImportState(transactionState)
+		if err := ch.TxnManager.ImportState(transactionState); err != nil {
+			return fmt.Errorf("install transaction state for topic deletion: %w", err)
+		}
 	}
 	return nil
 }
@@ -653,11 +470,16 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 
 	var assignments []int
 	if ch.isDistributed() {
+		topicRef := ch.TopicManager.GetTopic(topicName)
+		if topicRef == nil {
+			return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+		}
 		joinPayload := map[string]interface{}{
-			"type":   "JOIN",
-			"group":  groupName,
-			"member": consumerID,
-			"topic":  topicName,
+			"type":            "JOIN",
+			"group":           groupName,
+			"member":          consumerID,
+			"topic":           topicName,
+			"partition_count": len(topicRef.Partitions),
 		}
 
 		_, err := ch.applyViaLeader("GROUP_SYNC", joinPayload)
@@ -1076,7 +898,6 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 
 	if ch.isDistributed() {
 		payload := map[string]interface{}{
-			"type":       "COMMIT",
 			"group":      groupID,
 			"topic":      offsetTopic,
 			"member":     memberID,
@@ -1098,7 +919,7 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	return "OK"
 }
 
-// handleBatchCommit processes BATCH_COMMIT topic=T1 group=G1 generation=1 member=M1 P0:10,P1:20...
+// handleBatchCommit processes BATCH_COMMIT topic=T1 group=G1 generation=1 member=M1 offsets=P0:10,P1:20...
 func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 	args := parseKeyValueArgs(cmd[13:])
 
@@ -1140,38 +961,22 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 		}
 	}
 
-	partsIdx := strings.LastIndex(cmd, " ")
-	if partsIdx == -1 {
+	partitionData := args["offsets"]
+	if partitionData == "" {
 		return "ERROR: invalid_batch_commit_format"
 	}
+	pairs, pairErr := wire.DecodeOffsetPairs(partitionData)
+	if pairErr != nil {
+		return fmt.Sprintf("ERROR: invalid_batch_commit_entry reason=%q", pairErr.Error())
+	}
 
-	partitionData := cmd[partsIdx+1:]
-	partitionPairs := strings.Split(partitionData, ",")
-
-	var offsetList []coordinator.OffsetItem
-	for _, pair := range partitionPairs {
-		pair = strings.TrimSpace(pair)
-		kv := strings.Split(pair, ":")
-		if len(kv) != 2 {
-			return fmt.Sprintf("ERROR: invalid_batch_commit_entry entry=%q", pair)
-		}
-		if !strings.HasPrefix(kv[0], "P") {
-			return fmt.Sprintf("ERROR: invalid_partition entry=%q", pair)
-		}
-		partStr := strings.TrimPrefix(kv[0], "P")
-		p, err := strconv.Atoi(partStr)
-		if err != nil || p < 0 {
-			return fmt.Sprintf("ERROR: invalid_partition entry=%q", pair)
-		}
-		o, err := strconv.ParseUint(kv[1], 10, 64)
-		if err != nil {
-			return fmt.Sprintf("ERROR: invalid_offset entry=%q", pair)
-		}
-		if errResp := ch.ValidateOwnershipFailure(groupID, memberID, generation, p); errResp != "" {
-			util.Warn("Batch commit ownership rejected for partition %d: %s", p, errResp)
+	offsetList := make([]coordinator.OffsetItem, 0, len(pairs))
+	for _, pair := range pairs {
+		if errResp := ch.ValidateOwnershipFailure(groupID, memberID, generation, pair.Partition); errResp != "" {
+			util.Warn("Batch commit ownership rejected for partition %d: %s", pair.Partition, errResp)
 			return errResp
 		}
-		offsetList = append(offsetList, coordinator.OffsetItem{Partition: p, Offset: o})
+		offsetList = append(offsetList, coordinator.OffsetItem{Partition: pair.Partition, Offset: pair.Offset})
 	}
 
 	if len(offsetList) == 0 {
@@ -1181,7 +986,6 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 
 	if ch.isDistributed() {
 		batchCommitData := map[string]interface{}{
-			"type":       "BATCH_COMMIT",
 			"group":      groupID,
 			"topic":      offsetTopic,
 			"member":     memberID,
@@ -1204,133 +1008,6 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 
 	return fmt.Sprintf("OK batched=%d", len(offsetList))
 }
-func (ch *CommandHandler) resolveGroupOffsetTopic(groupName, topicName string) (string, string) {
-	if ch.Coordinator == nil {
-		return topicName, ""
-	}
-	group := ch.Coordinator.GetGroup(groupName)
-	if group == nil {
-		return topicName, ""
-	}
-	offsetTopic, ok := resolveOffsetTopic(group.TopicName, topicName)
-	if !ok {
-		return "", fmt.Sprintf("ERROR: topic_not_assigned_to_group expected=%s actual=%s", group.TopicName, topicName)
-	}
-	return offsetTopic, ""
-}
-
-func resolveOffsetTopic(groupTopic, requestedTopic string) (string, bool) {
-	if groupTopic == requestedTopic {
-		return requestedTopic, true
-	}
-	if isTopicMatched(groupTopic, requestedTopic) {
-		return requestedTopic, true
-	}
-	if isTopicMatched(requestedTopic, groupTopic) {
-		return groupTopic, true
-	}
-	return "", false
-}
-
-func formatReplicatedGroupError(err error, fallbackCode string) string {
-	msg := err.Error()
-	if idx := strings.Index(msg, "ERROR:"); idx >= 0 {
-		return msg[idx:]
-	}
-	return fmt.Sprintf("ERROR: %s reason=%q", fallbackCode, msg)
-}
-
-func formatCoordinatorError(err error) string {
-	if err == nil {
-		return "OK"
-	}
-	msg := err.Error()
-	if strings.HasPrefix(msg, "ERROR:") {
-		return msg
-	}
-	if strings.Contains(msg, "offset regression") {
-		return fmt.Sprintf("ERROR: offset_regression reason=%q", msg)
-	}
-	if strings.Contains(msg, "not found") {
-		return fmt.Sprintf("ERROR: group_not_found reason=%q", msg)
-	}
-	return fmt.Sprintf("ERROR: coordinator_error reason=%q", msg)
-}
-
-// resolveOffset determines the starting offset for a consumer
-func (ch *CommandHandler) resolveOffset(p *topic.Partition, topicName string, cArgs CommonArgs) (uint64, error) {
-	if ch.Coordinator != nil {
-		savedOffset, isFind := ch.Coordinator.GetOffset(cArgs.GroupName, topicName, cArgs.PartitionID)
-		if isFind {
-			return savedOffset, nil
-		}
-	}
-
-	if cArgs.HasOffset {
-		util.Debug("Using explicitly requested offset %d", cArgs.Offset)
-		return cArgs.Offset, nil
-	}
-
-	if cArgs.AutoOffsetReset == "latest" {
-		latest := p.OffsetRange().Latest
-		util.Debug("Reset policy 'latest': starting at %d", latest)
-		return latest, nil
-	}
-
-	util.Debug("Reset policy 'earliest': starting at 0")
-	return 0, nil
-}
-
-func (ch *CommandHandler) ValidateOwnership(groupName, memberID string, generation int, partition int) bool {
-	return ch.ValidateOwnershipFailure(groupName, memberID, generation, partition) == ""
-}
-
-func (ch *CommandHandler) ValidateOwnershipFailure(groupName, memberID string, generation int, partition int) string {
-	if ch.Coordinator == nil {
-		util.Debug("failed to validate ownership: Coordinator is nil.")
-		return "ERROR: coordinator_not_available"
-	}
-	return ch.Coordinator.ValidateOwnershipFailure(groupName, memberID, generation, partition)
-}
-func isTopicMatched(pattern, topicName string) bool {
-	if pattern == topicName {
-		return true
-	}
-	if strings.Contains(pattern, "*") || strings.Contains(pattern, "?") {
-		return match(pattern, topicName)
-	}
-	return false
-}
-
-func match(p, t string) bool {
-	regexMu.RLock()
-	cachedRe, ok := regexCache[p]
-	regexMu.RUnlock()
-
-	if ok {
-		return cachedRe.MatchString(t)
-	}
-
-	escaped := regexp.QuoteMeta(p)
-	regexPattern := strings.ReplaceAll(escaped, `\*`, ".*")
-	regexPattern = strings.ReplaceAll(regexPattern, `\?`, ".")
-
-	newRe, err := regexp.Compile("^" + regexPattern + "$")
-	if err != nil {
-		util.Error("Regex compile error for pattern %s: %v", p, err)
-		return false
-	}
-
-	regexMu.Lock()
-	if len(regexCache) >= maxCacheSize {
-		regexCache = make(map[string]*regexp.Regexp)
-	}
-	regexCache[p] = newRe
-	regexMu.Unlock()
-
-	return newRe.MatchString(t)
-}
-
 func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 	args := parseKeyValueArgs(cmd[17:]) // len("FIND_COORDINATOR ") = 17
 	coordKey := args["group"]
@@ -1374,8 +1051,7 @@ func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 			}
 		}
 
-		encodedCmd := util.EncodeMessage("", cmd)
-		resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, string(encodedCmd))
+		resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, cmd)
 		if fwdErr != nil {
 			return fmt.Sprintf("ERROR: forward_to_coordinator_failed reason=%q", fwdErr.Error())
 		}

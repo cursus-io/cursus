@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/wire"
 )
 
 func TestAppendMessageTimeoutDoesNotReserveOffset(t *testing.T) {
@@ -62,7 +63,7 @@ func TestDiskAndWireMessageLimitsStayAligned(t *testing.T) {
 	if MaxMessageSize <= 0 {
 		t.Fatal("maximum message size must be positive")
 	}
-	if MaxMessageSize != 16*1024*1024 {
+	if MaxMessageSize != wire.MaxFramePayload {
 		t.Fatalf("unexpected durable message limit %d", MaxMessageSize)
 	}
 }

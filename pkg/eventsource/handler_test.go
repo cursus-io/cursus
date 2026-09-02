@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/stream"
@@ -116,7 +115,7 @@ func (fp *fakeHandlerProvider) GetHandler(topicName string, partitionID int) (ty
 
 type fakeStreamManager struct{}
 
-func (f *fakeStreamManager) AddStream(_ string, _ *stream.StreamConnection, _ func(uint64, int) ([]types.Message, error), _ time.Duration) error {
+func (f *fakeStreamManager) AddStream(_ string, _ *stream.StreamConnection, _ func(uint64, int) ([]types.Message, error)) error {
 	return nil
 }
 func (f *fakeStreamManager) RemoveStream(_ string) {}
@@ -406,18 +405,18 @@ func TestHandler_HandleStreamVersion_Validation(t *testing.T) {
 func TestHandler_HandleReadStreamRejectsInvalidFromVersion(t *testing.T) {
 	h := NewHandler(nil)
 	client, server := net.Pipe()
-	defer client.Close()
+	t.Cleanup(func() { _ = client.Close() })
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		defer server.Close()
+		defer func() { _ = server.Close() }()
 		h.HandleReadStream("READ_STREAM topic=orders key=order-1 from_version=invalid", server)
 	}()
 
 	payload, err := util.ReadWithLength(client)
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"status\":\"ERROR\",\"error\":\"invalid_from_version\"}", string(payload))
+	require.Equal(t, "ERROR: invalid_from_version", string(payload))
 	<-done
 }
 func TestHandler_HandleSaveSnapshot_Validation(t *testing.T) {

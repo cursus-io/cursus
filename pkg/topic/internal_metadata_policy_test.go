@@ -8,23 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestManifestMigrationCanonicalizesInternalConsumerMetadataPolicy(t *testing.T) {
-	applicationPolicy := DefaultPolicy()
-	applicationPolicy.CleanupPolicy = config.CleanupPolicyDelete
-	applicationPolicy.RetentionHours = 1
-	applicationPolicy.RetentionBytes = 1
-	normalized, _, err := normalizeAndMarshalManifest([]Definition{{
-		Name: config.ConsumerOffsetsTopicName, Partitions: 4, Policy: applicationPolicy,
-	}})
-	require.NoError(t, err)
-	require.Len(t, normalized, 1)
-	require.Equal(t, ConsumerMetadataPolicy(), normalized[0].Policy)
-
-	_, _, err = normalizeAndMarshalManifest([]Definition{{
-		Name: config.ConsumerOffsetsTopicName, Partitions: 4, Idempotent: true, Policy: applicationPolicy,
-	}})
-	require.ErrorContains(t, err, "internal consumer metadata mode")
-}
 func TestInternalConsumerMetadataPolicyCannotBeOverriddenOrDeleted(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

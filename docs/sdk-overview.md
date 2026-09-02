@@ -1,6 +1,6 @@
 # SDK Overview
 
-Cursus maintains one wire contract across the in-repository Go SDK and the separately released Java and Python SDKs. Broker changes are SDK-complete only after each affected client has matching contract tests and a compatible release.
+Cursus defines one Wire v2 contract. The in-repository Go SDK is changed and tested atomically with the broker. Separately released Java and Python SDKs must migrate to Wire v2 before they can connect; this repository does not provide an older protocol mode for them.
 
 ## SDK Ecosystem
 
@@ -28,19 +28,19 @@ flowchart LR
 
 ## Wire Protocol Compatibility
 
-All SDKs implement the same wire protocol:
+Every supported SDK must implement the same wire protocol:
 
 ```mermaid
 flowchart TB
     subgraph "Wire Protocol"
-        FRAME["4-byte length prefix + payload"]
-        BATCH["Batch: magic 0xBA7C + header + messages"]
-        CMD["Commands: key=value text format"]
+        FRAME["Wire v2: 32-byte CRS2 header + payload"]
+        BATCH["Batch: CBV2 schema + records"]
+        CMD["Command: header ID + CRQ2 fields"]
     end
 
     subgraph "Shared"
-        ENCODE[EncodeMessage / encode_message]
-        DECODE[DecodeBatchMessages / decode_batch]
+        ENCODE[Canonical record encoder]
+        DECODE[Canonical batch decoder]
         COMPRESS[gzip / snappy / lz4]
     end
 
@@ -72,8 +72,8 @@ flowchart TB
 | Partition Leader Routing | ✅ | ✅ | ✅ |
 | Broker-owned offset resume / `auto_offset_reset` | ✅ | ✅ merged in SDK repo | ✅ merged in SDK repo |
 | Explicit `read_committed` / `read_uncommitted` | ✅ | follow-up required | follow-up required |
-| Protocol capability negotiation | ✅ | verify before requiring features | verify before requiring features |
-| Typed structured broker errors | ✅ | verify against SDK version | verify against SDK version |
+| Required Wire v2 handshake | ✅ | migration required | migration required |
+| Typed structured broker errors | ✅ | migration required | migration required |
 | High-level broker transactions | ✅ | follow-up required | follow-up required |
 | Connection authentication | ✅ | verify against SDK version | verify against SDK version |
 | Framework Integration | — | Spring Boot | FastAPI |
@@ -109,20 +109,19 @@ sequenceDiagram
         COORD-->>SDK: OK member=M-1234 generation=N
     end
 ```
-## Protocol Capability Negotiation
+## Wire v2 Handshake
 
-The Go SDK can query broker capabilities with `sdk.FetchProtocolInfo(conn)` and negotiate a connection with `sdk.NegotiateProtocol(conn, request)`. High-level producer and consumer clients perform the same handshake automatically when protocol settings are configured:
+Every Go SDK connection performs the required Wire v2 binary handshake before authentication or application requests. Compression is negotiated during this handshake and the temporary deadline is cleared before the request lifecycle begins:
 
 ```go
 cfg := sdk.NewDefaultConsumerConfig()
-cfg.ProtocolVersion = 1
-cfg.ProtocolFeatures = []string{"structured_errors_v1", "offset_resume_v1"}
-cfg.RequireProtocolFeatures = true
+cfg.CompressionType = "lz4"
+cfg.HandshakeTimeoutMS = 5000
 ```
 
-The default configuration leaves automatic negotiation disabled for compatibility with older brokers. Set `ProtocolVersion` or at least one `ProtocolFeatures` entry to enable it. Negotiation then runs once for every newly opened or reconnected TCP connection. A failed required negotiation closes the connection before it can be used, and `RequireProtocolFeatures=true` requires at least one configured feature. `ProtocolNegotiationTimeoutMS` bounds the handshake; values less than or equal to zero use 5000 ms.
+The handshake runs for every newly opened or reconnected TCP connection. `HandshakeTimeoutMS` bounds it; zero uses 5000 ms and negative values fail configuration validation. A version or compression mismatch closes the connection before use. The SDK has no application-level feature negotiation or legacy protocol mode.
 
-Broker failures returned by negotiation are available as `*sdk.BrokerError`:
+Broker failures returned by application requests are available as `*sdk.BrokerError`:
 
 ```go
 var brokerErr *sdk.BrokerError
@@ -133,11 +132,11 @@ if errors.As(err, &brokerErr) {
 }
 ```
 
-`BrokerError` exposes `Code`, `Class`, `Retryable`, `Fields`, and the raw response. It also remains compatible with existing Go SDK sentinels such as `ErrTopicNotFound`, `ErrInvalidPartition`, and `ErrNotLeader` through `errors.Is`.
+`BrokerError` exposes `Code`, `Class`, `Retryable`, `Fields`, and the raw response. Wire v2 requires explicit `class` and `retryable` fields; unstructured error text is rejected. Typed errors match `ErrTopicNotFound`, `ErrInvalidPartition`, and `ErrNotLeader` through `errors.Is`.
 
 ## Go Topic Policy
 
-`Producer.CreateTopic` remains the compatibility API. Disabled idempotence and unspecified policy values are omitted so repeated provisioning does not clear an existing definition. Use `CreateTopicWithOptions` for an explicit non-zero producer provisioning contract:
+`Producer.CreateTopic` is the minimal convenience API. Disabled idempotence and unspecified policy values are omitted so repeated provisioning does not clear an existing definition. Use `CreateTopicWithOptions` for an explicit non-zero producer provisioning contract:
 
 ```go
 err := producer.CreateTopicWithOptions("player-state", sdk.TopicOptions{
@@ -176,7 +175,7 @@ truncated, err := admin.TruncateTopic("test-player-state", sdk.TruncateTopicOpti
 
 `AdminClient` validates values locally, returns the broker's complete `TopicDefinition` for create/update, a `DeleteTopicResult` for delete, and a `TruncateTopicResult` for reset. Attempts are bounded by `MaxRetries + 1` and rotate across configured brokers for retryable routing/availability and pre-submission transport failures. The SDK canonicalizes `compact,delete` to `delete,compact`, enforces the portable topic-name contract, and rejects unsafe command values, zero expected revisions, negative retention, or unknown policy enums before opening a broker connection. Compact policies require a standalone, non-event-sourcing topic. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
 
-`DeleteTopic` and `TruncateTopic` exist only on the admin client; producer and consumer clients do not expose destructive lifecycle methods. `IfExists` makes an explicit deletion retry idempotent without changing legacy `topic_not_found` behavior. The admin client retries a dropped connection after command submission only for `IfExists=true`; legacy delete and truncate stop with an unknown-outcome error. A truncate replay cannot erase a second generation because `ExpectedRevision` is mandatory, but a committed first attempt would return a conflict rather than the original result, so the SDK does not hide that ambiguity. `CleanupPending` means the logical lifecycle committed while broker-local storage cleanup is still converging. Kubernetes reconcilers should call delete only for an explicit absent/tombstone resource that crossed a separate approval boundary, and should never emulate truncation with delete-and-create.
+`DeleteTopic` and `TruncateTopic` exist only on the admin client; producer and consumer clients do not expose destructive lifecycle methods. `IfExists` makes an explicit deletion retry idempotent; without it, a missing topic returns `topic_not_found`. The admin client retries a dropped connection after command submission only for `IfExists=true`; non-idempotent delete and truncate stop with an unknown-outcome error. A truncate replay cannot erase a second generation because `ExpectedRevision` is mandatory, but a committed first attempt would return a conflict rather than the original result, so the SDK does not hide that ambiguity. `CleanupPending` means the logical lifecycle committed while broker-local storage cleanup is still converging. Kubernetes reconcilers should call delete only for an explicit absent/tombstone resource that crossed a separate approval boundary, and should never emulate truncation with delete-and-create.
 
 ## Go Transactional Producer
 

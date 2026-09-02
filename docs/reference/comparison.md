@@ -16,7 +16,7 @@ Cursus is a Cursus-native partitioned-log broker. Its goal is to provide durable
 | Event sourcing | Optimistic aggregate versions, committed-tail reads, indexes, snapshots, and distributed routing | Snapshots optimize replay; the committed event log remains authoritative. |
 | Security | TLS, token authentication, coarse permissions, topic ACLs, internal token/mTLS listener boundary | Certificate/token rotation and external identity-provider integration are deployment responsibilities. |
 | Operations | Health/readiness probes, Prometheus metrics, lag and cluster state | Broader admin automation, backup orchestration, and extended soak evidence can still mature. |
-| SDKs | Go SDK in-tree; Java and Python SDKs maintained separately | Cross-repository compatibility must be verified for every new protocol capability. |
+| SDKs | Go SDK in-tree; Java and Python SDKs maintained separately | External SDKs must pass the same Wire v2 conformance contract before release. |
 
 ## Delivery Semantics
 

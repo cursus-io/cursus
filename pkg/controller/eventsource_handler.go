@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/cursus-io/cursus/pkg/eventsource"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -178,7 +179,7 @@ func (ch *CommandHandler) handleCatchupSnapshots(cmd string) string {
 	if err != nil {
 		return fmt.Sprintf("ERROR: snapshot_catchup_failed reason=%q", err.Error())
 	}
-	if strings.HasPrefix(resp, "ERROR:") {
+	if protocol.IsErrorResponse(resp) {
 		return resp
 	}
 	payload := strings.TrimPrefix(resp, "OK snapshots=")
@@ -281,7 +282,7 @@ func (ch *CommandHandler) HandleReadStreamCommand(conn net.Conn, cmd string) {
 	if ch.Config != nil && ch.Config.EnabledDistribution && ch.Cluster != nil {
 		if !ch.Cluster.IsAuthorized(topicName, partition) {
 			leaderAddr := ch.resolvePartitionLeaderAddr(topicName, partition)
-			writeReadStreamError(conn, fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", leaderAddr))
+			writeReadStreamError(conn, fmt.Sprintf("ERROR: NOT_LEADER leader=%s", leaderAddr))
 			return
 		}
 		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
@@ -341,7 +342,9 @@ func eventStreamKey(cmd, prefix string) string {
 }
 
 func writeReadStreamError(conn net.Conn, msg string) {
-	code := strings.TrimPrefix(msg, "ERROR: ")
-	payload, _ := json.Marshal(map[string]string{"status": "ERROR", "error": code})
-	_ = util.WriteWithLength(conn, payload)
+	msg = strings.TrimSpace(msg)
+	if !strings.HasPrefix(msg, "ERROR:") {
+		msg = "ERROR: " + msg
+	}
+	_ = util.WriteWithLength(conn, []byte(msg))
 }

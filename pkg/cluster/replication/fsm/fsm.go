@@ -41,23 +41,6 @@ type ProducerSequence struct {
 	Seq   uint64 `json:"seq"`
 }
 
-func (s *ProducerSequence) UnmarshalJSON(data []byte) error {
-	var legacySeq int64
-	if err := json.Unmarshal(data, &legacySeq); err == nil {
-		if legacySeq > 0 {
-			s.Seq = uint64(legacySeq)
-		}
-		return nil
-	}
-	type alias ProducerSequence
-	var decoded alias
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	*s = ProducerSequence(decoded)
-	return nil
-}
-
 type BrokerFSMState struct {
 	Version           int                                            `json:"version"`
 	Applied           uint64                                         `json:"applied"`
@@ -76,11 +59,12 @@ type BrokerFSM struct {
 	transitionMu      sync.Mutex
 	materializationMu sync.Mutex
 
-	logs              map[uint64]*ReplicationEntry
-	brokers           map[string]*BrokerInfo
-	partitionMetadata map[string]*PartitionMetadata
-	producerState     map[string]map[int]map[string]ProducerSequence // Topic -> Partition -> ProducerID -> Last Epoch/Seq
-	applied           uint64
+	logs                     map[uint64]*ReplicationEntry
+	brokers                  map[string]*BrokerInfo
+	partitionMetadata        map[string]*PartitionMetadata
+	producerState            map[string]map[int]map[string]ProducerSequence // Topic -> Partition -> ProducerID -> Last Epoch/Seq
+	applied                  uint64
+	partitionRecoveryPending bool
 
 	tm                       *topic.TopicManager
 	cd                       *coordinator.Coordinator
@@ -128,6 +112,18 @@ func (f *BrokerFSM) GetAllPartitionKeys() []string {
 	return keys
 }
 
+func (f *BrokerFSM) AppliedIndex() uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.applied
+}
+
+func (f *BrokerFSM) HasPendingPartitionRecovery() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.partitionRecoveryPending
+}
+
 // GetTopicDefinition returns a detached copy of the authoritative replicated
 // topic definition, including when node-local materialization is pending.
 func (f *BrokerFSM) GetTopicDefinition(name string) (topic.Definition, bool) {
@@ -151,7 +147,10 @@ func (f *BrokerFSM) SetTransactionManager(txn *transaction.Manager) {
 	defer f.mu.Unlock()
 	f.txn = txn
 	if f.txn != nil && f.restoredTransactionState != nil {
-		f.txn.ImportState(f.restoredTransactionState)
+		if err := f.txn.ImportState(f.restoredTransactionState); err != nil {
+			util.Error("FSM: Rejected deferred restored transactions: %v", err)
+			return
+		}
 		util.Info("FSM: Imported %d deferred restored transactions", len(f.restoredTransactionState))
 		f.restoredTransactionState = nil
 	}
@@ -187,8 +186,6 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyRegisterCommand(strings.TrimPrefix(data, "REGISTER:"))
 	case strings.HasPrefix(data, "DEREGISTER:"):
 		res = f.applyDeregisterCommand(strings.TrimPrefix(data, "DEREGISTER:"))
-	case strings.HasPrefix(data, "JOIN_GROUP:"):
-		res = f.applyJoinGroupCommand(strings.TrimPrefix(data, "JOIN_GROUP:"))
 	case strings.HasPrefix(data, "MESSAGE:"):
 		res = f.applyMessageCommand(strings.TrimPrefix(data, "MESSAGE:"))
 	case strings.HasPrefix(data, "BATCH:"):
@@ -205,6 +202,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyPartitionCommand(strings.TrimPrefix(data, "PARTITION:"))
 	case strings.HasPrefix(data, "PARTITION_COMMIT:"):
 		res = f.applyPartitionCommitCommand(strings.TrimPrefix(data, "PARTITION_COMMIT:"))
+	case strings.HasPrefix(data, "ISR_CATCHUP:"):
+		res = f.applyISRCatchupCommand(strings.TrimPrefix(data, "ISR_CATCHUP:"))
 	case strings.HasPrefix(data, "LEADER_ELECTION:"):
 		res = f.applyLeaderElectionCommand(strings.TrimPrefix(data, "LEADER_ELECTION:"))
 	case strings.HasPrefix(data, "GROUP_SYNC:"):
@@ -242,43 +241,33 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 
 	util.Info("Starting FSM restore from snapshot")
 
-	var state BrokerFSMState
-	if err := json.NewDecoder(rc).Decode(&state); err != nil {
+	snapshotData, err := io.ReadAll(rc)
+	if err != nil {
+		return fmt.Errorf("read snapshot: %w", err)
+	}
+	var header struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(snapshotData, &header); err != nil {
 		util.Error("Failed to decode snapshot: %v", err)
 		return fmt.Errorf("failed to restore snapshot: %w", err)
 	}
-
-	switch state.Version {
-	case 0:
-		util.Warn("FSM Restore: Legacy snapshot detected (Version 0).")
-	case 1:
-		util.Info("FSM Restore: Validating snapshot Version 1")
-	case 2:
-		util.Info("FSM Restore: Validating snapshot Version 2 (with group state)")
-	case 3:
-		util.Info("FSM Restore: Validating snapshot Version 3 (with producer epochs)")
-	case 4:
-		util.Info("FSM Restore: Validating snapshot Version 4 (with transaction state)")
-	case 5:
-		util.Info("FSM Restore: Validating snapshot Version 5 (with committed partition watermarks)")
-	case 6:
-		util.Info("FSM Restore: Validating snapshot Version 6 (with durable topic definitions)")
-	case 7:
-		util.Info("FSM Restore: Validating snapshot Version 7 (with revisioned topic definitions)")
-	case 8:
-		util.Info("FSM Restore: Validating snapshot Version 8 (with topic lifecycle epochs)")
-	default:
-		return fmt.Errorf("unknown snapshot version: %d", state.Version)
+	if header.Version != SnapshotVersionCurrent {
+		return fmt.Errorf("%w: snapshot version %d is not supported; remove all Cursus persistent state and clean bootstrap version %d", ErrUnsupportedRecoveryProtocol, header.Version, SnapshotVersionCurrent)
 	}
+
+	var state BrokerFSMState
+	if err := decodeStrictJSON(snapshotData, &state); err != nil {
+		util.Error("Failed to decode snapshot version %d: %v", header.Version, err)
+		return fmt.Errorf("failed to restore snapshot version %d: %w", header.Version, err)
+	}
+	util.Info("FSM Restore: Validating snapshot Version %d", state.Version)
 
 	restoredTopicState := copyTopicState(state.TopicState)
 	if len(restoredTopicState) == 0 && len(state.PartitionMetadata) > 0 {
-		if state.Version >= 6 {
-			return fmt.Errorf("snapshot version %d is missing topic state", state.Version)
-		}
-		restoredTopicState = legacyTopicState(state.PartitionMetadata)
+		return fmt.Errorf("snapshot version %d is missing topic state", state.Version)
 	}
-	if err := migrateSnapshotTopicDefinitionFields(state.Version, restoredTopicState, state.PartitionMetadata); err != nil {
+	if err := validateSnapshotTopicDefinitionFields(restoredTopicState, state.PartitionMetadata); err != nil {
 		return fmt.Errorf("restore topic definitions: %w", err)
 	}
 	definitions, err := validateTopicState(restoredTopicState, state.PartitionMetadata)
@@ -286,6 +275,12 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		return fmt.Errorf("restore topic definitions: %w", err)
 	}
 	restoredTopicState = topicStateFromDefinitions(definitions)
+	if err := coordinator.ValidateImportState(state.GroupState); err != nil {
+		return fmt.Errorf("restore consumer groups: %w", err)
+	}
+	if err := transaction.ValidateImportState(state.TransactionState); err != nil {
+		return fmt.Errorf("restore transactions: %w", err)
+	}
 	f.materializationMu.Lock()
 	localDefinitions := []topic.Definition(nil)
 	persistedTopicStorage := []string(nil)
@@ -366,13 +361,21 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		f.notifiers = make(map[string]chan interface{})
 	}
 	if state.GroupState != nil && f.cd != nil {
-		f.cd.ImportState(state.GroupState)
+		if err := f.cd.ImportState(state.GroupState); err != nil {
+			f.mu.Unlock()
+			f.materializationMu.Unlock()
+			return fmt.Errorf("restore consumer groups: %w", err)
+		}
 		util.Info("FSM Restore: Restored %d consumer groups from snapshot", len(state.GroupState))
 	}
 
 	if state.TransactionState != nil {
 		if f.txn != nil {
-			f.txn.ImportState(state.TransactionState)
+			if err := f.txn.ImportState(state.TransactionState); err != nil {
+				f.mu.Unlock()
+				f.materializationMu.Unlock()
+				return fmt.Errorf("restore transactions: %w", err)
+			}
 			util.Info("FSM Restore: Restored %d transactions from snapshot", len(state.TransactionState))
 		} else {
 			f.restoredTransactionState = state.TransactionState
@@ -385,14 +388,14 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	if err := f.ReconcileTopicMaterializations(); err != nil {
 		util.Warn("FSM Restore: Topic materialization pending: %v", err)
 	}
-	if state.Version >= 5 {
-		f.reconcileCommittedPartitions()
+	if err := f.reconcileCommittedPartitions(); err != nil {
+		return err
 	}
 	util.Info("FSM restore completed: %d logs, %d brokers, %d partitions", len(state.Logs), len(state.Brokers), len(state.PartitionMetadata))
 	return nil
 }
 
-func (f *BrokerFSM) reconcileCommittedPartitions() {
+func (f *BrokerFSM) reconcileCommittedPartitions() error {
 	f.mu.RLock()
 	metadata := make(map[string]PartitionMetadata, len(f.partitionMetadata))
 	for key, value := range f.partitionMetadata {
@@ -403,14 +406,12 @@ func (f *BrokerFSM) reconcileCommittedPartitions() {
 	tm := f.tm
 	f.mu.RUnlock()
 	if tm == nil {
-		return
+		return nil
 	}
+	pending := false
 	for key, meta := range metadata {
 		if !meta.CommittedHWMKnown {
-			// Metadata written before committed watermarks existed has no safe
-			// numeric boundary to apply. The partition leader migrates that
-			// legacy boundary through Raft before accepting a new append.
-			continue
+			return fmt.Errorf("%w: partition %s has no authoritative committed HWM", ErrUnsupportedRecoveryProtocol, key)
 		}
 		idx := strings.LastIndex(key, "-")
 		if idx < 0 {
@@ -426,13 +427,113 @@ func (f *BrokerFSM) reconcileCommittedPartitions() {
 		}
 		p, err := t.GetPartition(partition)
 		if err == nil {
-			if err := p.ReconcileCommittedHWM(meta.CommittedHWM); err != nil {
-				util.Warn("FSM: Failed to reconcile committed HWM for %s: %v", key, err)
-			} else {
-				p.FlushDisk()
+			if err := p.ReconcileSnapshotHWM(meta.CommittedHWM); err != nil {
+				return fmt.Errorf("reconcile committed HWM for %s: %w", key, err)
 			}
+			pending = pending || p.SnapshotRecoveryPending()
+			p.FlushDisk()
 		}
 	}
+	f.mu.Lock()
+	f.partitionRecoveryPending = pending
+	f.mu.Unlock()
+	return nil
+}
+
+// FinalizeRecoveredPartitions performs destructive reconciliation only after
+// the replication manager has observed every committed post-snapshot command
+// applied to this FSM.
+func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
+
+	f.mu.RLock()
+	metadata := make(map[string]PartitionMetadata, len(f.partitionMetadata))
+	for key, value := range f.partitionMetadata {
+		if value != nil {
+			metadata[key] = *value
+		}
+	}
+	tm := f.tm
+	f.mu.RUnlock()
+	if tm == nil {
+		f.mu.Lock()
+		f.partitionRecoveryPending = false
+		f.mu.Unlock()
+		return nil
+	}
+	for key, meta := range metadata {
+		if !meta.CommittedHWMKnown {
+			return fmt.Errorf("%w: partition %s has no authoritative committed HWM", ErrUnsupportedRecoveryProtocol, key)
+		}
+		idx := strings.LastIndex(key, "-")
+		if idx < 0 {
+			continue
+		}
+		partitionID, err := strconv.Atoi(key[idx+1:])
+		if err != nil {
+			continue
+		}
+		localTopic := tm.GetTopic(key[:idx])
+		if localTopic == nil {
+			continue
+		}
+		partition, err := localTopic.GetPartition(partitionID)
+		if err != nil {
+			continue
+		}
+		if err := partition.FinalizeSnapshotRecovery(meta.CommittedHWM); err != nil {
+			return fmt.Errorf("finalize committed HWM for %s: %w", key, err)
+		}
+		partition.FlushDisk()
+	}
+	f.mu.Lock()
+	f.partitionRecoveryPending = false
+	f.mu.Unlock()
+	return nil
+}
+
+// ValidateLocalLeaderLogs prevents a broker from serving as the clean leader
+// for a partition whose committed range is missing locally. Followers may be
+// below HWM because the background catch-up path can repair them.
+func (f *BrokerFSM) ValidateLocalLeaderLogs(brokerID string) error {
+	if brokerID == "" {
+		return nil
+	}
+	f.mu.RLock()
+	metadata := make(map[string]PartitionMetadata)
+	for key, value := range f.partitionMetadata {
+		if value != nil && value.Leader == brokerID {
+			metadata[key] = *value
+		}
+	}
+	tm := f.tm
+	f.mu.RUnlock()
+	if tm == nil {
+		return nil
+	}
+	for key, meta := range metadata {
+		idx := strings.LastIndex(key, "-")
+		if idx < 0 {
+			continue
+		}
+		partitionID, err := strconv.Atoi(key[idx+1:])
+		if err != nil {
+			continue
+		}
+		localTopic := tm.GetTopic(key[:idx])
+		if localTopic == nil {
+			continue
+		}
+		partition, err := localTopic.GetPartition(partitionID)
+		if err != nil {
+			continue
+		}
+		if partition.NextOffset() < meta.CommittedHWM {
+			return fmt.Errorf("local leader %s is missing committed data for %s: leo=%d hwm=%d", brokerID, key, partition.NextOffset(), meta.CommittedHWM)
+		}
+	}
+	return nil
 }
 
 func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
@@ -454,6 +555,9 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	}
 	metadataCopy := make(map[string]*PartitionMetadata, len(f.partitionMetadata))
 	for k, v := range f.partitionMetadata {
+		if !v.CommittedHWMKnown {
+			return nil, fmt.Errorf("%w: partition %s has no authoritative committed HWM", ErrUnsupportedRecoveryProtocol, k)
+		}
 		metaCopy := *v
 		if v.Replicas != nil {
 			metaCopy.Replicas = make([]string, len(v.Replicas))
@@ -480,7 +584,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 
 	topicStateCopy := copyTopicState(f.topicState)
 	if len(topicStateCopy) == 0 && len(metadataCopy) > 0 {
-		topicStateCopy = legacyTopicState(metadataCopy)
+		return nil, fmt.Errorf("snapshot version %d requires durable topic state", SnapshotVersionCurrent)
 	}
 	definitions, err := validateTopicState(topicStateCopy, metadataCopy)
 	if err != nil {

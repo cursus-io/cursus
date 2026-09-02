@@ -3,7 +3,6 @@ package controller
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"sort"
@@ -14,6 +13,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -194,13 +194,13 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string) string {
 	if offsetTopicErr != "" {
 		return offsetTopicErr
 	}
-	offsets, err := parseTxnOffsetPairs(cmd)
+	offsetPairs, err := wire.DecodeOffsetPairs(args["offsets"])
 	if err != nil {
 		return fmt.Sprintf("ERROR: invalid_txn_offsets reason=%q", err.Error())
 	}
-	ops := make([]transaction.OffsetOperation, 0, len(offsets))
-	for partition, offset := range offsets {
-		op := transaction.OffsetOperation{Topic: offsetTopic, Group: groupID, Member: memberID, Generation: generation, Partition: partition, Offset: offset}
+	ops := make([]transaction.OffsetOperation, 0, len(offsetPairs))
+	for _, pair := range offsetPairs {
+		op := transaction.OffsetOperation{Topic: offsetTopic, Group: groupID, Member: memberID, Generation: generation, Partition: pair.Partition, Offset: pair.Offset}
 		if err := ch.validateTransactionOffset(op, false); err != nil {
 			return err.Error()
 		}
@@ -435,8 +435,7 @@ func (ch *CommandHandler) validateTransactionOffset(op transaction.OffsetOperati
 		if !checkRegression {
 			cmd += " ownership_only=true"
 		}
-		encodedCmd := util.EncodeMessage("", cmd)
-		resp, err := ch.Cluster.Router.ForwardToCoordinator(op.Group, string(encodedCmd))
+		resp, err := ch.Cluster.Router.ForwardToCoordinator(op.Group, cmd)
 		if err != nil {
 			return err
 		}
@@ -724,7 +723,7 @@ func (ch *CommandHandler) commitTransactionOffsets(ops []transaction.OffsetOpera
 	})
 	scope := ordered[0]
 	items := make([]coordinator.OffsetItem, 0, len(ordered))
-	pairs := make([]string, 0, len(ordered))
+	pairs := make([]wire.OffsetPair, 0, len(ordered))
 	for _, op := range ordered {
 		if op.Topic != scope.Topic || op.Group != scope.Group || op.Member != scope.Member || op.Generation != scope.Generation {
 			return fmt.Errorf(
@@ -733,19 +732,22 @@ func (ch *CommandHandler) commitTransactionOffsets(ops []transaction.OffsetOpera
 			)
 		}
 		items = append(items, coordinator.OffsetItem{Partition: op.Partition, Offset: op.Offset})
-		pairs = append(pairs, fmt.Sprintf("P%d:%d", op.Partition, op.Offset))
+		pairs = append(pairs, wire.OffsetPair{Partition: op.Partition, Offset: op.Offset})
 	}
 
 	if ch.Config != nil && ch.Config.EnabledDistribution {
 		if ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.Cluster.Router == nil {
 			return fmt.Errorf("distributed transaction offset commit requires cluster coordinator router")
 		}
+		encodedOffsets, err := wire.EncodeOffsetPairs(pairs)
+		if err != nil {
+			return err
+		}
 		cmd := fmt.Sprintf(
-			"BATCH_COMMIT topic=%s group=%s member=%s generation=%d %s",
-			scope.Topic, scope.Group, scope.Member, scope.Generation, strings.Join(pairs, ","),
+			"BATCH_COMMIT topic=%s group=%s member=%s generation=%d offsets=%s",
+			scope.Topic, scope.Group, scope.Member, scope.Generation, encodedOffsets,
 		)
-		encodedCmd := util.EncodeMessage("", cmd)
-		resp, err := ch.Cluster.Router.ForwardToCoordinator(scope.Group, string(encodedCmd))
+		resp, err := ch.Cluster.Router.ForwardToCoordinator(scope.Group, cmd)
 		if err != nil {
 			return err
 		}
@@ -774,201 +776,4 @@ func (ch *CommandHandler) ensureTransactionCoordinator(txnID string) string {
 		return notCoordinatorResponse(coordAddr)
 	}
 	return ""
-}
-
-func (ch *CommandHandler) snapshotTransaction(txnID string) (*transaction.Snapshot, bool) {
-	state := ch.TxnManager.ExportState()
-	snap, ok := state[txnID]
-	return snap, ok
-}
-
-func (ch *CommandHandler) restoreTransaction(txnID string, snap *transaction.Snapshot, hadPrevious bool) {
-	if hadPrevious {
-		ch.TxnManager.ApplySnapshot(snap)
-		return
-	}
-	ch.TxnManager.Delete(txnID)
-}
-func (ch *CommandHandler) ConfigureTransactionJournal(path string) error {
-	if ch.isDistributed() {
-		return fmt.Errorf("standalone transaction journal cannot be enabled in distributed mode")
-	}
-	journal, err := transaction.OpenJournal(path)
-	if err != nil {
-		return err
-	}
-	state, err := journal.Load()
-	if err != nil {
-		return err
-	}
-	ch.TxnManager.ImportState(state)
-	if ch.TxnManager.PruneExpired(time.Now()) > 0 {
-		if err := journal.Rewrite(ch.TxnManager.ExportState()); err != nil {
-			return fmt.Errorf("prune recovered transaction journal: %w", err)
-		}
-	}
-	ch.txnJournal = journal
-	if err := ch.RecoverPendingTruncations(); err != nil {
-		return fmt.Errorf("recover pending topic truncation: %w", err)
-	}
-	return nil
-}
-
-func (ch *CommandHandler) syncTransactionState(txnID string) error {
-	if ch.transactionStateSyncHook != nil {
-		return ch.transactionStateSyncHook(txnID)
-	}
-	snapshots := ch.TxnManager.ExportState()
-	snap := snapshots[txnID]
-	if snap == nil {
-		return fmt.Errorf("transaction %s not found", txnID)
-	}
-	if !ch.isDistributed() {
-		if ch.txnJournal == nil {
-			return nil
-		}
-		if err := ch.txnJournal.Append(snap); err != nil {
-			return err
-		}
-		if ch.TxnManager.PruneExpired(time.Now()) > 0 {
-			return ch.txnJournal.Rewrite(ch.TxnManager.ExportState())
-		}
-		return nil
-	}
-	_, err := ch.applyViaLeader("TXN_SYNC", map[string]interface{}{"transaction": snap})
-	return err
-}
-
-func (ch *CommandHandler) commitTransactionDecision(txnID string) error {
-	snap, err := ch.TxnManager.BuildCommittedSnapshot(txnID)
-	if err != nil {
-		return err
-	}
-	return ch.persistFinalTransactionDecision(snap)
-}
-
-func (ch *CommandHandler) abortTransactionDecision(txnID, producerID string, epoch int64) error {
-	snap, err := ch.TxnManager.BuildAbortedSnapshot(txnID, producerID, epoch)
-	if err != nil {
-		return err
-	}
-	return ch.persistFinalTransactionDecision(snap)
-}
-
-func (ch *CommandHandler) persistFinalTransactionDecision(snap *transaction.Snapshot) error {
-	if ch.isDistributed() {
-		_, err := ch.applyViaLeader("TXN_SYNC", map[string]interface{}{"transaction": snap})
-		return err
-	}
-	if ch.txnJournal != nil {
-		if err := ch.txnJournal.Append(snap); err != nil {
-			return err
-		}
-	}
-	return ch.TxnManager.ApplyReplicatedSnapshot(snap)
-}
-
-func transactionCoordinatorKey(txnID string) string {
-	return "txn:" + txnID
-}
-
-func parseTxnProducerEpoch(args map[string]string, command string) (string, int64, string) {
-	producerID := firstNonEmpty(args["producerId"], args["producer_id"])
-	if producerID == "" {
-		return "", 0, fmt.Sprintf("ERROR: missing_producer_id command=%s", command)
-	}
-	epoch, err := parseOptionalInt64(args["epoch"])
-	if err != nil {
-		return "", 0, fmt.Sprintf("ERROR: invalid_epoch reason=%q", err.Error())
-	}
-	return producerID, epoch, ""
-}
-
-func parseTxnOffsetPairs(cmd string) (map[int]uint64, error) {
-	partsIdx := strings.LastIndex(cmd, " ")
-	if partsIdx == -1 {
-		return nil, fmt.Errorf("missing offset pairs")
-	}
-	partitionData := cmd[partsIdx+1:]
-	if !strings.Contains(partitionData, ":") {
-		return nil, fmt.Errorf("missing offset pairs")
-	}
-	pairs := strings.Split(partitionData, ",")
-	offsets := make(map[int]uint64, len(pairs))
-	for _, pair := range pairs {
-		kv := strings.Split(pair, ":")
-		if len(kv) != 2 || !strings.HasPrefix(kv[0], "P") {
-			return nil, fmt.Errorf("invalid pair %s", pair)
-		}
-		partition, err := strconv.Atoi(strings.TrimPrefix(kv[0], "P"))
-		if err != nil {
-			return nil, err
-		}
-		offset, err := strconv.ParseUint(kv[1], 10, 64)
-		if err != nil {
-			return nil, err
-		}
-		offsets[partition] = offset
-	}
-	if len(offsets) == 0 {
-		return nil, fmt.Errorf("no offsets supplied")
-	}
-	return offsets, nil
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func parseRequiredPositiveUint64(value string) (uint64, error) {
-	if value == "" {
-		return 0, fmt.Errorf("missing seqNum")
-	}
-	parsed, err := strconv.ParseUint(value, 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	if parsed == 0 {
-		return 0, fmt.Errorf("seqNum must be greater than zero")
-	}
-	return parsed, nil
-}
-
-func parseOptionalInt64(value string) (int64, error) {
-	if value == "" {
-		return 0, nil
-	}
-	return strconv.ParseInt(value, 10, 64)
-}
-
-func transactionMarkerControlBytes(marker string, coordinatorEpoch int64) ([]byte, []byte, error) {
-	if coordinatorEpoch < -(1<<31) || coordinatorEpoch > (1<<31)-1 {
-		return nil, nil, fmt.Errorf("coordinator epoch out of int32 range: %d", coordinatorEpoch)
-	}
-	var markerType int16
-	switch marker {
-	case types.TransactionMarkerCommit:
-		markerType = 0
-	case types.TransactionMarkerAbort:
-		markerType = 1
-	default:
-		return nil, nil, fmt.Errorf("invalid transaction marker %q", marker)
-	}
-	key := make([]byte, 4)
-	binary.BigEndian.PutUint16(key[0:2], 0)
-	binary.BigEndian.PutUint16(key[2:4], uint16(markerType))
-	valueBuf := bytes.Buffer{}
-	if err := binary.Write(&valueBuf, binary.BigEndian, int16(0)); err != nil {
-		return nil, nil, fmt.Errorf("encode transaction marker value version: %w", err)
-	}
-	epoch32 := int32(coordinatorEpoch) // #nosec G115 -- bounded to int32 range above.
-	if err := binary.Write(&valueBuf, binary.BigEndian, epoch32); err != nil {
-		return nil, nil, fmt.Errorf("encode transaction marker coordinator epoch: %w", err)
-	}
-	return key, valueBuf.Bytes(), nil
 }

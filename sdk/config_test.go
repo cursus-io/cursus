@@ -38,6 +38,9 @@ func TestNewDefaultPublisherConfig(t *testing.T) {
 	if cfg.FlushTimeoutMS != 30000 {
 		t.Errorf("expected FlushTimeoutMS=30000, got %d", cfg.FlushTimeoutMS)
 	}
+	if cfg.HandshakeTimeoutMS != 5000 {
+		t.Errorf("expected HandshakeTimeoutMS=5000, got %d", cfg.HandshakeTimeoutMS)
+	}
 	if cfg.Topic != "default-topic" {
 		t.Errorf("expected Topic=default-topic, got %s", cfg.Topic)
 	}
@@ -50,9 +53,6 @@ func TestNewDefaultPublisherConfig(t *testing.T) {
 	if cfg.BufferSize != 1024 {
 		t.Errorf("expected BufferSize=1024, got %d", cfg.BufferSize)
 	}
-	if cfg.MaxInflightRequests != 5 {
-		t.Errorf("expected MaxInflightRequests=5, got %d", cfg.MaxInflightRequests)
-	}
 	if cfg.Acks != "1" {
 		t.Errorf("expected Acks=1, got %s", cfg.Acks)
 	}
@@ -61,9 +61,6 @@ func TestNewDefaultPublisherConfig(t *testing.T) {
 	}
 	if cfg.LeaderStaleness != 30*time.Second {
 		t.Errorf("expected LeaderStaleness=30s, got %v", cfg.LeaderStaleness)
-	}
-	if cfg.LogLevel != LogLevelInfo {
-		t.Errorf("expected LogLevel=Info, got %d", cfg.LogLevel)
 	}
 }
 
@@ -114,6 +111,9 @@ func TestNewDefaultConsumerConfig(t *testing.T) {
 	if cfg.GroupID != "default-group" {
 		t.Errorf("expected GroupID=default-group, got %s", cfg.GroupID)
 	}
+	if cfg.Topic != "default-topic" {
+		t.Errorf("expected Topic=default-topic, got %s", cfg.Topic)
+	}
 	if cfg.ConsumerID == "" {
 		t.Error("expected non-empty ConsumerID")
 	}
@@ -129,11 +129,11 @@ func TestNewDefaultConsumerConfig(t *testing.T) {
 	if cfg.MaxPollRecords != 500 {
 		t.Errorf("expected MaxPollRecords=500, got %d", cfg.MaxPollRecords)
 	}
-	if cfg.SessionTimeoutMS != 30000 {
-		t.Errorf("expected SessionTimeoutMS=30000, got %d", cfg.SessionTimeoutMS)
-	}
 	if cfg.HeartbeatIntervalMS != 3000 {
 		t.Errorf("expected HeartbeatIntervalMS=3000, got %d", cfg.HeartbeatIntervalMS)
+	}
+	if cfg.HandshakeTimeoutMS != 5000 {
+		t.Errorf("expected HandshakeTimeoutMS=5000, got %d", cfg.HandshakeTimeoutMS)
 	}
 	if !cfg.EnableAutoCommit {
 		t.Error("expected EnableAutoCommit=true")
@@ -153,21 +153,21 @@ func TestNewDefaultConsumerConfig(t *testing.T) {
 	if cfg.LeaderStaleness != 30*time.Second {
 		t.Errorf("expected LeaderStaleness=30s, got %v", cfg.LeaderStaleness)
 	}
-	if cfg.LogLevel != LogLevelInfo {
-		t.Errorf("expected LogLevel=Info, got %d", cfg.LogLevel)
-	}
 }
 
 func TestLoadConfig_JSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "pub.json")
 
-	cfg := PublisherConfig{Topic: "my-topic", Partitions: 8, Acks: "all"}
-	data, err := json.Marshal(cfg)
+	cfg := *NewDefaultPublisherConfig()
+	cfg.Topic = "my-topic"
+	cfg.Partitions = 8
+	cfg.Acks = "all"
+	data, err := json.Marshal(cfg) // #nosec G117 -- the test fixture contains no credential value.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -186,7 +186,7 @@ func TestLoadConfig_YAML(t *testing.T) {
 
 	yamlData := `group_id: test-group
 batch_size: 50`
-	if err := os.WriteFile(path, []byte(yamlData), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(yamlData), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -210,7 +210,7 @@ func TestLoadConfig_FileNotFound(t *testing.T) {
 func TestLoadConfig_ConsumerDefaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "c.json")
-	if err := os.WriteFile(path, []byte(`{"group_id":"override"}`), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"group_id":"override"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -231,17 +231,12 @@ func TestNewDefaultPublisherConfig_AllDefaults(t *testing.T) {
 
 	assert.Equal(t, 100, cfg.RetryBackoffMS)
 	assert.Equal(t, 2000, cfg.MaxBackoffMS)
-	assert.Equal(t, 0, cfg.PublishDelayMS)
 	assert.False(t, cfg.UseTLS)
 	assert.Equal(t, "", cfg.TLSCertPath)
 	assert.Equal(t, "", cfg.TLSKeyPath)
 	assert.False(t, cfg.EnableMetrics)
 	assert.False(t, cfg.EnableIdempotence)
 	assert.False(t, cfg.EnableBenchmark)
-	assert.Equal(t, "", cfg.BenchTopicName)
-	assert.Equal(t, 0, cfg.MessageSize)
-	assert.Equal(t, 0, cfg.NumMessages)
-	assert.Equal(t, 0, cfg.CurrentBrokerIndex)
 	assert.False(t, cfg.AutoCreateTopics)
 }
 
@@ -251,19 +246,11 @@ func TestNewDefaultConsumerConfig_AllDefaults(t *testing.T) {
 	assert.Equal(t, 1000, cfg.WorkerChannelSize)
 	assert.Equal(t, 500*time.Millisecond, cfg.CommitRetryBackoff)
 	assert.Equal(t, 2*time.Second, cfg.CommitRetryMaxBackoff)
-	assert.Equal(t, 1*time.Second, cfg.StreamingCommitInterval)
-	assert.Equal(t, 100, cfg.StreamingCommitBatchSize)
 	assert.Equal(t, 300000, cfg.StreamingReadDeadlineMS)
-	assert.Equal(t, 1000, cfg.StreamingRetryIntervalMS)
 	assert.False(t, cfg.UseTLS)
 	assert.Equal(t, "", cfg.TLSCertPath)
 	assert.Equal(t, "", cfg.TLSKeyPath)
 	assert.False(t, cfg.EnableMetrics)
-	assert.False(t, cfg.EnableBenchmark)
-	assert.False(t, cfg.EnableCorrectness)
-	assert.Equal(t, 0, cfg.NumMessages)
-	assert.Equal(t, 0, cfg.CurrentBrokerIndex)
-	assert.False(t, cfg.EnableImmediateCommit)
 	assert.Equal(t, 0, cfg.MaxConnectRetries)
 	assert.Equal(t, 0, cfg.ConnectRetryBackoffMS)
 }
@@ -307,7 +294,7 @@ func TestPublisherConfig_EnableMetrics(t *testing.T) {
 func TestLoadConfig_PublisherDefaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "p.json")
-	if err := os.WriteFile(path, []byte(`{"topic":"override-topic"}`), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"topic":"override-topic"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -332,7 +319,7 @@ use_tls: true
 tls_cert_path: /cert
 tls_key_path: /key
 enable_metrics: true`
-	if err := os.WriteFile(path, []byte(yamlData), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(yamlData), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -356,7 +343,7 @@ use_tls: true
 tls_cert_path: /consumer/cert
 tls_key_path: /consumer/key
 enable_metrics: true`
-	if err := os.WriteFile(path, []byte(yamlData), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(yamlData), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -381,7 +368,7 @@ func TestLoadConfig_UnknownType_UsesYAML(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "cfg.txt")
 	yamlData := `topic: txt-topic`
-	if err := os.WriteFile(path, []byte(yamlData), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(yamlData), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -389,4 +376,57 @@ func TestLoadConfig_UnknownType_UsesYAML(t *testing.T) {
 	err := LoadConfig(path, &loaded)
 	assert.NoError(t, err)
 	assert.Equal(t, "txt-topic", loaded.Topic)
+}
+
+func TestPublisherConfigRejectsInvalidWireSettingsBeforeConnect(t *testing.T) {
+	tests := map[string]func(*PublisherConfig){
+		"compression": func(config *PublisherConfig) { config.CompressionType = "zstd" },
+		"credentials": func(config *PublisherConfig) { config.Principal = "service" },
+		"handshake":   func(config *PublisherConfig) { config.HandshakeTimeoutMS = -1 },
+		"duration":    func(config *PublisherConfig) { config.WriteTimeoutMS = -1 },
+		"partitions":  func(config *PublisherConfig) { config.Partitions = 0 },
+		"batch size":  func(config *PublisherConfig) { config.BatchSize = 0 },
+		"buffer size": func(config *PublisherConfig) { config.BufferSize = 0 },
+		"brokers":     func(config *PublisherConfig) { config.BrokerAddrs = nil },
+		"topic":       func(config *PublisherConfig) { config.Topic = "bad topic" },
+		"tls paths":   func(config *PublisherConfig) { config.UseTLS = true },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := NewDefaultPublisherConfig()
+			mutate(config)
+			require.Error(t, config.Validate())
+		})
+	}
+}
+
+func TestConsumerConfigRejectsInvalidRuntimeSettings(t *testing.T) {
+	tests := map[string]func(*ConsumerConfig){
+		"compression": func(config *ConsumerConfig) { config.CompressionType = "zstd" },
+		"credentials": func(config *ConsumerConfig) { config.AuthToken = "secret" },
+		"mode":        func(config *ConsumerConfig) { config.Mode = "push" },
+		"offset reset": func(config *ConsumerConfig) {
+			config.AutoOffsetReset = "middle"
+		},
+		"isolation":  func(config *ConsumerConfig) { config.ReadIsolation = "dirty" },
+		"duration":   func(config *ConsumerConfig) { config.PollInterval = -time.Second },
+		"batch size": func(config *ConsumerConfig) { config.BatchSize = 0 },
+		"worker channel": func(config *ConsumerConfig) {
+			config.WorkerChannelSize = 0
+		},
+		"brokers": func(config *ConsumerConfig) { config.BrokerAddrs = nil },
+		"topic":   func(config *ConsumerConfig) { config.Topic = "bad topic" },
+		"group":   func(config *ConsumerConfig) { config.GroupID = "bad group" },
+		"consumer": func(config *ConsumerConfig) {
+			config.ConsumerID = ""
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := NewDefaultConsumerConfig()
+			mutate(config)
+			require.Error(t, config.Validate())
+		})
+	}
+	require.Error(t, (*ConsumerConfig)(nil).Validate())
 }

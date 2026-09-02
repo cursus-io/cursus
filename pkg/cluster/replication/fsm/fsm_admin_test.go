@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/hashicorp/raft"
 )
 
@@ -30,7 +31,7 @@ func adminTestFSM(t *testing.T, broker2Status string) *BrokerFSM {
 	metadata := PartitionMetadata{
 		Leader: "broker-1", LeaderEpoch: 7, CommittedHWM: 42,
 		Replicas: []string{"broker-1", "broker-2", "broker-3"},
-		ISR:      []string{"broker-1", "broker-2"},
+		ISR:      []string{"broker-1", "broker-2"}, LifecycleEpoch: topic.InitialLifecycleEpoch,
 	}
 	data, err := json.Marshal(metadata)
 	if err != nil {

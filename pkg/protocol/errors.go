@@ -161,8 +161,6 @@ func ParseErrorResponse(raw string) (*ErrorResponse, bool) {
 	switch {
 	case strings.HasPrefix(trimmed, "ERROR:"):
 		body = strings.TrimSpace(strings.TrimPrefix(trimmed, "ERROR:"))
-	case strings.HasPrefix(trimmed, "ERROR "):
-		body = strings.TrimSpace(strings.TrimPrefix(trimmed, "ERROR "))
 	default:
 		return nil, false
 	}
@@ -206,6 +204,22 @@ func ParseErrorResponse(raw string) (*ErrorResponse, bool) {
 	}
 	parsed.ExplicitClassification = parsed.ClassExplicit && parsed.RetryableExplicit
 	return parsed, true
+}
+
+// ErrorCode returns the exact leading broker error code. It is the only
+// supported way for internal routing code to classify a textual controller
+// response before the server encodes it as a structured Wire v2 error frame.
+func ErrorCode(raw string) (string, bool) {
+	parsed, ok := ParseErrorResponse(raw)
+	if !ok {
+		return "", false
+	}
+	return parsed.Code, true
+}
+
+func IsErrorResponse(raw string) bool {
+	_, ok := ParseErrorResponse(raw)
+	return ok
 }
 
 func EnrichErrorResponse(raw string) string {

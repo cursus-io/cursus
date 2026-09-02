@@ -43,6 +43,7 @@ func (d *DiskHandler) OpenForRead(offset uint64) (*ReadSession, error) {
 		return nil, err
 	}
 
+	// #nosec G304 -- path is selected from DiskHandler's validated segment inventory.
 	f, err := os.Open(path)
 	if err != nil {
 		atomic.AddInt32(&d.activeReaders, -1)
@@ -208,9 +209,9 @@ func (d *DiskHandler) EnforceRetention(cfg *config.Config) {
 		meta := metas[i]
 
 		if meta.info.Mode().Perm() != 0444 {
-			_ = os.Chmod(meta.path, 0444)
+			_ = os.Chmod(meta.path, 0o400)
 			indexPath := strings.TrimSuffix(meta.path, ".log") + ".index"
-			_ = os.Chmod(indexPath, 0444)
+			_ = os.Chmod(indexPath, 0o400)
 			util.Debug("Segment %s secured (read-only)", filepath.Base(meta.path))
 		}
 
@@ -237,6 +238,9 @@ func (d *DiskHandler) markAsDeleted(logPath string) error {
 	segmentOffset, err := strconv.ParseUint(numStr, 10, 64)
 	if err != nil {
 		return fmt.Errorf("failed to parse offset from filename %s: %w", filepath.Base(logPath), err)
+	}
+	if err := d.segmentReaders.invalidate(segmentOffset); err != nil {
+		return fmt.Errorf("invalidate retained segment %d reader: %w", segmentOffset, err)
 	}
 
 	deletedLogPath := logPath + ".deleted"

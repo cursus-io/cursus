@@ -10,26 +10,25 @@ import (
 )
 
 type StreamManager struct {
-	streams   map[string]*StreamConnection // key: "topic:partition:group"
-	mu        sync.RWMutex
-	maxConn   int
-	timeout   time.Duration
-	heartbeat time.Duration
+	streams    map[string]*StreamConnection // key: "topic:partition:group"
+	mu         sync.RWMutex
+	maxConn    int
+	timeout    time.Duration
+	scheduling bool
+	scheduleCh chan struct{}
 }
 
-func NewStreamManager(maxConn int, timeout, heartbeat time.Duration) *StreamManager {
+func NewStreamManager(maxConn int, timeout time.Duration) *StreamManager {
 	return &StreamManager{
-		streams:   make(map[string]*StreamConnection),
-		maxConn:   maxConn,
-		timeout:   timeout,
-		heartbeat: heartbeat,
+		streams:    make(map[string]*StreamConnection),
+		maxConn:    maxConn,
+		timeout:    timeout,
+		scheduleCh: make(chan struct{}, 1),
 	}
 }
 
-// AddStream accepts a legacy commit interval that is intentionally ignored.
 func (sm *StreamManager) AddStream(key string, stream *StreamConnection,
 	readFn func(offset uint64, max int) ([]types.Message, error),
-	legacyCommitInterval time.Duration,
 ) error {
 	sm.mu.Lock()
 	previous, exists := sm.streams[key]
@@ -38,13 +37,24 @@ func (sm *StreamManager) AddStream(key string, stream *StreamConnection,
 		return fmt.Errorf("maximum connections (%d) reached", sm.maxConn)
 	}
 	sm.streams[key] = stream
+	startScheduler := !sm.scheduling
+	if startScheduler {
+		sm.scheduling = true
+	}
 	sm.mu.Unlock()
 
 	if previous != nil && previous != stream {
 		previous.StopWithReason(StreamControlReasonReplaced)
 	}
-	go stream.Run(readFn, legacyCommitInterval)
-	go sm.monitorConnection(key, stream)
+	go func() {
+		stream.Run(readFn)
+		sm.removeStreamIfCurrent(key, stream)
+	}()
+	if startScheduler {
+		go sm.runScheduler()
+	} else {
+		sm.wakeScheduler()
+	}
 	return nil
 }
 
@@ -57,6 +67,7 @@ func (sm *StreamManager) RemoveStream(key string) {
 	sm.mu.Unlock()
 	if ok {
 		stream.StopWithReason(StreamControlReasonRemoved)
+		sm.wakeScheduler()
 	}
 }
 
@@ -68,26 +79,90 @@ func (sm *StreamManager) removeStreamIfCurrent(key string, stream *StreamConnect
 		return false
 	}
 	delete(sm.streams, key)
+	sm.wakeScheduler()
 	return true
 }
 
-func (sm *StreamManager) monitorConnection(key string, stream *StreamConnection) {
-	ticker := time.NewTicker(sm.heartbeat)
-	defer ticker.Stop()
+func (sm *StreamManager) runScheduler() {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	type scheduledStream struct {
+		key    string
+		stream *StreamConnection
+	}
+	scheduled := make([]scheduledStream, 0)
 	for {
+		var now time.Time
 		select {
-		case <-stream.stopCh:
-			sm.removeStreamIfCurrent(key, stream)
-			stream.closeConn()
+		case now = <-timer.C:
+		case <-sm.scheduleCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			now = time.Now()
+		}
+		sm.mu.Lock()
+		if len(sm.streams) == 0 {
+			sm.scheduling = false
+			sm.mu.Unlock()
 			return
-		case <-ticker.C:
-			if time.Since(stream.LastActive()) > sm.timeout {
-				sm.removeStreamIfCurrent(key, stream)
-				stream.StopWithReason(StreamControlReasonTimeout)
-				stream.closeConn()
-				return
+		}
+		scheduled = scheduled[:0]
+		for key, stream := range sm.streams {
+			scheduled = append(scheduled, scheduledStream{key: key, stream: stream})
+		}
+		sm.mu.Unlock()
+
+		var nextWake time.Time
+		for _, item := range scheduled {
+			key, stream := item.key, item.stream
+			if sm.timeout > 0 && now.Sub(stream.LastActive()) > sm.timeout {
+				if sm.removeStreamIfCurrent(key, stream) {
+					stream.StopWithReason(StreamControlReasonTimeout)
+				}
+				continue
+			}
+			stream.schedule(now)
+			next := stream.nextScheduledAt()
+			if sm.timeout > 0 {
+				timeoutAt := stream.LastActive().Add(sm.timeout)
+				if next.IsZero() || timeoutAt.Before(next) {
+					next = timeoutAt
+				}
+			}
+			if nextWake.IsZero() || next.Before(nextWake) {
+				nextWake = next
 			}
 		}
+
+		sm.mu.Lock()
+		if len(sm.streams) == 0 {
+			sm.scheduling = false
+			sm.mu.Unlock()
+			return
+		}
+		sm.mu.Unlock()
+		wait := time.Until(nextWake)
+		if nextWake.IsZero() || wait < time.Millisecond {
+			wait = time.Millisecond
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(wait)
+	}
+}
+
+func (sm *StreamManager) wakeScheduler() {
+	select {
+	case sm.scheduleCh <- struct{}{}:
+	default:
 	}
 }
 

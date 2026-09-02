@@ -162,17 +162,24 @@ func closePartiallyInitializedTopic(name string, provider HandlerProvider, parti
 // getPartitionIndex computes the target partition index without acquiring any lock.
 // The caller must hold at least RLock and pass the current partition count.
 func (t *Topic) getPartitionIndex(msg types.Message, partitionsLen int) int {
-	if partitionsLen == 0 {
+	partitionCount, ok := util.SafeIntToUint64(partitionsLen)
+	if !ok || partitionCount == 0 {
 		return -1
 	}
 
+	var candidate uint64
 	if t.Policy.Partitioner == PartitionerHashKey && msg.Key != "" {
 		keyID := util.GenerateID(msg.Key)
-		return int(keyID % uint64(partitionsLen))
+		candidate = keyID % partitionCount
+	} else {
+		oldCounter := atomic.AddUint64(&t.counter, 1) - 1
+		candidate = oldCounter % partitionCount
 	}
-
-	oldCounter := atomic.AddUint64(&t.counter, 1) - 1
-	return int(oldCounter % uint64(partitionsLen))
+	partitionIndex, ok := util.SafeUint64ToInt(candidate)
+	if !ok {
+		return -1
+	}
+	return partitionIndex
 }
 
 // GetPartitionForMessage returns the partition index for a message.
@@ -476,15 +483,4 @@ func (t *Topic) applyAssignments(groupName string, assignments map[string][]int)
 	}
 
 	util.Debug("Applied assignments for group '%s': %v", groupName, assignments)
-}
-
-func (t *Topic) NewMessageSignal(partition int) <-chan struct{} {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	if partition < 0 || partition >= len(t.Partitions) {
-		util.Warn("NewMessageSignal called with invalid partition %d for topic '%s'", partition, t.Name)
-		return nil
-	}
-	return t.Partitions[partition].newMessageCh
 }

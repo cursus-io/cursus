@@ -47,14 +47,7 @@ func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 }
 
 func (s *BrokerFSMSnapshot) writeVersion() int {
-	for _, definition := range s.topicState {
-		if definition != nil && definition.LifecycleEpoch > topic.InitialLifecycleEpoch {
-			return 8
-		}
-	}
-	// A first-generation snapshot carries additive epoch fields but retains the
-	// previous version so old followers can keep participating while upgrading.
-	return 7
+	return SnapshotVersionCurrent
 }
 
 func (s *BrokerFSMSnapshot) Release() {}

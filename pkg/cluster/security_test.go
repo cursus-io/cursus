@@ -1,20 +1,20 @@
 package cluster
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/cursus-io/cursus/pkg/wire"
+)
 
 func TestSecureClusterServerAuthenticatesWithoutExposingCommand(t *testing.T) {
 	server := NewSecureClusterServer(nil, "secret-token", nil)
-	if _, ok := server.authenticate("JOIN_CLUSTER {}"); ok {
+	if server.authenticate(wire.CommandPayload{Fields: map[string]string{}}) {
 		t.Fatal("unauthenticated cluster command was accepted")
 	}
-	if _, ok := server.authenticate("AUTH wrong JOIN_CLUSTER {}"); ok {
+	if server.authenticate(wire.CommandPayload{Fields: map[string]string{"auth_token": "wrong"}}) {
 		t.Fatal("cluster command with wrong token was accepted")
 	}
-	command, ok := server.authenticate("AUTH secret-token JOIN_CLUSTER {}")
-	if !ok || command != "JOIN_CLUSTER {}" {
-		t.Fatalf("authenticated command = %q, accepted=%v", command, ok)
-	}
-	if got := clusterCommandName(command); got != "JOIN_CLUSTER" {
-		t.Fatalf("command name = %q", got)
+	if !server.authenticate(wire.CommandPayload{Fields: map[string]string{"auth_token": "secret-token"}}) {
+		t.Fatal("cluster command with exact token was rejected")
 	}
 }

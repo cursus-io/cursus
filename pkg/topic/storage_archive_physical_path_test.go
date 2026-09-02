@@ -12,7 +12,7 @@ func TestArchiveOrphanTopicRejectsSymlinkedParentIntoLogRoot(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "logs")
 	require.NoError(t, os.Mkdir(root, 0o750))
-	writeMigrationSegment(t, root, "orphan", 0, 0, nil)
+	writePersistedTestSegment(t, root, "orphan", 0, 0, nil)
 	inside := filepath.Join(root, "inside")
 	require.NoError(t, os.Mkdir(inside, 0o750))
 	alias := filepath.Join(parent, "alias")

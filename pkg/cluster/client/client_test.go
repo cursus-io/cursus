@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,8 +9,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/stretchr/testify/assert"
 )
+
+func serveJoinResponse(conn net.Conn, success bool, errorMessage string) {
+	connection, err := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
+	if err != nil {
+		return
+	}
+	request, err := connection.ReadFrame()
+	if err != nil {
+		return
+	}
+	response, err := json.Marshal(map[string]any{"success": success, "error": errorMessage})
+	if err != nil {
+		return
+	}
+	_ = connection.WriteFrame(wire.Frame{
+		Kind: wire.KindResponse, Command: request.Command, Status: wire.StatusOK,
+		RequestID: request.RequestID, Payload: response,
+	})
+}
 
 func TestNewTCPClusterClient(t *testing.T) {
 	client := NewTCPClusterClient()
@@ -49,26 +68,7 @@ func TestJoinCluster_Success(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 
-			// Read length
-			lenBuf := make([]byte, 4)
-			_, _ = io.ReadFull(conn, lenBuf)
-			length := binary.BigEndian.Uint32(lenBuf)
-
-			// Read message
-			msgBuf := make([]byte, length)
-			_, _ = io.ReadFull(conn, msgBuf)
-
-			// Send success response
-			resp := map[string]interface{}{
-				"success": true,
-			}
-			respData, _ := json.Marshal(resp)
-
-			respLenBuf := make([]byte, 4)
-			binary.BigEndian.PutUint32(respLenBuf, uint32(len(respData)))
-			_, _ = conn.Write(respLenBuf)
-			_, _ = conn.Write(respData)
-
+		serveJoinResponse(conn, true, "")
 	}()
 
 	client := NewTCPClusterClient()
@@ -96,24 +96,7 @@ func TestJoinCluster_Fail(t *testing.T) {
 				return
 			}
 
-			// Read request
-			lenBuf := make([]byte, 4)
-			_, _ = io.ReadFull(conn, lenBuf)
-			length := binary.BigEndian.Uint32(lenBuf)
-			msgBuf := make([]byte, length)
-			_, _ = io.ReadFull(conn, msgBuf)
-
-			// Send failure response
-			resp := map[string]interface{}{
-				"success": false,
-				"error":   "already joined",
-			}
-			respData, _ := json.Marshal(resp)
-
-			respLenBuf := make([]byte, 4)
-			binary.BigEndian.PutUint32(respLenBuf, uint32(len(respData)))
-			_, _ = conn.Write(respLenBuf)
-			_, _ = conn.Write(respData)
+			serveJoinResponse(conn, false, "already joined")
 			_ = conn.Close()
 		}
 	}()
@@ -164,12 +147,11 @@ func TestJoinCluster_FailsOverFromUnresponsiveSeed(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 
-		lenBuf := make([]byte, 4)
-		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		codec, err := wire.NewCodec(wire.CompressionNone)
+		if err != nil {
 			return
 		}
-		msgBuf := make([]byte, binary.BigEndian.Uint32(lenBuf))
-		if _, err := io.ReadFull(conn, msgBuf); err != nil {
+		if _, err := codec.ReadFrame(conn); err != nil {
 			return
 		}
 		close(stalled)
@@ -185,24 +167,23 @@ func TestJoinCluster_FailsOverFromUnresponsiveSeed(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 
-		lenBuf := make([]byte, 4)
-		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		connection, err := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
+		if err != nil {
 			return
 		}
-		msgBuf := make([]byte, binary.BigEndian.Uint32(lenBuf))
-		if _, err := io.ReadFull(conn, msgBuf); err != nil {
+		request, err := connection.ReadFrame()
+		if err != nil {
 			return
 		}
 		close(healthyAccepted)
-
 		respData, err := json.Marshal(map[string]bool{"success": true})
 		if err != nil {
 			return
 		}
-		respLenBuf := make([]byte, 4)
-		binary.BigEndian.PutUint32(respLenBuf, uint32(len(respData)))
-		_, _ = conn.Write(respLenBuf)
-		_, _ = conn.Write(respData)
+		_ = connection.WriteFrame(wire.Frame{
+			Kind: wire.KindResponse, Command: request.Command, Status: wire.StatusOK,
+			RequestID: request.RequestID, Payload: respData,
+		})
 	}()
 
 	client := NewTCPClusterClient()
@@ -262,7 +243,7 @@ func TestStartHeartbeat(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	client.StartHeartbeat(ctx, []string{addr}, "node-hb", "127.0.0.1:9001", port)
+	client.StartHeartbeat(ctx, nil, "node-hb", addr, port, nil)
 
 	select {
 	case <-received:

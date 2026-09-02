@@ -4,11 +4,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 type MockRaft struct {
@@ -118,6 +120,18 @@ func TestBuildRaftConfigRejectsUnsafeSnapshotSettings(t *testing.T) {
 	}
 }
 
+func TestHighestFSMCommandIndexIgnoresNonCommandEntries(t *testing.T) {
+	store := raft.NewInmemStore()
+	require.NoError(t, store.StoreLogs([]*raft.Log{
+		{Index: 6, Type: raft.LogCommand, Data: []byte("PARTITION_COMMIT:{}")},
+		{Index: 7, Type: raft.LogConfiguration},
+		{Index: 8, Type: raft.LogBarrier},
+	}))
+	index, err := highestFSMCommandIndex(store, 5, 8)
+	require.NoError(t, err)
+	require.Equal(t, uint64(6), index)
+}
+
 func TestRaftReplicationManagerGetRaftStatus(t *testing.T) {
 	mr := new(MockRaft)
 	mr.On("Stats").Return(map[string]string{
@@ -214,11 +228,13 @@ type MockISRManager struct {
 func (m *MockISRManager) HasQuorum(topic string, partition int, minISR int) bool {
 	return m.Called(topic, partition, minISR).Bool(0)
 }
-func (m *MockISRManager) UpdateHeartbeat(id string)           { m.Called(id) }
-func (m *MockISRManager) GetISR(t string, p int) []string     { return nil }
-func (m *MockISRManager) ComputeISR(t string, p int) []string { return nil }
-func (m *MockISRManager) SetLeader(l bool)                    { m.Called(l) }
-func (m *MockISRManager) Start()                              { m.Called() }
+func (m *MockISRManager) UpdateHeartbeat(id string)                               { m.Called(id) }
+func (m *MockISRManager) BuildCatchupProofs() []fsm.ISRCatchupProof               { return nil }
+func (m *MockISRManager) SubmitCatchupProofs(string, []fsm.ISRCatchupProof) error { return nil }
+func (m *MockISRManager) GetISR(t string, p int) []string                         { return nil }
+func (m *MockISRManager) ComputeISR(t string, p int) []string                     { return nil }
+func (m *MockISRManager) SetLeader(l bool)                                        { m.Called(l) }
+func (m *MockISRManager) Start()                                                  { m.Called() }
 
 func TestRaftReplicationManager_ReplicateWithQuorum(t *testing.T) {
 	mr := new(MockRaft)

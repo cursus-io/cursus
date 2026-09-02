@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -167,12 +168,6 @@ func (cfg *Config) Normalize() {
 	if cfg.StreamTimeout <= 0 {
 		cfg.StreamTimeout = 30 * time.Minute
 	}
-	if cfg.StreamHeartbeatInterval <= 0 {
-		cfg.StreamHeartbeatInterval = 3 * time.Second
-	}
-	if cfg.StreamCommitInterval <= 0 {
-		cfg.StreamCommitInterval = 5 * time.Second
-	}
 }
 
 func overrideEnvInt(target *int, key string) {
@@ -229,23 +224,23 @@ func overrideEnvStringSlice(target *[]string, key string) {
 	}
 }
 
-func overrideEnvSASLUsers(target *[]SASLUser, key string) {
+func overrideEnvSASLUsers(target *[]SASLUser, key string) error {
 	if v := os.Getenv(key); v != "" {
 		entries := strings.Split(v, ",")
 		users := make([]SASLUser, 0, len(entries))
 		for _, entry := range entries {
-			parts := strings.SplitN(strings.TrimSpace(entry), ":", 2)
+			parts := strings.SplitN(strings.TrimSpace(entry), ":", 3)
 			principal := strings.TrimSpace(parts[0])
-			token := ""
-			if len(parts) == 2 {
-				token = strings.TrimSpace(parts[1])
+			if len(parts) != 3 || principal == "" || strings.TrimSpace(parts[1]) == "" {
+				return fmt.Errorf("invalid %s entry %q: expected principal:token:permission1|permission2", key, entry)
 			}
-			if len(parts) != 2 || principal == "" || token == "" {
-				util.Warn("Skipping invalid %s entry %q (expected principal:token)", key, entry)
-				continue
+			permissions := strings.Split(parts[2], "|")
+			for i := range permissions {
+				permissions[i] = strings.TrimSpace(permissions[i])
 			}
-			users = append(users, SASLUser{Principal: principal, Token: token})
+			users = append(users, SASLUser{Principal: principal, Token: strings.TrimSpace(parts[1]), Permissions: permissions})
 		}
 		*target = users
 	}
+	return nil
 }

@@ -4,8 +4,8 @@ import "testing"
 
 func TestEnrichErrorResponseAddsOnlyMissingMetadata(t *testing.T) {
 	tests := map[string]string{
-		"ERROR: custom class=availability":                          "ERROR: custom retryable=false class=availability",
-		"ERROR: NOT_LEADER retryable=false LEADER_IS broker-2:9000": "ERROR: NOT_LEADER class=routing retryable=false LEADER_IS broker-2:9000",
+		"ERROR: custom class=availability":                       "ERROR: custom retryable=false class=availability",
+		"ERROR: NOT_LEADER retryable=false leader=broker-2:9000": "ERROR: NOT_LEADER class=routing retryable=false leader=broker-2:9000",
 	}
 	for input, want := range tests {
 		if got := EnrichErrorResponse(input); got != want {

@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -47,17 +47,16 @@ func (bc *BrokerClient) TransactionalPublish(transactionalID, topic string, part
 }
 
 func (bc *BrokerClient) SendOffsetsToTransaction(transactionalID, topic, group, member string, generation int, producer TransactionProducer, offsets map[int]uint64) error {
-	partitions := make([]int, 0, len(offsets))
-	for partition := range offsets {
-		partitions = append(partitions, partition)
+	pairs := make([]wire.OffsetPair, 0, len(offsets))
+	for partition, offset := range offsets {
+		pairs = append(pairs, wire.OffsetPair{Partition: partition, Offset: offset})
 	}
-	sort.Ints(partitions)
-	pairs := make([]string, 0, len(partitions))
-	for _, partition := range partitions {
-		pairs = append(pairs, fmt.Sprintf("P%d:%d", partition, offsets[partition]))
+	encodedOffsets, err := wire.EncodeOffsetPairs(pairs)
+	if err != nil {
+		return err
 	}
-	cmd := fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=%s producerId=%s epoch=%d topic=%s group=%s member=%s generation=%d %s", transactionalID, producer.ProducerID, producer.Epoch, topic, group, member, generation, strings.Join(pairs, ","))
-	_, err := bc.transactionCommand(cmd)
+	cmd := fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=%s producerId=%s epoch=%d topic=%s group=%s member=%s generation=%d offsets=%s", transactionalID, producer.ProducerID, producer.Epoch, topic, group, member, generation, encodedOffsets)
+	_, err = bc.transactionCommand(cmd)
 	return err
 }
 
@@ -85,9 +84,6 @@ func (bc *BrokerClient) FindTransactionCoordinator(transactionalID string) (stri
 	if err != nil {
 		return "", err
 	}
-	if strings.HasPrefix(resp, "ERROR:") {
-		return "", fmt.Errorf("broker error: %s", resp)
-	}
 	coordinatorID := responseFields(resp)["coordinator_id"]
 	if coordinatorID == "" {
 		return "", fmt.Errorf("missing coordinator_id in response: %s", resp)
@@ -99,9 +95,6 @@ func (bc *BrokerClient) transactionCommand(command string) (string, error) {
 	resp, err := bc.SendCommand("", command, 10*time.Second)
 	if err != nil {
 		return "", err
-	}
-	if strings.HasPrefix(resp, "ERROR:") {
-		return "", fmt.Errorf("broker error: %s", resp)
 	}
 	if resp != "OK" && !strings.HasPrefix(resp, "OK ") {
 		return "", fmt.Errorf("unexpected transaction response: %s", resp)
@@ -124,11 +117,7 @@ func responseFields(resp string) map[string]string {
 func (bc *BrokerClient) CreateTopic(topic string, partitions int, idempotent bool) error {
 	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, partitions, idempotent)
 
-	err := bc.executeCommand("admin", createCmd)
-	if err != nil && strings.Contains(err.Error(), "topic exists") {
-		return nil
-	}
-	return err
+	return bc.executeCommand("admin", createCmd)
 }
 
 // PublishIdempotent sends a message with idempotence metadata.
@@ -153,13 +142,7 @@ func (bc *BrokerClient) PublishIdempotentToPartition(topic, producerID string, p
 			return fmt.Errorf("publish idempotent failed: %w", err)
 		}
 
-		conn, err := net.Dial("tcp", addr)
-		if err != nil {
-			return fmt.Errorf("connect: %w", err)
-		}
-		defer func() { _ = conn.Close() }()
-		cmdBytes := util.EncodeMessage("admin", publishCmd)
-		return util.WriteWithLength(conn, cmdBytes)
+		return sendOneWayWireCommand(addr, publishCmd)
 	}
 
 	return bc.executeCommand("admin", publishCmd)
@@ -175,13 +158,7 @@ func (bc *BrokerClient) PublishSimple(topic, payload, acks string) error {
 			return fmt.Errorf("publish simple failed: %w", err)
 		}
 
-		conn, err := net.Dial("tcp", addr)
-		if err != nil {
-			return fmt.Errorf("connect: %w", err)
-		}
-		defer func() { _ = conn.Close() }()
-		cmdBytes := util.EncodeMessage("admin", publishCmd)
-		return util.WriteWithLength(conn, cmdBytes)
+		return sendOneWayWireCommand(addr, publishCmd)
 	}
 
 	return bc.executeCommand("admin", publishCmd)
@@ -194,10 +171,6 @@ func (bc *BrokerClient) GetConsumerGroupStatus(groupID string) (*ConsumerGroupSt
 	respStr, err := bc.SendCommand("admin", statusCmd, 2*time.Second)
 	if err != nil {
 		return nil, err
-	}
-
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return nil, fmt.Errorf("broker error: %s", respStr)
 	}
 
 	var status ConsumerGroupStatus
@@ -249,10 +222,6 @@ func (bc *BrokerClient) FetchCommittedOffset(topic string, partition int, groupI
 	if err != nil {
 		return 0, err
 	}
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return 0, fmt.Errorf("broker error: %s", respStr)
-	}
-
 	if strings.HasPrefix(respStr, "OK") {
 		for _, part := range strings.Fields(respStr) {
 			if strings.HasPrefix(part, "offset=") {
@@ -266,12 +235,7 @@ func (bc *BrokerClient) FetchCommittedOffset(topic string, partition int, groupI
 		return 0, fmt.Errorf("missing offset in response: %s", respStr)
 	}
 
-	// Legacy brokers returned a plain integer offset.
-	var offset uint64
-	if n, err := fmt.Sscanf(respStr, "%d", &offset); err != nil || n != 1 {
-		return 0, fmt.Errorf("expected offset response, got: %s", respStr)
-	}
-	return offset, nil
+	return 0, fmt.Errorf("expected offset response, got: %s", respStr)
 }
 
 // joinGroup executes the JOIN_GROUP command and extracts generation and memberID.
@@ -288,10 +252,6 @@ func (bc *BrokerClient) JoinGroup(topic, group string) (int, string, error) {
 	resp, err := bc.SendCommand("", joinCmd, 2*time.Second)
 	if err != nil {
 		return 0, "", fmt.Errorf("join group failed: %w", err)
-	}
-
-	if strings.HasPrefix(resp, "ERROR:") {
-		return 0, "", fmt.Errorf("broker error: %s", resp)
 	}
 
 	var gen int
@@ -338,10 +298,6 @@ func (bc *BrokerClient) SyncGroup(topic, group string, generation int, memberID 
 		return nil, fmt.Errorf("sync group failed: %w", err)
 	}
 
-	if strings.HasPrefix(resp, "ERROR:") {
-		return nil, fmt.Errorf("broker error: %s", resp)
-	}
-
 	assignedPartitions := []int{}
 
 	const assignmentPrefix = "assignments="
@@ -376,36 +332,37 @@ func (bc *BrokerClient) SyncGroup(topic, group string, generation int, memberID 
 
 // ConsumeMessages reads messages from a partition
 func (bc *BrokerClient) ConsumeMessages(topic string, partition int, consumerGroup string, memberID string, generation int, timeout time.Duration) ([]string, error) {
+	bc.requestMu.Lock()
+	defer bc.requestMu.Unlock()
 	if err := bc.connect(); err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
 
 	bc.mu.Lock()
-	defer bc.mu.Unlock()
-
-	if bc.conn == nil {
+	conn := bc.conn
+	bc.mu.Unlock()
+	if conn == nil {
 		return nil, fmt.Errorf("connection not available after connect")
 	}
 
 	startOffset := 0
 	consumeCmd := fmt.Sprintf("CONSUME topic=%s partition=%d offset=%d group=%s autoOffsetReset=earliest member=%s generation=%d",
 		topic, partition, startOffset, consumerGroup, memberID, generation)
-	cmdBytes := util.EncodeMessage(topic, consumeCmd)
-
-	if err := util.WriteWithLength(bc.conn, cmdBytes); err != nil {
-		if resetErr := bc.conn.SetReadDeadline(time.Time{}); resetErr != nil {
+	command, requestID, err := bc.writeWireCommand(consumeCmd)
+	if err != nil {
+		if resetErr := conn.SetReadDeadline(time.Time{}); resetErr != nil {
 			util.Warn("failed to reset read deadline after send failure: %v", resetErr)
 		}
 		return nil, fmt.Errorf("send consume command: %w", err)
 	}
 
-	if err := bc.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, fmt.Errorf("set read deadline: %w", err)
 	}
 
-	rawData, err := util.ReadWithLength(bc.conn)
+	rawData, err := bc.readWirePayload(command, requestID)
 
-	if resetErr := bc.conn.SetReadDeadline(time.Time{}); resetErr != nil {
+	if resetErr := conn.SetReadDeadline(time.Time{}); resetErr != nil {
 		util.Warn("failed to reset read deadline: %v", resetErr)
 	}
 
@@ -424,7 +381,7 @@ func (bc *BrokerClient) ConsumeMessages(topic string, partition int, consumerGro
 		return nil, fmt.Errorf("broker error during consume: %s", string(rawData))
 	}
 
-	if len(rawData) >= 2 && rawData[0] == 0xBA && rawData[1] == 0x7C {
+	if wire.IsBatch(rawData) {
 		batch, err := util.DecodeBatchMessages(rawData)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode batch: %w", err)
@@ -456,32 +413,33 @@ func (bc *BrokerClient) ConsumeMessagesWithOffsets(topic string, partition int, 
 		return nil, nil, fmt.Errorf("fetch committed offset: %w", err)
 	}
 
+	bc.requestMu.Lock()
+	defer bc.requestMu.Unlock()
 	bc.mu.Lock()
-	defer bc.mu.Unlock()
-
-	if bc.conn == nil {
+	conn := bc.conn
+	bc.mu.Unlock()
+	if conn == nil {
 		return nil, nil, fmt.Errorf("connection not available after connect")
 	}
 
 	consumeCmd := fmt.Sprintf("CONSUME topic=%s partition=%d offset=%d group=%s autoOffsetReset=earliest member=%s generation=%d", topic, partition, startOffset, consumerGroup, memberID, generation)
-	cmdBytes := util.EncodeMessage(topic, consumeCmd)
-
-	if err := util.WriteWithLength(bc.conn, cmdBytes); err != nil {
+	command, requestID, err := bc.writeWireCommand(consumeCmd)
+	if err != nil {
 		return nil, nil, fmt.Errorf("send consume command: %w", err)
 	}
 
-	if err := bc.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, nil, fmt.Errorf("set read deadline: %w", err)
 	}
 
-	rawData, err := util.ReadWithLength(bc.conn)
-	_ = bc.conn.SetReadDeadline(time.Time{})
+	rawData, err := bc.readWirePayload(command, requestID)
+	_ = conn.SetReadDeadline(time.Time{})
 
 	if err != nil {
 		return nil, nil, fmt.Errorf("read batch message with offsets: %w", err)
 	}
 
-	if len(rawData) >= 2 && rawData[0] == 0xBA && rawData[1] == 0x7C {
+	if wire.IsBatch(rawData) {
 		batch, err := util.DecodeBatchMessages(rawData)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to decode batch: %w", err)

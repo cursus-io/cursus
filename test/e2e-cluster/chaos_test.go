@@ -1,6 +1,7 @@
 package e2e_cluster
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/e2e"
 )
 
@@ -187,7 +189,8 @@ func consumeFromPartitionLeader(t *testing.T, addrs []string, topic string, part
 			return messages
 		}
 		lastErr = err
-		if !strings.Contains(err.Error(), "NOT_LEADER") {
+		var brokerErr *wire.BrokerError
+		if !errors.As(err, &brokerErr) || (brokerErr.Code != "NOT_LEADER" && brokerErr.Code != "NOT_PARTITION_LEADER") {
 			break
 		}
 	}

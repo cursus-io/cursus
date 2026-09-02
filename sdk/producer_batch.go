@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/cursus-io/cursus/util"
 )
 
 func (p *Producer) sendBatch(part int, batch []Message) {
@@ -46,16 +48,8 @@ func (p *Producer) sendBatch(part int, batch []Message) {
 		return
 	}
 
-	payload, err := CompressMessage(data, p.config.CompressionType)
-	if err != nil {
-		LogError("compress batch failed: %v", err)
-		p.cleanupBatchState(part, batchID)
-		p.handleSendFailure(part, batch)
-		return
-	}
-
 	sendStart := time.Now()
-	ackResp, err := p.sendWithRetry(payload, part)
+	ackResp, err := p.sendWithRetry(data, part)
 	if err != nil {
 		LogError("send failed: %v", err)
 		if p.config.EnableMetrics {
@@ -73,7 +67,12 @@ func (p *Producer) sendBatch(part int, batch []Message) {
 		producerBatchLatency.WithLabelValues(p.config.Topic).Observe(time.Since(sendStart).Seconds())
 	}
 
-	p.attemptsCount.Add(uint64(len(batch)))
+	batchCount, ok := util.SafeIntToUint64(len(batch))
+	if !ok {
+		LogError("invalid negative batch length: %d", len(batch))
+		return
+	}
+	p.attemptsCount.Add(batchCount)
 
 	switch ackResp.Status {
 	case "OK":
@@ -276,6 +275,11 @@ func (p *Producer) waitForRetry(backoffMS int) bool {
 }
 
 func (p *Producer) markBatchAckedByID(part int, batchID string, batchLen int) {
+	batchCount, ok := util.SafeIntToUint64(batchLen)
+	if !ok {
+		LogError("invalid negative acknowledged batch length: %d", batchLen)
+		return
+	}
 	p.partitionBatchMus[part].Lock()
 	state, ok := p.partitionBatchStates[part][batchID]
 	if !ok || state.Acked {
@@ -284,7 +288,7 @@ func (p *Producer) markBatchAckedByID(part int, batchID string, batchLen int) {
 	}
 
 	state.Acked = true
-	p.uniqueCount.Add(uint64(batchLen))
+	p.uniqueCount.Add(batchCount)
 
 	delete(p.partitionBatchStates[part], batchID)
 	p.partitionBatchMus[part].Unlock()
@@ -318,11 +322,6 @@ func (p *Producer) markBatchAckedByID(part int, batchID string, batchLen int) {
 }
 
 func (p *Producer) parseAckResponse(resp []byte) (*AckResponse, error) {
-	respStr := strings.TrimSpace(string(resp))
-	if brokerErr, ok := ParseBrokerError(respStr); ok {
-		return nil, brokerErr
-	}
-
 	var ackResp AckResponse
 	if err := json.Unmarshal(resp, &ackResp); err != nil {
 		return nil, fmt.Errorf("invalid ack format: %w", err)

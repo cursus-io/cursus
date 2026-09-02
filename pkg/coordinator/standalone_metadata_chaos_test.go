@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +34,7 @@ func TestStandaloneAckedOffsetSurvivesAbruptProcessExit(t *testing.T) {
 
 	root := t.TempDir()
 	readyPath := filepath.Join(root, "commit-acked")
+	// #nosec G204,G702 -- os.Args[0] is the current Go test binary and the test selector is constant.
 	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestStandaloneAckedOffsetSurvivesAbruptProcessExit$")
 	command.Env = append(os.Environ(),
 		abruptChildEnv+"=1",
@@ -86,6 +86,7 @@ func runAbruptMetadataChild(t *testing.T) {
 	require.NoError(t, cd.RegisterGroup("events", "workers", 2))
 	require.NoError(t, cd.CommitOffset("workers", "events", 0, 37))
 	require.ErrorContains(t, cd.CommitOffset("workers", "events", 0, 36), "offset regression")
+	// #nosec G703 -- the parent test sets this path to a file beneath t.TempDir.
 	require.NoError(t, os.WriteFile(os.Getenv(abruptReadyEnv), []byte("acked"), 0o600))
 }
 
@@ -102,7 +103,7 @@ func TestStandaloneConsumerMetadataCompactionKeepsLatestStateAcrossRestarts(t *t
 	for next := uint64(1); next <= 12; next++ {
 		require.NoError(t, cd.CommitOffset("workers", "events", 0, next))
 	}
-	firstCompaction := compactWorkerMetadata(t, dm, tm, 12, "first")
+	firstCompaction := compactWorkerMetadata(t, dm, tm, 12)
 	require.Greater(t, firstCompaction.RecordsRemoved, 0)
 	cd.Stop()
 	tm.Stop()
@@ -116,7 +117,7 @@ func TestStandaloneConsumerMetadataCompactionKeepsLatestStateAcrossRestarts(t *t
 	for next := uint64(13); next <= 20; next++ {
 		require.NoError(t, second.CommitOffset("workers", "events", 0, next))
 	}
-	secondCompaction := compactWorkerMetadata(t, secondDM, secondTM, 20, "second")
+	secondCompaction := compactWorkerMetadata(t, secondDM, secondTM, 20)
 	require.Greater(t, secondCompaction.RecordsRemoved, 0)
 	second.Stop()
 	secondTM.Stop()
@@ -134,7 +135,7 @@ func TestStandaloneConsumerMetadataCompactionKeepsLatestStateAcrossRestarts(t *t
 	require.ErrorContains(t, final.CommitOffset("workers", "events", 0, 19), "offset regression")
 }
 
-func compactWorkerMetadata(t *testing.T, dm *disk.DiskManager, tm *topic.TopicManager, latest uint64, cycle string) disk.CompactionResult {
+func compactWorkerMetadata(t *testing.T, dm *disk.DiskManager, tm *topic.TopicManager, latest uint64) disk.CompactionResult {
 	t.Helper()
 	internal := tm.GetTopic(config.ConsumerOffsetsTopicName)
 	require.NotNil(t, internal)
@@ -144,13 +145,16 @@ func compactWorkerMetadata(t *testing.T, dm *disk.DiskManager, tm *topic.TopicMa
 	require.NoError(t, err)
 	handler, ok := storage.(*disk.DiskHandler)
 	require.True(t, ok)
-	payload, err := json.Marshal(coordinator.OffsetCommitMessage{
-		Group: "workers", Topic: "events", Partition: 0, Offset: latest,
+	payload, err := json.Marshal(coordinator.ConsumerMetadataRecord{
+		Version: coordinator.ConsumerMetadataRecordVersion,
+		Type:    coordinator.ConsumerMetadataRecordOffsetSnapshot,
+		Group:   "workers", Topic: "events", Epoch: 1, Revision: latest,
+		Offsets: []coordinator.OffsetItem{{Partition: 0, Offset: latest}},
 	})
 	require.NoError(t, err)
 	for index := 0; index < 8; index++ {
 		_, err = handler.AppendMessageSync(config.ConsumerOffsetsTopicName, partitionID, &types.Message{
-			Key: fmt.Sprintf("%s-filler-%d", cycle, index), Payload: string(payload),
+			Key: key, Payload: string(payload),
 		})
 		require.NoError(t, err)
 	}

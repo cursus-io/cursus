@@ -2,7 +2,6 @@ package coordinator
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -17,7 +16,7 @@ func TestCoordinatorStateRoundTripPreservesGroupMetadata(t *testing.T) {
 
 	exported := source.ExportState()
 	restored := NewCoordinator(context.Background(), &config.Config{}, &DummyPublisher{})
-	restored.ImportState(exported)
+	require.NoError(t, restored.ImportState(exported))
 
 	status, err := restored.GetGroupStatus("workers")
 	require.NoError(t, err)
@@ -32,33 +31,25 @@ func TestCoordinatorImportStateReplacesExistingGroups(t *testing.T) {
 
 	restored := NewCoordinator(context.Background(), &config.Config{}, &DummyPublisher{})
 	require.NoError(t, restored.RegisterGroup("legacy", "stale", 1))
-	restored.ImportState(source.ExportState())
+	require.NoError(t, restored.ImportState(source.ExportState()))
 
 	require.ElementsMatch(t, []string{"current"}, restored.ListGroups())
 	_, err := restored.GetGroupStatus("stale")
 	require.Error(t, err)
 }
 
-func TestCoordinatorImportStateInfersPartitionsFromLegacySnapshot(t *testing.T) {
-	var legacy map[string]*GroupStateSnapshot
-	require.NoError(t, json.Unmarshal([]byte(`{
-		"workers": {
-			"topic": "orders",
-			"generation": 3,
-			"members": {"worker-1": [0, 1], "worker-2": [2, 3]},
-			"offsets": {}
-		}
-	}`), &legacy))
-
+func TestCoordinatorImportStateRejectsIncompleteSnapshot(t *testing.T) {
 	restored := NewCoordinator(context.Background(), &config.Config{}, &DummyPublisher{})
-	restored.ImportState(legacy)
-	restored.Rebalance("workers")
-
-	status, err := restored.GetGroupStatus("workers")
-	require.NoError(t, err)
-	require.Equal(t, 4, status.PartitionCount)
-	require.ElementsMatch(t, []int{0, 1}, restored.GetMemberAssignments("workers", "worker-1"))
-	require.ElementsMatch(t, []int{2, 3}, restored.GetMemberAssignments("workers", "worker-2"))
+	err := restored.ImportState(map[string]*GroupStateSnapshot{
+		"workers": {
+			TopicName:  "orders",
+			Generation: 3,
+			Members:    map[string][]int{"worker-1": {0, 1}, "worker-2": {2, 3}},
+			Offsets:    map[string]map[int]uint64{},
+		},
+	})
+	require.ErrorContains(t, err, "missing registration epoch")
+	require.Empty(t, restored.ListGroups())
 }
 
 func TestCoordinatorSnapshotPreservesDeletedGroupEpoch(t *testing.T) {
@@ -73,7 +64,7 @@ func TestCoordinatorSnapshotPreservesDeletedGroupEpoch(t *testing.T) {
 
 	restored := NewCoordinator(context.Background(), &config.Config{}, &DummyPublisher{})
 	t.Cleanup(restored.Stop)
-	restored.ImportState(exported)
+	require.NoError(t, restored.ImportState(exported))
 	require.Empty(t, restored.ListGroups())
 	require.NoError(t, restored.RegisterGroup("orders", "workers", 1))
 

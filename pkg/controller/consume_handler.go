@@ -248,17 +248,13 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	streamConn.SetBatchSize(cArgs.BatchSize)
 	streamConn.SetInterval(100 * time.Millisecond)
 
-	// Pass partition's message signal for event-driven streaming
-	signalCh := t.NewMessageSignal(cArgs.PartitionID)
-	if signalCh != nil {
-		streamConn.SetNewMessageCh(signalCh)
-	}
+	streamConn.SetMessageSource(p.MessageNotification)
 
 	readFn := func(offset uint64, max int) ([]types.Message, error) {
 		return readPartitionMessages(p, offset, max, cArgs.ReadIsolation)
 	}
 
-	return ch.StreamManager.AddStream(streamKey, streamConn, readFn, 0)
+	return ch.StreamManager.AddStream(streamKey, streamConn, readFn)
 }
 
 func readPartitionMessages(p *topic.Partition, offset uint64, max int, isolation string) ([]types.Message, error) {
@@ -302,7 +298,14 @@ func (ch *CommandHandler) checkPartitionLeaderOrRedirect(conn net.Conn, topicNam
 	}
 
 	leaderAddr := ch.resolvePartitionLeaderAddr(topicName, partitionID)
-	errResp := fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", leaderAddr)
+	if leaderAddr == "" {
+		errResp := fmt.Sprintf("ERROR: leader_not_found topic=%s partition=%d", topicName, partitionID)
+		if err := util.WriteWithLength(conn, []byte(errResp)); err != nil {
+			return fmt.Errorf("failed to send missing partition leader response: %w", err)
+		}
+		return fmt.Errorf("partition leader not found")
+	}
+	errResp := fmt.Sprintf("ERROR: NOT_LEADER leader=%s", leaderAddr)
 	if err := util.WriteWithLength(conn, []byte(errResp)); err != nil {
 		return fmt.Errorf("failed to send partition leader redirect: %w", err)
 	}
@@ -336,7 +339,7 @@ func (ch *CommandHandler) checkLeaderOrRedirect(conn net.Conn) error {
 		serviceLeader = net.JoinHostPort(host, strconv.Itoa(port))
 	}
 
-	errResp := fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", serviceLeader)
+	errResp := fmt.Sprintf("ERROR: NOT_LEADER leader=%s", serviceLeader)
 	util.Warn("leader redirect: %s", errResp)
 	if err := util.WriteWithLength(conn, []byte(errResp)); err != nil {
 		return fmt.Errorf("failed to send leader redirect: %w", err)

@@ -1,6 +1,7 @@
 package subscriber
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -68,34 +70,21 @@ type offsetOutOfRangeFrame struct {
 	Latest    uint64
 }
 
-func parseOffsetOutOfRangeFrame(respStr string) (offsetOutOfRangeFrame, bool) {
-	if !strings.Contains(respStr, "OFFSET_OUT_OF_RANGE") {
-		return offsetOutOfRangeFrame{}, false
-	}
+func offsetOutOfRangeFromFields(fields map[string]string) (offsetOutOfRangeFrame, bool) {
 	frame := offsetOutOfRangeFrame{}
-	hasEarliest := false
-	hasLatest := false
-	for _, field := range strings.Fields(respStr) {
-		key, value, ok := strings.Cut(field, "=")
-		if !ok {
-			continue
-		}
-		parsed, err := strconv.ParseUint(value, 10, 64)
+	values := map[string]uint64{}
+	for key, value := range fields {
+		parsedValue, err := strconv.ParseUint(value, 10, 64)
 		if err != nil {
 			continue
 		}
-		switch key {
-		case "requested":
-			frame.Requested = parsed
-		case "earliest":
-			frame.Earliest = parsed
-			hasEarliest = true
-		case "latest":
-			frame.Latest = parsed
-			hasLatest = true
-		}
+		values[key] = parsedValue
 	}
-	return frame, hasEarliest && hasLatest
+	requested, requestedOK := values["requested"]
+	earliest, earliestOK := values["earliest"]
+	latest, latestOK := values["latest"]
+	frame.Requested, frame.Earliest, frame.Latest = requested, earliest, latest
+	return frame, requestedOK && earliestOK && latestOK
 }
 
 type streamControlFrame struct {
@@ -202,23 +191,28 @@ func (pc *PartitionConsumer) handleStreamControl(data []byte) bool {
 		return true
 	}
 }
-func (pc *PartitionConsumer) handleBrokerError(data []byte) bool {
-	respStr := string(data)
-	if !strings.HasPrefix(respStr, "ERROR:") {
+func (pc *PartitionConsumer) handleBrokerError(err error) bool {
+	var brokerErr *wire.BrokerError
+	if !errors.As(err, &brokerErr) {
 		return false
 	}
 
-	util.Warn("Partition [%d] broker error: %s", pc.partitionID, respStr)
+	util.Warn("Partition [%d] broker error: code=%s class=%s retryable=%t", pc.partitionID, brokerErr.Code, brokerErr.Class, brokerErr.Retryable)
 
-	if frame, ok := parseOffsetOutOfRangeFrame(respStr); ok {
+	if brokerErr.Code == "OFFSET_OUT_OF_RANGE" {
+		frame, ok := offsetOutOfRangeFromFields(brokerErr.Fields)
+		if !ok {
+			pc.closeConnection()
+			return true
+		}
 		return pc.handleOffsetOutOfRange(frame)
 	}
 
-	if strings.Contains(respStr, "NOT_LEADER") {
-		pc.consumer.handleLeaderRedirection(respStr)
+	if brokerErr.Code == "NOT_LEADER" || brokerErr.Code == "NOT_PARTITION_LEADER" {
+		pc.consumer.handleLeaderRedirection(brokerErr.Fields["leader"])
 	}
 
-	if strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "REBALANCE_REQUIRED") || strings.Contains(respStr, "NOT_OWNER") {
+	if brokerErr.Code == "GEN_MISMATCH" || brokerErr.Code == "REBALANCE_REQUIRED" || brokerErr.Code == "NOT_OWNER" {
 		pc.close()
 		pc.consumer.handleRebalanceSignal()
 		return true

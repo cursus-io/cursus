@@ -8,18 +8,19 @@ import (
 )
 
 func encodeOffset(partition int, offset int64) []byte {
-	var buf [16]byte
-	binary.BigEndian.PutUint64(buf[0:8], uint64(partition))
-	binary.BigEndian.PutUint64(buf[8:16], uint64(offset))
-	return buf[:]
+	var buf [2 * binary.MaxVarintLen64]byte
+	length := binary.PutVarint(buf[:], int64(partition))
+	length += binary.PutVarint(buf[length:], offset)
+	return buf[:length]
 }
 
 func encodeMessageID(partition int, producerID string, seqNum uint64) []byte {
-	idLen := len(producerID)
-	buf := make([]byte, 4+idLen+8)
-	binary.BigEndian.PutUint32(buf[:4], uint32(partition))
-	copy(buf[4:4+idLen], []byte(producerID))
-	binary.BigEndian.PutUint64(buf[4+idLen:], seqNum)
+	var partitionBytes [binary.MaxVarintLen64]byte
+	partitionLength := binary.PutVarint(partitionBytes[:], int64(partition))
+	buf := make([]byte, partitionLength+len(producerID)+8)
+	copy(buf, partitionBytes[:partitionLength])
+	copy(buf[partitionLength:partitionLength+len(producerID)], producerID)
+	binary.BigEndian.PutUint64(buf[partitionLength+len(producerID):], seqNum)
 	return buf
 }
 
@@ -57,12 +58,12 @@ func NewBloomFilter(expected uint64, fpRate float64) *BloomFilter {
 
 func hashf(data []byte) (uint64, uint64) {
 	h1 := fnv.New64a()
-	h1.Write(data)
+	_, _ = h1.Write(data)
 	sum1 := h1.Sum64()
 
 	h2 := fnv.New64()
-	h2.Write([]byte{0x9e, 0x37, 0x79, 0xb9})
-	h2.Write(data)
+	_, _ = h2.Write([]byte{0x9e, 0x37, 0x79, 0xb9})
+	_, _ = h2.Write(data)
 	sum2 := h2.Sum64()
 
 	return sum1, sum2

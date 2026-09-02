@@ -21,7 +21,7 @@ func TestRestoreTopicsRejectsMissingInternalMetadataStorage(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
-			_, manifest, err := normalizeAndMarshalManifest([]Definition{{
+			_, manifest, err := normalizeAndMarshalCurrentManifest([]Definition{{
 				Name: config.ConsumerOffsetsTopicName, Partitions: 2, Policy: ConsumerMetadataPolicy(),
 			}})
 			require.NoError(t, err)

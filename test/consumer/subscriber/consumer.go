@@ -2,6 +2,7 @@ package subscriber
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/consumer/bench"
 	"github.com/cursus-io/cursus/util"
 
@@ -109,7 +111,16 @@ func (c *Consumer) getLeaderConn() (net.Conn, error) {
 		}
 	}
 
-	return conn, nil
+	return c.negotiateWire(conn)
+}
+
+func (c *Consumer) negotiateWire(conn net.Conn) (net.Conn, error) {
+	framed, err := wire.NewClientConn(conn, c.config.CompressionType)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return framed, nil
 }
 
 func (c *Consumer) findCoordinator() (string, error) {
@@ -121,7 +132,7 @@ func (c *Consumer) findCoordinator() (string, error) {
 
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	cmd := fmt.Sprintf("FIND_COORDINATOR group=%s", c.config.GroupID)
-	if err := util.WriteWithLength(conn, util.EncodeMessage("", cmd)); err != nil {
+	if err := util.WriteWithLength(conn, []byte(cmd)); err != nil {
 		return "", fmt.Errorf("send find_coordinator: %w", err)
 	}
 
@@ -158,6 +169,9 @@ func (c *Consumer) getCoordinatorConn() (net.Conn, error) {
 	if addr != "" {
 		conn, err := c.client.Connect(addr)
 		if err == nil {
+			conn, err = c.negotiateWire(conn)
+		}
+		if err == nil {
 			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 			return conn, nil
 		}
@@ -173,6 +187,10 @@ func (c *Consumer) getCoordinatorConn() (net.Conn, error) {
 	c.mu.Unlock()
 
 	conn, err := c.client.Connect(newAddr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err = c.negotiateWire(conn)
 	if err != nil {
 		return nil, err
 	}
@@ -198,18 +216,28 @@ func isLoopbackCoordinatorHost(host string) bool {
 	}
 }
 
-func (c *Consumer) handleNotCoordinator(respStr string) bool {
-	if !strings.Contains(respStr, "NOT_COORDINATOR") {
+func brokerErrorCode(err error, codes ...string) bool {
+	var brokerErr *wire.BrokerError
+	if !errors.As(err, &brokerErr) {
 		return false
 	}
-	var host, port string
-	for _, part := range strings.Fields(respStr) {
-		if strings.HasPrefix(part, "host=") {
-			host = strings.TrimPrefix(part, "host=")
-		} else if strings.HasPrefix(part, "port=") {
-			port = strings.TrimPrefix(part, "port=")
+	for _, code := range codes {
+		if brokerErr.Code == code {
+			return true
 		}
 	}
+	return false
+}
+
+func (c *Consumer) handleBrokerError(err error) bool {
+	var brokerErr *wire.BrokerError
+	if !errors.As(err, &brokerErr) {
+		return false
+	}
+	if brokerErr.Code != "NOT_COORDINATOR" {
+		return true
+	}
+	host, port := brokerErr.Fields["host"], brokerErr.Fields["port"]
 	if host != "" && port != "" {
 		newAddr := c.coordinatorAddrFromHostPort(host, port)
 		c.mu.Lock()
@@ -220,14 +248,6 @@ func (c *Consumer) handleNotCoordinator(respStr string) bool {
 	return true
 }
 
-func (c *Consumer) closeCommitConn(conn net.Conn) {
-	c.commitMu.Lock()
-	if c.commitConn == conn {
-		_ = conn.Close()
-		c.commitConn = nil
-	}
-	c.commitMu.Unlock()
-}
 func (c *Consumer) validateCommitConn() bool {
 	if c.commitConn == nil {
 		return false
@@ -502,19 +522,12 @@ func (c *Consumer) processRetryQueue() {
 	}
 }
 
-func (c *Consumer) handleLeaderRedirection(resp string) {
-	if strings.Contains(resp, "LEADER_IS") {
-		// "ERROR NOT_LEADER LEADER_IS 192.168.0.10:9000"
-		parts := strings.Fields(resp)
-		for i, part := range parts {
-			if part == "LEADER_IS" && i+1 < len(parts) {
-				newLeader := parts[i+1]
-				c.client.UpdateLeader(newLeader)
-				util.Debug("update leader: %s", newLeader)
-				break
-			}
-		}
+func (c *Consumer) handleLeaderRedirection(leader string) {
+	if leader == "" {
+		return
 	}
+	c.client.UpdateLeader(leader)
+	util.Debug("update leader: %s", leader)
 }
 
 // heartbeatLoop runs in background; if coordinator indicates generation mismatch or error => trigger rejoin
@@ -547,7 +560,7 @@ func (c *Consumer) heartbeatLoop() {
 
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 			hb := fmt.Sprintf("HEARTBEAT topic=%s group=%s member=%s generation=%d", c.config.Topic, c.config.GroupID, c.memberID, c.generation)
-			if err := util.WriteWithLength(conn, util.EncodeMessage("", hb)); err != nil {
+			if err := util.WriteWithLength(conn, []byte(hb)); err != nil {
 				util.Error("heartbeat send failed: %v", err)
 				c.cleanupHbConn(conn)
 				continue
@@ -557,23 +570,22 @@ func (c *Consumer) heartbeatLoop() {
 			_ = conn.SetDeadline(time.Time{})
 
 			if err != nil {
+				c.handleBrokerError(err)
 				util.Error("heartbeat response failed: %v", err)
 				c.cleanupHbConn(conn)
+				if brokerErrorCode(err, "REBALANCE_REQUIRED", "GEN_MISMATCH", "NOT_OWNER") {
+					select {
+					case c.rebalanceSig <- struct{}{}:
+					default:
+					}
+					return
+				}
 				continue
 			}
 
 			respStr := string(resp)
-			if c.handleNotCoordinator(respStr) {
-				c.cleanupHbConn(conn)
-				continue
-			}
-			if strings.Contains(respStr, "REBALANCE_REQUIRED") || strings.Contains(respStr, "GEN_MISMATCH") {
-				util.Warn("heartbeat indicated rebalance/mismatch: %s", respStr)
-				select {
-				case c.rebalanceSig <- struct{}{}:
-				default:
-				}
-				return
+			if respStr != "OK" && !strings.HasPrefix(respStr, "OK ") {
+				util.Warn("unexpected heartbeat response: %s", respStr)
 			}
 		}
 	}
@@ -794,19 +806,17 @@ func (c *Consumer) joinGroup() (generation int64, memberID string, assignments [
 	}
 
 	joinCmd := fmt.Sprintf("JOIN_GROUP topic=%s group=%s member=%s", c.config.Topic, c.config.GroupID, mID)
-	if err := util.WriteWithLength(conn, util.EncodeMessage("", joinCmd)); err != nil {
+	if err := util.WriteWithLength(conn, []byte(joinCmd)); err != nil {
 		return 0, "", nil, fmt.Errorf("send join command: %w", err)
 	}
 
 	resp, err := util.ReadWithLength(conn)
 	if err != nil {
+		c.handleBrokerError(err)
 		return 0, "", nil, fmt.Errorf("read response: %w", err)
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if c.handleNotCoordinator(respStr) {
-		return 0, "", nil, fmt.Errorf("coordinator moved, retry")
-	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return 0, "", nil, fmt.Errorf("join group rejected: %s", respStr)
 	}
@@ -865,19 +875,17 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	defer func() { _ = conn.Close() }()
 
 	syncCmd := fmt.Sprintf("SYNC_GROUP topic=%s group=%s member=%s generation=%d", c.config.Topic, c.config.GroupID, memberID, generation)
-	if err := util.WriteWithLength(conn, util.EncodeMessage("", syncCmd)); err != nil {
+	if err := util.WriteWithLength(conn, []byte(syncCmd)); err != nil {
 		return nil, fmt.Errorf("send sync command: %w", err)
 	}
 
 	resp, err := util.ReadWithLength(conn)
 	if err != nil {
+		c.handleBrokerError(err)
 		return nil, fmt.Errorf("read sync response: %w", err)
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if c.handleNotCoordinator(respStr) {
-		return nil, fmt.Errorf("coordinator moved, retry")
-	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return nil, fmt.Errorf("sync group rejected: %s", respStr)
 	}
@@ -913,7 +921,7 @@ func (c *Consumer) fetchOffsetWithRetry(partition int) (uint64, error) {
 			return offset, nil
 		}
 		lastErr = err
-		if !strings.Contains(err.Error(), "group_not_found") && !strings.Contains(err.Error(), "member_not_found") {
+		if !brokerErrorCode(err, "group_not_found", "member_not_found", "GROUP_NOT_FOUND", "MEMBER_NOT_FOUND") {
 			return 0, err
 		}
 		select {
@@ -938,23 +946,17 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	fetchCmd := fmt.Sprintf("FETCH_OFFSET topic=%s partition=%d group=%s", c.config.Topic, partition, c.config.GroupID)
-	if err := util.WriteWithLength(conn, util.EncodeMessage("", fetchCmd)); err != nil {
+	if err := util.WriteWithLength(conn, []byte(fetchCmd)); err != nil {
 		return 0, fmt.Errorf("fetch offset send failed: %v", err)
 	}
 
 	resp, err := util.ReadWithLength(conn)
 	if err != nil {
-		return 0, fmt.Errorf("fetch offset response failed: %v", err)
+		c.handleBrokerError(err)
+		return 0, fmt.Errorf("fetch offset response failed: %w", err)
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if c.handleNotCoordinator(respStr) {
-		return 0, fmt.Errorf("coordinator moved, retry")
-	}
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return 0, fmt.Errorf("fetch offset error: %s", respStr)
-	}
-
 	if strings.HasPrefix(respStr, "OK") {
 		for _, part := range strings.Fields(respStr) {
 			if strings.HasPrefix(part, "offset=") {
@@ -1021,15 +1023,19 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 	memberID := c.memberID
 	c.mu.RUnlock()
 
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "BATCH_COMMIT topic=%s group=%s generation=%d member=%s ", c.config.Topic, c.config.GroupID, generation, memberID)
-	parts := []string{}
+	pairs := make([]wire.OffsetPair, 0, len(offsets))
 	for pid, off := range offsets {
-		parts = append(parts, fmt.Sprintf("P%d:%d", pid, off))
+		pairs = append(pairs, wire.OffsetPair{Partition: pid, Offset: off})
 	}
-	sb.WriteString(strings.Join(parts, ","))
+	encodedOffsets, err := wire.EncodeOffsetPairs(pairs)
+	if err != nil {
+		util.Error("Batch commit: invalid offsets: %v", err)
+		return false
+	}
+	command := fmt.Sprintf("BATCH_COMMIT topic=%s group=%s generation=%d member=%s offsets=%s",
+		c.config.Topic, c.config.GroupID, generation, memberID, encodedOffsets)
 
-	if err := util.WriteWithLength(conn, util.EncodeMessage("", sb.String())); err != nil {
+	if err := util.WriteWithLength(conn, []byte(command)); err != nil {
 		util.Error("Batch commit send failed: %v", err)
 		c.commitMu.Lock()
 		if c.commitConn == conn {
@@ -1042,7 +1048,14 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 
 	resp, err := util.ReadWithLength(conn)
 	if err != nil {
+		c.handleBrokerError(err)
 		util.Error("Batch commit response read failed: %v", err)
+		if brokerErrorCode(err, "NOT_OWNER", "GEN_MISMATCH", "REBALANCE_REQUIRED", "NOT_AUTHORIZED_FOR_PARTITION") {
+			select {
+			case c.rebalanceSig <- struct{}{}:
+			default:
+			}
+		}
 		c.commitMu.Lock()
 		_ = conn.Close()
 		c.commitConn = nil
@@ -1051,28 +1064,7 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 	}
 
 	respStr := string(resp)
-	if strings.HasPrefix(respStr, "OK") {
-		return true
-	}
-
-	if c.handleNotCoordinator(respStr) {
-		c.closeCommitConn(conn)
-		util.Warn("Batch commit coordinator moved: %s", respStr)
-		return false
-	}
-
-	if strings.Contains(respStr, "ERROR") || strings.Contains(respStr, "STALE_METADATA") {
-		util.Error("Batch commit rejected: %s", respStr)
-
-		if strings.Contains(respStr, "NOT_OWNER") || strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "AUTHORIZED") {
-			select {
-			case c.rebalanceSig <- struct{}{}:
-			default:
-			}
-		}
-		return false
-	}
-	return false
+	return strings.HasPrefix(respStr, "OK")
 }
 
 func (c *Consumer) directCommit(partition int, offset uint64) error {
@@ -1090,24 +1082,22 @@ func (c *Consumer) directCommit(partition int, offset uint64) error {
 	commitCmd := fmt.Sprintf("COMMIT_OFFSET topic=%s partition=%d group=%s offset=%d generation=%d member=%s",
 		c.config.Topic, partition, c.config.GroupID, offset, generation, memberID)
 
-	if err := util.WriteWithLength(conn, util.EncodeMessage("", commitCmd)); err != nil {
+	if err := util.WriteWithLength(conn, []byte(commitCmd)); err != nil {
 		return fmt.Errorf("direct commit send failed: %v", err)
 	}
 
 	resp, err := util.ReadWithLength(conn)
 	if err != nil {
-		return fmt.Errorf("direct commit response failed: %v", err)
+		c.handleBrokerError(err)
+		if brokerErrorCode(err, "GEN_MISMATCH", "REBALANCE_REQUIRED", "NOT_OWNER") {
+			go c.handleRebalanceSignal()
+		}
+		return fmt.Errorf("direct commit response failed: %w", err)
 	}
 
 	respStr := string(resp)
-	if strings.Contains(respStr, "ERROR") {
-		if c.handleNotCoordinator(respStr) {
-			return fmt.Errorf("coordinator moved: %s", respStr)
-		}
-		if strings.Contains(respStr, "GEN_MISMATCH") {
-			go c.handleRebalanceSignal()
-		}
-		return fmt.Errorf("direct commit error: %s", respStr)
+	if respStr != "OK" && !strings.HasPrefix(respStr, "OK ") {
+		return fmt.Errorf("unexpected direct commit response: %s", respStr)
 	}
 
 	return nil
@@ -1137,7 +1127,7 @@ func (c *Consumer) Close() error {
 		if conn, err := c.getCoordinatorConn(); err == nil {
 			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
 				c.config.Topic, c.config.GroupID, memberID, generation)
-			_ = util.WriteWithLength(conn, util.EncodeMessage("", leaveCmd))
+			_ = util.WriteWithLength(conn, []byte(leaveCmd))
 			_ = conn.Close()
 		}
 	}

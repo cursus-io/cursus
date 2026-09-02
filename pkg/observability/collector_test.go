@@ -77,7 +77,10 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 				Offsets: map[string]map[int]uint64{"orders": {0: 9}},
 			},
 		}},
-		fixedDisk{snapshot: disk.RuntimeSnapshot{Handlers: 1, Segments: 2, Bytes: 4096, PendingWrites: 4, ActiveReaders: 2}},
+		fixedDisk{snapshot: disk.RuntimeSnapshot{
+			Handlers: 1, Segments: 2, Bytes: 4096, PendingWrites: 4, ActiveReaders: 2,
+			SegmentCacheEntries: 3, SegmentCacheHits: 11, SegmentCacheMisses: 5, SegmentCacheEvictions: 2,
+		}},
 		fixedStreams(2),
 		fixedCluster{snapshot: clustercontroller.RuntimeSnapshot{
 			Enabled: true, BrokerCount: 3, HasLeader: true, IsLeader: true, UnderReplicated: 1,
@@ -112,13 +115,35 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 	assertGauge(t, families, "cursus_consumer_group_offset_out_of_range", map[string]string{"group": "new-workers", "topic": "orders", "partition": "0"}, 1)
 	assertGauge(t, families, "cursus_consumer_group_offset_out_of_range", map[string]string{"group": "ahead-workers", "topic": "orders", "partition": "0"}, 1)
 	assertGauge(t, families, "cursus_storage_bytes", nil, 4096)
+	assertGauge(t, families, "cursus_storage_segment_cache_entries", nil, 3)
+	assertGauge(t, families, "cursus_storage_segment_cache_hits", nil, 11)
+	assertGauge(t, families, "cursus_storage_segment_cache_misses", nil, 5)
+	assertGauge(t, families, "cursus_storage_segment_cache_evictions", nil, 2)
 	assertGauge(t, families, "cursus_streams_active", nil, 2)
+	assertMetricExists(t, families, "cursus_wire_protocol_failures_total", map[string]string{"reason": "invalid_frame"})
+	assertMetricExists(t, families, "cursus_wire_decompression_rejections_total", map[string]string{"reason": "invalid_payload"})
+	assertMetricExists(t, families, "cursus_cluster_isr_catchup_proofs_total", map[string]string{"outcome": "accepted", "reason": "applied"})
 	assertGauge(t, families, "cursus_cluster_under_replicated_partitions", nil, 1)
 	assertGauge(t, families, "cursus_cluster_topic_materializations_pending", map[string]string{"operation": "create"}, 2)
 	assertCounter(t, families, "cursus_cluster_topic_materialization_attempts_total", map[string]string{"operation": "create", "result": "success"}, 4)
 	assertCounter(t, families, "cursus_cluster_topic_materialization_attempts_total", map[string]string{"operation": "create", "result": "failure"}, 3)
 	assertGauge(t, families, "cursus_cluster_topic_materialization_oldest_pending_seconds", nil, 12.5)
 	assertGauge(t, families, "cursus_cluster_partition_leader", map[string]string{"topic": "orders", "partition": "0", "broker_id": "broker-1"}, 1)
+}
+
+func assertMetricExists(t *testing.T, families []*dto.MetricFamily, name string, labels map[string]string) {
+	t.Helper()
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.Metric {
+			if labelsMatch(metric.Label, labels) {
+				return
+			}
+		}
+	}
+	t.Fatalf("metric %s%v not found", name, labels)
 }
 
 func TestCollectorExportsConsumerMetadataRecoveryStatus(t *testing.T) {

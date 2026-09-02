@@ -33,11 +33,11 @@ func TestConsumerReplacementContextKeepsRootCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	consumer.mainCancel()
-	consumer.mainCtx, consumer.mainCancel = context.WithCancel(consumer.rootCtx)
+	consumer.cancelAssignment()
+	replacement := consumer.replaceAssignmentContext()
 	cancel()
 	select {
-	case <-consumer.mainCtx.Done():
+	case <-replacement.Done():
 	default:
 		t.Fatal("replacement worker context detached from root cancellation")
 	}

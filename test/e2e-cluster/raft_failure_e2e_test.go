@@ -2,6 +2,7 @@ package e2e_cluster
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/e2e"
 )
 
@@ -162,12 +164,17 @@ func waitForTopicPresence(t *testing.T, nodes []int, topicName string, present b
 	pollClusterFailure(t, description, func() (bool, string) {
 		for _, node := range nodes {
 			response, err := sendDirectBrokerCommand(node, fmt.Sprintf("DESCRIBE topic=%s", topicName))
+			missing := false
 			if err != nil {
-				return false, fmt.Sprintf("broker-%d: %v", node, err)
+				var brokerErr *wire.BrokerError
+				if errors.As(err, &brokerErr) && brokerErr.Code == "topic_not_found" {
+					missing = true
+				} else {
+					return false, fmt.Sprintf("broker-%d: %v", node, err)
+				}
 			}
-			missing := strings.Contains(strings.ToLower(response), "not found") || strings.Contains(strings.ToUpper(response), "ERROR")
 			if present && missing {
-				return false, fmt.Sprintf("broker-%d has no topic: %s", node, response)
+				return false, fmt.Sprintf("broker-%d has no topic", node)
 			}
 			if !present && !missing {
 				return false, fmt.Sprintf("broker-%d still has topic: %s", node, response)

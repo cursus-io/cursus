@@ -473,17 +473,18 @@ func (m *Manager) ExportState() map[string]*Snapshot {
 	return out
 }
 
-func (m *Manager) ImportState(state map[string]*Snapshot) {
+func (m *Manager) ImportState(state map[string]*Snapshot) error {
+	if err := ValidateImportState(state); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.txns = make(map[string]*Transaction, len(state))
 	for id, snap := range state {
-		if snap == nil {
-			continue
-		}
 		m.txns[id] = transactionFromSnapshot(snap)
 	}
+	return nil
 }
 
 func (m *Manager) ApplySnapshot(snap *Snapshot) {
@@ -496,8 +497,8 @@ func (m *Manager) ApplySnapshot(snap *Snapshot) {
 }
 
 func (m *Manager) ApplyReplicatedSnapshot(snap *Snapshot) error {
-	if snap == nil || snap.ID == "" {
-		return fmt.Errorf("invalid transaction snapshot")
+	if err := validateSnapshot(snap); err != nil {
+		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -542,10 +543,45 @@ func snapshotIsNewer(current *Transaction, incoming *Snapshot) bool {
 	if incoming.Revision != current.Revision {
 		return incoming.Revision > current.Revision
 	}
-	if incoming.Revision == 0 {
-		return incoming.UpdatedAt.After(current.UpdatedAt)
-	}
 	return false
+}
+
+// ValidateImportState rejects incomplete transaction state before a journal
+// or Raft snapshot can mutate the live manager.
+func ValidateImportState(state map[string]*Snapshot) error {
+	for id, snap := range state {
+		if snap == nil {
+			return fmt.Errorf("transaction snapshot %q is nil", id)
+		}
+		if snap.ID != id {
+			return fmt.Errorf("transaction snapshot key %q does not match id %q", id, snap.ID)
+		}
+		if err := validateSnapshot(snap); err != nil {
+			return fmt.Errorf("transaction snapshot %q: %w", id, err)
+		}
+	}
+	return nil
+}
+
+func validateSnapshot(snap *Snapshot) error {
+	if snap == nil || snap.ID == "" || snap.Producer == "" {
+		return fmt.Errorf("invalid transaction snapshot identity")
+	}
+	if snap.Epoch < 0 {
+		return fmt.Errorf("transaction snapshot has negative epoch %d", snap.Epoch)
+	}
+	if snap.Revision == 0 {
+		return fmt.Errorf("transaction snapshot is missing revision; clean bootstrap required")
+	}
+	switch snap.State {
+	case StateOpen, StateCommitting, StateCommitted, StateAborted:
+	default:
+		return fmt.Errorf("transaction snapshot has invalid state %q", snap.State)
+	}
+	if snap.CreatedAt.IsZero() || snap.UpdatedAt.IsZero() || snap.UpdatedAt.Before(snap.CreatedAt) {
+		return fmt.Errorf("transaction snapshot has invalid timestamps")
+	}
+	return nil
 }
 
 func snapshotsEqual(current *Transaction, incoming *Snapshot) bool {

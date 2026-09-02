@@ -22,12 +22,6 @@ const (
 	StreamControlReasonOffsetOutOfRange = "offset_out_of_range"
 )
 
-// OffsetCommitter is retained for source compatibility.
-// Deprecated: stream delivery never commits consumer offsets.
-type OffsetCommitter interface {
-	CommitOffset(group, topic string, partition int, offset uint64) error
-}
-
 type StreamConnection struct {
 	conn      net.Conn
 	topic     string
@@ -49,8 +43,12 @@ type StreamConnection struct {
 	batchSize         int
 	interval          time.Duration
 	keepaliveInterval time.Duration
-	newMessageCh      <-chan struct{} // signal from partition when new messages arrive
-
+	messageSource     func() (uint64, <-chan struct{})
+	wakeCh            chan struct{}
+	nextPoll          time.Time
+	nextKeepalive     time.Time
+	pollPending       bool
+	keepalivePending  bool
 }
 
 // NewStreamConnection creates a new stream connection
@@ -66,6 +64,7 @@ func NewStreamConnection(conn net.Conn, topic string, partition int, group strin
 		batchSize:         10,
 		interval:          100 * time.Millisecond,
 		keepaliveInterval: 5 * time.Second,
+		wakeCh:            make(chan struct{}, 1),
 	}
 	return sc
 }
@@ -79,49 +78,43 @@ func (sc *StreamConnection) SetBatchSize(size int) {
 func (sc *StreamConnection) SetInterval(interval time.Duration) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	if interval <= 0 {
+		interval = 100 * time.Millisecond
+	}
 	sc.interval = interval
 }
-
-// SetCommitter is retained for source compatibility.
-// Deprecated: stream delivery never commits consumer offsets.
-func (sc *StreamConnection) SetCommitter(OffsetCommitter) {}
 
 func (sc *StreamConnection) SetKeepaliveInterval(d time.Duration) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	if d <= 0 {
+		d = 5 * time.Second
+	}
 	sc.keepaliveInterval = d
 }
 
-func (sc *StreamConnection) SetNewMessageCh(ch <-chan struct{}) {
+func (sc *StreamConnection) SetMessageSource(source func() (uint64, <-chan struct{})) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	sc.newMessageCh = ch
+	sc.messageSource = source
 }
 
-// Run accepts the legacy commit interval for source compatibility but ignores
-// it because delivery is not a processing acknowledgement.
-func (sc *StreamConnection) Run(
-	readFn func(offset uint64, max int) ([]types.Message, error), _ time.Duration,
-) {
+func (sc *StreamConnection) Run(readFn func(offset uint64, max int) ([]types.Message, error)) {
 	defer func() {
 		sc.sendCloseControlFrame()
 		sc.closeConn()
 	}()
 
-	pollTicker := time.NewTicker(sc.interval)
-	keepaliveTicker := time.NewTicker(sc.keepaliveInterval)
-	defer pollTicker.Stop()
-	defer keepaliveTicker.Stop()
-
-	// sendMessages reads and sends available messages. Returns false on fatal error.
-	sendMessages := func() bool {
+	// sendMessages reads and sends one available batch. The manager schedules
+	// catch-up polls; partition generations provide immediate broadcast wakeups.
+	sendMessages := func() (bool, bool) {
 		sc.mu.RLock()
 		conn := sc.conn
 		bs := sc.batchSize
 		sc.mu.RUnlock()
 
 		if conn == nil {
-			return false
+			return false, false
 		}
 
 		currentOffset := sc.Offset()
@@ -134,11 +127,11 @@ func (sc *StreamConnection) Run(
 			} else {
 				sc.setStopReason(StreamControlReasonError)
 			}
-			return false
+			return false, false
 		}
 
 		if len(msgs) == 0 {
-			return true
+			return false, true
 		}
 
 		// Offset gap detection
@@ -152,19 +145,34 @@ func (sc *StreamConnection) Run(
 		if err != nil {
 			util.Error("Failed to encode batch messages: %v", err)
 			sc.setStopReason(StreamControlReasonError)
-			return false
+			return false, false
 		}
 
 		if err := util.WriteWithLength(conn, batchData); err != nil {
 			util.Debug("Batch write error in stream: %v", err)
 			sc.setStopReason(StreamControlReasonError)
-			return false
+			return false, false
 		}
 
 		lastOffset := msgs[len(msgs)-1].Offset
 		sc.SetOffset(lastOffset + 1)
 		sc.SetLastActive(time.Now())
-		return true
+		return true, true
+	}
+
+	sc.mu.Lock()
+	messageSource := sc.messageSource
+	sc.nextPoll = time.Now().Add(sc.interval)
+	sc.nextKeepalive = time.Now().Add(sc.keepaliveInterval)
+	sc.mu.Unlock()
+	var observedGeneration uint64
+	var messageCh <-chan struct{}
+	if messageSource != nil {
+		observedGeneration, messageCh = messageSource()
+	}
+	if _, ok := sendMessages(); !ok {
+		sc.StopWithReason(StreamControlReasonError)
+		return
 	}
 
 	for {
@@ -172,32 +180,96 @@ func (sc *StreamConnection) Run(
 		case <-sc.stopCh:
 			return
 
-		case <-sc.newMessageCh:
-			if !sendMessages() {
+		case <-messageCh:
+			generation, nextCh := messageSource()
+			messageCh = nextCh
+			if generation == observedGeneration {
+				continue
+			}
+			observedGeneration = generation
+			if _, ok := sendMessages(); !ok {
 				sc.StopWithReason(StreamControlReasonError)
 				return
 			}
 
-		case <-pollTicker.C:
-			if !sendMessages() {
+		case <-sc.wakeCh:
+			poll, keepalive := sc.takeScheduledWork()
+			if !poll && !keepalive {
+				continue
+			}
+			sent, ok := sendMessages()
+			if !ok {
 				sc.StopWithReason(StreamControlReasonError)
 				return
 			}
-
-		case <-keepaliveTicker.C:
-			sc.mu.RLock()
-			conn := sc.conn
-			sc.mu.RUnlock()
-			if conn != nil {
-				if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
-					util.Debug("Keepalive write error: %v", err)
-					sc.StopWithReason(StreamControlReasonError)
-					return
-				}
-				sc.SetLastActive(time.Now())
+			if keepalive && !sent && !sc.sendKeepalive() {
+				sc.StopWithReason(StreamControlReasonError)
+				return
 			}
 		}
 	}
+}
+
+func (sc *StreamConnection) schedule(now time.Time) {
+	sc.mu.Lock()
+	if sc.nextPoll.IsZero() {
+		sc.nextPoll = now.Add(sc.interval)
+	}
+	if sc.nextKeepalive.IsZero() {
+		sc.nextKeepalive = now.Add(sc.keepaliveInterval)
+	}
+	if !now.Before(sc.nextPoll) {
+		sc.pollPending = true
+		sc.nextPoll = now.Add(sc.interval)
+	}
+	if !now.Before(sc.nextKeepalive) {
+		sc.keepalivePending = true
+		sc.nextKeepalive = now.Add(sc.keepaliveInterval)
+	}
+	pending := sc.pollPending || sc.keepalivePending
+	sc.mu.Unlock()
+	if pending {
+		select {
+		case sc.wakeCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (sc *StreamConnection) takeScheduledWork() (bool, bool) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	poll, keepalive := sc.pollPending, sc.keepalivePending
+	sc.pollPending = false
+	sc.keepalivePending = false
+	return poll, keepalive
+}
+
+func (sc *StreamConnection) nextScheduledAt() time.Time {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	if sc.nextPoll.IsZero() || (!sc.nextKeepalive.IsZero() && sc.nextKeepalive.Before(sc.nextPoll)) {
+		return sc.nextKeepalive
+	}
+	return sc.nextPoll
+}
+
+func (sc *StreamConnection) sendKeepalive() bool {
+	sc.mu.RLock()
+	conn := sc.conn
+	sc.mu.RUnlock()
+	if conn == nil {
+		return false
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
+	err := util.WriteWithLength(conn, []byte{})
+	_ = conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		util.Debug("Keepalive write error: %v", err)
+		return false
+	}
+	sc.SetLastActive(time.Now())
+	return true
 }
 
 func (sc *StreamConnection) Topic() string  { return sc.topic }

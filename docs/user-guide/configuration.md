@@ -107,18 +107,18 @@ The configuration is represented by the Config struct in the codebase, which org
 | Parameter           | Type       | Default        | Description                                      |
 |--------------------|------------|----------------|--------------------------------------------------|
 | `broker_port`        | int        | 9000           | Main broker TCP port for client connections     |
-| `health_check_port`  | int        | 9080           | HTTP port for `/live`, `/ready`, and `/health`             |
+| `health_check_port`  | int        | 9080           | HTTP port for `/live` and `/ready`                         |
 | `log_dir`            | string     | "broker-logs"  | Directory path for persistent log segments      |
 | `enable_exporter`    | bool       | true           | Enable Prometheus metrics exporter              |
 | `exporter_port`      | int        | 9100           | HTTP port for the Prometheus `/metrics` endpoint       |
 | `enable_benchmark`   | bool       | false          | Enable benchmark mode for testing               |
 | `cleanup_interval`   | int        | 300            | Log cleanup interval (seconds)                 |
 
-In standalone mode, `log_dir` also contains `__topic_metadata.json`, the broker-owned `__consumer_offsets` topic, and `__transaction_state.journal`. The versioned topic manifest is atomically replaced before create/update success exposes a new topic definition and is loaded before internal-topic validation, durable group/offset replay, coordinator/static-group initialization, and readiness. Invalid or unsupported manifest/internal metadata fails closed in diagnostics-only mode; the broker does not fall back to guessed ACL, event-sourcing, retention, group, or offset state. A pre-manifest directory with persisted logs requires the explicit offline [`cursus-storage` migration procedure](../standalone-storage-recovery.md); application `CREATE` retries are not an automatic migration.
+In standalone mode, `log_dir` also contains `__topic_metadata.json`, the broker-owned `__consumer_offsets` topic, and `__transaction_state.journal`. The versioned topic manifest is atomically replaced before create/update success exposes a new topic definition and is loaded before internal-topic validation, durable group/offset replay, coordinator/static-group initialization, and readiness. Invalid or unsupported manifest/internal metadata fails closed in diagnostics-only mode; the broker does not fall back to guessed ACL, event-sourcing, retention, group, or offset state. A pre-manifest directory with persisted logs requires a complete [`clean bootstrap`](../standalone-storage-recovery.md); no offline import or migration command is supported.
 
 The broker fsyncs the append-only transaction coordinator journal before acknowledging transaction state transitions and repairs only a torn or checksum-corrupt final record during startup. One encoded snapshot record is limited to 32 MiB, so transaction batches must remain bounded. Include the topic manifest, journal, consumer offset log, and partition directories in one backup and restore procedure.
 
-The health and metrics listeners are unauthenticated operations endpoints. Restrict both ports to a trusted network. `/live` reports process liveness, while `/ready` and the compatible `/health` endpoint include topic metadata, consumer metadata, storage, and distributed leader checks. See [Broker Observability](../reference/observability.md).
+The health and metrics listeners are unauthenticated operations endpoints. Restrict both ports to a trusted network. `/live` reports process liveness, while `/ready` includes topic metadata, consumer metadata, storage, and distributed leader checks. See [Broker Observability](../reference/observability.md).
 
 # Security and Compression
 
@@ -139,7 +139,7 @@ The health and metrics listeners are unauthenticated operations endpoints. Restr
 
 When `use_tls` is enabled and certificate paths are provided, the broker loads the certificate using `tls.LoadX509KeyPair()` during initialization. In distributed mode, `internal_broker_port` moves broker-to-broker text commands away from the public client listener. If `internal_use_tls` is enabled, the internal listener requires client certificates signed by `internal_tls_ca_path`, and peer routers dial the internal port with mTLS using `internal_tls_server_name` for certificate verification.
 
-When `enable_sasl` is enabled, protected commands require `AUTH principal=<principal> token=<token>` or inline `principal=<principal> auth_token=<token>`. A user can declare `permissions` from `admin`, `topic.read`, `topic.write`, `group`, `transaction`, and `*`. `CONSUME`/`STREAM` require both `topic.read` and `group`; `TXN_PUBLISH` requires `transaction` and `topic.write`; `SEND_OFFSETS_TO_TXN` requires `transaction` and `group`. Topic `auth_policy=acl` is evaluated after the coarse permission check. Omitting `permissions` preserves the legacy authenticated-user access model; declare an explicit list for least privilege. The `SASL_USERS=principal:token` environment form creates legacy users without a restricted permission list, so use YAML or JSON configuration when least privilege is required.
+When `enable_sasl` is enabled, protected commands require `AUTH principal=<principal> token=<token>` or inline `principal=<principal> auth_token=<token>`. Every user must declare at least one permission from `admin`, `topic.read`, `topic.write`, `group`, `transaction`, and `*`; startup rejects missing, unknown, repeated, or duplicate-principal entries. `CONSUME`/`STREAM` require both `topic.read` and `group`; `TXN_PUBLISH` requires `transaction` and `topic.write`; `SEND_OFFSETS_TO_TXN` requires `transaction` and `group`. Topic `auth_policy=acl` is evaluated after the coarse permission check. The environment form is `SASL_USERS=principal:token:permission1|permission2`, with comma-separated users.
 
 # DiskHandler Performance Tuning
 
@@ -379,7 +379,7 @@ consumer:
   tls_key_path: "certs/client.key"
 ```
 
-When `use_tls` is enabled, both producer and consumer use `tls.DialWithDialer()` with TLS 1.2 minimum.
+When `use_tls` is enabled, every SDK client uses the shared transport dialer and performs a context-bounded TLS handshake with TLS 1.2 minimum before Wire v2 negotiation.
 
 ### SDK Metrics (Prometheus)
 
@@ -410,6 +410,8 @@ When enabled, the SDK registers the following metrics in a dedicated Prometheus 
 | `cursus_consumer_commit_errors_total`      | Counter   | topic, group | Commit errors                    |
 | `cursus_consumer_poll_latency_seconds`     | Histogram | topic, group | Poll operation latency           |
 | `cursus_consumer_rebalance_total`          | Counter   | topic, group | Rebalance events                 |
+| `cursus_consumer_offset_gap_total`         | Counter   | topic, group | Offsets skipped by the configured reset policy |
+| `cursus_consumer_stale_workers_total`      | Counter   | topic, group, worker | Assignment workers fenced by a newer generation |
 
 To expose metrics via HTTP:
 

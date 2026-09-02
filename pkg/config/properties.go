@@ -101,11 +101,8 @@ type Config struct {
 	ClientIdleTimeoutMS  int `yaml:"client_idle_timeout_ms" json:"client.idle.timeout.ms"`
 
 	// stream
-	MaxStreamConnections    int           `yaml:"max_stream_connections" json:"max.stream.connections"`
-	StreamTimeout           time.Duration `yaml:"stream_timeout" json:"stream.timeout"`
-	StreamHeartbeatInterval time.Duration `yaml:"stream_heartbeat_interval" json:"stream.heartbeat.interval"`
-	// Deprecated: stream delivery never commits consumer offsets; clients commit after processing.
-	StreamCommitInterval time.Duration `yaml:"stream_commit_interval" json:"stream.commit.interval"`
+	MaxStreamConnections int           `yaml:"max_stream_connections" json:"max.stream.connections"`
+	StreamTimeout        time.Duration `yaml:"stream_timeout" json:"stream.timeout"`
 
 	// security
 	UseTLS                        bool `yaml:"use_tls" json:"tls.enable"`
@@ -192,10 +189,8 @@ func DefaultConfig() *Config {
 			ClientIdleTimeoutMS:  60000,
 
 			// stream
-			MaxStreamConnections:    1000,
-			StreamTimeout:           30 * time.Minute,
-			StreamHeartbeatInterval: 3 * time.Second,
-			StreamCommitInterval:    5 * time.Second,
+			MaxStreamConnections: 1000,
+			StreamTimeout:        30 * time.Minute,
 		}
 	})
 
@@ -242,11 +237,17 @@ func LoadConfig() (*Config, error) {
 
 	// log segment & retention
 	flag.IntVar(&cfg.CleanupInterval, "cleanup-interval", cfg.CleanupInterval, "Cleanup seconds")
-	var segmentSizeInt64 int64
-	flag.Int64Var(&segmentSizeInt64, "segment-size", int64(cfg.SegmentSize), "Segment size")
+	segmentSizeInt64, ok := util.SafeUint64ToInt64(cfg.SegmentSize)
+	if !ok {
+		return nil, fmt.Errorf("default segment size %d exceeds int64 max", cfg.SegmentSize)
+	}
+	flag.Int64Var(&segmentSizeInt64, "segment-size", segmentSizeInt64, "Segment size")
 	flag.IntVar(&cfg.SegmentRollTimeMS, "segment-roll-time-ms", cfg.SegmentRollTimeMS, "Segment roll time")
-	var indexSizeInt64 int64
-	flag.Int64Var(&indexSizeInt64, "index-size", int64(cfg.IndexSize), "Max index file size")
+	indexSizeInt64, ok := util.SafeUint64ToInt64(cfg.IndexSize)
+	if !ok {
+		return nil, fmt.Errorf("default index size %d exceeds int64 max", cfg.IndexSize)
+	}
+	flag.Int64Var(&indexSizeInt64, "index-size", indexSizeInt64, "Max index file size")
 	flag.IntVar(&cfg.IndexIntervalBytes, "index-interval-bytes", cfg.IndexIntervalBytes, "Index interval bytes")
 	flag.StringVar(&cfg.CleanupPolicy, "cleanup-policy", cfg.CleanupPolicy, "Cleanup policy (delete, compact, or delete,compact)")
 	flag.IntVar(&cfg.RetentionHours, "retention-hours", cfg.RetentionHours, "Retention hours")
@@ -290,8 +291,6 @@ func LoadConfig() (*Config, error) {
 	// stream
 	flag.IntVar(&cfg.MaxStreamConnections, "max-stream-connections", cfg.MaxStreamConnections, "Max stream connections")
 	flag.DurationVar(&cfg.StreamTimeout, "stream-timeout", cfg.StreamTimeout, "Stream timeout")
-	flag.DurationVar(&cfg.StreamHeartbeatInterval, "stream-heartbeat-interval", cfg.StreamHeartbeatInterval, "Stream heartbeat")
-	flag.DurationVar(&cfg.StreamCommitInterval, "stream-commit-interval", cfg.StreamCommitInterval, "Deprecated and ignored; clients commit stream offsets after processing")
 
 	// security
 	flag.BoolVar(&cfg.UseTLS, "tls", cfg.UseTLS, "Enable TLS")
@@ -356,12 +355,20 @@ func LoadConfig() (*Config, error) {
 	if segmentSizeInt64 <= 0 {
 		cfg.SegmentSize = DefaultConfig().SegmentSize
 	} else {
-		cfg.SegmentSize = uint64(segmentSizeInt64)
+		segmentSize, valid := util.SafeInt64ToUint64(segmentSizeInt64)
+		if !valid {
+			return nil, fmt.Errorf("segment size %d must be non-negative", segmentSizeInt64)
+		}
+		cfg.SegmentSize = segmentSize
 	}
 	if indexSizeInt64 <= 0 {
 		cfg.IndexSize = DefaultConfig().IndexSize
 	} else {
-		cfg.IndexSize = uint64(indexSizeInt64)
+		indexSize, valid := util.SafeInt64ToUint64(indexSizeInt64)
+		if !valid {
+			return nil, fmt.Errorf("index size %d must be non-negative", indexSizeInt64)
+		}
+		cfg.IndexSize = indexSize
 	}
 
 	overrideEnvInt(&cfg.BrokerPort, "BROKER_PORT")
@@ -424,12 +431,17 @@ func LoadConfig() (*Config, error) {
 	overrideEnvString(&cfg.InternalTLSCAPath, "INTERNAL_TLS_CA_PATH")
 	overrideEnvString(&cfg.InternalTLSServerName, "INTERNAL_TLS_SERVER_NAME")
 	overrideEnvBool(&cfg.EnableSASL, "ENABLE_SASL")
-	overrideEnvSASLUsers(&cfg.SASLUsers, "SASL_USERS")
+	if err := overrideEnvSASLUsers(&cfg.SASLUsers, "SASL_USERS"); err != nil {
+		return nil, err
+	}
 
 	cfg.Normalize()
 	util.SetLevel(cfg.LogLevel)
 
 	if err := cfg.ValidateClusterTransport(); err != nil {
+		return nil, err
+	}
+	if err := cfg.ValidateClientAuthentication(); err != nil {
 		return nil, err
 	}
 	if err := cfg.loadInternalTLSConfig(); err != nil {
@@ -448,6 +460,46 @@ func LoadConfig() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// ValidateClientAuthentication requires an explicit least-privilege contract
+// for every configured principal.
+func (cfg *Config) ValidateClientAuthentication() error {
+	if cfg == nil || !cfg.EnableSASL {
+		return nil
+	}
+	if len(cfg.SASLUsers) == 0 {
+		return fmt.Errorf("sasl_users must contain at least one principal when enable_sasl=true")
+	}
+	allowed := map[string]struct{}{
+		"admin": {}, "topic.read": {}, "topic.write": {}, "group": {}, "transaction": {}, "*": {},
+	}
+	principals := make(map[string]struct{}, len(cfg.SASLUsers))
+	for _, user := range cfg.SASLUsers {
+		principal := strings.TrimSpace(user.Principal)
+		if principal == "" || strings.TrimSpace(user.Token) == "" {
+			return fmt.Errorf("sasl user principal and token are required")
+		}
+		if _, duplicate := principals[principal]; duplicate {
+			return fmt.Errorf("duplicate sasl principal %q", principal)
+		}
+		principals[principal] = struct{}{}
+		if len(user.Permissions) == 0 {
+			return fmt.Errorf("sasl principal %q requires at least one permission", principal)
+		}
+		seen := make(map[string]struct{}, len(user.Permissions))
+		for _, permission := range user.Permissions {
+			permission = strings.ToLower(strings.TrimSpace(permission))
+			if _, ok := allowed[permission]; !ok {
+				return fmt.Errorf("sasl principal %q has invalid permission %q", principal, permission)
+			}
+			if _, duplicate := seen[permission]; duplicate {
+				return fmt.Errorf("sasl principal %q repeats permission %q", principal, permission)
+			}
+			seen[permission] = struct{}{}
+		}
+	}
+	return nil
 }
 
 // ValidateClusterTransport rejects accidental plaintext cluster deployments.

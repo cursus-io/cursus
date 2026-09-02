@@ -8,7 +8,7 @@ Cursus favors a compact implementation, but simplicity must not weaken a documen
 4. **Monotonic state**: offsets, generations, producer epochs, stream versions, and committed tails must not move backward.
 5. **Recoverable state**: every authoritative in-memory index needs a durable source and a tested rebuild or snapshot path.
 6. **Structured protocol behavior**: successes start with `OK` or use documented binary/JSON frames; failures use `ERROR: <code>` and expose retry/fencing semantics.
-7. **Bounded compatibility**: add version/feature negotiation for contract changes and keep SDK behavior aligned across Go, Java, and Python.
+7. **Explicit format boundaries**: the runtime supports one current wire and storage contract; incompatible state requires an offline converter or clean bootstrap, and the broker and in-repository Go SDK change together.
 8. **Operational evidence**: shared-path changes require unit tests, integration coverage, and failure-window tests proportional to their blast radius.
 
 ## Change Checklist

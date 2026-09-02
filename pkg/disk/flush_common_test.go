@@ -66,7 +66,10 @@ func TestWriteBatchRotation(t *testing.T) {
 	dh := setupDiskHandler(t)
 	defer func() { _ = dh.Close() }()
 
-	payloadSize := int(dh.SegmentSize / 2)
+	payloadSize, ok := util.SafeUint64ToInt(dh.SegmentSize / 2)
+	if !ok {
+		t.Fatalf("segment size %d exceeds platform allocation limit", dh.SegmentSize)
+	}
 	payload := make([]byte, payloadSize)
 
 	for i := range payload {

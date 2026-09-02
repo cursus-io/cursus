@@ -16,6 +16,7 @@ func CheckBrokerHealth(healthCheckURLs []string) error {
 	for _, url := range healthCheckURLs {
 		ready := false
 		for i := 0; i < healthCheckRetries; i++ {
+			// #nosec G107 -- URLs are local broker endpoints supplied by the E2E fixture.
 			resp, err := http.Get(url)
 			if err == nil && resp.StatusCode == http.StatusOK {
 				_ = resp.Body.Close()

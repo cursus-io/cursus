@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/controller"
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -33,7 +34,8 @@ type leaveResp struct {
 }
 
 type heartbeatRequest struct {
-	NodeID string `json:"node_id"`
+	NodeID        string                `json:"node_id"`
+	CatchupProofs []fsm.ISRCatchupProof `json:"catchup_proofs,omitempty"`
 }
 
 type ClusterServer struct {
@@ -82,138 +84,192 @@ func (h *ClusterServer) Start(addr string) (net.Listener, error) {
 
 func (h *ClusterServer) handleConnection(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
+	if err := conn.SetDeadline(time.Now().Add(h.requestTimeout)); err != nil {
+		return
+	}
+	connection, err := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
+	if err != nil {
+		util.Debug("cluster Wire v2 handshake failed: %v", err)
+		return
+	}
 
 	for {
 		if err := conn.SetDeadline(time.Now().Add(h.requestTimeout)); err != nil {
 			return
 		}
-
-		data, err := util.ReadWithLength(conn)
+		request, err := connection.ReadFrame()
 		if err != nil {
 			return
 		}
-
-		topic, payload, err := util.DecodeMessage(data)
+		if request.Kind != wire.KindRequest || request.Status != wire.StatusNone || request.RequestID == 0 {
+			return
+		}
+		payload, err := wire.DecodeCommandPayload(request.Payload)
 		if err != nil {
-			util.Error("⚠️ Decode error: %v", err)
+			h.writeErrorResponse(connection, request, wire.ErrorPayload{
+				Code: "invalid_cluster_request", Class: wire.ErrorClassValidation, Message: err.Error(),
+			})
+			continue
+		}
+		if !h.authenticate(payload) {
+			h.writeErrorResponse(connection, request, wire.ErrorPayload{
+				Code: "cluster_unauthorized", Class: wire.ErrorClassAuthorization, Message: "invalid cluster auth token",
+			})
 			return
 		}
+		delete(payload.Fields, "auth_token")
+		util.Debug("cluster-server received Wire v2 command: %s", request.Command)
 
-		payload, authorized := h.authenticate(payload)
-		if !authorized {
-			h.writeErrorResponse(conn, "unauthorized")
-			return
+		var response any
+		var requestError *wire.ErrorPayload
+		switch request.Command {
+		case wire.CommandJoinCluster:
+			response, requestError = h.handleJoinCluster(payload)
+		case wire.CommandLeaveCluster:
+			response, requestError = h.handleLeaveCluster(payload)
+		case wire.CommandHeartbeatCluster:
+			response, requestError = h.handleHeartbeatCluster(payload)
+		case wire.CommandReplicaCatchup:
+			response, requestError = h.handleReplicaCatchup(payload)
+		case wire.CommandListCluster:
+			response, requestError = h.handleListCluster()
+		default:
+			requestError = &wire.ErrorPayload{
+				Code: "unsupported_cluster_command", Class: wire.ErrorClassValidation,
+				Message: fmt.Sprintf("unsupported cluster command %s", request.Command),
+			}
 		}
-		util.Debug("cluster-server received command: topic=%s command=%s", topic, clusterCommandName(payload))
-
-		if strings.HasPrefix(payload, "JOIN_CLUSTER ") {
-			h.handleJoinCluster(conn, payload)
-		} else if strings.HasPrefix(payload, "LEAVE_CLUSTER ") {
-			h.handleLeaveCluster(conn, payload)
-		} else if strings.HasPrefix(payload, "HEARTBEAT_CLUSTER ") {
-			h.handleHeartbeatCluster(conn, payload)
-		} else if payload == "LIST_CLUSTER" {
-			h.handleListCluster(conn)
+		if requestError != nil {
+			h.writeErrorResponse(connection, request, *requestError)
+			continue
 		}
+		h.writeResponse(connection, request, response)
 	}
 }
 
-func (h *ClusterServer) handleHeartbeatCluster(conn net.Conn, payload string) {
-	jsonData := strings.TrimPrefix(payload, "HEARTBEAT_CLUSTER ")
-	var req heartbeatRequest
-	if err := json.Unmarshal([]byte(jsonData), &req); err != nil {
-		util.Error("invalid heartbeat json: %v", err)
-		h.writeErrorResponse(conn, "invalid heartbeat format")
-		return
+func (h *ClusterServer) handleHeartbeatCluster(payload wire.CommandPayload) (any, *wire.ErrorPayload) {
+	req := heartbeatRequest{NodeID: payload.Fields["node_id"]}
+	if encoded := payload.Fields["catchup_proofs"]; encoded != "" {
+		if err := json.Unmarshal([]byte(encoded), &req.CatchupProofs); err != nil {
+			return nil, validationError("invalid heartbeat catchup proofs")
+		}
 	}
-
 	if req.NodeID == "" {
-		h.writeErrorResponse(conn, "node_id is required")
-		return
+		return nil, validationError("node_id is required")
 	}
 
 	util.Debug("ClusterServer: Received heartbeat from %s", req.NodeID)
-	h.sd.UpdateHeartbeat(req.NodeID)
-	h.writeResponse(conn, map[string]bool{"success": true})
+	if err := h.sd.HandleHeartbeat(req.NodeID, req.CatchupProofs); err != nil {
+		return nil, internalClusterError(err)
+	}
+	return map[string]bool{"success": true}, nil
 }
 
-func (h *ClusterServer) handleJoinCluster(conn net.Conn, payload string) {
-	jsonData := strings.TrimPrefix(payload, "JOIN_CLUSTER ")
-	if jsonData == "" {
-		h.writeErrorResponse(conn, "missing join data")
-		return
+func (h *ClusterServer) handleReplicaCatchup(payload wire.CommandPayload) (any, *wire.ErrorPayload) {
+	encoded := payload.Fields["request"]
+	if encoded == "" {
+		return nil, validationError("replica catch-up request is required")
 	}
-
-	var req joinRequest
-	if err := json.Unmarshal([]byte(jsonData), &req); err != nil {
-		h.writeErrorResponse(conn, "invalid json")
-		return
+	var request fsm.ReplicaCatchupRequest
+	if err := json.Unmarshal([]byte(encoded), &request); err != nil {
+		return nil, validationError("invalid replica catch-up request")
 	}
+	batch, err := h.sd.FetchReplicaCatchup(request)
+	if err != nil {
+		return nil, internalClusterError(err)
+	}
+	batch, err = fitReplicaCatchupBatch(batch)
+	if err != nil {
+		return nil, internalClusterError(err)
+	}
+	return batch, nil
+}
 
+func fitReplicaCatchupBatch(batch fsm.ReplicaCatchupBatch) (fsm.ReplicaCatchupBatch, error) {
+	for {
+		data, err := json.Marshal(batch)
+		if err != nil {
+			return fsm.ReplicaCatchupBatch{}, err
+		}
+		if len(data) <= wire.MaxFramePayload {
+			return batch, nil
+		}
+		if len(batch.Messages) <= 1 {
+			return fsm.ReplicaCatchupBatch{}, fmt.Errorf("replica catch-up record exceeds Wire v2 frame limit")
+		}
+		batch.Messages = batch.Messages[:len(batch.Messages)/2]
+	}
+}
+
+func (h *ClusterServer) handleJoinCluster(payload wire.CommandPayload) (any, *wire.ErrorPayload) {
+	req := joinRequest{NodeID: payload.Fields["node_id"], Address: payload.Fields["address"]}
 	if req.NodeID == "" || req.Address == "" {
-		h.writeErrorResponse(conn, "missing node_id or address")
-		return
+		return nil, validationError("missing node_id or address")
 	}
 
 	leader, err := h.sd.AddNode(req.NodeID, req.Address)
 	if err != nil {
-		resp := joinResponse{
-			Success: false,
-			Leader:  leader,
-			Error:   err.Error(),
+		return nil, &wire.ErrorPayload{
+			Code: "cluster_join_failed", Class: wire.ErrorClassConflict, Message: err.Error(),
+			Fields: map[string]string{"leader": leader},
 		}
-		h.writeResponse(conn, resp)
-		return
 	}
-
-	resp := joinResponse{Success: true, Leader: leader}
-	h.writeResponse(conn, resp)
+	return joinResponse{Success: true, Leader: leader}, nil
 }
 
-func (h *ClusterServer) handleLeaveCluster(conn net.Conn, payload string) {
-	jsonData := strings.TrimPrefix(payload, "LEAVE_CLUSTER ")
-	if jsonData == "" {
-		h.writeErrorResponse(conn, "missing leave data")
-		return
-	}
-
-	var req leaveReq
-	if err := json.Unmarshal([]byte(jsonData), &req); err != nil || req.NodeID == "" {
-		h.writeErrorResponse(conn, "invalid request")
-		return
+func (h *ClusterServer) handleLeaveCluster(payload wire.CommandPayload) (any, *wire.ErrorPayload) {
+	req := leaveReq{NodeID: payload.Fields["node_id"]}
+	if req.NodeID == "" {
+		return nil, validationError("node_id is required")
 	}
 
 	_, err := h.sd.RemoveNode(req.NodeID)
 	if err != nil {
-		h.writeErrorResponse(conn, err.Error())
-		return
+		return nil, internalClusterError(err)
 	}
-
-	h.writeResponse(conn, leaveResp{Success: true})
+	return leaveResp{Success: true}, nil
 }
 
-func (h *ClusterServer) handleListCluster(conn net.Conn) {
+func (h *ClusterServer) handleListCluster() (any, *wire.ErrorPayload) {
 	nodes, err := h.sd.DiscoverBrokers()
 	if err != nil {
-		h.writeErrorResponse(conn, fmt.Sprintf("discovery failed: %v", err))
-		return
+		return nil, internalClusterError(fmt.Errorf("discovery failed: %w", err))
 	}
-	h.writeResponse(conn, nodes)
+	return nodes, nil
 }
 
-func (h *ClusterServer) writeResponse(conn net.Conn, resp interface{}) {
+func (h *ClusterServer) writeResponse(connection *wire.Connection, request wire.Frame, resp any) {
 	data, err := json.Marshal(resp)
 	if err != nil {
 		util.Error("cluster response marshal error: %v", err)
 		return
 	}
-
-	if err := util.WriteWithLength(conn, data); err != nil {
+	if err := connection.WriteFrame(wire.Frame{
+		Kind: wire.KindResponse, Command: request.Command, Status: wire.StatusOK,
+		RequestID: request.RequestID, Payload: data,
+	}); err != nil {
 		util.Error("cluster response write error: %v", err)
 	}
 }
 
-func (h *ClusterServer) writeErrorResponse(conn net.Conn, errMsg string) {
-	resp := joinResponse{Success: false, Error: errMsg}
-	h.writeResponse(conn, resp)
+func (h *ClusterServer) writeErrorResponse(connection *wire.Connection, request wire.Frame, response wire.ErrorPayload) {
+	payload, err := wire.EncodeError(response)
+	if err != nil {
+		util.Error("cluster error response encode error: %v", err)
+		return
+	}
+	if err := connection.WriteFrame(wire.Frame{
+		Kind: wire.KindResponse, Command: request.Command, Status: wire.StatusError,
+		RequestID: request.RequestID, Payload: payload,
+	}); err != nil {
+		util.Error("cluster error response write error: %v", err)
+	}
+}
+
+func validationError(message string) *wire.ErrorPayload {
+	return &wire.ErrorPayload{Code: "invalid_cluster_request", Class: wire.ErrorClassValidation, Message: message}
+}
+
+func internalClusterError(err error) *wire.ErrorPayload {
+	return &wire.ErrorPayload{Code: "cluster_request_failed", Class: wire.ErrorClassInternal, Message: err.Error()}
 }

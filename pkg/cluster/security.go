@@ -4,10 +4,10 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/controller"
+	"github.com/cursus-io/cursus/pkg/wire"
 )
 
 const (
@@ -39,30 +39,10 @@ func listenCluster(address string, tlsConfig *tls.Config) (net.Listener, error) 
 	return tls.NewListener(raw, tlsConfig.Clone()), nil
 }
 
-func (h *ClusterServer) authenticate(payload string) (string, bool) {
+func (h *ClusterServer) authenticate(payload wire.CommandPayload) bool {
 	if h.authToken == "" {
-		return payload, true
+		return true
 	}
-	const prefix = "AUTH "
-	if !strings.HasPrefix(payload, prefix) {
-		return "", false
-	}
-	rest := strings.TrimPrefix(payload, prefix)
-	separator := strings.IndexByte(rest, ' ')
-	if separator <= 0 {
-		return "", false
-	}
-	supplied := rest[:separator]
-	command := rest[separator+1:]
-	if subtle.ConstantTimeCompare([]byte(supplied), []byte(h.authToken)) != 1 {
-		return "", false
-	}
-	return command, true
-}
-
-func clusterCommandName(payload string) string {
-	if index := strings.IndexByte(payload, ' '); index >= 0 {
-		return payload[:index]
-	}
-	return payload
+	supplied := payload.Fields["auth_token"]
+	return subtle.ConstantTimeCompare([]byte(supplied), []byte(h.authToken)) == 1
 }

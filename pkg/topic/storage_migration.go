@@ -3,7 +3,6 @@ package topic
 import (
 	"bufio"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -85,13 +84,6 @@ type StorageInventory struct {
 	Topics                  []PersistedTopic                  `json:"topics"`
 	ConsumerMetadataRecords []PersistedConsumerMetadataRecord `json:"consumer_metadata_records,omitempty"`
 	Problems                []StorageProblem                  `json:"problems,omitempty"`
-}
-
-// ManifestMigrationResult reports whether a manifest was published.
-type ManifestMigrationResult struct {
-	Changed   bool             `json:"changed"`
-	Committed bool             `json:"committed"`
-	Inventory StorageInventory `json:"inventory"`
 }
 
 // ArchiveResult reports one atomic orphan-directory move.
@@ -343,7 +335,7 @@ func scanPersistedSegment(root, topicName string, partition int, segment Persist
 	if err != nil {
 		return 0, 0, 0, false, nil, fmt.Errorf("open persisted segment %q: %w", segment.Path, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	reader := bufio.NewReader(file)
 	markerAllowsGaps, markerProblem := compactionMarkerStatus(path, segment.Size)
 	allowGaps := markerAllowsGaps && !active
@@ -482,34 +474,21 @@ func inspectPersistedConsumerMetadata(root string, topics []PersistedTopic) ([]P
 					SegmentBase:  segment.BaseOffset,
 					RecordOffset: message.Offset,
 				}
-				record, versioned, recordErr := coordinator.DecodeConsumerMetadataRecord(message.Payload)
+				record, recordErr := coordinator.DecodeConsumerMetadataRecord(message.Payload)
 				if recordErr != nil {
 					problems = append(problems, StorageProblem{Path: segment.Path, Message: fmt.Sprintf("invalid consumer metadata payload at record offset %d: %v", message.Offset, recordErr)})
 					position += int64(4 + length)
 					continue
 				}
-				if versioned {
-					inspected.RecordType = record.Type
-					inspected.Version = record.Version
-					inspected.Group = record.Group
-					inspected.Topic = record.Topic
-					inspected.PartitionCount = record.PartitionCount
-					inspected.LifecycleEpoch = record.Epoch
-					inspected.SnapshotRevision = record.Revision
-					inspected.Offsets = append([]coordinator.OffsetItem(nil), record.Offsets...)
-					inspected.InitialOffsets = append([]coordinator.TopicOffsetSnapshot(nil), record.InitialOffsets...)
-				} else {
-					groupName, topicName, offsets, legacyErr := coordinator.DecodeLegacyOffsetPayload(message.Payload)
-					if legacyErr != nil {
-						problems = append(problems, StorageProblem{Path: segment.Path, Message: fmt.Sprintf("invalid legacy offset payload at record offset %d: %v", message.Offset, legacyErr)})
-						position += int64(4 + length)
-						continue
-					}
-					inspected.RecordType = "legacy_offset"
-					inspected.Group = groupName
-					inspected.Topic = topicName
-					inspected.Offsets = append([]coordinator.OffsetItem(nil), offsets...)
-				}
+				inspected.RecordType = record.Type
+				inspected.Version = record.Version
+				inspected.Group = record.Group
+				inspected.Topic = record.Topic
+				inspected.PartitionCount = record.PartitionCount
+				inspected.LifecycleEpoch = record.Epoch
+				inspected.SnapshotRevision = record.Revision
+				inspected.Offsets = append([]coordinator.OffsetItem(nil), record.Offsets...)
+				inspected.InitialOffsets = append([]coordinator.TopicOffsetSnapshot(nil), record.InitialOffsets...)
 				records = append(records, inspected)
 				position += int64(4 + length)
 			}
@@ -531,162 +510,6 @@ func inspectPersistedConsumerMetadata(root string, topics []PersistedTopic) ([]P
 		return records[i].RecordOffset < records[j].RecordOffset
 	})
 	return records, problems, nil
-}
-
-// CreateStandaloneManifest publishes explicit definitions without replacing an existing manifest.
-func CreateStandaloneManifest(logDir string, definitions []Definition, dryRun bool) (ManifestMigrationResult, error) {
-	inventory, err := InspectStandaloneStorage(logDir)
-	if err != nil {
-		return ManifestMigrationResult{}, err
-	}
-	result := ManifestMigrationResult{Inventory: inventory}
-	normalized, data, err := normalizeAndMarshalManifest(definitions)
-	if err != nil {
-		return result, err
-	}
-	root, err := safeStorageRoot(logDir)
-	if err != nil {
-		return result, err
-	}
-	manifestPath := filepath.Join(root, TopicMetadataFileName)
-	if !inventory.ManifestPresent && len(inventory.ConsumerMetadataRecords) > 0 {
-		_, migrationPresent, migrationErr := readConsumerMetadataMigration(filepath.Join(root, config.ConsumerMetadataMigrationFileName))
-		if migrationErr != nil {
-			return result, migrationErr
-		}
-		if !migrationPresent {
-			return result, fmt.Errorf("pre-manifest consumer metadata records require an explicit consumer-metadata migration selection")
-		}
-	}
-	if inventory.ManifestPresent {
-		existing, readErr := readStandaloneManifest(manifestPath)
-		if readErr != nil {
-			return result, readErr
-		}
-		if reflect.DeepEqual(existing, normalized) {
-			if len(inventory.Problems) > 0 {
-				return result, fmt.Errorf("persisted topic storage has %d validation problem(s)", len(inventory.Problems))
-			}
-			if err := definitionsMatchInventory(existing, inventory.Topics); err != nil {
-				return result, fmt.Errorf("existing topic metadata is not aligned with storage: %w", err)
-			}
-			return result, nil
-		}
-		return result, fmt.Errorf("topic metadata manifest already exists with different definitions")
-	}
-	if len(inventory.Problems) > 0 {
-		return result, fmt.Errorf("persisted topic storage has %d validation problem(s)", len(inventory.Problems))
-	}
-	if err := definitionsMatchInventory(normalized, inventory.Topics); err != nil {
-		return result, err
-	}
-	if dryRun {
-		return result, nil
-	}
-
-	second, err := InspectStandaloneStorage(root)
-	if err != nil {
-		return result, err
-	}
-	if !reflect.DeepEqual(inventory, second) {
-		return result, fmt.Errorf("persisted topic storage changed during validation")
-	}
-	committed, err := installManifestExclusive(root, manifestPath, data)
-	result.Committed = committed
-	result.Changed = committed
-	return result, err
-}
-
-func definitionsMatchInventory(definitions []Definition, topics []PersistedTopic) error {
-	if len(definitions) != len(topics) {
-		return fmt.Errorf("explicit definitions cover %d topics but storage contains %d", len(definitions), len(topics))
-	}
-	byName := make(map[string]PersistedTopic, len(topics))
-	for _, topic := range topics {
-		byName[topic.Name] = topic
-	}
-	for _, definition := range definitions {
-		persisted, ok := byName[definition.Name]
-		if !ok {
-			return fmt.Errorf("definition %q has no persisted topic storage", definition.Name)
-		}
-		if len(persisted.Partitions) != definition.Partitions {
-			return fmt.Errorf("topic %q definition has %d partitions but storage has %d", definition.Name, definition.Partitions, len(persisted.Partitions))
-		}
-		for expected, partition := range persisted.Partitions {
-			if partition.ID != expected {
-				return fmt.Errorf("topic %q persisted partition IDs are not contiguous from zero", definition.Name)
-			}
-			if len(partition.Segments) == 0 {
-				return fmt.Errorf("topic %q partition %d has no active log segment; deleted segments require explicit operator recovery", definition.Name, partition.ID)
-			}
-		}
-	}
-	return nil
-}
-
-func normalizeAndMarshalManifest(definitions []Definition) ([]Definition, []byte, error) {
-	normalized := make([]Definition, 0, len(definitions))
-	seen := make(map[string]struct{}, len(definitions))
-	for _, raw := range definitions {
-		definition, err := raw.Normalize()
-		if err != nil {
-			return nil, nil, fmt.Errorf("invalid topic metadata for %q: %w", raw.Name, err)
-		}
-		if definition.Name == config.ConsumerOffsetsTopicName {
-			if definition.Idempotent || definition.EventSourcing {
-				return nil, nil, fmt.Errorf("invalid topic metadata for %q: internal consumer metadata mode must be non-idempotent and non-event-sourcing", definition.Name)
-			}
-			definition.Policy = ConsumerMetadataPolicy()
-		}
-		if _, exists := seen[definition.Name]; exists {
-			return nil, nil, fmt.Errorf("duplicate topic metadata for %q", definition.Name)
-		}
-		seen[definition.Name] = struct{}{}
-		if err := validateCleanupPolicyForTopic(definition.Policy, nil, definition.EventSourcing); err != nil {
-			return nil, nil, fmt.Errorf("invalid topic metadata for %q: %w", definition.Name, err)
-		}
-		normalized = append(normalized, definition)
-	}
-	sort.Slice(normalized, func(i, j int) bool { return normalized[i].Name < normalized[j].Name })
-	data, err := json.MarshalIndent(topicMetadataManifest{Version: topicMetadataWriteVersion(normalized), Topics: normalized}, "", "  ")
-	if err != nil {
-		return nil, nil, fmt.Errorf("marshal topic metadata: %w", err)
-	}
-	data = append(data, '\n')
-	if len(data) > maxTopicMetadataBytes {
-		return nil, nil, fmt.Errorf("topic metadata size %d exceeds limit %d", len(data), maxTopicMetadataBytes)
-	}
-	return normalized, data, nil
-}
-
-func installManifestExclusive(root, path string, data []byte) (committed bool, err error) {
-	tmp, err := os.CreateTemp(root, ".topic-metadata-migration-*")
-	if err != nil {
-		return false, fmt.Errorf("create topic metadata temporary file: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
-	}()
-	if err := tmp.Chmod(0o600); err != nil {
-		return false, fmt.Errorf("secure topic metadata temporary file: %w", err)
-	}
-	if err := writeMetadataFile(tmp, data); err != nil {
-		return false, err
-	}
-	if err := tmp.Close(); err != nil {
-		return false, fmt.Errorf("close topic metadata temporary file: %w", err)
-	}
-	if err := installCheckpointFileExclusive(tmpPath, path); err != nil {
-		return false, fmt.Errorf("publish topic metadata without overwrite: %w", err)
-	}
-	committed = true
-	if err := syncTopicMetadataDirectoryFn(root); err != nil {
-		return true, fmt.Errorf("sync topic metadata directory: %w", err)
-	}
-	return true, nil
 }
 
 // ArchiveOrphanTopic atomically moves one manifest-omitted topic directory.

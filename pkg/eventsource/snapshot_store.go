@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+
+	"github.com/cursus-io/cursus/util"
 )
 
 // snapshotPointer holds the in-memory index entry for a snapshot.
@@ -46,12 +48,13 @@ type SnapshotStore struct {
 // NewSnapshotStore opens (or creates) the snapshot file for the given partition
 // and rebuilds the in-memory index by scanning the file sequentially.
 func NewSnapshotStore(dir string, partitionID int) (*SnapshotStore, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("snapshot store: mkdir: %w", err)
 	}
 
 	path := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots.dat", partitionID))
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	// #nosec G304 -- the file name is fixed by the partition and dir is the configured storage root.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot store: open file: %w", err)
 	}
@@ -83,6 +86,7 @@ func (s *SnapshotStore) loadFromDisk() error {
 	if fileInfo.Size() < 0 {
 		return fmt.Errorf("negative snapshot file size: %d", fileInfo.Size())
 	}
+	// #nosec G115 -- the file size is explicitly non-negative above.
 	fileSize := uint64(fileInfo.Size())
 
 	var offset uint64
@@ -173,12 +177,22 @@ func (s *SnapshotStore) Save(key string, version uint64, payload string) error {
 	defer s.mu.Unlock()
 
 	keyBytes := []byte(key)
-	keyLen := uint16(len(keyBytes))
+	keyLen, ok := util.SafeIntToUint16(len(keyBytes))
+	if !ok {
+		return fmt.Errorf("snapshot key length %d exceeds uint16 format limit", len(keyBytes))
+	}
 	payloadBytes := []byte(payload)
-	payloadLen := uint32(len(payloadBytes))
+	payloadLen, ok := util.SafeIntToUint32(len(payloadBytes))
+	if !ok {
+		return fmt.Errorf("snapshot payload length %d exceeds uint32 format limit", len(payloadBytes))
+	}
 
 	// Seek to the append position.
-	if _, err := s.file.Seek(int64(s.writeOffset), io.SeekStart); err != nil {
+	writePosition, ok := util.SafeUint64ToInt64(s.writeOffset)
+	if !ok {
+		return fmt.Errorf("snapshot write offset %d exceeds file offset limit", s.writeOffset)
+	}
+	if _, err := s.file.Seek(writePosition, io.SeekStart); err != nil {
 		return fmt.Errorf("snapshot store: seek: %w", err)
 	}
 
@@ -258,7 +272,10 @@ func (s *SnapshotStore) Read(key string) (*SnapshotData, error) {
 		return nil, nil
 	}
 
-	pos := int64(ptr.fileOffset)
+	pos, ok := util.SafeUint64ToInt64(ptr.fileOffset)
+	if !ok {
+		return nil, fmt.Errorf("snapshot file offset %d exceeds file offset limit", ptr.fileOffset)
+	}
 
 	// Read KeyLen (2 bytes).
 	var keyLenBuf [2]byte

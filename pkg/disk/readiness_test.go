@@ -15,7 +15,7 @@ func TestDiskManagerReadyChecksLogDirectory(t *testing.T) {
 	if err := manager.Ready(); err == nil {
 		t.Fatal("Ready accepted a missing log directory")
 	}
-	if err := os.MkdirAll(cfg.LogDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.LogDir, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.Ready(); err != nil {

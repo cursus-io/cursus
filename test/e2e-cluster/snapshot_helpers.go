@@ -2,11 +2,13 @@ package e2e_cluster
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/e2e"
 )
 
@@ -61,10 +63,11 @@ func parseLocalClusterStatus(resp string) (LocalClusterStatus, error) {
 func (a *ClusterActions) LocalTopicDefinition(nodeIndex int, topic string) (LocalTopicDefinition, bool, error) {
 	resp, err := a.sendCommandToNode(nodeIndex, fmt.Sprintf("METADATA topic=%s", topic))
 	if err != nil {
+		var brokerErr *wire.BrokerError
+		if errors.As(err, &brokerErr) && brokerErr.Code == "topic_not_found" {
+			return LocalTopicDefinition{}, false, nil
+		}
 		return LocalTopicDefinition{}, false, err
-	}
-	if strings.HasPrefix(resp, "ERROR: topic_not_found") {
-		return LocalTopicDefinition{}, false, nil
 	}
 	definition, err := parseLocalTopicDefinition(resp)
 	return definition, err == nil, err

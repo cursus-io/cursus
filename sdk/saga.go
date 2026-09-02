@@ -6,7 +6,16 @@ import (
 	"time"
 )
 
+const (
+	SagaRunning      = "RUNNING"
+	SagaWaiting      = "WAITING"
+	SagaCompleted    = "COMPLETED"
+	SagaCompensating = "COMPENSATING"
+	SagaFailed       = "FAILED"
+)
+
 // SagaState is the durable application-owned state of one saga instance.
+// Version is incremented by every successful mutation and fenced by SaveCAS.
 type SagaState struct {
 	ID             string
 	Type           string
@@ -18,17 +27,10 @@ type SagaState struct {
 	RetryCount     int
 	LastError      string
 	UpdatedAt      time.Time
+	Version        uint64
 	Effects        map[string]EffectState
 	Compensation   *CompensationState
 }
-
-const (
-	SagaRunning      = "RUNNING"
-	SagaWaiting      = "WAITING"
-	SagaCompleted    = "COMPLETED"
-	SagaCompensating = "COMPENSATING"
-	SagaFailed       = "FAILED"
-)
 
 // Command is an application command emitted by a saga.
 type Command struct {
@@ -41,30 +43,22 @@ type Command struct {
 	Payload       string
 }
 
-// NewCommand creates a command with a unique delivery identity.
-func NewCommand(commandType, sagaID, correlationID, causationID, payload string) Command {
-	event, _ := NewEventEnvelope("command", sagaID, commandType, payload)
-	return Command{ID: event.EventID, Type: commandType, SagaID: sagaID, CorrelationID: correlationID, CausationID: causationID, Payload: payload}
+// SagaTransaction is the single atomic durability boundary for an inbox claim,
+// saga state CAS, and outbox inserts. Implementations must roll back every
+// operation when the callback returned to SagaRepository.Transact fails.
+type SagaTransaction interface {
+	Claim(consumer, eventID string) (bool, error)
+	Load(sagaType, associationKey string) (*SagaState, error)
+	SaveCAS(state *SagaState, expectedVersion uint64) error
+	Enqueue(command Command) error
+	Complete(consumer, eventID string) error
+	Fail(consumer, eventID string, cause error) error
 }
 
-// InboxStore is implemented by the service database. Claim must be atomic on
-// (consumer, eventID) and return false when the event was already claimed.
-type InboxStore interface {
-	Claim(context.Context, string, string) (bool, error)
-	Complete(context.Context, string, string) error
-	Fail(context.Context, string, string, error) error
-}
-
-// OutboxStore is implemented by the service database. Enqueue should be part
-// of the same local transaction as the saga state update when possible.
-type OutboxStore interface {
-	Enqueue(context.Context, Command) error
-}
-
-// SagaStore persists saga state in the application-owned database.
-type SagaStore interface {
-	Load(context.Context, string, string) (*SagaState, error)
-	Save(context.Context, *SagaState) error
+// SagaRepository runs one serializable local transaction. A callback error must
+// leave the inbox, saga state, and outbox unchanged.
+type SagaRepository interface {
+	Transact(context.Context, func(SagaTransaction) error) error
 }
 
 // SagaHandler applies one event to a saga and returns commands to enqueue.
@@ -76,26 +70,25 @@ type SagaDefinition struct {
 	Handlers map[string]SagaHandler
 }
 
-// SagaManager coordinates inbox claim, saga state, and outbox commands.
+// SagaManager coordinates inbox, state, and outbox through one transaction.
 type SagaManager struct {
 	definition SagaDefinition
-	inbox      InboxStore
-	state      SagaStore
-	outbox     OutboxStore
+	repository SagaRepository
 	now        func() time.Time
 }
 
-func NewSagaManager(definition SagaDefinition, inbox InboxStore, state SagaStore, outbox OutboxStore) (*SagaManager, error) {
+func NewSagaManager(definition SagaDefinition, repository SagaRepository) (*SagaManager, error) {
 	if definition.Type == "" || len(definition.Handlers) == 0 {
 		return nil, fmt.Errorf("saga definition requires a type and handlers")
 	}
-	if inbox == nil || state == nil || outbox == nil {
-		return nil, fmt.Errorf("inbox, saga state, and outbox stores are required")
+	if repository == nil {
+		return nil, fmt.Errorf("saga repository is required")
 	}
-	return &SagaManager{definition: definition, inbox: inbox, state: state, outbox: outbox, now: time.Now}, nil
+	return &SagaManager{definition: definition, repository: repository, now: time.Now}, nil
 }
 
-// Handle processes an event at least once and safely ignores a duplicate claim.
+// Handle processes one event in a single atomic transaction. Duplicate claims
+// are harmless, and a crash cannot expose state without its outbox commands.
 func (m *SagaManager) Handle(ctx context.Context, event EventEnvelope) error {
 	if event.EventID == "" || event.EventType == "" {
 		return fmt.Errorf("saga event identity is incomplete")
@@ -107,99 +100,126 @@ func (m *SagaManager) Handle(ctx context.Context, event EventEnvelope) error {
 	if associationKey == "" {
 		associationKey = event.AggregateID
 	}
-	claimed, err := m.inbox.Claim(ctx, m.definition.Type, event.EventID)
-	if err != nil {
-		return fmt.Errorf("claim saga inbox: %w", err)
-	}
-	if !claimed {
-		return nil
+	if associationKey == "" {
+		return fmt.Errorf("saga association key is required")
 	}
 
-	state, err := m.state.Load(ctx, m.definition.Type, associationKey)
+	var handlerFailure error
+	err := m.repository.Transact(ctx, func(tx SagaTransaction) error {
+		claimed, err := tx.Claim(m.definition.Type, event.EventID)
+		if err != nil {
+			return fmt.Errorf("claim saga inbox: %w", err)
+		}
+		if !claimed {
+			return nil
+		}
+
+		state, expectedVersion, err := m.loadOrCreateState(tx, associationKey)
+		if err != nil {
+			return err
+		}
+		if state.CorrelationID == "" {
+			state.CorrelationID = event.CorrelationID
+		}
+
+		handler, ok := m.definition.Handlers[event.EventType]
+		if !ok {
+			return tx.Complete(m.definition.Type, event.EventID)
+		}
+
+		commands, handleErr := handler(ctx, state, event)
+		if handleErr != nil {
+			state.RetryCount++
+			state.LastError = handleErr.Error()
+			state.UpdatedAt = m.now().UTC()
+			if err := saveSagaState(tx, state, expectedVersion); err != nil {
+				return fmt.Errorf("save failed saga state: %w", err)
+			}
+			if err := tx.Fail(m.definition.Type, event.EventID, handleErr); err != nil {
+				return fmt.Errorf("record saga inbox failure: %w", err)
+			}
+			handlerFailure = handleErr
+			return nil
+		}
+
+		state.LastError = ""
+		for index, command := range commands {
+			if command.Type == "" {
+				return fmt.Errorf("saga command type is required at index %d", index)
+			}
+			effectID := command.EffectID
+			if effectID == "" {
+				effectID = fmt.Sprintf("%s:%d", event.EventID, index)
+			}
+			if effect, exists := state.Effects[effectID]; exists && (effect.Status == EffectEnqueued || effect.Status == EffectSucceeded) {
+				continue
+			}
+			command = m.prepareCommand(command, state, event.EventID, effectID)
+			if err := tx.Enqueue(command); err != nil {
+				return fmt.Errorf("enqueue saga command: %w", err)
+			}
+			effect := state.Effects[effectID]
+			effect.ID = effectID
+			effect.Step = command.Type
+			effect.Status = EffectEnqueued
+			effect.CommandID = command.ID
+			effect.Attempts++
+			effect.LastError = ""
+			effect.UpdatedAt = m.now().UTC()
+			state.Effects[effectID] = effect
+		}
+		state.UpdatedAt = m.now().UTC()
+		if err := saveSagaState(tx, state, expectedVersion); err != nil {
+			return fmt.Errorf("save saga state: %w", err)
+		}
+		if err := tx.Complete(m.definition.Type, event.EventID); err != nil {
+			return fmt.Errorf("complete saga inbox: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
-		return m.fail(ctx, associationKey, event.EventID, nil, fmt.Errorf("load saga state: %w", err))
+		return err
+	}
+	return handlerFailure
+}
+
+func (m *SagaManager) prepareCommand(command Command, state *SagaState, causationID, effectID string) Command {
+	command.EffectID = effectID
+	if command.SagaID == "" {
+		command.SagaID = state.ID
+	}
+	if command.CorrelationID == "" {
+		command.CorrelationID = state.CorrelationID
+	}
+	if command.CausationID == "" {
+		command.CausationID = causationID
+	}
+	command.ID = m.definition.Type + ":" + state.ID + ":" + effectID
+	return command
+}
+
+func (m *SagaManager) loadOrCreateState(tx SagaTransaction, associationKey string) (*SagaState, uint64, error) {
+	if associationKey == "" {
+		return nil, 0, fmt.Errorf("association key is required")
+	}
+	state, err := tx.Load(m.definition.Type, associationKey)
+	if err != nil {
+		return nil, 0, fmt.Errorf("load saga state: %w", err)
 	}
 	if state == nil {
-		state = &SagaState{ID: associationKey, Type: m.definition.Type, AssociationKey: associationKey, CorrelationID: event.CorrelationID, Status: SagaRunning}
+		state = &SagaState{ID: associationKey, Type: m.definition.Type, AssociationKey: associationKey, Status: SagaRunning}
 	}
 	if state.Effects == nil {
 		state.Effects = make(map[string]EffectState)
 	}
-	handler, ok := m.definition.Handlers[event.EventType]
-	if !ok {
-		return m.complete(ctx, associationKey, event.EventID, state)
-	}
-	commands, err := handler(ctx, state, event)
-	if err != nil {
-		state.RetryCount++
-		state.LastError = err.Error()
-		return m.fail(ctx, associationKey, event.EventID, state, err)
-	}
-	state.UpdatedAt = m.now().UTC()
-	if err := m.state.Save(ctx, state); err != nil {
-		return m.fail(ctx, associationKey, event.EventID, state, fmt.Errorf("save saga state: %w", err))
-	}
-	for index, command := range commands {
-		effectID := command.EffectID
-		if effectID == "" {
-			effectID = fmt.Sprintf("%s:%d", event.EventID, index)
-		}
-		if effect, ok := state.Effects[effectID]; ok && effect.Status == EffectSucceeded {
-			continue
-		}
-		if command.SagaID == "" {
-			command.SagaID = state.ID
-		}
-		if command.CorrelationID == "" {
-			command.CorrelationID = state.CorrelationID
-		}
-		if command.CausationID == "" {
-			command.CausationID = event.EventID
-		}
-		if command.ID == "" {
-			command = NewCommand(command.Type, command.SagaID, command.CorrelationID, command.CausationID, command.Payload)
-		}
-		command.EffectID = effectID
-		effect := state.Effects[effectID]
-		effect.ID = effectID
-		effect.Step = command.Type
-		effect.Attempts++
-		effect.Status = EffectPending
-		effect.CommandID = command.ID
-		effect.UpdatedAt = m.now().UTC()
-		state.Effects[effectID] = effect
-		if err := m.outbox.Enqueue(ctx, command); err != nil {
-			effect.Status = EffectFailed
-			effect.LastError = err.Error()
-			effect.UpdatedAt = m.now().UTC()
-			state.Effects[effectID] = effect
-			return m.fail(ctx, associationKey, event.EventID, state, fmt.Errorf("enqueue saga command: %w", err))
-		}
-		effect.Status = EffectSucceeded
-		effect.LastError = ""
-		effect.UpdatedAt = m.now().UTC()
-		state.Effects[effectID] = effect
-		if err := m.state.Save(ctx, state); err != nil {
-			return m.fail(ctx, associationKey, event.EventID, state, fmt.Errorf("save saga effect: %w", err))
-		}
-	}
-	return m.complete(ctx, associationKey, event.EventID, state)
+	return state, state.Version, nil
 }
 
-func (m *SagaManager) complete(ctx context.Context, associationKey, eventID string, state *SagaState) error {
-	if err := m.inbox.Complete(ctx, m.definition.Type, eventID); err != nil {
-		return fmt.Errorf("complete saga inbox: %w", err)
+func saveSagaState(tx SagaTransaction, state *SagaState, expectedVersion uint64) error {
+	state.Version = expectedVersion + 1
+	if err := tx.SaveCAS(state, expectedVersion); err != nil {
+		state.Version = expectedVersion
+		return err
 	}
 	return nil
-}
-
-func (m *SagaManager) fail(ctx context.Context, associationKey, eventID string, state *SagaState, cause error) error {
-	if state != nil {
-		state.UpdatedAt = m.now().UTC()
-		_ = m.state.Save(ctx, state)
-	}
-	if err := m.inbox.Fail(ctx, m.definition.Type, eventID, cause); err != nil {
-		return fmt.Errorf("record saga inbox failure: %w", err)
-	}
-	return cause
 }

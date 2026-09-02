@@ -50,7 +50,7 @@ func (p *recoverableCleanupHandlerProvider) RemoveTopicStorage(path string) erro
 func emptyTopicSnapshot(t *testing.T) io.ReadCloser {
 	t.Helper()
 	data, err := json.Marshal(BrokerFSMState{
-		Version:           6,
+		Version:           SnapshotVersionCurrent,
 		TopicState:        map[string]*topic.Definition{},
 		PartitionMetadata: map[string]*PartitionMetadata{},
 	})

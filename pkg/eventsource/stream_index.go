@@ -61,12 +61,14 @@ func NewStreamIndex(dir string, partitionID int) (*StreamIndex, error) {
 	indexPath := filepath.Join(dir, fmt.Sprintf("partition_%d_stream.idx", partitionID))
 	sidecarPath := filepath.Join(dir, fmt.Sprintf("partition_%d_stream_keys.dat", partitionID))
 
-	indexFile, err := os.OpenFile(indexPath, os.O_RDWR|os.O_CREATE, 0644)
+	// #nosec G304 -- both file names are fixed by the partition and dir is the configured storage root.
+	indexFile, err := os.OpenFile(indexPath, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open index file: %w", err)
 	}
 
-	sidecarFile, err := os.OpenFile(sidecarPath, os.O_RDWR|os.O_CREATE, 0644)
+	// #nosec G304 -- both file names are fixed by the partition and dir is the configured storage root.
+	sidecarFile, err := os.OpenFile(sidecarPath, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		_ = indexFile.Close()
 		return nil, fmt.Errorf("open sidecar file: %w", err)
@@ -287,7 +289,11 @@ func (si *StreamIndex) writeSidecarEntry(hash uint64, key string) error {
 	}
 	buf := make([]byte, 10+len(keyBytes))
 	binary.BigEndian.PutUint64(buf[0:8], hash)
-	binary.BigEndian.PutUint16(buf[8:10], uint16(len(keyBytes)))
+	keyLength, ok := util.SafeIntToUint16(len(keyBytes))
+	if !ok {
+		return fmt.Errorf("key length %d exceeds uint16 format limit", len(keyBytes))
+	}
+	binary.BigEndian.PutUint16(buf[8:10], keyLength)
 	copy(buf[10:], keyBytes)
 
 	if _, err := si.sidecarFile.Write(buf); err != nil {

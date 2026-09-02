@@ -25,6 +25,18 @@ func (m *MockISRManager) UpdateHeartbeat(brokerID string) {
 	m.Called(brokerID)
 }
 
+func (m *MockISRManager) BuildCatchupProofs() []fsm.ISRCatchupProof {
+	args := m.Called()
+	if args.Get(0) == nil {
+		return nil
+	}
+	return args.Get(0).([]fsm.ISRCatchupProof)
+}
+
+func (m *MockISRManager) SubmitCatchupProofs(nodeID string, proofs []fsm.ISRCatchupProof) error {
+	return m.Called(nodeID, proofs).Error(0)
+}
+
 func (m *MockISRManager) GetISR(topic string, partition int) []string {
 	args := m.Called(topic, partition)
 	return args.Get(0).([]string)

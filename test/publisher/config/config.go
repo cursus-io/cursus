@@ -122,6 +122,7 @@ func LoadPublisherConfig(explicitPath string) (*PublisherConfig, error) {
 	}
 
 	if finalPath != "" {
+		// #nosec G304 -- the CLI user explicitly selects the local configuration file.
 		data, err := os.ReadFile(finalPath)
 		if err != nil {
 			if os.IsNotExist(err) {

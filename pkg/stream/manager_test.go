@@ -14,17 +14,15 @@ var readFn = func(offset uint64, max int) ([]types.Message, error) {
 	return nil, nil
 }
 
-var DefaultStreamCommitInterval = 5 * time.Second
-
 func TestAddRemoveStream(t *testing.T) {
-	sm := NewStreamManager(2, 500*time.Millisecond, 100*time.Millisecond)
+	sm := NewStreamManager(2, 500*time.Millisecond)
 
 	conn1, _ := net.Pipe()
 	defer func() { _ = conn1.Close() }()
 	stream1 := NewStreamConnection(conn1, "topic1", 0, "group1", 0)
 
 	key1 := "topic1:0:group1"
-	if err := sm.AddStream(key1, stream1, readFn, DefaultStreamCommitInterval); err != nil {
+	if err := sm.AddStream(key1, stream1, readFn); err != nil {
 		t.Fatalf("failed to add stream: %v", err)
 	}
 
@@ -39,21 +37,21 @@ func TestAddRemoveStream(t *testing.T) {
 }
 
 func TestAddStreamReplacesSameKeyWithoutOldMonitorDeletingReplacement(t *testing.T) {
-	sm := NewStreamManager(2, time.Hour, 5*time.Millisecond)
+	sm := NewStreamManager(2, time.Hour)
 
 	conn1, peer1 := net.Pipe()
 	defer func() { _ = peer1.Close() }()
 	stream1 := NewStreamConnection(conn1, "topic", 0, "group", 0)
 
 	const key = "topic:0:group"
-	if err := sm.AddStream(key, stream1, readFn, DefaultStreamCommitInterval); err != nil {
+	if err := sm.AddStream(key, stream1, readFn); err != nil {
 		t.Fatalf("failed to add initial stream: %v", err)
 	}
 
 	conn2, peer2 := net.Pipe()
 	defer func() { _ = peer2.Close() }()
 	stream2 := NewStreamConnection(conn2, "topic", 0, "group", 0)
-	if err := sm.AddStream(key, stream2, readFn, DefaultStreamCommitInterval); err != nil {
+	if err := sm.AddStream(key, stream2, readFn); err != nil {
 		t.Fatalf("failed to replace stream: %v", err)
 	}
 	defer sm.RemoveStream(key)
@@ -79,33 +77,33 @@ func TestAddStreamReplacesSameKeyWithoutOldMonitorDeletingReplacement(t *testing
 }
 
 func TestMaxConnections(t *testing.T) {
-	sm := NewStreamManager(1, time.Second, 100*time.Millisecond)
+	sm := NewStreamManager(1, time.Second)
 
 	conn1, _ := net.Pipe()
 	defer func() { _ = conn1.Close() }()
 
 	stream1 := NewStreamConnection(conn1, "topic", 0, "group1", 0)
-	if err := sm.AddStream("key1", stream1, readFn, DefaultStreamCommitInterval); err != nil {
+	if err := sm.AddStream("key1", stream1, readFn); err != nil {
 		t.Fatalf("failed to add stream: %v", err)
 	}
 
 	conn2, _ := net.Pipe()
 	defer func() { _ = conn2.Close() }()
 	stream2 := NewStreamConnection(conn2, "topic", 0, "group2", 0)
-	if err := sm.AddStream("key2", stream2, readFn, DefaultStreamCommitInterval); err == nil {
+	if err := sm.AddStream("key2", stream2, readFn); err == nil {
 		t.Fatalf("expected error when adding stream beyond maxConn")
 	}
 }
 
 func TestGetStreamsForPartition(t *testing.T) {
-	sm := NewStreamManager(5, time.Second, 100*time.Millisecond)
+	sm := NewStreamManager(5, time.Second)
 
 	var conns []net.Conn
 	for i := 0; i < 3; i++ {
 		c1, c2 := net.Pipe()
 		conns = append(conns, c1, c2)
 		s := NewStreamConnection(c1, "topicA", i, "group", uint64(i))
-		if err := sm.AddStream("key"+strconv.Itoa(i), s, readFn, DefaultStreamCommitInterval); err != nil {
+		if err := sm.AddStream("key"+strconv.Itoa(i), s, readFn); err != nil {
 			t.Fatalf("failed to add stream: %v", err)
 		}
 
@@ -142,5 +140,90 @@ func TestStreamConnectionOffsetAndActive(t *testing.T) {
 
 	if !sc.LastActive().Equal(now) {
 		t.Fatalf("expected lastActive to be updated")
+	}
+}
+
+func TestManagerSchedulerPollsEveryStream(t *testing.T) {
+	sm := NewStreamManager(2, time.Hour)
+	firstConn, firstPeer := net.Pipe()
+	secondConn, secondPeer := net.Pipe()
+	defer func() { _ = firstPeer.Close() }()
+	defer func() { _ = secondPeer.Close() }()
+
+	first := NewStreamConnection(firstConn, "orders", 0, "first", 0)
+	second := NewStreamConnection(secondConn, "orders", 0, "second", 0)
+	first.SetInterval(20 * time.Millisecond)
+	second.SetInterval(20 * time.Millisecond)
+	firstReads := make(chan struct{}, 2)
+	secondReads := make(chan struct{}, 2)
+	recordRead := func(reads chan<- struct{}) func(uint64, int) ([]types.Message, error) {
+		return func(uint64, int) ([]types.Message, error) {
+			reads <- struct{}{}
+			return nil, nil
+		}
+	}
+	if err := sm.AddStream("orders:0:first", first, recordRead(firstReads)); err != nil {
+		t.Fatalf("add first stream: %v", err)
+	}
+	if err := sm.AddStream("orders:0:second", second, recordRead(secondReads)); err != nil {
+		t.Fatalf("add second stream: %v", err)
+	}
+	defer sm.RemoveStream("orders:0:first")
+	defer sm.RemoveStream("orders:0:second")
+
+	for name, reads := range map[string]<-chan struct{}{"first": firstReads, "second": secondReads} {
+		for poll := 0; poll < 2; poll++ {
+			select {
+			case <-reads:
+			case <-time.After(time.Second):
+				t.Fatalf("%s stream did not receive manager poll %d", name, poll)
+			}
+		}
+	}
+}
+
+func TestManagerSchedulerRestartsAfterBecomingIdle(t *testing.T) {
+	sm := NewStreamManager(1, time.Hour)
+	firstConn, firstPeer := net.Pipe()
+	first := NewStreamConnection(firstConn, "orders", 0, "first", 0)
+	if err := sm.AddStream("orders:0:first", first, readFn); err != nil {
+		t.Fatalf("add first stream: %v", err)
+	}
+	sm.RemoveStream("orders:0:first")
+	_ = firstPeer.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		sm.mu.RLock()
+		scheduling := sm.scheduling
+		sm.mu.RUnlock()
+		if !scheduling {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("scheduler did not stop after its last stream was removed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	secondConn, secondPeer := net.Pipe()
+	defer func() { _ = secondPeer.Close() }()
+	second := NewStreamConnection(secondConn, "orders", 0, "second", 0)
+	second.SetInterval(20 * time.Millisecond)
+	reads := make(chan struct{}, 2)
+	if err := sm.AddStream("orders:0:second", second, func(uint64, int) ([]types.Message, error) {
+		reads <- struct{}{}
+		return nil, nil
+	}); err != nil {
+		t.Fatalf("add second stream: %v", err)
+	}
+	defer sm.RemoveStream("orders:0:second")
+
+	for poll := 0; poll < 2; poll++ {
+		select {
+		case <-reads:
+		case <-time.After(time.Second):
+			t.Fatalf("restarted scheduler did not poll replacement stream %d", poll)
+		}
 	}
 }

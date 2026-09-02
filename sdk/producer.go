@@ -2,12 +2,14 @@ package sdk
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
-	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cursus-io/cursus/util"
 )
 
 type BatchState struct {
@@ -28,6 +30,13 @@ type partitionBuffer struct {
 	closed       bool
 }
 
+func (p *Producer) wireTLSConfig() *tls.Config {
+	if p == nil || p.client == nil {
+		return nil
+	}
+	return p.client.tlsConfig
+}
+
 func newPartitionBuffer() *partitionBuffer {
 	p := &partitionBuffer{
 		msgs:      make([]Message, 0),
@@ -46,7 +55,7 @@ type Producer struct {
 
 	sendersWG sync.WaitGroup
 
-	rr       uint32
+	rr       atomic.Uint64
 	inFlight []int32
 
 	partitionSentMus  []sync.Mutex
@@ -100,6 +109,11 @@ func NewProducerWithContext(ctx context.Context, cfg *PublisherConfig) (*Produce
 	if err != nil {
 		return nil, fmt.Errorf("create producer client: %w", err)
 	}
+	bootstrap := &Producer{config: cfg}
+	if err := bootstrap.createConfiguredTopic(); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
 
 	p := &Producer{
 		config:           cfg,
@@ -126,10 +140,6 @@ func NewProducerWithContext(ctx context.Context, cfg *PublisherConfig) (*Produce
 	p.partitionBatchMus = make([]sync.Mutex, cfg.Partitions)
 	for i := 0; i < cfg.Partitions; i++ {
 		p.partitionBatchStates[i] = make(map[string]*BatchState)
-	}
-
-	if err := p.CreateTopic(cfg.Topic, cfg.Partitions); err != nil {
-		LogError("failed to create topic '%s': %v", cfg.Topic, err)
 	}
 
 	p.fetchMetadata()
@@ -174,20 +184,16 @@ func (p *Producer) fetchMetadata() {
 		return
 	}
 	for _, addr := range addrs {
-		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		conn, err := dialAuthenticatedWireConnection(
+			context.Background(), addr, 5*time.Second,
+			p.config.HandshakeTimeoutMS, p.config.CompressionType, p.wireTLSConfig(),
+			p.config.Principal, p.config.AuthToken,
+		)
 		if err != nil {
 			continue
 		}
-		if err := negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS); err != nil {
-			_ = conn.Close()
-			continue
-		}
-		if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {
-			_ = conn.Close()
-			continue
-		}
 		cmd := fmt.Sprintf("METADATA topic=%s", p.config.Topic)
-		if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
+		if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 			_ = conn.Close()
 			continue
 		}
@@ -224,8 +230,15 @@ func (p *Producer) getPartitionLeaderAddr(partition int) string {
 }
 
 func (p *Producer) nextPartition() int {
-	idx := int((atomic.AddUint32(&p.rr, 1) - 1) % uint32(p.partitions))
-	return idx
+	partitionCount, ok := util.SafeIntToUint64(p.partitions)
+	if !ok || partitionCount == 0 {
+		return 0
+	}
+	index, ok := util.SafeUint64ToInt((p.rr.Add(1) - 1) % partitionCount)
+	if !ok {
+		return 0
+	}
+	return index
 }
 
 // TopicCleanupPolicy selects broker maintenance for a topic.
@@ -254,6 +267,16 @@ func (p *Producer) CreateTopic(topic string, partitions int) error {
 	return p.CreateTopicWithOptions(topic, TopicOptions{Partitions: partitions})
 }
 
+func (p *Producer) createConfiguredTopic() error {
+	if p == nil || p.config == nil || !p.config.AutoCreateTopics {
+		return nil
+	}
+	if err := p.CreateTopic(p.config.Topic, p.config.Partitions); err != nil {
+		return fmt.Errorf("auto-create topic %q: %w", p.config.Topic, err)
+	}
+	return nil
+}
+
 // CreateTopicWithOptions creates or updates a topic with explicit policy options.
 func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) error {
 	createCmd, err := buildCreateTopicCommand(topic, options, p.config.EnableIdempotence)
@@ -264,19 +287,16 @@ func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) er
 		return fmt.Errorf("no broker addresses available")
 	}
 	brokerAddr := p.config.BrokerAddrs[0]
-	conn, err := net.Dial("tcp", brokerAddr)
+	conn, err := dialAuthenticatedWireConnection(
+		context.Background(), brokerAddr, 5*time.Second,
+		p.config.HandshakeTimeoutMS, p.config.CompressionType, p.wireTLSConfig(),
+		p.config.Principal, p.config.AuthToken,
+	)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
-
-	if err := negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS); err != nil {
-		return fmt.Errorf("protocol negotiation: %w", err)
-	}
-	if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {
-		return fmt.Errorf("authentication: %w", err)
-	}
-	cmdBytes := EncodeMessage("admin", createCmd)
+	cmdBytes := []byte(createCmd)
 
 	if err := WriteWithLength(conn, cmdBytes); err != nil {
 		return fmt.Errorf("send command: %w", err)
@@ -288,9 +308,6 @@ func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) er
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if brokerErr, ok := ParseBrokerError(respStr); ok {
-		return brokerErr
-	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return fmt.Errorf("unexpected create response: %s", respStr)
 	}
@@ -449,11 +466,6 @@ func (p *Producer) Send(payload string) (uint64, error) {
 	buf.cond.Signal()
 
 	return seqNum, nil
-}
-
-// PublishMessage is an alias for Send, for compatibility with test/publisher.
-func (p *Producer) PublishMessage(payload string) (uint64, error) {
-	return p.Send(payload)
 }
 
 func (p *Producer) partitionSender(part int) {
@@ -635,6 +647,11 @@ func waitForDrain(waiters []chan struct{}, timeout time.Duration) bool {
 
 // FlushBenchmark waits until all expectedTotal messages are acknowledged or timeout expires.
 func (p *Producer) FlushBenchmark(expectedTotal int) {
+	expected, ok := util.SafeIntToUint64(expectedTotal)
+	if !ok {
+		LogError("invalid negative benchmark message count: %d", expectedTotal)
+		return
+	}
 	for _, buf := range p.buffers {
 		buf.mu.Lock()
 		buf.cond.Broadcast()
@@ -667,7 +684,7 @@ func (p *Producer) FlushBenchmark(expectedTotal int) {
 				p.partitionBatchMus[part].Unlock()
 			}
 
-			if ackedSoFar >= expectedTotal && totalPending == 0 {
+			if ackedSoFar >= expected && totalPending == 0 {
 				LogInfo("FlushBenchmark completed — all %d messages acknowledged (%.3fs)", expectedTotal, time.Since(start).Seconds())
 				return
 			}
@@ -724,12 +741,12 @@ func (p *Producer) GetLatencies() []time.Duration {
 	return res
 }
 
-func (p *Producer) GetUniqueAckCount() int {
-	return int(p.uniqueCount.Load())
+func (p *Producer) GetUniqueAckCount() uint64 {
+	return p.uniqueCount.Load()
 }
 
-func (p *Producer) GetAttemptsCount() int {
-	return int(p.attemptsCount.Load())
+func (p *Producer) GetAttemptsCount() uint64 {
+	return p.attemptsCount.Load()
 }
 
 func (p *Producer) GetPartitionCount() int {

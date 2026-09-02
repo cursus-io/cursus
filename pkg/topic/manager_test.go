@@ -105,8 +105,8 @@ type MockStreamManager struct {
 	mock.Mock
 }
 
-func (m *MockStreamManager) AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), commitInterval time.Duration) error {
-	args := m.Called(key, streamConn, readFn, commitInterval)
+func (m *MockStreamManager) AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error)) error {
+	args := m.Called(key, streamConn, readFn)
 	return args.Error(0)
 }
 

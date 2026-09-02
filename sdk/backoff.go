@@ -31,6 +31,7 @@ func (b *backoff) duration() time.Duration {
 	jitterRange := int64(b.current) / 10
 	var jitter time.Duration
 	if jitterRange > 0 {
+		// #nosec G404 -- retry jitter is not a security token or secret.
 		jitter = time.Duration(rand.Int63n(jitterRange))
 	}
 

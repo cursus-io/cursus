@@ -1,32 +1,12 @@
 package sdk
 
 import (
-	"fmt"
 	"time"
+
+	"github.com/cursus-io/cursus/pkg/wire"
 )
 
-// Message represents a single message
-type Message struct {
-	Offset     uint64
-	ProducerID string
-	SeqNum     uint64
-	Payload    string
-	Key        string // optional: partition routing key
-	Epoch      int64
-
-	EventType        string
-	SchemaVersion    uint32
-	AggregateVersion uint64
-	Metadata         string
-
-	RetryCount int
-	Retry      bool
-}
-
-func (m Message) String() string {
-	return fmt.Sprintf("Message { ID: %s-%d, Payload:%s, Offset:%d, Key:%s, Epoch:%d, RetryCount:%d }",
-		m.ProducerID, m.SeqNum, m.Payload, m.Offset, m.Key, m.Epoch, m.RetryCount)
-}
+type Message = wire.Message
 
 // PartitionOffsetRange describes broker-reported offsets for one partition.
 type PartitionOffsetRange struct {

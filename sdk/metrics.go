@@ -22,6 +22,7 @@ var (
 	consumerPollLatency      *prometheus.HistogramVec
 	consumerRebalanceTotal   *prometheus.CounterVec
 	consumerOffsetGapTotal   *prometheus.CounterVec
+	consumerStaleWorkers     *prometheus.CounterVec
 )
 
 func initMetrics() {
@@ -120,6 +121,16 @@ func initMetrics() {
 			[]string{"topic", "group"},
 		)
 
+		consumerStaleWorkers = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: "cursus",
+				Subsystem: "consumer",
+				Name:      "stale_workers_total",
+				Help:      "Assignment workers fenced after their consumer generation became stale.",
+			},
+			[]string{"topic", "group", "worker"},
+		)
+
 		metricsRegistry.MustRegister(
 			producerMessagesSent,
 			producerSendErrors,
@@ -130,6 +141,7 @@ func initMetrics() {
 			consumerPollLatency,
 			consumerRebalanceTotal,
 			consumerOffsetGapTotal,
+			consumerStaleWorkers,
 		)
 	})
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -56,16 +57,6 @@ func newTestConnPair(t *testing.T) (client, server net.Conn) {
 	return client, server
 }
 
-// sendFramed writes a length-prefixed message to conn.
-func sendFramed(t *testing.T, conn net.Conn, msg []byte) {
-	t.Helper()
-	buf := make([]byte, 4+len(msg))
-	binary.BigEndian.PutUint32(buf[0:4], uint32(len(msg)))
-	copy(buf[4:], msg)
-	_, err := conn.Write(buf)
-	require.NoError(t, err)
-}
-
 // readFramed reads a length-prefixed response from conn.
 func readFramed(t *testing.T, conn net.Conn) string {
 	t.Helper()
@@ -79,46 +70,53 @@ func readFramed(t *testing.T, conn net.Conn) string {
 	return string(msgBuf)
 }
 
+func newWireTestClient(t *testing.T, conn net.Conn) *wire.Connection {
+	t.Helper()
+	client, err := wire.ClientHandshake(conn, []wire.Compression{wire.CompressionNone})
+	require.NoError(t, err)
+	return client
+}
+
+func wireRequest(t *testing.T, client *wire.Connection, command wire.Command, payload []byte) string {
+	t.Helper()
+	parsedCommand, request, err := wire.ParseCommandText(string(payload))
+	require.NoError(t, err)
+	require.Equal(t, command, parsedCommand)
+	payload, err = wire.EncodeCommandPayload(request)
+	require.NoError(t, err)
+	require.NoError(t, client.WriteFrame(wire.Frame{
+		Kind: wire.KindRequest, Command: command, RequestID: 1, Payload: payload,
+	}))
+	response, err := client.ReadFrame()
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), response.RequestID)
+	require.Equal(t, command, response.Command)
+	if response.Status == wire.StatusError {
+		payload, err := wire.DecodeError(response.Payload)
+		require.NoError(t, err)
+		return "ERROR: " + payload.Code
+	}
+	return string(response.Payload)
+}
+
 func TestIsBatchMessage(t *testing.T) {
-	data := make([]byte, 10)
-	data[0] = 0xBA
-	data[1] = 0x7C
-	binary.BigEndian.PutUint16(data[2:4], 2)
+	data, err := wire.EncodeBatch(wire.Batch{Topic: "orders", Partition: 2, Acks: "all"})
+	require.NoError(t, err)
 	assert.True(t, isBatchMessage(data))
 
 	data[0] = 0x00
 	assert.False(t, isBatchMessage(data))
-
-	assert.False(t, isBatchMessage([]byte{0xBA, 0x7C}))
+	assert.False(t, isBatchMessage([]byte{0x43, 0x42, 0x56, 0x32, 0x00}))
 }
 
-func TestIsBatchMessage_ZeroTopicLen(t *testing.T) {
-	data := make([]byte, 10)
-	data[0] = 0xBA
-	data[1] = 0x7C
-	binary.BigEndian.PutUint16(data[2:4], 0)
-	assert.False(t, isBatchMessage(data))
-}
-
-func TestIsBatchMessage_TopicLenExceedsData(t *testing.T) {
-	data := make([]byte, 6)
-	data[0] = 0xBA
-	data[1] = 0x7C
-	binary.BigEndian.PutUint16(data[2:4], 200)
-	assert.False(t, isBatchMessage(data))
-}
-
-func TestIsBatchMessage_ExactlySixBytes(t *testing.T) {
-	data := []byte{0xBA, 0x7C, 0x00, 0x01, 0x41, 0x00}
+func TestIsBatchMessage_HeaderOnly(t *testing.T) {
+	data := []byte{0x43, 0x42, 0x56, 0x32, 0x00, 0x02}
 	assert.True(t, isBatchMessage(data))
 }
 
-func TestIsBatchMessage_SecondMagicByteMismatch(t *testing.T) {
-	data := make([]byte, 10)
-	data[0] = 0xBA
-	data[1] = 0x00
-	binary.BigEndian.PutUint16(data[2:4], 2)
-	assert.False(t, isBatchMessage(data))
+func TestIsBatchMessage_RejectsWrongVersionAndLegacyMagic(t *testing.T) {
+	assert.False(t, isBatchMessage([]byte{0x43, 0x42, 0x56, 0x32, 0x00, 0x01}))
+	assert.False(t, isBatchMessage([]byte{0xBA, 0x7C, 0x00, 0x02, 0x00, 0x00}))
 }
 
 func TestIsCommand(t *testing.T) {
@@ -141,7 +139,7 @@ func TestIsCommand_AllKeywords(t *testing.T) {
 		"INIT_PRODUCER_ID transactional_id=tx-1",
 		"BEGIN_TXN transactional_id=tx-1 producerId=p1 epoch=0",
 		"TXN_PUBLISH transactional_id=tx-1 topic=t1 partition=0 producerId=p1 seqNum=1 epoch=0 message=value",
-		"SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=p1 epoch=0 topic=t1 group=g1 member=m1 generation=1 P0:1",
+		"SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=p1 epoch=0 topic=t1 group=g1 member=m1 generation=1 offsets=P0:1",
 		"END_TXN transactional_id=tx-1 producerId=p1 epoch=0 result=commit",
 		"TXN_STATUS transactional_id=tx-1",
 	}
@@ -172,10 +170,9 @@ func TestHealthHandlerSeparatesLivenessAndReadiness(t *testing.T) {
 	handler.ServeHTTP(live, httptest.NewRequest(http.MethodGet, "/live", nil))
 	assert.Equal(t, http.StatusOK, live.Code)
 
-	legacy := httptest.NewRecorder()
-	handler.ServeHTTP(legacy, httptest.NewRequest(http.MethodGet, "/health", nil))
-	assert.Equal(t, http.StatusServiceUnavailable, legacy.Code)
-	assert.Contains(t, legacy.Body.String(), "broker=starting")
+	removed := httptest.NewRecorder()
+	handler.ServeHTTP(removed, httptest.NewRequest(http.MethodGet, "/health", nil))
+	assert.Equal(t, http.StatusNotFound, removed.Code)
 
 	state.SetReady(true)
 	ready := httptest.NewRecorder()
@@ -189,10 +186,9 @@ func TestHealthHandlerSeparatesLivenessAndReadiness(t *testing.T) {
 	assert.Equal(t, http.StatusOK, ready.Code)
 	assert.Contains(t, ready.Body.String(), `"status":"ready"`)
 
-	legacy = httptest.NewRecorder()
-	handler.ServeHTTP(legacy, httptest.NewRequest(http.MethodGet, "/", nil))
-	assert.Equal(t, http.StatusOK, legacy.Code)
-	assert.Equal(t, "OK", legacy.Body.String())
+	removed = httptest.NewRecorder()
+	handler.ServeHTTP(removed, httptest.NewRequest(http.MethodGet, "/", nil))
+	assert.Equal(t, http.StatusNotFound, removed.Code)
 }
 
 func TestReadinessDoesNotDependOnConsumerGroupMembers(t *testing.T) {
@@ -307,116 +303,17 @@ func TestWriteResponseWithTimeout_ClosedConn(t *testing.T) {
 	writeResponseWithTimeout(server, "should not panic", 1*time.Second)
 }
 
-func TestReadMessage(t *testing.T) {
-	client, server := newTestConnPair(t)
-
-	go func() {
-		msg := "test-message"
-		buf := make([]byte, 4+len(msg))
-		binary.BigEndian.PutUint32(buf[0:4], uint32(len(msg)))
-		copy(buf[4:], []byte(msg))
-		_, _ = server.Write(buf)
-	}()
-
-	data, err := readMessage(client, "none")
-	assert.NoError(t, err)
-	assert.Equal(t, "test-message", string(data))
-}
-
-func TestReadMessage_EOF(t *testing.T) {
-	client, server := newTestConnPair(t)
-	_ = server.Close()
-
-	_, err := readMessage(client, "none")
-	assert.Error(t, err)
-}
-
-func TestReadMessage_PartialLength(t *testing.T) {
-	client, server := newTestConnPair(t)
-
-	go func() {
-		_, _ = server.Write([]byte{0x00, 0x00})
-		_ = server.Close()
-	}()
-
-	_, err := readMessage(client, "none")
-	assert.Error(t, err)
-}
-
-func TestReadMessage_PartialBody(t *testing.T) {
-	client, server := newTestConnPair(t)
-
-	go func() {
-		lenBuf := make([]byte, 4)
-		binary.BigEndian.PutUint32(lenBuf, 100)
-		_, _ = server.Write(lenBuf)
-		_, _ = server.Write([]byte("short"))
-		_ = server.Close()
-	}()
-
-	_, err := readMessage(client, "none")
-	assert.Error(t, err)
-}
-
-func TestReadMessage_RejectsOversizedFrameBeforeReadingBody(t *testing.T) {
-	client, server := newTestConnPair(t)
-
-	go func() {
-		lenBuf := make([]byte, 4)
-		binary.BigEndian.PutUint32(lenBuf, uint32(util.MaxMessageSize+1))
-		_, _ = server.Write(lenBuf)
-	}()
-
-	_, err := readMessage(client, "none")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "exceeds maximum")
-}
-
-func TestReadMessage_WithGzipCompression(t *testing.T) {
-	client, server := newTestConnPair(t)
-
-	msg := "compressed-message"
-	compressed, err := util.CompressMessage([]byte(msg), "gzip")
-	require.NoError(t, err)
-
-	go func() {
-		buf := make([]byte, 4+len(compressed))
-		binary.BigEndian.PutUint32(buf[0:4], uint32(len(compressed)))
-		copy(buf[4:], compressed)
-		_, _ = server.Write(buf)
-	}()
-
-	data, err := readMessage(client, "gzip")
-	assert.NoError(t, err)
-	assert.Equal(t, msg, string(data))
-}
-
-func TestReadMessage_InvalidCompression(t *testing.T) {
-	client, server := newTestConnPair(t)
-
-	go func() {
-		msg := []byte("not-compressed-data")
-		buf := make([]byte, 4+len(msg))
-		binary.BigEndian.PutUint32(buf[0:4], uint32(len(msg)))
-		copy(buf[4:], msg)
-		_, _ = server.Write(buf)
-	}()
-
-	_, err := readMessage(client, "gzip")
-	assert.Error(t, err)
-}
-
-func TestProcessMessage_HeartbeatEncoded(t *testing.T) {
+func TestProcessMessage_HeartbeatCommand(t *testing.T) {
 	client, server := newTestConnPair(t)
 
 	cfg := config.DefaultConfig()
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("ignored", "HEARTBEAT")
+	command := []byte("HEARTBEAT")
 	done := make(chan bool)
 	go func() {
-		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
+		shouldExit, err := processMessage(command, cmdHandler, cmdCtx, server)
 		assert.NoError(t, err)
 		assert.False(t, shouldExit)
 		done <- true
@@ -434,10 +331,10 @@ func TestProcessMessage_UnrecognizedInput(t *testing.T) {
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("topic1", "some random data")
+	input := []byte("some random data")
 	done := make(chan bool)
 	go func() {
-		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
+		shouldExit, err := processMessage(input, cmdHandler, cmdCtx, server)
 		assert.NoError(t, err)
 		assert.True(t, shouldExit)
 		done <- true
@@ -477,24 +374,24 @@ func TestParseRawTextCommandPreservesLongCommand(t *testing.T) {
 }
 
 func TestParseRawTextCommandRejectsLegacyEnvelope(t *testing.T) {
-	encoded := util.EncodeMessage("", "HELP")
+	encoded := append([]byte{0, 0}, []byte("HELP")...)
 	_, ok := parseRawTextCommand(encoded)
 	assert.False(t, ok)
 }
 
-func TestProcessMessage_EncodedCommand(t *testing.T) {
+func TestProcessMessage_LegacyEnvelopeRejected(t *testing.T) {
 	client, server := newTestConnPair(t)
 
 	cfg := config.DefaultConfig()
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("topic1", "HELP")
+	encoded := append([]byte{0, 0}, []byte("HELP")...)
 	done := make(chan bool)
 	go func() {
 		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
 		assert.NoError(t, err)
-		assert.False(t, shouldExit)
+		assert.True(t, shouldExit)
 		done <- true
 	}()
 
@@ -510,7 +407,7 @@ func TestProcessMessage_JoinGroup(t *testing.T) {
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("topic", "JOIN_GROUP group=test-group")
+	encoded := []byte("JOIN_GROUP group=test-group")
 	done := make(chan bool)
 	go func() {
 		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
@@ -531,7 +428,7 @@ func TestProcessMessage_SyncGroup(t *testing.T) {
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("topic", "SYNC_GROUP group=test-group")
+	encoded := []byte("SYNC_GROUP group=test-group")
 	done := make(chan bool)
 	go func() {
 		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
@@ -552,7 +449,7 @@ func TestProcessMessage_LeaveGroup(t *testing.T) {
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("topic", "LEAVE_GROUP group=test-group")
+	encoded := []byte("LEAVE_GROUP group=test-group")
 	done := make(chan bool)
 	go func() {
 		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
@@ -598,7 +495,7 @@ func TestHandleCommandMessage_ListCluster(t *testing.T) {
 	assert.False(t, shouldExit)
 }
 
-func TestHandleConnection_Exit(t *testing.T) {
+func TestHandleConn_Exit(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -606,6 +503,8 @@ func TestHandleConnection_Exit(t *testing.T) {
 	defer func() { _ = l.Close() }()
 
 	cfg := config.DefaultConfig()
+	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = cmdHandler.Close() })
 	done := make(chan struct{})
 
 	go func() {
@@ -614,12 +513,13 @@ func TestHandleConnection_Exit(t *testing.T) {
 		if err != nil {
 			return
 		}
-		HandleConnection(context.Background(), conn, nil, cfg, nil, nil, nil)
+		handleConn(context.Background(), conn, cmdHandler)
 	}()
 
 	conn, _ := net.Dial("tcp", l.Addr().String())
 	msg := "MALFORMED"
 	buf := make([]byte, 4+len(msg))
+	// #nosec G115 -- the fixed malformed test message is smaller than uint32.
 	binary.BigEndian.PutUint32(buf[0:4], uint32(len(msg)))
 	copy(buf[4:], []byte(msg))
 	_, _ = conn.Write(buf)
@@ -628,16 +528,18 @@ func TestHandleConnection_Exit(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("HandleConnection failed to exit")
+		t.Fatal("handleConn failed to exit")
 	}
 }
 
-func TestHandleConnection_ContextCancel(t *testing.T) {
+func TestHandleConnSharedHandler_ContextCancel(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer func() { _ = l.Close() }()
 
 	cfg := config.DefaultConfig()
+	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = cmdHandler.Close() })
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 
@@ -647,7 +549,7 @@ func TestHandleConnection_ContextCancel(t *testing.T) {
 		if err != nil {
 			return
 		}
-		HandleConnection(ctx, conn, nil, cfg, nil, nil, nil)
+		handleConn(ctx, conn, cmdHandler)
 	}()
 
 	conn, err := net.Dial("tcp", l.Addr().String())
@@ -659,7 +561,7 @@ func TestHandleConnection_ContextCancel(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("HandleConnection did not exit after context cancel")
+		t.Fatal("handleConn did not exit after context cancel")
 	}
 }
 
@@ -670,6 +572,7 @@ func TestHandleConn_ImmediateClose(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = cmdHandler.Close() })
 	done := make(chan struct{})
 
 	go func() {
@@ -715,6 +618,7 @@ func TestHandleConn_MalformedInput(t *testing.T) {
 
 	msg := "MALFORMED"
 	buf := make([]byte, 4+len(msg))
+	// #nosec G115 -- the fixed malformed test message is smaller than uint32.
 	binary.BigEndian.PutUint32(buf[0:4], uint32(len(msg)))
 	copy(buf[4:], []byte(msg))
 	_, _ = conn.Write(buf)
@@ -747,11 +651,10 @@ func TestHandleConn_HelpCommand(t *testing.T) {
 
 	conn, err := net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
+	client := newWireTestClient(t, conn)
 
-	encoded := util.EncodeMessage("t", "HELP")
-	sendFramed(t, conn, encoded)
-
-	msg := readFramed(t, conn)
+	encoded := []byte("HELP")
+	msg := wireRequest(t, client, wire.CommandHelp, encoded)
 	assert.NotEmpty(t, msg)
 
 	_ = conn.Close()
@@ -853,7 +756,7 @@ func TestProcessMessage_HeartbeatWithPadding(t *testing.T) {
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("ignored", "  HEARTBEAT  ")
+	encoded := []byte("  HEARTBEAT  ")
 	done := make(chan bool)
 	go func() {
 		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
@@ -887,11 +790,10 @@ func TestHandleConn_StreamCommandSetsIsStreamed(t *testing.T) {
 
 	conn, err := net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
+	client := newWireTestClient(t, conn)
 
-	encoded := util.EncodeMessage("t", "STREAM topic=test partition=0 group=g1")
-	sendFramed(t, conn, encoded)
-
-	msg := readFramed(t, conn)
+	encoded := []byte("STREAM topic=test partition=0 group=g1")
+	msg := wireRequest(t, client, wire.CommandStream, encoded)
 	assert.Contains(t, msg, "ERROR")
 	_ = conn.Close()
 
@@ -899,40 +801,6 @@ func TestHandleConn_StreamCommandSetsIsStreamed(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("handleConn did not exit")
-	}
-}
-
-func TestHandleConnection_StreamCommandSetsIsStreamed(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer func() { _ = l.Close() }()
-
-	cfg := config.DefaultConfig()
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		sConn, err := l.Accept()
-		if err != nil {
-			return
-		}
-		HandleConnection(context.Background(), sConn, nil, cfg, nil, nil, nil)
-	}()
-
-	conn, err := net.Dial("tcp", l.Addr().String())
-	require.NoError(t, err)
-
-	encoded := util.EncodeMessage("t", "STREAM topic=test partition=0 group=g1")
-	sendFramed(t, conn, encoded)
-
-	msg := readFramed(t, conn)
-	assert.Contains(t, msg, "ERROR")
-	_ = conn.Close()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("HandleConnection did not exit")
 	}
 }
 
@@ -999,7 +867,7 @@ func TestWriteResponseWithTimeout_LongMessage(t *testing.T) {
 	<-done
 }
 
-func TestProcessMessage_BatchMessage(t *testing.T) {
+func TestProcessMessage_RejectsLegacyBatchMagic(t *testing.T) {
 	client, server := newTestConnPair(t)
 
 	cfg := config.DefaultConfig()
@@ -1012,7 +880,7 @@ func TestProcessMessage_BatchMessage(t *testing.T) {
 	go func() {
 		shouldExit, err := processMessage(batchData, cmdHandler, cmdCtx, server)
 		assert.NoError(t, err)
-		assert.False(t, shouldExit)
+		assert.True(t, shouldExit)
 		done <- true
 	}()
 
@@ -1138,6 +1006,5 @@ func TestInitializeConnection(t *testing.T) {
 }
 
 func TestConstants(t *testing.T) {
-	assert.Equal(t, 1000, maxWorkers)
 	assert.Equal(t, 9080, DefaultHealthCheckPort)
 }

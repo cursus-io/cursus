@@ -129,7 +129,7 @@ func TestProducerClient_SelectBroker_NilConfig(t *testing.T) {
 
 func TestProducerClient_SelectBroker_NoBrokers(t *testing.T) {
 	cfg := &PublisherConfig{BrokerAddrs: []string{}}
-	pc, _ := NewProducerClient(cfg)
+	pc := &ProducerClient{config: cfg}
 	assert.Equal(t, "", pc.selectBroker())
 }
 
@@ -231,7 +231,7 @@ func TestProducerClient_Close_NilConns(t *testing.T) {
 
 func TestProducerClient_ConnectPartition_NoBroker(t *testing.T) {
 	cfg := &PublisherConfig{BrokerAddrs: []string{}}
-	pc, _ := NewProducerClient(cfg)
+	pc := &ProducerClient{config: cfg}
 	err := pc.ConnectPartition(0, "")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "no broker address available")
@@ -398,18 +398,16 @@ func TestProducer_ParseAckResponse_OK(t *testing.T) {
 	assert.Equal(t, uint64(100), resp.LastOffset)
 }
 
-func TestProducer_ParseAckResponse_ErrorPrefix(t *testing.T) {
+func TestProducer_ParseAckResponseRejectsTextErrorPayload(t *testing.T) {
 	p := &Producer{
 		config: &PublisherConfig{},
 		client: mustNewProducerClient(NewDefaultPublisherConfig()),
 	}
 
-	_, err := p.parseAckResponse([]byte("ERROR: broker busy"))
+	_, err := p.parseAckResponse([]byte(`ERROR: broker_error class=internal retryable=false reason="busy"`))
 	var brokerErr *BrokerError
-	require.True(t, errors.As(err, &brokerErr))
-	assert.Equal(t, "broker", brokerErr.Code)
-	assert.Equal(t, ErrorClassInternal, brokerErr.Class)
-	assert.False(t, brokerErr.Retryable)
+	require.False(t, errors.As(err, &brokerErr))
+	require.ErrorContains(t, err, "invalid ack format")
 }
 
 func TestProducer_ParseAckResponse_InvalidJSON(t *testing.T) {
@@ -543,12 +541,12 @@ func TestProducer_GetPartitionCount(t *testing.T) {
 
 func TestProducer_GetUniqueAckCount_Zero(t *testing.T) {
 	p := &Producer{}
-	assert.Equal(t, 0, p.GetUniqueAckCount())
+	assert.Equal(t, uint64(0), p.GetUniqueAckCount())
 }
 
 func TestProducer_GetAttemptsCount_Zero(t *testing.T) {
 	p := &Producer{}
-	assert.Equal(t, 0, p.GetAttemptsCount())
+	assert.Equal(t, uint64(0), p.GetAttemptsCount())
 }
 
 func TestProducer_GetLatencies_Empty(t *testing.T) {
@@ -648,7 +646,7 @@ func TestProducer_MarkBatchAckedByID(t *testing.T) {
 
 	p.markBatchAckedByID(0, "batch-1", 5)
 
-	assert.Equal(t, 5, p.GetUniqueAckCount())
+	assert.Equal(t, uint64(5), p.GetUniqueAckCount())
 	assert.Equal(t, uint64(5), p.ackedCount.Load())
 
 	p.partitionSentMus[0].Lock()
@@ -685,7 +683,7 @@ func TestProducer_MarkBatchAckedByID_AlreadyAcked(t *testing.T) {
 	}
 
 	p.markBatchAckedByID(0, "batch-1", 5)
-	assert.Equal(t, 0, p.GetUniqueAckCount())
+	assert.Equal(t, uint64(0), p.GetUniqueAckCount())
 }
 
 func TestProducer_MarkBatchAckedByID_NotFound(t *testing.T) {
@@ -700,7 +698,7 @@ func TestProducer_MarkBatchAckedByID_NotFound(t *testing.T) {
 	p.partitionBatchStates[0] = make(map[string]*BatchState)
 
 	p.markBatchAckedByID(0, "nonexistent", 5)
-	assert.Equal(t, 0, p.GetUniqueAckCount())
+	assert.Equal(t, uint64(0), p.GetUniqueAckCount())
 }
 
 func TestProducer_CleanupBatchState(t *testing.T) {
@@ -879,6 +877,8 @@ func TestProducer_CommitBatch_FailureNotifiesChannels(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	c, err := NewConsumer(cfg)
 	require.NoError(t, err)
+	c.state.Store(uint32(ConsumerStateRunning))
+	generation := c.assignmentGeneration.Add(1)
 
 	ch1 := make(chan error, 1)
 	ch2 := make(chan error, 1)
@@ -886,7 +886,7 @@ func TestProducer_CommitBatch_FailureNotifiesChannels(t *testing.T) {
 	offsets := map[int]uint64{0: 100}
 	respChannels := map[int][]chan error{0: {ch1, ch2}}
 
-	c.commitBatch(offsets, respChannels)
+	c.commitBatch(offsets, respChannels, generation)
 
 	err1 := <-ch1
 	err2 := <-ch2
@@ -934,8 +934,8 @@ func TestNewProducerClient_TLSError(t *testing.T) {
 
 func TestProducerClient_ReconnectPartition_EmptyAddrFallsBackToSelectBroker(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	cfg.BrokerAddrs = []string{}
 	pc, _ := NewProducerClient(cfg)
+	pc.config.BrokerAddrs = nil
 
 	err := pc.ReconnectPartition(0, "")
 	require.Error(t, err)
@@ -1079,7 +1079,27 @@ func newProducerDrainTestHarness(t *testing.T) (*Producer, <-chan producerDrainB
 
 	client := mustNewProducerClient(cfg)
 	brokerConn, producerConn := net.Pipe()
-	connections := []net.Conn{producerConn}
+	resultCh := make(chan producerDrainBrokerResult, 1)
+	go func() {
+		connection, request, _, err := acceptWireTestRequest(brokerConn)
+		if err != nil {
+			resultCh <- producerDrainBrokerResult{err: err}
+			return
+		}
+		messages, _, _, err := DecodeBatchMessages(request.Payload)
+		if err != nil {
+			resultCh <- producerDrainBrokerResult{err: err}
+			return
+		}
+		ack, err := json.Marshal(AckResponse{Status: "OK"})
+		if err == nil {
+			err = writeWireTestResponse(connection, request, string(ack))
+		}
+		resultCh <- producerDrainBrokerResult{messages: messages, err: err}
+	}()
+	framed, err := openWireConnection(producerConn, 1000, "none")
+	require.NoError(t, err)
+	connections := []net.Conn{framed}
 	client.conns.Store(&connections)
 
 	p := &Producer{
@@ -1102,25 +1122,6 @@ func newProducerDrainTestHarness(t *testing.T) (*Producer, <-chan producerDrainB
 
 	p.sendersWG.Add(1)
 	go p.partitionSender(0)
-
-	resultCh := make(chan producerDrainBrokerResult, 1)
-	go func() {
-		payload, err := ReadWithLength(brokerConn)
-		if err != nil {
-			resultCh <- producerDrainBrokerResult{err: err}
-			return
-		}
-		messages, _, _, err := DecodeBatchMessages(payload)
-		if err != nil {
-			resultCh <- producerDrainBrokerResult{err: err}
-			return
-		}
-		ack, err := json.Marshal(AckResponse{Status: "OK"})
-		if err == nil {
-			err = WriteWithLength(brokerConn, ack)
-		}
-		resultCh <- producerDrainBrokerResult{messages: messages, err: err}
-	}()
 
 	t.Cleanup(func() {
 		_ = p.Close()

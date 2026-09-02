@@ -34,3 +34,28 @@ func TestBrokerFSMGroupRegistrationIsReplicatedAndIdempotent(t *testing.T) {
 		t.Fatalf("unexpected restored registration: %+v", status)
 	}
 }
+
+func TestBrokerFSMGroupJoinAtomicallyRegistersGroup(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	tm := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+	if err := tm.CreateTopic("events", 2, false, false); err != nil {
+		t.Fatal(err)
+	}
+	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
+	fsm := NewBrokerFSM(tm, cd)
+
+	result := fsm.Apply(&raft.Log{Data: []byte(
+		`GROUP_SYNC:{"type":"JOIN","group":"workers","topic":"events","member":"member-1","partition_count":2}`,
+	)})
+	if result != nil {
+		t.Fatalf("atomic group join failed: %v", result)
+	}
+	status, err := cd.GetGroupStatus("workers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.TopicName != "events" || status.PartitionCount != 2 || status.MemberCount != 1 {
+		t.Fatalf("unexpected joined group: %+v", status)
+	}
+}

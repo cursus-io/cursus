@@ -2,17 +2,20 @@ package sdk
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/cursus-io/cursus/pkg/wire"
 )
 
 var (
-	ErrProducerClosed   = errors.New("producer closed")
-	ErrConsumerClosed   = errors.New("consumer closed")
-	ErrTopicNotFound    = errors.New("topic not found")
-	ErrInvalidPartition = errors.New("invalid partition")
-	ErrNotLeader        = errors.New("not leader")
+	ErrProducerClosed      = errors.New("producer closed")
+	ErrConsumerClosed      = errors.New("consumer closed")
+	ErrConsumerRebalancing = errors.New("consumer assignment is rebalancing")
+	ErrTopicNotFound       = errors.New("topic not found")
+	ErrInvalidPartition    = errors.New("invalid partition")
+	ErrNotLeader           = errors.New("not leader")
 )
 
 type ErrorClass = wireprotocol.ErrorClass
@@ -32,16 +35,18 @@ type BrokerError struct {
 	Code      string
 	Class     ErrorClass
 	Retryable bool
+	Message   string
 	Fields    map[string]string
-	Details   []string
-	Raw       string
 }
 
 func (e *BrokerError) Error() string {
 	if e == nil {
 		return "<nil>"
 	}
-	return e.Raw
+	if e.Message == "" {
+		return fmt.Sprintf("broker error %s (%s)", e.Code, e.Class)
+	}
+	return fmt.Sprintf("broker error %s (%s): %s", e.Code, e.Class, e.Message)
 }
 
 func (e *BrokerError) Is(target error) bool {
@@ -60,21 +65,19 @@ func (e *BrokerError) Is(target error) bool {
 	}
 }
 
-func ParseBrokerError(response string) (*BrokerError, bool) {
-	parsed, ok := wireprotocol.ParseErrorResponse(response)
-	if !ok {
-		return nil, false
+func brokerErrorFromWire(remote *wire.BrokerError) *BrokerError {
+	if remote == nil {
+		return nil
 	}
-	fields := make(map[string]string, len(parsed.Fields))
-	for key, value := range parsed.Fields {
+	fields := make(map[string]string, len(remote.Fields))
+	for key, value := range remote.Fields {
 		fields[key] = value
 	}
 	return &BrokerError{
-		Code:      parsed.Code,
-		Class:     parsed.Class,
-		Retryable: parsed.Retryable,
+		Code:      remote.Code,
+		Class:     wireprotocol.ErrorClass(remote.Class.String()),
+		Retryable: remote.Retryable,
+		Message:   remote.Message,
 		Fields:    fields,
-		Details:   append([]string(nil), parsed.Details...),
-		Raw:       parsed.Raw,
-	}, true
+	}
 }

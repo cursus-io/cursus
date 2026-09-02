@@ -7,25 +7,53 @@ import (
 	sdk "github.com/cursus-io/cursus/sdk"
 )
 
-type inbox struct{ seen map[string]bool }
+type repository struct {
+	seen     map[string]bool
+	state    *sdk.SagaState
+	commands []sdk.Command
+}
 
-func (i *inbox) Claim(_ context.Context, consumer, eventID string) (bool, error) {
+func (r *repository) Transact(_ context.Context, apply func(sdk.SagaTransaction) error) error {
+	next := &repository{seen: make(map[string]bool, len(r.seen)), state: cloneState(r.state), commands: append([]sdk.Command(nil), r.commands...)}
+	for key, value := range r.seen {
+		next.seen[key] = value
+	}
+	if err := apply(next); err != nil {
+		return err
+	}
+	*r = *next
+	return nil
+}
+
+func (r *repository) Claim(consumer, eventID string) (bool, error) {
 	key := consumer + ":" + eventID
-	if i.seen[key] {
+	if r.seen[key] {
 		return false, nil
 	}
-	i.seen[key] = true
+	r.seen[key] = true
 	return true, nil
 }
-func (*inbox) Complete(context.Context, string, string) error    { return nil }
-func (*inbox) Fail(context.Context, string, string, error) error { return nil }
-
-type sagaStore struct{ state *sdk.SagaState }
-
-func (s *sagaStore) Load(context.Context, string, string) (*sdk.SagaState, error) {
-	return s.state, nil
+func (*repository) Complete(string, string) error    { return nil }
+func (*repository) Fail(string, string, error) error { return nil }
+func (r *repository) Load(string, string) (*sdk.SagaState, error) {
+	return cloneState(r.state), nil
 }
-func (s *sagaStore) Save(_ context.Context, state *sdk.SagaState) error {
+func (r *repository) SaveCAS(state *sdk.SagaState, expectedVersion uint64) error {
+	if r.state != nil && r.state.Version != expectedVersion {
+		return fmt.Errorf("saga version conflict")
+	}
+	r.state = cloneState(state)
+	return nil
+}
+func (r *repository) Enqueue(command sdk.Command) error {
+	r.commands = append(r.commands, command)
+	return nil
+}
+
+func cloneState(state *sdk.SagaState) *sdk.SagaState {
+	if state == nil {
+		return nil
+	}
 	copy := *state
 	if state.Effects != nil {
 		copy.Effects = make(map[string]sdk.EffectState, len(state.Effects))
@@ -37,15 +65,7 @@ func (s *sagaStore) Save(_ context.Context, state *sdk.SagaState) error {
 		compensation := *state.Compensation
 		copy.Compensation = &compensation
 	}
-	s.state = &copy
-	return nil
-}
-
-type outbox struct{ commands []sdk.Command }
-
-func (o *outbox) Enqueue(_ context.Context, command sdk.Command) error {
-	o.commands = append(o.commands, command)
-	return nil
+	return &copy
 }
 
 func main() {
@@ -62,7 +82,7 @@ func main() {
 				}}, nil
 			},
 		},
-	}, &inbox{seen: map[string]bool{}}, &sagaStore{}, &outbox{})
+	}, &repository{seen: map[string]bool{}})
 	if err != nil {
 		panic(err)
 	}

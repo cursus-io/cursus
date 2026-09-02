@@ -1,13 +1,14 @@
 package sdk
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strings"
-	"time"
-)
 
-const authenticationTimeout = 5 * time.Second
+	"github.com/cursus-io/cursus/pkg/wire"
+	"github.com/cursus-io/cursus/sdk/internal/transport"
+)
 
 func authenticateConfiguredClient(conn net.Conn, principal, token string) error {
 	if principal == "" && token == "" {
@@ -25,25 +26,16 @@ func authenticateConfiguredClient(conn net.Conn, principal, token string) error 
 	if conn == nil {
 		return fmt.Errorf("authentication connection is nil")
 	}
-	if err := conn.SetDeadline(time.Now().Add(authenticationTimeout)); err != nil {
-		return fmt.Errorf("set authentication deadline: %w", err)
+	framed, ok := conn.(*transport.Conn)
+	if !ok {
+		return fmt.Errorf("authentication requires a Wire v2 connection")
 	}
-	defer func() { _ = conn.SetDeadline(time.Time{}) }()
-
-	cmd := fmt.Sprintf("AUTH principal=%s token=%s", principal, token)
-	if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
-		return fmt.Errorf("send authentication command: %w", err)
-	}
-	resp, err := ReadWithLength(conn)
-	if err != nil {
-		return fmt.Errorf("read authentication response: %w", err)
-	}
-	value := strings.TrimSpace(string(resp))
-	if brokerErr, ok := ParseBrokerError(value); ok {
-		return brokerErr
-	}
-	if _, err := parseOKResponse(value); err != nil {
-		return fmt.Errorf("unexpected authentication response: %s", value)
+	if err := transport.Authenticate(framed, principal, token); err != nil {
+		var brokerErr *wire.BrokerError
+		if errors.As(err, &brokerErr) {
+			return brokerErrorFromWire(brokerErr)
+		}
+		return err
 	}
 	return nil
 }

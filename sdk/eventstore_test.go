@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -182,17 +181,10 @@ func TestEventStoreCreateTopicDeclaresDeleteCleanupPolicy(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()
 
-	store := NewEventStore("unused", "orders", "producer-1")
-	store.conn = client
 	done := make(chan error, 1)
 	go func() {
 		defer func() { _ = server.Close() }()
-		data, err := ReadWithLength(server)
-		if err != nil {
-			done <- err
-			return
-		}
-		_, command, err := util.DecodeMessage(data)
+		connection, request, command, err := acceptWireTestRequest(server)
 		if err != nil {
 			done <- err
 			return
@@ -202,9 +194,13 @@ func TestEventStoreCreateTopicDeclaresDeleteCleanupPolicy(t *testing.T) {
 			done <- fmt.Errorf("command = %q, want %q", command, want)
 			return
 		}
-		done <- WriteWithLength(server, []byte("OK topic=orders partitions=4 cleanup_policy=delete"))
+		done <- writeWireTestResponse(connection, request, "OK topic=orders partitions=4 cleanup_policy=delete")
 	}()
 
+	framed, err := openWireConnection(client, 1000, "none")
+	require.NoError(t, err)
+	store := NewEventStore("unused", "orders", "producer-1")
+	store.conn = framed
 	require.NoError(t, store.CreateTopic(4))
 	require.NoError(t, <-done)
 }

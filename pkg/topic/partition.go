@@ -48,43 +48,43 @@ type TransactionDecisionResolver interface {
 
 // Partition handles messages for one shard of a topic.
 type Partition struct {
-	id                int
-	topic             string
-	newMessageCh      chan struct{}
-	LEO               atomic.Uint64
-	HWM               uint64
-	mu                sync.RWMutex
-	dh                types.StorageHandler
-	closed            bool
-	streamManager     StreamManager
-	hwmCheckpointPath string
-	hwmCheckpointCh   chan struct{}
-	hwmCheckpointMu   sync.Mutex
-	hwmCheckpointWG   sync.WaitGroup
-	producerStatePath string
-	producerStateCh   chan struct{}
-	producerStateMu   sync.Mutex
-	producerStateWG   sync.WaitGroup
-	producerState     sync.Map // map[string]*producerEntry
-	isIdempotent      bool
-	producerStateTTL  time.Duration
-	txnMarkerMu       sync.RWMutex
-	txnResolver       TransactionDecisionResolver
-	txnMarkers        map[transactionMarkerKey]transactionMarkerInfo
-	txnOpenOffsets    map[transactionMarkerKey]uint64
-	closeCh           chan struct{}
+	id                    int
+	topic                 string
+	messageNotifyMu       sync.Mutex
+	messageGeneration     uint64
+	messageNotifyCh       chan struct{}
+	LEO                   atomic.Uint64
+	HWM                   uint64
+	mu                    sync.RWMutex
+	snapshotRecovery      bool
+	recoveryCheckpointHWM uint64
+	recoverySnapshotHWM   uint64
+	dh                    types.StorageHandler
+	closed                bool
+	streamManager         StreamManager
+	hwmCheckpointPath     string
+	hwmCheckpointCh       chan struct{}
+	hwmCheckpointMu       sync.Mutex
+	hwmCheckpointWG       sync.WaitGroup
+	producerStatePath     string
+	producerStateCh       chan struct{}
+	producerStateMu       sync.Mutex
+	producerStateWG       sync.WaitGroup
+	producerState         sync.Map // map[string]*producerEntry
+	isIdempotent          bool
+	producerStateTTL      time.Duration
+	txnMarkerMu           sync.RWMutex
+	txnResolver           TransactionDecisionResolver
+	txnMarkers            map[transactionMarkerKey]transactionMarkerInfo
+	txnOpenOffsets        map[transactionMarkerKey]uint64
+	txnRetentionFloor     uint64
+	closeCh               chan struct{}
 }
 
 func (p *Partition) SetTransactionDecisionResolver(resolver TransactionDecisionResolver) {
 	p.txnMarkerMu.Lock()
 	p.txnResolver = resolver
 	p.txnMarkerMu.Unlock()
-}
-
-func (p *Partition) transactionDecisionResolver() TransactionDecisionResolver {
-	p.txnMarkerMu.RLock()
-	defer p.txnMarkerMu.RUnlock()
-	return p.txnResolver
 }
 
 // NewPartition creates a partition instance.
@@ -97,7 +97,7 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		topic:            topic,
 		dh:               dh,
 		streamManager:    sm,
-		newMessageCh:     make(chan struct{}, 1),
+		messageNotifyCh:  make(chan struct{}),
 		closeCh:          make(chan struct{}),
 		txnMarkers:       make(map[transactionMarkerKey]transactionMarkerInfo),
 		txnOpenOffsets:   make(map[transactionMarkerKey]uint64),
@@ -123,13 +123,7 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		} else {
 			p.HWM = durableTail
 		}
-		notifyCh := p.newMessageCh
-		handler.SetOnSync(func(uint64) {
-			select {
-			case notifyCh <- struct{}{}:
-			default:
-			}
-		})
+		handler.SetOnSync(func(uint64) { p.NotifyNewMessage() })
 	}
 
 	if p.hwmCheckpointCh != nil {
@@ -604,10 +598,20 @@ func sameReplicatedMessage(a, b types.Message) bool {
 		bytes.Equal(a.ControlBatchKey, b.ControlBatchKey) && bytes.Equal(a.ControlBatchValue, b.ControlBatchValue)
 }
 func (p *Partition) NotifyNewMessage() {
-	select {
-	case p.newMessageCh <- struct{}{}:
-	default:
-	}
+	p.messageNotifyMu.Lock()
+	previous := p.messageNotifyCh
+	p.messageGeneration++
+	p.messageNotifyCh = make(chan struct{})
+	close(previous)
+	p.messageNotifyMu.Unlock()
+}
+
+// MessageNotification returns a monotonic generation and a channel closed by
+// the next append/commit event. Every waiter on the same generation wakes.
+func (p *Partition) MessageNotification() (uint64, <-chan struct{}) {
+	p.messageNotifyMu.Lock()
+	defer p.messageNotifyMu.Unlock()
+	return p.messageGeneration, p.messageNotifyCh
 }
 
 func (p *Partition) ReadMessages(offset uint64, max int) ([]types.Message, error) {
@@ -667,8 +671,10 @@ func (p *Partition) LastStableOffset() uint64 {
 	if flushed < hwm {
 		hwm = flushed
 	}
-	markers, openOffsets := p.transactionIndexBefore(hwm)
-	return firstUnresolvedOpenOffset(hwm, openOffsets, markers, p.transactionDecisionResolver())
+	p.pruneTransactionIndex(p.dh.GetFirstOffset())
+	p.txnMarkerMu.RLock()
+	defer p.txnMarkerMu.RUnlock()
+	return firstUnresolvedOpenOffset(hwm, p.txnRetentionFloor, p.txnOpenOffsets, p.txnMarkers, p.txnResolver)
 }
 func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, error) {
 	p.mu.RLock()
@@ -693,6 +699,7 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 	if offset >= hwm {
 		return nil, nil
 	}
+	p.pruneTransactionIndex(earliest)
 
 	canRead := hwm - offset
 	if canRead <= math.MaxInt && max > int(canRead) { // #nosec G115 -- canRead is bounded by math.MaxInt before narrowing.
@@ -707,45 +714,27 @@ func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm uint64) ([]
 		return nil, nil
 	}
 
-	markers, openOffsets := p.transactionIndexBefore(hwm)
-	resolver := p.transactionDecisionResolver()
-	lso := firstUnresolvedOpenOffset(hwm, openOffsets, markers, resolver)
+	p.txnMarkerMu.RLock()
+	defer p.txnMarkerMu.RUnlock()
+	resolver := p.txnResolver
+	lso := firstUnresolvedOpenOffset(hwm, p.txnRetentionFloor, p.txnOpenOffsets, p.txnMarkers, resolver)
 	scanLimit := hwm
 	if lso < scanLimit {
 		scanLimit = lso
 	}
-	messages, err := p.readCommittedScanRange(offset, scanLimit, max, markers, openOffsets, resolver)
-	if err != nil {
-		return nil, err
-	}
-	markers, openOffsets = mergeScannedTransactionIndex(markers, openOffsets, messages, hwm)
-	firstUnresolved := firstUnresolvedOpenOffset(hwm, openOffsets, markers, resolver)
-
-	visible := make([]types.Message, 0, max)
-	for _, msg := range messages {
-		if msg.Offset >= hwm || msg.Offset >= firstUnresolved {
-			break
-		}
-		if isReadCommittedVisible(msg, markers, resolver) {
-			visible = append(visible, msg)
-			if len(visible) == max {
-				break
-			}
-		}
-	}
-	return visible, nil
+	return p.readCommittedScanRange(offset, scanLimit, hwm, max, p.txnMarkers, resolver)
 }
 
-func (p *Partition) readCommittedScanRange(offset uint64, hwm uint64, maxVisible int, markers map[transactionMarkerKey]transactionMarkerInfo, openOffsets map[transactionMarkerKey]uint64, resolver TransactionDecisionResolver) ([]types.Message, error) {
-	if offset >= hwm {
+func (p *Partition) readCommittedScanRange(offset, scanLimit, committedHWM uint64, maxVisible int, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) ([]types.Message, error) {
+	if offset >= scanLimit {
 		return nil, nil
 	}
 
-	messages := make([]types.Message, 0)
+	visible := make([]types.Message, 0, maxVisible)
 	current := offset
 	const scanBatchSize = 1024
-	for current < hwm {
-		remaining := hwm - current
+	for current < scanLimit && len(visible) < maxVisible {
+		remaining := scanLimit - current
 		readMax := scanBatchSize
 		if remaining <= math.MaxInt && readMax > int(remaining) { // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
 			readMax = int(remaining) // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
@@ -762,88 +751,28 @@ func (p *Partition) readCommittedScanRange(offset uint64, hwm uint64, maxVisible
 			break
 		}
 		for _, msg := range batch {
-			if msg.Offset >= hwm {
+			if msg.Offset >= scanLimit {
 				break
 			}
-			messages = append(messages, msg)
 			next := msg.Offset + 1
 			if next <= current {
 				next = current + 1
 			}
 			current = next
-		}
-		if len(batch) < readMax || readCommittedScanHasEnoughVisible(messages, hwm, maxVisible, markers, openOffsets, resolver) {
-			break
-		}
-	}
-	return messages, nil
-}
-
-func readCommittedScanHasEnoughVisible(messages []types.Message, hwm uint64, maxVisible int, markers map[transactionMarkerKey]transactionMarkerInfo, openOffsets map[transactionMarkerKey]uint64, resolver TransactionDecisionResolver) bool {
-	if maxVisible <= 0 {
-		return true
-	}
-	markers, openOffsets = mergeScannedTransactionIndex(markers, openOffsets, messages, hwm)
-	firstUnresolved := firstUnresolvedOpenOffset(hwm, openOffsets, markers, resolver)
-	if firstUnresolved != hwm {
-		return false
-	}
-
-	visible := 0
-	for _, msg := range messages {
-		if msg.Offset >= hwm {
-			break
-		}
-		if isReadCommittedVisible(msg, markers, resolver) {
-			visible++
-			if visible >= maxVisible {
-				return true
+			if isReadCommittedVisible(msg, committedHWM, markers, resolver) {
+				visible = append(visible, msg)
+				if len(visible) == maxVisible {
+					break
+				}
 			}
 		}
-	}
-	return false
-}
-
-func mergeScannedTransactionIndex(baseMarkers map[transactionMarkerKey]transactionMarkerInfo, baseOpenOffsets map[transactionMarkerKey]uint64, messages []types.Message, hwm uint64) (map[transactionMarkerKey]transactionMarkerInfo, map[transactionMarkerKey]uint64) {
-	openOffsets := make(map[transactionMarkerKey]uint64, len(baseOpenOffsets))
-	for key, offset := range baseOpenOffsets {
-		openOffsets[key] = offset
-	}
-
-	markers := mergeScannedTransactionMarkers(baseMarkers, messages, hwm)
-	for _, msg := range messages {
-		if msg.Offset >= hwm {
+		if len(batch) < readMax {
 			break
 		}
-		if msg.TransactionalID == "" || msg.TransactionMarker != types.TransactionMarkerNone || msg.TransactionState != types.TransactionStateOpen {
-			continue
-		}
-		key := messageTransactionMarkerKey(msg)
-		if existing, ok := openOffsets[key]; !ok || msg.Offset < existing {
-			openOffsets[key] = msg.Offset
-		}
 	}
-	return markers, openOffsets
+	return visible, nil
 }
-func mergeScannedTransactionMarkers(base map[transactionMarkerKey]transactionMarkerInfo, messages []types.Message, hwm uint64) map[transactionMarkerKey]transactionMarkerInfo {
-	markers := make(map[transactionMarkerKey]transactionMarkerInfo, len(base))
-	for key, marker := range base {
-		markers[key] = marker
-	}
-	for _, msg := range messages {
-		if msg.Offset >= hwm {
-			break
-		}
-		if msg.TransactionMarker == types.TransactionMarkerNone || msg.TransactionalID == "" {
-			continue
-		}
-		key := messageTransactionMarkerKey(msg)
-		if existing, ok := markers[key]; !ok || msg.Offset >= existing.offset {
-			markers[key] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset}
-		}
-	}
-	return markers
-}
+
 func (p *Partition) indexTransactionMessage(msg types.Message) {
 	if msg.TransactionalID == "" {
 		return
@@ -870,22 +799,20 @@ func (p *Partition) indexTransactionMessage(msg types.Message) {
 	}
 }
 
-func (p *Partition) transactionIndexBefore(hwm uint64) (map[transactionMarkerKey]transactionMarkerInfo, map[transactionMarkerKey]uint64) {
-	p.txnMarkerMu.RLock()
-	defer p.txnMarkerMu.RUnlock()
-	markers := make(map[transactionMarkerKey]transactionMarkerInfo, len(p.txnMarkers))
+func (p *Partition) pruneTransactionIndex(retentionFloor uint64) {
+	p.txnMarkerMu.Lock()
+	defer p.txnMarkerMu.Unlock()
+	if retentionFloor <= p.txnRetentionFloor {
+		return
+	}
 	for key, marker := range p.txnMarkers {
-		if marker.offset < hwm {
-			markers[key] = marker
+		if marker.offset >= retentionFloor {
+			continue
 		}
+		delete(p.txnMarkers, key)
+		delete(p.txnOpenOffsets, key)
 	}
-	openOffsets := make(map[transactionMarkerKey]uint64, len(p.txnOpenOffsets))
-	for key, offset := range p.txnOpenOffsets {
-		if offset < hwm {
-			openOffsets[key] = offset
-		}
-	}
-	return markers, openOffsets
+	p.txnRetentionFloor = retentionFloor
 }
 
 func (p *Partition) rebuildTransactionMarkerIndex() {
@@ -932,6 +859,7 @@ func (p *Partition) rebuildTransactionMarkerIndex() {
 	p.txnMarkerMu.Lock()
 	p.txnMarkers = markers
 	p.txnOpenOffsets = openOffsets
+	p.txnRetentionFloor = first
 	p.txnMarkerMu.Unlock()
 }
 
@@ -949,15 +877,18 @@ func messageTransactionMarkerKey(msg types.Message) transactionMarkerKey {
 	return transactionMarkerKey{transactionalID: msg.TransactionalID, epoch: msg.Epoch}
 }
 
-func firstUnresolvedOpenOffset(hwm uint64, openOffsets map[transactionMarkerKey]uint64, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) uint64 {
+func firstUnresolvedOpenOffset(hwm, retentionFloor uint64, openOffsets map[transactionMarkerKey]uint64, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) uint64 {
 	firstUnresolved := hwm
 	for key, offset := range openOffsets {
 		if offset >= hwm {
 			continue
 		}
 		marker, ok := markers[key]
-		if ok && marker.offset > offset && transactionDecisionMatchesMarker(key, marker, resolver) {
+		if ok && marker.offset < hwm && marker.offset > offset && transactionDecisionMatchesMarker(key, marker, resolver) {
 			continue
+		}
+		if offset < retentionFloor {
+			offset = retentionFloor
 		}
 		if offset < firstUnresolved {
 			firstUnresolved = offset
@@ -978,7 +909,7 @@ func transactionDecisionMatchesMarker(key transactionMarkerKey, marker transacti
 		marker.marker == types.TransactionMarkerAbort && state == types.TransactionStateAborted
 }
 
-func isReadCommittedVisible(msg types.Message, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) bool {
+func isReadCommittedVisible(msg types.Message, hwm uint64, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) bool {
 	if msg.TransactionMarker != types.TransactionMarkerNone {
 		return false
 	}
@@ -990,7 +921,7 @@ func isReadCommittedVisible(msg types.Message, markers map[transactionMarkerKey]
 	}
 	key := messageTransactionMarkerKey(msg)
 	marker, ok := markers[key]
-	return ok && marker.offset > msg.Offset && marker.marker == types.TransactionMarkerCommit &&
+	return ok && marker.offset < hwm && marker.offset > msg.Offset && marker.marker == types.TransactionMarkerCommit &&
 		transactionDecisionMatchesMarker(key, marker, resolver)
 }
 
@@ -1124,7 +1055,73 @@ func (p *Partition) ApplyReplicaHWM(hwm uint64) error {
 func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.snapshotRecovery {
+		return fmt.Errorf("snapshot replay is still pending: visible_hwm=%d durable_hwm=%d requested_hwm=%d", p.HWM, p.recoveryCheckpointHWM, hwm)
+	}
+	return p.reconcileCommittedHWMLocked(hwm)
+}
 
+// ReconcileSnapshotHWM stages the snapshot visibility boundary without
+// deleting any later local records. Raft replays its committed log tail after
+// Restore returns, then FinalizeSnapshotRecovery performs the only truncation.
+func (p *Partition) ReconcileSnapshotHWM(snapshotHWM uint64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.snapshotRecovery {
+		if p.recoverySnapshotHWM != snapshotHWM {
+			return fmt.Errorf("snapshot recovery boundary changed: current=%d requested=%d", p.recoverySnapshotHWM, snapshotHWM)
+		}
+		return nil
+	}
+	leo := p.LEO.Load()
+	p.recoveryCheckpointHWM = p.HWM
+	p.recoverySnapshotHWM = snapshotHWM
+	p.HWM = min(snapshotHWM, leo)
+	p.snapshotRecovery = true
+	return nil
+}
+
+// FinalizeSnapshotRecovery reconciles to the FSM watermark after Raft has
+// applied every committed post-snapshot log entry.
+func (p *Partition) FinalizeSnapshotRecovery(hwm uint64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.snapshotRecovery {
+		return p.reconcileCommittedHWMLocked(hwm)
+	}
+	checkpointHWM := p.recoveryCheckpointHWM
+	snapshotHWM := p.recoverySnapshotHWM
+	p.snapshotRecovery = false
+	p.recoveryCheckpointHWM = 0
+	p.recoverySnapshotHWM = 0
+	if p.LEO.Load() < hwm {
+		if p.HWM > p.LEO.Load() {
+			p.HWM = p.LEO.Load()
+		}
+		if checkpointHWM != p.HWM {
+			p.signalHWMCheckpointLocked()
+		}
+		return nil
+	}
+	if err := p.reconcileCommittedHWMLocked(hwm); err != nil {
+		p.snapshotRecovery = true
+		p.recoveryCheckpointHWM = checkpointHWM
+		p.recoverySnapshotHWM = snapshotHWM
+		return err
+	}
+	if checkpointHWM != hwm {
+		p.signalHWMCheckpointLocked()
+	}
+	return nil
+}
+
+func (p *Partition) SnapshotRecoveryPending() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.snapshotRecovery
+}
+
+func (p *Partition) reconcileCommittedHWMLocked(hwm uint64) error {
 	leo := p.LEO.Load()
 	if leo < hwm {
 		return fmt.Errorf("replica is behind committed watermark: leo=%d hwm=%d", leo, hwm)
@@ -1151,6 +1148,7 @@ func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
 	p.txnMarkerMu.Lock()
 	p.txnMarkers = make(map[transactionMarkerKey]transactionMarkerInfo)
 	p.txnOpenOffsets = make(map[transactionMarkerKey]uint64)
+	p.txnRetentionFloor = 0
 	p.txnMarkerMu.Unlock()
 	p.rebuildTransactionMarkerIndex()
 	p.producerState.Range(func(key, _ any) bool {
@@ -1173,7 +1171,9 @@ func (p *Partition) setHWMLocked(hwm uint64) bool {
 		return false
 	}
 	p.HWM = hwm
-	p.signalHWMCheckpointLocked()
+	if !p.snapshotRecovery {
+		p.signalHWMCheckpointLocked()
+	}
 	return true
 }
 
@@ -1300,7 +1300,12 @@ func loadHWMCheckpoint(path string) (uint64, bool) {
 	return hwm, true
 }
 
-type producerStateCheckpoint map[string]producerStateCheckpointEntry
+const producerStateCheckpointVersion = 2
+
+type producerStateCheckpoint struct {
+	Version   int                                     `json:"version"`
+	Producers map[string]producerStateCheckpointEntry `json:"producers"`
+}
 
 type producerStateCheckpointEntry struct {
 	Epoch int64  `json:"epoch"`
@@ -1349,20 +1354,13 @@ func (p *Partition) loadProducerStateCheckpoint() {
 	if err != nil {
 		return
 	}
-	var checkpoint producerStateCheckpoint
-	if err := json.Unmarshal(data, &checkpoint); err != nil {
-		var legacy map[string]uint64
-		if legacyErr := json.Unmarshal(data, &legacy); legacyErr != nil {
-			util.Warn("ignoring invalid producer state checkpoint %s: %v", p.producerStatePath, err)
-			return
-		}
-		checkpoint = make(producerStateCheckpoint, len(legacy))
-		for producerID, lastSeq := range legacy {
-			checkpoint[producerID] = producerStateCheckpointEntry{Seq: lastSeq}
-		}
+	checkpoint, err := decodeProducerStateCheckpoint(data)
+	if err != nil {
+		util.Warn("ignoring invalid producer state checkpoint %s: %v", p.producerStatePath, err)
+		return
 	}
 	now := time.Now()
-	for producerID, entry := range checkpoint {
+	for producerID, entry := range checkpoint.Producers {
 		if producerID == "" || entry.Seq == 0 {
 			continue
 		}
@@ -1370,12 +1368,29 @@ func (p *Partition) loadProducerStateCheckpoint() {
 	}
 }
 
+func decodeProducerStateCheckpoint(data []byte) (producerStateCheckpoint, error) {
+	var checkpoint producerStateCheckpoint
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		return producerStateCheckpoint{}, fmt.Errorf("decode producer state checkpoint: %w", err)
+	}
+	if checkpoint.Version != producerStateCheckpointVersion {
+		return producerStateCheckpoint{}, fmt.Errorf("unsupported producer state checkpoint version %d; clean bootstrap required", checkpoint.Version)
+	}
+	if checkpoint.Producers == nil {
+		return producerStateCheckpoint{}, fmt.Errorf("producer state checkpoint is missing producers")
+	}
+	return checkpoint, nil
+}
+
 func (p *Partition) persistProducerStateCheckpoint() {
 	if p.producerStatePath == "" {
 		return
 	}
 
-	checkpoint := make(producerStateCheckpoint)
+	checkpoint := producerStateCheckpoint{
+		Version:   producerStateCheckpointVersion,
+		Producers: make(map[string]producerStateCheckpointEntry),
+	}
 	p.producerState.Range(func(key, value any) bool {
 		producerID, ok := key.(string)
 		if !ok || producerID == "" {
@@ -1385,7 +1400,7 @@ func (p *Partition) persistProducerStateCheckpoint() {
 		if !ok || entry.lastSeq == 0 {
 			return true
 		}
-		checkpoint[producerID] = producerStateCheckpointEntry{Epoch: entry.lastEpoch, Seq: entry.lastSeq}
+		checkpoint.Producers[producerID] = producerStateCheckpointEntry{Epoch: entry.lastEpoch, Seq: entry.lastSeq}
 		return true
 	})
 

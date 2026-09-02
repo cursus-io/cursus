@@ -116,7 +116,7 @@ func scanSegmentTail(logPath string, startPosition, expectedOffset uint64) (uint
 		if messageLength > uint64(^uint(0)>>1) {
 			return 0, 0, false, fmt.Errorf("record length %d exceeds addressable memory", messageLength)
 		}
-		// #nosec G115 -- messageLength is capped at MaxMessageSize (16 MiB).
+		// #nosec G115 -- messageLength is capped at MaxMessageSize.
 		data := make([]byte, int(messageLength))
 		// #nosec G115 -- recordEnd was checked against the int64-backed file size.
 		if _, err := f.ReadAt(data, int64(position+4)); err != nil {
@@ -157,7 +157,7 @@ func indexEntryMatchesRecord(logPath string, entry types.IndexEntry) (bool, erro
 	if messageLength == 0 || messageLength > MaxMessageSize {
 		return false, nil
 	}
-	// #nosec G115 -- messageLength is capped at MaxMessageSize (16 MiB).
+	// #nosec G115 -- messageLength is capped at MaxMessageSize.
 	data := make([]byte, int(messageLength))
 	if _, err := f.ReadAt(data, recordPosition+4); err != nil {
 		return false, err

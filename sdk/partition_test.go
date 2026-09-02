@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"errors"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,8 @@ func newTestConsumer(t *testing.T) *Consumer {
 	cfg := NewDefaultConsumerConfig()
 	c, err := NewConsumer(cfg)
 	require.NoError(t, err)
+	c.state.Store(uint32(ConsumerStateRunning))
+	c.assignmentGeneration.Store(1)
 	return c
 }
 
@@ -69,9 +72,8 @@ func TestPartitionConsumer_HandleBrokerError_NotError(t *testing.T) {
 		consumer:    c,
 	}
 
-	assert.False(t, pc.handleBrokerError([]byte("OK")))
-	assert.False(t, pc.handleBrokerError([]byte("")))
-	assert.False(t, pc.handleBrokerError([]byte("some data")))
+	assert.False(t, pc.handleBrokerError(errors.New("transport failure")))
+	assert.False(t, pc.handleBrokerError(nil))
 }
 
 func TestPartitionConsumer_HandleBrokerError_GenericError(t *testing.T) {
@@ -82,7 +84,7 @@ func TestPartitionConsumer_HandleBrokerError_GenericError(t *testing.T) {
 		consumer:    c,
 	}
 
-	assert.True(t, pc.handleBrokerError([]byte("ERROR: something went wrong")))
+	assert.True(t, pc.handleBrokerError(&BrokerError{Code: "broker_error", Class: ErrorClassInternal}))
 	assert.Nil(t, pc.conn)
 }
 
@@ -94,7 +96,10 @@ func TestPartitionConsumer_HandleBrokerError_NotLeader(t *testing.T) {
 		consumer:    c,
 	}
 
-	assert.True(t, pc.handleBrokerError([]byte("ERROR NOT_LEADER LEADER_IS broker-2:9000")))
+	assert.True(t, pc.handleBrokerError(&BrokerError{
+		Code: "NOT_LEADER", Class: ErrorClassRouting, Retryable: true,
+		Fields: map[string]string{"leader": "broker-2:9000"},
+	}))
 
 	assert.Equal(t, "broker-2:9000", c.getPartitionLeaderAddr(0))
 }
@@ -107,7 +112,7 @@ func TestPartitionConsumer_HandleBrokerError_GenMismatch(t *testing.T) {
 		consumer:    c,
 	}
 
-	result := pc.handleBrokerError([]byte("ERROR GEN_MISMATCH"))
+	result := pc.handleBrokerError(&BrokerError{Code: "GEN_MISMATCH", Class: ErrorClassFencing})
 	assert.True(t, result)
 	assert.True(t, pc.closed)
 }
@@ -120,7 +125,7 @@ func TestPartitionConsumer_HandleBrokerError_RebalanceRequired(t *testing.T) {
 		consumer:    c,
 	}
 
-	result := pc.handleBrokerError([]byte("ERROR REBALANCE_REQUIRED"))
+	result := pc.handleBrokerError(&BrokerError{Code: "REBALANCE_REQUIRED", Class: ErrorClassFencing})
 	assert.True(t, result)
 	assert.True(t, pc.closed)
 }
@@ -308,7 +313,7 @@ func TestConsumer_FlushOffsets_Empty(t *testing.T) {
 
 func TestConsumer_FlushOffsets_DuringRebalance(t *testing.T) {
 	c := newTestConsumer(t)
-	atomic.StoreInt32(&c.rebalancing, 1)
+	c.state.Store(uint32(ConsumerStateRebalancing))
 	c.offsetsMu.Lock()
 	c.currentOffsets[0] = 100
 	c.offsetsMu.Unlock()
@@ -362,15 +367,15 @@ func TestConsumer_ProcessRetryQueue_Empty(t *testing.T) {
 
 func TestConsumer_ProcessRetryQueue_DuringRebalance(t *testing.T) {
 	c := newTestConsumer(t)
-	atomic.StoreInt32(&c.rebalancing, 1)
+	c.state.Store(uint32(ConsumerStateRebalancing))
 	c.commitMu.Lock()
-	c.commitRetryMap[0] = 100
+	c.commitRetryMap[0] = retryCommit{offset: 100, assignmentGeneration: 1}
 	c.commitMu.Unlock()
 
 	c.processRetryQueue()
 
 	c.commitMu.Lock()
-	assert.Equal(t, uint64(100), c.commitRetryMap[0])
+	assert.Equal(t, uint64(100), c.commitRetryMap[0].offset)
 	c.commitMu.Unlock()
 }
 
@@ -595,13 +600,13 @@ func TestPartitionConsumer_HandleBrokerError_NotOwner(t *testing.T) {
 		consumer:    c,
 	}
 
-	result := pc.handleBrokerError([]byte("ERROR: NOT_OWNER partition=0 member=m1 group=g1 generation=2"))
+	result := pc.handleBrokerError(&BrokerError{Code: "NOT_OWNER", Class: ErrorClassFencing})
 	assert.True(t, result)
 	assert.True(t, pc.closed)
 }
 
 func TestParseOffsetOutOfRangeFrame(t *testing.T) {
-	frame, ok := parseOffsetOutOfRangeFrame("ERROR: OFFSET_OUT_OF_RANGE requested=1 earliest=5 latest=9")
+	frame, ok := brokerOffsetOutOfRangeFrame(offsetOutOfRangeBrokerError())
 	require.True(t, ok)
 	assert.Equal(t, uint64(1), frame.Requested)
 	assert.Equal(t, uint64(5), frame.Earliest)
@@ -613,7 +618,7 @@ func TestPartitionConsumer_HandleBrokerError_OffsetOutOfRangeEarliest(t *testing
 	c.config.AutoOffsetReset = AutoOffsetResetEarliest
 	pc := &PartitionConsumer{partitionID: 0, consumer: c, fetchOffset: 1}
 
-	result := pc.handleBrokerError([]byte("ERROR: OFFSET_OUT_OF_RANGE requested=1 earliest=5 latest=9"))
+	result := pc.handleBrokerError(offsetOutOfRangeBrokerError())
 	assert.True(t, result)
 	assert.Equal(t, uint64(5), atomic.LoadUint64(&pc.fetchOffset))
 	c.mu.RLock()
@@ -626,7 +631,7 @@ func TestPartitionConsumer_HandleBrokerError_OffsetOutOfRangeLatest(t *testing.T
 	c.config.AutoOffsetReset = AutoOffsetResetLatest
 	pc := &PartitionConsumer{partitionID: 0, consumer: c, fetchOffset: 1}
 
-	result := pc.handleBrokerError([]byte("ERROR: OFFSET_OUT_OF_RANGE requested=1 earliest=5 latest=9"))
+	result := pc.handleBrokerError(offsetOutOfRangeBrokerError())
 	assert.True(t, result)
 	assert.Equal(t, uint64(9), atomic.LoadUint64(&pc.fetchOffset))
 }
@@ -636,9 +641,16 @@ func TestPartitionConsumer_HandleBrokerError_OffsetOutOfRangeError(t *testing.T)
 	c.config.AutoOffsetReset = AutoOffsetResetError
 	pc := &PartitionConsumer{partitionID: 0, consumer: c, fetchOffset: 1}
 
-	result := pc.handleBrokerError([]byte("ERROR: OFFSET_OUT_OF_RANGE requested=1 earliest=5 latest=9"))
+	result := pc.handleBrokerError(offsetOutOfRangeBrokerError())
 	assert.True(t, result)
 	assert.Error(t, c.mainCtx.Err())
+}
+
+func offsetOutOfRangeBrokerError() *BrokerError {
+	return &BrokerError{
+		Code: "OFFSET_OUT_OF_RANGE", Class: ErrorClassConflict,
+		Fields: map[string]string{"requested": "1", "earliest": "5", "latest": "9"},
+	}
 }
 
 func TestPartitionConsumer_HandleStreamControl_OffsetOutOfRange(t *testing.T) {

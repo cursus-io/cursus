@@ -39,14 +39,6 @@ var (
 		Help: "Total number of duplicate sequence numbers detected",
 	}, []string{"topic", "partition"})
 
-	// ConsumerLag is retained for Go API compatibility. The broker exporter
-	// serves this name from its scrape-time runtime collector.
-	// Deprecated: use cursus_consumer_group_lag from the broker exporter.
-	ConsumerLag = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "broker_consumer_lag",
-		Help: "Deprecated consumer lag compatibility gauge",
-	}, []string{"topic", "partition", "group"})
-
 	ClientConnectionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "cursus_broker_client_connections_total",
 		Help: "Total client TCP connections accepted by the broker",

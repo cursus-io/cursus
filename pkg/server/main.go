@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"path/filepath"
 	"strings"
@@ -30,12 +28,12 @@ import (
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
 const (
 	defaultMaxWorkers      = 1000
-	maxWorkers             = defaultMaxWorkers // backward-compatible default alias
 	defaultIdleTimeout     = 60 * time.Second
 	readDeadlinePoll       = 5 * time.Second
 	DefaultHealthCheckPort = 9080
@@ -81,6 +79,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 
 	var cc *clusterController.ClusterController
 	var rm *replication.RaftReplicationManager
+	var clusterClient *client.TCPClusterClient
 	var discoveryListener net.Listener
 	defer func() {
 		if discoveryListener != nil {
@@ -98,8 +97,8 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		raftServerID := brokerID
 
 		var err error
-		clusterClient := *client.NewSecureTCPClusterClient(cfg.InternalAuthToken, cfg.InternalClientTLSConfig())
-		rm, err = replication.NewRaftReplicationManager(ctx, cfg, raftServerID, tm, cd, clusterClient)
+		clusterClient = client.NewSecureTCPClusterClient(cfg.InternalAuthToken, cfg.InternalClientTLSConfig())
+		rm, err = replication.NewRaftReplicationManager(ctx, cfg, raftServerID, tm, cd, *clusterClient)
 		if err != nil {
 			return fmt.Errorf("failed to create raft replication manager: %w", err)
 		}
@@ -126,7 +125,19 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		cc = clusterController.NewClusterController(ctx, cfg, rm, sd, brokerID, localAddr)
 
 		// Start background heartbeats to all cluster members
-		clusterClient.StartHeartbeat(ctx, cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort)
+		clusterClient.StartHeartbeat(
+			ctx,
+			cfg.StaticClusterMembers,
+			brokerID,
+			localAddr,
+			cfg.DiscoveryPort,
+			func() []fsm.ISRCatchupProof {
+				if manager := rm.GetISRManager(); manager != nil {
+					return manager.BuildCatchupProofs()
+				}
+				return nil
+			},
+		)
 
 		// Every node should attempt to join the cluster via seeds
 		go func() {
@@ -156,8 +167,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 							"status": "active", "lifecycle_protocol": fsm.TopicLifecycleProtocolVersion,
 						})
 						raftCmd := fmt.Sprintf("RAFT_APPLY %stype=REGISTER payload=%s", internalAuthPrefix(cfg), string(brokerJSON))
-						encodedCmd := util.EncodeMessage("", raftCmd)
-						if resp, err := cc.Router.ForwardToLeader(string(encodedCmd)); err == nil && !strings.HasPrefix(resp, "ERROR") {
+						if resp, err := cc.Router.ForwardToLeader(raftCmd); err == nil && !wireprotocol.IsErrorResponse(resp) {
 							util.Info("✅ Registered via leader with client address %s", clientAddr)
 							return
 						}
@@ -203,6 +213,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	}
 	if cc != nil {
 		cc.SetLocalProcessor(globalCH)
+		cc.StartReplicaCatchup(ctx, clusterClient, globalCH.ApplyReplicaCatchup)
 	}
 	if cfg.EnabledDistribution && cfg.InternalBrokerPort > 0 {
 		shutdownInternal, err := startInternalBrokerListener(ctx, cfg, globalCH)
@@ -420,81 +431,20 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 
 	clientCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stopContextClose := context.AfterFunc(clientCtx, func() { _ = conn.Close() })
+	defer stopContextClose()
 	cmdCtx.SetRequestContext(clientCtx)
 	idleTimeout := clientIdleTimeout(cmdHandler.Config)
 	lastActivity := time.Now()
-
-	for {
-		select {
-		case <-clientCtx.Done():
-			return
-		default:
-		}
-		deadline := time.Now().Add(readDeadlinePoll)
-		idleDeadline := lastActivity.Add(idleTimeout)
-		if idleDeadline.Before(deadline) {
-			deadline = idleDeadline
-		}
-		if err := conn.SetReadDeadline(deadline); err != nil {
-			util.Error("⚠️ SetReadDeadline error: %v", err)
-			return
-		}
-
-		data, err := readMessage(conn, cmdHandler.Config.CompressionType)
-		if err != nil {
-			select {
-			case <-clientCtx.Done():
-				return
-			default:
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() && time.Since(lastActivity) < idleTimeout {
-					continue
-				}
-				return
-			}
-		}
-
-		lastActivity = time.Now()
-		shouldExit, err := processMessage(data, cmdHandler, cmdCtx, conn)
-		if err != nil {
-			return
-		}
-		if shouldExit {
-			_, payload, decodeErr := util.DecodeMessage(data)
-			cmd := ""
-			if decodeErr == nil {
-				cmd = strings.TrimSpace(payload)
-			} else {
-				cmd = strings.TrimSpace(string(data))
-			}
-
-			if strings.HasPrefix(strings.ToUpper(cmd), "STREAM ") {
-				isStreamed = true
-			}
-			return
-		}
+	if err := conn.SetDeadline(lastActivity.Add(idleTimeout)); err != nil {
+		return
 	}
-}
+	wireConnection, responseConn, err := negotiateServerConnection(conn)
+	if err != nil {
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
 
-// HandleConnection processes a single client connection (creates a new CommandHandler per call).
-// Deprecated: prefer handleConn with a shared CommandHandler to avoid file descriptor leaks.
-func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager, cfg *config.Config, cd *coordinator.Coordinator, sm *stream.StreamManager, cc *clusterController.ClusterController) {
-	defer observeClientConnection()()
-	isStreamed := false
-	defer func() {
-		if !isStreamed {
-			_ = conn.Close()
-		}
-	}()
-
-	clientCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	cmdHandler, cmdCtx := initializeConnection(cfg, tm, cd, sm, cc)
-	defer func() { _ = cmdHandler.Close() }()
-	cmdCtx.SetRequestContext(clientCtx)
-
-	idleTimeout := clientIdleTimeout(cfg)
-	lastActivity := time.Now()
 	for {
 		select {
 		case <-clientCtx.Done():
@@ -511,7 +461,7 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 			return
 		}
 
-		data, err := readMessage(conn, cfg.CompressionType)
+		request, err := readWireRequest(wireConnection)
 		if err != nil {
 			select {
 			case <-clientCtx.Done():
@@ -524,22 +474,14 @@ func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager
 			}
 		}
 
-		shouldExit, err := processMessage(data, cmdHandler, cmdCtx, conn)
 		lastActivity = time.Now()
+		responseConn.setRequest(request)
+		shouldExit, err := processMessage(request.Payload, cmdHandler, cmdCtx, responseConn)
 		if err != nil {
 			return
 		}
 		if shouldExit {
-			// Check if this was a STREAM command to prevent closing the connection
-			_, payload, decodeErr := util.DecodeMessage(data)
-			cmd := ""
-			if decodeErr == nil {
-				cmd = strings.TrimSpace(payload)
-			} else {
-				cmd = strings.TrimSpace(string(data))
-			}
-
-			if strings.HasPrefix(strings.ToUpper(cmd), "STREAM ") {
+			if request.Command == wire.CommandStream {
 				isStreamed = true
 			}
 			return
@@ -630,36 +572,6 @@ func initializeConnection(cfg *config.Config, tm *topic.TopicManager, cd *coordi
 	return cmdHandler, ctx
 }
 
-func readMessage(conn net.Conn, compressionType string) ([]byte, error) {
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(conn, lenBuf); err != nil {
-		if err != io.EOF {
-			util.Error("⚠️ Read length error: %v", err)
-		}
-		return nil, err
-	}
-
-	msgLen := binary.BigEndian.Uint32(lenBuf)
-	if msgLen > uint32(util.MaxMessageSize) {
-		return nil, fmt.Errorf("message size %d exceeds maximum %d", msgLen, util.MaxMessageSize)
-	}
-	msgBuf := make([]byte, msgLen)
-	if _, err := io.ReadFull(conn, msgBuf); err != nil {
-		if err != io.EOF {
-			util.Error("⚠️ Read message error: %v (len=%d)", err, len(msgBuf))
-		}
-		return nil, err
-	}
-
-	data, err := util.DecompressMessage(msgBuf, compressionType)
-	if err != nil {
-		util.Error("⚠️ Decompress error: %v", err)
-		return nil, err
-	}
-
-	return data, nil
-}
-
 func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *controller.ClientContext, conn net.Conn) (bool, error) {
 	if isBatchMessage(data) {
 		if ctx != nil && ctx.Internal && cmdHandler.Config != nil && cmdHandler.Config.InternalAuthToken != "" && !cmdHandler.Config.InternalUseTLS {
@@ -688,36 +600,8 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 		return handleCommandMessage(rawInput, cmdHandler, ctx, conn)
 	}
 
-	_, payload, err := util.DecodeMessage(data)
-	if err != nil {
-		util.Error("⚠️ Decode error and not a raw command: %v (len=%d)", err, len(data))
-		writeResponse(conn, decorateServerResponse(fmt.Sprintf("ERROR: decode_failed reason=%q", err.Error()), ctx))
-		return false, nil
-	}
-
-	payload = strings.Trim(payload, "\x00 \t\n\r")
-
-	if strings.HasPrefix(strings.ToUpper(payload), "JOIN_GROUP") ||
-		strings.HasPrefix(strings.ToUpper(payload), "SYNC_GROUP") ||
-		strings.HasPrefix(strings.ToUpper(payload), "LEAVE_GROUP") {
-		resp := cmdHandler.HandleCommand(payload, ctx)
-		writeResponse(conn, resp)
-		return false, nil
-	}
-
-	if strings.HasPrefix(strings.ToUpper(payload), "INTERNAL_BATCH ") {
-		return handleInternalBatchMessage(payload, cmdHandler, ctx, conn)
-	}
-	if isCommand(payload) {
-		if resp := authorizeInternalListenerCommand(payload, cmdHandler, ctx); resp != "" {
-			writeResponse(conn, resp)
-			return false, nil
-		}
-		return handleCommandMessage(payload, cmdHandler, ctx, conn)
-	}
-
 	util.Debug("[%s] Received unrecognized input (len=%d)", conn.RemoteAddr().String(), len(rawInput))
-	writeResponse(conn, decorateServerResponse("ERROR: malformed_input reason=missing_topic_or_payload", ctx))
+	writeResponse(conn, decorateServerResponse("ERROR: malformed_input reason=command_payload_required", ctx))
 	return true, nil
 }
 
@@ -852,33 +736,19 @@ func suppressBatchPublishResponse(data []byte, ctx *controller.ClientContext) bo
 
 func commandErrorResponse(err error, ctx *controller.ClientContext) string {
 	resp := err.Error()
-	if !strings.HasPrefix(resp, "ERROR:") {
+	if !wireprotocol.IsErrorResponse(resp) {
 		resp = fmt.Sprintf("ERROR: command_failed reason=%q", resp)
 	}
 	return decorateServerResponse(resp, ctx)
 }
 
 func decorateServerResponse(resp string, ctx *controller.ClientContext) string {
-	if ctx == nil || !ctx.HasFeature(wireprotocol.FeatureStructuredErrorsV1) {
-		return resp
-	}
 	return wireprotocol.EnrichErrorResponse(resp)
 }
 
 // isBatchMessage checks if the data is in binary batch format
 func isBatchMessage(data []byte) bool {
-	if len(data) < 6 {
-		return false
-	}
-	if data[0] != 0xBA || data[1] != 0x7C {
-		return false
-	}
-
-	topicLen := binary.BigEndian.Uint16(data[2:4])
-	if topicLen == 0 || int(topicLen)+2 > len(data) {
-		return false
-	}
-	return true
+	return wire.IsBatch(data)
 }
 
 func isCommand(s string) bool {
@@ -887,10 +757,6 @@ func isCommand(s string) bool {
 
 // writeResponseWithTimeout adds write timeout
 func writeResponseWithTimeout(conn net.Conn, msg string, timeout time.Duration) {
-	resp := []byte(msg)
-	respLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(respLen, uint32(len(resp)))
-
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		util.Error("⚠️ SetWriteDeadline error: %v", err)
 		return
@@ -901,27 +767,13 @@ func writeResponseWithTimeout(conn net.Conn, msg string, timeout time.Duration) 
 		}
 	}()
 
-	if _, err := conn.Write(respLen); err != nil {
-		util.Error("⚠️ Write length error: %v", err)
-		return
-	}
-	if _, err := conn.Write(resp); err != nil {
+	if err := util.WriteWithLength(conn, []byte(msg)); err != nil {
 		util.Error("⚠️ Write response error: %v", err)
-		return
 	}
 }
 
 func writeResponse(conn net.Conn, msg string) {
-	resp := []byte(msg)
-	respLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(respLen, uint32(len(resp)))
-
-	if _, err := conn.Write(respLen); err != nil {
-		util.Error("⚠️ Write length error: %v", err)
-		return
-	}
-	if _, err := conn.Write(resp); err != nil {
+	if err := util.WriteWithLength(conn, []byte(msg)); err != nil {
 		util.Error("⚠️ Write response error: %v", err)
-		return
 	}
 }

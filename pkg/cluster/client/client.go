@@ -6,16 +6,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/cursus-io/cursus/util"
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/wire"
 )
 
 type TCPClusterClient struct {
 	timeout   time.Duration
 	authToken string
 	tlsConfig *tls.Config
+	nextID    uint64
 }
 
 func NewTCPClusterClient() *TCPClusterClient {
@@ -30,13 +34,6 @@ func NewSecureTCPClusterClient(authToken string, tlsConfig *tls.Config) *TCPClus
 	}
 }
 
-func (c *TCPClusterClient) secureCommand(command string) string {
-	if c.authToken == "" {
-		return command
-	}
-	return "AUTH " + c.authToken + " " + command
-}
-
 func (c *TCPClusterClient) dialContext(ctx context.Context, address string) (net.Conn, error) {
 	dialer := &net.Dialer{}
 	if c.tlsConfig == nil {
@@ -46,7 +43,13 @@ func (c *TCPClusterClient) dialContext(ctx context.Context, address string) (net
 	return tlsDialer.DialContext(ctx, "tcp", address)
 }
 
-func (c *TCPClusterClient) StartHeartbeat(ctx context.Context, peers []string, nodeID, localAddr string, discoveryPort int) {
+func (c *TCPClusterClient) StartHeartbeat(
+	ctx context.Context,
+	peers []string,
+	nodeID, localAddr string,
+	discoveryPort int,
+	proofProvider func() []fsm.ISRCatchupProof,
+) {
 	ticker := time.NewTicker(1 * time.Second)
 	go func() {
 		defer ticker.Stop()
@@ -55,61 +58,94 @@ func (c *TCPClusterClient) StartHeartbeat(ctx context.Context, peers []string, n
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				var proofs []fsm.ISRCatchupProof
+				if proofProvider != nil {
+					proofs = proofProvider()
+				}
 				// sendHeartbeat internal loop uses goroutines now
-				_ = c.sendHeartbeat(ctx, peers, nodeID, localAddr, discoveryPort)
+				_ = c.sendHeartbeat(ctx, peers, nodeID, localAddr, discoveryPort, proofs)
 			}
 		}
 	}()
 }
 
-func (c *TCPClusterClient) sendHeartbeat(ctx context.Context, peers []string, nodeID, localAddr string, discoveryPort int) error {
+func (c *TCPClusterClient) sendHeartbeat(
+	ctx context.Context,
+	peers []string,
+	nodeID, localAddr string,
+	discoveryPort int,
+	proofs []fsm.ISRCatchupProof,
+) error {
 	apiPort := discoveryPort
 	if apiPort == 0 {
 		apiPort = 8000
 	}
 
-	payload := map[string]string{"node_id": nodeID}
-	body, _ := json.Marshal(payload)
-	cmd := fmt.Sprintf("HEARTBEAT_CLUSTER %s", string(body))
+	fields := map[string]string{"node_id": nodeID}
+	if len(proofs) > 0 {
+		body, err := json.Marshal(proofs)
+		if err != nil {
+			return fmt.Errorf("marshal heartbeat proofs: %w", err)
+		}
+		fields["catchup_proofs"] = string(body)
+	}
 
-	for _, peer := range peers {
+	targets := make([]string, 0, len(peers)+1)
+	targets = append(targets, peers...)
+	targets = append(targets, localAddr)
+	seen := make(map[string]struct{}, len(targets))
+	for _, peer := range targets {
+		target := heartbeatTarget(peer, apiPort)
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		seen[target] = struct{}{}
 		// Launch each heartbeat in a separate goroutine to avoid blocking on DNS/Connection
-		go func(p string) {
-			addrOnly := p
-			if strings.Contains(p, "@") {
-				addrOnly = strings.Split(p, "@")[1]
-			}
-
-			if addrOnly == localAddr {
-				return
-			}
-
-			host := addrOnly
-			if strings.Contains(addrOnly, ":") {
-				var err error
-				host, _, err = net.SplitHostPort(addrOnly)
-				if err != nil {
-					host = addrOnly
-				}
-			}
-
-			target := net.JoinHostPort(host, fmt.Sprintf("%d", apiPort))
-
+		go func(target string) {
 			// Use short timeout for heartbeat connection
 			heartbeatCtx, cancel := context.WithTimeout(ctx, time.Second)
-			conn, err := c.dialContext(heartbeatCtx, target)
+			_, _ = c.sendRequest(heartbeatCtx, target, wire.CommandHeartbeatCluster, fields)
 			cancel()
-			if err != nil {
-				return
-			}
-			defer func() { _ = conn.Close() }()
-
-			// Set a write deadline to prevent goroutine buildup on slow connections
-			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-			_ = util.WriteWithLength(conn, util.EncodeMessage("cluster", c.secureCommand(cmd)))
-		}(peer)
+		}(target)
 	}
 	return nil
+}
+
+// FetchReplicaCatchup requests one bounded committed-log range from the
+// partition leader's authenticated discovery endpoint.
+func (c *TCPClusterClient) FetchReplicaCatchup(
+	ctx context.Context,
+	leaderAddr string,
+	discoveryPort int,
+	request fsm.ReplicaCatchupRequest,
+) (fsm.ReplicaCatchupBatch, error) {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("marshal replica catch-up request: %w", err)
+	}
+	response, err := c.sendRequest(ctx, heartbeatTarget(leaderAddr, discoveryPort), wire.CommandReplicaCatchup, map[string]string{
+		"request": string(data),
+	})
+	if err != nil {
+		return fsm.ReplicaCatchupBatch{}, err
+	}
+	var batch fsm.ReplicaCatchupBatch
+	if err := json.Unmarshal(response, &batch); err != nil {
+		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("decode replica catch-up response: %w", err)
+	}
+	return batch, nil
+}
+
+func heartbeatTarget(peer string, discoveryPort int) string {
+	address := peer
+	if _, suffix, ok := strings.Cut(peer, "@"); ok {
+		address = suffix
+	}
+	host := address
+	if parsedHost, _, err := net.SplitHostPort(address); err == nil {
+		host = parsedHost
+	}
+	return net.JoinHostPort(host, strconv.Itoa(discoveryPort))
 }
 
 func (c *TCPClusterClient) JoinCluster(peers []string, nodeID, addr string, discoveryPort int) error {
@@ -162,31 +198,10 @@ func (c *TCPClusterClient) joinClusterWithContext(ctx context.Context, peers []s
 }
 
 func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, localAddr string) error {
-	payload := map[string]string{
+	response, err := c.sendRequest(ctx, addr, wire.CommandJoinCluster, map[string]string{
 		"node_id": nodeID,
 		"address": localAddr,
-	}
-	body, _ := json.Marshal(payload)
-	joinCmd := fmt.Sprintf("JOIN_CLUSTER %s", string(body))
-
-	conn, err := c.dialContext(ctx, addr)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close() }()
-
-	// Set connection deadlines based on the context's remaining time
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	}
-
-	if err := util.WriteWithLength(conn, util.EncodeMessage("cluster", c.secureCommand(joinCmd))); err != nil {
-		return err
-	}
-
-	resp, err := util.ReadWithLength(conn)
+	})
 	if err != nil {
 		return err
 	}
@@ -195,7 +210,7 @@ func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, lo
 		Success bool   `json:"success"`
 		Error   string `json:"error"`
 	}
-	if err := json.Unmarshal(resp, &jr); err != nil {
+	if err := json.Unmarshal(response, &jr); err != nil {
 		return err
 	}
 
@@ -204,6 +219,67 @@ func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, lo
 	}
 
 	return nil
+}
+
+func (c *TCPClusterClient) sendRequest(
+	ctx context.Context,
+	address string,
+	command wire.Command,
+	fields map[string]string,
+) ([]byte, error) {
+	conn, err := c.dialContext(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(c.timeout))
+	}
+
+	connection, err := wire.ClientHandshake(conn, []wire.Compression{wire.CompressionNone})
+	if err != nil {
+		return nil, err
+	}
+	requestFields := make(map[string]string, len(fields))
+	for key, value := range fields {
+		requestFields[key] = value
+	}
+	if c.authToken != "" {
+		requestFields["auth_token"] = c.authToken
+	}
+	payload, err := wire.EncodeCommandPayload(wire.CommandPayload{Fields: requestFields})
+	if err != nil {
+		return nil, err
+	}
+	requestID := atomic.AddUint64(&c.nextID, 1)
+	if err := connection.WriteFrame(wire.Frame{
+		Kind: wire.KindRequest, Command: command, RequestID: requestID, Payload: payload,
+	}); err != nil {
+		return nil, err
+	}
+	response, err := connection.ReadFrame()
+	if err != nil {
+		return nil, err
+	}
+	if response.Kind != wire.KindResponse || response.Command != command || response.RequestID != requestID {
+		return nil, fmt.Errorf(
+			"cluster Wire v2 response correlation mismatch: request=%d/%s response=%d/%s",
+			requestID, command, response.RequestID, response.Command,
+		)
+	}
+	if response.Status == wire.StatusError {
+		brokerError, decodeErr := wire.DecodeError(response.Payload)
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode cluster Wire v2 error: %w", decodeErr)
+		}
+		return nil, fmt.Errorf("%s: %s", brokerError.Code, brokerError.Message)
+	}
+	if response.Status != wire.StatusOK {
+		return nil, fmt.Errorf("unexpected cluster Wire v2 status %d", response.Status)
+	}
+	return response.Payload, nil
 }
 
 func (c *TCPClusterClient) extractSeedHosts(peers []string, localAddr string) []string {

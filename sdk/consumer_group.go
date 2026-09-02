@@ -2,35 +2,34 @@ package sdk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
 // ─── Heartbeat ────────────────────────────────────────────────────────────────
 
-func (c *Consumer) heartbeatLoop() {
-	ticker := time.NewTicker(time.Duration(c.config.HeartbeatIntervalMS) * time.Millisecond)
+func (c *Consumer) heartbeatLoop(ctx context.Context, assignmentGeneration uint64) {
+	defer c.recordStaleWorker("heartbeat", assignmentGeneration)
+	interval := time.Duration(c.config.HeartbeatIntervalMS) * time.Millisecond
+	if interval <= 0 {
+		interval = 3 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
-	stopConnCloser := make(chan struct{})
-	go func() {
-		select {
-		case <-c.doneCh:
-			c.resetHeartbeatConn()
-		case <-stopConnCloser:
-		}
-	}()
-	defer close(stopConnCloser)
+	defer c.resetHeartbeatConn()
 
 	for {
 		select {
-		case <-c.doneCh:
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			conn := c.getOrDialHeartbeatConn()
+			if !c.assignmentActive(assignmentGeneration) {
+				return
+			}
+			conn := c.getOrDialHeartbeatConn(ctx)
 			if conn == nil {
 				continue
 			}
@@ -42,7 +41,7 @@ func (c *Consumer) heartbeatLoop() {
 			c.mu.RUnlock()
 			hb := fmt.Sprintf("HEARTBEAT topic=%s group=%s member=%s generation=%d",
 				c.config.Topic, c.config.GroupID, memberID, generation)
-			if err := WriteWithLength(conn, EncodeMessage("", hb)); err != nil {
+			if err := WriteWithLength(conn, []byte(hb)); err != nil {
 				LogError("Heartbeat send failed: %v", err)
 				c.cleanupHbConn(conn)
 				continue
@@ -51,19 +50,28 @@ func (c *Consumer) heartbeatLoop() {
 			resp, err := ReadWithLength(conn)
 			_ = conn.SetDeadline(time.Time{})
 			if err != nil {
+				var brokerErr *BrokerError
+				if errors.As(err, &brokerErr) {
+					_ = c.handleNotCoordinatorError(brokerErr)
+					switch strings.ToUpper(brokerErr.Code) {
+					case "REBALANCE_REQUIRED", "GEN_MISMATCH", "NOT_OWNER", "MEMBER_NOT_FOUND":
+						LogWarn("Heartbeat: rebalance triggered: %v", brokerErr)
+						select {
+						case c.rebalanceSig <- struct{}{}:
+						default:
+						}
+						return
+					}
+				}
 				LogError("Heartbeat response failed: %v", err)
 				c.cleanupHbConn(conn)
 				continue
 			}
 
 			respStr := string(resp)
-			if strings.Contains(respStr, "REBALANCE_REQUIRED") || strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "NOT_OWNER") || strings.Contains(respStr, "member_not_found") {
-				LogWarn("Heartbeat: rebalance triggered: %s", respStr)
-				select {
-				case c.rebalanceSig <- struct{}{}:
-				default:
-				}
-				return
+			if !hasOKStatus(respStr) {
+				LogError("Heartbeat returned an unexpected response: %s", respStr)
+				c.cleanupHbConn(conn)
 			}
 		}
 	}
@@ -78,10 +86,10 @@ func (c *Consumer) cleanupHbConn(bad net.Conn) {
 	c.hbMu.Unlock()
 }
 
-func (c *Consumer) getOrDialHeartbeatConn() net.Conn {
+func (c *Consumer) getOrDialHeartbeatConn(ctx context.Context) net.Conn {
 	c.hbMu.Lock()
 	select {
-	case <-c.doneCh:
+	case <-ctx.Done():
 		if c.hbConn != nil {
 			_ = c.hbConn.Close()
 			c.hbConn = nil
@@ -105,7 +113,7 @@ func (c *Consumer) getOrDialHeartbeatConn() net.Conn {
 
 	c.hbMu.Lock()
 	select {
-	case <-c.doneCh:
+	case <-ctx.Done():
 		c.hbMu.Unlock()
 		_ = newConn.Close()
 		return nil
@@ -133,42 +141,61 @@ func (c *Consumer) resetHeartbeatConn() {
 
 // ─── Consume / Stream ─────────────────────────────────────────────────────────
 
-func (c *Consumer) startConsuming() {
+func (c *Consumer) startAssignmentWorkers(ctx context.Context, assignmentGeneration uint64) {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.State() != ConsumerStateRunning || c.assignmentGeneration.Load() != assignmentGeneration {
+		return
+	}
+	c.mu.RLock()
+	pcs := make([]*PartitionConsumer, 0, len(c.partitionConsumers))
+	for _, pc := range c.partitionConsumers {
+		pcs = append(pcs, pc)
+	}
+	c.mu.RUnlock()
+	for _, pc := range pcs {
+		pc.initWorker()
+	}
+	if c.config.Mode == ModeStreaming {
+		c.startStreaming(ctx, assignmentGeneration, pcs)
+		return
+	}
+	c.startConsuming(ctx, assignmentGeneration, pcs)
+}
+
+func (c *Consumer) startConsuming(ctx context.Context, assignmentGeneration uint64, pcs []*PartitionConsumer) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		c.metadataRefreshLoop()
+		c.metadataRefreshLoop(ctx)
 	}()
 
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		c.heartbeatLoop()
+		c.heartbeatLoop(ctx, assignmentGeneration)
 	}()
 
-	for pid, pc := range c.partitionConsumers {
+	for _, pc := range pcs {
+		pid := pc.partitionID
 		c.wg.Add(1)
 		go func(pid int, pc *PartitionConsumer) {
 			defer c.wg.Done()
+			defer c.recordStaleWorker("poller", assignmentGeneration)
 			defer pc.closeDataCh()
 			for {
 				select {
-				case <-c.doneCh:
-					return
-				case <-c.mainCtx.Done():
-					LogInfo("Partition [%d] polling worker stopping", pid)
+				case <-ctx.Done():
 					return
 				default:
-					if !c.ownsPartition(pid) {
+					if !c.ownsPartition(pid, assignmentGeneration) {
 						LogWarn("Partition [%d] no longer owned, stopping poller", pid)
 						return
 					}
 					pc.pollAndProcess()
 					select {
 					case <-time.After(c.config.PollInterval):
-					case <-c.mainCtx.Done():
-						return
-					case <-c.doneCh:
+					case <-ctx.Done():
 						return
 					}
 				}
@@ -177,40 +204,43 @@ func (c *Consumer) startConsuming() {
 	}
 }
 
-func (c *Consumer) startStreaming() {
+func (c *Consumer) startStreaming(ctx context.Context, assignmentGeneration uint64, pcs []*PartitionConsumer) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		c.metadataRefreshLoop()
+		c.metadataRefreshLoop(ctx)
 	}()
 
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		c.heartbeatLoop()
+		c.heartbeatLoop(ctx, assignmentGeneration)
 	}()
-
-	c.mu.RLock()
-	pcs := make([]*PartitionConsumer, 0, len(c.partitionConsumers))
-	for _, pc := range c.partitionConsumers {
-		pcs = append(pcs, pc)
-	}
-	c.mu.RUnlock()
 
 	for _, pc := range pcs {
 		c.wg.Add(1)
 		go func(pc *PartitionConsumer) {
 			defer c.wg.Done()
+			defer c.recordStaleWorker("stream", assignmentGeneration)
 			pc.startStreamLoop()
 		}(pc)
 	}
 }
 
-func (c *Consumer) ownsPartition(pid int) bool {
+func (c *Consumer) ownsPartition(pid int, assignmentGeneration uint64) bool {
+	if !c.assignmentActive(assignmentGeneration) {
+		return false
+	}
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 	pc, ok := c.partitionConsumers[pid]
-	return ok && !pc.closed
+	c.mu.RUnlock()
+	if !ok || pc.assignmentGeneration != assignmentGeneration {
+		return false
+	}
+	pc.mu.Lock()
+	closed := pc.closed
+	pc.mu.Unlock()
+	return !closed
 }
 
 // ─── Rebalance ────────────────────────────────────────────────────────────────
@@ -218,7 +248,7 @@ func (c *Consumer) ownsPartition(pid int) bool {
 func (c *Consumer) rebalanceMonitorLoop() {
 	for {
 		select {
-		case <-c.doneCh:
+		case <-c.rootCtx.Done():
 			return
 		case <-c.rebalanceSig:
 			c.handleRebalanceSignal()
@@ -231,27 +261,28 @@ func (c *Consumer) scheduleRebalanceRetry() {
 	if delay < 100*time.Millisecond {
 		delay = 100 * time.Millisecond
 	}
-	go func() {
+	c.startLifecycleWorker(func() {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		select {
-		case <-c.doneCh:
+		case <-c.rootCtx.Done():
 			return
 		case <-timer.C:
 		}
 		select {
-		case <-c.doneCh:
+		case <-c.rootCtx.Done():
 		case c.rebalanceSig <- struct{}{}:
 		default:
 		}
-	}()
+	})
 }
 
 func (c *Consumer) handleRebalanceSignal() {
-	if !atomic.CompareAndSwapInt32(&c.rebalancing, 0, 1) {
+	assignmentGeneration, ok := c.beginRebalance()
+	if !ok {
 		return
 	}
-	defer atomic.StoreInt32(&c.rebalancing, 0)
+	defer c.finishRebalance()
 
 	if c.config.EnableMetrics {
 		consumerRebalanceTotal.WithLabelValues(c.config.Topic, c.config.GroupID).Inc()
@@ -259,22 +290,12 @@ func (c *Consumer) handleRebalanceSignal() {
 
 	LogInfo("Rebalance started — stopping existing workers")
 
-	c.mainCancel()
-
+	c.cancelAssignment()
+	c.closeActiveConnections()
 	c.wg.Wait()
-
-	drainDeadline := time.After(3 * time.Second)
-	for {
-		select {
-		case <-c.commitCh:
-		case <-time.After(100 * time.Millisecond):
-			goto drainDone
-		case <-drainDeadline:
-			LogWarn("Rebalance drain timeout, forcing continuation")
-			goto drainDone
-		}
+	if c.rootCtx.Err() != nil {
+		return
 	}
-drainDone:
 
 	c.resetHeartbeatConn()
 	c.commitMu.Lock()
@@ -292,7 +313,7 @@ drainDone:
 	c.offsets = make(map[int]uint64)
 	c.mu.Unlock()
 
-	c.mainCtx, c.mainCancel = context.WithCancel(c.rootCtx)
+	assignmentCtx := c.replaceAssignmentContext()
 
 	if coordAddr, err := c.findCoordinator(); err == nil {
 		c.mu.Lock()
@@ -332,10 +353,12 @@ drainDone:
 	for _, pid := range assignments {
 		offset := offsetMap[pid]
 		c.partitionConsumers[pid] = &PartitionConsumer{
-			partitionID:  pid,
-			consumer:     c,
-			fetchOffset:  offset,
-			commitOffset: offset,
+			partitionID:          pid,
+			consumer:             c,
+			fetchOffset:          offset,
+			commitOffset:         offset,
+			assignmentGeneration: assignmentGeneration,
+			ctx:                  assignmentCtx,
 		}
 		c.offsets[pid] = offset
 	}
@@ -348,11 +371,8 @@ drainDone:
 		LogWarn("Rebalance: failed to fetch metadata: %v", err)
 	}
 
-	if c.config.Mode == ModeStreaming {
-		go c.startStreaming()
-	} else {
-		go c.startConsuming()
-	}
+	c.finishRebalance()
+	c.startAssignmentWorkers(assignmentCtx, assignmentGeneration)
 
 	LogInfo("Rebalance completed — consuming %d partitions", len(assignments))
 }

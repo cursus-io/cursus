@@ -117,8 +117,8 @@ func TestCollectorThreeBrokerCoordinatorMovementConvergesWithoutDuplicateMembers
 	_, err := brokers[0].AddConsumer("workers", "member-1")
 	require.NoError(t, err)
 	state := brokers[0].ExportState()
-	brokers[1].ImportState(state)
-	brokers[2].ImportState(state)
+	require.NoError(t, brokers[1].ImportState(state))
+	require.NoError(t, brokers[2].ImportState(state))
 
 	owner := 1
 	collectors := make([]*Collector, len(brokers))

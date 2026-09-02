@@ -85,7 +85,7 @@ func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, err
 	}
 
 	dir := h.tm.GetLogDir(topicName, partitionID)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("create dir for stream index %s:%d: %w", topicName, partitionID, err)
 	}
 	idx, err := NewStreamIndex(dir, partitionID)
@@ -134,7 +134,7 @@ func (h *Handler) getSnapshot(topicName string, partitionID int) (*SnapshotStore
 	}
 
 	dir := h.tm.GetLogDir(topicName, partitionID)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("create dir for snapshot store %s:%d: %w", topicName, partitionID, err)
 	}
 	ss, err := NewSnapshotStore(dir, partitionID)
@@ -847,10 +847,14 @@ func (h *Handler) Close() error {
 	return firstErr
 }
 
-// writeError writes a JSON error envelope to the connection.
+// writeError writes the canonical textual error envelope used by the wire
+// transport to produce a typed broker error.
 func writeError(conn net.Conn, msg string) {
-	errResp, _ := json.Marshal(map[string]string{"status": "ERROR", "error": msg})
-	_ = util.WriteWithLength(conn, errResp)
+	msg = strings.TrimSpace(msg)
+	if !strings.HasPrefix(msg, "ERROR:") {
+		msg = "ERROR: " + msg
+	}
+	_ = util.WriteWithLength(conn, []byte(msg))
 }
 
 // parseKeyValueArgs parses "key=value" pairs from a command argument string.

@@ -38,12 +38,7 @@ func TestBrokerFSMTopicCreateFailureCommitsDesiredStateAndReconciles(t *testing.
 	f := NewBrokerFSM(manager, nil)
 	registerActiveBroker(t, f, "broker-1")
 
-	command, err := json.Marshal(TopicCommand{
-		Name:              "orders",
-		Partitions:        1,
-		ReplicationFactor: 1,
-		Policy:            topic.DefaultPolicy(),
-	})
+	command, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 
 	result := f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(command)), Index: 2})
@@ -74,12 +69,7 @@ func TestBrokerFSMTopicConfigFailureCommitsDesiredStateAndReconciles(t *testing.
 	f := NewBrokerFSM(manager, nil)
 	registerActiveBroker(t, f, "broker-1")
 
-	create, err := json.Marshal(TopicCommand{
-		Name:              "orders",
-		Partitions:        1,
-		ReplicationFactor: 1,
-		Policy:            topic.DefaultPolicy(),
-	})
+	create, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 	require.Nil(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 2}))
 
@@ -154,9 +144,12 @@ func TestBrokerFSMDeleteMissingTopicReturnsNotFound(t *testing.T) {
 
 func TestBrokerFSMRestoreRejectsIncompleteLegacyPartitionMetadata(t *testing.T) {
 	state := BrokerFSMState{
-		Version: 5,
+		Version: SnapshotVersionCurrent,
+		TopicState: map[string]*topic.Definition{
+			"orders": snapshotTopicDefinition("orders", 2),
+		},
 		PartitionMetadata: map[string]*PartitionMetadata{
-			"orders-0": {PartitionCount: 2},
+			"orders-0": authoritativePartitionMetadata(2),
 		},
 	}
 	data, err := json.Marshal(state)
@@ -174,27 +167,27 @@ func TestBrokerFSMRestoreRejectsTopicMetadataConflicts(t *testing.T) {
 	}{
 		{
 			name:     "partition count",
-			metadata: &PartitionMetadata{PartitionCount: 2, Idempotent: true},
+			metadata: authoritativePartitionMetadata(2),
 			want:     "declares partition count 2",
 		},
 		{
 			name:     "idempotent mode",
-			metadata: &PartitionMetadata{PartitionCount: 1, Idempotent: false},
+			metadata: authoritativePartitionMetadata(1),
 			want:     "idempotent mode conflicts",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			tt.metadata.Idempotent = tt.name == "partition count"
 			state := BrokerFSMState{
-				Version: 6,
+				Version: SnapshotVersionCurrent,
 				TopicState: map[string]*topic.Definition{
-					"orders": {
-						Name:       "orders",
-						Partitions: 1,
-						Idempotent: true,
-						Policy:     topic.DefaultPolicy(),
-					},
+					"orders": func() *topic.Definition {
+						definition := snapshotTopicDefinition("orders", 1)
+						definition.Idempotent = true
+						return definition
+					}(),
 				},
 				PartitionMetadata: map[string]*PartitionMetadata{"orders-0": tt.metadata},
 			}
@@ -215,12 +208,12 @@ func TestBrokerFSMRestoreDefersLocalTopicMaterializationFailure(t *testing.T) {
 	manager := topic.NewTopicManager(cfg, provider, nil)
 	f := NewBrokerFSM(manager, nil)
 	state := BrokerFSMState{
-		Version: 6,
+		Version: SnapshotVersionCurrent,
 		TopicState: map[string]*topic.Definition{
-			"orders": {Name: "orders", Partitions: 1, Policy: topic.DefaultPolicy()},
+			"orders": snapshotTopicDefinition("orders", 1),
 		},
 		PartitionMetadata: map[string]*PartitionMetadata{
-			"orders-0": {PartitionCount: 1},
+			"orders-0": authoritativePartitionMetadata(1),
 		},
 	}
 	data, err := json.Marshal(state)
@@ -246,9 +239,7 @@ func TestBrokerFSMDeleteSupersedesPendingCreateWithoutLocalTopic(t *testing.T) {
 	f := NewBrokerFSM(manager, nil)
 	registerActiveBroker(t, f, "broker-1")
 
-	command, err := json.Marshal(TopicCommand{
-		Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy(),
-	})
+	command, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 	require.Error(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(command)), Index: 2}).(error))
 	require.Error(t, f.TopicMaterializationReadinessError())

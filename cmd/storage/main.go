@@ -41,31 +41,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return writeJSON(stdout, stderr, inventory)
 
-	case "manifest create":
-		flags := flag.NewFlagSet("manifest create", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		logDir := flags.String("log-dir", "", "broker log directory")
-		definitionsPath := flags.String("definitions", "", "strict manifest-shaped topic definitions JSON")
-		dryRun := flags.Bool("dry-run", false, "validate without writing")
-		if code := parseCommandFlags(flags, args[2:]); code >= 0 {
-			return code
-		}
-		if *logDir == "" || *definitionsPath == "" || flags.NArg() != 0 {
-			return usageError(stderr, "--log-dir and --definitions are required; positional arguments are not accepted")
-		}
-		definitions, err := topic.ReadTopicDefinitionsFile(*definitionsPath)
-		if err != nil {
-			return operationError(stderr, err)
-		}
-		result, err := topic.CreateStandaloneManifest(*logDir, definitions, *dryRun)
-		if writeErr := writeJSONValue(stdout, result); writeErr != nil {
-			return operationError(stderr, writeErr)
-		}
-		if err != nil {
-			return operationError(stderr, err)
-		}
-		return 0
-
 	case "consumer-metadata inspect":
 		flags := flag.NewFlagSet("consumer-metadata inspect", flag.ContinueOnError)
 		flags.SetOutput(stderr)
@@ -89,30 +64,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 			Problems []topic.StorageProblem                  `json:"problems,omitempty"`
 		}{Records: records, Problems: inventory.Problems})
 
-	case "consumer-metadata migrate":
-		flags := flag.NewFlagSet("consumer-metadata migrate", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		logDir := flags.String("log-dir", "", "broker log directory")
-		selectionPath := flags.String("selection", "", "explicit consumer metadata record selection JSON")
-		dryRun := flags.Bool("dry-run", false, "validate without writing")
-		if code := parseCommandFlags(flags, args[2:]); code >= 0 {
-			return code
-		}
-		if *logDir == "" || *selectionPath == "" || flags.NArg() != 0 {
-			return usageError(stderr, "--log-dir and --selection are required; positional arguments are not accepted")
-		}
-		selection, err := topic.ReadConsumerMetadataSelection(*selectionPath)
-		if err != nil {
-			return operationError(stderr, err)
-		}
-		result, err := topic.CreateConsumerMetadataMigration(*logDir, selection, *dryRun)
-		if writeErr := writeJSONValue(stdout, result); writeErr != nil {
-			return operationError(stderr, writeErr)
-		}
-		if err != nil {
-			return operationError(stderr, err)
-		}
-		return 0
 	case "orphan inspect":
 		flags := flag.NewFlagSet("orphan inspect", flag.ContinueOnError)
 		flags.SetOutput(stderr)
@@ -186,7 +137,7 @@ func writeJSONValue(writer io.Writer, value any) error {
 }
 
 func operationError(stderr io.Writer, err error) int {
-	fmt.Fprintln(stderr, "error:", err)
+	_, _ = fmt.Fprintln(stderr, "error:", err)
 	return 1
 }
 
@@ -202,16 +153,14 @@ func parseCommandFlags(flags *flag.FlagSet, args []string) int {
 }
 
 func usageError(stderr io.Writer, message string) int {
-	fmt.Fprintln(stderr, "error:", message)
+	_, _ = fmt.Fprintln(stderr, "error:", message)
 	return 2
 }
 
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage:")
-	fmt.Fprintln(writer, "  cursus-storage manifest inspect --log-dir DIR")
-	fmt.Fprintln(writer, "  cursus-storage manifest create --log-dir DIR --definitions FILE [--dry-run]")
-	fmt.Fprintln(writer, "  cursus-storage consumer-metadata inspect --log-dir DIR")
-	fmt.Fprintln(writer, "  cursus-storage consumer-metadata migrate --log-dir DIR --selection FILE [--dry-run]")
-	fmt.Fprintln(writer, "  cursus-storage orphan inspect --log-dir DIR")
-	fmt.Fprintln(writer, "  cursus-storage orphan archive --log-dir DIR --archive-dir DIR --topic NAME [--dry-run]")
+	_, _ = fmt.Fprintln(writer, "usage:")
+	_, _ = fmt.Fprintln(writer, "  cursus-storage manifest inspect --log-dir DIR")
+	_, _ = fmt.Fprintln(writer, "  cursus-storage consumer-metadata inspect --log-dir DIR")
+	_, _ = fmt.Fprintln(writer, "  cursus-storage orphan inspect --log-dir DIR")
+	_, _ = fmt.Fprintln(writer, "  cursus-storage orphan archive --log-dir DIR --archive-dir DIR --topic NAME [--dry-run]")
 }

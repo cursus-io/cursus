@@ -87,7 +87,7 @@ cursus exposes three network ports, each serving a distinct purpose:
 | Port | Protocol | Handler | Purpose |
 |------|----------|---------|---------|
 | 9000 | TCP      | `server.RunServer()` | Main broker operations (`PUBLISH`, `CONSUME`, `CREATE`, etc.) |
-| 9080 | HTTP     | `startHealthCheckServer()` | `/live`, `/ready`, and compatible `/health` probes |
+| 9080 | HTTP     | `startHealthCheckServer()` | `/live` and `/ready` probes |
 | 9100 | HTTP     | `metrics.StartMetricsServer()` | Prometheus exporter with scrape-time broker state |
 
 
@@ -106,7 +106,7 @@ sequenceDiagram
     participant SM as StreamManager
     participant CONS as Consumer
 
-    PROD->>SRV: [4-byte len][PUBLISH topic msg]
+    PROD->>SRV: CRS2 PUBLISH request (CRQ2/CBV2 payload)
     SRV->>TM: Publish(topic, message)
     TM->>PART: select partition\nkey-hash or round-robin
     PART->>PART: validate producer epoch/sequence when enabled
@@ -116,11 +116,11 @@ sequenceDiagram
     SM->>CONS: embedded fan-out notification
 
     Note over CONS,DISK: Disk-based replay (CONSUME)
-    CONS->>SRV: [4-byte len][CONSUME topic partition offset]
+    CONS->>SRV: CRS2 CONSUME request
     SRV->>PART: ReadCommitted(offset) by default
     PART->>DISK: mmap read (up to 8192 bytes)
     DISK-->>SRV: message batch
-    SRV-->>CONS: [4-byte len][msg1][4-byte len][msg2]...
+    SRV-->>CONS: correlated CRS2 stream frames
 ```
 
 ### Mermaid Graph Overview
@@ -286,7 +286,7 @@ sequenceDiagram
 
     Note over C,B3: If partition leader changes...
     C->>B2: CONSUME topic=T partition=0
-    B2-->>C: ERROR: NOT_LEADER LEADER_IS B3:9003
+    B2-->>C: ERROR: NOT_LEADER leader=B3:9003
     C->>B3: CONSUME topic=T partition=0
     B3-->>C: [messages]
 ```

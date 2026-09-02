@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
@@ -64,7 +65,7 @@ func TestBrokerFSMTopicDeleteCleansLifecycleStateAndIsExplicitlyIdempotent(t *te
 	fsm.SetTransactionManager(transactions)
 	registerActiveBroker(t, fsm, "broker-1")
 
-	create, err := json.Marshal(TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()})
+	create, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 	require.Nil(t, fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 1}))
 	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
@@ -72,8 +73,9 @@ func TestBrokerFSMTopicDeleteCleansLifecycleStateAndIsExplicitlyIdempotent(t *te
 	require.NoError(t, err)
 
 	transactions.ApplySnapshot(&transaction.Snapshot{
-		ID: "tx-orders", State: transaction.StateOpen,
-		Messages: []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
+		ID: "tx-orders", Producer: "producer", Revision: 1, State: transaction.StateOpen,
+		Messages:  []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	})
 	blocked := fsm.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders"}`), Index: 2})
 	blockedErr, ok := blocked.(error)
@@ -83,8 +85,9 @@ func TestBrokerFSMTopicDeleteCleansLifecycleStateAndIsExplicitlyIdempotent(t *te
 
 	require.NoError(t, groupCoordinator.RemoveConsumer("workers", "member-1"))
 	transactions.ApplySnapshot(&transaction.Snapshot{
-		ID: "tx-orders", State: transaction.StateCommitted,
-		Messages: []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
+		ID: "tx-orders", Producer: "producer", Revision: 2, State: transaction.StateCommitted,
+		Messages:  []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	})
 	fsm.mu.Lock()
 	fsm.producerState["orders"] = map[int]map[string]ProducerSequence{0: {"producer": {Seq: 3}}}
@@ -129,7 +132,7 @@ func TestBrokerFSMTopicDeleteReportsCommittedDeletionWhenLocalCleanupIsPending(t
 	fsm := NewBrokerFSM(manager, nil)
 	registerActiveBroker(t, fsm, "broker-1")
 
-	create, err := json.Marshal(TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()})
+	create, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 	require.Nil(t, fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 1}))
 
@@ -152,7 +155,7 @@ func TestBrokerFSMLifecycleDependencyCleanupRunsAfterCommitAndReconciles(t *test
 		fsm := NewBrokerFSM(manager, groupCoordinator)
 		fsm.SetTransactionManager(transaction.NewManager())
 		registerLifecycleBroker(t, fsm, "broker-1", TopicLifecycleProtocolVersion)
-		create, err := json.Marshal(TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()})
+		create, err := json.Marshal(testTopicCommand("orders", 1, 1))
 		require.NoError(t, err)
 		require.Nil(t, fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 2}))
 		require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
@@ -214,10 +217,11 @@ func TestBrokerFSMCreateWaitsForStaleLifecycleCleanup(t *testing.T) {
 
 	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
 	transactions.ApplySnapshot(&transaction.Snapshot{
-		ID: "tx-orders", State: transaction.StateCommitted,
-		Messages: []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
+		ID: "tx-orders", Producer: "producer", Revision: 1, State: transaction.StateCommitted,
+		Messages:  []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	})
-	create, err := json.Marshal(TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()})
+	create, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 	result := fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 2})
 	require.ErrorContains(t, result.(error), "lifecycle cleanup is pending")
@@ -239,7 +243,7 @@ func TestBrokerFSMTopicTruncateResetsStateAndFencesOldLifecycle(t *testing.T) {
 	fsm.SetTransactionManager(transactions)
 	registerLifecycleBroker(t, fsm, "broker-1", TopicLifecycleProtocolVersion)
 
-	create, err := json.Marshal(TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()})
+	create, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 	require.Nil(t, fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 2}))
 
@@ -256,9 +260,10 @@ func TestBrokerFSMTopicTruncateResetsStateAndFencesOldLifecycle(t *testing.T) {
 	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
 	require.NoError(t, groupCoordinator.CommitOffset("workers", "orders", 0, oldLEO))
 	transactions.ApplySnapshot(&transaction.Snapshot{
-		ID: "tx-orders", State: transaction.StateCommitted,
-		Messages: []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
-		Offsets:  []transaction.OffsetOperation{{Topic: "orders", Group: "workers", Partition: 0, Offset: oldLEO}},
+		ID: "tx-orders", Producer: "producer", Revision: 1, State: transaction.StateCommitted,
+		Messages:  []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
+		Offsets:   []transaction.OffsetOperation{{Topic: "orders", Group: "workers", Partition: 0, Offset: oldLEO}},
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	})
 	fsm.mu.Lock()
 	metadataBefore := *fsm.partitionMetadata["orders-0"]
@@ -309,7 +314,7 @@ func TestBrokerFSMTopicTruncateResetsStateAndFencesOldLifecycle(t *testing.T) {
 	require.NoError(t, snapshot.Persist(&MockSnapshotSink{Writer: &encoded}))
 	var persisted BrokerFSMState
 	require.NoError(t, json.Unmarshal(encoded.Bytes(), &persisted))
-	require.Equal(t, 8, persisted.Version, "truncated lifecycle requires the epoch-aware snapshot format")
+	require.Equal(t, SnapshotVersionCurrent, persisted.Version, "truncated lifecycle requires the clean-bootstrap snapshot format")
 	restoredCfg := *cfg
 	restoredCfg.LogDir = t.TempDir()
 	restoredManager := topic.NewTopicManager(&restoredCfg, &MockHandlerProvider{}, nil)
@@ -375,7 +380,7 @@ func TestBrokerFSMTopicTruncateRejectsUnsafeClusterAndActiveState(t *testing.T) 
 		groupCoordinator := coordinator.NewCoordinator(context.Background(), cfg, manager)
 		fsm := NewBrokerFSM(manager, groupCoordinator)
 		registerLifecycleBroker(t, fsm, "broker-1", lifecycleProtocol)
-		create, err := json.Marshal(TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()})
+		create, err := json.Marshal(testTopicCommand("orders", 1, 1))
 		require.NoError(t, err)
 		require.Nil(t, fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 2}))
 		return fsm, manager, groupCoordinator
@@ -419,7 +424,7 @@ func TestBrokerFSMTopicUpdateSupersedesPendingTruncateMaterialization(t *testing
 	fsm := NewBrokerFSM(manager, nil)
 	registerLifecycleBroker(t, fsm, "broker-1", TopicLifecycleProtocolVersion)
 
-	create, err := json.Marshal(TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()})
+	create, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 	require.Nil(t, fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 2}))
 
@@ -433,7 +438,10 @@ func TestBrokerFSMTopicUpdateSupersedesPendingTruncateMaterialization(t *testing
 	provider.fail = false
 	policy := topic.DefaultPolicy()
 	policy.RetentionHours = 24
-	update, err := json.Marshal(TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: policy})
+	retentionHours := policy.RetentionHours
+	updateCommand := testTopicCommand("orders", 1, 1)
+	updateCommand.Patch = &topic.DefinitionPatch{RetentionHours: &retentionHours}
+	update, err := json.Marshal(updateCommand)
 	require.NoError(t, err)
 	require.Nil(t, fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(update)), Index: 4}))
 

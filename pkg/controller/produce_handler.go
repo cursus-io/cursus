@@ -14,6 +14,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/ackpolicy"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/metrics"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -116,7 +117,7 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 			return
 		}
 		result := "success"
-		if strings.HasPrefix(response, "ERROR:") {
+		if protocol.IsErrorResponse(response) {
 			result = "failure"
 		}
 		metrics.PublishAcknowledgements.WithLabelValues(string(ackSelection.Mode), result).Inc()
@@ -550,7 +551,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			return
 		}
 		result := "success"
-		if strings.HasPrefix(response, "ERROR:") || returnErr != nil {
+		if protocol.IsErrorResponse(response) || returnErr != nil {
 			result = "failure"
 		}
 		metrics.PublishAcknowledgements.WithLabelValues(string(ackSelection.Mode), result).Inc()

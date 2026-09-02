@@ -4,11 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cursus-io/cursus/pkg/wire"
 )
 
 const transactionCommandTimeout = 10 * time.Second
@@ -217,19 +218,15 @@ func buildSendOffsetsToTransactionCommand(transactionalID, producerID, topic, gr
 		return "", fmt.Errorf("transaction offsets must not be empty")
 	}
 
-	partitions := make([]int, 0, len(offsets))
-	for partition := range offsets {
-		if partition < 0 {
-			return "", fmt.Errorf("transaction offset partition must be non-negative: %d", partition)
-		}
-		partitions = append(partitions, partition)
+	pairs := make([]wire.OffsetPair, 0, len(offsets))
+	for partition, offset := range offsets {
+		pairs = append(pairs, wire.OffsetPair{Partition: partition, Offset: offset})
 	}
-	sort.Ints(partitions)
-	pairs := make([]string, 0, len(partitions))
-	for _, partition := range partitions {
-		pairs = append(pairs, fmt.Sprintf("P%d:%d", partition, offsets[partition]))
+	encodedOffsets, err := wire.EncodeOffsetPairs(pairs)
+	if err != nil {
+		return "", err
 	}
-	return fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=%s producerId=%s epoch=%d topic=%s group=%s member=%s generation=%d %s", transactionalID, producerID, epoch, topic, group, member, generation, strings.Join(pairs, ",")), nil
+	return fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=%s producerId=%s epoch=%d topic=%s group=%s member=%s generation=%d offsets=%s", transactionalID, producerID, epoch, topic, group, member, generation, encodedOffsets), nil
 }
 
 func (c *ConsumerClient) EndTransaction(transactionalID, producerID string, epoch int64, commit bool) error {
@@ -245,8 +242,7 @@ func (c *ConsumerClient) EndTransaction(transactionalID, producerID string, epoc
 	return err
 }
 
-// TransactionStatus preserves the original raw response API for compatibility.
-func (c *ConsumerClient) TransactionStatus(transactionalID string) (string, error) {
+func (c *ConsumerClient) transactionStatus(transactionalID string) (string, error) {
 	if err := validateTransactionToken("transactional ID", transactionalID); err != nil {
 		return "", err
 	}
@@ -255,7 +251,7 @@ func (c *ConsumerClient) TransactionStatus(transactionalID string) (string, erro
 
 // DescribeTransaction returns the broker transaction status as typed fields.
 func (c *ConsumerClient) DescribeTransaction(transactionalID string) (TransactionStatusInfo, error) {
-	resp, err := c.TransactionStatus(transactionalID)
+	resp, err := c.transactionStatus(transactionalID)
 	if err != nil {
 		return TransactionStatusInfo{}, err
 	}
@@ -355,7 +351,7 @@ func executeTransactionCommand(conn net.Conn, cmd string) (string, error) {
 	if err := conn.SetDeadline(time.Now().Add(transactionCommandTimeout)); err != nil {
 		return "", fmt.Errorf("set transaction command deadline: %w", err)
 	}
-	if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
+	if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 		return "", fmt.Errorf("send transaction command: %w", err)
 	}
 	resp, err := ReadWithLength(conn)
@@ -363,9 +359,6 @@ func executeTransactionCommand(conn net.Conn, cmd string) (string, error) {
 		return "", fmt.Errorf("read transaction response: %w", err)
 	}
 	respStr := strings.TrimSpace(string(resp))
-	if brokerErr, ok := ParseBrokerError(respStr); ok {
-		return "", brokerErr
-	}
 	if _, err := parseOKResponse(respStr); err != nil {
 		return "", fmt.Errorf("unexpected transaction response: %s", respStr)
 	}

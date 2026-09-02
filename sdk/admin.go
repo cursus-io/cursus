@@ -26,19 +26,19 @@ type AdminConfig struct {
 	Principal string `yaml:"principal" json:"principal"`
 	AuthToken string `yaml:"auth_token" json:"auth_token"`
 
-	ProtocolVersion              int      `yaml:"protocol_version" json:"protocol_version"`
-	ProtocolFeatures             []string `yaml:"protocol_features" json:"protocol_features"`
-	RequireProtocolFeatures      bool     `yaml:"require_protocol_features" json:"require_protocol_features"`
-	ProtocolNegotiationTimeoutMS int      `yaml:"protocol_negotiation_timeout_ms" json:"protocol_negotiation_timeout_ms"`
+	HandshakeTimeoutMS int    `yaml:"handshake_timeout_ms" json:"handshake_timeout_ms"`
+	CompressionType    string `yaml:"compression_type" json:"compression_type"`
 }
 
 // NewDefaultAdminConfig returns conservative defaults for a local broker.
 func NewDefaultAdminConfig() *AdminConfig {
 	return &AdminConfig{
-		BrokerAddrs:      []string{"localhost:9000"},
-		MaxRetries:       3,
-		RetryBackoffMS:   100,
-		RequestTimeoutMS: 5000,
+		BrokerAddrs:        []string{"localhost:9000"},
+		MaxRetries:         3,
+		RetryBackoffMS:     100,
+		RequestTimeoutMS:   5000,
+		HandshakeTimeoutMS: 5000,
+		CompressionType:    "none",
 	}
 }
 
@@ -77,7 +77,7 @@ type TopicDefinition struct {
 }
 
 // DeleteTopicOptions controls the explicit idempotency contract for deletion.
-// IfExists=false preserves the legacy topic_not_found error.
+// IfExists=false reports topic_not_found when the topic does not exist.
 type DeleteTopicOptions struct {
 	IfExists bool
 }
@@ -137,6 +137,12 @@ func NewAdminClient(config *AdminConfig) (*AdminClient, error) {
 	if len(config.BrokerAddrs) == 0 {
 		return nil, fmt.Errorf("no broker addresses available")
 	}
+	if err := validateWireClientSettings(config.CompressionType, config.Principal, config.AuthToken); err != nil {
+		return nil, err
+	}
+	if err := validateTLSFiles(config.UseTLS, config.TLSCertPath, config.TLSKeyPath); err != nil {
+		return nil, err
+	}
 	if config.MaxRetries < 0 {
 		return nil, fmt.Errorf("max retries must be non-negative")
 	}
@@ -148,9 +154,11 @@ func NewAdminClient(config *AdminConfig) (*AdminClient, error) {
 
 	client := &AdminClient{config: *config}
 	client.config.BrokerAddrs = append([]string(nil), config.BrokerAddrs...)
-	client.config.ProtocolFeatures = append([]string(nil), config.ProtocolFeatures...)
 	if client.config.RequestTimeoutMS <= 0 {
 		client.config.RequestTimeoutMS = 5000
+	}
+	if client.config.HandshakeTimeoutMS < 0 {
+		return nil, fmt.Errorf("handshake timeout must not be negative")
 	}
 	if client.config.RetryBackoffMS < 0 {
 		return nil, fmt.Errorf("retry backoff must be non-negative")
@@ -286,11 +294,25 @@ func (c *AdminClient) execute(ctx context.Context, command string, retryAmbiguou
 }
 
 func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (string, error) {
-	conn, err := c.dial(ctx, addr)
+	conn, err := dialAuthenticatedWireConnection(
+		ctx, addr, time.Duration(c.config.RequestTimeoutMS)*time.Millisecond,
+		c.config.HandshakeTimeoutMS, c.config.CompressionType, c.tlsConfig,
+		c.config.Principal, c.config.AuthToken,
+	)
 	if err != nil {
-		return "", err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		var brokerErr *BrokerError
+		if errors.As(err, &brokerErr) {
+			return "", brokerErr
+		}
+		if isRetryableAdminTransportError(err) {
+			return "", err
+		}
+		return "", &terminalAdminError{err: err}
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	deadline := time.Now().Add(time.Duration(c.config.RequestTimeoutMS) * time.Millisecond)
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
@@ -302,36 +324,10 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
 	defer stopCancellation()
 
-	if err := negotiateConfiguredProtocol(conn, c.config.ProtocolVersion, c.config.ProtocolFeatures, c.config.RequireProtocolFeatures, c.config.ProtocolNegotiationTimeoutMS); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
-		}
-		var brokerErr *BrokerError
-		if errors.As(err, &brokerErr) {
-			return "", brokerErr
-		}
-		if isRetryableAdminTransportError(err) {
-			return "", fmt.Errorf("protocol negotiation with %s: %w", addr, err)
-		}
-		return "", &terminalAdminError{err: fmt.Errorf("protocol negotiation with %s: %w", addr, err)}
-	}
-	if err := authenticateConfiguredClient(conn, c.config.Principal, c.config.AuthToken); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
-		}
-		var brokerErr *BrokerError
-		if errors.As(err, &brokerErr) {
-			return "", brokerErr
-		}
-		if isRetryableAdminTransportError(err) {
-			return "", fmt.Errorf("authentication with %s: %w", addr, err)
-		}
-		return "", &terminalAdminError{err: fmt.Errorf("authentication with %s: %w", addr, err)}
-	}
 	if err := conn.SetDeadline(deadline); err != nil {
 		return "", fmt.Errorf("restore admin request deadline: %w", err)
 	}
-	if err := WriteWithLength(conn, EncodeMessage("admin", command)); err != nil {
+	if err := WriteWithLength(conn, []byte(command)); err != nil {
 		return "", &ambiguousAdminError{err: fmt.Errorf("send admin command to %s: %w", addr, err)}
 	}
 	response, err := ReadWithLength(conn)
@@ -339,12 +335,13 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
 		}
+		var brokerErr *BrokerError
+		if errors.As(err, &brokerErr) {
+			return "", brokerErr
+		}
 		return "", &ambiguousAdminError{err: fmt.Errorf("read admin response from %s: %w", addr, err)}
 	}
 	value := strings.TrimSpace(string(response))
-	if brokerErr, ok := ParseBrokerError(value); ok {
-		return "", brokerErr
-	}
 	if !hasOKStatus(value) {
 		return "", &terminalAdminError{err: fmt.Errorf("unexpected admin response: %s", value)}
 	}
@@ -360,28 +357,6 @@ func isRetryableAdminTransportError(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr)
-}
-
-func (c *AdminClient) dial(ctx context.Context, addr string) (net.Conn, error) {
-	timeout := time.Duration(c.config.RequestTimeoutMS) * time.Millisecond
-	dialer := &net.Dialer{Timeout: timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("connect to %s: %w", addr, err)
-	}
-	if !c.config.UseTLS {
-		return conn, nil
-	}
-	if c.tlsConfig == nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("TLS enabled but certificate not loaded")
-	}
-	tlsConn := tls.Client(conn, c.tlsConfig.Clone())
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("TLS handshake with %s: %w", addr, err)
-	}
-	return tlsConn, nil
 }
 
 func buildAdminCreateTopicCommand(topic string, patch TopicDefinitionPatch) (string, error) {
@@ -514,11 +489,8 @@ func parseTopicDefinitionResponse(response string) (TopicDefinition, error) {
 	if definition.Revision, err = parseAdminUint64(fields, "revision"); err != nil {
 		return TopicDefinition{}, err
 	}
-	definition.LifecycleEpoch = 1
-	if _, present := fields["lifecycle_epoch"]; present {
-		if definition.LifecycleEpoch, err = parseAdminUint64(fields, "lifecycle_epoch"); err != nil {
-			return TopicDefinition{}, err
-		}
+	if definition.LifecycleEpoch, err = parseAdminUint64(fields, "lifecycle_epoch"); err != nil {
+		return TopicDefinition{}, err
 	}
 	if definition.Idempotent, err = parseAdminBool(fields, "idempotent"); err != nil {
 		return TopicDefinition{}, err

@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -48,6 +49,8 @@ type RaftStatus struct {
 type ISRManagerInterface interface {
 	HasQuorum(topic string, partition int, minISR int) bool
 	UpdateHeartbeat(brokerID string)
+	BuildCatchupProofs() []fsm.ISRCatchupProof
+	SubmitCatchupProofs(nodeID string, proofs []fsm.ISRCatchupProof) error
 	GetISR(topic string, partition int) []string
 	ComputeISR(topic string, partition int) []string
 	SetLeader(isLeader bool)
@@ -86,9 +89,12 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	}
 
 	dataDir := filepath.Join(cfg.LogDir, "raft")
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		util.Error("Failed to create raft data directory %s: %v", dataDir, err)
 		return nil, fmt.Errorf("failed to create raft data directory: %w", err)
+	}
+	if err := ensureRaftRecoveryFormat(dataDir); err != nil {
+		return nil, err
 	}
 
 	raftStore, err := newDurableRaftStore(dataDir)
@@ -177,6 +183,12 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 			util.Error("❌ Failed to get Raft configuration for node %s: %v", brokerID, confFuture.Error())
 		}
 	}
+	if err := awaitRecoveredPartitionReplay(ctx, r, raftStore, brokerFSM, brokerID, 30*time.Second); err != nil {
+		_ = r.Shutdown().Error()
+		_ = raftStore.Close()
+		_ = transport.Close()
+		return nil, err
+	}
 
 	rm := &RaftReplicationManager{
 		raft:      r,
@@ -195,6 +207,62 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	go rm.reconcileTopicMaterializations(ctx, 5*time.Second)
 
 	return rm, nil
+}
+
+func awaitRecoveredPartitionReplay(ctx context.Context, r *raft.Raft, logStore raft.LogStore, brokerFSM *fsm.BrokerFSM, brokerID string, timeout time.Duration) error {
+	if brokerFSM == nil || !brokerFSM.HasPendingPartitionRecovery() {
+		return nil
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		stats := r.Stats()
+		snapshotIndex, snapshotErr := strconv.ParseUint(stats["last_snapshot_index"], 10, 64)
+		commitIndex, commitErr := strconv.ParseUint(stats["commit_index"], 10, 64)
+		if snapshotErr == nil && commitErr == nil && commitIndex >= snapshotIndex {
+			target, err := highestFSMCommandIndex(logStore, snapshotIndex, commitIndex)
+			if err == nil && brokerFSM.AppliedIndex() >= target {
+				latestCommit, parseErr := strconv.ParseUint(r.Stats()["commit_index"], 10, 64)
+				if parseErr == nil && latestCommit == commitIndex {
+					if err := brokerFSM.FinalizeRecoveredPartitions(); err != nil {
+						return fmt.Errorf("finalize recovered partitions after Raft replay: %w", err)
+					}
+					if err := brokerFSM.ValidateLocalLeaderLogs(brokerID); err != nil {
+						return err
+					}
+					return nil
+				}
+			} else if err != nil && !errors.Is(err, raft.ErrLogNotFound) {
+				return fmt.Errorf("inspect committed Raft replay range: %w", err)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for recovered partition Raft replay: %w", ctx.Err())
+		case <-deadline.C:
+			return fmt.Errorf("timed out waiting for recovered partition Raft replay")
+		case <-ticker.C:
+		}
+	}
+}
+
+func highestFSMCommandIndex(logStore raft.LogStore, snapshotIndex, commitIndex uint64) (uint64, error) {
+	var target uint64
+	for index := snapshotIndex + 1; index <= commitIndex; index++ {
+		var entry raft.Log
+		if err := logStore.GetLog(index, &entry); err != nil {
+			return 0, err
+		}
+		if entry.Type == raft.LogCommand {
+			target = index
+		}
+	}
+	return target, nil
 }
 
 func buildRaftConfig(cfg *config.Config, brokerID string) (*raft.Config, error) {

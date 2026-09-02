@@ -6,6 +6,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -77,24 +78,13 @@ func TestCoordinator_Offsets(t *testing.T) {
 		assert.Equal(t, uint64(400), off1)
 	})
 
-	t.Run("ApplyOffsetUpdateFromFSM", func(t *testing.T) {
-		offsets := []OffsetItem{
-			{Partition: 0, Offset: 500},
-		}
-		err := c.ApplyOffsetUpdateFromFSM("group1", "topic1", offsets)
-		assert.NoError(t, err)
-
-		off, _ := c.GetOffset("group1", "topic1", 0)
-		assert.Equal(t, uint64(500), off)
-	})
-
 	t.Run("RejectLowerOffset", func(t *testing.T) {
-		err := c.CommitOffset("group1", "topic1", 0, 499)
+		err := c.CommitOffset("group1", "topic1", 0, 299)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "offset regression")
 
 		off, _ := c.GetOffset("group1", "topic1", 0)
-		assert.Equal(t, uint64(500), off)
+		assert.Equal(t, uint64(300), off)
 	})
 }
 
@@ -164,14 +154,14 @@ func (p *persistentOffsetLog) PublishWithAck(_ string, msg *types.Message) error
 
 func (p *persistentOffsetLog) ReadTopicPartition(_ string, partitionID int, offset uint64, max int) ([]types.Message, error) {
 	records := p.partitions[partitionID]
-	if int(offset) >= len(records) {
+	start, ok := util.SafeUint64ToInt(offset)
+	if !ok || start >= len(records) {
 		return nil, nil
 	}
-	end := int(offset) + max
+	end := start + max
 	if end > len(records) {
 		end = len(records)
 	}
-	start := int(offset)
 	out := make([]types.Message, end-start)
 	copy(out, records[start:end])
 	return out, nil
@@ -236,9 +226,6 @@ func TestCoordinatorRejectsMismatchedOffsetTopics(t *testing.T) {
 
 	require.ErrorContains(t, c.CommitOffset("group1", "topic2", 0, 1), "topic mismatch")
 	require.ErrorContains(t, c.CommitOffsetsBulk("group1", "topic2", []OffsetItem{{
-		Partition: 0, Offset: 1,
-	}}), "topic mismatch")
-	require.ErrorContains(t, c.ApplyOffsetUpdateFromFSM("group1", "topic2", []OffsetItem{{
 		Partition: 0, Offset: 1,
 	}}), "topic mismatch")
 	_, found := c.GetOffset("group1", "topic2", 0)

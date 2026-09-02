@@ -13,6 +13,7 @@ import (
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	replicationFSM "github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -36,6 +37,7 @@ func backoffDelay(attempt int, base time.Duration) time.Duration {
 		delay = 5 * time.Second
 	}
 	// Add jitter: ±25%
+	// #nosec G404 -- reconnect jitter is not security-sensitive randomness.
 	jitter := time.Duration(rand.Int63n(int64(delay)/2)) - delay/4
 	return delay + jitter
 }
@@ -52,14 +54,7 @@ func (ch *CommandHandler) hasRouter() bool {
 
 func (ch *CommandHandler) ProcessCommand(cmd string) string {
 	ctx := NewInternalClientContext("default-group", 0)
-
-	// Forwarded commands arrive wrapped in a binary envelope
-	// (2-byte topic length + topic + payload). Decode it first.
-	if _, payload, err := util.DecodeMessage([]byte(cmd)); err == nil {
-		cmd = strings.TrimSpace(payload)
-	}
-
-	return ch.HandleCommand(cmd, ctx)
+	return ch.HandleCommand(strings.TrimSpace(cmd), ctx)
 }
 
 func (ch *CommandHandler) isAuthorizedForPartition(topic string, partition int) bool {
@@ -113,10 +108,9 @@ func (ch *CommandHandler) isLeaderAndForwardContext(ctx context.Context, cmd str
 			return "ERROR: router_not_available", true, nil
 		}
 
-		encodedCmd := util.EncodeMessage("", cmd)
 		var lastErr error
 		for i := 0; i < maxRetries; i++ {
-			resp, err := ch.Cluster.Router.ForwardToLeader(string(encodedCmd))
+			resp, err := ch.Cluster.Router.ForwardToLeader(cmd)
 			if err == nil {
 				return resp, true, nil
 			}
@@ -265,8 +259,7 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 		}
 	}
 
-	encodedCmd := util.EncodeMessage("", findCmd)
-	resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, string(encodedCmd))
+	resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, findCmd)
 	if fwdErr == nil && strings.HasPrefix(resp, "OK") {
 		host, port := "", 0
 		for _, part := range strings.Fields(resp) {
@@ -316,14 +309,12 @@ func (ch *CommandHandler) isPartitionLeaderAndForwardContext(ctx context.Context
 
 	const maxRetries = 3
 
-	encodedCmd := util.EncodeMessage("", cmd)
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
-		resp, err := ch.Cluster.Router.ForwardToPartitionLeader(topic, partition, string(encodedCmd))
+		resp, err := ch.Cluster.Router.ForwardToPartitionLeader(topic, partition, cmd)
 		if err == nil {
-			const legacyNotLeaderPrefix = "ERROR:" + " not the partition leader"
-			isLeaderRedirect := strings.HasPrefix(resp, "ERROR: NOT_LEADER") ||
-				strings.HasPrefix(resp, legacyNotLeaderPrefix)
+			code, isError := protocol.ErrorCode(resp)
+			isLeaderRedirect := isError && strings.EqualFold(code, "NOT_LEADER")
 			if !isLeaderRedirect {
 				return resp, true, nil
 			}
@@ -349,29 +340,20 @@ func (ch *CommandHandler) resolvePartitionLeaderAddr(topicName string, partition
 
 	fsmRef := ch.Cluster.RaftManager.GetFSM()
 	if fsmRef == nil {
-		return ch.fallbackClientAddr()
+		return ""
 	}
 
 	partitionKey := fmt.Sprintf("%s-%d", topicName, partitionID)
 	meta := fsmRef.GetPartitionMetadata(partitionKey)
 	if meta == nil {
-		return ch.fallbackClientAddr()
+		return ""
 	}
 
 	broker := fsmRef.GetBroker(meta.Leader)
 	if broker == nil {
-		return ch.fallbackClientAddr()
+		return ""
 	}
-
-	if broker.ClientAddr != "" {
-		return broker.ClientAddr
-	}
-
-	// Legacy fallback: derive from Raft addr
-	if h, _, err := net.SplitHostPort(broker.Addr); err == nil {
-		return fmt.Sprintf("%s:%d", h, ch.Cluster.Router.ClientPort())
-	}
-	return ch.fallbackClientAddr()
+	return broker.ClientAddr
 }
 
 func (ch *CommandHandler) fallbackClientAddr() string {
@@ -446,18 +428,17 @@ func (ch *CommandHandler) applyViaLeaderContext(ctx context.Context, cmdType str
 	}
 
 	forwardCmd := fmt.Sprintf("RAFT_APPLY %stype=%s payload=%s", ch.internalAuthPrefix(), cmdType, string(data))
-	encodedCmd := util.EncodeMessage("", forwardCmd)
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
-	resp, fwdErr := ch.Cluster.Router.ForwardToLeader(string(encodedCmd))
+	resp, fwdErr := ch.Cluster.Router.ForwardToLeader(forwardCmd)
 	if fwdErr != nil {
 		return nil, fmt.Errorf("forward raft apply to leader: %w", fwdErr)
 	}
-	if strings.HasPrefix(resp, "ERROR") {
-		if wireErrorCode(resp) == "PARTITION_LEADER_FENCED" {
+	if code, isError := protocol.ErrorCode(resp); isError {
+		if strings.EqualFold(code, "PARTITION_LEADER_FENCED") {
 			return nil, fmt.Errorf("%w: remote partition commit rejected", clusterController.ErrPartitionLeaderFenced)
 		}
 		return nil, fmt.Errorf("leader raft apply: %s", resp)
@@ -466,11 +447,11 @@ func (ch *CommandHandler) applyViaLeaderContext(ctx context.Context, cmdType str
 }
 
 func wireErrorCode(response string) string {
-	fields := strings.Fields(strings.TrimSpace(response))
-	if len(fields) < 2 || !strings.EqualFold(fields[0], "ERROR:") {
+	code, ok := protocol.ErrorCode(response)
+	if !ok {
 		return ""
 	}
-	return strings.ToUpper(fields[1])
+	return strings.ToUpper(code)
 }
 
 func (ch *CommandHandler) applyAndWait(cmdType string, payload map[string]interface{}) (interface{}, error) {
@@ -564,16 +545,7 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshot(topicName string, parti
 		return fail(fmt.Errorf("insufficient_in_sync_replicas current=%d required=%d", len(snapshot.ISR), requiredISR))
 	}
 	if !metadata.CommittedHWMKnown {
-		// Pre-watermark metadata treated the durable local tail as committed on
-		// restart. Preserve that compatibility boundary exactly once, but make
-		// it authoritative through the current leader epoch before any new
-		// acknowledgement mode can append beyond it.
-		legacyHWM := p.GetHWM()
-		if err := ch.commitPartitionHWMAtEpoch(topicName, partitionID, legacyHWM, snapshot.Leader, snapshot.LeaderEpoch, snapshot.LifecycleEpoch); err != nil {
-			return fail(fmt.Errorf("migrate legacy committed HWM: %w", err))
-		}
-		metadata.CommittedHWM = legacyHWM
-		metadata.CommittedHWMKnown = true
+		return fail(fmt.Errorf("partition committed HWM is not initialized; clean bootstrap required"))
 	}
 	key := fmt.Sprintf("%s-%d", topicName, partitionID)
 	wantedFence := partitionLeadershipFence{leader: snapshot.Leader, epoch: snapshot.LeaderEpoch}
@@ -600,8 +572,8 @@ func (ch *CommandHandler) partitionPreparationErrorResponse(err error) string {
 
 // preparePartitionReplica serializes a follower append with local leadership
 // changes. The first request for a new leader epoch discards any tail beyond
-// the Raft-authoritative committed HWM before accepting offsets from that
-// leader.
+// the Raft-authoritative committed HWM. A replica below that boundary remains
+// fenced to the same leader but is allowed to receive contiguous backfill.
 func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID int, p *topic.Partition, leader string, leaderEpoch int) (func(), error) {
 	writeLock := ch.partitionWriteLock(topicName, partitionID)
 	writeLock.Lock()
@@ -633,7 +605,7 @@ func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID 
 	}
 	metadataLifecycleEpoch := metadata.LifecycleEpoch
 	if metadataLifecycleEpoch == 0 {
-		metadataLifecycleEpoch = topic.InitialLifecycleEpoch
+		return fail(fmt.Errorf("partition lifecycle epoch is not initialized; clean bootstrap required"))
 	}
 	if pTopic := ch.TopicManager.GetTopic(topicName); pTopic == nil {
 		return fail(fmt.Errorf("topic lifecycle pending or topic not found"))
@@ -641,16 +613,18 @@ func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID 
 		return fail(fmt.Errorf("stale topic lifecycle epoch: current=%d local=%d", metadataLifecycleEpoch, pTopic.LifecycleEpoch))
 	}
 	if !metadata.CommittedHWMKnown {
-		return fail(fmt.Errorf("partition committed HWM is not known; wait for the current leader to migrate legacy metadata"))
+		return fail(fmt.Errorf("partition committed HWM is not initialized; clean bootstrap required"))
 	}
 	key := fmt.Sprintf("%s-%d", topicName, partitionID)
 	wantedFence := partitionLeadershipFence{leader: leader, epoch: leaderEpoch}
 	preparedFence, prepared := ch.partitionPreparedEpochs.Load(key)
 	if !prepared || preparedFence.(partitionLeadershipFence) != wantedFence {
-		if err := p.ReconcileCommittedHWM(metadata.CommittedHWM); err != nil {
-			return fail(fmt.Errorf("partition is not ready for replica append: %w", err))
+		if p.NextOffset() >= metadata.CommittedHWM {
+			if err := p.ReconcileCommittedHWM(metadata.CommittedHWM); err != nil {
+				return fail(fmt.Errorf("partition is not ready for replica append: %w", err))
+			}
+			p.FlushDisk()
 		}
-		p.FlushDisk()
 		ch.partitionPreparedEpochs.Store(key, wantedFence)
 	}
 	return release, nil

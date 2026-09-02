@@ -25,9 +25,9 @@ func TestInspectStandaloneStorageRequiresValidCompactionMarkerForSegmentGaps(t *
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
-			writeMigrationSegment(t, root, "orders", 0, 0, []types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 0}})
-			writeMigrationSegment(t, root, "orders", 0, 2, []types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 2}})
-			writeMigrationSegment(t, root, "orders", 0, 3, []types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 3}})
+			writePersistedTestSegment(t, root, "orders", 0, 0, []types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 0}})
+			writePersistedTestSegment(t, root, "orders", 0, 2, []types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 2}})
+			writePersistedTestSegment(t, root, "orders", 0, 3, []types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 3}})
 			if test.markerContent != "" {
 				logPath := filepath.Join(root, "orders", "partition_0_segment_00000000000000000002.log")
 				info, err := os.Stat(logPath)
@@ -61,13 +61,4 @@ func TestInspectStandaloneStorageReportsTruncatedRecord(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, inventory.Problems, 1)
 	require.Contains(t, inventory.Problems[0].Message, "truncated record payload")
-}
-
-func TestCreateStandaloneManifestRejectsPartitionIDsThatDoNotStartAtZero(t *testing.T) {
-	root := t.TempDir()
-	writeMigrationSegment(t, root, "orders", 1, 0, nil)
-
-	_, err := CreateStandaloneManifest(root, []Definition{{Name: "orders", Partitions: 1, Policy: DefaultPolicy()}}, false)
-	require.ErrorContains(t, err, "not contiguous from zero")
-	require.NoFileExists(t, filepath.Join(root, TopicMetadataFileName))
 }

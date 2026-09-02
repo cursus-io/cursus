@@ -23,6 +23,13 @@ func SafeIntToUint32(v int) (uint32, bool) {
 	return uint32(v), true // #nosec G115
 }
 
+func SafeIntToUint64(v int) (uint64, bool) {
+	if v < 0 {
+		return 0, false
+	}
+	return uint64(v), true // #nosec G115
+}
+
 func SafeIntToInt32(v int) (int32, bool) {
 	if v < math.MinInt32 || v > math.MaxInt32 {
 		return 0, false

@@ -13,6 +13,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
+	"github.com/stretchr/testify/require"
 )
 
 type MockStorageHandler struct{}
@@ -51,10 +52,8 @@ type MockCommandApplier struct {
 }
 
 func (m *MockCommandApplier) ApplyCommand(prefix string, data []byte) error {
-	if prefix == "PARTITION" {
-		// ISRManager now passes "TOPIC-PARTITION:JSON" as data
-		// RaftReplicationManager adds "PARTITION:" prefix
-		fullData := fmt.Sprintf("PARTITION:%s", string(data))
+	if prefix == "PARTITION" || prefix == "ISR_CATCHUP" {
+		fullData := fmt.Sprintf("%s:%s", prefix, string(data))
 		result := m.fsm.Apply(&raft.Log{Data: []byte(fullData)})
 		if err, ok := result.(error); ok {
 			return err
@@ -63,6 +62,64 @@ func (m *MockCommandApplier) ApplyCommand(prefix string, data []byte) error {
 	return nil
 }
 func (m *MockCommandApplier) IsLeader() bool { return m.IsLeaderResult }
+
+func TestISRManager_SubmitCatchupProofsFencesIdentityAndAppliesOnLeader(t *testing.T) {
+	identityBefore := isrProofMetricValue(ISRProofOutcomeRejected, ISRProofReasonIdentityMismatch)
+	appliedBefore := isrProofMetricValue(ISRProofOutcomeAccepted, ISRProofReasonApplied)
+	alreadyBefore := isrProofMetricValue(ISRProofOutcomeAccepted, ISRProofReasonAlreadyInISR)
+	cfg := &config.Config{LogDir: t.TempDir()}
+	tm := topic.NewTopicManager(cfg, &FakeHandlerProvider{}, nil)
+	brokerFSM := fsm.NewBrokerFSM(tm, nil)
+	for _, id := range []string{"node1", "node2"} {
+		data, err := json.Marshal(fsm.BrokerInfo{ID: id, Status: "active"})
+		require.NoError(t, err)
+		require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte("REGISTER:" + string(data))}))
+	}
+	definition := topic.DefaultDefinition("orders", nil)
+	definition.Partitions = 1
+	definition.ReplicationFactor = 2
+	command, err := json.Marshal(fsm.TopicCommand{Definition: &definition, LeaderID: "node1"})
+	require.NoError(t, err)
+	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte("TOPIC:" + string(command))}))
+
+	metadata := brokerFSM.GetPartitionMetadata("orders-0")
+	metadata.ISR = []string{"node1"}
+	metadata.LeaderEpoch = 3
+	metadataData, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + string(metadataData))}))
+
+	proof := fsm.ISRCatchupProof{
+		Topic: "orders", Partition: 0, BrokerID: "node2",
+		CommittedHWM: 0, LocalLEO: 0, LocalHWM: 0,
+		LeaderEpoch: 3, LifecycleEpoch: topic.InitialLifecycleEpoch,
+	}
+	applier := &MockCommandApplier{IsLeaderResult: true, fsm: brokerFSM}
+	manager := NewISRManager(context.Background(), brokerFSM, "node1", time.Second, applier)
+
+	manager.UpdateHeartbeat("node1")
+	manager.UpdateHeartbeat("node2")
+	manager.ComputeISR("orders", 0)
+	require.Equal(t, []string{"node1"}, brokerFSM.GetPartitionMetadata("orders-0").ISR,
+		"heartbeat liveness alone must not re-admit a replica")
+	require.Error(t, manager.SubmitCatchupProofs("node1", []fsm.ISRCatchupProof{proof}))
+	require.Equal(t, []string{"node1"}, brokerFSM.GetPartitionMetadata("orders-0").ISR)
+	require.NoError(t, manager.SubmitCatchupProofs("node2", []fsm.ISRCatchupProof{proof}))
+	require.Equal(t, metadata.Replicas, brokerFSM.GetPartitionMetadata("orders-0").ISR)
+	require.NoError(t, manager.SubmitCatchupProofs("node2", []fsm.ISRCatchupProof{proof}))
+	require.Equal(t, identityBefore+1, isrProofMetricValue(ISRProofOutcomeRejected, ISRProofReasonIdentityMismatch))
+	require.Equal(t, appliedBefore+1, isrProofMetricValue(ISRProofOutcomeAccepted, ISRProofReasonApplied))
+	require.Equal(t, alreadyBefore+1, isrProofMetricValue(ISRProofOutcomeAccepted, ISRProofReasonAlreadyInISR))
+}
+
+func isrProofMetricValue(outcome, reason string) uint64 {
+	for _, metric := range ISRProofMetrics() {
+		if metric.Outcome == outcome && metric.Reason == reason {
+			return metric.Count
+		}
+	}
+	return 0
+}
 
 func TestISRManager_Quorum(t *testing.T) {
 	cfg := &config.Config{LogDir: t.TempDir()}
@@ -86,11 +143,9 @@ func TestISRManager_Quorum(t *testing.T) {
 		}
 	}
 
-	topicPayload := map[string]interface{}{
-		"name":       topicName,
-		"partitions": 1,
-		"leader_id":  "node1",
-	}
+	topicDefinition := topic.DefaultDefinition(topicName, nil)
+	topicDefinition.Partitions = 1
+	topicPayload := fsm.TopicCommand{Definition: &topicDefinition, LeaderID: "node1"}
 	topicData, err := json.Marshal(topicPayload)
 	if err != nil {
 		t.Fatalf("failed to marshal topic payload: %v", err)
@@ -109,6 +164,7 @@ func TestISRManager_Quorum(t *testing.T) {
 		Replicas:       []string{"node1", "node2", "node3"},
 		ISR:            []string{"node1", "node2", "node3"},
 		PartitionCount: 1,
+		LifecycleEpoch: topic.InitialLifecycleEpoch,
 	}
 	metaData, err := json.Marshal(partitionMetadata)
 	if err != nil {
@@ -178,6 +234,7 @@ func TestISRManager_ReplicaSubset(t *testing.T) {
 		Replicas:       []string{"node1", "node3", "node5"},
 		ISR:            []string{"node1", "node3", "node5"},
 		PartitionCount: 1,
+		LifecycleEpoch: topic.InitialLifecycleEpoch,
 	}
 	metaData, _ := json.Marshal(meta)
 	brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("PARTITION:%s:%s", key, metaData))})
@@ -235,10 +292,11 @@ func TestISRManager_UncleanLeaderElection(t *testing.T) {
 
 	key := "topic-0"
 	meta := fsm.PartitionMetadata{
-		Leader:      "node1",
-		Replicas:    []string{"node1", "node2", "node3"},
-		ISR:         []string{"node1"},
-		LeaderEpoch: 1,
+		Leader:         "node1",
+		Replicas:       []string{"node1", "node2", "node3"},
+		ISR:            []string{"node1"},
+		LeaderEpoch:    1,
+		LifecycleEpoch: topic.InitialLifecycleEpoch,
 	}
 	metaData, _ := json.Marshal(meta)
 	brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("PARTITION:%s:%s", key, metaData))})

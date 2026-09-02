@@ -1,9 +1,9 @@
 package producer
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"sort"
 	"strings"
@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/publisher/bench"
 	"github.com/cursus-io/cursus/test/publisher/config"
 	"github.com/cursus-io/cursus/util"
@@ -75,6 +76,18 @@ type Publisher struct {
 }
 
 func NewPublisher(cfg *config.PublisherConfig) (*Publisher, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("publisher config must not be nil")
+	}
+	if cfg.Partitions <= 0 || cfg.Partitions > math.MaxInt32 {
+		return nil, fmt.Errorf("partitions must be between 1 and %d", math.MaxInt32)
+	}
+	if cfg.BatchSize <= 0 {
+		return nil, fmt.Errorf("batch size must be positive")
+	}
+	if len(cfg.BrokerAddrs) == 0 {
+		return nil, fmt.Errorf("at least one broker address is required")
+	}
 	p := &Publisher{
 		config:       cfg,
 		producer:     NewProducerClient(cfg.Partitions, cfg),
@@ -125,7 +138,10 @@ func NewPublisher(cfg *config.PublisherConfig) (*Publisher, error) {
 }
 
 func (p *Publisher) nextPartition() int {
-	idx := int((atomic.AddUint32(&p.rr, 1) - 1) % uint32(p.partitions))
+	// #nosec G115 -- NewPublisher restricts partitions to 1..math.MaxInt32.
+	partitionCount := uint32(p.partitions)
+	// #nosec G115 -- modulo guarantees the result fits the validated int partition count.
+	idx := int((atomic.AddUint32(&p.rr, 1) - 1) % partitionCount)
 	return idx
 }
 
@@ -135,24 +151,26 @@ func (p *Publisher) CreateTopic(topic string, partitions int) error {
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	defer func() { _ = conn.Close() }()
+	framed, err := wire.NewClientConn(conn, p.config.CompressionType)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("wire v2 handshake: %w", err)
+	}
+	defer func() { _ = framed.Close() }()
 
 	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, partitions, p.config.EnableIdempotence)
-	cmdBytes := util.EncodeMessage("admin", createCmd)
+	cmdBytes := []byte(createCmd)
 
-	if err := util.WriteWithLength(conn, cmdBytes); err != nil {
+	if err := util.WriteWithLength(framed, cmdBytes); err != nil {
 		return fmt.Errorf("send command: %w", err)
 	}
 
-	resp, err := util.ReadWithLength(conn)
+	resp, err := util.ReadWithLength(framed)
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return fmt.Errorf("broker error: %s", respStr)
-	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return fmt.Errorf("unexpected create response: %s", respStr)
 	}
@@ -327,19 +345,9 @@ func (p *Publisher) sendBatch(part int, batch []types.Message) {
 		return
 	}
 
-	payload, err := util.CompressMessage(data, p.config.CompressionType)
-	if err != nil {
-		util.Error("compress batch failed: %v", err)
-		p.cleanupBatchState(part, batchID)
-		p.handleSendFailure(part, batch)
-		return
-	}
-
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
-	payload = append(lenBuf, payload...)
-
-	ackResp, err := p.sendWithRetry(payload, part)
+	// The negotiated Wire v2 connection owns framing and compression. Sending a
+	// second length prefix or pre-compressing here corrupts the canonical frame.
+	ackResp, err := p.sendWithRetry(data, part)
 	if err != nil {
 		util.Error("send failed: %v", err)
 		p.cleanupBatchState(part, batchID)
@@ -347,6 +355,7 @@ func (p *Publisher) sendBatch(part int, batch []types.Message) {
 		return
 	}
 
+	// #nosec G115 -- slice length is non-negative and int fits in uint64.
 	p.attemptsCount.Add(uint64(len(batch)))
 
 	switch ackResp.Status {
@@ -463,7 +472,7 @@ func (p *Publisher) sendWithRetry(payload []byte, part int) (*types.AckResponse,
 			continue
 		}
 
-		if _, err := conn.Write(payload); err != nil {
+		if err := util.WriteWithLength(conn, payload); err != nil {
 			lastErr = fmt.Errorf("write failed: %w", err)
 			brokerAddr := p.producer.selectBroker()
 			_ = p.producer.ReconnectPartition(part, brokerAddr, p.config.UseTLS, p.config.TLSCertPath, p.config.TLSKeyPath)
@@ -501,6 +510,10 @@ func (p *Publisher) sendWithRetry(payload []byte, part int) (*types.AckResponse,
 }
 
 func (p *Publisher) markBatchAckedByID(part int, batchID string, batchLen int) {
+	if batchLen < 0 {
+		util.Error("refusing negative acknowledged batch length %d", batchLen)
+		return
+	}
 	p.partitionBatchMus[part].Lock()
 	state, ok := p.partitionBatchStates[part][batchID]
 	if !ok || state.Acked {
@@ -509,6 +522,7 @@ func (p *Publisher) markBatchAckedByID(part int, batchID string, batchLen int) {
 	}
 
 	state.Acked = true
+	// #nosec G115 -- batchLen is checked non-negative above and int fits in uint64.
 	p.uniqueCount.Add(uint64(batchLen))
 
 	delete(p.partitionBatchStates[part], batchID)
@@ -534,16 +548,6 @@ func (p *Publisher) GetLatencies() []time.Duration {
 }
 
 func (p *Publisher) parseAckResponse(resp []byte) (*types.AckResponse, error) {
-	respStr := string(resp)
-	if strings.HasPrefix(respStr, "ERROR:") {
-		ackResp := types.AckResponse{
-			Status:   "ERROR",
-			ErrorMsg: strings.TrimSpace(respStr),
-		}
-		util.Error("broker responded with error: %s", respStr)
-		return &ackResp, fmt.Errorf("broker responded with error: %s", respStr)
-	}
-
 	var ackResp types.AckResponse
 	if err := json.Unmarshal(resp, &ackResp); err != nil {
 		util.Error("invalid ack format: %v, %w", string(resp), err)
@@ -753,17 +757,25 @@ func (p *Publisher) GetPartitionStats() []bench.PartitionStat {
 
 // GetSentMessageCount returns the number of successfully sent messages
 func (p *Publisher) GetSentMessageCount() int {
-	return int(p.ackedCount.Load())
+	return counterAsInt(p.ackedCount.Load())
 }
 
 // GetUniqueAckCount returns the number of unique messages
 func (p *Publisher) GetUniqueAckCount() int {
-	return int(p.uniqueCount.Load())
+	return counterAsInt(p.uniqueCount.Load())
 }
 
 // GetattemptsCount returns the number of published messages
 func (p *Publisher) GetAttemptsCount() int {
-	return int(p.attemptsCount.Load())
+	return counterAsInt(p.attemptsCount.Load())
+}
+
+func counterAsInt(value uint64) int {
+	if value > math.MaxInt {
+		return math.MaxInt
+	}
+	// #nosec G115 -- value is checked against the platform int maximum above.
+	return int(value)
 }
 
 // GetPartitionCount returns the number of partitions
