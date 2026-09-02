@@ -16,14 +16,14 @@ func newBenchDiskHandler(b *testing.B) (*DiskHandler, func()) {
 		b.Fatal(err)
 	}
 	cfg := &config.Config{
-		LogDir:             dir,
-		SegmentSize:        64 * 1024 * 1024,
-		IndexSize:          10 * 1024 * 1024,
-		IndexIntervalBytes: 4096,
-		ChannelBufferSize:  10000,
-		DiskFlushBatchSize: 500,
-		LingerMS:           5,
-		DiskWriteTimeoutMS: 5000,
+		LogDir:              dir,
+		SegmentSize:         64 * 1024 * 1024,
+		IndexSize:           10 * 1024 * 1024,
+		IndexIntervalBytes:  4096,
+		ChannelBufferSize:   10000,
+		DiskFlushBatchSize:  500,
+		LingerMS:            5,
+		DiskWriteTimeoutMS:  5000,
 		DiskFlushIntervalMS: 100,
 	}
 	dh, err := NewDiskHandler(cfg, "bench-topic", 0)
@@ -117,6 +117,35 @@ func BenchmarkReadMessages(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, err := dh.ReadMessages(0, 100)
 		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkReadMessagesCachedClosedSegment(b *testing.B) {
+	dh, cleanup := newBenchDiskHandler(b)
+	defer cleanup()
+
+	msgs := makeBenchMessages(1000)
+	if err := dh.WriteBatch(msgs); err != nil {
+		b.Fatal(err)
+	}
+	dh.mu.Lock()
+	dh.ioMu.Lock()
+	err := dh.rotateSegment(dh.GetAbsoluteOffset())
+	dh.ioMu.Unlock()
+	dh.mu.Unlock()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	if _, err := dh.ReadMessages(0, 100); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := dh.ReadMessages(0, 100); err != nil {
 			b.Fatal(err)
 		}
 	}

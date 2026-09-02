@@ -238,6 +238,9 @@ func (d *DiskHandler) markAsDeleted(logPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse offset from filename %s: %w", filepath.Base(logPath), err)
 	}
+	if err := d.segmentReaders.invalidate(segmentOffset); err != nil {
+		return fmt.Errorf("invalidate retained segment %d reader: %w", segmentOffset, err)
+	}
 
 	deletedLogPath := logPath + ".deleted"
 	indexPath := logPath[:len(logPath)-4] + ".index"

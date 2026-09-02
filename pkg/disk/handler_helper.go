@@ -79,6 +79,10 @@ func (d *DiskHandler) Close() error {
 			errs = append(errs, fmt.Errorf("index cleanup error: %w", err))
 		}
 		d.indexMu.Unlock()
+
+		if err := d.segmentReaders.close(); err != nil {
+			errs = append(errs, fmt.Errorf("segment reader cache cleanup error: %w", err))
+		}
 	})
 
 	if len(errs) > 0 {

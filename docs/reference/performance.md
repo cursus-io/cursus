@@ -38,7 +38,9 @@ Larger segments reduce file turnover but lengthen worst-case active-tail scans a
 
 ## Read Path Trade-offs
 
-Raw storage reads use the sparse index followed by mmap scanning. `read_committed` adds HWM/LSO checks and transaction visibility filtering. Its append-maintained in-memory transaction index is read in place, so each poll does not clone the full index or rescan an accumulated result set. Resolved entries below the retention floor are pruned; unresolved transactions remain indexed and can hold the stable boundary at or above that floor.
+Raw storage reads use the sparse index followed by mmap scanning. Closed segment mappings are retained in a bounded, reference-counted LRU cache, while the growing active segment is mapped per read so its visible length cannot become stale. Retention, compaction, truncation, and shutdown invalidate cached mappings before replacing or removing files.
+
+`read_committed` adds HWM/LSO checks and transaction visibility filtering. Its append-maintained in-memory transaction index is read in place, so each poll does not clone the full index or rescan an accumulated result set. Resolved entries below the retention floor are pruned; unresolved transactions remain indexed and can hold the stable boundary at or above that floor.
 
 Large poll batches reduce command overhead but increase handler latency and retry work. Stream batches reduce reconnect overhead but still require heartbeats, generation fencing, and offset commit discipline.
 

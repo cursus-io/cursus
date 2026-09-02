@@ -68,6 +68,7 @@ type DiskHandler struct {
 	maintenanceMu     sync.Mutex
 	compactionMu      sync.RWMutex
 	compactedSegments map[uint64]int64
+	segmentReaders    *segmentReaderCache
 	mu                sync.Mutex // metadata(offset, segment), file handler(d.file)
 	ioMu              sync.Mutex // bufio.Writer, flush
 
@@ -276,6 +277,7 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		distributed:            cfg.EnabledDistribution,
 		internalMetadata:       internalMetadata,
 		compactedSegments:      compactedSegments,
+		segmentReaders:         newSegmentReaderCache(defaultSegmentReaderCacheEntries),
 		file:                   file,
 		writer:                 bufio.NewWriter(file),
 	}
@@ -486,10 +488,22 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 			continue
 		}
 
-		reader, err := mmap.Open(currentFile)
+		var lease *segmentReaderLease
+		if segBase == currentSegment {
+			// mmap.ReaderAt captures the file length at open time. Never cache the
+			// active segment because an append would leave the mapping stale.
+			reader, openErr := mmap.Open(currentFile)
+			if openErr != nil {
+				return nil, fmt.Errorf("open segment %d: %w", segBase, openErr)
+			}
+			lease = &segmentReaderLease{reader: reader}
+		} else {
+			lease, err = dh.segmentReaders.acquire(segBase, currentFile)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("open segment %d: %w", segBase, err)
 		}
+		reader := lease.Reader()
 
 		remaining := max - len(messages)
 		readPos := uint64(0)
@@ -501,29 +515,29 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 		allowOffsetGaps := !activeSegment && dh.segmentAllowsOffsetGaps(segBase, actualSize)
 		batch, readErr := dh.readMessagesFromPosition(reader, readPos, remaining, offset, segBase, activeSegment, allowOffsetGaps)
 		if readErr != nil {
-			_ = reader.Close()
+			_ = lease.Close()
 			return nil, fmt.Errorf("read segment %d: %w", segBase, readErr)
 		}
-		if len(batch) == 0 && actualSize > 0 && uint64(actualSize) > readPos+4 {
-			if err := reader.Close(); err != nil {
+		if activeSegment && len(batch) == 0 && actualSize > 0 && uint64(actualSize) > readPos+4 {
+			if err := lease.Close(); err != nil {
 				util.Debug("error closing reader: %v", err)
 			}
 
-			var reErr error
-			reader, reErr = mmap.Open(currentFile)
+			reader, reErr := mmap.Open(currentFile)
 			if reErr != nil {
 				return nil, fmt.Errorf("reopen segment %d: %w", segBase, reErr)
 			}
+			lease = &segmentReaderLease{reader: reader}
 
 			batch, readErr = dh.readMessagesFromPosition(reader, readPos, remaining, offset, segBase, activeSegment, allowOffsetGaps)
 			if readErr != nil {
-				_ = reader.Close()
+				_ = lease.Close()
 				return nil, fmt.Errorf("reread segment %d: %w", segBase, readErr)
 			}
 		}
 
 		messages = append(messages, batch...)
-		if err := reader.Close(); err != nil {
+		if err := lease.Close(); err != nil {
 			util.Debug("error closing reader: %v", err)
 		}
 
