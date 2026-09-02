@@ -14,6 +14,7 @@ import (
 func TestEnsureRaftRecoveryFormatCreatesAndValidatesVersionNineMarker(t *testing.T) {
 	directory := t.TempDir()
 	require.NoError(t, ensureRaftRecoveryFormat(directory))
+	// #nosec G304 -- the marker path is fixed beneath t.TempDir.
 	data, err := os.ReadFile(filepath.Join(directory, raftFormatMarkerName))
 	require.NoError(t, err)
 	require.Equal(t, strconv.Itoa(fsm.SnapshotVersionCurrent)+"\n", string(data))

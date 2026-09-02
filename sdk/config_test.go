@@ -163,11 +163,11 @@ func TestLoadConfig_JSON(t *testing.T) {
 	cfg.Topic = "my-topic"
 	cfg.Partitions = 8
 	cfg.Acks = "all"
-	data, err := json.Marshal(cfg)
+	data, err := json.Marshal(cfg) // #nosec G117 -- the test fixture contains no credential value.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -186,7 +186,7 @@ func TestLoadConfig_YAML(t *testing.T) {
 
 	yamlData := `group_id: test-group
 batch_size: 50`
-	if err := os.WriteFile(path, []byte(yamlData), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(yamlData), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -210,7 +210,7 @@ func TestLoadConfig_FileNotFound(t *testing.T) {
 func TestLoadConfig_ConsumerDefaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "c.json")
-	if err := os.WriteFile(path, []byte(`{"group_id":"override"}`), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"group_id":"override"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -294,7 +294,7 @@ func TestPublisherConfig_EnableMetrics(t *testing.T) {
 func TestLoadConfig_PublisherDefaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "p.json")
-	if err := os.WriteFile(path, []byte(`{"topic":"override-topic"}`), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"topic":"override-topic"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -319,7 +319,7 @@ use_tls: true
 tls_cert_path: /cert
 tls_key_path: /key
 enable_metrics: true`
-	if err := os.WriteFile(path, []byte(yamlData), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(yamlData), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -343,7 +343,7 @@ use_tls: true
 tls_cert_path: /consumer/cert
 tls_key_path: /consumer/key
 enable_metrics: true`
-	if err := os.WriteFile(path, []byte(yamlData), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(yamlData), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -368,7 +368,7 @@ func TestLoadConfig_UnknownType_UsesYAML(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "cfg.txt")
 	yamlData := `topic: txt-topic`
-	if err := os.WriteFile(path, []byte(yamlData), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(yamlData), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

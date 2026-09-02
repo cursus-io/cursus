@@ -123,13 +123,16 @@ func writePersistedTestSegment(t *testing.T, root, topicName string, partition i
 	directory := filepath.Join(root, topicName)
 	require.NoError(t, os.MkdirAll(directory, 0o750))
 	path := filepath.Join(directory, "partition_"+strconv.Itoa(partition)+"_segment_"+fmt.Sprintf("%020d", base)+".log")
+	// #nosec G304 -- path is a generated segment path beneath the test's temporary storage root.
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	require.NoError(t, err)
 	for _, message := range messages {
 		payload, serializeErr := util.SerializeDiskMessage(message)
 		require.NoError(t, serializeErr)
+		payloadLen, ok := util.SafeIntToUint32(len(payload))
+		require.True(t, ok)
 		var length [4]byte
-		binary.BigEndian.PutUint32(length[:], uint32(len(payload)))
+		binary.BigEndian.PutUint32(length[:], payloadLen)
 		_, err = file.Write(length[:])
 		require.NoError(t, err)
 		_, err = file.Write(payload)

@@ -27,6 +27,7 @@ func (b *backoff) duration() time.Duration {
 		b.current = time.Millisecond
 	}
 
+	// #nosec G404 -- retry jitter is not security-sensitive randomness.
 	jitter := time.Duration(rand.Int63n(int64(b.current) / 10))
 	d := b.current + jitter
 

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/cursus-io/cursus/util"
 )
 
 func TestDecodeJournalSnapshotRejectsUnversionedAndUnknownVersions(t *testing.T) {
@@ -71,6 +73,7 @@ func TestJournalRepairsIncompleteTail(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// #nosec G304 -- path is the journal created beneath t.TempDir.
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -111,6 +114,7 @@ func TestJournalAppendDiscardsUnacknowledgedTail(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// #nosec G304 -- path is the journal created beneath t.TempDir.
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -146,11 +150,13 @@ func TestJournalRejectsCorruptNonTailRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// #nosec G304 -- path is the journal created beneath t.TempDir.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	data[5] ^= 0xff
+	// #nosec G703 -- path is the journal file created beneath t.TempDir.
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +166,11 @@ func TestJournalRejectsCorruptNonTailRecord(t *testing.T) {
 }
 
 func testJournalSnapshot(id string, revision uint64, state State) *Snapshot {
-	now := time.Unix(1_700_000_000+int64(revision), 0).UTC()
+	revisionSeconds, ok := util.SafeUint64ToInt64(revision)
+	if !ok {
+		panic("test revision exceeds int64")
+	}
+	now := time.Unix(1_700_000_000+revisionSeconds, 0).UTC()
 	return &Snapshot{
 		ID:        id,
 		Producer:  "producer-" + id,

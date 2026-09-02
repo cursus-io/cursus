@@ -6,6 +6,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -153,14 +154,14 @@ func (p *persistentOffsetLog) PublishWithAck(_ string, msg *types.Message) error
 
 func (p *persistentOffsetLog) ReadTopicPartition(_ string, partitionID int, offset uint64, max int) ([]types.Message, error) {
 	records := p.partitions[partitionID]
-	if int(offset) >= len(records) {
+	start, ok := util.SafeUint64ToInt(offset)
+	if !ok || start >= len(records) {
 		return nil, nil
 	}
-	end := int(offset) + max
+	end := start + max
 	if end > len(records) {
 		end = len(records)
 	}
-	start := int(offset)
 	out := make([]types.Message, end-start)
 	copy(out, records[start:end])
 	return out, nil

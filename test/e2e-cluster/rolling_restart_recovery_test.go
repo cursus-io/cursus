@@ -30,7 +30,7 @@ func TestCleanBootstrapRollingRestartRestoresFullISR(t *testing.T) {
 	}
 
 	if ctx.GetPublishedCount() != ctx.GetNumMessages() {
-		t.Fatalf("rolling restart published additional data: count=%d fixture=%d", ctx.GetPublishedCount(), ctx.GetNumMessages())
+		t.Fatalf("rolling restart publish count changed: count=%d fixture=%d", ctx.GetPublishedCount(), ctx.GetNumMessages())
 	}
 }
 

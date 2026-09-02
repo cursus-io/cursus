@@ -37,6 +37,7 @@ func backoffDelay(attempt int, base time.Duration) time.Duration {
 		delay = 5 * time.Second
 	}
 	// Add jitter: ±25%
+	// #nosec G404 -- reconnect jitter is not security-sensitive randomness.
 	jitter := time.Duration(rand.Int63n(int64(delay)/2)) - delay/4
 	return delay + jitter
 }

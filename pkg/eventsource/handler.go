@@ -85,7 +85,7 @@ func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, err
 	}
 
 	dir := h.tm.GetLogDir(topicName, partitionID)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("create dir for stream index %s:%d: %w", topicName, partitionID, err)
 	}
 	idx, err := NewStreamIndex(dir, partitionID)
@@ -134,7 +134,7 @@ func (h *Handler) getSnapshot(topicName string, partitionID int) (*SnapshotStore
 	}
 
 	dir := h.tm.GetLogDir(topicName, partitionID)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("create dir for snapshot store %s:%d: %w", topicName, partitionID, err)
 	}
 	ss, err := NewSnapshotStore(dir, partitionID)

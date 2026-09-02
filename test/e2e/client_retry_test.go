@@ -13,3 +13,20 @@ func TestRetryClassificationIncludesOnlyIdempotentPublish(t *testing.T) {
 		t.Fatal("read-only offset fetch must remain retryable")
 	}
 }
+
+func TestSuccessfulResponseAcceptsWireTextAndStructuredPublishResults(t *testing.T) {
+	for _, response := range []string{
+		"OK",
+		"OK topic=orders",
+		`{"status":"OK","last_offset":4}`,
+	} {
+		if !isSuccessfulResponse(response) {
+			t.Fatalf("valid response rejected: %s", response)
+		}
+	}
+	for _, response := range []string{"", "ERROR: failed", `{"status":"ERROR"}`, `{"last_offset":4}`} {
+		if isSuccessfulResponse(response) {
+			t.Fatalf("invalid response accepted: %s", response)
+		}
+	}
+}

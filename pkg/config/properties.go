@@ -237,11 +237,17 @@ func LoadConfig() (*Config, error) {
 
 	// log segment & retention
 	flag.IntVar(&cfg.CleanupInterval, "cleanup-interval", cfg.CleanupInterval, "Cleanup seconds")
-	var segmentSizeInt64 int64
-	flag.Int64Var(&segmentSizeInt64, "segment-size", int64(cfg.SegmentSize), "Segment size")
+	segmentSizeInt64, ok := util.SafeUint64ToInt64(cfg.SegmentSize)
+	if !ok {
+		return nil, fmt.Errorf("default segment size %d exceeds int64 max", cfg.SegmentSize)
+	}
+	flag.Int64Var(&segmentSizeInt64, "segment-size", segmentSizeInt64, "Segment size")
 	flag.IntVar(&cfg.SegmentRollTimeMS, "segment-roll-time-ms", cfg.SegmentRollTimeMS, "Segment roll time")
-	var indexSizeInt64 int64
-	flag.Int64Var(&indexSizeInt64, "index-size", int64(cfg.IndexSize), "Max index file size")
+	indexSizeInt64, ok := util.SafeUint64ToInt64(cfg.IndexSize)
+	if !ok {
+		return nil, fmt.Errorf("default index size %d exceeds int64 max", cfg.IndexSize)
+	}
+	flag.Int64Var(&indexSizeInt64, "index-size", indexSizeInt64, "Max index file size")
 	flag.IntVar(&cfg.IndexIntervalBytes, "index-interval-bytes", cfg.IndexIntervalBytes, "Index interval bytes")
 	flag.StringVar(&cfg.CleanupPolicy, "cleanup-policy", cfg.CleanupPolicy, "Cleanup policy (delete, compact, or delete,compact)")
 	flag.IntVar(&cfg.RetentionHours, "retention-hours", cfg.RetentionHours, "Retention hours")
@@ -349,12 +355,20 @@ func LoadConfig() (*Config, error) {
 	if segmentSizeInt64 <= 0 {
 		cfg.SegmentSize = DefaultConfig().SegmentSize
 	} else {
-		cfg.SegmentSize = uint64(segmentSizeInt64)
+		segmentSize, valid := util.SafeInt64ToUint64(segmentSizeInt64)
+		if !valid {
+			return nil, fmt.Errorf("segment size %d must be non-negative", segmentSizeInt64)
+		}
+		cfg.SegmentSize = segmentSize
 	}
 	if indexSizeInt64 <= 0 {
 		cfg.IndexSize = DefaultConfig().IndexSize
 	} else {
-		cfg.IndexSize = uint64(indexSizeInt64)
+		indexSize, valid := util.SafeInt64ToUint64(indexSizeInt64)
+		if !valid {
+			return nil, fmt.Errorf("index size %d must be non-negative", indexSizeInt64)
+		}
+		cfg.IndexSize = indexSize
 	}
 
 	overrideEnvInt(&cfg.BrokerPort, "BROKER_PORT")

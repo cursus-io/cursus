@@ -70,6 +70,7 @@ func FuzzDecompressDeclaredLength(f *testing.F) {
 		if err != nil {
 			f.Fatal(err)
 		}
+		// #nosec G115 -- the fixed seed is smaller than uint32.
 		f.Add(byte(compression), uint32(len(plain)), encoded)
 	}
 	f.Fuzz(func(t *testing.T, algorithm byte, decodedSize uint32, encoded []byte) {

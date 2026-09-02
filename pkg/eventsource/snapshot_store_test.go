@@ -5,12 +5,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSnapshotStoreRejectsKeyBeyondWireLength(t *testing.T) {
+	store, err := NewSnapshotStore(t.TempDir(), 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, store.Close()) }()
+
+	err = store.Save(strings.Repeat("k", 1<<16), 1, `{}`)
+	require.ErrorContains(t, err, "exceeds uint16 format limit")
+	require.Empty(t, store.index)
+}
 
 func TestSnapshotStore_SaveAndRead(t *testing.T) {
 	dir := t.TempDir()
@@ -230,7 +241,8 @@ func TestSnapshotStore_PartialWriteRecovery(t *testing.T) {
 	require.NoError(t, store.Close())
 
 	path := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots.dat", 0))
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)
+	// #nosec G304 -- path is the snapshot file created beneath t.TempDir.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
 	require.NoError(t, err)
 
 	// Write a KeyLen that claims 200 bytes but only provide 3 bytes of key data.
@@ -275,10 +287,12 @@ func TestSnapshotStore_PartialPayloadRecovery(t *testing.T) {
 	require.NoError(t, store.Close())
 
 	path := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots.dat", 0))
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)
+	// #nosec G304 -- path is the snapshot file created beneath t.TempDir.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
 	require.NoError(t, err)
 
 	key := []byte("partial-key")
+	// #nosec G115 -- the fixed test key is shorter than the uint16 format limit.
 	require.NoError(t, binary.Write(f, binary.BigEndian, uint16(len(key))))
 	_, err = f.Write(key)
 	require.NoError(t, err)

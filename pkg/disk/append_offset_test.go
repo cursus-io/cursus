@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 func TestAppendMessageSyncFailureDoesNotConsumeOffset(t *testing.T) {
@@ -85,13 +86,14 @@ func TestAppendMessageSyncConcurrentOffsetsAreContiguous(t *testing.T) {
 	}
 	seen := make([]bool, writers)
 	for offset := range offsets {
-		if offset >= writers {
+		index, ok := util.SafeUint64ToInt(offset)
+		if !ok || index < 0 || index >= len(seen) {
 			t.Fatalf("offset %d is outside expected range", offset)
 		}
-		if seen[offset] {
+		if seen[index] {
 			t.Fatalf("duplicate offset %d", offset)
 		}
-		seen[offset] = true
+		seen[index] = true
 	}
 	for offset, present := range seen {
 		if !present {

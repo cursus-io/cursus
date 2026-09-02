@@ -88,7 +88,7 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	}
 
 	dataDir := filepath.Join(cfg.LogDir, "raft")
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		util.Error("Failed to create raft data directory %s: %v", dataDir, err)
 		return nil, fmt.Errorf("failed to create raft data directory: %w", err)
 	}

@@ -8,21 +8,24 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestDiskHandler_EnforceRetention(t *testing.T) {
 	createSegment := func(t *testing.T, dh *DiskHandler, segNum int, size int, modTime time.Time) {
-		logPath := dh.GetSegmentPath(uint64(segNum))
-		indexPath := dh.GetIndexPath(uint64(segNum))
+		baseOffset, ok := util.SafeIntToUint64(segNum)
+		require.True(t, ok)
+		logPath := dh.GetSegmentPath(baseOffset)
+		indexPath := dh.GetIndexPath(baseOffset)
 
-		require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0755))
-		require.NoError(t, os.WriteFile(logPath, make([]byte, size), 0644))
+		require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o750))
+		require.NoError(t, os.WriteFile(logPath, make([]byte, size), 0o600))
 		require.NoError(t, os.Chtimes(logPath, modTime, modTime))
-		require.NoError(t, os.WriteFile(indexPath, []byte("index_data"), 0644))
+		require.NoError(t, os.WriteFile(indexPath, []byte("index_data"), 0o600))
 
-		dh.segments = append(dh.segments, uint64(segNum))
+		dh.segments = append(dh.segments, baseOffset)
 	}
 
 	tests := []struct {
@@ -64,6 +67,11 @@ func TestDiskHandler_EnforceRetention(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			toOffset := func(segNum int) uint64 {
+				baseOffset, ok := util.SafeIntToUint64(segNum)
+				require.True(t, ok)
+				return baseOffset
+			}
 			tmpDir := t.TempDir()
 			baseName := filepath.Join(tmpDir, "test_topic", "partition_0")
 			dh := &DiskHandler{BaseName: baseName}
@@ -76,25 +84,27 @@ func TestDiskHandler_EnforceRetention(t *testing.T) {
 			dh.EnforceRetention(tt.cfg)
 
 			for _, segNum := range tt.expectedDelete {
-				assert.NotContains(t, dh.segments, uint64(segNum), "Segment %d should be removed from memory slice", segNum)
+				assert.NotContains(t, dh.segments, toOffset(segNum), "Segment %d should be removed from memory slice", segNum)
 			}
 
 			assert.Equal(t, len(tt.expectedKeep), len(dh.segments), "Memory slice size mismatch")
 			for _, segNum := range tt.expectedKeep {
-				assert.Contains(t, dh.segments, uint64(segNum), "Segment %d should exist in memory slice", segNum)
+				assert.Contains(t, dh.segments, toOffset(segNum), "Segment %d should exist in memory slice", segNum)
 			}
 
 			for _, segNum := range tt.expectedDelete {
-				logPath := dh.GetSegmentPath(uint64(segNum))
-				indexPath := dh.GetIndexPath(uint64(segNum))
+				baseOffset := toOffset(segNum)
+				logPath := dh.GetSegmentPath(baseOffset)
+				indexPath := dh.GetIndexPath(baseOffset)
 				assert.NoFileExists(t, logPath, "Log %d should be removed", segNum)
 				assert.NoFileExists(t, indexPath, "Index %d should be removed", segNum)
 				assert.NoFileExists(t, logPath+".deleted", "Log tombstone %d should be purged", segNum)
 				assert.NoFileExists(t, indexPath+".deleted", "Index tombstone %d should be purged", segNum)
 			}
 			for _, segNum := range tt.expectedKeep {
-				logPath := dh.GetSegmentPath(uint64(segNum))
-				indexPath := dh.GetIndexPath(uint64(segNum))
+				baseOffset := toOffset(segNum)
+				logPath := dh.GetSegmentPath(baseOffset)
+				indexPath := dh.GetIndexPath(baseOffset)
 
 				assert.FileExists(t, logPath, "Log %d should still exist", segNum)
 				assert.NoFileExists(t, logPath+".deleted", "Log %d should NOT have .deleted suffix", segNum)

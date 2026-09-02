@@ -14,6 +14,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
@@ -64,7 +65,11 @@ func (m *MockStorageHandler) GetFlushedOffset() uint64  { return m.offset }
 func (m *MockStorageHandler) GetLatestOffset() uint64   { return m.offset }
 func (m *MockStorageHandler) ReserveOffsets(n int) uint64 {
 	start := m.offset
-	m.offset += uint64(n)
+	count, ok := util.SafeIntToUint64(n)
+	if !ok {
+		panic("negative offset reservation")
+	}
+	m.offset += count
 	return start
 }
 func (m *MockStorageHandler) TruncateTo(uint64) error { return nil }

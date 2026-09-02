@@ -50,6 +50,7 @@ func runComposeContext(ctx context.Context, args ...string) *exec.Cmd {
 	fullArgs := append([]string{}, base[1:]...)
 	fullArgs = append(fullArgs, "--project-name", "cursus-benchmark")
 	fullArgs = append(fullArgs, args...)
+	// #nosec G204,G702 -- executable and arguments are selected by this E2E test harness.
 	cmd := exec.CommandContext(ctx, base[0], fullArgs...)
 	return cmd
 }
@@ -158,6 +159,7 @@ func removeFixedBenchmarkContainer(t *testing.T, file, name string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), dockerCommandTimeout)
 	defer cancel()
+	// #nosec G204 -- name is a fixed E2E container name selected by the test table.
 	cmd := exec.CommandContext(ctx, "docker", "rm", "-f", "-v", name)
 	if output, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(output), "No such container") {
 		t.Logf("docker rm warning for %s: %v\n%s", name, err, string(output))
@@ -172,6 +174,7 @@ func isFixedBenchmarkContainer(t *testing.T, file, name string) bool {
 	}, "\n")
 	ctx, cancel := context.WithTimeout(context.Background(), dockerCommandTimeout)
 	defer cancel()
+	// #nosec G204 -- format and name are fixed values owned by the E2E test harness.
 	cmd := exec.CommandContext(ctx, "docker", "inspect", "-f", format, name)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -264,6 +267,7 @@ func waitForContainerExit(t *testing.T, file, service, container string, timeout
 		case <-ticker.C:
 			// Check if container has exited (docker inspect uses container name)
 			ctx, cancel := context.WithTimeout(context.Background(), dockerCommandTimeout)
+			// #nosec G204 -- container is a fixed E2E container name selected by the caller.
 			inspectCmd := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Status}}", container)
 			out, err := inspectCmd.Output()
 			cancel()

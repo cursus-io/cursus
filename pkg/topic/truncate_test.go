@@ -96,6 +96,7 @@ func TestApplyTruncateDefinitionFencesBeforeFallibleLocalCleanup(t *testing.T) {
 
 func readTopicManifestVersion(t *testing.T, logDir string) int {
 	t.Helper()
+	// #nosec G304 -- the manifest name is fixed and logDir is the test storage root.
 	data, err := os.ReadFile(filepath.Join(logDir, TopicMetadataFileName))
 	require.NoError(t, err)
 	var manifest topicMetadataManifest

@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -357,8 +358,19 @@ func (bc *BrokerClient) executeCommand(topic, payload string) error {
 	if err != nil {
 		return err
 	}
-	if resp != "OK" && !strings.HasPrefix(resp, "OK ") {
+	if !isSuccessfulResponse(resp) {
 		return fmt.Errorf("unexpected broker response: %s", resp)
 	}
 	return nil
+}
+
+func isSuccessfulResponse(response string) bool {
+	trimmed := strings.TrimSpace(response)
+	if trimmed == "OK" || strings.HasPrefix(trimmed, "OK ") {
+		return true
+	}
+	var envelope struct {
+		Status string `json:"status"`
+	}
+	return json.Unmarshal([]byte(trimmed), &envelope) == nil && envelope.Status == "OK"
 }

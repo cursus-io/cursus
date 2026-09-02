@@ -29,6 +29,7 @@ func (d *DiskHandler) openIndexFiles() error {
 	if os.IsNotExist(statErr) {
 		isNew = true
 	} else if statErr == nil && info.Size() >= 0 {
+		// #nosec G115 -- the file size is explicitly non-negative above.
 		existingSize = uint64(info.Size())
 	}
 

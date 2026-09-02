@@ -295,6 +295,7 @@ func LoadConfig(path string, cfg interface{}) error {
 		*p = *NewDefaultPublisherConfig()
 	}
 
+	// #nosec G304 -- loading the caller-selected local configuration file is this API's purpose.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err

@@ -162,13 +162,13 @@ func saveResultToJSON(res BenchmarkResult) {
 	}
 
 	dir := "bench_results"
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		log.Printf("[ERROR] Failed to create bench_results dir: %v", err)
 		return
 	}
 
 	filename := fmt.Sprintf("%s/bench_%d.json", dir, time.Now().Unix())
-	if err := os.WriteFile(filename, data, 0644); err != nil {
+	if err := os.WriteFile(filename, data, 0o600); err != nil {
 		log.Printf("[ERROR] Failed to save benchmark JSON '%s': %v", filename, err)
 		return
 	}

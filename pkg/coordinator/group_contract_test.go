@@ -8,6 +8,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -195,12 +196,16 @@ func (r *partitionedOffsetReader) ReadTopicPartition(_ string, partitionID int, 
 	if offset >= uint64(len(records)) {
 		return nil, nil
 	}
-	end := int(offset) + max
+	start, ok := util.SafeUint64ToInt(offset)
+	if !ok {
+		return nil, fmt.Errorf("offset %d exceeds platform index limit", offset)
+	}
+	end := start + max
 	if end > len(records) {
 		end = len(records)
 	}
-	result := make([]types.Message, end-int(offset))
-	copy(result, records[int(offset):end])
+	result := make([]types.Message, end-start)
+	copy(result, records[start:end])
 	return result, nil
 }
 

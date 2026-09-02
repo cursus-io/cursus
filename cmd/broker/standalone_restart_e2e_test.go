@@ -90,6 +90,7 @@ func runBrokerRestartChild(t *testing.T) {
 
 func startBrokerRestartChild(t *testing.T, root string, brokerPort, healthPort int) (*exec.Cmd, *bytes.Buffer) {
 	t.Helper()
+	// #nosec G204,G702 -- os.Args[0] is the current Go test binary and the test selector is constant.
 	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestStandaloneBrokerSamePVCRestartE2E$")
 	command.Env = append(os.Environ(),
 		brokerRestartChildEnv+"=1",

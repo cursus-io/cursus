@@ -6,6 +6,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -67,11 +68,15 @@ func (s *visibilityBenchmarkStorage) ReadMessages(offset uint64, max int) ([]typ
 	if offset >= uint64(len(s.messages)) || max <= 0 {
 		return nil, nil
 	}
-	end := int(offset) + max
+	start, ok := util.SafeUint64ToInt(offset)
+	if !ok {
+		return nil, nil
+	}
+	end := start + max
 	if end > len(s.messages) {
 		end = len(s.messages)
 	}
-	return s.messages[int(offset):end], nil
+	return s.messages[start:end], nil
 }
 func (*visibilityBenchmarkStorage) GetFirstOffset() uint64       { return 0 }
 func (s *visibilityBenchmarkStorage) GetAbsoluteOffset() uint64  { return uint64(len(s.messages)) }

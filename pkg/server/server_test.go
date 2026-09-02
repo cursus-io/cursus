@@ -519,6 +519,7 @@ func TestHandleConn_Exit(t *testing.T) {
 	conn, _ := net.Dial("tcp", l.Addr().String())
 	msg := "MALFORMED"
 	buf := make([]byte, 4+len(msg))
+	// #nosec G115 -- the fixed malformed test message is smaller than uint32.
 	binary.BigEndian.PutUint32(buf[0:4], uint32(len(msg)))
 	copy(buf[4:], []byte(msg))
 	_, _ = conn.Write(buf)
@@ -617,6 +618,7 @@ func TestHandleConn_MalformedInput(t *testing.T) {
 
 	msg := "MALFORMED"
 	buf := make([]byte, 4+len(msg))
+	// #nosec G115 -- the fixed malformed test message is smaller than uint32.
 	binary.BigEndian.PutUint32(buf[0:4], uint32(len(msg)))
 	copy(buf[4:], []byte(msg))
 	_, _ = conn.Write(buf)

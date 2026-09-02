@@ -34,6 +34,7 @@ func TestStandaloneAckedOffsetSurvivesAbruptProcessExit(t *testing.T) {
 
 	root := t.TempDir()
 	readyPath := filepath.Join(root, "commit-acked")
+	// #nosec G204,G702 -- os.Args[0] is the current Go test binary and the test selector is constant.
 	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestStandaloneAckedOffsetSurvivesAbruptProcessExit$")
 	command.Env = append(os.Environ(),
 		abruptChildEnv+"=1",
@@ -85,6 +86,7 @@ func runAbruptMetadataChild(t *testing.T) {
 	require.NoError(t, cd.RegisterGroup("events", "workers", 2))
 	require.NoError(t, cd.CommitOffset("workers", "events", 0, 37))
 	require.ErrorContains(t, cd.CommitOffset("workers", "events", 0, 36), "offset regression")
+	// #nosec G703 -- the parent test sets this path to a file beneath t.TempDir.
 	require.NoError(t, os.WriteFile(os.Getenv(abruptReadyEnv), []byte("acked"), 0o600))
 }
 

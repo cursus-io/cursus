@@ -541,12 +541,12 @@ func TestProducer_GetPartitionCount(t *testing.T) {
 
 func TestProducer_GetUniqueAckCount_Zero(t *testing.T) {
 	p := &Producer{}
-	assert.Equal(t, 0, p.GetUniqueAckCount())
+	assert.Equal(t, uint64(0), p.GetUniqueAckCount())
 }
 
 func TestProducer_GetAttemptsCount_Zero(t *testing.T) {
 	p := &Producer{}
-	assert.Equal(t, 0, p.GetAttemptsCount())
+	assert.Equal(t, uint64(0), p.GetAttemptsCount())
 }
 
 func TestProducer_GetLatencies_Empty(t *testing.T) {
@@ -646,7 +646,7 @@ func TestProducer_MarkBatchAckedByID(t *testing.T) {
 
 	p.markBatchAckedByID(0, "batch-1", 5)
 
-	assert.Equal(t, 5, p.GetUniqueAckCount())
+	assert.Equal(t, uint64(5), p.GetUniqueAckCount())
 	assert.Equal(t, uint64(5), p.ackedCount.Load())
 
 	p.partitionSentMus[0].Lock()
@@ -683,7 +683,7 @@ func TestProducer_MarkBatchAckedByID_AlreadyAcked(t *testing.T) {
 	}
 
 	p.markBatchAckedByID(0, "batch-1", 5)
-	assert.Equal(t, 0, p.GetUniqueAckCount())
+	assert.Equal(t, uint64(0), p.GetUniqueAckCount())
 }
 
 func TestProducer_MarkBatchAckedByID_NotFound(t *testing.T) {
@@ -698,7 +698,7 @@ func TestProducer_MarkBatchAckedByID_NotFound(t *testing.T) {
 	p.partitionBatchStates[0] = make(map[string]*BatchState)
 
 	p.markBatchAckedByID(0, "nonexistent", 5)
-	assert.Equal(t, 0, p.GetUniqueAckCount())
+	assert.Equal(t, uint64(0), p.GetUniqueAckCount())
 }
 
 func TestProducer_CleanupBatchState(t *testing.T) {

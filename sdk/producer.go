@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cursus-io/cursus/util"
 )
 
 type BatchState struct {
@@ -53,7 +55,7 @@ type Producer struct {
 
 	sendersWG sync.WaitGroup
 
-	rr       uint32
+	rr       atomic.Uint64
 	inFlight []int32
 
 	partitionSentMus  []sync.Mutex
@@ -228,8 +230,15 @@ func (p *Producer) getPartitionLeaderAddr(partition int) string {
 }
 
 func (p *Producer) nextPartition() int {
-	idx := int((atomic.AddUint32(&p.rr, 1) - 1) % uint32(p.partitions))
-	return idx
+	partitionCount, ok := util.SafeIntToUint64(p.partitions)
+	if !ok || partitionCount == 0 {
+		return 0
+	}
+	index, ok := util.SafeUint64ToInt((p.rr.Add(1) - 1) % partitionCount)
+	if !ok {
+		return 0
+	}
+	return index
 }
 
 // TopicCleanupPolicy selects broker maintenance for a topic.
@@ -638,6 +647,11 @@ func waitForDrain(waiters []chan struct{}, timeout time.Duration) bool {
 
 // FlushBenchmark waits until all expectedTotal messages are acknowledged or timeout expires.
 func (p *Producer) FlushBenchmark(expectedTotal int) {
+	expected, ok := util.SafeIntToUint64(expectedTotal)
+	if !ok {
+		LogError("invalid negative benchmark message count: %d", expectedTotal)
+		return
+	}
 	for _, buf := range p.buffers {
 		buf.mu.Lock()
 		buf.cond.Broadcast()
@@ -670,7 +684,7 @@ func (p *Producer) FlushBenchmark(expectedTotal int) {
 				p.partitionBatchMus[part].Unlock()
 			}
 
-			if ackedSoFar >= expectedTotal && totalPending == 0 {
+			if ackedSoFar >= expected && totalPending == 0 {
 				LogInfo("FlushBenchmark completed — all %d messages acknowledged (%.3fs)", expectedTotal, time.Since(start).Seconds())
 				return
 			}
@@ -727,12 +741,12 @@ func (p *Producer) GetLatencies() []time.Duration {
 	return res
 }
 
-func (p *Producer) GetUniqueAckCount() int {
-	return int(p.uniqueCount.Load())
+func (p *Producer) GetUniqueAckCount() uint64 {
+	return p.uniqueCount.Load()
 }
 
-func (p *Producer) GetAttemptsCount() int {
-	return int(p.attemptsCount.Load())
+func (p *Producer) GetAttemptsCount() uint64 {
+	return p.attemptsCount.Load()
 }
 
 func (p *Producer) GetPartitionCount() int {

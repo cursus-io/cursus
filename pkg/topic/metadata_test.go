@@ -138,6 +138,7 @@ func TestStandaloneTopicMetadataRejectsVersionOne(t *testing.T) {
 	dm.CloseAllHandlers()
 
 	manifestPath := filepath.Join(cfg.LogDir, TopicMetadataFileName)
+	// #nosec G304 -- manifestPath is fixed beneath this test's temporary log directory.
 	raw, err := os.ReadFile(manifestPath)
 	require.NoError(t, err)
 	var manifest map[string]any
