@@ -94,7 +94,7 @@ func DecodeNegotiationResponse(data []byte) (NegotiationResponse, error) {
 
 func SelectCompression(request NegotiationRequest, supported []Compression) (Compression, error) {
 	if request.MinimumVersion > ProtocolVersion || request.MaximumVersion < ProtocolVersion {
-		return CompressionNone, fmt.Errorf("Wire v2 is outside requested version range %d..%d", request.MinimumVersion, request.MaximumVersion)
+		return CompressionNone, fmt.Errorf("wire v2 is outside requested version range %d..%d", request.MinimumVersion, request.MaximumVersion)
 	}
 	available := make(map[Compression]struct{}, len(supported))
 	for _, compression := range supported {

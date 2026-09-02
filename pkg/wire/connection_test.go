@@ -10,8 +10,8 @@ import (
 
 func TestNegotiatedConnectionRoundTrip(t *testing.T) {
 	clientRaw, serverRaw := net.Pipe()
-	defer clientRaw.Close()
-	defer serverRaw.Close()
+	t.Cleanup(func() { _ = clientRaw.Close() })
+	t.Cleanup(func() { _ = serverRaw.Close() })
 
 	serverResult := make(chan *wire.Connection, 1)
 	serverError := make(chan error, 1)

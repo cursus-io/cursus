@@ -57,16 +57,6 @@ func newTestConnPair(t *testing.T) (client, server net.Conn) {
 	return client, server
 }
 
-// sendFramed writes a length-prefixed message to conn.
-func sendFramed(t *testing.T, conn net.Conn, msg []byte) {
-	t.Helper()
-	buf := make([]byte, 4+len(msg))
-	binary.BigEndian.PutUint32(buf[0:4], uint32(len(msg)))
-	copy(buf[4:], msg)
-	_, err := conn.Write(buf)
-	require.NoError(t, err)
-}
-
 // readFramed reads a length-prefixed response from conn.
 func readFramed(t *testing.T, conn net.Conn) string {
 	t.Helper()

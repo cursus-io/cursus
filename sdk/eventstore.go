@@ -94,7 +94,7 @@ func (es *EventStore) getConn() (net.Conn, error) {
 	framed, err := transport.NewClient(conn, "none")
 	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("Wire v2 negotiation with %s: %w", es.addr, err)
+		return nil, fmt.Errorf("wire v2 negotiation with %s: %w", es.addr, err)
 	}
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		_ = conn.Close()

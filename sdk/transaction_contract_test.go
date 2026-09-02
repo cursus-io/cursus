@@ -9,8 +9,8 @@ import (
 
 func TestExecuteTransactionCommandPreservesStructuredBrokerError(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	t.Cleanup(func() { _ = client.Close() })
+	t.Cleanup(func() { _ = server.Close() })
 
 	serverDone := make(chan error, 1)
 	go func() {
@@ -41,8 +41,8 @@ func TestExecuteTransactionCommandPreservesStructuredBrokerError(t *testing.T) {
 
 func TestExecuteTransactionCommandRequiresExactOKToken(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	t.Cleanup(func() { _ = client.Close() })
+	t.Cleanup(func() { _ = server.Close() })
 
 	go func() {
 		_, _ = ReadWithLength(server)

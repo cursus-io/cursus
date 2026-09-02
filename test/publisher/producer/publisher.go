@@ -139,7 +139,7 @@ func (p *Publisher) CreateTopic(topic string, partitions int) error {
 	framed, err := wire.NewClientConn(conn, p.config.CompressionType)
 	if err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("Wire v2 handshake: %w", err)
+		return fmt.Errorf("wire v2 handshake: %w", err)
 	}
 	defer func() { _ = framed.Close() }()
 

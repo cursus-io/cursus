@@ -3,7 +3,6 @@ package sdk
 import (
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 	"time"
 
@@ -17,7 +16,7 @@ const defaultHandshakeTimeout = 5 * time.Second
 // connection is returned so request-specific deadlines remain authoritative.
 func openWireConnection(conn net.Conn, timeoutMS int, compression string) (net.Conn, error) {
 	if conn == nil {
-		return nil, fmt.Errorf("Wire v2 connection is nil")
+		return nil, fmt.Errorf("wire v2 connection is nil")
 	}
 	timeout := defaultHandshakeTimeout
 	if timeoutMS > 0 {
@@ -29,7 +28,7 @@ func openWireConnection(conn net.Conn, timeoutMS int, compression string) (net.C
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 	framed, err := transport.NewClient(conn, compression)
 	if err != nil {
-		return conn, fmt.Errorf("Wire v2 handshake: %w", err)
+		return conn, fmt.Errorf("wire v2 handshake: %w", err)
 	}
 	return framed, nil
 }
@@ -51,16 +50,4 @@ func parseOKResponse(response string) (map[string]string, error) {
 		fields[key] = value
 	}
 	return fields, nil
-}
-
-func requiredIntField(fields map[string]string, key string) (int, error) {
-	value, ok := fields[key]
-	if !ok || value == "" {
-		return 0, fmt.Errorf("missing %s", key)
-	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil {
-		return 0, fmt.Errorf("invalid %s %q", key, value)
-	}
-	return parsed, nil
 }

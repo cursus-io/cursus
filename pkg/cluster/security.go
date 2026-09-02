@@ -44,8 +44,5 @@ func (h *ClusterServer) authenticate(payload wire.CommandPayload) bool {
 		return true
 	}
 	supplied := payload.Fields["auth_token"]
-	if subtle.ConstantTimeCompare([]byte(supplied), []byte(h.authToken)) != 1 {
-		return false
-	}
-	return true
+	return subtle.ConstantTimeCompare([]byte(supplied), []byte(h.authToken)) == 1
 }

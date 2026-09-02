@@ -97,7 +97,7 @@ func (c *ConsumerClient) Connect(addr string) (net.Conn, error) {
 	conn, err = openWireConnection(conn, c.config.HandshakeTimeoutMS, c.config.CompressionType)
 	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("Wire v2 handshake with %s failed: %w", addr, err)
+		return nil, fmt.Errorf("wire v2 handshake with %s failed: %w", addr, err)
 	}
 	if err := authenticateConfiguredClient(conn, c.config.Principal, c.config.AuthToken); err != nil {
 		_ = conn.Close()

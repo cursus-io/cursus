@@ -90,7 +90,7 @@ func (pc *ProducerClient) connectPartitionLocked(idx int, addr string, useTLS bo
 	framed, err := wire.NewClientConn(conn, pc.config.CompressionType)
 	if err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("Wire v2 handshake with %s failed: %w", addr, err)
+		return fmt.Errorf("wire v2 handshake with %s failed: %w", addr, err)
 	}
 	conn = framed
 

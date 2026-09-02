@@ -30,7 +30,7 @@ func readStandaloneManifest(path string) ([]Definition, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	info, err := file.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("stat topic metadata: %w", err)

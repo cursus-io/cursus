@@ -103,7 +103,7 @@ func readWireRequest(connection *wire.Connection) (wire.Frame, error) {
 	}
 	if wire.IsBatch(frame.Payload) {
 		if frame.Command != wire.CommandPublish {
-			return wire.Frame{}, fmt.Errorf("Wire v2 batch requires PUBLISH command")
+			return wire.Frame{}, fmt.Errorf("wire v2 batch requires PUBLISH command")
 		}
 		return frame, nil
 	}

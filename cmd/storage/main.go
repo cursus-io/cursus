@@ -186,7 +186,7 @@ func writeJSONValue(writer io.Writer, value any) error {
 }
 
 func operationError(stderr io.Writer, err error) int {
-	fmt.Fprintln(stderr, "error:", err)
+	_, _ = fmt.Fprintln(stderr, "error:", err)
 	return 1
 }
 
@@ -202,16 +202,16 @@ func parseCommandFlags(flags *flag.FlagSet, args []string) int {
 }
 
 func usageError(stderr io.Writer, message string) int {
-	fmt.Fprintln(stderr, "error:", message)
+	_, _ = fmt.Fprintln(stderr, "error:", message)
 	return 2
 }
 
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage:")
-	fmt.Fprintln(writer, "  cursus-storage manifest inspect --log-dir DIR")
-	fmt.Fprintln(writer, "  cursus-storage manifest create --log-dir DIR --definitions FILE [--dry-run]")
-	fmt.Fprintln(writer, "  cursus-storage consumer-metadata inspect --log-dir DIR")
-	fmt.Fprintln(writer, "  cursus-storage consumer-metadata migrate --log-dir DIR --selection FILE [--dry-run]")
-	fmt.Fprintln(writer, "  cursus-storage orphan inspect --log-dir DIR")
-	fmt.Fprintln(writer, "  cursus-storage orphan archive --log-dir DIR --archive-dir DIR --topic NAME [--dry-run]")
+	_, _ = fmt.Fprintln(writer, "usage:")
+	_, _ = fmt.Fprintln(writer, "  cursus-storage manifest inspect --log-dir DIR")
+	_, _ = fmt.Fprintln(writer, "  cursus-storage manifest create --log-dir DIR --definitions FILE [--dry-run]")
+	_, _ = fmt.Fprintln(writer, "  cursus-storage consumer-metadata inspect --log-dir DIR")
+	_, _ = fmt.Fprintln(writer, "  cursus-storage consumer-metadata migrate --log-dir DIR --selection FILE [--dry-run]")
+	_, _ = fmt.Fprintln(writer, "  cursus-storage orphan inspect --log-dir DIR")
+	_, _ = fmt.Fprintln(writer, "  cursus-storage orphan archive --log-dir DIR --archive-dir DIR --topic NAME [--dry-run]")
 }

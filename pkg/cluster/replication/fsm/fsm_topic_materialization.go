@@ -127,11 +127,12 @@ func (f *BrokerFSM) ReconcileTopicMaterializations() error {
 		operation := f.topicMaterialization[name].Operation
 		f.mu.RUnlock()
 		var err error
-		if operation == TopicMaterializationRestore {
+		switch operation {
+		case TopicMaterializationRestore:
 			err = f.materializeTopicRestore(desired[name])
-		} else if operation == TopicMaterializationTruncate {
+		case TopicMaterializationTruncate:
 			err = f.materializeTopicTruncate(desired[name])
-		} else {
+		default:
 			err = f.materializeTopicCreate(desired[name])
 		}
 		if err != nil {

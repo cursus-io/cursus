@@ -343,7 +343,7 @@ func scanPersistedSegment(root, topicName string, partition int, segment Persist
 	if err != nil {
 		return 0, 0, 0, false, nil, fmt.Errorf("open persisted segment %q: %w", segment.Path, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	reader := bufio.NewReader(file)
 	markerAllowsGaps, markerProblem := compactionMarkerStatus(path, segment.Size)
 	allowGaps := markerAllowsGaps && !active

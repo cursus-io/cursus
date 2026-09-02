@@ -48,7 +48,7 @@ func TestInternalBrokerMTLSConfigWithFixtureCertificates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls listen failed: %v", err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() { _ = listener.Close() })
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -57,7 +57,7 @@ func TestInternalBrokerMTLSConfigWithFixtureCertificates(t *testing.T) {
 			serverErr <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		_, err = conn.Write([]byte("ok"))
 		serverErr <- err
 	}()
@@ -67,7 +67,7 @@ func TestInternalBrokerMTLSConfigWithFixtureCertificates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls dial failed: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() { _ = conn.Close() })
 	buf := make([]byte, 2)
 	if _, err := conn.Read(buf); err != nil {
 		t.Fatalf("tls read failed: %v", err)

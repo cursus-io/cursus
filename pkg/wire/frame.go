@@ -19,9 +19,9 @@ const (
 
 var (
 	ErrInvalidFrame        = errors.New("invalid Wire v2 frame")
-	ErrFrameTooLarge       = errors.New("Wire v2 frame exceeds size limit")
-	ErrChecksumMismatch    = errors.New("Wire v2 checksum mismatch")
-	ErrCompressionMismatch = errors.New("Wire v2 compression mismatch")
+	ErrFrameTooLarge       = errors.New("wire v2 frame exceeds size limit")
+	ErrChecksumMismatch    = errors.New("wire v2 checksum mismatch")
+	ErrCompressionMismatch = errors.New("wire v2 compression mismatch")
 	crc32cTable            = crc32.MakeTable(crc32.Castagnoli)
 )
 

@@ -227,7 +227,7 @@ func (j *Journal) loadLocked() (map[string]*Snapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open transaction journal for recovery: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	info, err := file.Stat()
 	if err != nil {

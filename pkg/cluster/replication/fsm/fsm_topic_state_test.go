@@ -292,11 +292,12 @@ func TestBrokerFSMRestoreVersionNineRequiresDefinitionFields(t *testing.T) {
 				Name: "orders", Revision: 1, LifecycleEpoch: topic.InitialLifecycleEpoch,
 				Partitions: 1, ReplicationFactor: 3, Policy: topic.DefaultPolicy(),
 			}
-			if missing == "revision" {
+			switch missing {
+			case "revision":
 				definition.Revision = 0
-			} else if missing == "replication_factor" {
+			case "replication_factor":
 				definition.ReplicationFactor = 0
-			} else {
+			default:
 				definition.LifecycleEpoch = 0
 			}
 			state := BrokerFSMState{

@@ -405,12 +405,12 @@ func TestHandler_HandleStreamVersion_Validation(t *testing.T) {
 func TestHandler_HandleReadStreamRejectsInvalidFromVersion(t *testing.T) {
 	h := NewHandler(nil)
 	client, server := net.Pipe()
-	defer client.Close()
+	t.Cleanup(func() { _ = client.Close() })
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		defer server.Close()
+		defer func() { _ = server.Close() }()
 		h.HandleReadStream("READ_STREAM topic=orders key=order-1 from_version=invalid", server)
 	}()
 

@@ -212,7 +212,7 @@ func startAdminTestServer(t *testing.T, response string) (string, <-chan adminTe
 			result <- adminTestResult{err: acceptErr}
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		connection, request, command, readErr := acceptWireTestRequest(conn)
 		if readErr != nil {
 			result <- adminTestResult{err: readErr}
@@ -252,7 +252,7 @@ func startAdminNegotiationTestServer(t *testing.T, closeAfterNegotiation bool) (
 			result <- adminTestResult{err: acceptErr}
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		if closeAfterNegotiation {
 			plain, _ := wire.NewCodec(wire.CompressionNone)
 			frame, readErr := plain.ReadFrame(conn)
@@ -290,7 +290,7 @@ func startAdminCommandDropServer(t *testing.T) (string, <-chan adminTestResult) 
 			result <- adminTestResult{err: acceptErr}
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		_, _, command, readErr := acceptWireTestRequest(conn)
 		result <- adminTestResult{command: command, err: readErr}
 	}()

@@ -41,7 +41,7 @@ func NewClientConn(conn net.Conn, compression string) (*ClientConn, error) {
 
 func (c *ClientConn) Send(payload []byte) error {
 	if c == nil || c.wire == nil {
-		return fmt.Errorf("Wire v2 client connection is not initialized")
+		return fmt.Errorf("wire v2 client connection is not initialized")
 	}
 	command, framePayload, err := requestFramePayload(payload)
 	if err != nil {
@@ -69,7 +69,7 @@ func (c *ClientConn) Send(payload []byte) error {
 
 func (c *ClientConn) Receive() ([]byte, error) {
 	if c == nil || c.wire == nil {
-		return nil, fmt.Errorf("Wire v2 client connection is not initialized")
+		return nil, fmt.Errorf("wire v2 client connection is not initialized")
 	}
 	c.stateMu.Lock()
 	activeID, activeCommand, awaiting := c.activeID, c.activeCmd, c.awaiting
@@ -87,7 +87,7 @@ func (c *ClientConn) Receive() ([]byte, error) {
 	}
 	if activeID == 0 || frame.RequestID != activeID || frame.Command != activeCommand {
 		return nil, fmt.Errorf(
-			"Wire v2 response correlation mismatch: request=%d/%s response=%d/%s",
+			"wire v2 response correlation mismatch: request=%d/%s response=%d/%s",
 			activeID, activeCommand, frame.RequestID, frame.Command,
 		)
 	}

@@ -14,12 +14,12 @@ func TestTransactionCommandsFollowAndCacheCoordinatorRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer coordinator.Close()
+	t.Cleanup(func() { _ = coordinator.Close() })
 	bootstrap, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer bootstrap.Close()
+	t.Cleanup(func() { _ = bootstrap.Close() })
 
 	_, portText, err := net.SplitHostPort(coordinator.Addr().String())
 	if err != nil {
@@ -121,7 +121,7 @@ func TestTransactionalProducerReinitializesBeforeNextTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() { _ = listener.Close() })
 
 	commands := make(chan string, 5)
 	serverErrors := make(chan error, 1)
@@ -184,7 +184,7 @@ func TestTransactionalProducerPreservesSessionAcrossLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() { _ = listener.Close() })
 
 	commands := make(chan string, 7)
 	serverErrors := make(chan error, 1)

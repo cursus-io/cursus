@@ -109,7 +109,7 @@ func (pc *ProducerClient) connectPartitionLocked(idx int, addr string) error {
 	conn, err = openWireConnection(conn, pc.config.HandshakeTimeoutMS, pc.config.CompressionType)
 	if err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("Wire v2 handshake with %s failed: %w", addr, err)
+		return fmt.Errorf("wire v2 handshake with %s failed: %w", addr, err)
 	}
 	if err := authenticateConfiguredClient(conn, pc.config.Principal, pc.config.AuthToken); err != nil {
 		_ = conn.Close()

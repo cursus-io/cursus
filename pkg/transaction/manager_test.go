@@ -210,7 +210,9 @@ func TestManagerExportImportState(t *testing.T) {
 	}
 
 	restored := NewManager()
-	restored.ImportState(m.ExportState())
+	if err := restored.ImportState(m.ExportState()); err != nil {
+		t.Fatalf("import state failed: %v", err)
+	}
 	tx, err := restored.Status("tx-1")
 	if err != nil {
 		t.Fatalf("restored status failed: %v", err)
@@ -363,7 +365,9 @@ func TestManagerInitProducerStateSurvivesExportImport(t *testing.T) {
 	}
 
 	restored := NewManager()
-	restored.ImportState(m.ExportState())
+	if err := restored.ImportState(m.ExportState()); err != nil {
+		t.Fatalf("import state failed: %v", err)
+	}
 	producer2, epoch2, err := restored.InitProducer("tx-restore-producer")
 	if err != nil {
 		t.Fatalf("restored init producer failed: %v", err)

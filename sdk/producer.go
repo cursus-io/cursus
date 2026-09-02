@@ -284,7 +284,7 @@ func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) er
 
 	conn, err = openWireConnection(conn, p.config.HandshakeTimeoutMS, p.config.CompressionType)
 	if err != nil {
-		return fmt.Errorf("Wire v2 handshake: %w", err)
+		return fmt.Errorf("wire v2 handshake: %w", err)
 	}
 	if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {
 		return fmt.Errorf("authentication: %w", err)

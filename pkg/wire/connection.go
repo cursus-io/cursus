@@ -18,7 +18,7 @@ type Connection struct {
 
 func ClientHandshake(conn net.Conn, compressions []Compression) (*Connection, error) {
 	if conn == nil {
-		return nil, fmt.Errorf("Wire v2 client connection is nil")
+		return nil, fmt.Errorf("wire v2 client connection is nil")
 	}
 	request := NegotiationRequest{
 		MinimumVersion: ProtocolVersion,
@@ -41,7 +41,7 @@ func ClientHandshake(conn net.Conn, compressions []Compression) (*Connection, er
 		return nil, fmt.Errorf("unexpected Wire v2 negotiation frame kind=%d command=%s", frame.Kind, frame.Command)
 	}
 	if frame.Status != StatusOK {
-		return nil, fmt.Errorf("Wire v2 negotiation rejected")
+		return nil, fmt.Errorf("wire v2 negotiation rejected")
 	}
 	response, err := DecodeNegotiationResponse(frame.Payload)
 	if err != nil {
@@ -66,7 +66,7 @@ func ClientHandshake(conn net.Conn, compressions []Compression) (*Connection, er
 
 func ServerHandshake(conn net.Conn, supported []Compression) (*Connection, error) {
 	if conn == nil {
-		return nil, fmt.Errorf("Wire v2 server connection is nil")
+		return nil, fmt.Errorf("wire v2 server connection is nil")
 	}
 	plain, _ := NewCodec(CompressionNone)
 	frame, err := plain.ReadFrame(conn)
@@ -109,7 +109,7 @@ func (c *Connection) Compression() Compression {
 
 func (c *Connection) ReadFrame() (Frame, error) {
 	if c == nil || c.conn == nil || c.codec == nil {
-		return Frame{}, fmt.Errorf("Wire v2 connection is not initialized")
+		return Frame{}, fmt.Errorf("wire v2 connection is not initialized")
 	}
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
@@ -118,7 +118,7 @@ func (c *Connection) ReadFrame() (Frame, error) {
 
 func (c *Connection) WriteFrame(frame Frame) error {
 	if c == nil || c.conn == nil || c.codec == nil {
-		return fmt.Errorf("Wire v2 connection is not initialized")
+		return fmt.Errorf("wire v2 connection is not initialized")
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()

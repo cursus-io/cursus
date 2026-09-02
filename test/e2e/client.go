@@ -276,7 +276,7 @@ func (bc *BrokerClient) writeWireCommand(commandText string) (wire.Command, uint
 	requestID := bc.nextRequestID
 	bc.mu.Unlock()
 	if connection == nil {
-		return wire.CommandUnknown, 0, fmt.Errorf("Wire v2 connection is not available")
+		return wire.CommandUnknown, 0, fmt.Errorf("wire v2 connection is not available")
 	}
 	if err := connection.WriteFrame(wire.Frame{
 		Kind: wire.KindRequest, Command: command, RequestID: requestID, Payload: payload,
@@ -291,7 +291,7 @@ func (bc *BrokerClient) readWirePayload(command wire.Command, requestID uint64) 
 	connection := bc.wire
 	bc.mu.Unlock()
 	if connection == nil {
-		return nil, fmt.Errorf("Wire v2 connection is not available")
+		return nil, fmt.Errorf("wire v2 connection is not available")
 	}
 	response, err := connection.ReadFrame()
 	if err != nil {
@@ -300,7 +300,7 @@ func (bc *BrokerClient) readWirePayload(command wire.Command, requestID uint64) 
 	if response.Command != command || response.RequestID != requestID ||
 		(response.Kind != wire.KindResponse && response.Kind != wire.KindStream) {
 		return nil, fmt.Errorf(
-			"Wire v2 response correlation mismatch: request=%d/%s response=%d/%s",
+			"wire v2 response correlation mismatch: request=%d/%s response=%d/%s",
 			requestID, command, response.RequestID, response.Command,
 		)
 	}

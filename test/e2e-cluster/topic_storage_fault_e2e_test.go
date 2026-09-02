@@ -162,7 +162,7 @@ func readMetric(node int, name string, labels map[string]string) (float64, error
 	if err != nil {
 		return 0, err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("metrics status %d", response.StatusCode)
 	}
@@ -208,7 +208,7 @@ func readReadiness(node int) (int, string, error) {
 	if err != nil {
 		return 0, "", err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		return 0, "", err

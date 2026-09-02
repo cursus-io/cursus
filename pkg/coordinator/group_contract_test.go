@@ -65,7 +65,7 @@ func TestGroupSnapshotRestoresPartitionsBeforeFirstOffsetCommit(t *testing.T) {
 	require.Len(t, assignments, 4)
 
 	restored := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
-	restored.ImportState(c.ExportState())
+	require.NoError(t, restored.ImportState(c.ExportState()))
 
 	status, err := restored.GetGroupStatus("workers")
 	require.NoError(t, err)

@@ -298,7 +298,7 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 	if err != nil {
 		return "", err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	deadline := time.Now().Add(time.Duration(c.config.RequestTimeoutMS) * time.Millisecond)
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
@@ -320,9 +320,9 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 			return "", brokerErr
 		}
 		if isRetryableAdminTransportError(err) {
-			return "", fmt.Errorf("Wire v2 handshake with %s: %w", addr, err)
+			return "", fmt.Errorf("wire v2 handshake with %s: %w", addr, err)
 		}
-		return "", &terminalAdminError{err: fmt.Errorf("Wire v2 handshake with %s: %w", addr, err)}
+		return "", &terminalAdminError{err: fmt.Errorf("wire v2 handshake with %s: %w", addr, err)}
 	}
 	if err := authenticateConfiguredClient(conn, c.config.Principal, c.config.AuthToken); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
