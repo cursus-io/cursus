@@ -59,6 +59,7 @@ const (
 	CommandJoinCluster
 	CommandLeaveCluster
 	CommandHeartbeatCluster
+	CommandReplicaCatchup
 )
 
 var commandNames = [...]string{
@@ -113,6 +114,7 @@ var commandNames = [...]string{
 	CommandJoinCluster:       "JOIN_CLUSTER",
 	CommandLeaveCluster:      "LEAVE_CLUSTER",
 	CommandHeartbeatCluster:  "HEARTBEAT_CLUSTER",
+	CommandReplicaCatchup:    "REPLICA_CATCHUP",
 }
 
 var commandsByName = func() map[string]Command {

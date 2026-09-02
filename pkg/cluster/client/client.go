@@ -111,6 +111,31 @@ func (c *TCPClusterClient) sendHeartbeat(
 	return nil
 }
 
+// FetchReplicaCatchup requests one bounded committed-log range from the
+// partition leader's authenticated discovery endpoint.
+func (c *TCPClusterClient) FetchReplicaCatchup(
+	ctx context.Context,
+	leaderAddr string,
+	discoveryPort int,
+	request fsm.ReplicaCatchupRequest,
+) (fsm.ReplicaCatchupBatch, error) {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("marshal replica catch-up request: %w", err)
+	}
+	response, err := c.sendRequest(ctx, heartbeatTarget(leaderAddr, discoveryPort), wire.CommandReplicaCatchup, map[string]string{
+		"request": string(data),
+	})
+	if err != nil {
+		return fsm.ReplicaCatchupBatch{}, err
+	}
+	var batch fsm.ReplicaCatchupBatch
+	if err := json.Unmarshal(response, &batch); err != nil {
+		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("decode replica catch-up response: %w", err)
+	}
+	return batch, nil
+}
+
 func heartbeatTarget(peer string, discoveryPort int) string {
 	address := peer
 	if _, suffix, ok := strings.Cut(peer, "@"); ok {

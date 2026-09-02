@@ -847,10 +847,14 @@ func (h *Handler) Close() error {
 	return firstErr
 }
 
-// writeError writes a JSON error envelope to the connection.
+// writeError writes the canonical textual error envelope used by the wire
+// transport to produce a typed broker error.
 func writeError(conn net.Conn, msg string) {
-	errResp, _ := json.Marshal(map[string]string{"status": "ERROR", "error": msg})
-	_ = util.WriteWithLength(conn, errResp)
+	msg = strings.TrimSpace(msg)
+	if !strings.HasPrefix(msg, "ERROR:") {
+		msg = "ERROR: " + msg
+	}
+	_ = util.WriteWithLength(conn, []byte(msg))
 }
 
 // parseKeyValueArgs parses "key=value" pairs from a command argument string.

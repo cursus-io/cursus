@@ -47,6 +47,10 @@ func (m *MockServiceDiscovery) UpdateHeartbeat(nodeID string) {
 func (m *MockServiceDiscovery) HandleHeartbeat(nodeID string, proofs []fsm.ISRCatchupProof) error {
 	return m.Called(nodeID, proofs).Error(0)
 }
+func (m *MockServiceDiscovery) FetchReplicaCatchup(request fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error) {
+	args := m.Called(request)
+	return args.Get(0).(fsm.ReplicaCatchupBatch), args.Error(1)
+}
 
 func (m *MockServiceDiscovery) StartReconciler(ctx context.Context) {
 	m.Called(ctx)

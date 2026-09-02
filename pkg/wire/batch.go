@@ -115,7 +115,7 @@ func DecodeBatch(data []byte) (*Batch, error) {
 
 func validateAcks(acks string) error {
 	switch acks {
-	case "", "0", "none", "1", "-1", "all":
+	case "", "0", "1", "-1", "all":
 		return nil
 	default:
 		return fmt.Errorf("invalid acknowledgements %q", acks)

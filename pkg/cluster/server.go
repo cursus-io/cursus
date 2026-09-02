@@ -129,6 +129,8 @@ func (h *ClusterServer) handleConnection(conn net.Conn) {
 			response, requestError = h.handleLeaveCluster(payload)
 		case wire.CommandHeartbeatCluster:
 			response, requestError = h.handleHeartbeatCluster(payload)
+		case wire.CommandReplicaCatchup:
+			response, requestError = h.handleReplicaCatchup(payload)
 		case wire.CommandListCluster:
 			response, requestError = h.handleListCluster()
 		default:
@@ -161,6 +163,42 @@ func (h *ClusterServer) handleHeartbeatCluster(payload wire.CommandPayload) (any
 		return nil, internalClusterError(err)
 	}
 	return map[string]bool{"success": true}, nil
+}
+
+func (h *ClusterServer) handleReplicaCatchup(payload wire.CommandPayload) (any, *wire.ErrorPayload) {
+	encoded := payload.Fields["request"]
+	if encoded == "" {
+		return nil, validationError("replica catch-up request is required")
+	}
+	var request fsm.ReplicaCatchupRequest
+	if err := json.Unmarshal([]byte(encoded), &request); err != nil {
+		return nil, validationError("invalid replica catch-up request")
+	}
+	batch, err := h.sd.FetchReplicaCatchup(request)
+	if err != nil {
+		return nil, internalClusterError(err)
+	}
+	batch, err = fitReplicaCatchupBatch(batch)
+	if err != nil {
+		return nil, internalClusterError(err)
+	}
+	return batch, nil
+}
+
+func fitReplicaCatchupBatch(batch fsm.ReplicaCatchupBatch) (fsm.ReplicaCatchupBatch, error) {
+	for {
+		data, err := json.Marshal(batch)
+		if err != nil {
+			return fsm.ReplicaCatchupBatch{}, err
+		}
+		if len(data) <= wire.MaxFramePayload {
+			return batch, nil
+		}
+		if len(batch.Messages) <= 1 {
+			return fsm.ReplicaCatchupBatch{}, fmt.Errorf("replica catch-up record exceeds Wire v2 frame limit")
+		}
+		batch.Messages = batch.Messages[:len(batch.Messages)/2]
+	}
 }
 
 func (h *ClusterServer) handleJoinCluster(payload wire.CommandPayload) (any, *wire.ErrorPayload) {

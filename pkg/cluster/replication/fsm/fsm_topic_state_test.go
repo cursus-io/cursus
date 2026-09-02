@@ -127,6 +127,8 @@ func TestBrokerFSMRestoreTruncatesTailBeyondExplicitCommittedHWMZero(t *testing.
 
 	restored := NewBrokerFSM(manager, nil)
 	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(data))))
+	require.Equal(t, uint64(1), partition.NextOffset(), "restore stages the tail until replay is finalized")
+	require.NoError(t, restored.FinalizeRecoveredPartitions())
 	require.Zero(t, partition.NextOffset())
 	require.Zero(t, partition.GetHWM())
 	messages, err := partition.ReadMessages(0, 10)
@@ -143,7 +145,10 @@ func TestBrokerFSMRestoreTruncatesTailToAuthoritativeCommittedHWM(t *testing.T) 
 	partition.FlushDisk()
 
 	data := currentSnapshotData(t, manager, "bounded-orders", 1)
-	require.NoError(t, NewBrokerFSM(manager, nil).Restore(io.NopCloser(bytes.NewReader(data))))
+	restored := NewBrokerFSM(manager, nil)
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(data))))
+	require.Equal(t, uint64(2), partition.NextOffset(), "restore must not truncate before Raft replay completes")
+	require.NoError(t, restored.FinalizeRecoveredPartitions())
 	require.Equal(t, uint64(1), partition.NextOffset())
 	require.Equal(t, uint64(1), partition.GetHWM())
 	messages, err := partition.ReadMessages(0, 10)
@@ -152,14 +157,52 @@ func TestBrokerFSMRestoreTruncatesTailToAuthoritativeCommittedHWM(t *testing.T) 
 	require.Equal(t, "committed", messages[0].Payload)
 }
 
-func TestBrokerFSMRestoreRejectsCommittedHWMAboveLocalLEO(t *testing.T) {
+func TestBrokerFSMRestorePreservesLocallyCommittedPostSnapshotTail(t *testing.T) {
+	manager, partition := newDurableFSMTopic(t, "post-snapshot-orders")
+	require.NoError(t, partition.EnqueueBatchLeader([]types.Message{
+		{Payload: "in-snapshot"},
+		{Payload: "committed-after-snapshot"},
+		{Payload: "uncommitted-tail"},
+	}))
+	partition.SetHWM(2)
+	partition.FlushDisk()
+
+	data := currentSnapshotData(t, manager, "post-snapshot-orders", 1)
+	restored := NewBrokerFSM(manager, nil)
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(data))))
+	require.Equal(t, uint64(3), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM(), "post-snapshot data stays invisible before replay")
+	definition := manager.GetTopic("post-snapshot-orders").Definition()
+	commit, err := json.Marshal(partitionCommitCommand{
+		Topic: "post-snapshot-orders", Partition: 0, Leader: "broker-1", LeaderEpoch: 7,
+		HWM: 2, LifecycleEpoch: definition.LifecycleEpoch,
+	})
+	require.NoError(t, err)
+	require.Nil(t, restored.Apply(&raft.Log{Data: append([]byte("PARTITION_COMMIT:"), commit...), Index: 2}))
+	require.Equal(t, uint64(2), partition.GetHWM())
+	require.Equal(t, uint64(3), partition.NextOffset())
+	require.NoError(t, restored.FinalizeRecoveredPartitions())
+	require.Equal(t, uint64(2), partition.NextOffset())
+	require.Equal(t, uint64(2), partition.GetHWM())
+	messages, err := partition.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	require.Equal(t, "in-snapshot", messages[0].Payload)
+	require.Equal(t, "committed-after-snapshot", messages[1].Payload)
+}
+
+func TestBrokerFSMRestoreLeavesReplicaBelowCommittedHWMForCatchup(t *testing.T) {
 	manager, partition := newDurableFSMTopic(t, "behind-orders")
 	data := currentSnapshotData(t, manager, "behind-orders", 1)
 
-	err := NewBrokerFSM(manager, nil).Restore(io.NopCloser(bytes.NewReader(data)))
-	require.ErrorContains(t, err, "replica is behind committed watermark")
+	restored := NewBrokerFSM(manager, nil)
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(data))))
+	require.True(t, restored.HasPendingPartitionRecovery())
+	require.NoError(t, restored.FinalizeRecoveredPartitions())
 	require.Zero(t, partition.NextOffset())
 	require.Zero(t, partition.GetHWM())
+	require.ErrorContains(t, restored.ValidateLocalLeaderLogs("broker-1"), "missing committed data")
+	require.NoError(t, restored.ValidateLocalLeaderLogs("broker-2"), "a follower may start and fetch the missing committed range")
 }
 
 func currentSnapshotData(t *testing.T, manager *topic.TopicManager, name string, committedHWM uint64) []byte {

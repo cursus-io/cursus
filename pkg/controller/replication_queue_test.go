@@ -544,6 +544,41 @@ func TestAllInsufficientISRRejectsBeforeLeadershipReconciliation(t *testing.T) {
 	require.Zero(t, partition.GetHWM())
 }
 
+func TestPreparePartitionReplicaAllowsFencedBackfillBelowCommittedHWM(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	diskManager := disk.NewDiskManager(cfg)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	state := fsm.NewBrokerFSM(topicManager, nil)
+	applyPartitionMetadata(t, state, "orders", 0, fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 7, CommittedHWM: 2, CommittedHWMKnown: true,
+		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1"}, PartitionCount: 1,
+	})
+	raftManager := &MockRaftManagerForForward{state: state}
+	cluster := clusterController.NewClusterController(context.Background(), cfg, raftManager, nil, "broker-2", "broker-2:9001")
+	handler := NewCommandHandler(topicManager, cfg, nil, nil, cluster)
+	t.Cleanup(func() {
+		_ = handler.Close()
+		diskManager.CloseAllHandlers()
+	})
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+
+	release, err := handler.preparePartitionReplica("orders", 0, partition, "broker-1", 7)
+	require.NoError(t, err)
+	release()
+	require.Zero(t, partition.NextOffset())
+	require.NoError(t, handler.ApplyReplicaCatchup(fsm.ReplicaCatchupBatch{
+		Topic: "orders", Partition: 0, BrokerID: "broker-2", StartOffset: 0, CommittedHWM: 2,
+		Leader: "broker-1", LeaderEpoch: 7, LifecycleEpoch: topic.InitialLifecycleEpoch,
+		Messages: []types.Message{{Offset: 0, Payload: "zero"}, {Offset: 1, Payload: "one"}},
+	}))
+	require.Equal(t, uint64(2), partition.NextOffset())
+	require.Equal(t, uint64(2), partition.GetHWM())
+}
+
 func TestDistributedLeaderAcknowledgementsPreserveOrderedUncommittedTail(t *testing.T) {
 	handler, manager, executor := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))

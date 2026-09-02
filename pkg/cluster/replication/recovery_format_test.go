@@ -38,3 +38,29 @@ func TestEnsureRaftRecoveryFormatRejectsUnknownMarker(t *testing.T) {
 	err := ensureRaftRecoveryFormat(directory)
 	require.True(t, errors.Is(err, fsm.ErrUnsupportedRecoveryProtocol))
 }
+
+func TestEnsureRaftRecoveryFormatSyncsContainingDirectory(t *testing.T) {
+	directory := t.TempDir()
+	original := syncRaftDirectoryFn
+	t.Cleanup(func() { syncRaftDirectoryFn = original })
+	var synced string
+	syncRaftDirectoryFn = func(path string) error {
+		synced = path
+		return nil
+	}
+
+	require.NoError(t, ensureRaftRecoveryFormat(directory))
+	require.Equal(t, directory, synced)
+}
+
+func TestEnsureRaftRecoveryFormatFailsWhenDirectorySyncFails(t *testing.T) {
+	directory := t.TempDir()
+	original := syncRaftDirectoryFn
+	t.Cleanup(func() { syncRaftDirectoryFn = original })
+	want := errors.New("directory sync failed")
+	syncRaftDirectoryFn = func(string) error { return want }
+
+	err := ensureRaftRecoveryFormat(directory)
+	require.ErrorIs(t, err, want)
+	require.Contains(t, err.Error(), "sync Raft format marker directory")
+}

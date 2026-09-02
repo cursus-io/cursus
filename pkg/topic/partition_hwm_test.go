@@ -323,6 +323,36 @@ func TestPartition_ReconcileCommittedHWMTruncatesUncommittedTail(t *testing.T) {
 	require.Equal(t, "replacement", msgs[1].Payload)
 }
 
+func TestPartition_ReconcileSnapshotHWMPreservesLaterCommittedData(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 1
+	dh, err := disk.NewDiskHandler(cfg, "snapshot-hwm", 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dh.Close() })
+	p := NewPartition(0, "snapshot-hwm", dh, nil, cfg)
+	t.Cleanup(p.Close)
+
+	require.NoError(t, p.EnqueueBatchLeader([]types.Message{
+		{Payload: "snapshot"},
+		{Payload: "later-commit"},
+		{Payload: "uncommitted"},
+	}))
+	p.SetHWM(2)
+	require.NoError(t, p.ReconcileSnapshotHWM(1))
+	require.True(t, p.SnapshotRecoveryPending())
+	require.Equal(t, uint64(3), p.NextOffset())
+	require.Equal(t, uint64(1), p.GetHWM())
+	require.NoError(t, p.ApplyReplicaHWM(2))
+	require.NoError(t, p.FinalizeSnapshotRecovery(2))
+	require.False(t, p.SnapshotRecoveryPending())
+	require.Equal(t, uint64(2), p.NextOffset())
+	require.Equal(t, uint64(2), p.GetHWM())
+	messages, err := p.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+}
+
 func TestPartition_EnqueueBatchLeaderDoesNotAdvanceStateOnWriteFailure(t *testing.T) {
 	cfg := config.DefaultConfig()
 	dh := new(MockStorageHandler)

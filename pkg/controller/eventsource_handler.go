@@ -342,7 +342,9 @@ func eventStreamKey(cmd, prefix string) string {
 }
 
 func writeReadStreamError(conn net.Conn, msg string) {
-	code := strings.TrimPrefix(msg, "ERROR: ")
-	payload, _ := json.Marshal(map[string]string{"status": "ERROR", "error": code})
-	_ = util.WriteWithLength(conn, payload)
+	msg = strings.TrimSpace(msg)
+	if !strings.HasPrefix(msg, "ERROR:") {
+		msg = "ERROR: " + msg
+	}
+	_ = util.WriteWithLength(conn, []byte(msg))
 }

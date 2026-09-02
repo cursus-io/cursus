@@ -18,6 +18,7 @@ type ServiceDiscovery interface {
 	RemoveNode(nodeID string) (string, error)
 	UpdateHeartbeat(nodeID string)
 	HandleHeartbeat(nodeID string, proofs []fsm.ISRCatchupProof) error
+	FetchReplicaCatchup(request fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error)
 	StartReconciler(ctx context.Context)
 	Reconcile()
 }
@@ -106,6 +107,20 @@ func (sd *serviceDiscovery) HandleHeartbeat(nodeID string, proofs []fsm.ISRCatch
 	manager := sd.rm.GetISRManager()
 	manager.UpdateHeartbeat(nodeID)
 	return manager.SubmitCatchupProofs(nodeID, proofs)
+}
+
+func (sd *serviceDiscovery) FetchReplicaCatchup(request fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error) {
+	if sd.fsm == nil {
+		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("FSM is unavailable")
+	}
+	metadata := sd.fsm.GetPartitionMetadata(fmt.Sprintf("%s-%d", request.Topic, request.Partition))
+	if metadata == nil {
+		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("partition metadata not found")
+	}
+	if metadata.Leader != sd.brokerID {
+		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("broker %s is not partition leader; current leader is %s", sd.brokerID, metadata.Leader)
+	}
+	return sd.fsm.FetchReplicaCatchup(request)
 }
 
 func (sd *serviceDiscovery) AddNode(nodeID string, addr string) (string, error) {

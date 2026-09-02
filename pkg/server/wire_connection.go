@@ -86,7 +86,17 @@ func joinErrorDetails(details []string) string {
 }
 
 func isStreamClosePayload(payload []byte) bool {
-	return strings.HasPrefix(string(payload), "STREAM_CONTROL type=close")
+	fields := strings.Fields(string(payload))
+	if len(fields) == 0 || !strings.EqualFold(fields[0], "STREAM_CONTROL") {
+		return false
+	}
+	for _, field := range fields[1:] {
+		key, value, ok := strings.Cut(field, "=")
+		if ok && strings.EqualFold(key, "type") && strings.EqualFold(value, "close") {
+			return true
+		}
+	}
+	return false
 }
 
 func negotiateServerConnection(conn net.Conn) (*wire.Connection, *serverWireConn, error) {

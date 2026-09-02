@@ -175,7 +175,7 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 		err = f.tm.ApplyDefinition(*definition)
 	}
 	if err == nil {
-		err = f.reconcileMaterializedTopicHWM(definition.Name)
+		err = f.reconcileMaterializedTopicHWM(definition.Name, false)
 	}
 	f.recordTopicMaterialization(definition.Name, TopicMaterializationCreate, err)
 	if err != nil {
@@ -208,7 +208,7 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 		err = f.tm.CompleteTruncation(definition.Name)
 	}
 	if err == nil {
-		err = f.reconcileMaterializedTopicHWM(definition.Name)
+		err = f.reconcileMaterializedTopicHWM(definition.Name, true)
 	}
 	f.recordTopicMaterialization(definition.Name, TopicMaterializationRestore, err)
 	if err != nil {
@@ -217,7 +217,7 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 	return nil
 }
 
-func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string) error {
+func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string, restoringSnapshot bool) error {
 	if f.tm == nil {
 		return nil
 	}
@@ -254,8 +254,14 @@ func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string) error {
 		if err != nil {
 			return err
 		}
-		if err := currentPartition.ReconcileCommittedHWM(partitionMetadata.CommittedHWM); err != nil {
-			return fmt.Errorf("reconcile partition %d committed HWM: %w", partition, err)
+		var reconcileErr error
+		if restoringSnapshot {
+			reconcileErr = currentPartition.ReconcileSnapshotHWM(partitionMetadata.CommittedHWM)
+		} else {
+			reconcileErr = currentPartition.ReconcileCommittedHWM(partitionMetadata.CommittedHWM)
+		}
+		if reconcileErr != nil {
+			return fmt.Errorf("reconcile partition %d committed HWM: %w", partition, reconcileErr)
 		}
 		currentPartition.FlushDisk()
 	}

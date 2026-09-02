@@ -59,11 +59,12 @@ type BrokerFSM struct {
 	transitionMu      sync.Mutex
 	materializationMu sync.Mutex
 
-	logs              map[uint64]*ReplicationEntry
-	brokers           map[string]*BrokerInfo
-	partitionMetadata map[string]*PartitionMetadata
-	producerState     map[string]map[int]map[string]ProducerSequence // Topic -> Partition -> ProducerID -> Last Epoch/Seq
-	applied           uint64
+	logs                     map[uint64]*ReplicationEntry
+	brokers                  map[string]*BrokerInfo
+	partitionMetadata        map[string]*PartitionMetadata
+	producerState            map[string]map[int]map[string]ProducerSequence // Topic -> Partition -> ProducerID -> Last Epoch/Seq
+	applied                  uint64
+	partitionRecoveryPending bool
 
 	tm                       *topic.TopicManager
 	cd                       *coordinator.Coordinator
@@ -109,6 +110,18 @@ func (f *BrokerFSM) GetAllPartitionKeys() []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+func (f *BrokerFSM) AppliedIndex() uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.applied
+}
+
+func (f *BrokerFSM) HasPendingPartitionRecovery() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.partitionRecoveryPending
 }
 
 // GetTopicDefinition returns a detached copy of the authoritative replicated
@@ -395,6 +408,7 @@ func (f *BrokerFSM) reconcileCommittedPartitions() error {
 	if tm == nil {
 		return nil
 	}
+	pending := false
 	for key, meta := range metadata {
 		if !meta.CommittedHWMKnown {
 			return fmt.Errorf("%w: partition %s has no authoritative committed HWM", ErrUnsupportedRecoveryProtocol, key)
@@ -413,10 +427,110 @@ func (f *BrokerFSM) reconcileCommittedPartitions() error {
 		}
 		p, err := t.GetPartition(partition)
 		if err == nil {
-			if err := p.ReconcileCommittedHWM(meta.CommittedHWM); err != nil {
+			if err := p.ReconcileSnapshotHWM(meta.CommittedHWM); err != nil {
 				return fmt.Errorf("reconcile committed HWM for %s: %w", key, err)
 			}
+			pending = pending || p.SnapshotRecoveryPending()
 			p.FlushDisk()
+		}
+	}
+	f.mu.Lock()
+	f.partitionRecoveryPending = pending
+	f.mu.Unlock()
+	return nil
+}
+
+// FinalizeRecoveredPartitions performs destructive reconciliation only after
+// the replication manager has observed every committed post-snapshot command
+// applied to this FSM.
+func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
+
+	f.mu.RLock()
+	metadata := make(map[string]PartitionMetadata, len(f.partitionMetadata))
+	for key, value := range f.partitionMetadata {
+		if value != nil {
+			metadata[key] = *value
+		}
+	}
+	tm := f.tm
+	f.mu.RUnlock()
+	if tm == nil {
+		f.mu.Lock()
+		f.partitionRecoveryPending = false
+		f.mu.Unlock()
+		return nil
+	}
+	for key, meta := range metadata {
+		if !meta.CommittedHWMKnown {
+			return fmt.Errorf("%w: partition %s has no authoritative committed HWM", ErrUnsupportedRecoveryProtocol, key)
+		}
+		idx := strings.LastIndex(key, "-")
+		if idx < 0 {
+			continue
+		}
+		partitionID, err := strconv.Atoi(key[idx+1:])
+		if err != nil {
+			continue
+		}
+		localTopic := tm.GetTopic(key[:idx])
+		if localTopic == nil {
+			continue
+		}
+		partition, err := localTopic.GetPartition(partitionID)
+		if err != nil {
+			continue
+		}
+		if err := partition.FinalizeSnapshotRecovery(meta.CommittedHWM); err != nil {
+			return fmt.Errorf("finalize committed HWM for %s: %w", key, err)
+		}
+		partition.FlushDisk()
+	}
+	f.mu.Lock()
+	f.partitionRecoveryPending = false
+	f.mu.Unlock()
+	return nil
+}
+
+// ValidateLocalLeaderLogs prevents a broker from serving as the clean leader
+// for a partition whose committed range is missing locally. Followers may be
+// below HWM because the background catch-up path can repair them.
+func (f *BrokerFSM) ValidateLocalLeaderLogs(brokerID string) error {
+	if brokerID == "" {
+		return nil
+	}
+	f.mu.RLock()
+	metadata := make(map[string]PartitionMetadata)
+	for key, value := range f.partitionMetadata {
+		if value != nil && value.Leader == brokerID {
+			metadata[key] = *value
+		}
+	}
+	tm := f.tm
+	f.mu.RUnlock()
+	if tm == nil {
+		return nil
+	}
+	for key, meta := range metadata {
+		idx := strings.LastIndex(key, "-")
+		if idx < 0 {
+			continue
+		}
+		partitionID, err := strconv.Atoi(key[idx+1:])
+		if err != nil {
+			continue
+		}
+		localTopic := tm.GetTopic(key[:idx])
+		if localTopic == nil {
+			continue
+		}
+		partition, err := localTopic.GetPartition(partitionID)
+		if err != nil {
+			continue
+		}
+		if partition.NextOffset() < meta.CommittedHWM {
+			return fmt.Errorf("local leader %s is missing committed data for %s: leo=%d hwm=%d", brokerID, key, partition.NextOffset(), meta.CommittedHWM)
 		}
 	}
 	return nil

@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
@@ -100,4 +103,70 @@ func TestValidateISRCatchupProofRejectsReplicaBelowAuthoritativeHWM(t *testing.T
 	require.ErrorContains(t, err, "not synchronized")
 	require.False(t, required)
 	require.Equal(t, []string{"node-1"}, brokerFSM.GetPartitionMetadata("orders-0").ISR)
+}
+
+func TestBuildReplicaCatchupRequestsUsesLocalLEOAndLeaderFence(t *testing.T) {
+	brokerFSM := newISRCatchupTestFSM(t)
+	brokerFSM.mu.Lock()
+	brokerFSM.partitionMetadata["orders-0"].CommittedHWM = 3
+	brokerFSM.mu.Unlock()
+
+	requests := brokerFSM.BuildReplicaCatchupRequests("node-2")
+	require.Len(t, requests, 1)
+	require.Equal(t, ReplicaCatchupRequest{
+		Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 0, CommittedHWM: 3,
+		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: topic.InitialLifecycleEpoch,
+		MaxRecords: MaxReplicaCatchupRecords, LeaderAddress: "127.0.0.1:9000",
+	}, requests[0])
+	require.Empty(t, brokerFSM.BuildReplicaCatchupRequests("node-1"))
+	brokerFSM.mu.Lock()
+	brokerFSM.partitionMetadata["orders-0"].ISR = []string{"node-1", "node-2"}
+	brokerFSM.mu.Unlock()
+	require.Len(t, brokerFSM.BuildReplicaCatchupRequests("node-2"), 1, "a lagging replica must catch up even before ISR eviction commits")
+}
+
+func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	t.Cleanup(partition.Close)
+	require.NoError(t, partition.EnqueueSync(types.Message{Payload: "zero"}))
+	require.NoError(t, partition.EnqueueSync(types.Message{Payload: "one"}))
+	require.NoError(t, partition.EnqueueSync(types.Message{Payload: "two"}))
+	partition.FlushDisk()
+
+	brokerFSM := NewBrokerFSM(topicManager, nil)
+	definition := topicManager.GetTopic("orders").Definition()
+	brokerFSM.mu.Lock()
+	brokerFSM.topicState["orders"] = &definition
+	brokerFSM.partitionMetadata["orders-0"] = &PartitionMetadata{
+		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch,
+		CommittedHWM: 3, CommittedHWMKnown: true, PartitionCount: 1,
+		Replicas: []string{"node-1", "node-2"}, ISR: []string{"node-1"},
+	}
+	brokerFSM.mu.Unlock()
+	request := ReplicaCatchupRequest{
+		Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 1, CommittedHWM: 3,
+		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch, MaxRecords: 1,
+	}
+	batch, err := brokerFSM.FetchReplicaCatchup(request)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), batch.StartOffset)
+	require.Equal(t, uint64(3), batch.CommittedHWM)
+	require.Len(t, batch.Messages, 1)
+	require.Equal(t, uint64(1), batch.Messages[0].Offset)
+	require.Equal(t, "one", batch.Messages[0].Payload)
+
+	request.BrokerID = "node-3"
+	_, err = brokerFSM.FetchReplicaCatchup(request)
+	require.ErrorContains(t, err, "not a configured replica")
+	request.BrokerID = "node-2"
+	request.LeaderEpoch++
+	_, err = brokerFSM.FetchReplicaCatchup(request)
+	require.ErrorContains(t, err, "stale leader fence")
 }

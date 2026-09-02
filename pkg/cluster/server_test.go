@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -35,6 +36,10 @@ func (m *MockServiceDiscovery) RemoveNode(nodeID string) (string, error) {
 func (m *MockServiceDiscovery) UpdateHeartbeat(nodeID string) { m.Called(nodeID) }
 func (m *MockServiceDiscovery) HandleHeartbeat(nodeID string, proofs []fsm.ISRCatchupProof) error {
 	return m.Called(nodeID, proofs).Error(0)
+}
+func (m *MockServiceDiscovery) FetchReplicaCatchup(request fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error) {
+	args := m.Called(request)
+	return args.Get(0).(fsm.ReplicaCatchupBatch), args.Error(1)
 }
 func (m *MockServiceDiscovery) StartReconciler(ctx context.Context) { m.Called(ctx) }
 func (m *MockServiceDiscovery) Reconcile()                          { m.Called() }
@@ -139,6 +144,35 @@ func TestClusterServer_HeartbeatCarriesCatchupProofs(t *testing.T) {
 	})
 	require.Equal(t, wire.StatusOK, response.Status)
 	require.Contains(t, string(response.Payload), `"success":true`)
+	msd.AssertExpectations(t)
+}
+
+func TestClusterServer_FetchesAuthenticatedReplicaCatchupBatch(t *testing.T) {
+	msd := new(MockServiceDiscovery)
+	server := NewClusterServer(msd)
+	listener, err := server.Start("127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	request := fsm.ReplicaCatchupRequest{
+		Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 1, CommittedHWM: 2,
+		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: 1, MaxRecords: 1,
+	}
+	batch := fsm.ReplicaCatchupBatch{
+		Topic: "orders", Partition: 0, BrokerID: "node-2", StartOffset: 1, CommittedHWM: 2,
+		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: 1,
+		Messages: []types.Message{{Offset: 1, Payload: "backfill"}},
+	}
+	msd.On("FetchReplicaCatchup", request).Return(batch, nil).Once()
+	encoded, err := json.Marshal(request)
+	require.NoError(t, err)
+	response := clusterRoundTrip(t, listener.Addr().String(), wire.CommandReplicaCatchup, map[string]string{
+		"request": string(encoded),
+	})
+	require.Equal(t, wire.StatusOK, response.Status)
+	var decoded fsm.ReplicaCatchupBatch
+	require.NoError(t, json.Unmarshal(response.Payload, &decoded))
+	require.Equal(t, batch, decoded)
 	msd.AssertExpectations(t)
 }
 

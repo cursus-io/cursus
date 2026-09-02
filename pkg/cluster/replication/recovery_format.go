@@ -13,6 +13,8 @@ import (
 
 const raftFormatMarkerName = ".cursus-raft-format"
 
+var syncRaftDirectoryFn = syncRaftDirectory
+
 func ensureRaftRecoveryFormat(dataDir string) error {
 	markerPath := filepath.Join(dataDir, raftFormatMarkerName)
 	markerInfo, err := os.Lstat(markerPath)
@@ -21,7 +23,13 @@ func ensureRaftRecoveryFormat(dataDir string) error {
 		if markerInfo.Mode()&os.ModeSymlink != 0 || !markerInfo.Mode().IsRegular() {
 			return fmt.Errorf("%w: Raft format marker is not a regular file", fsm.ErrUnsupportedRecoveryProtocol)
 		}
-		return validateRaftFormatMarker(dataDir)
+		if err := validateRaftFormatMarker(dataDir); err != nil {
+			return err
+		}
+		if err := syncRaftDirectoryFn(dataDir); err != nil {
+			return fmt.Errorf("sync Raft format marker directory: %w", err)
+		}
+		return nil
 	case !errors.Is(err, os.ErrNotExist):
 		return fmt.Errorf("inspect Raft format marker: %w", err)
 	}
@@ -53,6 +61,11 @@ func ensureRaftRecoveryFormat(dataDir string) error {
 	}
 	if closeErr := marker.Close(); writeErr == nil && closeErr != nil {
 		writeErr = fmt.Errorf("close Raft format marker: %w", closeErr)
+	}
+	if writeErr == nil {
+		if err := syncRaftDirectoryFn(dataDir); err != nil {
+			writeErr = fmt.Errorf("sync Raft format marker directory: %w", err)
+		}
 	}
 	return writeErr
 }

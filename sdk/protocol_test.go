@@ -119,7 +119,7 @@ func TestEncodeDecode_SingleMessage(t *testing.T) {
 		AggregateVersion: 5,
 		Metadata:         "{}",
 	}}
-	encoded, err := EncodeBatchMessages("topic", 1, "none", false, msgs)
+	encoded, err := EncodeBatchMessages("topic", 1, "1", false, msgs)
 	require.NoError(t, err)
 
 	decoded, topic, partition, err := DecodeBatchMessages(encoded)

@@ -79,6 +79,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 
 	var cc *clusterController.ClusterController
 	var rm *replication.RaftReplicationManager
+	var clusterClient *client.TCPClusterClient
 	var discoveryListener net.Listener
 	defer func() {
 		if discoveryListener != nil {
@@ -96,8 +97,8 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		raftServerID := brokerID
 
 		var err error
-		clusterClient := *client.NewSecureTCPClusterClient(cfg.InternalAuthToken, cfg.InternalClientTLSConfig())
-		rm, err = replication.NewRaftReplicationManager(ctx, cfg, raftServerID, tm, cd, clusterClient)
+		clusterClient = client.NewSecureTCPClusterClient(cfg.InternalAuthToken, cfg.InternalClientTLSConfig())
+		rm, err = replication.NewRaftReplicationManager(ctx, cfg, raftServerID, tm, cd, *clusterClient)
 		if err != nil {
 			return fmt.Errorf("failed to create raft replication manager: %w", err)
 		}
@@ -212,6 +213,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	}
 	if cc != nil {
 		cc.SetLocalProcessor(globalCH)
+		cc.StartReplicaCatchup(ctx, clusterClient, globalCH.ApplyReplicaCatchup)
 	}
 	if cfg.EnabledDistribution && cfg.InternalBrokerPort > 0 {
 		shutdownInternal, err := startInternalBrokerListener(ctx, cfg, globalCH)

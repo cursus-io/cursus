@@ -572,8 +572,8 @@ func (ch *CommandHandler) partitionPreparationErrorResponse(err error) string {
 
 // preparePartitionReplica serializes a follower append with local leadership
 // changes. The first request for a new leader epoch discards any tail beyond
-// the Raft-authoritative committed HWM before accepting offsets from that
-// leader.
+// the Raft-authoritative committed HWM. A replica below that boundary remains
+// fenced to the same leader but is allowed to receive contiguous backfill.
 func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID int, p *topic.Partition, leader string, leaderEpoch int) (func(), error) {
 	writeLock := ch.partitionWriteLock(topicName, partitionID)
 	writeLock.Lock()
@@ -619,10 +619,12 @@ func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID 
 	wantedFence := partitionLeadershipFence{leader: leader, epoch: leaderEpoch}
 	preparedFence, prepared := ch.partitionPreparedEpochs.Load(key)
 	if !prepared || preparedFence.(partitionLeadershipFence) != wantedFence {
-		if err := p.ReconcileCommittedHWM(metadata.CommittedHWM); err != nil {
-			return fail(fmt.Errorf("partition is not ready for replica append: %w", err))
+		if p.NextOffset() >= metadata.CommittedHWM {
+			if err := p.ReconcileCommittedHWM(metadata.CommittedHWM); err != nil {
+				return fail(fmt.Errorf("partition is not ready for replica append: %w", err))
+			}
+			p.FlushDisk()
 		}
-		p.FlushDisk()
 		ch.partitionPreparedEpochs.Store(key, wantedFence)
 	}
 	return release, nil

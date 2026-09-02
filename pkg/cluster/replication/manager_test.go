@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 type MockRaft struct {
@@ -117,6 +118,18 @@ func TestBuildRaftConfigRejectsUnsafeSnapshotSettings(t *testing.T) {
 			assert.ErrorContains(t, err, test.want)
 		})
 	}
+}
+
+func TestHighestFSMCommandIndexIgnoresNonCommandEntries(t *testing.T) {
+	store := raft.NewInmemStore()
+	require.NoError(t, store.StoreLogs([]*raft.Log{
+		{Index: 6, Type: raft.LogCommand, Data: []byte("PARTITION_COMMIT:{}")},
+		{Index: 7, Type: raft.LogConfiguration},
+		{Index: 8, Type: raft.LogBarrier},
+	}))
+	index, err := highestFSMCommandIndex(store, 5, 8)
+	require.NoError(t, err)
+	require.Equal(t, uint64(6), index)
 }
 
 func TestRaftReplicationManagerGetRaftStatus(t *testing.T) {

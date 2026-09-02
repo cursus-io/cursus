@@ -48,34 +48,37 @@ type TransactionDecisionResolver interface {
 
 // Partition handles messages for one shard of a topic.
 type Partition struct {
-	id                int
-	topic             string
-	messageNotifyMu   sync.Mutex
-	messageGeneration uint64
-	messageNotifyCh   chan struct{}
-	LEO               atomic.Uint64
-	HWM               uint64
-	mu                sync.RWMutex
-	dh                types.StorageHandler
-	closed            bool
-	streamManager     StreamManager
-	hwmCheckpointPath string
-	hwmCheckpointCh   chan struct{}
-	hwmCheckpointMu   sync.Mutex
-	hwmCheckpointWG   sync.WaitGroup
-	producerStatePath string
-	producerStateCh   chan struct{}
-	producerStateMu   sync.Mutex
-	producerStateWG   sync.WaitGroup
-	producerState     sync.Map // map[string]*producerEntry
-	isIdempotent      bool
-	producerStateTTL  time.Duration
-	txnMarkerMu       sync.RWMutex
-	txnResolver       TransactionDecisionResolver
-	txnMarkers        map[transactionMarkerKey]transactionMarkerInfo
-	txnOpenOffsets    map[transactionMarkerKey]uint64
-	txnRetentionFloor uint64
-	closeCh           chan struct{}
+	id                    int
+	topic                 string
+	messageNotifyMu       sync.Mutex
+	messageGeneration     uint64
+	messageNotifyCh       chan struct{}
+	LEO                   atomic.Uint64
+	HWM                   uint64
+	mu                    sync.RWMutex
+	snapshotRecovery      bool
+	recoveryCheckpointHWM uint64
+	recoverySnapshotHWM   uint64
+	dh                    types.StorageHandler
+	closed                bool
+	streamManager         StreamManager
+	hwmCheckpointPath     string
+	hwmCheckpointCh       chan struct{}
+	hwmCheckpointMu       sync.Mutex
+	hwmCheckpointWG       sync.WaitGroup
+	producerStatePath     string
+	producerStateCh       chan struct{}
+	producerStateMu       sync.Mutex
+	producerStateWG       sync.WaitGroup
+	producerState         sync.Map // map[string]*producerEntry
+	isIdempotent          bool
+	producerStateTTL      time.Duration
+	txnMarkerMu           sync.RWMutex
+	txnResolver           TransactionDecisionResolver
+	txnMarkers            map[transactionMarkerKey]transactionMarkerInfo
+	txnOpenOffsets        map[transactionMarkerKey]uint64
+	txnRetentionFloor     uint64
+	closeCh               chan struct{}
 }
 
 func (p *Partition) SetTransactionDecisionResolver(resolver TransactionDecisionResolver) {
@@ -1052,7 +1055,73 @@ func (p *Partition) ApplyReplicaHWM(hwm uint64) error {
 func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.snapshotRecovery {
+		return fmt.Errorf("snapshot replay is still pending: visible_hwm=%d durable_hwm=%d requested_hwm=%d", p.HWM, p.recoveryCheckpointHWM, hwm)
+	}
+	return p.reconcileCommittedHWMLocked(hwm)
+}
 
+// ReconcileSnapshotHWM stages the snapshot visibility boundary without
+// deleting any later local records. Raft replays its committed log tail after
+// Restore returns, then FinalizeSnapshotRecovery performs the only truncation.
+func (p *Partition) ReconcileSnapshotHWM(snapshotHWM uint64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.snapshotRecovery {
+		if p.recoverySnapshotHWM != snapshotHWM {
+			return fmt.Errorf("snapshot recovery boundary changed: current=%d requested=%d", p.recoverySnapshotHWM, snapshotHWM)
+		}
+		return nil
+	}
+	leo := p.LEO.Load()
+	p.recoveryCheckpointHWM = p.HWM
+	p.recoverySnapshotHWM = snapshotHWM
+	p.HWM = min(snapshotHWM, leo)
+	p.snapshotRecovery = true
+	return nil
+}
+
+// FinalizeSnapshotRecovery reconciles to the FSM watermark after Raft has
+// applied every committed post-snapshot log entry.
+func (p *Partition) FinalizeSnapshotRecovery(hwm uint64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.snapshotRecovery {
+		return p.reconcileCommittedHWMLocked(hwm)
+	}
+	checkpointHWM := p.recoveryCheckpointHWM
+	snapshotHWM := p.recoverySnapshotHWM
+	p.snapshotRecovery = false
+	p.recoveryCheckpointHWM = 0
+	p.recoverySnapshotHWM = 0
+	if p.LEO.Load() < hwm {
+		if p.HWM > p.LEO.Load() {
+			p.HWM = p.LEO.Load()
+		}
+		if checkpointHWM != p.HWM {
+			p.signalHWMCheckpointLocked()
+		}
+		return nil
+	}
+	if err := p.reconcileCommittedHWMLocked(hwm); err != nil {
+		p.snapshotRecovery = true
+		p.recoveryCheckpointHWM = checkpointHWM
+		p.recoverySnapshotHWM = snapshotHWM
+		return err
+	}
+	if checkpointHWM != hwm {
+		p.signalHWMCheckpointLocked()
+	}
+	return nil
+}
+
+func (p *Partition) SnapshotRecoveryPending() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.snapshotRecovery
+}
+
+func (p *Partition) reconcileCommittedHWMLocked(hwm uint64) error {
 	leo := p.LEO.Load()
 	if leo < hwm {
 		return fmt.Errorf("replica is behind committed watermark: leo=%d hwm=%d", leo, hwm)
@@ -1102,7 +1171,9 @@ func (p *Partition) setHWMLocked(hwm uint64) bool {
 		return false
 	}
 	p.HWM = hwm
-	p.signalHWMCheckpointLocked()
+	if !p.snapshotRecovery {
+		p.signalHWMCheckpointLocked()
+	}
 	return true
 }
 

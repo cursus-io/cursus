@@ -14,9 +14,11 @@ type ClientConn struct {
 	wire      *Connection
 	nextID    atomic.Uint64
 	roundTrip sync.Mutex
+	receiveMu sync.Mutex
 	stateMu   sync.Mutex
 	activeID  uint64
 	activeCmd Command
+	received  uint32
 	awaiting  bool
 }
 
@@ -55,11 +57,11 @@ func (c *ClientConn) Send(payload []byte) error {
 	c.stateMu.Lock()
 	c.activeID = requestID
 	c.activeCmd = command
+	c.received = 0
 	c.awaiting = true
 	c.stateMu.Unlock()
 	if responseSuppressed(payload) {
-		c.clearPending()
-		c.roundTrip.Unlock()
+		c.finishPending()
 	}
 	return nil
 }
@@ -68,25 +70,34 @@ func (c *ClientConn) Receive() ([]byte, error) {
 	if c == nil || c.wire == nil {
 		return nil, fmt.Errorf("wire v2 client connection is not initialized")
 	}
+	c.receiveMu.Lock()
+	defer c.receiveMu.Unlock()
+
 	c.stateMu.Lock()
 	activeID, activeCommand, awaiting := c.activeID, c.activeCmd, c.awaiting
 	c.stateMu.Unlock()
-	frame, err := c.wire.ReadFrame()
-	if awaiting {
-		c.clearPending()
-		c.roundTrip.Unlock()
+	if !awaiting {
+		return nil, fmt.Errorf("wire v2 client has no pending request")
 	}
+	frame, err := c.wire.ReadFrame()
 	if err != nil {
+		c.finishPending()
 		return nil, err
 	}
 	if frame.Kind != KindResponse && frame.Kind != KindStream {
+		c.finishPending()
 		return nil, fmt.Errorf("unexpected Wire v2 response kind %d", frame.Kind)
 	}
 	if activeID == 0 || frame.RequestID != activeID || frame.Command != activeCommand {
+		c.finishPending()
 		return nil, fmt.Errorf(
 			"wire v2 response correlation mismatch: request=%d/%s response=%d/%s",
 			activeID, activeCommand, frame.RequestID, frame.Command,
 		)
+	}
+	terminal := c.recordResponse(frame.Status)
+	if terminal {
+		c.finishPending()
 	}
 	if frame.Status == StatusError {
 		payload, err := DecodeError(frame.Payload)
@@ -96,6 +107,9 @@ func (c *ClientConn) Receive() ([]byte, error) {
 		return nil, NewBrokerError(payload)
 	}
 	if frame.Status != StatusOK && frame.Status != StatusStreamEnd {
+		if !terminal {
+			c.finishPending()
+		}
 		return nil, fmt.Errorf("unexpected Wire v2 response status %d", frame.Status)
 	}
 	return frame.Payload, nil
@@ -109,19 +123,52 @@ func (c *ClientConn) ReadPayload() ([]byte, error) {
 	return c.Receive()
 }
 
-func (c *ClientConn) clearPending() {
+func (c *ClientConn) finishPending() {
 	c.stateMu.Lock()
+	if !c.awaiting {
+		c.stateMu.Unlock()
+		return
+	}
 	c.awaiting = false
+	c.activeID = 0
+	c.activeCmd = CommandUnknown
+	c.received = 0
 	c.stateMu.Unlock()
+	c.roundTrip.Unlock()
+}
+
+func (c *ClientConn) recordResponse(status Status) bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.received++
+	if status == StatusError {
+		return true
+	}
+	switch c.activeCmd {
+	case CommandReadStream:
+		return status == StatusStreamEnd || c.received >= 2
+	case CommandStream:
+		return status == StatusStreamEnd
+	default:
+		return true
+	}
 }
 
 func requestFramePayload(payload []byte) (Command, []byte, error) {
 	if IsBatch(payload) {
+		if _, err := DecodeBatch(payload); err != nil {
+			return CommandUnknown, nil, err
+		}
 		return CommandPublish, payload, nil
 	}
 	command, request, err := ParseCommandText(string(payload))
 	if err != nil {
 		return CommandUnknown, nil, err
+	}
+	if command == CommandPublish {
+		if err := validateAcks(request.Fields["acks"]); err != nil {
+			return CommandUnknown, nil, err
+		}
 	}
 	encoded, err := EncodeCommandPayload(request)
 	if err != nil {
@@ -133,11 +180,11 @@ func requestFramePayload(payload []byte) (Command, []byte, error) {
 func responseSuppressed(payload []byte) bool {
 	if IsBatch(payload) {
 		batch, err := DecodeBatch(payload)
-		return err == nil && (batch.Acks == "0" || batch.Acks == "none")
+		return err == nil && batch.Acks == "0"
 	}
 	command, request, err := ParseCommandText(string(payload))
 	if err != nil || command != CommandPublish {
 		return false
 	}
-	return request.Fields["acks"] == "0" || request.Fields["acks"] == "none"
+	return request.Fields["acks"] == "0"
 }

@@ -416,7 +416,7 @@ func TestHandler_HandleReadStreamRejectsInvalidFromVersion(t *testing.T) {
 
 	payload, err := util.ReadWithLength(client)
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"status\":\"ERROR\",\"error\":\"invalid_from_version\"}", string(payload))
+	require.Equal(t, "ERROR: invalid_from_version", string(payload))
 	<-done
 }
 func TestHandler_HandleSaveSnapshot_Validation(t *testing.T) {
