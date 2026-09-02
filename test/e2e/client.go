@@ -3,10 +3,13 @@ package e2e
 import (
 	"fmt"
 	"net"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -14,7 +17,10 @@ import (
 type BrokerClient struct {
 	addrs         []string
 	conn          net.Conn
+	wire          *wire.Connection
 	mu            sync.Mutex
+	requestMu     sync.Mutex
+	nextRequestID uint64
 	closed        bool
 	topic         string
 	consumerGroup string
@@ -82,13 +88,23 @@ func (bc *BrokerClient) connect() error {
 	if bc.conn != nil {
 		_ = bc.conn.Close()
 		bc.conn = nil
+		bc.wire = nil
 	}
 
 	var lastErr error
 	for _, addr := range bc.addrs {
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err == nil {
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			connection, handshakeErr := wire.ClientHandshake(conn, []wire.Compression{wire.CompressionNone})
+			if handshakeErr != nil {
+				_ = conn.Close()
+				lastErr = handshakeErr
+				continue
+			}
+			_ = conn.SetDeadline(time.Time{})
 			bc.conn = conn
+			bc.wire = connection
 			bc.closed = false
 			return nil
 		}
@@ -116,11 +132,15 @@ func (bc *BrokerClient) Close() {
 			util.Debug("failed to close connection: %v", err)
 		}
 		bc.conn = nil
+		bc.wire = nil
 	}
 	bc.closed = true
 }
 
 func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout time.Duration) (string, error) {
+	_ = cmdTopic
+	bc.requestMu.Lock()
+	defer bc.requestMu.Unlock()
 	const maxRetries = 5
 	var lastErr error
 
@@ -141,8 +161,8 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 			continue
 		}
 
-		cmdBytes := util.EncodeMessage(cmdTopic, cmdPayload)
-		if err := util.WriteWithLength(conn, cmdBytes); err != nil {
+		command, requestID, err := bc.writeWireCommand(cmdPayload)
+		if err != nil {
 			bc.closeInternal()
 			lastErr = err
 			bc.rotateAddrs()
@@ -160,7 +180,7 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 			return "", err
 		}
 
-		respBuf, err := util.ReadWithLength(conn)
+		respBuf, err := bc.readWirePayload(command, requestID)
 		if err != nil {
 			bc.closeInternal()
 			lastErr = err
@@ -173,6 +193,7 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 
 			return "", fmt.Errorf("write succeeded but read failed (possible duplicate if retried): %w", err)
 		}
+		_ = conn.SetReadDeadline(time.Time{})
 
 		respStr := strings.TrimSpace(string(respBuf))
 		if redirectAddr, ok := parseNotCoordinator(respStr); ok {
@@ -235,7 +256,105 @@ func (bc *BrokerClient) closeInternal() {
 	if bc.conn != nil {
 		_ = bc.conn.Close()
 		bc.conn = nil
+		bc.wire = nil
 	}
+	bc.wire = nil
+}
+
+func (bc *BrokerClient) writeWireCommand(commandText string) (wire.Command, uint64, error) {
+	command, request, err := wire.ParseCommandText(commandText)
+	if err != nil {
+		return wire.CommandUnknown, 0, err
+	}
+	payload, err := wire.EncodeCommandPayload(request)
+	if err != nil {
+		return wire.CommandUnknown, 0, err
+	}
+	bc.mu.Lock()
+	connection := bc.wire
+	bc.nextRequestID++
+	requestID := bc.nextRequestID
+	bc.mu.Unlock()
+	if connection == nil {
+		return wire.CommandUnknown, 0, fmt.Errorf("Wire v2 connection is not available")
+	}
+	if err := connection.WriteFrame(wire.Frame{
+		Kind: wire.KindRequest, Command: command, RequestID: requestID, Payload: payload,
+	}); err != nil {
+		return wire.CommandUnknown, 0, err
+	}
+	return command, requestID, nil
+}
+
+func (bc *BrokerClient) readWirePayload(command wire.Command, requestID uint64) ([]byte, error) {
+	bc.mu.Lock()
+	connection := bc.wire
+	bc.mu.Unlock()
+	if connection == nil {
+		return nil, fmt.Errorf("Wire v2 connection is not available")
+	}
+	response, err := connection.ReadFrame()
+	if err != nil {
+		return nil, err
+	}
+	if response.Command != command || response.RequestID != requestID ||
+		(response.Kind != wire.KindResponse && response.Kind != wire.KindStream) {
+		return nil, fmt.Errorf(
+			"Wire v2 response correlation mismatch: request=%d/%s response=%d/%s",
+			requestID, command, response.RequestID, response.Command,
+		)
+	}
+	if response.Status == wire.StatusError {
+		payload, err := wire.DecodeError(response.Payload)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(renderWireError(payload)), nil
+	}
+	if response.Status != wire.StatusOK && response.Status != wire.StatusStreamEnd {
+		return nil, fmt.Errorf("unexpected Wire v2 response status %d", response.Status)
+	}
+	return response.Payload, nil
+}
+
+func renderWireError(payload wire.ErrorPayload) string {
+	parts := []string{
+		"ERROR:", payload.Code, "class=" + payload.Class.String(),
+		"retryable=" + strconv.FormatBool(payload.Retryable),
+	}
+	keys := make([]string, 0, len(payload.Fields))
+	for key := range payload.Fields {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		parts = append(parts, key+"="+payload.Fields[key])
+	}
+	return strings.Join(parts, " ")
+}
+
+func sendOneWayWireCommand(address, commandText string) error {
+	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	connection, err := wire.ClientHandshake(conn, []wire.Compression{wire.CompressionNone})
+	if err != nil {
+		return err
+	}
+	command, request, err := wire.ParseCommandText(commandText)
+	if err != nil {
+		return err
+	}
+	payload, err := wire.EncodeCommandPayload(request)
+	if err != nil {
+		return err
+	}
+	return connection.WriteFrame(wire.Frame{
+		Kind: wire.KindRequest, Command: command, RequestID: 1, Payload: payload,
+	})
 }
 
 func isIdempotent(payload string) bool {
