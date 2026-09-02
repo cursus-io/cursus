@@ -310,11 +310,6 @@ func (p *Producer) markBatchAckedByID(part int, batchID string, batchLen int) {
 }
 
 func (p *Producer) parseAckResponse(resp []byte) (*AckResponse, error) {
-	respStr := strings.TrimSpace(string(resp))
-	if brokerErr, ok := ParseBrokerError(respStr); ok {
-		return nil, brokerErr
-	}
-
 	var ackResp AckResponse
 	if err := json.Unmarshal(resp, &ackResp); err != nil {
 		return nil, fmt.Errorf("invalid ack format: %w", err)

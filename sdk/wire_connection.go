@@ -1,6 +1,8 @@
 package sdk
 
 import (
+	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
@@ -11,26 +13,34 @@ import (
 
 const defaultHandshakeTimeout = 5 * time.Second
 
-// openWireConnection performs the sole protocol negotiation supported by the
-// SDK: the Wire v2 handshake. The temporary deadline is cleared before the
-// connection is returned so request-specific deadlines remain authoritative.
-func openWireConnection(conn net.Conn, timeoutMS int, compression string) (net.Conn, error) {
-	if conn == nil {
-		return nil, fmt.Errorf("wire v2 connection is nil")
+func dialAuthenticatedWireConnection(
+	ctx context.Context,
+	addr string,
+	dialTimeout time.Duration,
+	handshakeTimeoutMS int,
+	compression string,
+	tlsConfig *tls.Config,
+	principal string,
+	authToken string,
+) (net.Conn, error) {
+	handshakeTimeout := defaultHandshakeTimeout
+	if handshakeTimeoutMS > 0 {
+		handshakeTimeout = time.Duration(handshakeTimeoutMS) * time.Millisecond
 	}
-	timeout := defaultHandshakeTimeout
-	if timeoutMS > 0 {
-		timeout = time.Duration(timeoutMS) * time.Millisecond
-	}
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return conn, fmt.Errorf("set Wire v2 handshake deadline: %w", err)
-	}
-	defer func() { _ = conn.SetDeadline(time.Time{}) }()
-	framed, err := transport.NewClient(conn, compression)
+	conn, err := transport.Dial(ctx, addr, transport.DialConfig{
+		DialTimeout:      dialTimeout,
+		HandshakeTimeout: handshakeTimeout,
+		Compression:      compression,
+		TLS:              tlsConfig,
+	})
 	if err != nil {
-		return conn, fmt.Errorf("wire v2 handshake: %w", err)
+		return nil, err
 	}
-	return framed, nil
+	if err := authenticateConfiguredClient(conn, principal, authToken); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("authenticate with %s: %w", addr, err)
+	}
+	return conn, nil
 }
 
 func parseOKResponse(response string) (map[string]string, error) {

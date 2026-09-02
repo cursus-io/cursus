@@ -1,6 +1,10 @@
 package wire
 
-import "testing"
+import (
+	"errors"
+	"net"
+	"testing"
+)
 
 func TestRequestFramePayloadUsesCanonicalCommandPayload(t *testing.T) {
 	command, encoded, err := requestFramePayload([]byte("PUBLISH topic=orders partition=2 acks=all message=created"))
@@ -23,5 +27,60 @@ func TestRequestFramePayloadRejectsLegacyTopicEnvelope(t *testing.T) {
 	legacy := append([]byte{0, 0}, []byte("HELP")...)
 	if _, _, err := requestFramePayload(legacy); err == nil {
 		t.Fatal("legacy topic envelope was accepted")
+	}
+}
+
+func TestClientReceiveReturnsStructuredBrokerError(t *testing.T) {
+	clientNet, serverNet := net.Pipe()
+	defer func() { _ = clientNet.Close() }()
+	defer func() { _ = serverNet.Close() }()
+
+	clientCodec, err := NewCodec(CompressionNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCodec, err := NewCodec(CompressionNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &ClientConn{
+		Conn:      clientNet,
+		wire:      &Connection{conn: clientNet, codec: clientCodec},
+		activeID:  7,
+		activeCmd: CommandPublish,
+	}
+	payload, err := EncodeError(ErrorPayload{
+		Code:      "NOT_LEADER",
+		Class:     ErrorClassRouting,
+		Retryable: true,
+		Message:   "partition leader moved",
+		Fields:    map[string]string{"leader": "broker-2:9092"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeErr := make(chan error, 1)
+	go func() {
+		writeErr <- serverCodec.WriteFrame(serverNet, Frame{
+			Kind: KindResponse, Command: CommandPublish, Status: StatusError, RequestID: 7, Payload: payload,
+		})
+	}()
+
+	response, err := client.Receive()
+	if response != nil {
+		t.Fatalf("response = %q, want nil", response)
+	}
+	var brokerErr *BrokerError
+	if !errors.As(err, &brokerErr) {
+		t.Fatalf("error = %T %v, want *BrokerError", err, err)
+	}
+	if brokerErr.Code != "NOT_LEADER" || brokerErr.Class != ErrorClassRouting || !brokerErr.Retryable {
+		t.Fatalf("unexpected broker error: %+v", brokerErr)
+	}
+	if brokerErr.Fields["leader"] != "broker-2:9092" {
+		t.Fatalf("unexpected broker fields: %+v", brokerErr.Fields)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatal(err)
 	}
 }

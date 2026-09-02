@@ -296,12 +296,13 @@ func assertBenchmarkSuccess(t *testing.T, logs string, component string) {
 		}
 	}
 
-	if component == "Publisher" {
+	switch component {
+	case "Publisher":
 		failed, ok := benchmarkCounter(logs, "Failed messages")
 		if !ok || failed != 0 || !strings.Contains(logs, "rate: 100.00%") {
 			t.Fatalf("publisher did not report a complete publish:\n%s", lastLines(logs, 40))
 		}
-	} else if component == "Consumer" {
+	case "Consumer":
 		if !strings.Contains(logs, "All messages consumed") {
 			t.Fatalf("consumer did not report complete consumption:\n%s", lastLines(logs, 40))
 		}

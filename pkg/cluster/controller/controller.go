@@ -14,6 +14,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/metrics"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	topicpkg "github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -207,7 +208,7 @@ func (cc *ClusterController) ReplicateCommandToFollowers(topic string, partition
 		go func(addr, brokerID string) {
 			defer wg.Done()
 			resp, err := cc.Router.forwardWithTimeout(addr, command)
-			if err == nil && !strings.HasPrefix(resp, "ERROR") {
+			if err == nil && !protocol.IsErrorResponse(resp) {
 				mu.Lock()
 				successCount++
 				mu.Unlock()

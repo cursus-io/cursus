@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -226,31 +227,9 @@ func (s *topicMetadataStore) Save(definitions []Definition) (err error) {
 	if s == nil {
 		return nil
 	}
-	normalized := make([]Definition, 0, len(definitions))
-	seen := make(map[string]struct{}, len(definitions))
-	for _, raw := range definitions {
-		definition, normalizeErr := raw.Normalize()
-		if normalizeErr != nil {
-			return fmt.Errorf("invalid topic metadata for %q: %w", raw.Name, normalizeErr)
-		}
-		if _, exists := seen[definition.Name]; exists {
-			return fmt.Errorf("duplicate topic metadata for %q", definition.Name)
-		}
-		seen[definition.Name] = struct{}{}
-		normalized = append(normalized, definition)
-	}
-	sort.Slice(normalized, func(i, j int) bool { return normalized[i].Name < normalized[j].Name })
-
-	data, err := json.MarshalIndent(topicMetadataManifest{
-		Version: topicMetadataFormatVersion,
-		Topics:  normalized,
-	}, "", "  ")
+	_, data, err := normalizeAndMarshalCurrentManifest(definitions)
 	if err != nil {
-		return fmt.Errorf("marshal topic metadata: %w", err)
-	}
-	data = append(data, '\n')
-	if len(data) > maxTopicMetadataBytes {
-		return fmt.Errorf("topic metadata size %d exceeds limit %d", len(data), maxTopicMetadataBytes)
+		return err
 	}
 
 	dir := filepath.Dir(s.path)
@@ -286,6 +265,40 @@ func (s *topicMetadataStore) Save(definitions []Definition) (err error) {
 		}
 	}
 	return nil
+}
+
+func normalizeAndMarshalCurrentManifest(definitions []Definition) ([]Definition, []byte, error) {
+	normalized := make([]Definition, 0, len(definitions))
+	seen := make(map[string]struct{}, len(definitions))
+	for _, raw := range definitions {
+		definition, err := raw.Normalize()
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid topic metadata for %q: %w", raw.Name, err)
+		}
+		if definition.Name == config.ConsumerOffsetsTopicName {
+			if definition.Idempotent || definition.EventSourcing || !reflect.DeepEqual(definition.Policy, ConsumerMetadataPolicy()) {
+				return nil, nil, fmt.Errorf("invalid topic metadata for %q: internal consumer metadata contract mismatch; clean bootstrap required", definition.Name)
+			}
+		}
+		if _, exists := seen[definition.Name]; exists {
+			return nil, nil, fmt.Errorf("duplicate topic metadata for %q", definition.Name)
+		}
+		seen[definition.Name] = struct{}{}
+		if err := validateCleanupPolicyForTopic(definition.Policy, nil, definition.EventSourcing); err != nil {
+			return nil, nil, fmt.Errorf("invalid topic metadata for %q: %w", definition.Name, err)
+		}
+		normalized = append(normalized, definition)
+	}
+	sort.Slice(normalized, func(i, j int) bool { return normalized[i].Name < normalized[j].Name })
+	data, err := json.MarshalIndent(topicMetadataManifest{Version: topicMetadataFormatVersion, Topics: normalized}, "", "  ")
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal topic metadata: %w", err)
+	}
+	data = append(data, '\n')
+	if len(data) > maxTopicMetadataBytes {
+		return nil, nil, fmt.Errorf("topic metadata size %d exceeds limit %d", len(data), maxTopicMetadataBytes)
+	}
+	return normalized, data, nil
 }
 
 func writeMetadataFile(file *os.File, data []byte) error {

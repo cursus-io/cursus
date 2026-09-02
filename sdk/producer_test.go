@@ -398,7 +398,7 @@ func TestProducer_ParseAckResponse_OK(t *testing.T) {
 	assert.Equal(t, uint64(100), resp.LastOffset)
 }
 
-func TestProducer_ParseAckResponse_ErrorPrefix(t *testing.T) {
+func TestProducer_ParseAckResponseRejectsTextErrorPayload(t *testing.T) {
 	p := &Producer{
 		config: &PublisherConfig{},
 		client: mustNewProducerClient(NewDefaultPublisherConfig()),
@@ -406,10 +406,8 @@ func TestProducer_ParseAckResponse_ErrorPrefix(t *testing.T) {
 
 	_, err := p.parseAckResponse([]byte(`ERROR: broker_error class=internal retryable=false reason="busy"`))
 	var brokerErr *BrokerError
-	require.True(t, errors.As(err, &brokerErr))
-	assert.Equal(t, "broker_error", brokerErr.Code)
-	assert.Equal(t, ErrorClassInternal, brokerErr.Class)
-	assert.False(t, brokerErr.Retryable)
+	require.False(t, errors.As(err, &brokerErr))
+	require.ErrorContains(t, err, "invalid ack format")
 }
 
 func TestProducer_ParseAckResponse_InvalidJSON(t *testing.T) {
@@ -1081,7 +1079,27 @@ func newProducerDrainTestHarness(t *testing.T) (*Producer, <-chan producerDrainB
 
 	client := mustNewProducerClient(cfg)
 	brokerConn, producerConn := net.Pipe()
-	connections := []net.Conn{producerConn}
+	resultCh := make(chan producerDrainBrokerResult, 1)
+	go func() {
+		connection, request, _, err := acceptWireTestRequest(brokerConn)
+		if err != nil {
+			resultCh <- producerDrainBrokerResult{err: err}
+			return
+		}
+		messages, _, _, err := DecodeBatchMessages(request.Payload)
+		if err != nil {
+			resultCh <- producerDrainBrokerResult{err: err}
+			return
+		}
+		ack, err := json.Marshal(AckResponse{Status: "OK"})
+		if err == nil {
+			err = writeWireTestResponse(connection, request, string(ack))
+		}
+		resultCh <- producerDrainBrokerResult{messages: messages, err: err}
+	}()
+	framed, err := openWireConnection(producerConn, 1000, "none")
+	require.NoError(t, err)
+	connections := []net.Conn{framed}
 	client.conns.Store(&connections)
 
 	p := &Producer{
@@ -1104,25 +1122,6 @@ func newProducerDrainTestHarness(t *testing.T) (*Producer, <-chan producerDrainB
 
 	p.sendersWG.Add(1)
 	go p.partitionSender(0)
-
-	resultCh := make(chan producerDrainBrokerResult, 1)
-	go func() {
-		payload, err := ReadWithLength(brokerConn)
-		if err != nil {
-			resultCh <- producerDrainBrokerResult{err: err}
-			return
-		}
-		messages, _, _, err := DecodeBatchMessages(payload)
-		if err != nil {
-			resultCh <- producerDrainBrokerResult{err: err}
-			return
-		}
-		ack, err := json.Marshal(AckResponse{Status: "OK"})
-		if err == nil {
-			err = WriteWithLength(brokerConn, ack)
-		}
-		resultCh <- producerDrainBrokerResult{messages: messages, err: err}
-	}()
 
 	t.Cleanup(func() {
 		_ = p.Close()

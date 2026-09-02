@@ -31,8 +31,8 @@ func (bc *BrokerClient) CreateEventSourcingTopic(topic string, partitions int) e
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(resp, "ERROR:") && !strings.Contains(resp, "already_exists") && !strings.Contains(resp, "topic_exists") {
-		return fmt.Errorf("broker error: %s", resp)
+	if resp != "OK" && !strings.HasPrefix(resp, "OK ") {
+		return fmt.Errorf("unexpected create response: %s", resp)
 	}
 	return nil
 }
@@ -43,9 +43,6 @@ func (bc *BrokerClient) AppendStream(topic, key string, expectedNextVersion uint
 	if err != nil {
 		return "", err
 	}
-	if strings.HasPrefix(resp, "ERROR:") {
-		return "", fmt.Errorf("broker error: %s", resp)
-	}
 	return resp, nil
 }
 
@@ -54,9 +51,6 @@ func (bc *BrokerClient) StreamVersion(topic, key string) (uint64, error) {
 	resp, err := bc.SendCommand(topic, cmd, 5*time.Second)
 	if err != nil {
 		return 0, err
-	}
-	if strings.HasPrefix(resp, "ERROR:") {
-		return 0, fmt.Errorf("broker error: %s", resp)
 	}
 	if strings.HasPrefix(resp, "OK") {
 		for _, part := range strings.Fields(resp) {

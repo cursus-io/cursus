@@ -3,13 +3,15 @@ package sdk
 import (
 	"errors"
 	"testing"
+
+	"github.com/cursus-io/cursus/pkg/wire"
 )
 
-func TestParseBrokerErrorPreservesStructuredFields(t *testing.T) {
-	err, ok := ParseBrokerError(`ERROR: offset_regression class=conflict retryable=false reason="current offset is 10" current=10 requested=9`)
-	if !ok {
-		t.Fatal("response was not recognized")
-	}
+func TestBrokerErrorFromWirePreservesStructuredFields(t *testing.T) {
+	err := brokerErrorFromWire(&wire.BrokerError{
+		Code: "offset_regression", Class: wire.ErrorClassConflict,
+		Fields: map[string]string{"reason": "current offset is 10", "current": "10", "requested": "9"},
+	})
 	if err.Code != "offset_regression" || err.Class != ErrorClassConflict || err.Retryable {
 		t.Fatalf("unexpected error: %+v", err)
 	}
@@ -18,24 +20,17 @@ func TestParseBrokerErrorPreservesStructuredFields(t *testing.T) {
 	}
 }
 
-func TestParseBrokerErrorRejectsUnstructuredResponse(t *testing.T) {
-	if err, ok := ParseBrokerError("ERROR NOT_LEADER LEADER_IS broker-2:9000"); ok || err != nil {
-		t.Fatalf("unstructured response was accepted: %+v", err)
-	}
-}
-
 func TestBrokerErrorMatchesExistingSentinels(t *testing.T) {
 	tests := []struct {
-		response string
-		target   error
+		brokerErr *BrokerError
+		target    error
 	}{
-		{"ERROR: topic_not_found class=not_found retryable=false topic=orders", ErrTopicNotFound},
-		{"ERROR: partition_not_found class=not_found retryable=false partition=99", ErrInvalidPartition},
+		{&BrokerError{Code: "topic_not_found", Class: ErrorClassNotFound}, ErrTopicNotFound},
+		{&BrokerError{Code: "partition_not_found", Class: ErrorClassNotFound}, ErrInvalidPartition},
 	}
 	for _, test := range tests {
-		brokerErr, ok := ParseBrokerError(test.response)
-		if !ok || !errors.Is(brokerErr, test.target) {
-			t.Fatalf("%q did not match %v", test.response, test.target)
+		if !errors.Is(test.brokerErr, test.target) {
+			t.Fatalf("%s did not match %v", test.brokerErr.Code, test.target)
 		}
 	}
 }

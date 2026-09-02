@@ -167,27 +167,8 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	internalMetadata := topicName == config.ConsumerOffsetsTopicName
 	standaloneInternalMetadata := internalMetadata && !cfg.EnabledDistribution
 	tempDh := &DiskHandler{BaseName: base}
-	preserveDeletedMetadata := false
-	if standaloneInternalMetadata {
-		deleted, deletedErr := filepath.Glob(base + "_segment_*.deleted")
-		if deletedErr != nil {
-			return nil, fmt.Errorf("inspect internal metadata deleted segments: %w", deletedErr)
-		}
-		if len(deleted) > 0 {
-			migrationPath := filepath.Join(cfg.LogDir, config.ConsumerMetadataMigrationFileName)
-			if _, migrationErr := os.Stat(migrationPath); migrationErr != nil {
-				if os.IsNotExist(migrationErr) {
-					return nil, fmt.Errorf("internal metadata has %d deleted segment tombstone(s); explicit migration is required", len(deleted))
-				}
-				return nil, fmt.Errorf("inspect consumer metadata migration authorization: %w", migrationErr)
-			}
-			preserveDeletedMetadata = true
-		}
-	}
-	if !preserveDeletedMetadata {
-		if err := cleanupDeletedSegments(base); err != nil {
-			return nil, fmt.Errorf("cleanup deleted segment tombstones: %w", err)
-		}
+	if err := cleanupDeletedSegments(base); err != nil {
+		return nil, fmt.Errorf("cleanup deleted segment tombstones: %w", err)
 	}
 	if err := cleanupCompactionTemps(base); err != nil {
 		return nil, fmt.Errorf("cleanup compaction temporary files: %w", err)

@@ -85,17 +85,18 @@ Transaction visibility indexes are rebuilt from durable transaction records and 
 
 ## Standalone Topic Manifest
 
-A standalone broker stores the authoritative topic registry in `{log_dir}/__topic_metadata.json`. The current version 2 shape is:
+A standalone broker stores the authoritative topic registry in `{log_dir}/__topic_metadata.json`. The only supported shape is version 3:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "topics": [
     {
       "name": "orders",
       "revision": 3,
       "partitions": 4,
       "replication_factor": 3,
+      "lifecycle_epoch": 1,
       "idempotent": true,
       "event_sourcing": false,
       "policy": {
@@ -120,7 +121,7 @@ Backups of a standalone broker must keep this manifest with topic partition dire
 
 `__consumer_offsets` stores version-1 group registration, complete committed-next-offset snapshot, and group tombstone JSON payloads inside ordinary segment frames. Stable semantic keys support compaction; lifecycle epochs fence delete/re-create, and snapshot revisions make replay deterministic across physical internal partitions. Runtime replay rejects unversioned single/bulk offset JSON records.
 
-The internal topic is forced to compact cleanup and unlimited time/size retention regardless of broker defaults, manifest input, or application `CREATE`. Registration/commit acknowledgement synchronously flushes and fsyncs its authoritative log. Corrupt, truncated, conflicting, regressing, or key-mismatched records fail readiness instead of being skipped. See [Standalone Storage Recovery](../../standalone-storage-recovery.md) for the record shapes and pre-manifest migration procedure.
+The internal topic is forced to compact cleanup and unlimited time/size retention regardless of broker defaults, manifest input, or application `CREATE`. Registration/commit acknowledgement synchronously flushes and fsyncs its authoritative log. Corrupt, truncated, conflicting, regressing, unversioned, or key-mismatched records fail readiness instead of being skipped. See [Standalone Clean-Bootstrap Recovery](../../standalone-storage-recovery.md) for the supported reset boundary.
 
 ## Standalone Transaction Journal
 

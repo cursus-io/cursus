@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -64,46 +65,14 @@ func (c *ConsumerClient) UpdateLeader(addr string) {
 
 // Connect opens a TCP (or TLS) connection to addr with socket tuning applied.
 func (c *ConsumerClient) Connect(addr string) (net.Conn, error) {
-	var conn net.Conn
-	var err error
-
-	if c.config.UseTLS {
-		if c.tlsConfig == nil {
-			return nil, fmt.Errorf("TLS enabled but certificate not loaded")
-		}
-		conn, err = tls.DialWithDialer(
-			&net.Dialer{Timeout: 5 * time.Second},
-			"tcp", addr, c.tlsConfig,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("TLS dial to %s failed: %w", addr, err)
-		}
-	} else {
-		dialer := net.Dialer{Timeout: 5 * time.Second}
-		conn, err = dialer.Dial("tcp", addr)
-		if err != nil {
-			return nil, fmt.Errorf("dial failed to %s: %w", addr, err)
-		}
+	if c.config.UseTLS && c.tlsConfig == nil {
+		return nil, fmt.Errorf("TLS enabled but certificate not loaded")
 	}
-
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true)
-		_ = tcpConn.SetKeepAlive(true)
-		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		_ = tcpConn.SetReadBuffer(2 * 1024 * 1024)
-		_ = tcpConn.SetWriteBuffer(2 * 1024 * 1024)
-	}
-
-	conn, err = openWireConnection(conn, c.config.HandshakeTimeoutMS, c.config.CompressionType)
-	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("wire v2 handshake with %s failed: %w", addr, err)
-	}
-	if err := authenticateConfiguredClient(conn, c.config.Principal, c.config.AuthToken); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("authenticate with %s: %w", addr, err)
-	}
-	return conn, nil
+	return dialAuthenticatedWireConnection(
+		context.Background(), addr, 5*time.Second,
+		c.config.HandshakeTimeoutMS, c.config.CompressionType, c.tlsConfig,
+		c.config.Principal, c.config.AuthToken,
+	)
 }
 
 // ConnectToAddr opens a connection to a specific address (e.g., the coordinator).
@@ -185,9 +154,6 @@ func (c *ConsumerClient) ListOffsets(topic string, partition ...int) ([]Partitio
 }
 
 func parseListOffsetsResponse(resp string) ([]PartitionOffsetRange, error) {
-	if strings.HasPrefix(resp, "ERROR:") {
-		return nil, fmt.Errorf("list offsets broker error: %s", resp)
-	}
 	if !strings.HasPrefix(resp, "OK") {
 		return nil, fmt.Errorf("unexpected list offsets response: %s", resp)
 	}

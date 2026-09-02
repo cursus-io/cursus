@@ -95,16 +95,25 @@ func (c *Codec) Encode(frame Frame) ([]byte, error) {
 
 func (c *Codec) Decode(encodedFrame []byte) (Frame, error) {
 	if len(encodedFrame) < HeaderSize {
-		return Frame{}, fmt.Errorf("%w: header is %d bytes", ErrInvalidFrame, len(encodedFrame))
+		err := fmt.Errorf("%w: header is %d bytes", ErrInvalidFrame, len(encodedFrame))
+		recordProtocolFailure(err)
+		return Frame{}, err
 	}
 	header, err := c.decodeHeader(encodedFrame[:HeaderSize])
 	if err != nil {
+		recordProtocolFailure(err)
 		return Frame{}, err
 	}
 	if len(encodedFrame)-HeaderSize != int(header.encodedSize) {
-		return Frame{}, fmt.Errorf("%w: encoded length=%d actual=%d", ErrInvalidFrame, header.encodedSize, len(encodedFrame)-HeaderSize)
+		err = fmt.Errorf("%w: encoded length=%d actual=%d", ErrInvalidFrame, header.encodedSize, len(encodedFrame)-HeaderSize)
+		recordProtocolFailure(err)
+		return Frame{}, err
 	}
-	return c.decodePayload(header, encodedFrame[HeaderSize:])
+	frame, err := c.decodePayload(header, encodedFrame[HeaderSize:])
+	if err != nil {
+		recordProtocolFailure(err)
+	}
+	return frame, err
 }
 
 func (c *Codec) WriteFrame(writer io.Writer, frame Frame) error {
@@ -128,13 +137,18 @@ func (c *Codec) ReadFrame(reader io.Reader) (Frame, error) {
 	}
 	header, err := c.decodeHeader(headerBytes)
 	if err != nil {
+		recordProtocolFailure(err)
 		return Frame{}, err
 	}
 	payload := make([]byte, header.encodedSize)
 	if _, err := io.ReadFull(reader, payload); err != nil {
 		return Frame{}, fmt.Errorf("read Wire v2 payload: %w", err)
 	}
-	return c.decodePayload(header, payload)
+	frame, err := c.decodePayload(header, payload)
+	if err != nil {
+		recordProtocolFailure(err)
+	}
+	return frame, err
 }
 
 type decodedHeader struct {

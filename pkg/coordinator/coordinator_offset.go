@@ -1,7 +1,6 @@
 package coordinator
 
 import (
-	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -283,25 +282,6 @@ func (c *Coordinator) LoadOffsetsFromLog(reader OffsetLogReader) error {
 		util.Info("Coordinator: restored groups=%d offsets=%d records=%d orphan=%d from %q", status.RestoredGroups, status.RestoredOffsets, status.ReplayedRecords, status.OrphanRecords, c.offsetTopic)
 	}
 	return nil
-}
-
-func parseOffsetLogPayload(payload string) (string, string, []OffsetItem, error) {
-	var bulk BulkOffsetMsg
-	if err := json.Unmarshal([]byte(payload), &bulk); err == nil && bulk.Group != "" && bulk.Topic != "" && len(bulk.Offsets) > 0 {
-		return bulk.Group, bulk.Topic, bulk.Offsets, nil
-	}
-
-	var single OffsetCommitMessage
-	if err := json.Unmarshal([]byte(payload), &single); err != nil {
-		return "", "", nil, err
-	}
-	if single.Group == "" || single.Topic == "" {
-		return "", "", nil, fmt.Errorf("missing group or topic")
-	}
-	return single.Group, single.Topic, []OffsetItem{{
-		Partition: single.Partition,
-		Offset:    single.Offset,
-	}}, nil
 }
 
 func (c *Coordinator) GetOffset(groupName, topic string, partition int) (uint64, bool) {

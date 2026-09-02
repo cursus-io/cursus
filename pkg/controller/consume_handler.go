@@ -305,7 +305,7 @@ func (ch *CommandHandler) checkPartitionLeaderOrRedirect(conn net.Conn, topicNam
 		}
 		return fmt.Errorf("partition leader not found")
 	}
-	errResp := fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", leaderAddr)
+	errResp := fmt.Sprintf("ERROR: NOT_LEADER leader=%s", leaderAddr)
 	if err := util.WriteWithLength(conn, []byte(errResp)); err != nil {
 		return fmt.Errorf("failed to send partition leader redirect: %w", err)
 	}
@@ -339,7 +339,7 @@ func (ch *CommandHandler) checkLeaderOrRedirect(conn net.Conn) error {
 		serviceLeader = net.JoinHostPort(host, strconv.Itoa(port))
 	}
 
-	errResp := fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", serviceLeader)
+	errResp := fmt.Sprintf("ERROR: NOT_LEADER leader=%s", serviceLeader)
 	util.Warn("leader redirect: %s", errResp)
 	if err := util.WriteWithLength(conn, []byte(errResp)); err != nil {
 		return fmt.Errorf("failed to send leader redirect: %w", err)

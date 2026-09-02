@@ -2,6 +2,7 @@ package e2e_cluster
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/e2e"
 	"github.com/stretchr/testify/require"
 )
@@ -60,8 +62,8 @@ func TestRepeatedCreatePatchPreservesDefinitionAcrossThreeNodes(t *testing.T) {
 				errs <- err
 				return
 			}
-			if strings.HasPrefix(response, "ERROR:") {
-				errs <- fmt.Errorf("%s", response)
+			if response != "OK" && !strings.HasPrefix(response, "OK ") {
+				errs <- fmt.Errorf("unexpected response: %s", response)
 			}
 		}()
 	}
@@ -83,9 +85,8 @@ func TestRepeatedCreatePatchPreservesDefinitionAcrossThreeNodes(t *testing.T) {
 		"revision": "4", "retention_hours": "0", "retention_bytes": "8192", "read_acl": "", "write_acl": "writer-2",
 	})
 
-	conflict := sendClusterTopicCommandRaw(t, ctx.GetBrokerAddrs(), "CREATE topic="+topicName+" idempotent=false")
-	require.Contains(t, conflict, "ERROR: create_topic_failed")
-	require.Contains(t, conflict, "idempotent mode is immutable")
+	conflict := sendClusterTopicCommandError(t, ctx.GetBrokerAddrs(), "CREATE topic="+topicName+" idempotent=false")
+	requireBrokerError(t, conflict, "create_topic_failed", "idempotent mode is immutable")
 
 	follower := waitForRaftFollower(t, actions)
 	actions.StopBroker(follower)
@@ -121,8 +122,8 @@ func TestRepeatedCreatePatchPreservesDefinitionAcrossThreeNodes(t *testing.T) {
 		"idempotent": "true", "retention_hours": "48", "retention_bytes": "4096",
 	})
 	requireClusterPartitionOffsetsEventually(t, ctx.GetBrokerAddrs(), truncateTopicName, 0, true)
-	conflictingTruncate := sendClusterTopicCommandRaw(t, ctx.GetBrokerAddrs(), "TRUNCATE topic="+truncateTopicName+" expected_revision=1")
-	require.Contains(t, conflictingTruncate, "topic_revision_conflict")
+	conflictingTruncate := sendClusterTopicCommandError(t, ctx.GetBrokerAddrs(), "TRUNCATE topic="+truncateTopicName+" expected_revision=1")
+	requireBrokerError(t, conflictingTruncate, "topic_revision_conflict", "")
 
 	actions.StopBroker(follower)
 	actions.StartBroker(follower)
@@ -140,10 +141,10 @@ func TestRepeatedCreatePatchPreservesDefinitionAcrossThreeNodes(t *testing.T) {
 
 	deleted := sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "DELETE topic="+topicName)
 	requireDefinitionFields(t, deleted, map[string]string{"topic": topicName, "deleted": "true"})
-	require.Contains(t, sendClusterTopicCommandRaw(t, ctx.GetBrokerAddrs(), "DELETE topic="+topicName), "topic_not_found")
+	requireBrokerError(t, sendClusterTopicCommandError(t, ctx.GetBrokerAddrs(), "DELETE topic="+topicName), "topic_not_found", "")
 	idempotentDelete := sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "DELETE topic="+topicName+" if_exists=true")
 	requireDefinitionFields(t, idempotentDelete, map[string]string{"topic": topicName, "deleted": "false"})
-	require.Contains(t, sendClusterTopicCommandRaw(t, ctx.GetBrokerAddrs(), "DELETE topic=__consumer_offsets if_exists=true"), "internal_topic_delete_forbidden")
+	requireBrokerError(t, sendClusterTopicCommandError(t, ctx.GetBrokerAddrs(), "DELETE topic=__consumer_offsets if_exists=true"), "internal_topic_delete_forbidden", "")
 	requireClusterTopicMissingEventually(t, ctx.GetBrokerAddrs(), topicName)
 
 	actions.StopBroker(follower)
@@ -165,18 +166,30 @@ func TestRepeatedCreatePatchPreservesDefinitionAcrossThreeNodes(t *testing.T) {
 
 func sendClusterTopicCommand(t *testing.T, addrs []string, command string) string {
 	t.Helper()
-	response := sendClusterTopicCommandRaw(t, addrs, command)
-	require.False(t, strings.HasPrefix(response, "ERROR:"), response)
-	return response
-}
-
-func sendClusterTopicCommandRaw(t *testing.T, addrs []string, command string) string {
-	t.Helper()
 	client := e2e.NewBrokerClient(addrs)
 	defer client.Close()
 	response, err := client.SendCommand("admin", command, 10*time.Second)
 	require.NoError(t, err)
 	return response
+}
+
+func sendClusterTopicCommandError(t *testing.T, addrs []string, command string) error {
+	t.Helper()
+	client := e2e.NewBrokerClient(addrs)
+	defer client.Close()
+	_, err := client.SendCommand("admin", command, 10*time.Second)
+	require.Error(t, err)
+	return err
+}
+
+func requireBrokerError(t *testing.T, err error, code, reason string) {
+	t.Helper()
+	var brokerErr *wire.BrokerError
+	require.True(t, errors.As(err, &brokerErr), "%T %v", err, err)
+	require.Equal(t, code, brokerErr.Code)
+	if reason != "" {
+		require.Contains(t, brokerErr.Fields["reason"], reason)
+	}
 }
 
 func requireClusterDefinitionEventually(t *testing.T, addrs []string, topicName string, expected map[string]string) {

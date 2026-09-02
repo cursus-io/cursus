@@ -144,7 +144,7 @@ flowchart TD
     UPDATE --> RETRY[Retry command]
     FIND --> RETRY
 
-    CHECK -->|NOT_LEADER LEADER_IS addr| ULEAD[Update partition leader cache]
+    CHECK -->|NOT_LEADER leader=addr| ULEAD[Update partition leader cache]
     ULEAD --> RETRY
 
     CHECK -->|OK / data| DONE[Process response]

@@ -7,12 +7,16 @@ import (
 
 // RuntimeSnapshot is an aggregate view of open broker storage handlers.
 type RuntimeSnapshot struct {
-	Handlers      int
-	Segments      int
-	Bytes         int64
-	PendingWrites int
-	ActiveReaders int
-	StatFailures  int
+	Handlers              int
+	Segments              int
+	Bytes                 int64
+	PendingWrites         int
+	ActiveReaders         int
+	StatFailures          int
+	SegmentCacheEntries   int
+	SegmentCacheHits      uint64
+	SegmentCacheMisses    uint64
+	SegmentCacheEvictions uint64
 }
 
 // RuntimeSnapshot returns storage state without retaining manager locks during I/O.
@@ -62,6 +66,11 @@ func (dm *DiskManager) RuntimeSnapshot() RuntimeSnapshot {
 
 		snapshot.PendingWrites += pending
 		snapshot.ActiveReaders += int(handler.GetActiveReaders())
+		cache := handler.segmentReaders.stats()
+		snapshot.SegmentCacheEntries += cache.Entries
+		snapshot.SegmentCacheHits += cache.Hits
+		snapshot.SegmentCacheMisses += cache.Misses
+		snapshot.SegmentCacheEvictions += cache.Evictions
 	}
 
 	return snapshot

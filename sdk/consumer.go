@@ -479,6 +479,23 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64, assignmentGeneration 
 
 	resp, err := ReadWithLength(conn)
 	if err != nil {
+		var brokerErr *BrokerError
+		if errors.As(err, &brokerErr) {
+			if c.handleNotCoordinatorError(brokerErr) {
+				c.closeCommitConn(conn)
+				LogWarn("Batch commit coordinator moved: %v", brokerErr)
+				return false
+			}
+			switch strings.ToUpper(brokerErr.Code) {
+			case "NOT_OWNER", "GEN_MISMATCH", "REBALANCE_REQUIRED", "MEMBER_NOT_FOUND":
+				select {
+				case c.rebalanceSig <- struct{}{}:
+				default:
+				}
+			}
+			LogError("Batch commit rejected: %v", brokerErr)
+			return false
+		}
 		LogError("Batch commit response failed: %v", err)
 		c.commitMu.Lock()
 		if c.commitConn == conn {
@@ -492,23 +509,6 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64, assignmentGeneration 
 	respStr := string(resp)
 	if hasOKStatus(respStr) {
 		return true
-	}
-
-	if c.handleNotCoordinator(respStr) {
-		c.closeCommitConn(conn)
-		LogWarn("Batch commit coordinator moved: %s", respStr)
-		return false
-	}
-
-	c.handleLeaderRedirection(respStr)
-
-	if strings.Contains(respStr, "NOT_OWNER") ||
-		strings.Contains(respStr, "GEN_MISMATCH") ||
-		strings.Contains(respStr, "REBALANCE_REQUIRED") {
-		select {
-		case c.rebalanceSig <- struct{}{}:
-		default:
-		}
 	}
 
 	LogError("Batch commit rejected: %s", respStr)
@@ -555,40 +555,26 @@ func (c *Consumer) directCommit(partition int, offset uint64, assignmentGenerati
 
 	resp, err := ReadWithLength(conn)
 	if err != nil {
+		var brokerErr *BrokerError
+		if errors.As(err, &brokerErr) {
+			_ = c.handleNotCoordinatorError(brokerErr)
+			switch strings.ToUpper(brokerErr.Code) {
+			case "GEN_MISMATCH", "NOT_OWNER", "REBALANCE_REQUIRED", "MEMBER_NOT_FOUND":
+				select {
+				case c.rebalanceSig <- struct{}{}:
+				default:
+				}
+			}
+			return brokerErr
+		}
 		return fmt.Errorf("direct commit response: %w", err)
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if brokerErr, ok := ParseBrokerError(respStr); ok {
-		if c.handleNotCoordinator(respStr) {
-			return brokerErr
-		}
-		switch strings.ToUpper(brokerErr.Code) {
-		case "GEN_MISMATCH", "NOT_OWNER", "REBALANCE_REQUIRED", "MEMBER_NOT_FOUND":
-			select {
-			case c.rebalanceSig <- struct{}{}:
-			default:
-			}
-		}
-		return brokerErr
-	}
 	if !hasOKStatus(respStr) {
 		return fmt.Errorf("unexpected direct commit response: %s", respStr)
 	}
 	return nil
-}
-
-func (c *Consumer) handleLeaderRedirection(resp string) {
-	if !strings.Contains(resp, "LEADER_IS") {
-		return
-	}
-	fields := strings.Fields(resp)
-	for i, f := range fields {
-		if f == "LEADER_IS" && i+1 < len(fields) {
-			c.client.UpdateLeader(fields[i+1])
-			return
-		}
-	}
 }
 
 // ─── Metadata ─────────────────────────────────────────────────────────────────
@@ -727,16 +713,14 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 	resp, err := ReadWithLength(conn)
 	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
-		return 0, "", nil, fmt.Errorf("read join response: %w", err)
-	}
-
-	respStr := strings.TrimSpace(string(resp))
-	if c.handleNotCoordinator(respStr) {
-		return 0, "", nil, fmt.Errorf("coordinator moved, retry")
-	}
-	if !hasOKStatus(respStr) {
-		brokerErr, hasBrokerErr := ParseBrokerError(respStr)
-		if resuming && hasBrokerErr && strings.EqualFold(brokerErr.Code, "GEN_MISMATCH") {
+		var brokerErr *BrokerError
+		if !errors.As(err, &brokerErr) {
+			return 0, "", nil, fmt.Errorf("read join response: %w", err)
+		}
+		if c.handleNotCoordinatorError(brokerErr) {
+			return 0, "", nil, fmt.Errorf("coordinator moved, retry: %w", brokerErr)
+		}
+		if resuming && strings.EqualFold(brokerErr.Code, "GEN_MISMATCH") {
 			currentText := brokerErr.Fields["current"]
 			current, parseErr := strconv.ParseInt(currentText, 10, 64)
 			if parseErr == nil {
@@ -746,7 +730,7 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 				}
 			}
 		}
-		if resuming && hasBrokerErr && strings.EqualFold(brokerErr.Code, "member_not_found") {
+		if resuming && strings.EqualFold(brokerErr.Code, "member_not_found") {
 			c.mu.Lock()
 			if c.memberID == mID {
 				c.memberID = ""
@@ -755,6 +739,11 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 			c.mu.Unlock()
 			return c.joinGroup()
 		}
+		return 0, "", nil, brokerErr
+	}
+
+	respStr := strings.TrimSpace(string(resp))
+	if !hasOKStatus(respStr) {
 		return 0, "", nil, fmt.Errorf("join rejected: %s", respStr)
 	}
 
@@ -865,14 +854,15 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 
 	resp, err := ReadWithLength(conn)
 	if err != nil {
+		var brokerErr *BrokerError
+		if errors.As(err, &brokerErr) {
+			_ = c.handleNotCoordinatorError(brokerErr)
+			return 0, brokerErr
+		}
 		return 0, fmt.Errorf("fetch offset response: %w", err)
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if brokerErr, ok := ParseBrokerError(respStr); ok {
-		_ = c.handleNotCoordinator(respStr)
-		return 0, brokerErr
-	}
 	return parseFetchOffsetResponse(respStr)
 }
 
@@ -893,9 +883,6 @@ func isRetryableFetchOffsetError(err error) bool {
 }
 
 func parseFetchOffsetResponse(respStr string) (uint64, error) {
-	if brokerErr, ok := ParseBrokerError(respStr); ok {
-		return 0, brokerErr
-	}
 	fields, err := parseOKResponse(respStr)
 	if err != nil {
 		return 0, fmt.Errorf("unexpected offset response: %s", respStr)
@@ -1019,9 +1006,6 @@ func (c *Consumer) findCoordinator() (string, error) {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if brokerErr, ok := ParseBrokerError(respStr); ok {
-		return "", brokerErr
-	}
 	fields, err := parseOKResponse(respStr)
 	if err != nil {
 		return "", fmt.Errorf("find_coordinator failed: %s", respStr)
@@ -1081,9 +1065,8 @@ func isLoopbackCoordinatorHost(host string) bool {
 	}
 }
 
-func (c *Consumer) handleNotCoordinator(respStr string) bool {
-	brokerErr, ok := ParseBrokerError(strings.TrimSpace(respStr))
-	if !ok || !strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
+func (c *Consumer) handleNotCoordinatorError(brokerErr *BrokerError) bool {
+	if brokerErr == nil || !strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
 		return false
 	}
 	host, port := brokerErr.Fields["host"], brokerErr.Fields["port"]

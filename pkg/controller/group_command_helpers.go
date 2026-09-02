@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/util"
 )
@@ -57,7 +58,7 @@ func formatCoordinatorError(err error) string {
 		return "OK"
 	}
 	msg := err.Error()
-	if strings.HasPrefix(msg, "ERROR:") {
+	if protocol.IsErrorResponse(msg) {
 		return msg
 	}
 	if strings.Contains(msg, "offset regression") {

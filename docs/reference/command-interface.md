@@ -19,7 +19,7 @@ Cursus clients use Wire v2 `CRS2` frames over TCP after a required binary handsh
 1. Discover group coordinators with `FIND_COORDINATOR group=<group>` and transaction coordinators with `FIND_COORDINATOR transactional_id=<id>`.
 2. Discover partition leaders with `METADATA topic=<topic>`.
 3. On `ERROR: NOT_COORDINATOR host=<host> port=<port>`, update the coordinator cache and retry only when the error registry marks the operation retryable.
-4. On `ERROR: NOT_LEADER LEADER_IS <host:port>`, update partition metadata and retry the leader-routed command.
+4. On `ERROR: NOT_LEADER leader=<host:port>`, update partition metadata and retry the leader-routed command.
 5. Treat fencing, validation, and authorization errors as terminal until client state or credentials change.
 
 ## Examples

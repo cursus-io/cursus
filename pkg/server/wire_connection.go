@@ -49,12 +49,8 @@ func (c *serverWireConn) WritePayload(payload []byte) error {
 
 func (c *serverWireConn) writeMessage(payload []byte) error {
 	status := wire.StatusOK
-	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(string(payload))), "ERROR:") {
+	if parsed, ok := wireprotocol.ParseErrorResponse(string(payload)); ok {
 		status = wire.StatusError
-		parsed, ok := wireprotocol.ParseErrorResponse(string(payload))
-		if !ok {
-			return fmt.Errorf("invalid broker error response")
-		}
 		class, err := wire.ParseErrorClass(string(parsed.Class))
 		if err != nil {
 			return err
@@ -67,7 +63,7 @@ func (c *serverWireConn) writeMessage(payload []byte) error {
 		}
 		payload, err = wire.EncodeError(wire.ErrorPayload{
 			Code: parsed.Code, Class: class, Retryable: parsed.Retryable,
-			Message: strings.Join(parsed.Details, " "), Fields: fields,
+			Message: joinErrorDetails(parsed.Details), Fields: fields,
 		})
 		if err != nil {
 			return err
@@ -76,13 +72,21 @@ func (c *serverWireConn) writeMessage(payload []byte) error {
 	kind := wire.KindResponse
 	if c.request.Command == wire.CommandStream {
 		kind = wire.KindStream
-		if strings.HasPrefix(string(payload), "STREAM_CONTROL type=close") {
+		if isStreamClosePayload(payload) {
 			status = wire.StatusStreamEnd
 		}
 	}
 	return c.connection.WriteFrame(wire.Frame{
 		Kind: kind, Command: c.request.Command, Status: status, RequestID: c.request.RequestID, Payload: payload,
 	})
+}
+
+func joinErrorDetails(details []string) string {
+	return strings.Join(details, " ")
+}
+
+func isStreamClosePayload(payload []byte) bool {
+	return strings.HasPrefix(string(payload), "STREAM_CONTROL type=close")
 }
 
 func negotiateServerConnection(conn net.Conn) (*wire.Connection, *serverWireConn, error) {

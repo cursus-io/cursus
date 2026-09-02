@@ -3,9 +3,6 @@ package wire
 import (
 	"fmt"
 	"net"
-	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -96,7 +93,7 @@ func (c *ClientConn) Receive() ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("decode Wire v2 broker error: %w", err)
 		}
-		return []byte(renderBrokerError(payload)), nil
+		return nil, NewBrokerError(payload)
 	}
 	if frame.Status != StatusOK && frame.Status != StatusStreamEnd {
 		return nil, fmt.Errorf("unexpected Wire v2 response status %d", frame.Status)
@@ -143,31 +140,4 @@ func responseSuppressed(payload []byte) bool {
 		return false
 	}
 	return request.Fields["acks"] == "0" || request.Fields["acks"] == "none"
-}
-
-func renderBrokerError(payload ErrorPayload) string {
-	parts := []string{
-		"ERROR:", payload.Code,
-		"class=" + payload.Class.String(),
-		"retryable=" + strconv.FormatBool(payload.Retryable),
-	}
-	if payload.Message != "" {
-		parts = append(parts, "message="+quoteErrorField(payload.Message))
-	}
-	keys := make([]string, 0, len(payload.Fields))
-	for key := range payload.Fields {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		parts = append(parts, key+"="+quoteErrorField(payload.Fields[key]))
-	}
-	return strings.Join(parts, " ")
-}
-
-func quoteErrorField(value string) string {
-	if strings.ContainsAny(value, " \t\r\n\"") {
-		return strconv.Quote(value)
-	}
-	return value
 }

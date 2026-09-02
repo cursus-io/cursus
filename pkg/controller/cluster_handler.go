@@ -13,6 +13,7 @@ import (
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	replicationFSM "github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -311,7 +312,8 @@ func (ch *CommandHandler) isPartitionLeaderAndForwardContext(ctx context.Context
 	for i := 0; i < maxRetries; i++ {
 		resp, err := ch.Cluster.Router.ForwardToPartitionLeader(topic, partition, cmd)
 		if err == nil {
-			isLeaderRedirect := strings.HasPrefix(resp, "ERROR: NOT_LEADER")
+			code, isError := protocol.ErrorCode(resp)
+			isLeaderRedirect := isError && strings.EqualFold(code, "NOT_LEADER")
 			if !isLeaderRedirect {
 				return resp, true, nil
 			}
@@ -434,8 +436,8 @@ func (ch *CommandHandler) applyViaLeaderContext(ctx context.Context, cmdType str
 	if fwdErr != nil {
 		return nil, fmt.Errorf("forward raft apply to leader: %w", fwdErr)
 	}
-	if strings.HasPrefix(resp, "ERROR") {
-		if wireErrorCode(resp) == "PARTITION_LEADER_FENCED" {
+	if code, isError := protocol.ErrorCode(resp); isError {
+		if strings.EqualFold(code, "PARTITION_LEADER_FENCED") {
 			return nil, fmt.Errorf("%w: remote partition commit rejected", clusterController.ErrPartitionLeaderFenced)
 		}
 		return nil, fmt.Errorf("leader raft apply: %s", resp)
@@ -444,11 +446,11 @@ func (ch *CommandHandler) applyViaLeaderContext(ctx context.Context, cmdType str
 }
 
 func wireErrorCode(response string) string {
-	fields := strings.Fields(strings.TrimSpace(response))
-	if len(fields) < 2 || !strings.EqualFold(fields[0], "ERROR:") {
+	code, ok := protocol.ErrorCode(response)
+	if !ok {
 		return ""
 	}
-	return strings.ToUpper(fields[1])
+	return strings.ToUpper(code)
 }
 
 func (ch *CommandHandler) applyAndWait(cmdType string, payload map[string]interface{}) (interface{}, error) {

@@ -35,13 +35,29 @@ func (h *metadataReplayHandler) ReadTopicPartition(_ string, partition int, offs
 	return result, nil
 }
 
-func TestConsumerMetadataReplayRequiresMigrationForRetainedGap(t *testing.T) {
-	handler := &metadataReplayHandler{starts: map[int]uint64{0: 42}}
+func TestConsumerMetadataReplayAcceptsCurrentRecordsAfterRetention(t *testing.T) {
+	registration := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
+		Group: "workers", Topic: "events", PartitionCount: 1, Epoch: 1, Timestamp: time.Unix(1, 0).UTC(),
+	}
+	snapshot := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordOffsetSnapshot,
+		Group: "workers", Topic: "events", Epoch: 1, Revision: 1,
+		Offsets: []OffsetItem{{Partition: 0, Offset: 7}}, Timestamp: time.Unix(2, 0).UTC(),
+	}
+	handler := &metadataReplayHandler{
+		starts: map[int]uint64{0: 42},
+		messages: map[int][]types.Message{0: {
+			encodedMetadataMessage(t, registration, 42),
+			encodedMetadataMessage(t, snapshot, 43),
+		}},
+	}
 	coordinator, err := NewCoordinatorWithRecovery(context.Background(), config.DefaultConfig(), handler)
-	require.ErrorContains(t, err, "starts at offset 42; explicit migration selection is required")
-	require.False(t, coordinator.RecoverySnapshot().Ready)
-	require.Equal(t, 1, coordinator.RecoverySnapshot().OrphanRecords)
-	require.Empty(t, coordinator.ListGroups())
+	require.NoError(t, err)
+	require.True(t, coordinator.RecoverySnapshot().Ready)
+	offset, found := coordinator.GetOffset("workers", "events", 0)
+	require.True(t, found)
+	require.Equal(t, uint64(7), offset)
 }
 
 func TestStandaloneRecoveryRejectsUnversionedOffsetRecord(t *testing.T) {

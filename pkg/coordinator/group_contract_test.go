@@ -2,7 +2,6 @@ package coordinator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -241,18 +240,10 @@ func TestLoadOffsetsFromLogFailsClosedOnInvalidRecord(t *testing.T) {
 	for i := 0; i < 1024; i++ {
 		records[i] = types.Message{Offset: uint64(i), Payload: "invalid"}
 	}
-	valid, err := json.Marshal(OffsetCommitMessage{
-		Group:     "workers",
-		Topic:     "events",
-		Partition: 2,
-		Offset:    19,
-		Timestamp: time.Now(),
-	})
-	require.NoError(t, err)
-	records[1024] = types.Message{Offset: 1024, Payload: string(valid)}
+	records[1024] = types.Message{Offset: 1024, Payload: `{"group":"workers","topic":"events","partition":2,"offset":19}`}
 
 	c := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
-	err = c.LoadOffsetsFromLog(&partitionedOffsetReader{
+	err := c.LoadOffsetsFromLog(&partitionedOffsetReader{
 		records: map[int][]types.Message{0: records},
 	})
 	require.ErrorContains(t, err, "decode internal metadata")

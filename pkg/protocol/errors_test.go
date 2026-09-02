@@ -15,10 +15,19 @@ func TestParseErrorResponseUsesExplicitMetadata(t *testing.T) {
 	}
 }
 
-func TestParseLegacyErrorDerivesClassification(t *testing.T) {
-	parsed, ok := ParseErrorResponse("ERROR NOT_LEADER LEADER_IS broker-2:9000")
+func TestParseErrorDerivesClassification(t *testing.T) {
+	parsed, ok := ParseErrorResponse("ERROR: NOT_LEADER leader=broker-2:9000")
 	if !ok || parsed.Class != ErrorClassRouting || !parsed.Retryable {
 		t.Fatalf("unexpected parsed response: %+v", parsed)
+	}
+	if parsed.Fields["leader"] != "broker-2:9000" {
+		t.Fatalf("leader field was not preserved: %+v", parsed.Fields)
+	}
+}
+
+func TestParseErrorRejectsLegacyMissingColon(t *testing.T) {
+	if parsed, ok := ParseErrorResponse("ERROR NOT_LEADER leader=broker-2:9000"); ok || parsed != nil {
+		t.Fatalf("legacy response was accepted: %+v", parsed)
 	}
 }
 

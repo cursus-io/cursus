@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
@@ -13,6 +14,10 @@ import (
 )
 
 var xerialSnappyHeader = []byte{130, 83, 78, 65, 80, 80, 89, 0}
+
+// ErrDecompressionRejected identifies payloads rejected by the bounded Wire v2
+// decompressor. The detailed cause remains wrapped for diagnostics.
+var ErrDecompressionRejected = errors.New("wire v2 decompression rejected")
 
 const xerialSnappyFrameHeaderSize = 16
 
@@ -58,6 +63,15 @@ func Compress(payload []byte, algorithm Compression) ([]byte, error) {
 }
 
 func Decompress(payload []byte, algorithm Compression, decodedSize uint32) ([]byte, error) {
+	decoded, err := decompress(payload, algorithm, decodedSize)
+	if err != nil {
+		recordDecompressionRejection()
+		return nil, fmt.Errorf("%w: %w", ErrDecompressionRejected, err)
+	}
+	return decoded, nil
+}
+
+func decompress(payload []byte, algorithm Compression, decodedSize uint32) ([]byte, error) {
 	if len(payload) > MaxFramePayload {
 		return nil, fmt.Errorf("encoded payload size %d exceeds maximum %d", len(payload), MaxFramePayload)
 	}
@@ -106,47 +120,6 @@ func Decompress(payload []byte, algorithm Compression, decodedSize uint32) ([]by
 	return decoded, nil
 }
 
-// DecompressBounded supports transitional call sites that do not yet carry a
-// Wire v2 decoded-length header. It still enforces the same 64 MiB allocation
-// boundary. New network paths should call Codec.ReadFrame instead.
-func DecompressBounded(payload []byte, algorithm Compression) ([]byte, error) {
-	if len(payload) > MaxFramePayload {
-		return nil, fmt.Errorf("encoded payload size %d exceeds maximum %d", len(payload), MaxFramePayload)
-	}
-	switch algorithm {
-	case CompressionNone:
-		return payload, nil
-	case CompressionGZIP:
-		reader, err := gzip.NewReader(bytes.NewReader(payload))
-		if err != nil {
-			return nil, fmt.Errorf("open gzip payload: %w", err)
-		}
-		decoded, readErr := readUnknownBounded(reader)
-		closeErr := reader.Close()
-		if readErr != nil {
-			return nil, readErr
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("close gzip payload: %w", closeErr)
-		}
-		return decoded, nil
-	case CompressionSnappy:
-		decodedSize, err := snappyDecodedSize(payload)
-		if err != nil {
-			return nil, err
-		}
-		if decodedSize > MaxFramePayload {
-			return nil, fmt.Errorf("decoded payload size %d exceeds maximum %d", decodedSize, MaxFramePayload)
-		}
-		// #nosec G115 -- decodedSize is non-negative and bounded by MaxFramePayload above.
-		return Decompress(payload, algorithm, uint32(decodedSize))
-	case CompressionLZ4:
-		return readUnknownBounded(lz4.NewReader(bytes.NewReader(payload)))
-	default:
-		return nil, fmt.Errorf("unsupported compression %q", algorithm.String())
-	}
-}
-
 func readBounded(reader io.Reader, expected uint32) ([]byte, error) {
 	limit := int64(expected) + 1
 	if limit > int64(MaxFramePayload)+1 {
@@ -158,17 +131,6 @@ func readBounded(reader io.Reader, expected uint32) ([]byte, error) {
 	}
 	if len(decoded) > int(expected) {
 		return nil, fmt.Errorf("decoded payload exceeds declared length %d", expected)
-	}
-	return decoded, nil
-}
-
-func readUnknownBounded(reader io.Reader) ([]byte, error) {
-	decoded, err := io.ReadAll(io.LimitReader(reader, int64(MaxFramePayload)+1))
-	if err != nil {
-		return nil, fmt.Errorf("decompress payload: %w", err)
-	}
-	if len(decoded) > MaxFramePayload {
-		return nil, fmt.Errorf("decoded payload size %d exceeds maximum %d", len(decoded), MaxFramePayload)
 	}
 	return decoded, nil
 }

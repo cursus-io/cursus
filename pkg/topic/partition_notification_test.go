@@ -1,6 +1,7 @@
 package topic
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -28,5 +29,28 @@ func TestPartitionMessageNotificationBroadcastsGeneration(t *testing.T) {
 	case <-next:
 		t.Fatal("next generation notification was already closed")
 	default:
+	}
+}
+
+func BenchmarkPartitionMessageNotificationFanout(b *testing.B) {
+	for _, streams := range []int{1, 64, 1024} {
+		b.Run(fmt.Sprintf("streams-%d", streams), func(b *testing.B) {
+			partition := &Partition{messageNotifyCh: make(chan struct{})}
+			waiters := make([]<-chan struct{}, streams)
+			b.ResetTimer()
+			for range b.N {
+				for index := range waiters {
+					_, waiters[index] = partition.MessageNotification()
+				}
+				partition.NotifyNewMessage()
+				for _, waiter := range waiters {
+					select {
+					case <-waiter:
+					default:
+						b.Fatal("notification did not broadcast to every stream")
+					}
+				}
+			}
+		})
 	}
 }

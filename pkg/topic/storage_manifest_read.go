@@ -59,7 +59,7 @@ func readStandaloneManifest(path string) ([]Definition, error) {
 			return nil, fmt.Errorf("invalid topic metadata for %q: %w", definition.Name, err)
 		}
 	}
-	definitions, _, err := normalizeAndMarshalManifest(manifest.Topics)
+	definitions, _, err := normalizeAndMarshalCurrentManifest(manifest.Topics)
 	if err != nil {
 		return nil, err
 	}

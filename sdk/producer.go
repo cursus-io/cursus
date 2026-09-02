@@ -2,8 +2,8 @@ package sdk
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
-	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +26,13 @@ type partitionBuffer struct {
 	drainWake    chan struct{}
 	drainWaiters []chan struct{}
 	closed       bool
+}
+
+func (p *Producer) wireTLSConfig() *tls.Config {
+	if p == nil || p.client == nil {
+		return nil
+	}
+	return p.client.tlsConfig
 }
 
 func newPartitionBuffer() *partitionBuffer {
@@ -175,17 +182,12 @@ func (p *Producer) fetchMetadata() {
 		return
 	}
 	for _, addr := range addrs {
-		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		conn, err := dialAuthenticatedWireConnection(
+			context.Background(), addr, 5*time.Second,
+			p.config.HandshakeTimeoutMS, p.config.CompressionType, p.wireTLSConfig(),
+			p.config.Principal, p.config.AuthToken,
+		)
 		if err != nil {
-			continue
-		}
-		conn, err = openWireConnection(conn, p.config.HandshakeTimeoutMS, p.config.CompressionType)
-		if err != nil {
-			_ = conn.Close()
-			continue
-		}
-		if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {
-			_ = conn.Close()
 			continue
 		}
 		cmd := fmt.Sprintf("METADATA topic=%s", p.config.Topic)
@@ -276,19 +278,15 @@ func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) er
 		return fmt.Errorf("no broker addresses available")
 	}
 	brokerAddr := p.config.BrokerAddrs[0]
-	conn, err := net.Dial("tcp", brokerAddr)
+	conn, err := dialAuthenticatedWireConnection(
+		context.Background(), brokerAddr, 5*time.Second,
+		p.config.HandshakeTimeoutMS, p.config.CompressionType, p.wireTLSConfig(),
+		p.config.Principal, p.config.AuthToken,
+	)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
-
-	conn, err = openWireConnection(conn, p.config.HandshakeTimeoutMS, p.config.CompressionType)
-	if err != nil {
-		return fmt.Errorf("wire v2 handshake: %w", err)
-	}
-	if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {
-		return fmt.Errorf("authentication: %w", err)
-	}
 	cmdBytes := []byte(createCmd)
 
 	if err := WriteWithLength(conn, cmdBytes); err != nil {
@@ -301,9 +299,6 @@ func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) er
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if brokerErr, ok := ParseBrokerError(respStr); ok {
-		return brokerErr
-	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return fmt.Errorf("unexpected create response: %s", respStr)
 	}

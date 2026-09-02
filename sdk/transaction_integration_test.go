@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -137,11 +138,8 @@ func integrationOKCommand(client *ConsumerClient, command string) (string, error
 		response, err := ReadWithLength(conn)
 		_ = conn.Close()
 		if err != nil {
-			return "", err
-		}
-		value := strings.TrimSpace(string(response))
-		if brokerErr, ok := ParseBrokerError(value); ok {
-			if strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
+			var brokerErr *BrokerError
+			if errors.As(err, &brokerErr) && strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
 				host, port := brokerErr.Fields["host"], brokerErr.Fields["port"]
 				if host == "" || port == "" {
 					return "", brokerErr
@@ -149,8 +147,9 @@ func integrationOKCommand(client *ConsumerClient, command string) (string, error
 				addr = netJoinCoordinator(client, host, port)
 				continue
 			}
-			return "", brokerErr
+			return "", err
 		}
+		value := strings.TrimSpace(string(response))
 		if !hasOKStatus(value) {
 			return "", fmt.Errorf("unexpected response from %s: %s", connAddr, value)
 		}
@@ -189,11 +188,8 @@ func integrationConsumePartition(t *testing.T, client *ConsumerClient, addrs []s
 		_ = conn.Close()
 		if err != nil {
 			lastErr = err
-			continue
-		}
-		if brokerErr, ok := ParseBrokerError(strings.TrimSpace(string(response))); ok {
-			lastErr = brokerErr
-			if strings.EqualFold(brokerErr.Code, "NOT_LEADER") {
+			var brokerErr *BrokerError
+			if errors.As(err, &brokerErr) && strings.EqualFold(brokerErr.Code, "NOT_LEADER") {
 				continue
 			}
 			break

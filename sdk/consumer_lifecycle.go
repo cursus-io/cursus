@@ -69,6 +69,16 @@ func (c *Consumer) assignmentActive(generation uint64) bool {
 	return generation != 0 && c.State() == ConsumerStateRunning && c.assignmentGeneration.Load() == generation
 }
 
+func (c *Consumer) recordStaleWorker(worker string, generation uint64) {
+	if c == nil || c.config == nil || !c.config.EnableMetrics || generation == 0 {
+		return
+	}
+	if c.assignmentGeneration.Load() == generation {
+		return
+	}
+	consumerStaleWorkers.WithLabelValues(c.config.Topic, c.config.GroupID, worker).Inc()
+}
+
 func (c *Consumer) assignmentContext() context.Context {
 	c.lifecycleMu.Lock()
 	ctx := c.mainCtx

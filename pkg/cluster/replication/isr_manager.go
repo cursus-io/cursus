@@ -129,6 +129,7 @@ func (i *ISRManager) BuildCatchupProofs() []fsm.ISRCatchupProof {
 func (i *ISRManager) SubmitCatchupProofs(nodeID string, proofs []fsm.ISRCatchupProof) error {
 	for _, proof := range proofs {
 		if proof.BrokerID != nodeID {
+			recordISRProof(ISRProofOutcomeRejected, ISRProofReasonIdentityMismatch)
 			return fmt.Errorf("ISR catch-up proof broker %q does not match authenticated heartbeat node %q", proof.BrokerID, nodeID)
 		}
 	}
@@ -136,26 +137,33 @@ func (i *ISRManager) SubmitCatchupProofs(nodeID string, proofs []fsm.ISRCatchupP
 		return nil
 	}
 	if i.fsm == nil {
+		recordISRProof(ISRProofOutcomeRejected, ISRProofReasonFSMUnavailable)
 		return fmt.Errorf("FSM is unavailable for ISR catch-up validation")
 	}
 	requiredProofs := make([]fsm.ISRCatchupProof, 0, len(proofs))
 	for _, proof := range proofs {
 		required, err := i.fsm.ValidateISRCatchupProof(proof)
 		if err != nil {
+			recordISRProof(ISRProofOutcomeRejected, ISRProofReasonValidation)
 			return err
 		}
 		if required {
 			requiredProofs = append(requiredProofs, proof)
+		} else {
+			recordISRProof(ISRProofOutcomeAccepted, ISRProofReasonAlreadyInISR)
 		}
 	}
 	for _, proof := range requiredProofs {
 		data, err := json.Marshal(proof)
 		if err != nil {
+			recordISRProof(ISRProofOutcomeRejected, ISRProofReasonEncoding)
 			return fmt.Errorf("marshal ISR catch-up proof: %w", err)
 		}
 		if err := i.applier.ApplyCommand("ISR_CATCHUP", data); err != nil {
+			recordISRProof(ISRProofOutcomeRejected, ISRProofReasonApply)
 			return fmt.Errorf("apply ISR catch-up proof for %s-%d: %w", proof.Topic, proof.Partition, err)
 		}
+		recordISRProof(ISRProofOutcomeAccepted, ISRProofReasonApplied)
 	}
 	return nil
 }

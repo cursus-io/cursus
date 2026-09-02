@@ -1,14 +1,15 @@
 package metrics
 
 import (
-	"strings"
 	"time"
+
+	"github.com/cursus-io/cursus/pkg/protocol"
 )
 
 // RecordCommand records a bounded command name and its wire response.
 func RecordCommand(command, response string, elapsed time.Duration) {
 	result := "ok"
-	if strings.HasPrefix(strings.TrimSpace(response), "ERROR:") {
+	if protocol.IsErrorResponse(response) {
 		result = "error"
 		CommandErrors.WithLabelValues(command, errorCode(response)).Inc()
 	}
@@ -17,11 +18,9 @@ func RecordCommand(command, response string, elapsed time.Duration) {
 }
 
 func errorCode(response string) string {
-	trimmed := strings.TrimSpace(response)
-	trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "ERROR:"))
-	fields := strings.Fields(trimmed)
-	if len(fields) == 0 {
+	code, ok := protocol.ErrorCode(response)
+	if !ok {
 		return "unknown"
 	}
-	return fields[0]
+	return code
 }

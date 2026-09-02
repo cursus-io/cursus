@@ -228,48 +228,42 @@ func encodeConsumerMetadataRecord(record ConsumerMetadataRecord) ([]byte, string
 	return payload, consumerMetadataRecordKey(record), nil
 }
 
-func decodeConsumerMetadataRecord(payload string) (ConsumerMetadataRecord, bool, error) {
+func decodeConsumerMetadataRecord(payload string) (ConsumerMetadataRecord, error) {
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(payload), &object); err != nil {
-		return ConsumerMetadataRecord{}, false, err
+		return ConsumerMetadataRecord{}, err
 	}
-	versionRaw, versioned := object["version"]
-	if !versioned {
-		return ConsumerMetadataRecord{}, false, nil
+	versionRaw, ok := object["version"]
+	if !ok {
+		return ConsumerMetadataRecord{}, fmt.Errorf("unversioned consumer metadata; clean bootstrap required")
 	}
 	var version int
 	if err := json.Unmarshal(versionRaw, &version); err != nil {
-		return ConsumerMetadataRecord{}, true, fmt.Errorf("decode consumer metadata version: %w", err)
+		return ConsumerMetadataRecord{}, fmt.Errorf("decode consumer metadata version: %w", err)
 	}
 	decoder := json.NewDecoder(bytes.NewBufferString(payload))
 	decoder.DisallowUnknownFields()
 	var record ConsumerMetadataRecord
 	if err := decoder.Decode(&record); err != nil {
-		return ConsumerMetadataRecord{}, true, err
+		return ConsumerMetadataRecord{}, err
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return ConsumerMetadataRecord{}, true, fmt.Errorf("consumer metadata record has trailing content")
+		return ConsumerMetadataRecord{}, fmt.Errorf("consumer metadata record has trailing content")
 	}
 	record = canonicalConsumerMetadataRecord(record)
 	if version != record.Version {
-		return ConsumerMetadataRecord{}, true, fmt.Errorf("consumer metadata version mismatch")
+		return ConsumerMetadataRecord{}, fmt.Errorf("consumer metadata version mismatch")
 	}
 	if err := validateConsumerMetadataRecord(record); err != nil {
-		return ConsumerMetadataRecord{}, true, err
+		return ConsumerMetadataRecord{}, err
 	}
-	return record, true, nil
+	return record, nil
 }
 
-// DecodeConsumerMetadataRecord is a read-only decoder used by the storage
-// maintenance CLI. The bool is false for a valid legacy offset payload.
-func DecodeConsumerMetadataRecord(payload string) (ConsumerMetadataRecord, bool, error) {
+// DecodeConsumerMetadataRecord validates a current-format record without
+// mutating coordinator state. Unversioned records are always rejected.
+func DecodeConsumerMetadataRecord(payload string) (ConsumerMetadataRecord, error) {
 	return decodeConsumerMetadataRecord(payload)
-}
-
-// DecodeLegacyOffsetPayload decodes the pre-v1 single and bulk offset JSON
-// formats without changing coordinator state.
-func DecodeLegacyOffsetPayload(payload string) (string, string, []OffsetItem, error) {
-	return parseOffsetLogPayload(payload)
 }
 
 func sameConsumerMetadataRecord(left, right ConsumerMetadataRecord) bool {
@@ -365,10 +359,6 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 			if err != nil {
 				return status, fmt.Errorf("inspect internal metadata log start partition=%d: %w", partition, err)
 			}
-			if earliest > 0 && !c.migrationAuthoritative {
-				status.OrphanRecords++
-				return status, fmt.Errorf("internal metadata partition %d starts at offset %d; explicit migration selection is required", partition, earliest)
-			}
 			next = earliest
 		}
 		for {
@@ -389,57 +379,47 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 				previous = message.Offset + 1
 				status.ReplayedRecords++
 
-				record, versioned, decodeErr := decodeConsumerMetadataRecord(message.Payload)
+				record, decodeErr := decodeConsumerMetadataRecord(message.Payload)
 				if decodeErr != nil {
 					status.CorruptRecords++
 					return status, fmt.Errorf("decode internal metadata partition=%d offset=%d: %w", partition, message.Offset, decodeErr)
 				}
-				if versioned {
-					if message.Key != consumerMetadataRecordKey(record) {
+				if message.Key != consumerMetadataRecordKey(record) {
+					status.CorruptRecords++
+					return status, fmt.Errorf("internal metadata key mismatch partition=%d offset=%d", partition, message.Offset)
+				}
+				switch record.Type {
+				case ConsumerMetadataRecordRegistration, ConsumerMetadataRecordTombstone:
+					status.RegistrationRecords++
+					candidate, exists := lifecycles[record.Group]
+					switch {
+					case !exists:
+						lifecycles[record.Group] = lifecycleCandidate{record: record}
+					case record.Epoch > candidate.record.Epoch:
+						status.OrphanRecords++
+						lifecycles[record.Group] = lifecycleCandidate{record: record}
+					case record.Epoch < candidate.record.Epoch:
+						status.OrphanRecords++
+					case !sameConsumerMetadataRecord(record, candidate.record):
 						status.CorruptRecords++
-						return status, fmt.Errorf("internal metadata key mismatch partition=%d offset=%d", partition, message.Offset)
+						return status, fmt.Errorf("conflicting lifecycle records group=%s epoch=%d", record.Group, record.Epoch)
+					default:
+						status.OrphanRecords++
 					}
-					switch record.Type {
-					case ConsumerMetadataRecordRegistration, ConsumerMetadataRecordTombstone:
-						status.RegistrationRecords++
-						candidate, exists := lifecycles[record.Group]
-						switch {
-						case !exists:
-							lifecycles[record.Group] = lifecycleCandidate{record: record}
-						case record.Epoch > candidate.record.Epoch:
-							status.OrphanRecords++
-							lifecycles[record.Group] = lifecycleCandidate{record: record}
-						case record.Epoch < candidate.record.Epoch:
-							status.OrphanRecords++
-						case !sameConsumerMetadataRecord(record, candidate.record):
-							status.CorruptRecords++
-							return status, fmt.Errorf("conflicting lifecycle records group=%s epoch=%d", record.Group, record.Epoch)
-						default:
-							status.OrphanRecords++
-						}
-					case ConsumerMetadataRecordOffsetSnapshot:
-						status.OffsetRecords++
-						identity := offsetCandidateIdentity(record)
-						candidate, exists := offsetSnapshots[identity]
-						if exists && !sameConsumerMetadataRecord(record, candidate.record) {
-							status.CorruptRecords++
-							return status, fmt.Errorf("conflicting offset snapshots group=%s topic=%s epoch=%d revision=%d", record.Group, record.Topic, record.Epoch, record.Revision)
-						}
-						if exists {
-							status.OrphanRecords++
-						} else {
-							offsetSnapshots[identity] = offsetCandidate{record: record}
-						}
+				case ConsumerMetadataRecordOffsetSnapshot:
+					status.OffsetRecords++
+					identity := offsetCandidateIdentity(record)
+					candidate, exists := offsetSnapshots[identity]
+					if exists && !sameConsumerMetadataRecord(record, candidate.record) {
+						status.CorruptRecords++
+						return status, fmt.Errorf("conflicting offset snapshots group=%s topic=%s epoch=%d revision=%d", record.Group, record.Topic, record.Epoch, record.Revision)
 					}
-					continue
+					if exists {
+						status.OrphanRecords++
+					} else {
+						offsetSnapshots[identity] = offsetCandidate{record: record}
+					}
 				}
-
-				if c.migrationAuthoritative {
-					status.OrphanRecords++
-					continue
-				}
-				status.CorruptRecords++
-				return status, fmt.Errorf("unversioned internal metadata partition=%d offset=%d; clean bootstrap required", partition, message.Offset)
 			}
 			if previous <= next {
 				status.CorruptRecords++
@@ -448,46 +428,6 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 			next = previous
 			if len(messages) < batchSize {
 				break
-			}
-		}
-	}
-
-	for _, raw := range c.migrationRecords {
-		record := canonicalConsumerMetadataRecord(raw)
-		if err := validateConsumerMetadataRecord(record); err != nil {
-			status.CorruptRecords++
-			return status, fmt.Errorf("invalid selected migration record for group %q: %w", record.Group, err)
-		}
-		switch record.Type {
-		case ConsumerMetadataRecordRegistration, ConsumerMetadataRecordTombstone:
-			status.RegistrationRecords++
-			candidate, exists := lifecycles[record.Group]
-			switch {
-			case !exists:
-				lifecycles[record.Group] = lifecycleCandidate{record: record}
-			case record.Epoch > candidate.record.Epoch:
-				status.OrphanRecords++
-				lifecycles[record.Group] = lifecycleCandidate{record: record}
-			case record.Epoch < candidate.record.Epoch:
-				status.OrphanRecords++
-			case !sameConsumerMetadataRecord(record, candidate.record):
-				status.CorruptRecords++
-				return status, fmt.Errorf("migration conflicts with lifecycle record group=%s epoch=%d", record.Group, record.Epoch)
-			default:
-				status.OrphanRecords++
-			}
-		case ConsumerMetadataRecordOffsetSnapshot:
-			status.OffsetRecords++
-			identity := offsetCandidateIdentity(record)
-			candidate, exists := offsetSnapshots[identity]
-			if exists && !sameConsumerMetadataRecord(record, candidate.record) {
-				status.CorruptRecords++
-				return status, fmt.Errorf("migration conflicts with offset snapshot group=%s topic=%s", record.Group, record.Topic)
-			}
-			if exists {
-				status.OrphanRecords++
-			} else {
-				offsetSnapshots[identity] = offsetCandidate{record: record}
 			}
 		}
 	}

@@ -256,7 +256,7 @@ ERROR: missing_member command=CONSUME
 ERROR: invalid_partition
 ERROR: invalid_offset
 ERROR: invalid_isolation isolation=<value>
-ERROR: NOT_LEADER LEADER_IS <host:port>
+ERROR: NOT_LEADER leader=<host:port>
 ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>
 ```
 
@@ -289,7 +289,7 @@ ERROR: missing_partition command=STREAM
 ERROR: missing_offset command=STREAM
 ERROR: missing_member command=STREAM
 ERROR: invalid_isolation isolation=<value>
-ERROR: NOT_LEADER LEADER_IS <host:port>
+ERROR: NOT_LEADER leader=<host:port>
 ```
 
 ## Consumer Group Commands
@@ -557,7 +557,7 @@ ERROR: raft_apply_failed reason="..."
 Event-sourcing commands are routed by aggregate `key`. In distributed mode, the broker handling the command must be the leader for the aggregate partition. A non-leader broker returns:
 
 ```text
-ERROR: NOT_LEADER LEADER_IS <host:port>
+ERROR: NOT_LEADER leader=<host:port>
 ```
 
 Clients and SDKs should reconnect to that leader and retry. Followers index replicated event-sourcing records, apply quorum-replicated snapshots, and can pull missing snapshots from the partition leader with token-authenticated internal catch-up commands after restart. Partitions restore a synced high-watermark checkpoint with durable-tail clamping, so committed reads remain bounded by the last successful committed tail.

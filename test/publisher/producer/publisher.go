@@ -1,7 +1,6 @@
 package producer
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -172,9 +171,6 @@ func (p *Publisher) CreateTopic(topic string, partitions int) error {
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return fmt.Errorf("broker error: %s", respStr)
-	}
 	if !strings.HasPrefix(respStr, "OK") {
 		return fmt.Errorf("unexpected create response: %s", respStr)
 	}
@@ -349,26 +345,9 @@ func (p *Publisher) sendBatch(part int, batch []types.Message) {
 		return
 	}
 
-	payload, err := util.CompressMessage(data, p.config.CompressionType)
-	if err != nil {
-		util.Error("compress batch failed: %v", err)
-		p.cleanupBatchState(part, batchID)
-		p.handleSendFailure(part, batch)
-		return
-	}
-
-	lenBuf := make([]byte, 4)
-	if len(payload) > math.MaxUint32 {
-		util.Error("compressed batch size %d exceeds uint32", len(payload))
-		p.cleanupBatchState(part, batchID)
-		p.handleSendFailure(part, batch)
-		return
-	}
-	// #nosec G115 -- payload length is checked against math.MaxUint32 above.
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
-	payload = append(lenBuf, payload...)
-
-	ackResp, err := p.sendWithRetry(payload, part)
+	// The negotiated Wire v2 connection owns framing and compression. Sending a
+	// second length prefix or pre-compressing here corrupts the canonical frame.
+	ackResp, err := p.sendWithRetry(data, part)
 	if err != nil {
 		util.Error("send failed: %v", err)
 		p.cleanupBatchState(part, batchID)
@@ -493,7 +472,7 @@ func (p *Publisher) sendWithRetry(payload []byte, part int) (*types.AckResponse,
 			continue
 		}
 
-		if _, err := conn.Write(payload); err != nil {
+		if err := util.WriteWithLength(conn, payload); err != nil {
 			lastErr = fmt.Errorf("write failed: %w", err)
 			brokerAddr := p.producer.selectBroker()
 			_ = p.producer.ReconnectPartition(part, brokerAddr, p.config.UseTLS, p.config.TLSCertPath, p.config.TLSKeyPath)
@@ -569,16 +548,6 @@ func (p *Publisher) GetLatencies() []time.Duration {
 }
 
 func (p *Publisher) parseAckResponse(resp []byte) (*types.AckResponse, error) {
-	respStr := string(resp)
-	if strings.HasPrefix(respStr, "ERROR:") {
-		ackResp := types.AckResponse{
-			Status:   "ERROR",
-			ErrorMsg: strings.TrimSpace(respStr),
-		}
-		util.Error("broker responded with error: %s", respStr)
-		return &ackResp, fmt.Errorf("broker responded with error: %s", respStr)
-	}
-
 	var ackResp types.AckResponse
 	if err := json.Unmarshal(resp, &ackResp); err != nil {
 		util.Error("invalid ack format: %v, %w", string(resp), err)

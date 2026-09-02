@@ -114,7 +114,7 @@ The configuration is represented by the Config struct in the codebase, which org
 | `enable_benchmark`   | bool       | false          | Enable benchmark mode for testing               |
 | `cleanup_interval`   | int        | 300            | Log cleanup interval (seconds)                 |
 
-In standalone mode, `log_dir` also contains `__topic_metadata.json`, the broker-owned `__consumer_offsets` topic, and `__transaction_state.journal`. The versioned topic manifest is atomically replaced before create/update success exposes a new topic definition and is loaded before internal-topic validation, durable group/offset replay, coordinator/static-group initialization, and readiness. Invalid or unsupported manifest/internal metadata fails closed in diagnostics-only mode; the broker does not fall back to guessed ACL, event-sourcing, retention, group, or offset state. A pre-manifest directory with persisted logs requires the explicit offline [`cursus-storage` migration procedure](../standalone-storage-recovery.md); application `CREATE` retries are not an automatic migration.
+In standalone mode, `log_dir` also contains `__topic_metadata.json`, the broker-owned `__consumer_offsets` topic, and `__transaction_state.journal`. The versioned topic manifest is atomically replaced before create/update success exposes a new topic definition and is loaded before internal-topic validation, durable group/offset replay, coordinator/static-group initialization, and readiness. Invalid or unsupported manifest/internal metadata fails closed in diagnostics-only mode; the broker does not fall back to guessed ACL, event-sourcing, retention, group, or offset state. A pre-manifest directory with persisted logs requires a complete [`clean bootstrap`](../standalone-storage-recovery.md); no offline import or migration command is supported.
 
 The broker fsyncs the append-only transaction coordinator journal before acknowledging transaction state transitions and repairs only a torn or checksum-corrupt final record during startup. One encoded snapshot record is limited to 32 MiB, so transaction batches must remain bounded. Include the topic manifest, journal, consumer offset log, and partition directories in one backup and restore procedure.
 
@@ -379,7 +379,7 @@ consumer:
   tls_key_path: "certs/client.key"
 ```
 
-When `use_tls` is enabled, both producer and consumer use `tls.DialWithDialer()` with TLS 1.2 minimum.
+When `use_tls` is enabled, every SDK client uses the shared transport dialer and performs a context-bounded TLS handshake with TLS 1.2 minimum before Wire v2 negotiation.
 
 ### SDK Metrics (Prometheus)
 
@@ -410,6 +410,8 @@ When enabled, the SDK registers the following metrics in a dedicated Prometheus 
 | `cursus_consumer_commit_errors_total`      | Counter   | topic, group | Commit errors                    |
 | `cursus_consumer_poll_latency_seconds`     | Histogram | topic, group | Poll operation latency           |
 | `cursus_consumer_rebalance_total`          | Counter   | topic, group | Rebalance events                 |
+| `cursus_consumer_offset_gap_total`         | Counter   | topic, group | Offsets skipped by the configured reset policy |
+| `cursus_consumer_stale_workers_total`      | Counter   | topic, group, worker | Assignment workers fenced by a newer generation |
 
 To expose metrics via HTTP:
 

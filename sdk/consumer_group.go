@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -11,6 +12,7 @@ import (
 // ─── Heartbeat ────────────────────────────────────────────────────────────────
 
 func (c *Consumer) heartbeatLoop(ctx context.Context, assignmentGeneration uint64) {
+	defer c.recordStaleWorker("heartbeat", assignmentGeneration)
 	interval := time.Duration(c.config.HeartbeatIntervalMS) * time.Millisecond
 	if interval <= 0 {
 		interval = 3 * time.Second
@@ -48,19 +50,28 @@ func (c *Consumer) heartbeatLoop(ctx context.Context, assignmentGeneration uint6
 			resp, err := ReadWithLength(conn)
 			_ = conn.SetDeadline(time.Time{})
 			if err != nil {
+				var brokerErr *BrokerError
+				if errors.As(err, &brokerErr) {
+					_ = c.handleNotCoordinatorError(brokerErr)
+					switch strings.ToUpper(brokerErr.Code) {
+					case "REBALANCE_REQUIRED", "GEN_MISMATCH", "NOT_OWNER", "MEMBER_NOT_FOUND":
+						LogWarn("Heartbeat: rebalance triggered: %v", brokerErr)
+						select {
+						case c.rebalanceSig <- struct{}{}:
+						default:
+						}
+						return
+					}
+				}
 				LogError("Heartbeat response failed: %v", err)
 				c.cleanupHbConn(conn)
 				continue
 			}
 
 			respStr := string(resp)
-			if strings.Contains(respStr, "REBALANCE_REQUIRED") || strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "NOT_OWNER") || strings.Contains(respStr, "member_not_found") {
-				LogWarn("Heartbeat: rebalance triggered: %s", respStr)
-				select {
-				case c.rebalanceSig <- struct{}{}:
-				default:
-				}
-				return
+			if !hasOKStatus(respStr) {
+				LogError("Heartbeat returned an unexpected response: %s", respStr)
+				c.cleanupHbConn(conn)
 			}
 		}
 	}
@@ -170,6 +181,7 @@ func (c *Consumer) startConsuming(ctx context.Context, assignmentGeneration uint
 		c.wg.Add(1)
 		go func(pid int, pc *PartitionConsumer) {
 			defer c.wg.Done()
+			defer c.recordStaleWorker("poller", assignmentGeneration)
 			defer pc.closeDataCh()
 			for {
 				select {
@@ -209,6 +221,7 @@ func (c *Consumer) startStreaming(ctx context.Context, assignmentGeneration uint
 		c.wg.Add(1)
 		go func(pc *PartitionConsumer) {
 			defer c.wg.Done()
+			defer c.recordStaleWorker("stream", assignmentGeneration)
 			pc.startStreamLoop()
 		}(pc)
 	}

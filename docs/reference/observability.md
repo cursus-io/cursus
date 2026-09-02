@@ -112,6 +112,12 @@ the lifetime or payload transfer time of a stream.
 | `cursus_storage_pending_writes` | Messages queued for disk writes |
 | `cursus_storage_active_readers` | Current segment readers |
 | `cursus_storage_stat_failures` | Files that could not be inspected during the scrape |
+| `cursus_storage_segment_cache_entries` | Memory-mapped segment readers retained by open handlers |
+| `cursus_storage_segment_cache_hits` | Cache hits accumulated by open handlers |
+| `cursus_storage_segment_cache_misses` | Cache misses accumulated by open handlers |
+| `cursus_storage_segment_cache_evictions` | Cache evictions accumulated by open handlers |
+| `cursus_wire_protocol_failures_total{reason}` | Rejected Wire v2 frames by bounded protocol reason |
+| `cursus_wire_decompression_rejections_total{reason}` | Rejected compressed payloads by bounded reason |
 
 `cursus_storage_bytes` covers open topic handlers. It is not filesystem capacity
 or free-space telemetry; collect those values with the node or container
@@ -226,6 +232,7 @@ Wire v2 exposes only `cursus_consumer_group_lag`; the former
 | `cursus_cluster_partition_in_sync_replicas{topic,partition}` | Current ISR size |
 | `cursus_cluster_partition_leader_epoch{topic,partition}` | Current leader epoch |
 | `cursus_cluster_partition_leader{topic,partition,broker_id}` | Current leader identity (`1`) |
+| `cursus_cluster_isr_catchup_proofs_total{outcome,reason}` | ISR catch-up proofs accepted or rejected by bounded reason |
 | `cluster_replication_lag_seconds{topic,partition,broker}` | Successful follower acknowledgement latency |
 
 `cluster_replication_lag_seconds` is the only operation-time cluster metric.

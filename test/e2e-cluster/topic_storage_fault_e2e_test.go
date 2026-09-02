@@ -115,8 +115,8 @@ func requireDirectCommandSuccess(t *testing.T, node int, command string) {
 	if err != nil {
 		t.Fatalf("broker-%d command %q failed: %v", node, command, err)
 	}
-	if strings.HasPrefix(strings.TrimSpace(response), "ERROR:") {
-		t.Fatalf("broker-%d command %q returned %q", node, command, response)
+	if strings.TrimSpace(response) == "" {
+		t.Fatalf("broker-%d command %q returned an empty response", node, command)
 	}
 }
 

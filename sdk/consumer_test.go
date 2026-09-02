@@ -108,50 +108,6 @@ func TestConsumerClient_LeaderStaleness(t *testing.T) {
 	assert.Contains(t, err.Error(), "all brokers unreachable")
 }
 
-func TestConsumer_HandleLeaderRedirection_WithLeaderIs(t *testing.T) {
-	cfg := NewDefaultConsumerConfig()
-	consumer, err := NewConsumer(cfg)
-	require.NoError(t, err)
-
-	consumer.handleLeaderRedirection("ERROR NOT_LEADER LEADER_IS broker-3:9000")
-
-	info := consumer.client.leader.Load()
-	assert.Equal(t, "broker-3:9000", info.addr)
-}
-
-func TestConsumer_HandleLeaderRedirection_NoLeaderIs(t *testing.T) {
-	cfg := NewDefaultConsumerConfig()
-	consumer, err := NewConsumer(cfg)
-	require.NoError(t, err)
-
-	consumer.handleLeaderRedirection("ERROR some other error")
-
-	info := consumer.client.leader.Load()
-	assert.Equal(t, "", info.addr)
-}
-
-func TestConsumer_HandleLeaderRedirection_LeaderIsAtEnd(t *testing.T) {
-	cfg := NewDefaultConsumerConfig()
-	consumer, err := NewConsumer(cfg)
-	require.NoError(t, err)
-
-	consumer.handleLeaderRedirection("LEADER_IS")
-
-	info := consumer.client.leader.Load()
-	assert.Equal(t, "", info.addr)
-}
-
-func TestConsumer_HandleLeaderRedirection_EmptyResponse(t *testing.T) {
-	cfg := NewDefaultConsumerConfig()
-	consumer, err := NewConsumer(cfg)
-	require.NoError(t, err)
-
-	consumer.handleLeaderRedirection("")
-
-	info := consumer.client.leader.Load()
-	assert.Equal(t, "", info.addr)
-}
-
 func TestNewConsumer_Construction(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	consumer, err := NewConsumer(cfg)
@@ -326,5 +282,5 @@ func TestParseListOffsetsResponse(t *testing.T) {
 
 	_, err = parseListOffsetsResponse("ERROR: topic_not_found topic=t")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "list offsets broker error")
+	assert.Contains(t, err.Error(), "unexpected list offsets response")
 }

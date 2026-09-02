@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"errors"
 	"fmt"
 	"net"
 
@@ -28,28 +29,20 @@ func WriteWithLength(conn net.Conn, data []byte) error {
 	if framed, ok := conn.(*transport.Conn); ok {
 		return framed.Send(data)
 	}
-	return wire.WriteLengthPrefixed(conn, data)
+	return fmt.Errorf("SDK payload writes require a negotiated Wire v2 connection")
 }
 
 func ReadWithLength(conn net.Conn) ([]byte, error) {
 	if framed, ok := conn.(*transport.Conn); ok {
-		return framed.Receive()
-	}
-	return wire.ReadLengthPrefixed(conn)
-}
-
-func CompressMessage(data []byte, compressionType string) ([]byte, error) {
-	compression, err := wire.ParseCompression(compressionType)
-	if err != nil {
+		payload, err := framed.Receive()
+		if err == nil {
+			return payload, nil
+		}
+		var brokerErr *wire.BrokerError
+		if errors.As(err, &brokerErr) {
+			return nil, brokerErrorFromWire(brokerErr)
+		}
 		return nil, err
 	}
-	return wire.Compress(data, compression)
-}
-
-func DecompressMessage(data []byte, compressionType string) ([]byte, error) {
-	compression, err := wire.ParseCompression(compressionType)
-	if err != nil {
-		return nil, err
-	}
-	return wire.DecompressBounded(data, compression)
+	return nil, fmt.Errorf("SDK payload reads require a negotiated Wire v2 connection")
 }

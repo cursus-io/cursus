@@ -64,6 +64,9 @@ func (m *MockCommandApplier) ApplyCommand(prefix string, data []byte) error {
 func (m *MockCommandApplier) IsLeader() bool { return m.IsLeaderResult }
 
 func TestISRManager_SubmitCatchupProofsFencesIdentityAndAppliesOnLeader(t *testing.T) {
+	identityBefore := isrProofMetricValue(ISRProofOutcomeRejected, ISRProofReasonIdentityMismatch)
+	appliedBefore := isrProofMetricValue(ISRProofOutcomeAccepted, ISRProofReasonApplied)
+	alreadyBefore := isrProofMetricValue(ISRProofOutcomeAccepted, ISRProofReasonAlreadyInISR)
 	cfg := &config.Config{LogDir: t.TempDir()}
 	tm := topic.NewTopicManager(cfg, &FakeHandlerProvider{}, nil)
 	brokerFSM := fsm.NewBrokerFSM(tm, nil)
@@ -103,6 +106,19 @@ func TestISRManager_SubmitCatchupProofsFencesIdentityAndAppliesOnLeader(t *testi
 	require.Equal(t, []string{"node1"}, brokerFSM.GetPartitionMetadata("orders-0").ISR)
 	require.NoError(t, manager.SubmitCatchupProofs("node2", []fsm.ISRCatchupProof{proof}))
 	require.Equal(t, metadata.Replicas, brokerFSM.GetPartitionMetadata("orders-0").ISR)
+	require.NoError(t, manager.SubmitCatchupProofs("node2", []fsm.ISRCatchupProof{proof}))
+	require.Equal(t, identityBefore+1, isrProofMetricValue(ISRProofOutcomeRejected, ISRProofReasonIdentityMismatch))
+	require.Equal(t, appliedBefore+1, isrProofMetricValue(ISRProofOutcomeAccepted, ISRProofReasonApplied))
+	require.Equal(t, alreadyBefore+1, isrProofMetricValue(ISRProofOutcomeAccepted, ISRProofReasonAlreadyInISR))
+}
+
+func isrProofMetricValue(outcome, reason string) uint64 {
+	for _, metric := range ISRProofMetrics() {
+		if metric.Outcome == outcome && metric.Reason == reason {
+			return metric.Count
+		}
+	}
+	return 0
 }
 
 func TestISRManager_Quorum(t *testing.T) {

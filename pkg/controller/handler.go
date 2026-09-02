@@ -12,6 +12,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/eventsource"
 	"github.com/cursus-io/cursus/pkg/metrics"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
@@ -179,7 +180,7 @@ func NewCommandHandler(
 
 func (ch *CommandHandler) logCommandResult(cmd, response string) {
 	status := "SUCCESS"
-	if strings.HasPrefix(response, "ERROR:") {
+	if protocol.IsErrorResponse(response) {
 		status = "FAILURE"
 	}
 	cleanCmd := redactCommandSecrets(cmd)

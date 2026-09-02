@@ -1,7 +1,6 @@
 package sdk
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"strings"
@@ -42,14 +41,7 @@ func decodeWireTestCommand(request wire.Frame) (string, error) {
 		}
 		return wire.RenderCommand(request.Command, payload)
 	}
-	payload := request.Payload
-	if len(payload) >= 2 {
-		topicLength := int(binary.BigEndian.Uint16(payload[:2]))
-		if topicLength <= len(payload)-2 {
-			return string(payload[2+topicLength:]), nil
-		}
-	}
-	return string(payload), nil
+	return "", fmt.Errorf("request is neither a Wire v2 batch nor command payload")
 }
 
 func writeWireTestResponse(connection *wire.Connection, request wire.Frame, response string) error {
@@ -57,8 +49,8 @@ func writeWireTestResponse(connection *wire.Connection, request wire.Frame, resp
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(response)), "ERROR:") {
 		status = wire.StatusError
 		response = wireprotocol.EnrichErrorResponse(response)
-		brokerError, ok := ParseBrokerError(response)
-		if !ok {
+		brokerError, ok := wireprotocol.ParseErrorResponse(response)
+		if !ok || !brokerError.ExplicitClassification {
 			return fmt.Errorf("invalid test broker error %q", response)
 		}
 		class, err := wire.ParseErrorClass(string(brokerError.Class))

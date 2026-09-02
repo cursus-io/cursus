@@ -13,19 +13,23 @@ func TestAuthenticateConfiguredClientSendsExactCommand(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		request, err := ReadWithLength(server)
+		connection, request, command, err := acceptWireTestRequest(server)
 		if err != nil {
 			done <- err
 			return
 		}
-		if got := string(request); got != "AUTH principal=game-server token=secret-token" {
-			done <- errors.New("unexpected auth command: " + got)
+		if command != "AUTH principal=game-server token=secret-token" {
+			done <- errors.New("unexpected auth command: " + command)
 			return
 		}
-		done <- WriteWithLength(server, []byte("OK principal=game-server"))
+		done <- writeWireTestResponse(connection, request, "OK principal=game-server")
 	}()
 
-	if err := authenticateConfiguredClient(client, "game-server", "secret-token"); err != nil {
+	framed, err := openWireConnection(client, 1000, "none")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authenticateConfiguredClient(framed, "game-server", "secret-token"); err != nil {
 		t.Fatalf("authenticate failed: %v", err)
 	}
 	if err := <-done; err != nil {
@@ -39,11 +43,20 @@ func TestAuthenticateConfiguredClientPreservesBrokerError(t *testing.T) {
 	t.Cleanup(func() { _ = server.Close() })
 
 	go func() {
-		_, _ = ReadWithLength(server)
-		_ = WriteWithLength(server, []byte("ERROR: authentication_failed class=authorization retryable=false"))
+		connection, request, _, err := acceptWireTestRequest(server)
+		if err == nil {
+			err = writeWireTestResponse(connection, request, "ERROR: authentication_failed class=authorization retryable=false")
+		}
+		if err != nil {
+			_ = server.Close()
+		}
 	}()
 
-	err := authenticateConfiguredClient(client, "game-server", "wrong-token")
+	framed, err := openWireConnection(client, 1000, "none")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = authenticateConfiguredClient(framed, "game-server", "wrong-token")
 	var brokerErr *BrokerError
 	if !errors.As(err, &brokerErr) {
 		t.Fatalf("expected BrokerError, got %T: %v", err, err)

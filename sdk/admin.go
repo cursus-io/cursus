@@ -294,9 +294,23 @@ func (c *AdminClient) execute(ctx context.Context, command string, retryAmbiguou
 }
 
 func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (string, error) {
-	conn, err := c.dial(ctx, addr)
+	conn, err := dialAuthenticatedWireConnection(
+		ctx, addr, time.Duration(c.config.RequestTimeoutMS)*time.Millisecond,
+		c.config.HandshakeTimeoutMS, c.config.CompressionType, c.tlsConfig,
+		c.config.Principal, c.config.AuthToken,
+	)
 	if err != nil {
-		return "", err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		var brokerErr *BrokerError
+		if errors.As(err, &brokerErr) {
+			return "", brokerErr
+		}
+		if isRetryableAdminTransportError(err) {
+			return "", err
+		}
+		return "", &terminalAdminError{err: err}
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -310,33 +324,6 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
 	defer stopCancellation()
 
-	conn, err = openWireConnection(conn, c.config.HandshakeTimeoutMS, c.config.CompressionType)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
-		}
-		var brokerErr *BrokerError
-		if errors.As(err, &brokerErr) {
-			return "", brokerErr
-		}
-		if isRetryableAdminTransportError(err) {
-			return "", fmt.Errorf("wire v2 handshake with %s: %w", addr, err)
-		}
-		return "", &terminalAdminError{err: fmt.Errorf("wire v2 handshake with %s: %w", addr, err)}
-	}
-	if err := authenticateConfiguredClient(conn, c.config.Principal, c.config.AuthToken); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
-		}
-		var brokerErr *BrokerError
-		if errors.As(err, &brokerErr) {
-			return "", brokerErr
-		}
-		if isRetryableAdminTransportError(err) {
-			return "", fmt.Errorf("authentication with %s: %w", addr, err)
-		}
-		return "", &terminalAdminError{err: fmt.Errorf("authentication with %s: %w", addr, err)}
-	}
 	if err := conn.SetDeadline(deadline); err != nil {
 		return "", fmt.Errorf("restore admin request deadline: %w", err)
 	}
@@ -348,12 +335,13 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
 		}
+		var brokerErr *BrokerError
+		if errors.As(err, &brokerErr) {
+			return "", brokerErr
+		}
 		return "", &ambiguousAdminError{err: fmt.Errorf("read admin response from %s: %w", addr, err)}
 	}
 	value := strings.TrimSpace(string(response))
-	if brokerErr, ok := ParseBrokerError(value); ok {
-		return "", brokerErr
-	}
 	if !hasOKStatus(value) {
 		return "", &terminalAdminError{err: fmt.Errorf("unexpected admin response: %s", value)}
 	}
@@ -369,28 +357,6 @@ func isRetryableAdminTransportError(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr)
-}
-
-func (c *AdminClient) dial(ctx context.Context, addr string) (net.Conn, error) {
-	timeout := time.Duration(c.config.RequestTimeoutMS) * time.Millisecond
-	dialer := &net.Dialer{Timeout: timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("connect to %s: %w", addr, err)
-	}
-	if !c.config.UseTLS {
-		return conn, nil
-	}
-	if c.tlsConfig == nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("TLS enabled but certificate not loaded")
-	}
-	tlsConn := tls.Client(conn, c.tlsConfig.Clone())
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("TLS handshake with %s: %w", addr, err)
-	}
-	return tlsConn, nil
 }
 
 func buildAdminCreateTopicCommand(topic string, patch TopicDefinitionPatch) (string, error) {

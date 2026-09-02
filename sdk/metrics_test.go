@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -21,6 +22,8 @@ func resetMetricsState() {
 	consumerCommitErrors = nil
 	consumerPollLatency = nil
 	consumerRebalanceTotal = nil
+	consumerOffsetGapTotal = nil
+	consumerStaleWorkers = nil
 }
 
 func TestInitMetrics_CreatesRegistry(t *testing.T) {
@@ -86,6 +89,7 @@ func TestConsumerMetrics_CanBeIncremented(t *testing.T) {
 	consumerCommitErrors.WithLabelValues("events", "grp1").Inc()
 	consumerPollLatency.WithLabelValues("events", "grp1").Observe(0.01)
 	consumerRebalanceTotal.WithLabelValues("events", "grp1").Inc()
+	consumerStaleWorkers.WithLabelValues("events", "grp1", "poller").Inc()
 
 	metrics, err := metricsRegistry.Gather()
 	assert.NoError(t, err)
@@ -99,6 +103,7 @@ func TestConsumerMetrics_CanBeIncremented(t *testing.T) {
 	assert.True(t, names["cursus_consumer_commit_errors_total"])
 	assert.True(t, names["cursus_consumer_poll_latency_seconds"])
 	assert.True(t, names["cursus_consumer_rebalance_total"])
+	assert.True(t, names["cursus_consumer_stale_workers_total"])
 }
 
 func TestMetricsHandler_ServesPrometheusFormat(t *testing.T) {
@@ -120,4 +125,21 @@ func TestMetricsHandler_ServesPrometheusFormat(t *testing.T) {
 	assert.True(t, strings.Contains(body, "cursus_consumer_messages_received_total"))
 	assert.True(t, strings.Contains(body, "test-topic"))
 	assert.True(t, strings.Contains(body, `topic="test-topic"`))
+}
+
+func TestRecordStaleWorkerCountsOnlySupersededAssignments(t *testing.T) {
+	resetMetricsState()
+	t.Cleanup(resetMetricsState)
+	initMetrics()
+
+	consumer := &Consumer{config: &ConsumerConfig{Topic: "events", GroupID: "grp1", EnableMetrics: true}}
+	consumer.assignmentGeneration.Store(2)
+	consumer.recordStaleWorker("poller", 2)
+	consumer.recordStaleWorker("poller", 1)
+
+	metric, err := consumerStaleWorkers.GetMetricWithLabelValues("events", "grp1", "poller")
+	assert.NoError(t, err)
+	value := &dto.Metric{}
+	assert.NoError(t, metric.Write(value))
+	assert.Equal(t, float64(1), value.GetCounter().GetValue())
 }

@@ -84,9 +84,6 @@ func (bc *BrokerClient) FindTransactionCoordinator(transactionalID string) (stri
 	if err != nil {
 		return "", err
 	}
-	if strings.HasPrefix(resp, "ERROR:") {
-		return "", fmt.Errorf("broker error: %s", resp)
-	}
 	coordinatorID := responseFields(resp)["coordinator_id"]
 	if coordinatorID == "" {
 		return "", fmt.Errorf("missing coordinator_id in response: %s", resp)
@@ -98,9 +95,6 @@ func (bc *BrokerClient) transactionCommand(command string) (string, error) {
 	resp, err := bc.SendCommand("", command, 10*time.Second)
 	if err != nil {
 		return "", err
-	}
-	if strings.HasPrefix(resp, "ERROR:") {
-		return "", fmt.Errorf("broker error: %s", resp)
 	}
 	if resp != "OK" && !strings.HasPrefix(resp, "OK ") {
 		return "", fmt.Errorf("unexpected transaction response: %s", resp)
@@ -123,11 +117,7 @@ func responseFields(resp string) map[string]string {
 func (bc *BrokerClient) CreateTopic(topic string, partitions int, idempotent bool) error {
 	createCmd := fmt.Sprintf("CREATE topic=%s partitions=%d idempotent=%t", topic, partitions, idempotent)
 
-	err := bc.executeCommand("admin", createCmd)
-	if err != nil && strings.Contains(err.Error(), "topic exists") {
-		return nil
-	}
-	return err
+	return bc.executeCommand("admin", createCmd)
 }
 
 // PublishIdempotent sends a message with idempotence metadata.
@@ -183,10 +173,6 @@ func (bc *BrokerClient) GetConsumerGroupStatus(groupID string) (*ConsumerGroupSt
 		return nil, err
 	}
 
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return nil, fmt.Errorf("broker error: %s", respStr)
-	}
-
 	var status ConsumerGroupStatus
 	if err := json.Unmarshal([]byte(respStr), &status); err != nil {
 		return nil, fmt.Errorf("parse response: %w", err)
@@ -236,10 +222,6 @@ func (bc *BrokerClient) FetchCommittedOffset(topic string, partition int, groupI
 	if err != nil {
 		return 0, err
 	}
-	if strings.HasPrefix(respStr, "ERROR:") {
-		return 0, fmt.Errorf("broker error: %s", respStr)
-	}
-
 	if strings.HasPrefix(respStr, "OK") {
 		for _, part := range strings.Fields(respStr) {
 			if strings.HasPrefix(part, "offset=") {
@@ -270,10 +252,6 @@ func (bc *BrokerClient) JoinGroup(topic, group string) (int, string, error) {
 	resp, err := bc.SendCommand("", joinCmd, 2*time.Second)
 	if err != nil {
 		return 0, "", fmt.Errorf("join group failed: %w", err)
-	}
-
-	if strings.HasPrefix(resp, "ERROR:") {
-		return 0, "", fmt.Errorf("broker error: %s", resp)
 	}
 
 	var gen int
@@ -318,10 +296,6 @@ func (bc *BrokerClient) SyncGroup(topic, group string, generation int, memberID 
 	resp, err := bc.SendCommand("", syncCmd, 2*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("sync group failed: %w", err)
-	}
-
-	if strings.HasPrefix(resp, "ERROR:") {
-		return nil, fmt.Errorf("broker error: %s", resp)
 	}
 
 	assignedPartitions := []int{}

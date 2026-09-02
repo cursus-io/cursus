@@ -257,7 +257,7 @@ Followers append replicated event-sourcing messages without treating the uncommi
 `READ_STREAM`, `STREAM_VERSION`, `SAVE_SNAPSHOT`, and `READ_SNAPSHOT` are partition-routed commands. In distributed mode, clients should send them to the leader for the aggregate partition. A non-leader broker returns a leader redirect:
 
 ```text
-ERROR: NOT_LEADER LEADER_IS <host:port>
+ERROR: NOT_LEADER leader=<host:port>
 ```
 
 SDKs should reconnect to the advertised leader and retry the command. `READ_STREAM` reads from the committed log, so it does not expose uncommitted leader-local events.

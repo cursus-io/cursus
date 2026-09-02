@@ -320,7 +320,7 @@ Returns partition leaders/epochs and the authoritative durable topic policy rest
 Any broker can answer this command. Addresses are the advertised client addresses from the FSM broker registry.
 
 > In cluster mode, `CONSUME` and `STREAM` should be sent to the partition leader. If sent to a non-leader broker, the response will be:
-> `ERROR: NOT_LEADER LEADER_IS <host:port>`
+> `ERROR: NOT_LEADER leader=<host:port>`
 
 **CLUSTER_STATUS**
 ```
@@ -601,7 +601,7 @@ The marker uses Cursus control metadata (`control_batch_type=transaction`, `cont
 
 These commands are available only on topics created with `event_sourcing=true`.
 
-Event-sourcing commands are partition-routed by aggregate `key`. In distributed mode, `APPEND_STREAM`, `READ_STREAM`, `STREAM_VERSION`, `SAVE_SNAPSHOT`, and `READ_SNAPSHOT` must execute on the leader for the aggregate partition. A non-leader broker returns `ERROR: NOT_LEADER LEADER_IS <host:port>`; clients should reconnect to that address and retry. Followers index replicated event-sourcing messages, apply quorum-replicated snapshots, and rebuild local stream indexes from the committed log on restart. Partitions persist their high watermark checkpoint and restore it on broker restart so committed reads resume from the last successful committed tail.
+Event-sourcing commands are partition-routed by aggregate `key`. In distributed mode, `APPEND_STREAM`, `READ_STREAM`, `STREAM_VERSION`, `SAVE_SNAPSHOT`, and `READ_SNAPSHOT` must execute on the leader for the aggregate partition. A non-leader broker returns `ERROR: NOT_LEADER leader=<host:port>`; clients should reconnect to that address and retry. Followers index replicated event-sourcing messages, apply quorum-replicated snapshots, and rebuild local stream indexes from the committed log on restart. Partitions persist their high watermark checkpoint and restore it on broker restart so committed reads resume from the last successful committed tail.
 
 **APPEND_STREAM**
 ```
@@ -625,7 +625,7 @@ Error responses:
 - `ERROR: version_conflict current=<N> expected=<N>` — optimistic concurrency failure
 - `ERROR: event_sourcing_not_enabled topic=<name>` - topic not created with `event_sourcing=true`
 - `ERROR: invalid_schema_version` - `schema_version` was not an unsigned integer
-- `ERROR: NOT_LEADER LEADER_IS <host:port>` - command reached a non-leader broker in distributed mode
+- `ERROR: NOT_LEADER leader=<host:port>` - command reached a non-leader broker in distributed mode
 
 **READ_STREAM**
 ```
@@ -786,7 +786,7 @@ All SDKs should implement the same consumer group resume behavior:
 - On `ERROR: OFFSET_OUT_OF_RANGE ...`, apply the SDK `auto_offset_reset` policy: `earliest` resumes from the broker-reported earliest retained offset, `latest` resumes from the broker-reported latest offset, and `error` fails the consumer instead of silently skipping or replaying data.
 ### Offset Lifecycle and Delivery Guarantees
 
-Consumer group registrations, tombstones, and committed next offsets are stored by the standalone broker in versioned records in `__consumer_offsets` and loaded again before readiness. A successful registration survives without a commit; `FETCH_OFFSET` returns `0` for its uncommitted partitions. Successful commits are synchronously persisted as monotonic complete snapshots, and the internal topic is compacted with unlimited retention rather than inheriting application delete retention. Replay corruption, inconsistency, or an unversioned record keeps readiness false and never falls back to an empty coordinator. The offline storage command can inspect earlier record shapes for an explicit operator migration, but the broker runtime does not import them. See [Standalone Storage Recovery](standalone-storage-recovery.md) for the clean-bootstrap procedure.
+Consumer group registrations, tombstones, and committed next offsets are stored by the standalone broker in versioned records in `__consumer_offsets` and loaded again before readiness. A successful registration survives without a commit; `FETCH_OFFSET` returns `0` for its uncommitted partitions. Successful commits are synchronously persisted as monotonic complete snapshots, and the internal topic is compacted with unlimited retention rather than inheriting application delete retention. Replay corruption, inconsistency, or an unversioned record keeps readiness false and never falls back to an empty coordinator. The offline storage command reports unsupported record shapes but cannot convert or authorize them. See [Standalone Clean-Bootstrap Recovery](standalone-storage-recovery.md) for the reset procedure.
 
 In distributed mode, offset updates are also applied through the Raft FSM and included in FSM snapshots.
 
@@ -852,7 +852,7 @@ SDKs should parse the code and fields first, use `class` for broad handling, and
 | `PARTITION_NOT_FOUND <N>` | Invalid partition ID | Check DESCRIBE for valid IDs |
 | `TOPIC_NOT_FOUND <X>` | Topic not found | CREATE topic first |
 | `NOT_AUTHORIZED_FOR_PARTITION <T>:<P>` | Not partition leader | Redirect to correct leader |
-| `NOT_LEADER LEADER_IS <addr>` | Not Raft leader | Reconnect to specified address |
+| `NOT_LEADER leader=<addr>` | Not Raft leader | Reconnect to specified address |
 | `group_not_found group=<X>` | Group not registered | JOIN_GROUP or REGISTER_GROUP |
 | `topic_not_assigned_to_group` | Topic mismatch | Verify group registration |
 | `GEN_MISMATCH current=N requested=N group=<G> member=<M>` | Stale generation | Re-join group |
@@ -884,7 +884,7 @@ SDKs should parse the code and fields first, use `class` for broad handling, and
 In distributed mode, if a request reaches a non-leader broker:
 
 ```
-ERROR: NOT_LEADER LEADER_IS 192.168.1.10:9000
+ERROR: NOT_LEADER leader=192.168.1.10:9000
 ```
 
 Client should reconnect to the specified address and retry.

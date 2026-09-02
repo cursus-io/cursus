@@ -286,7 +286,7 @@ sequenceDiagram
 
     Note over C,B3: If partition leader changes...
     C->>B2: CONSUME topic=T partition=0
-    B2-->>C: ERROR: NOT_LEADER LEADER_IS B3:9003
+    B2-->>C: ERROR: NOT_LEADER leader=B3:9003
     C->>B3: CONSUME topic=T partition=0
     B3-->>C: [messages]
 ```

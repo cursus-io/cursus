@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -77,43 +78,16 @@ func (pc *ProducerClient) connectPartitionLocked(idx int, addr string) error {
 		return fmt.Errorf("invalid partition index: %d", idx)
 	}
 
-	var conn net.Conn
-	var err error
-
-	if pc.config.UseTLS {
-		if pc.tlsConfig == nil {
-			return fmt.Errorf("TLS enabled but certificate not loaded")
-		}
-		conn, err = tls.DialWithDialer(
-			&net.Dialer{Timeout: 5 * time.Second},
-			"tcp", addr, pc.tlsConfig,
-		)
-		if err != nil {
-			return fmt.Errorf("TLS dial to %s failed: %w", addr, err)
-		}
-	} else {
-		conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
-		if err != nil {
-			return fmt.Errorf("TCP dial to %s failed: %w", addr, err)
-		}
+	if pc.config.UseTLS && pc.tlsConfig == nil {
+		return fmt.Errorf("TLS enabled but certificate not loaded")
 	}
-
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true)
-		_ = tcpConn.SetKeepAlive(true)
-		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		_ = tcpConn.SetReadBuffer(2 * 1024 * 1024)
-		_ = tcpConn.SetWriteBuffer(2 * 1024 * 1024)
-	}
-
-	conn, err = openWireConnection(conn, pc.config.HandshakeTimeoutMS, pc.config.CompressionType)
+	conn, err := dialAuthenticatedWireConnection(
+		context.Background(), addr, 5*time.Second,
+		pc.config.HandshakeTimeoutMS, pc.config.CompressionType, pc.tlsConfig,
+		pc.config.Principal, pc.config.AuthToken,
+	)
 	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("wire v2 handshake with %s failed: %w", addr, err)
-	}
-	if err := authenticateConfiguredClient(conn, pc.config.Principal, pc.config.AuthToken); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("authenticate with %s: %w", addr, err)
+		return err
 	}
 
 	var currentConns []net.Conn

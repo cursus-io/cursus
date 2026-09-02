@@ -93,36 +93,6 @@ func TestDistributedOffsetResilience(t *testing.T) {
 		Expect(ExpectOffsetMatched(0, 50))
 }
 
-// TestRollingRestartNoDowntime simulates rolling restart and verifies zero downtime
-func TestRollingRestartNoDowntime(t *testing.T) {
-	t.Skip("Unstable: Rolling restart timing issues in CI environment")
-	ctx := GivenClusterRestart(t).
-		WithClusterSize(3).
-		WithTopic("rolling-test").
-		WithNumMessages(30).
-		WithAcks("all")
-	defer ctx.Cleanup()
-	ctx.WhenCluster().
-		StartCluster().
-		CreateTopic().
-		PublishMessages()
-
-	// rolling restart nodes
-	for i := 1; i <= 3; i++ {
-		ctx.WhenCluster().
-			SimulateFollowerFailure(i).
-			RecoverFollower(i)
-		ctx.WhenCluster().WaitForTopicMetadata()
-	}
-
-	ctx.ResetPublishedCount().
-		WithNumMessages(30).
-		WhenCluster().
-		PublishMessages().
-		Then().
-		Expect(MessagesPublishedWithQuorum())
-}
-
 // TestClusterWideDeduplication verifies exactly-once delivery across cluster failover
 func TestClusterWideDeduplication(t *testing.T) {
 	ctx := GivenClusterRestart(t).

@@ -1,10 +1,9 @@
 package e2e
 
 import (
+	"errors"
 	"fmt"
 	"net"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -182,6 +181,26 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 
 		respBuf, err := bc.readWirePayload(command, requestID)
 		if err != nil {
+			var brokerErr *wire.BrokerError
+			if errors.As(err, &brokerErr) {
+				if redirectAddr, ok := notCoordinatorAddr(brokerErr); ok {
+					bc.closeInternal()
+					bc.preferAddr(redirectAddr)
+					lastErr = err
+					util.Debug("Coordinator moved to %s, retrying (%d/%d)", redirectAddr, i, maxRetries)
+					time.Sleep(500 * time.Millisecond)
+					continue
+				}
+				if brokerErr.Code == "NOT_AUTHORIZED_FOR_PARTITION" {
+					bc.closeInternal()
+					bc.rotateAddrs()
+					lastErr = err
+					util.Debug("Not authorized for partition, rotating and retrying (%d/%d)", i, maxRetries)
+					time.Sleep(time.Second)
+					continue
+				}
+				return "", err
+			}
 			bc.closeInternal()
 			lastErr = err
 			bc.rotateAddrs()
@@ -195,42 +214,16 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 		}
 		_ = conn.SetReadDeadline(time.Time{})
 
-		respStr := strings.TrimSpace(string(respBuf))
-		if redirectAddr, ok := parseNotCoordinator(respStr); ok {
-			bc.closeInternal()
-			bc.preferAddr(redirectAddr)
-			lastErr = fmt.Errorf("broker error: %s", respStr)
-			util.Debug("Coordinator moved to %s, retrying (%d/%d)", redirectAddr, i, maxRetries)
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		if strings.Contains(respStr, "NOT_AUTHORIZED_FOR_PARTITION") {
-			bc.closeInternal()
-			bc.rotateAddrs()
-			lastErr = fmt.Errorf("broker error: %s", respStr)
-			util.Debug("Not authorized for partition, rotating and retrying (%d/%d)", i, maxRetries)
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		return respStr, nil
+		return strings.TrimSpace(string(respBuf)), nil
 	}
 	return "", fmt.Errorf("command failed after retries: %w", lastErr)
 }
 
-func parseNotCoordinator(resp string) (string, bool) {
-	if !strings.Contains(resp, "NOT_COORDINATOR") {
+func notCoordinatorAddr(brokerErr *wire.BrokerError) (string, bool) {
+	if brokerErr == nil || brokerErr.Code != "NOT_COORDINATOR" {
 		return "", false
 	}
-	host := ""
-	port := ""
-	for _, part := range strings.Fields(resp) {
-		if strings.HasPrefix(part, "host=") {
-			host = strings.TrimPrefix(part, "host=")
-		} else if strings.HasPrefix(part, "port=") {
-			port = strings.TrimPrefix(part, "port=")
-		}
-	}
+	host, port := brokerErr.Fields["host"], brokerErr.Fields["port"]
 	if host == "" || port == "" {
 		return "", false
 	}
@@ -309,28 +302,12 @@ func (bc *BrokerClient) readWirePayload(command wire.Command, requestID uint64) 
 		if err != nil {
 			return nil, err
 		}
-		return []byte(renderWireError(payload)), nil
+		return nil, wire.NewBrokerError(payload)
 	}
 	if response.Status != wire.StatusOK && response.Status != wire.StatusStreamEnd {
 		return nil, fmt.Errorf("unexpected Wire v2 response status %d", response.Status)
 	}
 	return response.Payload, nil
-}
-
-func renderWireError(payload wire.ErrorPayload) string {
-	parts := []string{
-		"ERROR:", payload.Code, "class=" + payload.Class.String(),
-		"retryable=" + strconv.FormatBool(payload.Retryable),
-	}
-	keys := make([]string, 0, len(payload.Fields))
-	for key := range payload.Fields {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		parts = append(parts, key+"="+payload.Fields[key])
-	}
-	return strings.Join(parts, " ")
 }
 
 func sendOneWayWireCommand(address, commandText string) error {
@@ -374,14 +351,14 @@ func isIdempotent(payload string) bool {
 	}
 }
 
-// executeCommand is a simplified wrapper for commands expected to return only "OK" or "ERROR:".
+// executeCommand is a simplified wrapper for commands expected to return OK.
 func (bc *BrokerClient) executeCommand(topic, payload string) error {
 	resp, err := bc.SendCommand(topic, payload, 2*time.Second)
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(resp, "ERROR:") {
-		return fmt.Errorf("broker error: %s", resp)
+	if resp != "OK" && !strings.HasPrefix(resp, "OK ") {
+		return fmt.Errorf("unexpected broker response: %s", resp)
 	}
 	return nil
 }

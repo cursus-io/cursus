@@ -73,6 +73,41 @@ type ErrorPayload struct {
 	Fields    map[string]string
 }
 
+// BrokerError is the typed client-side representation of a Wire v2 error
+// response. Error metadata remains structured all the way through the client
+// transport; callers must not recover it by parsing Error().
+type BrokerError struct {
+	Code      string
+	Class     ErrorClass
+	Retryable bool
+	Message   string
+	Fields    map[string]string
+}
+
+func NewBrokerError(payload ErrorPayload) *BrokerError {
+	fields := make(map[string]string, len(payload.Fields))
+	for key, value := range payload.Fields {
+		fields[key] = value
+	}
+	return &BrokerError{
+		Code:      payload.Code,
+		Class:     payload.Class,
+		Retryable: payload.Retryable,
+		Message:   payload.Message,
+		Fields:    fields,
+	}
+}
+
+func (e *BrokerError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	if e.Message == "" {
+		return fmt.Sprintf("broker error %s (%s)", e.Code, e.Class)
+	}
+	return fmt.Sprintf("broker error %s (%s): %s", e.Code, e.Class, e.Message)
+}
+
 func EncodeError(payload ErrorPayload) ([]byte, error) {
 	if payload.Code == "" || payload.Class < ErrorClassValidation || payload.Class > ErrorClassInternal {
 		return nil, fmt.Errorf("invalid Wire v2 error code=%q class=%d", payload.Code, payload.Class)

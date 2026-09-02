@@ -12,7 +12,7 @@ import (
 
 func TestInspectStandaloneStorageDoesNotAllowGapsInActiveSegment(t *testing.T) {
 	root := t.TempDir()
-	writeMigrationSegment(t, root, "orders", 0, 0, []types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 1}})
+	writePersistedTestSegment(t, root, "orders", 0, 0, []types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 1}})
 	logPath := filepath.Join(root, "orders", "partition_0_segment_00000000000000000000.log")
 	info, err := os.Stat(logPath)
 	require.NoError(t, err)

@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -86,6 +87,7 @@ func (pc *PartitionConsumer) closeDataCh() {
 // runWorker processes batches from dataCh, calls the message handler, and commits offsets.
 func (pc *PartitionConsumer) runWorker() {
 	defer pc.consumer.wg.Done()
+	defer pc.consumer.recordStaleWorker("processor", pc.assignmentToken())
 
 	for batch := range pc.dataCh {
 		select {
@@ -212,13 +214,17 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	batchData, err := ReadWithLength(conn)
 	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
+		if pc.handleBrokerError(err) {
+			pc.waitWithBackoff(bo)
+			return
+		}
 		LogError("Partition [%d] read batch error: %v", pc.partitionID, err)
 		pc.closeConnection()
 		pc.waitWithBackoff(bo)
 		return
 	}
 
-	if pc.handleBrokerError(batchData) || pc.handleStreamControl(batchData) {
+	if pc.handleStreamControl(batchData) {
 		pc.waitWithBackoff(bo)
 		return
 	}
@@ -339,6 +345,12 @@ func (pc *PartitionConsumer) startStreamLoop() {
 
 			batchData, err := ReadWithLength(conn)
 			if err != nil {
+				if pc.handleBrokerError(err) {
+					if !pc.waitWithBackoff(bo) {
+						return
+					}
+					continue
+				}
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
 					continue // idle timeout — retry read
 				}
@@ -358,7 +370,7 @@ func (pc *PartitionConsumer) startStreamLoop() {
 				break
 			}
 
-			if pc.handleBrokerError(batchData) || pc.handleStreamControl(batchData) {
+			if pc.handleStreamControl(batchData) {
 				if !pc.waitWithBackoff(bo) {
 					return
 				}
@@ -504,19 +516,15 @@ type offsetOutOfRangeFrame struct {
 	Latest    uint64
 }
 
-func parseOffsetOutOfRangeFrame(respStr string) (offsetOutOfRangeFrame, bool) {
-	if !strings.Contains(respStr, "OFFSET_OUT_OF_RANGE") {
+func brokerOffsetOutOfRangeFrame(brokerErr *BrokerError) (offsetOutOfRangeFrame, bool) {
+	if brokerErr == nil || !strings.EqualFold(brokerErr.Code, "OFFSET_OUT_OF_RANGE") {
 		return offsetOutOfRangeFrame{}, false
 	}
 
 	frame := offsetOutOfRangeFrame{}
 	hasEarliest := false
 	hasLatest := false
-	for _, field := range strings.Fields(respStr) {
-		key, value, ok := strings.Cut(field, "=")
-		if !ok {
-			continue
-		}
+	for key, value := range brokerErr.Fields {
 		parsed, err := strconv.ParseUint(value, 10, 64)
 		if err != nil {
 			continue
@@ -640,30 +648,27 @@ func (pc *PartitionConsumer) handleStreamControl(data []byte) bool {
 	}
 }
 
-// handleBrokerError returns true if data is a recognised broker error string.
-func (pc *PartitionConsumer) handleBrokerError(data []byte) bool {
-	respStr := string(data)
-	if !strings.HasPrefix(respStr, "ERROR") {
+// handleBrokerError returns true if err is a structured broker response.
+func (pc *PartitionConsumer) handleBrokerError(err error) bool {
+	var brokerErr *BrokerError
+	if !errors.As(err, &brokerErr) {
 		return false
 	}
 
-	LogWarn("Partition [%d] broker error: %s", pc.partitionID, respStr)
+	LogWarn("Partition [%d] broker error: %v", pc.partitionID, brokerErr)
 
-	if frame, ok := parseOffsetOutOfRangeFrame(respStr); ok {
+	if frame, ok := brokerOffsetOutOfRangeFrame(brokerErr); ok {
 		return pc.handleOffsetOutOfRange(frame)
 	}
 
-	if strings.Contains(respStr, "NOT_LEADER") {
-		fields := strings.Fields(respStr)
-		for i, f := range fields {
-			if f == "LEADER_IS" && i+1 < len(fields) {
-				pc.consumer.updatePartitionLeader(pc.partitionID, fields[i+1])
-				break
-			}
+	if strings.EqualFold(brokerErr.Code, "NOT_LEADER") {
+		if leader := brokerErr.Fields["leader"]; leader != "" {
+			pc.consumer.updatePartitionLeader(pc.partitionID, leader)
 		}
 	}
 
-	if strings.Contains(respStr, "GEN_MISMATCH") || strings.Contains(respStr, "REBALANCE_REQUIRED") || strings.Contains(respStr, "NOT_OWNER") {
+	switch strings.ToUpper(brokerErr.Code) {
+	case "GEN_MISMATCH", "REBALANCE_REQUIRED", "NOT_OWNER", "MEMBER_NOT_FOUND":
 		pc.close()
 		select {
 		case pc.consumer.rebalanceSig <- struct{}{}:

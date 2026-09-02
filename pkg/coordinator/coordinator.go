@@ -27,8 +27,6 @@ type Coordinator struct {
 	offsetTopicPartitionCount int
 	standalone                bool
 	groupEpochs               map[string]uint64
-	migrationRecords          []ConsumerMetadataRecord
-	migrationAuthoritative    bool
 
 	recoveryMu sync.RWMutex
 	recovery   ConsumerMetadataRecoveryStatus
@@ -58,10 +56,6 @@ type offsetTopicPartitionProvider interface {
 
 type offsetLogStartProvider interface {
 	EarliestTopicOffset(topic string, partition int) (uint64, error)
-}
-
-type consumerMetadataMigrationProvider interface {
-	ConsumerMetadataMigrationRecords() ([]ConsumerMetadataRecord, bool, error)
 }
 
 type syncPublisher interface {
@@ -149,24 +143,9 @@ type consumerGroupObservationRef struct {
 	group string
 }
 
-type OffsetCommitMessage struct {
-	Group     string    `json:"group"`
-	Topic     string    `json:"topic"`
-	Partition int       `json:"partition"`
-	Offset    uint64    `json:"offset"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
 type OffsetItem struct {
 	Partition int    `json:"partition"`
 	Offset    uint64 `json:"offset"`
-}
-
-type BulkOffsetMsg struct {
-	Group     string       `json:"group"`
-	Topic     string       `json:"topic"`
-	Offsets   []OffsetItem `json:"offsets"`
-	Timestamp time.Time    `json:"timestamp"`
 }
 
 // NewCoordinator creates a new Coordinator instance.
@@ -231,16 +210,6 @@ func NewCoordinatorWithRecovery(ctx context.Context, cfg *config.Config, handler
 		return c, recoveryErr
 	}
 	if c.standalone {
-		if provider, ok := handler.(consumerMetadataMigrationProvider); ok {
-			records, authoritative, err := provider.ConsumerMetadataMigrationRecords()
-			if err != nil {
-				recoveryErr := fmt.Errorf("load consumer metadata migration: %w", err)
-				c.setRecoveryFailure(recoveryErr)
-				return c, recoveryErr
-			}
-			c.migrationRecords = append([]ConsumerMetadataRecord(nil), records...)
-			c.migrationAuthoritative = authoritative
-		}
 		if reader, ok := handler.(OffsetLogReader); ok {
 			if recoveryErr := c.LoadOffsetsFromLog(reader); recoveryErr != nil {
 				wrapped := fmt.Errorf("replay internal consumer metadata from %q: %w", c.offsetTopic, recoveryErr)

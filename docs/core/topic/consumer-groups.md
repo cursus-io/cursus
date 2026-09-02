@@ -164,7 +164,7 @@ commit `15`.
 
 Standalone `REGISTER_GROUP` writes a versioned durable registration before returning success, so a group with no commit survives restart with its topic and partition mapping and `FETCH_OFFSET=0`. Offset commits write complete, monotonically revised next-offset snapshots; deletion writes a higher lifecycle tombstone before removing memory state. Startup replays lifecycle records before snapshots, independent of physical internal-partition order.
 
-The internal `__consumer_offsets` topic is compacted but is never subject to application time/size delete retention. Corrupt, inconsistent, or unversioned replay fails readiness rather than presenting a healthy empty coordinator. Pre-manifest storage and `.deleted` offset evidence can be inspected only by the explicit offline [standalone storage recovery procedure](../../standalone-storage-recovery.md); the broker runtime does not import them. In distributed mode, fenced offset updates flow through the Raft FSM and are included in version-9 FSM snapshots.
+The internal `__consumer_offsets` topic is compacted but is never subject to application time/size delete retention. Corrupt, inconsistent, or unversioned replay fails readiness rather than presenting a healthy empty coordinator. Pre-manifest storage and `.deleted` offset evidence may be archived for forensics but cannot be imported; use the [standalone clean-bootstrap procedure](../../standalone-storage-recovery.md). In distributed mode, fenced offset updates flow through the Raft FSM and are included in version-9 FSM snapshots.
 
 ### Commit and Resume Contract
 A group is bound to the topic supplied at registration. `JOIN_GROUP`,

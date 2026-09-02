@@ -9,10 +9,12 @@ import (
 	"time"
 
 	clustercontroller "github.com/cursus-io/cursus/pkg/cluster/controller"
+	"github.com/cursus-io/cursus/pkg/cluster/replication"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -98,6 +100,12 @@ type Collector struct {
 	storagePendingWrites            *prometheus.Desc
 	storageActiveReaders            *prometheus.Desc
 	storageStatFailures             *prometheus.Desc
+	storageSegmentCacheEntries      *prometheus.Desc
+	storageSegmentCacheHits         *prometheus.Desc
+	storageSegmentCacheMisses       *prometheus.Desc
+	storageSegmentCacheEvictions    *prometheus.Desc
+	wireProtocolFailures            *prometheus.Desc
+	wireDecompressionRejections     *prometheus.Desc
 	distributionEnabled             *prometheus.Desc
 	clusterBrokers                  *prometheus.Desc
 	clusterHasLeader                *prometheus.Desc
@@ -111,6 +119,7 @@ type Collector struct {
 	partitionInSync                 *prometheus.Desc
 	partitionLeaderEpoch            *prometheus.Desc
 	partitionLeader                 *prometheus.Desc
+	isrCatchupProofs                *prometheus.Desc
 	transactionRecovery             *prometheus.Desc
 	transactionStates               *prometheus.Desc
 	transactionExpired              *prometheus.Desc
@@ -177,6 +186,12 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		storagePendingWrites:            prometheus.NewDesc("cursus_storage_pending_writes", "Messages waiting in storage write queues.", nil, nil),
 		storageActiveReaders:            prometheus.NewDesc("cursus_storage_active_readers", "Readers currently accessing storage segments.", nil, nil),
 		storageStatFailures:             prometheus.NewDesc("cursus_storage_stat_failures", "Storage files that could not be inspected during this scrape.", nil, nil),
+		storageSegmentCacheEntries:      prometheus.NewDesc("cursus_storage_segment_cache_entries", "Open memory-mapped segment readers retained in the bounded cache.", nil, nil),
+		storageSegmentCacheHits:         prometheus.NewDesc("cursus_storage_segment_cache_hits", "Segment reader cache hits for currently open handlers.", nil, nil),
+		storageSegmentCacheMisses:       prometheus.NewDesc("cursus_storage_segment_cache_misses", "Segment reader cache misses for currently open handlers.", nil, nil),
+		storageSegmentCacheEvictions:    prometheus.NewDesc("cursus_storage_segment_cache_evictions", "Segment reader cache evictions for currently open handlers.", nil, nil),
+		wireProtocolFailures:            prometheus.NewDesc("cursus_wire_protocol_failures_total", "Wire v2 frames rejected by bounded protocol failure reason.", []string{"reason"}, nil),
+		wireDecompressionRejections:     prometheus.NewDesc("cursus_wire_decompression_rejections_total", "Wire v2 payloads rejected by bounded decompression reason.", []string{"reason"}, nil),
 		distributionEnabled:             prometheus.NewDesc("cursus_distribution_enabled", "Whether distributed cluster mode is enabled.", nil, nil),
 		clusterBrokers:                  prometheus.NewDesc("cursus_cluster_brokers", "Brokers present in replicated cluster metadata.", nil, nil),
 		clusterHasLeader:                prometheus.NewDesc("cursus_cluster_has_leader", "Whether this broker can resolve the cluster leader.", nil, nil),
@@ -190,6 +205,7 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		partitionInSync:                 prometheus.NewDesc("cursus_cluster_partition_in_sync_replicas", "In-sync replica count for a partition.", []string{"topic", "partition"}, nil),
 		partitionLeaderEpoch:            prometheus.NewDesc("cursus_cluster_partition_leader_epoch", "Current partition leader epoch.", []string{"topic", "partition"}, nil),
 		partitionLeader:                 prometheus.NewDesc("cursus_cluster_partition_leader", "Current partition leader identity.", []string{"topic", "partition", "broker_id"}, nil),
+		isrCatchupProofs:                prometheus.NewDesc("cursus_cluster_isr_catchup_proofs_total", "ISR catch-up proofs by outcome and bounded reason.", []string{"outcome", "reason"}, nil),
 		transactionRecovery:             prometheus.NewDesc("cursus_transaction_recovery_ready", "Whether transaction state recovery completed before serving.", nil, nil),
 		transactionStates:               prometheus.NewDesc("cursus_transactions", "Transactions retained by coordinator state.", []string{"state"}, nil),
 		transactionExpired:              prometheus.NewDesc("cursus_transactions_expired", "Expired transaction identities awaiting replacement or compaction.", nil, nil),
@@ -211,10 +227,13 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		c.consumerMetadataReplayedRecords, c.consumerMetadataOrphanRecords, c.consumerMetadataCorruptRecords,
 		c.activeStreams, c.storageHandlers,
 		c.storageSegments, c.storageBytes, c.storagePendingWrites, c.storageActiveReaders,
-		c.storageStatFailures, c.distributionEnabled, c.clusterBrokers, c.clusterHasLeader,
+		c.storageStatFailures, c.storageSegmentCacheEntries, c.storageSegmentCacheHits,
+		c.storageSegmentCacheMisses, c.storageSegmentCacheEvictions,
+		c.wireProtocolFailures, c.wireDecompressionRejections,
+		c.distributionEnabled, c.clusterBrokers, c.clusterHasLeader,
 		c.clusterIsLeader, c.clusterOffline, c.clusterUnderReplicated, c.topicMaterializationPending,
 		c.topicMaterializationAttempts, c.topicMaterializationOldest, c.partitionReplicas,
-		c.partitionInSync, c.partitionLeaderEpoch, c.partitionLeader,
+		c.partitionInSync, c.partitionLeaderEpoch, c.partitionLeader, c.isrCatchupProofs,
 		c.transactionRecovery, c.transactionStates, c.transactionExpired, c.transactionOldestActive,
 	}
 	return c
@@ -279,6 +298,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	ch <- gauge(c.activeStreams, float64(activeStreams))
 	c.collectStorage(ch)
+	c.collectWire(ch)
 	c.collectCluster(ch)
 	c.collectTransactions(ch)
 }
@@ -505,6 +525,20 @@ func (c *Collector) collectStorage(ch chan<- prometheus.Metric) {
 	ch <- gauge(c.storagePendingWrites, float64(state.PendingWrites))
 	ch <- gauge(c.storageActiveReaders, float64(state.ActiveReaders))
 	ch <- gauge(c.storageStatFailures, float64(state.StatFailures))
+	ch <- gauge(c.storageSegmentCacheEntries, float64(state.SegmentCacheEntries))
+	ch <- gauge(c.storageSegmentCacheHits, float64(state.SegmentCacheHits))
+	ch <- gauge(c.storageSegmentCacheMisses, float64(state.SegmentCacheMisses))
+	ch <- gauge(c.storageSegmentCacheEvictions, float64(state.SegmentCacheEvictions))
+}
+
+func (c *Collector) collectWire(ch chan<- prometheus.Metric) {
+	state := wire.RuntimeMetrics()
+	for _, reason := range sortedCounterKeys(state.ProtocolFailures) {
+		ch <- counter(c.wireProtocolFailures, float64(state.ProtocolFailures[reason]), reason)
+	}
+	for _, reason := range sortedCounterKeys(state.DecompressionRejections) {
+		ch <- counter(c.wireDecompressionRejections, float64(state.DecompressionRejections[reason]), reason)
+	}
 }
 
 func (c *Collector) collectCluster(ch chan<- prometheus.Metric) {
@@ -518,6 +552,9 @@ func (c *Collector) collectCluster(ch chan<- prometheus.Metric) {
 	ch <- gauge(c.clusterIsLeader, boolValue(state.IsLeader))
 	ch <- gauge(c.clusterOffline, float64(state.Offline))
 	ch <- gauge(c.clusterUnderReplicated, float64(state.UnderReplicated))
+	for _, metric := range replication.ISRProofMetrics() {
+		ch <- counter(c.isrCatchupProofs, float64(metric.Count), metric.Outcome, metric.Reason)
+	}
 	for _, operation := range []string{"create", "restore", "delete"} {
 		ch <- gauge(c.topicMaterializationPending, float64(state.TopicMaterializationsPending[operation]), operation)
 		attempts := state.TopicMaterializationAttempts[operation]
@@ -534,6 +571,15 @@ func (c *Collector) collectCluster(ch chan<- prometheus.Metric) {
 			ch <- gauge(c.partitionLeader, 1, partition.Topic, partitionLabel, partition.Leader)
 		}
 	}
+}
+
+func sortedCounterKeys(counters map[string]uint64) []string {
+	keys := make([]string, 0, len(counters))
+	for key := range counters {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func partitionKey(topicName string, partition int) string {

@@ -2,8 +2,10 @@
 
 ## Status
 
-Implementation design for topic-specific replication safety and request-specific
-publish acknowledgement behavior.
+Historical implementation design for topic-specific replication safety and
+request-specific publish acknowledgement behavior. Its recovery compatibility
+sections are superseded by the approved Wire v2 clean-bootstrap design and are
+not a supported runtime or upgrade contract.
 
 ## Goals
 

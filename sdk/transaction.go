@@ -359,9 +359,6 @@ func executeTransactionCommand(conn net.Conn, cmd string) (string, error) {
 		return "", fmt.Errorf("read transaction response: %w", err)
 	}
 	respStr := strings.TrimSpace(string(resp))
-	if brokerErr, ok := ParseBrokerError(respStr); ok {
-		return "", brokerErr
-	}
 	if _, err := parseOKResponse(respStr); err != nil {
 		return "", fmt.Errorf("unexpected transaction response: %s", respStr)
 	}

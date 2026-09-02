@@ -203,250 +203,15 @@ func TestDecode_TruncatedBody(t *testing.T) {
 	assert.Contains(t, err.Error(), "field length")
 }
 
-// ---------------------------------------------------------------------------
-// WriteWithLength + ReadWithLength round-trip
-// ---------------------------------------------------------------------------
-
-func TestWriteReadWithLength_RoundTrip(t *testing.T) {
+func TestPayloadIORejectsUnnegotiatedConnections(t *testing.T) {
 	server, client := net.Pipe()
 	defer func() { _ = server.Close() }()
 	defer func() { _ = client.Close() }()
 
-	payload := []byte("hello, cursus")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- WriteWithLength(client, payload)
-	}()
-
-	got, err := ReadWithLength(server)
-	require.NoError(t, err)
-	assert.Equal(t, payload, got)
-	require.NoError(t, <-errCh)
-}
-
-func TestWriteReadWithLength_EmptyPayload(t *testing.T) {
-	server, client := net.Pipe()
-	defer func() { _ = server.Close() }()
-	defer func() { _ = client.Close() }()
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- WriteWithLength(client, []byte{})
-	}()
-
-	got, err := ReadWithLength(server)
-	require.NoError(t, err)
-	assert.Empty(t, got)
-	require.NoError(t, <-errCh)
-}
-
-func TestWriteReadWithLength_LargePayload(t *testing.T) {
-	server, client := net.Pipe()
-	defer func() { _ = server.Close() }()
-	defer func() { _ = client.Close() }()
-
-	payload := bytes.Repeat([]byte("A"), 1024*1024) // 1 MB
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- WriteWithLength(client, payload)
-	}()
-
-	got, err := ReadWithLength(server)
-	require.NoError(t, err)
-	assert.Equal(t, len(payload), len(got))
-	require.NoError(t, <-errCh)
-}
-
-func TestWriteWithLength_OversizedData(t *testing.T) {
-	server, client := net.Pipe()
-	defer func() { _ = server.Close() }()
-	defer func() { _ = client.Close() }()
-
-	oversized := make([]byte, MaxMessageSize+1)
-	err := WriteWithLength(client, oversized)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "exceeds maximum")
-}
-
-func TestReadWithLength_TruncatedLength(t *testing.T) {
-	server, client := net.Pipe()
-	defer func() { _ = client.Close() }()
-
-	// Write only 2 bytes instead of 4
-	go func() {
-		_, _ = server.Write([]byte{0x00, 0x01})
-		_ = server.Close()
-	}()
-
-	_, err := ReadWithLength(client)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "read payload length")
-}
-
-func TestReadWithLength_TruncatedBody(t *testing.T) {
-	server, client := net.Pipe()
-	defer func() { _ = client.Close() }()
-
-	go func() {
-		// Write length=10 but only 3 bytes of body, then close
-		lenBuf := make([]byte, 4)
-		binary.BigEndian.PutUint32(lenBuf, 10)
-		_, _ = server.Write(lenBuf)
-		_, _ = server.Write([]byte{1, 2, 3})
-		_ = server.Close()
-	}()
-
-	_, err := ReadWithLength(client)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "read payload")
-}
-
-func TestReadWithLength_OversizedLength(t *testing.T) {
-	server, client := net.Pipe()
-	defer func() { _ = client.Close() }()
-
-	go func() {
-		lenBuf := make([]byte, 4)
-		binary.BigEndian.PutUint32(lenBuf, uint32(MaxMessageSize+1))
-		_, _ = server.Write(lenBuf)
-		_ = server.Close()
-	}()
-
-	_, err := ReadWithLength(client)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "exceeds maximum")
-}
-
-// ---------------------------------------------------------------------------
-// CompressMessage + DecompressMessage round-trip
-// ---------------------------------------------------------------------------
-
-func TestCompressDecompress_Gzip(t *testing.T) {
-	original := []byte("The quick brown fox jumps over the lazy dog")
-	compressed, err := CompressMessage(original, "gzip")
-	require.NoError(t, err)
-	assert.NotEqual(t, original, compressed)
-
-	decompressed, err := DecompressMessage(compressed, "gzip")
-	require.NoError(t, err)
-	assert.Equal(t, original, decompressed)
-}
-
-func TestCompressDecompress_Snappy(t *testing.T) {
-	original := []byte("snappy test data 1234567890")
-	compressed, err := CompressMessage(original, "snappy")
-	require.NoError(t, err)
-
-	decompressed, err := DecompressMessage(compressed, "snappy")
-	require.NoError(t, err)
-	assert.Equal(t, original, decompressed)
-}
-
-func TestCompressDecompress_LZ4(t *testing.T) {
-	original := []byte("lz4 round-trip test payload with repeated content repeated content repeated content")
-	compressed, err := CompressMessage(original, "lz4")
-	require.NoError(t, err)
-
-	decompressed, err := DecompressMessage(compressed, "lz4")
-	require.NoError(t, err)
-	assert.Equal(t, original, decompressed)
-}
-
-func TestCompressDecompress_None(t *testing.T) {
-	original := []byte("no compression")
-	compressed, err := CompressMessage(original, "none")
-	require.NoError(t, err)
-	assert.Equal(t, original, compressed)
-
-	decompressed, err := DecompressMessage(compressed, "none")
-	require.NoError(t, err)
-	assert.Equal(t, original, decompressed)
-}
-
-func TestCompressDecompress_Empty(t *testing.T) {
-	original := []byte("empty type means none")
-	compressed, err := CompressMessage(original, "")
-	require.NoError(t, err)
-	assert.Equal(t, original, compressed)
-
-	decompressed, err := DecompressMessage(compressed, "")
-	require.NoError(t, err)
-	assert.Equal(t, original, decompressed)
-}
-
-func TestCompress_UnsupportedType(t *testing.T) {
-	_, err := CompressMessage([]byte("data"), "zstd")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported compression type")
-}
-
-func TestDecompress_UnsupportedType(t *testing.T) {
-	_, err := DecompressMessage([]byte("data"), "zstd")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported compression type")
-}
-
-func TestCompressDecompress_EmptyData(t *testing.T) {
-	// snappy (xerial framing) does not support empty input, so we skip it here.
-	for _, ct := range []string{"gzip", "lz4", "none", ""} {
-		t.Run(ct, func(t *testing.T) {
-			compressed, err := CompressMessage([]byte{}, ct)
-			require.NoError(t, err)
-
-			decompressed, err := DecompressMessage(compressed, ct)
-			require.NoError(t, err)
-			assert.Empty(t, decompressed)
-		})
-	}
-}
-
-func TestCompressDecompress_LargeData(t *testing.T) {
-	original := bytes.Repeat([]byte("ABCDEFGHIJ"), 10000) // 100 KB
-	for _, ct := range []string{"gzip", "snappy", "lz4"} {
-		t.Run(ct, func(t *testing.T) {
-			compressed, err := CompressMessage(original, ct)
-			require.NoError(t, err)
-			// Repeated data should compress well
-			assert.Less(t, len(compressed), len(original))
-
-			decompressed, err := DecompressMessage(compressed, ct)
-			require.NoError(t, err)
-			assert.Equal(t, original, decompressed)
-		})
-	}
-}
-
-func TestDecompress_InvalidGzipData(t *testing.T) {
-	_, err := DecompressMessage([]byte("not gzip"), "gzip")
-	assert.Error(t, err)
-}
-
-// ---------------------------------------------------------------------------
-// EncodeBatchMessages + compression integration
-// ---------------------------------------------------------------------------
-
-func TestEncodeBatch_CompressDecompressRoundTrip(t *testing.T) {
-	msgs := sampleMessages()
-	encoded, err := EncodeBatchMessages("events", 0, "all", true, msgs)
-	require.NoError(t, err)
-
-	for _, ct := range []string{"gzip", "snappy", "lz4", "none"} {
-		t.Run(ct, func(t *testing.T) {
-			compressed, err := CompressMessage(encoded, ct)
-			require.NoError(t, err)
-
-			decompressed, err := DecompressMessage(compressed, ct)
-			require.NoError(t, err)
-
-			decoded, topic, partition, err := DecodeBatchMessages(decompressed)
-			require.NoError(t, err)
-			assert.Equal(t, "events", topic)
-			assert.Equal(t, 0, partition)
-			require.Len(t, decoded, 2)
-			assert.Equal(t, msgs[0].EventType, decoded[0].EventType)
-			assert.Equal(t, msgs[1].Payload, decoded[1].Payload)
-		})
-	}
+	err := WriteWithLength(client, []byte("legacy"))
+	require.ErrorContains(t, err, "negotiated Wire v2")
+	_, err = ReadWithLength(client)
+	require.ErrorContains(t, err, "negotiated Wire v2")
 }
 
 // ---------------------------------------------------------------------------
@@ -462,14 +227,22 @@ func TestWriteReadBatch_Integration(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	defer func() { _ = client.Close() }()
 
-	errCh := make(chan error, 1)
+	serverDone := make(chan error, 1)
 	go func() {
-		errCh <- WriteWithLength(client, encoded)
+		connection, request, _, err := acceptWireTestRequest(server)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- writeWireTestResponse(connection, request, string(request.Payload))
 	}()
 
-	received, err := ReadWithLength(server)
+	framed, err := openWireConnection(client, 1000, "none")
 	require.NoError(t, err)
-	require.NoError(t, <-errCh)
+	require.NoError(t, WriteWithLength(framed, encoded))
+	received, err := ReadWithLength(framed)
+	require.NoError(t, err)
+	require.NoError(t, <-serverDone)
 
 	decoded, topic, partition, err := DecodeBatchMessages(received)
 	require.NoError(t, err)
