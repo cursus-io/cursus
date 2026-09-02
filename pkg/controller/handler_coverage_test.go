@@ -731,7 +731,7 @@ func TestHandleBatchCommit_NoValidOffsets(t *testing.T) {
 	_, _ = coord.AddConsumer("bc-g1", "bc-m1")
 	ctx := NewClientContext("", 0)
 
-	resp := ch.HandleCommand("BATCH_COMMIT topic=bc-topic group=bc-g1 generation=1 member=bc-m1 invalid", ctx)
+	resp := ch.HandleCommand("BATCH_COMMIT topic=bc-topic group=bc-g1 generation=1 member=bc-m1 offsets=invalid", ctx)
 	assert.Contains(t, resp, "invalid_batch_commit_entry")
 }
 
@@ -744,7 +744,7 @@ func TestHandleBatchCommit_ValidBulk(t *testing.T) {
 	gen := coord.GetGeneration("bc2-g1")
 	ctx := NewClientContext("", 0)
 
-	cmd := fmt.Sprintf("BATCH_COMMIT topic=bc2-topic group=bc2-g1 generation=%d member=bc2-m1 P0:100,P1:200", gen)
+	cmd := fmt.Sprintf("BATCH_COMMIT topic=bc2-topic group=bc2-g1 generation=%d member=bc2-m1 offsets=P0:100,P1:200", gen)
 	resp := ch.HandleCommand(cmd, ctx)
 	assert.Contains(t, resp, "OK batched=")
 }
@@ -1034,9 +1034,9 @@ func TestHandleBatchCommit_InvalidPartitionFormat(t *testing.T) {
 	gen := coord.GetGeneration("bc3-g1")
 	ctx := NewClientContext("", 0)
 
-	cmd := fmt.Sprintf("BATCH_COMMIT topic=bc3-topic group=bc3-g1 generation=%d member=bc3-m1 Pabc:100", gen)
+	cmd := fmt.Sprintf("BATCH_COMMIT topic=bc3-topic group=bc3-g1 generation=%d member=bc3-m1 offsets=Pabc:100", gen)
 	resp := ch.HandleCommand(cmd, ctx)
-	assert.Contains(t, resp, "invalid_partition")
+	assert.Contains(t, resp, "invalid_batch_commit_entry")
 }
 
 func TestHandleBatchCommit_InvalidOffsetFormat(t *testing.T) {
@@ -1048,9 +1048,9 @@ func TestHandleBatchCommit_InvalidOffsetFormat(t *testing.T) {
 	gen := coord.GetGeneration("bc4-g1")
 	ctx := NewClientContext("", 0)
 
-	cmd := fmt.Sprintf("BATCH_COMMIT topic=bc4-topic group=bc4-g1 generation=%d member=bc4-m1 P0:abc", gen)
+	cmd := fmt.Sprintf("BATCH_COMMIT topic=bc4-topic group=bc4-g1 generation=%d member=bc4-m1 offsets=P0:abc", gen)
 	resp := ch.HandleCommand(cmd, ctx)
-	assert.Contains(t, resp, "invalid_offset")
+	assert.Contains(t, resp, "invalid_batch_commit_entry")
 }
 
 func TestHandleBatchCommit_StaleGeneration(t *testing.T) {
@@ -1061,7 +1061,7 @@ func TestHandleBatchCommit_StaleGeneration(t *testing.T) {
 	coord.Rebalance("bc5-g1")
 	ctx := NewClientContext("", 0)
 
-	cmd := "BATCH_COMMIT topic=bc5-topic group=bc5-g1 generation=999 member=bc5-m1 P0:100"
+	cmd := "BATCH_COMMIT topic=bc5-topic group=bc5-g1 generation=999 member=bc5-m1 offsets=P0:100"
 	resp := ch.HandleCommand(cmd, ctx)
 	assert.Contains(t, resp, "GEN_MISMATCH")
 }
@@ -1496,7 +1496,7 @@ func TestTransactionCommitStagesMessagesAndOffsets(t *testing.T) {
 	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-1 topic=txn-topic partition=0 producerId="+producerID+" seqNum=1 epoch="+epoch+" message=created", ctx)
 	assert.Contains(t, resp, "staged_messages=1")
 
-	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId="+producerID+" epoch="+epoch+" topic=txn-topic group=txn-group member=txn-member generation="+strconv.Itoa(generation)+" P0:4", ctx)
+	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId="+producerID+" epoch="+epoch+" topic=txn-topic group=txn-group member=txn-member generation="+strconv.Itoa(generation)+" offsets=P0:4", ctx)
 	assert.Contains(t, resp, "staged_offsets=1")
 
 	resp = ch.HandleCommand("FETCH_OFFSET topic=txn-topic partition=0 group=txn-group", ctx)
@@ -1533,7 +1533,7 @@ func TestTransactionAbortDiscardsOffsets(t *testing.T) {
 	assert.Contains(t, resp, "state=open")
 	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-abort topic=txn-abort-topic partition=0 producerId="+producerID+" seqNum=1 epoch="+epoch+" message=discarded", ctx)
 	assert.Contains(t, resp, "staged_messages=1")
-	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-abort producerId="+producerID+" epoch="+epoch+" topic=txn-abort-topic group=txn-abort-group member=txn-abort-member generation="+strconv.Itoa(generation)+" P0:9", ctx)
+	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-abort producerId="+producerID+" epoch="+epoch+" topic=txn-abort-topic group=txn-abort-group member=txn-abort-member generation="+strconv.Itoa(generation)+" offsets=P0:9", ctx)
 	assert.Contains(t, resp, "staged_offsets=1")
 	resp = ch.HandleCommand("END_TXN transactional_id=tx-abort producerId="+producerID+" epoch="+epoch+" result=abort", ctx)
 	assert.Contains(t, resp, "state=aborted")
@@ -1564,7 +1564,7 @@ func TestTransactionRejectsOffsetRegressionBeforePublishing(t *testing.T) {
 	assert.Contains(t, resp, "state=open")
 	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-regression topic=txn-regression-topic partition=0 producerId="+producerID+" seqNum=1 epoch="+epoch+" message=should-not-commit", ctx)
 	assert.Contains(t, resp, "staged_messages=1")
-	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-regression producerId="+producerID+" epoch="+epoch+" topic=txn-regression-topic group=txn-regression-group member=txn-regression-member generation="+strconv.Itoa(generation)+" P0:5", ctx)
+	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-regression producerId="+producerID+" epoch="+epoch+" topic=txn-regression-topic group=txn-regression-group member=txn-regression-member generation="+strconv.Itoa(generation)+" offsets=P0:5", ctx)
 	assert.Contains(t, resp, "staged_offsets=1")
 
 	resp = ch.HandleCommand("END_TXN transactional_id=tx-regression producerId="+producerID+" epoch="+epoch+" result=commit", ctx)
@@ -1592,7 +1592,7 @@ func TestTransactionCommitRejectsStaleGroupGenerationBeforePublishing(t *testing
 	assert.Contains(t, resp, "state=open")
 	resp = ch.HandleCommand("TXN_PUBLISH transactional_id=tx-stale-generation topic=txn-stale-generation-topic partition=0 producerId="+producerID+" seqNum=1 epoch="+epoch+" message=must-not-publish", ctx)
 	assert.Contains(t, resp, "staged_messages=1")
-	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-stale-generation producerId="+producerID+" epoch="+epoch+" topic=txn-stale-generation-topic group=txn-stale-generation-group member=txn-stale-generation-member generation="+strconv.Itoa(generation)+" P0:3", ctx)
+	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-stale-generation producerId="+producerID+" epoch="+epoch+" topic=txn-stale-generation-topic group=txn-stale-generation-group member=txn-stale-generation-member generation="+strconv.Itoa(generation)+" offsets=P0:3", ctx)
 	assert.Contains(t, resp, "staged_offsets=1")
 
 	p, err := tm.GetTopic("txn-stale-generation-topic").GetPartition(0)

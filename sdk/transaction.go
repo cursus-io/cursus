@@ -4,11 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cursus-io/cursus/pkg/wire"
 )
 
 const transactionCommandTimeout = 10 * time.Second
@@ -217,19 +218,15 @@ func buildSendOffsetsToTransactionCommand(transactionalID, producerID, topic, gr
 		return "", fmt.Errorf("transaction offsets must not be empty")
 	}
 
-	partitions := make([]int, 0, len(offsets))
-	for partition := range offsets {
-		if partition < 0 {
-			return "", fmt.Errorf("transaction offset partition must be non-negative: %d", partition)
-		}
-		partitions = append(partitions, partition)
+	pairs := make([]wire.OffsetPair, 0, len(offsets))
+	for partition, offset := range offsets {
+		pairs = append(pairs, wire.OffsetPair{Partition: partition, Offset: offset})
 	}
-	sort.Ints(partitions)
-	pairs := make([]string, 0, len(partitions))
-	for _, partition := range partitions {
-		pairs = append(pairs, fmt.Sprintf("P%d:%d", partition, offsets[partition]))
+	encodedOffsets, err := wire.EncodeOffsetPairs(pairs)
+	if err != nil {
+		return "", err
 	}
-	return fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=%s producerId=%s epoch=%d topic=%s group=%s member=%s generation=%d %s", transactionalID, producerID, epoch, topic, group, member, generation, strings.Join(pairs, ",")), nil
+	return fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=%s producerId=%s epoch=%d topic=%s group=%s member=%s generation=%d offsets=%s", transactionalID, producerID, epoch, topic, group, member, generation, encodedOffsets), nil
 }
 
 func (c *ConsumerClient) EndTransaction(transactionalID, producerID string, epoch int64, commit bool) error {

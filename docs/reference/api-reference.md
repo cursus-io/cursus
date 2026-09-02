@@ -426,7 +426,7 @@ ERROR: commit_offset_failed reason="..."
 ### BATCH_COMMIT
 
 ```text
-BATCH_COMMIT topic=<name> group=<group> member=<member-id> generation=<N> P0:<nextOffset>,P1:<nextOffset>
+BATCH_COMMIT topic=<name> group=<group> member=<member-id> generation=<N> offsets=P0:<nextOffset>,P1:<nextOffset>
 ```
 
 Success:
@@ -441,7 +441,7 @@ Common errors:
 
 ```text
 ERROR: invalid_batch_commit_format
-ERROR: invalid_batch_commit_entry entry=<entry>
+ERROR: invalid_batch_commit_entry reason=<reason>
 ERROR: missing_generation command=BATCH_COMMIT
 ERROR: invalid_generation command=BATCH_COMMIT
 ERROR: duplicate_partition partition=<N> group=<group> topic=<topic>
@@ -591,7 +591,7 @@ Stages one record in the transaction. `seqNum` is required and must be greater t
 ### SEND_OFFSETS_TO_TXN
 
 ```text
-SEND_OFFSETS_TO_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> topic=<topic> group=<group> member=<member> generation=<N> P<partition>:<nextOffset>,P<partition>:<nextOffset>
+SEND_OFFSETS_TO_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> topic=<topic> group=<group> member=<member> generation=<N> offsets=P<partition>:<nextOffset>,P<partition>:<nextOffset>
 ```
 
 Stages consumer offsets in the transaction. The broker validates group member, generation, partition ownership, and monotonic offsets at stage and commit time. All entries in one transaction must share one `(topic, group, member, generation)` scope. Repeated partition entries may only stay equal or advance. Finalization applies the scope through one fenced `BATCH_COMMIT`; different consumer scopes require separate transactions.

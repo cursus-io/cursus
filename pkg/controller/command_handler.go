@@ -15,6 +15,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -897,7 +898,6 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 
 	if ch.isDistributed() {
 		payload := map[string]interface{}{
-			"type":       "COMMIT",
 			"group":      groupID,
 			"topic":      offsetTopic,
 			"member":     memberID,
@@ -919,7 +919,7 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	return "OK"
 }
 
-// handleBatchCommit processes BATCH_COMMIT topic=T1 group=G1 generation=1 member=M1 P0:10,P1:20...
+// handleBatchCommit processes BATCH_COMMIT topic=T1 group=G1 generation=1 member=M1 offsets=P0:10,P1:20...
 func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 	args := parseKeyValueArgs(cmd[13:])
 
@@ -961,38 +961,22 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 		}
 	}
 
-	partsIdx := strings.LastIndex(cmd, " ")
-	if partsIdx == -1 {
+	partitionData := args["offsets"]
+	if partitionData == "" {
 		return "ERROR: invalid_batch_commit_format"
 	}
+	pairs, pairErr := wire.DecodeOffsetPairs(partitionData)
+	if pairErr != nil {
+		return fmt.Sprintf("ERROR: invalid_batch_commit_entry reason=%q", pairErr.Error())
+	}
 
-	partitionData := cmd[partsIdx+1:]
-	partitionPairs := strings.Split(partitionData, ",")
-
-	var offsetList []coordinator.OffsetItem
-	for _, pair := range partitionPairs {
-		pair = strings.TrimSpace(pair)
-		kv := strings.Split(pair, ":")
-		if len(kv) != 2 {
-			return fmt.Sprintf("ERROR: invalid_batch_commit_entry entry=%q", pair)
-		}
-		if !strings.HasPrefix(kv[0], "P") {
-			return fmt.Sprintf("ERROR: invalid_partition entry=%q", pair)
-		}
-		partStr := strings.TrimPrefix(kv[0], "P")
-		p, err := strconv.Atoi(partStr)
-		if err != nil || p < 0 {
-			return fmt.Sprintf("ERROR: invalid_partition entry=%q", pair)
-		}
-		o, err := strconv.ParseUint(kv[1], 10, 64)
-		if err != nil {
-			return fmt.Sprintf("ERROR: invalid_offset entry=%q", pair)
-		}
-		if errResp := ch.ValidateOwnershipFailure(groupID, memberID, generation, p); errResp != "" {
-			util.Warn("Batch commit ownership rejected for partition %d: %s", p, errResp)
+	offsetList := make([]coordinator.OffsetItem, 0, len(pairs))
+	for _, pair := range pairs {
+		if errResp := ch.ValidateOwnershipFailure(groupID, memberID, generation, pair.Partition); errResp != "" {
+			util.Warn("Batch commit ownership rejected for partition %d: %s", pair.Partition, errResp)
 			return errResp
 		}
-		offsetList = append(offsetList, coordinator.OffsetItem{Partition: p, Offset: o})
+		offsetList = append(offsetList, coordinator.OffsetItem{Partition: pair.Partition, Offset: pair.Offset})
 	}
 
 	if len(offsetList) == 0 {
@@ -1002,7 +986,6 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 
 	if ch.isDistributed() {
 		batchCommitData := map[string]interface{}{
-			"type":       "BATCH_COMMIT",
 			"group":      groupID,
 			"topic":      offsetTopic,
 			"member":     memberID,

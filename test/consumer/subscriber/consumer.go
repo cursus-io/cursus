@@ -1038,15 +1038,19 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64) bool {
 	memberID := c.memberID
 	c.mu.RUnlock()
 
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "BATCH_COMMIT topic=%s group=%s generation=%d member=%s ", c.config.Topic, c.config.GroupID, generation, memberID)
-	parts := []string{}
+	pairs := make([]wire.OffsetPair, 0, len(offsets))
 	for pid, off := range offsets {
-		parts = append(parts, fmt.Sprintf("P%d:%d", pid, off))
+		pairs = append(pairs, wire.OffsetPair{Partition: pid, Offset: off})
 	}
-	sb.WriteString(strings.Join(parts, ","))
+	encodedOffsets, err := wire.EncodeOffsetPairs(pairs)
+	if err != nil {
+		util.Error("Batch commit: invalid offsets: %v", err)
+		return false
+	}
+	command := fmt.Sprintf("BATCH_COMMIT topic=%s group=%s generation=%d member=%s offsets=%s",
+		c.config.Topic, c.config.GroupID, generation, memberID, encodedOffsets)
 
-	if err := util.WriteWithLength(conn, []byte(sb.String())); err != nil {
+	if err := util.WriteWithLength(conn, []byte(command)); err != nil {
 		util.Error("Batch commit send failed: %v", err)
 		c.commitMu.Lock()
 		if c.commitConn == conn {

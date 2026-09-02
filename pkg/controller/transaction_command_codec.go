@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/cursus-io/cursus/pkg/types"
 )
@@ -24,38 +23,6 @@ func parseTxnProducerEpoch(args map[string]string, command string) (string, int6
 		return "", 0, fmt.Sprintf("ERROR: invalid_epoch reason=%q", err.Error())
 	}
 	return producerID, epoch, ""
-}
-
-func parseTxnOffsetPairs(command string) (map[int]uint64, error) {
-	partsIndex := strings.LastIndex(command, " ")
-	if partsIndex == -1 {
-		return nil, fmt.Errorf("missing offset pairs")
-	}
-	partitionData := command[partsIndex+1:]
-	if !strings.Contains(partitionData, ":") {
-		return nil, fmt.Errorf("missing offset pairs")
-	}
-	pairs := strings.Split(partitionData, ",")
-	offsets := make(map[int]uint64, len(pairs))
-	for _, pair := range pairs {
-		keyValue := strings.Split(pair, ":")
-		if len(keyValue) != 2 || !strings.HasPrefix(keyValue[0], "P") {
-			return nil, fmt.Errorf("invalid pair %s", pair)
-		}
-		partition, err := strconv.Atoi(strings.TrimPrefix(keyValue[0], "P"))
-		if err != nil {
-			return nil, err
-		}
-		offset, err := strconv.ParseUint(keyValue[1], 10, 64)
-		if err != nil {
-			return nil, err
-		}
-		offsets[partition] = offset
-	}
-	if len(offsets) == 0 {
-		return nil, fmt.Errorf("no offsets supplied")
-	}
-	return offsets, nil
 }
 
 func firstNonEmpty(values ...string) string {

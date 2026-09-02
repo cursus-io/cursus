@@ -139,7 +139,7 @@ func TestIsCommand_AllKeywords(t *testing.T) {
 		"INIT_PRODUCER_ID transactional_id=tx-1",
 		"BEGIN_TXN transactional_id=tx-1 producerId=p1 epoch=0",
 		"TXN_PUBLISH transactional_id=tx-1 topic=t1 partition=0 producerId=p1 seqNum=1 epoch=0 message=value",
-		"SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=p1 epoch=0 topic=t1 group=g1 member=m1 generation=1 P0:1",
+		"SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=p1 epoch=0 topic=t1 group=g1 member=m1 generation=1 offsets=P0:1",
 		"END_TXN transactional_id=tx-1 producerId=p1 epoch=0 result=commit",
 		"TXN_STATUS transactional_id=tx-1",
 	}

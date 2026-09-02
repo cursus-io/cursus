@@ -505,9 +505,11 @@ errors.
 
 **BATCH_COMMIT**
 ```
-BATCH_COMMIT topic=<name> group=<name> member=<id> generation=<N> P<partition>:<offset>,P<partition>:<offset>,...
+BATCH_COMMIT topic=<name> group=<name> member=<id> generation=<N> offsets=P<partition>:<offset>,P<partition>:<offset>,...
 ```
-Example: `BATCH_COMMIT topic=t1 group=g1 member=m1 generation=3 P0:100,P1:200,P2:150`
+Example: `BATCH_COMMIT topic=t1 group=g1 member=m1 generation=3 offsets=P0:100,P1:200,P2:150`
+
+`offsets` is one required Wire v2 field containing at most 1,024 unique partition pairs. Positional offset lists are not part of the current protocol.
 
 Response: `OK batched=<N>`
 
@@ -559,7 +561,7 @@ The record is staged in the transaction coordinator and is not published until `
 **SEND_OFFSETS_TO_TXN**
 
 ```text
-SEND_OFFSETS_TO_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> topic=<topic> group=<group> member=<member> generation=<N> P<partition>:<nextOffset>,P<partition>:<nextOffset>
+SEND_OFFSETS_TO_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> topic=<topic> group=<group> member=<member> generation=<N> offsets=P<partition>:<nextOffset>,P<partition>:<nextOffset>
 ```
 
 Success: `OK transactional_id=<id> staged_offsets=<N>`.
@@ -793,7 +795,7 @@ Recommended client loop:
 1. Fetch or join/sync assignments.
 2. Consume from the broker-selected resume offset.
 3. Process the returned records.
-4. Commit `lastProcessedOffset + 1` using `COMMIT_OFFSET ... member=<id> generation=<N>` or `BATCH_COMMIT ... P<partition>:<nextOffset>`.
+4. Commit `lastProcessedOffset + 1` using `COMMIT_OFFSET ... member=<id> generation=<N>` or `BATCH_COMMIT ... offsets=P<partition>:<nextOffset>`.
 
 This gives at-least-once delivery when the client commits after processing. If a
 client commits before processing and then crashes, it may skip unprocessed
@@ -862,7 +864,7 @@ SDKs should parse the code and fields first, use `class` for broad handling, and
 | `OFFSET_OUT_OF_RANGE requested=N earliest=N latest=N` | Requested offset is older than retained log or beyond available range | Treat as data loss or reset according to policy |
 | `no_valid_offsets` | BATCH_COMMIT contains no usable offsets | Supply at least one `P<N>:<offset>` entry |
 | `missing_generation command=<command>` | Group command omitted its generation | Rejoin if needed and send the current generation |
-| `invalid_batch_commit_entry entry=<entry>` | BATCH_COMMIT entry is not `P<N>:<offset>` | Correct the malformed entry and retry |
+| `invalid_batch_commit_entry reason=<reason>` | BATCH_COMMIT `offsets` is missing, malformed, oversized, or repeats a partition | Correct the named offsets field and retry |
 | `duplicate_partition partition=N group=<G> topic=<T>` | BATCH_COMMIT repeats a partition | Send one next offset per partition; no offsets were committed |
 | `NOT_PARTITION_LEADER leader=<id> requested_leader=<id>` | Replication reached a broker that is not the current partition leader | Refresh partition metadata and retry against the leader |
 | `PARTITION_LEADER_FENCED` | An internal partition commit no longer matches the current leader or epoch | Do not acknowledge success; refresh partition metadata before retrying |

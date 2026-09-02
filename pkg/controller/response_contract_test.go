@@ -31,12 +31,12 @@ func TestTextCommandResponseContract(t *testing.T) {
 	contractEpoch := valueFromOKResponse(initResp, "epoch")
 	assertContractSuccess(t, ch.HandleCommand("BEGIN_TXN transactional_id=contract-tx producerId="+contractProducer+" epoch="+contractEpoch, ctx), "BEGIN_TXN")
 	assertContractSuccess(t, ch.HandleCommand("TXN_PUBLISH transactional_id=contract-tx topic=contract-topic partition=0 producerId="+contractProducer+" seqNum=1 epoch="+contractEpoch+" message=tx", ctx), "TXN_PUBLISH")
-	assertContractSuccess(t, ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=contract-tx producerId="+contractProducer+" epoch="+contractEpoch+" topic=contract-topic group=contract-group member="+ctx.MemberID+" generation="+strconv.Itoa(ctx.Generation)+" P0:2", ctx), "SEND_OFFSETS_TO_TXN")
+	assertContractSuccess(t, ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=contract-tx producerId="+contractProducer+" epoch="+contractEpoch+" topic=contract-topic group=contract-group member="+ctx.MemberID+" generation="+strconv.Itoa(ctx.Generation)+" offsets=P0:2", ctx), "SEND_OFFSETS_TO_TXN")
 	assertContractSuccess(t, ch.HandleCommand("TXN_STATUS transactional_id=contract-tx", ctx), "TXN_STATUS")
 	assertContractSuccess(t, ch.HandleCommand("END_TXN transactional_id=contract-tx producerId="+contractProducer+" epoch="+contractEpoch+" result=abort", ctx), "END_TXN")
 	assertContractSuccess(t, ch.HandleCommand("LIST_OFFSETS topic=contract-topic", ctx), "LIST_OFFSETS")
 
-	batchCmd := fmt.Sprintf("BATCH_COMMIT topic=contract-topic group=contract-group generation=%d member=%s P0:3", ctx.Generation, ctx.MemberID)
+	batchCmd := fmt.Sprintf("BATCH_COMMIT topic=contract-topic group=contract-group generation=%d member=%s offsets=P0:3", ctx.Generation, ctx.MemberID)
 	assertContractSuccess(t, ch.HandleCommand(batchCmd, ctx), "BATCH_COMMIT")
 	assertContractSuccess(t, ch.HandleCommand("METADATA topic=contract-topic", ctx), "METADATA")
 	assertContractSuccess(t, ch.HandleCommand("FIND_COORDINATOR group=contract-group", ctx), "FIND_COORDINATOR")
@@ -58,7 +58,7 @@ func TestTextCommandErrorContract(t *testing.T) {
 		"BEGIN_TXN producerId=p1",
 		"BEGIN_TXN transactional_id=uninitialized producerId=p1 epoch=0",
 		"TXN_PUBLISH transactional_id=missing topic=t1 producerId=p1 message=x",
-		"SEND_OFFSETS_TO_TXN transactional_id=missing topic=t1 group=g1 P0:1",
+		"SEND_OFFSETS_TO_TXN transactional_id=missing topic=t1 group=g1 offsets=P0:1",
 		"END_TXN transactional_id=missing result=commit",
 		"DESCRIBE topic=missing-topic",
 	}

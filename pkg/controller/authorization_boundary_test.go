@@ -106,7 +106,7 @@ func TestCompositeTransactionPermissionsAreRequired(t *testing.T) {
 	if !strings.Contains(resp, "permission=topic.write") {
 		t.Fatalf("TXN_PUBLISH did not require topic.write: %s", resp)
 	}
-	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=p1 epoch=0 topic=missing group=g1 member=m1 generation=1 P0:1", ctx)
+	resp = ch.HandleCommand("SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=p1 epoch=0 topic=missing group=g1 member=m1 generation=1 offsets=P0:1", ctx)
 	if !strings.Contains(resp, "permission=group") {
 		t.Fatalf("SEND_OFFSETS_TO_TXN did not require group: %s", resp)
 	}

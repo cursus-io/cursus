@@ -64,7 +64,7 @@ func TestCommandHandler_GroupOps(t *testing.T) {
 	})
 
 	t.Run("handleBatchCommit", func(t *testing.T) {
-		cmd := fmt.Sprintf("BATCH_COMMIT topic=topic1 group=g1 generation=%d member=%s P0:150,P1:250", ctx.Generation, ctx.MemberID)
+		cmd := fmt.Sprintf("BATCH_COMMIT topic=topic1 group=g1 generation=%d member=%s offsets=P0:150,P1:250", ctx.Generation, ctx.MemberID)
 		resp := ch.HandleCommand(cmd, ctx)
 		assert.Contains(t, resp, "OK batched=2")
 
@@ -154,7 +154,7 @@ func TestCommandHandler_GroupCommandsRejectTopicMismatchAndPartialBatch(t *testi
 	assert.Equal(t, generation, status.Generation)
 
 	resp := ch.HandleCommand(
-		fmt.Sprintf("BATCH_COMMIT topic=topic1 group=g1 generation=%d member=m1 P0:150,invalid", generation),
+		fmt.Sprintf("BATCH_COMMIT topic=topic1 group=g1 generation=%d member=m1 offsets=P0:150,invalid", generation),
 		ctx,
 	)
 	assert.Contains(t, resp, "ERROR: invalid_batch_commit_entry")
@@ -169,7 +169,7 @@ func TestCommandHandler_GroupCommandsRejectTopicMismatchAndPartialBatch(t *testi
 	assert.Equal(t, "ERROR: invalid_partition", resp)
 
 	resp = ch.HandleCommand(
-		"BATCH_COMMIT topic=topic1 group=g1 member=m1 P0:150",
+		"BATCH_COMMIT topic=topic1 group=g1 member=m1 offsets=P0:150",
 		ctx,
 	)
 	assert.Equal(t, "ERROR: missing_generation command=BATCH_COMMIT", resp)

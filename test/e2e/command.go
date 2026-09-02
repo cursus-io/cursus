@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -48,17 +47,16 @@ func (bc *BrokerClient) TransactionalPublish(transactionalID, topic string, part
 }
 
 func (bc *BrokerClient) SendOffsetsToTransaction(transactionalID, topic, group, member string, generation int, producer TransactionProducer, offsets map[int]uint64) error {
-	partitions := make([]int, 0, len(offsets))
-	for partition := range offsets {
-		partitions = append(partitions, partition)
+	pairs := make([]wire.OffsetPair, 0, len(offsets))
+	for partition, offset := range offsets {
+		pairs = append(pairs, wire.OffsetPair{Partition: partition, Offset: offset})
 	}
-	sort.Ints(partitions)
-	pairs := make([]string, 0, len(partitions))
-	for _, partition := range partitions {
-		pairs = append(pairs, fmt.Sprintf("P%d:%d", partition, offsets[partition]))
+	encodedOffsets, err := wire.EncodeOffsetPairs(pairs)
+	if err != nil {
+		return err
 	}
-	cmd := fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=%s producerId=%s epoch=%d topic=%s group=%s member=%s generation=%d %s", transactionalID, producer.ProducerID, producer.Epoch, topic, group, member, generation, strings.Join(pairs, ","))
-	_, err := bc.transactionCommand(cmd)
+	cmd := fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=%s producerId=%s epoch=%d topic=%s group=%s member=%s generation=%d offsets=%s", transactionalID, producer.ProducerID, producer.Epoch, topic, group, member, generation, encodedOffsets)
+	_, err = bc.transactionCommand(cmd)
 	return err
 }
 

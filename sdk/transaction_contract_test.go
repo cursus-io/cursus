@@ -62,7 +62,7 @@ func TestBuildSendOffsetsToTransactionCommandSortsPartitions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := "SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=producer-1 epoch=2 topic=orders group=workers member=member-1 generation=4 P0:11,P2:30,P10:90"
+	expected := "SEND_OFFSETS_TO_TXN transactional_id=tx-1 producerId=producer-1 epoch=2 topic=orders group=workers member=member-1 generation=4 offsets=P0:11,P2:30,P10:90"
 	if cmd != expected {
 		t.Fatalf("command mismatch\nwant: %s\n got: %s", expected, cmd)
 	}

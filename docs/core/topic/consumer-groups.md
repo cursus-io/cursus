@@ -178,7 +178,7 @@ Use these broker commands:
 ```
 FETCH_OFFSET topic=<topic> group=<group> partition=<partition>
 COMMIT_OFFSET topic=<topic> group=<group> partition=<partition> offset=<nextOffset> member=<actual-id> generation=<N>
-BATCH_COMMIT topic=<topic> group=<group> member=<member> generation=<N> P0:<nextOffset>,P1:<nextOffset>
+BATCH_COMMIT topic=<topic> group=<group> member=<member> generation=<N> offsets=P0:<nextOffset>,P1:<nextOffset>
 ```
 
 If no offset has been committed for the key, `FETCH_OFFSET` returns `OK offset=0`. This is

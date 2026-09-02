@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cursus-io/cursus/pkg/wire"
 )
 
 type commitEntry struct {
@@ -446,26 +447,24 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64, assignmentGeneration 
 	memberID := c.memberID
 	c.mu.RUnlock()
 
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "BATCH_COMMIT topic=%s group=%s generation=%d member=%s ",
-		c.config.Topic, c.config.GroupID, generation, memberID)
-	partitions := make([]int, 0, len(offsets))
-	for pid := range offsets {
-		partitions = append(partitions, pid)
+	pairs := make([]wire.OffsetPair, 0, len(offsets))
+	for partition, offset := range offsets {
+		pairs = append(pairs, wire.OffsetPair{Partition: partition, Offset: offset})
 	}
-	sort.Ints(partitions)
-	parts := make([]string, 0, len(partitions))
-	for _, pid := range partitions {
-		parts = append(parts, fmt.Sprintf("P%d:%d", pid, offsets[pid]))
+	encodedOffsets, err := wire.EncodeOffsetPairs(pairs)
+	if err != nil {
+		LogError("Batch commit: invalid offsets: %v", err)
+		return false
 	}
-	sb.WriteString(strings.Join(parts, ","))
+	command := fmt.Sprintf("BATCH_COMMIT topic=%s group=%s generation=%d member=%s offsets=%s",
+		c.config.Topic, c.config.GroupID, generation, memberID, encodedOffsets)
 
 	c.lifecycleMu.Lock()
 	if !c.assignmentActive(assignmentGeneration) {
 		c.lifecycleMu.Unlock()
 		return false
 	}
-	err := WriteWithLength(conn, []byte(sb.String()))
+	err = WriteWithLength(conn, []byte(command))
 	c.lifecycleMu.Unlock()
 	if err != nil {
 		LogError("Batch commit send failed: %v", err)

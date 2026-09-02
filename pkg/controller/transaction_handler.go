@@ -13,6 +13,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -193,13 +194,13 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string) string {
 	if offsetTopicErr != "" {
 		return offsetTopicErr
 	}
-	offsets, err := parseTxnOffsetPairs(cmd)
+	offsetPairs, err := wire.DecodeOffsetPairs(args["offsets"])
 	if err != nil {
 		return fmt.Sprintf("ERROR: invalid_txn_offsets reason=%q", err.Error())
 	}
-	ops := make([]transaction.OffsetOperation, 0, len(offsets))
-	for partition, offset := range offsets {
-		op := transaction.OffsetOperation{Topic: offsetTopic, Group: groupID, Member: memberID, Generation: generation, Partition: partition, Offset: offset}
+	ops := make([]transaction.OffsetOperation, 0, len(offsetPairs))
+	for _, pair := range offsetPairs {
+		op := transaction.OffsetOperation{Topic: offsetTopic, Group: groupID, Member: memberID, Generation: generation, Partition: pair.Partition, Offset: pair.Offset}
 		if err := ch.validateTransactionOffset(op, false); err != nil {
 			return err.Error()
 		}
@@ -722,7 +723,7 @@ func (ch *CommandHandler) commitTransactionOffsets(ops []transaction.OffsetOpera
 	})
 	scope := ordered[0]
 	items := make([]coordinator.OffsetItem, 0, len(ordered))
-	pairs := make([]string, 0, len(ordered))
+	pairs := make([]wire.OffsetPair, 0, len(ordered))
 	for _, op := range ordered {
 		if op.Topic != scope.Topic || op.Group != scope.Group || op.Member != scope.Member || op.Generation != scope.Generation {
 			return fmt.Errorf(
@@ -731,16 +732,20 @@ func (ch *CommandHandler) commitTransactionOffsets(ops []transaction.OffsetOpera
 			)
 		}
 		items = append(items, coordinator.OffsetItem{Partition: op.Partition, Offset: op.Offset})
-		pairs = append(pairs, fmt.Sprintf("P%d:%d", op.Partition, op.Offset))
+		pairs = append(pairs, wire.OffsetPair{Partition: op.Partition, Offset: op.Offset})
 	}
 
 	if ch.Config != nil && ch.Config.EnabledDistribution {
 		if ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.Cluster.Router == nil {
 			return fmt.Errorf("distributed transaction offset commit requires cluster coordinator router")
 		}
+		encodedOffsets, err := wire.EncodeOffsetPairs(pairs)
+		if err != nil {
+			return err
+		}
 		cmd := fmt.Sprintf(
-			"BATCH_COMMIT topic=%s group=%s member=%s generation=%d %s",
-			scope.Topic, scope.Group, scope.Member, scope.Generation, strings.Join(pairs, ","),
+			"BATCH_COMMIT topic=%s group=%s member=%s generation=%d offsets=%s",
+			scope.Topic, scope.Group, scope.Member, scope.Generation, encodedOffsets,
 		)
 		resp, err := ch.Cluster.Router.ForwardToCoordinator(scope.Group, cmd)
 		if err != nil {
