@@ -6,7 +6,6 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
-	"github.com/cursus-io/cursus/util"
 )
 
 func TestNegotiatedTransportErrorsAreStructured(t *testing.T) {
@@ -20,12 +19,12 @@ func TestNegotiatedTransportErrorsAreStructured(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		shouldExit, err := processMessage(util.EncodeMessage("topic", "not-a-command"), handler, ctx, server)
+		shouldExit, err := processMessage([]byte("not-a-command"), handler, ctx, server)
 		if err != nil || !shouldExit {
 			t.Errorf("process result: shouldExit=%v err=%v", shouldExit, err)
 		}
 	}()
-	want := "ERROR: malformed_input class=validation retryable=false reason=missing_topic_or_payload"
+	want := "ERROR: malformed_input class=validation retryable=false reason=command_payload_required"
 	if got := readFramed(t, client); got != want {
 		t.Fatalf("transport error = %q, want %q", got, want)
 	}

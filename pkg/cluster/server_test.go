@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
-	"github.com/cursus-io/cursus/util"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -39,6 +39,25 @@ func (m *MockServiceDiscovery) HandleHeartbeat(nodeID string, proofs []fsm.ISRCa
 func (m *MockServiceDiscovery) StartReconciler(ctx context.Context) { m.Called(ctx) }
 func (m *MockServiceDiscovery) Reconcile()                          { m.Called() }
 
+func clusterRoundTrip(t *testing.T, address string, command wire.Command, fields map[string]string) wire.Frame {
+	t.Helper()
+	conn, err := net.Dial("tcp", address)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	connection, err := wire.ClientHandshake(conn, []wire.Compression{wire.CompressionNone})
+	require.NoError(t, err)
+	payload, err := wire.EncodeCommandPayload(wire.CommandPayload{Fields: fields})
+	require.NoError(t, err)
+	require.NoError(t, connection.WriteFrame(wire.Frame{
+		Kind: wire.KindRequest, Command: command, RequestID: 1, Payload: payload,
+	}))
+	response, err := connection.ReadFrame()
+	require.NoError(t, err)
+	require.Equal(t, command, response.Command)
+	require.Equal(t, uint64(1), response.RequestID)
+	return response
+}
+
 func TestClusterServer_Join(t *testing.T) {
 	msd := new(MockServiceDiscovery)
 	server := NewClusterServer(msd)
@@ -54,19 +73,12 @@ func TestClusterServer_Join(t *testing.T) {
 	t.Run("Join Success", func(t *testing.T) {
 		msd.On("AddNode", "node1", "127.0.0.1:9001").Return("leader-addr", nil).Once()
 
-		conn, err := net.Dial("tcp", addr)
-		assert.NoError(t, err)
-		defer func() { _ = conn.Close() }()
-
-		payload := `{"node_id":"node1","address":"127.0.0.1:9001"}`
-		msg := util.EncodeMessage("cluster", "JOIN_CLUSTER "+payload)
-		err = util.WriteWithLength(conn, msg)
-		assert.NoError(t, err)
-
-		respData, err := util.ReadWithLength(conn)
-		assert.NoError(t, err)
+		response := clusterRoundTrip(t, addr, wire.CommandJoinCluster, map[string]string{
+			"node_id": "node1", "address": "127.0.0.1:9001",
+		})
+		require.Equal(t, wire.StatusOK, response.Status)
 		var resp joinResponse
-		err = json.Unmarshal(respData, &resp)
+		err = json.Unmarshal(response.Payload, &resp)
 		assert.NoError(t, err)
 
 		assert.True(t, resp.Success)
@@ -77,22 +89,13 @@ func TestClusterServer_Join(t *testing.T) {
 	t.Run("Join Fail", func(t *testing.T) {
 		msd.On("AddNode", "node2", "127.0.0.1:9002").Return("", fmt.Errorf("error")).Once()
 
-		conn, err := net.Dial("tcp", addr)
-		assert.NoError(t, err)
-		defer func() { _ = conn.Close() }()
-
-		payload := `{"node_id":"node2","address":"127.0.0.1:9002"}`
-		msg := util.EncodeMessage("cluster", "JOIN_CLUSTER "+payload)
-		err = util.WriteWithLength(conn, msg)
-		assert.NoError(t, err)
-
-		respData, err := util.ReadWithLength(conn)
-		assert.NoError(t, err)
-		var resp joinResponse
-		err = json.Unmarshal(respData, &resp)
-		assert.NoError(t, err)
-
-		assert.False(t, resp.Success)
+		response := clusterRoundTrip(t, addr, wire.CommandJoinCluster, map[string]string{
+			"node_id": "node2", "address": "127.0.0.1:9002",
+		})
+		require.Equal(t, wire.StatusError, response.Status)
+		brokerError, err := wire.DecodeError(response.Payload)
+		require.NoError(t, err)
+		assert.Equal(t, "cluster_join_failed", brokerError.Code)
 		msd.AssertExpectations(t)
 	})
 }
@@ -111,18 +114,9 @@ func TestClusterServer_Heartbeat(t *testing.T) {
 
 	msd.On("HandleHeartbeat", "node-hb", []fsm.ISRCatchupProof(nil)).Return(nil).Once()
 
-	conn, err := net.Dial("tcp", addr)
-	assert.NoError(t, err)
-	defer func() { _ = conn.Close() }()
-
-	payload := `{"node_id":"node-hb"}`
-	msg := util.EncodeMessage("cluster", "HEARTBEAT_CLUSTER "+payload)
-	err = util.WriteWithLength(conn, msg)
-	assert.NoError(t, err)
-
-	respData, err := util.ReadWithLength(conn)
-	assert.NoError(t, err)
-	assert.Contains(t, string(respData), "true")
+	response := clusterRoundTrip(t, addr, wire.CommandHeartbeatCluster, map[string]string{"node_id": "node-hb"})
+	require.Equal(t, wire.StatusOK, response.Status)
+	assert.Contains(t, string(response.Payload), "true")
 	msd.AssertExpectations(t)
 }
 
@@ -138,16 +132,13 @@ func TestClusterServer_HeartbeatCarriesCatchupProofs(t *testing.T) {
 		CommittedHWM: 3, LocalLEO: 3, LocalHWM: 3, LeaderEpoch: 2, LifecycleEpoch: 1,
 	}}
 	msd.On("HandleHeartbeat", "node-hb", proofs).Return(nil).Once()
-	connection, err := net.Dial("tcp", listener.Addr().String())
+	payload, err := json.Marshal(proofs)
 	require.NoError(t, err)
-	defer func() { _ = connection.Close() }()
-	payload, err := json.Marshal(heartbeatRequest{NodeID: "node-hb", CatchupProofs: proofs})
-	require.NoError(t, err)
-	require.NoError(t, util.WriteWithLength(connection, util.EncodeMessage("cluster", "HEARTBEAT_CLUSTER "+string(payload))))
-
-	response, err := util.ReadWithLength(connection)
-	require.NoError(t, err)
-	require.Contains(t, string(response), `"success":true`)
+	response := clusterRoundTrip(t, listener.Addr().String(), wire.CommandHeartbeatCluster, map[string]string{
+		"node_id": "node-hb", "catchup_proofs": string(payload),
+	})
+	require.Equal(t, wire.StatusOK, response.Status)
+	require.Contains(t, string(response.Payload), `"success":true`)
 	msd.AssertExpectations(t)
 }
 
@@ -165,16 +156,8 @@ func TestClusterServer_List(t *testing.T) {
 
 	msd.On("DiscoverBrokers").Return([]fsm.BrokerInfo{{ID: "n1"}}, nil).Once()
 
-	conn, err := net.Dial("tcp", addr)
-	assert.NoError(t, err)
-	defer func() { _ = conn.Close() }()
-
-	msg := util.EncodeMessage("cluster", "LIST_CLUSTER")
-	err = util.WriteWithLength(conn, msg)
-	assert.NoError(t, err)
-
-	respData, err := util.ReadWithLength(conn)
-	assert.NoError(t, err)
-	assert.Contains(t, string(respData), "n1")
+	response := clusterRoundTrip(t, addr, wire.CommandListCluster, nil)
+	require.Equal(t, wire.StatusOK, response.Status)
+	assert.Contains(t, string(response.Payload), "n1")
 	msd.AssertExpectations(t)
 }

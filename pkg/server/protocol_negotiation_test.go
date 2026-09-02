@@ -6,7 +6,6 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
-	"github.com/cursus-io/cursus/util"
 )
 
 func TestProcessMessageNegotiatesAndDecoratesSubsequentErrors(t *testing.T) {
@@ -21,7 +20,7 @@ func TestProcessMessageNegotiatesAndDecoratesSubsequentErrors(t *testing.T) {
 	go func() {
 		defer close(done)
 		shouldExit, err := processMessage(
-			util.EncodeMessage("", "NEGOTIATE version=1 features=structured_errors_v1"),
+			[]byte("NEGOTIATE version=1 features=structured_errors_v1"),
 			handler,
 			ctx,
 			server,
@@ -38,7 +37,7 @@ func TestProcessMessageNegotiatesAndDecoratesSubsequentErrors(t *testing.T) {
 	done = make(chan struct{})
 	go func() {
 		defer close(done)
-		shouldExit, err := processMessage(util.EncodeMessage("", "HELP extra"), handler, ctx, server)
+		shouldExit, err := processMessage([]byte("HELP extra"), handler, ctx, server)
 		if err != nil || shouldExit {
 			t.Errorf("error process result: shouldExit=%v err=%v", shouldExit, err)
 		}

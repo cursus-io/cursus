@@ -57,6 +57,9 @@ const (
 	CommandProtocolInfo
 	CommandNegotiate
 	CommandExit
+	CommandJoinCluster
+	CommandLeaveCluster
+	CommandHeartbeatCluster
 )
 
 var commandNames = [...]string{
@@ -109,6 +112,9 @@ var commandNames = [...]string{
 	CommandProtocolInfo:      "PROTOCOL_INFO",
 	CommandNegotiate:         "NEGOTIATE",
 	CommandExit:              "EXIT",
+	CommandJoinCluster:       "JOIN_CLUSTER",
+	CommandLeaveCluster:      "LEAVE_CLUSTER",
+	CommandHeartbeatCluster:  "HEARTBEAT_CLUSTER",
 }
 
 var commandsByName = func() map[string]Command {

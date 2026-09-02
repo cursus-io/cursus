@@ -705,36 +705,8 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 		return handleCommandMessage(rawInput, cmdHandler, ctx, conn)
 	}
 
-	_, payload, err := util.DecodeMessage(data)
-	if err != nil {
-		util.Error("⚠️ Decode error and not a raw command: %v (len=%d)", err, len(data))
-		writeResponse(conn, decorateServerResponse(fmt.Sprintf("ERROR: decode_failed reason=%q", err.Error()), ctx))
-		return false, nil
-	}
-
-	payload = strings.Trim(payload, "\x00 \t\n\r")
-
-	if strings.HasPrefix(strings.ToUpper(payload), "JOIN_GROUP") ||
-		strings.HasPrefix(strings.ToUpper(payload), "SYNC_GROUP") ||
-		strings.HasPrefix(strings.ToUpper(payload), "LEAVE_GROUP") {
-		resp := cmdHandler.HandleCommand(payload, ctx)
-		writeResponse(conn, resp)
-		return false, nil
-	}
-
-	if strings.HasPrefix(strings.ToUpper(payload), "INTERNAL_BATCH ") {
-		return handleInternalBatchMessage(payload, cmdHandler, ctx, conn)
-	}
-	if isCommand(payload) {
-		if resp := authorizeInternalListenerCommand(payload, cmdHandler, ctx); resp != "" {
-			writeResponse(conn, resp)
-			return false, nil
-		}
-		return handleCommandMessage(payload, cmdHandler, ctx, conn)
-	}
-
 	util.Debug("[%s] Received unrecognized input (len=%d)", conn.RemoteAddr().String(), len(rawInput))
-	writeResponse(conn, decorateServerResponse("ERROR: malformed_input reason=missing_topic_or_payload", ctx))
+	writeResponse(conn, decorateServerResponse("ERROR: malformed_input reason=command_payload_required", ctx))
 	return true, nil
 }
 

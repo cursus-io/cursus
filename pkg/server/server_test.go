@@ -89,9 +89,7 @@ func newWireTestClient(t *testing.T, conn net.Conn) *wire.Connection {
 
 func wireRequest(t *testing.T, client *wire.Connection, command wire.Command, payload []byte) string {
 	t.Helper()
-	_, commandText, err := util.DecodeMessage(payload)
-	require.NoError(t, err)
-	parsedCommand, request, err := wire.ParseCommandText(commandText)
+	parsedCommand, request, err := wire.ParseCommandText(string(payload))
 	require.NoError(t, err)
 	require.Equal(t, command, parsedCommand)
 	payload, err = wire.EncodeCommandPayload(request)
@@ -416,17 +414,17 @@ func TestReadMessage_InvalidCompression(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestProcessMessage_HeartbeatEncoded(t *testing.T) {
+func TestProcessMessage_HeartbeatCommand(t *testing.T) {
 	client, server := newTestConnPair(t)
 
 	cfg := config.DefaultConfig()
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("ignored", "HEARTBEAT")
+	command := []byte("HEARTBEAT")
 	done := make(chan bool)
 	go func() {
-		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
+		shouldExit, err := processMessage(command, cmdHandler, cmdCtx, server)
 		assert.NoError(t, err)
 		assert.False(t, shouldExit)
 		done <- true
@@ -444,10 +442,10 @@ func TestProcessMessage_UnrecognizedInput(t *testing.T) {
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("topic1", "some random data")
+	input := []byte("some random data")
 	done := make(chan bool)
 	go func() {
-		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
+		shouldExit, err := processMessage(input, cmdHandler, cmdCtx, server)
 		assert.NoError(t, err)
 		assert.True(t, shouldExit)
 		done <- true
@@ -487,24 +485,24 @@ func TestParseRawTextCommandPreservesLongCommand(t *testing.T) {
 }
 
 func TestParseRawTextCommandRejectsLegacyEnvelope(t *testing.T) {
-	encoded := util.EncodeMessage("", "HELP")
+	encoded := append([]byte{0, 0}, []byte("HELP")...)
 	_, ok := parseRawTextCommand(encoded)
 	assert.False(t, ok)
 }
 
-func TestProcessMessage_EncodedCommand(t *testing.T) {
+func TestProcessMessage_LegacyEnvelopeRejected(t *testing.T) {
 	client, server := newTestConnPair(t)
 
 	cfg := config.DefaultConfig()
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("topic1", "HELP")
+	encoded := append([]byte{0, 0}, []byte("HELP")...)
 	done := make(chan bool)
 	go func() {
 		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
 		assert.NoError(t, err)
-		assert.False(t, shouldExit)
+		assert.True(t, shouldExit)
 		done <- true
 	}()
 
@@ -520,7 +518,7 @@ func TestProcessMessage_JoinGroup(t *testing.T) {
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("topic", "JOIN_GROUP group=test-group")
+	encoded := []byte("JOIN_GROUP group=test-group")
 	done := make(chan bool)
 	go func() {
 		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
@@ -541,7 +539,7 @@ func TestProcessMessage_SyncGroup(t *testing.T) {
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("topic", "SYNC_GROUP group=test-group")
+	encoded := []byte("SYNC_GROUP group=test-group")
 	done := make(chan bool)
 	go func() {
 		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
@@ -562,7 +560,7 @@ func TestProcessMessage_LeaveGroup(t *testing.T) {
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("topic", "LEAVE_GROUP group=test-group")
+	encoded := []byte("LEAVE_GROUP group=test-group")
 	done := make(chan bool)
 	go func() {
 		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
@@ -759,7 +757,7 @@ func TestHandleConn_HelpCommand(t *testing.T) {
 	require.NoError(t, err)
 	client := newWireTestClient(t, conn)
 
-	encoded := util.EncodeMessage("t", "HELP")
+	encoded := []byte("HELP")
 	msg := wireRequest(t, client, wire.CommandHelp, encoded)
 	assert.NotEmpty(t, msg)
 
@@ -862,7 +860,7 @@ func TestProcessMessage_HeartbeatWithPadding(t *testing.T) {
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
 	cmdCtx := controller.NewClientContext("default-group", 0)
 
-	encoded := util.EncodeMessage("ignored", "  HEARTBEAT  ")
+	encoded := []byte("  HEARTBEAT  ")
 	done := make(chan bool)
 	go func() {
 		shouldExit, err := processMessage(encoded, cmdHandler, cmdCtx, server)
@@ -898,7 +896,7 @@ func TestHandleConn_StreamCommandSetsIsStreamed(t *testing.T) {
 	require.NoError(t, err)
 	client := newWireTestClient(t, conn)
 
-	encoded := util.EncodeMessage("t", "STREAM topic=test partition=0 group=g1")
+	encoded := []byte("STREAM topic=test partition=0 group=g1")
 	msg := wireRequest(t, client, wire.CommandStream, encoded)
 	assert.Contains(t, msg, "ERROR")
 	_ = conn.Close()
@@ -931,7 +929,7 @@ func TestHandleConnection_StreamCommandSetsIsStreamed(t *testing.T) {
 	require.NoError(t, err)
 	client := newWireTestClient(t, conn)
 
-	encoded := util.EncodeMessage("t", "STREAM topic=test partition=0 group=g1")
+	encoded := []byte("STREAM topic=test partition=0 group=g1")
 	msg := wireRequest(t, client, wire.CommandStream, encoded)
 	assert.Contains(t, msg, "ERROR")
 	_ = conn.Close()
@@ -1006,7 +1004,7 @@ func TestWriteResponseWithTimeout_LongMessage(t *testing.T) {
 	<-done
 }
 
-func TestProcessMessage_BatchMessage(t *testing.T) {
+func TestProcessMessage_RejectsLegacyBatchMagic(t *testing.T) {
 	client, server := newTestConnPair(t)
 
 	cfg := config.DefaultConfig()
@@ -1019,7 +1017,7 @@ func TestProcessMessage_BatchMessage(t *testing.T) {
 	go func() {
 		shouldExit, err := processMessage(batchData, cmdHandler, cmdCtx, server)
 		assert.NoError(t, err)
-		assert.False(t, shouldExit)
+		assert.True(t, shouldExit)
 		done <- true
 	}()
 
