@@ -217,7 +217,7 @@ func (c *TCPClusterClient) sendRequest(
 	if err != nil {
 		return nil, err
 	}
-	requestFields := make(map[string]string, len(fields)+1)
+	requestFields := make(map[string]string, len(fields))
 	for key, value := range fields {
 		requestFields[key] = value
 	}

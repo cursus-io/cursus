@@ -13,7 +13,7 @@ func TestSecureClusterClientHasBoundedTimeoutAndAuthPrefix(t *testing.T) {
 		t.Fatalf("cluster client timeout = %s", client.timeout)
 	}
 	fields := map[string]string{}
-	requestFields := make(map[string]string, len(fields)+1)
+	requestFields := make(map[string]string, len(fields))
 	requestFields["auth_token"] = client.authToken
 	payload, err := wire.EncodeCommandPayload(wire.CommandPayload{Fields: requestFields})
 	if err != nil {
