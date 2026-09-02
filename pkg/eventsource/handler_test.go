@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/stream"
@@ -116,7 +115,7 @@ func (fp *fakeHandlerProvider) GetHandler(topicName string, partitionID int) (ty
 
 type fakeStreamManager struct{}
 
-func (f *fakeStreamManager) AddStream(_ string, _ *stream.StreamConnection, _ func(uint64, int) ([]types.Message, error), _ time.Duration) error {
+func (f *fakeStreamManager) AddStream(_ string, _ *stream.StreamConnection, _ func(uint64, int) ([]types.Message, error)) error {
 	return nil
 }
 func (f *fakeStreamManager) RemoveStream(_ string) {}

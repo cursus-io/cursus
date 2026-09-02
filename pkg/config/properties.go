@@ -101,11 +101,8 @@ type Config struct {
 	ClientIdleTimeoutMS  int `yaml:"client_idle_timeout_ms" json:"client.idle.timeout.ms"`
 
 	// stream
-	MaxStreamConnections    int           `yaml:"max_stream_connections" json:"max.stream.connections"`
-	StreamTimeout           time.Duration `yaml:"stream_timeout" json:"stream.timeout"`
-	StreamHeartbeatInterval time.Duration `yaml:"stream_heartbeat_interval" json:"stream.heartbeat.interval"`
-	// Deprecated: stream delivery never commits consumer offsets; clients commit after processing.
-	StreamCommitInterval time.Duration `yaml:"stream_commit_interval" json:"stream.commit.interval"`
+	MaxStreamConnections int           `yaml:"max_stream_connections" json:"max.stream.connections"`
+	StreamTimeout        time.Duration `yaml:"stream_timeout" json:"stream.timeout"`
 
 	// security
 	UseTLS                        bool `yaml:"use_tls" json:"tls.enable"`
@@ -192,10 +189,8 @@ func DefaultConfig() *Config {
 			ClientIdleTimeoutMS:  60000,
 
 			// stream
-			MaxStreamConnections:    1000,
-			StreamTimeout:           30 * time.Minute,
-			StreamHeartbeatInterval: 3 * time.Second,
-			StreamCommitInterval:    5 * time.Second,
+			MaxStreamConnections: 1000,
+			StreamTimeout:        30 * time.Minute,
 		}
 	})
 
@@ -290,8 +285,6 @@ func LoadConfig() (*Config, error) {
 	// stream
 	flag.IntVar(&cfg.MaxStreamConnections, "max-stream-connections", cfg.MaxStreamConnections, "Max stream connections")
 	flag.DurationVar(&cfg.StreamTimeout, "stream-timeout", cfg.StreamTimeout, "Stream timeout")
-	flag.DurationVar(&cfg.StreamHeartbeatInterval, "stream-heartbeat-interval", cfg.StreamHeartbeatInterval, "Stream heartbeat")
-	flag.DurationVar(&cfg.StreamCommitInterval, "stream-commit-interval", cfg.StreamCommitInterval, "Deprecated and ignored; clients commit stream offsets after processing")
 
 	// security
 	flag.BoolVar(&cfg.UseTLS, "tls", cfg.UseTLS, "Enable TLS")

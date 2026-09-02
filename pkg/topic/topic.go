@@ -477,14 +477,3 @@ func (t *Topic) applyAssignments(groupName string, assignments map[string][]int)
 
 	util.Debug("Applied assignments for group '%s': %v", groupName, assignments)
 }
-
-func (t *Topic) NewMessageSignal(partition int) <-chan struct{} {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	if partition < 0 || partition >= len(t.Partitions) {
-		util.Warn("NewMessageSignal called with invalid partition %d for topic '%s'", partition, t.Name)
-		return nil
-	}
-	return t.Partitions[partition].newMessageCh
-}

@@ -167,12 +167,6 @@ func (cfg *Config) Normalize() {
 	if cfg.StreamTimeout <= 0 {
 		cfg.StreamTimeout = 30 * time.Minute
 	}
-	if cfg.StreamHeartbeatInterval <= 0 {
-		cfg.StreamHeartbeatInterval = 3 * time.Second
-	}
-	if cfg.StreamCommitInterval <= 0 {
-		cfg.StreamCommitInterval = 5 * time.Second
-	}
 }
 
 func overrideEnvInt(target *int, key string) {

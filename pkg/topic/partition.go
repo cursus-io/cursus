@@ -50,7 +50,9 @@ type TransactionDecisionResolver interface {
 type Partition struct {
 	id                int
 	topic             string
-	newMessageCh      chan struct{}
+	messageNotifyMu   sync.Mutex
+	messageGeneration uint64
+	messageNotifyCh   chan struct{}
 	LEO               atomic.Uint64
 	HWM               uint64
 	mu                sync.RWMutex
@@ -92,7 +94,7 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		topic:            topic,
 		dh:               dh,
 		streamManager:    sm,
-		newMessageCh:     make(chan struct{}, 1),
+		messageNotifyCh:  make(chan struct{}),
 		closeCh:          make(chan struct{}),
 		txnMarkers:       make(map[transactionMarkerKey]transactionMarkerInfo),
 		txnOpenOffsets:   make(map[transactionMarkerKey]uint64),
@@ -118,13 +120,7 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		} else {
 			p.HWM = durableTail
 		}
-		notifyCh := p.newMessageCh
-		handler.SetOnSync(func(uint64) {
-			select {
-			case notifyCh <- struct{}{}:
-			default:
-			}
-		})
+		handler.SetOnSync(func(uint64) { p.NotifyNewMessage() })
 	}
 
 	if p.hwmCheckpointCh != nil {
@@ -599,10 +595,20 @@ func sameReplicatedMessage(a, b types.Message) bool {
 		bytes.Equal(a.ControlBatchKey, b.ControlBatchKey) && bytes.Equal(a.ControlBatchValue, b.ControlBatchValue)
 }
 func (p *Partition) NotifyNewMessage() {
-	select {
-	case p.newMessageCh <- struct{}{}:
-	default:
-	}
+	p.messageNotifyMu.Lock()
+	previous := p.messageNotifyCh
+	p.messageGeneration++
+	p.messageNotifyCh = make(chan struct{})
+	close(previous)
+	p.messageNotifyMu.Unlock()
+}
+
+// MessageNotification returns a monotonic generation and a channel closed by
+// the next append/commit event. Every waiter on the same generation wakes.
+func (p *Partition) MessageNotification() (uint64, <-chan struct{}) {
+	p.messageNotifyMu.Lock()
+	defer p.messageNotifyMu.Unlock()
+	return p.messageGeneration, p.messageNotifyCh
 }
 
 func (p *Partition) ReadMessages(offset uint64, max int) ([]types.Message, error) {

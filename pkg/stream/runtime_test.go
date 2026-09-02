@@ -6,7 +6,7 @@ import (
 )
 
 func TestActiveCountUsesCurrentRegistry(t *testing.T) {
-	manager := NewStreamManager(10, time.Minute, time.Minute)
+	manager := NewStreamManager(10, time.Minute)
 	if got := manager.ActiveCount(); got != 0 {
 		t.Fatalf("empty ActiveCount = %d", got)
 	}

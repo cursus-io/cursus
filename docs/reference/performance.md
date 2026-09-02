@@ -44,6 +44,8 @@ Raw storage reads use the sparse index followed by mmap scanning. Closed segment
 
 Large poll batches reduce command overhead but increase handler latency and retry work. Stream batches reduce reconnect overhead but still require heartbeats, generation fencing, and offset commit discipline.
 
+Partition signals are monotonic broadcast generations, so one append wakes every stream waiting on that partition instead of being consumed by only one waiter. One manager-owned scheduler drives periodic catch-up polls, keepalives, and timeout checks for all active streams; streams do not allocate independent polling or monitor tickers.
+
 ## Partitioning
 
 Partition count is the main unit of producer, consumer, and disk parallelism. Too few partitions cap concurrency; too many create files, goroutines, coordinator assignments, metrics, and replication work. Keyed records preserve ordering only inside the selected partition. Increasing partition count can remap future records for the same key.

@@ -28,7 +28,7 @@ type DeleteResult struct {
 }
 
 type StreamManager interface {
-	AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error), legacyCommitInterval time.Duration) error
+	AddStream(key string, streamConn *stream.StreamConnection, readFn func(offset uint64, max int) ([]types.Message, error)) error
 	RemoveStream(key string)
 	GetStreamsForPartition(topic string, partition int) []*stream.StreamConnection
 	StopStream(key string)

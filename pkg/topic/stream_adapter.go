@@ -2,7 +2,6 @@ package topic
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -23,9 +22,8 @@ func (a *StreamManagerAdapter) AddStream(
 	key string,
 	streamConn *stream.StreamConnection,
 	readFn func(offset uint64, max int) ([]types.Message, error),
-	legacyCommitInterval time.Duration,
 ) error {
-	return a.sm.AddStream(key, streamConn, readFn, legacyCommitInterval)
+	return a.sm.AddStream(key, streamConn, readFn)
 }
 
 func (a *StreamManagerAdapter) RemoveStream(key string) {

@@ -56,7 +56,7 @@ func main() {
 func runBroker(ctx context.Context, cfg *config.Config) error {
 	dm := disk.NewDiskManager(cfg)
 	defer dm.CloseAllHandlers()
-	sm := stream.NewStreamManager(cfg.MaxStreamConnections, cfg.StreamTimeout, cfg.StreamHeartbeatInterval)
+	sm := stream.NewStreamManager(cfg.MaxStreamConnections, cfg.StreamTimeout)
 	smAdapter, err := topic.NewStreamManagerAdapter(sm)
 	if err != nil {
 		return fmt.Errorf("create stream manager adapter: %w", err)
