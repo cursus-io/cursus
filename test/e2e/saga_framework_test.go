@@ -2,41 +2,66 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	sdk "github.com/cursus-io/cursus/sdk"
 	"github.com/stretchr/testify/require"
 )
 
-type e2eInbox struct{ seen map[string]bool }
+type e2eSagaRepository struct {
+	seen     map[string]bool
+	state    *sdk.SagaState
+	commands []sdk.Command
+}
 
-func (i *e2eInbox) Claim(_ context.Context, consumer, eventID string) (bool, error) {
+func (r *e2eSagaRepository) Transact(_ context.Context, apply func(sdk.SagaTransaction) error) error {
+	next := &e2eSagaRepository{seen: make(map[string]bool, len(r.seen)), state: cloneE2ESagaState(r.state), commands: append([]sdk.Command(nil), r.commands...)}
+	for key, value := range r.seen {
+		next.seen[key] = value
+	}
+	if err := apply(next); err != nil {
+		return err
+	}
+	*r = *next
+	return nil
+}
+
+func (r *e2eSagaRepository) Claim(consumer, eventID string) (bool, error) {
 	key := consumer + ":" + eventID
-	if i.seen[key] {
+	if r.seen[key] {
 		return false, nil
 	}
-	i.seen[key] = true
+	r.seen[key] = true
 	return true, nil
 }
-func (*e2eInbox) Complete(context.Context, string, string) error    { return nil }
-func (*e2eInbox) Fail(context.Context, string, string, error) error { return nil }
-
-type e2eSagaStore struct{ state *sdk.SagaState }
-
-func (s *e2eSagaStore) Load(context.Context, string, string) (*sdk.SagaState, error) {
-	return s.state, nil
+func (*e2eSagaRepository) Complete(string, string) error    { return nil }
+func (*e2eSagaRepository) Fail(string, string, error) error { return nil }
+func (r *e2eSagaRepository) Load(string, string) (*sdk.SagaState, error) {
+	return cloneE2ESagaState(r.state), nil
 }
-func (s *e2eSagaStore) Save(_ context.Context, state *sdk.SagaState) error {
+func (r *e2eSagaRepository) SaveCAS(state *sdk.SagaState, expectedVersion uint64) error {
+	if r.state != nil && r.state.Version != expectedVersion {
+		return fmt.Errorf("saga version conflict")
+	}
+	r.state = cloneE2ESagaState(state)
+	return nil
+}
+func (r *e2eSagaRepository) Enqueue(command sdk.Command) error {
+	r.commands = append(r.commands, command)
+	return nil
+}
+
+func cloneE2ESagaState(state *sdk.SagaState) *sdk.SagaState {
+	if state == nil {
+		return nil
+	}
 	copy := *state
-	s.state = &copy
-	return nil
-}
-
-type e2eOutbox struct{ commands []sdk.Command }
-
-func (o *e2eOutbox) Enqueue(_ context.Context, command sdk.Command) error {
-	o.commands = append(o.commands, command)
-	return nil
+	copy.Effects = make(map[string]sdk.EffectState, len(state.Effects))
+	for key, effect := range state.Effects {
+		copy.Effects[key] = effect
+	}
+	return &copy
 }
 
 func TestSagaFrameworkProcessesCursusEventThroughDockerBroker(t *testing.T) {
@@ -56,17 +81,17 @@ func TestSagaFrameworkProcessesCursusEventThroughDockerBroker(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, events, 1)
 
-	outbox := &e2eOutbox{}
+	repository := &e2eSagaRepository{seen: map[string]bool{}}
 	manager, err := sdk.NewSagaManager(sdk.SagaDefinition{Type: "finish-game", Handlers: map[string]sdk.SagaHandler{
 		"GameFinished": func(_ context.Context, state *sdk.SagaState, _ sdk.EventEnvelope) ([]sdk.Command, error) {
 			state.Status = sdk.SagaWaiting
 			state.Step = "update-elo"
 			return []sdk.Command{{Type: "UpdatePlayerElo", Payload: `{"player":"p1"}`}}, nil
 		},
-	}}, &e2eInbox{seen: map[string]bool{}}, &e2eSagaStore{}, outbox)
+	}}, repository)
 	require.NoError(t, err)
 	require.NoError(t, manager.Handle(context.Background(), events[0]))
-	require.Len(t, outbox.commands, 1)
-	require.Equal(t, "UpdatePlayerElo", outbox.commands[0].Type)
-	require.Equal(t, "saga-e2e-1", outbox.commands[0].SagaID)
+	require.Len(t, repository.commands, 1)
+	require.Equal(t, "UpdatePlayerElo", repository.commands[0].Type)
+	require.Equal(t, "saga-e2e-1", repository.commands[0].SagaID)
 }

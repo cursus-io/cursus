@@ -2,13 +2,20 @@
 
 The Cursus Saga Manager is a client-side coordinator. It uses Cursus events and consumer offsets, but it does not add a database to the broker.
 
-## Service-owned stores
+## Service-owned repository
 
-Implement these SDK interfaces with the service's existing database:
+Implement `sdk.SagaRepository` with the service's existing database. Its
+`Transact` callback is the only durability boundary and receives an
+`sdk.SagaTransaction` that must atomically:
 
-- `sdk.InboxStore` claims `(consumer, event_id)` exactly once
-- `sdk.SagaStore` persists saga state and retry information
-- `sdk.OutboxStore` stores commands in the same local transaction as state changes
+- claim `(consumer, event_id)` exactly once
+- compare-and-swap `SagaState.Version`
+- enqueue commands with a unique command ID
+- complete or fail the inbox item
+
+If the callback returns an error, none of those writes may commit. Use a
+serializable database transaction and unique constraints for inbox and outbox
+identities.
 
 The broker remains responsible for event storage and delivery. The service database remains responsible for local business consistency.
 
@@ -30,20 +37,28 @@ manager, err := sdk.NewSagaManager(sdk.SagaDefinition{
             return nil, nil
         },
     },
-}, inboxStore, sagaStore, outboxStore)
+}, sagaRepository)
 ```
 
-The manager claims the event in the inbox, loads the saga state, invokes the matching handler, saves the state, and enqueues returned commands. A duplicate `event_id` is ignored.
+The manager claims the event, loads the saga state, invokes the matching
+handler, saves the state with CAS, enqueues returned commands, and completes
+the inbox item in one transaction. A duplicate `event_id` is ignored.
 
 ## Transaction boundary
 
-For a database-backed implementation, save saga state, claim/complete inbox, and enqueue outbox commands in one local database transaction. A publisher worker then sends pending outbox commands to Cursus and marks them published.
+`SagaRepository.Transact` must commit state, inbox, and outbox together. A
+publisher worker then sends pending outbox commands to Cursus. After the
+command is durably acknowledged, call `AcknowledgeEffect` with the saga,
+effect, and command identities.
 
 Do not commit the Cursus consumer offset before the local transaction succeeds. Cursus broker transactions cannot atomically include an external service database.
 
 ## Failure and compensation
 
-Handler errors increment `RetryCount` and are recorded through `InboxStore.Fail`. A retry worker can redeliver the event. After a policy limit, set the saga to `FAILED` or `COMPENSATING` and emit a compensating command such as `RollbackPlayerElo`.
+Handler errors increment `RetryCount`; the failed state and inbox failure
+record commit together. A retry worker can redeliver the event. After a policy
+limit, set the saga to `FAILED` or `COMPENSATING` and emit a compensating
+command such as `RollbackPlayerElo`.
 
 Run the example with:
 
@@ -59,11 +74,20 @@ Each logical command-producing step should use a stable effect identity. Store e
 The effect lifecycle is:
 
 ~~~text
-PENDING -> SUCCEEDED
+ENQUEUED -> SUCCEEDED
         \-> FAILED -> retry or compensation
 ~~~
 
-When a redelivery produces an effect already marked SUCCEEDED, the Saga Manager skips the outbox enqueue. The outbox adapter must also deduplicate by effect ID because a process may crash after publishing and before persisting SUCCEEDED.
+`ENQUEUED` means the command and saga state committed atomically; it does not
+claim that the external effect succeeded. When a redelivery produces an effect
+already marked ENQUEUED or SUCCEEDED, the Saga Manager skips the outbox insert.
+The stable command ID is derived from saga type, saga ID, and effect ID.
+
+~~~go
+err := manager.AcknowledgeEffect(ctx, associationKey, effectID, commandID)
+~~~
+
+The command ID fences stale acknowledgements from older attempts.
 
 Set EventEnvelope.AssociationKey when the Saga instance is not identified by the aggregate:
 
@@ -89,4 +113,6 @@ return manager.CompleteCompensation(ctx, associationKey)
 
 StartCompensation, CompleteCompensation, and FailCompensation persist the compensation step, status, attempt count, and last error. A restarted worker can load SagaState and resume the recorded step.
 
-The in-memory example is instructional only. Production adapters must make inbox claim, saga state, effect state, and outbox enqueue part of one local transaction.
+The in-memory example is instructional only. Production repositories must
+provide a real rollback-capable transaction, CAS on `SagaState.Version`, and
+unique inbox and outbox constraints.

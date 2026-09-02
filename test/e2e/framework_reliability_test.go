@@ -74,7 +74,7 @@ func TestSagaFrameworkRedeliveryDoesNotDuplicateCommandThroughDockerBroker(t *te
 	require.NoError(t, err)
 	require.Len(t, events, 1)
 
-	outbox := &e2eOutbox{}
+	repository := &e2eSagaRepository{seen: map[string]bool{}}
 	manager, err := sdk.NewSagaManager(sdk.SagaDefinition{
 		Type: "finish-game",
 		Handlers: map[string]sdk.SagaHandler{
@@ -83,10 +83,10 @@ func TestSagaFrameworkRedeliveryDoesNotDuplicateCommandThroughDockerBroker(t *te
 				return []sdk.Command{{Type: "UpdatePlayerElo"}}, nil
 			},
 		},
-	}, &e2eInbox{seen: map[string]bool{}}, &e2eSagaStore{}, outbox)
+	}, repository)
 	require.NoError(t, err)
 
 	require.NoError(t, manager.Handle(context.Background(), events[0]))
 	require.NoError(t, manager.Handle(context.Background(), events[0]))
-	require.Len(t, outbox.commands, 1)
+	require.Len(t, repository.commands, 1)
 }

@@ -44,7 +44,7 @@ func (p RetryPolicy) Delay(attempt int) time.Duration {
 
 // CompensationCommand creates a command for a failed saga step.
 func CompensationCommand(commandType string, state SagaState, causationID, payload string) Command {
-	return NewCommand(commandType, state.ID, state.CorrelationID, causationID, payload)
+	return Command{Type: commandType, SagaID: state.ID, CorrelationID: state.CorrelationID, CausationID: causationID, Payload: payload}
 }
 
 // EventUpcaster transforms an immutable event into the next schema version.
