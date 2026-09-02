@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"strings"
@@ -19,20 +18,18 @@ var brokerCompressions = []wire.Compression{
 	wire.CompressionLZ4,
 }
 
-// serverWireConn adapts the remaining controller net.Conn writers to Wire v2
-// frames while those packages are split into typed response encoders.
+// serverWireConn exposes connection lifecycle operations to handlers and sends
+// every handler payload as a correlated Wire v2 response or stream frame.
 type serverWireConn struct {
 	net.Conn
 	connection *wire.Connection
 
-	mu       sync.Mutex
-	buffer   []byte
-	expected int
-	request  wire.Frame
+	mu      sync.Mutex
+	request wire.Frame
 }
 
 func newServerWireConn(conn net.Conn, connection *wire.Connection) *serverWireConn {
-	return &serverWireConn{Conn: conn, connection: connection, expected: -1}
+	return &serverWireConn{Conn: conn, connection: connection}
 }
 
 func (c *serverWireConn) setRequest(request wire.Frame) {
@@ -41,36 +38,13 @@ func (c *serverWireConn) setRequest(request wire.Frame) {
 	c.mu.Unlock()
 }
 
-func (c *serverWireConn) Write(payload []byte) (int, error) {
+func (c *serverWireConn) WritePayload(payload []byte) error {
 	if c == nil || c.connection == nil {
-		return 0, fmt.Errorf("server Wire v2 connection is not initialized")
+		return fmt.Errorf("server Wire v2 connection is not initialized")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.buffer = append(c.buffer, payload...)
-	for {
-		if c.expected < 0 {
-			if len(c.buffer) < 4 {
-				break
-			}
-			length := binary.BigEndian.Uint32(c.buffer[:4])
-			if length > wire.MaxFramePayload {
-				return 0, fmt.Errorf("response payload size %d exceeds maximum %d", length, wire.MaxFramePayload)
-			}
-			c.expected = int(length)
-			c.buffer = c.buffer[4:]
-		}
-		if len(c.buffer) < c.expected {
-			break
-		}
-		message := append([]byte(nil), c.buffer[:c.expected]...)
-		c.buffer = c.buffer[c.expected:]
-		c.expected = -1
-		if err := c.writeMessage(message); err != nil {
-			return 0, err
-		}
-	}
-	return len(payload), nil
+	return c.writeMessage(payload)
 }
 
 func (c *serverWireConn) writeMessage(payload []byte) error {

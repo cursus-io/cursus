@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"path/filepath"
 	"strings"
@@ -647,36 +645,6 @@ func initializeConnection(cfg *config.Config, tm *topic.TopicManager, cd *coordi
 	return cmdHandler, ctx
 }
 
-func readMessage(conn net.Conn, compressionType string) ([]byte, error) {
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(conn, lenBuf); err != nil {
-		if err != io.EOF {
-			util.Error("⚠️ Read length error: %v", err)
-		}
-		return nil, err
-	}
-
-	msgLen := binary.BigEndian.Uint32(lenBuf)
-	if msgLen > uint32(util.MaxMessageSize) {
-		return nil, fmt.Errorf("message size %d exceeds maximum %d", msgLen, util.MaxMessageSize)
-	}
-	msgBuf := make([]byte, msgLen)
-	if _, err := io.ReadFull(conn, msgBuf); err != nil {
-		if err != io.EOF {
-			util.Error("⚠️ Read message error: %v (len=%d)", err, len(msgBuf))
-		}
-		return nil, err
-	}
-
-	data, err := util.DecompressMessage(msgBuf, compressionType)
-	if err != nil {
-		util.Error("⚠️ Decompress error: %v", err)
-		return nil, err
-	}
-
-	return data, nil
-}
-
 func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *controller.ClientContext, conn net.Conn) (bool, error) {
 	if isBatchMessage(data) {
 		if ctx != nil && ctx.Internal && cmdHandler.Config != nil && cmdHandler.Config.InternalAuthToken != "" && !cmdHandler.Config.InternalUseTLS {
@@ -865,10 +833,6 @@ func isCommand(s string) bool {
 
 // writeResponseWithTimeout adds write timeout
 func writeResponseWithTimeout(conn net.Conn, msg string, timeout time.Duration) {
-	resp := []byte(msg)
-	respLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(respLen, uint32(len(resp)))
-
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		util.Error("⚠️ SetWriteDeadline error: %v", err)
 		return
@@ -879,27 +843,13 @@ func writeResponseWithTimeout(conn net.Conn, msg string, timeout time.Duration) 
 		}
 	}()
 
-	if _, err := conn.Write(respLen); err != nil {
-		util.Error("⚠️ Write length error: %v", err)
-		return
-	}
-	if _, err := conn.Write(resp); err != nil {
+	if err := util.WriteWithLength(conn, []byte(msg)); err != nil {
 		util.Error("⚠️ Write response error: %v", err)
-		return
 	}
 }
 
 func writeResponse(conn net.Conn, msg string) {
-	resp := []byte(msg)
-	respLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(respLen, uint32(len(resp)))
-
-	if _, err := conn.Write(respLen); err != nil {
-		util.Error("⚠️ Write length error: %v", err)
-		return
-	}
-	if _, err := conn.Write(resp); err != nil {
+	if err := util.WriteWithLength(conn, []byte(msg)); err != nil {
 		util.Error("⚠️ Write response error: %v", err)
-		return
 	}
 }
