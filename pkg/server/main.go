@@ -169,8 +169,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 							"status": "active", "lifecycle_protocol": fsm.TopicLifecycleProtocolVersion,
 						})
 						raftCmd := fmt.Sprintf("RAFT_APPLY %stype=REGISTER payload=%s", internalAuthPrefix(cfg), string(brokerJSON))
-						encodedCmd := util.EncodeMessage("", raftCmd)
-						if resp, err := cc.Router.ForwardToLeader(string(encodedCmd)); err == nil && !strings.HasPrefix(resp, "ERROR") {
+						if resp, err := cc.Router.ForwardToLeader(raftCmd); err == nil && !strings.HasPrefix(resp, "ERROR") {
 							util.Info("✅ Registered via leader with client address %s", clientAddr)
 							return
 						}

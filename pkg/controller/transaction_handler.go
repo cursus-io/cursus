@@ -435,8 +435,7 @@ func (ch *CommandHandler) validateTransactionOffset(op transaction.OffsetOperati
 		if !checkRegression {
 			cmd += " ownership_only=true"
 		}
-		encodedCmd := util.EncodeMessage("", cmd)
-		resp, err := ch.Cluster.Router.ForwardToCoordinator(op.Group, string(encodedCmd))
+		resp, err := ch.Cluster.Router.ForwardToCoordinator(op.Group, cmd)
 		if err != nil {
 			return err
 		}
@@ -744,8 +743,7 @@ func (ch *CommandHandler) commitTransactionOffsets(ops []transaction.OffsetOpera
 			"BATCH_COMMIT topic=%s group=%s member=%s generation=%d %s",
 			scope.Topic, scope.Group, scope.Member, scope.Generation, strings.Join(pairs, ","),
 		)
-		encodedCmd := util.EncodeMessage("", cmd)
-		resp, err := ch.Cluster.Router.ForwardToCoordinator(scope.Group, string(encodedCmd))
+		resp, err := ch.Cluster.Router.ForwardToCoordinator(scope.Group, cmd)
 		if err != nil {
 			return err
 		}

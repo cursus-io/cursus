@@ -52,14 +52,7 @@ func (ch *CommandHandler) hasRouter() bool {
 
 func (ch *CommandHandler) ProcessCommand(cmd string) string {
 	ctx := NewInternalClientContext("default-group", 0)
-
-	// Forwarded commands arrive wrapped in a binary envelope
-	// (2-byte topic length + topic + payload). Decode it first.
-	if _, payload, err := util.DecodeMessage([]byte(cmd)); err == nil {
-		cmd = strings.TrimSpace(payload)
-	}
-
-	return ch.HandleCommand(cmd, ctx)
+	return ch.HandleCommand(strings.TrimSpace(cmd), ctx)
 }
 
 func (ch *CommandHandler) isAuthorizedForPartition(topic string, partition int) bool {
@@ -113,10 +106,9 @@ func (ch *CommandHandler) isLeaderAndForwardContext(ctx context.Context, cmd str
 			return "ERROR: router_not_available", true, nil
 		}
 
-		encodedCmd := util.EncodeMessage("", cmd)
 		var lastErr error
 		for i := 0; i < maxRetries; i++ {
-			resp, err := ch.Cluster.Router.ForwardToLeader(string(encodedCmd))
+			resp, err := ch.Cluster.Router.ForwardToLeader(cmd)
 			if err == nil {
 				return resp, true, nil
 			}
@@ -265,8 +257,7 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 		}
 	}
 
-	encodedCmd := util.EncodeMessage("", findCmd)
-	resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, string(encodedCmd))
+	resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, findCmd)
 	if fwdErr == nil && strings.HasPrefix(resp, "OK") {
 		host, port := "", 0
 		for _, part := range strings.Fields(resp) {
@@ -316,14 +307,11 @@ func (ch *CommandHandler) isPartitionLeaderAndForwardContext(ctx context.Context
 
 	const maxRetries = 3
 
-	encodedCmd := util.EncodeMessage("", cmd)
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
-		resp, err := ch.Cluster.Router.ForwardToPartitionLeader(topic, partition, string(encodedCmd))
+		resp, err := ch.Cluster.Router.ForwardToPartitionLeader(topic, partition, cmd)
 		if err == nil {
-			const legacyNotLeaderPrefix = "ERROR:" + " not the partition leader"
-			isLeaderRedirect := strings.HasPrefix(resp, "ERROR: NOT_LEADER") ||
-				strings.HasPrefix(resp, legacyNotLeaderPrefix)
+			isLeaderRedirect := strings.HasPrefix(resp, "ERROR: NOT_LEADER")
 			if !isLeaderRedirect {
 				return resp, true, nil
 			}
@@ -446,13 +434,12 @@ func (ch *CommandHandler) applyViaLeaderContext(ctx context.Context, cmdType str
 	}
 
 	forwardCmd := fmt.Sprintf("RAFT_APPLY %stype=%s payload=%s", ch.internalAuthPrefix(), cmdType, string(data))
-	encodedCmd := util.EncodeMessage("", forwardCmd)
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
-	resp, fwdErr := ch.Cluster.Router.ForwardToLeader(string(encodedCmd))
+	resp, fwdErr := ch.Cluster.Router.ForwardToLeader(forwardCmd)
 	if fwdErr != nil {
 		return nil, fmt.Errorf("forward raft apply to leader: %w", fwdErr)
 	}

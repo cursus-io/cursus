@@ -1376,8 +1376,7 @@ func (ch *CommandHandler) handleFindCoordinator(cmd string) string {
 			}
 		}
 
-		encodedCmd := util.EncodeMessage("", cmd)
-		resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, string(encodedCmd))
+		resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, cmd)
 		if fwdErr != nil {
 			return fmt.Sprintf("ERROR: forward_to_coordinator_failed reason=%q", fwdErr.Error())
 		}

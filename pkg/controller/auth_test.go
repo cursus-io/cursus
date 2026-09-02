@@ -2,8 +2,7 @@ package controller
 
 import (
 	"context"
-	"encoding/binary"
-	"io"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -15,6 +14,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -221,19 +221,28 @@ func TestListFiltersForwardedTopicsByReadACL(t *testing.T) {
 			return
 		}
 		defer func() { _ = conn.Close() }()
-		length := make([]byte, 4)
-		if _, readErr := io.ReadFull(conn, length); readErr != nil {
+		wireConn, handshakeErr := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
+		if handshakeErr != nil {
+			serverErr <- handshakeErr
+			return
+		}
+		request, readErr := wireConn.ReadFrame()
+		if readErr != nil {
 			serverErr <- readErr
 			return
 		}
-		request := make([]byte, binary.BigEndian.Uint32(length))
-		if _, readErr := io.ReadFull(conn, request); readErr != nil {
-			serverErr <- readErr
+		if request.Kind != wire.KindRequest || request.Command != wire.CommandList {
+			serverErr <- fmt.Errorf("unexpected forwarded frame kind=%d command=%s", request.Kind, request.Command)
 			return
 		}
-		response := []byte("OK count=4 topics=alice-topic,bob-topic,denied-topic,open-topic")
-		binary.BigEndian.PutUint32(length, uint32(len(response)))
-		if _, writeErr := conn.Write(append(length, response...)); writeErr != nil {
+		response := wire.Frame{
+			Kind:      wire.KindResponse,
+			Command:   request.Command,
+			Status:    wire.StatusOK,
+			RequestID: request.RequestID,
+			Payload:   []byte("OK count=4 topics=alice-topic,bob-topic,denied-topic,open-topic"),
+		}
+		if writeErr := wireConn.WriteFrame(response); writeErr != nil {
 			serverErr <- writeErr
 			return
 		}
