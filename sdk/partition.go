@@ -193,7 +193,7 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	consumeCmd := fmt.Sprintf("CONSUME topic=%s partition=%d offset=%d group=%s generation=%d member=%s%s%s batch=%d",
 		c.config.Topic, pc.partitionID, currentOffset, c.config.GroupID, generation, memberID, autoOffsetResetArgument(c.config.AutoOffsetReset), readIsolationArgument(c.config.ReadIsolation), effectivePollBatchSize(c.config))
 
-	if err := WriteWithLength(conn, EncodeMessage("", consumeCmd)); err != nil {
+	if err := WriteWithLength(conn, []byte(consumeCmd)); err != nil {
 		LogError("Partition [%d] send CONSUME failed: %v", pc.partitionID, err)
 		pc.closeConnection()
 		return
@@ -315,7 +315,7 @@ func (pc *PartitionConsumer) startStreamLoop() {
 		streamCmd := fmt.Sprintf("STREAM topic=%s partition=%d group=%s offset=%d generation=%d member=%s%s%s batch=%d",
 			c.config.Topic, pid, c.config.GroupID, currentOffset, generation, memberID, autoOffsetResetArgument(c.config.AutoOffsetReset), readIsolationArgument(c.config.ReadIsolation), effectiveStreamBatchSize(c.config))
 
-		if err := WriteWithLength(conn, EncodeMessage("", streamCmd)); err != nil {
+		if err := WriteWithLength(conn, []byte(streamCmd)); err != nil {
 			LogError("Partition [%d] STREAM send failed: %v", pid, err)
 			pc.closeConnection()
 			if !pc.waitWithBackoff(bo) {

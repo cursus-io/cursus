@@ -465,7 +465,7 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64, assignmentGeneration 
 		c.lifecycleMu.Unlock()
 		return false
 	}
-	err := WriteWithLength(conn, EncodeMessage("", sb.String()))
+	err := WriteWithLength(conn, []byte(sb.String()))
 	c.lifecycleMu.Unlock()
 	if err != nil {
 		LogError("Batch commit send failed: %v", err)
@@ -548,7 +548,7 @@ func (c *Consumer) directCommit(partition int, offset uint64, assignmentGenerati
 		c.lifecycleMu.Unlock()
 		return ErrConsumerRebalancing
 	}
-	err = WriteWithLength(conn, EncodeMessage("", commitCmd))
+	err = WriteWithLength(conn, []byte(commitCmd))
 	c.lifecycleMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("direct commit send: %w", err)
@@ -603,7 +603,7 @@ func (c *Consumer) fetchMetadata() error {
 
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	cmd := fmt.Sprintf("METADATA topic=%s", c.config.Topic)
-	if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
+	if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 		return fmt.Errorf("send metadata: %w", err)
 	}
 
@@ -721,7 +721,7 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 	if resuming {
 		joinCmd += fmt.Sprintf(" generation=%d", generation)
 	}
-	if err := WriteWithLength(conn, EncodeMessage("", joinCmd)); err != nil {
+	if err := WriteWithLength(conn, []byte(joinCmd)); err != nil {
 		return 0, "", nil, fmt.Errorf("send join: %w", err)
 	}
 
@@ -782,7 +782,7 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 
 	syncCmd := fmt.Sprintf("SYNC_GROUP topic=%s group=%s member=%s generation=%d",
 		c.config.Topic, c.config.GroupID, memberID, generation)
-	if err := WriteWithLength(conn, EncodeMessage("", syncCmd)); err != nil {
+	if err := WriteWithLength(conn, []byte(syncCmd)); err != nil {
 		return nil, fmt.Errorf("send sync: %w", err)
 	}
 
@@ -860,7 +860,7 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	fetchCmd := fmt.Sprintf("FETCH_OFFSET topic=%s partition=%d group=%s",
 		c.config.Topic, partition, c.config.GroupID)
-	if err := WriteWithLength(conn, EncodeMessage("", fetchCmd)); err != nil {
+	if err := WriteWithLength(conn, []byte(fetchCmd)); err != nil {
 		return 0, fmt.Errorf("fetch offset send: %w", err)
 	}
 
@@ -943,7 +943,7 @@ func (c *Consumer) Close() error {
 		if conn, err := c.getCoordinatorConn(); err == nil {
 			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
 				c.config.Topic, c.config.GroupID, memberID, generation)
-			_ = WriteWithLength(conn, EncodeMessage("", leaveCmd))
+			_ = WriteWithLength(conn, []byte(leaveCmd))
 			_ = conn.Close()
 		}
 	}
@@ -1009,7 +1009,7 @@ func (c *Consumer) findCoordinator() (string, error) {
 
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	cmd := fmt.Sprintf("FIND_COORDINATOR group=%s", c.config.GroupID)
-	if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
+	if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 		return "", fmt.Errorf("send find_coordinator: %w", err)
 	}
 

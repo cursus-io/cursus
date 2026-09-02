@@ -194,7 +194,7 @@ func executeProtocolCommand(conn net.Conn, command string) (string, error) {
 	if conn == nil {
 		return "", fmt.Errorf("protocol command connection is nil")
 	}
-	if err := WriteWithLength(conn, EncodeMessage("", command)); err != nil {
+	if err := WriteWithLength(conn, []byte(command)); err != nil {
 		return "", fmt.Errorf("send protocol command: %w", err)
 	}
 	resp, err := ReadWithLength(conn)

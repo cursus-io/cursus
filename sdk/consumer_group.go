@@ -39,7 +39,7 @@ func (c *Consumer) heartbeatLoop(ctx context.Context, assignmentGeneration uint6
 			c.mu.RUnlock()
 			hb := fmt.Sprintf("HEARTBEAT topic=%s group=%s member=%s generation=%d",
 				c.config.Topic, c.config.GroupID, memberID, generation)
-			if err := WriteWithLength(conn, EncodeMessage("", hb)); err != nil {
+			if err := WriteWithLength(conn, []byte(hb)); err != nil {
 				LogError("Heartbeat send failed: %v", err)
 				c.cleanupHbConn(conn)
 				continue

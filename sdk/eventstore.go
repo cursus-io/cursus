@@ -135,7 +135,7 @@ func (es *EventStore) sendCommand(cmd string) (string, error) {
 		return "", err
 	}
 
-	data := EncodeMessage("", cmd)
+	data := []byte(cmd)
 	if err := WriteWithLength(conn, data); err != nil {
 		es.resetConn()
 		return "", fmt.Errorf("write: %w", err)
@@ -268,7 +268,7 @@ func (es *EventStore) ReadStreamFrom(key string, fromVersion uint64) (*StreamDat
 		return nil, err
 	}
 
-	data := EncodeMessage("", cmd)
+	data := []byte(cmd)
 	if err := WriteWithLength(conn, data); err != nil {
 		es.resetConn()
 		return nil, fmt.Errorf("write: %w", err)

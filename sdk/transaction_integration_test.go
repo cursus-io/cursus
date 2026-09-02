@@ -130,7 +130,7 @@ func integrationOKCommand(client *ConsumerClient, command string) (string, error
 			return "", connErr
 		}
 		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-		if err := WriteWithLength(conn, EncodeMessage("", command)); err != nil {
+		if err := WriteWithLength(conn, []byte(command)); err != nil {
 			_ = conn.Close()
 			return "", err
 		}
@@ -180,7 +180,7 @@ func integrationConsumePartition(t *testing.T, client *ConsumerClient, addrs []s
 			continue
 		}
 		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-		if err := WriteWithLength(conn, EncodeMessage("", command)); err != nil {
+		if err := WriteWithLength(conn, []byte(command)); err != nil {
 			_ = conn.Close()
 			lastErr = err
 			continue

@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -192,11 +191,7 @@ func TestEventStoreCreateTopicDeclaresDeleteCleanupPolicy(t *testing.T) {
 			done <- err
 			return
 		}
-		_, command, err := util.DecodeMessage(data)
-		if err != nil {
-			done <- err
-			return
-		}
+		command := string(data)
 		want := "CREATE topic=orders partitions=4 event_sourcing=true cleanup_policy=delete"
 		if command != want {
 			done <- fmt.Errorf("command = %q, want %q", command, want)

@@ -18,7 +18,7 @@ func TestAuthenticateConfiguredClientSendsExactCommand(t *testing.T) {
 			done <- err
 			return
 		}
-		if got := string(request[2:]); got != "AUTH principal=game-server token=secret-token" {
+		if got := string(request); got != "AUTH principal=game-server token=secret-token" {
 			done <- errors.New("unexpected auth command: " + got)
 			return
 		}

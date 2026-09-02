@@ -1,7 +1,6 @@
 package transport
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"sort"
@@ -117,8 +116,7 @@ func requestFramePayload(payload []byte) (wire.Command, []byte, error) {
 	if wire.IsBatch(payload) {
 		return wire.CommandPublish, payload, nil
 	}
-	commandText := legacyCommandText(payload)
-	command, request, err := wire.ParseCommandText(string(commandText))
+	command, request, err := wire.ParseCommandText(string(payload))
 	if err != nil {
 		return wire.CommandUnknown, nil, err
 	}
@@ -129,22 +127,12 @@ func requestFramePayload(payload []byte) (wire.Command, []byte, error) {
 	return command, encoded, nil
 }
 
-func legacyCommandText(payload []byte) []byte {
-	if len(payload) >= 2 {
-		topicLength := int(binary.BigEndian.Uint16(payload[:2]))
-		if topicLength <= len(payload)-2 {
-			return payload[2+topicLength:]
-		}
-	}
-	return payload
-}
-
 func responseSuppressed(payload []byte) bool {
 	if wire.IsBatch(payload) {
 		batch, err := wire.DecodeBatch(payload)
 		return err == nil && (batch.Acks == "0" || batch.Acks == "none")
 	}
-	command, request, err := wire.ParseCommandText(string(legacyCommandText(payload)))
+	command, request, err := wire.ParseCommandText(string(payload))
 	if err != nil || command != wire.CommandPublish {
 		return false
 	}

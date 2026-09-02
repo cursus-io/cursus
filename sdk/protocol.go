@@ -1,9 +1,7 @@
 package sdk
 
 import (
-	"encoding/binary"
 	"fmt"
-	"math"
 	"net"
 
 	"github.com/cursus-io/cursus/pkg/wire"
@@ -11,19 +9,6 @@ import (
 )
 
 const MaxMessageSize = wire.MaxFramePayload
-
-// EncodeMessage is a transitional helper for SDK paths not yet moved to the
-// shared Wire v2 transport. It is removed with the transport migration.
-func EncodeMessage(topic string, payload string) []byte {
-	if len(topic) > math.MaxUint16 || len(topic) > MaxMessageSize-2 || len(payload) > MaxMessageSize-2-len(topic) {
-		return nil
-	}
-	encoded := make([]byte, 2+len(topic)+len(payload))
-	binary.BigEndian.PutUint16(encoded[:2], uint16(len(topic)))
-	copy(encoded[2:], topic)
-	copy(encoded[2+len(topic):], payload)
-	return encoded
-}
 
 func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent bool, messages []Message) ([]byte, error) {
 	return wire.EncodeBatch(wire.Batch{

@@ -19,7 +19,7 @@ func TestExecuteTransactionCommandPreservesStructuredBrokerError(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		if got := string(request[2:]); got != "END_TXN transactional_id=tx-1 producerId=p-1 epoch=2 result=commit" {
+		if got := string(request); got != "END_TXN transactional_id=tx-1 producerId=p-1 epoch=2 result=commit" {
 			serverDone <- errors.New("unexpected transaction command: " + got)
 			return
 		}

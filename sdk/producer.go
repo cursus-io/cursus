@@ -188,7 +188,7 @@ func (p *Producer) fetchMetadata() {
 			continue
 		}
 		cmd := fmt.Sprintf("METADATA topic=%s", p.config.Topic)
-		if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
+		if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 			_ = conn.Close()
 			continue
 		}
@@ -278,7 +278,7 @@ func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) er
 	if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {
 		return fmt.Errorf("authentication: %w", err)
 	}
-	cmdBytes := EncodeMessage("admin", createCmd)
+	cmdBytes := []byte(createCmd)
 
 	if err := WriteWithLength(conn, cmdBytes); err != nil {
 		return fmt.Errorf("send command: %w", err)

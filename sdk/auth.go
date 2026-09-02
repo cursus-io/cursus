@@ -31,7 +31,7 @@ func authenticateConfiguredClient(conn net.Conn, principal, token string) error 
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 
 	cmd := fmt.Sprintf("AUTH principal=%s token=%s", principal, token)
-	if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
+	if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 		return fmt.Errorf("send authentication command: %w", err)
 	}
 	resp, err := ReadWithLength(conn)

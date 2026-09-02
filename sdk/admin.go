@@ -340,7 +340,7 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 	if err := conn.SetDeadline(deadline); err != nil {
 		return "", fmt.Errorf("restore admin request deadline: %w", err)
 	}
-	if err := WriteWithLength(conn, EncodeMessage("admin", command)); err != nil {
+	if err := WriteWithLength(conn, []byte(command)); err != nil {
 		return "", &ambiguousAdminError{err: fmt.Errorf("send admin command to %s: %w", addr, err)}
 	}
 	response, err := ReadWithLength(conn)

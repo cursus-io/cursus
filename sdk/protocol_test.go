@@ -12,40 +12,6 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// EncodeMessage
-// ---------------------------------------------------------------------------
-
-func TestEncodeMessage_Basic(t *testing.T) {
-	data := EncodeMessage("my-topic", "hello world")
-	// First 2 bytes = topic length (big-endian uint16)
-	topicLen := binary.BigEndian.Uint16(data[:2])
-	assert.Equal(t, uint16(8), topicLen)
-	assert.Equal(t, "my-topic", string(data[2:2+topicLen]))
-	assert.Equal(t, "hello world", string(data[2+topicLen:]))
-}
-
-func TestEncodeMessage_EmptyTopic(t *testing.T) {
-	data := EncodeMessage("", "payload")
-	topicLen := binary.BigEndian.Uint16(data[:2])
-	assert.Equal(t, uint16(0), topicLen)
-	assert.Equal(t, "payload", string(data[2:]))
-}
-
-func TestEncodeMessage_EmptyPayload(t *testing.T) {
-	data := EncodeMessage("t", "")
-	topicLen := binary.BigEndian.Uint16(data[:2])
-	assert.Equal(t, uint16(1), topicLen)
-	assert.Equal(t, "t", string(data[2:3]))
-	assert.Equal(t, 3, len(data))
-}
-
-func TestEncodeMessage_BothEmpty(t *testing.T) {
-	data := EncodeMessage("", "")
-	assert.Equal(t, 2, len(data))
-	assert.Equal(t, uint16(0), binary.BigEndian.Uint16(data[:2]))
-}
-
-// ---------------------------------------------------------------------------
 // EncodeBatchMessages + DecodeBatchMessages round-trip
 // ---------------------------------------------------------------------------
 

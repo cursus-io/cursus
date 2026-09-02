@@ -355,7 +355,7 @@ func executeTransactionCommand(conn net.Conn, cmd string) (string, error) {
 	if err := conn.SetDeadline(time.Now().Add(transactionCommandTimeout)); err != nil {
 		return "", fmt.Errorf("set transaction command deadline: %w", err)
 	}
-	if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
+	if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 		return "", fmt.Errorf("send transaction command: %w", err)
 	}
 	resp, err := ReadWithLength(conn)

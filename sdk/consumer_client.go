@@ -173,7 +173,7 @@ func (c *ConsumerClient) ListOffsets(topic string, partition ...int) ([]Partitio
 	if len(partition) == 1 {
 		cmd = fmt.Sprintf("%s partition=%d", cmd, partition[0])
 	}
-	if err := WriteWithLength(conn, EncodeMessage("", cmd)); err != nil {
+	if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 		return nil, fmt.Errorf("send list offsets: %w", err)
 	}
 

@@ -5,8 +5,6 @@ import (
 	"net"
 	"reflect"
 	"testing"
-
-	"github.com/cursus-io/cursus/util"
 )
 
 func TestFetchProtocolInfo(t *testing.T) {
@@ -21,11 +19,7 @@ func TestFetchProtocolInfo(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		_, command, err := util.DecodeMessage(data)
-		if err != nil {
-			serverDone <- err
-			return
-		}
+		command := string(data)
 		if command != "PROTOCOL_INFO" {
 			serverDone <- errors.New("unexpected command: " + command)
 			return
@@ -60,11 +54,7 @@ func TestNegotiateProtocolSortsFeaturesAndParsesResult(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		_, command, err := util.DecodeMessage(data)
-		if err != nil {
-			serverDone <- err
-			return
-		}
+		command := string(data)
 		want := "NEGOTIATE version=1 features=offset_resume_v1,structured_errors_v1 require_features=false"
 		if command != want {
 			serverDone <- errors.New("unexpected command: " + command)
