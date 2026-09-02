@@ -139,6 +139,12 @@ func NewAdminClient(config *AdminConfig) (*AdminClient, error) {
 	if len(config.BrokerAddrs) == 0 {
 		return nil, fmt.Errorf("no broker addresses available")
 	}
+	if err := validateWireClientSettings(config.ProtocolVersion, config.ProtocolFeatures, config.RequireProtocolFeatures, config.CompressionType, config.Principal, config.AuthToken); err != nil {
+		return nil, err
+	}
+	if err := validateTLSFiles(config.UseTLS, config.TLSCertPath, config.TLSKeyPath); err != nil {
+		return nil, err
+	}
 	if config.MaxRetries < 0 {
 		return nil, fmt.Errorf("max retries must be non-negative")
 	}

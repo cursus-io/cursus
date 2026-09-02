@@ -37,23 +37,16 @@ func TestConsumerClientNegotiatesConfiguredProtocol(t *testing.T) {
 }
 
 func TestProducerClientRejectsLegacyProtocolFeatures(t *testing.T) {
-	addr, _, closeServer := startProtocolTestServer(t)
-	defer closeServer()
-
 	cfg := NewDefaultPublisherConfig()
 	cfg.ProtocolVersion = 2
 	cfg.ProtocolFeatures = []string{"required_v1"}
 	cfg.RequireProtocolFeatures = true
 	client, err := NewProducerClient(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = client.ConnectPartition(0, addr)
 	if err == nil || !strings.Contains(err.Error(), "legacy protocol features") {
 		t.Fatalf("expected legacy feature rejection, got %v", err)
 	}
-	if client.GetConn(0) != nil {
-		t.Fatal("failed negotiation stored a partition connection")
+	if client != nil {
+		t.Fatal("invalid protocol config created a producer client")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/ackpolicy"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 )
@@ -76,6 +77,17 @@ func (c *PublisherConfig) Validate() error {
 	c.Acks = selection.Requested
 	if c.EnableIdempotence && !selection.SupportsIdempotence() {
 		return fmt.Errorf("enable_idempotence requires acks=all or acks=-1")
+	}
+	if err := validateWireClientSettings(c.ProtocolVersion, c.ProtocolFeatures, c.RequireProtocolFeatures, c.CompressionType, c.Principal, c.AuthToken); err != nil {
+		return err
+	}
+	if c.MaxRetries < 0 || c.RetryBackoffMS < 0 || c.AckTimeoutMS < 0 || c.PublishDelayMS < 0 ||
+		c.MaxInflightRequests < 0 || c.MaxBackoffMS < 0 || c.WriteTimeoutMS < 0 || c.LingerMS < 0 ||
+		c.FlushTimeoutMS < 0 || c.LeaderStaleness < 0 {
+		return fmt.Errorf("publisher durations and limits must not be negative")
+	}
+	if err := validateTLSFiles(c.UseTLS, c.TLSCertPath, c.TLSKeyPath); err != nil {
+		return err
 	}
 	return nil
 }
@@ -186,6 +198,69 @@ type ConsumerConfig struct {
 	LogLevel LogLevel `yaml:"log_level" json:"log_level"`
 }
 
+func (c *ConsumerConfig) Validate() error {
+	if c == nil {
+		return fmt.Errorf("consumer config is required")
+	}
+	if err := validateWireClientSettings(c.ProtocolVersion, c.ProtocolFeatures, c.RequireProtocolFeatures, c.CompressionType, c.Principal, c.AuthToken); err != nil {
+		return err
+	}
+	if err := validateTLSFiles(c.UseTLS, c.TLSCertPath, c.TLSKeyPath); err != nil {
+		return err
+	}
+	if c.Mode != "" && c.Mode != ModePolling && c.Mode != ModeStreaming {
+		return fmt.Errorf("unsupported consumer mode %q", c.Mode)
+	}
+	if c.AutoOffsetReset != "" && c.AutoOffsetReset != AutoOffsetResetEarliest &&
+		c.AutoOffsetReset != AutoOffsetResetLatest && c.AutoOffsetReset != AutoOffsetResetError {
+		return fmt.Errorf("unsupported auto offset reset policy %q", c.AutoOffsetReset)
+	}
+	if c.ReadIsolation != "" && c.ReadIsolation != ReadCommitted && c.ReadIsolation != ReadUncommitted {
+		return fmt.Errorf("unsupported read isolation %q", c.ReadIsolation)
+	}
+	if c.PollInterval < 0 || c.AutoCommitInterval < 0 || c.CommitRetryBackoff < 0 ||
+		c.CommitRetryMaxBackoff < 0 || c.StreamingCommitInterval < 0 || c.LeaderStaleness < 0 ||
+		c.MetadataRefreshInterval < 0 || c.PollTimeoutMS < 0 || c.SessionTimeoutMS < 0 ||
+		c.ConnectRetryBackoffMS < 0 || c.HeartbeatIntervalMS < 0 || c.StreamingReadDeadlineMS < 0 ||
+		c.StreamingRetryIntervalMS < 0 {
+		return fmt.Errorf("consumer durations must not be negative")
+	}
+	if c.BatchSize < 0 || c.MaxPollRecords < 0 || c.MaxConnectRetries < 0 || c.MaxCommitRetries < 0 ||
+		c.WorkerChannelSize < 0 || c.StreamingCommitBatchSize < 0 {
+		return fmt.Errorf("consumer limits must not be negative")
+	}
+	return nil
+}
+
+func validateWireClientSettings(version int, features []string, requireFeatures bool, compression, principal, token string) error {
+	if version != 0 && version != int(wire.ProtocolVersion) {
+		return fmt.Errorf("unsupported protocol version %d; Wire v2 is required", version)
+	}
+	if len(features) > 0 || requireFeatures {
+		return fmt.Errorf("legacy protocol features are not supported by Wire v2")
+	}
+	if _, err := wire.ParseCompression(compression); err != nil {
+		return err
+	}
+	if (principal == "") != (token == "") {
+		return fmt.Errorf("principal and auth token must be configured together")
+	}
+	if strings.ContainsAny(principal, " \t\r\n") || strings.ContainsAny(token, " \t\r\n") {
+		return fmt.Errorf("principal and auth token must not contain whitespace")
+	}
+	return nil
+}
+
+func validateTLSFiles(enabled bool, certificate, key string) error {
+	if !enabled {
+		return nil
+	}
+	if strings.TrimSpace(certificate) == "" || strings.TrimSpace(key) == "" {
+		return fmt.Errorf("TLS certificate and key paths are required when TLS is enabled")
+	}
+	return nil
+}
+
 func NewDefaultConsumerConfig() *ConsumerConfig {
 	return &ConsumerConfig{
 		BrokerAddrs:              []string{"localhost:9000"},
@@ -238,6 +313,9 @@ func LoadConfig(path string, cfg interface{}) error {
 	}
 	if publisher, ok := cfg.(*PublisherConfig); ok {
 		return publisher.Validate()
+	}
+	if consumer, ok := cfg.(*ConsumerConfig); ok {
+		return consumer.Validate()
 	}
 	return nil
 }

@@ -28,6 +28,9 @@ type ConsumerClient struct {
 }
 
 func NewConsumerClient(cfg *ConsumerConfig) (*ConsumerClient, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	c := &ConsumerClient{
 		ID:     uuid.New().String(),
 		config: cfg,

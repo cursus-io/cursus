@@ -74,6 +74,9 @@ func NewConsumerWithContext(ctx context.Context, cfg *ConsumerConfig) (*Consumer
 	if ctx == nil {
 		return nil, fmt.Errorf("consumer context must not be nil")
 	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	if cfg.EnableMetrics {
 		initMetrics()
 	}

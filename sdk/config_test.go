@@ -390,3 +390,42 @@ func TestLoadConfig_UnknownType_UsesYAML(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "txt-topic", loaded.Topic)
 }
+
+func TestPublisherConfigRejectsInvalidWireSettingsBeforeConnect(t *testing.T) {
+	tests := map[string]func(*PublisherConfig){
+		"compression": func(config *PublisherConfig) { config.CompressionType = "zstd" },
+		"credentials": func(config *PublisherConfig) { config.Principal = "service" },
+		"protocol":    func(config *PublisherConfig) { config.ProtocolVersion = 1 },
+		"features":    func(config *PublisherConfig) { config.ProtocolFeatures = []string{"legacy"} },
+		"duration":    func(config *PublisherConfig) { config.WriteTimeoutMS = -1 },
+		"tls paths":   func(config *PublisherConfig) { config.UseTLS = true },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := NewDefaultPublisherConfig()
+			mutate(config)
+			require.Error(t, config.Validate())
+		})
+	}
+}
+
+func TestConsumerConfigRejectsInvalidRuntimeSettings(t *testing.T) {
+	tests := map[string]func(*ConsumerConfig){
+		"compression": func(config *ConsumerConfig) { config.CompressionType = "zstd" },
+		"credentials": func(config *ConsumerConfig) { config.AuthToken = "secret" },
+		"mode":        func(config *ConsumerConfig) { config.Mode = "push" },
+		"offset reset": func(config *ConsumerConfig) {
+			config.AutoOffsetReset = "middle"
+		},
+		"isolation": func(config *ConsumerConfig) { config.ReadIsolation = "dirty" },
+		"duration":  func(config *ConsumerConfig) { config.PollInterval = -time.Second },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := NewDefaultConsumerConfig()
+			mutate(config)
+			require.Error(t, config.Validate())
+		})
+	}
+	require.Error(t, (*ConsumerConfig)(nil).Validate())
+}
