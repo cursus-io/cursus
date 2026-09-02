@@ -93,6 +93,7 @@ func getComposeCommand() []string {
 func RunCompose(args ...string) *exec.Cmd {
 	base := getComposeCommand()
 	fullArgs := append(base[1:], args...)
+	// #nosec G204 -- executable is restricted to the two hard-coded Docker Compose commands above.
 	return exec.Command(base[0], fullArgs...)
 }
 

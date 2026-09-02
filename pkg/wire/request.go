@@ -114,6 +114,7 @@ func EncodeCommandPayload(payload CommandPayload) ([]byte, error) {
 	encoder := newBinaryEncoder(MaxFramePayload)
 	encoder.uint32(commandPayloadMagic)
 	encoder.uint16(commandPayloadVersion)
+	// #nosec G115 -- argument counts are bounded by maxCommandArguments above.
 	encoder.uint16(uint16(len(payload.Positionals)))
 	for _, positional := range payload.Positionals {
 		if positional == "" || strings.ContainsAny(positional, " \t\r\n") {
@@ -121,6 +122,7 @@ func EncodeCommandPayload(payload CommandPayload) ([]byte, error) {
 		}
 		encoder.string(positional)
 	}
+	// #nosec G115 -- field count is bounded by maxCommandArguments above.
 	encoder.uint16(uint16(len(keys)))
 	for _, key := range keys {
 		encoder.string(key)

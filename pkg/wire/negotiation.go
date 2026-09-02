@@ -12,6 +12,7 @@ func EncodeNegotiationRequest(request NegotiationRequest) ([]byte, error) {
 	encoder := newBinaryEncoder(64)
 	encoder.uint16(request.MinimumVersion)
 	encoder.uint16(request.MaximumVersion)
+	// #nosec G115 -- the preference count is limited to the known compression enum above.
 	encoder.uint16(uint16(len(request.Compressions)))
 	seen := make(map[Compression]struct{}, len(request.Compressions))
 	for _, compression := range request.Compressions {

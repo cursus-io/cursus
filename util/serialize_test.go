@@ -204,3 +204,18 @@ func TestDiskMessageTransactionMetadataRoundTrip(t *testing.T) {
 		t.Fatalf("transaction metadata mismatch: %+v", got)
 	}
 }
+
+func TestDiskMessageNegativeControlMetadataRoundTrip(t *testing.T) {
+	msg := types.DiskMessage{
+		Topic:                        "txn-topic",
+		ControlBatchVersion:          -1,
+		ControlBatchCoordinatorEpoch: -2,
+	}
+
+	data, err := SerializeDiskMessage(msg)
+	assert.NoError(t, err)
+	got, err := DeserializeDiskMessage(data)
+	assert.NoError(t, err)
+	assert.Equal(t, msg.ControlBatchVersion, got.ControlBatchVersion)
+	assert.Equal(t, msg.ControlBatchCoordinatorEpoch, got.ControlBatchCoordinatorEpoch)
+}

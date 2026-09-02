@@ -21,7 +21,7 @@ func ensureRaftRecoveryFormat(dataDir string) error {
 		if markerInfo.Mode()&os.ModeSymlink != 0 || !markerInfo.Mode().IsRegular() {
 			return fmt.Errorf("%w: Raft format marker is not a regular file", fsm.ErrUnsupportedRecoveryProtocol)
 		}
-		return validateRaftFormatMarker(markerPath)
+		return validateRaftFormatMarker(dataDir)
 	case !errors.Is(err, os.ErrNotExist):
 		return fmt.Errorf("inspect Raft format marker: %w", err)
 	}
@@ -37,10 +37,11 @@ func ensureRaftRecoveryFormat(dataDir string) error {
 		)
 	}
 
+	// #nosec G304 -- markerPath is a constant child of the configured Raft data directory.
 	marker, err := os.OpenFile(markerPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
-			return validateRaftFormatMarker(markerPath)
+			return validateRaftFormatMarker(dataDir)
 		}
 		return fmt.Errorf("create Raft format marker: %w", err)
 	}
@@ -56,8 +57,17 @@ func ensureRaftRecoveryFormat(dataDir string) error {
 	return writeErr
 }
 
-func validateRaftFormatMarker(path string) error {
-	data, err := os.ReadFile(path)
+func validateRaftFormatMarker(dataDir string) error {
+	markerPath := filepath.Join(dataDir, raftFormatMarkerName)
+	markerInfo, err := os.Lstat(markerPath)
+	if err != nil {
+		return fmt.Errorf("inspect Raft format marker: %w", err)
+	}
+	if markerInfo.Mode()&os.ModeSymlink != 0 || !markerInfo.Mode().IsRegular() {
+		return fmt.Errorf("%w: Raft format marker is not a regular file", fsm.ErrUnsupportedRecoveryProtocol)
+	}
+	// #nosec G304 -- markerPath is a constant child checked above to be a regular, non-symlink file.
+	data, err := os.ReadFile(markerPath)
 	if err != nil {
 		return fmt.Errorf("read Raft format marker: %w", err)
 	}

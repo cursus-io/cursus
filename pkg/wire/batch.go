@@ -51,6 +51,7 @@ func EncodeBatch(batch Batch) ([]byte, error) {
 	encoder.string(batch.Acks)
 	encoder.uint64(batch.BatchStart)
 	encoder.uint64(batch.BatchEnd)
+	// #nosec G115 -- the message count is checked against math.MaxUint32 above.
 	encoder.uint32(uint32(len(batch.Messages)))
 	for index, message := range batch.Messages {
 		message.Topic = batch.Topic

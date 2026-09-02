@@ -29,6 +29,22 @@ func TestRecordRoundTripPreservesEventTransactionAndControlFields(t *testing.T) 
 	require.True(t, reflect.DeepEqual(want, got), "record mismatch\nwant=%+v\n got=%+v", want, got)
 }
 
+func TestRecordRoundTripPreservesNegativeSignedFields(t *testing.T) {
+	want := wire.Message{
+		Topic:                        "orders",
+		Partition:                    -1,
+		Timestamp:                    -2,
+		Epoch:                        -3,
+		ControlBatchVersion:          -4,
+		ControlBatchCoordinatorEpoch: -5,
+	}
+	encoded, err := wire.EncodeRecord(want)
+	require.NoError(t, err)
+	got, err := wire.DecodeRecord(encoded)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+}
+
 func TestBatchRoundTripUsesWireV2AndRejectsLegacyMagic(t *testing.T) {
 	want := wire.Batch{
 		Topic: "orders", Partition: 3, Acks: "all", IsIdempotent: true,

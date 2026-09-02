@@ -454,11 +454,13 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	if offset+2 > len(data) {
 		return msg, fmt.Errorf("incomplete control batch version field: truncated value")
 	}
+	// #nosec G115 -- disk format stores the signed value's two's-complement bits.
 	msg.ControlBatchVersion = int16(binary.BigEndian.Uint16(data[offset : offset+2]))
 	offset += 2
 	if offset+8 > len(data) {
 		return msg, fmt.Errorf("incomplete control batch coordinator epoch field: truncated value")
 	}
+	// #nosec G115 -- disk format stores the signed value's two's-complement bits.
 	msg.ControlBatchCoordinatorEpoch = int64(binary.BigEndian.Uint64(data[offset : offset+8]))
 	offset += 8
 	if err := readDiskBytes(data, &offset, &msg.ControlBatchKey, "control batch key"); err != nil {

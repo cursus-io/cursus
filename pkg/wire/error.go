@@ -91,6 +91,7 @@ func EncodeError(payload ErrorPayload) ([]byte, error) {
 		retryable[0] = 1
 	}
 	encoder.string(payload.Message)
+	// #nosec G115 -- the field count is checked against the 256-field protocol limit above.
 	encoder.uint16(uint16(len(payload.Fields)))
 	keys := make([]string, 0, len(payload.Fields))
 	for key := range payload.Fields {

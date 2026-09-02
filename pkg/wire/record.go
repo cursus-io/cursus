@@ -262,27 +262,30 @@ func (e *binaryEncoder) uint16(value uint16) {
 		binary.BigEndian.PutUint16(field, value)
 	}
 }
-func (e *binaryEncoder) int16(value int16) { e.uint16(uint16(value)) }
+
+// Signed values use their two's-complement bit pattern on the wire.
+func (e *binaryEncoder) int16(value int16) { e.uint16(uint16(value)) } // #nosec G115 -- intentional bit-preserving conversion.
 func (e *binaryEncoder) uint32(value uint32) {
 	field := e.append(4)
 	if len(field) == 4 {
 		binary.BigEndian.PutUint32(field, value)
 	}
 }
-func (e *binaryEncoder) int32(value int32) { e.uint32(uint32(value)) }
+func (e *binaryEncoder) int32(value int32) { e.uint32(uint32(value)) } // #nosec G115 -- intentional bit-preserving conversion.
 func (e *binaryEncoder) uint64(value uint64) {
 	field := e.append(8)
 	if len(field) == 8 {
 		binary.BigEndian.PutUint64(field, value)
 	}
 }
-func (e *binaryEncoder) int64(value int64)   { e.uint64(uint64(value)) }
+func (e *binaryEncoder) int64(value int64)   { e.uint64(uint64(value)) } // #nosec G115 -- intentional bit-preserving conversion.
 func (e *binaryEncoder) string(value string) { e.bytes([]byte(value)) }
 func (e *binaryEncoder) bytes(value []byte) {
 	if len(value) > math.MaxUint32 {
 		e.err = fmt.Errorf("field length %d exceeds uint32", len(value))
 		return
 	}
+	// #nosec G115 -- the field length is checked against math.MaxUint32 above.
 	e.uint32(uint32(len(value)))
 	copy(e.append(len(value)), value)
 }
@@ -325,7 +328,7 @@ func (d *binaryDecoder) uint16() uint16 {
 	}
 	return binary.BigEndian.Uint16(field)
 }
-func (d *binaryDecoder) int16() int16 { return int16(d.uint16()) }
+func (d *binaryDecoder) int16() int16 { return int16(d.uint16()) } // #nosec G115 -- decode the preserved two's-complement bits.
 func (d *binaryDecoder) uint32() uint32 {
 	field := d.take(4)
 	if len(field) != 4 {
@@ -333,7 +336,7 @@ func (d *binaryDecoder) uint32() uint32 {
 	}
 	return binary.BigEndian.Uint32(field)
 }
-func (d *binaryDecoder) int32() int32 { return int32(d.uint32()) }
+func (d *binaryDecoder) int32() int32 { return int32(d.uint32()) } // #nosec G115 -- decode the preserved two's-complement bits.
 func (d *binaryDecoder) uint64() uint64 {
 	field := d.take(8)
 	if len(field) != 8 {
@@ -341,13 +344,14 @@ func (d *binaryDecoder) uint64() uint64 {
 	}
 	return binary.BigEndian.Uint64(field)
 }
-func (d *binaryDecoder) int64() int64   { return int64(d.uint64()) }
+func (d *binaryDecoder) int64() int64   { return int64(d.uint64()) } // #nosec G115 -- decode the preserved two's-complement bits.
 func (d *binaryDecoder) string() string { return string(d.bytes()) }
 func (d *binaryDecoder) bytes() []byte {
 	length := d.uint32()
 	if d.err != nil {
 		return nil
 	}
+	// #nosec G115 -- length is widened losslessly and remaining bytes are non-negative.
 	if uint64(length) > uint64(len(d.data)-d.pos) {
 		if d.err == nil {
 			d.err = fmt.Errorf("field length %d exceeds remaining payload %d", length, len(d.data)-d.pos)

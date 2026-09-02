@@ -65,6 +65,7 @@ func Decompress(payload []byte, algorithm Compression, decodedSize uint32) ([]by
 		return nil, fmt.Errorf("decoded payload size %d exceeds maximum %d", decodedSize, MaxFramePayload)
 	}
 	if algorithm == CompressionNone {
+		// #nosec G115 -- payload length is bounded by MaxFramePayload above.
 		if uint32(len(payload)) != decodedSize {
 			return nil, fmt.Errorf("uncompressed payload length mismatch: encoded=%d decoded=%d", len(payload), decodedSize)
 		}
@@ -137,6 +138,7 @@ func DecompressBounded(payload []byte, algorithm Compression) ([]byte, error) {
 		if decodedSize > MaxFramePayload {
 			return nil, fmt.Errorf("decoded payload size %d exceeds maximum %d", decodedSize, MaxFramePayload)
 		}
+		// #nosec G115 -- decodedSize is non-negative and bounded by MaxFramePayload above.
 		return Decompress(payload, algorithm, uint32(decodedSize))
 	case CompressionLZ4:
 		return readUnknownBounded(lz4.NewReader(bytes.NewReader(payload)))

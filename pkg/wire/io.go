@@ -14,6 +14,7 @@ func WriteLengthPrefixed(writer io.Writer, payload []byte) error {
 		return fmt.Errorf("payload size %d exceeds maximum %d", len(payload), MaxFramePayload)
 	}
 	header := make([]byte, 4)
+	// #nosec G115 -- payload length is checked against MaxFramePayload above.
 	binary.BigEndian.PutUint32(header, uint32(len(payload)))
 	if err := writeAll(writer, header); err != nil {
 		return fmt.Errorf("write payload length: %w", err)

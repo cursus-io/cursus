@@ -84,7 +84,9 @@ func (c *Codec) Encode(frame Frame) ([]byte, error) {
 	binary.BigEndian.PutUint16(header[8:10], uint16(frame.Command))
 	binary.BigEndian.PutUint16(header[10:12], uint16(frame.Status))
 	binary.BigEndian.PutUint64(header[12:20], frame.RequestID)
+	// #nosec G115 -- both lengths are checked against MaxFramePayload above.
 	binary.BigEndian.PutUint32(header[20:24], uint32(len(encoded)))
+	// #nosec G115 -- both lengths are checked against MaxFramePayload above.
 	binary.BigEndian.PutUint32(header[24:28], uint32(len(frame.Payload)))
 	binary.BigEndian.PutUint32(header[28:32], crc32.Checksum(encoded, crc32cTable))
 	copy(result[HeaderSize:], encoded)
