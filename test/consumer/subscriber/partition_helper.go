@@ -42,6 +42,12 @@ func (pc *PartitionConsumer) ensureConnection() error {
 
 		conn, _, connectErr := pc.consumer.client.ConnectWithFailover()
 		if connectErr == nil {
+			conn, connectErr = pc.consumer.negotiateWire(conn)
+			if connectErr != nil {
+				connectErr = fmt.Errorf("negotiate Wire v2 connection: %w", connectErr)
+			}
+		}
+		if connectErr == nil {
 			pc.mu.Lock()
 			if pc.closed {
 				_ = conn.Close()
