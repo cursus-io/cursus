@@ -16,8 +16,8 @@ The default ports are:
 
 | Port | Purpose |
 |---:|---|
-| 9000 | length-prefixed TCP client protocol |
-| 9080 | `/live`, `/ready`, `/health` |
+| 9000 | Wire v2 TCP client protocol |
+| 9080 | `/live`, `/ready` |
 | 9100 | Prometheus `/metrics` |
 
 In another terminal:
@@ -73,9 +73,9 @@ go run ./consumer
 ./bin/cursus-cli
 ```
 
-The current CLI creates local broker components and executes commands in-process. It is useful for command exploration, but it is not a remote network administration client for an already running broker. Use the Go/Java/Python SDKs or a framed protocol client for remote operations.
+The current CLI creates local broker components and executes commands in-process. It is useful for command exploration, but it is not a remote network administration client for an already running broker. Use the in-repository Go SDK or another client that passes the current Wire v2 conformance contract for remote operations.
 
-Raw `nc localhost 9000` text is not valid because every TCP payload requires a 4-byte big-endian length prefix.
+Raw `nc localhost 9000` text is not valid because every connection must complete the Wire v2 binary handshake and exchange `CRS2` frames.
 
 ## Standalone And Cluster Modes
 

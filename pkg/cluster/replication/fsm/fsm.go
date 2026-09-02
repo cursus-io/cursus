@@ -134,7 +134,10 @@ func (f *BrokerFSM) SetTransactionManager(txn *transaction.Manager) {
 	defer f.mu.Unlock()
 	f.txn = txn
 	if f.txn != nil && f.restoredTransactionState != nil {
-		f.txn.ImportState(f.restoredTransactionState)
+		if err := f.txn.ImportState(f.restoredTransactionState); err != nil {
+			util.Error("FSM: Rejected deferred restored transactions: %v", err)
+			return
+		}
 		util.Info("FSM: Imported %d deferred restored transactions", len(f.restoredTransactionState))
 		f.restoredTransactionState = nil
 	}
@@ -170,8 +173,6 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyRegisterCommand(strings.TrimPrefix(data, "REGISTER:"))
 	case strings.HasPrefix(data, "DEREGISTER:"):
 		res = f.applyDeregisterCommand(strings.TrimPrefix(data, "DEREGISTER:"))
-	case strings.HasPrefix(data, "JOIN_GROUP:"):
-		res = f.applyJoinGroupCommand(strings.TrimPrefix(data, "JOIN_GROUP:"))
 	case strings.HasPrefix(data, "MESSAGE:"):
 		res = f.applyMessageCommand(strings.TrimPrefix(data, "MESSAGE:"))
 	case strings.HasPrefix(data, "BATCH:"):
@@ -261,6 +262,12 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		return fmt.Errorf("restore topic definitions: %w", err)
 	}
 	restoredTopicState = topicStateFromDefinitions(definitions)
+	if err := coordinator.ValidateImportState(state.GroupState); err != nil {
+		return fmt.Errorf("restore consumer groups: %w", err)
+	}
+	if err := transaction.ValidateImportState(state.TransactionState); err != nil {
+		return fmt.Errorf("restore transactions: %w", err)
+	}
 	f.materializationMu.Lock()
 	localDefinitions := []topic.Definition(nil)
 	persistedTopicStorage := []string(nil)
@@ -341,13 +348,21 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		f.notifiers = make(map[string]chan interface{})
 	}
 	if state.GroupState != nil && f.cd != nil {
-		f.cd.ImportState(state.GroupState)
+		if err := f.cd.ImportState(state.GroupState); err != nil {
+			f.mu.Unlock()
+			f.materializationMu.Unlock()
+			return fmt.Errorf("restore consumer groups: %w", err)
+		}
 		util.Info("FSM Restore: Restored %d consumer groups from snapshot", len(state.GroupState))
 	}
 
 	if state.TransactionState != nil {
 		if f.txn != nil {
-			f.txn.ImportState(state.TransactionState)
+			if err := f.txn.ImportState(state.TransactionState); err != nil {
+				f.mu.Unlock()
+				f.materializationMu.Unlock()
+				return fmt.Errorf("restore transactions: %w", err)
+			}
 			util.Info("FSM Restore: Restored %d transactions from snapshot", len(state.TransactionState))
 		} else {
 			f.restoredTransactionState = state.TransactionState

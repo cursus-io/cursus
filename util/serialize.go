@@ -147,9 +147,11 @@ var diskMsgBufPool = sync.Pool{
 	},
 }
 
+const diskMessageMagic = "CDM2"
+
 // EstimateDiskMessageSize returns the serialized size of a DiskMessage without allocating.
 func EstimateDiskMessageSize(msg types.DiskMessage) int {
-	return 2 + len(msg.Topic) + 4 + 8 + 2 + len(msg.ProducerID) + 8 + 8 +
+	return len(diskMessageMagic) + 2 + len(msg.Topic) + 4 + 8 + 2 + len(msg.ProducerID) + 8 + 8 +
 		4 + len(msg.Payload) + 2 + len(msg.Key) +
 		2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata) + 2 + len(msg.TransactionalID) + 2 + len(msg.TransactionState) + 2 + len(msg.TransactionMarker) + 2 + len(msg.ControlBatchType) + 2 + 8 + 2 + len(msg.ControlBatchKey) + 2 + len(msg.ControlBatchValue)
 }
@@ -221,6 +223,7 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	}
 
 	var tmp [8]byte
+	buf = append(buf, diskMessageMagic...)
 
 	// Topic (length + string)
 	binary.BigEndian.PutUint16(tmp[:2], topicLen)
@@ -326,7 +329,10 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 // DeserializeDiskMessage deserializes bytes back to DiskMessage
 func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	var msg types.DiskMessage
-	offset := 0
+	if len(data) < len(diskMessageMagic) || string(data[:len(diskMessageMagic)]) != diskMessageMagic {
+		return msg, fmt.Errorf("unsupported disk message format: clean bootstrap required")
+	}
+	offset := len(diskMessageMagic)
 
 	// Topic
 	if offset+2 > len(data) {
@@ -404,92 +410,65 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	msg.Payload = string(data[offset : offset+payloadLen])
 	offset += payloadLen
 
-	// Event sourcing fields (optional - backward compatible with old messages)
-	// If event-sourcing trailer is present, all fields must be complete.
-	if offset < len(data) {
-		if offset+2 > len(data) {
-			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated event type length")
-		}
-		eventTypeLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
-		offset += 2
-		if offset+eventTypeLen > len(data) {
-			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated event type")
-		}
-		msg.EventType = string(data[offset : offset+eventTypeLen])
-		offset += eventTypeLen
+	if offset+2 > len(data) {
+		return msg, fmt.Errorf("incomplete event-sourcing fields: truncated event type length")
+	}
+	eventTypeLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	if offset+eventTypeLen > len(data) {
+		return msg, fmt.Errorf("incomplete event-sourcing fields: truncated event type")
+	}
+	msg.EventType = string(data[offset : offset+eventTypeLen])
+	offset += eventTypeLen
 
-		if offset+4 > len(data) {
-			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated schema version")
-		}
-		msg.SchemaVersion = binary.BigEndian.Uint32(data[offset : offset+4])
-		offset += 4
+	if offset+4 > len(data) {
+		return msg, fmt.Errorf("incomplete event-sourcing fields: truncated schema version")
+	}
+	msg.SchemaVersion = binary.BigEndian.Uint32(data[offset : offset+4])
+	offset += 4
 
-		if offset+8 > len(data) {
-			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated aggregate version")
-		}
-		msg.AggregateVersion = binary.BigEndian.Uint64(data[offset : offset+8])
-		offset += 8
+	if offset+8 > len(data) {
+		return msg, fmt.Errorf("incomplete event-sourcing fields: truncated aggregate version")
+	}
+	msg.AggregateVersion = binary.BigEndian.Uint64(data[offset : offset+8])
+	offset += 8
 
-		if offset+2 > len(data) {
-			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated metadata length")
-		}
-		metadataLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
-		offset += 2
-		if offset+metadataLen > len(data) {
-			return msg, fmt.Errorf("incomplete event-sourcing fields: truncated metadata")
-		}
-		msg.Metadata = string(data[offset : offset+metadataLen])
-		offset += metadataLen
-
-		// Key (optional - backward compatible with messages before Key was added)
-		if offset+2 <= len(data) {
-			keyLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
-			offset += 2
-			if offset+keyLen > len(data) {
-				return msg, fmt.Errorf("incomplete key field: truncated key")
-			}
-			msg.Key = string(data[offset : offset+keyLen])
-			offset += keyLen
-		}
-
-		if offset < len(data) {
-			if err := readDiskString(data, &offset, &msg.TransactionalID, "transactional ID"); err != nil {
-				return msg, err
-			}
-			if err := readDiskString(data, &offset, &msg.TransactionState, "transaction state"); err != nil {
-				return msg, err
-			}
-			if err := readDiskString(data, &offset, &msg.TransactionMarker, "transaction marker"); err != nil {
-				return msg, err
-			}
-			if offset < len(data) {
-				if err := readDiskString(data, &offset, &msg.ControlBatchType, "control batch type"); err != nil {
-					return msg, err
-				}
-				if offset+2 > len(data) {
-					return msg, fmt.Errorf("incomplete control batch version field: truncated value")
-				}
-				if err := binary.Read(bytes.NewReader(data[offset:offset+2]), binary.BigEndian, &msg.ControlBatchVersion); err != nil {
-					return msg, fmt.Errorf("read control batch version: %w", err)
-				}
-				offset += 2
-				if offset+8 > len(data) {
-					return msg, fmt.Errorf("incomplete control batch coordinator epoch field: truncated value")
-				}
-				if err := binary.Read(bytes.NewReader(data[offset:offset+8]), binary.BigEndian, &msg.ControlBatchCoordinatorEpoch); err != nil {
-					return msg, fmt.Errorf("read control batch coordinator epoch: %w", err)
-				}
-				offset += 8
-				if offset < len(data) {
-					if err := readDiskBytes(data, &offset, &msg.ControlBatchKey, "control batch key"); err != nil {
-						return msg, err
-					}
-					if err := readDiskBytes(data, &offset, &msg.ControlBatchValue, "control batch value"); err != nil {
-						return msg, err
-					}
-				}
-			}
-		}
+	if err := readDiskString(data, &offset, &msg.Metadata, "metadata"); err != nil {
+		return msg, err
+	}
+	if err := readDiskString(data, &offset, &msg.Key, "key"); err != nil {
+		return msg, err
+	}
+	if err := readDiskString(data, &offset, &msg.TransactionalID, "transactional ID"); err != nil {
+		return msg, err
+	}
+	if err := readDiskString(data, &offset, &msg.TransactionState, "transaction state"); err != nil {
+		return msg, err
+	}
+	if err := readDiskString(data, &offset, &msg.TransactionMarker, "transaction marker"); err != nil {
+		return msg, err
+	}
+	if err := readDiskString(data, &offset, &msg.ControlBatchType, "control batch type"); err != nil {
+		return msg, err
+	}
+	if offset+2 > len(data) {
+		return msg, fmt.Errorf("incomplete control batch version field: truncated value")
+	}
+	msg.ControlBatchVersion = int16(binary.BigEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	if offset+8 > len(data) {
+		return msg, fmt.Errorf("incomplete control batch coordinator epoch field: truncated value")
+	}
+	msg.ControlBatchCoordinatorEpoch = int64(binary.BigEndian.Uint64(data[offset : offset+8]))
+	offset += 8
+	if err := readDiskBytes(data, &offset, &msg.ControlBatchKey, "control batch key"); err != nil {
+		return msg, err
+	}
+	if err := readDiskBytes(data, &offset, &msg.ControlBatchValue, "control batch value"); err != nil {
+		return msg, err
+	}
+	if offset != len(data) {
+		return msg, fmt.Errorf("disk message has %d trailing bytes", len(data)-offset)
 	}
 
 	return msg, nil

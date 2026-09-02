@@ -26,21 +26,19 @@ type AdminConfig struct {
 	Principal string `yaml:"principal" json:"principal"`
 	AuthToken string `yaml:"auth_token" json:"auth_token"`
 
-	ProtocolVersion              int      `yaml:"protocol_version" json:"protocol_version"`
-	ProtocolFeatures             []string `yaml:"protocol_features" json:"protocol_features"`
-	RequireProtocolFeatures      bool     `yaml:"require_protocol_features" json:"require_protocol_features"`
-	ProtocolNegotiationTimeoutMS int      `yaml:"protocol_negotiation_timeout_ms" json:"protocol_negotiation_timeout_ms"`
-	CompressionType              string   `yaml:"compression_type" json:"compression_type"`
+	HandshakeTimeoutMS int    `yaml:"handshake_timeout_ms" json:"handshake_timeout_ms"`
+	CompressionType    string `yaml:"compression_type" json:"compression_type"`
 }
 
 // NewDefaultAdminConfig returns conservative defaults for a local broker.
 func NewDefaultAdminConfig() *AdminConfig {
 	return &AdminConfig{
-		BrokerAddrs:      []string{"localhost:9000"},
-		MaxRetries:       3,
-		RetryBackoffMS:   100,
-		RequestTimeoutMS: 5000,
-		CompressionType:  "none",
+		BrokerAddrs:        []string{"localhost:9000"},
+		MaxRetries:         3,
+		RetryBackoffMS:     100,
+		RequestTimeoutMS:   5000,
+		HandshakeTimeoutMS: 5000,
+		CompressionType:    "none",
 	}
 }
 
@@ -79,7 +77,7 @@ type TopicDefinition struct {
 }
 
 // DeleteTopicOptions controls the explicit idempotency contract for deletion.
-// IfExists=false preserves the legacy topic_not_found error.
+// IfExists=false reports topic_not_found when the topic does not exist.
 type DeleteTopicOptions struct {
 	IfExists bool
 }
@@ -139,7 +137,7 @@ func NewAdminClient(config *AdminConfig) (*AdminClient, error) {
 	if len(config.BrokerAddrs) == 0 {
 		return nil, fmt.Errorf("no broker addresses available")
 	}
-	if err := validateWireClientSettings(config.ProtocolVersion, config.ProtocolFeatures, config.RequireProtocolFeatures, config.CompressionType, config.Principal, config.AuthToken); err != nil {
+	if err := validateWireClientSettings(config.CompressionType, config.Principal, config.AuthToken); err != nil {
 		return nil, err
 	}
 	if err := validateTLSFiles(config.UseTLS, config.TLSCertPath, config.TLSKeyPath); err != nil {
@@ -156,9 +154,11 @@ func NewAdminClient(config *AdminConfig) (*AdminClient, error) {
 
 	client := &AdminClient{config: *config}
 	client.config.BrokerAddrs = append([]string(nil), config.BrokerAddrs...)
-	client.config.ProtocolFeatures = append([]string(nil), config.ProtocolFeatures...)
 	if client.config.RequestTimeoutMS <= 0 {
 		client.config.RequestTimeoutMS = 5000
+	}
+	if client.config.HandshakeTimeoutMS < 0 {
+		return nil, fmt.Errorf("handshake timeout must not be negative")
 	}
 	if client.config.RetryBackoffMS < 0 {
 		return nil, fmt.Errorf("retry backoff must be non-negative")
@@ -310,7 +310,7 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
 	defer stopCancellation()
 
-	conn, err = negotiateConfiguredProtocol(conn, c.config.ProtocolVersion, c.config.ProtocolFeatures, c.config.RequireProtocolFeatures, c.config.ProtocolNegotiationTimeoutMS, c.config.CompressionType)
+	conn, err = openWireConnection(conn, c.config.HandshakeTimeoutMS, c.config.CompressionType)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
@@ -320,9 +320,9 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 			return "", brokerErr
 		}
 		if isRetryableAdminTransportError(err) {
-			return "", fmt.Errorf("protocol negotiation with %s: %w", addr, err)
+			return "", fmt.Errorf("Wire v2 handshake with %s: %w", addr, err)
 		}
-		return "", &terminalAdminError{err: fmt.Errorf("protocol negotiation with %s: %w", addr, err)}
+		return "", &terminalAdminError{err: fmt.Errorf("Wire v2 handshake with %s: %w", addr, err)}
 	}
 	if err := authenticateConfiguredClient(conn, c.config.Principal, c.config.AuthToken); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -523,11 +523,8 @@ func parseTopicDefinitionResponse(response string) (TopicDefinition, error) {
 	if definition.Revision, err = parseAdminUint64(fields, "revision"); err != nil {
 		return TopicDefinition{}, err
 	}
-	definition.LifecycleEpoch = 1
-	if _, present := fields["lifecycle_epoch"]; present {
-		if definition.LifecycleEpoch, err = parseAdminUint64(fields, "lifecycle_epoch"); err != nil {
-			return TopicDefinition{}, err
-		}
+	if definition.LifecycleEpoch, err = parseAdminUint64(fields, "lifecycle_epoch"); err != nil {
+		return TopicDefinition{}, err
 	}
 	if definition.Idempotent, err = parseAdminBool(fields, "idempotent"); err != nil {
 		return TopicDefinition{}, err

@@ -49,7 +49,7 @@ func clusterHealthCheckAddrs(size int) []string {
 	addrs := make([]string, 0, size)
 	for i := 1; i <= size; i++ {
 		addrs = append(addrs,
-			fmt.Sprintf("http://localhost:%d/health", healthPort(i)),
+			fmt.Sprintf("http://localhost:%d/ready", healthPort(i)),
 		)
 	}
 	return addrs

@@ -66,7 +66,7 @@ Active readers cause the maintenance pass to skip rather than replacing a mapped
 
 A topic overrides the broker cleanup default with `CREATE ... cleanup_policy=<policy>`. Repeating `CREATE` with the same partition count updates the topic policy. Provisioning code should issue the same idempotent topic declaration whenever it establishes broker resources.
 
-The Go SDK exposes `Producer.CreateTopicWithOptions` and `TopicOptions.CleanupPolicy`. Existing `CreateTopic(topic, partitions)` remains a compatibility wrapper and inherits the broker default.
+The Go SDK exposes `Producer.CreateTopicWithOptions` and `TopicOptions.CleanupPolicy`. `CreateTopic(topic, partitions)` is the minimal convenience form and inherits the broker default.
 
 ## Operational Guidance
 

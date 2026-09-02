@@ -38,12 +38,7 @@ func TestBrokerFSMTopicCreateFailureCommitsDesiredStateAndReconciles(t *testing.
 	f := NewBrokerFSM(manager, nil)
 	registerActiveBroker(t, f, "broker-1")
 
-	command, err := json.Marshal(TopicCommand{
-		Name:              "orders",
-		Partitions:        1,
-		ReplicationFactor: 1,
-		Policy:            topic.DefaultPolicy(),
-	})
+	command, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 
 	result := f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(command)), Index: 2})
@@ -74,12 +69,7 @@ func TestBrokerFSMTopicConfigFailureCommitsDesiredStateAndReconciles(t *testing.
 	f := NewBrokerFSM(manager, nil)
 	registerActiveBroker(t, f, "broker-1")
 
-	create, err := json.Marshal(TopicCommand{
-		Name:              "orders",
-		Partitions:        1,
-		ReplicationFactor: 1,
-		Policy:            topic.DefaultPolicy(),
-	})
+	create, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 	require.Nil(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 2}))
 
@@ -249,9 +239,7 @@ func TestBrokerFSMDeleteSupersedesPendingCreateWithoutLocalTopic(t *testing.T) {
 	f := NewBrokerFSM(manager, nil)
 	registerActiveBroker(t, f, "broker-1")
 
-	command, err := json.Marshal(TopicCommand{
-		Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy(),
-	})
+	command, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 	require.Error(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(command)), Index: 2}).(error))
 	require.Error(t, f.TopicMaterializationReadinessError())

@@ -29,14 +29,12 @@ func TestBrokerFSMSnapshotRestoresTopicDefinition(t *testing.T) {
 	}
 	minISR := 1
 	policy.MinInSyncReplicas = &minISR
-	command := TopicCommand{
-		Name:              "orders",
-		Partitions:        2,
-		Idempotent:        true,
-		EventSourcing:     false,
-		ReplicationFactor: 1,
-		Policy:            policy,
-	}
+	definition := topic.DefaultDefinition("orders", nil)
+	definition.Partitions = 2
+	definition.Idempotent = true
+	definition.ReplicationFactor = 1
+	definition.Policy = policy
+	command := TopicCommand{Definition: &definition}
 	data, err := json.Marshal(command)
 	require.NoError(t, err)
 	require.Nil(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(data)), Index: 2}))
@@ -74,12 +72,7 @@ func TestBrokerFSMSnapshotRestoresAlteredTopicMinInSyncReplicas(t *testing.T) {
 	for _, brokerID := range []string{"broker-1", "broker-2", "broker-3"} {
 		registerActiveBroker(t, f, brokerID)
 	}
-	create, err := json.Marshal(TopicCommand{
-		Name:              "orders",
-		Partitions:        1,
-		ReplicationFactor: 3,
-		Policy:            topic.DefaultPolicy(),
-	})
+	create, err := json.Marshal(testTopicCommand("orders", 1, 3))
 	require.NoError(t, err)
 	require.Nil(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 4}))
 	configured := 2
@@ -255,7 +248,7 @@ func applyTopicPatch(t *testing.T, f *BrokerFSM, index uint64, defaults topic.De
 func TestBrokerFSMRepeatedCreatePreservesExistingPartitionState(t *testing.T) {
 	f := newTestFSM()
 	registerActiveBroker(t, f, "broker-1")
-	initial := TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()}
+	initial := testTopicCommand("orders", 1, 1)
 	data, err := json.Marshal(initial)
 	require.NoError(t, err)
 	require.Nil(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(data)), Index: 2}))
@@ -269,8 +262,9 @@ func TestBrokerFSMRepeatedCreatePreservesExistingPartitionState(t *testing.T) {
 	partition.UpdateLEO(41)
 
 	updated := initial
-	updated.Partitions = 2
-	updated.Policy.RetentionHours = 24
+	partitions := 2
+	retentionHours := 24
+	updated.Patch = &topic.DefinitionPatch{Partitions: &partitions, RetentionHours: &retentionHours}
 	data, err = json.Marshal(updated)
 	require.NoError(t, err)
 	require.Nil(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(data)), Index: 3}))

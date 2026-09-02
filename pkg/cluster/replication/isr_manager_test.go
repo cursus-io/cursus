@@ -72,9 +72,10 @@ func TestISRManager_SubmitCatchupProofsFencesIdentityAndAppliesOnLeader(t *testi
 		require.NoError(t, err)
 		require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte("REGISTER:" + string(data))}))
 	}
-	command, err := json.Marshal(fsm.TopicCommand{
-		Name: "orders", Partitions: 1, LeaderID: "node1", ReplicationFactor: 2, Policy: topic.DefaultPolicy(),
-	})
+	definition := topic.DefaultDefinition("orders", nil)
+	definition.Partitions = 1
+	definition.ReplicationFactor = 2
+	command, err := json.Marshal(fsm.TopicCommand{Definition: &definition, LeaderID: "node1"})
 	require.NoError(t, err)
 	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte("TOPIC:" + string(command))}))
 
@@ -126,12 +127,9 @@ func TestISRManager_Quorum(t *testing.T) {
 		}
 	}
 
-	topicPayload := map[string]interface{}{
-		"name":                  topicName,
-		"partitions":            1,
-		"leader_id":             "node1",
-		"committed_hwm_version": fsm.CommittedHWMVersionCurrent,
-	}
+	topicDefinition := topic.DefaultDefinition(topicName, nil)
+	topicDefinition.Partitions = 1
+	topicPayload := fsm.TopicCommand{Definition: &topicDefinition, LeaderID: "node1"}
 	topicData, err := json.Marshal(topicPayload)
 	if err != nil {
 		t.Fatalf("failed to marshal topic payload: %v", err)

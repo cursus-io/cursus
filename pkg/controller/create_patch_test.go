@@ -25,7 +25,7 @@ func TestExplicitEmptyACLSurvivesDistributedPatchEncoding(t *testing.T) {
 	require.Empty(t, *restored.ReadACL)
 }
 
-func TestDistributedTopicCommandPayloadKeepsLegacyFields(t *testing.T) {
+func TestDistributedTopicCommandPayloadUsesCanonicalDefinitionPatch(t *testing.T) {
 	current := topic.DefaultDefinition("orders", nil)
 	current.Partitions = 2
 	current.Policy.RetentionHours = 168
@@ -40,19 +40,19 @@ func TestDistributedTopicCommandPayloadKeepsLegacyFields(t *testing.T) {
 
 	encoded, err := json.Marshal(payload)
 	require.NoError(t, err)
-	var legacy struct {
-		Name              string       `json:"name"`
-		Partitions        int          `json:"partitions"`
-		ReplicationFactor int          `json:"replication_factor"`
-		Policy            topic.Policy `json:"policy"`
+	var command struct {
+		Definition topic.Definition      `json:"definition"`
+		Patch      topic.DefinitionPatch `json:"patch"`
 	}
-	require.NoError(t, json.Unmarshal(encoded, &legacy))
-	require.Equal(t, "orders", legacy.Name)
-	require.Equal(t, 2, legacy.Partitions)
-	require.Equal(t, topic.DefaultReplicationFactor, legacy.ReplicationFactor)
-	require.Equal(t, 168, legacy.Policy.RetentionHours)
-	require.Equal(t, int64(8192), legacy.Policy.RetentionBytes)
-	require.Equal(t, []string{"reader"}, legacy.Policy.ReadACL)
+	require.NoError(t, json.Unmarshal(encoded, &command))
+	require.Equal(t, "orders", command.Definition.Name)
+	require.Equal(t, topic.DefaultPartitionCount, command.Definition.Partitions)
+	require.NotNil(t, command.Patch.RetentionBytes)
+	require.Equal(t, int64(8192), *command.Patch.RetentionBytes)
+	require.NotContains(t, payload, "name")
+	require.NotContains(t, payload, "partitions")
+	require.NotContains(t, payload, "replication_factor")
+	require.NotContains(t, payload, "policy")
 	require.NotNil(t, payload["definition"])
 	require.NotNil(t, payload["patch"])
 }

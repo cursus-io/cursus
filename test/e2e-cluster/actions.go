@@ -75,7 +75,7 @@ func validateNodeHealthURL(nodeIndex int, healthURL string) error {
 	if nodeIndex <= 0 {
 		return fmt.Errorf("invalid broker index %d", nodeIndex)
 	}
-	expected := fmt.Sprintf("http://localhost:%d/health", healthPort(nodeIndex))
+	expected := fmt.Sprintf("http://localhost:%d/ready", healthPort(nodeIndex))
 	if healthURL != expected {
 		return fmt.Errorf("refusing unexpected node health URL %q", healthURL)
 	}

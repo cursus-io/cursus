@@ -1,7 +1,7 @@
 # Cursus Wire Protocol Specification
 
-> Specification revision: 1.1
-> Supported wire protocol versions: 1
+> Specification revision: 2.0
+> Supported wire protocol versions: 2
 > Target audience: SDK implementors (C++, Java, Python, Go)
 
 ---
@@ -15,7 +15,7 @@
 | Transport | TCP (IPv4/IPv6) |
 | Default port | 9000 (configurable) |
 | TLS | Optional, TLS 1.2+ required when enabled |
-| Health check | HTTP GET `/health` on port 9080 (configurable) |
+| Health checks | HTTP GET `/live` and `/ready` on port 9080 (configurable) |
 | Max concurrent connections | 1000 |
 | Idle timeout | 5 seconds (server re-reads on timeout, does NOT disconnect) |
 
@@ -25,150 +25,100 @@
 Client              Broker
   |--- TCP connect --->|
   |                    | (worker assigned)
-  |--- PROTOCOL_INFO ->| (optional discovery)
-  |--- NEGOTIATE ----->| (optional, once per connection)
-  |--- command/batch ->| (length-prefixed frame)
-  |<-- response -------|
-  |--- command ------->|
-  |<-- response -------|
+  |--- NEGOTIATE ----->| (required Wire v2 binary frame)
+  |<-- NEGOTIATE ------| (version + compression selected)
+  |--- REQUEST -------->| (correlated Wire v2 frame)
+  |<-- RESPONSE --------| (same request ID)
+  |--- REQUEST -------->|
+  |<-- STREAM ----------| (zero or more correlated frames)
   |    ...             |
   |--- EXIT ---------->| (or close socket)
 ```
 
-A single TCP connection handles all commands sequentially. For parallel operations, open multiple connections.
+A connection that does not begin with the Wire v2 negotiation frame is rejected. The Go client serializes request lifecycles on each connection; use multiple connections for parallel operations.
 
 ---
 
 ## 2. Framing
 
-Every message (request and response) uses a **4-byte Big Endian length prefix**.
+Every message is a self-delimiting Wire v2 frame with a fixed 32-byte big-endian header followed by `encoded_length` payload bytes.
 
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                    Body Length (uint32 BE)                     |
+| Magic `CRS2` (u32) | Version (u16) | Kind (u8) | Flags (u8)   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-|                     Body (N bytes)                            |
-|                                                               |
+| Command (u16) | Status (u16) | Request ID (u64)               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Encoded length (u32) | Decoded length (u32) | CRC32C (u32)    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Encoded payload (`encoded_length` bytes)                       |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-- **Max body size**: 64 MB (`67,108,864` bytes)
+- **Magic**: `0x43525332` (`CRS2`)
+- **Version**: exactly `2`
+- **Max encoded and decoded payload**: 64 MB (`67,108,864` bytes)
 - **Byte order**: Big Endian (network order) throughout the protocol
-- Length field does NOT include itself (only body size)
+- **Checksum**: CRC32C (Castagnoli) over the encoded payload
+- Application requests and responses require a non-zero request ID. A response or stream frame uses the request's ID and command.
 
 ### Compression
 
-Body may be compressed before framing. Algorithm is configured per-broker (not negotiated per-connection).
+Compression is selected by the required connection handshake. Negotiation frames are always uncompressed; every later frame explicitly identifies the selected algorithm in its flags.
 
 | Algorithm | ID |
 |-----------|----|
-| none | `""` or `"none"` |
-| gzip | `"gzip"` |
-| snappy | `"snappy"` (xerial format) |
-| lz4 | `"lz4"` |
+| none | `0` |
+| gzip | `1` |
+| snappy | `2` |
+| lz4 | `3` |
 
 ```
-Send:  body → compress(body) → [4-byte len][compressed body]
-Recv:  [4-byte len][compressed body] → decompress → body
+Send: decoded payload → compress → header + encoded payload
+Recv: header + encoded payload → CRC32C verify → decompress → decoded payload
 ```
 
 ---
 
 ## 3. Message Types
 
-The broker distinguishes two message types by inspecting the first 2 bytes of the body:
-
-| Magic | Type | Format |
-|-------|------|--------|
-| `0xBA 0x7C` | Binary batch | Structured binary (Section 5) |
-| Other | Text command | UTF-8 string (Section 4) |
+| Kind | Value | Purpose |
+|------|-------|---------|
+| Negotiation request | `1` | Client version range and ordered compression preferences |
+| Negotiation response | `2` | Selected Wire version and compression |
+| Request | `3` | Correlated application request |
+| Response | `4` | Correlated success or structured error |
+| Stream | `5` | Correlated stream data/control/end frame |
 
 ---
 
-## 4. Text Commands
+## 4. Negotiation and Application Payloads
 
-### Encoding
+### Required Binary Handshake
 
-Text commands use an optional topic+payload envelope:
+The first frame must be an uncompressed negotiation request with command `NEGOTIATE`. Its payload is `minimum_version (u16)`, `maximum_version (u16)`, `compression_count (u16)`, followed by that many compression IDs. The broker selects the first mutually supported compression and returns an uncompressed negotiation response containing `version (u16)` and `compression (u8)`. Version 2 must fall inside the requested range. There are no application-level `PROTOCOL_INFO`, feature flags, or text `NEGOTIATE` commands.
 
-```
- 0                   1
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|      Topic Length (uint16 BE) |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|        Topic (T bytes)        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|     Command Payload (UTF-8)   |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
+### Request Encoding
 
-Alternatively, raw command strings (without the topic envelope) are accepted if they match a known command keyword.
+The frame header carries the command ID. Most request payloads use the deterministic command schema with magic `CRQ2` (`0x43525132`), schema version 2, ordered positional strings, and ordered key/value fields. `PUBLISH` may instead carry a Wire v2 batch with magic `CBV2` (`0x43425632`). Raw text commands and topic envelopes are rejected by the public listener.
 
 ### Parameter Parsing Rules
 
 - Parameters use `key=value` syntax, separated by whitespace
 - **Parameter order is flexible** — the broker parses key=value pairs regardless of order
 - The `message=` parameter is special: it captures the entire remainder of the line
-- Command names are case-insensitive
+- Field names use lower-case ASCII letters and underscores; later characters may also contain upper-case ASCII letters or digits.
 
-### Text Response Contract
+### Response Contract
 
-Text command responses are machine-readable.
+Application response payloads are machine-readable.
 
 - Success responses MUST be `OK` or `OK key=value ...` unless the command returns a documented JSON envelope with `"status":"OK"`.
-- Failure responses MUST be `ERROR: <code> [key=value ...]`.
-- Clients SHOULD branch on the `OK` / JSON status / `ERROR:` contract instead of matching natural-language phrases.
-- Legacy bare responses, such as the old CREATE phrase or plain integer offsets, are deprecated and should only be accepted by clients as narrow backward-compatible fallbacks.
-
-### Protocol Discovery and Negotiation
-
-Negotiation is optional and connection-scoped. A client that sends neither command remains on wire protocol version 1 with legacy-compatible text errors. Clients should negotiate immediately after opening every TCP connection, before sending application commands.
-
-**PROTOCOL_INFO**
-
-```text
-PROTOCOL_INFO
-```
-
-Response:
-
-```text
-OK protocol=cursus min_version=1 max_version=1 default_version=1 features=<csv> error_classes=<csv>
-```
-
-The response is safe to query without changing connection state.
-
-**NEGOTIATE**
-
-```text
-NEGOTIATE version=<N> [features=<csv|*>] [require_features=<true|false>]
-```
-
-Success response:
-
-```text
-OK protocol_version=<N> enabled=<csv> unsupported=<csv>
-```
-
-`features=*` enables every feature advertised by `PROTOCOL_INFO`. Named features use lowercase ASCII letters, digits, and underscores, with at most 64 names of 64 bytes each. Unknown valid optional features are returned in `unsupported=`. When `require_features=true`, any unknown feature rejects the negotiation with `ERROR: UNSUPPORTED_FEATURE ...` and leaves the connection context unchanged. An unsupported version returns `ERROR: UNSUPPORTED_PROTOCOL_VERSION ...`.
-
-Version 1 features currently advertised by the broker are:
-
-| Feature | Contract |
-|---------|----------|
-| `structured_errors_v1` | Adds `class=<class> retryable=<bool>` to text `ERROR:` responses on this connection |
-| `stream_control_v1` | Supports documented `STREAM_CONTROL` close frames |
-| `offset_resume_v1` | Supports broker-owned `FETCH_OFFSET`/commit resume semantics |
-| `idempotent_producer_v1` | Supports producer ID, epoch, and sequence fencing |
-| `event_sourcing_v1` | Supports event stream and snapshot commands |
-| `topic_compaction_v1` | Supports per-topic cleanup policy declaration and standalone keyed closed-segment compaction |
-| `topic_truncate_v1` | Supports revision-guarded topic reset with lifecycle-epoch fencing |
-
-Feature names describe independent contracts; clients must not infer support for an unadvertised feature from the protocol version alone.
+- Failure responses use status `ERROR` and a binary error payload containing code, class, retryable flag, message, and deterministic fields.
+- Error classes are `validation`, `authorization`, `routing`, `availability`, `conflict`, `fencing`, `not_found`, and `internal`.
+- Clients branch on frame status and decoded schemas, never on natural-language text.
 
 ### Command Reference
 
@@ -194,13 +144,13 @@ CREATE topic=<name> [partitions=<N>] [idempotent=<true|false>] [event_sourcing=<
 | replication_factor | No | 3 | Replica count (distributed mode) |
 | min_in_sync_replicas | No | broker default | Optional durable topic override; must be between 1 and the topic replication factor |
 
-Response: `OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> lifecycle_epoch=<N> min_in_sync_replicas=<N|default> effective_min_in_sync_replicas=<N>`. The original field order remains intact and new definition and ISR-policy fields are appended for positional legacy parsers.
+Response: `OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<hash_key|round_robin> auth_policy=<open|deny_write|deny_read|acl> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> lifecycle_epoch=<N> min_in_sync_replicas=<N|default> effective_min_in_sync_replicas=<N>`.
 
 Topic names are a portable on-disk identifier: 1-249 ASCII bytes containing only letters, digits, `.`, `_`, `-`, or `=`; `.` and `..` are reserved. Invalid names return `ERROR: invalid_topic_name ...`.
 
 A missing topic is built from broker defaults and the supplied fields. For an existing topic, `CREATE` is a presence-aware patch: omitted fields retain their authoritative value, while explicit `0`, `false`, and empty `read_acl=`/`write_acl=` values are applied. Partition count can only increase. `replication_factor`, `idempotent`, and `event_sourcing` may be restated with the current value but cannot be changed. A no-op keeps the current `revision`; every effective definition change increments it.
 
-A successful standalone `CREATE` means the revisioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. Broker restart also restores the optional `min_in_sync_replicas` override; manifests without it use the broker `min_insync_replicas` fallback. First-generation topics continue to write manifest version 2 during a rolling upgrade; the additive `lifecycle_epoch=1` field is ignored by older readers. Version 1 manifests load with `revision=1`, `replication_factor=3`, and lifecycle epoch 1. The first successful truncate advances the manifest to version 3, which requires the epoch field and is intentionally rejected by older binaries. Distributed mode follows the same boundary: snapshot version 7 remains in use while every topic is at epoch 1, and the first retained epoch greater than 1 requires snapshot version 8. Version 7 snapshots without the additive field receive `lifecycle_epoch=1`; version 6 also receives revision 1 and infers replication factor from consistent partition replica metadata, falling back to 3 only when legacy metadata has no replica set. Snapshots without `min_in_sync_replicas` remain valid and use the broker fallback. Repeating `CREATE` without the field preserves an existing override.
+A successful standalone `CREATE` means the revisioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. Broker restart restores the optional `min_in_sync_replicas` override; omission uses the broker `min_insync_replicas` fallback. Manifest format 3 carries lifecycle epochs after truncate. Distributed state uses only Raft snapshot version 9 and requires every partition to carry `committed_hwm_version=1`, an explicit numeric `committed_hwm` (including zero), leader epoch, ISR, and lifecycle epoch.
 
 **ALTER_TOPIC_CONFIG**
 ```
@@ -220,7 +170,7 @@ Responses:
 - `OK topic=<name> deleted=false` when `if_exists=true` observes an already missing topic.
 - Either response can include `cleanup_pending=true` when the durable logical state is committed but node-local storage cleanup must be retried by reconciliation.
 
-`if_exists` defaults to `false`, preserving the legacy `ERROR: topic_not_found topic=<name>` response for a missing topic. Invalid boolean values return `ERROR: invalid_if_exists ...`. `DELETE` requires the admin permission; topic read/write permission is insufficient. Broker-owned `__consumer_offsets` returns `ERROR: internal_topic_delete_forbidden ...` even with `if_exists=true`.
+`if_exists` defaults to `false`, so a missing topic returns `ERROR: topic_not_found topic=<name>`. Invalid boolean values return `ERROR: invalid_if_exists ...`. `DELETE` requires the admin permission; topic read/write permission is insufficient. Broker-owned `__consumer_offsets` returns `ERROR: internal_topic_delete_forbidden ...` even with `if_exists=true`.
 
 Deletion fails closed with `ERROR: topic_delete_blocked ...` while a consumer group for the topic has active members or an open/committing transaction references it. Successful deletion writes lifecycle tombstones for inactive groups and removes their offsets, removes producer sequence state, and removes target-topic operations from terminal transactions. Event-sourcing indexes and snapshot handles are closed before topic storage is removed. Recreating the same name starts at definition revision 1 and must not restore old logs, offsets, producer state, transaction operations, or event-sourcing metadata.
 
@@ -243,7 +193,7 @@ The operation fails closed while a consumer group has active members or an open/
 
 Standalone mode durably commits the new definition epoch before replacing storage. Until the matching local epoch marker is synced, all access to the topic is fenced and startup resumes cleanup instead of serving the old generation. Distributed mode commits one `TOPIC_TRUNCATE` Raft transition, advances partition leader epochs, and fences message replication, partition commits, and event snapshots whose lifecycle epoch is missing or stale. A node-local cleanup failure returns `cleanup_pending=true` and remains unavailable on that node until materialization converges.
 
-Every active broker must advertise lifecycle protocol version 1 before a distributed truncate is accepted, so rolling upgrades cannot commit a lifecycle transition through an older FSM. Public clients can discover the additive command through `topic_truncate_v1`. Older clients continue to use the unchanged protocol version and established response-field prefix; missing lifecycle fields from an older server are interpreted as epoch 1 by the Go SDK. Downgrading a broker after it has written manifest version 3 or snapshot version 8 is not supported.
+Every active broker must advertise lifecycle protocol version 1 before a distributed truncate is accepted. A Raft directory is valid only when its `.cursus-raft-format` marker contains `9`; non-empty unmarked directories, older markers, older snapshots, and partition metadata without explicit committed-HWM provenance fail startup with `unsupported recovery protocol`. Recovery requires removing all Cursus persistent state and clean-bootstrapping the whole cluster; mixed-version rolling upgrades and downgrade are unsupported.
 
 **LIST**
 ```
@@ -398,6 +348,9 @@ Response: `OK generation=<N> member=<actual-id> assignments=[0,1,2]`
 
 > Broker appends a random 4-digit suffix to the member ID.
 > e.g., `member=consumer-1` → actual ID `consumer-1-8374`
+> A fresh join atomically registers a missing group against the supplied topic and
+> its authoritative partition count. `REGISTER_GROUP` is optional explicit
+> provisioning for a group that must exist before its first member.
 
 **SYNC_GROUP**
 ```
@@ -491,9 +444,9 @@ Opens a continuous stream. Server pushes binary batches at ~100ms intervals. The
 
 Stream delivery never advances the consumer group's committed offset. Delivery to a TCP connection is not processing acknowledgement. After processing a batch, the client must explicitly send `COMMIT_OFFSET` or `BATCH_COMMIT` with its current member and generation.
 
-Keepalive: Server sends `[00 00 00 00]` (4 zero bytes as length prefix) when no messages are available. Clients MUST treat zero-length frames as keepalive and continue reading.
+Keepalive: the server sends a correlated Wire stream frame with status `OK` and an empty payload when no messages are available. Clients treat the empty payload as keepalive and continue reading.
 
-Control frames: The broker may send UTF-8 text frames with the prefix `STREAM_CONTROL` on the same length-prefixed connection. Clients MUST inspect text control frames before binary batch decoding.
+Control frames: the broker may send a correlated Wire stream frame whose payload starts with `STREAM_CONTROL`. Clients inspect control payloads before binary batch decoding.
 
 ```text
 STREAM_CONTROL type=CLOSE reason=<stopped|removed|timeout|error|offset_out_of_range> offset=<nextOffset>
@@ -531,7 +484,7 @@ ERROR: partition_not_found partition=<N>
 ```
 FETCH_OFFSET topic=<name> partition=<N> group=<name>
 ```
-Response: `OK offset=<nextOffset>`. If no offset has been committed, the broker returns `OK offset=0` (earliest). Older brokers returned a plain integer; clients may keep that only as a legacy fallback.
+Response: `OK offset=<nextOffset>`. If no offset has been committed, the broker returns `OK offset=0` (earliest).
 
 The key is `(topic, group, partition)`. Offsets are independent for every group
 and every partition.
@@ -573,7 +526,7 @@ missing, an entry is malformed, or the same partition appears more than once.
 
 Cursus exposes a broker-managed transaction coordinator for consume-process-produce workflows. In distributed mode, transaction commands are routed by `transactional_id` using the coordinator key `txn:<transactional_id>`. Clients can discover the owner with `FIND_COORDINATOR transactional_id=<id>` and must retry on `ERROR: NOT_COORDINATOR host=<host> port=<port>`.
 
-Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Transaction state entered the schema in version 4, committed partition watermarks in version 5, durable topic definitions in version 6, revisioned definitions in version 7, and post-truncate lifecycle epochs in version 8. Legacy partition metadata that omits `committed_hwm` is distinct from an explicit zero: it keeps the previous durable-tail recovery behavior and is promoted through an epoch- and lifecycle-fenced Raft HWM commit before the next publish append. Current metadata serializes explicit zero, so later recovery can safely truncate a new uncommitted tail.
+Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Snapshot version 9 requires explicit committed-HWM provenance for every partition. On restore, local data above the authoritative committed HWM is truncated before service, while an HWM above local LEO or missing provenance fails startup rather than guessing.
 
 Clients should first call `INIT_PRODUCER_ID` for a `transactional_id`; the broker returns the authoritative `(producerId, epoch)` session and bumps `epoch` on re-initialization to fence older producers. The coordinator fences stale producers by `(transactional_id, producerId, epoch)`: lower epochs are rejected, and staged operations must use the same producer and epoch that opened the transaction. After `transactional_id_expiration_ms`, completed transactions discard staged message/offset payloads but retain a compact epoch tombstone. The tombstone participates in standalone journal and distributed metadata snapshots, preventing an older producer session from being revived. Active `open` and `committing` transactions are not expired by the cleanup path.
 
@@ -639,7 +592,7 @@ Current guarantee: a successful transaction commit has one durable coordinator d
 6. apply the staged offsets with one generation/ownership-fenced bulk commit,
 7. persist the final `committed` coordinator decision.
 
-`read_committed` exposes a transaction only when its partition commit marker and current-epoch coordinator decision agree. Aborted records and control markers are skipped; the earliest unresolved transaction defines the stable visibility boundary. Partitions maintain an in-memory transaction index rebuilt from durable logs. For records created before durable coordinator decisions were stored, or for epochs no longer retained in the current coordinator snapshot, the durable partition marker remains the compatibility authority; every currently tracked epoch requires marker/decision agreement. Coordinator state is restored from the standalone fsynced journal or, in distributed mode, from `TXN_SYNC` and Raft metadata snapshots. A broker that restores `committing` state retries the prepared work; producer sequence state rebuilt from logs prevents duplicate records. Retried finalization with the same epoch is idempotent.
+`read_committed` exposes a transaction only when its partition commit marker and current-epoch coordinator decision agree. Aborted records and control markers are skipped; the earliest unresolved transaction defines the stable visibility boundary. Partitions maintain an in-memory transaction index rebuilt from durable logs. For historical producer epochs no longer retained by the coordinator, the durable partition marker remains authoritative; every currently tracked epoch requires marker/decision agreement. Coordinator state is restored from the standalone fsynced versioned journal or, in distributed mode, from `TXN_SYNC` and version-9 Raft metadata snapshots. A broker that restores `committing` state retries the prepared work; producer sequence state rebuilt from logs prevents duplicate records. Retried finalization with the same epoch is idempotent.
 
 The marker uses Cursus control metadata (`control_batch_type=transaction`, `control_batch_version=2`, `control_batch_coordinator_epoch=<epoch>`) and control-record bytes (`key: int16 version, int16 markerType`; `value: int16 version, int32 coordinatorEpoch`). The surrounding segment and network protocol remain Cursus-owned. The transaction covers broker output records and one consumer offset scope; external database, HTTP, filesystem, or service effects remain outside it and require application-level idempotency or their own transaction.
 #### Event Sourcing Commands
@@ -682,7 +635,7 @@ READ_STREAM topic=<name> key=<aggregate_key> [from_version=<N>]
 | key | Yes | - | Aggregate ID |
 | from_version | No | 1 | Positive starting version; a usable snapshot advances the event batch to snapshot version + 1 |
 
-Response: Two length-prefixed frames sent sequentially.
+Response: Two correlated Wire stream frames sent sequentially.
 
 Frame 1 — JSON envelope:
 ```json
@@ -698,7 +651,7 @@ Frame 1 — JSON envelope:
 
 The `snapshot` field is included only when a snapshot exists at or after `from_version`. `count` reflects the number of events in Frame 2 (not including the snapshot).
 
-Frame 2 — Binary batch (standard 0xBA7C format) containing the events. If no events exist after the snapshot, the batch has message count 0. A missing, zero, or non-numeric `from_version` is handled as follows: missing defaults to `1`; zero or non-numeric values return a JSON error envelope with `error:"invalid_from_version"` and no batch frame.
+Frame 2 — Wire v2 `CBV2` batch containing the events. If no events exist after the snapshot, the batch has message count 0. A missing, zero, or non-numeric `from_version` is handled as follows: missing defaults to `1`; zero or non-numeric values return a JSON error envelope with `error:"invalid_from_version"` and no batch frame.
 
 **STREAM_VERSION**
 ```
@@ -709,7 +662,7 @@ STREAM_VERSION topic=<name> key=<aggregate_key>
 | topic | Yes | - | Portable topic name: 1-249 ASCII bytes using letters, digits, `.`, `_`, `-`, or `=` |
 | key | Yes | - | Aggregate ID |
 
-Response: `OK version=<N>` (for example, `OK version=6`). Returns `OK version=0` if the aggregate does not exist. Older brokers returned a plain integer; clients may keep that only as a legacy fallback.
+Response: `OK version=<N>` (for example, `OK version=6`). Returns `OK version=0` if the aggregate does not exist.
 
 **SAVE_SNAPSHOT**
 ```
@@ -744,45 +697,32 @@ Success response: `OK snapshot=<json>`
 OK snapshot={"version":500,"payload":"..."}
 ```
 
-Not found response: `OK snapshot=null`. Older brokers returned `NULL`; clients may keep that only as a legacy fallback.
+Not found response: `OK snapshot=null`.
 
 ---
 
 ## 5. Binary Batch Format
 
-### Header
+### Batch Schema
+
+All integers are big-endian. Strings and byte arrays use a `uint32` length followed by that many bytes.
 
 ```
-Offset  Size  Type     Field
-------  ----  -------  --------------------------------
-0       2     uint16   Magic (0xBA7C)
-2       2     uint16   Topic name length (T)
-4       T     string   Topic name (UTF-8)
-4+T     4     int32    Partition ID
-8+T     1     uint8    Acks string length (A)
-9+T     A     string   Acks value ("0", "1", "-1", "all")
-9+T+A   1     uint8    IsIdempotent (0x00 or 0x01)
-10+T+A  8     uint64   Batch start sequence number
-18+T+A  8     uint64   Batch end sequence number
-26+T+A  4     int32    Message count (M)
-30+T+A  ...   Message  M message records follow
+magic (u32 = 0x43425632 "CBV2")
+version (u16 = 2)
+flags (u16; bit 0 = idempotent)
+topic (string)
+partition (i32)
+acks (string)
+batch_start (u64)
+batch_end (u64)
+record_count (u32)
+records (record_count × length-prefixed record bytes)
 ```
 
 ### Message Record
 
-```
-Offset  Size  Type     Field
-------  ----  -------  --------------------------------
-0       8     uint64   Offset (0 on send, assigned by broker)
-8       8     uint64   Sequence number
-16      2     uint16   ProducerID length (P)
-18      P     string   ProducerID (UTF-8)
-18+P    2     uint16   Key length (K)
-20+P    K     string   Partition key (UTF-8, optional)
-20+P+K  8     int64    Epoch
-28+P+K  4     uint32   Payload length (L)
-32+P+K  L     bytes    Payload
-```
+Each record starts with `version (u16 = 2)` and a `presence (u64)` bitmap, followed by required topic, partition, offset, and payload fields. Optional producer, timestamp, key, event-sourcing, transaction, and control-record fields appear in bitmap order. Decoders reject unknown presence bits, trailing bytes, routing fields that conflict with the enclosing batch, and more than 100,000 records.
 
 ### Batch Response
 
@@ -844,7 +784,7 @@ All SDKs should implement the same consumer group resume behavior:
 - On `ERROR: OFFSET_OUT_OF_RANGE ...`, apply the SDK `auto_offset_reset` policy: `earliest` resumes from the broker-reported earliest retained offset, `latest` resumes from the broker-reported latest offset, and `error` fails the consumer instead of silently skipping or replaying data.
 ### Offset Lifecycle and Delivery Guarantees
 
-Consumer group registrations, tombstones, and committed next offsets are stored by the standalone broker in versioned records in `__consumer_offsets` and loaded again before readiness. A successful registration survives without a commit; `FETCH_OFFSET` returns `0` for its uncommitted partitions. Successful commits are synchronously persisted as monotonic complete snapshots, and the internal topic is compacted with unlimited retention rather than inheriting application delete retention. Replay corruption or inconsistency keeps readiness false and never falls back to an empty coordinator. Earlier single/bulk offset records remain readable. See [Standalone Storage Recovery](standalone-storage-recovery.md) for record and pre-manifest migration details.
+Consumer group registrations, tombstones, and committed next offsets are stored by the standalone broker in versioned records in `__consumer_offsets` and loaded again before readiness. A successful registration survives without a commit; `FETCH_OFFSET` returns `0` for its uncommitted partitions. Successful commits are synchronously persisted as monotonic complete snapshots, and the internal topic is compacted with unlimited retention rather than inheriting application delete retention. Replay corruption, inconsistency, or an unversioned record keeps readiness false and never falls back to an empty coordinator. The offline storage command can inspect earlier record shapes for an explicit operator migration, but the broker runtime does not import them. See [Standalone Storage Recovery](standalone-storage-recovery.md) for the clean-bootstrap procedure.
 
 In distributed mode, offset updates are also applied through the Raft FSM and included in FSM snapshots.
 
@@ -880,13 +820,7 @@ last successful broker commit.
 
 ### Error Response Format
 
-Without feature negotiation, the backward-compatible response is:
-
-```text
-ERROR: <code> [key=value ...]
-```
-
-After negotiating `structured_errors_v1`, every text error generated for that connection includes classification metadata directly after the code:
+Every Wire v2 error response has status `ERROR` and a typed binary payload. Its readable form is:
 
 ```text
 ERROR: <code> class=<class> retryable=<true|false> [key=value ...]
@@ -938,7 +872,7 @@ SDKs should parse the code and fields first, use `class` for broad handling, and
 | `missing_leader_fence command=REPLICATE_MESSAGE` | Internal replication omitted leader ID or epoch | Correct the broker request; do not retry unchanged |
 | `invalid_commit_watermark reason="..."` | Commit watermark is ahead of local durable data or otherwise invalid | Repair/catch up the replica before retrying |
 | `replica_index_prepare_failed reason="..."` | The follower could not prepare its committed event-stream index before HWM advancement | Repair the local index/storage error and retry the HWM commit |
-| invalid_control_batch_bytes field=<key|value> | Broker-internal transaction control bytes are not valid base64 | Reject the internal publish and inspect broker compatibility |
+| invalid_control_batch_bytes field=<key|value> | Broker-internal transaction control bytes are not valid base64 | Reject the internal publish and inspect the producing broker's Wire v2 encoding |
 | `version_conflict current=N expected=N` | Optimistic concurrency failure | Reload aggregate and retry |
 | `event_sourcing_not_enabled topic=<X>` | ES command on non-ES topic | CREATE topic with `event_sourcing=true` |
 | `snapshot_version_exceeds_stream version=N current=N` | Invalid snapshot version | Use version <= current stream version |
@@ -963,7 +897,7 @@ The wire protocol exposes per-topic `auth_policy` metadata: `open`, `deny_write`
 
 Configured users may receive `admin`, `topic.read`, `topic.write`, `group`, `transaction`, or wildcard `*` permissions. Commands that cross boundaries require every applicable permission: `CONSUME`/`STREAM` require `topic.read` plus `group`, `TXN_PUBLISH` requires `transaction` plus `topic.write`, and `SEND_OFFSETS_TO_TXN` requires `transaction` plus `group`. Missing authentication returns `ERROR: authentication_required command=<COMMAND>`; insufficient coarse permission returns `ERROR: NOT_AUTHORIZED_FOR_OPERATION command=<COMMAND> permission=<permission>`.
 
-After coarse authorization, `auth_policy=acl` checks `read_acl` for topic reads and `write_acl` for topic writes, returning `ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=<T> operation=<read|write>` on denial. Internal broker contexts bypass client permissions but remain subject to the separate internal-listener/token boundary. This is a token authentication contract, not a mechanism-specific SASL byte protocol; use TLS/mTLS and network controls across trust boundaries. An omitted `permissions` list retains legacy full access for an authenticated user and should be avoided in least-privilege deployments.
+After coarse authorization, `auth_policy=acl` checks `read_acl` for topic reads and `write_acl` for topic writes, returning `ERROR: NOT_AUTHORIZED_FOR_TOPIC topic=<T> operation=<read|write>` on denial. Internal broker contexts bypass client permissions but remain subject to the separate internal-listener/token boundary. This is a token authentication contract, not a mechanism-specific SASL byte protocol; use TLS/mTLS and network controls across trust boundaries. Every configured principal requires an explicit non-empty permission list; invalid authentication configuration fails startup.
 
 ### Retention
 
@@ -997,7 +931,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - Broker tracks the last seen `(epoch, seqNum)` per `(producerId)` per partition
 - Disk-backed partitions persist producer sequence checkpoints, rebuild producer state from partition logs on broker restart, and use that state to make transactional commit recovery idempotent
 - Distributed FSM snapshots also include producer sequence state for replicated message commands
-- Producer epochs entered FSM snapshot version 3, transaction state version 4, committed partition watermarks version 5, durable topic definitions version 6, and revision/replication fields version 7. Current brokers write version 7. Do not run a mixed-version rolling upgrade with binaries that cannot decode version 7; upgrade the cluster together or use an explicitly documented compatibility procedure.
+- Distributed recovery writes and accepts only FSM snapshot version 9. Every partition includes explicit committed-HWM provenance; older persistent state requires a full clean bootstrap.
 - Producer state expires from memory after `producer_state_ttl_ms` of inactivity (default 30 minutes); durable checkpoints retain the last persisted sequence until the partition data is removed
 
 ---
@@ -1006,15 +940,14 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 
 ### Required
 
-- [ ] TCP connection with length-prefixed framing (4-byte BE)
-- [ ] Binary batch encoding/decoding (0xBA7C magic)
-- [ ] Text command formatting
+- [ ] Required Wire v2 handshake and exact version enforcement
+- [ ] CRS2 frame encoding/decoding, CRC32C, request correlation, and explicit compression
+- [ ] CBV2 batch and CRQ2 command payload encoding/decoding
 - [ ] JSON response parsing (AckResponse, DESCRIBE, GROUP_STATUS)
 - [ ] Consumer group lifecycle (JOIN → SYNC → HEARTBEAT → CONSUME → COMMIT)
 - [ ] Broker-owned offset resume, monotonic `nextOffset` commits, and `auto_offset_reset` gap handling
 - [ ] Explicit `read_committed` / `read_uncommitted` on `CONSUME` and `STREAM`
-- [ ] Error response parsing, including quoted values
-- [ ] `PROTOCOL_INFO` discovery and connection-scoped `NEGOTIATE`
+- [ ] Typed binary error payload parsing
 - [ ] Structured error class and retry eligibility handling
 - [ ] Leader redirect handling
 

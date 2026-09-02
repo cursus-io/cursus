@@ -298,6 +298,13 @@ func (ch *CommandHandler) checkPartitionLeaderOrRedirect(conn net.Conn, topicNam
 	}
 
 	leaderAddr := ch.resolvePartitionLeaderAddr(topicName, partitionID)
+	if leaderAddr == "" {
+		errResp := fmt.Sprintf("ERROR: leader_not_found topic=%s partition=%d", topicName, partitionID)
+		if err := util.WriteWithLength(conn, []byte(errResp)); err != nil {
+			return fmt.Errorf("failed to send missing partition leader response: %w", err)
+		}
+		return fmt.Errorf("partition leader not found")
+	}
 	errResp := fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", leaderAddr)
 	if err := util.WriteWithLength(conn, []byte(errResp)); err != nil {
 		return fmt.Errorf("failed to send partition leader redirect: %w", err)

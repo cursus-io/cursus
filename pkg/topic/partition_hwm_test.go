@@ -144,6 +144,17 @@ func TestPartition_RecoversProducerStateFromLogWithoutCheckpoint(t *testing.T) {
 	require.Len(t, msgs, 1)
 	require.Equal(t, "first", msgs[0].Payload)
 }
+
+func TestDecodeProducerStateCheckpointRequiresVersionTwo(t *testing.T) {
+	_, err := decodeProducerStateCheckpoint([]byte(`{"producer-1":1}`))
+	require.ErrorContains(t, err, "clean bootstrap required")
+
+	checkpoint, err := decodeProducerStateCheckpoint([]byte(`{"version":2,"producers":{"producer-1":{"epoch":3,"seq":7}}}`))
+	require.NoError(t, err)
+	require.Equal(t, producerStateCheckpointVersion, checkpoint.Version)
+	require.Equal(t, producerStateCheckpointEntry{Epoch: 3, Seq: 7}, checkpoint.Producers["producer-1"])
+}
+
 func TestPartition_ProducerEpochFencing(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

@@ -649,7 +649,7 @@ func normalizeAndMarshalManifest(definitions []Definition) ([]Definition, []byte
 		normalized = append(normalized, definition)
 	}
 	sort.Slice(normalized, func(i, j int) bool { return normalized[i].Name < normalized[j].Name })
-	data, err := json.MarshalIndent(topicMetadataManifest{Version: topicMetadataWriteVersion(normalized), Topics: normalized}, "", "  ")
+	data, err := json.MarshalIndent(topicMetadataManifest{Version: topicMetadataFormatVersion, Topics: normalized}, "", "  ")
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal topic metadata: %w", err)
 	}

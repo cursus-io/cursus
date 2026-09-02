@@ -792,21 +792,21 @@ func TestMatchTopicPattern_QuestionMark(t *testing.T) {
 }
 
 func TestMatchCacheEviction(t *testing.T) {
-	origMax := maxCacheSize
-	maxCacheSize = 2
-	defer func() { maxCacheSize = origMax }()
+	origMax := maxTopicPatternCacheSize
+	maxTopicPatternCacheSize = 2
+	defer func() { maxTopicPatternCacheSize = origMax }()
 
-	regexMu.Lock()
-	regexCache = make(map[string]*regexp.Regexp)
-	regexMu.Unlock()
+	topicPatternMu.Lock()
+	topicPatternCache = make(map[string]*regexp.Regexp)
+	topicPatternMu.Unlock()
 
-	assert.True(t, match("a*", "abc"))
-	assert.True(t, match("b*", "bcd"))
-	assert.True(t, match("c*", "cde"))
+	assert.True(t, matchTopicPattern("a*", "abc"))
+	assert.True(t, matchTopicPattern("b*", "bcd"))
+	assert.True(t, matchTopicPattern("c*", "cde"))
 
-	regexMu.RLock()
-	size := len(regexCache)
-	regexMu.RUnlock()
+	topicPatternMu.RLock()
+	size := len(topicPatternCache)
+	topicPatternMu.RUnlock()
 	assert.LessOrEqual(t, size, 3)
 }
 

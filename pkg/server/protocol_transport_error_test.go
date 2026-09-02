@@ -5,17 +5,15 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
-	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 )
 
-func TestNegotiatedTransportErrorsAreStructured(t *testing.T) {
+func TestWireTransportErrorsAreStructured(t *testing.T) {
 	client, server := newTestConnPair(t)
 	defer func() { _ = client.Close() }()
 	defer func() { _ = server.Close() }()
 
 	handler := controller.NewCommandHandler(nil, config.DefaultConfig(), nil, nil, nil)
 	ctx := controller.NewClientContext("default-group", 0)
-	ctx.SetProtocol(1, []wireprotocol.Feature{wireprotocol.FeatureStructuredErrorsV1})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

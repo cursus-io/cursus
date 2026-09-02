@@ -49,15 +49,16 @@ func TestDeleteFailsWithActiveTransactionAndPrunesTerminalReferences(t *testing.
 	ctx := NewClientContext("", 0)
 	require.True(t, strings.HasPrefix(handler.HandleCommand("CREATE topic=orders partitions=1", ctx), "OK "))
 	handler.TxnManager.ApplySnapshot(&transaction.Snapshot{
-		ID: "tx-orders", State: transaction.StateOpen,
-		Messages: []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
+		ID: "tx-orders", Producer: "producer", Revision: 1, State: transaction.StateOpen,
+		Messages:  []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	})
 
 	require.Contains(t, handler.HandleCommand("DELETE topic=orders", ctx), "topic_delete_blocked")
 	require.NotNil(t, handler.TopicManager.GetTopic("orders"))
 
 	handler.TxnManager.ApplySnapshot(&transaction.Snapshot{
-		ID: "tx-orders", State: transaction.StateCommitted, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		ID: "tx-orders", Producer: "producer", Revision: 2, State: transaction.StateCommitted, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		Messages: []transaction.MessageOperation{{Topic: "orders", Partition: 0}, {Topic: "audit", Partition: 0}},
 	})
 	require.Equal(t, "OK topic=orders deleted=true", handler.HandleCommand("DELETE topic=orders", ctx))
@@ -72,7 +73,7 @@ func TestDeleteRewritesStandaloneTransactionJournalWithoutTopicReferences(t *tes
 	ctx := NewClientContext("", 0)
 	require.True(t, strings.HasPrefix(handler.HandleCommand("CREATE topic=orders partitions=1", ctx), "OK "))
 	handler.TxnManager.ApplySnapshot(&transaction.Snapshot{
-		ID: "tx-orders", State: transaction.StateCommitted, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		ID: "tx-orders", Producer: "producer", Revision: 1, State: transaction.StateCommitted, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		Messages: []transaction.MessageOperation{{Topic: "orders", Partition: 0}, {Topic: "audit", Partition: 0}},
 	})
 	require.NoError(t, handler.syncTransactionState("tx-orders"))
@@ -92,7 +93,7 @@ func TestDeleteDoesNotPruneDependenciesBeforeLogicalCommit(t *testing.T) {
 	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
 	require.NoError(t, groupCoordinator.CommitOffset("workers", "orders", 0, 17))
 	handler.TxnManager.ApplySnapshot(&transaction.Snapshot{
-		ID: "tx-orders", State: transaction.StateCommitted, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		ID: "tx-orders", Producer: "producer", Revision: 1, State: transaction.StateCommitted, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		Messages: []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
 	})
 	handler.TopicManager.SetDeleteHook(func(string) error { return errors.New("injected pre-commit failure") })
@@ -131,7 +132,7 @@ func TestStandaloneTruncateRequiresRevisionAndResetsLifecycleState(t *testing.T)
 	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
 	require.NoError(t, groupCoordinator.CommitOffset("workers", "orders", 0, 17))
 	handler.TxnManager.ApplySnapshot(&transaction.Snapshot{
-		ID: "tx-orders", State: transaction.StateCommitted, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		ID: "tx-orders", Producer: "producer", Revision: 1, State: transaction.StateCommitted, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		Messages: []transaction.MessageOperation{{Topic: "orders", Partition: 0}, {Topic: "audit", Partition: 0}},
 	})
 

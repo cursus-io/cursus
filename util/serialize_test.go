@@ -57,7 +57,7 @@ func TestDeserializeMessage_ErrorCases(t *testing.T) {
 
 	_, err = DeserializeDiskMessage([]byte{0})
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "topic length")
+	assert.Contains(t, err.Error(), "unsupported disk message format")
 
 	// Malformed length-prefixes (claims to have more data than provided)
 	// DeserializeMessage: [2 bytes producer length] [producer ID...]
@@ -65,8 +65,8 @@ func TestDeserializeMessage_ErrorCases(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "producer ID")
 
-	// DeserializeDiskMessage: [2 bytes topic length] [topic...] [4 bytes partition] ...
-	_, err = DeserializeDiskMessage([]byte{0, 5, 't', 'e', 's', 't', '1'}) // claims 5 bytes topic, OK, but missing partition
+	// DeserializeDiskMessage: [CDM2] [2 bytes topic length] [topic...] [4 bytes partition] ...
+	_, err = DeserializeDiskMessage([]byte{'C', 'D', 'M', '2', 0, 5, 't', 'e', 's', 't', '1'}) // claims 5 bytes topic, OK, but missing partition
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "partition")
 
@@ -126,34 +126,28 @@ func TestDeserializeDiskMessage_TruncatedEventSourcingFields(t *testing.T) {
 	assert.Contains(t, err.Error(), "incomplete")
 }
 
-func TestDeserializeDiskMessage_OldFormatNoEventSourcing(t *testing.T) {
-	// Serialize with empty event-sourcing fields, then strip the ES trailer
+func TestDeserializeDiskMessageRejectsIncompleteStorageV2Record(t *testing.T) {
 	msg := types.DiskMessage{
-		Topic:      "legacy-topic",
+		Topic:      "orders",
 		Partition:  1,
 		Offset:     50,
-		ProducerID: "old-prod",
+		ProducerID: "producer",
 		SeqNum:     5,
 		Epoch:      500,
-		Payload:    "old-payload",
+		Payload:    "payload",
 	}
 
 	data, err := SerializeDiskMessage(msg)
 	assert.NoError(t, err)
 
-	// Empty-field trailer: ES(16) + Key(2) + transaction(6) + control-batch(16) = 40 bytes
-	oldData := data[:len(data)-40]
+	_, err = DeserializeDiskMessage(data[:len(data)-40])
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "incomplete")
+}
 
-	got, err := DeserializeDiskMessage(oldData)
-	assert.NoError(t, err)
-	assert.Equal(t, msg.Topic, got.Topic)
-	assert.Equal(t, msg.Payload, got.Payload)
-	assert.Equal(t, msg.ProducerID, got.ProducerID)
-	// Event-sourcing fields should be zero-valued
-	assert.Equal(t, "", got.EventType)
-	assert.Equal(t, uint32(0), got.SchemaVersion)
-	assert.Equal(t, uint64(0), got.AggregateVersion)
-	assert.Equal(t, "", got.Metadata)
+func TestDeserializeDiskMessageRejectsLegacyUnversionedRecord(t *testing.T) {
+	_, err := DeserializeDiskMessage([]byte{0, 6, 'o', 'r', 'd', 'e', 'r', 's'})
+	assert.ErrorContains(t, err, "clean bootstrap required")
 }
 
 func TestDiskMessageSerialization_EmptyFields(t *testing.T) {

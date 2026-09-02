@@ -18,7 +18,6 @@ import (
 
 const (
 	topicMetadataFormatVersion = 3
-	oldestTopicMetadataVersion = 1
 	maxTopicMetadataBytes      = 16 << 20
 	maxTopicNameBytes          = 249
 	TopicMetadataFileName      = config.TopicMetadataFileName
@@ -66,16 +65,13 @@ func (d Definition) Normalize() (Definition, error) {
 }
 
 func validateDefinitionVersionFields(version int, definition Definition) error {
-	if version < 2 {
-		return nil
-	}
 	if definition.Revision == 0 {
 		return fmt.Errorf("revision must be present in topic metadata version %d", version)
 	}
 	if definition.ReplicationFactor == 0 {
 		return fmt.Errorf("replication_factor must be present in topic metadata version %d", version)
 	}
-	if version >= 3 && definition.LifecycleEpoch == 0 {
+	if definition.LifecycleEpoch == 0 {
 		return fmt.Errorf("lifecycle_epoch must be present in topic metadata version %d", version)
 	}
 	return nil
@@ -186,8 +182,8 @@ func (s *topicMetadataStore) Load() (_ []Definition, err error) {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("decode topic metadata trailing content")
 	}
-	if manifest.Version < oldestTopicMetadataVersion || manifest.Version > topicMetadataFormatVersion {
-		return nil, fmt.Errorf("unsupported topic metadata version %d", manifest.Version)
+	if manifest.Version != topicMetadataFormatVersion {
+		return nil, fmt.Errorf("unsupported topic metadata version %d; clean bootstrap required", manifest.Version)
 	}
 
 	seen := make(map[string]struct{}, len(manifest.Topics))
@@ -246,7 +242,7 @@ func (s *topicMetadataStore) Save(definitions []Definition) (err error) {
 	sort.Slice(normalized, func(i, j int) bool { return normalized[i].Name < normalized[j].Name })
 
 	data, err := json.MarshalIndent(topicMetadataManifest{
-		Version: topicMetadataWriteVersion(normalized),
+		Version: topicMetadataFormatVersion,
 		Topics:  normalized,
 	}, "", "  ")
 	if err != nil {
@@ -290,17 +286,6 @@ func (s *topicMetadataStore) Save(definitions []Definition) (err error) {
 		}
 	}
 	return nil
-}
-
-func topicMetadataWriteVersion(definitions []Definition) int {
-	for _, definition := range definitions {
-		if definition.LifecycleEpoch > InitialLifecycleEpoch {
-			return topicMetadataFormatVersion
-		}
-	}
-	// Keep first-generation manifests readable by the previous release during
-	// a rolling upgrade. The first truncate is the irreversible format boundary.
-	return 2
 }
 
 func writeMetadataFile(file *os.File, data []byte) error {

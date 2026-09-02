@@ -1,12 +1,12 @@
 # Command Interface
 
-Cursus clients use 4-byte big-endian length-prefixed frames over TCP. Most requests contain a UTF-8 text command with `key=value` parameters. Successful text responses start with `OK`; failures start with `ERROR: <code>`. Binary consume/stream frames are documented separately in the [wire protocol specification](../protocol-spec.md).
+Cursus clients use Wire v2 `CRS2` frames over TCP after a required binary handshake. The frame header carries the command ID and request ID; most payloads use the deterministic `CRQ2` field schema. The text forms in this document are readable representations of those fields. Binary batches and stream frames are documented in the [wire protocol specification](../protocol-spec.md).
 
 ## Command Map
 
 | Area | Commands | Route |
 |---|---|---|
-| Protocol and auth | `PROTOCOL_INFO`, `NEGOTIATE`, `AUTH` | Any broker |
+| Connection and auth | Wire v2 binary handshake, `AUTH` | Any broker |
 | Topic admin | `CREATE`, `DELETE`, `TRUNCATE`, `LIST`, `DESCRIBE`, `HELP` | Any broker; distributed mutations use metadata consensus |
 | Produce and read | `PUBLISH`, `CONSUME`, `STREAM`, `LIST_OFFSETS` | Partition leader |
 | Consumer groups | `REGISTER_GROUP`, `FIND_COORDINATOR`, `JOIN_GROUP`, `SYNC_GROUP`, `HEARTBEAT`, `LEAVE_GROUP`, `GROUP_STATUS`, `FETCH_OFFSET`, `COMMIT_OFFSET`, `BATCH_COMMIT` | Group coordinator except discovery |

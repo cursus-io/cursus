@@ -1,7 +1,6 @@
 package fsm
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"github.com/cursus-io/cursus/pkg/coordinator"
@@ -10,6 +9,7 @@ import (
 
 func (f *BrokerFSM) applyOffsetSyncCommand(jsonData string) interface{} {
 	var cmd struct {
+		ReqID      string `json:"req_id,omitempty"`
 		Group      string `json:"group"`
 		Topic      string `json:"topic"`
 		Member     string `json:"member"`
@@ -18,7 +18,7 @@ func (f *BrokerFSM) applyOffsetSyncCommand(jsonData string) interface{} {
 		Offset     uint64 `json:"offset"`
 	}
 
-	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
+	if err := decodeStrictJSON([]byte(jsonData), &cmd); err != nil {
 		util.Error("Failed to unmarshal offset sync: %v", err)
 		return err
 	}
@@ -29,20 +29,11 @@ func (f *BrokerFSM) applyOffsetSyncCommand(jsonData string) interface{} {
 		return err
 	}
 
-	if cmd.Member != "" && cmd.Generation != nil {
-		return f.cd.ApplyFencedOffsetUpdateFromFSM(cmd.Group, cmd.Topic, cmd.Member, *cmd.Generation,
-			[]coordinator.OffsetItem{{
-				Partition: cmd.Partition,
-				Offset:    cmd.Offset,
-			}})
+	if cmd.Group == "" || cmd.Topic == "" || cmd.Member == "" || cmd.Generation == nil {
+		return fmt.Errorf("OFFSET_SYNC requires group, topic, member, and generation")
 	}
-	err := f.cd.ApplyOffsetUpdateFromFSM(cmd.Group, cmd.Topic,
-		[]coordinator.OffsetItem{
-			{
-				Partition: cmd.Partition,
-				Offset:    cmd.Offset,
-			},
-		})
+	err := f.cd.ApplyFencedOffsetUpdateFromFSM(cmd.Group, cmd.Topic, cmd.Member, *cmd.Generation,
+		[]coordinator.OffsetItem{{Partition: cmd.Partition, Offset: cmd.Offset}})
 	if err != nil {
 		util.Error("FSM: Failed to sync offset: %v", err)
 		return err
@@ -52,6 +43,7 @@ func (f *BrokerFSM) applyOffsetSyncCommand(jsonData string) interface{} {
 
 func (f *BrokerFSM) applyBatchOffsetSyncCommand(jsonData string) interface{} {
 	var cmd struct {
+		ReqID      string                   `json:"req_id,omitempty"`
 		Group      string                   `json:"group"`
 		Topic      string                   `json:"topic"`
 		Member     string                   `json:"member"`
@@ -59,7 +51,7 @@ func (f *BrokerFSM) applyBatchOffsetSyncCommand(jsonData string) interface{} {
 		Offsets    []coordinator.OffsetItem `json:"offsets"`
 	}
 
-	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
+	if err := decodeStrictJSON([]byte(jsonData), &cmd); err != nil {
 		util.Error("Failed to unmarshal batch offset sync: %v", err)
 		return err
 	}
@@ -70,10 +62,10 @@ func (f *BrokerFSM) applyBatchOffsetSyncCommand(jsonData string) interface{} {
 		return err
 	}
 
-	if cmd.Member != "" && cmd.Generation != nil {
-		return f.cd.ApplyFencedOffsetUpdateFromFSM(cmd.Group, cmd.Topic, cmd.Member, *cmd.Generation, cmd.Offsets)
+	if cmd.Group == "" || cmd.Topic == "" || cmd.Member == "" || cmd.Generation == nil {
+		return fmt.Errorf("BATCH_OFFSET requires group, topic, member, and generation")
 	}
-	err := f.cd.ApplyOffsetUpdateFromFSM(cmd.Group, cmd.Topic, cmd.Offsets)
+	err := f.cd.ApplyFencedOffsetUpdateFromFSM(cmd.Group, cmd.Topic, cmd.Member, *cmd.Generation, cmd.Offsets)
 	if err != nil {
 		util.Error("FSM: Failed to update coordinator state: %v", err)
 		return err

@@ -14,10 +14,8 @@ func TestSDKTopicEntryPointsRejectInvalidNameBeforeNetwork(t *testing.T) {
 
 	consumerConfig := NewDefaultConsumerConfig()
 	consumerConfig.Topic = "../escape"
-	consumer, err := NewConsumer(consumerConfig)
-	require.NoError(t, err)
-	defer consumer.mainCancel()
-	require.ErrorContains(t, consumer.Start(func(Message) error { return nil }), "invalid topic name")
+	_, err = NewConsumer(consumerConfig)
+	require.ErrorContains(t, err, "invalid topic name")
 
 	store := NewEventStore("127.0.0.1:1", "../escape", "producer")
 	require.ErrorContains(t, store.CreateTopic(1), "invalid topic name")

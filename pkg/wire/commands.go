@@ -54,7 +54,6 @@ const (
 	CommandRaftApply
 	CommandMetadata
 	CommandInternalBatch
-	CommandProtocolInfo
 	CommandNegotiate
 	CommandExit
 	CommandJoinCluster
@@ -109,7 +108,6 @@ var commandNames = [...]string{
 	CommandRaftApply:         "RAFT_APPLY",
 	CommandMetadata:          "METADATA",
 	CommandInternalBatch:     "INTERNAL_BATCH",
-	CommandProtocolInfo:      "PROTOCOL_INFO",
 	CommandNegotiate:         "NEGOTIATE",
 	CommandExit:              "EXIT",
 	CommandJoinCluster:       "JOIN_CLUSTER",

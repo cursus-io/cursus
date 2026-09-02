@@ -106,10 +106,10 @@ func (pc *ProducerClient) connectPartitionLocked(idx int, addr string) error {
 		_ = tcpConn.SetWriteBuffer(2 * 1024 * 1024)
 	}
 
-	conn, err = negotiateConfiguredProtocol(conn, pc.config.ProtocolVersion, pc.config.ProtocolFeatures, pc.config.RequireProtocolFeatures, pc.config.ProtocolNegotiationTimeoutMS, pc.config.CompressionType)
+	conn, err = openWireConnection(conn, pc.config.HandshakeTimeoutMS, pc.config.CompressionType)
 	if err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("protocol negotiation with %s failed: %w", addr, err)
+		return fmt.Errorf("Wire v2 handshake with %s failed: %w", addr, err)
 	}
 	if err := authenticateConfiguredClient(conn, pc.config.Principal, pc.config.AuthToken); err != nil {
 		_ = conn.Close()

@@ -8,7 +8,7 @@ This index separates normative contracts from implementation notes. When prose c
 - [Installation](user-guide/installation.md): source builds, binaries, Docker, and GHCR images.
 - [Configuration](user-guide/configuration.md): files, environment variables, CLI flags, security, storage, cluster, and SDK options.
 - [Architecture](architecture.md): standalone and clustered data/control paths and their guarantees.
-- [SDK Overview](sdk-overview.md): Go, Java, and Python compatibility plus high-level client behavior.
+- [SDK Overview](sdk-overview.md): the in-repository Go SDK contract and external SDK migration status.
 
 ## Normative Contracts
 

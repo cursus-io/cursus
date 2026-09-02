@@ -337,29 +337,20 @@ func (ch *CommandHandler) resolvePartitionLeaderAddr(topicName string, partition
 
 	fsmRef := ch.Cluster.RaftManager.GetFSM()
 	if fsmRef == nil {
-		return ch.fallbackClientAddr()
+		return ""
 	}
 
 	partitionKey := fmt.Sprintf("%s-%d", topicName, partitionID)
 	meta := fsmRef.GetPartitionMetadata(partitionKey)
 	if meta == nil {
-		return ch.fallbackClientAddr()
+		return ""
 	}
 
 	broker := fsmRef.GetBroker(meta.Leader)
 	if broker == nil {
-		return ch.fallbackClientAddr()
+		return ""
 	}
-
-	if broker.ClientAddr != "" {
-		return broker.ClientAddr
-	}
-
-	// Legacy fallback: derive from Raft addr
-	if h, _, err := net.SplitHostPort(broker.Addr); err == nil {
-		return fmt.Sprintf("%s:%d", h, ch.Cluster.Router.ClientPort())
-	}
-	return ch.fallbackClientAddr()
+	return broker.ClientAddr
 }
 
 func (ch *CommandHandler) fallbackClientAddr() string {

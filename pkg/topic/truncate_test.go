@@ -24,7 +24,7 @@ func TestTruncateTopicDurableResetsRecordsOffsetsAndProducerState(t *testing.T) 
 	t.Cleanup(manager.Stop)
 
 	require.NoError(t, manager.CreateTopic("orders", 1, true, false))
-	require.Equal(t, 2, readTopicManifestVersion(t, cfg.LogDir), "first lifecycle preserves the rolling-upgrade format")
+	require.Equal(t, topicMetadataFormatVersion, readTopicManifestVersion(t, cfg.LogDir))
 	require.NoError(t, manager.PublishToPartitionWithAck("orders", 0, &types.Message{
 		Payload: "old", ProducerID: "producer-1", Epoch: 1, SeqNum: 1,
 	}))
@@ -36,7 +36,7 @@ func TestTruncateTopicDurableResetsRecordsOffsetsAndProducerState(t *testing.T) 
 	require.True(t, result.Truncated)
 	require.True(t, result.CleanupPending)
 	require.True(t, manager.IsTruncationPending("orders"))
-	require.Equal(t, 3, readTopicManifestVersion(t, cfg.LogDir), "truncate commits the epoch-aware manifest format")
+	require.Equal(t, topicMetadataFormatVersion, readTopicManifestVersion(t, cfg.LogDir))
 	require.Nil(t, manager.GetTopic("orders"), "pending truncate must fence all direct topic access")
 	require.ErrorContains(t, manager.MetadataReadinessError(), "topic truncation(s) pending")
 	require.NoError(t, manager.CompleteTruncation("orders"))

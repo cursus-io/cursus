@@ -100,6 +100,11 @@ func NewProducerWithContext(ctx context.Context, cfg *PublisherConfig) (*Produce
 	if err != nil {
 		return nil, fmt.Errorf("create producer client: %w", err)
 	}
+	bootstrap := &Producer{config: cfg}
+	if err := bootstrap.createConfiguredTopic(); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
 
 	p := &Producer{
 		config:           cfg,
@@ -126,10 +131,6 @@ func NewProducerWithContext(ctx context.Context, cfg *PublisherConfig) (*Produce
 	p.partitionBatchMus = make([]sync.Mutex, cfg.Partitions)
 	for i := 0; i < cfg.Partitions; i++ {
 		p.partitionBatchStates[i] = make(map[string]*BatchState)
-	}
-
-	if err := p.CreateTopic(cfg.Topic, cfg.Partitions); err != nil {
-		LogError("failed to create topic '%s': %v", cfg.Topic, err)
 	}
 
 	p.fetchMetadata()
@@ -178,7 +179,7 @@ func (p *Producer) fetchMetadata() {
 		if err != nil {
 			continue
 		}
-		conn, err = negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS, p.config.CompressionType)
+		conn, err = openWireConnection(conn, p.config.HandshakeTimeoutMS, p.config.CompressionType)
 		if err != nil {
 			_ = conn.Close()
 			continue
@@ -255,6 +256,16 @@ func (p *Producer) CreateTopic(topic string, partitions int) error {
 	return p.CreateTopicWithOptions(topic, TopicOptions{Partitions: partitions})
 }
 
+func (p *Producer) createConfiguredTopic() error {
+	if p == nil || p.config == nil || !p.config.AutoCreateTopics {
+		return nil
+	}
+	if err := p.CreateTopic(p.config.Topic, p.config.Partitions); err != nil {
+		return fmt.Errorf("auto-create topic %q: %w", p.config.Topic, err)
+	}
+	return nil
+}
+
 // CreateTopicWithOptions creates or updates a topic with explicit policy options.
 func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) error {
 	createCmd, err := buildCreateTopicCommand(topic, options, p.config.EnableIdempotence)
@@ -271,9 +282,9 @@ func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) er
 	}
 	defer func() { _ = conn.Close() }()
 
-	conn, err = negotiateConfiguredProtocol(conn, p.config.ProtocolVersion, p.config.ProtocolFeatures, p.config.RequireProtocolFeatures, p.config.ProtocolNegotiationTimeoutMS, p.config.CompressionType)
+	conn, err = openWireConnection(conn, p.config.HandshakeTimeoutMS, p.config.CompressionType)
 	if err != nil {
-		return fmt.Errorf("protocol negotiation: %w", err)
+		return fmt.Errorf("Wire v2 handshake: %w", err)
 	}
 	if err := authenticateConfiguredClient(conn, p.config.Principal, p.config.AuthToken); err != nil {
 		return fmt.Errorf("authentication: %w", err)
@@ -451,11 +462,6 @@ func (p *Producer) Send(payload string) (uint64, error) {
 	buf.cond.Signal()
 
 	return seqNum, nil
-}
-
-// PublishMessage is an alias for Send, for compatibility with test/publisher.
-func (p *Producer) PublishMessage(payload string) (uint64, error) {
-	return p.Send(payload)
 }
 
 func (p *Producer) partitionSender(part int) {

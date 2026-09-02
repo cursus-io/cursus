@@ -105,7 +105,7 @@ curl -f http://localhost:9080/ready
 curl -f http://localhost:9100/metrics
 ```
 
-The client port is a length-prefixed TCP protocol, so raw `nc` text without the 4-byte frame is not a valid protocol check. Use `bin/cursus-cli`, a supported SDK, or the E2E client helpers.
+The client port accepts only Wire v2, so raw `nc` text without the required handshake and `CRS2` frame is not a valid protocol check. Use `bin/cursus-cli`, a supported SDK, or the E2E client helpers.
 
 Run local validation:
 

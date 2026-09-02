@@ -1,12 +1,12 @@
 # Standalone Storage Recovery
 
-This runbook covers durable standalone topic, consumer-group, and committed-offset recovery, including storage created by pre-manifest builds such as `c77fb974`. Run migration commands only while every broker process that can write the target directory is stopped. Take a volume snapshot or immutable copy first.
+This runbook covers offline inspection and explicit migration of standalone topic, consumer-group, and committed-offset storage. The broker runtime accepts only the current manifest and versioned metadata formats; older pre-manifest data must be converted on a stopped copy or replaced by a clean bootstrap. Run migration commands only while every broker process that can write the target directory is stopped. Take a volume snapshot or immutable copy first.
 
 ## Recovery contract
 
 Standalone startup is ordered and fail-closed:
 
-1. Load and validate `{log_dir}/__topic_metadata.json`.
+1. Load and validate the version-3 `{log_dir}/__topic_metadata.json`.
 2. Restore every declared topic and validate the broker-owned `__consumer_offsets` topic.
 3. Replay durable group registrations and tombstones by lifecycle epoch.
 4. Replay complete committed-next-offset snapshots by revision.
@@ -63,7 +63,7 @@ Registration and tombstone records share a stable `cursus.consumer.group.v1.<sha
 
 The internal topic is always forced to compact cleanup with unlimited time/size retention. Broker defaults and application `CREATE` policy cannot enable delete retention, set a retention limit, change its mode, or delete the topic. Compaction must retain the latest lifecycle record and latest complete offset snapshot for every semantic key.
 
-The decoder still accepts the earlier single-offset and bulk-offset JSON payloads. When no versioned lifecycle exists, a legacy group can be synthesized only when its records identify exactly one topic; the highest observed partition supplies the minimum recoverable partition set. The explicit migration below is required to preserve the full partition count for pre-manifest storage, including groups that never committed an offset.
+The broker runtime decoder rejects earlier single-offset and bulk-offset JSON payloads. The read-only storage inspector can identify those records, and the offline migration command can copy only operator-selected values into a versioned migration authority file. When no versioned lifecycle exists, the migration tool accepts a group only when its selected records identify exactly one topic; the operator must still supply the authoritative partition count, including for groups that never committed an offset.
 
 ## Read-only inventory
 
@@ -78,7 +78,7 @@ The full manifest inventory reports every topic and partition, active and `.dele
 
 A `.log.deleted` consumer-offset segment is never renamed or automatically returned to the live log. Without an explicit migration selection, its presence prevents the internal handler from opening. Selecting one of its records copies only the operator-approved semantic value into the migration authority file; the `.deleted` evidence remains unchanged.
 
-## Migrating a c77 pre-manifest directory
+## Migrating a pre-manifest directory
 
 Do this on an offline snapshot or with all writers stopped.
 

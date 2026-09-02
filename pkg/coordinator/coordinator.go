@@ -78,7 +78,7 @@ type GroupMetadata struct {
 	LastRebalance     time.Time                  // Timestamp of last rebalance
 	LastActivity      time.Time                  // Timestamp of last heartbeat or lifecycle activity
 	Offsets           map[string]map[int]uint64  // topic -> partition -> next offset
-	RegistrationEpoch uint64                     // durable lifecycle epoch; zero is legacy
+	RegistrationEpoch uint64                     // durable lifecycle epoch
 	OffsetRevisions   map[string]uint64          // topic -> durable snapshot revision
 }
 
@@ -230,33 +230,30 @@ func NewCoordinatorWithRecovery(ctx context.Context, cfg *config.Config, handler
 		c.setRecoveryFailure(recoveryErr)
 		return c, recoveryErr
 	}
-	if provider, ok := handler.(consumerMetadataMigrationProvider); ok {
-		records, authoritative, err := provider.ConsumerMetadataMigrationRecords()
-		if err != nil {
-			recoveryErr := fmt.Errorf("load consumer metadata migration: %w", err)
-			c.setRecoveryFailure(recoveryErr)
-			return c, recoveryErr
-		}
-		c.migrationRecords = append([]ConsumerMetadataRecord(nil), records...)
-		c.migrationAuthoritative = authoritative
-	}
-	if reader, ok := handler.(OffsetLogReader); ok {
-		var recoveryErr error
-		if c.standalone {
-			recoveryErr = c.LoadOffsetsFromLog(reader)
-		} else {
-			var status ConsumerMetadataRecoveryStatus
-			status, recoveryErr = c.loadDistributedOffsetsFromLog(reader)
-			if recoveryErr == nil {
-				c.markRecoveryComplete(status)
+	if c.standalone {
+		if provider, ok := handler.(consumerMetadataMigrationProvider); ok {
+			records, authoritative, err := provider.ConsumerMetadataMigrationRecords()
+			if err != nil {
+				recoveryErr := fmt.Errorf("load consumer metadata migration: %w", err)
+				c.setRecoveryFailure(recoveryErr)
+				return c, recoveryErr
 			}
+			c.migrationRecords = append([]ConsumerMetadataRecord(nil), records...)
+			c.migrationAuthoritative = authoritative
 		}
-		if recoveryErr != nil {
-			wrapped := fmt.Errorf("replay internal consumer metadata from %q: %w", c.offsetTopic, recoveryErr)
-			c.setRecoveryFailure(wrapped)
-			return c, wrapped
+		if reader, ok := handler.(OffsetLogReader); ok {
+			if recoveryErr := c.LoadOffsetsFromLog(reader); recoveryErr != nil {
+				wrapped := fmt.Errorf("replay internal consumer metadata from %q: %w", c.offsetTopic, recoveryErr)
+				c.setRecoveryFailure(wrapped)
+				return c, wrapped
+			}
+		} else {
+			c.markRecoveryComplete(ConsumerMetadataRecoveryStatus{})
 		}
 	} else {
+		// Distributed consumer metadata is restored exclusively through the
+		// versioned Raft snapshot and log. The local internal topic is not an
+		// independent recovery authority.
 		c.markRecoveryComplete(ConsumerMetadataRecoveryStatus{})
 	}
 	recoveryComplete = true
@@ -691,8 +688,12 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 	return result
 }
 
-// ImportState restores consumer group state from a snapshot.
-func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) {
+// ImportState restores consumer group state from a current-version snapshot.
+func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) error {
+	if err := ValidateImportState(state); err != nil {
+		return err
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -716,10 +717,6 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) {
 			RegistrationEpoch: snap.RegistrationEpoch,
 			OffsetRevisions:   make(map[string]uint64, len(snap.OffsetRevisions)),
 		}
-		if group.LastActivity.IsZero() {
-			group.LastActivity = group.LastRebalance
-		}
-
 		for mid, assignments := range snap.Members {
 			group.Members[mid] = &MemberMetadata{
 				ID:            mid,
@@ -738,30 +735,99 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) {
 			group.OffsetRevisions[topic] = revision
 		}
 
-		if len(group.Partitions) == 0 {
-			group.Partitions = inferSnapshotPartitions(snap)
-		}
-
 		c.groups[name] = group
 	}
+	return nil
 }
 
-func inferSnapshotPartitions(snap *GroupStateSnapshot) []int {
-	seen := make(map[int]struct{})
-	for _, assignments := range snap.Members {
-		for _, partition := range assignments {
-			seen[partition] = struct{}{}
+// ValidateImportState rejects incomplete or internally inconsistent group
+// snapshots before any live coordinator state is replaced.
+func ValidateImportState(state map[string]*GroupStateSnapshot) error {
+	for name, snap := range state {
+		if name == "" {
+			return fmt.Errorf("consumer group snapshot has an empty group name")
+		}
+		if snap == nil {
+			return fmt.Errorf("consumer group %q snapshot is nil", name)
+		}
+		if snap.RegistrationEpoch == 0 {
+			return fmt.Errorf("consumer group %q snapshot is missing registration epoch; clean bootstrap is required", name)
+		}
+		if snap.Deleted {
+			if snap.TopicName != "" || snap.Generation != 0 || len(snap.Members) != 0 ||
+				len(snap.Partitions) != 0 || len(snap.Offsets) != 0 || len(snap.OffsetRevisions) != 0 {
+				return fmt.Errorf("consumer group %q tombstone contains live state", name)
+			}
+			continue
+		}
+		if snap.TopicName == "" {
+			return fmt.Errorf("consumer group %q snapshot is missing topic", name)
+		}
+		if snap.Generation < 0 {
+			return fmt.Errorf("consumer group %q snapshot has negative generation %d", name, snap.Generation)
+		}
+		if len(snap.Partitions) == 0 {
+			return fmt.Errorf("consumer group %q snapshot is missing declared partitions; clean bootstrap is required", name)
+		}
+		if snap.LastActivity.IsZero() {
+			return fmt.Errorf("consumer group %q snapshot is missing last activity; clean bootstrap is required", name)
+		}
+
+		declared := make(map[int]struct{}, len(snap.Partitions))
+		for _, partition := range snap.Partitions {
+			if partition < 0 {
+				return fmt.Errorf("consumer group %q snapshot has negative partition %d", name, partition)
+			}
+			if _, duplicate := declared[partition]; duplicate {
+				return fmt.Errorf("consumer group %q snapshot has duplicate partition %d", name, partition)
+			}
+			declared[partition] = struct{}{}
+		}
+		for partition := 0; partition < len(snap.Partitions); partition++ {
+			if _, ok := declared[partition]; !ok {
+				return fmt.Errorf("consumer group %q snapshot partitions must be contiguous from zero", name)
+			}
+		}
+
+		assigned := make(map[int]string, len(declared))
+		for memberID, assignments := range snap.Members {
+			if memberID == "" {
+				return fmt.Errorf("consumer group %q snapshot has an empty member id", name)
+			}
+			memberPartitions := make(map[int]struct{}, len(assignments))
+			for _, partition := range assignments {
+				if _, ok := declared[partition]; !ok {
+					return fmt.Errorf("consumer group %q member %q references undeclared partition %d", name, memberID, partition)
+				}
+				if _, duplicate := memberPartitions[partition]; duplicate {
+					return fmt.Errorf("consumer group %q member %q has duplicate partition %d", name, memberID, partition)
+				}
+				if owner, duplicate := assigned[partition]; duplicate {
+					return fmt.Errorf("consumer group %q partition %d is assigned to both %q and %q", name, partition, owner, memberID)
+				}
+				memberPartitions[partition] = struct{}{}
+				assigned[partition] = memberID
+			}
+		}
+
+		for topicName, offsets := range snap.Offsets {
+			if !groupTopicMatches(snap.TopicName, topicName) {
+				return fmt.Errorf("consumer group %q snapshot offset topic %q does not match registered topic %q", name, topicName, snap.TopicName)
+			}
+			for partition := range offsets {
+				if _, ok := declared[partition]; !ok {
+					return fmt.Errorf("consumer group %q offset references undeclared partition %d", name, partition)
+				}
+			}
+		}
+		for topicName, revision := range snap.OffsetRevisions {
+			if !groupTopicMatches(snap.TopicName, topicName) {
+				return fmt.Errorf("consumer group %q snapshot revision topic %q does not match registered topic %q", name, topicName, snap.TopicName)
+			}
+			if revision == 0 {
+				return fmt.Errorf("consumer group %q snapshot has zero offset revision for topic %q", name, topicName)
+			}
 		}
 	}
-	if topicOffsets := snap.Offsets[snap.TopicName]; topicOffsets != nil {
-		for partition := range topicOffsets {
-			seen[partition] = struct{}{}
-		}
-	}
-	partitions := make([]int, 0, len(seen))
-	for partition := range seen {
-		partitions = append(partitions, partition)
-	}
-	sort.Ints(partitions)
-	return partitions
+	return nil
 }

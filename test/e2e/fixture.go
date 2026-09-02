@@ -15,7 +15,7 @@ var (
 	composeFile               = "docker-compose.yml"
 	envOnce                   sync.Once
 	defaultBrokerAddrs        = []string{"localhost:10000"}
-	StandAloneHealthCheckAddr = []string{"http://localhost:10080/health"}
+	StandAloneHealthCheckAddr = []string{"http://localhost:10080/ready"}
 )
 
 type PublishedMessage struct {

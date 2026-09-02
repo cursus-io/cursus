@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"sort"
 	"strconv"
@@ -90,21 +91,19 @@ func (m *PartitionMetadata) UnmarshalJSON(data []byte) error {
 }
 
 type TopicCommand struct {
-	Name                string                 `json:"name,omitempty"`
-	Partitions          int                    `json:"partitions,omitempty"`
-	Idempotent          bool                   `json:"idempotent,omitempty"`
-	EventSourcing       bool                   `json:"event_sourcing,omitempty"`
-	LeaderID            string                 `json:"leader_id,omitempty"`
-	ReplicationFactor   int                    `json:"replication_factor,omitempty"`
-	Policy              topic.Policy           `json:"policy,omitempty"`
+	ReqID               string                 `json:"req_id,omitempty"`
 	Definition          *topic.Definition      `json:"definition,omitempty"`
 	Patch               *topic.DefinitionPatch `json:"patch,omitempty"`
+	LeaderID            string                 `json:"leader_id,omitempty"`
 	CommittedHWMVersion *int                   `json:"committed_hwm_version,omitempty"`
 }
 
 func (c TopicCommand) MarshalJSON() ([]byte, error) {
 	type alias TopicCommand
 	copy := c
+	if copy.Definition == nil {
+		return nil, fmt.Errorf("TOPIC command is missing the default definition")
+	}
 	if copy.CommittedHWMVersion == nil {
 		version := CommittedHWMVersionCurrent
 		copy.CommittedHWMVersion = &version
@@ -120,9 +119,14 @@ type TopicConfigCommand struct {
 
 func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	var topicCmd TopicCommand
-	if err := json.Unmarshal([]byte(jsonData), &topicCmd); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(jsonData))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&topicCmd); err != nil {
 		util.Error("FSM: Failed to unmarshal topic command: %v", err)
-		return err
+		return fmt.Errorf("%w: decode TOPIC command: %v; clean bootstrap required", ErrUnsupportedRecoveryProtocol, err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("%w: TOPIC command contains trailing data; clean bootstrap required", ErrUnsupportedRecoveryProtocol)
 	}
 	if topicCmd.CommittedHWMVersion == nil {
 		return fmt.Errorf("%w: TOPIC command is missing committed_hwm_version; clean bootstrap required", ErrUnsupportedRecoveryProtocol)
@@ -130,27 +134,16 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	if *topicCmd.CommittedHWMVersion != CommittedHWMVersionCurrent {
 		return fmt.Errorf("%w: TOPIC committed_hwm_version %d is not supported", ErrUnsupportedRecoveryProtocol, *topicCmd.CommittedHWMVersion)
 	}
-	patchCommand := topicCmd.Definition != nil || topicCmd.Patch != nil
-	if patchCommand && topicCmd.Definition == nil {
-		return fmt.Errorf("topic patch command is missing the default definition")
+	if topicCmd.Definition == nil {
+		return fmt.Errorf("%w: TOPIC command is missing the default definition; clean bootstrap required", ErrUnsupportedRecoveryProtocol)
 	}
 
-	base := topic.Definition{
-		Name:              topicCmd.Name,
-		Partitions:        topicCmd.Partitions,
-		ReplicationFactor: topicCmd.ReplicationFactor,
-		Idempotent:        topicCmd.Idempotent,
-		EventSourcing:     topicCmd.EventSourcing,
-		Policy:            topicCmd.Policy,
-	}
-	if topicCmd.Definition != nil {
-		base = *topicCmd.Definition
-	}
+	base := *topicCmd.Definition
 	base, err := base.Normalize()
 	if err != nil {
 		return fmt.Errorf("invalid topic definition: %w", err)
 	}
-	topicCmd.Name = base.Name
+	topicName := base.Name
 	var appliedDefinition topic.Definition
 
 	stageResult := func() interface{} {
@@ -160,20 +153,20 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		stagedTopics := copyTopicState(f.topicState)
 		stagedPartitions := copyPartitionMetadataState(f.partitionMetadata)
 		currentPartitions := 0
-		currentTopic := stagedTopics[topicCmd.Name]
+		currentTopic := stagedTopics[topicName]
 		if currentTopic == nil {
 			if f.cd != nil {
-				if references := f.cd.TopicGroupReferences(topicCmd.Name); len(references) != 0 {
-					return fmt.Errorf("topic %q lifecycle cleanup is pending for consumer group %q", topicCmd.Name, references[0].Name)
+				if references := f.cd.TopicGroupReferences(topicName); len(references) != 0 {
+					return fmt.Errorf("topic %q lifecycle cleanup is pending for consumer group %q", topicName, references[0].Name)
 				}
 			}
 			if f.txn != nil {
-				_, affected, stateErr := f.txn.StateWithoutTopicReferences(topicCmd.Name)
+				_, affected, stateErr := f.txn.StateWithoutTopicReferences(topicName)
 				if stateErr != nil {
-					return fmt.Errorf("topic %q lifecycle cleanup is pending: %w", topicCmd.Name, stateErr)
+					return fmt.Errorf("topic %q lifecycle cleanup is pending: %w", topicName, stateErr)
 				}
 				if len(affected) != 0 {
-					return fmt.Errorf("topic %q lifecycle cleanup is pending for transaction %q", topicCmd.Name, affected[0])
+					return fmt.Errorf("topic %q lifecycle cleanup is pending for transaction %q", topicName, affected[0])
 				}
 			}
 		}
@@ -182,23 +175,15 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		if currentTopic != nil {
 			currentPartitions = currentTopic.Partitions
 			var patch topic.DefinitionPatch
-			if patchCommand {
-				if topicCmd.Patch != nil {
-					patch = *topicCmd.Patch
-				}
-			} else {
-				patch = legacyTopicDefinitionPatch(base, topicCmd.ReplicationFactor > 0)
+			if topicCmd.Patch != nil {
+				patch = *topicCmd.Patch
 			}
 			definition, err = topic.MergeDefinitionPatch(*currentTopic, patch, true)
 			if err != nil {
 				return err
 			}
-		} else if patchCommand {
-			var patch topic.DefinitionPatch
-			if topicCmd.Patch != nil {
-				patch = *topicCmd.Patch
-			}
-			definition, err = topic.MergeDefinitionPatch(base, patch, false)
+		} else if topicCmd.Patch != nil {
+			definition, err = topic.MergeDefinitionPatch(base, *topicCmd.Patch, false)
 			if err != nil {
 				return err
 			}
@@ -221,7 +206,7 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		}
 
 		if definition.Partitions <= 0 {
-			util.Error("FSM: Invalid partition count %d for topic %s", definition.Partitions, topicCmd.Name)
+			util.Error("FSM: Invalid partition count %d for topic %s", definition.Partitions, topicName)
 			return fmt.Errorf("invalid partition count: %d", definition.Partitions)
 		}
 
@@ -256,19 +241,19 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		ring.Add(brokers...)
 
 		for i := 0; i < currentPartitions; i++ {
-			key := topicCmd.Name + "-" + strconv.Itoa(i)
+			key := topicName + "-" + strconv.Itoa(i)
 			if stagedPartitions[key] == nil {
-				return fmt.Errorf("topic %q is missing partition metadata %d", topicCmd.Name, i)
+				return fmt.Errorf("topic %q is missing partition metadata %d", topicName, i)
 			}
 		}
 		for i := 0; i < currentPartitions; i++ {
-			key := topicCmd.Name + "-" + strconv.Itoa(i)
+			key := topicName + "-" + strconv.Itoa(i)
 			stagedPartitions[key].PartitionCount = definition.Partitions
 			stagedPartitions[key].LifecycleEpoch = definition.LifecycleEpoch
 		}
 
 		for i := currentPartitions; i < definition.Partitions; i++ {
-			key := topicCmd.Name + "-" + strconv.Itoa(i)
+			key := topicName + "-" + strconv.Itoa(i)
 
 			assignedLeader := topicCmd.LeaderID
 			var replicas []string
@@ -309,7 +294,7 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			util.Info("FSM: Assigned leader %s to partition %s (replicas=%v)", assignedLeader, key, replicas)
 		}
 
-		stagedTopics[topicCmd.Name] = copyTopicDefinition(&definition)
+		stagedTopics[topicName] = copyTopicDefinition(&definition)
 		f.partitionMetadata = stagedPartitions
 		f.topicState = stagedTopics
 		appliedDefinition = definition
@@ -320,10 +305,10 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 	}
 
 	if err := f.materializeTopicCreate(&appliedDefinition); err != nil {
-		util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicCmd.Name, err)
+		util.Error("FSM: Failed to create topic '%s' in local manager: %v", topicName, err)
 		return err
 	}
-	util.Info("FSM: Created topic '%s' with %d partitions", topicCmd.Name, appliedDefinition.Partitions)
+	util.Info("FSM: Created topic '%s' with %d partitions", topicName, appliedDefinition.Partitions)
 	return nil
 }
 
@@ -393,36 +378,6 @@ func (f *BrokerFSM) applyTopicConfigCommand(jsonData string) interface{} {
 		return fmt.Errorf("materialize topic config: %w", err)
 	}
 	return nil
-}
-
-func legacyTopicDefinitionPatch(definition topic.Definition, includeReplicationFactor bool) topic.DefinitionPatch {
-	partitions := definition.Partitions
-	cleanupPolicy := definition.Policy.CleanupPolicy
-	retentionHours := definition.Policy.RetentionHours
-	retentionBytes := definition.Policy.RetentionBytes
-	partitioner := definition.Policy.Partitioner
-	authPolicy := definition.Policy.AuthPolicy
-	readACL := append([]string(nil), definition.Policy.ReadACL...)
-	writeACL := append([]string(nil), definition.Policy.WriteACL...)
-	patch := topic.DefinitionPatch{
-		Partitions:     &partitions,
-		CleanupPolicy:  &cleanupPolicy,
-		RetentionHours: &retentionHours,
-		RetentionBytes: &retentionBytes,
-		Partitioner:    &partitioner,
-		AuthPolicy:     &authPolicy,
-		ReadACL:        &readACL,
-		WriteACL:       &writeACL,
-	}
-	if includeReplicationFactor {
-		replicationFactor := definition.ReplicationFactor
-		patch.ReplicationFactor = &replicationFactor
-	}
-	if definition.Policy.MinInSyncReplicas != nil {
-		minInSyncReplicas := *definition.Policy.MinInSyncReplicas
-		patch.MinInSyncReplicas = &minInSyncReplicas
-	}
-	return patch
 }
 
 func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
@@ -707,29 +662,9 @@ func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
 	return nil
 }
 
-// applyJoinGroupCommand restores group join state.
-func (f *BrokerFSM) applyJoinGroupCommand(jsonData string) interface{} {
-	var cmd struct {
-		Group  string `json:"group"`
-		Member string `json:"member"`
-	}
-	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
-		util.Error("FSM: Failed to unmarshal join group: %v", err)
-		return err
-	}
-
-	if f.cd != nil {
-		_, err := f.cd.AddConsumer(cmd.Group, cmd.Member)
-		if err != nil {
-			return err
-		}
-		util.Info("FSM: Synced JOIN_GROUP group=%s member=%s", cmd.Group, cmd.Member)
-	}
-	return nil
-}
-
 func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 	var cmd struct {
+		ReqID          string   `json:"req_id,omitempty"`
 		Type           string   `json:"type"`
 		Group          string   `json:"group"`
 		Member         string   `json:"member"`
@@ -739,7 +674,7 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 		PartitionCount int      `json:"partition_count"`
 	}
 
-	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
+	if err := decodeStrictJSON([]byte(jsonData), &cmd); err != nil {
 		util.Error("Failed to unmarshal group sync: %v", err)
 		return err
 	}
@@ -750,6 +685,9 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 
 	switch cmd.Type {
 	case "REGISTER":
+		if cmd.Group == "" || cmd.Topic == "" || cmd.PartitionCount <= 0 {
+			return fmt.Errorf("GROUP_SYNC REGISTER requires group, topic, and positive partition_count")
+		}
 		if f.tm == nil {
 			return fmt.Errorf("topic manager not available in FSM")
 		}
@@ -758,7 +696,7 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 			return fmt.Errorf("topic '%s' not found during group registration", cmd.Topic)
 		}
 		partitionCount := len(t.Partitions)
-		if cmd.PartitionCount > 0 && cmd.PartitionCount != partitionCount {
+		if cmd.PartitionCount != partitionCount {
 			return fmt.Errorf("partition count mismatch for topic %s: requested=%d actual=%d", cmd.Topic, cmd.PartitionCount, partitionCount)
 		}
 		if err := f.cd.RegisterGroup(cmd.Topic, cmd.Group, partitionCount); err != nil {
@@ -767,19 +705,23 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 		util.Info("FSM: Registered group %s for topic %s", cmd.Group, cmd.Topic)
 		return nil
 	case "JOIN":
+		if cmd.Group == "" || cmd.Topic == "" || cmd.Member == "" || cmd.PartitionCount <= 0 {
+			return fmt.Errorf("GROUP_SYNC JOIN requires group, topic, member, and positive partition_count")
+		}
+		if f.tm == nil {
+			return fmt.Errorf("topic manager not available in FSM")
+		}
+		t := f.tm.GetTopic(cmd.Topic)
+		if t == nil {
+			return fmt.Errorf("topic '%s' not found during group join", cmd.Topic)
+		}
+		partitionCount := len(t.Partitions)
+		if cmd.PartitionCount != partitionCount {
+			return fmt.Errorf("partition count mismatch for topic %s: requested=%d actual=%d", cmd.Topic, cmd.PartitionCount, partitionCount)
+		}
 		if f.cd.GetGroup(cmd.Group) == nil {
-			if f.tm == nil {
-				return fmt.Errorf("topic manager not available in FSM")
-			}
-			t := f.tm.GetTopic(cmd.Topic)
-			if t == nil {
-				return fmt.Errorf("topic '%s' not found during group join", cmd.Topic)
-			}
-
-			if err := f.cd.RegisterGroup(cmd.Topic, cmd.Group, len(t.Partitions)); err != nil {
-				util.Warn("FSM: Failed to auto-register group %s: %v", cmd.Group, err)
-			} else {
-				util.Info("FSM: Auto-registered group %s for topic %s", cmd.Group, cmd.Topic)
+			if err := f.cd.RegisterGroup(cmd.Topic, cmd.Group, partitionCount); err != nil {
+				return err
 			}
 		}
 
@@ -788,13 +730,17 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 			return err
 		}
 	case "LEAVE":
+		if cmd.Group == "" || cmd.Member == "" {
+			return fmt.Errorf("GROUP_SYNC LEAVE requires group and member")
+		}
 		if cmd.Generation == nil {
-			// Compatibility with metadata entries written before generation
-			// fencing was introduced.
-			return f.cd.RemoveConsumer(cmd.Group, cmd.Member)
+			return fmt.Errorf("missing generation for group leave")
 		}
 		return f.cd.RemoveConsumerForGeneration(cmd.Group, cmd.Member, *cmd.Generation)
 	case "EXPIRE":
+		if cmd.Group == "" {
+			return fmt.Errorf("missing group for group expiration")
+		}
 		if cmd.Generation == nil {
 			return fmt.Errorf("missing generation for group expiration")
 		}
@@ -802,8 +748,9 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 			return fmt.Errorf("missing members for group expiration")
 		}
 		return f.cd.ExpireConsumers(cmd.Group, *cmd.Generation, cmd.Members)
+	default:
+		return fmt.Errorf("unsupported GROUP_SYNC type %q", cmd.Type)
 	}
-
 	return nil
 }
 

@@ -34,7 +34,6 @@ import (
 
 const (
 	defaultMaxWorkers      = 1000
-	maxWorkers             = defaultMaxWorkers // backward-compatible default alias
 	defaultIdleTimeout     = 60 * time.Second
 	readDeadlinePoll       = 5 * time.Second
 	DefaultHealthCheckPort = 9080
@@ -488,80 +487,6 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 	}
 }
 
-// HandleConnection processes a single client connection (creates a new CommandHandler per call).
-// Deprecated: prefer handleConn with a shared CommandHandler to avoid file descriptor leaks.
-func HandleConnection(ctx context.Context, conn net.Conn, tm *topic.TopicManager, cfg *config.Config, cd *coordinator.Coordinator, sm *stream.StreamManager, cc *clusterController.ClusterController) {
-	defer observeClientConnection()()
-	isStreamed := false
-	defer func() {
-		if !isStreamed {
-			_ = conn.Close()
-		}
-	}()
-
-	clientCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	stopContextClose := context.AfterFunc(clientCtx, func() { _ = conn.Close() })
-	defer stopContextClose()
-
-	cmdHandler, cmdCtx := initializeConnection(cfg, tm, cd, sm, cc)
-	defer func() { _ = cmdHandler.Close() }()
-	cmdCtx.SetRequestContext(clientCtx)
-
-	idleTimeout := clientIdleTimeout(cfg)
-	lastActivity := time.Now()
-	if err := conn.SetDeadline(lastActivity.Add(idleTimeout)); err != nil {
-		return
-	}
-	wireConnection, responseConn, err := negotiateServerConnection(conn)
-	if err != nil {
-		return
-	}
-	_ = conn.SetDeadline(time.Time{})
-	for {
-		select {
-		case <-clientCtx.Done():
-			return
-		default:
-		}
-		deadline := time.Now().Add(readDeadlinePoll)
-		idleDeadline := lastActivity.Add(idleTimeout)
-		if idleDeadline.Before(deadline) {
-			deadline = idleDeadline
-		}
-		if err := conn.SetReadDeadline(deadline); err != nil {
-			util.Error("⚠️ SetReadDeadline error: %v", err)
-			return
-		}
-
-		request, err := readWireRequest(wireConnection)
-		if err != nil {
-			select {
-			case <-clientCtx.Done():
-				return
-			default:
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() && time.Since(lastActivity) < idleTimeout {
-					continue
-				}
-				return
-			}
-		}
-
-		responseConn.setRequest(request)
-		shouldExit, err := processMessage(request.Payload, cmdHandler, cmdCtx, responseConn)
-		lastActivity = time.Now()
-		if err != nil {
-			return
-		}
-		if shouldExit {
-			if request.Command == wire.CommandStream {
-				isStreamed = true
-			}
-			return
-		}
-	}
-}
-
 type connectionLimiter struct {
 	slots chan struct{}
 }
@@ -816,9 +741,6 @@ func commandErrorResponse(err error, ctx *controller.ClientContext) string {
 }
 
 func decorateServerResponse(resp string, ctx *controller.ClientContext) string {
-	if ctx == nil || !ctx.HasFeature(wireprotocol.FeatureStructuredErrorsV1) {
-		return resp
-	}
 	return wireprotocol.EnrichErrorResponse(resp)
 }
 

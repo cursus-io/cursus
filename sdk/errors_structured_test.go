@@ -18,13 +18,9 @@ func TestParseBrokerErrorPreservesStructuredFields(t *testing.T) {
 	}
 }
 
-func TestParseBrokerErrorClassifiesLegacyResponse(t *testing.T) {
-	err, ok := ParseBrokerError("ERROR NOT_LEADER LEADER_IS broker-2:9000")
-	if !ok || err.Class != ErrorClassRouting || !err.Retryable {
-		t.Fatalf("unexpected error: %+v", err)
-	}
-	if !errors.Is(err, ErrNotLeader) {
-		t.Fatal("typed broker error does not match ErrNotLeader")
+func TestParseBrokerErrorRejectsUnstructuredResponse(t *testing.T) {
+	if err, ok := ParseBrokerError("ERROR NOT_LEADER LEADER_IS broker-2:9000"); ok || err != nil {
+		t.Fatalf("unstructured response was accepted: %+v", err)
 	}
 }
 
@@ -33,8 +29,8 @@ func TestBrokerErrorMatchesExistingSentinels(t *testing.T) {
 		response string
 		target   error
 	}{
-		{"ERROR: topic_not_found topic=orders", ErrTopicNotFound},
-		{"ERROR: partition_not_found partition=99", ErrInvalidPartition},
+		{"ERROR: topic_not_found class=not_found retryable=false topic=orders", ErrTopicNotFound},
+		{"ERROR: partition_not_found class=not_found retryable=false partition=99", ErrInvalidPartition},
 	}
 	for _, test := range tests {
 		brokerErr, ok := ParseBrokerError(test.response)

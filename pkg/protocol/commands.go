@@ -25,7 +25,7 @@ func IsTextCommand(value string) bool {
 		return false
 	}
 	switch command {
-	case wire.CommandJoinCluster, wire.CommandLeaveCluster, wire.CommandHeartbeatCluster:
+	case wire.CommandNegotiate, wire.CommandJoinCluster, wire.CommandLeaveCluster, wire.CommandHeartbeatCluster:
 		return false
 	default:
 		return true

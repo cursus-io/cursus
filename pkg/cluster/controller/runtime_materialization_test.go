@@ -28,7 +28,10 @@ func TestRuntimeSnapshotIncludesTopicMaterializationState(t *testing.T) {
 	broker, err := json.Marshal(fsm.BrokerInfo{ID: "broker-1", Addr: "127.0.0.1:9000", Status: "active"})
 	require.NoError(t, err)
 	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", broker)), Index: 1}))
-	command, err := json.Marshal(fsm.TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()})
+	definition := topic.DefaultDefinition("orders", nil)
+	definition.Partitions = 1
+	definition.ReplicationFactor = 1
+	command, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
 	require.NoError(t, err)
 	require.Error(t, brokerFSM.Apply(&raft.Log{Data: []byte("TOPIC:" + string(command)), Index: 2}).(error))
 

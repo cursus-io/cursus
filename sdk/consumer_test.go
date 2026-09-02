@@ -86,11 +86,10 @@ func TestConsumerClient_UpdateLeader_DifferentAddrUpdates(t *testing.T) {
 func TestConsumerClient_ConnectWithFailover_NoBrokers(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	cfg.BrokerAddrs = []string{}
-	client, _ := NewConsumerClient(cfg)
-
-	_, _, err := client.ConnectWithFailover()
+	client, err := NewConsumerClient(cfg)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "no broker addresses configured")
+	assert.Contains(t, err.Error(), "at least one broker address")
+	assert.Nil(t, client)
 }
 
 func TestConsumerClient_LeaderStaleness(t *testing.T) {
@@ -278,9 +277,9 @@ func TestConsumer_GetOrDialHeartbeatConn_ExistingConn(t *testing.T) {
 
 func TestConsumer_GetOrDialHeartbeatConn_NilConnGetLeaderFails(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
-	cfg.BrokerAddrs = []string{}
 	c, err := NewConsumer(cfg)
 	require.NoError(t, err)
+	c.config.BrokerAddrs = nil
 
 	conn := c.getOrDialHeartbeatConn(c.assignmentContext())
 	assert.Nil(t, conn)

@@ -245,8 +245,7 @@ func (c *ConsumerClient) EndTransaction(transactionalID, producerID string, epoc
 	return err
 }
 
-// TransactionStatus preserves the original raw response API for compatibility.
-func (c *ConsumerClient) TransactionStatus(transactionalID string) (string, error) {
+func (c *ConsumerClient) transactionStatus(transactionalID string) (string, error) {
 	if err := validateTransactionToken("transactional ID", transactionalID); err != nil {
 		return "", err
 	}
@@ -255,7 +254,7 @@ func (c *ConsumerClient) TransactionStatus(transactionalID string) (string, erro
 
 // DescribeTransaction returns the broker transaction status as typed fields.
 func (c *ConsumerClient) DescribeTransaction(transactionalID string) (TransactionStatusInfo, error) {
-	resp, err := c.TransactionStatus(transactionalID)
+	resp, err := c.transactionStatus(transactionalID)
 	if err != nil {
 		return TransactionStatusInfo{}, err
 	}

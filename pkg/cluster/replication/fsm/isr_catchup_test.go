@@ -14,9 +14,9 @@ func newISRCatchupTestFSM(t *testing.T) *BrokerFSM {
 	brokerFSM := newTestFSM()
 	registerActiveBroker(t, brokerFSM, "node-1")
 	registerActiveBroker(t, brokerFSM, "node-2")
-	command, err := json.Marshal(TopicCommand{
-		Name: "orders", Partitions: 1, ReplicationFactor: 2, LeaderID: "node-1", Policy: topic.DefaultPolicy(),
-	})
+	topicCommand := testTopicCommand("orders", 1, 2)
+	topicCommand.LeaderID = "node-1"
+	command, err := json.Marshal(topicCommand)
 	require.NoError(t, err)
 	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte("TOPIC:" + string(command)), Index: 3}))
 

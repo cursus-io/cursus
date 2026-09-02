@@ -8,21 +8,17 @@ import (
 	"time"
 )
 
-func TestDecodeJournalSnapshotSupportsLegacyAndRejectsUnknownVersion(t *testing.T) {
-	legacy := testJournalSnapshot("tx-legacy", 1, StateCommitted)
-	payload, err := json.Marshal(legacy)
+func TestDecodeJournalSnapshotRejectsUnversionedAndUnknownVersions(t *testing.T) {
+	snapshot := testJournalSnapshot("tx-versioned", 1, StateCommitted)
+	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	decoded, err := decodeJournalSnapshot(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if decoded.ID != legacy.ID || decoded.State != legacy.State {
-		t.Fatalf("unexpected legacy snapshot: %+v", decoded)
+	if _, err := decodeJournalSnapshot(payload); err == nil {
+		t.Fatal("expected an unversioned journal snapshot to fail")
 	}
 
-	payload, err = json.Marshal(journalRecord{Version: journalFormatVersion + 1, Transaction: legacy})
+	payload, err = json.Marshal(journalRecord{Version: journalFormatVersion + 1, Transaction: snapshot})
 	if err != nil {
 		t.Fatal(err)
 	}

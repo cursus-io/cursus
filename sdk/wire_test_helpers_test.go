@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 
+	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/wire"
 )
 
@@ -55,6 +56,7 @@ func writeWireTestResponse(connection *wire.Connection, request wire.Frame, resp
 	status := wire.StatusOK
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(response)), "ERROR:") {
 		status = wire.StatusError
+		response = wireprotocol.EnrichErrorResponse(response)
 		brokerError, ok := ParseBrokerError(response)
 		if !ok {
 			return fmt.Errorf("invalid test broker error %q", response)

@@ -1,6 +1,6 @@
 # Disk Format
 
-This document describes the Cursus partition-log files. The format is Cursus-owned and may evolve only with compatible recovery and upgrade handling.
+This document describes the Cursus partition-log files. The runtime accepts only the documented current metadata versions; an incompatible format requires an explicit offline converter or clean bootstrap.
 
 ## Layout
 
@@ -112,13 +112,13 @@ A standalone broker stores the authoritative topic registry in `{log_dir}/__topi
 }
 ```
 
-The encoded manifest is limited to 16 MiB. Updates write a mode-`0600` same-directory temporary file, sync it, atomically replace the committed manifest, and sync the parent directory where supported. Startup reads only the committed path; abandoned `.tmp` files are not authoritative. Parsing disallows unknown fields and rejects duplicate names, invalid definitions, trailing content, and unsupported versions. Version 1 remains readable and supplies `revision=1` and `replication_factor=3`; the next definition write emits version 2. A version 2 entry missing either field is corrupt and fails closed. A missing manifest with persisted topic logs, or a valid manifest that omits a persisted topic directory, is an integrity error. The broker does not infer ACL or event-sourcing mode from segment filenames when a manifest is absent or invalid.
+The encoded manifest is limited to 16 MiB. Updates write a mode-`0600` same-directory temporary file, sync it, atomically replace the committed manifest, and sync the parent directory where supported. Startup reads only the committed path; abandoned `.tmp` files are not authoritative. Runtime parsing accepts only manifest version 3, disallows unknown fields, and rejects duplicate names, missing revision/replication-factor/lifecycle-epoch fields, invalid definitions, and trailing content. A missing manifest with persisted topic logs, or a valid manifest that omits a persisted topic directory, is an integrity error. The broker does not infer ACL or event-sourcing mode from segment filenames when a manifest is absent or invalid.
 
 Backups of a standalone broker must keep this manifest with topic partition directories, `__transaction_state.journal`, and the consumer offset log. Restoring only segment files cannot reconstruct the full topic policy.
 
 ## Standalone Consumer Metadata
 
-`__consumer_offsets` stores version-1 group registration, complete committed-next-offset snapshot, and group tombstone JSON payloads inside ordinary segment frames. Stable semantic keys support compaction; lifecycle epochs fence delete/re-create, and snapshot revisions make replay deterministic across physical internal partitions. The decoder retains compatibility with the earlier single/bulk offset JSON records.
+`__consumer_offsets` stores version-1 group registration, complete committed-next-offset snapshot, and group tombstone JSON payloads inside ordinary segment frames. Stable semantic keys support compaction; lifecycle epochs fence delete/re-create, and snapshot revisions make replay deterministic across physical internal partitions. Runtime replay rejects unversioned single/bulk offset JSON records.
 
 The internal topic is forced to compact cleanup and unlimited time/size retention regardless of broker defaults, manifest input, or application `CREATE`. Registration/commit acknowledgement synchronously flushes and fsyncs its authoritative log. Corrupt, truncated, conflicting, regressing, or key-mismatched records fail readiness instead of being skipped. See [Standalone Storage Recovery](../../standalone-storage-recovery.md) for the record shapes and pre-manifest migration procedure.
 
@@ -130,7 +130,7 @@ A standalone broker stores coordinator snapshots in `{log_dir}/__transaction_sta
     byte[payloadLength] JSON {"version":1,"transaction":{...}}
     uint32_be crc32(payload)
 
-The encoded payload is limited to 32 MiB. Every accepted transition is appended and fsynced. Before appending, the broker truncates bytes beyond the last validated record so a failed partial write cannot hide later acknowledged state. Startup repairs only a torn or checksum-corrupt final frame and rejects corruption before the tail. The decoder accepts the earlier bare-snapshot JSON payload for recovery compatibility, but all new writes use version 1.
+The encoded payload is limited to 32 MiB. Every accepted transition is appended and fsynced. Before appending, the broker truncates bytes beyond the last validated record so a failed partial write cannot hide later acknowledged state. Startup repairs only a torn or checksum-corrupt final frame and rejects corruption before the tail. Every runtime record must use the version-1 envelope; bare transaction snapshots are rejected.
 
 The journal is append-only and currently has no automatic compaction. Backups must keep it consistent with partition logs and the standalone consumer offset store.
 

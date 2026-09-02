@@ -94,10 +94,10 @@ func (c *ConsumerClient) Connect(addr string) (net.Conn, error) {
 		_ = tcpConn.SetWriteBuffer(2 * 1024 * 1024)
 	}
 
-	conn, err = negotiateConfiguredProtocol(conn, c.config.ProtocolVersion, c.config.ProtocolFeatures, c.config.RequireProtocolFeatures, c.config.ProtocolNegotiationTimeoutMS, c.config.CompressionType)
+	conn, err = openWireConnection(conn, c.config.HandshakeTimeoutMS, c.config.CompressionType)
 	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("protocol negotiation with %s failed: %w", addr, err)
+		return nil, fmt.Errorf("Wire v2 handshake with %s failed: %w", addr, err)
 	}
 	if err := authenticateConfiguredClient(conn, c.config.Principal, c.config.AuthToken); err != nil {
 		_ = conn.Close()

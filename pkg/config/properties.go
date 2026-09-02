@@ -417,12 +417,17 @@ func LoadConfig() (*Config, error) {
 	overrideEnvString(&cfg.InternalTLSCAPath, "INTERNAL_TLS_CA_PATH")
 	overrideEnvString(&cfg.InternalTLSServerName, "INTERNAL_TLS_SERVER_NAME")
 	overrideEnvBool(&cfg.EnableSASL, "ENABLE_SASL")
-	overrideEnvSASLUsers(&cfg.SASLUsers, "SASL_USERS")
+	if err := overrideEnvSASLUsers(&cfg.SASLUsers, "SASL_USERS"); err != nil {
+		return nil, err
+	}
 
 	cfg.Normalize()
 	util.SetLevel(cfg.LogLevel)
 
 	if err := cfg.ValidateClusterTransport(); err != nil {
+		return nil, err
+	}
+	if err := cfg.ValidateClientAuthentication(); err != nil {
 		return nil, err
 	}
 	if err := cfg.loadInternalTLSConfig(); err != nil {
@@ -441,6 +446,46 @@ func LoadConfig() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// ValidateClientAuthentication requires an explicit least-privilege contract
+// for every configured principal.
+func (cfg *Config) ValidateClientAuthentication() error {
+	if cfg == nil || !cfg.EnableSASL {
+		return nil
+	}
+	if len(cfg.SASLUsers) == 0 {
+		return fmt.Errorf("sasl_users must contain at least one principal when enable_sasl=true")
+	}
+	allowed := map[string]struct{}{
+		"admin": {}, "topic.read": {}, "topic.write": {}, "group": {}, "transaction": {}, "*": {},
+	}
+	principals := make(map[string]struct{}, len(cfg.SASLUsers))
+	for _, user := range cfg.SASLUsers {
+		principal := strings.TrimSpace(user.Principal)
+		if principal == "" || strings.TrimSpace(user.Token) == "" {
+			return fmt.Errorf("sasl user principal and token are required")
+		}
+		if _, duplicate := principals[principal]; duplicate {
+			return fmt.Errorf("duplicate sasl principal %q", principal)
+		}
+		principals[principal] = struct{}{}
+		if len(user.Permissions) == 0 {
+			return fmt.Errorf("sasl principal %q requires at least one permission", principal)
+		}
+		seen := make(map[string]struct{}, len(user.Permissions))
+		for _, permission := range user.Permissions {
+			permission = strings.ToLower(strings.TrimSpace(permission))
+			if _, ok := allowed[permission]; !ok {
+				return fmt.Errorf("sasl principal %q has invalid permission %q", principal, permission)
+			}
+			if _, duplicate := seen[permission]; duplicate {
+				return fmt.Errorf("sasl principal %q repeats permission %q", principal, permission)
+			}
+			seen[permission] = struct{}{}
+		}
+	}
+	return nil
 }
 
 // ValidateClusterTransport rejects accidental plaintext cluster deployments.

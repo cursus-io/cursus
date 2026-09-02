@@ -60,4 +60,4 @@ on one branch and split into reviewable, signed work-unit commits.
 - [x] Run cluster chaos coverage in CI, including hard-kill recovery where the
       environment supports it.
 - [x] Add regression tests for every item above, including read-only behavior and
-      mixed-version/format compatibility where applicable.
+      rejection at unsupported wire/storage format boundaries.

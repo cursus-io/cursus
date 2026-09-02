@@ -2,6 +2,7 @@ package transaction
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -244,25 +245,19 @@ func TestManagerApplySnapshotDoesNotRegressReplicatedState(t *testing.T) {
 	}
 }
 
-func TestManagerApplySnapshotUsesTimestampForLegacyRevisions(t *testing.T) {
+func TestManagerApplyReplicatedSnapshotRejectsMissingRevision(t *testing.T) {
 	m := NewManager()
 	base := time.Now().UTC()
-	if err := m.ApplyReplicatedSnapshot(&Snapshot{ID: "legacy", Producer: "p1", Epoch: 0, State: StateAborted, UpdatedAt: base}); err != nil {
-		t.Fatalf("apply initial legacy snapshot: %v", err)
-	}
-	if err := m.ApplyReplicatedSnapshot(&Snapshot{ID: "legacy", Producer: "p1", Epoch: 0, State: StateOpen, UpdatedAt: base.Add(time.Second)}); err != nil {
-		t.Fatalf("apply newer legacy snapshot: %v", err)
-	}
-	if err := m.ApplyReplicatedSnapshot(&Snapshot{ID: "legacy", Producer: "p1", Epoch: 0, State: StateAborted, UpdatedAt: base}); err == nil {
-		t.Fatal("expected older legacy snapshot to be rejected")
+	err := m.ApplyReplicatedSnapshot(&Snapshot{
+		ID: "missing-revision", Producer: "p1", Epoch: 0, State: StateAborted,
+		CreatedAt: base, UpdatedAt: base,
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing revision") {
+		t.Fatalf("expected missing revision rejection, got %v", err)
 	}
 
-	tx, err := m.Status("legacy")
-	if err != nil {
-		t.Fatalf("status failed: %v", err)
-	}
-	if tx.State != StateOpen {
-		t.Fatalf("older legacy snapshot regressed state: %+v", tx)
+	if _, err := m.Status("missing-revision"); err == nil {
+		t.Fatal("invalid replicated snapshot mutated manager state")
 	}
 }
 

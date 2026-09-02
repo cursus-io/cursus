@@ -9,7 +9,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/wire"
 )
 
-func TestConfiguredNegotiationHasBoundedTimeout(t *testing.T) {
+func TestWireHandshakeHasBoundedTimeout(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()
 	defer func() { _ = server.Close() }()
@@ -17,17 +17,17 @@ func TestConfiguredNegotiationHasBoundedTimeout(t *testing.T) {
 	go func() { <-release }()
 
 	start := time.Now()
-	_, err := negotiateConfiguredProtocol(client, 2, nil, false, 25, "none")
+	_, err := openWireConnection(client, 25, "none")
 	close(release)
 	if err == nil || !strings.Contains(err.Error(), "timeout") {
 		t.Fatalf("expected timeout, got %v", err)
 	}
 	if time.Since(start) > time.Second {
-		t.Fatalf("negotiation timeout was not bounded: %v", time.Since(start))
+		t.Fatalf("handshake timeout was not bounded: %v", time.Since(start))
 	}
 }
 
-func TestConfiguredNegotiationClearsDeadlineAfterSuccess(t *testing.T) {
+func TestWireHandshakeClearsDeadlineAfterSuccess(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()
 	defer func() { _ = server.Close() }()
@@ -45,32 +45,22 @@ func TestConfiguredNegotiationClearsDeadlineAfterSuccess(t *testing.T) {
 		}
 		serverDone <- connection.WriteFrame(wire.Frame{
 			Kind: wire.KindResponse, Command: request.Command, Status: wire.StatusOK, RequestID: request.RequestID,
-			Payload: []byte("OK protocol=cursus min_version=2 max_version=2 default_version=2 features= error_classes=validation"),
+			Payload: []byte("OK commands=HELP"),
 		})
 	}()
 
-	framed, err := negotiateConfiguredProtocol(client, 2, nil, false, 25, "none")
+	framed, err := openWireConnection(client, 25, "none")
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if _, err := FetchProtocolInfo(framed); err != nil {
+	if err := WriteWithLength(framed, []byte("HELP")); err != nil {
+		t.Fatalf("cleared connection deadline was not reusable: %v", err)
+	}
+	if _, err := ReadWithLength(framed); err != nil {
 		t.Fatalf("cleared connection deadline was not reusable: %v", err)
 	}
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestFetchProtocolInfoRejectsInvalidVersionRange(t *testing.T) {
-	client, server := net.Pipe()
-	defer func() { _ = client.Close() }()
-	defer func() { _ = server.Close() }()
-	go func() {
-		_, _ = ReadWithLength(server)
-		_ = WriteWithLength(server, []byte("OK protocol=cursus min_version=2 max_version=1 default_version=1 features= error_classes="))
-	}()
-	if _, err := FetchProtocolInfo(client); err == nil {
-		t.Fatal("invalid broker protocol range was accepted")
 	}
 }

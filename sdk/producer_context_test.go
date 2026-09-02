@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func newProducerLifecycleTestHarness(t *testing.T) *Producer {
@@ -26,6 +28,16 @@ func TestNewProducerWithContextRejectsNilContext(t *testing.T) {
 	if _, err := NewProducerWithContext(nilContext, NewDefaultPublisherConfig()); err == nil {
 		t.Fatal("expected nil context error")
 	}
+}
+
+func TestProducerAutoCreateSwitchIsAuthoritative(t *testing.T) {
+	cfg := NewDefaultPublisherConfig()
+	cfg.BrokerAddrs = []string{"127.0.0.1:0"}
+	producer := &Producer{config: cfg}
+
+	require.NoError(t, producer.createConfiguredTopic())
+	cfg.AutoCreateTopics = true
+	require.ErrorContains(t, producer.createConfiguredTopic(), "auto-create topic")
 }
 
 func TestProducerContextCancellationClosesProducer(t *testing.T) {

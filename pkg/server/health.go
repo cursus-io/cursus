@@ -109,26 +109,6 @@ func newHealthHandler(state *HealthState) http.Handler {
 		}
 		writeHealthJSON(w, status, healthResponse{Status: label, Checks: checks})
 	})
-	compatibilityHandler := func(w http.ResponseWriter, r *http.Request) {
-		if !allowHealthMethod(w, r) {
-			return
-		}
-		ready, checks := state.report()
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		if !ready {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			if _, err := fmt.Fprintf(w, "Broker not ready: %s", failedChecks(checks)); err != nil {
-				util.Error("health check response write error: %v", err)
-			}
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte("OK")); err != nil {
-			util.Error("health check response write error: %v", err)
-		}
-	}
-	mux.HandleFunc("/health", compatibilityHandler)
-	mux.HandleFunc("/", compatibilityHandler)
 	return mux
 }
 
@@ -147,20 +127,6 @@ func writeHealthJSON(w http.ResponseWriter, status int, response healthResponse)
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		util.Error("health check JSON write error: %v", err)
 	}
-}
-
-func failedChecks(checks map[string]string) string {
-	names := make([]string, 0, len(checks))
-	for name, result := range checks {
-		if result != "ok" {
-			names = append(names, name+"="+result)
-		}
-	}
-	sort.Strings(names)
-	if len(names) == 0 {
-		return "unknown"
-	}
-	return strings.Join(names, ",")
 }
 
 // startHealthCheckServer binds synchronously so startup cannot report ready on bind failure.

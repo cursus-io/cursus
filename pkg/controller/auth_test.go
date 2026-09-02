@@ -21,7 +21,7 @@ import (
 func TestSASLACLGuardsPublishAndConsume(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnableSASL = true
-	cfg.SASLUsers = []config.SASLUser{{Principal: "alice", Token: "secret"}}
+	cfg.SASLUsers = []config.SASLUser{{Principal: "alice", Token: "secret", Permissions: []string{PermissionAll}}}
 
 	storage := &authTestStorage{messages: []types.Message{{Offset: 0, Payload: "ready"}}}
 	tm := topic.NewTopicManager(cfg, &authStorageProvider{storage: storage}, nil)
@@ -95,7 +95,7 @@ func TestSASLACLGuardsPublishAndConsume(t *testing.T) {
 func TestListOffsetsRequiresReadACL(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnableSASL = true
-	cfg.SASLUsers = []config.SASLUser{{Principal: "alice", Token: "secret"}}
+	cfg.SASLUsers = []config.SASLUser{{Principal: "alice", Token: "secret", Permissions: []string{PermissionAll}}}
 
 	storage := &authTestStorage{}
 	tm := topic.NewTopicManager(cfg, &authStorageProvider{storage: storage}, nil)
@@ -123,8 +123,8 @@ func TestListFiltersTopicsByReadACL(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnableSASL = true
 	cfg.SASLUsers = []config.SASLUser{
-		{Principal: "alice", Token: "alice-secret"},
-		{Principal: "bob", Token: "bob-secret"},
+		{Principal: "alice", Token: "alice-secret", Permissions: []string{PermissionAll}},
+		{Principal: "bob", Token: "bob-secret", Permissions: []string{PermissionAll}},
 	}
 
 	tm := topic.NewTopicManager(cfg, &authStorageProvider{storage: &authTestStorage{}}, nil)
@@ -173,7 +173,7 @@ func TestListFiltersForwardedTopicsByReadACL(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnableSASL = true
 	cfg.EnabledDistribution = true
-	cfg.SASLUsers = []config.SASLUser{{Principal: "alice", Token: "alice-secret"}}
+	cfg.SASLUsers = []config.SASLUser{{Principal: "alice", Token: "alice-secret", Permissions: []string{PermissionAll}}}
 
 	tm := topic.NewTopicManager(cfg, &authStorageProvider{storage: &authTestStorage{}}, nil)
 	policies := map[string]topic.Policy{

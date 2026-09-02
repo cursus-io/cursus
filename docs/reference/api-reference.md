@@ -2,13 +2,7 @@
 
 This document summarizes the Cursus TCP command API. The canonical response contract is defined in [Protocol Specification](../protocol-spec.md); this page is a command-oriented quick reference.
 
-Cursus uses a length-prefixed TCP protocol. Every command request and text response is encoded as:
-
-```text
-[4-byte big-endian length][payload]
-```
-
-`CONSUME`, `STREAM`, and `READ_STREAM` are data-plane commands and can return one or more length-prefixed binary frames. Other control-plane commands return a single text or JSON response frame.
+Cursus accepts only Wire v2: a required binary handshake followed by correlated `CRS2` frames with a 32-byte header, CRC32C, explicit compression, command ID, status, and request ID. Most application requests carry a `CRQ2` command payload; publish batches use `CBV2`. `CONSUME`, `STREAM`, and `READ_STREAM` can return multiple correlated stream frames. See the [Protocol Specification](../protocol-spec.md) for the canonical byte layout.
 
 ## Response Contract
 
@@ -23,35 +17,11 @@ ERROR: <code> [key=value ...]
 
 Clients should treat `OK`, `OK ...`, and JSON responses with `status:"OK"` as success. Clients should treat every `ERROR:` response as failure and branch on the machine-readable error code immediately after the prefix.
 
-Legacy natural-language responses such as `Topic '<name>' now has <N> partitions`, `(no topics)`, or plain integer offsets are deprecated. SDKs may keep narrow fallback parsers for older brokers, but new client code should use the structured contract above.
+Wire v2 errors are always encoded as typed binary payloads with code, class, retryability, message, and fields. The text forms below describe the handler-level semantics, not an alternate transport.
 
-## Protocol Commands
+## Connection Handshake
 
-### PROTOCOL_INFO
-
-```text
-PROTOCOL_INFO
-```
-
-Returns the supported wire protocol range, default version, feature names, and structured error classes without changing connection state:
-
-```text
-OK protocol=cursus min_version=1 max_version=1 default_version=1 features=<csv> error_classes=<csv>
-```
-
-### NEGOTIATE
-
-```text
-NEGOTIATE version=<N> [features=<csv|*>] [require_features=<true|false>]
-```
-
-Negotiation applies only to the current TCP connection. Success returns:
-
-```text
-OK protocol_version=<N> enabled=<csv> unsupported=<csv>
-```
-
-With `structured_errors_v1` enabled, subsequent text errors use `ERROR: <code> class=<class> retryable=<bool> ...`. Existing clients that do not negotiate retain the previous response shape. Clients opening multiple data, coordinator, or partition connections must negotiate each connection independently.
+The first frame is the Wire v2 binary negotiation request. It selects exactly protocol version 2 and one mutually supported compression. `PROTOCOL_INFO` and application-level `NEGOTIATE` are not commands. Every data, coordinator, partition, admin, and broker-internal connection performs its own handshake.
 
 ## Topic Commands
 
@@ -69,7 +39,7 @@ Success:
 OK topic=<name> partitions=<N> cleanup_policy=<policy> partitioner=<policy> auth_policy=<policy> read_acl=<csv> write_acl=<csv> retention_hours=<N> retention_bytes=<N> revision=<N> replication_factor=<N> idempotent=<bool> event_sourcing=<bool> lifecycle_epoch=<N> min_in_sync_replicas=<N|default> effective_min_in_sync_replicas=<N>
 ```
 
-The pre-revision response fields keep their original order. New fields are appended so legacy key/value and positional readers can continue consuming the established prefix.
+Clients decode response fields by name and must not depend on presentation order.
 
 Common errors:
 
@@ -90,7 +60,7 @@ ERROR: create_topic_failed reason="..."
 DELETE topic=<name> [if_exists=<true|false>]
 ```
 
-Deletes a topic through the admin-only lifecycle path. The default `if_exists=false` preserves the legacy missing-topic error. Use `if_exists=true` only when an explicitly approved GitOps deletion must be safely retried. Active consumer-group members and open/committing transactions block deletion. Inactive groups and offsets, producer sequence state, target-topic operations in terminal transactions, and event-sourcing state are removed with the topic lifecycle. `__consumer_offsets` cannot be deleted.
+Deletes a topic through the admin-only lifecycle path. With `if_exists=false`, a missing topic returns `topic_not_found`. Use `if_exists=true` only when an explicitly approved GitOps deletion must be safely retried. Active consumer-group members and open/committing transactions block deletion. Inactive groups and offsets, producer sequence state, target-topic operations in terminal transactions, and event-sourcing state are removed with the topic lifecycle. `__consumer_offsets` cannot be deleted.
 
 Success:
 
@@ -218,7 +188,7 @@ Transaction metadata fields are not accepted on client `PUBLISH`; use the transa
 
 `acks` belongs to the publish request or publisher configuration; it is not topic metadata. For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. `acks=0` emits no external response frame. `acks=1` responds after the leader's durable local append while bounded ordered follower replication continues; a leader failure before commit can lose the record. `acks=all` and `acks=-1` are aliases: the broker first requires the current ISR to meet the topic-effective minimum, then waits for the captured ISR and lifecycle-fenced committed HWM. Read-committed consumers remain bounded by committed HWM. Non-ISR failures do not delay the success response.
 
-Text `PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Producer epochs entered FSM snapshot version 3; current brokers write version 7 while topics remain in their first lifecycle and version 8 after a truncate. Avoid mixed-version rolling upgrades with binaries that cannot decode the active snapshot version.
+`PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Distributed recovery writes and accepts only FSM snapshot version 9 with explicit committed-HWM provenance; older persistent state requires a full clean bootstrap.
 
 The effective minimum is the topic `min_in_sync_replicas` override when present and broker `min_insync_replicas` otherwise. Standalone has one replica, so `1`, `all`, and `-1` share the local durable-append completion point when the effective minimum is 1; `all`/`-1` reject when it is greater than 1. Idempotent publishers must use `all` or `-1`; `0` and `1` fail before append or sequence mutation.
 
@@ -298,12 +268,12 @@ Continuous push-mode consume command.
 STREAM topic=<name> group=<group> partition=<N> offset=<N> member=<member-id> [isolation=<read_committed|read_uncommitted>]
 ```
 
-`STREAM` returns one or more length-prefixed frames:
+`STREAM` returns one or more correlated Wire stream frames:
 
 ```text
-[binary batch frame]
-[00 00 00 00]                                  # zero-length keepalive
-STREAM_CONTROL type=CLOSE reason=<stopped|removed|timeout|error|offset_out_of_range> offset=<nextOffset>
+[CBV2 batch payload]
+[empty payload]                                 # keepalive
+[STREAM_CONTROL type=CLOSE ... payload]         # stream end
 ```
 
 Clients must treat zero-length frames as keepalive. Like `CONSUME`, `STREAM` is a stateless partition-leader data path and does not validate group ownership or generation on every read. `STREAM` uses the same `isolation` contract as `CONSUME`; the default is `read_committed`. A `STREAM_CONTROL type=CLOSE` frame is a graceful terminator; `reason=offset_out_of_range` means the requested stream offset is older than the retained log. Clients should close the socket and resume through the consumer group offset contract or reset according to policy. Raw TCP disconnect without a close control frame remains possible on broker crash or network failure and should be treated as retryable.
@@ -341,6 +311,10 @@ OK group=<group> topic=<name> registered=true
 ```text
 JOIN_GROUP topic=<name> group=<group> member=<member-id>
 ```
+
+A fresh join atomically registers a missing group for the topic. Use
+`REGISTER_GROUP` only when an empty group must be provisioned before its first
+member.
 
 Success:
 
@@ -724,7 +698,7 @@ OK snapshot=null
 
 ## Topic Policy Notes
 
-- With `enable_sasl=true`, protected commands require connection or inline authentication. Users may declare `admin`, `topic.read`, `topic.write`, `group`, `transaction`, or `*` permissions; cross-boundary commands require every applicable permission. Missing authentication returns `authentication_required`, and missing coarse permission returns `NOT_AUTHORIZED_FOR_OPERATION`. Per-topic `auth_policy=acl` is evaluated afterward with `read_acl`/`write_acl` and returns `NOT_AUTHORIZED_FOR_TOPIC` on denial. Omitting a user permission list preserves legacy full authenticated access. This is a token contract, not a mechanism-specific SASL byte protocol; use TLS/mTLS and network controls for broker exposure.
+- With `enable_sasl=true`, protected commands require connection or inline authentication. Every user must declare at least one of `admin`, `topic.read`, `topic.write`, `group`, `transaction`, or `*`; invalid authentication configuration fails startup. Cross-boundary commands require every applicable permission. Missing authentication returns `authentication_required`, and missing coarse permission returns `NOT_AUTHORIZED_FOR_OPERATION`. Per-topic `auth_policy=acl` is evaluated afterward with `read_acl`/`write_acl` and returns `NOT_AUTHORIZED_FOR_TOPIC` on denial. This is a token contract, not a mechanism-specific SASL byte protocol; use TLS/mTLS and network controls for broker exposure.
 - Topics expose `retention_hours` and `retention_bytes` policy metadata. `0` means broker default. Reads before the earliest retained offset fail with `ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>`. SDKs should apply `auto_offset_reset` (`earliest`, `latest`, or `error`) to decide whether to reset or fail; `latest` should use `LIST_OFFSETS latest`, the next readable committed offset.
 - `partitioner=hash_key` uses FNV-1a 64-bit hash modulo partition count for keyed messages and round-robin for missing keys. `partitioner=round_robin` ignores keys. Increasing partition count can remap future records for an existing key.
 

@@ -77,24 +77,13 @@ func TestCoordinator_Offsets(t *testing.T) {
 		assert.Equal(t, uint64(400), off1)
 	})
 
-	t.Run("ApplyOffsetUpdateFromFSM", func(t *testing.T) {
-		offsets := []OffsetItem{
-			{Partition: 0, Offset: 500},
-		}
-		err := c.ApplyOffsetUpdateFromFSM("group1", "topic1", offsets)
-		assert.NoError(t, err)
-
-		off, _ := c.GetOffset("group1", "topic1", 0)
-		assert.Equal(t, uint64(500), off)
-	})
-
 	t.Run("RejectLowerOffset", func(t *testing.T) {
-		err := c.CommitOffset("group1", "topic1", 0, 499)
+		err := c.CommitOffset("group1", "topic1", 0, 299)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "offset regression")
 
 		off, _ := c.GetOffset("group1", "topic1", 0)
-		assert.Equal(t, uint64(500), off)
+		assert.Equal(t, uint64(300), off)
 	})
 }
 
@@ -236,9 +225,6 @@ func TestCoordinatorRejectsMismatchedOffsetTopics(t *testing.T) {
 
 	require.ErrorContains(t, c.CommitOffset("group1", "topic2", 0, 1), "topic mismatch")
 	require.ErrorContains(t, c.CommitOffsetsBulk("group1", "topic2", []OffsetItem{{
-		Partition: 0, Offset: 1,
-	}}), "topic mismatch")
-	require.ErrorContains(t, c.ApplyOffsetUpdateFromFSM("group1", "topic2", []OffsetItem{{
 		Partition: 0, Offset: 1,
 	}}), "topic mismatch")
 	_, found := c.GetOffset("group1", "topic2", 0)

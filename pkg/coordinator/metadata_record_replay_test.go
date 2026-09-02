@@ -2,7 +2,6 @@ package coordinator
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -45,39 +44,33 @@ func TestConsumerMetadataReplayRequiresMigrationForRetainedGap(t *testing.T) {
 	require.Empty(t, coordinator.ListGroups())
 }
 
-func TestDistributedRecoveryPreservesLegacyBestEffortReplay(t *testing.T) {
-	first, err := json.Marshal(OffsetCommitMessage{
-		Group: "workers", Topic: "events", Partition: 0, Offset: 7, Timestamp: time.Now(),
-	})
-	require.NoError(t, err)
-	second, err := json.Marshal(OffsetCommitMessage{
-		Group: "auditors", Topic: "audit", Partition: 1, Offset: 9, Timestamp: time.Now(),
-	})
-	require.NoError(t, err)
+func TestStandaloneRecoveryRejectsUnversionedOffsetRecord(t *testing.T) {
+	handler := &metadataReplayHandler{messages: map[int][]types.Message{
+		0: {{Offset: 0, Payload: `{"group":"workers","topic":"events","partition":0,"offset":7}`}},
+	}}
+	coordinator, err := NewCoordinatorWithRecovery(context.Background(), config.DefaultConfig(), handler)
+	require.ErrorContains(t, err, "clean bootstrap required")
+	require.False(t, coordinator.RecoverySnapshot().Ready)
+	require.Empty(t, coordinator.ListGroups())
+}
 
+func TestDistributedRecoveryUsesRaftAsSoleAuthority(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
 	handler := &metadataReplayHandler{
 		starts: map[int]uint64{0: 42},
 		messages: map[int][]types.Message{
 			0: {
-				{Offset: 42, Payload: "invalid legacy record"},
-				{Offset: 43, Payload: string(first)},
+				{Offset: 42, Payload: "local internal-topic state is non-authoritative"},
 			},
-			1: {{Offset: 0, Payload: string(second)}},
 		},
 	}
 
 	recovered, err := NewCoordinatorWithRecovery(context.Background(), cfg, handler)
 	require.NoError(t, err)
 	require.True(t, recovered.RecoverySnapshot().Ready)
-	require.Equal(t, 1, recovered.RecoverySnapshot().CorruptRecords)
-	offset, found := recovered.GetOffset("workers", "events", 0)
-	require.True(t, found)
-	require.Equal(t, uint64(7), offset)
-	offset, found = recovered.GetOffset("auditors", "audit", 1)
-	require.True(t, found)
-	require.Equal(t, uint64(9), offset)
+	require.Zero(t, recovered.RecoverySnapshot().ReplayedRecords)
+	require.Empty(t, recovered.ListGroups())
 }
 
 func TestConsumerMetadataReplayIsDeterministicAcrossPartitions(t *testing.T) {

@@ -329,18 +329,8 @@ func decodeJournalSnapshot(payload []byte) (*Snapshot, error) {
 	if err := json.Unmarshal(payload, &record); err != nil {
 		return nil, err
 	}
-	if record.Version == 0 && record.Transaction == nil {
-		var legacy Snapshot
-		if err := json.Unmarshal(payload, &legacy); err != nil {
-			return nil, err
-		}
-		if legacy.ID == "" {
-			return nil, fmt.Errorf("journal snapshot has no id")
-		}
-		return &legacy, nil
-	}
 	if record.Version != journalFormatVersion {
-		return nil, fmt.Errorf("unsupported transaction journal version %d", record.Version)
+		return nil, fmt.Errorf("unsupported transaction journal version %d; clean bootstrap required", record.Version)
 	}
 	if record.Transaction == nil || record.Transaction.ID == "" {
 		return nil, fmt.Errorf("journal transaction is missing")

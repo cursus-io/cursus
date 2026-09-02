@@ -84,7 +84,6 @@ type Collector struct {
 	groupAssignments                *prometheus.Desc
 	groupCommittedOffset            *prometheus.Desc
 	groupLag                        *prometheus.Desc
-	legacyGroupLag                  *prometheus.Desc
 	groupOffsetOutOfRange           *prometheus.Desc
 	consumerMetadataRecovery        *prometheus.Desc
 	consumerMetadataRestoredGroups  *prometheus.Desc
@@ -164,7 +163,6 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		groupAssignments:                prometheus.NewDesc("cursus_consumer_group_assigned_partitions", "Partitions assigned to active group members.", []string{"group", "topic"}, nil),
 		groupCommittedOffset:            prometheus.NewDesc("cursus_consumer_group_committed_offset", "Committed next offset for a consumer group partition.", []string{"group", "topic", "partition"}, nil),
 		groupLag:                        prometheus.NewDesc("cursus_consumer_group_lag", "Committed-reader lag, max(high watermark - committed next offset, 0).", []string{"group", "topic", "partition"}, nil),
-		legacyGroupLag:                  prometheus.NewDesc("broker_consumer_lag", "Deprecated alias of cursus_consumer_group_lag.", []string{"topic", "partition", "group"}, nil),
 		groupOffsetOutOfRange:           prometheus.NewDesc("cursus_consumer_group_offset_out_of_range", "Whether a committed offset is outside the retained committed-readable range.", []string{"group", "topic", "partition"}, nil),
 		consumerMetadataRecovery:        prometheus.NewDesc("cursus_consumer_metadata_recovery_ready", "Whether durable consumer metadata recovery completed without error.", []string{"phase"}, nil),
 		consumerMetadataRestoredGroups:  prometheus.NewDesc("cursus_consumer_metadata_restored_groups", "Consumer groups restored during startup.", nil, nil),
@@ -208,7 +206,7 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		c.groupMembers, c.groupState, c.groupCoordinatorUp, c.groupLastActivity,
 		c.groupLastRebalance, c.groupObservationFailures,
 		c.groupGeneration, c.groupAssignments, c.groupCommittedOffset,
-		c.groupLag, c.legacyGroupLag, c.groupOffsetOutOfRange,
+		c.groupLag, c.groupOffsetOutOfRange,
 		c.consumerMetadataRecovery, c.consumerMetadataRestoredGroups, c.consumerMetadataRestoredOffsets,
 		c.consumerMetadataReplayedRecords, c.consumerMetadataOrphanRecords, c.consumerMetadataCorruptRecords,
 		c.activeStreams, c.storageHandlers,
@@ -355,7 +353,6 @@ func (c *Collector) collectGroups(
 			partitionLabel := strconv.Itoa(partition.Partition)
 			ch <- gauge(c.groupCommittedOffset, float64(committed), name, partition.Topic, partitionLabel)
 			ch <- gauge(c.groupLag, float64(lag), name, partition.Topic, partitionLabel)
-			ch <- gauge(c.legacyGroupLag, float64(lag), partition.Topic, partitionLabel, name)
 			ch <- gauge(c.groupOffsetOutOfRange, boolValue(outOfRange), name, partition.Topic, partitionLabel)
 		}
 	}

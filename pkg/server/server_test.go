@@ -180,10 +180,9 @@ func TestHealthHandlerSeparatesLivenessAndReadiness(t *testing.T) {
 	handler.ServeHTTP(live, httptest.NewRequest(http.MethodGet, "/live", nil))
 	assert.Equal(t, http.StatusOK, live.Code)
 
-	legacy := httptest.NewRecorder()
-	handler.ServeHTTP(legacy, httptest.NewRequest(http.MethodGet, "/health", nil))
-	assert.Equal(t, http.StatusServiceUnavailable, legacy.Code)
-	assert.Contains(t, legacy.Body.String(), "broker=starting")
+	removed := httptest.NewRecorder()
+	handler.ServeHTTP(removed, httptest.NewRequest(http.MethodGet, "/health", nil))
+	assert.Equal(t, http.StatusNotFound, removed.Code)
 
 	state.SetReady(true)
 	ready := httptest.NewRecorder()
@@ -197,10 +196,9 @@ func TestHealthHandlerSeparatesLivenessAndReadiness(t *testing.T) {
 	assert.Equal(t, http.StatusOK, ready.Code)
 	assert.Contains(t, ready.Body.String(), `"status":"ready"`)
 
-	legacy = httptest.NewRecorder()
-	handler.ServeHTTP(legacy, httptest.NewRequest(http.MethodGet, "/", nil))
-	assert.Equal(t, http.StatusOK, legacy.Code)
-	assert.Equal(t, "OK", legacy.Body.String())
+	removed = httptest.NewRecorder()
+	handler.ServeHTTP(removed, httptest.NewRequest(http.MethodGet, "/", nil))
+	assert.Equal(t, http.StatusNotFound, removed.Code)
 }
 
 func TestReadinessDoesNotDependOnConsumerGroupMembers(t *testing.T) {
@@ -507,7 +505,7 @@ func TestHandleCommandMessage_ListCluster(t *testing.T) {
 	assert.False(t, shouldExit)
 }
 
-func TestHandleConnection_Exit(t *testing.T) {
+func TestHandleConn_Exit(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -515,6 +513,8 @@ func TestHandleConnection_Exit(t *testing.T) {
 	defer func() { _ = l.Close() }()
 
 	cfg := config.DefaultConfig()
+	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = cmdHandler.Close() })
 	done := make(chan struct{})
 
 	go func() {
@@ -523,7 +523,7 @@ func TestHandleConnection_Exit(t *testing.T) {
 		if err != nil {
 			return
 		}
-		HandleConnection(context.Background(), conn, nil, cfg, nil, nil, nil)
+		handleConn(context.Background(), conn, cmdHandler)
 	}()
 
 	conn, _ := net.Dial("tcp", l.Addr().String())
@@ -537,16 +537,18 @@ func TestHandleConnection_Exit(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("HandleConnection failed to exit")
+		t.Fatal("handleConn failed to exit")
 	}
 }
 
-func TestHandleConnection_ContextCancel(t *testing.T) {
+func TestHandleConnSharedHandler_ContextCancel(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer func() { _ = l.Close() }()
 
 	cfg := config.DefaultConfig()
+	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = cmdHandler.Close() })
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 
@@ -556,7 +558,7 @@ func TestHandleConnection_ContextCancel(t *testing.T) {
 		if err != nil {
 			return
 		}
-		HandleConnection(ctx, conn, nil, cfg, nil, nil, nil)
+		handleConn(ctx, conn, cmdHandler)
 	}()
 
 	conn, err := net.Dial("tcp", l.Addr().String())
@@ -568,7 +570,7 @@ func TestHandleConnection_ContextCancel(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("HandleConnection did not exit after context cancel")
+		t.Fatal("handleConn did not exit after context cancel")
 	}
 }
 
@@ -579,6 +581,7 @@ func TestHandleConn_ImmediateClose(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cmdHandler := controller.NewCommandHandler(nil, cfg, nil, nil, nil)
+	t.Cleanup(func() { _ = cmdHandler.Close() })
 	done := make(chan struct{})
 
 	go func() {
@@ -809,39 +812,6 @@ func TestHandleConn_StreamCommandSetsIsStreamed(t *testing.T) {
 	}
 }
 
-func TestHandleConnection_StreamCommandSetsIsStreamed(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer func() { _ = l.Close() }()
-
-	cfg := config.DefaultConfig()
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		sConn, err := l.Accept()
-		if err != nil {
-			return
-		}
-		HandleConnection(context.Background(), sConn, nil, cfg, nil, nil, nil)
-	}()
-
-	conn, err := net.Dial("tcp", l.Addr().String())
-	require.NoError(t, err)
-	client := newWireTestClient(t, conn)
-
-	encoded := []byte("STREAM topic=test partition=0 group=g1")
-	msg := wireRequest(t, client, wire.CommandStream, encoded)
-	assert.Contains(t, msg, "ERROR")
-	_ = conn.Close()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("HandleConnection did not exit")
-	}
-}
-
 func TestHandleConn_ContextCancel(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -1044,6 +1014,5 @@ func TestInitializeConnection(t *testing.T) {
 }
 
 func TestConstants(t *testing.T) {
-	assert.Equal(t, 1000, maxWorkers)
 	assert.Equal(t, 9080, DefaultHealthCheckPort)
 }

@@ -28,12 +28,12 @@ func TestLeaderNodeFromDescribeRejectsUnknownLeader(t *testing.T) {
 }
 
 func TestValidateNodeHealthURLRestrictsLoopbackEndpoint(t *testing.T) {
-	if err := validateNodeHealthURL(2, "http://localhost:9082/health"); err != nil {
+	if err := validateNodeHealthURL(2, "http://localhost:9082/ready"); err != nil {
 		t.Fatalf("expected cluster health URL to be accepted: %v", err)
 	}
 	for _, candidate := range []string{
-		"http://example.com:9082/health",
-		"http://localhost:9081/health",
+		"http://example.com:9082/ready",
+		"http://localhost:9081/ready",
 		"http://localhost:9082/other",
 	} {
 		if err := validateNodeHealthURL(2, candidate); err == nil {

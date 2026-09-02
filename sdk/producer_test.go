@@ -129,7 +129,7 @@ func TestProducerClient_SelectBroker_NilConfig(t *testing.T) {
 
 func TestProducerClient_SelectBroker_NoBrokers(t *testing.T) {
 	cfg := &PublisherConfig{BrokerAddrs: []string{}}
-	pc, _ := NewProducerClient(cfg)
+	pc := &ProducerClient{config: cfg}
 	assert.Equal(t, "", pc.selectBroker())
 }
 
@@ -231,7 +231,7 @@ func TestProducerClient_Close_NilConns(t *testing.T) {
 
 func TestProducerClient_ConnectPartition_NoBroker(t *testing.T) {
 	cfg := &PublisherConfig{BrokerAddrs: []string{}}
-	pc, _ := NewProducerClient(cfg)
+	pc := &ProducerClient{config: cfg}
 	err := pc.ConnectPartition(0, "")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "no broker address available")
@@ -404,10 +404,10 @@ func TestProducer_ParseAckResponse_ErrorPrefix(t *testing.T) {
 		client: mustNewProducerClient(NewDefaultPublisherConfig()),
 	}
 
-	_, err := p.parseAckResponse([]byte("ERROR: broker busy"))
+	_, err := p.parseAckResponse([]byte(`ERROR: broker_error class=internal retryable=false reason="busy"`))
 	var brokerErr *BrokerError
 	require.True(t, errors.As(err, &brokerErr))
-	assert.Equal(t, "broker", brokerErr.Code)
+	assert.Equal(t, "broker_error", brokerErr.Code)
 	assert.Equal(t, ErrorClassInternal, brokerErr.Class)
 	assert.False(t, brokerErr.Retryable)
 }
@@ -936,8 +936,8 @@ func TestNewProducerClient_TLSError(t *testing.T) {
 
 func TestProducerClient_ReconnectPartition_EmptyAddrFallsBackToSelectBroker(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
-	cfg.BrokerAddrs = []string{}
 	pc, _ := NewProducerClient(cfg)
+	pc.config.BrokerAddrs = nil
 
 	err := pc.ReconnectPartition(0, "")
 	require.Error(t, err)

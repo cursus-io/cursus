@@ -9,8 +9,6 @@ the client protocol listener.
 |---|---|---|---|
 | `9080` | `GET /live` | JSON | Process liveness |
 | `9080` | `GET /ready` | JSON | Broker and dependency readiness |
-| `9080` | `GET /health` | Plain text | Backward-compatible readiness check |
-| `9080` | `GET /` | Plain text | Alias of `/health` |
 | `9100` | `GET /metrics` | Prometheus/OpenMetrics | Broker metrics when the exporter is enabled |
 
 Only `GET` and `HEAD` are accepted by health endpoints. Other methods return
@@ -55,12 +53,7 @@ during election or loss of cluster leadership.
 }
 ```
 
-`/health` remains compatible with existing container checks:
-
-```text
-HTTP 200: OK
-HTTP 503: Broker not ready: <failed-check>=<reason>
-```
+Only `/live` and `/ready` are registered. `/health` and `/` return HTTP 404.
 
 Recommended Kubernetes probes:
 
@@ -216,9 +209,8 @@ tail data is not reported as consumable work. For an exact-topic group with no
 stored offset, the collector applies the broker's earliest default of `0`.
 Wildcard groups expose partitions for which broker offset state exists.
 
-`broker_consumer_lag{topic,partition,group}` remains as a deprecated alias with
-the same scrape-time HWM semantics. New dashboards should use
-`cursus_consumer_group_lag`.
+Wire v2 exposes only `cursus_consumer_group_lag`; the former
+`broker_consumer_lag` alias is not registered.
 
 ### Cluster State
 
@@ -235,20 +227,21 @@ the same scrape-time HWM semantics. New dashboards should use
 | `cursus_cluster_partition_leader_epoch{topic,partition}` | Current leader epoch |
 | `cursus_cluster_partition_leader{topic,partition,broker_id}` | Current leader identity (`1`) |
 | `cluster_replication_lag_seconds{topic,partition,broker}` | Successful follower acknowledgement latency |
-| `cluster_quorum_operations_total{operation,result}` | Instrumented quorum operation results |
 
-The historical `cluster_*` vectors that are not listed above are compatibility
-surfaces and may have no series unless their corresponding operation occurs.
+`cluster_replication_lag_seconds` is the only operation-time cluster metric.
 Use the `cursus_cluster_*` scrape-time metrics for current topology and health.
 
 ### Transaction State
 
-Transaction-state gauges are not exported yet. Operators can inspect a known
-transaction with `TXN_STATUS`, and command failures are counted by
-`cursus_broker_command_errors_total{command,code}`. Until bounded transaction
-state, recovery, and age metrics are added, alerting cannot directly detect a
-transaction that remains in `committing`; recovery logs and command errors are
-the current operational signals.
+| Metric | Meaning |
+|---|---|
+| `cursus_transaction_recovery_ready` | Transaction state recovery completed before serving |
+| `cursus_transactions{state}` | Transactions retained by coordinator state |
+| `cursus_transactions_expired` | Expired transaction identities awaiting replacement or compaction |
+| `cursus_transaction_oldest_active_seconds` | Age of the oldest open or committing transaction |
+
+Use these gauges with `cursus_broker_command_errors_total{command,code}` and the
+[transaction alert runbook](../operations/transaction-alerts.md).
 
 ## Configuration
 
@@ -317,10 +310,4 @@ Do not expose the metrics listener as a public application endpoint.
 curl -fsS http://localhost:9080/live
 curl -fsS http://localhost:9080/ready
 curl -fsS http://localhost:9100/metrics | grep '^cursus_'
-```
-
-The compatibility probe remains:
-
-```bash
-curl -fsS http://localhost:9080/health
 ```

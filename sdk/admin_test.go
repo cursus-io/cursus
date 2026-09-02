@@ -51,12 +51,11 @@ func TestParseTopicDefinitionResponse(t *testing.T) {
 	require.Equal(t, []string{"writer"}, definition.WriteACL)
 }
 
-func TestParseLegacyTopicDefinitionDefaultsLifecycleEpoch(t *testing.T) {
-	definition, err := parseTopicDefinitionResponse(
+func TestParseTopicDefinitionRequiresLifecycleEpoch(t *testing.T) {
+	_, err := parseTopicDefinitionResponse(
 		"OK topic=orders partitions=1 revision=1 replication_factor=1 idempotent=false event_sourcing=false cleanup_policy=delete partitioner=hash_key auth_policy=open read_acl= write_acl= retention_hours=0 retention_bytes=0",
 	)
-	require.NoError(t, err)
-	require.Equal(t, uint64(1), definition.LifecycleEpoch)
+	require.ErrorContains(t, err, "missing lifecycle_epoch")
 }
 
 func TestBuildAndParseAdminDeleteTopic(t *testing.T) {
@@ -127,7 +126,7 @@ func TestAdminClientDoesNotReplayAmbiguousTruncate(t *testing.T) {
 func TestAdminClientRetriesRetryableFailureOnNextBroker(t *testing.T) {
 	firstAddr, firstResult := startAdminTestServer(t, "ERROR: no_raft_leader class=availability retryable=true")
 	secondAddr, secondResult := startAdminTestServer(t,
-		"OK topic=orders partitions=3 revision=1 replication_factor=3 idempotent=false event_sourcing=false cleanup_policy=delete partitioner=hash_key auth_policy=open read_acl= write_acl= retention_hours=0 retention_bytes=0",
+		"OK topic=orders partitions=3 revision=1 replication_factor=3 idempotent=false event_sourcing=false cleanup_policy=delete partitioner=hash_key auth_policy=open read_acl= write_acl= retention_hours=0 retention_bytes=0 lifecycle_epoch=1",
 	)
 	client, err := NewAdminClient(&AdminConfig{
 		BrokerAddrs:      []string{firstAddr, secondAddr},
@@ -144,14 +143,13 @@ func TestAdminClientRetriesRetryableFailureOnNextBroker(t *testing.T) {
 	require.Equal(t, "CREATE topic=orders partitions=3", receiveAdminTestCommand(t, secondResult))
 }
 
-func TestAdminClientRetriesNegotiationTransportFailureOnNextBroker(t *testing.T) {
+func TestAdminClientRetriesHandshakeTransportFailureOnNextBroker(t *testing.T) {
 	firstAddr, firstResult := startAdminNegotiationTestServer(t, true)
 	secondAddr, secondResult := startAdminNegotiationTestServer(t, false)
 	client, err := NewAdminClient(&AdminConfig{
 		BrokerAddrs:      []string{firstAddr, secondAddr},
 		MaxRetries:       1,
 		RequestTimeoutMS: 1000,
-		ProtocolVersion:  2,
 	})
 	require.NoError(t, err)
 
@@ -163,7 +161,7 @@ func TestAdminClientRetriesNegotiationTransportFailureOnNextBroker(t *testing.T)
 }
 
 func TestAdminClientRetriesAmbiguousDeleteOnlyWhenExplicitlyIdempotent(t *testing.T) {
-	t.Run("legacy delete stops with unknown outcome", func(t *testing.T) {
+	t.Run("non-idempotent delete stops with unknown outcome", func(t *testing.T) {
 		firstAddr, firstResult := startAdminCommandDropServer(t)
 		secondAddr, secondResult := startAdminTestServer(t, "OK topic=orders deleted=true")
 		client, err := NewAdminClient(&AdminConfig{
@@ -176,7 +174,7 @@ func TestAdminClientRetriesAmbiguousDeleteOnlyWhenExplicitlyIdempotent(t *testin
 		require.Equal(t, "DELETE topic=orders", receiveAdminTestCommand(t, firstResult))
 		select {
 		case result := <-secondResult:
-			t.Fatalf("legacy delete unexpectedly retried on the second broker: %+v", result)
+			t.Fatalf("non-idempotent delete unexpectedly retried on the second broker: %+v", result)
 		case <-time.After(100 * time.Millisecond):
 		}
 	})
@@ -270,7 +268,7 @@ func startAdminNegotiationTestServer(t *testing.T, closeAfterNegotiation bool) (
 			result <- adminTestResult{err: readErr}
 			return
 		}
-		if writeErr := writeWireTestResponse(connection, request, "OK topic=orders partitions=4 revision=1 replication_factor=3 idempotent=false event_sourcing=false cleanup_policy=delete partitioner=hash_key auth_policy=open read_acl= write_acl= retention_hours=0 retention_bytes=0"); writeErr != nil {
+		if writeErr := writeWireTestResponse(connection, request, "OK topic=orders partitions=4 revision=1 replication_factor=3 idempotent=false event_sourcing=false cleanup_policy=delete partitioner=hash_key auth_policy=open read_acl= write_acl= retention_hours=0 retention_bytes=0 lifecycle_epoch=1"); writeErr != nil {
 			result <- adminTestResult{err: writeErr}
 			return
 		}

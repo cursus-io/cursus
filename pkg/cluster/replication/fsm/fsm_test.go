@@ -94,6 +94,13 @@ func newTestFSM() *BrokerFSM {
 	return fsm
 }
 
+func testTopicCommand(name string, partitions, replicationFactor int) TopicCommand {
+	definition := topic.DefaultDefinition(name, nil)
+	definition.Partitions = partitions
+	definition.ReplicationFactor = replicationFactor
+	return TopicCommand{Definition: &definition}
+}
+
 func snapshotTopicDefinition(name string, partitions int) *topic.Definition {
 	definition := topic.DefaultDefinition(name, nil)
 	definition.Partitions = partitions
@@ -229,7 +236,7 @@ func TestBrokerFSM_PartitionCommitIsMonotonicAndEpochFenced(t *testing.T) {
 func TestBrokerFSM_SnapshotRestoresAuthoritativeZeroWatermark(t *testing.T) {
 	f := newTestFSM()
 	registerActiveBroker(t, f, "node-1")
-	command, err := json.Marshal(TopicCommand{Name: "orders", Partitions: 1, ReplicationFactor: 1, Policy: topic.DefaultPolicy()})
+	command, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 	require.Nil(t, f.Apply(&raft.Log{Data: []byte("TOPIC:" + string(command)), Index: 6}))
 	metadata := PartitionMetadata{
@@ -476,11 +483,7 @@ func TestBrokerFSM_TopicCreation_ReplicaSubset(t *testing.T) {
 	}
 
 	// Create topic with replication_factor=3
-	topicCmd := TopicCommand{
-		Name:              "test-topic",
-		Partitions:        6,
-		ReplicationFactor: 3,
-	}
+	topicCmd := testTopicCommand("test-topic", 6, 3)
 	data, _ := json.Marshal(topicCmd)
 	result := fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", data)), Index: 10})
 	if err, ok := result.(error); ok && err != nil {
@@ -537,10 +540,7 @@ func TestBrokerFSM_TopicCreation_DefaultRF_Capped(t *testing.T) {
 		fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", data)), Index: uint64(i)})
 	}
 
-	topicCmd := TopicCommand{
-		Name:       "capped-rf-topic",
-		Partitions: 4,
-	}
+	topicCmd := testTopicCommand("capped-rf-topic", 4, 0)
 	data, _ := json.Marshal(topicCmd)
 	fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", data)), Index: 10})
 
@@ -570,10 +570,7 @@ func TestBrokerFSM_TopicCreation_DefaultRF_Satisfied(t *testing.T) {
 		fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", data)), Index: uint64(i)})
 	}
 
-	topicCmd := TopicCommand{
-		Name:       "default-rf-topic",
-		Partitions: 4,
-	}
+	topicCmd := testTopicCommand("default-rf-topic", 4, 0)
 	data, _ := json.Marshal(topicCmd)
 	fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", data)), Index: 10})
 
@@ -613,11 +610,7 @@ func TestBrokerFSM_TopicCreation_ConsistentHashing_Stability(t *testing.T) {
 			fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", data)), Index: uint64(i)})
 		}
 
-		topicCmd := TopicCommand{
-			Name:              "stable-topic",
-			Partitions:        8,
-			ReplicationFactor: 2,
-		}
+		topicCmd := testTopicCommand("stable-topic", 8, 2)
 		data, _ := json.Marshal(topicCmd)
 		fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", data)), Index: 10})
 
@@ -683,11 +676,7 @@ func TestBrokerFSM_Snapshot_Restore_WithReplicas(t *testing.T) {
 	}
 
 	// Create topic with replication_factor=2
-	topicCmd := TopicCommand{
-		Name:              "snap-topic",
-		Partitions:        4,
-		ReplicationFactor: 2,
-	}
+	topicCmd := testTopicCommand("snap-topic", 4, 2)
 	data, _ := json.Marshal(topicCmd)
 	f.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", data)), Index: 10})
 
@@ -767,7 +756,7 @@ func TestBrokerFSM_TopicDelete(t *testing.T) {
 	f.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", data)), Index: 1})
 
 	// Create topic
-	topicCmd := TopicCommand{Name: "delete-me", Partitions: 3, ReplicationFactor: 1}
+	topicCmd := testTopicCommand("delete-me", 3, 1)
 	tdata, _ := json.Marshal(topicCmd)
 	f.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", tdata)), Index: 2})
 
@@ -794,7 +783,7 @@ func TestBrokerFSM_TopicCreation_InvalidPartitionCount(t *testing.T) {
 	f.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", data)), Index: 1})
 
 	// Zero partitions
-	topicCmd := TopicCommand{Name: "bad-topic", Partitions: 0}
+	topicCmd := testTopicCommand("bad-topic", 0, 0)
 	tdata, _ := json.Marshal(topicCmd)
 	result := f.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", tdata)), Index: 2})
 	if result == nil {
@@ -802,7 +791,7 @@ func TestBrokerFSM_TopicCreation_InvalidPartitionCount(t *testing.T) {
 	}
 
 	// Negative partitions
-	topicCmd2 := TopicCommand{Name: "bad-topic2", Partitions: -1}
+	topicCmd2 := testTopicCommand("bad-topic2", -1, 0)
 	tdata2, _ := json.Marshal(topicCmd2)
 	result2 := f.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", tdata2)), Index: 3})
 	if result2 == nil {
@@ -813,7 +802,7 @@ func TestBrokerFSM_TopicCreation_InvalidPartitionCount(t *testing.T) {
 func TestBrokerFSM_TopicCreation_NoBrokers(t *testing.T) {
 	f := newTestFSM()
 
-	topicCmd := TopicCommand{Name: "no-broker-topic", Partitions: 2}
+	topicCmd := testTopicCommand("no-broker-topic", 2, 0)
 	tdata, _ := json.Marshal(topicCmd)
 	result := f.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", tdata)), Index: 1})
 	if result == nil {
@@ -833,12 +822,8 @@ func TestBrokerFSM_TopicCreation_ExplicitLeader(t *testing.T) {
 		f.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", data)), Index: uint64(i)})
 	}
 
-	topicCmd := TopicCommand{
-		Name:              "leader-topic",
-		Partitions:        2,
-		LeaderID:          "b2",
-		ReplicationFactor: 2,
-	}
+	topicCmd := testTopicCommand("leader-topic", 2, 2)
+	topicCmd.LeaderID = "b2"
 	tdata, _ := json.Marshal(topicCmd)
 	result := f.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", tdata)), Index: 10})
 	if err, ok := result.(error); ok && err != nil {
@@ -887,7 +872,8 @@ func TestBrokerFSM_TopicCreation_ExplicitLeader_NotInBrokers(t *testing.T) {
 	data, _ := json.Marshal(BrokerInfo{ID: "b1", Addr: "localhost:9001", Status: "active"})
 	f.Apply(&raft.Log{Data: []byte(fmt.Sprintf("REGISTER:%s", data)), Index: 1})
 
-	topicCmd := TopicCommand{Name: "bad-leader", Partitions: 1, LeaderID: "nonexistent"}
+	topicCmd := testTopicCommand("bad-leader", 1, 0)
+	topicCmd.LeaderID = "nonexistent"
 	tdata, _ := json.Marshal(topicCmd)
 	result := f.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", tdata)), Index: 2})
 	if result == nil {
@@ -1096,6 +1082,12 @@ func TestBrokerFSMOffsetSyncRejectsStaleGeneration(t *testing.T) {
 		t.Fatalf("add member: %v", err)
 	}
 	f := NewBrokerFSM(tm, cd)
+	unfenced := &raft.Log{Data: []byte(`OFFSET_SYNC:{"group":"workers","topic":"events","partition":0,"offset":4}`)}
+	result := f.Apply(unfenced)
+	applyErr, ok := result.(error)
+	if !ok || applyErr.Error() != "OFFSET_SYNC requires group, topic, member, and generation" {
+		t.Fatalf("expected missing ownership fence rejection, got %T %v", result, result)
+	}
 
 	valid := &raft.Log{Data: []byte(`OFFSET_SYNC:{"group":"workers","topic":"events","member":"member-1","generation":1,"partition":0,"offset":5}`)}
 	if result := f.Apply(valid); result != nil {
@@ -1106,7 +1098,7 @@ func TestBrokerFSMOffsetSyncRejectsStaleGeneration(t *testing.T) {
 		t.Fatalf("add second member: %v", err)
 	}
 	stale := &raft.Log{Data: []byte(`OFFSET_SYNC:{"group":"workers","topic":"events","member":"member-1","generation":1,"partition":0,"offset":6}`)}
-	result := f.Apply(stale)
+	result = f.Apply(stale)
 	err, ok := result.(error)
 	if !ok {
 		t.Fatalf("expected stale generation error, got %T %v", result, result)

@@ -1229,7 +1229,12 @@ func loadHWMCheckpoint(path string) (uint64, bool) {
 	return hwm, true
 }
 
-type producerStateCheckpoint map[string]producerStateCheckpointEntry
+const producerStateCheckpointVersion = 2
+
+type producerStateCheckpoint struct {
+	Version   int                                     `json:"version"`
+	Producers map[string]producerStateCheckpointEntry `json:"producers"`
+}
 
 type producerStateCheckpointEntry struct {
 	Epoch int64  `json:"epoch"`
@@ -1278,20 +1283,13 @@ func (p *Partition) loadProducerStateCheckpoint() {
 	if err != nil {
 		return
 	}
-	var checkpoint producerStateCheckpoint
-	if err := json.Unmarshal(data, &checkpoint); err != nil {
-		var legacy map[string]uint64
-		if legacyErr := json.Unmarshal(data, &legacy); legacyErr != nil {
-			util.Warn("ignoring invalid producer state checkpoint %s: %v", p.producerStatePath, err)
-			return
-		}
-		checkpoint = make(producerStateCheckpoint, len(legacy))
-		for producerID, lastSeq := range legacy {
-			checkpoint[producerID] = producerStateCheckpointEntry{Seq: lastSeq}
-		}
+	checkpoint, err := decodeProducerStateCheckpoint(data)
+	if err != nil {
+		util.Warn("ignoring invalid producer state checkpoint %s: %v", p.producerStatePath, err)
+		return
 	}
 	now := time.Now()
-	for producerID, entry := range checkpoint {
+	for producerID, entry := range checkpoint.Producers {
 		if producerID == "" || entry.Seq == 0 {
 			continue
 		}
@@ -1299,12 +1297,29 @@ func (p *Partition) loadProducerStateCheckpoint() {
 	}
 }
 
+func decodeProducerStateCheckpoint(data []byte) (producerStateCheckpoint, error) {
+	var checkpoint producerStateCheckpoint
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		return producerStateCheckpoint{}, fmt.Errorf("decode producer state checkpoint: %w", err)
+	}
+	if checkpoint.Version != producerStateCheckpointVersion {
+		return producerStateCheckpoint{}, fmt.Errorf("unsupported producer state checkpoint version %d; clean bootstrap required", checkpoint.Version)
+	}
+	if checkpoint.Producers == nil {
+		return producerStateCheckpoint{}, fmt.Errorf("producer state checkpoint is missing producers")
+	}
+	return checkpoint, nil
+}
+
 func (p *Partition) persistProducerStateCheckpoint() {
 	if p.producerStatePath == "" {
 		return
 	}
 
-	checkpoint := make(producerStateCheckpoint)
+	checkpoint := producerStateCheckpoint{
+		Version:   producerStateCheckpointVersion,
+		Producers: make(map[string]producerStateCheckpointEntry),
+	}
 	p.producerState.Range(func(key, value any) bool {
 		producerID, ok := key.(string)
 		if !ok || producerID == "" {
@@ -1314,7 +1329,7 @@ func (p *Partition) persistProducerStateCheckpoint() {
 		if !ok || entry.lastSeq == 0 {
 			return true
 		}
-		checkpoint[producerID] = producerStateCheckpointEntry{Epoch: entry.lastEpoch, Seq: entry.lastSeq}
+		checkpoint.Producers[producerID] = producerStateCheckpointEntry{Epoch: entry.lastEpoch, Seq: entry.lastSeq}
 		return true
 	})
 

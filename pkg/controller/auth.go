@@ -120,11 +120,9 @@ func (ch *CommandHandler) authorizeClientPermissions(command string, args map[st
 	if user == nil {
 		return fmt.Sprintf("ERROR: authentication_failed principal=%s", ctx.Principal)
 	}
-	if len(user.Permissions) > 0 {
-		for _, permission := range permissions {
-			if !hasPermission(user.Permissions, permission) {
-				return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_OPERATION command=%s permission=%s", command, permission)
-			}
+	for _, permission := range permissions {
+		if !hasPermission(user.Permissions, permission) {
+			return fmt.Sprintf("ERROR: NOT_AUTHORIZED_FOR_OPERATION command=%s permission=%s", command, permission)
 		}
 	}
 

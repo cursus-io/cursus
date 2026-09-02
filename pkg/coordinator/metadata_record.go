@@ -23,8 +23,7 @@ const (
 )
 
 // TopicOffsetSnapshot is a complete durable next-offset snapshot for one
-// group/topic pair. A registration can carry legacy offsets while upgrading
-// an older log that did not persist group lifecycle metadata.
+// group/topic pair.
 type TopicOffsetSnapshot struct {
 	Topic    string       `json:"topic"`
 	Revision uint64       `json:"revision"`
@@ -60,7 +59,6 @@ type ConsumerMetadataRecoveryStatus struct {
 	ReplayedRecords     int    `json:"replayed_records"`
 	RegistrationRecords int    `json:"registration_records"`
 	OffsetRecords       int    `json:"offset_records"`
-	LegacyRecords       int    `json:"legacy_records"`
 	OrphanRecords       int    `json:"orphan_records"`
 	CorruptRecords      int    `json:"corrupt_records"`
 }
@@ -72,8 +70,6 @@ type lifecycleCandidate struct {
 type offsetCandidate struct {
 	record ConsumerMetadataRecord
 }
-
-type legacyRecoveryState map[string]map[string]map[int]uint64
 
 func (c *Coordinator) RecoverySnapshot() ConsumerMetadataRecoveryStatus {
 	if c == nil {
@@ -361,8 +357,6 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 	status := ConsumerMetadataRecoveryStatus{Phase: "consumer_metadata_scan"}
 	lifecycles := make(map[string]lifecycleCandidate)
 	offsetSnapshots := make(map[string]offsetCandidate)
-	legacy := make(legacyRecoveryState)
-	legacyRecordCounts := make(map[string]int)
 
 	for partition := 0; partition < c.offsetTopicPartitionCount; partition++ {
 		next := uint64(0)
@@ -440,29 +434,12 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 					continue
 				}
 
-				groupName, topicName, offsets, parseErr := parseOffsetLogPayload(message.Payload)
-				if parseErr != nil {
-					status.CorruptRecords++
-					return status, fmt.Errorf("decode legacy offset partition=%d offset=%d: %w", partition, message.Offset, parseErr)
+				if c.migrationAuthoritative {
+					status.OrphanRecords++
+					continue
 				}
-				status.LegacyRecords++
-				legacyRecordCounts[groupName]++
-				if legacy[groupName] == nil {
-					legacy[groupName] = make(map[string]map[int]uint64)
-				}
-				if legacy[groupName][topicName] == nil {
-					legacy[groupName][topicName] = make(map[int]uint64)
-				}
-				for _, item := range offsets {
-					if item.Partition < 0 {
-						status.CorruptRecords++
-						return status, fmt.Errorf("legacy offset contains negative partition %d", item.Partition)
-					}
-					current, exists := legacy[groupName][topicName][item.Partition]
-					if !exists || item.Offset > current {
-						legacy[groupName][topicName][item.Partition] = item.Offset
-					}
-				}
+				status.CorruptRecords++
+				return status, fmt.Errorf("unversioned internal metadata partition=%d offset=%d; clean bootstrap required", partition, message.Offset)
 			}
 			if previous <= next {
 				status.CorruptRecords++
@@ -475,13 +452,6 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 		}
 	}
 
-	if c.migrationAuthoritative {
-		for _, count := range legacyRecordCounts {
-			status.OrphanRecords += count
-		}
-		legacy = make(legacyRecoveryState)
-		legacyRecordCounts = make(map[string]int)
-	}
 	for _, raw := range c.migrationRecords {
 		record := canonicalConsumerMetadataRecord(raw)
 		if err := validateConsumerMetadataRecord(record); err != nil {
@@ -523,7 +493,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 	}
 
 	status.Phase = "group_registration_replay"
-	groups, groupEpochs, orphanCount, err := materializeConsumerMetadata(lifecycles, offsetSnapshots, legacy, legacyRecordCounts, &status)
+	groups, groupEpochs, orphanCount, err := materializeConsumerMetadata(lifecycles, offsetSnapshots, &status)
 	status.OrphanRecords += orphanCount
 	if err != nil {
 		status.CorruptRecords++
@@ -548,8 +518,6 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 func materializeConsumerMetadata(
 	lifecycles map[string]lifecycleCandidate,
 	offsetSnapshots map[string]offsetCandidate,
-	legacy legacyRecoveryState,
-	legacyRecordCounts map[string]int,
 	status *ConsumerMetadataRecoveryStatus,
 ) (map[string]*GroupMetadata, map[string]uint64, int, error) {
 	groups := make(map[string]*GroupMetadata)
@@ -584,44 +552,6 @@ func materializeConsumerMetadata(
 			group.OffsetRevisions[snapshot.Topic] = snapshot.Revision
 		}
 		groups[groupName] = group
-	}
-
-	legacyNames := make([]string, 0, len(legacy))
-	for groupName := range legacy {
-		legacyNames = append(legacyNames, groupName)
-	}
-	sort.Strings(legacyNames)
-	for _, groupName := range legacyNames {
-		if _, hasLifecycle := lifecycles[groupName]; hasLifecycle {
-			orphans += legacyRecordCounts[groupName]
-			continue
-		}
-		topics := make([]string, 0, len(legacy[groupName]))
-		for topicName := range legacy[groupName] {
-			topics = append(topics, topicName)
-		}
-		sort.Strings(topics)
-		if len(topics) != 1 {
-			return nil, nil, orphans, fmt.Errorf("legacy group %q has offsets for %d topics and no durable registration", groupName, len(topics))
-		}
-		topicName := topics[0]
-		partitionCount := 0
-		for partition := range legacy[groupName][topicName] {
-			if partition+1 > partitionCount {
-				partitionCount = partition + 1
-			}
-		}
-		partitions := make([]int, partitionCount)
-		for partition := range partitions {
-			partitions[partition] = partition
-		}
-		groups[groupName] = &GroupMetadata{
-			TopicName:       topicName,
-			Members:         make(map[string]*MemberMetadata),
-			Partitions:      partitions,
-			Offsets:         map[string]map[int]uint64{topicName: clonePartitionOffsets(legacy[groupName][topicName])},
-			OffsetRevisions: make(map[string]uint64),
-		}
 	}
 
 	if status != nil {
@@ -707,14 +637,6 @@ func offsetItemsToMap(items []OffsetItem) map[int]uint64 {
 	result := make(map[int]uint64, len(items))
 	for _, item := range items {
 		result[item.Partition] = item.Offset
-	}
-	return result
-}
-
-func clonePartitionOffsets(source map[int]uint64) map[int]uint64 {
-	result := make(map[int]uint64, len(source))
-	for partition, offset := range source {
-		result[partition] = offset
 	}
 	return result
 }

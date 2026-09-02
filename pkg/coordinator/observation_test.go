@@ -155,7 +155,7 @@ func TestObserveConsumerGroupsDoesNotFabricateUnknownGroup(t *testing.T) {
 	require.Empty(t, coordinator.ObserveConsumerGroups())
 }
 
-func TestGroupSnapshotRestoresLastActivityCompatibly(t *testing.T) {
+func TestGroupSnapshotRequiresLastActivity(t *testing.T) {
 	coordinator := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
 	t.Cleanup(coordinator.Stop)
 	require.NoError(t, coordinator.RegisterGroup("events", "workers", 1))
@@ -166,13 +166,13 @@ func TestGroupSnapshotRestoresLastActivityCompatibly(t *testing.T) {
 
 	restored := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
 	t.Cleanup(restored.Stop)
-	restored.ImportState(coordinator.ExportState())
+	require.NoError(t, restored.ImportState(coordinator.ExportState()))
 	assert.Equal(t, time.Unix(100, 0), requireSingleObservation(t, restored).LastActivity)
 
-	legacy := coordinator.ExportState()
-	legacy["workers"].LastActivity = time.Time{}
-	restored.ImportState(legacy)
-	assert.Equal(t, time.Unix(90, 0), requireSingleObservation(t, restored).LastActivity)
+	incomplete := coordinator.ExportState()
+	incomplete["workers"].LastActivity = time.Time{}
+	require.ErrorContains(t, restored.ImportState(incomplete), "missing last activity")
+	assert.Equal(t, time.Unix(100, 0), requireSingleObservation(t, restored).LastActivity)
 }
 
 func requireSingleObservation(t *testing.T, coordinator *Coordinator) ConsumerGroupObservation {

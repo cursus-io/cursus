@@ -130,12 +130,12 @@ func TestInlineAuthenticationAndInternalContextRespectBoundaries(t *testing.T) {
 	}
 }
 
-func TestEmptyPermissionListPreservesLegacyAuthenticatedAccess(t *testing.T) {
-	ch := authorizationHandler(t, []config.SASLUser{{Principal: "legacy", Token: "secret"}})
-	ctx := authenticateTestUser(t, ch, "legacy", "secret")
+func TestEmptyPermissionListDeniesProtectedCommands(t *testing.T) {
+	ch := authorizationHandler(t, []config.SASLUser{{Principal: "restricted", Token: "secret"}})
+	ctx := authenticateTestUser(t, ch, "restricted", "secret")
 
-	resp := ch.HandleCommand("CREATE topic=legacy-topic partitions=1", ctx)
-	if !strings.HasPrefix(resp, "OK ") {
-		t.Fatalf("legacy user with omitted permissions lost access: %s", resp)
+	resp := ch.HandleCommand("CREATE topic=restricted-topic partitions=1", ctx)
+	if !strings.Contains(resp, "permission=admin") {
+		t.Fatalf("user with omitted permissions accessed a protected command: %s", resp)
 	}
 }

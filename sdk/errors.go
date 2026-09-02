@@ -63,7 +63,7 @@ func (e *BrokerError) Is(target error) bool {
 
 func ParseBrokerError(response string) (*BrokerError, bool) {
 	parsed, ok := wireprotocol.ParseErrorResponse(response)
-	if !ok {
+	if !ok || !parsed.ExplicitClassification {
 		return nil, false
 	}
 	fields := make(map[string]string, len(parsed.Fields))
