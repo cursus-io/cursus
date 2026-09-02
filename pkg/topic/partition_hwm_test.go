@@ -418,7 +418,7 @@ func TestPartition_ReadCommittedStopsAtUnresolvedOpenTransaction(t *testing.T) {
 	dh.On("GetLatestOffset").Return(uint64(0)).Once()
 	dh.On("GetFlushedOffset").Return(uint64(5)).Once()
 	dh.On("GetFirstOffset").Return(uint64(0)).Once()
-	dh.On("ReadMessages", uint64(0), 5).Return([]types.Message{
+	dh.On("ReadMessages", uint64(0), 1).Return([]types.Message{
 		{Offset: 0, Payload: "plain"},
 		{Offset: 1, Payload: "open", TransactionalID: "tx-open", TransactionState: types.TransactionStateOpen},
 		{Offset: 2, Payload: "committed", TransactionalID: "tx-commit", TransactionState: types.TransactionStateCommitted},
@@ -428,6 +428,7 @@ func TestPartition_ReadCommittedStopsAtUnresolvedOpenTransaction(t *testing.T) {
 
 	p := NewPartition(0, "orders", dh, nil, cfg)
 	p.SetHWM(5)
+	p.indexTransactionMessage(types.Message{Offset: 1, TransactionalID: "tx-open", TransactionState: types.TransactionStateOpen})
 
 	msgs, err := p.ReadCommitted(0, 5)
 	require.NoError(t, err)
@@ -453,6 +454,10 @@ func TestPartition_ReadCommittedUsesTransactionMarkers(t *testing.T) {
 
 	p := NewPartition(0, "orders", dh, nil, cfg)
 	p.SetHWM(6)
+	p.indexTransactionMessage(types.Message{Offset: 1, TransactionalID: "tx-commit", TransactionState: types.TransactionStateOpen})
+	p.indexTransactionMessage(types.Message{Offset: 2, TransactionalID: "tx-commit", TransactionMarker: types.TransactionMarkerCommit})
+	p.indexTransactionMessage(types.Message{Offset: 3, TransactionalID: "tx-abort", TransactionState: types.TransactionStateOpen})
+	p.indexTransactionMessage(types.Message{Offset: 4, TransactionalID: "tx-abort", TransactionMarker: types.TransactionMarkerAbort})
 
 	msgs, err := p.ReadCommitted(0, 10)
 	require.NoError(t, err)
@@ -468,13 +473,12 @@ func TestPartition_ReadCommittedWaitsForCoordinatorCommitDecision(t *testing.T) 
 	dh := new(MockStorageHandler)
 	dh.On("GetLatestOffset").Return(uint64(0)).Once()
 	dh.On("GetFlushedOffset").Return(uint64(3)).Times(4)
+	dh.On("GetFirstOffset").Return(uint64(0)).Times(4)
 	dh.On("ReadMessages", uint64(0), 3).Return([]types.Message{
 		{Offset: 0, Payload: "transactional", TransactionalID: "tx-decision", TransactionState: types.TransactionStateOpen, Epoch: 4},
 		{Offset: 1, Payload: "commit-marker", TransactionalID: "tx-decision", TransactionMarker: types.TransactionMarkerCommit, Epoch: 4},
 		{Offset: 2, Payload: "after"},
 	}, nil).Once()
-	dh.On("GetFirstOffset").Return(uint64(0)).Twice()
-
 	p := NewPartition(0, "orders", dh, nil, cfg)
 	p.SetHWM(3)
 	p.indexTransactionMessage(types.Message{Offset: 0, TransactionalID: "tx-decision", TransactionState: types.TransactionStateOpen, Epoch: 4})
@@ -512,6 +516,8 @@ func TestPartition_ReadCommittedScansPastSmallVisibleBatchToFindMarker(t *testin
 	p := NewPartition(0, "orders", dh, nil, cfg)
 	p.SetHWM(3)
 
+	p.indexTransactionMessage(types.Message{Offset: 0, TransactionalID: "tx-commit", TransactionState: types.TransactionStateOpen})
+	p.indexTransactionMessage(types.Message{Offset: 1, TransactionalID: "tx-commit", TransactionMarker: types.TransactionMarkerCommit})
 	msgs, err := p.ReadCommitted(0, 1)
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)
@@ -546,7 +552,7 @@ func TestPartition_ReadCommittedSeparatesMarkersByEpoch(t *testing.T) {
 	dh.On("GetLatestOffset").Return(uint64(0)).Once()
 	dh.On("GetFlushedOffset").Return(uint64(4)).Once()
 	dh.On("GetFirstOffset").Return(uint64(0)).Once()
-	dh.On("ReadMessages", uint64(0), 4).Return([]types.Message{
+	dh.On("ReadMessages", uint64(0), 2).Return([]types.Message{
 		{Offset: 0, Payload: "epoch0", TransactionalID: "tx-reused", TransactionState: types.TransactionStateOpen, Epoch: 0},
 		{Offset: 1, Payload: "epoch0-marker", TransactionalID: "tx-reused", TransactionMarker: types.TransactionMarkerCommit, Epoch: 0},
 		{Offset: 2, Payload: "epoch1-open", TransactionalID: "tx-reused", TransactionState: types.TransactionStateOpen, Epoch: 1},
@@ -555,6 +561,9 @@ func TestPartition_ReadCommittedSeparatesMarkersByEpoch(t *testing.T) {
 
 	p := NewPartition(0, "orders", dh, nil, cfg)
 	p.SetHWM(4)
+	p.indexTransactionMessage(types.Message{Offset: 0, TransactionalID: "tx-reused", TransactionState: types.TransactionStateOpen, Epoch: 0})
+	p.indexTransactionMessage(types.Message{Offset: 1, TransactionalID: "tx-reused", TransactionMarker: types.TransactionMarkerCommit, Epoch: 0})
+	p.indexTransactionMessage(types.Message{Offset: 2, TransactionalID: "tx-reused", TransactionState: types.TransactionStateOpen, Epoch: 1})
 
 	msgs, err := p.ReadCommitted(0, 10)
 	require.NoError(t, err)
@@ -569,7 +578,7 @@ func TestPartition_ReadCommittedIgnoresMarkerBeforeRecord(t *testing.T) {
 	dh.On("GetLatestOffset").Return(uint64(0)).Once()
 	dh.On("GetFlushedOffset").Return(uint64(3)).Once()
 	dh.On("GetFirstOffset").Return(uint64(0)).Once()
-	dh.On("ReadMessages", uint64(0), 3).Return([]types.Message{
+	dh.On("ReadMessages", uint64(0), 1).Return([]types.Message{
 		{Offset: 0, Payload: "early-marker", TransactionalID: "tx-order", TransactionMarker: types.TransactionMarkerCommit, Epoch: 0},
 		{Offset: 1, Payload: "late-record", TransactionalID: "tx-order", TransactionState: types.TransactionStateOpen, Epoch: 0},
 		{Offset: 2, Payload: "after"},
@@ -577,6 +586,8 @@ func TestPartition_ReadCommittedIgnoresMarkerBeforeRecord(t *testing.T) {
 
 	p := NewPartition(0, "orders", dh, nil, cfg)
 	p.SetHWM(3)
+	p.indexTransactionMessage(types.Message{Offset: 0, TransactionalID: "tx-order", TransactionMarker: types.TransactionMarkerCommit, Epoch: 0})
+	p.indexTransactionMessage(types.Message{Offset: 1, TransactionalID: "tx-order", TransactionState: types.TransactionStateOpen, Epoch: 0})
 
 	msgs, err := p.ReadCommitted(0, 10)
 	require.NoError(t, err)
@@ -589,6 +600,7 @@ func TestPartition_LastStableOffsetUsesTransactionIndex(t *testing.T) {
 	dh := new(MockStorageHandler)
 	dh.On("GetLatestOffset").Return(uint64(0)).Once()
 	dh.On("GetFlushedOffset").Return(uint64(6)).Once()
+	dh.On("GetFirstOffset").Return(uint64(0)).Once()
 
 	p := NewPartition(0, "orders", dh, nil, cfg)
 	p.SetHWM(6)

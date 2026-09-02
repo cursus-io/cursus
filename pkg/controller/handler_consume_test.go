@@ -212,12 +212,20 @@ func (s *sequenceStorage) GetSegmentPath(uint64) string {
 	return ""
 }
 
-func (s *sequenceStorage) AppendMessage(string, int, *types.Message) (uint64, error) {
-	return 0, nil
+func (s *sequenceStorage) appendMessage(msg *types.Message) (uint64, error) {
+	offset := s.tailOffset()
+	stored := *msg
+	stored.Offset = offset
+	s.messages = append(s.messages, stored)
+	return offset, nil
 }
 
-func (s *sequenceStorage) AppendMessageSync(string, int, *types.Message) (uint64, error) {
-	return 0, nil
+func (s *sequenceStorage) AppendMessage(_ string, _ int, msg *types.Message) (uint64, error) {
+	return s.appendMessage(msg)
+}
+
+func (s *sequenceStorage) AppendMessageSync(_ string, _ int, msg *types.Message) (uint64, error) {
+	return s.appendMessage(msg)
 }
 
 func (s *sequenceStorage) AppendMessageWithOffset(string, int, *types.Message) error {
@@ -332,18 +340,21 @@ func TestCommandHandler_ConsumeWritesOffsetOutOfRangeFrame(t *testing.T) {
 
 func TestCommandHandler_ConsumeReadIsolationModes(t *testing.T) {
 	cfg := config.DefaultConfig()
-	storage := &sequenceStorage{messages: []types.Message{
+	storage := &sequenceStorage{}
+	transactionLog := []types.Message{
 		{Offset: 0, Payload: "plain"},
 		{Offset: 1, Payload: "open", TransactionalID: "tx-open", TransactionState: types.TransactionStateOpen},
 		{Offset: 2, Payload: "committed", TransactionalID: "tx-commit", TransactionState: types.TransactionStateOpen},
 		{Offset: 3, Payload: "commit-marker", TransactionalID: "tx-commit", TransactionMarker: types.TransactionMarkerCommit},
 		{Offset: 4, Payload: "after"},
-	}}
+	}
 	tm := topic.NewTopicManager(cfg, &singleStorageProvider{storage: storage}, nil)
 	require.NoError(t, tm.CreateTopic("isolation-topic", 1, false, false))
 	p, err := tm.GetTopic("isolation-topic").GetPartition(0)
 	require.NoError(t, err)
-	p.SetHWM(5)
+	for _, message := range transactionLog {
+		require.NoError(t, p.EnqueueSync(message))
+	}
 
 	coord := coordinator.NewCoordinator(context.Background(), cfg, &DummyPublisher{})
 	require.NoError(t, coord.RegisterGroup("isolation-topic", "isolation-group", 1))

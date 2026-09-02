@@ -72,6 +72,7 @@ type Partition struct {
 	txnResolver       TransactionDecisionResolver
 	txnMarkers        map[transactionMarkerKey]transactionMarkerInfo
 	txnOpenOffsets    map[transactionMarkerKey]uint64
+	txnRetentionFloor uint64
 	closeCh           chan struct{}
 }
 
@@ -79,12 +80,6 @@ func (p *Partition) SetTransactionDecisionResolver(resolver TransactionDecisionR
 	p.txnMarkerMu.Lock()
 	p.txnResolver = resolver
 	p.txnMarkerMu.Unlock()
-}
-
-func (p *Partition) transactionDecisionResolver() TransactionDecisionResolver {
-	p.txnMarkerMu.RLock()
-	defer p.txnMarkerMu.RUnlock()
-	return p.txnResolver
 }
 
 // NewPartition creates a partition instance.
@@ -667,8 +662,10 @@ func (p *Partition) LastStableOffset() uint64 {
 	if flushed < hwm {
 		hwm = flushed
 	}
-	markers, openOffsets := p.transactionIndexBefore(hwm)
-	return firstUnresolvedOpenOffset(hwm, openOffsets, markers, p.transactionDecisionResolver())
+	p.pruneTransactionIndex(p.dh.GetFirstOffset())
+	p.txnMarkerMu.RLock()
+	defer p.txnMarkerMu.RUnlock()
+	return firstUnresolvedOpenOffset(hwm, p.txnRetentionFloor, p.txnOpenOffsets, p.txnMarkers, p.txnResolver)
 }
 func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, error) {
 	p.mu.RLock()
@@ -693,6 +690,7 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 	if offset >= hwm {
 		return nil, nil
 	}
+	p.pruneTransactionIndex(earliest)
 
 	canRead := hwm - offset
 	if canRead <= math.MaxInt && max > int(canRead) { // #nosec G115 -- canRead is bounded by math.MaxInt before narrowing.
@@ -707,45 +705,27 @@ func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm uint64) ([]
 		return nil, nil
 	}
 
-	markers, openOffsets := p.transactionIndexBefore(hwm)
-	resolver := p.transactionDecisionResolver()
-	lso := firstUnresolvedOpenOffset(hwm, openOffsets, markers, resolver)
+	p.txnMarkerMu.RLock()
+	defer p.txnMarkerMu.RUnlock()
+	resolver := p.txnResolver
+	lso := firstUnresolvedOpenOffset(hwm, p.txnRetentionFloor, p.txnOpenOffsets, p.txnMarkers, resolver)
 	scanLimit := hwm
 	if lso < scanLimit {
 		scanLimit = lso
 	}
-	messages, err := p.readCommittedScanRange(offset, scanLimit, max, markers, openOffsets, resolver)
-	if err != nil {
-		return nil, err
-	}
-	markers, openOffsets = mergeScannedTransactionIndex(markers, openOffsets, messages, hwm)
-	firstUnresolved := firstUnresolvedOpenOffset(hwm, openOffsets, markers, resolver)
-
-	visible := make([]types.Message, 0, max)
-	for _, msg := range messages {
-		if msg.Offset >= hwm || msg.Offset >= firstUnresolved {
-			break
-		}
-		if isReadCommittedVisible(msg, markers, resolver) {
-			visible = append(visible, msg)
-			if len(visible) == max {
-				break
-			}
-		}
-	}
-	return visible, nil
+	return p.readCommittedScanRange(offset, scanLimit, hwm, max, p.txnMarkers, resolver)
 }
 
-func (p *Partition) readCommittedScanRange(offset uint64, hwm uint64, maxVisible int, markers map[transactionMarkerKey]transactionMarkerInfo, openOffsets map[transactionMarkerKey]uint64, resolver TransactionDecisionResolver) ([]types.Message, error) {
-	if offset >= hwm {
+func (p *Partition) readCommittedScanRange(offset, scanLimit, committedHWM uint64, maxVisible int, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) ([]types.Message, error) {
+	if offset >= scanLimit {
 		return nil, nil
 	}
 
-	messages := make([]types.Message, 0)
+	visible := make([]types.Message, 0, maxVisible)
 	current := offset
 	const scanBatchSize = 1024
-	for current < hwm {
-		remaining := hwm - current
+	for current < scanLimit && len(visible) < maxVisible {
+		remaining := scanLimit - current
 		readMax := scanBatchSize
 		if remaining <= math.MaxInt && readMax > int(remaining) { // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
 			readMax = int(remaining) // #nosec G115 -- remaining is bounded by math.MaxInt before narrowing.
@@ -762,88 +742,28 @@ func (p *Partition) readCommittedScanRange(offset uint64, hwm uint64, maxVisible
 			break
 		}
 		for _, msg := range batch {
-			if msg.Offset >= hwm {
+			if msg.Offset >= scanLimit {
 				break
 			}
-			messages = append(messages, msg)
 			next := msg.Offset + 1
 			if next <= current {
 				next = current + 1
 			}
 			current = next
-		}
-		if len(batch) < readMax || readCommittedScanHasEnoughVisible(messages, hwm, maxVisible, markers, openOffsets, resolver) {
-			break
-		}
-	}
-	return messages, nil
-}
-
-func readCommittedScanHasEnoughVisible(messages []types.Message, hwm uint64, maxVisible int, markers map[transactionMarkerKey]transactionMarkerInfo, openOffsets map[transactionMarkerKey]uint64, resolver TransactionDecisionResolver) bool {
-	if maxVisible <= 0 {
-		return true
-	}
-	markers, openOffsets = mergeScannedTransactionIndex(markers, openOffsets, messages, hwm)
-	firstUnresolved := firstUnresolvedOpenOffset(hwm, openOffsets, markers, resolver)
-	if firstUnresolved != hwm {
-		return false
-	}
-
-	visible := 0
-	for _, msg := range messages {
-		if msg.Offset >= hwm {
-			break
-		}
-		if isReadCommittedVisible(msg, markers, resolver) {
-			visible++
-			if visible >= maxVisible {
-				return true
+			if isReadCommittedVisible(msg, committedHWM, markers, resolver) {
+				visible = append(visible, msg)
+				if len(visible) == maxVisible {
+					break
+				}
 			}
 		}
-	}
-	return false
-}
-
-func mergeScannedTransactionIndex(baseMarkers map[transactionMarkerKey]transactionMarkerInfo, baseOpenOffsets map[transactionMarkerKey]uint64, messages []types.Message, hwm uint64) (map[transactionMarkerKey]transactionMarkerInfo, map[transactionMarkerKey]uint64) {
-	openOffsets := make(map[transactionMarkerKey]uint64, len(baseOpenOffsets))
-	for key, offset := range baseOpenOffsets {
-		openOffsets[key] = offset
-	}
-
-	markers := mergeScannedTransactionMarkers(baseMarkers, messages, hwm)
-	for _, msg := range messages {
-		if msg.Offset >= hwm {
+		if len(batch) < readMax {
 			break
 		}
-		if msg.TransactionalID == "" || msg.TransactionMarker != types.TransactionMarkerNone || msg.TransactionState != types.TransactionStateOpen {
-			continue
-		}
-		key := messageTransactionMarkerKey(msg)
-		if existing, ok := openOffsets[key]; !ok || msg.Offset < existing {
-			openOffsets[key] = msg.Offset
-		}
 	}
-	return markers, openOffsets
+	return visible, nil
 }
-func mergeScannedTransactionMarkers(base map[transactionMarkerKey]transactionMarkerInfo, messages []types.Message, hwm uint64) map[transactionMarkerKey]transactionMarkerInfo {
-	markers := make(map[transactionMarkerKey]transactionMarkerInfo, len(base))
-	for key, marker := range base {
-		markers[key] = marker
-	}
-	for _, msg := range messages {
-		if msg.Offset >= hwm {
-			break
-		}
-		if msg.TransactionMarker == types.TransactionMarkerNone || msg.TransactionalID == "" {
-			continue
-		}
-		key := messageTransactionMarkerKey(msg)
-		if existing, ok := markers[key]; !ok || msg.Offset >= existing.offset {
-			markers[key] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset}
-		}
-	}
-	return markers
-}
+
 func (p *Partition) indexTransactionMessage(msg types.Message) {
 	if msg.TransactionalID == "" {
 		return
@@ -870,22 +790,20 @@ func (p *Partition) indexTransactionMessage(msg types.Message) {
 	}
 }
 
-func (p *Partition) transactionIndexBefore(hwm uint64) (map[transactionMarkerKey]transactionMarkerInfo, map[transactionMarkerKey]uint64) {
-	p.txnMarkerMu.RLock()
-	defer p.txnMarkerMu.RUnlock()
-	markers := make(map[transactionMarkerKey]transactionMarkerInfo, len(p.txnMarkers))
+func (p *Partition) pruneTransactionIndex(retentionFloor uint64) {
+	p.txnMarkerMu.Lock()
+	defer p.txnMarkerMu.Unlock()
+	if retentionFloor <= p.txnRetentionFloor {
+		return
+	}
 	for key, marker := range p.txnMarkers {
-		if marker.offset < hwm {
-			markers[key] = marker
+		if marker.offset >= retentionFloor {
+			continue
 		}
+		delete(p.txnMarkers, key)
+		delete(p.txnOpenOffsets, key)
 	}
-	openOffsets := make(map[transactionMarkerKey]uint64, len(p.txnOpenOffsets))
-	for key, offset := range p.txnOpenOffsets {
-		if offset < hwm {
-			openOffsets[key] = offset
-		}
-	}
-	return markers, openOffsets
+	p.txnRetentionFloor = retentionFloor
 }
 
 func (p *Partition) rebuildTransactionMarkerIndex() {
@@ -932,6 +850,7 @@ func (p *Partition) rebuildTransactionMarkerIndex() {
 	p.txnMarkerMu.Lock()
 	p.txnMarkers = markers
 	p.txnOpenOffsets = openOffsets
+	p.txnRetentionFloor = first
 	p.txnMarkerMu.Unlock()
 }
 
@@ -949,15 +868,18 @@ func messageTransactionMarkerKey(msg types.Message) transactionMarkerKey {
 	return transactionMarkerKey{transactionalID: msg.TransactionalID, epoch: msg.Epoch}
 }
 
-func firstUnresolvedOpenOffset(hwm uint64, openOffsets map[transactionMarkerKey]uint64, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) uint64 {
+func firstUnresolvedOpenOffset(hwm, retentionFloor uint64, openOffsets map[transactionMarkerKey]uint64, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) uint64 {
 	firstUnresolved := hwm
 	for key, offset := range openOffsets {
 		if offset >= hwm {
 			continue
 		}
 		marker, ok := markers[key]
-		if ok && marker.offset > offset && transactionDecisionMatchesMarker(key, marker, resolver) {
+		if ok && marker.offset < hwm && marker.offset > offset && transactionDecisionMatchesMarker(key, marker, resolver) {
 			continue
+		}
+		if offset < retentionFloor {
+			offset = retentionFloor
 		}
 		if offset < firstUnresolved {
 			firstUnresolved = offset
@@ -978,7 +900,7 @@ func transactionDecisionMatchesMarker(key transactionMarkerKey, marker transacti
 		marker.marker == types.TransactionMarkerAbort && state == types.TransactionStateAborted
 }
 
-func isReadCommittedVisible(msg types.Message, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) bool {
+func isReadCommittedVisible(msg types.Message, hwm uint64, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) bool {
 	if msg.TransactionMarker != types.TransactionMarkerNone {
 		return false
 	}
@@ -990,7 +912,7 @@ func isReadCommittedVisible(msg types.Message, markers map[transactionMarkerKey]
 	}
 	key := messageTransactionMarkerKey(msg)
 	marker, ok := markers[key]
-	return ok && marker.offset > msg.Offset && marker.marker == types.TransactionMarkerCommit &&
+	return ok && marker.offset < hwm && marker.offset > msg.Offset && marker.marker == types.TransactionMarkerCommit &&
 		transactionDecisionMatchesMarker(key, marker, resolver)
 }
 
@@ -1151,6 +1073,7 @@ func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
 	p.txnMarkerMu.Lock()
 	p.txnMarkers = make(map[transactionMarkerKey]transactionMarkerInfo)
 	p.txnOpenOffsets = make(map[transactionMarkerKey]uint64)
+	p.txnRetentionFloor = 0
 	p.txnMarkerMu.Unlock()
 	p.rebuildTransactionMarkerIndex()
 	p.producerState.Range(func(key, _ any) bool {
