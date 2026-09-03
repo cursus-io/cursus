@@ -29,12 +29,12 @@ func TestCreateRejectsCompactionForExistingEventSourcingTopic(t *testing.T) {
 	require.Contains(t, response, "ERROR: invalid_topic_policy")
 }
 
-func TestCreateRejectsCompactionForUnsupportedTopicModes(t *testing.T) {
+func TestCreateRejectsCompactionForEventSourcingAndAllowsDistributedMode(t *testing.T) {
 	handler, _ := newTestHandler(t)
 	response := handler.HandleCommand("CREATE topic=events partitions=1 event_sourcing=true cleanup_policy=compact", NewClientContext("", 0))
 	require.Contains(t, response, "ERROR: invalid_topic_policy")
 
 	handler.Config.EnabledDistribution = true
 	response = handler.HandleCommand("CREATE topic=distributed partitions=1 cleanup_policy=compact", NewClientContext("", 0))
-	require.Contains(t, response, "ERROR: unsupported_topic_policy")
+	require.True(t, strings.HasPrefix(response, "OK "), response)
 }

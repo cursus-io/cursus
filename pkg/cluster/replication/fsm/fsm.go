@@ -18,7 +18,11 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-const TopicLifecycleProtocolVersion = 1
+const (
+	TopicLifecycleProtocolVersion        = 1
+	DistributedCompactionProtocolVersion = 2
+	BrokerProtocolVersionCurrent         = DistributedCompactionProtocolVersion
+)
 
 type ReplicationEntry struct {
 	Topic     string

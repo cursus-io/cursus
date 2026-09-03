@@ -83,29 +83,30 @@ func TestTopicCleanupPolicyUpdateAppliesBeforePartitionGrowth(t *testing.T) {
 	}
 }
 
-func TestTopicCleanupPolicyRejectsUnsupportedTopicModes(t *testing.T) {
-	for _, testCase := range []struct {
-		name          string
-		distributed   bool
-		eventSourcing bool
-	}{
-		{name: "event sourcing", eventSourcing: true},
-		{name: "distributed", distributed: true},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			cfg := config.DefaultConfig()
-			cfg.LogDir = t.TempDir()
-			cfg.EnabledDistribution = testCase.distributed
-			diskManager := disk.NewDiskManager(cfg)
-			defer diskManager.CloseAllHandlers()
-			manager := NewTopicManager(cfg, diskManager, nil)
-			policy := DefaultPolicy()
-			policy.CleanupPolicy = config.CleanupPolicyCompact
-			err := manager.CreateTopicWithPolicy("state", 1, false, testCase.eventSourcing, policy)
-			require.ErrorContains(t, err, "cleanup policy compact is not supported")
-			require.Nil(t, manager.GetTopic("state"))
-		})
-	}
+func TestTopicCleanupPolicyRejectsEventSourcingMode(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	diskManager := disk.NewDiskManager(cfg)
+	defer diskManager.CloseAllHandlers()
+	manager := NewTopicManager(cfg, diskManager, nil)
+	policy := DefaultPolicy()
+	policy.CleanupPolicy = config.CleanupPolicyCompact
+	err := manager.CreateTopicWithPolicy("state", 1, false, true, policy)
+	require.ErrorContains(t, err, "cleanup policy compact is not supported")
+	require.Nil(t, manager.GetTopic("state"))
+}
+
+func TestTopicCleanupPolicyAllowsDistributedMode(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	diskManager := disk.NewDiskManager(cfg)
+	defer diskManager.CloseAllHandlers()
+	manager := NewTopicManager(cfg, diskManager, nil)
+	policy := DefaultPolicy()
+	policy.CleanupPolicy = config.CleanupPolicyCompact
+	require.NoError(t, manager.CreateTopicWithPolicy("state", 1, false, false, policy))
+	require.Equal(t, config.CleanupPolicyCompact, manager.GetTopic("state").Policy.CleanupPolicy)
 }
 
 func TestExistingEventSourcingTopicCannotBeChangedToCompact(t *testing.T) {

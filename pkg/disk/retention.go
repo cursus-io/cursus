@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -328,11 +329,75 @@ func (d *DiskHandler) retentionLoop(cfg *config.Config) {
 		case <-retentionTicker.C:
 			d.EnforceRetention(cfg)
 		case <-compactionTicker.C:
-			if _, err := d.EnforceCompaction(); err != nil {
-				util.Error("log compaction failed for %s: %v", d.BaseName, err)
-			}
+			result, err := d.EnforceCompaction()
+			d.recordCompactionPass(result, err)
 		case <-d.done:
 			return
 		}
+	}
+}
+
+func (d *DiskHandler) recordCompactionPass(result CompactionResult, err error) {
+	if err != nil {
+		class := compactionErrorClass(err)
+		metrics.LogCompactionRuns.WithLabelValues("error", class).Inc()
+		if d.transitionCompactionFailure(class) {
+			util.Error("log compaction entered failure state for %s class=%s: %v", d.BaseName, class, err)
+		}
+		return
+	}
+	reason := boundedCompactionReason(result.SkippedReason)
+	status := "completed"
+	if reason != "none" {
+		status = "skipped"
+	}
+	metrics.LogCompactionRuns.WithLabelValues(status, reason).Inc()
+	d.compactionStateMu.Lock()
+	previous := d.compactionFailure
+	d.compactionFailure = ""
+	d.compactionStateMu.Unlock()
+	if previous != "" {
+		util.Info("log compaction recovered for %s previous_class=%s", d.BaseName, previous)
+	}
+}
+
+func (d *DiskHandler) transitionCompactionFailure(class string) bool {
+	d.compactionStateMu.Lock()
+	defer d.compactionStateMu.Unlock()
+	changed := d.compactionFailure != class
+	d.compactionFailure = class
+	return changed
+}
+
+func compactionErrorClass(err error) string {
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "permission"):
+		return "permission"
+	case strings.Contains(message, "sync"):
+		return "sync"
+	case strings.Contains(message, "corrupt"), strings.Contains(message, "invalid"), strings.Contains(message, "decode"):
+		return "corrupt_segment"
+	case strings.Contains(message, "active segment"):
+		return "active_segment"
+	default:
+		return "storage"
+	}
+}
+
+func boundedCompactionReason(reason string) string {
+	switch reason {
+	case "", "none":
+		return "none"
+	case "policy_disabled", "distributed_internal_metadata", "distributed_gate_unavailable",
+		"distributed_gate_closed", "cluster_gate_unavailable", "cluster_metadata_unavailable",
+		"partition_metadata_unavailable", "topic_definition_unavailable", "topic_policy_mismatch",
+		"partition_closed", "local_uncommitted_tail",
+		"local_replica_not_in_sync", "replica_not_caught_up", "replica_not_active",
+		"mixed_broker_protocol", "topic_lifecycle_mismatch", "active_readers",
+		"no_closed_segments", "no_superseded_records", "dirty_ratio":
+		return reason
+	default:
+		return "other"
 	}
 }

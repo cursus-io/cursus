@@ -74,4 +74,9 @@ var (
 		Name: "cursus_broker_async_replication_failures_total",
 		Help: "Asynchronous partition replication failures by topic and bounded error class",
 	}, []string{"topic", "error_class"})
+
+	LogCompactionRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "cursus_broker_log_compaction_runs_total",
+		Help: "Log compaction passes by bounded result and reason",
+	}, []string{"result", "reason"})
 )

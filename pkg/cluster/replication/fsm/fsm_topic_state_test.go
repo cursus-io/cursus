@@ -67,6 +67,43 @@ func TestBrokerFSMSnapshotRestoresTopicDefinition(t *testing.T) {
 	require.Equal(t, uint64(topic.InitialLifecycleEpoch), restoredTopic.LifecycleEpoch)
 }
 
+func TestBrokerFSMAllowsCompactedTopicWhenAllBrokersSupportProtocol(t *testing.T) {
+	f := newTestFSM()
+	for _, brokerID := range []string{"broker-1", "broker-2", "broker-3"} {
+		payload, err := json.Marshal(BrokerInfo{
+			ID: brokerID, Addr: "127.0.0.1:9000", Status: "active",
+			LifecycleProtocol: BrokerProtocolVersionCurrent,
+		})
+		require.NoError(t, err)
+		require.Nil(t, f.Apply(&raft.Log{Data: append([]byte("REGISTER:"), payload...), Index: 1}))
+	}
+	command := testTopicCommand("state", 1, 3)
+	command.Definition.Policy.CleanupPolicy = config.CleanupPolicyCompact
+	payload, err := json.Marshal(command)
+	require.NoError(t, err)
+	require.Nil(t, f.Apply(&raft.Log{Data: append([]byte("TOPIC:"), payload...), Index: 4}))
+	require.Equal(t, config.CleanupPolicyCompact, f.tm.GetTopic("state").Policy.CleanupPolicy)
+}
+
+func TestBrokerFSMRejectsCompactedTopicDuringMixedVersionRollout(t *testing.T) {
+	f := newTestFSM()
+	for index, protocolVersion := range []int{BrokerProtocolVersionCurrent, BrokerProtocolVersionCurrent - 1} {
+		payload, err := json.Marshal(BrokerInfo{
+			ID: fmt.Sprintf("broker-%d", index+1), Addr: "127.0.0.1:9000", Status: "active",
+			LifecycleProtocol: protocolVersion,
+		})
+		require.NoError(t, err)
+		require.Nil(t, f.Apply(&raft.Log{Data: append([]byte("REGISTER:"), payload...), Index: uint64(index + 1)}))
+	}
+	command := testTopicCommand("state", 1, 2)
+	command.Definition.Policy.CleanupPolicy = config.CleanupPolicyCompact
+	payload, err := json.Marshal(command)
+	require.NoError(t, err)
+	result := f.Apply(&raft.Log{Data: append([]byte("TOPIC:"), payload...), Index: 3})
+	require.ErrorContains(t, result.(error), "requires broker protocol")
+	require.Nil(t, f.tm.GetTopic("state"))
+}
+
 func TestBrokerFSMSnapshotRestoresAlteredTopicMinInSyncReplicas(t *testing.T) {
 	f := newTestFSM()
 	for _, brokerID := range []string{"broker-1", "broker-2", "broker-3"} {

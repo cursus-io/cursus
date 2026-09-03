@@ -1,0 +1,18 @@
+services:
+  broker-1:
+    environment:
+      LOG_SEGMENT_BYTES: "1048576"
+      LOG_COMPACTION_CHECK_INTERVAL_MS: "250"
+      LOG_MIN_CLEANABLE_DIRTY_RATIO: "0.01"
+
+  broker-2:
+    environment:
+      LOG_SEGMENT_BYTES: "1048576"
+      LOG_COMPACTION_CHECK_INTERVAL_MS: "250"
+      LOG_MIN_CLEANABLE_DIRTY_RATIO: "0.01"
+
+  broker-3:
+    environment:
+      LOG_SEGMENT_BYTES: "1048576"
+      LOG_COMPACTION_CHECK_INTERVAL_MS: "250"
+      LOG_MIN_CLEANABLE_DIRTY_RATIO: "0.01"

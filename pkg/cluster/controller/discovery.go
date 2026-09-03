@@ -55,7 +55,7 @@ func (sd *serviceDiscovery) Register() error {
 		ClientAddr:        sd.clientAddr,
 		Status:            "active",
 		LastSeen:          time.Now(),
-		LifecycleProtocol: fsm.TopicLifecycleProtocolVersion,
+		LifecycleProtocol: fsm.BrokerProtocolVersionCurrent,
 	}
 
 	data, err := json.Marshal(broker)

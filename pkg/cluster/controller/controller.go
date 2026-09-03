@@ -138,6 +138,13 @@ func (cc *ClusterController) IsLeader() bool {
 	return false
 }
 
+func (cc *ClusterController) BrokerID() string {
+	if cc == nil {
+		return ""
+	}
+	return cc.brokerID
+}
+
 func (cc *ClusterController) IsAuthorized(topic string, partition int) bool {
 	if cc.RaftManager == nil {
 		return false

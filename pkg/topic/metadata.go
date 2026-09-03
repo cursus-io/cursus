@@ -428,6 +428,7 @@ func (tm *TopicManager) RestoreDefinitions(definitions []Definition) error {
 			tm.rollbackRestoredTopicsLocked(created)
 			return fmt.Errorf("restore topic %q: %w", definition.Name, err)
 		}
+		restored.SetDistributedCompactionGate(tm.compactionGate)
 		restored.SetTransactionDecisionResolver(tm.txnResolver)
 		tm.topics[definition.Name] = restored
 		created = append(created, definition.Name)

@@ -131,6 +131,8 @@ func formatCreateTopicError(topicName string, err error) string {
 	switch {
 	case strings.Contains(reason, "cleanup policy compact is not supported in distributed mode"):
 		return `ERROR: unsupported_topic_policy field=cleanup_policy reason="compaction is not supported in distributed mode"`
+	case strings.Contains(reason, "distributed compaction requires broker protocol"):
+		return fmt.Sprintf(`ERROR: unsupported_topic_policy field=cleanup_policy reason=%q`, reason)
 	case strings.Contains(reason, "cleanup policy compact is not supported for event-sourcing topics"):
 		return `ERROR: invalid_topic_policy field=cleanup_policy reason="compaction is not supported for event-sourcing topics"`
 	case strings.Contains(reason, "min_in_sync_replicas"):
