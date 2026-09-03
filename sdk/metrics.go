@@ -16,13 +16,14 @@ var (
 	producerSendErrors   *prometheus.CounterVec
 	producerBatchLatency *prometheus.HistogramVec
 
-	consumerMessagesReceived *prometheus.CounterVec
-	consumerCommitTotal      *prometheus.CounterVec
-	consumerCommitErrors     *prometheus.CounterVec
-	consumerPollLatency      *prometheus.HistogramVec
-	consumerRebalanceTotal   *prometheus.CounterVec
-	consumerOffsetGapTotal   *prometheus.CounterVec
-	consumerStaleWorkers     *prometheus.CounterVec
+	consumerMessagesReceived        *prometheus.CounterVec
+	consumerCommitTotal             *prometheus.CounterVec
+	consumerCommitErrors            *prometheus.CounterVec
+	consumerPollLatency             *prometheus.HistogramVec
+	consumerRebalanceTotal          *prometheus.CounterVec
+	consumerOffsetGapTotal          *prometheus.CounterVec
+	consumerCompactedOffsetsSkipped *prometheus.CounterVec
+	consumerStaleWorkers            *prometheus.CounterVec
 )
 
 func initMetrics() {
@@ -121,6 +122,16 @@ func initMetrics() {
 			[]string{"topic", "group"},
 		)
 
+		consumerCompactedOffsetsSkipped = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: "cursus",
+				Subsystem: "consumer",
+				Name:      "compacted_offsets_skipped_total",
+				Help:      "Total number of logical offsets skipped while consuming compacted topics.",
+			},
+			[]string{"topic", "group"},
+		)
+
 		consumerStaleWorkers = prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: "cursus",
@@ -141,6 +152,7 @@ func initMetrics() {
 			consumerPollLatency,
 			consumerRebalanceTotal,
 			consumerOffsetGapTotal,
+			consumerCompactedOffsetsSkipped,
 			consumerStaleWorkers,
 		)
 	})

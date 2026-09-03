@@ -192,9 +192,7 @@ func (pc *PartitionConsumer) pollAndProcess() {
 			lastMsg := batch.Messages[len(batch.Messages)-1]
 
 			expectedOffset := atomic.LoadUint64(&pc.fetchOffset)
-			if expectedOffset > 0 && firstMsg.Offset > expectedOffset {
-				util.Error("🚨 Partition [%d] offset gap detected. expected: %d, received: %d (missing: %d messages)", pc.partitionID, expectedOffset, firstMsg.Offset, firstMsg.Offset-expectedOffset)
-			}
+			pc.recordOffsetAdvance(expectedOffset, batch.Messages, true)
 
 			newOffset := lastMsg.Offset + 1
 			atomic.StoreUint64(&pc.fetchOffset, newOffset)
@@ -313,6 +311,8 @@ func (pc *PartitionConsumer) startStreamLoop() {
 			case pc.dataCh <- batch:
 				if len(batch.Messages) > 0 {
 					bo.reset()
+					expectedOffset := atomic.LoadUint64(&pc.fetchOffset)
+					pc.recordOffsetAdvance(expectedOffset, batch.Messages, false)
 					lastOffset := batch.Messages[len(batch.Messages)-1].Offset
 					atomic.StoreUint64(&pc.fetchOffset, lastOffset+1)
 				} else {
@@ -331,4 +331,38 @@ func (pc *PartitionConsumer) startStreamLoop() {
 			}
 		}
 	}
+}
+
+func (pc *PartitionConsumer) recordOffsetAdvance(expectedOffset uint64, messages []types.Message, reportUnexpected bool) {
+	if len(messages) == 0 {
+		return
+	}
+	if pc.consumer.compactionEnabled.Load() {
+		skipped := countSkippedOffsets(expectedOffset, messages)
+		if skipped > 0 {
+			util.Debug("Partition [%d] skipped %d compacted offsets from %d", pc.partitionID, skipped, expectedOffset)
+		}
+		return
+	}
+	if !reportUnexpected {
+		return
+	}
+	firstOffset := messages[0].Offset
+	if expectedOffset > 0 && firstOffset > expectedOffset {
+		util.Error("Partition [%d] offset gap detected. expected: %d, received: %d (missing: %d messages)", pc.partitionID, expectedOffset, firstOffset, firstOffset-expectedOffset)
+	}
+}
+
+func countSkippedOffsets(expectedOffset uint64, messages []types.Message) uint64 {
+	nextOffset := expectedOffset
+	var skipped uint64
+	for _, message := range messages {
+		if message.Offset > nextOffset {
+			skipped += message.Offset - nextOffset
+		}
+		if message.Offset >= nextOffset {
+			nextOffset = message.Offset + 1
+		}
+	}
+	return skipped
 }

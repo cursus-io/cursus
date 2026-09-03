@@ -23,6 +23,7 @@ func resetMetricsState() {
 	consumerPollLatency = nil
 	consumerRebalanceTotal = nil
 	consumerOffsetGapTotal = nil
+	consumerCompactedOffsetsSkipped = nil
 	consumerStaleWorkers = nil
 }
 
@@ -89,6 +90,7 @@ func TestConsumerMetrics_CanBeIncremented(t *testing.T) {
 	consumerCommitErrors.WithLabelValues("events", "grp1").Inc()
 	consumerPollLatency.WithLabelValues("events", "grp1").Observe(0.01)
 	consumerRebalanceTotal.WithLabelValues("events", "grp1").Inc()
+	consumerCompactedOffsetsSkipped.WithLabelValues("events", "grp1").Add(3)
 	consumerStaleWorkers.WithLabelValues("events", "grp1", "poller").Inc()
 
 	metrics, err := metricsRegistry.Gather()
@@ -103,6 +105,7 @@ func TestConsumerMetrics_CanBeIncremented(t *testing.T) {
 	assert.True(t, names["cursus_consumer_commit_errors_total"])
 	assert.True(t, names["cursus_consumer_poll_latency_seconds"])
 	assert.True(t, names["cursus_consumer_rebalance_total"])
+	assert.True(t, names["cursus_consumer_compacted_offsets_skipped_total"])
 	assert.True(t, names["cursus_consumer_stale_workers_total"])
 }
 

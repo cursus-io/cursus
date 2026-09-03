@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	brokerConfig "github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/consumer/bench"
 	"github.com/cursus-io/cursus/util"
@@ -41,8 +42,9 @@ type Consumer struct {
 	mainCtx    context.Context
 	mainCancel context.CancelFunc
 
-	rebalancing  int32
-	rebalanceSig chan struct{}
+	rebalancing       int32
+	rebalanceSig      chan struct{}
+	compactionEnabled atomic.Bool
 
 	offsets map[int]uint64
 	doneCh  chan struct{}
@@ -294,6 +296,9 @@ func (c *Consumer) Start() error {
 			return fmt.Errorf("sync group failed: %w", err)
 		}
 	}
+	if err := c.refreshTopicPolicy(); err != nil {
+		util.Debug("Failed to refresh topic cleanup policy: %v", err)
+	}
 
 	util.Info("✅ Successfully joined topic '%s' for group '%s' with %d partitions: %v (generation=%d, member=%s)",
 		c.config.Topic, c.config.GroupID, len(assignments), assignments, gen, mid)
@@ -403,6 +408,51 @@ func (c *Consumer) startCommitWorker() {
 			}
 		}
 	}()
+}
+
+func (c *Consumer) refreshTopicPolicy() error {
+	conn, err := c.getLeaderConn()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
+	if err := util.WriteWithLength(conn, []byte("METADATA topic="+c.config.Topic)); err != nil {
+		return err
+	}
+	response, err := util.ReadWithLength(conn)
+	if err != nil {
+		return err
+	}
+	return c.applyTopicPolicyMetadata(string(response))
+}
+
+func (c *Consumer) applyTopicPolicyMetadata(response string) error {
+	policy, err := cleanupPolicyFromMetadata(response)
+	if err != nil {
+		return err
+	}
+	c.compactionEnabled.Store(brokerConfig.HasCleanupPolicy(policy, brokerConfig.CleanupPolicyCompact))
+	return nil
+}
+
+func cleanupPolicyFromMetadata(response string) (string, error) {
+	if !strings.HasPrefix(strings.TrimSpace(response), "OK") {
+		return "", fmt.Errorf("metadata request failed")
+	}
+	for _, field := range strings.Fields(response) {
+		if strings.HasPrefix(field, "cleanup_policy=") {
+			policy := strings.TrimPrefix(field, "cleanup_policy=")
+			if _, valid := brokerConfig.NormalizeCleanupPolicy(policy); !valid {
+				return "", fmt.Errorf("invalid cleanup policy in metadata")
+			}
+			return policy, nil
+		}
+	}
+	return "", nil
 }
 
 func (c *Consumer) rebalanceMonitorLoop() {
@@ -663,6 +713,9 @@ func (c *Consumer) handleRebalanceSignal() {
 			util.Error("❌ Rebalance sync failed: %v", err)
 			return
 		}
+	}
+	if err := c.refreshTopicPolicy(); err != nil {
+		util.Debug("Failed to refresh topic cleanup policy after rebalance: %v", err)
 	}
 
 	c.mu.Lock()
