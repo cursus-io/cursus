@@ -2,6 +2,7 @@ package e2e_cluster
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -67,6 +68,8 @@ func TestDistributedCompactionPreservesReplicaAndConsumerOffsets(t *testing.T) {
 
 	failedLeader, _ := actions.SimulateLeaderFailure()
 	availableAddrs := availableBrokerAddrs(ctx.GetBrokerAddrs(), failedLeader)
+	requireFailoverISRReady(t, availableAddrs, ctx.GetTopic(), failedLeader, recordCount)
+	requireReplicaOffsetsEventually(t, availableAddrs, ctx.GetTopic(), recordCount)
 	failoverWriter := e2e.NewBrokerClient(availableAddrs)
 	for offset := recordCount; offset < recordCount+2; offset++ {
 		response, publishErr := failoverWriter.SendCommand(ctx.GetTopic(), fmt.Sprintf(
@@ -196,6 +199,42 @@ func requireReplicaOffsetsEventually(t *testing.T, addrs []string, topicName str
 			}
 		}
 		return true, want, nil
+	}))
+}
+
+func requireFailoverISRReady(t *testing.T, addrs []string, topicName string, unavailableNode int, expected uint64) {
+	t.Helper()
+	unavailableBroker := fmt.Sprintf("broker-%d", unavailableNode)
+	require.NoError(t, eventually(t, "failover ISR convergence", 2*clusterReadyTimeout, func() (bool, string, error) {
+		client := e2e.NewBrokerClient(addrs)
+		response, err := client.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topicName), 5*time.Second)
+		client.Close()
+		if err != nil {
+			return false, fmt.Sprintf("DESCRIBE failed: %v", err), nil
+		}
+		var metadata topicMetadata
+		if err := json.Unmarshal([]byte(response), &metadata); err != nil {
+			return false, response, err
+		}
+		if len(metadata.Partitions) != 1 {
+			return false, fmt.Sprintf("partitions=%d", len(metadata.Partitions)), nil
+		}
+		partition := metadata.Partitions[0]
+		if partition.Leader == "" || strings.HasPrefix(partition.Leader, unavailableBroker+":") {
+			return false, fmt.Sprintf("leader=%q", partition.Leader), nil
+		}
+		if len(partition.ISR) != len(addrs) {
+			return false, fmt.Sprintf("isr=%v", partition.ISR), nil
+		}
+		for _, broker := range partition.ISR {
+			if broker == unavailableBroker {
+				return false, fmt.Sprintf("isr=%v", partition.ISR), nil
+			}
+		}
+		if partition.LEO != expected || partition.HWM != expected {
+			return false, fmt.Sprintf("leo=%d hwm=%d", partition.LEO, partition.HWM), nil
+		}
+		return true, fmt.Sprintf("leader=%s isr=%v leo=%d hwm=%d", partition.Leader, partition.ISR, partition.LEO, partition.HWM), nil
 	}))
 }
 
