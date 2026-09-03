@@ -12,11 +12,21 @@ func TestCleanupPolicyFromMetadata(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "delete,compact", policy)
 
-	_, err = cleanupPolicyFromMetadata("OK topic=state leaders=broker-1:9001")
-	require.Error(t, err)
+	policy, err = cleanupPolicyFromMetadata("OK topic=state leaders=broker-1:9001")
+	require.NoError(t, err)
+	require.Empty(t, policy)
 
 	_, err = cleanupPolicyFromMetadata("ERROR: topic_not_found")
 	require.Error(t, err)
+}
+
+func TestOmittedCleanupPolicyClearsCompactionClassification(t *testing.T) {
+	consumer := &Consumer{}
+	consumer.compactionEnabled.Store(true)
+
+	require.NoError(t, consumer.applyTopicPolicyMetadata("OK topic=state leaders=broker-1:9001"))
+
+	require.False(t, consumer.compactionEnabled.Load())
 }
 
 func TestCountSkippedOffsetsIncludesInteriorHoles(t *testing.T) {

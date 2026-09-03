@@ -427,7 +427,11 @@ func (c *Consumer) refreshTopicPolicy() error {
 	if err != nil {
 		return err
 	}
-	policy, err := cleanupPolicyFromMetadata(string(response))
+	return c.applyTopicPolicyMetadata(string(response))
+}
+
+func (c *Consumer) applyTopicPolicyMetadata(response string) error {
+	policy, err := cleanupPolicyFromMetadata(response)
 	if err != nil {
 		return err
 	}
@@ -448,7 +452,7 @@ func cleanupPolicyFromMetadata(response string) (string, error) {
 			return policy, nil
 		}
 	}
-	return "", fmt.Errorf("metadata response omitted cleanup policy")
+	return "", nil
 }
 
 func (c *Consumer) rebalanceMonitorLoop() {

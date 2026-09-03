@@ -8,29 +8,49 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestFetchMetadataEnablesCompactionGapClassification(t *testing.T) {
-	response := "OK topic=state partitions=1 leaders=broker-1:9001 epochs=1 cleanup_policy=compact"
-	addr, result := startAdminTestServer(t, response)
+func TestFetchMetadataClearsCompactionClassificationWhenPolicyIsOmitted(t *testing.T) {
+	resetMetricsState()
+	t.Cleanup(resetMetricsState)
+	initMetrics()
+
+	compactResponse := "OK topic=state partitions=1 leaders=broker-1:9001 epochs=1 cleanup_policy=compact"
+	compactAddr, compactResult := startAdminTestServer(t, compactResponse)
 	config := NewDefaultConsumerConfig()
-	config.BrokerAddrs = []string{addr}
+	config.BrokerAddrs = []string{compactAddr}
 	config.Topic = "state"
+	config.GroupID = "reader"
+	config.EnableMetrics = true
 	consumer, err := NewConsumer(config)
 	require.NoError(t, err)
 
 	require.NoError(t, consumer.fetchMetadata())
 	require.True(t, consumer.compactionEnabled.Load())
-	require.Equal(t, "METADATA topic=state", receiveAdminTestCommand(t, result))
-	require.Equal(t, "broker-1:9001", consumer.getPartitionLeaderAddr(0), "metadata response: %s", response)
+	require.Equal(t, "METADATA topic=state", receiveAdminTestCommand(t, compactResult))
+	require.Equal(t, "broker-1:9001", consumer.getPartitionLeaderAddr(0), "metadata response: %s", compactResponse)
+
+	omittedResponse := "OK topic=state partitions=1 leaders=broker-2:9001 epochs=2"
+	omittedAddr, omittedResult := startAdminTestServer(t, omittedResponse)
+	config.BrokerAddrs = []string{omittedAddr}
+	consumer.client.UpdateLeader(omittedAddr)
+	require.NoError(t, consumer.fetchMetadata())
+	require.False(t, consumer.compactionEnabled.Load())
+	require.Equal(t, "METADATA topic=state", receiveAdminTestCommand(t, omittedResult))
+	require.Equal(t, "broker-2:9001", consumer.getPartitionLeaderAddr(0), "metadata response: %s", omittedResponse)
+
+	partition := &PartitionConsumer{partitionID: 0, consumer: consumer}
+	partition.recordOffsetAdvance(2, []Message{{Offset: 5}}, true)
+	require.Equal(t, float64(3), counterValue(t, consumerOffsetGapTotal, "state", "reader"))
+	require.Zero(t, counterValue(t, consumerCompactedOffsetsSkipped, "state", "reader"))
 }
 
 func TestCleanupPolicyIncludesCompaction(t *testing.T) {
 	tests := map[string]bool{
-		"delete":         false,
-		"compact":        true,
-		"delete,compact": true,
-		"compact,delete": true,
+		"delete":          false,
+		"compact":         true,
+		"delete,compact":  true,
+		"compact,delete":  true,
 		"invalid,compact": false,
-		"":               false,
+		"":                false,
 	}
 	for policy, expected := range tests {
 		require.Equal(t, expected, cleanupPolicyIncludesCompaction(policy), policy)

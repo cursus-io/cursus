@@ -623,9 +623,7 @@ func (c *Consumer) fetchMetadata() error {
 		c.partitionLeaders[i] = addr
 	}
 	c.partitionMu.Unlock()
-	if cleanupPolicy != "" {
-		c.compactionEnabled.Store(cleanupPolicyIncludesCompaction(cleanupPolicy))
-	}
+	c.compactionEnabled.Store(cleanupPolicyIncludesCompaction(cleanupPolicy))
 
 	return nil
 }
