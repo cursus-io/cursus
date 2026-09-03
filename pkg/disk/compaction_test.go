@@ -488,3 +488,167 @@ func TestStoragePolicyUpdateWaitsForMaintenance(t *testing.T) {
 	require.Equal(t, 24, hours)
 	require.Equal(t, int64(1024), bytes)
 }
+
+func TestDistributedCompactionUsesSafetyGateAndPreservesLogicalTail(t *testing.T) {
+	cfg := compactionTestConfig(t)
+	cfg.EnabledDistribution = true
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, handler.Close()) }()
+
+	appendCompactionMessage(t, handler, types.Message{Key: "key", Payload: "old"})
+	appendCompactionMessage(t, handler, types.Message{Key: "key", Payload: "current"})
+	rollCompactionSegment(t, handler)
+
+	result, err := handler.EnforceCompaction()
+	require.NoError(t, err)
+	require.Equal(t, "distributed_gate_unavailable", result.SkippedReason)
+
+	handler.SetDistributedCompactionGate(func() (bool, string) { return false, "replica_not_caught_up" })
+	result, err = handler.EnforceCompaction()
+	require.NoError(t, err)
+	require.Equal(t, "replica_not_caught_up", result.SkippedReason)
+
+	handler.SetDistributedCompactionGate(func() (bool, string) { return true, "" })
+	result, err = handler.EnforceCompaction()
+	require.NoError(t, err)
+	require.Equal(t, 1, result.RecordsRemoved)
+	require.Equal(t, uint64(2), handler.GetAbsoluteOffset())
+
+	messages, err := handler.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1}, messageOffsets(messages))
+}
+
+func TestDistributedDeletePolicyDoesNotEnterCompactionErrorLoop(t *testing.T) {
+	cfg := compactionTestConfig(t)
+	cfg.EnabledDistribution = true
+	cfg.CleanupPolicy = config.CleanupPolicyDelete
+	handler, err := NewDiskHandler(cfg, "audit", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, handler.Close()) }()
+
+	result, err := handler.EnforceCompaction()
+	require.NoError(t, err)
+	require.Equal(t, "policy_disabled", result.SkippedReason)
+}
+
+func TestWriteCompactedReplicaRangePersistsOffsetHolesAcrossRestart(t *testing.T) {
+	cfg := compactionTestConfig(t)
+	cfg.EnabledDistribution = true
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+
+	records := []types.DiskMessage{
+		{Topic: "orders", Partition: 0, Offset: 2, Key: "a", Payload: "current-a"},
+		{Topic: "orders", Partition: 0, Offset: 4, Key: "b", Payload: "current-b"},
+	}
+	require.NoError(t, handler.WriteCompactedReplicaRange(0, 5, records))
+	require.Equal(t, uint64(5), handler.GetAbsoluteOffset())
+	require.Equal(t, uint64(5), handler.GetFlushedOffset())
+	messages, err := handler.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{2, 4}, messageOffsets(messages))
+	require.NoError(t, handler.Close())
+
+	reopened, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reopened.Close()) }()
+	require.Equal(t, uint64(5), reopened.GetAbsoluteOffset())
+	messages, err = reopened.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{2, 4}, messageOffsets(messages))
+}
+
+func TestPendingCompactedReplicaRangeCompletesDuringRestart(t *testing.T) {
+	cfg := compactionTestConfig(t)
+	cfg.EnabledDistribution = true
+	handler, err := NewDiskHandler(cfg, "state", 0)
+	require.NoError(t, err)
+	records := []types.DiskMessage{
+		{Topic: "state", Partition: 0, Offset: 2, Key: "a", Payload: "current-a"},
+		{Topic: "state", Partition: 0, Offset: 4, Key: "b", Payload: "current-b"},
+	}
+	_, err = handler.stageCompactedReplicaRange(0, 5, records)
+	require.NoError(t, err)
+	require.FileExists(t, compactedRangePendingPath(handler.BaseName))
+	require.NoError(t, handler.Close())
+
+	reopened, err := NewDiskHandler(cfg, "state", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reopened.Close()) }()
+	require.NoFileExists(t, compactedRangePendingPath(reopened.BaseName))
+	require.Equal(t, uint64(5), reopened.GetAbsoluteOffset())
+	messages, err := reopened.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{2, 4}, messageOffsets(messages))
+}
+
+func TestWriteCompactedReplicaRangePersistsAnEmptyLogicalRange(t *testing.T) {
+	cfg := compactionTestConfig(t)
+	cfg.EnabledDistribution = true
+	handler, err := NewDiskHandler(cfg, "state", 0)
+	require.NoError(t, err)
+	require.NoError(t, handler.WriteCompactedReplicaRange(0, 5, nil))
+	require.Equal(t, uint64(5), handler.GetAbsoluteOffset())
+	messages, err := handler.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Empty(t, messages)
+	require.NoError(t, handler.Close())
+
+	reopened, err := NewDiskHandler(cfg, "state", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reopened.Close()) }()
+	require.Equal(t, uint64(5), reopened.GetAbsoluteOffset())
+	messages, err = reopened.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Empty(t, messages)
+}
+
+func TestPendingCompactedReplicaRangeRecoveryIsIdempotentAfterLogInstall(t *testing.T) {
+	cfg := compactionTestConfig(t)
+	cfg.EnabledDistribution = true
+	handler, err := NewDiskHandler(cfg, "state", 0)
+	require.NoError(t, err)
+	records := []types.DiskMessage{
+		{Topic: "state", Partition: 0, Offset: 3, Key: "key", Payload: "current"},
+	}
+	_, err = handler.stageCompactedReplicaRange(0, 5, records)
+	require.NoError(t, err)
+	require.NoError(t, handler.Close())
+	logPath := handler.GetSegmentPath(0)
+	require.NoError(t, replaceCompactedFile(compactedRangeTempPath(logPath), logPath))
+
+	reopened, err := NewDiskHandler(cfg, "state", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reopened.Close()) }()
+	require.Equal(t, uint64(5), reopened.GetAbsoluteOffset())
+	messages, err := reopened.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{3}, messageOffsets(messages))
+}
+
+func TestPendingCompactedReplicaRangeFailsClosedOnCorruptStage(t *testing.T) {
+	cfg := compactionTestConfig(t)
+	cfg.EnabledDistribution = true
+	handler, err := NewDiskHandler(cfg, "state", 0)
+	require.NoError(t, err)
+	_, err = handler.stageCompactedReplicaRange(0, 5, []types.DiskMessage{
+		{Topic: "state", Partition: 0, Offset: 3, Key: "key", Payload: "current"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, handler.Close())
+	logTemp := compactedRangeTempPath(handler.GetSegmentPath(0))
+	require.NoError(t, os.WriteFile(logTemp, []byte("corrupt"), 0o600))
+
+	_, err = NewDiskHandler(cfg, "state", 0)
+	require.ErrorContains(t, err, "does not match pending")
+}
+
+func TestCompactionFailureDiagnosticsAreStateTransitionBounded(t *testing.T) {
+	handler := &DiskHandler{}
+	require.True(t, handler.transitionCompactionFailure("storage"))
+	require.False(t, handler.transitionCompactionFailure("storage"))
+	require.True(t, handler.transitionCompactionFailure("sync"))
+	require.Equal(t, "other", boundedCompactionReason("path-specific-reason"))
+}

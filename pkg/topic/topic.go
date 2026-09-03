@@ -30,6 +30,7 @@ type Topic struct {
 	LifecycleEpoch    uint64
 	Policy            Policy
 	txnResolver       TransactionDecisionResolver
+	compactionGate    func(topic string, partition int) (bool, string)
 }
 
 func (t *Topic) SetTransactionDecisionResolver(resolver TransactionDecisionResolver) {
@@ -39,6 +40,15 @@ func (t *Topic) SetTransactionDecisionResolver(resolver TransactionDecisionResol
 	t.txnResolver = resolver
 	for _, partition := range t.Partitions {
 		partition.SetTransactionDecisionResolver(resolver)
+	}
+}
+
+func (t *Topic) SetDistributedCompactionGate(gate func(topic string, partition int) (bool, string)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.compactionGate = gate
+	for _, partition := range t.Partitions {
+		partition.SetDistributedCompactionGate(gate)
 	}
 }
 
@@ -277,6 +287,7 @@ func (t *Topic) applyFullDefinitionLocked(definition Definition, hp HandlerProvi
 		}
 		partition := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
 		partition.SetTransactionDecisionResolver(t.txnResolver)
+		partition.SetDistributedCompactionGate(t.compactionGate)
 		partition.isIdempotent = t.IsIdempotent
 		partition.RecoverProducerStateFromLog()
 		partition.StartProducerStateMaintenance()

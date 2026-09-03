@@ -40,19 +40,31 @@ type compactionFrame struct {
 // EnforceCompaction rewrites eligible closed segments for compacted topics.
 func (d *DiskHandler) EnforceCompaction() (CompactionResult, error) {
 	var result CompactionResult
-	if d.distributed {
-		if d.internalMetadata {
-			result.SkippedReason = "distributed_internal_metadata"
-			return result, nil
-		}
-		return result, fmt.Errorf("log compaction is not supported in distributed mode")
-	}
-
 	d.maintenanceMu.Lock()
 	defer d.maintenanceMu.Unlock()
 	if !config.HasCleanupPolicy(d.CleanupPolicy(), config.CleanupPolicyCompact) {
 		result.SkippedReason = "policy_disabled"
 		return result, nil
+	}
+	if d.distributed {
+		if d.internalMetadata {
+			result.SkippedReason = "distributed_internal_metadata"
+			return result, nil
+		}
+		d.compactionGateMu.RLock()
+		gate := d.compactionGate
+		d.compactionGateMu.RUnlock()
+		if gate == nil {
+			result.SkippedReason = "distributed_gate_unavailable"
+			return result, nil
+		}
+		if allowed, reason := gate(); !allowed {
+			if reason == "" {
+				reason = "distributed_gate_closed"
+			}
+			result.SkippedReason = reason
+			return result, nil
+		}
 	}
 	if atomic.LoadInt32(&d.activeReaders) > 0 {
 		result.SkippedReason = "active_readers"
@@ -157,6 +169,14 @@ func (d *DiskHandler) EnforceCompaction() (CompactionResult, error) {
 	}
 	result.BytesAfter = result.BytesBefore - removedBytes
 	return result, nil
+}
+
+// SetDistributedCompactionGate installs the cluster-safety predicate checked
+// before a distributed application partition rewrites closed segments.
+func (d *DiskHandler) SetDistributedCompactionGate(gate func() (bool, string)) {
+	d.compactionGateMu.Lock()
+	d.compactionGate = gate
+	d.compactionGateMu.Unlock()
 }
 
 func (d *DiskHandler) compactionDirtyRatio() float64 {

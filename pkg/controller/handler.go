@@ -111,6 +111,9 @@ func NewCommandHandler(
 	if tm != nil {
 		tm.SetTransactionDecisionResolver(ch.TxnManager)
 		tm.SetDeleteHook(ch.ESHandler.DeleteTopic)
+		if cfg != nil && cfg.EnabledDistribution {
+			tm.SetDistributedCompactionGate(ch.distributedCompactionAllowed)
+		}
 	}
 	if cc != nil && cc.RaftManager != nil {
 		if fsm := cc.RaftManager.GetFSM(); fsm != nil {

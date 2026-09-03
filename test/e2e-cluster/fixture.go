@@ -12,12 +12,13 @@ import (
 )
 
 const (
-	composeFile         = "docker-compose.yml"
-	snapshotComposeFile = "docker-compose.snapshot.yml"
-	snapshotProjectName = "cursus-snapshot-e2e"
-	faultComposeFile    = "docker-compose.faults.yml"
-	baseBrokerPort      = 9000
-	baseHealthPort      = 9080
+	composeFile           = "docker-compose.yml"
+	compactionComposeFile = "docker-compose.compaction.yml"
+	snapshotComposeFile   = "docker-compose.snapshot.yml"
+	snapshotProjectName   = "cursus-snapshot-e2e"
+	faultComposeFile      = "docker-compose.faults.yml"
+	baseBrokerPort        = 9000
+	baseHealthPort        = 9080
 )
 
 // ClusterTestContext extends e2e.TestContext for cluster testing
@@ -71,6 +72,10 @@ func GivenCluster(t *testing.T) *ClusterTestContext {
 
 func GivenClusterRestart(t *testing.T) *ClusterTestContext {
 	return givenClusterRestart(t, "", composeFile)
+}
+
+func GivenCompactionClusterRestart(t *testing.T) *ClusterTestContext {
+	return givenClusterRestart(t, "", composeFile, compactionComposeFile)
 }
 
 func GivenSnapshotClusterRestart(t *testing.T) *ClusterTestContext {

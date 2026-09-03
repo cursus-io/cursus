@@ -68,6 +68,10 @@ type DiskHandler struct {
 	maintenanceMu     sync.Mutex
 	compactionMu      sync.RWMutex
 	compactedSegments map[uint64]int64
+	compactionGateMu  sync.RWMutex
+	compactionGate    func() (bool, string)
+	compactionStateMu sync.Mutex
+	compactionFailure string
 	segmentReaders    *segmentReaderCache
 	mu                sync.Mutex // metadata(offset, segment), file handler(d.file)
 	ioMu              sync.Mutex // bufio.Writer, flush
@@ -167,6 +171,9 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	internalMetadata := topicName == config.ConsumerOffsetsTopicName
 	standaloneInternalMetadata := internalMetadata && !cfg.EnabledDistribution
 	tempDh := &DiskHandler{BaseName: base}
+	if err := recoverPendingCompactedRange(base); err != nil {
+		return nil, fmt.Errorf("recover pending compacted replica range: %w", err)
+	}
 	if err := cleanupDeletedSegments(base); err != nil {
 		return nil, fmt.Errorf("cleanup deleted segment tombstones: %w", err)
 	}

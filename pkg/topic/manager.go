@@ -48,6 +48,7 @@ type TopicManager struct {
 	txnResolver        TransactionDecisionResolver
 	metadataStore      *topicMetadataStore
 	deleteHook         func(string) error
+	compactionGate     func(topic string, partition int) (bool, string)
 
 	metadataLoadFailure             string
 	metadataRestoredTopicCount      int
@@ -95,6 +96,15 @@ func (tm *TopicManager) SetTransactionDecisionResolver(resolver TransactionDecis
 	tm.txnResolver = resolver
 	for _, t := range tm.topics {
 		t.SetTransactionDecisionResolver(resolver)
+	}
+}
+
+func (tm *TopicManager) SetDistributedCompactionGate(gate func(topic string, partition int) (bool, string)) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.compactionGate = gate
+	for _, value := range tm.topics {
+		value.SetDistributedCompactionGate(gate)
 	}
 }
 
@@ -221,6 +231,7 @@ func (tm *TopicManager) CreateTopicWithPatch(defaults Definition, patch Definiti
 		return Definition{}, fmt.Errorf("failed to create topic '%s': %w", target.Name, err)
 	}
 	created.SetTransactionDecisionResolver(tm.txnResolver)
+	created.SetDistributedCompactionGate(tm.compactionGate)
 	if err := tm.persistDefinitionLocked(target); err != nil {
 		closePartiallyInitializedTopic(target.Name, tm.hp, created.Partitions)
 		return Definition{}, err
@@ -278,6 +289,7 @@ func (tm *TopicManager) ApplyDefinition(raw Definition) error {
 		return fmt.Errorf("failed to create topic '%s': %w", definition.Name, err)
 	}
 	created.SetTransactionDecisionResolver(tm.txnResolver)
+	created.SetDistributedCompactionGate(tm.compactionGate)
 	if err := tm.persistDefinitionLocked(definition); err != nil {
 		closePartiallyInitializedTopic(definition.Name, tm.hp, created.Partitions)
 		return err

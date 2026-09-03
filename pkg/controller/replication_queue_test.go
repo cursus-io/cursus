@@ -579,6 +579,45 @@ func TestPreparePartitionReplicaAllowsFencedBackfillBelowCommittedHWM(t *testing
 	require.Equal(t, uint64(2), partition.GetHWM())
 }
 
+func TestApplyReplicaCatchupAcceptsCompactedOffsetRangeAndPreservesHWM(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	cfg.CleanupPolicy = config.CleanupPolicyCompact
+	diskManager := disk.NewDiskManager(cfg)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, topicManager.CreateTopic("state", 1, false, false))
+	state := fsm.NewBrokerFSM(topicManager, nil)
+	applyPartitionMetadata(t, state, "state", 0, fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 7, CommittedHWM: 5, CommittedHWMKnown: true,
+		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1"}, PartitionCount: 1,
+	})
+	raftManager := &MockRaftManagerForForward{state: state}
+	cluster := clusterController.NewClusterController(context.Background(), cfg, raftManager, nil, "broker-2", "broker-2:9001")
+	handler := NewCommandHandler(topicManager, cfg, nil, nil, cluster)
+	t.Cleanup(func() {
+		_ = handler.Close()
+		diskManager.CloseAllHandlers()
+	})
+
+	require.NoError(t, handler.ApplyReplicaCatchup(fsm.ReplicaCatchupBatch{
+		Topic: "state", Partition: 0, BrokerID: "broker-2", StartOffset: 0, EndOffset: 5,
+		CommittedHWM: 5, Leader: "broker-1", LeaderEpoch: 7,
+		LifecycleEpoch: topic.InitialLifecycleEpoch, Compacted: true,
+		Messages: []types.Message{{Offset: 2, Key: "a", Payload: "current-a"}, {Offset: 4, Key: "b", Payload: "current-b"}},
+	}))
+	partition, err := topicManager.GetTopic("state").GetPartition(0)
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), partition.NextOffset())
+	require.Equal(t, uint64(5), partition.GetHWM())
+	messages, err := partition.ReadCommitted(0, 10)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{2, 4}, []uint64{messages[0].Offset, messages[1].Offset})
+	messages, err = partition.ReadCommitted(3, 10)
+	require.NoError(t, err, "a committed offset inside a compacted hole must remain in range")
+	require.Equal(t, []uint64{4}, []uint64{messages[0].Offset})
+}
+
 func TestDistributedLeaderAcknowledgementsPreserveOrderedUncommittedTail(t *testing.T) {
 	handler, manager, executor := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))

@@ -164,7 +164,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 					if cc != nil && cc.Router != nil {
 						brokerJSON, _ := json.Marshal(map[string]interface{}{
 							"id": brokerID, "addr": localAddr, "client_addr": clientAddr,
-							"status": "active", "lifecycle_protocol": fsm.TopicLifecycleProtocolVersion,
+							"status": "active", "lifecycle_protocol": fsm.BrokerProtocolVersionCurrent,
 						})
 						raftCmd := fmt.Sprintf("RAFT_APPLY %stype=REGISTER payload=%s", internalAuthPrefix(cfg), string(brokerJSON))
 						if resp, err := cc.Router.ForwardToLeader(raftCmd); err == nil && !wireprotocol.IsErrorResponse(resp) {

@@ -468,6 +468,27 @@ func (d *DiskHandler) rotateSegment(nextBaseOffset uint64) error {
 	return nil
 }
 
+// RollSegmentAt closes the active segment at the current logical tail. It is
+// primarily used by replica maintenance and tests that need a stable closed
+// segment boundary.
+func (d *DiskHandler) RollSegmentAt(nextBaseOffset uint64) error {
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+	d.appendMu.Lock()
+	defer d.appendMu.Unlock()
+	if nextBaseOffset != atomic.LoadUint64(&d.AbsoluteOffset) {
+		return fmt.Errorf("segment roll boundary %d does not match local tail %d", nextBaseOffset, atomic.LoadUint64(&d.AbsoluteOffset))
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
+	if err := d.rotateSegment(nextBaseOffset); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(d.BaseName))
+}
+
 // openSegment opens or creates the current segment file for writing.
 func (d *DiskHandler) openSegment() error {
 	flags := os.O_CREATE | os.O_RDWR | os.O_APPEND

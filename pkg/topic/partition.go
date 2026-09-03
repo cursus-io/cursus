@@ -87,6 +87,31 @@ func (p *Partition) SetTransactionDecisionResolver(resolver TransactionDecisionR
 	p.txnMarkerMu.Unlock()
 }
 
+func (p *Partition) SetDistributedCompactionGate(gate func(topic string, partition int) (bool, string)) {
+	setter, ok := p.dh.(interface {
+		SetDistributedCompactionGate(func() (bool, string))
+	})
+	if !ok {
+		return
+	}
+	setter.SetDistributedCompactionGate(func() (bool, string) {
+		p.mu.RLock()
+		closed := p.closed
+		hwm := p.HWM
+		p.mu.RUnlock()
+		if closed {
+			return false, "partition_closed"
+		}
+		if leo := p.LEO.Load(); leo != hwm {
+			return false, "local_uncommitted_tail"
+		}
+		if gate == nil {
+			return false, "cluster_gate_unavailable"
+		}
+		return gate(p.topic, p.id)
+	})
+}
+
 // NewPartition creates a partition instance.
 func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManager, cfg *config.Config) *Partition {
 	// Storage exposes the next assignable offset, not the last record offset.
@@ -548,6 +573,48 @@ func (p *Partition) ReplicaAppendWithMode(msgs []types.Message, forceIdempotent 
 		p.LEO.Store(nextOffset)
 		p.NotifyNewMessage()
 	}
+	return nil
+}
+
+// ReplicaAppendCompactedRange installs a leader-provided logical range while
+// preserving holes created by compaction and advancing only LEO. HWM remains a
+// separate authoritative transition.
+func (p *Partition) ReplicaAppendCompactedRange(msgs []types.Message, endOffset uint64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return fmt.Errorf("partition %d is closed", p.id)
+	}
+	startOffset := p.LEO.Load()
+	if endOffset <= startOffset {
+		return fmt.Errorf("invalid compacted replica range [%d,%d)", startOffset, endOffset)
+	}
+	storage, ok := p.dh.(types.CompactedRangeStorage)
+	if !ok {
+		return fmt.Errorf("storage does not support compacted replica ranges")
+	}
+	if p.id > math.MaxInt32 {
+		return fmt.Errorf("partition ID %d exceeds int32 range", p.id)
+	}
+	partitionID := int32(p.id) // #nosec G115 -- p.id is validated before narrowing.
+	diskBatch := make([]types.DiskMessage, 0, len(msgs))
+	previous := startOffset
+	for i := range msgs {
+		if msgs[i].Offset < startOffset || msgs[i].Offset >= endOffset || (i > 0 && msgs[i].Offset <= previous) {
+			return fmt.Errorf("invalid compacted replica offset %d for range [%d,%d)", msgs[i].Offset, startOffset, endOffset)
+		}
+		previous = msgs[i].Offset
+		diskBatch = append(diskBatch, diskMessageFromMessage(p.topic, partitionID, msgs[i]))
+	}
+	if err := storage.WriteCompactedReplicaRange(startOffset, endOffset, diskBatch); err != nil {
+		return fmt.Errorf("compacted replica range append failed: %w", err)
+	}
+	for i := range msgs {
+		p.updateProducerStateWithMode(&msgs[i], true)
+		p.indexTransactionMessage(msgs[i])
+	}
+	p.LEO.Store(endOffset)
+	p.NotifyNewMessage()
 	return nil
 }
 

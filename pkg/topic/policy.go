@@ -120,9 +120,6 @@ func validateCleanupPolicyForTopic(policy Policy, cfg *config.Config, eventSourc
 	if eventSourcing {
 		return fmt.Errorf("cleanup policy compact is not supported for event-sourcing topics")
 	}
-	if cfg != nil && cfg.EnabledDistribution {
-		return fmt.Errorf("cleanup policy compact is not supported in distributed mode")
-	}
 	return nil
 }
 

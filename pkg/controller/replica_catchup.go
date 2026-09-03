@@ -5,11 +5,13 @@ import (
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	replicationFSM "github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/config"
 )
 
-// ApplyReplicaCatchup appends one leader-fenced, contiguous raw log range to a
-// local replica. It advances the local HWM only when the complete committed
-// range is present; ISR admission remains the heartbeat proof's responsibility.
+// ApplyReplicaCatchup appends one leader-fenced committed logical range to a
+// local replica. Compacted ranges may contain physical offset holes. It advances
+// HWM only when the complete committed range is present; ISR admission remains
+// the heartbeat proof's responsibility.
 func (ch *CommandHandler) ApplyReplicaCatchup(batch replicationFSM.ReplicaCatchupBatch) error {
 	if ch == nil || ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.TopicManager == nil {
 		return fmt.Errorf("replica catch-up dependencies are unavailable")
@@ -17,7 +19,7 @@ func (ch *CommandHandler) ApplyReplicaCatchup(batch replicationFSM.ReplicaCatchu
 	if ch.Cluster.Router == nil || batch.BrokerID != ch.Cluster.Router.BrokerID() {
 		return fmt.Errorf("replica catch-up broker identity mismatch")
 	}
-	if len(batch.Messages) == 0 || len(batch.Messages) > replicationFSM.MaxReplicaCatchupRecords {
+	if len(batch.Messages) > replicationFSM.MaxReplicaCatchupRecords || (!batch.Compacted && len(batch.Messages) == 0) {
 		return fmt.Errorf("invalid replica catch-up batch size %d", len(batch.Messages))
 	}
 
@@ -58,21 +60,35 @@ func (ch *CommandHandler) ApplyReplicaCatchup(batch replicationFSM.ReplicaCatchu
 	if partition.NextOffset() != batch.StartOffset {
 		return fmt.Errorf("replica catch-up local LEO changed: current=%d response_start=%d", partition.NextOffset(), batch.StartOffset)
 	}
+	endOffset := batch.EndOffset
+	if endOffset == 0 && len(batch.Messages) > 0 {
+		endOffset = batch.Messages[len(batch.Messages)-1].Offset + 1
+	}
+	if endOffset <= batch.StartOffset || endOffset > batch.CommittedHWM {
+		return fmt.Errorf("invalid replica catch-up range [%d,%d)", batch.StartOffset, endOffset)
+	}
 	next := batch.StartOffset
 	for i := range batch.Messages {
 		message := &batch.Messages[i]
-		if message.Offset != next || message.Offset >= batch.CommittedHWM {
+		if message.Offset >= endOffset || (!batch.Compacted && message.Offset != next) || (batch.Compacted && message.Offset < next) {
 			return fmt.Errorf("invalid replica catch-up offset: expected=%d got=%d hwm=%d", next, message.Offset, batch.CommittedHWM)
 		}
 		if errResp := ch.validateReplicatedTransactionMessage(batch.Topic, batch.Partition, message); errResp != "" {
 			return fmt.Errorf("replica catch-up transaction validation failed: %s", errResp)
 		}
-		next++
+		next = message.Offset + 1
 	}
-	if err := partition.ReplicaAppendWithMode(batch.Messages, true); err != nil {
+	if batch.Compacted {
+		if !config.HasCleanupPolicy(localTopic.PolicySnapshot().CleanupPolicy, config.CleanupPolicyCompact) {
+			return fmt.Errorf("compacted replica catch-up is not allowed for topic policy")
+		}
+		if err := partition.ReplicaAppendCompactedRange(batch.Messages, endOffset); err != nil {
+			return err
+		}
+	} else if err := partition.ReplicaAppendWithMode(batch.Messages, true); err != nil {
 		return err
 	}
-	if next != batch.CommittedHWM {
+	if endOffset != batch.CommittedHWM {
 		return nil
 	}
 	if localTopic.IsEventSourcing && ch.ESHandler != nil {

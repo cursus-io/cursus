@@ -74,7 +74,11 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		if err := apply(batch); err != nil {
 			return err
 		}
-		request.NextOffset = batch.Messages[len(batch.Messages)-1].Offset + 1
+		nextOffset := batch.EndOffset
+		if nextOffset == 0 && len(batch.Messages) > 0 {
+			nextOffset = batch.Messages[len(batch.Messages)-1].Offset + 1
+		}
+		request.NextOffset = nextOffset
 	}
 	return nil
 }
@@ -89,15 +93,22 @@ func validateReplicaCatchupBatch(request fsm.ReplicaCatchupRequest, batch fsm.Re
 	if batch.CommittedHWM != request.CommittedHWM || batch.StartOffset != request.NextOffset {
 		return fmt.Errorf("replica catch-up response boundary mismatch")
 	}
-	if len(batch.Messages) == 0 || len(batch.Messages) > request.MaxRecords {
+	if len(batch.Messages) > request.MaxRecords || (!batch.Compacted && len(batch.Messages) == 0) {
 		return fmt.Errorf("invalid replica catch-up batch size %d", len(batch.Messages))
+	}
+	endOffset := batch.EndOffset
+	if endOffset == 0 && len(batch.Messages) > 0 {
+		endOffset = batch.Messages[len(batch.Messages)-1].Offset + 1
+	}
+	if endOffset <= request.NextOffset || endOffset > request.CommittedHWM {
+		return fmt.Errorf("invalid replica catch-up end offset %d", endOffset)
 	}
 	next := request.NextOffset
 	for _, message := range batch.Messages {
-		if message.Offset != next || message.Offset >= request.CommittedHWM {
+		if message.Offset >= endOffset || (!batch.Compacted && message.Offset != next) || (batch.Compacted && message.Offset < next) {
 			return fmt.Errorf("invalid replica catch-up offset: expected=%d got=%d hwm=%d", next, message.Offset, request.CommittedHWM)
 		}
-		next++
+		next = message.Offset + 1
 	}
 	return nil
 }

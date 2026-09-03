@@ -189,7 +189,14 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			}
 		}
 		if config.HasCleanupPolicy(definition.Policy.CleanupPolicy, config.CleanupPolicyCompact) {
-			return fmt.Errorf("cleanup policy compact is not supported in distributed mode")
+			for _, broker := range f.brokers {
+				if broker.Status == "active" && broker.LifecycleProtocol < DistributedCompactionProtocolVersion {
+					return fmt.Errorf(
+						"distributed compaction requires broker protocol %d on every active broker; broker %q advertises %d",
+						DistributedCompactionProtocolVersion, broker.ID, broker.LifecycleProtocol,
+					)
+				}
+			}
 		}
 
 		var brokers []string

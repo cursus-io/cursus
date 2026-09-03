@@ -404,13 +404,18 @@ func (bc *BrokerClient) ConsumeMessages(topic string, partition int, consumerGro
 
 // ConsumeMessagesWithOffsets reads messages and their actual offsets from a partition
 func (bc *BrokerClient) ConsumeMessagesWithOffsets(topic string, partition int, consumerGroup string, memberID string, generation int, timeout time.Duration) ([]string, []uint64, error) {
-	if err := bc.connect(); err != nil {
-		return nil, nil, fmt.Errorf("connect: %w", err)
-	}
-
 	startOffset, err := bc.FetchCommittedOffset(topic, partition, consumerGroup)
 	if err != nil {
 		return nil, nil, fmt.Errorf("fetch committed offset: %w", err)
+	}
+	return bc.ConsumeMessagesAtOffsetWithOffsets(topic, partition, startOffset, consumerGroup, memberID, generation, timeout)
+}
+
+// ConsumeMessagesAtOffsetWithOffsets reads messages from an explicit logical
+// offset without changing the client's broker selection first.
+func (bc *BrokerClient) ConsumeMessagesAtOffsetWithOffsets(topic string, partition int, startOffset uint64, consumerGroup string, memberID string, generation int, timeout time.Duration) ([]string, []uint64, error) {
+	if err := bc.connect(); err != nil {
+		return nil, nil, fmt.Errorf("connect: %w", err)
 	}
 
 	bc.requestMu.Lock()

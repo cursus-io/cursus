@@ -157,6 +157,8 @@ func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
 	batch, err := brokerFSM.FetchReplicaCatchup(request)
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), batch.StartOffset)
+	require.Equal(t, uint64(2), batch.EndOffset)
+	require.False(t, batch.Compacted)
 	require.Equal(t, uint64(3), batch.CommittedHWM)
 	require.Len(t, batch.Messages, 1)
 	require.Equal(t, uint64(1), batch.Messages[0].Offset)
@@ -169,4 +171,51 @@ func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
 	request.LeaderEpoch++
 	_, err = brokerFSM.FetchReplicaCatchup(request)
 	require.ErrorContains(t, err, "stale leader fence")
+}
+
+func TestFetchReplicaCatchupCarriesCompactedOffsetRange(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.CleanupPolicy = config.CleanupPolicyCompact
+	cfg.MinCleanableDirtyRatio = 0.01
+	cfg.RetentionCheckIntervalMS = 60_000
+	cfg.CompactionCheckIntervalMS = 60_000
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, topicManager.CreateTopic("state", 1, false, false))
+	partition, err := topicManager.GetTopic("state").GetPartition(0)
+	require.NoError(t, err)
+	t.Cleanup(partition.Close)
+	require.NoError(t, partition.EnqueueSync(types.Message{Key: "key", Payload: "old"}))
+	require.NoError(t, partition.EnqueueSync(types.Message{Key: "key", Payload: "current"}))
+	require.NoError(t, partition.EnqueueSync(types.Message{Key: "other", Payload: "retained"}))
+	partition.FlushDisk()
+	handlerValue, err := diskManager.GetHandler("state", 0)
+	require.NoError(t, err)
+	handler := handlerValue.(*disk.DiskHandler)
+	require.NoError(t, handler.RollSegmentAt(handler.GetAbsoluteOffset()))
+	result, err := handler.EnforceCompaction()
+	require.NoError(t, err)
+	require.Equal(t, 1, result.RecordsRemoved)
+
+	brokerFSM := NewBrokerFSM(topicManager, nil)
+	definition := topicManager.GetTopic("state").Definition()
+	brokerFSM.mu.Lock()
+	brokerFSM.topicState["state"] = &definition
+	brokerFSM.partitionMetadata["state-0"] = &PartitionMetadata{
+		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch,
+		CommittedHWM: 3, CommittedHWMKnown: true, PartitionCount: 1,
+		Replicas: []string{"node-1", "node-2"}, ISR: []string{"node-1"},
+	}
+	brokerFSM.mu.Unlock()
+
+	batch, err := brokerFSM.FetchReplicaCatchup(ReplicaCatchupRequest{
+		Topic: "state", Partition: 0, BrokerID: "node-2", NextOffset: 0, CommittedHWM: 3,
+		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch, MaxRecords: 10,
+	})
+	require.NoError(t, err)
+	require.True(t, batch.Compacted)
+	require.Equal(t, uint64(3), batch.EndOffset)
+	require.Equal(t, []uint64{1, 2}, []uint64{batch.Messages[0].Offset, batch.Messages[1].Offset})
 }

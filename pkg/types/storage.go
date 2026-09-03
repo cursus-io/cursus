@@ -31,6 +31,13 @@ type DurableBatchStorage interface {
 	WriteBatchSync(batch []DiskMessage) error
 }
 
+// CompactedRangeStorage durably materializes a logical replica range whose
+// superseded offsets may be absent from the physical record stream.
+type CompactedRangeStorage interface {
+	StorageHandler
+	WriteCompactedReplicaRange(startOffset, endOffset uint64, batch []DiskMessage) error
+}
+
 // OffsetOutOfRangeError indicates that the requested offset is outside the retained committed log range.
 type OffsetOutOfRangeError struct {
 	Requested uint64

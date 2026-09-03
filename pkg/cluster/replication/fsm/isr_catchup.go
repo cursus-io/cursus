@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
@@ -26,17 +27,20 @@ type ReplicaCatchupRequest struct {
 	LeaderAddress  string `json:"-"`
 }
 
-// ReplicaCatchupBatch carries an exact, contiguous committed-log range under
-// the same partition fences as the request.
+// ReplicaCatchupBatch carries a committed logical range under the same
+// partition fences as the request. Compacted batches may omit superseded
+// physical records while EndOffset still advances the logical replica tail.
 type ReplicaCatchupBatch struct {
 	Topic          string          `json:"topic"`
 	Partition      int             `json:"partition"`
 	BrokerID       string          `json:"broker_id"`
 	StartOffset    uint64          `json:"start_offset"`
+	EndOffset      uint64          `json:"end_offset,omitempty"`
 	CommittedHWM   uint64          `json:"committed_hwm"`
 	Leader         string          `json:"leader"`
 	LeaderEpoch    int             `json:"leader_epoch"`
 	LifecycleEpoch uint64          `json:"lifecycle_epoch"`
+	Compacted      bool            `json:"compacted,omitempty"`
 	Messages       []types.Message `json:"messages"`
 }
 
@@ -335,14 +339,42 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 	if err != nil {
 		return ReplicaCatchupBatch{}, err
 	}
-	if request.NextOffset < current.CommittedHWM && len(messages) == 0 {
-		return ReplicaCatchupBatch{}, fmt.Errorf("committed catch-up range at %d is unavailable", request.NextOffset)
+	f.mu.RLock()
+	definition := copyTopicDefinition(f.topicState[request.Topic])
+	f.mu.RUnlock()
+	compactionEnabled := definition != nil && config.HasCleanupPolicy(definition.Policy.CleanupPolicy, config.CleanupPolicyCompact)
+	endOffset := request.NextOffset
+	compacted := false
+	if len(messages) == 0 {
+		if request.NextOffset < current.CommittedHWM && !compactionEnabled {
+			return ReplicaCatchupBatch{}, fmt.Errorf("committed catch-up range at %d is unavailable", request.NextOffset)
+		}
+		if request.NextOffset < current.CommittedHWM {
+			endOffset = current.CommittedHWM
+			compacted = true
+		}
+	} else {
+		expected := request.NextOffset
+		for _, message := range messages {
+			if message.Offset != expected {
+				compacted = true
+			}
+			expected = message.Offset + 1
+		}
+		endOffset = expected
+		if len(messages) < request.MaxRecords && endOffset < current.CommittedHWM {
+			endOffset = current.CommittedHWM
+			compacted = true
+		}
+		if compacted && !compactionEnabled {
+			return ReplicaCatchupBatch{}, fmt.Errorf("non-contiguous committed range for uncompacted topic %s", request.Topic)
+		}
 	}
 	return ReplicaCatchupBatch{
 		Topic: request.Topic, Partition: request.Partition, BrokerID: request.BrokerID,
-		StartOffset: request.NextOffset, CommittedHWM: current.CommittedHWM,
+		StartOffset: request.NextOffset, EndOffset: endOffset, CommittedHWM: current.CommittedHWM,
 		Leader: current.Leader, LeaderEpoch: current.LeaderEpoch, LifecycleEpoch: current.LifecycleEpoch,
-		Messages: messages,
+		Compacted: compacted, Messages: messages,
 	}, nil
 }
 
@@ -375,16 +407,11 @@ func (f *BrokerFSM) ReadCommittedLogRange(topicName string, partitionID int, off
 		return nil, err
 	}
 	result := make([]types.Message, 0, len(messages))
-	next := offset
 	for _, message := range messages {
 		if message.Offset >= committedHWM {
 			break
 		}
-		if message.Offset != next {
-			return nil, fmt.Errorf("non-contiguous local replica log: expected %d, got %d", next, message.Offset)
-		}
 		result = append(result, message)
-		next++
 	}
 	return result, nil
 }
