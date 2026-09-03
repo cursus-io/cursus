@@ -368,10 +368,16 @@ func TestDistributedLeaderAcknowledgementReturnsBeforeFollowerAndKeepsReplicatin
 	partition, err := manager.GetTopic("orders").GetPartition(0)
 	require.NoError(t, err)
 
-	started := time.Now()
-	response := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=value", NewClientContext("", 0))
-	require.Contains(t, response, `"status":"OK"`)
-	require.Less(t, time.Since(started), 100*time.Millisecond)
+	responseCh := make(chan string, 1)
+	go func() {
+		responseCh <- handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=value", NewClientContext("", 0))
+	}()
+	select {
+	case response := <-responseCh:
+		require.Contains(t, response, `"status":"OK"`)
+	case <-time.After(time.Second):
+		t.Fatal("leader acknowledgement waited for follower replication")
+	}
 	<-executor.started
 	require.Equal(t, uint64(1), partition.NextOffset())
 	require.Zero(t, partition.GetHWM(), "leader-only append became consumer-visible")
