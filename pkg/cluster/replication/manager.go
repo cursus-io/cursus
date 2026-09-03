@@ -273,6 +273,10 @@ func awaitRecoveredPartitionReplay(ctx context.Context, r raftStatsReader, logSt
 
 	var furthestProgress recoveredPartitionReplayProgress
 	var latestProgress recoveredPartitionReplayProgress
+	var scannedSnapshotIndex uint64
+	var scannedCommitIndex uint64
+	var targetIndex uint64
+	targetKnown := false
 	initialized := false
 	for {
 		stats := r.Stats()
@@ -286,9 +290,28 @@ func awaitRecoveredPartitionReplay(ctx context.Context, r raftStatsReader, logSt
 			appliedIndex:  brokerFSM.AppliedIndex(),
 		}
 		if snapshotErr == nil && commitErr == nil && lastLogErr == nil && commitIndex >= snapshotIndex && lastLogIndex >= commitIndex {
-			target, err := highestFSMCommandIndex(logStore, snapshotIndex, commitIndex)
-			latestProgress.targetIndex = target
-			if err == nil && latestProgress.appliedIndex >= target {
+			scanStart := snapshotIndex
+			if targetKnown && snapshotIndex == scannedSnapshotIndex && commitIndex >= scannedCommitIndex {
+				scanStart = scannedCommitIndex
+			} else {
+				targetIndex = 0
+				targetKnown = false
+			}
+			if !targetKnown || commitIndex > scannedCommitIndex {
+				candidate, err := highestFSMCommandIndex(logStore, scanStart, commitIndex)
+				if err == nil {
+					if candidate > targetIndex {
+						targetIndex = candidate
+					}
+					scannedSnapshotIndex = snapshotIndex
+					scannedCommitIndex = commitIndex
+					targetKnown = true
+				} else if !errors.Is(err, raft.ErrLogNotFound) {
+					return fmt.Errorf("inspect committed Raft replay range: %w", err)
+				}
+			}
+			latestProgress.targetIndex = targetIndex
+			if targetKnown && latestProgress.appliedIndex >= targetIndex {
 				latestCommit, parseErr := strconv.ParseUint(r.Stats()["commit_index"], 10, 64)
 				if parseErr == nil && latestCommit == commitIndex {
 					if err := brokerFSM.FinalizeRecoveredPartitions(); err != nil {
@@ -299,8 +322,6 @@ func awaitRecoveredPartitionReplay(ctx context.Context, r raftStatsReader, logSt
 					}
 					return nil
 				}
-			} else if err != nil && !errors.Is(err, raft.ErrLogNotFound) {
-				return fmt.Errorf("inspect committed Raft replay range: %w", err)
 			}
 		}
 		if !initialized {
