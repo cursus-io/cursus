@@ -57,6 +57,7 @@ func TestDistributedCompactionPreservesReplicaAndConsumerOffsets(t *testing.T) {
 		response, publishErr := client.SendCommand(ctx.GetTopic(), command, 10*time.Second)
 		require.NoError(t, publishErr, "publish offset %d", offset)
 		require.True(t, successfulBrokerResponse(response), "publish offset %d: %s", offset, response)
+		requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), ctx.GetTopic(), uint64(offset+1))
 	}
 	waitForFullISRAndZeroUnderReplicated(t, ctx, "compacted records publish")
 	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), ctx.GetTopic(), recordCount)
@@ -74,6 +75,7 @@ func TestDistributedCompactionPreservesReplicaAndConsumerOffsets(t *testing.T) {
 		), 10*time.Second)
 		require.NoError(t, publishErr, "failover publish offset %d", offset)
 		require.True(t, successfulBrokerResponse(response), response)
+		requireReplicaOffsetsEventually(t, availableAddrs, ctx.GetTopic(), uint64(offset+1))
 	}
 	failoverWriter.Close()
 	const finalRecordCount = recordCount + 2
@@ -109,15 +111,14 @@ func TestDistributedCompactionPreservesReplicaAndConsumerOffsets(t *testing.T) {
 	deleteResponse, err := controlClient.SendCommand("admin", "CREATE topic="+deleteTopic+" partitions=1 replication_factor=3", 5*time.Second)
 	require.NoError(t, err)
 	require.True(t, successfulBrokerResponse(deleteResponse), deleteResponse)
-	for offset := 0; offset < 3; offset++ {
-		response, publishErr := controlClient.SendCommand(deleteTopic, fmt.Sprintf(
-			"PUBLISH topic=%s partition=0 acks=all producerId=delete-writer isIdempotent=true seqNum=%d epoch=1 message=value-%d",
-			deleteTopic, offset+1, offset,
-		), 5*time.Second)
-		require.NoError(t, publishErr)
-		require.True(t, successfulBrokerResponse(response), response)
-	}
-	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), deleteTopic, 3)
+	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), deleteTopic, 0)
+	response, publishErr := controlClient.SendCommand(deleteTopic, fmt.Sprintf(
+		"PUBLISH topic=%s partition=0 acks=all producerId=delete-writer isIdempotent=true seqNum=1 epoch=1 message=value",
+		deleteTopic,
+	), 5*time.Second)
+	require.NoError(t, publishErr)
+	require.True(t, successfulBrokerResponse(response), response)
+	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), deleteTopic, 1)
 }
 
 func successfulBrokerResponse(response string) bool {

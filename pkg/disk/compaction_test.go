@@ -572,6 +572,10 @@ func TestPendingCompactedReplicaRangeCompletesDuringRestart(t *testing.T) {
 	_, err = handler.stageCompactedReplicaRange(0, 5, records)
 	require.NoError(t, err)
 	require.FileExists(t, compactedRangePendingPath(handler.BaseName))
+	_, err = handler.stageCompactedReplicaRange(0, 5, records)
+	require.ErrorContains(t, err, "pending compacted replica range already exists")
+	require.FileExists(t, compactedRangeTempPath(handler.GetSegmentPath(0)))
+	require.FileExists(t, compactedRangeTempPath(handler.GetIndexPath(0)))
 	require.NoError(t, handler.Close())
 
 	reopened, err := NewDiskHandler(cfg, "state", 0)

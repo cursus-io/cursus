@@ -186,18 +186,26 @@ func (h *ClusterServer) handleReplicaCatchup(payload wire.CommandPayload) (any, 
 }
 
 func fitReplicaCatchupBatch(batch fsm.ReplicaCatchupBatch) (fsm.ReplicaCatchupBatch, error) {
+	return fitReplicaCatchupBatchToLimit(batch, wire.MaxFramePayload)
+}
+
+func fitReplicaCatchupBatchToLimit(batch fsm.ReplicaCatchupBatch, limit int) (fsm.ReplicaCatchupBatch, error) {
 	for {
 		data, err := json.Marshal(batch)
 		if err != nil {
 			return fsm.ReplicaCatchupBatch{}, err
 		}
-		if len(data) <= wire.MaxFramePayload {
+		if len(data) <= limit {
 			return batch, nil
 		}
 		if len(batch.Messages) <= 1 {
 			return fsm.ReplicaCatchupBatch{}, fmt.Errorf("replica catch-up record exceeds Wire v2 frame limit")
 		}
-		batch.Messages = batch.Messages[:len(batch.Messages)/2]
+		messageCount := len(batch.Messages) / 2
+		// The first unsent retained record is the exclusive boundary of this
+		// fitted logical range. Keeping the original EndOffset would skip it.
+		batch.EndOffset = batch.Messages[messageCount].Offset
+		batch.Messages = batch.Messages[:messageCount]
 	}
 }
 

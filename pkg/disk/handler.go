@@ -171,6 +171,8 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	internalMetadata := topicName == config.ConsumerOffsetsTopicName
 	standaloneInternalMetadata := internalMetadata && !cfg.EnabledDistribution
 	tempDh := &DiskHandler{BaseName: base}
+	// Recovery must run before generic compaction-temp cleanup because a pending
+	// compacted range still owns its staged .range.compacting files.
 	if err := recoverPendingCompactedRange(base); err != nil {
 		return nil, fmt.Errorf("recover pending compacted replica range: %w", err)
 	}

@@ -63,6 +63,30 @@ func clusterRoundTrip(t *testing.T, address string, command wire.Command, fields
 	return response
 }
 
+func TestFitReplicaCatchupBatchPreservesFirstUnsentOffset(t *testing.T) {
+	batch := fsm.ReplicaCatchupBatch{
+		StartOffset: 0, EndOffset: 20, CommittedHWM: 20, Compacted: true,
+		Messages: []types.Message{
+			{Offset: 2, Payload: "first"},
+			{Offset: 4, Payload: "second"},
+			{Offset: 8, Payload: "third"},
+			{Offset: 12, Payload: "fourth"},
+		},
+	}
+	expectedPrefix := batch
+	expectedPrefix.EndOffset = 8
+	expectedPrefix.Messages = expectedPrefix.Messages[:2]
+	encodedPrefix, err := json.Marshal(expectedPrefix)
+	require.NoError(t, err)
+
+	fitted, err := fitReplicaCatchupBatchToLimit(batch, len(encodedPrefix))
+	require.NoError(t, err)
+	require.True(t, fitted.Compacted)
+	require.Equal(t, uint64(20), fitted.CommittedHWM)
+	require.Equal(t, uint64(8), fitted.EndOffset)
+	require.Equal(t, []uint64{2, 4}, []uint64{fitted.Messages[0].Offset, fitted.Messages[1].Offset})
+}
+
 func TestClusterServer_Join(t *testing.T) {
 	msd := new(MockServiceDiscovery)
 	server := NewClusterServer(msd)

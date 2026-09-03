@@ -119,13 +119,13 @@ func (d *DiskHandler) stageCompactedReplicaRange(startOffset, endOffset uint64, 
 	indexTemp := compactedRangeTempPath(indexPath)
 	pendingPath := compactedRangePendingPath(d.BaseName)
 	pendingTemp := compactedRangePendingTempPath(d.BaseName)
-	for _, path := range []string{logTemp, indexTemp, pendingTemp} {
-		_ = os.Remove(path)
-	}
 	if _, err := os.Stat(pendingPath); err == nil {
 		return transaction, fmt.Errorf("pending compacted replica range already exists")
 	} else if !os.IsNotExist(err) {
 		return transaction, err
+	}
+	for _, path := range []string{logTemp, indexTemp, pendingTemp} {
+		_ = os.Remove(path)
 	}
 
 	// #nosec G304 -- temporary paths are derived from broker-owned segment paths.
