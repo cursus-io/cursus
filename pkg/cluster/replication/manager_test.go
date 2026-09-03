@@ -1,6 +1,9 @@
 package replication
 
 import (
+	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +15,78 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
+
+type countingLogStore struct {
+	raft.LogStore
+	reads atomic.Int64
+}
+
+func (s *countingLogStore) GetLog(index uint64, entry *raft.Log) error {
+	s.reads.Add(1)
+	return s.LogStore.GetLog(index, entry)
+}
+
+type mutableRaftStats struct {
+	mu    sync.RWMutex
+	stats map[string]string
+}
+
+func (s *mutableRaftStats) Stats() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make(map[string]string, len(s.stats))
+	for key, value := range s.stats {
+		result[key] = value
+	}
+	return result
+}
+
+func (s *mutableRaftStats) set(key, value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stats[key] = value
+}
+
+type fakeRecoveredPartitionFSM struct {
+	mu        sync.RWMutex
+	applied   uint64
+	pending   bool
+	finalized bool
+}
+
+func (f *fakeRecoveredPartitionFSM) AppliedIndex() uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.applied
+}
+
+func (f *fakeRecoveredPartitionFSM) HasPendingPartitionRecovery() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.pending
+}
+
+func (f *fakeRecoveredPartitionFSM) FinalizeRecoveredPartitions() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.finalized = true
+	f.pending = false
+	return nil
+}
+
+func (f *fakeRecoveredPartitionFSM) ValidateLocalLeaderLogs(string) error { return nil }
+
+func (f *fakeRecoveredPartitionFSM) setApplied(index uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.applied = index
+}
+
+func (f *fakeRecoveredPartitionFSM) wasFinalized() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.finalized
+}
 
 type MockRaft struct {
 	mock.Mock
@@ -130,6 +205,75 @@ func TestHighestFSMCommandIndexIgnoresNonCommandEntries(t *testing.T) {
 	index, err := highestFSMCommandIndex(store, 5, 8)
 	require.NoError(t, err)
 	require.Equal(t, uint64(6), index)
+}
+
+func TestAwaitRecoveredPartitionReplayResetsTimeoutOnProgress(t *testing.T) {
+	store := raft.NewInmemStore()
+	require.NoError(t, store.StoreLogs([]*raft.Log{
+		{Index: 6, Type: raft.LogCommand, Data: []byte("PARTITION_COMMIT:{}")},
+		{Index: 7, Type: raft.LogBarrier},
+		{Index: 8, Type: raft.LogBarrier},
+	}))
+	stats := &mutableRaftStats{stats: map[string]string{
+		"last_snapshot_index": "5",
+		"commit_index":        "8",
+		"last_log_index":      "6",
+	}}
+	brokerFSM := &fakeRecoveredPartitionFSM{pending: true}
+
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		stats.set("last_log_index", "7")
+		time.Sleep(600 * time.Millisecond)
+		stats.set("last_log_index", "8")
+		brokerFSM.setApplied(6)
+	}()
+
+	err := awaitRecoveredPartitionReplay(context.Background(), stats, store, brokerFSM, "broker-1", time.Second)
+	require.NoError(t, err)
+	require.True(t, brokerFSM.wasFinalized())
+}
+
+func TestAwaitRecoveredPartitionReplayReportsStalledIndexes(t *testing.T) {
+	store := raft.NewInmemStore()
+	stats := &mutableRaftStats{stats: map[string]string{
+		"last_snapshot_index": "5",
+		"commit_index":        "8",
+		"last_log_index":      "6",
+	}}
+	brokerFSM := &fakeRecoveredPartitionFSM{pending: true, applied: 5}
+
+	err := awaitRecoveredPartitionReplay(context.Background(), stats, store, brokerFSM, "broker-1", 20*time.Millisecond)
+	require.ErrorContains(t, err, "without progress")
+	require.ErrorContains(t, err, "snapshot_index=5")
+	require.ErrorContains(t, err, "commit_index=8")
+	require.ErrorContains(t, err, "last_log_index=6")
+	require.ErrorContains(t, err, "applied_index=5")
+}
+
+func TestAwaitRecoveredPartitionReplayScansStableCommitRangeOnce(t *testing.T) {
+	baseStore := raft.NewInmemStore()
+	require.NoError(t, baseStore.StoreLogs([]*raft.Log{
+		{Index: 6, Type: raft.LogCommand, Data: []byte("PARTITION_COMMIT:{}")},
+		{Index: 7, Type: raft.LogBarrier},
+		{Index: 8, Type: raft.LogBarrier},
+	}))
+	store := &countingLogStore{LogStore: baseStore}
+	stats := &mutableRaftStats{stats: map[string]string{
+		"last_snapshot_index": "5",
+		"commit_index":        "8",
+		"last_log_index":      "8",
+	}}
+	brokerFSM := &fakeRecoveredPartitionFSM{pending: true, applied: 5}
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		brokerFSM.setApplied(6)
+	}()
+
+	err := awaitRecoveredPartitionReplay(context.Background(), stats, store, brokerFSM, "broker-1", time.Second)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), store.reads.Load())
 }
 
 func TestRaftReplicationManagerGetRaftStatus(t *testing.T) {

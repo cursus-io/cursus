@@ -46,6 +46,54 @@ type RaftStatus struct {
 	LastSnapshotTerm  uint64
 }
 
+const recoveredPartitionReplayNoProgressTimeout = 2 * time.Minute
+
+type raftStatsReader interface {
+	Stats() map[string]string
+}
+
+type recoveredPartitionState interface {
+	AppliedIndex() uint64
+	HasPendingPartitionRecovery() bool
+	FinalizeRecoveredPartitions() error
+	ValidateLocalLeaderLogs(string) error
+}
+
+type recoveredPartitionReplayProgress struct {
+	snapshotIndex uint64
+	commitIndex   uint64
+	lastLogIndex  uint64
+	appliedIndex  uint64
+	targetIndex   uint64
+}
+
+func (p recoveredPartitionReplayProgress) advancedSince(previous recoveredPartitionReplayProgress) bool {
+	return p.snapshotIndex > previous.snapshotIndex ||
+		p.commitIndex > previous.commitIndex ||
+		p.lastLogIndex > previous.lastLogIndex ||
+		p.appliedIndex > previous.appliedIndex ||
+		p.targetIndex > previous.targetIndex
+}
+
+func (p recoveredPartitionReplayProgress) mergeMax(other recoveredPartitionReplayProgress) recoveredPartitionReplayProgress {
+	if other.snapshotIndex > p.snapshotIndex {
+		p.snapshotIndex = other.snapshotIndex
+	}
+	if other.commitIndex > p.commitIndex {
+		p.commitIndex = other.commitIndex
+	}
+	if other.lastLogIndex > p.lastLogIndex {
+		p.lastLogIndex = other.lastLogIndex
+	}
+	if other.appliedIndex > p.appliedIndex {
+		p.appliedIndex = other.appliedIndex
+	}
+	if other.targetIndex > p.targetIndex {
+		p.targetIndex = other.targetIndex
+	}
+	return p
+}
+
 type ISRManagerInterface interface {
 	HasQuorum(topic string, partition int, minISR int) bool
 	UpdateHeartbeat(brokerID string)
@@ -183,7 +231,7 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 			util.Error("❌ Failed to get Raft configuration for node %s: %v", brokerID, confFuture.Error())
 		}
 	}
-	if err := awaitRecoveredPartitionReplay(ctx, r, raftStore, brokerFSM, brokerID, 30*time.Second); err != nil {
+	if err := awaitRecoveredPartitionReplay(ctx, r, raftStore, brokerFSM, brokerID, recoveredPartitionReplayNoProgressTimeout); err != nil {
 		_ = r.Shutdown().Error()
 		_ = raftStore.Close()
 		_ = transport.Close()
@@ -209,24 +257,61 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	return rm, nil
 }
 
-func awaitRecoveredPartitionReplay(ctx context.Context, r *raft.Raft, logStore raft.LogStore, brokerFSM *fsm.BrokerFSM, brokerID string, timeout time.Duration) error {
+func awaitRecoveredPartitionReplay(ctx context.Context, r raftStatsReader, logStore raft.LogStore, brokerFSM recoveredPartitionState, brokerID string, noProgressTimeout time.Duration) error {
 	if brokerFSM == nil || !brokerFSM.HasPendingPartitionRecovery() {
 		return nil
 	}
-	if timeout <= 0 {
-		timeout = 30 * time.Second
+	if noProgressTimeout <= 0 {
+		noProgressTimeout = recoveredPartitionReplayNoProgressTimeout
 	}
-	deadline := time.NewTimer(timeout)
+	deadline := time.NewTimer(noProgressTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+	progressLog := time.NewTicker(10 * time.Second)
+	defer progressLog.Stop()
+
+	var furthestProgress recoveredPartitionReplayProgress
+	var latestProgress recoveredPartitionReplayProgress
+	var scannedSnapshotIndex uint64
+	var scannedCommitIndex uint64
+	var targetIndex uint64
+	targetKnown := false
+	initialized := false
 	for {
 		stats := r.Stats()
 		snapshotIndex, snapshotErr := strconv.ParseUint(stats["last_snapshot_index"], 10, 64)
 		commitIndex, commitErr := strconv.ParseUint(stats["commit_index"], 10, 64)
-		if snapshotErr == nil && commitErr == nil && commitIndex >= snapshotIndex {
-			target, err := highestFSMCommandIndex(logStore, snapshotIndex, commitIndex)
-			if err == nil && brokerFSM.AppliedIndex() >= target {
+		lastLogIndex, lastLogErr := strconv.ParseUint(stats["last_log_index"], 10, 64)
+		latestProgress = recoveredPartitionReplayProgress{
+			snapshotIndex: snapshotIndex,
+			commitIndex:   commitIndex,
+			lastLogIndex:  lastLogIndex,
+			appliedIndex:  brokerFSM.AppliedIndex(),
+		}
+		if snapshotErr == nil && commitErr == nil && lastLogErr == nil && commitIndex >= snapshotIndex && lastLogIndex >= commitIndex {
+			scanStart := snapshotIndex
+			if targetKnown && snapshotIndex == scannedSnapshotIndex && commitIndex >= scannedCommitIndex {
+				scanStart = scannedCommitIndex
+			} else {
+				targetIndex = 0
+				targetKnown = false
+			}
+			if !targetKnown || commitIndex > scannedCommitIndex {
+				candidate, err := highestFSMCommandIndex(logStore, scanStart, commitIndex)
+				if err == nil {
+					if candidate > targetIndex {
+						targetIndex = candidate
+					}
+					scannedSnapshotIndex = snapshotIndex
+					scannedCommitIndex = commitIndex
+					targetKnown = true
+				} else if !errors.Is(err, raft.ErrLogNotFound) {
+					return fmt.Errorf("inspect committed Raft replay range: %w", err)
+				}
+			}
+			latestProgress.targetIndex = targetIndex
+			if targetKnown && latestProgress.appliedIndex >= targetIndex {
 				latestCommit, parseErr := strconv.ParseUint(r.Stats()["commit_index"], 10, 64)
 				if parseErr == nil && latestCommit == commitIndex {
 					if err := brokerFSM.FinalizeRecoveredPartitions(); err != nil {
@@ -237,15 +322,44 @@ func awaitRecoveredPartitionReplay(ctx context.Context, r *raft.Raft, logStore r
 					}
 					return nil
 				}
-			} else if err != nil && !errors.Is(err, raft.ErrLogNotFound) {
-				return fmt.Errorf("inspect committed Raft replay range: %w", err)
 			}
+		}
+		if !initialized {
+			furthestProgress = latestProgress
+			initialized = true
+		} else if latestProgress.advancedSince(furthestProgress) {
+			furthestProgress = furthestProgress.mergeMax(latestProgress)
+			if !deadline.Stop() {
+				select {
+				case <-deadline.C:
+				default:
+				}
+			}
+			deadline.Reset(noProgressTimeout)
 		}
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("wait for recovered partition Raft replay: %w", ctx.Err())
 		case <-deadline.C:
-			return fmt.Errorf("timed out waiting for recovered partition Raft replay")
+			return fmt.Errorf(
+				"timed out waiting for recovered partition Raft replay after %s without progress (snapshot_index=%d commit_index=%d last_log_index=%d applied_index=%d target_index=%d)",
+				noProgressTimeout,
+				latestProgress.snapshotIndex,
+				latestProgress.commitIndex,
+				latestProgress.lastLogIndex,
+				latestProgress.appliedIndex,
+				latestProgress.targetIndex,
+			)
+		case <-progressLog.C:
+			util.Info(
+				"Waiting for recovered partition Raft replay on broker %s: snapshot_index=%d commit_index=%d last_log_index=%d applied_index=%d target_index=%d",
+				brokerID,
+				latestProgress.snapshotIndex,
+				latestProgress.commitIndex,
+				latestProgress.lastLogIndex,
+				latestProgress.appliedIndex,
+				latestProgress.targetIndex,
+			)
 		case <-ticker.C:
 		}
 	}
