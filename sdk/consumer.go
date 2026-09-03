@@ -64,8 +64,9 @@ type Consumer struct {
 	closeDone chan struct{}
 	mu        sync.RWMutex
 
-	partitionLeaders map[int]string
-	partitionMu      sync.RWMutex
+	partitionLeaders  map[int]string
+	partitionMu       sync.RWMutex
+	compactionEnabled atomic.Bool
 
 	hbConn net.Conn
 	hbMu   sync.Mutex
@@ -604,9 +605,12 @@ func (c *Consumer) fetchMetadata() error {
 	}
 
 	var leadersStr string
+	var cleanupPolicy string
 	for _, part := range strings.Fields(respStr) {
 		if strings.HasPrefix(part, "leaders=") {
 			leadersStr = strings.TrimPrefix(part, "leaders=")
+		} else if strings.HasPrefix(part, "cleanup_policy=") {
+			cleanupPolicy = strings.TrimPrefix(part, "cleanup_policy=")
 		}
 	}
 	if leadersStr == "" {
@@ -619,8 +623,16 @@ func (c *Consumer) fetchMetadata() error {
 		c.partitionLeaders[i] = addr
 	}
 	c.partitionMu.Unlock()
+	if cleanupPolicy != "" {
+		c.compactionEnabled.Store(cleanupPolicyIncludesCompaction(cleanupPolicy))
+	}
 
 	return nil
+}
+
+func cleanupPolicyIncludesCompaction(policy string) bool {
+	normalized, err := normalizeSDKCleanupPolicy(TopicCleanupPolicy(policy))
+	return err == nil && (normalized == string(TopicCleanupCompact) || normalized == string(TopicCleanupDeleteCompact))
 }
 
 func (c *Consumer) getPartitionLeaderAddr(partitionID int) string {
