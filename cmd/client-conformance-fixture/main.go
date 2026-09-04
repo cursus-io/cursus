@@ -45,10 +45,10 @@ func main() {
 		_, _ = os.Stdout.Write(data)
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(*out), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(*out), 0o750); err != nil {
 		panic(err)
 	}
-	if err := os.WriteFile(*out, data, 0o644); err != nil {
+	if err := os.WriteFile(*out, data, 0o600); err != nil {
 		panic(err)
 	}
 }
