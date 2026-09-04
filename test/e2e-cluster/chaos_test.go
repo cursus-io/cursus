@@ -26,9 +26,9 @@ func TestChaosLeaderFailoverRetryAndOffsetDurability(t *testing.T) {
 		WithTopic("chaos-eos-test").
 		WithPartitions(1).
 		WithNumMessages(100).
+		WithIdempotent(true).
 		WithAcks("all").
 		WithMinInSyncReplicas(2)
-	ctx.WithIdempotent(true)
 	defer ctx.Cleanup()
 
 	leaderNode, actions := ctx.WhenCluster().

@@ -96,6 +96,15 @@ func givenClusterRestart(t *testing.T, project string, composeFiles ...string) *
 	}
 
 	t.Cleanup(func() {
+		if t.Failed() {
+			logArgs := composeCommandArgs(project, composeFiles, "logs", "--no-color", "--tail", "300")
+			output, err := e2e.RunCompose(logArgs...).CombinedOutput()
+			if err != nil {
+				t.Logf("Failed to capture docker compose logs before cleanup: %v\nOutput: %s", err, string(output))
+			} else {
+				t.Logf("Docker compose logs before cleanup:\n%s", string(output))
+			}
+		}
 		cmd := e2e.RunCompose(composeCommandArgs(project, composeFiles, "down", "-v", "--remove-orphans")...)
 		if err := cmd.Run(); err != nil {
 			t.Logf("Cleanup warning: failed to bring down docker compose: %v", err)
@@ -179,6 +188,11 @@ func (c *ClusterTestContext) ResetPublishedCount() *ClusterTestContext {
 
 func (c *ClusterTestContext) WithAcks(acks string) *ClusterTestContext {
 	c.TestContext.WithAcks(acks)
+	return c
+}
+
+func (c *ClusterTestContext) WithIdempotent(enabled bool) *ClusterTestContext {
+	c.TestContext.WithIdempotent(enabled)
 	return c
 }
 

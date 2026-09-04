@@ -11,6 +11,7 @@ func TestISRWithAllAcks(t *testing.T) {
 		WithTopic("isr-test").
 		WithPartitions(1).
 		WithNumMessages(50).
+		WithIdempotent(true).
 		WithAcks("all").
 		WithMinInSyncReplicas(2)
 	defer ctx.Cleanup()
@@ -32,6 +33,7 @@ func TestLeaderFailover(t *testing.T) {
 		WithTopic("failover-test").
 		WithPartitions(1).
 		WithNumMessages(20).
+		WithIdempotent(true).
 		WithAcks("all")
 	defer ctx.Cleanup()
 
@@ -55,6 +57,7 @@ func TestClusterDataConsistency(t *testing.T) {
 		WithTopic("consistency-test").
 		WithPartitions(1).
 		WithNumMessages(10).
+		WithIdempotent(true).
 		WithAcks("all")
 	defer ctx.Cleanup()
 
@@ -99,6 +102,7 @@ func TestClusterWideDeduplication(t *testing.T) {
 		WithClusterSize(3).
 		WithTopic("dedup-test").
 		WithNumMessages(5).
+		WithIdempotent(true).
 		WithAcks("all")
 	defer ctx.Cleanup()
 
