@@ -114,7 +114,7 @@ func waitForStableFullISRAndZeroUnderReplicated(t *testing.T, ctx *ClusterTestCo
 func fullISRAndZeroUnderReplicated(ctx *ClusterTestContext) (bool, string, error) {
 	response, err := ctx.GetClient().SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", ctx.GetTopic()), 5*time.Second)
 	if err != nil {
-		return false, "DESCRIBE failed", nil
+		return false, "DESCRIBE failed", err
 	}
 	var metadata topicMetadata
 	if err := json.Unmarshal([]byte(response), &metadata); err != nil {

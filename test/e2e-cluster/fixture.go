@@ -1,11 +1,13 @@
 package e2e_cluster
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/test/e2e"
@@ -19,6 +21,7 @@ const (
 	faultComposeFile      = "docker-compose.faults.yml"
 	baseBrokerPort        = 9000
 	baseHealthPort        = 9080
+	composeLogTimeout     = 30 * time.Second
 )
 
 // ClusterTestContext extends e2e.TestContext for cluster testing
@@ -98,7 +101,9 @@ func givenClusterRestart(t *testing.T, project string, composeFiles ...string) *
 	t.Cleanup(func() {
 		if t.Failed() {
 			logArgs := composeCommandArgs(project, composeFiles, "logs", "--no-color", "--tail", "300")
-			output, err := e2e.RunCompose(logArgs...).CombinedOutput()
+			logCtx, cancelLogCapture := context.WithTimeout(context.Background(), composeLogTimeout)
+			output, err := e2e.RunComposeContext(logCtx, logArgs...).CombinedOutput()
+			cancelLogCapture()
 			if err != nil {
 				t.Logf("Failed to capture docker compose logs before cleanup: %v\nOutput: %s", err, string(output))
 			} else {

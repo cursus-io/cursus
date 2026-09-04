@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -42,7 +43,9 @@ func main() {
 		panic(err)
 	}
 	if *out == "" {
-		_, _ = os.Stdout.Write(data)
+		if err := writeFixture(os.Stdout, data); err != nil {
+			panic(err)
+		}
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(*out), 0o750); err != nil {
@@ -51,6 +54,17 @@ func main() {
 	if err := os.WriteFile(*out, data, 0o600); err != nil {
 		panic(err)
 	}
+}
+
+func writeFixture(writer io.Writer, data []byte) error {
+	written, err := writer.Write(data)
+	if err != nil {
+		return err
+	}
+	if written != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func buildFixture() ([]byte, error) {
