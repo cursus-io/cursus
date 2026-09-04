@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
@@ -117,6 +118,21 @@ func TestErrorResponse(t *testing.T) {
 
 	resp := ch.errorResponse("something went wrong")
 	assert.Equal(t, "ERROR: broker_error reason=\"something went wrong\"", resp)
+}
+
+func TestReplicationErrorResponse(t *testing.T) {
+	ch, _ := newTestHandler(t)
+
+	t.Run("transient replication failure is retryable", func(t *testing.T) {
+		resp := ch.replicationErrorResponse(7, context.DeadlineExceeded)
+		assert.Equal(t, `ERROR: replication_unavailable offset=7 reason="context deadline exceeded"`, resp)
+	})
+
+	t.Run("leadership fence is not retryable", func(t *testing.T) {
+		err := fmt.Errorf("%w: stale epoch", clusterController.ErrPartitionLeaderFenced)
+		resp := ch.replicationErrorResponse(8, err)
+		assert.Equal(t, `ERROR: PARTITION_LEADER_FENCED offset=8 reason="partition leader fenced: stale epoch"`, resp)
+	})
 }
 
 func TestValidateStreamArgs(t *testing.T) {

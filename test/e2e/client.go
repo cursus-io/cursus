@@ -200,6 +200,14 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 					time.Sleep(time.Second)
 					continue
 				}
+				if shouldRetryBrokerError(cmdPayload, brokerErr) {
+					bc.closeInternal()
+					bc.rotateAddrs()
+					lastErr = err
+					util.Debug("Retryable broker error on idempotent command, retrying (%d/%d): %v", i, maxRetries, err)
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
 				return "", err
 			}
 			bc.closeInternal()
@@ -218,6 +226,10 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 		return strings.TrimSpace(string(respBuf)), nil
 	}
 	return "", fmt.Errorf("command failed after retries: %w", lastErr)
+}
+
+func shouldRetryBrokerError(cmdPayload string, brokerErr *wire.BrokerError) bool {
+	return brokerErr != nil && brokerErr.Retryable && isIdempotent(cmdPayload)
 }
 
 func notCoordinatorAddr(brokerErr *wire.BrokerError) (string, bool) {

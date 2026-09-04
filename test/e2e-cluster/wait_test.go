@@ -29,3 +29,17 @@ func TestEventuallyIncludesLastError(t *testing.T) {
 		t.Fatalf("unexpected timeout error: %v", err)
 	}
 }
+
+func TestEventuallyStableResetsWindowAfterRegression(t *testing.T) {
+	attempts := 0
+	err := eventuallyStable(t, "stable test condition", 2*time.Second, 2*clusterPollInterval, func() (bool, string, error) {
+		attempts++
+		return attempts != 2, "transient regression", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts < 5 {
+		t.Fatalf("attempts = %d, want at least 5 after stability window reset", attempts)
+	}
+}

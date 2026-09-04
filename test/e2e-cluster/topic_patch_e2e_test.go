@@ -220,15 +220,28 @@ func requireClusterTopicMissingEventually(t *testing.T, addrs []string, topicNam
 			client := e2e.NewBrokerClient([]string{addr})
 			response, err := client.SendCommand("", "METADATA topic="+topicName, 5*time.Second)
 			client.Close()
+			if topicMissingResult(response, err) {
+				continue
+			}
 			if err != nil {
-				return false, addr + ": request failed", nil
+				return false, fmt.Sprintf("%s: request failed: %v", addr, err), nil
 			}
-			if !strings.Contains(response, "topic_not_found") {
-				return false, fmt.Sprintf("%s: topic still present (%s)", addr, response), nil
-			}
+			return false, fmt.Sprintf("%s: topic still present (%s)", addr, response), nil
 		}
 		return true, "topic deletion converged", nil
 	}))
+}
+
+func topicMissingResult(response string, err error) bool {
+	var brokerErr *wire.BrokerError
+	return errors.As(err, &brokerErr) && brokerErr.Code == "topic_not_found" ||
+		strings.Contains(response, "topic_not_found")
+}
+
+func TestTopicMissingResultHandlesWireV2Error(t *testing.T) {
+	require.True(t, topicMissingResult("", &wire.BrokerError{Code: "topic_not_found"}))
+	require.True(t, topicMissingResult("ERROR: topic_not_found", nil))
+	require.False(t, topicMissingResult("", errors.New("connection reset")))
 }
 
 func requireClusterPartitionOffsetsEventually(t *testing.T, addrs []string, topicName string, partition int, empty bool) {

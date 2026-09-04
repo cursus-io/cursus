@@ -311,7 +311,7 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 				select {
 				case replicationErr := <-result:
 					if replicationErr != nil {
-						return ch.errorResponse(fmt.Sprintf("replication failed (offset=%d): %v", lastOffset, replicationErr))
+						return ch.replicationErrorResponse(lastOffset, replicationErr)
 					}
 				case <-requestCtx.Done():
 					return "ERROR: request_cancelled"
@@ -354,7 +354,7 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 			select {
 			case replicationErr := <-replicationResult:
 				if replicationErr != nil {
-					return ch.errorResponse(fmt.Sprintf("replication failed (offset=%d): %v", assignedOffset, replicationErr))
+					return ch.replicationErrorResponse(assignedOffset, replicationErr)
 				}
 			case <-requestCtx.Done():
 				return "ERROR: request_cancelled"
@@ -666,7 +666,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 				select {
 				case replicationErr := <-result:
 					if replicationErr != nil {
-						return ch.errorResponse(fmt.Sprintf("batch replication failed (offset=%d): %v", lastOffset, replicationErr)), nil
+						return ch.replicationErrorResponse(lastOffset, replicationErr), nil
 					}
 				case <-requestCtx.Done():
 					return "ERROR: request_cancelled", nil
@@ -718,7 +718,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			select {
 			case replicationErr := <-replicationResult:
 				if replicationErr != nil {
-					return ch.errorResponse(fmt.Sprintf("batch replication failed (offset=%d): %v", lastOffset, replicationErr)), nil
+					return ch.replicationErrorResponse(lastOffset, replicationErr), nil
 				}
 			case <-requestCtx.Done():
 				return "ERROR: request_cancelled", nil

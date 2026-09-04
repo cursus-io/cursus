@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -91,10 +92,15 @@ func getComposeCommand() []string {
 }
 
 func RunCompose(args ...string) *exec.Cmd {
+	return RunComposeContext(context.Background(), args...)
+}
+
+// RunComposeContext creates a Docker Compose command bounded by the supplied context.
+func RunComposeContext(ctx context.Context, args ...string) *exec.Cmd {
 	base := getComposeCommand()
 	fullArgs := append(base[1:], args...)
 	// #nosec G204 -- executable is restricted to the two hard-coded Docker Compose commands above.
-	return exec.Command(base[0], fullArgs...)
+	return exec.CommandContext(ctx, base[0], fullArgs...)
 }
 
 // GivenRestart starts the broker environment and returns a new context

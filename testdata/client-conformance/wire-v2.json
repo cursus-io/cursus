@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "wire_version": 2,
+  "header_size": 32,
+  "max_payload": 67108864,
+  "capabilities": [
+    "wire_v2",
+    "compression_none",
+    "compression_gzip",
+    "compression_snappy",
+    "compression_lz4",
+    "transport_tls",
+    "authentication",
+    "typed_errors",
+    "request_correlation",
+    "producer_acks",
+    "producer_batching",
+    "producer_idempotence",
+    "safe_retry",
+    "consumer_polling",
+    "consumer_streaming",
+    "consumer_groups",
+    "offset_reset",
+    "isolation_levels",
+    "event_store",
+    "snapshots",
+    "transactions",
+    "transactional_offsets",
+    "transaction_status",
+    "admin_client",
+    "event_envelope",
+    "aggregate_repository",
+    "saga",
+    "client_metrics",
+    "error_classification"
+  ],
+  "command_ids": {
+    "ALTER_TOPIC_CONFIG": 3,
+    "APPEND_STREAM": 32,
+    "AUTH": 1,
+    "BATCH_COMMIT": 19,
+    "BEGIN_TXN": 27,
+    "CATCHUP_SNAPSHOTS": 41,
+    "CLUSTER_STATUS": 8,
+    "COMMIT_OFFSET": 18,
+    "CONSUME": 11,
+    "CREATE": 2,
+    "DELETE": 4,
+    "DESCRIBE": 25,
+    "ELECT_LEADER": 9,
+    "END_TXN": 30,
+    "EXIT": 47,
+    "FETCH_OFFSET": 22,
+    "FETCH_SNAPSHOT": 40,
+    "FIND_COORDINATOR": 42,
+    "GROUP_STATUS": 21,
+    "HEARTBEAT": 14,
+    "HEARTBEAT_CLUSTER": 50,
+    "HELP": 13,
+    "INIT_PRODUCER_ID": 26,
+    "INTERNAL_BATCH": 45,
+    "JOIN_CLUSTER": 48,
+    "JOIN_GROUP": 15,
+    "LEAVE_CLUSTER": 49,
+    "LEAVE_GROUP": 17,
+    "LIST": 6,
+    "LIST_CLUSTER": 7,
+    "LIST_GROUPS": 23,
+    "LIST_OFFSETS": 24,
+    "LIST_SNAPSHOTS": 39,
+    "METADATA": 44,
+    "NEGOTIATE": 46,
+    "PUBLISH": 10,
+    "RAFT_APPLY": 43,
+    "READ_SNAPSHOT": 35,
+    "READ_STREAM": 33,
+    "REGISTER_GROUP": 20,
+    "REPLICATE_MESSAGE": 37,
+    "REPLICATE_SNAPSHOT": 38,
+    "REPLICA_CATCHUP": 51,
+    "SAVE_SNAPSHOT": 34,
+    "SEND_OFFSETS_TO_TXN": 29,
+    "STREAM": 12,
+    "STREAM_VERSION": 36,
+    "SYNC_GROUP": 16,
+    "TRUNCATE": 5,
+    "TXN_PUBLISH": 28,
+    "TXN_STATUS": 31
+  },
+  "compression_ids": {
+    "gzip": 1,
+    "lz4": 3,
+    "none": 0,
+    "snappy": 2
+  },
+  "vectors": [
+    {
+      "name": "negotiation_request_all_compressions",
+      "hex": "00020002000401020300"
+    },
+    {
+      "name": "negotiation_response_lz4",
+      "hex": "000203"
+    },
+    {
+      "name": "uncompressed_publish_frame",
+      "hex": "4352533200020301000a0000000000000000002a00000005000000059a71bb4c68656c6c6f"
+    },
+    {
+      "name": "gzip_publish_frame",
+      "hex": "4352533200020303000a0000000000000000004d00000035000000507d9c486c1f8b08000000000000ff4a2eca2f2ed6cd49cc4b2f4d4c4fd54dcecf2d284a2d2ececccfd3254b0a100000ffff0b727e8e50000000"
+    },
+    {
+      "name": "snappy_publish_frame",
+      "hex": "4352533200020305000a0000000000000000004d0000002000000050a6478ee2506863726f73732d6c616e67756167652d636f6d7072657373696f6e2dd21b00"
+    },
+    {
+      "name": "lz4_publish_frame",
+      "hex": "4352533200020307000a0000000000000000004d0000004300000050a627d45a04224d186470b930000000ff0c63726f73732d6c616e67756167652d636f6d7072657373696f6e2d1b0012003600c02d636f6d7072657373696f6e00000000297fa3b8"
+    },
+    {
+      "name": "append_stream_command_payload",
+      "hex": "4352513200020000000700000005746f706963000000066576656e7473000000036b65790000000b6167677265676174652d370000000f657870656374656456657273696f6e0000000133000000096576656e745479706500000007557064617465640000000d736368656d6156657273696f6e0000000132000000086d657461646174610000000f7b227472616365223a22612062227d000000076d6573736167650000000f7b2276616c7565223a22782079227d"
+    },
+    {
+      "name": "full_record_batch",
+      "hex": "4342563200020001000000066576656e74730000000200000003616c6c0000000000000009000000000000000900000001000000ea00020000000000007fff000000066576656e74730000000200000000000000070000001920206f706171756500ed959ceab880097061796c6f61642020ffffffffffffff850000000a70726f64756365722d310000000000000009fffffffffffffffe0000000b6167677265676174652d3700000007557064617465640000000200000000000000030000000f7b227472616365223a22612062227d0000000574786e2d310000000761626f727465640000000561626f72740000000b7472616e73616374696f6e0002000000000000000b000000030001ff0000000d636f6e74726f6c2d76616c7565"
+    },
+    {
+      "name": "structured_availability_error",
+      "hex": "000000177265706c69636174696f6e5f756e617661696c61626c6504010000001e7265706c69636174696f6e2071756f72756d20756e617661696c61626c650002000000066f6666736574000000013700000006726561736f6e0000000f7265706c6963612074696d656f7574"
+    }
+  ]
+}

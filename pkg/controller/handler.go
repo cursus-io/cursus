@@ -365,6 +365,14 @@ func (ch *CommandHandler) errorResponse(msg string) string {
 	return fmt.Sprintf("ERROR: broker_error reason=%q", msg)
 }
 
+func (ch *CommandHandler) replicationErrorResponse(offset uint64, err error) string {
+	code := "replication_unavailable"
+	if isReplicationFenceError(err) {
+		code = "PARTITION_LEADER_FENCED"
+	}
+	return fmt.Sprintf("ERROR: %s offset=%d reason=%q", code, offset, err)
+}
+
 // Close releases resources held by the command handler (e.g., event-sourcing indexes and snapshots).
 func (ch *CommandHandler) Close() error {
 	if ch.replication != nil {

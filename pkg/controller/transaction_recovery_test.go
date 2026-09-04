@@ -35,6 +35,8 @@ func newDiskBackedTransactionHandler(t *testing.T) (*CommandHandler, *topic.Topi
 
 	t.Cleanup(func() {
 		_ = ch.Close()
+		coord.Stop()
+		tm.Stop()
 		dm.CloseAllHandlers()
 	})
 
