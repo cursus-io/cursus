@@ -86,6 +86,9 @@ partition leaders.
 | `cursus_broker_commands_total{command,result}` | Counter | Completed text command dispatches |
 | `cursus_broker_command_duration_seconds{command}` | Histogram | Command dispatch latency |
 | `cursus_broker_command_errors_total{command,code}` | Counter | Wire errors by bounded command and error code |
+| `cursus_broker_publish_acknowledgements_total{ack_mode,result}` | Counter | Publish requests by normalized acknowledgement mode and bounded result |
+| `cursus_broker_async_replication_failures_total{topic,error_class}` | Counter | Follower failures after an `acks=1` leader acknowledgement |
+| `cursus_broker_log_compaction_runs_total{result,reason}` | Counter | Completed, skipped, or failed compaction passes with bounded reasons |
 | `broker_messages_processed_total` | Counter | Messages accepted by the topic manager |
 | `broker_message_latency_seconds` | Histogram | Topic manager publish latency |
 | `broker_seqnum_gap_total{topic,partition,producer_id}` | Counter | Detected producer sequence gaps |
@@ -218,6 +221,12 @@ Wildcard groups expose partitions for which broker offset state exists.
 Wire v2 exposes only `cursus_consumer_group_lag`; the former
 `broker_consumer_lag` alias is not registered.
 
+The in-process Go SDK exposes separate counters for physical anomalies and
+expected compacted holes. `cursus_consumer_offset_gap_total{topic,group}`
+increments only when a non-compacted topic jumps forward unexpectedly.
+`cursus_consumer_compacted_offsets_skipped_total{topic,group}` counts logical
+offsets removed by a cleanup policy that includes `compact`.
+
 ### Cluster State
 
 | Metric | Meaning |
@@ -297,6 +306,9 @@ max_over_time(cursus_consumer_group_lag[10m]) > 10000
 
 # Storage writer backlog
 cursus_storage_pending_writes > 0
+
+# Compaction errors (inspect the bounded reason label)
+increase(cursus_broker_log_compaction_runs_total{result="error"}[10m]) > 0
 ```
 
 Tune lag and pending-write thresholds to topic throughput and retention. A

@@ -102,8 +102,8 @@ RUN_E2E_BENCHMARK=1 go test -v -timeout 30m ./test/e2e-benchmark/...
 - initialize a new producer epoch before each new transaction; finalization retry keeps the old epoch,
 - ordering is per partition,
 - retention deletion can move the earliest offset,
-- standalone keyed compaction creates physical holes without renumbering logical offsets,
-- compaction is rejected for distributed and event-sourcing topics.
+- keyed compaction creates physical holes without renumbering logical offsets,
+- distributed application-topic compaction runs only behind protocol/full-ISR/HWM/lifecycle safety gates; event-sourcing topics reject compaction.
 
 ## Next Steps
 

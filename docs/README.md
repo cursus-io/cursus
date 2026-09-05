@@ -8,7 +8,7 @@ This index separates normative contracts from implementation notes. When prose c
 - [Installation](user-guide/installation.md): source builds, binaries, Docker, and GHCR images.
 - [Configuration](user-guide/configuration.md): files, environment variables, CLI flags, security, storage, cluster, and SDK options.
 - [Architecture](architecture.md): standalone and clustered data/control paths and their guarantees.
-- [SDK Overview](sdk-overview.md): the in-repository Go SDK contract and external SDK migration status.
+- [SDK Overview](sdk-overview.md): cross-language Wire v2 compatibility and Go, Java, and Python capability contracts.
 
 ## Normative Contracts
 
@@ -26,6 +26,7 @@ This index separates normative contracts from implementation notes. When prose c
 - [Server](core/server.md)
 - [Topics And Partitions](core/topic/topics-and-partitions.md)
 - [Topic Management](core/topic/topic-management.md)
+- [Log Compaction](core/storage/log-compaction.md): standalone and distributed safety gates, offset holes, replica catch-up, and recovery.
 - [Disk Format](core/storage/disk-format.md)
 - [Disk Persistence](core/storage/disk-persistence.md)
 - [Segment Management](core/storage/segment-management.md)

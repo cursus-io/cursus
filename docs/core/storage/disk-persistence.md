@@ -7,7 +7,7 @@ Cursus stores every topic partition in an independent append-only segment log ma
 | Component | Responsibility |
 |---|---|
 | `DiskManager` | Handler registry keyed by topic/partition, shared configuration, close-all lifecycle, runtime storage metrics. |
-| `DiskHandler` | Offset allocation, buffered writes, segment/index files, mmap reads, recovery, sync callback, retention, and standalone compaction. |
+| `DiskHandler` | Offset allocation, buffered writes, segment/index files, mmap reads, recovery, sync callback, retention, and gated compaction. |
 | `Partition` | HWM/LSO visibility, producer sequence state, transaction index, and broker-level read semantics. |
 
 The [disk format](disk-format.md) defines the record and sparse index bytes.
@@ -88,7 +88,9 @@ The maintenance loop evaluates delete retention and compaction on independent in
 
 Delete retention removes complete closed segments and changes the earliest readable offset. Stale reads receive `OFFSET_OUT_OF_RANGE` with earliest/latest boundaries.
 
-Standalone compaction atomically rewrites eligible closed log/index files when the removable-byte ratio reaches the configured threshold. A durable size-bound sidecar distinguishes compacted holes from unmarked offset gaps in ordinary closed segments. Backups and restores must keep each compacted log, its matching sidecar, and its index together. Removed keyed records leave logical offset holes; reads continue at the first retained offset. Transaction/control records and the latest producer recovery record are protected. Distributed and event-sourcing topics reject compaction. See [Log Compaction](log-compaction.md).
+Compaction atomically rewrites eligible closed log/index files when the removable-byte ratio reaches the configured threshold. A durable size-bound sidecar distinguishes compacted holes from unmarked offset gaps in ordinary closed segments. Backups and restores must keep each compacted log, its matching sidecar, and its index together. Removed keyed records leave logical offset holes; reads continue at the first retained offset. Transaction/control records and the latest producer recovery record are protected.
+
+In distributed mode each application-topic partition cleaner is gated on broker lifecycle protocol version 2 across all configured replicas, full ISR, an authoritative committed HWM, and matching local/FSM lifecycle epoch, cleanup policy, LEO, and HWM. Replica catch-up can transfer a committed logical range containing compacted holes and installs its data, index, marker, and empty tail through a checksummed pending manifest. Internal metadata and event-sourcing topics do not use distributed compaction. See [Log Compaction](log-compaction.md).
 
 ## Shutdown
 
