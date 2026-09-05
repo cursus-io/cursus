@@ -14,15 +14,24 @@ It covers all available configuration parameters, their default values, configur
 - Disk persistence parameters (flush batching, linger times)
 - Message handling (compression, channel capacities)
 
-The configuration system uses a hierarchical approach where settings can be specified via multiple sources with a defined precedence order.
+Broker configuration is a flat `Config` value. YAML uses snake-case keys and JSON uses the dotted keys declared on `pkg/config.Config`.
 
 ## Configuration Sources and Precedence
 
-cursus supports three configuration sources with the following precedence order (highest to lowest):
+cursus applies configuration in this order:
 
-- **Command-line flags** - Highest precedence
-- **Configuration file** (YAML or JSON) - Specified via `--config` flag or `CONFIG_PATH` environment variable
-- **Built-in defaults** - Lowest precedence
+1. built-in defaults,
+2. parsed command-line flags,
+3. the YAML or JSON file selected by `--config` or `CONFIG_PATH`,
+4. supported environment-variable overrides,
+5. normalization and security validation.
+
+The configuration file therefore overrides ordinary value flags, and supported
+environment variables override both. `--raft-peers` is the one value flag
+applied after file loading and before environment overrides. Use `--config`
+to select a file and environment variables for deliberate deployment-time
+overrides; do not assume that `--port` or another ordinary flag overrides a
+value present in that file.
 
 ## Configuration File Format
 
@@ -30,46 +39,28 @@ Configuration files can be in either YAML or JSON format. The format is detected
 
 ### YAML Format
 
-The standard configuration format used in cursus is YAML. Here's the complete structure:
+The standard configuration format used in cursus is YAML. Keys are top-level;
+there is no `broker:` wrapper:
 
 ```
-broker:
-  port: 9000
-  health_check_port: 9080
-  log_dir: "broker-logs"
-  cleanup_interval: 60
-  enable_exporter: true
-  exporter_port: 9100
-  enable_benchmark: false
-  
-  # TLS Configuration
-  use_tls: false
-  tls_cert_path: "certs/server.crt"
-  tls_key_path: "certs/server.key"
-  internal_broker_port: 19000
-  internal_use_tls: false
-  internal_tls_cert_path: "certs/broker.crt"
-  internal_tls_key_path: "certs/broker.key"
-  internal_tls_ca_path: "certs/ca.crt"
-  internal_tls_server_name: "broker.internal"
-  enable_sasl: false
-  sasl_users:
-    - principal: "game-server"
-      token: "change-me"
-      permissions: ["topic.read", "topic.write", "group", "transaction"]
-  
-  # Compression
-  enable_gzip: false
-  
-  # Performance Tuning
-  channel_buffer_size: 10000
-  disk_flush_batch_size: 500
-  linger_ms: 100
-  disk_write_timeout_ms: 200
-  
-  # Partition/Consumer Tuning
-  partition_channel_buffer_size: 10000
-  consumer_channel_buffer_size: 1000
+broker_port: 9000
+health_check_port: 9080
+enable_exporter: true
+exporter_port: 9100
+log_dir: "broker-logs"
+compression_type: "lz4"
+disk_flush_batch_size: 500
+disk_write_timeout_ms: 200
+linger_ms: 100
+log_segment_roll_ms: 604800000
+log_cleanup_policy: "delete"
+
+static_consumer_groups:
+  - name: "workers"
+    consumer_count: 2
+    topics: ["orders"]
+    topic_partitions:
+      orders: 6
 ```
 
 ### JSON Format
@@ -83,12 +74,11 @@ The same configuration can be expressed in JSON format:
   "log.dir": "broker-logs",
   "enable.exporter": true,
   "exporter.port": 9100,
-  "enable.benchmark": false,
-  "cleanup.interval": 60,
+  "log.cleanup.interval": 60,
   "tls.enable": false,
   "tls.cert_path": "certs/server.crt",
   "tls.key_path": "certs/server.key",
-  "gzip.enable": false,
+  "compression.type": "lz4",
   "disk.flush.batch.size": 500,
   "linger.ms": 100,
   "channel.buffer.size": 10000,
@@ -111,8 +101,8 @@ The configuration is represented by the Config struct in the codebase, which org
 | `log_dir`            | string     | "broker-logs"  | Directory path for persistent log segments      |
 | `enable_exporter`    | bool       | true           | Enable Prometheus metrics exporter              |
 | `exporter_port`      | int        | 9100           | HTTP port for the Prometheus `/metrics` endpoint       |
-| `enable_benchmark`   | bool       | false          | Enable benchmark mode for testing               |
-| `cleanup_interval`   | int        | 300            | Log cleanup interval (seconds)                 |
+| `log_level`          | string     | "info"         | Broker log level: `debug`, `info`, `warn`, or `error` |
+| `log_cleanup_interval` | int      | 300            | Legacy maintenance-loop interval (seconds)      |
 
 In standalone mode, `log_dir` also contains `__topic_metadata.json`, the broker-owned `__consumer_offsets` topic, and `__transaction_state.journal`. The versioned topic manifest is atomically replaced before create/update success exposes a new topic definition and is loaded before internal-topic validation, durable group/offset replay, coordinator/static-group initialization, and readiness. Invalid or unsupported manifest/internal metadata fails closed in diagnostics-only mode; the broker does not fall back to guessed ACL, event-sourcing, retention, group, or offset state. A pre-manifest directory with persisted logs requires a complete [`clean bootstrap`](../standalone-storage-recovery.md); no offline import or migration command is supported.
 
@@ -135,7 +125,7 @@ The health and metrics listeners are unauthenticated operations endpoints. Restr
 | `internal_tls_server_name` | string | "" | Server name used by broker-to-broker mTLS clients |
 | `enable_sasl` | bool | false | Enable SASL-PLAIN-style token authentication for text commands |
 | `sasl_users` | list | [] | Principal/token/permissions entries accepted by `AUTH` and inline authentication |
-| `enable_gzip`    | bool   | false   | Enable gzip compression for messages        |
+| `compression_type` | string | "none" | Preferred codec: `none`, `gzip`, `snappy`, or `lz4` |
 
 When `use_tls` is enabled and certificate paths are provided, the broker loads the certificate using `tls.LoadX509KeyPair()` during initialization. In distributed mode, `internal_broker_port` moves broker-to-broker text commands away from the public client listener. If `internal_use_tls` is enabled, the internal listener requires client certificates signed by `internal_tls_ca_path`, and peer routers dial the internal port with mTLS using `internal_tls_server_name` for certificate verification.
 
@@ -158,7 +148,7 @@ These parameters directly affect the write path performance and batching behavio
 | `log_retention_hours`   | int  | 168     | Log retention period in hours (7 days default)            |
 | `log_retention_bytes`   | int64 | -1     | Retained byte limit; `-1` means unlimited                 |
 | `log_segment_roll_ms`   | int  | 604800000 | Time-based roll interval (7 days)                       |
-| `log_cleanup_policy`    | string | "delete" | `delete`, `compact`, or `delete,compact`; compact policies are standalone-only |
+| `log_cleanup_policy`    | string | "delete" | `delete`, `compact`, or `delete,compact`; distributed compaction is safety-gated |
 | `log_retention_check_interval_ms` | int | 300000 | Delete-retention evaluation interval                  |
 | `log_compaction_check_interval_ms` | int | 300000 | Closed-segment compaction evaluation interval         |
 | `log_min_cleanable_dirty_ratio` | float64 | 0.5 | Minimum removable-byte ratio before compaction         |
@@ -179,6 +169,7 @@ These parameters control the in-memory channel buffer sizes for message distribu
 |-------------------------------|------|---------|--------------------------------------------------|
 | `partition_channel_buffer_size` | int  | 10000   | Buffer size for each Partition's input channel  |
 | `consumer_channel_buffer_size`  | int  | 1000    | Buffer size for each Consumer's message channel |
+| `broadcast_channel_buffer_size` | int  | 10000   | Buffer size for embedded topic broadcast channels |
 
 # Broker And Cluster Parameters
 
@@ -186,19 +177,49 @@ These values participate in active broker behavior:
 
 | Parameter | Default | Purpose |
 |---|---:|---|
-| `bootstrap_servers` | empty | Initial broker addresses for distributed discovery. |
-| `acks` | empty/default path | Publish request/publisher acknowledgement selection; not topic metadata. |
+| `enabled_distribution` | false | Enable the Raft-backed cluster runtime. |
 | `min_insync_replicas` | 2 | Broker fallback minimum for `acks=all`/`-1` when a topic has no `min_in_sync_replicas` override. |
-| `replication_factor` | 3 | Requested topic replica count when distribution is enabled. |
+| `default_replication_factor` | 3 | Default replica count for new distributed topics. |
 | `internal_broker_port` | 0 | Dedicated broker-to-broker command listener; configure in production clusters. |
-| `internal_auth_token` | empty | Shared internal command credential; required unless mTLS identity is authoritative. |
+| `internal_auth_token` | empty | Shared internal command credential; always required when distribution is enabled. |
 | `internal_use_tls` | false | Enables broker-internal TLS and client-certificate verification. |
+| `allow_insecure_cluster_transport` | false | Explicit test-only opt-out from the distributed mTLS requirement. |
+| `raft_peers` | [] | Initial Raft peer addresses. |
 | `transactional_id_expiration_ms` | 604800000 | Retention for completed transaction payloads. Epoch tombstones remain for fencing; active transactions are not expired. |
 | `producer_state_ttl_ms` | 1800000 | In-memory producer state cleanup window; durable records/checkpoints remain recovery sources. |
+| `raft_port` | 9001 | Raft transport listener. |
+| `discovery_port` | 8000 | Broker discovery and internal replication HTTP listener. |
+| `raft_snapshot_interval_ms` | 120000 | Interval for evaluating snapshot creation. |
+| `raft_snapshot_threshold` | 8192 | Outstanding Raft log entries required before snapshotting. |
+| `raft_trailing_logs` | 10240 | Raft log entries retained after a snapshot. |
+| `static_cluster_members` | [] | Stable `broker-id@host:raft-port` membership set. |
+| `bootstrap_cluster` | false | Explicitly bootstrap a new Raft cluster. |
+| `advertised_host` | localhost | Host advertised for broker discovery. |
+| `advertised_broker_port` | 0 | Broker port advertised to peers when different from the listener. |
+| `advertised_client_host` | empty | Client-facing host returned by routing metadata. |
+| `max_client_connections` | 1000 | Concurrent client connection limit. |
+| `client_idle_timeout_ms` | 60000 | Idle client connection deadline. |
+| `max_stream_connections` | 1000 | Concurrent streaming connection limit. |
+| `stream_timeout` | 30m | Maximum broker stream lifetime as a Go duration string. |
+| `consumer_session_timeout_ms` | 10000 | Group member session timeout. |
+| `consumer_heartbeat_check_ms` | 5000 | Broker interval for detecting expired members; normalized below the session timeout. |
+| `enable_idempotence` | false | Broker default for producer idempotence; topic/request contracts can enable it explicitly. |
 
 Distribution is disabled by default. Production clusters should use a dedicated internal listener, mTLS, least-privilege client users, and explicit advertised addresses.
 
 Topic creation can set `min_in_sync_replicas=<N>` with `1 <= N <= replication_factor`. `ALTER_TOPIC_CONFIG topic=<name> min_in_sync_replicas=<N|default>` changes or removes that optional durable override. Old topic metadata without the field continues to use the broker fallback. Idempotent publishers require `acks=all` or `acks=-1`; the SDK and broker reject weaker combinations rather than silently changing them.
+
+`bootstrap_servers` and `acks` are SDK publisher settings, while
+`replication_factor` is a topic-definition field. They are not broker
+configuration keys.
+
+`static_consumer_groups` is a broker bootstrap facility. Each entry declares
+`name`, `consumer_count`, `topics`, and an optional
+`topic_partitions` map. Missing or non-positive partition counts normalize to
+one for the corresponding topic. Network clients still use the durable
+`REGISTER_GROUP`, `JOIN_GROUP`, and `SYNC_GROUP` lifecycle; static
+in-process groups are not a substitute for that protocol.
+
 # Using Configuration in Different Scenarios
 
 ## Scenario 1: Development with Defaults
@@ -248,27 +269,28 @@ services:
       - "9080:9080"
 ```
 
-## Scenario 4: Override Specific Parameters via CLI
+## Scenario 4: Deployment-Time Overrides
 
-You can use a configuration file for most settings and override specific values:
+Use supported environment variables when a deployment must override values
+loaded from a configuration file:
 
 ```
-./bin/cursus --config config.yaml --port 9001 --exporter-port 9101
+CONFIG_PATH=config.yaml BROKER_PORT=9001 EXPORTER_PORT=9101 ./bin/cursus
 ```
 
-CLI flags take precedence over configuration file values.
+Ordinary value flags are parsed before the file and are overwritten by matching
+file values. This ordering is part of the current implementation contract.
 
 ## Scenario 5: High-Throughput Configuration
 
 For maximum throughput at the cost of latency:
 
 ```
-broker:
-  disk_flush_batch_size: 1000    # Batch more messages
-  linger_ms: 200                  # Wait longer before flush
-  channel_buffer_size: 20000      # Larger write buffer
-  partition_channel_buffer_size: 20000  # Larger partition buffers
-  consumer_channel_buffer_size: 5000    # Larger consumer buffers
+disk_flush_batch_size: 1000    # Batch more messages
+linger_ms: 200                 # Wait longer before flush
+channel_buffer_size: 20000     # Larger write buffer
+partition_channel_buffer_size: 20000
+consumer_channel_buffer_size: 5000
 ```
 
 ## Scenario 6: Low-Latency Configuration
@@ -276,12 +298,11 @@ broker:
 For minimum latency at the cost of throughput:
 
 ```
-broker:
-  disk_flush_batch_size: 50      # Flush more frequently
-  linger_ms: 10                  # Minimal wait time
-  channel_buffer_size: 1024      # Smaller buffers
-  partition_channel_buffer_size: 5000
-  consumer_channel_buffer_size: 500
+disk_flush_batch_size: 50
+linger_ms: 10
+channel_buffer_size: 1024
+partition_channel_buffer_size: 5000
+consumer_channel_buffer_size: 500
 ```
 
 # Configuration Parameter Mapping
@@ -295,12 +316,11 @@ The Config struct uses both YAML and JSON tags to support both formats. Here's h
 | LogDir                    | `log_dir`                    | `log.dir`                     | --log-dir                |
 | EnableExporter            | `enable_exporter`            | `enable.exporter`             | --exporter               |
 | ExporterPort              | `exporter_port`              | `exporter.port`               | --exporter-port          |
-| EnableBenchmark           | `enable_benchmark`           | `enable.benchmark`            | --benchmark              |
-| CleanupInterval           | `cleanup_interval`           | `cleanup.interval`            | --cleanup-interval       |
+| CleanupInterval           | `log_cleanup_interval`       | `log.cleanup.interval`        | --cleanup-interval       |
 | UseTLS                    | `use_tls`                    | `tls.enable`                  | --tls                    |
 | TLSCertPath               | `tls_cert_path`              | `tls.cert_path`               | --tls-cert               |
 | TLSKeyPath                | `tls_key_path`               | `tls.key_path`                | --tls-key                |
-| EnableGzip                | `enable_gzip`                | `gzip.enable`                 | --gzip                   |
+| CompressionType           | `compression_type`           | `compression.type`            | --compression-type       |
 | InternalBrokerPort        | `internal_broker_port`       | `distribution.internal_broker_port` | --internal-broker-port |
 | InternalUseTLS            | `internal_use_tls`           | `internal_tls.enable`         | --internal-tls           |
 | InternalTLSCertPath        | `internal_tls_cert_path`     | `internal_tls.cert_path`      | --internal-tls-cert      |
@@ -411,6 +431,7 @@ When enabled, the SDK registers the following metrics in a dedicated Prometheus 
 | `cursus_consumer_poll_latency_seconds`     | Histogram | topic, group | Poll operation latency           |
 | `cursus_consumer_rebalance_total`          | Counter   | topic, group | Rebalance events                 |
 | `cursus_consumer_offset_gap_total`         | Counter   | topic, group | Offsets skipped by the configured reset policy |
+| `cursus_consumer_compacted_offsets_skipped_total` | Counter | topic, group | Logical offset holes skipped because the topic metadata declares compaction |
 | `cursus_consumer_stale_workers_total`      | Counter   | topic, group, worker | Assignment workers fenced by a newer generation |
 
 To expose metrics via HTTP:
@@ -426,6 +447,6 @@ log.Fatal(http.ListenAndServe(":2112", nil))
 
 `Config.Normalize()` applies safe fallbacks for invalid or non-positive values, including write batching, sync intervals, segment/index sizes, retention intervals, channel capacities, replica settings, and transaction/producer retention. TLS certificate loading still fails startup when configured files are invalid.
 
-Cleanup policy values normalize to `delete`, `compact`, or canonical `delete,compact`; unknown values fall back to `delete` with a warning. A broker configured for distribution rejects compact topic creation, and event-sourcing topics always require `delete`. Operators should treat normalization and policy errors as configuration/provisioning failures and verify the effective topic policy with `METADATA`.
+Cleanup policy values normalize to `delete`, `compact`, or canonical `delete,compact`; unknown values fall back to `delete` with a warning. Distributed application topics accept compact policies only after every active broker advertises lifecycle protocol version 2, and cleaner passes wait for full ISR plus authoritative, matching HWM/lifecycle/policy state. Event-sourcing topics always require `delete`. Operators should treat normalization and policy errors as configuration/provisioning failures and verify the effective topic policy with `METADATA`.
 
-Missing values fall back to defaults in `pkg/config/properties.go`. Configuration precedence is defaults, file, environment, then CLI overrides where a flag is exposed.
+Missing values fall back to defaults in `pkg/config/properties.go`. The effective order is defaults, parsed flags, configuration file, supported environment overrides, then normalization and validation; `--raft-peers` is the documented post-file flag exception.

@@ -1,6 +1,6 @@
 # Log Compaction
 
-Cursus can compact keyed topic records on a standalone broker. Compaction retains the latest ordinary record for each key while preserving logical offsets and broker recovery metadata.
+Cursus compacts keyed application-topic records in standalone and distributed mode. Compaction retains the latest ordinary record for each key while preserving logical offsets and broker recovery metadata.
 
 ## Scope
 
@@ -12,7 +12,22 @@ Supported cleanup policies are:
 | `compact` | Rewrite eligible closed segments and remove superseded keyed records. |
 | `delete,compact` | Run both maintenance policies on their independent intervals. |
 
-Compaction is currently standalone-only. `CREATE` rejects a compact policy when distribution is enabled because follower catch-up does not yet install rewritten segment generations. Event-sourcing topics also reject compaction because aggregate replay requires complete history.
+Event-sourcing topics reject compaction because aggregate replay requires complete history. Broker-owned distributed metadata is also excluded. A distributed application topic accepts `compact` or `delete,compact` only when every active broker advertises lifecycle protocol version 2.
+
+Accepting the topic policy does not force a cleaner pass. Every distributed
+partition evaluates a fail-closed runtime gate and skips compaction unless:
+
+- the authoritative topic definition and partition metadata are available,
+- committed HWM provenance is explicit,
+- every configured replica is active and the complete replica set is in ISR,
+- every replica advertises lifecycle protocol version 2,
+- the local broker is an in-sync configured replica,
+- local and FSM lifecycle epochs and cleanup policies match, and
+- local LEO and HWM both equal the authoritative committed HWM.
+
+These conditions prevent a rewritten segment generation from being installed
+while replica membership, topic identity, or committed visibility is
+ambiguous.
 
 ## Record Selection
 
@@ -35,6 +50,14 @@ A read from a removed offset returns the first retained record whose offset is g
 
 The active segment remains contiguous and uses strict recovery validation. Closed compacted segments require strictly increasing offsets but may contain gaps.
 
+Consumers refresh the authoritative cleanup policy from topic metadata. On a
+policy that includes `compact`, a forward offset jump is classified as an
+expected compacted hole and increments
+`cursus_consumer_compacted_offsets_skipped_total`. The same jump on a
+non-compacted topic increments `cursus_consumer_offset_gap_total`. Missing or
+invalid cleanup policy metadata never enables the compacted-hole
+classification.
+
 ## Rewrite And Recovery
 
 The cleaner serializes with delete retention but keeps producer appends running during closed-segment scans and temporary-file construction:
@@ -55,6 +78,22 @@ The log is replaced first because it is authoritative. If a broker stops before 
 
 Active readers cause the maintenance pass to skip rather than replacing a mapped file.
 
+## Distributed Replica Catch-up
+
+A replica outside ISR catches up only to the Raft-authoritative committed HWM.
+The leader returns a fenced logical range containing topic, partition, target
+broker, leader epoch, lifecycle epoch, start offset, end offset, committed HWM,
+and whether the range is compacted. A compacted range may contain zero or more
+physical records while still advancing across a non-empty logical interval.
+
+The follower validates every identity and boundary before mutation. It stages
+the compacted log and sparse index, fsyncs them, records their sizes and SHA-256
+checksums in a durable pending manifest, installs the marker and empty tail,
+and removes the pending manifest last. Restart completes or validates an
+interrupted installation from that manifest. HWM advances only after the
+entire committed range is present; ISR admission remains a separate,
+leader/lifecycle/HWM-fenced catch-up proof.
+
 ## Configuration
 
 | Setting | Default | Meaning |
@@ -64,7 +103,7 @@ Active readers cause the maintenance pass to skip rather than replacing a mapped
 | `log_min_cleanable_dirty_ratio` | 0.5 | Minimum removable closed-segment bytes divided by total closed-segment bytes. |
 | `log_retention_check_interval_ms` | 300000 | Interval between delete-retention passes. |
 
-A topic overrides the broker cleanup default with `CREATE ... cleanup_policy=<policy>`. Repeating `CREATE` with the same partition count updates the topic policy. Provisioning code should issue the same idempotent topic declaration whenever it establishes broker resources.
+A topic overrides the broker cleanup default with `CREATE ... cleanup_policy=<policy>`. Repeating `CREATE` patches only supplied fields and advances the topic definition revision only when the effective definition changes. In distributed mode do not enable compaction until every broker is on a lifecycle-protocol-v2-capable build.
 
 The Go SDK exposes `Producer.CreateTopicWithOptions` and `TopicOptions.CleanupPolicy`. `CreateTopic(topic, partitions)` is the minimal convenience form and inherits the broker default.
 
@@ -72,8 +111,17 @@ The Go SDK exposes `Producer.CreateTopicWithOptions` and `TopicOptions.CleanupPo
 
 Keyed state topics are the intended use case. Choose a segment roll size/time that produces closed segments frequently enough to clean, then observe disk usage and cleaner duration before lowering the dirty ratio.
 
+Monitor `cursus_broker_log_compaction_runs_total{result,reason}`. A skipped
+pass can be normal—for example `no_closed_segments`, `dirty_ratio`, or
+`active_readers`. Repeated distributed gate reasons such as
+`mixed_broker_protocol`, `replica_not_active`,
+`replica_not_caught_up`, `topic_lifecycle_mismatch`, or
+`partition_metadata_unavailable` indicate that compaction is intentionally
+paused until cluster state converges. An `error` result requires storage and
+recovery investigation.
+
 Do not enable compaction for audit/event history that must retain every mutation. Use a separate compacted state topic and an uncompacted event-sourcing topic when both current state and full history are required.
 
 Backups and restores must preserve each compacted `.log` file together with its matching `.log.compacted-<size>` sidecar and `.index` file. A missing or invalid sidecar is not reconstructed from offset holes: startup and reads fail closed instead of treating an unmarked gap as valid compaction. Restore the files from the same backup generation before opening the broker.
 
-Distributed compacted-segment installation, tombstone grace periods, and per-topic dirty-ratio overrides are not part of the current contract.
+Tombstone grace periods and per-topic dirty-ratio overrides are not part of the current contract. An empty payload is retained as the latest value and is not a time-based tombstone.

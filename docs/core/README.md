@@ -35,7 +35,7 @@ A transaction does not collapse those owners into one in-memory object. The tran
 | Partition / consumer / broadcast buffers | `10000` / `1000` / `10000` |
 | Distribution | disabled unless configured |
 
-Configuration validation normalizes invalid values. Cleanup policy accepts `delete`, `compact`, or `delete,compact`; compaction is standalone-only and is rejected for event-sourcing topics.
+Configuration validation normalizes invalid values. Cleanup policy accepts `delete`, `compact`, or `delete,compact`. Application topics support compaction in standalone and distributed mode; distributed passes run only while the protocol, replica, HWM, lifecycle, and policy safety gate is open. Event-sourcing topics reject compaction.
 
 ## Concurrency
 
@@ -55,6 +55,8 @@ Configuration validation normalizes invalid values. Cleanup policy accepts `dele
 5. retry durable `committing` transactions,
 6. start client, internal, health, and metrics listeners,
 7. report readiness only after required cluster/storage authority is available.
+
+Distributed recovery waits for partition materialization by tracking Raft snapshot, commit, log, applied, and target indexes. Its two-minute timeout is a no-progress timeout: forward movement resets the deadline, while a genuinely stalled replay fails startup with the last observed indexes.
 
 ## Shutdown
 

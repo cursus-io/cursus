@@ -158,7 +158,7 @@ ALTER_TOPIC_CONFIG topic=<name> min_in_sync_replicas=<N|default>
 ```
 This command atomically replaces only the topic override. `default` removes the override and restores broker fallback; it does not rewrite older metadata with an arbitrary value.
 
-`compact` and `delete,compact` are accepted only by standalone, non-event-sourcing topics. Unsupported combinations return `ERROR: invalid_topic_policy ...` or `ERROR: unsupported_topic_policy ...`. Repeating `CREATE` for an existing event-sourcing topic cannot use a false `event_sourcing` argument to bypass this validation. Repeating `CREATE` also preserves existing partition leader epochs and committed HWMs; only newly added partitions receive new assignments.
+`compact` and `delete,compact` are accepted for non-event-sourcing application topics in standalone and distributed mode. Distributed creation or update requires every active broker to advertise lifecycle protocol version 2; mixed-version attempts return `ERROR: unsupported_topic_policy ...`. Cleaner passes remain gated until all configured replicas are active and in ISR, committed HWM is authoritative, and local/FSM lifecycle epoch, cleanup policy, LEO, and HWM agree. Event-sourcing topics return `ERROR: invalid_topic_policy ...`, and broker-owned internal metadata is never compacted by the distributed cleaner. Repeating `CREATE` for an existing event-sourcing topic cannot use a false `event_sourcing` argument to bypass validation. Repeating `CREATE` also preserves existing partition leader epochs and committed HWMs; only newly added partitions receive new assignments.
 
 **DELETE**
 ```

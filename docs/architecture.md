@@ -162,6 +162,14 @@ Each topic-partition pair gets its own DiskHandler instance:
 
 This architecture enables parallel I/O across partitions and efficient sequential reads. For detailed persistence mechanics, see [Disk Persistence System](./core/storage/disk-persistence.md).
 
+Keyed compaction rewrites only closed segments and preserves logical offsets,
+transaction/control records, and producer recovery anchors. In distributed
+mode a cleaner pass runs only when every configured replica is active and in
+ISR, all brokers advertise lifecycle protocol version 2, and the local/FSM
+policy, lifecycle epoch, LEO, and authoritative committed HWM agree. Replica
+catch-up transports compacted logical ranges with explicit start/end offsets so
+followers can reproduce holes without synthetic consumer-visible records.
+
 ## Cluster Architecture
 
 cursus supports a configured Raft-based cluster with coordinator and partition-leader routing. The common deployment and test topology uses three brokers so a majority remains available after one node failure; the protocol contract is not hard-coded to exactly three nodes.
@@ -294,6 +302,15 @@ sequenceDiagram
 ### Raft Consensus
 
 In distributed mode, authoritative group and transaction metadata changes are persisted through the Raft FSM and snapshots. A logical group or transaction coordinator may differ from the Raft leader; `applyViaLeader` forwards the metadata mutation through the authenticated broker-internal path before it is considered durable. Standalone consumer offsets use the internal offset log, while standalone transaction snapshots use an append-only fsynced journal under `log_dir`. The final transaction snapshot is persisted before the in-memory decision opens `read_committed` visibility.
+
+Current distributed storage uses Raft snapshot format 9 and requires explicit
+committed-HWM provenance. Older, unmarked, or ambiguous persistent state is a
+clean-bootstrap boundary; mixed-version rolling upgrade and downgrade are not
+supported across that boundary. During supported current-format startup, the
+broker waits for recovered partition replay with a two-minute no-progress
+deadline. Snapshot, commit, last-log, applied, or target-index advancement
+resets the deadline, so a large replay can continue while a stalled replay
+fails closed with diagnostic indexes.
 
 ```mermaid
 graph LR

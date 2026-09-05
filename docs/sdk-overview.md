@@ -1,6 +1,6 @@
 # SDK Overview
 
-Cursus defines one Wire v2 contract. The in-repository Go SDK is changed and tested atomically with the broker. Separately released Java and Python SDKs must migrate to Wire v2 before they can connect; this repository does not provide an older protocol mode for them.
+Cursus defines one Wire v2 contract. The in-repository Go SDK is changed and tested atomically with the broker. The separately released Java and Python SDKs also implement the required handshake, correlated frames, compression, structured errors, routing, administration, transactions, event sourcing, and framework helpers. This repository does not provide a legacy protocol mode; every SDK release must pass the shared byte-exact conformance fixture and live-broker tests.
 
 ## SDK Ecosystem
 
@@ -63,19 +63,22 @@ flowchart TB
 | Consumer (polling) | ✅ | ✅ | ✅ |
 | Consumer (streaming) | ✅ | ✅ | ✅ |
 | Consumer Groups | ✅ | ✅ | ✅ |
-| EventStore | ✅ | — | ✅ |
+| EventStore | ✅ | ✅ | ✅ |
 | Compression (gzip) | ✅ | ✅ | ✅ |
-| Compression (snappy) | ✅ | — | ✅ (extras) |
-| Compression (lz4) | ✅ | — | ✅ (extras) |
+| Compression (snappy) | ✅ | ✅ | ✅ (extras) |
+| Compression (lz4) | ✅ | ✅ | ✅ (extras) |
 | TLS | ✅ | ✅ | ✅ |
 | FindCoordinator | ✅ | ✅ | ✅ |
 | Partition Leader Routing | ✅ | ✅ | ✅ |
-| Broker-owned offset resume / `auto_offset_reset` | ✅ | ✅ merged in SDK repo | ✅ merged in SDK repo |
-| Explicit `read_committed` / `read_uncommitted` | ✅ | follow-up required | follow-up required |
-| Required Wire v2 handshake | ✅ | migration required | migration required |
-| Typed structured broker errors | ✅ | migration required | migration required |
-| High-level broker transactions | ✅ | follow-up required | follow-up required |
-| Connection authentication | ✅ | verify against SDK version | verify against SDK version |
+| Broker-owned offset resume / `auto_offset_reset` | ✅ | ✅ | ✅ |
+| Explicit `read_committed` / `read_uncommitted` | ✅ | ✅ | ✅ |
+| Required Wire v2 handshake | ✅ | ✅ | ✅ |
+| Typed structured broker errors | ✅ | ✅ | ✅ |
+| High-level broker transactions | ✅ | ✅ | ✅ |
+| Admin client | ✅ | ✅ | ✅ |
+| Event framework and saga helpers | ✅ | ✅ | ✅ |
+| Client metrics | ✅ | ✅ | ✅ |
+| Connection authentication | ✅ | ✅ | ✅ |
 | Framework Integration | — | Spring Boot | FastAPI |
 | Iterator Pattern | — | — | ✅ for/async for |
 
@@ -120,6 +123,12 @@ cfg.HandshakeTimeoutMS = 5000
 ```
 
 The handshake runs for every newly opened or reconnected TCP connection. `HandshakeTimeoutMS` bounds it; zero uses 5000 ms and negative values fail configuration validation. A version or compression mismatch closes the connection before use. The SDK has no application-level feature negotiation or legacy protocol mode.
+
+Go, Java, and Python encode the same canonical conformance vectors for
+negotiation, requests, batches, stream controls, errors, and compression. The
+fixture protects byte-level compatibility; it does not replace each SDK's
+required live-broker producer, consumer, administration, transaction, and
+EventStore tests.
 
 Broker failures returned by application requests are available as `*sdk.BrokerError`:
 
@@ -173,7 +182,7 @@ truncated, err := admin.TruncateTopic("test-player-state", sdk.TruncateTopicOpti
 })
 ```
 
-`AdminClient` validates values locally, returns the broker's complete `TopicDefinition` for create/update, a `DeleteTopicResult` for delete, and a `TruncateTopicResult` for reset. Attempts are bounded by `MaxRetries + 1` and rotate across configured brokers for retryable routing/availability and pre-submission transport failures. The SDK canonicalizes `compact,delete` to `delete,compact`, enforces the portable topic-name contract, and rejects unsafe command values, zero expected revisions, negative retention, or unknown policy enums before opening a broker connection. Compact policies require a standalone, non-event-sourcing topic. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
+`AdminClient` validates values locally, returns the broker's complete `TopicDefinition` for create/update, a `DeleteTopicResult` for delete, and a `TruncateTopicResult` for reset. Attempts are bounded by `MaxRetries + 1` and rotate across configured brokers for retryable routing/availability and pre-submission transport failures. The SDK canonicalizes `compact,delete` to `delete,compact`, enforces the portable topic-name contract, and rejects unsafe command values, zero expected revisions, negative retention, or unknown policy enums before opening a broker connection. Compact policies require a non-event-sourcing application topic; the broker enforces the additional distributed safety gates. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
 
 `DeleteTopic` and `TruncateTopic` exist only on the admin client; producer and consumer clients do not expose destructive lifecycle methods. `IfExists` makes an explicit deletion retry idempotent; without it, a missing topic returns `topic_not_found`. The admin client retries a dropped connection after command submission only for `IfExists=true`; non-idempotent delete and truncate stop with an unknown-outcome error. A truncate replay cannot erase a second generation because `ExpectedRevision` is mandatory, but a committed first attempt would return a conflict rather than the original result, so the SDK does not hide that ambiguity. `CleanupPending` means the logical lifecycle committed while broker-local storage cleanup is still converging. Kubernetes reconcilers should call delete only for an explicit absent/tombstone resource that crossed a separate approval boundary, and should never emulate truncation with delete-and-create.
 
@@ -251,6 +260,15 @@ last broker-committed offset, providing at-least-once processing.
 `autoOffsetReset=earliest|latest` in polling and streaming commands.
 `AutoOffsetResetError` leaves reset selection disabled and surfaces an
 out-of-range condition.
+
+After each metadata refresh the consumer records whether the authoritative
+`cleanup_policy` includes `compact`. Forward jumps on such a topic are valid
+logical holes and increment
+`cursus_consumer_compacted_offsets_skipped_total{topic,group}`; they do not
+increment `cursus_consumer_offset_gap_total`. The same jump on a non-compacted
+topic remains an unexpected offset gap. Missing or invalid cleanup policy
+metadata clears the compaction classification instead of weakening gap
+detection.
 
 `ConsumerConfig.ReadIsolation` selects `sdk.ReadCommitted` or
 `sdk.ReadUncommitted`; the default is `ReadCommitted`. The SDK sends the value
