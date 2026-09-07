@@ -133,6 +133,11 @@ func TestReplicationErrorResponse(t *testing.T) {
 		resp := ch.replicationErrorResponse(8, err)
 		assert.Equal(t, `ERROR: PARTITION_LEADER_FENCED offset=8 reason="partition leader fenced: stale epoch"`, resp)
 	})
+
+	t.Run("permanent replication failure is not exposed as retryable", func(t *testing.T) {
+		resp := ch.replicationErrorResponse(9, permanentReplicationError{})
+		assert.Equal(t, `ERROR: broker_error offset=9 reason="invalid replica append"`, resp)
+	})
 }
 
 func TestValidateStreamArgs(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +25,7 @@ type partitionReplicationTask struct {
 	command      types.MessageCommand
 	commitHWM    uint64
 	ackMode      ackpolicy.Mode
-	barrierOnly  bool
+	duplicate    bool
 	snapshot     clusterController.PartitionReplicationSnapshot
 	partitionRef *topic.Partition
 	result       chan error
@@ -251,7 +252,7 @@ func (l *partitionReplicationLane) enqueueCatchup(task partitionReplicationTask,
 
 func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 	backoff := 25 * time.Millisecond
-	reported := false
+	failures := uint64(0)
 	for {
 		if l.owner.ctx.Err() != nil {
 			completeReplicationTask(task, errReplicationQueueClosed)
@@ -259,9 +260,19 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 		}
 
 		snapshot, err := l.replicationSnapshot(task)
-		if err == nil && task.barrierOnly {
-			completeReplicationTask(task, nil)
-			return
+		if err == nil && task.duplicate {
+			if task.partitionRef == nil {
+				err = errors.New("duplicate producer sequence partition is unavailable")
+			} else {
+				committedHWM := task.partitionRef.GetHWM()
+				if committedHWM >= task.commitHWM {
+					completeReplicationTask(task, nil)
+					if failures > 0 {
+						util.Info("partition replication recovered topic=%s partition=%d ack_mode=%s attempts=%d", task.topic, task.partition, task.ackMode, failures+1)
+					}
+					return
+				}
+			}
 		}
 		if err == nil {
 			err = l.owner.executor.ReplicateISR(l.owner.ctx, task, snapshot)
@@ -287,6 +298,9 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 		}
 		if err == nil {
 			completeReplicationTask(task, nil)
+			if failures > 0 {
+				util.Info("partition replication recovered topic=%s partition=%d ack_mode=%s attempts=%d", task.topic, task.partition, task.ackMode, failures+1)
+			}
 			l.enqueueCatchup(task, snapshot)
 			return
 		}
@@ -295,25 +309,28 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			return
 		}
 
-		if !reported {
-			reported = true
-			class := replicationErrorClass(err)
-			if task.ackMode == ackpolicy.All {
-				completeReplicationTask(task, err)
-			} else {
-				metrics.AsyncReplicationFailures.WithLabelValues(task.topic, class).Inc()
-				util.Error("async replication failed topic=%s partition=%d ack_mode=%s error_class=%s error=%v", task.topic, task.partition, task.ackMode, class, err)
-			}
-		}
+		class := replicationErrorClass(err)
 		if isReplicationFenceError(err) {
+			util.Error("partition replication fenced topic=%s partition=%d ack_mode=%s error_class=%s error=%v", task.topic, task.partition, task.ackMode, class, err)
 			completeReplicationTask(task, err)
 			return
 		}
+		if !isRetryableReplicationError(err) {
+			util.Error("partition replication failed permanently topic=%s partition=%d ack_mode=%s error_class=%s error=%v", task.topic, task.partition, task.ackMode, class, err)
+			completeReplicationTask(task, err)
+			return
+		}
+		failures++
+		metrics.ReplicationRetries.WithLabelValues(task.topic, string(task.ackMode), class).Inc()
+		if task.ackMode != ackpolicy.All {
+			metrics.AsyncReplicationFailures.WithLabelValues(task.topic, class).Inc()
+		}
+		if failures == 1 || failures&(failures-1) == 0 {
+			util.Error("partition replication retrying topic=%s partition=%d ack_mode=%s attempt=%d error_class=%s error=%v", task.topic, task.partition, task.ackMode, failures, class, err)
+		}
 		select {
 		case <-time.After(backoff):
-			if backoff < time.Second {
-				backoff *= 2
-			}
+			backoff = min(backoff*2, time.Second)
 		case <-l.owner.ctx.Done():
 			completeReplicationTask(task, errReplicationQueueClosed)
 			return
@@ -355,9 +372,33 @@ func isReplicationFenceError(err error) bool {
 	return errors.Is(err, clusterController.ErrPartitionLeaderFenced)
 }
 
+type classifiedReplicationError interface {
+	Retryable() bool
+	ReplicationErrorClass() string
+}
+
+func isRetryableReplicationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var classified classifiedReplicationError
+	if errors.As(err, &classified) {
+		return classified.Retryable()
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr)
+}
+
 func replicationErrorClass(err error) string {
 	if err == nil {
 		return "none"
+	}
+	var classified classifiedReplicationError
+	if errors.As(err, &classified) {
+		return classified.ReplicationErrorClass()
 	}
 	value := strings.ToLower(err.Error())
 	switch {

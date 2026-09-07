@@ -23,17 +23,26 @@ import (
 )
 
 type barrierReplicationExecutor struct {
-	mu             sync.Mutex
-	snapshot       clusterController.PartitionReplicationSnapshot
-	started        chan struct{}
-	barrier        chan struct{}
-	replicateErr   error
-	committedHWM   uint64
-	commitHook     func()
-	replicateCalls int
-	nonISRCalls    int
-	nonISRBarrier  chan struct{}
+	mu                sync.Mutex
+	snapshot          clusterController.PartitionReplicationSnapshot
+	started           chan struct{}
+	barrier           chan struct{}
+	replicateErr      error
+	replicateFailures int
+	committedHWM      uint64
+	commitHook        func()
+	replicateCalls    int
+	nonISRCalls       int
+	nonISRBarrier     chan struct{}
 }
+
+type permanentReplicationError struct{}
+
+func (permanentReplicationError) Error() string { return "invalid replica append" }
+
+func (permanentReplicationError) Retryable() bool { return false }
+
+func (permanentReplicationError) ReplicationErrorClass() string { return "validation" }
 
 func (e *barrierReplicationExecutor) Snapshot(string, int) (clusterController.PartitionReplicationSnapshot, error) {
 	e.mu.Lock()
@@ -46,7 +55,13 @@ func (e *barrierReplicationExecutor) ReplicateISR(ctx context.Context, _ partiti
 	e.replicateCalls++
 	started := e.started
 	barrier := e.barrier
-	err := e.replicateErr
+	err := error(nil)
+	if e.replicateFailures != 0 {
+		err = e.replicateErr
+		if e.replicateFailures > 0 {
+			e.replicateFailures--
+		}
+	}
 	e.mu.Unlock()
 	select {
 	case started <- struct{}{}:
@@ -76,6 +91,11 @@ func (e *barrierReplicationExecutor) Commit(task partitionReplicationTask) error
 	e.committedHWM = task.commitHWM
 	hook := e.commitHook
 	e.mu.Unlock()
+	if task.partitionRef != nil {
+		if err := task.partitionRef.ApplyReplicaHWM(task.commitHWM); err != nil {
+			return err
+		}
+	}
 	if hook != nil {
 		hook()
 	}
@@ -154,21 +174,89 @@ func TestLeaderAcknowledgementQueuesReplicationWithoutWaiting(t *testing.T) {
 	require.Eventually(t, func() bool { return executor.committed() == 1 }, time.Second, time.Millisecond)
 }
 
-func TestIdempotentDuplicateBarrierDoesNotReplicateOrCommit(t *testing.T) {
+func TestIdempotentDuplicateResumesReplicationBeforeAcknowledging(t *testing.T) {
+	handler, manager, executor := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	messages := []types.Message{{Payload: "value", ProducerID: "p1", Epoch: 7, SeqNum: 1}}
+	require.NoError(t, partition.EnqueueBatchLeaderWithMode(messages, true))
+	require.Zero(t, partition.GetHWM())
+
+	reservation, err := handler.replication.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	task := replicationTaskForMode(executor, ackpolicy.All)
+	task.duplicate = true
+	task.partitionRef = partition
+	task.command = types.MessageCommand{Topic: "orders", Partition: 0, Messages: []types.Message{{Offset: 0, Payload: "value", ProducerID: "p1", Epoch: 7, SeqNum: 1}}}
+	reservation.submit(task)
+
+	<-executor.started
+	select {
+	case err := <-task.result:
+		t.Fatalf("duplicate acknowledgement crossed the HWM before commit: %v", err)
+	default:
+	}
+	close(executor.barrier)
+	require.NoError(t, <-task.result)
+	executor.mu.Lock()
+	require.Equal(t, 1, executor.replicateCalls)
+	executor.mu.Unlock()
+	require.Equal(t, uint64(1), executor.committed())
+	require.Equal(t, uint64(1), partition.GetHWM())
+}
+
+func TestAllAcknowledgementRetriesTransientFollowerFailureBeforeResponding(t *testing.T) {
 	executor := newBarrierReplicationExecutor()
+	executor.replicateErr = context.DeadlineExceeded
+	executor.replicateFailures = 1
+	close(executor.barrier)
 	coordinator := newPartitionReplicationCoordinator(1, executor)
 	t.Cleanup(coordinator.close)
 	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
 	require.NoError(t, err)
 	task := replicationTaskForMode(executor, ackpolicy.All)
-	task.barrierOnly = true
 	reservation.submit(task)
 
+	require.Eventually(t, func() bool {
+		executor.mu.Lock()
+		defer executor.mu.Unlock()
+		return executor.replicateCalls >= 1
+	}, time.Second, time.Millisecond)
+	select {
+	case err := <-task.result:
+		t.Fatalf("acks=all exposed a transient follower failure: %v", err)
+	default:
+	}
 	require.NoError(t, <-task.result)
+	require.Equal(t, uint64(1), executor.committed())
+}
+
+func TestAllAcknowledgementReturnsPermanentFollowerFailureWithoutBlockingLane(t *testing.T) {
+	executor := newBarrierReplicationExecutor()
+	executor.replicateErr = permanentReplicationError{}
+	executor.replicateFailures = 1
+	close(executor.barrier)
+	coordinator := newPartitionReplicationCoordinator(1, executor)
+	t.Cleanup(coordinator.close)
+
+	firstReservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	first := replicationTaskForMode(executor, ackpolicy.All)
+	firstReservation.submit(first)
+	require.ErrorContains(t, <-first.result, "invalid replica append")
+
+	secondReservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	second := replicationTaskForMode(executor, ackpolicy.All)
+	second.commitHWM = 2
+	secondReservation.submit(second)
+	require.NoError(t, <-second.result)
+
 	executor.mu.Lock()
-	require.Zero(t, executor.replicateCalls)
+	require.Equal(t, 2, executor.replicateCalls, "permanent failure was retried or kept the lane occupied")
 	executor.mu.Unlock()
-	require.Zero(t, executor.committed())
 }
 
 func TestReplicationQueueAppliesBoundedBackpressure(t *testing.T) {
@@ -724,9 +812,10 @@ func TestDistributedAllRequestCancellationDoesNotLeakOrAbandonReplication(t *tes
 	require.Eventually(t, func() bool { return executor.committed() == 1 }, time.Second, time.Millisecond)
 }
 
-func TestAllAcknowledgementReportsFollowerTimeoutAndShutsDownCleanly(t *testing.T) {
+func TestAllAcknowledgementKeepsRetryingFollowerTimeoutUntilShutdown(t *testing.T) {
 	executor := newBarrierReplicationExecutor()
 	executor.replicateErr = context.DeadlineExceeded
+	executor.replicateFailures = -1
 	coordinator := newPartitionReplicationCoordinator(1, executor)
 	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
 	require.NoError(t, err)
@@ -734,7 +823,11 @@ func TestAllAcknowledgementReportsFollowerTimeoutAndShutsDownCleanly(t *testing.
 	reservation.submit(task)
 	<-executor.started
 	close(executor.barrier)
-	require.ErrorIs(t, <-task.result, context.DeadlineExceeded)
+	require.Eventually(t, func() bool {
+		executor.mu.Lock()
+		defer executor.mu.Unlock()
+		return executor.replicateCalls >= 2
+	}, time.Second, time.Millisecond)
 	done := make(chan struct{})
 	go func() {
 		coordinator.close()
@@ -745,6 +838,7 @@ func TestAllAcknowledgementReportsFollowerTimeoutAndShutsDownCleanly(t *testing.
 	case <-time.After(time.Second):
 		t.Fatal("replication retry leaked after follower timeout and shutdown")
 	}
+	require.ErrorIs(t, <-task.result, errReplicationQueueClosed)
 }
 
 func TestTopicEffectiveMinimumISRIsAppliedIndependently(t *testing.T) {

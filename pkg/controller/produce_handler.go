@@ -58,6 +58,33 @@ func duplicateAcknowledgementOffset(p *topic.Partition, messages []types.Message
 	return offset, nil
 }
 
+func duplicateReplicationMessages(p *topic.Partition, messages []types.Message) ([]types.Message, uint64, error) {
+	if len(messages) == 0 {
+		return nil, 0, fmt.Errorf("duplicate replication has no messages")
+	}
+	recovered := make([]types.Message, 0, len(messages))
+	var lastOffset uint64
+	for _, message := range messages {
+		offset, found, err := p.ProducerSequenceOffset(message.ProducerID, message.Epoch, message.SeqNum)
+		if err != nil {
+			return nil, 0, fmt.Errorf("resolve duplicate producer sequence: %w", err)
+		}
+		if !found {
+			return nil, 0, fmt.Errorf("duplicate producer sequence offset is unavailable: producer=%s epoch=%d seq=%d", message.ProducerID, message.Epoch, message.SeqNum)
+		}
+		stored, err := p.ReadMessages(offset, 1)
+		if err != nil {
+			return nil, 0, fmt.Errorf("read duplicate producer sequence: %w", err)
+		}
+		if len(stored) != 1 || stored[0].Offset != offset {
+			return nil, 0, fmt.Errorf("duplicate producer sequence record is unavailable: producer=%s epoch=%d seq=%d offset=%d", message.ProducerID, message.Epoch, message.SeqNum, offset)
+		}
+		recovered = append(recovered, stored[0])
+		lastOffset = offset
+	}
+	return recovered, lastOffset, nil
+}
+
 // handlePublish processes PUBLISH command
 func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (response string) {
 	var clientCtx *ClientContext
@@ -293,19 +320,23 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		}
 		appended := appendedLeaderMessages(messageData.Messages)
 		if len(appended) == 0 {
-			lastOffset, resolveErr := duplicateAcknowledgementOffset(p, messageData.Messages)
+			recovered, lastOffset, resolveErr := duplicateReplicationMessages(p, messageData.Messages)
 			if resolveErr != nil {
 				return ch.errorResponse(resolveErr.Error())
 			}
 			if ackSelection.Mode == ackpolicy.All {
+				messageData.Messages = recovered
 				result := make(chan error, 1)
 				reservation.submit(partitionReplicationTask{
-					topic:       topicName,
-					partition:   partition,
-					ackMode:     ackSelection.Mode,
-					barrierOnly: true,
-					snapshot:    replicationSnapshot,
-					result:      result,
+					topic:        topicName,
+					partition:    partition,
+					commitHWM:    lastOffset + 1,
+					ackMode:      ackSelection.Mode,
+					command:      messageData,
+					duplicate:    true,
+					snapshot:     replicationSnapshot,
+					partitionRef: p,
+					result:       result,
 				})
 				submitted = true
 				select {
@@ -648,19 +679,32 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		}
 		appended := appendedLeaderMessages(batch.Messages)
 		if len(appended) == 0 {
-			lastOffset, err = duplicateAcknowledgementOffset(p, batch.Messages)
+			recovered, duplicateOffset, resolveErr := duplicateReplicationMessages(p, batch.Messages)
+			lastOffset, err = duplicateOffset, resolveErr
 			if err != nil {
 				return ch.errorResponse(err.Error()), nil
 			}
 			if ackSelection.Mode == ackpolicy.All {
+				msgCmd := types.MessageCommand{
+					Topic:          batch.Topic,
+					Partition:      batch.Partition,
+					LifecycleEpoch: t.LifecycleEpoch,
+					IsIdempotent:   effectiveIdempotent,
+					SequenceScope:  scope,
+					Messages:       recovered,
+					Acks:           acks,
+				}
 				result := make(chan error, 1)
 				reservation.submit(partitionReplicationTask{
-					topic:       batch.Topic,
-					partition:   batch.Partition,
-					ackMode:     ackSelection.Mode,
-					barrierOnly: true,
-					snapshot:    replicationSnapshot,
-					result:      result,
+					topic:        batch.Topic,
+					partition:    batch.Partition,
+					commitHWM:    lastOffset + 1,
+					ackMode:      ackSelection.Mode,
+					command:      msgCmd,
+					duplicate:    true,
+					snapshot:     replicationSnapshot,
+					partitionRef: p,
+					result:       result,
 				})
 				submitted = true
 				select {
