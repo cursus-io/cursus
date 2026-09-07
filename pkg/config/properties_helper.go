@@ -1,7 +1,11 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -246,6 +250,20 @@ func overrideEnvStringSlice(target *[]string, key string) {
 
 func overrideEnvSASLUsers(target *[]SASLUser, key string) error {
 	if v := os.Getenv(key); v != "" {
+		v = strings.TrimSpace(v)
+		if strings.HasPrefix(v, "[") {
+			decoder := json.NewDecoder(bytes.NewBufferString(v))
+			decoder.DisallowUnknownFields()
+			var users []SASLUser
+			if err := decoder.Decode(&users); err != nil {
+				return fmt.Errorf("decode %s JSON users: %w", key, err)
+			}
+			if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+				return fmt.Errorf("decode %s JSON users: trailing data", key)
+			}
+			*target = users
+			return nil
+		}
 		entries := strings.Split(v, ",")
 		users := make([]SASLUser, 0, len(entries))
 		for _, entry := range entries {
