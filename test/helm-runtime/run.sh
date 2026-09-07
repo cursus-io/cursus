@@ -112,6 +112,12 @@ for mode in standalone cluster; do
     --set monitoring.enabled=true --set monitoring.serviceMonitor.enabled=false \
     --set networkPolicy.enabled=true --set production=true --set persistence.logDir.size=1Gi \
     "${extra[@]}"
+  kubectl -n "$ns" wait --for=jsonpath='{.status.phase}'=Bound pvc --all --timeout=180s
+  if [[ $mode == standalone ]]; then
+    kubectl -n "$ns" rollout status deployment/cursus --timeout=180s
+  else
+    kubectl -n "$ns" rollout status statefulset/cursus --timeout=300s
+  fi
   [[ $(kubectl -n "$ns" get pvc -o json | jq '[.items[] | select(.status.phase == "Bound")] | length') == "$replicas" ]]
   if [[ $mode == cluster ]]; then
     [[ $(kubectl -n "$ns" get pods -l app.kubernetes.io/name=cursus -o json | jq '[.items[].spec.nodeName] | unique | length') == 3 ]]
