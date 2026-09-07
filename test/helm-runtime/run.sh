@@ -121,6 +121,7 @@ for mode in standalone cluster; do
   [[ $(kubectl -n "$ns" get pvc -o json | jq '[.items[] | select(.status.phase == "Bound")] | length') == "$replicas" ]]
   if [[ $mode == cluster ]]; then
     [[ $(kubectl -n "$ns" get pods -l app.kubernetes.io/name=cursus -o json | jq '[.items[].spec.nodeName] | unique | length') == 3 ]]
+    run_client ready
   fi
   run_client seed
   claims=$(kubectl -n "$ns" get pvc -o json | jq -c '[.items[] | {name:.metadata.name,uid:.metadata.uid,volume:.spec.volumeName}] | sort_by(.name)')

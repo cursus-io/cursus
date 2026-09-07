@@ -16,7 +16,7 @@ func TestHelmSDKPersistence(t *testing.T) {
 	if phase == "" {
 		t.Skip("run in the isolated Helm runtime fixture")
 	}
-	require.Contains(t, []string{"seed", "restored"}, phase)
+	require.Contains(t, []string{"ready", "seed", "restored"}, phase)
 	address := os.Getenv("HELM_BROKER_ADDRESS")
 	require.NotEmpty(t, address)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -31,6 +31,11 @@ func TestHelmSDKPersistence(t *testing.T) {
 	cfg.UseTLS = true
 	cfg.TLSCertPath, cfg.TLSKeyPath = "/tls/tls.crt", "/tls/tls.key"
 	cfg.Principal, cfg.AuthToken = "runtime-test", os.Getenv("HELM_AUTH_TOKEN")
+	if phase == "ready" {
+		cfg.Topic, cfg.Partitions, cfg.AutoCreateTopics = "helm-runtime-ready", 1, true
+		require.NoError(t, publishAfterClusterRecovery(ctx, cfg))
+		return
+	}
 	producer, err := newProducerAfterRecovery(ctx, cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, producer.Close()) })
@@ -115,6 +120,33 @@ func newProducerAfterRecovery(ctx context.Context, cfg *sdk.PublisherConfig) (*s
 		case <-deadline.C:
 			return nil, err
 		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+func publishAfterClusterRecovery(ctx context.Context, cfg *sdk.PublisherConfig) error {
+	deadline := time.NewTimer(90 * time.Second)
+	defer deadline.Stop()
+	for {
+		producer, err := sdk.NewProducerWithContext(ctx, cfg)
+		if err == nil {
+			_, err = producer.Send("ready")
+			if err == nil {
+				err = producer.Flush()
+			}
+			if closeErr := producer.Close(); err == nil {
+				err = closeErr
+			}
+		}
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return err
+		case <-time.After(time.Second):
 		}
 	}
 }
