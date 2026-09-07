@@ -528,16 +528,18 @@ func (ch *CommandHandler) publishInternalTransactionCommand(cmd string) error {
 		if strings.HasPrefix(lastResp, "OK") || strings.HasPrefix(lastResp, "{") {
 			return nil
 		}
-		if !isRetryableTransactionStateLag(lastResp) || !time.Now().Before(deadline) {
+		if !isRetryableInternalTransactionPublishResponse(lastResp) || !time.Now().Before(deadline) {
 			return fmt.Errorf("%s", lastResp)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 }
 
-func isRetryableTransactionStateLag(resp string) bool {
+func isRetryableInternalTransactionPublishResponse(resp string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(resp))
 	for _, code := range []string{
+		"replication_unavailable",
+		"insufficient_in_sync_replicas",
 		"transaction_not_found",
 		"transaction_not_committing",
 		"transaction_record_not_staged",
