@@ -300,12 +300,14 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 			if ackSelection.Mode == ackpolicy.All {
 				result := make(chan error, 1)
 				reservation.submit(partitionReplicationTask{
-					topic:       topicName,
-					partition:   partition,
-					ackMode:     ackSelection.Mode,
-					barrierOnly: true,
-					snapshot:    replicationSnapshot,
-					result:      result,
+					topic:        topicName,
+					partition:    partition,
+					commitHWM:    lastOffset + 1,
+					ackMode:      ackSelection.Mode,
+					barrierOnly:  true,
+					snapshot:     replicationSnapshot,
+					partitionRef: p,
+					result:       result,
 				})
 				submitted = true
 				select {
@@ -655,12 +657,14 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			if ackSelection.Mode == ackpolicy.All {
 				result := make(chan error, 1)
 				reservation.submit(partitionReplicationTask{
-					topic:       batch.Topic,
-					partition:   batch.Partition,
-					ackMode:     ackSelection.Mode,
-					barrierOnly: true,
-					snapshot:    replicationSnapshot,
-					result:      result,
+					topic:        batch.Topic,
+					partition:    batch.Partition,
+					commitHWM:    lastOffset + 1,
+					ackMode:      ackSelection.Mode,
+					barrierOnly:  true,
+					snapshot:     replicationSnapshot,
+					partitionRef: p,
+					result:       result,
 				})
 				submitted = true
 				select {

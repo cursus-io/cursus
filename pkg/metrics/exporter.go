@@ -13,7 +13,7 @@ import (
 
 func init() {
 	prometheus.MustRegister(MessagesProcessed, MessagesPerSec, LatencyHist, QueueSize, CleanupCount, SeqNumGapTotal, SeqNumDuplicateTotal)
-	prometheus.MustRegister(ClientConnectionsTotal, ClientConnectionsActive, CommandsTotal, CommandDuration, CommandErrors, PublishAcknowledgements, AsyncReplicationFailures, LogCompactionRuns)
+	prometheus.MustRegister(ClientConnectionsTotal, ClientConnectionsActive, CommandsTotal, CommandDuration, CommandErrors, PublishAcknowledgements, AsyncReplicationFailures, ReplicationRetries, LogCompactionRuns)
 	prometheus.MustRegister(ClusterReplicationLag)
 }
 

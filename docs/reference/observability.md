@@ -88,6 +88,7 @@ partition leaders.
 | `cursus_broker_command_errors_total{command,code}` | Counter | Wire errors by bounded command and error code |
 | `cursus_broker_publish_acknowledgements_total{ack_mode,result}` | Counter | Publish requests by normalized acknowledgement mode and bounded result |
 | `cursus_broker_async_replication_failures_total{topic,error_class}` | Counter | Follower failures after an `acks=1` leader acknowledgement |
+| `cursus_broker_replication_retries_total{topic,ack_mode,error_class}` | Counter | Retried partition replication attempts, including pending duplicate commit barriers |
 | `cursus_broker_log_compaction_runs_total{result,reason}` | Counter | Completed, skipped, or failed compaction passes with bounded reasons |
 | `broker_messages_processed_total` | Counter | Messages accepted by the topic manager |
 | `broker_message_latency_seconds` | Histogram | Topic manager publish latency |
