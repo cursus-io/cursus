@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -17,7 +18,30 @@ type raftTLSStreamLayer struct {
 	clientConfig *tls.Config
 }
 
-func newRaftTLSStreamLayer(bindAddress string, advertised *net.TCPAddr, serverConfig, clientConfig *tls.Config) (*raftTLSStreamLayer, error) {
+type raftAdvertiseAddr struct {
+	address string
+}
+
+func (a raftAdvertiseAddr) Network() string { return "tcp" }
+
+func (a raftAdvertiseAddr) String() string { return a.address }
+
+func newRaftAdvertiseAddr(address string) (net.Addr, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	if host == "" {
+		return nil, fmt.Errorf("advertised host is required")
+	}
+	parsedPort, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || parsedPort == 0 {
+		return nil, fmt.Errorf("invalid advertised port %q", port)
+	}
+	return raftAdvertiseAddr{address: net.JoinHostPort(host, port)}, nil
+}
+
+func newRaftTLSStreamLayer(bindAddress string, advertised net.Addr, serverConfig, clientConfig *tls.Config) (*raftTLSStreamLayer, error) {
 	if serverConfig == nil || clientConfig == nil {
 		return nil, fmt.Errorf("raft TLS requires server and client TLS configuration")
 	}
@@ -49,7 +73,7 @@ func (l *raftTLSStreamLayer) Dial(address raft.ServerAddress, timeout time.Durat
 	return tls.DialWithDialer(dialer, "tcp", string(address), l.clientConfig.Clone())
 }
 
-func newRaftNetworkTransport(cfg *config.Config, bindAddress string, advertised *net.TCPAddr) (*raft.NetworkTransport, error) {
+func newRaftNetworkTransport(cfg *config.Config, bindAddress string, advertised net.Addr) (*raft.NetworkTransport, error) {
 	const timeout = 10 * time.Second
 	if !cfg.InternalUseTLS {
 		return raft.NewTCPTransport(bindAddress, advertised, 3, timeout, os.Stderr)
