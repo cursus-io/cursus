@@ -317,6 +317,29 @@ func (cc *ClusterController) ReplicateToNonISR(topic string, partition int, msgC
 	return cc.replicateToReplicaSet(topic, partition, msgCmd, snapshot, targets, false)
 }
 
+type replicaResponseError struct {
+	response  string
+	code      string
+	class     protocol.ErrorClass
+	retryable bool
+}
+
+func (e *replicaResponseError) Error() string {
+	return e.response
+}
+
+func (e *replicaResponseError) Retryable() bool {
+	return e.retryable
+}
+
+func (e *replicaResponseError) ReplicationErrorCode() string {
+	return e.code
+}
+
+func (e *replicaResponseError) ReplicationErrorClass() string {
+	return string(e.class)
+}
+
 func (cc *ClusterController) replicateToReplicaSet(topic string, partition int, msgCmd types.MessageCommand, snapshot PartitionReplicationSnapshot, targets []string, required bool) error {
 	current, err := cc.GetPartitionReplicationSnapshot(topic, partition)
 	if err != nil {
@@ -366,6 +389,13 @@ func (cc *ClusterController) replicateToReplicaSet(topic string, partition int, 
 				targetErr = fmt.Errorf("replica %s append failed: %w", brokerID, forwardErr)
 			} else if replicaFenceResponse(resp) {
 				targetErr = fmt.Errorf("%w: replica %s rejected append: %s", ErrPartitionLeaderFenced, brokerID, resp)
+			} else if parsed, ok := protocol.ParseErrorResponse(resp); ok {
+				targetErr = fmt.Errorf("replica %s rejected append: %w", brokerID, &replicaResponseError{
+					response:  resp,
+					code:      parsed.Code,
+					class:     parsed.Class,
+					retryable: parsed.Retryable,
+				})
 			} else {
 				targetErr = fmt.Errorf("replica %s rejected append: %s", brokerID, resp)
 			}

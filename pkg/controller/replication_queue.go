@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -317,6 +318,11 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			completeReplicationTask(task, err)
 			return
 		}
+		if !isRetryableReplicationError(err) {
+			util.Error("partition replication failed permanently topic=%s partition=%d ack_mode=%s error_class=%s error=%v", task.topic, task.partition, task.ackMode, class, err)
+			completeReplicationTask(task, err)
+			return
+		}
 		failures++
 		metrics.ReplicationRetries.WithLabelValues(task.topic, string(task.ackMode), class).Inc()
 		if task.ackMode != ackpolicy.All {
@@ -369,9 +375,33 @@ func isReplicationFenceError(err error) bool {
 	return errors.Is(err, clusterController.ErrPartitionLeaderFenced)
 }
 
+type classifiedReplicationError interface {
+	Retryable() bool
+	ReplicationErrorClass() string
+}
+
+func isRetryableReplicationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errDuplicateCommitPending) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var classified classifiedReplicationError
+	if errors.As(err, &classified) {
+		return classified.Retryable()
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr)
+}
+
 func replicationErrorClass(err error) string {
 	if err == nil {
 		return "none"
+	}
+	var classified classifiedReplicationError
+	if errors.As(err, &classified) {
+		return classified.ReplicationErrorClass()
 	}
 	value := strings.ToLower(err.Error())
 	switch {

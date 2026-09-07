@@ -21,6 +21,8 @@ having their error logs suppressed.
 - Transient replication errors are retried in the ordered partition lane with
   exponential backoff. They are observable but are not terminal producer
   acknowledgements.
+- Structured non-retryable replica responses are returned immediately and
+  release the ordered lane; their error code is preserved for the producer.
 - A leader or lifecycle fence is terminal for the current request.
 - An idempotent duplicate is acknowledged only when its original offset is
   below the committed HWM under the same replication fence.

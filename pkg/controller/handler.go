@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -369,6 +370,12 @@ func (ch *CommandHandler) replicationErrorResponse(offset uint64, err error) str
 	code := "replication_unavailable"
 	if isReplicationFenceError(err) {
 		code = "PARTITION_LEADER_FENCED"
+	} else if !isRetryableReplicationError(err) {
+		code = "broker_error"
+		var coded interface{ ReplicationErrorCode() string }
+		if errors.As(err, &coded) && protocol.IsKnownErrorCode(coded.ReplicationErrorCode()) {
+			code = coded.ReplicationErrorCode()
+		}
 	}
 	return fmt.Sprintf("ERROR: %s offset=%d reason=%q", code, offset, err)
 }

@@ -36,6 +36,14 @@ type barrierReplicationExecutor struct {
 	nonISRBarrier     chan struct{}
 }
 
+type permanentReplicationError struct{}
+
+func (permanentReplicationError) Error() string { return "invalid replica append" }
+
+func (permanentReplicationError) Retryable() bool { return false }
+
+func (permanentReplicationError) ReplicationErrorClass() string { return "validation" }
+
 func (e *barrierReplicationExecutor) Snapshot(string, int) (clusterController.PartitionReplicationSnapshot, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -220,6 +228,32 @@ func TestAllAcknowledgementRetriesTransientFollowerFailureBeforeResponding(t *te
 	}
 	require.NoError(t, <-task.result)
 	require.Equal(t, uint64(1), executor.committed())
+}
+
+func TestAllAcknowledgementReturnsPermanentFollowerFailureWithoutBlockingLane(t *testing.T) {
+	executor := newBarrierReplicationExecutor()
+	executor.replicateErr = permanentReplicationError{}
+	executor.replicateFailures = 1
+	close(executor.barrier)
+	coordinator := newPartitionReplicationCoordinator(1, executor)
+	t.Cleanup(coordinator.close)
+
+	firstReservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	first := replicationTaskForMode(executor, ackpolicy.All)
+	firstReservation.submit(first)
+	require.ErrorContains(t, <-first.result, "invalid replica append")
+
+	secondReservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	second := replicationTaskForMode(executor, ackpolicy.All)
+	second.commitHWM = 2
+	secondReservation.submit(second)
+	require.NoError(t, <-second.result)
+
+	executor.mu.Lock()
+	require.Equal(t, 2, executor.replicateCalls, "permanent failure was retried or kept the lane occupied")
+	executor.mu.Unlock()
 }
 
 func TestReplicationQueueAppliesBoundedBackpressure(t *testing.T) {
