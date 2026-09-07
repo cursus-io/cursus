@@ -116,7 +116,7 @@ for mode in standalone cluster; do
   if [[ $mode == standalone ]]; then
     kubectl -n "$ns" rollout status deployment/cursus --timeout=180s
   else
-    kubectl -n "$ns" rollout status statefulset/cursus --timeout=300s
+    kubectl -n "$ns" wait --for=condition=Ready pod -l app.kubernetes.io/name=cursus --timeout=300s
   fi
   [[ $(kubectl -n "$ns" get pvc -o json | jq '[.items[] | select(.status.phase == "Bound")] | length') == "$replicas" ]]
   if [[ $mode == cluster ]]; then
