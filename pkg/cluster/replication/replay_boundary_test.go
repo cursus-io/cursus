@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
 	"time"
@@ -76,4 +77,10 @@ func TestReplayBoundaryAcceptsNewerCommittedSnapshot(t *testing.T) {
 		}
 		require.Equal(t, term == "3", ready)
 	}
+}
+
+func TestReplayBoundaryFailsClosedWhenCommittedLogIsUnavailable(t *testing.T) {
+	ready, err := (replayBoundary{index: 10, term: 3}).committed(raft.NewInmemStore(), nil, 5, 0)
+	require.False(t, ready)
+	require.True(t, errors.Is(err, raft.ErrLogNotFound))
 }
