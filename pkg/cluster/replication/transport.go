@@ -4,7 +4,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 	"time"
 
@@ -16,6 +15,11 @@ type raftTLSStreamLayer struct {
 	listener     net.Listener
 	advertised   net.Addr
 	clientConfig *tls.Config
+}
+
+type raftTCPStreamLayer struct {
+	listener   net.Listener
+	advertised net.Addr
 }
 
 type raftAdvertiseAddr struct {
@@ -56,6 +60,14 @@ func newRaftTLSStreamLayer(bindAddress string, advertised net.Addr, serverConfig
 	}, nil
 }
 
+func newRaftTCPStreamLayer(bindAddress string, advertised net.Addr) (*raftTCPStreamLayer, error) {
+	listener, err := net.Listen("tcp", bindAddress)
+	if err != nil {
+		return nil, err
+	}
+	return &raftTCPStreamLayer{listener: listener, advertised: advertised}, nil
+}
+
 func (l *raftTLSStreamLayer) Accept() (net.Conn, error) {
 	return l.listener.Accept()
 }
@@ -73,13 +85,31 @@ func (l *raftTLSStreamLayer) Dial(address raft.ServerAddress, timeout time.Durat
 	return tls.DialWithDialer(dialer, "tcp", string(address), l.clientConfig.Clone())
 }
 
+func (l *raftTCPStreamLayer) Accept() (net.Conn, error) {
+	return l.listener.Accept()
+}
+
+func (l *raftTCPStreamLayer) Close() error {
+	return l.listener.Close()
+}
+
+func (l *raftTCPStreamLayer) Addr() net.Addr {
+	return l.advertised
+}
+
+func (l *raftTCPStreamLayer) Dial(address raft.ServerAddress, timeout time.Duration) (net.Conn, error) {
+	return net.DialTimeout("tcp", string(address), timeout)
+}
+
 func newRaftNetworkTransport(cfg *config.Config, bindAddress string, advertised net.Addr) (*raft.NetworkTransport, error) {
 	const timeout = 10 * time.Second
+	var layer raft.StreamLayer
+	var err error
 	if !cfg.InternalUseTLS {
-		return raft.NewTCPTransport(bindAddress, advertised, 3, timeout, os.Stderr)
+		layer, err = newRaftTCPStreamLayer(bindAddress, advertised)
+	} else {
+		layer, err = newRaftTLSStreamLayer(bindAddress, advertised, cfg.InternalServerTLSConfig(), cfg.InternalClientTLSConfig())
 	}
-
-	layer, err := newRaftTLSStreamLayer(bindAddress, advertised, cfg.InternalServerTLSConfig(), cfg.InternalClientTLSConfig())
 	if err != nil {
 		return nil, err
 	}

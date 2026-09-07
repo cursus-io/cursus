@@ -3,6 +3,7 @@ package replication
 import (
 	"testing"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,4 +18,15 @@ func TestRaftAdvertiseAddrRejectsInvalidAddress(t *testing.T) {
 		_, err := newRaftAdvertiseAddr(address)
 		require.Error(t, err, address)
 	}
+}
+
+func TestRaftNetworkTransportPreservesDNSHostWithoutTLS(t *testing.T) {
+	advertised, err := newRaftAdvertiseAddr("broker-1:9001")
+	require.NoError(t, err)
+
+	transport, err := newRaftNetworkTransport(&config.Config{}, "127.0.0.1:0", advertised)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+
+	require.Equal(t, "broker-1:9001", string(transport.LocalAddr()))
 }
