@@ -31,7 +31,7 @@ func TestHelmSDKPersistence(t *testing.T) {
 	cfg.UseTLS = true
 	cfg.TLSCertPath, cfg.TLSKeyPath = "/tls/tls.crt", "/tls/tls.key"
 	cfg.Principal, cfg.AuthToken = "runtime-test", os.Getenv("HELM_AUTH_TOKEN")
-	producer, err := sdk.NewProducerWithContext(ctx, cfg)
+	producer, err := newProducerAfterRecovery(ctx, cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, producer.Close()) })
 	first, total := 0, 60
@@ -97,6 +97,24 @@ func TestHelmSDKPersistence(t *testing.T) {
 			require.NoError(t, <-finished)
 			t.Logf("%s: verified %d distinct records across %d partitions", phase, total, len(partitions))
 			return
+		}
+	}
+}
+
+func newProducerAfterRecovery(ctx context.Context, cfg *sdk.PublisherConfig) (*sdk.Producer, error) {
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+	for {
+		producer, err := sdk.NewProducerWithContext(ctx, cfg)
+		if err == nil {
+			return producer, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-deadline.C:
+			return nil, err
+		case <-time.After(250 * time.Millisecond):
 		}
 	}
 }
