@@ -25,7 +25,9 @@ having their error logs suppressed.
   release the ordered lane; their error code is preserved for the producer.
 - A leader or lifecycle fence is terminal for the current request.
 - An idempotent duplicate is acknowledged only when its original offset is
-  below the committed HWM under the same replication fence.
+  below the committed HWM under the same replication fence. If a broker restart
+  discarded the original in-memory replication task, the duplicate reloads the
+  original durable record and resumes ISR replication before advancing the HWM.
 - Client cancellation may stop waiting for an acknowledgement, but it does not
   abandon an already durable local append. A later idempotent retry resolves the
   ambiguous result without acknowledging uncommitted data.

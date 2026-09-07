@@ -18,7 +18,6 @@ import (
 )
 
 var errReplicationQueueClosed = errors.New("replication queue closed")
-var errDuplicateCommitPending = errors.New("duplicate producer sequence is not committed")
 
 type partitionReplicationTask struct {
 	topic        string
@@ -26,7 +25,7 @@ type partitionReplicationTask struct {
 	command      types.MessageCommand
 	commitHWM    uint64
 	ackMode      ackpolicy.Mode
-	barrierOnly  bool
+	duplicate    bool
 	snapshot     clusterController.PartitionReplicationSnapshot
 	partitionRef *topic.Partition
 	result       chan error
@@ -261,14 +260,12 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 		}
 
 		snapshot, err := l.replicationSnapshot(task)
-		if err == nil && task.barrierOnly {
+		if err == nil && task.duplicate {
 			if task.partitionRef == nil {
-				err = fmt.Errorf("%w: partition is unavailable", errDuplicateCommitPending)
+				err = errors.New("duplicate producer sequence partition is unavailable")
 			} else {
 				committedHWM := task.partitionRef.GetHWM()
-				if committedHWM < task.commitHWM {
-					err = fmt.Errorf("%w: committed_hwm=%d required_hwm=%d", errDuplicateCommitPending, committedHWM, task.commitHWM)
-				} else {
+				if committedHWM >= task.commitHWM {
 					completeReplicationTask(task, nil)
 					if failures > 0 {
 						util.Info("partition replication recovered topic=%s partition=%d ack_mode=%s attempts=%d", task.topic, task.partition, task.ackMode, failures+1)
@@ -384,7 +381,7 @@ func isRetryableReplicationError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, errDuplicateCommitPending) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 	var classified classifiedReplicationError
@@ -415,8 +412,6 @@ func replicationErrorClass(err error) string {
 		return "cancelled"
 	case errors.Is(err, errReplicationQueueClosed):
 		return "shutdown"
-	case errors.Is(err, errDuplicateCommitPending):
-		return "commit_pending"
 	default:
 		return "replication"
 	}

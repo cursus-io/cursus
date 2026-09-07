@@ -174,7 +174,7 @@ func TestLeaderAcknowledgementQueuesReplicationWithoutWaiting(t *testing.T) {
 	require.Eventually(t, func() bool { return executor.committed() == 1 }, time.Second, time.Millisecond)
 }
 
-func TestIdempotentDuplicateBarrierDoesNotReplicateOrCommit(t *testing.T) {
+func TestIdempotentDuplicateResumesReplicationBeforeAcknowledging(t *testing.T) {
 	handler, manager, executor := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
 	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
@@ -187,21 +187,24 @@ func TestIdempotentDuplicateBarrierDoesNotReplicateOrCommit(t *testing.T) {
 	reservation, err := handler.replication.reserve(context.Background(), "orders", 0)
 	require.NoError(t, err)
 	task := replicationTaskForMode(executor, ackpolicy.All)
-	task.barrierOnly = true
+	task.duplicate = true
 	task.partitionRef = partition
+	task.command = types.MessageCommand{Topic: "orders", Partition: 0, Messages: []types.Message{{Offset: 0, Payload: "value", ProducerID: "p1", Epoch: 7, SeqNum: 1}}}
 	reservation.submit(task)
 
+	<-executor.started
 	select {
 	case err := <-task.result:
 		t.Fatalf("duplicate acknowledgement crossed the HWM before commit: %v", err)
-	case <-time.After(75 * time.Millisecond):
+	default:
 	}
-	require.NoError(t, partition.ApplyReplicaHWM(1))
+	close(executor.barrier)
 	require.NoError(t, <-task.result)
 	executor.mu.Lock()
-	require.Zero(t, executor.replicateCalls)
+	require.Equal(t, 1, executor.replicateCalls)
 	executor.mu.Unlock()
-	require.Zero(t, executor.committed())
+	require.Equal(t, uint64(1), executor.committed())
+	require.Equal(t, uint64(1), partition.GetHWM())
 }
 
 func TestAllAcknowledgementRetriesTransientFollowerFailureBeforeResponding(t *testing.T) {
