@@ -96,7 +96,7 @@ func TestEventStoreDoesNotRedirectAfterEnvelopeOrToInvalidLeader(t *testing.T) {
 		name, leader string
 		body         bool
 	}{
-		{name: "missing leader"}, {name: "invalid port", leader: "localhost:99999"},
+		{name: "missing leader"}, {name: "invalid port", leader: "localhost:99999"}, {name: "unbracketed IPv6", leader: "::1:9000"},
 		{name: "body error", leader: "localhost:1", body: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
