@@ -24,6 +24,9 @@ having their error logs suppressed.
 - Structured non-retryable replica responses are returned immediately and
   release the ordered lane; their error code is preserved for the producer.
 - A leader or lifecycle fence is terminal for the current request.
+- A follower's retryable routing response during metadata convergence is not
+  treated as proof that the local leader fence changed; the lane retries and
+  rechecks its Raft-authoritative local fence before commit.
 - An idempotent duplicate is acknowledged only when its original offset is
   below the committed HWM under the same replication fence. If a broker restart
   discarded the original in-memory replication task, the duplicate reloads the

@@ -340,6 +340,19 @@ func (e *replicaResponseError) ReplicationErrorClass() string {
 	return string(e.class)
 }
 
+func classifiedReplicaResponseError(brokerID, response string) error {
+	parsed, ok := protocol.ParseErrorResponse(response)
+	if !ok {
+		return fmt.Errorf("replica %s rejected append: %s", brokerID, response)
+	}
+	return fmt.Errorf("replica %s rejected append: %w", brokerID, &replicaResponseError{
+		response:  response,
+		code:      parsed.Code,
+		class:     parsed.Class,
+		retryable: parsed.Retryable,
+	})
+}
+
 func (cc *ClusterController) replicateToReplicaSet(topic string, partition int, msgCmd types.MessageCommand, snapshot PartitionReplicationSnapshot, targets []string, required bool) error {
 	current, err := cc.GetPartitionReplicationSnapshot(topic, partition)
 	if err != nil {
@@ -387,17 +400,8 @@ func (cc *ClusterController) replicateToReplicaSet(topic string, partition int, 
 			var targetErr error
 			if forwardErr != nil {
 				targetErr = fmt.Errorf("replica %s append failed: %w", brokerID, forwardErr)
-			} else if replicaFenceResponse(resp) {
-				targetErr = fmt.Errorf("%w: replica %s rejected append: %s", ErrPartitionLeaderFenced, brokerID, resp)
-			} else if parsed, ok := protocol.ParseErrorResponse(resp); ok {
-				targetErr = fmt.Errorf("replica %s rejected append: %w", brokerID, &replicaResponseError{
-					response:  resp,
-					code:      parsed.Code,
-					class:     parsed.Class,
-					retryable: parsed.Retryable,
-				})
 			} else {
-				targetErr = fmt.Errorf("replica %s rejected append: %s", brokerID, resp)
+				targetErr = classifiedReplicaResponseError(brokerID, resp)
 			}
 			if required {
 				return targetErr
@@ -411,16 +415,6 @@ func (cc *ClusterController) replicateToReplicaSet(topic string, partition int, 
 		}
 	}
 	return replicationErr
-}
-
-func replicaFenceResponse(response string) bool {
-	fields := strings.Fields(strings.TrimSpace(response))
-	if len(fields) < 2 || !strings.EqualFold(fields[0], "ERROR:") {
-		return false
-	}
-	code := strings.ToUpper(fields[1])
-	return code == "NOT_PARTITION_LEADER" || code == "STALE_LEADER_EPOCH" ||
-		code == "STALE_TOPIC_LIFECYCLE_EPOCH" || code == "MISSING_TOPIC_LIFECYCLE_EPOCH"
 }
 
 func containsBroker(brokers []string, wanted string) bool {

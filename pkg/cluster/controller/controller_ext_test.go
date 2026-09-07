@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
@@ -114,10 +115,22 @@ func TestReplicateToFollowersRejectsStalePartitionLeader(t *testing.T) {
 	require.ErrorIs(t, err, ErrPartitionLeaderFenced)
 }
 
-func TestReplicaFenceResponseMatchesExactWireCodes(t *testing.T) {
-	require.True(t, replicaFenceResponse("ERROR: NOT_PARTITION_LEADER current=node2"))
-	require.True(t, replicaFenceResponse("ERROR: STALE_LEADER_EPOCH current=8"))
-	require.False(t, replicaFenceResponse("ERROR: replica failed because NOT_PARTITION_LEADER was logged"))
+func TestReplicaResponsePreservesWireRetryClassification(t *testing.T) {
+	retryable := classifiedReplicaResponseError("node2", "ERROR: NOT_PARTITION_LEADER current=node2")
+	var retryableClassification interface{ Retryable() bool }
+	require.ErrorAs(t, retryable, &retryableClassification)
+	require.True(t, retryableClassification.Retryable())
+	require.False(t, errors.Is(retryable, ErrPartitionLeaderFenced))
+
+	terminal := classifiedReplicaResponseError("node2", "ERROR: STALE_LEADER_EPOCH current=8")
+	var terminalClassification interface{ Retryable() bool }
+	require.ErrorAs(t, terminal, &terminalClassification)
+	require.False(t, terminalClassification.Retryable())
+
+	malformed := classifiedReplicaResponseError("node2", "ERROR: replica failed because NOT_PARTITION_LEADER was logged")
+	var malformedClassification interface{ Retryable() bool }
+	require.ErrorAs(t, malformed, &malformedClassification)
+	require.False(t, malformedClassification.Retryable())
 }
 
 func TestReplicateToFollowersRequiresConfiguredMinimumISR(t *testing.T) {
