@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestValidateClientAuthenticationRequiresExplicitPermissions(t *testing.T) {
@@ -13,6 +15,18 @@ func TestValidateClientAuthenticationRequiresExplicitPermissions(t *testing.T) {
 	if err := cfg.ValidateClientAuthentication(); err == nil || !strings.Contains(err.Error(), "requires at least one permission") {
 		t.Fatalf("ValidateClientAuthentication() error = %v, want missing permission", err)
 	}
+}
+
+func TestOverrideEnvSASLUsersAcceptsStrictJSONSecret(t *testing.T) {
+	t.Setenv("TEST_SASL_USERS", `[{"principal":"processor","token":"secret","permissions":["topic.read","group"]}]`)
+	var users []SASLUser
+	require.NoError(t, overrideEnvSASLUsers(&users, "TEST_SASL_USERS"))
+	require.Equal(t, []SASLUser{{Principal: "processor", Token: "secret", Permissions: []string{"topic.read", "group"}}}, users)
+
+	t.Setenv("TEST_SASL_USERS", `[{"principal":"processor","token":"secret","permissions":["group"],"unexpected":true}]`)
+	require.ErrorContains(t, overrideEnvSASLUsers(&users, "TEST_SASL_USERS"), "unknown field")
+	t.Setenv("TEST_SASL_USERS", `[{"principal":"processor"}] trailing`)
+	require.ErrorContains(t, overrideEnvSASLUsers(&users, "TEST_SASL_USERS"), "trailing data")
 }
 
 func TestValidateClientAuthenticationAcceptsKnownPermissions(t *testing.T) {
