@@ -17,6 +17,12 @@ data:
     max_internal_request_bytes: {{ .Values.limits.maxInternalRequestBytes }}
     enabled_distribution: {{ eq .Values.mode "cluster" }}
     {{- if eq .Values.mode "cluster" }}
+    min_insync_replicas: {{ .Values.cluster.minInSyncReplicas }}
+    {{- else }}
+    min_insync_replicas: 1
+    {{- end }}
+    default_replication_factor: {{ .Values.replicaCount }}
+    {{- if eq .Values.mode "cluster" }}
     bootstrap_cluster: true
     internal_use_tls: true
     internal_tls_cert_path: /app/internal-tls/tls.crt
@@ -25,8 +31,6 @@ data:
     internal_broker_port: {{ .Values.cluster.internalPort }}
     raft_port: {{ .Values.cluster.raftPort }}
     discovery_port: {{ .Values.cluster.discoveryPort }}
-    min_insync_replicas: {{ .Values.cluster.minInSyncReplicas }}
-    default_replication_factor: {{ .Values.replicaCount }}
     static_cluster_members:
       {{- range $i := until (int .Values.replicaCount) }}
       {{- $host := printf "%s-%d.%s-headless.%s.svc.%s" (include "cursus.fullname" $) $i (include "cursus.fullname" $) $.Release.Namespace $.Values.cluster.domain }}
