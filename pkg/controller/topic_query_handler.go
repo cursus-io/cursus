@@ -183,9 +183,9 @@ func (ch *CommandHandler) handleMetadata(cmd string) string {
 		}
 	}
 
-	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d revision=%d replication_factor=%d idempotent=%t event_sourcing=%t lifecycle_epoch=%d %s",
+	return fmt.Sprintf("OK topic=%s partitions=%d leaders=%s epochs=%s cleanup_policy=%s partitioner=%s auth_policy=%s read_acl=%s write_acl=%s retention_hours=%d retention_bytes=%d revision=%d replication_factor=%d idempotent=%t event_sourcing=%t lifecycle_epoch=%d %s aggregate_replay=%t",
 		topicName, partitionCount, strings.Join(leaders, ","), strings.Join(epochs, ","), definition.Policy.CleanupPolicy, definition.Policy.Partitioner,
 		definition.Policy.AuthPolicy, strings.Join(definition.Policy.ReadACL, ","), strings.Join(definition.Policy.WriteACL, ","),
 		definition.Policy.RetentionHours, definition.Policy.RetentionBytes, definition.Revision, definition.ReplicationFactor,
-		definition.Idempotent, definition.EventSourcing, definition.LifecycleEpoch, ch.topicMinISRMetadata(definition.Policy))
+		definition.Idempotent, definition.EventSourcing, definition.LifecycleEpoch, ch.topicMinISRMetadata(definition.Policy), definition.Policy.AggregateReplay)
 }

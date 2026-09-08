@@ -65,7 +65,7 @@ func TestDeserializeMessage_ErrorCases(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "producer ID")
 
-	// DeserializeDiskMessage: [CDM2] [2 bytes topic length] [topic...] [4 bytes partition] ...
+	// DeserializeDiskMessage: [CDM3] [2 bytes topic length] [topic...] [4 bytes partition] ...
 	_, err = DeserializeDiskMessage([]byte{'C', 'D', 'M', '2', 0, 5, 't', 'e', 's', 't', '1'}) // claims 5 bytes topic, OK, but missing partition
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "partition")
@@ -73,6 +73,18 @@ func TestDeserializeMessage_ErrorCases(t *testing.T) {
 	// Large claims that exceed buffer
 	_, err = DeserializeMessage([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255})
 	assert.Error(t, err)
+}
+
+func TestDeserializeDiskMessageSupportsV2RecordsWithoutReplayIdentity(t *testing.T) {
+	data, err := SerializeDiskMessage(types.DiskMessage{Topic: "orders", Payload: "created"})
+	assert.NoError(t, err)
+	legacy := append([]byte("CDM2"), data[4:len(data)-4]...)
+
+	got, err := DeserializeDiskMessage(legacy)
+	assert.NoError(t, err)
+	assert.Equal(t, "orders", got.Topic)
+	assert.Empty(t, got.EventID)
+	assert.Empty(t, got.PayloadDigest)
 }
 
 func TestDiskMessageSerialization_WithEventSourcingFields(t *testing.T) {

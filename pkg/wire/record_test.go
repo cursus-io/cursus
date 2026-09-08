@@ -13,6 +13,7 @@ func fullMessage() wire.Message {
 		Topic: "orders", Partition: 3, Offset: 42, Timestamp: 1_725_000_000_123,
 		ProducerID: "producer-1", SeqNum: 9, Epoch: 4, Key: "order-7", Payload: `{"status":"paid"}`,
 		EventType: "OrderPaid", SchemaVersion: 2, AggregateVersion: 11, Metadata: `{"trace":"abc"}`,
+		EventID: "event-11", PayloadDigest: "sha256:example",
 		TransactionalID: "txn-1", TransactionState: wire.TransactionStateCommitted,
 		TransactionMarker: wire.TransactionMarkerCommit, ControlBatchType: wire.ControlBatchTransaction,
 		ControlBatchVersion: wire.ControlBatchVersionCursusV2, ControlBatchCoordinatorEpoch: 8,
@@ -64,6 +65,8 @@ func TestBatchRoundTripUsesWireV2AndRejectsLegacyMagic(t *testing.T) {
 	require.Equal(t, wire.TransactionStateCommitted, got.Messages[0].TransactionState)
 	require.Equal(t, wire.TransactionMarkerCommit, got.Messages[0].TransactionMarker)
 	require.Equal(t, []byte{3, 4, 5}, got.Messages[0].ControlBatchValue)
+	require.Equal(t, "event-11", got.Messages[0].EventID)
+	require.Equal(t, "sha256:example", got.Messages[0].PayloadDigest)
 }
 
 func TestRecordRejectsUnknownTransactionEnumsAndTrailingData(t *testing.T) {

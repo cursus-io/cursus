@@ -23,6 +23,7 @@ type DefinitionPatch struct {
 	ReplicationFactor *int      `json:"replication_factor,omitempty"`
 	Idempotent        *bool     `json:"idempotent,omitempty"`
 	EventSourcing     *bool     `json:"event_sourcing,omitempty"`
+	AggregateReplay   *bool     `json:"aggregate_replay,omitempty"`
 	MinInSyncReplicas *int      `json:"min_in_sync_replicas,omitempty"`
 	CleanupPolicy     *string   `json:"cleanup_policy,omitempty"`
 	RetentionHours    *int      `json:"retention_hours,omitempty"`
@@ -115,6 +116,17 @@ func MergeDefinitionPatch(current Definition, patch DefinitionPatch, existing bo
 		}
 		next.EventSourcing = *patch.EventSourcing
 	}
+	if patch.AggregateReplay != nil {
+		if existing && *patch.AggregateReplay != base.Policy.AggregateReplay {
+			return current, fmt.Errorf(
+				"aggregate_replay mode is immutable for existing topic %q: current=%t requested=%t",
+				base.Name,
+				base.Policy.AggregateReplay,
+				*patch.AggregateReplay,
+			)
+		}
+		next.Policy.AggregateReplay = *patch.AggregateReplay
+	}
 	if patch.MinInSyncReplicas != nil {
 		value := *patch.MinInSyncReplicas
 		next.Policy.MinInSyncReplicas = &value
@@ -139,6 +151,13 @@ func MergeDefinitionPatch(current Definition, patch DefinitionPatch, existing bo
 	}
 	if patch.WriteACL != nil {
 		next.Policy.WriteACL = append([]string(nil), (*patch.WriteACL)...)
+	}
+	if next.Policy.AggregateReplay {
+		// A replay proof relies on append-only aggregate ordering and on stable
+		// producer identity. Keep those prerequisites inseparable from the
+		// opt-in profile instead of depending on every caller to restate them.
+		next.EventSourcing = true
+		next.Idempotent = true
 	}
 
 	next, err = next.Normalize()

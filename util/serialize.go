@@ -147,13 +147,16 @@ var diskMsgBufPool = sync.Pool{
 	},
 }
 
-const diskMessageMagic = "CDM2"
+const (
+	diskMessageMagic       = "CDM3"
+	legacyDiskMessageMagic = "CDM2"
+)
 
 // EstimateDiskMessageSize returns the serialized size of a DiskMessage without allocating.
 func EstimateDiskMessageSize(msg types.DiskMessage) int {
 	return len(diskMessageMagic) + 2 + len(msg.Topic) + 4 + 8 + 2 + len(msg.ProducerID) + 8 + 8 +
 		4 + len(msg.Payload) + 2 + len(msg.Key) +
-		2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata) + 2 + len(msg.TransactionalID) + 2 + len(msg.TransactionState) + 2 + len(msg.TransactionMarker) + 2 + len(msg.ControlBatchType) + 2 + 8 + 2 + len(msg.ControlBatchKey) + 2 + len(msg.ControlBatchValue)
+		2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata) + 2 + len(msg.TransactionalID) + 2 + len(msg.TransactionState) + 2 + len(msg.TransactionMarker) + 2 + len(msg.ControlBatchType) + 2 + 8 + 2 + len(msg.ControlBatchKey) + 2 + len(msg.ControlBatchValue) + 2 + len(msg.EventID) + 2 + len(msg.PayloadDigest)
 }
 
 // SerializeDiskMessage serializes a DiskMessage for disk storage
@@ -209,6 +212,14 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	controlBatchValueLen, ok := SafeIntToUint16(len(msg.ControlBatchValue))
 	if !ok {
 		return nil, fmt.Errorf("controlBatchValue too long: %d", len(msg.ControlBatchValue))
+	}
+	eventIDLen, ok := SafeIntToUint16(len(msg.EventID))
+	if !ok {
+		return nil, fmt.Errorf("event ID too long: %d", len(msg.EventID))
+	}
+	digestLen, ok := SafeIntToUint16(len(msg.PayloadDigest))
+	if !ok {
+		return nil, fmt.Errorf("payload digest too long: %d", len(msg.PayloadDigest))
 	}
 	epochVal, ok := SafeInt64ToUint64(msg.Epoch)
 	if !ok {
@@ -316,6 +327,12 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	binary.BigEndian.PutUint16(tmp[:2], controlBatchValueLen)
 	buf = append(buf, tmp[:2]...)
 	buf = append(buf, msg.ControlBatchValue...)
+	binary.BigEndian.PutUint16(tmp[:2], eventIDLen)
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.EventID...)
+	binary.BigEndian.PutUint16(tmp[:2], digestLen)
+	buf = append(buf, tmp[:2]...)
+	buf = append(buf, msg.PayloadDigest...)
 
 	// Return a copy so the pooled buffer can be reused
 	result := make([]byte, len(buf))
@@ -329,7 +346,11 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 // DeserializeDiskMessage deserializes bytes back to DiskMessage
 func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	var msg types.DiskMessage
-	if len(data) < len(diskMessageMagic) || string(data[:len(diskMessageMagic)]) != diskMessageMagic {
+	if len(data) < len(diskMessageMagic) {
+		return msg, fmt.Errorf("unsupported disk message format: clean bootstrap required")
+	}
+	magic := string(data[:len(diskMessageMagic)])
+	if magic != diskMessageMagic && magic != legacyDiskMessageMagic {
 		return msg, fmt.Errorf("unsupported disk message format: clean bootstrap required")
 	}
 	offset := len(diskMessageMagic)
@@ -468,6 +489,14 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	}
 	if err := readDiskBytes(data, &offset, &msg.ControlBatchValue, "control batch value"); err != nil {
 		return msg, err
+	}
+	if magic == diskMessageMagic {
+		if err := readDiskString(data, &offset, &msg.EventID, "event ID"); err != nil {
+			return msg, err
+		}
+		if err := readDiskString(data, &offset, &msg.PayloadDigest, "payload digest"); err != nil {
+			return msg, err
+		}
 	}
 	if offset != len(data) {
 		return msg, fmt.Errorf("disk message has %d trailing bytes", len(data)-offset)
