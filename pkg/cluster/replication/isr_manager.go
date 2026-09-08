@@ -119,6 +119,26 @@ func (i *ISRManager) UpdateHeartbeat(brokerID string) {
 	i.lastSeen[brokerID] = time.Now()
 }
 
+// IsBrokerAlive reports heartbeat liveness with a leadership grace period so
+// a newly elected leader does not immediately deactivate peers before it has
+// had a chance to observe their heartbeats.
+func (i *ISRManager) IsBrokerAlive(brokerID string) bool {
+	if brokerID == "" {
+		return false
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	if brokerID == i.brokerID {
+		return true
+	}
+	now := time.Now()
+	if !i.leaderSince.IsZero() && now.Sub(i.leaderSince) <= i.heartbeatTimeout {
+		return true
+	}
+	lastSeen, ok := i.lastSeen[brokerID]
+	return ok && now.Sub(lastSeen) <= i.heartbeatTimeout
+}
+
 func (i *ISRManager) BuildCatchupProofs() []fsm.ISRCatchupProof {
 	if i.fsm == nil {
 		return nil

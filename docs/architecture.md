@@ -238,14 +238,14 @@ graph TB
 |---|---|---|---|
 | Any broker | Any node | Config | `FIND_COORDINATOR`, `METADATA`, `CREATE`, `LIST` |
 | Group coordinator | Per group | `FIND_COORDINATOR group=<group>` | `JOIN_GROUP`, `SYNC_GROUP`, `LEAVE_GROUP`, `HEARTBEAT`, `COMMIT_OFFSET`, `BATCH_COMMIT`, `FETCH_OFFSET` |
-| Transaction coordinator | Per transactional id | `FIND_COORDINATOR transactional_id=<id>` | `INIT_PRODUCER_ID`, `BEGIN_TXN`, `TXN_PUBLISH`, `SEND_OFFSETS_TO_TXN`, `END_TXN`, `TXN_STATUS` |
+| Transaction coordinator | Per logical transaction shard | `FIND_COORDINATOR transactional_id=<id>` | `INIT_PRODUCER_ID`, `BEGIN_TXN`, `TXN_PUBLISH`, `SEND_OFFSETS_TO_TXN`, `END_TXN`, `TXN_STATUS` |
 | Partition leader | Per-partition | `METADATA` | `CONSUME`, `STREAM`, `PUBLISH` |
 
 ### Transaction Visibility Boundary
 
-Transactional output follows the normal partition-leader publish and replication path. A prepared commit writes idempotent records, appends a marker to every touched partition, applies one fenced bulk consumer offset scope, and then persists the final transaction decision. `read_committed` requires both the marker and matching final coordinator decision. A restored `committing` transaction is retried during startup recovery from the standalone journal or distributed metadata snapshot; records remain hidden until recovery completes.
+Transactional output follows the normal partition-leader publish and replication path when sent, but remains unresolved and invisible to `read_committed`. While the transaction is still open, commit appends its staged multi-topic offsets as transactional records in `__consumer_offsets` and registers those internal partitions as participants. It then durably prepares, appends markers to every output and offset partition, and persists the final decision. Output and offsets become visible only from that committed decision; a committed offset is then materialized as an ordinary revised snapshot for long-term recovery. Transactional IDs map to a stable set of logical coordinator shards (50 by default) whose count, owners, and fencing epochs are stored in Raft metadata. The count is fixed when the cluster is created; a broker configured with a different count is rejected before joining. A new shard owner retries prepared commit or abort work, while the previous owner is rejected by its stale coordinator epoch. Each owner also resolves timed-out transactions for its shards, so recovery work is distributed across active brokers.
 
-This contract covers broker records and one source consumer scope. It does not include external database, HTTP, or filesystem side effects.
+This is exactly-once processing inside the Cursus broker boundary for one fenced consumer group session. It does not include external database, HTTP, or filesystem side effects.
 
 ### Coordinator Pattern
 
@@ -301,7 +301,7 @@ sequenceDiagram
 
 ### Raft Consensus
 
-In distributed mode, authoritative group and transaction metadata changes are persisted through the Raft FSM and snapshots. A logical group or transaction coordinator may differ from the Raft leader; `applyViaLeader` forwards the metadata mutation through the authenticated broker-internal path before it is considered durable. Standalone consumer offsets use the internal offset log, while standalone transaction snapshots use an append-only fsynced journal under `log_dir`. The final transaction snapshot is persisted before the in-memory decision opens `read_committed` visibility.
+In distributed mode, authoritative group and transaction-coordinator changes are persisted through the Raft FSM and snapshots. Consumer offsets are different: new ordinary and transactional offset writes use the replicated `__consumer_offsets` partition log in both standalone and distributed modes. `OFFSET_SYNC` and `BATCH_OFFSET` remain decodable only to replay older metadata logs. Standalone transaction snapshots use an append-only fsynced journal under `log_dir`. The final transaction snapshot is persisted before its decision opens `read_committed` output and offset visibility.
 
 Current distributed storage uses Raft snapshot format 9 and requires explicit
 committed-HWM provenance. Older, unmarked, or ambiguous persistent state is a

@@ -9,10 +9,6 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
-func transactionCoordinatorKey(txnID string) string {
-	return "txn:" + txnID
-}
-
 func parseTxnProducerEpoch(args map[string]string, command string) (string, int64, string) {
 	producerID := firstNonEmpty(args["producerId"], args["producer_id"])
 	if producerID == "" {

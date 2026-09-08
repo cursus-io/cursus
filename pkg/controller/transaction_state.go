@@ -69,7 +69,11 @@ func (ch *CommandHandler) syncTransactionState(txnID string) error {
 		}
 		return nil
 	}
-	_, err := ch.applyViaLeader("TXN_SYNC", map[string]interface{}{"transaction": snapshot})
+	payload, err := ch.transactionSyncPayload(snapshot)
+	if err != nil {
+		return err
+	}
+	_, err = ch.applyViaLeader("TXN_SYNC", payload)
 	return err
 }
 
@@ -91,7 +95,11 @@ func (ch *CommandHandler) abortTransactionDecision(txnID, producerID string, epo
 
 func (ch *CommandHandler) persistFinalTransactionDecision(snapshot *transaction.Snapshot) error {
 	if ch.isDistributed() {
-		_, err := ch.applyViaLeader("TXN_SYNC", map[string]interface{}{"transaction": snapshot})
+		payload, err := ch.transactionSyncPayload(snapshot)
+		if err != nil {
+			return err
+		}
+		_, err = ch.applyViaLeader("TXN_SYNC", payload)
 		return err
 	}
 	if ch.txnJournal != nil {
@@ -100,4 +108,28 @@ func (ch *CommandHandler) persistFinalTransactionDecision(snapshot *transaction.
 		}
 	}
 	return ch.TxnManager.ApplyReplicatedSnapshot(snapshot)
+}
+
+func (ch *CommandHandler) transactionSyncPayload(snapshot *transaction.Snapshot) (map[string]interface{}, error) {
+	payload := map[string]interface{}{"transaction": snapshot}
+	if snapshot == nil || snapshot.Mode != transaction.ModeProcessingV1 || !ch.isDistributed() {
+		return payload, nil
+	}
+	if ch.Cluster.Router == nil {
+		return nil, fmt.Errorf("transaction coordinator router is unavailable")
+	}
+	owner, _, epoch, err := ch.Cluster.Router.FindTransactionCoordinator(snapshot.ID)
+	if err != nil {
+		return nil, err
+	}
+	localOwner := ch.Cluster.Router.BrokerID()
+	if owner != localOwner || snapshot.CoordinatorEpoch != epoch {
+		return nil, fmt.Errorf(
+			"transaction coordinator fenced transactional_id=%s current_owner=%s current_epoch=%d local_owner=%s local_epoch=%d",
+			snapshot.ID, owner, epoch, localOwner, snapshot.CoordinatorEpoch,
+		)
+	}
+	payload["coordinator_owner"] = owner
+	payload["coordinator_epoch"] = epoch
+	return payload, nil
 }

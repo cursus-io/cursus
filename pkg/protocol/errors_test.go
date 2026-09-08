@@ -53,6 +53,7 @@ func TestClassifyFencingAndAvailability(t *testing.T) {
 		{"producer_fenced", ErrorClassFencing, false},
 		{"transaction_manager_not_available", ErrorClassAvailability, true},
 		{"replication_unavailable", ErrorClassAvailability, true},
+		{"replica_offset_gap", ErrorClassAvailability, true},
 		{"authentication_failed", ErrorClassAuthorization, false},
 		{"coordinator_not_available", ErrorClassAvailability, true},
 		{"cluster_metadata_unavailable", ErrorClassAvailability, true},

@@ -237,7 +237,9 @@ The broker allocates and fences the producer ID and epoch. The high-level
 producer retains that session across reconnects and serializes lifecycle calls.
 A successful `Commit` or `Abort` consumes the current epoch; the next `Begin`
 automatically reinitializes the session and obtains a higher epoch. Retrying an
-uncertain finalization continues to use the same epoch, preserving idempotency. Once the broker reports `state=committing`, retry `Commit`; do not switch that epoch to abort.
+uncertain finalization continues to use the same epoch, preserving idempotency. Once the broker reports `state=prepare_commit`, retry `Commit`; do not switch that epoch to abort.
+
+For multi-topic input, register with `RegisterGroupSubscription`, join with `JoinGroupSubscription`, and stage all offsets with `SendTopicOffsets`. Returned `sdk.Message` values include `Topic` and `Partition` so handlers can preserve source identity. Exactly-once processing covers Cursus offsets and Cursus output records; external effects are not included.
 
 `NOT_COORDINATOR` responses update a per-transaction coordinator cache and are
 retried with a bounded delay. Fencing, authorization, validation, and ambiguous

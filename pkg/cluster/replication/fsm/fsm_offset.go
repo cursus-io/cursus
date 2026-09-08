@@ -43,12 +43,14 @@ func (f *BrokerFSM) applyOffsetSyncCommand(jsonData string) interface{} {
 
 func (f *BrokerFSM) applyBatchOffsetSyncCommand(jsonData string) interface{} {
 	var cmd struct {
-		ReqID      string                   `json:"req_id,omitempty"`
-		Group      string                   `json:"group"`
-		Topic      string                   `json:"topic"`
-		Member     string                   `json:"member"`
-		Generation *int                     `json:"generation"`
-		Offsets    []coordinator.OffsetItem `json:"offsets"`
+		ReqID             string                              `json:"req_id,omitempty"`
+		Group             string                              `json:"group"`
+		Topic             string                              `json:"topic"`
+		Member            string                              `json:"member"`
+		Generation        *int                                `json:"generation"`
+		Offsets           []coordinator.OffsetItem            `json:"offsets"`
+		OffsetsByTopic    map[string][]coordinator.OffsetItem `json:"offsets_by_topic"`
+		RegistrationEpoch uint64                              `json:"registration_epoch"`
 	}
 
 	if err := decodeStrictJSON([]byte(jsonData), &cmd); err != nil {
@@ -60,6 +62,12 @@ func (f *BrokerFSM) applyBatchOffsetSyncCommand(jsonData string) interface{} {
 		err := fmt.Errorf("FSM: Coordinator is nil (skipping batch offset update)")
 		util.Error("%v", err)
 		return err
+	}
+	if len(cmd.OffsetsByTopic) > 0 {
+		if cmd.Member == "" || cmd.Generation == nil {
+			return fmt.Errorf("multi-topic offset update requires member and generation")
+		}
+		return f.cd.ApplyFencedTopicOffsetUpdateFromFSM(cmd.Group, cmd.Member, *cmd.Generation, cmd.RegistrationEpoch, cmd.OffsetsByTopic)
 	}
 
 	if cmd.Group == "" || cmd.Topic == "" || cmd.Member == "" || cmd.Generation == nil {

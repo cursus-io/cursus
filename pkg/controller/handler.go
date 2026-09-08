@@ -36,7 +36,6 @@ type CommandHandler struct {
 
 	coordCache               map[string]coordCacheEntry
 	coordCacheMu             sync.RWMutex
-	txnApplyMu               sync.Mutex
 	topicLifecycleMu         sync.RWMutex
 	topicCreateMu            sync.Mutex
 	txnJournal               *transaction.Journal
@@ -63,6 +62,20 @@ func transactionalIDExpiration(cfg *config.Config) time.Duration {
 		return 7 * 24 * time.Hour
 	}
 	return time.Duration(cfg.TransactionalIDExpirationMS) * time.Millisecond
+}
+
+func transactionTimeout(cfg *config.Config) time.Duration {
+	if cfg == nil || cfg.TransactionTimeoutMS <= 0 {
+		return 60 * time.Second
+	}
+	return time.Duration(cfg.TransactionTimeoutMS) * time.Millisecond
+}
+
+func transactionCoordinatorShardCount(cfg *config.Config) int {
+	if cfg == nil || cfg.TransactionCoordinatorShards <= 0 {
+		return transaction.DefaultCoordinatorShardCount
+	}
+	return cfg.TransactionCoordinatorShards
 }
 
 // commandEntry defines a single command routing rule.
@@ -107,13 +120,19 @@ func NewCommandHandler(
 		coordCache:    make(map[string]coordCacheEntry),
 		Cluster:       cc,
 		ESHandler:     eventsource.NewHandler(tm),
-		TxnManager:    transaction.NewManagerWithExpiration(transactionalIDExpiration(cfg)),
+		TxnManager:    transaction.NewManagerWithExpirationAndShards(transactionalIDExpiration(cfg), transactionCoordinatorShardCount(cfg)),
 	}
 	if tm != nil {
 		tm.SetTransactionDecisionResolver(ch.TxnManager)
 		tm.SetDeleteHook(ch.ESHandler.DeleteTopic)
 		if cfg != nil && cfg.EnabledDistribution {
 			tm.SetDistributedCompactionGate(ch.distributedCompactionAllowed)
+		}
+	}
+	if cd != nil {
+		cd.SetTransactionalOffsetResolver(ch.TxnManager)
+		if ch.isDistributed() {
+			cd.SetOffsetRecordWriter(ch.writeConsumerOffsetRecord)
 		}
 	}
 	if cc != nil && cc.RaftManager != nil {

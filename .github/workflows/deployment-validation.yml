@@ -67,7 +67,7 @@ jobs:
       - name: Run hard-kill transaction and offset recovery
         env:
           RUN_E2E_CHAOS: '1'
-        run: go test -v -count=1 -timeout 25m ./test/e2e-cluster -run '^TestChaos(TransactionCoordinatorRestartPreservesAtomicVisibility|LeaderFailoverRetryAndOffsetDurability)$'
+        run: go test -v -count=1 -timeout 25m ./test/e2e-cluster -run '^TestChaos(TransactionCoordinatorFailoverAbortsTimedOutTransaction|LeaderFailoverRetryAndOffsetDurability)$'
       - name: Show cluster logs on failure
         if: failure()
         working-directory: test/e2e-cluster

@@ -209,6 +209,36 @@ func (r *ClusterRouter) coordinatorRoutes(groupNames []string) (map[string]coord
 	return routes, nil
 }
 
+// FindTransactionCoordinator resolves the durable owner of the logical
+// transaction coordinator shard instead of rebuilding ownership locally from
+// a broker list.
+func (r *ClusterRouter) FindTransactionCoordinator(transactionalID string) (string, string, int64, error) {
+	fsmRef := r.rm.GetFSM()
+	if fsmRef == nil {
+		return "", "", 0, fmt.Errorf("FSM not available")
+	}
+	ownership, ok := fsmRef.GetTransactionCoordinator(transactionalID)
+	if !ok {
+		return "", "", 0, fmt.Errorf("transaction coordinator unavailable")
+	}
+	broker := fsmRef.GetBroker(ownership.Owner)
+	if broker == nil || broker.Status != "active" {
+		return "", "", 0, fmt.Errorf("transaction coordinator broker %s not active", ownership.Owner)
+	}
+	return ownership.Owner, broker.Addr, ownership.Epoch, nil
+}
+
+func (r *ClusterRouter) ForwardToTransactionCoordinator(transactionalID, req string) (string, error) {
+	id, addr, _, err := r.FindTransactionCoordinator(transactionalID)
+	if err != nil {
+		return "", err
+	}
+	if id == r.brokerID {
+		return r.processLocally(req), nil
+	}
+	return r.forwardWithTimeout(addr, req)
+}
+
 func (r *ClusterRouter) ForwardToCoordinator(groupName, req string) (string, error) {
 	id, addr, err := r.FindCoordinator(groupName)
 	if err != nil {

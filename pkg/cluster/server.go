@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/controller"
@@ -14,8 +15,9 @@ import (
 )
 
 type joinRequest struct {
-	NodeID  string `json:"node_id"`
-	Address string `json:"address"`
+	NodeID                       string `json:"node_id"`
+	Address                      string `json:"address"`
+	TransactionCoordinatorShards int    `json:"transaction_coordinator_shards,omitempty"`
 }
 
 type joinResponse struct {
@@ -211,11 +213,30 @@ func fitReplicaCatchupBatchToLimit(batch fsm.ReplicaCatchupBatch, limit int) (fs
 
 func (h *ClusterServer) handleJoinCluster(payload wire.CommandPayload) (any, *wire.ErrorPayload) {
 	req := joinRequest{NodeID: payload.Fields["node_id"], Address: payload.Fields["address"]}
+	if shardText := payload.Fields["transaction_coordinator_shards"]; shardText != "" {
+		shardCount, err := strconv.Atoi(shardText)
+		if err != nil || shardCount <= 0 {
+			return nil, validationError("transaction_coordinator_shards must be a positive integer")
+		}
+		req.TransactionCoordinatorShards = shardCount
+	}
 	if req.NodeID == "" || req.Address == "" {
 		return nil, validationError("missing node_id or address")
 	}
 
-	leader, err := h.sd.AddNode(req.NodeID, req.Address)
+	var leader string
+	var err error
+	if req.TransactionCoordinatorShards > 0 {
+		extended, ok := h.sd.(interface {
+			AddNodeWithTransactionCoordinatorShards(string, string, int) (string, error)
+		})
+		if !ok {
+			return nil, internalClusterError(fmt.Errorf("service discovery does not support explicit transaction coordinator shards"))
+		}
+		leader, err = extended.AddNodeWithTransactionCoordinatorShards(req.NodeID, req.Address, req.TransactionCoordinatorShards)
+	} else {
+		leader, err = h.sd.AddNode(req.NodeID, req.Address)
+	}
 	if err != nil {
 		return nil, &wire.ErrorPayload{
 			Code: "cluster_join_failed", Class: wire.ErrorClassConflict, Message: err.Error(),

@@ -24,6 +24,12 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.RaftTrailingLogs != 10240 {
 		t.Errorf("Expected default RaftTrailingLogs 10240, got %d", cfg.RaftTrailingLogs)
 	}
+	if cfg.TransactionCoordinatorShards != 50 {
+		t.Errorf("Expected default TransactionCoordinatorShards 50, got %d", cfg.TransactionCoordinatorShards)
+	}
+	if cfg.TransactionRecoveryBatchSize != 256 {
+		t.Errorf("Expected default TransactionRecoveryBatchSize 256, got %d", cfg.TransactionRecoveryBatchSize)
+	}
 }
 
 func TestLoadConfig_EnvOverrides(t *testing.T) {
@@ -32,6 +38,8 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("RAFT_SNAPSHOT_INTERVAL_MS", "250")
 	t.Setenv("RAFT_SNAPSHOT_THRESHOLD", "16")
 	t.Setenv("RAFT_TRAILING_LOGS", "0")
+	t.Setenv("TRANSACTION_COORDINATOR_SHARDS", "17")
+	t.Setenv("TRANSACTION_RECOVERY_BATCH_SIZE", "19")
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -52,6 +60,12 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	}
 	if cfg.RaftTrailingLogs != 0 {
 		t.Errorf("Expected RaftTrailingLogs 0 from env, got %d", cfg.RaftTrailingLogs)
+	}
+	if cfg.TransactionCoordinatorShards != 17 {
+		t.Errorf("Expected TransactionCoordinatorShards 17 from env, got %d", cfg.TransactionCoordinatorShards)
+	}
+	if cfg.TransactionRecoveryBatchSize != 19 {
+		t.Errorf("Expected TransactionRecoveryBatchSize 19 from env, got %d", cfg.TransactionRecoveryBatchSize)
 	}
 }
 
@@ -84,5 +98,11 @@ func TestConfig_Normalize(t *testing.T) {
 	cfg.Normalize()
 	if cfg.BrokerPort != 9000 {
 		t.Errorf("Normalize should have reset BrokerPort to 9000, got %d", cfg.BrokerPort)
+	}
+	if cfg.TransactionCoordinatorShards != 50 {
+		t.Errorf("Normalize should have reset TransactionCoordinatorShards to 50, got %d", cfg.TransactionCoordinatorShards)
+	}
+	if cfg.TransactionRecoveryBatchSize != 256 {
+		t.Errorf("Normalize should have reset TransactionRecoveryBatchSize to 256, got %d", cfg.TransactionRecoveryBatchSize)
 	}
 }

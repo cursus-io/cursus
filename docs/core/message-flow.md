@@ -63,17 +63,18 @@ sequenceDiagram
     participant G as Group coordinator
 
     C->>X: INIT_PRODUCER_ID, BEGIN_TXN
-    C->>X: TXN_PUBLISH (staged)
-    C->>X: SEND_OFFSETS_TO_TXN (one consumer scope)
+    C->>X: TXN_PUBLISH
+    X->>P: append unresolved idempotent record
+    C->>X: SEND_OFFSETS_TO_TXN (one group session, multiple topics)
     C->>X: END_TXN result=commit
-    X->>X: persist committing state
-    X->>P: append idempotent records and markers
-    X->>G: fenced bulk offset commit
+    X->>X: persist prepare_commit
+    X->>G: atomic fenced multi-topic offset commit
+    X->>P: append commit markers
     X->>X: persist committed decision
     X-->>C: OK state=committed
 ```
 
-Output records remain invisible to `read_committed` until the partition marker and final coordinator decision agree. A restored `committing` transaction is retried. Each completed epoch must be reinitialized before the next transaction; uncertain finalization retry keeps the old epoch.
+Output records remain invisible to `read_committed` until the partition marker and final coordinator decision agree. A restored prepared transaction is retried, while an open transaction past `transaction_timeout_ms` is durably aborted. Recovery work is indexed by coordinator shard and drained in bounded batches, so retained transaction history is not scanned on every monitor tick. Within this boundary, Cursus input offsets and output records form an exactly-once broker operation. Each completed epoch must be reinitialized before the next transaction; uncertain finalization retry keeps the old epoch.
 
 ## Event Sourcing
 

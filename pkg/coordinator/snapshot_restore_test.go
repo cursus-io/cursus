@@ -25,6 +25,25 @@ func TestCoordinatorStateRoundTripPreservesGroupMetadata(t *testing.T) {
 	require.True(t, status.LastRebalance.Equal(exported["workers"].LastRebalance))
 }
 
+func TestCoordinatorStateRoundTripPreservesMultiTopicSubscription(t *testing.T) {
+	source := NewCoordinator(context.Background(), &config.Config{}, &DummyPublisher{})
+	require.NoError(t, source.RegisterGroupSubscription(
+		"workers",
+		[]string{"orders", "payments"},
+		"",
+		map[string]int{"orders": 2, "payments": 1},
+	))
+	_, err := source.AddConsumer("workers", "worker-1")
+	require.NoError(t, err)
+
+	restored := NewCoordinator(context.Background(), &config.Config{}, &DummyPublisher{})
+	require.NoError(t, restored.ImportState(source.ExportState()))
+	status, err := restored.GetGroupStatus("workers")
+	require.NoError(t, err)
+	require.Equal(t, []string{"orders", "payments"}, status.Topics)
+	require.Len(t, restored.GetMemberTopicAssignments("workers", "worker-1"), 3)
+}
+
 func TestCoordinatorImportStateReplacesExistingGroups(t *testing.T) {
 	source := NewCoordinator(context.Background(), &config.Config{}, &DummyPublisher{})
 	require.NoError(t, source.RegisterGroup("orders", "current", 2))

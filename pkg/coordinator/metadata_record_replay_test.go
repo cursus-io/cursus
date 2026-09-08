@@ -89,6 +89,36 @@ func TestDistributedRecoveryUsesRaftAsSoleAuthority(t *testing.T) {
 	require.Empty(t, recovered.ListGroups())
 }
 
+func TestStandaloneRecoveryUsesLatestVersionedMultiTopicSnapshots(t *testing.T) {
+	registration := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersionSubscriptions, Type: ConsumerMetadataRecordRegistration,
+		Group: "workers", Topics: []string{"orders", "payments"}, Epoch: 3,
+		TopicPartitions: []TopicPartition{{Topic: "orders", Partition: 0}, {Topic: "payments", Partition: 0}},
+		Timestamp:       time.Unix(1, 0).UTC(),
+	}
+	recordA := ConsumerMetadataRecord{Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordOffsetSnapshot, Group: "workers", Topic: "orders", Epoch: 3, Revision: 2, Offsets: []OffsetItem{{Partition: 0, Offset: 8}}, Timestamp: time.Unix(2, 0).UTC()}
+	recordB := ConsumerMetadataRecord{Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordOffsetSnapshot, Group: "workers", Topic: "payments", Epoch: 3, Revision: 1, Offsets: []OffsetItem{{Partition: 0, Offset: 5}}, Timestamp: time.Unix(3, 0).UTC()}
+	staleA := recordA
+	staleA.Revision = 1
+	staleA.Offsets = []OffsetItem{{Partition: 0, Offset: 4}}
+
+	handler := &metadataReplayHandler{messages: map[int][]types.Message{
+		0: {encodedMetadataMessage(t, staleA, 0)},
+		1: {encodedMetadataMessage(t, recordB, 0)},
+		2: {encodedMetadataMessage(t, recordA, 0)},
+		3: {encodedMetadataMessage(t, registration, 0)},
+	}}
+	recovered, err := NewCoordinatorWithRecovery(context.Background(), config.DefaultConfig(), handler)
+	require.NoError(t, err)
+	orders, ok := recovered.GetOffset("workers", "orders", 0)
+	require.True(t, ok)
+	require.Equal(t, uint64(8), orders)
+	payments, ok := recovered.GetOffset("workers", "payments", 0)
+	require.True(t, ok)
+	require.Equal(t, uint64(5), payments)
+	require.Equal(t, uint64(3), recovered.GetRegistrationEpoch("workers"))
+}
+
 func TestConsumerMetadataReplayIsDeterministicAcrossPartitions(t *testing.T) {
 	registration := ConsumerMetadataRecord{
 		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,

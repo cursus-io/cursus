@@ -31,6 +31,14 @@ func (m *coordinatorRoutingRaftManager) GetFSM() *fsm.BrokerFSM {
 	return m.brokerFSM
 }
 
+func (m *coordinatorRoutingRaftManager) ApplyCommand(prefix string, data []byte) error {
+	result := m.brokerFSM.Apply(&raft.Log{Data: append([]byte(prefix+":"), data...)})
+	if err, ok := result.(error); ok {
+		return err
+	}
+	return nil
+}
+
 func newCoordinatorRoutingHandler(
 	brokerID string,
 	brokerFSM *fsm.BrokerFSM,

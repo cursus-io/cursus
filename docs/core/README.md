@@ -19,7 +19,7 @@ Cursus separates client handling, partition data, coordinator metadata, storage,
 
 Normal records are owned by a partition leader. Consumer membership/offsets are owned by the selected group coordinator. Transaction lifecycle state is owned by the selected transaction coordinator. Distributed metadata mutations are replicated through the Raft FSM; standalone transaction state is appended to the broker transaction journal before acknowledgement.
 
-A transaction does not collapse those owners into one in-memory object. The transaction coordinator stages intent, partition leaders append idempotent output and markers, the group coordinator applies one fenced bulk source-offset scope, and the final transaction decision gates `read_committed` visibility.
+A transaction does not collapse those owners into one in-memory object. The transaction coordinator durably registers participants, partition leaders append unresolved idempotent output, the group coordinator applies one fenced multi-topic source-offset set, and commit markers plus the final decision gate `read_committed` visibility.
 
 ## Configuration Defaults
 

@@ -3,6 +3,7 @@ package topic
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -20,6 +21,8 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
+
+var ErrReplicaOffsetGap = errors.New("replica offset gap")
 
 // producerEntry tracks the last producer epoch, sequence number, and activity time for a producer.
 type producerEntry struct {
@@ -44,6 +47,10 @@ type PartitionOffsetRange struct {
 
 type TransactionDecisionResolver interface {
 	TransactionDecision(transactionalID string, epoch int64) (state string, known bool)
+}
+
+type transactionCoordinatorEpochResolver interface {
+	TransactionDecisionWithCoordinatorEpoch(transactionalID string, epoch int64) (state string, coordinatorEpoch int64, known bool)
 }
 
 // Partition handles messages for one shard of a topic.
@@ -553,7 +560,7 @@ func (p *Partition) ReplicaAppendWithMode(msgs []types.Message, forceIdempotent 
 			}
 			continue
 		case msgs[i].Offset > nextOffset:
-			return fmt.Errorf("replica offset gap: expected %d, got %d", nextOffset, msgs[i].Offset)
+			return fmt.Errorf("%w: expected %d, got %d", ErrReplicaOffsetGap, nextOffset, msgs[i].Offset)
 		}
 
 		pending = append(pending, i)
@@ -855,7 +862,7 @@ func (p *Partition) indexTransactionMessage(msg types.Message) {
 	}
 	if msg.TransactionMarker != types.TransactionMarkerNone {
 		if existing, ok := p.txnMarkers[key]; !ok || msg.Offset >= existing.offset {
-			p.txnMarkers[key] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset}
+			p.txnMarkers[key] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset, coordinatorEpoch: msg.ControlBatchCoordinatorEpoch}
 		}
 		return
 	}
@@ -904,7 +911,7 @@ func (p *Partition) rebuildTransactionMarkerIndex() {
 			if msg.TransactionalID != "" && msg.TransactionMarker != types.TransactionMarkerNone {
 				key := messageTransactionMarkerKey(msg)
 				if existing, ok := markers[key]; !ok || msg.Offset >= existing.offset {
-					markers[key] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset}
+					markers[key] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset, coordinatorEpoch: msg.ControlBatchCoordinatorEpoch}
 				}
 			}
 			if msg.TransactionalID != "" && msg.TransactionMarker == types.TransactionMarkerNone && msg.TransactionState == types.TransactionStateOpen {
@@ -936,8 +943,9 @@ type transactionMarkerKey struct {
 }
 
 type transactionMarkerInfo struct {
-	marker string
-	offset uint64
+	marker           string
+	offset           uint64
+	coordinatorEpoch int64
 }
 
 func messageTransactionMarkerKey(msg types.Message) transactionMarkerKey {
@@ -967,6 +975,15 @@ func firstUnresolvedOpenOffset(hwm, retentionFloor uint64, openOffsets map[trans
 func transactionDecisionMatchesMarker(key transactionMarkerKey, marker transactionMarkerInfo, resolver TransactionDecisionResolver) bool {
 	if resolver == nil {
 		return true
+	}
+	if epochResolver, ok := resolver.(transactionCoordinatorEpochResolver); ok {
+		state, coordinatorEpoch, known := epochResolver.TransactionDecisionWithCoordinatorEpoch(key.transactionalID, key.epoch)
+		if !known {
+			return true
+		}
+		epochMatches := coordinatorEpoch == 0 || marker.coordinatorEpoch == coordinatorEpoch
+		return epochMatches && (marker.marker == types.TransactionMarkerCommit && state == types.TransactionStateCommitted ||
+			marker.marker == types.TransactionMarkerAbort && state == types.TransactionStateAborted)
 	}
 	state, known := resolver.TransactionDecision(key.transactionalID, key.epoch)
 	if !known {

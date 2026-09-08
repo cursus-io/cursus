@@ -32,12 +32,13 @@ type ReplicationEntry struct {
 }
 
 type BrokerInfo struct {
-	ID                string    `json:"id"`
-	Addr              string    `json:"addr"`
-	ClientAddr        string    `json:"client_addr,omitempty"`
-	Status            string    `json:"status"`
-	LastSeen          time.Time `json:"last_seen"`
-	LifecycleProtocol int       `json:"lifecycle_protocol,omitempty"`
+	ID                           string    `json:"id"`
+	Addr                         string    `json:"addr"`
+	ClientAddr                   string    `json:"client_addr,omitempty"`
+	Status                       string    `json:"status"`
+	LastSeen                     time.Time `json:"last_seen"`
+	LifecycleProtocol            int       `json:"lifecycle_protocol,omitempty"`
+	TransactionCoordinatorShards int       `json:"transaction_coordinator_shards,omitempty"`
 }
 
 type ProducerSequence struct {
@@ -45,16 +46,23 @@ type ProducerSequence struct {
 	Seq   uint64 `json:"seq"`
 }
 
+type TransactionCoordinatorShard struct {
+	Owner string `json:"owner"`
+	Epoch int64  `json:"epoch"`
+}
+
 type BrokerFSMState struct {
-	Version           int                                            `json:"version"`
-	Applied           uint64                                         `json:"applied"`
-	Logs              map[uint64]*ReplicationEntry                   `json:"logs"`
-	Brokers           map[string]*BrokerInfo                         `json:"brokers"`
-	PartitionMetadata map[string]*PartitionMetadata                  `json:"partitionMetadata"`
-	ProducerState     map[string]map[int]map[string]ProducerSequence `json:"producerState"`
-	GroupState        map[string]*coordinator.GroupStateSnapshot     `json:"groupState,omitempty"`
-	TransactionState  map[string]*transaction.Snapshot               `json:"transactionState,omitempty"`
-	TopicState        map[string]*topic.Definition                   `json:"topicState,omitempty"`
+	Version                          int                                            `json:"version"`
+	Applied                          uint64                                         `json:"applied"`
+	Logs                             map[uint64]*ReplicationEntry                   `json:"logs"`
+	Brokers                          map[string]*BrokerInfo                         `json:"brokers"`
+	PartitionMetadata                map[string]*PartitionMetadata                  `json:"partitionMetadata"`
+	ProducerState                    map[string]map[int]map[string]ProducerSequence `json:"producerState"`
+	GroupState                       map[string]*coordinator.GroupStateSnapshot     `json:"groupState,omitempty"`
+	TransactionState                 map[string]*transaction.Snapshot               `json:"transactionState,omitempty"`
+	TransactionCoordinatorShards     map[int]TransactionCoordinatorShard            `json:"transactionCoordinatorShards,omitempty"`
+	TransactionCoordinatorShardCount int                                            `json:"transactionCoordinatorShardCount,omitempty"`
+	TopicState                       map[string]*topic.Definition                   `json:"topicState,omitempty"`
 }
 
 type BrokerFSM struct {
@@ -70,27 +78,41 @@ type BrokerFSM struct {
 	applied                  uint64
 	partitionRecoveryPending bool
 
-	tm                       *topic.TopicManager
-	cd                       *coordinator.Coordinator
-	txn                      *transaction.Manager
-	restoredTransactionState map[string]*transaction.Snapshot
-	topicState               map[string]*topic.Definition
-	topicMaterialization     map[string]TopicMaterializationIssue
-	topicMaterializationRuns map[string]TopicMaterializationAttempts
+	tm                                         *topic.TopicManager
+	cd                                         *coordinator.Coordinator
+	txn                                        *transaction.Manager
+	restoredTransactionState                   map[string]*transaction.Snapshot
+	transactionCoordinatorShards               map[int]TransactionCoordinatorShard
+	configuredTransactionCoordinatorShardCount int
+	transactionCoordinatorShardCount           int
+	transactionCoordinatorChanges              chan []int
+	topicState                                 map[string]*topic.Definition
+	topicMaterialization                       map[string]TopicMaterializationIssue
+	topicMaterializationRuns                   map[string]TopicMaterializationAttempts
 }
 
 func NewBrokerFSM(tm *topic.TopicManager, cd *coordinator.Coordinator) *BrokerFSM {
+	return NewBrokerFSMWithTransactionCoordinatorShards(tm, cd, transaction.DefaultCoordinatorShardCount)
+}
+
+func NewBrokerFSMWithTransactionCoordinatorShards(tm *topic.TopicManager, cd *coordinator.Coordinator, shardCount int) *BrokerFSM {
+	if shardCount <= 0 {
+		shardCount = transaction.DefaultCoordinatorShardCount
+	}
 	return &BrokerFSM{
-		notifiers:                make(map[string]chan interface{}),
-		logs:                     make(map[uint64]*ReplicationEntry),
-		brokers:                  make(map[string]*BrokerInfo),
-		partitionMetadata:        make(map[string]*PartitionMetadata),
-		producerState:            make(map[string]map[int]map[string]ProducerSequence),
-		topicState:               make(map[string]*topic.Definition),
-		topicMaterialization:     make(map[string]TopicMaterializationIssue),
-		topicMaterializationRuns: make(map[string]TopicMaterializationAttempts),
-		tm:                       tm,
-		cd:                       cd,
+		notifiers:                    make(map[string]chan interface{}),
+		logs:                         make(map[uint64]*ReplicationEntry),
+		brokers:                      make(map[string]*BrokerInfo),
+		partitionMetadata:            make(map[string]*PartitionMetadata),
+		producerState:                make(map[string]map[int]map[string]ProducerSequence),
+		topicState:                   make(map[string]*topic.Definition),
+		topicMaterialization:         make(map[string]TopicMaterializationIssue),
+		topicMaterializationRuns:     make(map[string]TopicMaterializationAttempts),
+		transactionCoordinatorShards: make(map[int]TransactionCoordinatorShard),
+		configuredTransactionCoordinatorShardCount: shardCount,
+		transactionCoordinatorChanges:              make(chan []int, 1),
+		tm:                                         tm,
+		cd:                                         cd,
 	}
 }
 
@@ -157,6 +179,9 @@ func (f *BrokerFSM) SetTransactionManager(txn *transaction.Manager) {
 		}
 		util.Info("FSM: Imported %d deferred restored transactions", len(f.restoredTransactionState))
 		f.restoredTransactionState = nil
+	}
+	if f.txn != nil {
+		f.txn.ReconcileCoordinatorEpochs(f.transactionCoordinatorEpochsLocked(), f.effectiveTransactionCoordinatorShardCountLocked())
 	}
 }
 
@@ -259,13 +284,24 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	if header.Version != SnapshotVersionCurrent {
 		return fmt.Errorf("%w: snapshot version %d is not supported; remove all Cursus persistent state and clean bootstrap version %d", ErrUnsupportedRecoveryProtocol, header.Version, SnapshotVersionCurrent)
 	}
-
 	var state BrokerFSMState
 	if err := decodeStrictJSON(snapshotData, &state); err != nil {
 		util.Error("Failed to decode snapshot version %d: %v", header.Version, err)
 		return fmt.Errorf("failed to restore snapshot version %d: %w", header.Version, err)
 	}
 	util.Info("FSM Restore: Validating snapshot Version %d", state.Version)
+	persistedShardCount := state.TransactionCoordinatorShardCount
+	if persistedShardCount <= 0 {
+		persistedShardCount = f.configuredTransactionCoordinatorShardCount
+	}
+	if persistedShardCount != f.configuredTransactionCoordinatorShardCount {
+		return fmt.Errorf("transaction coordinator shard count mismatch: configured=%d persisted=%d", f.configuredTransactionCoordinatorShardCount, persistedShardCount)
+	}
+	for shard := range state.TransactionCoordinatorShards {
+		if shard < 0 || shard >= persistedShardCount {
+			return fmt.Errorf("snapshot version %d contains transaction coordinator shard %d outside configured count %d", state.Version, shard, persistedShardCount)
+		}
+	}
 
 	restoredTopicState := copyTopicState(state.TopicState)
 	if len(restoredTopicState) == 0 && len(state.PartitionMetadata) > 0 {
@@ -304,6 +340,12 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	f.brokers = state.Brokers
 	f.partitionMetadata = state.PartitionMetadata
 	f.topicState = restoredTopicState
+	f.transactionCoordinatorShardCount = persistedShardCount
+	f.transactionCoordinatorShards = state.TransactionCoordinatorShards
+	if f.transactionCoordinatorShards == nil {
+		f.transactionCoordinatorShards = make(map[int]TransactionCoordinatorShard)
+	}
+	f.reconcileTransactionCoordinatorShardsLocked()
 	f.topicMaterialization = make(map[string]TopicMaterializationIssue, len(restoredTopicState))
 	now := time.Now()
 	for name := range restoredTopicState {
@@ -364,6 +406,9 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	if f.notifiers == nil {
 		f.notifiers = make(map[string]chan interface{})
 	}
+	if f.transactionCoordinatorChanges == nil {
+		f.transactionCoordinatorChanges = make(chan []int, 1)
+	}
 	if state.GroupState != nil && f.cd != nil {
 		if err := f.cd.ImportState(state.GroupState); err != nil {
 			f.mu.Unlock()
@@ -385,6 +430,9 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 			f.restoredTransactionState = state.TransactionState
 			util.Info("FSM Restore: Deferred %d transactions until transaction manager is attached", len(state.TransactionState))
 		}
+	}
+	if f.txn != nil {
+		f.txn.ReconcileCoordinatorEpochs(f.transactionCoordinatorEpochsLocked(), f.transactionCoordinatorShardCount)
 	}
 
 	f.mu.Unlock()
@@ -604,17 +652,23 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	if f.txn != nil {
 		transactionState = f.txn.ExportState()
 	}
+	transactionCoordinatorShards := make(map[int]TransactionCoordinatorShard, len(f.transactionCoordinatorShards))
+	for shard, ownership := range f.transactionCoordinatorShards {
+		transactionCoordinatorShards[shard] = ownership
+	}
 
 	util.Debug("Creating FSM snapshot")
 	return &BrokerFSMSnapshot{
-		applied:           f.applied,
-		logs:              logsCopy,
-		brokers:           brokersCopy,
-		partitionMetadata: metadataCopy,
-		producerState:     producerStateCopy,
-		groupState:        groupState,
-		transactionState:  transactionState,
-		topicState:        topicStateCopy,
+		applied:                          f.applied,
+		logs:                             logsCopy,
+		brokers:                          brokersCopy,
+		partitionMetadata:                metadataCopy,
+		producerState:                    producerStateCopy,
+		groupState:                       groupState,
+		transactionState:                 transactionState,
+		transactionCoordinatorShards:     transactionCoordinatorShards,
+		transactionCoordinatorShardCount: f.effectiveTransactionCoordinatorShardCountLocked(),
+		topicState:                       topicStateCopy,
 	}, nil
 }
 

@@ -16,6 +16,23 @@ type MockISRManager struct {
 	mock.Mock
 }
 
+type LivenessMockISRManager struct {
+	MockISRManager
+	alive map[string]bool
+}
+
+func (m *LivenessMockISRManager) IsBrokerAlive(brokerID string) bool {
+	return m.alive[brokerID]
+}
+
+type staticConfigurationFuture struct {
+	configuration raft.Configuration
+}
+
+func (f staticConfigurationFuture) Error() error                      { return nil }
+func (f staticConfigurationFuture) Index() uint64                     { return 1 }
+func (f staticConfigurationFuture) Configuration() raft.Configuration { return f.configuration }
+
 func (m *MockISRManager) HasQuorum(topic string, partition int, minISR int) bool {
 	args := m.Called(topic, partition, minISR)
 	return args.Bool(0)
@@ -201,6 +218,20 @@ func TestServiceDiscovery_NodeOperations(t *testing.T) {
 	})
 }
 
+func TestServiceDiscoveryRejectsMismatchedTransactionCoordinatorShardCountBeforeAddingVoter(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.mockFSM = fsm.NewBrokerFSMWithTransactionCoordinatorShards(nil, nil, 7)
+	rm.isLeader = true
+	rm.On("GetLeaderAddress").Return("localhost:9001").Once()
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+
+	leader, err := sd.AddNodeWithTransactionCoordinatorShards("node2", "localhost:9002", 8)
+	assert.Equal(t, "localhost:9001", leader)
+	assert.ErrorContains(t, err, "configured=8 cluster=7")
+	rm.AssertNotCalled(t, "AddVoter", mock.Anything, mock.Anything)
+	rm.AssertExpectations(t)
+}
+
 func TestServiceDiscovery_Heartbeat(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
 	isr := new(MockISRManager)
@@ -251,4 +282,45 @@ func TestServiceDiscovery_Heartbeat_NilISRManager(t *testing.T) {
 	// Should not panic
 	sd.UpdateHeartbeat("node1")
 	rm.AssertExpectations(t)
+}
+
+func TestServiceDiscoveryReconcileMarksHeartbeatExpiredBrokerInactive(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node1","addr":"localhost:9001","status":"active"}`)})
+	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node2","addr":"localhost:9002","status":"active"}`)})
+	liveness := &LivenessMockISRManager{alive: map[string]bool{"node1": true, "node2": false}}
+	configuration := raft.Configuration{Servers: []raft.Server{
+		{ID: "node1", Address: "localhost:9001"},
+		{ID: "node2", Address: "localhost:9002"},
+	}}
+	rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: configuration}).Once()
+	rm.On("GetISRManager").Return(liveness)
+	rm.On("ApplyCommand", "DEREGISTER", mock.Anything).Return(nil).Once()
+
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	sd.Reconcile()
+
+	assert.Equal(t, "inactive", rm.mockFSM.GetBroker("node2").Status)
+	rm.AssertExpectations(t)
+}
+
+func TestServiceDiscoveryHeartbeatReactivatesBroker(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node2","addr":"localhost:9002","status":"active"}`)})
+	rm.mockFSM.Apply(&raft.Log{Data: []byte(`DEREGISTER:{"id":"node2"}`)})
+	isr := new(MockISRManager)
+	rm.On("GetISRManager").Return(isr)
+	isr.On("UpdateHeartbeat", "node2").Return().Once()
+	rm.On("ApplyCommand", "REGISTER", mock.Anything).Return(nil).Once()
+
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	sd.UpdateHeartbeat("node2")
+
+	assert.Equal(t, "active", rm.mockFSM.GetBroker("node2").Status)
+	rm.AssertExpectations(t)
+	isr.AssertExpectations(t)
 }

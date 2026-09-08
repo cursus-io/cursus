@@ -18,9 +18,10 @@ type TransactionProducer struct {
 }
 
 type TransactionStatus struct {
-	State    string
-	Messages int
-	Offsets  int
+	State        string
+	Messages     int
+	Participants int
+	Offsets      int
 }
 
 func (bc *BrokerClient) InitTransactionProducer(transactionalID string) (TransactionProducer, error) {
@@ -72,11 +73,12 @@ func (bc *BrokerClient) GetTransactionStatus(transactionalID string) (Transactio
 	}
 	fields := responseFields(resp)
 	messages, msgErr := strconv.Atoi(fields["messages"])
+	participants, participantErr := strconv.Atoi(fields["participants"])
 	offsets, offsetErr := strconv.Atoi(fields["offsets"])
-	if fields["state"] == "" || msgErr != nil || offsetErr != nil {
+	if fields["state"] == "" || msgErr != nil || participantErr != nil || offsetErr != nil {
 		return TransactionStatus{}, fmt.Errorf("invalid transaction status response: %s", resp)
 	}
-	return TransactionStatus{State: fields["state"], Messages: messages, Offsets: offsets}, nil
+	return TransactionStatus{State: fields["state"], Messages: messages, Participants: participants, Offsets: offsets}, nil
 }
 
 func (bc *BrokerClient) FindTransactionCoordinator(transactionalID string) (string, error) {

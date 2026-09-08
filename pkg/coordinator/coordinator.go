@@ -27,6 +27,8 @@ type Coordinator struct {
 	offsetTopicPartitionCount int
 	standalone                bool
 	groupEpochs               map[string]uint64
+	offsetRecordWriter        func(ConsumerMetadataRecord) error
+	transactionalOffsets      TransactionalOffsetResolver
 
 	recoveryMu sync.RWMutex
 	recovery   ConsumerMetadataRecoveryStatus
@@ -62,10 +64,34 @@ type syncPublisher interface {
 	PublishWithAck(topic string, msg *types.Message) error
 }
 
+// TransactionalOffsetResolver exposes only offsets whose transaction has a
+// final committed decision. The registration epoch prevents an old
+// transaction from leaking into a re-created consumer group.
+type TransactionalOffsetResolver interface {
+	CommittedOffset(group, topic string, partition int, registrationEpoch uint64) (uint64, bool)
+}
+
+// SetOffsetRecordWriter installs the cluster-aware __consumer_offsets writer.
+// Standalone coordinators continue to publish through their TopicHandler.
+func (c *Coordinator) SetOffsetRecordWriter(writer func(ConsumerMetadataRecord) error) {
+	c.mu.Lock()
+	c.offsetRecordWriter = writer
+	c.mu.Unlock()
+}
+
+func (c *Coordinator) SetTransactionalOffsetResolver(resolver TransactionalOffsetResolver) {
+	c.mu.Lock()
+	c.transactionalOffsets = resolver
+	c.mu.Unlock()
+}
+
 // GroupMetadata holds metadata for a single consumer group.
 type GroupMetadata struct {
 	mu                sync.RWMutex               // Per-group lock for offset operations
 	TopicName         string                     // Topic this group consumes
+	Topics            []string                   // Explicit v1 subscription topics
+	TopicPattern      string                     // Optional v1 subscription pattern
+	TopicPartitions   []TopicPartition           // Assignable v1 topic-partitions
 	Members           map[string]*MemberMetadata // Active members
 	Generation        int                        // Current membership generation
 	Partitions        []int                      // All partitions of the topic
@@ -78,23 +104,33 @@ type GroupMetadata struct {
 
 // MemberMetadata holds state for a single consumer instance.
 type MemberMetadata struct {
-	ID            string    // Unique consumer ID
-	LastHeartbeat time.Time // Last heartbeat timestamp
-	Assignments   []int     // Partition assignments for this member
+	ID               string           // Unique consumer ID
+	LastHeartbeat    time.Time        // Last heartbeat timestamp
+	Assignments      []int            // Legacy single-topic assignments
+	TopicAssignments []TopicPartition // v1 topic-partition assignments
+}
+
+type TopicPartition struct {
+	Topic     string `json:"topic"`
+	Partition int    `json:"partition"`
 }
 
 // GroupStateSnapshot is a serializable snapshot of a consumer group's state.
 type GroupStateSnapshot struct {
-	TopicName         string                    `json:"topic"`
-	Generation        int                       `json:"generation"`
-	Members           map[string][]int          `json:"members"`
-	Partitions        []int                     `json:"partitions,omitempty"`
-	LastRebalance     time.Time                 `json:"last_rebalance,omitempty"`
-	LastActivity      time.Time                 `json:"last_activity,omitempty"`
-	Offsets           map[string]map[int]uint64 `json:"offsets"`
-	RegistrationEpoch uint64                    `json:"registration_epoch,omitempty"`
-	OffsetRevisions   map[string]uint64         `json:"offset_revisions,omitempty"`
-	Deleted           bool                      `json:"deleted,omitempty"`
+	TopicName         string                      `json:"topic"`
+	Topics            []string                    `json:"topics,omitempty"`
+	TopicPattern      string                      `json:"topic_pattern,omitempty"`
+	TopicPartitions   []TopicPartition            `json:"topic_partitions,omitempty"`
+	Generation        int                         `json:"generation"`
+	Members           map[string][]int            `json:"members"`
+	TopicAssignments  map[string][]TopicPartition `json:"topic_assignments,omitempty"`
+	Partitions        []int                       `json:"partitions,omitempty"`
+	LastRebalance     time.Time                   `json:"last_rebalance,omitempty"`
+	LastActivity      time.Time                   `json:"last_activity,omitempty"`
+	Offsets           map[string]map[int]uint64   `json:"offsets"`
+	RegistrationEpoch uint64                      `json:"registration_epoch,omitempty"`
+	OffsetRevisions   map[string]uint64           `json:"offset_revisions,omitempty"`
+	Deleted           bool                        `json:"deleted,omitempty"`
 }
 
 // GroupStatus represents the status of a consumer group
@@ -102,6 +138,8 @@ type GroupStatus struct {
 	Status         string       `json:"status,omitempty"`
 	GroupName      string       `json:"group_name"`
 	TopicName      string       `json:"topic_name"`
+	Topics         []string     `json:"topics,omitempty"`
+	TopicPattern   string       `json:"topic_pattern,omitempty"`
 	State          string       `json:"state"` // "Stable", "Rebalancing", "Dead"
 	Generation     int          `json:"generation"`
 	MemberCount    int          `json:"member_count"`
@@ -111,9 +149,10 @@ type GroupStatus struct {
 }
 
 type MemberInfo struct {
-	MemberID      string    `json:"member_id"`
-	LastHeartbeat time.Time `json:"last_heartbeat"`
-	Assignments   []int     `json:"assignments"`
+	MemberID         string           `json:"member_id"`
+	LastHeartbeat    time.Time        `json:"last_heartbeat"`
+	Assignments      []int            `json:"assignments"`
+	TopicAssignments []TopicPartition `json:"topic_assignments,omitempty"`
 }
 
 const (
@@ -406,6 +445,25 @@ func (c *Coordinator) GetMemberAssignments(groupName string, memberID string) []
 	return cp
 }
 
+// GetMemberTopicAssignments returns assignments with their topic identity.
+func (c *Coordinator) GetMemberTopicAssignments(groupName, memberID string) []TopicPartition {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	group := c.groups[groupName]
+	if group == nil || group.Members[memberID] == nil {
+		return nil
+	}
+	member := group.Members[memberID]
+	if len(member.TopicAssignments) > 0 {
+		return append([]TopicPartition(nil), member.TopicAssignments...)
+	}
+	result := make([]TopicPartition, 0, len(member.Assignments))
+	for _, partition := range member.Assignments {
+		result = append(result, TopicPartition{Topic: group.TopicName, Partition: partition})
+	}
+	return result
+}
+
 func (c *Coordinator) ListGroups() []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -428,10 +486,15 @@ func (c *Coordinator) GetGroupStatus(groupName string) (*GroupStatus, error) {
 
 	gName := groupName
 	tName := group.TopicName
+	topics := append([]string(nil), group.Topics...)
+	topicPattern := group.TopicPattern
 	gen := group.Generation
 	lRebalance := group.LastRebalance
 	mCount := len(group.Members)
 	pCount := len(group.Partitions)
+	if len(group.TopicPartitions) > 0 {
+		pCount = len(group.TopicPartitions)
+	}
 
 	members := make([]MemberInfo, 0, mCount)
 	for _, member := range group.Members {
@@ -439,9 +502,10 @@ func (c *Coordinator) GetGroupStatus(groupName string) (*GroupStatus, error) {
 		copy(asgn, member.Assignments)
 
 		members = append(members, MemberInfo{
-			MemberID:      member.ID,
-			LastHeartbeat: member.LastHeartbeat,
-			Assignments:   asgn,
+			MemberID:         member.ID,
+			LastHeartbeat:    member.LastHeartbeat,
+			Assignments:      asgn,
+			TopicAssignments: append([]TopicPartition(nil), member.TopicAssignments...),
 		})
 	}
 	c.mu.RUnlock()
@@ -454,6 +518,8 @@ func (c *Coordinator) GetGroupStatus(groupName string) (*GroupStatus, error) {
 	return &GroupStatus{
 		GroupName:      gName,
 		TopicName:      tName,
+		Topics:         topics,
+		TopicPattern:   topicPattern,
 		State:          state,
 		Generation:     gen,
 		MemberCount:    mCount,
@@ -470,12 +536,28 @@ func (c *Coordinator) GetGroup(groupName string) *GroupMetadata {
 	return c.groups[groupName]
 }
 
+func (c *Coordinator) IsSubscriptionGroup(groupName string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	group := c.groups[groupName]
+	return group != nil && len(group.TopicPartitions) > 0
+}
+
 func (c *Coordinator) GetGeneration(groupName string) int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	if group := c.groups[groupName]; group != nil {
 		return group.Generation
+	}
+	return 0
+}
+
+func (c *Coordinator) GetRegistrationEpoch(groupName string) uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if group := c.groups[groupName]; group != nil {
+		return group.RegistrationEpoch
 	}
 	return 0
 }
@@ -522,6 +604,17 @@ func (c *Coordinator) ResumeConsumer(groupName, memberID string, generation int)
 	return append([]int(nil), member.Assignments...), nil
 }
 
+func (c *Coordinator) ResumeConsumerTopicAssignments(groupName, memberID string, generation int) ([]TopicPartition, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
+		return nil, fmt.Errorf("%s", errResp)
+	}
+	member := c.groups[groupName].Members[memberID]
+	member.LastHeartbeat = time.Now()
+	return append([]TopicPartition(nil), member.TopicAssignments...), nil
+}
+
 // ValidateOwnershipFailure returns a wire-ready error code when a member does
 // not own a partition in the supplied generation. Empty string means valid.
 func (c *Coordinator) ValidateOwnershipFailure(groupName, memberID string, generation int, partition int) string {
@@ -538,6 +631,54 @@ func (c *Coordinator) ValidateOwnershipFailure(groupName, memberID string, gener
 		return fmt.Sprintf("ERROR: NOT_OWNER partition=%d member=%s group=%s generation=%d", partition, memberID, groupName, generation)
 	}
 	return ""
+}
+
+func (c *Coordinator) ValidateTopicPartitionOwnershipFailure(groupName, memberID string, generation int, topic string, partition int) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
+		return errResp
+	}
+	member := c.groups[groupName].Members[memberID]
+	for _, assigned := range member.TopicAssignments {
+		if assigned.Topic == topic && assigned.Partition == partition {
+			return ""
+		}
+	}
+	if len(member.TopicAssignments) == 0 && groupTopicMatches(c.groups[groupName].TopicName, topic) && contains(member.Assignments, partition) {
+		return ""
+	}
+	return fmt.Sprintf("ERROR: NOT_OWNER topic=%s partition=%d member=%s group=%s generation=%d", topic, partition, memberID, groupName, generation)
+}
+
+func (c *Coordinator) WithTopicOwnershipFence(groupName, memberID string, generation int, partitions []TopicPartition, fn func() error) error {
+	c.mu.RLock()
+	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
+		c.mu.RUnlock()
+		return fmt.Errorf("%s", errResp)
+	}
+	member := c.groups[groupName].Members[memberID]
+	for _, requested := range partitions {
+		owned := false
+		for _, assigned := range member.TopicAssignments {
+			if assigned == requested {
+				owned = true
+				break
+			}
+		}
+		if !owned && len(member.TopicAssignments) == 0 && groupTopicMatches(c.groups[groupName].TopicName, requested.Topic) {
+			owned = contains(member.Assignments, requested.Partition)
+		}
+		if !owned {
+			c.mu.RUnlock()
+			return fmt.Errorf("ERROR: NOT_OWNER topic=%s partition=%d member=%s group=%s generation=%d", requested.Topic, requested.Partition, memberID, groupName, generation)
+		}
+	}
+	c.mu.RUnlock()
+	if fn == nil {
+		return nil
+	}
+	return fn()
 }
 func (c *Coordinator) WithOwnershipFence(groupName, memberID string, generation int, partitions []int, fn func() error) error {
 	c.mu.RLock()
@@ -619,8 +760,12 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 		group.mu.RLock()
 		snap := &GroupStateSnapshot{
 			TopicName:         group.TopicName,
+			Topics:            append([]string(nil), group.Topics...),
+			TopicPattern:      group.TopicPattern,
+			TopicPartitions:   append([]TopicPartition(nil), group.TopicPartitions...),
 			Generation:        group.Generation,
 			Members:           make(map[string][]int, len(group.Members)),
+			TopicAssignments:  make(map[string][]TopicPartition, len(group.Members)),
 			Partitions:        append([]int(nil), group.Partitions...),
 			LastRebalance:     group.LastRebalance,
 			LastActivity:      group.LastActivity,
@@ -632,6 +777,7 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 			assignments := make([]int, len(member.Assignments))
 			copy(assignments, member.Assignments)
 			snap.Members[mid] = assignments
+			snap.TopicAssignments[mid] = append([]TopicPartition(nil), member.TopicAssignments...)
 		}
 		for topic, partitions := range group.Offsets {
 			snap.Offsets[topic] = make(map[int]uint64, len(partitions))
@@ -677,6 +823,9 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) error {
 		}
 		group := &GroupMetadata{
 			TopicName:         snap.TopicName,
+			Topics:            append([]string(nil), snap.Topics...),
+			TopicPattern:      snap.TopicPattern,
+			TopicPartitions:   append([]TopicPartition(nil), snap.TopicPartitions...),
 			Generation:        snap.Generation,
 			Members:           make(map[string]*MemberMetadata, len(snap.Members)),
 			Partitions:        append([]int(nil), snap.Partitions...),
@@ -688,9 +837,10 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) error {
 		}
 		for mid, assignments := range snap.Members {
 			group.Members[mid] = &MemberMetadata{
-				ID:            mid,
-				LastHeartbeat: time.Now(),
-				Assignments:   append([]int(nil), assignments...),
+				ID:               mid,
+				LastHeartbeat:    time.Now(),
+				Assignments:      append([]int(nil), assignments...),
+				TopicAssignments: append([]TopicPartition(nil), snap.TopicAssignments[mid]...),
 			}
 		}
 
@@ -723,75 +873,42 @@ func ValidateImportState(state map[string]*GroupStateSnapshot) error {
 			return fmt.Errorf("consumer group %q snapshot is missing registration epoch; clean bootstrap is required", name)
 		}
 		if snap.Deleted {
-			if snap.TopicName != "" || snap.Generation != 0 || len(snap.Members) != 0 ||
-				len(snap.Partitions) != 0 || len(snap.Offsets) != 0 || len(snap.OffsetRevisions) != 0 {
+			if snap.TopicName != "" || len(snap.Topics) != 0 || snap.TopicPattern != "" ||
+				len(snap.TopicPartitions) != 0 || snap.Generation != 0 || len(snap.Members) != 0 ||
+				len(snap.TopicAssignments) != 0 || len(snap.Partitions) != 0 || len(snap.Offsets) != 0 || len(snap.OffsetRevisions) != 0 {
 				return fmt.Errorf("consumer group %q tombstone contains live state", name)
 			}
 			continue
 		}
-		if snap.TopicName == "" {
-			return fmt.Errorf("consumer group %q snapshot is missing topic", name)
-		}
 		if snap.Generation < 0 {
 			return fmt.Errorf("consumer group %q snapshot has negative generation %d", name, snap.Generation)
-		}
-		if len(snap.Partitions) == 0 {
-			return fmt.Errorf("consumer group %q snapshot is missing declared partitions; clean bootstrap is required", name)
 		}
 		if snap.LastActivity.IsZero() {
 			return fmt.Errorf("consumer group %q snapshot is missing last activity; clean bootstrap is required", name)
 		}
 
-		declared := make(map[int]struct{}, len(snap.Partitions))
-		for _, partition := range snap.Partitions {
-			if partition < 0 {
-				return fmt.Errorf("consumer group %q snapshot has negative partition %d", name, partition)
+		isSubscription := len(snap.Topics) > 0 || snap.TopicPattern != "" || len(snap.TopicPartitions) > 0
+		if isSubscription {
+			if err := validateSubscriptionSnapshot(name, snap); err != nil {
+				return err
 			}
-			if _, duplicate := declared[partition]; duplicate {
-				return fmt.Errorf("consumer group %q snapshot has duplicate partition %d", name, partition)
-			}
-			declared[partition] = struct{}{}
-		}
-		for partition := 0; partition < len(snap.Partitions); partition++ {
-			if _, ok := declared[partition]; !ok {
-				return fmt.Errorf("consumer group %q snapshot partitions must be contiguous from zero", name)
-			}
-		}
-
-		assigned := make(map[int]string, len(declared))
-		for memberID, assignments := range snap.Members {
-			if memberID == "" {
-				return fmt.Errorf("consumer group %q snapshot has an empty member id", name)
-			}
-			memberPartitions := make(map[int]struct{}, len(assignments))
-			for _, partition := range assignments {
-				if _, ok := declared[partition]; !ok {
-					return fmt.Errorf("consumer group %q member %q references undeclared partition %d", name, memberID, partition)
-				}
-				if _, duplicate := memberPartitions[partition]; duplicate {
-					return fmt.Errorf("consumer group %q member %q has duplicate partition %d", name, memberID, partition)
-				}
-				if owner, duplicate := assigned[partition]; duplicate {
-					return fmt.Errorf("consumer group %q partition %d is assigned to both %q and %q", name, partition, owner, memberID)
-				}
-				memberPartitions[partition] = struct{}{}
-				assigned[partition] = memberID
-			}
+		} else if err := validateLegacyGroupSnapshot(name, snap); err != nil {
+			return err
 		}
 
 		for topicName, offsets := range snap.Offsets {
-			if !groupTopicMatches(snap.TopicName, topicName) {
-				return fmt.Errorf("consumer group %q snapshot offset topic %q does not match registered topic %q", name, topicName, snap.TopicName)
+			if !snapshotTopicMatches(snap, topicName) {
+				return fmt.Errorf("consumer group %q snapshot offset topic %q does not match its subscription", name, topicName)
 			}
 			for partition := range offsets {
-				if _, ok := declared[partition]; !ok {
-					return fmt.Errorf("consumer group %q offset references undeclared partition %d", name, partition)
+				if !snapshotPartitionDeclared(snap, topicName, partition) {
+					return fmt.Errorf("consumer group %q offset references undeclared topic-partition %s:%d", name, topicName, partition)
 				}
 			}
 		}
 		for topicName, revision := range snap.OffsetRevisions {
-			if !groupTopicMatches(snap.TopicName, topicName) {
-				return fmt.Errorf("consumer group %q snapshot revision topic %q does not match registered topic %q", name, topicName, snap.TopicName)
+			if !snapshotTopicMatches(snap, topicName) {
+				return fmt.Errorf("consumer group %q snapshot revision topic %q does not match its subscription", name, topicName)
 			}
 			if revision == 0 {
 				return fmt.Errorf("consumer group %q snapshot has zero offset revision for topic %q", name, topicName)
@@ -799,4 +916,150 @@ func ValidateImportState(state map[string]*GroupStateSnapshot) error {
 		}
 	}
 	return nil
+}
+
+func validateLegacyGroupSnapshot(name string, snap *GroupStateSnapshot) error {
+	if snap.TopicName == "" {
+		return fmt.Errorf("consumer group %q snapshot is missing topic", name)
+	}
+	if len(snap.Partitions) == 0 {
+		return fmt.Errorf("consumer group %q snapshot is missing declared partitions; clean bootstrap is required", name)
+	}
+	for memberID, assignments := range snap.TopicAssignments {
+		if _, ok := snap.Members[memberID]; !ok || len(assignments) != 0 {
+			return fmt.Errorf("consumer group %q legacy snapshot contains invalid topic assignments for member %q", name, memberID)
+		}
+	}
+	declared := make(map[int]struct{}, len(snap.Partitions))
+	for _, partition := range snap.Partitions {
+		if partition < 0 {
+			return fmt.Errorf("consumer group %q snapshot has negative partition %d", name, partition)
+		}
+		if _, duplicate := declared[partition]; duplicate {
+			return fmt.Errorf("consumer group %q snapshot has duplicate partition %d", name, partition)
+		}
+		declared[partition] = struct{}{}
+	}
+	for partition := 0; partition < len(snap.Partitions); partition++ {
+		if _, ok := declared[partition]; !ok {
+			return fmt.Errorf("consumer group %q snapshot partitions must be contiguous from zero", name)
+		}
+	}
+
+	assigned := make(map[int]string, len(declared))
+	for memberID, assignments := range snap.Members {
+		if memberID == "" {
+			return fmt.Errorf("consumer group %q snapshot has an empty member id", name)
+		}
+		memberPartitions := make(map[int]struct{}, len(assignments))
+		for _, partition := range assignments {
+			if _, ok := declared[partition]; !ok {
+				return fmt.Errorf("consumer group %q member %q references undeclared partition %d", name, memberID, partition)
+			}
+			if _, duplicate := memberPartitions[partition]; duplicate {
+				return fmt.Errorf("consumer group %q member %q has duplicate partition %d", name, memberID, partition)
+			}
+			if owner, duplicate := assigned[partition]; duplicate {
+				return fmt.Errorf("consumer group %q partition %d is assigned to both %q and %q", name, partition, owner, memberID)
+			}
+			memberPartitions[partition] = struct{}{}
+			assigned[partition] = memberID
+		}
+	}
+
+	return nil
+}
+
+func validateSubscriptionSnapshot(name string, snap *GroupStateSnapshot) error {
+	if len(snap.Topics) == 0 || len(snap.TopicPartitions) == 0 {
+		return fmt.Errorf("consumer group %q snapshot is missing subscription topics or partitions", name)
+	}
+	if snap.TopicName != subscriptionDisplayName(snap.Topics, snap.TopicPattern) {
+		return fmt.Errorf("consumer group %q snapshot has inconsistent subscription display topic", name)
+	}
+	if len(snap.Partitions) != 0 {
+		return fmt.Errorf("consumer group %q subscription snapshot contains legacy partitions", name)
+	}
+	topics := make(map[string]struct{}, len(snap.Topics))
+	for i, topicName := range snap.Topics {
+		if topicName == "" || (i > 0 && snap.Topics[i-1] >= topicName) {
+			return fmt.Errorf("consumer group %q snapshot topics must be non-empty, unique, and sorted", name)
+		}
+		topics[topicName] = struct{}{}
+	}
+	declared := make(map[TopicPartition]struct{}, len(snap.TopicPartitions))
+	counts := make(map[string]int, len(topics))
+	for _, tp := range snap.TopicPartitions {
+		if _, ok := topics[tp.Topic]; !ok || tp.Partition < 0 {
+			return fmt.Errorf("consumer group %q snapshot has undeclared topic-partition %s:%d", name, tp.Topic, tp.Partition)
+		}
+		if _, duplicate := declared[tp]; duplicate {
+			return fmt.Errorf("consumer group %q snapshot has duplicate topic-partition %s:%d", name, tp.Topic, tp.Partition)
+		}
+		declared[tp] = struct{}{}
+		counts[tp.Topic]++
+	}
+	for topicName := range topics {
+		if counts[topicName] == 0 {
+			return fmt.Errorf("consumer group %q snapshot is missing partitions for topic %q", name, topicName)
+		}
+		for partition := 0; partition < counts[topicName]; partition++ {
+			if _, ok := declared[TopicPartition{Topic: topicName, Partition: partition}]; !ok {
+				return fmt.Errorf("consumer group %q snapshot partitions for topic %q must be contiguous from zero", name, topicName)
+			}
+		}
+	}
+	assigned := make(map[TopicPartition]string, len(declared))
+	for memberID := range snap.Members {
+		if memberID == "" {
+			return fmt.Errorf("consumer group %q snapshot has an empty member id", name)
+		}
+		memberAssignments := make(map[TopicPartition]struct{})
+		if len(snap.Members[memberID]) != 0 {
+			return fmt.Errorf("consumer group %q subscription member %q contains legacy assignments", name, memberID)
+		}
+		for _, tp := range snap.TopicAssignments[memberID] {
+			if _, ok := declared[tp]; !ok {
+				return fmt.Errorf("consumer group %q member %q references undeclared topic-partition %s:%d", name, memberID, tp.Topic, tp.Partition)
+			}
+			if _, duplicate := memberAssignments[tp]; duplicate {
+				return fmt.Errorf("consumer group %q member %q has duplicate topic-partition %s:%d", name, memberID, tp.Topic, tp.Partition)
+			}
+			if owner, duplicate := assigned[tp]; duplicate {
+				return fmt.Errorf("consumer group %q topic-partition %s:%d is assigned to both %q and %q", name, tp.Topic, tp.Partition, owner, memberID)
+			}
+			memberAssignments[tp] = struct{}{}
+			assigned[tp] = memberID
+		}
+	}
+	for memberID := range snap.TopicAssignments {
+		if _, ok := snap.Members[memberID]; !ok {
+			return fmt.Errorf("consumer group %q snapshot has assignments for unknown member %q", name, memberID)
+		}
+	}
+	return nil
+}
+
+func snapshotTopicMatches(snap *GroupStateSnapshot, topicName string) bool {
+	if len(snap.Topics) == 0 {
+		return groupTopicMatches(snap.TopicName, topicName)
+	}
+	for _, subscribed := range snap.Topics {
+		if subscribed == topicName {
+			return true
+		}
+	}
+	return false
+}
+
+func snapshotPartitionDeclared(snap *GroupStateSnapshot, topicName string, partition int) bool {
+	if len(snap.TopicPartitions) == 0 {
+		return partition >= 0 && partition < len(snap.Partitions)
+	}
+	for _, declared := range snap.TopicPartitions {
+		if declared.Topic == topicName && declared.Partition == partition {
+			return true
+		}
+	}
+	return false
 }

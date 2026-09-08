@@ -14,6 +14,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestCommandHandlerMultiTopicGroupSubscription(t *testing.T) {
+	cfg := config.DefaultConfig()
+	hp := &mockHandlerProvider{}
+	tm := topic.NewTopicManager(cfg, hp, nil)
+	require.NoError(t, tm.CreateTopic("orders", 2, false, false))
+	require.NoError(t, tm.CreateTopic("payments", 1, false, false))
+	coord := coordinator.NewCoordinator(context.Background(), cfg, &DummyPublisher{})
+	ch := controller.NewCommandHandler(tm, cfg, coord, nil, nil)
+	ctx := controller.NewClientContext("", 0)
+
+	resp := ch.HandleCommand("REGISTER_GROUP group=workers topics=payments,orders", ctx)
+	require.Contains(t, resp, "registered=true")
+	resp = ch.HandleCommand("JOIN_GROUP group=workers member=worker", ctx)
+	require.Contains(t, resp, "topic_assignments=")
+	status, err := coord.GetGroupStatus("workers")
+	require.NoError(t, err)
+	require.Equal(t, []string{"orders", "payments"}, status.Topics)
+	require.Equal(t, 3, status.PartitionCount)
+	require.Len(t, coord.GetMemberTopicAssignments("workers", ctx.MemberID), 3)
+}
+
 type DummyPublisher struct{}
 
 func (d *DummyPublisher) Publish(topic string, msg *types.Message) error {
