@@ -122,6 +122,11 @@ func TestReplicaResponsePreservesWireRetryClassification(t *testing.T) {
 	require.True(t, retryableClassification.Retryable())
 	require.False(t, errors.Is(retryable, ErrPartitionLeaderFenced))
 
+	lagging := classifiedReplicaResponseError("node2", `ERROR: replica_offset_gap reason="replica offset gap: expected 95, got 96"`)
+	var laggingClassification interface{ Retryable() bool }
+	require.ErrorAs(t, lagging, &laggingClassification)
+	require.True(t, laggingClassification.Retryable())
+
 	terminal := classifiedReplicaResponseError("node2", "ERROR: STALE_LEADER_EPOCH current=8")
 	var terminalClassification interface{ Retryable() bool }
 	require.ErrorAs(t, terminal, &terminalClassification)

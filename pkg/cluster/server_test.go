@@ -29,6 +29,10 @@ func (m *MockServiceDiscovery) AddNode(nodeID string, addr string) (string, erro
 	args := m.Called(nodeID, addr)
 	return args.String(0), args.Error(1)
 }
+func (m *MockServiceDiscovery) AddNodeWithTransactionCoordinatorShards(nodeID string, addr string, shardCount int) (string, error) {
+	args := m.Called(nodeID, addr, shardCount)
+	return args.String(0), args.Error(1)
+}
 func (m *MockServiceDiscovery) RemoveNode(nodeID string) (string, error) {
 	args := m.Called(nodeID)
 	return args.String(0), args.Error(1)
@@ -125,6 +129,15 @@ func TestClusterServer_Join(t *testing.T) {
 		brokerError, err := wire.DecodeError(response.Payload)
 		require.NoError(t, err)
 		assert.Equal(t, "cluster_join_failed", brokerError.Code)
+		msd.AssertExpectations(t)
+	})
+
+	t.Run("Join Passes Transaction Coordinator Shards", func(t *testing.T) {
+		msd.On("AddNodeWithTransactionCoordinatorShards", "node3", "127.0.0.1:9003", 7).Return("leader-addr", nil).Once()
+		response := clusterRoundTrip(t, addr, wire.CommandJoinCluster, map[string]string{
+			"node_id": "node3", "address": "127.0.0.1:9003", "transaction_coordinator_shards": "7",
+		})
+		require.Equal(t, wire.StatusOK, response.Status)
 		msd.AssertExpectations(t)
 	})
 }

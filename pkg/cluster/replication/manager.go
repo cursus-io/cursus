@@ -121,7 +121,7 @@ type RaftReplicationManager struct {
 }
 
 func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID string, topicManager *topic.TopicManager, coordinator *coordinator.Coordinator, client client.TCPClusterClient) (*RaftReplicationManager, error) {
-	brokerFSM := fsm.NewBrokerFSM(topicManager, coordinator)
+	brokerFSM := fsm.NewBrokerFSMWithTransactionCoordinatorShards(topicManager, coordinator, cfg.TransactionCoordinatorShards)
 
 	localAddr := fmt.Sprintf("%s:%d", cfg.AdvertisedHost, cfg.RaftPort)
 	raftCfg, err := buildRaftConfig(cfg, brokerID)
@@ -499,7 +499,13 @@ func (rm *RaftReplicationManager) GetConfiguration() raft.ConfigurationFuture {
 func (rm *RaftReplicationManager) ApplyCommand(prefix string, data []byte) error {
 	fullCmd := []byte(fmt.Sprintf("%s:%s", prefix, string(data)))
 	future := rm.raft.Apply(fullCmd, 5*time.Second)
-	return future.Error()
+	if err := future.Error(); err != nil {
+		return err
+	}
+	if err, ok := future.Response().(error); ok {
+		return err
+	}
+	return nil
 }
 
 func (rm *RaftReplicationManager) AddVoter(id string, addr string) error {

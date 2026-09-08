@@ -44,12 +44,12 @@ func backoffDelay(attempt int, base time.Duration) time.Duration {
 
 // isDistributed returns true if the broker is running in distributed cluster mode.
 func (ch *CommandHandler) isDistributed() bool {
-	return ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil
+	return ch != nil && ch.Config != nil && ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.RaftManager != nil
 }
 
 // hasRouter returns true if distributed mode is enabled with a working router.
 func (ch *CommandHandler) hasRouter() bool {
-	return ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.Router != nil
+	return ch != nil && ch.Config != nil && ch.Config.EnabledDistribution && ch.Cluster != nil && ch.Cluster.Router != nil
 }
 
 func (ch *CommandHandler) ProcessCommand(cmd string) string {
@@ -223,7 +223,16 @@ func (ch *CommandHandler) checkCoordinator(groupName string) (AdvertisedAddr, bo
 }
 
 func (ch *CommandHandler) checkTransactionCoordinator(txnID string) (AdvertisedAddr, bool, error) {
-	return ch.checkCoordinatorKey(transactionCoordinatorKey(txnID), fmt.Sprintf("FIND_COORDINATOR transactional_id=%s", txnID))
+	if !ch.hasRouter() {
+		return AdvertisedAddr{}, true, nil
+	}
+	id, raftAddr, _, err := ch.Cluster.Router.FindTransactionCoordinator(txnID)
+	if err != nil {
+		return AdvertisedAddr{}, false, fmt.Errorf("coordinator unavailable: %w", err)
+	}
+	return ch.checkResolvedCoordinator(id, raftAddr, fmt.Sprintf("FIND_COORDINATOR transactional_id=%s", txnID), func(req string) (string, error) {
+		return ch.Cluster.Router.ForwardToTransactionCoordinator(txnID, req)
+	})
 }
 
 func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (AdvertisedAddr, bool, error) {
@@ -234,6 +243,12 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 	if err != nil {
 		return AdvertisedAddr{}, false, fmt.Errorf("coordinator unavailable: %w", err)
 	}
+	return ch.checkResolvedCoordinator(id, raftAddr, findCmd, func(req string) (string, error) {
+		return ch.Cluster.Router.ForwardToCoordinator(coordKey, req)
+	})
+}
+
+func (ch *CommandHandler) checkResolvedCoordinator(id, raftAddr, findCmd string, forward func(string) (string, error)) (AdvertisedAddr, bool, error) {
 	if id == ch.Cluster.Router.BrokerID() {
 		return AdvertisedAddr{}, true, nil
 	}
@@ -259,7 +274,7 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 		}
 	}
 
-	resp, fwdErr := ch.Cluster.Router.ForwardToCoordinator(coordKey, findCmd)
+	resp, fwdErr := forward(findCmd)
 	if fwdErr == nil && strings.HasPrefix(resp, "OK") {
 		host, port := "", 0
 		for _, part := range strings.Fields(resp) {

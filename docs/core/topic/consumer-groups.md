@@ -164,13 +164,11 @@ commit `15`.
 
 Standalone `REGISTER_GROUP` writes a versioned durable registration before returning success, so a group with no commit survives restart with its topic and partition mapping and `FETCH_OFFSET=0`. Offset commits write complete, monotonically revised next-offset snapshots; deletion writes a higher lifecycle tombstone before removing memory state. Startup replays lifecycle records before snapshots, independent of physical internal-partition order.
 
-The internal `__consumer_offsets` topic is compacted but is never subject to application time/size delete retention. Corrupt, inconsistent, or unversioned replay fails readiness rather than presenting a healthy empty coordinator. Pre-manifest storage and `.deleted` offset evidence may be archived for forensics but cannot be imported; use the [standalone clean-bootstrap procedure](../../standalone-storage-recovery.md). In distributed mode, fenced offset updates flow through the Raft FSM and are included in version-9 FSM snapshots.
+The internal `__consumer_offsets` topic is compacted but is never subject to application time/size delete retention. Corrupt, inconsistent, or unversioned replay fails readiness rather than presenting a healthy empty coordinator. Pre-manifest storage and `.deleted` offset evidence may be archived for forensics but cannot be imported; use the [standalone clean-bootstrap procedure](../../standalone-storage-recovery.md). In distributed mode, new fenced offset updates use the replicated `__consumer_offsets` partition log; version-9 FSM snapshots retain compatibility state for older Raft offset records.
 
 ### Commit and Resume Contract
-A group is bound to the topic supplied at registration. `JOIN_GROUP`,
-`SYNC_GROUP`, `HEARTBEAT`, and `LEAVE_GROUP` must name that topic (or a topic
-accepted by the registered topic pattern). A mismatch returns
-`ERROR: topic_not_assigned_to_group ...` without changing membership.
+
+A group may use `topic=<topic>` registration or register `topics=<csv>` or `pattern=<glob>`. The broker persists the subscription and assigns concrete `(topic, partition)` pairs across members. Multi-topic `JOIN_GROUP` and `SYNC_GROUP` omit `topic` and return `topic_assignments=orders:P0,payments:P0,...`. Topic-specific offset commands continue to name the concrete topic.
 
 
 Use these broker commands:
@@ -192,10 +190,8 @@ group/partition, even if the request includes a lower explicit `offset=`.
 
 Commits are monotonic. A commit lower than the current offset is rejected and the
 stored offset is left unchanged. Recommitting the same offset is idempotent.
-Every commit is fenced by the current member, generation, and partition
-assignment. In distributed mode this validation runs again when the replicated
-metadata entry is applied, so a rebalance between request parsing and state
-application cannot commit an offset for a stale owner. A rejected batch applies
+Every commit is fenced by the current member, generation, lifecycle epoch, and partition
+assignment before the acknowledged `__consumer_offsets` append. A rejected batch applies
 none of its offsets. Batch entries are parsed strictly, so malformed entries,
 invalid partitions or offsets, and duplicate partitions also reject the whole
 batch.
@@ -213,12 +209,7 @@ Committing before processing gives at-most-once behavior for that client: a cras
 after the commit can skip unprocessed records. Consumer-group commits alone do
 not make external side effects exactly once.
 
-For a consume-process-produce workflow, `SEND_OFFSETS_TO_TXN` may stage several
-partitions only when they all share one `(topic, group, member, generation)`
-scope. The transaction applies those offsets through one fenced bulk commit and
-keeps output hidden until the partition markers and durable coordinator decision
-agree. Use separate transactions for separate consumer scopes, and keep
-non-broker effects idempotent or transactional in their own system.
+For a consume-process-produce workflow, `SEND_OFFSETS_TO_TXN` may be called for several topics when all offsets share one `(group, member, generation, registrationEpoch)` session. The transaction advances the complete topic-partition set under one fence and keeps output hidden until partition markers and the durable coordinator decision agree. This provides exactly-once broker processing; keep non-broker effects idempotent or transactional in their own system.
 
 Network consumers should use `read_committed` unless they intentionally need the
 raw committed partition log. `read_uncommitted` can include unresolved

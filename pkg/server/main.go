@@ -123,6 +123,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		go closeListenerOnDone(ctx, discoveryListener)
 
 		cc = clusterController.NewClusterController(ctx, cfg, rm, sd, brokerID, localAddr)
+		sd.StartReconciler(ctx)
 
 		// Start background heartbeats to all cluster members
 		clusterClient.StartHeartbeat(
@@ -145,7 +146,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			// Wait a bit for Raft to initialize
 			time.Sleep(2 * time.Second)
 
-			if err := clusterClient.JoinCluster(cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort); err != nil {
+			if err := clusterClient.JoinClusterWithTransactionCoordinatorShards(cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort, cfg.TransactionCoordinatorShards); err != nil {
 				util.Warn("⚠️ Join cluster attempt failed: %v. This is normal if already part of the cluster.", err)
 			} else {
 				util.Info("✅ Successfully joined cluster")
@@ -225,6 +226,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	if err := globalCH.RecoverPreparedTransactions(); err != nil {
 		return fmt.Errorf("failed to recover prepared transactions: %w", err)
 	}
+	globalCH.StartTransactionTimeoutMonitor(ctx)
 
 	healthState := NewHealthState()
 	addStorageReadinessChecks(healthState, tm, dm)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -112,7 +113,7 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 	if !ok || producerID == "" {
 		return "ERROR: missing_producer_id command=PUBLISH"
 	}
-	if topicName == config.ConsumerOffsetsTopicName {
+	if topicName == config.ConsumerOffsetsTopicName && (clientCtx == nil || !clientCtx.Internal) {
 		return fmt.Sprintf("ERROR: internal_topic_write_forbidden topic=%s", topicName)
 	}
 
@@ -524,6 +525,9 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 
 	if len(msgCmd.Messages) > 0 {
 		if err := p.ReplicaAppendWithMode(msgCmd.Messages, msgCmd.IsIdempotent); err != nil {
+			if errors.Is(err, topic.ErrReplicaOffsetGap) {
+				return fmt.Sprintf("ERROR: replica_offset_gap reason=%q", err.Error())
+			}
 			return fmt.Sprintf("ERROR: replica_append_failed reason=%q", err.Error())
 		}
 	}

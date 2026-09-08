@@ -62,19 +62,20 @@ func buildErrorRegistry() map[string]ErrorClassification {
 	)
 	register(ErrorClassAvailability, true,
 		"cluster_metadata_unavailable", "cluster_not_available", "coordinator_not_available", "fsm_not_available",
-		"insufficient_in_sync_replicas", "leader_election_result_unavailable", "leader_not_found", "no_raft_leader", "offset_manager_not_available", "replication_unavailable", "request_cancelled", "router_not_available",
+		"insufficient_in_sync_replicas", "leader_election_result_unavailable", "leader_not_found", "no_raft_leader", "offset_manager_not_available", "replica_offset_gap", "replication_unavailable", "request_cancelled", "router_not_available",
 		"transaction_abort_marker_failed", "transaction_commit_failed", "transaction_manager_not_available", "transaction_sync_failed",
+		"transaction_offset_materialization_failed", "transaction_offset_prepare_failed",
 	)
 	register(ErrorClassFencing, false,
 		"GEN_MISMATCH", "NOT_OWNER", "PARTITION_LEADER_FENCED", "STALE_LEADER_EPOCH", "STALE_TOPIC_LIFECYCLE_EPOCH", "member_not_found",
-		"missing_topic_lifecycle_epoch", "producer_fenced", "stale_producer_epoch",
+		"group_epoch_mismatch", "missing_topic_lifecycle_epoch", "producer_fenced", "stale_producer_epoch",
 	)
 	register(ErrorClassConflict, false,
 		"OFFSET_OUT_OF_RANGE", "leader_election_rejected", "offset_regression", "snapshot_version_exceeds_stream",
 		"producer_reinitialization_required", "topic_delete_blocked", "topic_lifecycle_pending", "topic_revision_conflict", "topic_truncate_blocked",
 		"topic_not_assigned_to_group", "transaction_aborted", "transaction_already_committed",
 		"transaction_marker_partition_not_touched", "transaction_not_abortable", "transaction_not_committing",
-		"transaction_record_not_staged", "version_conflict",
+		"transaction_not_open", "transaction_record_not_staged", "version_conflict",
 	)
 	register(ErrorClassAuthorization, false,
 		"NOT_AUTHORIZED_FOR_OPERATION", "NOT_AUTHORIZED_FOR_PARTITION", "NOT_AUTHORIZED_FOR_TOPIC", "authentication_failed", "authentication_required",
@@ -86,7 +87,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 	)
 	register(ErrorClassValidation, false,
 		"UNSUPPORTED_FEATURE", "UNSUPPORTED_PROTOCOL_VERSION", "batch_decode_failed", "decode_failed",
-		"distribution_not_enabled", "distribution_required", "duplicate_partition", "empty_command", "empty_messages",
+		"consumer_group_subscriptions_feature_required", "distribution_not_enabled", "distribution_required", "duplicate_partition", "empty_command", "empty_messages",
 		"empty_required_params", "event_sourcing_not_enabled", "invalid_acks", "invalid_batch_commit_entry", "invalid_batch_commit_format", "invalid_min_in_sync_replicas",
 		"invalid_auth", "invalid_consume_syntax", "invalid_control_batch_bytes", "invalid_control_batch_coordinator_epoch",
 		"invalid_control_batch_version", "invalid_commit_watermark", "invalid_epoch", "invalid_generation", "invalid_is_idempotent",
@@ -94,7 +95,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"invalid_protocol_features", "invalid_protocol_version", "invalid_replication_factor", "invalid_require_features",
 		"invalid_transaction_control_batch", "invalid_transaction_control_epoch", "invalid_transaction_control_record",
 		"invalid_transaction_marker", "invalid_transaction_marker_producer", "invalid_transaction_result",
-		"invalid_transaction_state", "invalid_txn_offsets",
+		"invalid_group_epoch", "invalid_subscription", "invalid_transaction_state", "invalid_txn_offsets",
 		"invalid_retention_bytes", "invalid_retention_hours", "invalid_schema_version", "invalid_seq_num",
 		"invalid_snapshot_catchup_response", "invalid_snapshot_payload", "invalid_stream_syntax",
 		"invalid_expected_revision", "invalid_topic_name", "invalid_topic_policy", "invalid_version", "invalid_from_version", "malformed_input", "missing_expected_revision", "missing_generation", "missing_group", "missing_key",
@@ -102,7 +103,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"missing_broker", "missing_leader_fence", "missing_member", "missing_message", "missing_offset", "missing_partition", "missing_payload",
 		"missing_coordinator_key", "missing_ownership_params", "missing_producer_id", "missing_protocol_version",
 		"missing_min_in_sync_replicas", "missing_required_params", "missing_topic", "missing_transactional_id",
-		"missing_version", "no_valid_offsets", "unknown_command", "unmarshal_failed",
+		"missing_version", "no_valid_offsets", "transactional_processing_feature_required", "unknown_command", "unmarshal_failed",
 	)
 	register(ErrorClassInternal, false,
 		"append_stream_failed", "broker_error", "command_failed", "coordinator_error", "create_topic_failed",

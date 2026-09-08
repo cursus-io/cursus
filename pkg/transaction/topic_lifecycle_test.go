@@ -29,3 +29,26 @@ func TestPruneTopicReferencesBlocksActiveAndFiltersTerminalTransactions(t *testi
 	require.Equal(t, []MessageOperation{{Topic: "audit", Partition: 0}}, state.Messages)
 	require.Equal(t, []OffsetOperation{{Topic: "audit", Group: "auditors"}}, state.Offsets)
 }
+
+func TestTopicPruningRejectsRecoveryPendingTransactions(t *testing.T) {
+	states := []State{StatePrepareCommit, StatePrepareAbort}
+	for _, state := range states {
+		t.Run(string(state), func(t *testing.T) {
+			_, _, err := stateWithoutTopicReferencesLocked(map[string]*Snapshot{
+				"txn": {ID: "txn", Mode: ModeProcessingV1, State: state, Messages: []MessageOperation{{Topic: "orders"}}},
+			}, "orders")
+			require.ErrorContains(t, err, "active transaction")
+		})
+	}
+
+	_, _, err := stateWithoutTopicReferencesLocked(map[string]*Snapshot{
+		"txn": {
+			ID:                  "txn",
+			Mode:                ModeProcessingV1,
+			State:               StateCommitted,
+			OffsetsMaterialized: false,
+			Offsets:             []OffsetOperation{{Topic: "orders"}},
+		},
+	}, "orders")
+	require.ErrorContains(t, err, "active transaction")
+}

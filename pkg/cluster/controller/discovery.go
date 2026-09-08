@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -98,6 +99,22 @@ func (sd *serviceDiscovery) UpdateHeartbeat(nodeID string) {
 	if sd.rm != nil && sd.rm.GetISRManager() != nil {
 		sd.rm.GetISRManager().UpdateHeartbeat(nodeID)
 	}
+	if sd.rm == nil || !sd.rm.IsLeader() || sd.fsm == nil {
+		return
+	}
+	broker := sd.fsm.GetBroker(nodeID)
+	if broker == nil || broker.Status == "active" {
+		return
+	}
+	broker.Status = "active"
+	broker.LastSeen = time.Now()
+	broker.TransactionCoordinatorShards = sd.transactionCoordinatorShardCount()
+	data, err := json.Marshal(broker)
+	if err == nil {
+		if err := sd.rm.ApplyCommand("REGISTER", data); err != nil {
+			util.Warn("Failed to reactivate broker %s after heartbeat: %v", nodeID, err)
+		}
+	}
 }
 
 func (sd *serviceDiscovery) HandleHeartbeat(nodeID string, proofs []fsm.ISRCatchupProof) error {
@@ -124,9 +141,20 @@ func (sd *serviceDiscovery) FetchReplicaCatchup(request fsm.ReplicaCatchupReques
 }
 
 func (sd *serviceDiscovery) AddNode(nodeID string, addr string) (string, error) {
+	return sd.AddNodeWithTransactionCoordinatorShards(nodeID, addr, sd.transactionCoordinatorShardCount())
+}
+
+func (sd *serviceDiscovery) AddNodeWithTransactionCoordinatorShards(nodeID string, addr string, shardCount int) (string, error) {
 	leaderAddr := sd.rm.GetLeaderAddress()
 	if !sd.rm.IsLeader() {
 		return leaderAddr, fmt.Errorf("not leader; contact leader at %s", leaderAddr)
+	}
+	clusterShardCount := sd.fsm.TransactionCoordinatorShardCount()
+	if shardCount == 0 {
+		shardCount = transaction.DefaultCoordinatorShardCount
+	}
+	if shardCount != clusterShardCount {
+		return leaderAddr, fmt.Errorf("transaction coordinator shard count mismatch: broker=%s configured=%d cluster=%d", nodeID, shardCount, clusterShardCount)
 	}
 
 	if err := sd.rm.AddVoter(nodeID, addr); err != nil {
@@ -135,10 +163,11 @@ func (sd *serviceDiscovery) AddNode(nodeID string, addr string) (string, error) 
 	}
 
 	broker := &fsm.BrokerInfo{
-		ID:       nodeID,
-		Addr:     addr,
-		Status:   "active",
-		LastSeen: time.Now(),
+		ID:                           nodeID,
+		Addr:                         addr,
+		Status:                       "active",
+		LastSeen:                     time.Now(),
+		TransactionCoordinatorShards: shardCount,
 	}
 
 	data, err := json.Marshal(broker)
@@ -239,6 +268,17 @@ func (sd *serviceDiscovery) Reconcile() {
 
 	for _, b := range fsmBrokers {
 		fsmMap[b.ID] = true
+		if b.Status == "active" && !sd.brokerAlive(b.ID) {
+			util.Warn("Broker %s heartbeat expired; marking inactive", b.ID)
+			payload := map[string]string{"id": b.ID}
+			data, err := json.Marshal(payload)
+			if err == nil {
+				if err := sd.rm.ApplyCommand("DEREGISTER", data); err != nil {
+					util.Error("Failed to mark broker %s inactive: %v", b.ID, err)
+				}
+			}
+			continue
+		}
 		if _, exists := raftMap[b.ID]; !exists {
 			util.Warn("Node %s found in FSM but missing in Raft. Cleaning up...", b.ID)
 			payload := map[string]string{"id": b.ID}
@@ -259,10 +299,11 @@ func (sd *serviceDiscovery) Reconcile() {
 		if !fsmMap[id] {
 			util.Warn("Node %s found in Raft but missing in FSM. Repairing...", id)
 			broker := &fsm.BrokerInfo{
-				ID:       id,
-				Addr:     addr,
-				Status:   "active",
-				LastSeen: time.Now(),
+				ID:                           id,
+				Addr:                         addr,
+				Status:                       "active",
+				LastSeen:                     time.Now(),
+				TransactionCoordinatorShards: sd.transactionCoordinatorShardCount(),
 			}
 			if id == sd.brokerID && sd.clientAddr != "" {
 				broker.ClientAddr = sd.clientAddr
@@ -279,4 +320,22 @@ func (sd *serviceDiscovery) Reconcile() {
 			}
 		}
 	}
+}
+
+func (sd *serviceDiscovery) transactionCoordinatorShardCount() int {
+	if sd.fsm == nil {
+		return 0
+	}
+	return sd.fsm.ConfiguredTransactionCoordinatorShardCount()
+}
+
+func (sd *serviceDiscovery) brokerAlive(brokerID string) bool {
+	if brokerID == sd.brokerID {
+		return true
+	}
+	if sd.rm == nil || sd.rm.GetISRManager() == nil {
+		return true
+	}
+	liveness, ok := sd.rm.GetISRManager().(interface{ IsBrokerAlive(string) bool })
+	return !ok || liveness.IsBrokerAlive(brokerID)
 }

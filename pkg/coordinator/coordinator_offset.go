@@ -3,6 +3,7 @@ package coordinator
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/cursus-io/cursus/pkg/types"
@@ -11,6 +12,10 @@ import (
 
 func calculateOffsetPartitionCount(groupCount int) int {
 	return min(max(groupCount/10, 4), 50)
+}
+
+func (c *Coordinator) authoritativeOffsetWritesEnabled() bool {
+	return c.standalone || c.offsetRecordWriter != nil
 }
 
 func (c *Coordinator) CommitOffset(groupName, topic string, partition int, offset uint64) error {
@@ -43,13 +48,14 @@ func (c *Coordinator) commitOffsetForGroupLocked(gm *GroupMetadata, groupName, t
 		return err
 	}
 
-	if partition < 0 || partition >= len(gm.Partitions) {
-		return fmt.Errorf("invalid partition %d for group=%s partition_count=%d", partition, groupName, len(gm.Partitions))
+	partitionCount := groupTopicPartitionCount(gm, topic)
+	if partition < 0 || partition >= partitionCount {
+		return fmt.Errorf("invalid partition %d for group=%s topic=%s partition_count=%d", partition, groupName, topic, partitionCount)
 	}
 	if current, ok := gm.getOffsetSafe(topic, partition); ok && offset < current {
 		return fmt.Errorf("offset regression for group=%s topic=%s partition=%d: current=%d attempted=%d", groupName, topic, partition, current, offset)
 	}
-	if c.standalone {
+	if c.authoritativeOffsetWritesEnabled() {
 		if gm.RegistrationEpoch == 0 {
 			return fmt.Errorf("group %q requires durable registration before offset commit", groupName)
 		}
@@ -108,8 +114,8 @@ func (c *Coordinator) ValidateAndCommitOffsetsBulk(groupName, topic, memberID st
 	}
 	group := c.groups[groupName]
 	for _, item := range offsets {
-		if !contains(group.Members[memberID].Assignments, item.Partition) {
-			return fmt.Errorf("ERROR: NOT_OWNER partition=%d member=%s group=%s generation=%d", item.Partition, memberID, groupName, generation)
+		if !memberOwnsTopicPartition(group, group.Members[memberID], topic, item.Partition) {
+			return fmt.Errorf("ERROR: NOT_OWNER topic=%s partition=%d member=%s group=%s generation=%d", topic, item.Partition, memberID, groupName, generation)
 		}
 	}
 	return c.commitOffsetsBulkForGroup(group, groupName, topic, offsets)
@@ -125,12 +131,13 @@ func (c *Coordinator) commitOffsetsBulkForGroupLocked(gm *GroupMetadata, groupNa
 	if err := validateOffsetBatchLocked(gm, groupName, topic, offsets); err != nil {
 		return err
 	}
+	partitionCount := groupTopicPartitionCount(gm, topic)
 	for _, item := range offsets {
-		if item.Partition < 0 || item.Partition >= len(gm.Partitions) {
-			return fmt.Errorf("invalid partition %d for group=%s partition_count=%d", item.Partition, groupName, len(gm.Partitions))
+		if item.Partition < 0 || item.Partition >= partitionCount {
+			return fmt.Errorf("invalid partition %d for group=%s topic=%s partition_count=%d", item.Partition, groupName, topic, partitionCount)
 		}
 	}
-	if c.standalone {
+	if c.authoritativeOffsetWritesEnabled() {
 		if gm.RegistrationEpoch == 0 {
 			return fmt.Errorf("group %q requires durable registration before offset commit", groupName)
 		}
@@ -163,6 +170,147 @@ func (c *Coordinator) commitOffsetsBulkForGroupLocked(gm *GroupMetadata, groupNa
 	// read-only so it cannot grow without bound.
 	for _, item := range offsets {
 		gm.storeOffset(topic, item.Partition, item.Offset)
+	}
+	return nil
+}
+
+func memberOwnsTopicPartition(group *GroupMetadata, member *MemberMetadata, topic string, partition int) bool {
+	for _, assignment := range member.TopicAssignments {
+		if assignment.Topic == topic && assignment.Partition == partition {
+			return true
+		}
+	}
+	return len(member.TopicAssignments) == 0 && groupTopicMatches(group.TopicName, topic) && contains(member.Assignments, partition)
+}
+
+// ValidateAndCommitTopicOffsetsBulk validates and applies a multi-topic offset
+// set under one group membership fence.
+func (c *Coordinator) ValidateAndCommitTopicOffsetsBulk(groupName, memberID string, generation int, offsets map[string][]OffsetItem) error {
+	return c.ValidateAndCommitTopicOffsetsBulkForEpoch(groupName, memberID, generation, 0, offsets)
+}
+
+func (c *Coordinator) ValidateAndCommitTopicOffsetsBulkForEpoch(groupName, memberID string, generation int, registrationEpoch uint64, offsets map[string][]OffsetItem) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.lifecyclePending[groupName] {
+		return fmt.Errorf("group %q lifecycle update in progress", groupName)
+	}
+	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
+		return fmt.Errorf("%s", errResp)
+	}
+	group := c.groups[groupName]
+	if registrationEpoch != 0 && group.RegistrationEpoch != registrationEpoch {
+		return fmt.Errorf("ERROR: group_epoch_mismatch group=%s expected=%d actual=%d", groupName, registrationEpoch, group.RegistrationEpoch)
+	}
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	topics := make([]string, 0, len(offsets))
+	for topic := range offsets {
+		topics = append(topics, topic)
+	}
+	sort.Strings(topics)
+	for _, topic := range topics {
+		if err := validateOffsetBatchLocked(group, groupName, topic, offsets[topic]); err != nil {
+			return err
+		}
+		count := groupTopicPartitionCount(group, topic)
+		for _, item := range offsets[topic] {
+			if item.Partition < 0 || item.Partition >= count {
+				return fmt.Errorf("invalid partition %d for group=%s topic=%s partition_count=%d", item.Partition, groupName, topic, count)
+			}
+			if !memberOwnsTopicPartition(group, group.Members[memberID], topic, item.Partition) {
+				return fmt.Errorf("ERROR: NOT_OWNER topic=%s partition=%d member=%s group=%s generation=%d", topic, item.Partition, memberID, groupName, generation)
+			}
+		}
+	}
+	durableWrites := c.authoritativeOffsetWritesEnabled()
+	if durableWrites {
+		if group.RegistrationEpoch == 0 {
+			return fmt.Errorf("group %q requires durable registration before offset commit", groupName)
+		}
+		return c.writeAndApplyOffsetSnapshotsLocked(group, groupName, group.RegistrationEpoch, topics, offsets)
+	}
+	for _, topic := range topics {
+		for _, item := range offsets[topic] {
+			group.storeOffset(topic, item.Partition, item.Offset)
+		}
+	}
+	return nil
+}
+
+// MaterializeCommittedTransactionOffsets advances the ordinary durable
+// snapshot after the transaction decision is committed.
+func (c *Coordinator) MaterializeCommittedTransactionOffsets(groupName string, registrationEpoch uint64, offsets map[string][]OffsetItem) error {
+	if len(offsets) == 0 {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	group := c.groups[groupName]
+	if group == nil {
+		return fmt.Errorf("group %q not found", groupName)
+	}
+	if group.RegistrationEpoch != registrationEpoch {
+		return fmt.Errorf("ERROR: group_epoch_mismatch group=%s expected=%d actual=%d", groupName, registrationEpoch, group.RegistrationEpoch)
+	}
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	topics := make([]string, 0, len(offsets))
+	for topic := range offsets {
+		topics = append(topics, topic)
+	}
+	sort.Strings(topics)
+	for _, topic := range topics {
+		if err := validateOffsetBatchLocked(group, groupName, topic, offsets[topic]); err != nil {
+			return err
+		}
+	}
+	return c.writeAndApplyOffsetSnapshotsLocked(group, groupName, registrationEpoch, topics, offsets)
+}
+
+func (c *Coordinator) writeAndApplyOffsetSnapshotsLocked(group *GroupMetadata, groupName string, registrationEpoch uint64, topics []string, offsets map[string][]OffsetItem) error {
+	for _, topic := range topics {
+		items := mergedOffsetSnapshot(group, topic, offsets[topic])
+		revision := group.OffsetRevisions[topic] + 1
+		if err := c.writeOffsetSnapshot(groupName, topic, registrationEpoch, revision, items); err != nil {
+			return err
+		}
+		for _, item := range offsets[topic] {
+			group.storeOffset(topic, item.Partition, item.Offset)
+		}
+		group.OffsetRevisions[topic] = revision
+	}
+	return nil
+}
+
+// ApplyFencedTopicOffsetUpdateFromFSM is the replay-only compatibility path
+// for historical BATCH_OFFSET records. It never emits a new offset record.
+func (c *Coordinator) ApplyFencedTopicOffsetUpdateFromFSM(groupName, memberID string, generation int, registrationEpoch uint64, offsets map[string][]OffsetItem) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
+		return fmt.Errorf("%s", errResp)
+	}
+	group := c.groups[groupName]
+	if registrationEpoch != 0 && group.RegistrationEpoch != registrationEpoch {
+		return fmt.Errorf("ERROR: group_epoch_mismatch group=%s expected=%d actual=%d", groupName, registrationEpoch, group.RegistrationEpoch)
+	}
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	for topic, items := range offsets {
+		if err := validateOffsetBatchLocked(group, groupName, topic, items); err != nil {
+			return err
+		}
+		for _, item := range items {
+			if !memberOwnsTopicPartition(group, group.Members[memberID], topic, item.Partition) {
+				return fmt.Errorf("ERROR: NOT_OWNER topic=%s partition=%d member=%s group=%s generation=%d", topic, item.Partition, memberID, groupName, generation)
+			}
+		}
+	}
+	for topic, items := range offsets {
+		for _, item := range items {
+			group.storeOffset(topic, item.Partition, item.Offset)
+		}
 	}
 	return nil
 }
@@ -222,10 +370,42 @@ func validateOffsetBatchLocked(group *GroupMetadata, groupName, topic string, of
 }
 
 func validateGroupTopicLocked(group *GroupMetadata, groupName, topic string) error {
-	if group.TopicName != "" && !groupTopicMatches(group.TopicName, topic) {
+	if !groupAcceptsTopic(group, topic) {
 		return fmt.Errorf("topic mismatch for group=%s (existing: %s, requested: %s)", groupName, group.TopicName, topic)
 	}
 	return nil
+}
+
+func groupAcceptsTopic(group *GroupMetadata, topic string) bool {
+	if group == nil {
+		return false
+	}
+	if len(group.Topics) > 0 {
+		for _, subscribed := range group.Topics {
+			if subscribed == topic {
+				return true
+			}
+		}
+		return false
+	}
+	return group.TopicName == "" || groupTopicMatches(group.TopicName, topic)
+}
+
+func topicPartitionCount(partitions []TopicPartition, topic string) int {
+	count := 0
+	for _, tp := range partitions {
+		if tp.Topic == topic && tp.Partition+1 > count {
+			count = tp.Partition + 1
+		}
+	}
+	return count
+}
+
+func groupTopicPartitionCount(group *GroupMetadata, topic string) int {
+	if len(group.TopicPartitions) > 0 {
+		return topicPartitionCount(group.TopicPartitions, topic)
+	}
+	return len(group.Partitions)
 }
 
 func groupTopicMatches(pattern, topic string) bool {
@@ -291,8 +471,18 @@ func (c *Coordinator) GetOffset(groupName, topic string, partition int) (uint64,
 	}
 
 	gm.mu.RLock()
-	defer gm.mu.RUnlock()
-	return gm.getOffsetSafe(topic, partition)
+	base, baseOK := gm.getOffsetSafe(topic, partition)
+	epoch := gm.RegistrationEpoch
+	gm.mu.RUnlock()
+	c.mu.RLock()
+	resolver := c.transactionalOffsets
+	c.mu.RUnlock()
+	if resolver != nil {
+		if committed, ok := resolver.CommittedOffset(groupName, topic, partition, epoch); ok && (!baseOK || committed > base) {
+			return committed, true
+		}
+	}
+	return base, baseOK
 }
 
 // updateOffsetPartitionCount updates the number of partitions for the internal offset topic.

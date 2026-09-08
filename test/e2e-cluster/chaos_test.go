@@ -58,7 +58,7 @@ func TestChaosLeaderFailoverRetryAndOffsetDurability(t *testing.T) {
 		And(e2e.NoDuplicateMessages())
 }
 
-func TestChaosTransactionCoordinatorRestartPreservesAtomicVisibility(t *testing.T) {
+func TestChaosTransactionCoordinatorFailoverAbortsTimedOutTransaction(t *testing.T) {
 	if os.Getenv("RUN_E2E_CHAOS") != "1" {
 		t.Skip("set RUN_E2E_CHAOS=1 to run long cluster chaos validation")
 	}
@@ -125,10 +125,18 @@ func TestChaosTransactionCoordinatorRestartPreservesAtomicVisibility(t *testing.
 	}
 	txnClient.Close()
 	actions.KillBroker(coordinatorNode)
-	actions.StartBroker(coordinatorNode)
 
 	recoveryClient := e2e.NewBrokerClient(ctx.GetBrokerAddrs())
 	defer recoveryClient.Close()
+	if err := eventually(t, "transaction coordinator shard reassignment", clusterReadyTimeout, func() (bool, string, error) {
+		currentCoordinator, findErr := recoveryClient.FindTransactionCoordinator(txnID)
+		if findErr != nil {
+			return false, "FIND_COORDINATOR failed", findErr
+		}
+		return currentCoordinator != coordinatorID, fmt.Sprintf("coordinator=%s", currentCoordinator), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	var status e2e.TransactionStatus
 	if err := eventually(t, "transaction coordinator recovery", clusterReadyTimeout, func() (bool, string, error) {
 		current, statusErr := recoveryClient.GetTransactionStatus(txnID)
@@ -136,29 +144,22 @@ func TestChaosTransactionCoordinatorRestartPreservesAtomicVisibility(t *testing.
 			return false, "TXN_STATUS failed", statusErr
 		}
 		status = current
-		return status.State == "open" && status.Messages == 2 && status.Offsets == 2, fmt.Sprintf("state=%s messages=%d offsets=%d", status.State, status.Messages, status.Offsets), nil
+		return status.State == "aborted" && status.Participants == 2 && status.Offsets == 2, fmt.Sprintf("state=%s participants=%d offsets=%d", status.State, status.Participants, status.Offsets), nil
 	}); err != nil {
 		t.Fatal(err)
-	}
-	if err := recoveryClient.EndTransaction(txnID, producer, "commit"); err != nil {
-		t.Fatalf("commit recovered transaction: %v", err)
-	}
-	if err := recoveryClient.EndTransaction(txnID, producer, "commit"); err != nil {
-		t.Fatalf("retry committed transaction: %v", err)
 	}
 
 	for partition := 0; partition < 2; partition++ {
 		messages := consumeFromPartitionLeader(t, ctx.GetBrokerAddrs(), topic, partition, visibilityGroup, visibilityMember, visibilityGeneration)
-		expected := fmt.Sprintf("transaction-partition-%d", partition)
-		if len(messages) != 1 || messages[0] != expected {
-			t.Fatalf("partition %d expected only %q after commit, got %v", partition, expected, messages)
+		if len(messages) != 0 {
+			t.Fatalf("partition %d exposed aborted transaction: %v", partition, messages)
 		}
 		offset, err := offsetClient.FetchCommittedOffset(topic, partition, offsetGroup)
 		if err != nil {
 			t.Fatalf("fetch committed offset for partition %d: %v", partition, err)
 		}
-		if offset != 1 {
-			t.Fatalf("partition %d expected committed offset 1, got %d", partition, offset)
+		if offset != 0 {
+			t.Fatalf("partition %d expected offset 0 after abort, got %d", partition, offset)
 		}
 	}
 }

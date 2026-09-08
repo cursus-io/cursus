@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/cluster/replication"
@@ -19,6 +20,127 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/stretchr/testify/require"
 )
+
+func TestTransactionalProcessingV1AppendsBeforeDecisionAndCommitsOffsetsBeforeVisibility(t *testing.T) {
+	ch, tm, coord, _ := newDiskBackedTransactionHandler(t)
+	topicName, groupName, memberID := "eos-output", "eos-workers", "worker-1"
+	generation := prepareTransactionGroup(t, tm, coord, topicName, groupName, memberID)
+	ctx := NewClientContext("", 0)
+
+	initResp := ch.HandleCommand("INIT_PRODUCER_ID transactional_id=eos-1", ctx)
+	require.True(t, strings.HasPrefix(initResp, "OK "), initResp)
+	fields := parseKeyValueArgs(strings.TrimPrefix(initResp, "OK "))
+	producerID := fields["producerId"]
+	epoch, err := strconv.ParseInt(fields["epoch"], 10, 64)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(ch.HandleCommand(fmt.Sprintf("BEGIN_TXN transactional_id=eos-1 producerId=%s epoch=%d", producerID, epoch), ctx), "OK "))
+	require.True(t, strings.HasPrefix(ch.HandleCommand(fmt.Sprintf("TXN_PUBLISH transactional_id=eos-1 topic=%s partition=0 producerId=%s seqNum=1 epoch=%d message=result", topicName, producerID, epoch), ctx), "OK "))
+
+	p, err := tm.GetTopic(topicName).GetPartition(0)
+	require.NoError(t, err)
+	require.Greater(t, p.NextOffset(), uint64(0), "record must already be appended")
+	require.Empty(t, readCommittedPayloads(t, tm, topicName), "open transaction stays invisible")
+
+	send := fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=eos-1 producerId=%s epoch=%d topic=%s group=%s member=%s generation=%d offsets=P0:9", producerID, epoch, topicName, groupName, memberID, generation)
+	require.True(t, strings.HasPrefix(ch.HandleCommand(send, ctx), "OK "))
+	commit := fmt.Sprintf("END_TXN transactional_id=eos-1 producerId=%s epoch=%d result=commit", producerID, epoch)
+	require.True(t, strings.HasPrefix(ch.HandleCommand(commit, ctx), "OK "))
+	require.Equal(t, []string{"result"}, readCommittedPayloads(t, tm, topicName))
+	offset, ok := coord.GetOffset(groupName, topicName, 0)
+	require.True(t, ok)
+	require.Equal(t, uint64(9), offset)
+	var transactionalOffset, offsetMarker, materialized bool
+	for partition := 0; partition < 4; partition++ {
+		messages, readErr := tm.ReadTopicPartition("__consumer_offsets", partition, 0, 100)
+		require.NoError(t, readErr)
+		for _, message := range messages {
+			if message.TransactionalID == "eos-1" && message.TransactionMarker == types.TransactionMarkerCommit {
+				offsetMarker = true
+			}
+			record, decodeErr := coordinator.DecodeConsumerMetadataRecord(message.Payload)
+			if decodeErr != nil {
+				continue
+			}
+			if record.Type == coordinator.ConsumerMetadataRecordTransactionalOffsetSnapshot && record.TransactionalID == "eos-1" {
+				transactionalOffset = true
+			}
+			if record.Type == coordinator.ConsumerMetadataRecordOffsetSnapshot && record.Group == groupName && record.Topic == topicName {
+				materialized = true
+			}
+		}
+	}
+	require.True(t, transactionalOffset, "transactional offset record must be durable")
+	require.True(t, offsetMarker, "consumer offset partition must receive the transaction marker")
+	require.True(t, materialized, "committed offset must be materialized for long-term recovery")
+}
+
+func TestTransactionalProcessingV1TimeoutAbortsUnresolvedRecords(t *testing.T) {
+	ch, tm, _, _ := newDiskBackedTransactionHandler(t)
+	require.NoError(t, tm.CreateTopic("eos-timeout", 1, false, false))
+	ctx := NewClientContext("", 0)
+	initResp := ch.HandleCommand("INIT_PRODUCER_ID transactional_id=eos-timeout-1", ctx)
+	fields := parseKeyValueArgs(strings.TrimPrefix(initResp, "OK "))
+	producerID := fields["producerId"]
+	epoch, err := strconv.ParseInt(fields["epoch"], 10, 64)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(ch.HandleCommand(fmt.Sprintf("BEGIN_TXN transactional_id=eos-timeout-1 producerId=%s epoch=%d", producerID, epoch), ctx), "OK "))
+	require.True(t, strings.HasPrefix(ch.HandleCommand(fmt.Sprintf("TXN_PUBLISH transactional_id=eos-timeout-1 topic=eos-timeout partition=0 producerId=%s seqNum=1 epoch=%d message=discard", producerID, epoch), ctx), "OK "))
+	require.NoError(t, ch.AbortTimedOutTransactions(time.Now().Add(2*time.Minute)))
+	tx, err := ch.TxnManager.Status("eos-timeout-1")
+	require.NoError(t, err)
+	require.Equal(t, transaction.StateAborted, tx.State)
+	require.Empty(t, readCommittedPayloads(t, tm, "eos-timeout"))
+}
+
+func TestTransactionalProcessingV1CommitsMultiTopicOffsetsAtomically(t *testing.T) {
+	ch, tm, coord, _ := newDiskBackedTransactionHandler(t)
+	require.NoError(t, tm.CreateTopic("input-a", 1, false, false))
+	require.NoError(t, tm.CreateTopic("input-b", 1, false, false))
+	require.NoError(t, coord.RegisterGroupSubscription("multi-workers", []string{"input-a", "input-b"}, "", map[string]int{"input-a": 1, "input-b": 1}))
+	_, err := coord.AddConsumer("multi-workers", "worker-1")
+	require.NoError(t, err)
+	generation := coord.GetGeneration("multi-workers")
+	ctx := NewClientContext("", 0)
+	initResp := ch.HandleCommand("INIT_PRODUCER_ID transactional_id=eos-multi", ctx)
+	fields := parseKeyValueArgs(strings.TrimPrefix(initResp, "OK "))
+	producerID := fields["producerId"]
+	epoch, err := strconv.ParseInt(fields["epoch"], 10, 64)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(ch.HandleCommand(fmt.Sprintf("BEGIN_TXN transactional_id=eos-multi producerId=%s epoch=%d", producerID, epoch), ctx), "OK "))
+	for topicName, offset := range map[string]uint64{"input-a": 4, "input-b": 7} {
+		cmd := fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=eos-multi producerId=%s epoch=%d topic=%s group=multi-workers member=worker-1 generation=%d offsets=P0:%d", producerID, epoch, topicName, generation, offset)
+		require.True(t, strings.HasPrefix(ch.HandleCommand(cmd, ctx), "OK "))
+	}
+	require.True(t, strings.HasPrefix(ch.HandleCommand(fmt.Sprintf("END_TXN transactional_id=eos-multi producerId=%s epoch=%d result=commit", producerID, epoch), ctx), "OK "))
+	for topicName, expected := range map[string]uint64{"input-a": 4, "input-b": 7} {
+		offset, ok := coord.GetOffset("multi-workers", topicName, 0)
+		require.True(t, ok)
+		require.Equal(t, expected, offset)
+	}
+}
+
+func TestTransactionalProcessingV1FencesRecreatedConsumerGroup(t *testing.T) {
+	ch, tm, coord, _ := newDiskBackedTransactionHandler(t)
+	generation := prepareTransactionGroup(t, tm, coord, "epoch-input", "epoch-workers", "worker-1")
+	ctx := NewClientContext("", 0)
+	initResp := ch.HandleCommand("INIT_PRODUCER_ID transactional_id=eos-epoch", ctx)
+	fields := parseKeyValueArgs(strings.TrimPrefix(initResp, "OK "))
+	producerID := fields["producerId"]
+	epoch, err := strconv.ParseInt(fields["epoch"], 10, 64)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(ch.HandleCommand(fmt.Sprintf("BEGIN_TXN transactional_id=eos-epoch producerId=%s epoch=%d", producerID, epoch), ctx), "OK "))
+	send := fmt.Sprintf("SEND_OFFSETS_TO_TXN transactional_id=eos-epoch producerId=%s epoch=%d topic=epoch-input group=epoch-workers member=worker-1 generation=%d offsets=P0:3", producerID, epoch, generation)
+	require.True(t, strings.HasPrefix(ch.HandleCommand(send, ctx), "OK "))
+	require.NoError(t, coord.RemoveConsumerForGeneration("epoch-workers", "worker-1", generation))
+	require.NoError(t, coord.DeleteGroup("epoch-workers"))
+	require.NoError(t, coord.RegisterGroup("epoch-input", "epoch-workers", 1))
+	_, err = coord.AddConsumer("epoch-workers", "worker-1")
+	require.NoError(t, err)
+	resp := ch.HandleCommand(fmt.Sprintf("END_TXN transactional_id=eos-epoch producerId=%s epoch=%d result=commit", producerID, epoch), ctx)
+	require.Contains(t, resp, "group_epoch_mismatch")
+	_, committed := coord.GetOffset("epoch-workers", "epoch-input", 0)
+	require.False(t, committed)
+}
 
 func newDiskBackedTransactionHandler(t *testing.T) (*CommandHandler, *topic.TopicManager, *coordinator.Coordinator, *disk.DiskManager) {
 	t.Helper()

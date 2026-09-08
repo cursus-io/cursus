@@ -8,6 +8,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/hashicorp/raft"
+	"github.com/stretchr/testify/require"
 )
 
 func TestBrokerFSMGroupRegistrationIsReplicatedAndIdempotent(t *testing.T) {
@@ -58,4 +59,20 @@ func TestBrokerFSMGroupJoinAtomicallyRegistersGroup(t *testing.T) {
 	if status.TopicName != "events" || status.PartitionCount != 2 || status.MemberCount != 1 {
 		t.Fatalf("unexpected joined group: %+v", status)
 	}
+}
+
+func TestBrokerFSMMultiTopicGroupRegistrationAndJoin(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	tm := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+	require.NoError(t, tm.CreateTopic("orders", 2, false, false))
+	require.NoError(t, tm.CreateTopic("payments", 1, false, false))
+	cd := coordinator.NewCoordinator(context.Background(), cfg, tm)
+	brokerFSM := NewBrokerFSM(tm, cd)
+
+	register := `GROUP_SYNC:{"type":"REGISTER","group":"workers","topics":["orders","payments"],"partition_counts":{"orders":2,"payments":1}}`
+	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte(register)}))
+	join := `GROUP_SYNC:{"type":"JOIN","group":"workers","member":"member-1"}`
+	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: []byte(join)}))
+	require.Len(t, cd.GetMemberTopicAssignments("workers", "member-1"), 3)
 }

@@ -11,27 +11,31 @@ import (
 )
 
 type BrokerFSMSnapshot struct {
-	applied           uint64
-	logs              map[uint64]*ReplicationEntry
-	brokers           map[string]*BrokerInfo
-	partitionMetadata map[string]*PartitionMetadata
-	producerState     map[string]map[int]map[string]ProducerSequence
-	groupState        map[string]*coordinator.GroupStateSnapshot
-	transactionState  map[string]*transaction.Snapshot
-	topicState        map[string]*topic.Definition
+	applied                          uint64
+	logs                             map[uint64]*ReplicationEntry
+	brokers                          map[string]*BrokerInfo
+	partitionMetadata                map[string]*PartitionMetadata
+	producerState                    map[string]map[int]map[string]ProducerSequence
+	groupState                       map[string]*coordinator.GroupStateSnapshot
+	transactionState                 map[string]*transaction.Snapshot
+	transactionCoordinatorShards     map[int]TransactionCoordinatorShard
+	transactionCoordinatorShardCount int
+	topicState                       map[string]*topic.Definition
 }
 
 func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	state := BrokerFSMState{
-		Version:           s.writeVersion(),
-		Applied:           s.applied,
-		Logs:              s.logs,
-		Brokers:           s.brokers,
-		PartitionMetadata: s.partitionMetadata,
-		ProducerState:     s.producerState,
-		GroupState:        s.groupState,
-		TransactionState:  s.transactionState,
-		TopicState:        s.topicState,
+		Version:                          s.writeVersion(),
+		Applied:                          s.applied,
+		Logs:                             s.logs,
+		Brokers:                          s.brokers,
+		PartitionMetadata:                s.partitionMetadata,
+		ProducerState:                    s.producerState,
+		GroupState:                       s.groupState,
+		TransactionState:                 s.transactionState,
+		TransactionCoordinatorShards:     s.transactionCoordinatorShards,
+		TransactionCoordinatorShardCount: s.transactionCoordinatorShardCount,
+		TopicState:                       s.topicState,
 	}
 
 	util.Debug("Persisting snapshot data")

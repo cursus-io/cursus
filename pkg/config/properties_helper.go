@@ -123,6 +123,15 @@ func (cfg *Config) Normalize() {
 	if cfg.TransactionalIDExpirationMS <= 0 {
 		cfg.TransactionalIDExpirationMS = 7 * 24 * 60 * 60 * 1000
 	}
+	if cfg.TransactionTimeoutMS <= 0 {
+		cfg.TransactionTimeoutMS = 60 * 1000
+	}
+	if cfg.TransactionCoordinatorShards <= 0 {
+		cfg.TransactionCoordinatorShards = 50
+	}
+	if cfg.TransactionRecoveryBatchSize <= 0 {
+		cfg.TransactionRecoveryBatchSize = 256
+	}
 
 	// consumer
 	if cfg.ConsumerSessionTimeoutMS <= 0 {

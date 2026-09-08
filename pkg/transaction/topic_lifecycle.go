@@ -13,9 +13,7 @@ func (m *Manager) StateWithoutTopicReferences(topicName string) (map[string]*Sna
 	if m == nil {
 		return nil, nil, fmt.Errorf("transaction manager is not available")
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return stateWithoutTopicReferencesLocked(m.txns, topicName)
+	return stateWithoutTopicReferencesLocked(m.ExportState(), topicName)
 }
 
 // PruneTopicReferences applies StateWithoutTopicReferences atomically to the
@@ -25,33 +23,31 @@ func (m *Manager) PruneTopicReferences(topicName string) ([]string, error) {
 	if m == nil {
 		return nil, fmt.Errorf("transaction manager is not available")
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	state, affected, err := stateWithoutTopicReferencesLocked(m.txns, topicName)
+	m.lockAllShards()
+	defer m.unlockAllShards()
+	state, affected, err := stateWithoutTopicReferencesLocked(m.exportStateLocked(), topicName)
 	if err != nil {
 		return nil, err
 	}
-	m.txns = make(map[string]*Transaction, len(state))
-	for id, snap := range state {
-		m.txns[id] = transactionFromSnapshot(snap)
-	}
+	m.replaceStateLocked(state)
 	return affected, nil
 }
 
-func stateWithoutTopicReferencesLocked(current map[string]*Transaction, topicName string) (map[string]*Snapshot, []string, error) {
+func stateWithoutTopicReferencesLocked(current map[string]*Snapshot, topicName string) (map[string]*Snapshot, []string, error) {
 	next := make(map[string]*Snapshot, len(current))
 	affected := make([]string, 0)
 	active := make([]string, 0)
-	for id, tx := range current {
-		if tx == nil {
+	for id, snap := range current {
+		if snap == nil {
 			continue
 		}
-		snap := snapshot(tx)
 		if !transactionReferencesTopic(snap, topicName) {
 			next[id] = snap
 			continue
 		}
-		if !tx.Expired && (tx.State == StateOpen || tx.State == StateCommitting) {
+		recoveryPending := snap.State == StateCommitted && snap.Mode == ModeProcessingV1 && len(snap.Offsets) > 0 && !snap.OffsetsMaterialized
+		if !snap.Expired && (snap.State == StateOpen || snap.State == StateCommitting ||
+			snap.State == StatePrepareCommit || snap.State == StatePrepareAbort || recoveryPending) {
 			active = append(active, id)
 			next[id] = snap
 			continue

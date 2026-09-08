@@ -461,3 +461,32 @@ func TestManagerTreatsExactCommittingPredecessorAsIdempotent(t *testing.T) {
 		t.Fatal("different committing predecessor was accepted")
 	}
 }
+
+func TestCoordinatorEpochReconciliationPreservesTerminalDecisionEpoch(t *testing.T) {
+	m := NewManager()
+	producer, epoch, err := m.InitProducerWithMode("terminal-epoch", ModeProcessingV1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetCoordinatorEpoch("terminal-epoch", 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Begin("terminal-epoch", producer, epoch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.PrepareCommit("terminal-epoch", producer, epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Commit("terminal-epoch"); err != nil {
+		t.Fatal(err)
+	}
+
+	m.ReconcileCoordinatorEpochs(map[int]int64{CoordinatorShard("terminal-epoch"): 8}, DefaultCoordinatorShardCount)
+	tx, err := m.Status("terminal-epoch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.CoordinatorEpoch != 7 {
+		t.Fatalf("terminal coordinator epoch changed: got %d want 7", tx.CoordinatorEpoch)
+	}
+}

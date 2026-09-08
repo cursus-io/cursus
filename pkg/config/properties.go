@@ -87,9 +87,12 @@ type Config struct {
 	DefaultReplicationFactor int    `yaml:"default_replication_factor" json:"default.replication.factor"`
 
 	// idempotency
-	EnableIdempotence           bool `yaml:"enable_idempotence" json:"enable.idempotence"`
-	ProducerStateTTLMS          int  `yaml:"producer_state_ttl_ms" json:"producer.state.ttl.ms"`
-	TransactionalIDExpirationMS int  `yaml:"transactional_id_expiration_ms" json:"transactional.id.expiration.ms"`
+	EnableIdempotence            bool `yaml:"enable_idempotence" json:"enable.idempotence"`
+	ProducerStateTTLMS           int  `yaml:"producer_state_ttl_ms" json:"producer.state.ttl.ms"`
+	TransactionalIDExpirationMS  int  `yaml:"transactional_id_expiration_ms" json:"transactional.id.expiration.ms"`
+	TransactionTimeoutMS         int  `yaml:"transaction_timeout_ms" json:"transaction.timeout.ms"`
+	TransactionCoordinatorShards int  `yaml:"transaction_coordinator_shards" json:"transaction.coordinator.shards"`
+	TransactionRecoveryBatchSize int  `yaml:"transaction_recovery_batch_size" json:"transaction.recovery.batch.size"`
 
 	// consumer
 	ConsumerSessionTimeoutMS int                   `yaml:"consumer_session_timeout_ms" json:"consumer.session.timeout.ms"`
@@ -176,9 +179,12 @@ func DefaultConfig() *Config {
 			DefaultReplicationFactor: 3,
 
 			// idempotency
-			EnableIdempotence:           false,
-			ProducerStateTTLMS:          30 * 60 * 1000,
-			TransactionalIDExpirationMS: 7 * 24 * 60 * 60 * 1000,
+			EnableIdempotence:            false,
+			ProducerStateTTLMS:           30 * 60 * 1000,
+			TransactionalIDExpirationMS:  7 * 24 * 60 * 60 * 1000,
+			TransactionTimeoutMS:         60 * 1000,
+			TransactionCoordinatorShards: 50,
+			TransactionRecoveryBatchSize: 256,
 
 			// consumer
 			ConsumerSessionTimeoutMS: 10000,
@@ -281,6 +287,9 @@ func LoadConfig() (*Config, error) {
 	flag.BoolVar(&cfg.EnableIdempotence, "enable-idempotence", cfg.EnableIdempotence, "Enable producer idempotency")
 	flag.IntVar(&cfg.ProducerStateTTLMS, "producer-state-ttl-ms", cfg.ProducerStateTTLMS, "Producer idempotency state TTL in milliseconds")
 	flag.IntVar(&cfg.TransactionalIDExpirationMS, "transactional-id-expiration-ms", cfg.TransactionalIDExpirationMS, "Completed transactional.id expiration in milliseconds")
+	flag.IntVar(&cfg.TransactionTimeoutMS, "transaction-timeout-ms", cfg.TransactionTimeoutMS, "Maximum open transaction duration in milliseconds")
+	flag.IntVar(&cfg.TransactionCoordinatorShards, "transaction-coordinator-shards", cfg.TransactionCoordinatorShards, "Logical transaction coordinator shard count (immutable after cluster creation)")
+	flag.IntVar(&cfg.TransactionRecoveryBatchSize, "transaction-recovery-batch-size", cfg.TransactionRecoveryBatchSize, "Maximum transaction recovery candidates processed per pass")
 
 	// consumer
 	flag.IntVar(&cfg.ConsumerSessionTimeoutMS, "consumer-session-timeout", cfg.ConsumerSessionTimeoutMS, "Session timeout")
@@ -418,6 +427,9 @@ func LoadConfig() (*Config, error) {
 	overrideEnvBool(&cfg.EnableIdempotence, "ENABLE_IDEMPOTENCE")
 	overrideEnvInt(&cfg.ProducerStateTTLMS, "PRODUCER_STATE_TTL_MS")
 	overrideEnvInt(&cfg.TransactionalIDExpirationMS, "TRANSACTIONAL_ID_EXPIRATION_MS")
+	overrideEnvInt(&cfg.TransactionTimeoutMS, "TRANSACTION_TIMEOUT_MS")
+	overrideEnvInt(&cfg.TransactionCoordinatorShards, "TRANSACTION_COORDINATOR_SHARDS")
+	overrideEnvInt(&cfg.TransactionRecoveryBatchSize, "TRANSACTION_RECOVERY_BATCH_SIZE")
 
 	overrideEnvInt(&cfg.ConsumerSessionTimeoutMS, "CONSUMER_SESSION_TIMEOUT")
 	overrideEnvInt(&cfg.ConsumerHeartbeatCheckMS, "CONSUMER_HEARTBEAT_CHECK")

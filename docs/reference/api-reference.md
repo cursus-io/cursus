@@ -298,6 +298,8 @@ ERROR: NOT_LEADER leader=<host:port>
 
 ```text
 REGISTER_GROUP topic=<name> group=<group>
+REGISTER_GROUP topics=<topic-1>,<topic-2>[,...] group=<group>
+REGISTER_GROUP pattern=<glob> group=<group>
 ```
 
 Success:
@@ -305,6 +307,8 @@ Success:
 ```text
 OK group=<group> topic=<name> registered=true
 ```
+
+The multi-topic forms durably register the concrete topic-partition expansion. Multi-topic members omit `topic` from `JOIN_GROUP`/`SYNC_GROUP` and receive `topic_assignments=<topic>:P<partition>,...`.
 
 ### JOIN_GROUP
 
@@ -578,7 +582,7 @@ Initializes or reinitializes a broker-managed producer session for a transaction
 BEGIN_TXN transactional_id=<id> producerId=<producer-id> epoch=<N>
 ```
 
-Starts a broker-managed transaction using the `producerId` and `epoch` returned by `INIT_PRODUCER_ID`. In distributed mode, route transaction commands to `FIND_COORDINATOR transactional_id=<id>`; the coordinator key is `txn:<id>`. Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`. One initialized epoch may begin one transaction. After commit or abort, call `INIT_PRODUCER_ID` before the next begin; otherwise the broker returns `producer_reinitialization_required`. An uncertain `END_TXN` may still be retried with the completed epoch.
+Starts a broker-managed transaction using the `producerId` and `epoch` returned by `INIT_PRODUCER_ID`. In distributed mode, `transactional_id` maps to a durable logical coordinator shard; route transaction commands to the owner returned by `FIND_COORDINATOR transactional_id=<id>`. Shard ownership changes advance a coordinator epoch that fences the previous owner. Success: `OK transactional_id=<id> state=open producerId=<producer-id> epoch=<N>`. One initialized epoch may begin one transaction. After commit or abort, call `INIT_PRODUCER_ID` before the next begin; otherwise the broker returns `producer_reinitialization_required`. An uncertain `END_TXN` may still be retried with the completed epoch.
 
 ### TXN_PUBLISH
 
@@ -586,7 +590,7 @@ Starts a broker-managed transaction using the `producerId` and `epoch` returned 
 TXN_PUBLISH transactional_id=<id> topic=<topic> [partition=<N>] producerId=<producer-id> seqNum=<N> epoch=<N> [key=<key>] message=<payload>
 ```
 
-Stages one record in the transaction. `seqNum` is required and must be greater than zero; Cursus uses `(producerId, epoch, seqNum)` to make commit recovery idempotent even on non-idempotent topics. The record is not published until commit finalization begins. Output uses the normal partition-leader and replication path and remains `transaction_state=open` in the log. A hidden partition commit marker resolves that log entry, but `read_committed` also requires the final coordinator decision for the current epoch; marker append alone does not expose the record. Abort markers resolve records from interrupted retries. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
+Appends one unresolved record immediately through the normal partition-leader path. `seqNum` is required and makes retries idempotent even on non-idempotent topics. The record remains invisible to `read_committed` until its commit marker and final coordinator decision agree. Explicit abort and `transaction_timeout_ms` timeout resolution append abort markers. The producer and epoch must match `BEGIN_TXN`; stale epochs are fenced.
 
 ### SEND_OFFSETS_TO_TXN
 
@@ -594,7 +598,7 @@ Stages one record in the transaction. `seqNum` is required and must be greater t
 SEND_OFFSETS_TO_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> topic=<topic> group=<group> member=<member> generation=<N> offsets=P<partition>:<nextOffset>,P<partition>:<nextOffset>
 ```
 
-Stages consumer offsets in the transaction. The broker validates group member, generation, partition ownership, and monotonic offsets at stage and commit time. All entries in one transaction must share one `(topic, group, member, generation)` scope. Repeated partition entries may only stay equal or advance. Finalization applies the scope through one fenced `BATCH_COMMIT`; different consumer scopes require separate transactions.
+Stages consumer offsets in the transaction. The broker validates group member, generation, lifecycle epoch, topic-partition ownership, and monotonic offsets at stage and commit time. Callers may repeat this command for multiple topics in the same `(group, member, generation, registrationEpoch)` session. Finalization applies the complete set atomically under one membership fence.
 
 ### END_TXN
 
@@ -602,7 +606,7 @@ Stages consumer offsets in the transaction. The broker validates group member, g
 END_TXN transactional_id=<id> producerId=<producer-id> epoch=<N> result=<commit|abort>
 ```
 
-Commits staged records and offsets, or aborts an `open` transaction without writing partition records. Commit validates records and the one consumer offset scope before preparation, persists `committing`, revalidates current fences, publishes idempotent output through partition leaders, appends hidden markers, applies one fenced bulk offset update, and persists the final coordinator decision. `read_committed` requires the marker and current-epoch decision to agree, skips aborted records/control markers, and stops at the earliest unresolved transaction. Restored `committing` transactions are retried; finalization with the same epoch is idempotent. A `committing` transaction cannot be changed to abort, because commit-side records, markers, or source offsets may already have been applied. Cursus stores control-record key/value bytes (`key: int16 version, int16 markerType`; `value: int16 version, int32 coordinatorEpoch`) with Cursus control metadata (`control_batch_type=transaction`, `control_batch_version=2`, `control_batch_coordinator_epoch=<epoch>`). The transaction covers broker records and one consumer offset scope, not external side effects.
+Commit validates the transaction, appends staged source offsets as unresolved records in `__consumer_offsets`, registers those partitions as participants, persists `prepare_commit`, appends markers to every output and offset partition, and finally persists `committed`. The same final decision exposes output and offsets; committed offsets are subsequently materialized as ordinary revised snapshots for long-term recovery. Abort persists `prepare_abort`, appends abort markers, and persists `aborted`; the timeout monitor uses the same path. Recovery retries either prepared state on its current coordinator-shard owner. Ownership and timeout work are distributed across active brokers, and the marker's durable coordinator-shard epoch rejects stale owners after reassignment independently of producer fencing. Repeated finalization is idempotent. This provides exactly-once processing for Cursus source offsets and Cursus output records, not external side effects.
 
 ### TXN_STATUS
 

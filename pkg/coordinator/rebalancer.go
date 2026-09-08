@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -145,6 +146,115 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 	c.updateOffsetPartitionCount()
 	util.Info("🆕 Group '%s' registered for topic '%s' (%d partitions)", groupName, topicName, partitionCount)
 	return nil
+}
+
+// RegisterGroupSubscription durably registers a multi-topic or pattern-backed
+// group. The supplied topics are the concrete expansion used for assignment.
+func (c *Coordinator) RegisterGroupSubscription(groupName string, topics []string, pattern string, partitionCounts map[string]int) error {
+	canonicalTopics, topicPartitions, err := canonicalSubscription(topics, pattern, partitionCounts)
+	if err != nil {
+		return err
+	}
+
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
+	c.mu.Lock()
+	existing := c.groups[groupName]
+	if existing != nil {
+		if !sameSubscription(existing, canonicalTopics, pattern, topicPartitions) {
+			c.mu.Unlock()
+			return fmt.Errorf("subscription mismatch for group %q", groupName)
+		}
+		if existing.RegistrationEpoch != 0 {
+			c.mu.Unlock()
+			return nil
+		}
+	}
+	epoch := c.groupEpochs[groupName] + 1
+	if epoch == 0 {
+		c.mu.Unlock()
+		return fmt.Errorf("group lifecycle epoch overflow")
+	}
+	initial := []TopicOffsetSnapshot(nil)
+	if existing != nil {
+		initial = registrationInitialOffsets(existing)
+	}
+	if c.lifecyclePending == nil {
+		c.lifecyclePending = make(map[string]bool)
+	}
+	c.lifecyclePending[groupName] = true
+	c.mu.Unlock()
+
+	err = c.writeGroupSubscriptionRegistration(groupName, canonicalTopics, pattern, partitionCounts, epoch, initial)
+
+	c.mu.Lock()
+	delete(c.lifecyclePending, groupName)
+	if err != nil {
+		c.mu.Unlock()
+		return fmt.Errorf("persist group subscription: %w", err)
+	}
+	if existing == nil {
+		existing = &GroupMetadata{
+			Members:         make(map[string]*MemberMetadata),
+			Offsets:         make(map[string]map[int]uint64),
+			OffsetRevisions: make(map[string]uint64),
+		}
+		c.groups[groupName] = existing
+	}
+	existing.TopicName = subscriptionDisplayName(canonicalTopics, pattern)
+	existing.Topics = append([]string(nil), canonicalTopics...)
+	existing.TopicPattern = pattern
+	existing.TopicPartitions = append([]TopicPartition(nil), topicPartitions...)
+	existing.RegistrationEpoch = epoch
+	existing.LastActivity = time.Now()
+	c.groupEpochs[groupName] = epoch
+	c.mu.Unlock()
+	c.updateOffsetPartitionCount()
+	return nil
+}
+
+func canonicalSubscription(topics []string, pattern string, partitionCounts map[string]int) ([]string, []TopicPartition, error) {
+	if len(topics) == 0 {
+		return nil, nil, fmt.Errorf("subscription must resolve at least one topic")
+	}
+	canonical := append([]string(nil), topics...)
+	sort.Strings(canonical)
+	unique := canonical[:0]
+	for _, topicName := range canonical {
+		if topicName == "" {
+			return nil, nil, fmt.Errorf("subscription contains empty topic")
+		}
+		if len(unique) > 0 && unique[len(unique)-1] == topicName {
+			return nil, nil, fmt.Errorf("duplicate subscription topic %q", topicName)
+		}
+		unique = append(unique, topicName)
+	}
+	partitions := make([]TopicPartition, 0)
+	for _, topicName := range unique {
+		count := partitionCounts[topicName]
+		if count <= 0 {
+			return nil, nil, fmt.Errorf("invalid partition count for topic %q", topicName)
+		}
+		for partition := 0; partition < count; partition++ {
+			partitions = append(partitions, TopicPartition{Topic: topicName, Partition: partition})
+		}
+	}
+	return append([]string(nil), unique...), partitions, nil
+}
+
+func sameSubscription(group *GroupMetadata, topics []string, pattern string, partitions []TopicPartition) bool {
+	return group != nil && slices.Equal(group.Topics, topics) && group.TopicPattern == pattern && slices.Equal(group.TopicPartitions, partitions)
+}
+
+func subscriptionDisplayName(topics []string, pattern string) string {
+	if pattern != "" {
+		return pattern
+	}
+	if len(topics) == 1 {
+		return topics[0]
+	}
+	return ""
 }
 
 func makePartitions(partitionCount int) []int {
@@ -350,6 +460,12 @@ func (c *Coordinator) rebalanceRange(groupName string) {
 		return
 	}
 
+	if len(group.TopicPartitions) > 0 {
+		rebalanceTopicPartitions(group, members)
+		group.LastRebalance = time.Now()
+		return
+	}
+
 	pCount := len(group.Partitions)
 	mCount := len(members)
 	partitionsPerConsumer := pCount / mCount
@@ -377,5 +493,27 @@ func (c *Coordinator) rebalanceRange(groupName string) {
 		partitionIdx += len(newAssignments)
 
 		util.Info("📋 Assigned %v to %s", newAssignments, memberID)
+	}
+}
+
+func rebalanceTopicPartitions(group *GroupMetadata, members []string) {
+	pCount := len(group.TopicPartitions)
+	mCount := len(members)
+	partitionsPerConsumer := pCount / mCount
+	remainder := pCount % mCount
+	partitionIdx := 0
+	for i, memberID := range members {
+		count := partitionsPerConsumer
+		if i < remainder {
+			count++
+		}
+		end := partitionIdx + count
+		if end > pCount {
+			end = pCount
+		}
+		member := group.Members[memberID]
+		member.Assignments = nil
+		member.TopicAssignments = append([]TopicPartition(nil), group.TopicPartitions[partitionIdx:end]...)
+		partitionIdx = end
 	}
 }

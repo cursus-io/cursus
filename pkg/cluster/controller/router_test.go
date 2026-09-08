@@ -135,6 +135,31 @@ func TestClusterRouter_FindCoordinator(t *testing.T) {
 	t.Logf("Group %s after adding node4 -> %s", group1, id1_after)
 }
 
+func TestClusterRouterFindTransactionCoordinatorUsesDurableShardOwner(t *testing.T) {
+	mockFSM := fsm.NewBrokerFSM(nil, nil)
+	mockFSM.Apply(&raft.Log{Index: 1, Data: []byte("REGISTER:{\"id\":\"node1\",\"addr\":\"localhost:7001\",\"status\":\"active\"}")})
+	mockFSM.Apply(&raft.Log{Index: 2, Data: []byte("REGISTER:{\"id\":\"node2\",\"addr\":\"localhost:7002\",\"status\":\"active\"}")})
+
+	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
+	router := NewClusterRouter("node1", "localhost:7001", nil, rm, 7000, "", nil)
+
+	id, addr, epoch, err := router.FindTransactionCoordinator("payments-processor")
+	if err != nil {
+		t.Fatalf("FindTransactionCoordinator failed: %v", err)
+	}
+	if id != "node1" && id != "node2" {
+		t.Fatalf("unexpected coordinator %q", id)
+	}
+	if addr == "" || epoch <= 0 {
+		t.Fatalf("invalid durable coordinator addr=%q epoch=%d", addr, epoch)
+	}
+
+	ownership, ok := mockFSM.GetTransactionCoordinator("payments-processor")
+	if !ok || ownership.Owner != id || ownership.Epoch != epoch {
+		t.Fatalf("router result does not match replicated ownership: %+v", ownership)
+	}
+}
+
 func TestClusterRouter_FindCoordinator_CacheRebuild(t *testing.T) {
 	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n1\",\"addr\":\"localhost:7001\",\"status\":\"active\"}")})

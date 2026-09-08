@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -328,12 +329,26 @@ func TestRaftReplicationManager_ApplyCommand(t *testing.T) {
 
 	fut := new(MockApplyFuture)
 	fut.On("Error").Return(nil)
+	fut.On("Response").Return(nil)
 	mr.On("Apply", mock.MatchedBy(func(b []byte) bool {
 		return string(b) == "TEST:data"
 	}), 5*time.Second).Return(fut)
 
 	err := rm.ApplyCommand("TEST", []byte("data"))
 	assert.NoError(t, err)
+}
+
+func TestRaftReplicationManager_ApplyCommandReturnsFSMError(t *testing.T) {
+	mr := new(MockRaft)
+	rm := &RaftReplicationManager{raft: mr}
+
+	want := errors.New("configuration mismatch")
+	fut := new(MockApplyFuture)
+	fut.On("Error").Return(nil)
+	fut.On("Response").Return(want)
+	mr.On("Apply", mock.Anything, 5*time.Second).Return(fut)
+
+	assert.ErrorIs(t, rm.ApplyCommand("REGISTER", []byte("{}")), want)
 }
 
 func TestRaftReplicationManager_AddRemoveVoter(t *testing.T) {

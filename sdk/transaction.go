@@ -22,8 +22,10 @@ type ProducerSession struct {
 
 type TransactionStatusInfo struct {
 	TransactionalID string
+	Mode            string
 	State           string
 	Messages        int
+	Participants    int
 	Offsets         int
 }
 
@@ -265,6 +267,7 @@ func parseTransactionStatus(resp string) (TransactionStatusInfo, error) {
 	}
 	status := TransactionStatusInfo{
 		TransactionalID: fields["transactional_id"],
+		Mode:            fields["mode"],
 		State:           fields["state"],
 	}
 	if status.TransactionalID == "" || status.State == "" {
@@ -273,6 +276,12 @@ func parseTransactionStatus(resp string) (TransactionStatusInfo, error) {
 	status.Messages, err = strconv.Atoi(fields["messages"])
 	if err != nil || status.Messages < 0 {
 		return TransactionStatusInfo{}, fmt.Errorf("invalid transaction message count %q", fields["messages"])
+	}
+	if fields["participants"] != "" {
+		status.Participants, err = strconv.Atoi(fields["participants"])
+		if err != nil || status.Participants < 0 {
+			return TransactionStatusInfo{}, fmt.Errorf("invalid transaction participant count %q", fields["participants"])
+		}
 	}
 	status.Offsets, err = strconv.Atoi(fields["offsets"])
 	if err != nil || status.Offsets < 0 {

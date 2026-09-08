@@ -38,3 +38,20 @@ func TestISRManager_SetLeader(t *testing.T) {
 	assert.True(t, isrManager.leaderSince.IsZero())
 	isrManager.mu.RUnlock()
 }
+
+func TestISRManagerBrokerLivenessUsesHeartbeatAndLeaderGrace(t *testing.T) {
+	brokerFSM := fsm.NewBrokerFSM(nil, nil)
+	isrManager := NewISRManager(context.Background(), brokerFSM, "node1", time.Second, nil)
+	isrManager.SetLeader(true)
+	assert.True(t, isrManager.IsBrokerAlive("node2"), "new leader should grant heartbeat grace")
+
+	isrManager.mu.Lock()
+	isrManager.leaderSince = time.Now().Add(-2 * time.Second)
+	isrManager.lastSeen["node2"] = time.Now().Add(-2 * time.Second)
+	isrManager.mu.Unlock()
+	assert.False(t, isrManager.IsBrokerAlive("node2"))
+
+	isrManager.UpdateHeartbeat("node2")
+	assert.True(t, isrManager.IsBrokerAlive("node2"))
+	assert.True(t, isrManager.IsBrokerAlive("node1"))
+}

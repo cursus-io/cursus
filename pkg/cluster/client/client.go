@@ -151,11 +151,21 @@ func heartbeatTarget(peer string, discoveryPort int) string {
 func (c *TCPClusterClient) JoinCluster(peers []string, nodeID, addr string, discoveryPort int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	return c.joinClusterWithContextAndShards(ctx, peers, nodeID, addr, discoveryPort, 0)
+}
 
-	return c.joinClusterWithContext(ctx, peers, nodeID, addr, discoveryPort)
+func (c *TCPClusterClient) JoinClusterWithTransactionCoordinatorShards(peers []string, nodeID, addr string, discoveryPort, shardCount int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	return c.joinClusterWithContextAndShards(ctx, peers, nodeID, addr, discoveryPort, shardCount)
 }
 
 func (c *TCPClusterClient) joinClusterWithContext(ctx context.Context, peers []string, nodeID, addr string, discoveryPort int) error {
+	return c.joinClusterWithContextAndShards(ctx, peers, nodeID, addr, discoveryPort, 0)
+}
+
+func (c *TCPClusterClient) joinClusterWithContextAndShards(ctx context.Context, peers []string, nodeID, addr string, discoveryPort, shardCount int) error {
 	apiPort := discoveryPort
 	if apiPort == 0 {
 		apiPort = 8000
@@ -180,7 +190,7 @@ func (c *TCPClusterClient) joinClusterWithContext(ctx context.Context, peers []s
 			// deadline. Keep each connection attempt bounded while retaining the
 			// caller's cancellation and overall deadline as the outer limit.
 			attemptCtx, cancel := context.WithTimeout(ctx, c.timeout)
-			err := c.sendJoinCommand(attemptCtx, targetAddr, nodeID, addr)
+			err := c.sendJoinCommand(attemptCtx, targetAddr, nodeID, addr, shardCount)
 			cancel()
 			if err == nil {
 				return nil
@@ -197,11 +207,12 @@ func (c *TCPClusterClient) joinClusterWithContext(ctx context.Context, peers []s
 	return fmt.Errorf("failed to join cluster after 5 attempts")
 }
 
-func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, localAddr string) error {
-	response, err := c.sendRequest(ctx, addr, wire.CommandJoinCluster, map[string]string{
-		"node_id": nodeID,
-		"address": localAddr,
-	})
+func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, localAddr string, shardCount int) error {
+	fields := map[string]string{"node_id": nodeID, "address": localAddr}
+	if shardCount > 0 {
+		fields["transaction_coordinator_shards"] = strconv.Itoa(shardCount)
+	}
+	response, err := c.sendRequest(ctx, addr, wire.CommandJoinCluster, fields)
 	if err != nil {
 		return err
 	}

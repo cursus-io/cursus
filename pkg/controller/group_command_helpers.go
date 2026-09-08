@@ -25,6 +25,18 @@ func (ch *CommandHandler) resolveGroupOffsetTopic(groupName, topicName string) (
 	if group == nil {
 		return topicName, ""
 	}
+	if len(group.Topics) > 0 {
+		for _, subscribedTopic := range group.Topics {
+			if subscribedTopic == topicName {
+				return topicName, ""
+			}
+		}
+		expected := strings.Join(group.Topics, ",")
+		if group.TopicPattern != "" {
+			expected = group.TopicPattern
+		}
+		return "", fmt.Sprintf("ERROR: topic_not_assigned_to_group expected=%s actual=%s", expected, topicName)
+	}
 	offsetTopic, ok := resolveOffsetTopic(group.TopicName, topicName)
 	if !ok {
 		return "", fmt.Sprintf("ERROR: topic_not_assigned_to_group expected=%s actual=%s", group.TopicName, topicName)

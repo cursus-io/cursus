@@ -18,24 +18,28 @@ func (m *Manager) RuntimeSnapshot() RuntimeSnapshot {
 		return result
 	}
 	now := time.Now()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, tx := range m.txns {
-		if tx == nil {
-			continue
-		}
-		result.Total++
-		if tx.Expired {
-			result.Expired++
-			continue
-		}
-		result.ByState[tx.State]++
-		if tx.State == StateOpen || tx.State == StateCommitting {
-			age := now.Sub(tx.UpdatedAt).Seconds()
-			if age > result.OldestActiveAgeSeconds {
-				result.OldestActiveAgeSeconds = age
+	for i := range m.shards {
+		s := &m.shards[i]
+		s.mu.Lock()
+		for _, tx := range s.txns {
+			if tx == nil {
+				continue
+			}
+			result.Total++
+			if tx.Expired {
+				result.Expired++
+				continue
+			}
+			result.ByState[tx.State]++
+			switch tx.State {
+			case StateOpen, StateCommitting, StatePrepareCommit, StatePrepareAbort:
+				age := now.Sub(tx.UpdatedAt).Seconds()
+				if age > result.OldestActiveAgeSeconds {
+					result.OldestActiveAgeSeconds = age
+				}
 			}
 		}
+		s.mu.Unlock()
 	}
 	return result
 }
