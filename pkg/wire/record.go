@@ -6,7 +6,10 @@ import (
 	"math"
 )
 
-const recordVersion uint16 = 2
+const (
+	recordVersion       uint16 = 3
+	legacyRecordVersion uint16 = 2
+)
 
 const (
 	recordTimestamp uint64 = 1 << iota
@@ -24,9 +27,14 @@ const (
 	recordControlCoordinatorEpoch
 	recordControlKey
 	recordControlValue
+	recordEventID
+	recordPayloadDigest
 )
 
-const recordKnownMask = (recordControlValue << 1) - 1
+const (
+	legacyRecordKnownMask = (recordControlValue << 1) - 1
+	recordKnownMask       = (recordPayloadDigest << 1) - 1
+)
 
 func EncodeRecord(message Message) ([]byte, error) {
 	if message.Partition < math.MinInt32 || message.Partition > math.MaxInt32 {
@@ -91,6 +99,12 @@ func EncodeRecord(message Message) ([]byte, error) {
 	if presence&recordControlValue != 0 {
 		encoder.bytes(message.ControlBatchValue)
 	}
+	if presence&recordEventID != 0 {
+		encoder.string(message.EventID)
+	}
+	if presence&recordPayloadDigest != 0 {
+		encoder.string(message.PayloadDigest)
+	}
 	return encoder.result()
 }
 
@@ -100,11 +114,15 @@ func DecodeRecord(data []byte) (Message, error) {
 	if decoder.err != nil {
 		return Message{}, decoder.err
 	}
-	if version != recordVersion {
+	if version != recordVersion && version != legacyRecordVersion {
 		return Message{}, fmt.Errorf("unsupported record version %d", version)
 	}
 	presence := decoder.uint64()
-	if presence&^recordKnownMask != 0 {
+	knownMask := recordKnownMask
+	if version == legacyRecordVersion {
+		knownMask = legacyRecordKnownMask
+	}
+	if presence&^knownMask != 0 {
 		return Message{}, fmt.Errorf("record contains unknown presence bits %x", presence)
 	}
 	message := Message{
@@ -156,6 +174,12 @@ func DecodeRecord(data []byte) (Message, error) {
 	}
 	if presence&recordControlValue != 0 {
 		message.ControlBatchValue = decoder.bytes()
+	}
+	if version == recordVersion && presence&recordEventID != 0 {
+		message.EventID = decoder.string()
+	}
+	if version == recordVersion && presence&recordPayloadDigest != 0 {
+		message.PayloadDigest = decoder.string()
 	}
 	if err := decoder.finish(); err != nil {
 		return Message{}, err
@@ -212,6 +236,12 @@ func recordPresence(message Message) uint64 {
 	}
 	if message.ControlBatchValue != nil {
 		result |= recordControlValue
+	}
+	if message.EventID != "" {
+		result |= recordEventID
+	}
+	if message.PayloadDigest != "" {
+		result |= recordPayloadDigest
 	}
 	return result
 }

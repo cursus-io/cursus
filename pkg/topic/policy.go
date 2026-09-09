@@ -25,6 +25,7 @@ type Policy struct {
 	ReadACL           []string `json:"read_acl,omitempty"`
 	WriteACL          []string `json:"write_acl,omitempty"`
 	MinInSyncReplicas *int     `json:"min_in_sync_replicas,omitempty"`
+	AggregateReplay   bool     `json:"aggregate_replay,omitempty"`
 }
 
 func DefaultPolicy() Policy {
@@ -114,6 +115,9 @@ func (p Policy) EffectiveMinInSyncReplicas(brokerDefault int) int {
 }
 
 func validateCleanupPolicyForTopic(policy Policy, cfg *config.Config, eventSourcing bool) error {
+	if policy.AggregateReplay && !eventSourcing {
+		return fmt.Errorf("aggregate_replay requires event_sourcing")
+	}
 	if !config.HasCleanupPolicy(policy.CleanupPolicy, config.CleanupPolicyCompact) {
 		return nil
 	}

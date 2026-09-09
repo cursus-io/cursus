@@ -312,6 +312,8 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 		SchemaVersion:                msg.SchemaVersion,
 		AggregateVersion:             msg.AggregateVersion,
 		Metadata:                     msg.Metadata,
+		EventID:                      msg.EventID,
+		PayloadDigest:                msg.PayloadDigest,
 		TransactionalID:              msg.TransactionalID,
 		TransactionState:             msg.TransactionState,
 		TransactionMarker:            msg.TransactionMarker,

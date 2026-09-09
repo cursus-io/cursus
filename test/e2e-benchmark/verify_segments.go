@@ -26,6 +26,10 @@ type DiskMessage struct {
 func deserializeDiskMessage(data []byte) (DiskMessage, error) {
 	var msg DiskMessage
 	pos := 0
+	if len(data) < 4 || (string(data[:4]) != "CDM2" && string(data[:4]) != "CDM3") {
+		return msg, fmt.Errorf("unsupported disk message format")
+	}
+	pos = 4
 
 	if pos+2 > len(data) {
 		return msg, fmt.Errorf("too short for topic length")

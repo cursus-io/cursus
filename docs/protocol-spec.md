@@ -744,6 +744,14 @@ Server responds with the same binary batch format for CONSUME. PUBLISH with `ack
 
 ---
 
+## Aggregate replay proof
+
+Topics created with `event_sourcing=true aggregate_replay=true idempotent=true` opt into retained aggregate replay. `PUBLISH` is rejected for these topics; producers use `APPEND_STREAM` with `key` (the match ID), `version`, `event_id`, `producerId`, `seqNum`, and optional `epoch`. The broker persists the event ID and a SHA-256 payload digest, routes by key, rejects partition-count changes, and accepts an exact same `(key, version, event_id, payload)` retry without appending again.
+
+`AGGREGATE_REPLAY_PROOF topic=<topic> match_id=<id> [partition=<n>] [expected_last_sequence=<n>]` returns `OK proof=<json>` only when the committed retained log has exactly sequences `1..last`. The proof includes retained sequence bounds, offsets, event count, first/last IDs, and the committed `proof_hwm`. Failure is explicit: `aggregate_proof_retention_gap`, `aggregate_proof_sequence_gap`, `aggregate_proof_identity_conflict`, or `aggregate_proof_proof_unavailable` includes the diagnostic proof JSON.
+
+`AGGREGATE_EVENT_RANGE_READ topic=<topic> match_id=<id> from_sequence=<n> to_sequence=<n> max_records=<n>` returns a proof plus ordered raw event envelopes. It never reads or writes a consumer-group offset. S3 artifact generation, checksums, database pointer promotion, and subsequent consumer offset commits remain application responsibilities.
+
 ## 6. Consumer Group Protocol
 
 ### Lifecycle

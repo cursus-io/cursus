@@ -94,7 +94,7 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 		}
 	}
 	definition := t.Definition()
-	return formatTopicDefinitionResponse(definition) + " " + ch.topicMinISRMetadata(definition.Policy)
+	return formatTopicDefinitionResponse(definition) + " " + ch.topicMinISRMetadata(definition.Policy) + fmt.Sprintf(" aggregate_replay=%t", definition.Policy.AggregateReplay)
 }
 
 // handleDelete processes DELETE command

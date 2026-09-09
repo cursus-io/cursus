@@ -478,6 +478,8 @@ func (p *Partition) EnqueueBatchLeaderWithMode(msgs []types.Message, forceIdempo
 			SchemaVersion:                msgs[i].SchemaVersion,
 			AggregateVersion:             msgs[i].AggregateVersion,
 			Metadata:                     msgs[i].Metadata,
+			EventID:                      msgs[i].EventID,
+			PayloadDigest:                msgs[i].PayloadDigest,
 			TransactionalID:              msgs[i].TransactionalID,
 			TransactionState:             msgs[i].TransactionState,
 			TransactionMarker:            msgs[i].TransactionMarker,
@@ -649,6 +651,8 @@ func diskMessageFromMessage(topic string, partition int32, msg types.Message) ty
 		SchemaVersion:                msg.SchemaVersion,
 		AggregateVersion:             msg.AggregateVersion,
 		Metadata:                     msg.Metadata,
+		EventID:                      msg.EventID,
+		PayloadDigest:                msg.PayloadDigest,
 		TransactionalID:              msg.TransactionalID,
 		TransactionState:             msg.TransactionState,
 		TransactionMarker:            msg.TransactionMarker,
@@ -665,6 +669,7 @@ func sameReplicatedMessage(a, b types.Message) bool {
 		a.Payload == b.Payload && a.Key == b.Key && a.Epoch == b.Epoch &&
 		a.EventType == b.EventType && a.SchemaVersion == b.SchemaVersion &&
 		a.AggregateVersion == b.AggregateVersion && a.Metadata == b.Metadata &&
+		a.EventID == b.EventID && a.PayloadDigest == b.PayloadDigest &&
 		a.TransactionalID == b.TransactionalID && a.TransactionState == b.TransactionState &&
 		a.TransactionMarker == b.TransactionMarker && a.ControlBatchType == b.ControlBatchType &&
 		a.ControlBatchVersion == b.ControlBatchVersion &&

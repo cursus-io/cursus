@@ -1,6 +1,8 @@
 package eventsource
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -333,6 +335,29 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 		AggregateVersion: expectedVersion,
 		Metadata:         args["metadata"],
 	}
+	if t.Policy.AggregateReplay {
+		if args["event_id"] == "" {
+			return nil, "ERROR: missing_event_id"
+		}
+		if args["producerId"] == "" {
+			return nil, "ERROR: missing_producer_id"
+		}
+		seq, parseErr := strconv.ParseUint(args["seqNum"], 10, 64)
+		if parseErr != nil || seq == 0 {
+			return nil, "ERROR: invalid_producer_sequence"
+		}
+		epoch := int64(0)
+		if raw := args["epoch"]; raw != "" {
+			parsed, epochErr := strconv.ParseInt(raw, 10, 64)
+			if epochErr != nil || parsed < 0 {
+				return nil, "ERROR: invalid_producer_epoch"
+			}
+			epoch = parsed
+		}
+		sum := sha256.Sum256([]byte(payload))
+		msg.EventID, msg.PayloadDigest = args["event_id"], hex.EncodeToString(sum[:])
+		msg.ProducerID, msg.SeqNum, msg.Epoch = args["producerId"], seq, epoch
+	}
 	if svStr := args["schema_version"]; svStr != "" {
 		sv, err := strconv.ParseUint(svStr, 10, 32)
 		if err != nil {
@@ -354,6 +379,34 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 	idx, err := h.getIndex(topicName, partitionID)
 	if err != nil {
 		return nil, fmt.Sprintf("ERROR: stream_index_failed partition=%d reason=%q", partitionID, err.Error())
+	}
+	if t.Policy.AggregateReplay && expectedVersion <= idx.GetVersion(key) {
+		entries, lookupErr := idx.Lookup(key, expectedVersion)
+		if lookupErr != nil {
+			return nil, fmt.Sprintf("ERROR: aggregate_index_lookup_failed reason=%q", lookupErr.Error())
+		}
+		for _, entry := range entries {
+			if entry.AggregateVersion != expectedVersion {
+				continue
+			}
+			existing, readErr := p.ReadCommitted(entry.Offset, 1)
+			if readErr != nil || len(existing) != 1 {
+				return nil, "ERROR: aggregate_proof_unavailable"
+			}
+			if existing[0].EventID == msg.EventID && existing[0].PayloadDigest == msg.PayloadDigest {
+				return &AppendResult{Topic: topicName, Key: key, Version: expectedVersion, Offset: entry.Offset, Partition: partitionID, Message: existing[0]}, ""
+			}
+			return nil, fmt.Sprintf("ERROR: aggregate_identity_conflict sequence=%d", expectedVersion)
+		}
+	}
+	if t.Policy.AggregateReplay {
+		seen, scanErr := aggregateEventIDExists(p, msg.EventID)
+		if scanErr != nil {
+			return nil, fmt.Sprintf("ERROR: aggregate_proof_unavailable reason=%q", scanErr.Error())
+		}
+		if seen {
+			return nil, fmt.Sprintf("ERROR: aggregate_identity_conflict event_id=%s", msg.EventID)
+		}
 	}
 
 	var appendedOffset uint64
@@ -420,6 +473,35 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 	h.mu.Unlock()
 
 	return &AppendResult{Topic: topicName, Key: key, Version: expectedVersion, Offset: appendedOffset, Partition: partitionID, Message: appendedMsg}, ""
+}
+
+// aggregateEventIDExists consults the committed retained log rather than an
+// in-memory index so an event-id uniqueness decision survives broker restart.
+func aggregateEventIDExists(p *topic.Partition, eventID string) (bool, error) {
+	limit := p.LastStableOffset()
+	for offset := p.OffsetRange().Earliest; offset < limit; {
+		messages, err := p.ReadCommitted(offset, 256)
+		if err != nil {
+			return false, err
+		}
+		if len(messages) == 0 {
+			return false, fmt.Errorf("committed log scan made no progress")
+		}
+		for _, existing := range messages {
+			if existing.Offset >= limit {
+				return false, nil
+			}
+			if existing.EventID == eventID {
+				return true, nil
+			}
+		}
+		next := messages[len(messages)-1].Offset + 1
+		if next <= offset {
+			return false, fmt.Errorf("committed log scan did not advance")
+		}
+		offset = next
+	}
+	return false, nil
 }
 
 // HandleReadStream writes event data directly to conn.

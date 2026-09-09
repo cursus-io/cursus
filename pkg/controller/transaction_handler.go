@@ -157,6 +157,9 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 	if t == nil {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
+	if t.PolicySnapshot().AggregateReplay {
+		return fmt.Sprintf("ERROR: aggregate_publish_requires_append_stream topic=%s", topicName)
+	}
 	if authResp := ch.authorizeTopicWrite(t.PolicySnapshot(), clientCtx); authResp != "" {
 		return fmt.Sprintf("%s topic=%s", authResp, topicName)
 	}

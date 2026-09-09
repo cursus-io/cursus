@@ -274,6 +274,9 @@ func (t *Topic) applyFullDefinitionLocked(definition Definition, hp HandlerProvi
 	partitionCount := definition.Partitions
 	policy := definition.Policy
 	current := len(t.Partitions)
+	if t.Policy.AggregateReplay && partitionCount != current {
+		return fmt.Errorf("cannot change partition count for aggregate replay topic '%s'", t.Name)
+	}
 	if partitionCount < current {
 		return fmt.Errorf("cannot decrease partition count for topic '%s': %d -> %d", t.Name, current, partitionCount)
 	}

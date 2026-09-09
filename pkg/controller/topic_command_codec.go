@@ -61,6 +61,13 @@ func parseTopicDefinitionPatch(args map[string]string) (topic.DefinitionPatch, s
 		}
 		patch.EventSourcing = &parsed
 	}
+	if value, ok := args["aggregate_replay"]; ok {
+		parsed, valid := parseCreateBool(value)
+		if !valid {
+			return patch, fmt.Sprintf("ERROR: invalid_aggregate_replay value=%q", value)
+		}
+		patch.AggregateReplay = &parsed
+	}
 	if value, ok := args["min_in_sync_replicas"]; ok {
 		parsed, err := strconv.Atoi(value)
 		if err != nil || parsed < 1 {

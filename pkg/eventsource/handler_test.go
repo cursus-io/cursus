@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -364,6 +365,17 @@ func TestHandler_HandleAppendStream_VersionConflict(t *testing.T) {
 	assert.Contains(t, result, "ERROR: version_conflict")
 	assert.Contains(t, result, "current=1")
 	assert.Contains(t, result, "expected=1")
+}
+
+func TestHandler_HandleAppendStream_RejectsReusedAggregateEventID(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+	require.NoError(t, h.tm.CreateTopicWithPolicy("matches", 1, true, true, topic.Policy{AggregateReplay: true}))
+
+	first := "APPEND_STREAM topic=matches key=match-1 version=1 event_id=event-1 producerId=producer-1 seqNum=1 message=started"
+	second := "APPEND_STREAM topic=matches key=match-1 version=2 event_id=event-1 producerId=producer-1 seqNum=2 message=finished"
+	require.True(t, strings.HasPrefix(h.HandleAppendStream(first), "OK "))
+	require.Contains(t, h.HandleAppendStream(second), "aggregate_identity_conflict")
 }
 
 func TestHandler_HandleStreamVersion(t *testing.T) {

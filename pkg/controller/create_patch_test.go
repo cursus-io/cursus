@@ -64,14 +64,14 @@ func TestTopicDefinitionResponsesAppendFieldsAfterLegacyPrefix(t *testing.T) {
 	require.Equal(t, []string{
 		"OK", "topic", "partitions", "cleanup_policy", "partitioner", "auth_policy", "read_acl", "write_acl",
 		"retention_hours", "retention_bytes", "revision", "replication_factor", "idempotent", "event_sourcing", "lifecycle_epoch",
-		"min_in_sync_replicas", "effective_min_in_sync_replicas",
+		"min_in_sync_replicas", "effective_min_in_sync_replicas", "aggregate_replay",
 	}, responseFieldNames(create))
 
 	metadata := handler.HandleCommand("METADATA topic=compat", ctx)
 	require.Equal(t, []string{
 		"OK", "topic", "partitions", "leaders", "epochs", "cleanup_policy", "partitioner", "auth_policy", "read_acl",
 		"write_acl", "retention_hours", "retention_bytes", "revision", "replication_factor", "idempotent", "event_sourcing", "lifecycle_epoch",
-		"min_in_sync_replicas", "effective_min_in_sync_replicas",
+		"min_in_sync_replicas", "effective_min_in_sync_replicas", "aggregate_replay",
 	}, responseFieldNames(metadata))
 }
 
@@ -261,4 +261,35 @@ func TestRepeatedCreateStillRejectsCompactEventSourcingTopic(t *testing.T) {
 	require.True(t, definition.EventSourcing)
 	require.Equal(t, config.CleanupPolicyDelete, definition.Policy.CleanupPolicy)
 	require.Equal(t, 168, definition.Policy.RetentionHours)
+}
+
+func TestAggregateReplayProfileEnablesItsPrerequisites(t *testing.T) {
+	ch, _ := newTestHandler(t)
+	response := ch.HandleCommand("CREATE topic=matches partitions=1 aggregate_replay=true", NewClientContext("", 0))
+	require.Contains(t, response, "aggregate_replay=true")
+
+	definition := ch.TopicManager.GetTopic("matches").Definition()
+	require.True(t, definition.Policy.AggregateReplay)
+	require.True(t, definition.EventSourcing)
+	require.True(t, definition.Idempotent)
+}
+
+func TestAggregateReplayProofAndRangeRead(t *testing.T) {
+	ch, _, _, _ := newDiskBackedTransactionHandler(t)
+	ctx := NewClientContext("", 0)
+	require.Contains(t, ch.HandleCommand("CREATE topic=matches partitions=1 aggregate_replay=true", ctx), "aggregate_replay=true")
+
+	first := "APPEND_STREAM topic=matches key=match-1 version=1 event_id=event-1 producerId=producer-1 seqNum=1 message=started"
+	second := "APPEND_STREAM topic=matches key=match-1 version=2 event_id=event-2 producerId=producer-1 seqNum=2 message=finished"
+	require.True(t, strings.HasPrefix(ch.HandleCommand(first, ctx), "OK "))
+	require.True(t, strings.HasPrefix(ch.HandleCommand(second, ctx), "OK "))
+
+	proof := ch.HandleCommand("AGGREGATE_REPLAY_PROOF topic=matches match_id=match-1 expected_last_sequence=2", ctx)
+	require.Contains(t, proof, "OK proof=")
+	require.Contains(t, proof, `"status":"complete"`)
+
+	rangeRead := ch.HandleCommand("AGGREGATE_EVENT_RANGE_READ topic=matches match_id=match-1 from_sequence=1 to_sequence=2", ctx)
+	require.Contains(t, rangeRead, "OK range=")
+	require.Contains(t, rangeRead, `"event_id":"event-1"`)
+	require.Contains(t, rangeRead, `"event_id":"event-2"`)
 }

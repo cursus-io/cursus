@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/ackpolicy"
+	"github.com/cursus-io/cursus/pkg/aggregate"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/protocol"
@@ -184,6 +185,9 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 	if t == nil {
 		util.Warn("ch publish: topic '%s' does not exist after retries", topicName)
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+	if t.Policy.AggregateReplay && !strings.EqualFold(args["internal_txn_publish"], "true") {
+		return fmt.Sprintf("ERROR: aggregate_publish_requires_append_stream topic=%s", topicName)
 	}
 	if strings.EqualFold(args["internal_txn_publish"], "true") {
 		if clientCtx == nil || !clientCtx.Internal {
@@ -518,6 +522,12 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 		return "ERROR: empty_messages command=REPLICATE_MESSAGE"
 	}
 	for i := range msgCmd.Messages {
+		if t.PolicySnapshot().AggregateReplay {
+			message := msgCmd.Messages[i]
+			if message.Key == "" || message.AggregateVersion == 0 || message.EventID == "" || message.ProducerID == "" || message.SeqNum == 0 || message.PayloadDigest != aggregate.Digest(message.Payload) {
+				return "ERROR: aggregate_identity_conflict"
+			}
+		}
 		if errResp := ch.validateReplicatedTransactionMessage(msgCmd.Topic, msgCmd.Partition, &msgCmd.Messages[i]); errResp != "" {
 			return errResp
 		}
