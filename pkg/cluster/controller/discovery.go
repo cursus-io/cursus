@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/util"
+	"github.com/google/uuid"
 )
 
 type ServiceDiscovery interface {
@@ -25,19 +27,28 @@ type ServiceDiscovery interface {
 }
 
 type serviceDiscovery struct {
-	rm         RaftManager
-	fsm        *fsm.BrokerFSM
-	brokerID   string
-	addr       string
-	clientAddr string
+	rm               RaftManager
+	fsm              *fsm.BrokerFSM
+	brokerID         string
+	addr             string
+	clientAddr       string
+	incarnationID    string
+	heartbeatTimeout time.Duration
+
+	livenessMu  sync.RWMutex
+	lastSeen    map[string]time.Time
+	leaderSince time.Time
 }
 
 func NewServiceDiscoveryImpl(rm RaftManager, brokerID, addr, clientAddr string) *serviceDiscovery {
 	sd := &serviceDiscovery{
-		rm:         rm,
-		brokerID:   brokerID,
-		addr:       addr,
-		clientAddr: clientAddr,
+		rm:               rm,
+		brokerID:         brokerID,
+		addr:             addr,
+		clientAddr:       clientAddr,
+		incarnationID:    uuid.NewString(),
+		heartbeatTimeout: 5 * time.Second,
+		lastSeen:         make(map[string]time.Time),
 	}
 	if rm != nil {
 		sd.fsm = rm.GetFSM()
@@ -45,18 +56,24 @@ func NewServiceDiscoveryImpl(rm RaftManager, brokerID, addr, clientAddr string) 
 	return sd
 }
 
+// BrokerIncarnationID is carried by leader-directed heartbeats. It is process
+// local, while its assigned epoch is part of the replicated BrokerInfo.
+func (sd *serviceDiscovery) BrokerIncarnationID() string { return sd.incarnationID }
+
 func NewServiceDiscovery(rm RaftManager, brokerID, addr, clientAddr string) ServiceDiscovery {
 	return NewServiceDiscoveryImpl(rm, brokerID, addr, clientAddr)
 }
 
 func (sd *serviceDiscovery) Register() error {
 	broker := &fsm.BrokerInfo{
-		ID:                sd.brokerID,
-		Addr:              sd.addr,
-		ClientAddr:        sd.clientAddr,
-		Status:            "active",
-		LastSeen:          time.Now(),
-		LifecycleProtocol: fsm.BrokerProtocolVersionCurrent,
+		ID:                           sd.brokerID,
+		Addr:                         sd.addr,
+		ClientAddr:                   sd.clientAddr,
+		Status:                       "active",
+		LastSeen:                     time.Now(),
+		IncarnationID:                sd.incarnationID,
+		TransactionCoordinatorShards: sd.transactionCoordinatorShardCount(),
+		LifecycleProtocol:            fsm.BrokerProtocolVersionCurrent,
 	}
 
 	data, err := json.Marshal(broker)
@@ -96,6 +113,14 @@ func (sd *serviceDiscovery) DiscoverBrokers() ([]fsm.BrokerInfo, error) {
 }
 
 func (sd *serviceDiscovery) UpdateHeartbeat(nodeID string) {
+	sd.UpdateHeartbeatWithIncarnation(nodeID, "")
+}
+
+// UpdateHeartbeatWithIncarnation accepts liveness only on the Raft leader.
+// Followers must not create a second membership view from their local socket
+// observations. The resulting active/inactive transition is still committed
+// through Raft before it becomes visible to coordinator routing.
+func (sd *serviceDiscovery) UpdateHeartbeatWithIncarnation(nodeID, incarnationID string) {
 	if sd.rm != nil && sd.rm.GetISRManager() != nil {
 		sd.rm.GetISRManager().UpdateHeartbeat(nodeID)
 	}
@@ -103,7 +128,17 @@ func (sd *serviceDiscovery) UpdateHeartbeat(nodeID string) {
 		return
 	}
 	broker := sd.fsm.GetBroker(nodeID)
-	if broker == nil || broker.Status == "active" {
+	if broker == nil {
+		return
+	}
+	if broker.IncarnationID != "" && incarnationID != broker.IncarnationID {
+		util.Warn("Ignoring fenced heartbeat from broker %s", nodeID)
+		return
+	}
+	sd.livenessMu.Lock()
+	sd.lastSeen[nodeID] = time.Now()
+	sd.livenessMu.Unlock()
+	if broker.Status == "active" {
 		return
 	}
 	broker.Status = "active"
@@ -216,7 +251,7 @@ func (sd *serviceDiscovery) RemoveNode(nodeID string) (string, error) {
 }
 
 func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(time.Second)
 	go func() {
 		defer ticker.Stop()
 		util.Debug("reconciler started for broker %s", sd.brokerID)
@@ -251,6 +286,21 @@ func (sd *serviceDiscovery) ensureClientAddrs() {
 }
 
 func (sd *serviceDiscovery) Reconcile() {
+	if sd.rm == nil || sd.fsm == nil {
+		return
+	}
+	if !sd.rm.IsLeader() {
+		sd.livenessMu.Lock()
+		sd.leaderSince = time.Time{}
+		sd.livenessMu.Unlock()
+		return
+	}
+	sd.livenessMu.Lock()
+	if sd.leaderSince.IsZero() {
+		sd.leaderSince = time.Now()
+		sd.lastSeen[sd.brokerID] = sd.leaderSince
+	}
+	sd.livenessMu.Unlock()
 	future := sd.rm.GetConfiguration()
 	if err := future.Error(); err != nil {
 		util.Error("Failed to get Raft configuration: %v", err)
@@ -333,9 +383,11 @@ func (sd *serviceDiscovery) brokerAlive(brokerID string) bool {
 	if brokerID == sd.brokerID {
 		return true
 	}
-	if sd.rm == nil || sd.rm.GetISRManager() == nil {
+	sd.livenessMu.RLock()
+	defer sd.livenessMu.RUnlock()
+	if !sd.leaderSince.IsZero() && time.Since(sd.leaderSince) <= sd.heartbeatTimeout {
 		return true
 	}
-	liveness, ok := sd.rm.GetISRManager().(interface{ IsBrokerAlive(string) bool })
-	return !ok || liveness.IsBrokerAlive(brokerID)
+	lastSeen, ok := sd.lastSeen[brokerID]
+	return ok && time.Since(lastSeen) <= sd.heartbeatTimeout
 }

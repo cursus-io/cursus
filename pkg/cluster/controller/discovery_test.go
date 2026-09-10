@@ -290,19 +290,53 @@ func TestServiceDiscoveryReconcileMarksHeartbeatExpiredBrokerInactive(t *testing
 	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
 	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node1","addr":"localhost:9001","status":"active"}`)})
 	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node2","addr":"localhost:9002","status":"active"}`)})
-	liveness := &LivenessMockISRManager{alive: map[string]bool{"node1": true, "node2": false}}
 	configuration := raft.Configuration{Servers: []raft.Server{
 		{ID: "node1", Address: "localhost:9001"},
 		{ID: "node2", Address: "localhost:9002"},
 	}}
 	rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: configuration}).Once()
-	rm.On("GetISRManager").Return(liveness)
 	rm.On("ApplyCommand", "DEREGISTER", mock.Anything).Return(nil).Once()
+
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	sd.livenessMu.Lock()
+	sd.leaderSince = time.Now().Add(-2 * sd.heartbeatTimeout)
+	sd.livenessMu.Unlock()
+	sd.Reconcile()
+
+	assert.Equal(t, "inactive", rm.mockFSM.GetBroker("node2").Status)
+	rm.AssertExpectations(t)
+}
+
+func TestServiceDiscoveryLeaderGraceDefersMembershipTransition(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node1","addr":"localhost:9001","status":"active"}`)})
+	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node2","addr":"localhost:9002","status":"active"}`)})
+	configuration := raft.Configuration{Servers: []raft.Server{{ID: "node1", Address: "localhost:9001"}, {ID: "node2", Address: "localhost:9002"}}}
+	rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: configuration}).Once()
 
 	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
 	sd.Reconcile()
 
+	assert.Equal(t, "active", rm.mockFSM.GetBroker("node2").Status)
+	rm.AssertNotCalled(t, "ApplyCommand", "DEREGISTER", mock.Anything)
+	rm.AssertExpectations(t)
+}
+
+func TestServiceDiscoveryRejectsFencedHeartbeat(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node2","addr":"localhost:9002","status":"inactive","incarnation_id":"current","incarnation_epoch":2}`)})
+	rm.On("GetISRManager").Return(nil).Twice()
+	rm.On("ApplyCommand", "REGISTER", mock.Anything).Return(nil).Once()
+
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	sd.UpdateHeartbeatWithIncarnation("node2", "stale")
 	assert.Equal(t, "inactive", rm.mockFSM.GetBroker("node2").Status)
+	sd.UpdateHeartbeatWithIncarnation("node2", "current")
+	assert.Equal(t, "active", rm.mockFSM.GetBroker("node2").Status)
 	rm.AssertExpectations(t)
 }
 

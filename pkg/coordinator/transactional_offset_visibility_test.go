@@ -66,7 +66,7 @@ func TestTransactionalOffsetRecordRoundTripIsDeterministic(t *testing.T) {
 	}
 	payload, key, err := encodeConsumerMetadataRecord(record)
 	require.NoError(t, err)
-	decoded, err := DecodeConsumerMetadataRecord(string(payload))
+	decoded, _, err := DecodeConsumerMetadataRecord(string(payload))
 	require.NoError(t, err)
 	require.Equal(t, canonicalConsumerMetadataRecord(record), decoded)
 	secondPayload, secondKey, err := encodeConsumerMetadataRecord(record)

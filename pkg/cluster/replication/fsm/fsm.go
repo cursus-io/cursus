@@ -32,13 +32,18 @@ type ReplicationEntry struct {
 }
 
 type BrokerInfo struct {
-	ID                           string    `json:"id"`
-	Addr                         string    `json:"addr"`
-	ClientAddr                   string    `json:"client_addr,omitempty"`
-	Status                       string    `json:"status"`
-	LastSeen                     time.Time `json:"last_seen"`
-	LifecycleProtocol            int       `json:"lifecycle_protocol,omitempty"`
-	TransactionCoordinatorShards int       `json:"transaction_coordinator_shards,omitempty"`
+	ID                string    `json:"id"`
+	Addr              string    `json:"addr"`
+	ClientAddr        string    `json:"client_addr,omitempty"`
+	Status            string    `json:"status"`
+	LastSeen          time.Time `json:"last_seen"`
+	LifecycleProtocol int       `json:"lifecycle_protocol,omitempty"`
+	// IncarnationID identifies one broker process lifetime. IncarnationEpoch is
+	// assigned durably when that lifetime is first registered, so an older
+	// process cannot keep a newer registration alive with heartbeats.
+	IncarnationID                string `json:"incarnation_id,omitempty"`
+	IncarnationEpoch             uint64 `json:"incarnation_epoch,omitempty"`
+	TransactionCoordinatorShards int    `json:"transaction_coordinator_shards,omitempty"`
 }
 
 type ProducerSequence struct {

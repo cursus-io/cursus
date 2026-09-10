@@ -57,7 +57,7 @@ func TestTransactionalProcessingV1AppendsBeforeDecisionAndCommitsOffsetsBeforeVi
 			if message.TransactionalID == "eos-1" && message.TransactionMarker == types.TransactionMarkerCommit {
 				offsetMarker = true
 			}
-			record, decodeErr := coordinator.DecodeConsumerMetadataRecord(message.Payload)
+			record, _, decodeErr := coordinator.DecodeConsumerMetadataRecord(message.Payload)
 			if decodeErr != nil {
 				continue
 			}

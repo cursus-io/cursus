@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"time"
 
@@ -18,19 +19,45 @@ const (
 	ConsumerMetadataRecordVersion              = 1
 	ConsumerMetadataRecordVersionSubscriptions = 2
 	ConsumerMetadataRecordVersionTransactions  = 3
+	ConsumerMetadataRecordVersionLifecycle     = 4
 
 	ConsumerMetadataRecordRegistration                = "group_registration"
 	ConsumerMetadataRecordOffsetSnapshot              = "offset_snapshot"
 	ConsumerMetadataRecordTransactionalOffsetSnapshot = "transactional_offset_snapshot"
 	ConsumerMetadataRecordTombstone                   = "group_tombstone"
+	ConsumerMetadataRecordLifecycleSnapshot           = "group_lifecycle_snapshot"
 )
 
 // TopicOffsetSnapshot is a complete durable next-offset snapshot for one
-// group/topic pair.
+// group/topic pair. A registration can carry legacy offsets while upgrading
+// an older log that did not persist group lifecycle metadata.
 type TopicOffsetSnapshot struct {
 	Topic    string       `json:"topic"`
 	Revision uint64       `json:"revision"`
 	Offsets  []OffsetItem `json:"offsets"`
+}
+
+// GroupLifecycleMember is the durable, assignment-bearing part of a member.
+// Leases are deliberately not persisted: a newly elected partition leader
+// starts a fresh session window before it can expire a recovered member.
+type GroupLifecycleMember struct {
+	ID               string           `json:"id"`
+	Assignments      []int            `json:"assignments,omitempty"`
+	TopicAssignments []TopicPartition `json:"topic_assignments,omitempty"`
+}
+
+// GroupLifecycleSnapshot is the authoritative group state written to the
+// group's __consumer_offsets partition. It intentionally excludes committed
+// offsets: those retain their own compacted keys and monotonic revisions.
+type GroupLifecycleSnapshot struct {
+	TopicName       string                 `json:"topic,omitempty"`
+	Topics          []string               `json:"topics,omitempty"`
+	TopicPattern    string                 `json:"topic_pattern,omitempty"`
+	TopicPartitions []TopicPartition       `json:"topic_partitions,omitempty"`
+	Generation      int                    `json:"generation"`
+	Members         []GroupLifecycleMember `json:"members"`
+	Partitions      []int                  `json:"partitions,omitempty"`
+	LastRebalance   time.Time              `json:"last_rebalance,omitempty"`
 }
 
 // ConsumerMetadataRecord is the versioned record stored in
@@ -38,23 +65,24 @@ type TopicOffsetSnapshot struct {
 // re-created groups, while offset revisions make replay independent of the
 // physical internal-topic partition order.
 type ConsumerMetadataRecord struct {
-	Version          int                   `json:"version"`
-	Type             string                `json:"type"`
-	Group            string                `json:"group"`
-	Topic            string                `json:"topic,omitempty"`
-	PartitionCount   int                   `json:"partition_count,omitempty"`
-	Topics           []string              `json:"topics,omitempty"`
-	TopicPattern     string                `json:"topic_pattern,omitempty"`
-	TopicPartitions  []TopicPartition      `json:"topic_partitions,omitempty"`
-	Epoch            uint64                `json:"epoch"`
-	Revision         uint64                `json:"revision,omitempty"`
-	Offsets          []OffsetItem          `json:"offsets,omitempty"`
-	InitialOffsets   []TopicOffsetSnapshot `json:"initial_offsets,omitempty"`
-	Timestamp        time.Time             `json:"timestamp"`
-	TransactionalID  string                `json:"transactional_id,omitempty"`
-	ProducerID       string                `json:"producer_id,omitempty"`
-	ProducerEpoch    int64                 `json:"producer_epoch,omitempty"`
-	CoordinatorEpoch int64                 `json:"coordinator_epoch,omitempty"`
+	Version          int                     `json:"version"`
+	Type             string                  `json:"type"`
+	Group            string                  `json:"group"`
+	Topic            string                  `json:"topic,omitempty"`
+	PartitionCount   int                     `json:"partition_count,omitempty"`
+	Topics           []string                `json:"topics,omitempty"`
+	TopicPattern     string                  `json:"topic_pattern,omitempty"`
+	TopicPartitions  []TopicPartition        `json:"topic_partitions,omitempty"`
+	Epoch            uint64                  `json:"epoch"`
+	Revision         uint64                  `json:"revision,omitempty"`
+	Offsets          []OffsetItem            `json:"offsets,omitempty"`
+	InitialOffsets   []TopicOffsetSnapshot   `json:"initial_offsets,omitempty"`
+	Timestamp        time.Time               `json:"timestamp"`
+	TransactionalID  string                  `json:"transactional_id,omitempty"`
+	ProducerID       string                  `json:"producer_id,omitempty"`
+	ProducerEpoch    int64                   `json:"producer_epoch,omitempty"`
+	CoordinatorEpoch int64                   `json:"coordinator_epoch,omitempty"`
+	Lifecycle        *GroupLifecycleSnapshot `json:"lifecycle,omitempty"`
 }
 
 // ConsumerMetadataRecoveryStatus is safe to expose through readiness and
@@ -69,6 +97,7 @@ type ConsumerMetadataRecoveryStatus struct {
 	ReplayedRecords     int    `json:"replayed_records"`
 	RegistrationRecords int    `json:"registration_records"`
 	OffsetRecords       int    `json:"offset_records"`
+	LegacyRecords       int    `json:"legacy_records"`
 	OrphanRecords       int    `json:"orphan_records"`
 	CorruptRecords      int    `json:"corrupt_records"`
 }
@@ -77,9 +106,15 @@ type lifecycleCandidate struct {
 	record ConsumerMetadataRecord
 }
 
+type lifecycleSnapshotCandidate struct {
+	record ConsumerMetadataRecord
+}
+
 type offsetCandidate struct {
 	record ConsumerMetadataRecord
 }
+
+type legacyRecoveryState map[string]map[string]map[int]uint64
 
 func (c *Coordinator) RecoverySnapshot() ConsumerMetadataRecoveryStatus {
 	if c == nil {
@@ -147,6 +182,35 @@ func canonicalConsumerMetadataRecord(record ConsumerMetadataRecord) ConsumerMeta
 	}
 	sort.Slice(initial, func(i, j int) bool { return initial[i].Topic < initial[j].Topic })
 	record.InitialOffsets = initial
+	if record.Lifecycle != nil {
+		lifecycle := *record.Lifecycle
+		lifecycle.Topics = append([]string(nil), lifecycle.Topics...)
+		sort.Strings(lifecycle.Topics)
+		lifecycle.TopicPartitions = append([]TopicPartition(nil), lifecycle.TopicPartitions...)
+		sort.Slice(lifecycle.TopicPartitions, func(i, j int) bool {
+			if lifecycle.TopicPartitions[i].Topic != lifecycle.TopicPartitions[j].Topic {
+				return lifecycle.TopicPartitions[i].Topic < lifecycle.TopicPartitions[j].Topic
+			}
+			return lifecycle.TopicPartitions[i].Partition < lifecycle.TopicPartitions[j].Partition
+		})
+		lifecycle.Partitions = append([]int(nil), lifecycle.Partitions...)
+		sort.Ints(lifecycle.Partitions)
+		lifecycle.Members = append([]GroupLifecycleMember(nil), lifecycle.Members...)
+		for i := range lifecycle.Members {
+			lifecycle.Members[i].Assignments = append([]int(nil), lifecycle.Members[i].Assignments...)
+			sort.Ints(lifecycle.Members[i].Assignments)
+			lifecycle.Members[i].TopicAssignments = append([]TopicPartition(nil), lifecycle.Members[i].TopicAssignments...)
+			sort.Slice(lifecycle.Members[i].TopicAssignments, func(a, b int) bool {
+				left, right := lifecycle.Members[i].TopicAssignments[a], lifecycle.Members[i].TopicAssignments[b]
+				if left.Topic != right.Topic {
+					return left.Topic < right.Topic
+				}
+				return left.Partition < right.Partition
+			})
+		}
+		sort.Slice(lifecycle.Members, func(i, j int) bool { return lifecycle.Members[i].ID < lifecycle.Members[j].ID })
+		record.Lifecycle = &lifecycle
+	}
 	return record
 }
 
@@ -157,7 +221,7 @@ func canonicalOffsetItems(offsets []OffsetItem) []OffsetItem {
 }
 
 func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
-	if record.Version != ConsumerMetadataRecordVersion && record.Version != ConsumerMetadataRecordVersionSubscriptions && record.Version != ConsumerMetadataRecordVersionTransactions {
+	if record.Version != ConsumerMetadataRecordVersion && record.Version != ConsumerMetadataRecordVersionSubscriptions && record.Version != ConsumerMetadataRecordVersionTransactions && record.Version != ConsumerMetadataRecordVersionLifecycle {
 		return fmt.Errorf("unsupported consumer metadata record version %d", record.Version)
 	}
 	if record.Group == "" || record.Epoch == 0 {
@@ -165,6 +229,9 @@ func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
 	}
 	if record.Version == ConsumerMetadataRecordVersionTransactions && record.Type != ConsumerMetadataRecordTransactionalOffsetSnapshot {
 		return fmt.Errorf("consumer metadata version 3 requires a transactional offset snapshot")
+	}
+	if record.Version == ConsumerMetadataRecordVersionLifecycle && record.Type != ConsumerMetadataRecordLifecycleSnapshot {
+		return fmt.Errorf("consumer metadata version 4 requires a lifecycle snapshot")
 	}
 	switch record.Type {
 	case ConsumerMetadataRecordRegistration:
@@ -229,8 +296,38 @@ func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
 		if record.PartitionCount != 0 || record.Revision != 0 || len(record.Offsets) != 0 || len(record.InitialOffsets) != 0 {
 			return fmt.Errorf("group tombstone contains live metadata fields")
 		}
+	case ConsumerMetadataRecordLifecycleSnapshot:
+		if record.Version != ConsumerMetadataRecordVersionLifecycle || record.Lifecycle == nil {
+			return fmt.Errorf("group lifecycle snapshot is missing version or state")
+		}
+		if record.Topic != "" || record.PartitionCount != 0 || len(record.Offsets) != 0 || len(record.InitialOffsets) != 0 || hasConsumerMetadataTransactionFields(record) {
+			return fmt.Errorf("group lifecycle snapshot contains non-lifecycle fields")
+		}
+		if err := validateGroupLifecycleSnapshot(*record.Lifecycle); err != nil {
+			return err
+		}
+		if record.Revision != uint64(record.Lifecycle.Generation) {
+			return fmt.Errorf("group lifecycle snapshot revision does not match generation")
+		}
 	default:
 		return fmt.Errorf("unsupported consumer metadata record type %q", record.Type)
+	}
+	return nil
+}
+
+func validateGroupLifecycleSnapshot(snapshot GroupLifecycleSnapshot) error {
+	if snapshot.Generation < 0 || (snapshot.TopicName == "" && len(snapshot.Topics) == 0) {
+		return fmt.Errorf("group lifecycle snapshot is missing subscription or has invalid generation")
+	}
+	seenMembers := make(map[string]struct{}, len(snapshot.Members))
+	for _, member := range snapshot.Members {
+		if member.ID == "" {
+			return fmt.Errorf("group lifecycle snapshot contains empty member")
+		}
+		if _, exists := seenMembers[member.ID]; exists {
+			return fmt.Errorf("group lifecycle snapshot contains duplicate member %q", member.ID)
+		}
+		seenMembers[member.ID] = struct{}{}
 	}
 	return nil
 }
@@ -297,6 +394,9 @@ func validateOffsetItems(offsets []OffsetItem, partitionCount int) error {
 func consumerMetadataRecordKey(record ConsumerMetadataRecord) string {
 	identity := record.Group
 	prefix := "group"
+	if record.Type == ConsumerMetadataRecordLifecycleSnapshot {
+		prefix = "lifecycle"
+	}
 	if record.Type == ConsumerMetadataRecordOffsetSnapshot || record.Type == ConsumerMetadataRecordTransactionalOffsetSnapshot {
 		identity += "\x00" + record.Topic
 		prefix = "offset"
@@ -307,6 +407,13 @@ func consumerMetadataRecordKey(record ConsumerMetadataRecord) string {
 	}
 	digest := sha256.Sum256([]byte(identity))
 	return "cursus.consumer." + prefix + ".v1." + hex.EncodeToString(digest[:])
+}
+
+// ConsumerMetadataGroupPartitionKey is used only for selecting the internal
+// topic partition. The record key remains record-specific so compaction never
+// deletes a group's lifecycle record in favor of an offset snapshot.
+func ConsumerMetadataGroupPartitionKey(group string) string {
+	return "cursus.consumer.partition.v1." + group
 }
 
 func encodeConsumerMetadataRecord(record ConsumerMetadataRecord) ([]byte, string, error) {
@@ -321,48 +428,54 @@ func encodeConsumerMetadataRecord(record ConsumerMetadataRecord) ([]byte, string
 	return payload, consumerMetadataRecordKey(record), nil
 }
 
-// EncodeConsumerMetadataRecord validates and encodes a record for an
-// acknowledged append to __consumer_offsets.
-func EncodeConsumerMetadataRecord(record ConsumerMetadataRecord) ([]byte, string, error) {
-	return encodeConsumerMetadataRecord(record)
-}
-
-func decodeConsumerMetadataRecord(payload string) (ConsumerMetadataRecord, error) {
+func decodeConsumerMetadataRecord(payload string) (ConsumerMetadataRecord, bool, error) {
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(payload), &object); err != nil {
-		return ConsumerMetadataRecord{}, err
+		return ConsumerMetadataRecord{}, false, err
 	}
-	versionRaw, ok := object["version"]
-	if !ok {
-		return ConsumerMetadataRecord{}, fmt.Errorf("unversioned consumer metadata; clean bootstrap required")
+	versionRaw, versioned := object["version"]
+	if !versioned {
+		return ConsumerMetadataRecord{}, false, nil
 	}
 	var version int
 	if err := json.Unmarshal(versionRaw, &version); err != nil {
-		return ConsumerMetadataRecord{}, fmt.Errorf("decode consumer metadata version: %w", err)
+		return ConsumerMetadataRecord{}, true, fmt.Errorf("decode consumer metadata version: %w", err)
 	}
 	decoder := json.NewDecoder(bytes.NewBufferString(payload))
 	decoder.DisallowUnknownFields()
 	var record ConsumerMetadataRecord
 	if err := decoder.Decode(&record); err != nil {
-		return ConsumerMetadataRecord{}, err
+		return ConsumerMetadataRecord{}, true, err
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return ConsumerMetadataRecord{}, fmt.Errorf("consumer metadata record has trailing content")
+		return ConsumerMetadataRecord{}, true, fmt.Errorf("consumer metadata record has trailing content")
 	}
 	record = canonicalConsumerMetadataRecord(record)
 	if version != record.Version {
-		return ConsumerMetadataRecord{}, fmt.Errorf("consumer metadata version mismatch")
+		return ConsumerMetadataRecord{}, true, fmt.Errorf("consumer metadata version mismatch")
 	}
 	if err := validateConsumerMetadataRecord(record); err != nil {
-		return ConsumerMetadataRecord{}, err
+		return ConsumerMetadataRecord{}, true, err
 	}
-	return record, nil
+	return record, true, nil
 }
 
-// DecodeConsumerMetadataRecord validates a current-format record without
-// mutating coordinator state. Unversioned records are always rejected.
-func DecodeConsumerMetadataRecord(payload string) (ConsumerMetadataRecord, error) {
+// DecodeConsumerMetadataRecord is a read-only decoder used by the storage
+// maintenance CLI. The bool is false for a valid legacy offset payload.
+func DecodeConsumerMetadataRecord(payload string) (ConsumerMetadataRecord, bool, error) {
 	return decodeConsumerMetadataRecord(payload)
+}
+
+// EncodeConsumerMetadataRecord is used by the broker's routed internal-topic
+// writer. It preserves the same strict validation as recovery.
+func EncodeConsumerMetadataRecord(record ConsumerMetadataRecord) ([]byte, string, error) {
+	return encodeConsumerMetadataRecord(record)
+}
+
+// DecodeLegacyOffsetPayload decodes the pre-v1 single and bulk offset JSON
+// formats without changing coordinator state.
+func DecodeLegacyOffsetPayload(payload string) (string, string, []OffsetItem, error) {
+	return parseOffsetLogPayload(payload)
 }
 
 func sameConsumerMetadataRecord(left, right ConsumerMetadataRecord) bool {
@@ -376,7 +489,14 @@ func sameConsumerMetadataRecord(left, right ConsumerMetadataRecord) bool {
 }
 
 func (c *Coordinator) writeConsumerMetadataRecord(record ConsumerMetadataRecord) error {
-	if !c.standalone {
+	c.mu.RLock()
+	writer := c.offsetRecordWriter
+	standalone := c.standalone
+	c.mu.RUnlock()
+	if writer != nil {
+		return writer(record)
+	}
+	if !standalone {
 		return nil
 	}
 	payload, key, err := encodeConsumerMetadataRecord(record)
@@ -384,6 +504,42 @@ func (c *Coordinator) writeConsumerMetadataRecord(record ConsumerMetadataRecord)
 		return err
 	}
 	return c.publishOffsetMessage(&types.Message{Payload: string(payload), Key: key})
+}
+
+func lifecycleSnapshot(group *GroupMetadata) *GroupLifecycleSnapshot {
+	if group == nil {
+		return nil
+	}
+	snapshot := &GroupLifecycleSnapshot{
+		TopicName:       group.TopicName,
+		Topics:          append([]string(nil), group.Topics...),
+		TopicPattern:    group.TopicPattern,
+		TopicPartitions: append([]TopicPartition(nil), group.TopicPartitions...),
+		Generation:      group.Generation,
+		Members:         make([]GroupLifecycleMember, 0, len(group.Members)),
+		Partitions:      append([]int(nil), group.Partitions...),
+		LastRebalance:   group.LastRebalance,
+	}
+	for _, member := range group.Members {
+		snapshot.Members = append(snapshot.Members, GroupLifecycleMember{
+			ID:               member.ID,
+			Assignments:      append([]int(nil), member.Assignments...),
+			TopicAssignments: append([]TopicPartition(nil), member.TopicAssignments...),
+		})
+	}
+	return snapshot
+}
+
+func (c *Coordinator) writeGroupLifecycleSnapshot(groupName string, epoch uint64, group *GroupMetadata) error {
+	return c.writeConsumerMetadataRecord(ConsumerMetadataRecord{
+		Version:   ConsumerMetadataRecordVersionLifecycle,
+		Type:      ConsumerMetadataRecordLifecycleSnapshot,
+		Group:     groupName,
+		Epoch:     epoch,
+		Revision:  uint64(group.Generation),
+		Lifecycle: lifecycleSnapshot(group),
+		Timestamp: time.Now().UTC(),
+	})
 }
 
 func registrationInitialOffsets(group *GroupMetadata) []TopicOffsetSnapshot {
@@ -452,7 +608,9 @@ func (c *Coordinator) writeOffsetSnapshot(groupName, topicName string, epoch, re
 		Offsets:   canonicalOffsetItems(offsets),
 		Timestamp: time.Now().UTC(),
 	}
+	c.mu.RLock()
 	writer := c.offsetRecordWriter
+	c.mu.RUnlock()
 	if writer != nil {
 		return writer(record)
 	}
@@ -474,7 +632,10 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 	const batchSize = 1024
 	status := ConsumerMetadataRecoveryStatus{Phase: "consumer_metadata_scan"}
 	lifecycles := make(map[string]lifecycleCandidate)
+	lifecycleSnapshots := make(map[string]lifecycleSnapshotCandidate)
 	offsetSnapshots := make(map[string]offsetCandidate)
+	legacy := make(legacyRecoveryState)
+	legacyRecordCounts := make(map[string]int)
 
 	for partition := 0; partition < c.offsetTopicPartitionCount; partition++ {
 		next := uint64(0)
@@ -482,6 +643,10 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 			earliest, err := provider.EarliestTopicOffset(c.offsetTopic, partition)
 			if err != nil {
 				return status, fmt.Errorf("inspect internal metadata log start partition=%d: %w", partition, err)
+			}
+			if earliest > 0 && !c.migrationAuthoritative && c.standalone {
+				status.OrphanRecords++
+				return status, fmt.Errorf("internal metadata partition %d starts at offset %d; explicit migration selection is required", partition, earliest)
 			}
 			next = earliest
 		}
@@ -506,45 +671,87 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 					continue
 				}
 
-				record, decodeErr := decodeConsumerMetadataRecord(message.Payload)
+				record, versioned, decodeErr := decodeConsumerMetadataRecord(message.Payload)
 				if decodeErr != nil {
 					status.CorruptRecords++
+					if !c.standalone {
+						continue
+					}
 					return status, fmt.Errorf("decode internal metadata partition=%d offset=%d: %w", partition, message.Offset, decodeErr)
 				}
-				if message.Key != consumerMetadataRecordKey(record) {
-					status.CorruptRecords++
-					return status, fmt.Errorf("internal metadata key mismatch partition=%d offset=%d", partition, message.Offset)
+				if versioned {
+					if message.Key != consumerMetadataRecordKey(record) {
+						status.CorruptRecords++
+						return status, fmt.Errorf("internal metadata key mismatch partition=%d offset=%d", partition, message.Offset)
+					}
+					switch record.Type {
+					case ConsumerMetadataRecordRegistration, ConsumerMetadataRecordTombstone:
+						status.RegistrationRecords++
+						candidate, exists := lifecycles[record.Group]
+						switch {
+						case !exists:
+							lifecycles[record.Group] = lifecycleCandidate{record: record}
+						case record.Epoch > candidate.record.Epoch:
+							status.OrphanRecords++
+							lifecycles[record.Group] = lifecycleCandidate{record: record}
+						case record.Epoch < candidate.record.Epoch:
+							status.OrphanRecords++
+						case !sameConsumerMetadataRecord(record, candidate.record):
+							status.CorruptRecords++
+							return status, fmt.Errorf("conflicting lifecycle records group=%s epoch=%d", record.Group, record.Epoch)
+						default:
+							status.OrphanRecords++
+						}
+					case ConsumerMetadataRecordLifecycleSnapshot:
+						if err := selectLifecycleSnapshot(lifecycleSnapshots, record, &status); err != nil {
+							return status, err
+						}
+					case ConsumerMetadataRecordOffsetSnapshot:
+						status.OffsetRecords++
+						identity := offsetCandidateIdentity(record)
+						candidate, exists := offsetSnapshots[identity]
+						if exists && !sameConsumerMetadataRecord(record, candidate.record) {
+							status.CorruptRecords++
+							return status, fmt.Errorf("conflicting offset snapshots group=%s topic=%s epoch=%d revision=%d", record.Group, record.Topic, record.Epoch, record.Revision)
+						}
+						if exists {
+							status.OrphanRecords++
+						} else {
+							offsetSnapshots[identity] = offsetCandidate{record: record}
+						}
+					case ConsumerMetadataRecordTransactionalOffsetSnapshot:
+						// Visibility is decided by the transaction state store. A
+						// committed transaction is subsequently materialized as an
+						// ordinary snapshot, so startup does not guess a decision.
+						status.OffsetRecords++
+					}
+					continue
 				}
-				switch record.Type {
-				case ConsumerMetadataRecordRegistration, ConsumerMetadataRecordTombstone:
-					status.RegistrationRecords++
-					candidate, exists := lifecycles[record.Group]
-					switch {
-					case !exists:
-						lifecycles[record.Group] = lifecycleCandidate{record: record}
-					case record.Epoch > candidate.record.Epoch:
-						status.OrphanRecords++
-						lifecycles[record.Group] = lifecycleCandidate{record: record}
-					case record.Epoch < candidate.record.Epoch:
-						status.OrphanRecords++
-					case !sameConsumerMetadataRecord(record, candidate.record):
-						status.CorruptRecords++
-						return status, fmt.Errorf("conflicting lifecycle records group=%s epoch=%d", record.Group, record.Epoch)
-					default:
-						status.OrphanRecords++
+
+				groupName, topicName, offsets, parseErr := parseOffsetLogPayload(message.Payload)
+				if parseErr != nil {
+					status.CorruptRecords++
+					if !c.standalone {
+						continue
 					}
-				case ConsumerMetadataRecordOffsetSnapshot:
-					status.OffsetRecords++
-					identity := offsetCandidateIdentity(record)
-					candidate, exists := offsetSnapshots[identity]
-					if exists && !sameConsumerMetadataRecord(record, candidate.record) {
+					return status, fmt.Errorf("decode legacy offset partition=%d offset=%d: %w", partition, message.Offset, parseErr)
+				}
+				status.LegacyRecords++
+				legacyRecordCounts[groupName]++
+				if legacy[groupName] == nil {
+					legacy[groupName] = make(map[string]map[int]uint64)
+				}
+				if legacy[groupName][topicName] == nil {
+					legacy[groupName][topicName] = make(map[int]uint64)
+				}
+				for _, item := range offsets {
+					if item.Partition < 0 {
 						status.CorruptRecords++
-						return status, fmt.Errorf("conflicting offset snapshots group=%s topic=%s epoch=%d revision=%d", record.Group, record.Topic, record.Epoch, record.Revision)
+						return status, fmt.Errorf("legacy offset contains negative partition %d", item.Partition)
 					}
-					if exists {
-						status.OrphanRecords++
-					} else {
-						offsetSnapshots[identity] = offsetCandidate{record: record}
+					current, exists := legacy[groupName][topicName][item.Partition]
+					if !exists || item.Offset > current {
+						legacy[groupName][topicName][item.Partition] = item.Offset
 					}
 				}
 			}
@@ -559,14 +766,88 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 		}
 	}
 
+	if c.migrationAuthoritative {
+		for _, count := range legacyRecordCounts {
+			status.OrphanRecords += count
+		}
+		legacy = make(legacyRecoveryState)
+		legacyRecordCounts = make(map[string]int)
+	}
+	for _, raw := range c.migrationRecords {
+		record := canonicalConsumerMetadataRecord(raw)
+		if err := validateConsumerMetadataRecord(record); err != nil {
+			status.CorruptRecords++
+			return status, fmt.Errorf("invalid selected migration record for group %q: %w", record.Group, err)
+		}
+		switch record.Type {
+		case ConsumerMetadataRecordRegistration, ConsumerMetadataRecordTombstone:
+			status.RegistrationRecords++
+			candidate, exists := lifecycles[record.Group]
+			switch {
+			case !exists:
+				lifecycles[record.Group] = lifecycleCandidate{record: record}
+			case record.Epoch > candidate.record.Epoch:
+				status.OrphanRecords++
+				lifecycles[record.Group] = lifecycleCandidate{record: record}
+			case record.Epoch < candidate.record.Epoch:
+				status.OrphanRecords++
+			case !sameConsumerMetadataRecord(record, candidate.record):
+				status.CorruptRecords++
+				return status, fmt.Errorf("migration conflicts with lifecycle record group=%s epoch=%d", record.Group, record.Epoch)
+			default:
+				status.OrphanRecords++
+			}
+		case ConsumerMetadataRecordLifecycleSnapshot:
+			if err := selectLifecycleSnapshot(lifecycleSnapshots, record, &status); err != nil {
+				return status, fmt.Errorf("migration lifecycle snapshot: %w", err)
+			}
+		case ConsumerMetadataRecordOffsetSnapshot:
+			status.OffsetRecords++
+			identity := offsetCandidateIdentity(record)
+			candidate, exists := offsetSnapshots[identity]
+			if exists && !sameConsumerMetadataRecord(record, candidate.record) {
+				status.CorruptRecords++
+				return status, fmt.Errorf("migration conflicts with offset snapshot group=%s topic=%s", record.Group, record.Topic)
+			}
+			if exists {
+				status.OrphanRecords++
+			} else {
+				offsetSnapshots[identity] = offsetCandidate{record: record}
+			}
+		case ConsumerMetadataRecordTransactionalOffsetSnapshot:
+			status.OffsetRecords++
+		}
+	}
+
 	status.Phase = "group_registration_replay"
-	groups, groupEpochs, orphanCount, err := materializeConsumerMetadata(lifecycles, offsetSnapshots, &status)
+	groups, groupEpochs, orphanCount, err := materializeConsumerMetadata(lifecycles, lifecycleSnapshots, offsetSnapshots, legacy, legacyRecordCounts, &status)
 	status.OrphanRecords += orphanCount
 	if err != nil {
 		status.CorruptRecords++
 		return status, err
 	}
 	c.mu.Lock()
+	// origin/main placed membership in GROUP_SYNC. Its offsets records have no
+	// v4 lifecycle snapshot, so retain that restored FSM membership while
+	// replacing only the committed-offset view. Once a v4 snapshot exists it
+	// is authoritative and this compatibility path is deliberately bypassed.
+	for groupName, existing := range c.groups {
+		if _, hasV4Lifecycle := lifecycleSnapshots[groupName]; hasV4Lifecycle {
+			continue
+		}
+		recovered := groups[groupName]
+		if recovered == nil || existing == nil {
+			continue
+		}
+		existing.mu.RLock()
+		recovered.Generation = existing.Generation
+		recovered.LastRebalance = existing.LastRebalance
+		recovered.Members = make(map[string]*MemberMetadata, len(existing.Members))
+		for memberID, member := range existing.Members {
+			recovered.Members[memberID] = &MemberMetadata{ID: member.ID, LastHeartbeat: member.LastHeartbeat, Assignments: append([]int(nil), member.Assignments...), TopicAssignments: append([]TopicPartition(nil), member.TopicAssignments...)}
+		}
+		existing.mu.RUnlock()
+	}
 	c.groups = groups
 	c.groupEpochs = groupEpochs
 	c.ownershipSince = make(map[string]time.Time)
@@ -582,9 +863,33 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 	return status, nil
 }
 
+func selectLifecycleSnapshot(candidates map[string]lifecycleSnapshotCandidate, record ConsumerMetadataRecord, status *ConsumerMetadataRecoveryStatus) error {
+	candidate, exists := candidates[record.Group]
+	switch {
+	case !exists || record.Epoch > candidate.record.Epoch || (record.Epoch == candidate.record.Epoch && record.Revision > candidate.record.Revision):
+		if exists && status != nil {
+			status.OrphanRecords++
+		}
+		candidates[record.Group] = lifecycleSnapshotCandidate{record: record}
+	case record.Epoch == candidate.record.Epoch && record.Revision == candidate.record.Revision && !sameConsumerMetadataRecord(record, candidate.record):
+		if status != nil {
+			status.CorruptRecords++
+		}
+		return fmt.Errorf("conflicting lifecycle snapshots group=%s epoch=%d generation=%d", record.Group, record.Epoch, record.Revision)
+	default:
+		if status != nil {
+			status.OrphanRecords++
+		}
+	}
+	return nil
+}
+
 func materializeConsumerMetadata(
 	lifecycles map[string]lifecycleCandidate,
+	lifecycleSnapshots map[string]lifecycleSnapshotCandidate,
 	offsetSnapshots map[string]offsetCandidate,
+	legacy legacyRecoveryState,
+	legacyRecordCounts map[string]int,
 	status *ConsumerMetadataRecoveryStatus,
 ) (map[string]*GroupMetadata, map[string]uint64, int, error) {
 	groups := make(map[string]*GroupMetadata)
@@ -626,6 +931,61 @@ func materializeConsumerMetadata(
 		}
 		groups[groupName] = group
 	}
+	for groupName, candidate := range lifecycleSnapshots {
+		group := groups[groupName]
+		if group == nil || group.RegistrationEpoch != candidate.record.Epoch {
+			orphans++
+			continue
+		}
+		lifecycle := candidate.record.Lifecycle
+		if lifecycle == nil || lifecycle.TopicName != group.TopicName || !slices.Equal(lifecycle.Topics, group.Topics) || lifecycle.TopicPattern != group.TopicPattern || !slices.Equal(lifecycle.TopicPartitions, group.TopicPartitions) || !slices.Equal(lifecycle.Partitions, group.Partitions) {
+			return nil, nil, orphans, fmt.Errorf("lifecycle snapshot does not match registration group=%s", groupName)
+		}
+		group.Generation = lifecycle.Generation
+		group.LastRebalance = lifecycle.LastRebalance
+		group.Members = make(map[string]*MemberMetadata, len(lifecycle.Members))
+		for _, member := range lifecycle.Members {
+			group.Members[member.ID] = &MemberMetadata{ID: member.ID, LastHeartbeat: time.Now(), Assignments: append([]int(nil), member.Assignments...), TopicAssignments: append([]TopicPartition(nil), member.TopicAssignments...)}
+		}
+	}
+
+	legacyNames := make([]string, 0, len(legacy))
+	for groupName := range legacy {
+		legacyNames = append(legacyNames, groupName)
+	}
+	sort.Strings(legacyNames)
+	for _, groupName := range legacyNames {
+		if _, hasLifecycle := lifecycles[groupName]; hasLifecycle {
+			orphans += legacyRecordCounts[groupName]
+			continue
+		}
+		topics := make([]string, 0, len(legacy[groupName]))
+		for topicName := range legacy[groupName] {
+			topics = append(topics, topicName)
+		}
+		sort.Strings(topics)
+		if len(topics) != 1 {
+			return nil, nil, orphans, fmt.Errorf("legacy group %q has offsets for %d topics and no durable registration", groupName, len(topics))
+		}
+		topicName := topics[0]
+		partitionCount := 0
+		for partition := range legacy[groupName][topicName] {
+			if partition+1 > partitionCount {
+				partitionCount = partition + 1
+			}
+		}
+		partitions := make([]int, partitionCount)
+		for partition := range partitions {
+			partitions[partition] = partition
+		}
+		groups[groupName] = &GroupMetadata{
+			TopicName:       topicName,
+			Members:         make(map[string]*MemberMetadata),
+			Partitions:      partitions,
+			Offsets:         map[string]map[int]uint64{topicName: clonePartitionOffsets(legacy[groupName][topicName])},
+			OffsetRevisions: make(map[string]uint64),
+		}
+	}
 
 	if status != nil {
 		status.Phase = "committed_offset_replay"
@@ -647,6 +1007,58 @@ func materializeConsumerMetadata(
 		}
 		return left.Revision < right.Revision
 	})
+	// origin/main distributed clusters persisted group membership in Raft and
+	// may therefore contain offset snapshots without a registration record.
+	// Materialize a compatibility shell so those offsets remain readable until
+	// the group is next registered through the v4 lifecycle path.
+	type inferredGroup struct {
+		epoch  uint64
+		topics map[string]int
+	}
+	inferred := make(map[string]*inferredGroup)
+	for _, record := range offsetRecords {
+		if groups[record.Group] != nil {
+			continue
+		}
+		if fencedEpoch, exists := groupEpochs[record.Group]; exists && fencedEpoch >= record.Epoch {
+			continue
+		}
+		entry := inferred[record.Group]
+		if entry == nil || record.Epoch > entry.epoch {
+			entry = &inferredGroup{epoch: record.Epoch, topics: make(map[string]int)}
+			inferred[record.Group] = entry
+		}
+		if record.Epoch != entry.epoch {
+			continue
+		}
+		for _, item := range record.Offsets {
+			if item.Partition+1 > entry.topics[record.Topic] {
+				entry.topics[record.Topic] = item.Partition + 1
+			}
+		}
+	}
+	for groupName, entry := range inferred {
+		topics := make([]string, 0, len(entry.topics))
+		for topicName := range entry.topics {
+			topics = append(topics, topicName)
+		}
+		sort.Strings(topics)
+		partitions := make([]TopicPartition, 0)
+		for _, topicName := range topics {
+			for partition := 0; partition < entry.topics[topicName]; partition++ {
+				partitions = append(partitions, TopicPartition{Topic: topicName, Partition: partition})
+			}
+		}
+		group := &GroupMetadata{Topics: topics, TopicPartitions: partitions, Members: make(map[string]*MemberMetadata), Offsets: make(map[string]map[int]uint64), RegistrationEpoch: entry.epoch, OffsetRevisions: make(map[string]uint64)}
+		if len(topics) == 1 {
+			group.TopicName = topics[0]
+			group.Partitions = makePartitions(entry.topics[topics[0]])
+		} else {
+			group.TopicName = subscriptionDisplayName(topics, "")
+		}
+		groups[groupName] = group
+		groupEpochs[groupName] = entry.epoch
+	}
 	for _, record := range offsetRecords {
 		group := groups[record.Group]
 		if group == nil || group.RegistrationEpoch != record.Epoch {
@@ -711,6 +1123,14 @@ func offsetItemsToMap(items []OffsetItem) map[int]uint64 {
 	result := make(map[int]uint64, len(items))
 	for _, item := range items {
 		result[item.Partition] = item.Offset
+	}
+	return result
+}
+
+func clonePartitionOffsets(source map[int]uint64) map[int]uint64 {
+	result := make(map[int]uint64, len(source))
+	for partition, offset := range source {
+		result[partition] = offset
 	}
 	return result
 }

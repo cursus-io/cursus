@@ -25,8 +25,9 @@ func (ch *CommandHandler) writeConsumerOffsetRecord(record coordinator.ConsumerM
 	if topic == nil {
 		return fmt.Errorf("consumer offset topic is unavailable")
 	}
-	msg := types.Message{Payload: string(payload), Key: key}
-	partition := topic.GetPartitionForMessage(msg)
+	// Partition by group identity so lifecycle and offset records share one
+	// durable coordinator partition, while retaining their independent keys.
+	partition := topic.GetPartitionForMessage(types.Message{Key: coordinator.ConsumerMetadataGroupPartitionKey(record.Group)})
 	cmd := fmt.Sprintf("PUBLISH topic=%s partition=%d acks=all producerId=consumer-offset-coordinator key=%s message=%s", config.ConsumerOffsetsTopicName, partition, key, payload)
 	resp := ch.handlePublish(cmd, NewInternalClientContext("default-group", 0))
 	if strings.HasPrefix(resp, "OK") {

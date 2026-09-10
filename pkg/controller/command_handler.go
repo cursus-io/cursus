@@ -410,9 +410,18 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string, contexts ...*ClientCon
 			}
 			partitionCounts[subscribed] = len(t.Partitions)
 		}
-		payload := map[string]interface{}{"type": "REGISTER", "group": groupName, "topics": topics, "topic_pattern": pattern, "partition_counts": partitionCounts}
 		if ch.isDistributed() {
-			if _, err := ch.applyViaLeader("GROUP_SYNC", payload); err != nil {
+			coordAddr, isCoord, coordErr := ch.checkCoordinator(groupName)
+			if coordErr != nil {
+				return coordinatorUnavailableResponse
+			}
+			if !isCoord {
+				return notCoordinatorResponse(coordAddr)
+			}
+			if ch.Coordinator == nil {
+				return "ERROR: coordinator_not_available"
+			}
+			if err := ch.Coordinator.RegisterGroupSubscription(groupName, topics, pattern, partitionCounts); err != nil {
 				return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 			}
 		} else if ch.Coordinator != nil {
@@ -431,13 +440,17 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string, contexts ...*ClientCon
 	}
 
 	if ch.isDistributed() {
-		_, err := ch.applyViaLeader("GROUP_SYNC", map[string]interface{}{
-			"type":            "REGISTER",
-			"group":           groupName,
-			"topic":           topicName,
-			"partition_count": len(t.Partitions),
-		})
-		if err != nil {
+		coordAddr, isCoord, coordErr := ch.checkCoordinator(groupName)
+		if coordErr != nil {
+			return coordinatorUnavailableResponse
+		}
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
+		}
+		if ch.Coordinator == nil {
+			return "ERROR: coordinator_not_available"
+		}
+		if err := ch.Coordinator.RegisterGroup(topicName, groupName, len(t.Partitions)); err != nil {
 			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 		}
 		return fmt.Sprintf("OK group=%s topic=%s registered=true", groupName, topicName)
@@ -522,38 +535,9 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 
 	var assignments []int
 	if ch.isDistributed() {
-		joinPayload := map[string]interface{}{
-			"type":   "JOIN",
-			"group":  groupName,
-			"member": consumerID,
-		}
-		if !multiTopic {
-			topicRef := ch.TopicManager.GetTopic(topicName)
-			if topicRef == nil {
-				return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
-			}
-			joinPayload["topic"] = topicName
-			joinPayload["partition_count"] = len(topicRef.Partitions)
-		}
-
-		_, err := ch.applyViaLeader("GROUP_SYNC", joinPayload)
+		assignments, err = ch.Coordinator.AddConsumer(groupName, consumerID)
 		if err != nil {
-			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
-		}
-
-		// Wait briefly for Raft to propagate to local FSM
-		for i := 0; i < 10; i++ {
-			if multiTopic {
-				if len(ch.Coordinator.GetMemberTopicAssignments(groupName, consumerID)) > 0 {
-					break
-				}
-			} else {
-				assignments = ch.Coordinator.GetMemberAssignments(groupName, consumerID)
-			}
-			if !multiTopic && len(assignments) > 0 {
-				break
-			}
-			time.Sleep(50 * time.Millisecond)
+			return fmt.Sprintf("ERROR: join_group_failed reason=%q", err.Error())
 		}
 	} else {
 		if ch.Coordinator != nil {
@@ -696,16 +680,8 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 		return errResp
 	}
 	if ch.isDistributed() {
-		payload := map[string]interface{}{
-			"type":       "LEAVE",
-			"group":      groupName,
-			"member":     consumerID,
-			"generation": generation,
-		}
-
-		_, err := ch.applyViaLeader("GROUP_SYNC", payload)
-		if err != nil {
-			return formatReplicatedGroupError(err, "register_group_failed")
+		if err := ch.Coordinator.RemoveConsumerForGeneration(groupName, consumerID, generation); err != nil {
+			return formatCoordinatorError(err)
 		}
 	} else {
 		if ch.Coordinator != nil {

@@ -9,10 +9,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
@@ -22,7 +22,6 @@ type LocalProcessor interface {
 }
 
 type ClusterRouter struct {
-	mu             sync.RWMutex
 	LocalAddr      string
 	brokerID       string
 	rm             RaftManager
@@ -33,10 +32,6 @@ type ClusterRouter struct {
 	internalToken  string
 	timeout        time.Duration
 	localProcessor LocalProcessor
-
-	// Cached coordinator ring
-	coordRing       *util.ConsistentHashRing
-	coordBrokerHash string // hash of active broker IDs to detect changes
 }
 
 func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm RaftManager, clientPort int, clientHost string, cfg *config.Config) *ClusterRouter {
@@ -159,53 +154,23 @@ func (r *ClusterRouter) coordinatorRoutes(groupNames []string) (map[string]coord
 	if fsmRef == nil {
 		return nil, fmt.Errorf("FSM not available")
 	}
-
-	brokers := fsmRef.GetBrokers()
-	activeBrokerIDs := make([]string, 0, len(brokers))
-	activeBrokerAddrs := make(map[string]string, len(brokers))
-	for _, info := range brokers {
-		if info.Status == "active" {
-			activeBrokerIDs = append(activeBrokerIDs, info.ID)
-			activeBrokerAddrs[info.ID] = info.Addr
-		}
+	root := fsmRef.GetPartitionMetadata(config.ConsumerOffsetsTopicName + "-0")
+	if root == nil || root.PartitionCount <= 0 {
+		return nil, fmt.Errorf("consumer offsets topology unavailable")
 	}
-
-	if len(activeBrokerIDs) == 0 {
-		return nil, fmt.Errorf("no active brokers available")
-	}
-
-	sort.Strings(activeBrokerIDs)
-	brokerHash := strings.Join(activeBrokerIDs, ",")
-
-	// Check if rebuild needed
-	r.mu.RLock()
-	needsRebuild := r.coordRing == nil || r.coordBrokerHash != brokerHash
-	r.mu.RUnlock()
-
-	if needsRebuild {
-		r.mu.Lock()
-		// Double-check
-		if r.coordRing == nil || r.coordBrokerHash != brokerHash {
-			r.coordRing = util.NewConsistentHashRing(150, nil)
-			r.coordRing.Add(activeBrokerIDs...)
-			r.coordBrokerHash = brokerHash
-		}
-		r.mu.Unlock()
-	}
-
 	routes := make(map[string]coordinatorRoute, len(groupNames))
-	r.mu.RLock()
 	for _, groupName := range groupNames {
-		coordID := r.coordRing.Get(groupName)
-		addr, ok := activeBrokerAddrs[coordID]
-		if !ok {
-			r.mu.RUnlock()
-			return nil, fmt.Errorf("coordinator broker %s not found in active registry", coordID)
+		partition := int(util.GenerateID(coordinator.ConsumerMetadataGroupPartitionKey(groupName)) % uint64(root.PartitionCount))
+		metadata := fsmRef.GetPartitionMetadata(config.ConsumerOffsetsTopicName + "-" + strconv.Itoa(partition))
+		if metadata == nil || metadata.Leader == "" {
+			return nil, fmt.Errorf("consumer offsets partition %d has no durable leader", partition)
 		}
-		routes[groupName] = coordinatorRoute{id: coordID, addr: addr}
+		broker := fsmRef.GetBroker(metadata.Leader)
+		if broker == nil || broker.Status != "active" {
+			return nil, fmt.Errorf("consumer offsets partition %d leader %s is not active", partition, metadata.Leader)
+		}
+		routes[groupName] = coordinatorRoute{id: metadata.Leader, addr: broker.Addr}
 	}
-	r.mu.RUnlock()
-
 	return routes, nil
 }
 

@@ -38,6 +38,7 @@ type leaveResp struct {
 type heartbeatRequest struct {
 	NodeID        string                `json:"node_id"`
 	CatchupProofs []fsm.ISRCatchupProof `json:"catchup_proofs,omitempty"`
+	IncarnationID string                `json:"incarnation_id,omitempty"`
 }
 
 type ClusterServer struct {
@@ -163,6 +164,11 @@ func (h *ClusterServer) handleHeartbeatCluster(payload wire.CommandPayload) (any
 	util.Debug("ClusterServer: Received heartbeat from %s", req.NodeID)
 	if err := h.sd.HandleHeartbeat(req.NodeID, req.CatchupProofs); err != nil {
 		return nil, internalClusterError(err)
+	}
+	if incarnationAware, ok := h.sd.(interface{ UpdateHeartbeatWithIncarnation(string, string) }); ok {
+		incarnationAware.UpdateHeartbeatWithIncarnation(req.NodeID, req.IncarnationID)
+	} else {
+		h.sd.UpdateHeartbeat(req.NodeID)
 	}
 	return map[string]bool{"success": true}, nil
 }

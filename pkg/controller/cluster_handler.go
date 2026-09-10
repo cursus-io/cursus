@@ -191,29 +191,33 @@ func (ch *CommandHandler) ResolveGroupCoordinators(groupNames []string) (map[str
 		return nil, err
 	}
 	localID := ch.Cluster.Router.BrokerID()
+	localOwnsGroup := false
 	for _, groupName := range groupNames {
 		ownerID, ok := owners[groupName]
 		if !ok {
 			return nil, fmt.Errorf("coordinator result missing for group %q", groupName)
 		}
 		resolved[groupName] = ownerID == localID
+		localOwnsGroup = localOwnsGroup || resolved[groupName]
+	}
+	if localOwnsGroup && ch.Coordinator != nil {
+		if err := ch.Coordinator.ReloadDistributedConsumerMetadata(); err != nil {
+			return nil, fmt.Errorf("reload distributed consumer metadata: %w", err)
+		}
 	}
 	return resolved, nil
 }
 
-// ExpireGroupMembers serializes timeout-driven membership removal through the
-// replicated metadata log.
+// ExpireGroupMembers durably removes timed-out members through the owning
+// offsets-partition leader. The lifecycle snapshot append is the commit point.
 func (ch *CommandHandler) ExpireGroupMembers(groupName string, generation int, memberIDs []string) error {
 	if !ch.isDistributed() {
 		return ch.Coordinator.ExpireConsumers(groupName, generation, memberIDs)
 	}
-	_, err := ch.applyViaLeader("GROUP_SYNC", map[string]interface{}{
-		"type":       "EXPIRE",
-		"group":      groupName,
-		"generation": generation,
-		"members":    memberIDs,
-	})
-	return err
+	if ch.Coordinator == nil {
+		return fmt.Errorf("coordinator not available")
+	}
+	return ch.Coordinator.ExpireConsumers(groupName, generation, memberIDs)
 }
 
 // checkCoordinator checks if this broker is the coordinator for the given group.
@@ -243,9 +247,16 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 	if err != nil {
 		return AdvertisedAddr{}, false, fmt.Errorf("coordinator unavailable: %w", err)
 	}
-	return ch.checkResolvedCoordinator(id, raftAddr, findCmd, func(req string) (string, error) {
+	addr, isCoordinator, resolveErr := ch.checkResolvedCoordinator(id, raftAddr, findCmd, func(req string) (string, error) {
 		return ch.Cluster.Router.ForwardToCoordinator(coordKey, req)
 	})
+	if resolveErr != nil || !isCoordinator || ch.Coordinator == nil {
+		return addr, isCoordinator, resolveErr
+	}
+	if err := ch.Coordinator.ReloadDistributedConsumerMetadata(); err != nil {
+		return AdvertisedAddr{}, false, fmt.Errorf("reload coordinator state: %w", err)
+	}
+	return addr, true, nil
 }
 
 func (ch *CommandHandler) checkResolvedCoordinator(id, raftAddr, findCmd string, forward func(string) (string, error)) (AdvertisedAddr, bool, error) {

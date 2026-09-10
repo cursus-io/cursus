@@ -809,6 +809,35 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 		f.mu.Unlock()
 		return fmt.Errorf("transaction coordinator shard count mismatch: broker=%s configured=%d cluster=%d", info.ID, shardCount, configuredShardCount)
 	}
+	if previous := f.brokers[info.ID]; previous != nil {
+		// A registration without an incarnation is retained for compatibility
+		// with metadata written before broker-process fencing existed. A new
+		// non-empty ID may start the next fenced process incarnation only after
+		// the current process has been durably fenced. Without this check, an
+		// old process could submit a delayed REGISTER and replace the live
+		// incarnation merely by advancing the epoch.
+		if info.IncarnationID == "" {
+			// Once a broker ID has moved to an incarnation-aware registration,
+			// an older binary must not be able to refresh that registration
+			// without proving the current process identity.
+			if previous.IncarnationID != "" {
+				f.mu.Unlock()
+				return fmt.Errorf("broker_registration_fenced broker=%s reason=missing_incarnation_id", info.ID)
+			}
+			info.IncarnationID = previous.IncarnationID
+			info.IncarnationEpoch = previous.IncarnationEpoch
+		} else if info.IncarnationID != previous.IncarnationID {
+			if previous.IncarnationID != "" && previous.Status == "active" {
+				f.mu.Unlock()
+				return fmt.Errorf("broker_registration_fenced broker=%s active_incarnation=%s", info.ID, previous.IncarnationID)
+			}
+			info.IncarnationEpoch = previous.IncarnationEpoch + 1
+		} else if info.IncarnationEpoch < previous.IncarnationEpoch {
+			info.IncarnationEpoch = previous.IncarnationEpoch
+		}
+	} else if info.IncarnationID != "" && info.IncarnationEpoch == 0 {
+		info.IncarnationEpoch = 1
+	}
 	if f.transactionCoordinatorShardCount == 0 {
 		f.transactionCoordinatorShardCount = shardCount
 	}
