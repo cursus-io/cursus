@@ -146,8 +146,17 @@ const coordinatorUnavailableResponse = "ERROR: coordinator_not_available"
 // Discovery failures return false so multiple brokers cannot expire the same
 // group while the coordinator ring is unavailable.
 func (ch *CommandHandler) IsGroupCoordinator(groupName string) bool {
-	owned, err := ch.ResolveGroupCoordinator(groupName)
-	return err == nil && owned
+	if !ch.isDistributed() {
+		return true
+	}
+	if !ch.hasRouter() {
+		return false
+	}
+	id, _, partition, epoch, err := ch.Cluster.Router.FindCoordinatorWithEpoch(groupName)
+	if err != nil || id != ch.Cluster.Router.BrokerID() {
+		return false
+	}
+	return ch.ensureGroupRecovery(partition, epoch) == nil
 }
 
 // ResolveGroupCoordinator reports whether this broker is the current group
@@ -191,17 +200,29 @@ func (ch *CommandHandler) ResolveGroupCoordinators(groupNames []string) (map[str
 		return nil, err
 	}
 	localID := ch.Cluster.Router.BrokerID()
-	localOwnsGroup := false
+	localGroups := make([]string, 0, len(groupNames))
 	for _, groupName := range groupNames {
 		ownerID, ok := owners[groupName]
 		if !ok {
 			return nil, fmt.Errorf("coordinator result missing for group %q", groupName)
 		}
 		resolved[groupName] = ownerID == localID
-		localOwnsGroup = localOwnsGroup || resolved[groupName]
+		if resolved[groupName] {
+			localGroups = append(localGroups, groupName)
+		}
 	}
-	if localOwnsGroup && ch.Coordinator != nil {
-		if err := ch.Coordinator.ReloadDistributedConsumerMetadata(); err != nil {
+	for _, groupName := range localGroups {
+		if ch.Coordinator == nil {
+			continue
+		}
+		ownerID, _, partition, epoch, recoveryErr := ch.Cluster.Router.FindCoordinatorWithEpoch(groupName)
+		if recoveryErr != nil {
+			return nil, fmt.Errorf("refresh coordinator recovery fence for group %q: %w", groupName, recoveryErr)
+		}
+		if ownerID != localID {
+			return nil, fmt.Errorf("coordinator ownership changed while refreshing group %q", groupName)
+		}
+		if err := ch.ensureGroupRecovery(partition, epoch); err != nil {
 			return nil, fmt.Errorf("reload distributed consumer metadata: %w", err)
 		}
 	}
@@ -243,7 +264,7 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 	if !ch.hasRouter() {
 		return AdvertisedAddr{}, true, nil
 	}
-	id, raftAddr, err := ch.Cluster.Router.FindCoordinator(coordKey)
+	id, raftAddr, partition, epoch, err := ch.Cluster.Router.FindCoordinatorWithEpoch(coordKey)
 	if err != nil {
 		return AdvertisedAddr{}, false, fmt.Errorf("coordinator unavailable: %w", err)
 	}
@@ -253,10 +274,26 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 	if resolveErr != nil || !isCoordinator || ch.Coordinator == nil {
 		return addr, isCoordinator, resolveErr
 	}
-	if err := ch.Coordinator.ReloadDistributedConsumerMetadata(); err != nil {
+	if err := ch.ensureGroupRecovery(partition, epoch); err != nil {
 		return AdvertisedAddr{}, false, fmt.Errorf("reload coordinator state: %w", err)
 	}
 	return addr, true, nil
+}
+
+func (ch *CommandHandler) ensureGroupRecovery(partition, epoch int) error {
+	if ch.Coordinator == nil {
+		return fmt.Errorf("coordinator unavailable")
+	}
+	ch.groupRecoveryMu.Lock()
+	defer ch.groupRecoveryMu.Unlock()
+	if ch.groupRecoveryEpoch[partition] == epoch {
+		return nil
+	}
+	if err := ch.Coordinator.ReloadDistributedConsumerMetadata(); err != nil {
+		return err
+	}
+	ch.groupRecoveryEpoch[partition] = epoch
+	return nil
 }
 
 func (ch *CommandHandler) checkResolvedCoordinator(id, raftAddr, findCmd string, forward func(string) (string, error)) (AdvertisedAddr, bool, error) {

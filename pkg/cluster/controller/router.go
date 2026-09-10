@@ -126,6 +126,21 @@ func (r *ClusterRouter) FindCoordinator(groupName string) (string, string, error
 	return route.id, route.addr, nil
 }
 
+// FindCoordinatorWithEpoch returns the durable offsets-partition leader epoch
+// alongside its owner. Callers use the epoch as a replay fence, not local
+// socket health, so a broker replays only after ownership actually changes.
+func (r *ClusterRouter) FindCoordinatorWithEpoch(groupName string) (string, string, int, int, error) {
+	routes, err := r.coordinatorRoutes([]string{groupName})
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+	route, ok := routes[groupName]
+	if !ok {
+		return "", "", 0, 0, fmt.Errorf("coordinator route for group %q not found", groupName)
+	}
+	return route.id, route.addr, route.partition, route.epoch, nil
+}
+
 // FindCoordinatorOwners resolves a set of groups from one broker-membership
 // snapshot. It is used by scrape-time observation to avoid rebuilding and
 // validating the coordinator ring once per group.
@@ -142,8 +157,10 @@ func (r *ClusterRouter) FindCoordinatorOwners(groupNames []string) (map[string]s
 }
 
 type coordinatorRoute struct {
-	id   string
-	addr string
+	id        string
+	addr      string
+	partition int
+	epoch     int
 }
 
 func (r *ClusterRouter) coordinatorRoutes(groupNames []string) (map[string]coordinatorRoute, error) {
@@ -169,7 +186,7 @@ func (r *ClusterRouter) coordinatorRoutes(groupNames []string) (map[string]coord
 		if broker == nil || broker.Status != "active" {
 			return nil, fmt.Errorf("consumer offsets partition %d leader %s is not active", partition, metadata.Leader)
 		}
-		routes[groupName] = coordinatorRoute{id: metadata.Leader, addr: broker.Addr}
+		routes[groupName] = coordinatorRoute{id: metadata.Leader, addr: broker.Addr, partition: partition, epoch: metadata.LeaderEpoch}
 	}
 	return routes, nil
 }

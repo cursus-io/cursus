@@ -258,20 +258,26 @@ func TestClusterRouterFindCoordinatorFollowsDurableOffsetsLeader(t *testing.T) {
 	rm := &MockRaftManager{isLeader: true, mockFSM: state}
 	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "", nil)
 
-	id, _, err := router.FindCoordinator("failover-group")
+	id, _, partition, epoch, err := router.FindCoordinatorWithEpoch("failover-group")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if id != "n2" {
 		t.Fatalf("coordinator=%s, want durable offsets leader n2", id)
 	}
+	if partition < 0 || partition >= 4 || epoch == 0 {
+		t.Fatalf("invalid durable coordinator fence partition=%d epoch=%d", partition, epoch)
+	}
 	setConsumerOffsetsLeaders(t, state, next, "n1")
-	id, _, err = router.FindCoordinator("failover-group")
+	id, _, nextPartition, nextEpoch, err := router.FindCoordinatorWithEpoch("failover-group")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if id != "n1" {
 		t.Fatalf("coordinator=%s, want post-apply offsets leader n1", id)
+	}
+	if nextPartition != partition || nextEpoch <= epoch {
+		t.Fatalf("durable coordinator fence did not advance: partition %d->%d epoch %d->%d", partition, nextPartition, epoch, nextEpoch)
 	}
 }
 

@@ -33,7 +33,17 @@ func (c *Coordinator) CommitOffset(groupName, topic string, partition int, offse
 		return fmt.Errorf("group '%s' not found", groupName)
 	}
 	gm.mu.Lock()
-	c.mu.RUnlock()
+	if c.standalone {
+		// Standalone mode never rebuilds c.groups from a replicated log, so keep
+		// the historic non-blocking publish behavior for local durable writes.
+		c.mu.RUnlock()
+		defer gm.mu.Unlock()
+		return c.commitOffsetForGroupLocked(gm, groupName, topic, partition, offset)
+	}
+	// Keep the group map read lock through the durable write. A reload replaces
+	// c.groups wholesale; releasing this lock after taking only the old group
+	// mutex would allow an acknowledged commit to update a detached object.
+	defer c.mu.RUnlock()
 	defer gm.mu.Unlock()
 	return c.commitOffsetForGroupLocked(gm, groupName, topic, partition, offset)
 }
@@ -95,7 +105,15 @@ func (c *Coordinator) CommitOffsetsBulk(groupName, topic string, offsets []Offse
 		return fmt.Errorf("group '%s' not found", groupName)
 	}
 	gm.mu.Lock()
-	c.mu.RUnlock()
+	if c.standalone {
+		// See CommitOffset: standalone mode has no distributed-map reload.
+		c.mu.RUnlock()
+		defer gm.mu.Unlock()
+		return c.commitOffsetsBulkForGroupLocked(gm, groupName, topic, offsets)
+	}
+	// See CommitOffset: reload must not swap the group map while this durable
+	// bulk append is still committing into the selected group object.
+	defer c.mu.RUnlock()
 	defer gm.mu.Unlock()
 	return c.commitOffsetsBulkForGroupLocked(gm, groupName, topic, offsets)
 }
