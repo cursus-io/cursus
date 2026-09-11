@@ -151,7 +151,7 @@ func (h *ClusterServer) handleConnection(conn net.Conn) {
 }
 
 func (h *ClusterServer) handleHeartbeatCluster(payload wire.CommandPayload) (any, *wire.ErrorPayload) {
-	req := heartbeatRequest{NodeID: payload.Fields["node_id"]}
+	req := heartbeatRequest{NodeID: payload.Fields["node_id"], IncarnationID: payload.Fields["incarnation_id"]}
 	if encoded := payload.Fields["catchup_proofs"]; encoded != "" {
 		if err := json.Unmarshal([]byte(encoded), &req.CatchupProofs); err != nil {
 			return nil, validationError("invalid heartbeat catchup proofs")
@@ -165,7 +165,7 @@ func (h *ClusterServer) handleHeartbeatCluster(payload wire.CommandPayload) (any
 	if err := h.sd.HandleHeartbeat(req.NodeID, req.CatchupProofs); err != nil {
 		return nil, internalClusterError(err)
 	}
-	if incarnationAware, ok := h.sd.(interface{ UpdateHeartbeatWithIncarnation(string, string) }); ok {
+	if incarnationAware, ok := h.sd.(interface{ UpdateHeartbeatWithIncarnation(string, string) }); ok && req.IncarnationID != "" {
 		incarnationAware.UpdateHeartbeatWithIncarnation(req.NodeID, req.IncarnationID)
 	} else {
 		h.sd.UpdateHeartbeat(req.NodeID)

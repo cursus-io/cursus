@@ -506,6 +506,7 @@ func applyGroupLifecycle(group, candidate *GroupMetadata) {
 	group.LastRebalance = candidate.LastRebalance
 }
 
+//nolint:unused // Lifecycle mutations use durable snapshot transitions instead.
 func (c *Coordinator) removeConsumerLocked(groupName, consumerID string) (int, int, error) {
 	group := c.groups[groupName]
 	if group == nil {

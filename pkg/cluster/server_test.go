@@ -155,6 +155,7 @@ func TestClusterServer_Heartbeat(t *testing.T) {
 	addr := ln.Addr().String()
 
 	msd.On("HandleHeartbeat", "node-hb", []fsm.ISRCatchupProof(nil)).Return(nil).Once()
+	msd.On("UpdateHeartbeat", "node-hb").Return().Once()
 
 	response := clusterRoundTrip(t, addr, wire.CommandHeartbeatCluster, map[string]string{"node_id": "node-hb"})
 	require.Equal(t, wire.StatusOK, response.Status)
@@ -174,6 +175,7 @@ func TestClusterServer_HeartbeatCarriesCatchupProofs(t *testing.T) {
 		CommittedHWM: 3, LocalLEO: 3, LocalHWM: 3, LeaderEpoch: 2, LifecycleEpoch: 1,
 	}}
 	msd.On("HandleHeartbeat", "node-hb", proofs).Return(nil).Once()
+	msd.On("UpdateHeartbeat", "node-hb").Return().Once()
 	payload, err := json.Marshal(proofs)
 	require.NoError(t, err)
 	response := clusterRoundTrip(t, listener.Addr().String(), wire.CommandHeartbeatCluster, map[string]string{

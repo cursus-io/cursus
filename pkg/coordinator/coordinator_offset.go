@@ -346,6 +346,7 @@ func (c *Coordinator) ApplyOffsetUpdateFromFSM(groupName, topic string, offsets 
 	return nil
 }
 
+//nolint:unused // Retained only for decoding legacy distributed offset snapshots during migration analysis.
 func (c *Coordinator) applyVersionedOffsetSnapshotFromLog(groupName, topic string, epoch, revision uint64, offsets []OffsetItem) error {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
@@ -588,6 +589,8 @@ func (c *Coordinator) loadDistributedOffsetsFromLog(reader OffsetLogReader) (Con
 // implementation as a narrow origin/main fallback reference while the v4
 // lifecycle format is rolled out. New distributed coordinators use the full
 // metadata replay above.
+//
+//nolint:unused // Retained only for decoding legacy distributed offset snapshots during migration analysis.
 func (c *Coordinator) loadDistributedOffsetsFromLogLegacy(reader OffsetLogReader) (ConsumerMetadataRecoveryStatus, error) {
 	const batchSize = 1024
 	status := ConsumerMetadataRecoveryStatus{Phase: "committed_offset_replay"}
