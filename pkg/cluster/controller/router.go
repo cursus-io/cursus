@@ -129,7 +129,7 @@ func (r *ClusterRouter) FindCoordinator(groupName string) (string, string, error
 // FindCoordinatorWithEpoch returns the durable offsets-partition leader epoch
 // alongside its owner. Callers use the epoch as a replay fence, not local
 // socket health, so a broker replays only after ownership actually changes.
-func (r *ClusterRouter) FindCoordinatorWithEpoch(groupName string) (string, string, int, int, error) {
+func (r *ClusterRouter) FindCoordinatorWithEpoch(groupName string) (string, string, uint64, int, error) {
 	routes, err := r.coordinatorRoutes([]string{groupName})
 	if err != nil {
 		return "", "", 0, 0, err
@@ -159,7 +159,7 @@ func (r *ClusterRouter) FindCoordinatorOwners(groupNames []string) (map[string]s
 type coordinatorRoute struct {
 	id        string
 	addr      string
-	partition int
+	partition uint64
 	epoch     int
 }
 
@@ -177,8 +177,8 @@ func (r *ClusterRouter) coordinatorRoutes(groupNames []string) (map[string]coord
 	}
 	routes := make(map[string]coordinatorRoute, len(groupNames))
 	for _, groupName := range groupNames {
-		partition := int(util.GenerateID(coordinator.ConsumerMetadataGroupPartitionKey(groupName)) % uint64(root.PartitionCount))
-		metadata := fsmRef.GetPartitionMetadata(config.ConsumerOffsetsTopicName + "-" + strconv.Itoa(partition))
+		partition := util.GenerateID(coordinator.ConsumerMetadataGroupPartitionKey(groupName)) % uint64(root.PartitionCount)
+		metadata := fsmRef.GetPartitionMetadata(config.ConsumerOffsetsTopicName + "-" + strconv.FormatUint(partition, 10))
 		if metadata == nil || metadata.Leader == "" {
 			return nil, fmt.Errorf("consumer offsets partition %d has no durable leader", partition)
 		}

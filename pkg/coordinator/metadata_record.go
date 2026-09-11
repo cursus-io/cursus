@@ -306,7 +306,8 @@ func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
 		if err := validateGroupLifecycleSnapshot(*record.Lifecycle); err != nil {
 			return err
 		}
-		if record.Revision != uint64(record.Lifecycle.Generation) {
+		generation := record.Lifecycle.Generation
+		if generation < 0 || record.Revision != uint64(generation) {
 			return fmt.Errorf("group lifecycle snapshot revision does not match generation")
 		}
 	default:
@@ -531,6 +532,9 @@ func lifecycleSnapshot(group *GroupMetadata) *GroupLifecycleSnapshot {
 }
 
 func (c *Coordinator) writeGroupLifecycleSnapshot(groupName string, epoch uint64, group *GroupMetadata) error {
+	if group == nil || group.Generation < 0 {
+		return fmt.Errorf("group lifecycle snapshot has invalid generation")
+	}
 	return c.writeConsumerMetadataRecord(ConsumerMetadataRecord{
 		Version:   ConsumerMetadataRecordVersionLifecycle,
 		Type:      ConsumerMetadataRecordLifecycleSnapshot,

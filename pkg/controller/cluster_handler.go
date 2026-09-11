@@ -280,7 +280,7 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 	return addr, true, nil
 }
 
-func (ch *CommandHandler) ensureGroupRecovery(partition, epoch int) error {
+func (ch *CommandHandler) ensureGroupRecovery(partition uint64, epoch int) error {
 	if ch.Coordinator == nil {
 		return fmt.Errorf("coordinator unavailable")
 	}

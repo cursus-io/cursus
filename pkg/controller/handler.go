@@ -38,7 +38,7 @@ type CommandHandler struct {
 	coordCacheMu             sync.RWMutex
 	topicLifecycleMu         sync.RWMutex
 	topicCreateMu            sync.Mutex
-	groupRecoveryEpoch       map[int]int
+	groupRecoveryEpoch       map[uint64]int
 	groupRecoveryMu          sync.Mutex
 	txnJournal               *transaction.Journal
 	transactionStateSyncHook func(string) error
@@ -120,7 +120,7 @@ func NewCommandHandler(
 		Coordinator:        cd,
 		StreamManager:      sm,
 		coordCache:         make(map[string]coordCacheEntry),
-		groupRecoveryEpoch: make(map[int]int),
+		groupRecoveryEpoch: make(map[uint64]int),
 		Cluster:            cc,
 		ESHandler:          eventsource.NewHandler(tm),
 		TxnManager:         transaction.NewManagerWithExpirationAndShards(transactionalIDExpiration(cfg), transactionCoordinatorShardCount(cfg)),
