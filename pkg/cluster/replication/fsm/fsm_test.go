@@ -204,18 +204,18 @@ func TestBrokerFSMRegisterAssignsMonotonicIncarnationEpoch(t *testing.T) {
 	}
 }
 
-func TestBrokerFSMRejectsStaleRegistrationWhileNewIncarnationIsActive(t *testing.T) {
+func TestBrokerFSMRegistrationAdvancesEpochAndFencesPreviousIncarnation(t *testing.T) {
 	state := NewBrokerFSM(nil, nil)
 	if result := state.Apply(&raft.Log{Index: 1, Data: []byte(`REGISTER:{"id":"broker-1","addr":"localhost:9001","status":"active","incarnation_id":"current"}`)}); result != nil {
 		t.Fatalf("current registration: %v", result)
 	}
-	result := state.Apply(&raft.Log{Index: 2, Data: []byte(`REGISTER:{"id":"broker-1","addr":"localhost:9001","status":"active","incarnation_id":"stale"}`)})
-	if result == nil {
-		t.Fatal("stale registration unexpectedly replaced active incarnation")
+	result := state.Apply(&raft.Log{Index: 2, Data: []byte(`REGISTER:{"id":"broker-1","addr":"localhost:9001","status":"active","incarnation_id":"replacement"}`)})
+	if result != nil {
+		t.Fatalf("new broker incarnation must replace the prior active registration: %v", result)
 	}
 	broker := state.GetBroker("broker-1")
-	if broker.IncarnationID != "current" || broker.IncarnationEpoch != 1 || broker.Status != "active" {
-		t.Fatalf("active broker was changed by stale registration: %+v", broker)
+	if broker.IncarnationID != "replacement" || broker.IncarnationEpoch != 2 || broker.Status != "active" {
+		t.Fatalf("new registration was not durably fenced: %+v", broker)
 	}
 }
 

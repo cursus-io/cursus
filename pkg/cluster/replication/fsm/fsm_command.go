@@ -812,10 +812,11 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 	if previous := f.brokers[info.ID]; previous != nil {
 		// A registration without an incarnation is retained for compatibility
 		// with metadata written before broker-process fencing existed. A new
-		// non-empty ID may start the next fenced process incarnation only after
-		// the current process has been durably fenced. Without this check, an
-		// old process could submit a delayed REGISTER and replace the live
-		// incarnation merely by advancing the epoch.
+		// non-empty ID starts the next broker process incarnation atomically in
+		// the Raft FSM.  It must be accepted even while the previous record is
+		// active: a restarted broker cannot first make its old process mark
+		// itself inactive.  The durable epoch then fences the previous process's
+		// heartbeats and leaves every router with one membership view.
 		if info.IncarnationID == "" {
 			// Once a broker ID has moved to an incarnation-aware registration,
 			// an older binary must not be able to refresh that registration
@@ -827,10 +828,6 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 			info.IncarnationID = previous.IncarnationID
 			info.IncarnationEpoch = previous.IncarnationEpoch
 		} else if info.IncarnationID != previous.IncarnationID {
-			if previous.IncarnationID != "" && previous.Status == "active" {
-				f.mu.Unlock()
-				return fmt.Errorf("broker_registration_fenced broker=%s active_incarnation=%s", info.ID, previous.IncarnationID)
-			}
 			info.IncarnationEpoch = previous.IncarnationEpoch + 1
 		} else if info.IncarnationEpoch < previous.IncarnationEpoch {
 			info.IncarnationEpoch = previous.IncarnationEpoch
