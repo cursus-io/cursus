@@ -538,6 +538,19 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 
 	var assignments []int
 	if ch.isDistributed() {
+		// Group creation belongs to the selected offsets-partition leader.  Do
+		// it only after checkCoordinator has established durable ownership; the
+		// old CREATE-topic convenience registration could publish before the
+		// internal offsets topology existed.
+		if ch.Coordinator.GetGroup(groupName) == nil {
+			topic := ch.TopicManager.GetTopic(topicName)
+			if topic == nil {
+				return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+			}
+			if err := ch.Coordinator.RegisterGroup(topicName, groupName, len(topic.Partitions)); err != nil {
+				return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
+			}
+		}
 		assignments, err = ch.Coordinator.AddConsumer(groupName, consumerID)
 		if err != nil {
 			return fmt.Sprintf("ERROR: join_group_failed reason=%q", err.Error())
