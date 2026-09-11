@@ -241,6 +241,9 @@ func TestDistributedOffsetCommandsMatchStrictRaftSchema(t *testing.T) {
 	// in-memory group fixture standalone: durable lifecycle recovery is covered
 	// separately by the coordinator replay tests.
 	groupCoordinator := coordinator.NewCoordinator(context.Background(), config.DefaultConfig(), &coordinatorRoutingTopicHandler{})
+	// Live distributed commits are durable in __consumer_offsets, not mirrored
+	// through the controller Raft FSM. The writer models the acknowledged
+	// partition append used by the real command handler.
 	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 2))
 	_, err := groupCoordinator.AddConsumer("workers", "worker-1")
 	require.NoError(t, err)
@@ -261,6 +264,11 @@ func TestDistributedOffsetCommandsMatchStrictRaftSchema(t *testing.T) {
 		RaftManager: raftManager,
 		Router:      router,
 	})
+	writes := 0
+	groupCoordinator.SetOffsetRecordWriter(func(coordinator.ConsumerMetadataRecord) error {
+		writes++
+		return nil
+	})
 	requestContext := NewClientContext("workers", 0)
 
 	response := handler.HandleCommand(fmt.Sprintf(
@@ -277,6 +285,7 @@ func TestDistributedOffsetCommandsMatchStrictRaftSchema(t *testing.T) {
 	offset, ok := groupCoordinator.GetOffset("workers", "orders", 1)
 	require.True(t, ok)
 	require.Equal(t, uint64(7), offset)
+	require.GreaterOrEqual(t, writes, 2)
 
 	legacyPositional := handler.HandleCommand(fmt.Sprintf(
 		"BATCH_COMMIT topic=orders group=workers member=worker-1 generation=%d P0:8",

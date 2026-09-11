@@ -981,22 +981,11 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 		return "OK validated=true"
 	}
 
-	if ch.isDistributed() {
-		payload := map[string]interface{}{
-			"group":      groupID,
-			"topic":      offsetTopic,
-			"member":     memberID,
-			"generation": generation,
-			"partition":  partition,
-			"offset":     offset,
-		}
-		_, err := ch.applyViaLeader("OFFSET_SYNC", payload)
-		if err != nil {
-			return formatReplicatedGroupError(err, "offset_sync_failed")
-		}
-		return "OK"
-	}
-
+	// The coordinator selected from the replicated controller metadata owns this
+	// group. Its __consumer_offsets partition is the durable source of truth;
+	// do not mirror a new commit through the controller Raft FSM. A follower
+	// can legitimately not have this group's reconstructed in-memory state, so
+	// mirroring would turn a durable commit into a false group_not_found error.
 	err = ch.Coordinator.ValidateAndCommit(groupID, offsetTopic, partition, offset, generation, memberID)
 	if err != nil {
 		return formatCoordinatorError(err)
@@ -1105,26 +1094,12 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 		return "ERROR: no_valid_offsets"
 	}
 
-	if ch.isDistributed() {
-		batchCommitData := map[string]interface{}{
-			"group":      groupID,
-			"topic":      offsetTopic,
-			"member":     memberID,
-			"generation": generation,
-			"offsets":    offsetList,
-		}
-		_, err := ch.applyViaLeader("BATCH_OFFSET", batchCommitData)
-		if err != nil {
-			util.Error("Raft batch apply failed: %v", err)
-			return formatReplicatedGroupError(err, "raft_batch_apply_failed")
-		}
-	} else if ch.Coordinator != nil {
-		err := ch.Coordinator.ValidateAndCommitOffsetsBulk(groupID, offsetTopic, memberID, generation, offsetList)
-		if err != nil {
-			return formatCoordinatorError(err)
-		}
-	} else {
-		return "ERROR: offset_manager_not_available"
+	// As with COMMIT_OFFSET, write only through the selected coordinator's
+	// __consumer_offsets partition. BATCH_OFFSET remains an FSM replay
+	// compatibility command for historical logs, not a live write protocol.
+	err := ch.Coordinator.ValidateAndCommitOffsetsBulk(groupID, offsetTopic, memberID, generation, offsetList)
+	if err != nil {
+		return formatCoordinatorError(err)
 	}
 
 	return fmt.Sprintf("OK batched=%d", len(offsetList))
