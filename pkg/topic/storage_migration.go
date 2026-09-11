@@ -474,9 +474,14 @@ func inspectPersistedConsumerMetadata(root string, topics []PersistedTopic) ([]P
 					SegmentBase:  segment.BaseOffset,
 					RecordOffset: message.Offset,
 				}
-				record, _, recordErr := coordinator.DecodeConsumerMetadataRecord(message.Payload)
+				record, versioned, recordErr := coordinator.DecodeConsumerMetadataRecord(message.Payload)
 				if recordErr != nil {
 					problems = append(problems, StorageProblem{Path: segment.Path, Message: fmt.Sprintf("invalid consumer metadata payload at record offset %d: %v", message.Offset, recordErr)})
+					position += int64(4 + length)
+					continue
+				}
+				if !versioned {
+					problems = append(problems, StorageProblem{Path: segment.Path, Message: fmt.Sprintf("legacy consumer metadata payload at record offset %d; clean bootstrap required", message.Offset)})
 					position += int64(4 + length)
 					continue
 				}

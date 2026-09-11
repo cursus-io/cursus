@@ -265,7 +265,7 @@ func TestClusterRouterFindCoordinatorFollowsDurableOffsetsLeader(t *testing.T) {
 	if id != "n2" {
 		t.Fatalf("coordinator=%s, want durable offsets leader n2", id)
 	}
-	if partition < 0 || partition >= 4 || epoch == 0 {
+	if partition >= 4 || epoch == 0 {
 		t.Fatalf("invalid durable coordinator fence partition=%d epoch=%d", partition, epoch)
 	}
 	setConsumerOffsetsLeaders(t, state, next, "n1")

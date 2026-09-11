@@ -87,7 +87,10 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 		return fmt.Sprintf("ERROR: topic_create_missing topic=%s", topicName)
 	}
 
-	if ch.Coordinator != nil {
+	// Distributed groups are created by their coordinator after the durable
+	// __consumer_offsets topology is ready. The standalone convenience group
+	// must not publish during controller-topic materialization.
+	if ch.Coordinator != nil && !ch.isDistributed() {
 		err := ch.Coordinator.RegisterGroup(topicName, "default-group", len(t.Partitions))
 		if err != nil {
 			util.Warn("Failed to register default group with coordinator: %v", err)
