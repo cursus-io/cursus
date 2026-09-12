@@ -25,11 +25,23 @@ type partitionReplicationTask struct {
 	command      types.MessageCommand
 	commitHWM    uint64
 	ackMode      ackpolicy.Mode
+	requiredISR  int
 	duplicate    bool
 	snapshot     clusterController.PartitionReplicationSnapshot
 	partitionRef *topic.Partition
 	result       chan error
 }
+
+type retryableReplicationStateError struct {
+	message string
+	class   string
+}
+
+func (e *retryableReplicationStateError) Error() string { return e.message }
+
+func (e *retryableReplicationStateError) Retryable() bool { return true }
+
+func (e *retryableReplicationStateError) ReplicationErrorClass() string { return e.class }
 
 type partitionReplicationExecutor interface {
 	Snapshot(topic string, partition int) (clusterController.PartitionReplicationSnapshot, error)
@@ -283,6 +295,11 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 				err = snapshotErr
 			} else if !sameReplicationFence(current, task.snapshot) {
 				err = fmt.Errorf("%w before commit: current=%s/%d/%d requested=%s/%d/%d", clusterController.ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, current.LifecycleEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch, task.snapshot.LifecycleEpoch)
+			} else if task.ackMode == ackpolicy.All && !sameBrokerSet(current.ISR, snapshot.ISR) {
+				err = &retryableReplicationStateError{
+					message: fmt.Sprintf("ISR changed during replication: current=%v replicated=%v", current.ISR, snapshot.ISR),
+					class:   "insufficient_isr",
+				}
 			}
 		}
 		if err == nil {
@@ -347,7 +364,13 @@ func (l *partitionReplicationLane) replicationSnapshot(task partitionReplication
 		return clusterController.PartitionReplicationSnapshot{}, fmt.Errorf("%w: current=%s/%d/%d requested=%s/%d/%d", clusterController.ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, current.LifecycleEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch, task.snapshot.LifecycleEpoch)
 	}
 	if task.ackMode == ackpolicy.All {
-		return task.snapshot, nil
+		if len(current.ISR) < task.requiredISR {
+			return clusterController.PartitionReplicationSnapshot{}, &retryableReplicationStateError{
+				message: fmt.Sprintf("insufficient in-sync replicas: got %d, want minISR %d", len(current.ISR), task.requiredISR),
+				class:   "insufficient_isr",
+			}
+		}
+		return current, nil
 	}
 	return current, nil
 }
@@ -356,6 +379,22 @@ func sameReplicationFence(left, right clusterController.PartitionReplicationSnap
 	return left.Leader == right.Leader &&
 		left.LeaderEpoch == right.LeaderEpoch &&
 		left.LifecycleEpoch == right.LifecycleEpoch
+}
+
+func sameBrokerSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	members := make(map[string]struct{}, len(left))
+	for _, brokerID := range left {
+		members[brokerID] = struct{}{}
+	}
+	for _, brokerID := range right {
+		if _, found := members[brokerID]; !found {
+			return false
+		}
+	}
+	return true
 }
 
 func completeReplicationTask(task partitionReplicationTask, err error) {

@@ -420,6 +420,9 @@ func (rm *RaftReplicationManager) reconcileTopicMaterializations(ctx context.Con
 			if err := rm.fsm.ReconcileTopicMaterializations(); err != nil {
 				util.Warn("Topic materialization reconcile pending on broker %s: %v", rm.brokerID, err)
 			}
+			if err := rm.fsm.ReconcileReplicaMaterializations(rm.brokerID); err != nil {
+				util.Warn("Replica materialization reconcile pending on broker %s: %v", rm.brokerID, err)
+			}
 		}
 	}
 }

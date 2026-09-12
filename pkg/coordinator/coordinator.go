@@ -27,6 +27,9 @@ type Coordinator struct {
 	offsetTopicPartitionCount int
 	standalone                bool
 	groupEpochs               map[string]uint64
+	migrationRecords          []ConsumerMetadataRecord
+	migrationAuthoritative    bool
+	offsetRecordWriterMu      sync.RWMutex
 	offsetRecordWriter        func(ConsumerMetadataRecord) error
 	transactionalOffsets      TransactionalOffsetResolver
 
@@ -41,6 +44,11 @@ type Coordinator struct {
 	ownershipSince    map[string]time.Time
 	observationOwner  func(groupName string) (bool, error)
 	observationOwners func(groupNames []string) (map[string]bool, error)
+
+	observationCatalogMu    sync.Mutex
+	observationCatalogAt    time.Time
+	observationCatalog      []consumerGroupObservationRef
+	observationCatalogReady bool
 }
 
 type TopicHandler interface {
@@ -54,6 +62,10 @@ type OffsetLogReader interface {
 
 type offsetTopicPartitionProvider interface {
 	ExistingPartitionCount(topic string) (int, error)
+}
+
+type consumerMetadataMigrationProvider interface {
+	ConsumerMetadataMigrationRecords() ([]ConsumerMetadataRecord, bool, error)
 }
 
 type offsetLogStartProvider interface {
@@ -74,9 +86,9 @@ type TransactionalOffsetResolver interface {
 // SetOffsetRecordWriter installs the cluster-aware __consumer_offsets writer.
 // Standalone coordinators continue to publish through their TopicHandler.
 func (c *Coordinator) SetOffsetRecordWriter(writer func(ConsumerMetadataRecord) error) {
-	c.mu.Lock()
+	c.offsetRecordWriterMu.Lock()
 	c.offsetRecordWriter = writer
-	c.mu.Unlock()
+	c.offsetRecordWriterMu.Unlock()
 }
 
 func (c *Coordinator) SetTransactionalOffsetResolver(resolver TransactionalOffsetResolver) {
@@ -187,6 +199,21 @@ type OffsetItem struct {
 	Offset    uint64 `json:"offset"`
 }
 
+type OffsetCommitMessage struct {
+	Group     string    `json:"group"`
+	Topic     string    `json:"topic"`
+	Partition int       `json:"partition"`
+	Offset    uint64    `json:"offset"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+type BulkOffsetMsg struct {
+	Group     string       `json:"group"`
+	Topic     string       `json:"topic"`
+	Offsets   []OffsetItem `json:"offsets"`
+	Timestamp time.Time    `json:"timestamp"`
+}
+
 // NewCoordinator creates a new Coordinator instance.
 // The provided ctx controls the lifetime of background goroutines (e.g., heartbeat monitor).
 func NewCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandler) *Coordinator {
@@ -248,20 +275,31 @@ func NewCoordinatorWithRecovery(ctx context.Context, cfg *config.Config, handler
 		c.setRecoveryFailure(recoveryErr)
 		return c, recoveryErr
 	}
-	if c.standalone {
-		if reader, ok := handler.(OffsetLogReader); ok {
+	if provider, ok := handler.(consumerMetadataMigrationProvider); ok {
+		records, authoritative, err := provider.ConsumerMetadataMigrationRecords()
+		if err != nil {
+			recoveryErr := fmt.Errorf("load consumer metadata migration: %w", err)
+			c.setRecoveryFailure(recoveryErr)
+			return c, recoveryErr
+		}
+		c.migrationRecords = append([]ConsumerMetadataRecord(nil), records...)
+		c.migrationAuthoritative = authoritative
+	}
+	if reader, ok := handler.(OffsetLogReader); ok {
+		if c.standalone {
 			if recoveryErr := c.LoadOffsetsFromLog(reader); recoveryErr != nil {
 				wrapped := fmt.Errorf("replay internal consumer metadata from %q: %w", c.offsetTopic, recoveryErr)
 				c.setRecoveryFailure(wrapped)
 				return c, wrapped
 			}
+		} else if status, recoveryErr := c.loadDistributedOffsetsFromLog(reader); recoveryErr != nil {
+			wrapped := fmt.Errorf("replay distributed consumer metadata from %q: %w", c.offsetTopic, recoveryErr)
+			c.setRecoveryFailure(wrapped)
+			return c, wrapped
 		} else {
-			c.markRecoveryComplete(ConsumerMetadataRecoveryStatus{})
+			c.markRecoveryComplete(status)
 		}
 	} else {
-		// Distributed consumer metadata is restored exclusively through the
-		// versioned Raft snapshot and log. The local internal topic is not an
-		// independent recovery authority.
 		c.markRecoveryComplete(ConsumerMetadataRecoveryStatus{})
 	}
 	recoveryComplete = true
@@ -308,17 +346,31 @@ func (c *Coordinator) ObserveConsumerGroups() []ConsumerGroupObservation {
 	}
 
 	c.mu.RLock()
-	refs := make([]consumerGroupObservationRef, 0, len(c.groups))
+	refsByGroup := make(map[string]consumerGroupObservationRef, len(c.groups))
 	for name, group := range c.groups {
 		if group == nil {
 			continue
 		}
-		refs = append(refs, consumerGroupObservationRef{topic: group.TopicName, group: name})
+		refsByGroup[name] = consumerGroupObservationRef{topic: group.TopicName, group: name}
 	}
 	standalone := c.standalone
 	resolver := c.observationOwner
 	batchResolver := c.observationOwners
 	c.mu.RUnlock()
+	if !standalone {
+		// A follower may have the committed __consumer_offsets records before it
+		// has ever owned and loaded the group. Keep the durable catalog visible so
+		// every broker exports coordinator_up=0 for the same bounded group set.
+		if durableRefs, ready := c.durableGroupObservationRefs(); ready {
+			for _, ref := range durableRefs {
+				refsByGroup[ref.group] = ref
+			}
+		}
+	}
+	refs := make([]consumerGroupObservationRef, 0, len(refsByGroup))
+	for _, ref := range refsByGroup {
+		refs = append(refs, ref)
+	}
 	sort.Slice(refs, func(i, j int) bool {
 		if refs[i].topic != refs[j].topic {
 			return refs[i].topic < refs[j].topic
@@ -390,6 +442,82 @@ func (c *Coordinator) ObserveConsumerGroups() []ConsumerGroupObservation {
 	}
 	c.mu.RUnlock()
 	return observations
+}
+
+const groupObservationCatalogTTL = time.Second
+
+func (c *Coordinator) durableGroupObservationRefs() ([]consumerGroupObservationRef, bool) {
+	now := time.Now()
+	c.observationCatalogMu.Lock()
+	defer c.observationCatalogMu.Unlock()
+	if !c.observationCatalogAt.IsZero() && now.Sub(c.observationCatalogAt) < groupObservationCatalogTTL {
+		return append([]consumerGroupObservationRef(nil), c.observationCatalog...), c.observationCatalogReady
+	}
+	c.observationCatalogAt = now
+
+	c.mu.RLock()
+	handler := c.topicHandler
+	offsetTopic := c.offsetTopic
+	partitionCount := c.offsetTopicPartitionCount
+	migrationRecords := append([]ConsumerMetadataRecord(nil), c.migrationRecords...)
+	migrationAuthoritative := c.migrationAuthoritative
+	c.mu.RUnlock()
+	reader, ok := handler.(OffsetLogReader)
+	if !ok {
+		return append([]consumerGroupObservationRef(nil), c.observationCatalog...), c.observationCatalogReady
+	}
+	// Reuse the strict recovery decoder against an isolated coordinator. The
+	// scan is read-only with respect to the live coordinator, so a metrics scrape
+	// cannot reset heartbeats, generations, or ownership grace periods.
+	view := &Coordinator{
+		groups:                    make(map[string]*GroupMetadata),
+		lifecyclePending:          make(map[string]bool),
+		topicHandler:              handler,
+		offsetTopic:               offsetTopic,
+		offsetTopicPartitionCount: partitionCount,
+		standalone:                false,
+		groupEpochs:               make(map[string]uint64),
+		migrationRecords:          migrationRecords,
+		migrationAuthoritative:    migrationAuthoritative,
+		ownershipSince:            make(map[string]time.Time),
+	}
+	if _, err := view.recoverConsumerMetadata(reader); err != nil {
+		return append([]consumerGroupObservationRef(nil), c.observationCatalog...), c.observationCatalogReady
+	}
+	view.mu.RLock()
+	refs := make([]consumerGroupObservationRef, 0, len(view.groups))
+	for name, group := range view.groups {
+		if group != nil {
+			refs = append(refs, consumerGroupObservationRef{topic: group.TopicName, group: name})
+		}
+	}
+	view.mu.RUnlock()
+	c.observationCatalog = refs
+	c.observationCatalogReady = true
+	return append([]consumerGroupObservationRef(nil), refs...), true
+}
+
+// ReloadDistributedConsumerMetadata rebuilds local group fencing state from
+// the replicated offsets log. It is called when a broker becomes the durable
+// leader for a group's offsets partition; no controller-Raft group mutation is
+// involved.
+func (c *Coordinator) ReloadDistributedConsumerMetadata() error {
+	if c == nil || c.standalone {
+		return nil
+	}
+	reader, ok := c.topicHandler.(OffsetLogReader)
+	if !ok {
+		return fmt.Errorf("distributed coordinator has no offset-log reader")
+	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	status, err := c.loadDistributedOffsetsFromLog(reader)
+	if err != nil {
+		c.setRecoveryFailureStatus(status, err)
+		return err
+	}
+	c.markRecoveryComplete(status)
+	return nil
 }
 
 // Start launches background monitoring processes (e.g., heartbeat monitor).

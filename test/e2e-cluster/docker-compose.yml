@@ -24,6 +24,9 @@ services:
       - "127.0.0.1:19001:19000"
     volumes:
       - ../cluster/config.yaml:/app/config.yaml
+      # Preserve Raft and topic logs across docker stop/start. Each broker
+      # needs its own durable store; sharing one would corrupt Raft state.
+      - broker-1-data:/app/cluster-logs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
       interval: 3s
@@ -57,6 +60,7 @@ services:
       - "127.0.0.1:19002:19000"
     volumes:
       - ../cluster/config.yaml:/app/config.yaml
+      - broker-2-data:/app/cluster-logs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
       interval: 3s
@@ -93,6 +97,7 @@ services:
       - "127.0.0.1:19003:19000"
     volumes:
       - ../cluster/config.yaml:/app/config.yaml
+      - broker-3-data:/app/cluster-logs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
       interval: 3s
@@ -107,3 +112,8 @@ services:
 networks:
   cluster_network:
     name: cluster_network
+
+volumes:
+  broker-1-data:
+  broker-2-data:
+  broker-3-data:

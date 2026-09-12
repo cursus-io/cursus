@@ -14,6 +14,7 @@ type BrokerFSMSnapshot struct {
 	applied                          uint64
 	logs                             map[uint64]*ReplicationEntry
 	brokers                          map[string]*BrokerInfo
+	retiredBrokerIncarnations        map[string][]string
 	partitionMetadata                map[string]*PartitionMetadata
 	producerState                    map[string]map[int]map[string]ProducerSequence
 	groupState                       map[string]*coordinator.GroupStateSnapshot
@@ -29,6 +30,7 @@ func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 		Applied:                          s.applied,
 		Logs:                             s.logs,
 		Brokers:                          s.brokers,
+		RetiredBrokerIncarnations:        s.retiredBrokerIncarnations,
 		PartitionMetadata:                s.partitionMetadata,
 		ProducerState:                    s.producerState,
 		GroupState:                       s.groupState,

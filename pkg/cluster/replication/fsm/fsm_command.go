@@ -118,6 +118,9 @@ type TopicConfigCommand struct {
 }
 
 func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
+	// Runtime coordinator and transaction references are validated before the
+	// command is submitted. Raft replay must use committed FSM state only:
+	// those runtimes may already contain records written after this command.
 	var topicCmd TopicCommand
 	decoder := json.NewDecoder(strings.NewReader(jsonData))
 	decoder.DisallowUnknownFields()
@@ -154,22 +157,6 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		stagedPartitions := copyPartitionMetadataState(f.partitionMetadata)
 		currentPartitions := 0
 		currentTopic := stagedTopics[topicName]
-		if currentTopic == nil {
-			if f.cd != nil {
-				if references := f.cd.TopicGroupReferences(topicName); len(references) != 0 {
-					return fmt.Errorf("topic %q lifecycle cleanup is pending for consumer group %q", topicName, references[0].Name)
-				}
-			}
-			if f.txn != nil {
-				_, affected, stateErr := f.txn.StateWithoutTopicReferences(topicName)
-				if stateErr != nil {
-					return fmt.Errorf("topic %q lifecycle cleanup is pending: %w", topicName, stateErr)
-				}
-				if len(affected) != 0 {
-					return fmt.Errorf("topic %q lifecycle cleanup is pending for transaction %q", topicName, affected[0])
-				}
-			}
-		}
 
 		definition := base
 		if currentTopic != nil {
@@ -410,29 +397,9 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 			found = true
 		}
 	}
-	coordinatorRef := f.cd
-	transactionManager := f.txn
 	f.mu.RUnlock()
 	if !found && !payload.IfExists {
 		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
-	}
-	if coordinatorRef != nil {
-		for _, reference := range coordinatorRef.TopicGroupReferences(payload.Topic) {
-			if reference.MemberCount != 0 {
-				return fmt.Errorf(
-					"%w: topic %q has active consumer group %q with %d member(s)",
-					topic.ErrTopicDeleteBlocked,
-					payload.Topic,
-					reference.Name,
-					reference.MemberCount,
-				)
-			}
-		}
-	}
-	if transactionManager != nil {
-		if _, _, err := transactionManager.StateWithoutTopicReferences(payload.Topic); err != nil {
-			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
-		}
 	}
 	f.mu.Lock()
 	for key := range f.partitionMetadata {
@@ -475,8 +442,6 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 
 	f.mu.RLock()
 	current := copyTopicDefinition(f.topicState[payload.Topic])
-	coordinatorRef := f.cd
-	transactionManager := f.txn
 	for _, broker := range f.brokers {
 		if broker.Status == "active" && broker.LifecycleProtocol < TopicLifecycleProtocolVersion {
 			f.mu.RUnlock()
@@ -507,21 +472,6 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 		return fmt.Errorf("topic lifecycle counter overflow for %q", payload.Topic)
 	}
 
-	if coordinatorRef != nil {
-		for _, reference := range coordinatorRef.TopicGroupReferences(payload.Topic) {
-			if reference.MemberCount != 0 {
-				return fmt.Errorf(
-					"%w: topic %q has active consumer group %q with %d member(s)",
-					topic.ErrTopicDeleteBlocked, payload.Topic, reference.Name, reference.MemberCount,
-				)
-			}
-		}
-	}
-	if transactionManager != nil {
-		if _, _, err := transactionManager.StateWithoutTopicReferences(payload.Topic); err != nil {
-			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
-		}
-	}
 	target := *current
 	target.Revision++
 	target.LifecycleEpoch++
@@ -804,10 +754,49 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 	info.TransactionCoordinatorShards = 0
 
 	f.mu.Lock()
+	if f.retiredBrokerIncarnations == nil {
+		f.retiredBrokerIncarnations = make(map[string]map[string]struct{})
+	}
 	if shardCount != f.configuredTransactionCoordinatorShardCount {
 		configuredShardCount := f.configuredTransactionCoordinatorShardCount
 		f.mu.Unlock()
 		return fmt.Errorf("transaction coordinator shard count mismatch: broker=%s configured=%d cluster=%d", info.ID, shardCount, configuredShardCount)
+	}
+	if previous := f.brokers[info.ID]; previous != nil {
+		// A registration without an incarnation is retained for compatibility
+		// with metadata written before broker-process fencing existed. A new
+		// non-empty ID starts the next broker process incarnation atomically in
+		// the Raft FSM.  It must be accepted even while the previous record is
+		// active: a restarted broker cannot first make its old process mark
+		// itself inactive.  The durable epoch then fences the previous process's
+		// heartbeats and leaves every router with one membership view.
+		if info.IncarnationID == "" {
+			// Once a broker ID has moved to an incarnation-aware registration,
+			// an older binary must not be able to refresh that registration
+			// without proving the current process identity.
+			if previous.IncarnationID != "" {
+				f.mu.Unlock()
+				return fmt.Errorf("broker_registration_fenced broker=%s reason=missing_incarnation_id", info.ID)
+			}
+			info.IncarnationID = previous.IncarnationID
+			info.IncarnationEpoch = previous.IncarnationEpoch
+		} else if info.IncarnationID != previous.IncarnationID {
+			if brokerIncarnationRetired(f.retiredBrokerIncarnations[info.ID], info.IncarnationID) {
+				f.mu.Unlock()
+				return fmt.Errorf("broker_registration_fenced broker=%s reason=retired_incarnation incarnation_id=%s", info.ID, info.IncarnationID)
+			}
+			info.IncarnationEpoch = previous.IncarnationEpoch + 1
+			if previous.IncarnationID != "" {
+				if f.retiredBrokerIncarnations[info.ID] == nil {
+					f.retiredBrokerIncarnations[info.ID] = make(map[string]struct{})
+				}
+				f.retiredBrokerIncarnations[info.ID][previous.IncarnationID] = struct{}{}
+			}
+		} else if info.IncarnationEpoch < previous.IncarnationEpoch {
+			info.IncarnationEpoch = previous.IncarnationEpoch
+		}
+	} else if info.IncarnationID != "" && info.IncarnationEpoch == 0 {
+		info.IncarnationEpoch = 1
 	}
 	if f.transactionCoordinatorShardCount == 0 {
 		f.transactionCoordinatorShardCount = shardCount
@@ -830,7 +819,9 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 
 func (f *BrokerFSM) applyDeregisterCommand(jsonData string) interface{} {
 	var info struct {
-		ID string `json:"id"`
+		ID               string `json:"id"`
+		IncarnationID    string `json:"incarnation_id,omitempty"`
+		IncarnationEpoch uint64 `json:"incarnation_epoch,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(jsonData), &info); err != nil {
 		util.Error("FSM: Failed to unmarshal deregistration: %v", err)
@@ -839,6 +830,10 @@ func (f *BrokerFSM) applyDeregisterCommand(jsonData string) interface{} {
 
 	f.mu.Lock()
 	if b, ok := f.brokers[info.ID]; ok {
+		if b.IncarnationID != "" && (info.IncarnationID != b.IncarnationID || info.IncarnationEpoch != b.IncarnationEpoch) {
+			f.mu.Unlock()
+			return fmt.Errorf("broker_deregistration_fenced broker=%s expected_incarnation=%s expected_epoch=%d", info.ID, b.IncarnationID, b.IncarnationEpoch)
+		}
 		b.Status = "inactive"
 		util.Info("FSM: Member %s marked as inactive", info.ID)
 	}
@@ -848,6 +843,11 @@ func (f *BrokerFSM) applyDeregisterCommand(jsonData string) interface{} {
 		f.notifyTransactionCoordinatorChange(changed)
 	}
 	return nil
+}
+
+func brokerIncarnationRetired(retired map[string]struct{}, incarnationID string) bool {
+	_, exists := retired[incarnationID]
+	return exists
 }
 
 func (f *BrokerFSM) handleUnknownCommand(data string) interface{} {

@@ -124,12 +124,17 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 
 		cc = clusterController.NewClusterController(ctx, cfg, rm, sd, brokerID, localAddr)
 		sd.StartReconciler(ctx)
-
-		// Start background heartbeats to all cluster members
+		incarnationID := ""
+		if identity, ok := sd.(interface{ BrokerIncarnationID() string }); ok {
+			incarnationID = identity.BrokerIncarnationID()
+		}
+		clusterClient.StartLeaderHeartbeat(ctx, rm.GetLeaderAddress, brokerID, incarnationID, cfg.DiscoveryPort)
+		// ISR proof propagation remains peer based; coordinator membership does not.
 		clusterClient.StartHeartbeat(
 			ctx,
 			cfg.StaticClusterMembers,
 			brokerID,
+			incarnationID,
 			localAddr,
 			cfg.DiscoveryPort,
 			func() []fsm.ISRCatchupProof {
@@ -165,7 +170,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 					if cc != nil && cc.Router != nil {
 						brokerJSON, _ := json.Marshal(map[string]interface{}{
 							"id": brokerID, "addr": localAddr, "client_addr": clientAddr,
-							"status": "active", "lifecycle_protocol": fsm.BrokerProtocolVersionCurrent,
+							"status": "active", "lifecycle_protocol": fsm.BrokerProtocolVersionCurrent, "incarnation_id": incarnationID, "transaction_coordinator_shards": cfg.TransactionCoordinatorShards,
 						})
 						raftCmd := fmt.Sprintf("RAFT_APPLY %stype=REGISTER payload=%s", internalAuthPrefix(cfg), string(brokerJSON))
 						if resp, err := cc.Router.ForwardToLeader(raftCmd); err == nil && !wireprotocol.IsErrorResponse(resp) {
@@ -189,6 +194,30 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 					sd.Reconcile()
 				} else {
 					util.Info("💀 Lost cluster leadership.")
+				}
+			}
+		}()
+
+		// Bootstrap only after every current Raft voter is durably registered.
+		// Followers register asynchronously, so a leader event alone is too early
+		// to choose the internal topic's replica set. This loop does no local
+		// mutation and becomes a no-op after the single durable TOPIC command.
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if !rm.IsLeader() || rm.GetFSM().GetPartitionMetadata(config.ConsumerOffsetsTopicName+"-0") != nil {
+						continue
+					}
+					if err := clusterController.BootstrapConsumerOffsetsTopic(rm, cfg); err != nil {
+						util.Debug("consumer offsets topology bootstrap pending: %v", err)
+					} else {
+						util.Info("consumer offsets topology committed through Raft")
+					}
 				}
 			}
 		}()
@@ -246,6 +275,12 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 				return fmt.Errorf("topic materialization state unavailable")
 			}
 			return cc.RaftManager.GetFSM().TopicMaterializationReadinessError()
+		})
+		healthState.AddCheck("replica_materialization", func(context.Context) error {
+			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
+				return fmt.Errorf("replica materialization state unavailable")
+			}
+			return cc.RaftManager.GetFSM().ReplicaMaterializationReadinessError(cc.BrokerID())
 		})
 	}
 

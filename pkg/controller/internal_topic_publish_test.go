@@ -1,9 +1,11 @@
 package controller
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
@@ -68,4 +70,27 @@ func TestCoordinatorCanWriteConsumerMetadataTopicInternally(t *testing.T) {
 		Timestamp:      time.Now(),
 	}
 	require.NoError(t, handler.writeConsumerOffsetRecord(record))
+}
+
+func TestConsumerOffsetWriterUsesDurablePartitionCount(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	topicManager := topic.NewTopicManager(cfg, &testMockHandlerProvider{}, nil)
+	require.NoError(t, topicManager.CreateTopic(config.ConsumerOffsetsTopicName, 5, false, false))
+	internalTopic := topicManager.GetTopic(config.ConsumerOffsetsTopicName)
+	require.NotNil(t, internalTopic)
+
+	brokerFSM := fsm.NewBrokerFSM(nil, nil)
+	registerRoutingBroker(t, brokerFSM, "node-1")
+	installRoutingOffsetsTopology(t, brokerFSM, "node-1")
+	handler := newCoordinatorRoutingHandler("node-1", brokerFSM, nil)
+	handler.TopicManager = topicManager
+	t.Cleanup(func() { require.NoError(t, handler.Close()) })
+
+	groupName := "workers"
+	_, _, durablePartition, _, err := handler.Cluster.Router.FindCoordinatorWithEpoch(groupName)
+	require.NoError(t, err)
+	partition, err := handler.consumerOffsetPartition(internalTopic, groupName)
+	require.NoError(t, err)
+	require.Equal(t, strconv.FormatUint(durablePartition, 10), partition)
 }

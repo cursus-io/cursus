@@ -38,6 +38,7 @@ type leaveResp struct {
 type heartbeatRequest struct {
 	NodeID        string                `json:"node_id"`
 	CatchupProofs []fsm.ISRCatchupProof `json:"catchup_proofs,omitempty"`
+	IncarnationID string                `json:"incarnation_id,omitempty"`
 }
 
 type ClusterServer struct {
@@ -150,7 +151,7 @@ func (h *ClusterServer) handleConnection(conn net.Conn) {
 }
 
 func (h *ClusterServer) handleHeartbeatCluster(payload wire.CommandPayload) (any, *wire.ErrorPayload) {
-	req := heartbeatRequest{NodeID: payload.Fields["node_id"]}
+	req := heartbeatRequest{NodeID: payload.Fields["node_id"], IncarnationID: payload.Fields["incarnation_id"]}
 	if encoded := payload.Fields["catchup_proofs"]; encoded != "" {
 		if err := json.Unmarshal([]byte(encoded), &req.CatchupProofs); err != nil {
 			return nil, validationError("invalid heartbeat catchup proofs")
@@ -161,8 +162,20 @@ func (h *ClusterServer) handleHeartbeatCluster(payload wire.CommandPayload) (any
 	}
 
 	util.Debug("ClusterServer: Received heartbeat from %s", req.NodeID)
+	if validator, ok := h.sd.(interface {
+		ValidateHeartbeat(string, string) error
+	}); ok {
+		if err := validator.ValidateHeartbeat(req.NodeID, req.IncarnationID); err != nil {
+			return nil, internalClusterError(err)
+		}
+	}
 	if err := h.sd.HandleHeartbeat(req.NodeID, req.CatchupProofs); err != nil {
 		return nil, internalClusterError(err)
+	}
+	if incarnationAware, ok := h.sd.(interface{ UpdateHeartbeatWithIncarnation(string, string) }); ok && req.IncarnationID != "" {
+		incarnationAware.UpdateHeartbeatWithIncarnation(req.NodeID, req.IncarnationID)
+	} else {
+		h.sd.UpdateHeartbeat(req.NodeID)
 	}
 	return map[string]bool{"success": true}, nil
 }
@@ -208,6 +221,10 @@ func fitReplicaCatchupBatchToLimit(batch fsm.ReplicaCatchupBatch, limit int) (fs
 		// fitted logical range. Keeping the original EndOffset would skip it.
 		batch.EndOffset = batch.Messages[messageCount].Offset
 		batch.Messages = batch.Messages[:messageCount]
+		batch, err = fsm.SealReplicaCatchupBatch(batch)
+		if err != nil {
+			return fsm.ReplicaCatchupBatch{}, err
+		}
 	}
 }
 

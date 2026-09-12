@@ -146,8 +146,20 @@ const coordinatorUnavailableResponse = "ERROR: coordinator_not_available"
 // Discovery failures return false so multiple brokers cannot expire the same
 // group while the coordinator ring is unavailable.
 func (ch *CommandHandler) IsGroupCoordinator(groupName string) bool {
-	owned, err := ch.ResolveGroupCoordinator(groupName)
-	return err == nil && owned
+	if !ch.isDistributed() {
+		return true
+	}
+	if !ch.hasRouter() {
+		return false
+	}
+	id, _, partition, epoch, err := ch.Cluster.Router.FindCoordinatorWithEpoch(groupName)
+	if err != nil || id != ch.Cluster.Router.BrokerID() {
+		return false
+	}
+	if err := ch.ensureGroupRecovery(partition, epoch); err != nil {
+		return false
+	}
+	return ch.validateRecoveredCoordinatorRoute(groupName, partition, epoch) == nil
 }
 
 // ResolveGroupCoordinator reports whether this broker is the current group
@@ -191,29 +203,48 @@ func (ch *CommandHandler) ResolveGroupCoordinators(groupNames []string) (map[str
 		return nil, err
 	}
 	localID := ch.Cluster.Router.BrokerID()
+	localGroups := make([]string, 0, len(groupNames))
 	for _, groupName := range groupNames {
 		ownerID, ok := owners[groupName]
 		if !ok {
 			return nil, fmt.Errorf("coordinator result missing for group %q", groupName)
 		}
 		resolved[groupName] = ownerID == localID
+		if resolved[groupName] {
+			localGroups = append(localGroups, groupName)
+		}
+	}
+	for _, groupName := range localGroups {
+		if ch.Coordinator == nil {
+			continue
+		}
+		ownerID, _, partition, epoch, recoveryErr := ch.Cluster.Router.FindCoordinatorWithEpoch(groupName)
+		if recoveryErr != nil {
+			return nil, fmt.Errorf("refresh coordinator recovery fence for group %q: %w", groupName, recoveryErr)
+		}
+		if ownerID != localID {
+			return nil, fmt.Errorf("coordinator ownership changed while refreshing group %q", groupName)
+		}
+		if err := ch.ensureGroupRecovery(partition, epoch); err != nil {
+			return nil, fmt.Errorf("reload distributed consumer metadata: %w", err)
+		}
+		if err := ch.validateRecoveredCoordinatorRoute(groupName, partition, epoch); err != nil {
+			return nil, err
+		}
 	}
 	return resolved, nil
 }
 
-// ExpireGroupMembers serializes timeout-driven membership removal through the
-// replicated metadata log.
+// ExpireGroupMembers durably removes timed-out members through the owning
+// offsets-partition leader. The lifecycle snapshot append is the commit point.
 func (ch *CommandHandler) ExpireGroupMembers(groupName string, generation int, memberIDs []string) error {
 	if !ch.isDistributed() {
 		return ch.Coordinator.ExpireConsumers(groupName, generation, memberIDs)
 	}
-	_, err := ch.applyViaLeader("GROUP_SYNC", map[string]interface{}{
-		"type":       "EXPIRE",
-		"group":      groupName,
-		"generation": generation,
-		"members":    memberIDs,
-	})
-	return err
+	if ch.Coordinator == nil {
+		return fmt.Errorf("coordinator not available")
+	}
+	return ch.Coordinator.ExpireConsumers(groupName, generation, memberIDs)
 }
 
 // checkCoordinator checks if this broker is the coordinator for the given group.
@@ -239,13 +270,57 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 	if !ch.hasRouter() {
 		return AdvertisedAddr{}, true, nil
 	}
-	id, raftAddr, err := ch.Cluster.Router.FindCoordinator(coordKey)
+	id, raftAddr, partition, epoch, err := ch.Cluster.Router.FindCoordinatorWithEpoch(coordKey)
 	if err != nil {
 		return AdvertisedAddr{}, false, fmt.Errorf("coordinator unavailable: %w", err)
 	}
-	return ch.checkResolvedCoordinator(id, raftAddr, findCmd, func(req string) (string, error) {
+	addr, isCoordinator, resolveErr := ch.checkResolvedCoordinator(id, raftAddr, findCmd, func(req string) (string, error) {
 		return ch.Cluster.Router.ForwardToCoordinator(coordKey, req)
 	})
+	if resolveErr != nil || !isCoordinator || ch.Coordinator == nil {
+		return addr, isCoordinator, resolveErr
+	}
+	if err := ch.ensureGroupRecovery(partition, epoch); err != nil {
+		return AdvertisedAddr{}, false, fmt.Errorf("reload coordinator state: %w", err)
+	}
+	if err := ch.validateRecoveredCoordinatorRoute(coordKey, partition, epoch); err != nil {
+		return AdvertisedAddr{}, false, err
+	}
+	return addr, true, nil
+}
+
+func (ch *CommandHandler) validateRecoveredCoordinatorRoute(coordKey string, expectedPartition uint64, expectedEpoch int) error {
+	id, _, partition, epoch, err := ch.Cluster.Router.FindCoordinatorWithEpoch(coordKey)
+	if err != nil {
+		return fmt.Errorf("revalidate coordinator ownership: %w", err)
+	}
+	localID := ch.Cluster.Router.BrokerID()
+	if id != localID || partition != expectedPartition || epoch != expectedEpoch {
+		return fmt.Errorf(
+			"coordinator ownership changed during recovery: group=%s owner=%s partition=%d epoch=%d expected_owner=%s expected_partition=%d expected_epoch=%d",
+			coordKey, id, partition, epoch, localID, expectedPartition, expectedEpoch,
+		)
+	}
+	return nil
+}
+
+func (ch *CommandHandler) ensureGroupRecovery(partition uint64, epoch int) error {
+	if ch.Coordinator == nil {
+		return fmt.Errorf("coordinator unavailable")
+	}
+	ch.groupRecoveryMu.Lock()
+	defer ch.groupRecoveryMu.Unlock()
+	if ch.groupRecoveryEpoch[partition] == epoch {
+		return nil
+	}
+	// The internal topic is broker-owned and permanently compacted. Replay the
+	// complete compacted view so replacing c.groups stays atomic across group
+	// partitions; a partition-scoped scan would require a separate merge fence.
+	if err := ch.Coordinator.ReloadDistributedConsumerMetadata(); err != nil {
+		return err
+	}
+	ch.groupRecoveryEpoch[partition] = epoch
+	return nil
 }
 
 func (ch *CommandHandler) checkResolvedCoordinator(id, raftAddr, findCmd string, forward func(string) (string, error)) (AdvertisedAddr, bool, error) {

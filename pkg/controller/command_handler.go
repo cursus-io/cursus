@@ -63,6 +63,14 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 				current = &definition
 			}
 		}
+		if current == nil {
+			// Runtime references are deliberately checked at the submission
+			// boundary, not inside the Raft FSM. Applying an old TOPIC entry during
+			// restart must not depend on group/transaction state restored later.
+			if err := ch.ensureTopicRecreationIsClean(topicName); err != nil {
+				return formatCreateTopicError(topicName, err)
+			}
+		}
 		payload, payloadErr := distributedTopicCommandPayload(defaults, patch, current)
 		if payloadErr != nil {
 			return formatCreateTopicError(topicName, payloadErr)
@@ -87,8 +95,11 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 		return fmt.Sprintf("ERROR: topic_create_missing topic=%s", topicName)
 	}
 
-	if ch.Coordinator != nil {
-		err := ch.Coordinator.RegisterGroup(topicName, "default-group", len(t.Partitions))
+	// Distributed groups are created by their coordinator after the durable
+	// __consumer_offsets topology is ready. The standalone convenience group
+	// must not publish during controller-topic materialization.
+	if ch.Coordinator != nil && !ch.isDistributed() {
+		err := ch.Coordinator.RegisterGroup(topicName, implicitDefaultGroupName(topicName), len(t.Partitions))
 		if err != nil {
 			util.Warn("Failed to register default group with coordinator: %v", err)
 		}
@@ -125,6 +136,12 @@ func (ch *CommandHandler) handleDelete(cmd string, ctx ...*ClientContext) string
 		if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, cmd); forwarded {
 			return resp
 		}
+		if _, err := ch.prepareTopicDependencies(topicName); err != nil {
+			if errors.Is(err, topic.ErrTopicDeleteBlocked) {
+				return fmt.Sprintf("ERROR: topic_delete_blocked topic=%s reason=%q", topicName, err.Error())
+			}
+			return fmt.Sprintf("ERROR: delete_topic_failed topic=%s reason=%q", topicName, err.Error())
+		}
 
 		payload := map[string]interface{}{
 			"topic":     topicName,
@@ -157,7 +174,7 @@ func (ch *CommandHandler) handleDelete(cmd string, ctx ...*ClientContext) string
 	if !exists && !ifExists {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	transactionState, err := ch.prepareStandaloneTopicDependencies(topicName)
+	transactionState, err := ch.prepareTopicDependencies(topicName)
 	if err != nil {
 		if errors.Is(err, topic.ErrTopicDeleteBlocked) {
 			return fmt.Sprintf("ERROR: topic_delete_blocked topic=%s reason=%q", topicName, err.Error())
@@ -215,6 +232,12 @@ func (ch *CommandHandler) handleTruncate(cmd string, ctx ...*ClientContext) stri
 		if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, cmd); forwarded {
 			return resp
 		}
+		if _, err := ch.prepareTopicDependencies(topicName); err != nil {
+			if errors.Is(err, topic.ErrTopicDeleteBlocked) {
+				return fmt.Sprintf("ERROR: topic_truncate_blocked topic=%s reason=%q", topicName, err.Error())
+			}
+			return fmt.Sprintf("ERROR: truncate_topic_failed topic=%s reason=%q", topicName, err.Error())
+		}
 		result, applyErr := ch.applyAndWaitContext(requestCtx, "TOPIC_TRUNCATE", map[string]interface{}{
 			"topic":             topicName,
 			"expected_revision": expectedRevision,
@@ -229,7 +252,7 @@ func (ch *CommandHandler) handleTruncate(cmd string, ctx ...*ClientContext) stri
 		return formatTruncateResult(truncateResult)
 	}
 
-	transactionState, err := ch.prepareStandaloneTopicDependencies(topicName)
+	transactionState, err := ch.prepareTopicDependencies(topicName)
 	if err != nil {
 		if errors.Is(err, topic.ErrTopicDeleteBlocked) {
 			return fmt.Sprintf("ERROR: topic_truncate_blocked topic=%s reason=%q", topicName, err.Error())
@@ -285,7 +308,7 @@ func (ch *CommandHandler) RecoverPendingTruncations() error {
 		if definition.Revision <= topic.InitialDefinitionRevision {
 			return fmt.Errorf("invalid pending truncate revision for topic %q", definition.Name)
 		}
-		transactionState, err := ch.prepareStandaloneTopicDependencies(definition.Name)
+		transactionState, err := ch.prepareTopicDependencies(definition.Name)
 		if err != nil {
 			return err
 		}
@@ -321,7 +344,7 @@ func (ch *CommandHandler) ensureTopicRecreationIsClean(topicName string) error {
 	return nil
 }
 
-func (ch *CommandHandler) prepareStandaloneTopicDependencies(topicName string) (map[string]*transaction.Snapshot, error) {
+func (ch *CommandHandler) prepareTopicDependencies(topicName string) (map[string]*transaction.Snapshot, error) {
 	if ch.Coordinator != nil {
 		for _, reference := range ch.Coordinator.TopicGroupReferences(topicName) {
 			if reference.MemberCount != 0 {
@@ -390,10 +413,29 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string, contexts ...*ClientCon
 	if !ok || groupName == "" {
 		return "ERROR: missing_group command=REGISTER_GROUP"
 	}
+	distributed := ch.isDistributed()
+	if distributed {
+		coordAddr, isCoord, coordErr := ch.checkCoordinator(groupName)
+		if coordErr != nil {
+			return coordinatorUnavailableResponse
+		}
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
+		}
+		if ch.Coordinator == nil {
+			return coordinatorUnavailableResponse
+		}
+	}
 
 	if topicsValue != "" || pattern != "" {
 		var topics []string
 		if pattern != "" {
+			if ch.TopicManager == nil {
+				if distributed {
+					return fmt.Sprintf("ERROR: topic_materialization_pending pattern=%s reason=%q", pattern, "topic manager unavailable")
+				}
+				return fmt.Sprintf("ERROR: invalid_subscription reason=%q", "topic manager unavailable")
+			}
 			matched, err := ch.matchTopicPattern(pattern)
 			if err != nil {
 				return fmt.Sprintf("ERROR: invalid_subscription reason=%q", err.Error())
@@ -404,15 +446,14 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string, contexts ...*ClientCon
 		}
 		partitionCounts := make(map[string]int, len(topics))
 		for _, subscribed := range topics {
-			t := ch.TopicManager.GetTopic(subscribed)
-			if t == nil {
-				return fmt.Sprintf("ERROR: topic_not_found topic=%s", subscribed)
+			partitionCount, admissionErr := ch.groupAdmissionPartitionCount(subscribed)
+			if admissionErr != "" {
+				return admissionErr
 			}
-			partitionCounts[subscribed] = len(t.Partitions)
+			partitionCounts[subscribed] = partitionCount
 		}
-		payload := map[string]interface{}{"type": "REGISTER", "group": groupName, "topics": topics, "topic_pattern": pattern, "partition_counts": partitionCounts}
-		if ch.isDistributed() {
-			if _, err := ch.applyViaLeader("GROUP_SYNC", payload); err != nil {
+		if distributed {
+			if err := ch.Coordinator.RegisterGroupSubscription(groupName, topics, pattern, partitionCounts); err != nil {
 				return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 			}
 		} else if ch.Coordinator != nil {
@@ -425,30 +466,62 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string, contexts ...*ClientCon
 		return fmt.Sprintf("OK group=%s topics=%s pattern=%s registered=true", groupName, strings.Join(topics, ","), pattern)
 	}
 
-	t := ch.TopicManager.GetTopic(topicName)
-	if t == nil {
-		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	partitionCount, admissionErr := ch.groupAdmissionPartitionCount(topicName)
+	if admissionErr != "" {
+		return admissionErr
 	}
 
-	if ch.isDistributed() {
-		_, err := ch.applyViaLeader("GROUP_SYNC", map[string]interface{}{
-			"type":            "REGISTER",
-			"group":           groupName,
-			"topic":           topicName,
-			"partition_count": len(t.Partitions),
-		})
-		if err != nil {
+	if distributed {
+		if err := ch.Coordinator.RegisterGroup(topicName, groupName, partitionCount); err != nil {
 			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 		}
 		return fmt.Sprintf("OK group=%s topic=%s registered=true", groupName, topicName)
 	}
 	if ch.Coordinator != nil {
-		if err := ch.Coordinator.RegisterGroup(topicName, groupName, len(t.Partitions)); err != nil {
+		if err := ch.Coordinator.RegisterGroup(topicName, groupName, partitionCount); err != nil {
 			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 		}
 		return fmt.Sprintf("OK group=%s topic=%s registered=true", groupName, topicName)
 	}
 	return "ERROR: coordinator_not_available"
+}
+
+func (ch *CommandHandler) groupAdmissionPartitionCount(topicName string) (int, string) {
+	if !ch.isDistributed() {
+		if ch.TopicManager == nil {
+			return 0, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+		}
+		localTopic := ch.TopicManager.GetTopic(topicName)
+		if localTopic == nil {
+			return 0, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+		}
+		return len(localTopic.Partitions), ""
+	}
+	fsmRef := ch.Cluster.RaftManager.GetFSM()
+	if fsmRef == nil {
+		return 0, coordinatorUnavailableResponse
+	}
+	definition, found := fsmRef.GetTopicDefinition(topicName)
+	if !found {
+		return 0, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+	if ch.TopicManager == nil {
+		return 0, fmt.Sprintf("ERROR: topic_materialization_pending topic=%s reason=%q", topicName, "topic manager unavailable")
+	}
+	localTopic := ch.TopicManager.GetTopic(topicName)
+	if localTopic == nil {
+		return 0, fmt.Sprintf("ERROR: topic_materialization_pending topic=%s reason=%q", topicName, "local topic handler unavailable")
+	}
+	localDefinition := localTopic.Definition()
+	if localDefinition.LifecycleEpoch != definition.LifecycleEpoch || len(localTopic.Partitions) != definition.Partitions {
+		return 0, fmt.Sprintf(
+			"ERROR: topic_materialization_pending topic=%s reason=%q",
+			topicName,
+			fmt.Sprintf("local definition mismatch: local_epoch=%d authoritative_epoch=%d local_partitions=%d authoritative_partitions=%d",
+				localDefinition.LifecycleEpoch, definition.LifecycleEpoch, len(localTopic.Partitions), definition.Partitions),
+		)
+	}
+	return definition.Partitions, ""
 }
 
 // handleJoinGroup processes JOIN_GROUP command
@@ -522,38 +595,25 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 
 	var assignments []int
 	if ch.isDistributed() {
-		joinPayload := map[string]interface{}{
-			"type":   "JOIN",
-			"group":  groupName,
-			"member": consumerID,
+		if ch.Coordinator == nil {
+			return coordinatorUnavailableResponse
 		}
-		if !multiTopic {
-			topicRef := ch.TopicManager.GetTopic(topicName)
-			if topicRef == nil {
+		// Group creation belongs to the selected offsets-partition leader.  Do
+		// it only after checkCoordinator has established durable ownership; the
+		// old CREATE-topic convenience registration could publish before the
+		// internal offsets topology existed.
+		if ch.Coordinator.GetGroup(groupName) == nil {
+			topic := ch.TopicManager.GetTopic(topicName)
+			if topic == nil {
 				return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 			}
-			joinPayload["topic"] = topicName
-			joinPayload["partition_count"] = len(topicRef.Partitions)
+			if err := ch.Coordinator.RegisterGroup(topicName, groupName, len(topic.Partitions)); err != nil {
+				return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
+			}
 		}
-
-		_, err := ch.applyViaLeader("GROUP_SYNC", joinPayload)
+		assignments, err = ch.Coordinator.AddConsumer(groupName, consumerID)
 		if err != nil {
-			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
-		}
-
-		// Wait briefly for Raft to propagate to local FSM
-		for i := 0; i < 10; i++ {
-			if multiTopic {
-				if len(ch.Coordinator.GetMemberTopicAssignments(groupName, consumerID)) > 0 {
-					break
-				}
-			} else {
-				assignments = ch.Coordinator.GetMemberAssignments(groupName, consumerID)
-			}
-			if !multiTopic && len(assignments) > 0 {
-				break
-			}
-			time.Sleep(50 * time.Millisecond)
+			return fmt.Sprintf("ERROR: coordinator_not_available reason=%q", err.Error())
 		}
 	} else {
 		if ch.Coordinator != nil {
@@ -696,16 +756,8 @@ func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 		return errResp
 	}
 	if ch.isDistributed() {
-		payload := map[string]interface{}{
-			"type":       "LEAVE",
-			"group":      groupName,
-			"member":     consumerID,
-			"generation": generation,
-		}
-
-		_, err := ch.applyViaLeader("GROUP_SYNC", payload)
-		if err != nil {
-			return formatReplicatedGroupError(err, "register_group_failed")
+		if err := ch.Coordinator.RemoveConsumerForGeneration(groupName, consumerID, generation); err != nil {
+			return formatCoordinatorError(err)
 		}
 	} else {
 		if ch.Coordinator != nil {
@@ -989,22 +1041,11 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 		return "OK validated=true"
 	}
 
-	if ch.isDistributed() {
-		payload := map[string]interface{}{
-			"group":      groupID,
-			"topic":      offsetTopic,
-			"member":     memberID,
-			"generation": generation,
-			"partition":  partition,
-			"offset":     offset,
-		}
-		_, err := ch.applyViaLeader("OFFSET_SYNC", payload)
-		if err != nil {
-			return formatReplicatedGroupError(err, "offset_sync_failed")
-		}
-		return "OK"
-	}
-
+	// The coordinator selected from the replicated controller metadata owns this
+	// group. Its __consumer_offsets partition is the durable source of truth;
+	// do not mirror a new commit through the controller Raft FSM. A follower
+	// can legitimately not have this group's reconstructed in-memory state, so
+	// mirroring would turn a durable commit into a false group_not_found error.
 	err = ch.Coordinator.ValidateAndCommit(groupID, offsetTopic, partition, offset, generation, memberID)
 	if err != nil {
 		return formatCoordinatorError(err)
@@ -1113,26 +1154,12 @@ func (ch *CommandHandler) handleBatchCommit(cmd string) string {
 		return "ERROR: no_valid_offsets"
 	}
 
-	if ch.isDistributed() {
-		batchCommitData := map[string]interface{}{
-			"group":      groupID,
-			"topic":      offsetTopic,
-			"member":     memberID,
-			"generation": generation,
-			"offsets":    offsetList,
-		}
-		_, err := ch.applyViaLeader("BATCH_OFFSET", batchCommitData)
-		if err != nil {
-			util.Error("Raft batch apply failed: %v", err)
-			return formatReplicatedGroupError(err, "raft_batch_apply_failed")
-		}
-	} else if ch.Coordinator != nil {
-		err := ch.Coordinator.ValidateAndCommitOffsetsBulk(groupID, offsetTopic, memberID, generation, offsetList)
-		if err != nil {
-			return formatCoordinatorError(err)
-		}
-	} else {
-		return "ERROR: offset_manager_not_available"
+	// As with COMMIT_OFFSET, write only through the selected coordinator's
+	// __consumer_offsets partition. BATCH_OFFSET remains an FSM replay
+	// compatibility command for historical logs, not a live write protocol.
+	err := ch.Coordinator.ValidateAndCommitOffsetsBulk(groupID, offsetTopic, memberID, generation, offsetList)
+	if err != nil {
+		return formatCoordinatorError(err)
 	}
 
 	return fmt.Sprintf("OK batched=%d", len(offsetList))

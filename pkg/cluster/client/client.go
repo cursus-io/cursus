@@ -46,7 +46,7 @@ func (c *TCPClusterClient) dialContext(ctx context.Context, address string) (net
 func (c *TCPClusterClient) StartHeartbeat(
 	ctx context.Context,
 	peers []string,
-	nodeID, localAddr string,
+	nodeID, incarnationID, localAddr string,
 	discoveryPort int,
 	proofProvider func() []fsm.ISRCatchupProof,
 ) {
@@ -63,16 +63,40 @@ func (c *TCPClusterClient) StartHeartbeat(
 					proofs = proofProvider()
 				}
 				// sendHeartbeat internal loop uses goroutines now
-				_ = c.sendHeartbeat(ctx, peers, nodeID, localAddr, discoveryPort, proofs)
+				_ = c.sendHeartbeat(ctx, peers, nodeID, incarnationID, localAddr, discoveryPort, proofs)
 			}
 		}
 	}()
 }
 
+// StartLeaderHeartbeat sends a broker liveness session only to the Raft
+// leader, which is the sole authority allowed to replicate membership changes.
+func (c *TCPClusterClient) StartLeaderHeartbeat(ctx context.Context, leader func() string, nodeID, incarnationID string, discoveryPort int) {
+	ticker := time.NewTicker(time.Second)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if leader != nil && leader() != "" {
+					_ = c.sendHeartbeatToLeader(ctx, leader(), nodeID, incarnationID, discoveryPort)
+				}
+			}
+		}
+	}()
+}
+
+func (c *TCPClusterClient) sendHeartbeatToLeader(ctx context.Context, leaderAddr, nodeID, incarnationID string, discoveryPort int) error {
+	_, err := c.sendRequest(ctx, heartbeatTarget(leaderAddr, discoveryPort), wire.CommandHeartbeatCluster, map[string]string{"node_id": nodeID, "incarnation_id": incarnationID})
+	return err
+}
+
 func (c *TCPClusterClient) sendHeartbeat(
 	ctx context.Context,
 	peers []string,
-	nodeID, localAddr string,
+	nodeID, incarnationID, localAddr string,
 	discoveryPort int,
 	proofs []fsm.ISRCatchupProof,
 ) error {
@@ -81,7 +105,7 @@ func (c *TCPClusterClient) sendHeartbeat(
 		apiPort = 8000
 	}
 
-	fields := map[string]string{"node_id": nodeID}
+	fields := map[string]string{"node_id": nodeID, "incarnation_id": incarnationID}
 	if len(proofs) > 0 {
 		body, err := json.Marshal(proofs)
 		if err != nil {
