@@ -3,10 +3,12 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
@@ -27,8 +29,11 @@ func (ch *CommandHandler) writeConsumerOffsetRecord(record coordinator.ConsumerM
 	}
 	// Partition by group identity so lifecycle and offset records share one
 	// durable coordinator partition, while retaining their independent keys.
-	partition := topic.GetPartitionForMessage(types.Message{Key: coordinator.ConsumerMetadataGroupPartitionKey(record.Group)})
-	cmd := fmt.Sprintf("PUBLISH topic=%s partition=%d acks=all producerId=consumer-offset-coordinator key=%s message=%s", config.ConsumerOffsetsTopicName, partition, key, payload)
+	partitionText, err := ch.consumerOffsetPartition(topic, record.Group)
+	if err != nil {
+		return err
+	}
+	cmd := fmt.Sprintf("PUBLISH topic=%s partition=%s acks=all producerId=consumer-offset-coordinator key=%s message=%s", config.ConsumerOffsetsTopicName, partitionText, key, payload)
 	resp := ch.handlePublish(cmd, NewInternalClientContext("default-group", 0))
 	if strings.HasPrefix(resp, "OK") {
 		return nil
@@ -38,4 +43,16 @@ func (ch *CommandHandler) writeConsumerOffsetRecord(record coordinator.ConsumerM
 		return fmt.Errorf("consumer offset append failed: %s", resp)
 	}
 	return nil
+}
+
+func (ch *CommandHandler) consumerOffsetPartition(internalTopic *topic.Topic, groupName string) (string, error) {
+	if ch.hasRouter() {
+		_, _, durablePartition, _, err := ch.Cluster.Router.FindCoordinatorWithEpoch(groupName)
+		if err != nil {
+			return "", fmt.Errorf("resolve durable consumer offset partition: %w", err)
+		}
+		return strconv.FormatUint(durablePartition, 10), nil
+	}
+	partition := internalTopic.GetPartitionForMessage(types.Message{Key: coordinator.ConsumerMetadataGroupPartitionKey(groupName)})
+	return strconv.Itoa(partition), nil
 }

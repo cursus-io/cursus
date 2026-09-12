@@ -1,6 +1,9 @@
 package fsm
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -12,8 +15,8 @@ import (
 
 const MaxReplicaCatchupRecords = 1024
 
-// ReplicaCatchupRequest asks the current partition leader for a bounded raw
-// committed-log range. LeaderAddress is local routing metadata and is not sent.
+// ReplicaCatchupRequest asks a current in-sync replica for a bounded raw
+// committed-log range. SourceAddress is local routing metadata and is not sent.
 type ReplicaCatchupRequest struct {
 	Topic          string `json:"topic"`
 	Partition      int    `json:"partition"`
@@ -21,10 +24,11 @@ type ReplicaCatchupRequest struct {
 	NextOffset     uint64 `json:"next_offset"`
 	CommittedHWM   uint64 `json:"committed_hwm"`
 	Leader         string `json:"leader"`
+	SourceBroker   string `json:"source_broker,omitempty"`
 	LeaderEpoch    int    `json:"leader_epoch"`
 	LifecycleEpoch uint64 `json:"lifecycle_epoch"`
 	MaxRecords     int    `json:"max_records"`
-	LeaderAddress  string `json:"-"`
+	SourceAddress  string `json:"-"`
 }
 
 // ReplicaCatchupBatch carries a committed logical range under the same
@@ -38,10 +42,48 @@ type ReplicaCatchupBatch struct {
 	EndOffset      uint64          `json:"end_offset,omitempty"`
 	CommittedHWM   uint64          `json:"committed_hwm"`
 	Leader         string          `json:"leader"`
+	SourceBroker   string          `json:"source_broker,omitempty"`
 	LeaderEpoch    int             `json:"leader_epoch"`
 	LifecycleEpoch uint64          `json:"lifecycle_epoch"`
 	Compacted      bool            `json:"compacted,omitempty"`
 	Messages       []types.Message `json:"messages"`
+	Digest         string          `json:"digest"`
+}
+
+// SealReplicaCatchupBatch binds the logical range, fences, source, and decoded
+// records to a SHA-256 digest before the batch crosses the cluster transport.
+func SealReplicaCatchupBatch(batch ReplicaCatchupBatch) (ReplicaCatchupBatch, error) {
+	digest, err := replicaCatchupBatchDigest(batch)
+	if err != nil {
+		return ReplicaCatchupBatch{}, err
+	}
+	batch.Digest = digest
+	return batch, nil
+}
+
+// ValidateReplicaCatchupBatchDigest rejects missing or changed recovery data.
+func ValidateReplicaCatchupBatchDigest(batch ReplicaCatchupBatch) error {
+	if batch.Digest == "" {
+		return fmt.Errorf("replica catch-up checksum is missing")
+	}
+	digest, err := replicaCatchupBatchDigest(batch)
+	if err != nil {
+		return err
+	}
+	if digest != batch.Digest {
+		return fmt.Errorf("replica catch-up checksum mismatch")
+	}
+	return nil
+}
+
+func replicaCatchupBatchDigest(batch ReplicaCatchupBatch) (string, error) {
+	batch.Digest = ""
+	data, err := json.Marshal(batch)
+	if err != nil {
+		return "", fmt.Errorf("encode replica catch-up checksum payload: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // ISRCatchupProof fences ISR re-admission with the authoritative partition
@@ -219,8 +261,9 @@ func (f *BrokerFSM) BuildISRCatchupProofs(brokerID string) []ISRCatchupProof {
 }
 
 // BuildReplicaCatchupRequests returns one bounded-range request for each local
-// follower below the authoritative committed HWM. A lagging ISR member is also
-// repaired while its eviction is still propagating through Raft.
+// replica below the authoritative committed HWM. The transfer source is a
+// remote active ISR member and is independent from metadata leadership, so a
+// restarted lagging leader can recover without a forced leader election.
 func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchupRequest {
 	if brokerID == "" {
 		return nil
@@ -250,7 +293,7 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 
 	requests := make([]ReplicaCatchupRequest, 0)
 	for key, meta := range metadata {
-		if !meta.CommittedHWMKnown || !containsString(meta.Replicas, brokerID) || meta.Leader == brokerID {
+		if !meta.CommittedHWMKnown || !containsString(meta.Replicas, brokerID) {
 			continue
 		}
 		separator := strings.LastIndex(key, "-")
@@ -264,8 +307,8 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 		topicName := key[:separator]
 		definition := definitions[topicName]
 		localTopic := topicManager.GetTopic(topicName)
-		leader, leaderKnown := brokers[meta.Leader]
-		if definition == nil || localTopic == nil || !leaderKnown || leader.Addr == "" ||
+		source, sourceKnown := selectReplicaCatchupSource(meta, brokerID, brokers)
+		if definition == nil || localTopic == nil || !sourceKnown || source.Addr == "" ||
 			definition.LifecycleEpoch != meta.LifecycleEpoch || localTopic.Definition().LifecycleEpoch != meta.LifecycleEpoch {
 			continue
 		}
@@ -285,8 +328,9 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 		requests = append(requests, ReplicaCatchupRequest{
 			Topic: topicName, Partition: partitionID, BrokerID: brokerID,
 			NextOffset: leo, CommittedHWM: meta.CommittedHWM,
-			Leader: meta.Leader, LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch,
-			MaxRecords: MaxReplicaCatchupRecords, LeaderAddress: leader.Addr,
+			Leader: meta.Leader, SourceBroker: source.ID,
+			LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch,
+			MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr,
 		})
 	}
 	sort.Slice(requests, func(i, j int) bool {
@@ -296,6 +340,25 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 		return requests[i].Partition < requests[j].Partition
 	})
 	return requests
+}
+
+func selectReplicaCatchupSource(meta PartitionMetadata, localBrokerID string, brokers map[string]BrokerInfo) (BrokerInfo, bool) {
+	candidates := make([]string, 0, len(meta.ISR))
+	if meta.Leader != localBrokerID && containsString(meta.ISR, meta.Leader) {
+		candidates = append(candidates, meta.Leader)
+	}
+	for _, brokerID := range meta.ISR {
+		if brokerID != localBrokerID && brokerID != meta.Leader {
+			candidates = append(candidates, brokerID)
+		}
+	}
+	for _, brokerID := range candidates {
+		broker, ok := brokers[brokerID]
+		if ok && broker.Status == "active" && broker.Addr != "" && containsString(meta.Replicas, brokerID) {
+			return broker, true
+		}
+	}
+	return BrokerInfo{}, false
 }
 
 // FetchReplicaCatchup validates the request against current Raft metadata and
@@ -316,12 +379,24 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 	}
 	current := *meta
 	current.Replicas = append([]string(nil), meta.Replicas...)
+	current.ISR = append([]string(nil), meta.ISR...)
+	sourceBroker := request.SourceBroker
+	if sourceBroker == "" {
+		sourceBroker = request.Leader
+	}
+	source := f.brokers[sourceBroker]
 	f.mu.RUnlock()
 	if !containsString(current.Replicas, request.BrokerID) {
 		return ReplicaCatchupBatch{}, fmt.Errorf("broker %s is not a configured replica for %s", request.BrokerID, key)
 	}
 	if !current.CommittedHWMKnown {
 		return ReplicaCatchupBatch{}, fmt.Errorf("%w: partition %s has no authoritative committed HWM", ErrUnsupportedRecoveryProtocol, key)
+	}
+	if !containsString(current.Replicas, sourceBroker) || !containsString(current.ISR, sourceBroker) {
+		return ReplicaCatchupBatch{}, fmt.Errorf("source broker %s is not an in-sync replica for %s", sourceBroker, key)
+	}
+	if source == nil || source.Status != "active" {
+		return ReplicaCatchupBatch{}, fmt.Errorf("source broker %s is not active", sourceBroker)
 	}
 	if request.Leader != current.Leader || request.LeaderEpoch != current.LeaderEpoch {
 		return ReplicaCatchupBatch{}, fmt.Errorf("stale leader fence for %s", key)
@@ -370,12 +445,13 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 			return ReplicaCatchupBatch{}, fmt.Errorf("non-contiguous committed range for uncompacted topic %s", request.Topic)
 		}
 	}
-	return ReplicaCatchupBatch{
+	return SealReplicaCatchupBatch(ReplicaCatchupBatch{
 		Topic: request.Topic, Partition: request.Partition, BrokerID: request.BrokerID,
 		StartOffset: request.NextOffset, EndOffset: endOffset, CommittedHWM: current.CommittedHWM,
-		Leader: current.Leader, LeaderEpoch: current.LeaderEpoch, LifecycleEpoch: current.LifecycleEpoch,
+		Leader: current.Leader, SourceBroker: sourceBroker,
+		LeaderEpoch: current.LeaderEpoch, LifecycleEpoch: current.LifecycleEpoch,
 		Compacted: compacted, Messages: messages,
-	}, nil
+	})
 }
 
 // ReadCommittedLogRange returns raw log records for replica catch-up. Unlike a

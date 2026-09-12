@@ -664,11 +664,13 @@ func TestPreparePartitionReplicaAllowsFencedBackfillBelowCommittedHWM(t *testing
 	require.NoError(t, err)
 	release()
 	require.Zero(t, partition.NextOffset())
-	require.NoError(t, handler.ApplyReplicaCatchup(fsm.ReplicaCatchupBatch{
+	catchupBatch, err := fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
 		Topic: "orders", Partition: 0, BrokerID: "broker-2", StartOffset: 0, CommittedHWM: 2,
-		Leader: "broker-1", LeaderEpoch: 7, LifecycleEpoch: topic.InitialLifecycleEpoch,
+		Leader: "broker-1", SourceBroker: "broker-1", LeaderEpoch: 7, LifecycleEpoch: topic.InitialLifecycleEpoch,
 		Messages: []types.Message{{Offset: 0, Payload: "zero"}, {Offset: 1, Payload: "one"}},
-	}))
+	})
+	require.NoError(t, err)
+	require.NoError(t, handler.ApplyReplicaCatchup(catchupBatch))
 	require.Equal(t, uint64(2), partition.NextOffset())
 	require.Equal(t, uint64(2), partition.GetHWM())
 }
@@ -694,12 +696,14 @@ func TestApplyReplicaCatchupAcceptsCompactedOffsetRangeAndPreservesHWM(t *testin
 		diskManager.CloseAllHandlers()
 	})
 
-	require.NoError(t, handler.ApplyReplicaCatchup(fsm.ReplicaCatchupBatch{
+	catchupBatch, err := fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
 		Topic: "state", Partition: 0, BrokerID: "broker-2", StartOffset: 0, EndOffset: 5,
-		CommittedHWM: 5, Leader: "broker-1", LeaderEpoch: 7,
+		CommittedHWM: 5, Leader: "broker-1", SourceBroker: "broker-1", LeaderEpoch: 7,
 		LifecycleEpoch: topic.InitialLifecycleEpoch, Compacted: true,
 		Messages: []types.Message{{Offset: 2, Key: "a", Payload: "current-a"}, {Offset: 4, Key: "b", Payload: "current-b"}},
-	}))
+	})
+	require.NoError(t, err)
+	require.NoError(t, handler.ApplyReplicaCatchup(catchupBatch))
 	partition, err := topicManager.GetTopic("state").GetPartition(0)
 	require.NoError(t, err)
 	require.Equal(t, uint64(5), partition.NextOffset())

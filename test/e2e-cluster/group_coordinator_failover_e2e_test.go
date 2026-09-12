@@ -1,6 +1,7 @@
 package e2e_cluster
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/e2e"
 )
 
@@ -28,11 +30,17 @@ func TestGroupCoordinatorFailoverUsesDurableMembership(t *testing.T) {
 
 	topic := "group-coordinator-failover"
 	group := "group-coordinator-failover-workers"
+	adminClient := e2e.NewBrokerClient(clusterBrokerAddrs(3))
+	createErr := adminClient.CreateTopic(topic, 1, false)
+	adminClient.Close()
+	if createErr != nil {
+		t.Fatalf("create topic: %v", createErr)
+	}
+	if err := waitForGroupRegistration(topic, group); err != nil {
+		t.Fatalf("register group after topic creation: %v", err)
+	}
 	client := e2e.NewBrokerClient(clusterBrokerAddrs(3))
 	defer client.Close()
-	if err := client.CreateTopic(topic, 1, false); err != nil {
-		t.Fatalf("create topic: %v", err)
-	}
 	generation, member, err := client.JoinGroup(topic, group)
 	if err != nil {
 		t.Fatalf("join group: %v", err)
@@ -50,6 +58,7 @@ func TestGroupCoordinatorFailoverUsesDurableMembership(t *testing.T) {
 
 	var newID string
 	if err := eventually(t, "durable group coordinator failover", clusterReadyTimeout, func() (bool, string, error) {
+		attemptID := ""
 		for _, node := range survivors {
 			id, err := findGroupCoordinatorFrom(node, group)
 			if err != nil {
@@ -58,11 +67,12 @@ func TestGroupCoordinatorFailoverUsesDurableMembership(t *testing.T) {
 			if id == oldID {
 				return false, fmt.Sprintf("broker-%d still returns %s", node, oldID), nil
 			}
-			if newID != "" && id != newID {
-				return false, fmt.Sprintf("inconsistent coordinators %s and %s", newID, id), nil
+			if attemptID != "" && id != attemptID {
+				return false, fmt.Sprintf("inconsistent coordinators %s and %s", attemptID, id), nil
 			}
-			newID = id
+			attemptID = id
 		}
+		newID = attemptID
 		return newID != "", fmt.Sprintf("coordinator=%s", newID), nil
 	}); err != nil {
 		t.Fatal(err)
@@ -98,6 +108,35 @@ func TestGroupCoordinatorFailoverUsesDurableMembership(t *testing.T) {
 	// after the leader commits active membership.
 	startComposeBroker(t, oldNode)
 	waitForAllBrokerReadiness(t, []int{1, 2, 3})
+}
+
+func waitForGroupRegistration(topic, group string) error {
+	deadline := time.Now().Add(clusterReadyTimeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		client := e2e.NewBrokerClient(clusterBrokerAddrs(3))
+		response, err := client.SendCommand("", fmt.Sprintf("REGISTER_GROUP topic=%s group=%s", topic, group), 5*time.Second)
+		client.Close()
+		if err == nil && strings.HasPrefix(response, "OK ") {
+			return nil
+		}
+		var brokerErr *wire.BrokerError
+		if errors.As(err, &brokerErr) {
+			if brokerErr.Code == "topic_not_found" {
+				return fmt.Errorf("authoritative topic was reported missing: %w", err)
+			}
+			if brokerErr.Retryable {
+				lastErr = err
+				time.Sleep(clusterPollInterval)
+				continue
+			}
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("unexpected REGISTER_GROUP response %q", response)
+	}
+	return fmt.Errorf("timed out waiting for retryable topic/coordinator materialization: %w", lastErr)
 }
 
 func findGroupCoordinator(t *testing.T, node int, group string) string {

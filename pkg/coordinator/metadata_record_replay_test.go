@@ -17,6 +17,14 @@ type metadataReplayHandler struct {
 	starts   map[int]uint64
 }
 
+type failingMigrationReplayHandler struct {
+	metadataReplayHandler
+}
+
+func (*failingMigrationReplayHandler) ConsumerMetadataMigrationRecords() ([]ConsumerMetadataRecord, bool, error) {
+	return nil, false, fmt.Errorf("migration unavailable")
+}
+
 func (h *metadataReplayHandler) Publish(string, *types.Message) error       { return nil }
 func (h *metadataReplayHandler) CreateTopic(string, int, bool, bool) error  { return nil }
 func (h *metadataReplayHandler) ExistingPartitionCount(string) (int, error) { return 4, nil }
@@ -81,6 +89,42 @@ func TestDistributedRecoveryPreservesLegacyBestEffortReplay(t *testing.T) {
 	require.Equal(t, uint64(9), offset)
 }
 
+func TestDistributedRecoverySkipsMismatchedKeysAndNegativeLegacyPartitions(t *testing.T) {
+	record := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
+		Group: "workers", Topic: "events", PartitionCount: 1, Epoch: 1, Timestamp: time.Unix(1, 0).UTC(),
+	}
+	mismatched := encodedMetadataMessage(t, record, 0)
+	mismatched.Key = "wrong-key"
+	negative, err := json.Marshal(OffsetCommitMessage{
+		Group: "legacy", Topic: "events", Partition: -1, Offset: 7, Timestamp: time.Unix(2, 0).UTC(),
+	})
+	require.NoError(t, err)
+	valid, err := json.Marshal(OffsetCommitMessage{
+		Group: "legacy", Topic: "events", Partition: 0, Offset: 9, Timestamp: time.Unix(3, 0).UTC(),
+	})
+	require.NoError(t, err)
+
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	recovered, err := NewCoordinatorWithRecovery(context.Background(), cfg, &metadataReplayHandler{messages: map[int][]types.Message{
+		0: {mismatched, {Offset: 1, Payload: string(negative)}, {Offset: 2, Payload: string(valid)}},
+	}})
+	require.NoError(t, err)
+	require.Equal(t, 2, recovered.RecoverySnapshot().CorruptRecords)
+	offset, found := recovered.GetOffset("legacy", "events", 0)
+	require.True(t, found)
+	require.Equal(t, uint64(9), offset)
+}
+
+func TestCoordinatorRecoveryRecordsMigrationProviderFailure(t *testing.T) {
+	coordinator, err := NewCoordinatorWithRecovery(context.Background(), config.DefaultConfig(), &failingMigrationReplayHandler{})
+	require.ErrorContains(t, err, "migration unavailable")
+	status := coordinator.RecoverySnapshot()
+	require.False(t, status.Ready)
+	require.Contains(t, status.Failure, "load consumer metadata migration")
+}
+
 func TestDistributedRecoveryUsesLatestVersionedMultiTopicSnapshots(t *testing.T) {
 	recordA := ConsumerMetadataRecord{Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordOffsetSnapshot, Group: "workers", Topic: "orders", Epoch: 3, Revision: 2, Offsets: []OffsetItem{{Partition: 0, Offset: 8}}, Timestamp: time.Unix(2, 0).UTC()}
 	recordB := ConsumerMetadataRecord{Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordOffsetSnapshot, Group: "workers", Topic: "payments", Epoch: 3, Revision: 1, Offsets: []OffsetItem{{Partition: 0, Offset: 5}}, Timestamp: time.Unix(3, 0).UTC()}
@@ -138,6 +182,56 @@ func TestDistributedLifecycleSnapshotsRecoverGenerationAndAssignments(t *testing
 	require.Equal(t, 2, recovered.GetGeneration("workers"))
 	require.Equal(t, []int{0, 1}, recovered.GetMemberAssignments("workers", "member-a"))
 	require.Equal(t, []int{2, 3}, recovered.GetMemberAssignments("workers", "member-b"))
+}
+
+func TestDistributedReloadPreservesMembershipWhenSelectedLifecycleSnapshotIsOrphaned(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	handler := &metadataReplayHandler{}
+	coordinator, err := NewCoordinatorWithRecovery(context.Background(), cfg, handler)
+	require.NoError(t, err)
+	coordinator.SetOffsetRecordWriter(func(ConsumerMetadataRecord) error { return nil })
+	require.NoError(t, coordinator.RegisterGroup("orders", "workers", 1))
+	_, err = coordinator.AddConsumer("workers", "member-a")
+	require.NoError(t, err)
+
+	registration := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
+		Group: "workers", Topic: "orders", PartitionCount: 1, Epoch: 2, Timestamp: time.Unix(2, 0).UTC(),
+	}
+	staleLifecycle := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersionLifecycle, Type: ConsumerMetadataRecordLifecycleSnapshot,
+		Group: "workers", Epoch: 1, Revision: 1,
+		Lifecycle: &GroupLifecycleSnapshot{TopicName: "orders", Generation: 1, Members: []GroupLifecycleMember{{ID: "stale-member"}}, Partitions: []int{0}},
+		Timestamp: time.Unix(1, 0).UTC(),
+	}
+	handler.messages = map[int][]types.Message{0: {encodedMetadataMessage(t, staleLifecycle, 0), encodedMetadataMessage(t, registration, 1)}}
+
+	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.Equal(t, 1, coordinator.GetGeneration("workers"))
+	require.Equal(t, []int{0}, coordinator.GetMemberAssignments("workers", "member-a"))
+}
+
+func TestDistributedRecoveryPrefersVersionedSnapshotOverLegacyOffsets(t *testing.T) {
+	legacy, err := json.Marshal(OffsetCommitMessage{
+		Group: "workers", Topic: "events", Partition: 0, Offset: 4, Timestamp: time.Unix(1, 0).UTC(),
+	})
+	require.NoError(t, err)
+	versioned := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordOffsetSnapshot,
+		Group: "workers", Topic: "events", Epoch: 3, Revision: 1,
+		Offsets: []OffsetItem{{Partition: 0, Offset: 12}}, Timestamp: time.Unix(2, 0).UTC(),
+	}
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	recovered, err := NewCoordinatorWithRecovery(context.Background(), cfg, &metadataReplayHandler{messages: map[int][]types.Message{
+		0: {{Offset: 0, Payload: string(legacy)}, encodedMetadataMessage(t, versioned, 1)},
+	}})
+	require.NoError(t, err)
+	offset, found := recovered.GetOffset("workers", "events", 0)
+	require.True(t, found)
+	require.Equal(t, uint64(12), offset)
+	require.Equal(t, uint64(3), recovered.GetRegistrationEpoch("workers"))
 }
 
 func TestDistributedLifecycleAppendFailureDoesNotAdvanceGeneration(t *testing.T) {

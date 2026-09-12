@@ -357,6 +357,8 @@ func isIdempotent(payload string) bool {
 		wire.CommandListGroups, wire.CommandListOffsets, wire.CommandFetchOffset,
 		wire.CommandGroupStatus, wire.CommandHelp, wire.CommandConsume:
 		return true
+	case wire.CommandCreate:
+		return strings.EqualFold(request.Fields["idempotent"], "true")
 	case wire.CommandPublish:
 		return strings.EqualFold(request.Fields["isIdempotent"], "true")
 	default:

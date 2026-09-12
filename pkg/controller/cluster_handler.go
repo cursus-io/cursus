@@ -156,7 +156,10 @@ func (ch *CommandHandler) IsGroupCoordinator(groupName string) bool {
 	if err != nil || id != ch.Cluster.Router.BrokerID() {
 		return false
 	}
-	return ch.ensureGroupRecovery(partition, epoch) == nil
+	if err := ch.ensureGroupRecovery(partition, epoch); err != nil {
+		return false
+	}
+	return ch.validateRecoveredCoordinatorRoute(groupName, partition, epoch) == nil
 }
 
 // ResolveGroupCoordinator reports whether this broker is the current group
@@ -225,6 +228,9 @@ func (ch *CommandHandler) ResolveGroupCoordinators(groupNames []string) (map[str
 		if err := ch.ensureGroupRecovery(partition, epoch); err != nil {
 			return nil, fmt.Errorf("reload distributed consumer metadata: %w", err)
 		}
+		if err := ch.validateRecoveredCoordinatorRoute(groupName, partition, epoch); err != nil {
+			return nil, err
+		}
 	}
 	return resolved, nil
 }
@@ -277,7 +283,25 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 	if err := ch.ensureGroupRecovery(partition, epoch); err != nil {
 		return AdvertisedAddr{}, false, fmt.Errorf("reload coordinator state: %w", err)
 	}
+	if err := ch.validateRecoveredCoordinatorRoute(coordKey, partition, epoch); err != nil {
+		return AdvertisedAddr{}, false, err
+	}
 	return addr, true, nil
+}
+
+func (ch *CommandHandler) validateRecoveredCoordinatorRoute(coordKey string, expectedPartition uint64, expectedEpoch int) error {
+	id, _, partition, epoch, err := ch.Cluster.Router.FindCoordinatorWithEpoch(coordKey)
+	if err != nil {
+		return fmt.Errorf("revalidate coordinator ownership: %w", err)
+	}
+	localID := ch.Cluster.Router.BrokerID()
+	if id != localID || partition != expectedPartition || epoch != expectedEpoch {
+		return fmt.Errorf(
+			"coordinator ownership changed during recovery: group=%s owner=%s partition=%d epoch=%d expected_owner=%s expected_partition=%d expected_epoch=%d",
+			coordKey, id, partition, epoch, localID, expectedPartition, expectedEpoch,
+		)
+	}
+	return nil
 }
 
 func (ch *CommandHandler) ensureGroupRecovery(partition uint64, epoch int) error {
@@ -289,6 +313,9 @@ func (ch *CommandHandler) ensureGroupRecovery(partition uint64, epoch int) error
 	if ch.groupRecoveryEpoch[partition] == epoch {
 		return nil
 	}
+	// The internal topic is broker-owned and permanently compacted. Replay the
+	// complete compacted view so replacing c.groups stays atomic across group
+	// partitions; a partition-scoped scan would require a separate merge fence.
 	if err := ch.Coordinator.ReloadDistributedConsumerMetadata(); err != nil {
 		return err
 	}

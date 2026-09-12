@@ -29,6 +29,7 @@ type Coordinator struct {
 	groupEpochs               map[string]uint64
 	migrationRecords          []ConsumerMetadataRecord
 	migrationAuthoritative    bool
+	offsetRecordWriterMu      sync.RWMutex
 	offsetRecordWriter        func(ConsumerMetadataRecord) error
 	transactionalOffsets      TransactionalOffsetResolver
 
@@ -80,9 +81,9 @@ type TransactionalOffsetResolver interface {
 // SetOffsetRecordWriter installs the cluster-aware __consumer_offsets writer.
 // Standalone coordinators continue to publish through their TopicHandler.
 func (c *Coordinator) SetOffsetRecordWriter(writer func(ConsumerMetadataRecord) error) {
-	c.mu.Lock()
+	c.offsetRecordWriterMu.Lock()
 	c.offsetRecordWriter = writer
-	c.mu.Unlock()
+	c.offsetRecordWriterMu.Unlock()
 }
 
 func (c *Coordinator) SetTransactionalOffsetResolver(resolver TransactionalOffsetResolver) {
@@ -272,7 +273,9 @@ func NewCoordinatorWithRecovery(ctx context.Context, cfg *config.Config, handler
 	if provider, ok := handler.(consumerMetadataMigrationProvider); ok {
 		records, authoritative, err := provider.ConsumerMetadataMigrationRecords()
 		if err != nil {
-			return c, fmt.Errorf("load consumer metadata migration: %w", err)
+			recoveryErr := fmt.Errorf("load consumer metadata migration: %w", err)
+			c.setRecoveryFailure(recoveryErr)
+			return c, recoveryErr
 		}
 		c.migrationRecords = append([]ConsumerMetadataRecord(nil), records...)
 		c.migrationAuthoritative = authoritative

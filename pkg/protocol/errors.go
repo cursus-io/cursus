@@ -62,7 +62,8 @@ func buildErrorRegistry() map[string]ErrorClassification {
 	)
 	register(ErrorClassAvailability, true,
 		"cluster_metadata_unavailable", "cluster_not_available", "coordinator_not_available", "fsm_not_available",
-		"insufficient_in_sync_replicas", "leader_election_result_unavailable", "leader_not_found", "no_raft_leader", "offset_manager_not_available", "replica_offset_gap", "replication_unavailable", "request_cancelled", "router_not_available",
+		"join_group_failed",
+		"insufficient_in_sync_replicas", "leader_election_result_unavailable", "leader_not_found", "no_raft_leader", "offset_manager_not_available", "replica_offset_gap", "replication_unavailable", "request_cancelled", "router_not_available", "topic_materialization_pending",
 		"transaction_abort_marker_failed", "transaction_commit_failed", "transaction_manager_not_available", "transaction_sync_failed",
 		"transaction_offset_materialization_failed", "transaction_offset_prepare_failed",
 	)
@@ -115,7 +116,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"local_processor_not_configured", "marshal_ack_failed", "marshal_brokers_failed", "marshal_cluster_status_failed", "marshal_metadata_failed",
 		"marshal_aggregate_proof_failed", "marshal_aggregate_range_failed", "marshal_snapshot_failed", "marshal_snapshots_failed", "marshal_status_failed", "negotiation_context_required",
 		"no_partitions_available", "offset_sync_failed", "partition_lookup_failed", "raft_apply_failed",
-		"raft_batch_apply_failed", "register_group_failed", "join_group_failed", "replica_append_failed", "replica_index_failed", "replica_index_prepare_failed",
+		"raft_batch_apply_failed", "register_group_failed", "replica_append_failed", "replica_index_failed", "replica_index_prepare_failed",
 		"snapshot_catchup_failed", "snapshot_list_failed", "snapshot_read_failed", "snapshot_replicate_failed",
 		"snapshot_save_failed", "snapshot_store_failed", "stream_index_failed", "topic_create_missing", "truncate_topic_failed",
 		"init_producer_failed", "transaction_abort_failed", "transaction_begin_failed", "transaction_offsets_failed",

@@ -46,7 +46,7 @@ func (c *TCPClusterClient) dialContext(ctx context.Context, address string) (net
 func (c *TCPClusterClient) StartHeartbeat(
 	ctx context.Context,
 	peers []string,
-	nodeID, localAddr string,
+	nodeID, incarnationID, localAddr string,
 	discoveryPort int,
 	proofProvider func() []fsm.ISRCatchupProof,
 ) {
@@ -63,7 +63,7 @@ func (c *TCPClusterClient) StartHeartbeat(
 					proofs = proofProvider()
 				}
 				// sendHeartbeat internal loop uses goroutines now
-				_ = c.sendHeartbeat(ctx, peers, nodeID, localAddr, discoveryPort, proofs)
+				_ = c.sendHeartbeat(ctx, peers, nodeID, incarnationID, localAddr, discoveryPort, proofs)
 			}
 		}
 	}()
@@ -96,7 +96,7 @@ func (c *TCPClusterClient) sendHeartbeatToLeader(ctx context.Context, leaderAddr
 func (c *TCPClusterClient) sendHeartbeat(
 	ctx context.Context,
 	peers []string,
-	nodeID, localAddr string,
+	nodeID, incarnationID, localAddr string,
 	discoveryPort int,
 	proofs []fsm.ISRCatchupProof,
 ) error {
@@ -105,7 +105,7 @@ func (c *TCPClusterClient) sendHeartbeat(
 		apiPort = 8000
 	}
 
-	fields := map[string]string{"node_id": nodeID}
+	fields := map[string]string{"node_id": nodeID, "incarnation_id": incarnationID}
 	if len(proofs) > 0 {
 		body, err := json.Marshal(proofs)
 		if err != nil {

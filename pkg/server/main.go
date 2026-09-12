@@ -134,6 +134,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			ctx,
 			cfg.StaticClusterMembers,
 			brokerID,
+			incarnationID,
 			localAddr,
 			cfg.DiscoveryPort,
 			func() []fsm.ISRCatchupProof {
@@ -274,6 +275,12 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 				return fmt.Errorf("topic materialization state unavailable")
 			}
 			return cc.RaftManager.GetFSM().TopicMaterializationReadinessError()
+		})
+		healthState.AddCheck("replica_materialization", func(context.Context) error {
+			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
+				return fmt.Errorf("replica materialization state unavailable")
+			}
+			return cc.RaftManager.GetFSM().ReplicaMaterializationReadinessError(cc.BrokerID())
 		})
 	}
 

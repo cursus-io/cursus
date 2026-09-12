@@ -162,6 +162,13 @@ func (h *ClusterServer) handleHeartbeatCluster(payload wire.CommandPayload) (any
 	}
 
 	util.Debug("ClusterServer: Received heartbeat from %s", req.NodeID)
+	if validator, ok := h.sd.(interface {
+		ValidateHeartbeat(string, string) error
+	}); ok {
+		if err := validator.ValidateHeartbeat(req.NodeID, req.IncarnationID); err != nil {
+			return nil, internalClusterError(err)
+		}
+	}
 	if err := h.sd.HandleHeartbeat(req.NodeID, req.CatchupProofs); err != nil {
 		return nil, internalClusterError(err)
 	}
@@ -214,6 +221,10 @@ func fitReplicaCatchupBatchToLimit(batch fsm.ReplicaCatchupBatch, limit int) (fs
 		// fitted logical range. Keeping the original EndOffset would skip it.
 		batch.EndOffset = batch.Messages[messageCount].Offset
 		batch.Messages = batch.Messages[:messageCount]
+		batch, err = fsm.SealReplicaCatchupBatch(batch)
+		if err != nil {
+			return fsm.ReplicaCatchupBatch{}, err
+		}
 	}
 }
 

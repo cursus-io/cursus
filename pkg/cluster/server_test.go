@@ -19,6 +19,16 @@ type MockServiceDiscovery struct {
 	mock.Mock
 }
 
+type heartbeatValidatingServiceDiscovery struct {
+	*MockServiceDiscovery
+	validationErr error
+}
+
+func (m *heartbeatValidatingServiceDiscovery) ValidateHeartbeat(nodeID, incarnationID string) error {
+	m.Called(nodeID, incarnationID)
+	return m.validationErr
+}
+
 func (m *MockServiceDiscovery) Register() error   { return m.Called().Error(0) }
 func (m *MockServiceDiscovery) Deregister() error { return m.Called().Error(0) }
 func (m *MockServiceDiscovery) DiscoverBrokers() ([]fsm.BrokerInfo, error) {
@@ -77,9 +87,13 @@ func TestFitReplicaCatchupBatchPreservesFirstUnsentOffset(t *testing.T) {
 			{Offset: 12, Payload: "fourth"},
 		},
 	}
+	batch, err := fsm.SealReplicaCatchupBatch(batch)
+	require.NoError(t, err)
 	expectedPrefix := batch
 	expectedPrefix.EndOffset = 8
 	expectedPrefix.Messages = expectedPrefix.Messages[:2]
+	expectedPrefix, err = fsm.SealReplicaCatchupBatch(expectedPrefix)
+	require.NoError(t, err)
 	encodedPrefix, err := json.Marshal(expectedPrefix)
 	require.NoError(t, err)
 
@@ -186,6 +200,27 @@ func TestClusterServer_HeartbeatCarriesCatchupProofs(t *testing.T) {
 	msd.AssertExpectations(t)
 }
 
+func TestClusterServerRejectsFencedHeartbeatBeforeISRProcessing(t *testing.T) {
+	base := new(MockServiceDiscovery)
+	service := &heartbeatValidatingServiceDiscovery{
+		MockServiceDiscovery: base,
+		validationErr:        fmt.Errorf("broker_heartbeat_fenced"),
+	}
+	service.On("ValidateHeartbeat", "node-hb", "stale-incarnation").Return().Once()
+	server := NewClusterServer(service)
+	listener, err := server.Start("127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	response := clusterRoundTrip(t, listener.Addr().String(), wire.CommandHeartbeatCluster, map[string]string{
+		"node_id": "node-hb", "incarnation_id": "stale-incarnation",
+	})
+	require.Equal(t, wire.StatusError, response.Status)
+	base.AssertNotCalled(t, "HandleHeartbeat", mock.Anything, mock.Anything)
+	base.AssertNotCalled(t, "UpdateHeartbeat", mock.Anything)
+	service.AssertExpectations(t)
+}
+
 func TestClusterServer_FetchesAuthenticatedReplicaCatchupBatch(t *testing.T) {
 	msd := new(MockServiceDiscovery)
 	server := NewClusterServer(msd)
@@ -195,13 +230,15 @@ func TestClusterServer_FetchesAuthenticatedReplicaCatchupBatch(t *testing.T) {
 
 	request := fsm.ReplicaCatchupRequest{
 		Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 1, CommittedHWM: 2,
-		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: 1, MaxRecords: 1,
+		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 4, LifecycleEpoch: 1, MaxRecords: 1,
 	}
 	batch := fsm.ReplicaCatchupBatch{
 		Topic: "orders", Partition: 0, BrokerID: "node-2", StartOffset: 1, CommittedHWM: 2,
-		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: 1,
+		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 4, LifecycleEpoch: 1,
 		Messages: []types.Message{{Offset: 1, Payload: "backfill"}},
 	}
+	batch, err = fsm.SealReplicaCatchupBatch(batch)
+	require.NoError(t, err)
 	msd.On("FetchReplicaCatchup", request).Return(batch, nil).Once()
 	encoded, err := json.Marshal(request)
 	require.NoError(t, err)

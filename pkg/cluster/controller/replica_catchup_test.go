@@ -20,12 +20,13 @@ type recordingCatchupFetcher struct {
 
 func (f *recordingCatchupFetcher) FetchReplicaCatchup(_ context.Context, _ string, _ int, request fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error) {
 	f.requests = append(f.requests, request)
-	return fsm.ReplicaCatchupBatch{
+	return fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
 		Topic: request.Topic, Partition: request.Partition, BrokerID: request.BrokerID,
 		StartOffset: request.NextOffset, CommittedHWM: request.CommittedHWM,
-		Leader: request.Leader, LeaderEpoch: request.LeaderEpoch, LifecycleEpoch: request.LifecycleEpoch,
+		Leader: request.Leader, SourceBroker: request.SourceBroker,
+		LeaderEpoch: request.LeaderEpoch, LifecycleEpoch: request.LifecycleEpoch,
 		Messages: []types.Message{{Offset: request.NextOffset, Payload: "backfill"}},
-	}, nil
+	})
 }
 
 func TestRunReplicaCatchupOnceFetchesUntilCommittedHWM(t *testing.T) {
@@ -78,17 +79,19 @@ func TestRunReplicaCatchupOnceFetchesUntilCommittedHWM(t *testing.T) {
 func TestValidateReplicaCatchupBatchRejectsFenceAndGap(t *testing.T) {
 	request := fsm.ReplicaCatchupRequest{
 		Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 4, CommittedHWM: 6,
-		Leader: "node-1", LeaderEpoch: 3, LifecycleEpoch: 1, MaxRecords: 2,
+		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 3, LifecycleEpoch: 1, MaxRecords: 2,
 	}
 	batch := fsm.ReplicaCatchupBatch{
 		Topic: "orders", Partition: 0, BrokerID: "node-2", StartOffset: 4, CommittedHWM: 6,
-		Leader: "node-1", LeaderEpoch: 3, LifecycleEpoch: 1,
+		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 3, LifecycleEpoch: 1,
 		Messages: []types.Message{{Offset: 4}, {Offset: 5}},
 	}
+	batch, err := fsm.SealReplicaCatchupBatch(batch)
+	require.NoError(t, err)
 	require.NoError(t, validateReplicaCatchupBatch(request, batch))
 	batch.LeaderEpoch++
 	require.ErrorContains(t, validateReplicaCatchupBatch(request, batch), "fence")
 	batch.LeaderEpoch = request.LeaderEpoch
 	batch.Messages[1].Offset = 7
-	require.ErrorContains(t, validateReplicaCatchupBatch(request, batch), "offset")
+	require.ErrorContains(t, validateReplicaCatchupBatch(request, batch), "checksum")
 }

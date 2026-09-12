@@ -318,3 +318,43 @@ func TestDistributedOffsetCommitPreventsConcurrentGroupMapReplacement(t *testing
 		t.Fatal("group map replacement remained blocked after offset commit")
 	}
 }
+
+func TestDistributedOffsetCommitDoesNotRecursivelyReadLockCoordinator(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	c := NewCoordinator(context.Background(), cfg, &DummyPublisher{})
+	t.Cleanup(c.Stop)
+	c.SetOffsetRecordWriter(func(ConsumerMetadataRecord) error { return nil })
+	if err := c.RegisterGroup("events", "workers", 1); err != nil {
+		t.Fatalf("RegisterGroup failed: %v", err)
+	}
+
+	group := c.GetGroup("workers")
+	group.mu.Lock()
+	committed := make(chan error, 1)
+	go func() { committed <- c.CommitOffset("workers", "events", 0, 1) }()
+	// CommitOffset takes c.mu.RLock before waiting for the group lock.
+	time.Sleep(50 * time.Millisecond)
+	writerAcquired := make(chan struct{})
+	go func() {
+		c.mu.Lock()
+		close(writerAcquired)
+		c.mu.Unlock()
+	}()
+	time.Sleep(50 * time.Millisecond)
+	group.mu.Unlock()
+
+	select {
+	case err := <-committed:
+		if err != nil {
+			t.Fatalf("CommitOffset failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CommitOffset deadlocked behind a waiting coordinator writer")
+	}
+	select {
+	case <-writerAcquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("coordinator writer remained blocked after offset commit")
+	}
+}

@@ -91,7 +91,7 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 	// __consumer_offsets topology is ready. The standalone convenience group
 	// must not publish during controller-topic materialization.
 	if ch.Coordinator != nil && !ch.isDistributed() {
-		err := ch.Coordinator.RegisterGroup(topicName, "default-group", len(t.Partitions))
+		err := ch.Coordinator.RegisterGroup(topicName, implicitDefaultGroupName(topicName), len(t.Partitions))
 		if err != nil {
 			util.Warn("Failed to register default group with coordinator: %v", err)
 		}
@@ -393,10 +393,29 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string, contexts ...*ClientCon
 	if !ok || groupName == "" {
 		return "ERROR: missing_group command=REGISTER_GROUP"
 	}
+	distributed := ch.isDistributed()
+	if distributed {
+		coordAddr, isCoord, coordErr := ch.checkCoordinator(groupName)
+		if coordErr != nil {
+			return coordinatorUnavailableResponse
+		}
+		if !isCoord {
+			return notCoordinatorResponse(coordAddr)
+		}
+		if ch.Coordinator == nil {
+			return coordinatorUnavailableResponse
+		}
+	}
 
 	if topicsValue != "" || pattern != "" {
 		var topics []string
 		if pattern != "" {
+			if ch.TopicManager == nil {
+				if distributed {
+					return fmt.Sprintf("ERROR: topic_materialization_pending pattern=%s reason=%q", pattern, "topic manager unavailable")
+				}
+				return fmt.Sprintf("ERROR: invalid_subscription reason=%q", "topic manager unavailable")
+			}
 			matched, err := ch.matchTopicPattern(pattern)
 			if err != nil {
 				return fmt.Sprintf("ERROR: invalid_subscription reason=%q", err.Error())
@@ -407,23 +426,13 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string, contexts ...*ClientCon
 		}
 		partitionCounts := make(map[string]int, len(topics))
 		for _, subscribed := range topics {
-			t := ch.TopicManager.GetTopic(subscribed)
-			if t == nil {
-				return fmt.Sprintf("ERROR: topic_not_found topic=%s", subscribed)
+			partitionCount, admissionErr := ch.groupAdmissionPartitionCount(subscribed)
+			if admissionErr != "" {
+				return admissionErr
 			}
-			partitionCounts[subscribed] = len(t.Partitions)
+			partitionCounts[subscribed] = partitionCount
 		}
-		if ch.isDistributed() {
-			coordAddr, isCoord, coordErr := ch.checkCoordinator(groupName)
-			if coordErr != nil {
-				return coordinatorUnavailableResponse
-			}
-			if !isCoord {
-				return notCoordinatorResponse(coordAddr)
-			}
-			if ch.Coordinator == nil {
-				return "ERROR: coordinator_not_available"
-			}
+		if distributed {
 			if err := ch.Coordinator.RegisterGroupSubscription(groupName, topics, pattern, partitionCounts); err != nil {
 				return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 			}
@@ -437,34 +446,62 @@ func (ch *CommandHandler) handleRegisterGroup(cmd string, contexts ...*ClientCon
 		return fmt.Sprintf("OK group=%s topics=%s pattern=%s registered=true", groupName, strings.Join(topics, ","), pattern)
 	}
 
-	t := ch.TopicManager.GetTopic(topicName)
-	if t == nil {
-		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	partitionCount, admissionErr := ch.groupAdmissionPartitionCount(topicName)
+	if admissionErr != "" {
+		return admissionErr
 	}
 
-	if ch.isDistributed() {
-		coordAddr, isCoord, coordErr := ch.checkCoordinator(groupName)
-		if coordErr != nil {
-			return coordinatorUnavailableResponse
-		}
-		if !isCoord {
-			return notCoordinatorResponse(coordAddr)
-		}
-		if ch.Coordinator == nil {
-			return "ERROR: coordinator_not_available"
-		}
-		if err := ch.Coordinator.RegisterGroup(topicName, groupName, len(t.Partitions)); err != nil {
+	if distributed {
+		if err := ch.Coordinator.RegisterGroup(topicName, groupName, partitionCount); err != nil {
 			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 		}
 		return fmt.Sprintf("OK group=%s topic=%s registered=true", groupName, topicName)
 	}
 	if ch.Coordinator != nil {
-		if err := ch.Coordinator.RegisterGroup(topicName, groupName, len(t.Partitions)); err != nil {
+		if err := ch.Coordinator.RegisterGroup(topicName, groupName, partitionCount); err != nil {
 			return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 		}
 		return fmt.Sprintf("OK group=%s topic=%s registered=true", groupName, topicName)
 	}
 	return "ERROR: coordinator_not_available"
+}
+
+func (ch *CommandHandler) groupAdmissionPartitionCount(topicName string) (int, string) {
+	if !ch.isDistributed() {
+		if ch.TopicManager == nil {
+			return 0, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+		}
+		localTopic := ch.TopicManager.GetTopic(topicName)
+		if localTopic == nil {
+			return 0, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+		}
+		return len(localTopic.Partitions), ""
+	}
+	fsmRef := ch.Cluster.RaftManager.GetFSM()
+	if fsmRef == nil {
+		return 0, coordinatorUnavailableResponse
+	}
+	definition, found := fsmRef.GetTopicDefinition(topicName)
+	if !found {
+		return 0, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+	if ch.TopicManager == nil {
+		return 0, fmt.Sprintf("ERROR: topic_materialization_pending topic=%s reason=%q", topicName, "topic manager unavailable")
+	}
+	localTopic := ch.TopicManager.GetTopic(topicName)
+	if localTopic == nil {
+		return 0, fmt.Sprintf("ERROR: topic_materialization_pending topic=%s reason=%q", topicName, "local topic handler unavailable")
+	}
+	localDefinition := localTopic.Definition()
+	if localDefinition.LifecycleEpoch != definition.LifecycleEpoch || len(localTopic.Partitions) != definition.Partitions {
+		return 0, fmt.Sprintf(
+			"ERROR: topic_materialization_pending topic=%s reason=%q",
+			topicName,
+			fmt.Sprintf("local definition mismatch: local_epoch=%d authoritative_epoch=%d local_partitions=%d authoritative_partitions=%d",
+				localDefinition.LifecycleEpoch, definition.LifecycleEpoch, len(localTopic.Partitions), definition.Partitions),
+		)
+	}
+	return definition.Partitions, ""
 }
 
 // handleJoinGroup processes JOIN_GROUP command
@@ -538,6 +575,9 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 
 	var assignments []int
 	if ch.isDistributed() {
+		if ch.Coordinator == nil {
+			return coordinatorUnavailableResponse
+		}
 		// Group creation belongs to the selected offsets-partition leader.  Do
 		// it only after checkCoordinator has established durable ownership; the
 		// old CREATE-topic convenience registration could publish before the
@@ -553,7 +593,7 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 		}
 		assignments, err = ch.Coordinator.AddConsumer(groupName, consumerID)
 		if err != nil {
-			return fmt.Sprintf("ERROR: join_group_failed reason=%q", err.Error())
+			return fmt.Sprintf("ERROR: coordinator_not_available reason=%q", err.Error())
 		}
 	} else {
 		if ch.Coordinator != nil {

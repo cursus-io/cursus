@@ -804,6 +804,9 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 	info.TransactionCoordinatorShards = 0
 
 	f.mu.Lock()
+	if f.retiredBrokerIncarnations == nil {
+		f.retiredBrokerIncarnations = make(map[string]map[string]struct{})
+	}
 	if shardCount != f.configuredTransactionCoordinatorShardCount {
 		configuredShardCount := f.configuredTransactionCoordinatorShardCount
 		f.mu.Unlock()
@@ -828,7 +831,17 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 			info.IncarnationID = previous.IncarnationID
 			info.IncarnationEpoch = previous.IncarnationEpoch
 		} else if info.IncarnationID != previous.IncarnationID {
+			if brokerIncarnationRetired(f.retiredBrokerIncarnations[info.ID], info.IncarnationID) {
+				f.mu.Unlock()
+				return fmt.Errorf("broker_registration_fenced broker=%s reason=retired_incarnation incarnation_id=%s", info.ID, info.IncarnationID)
+			}
 			info.IncarnationEpoch = previous.IncarnationEpoch + 1
+			if previous.IncarnationID != "" {
+				if f.retiredBrokerIncarnations[info.ID] == nil {
+					f.retiredBrokerIncarnations[info.ID] = make(map[string]struct{})
+				}
+				f.retiredBrokerIncarnations[info.ID][previous.IncarnationID] = struct{}{}
+			}
 		} else if info.IncarnationEpoch < previous.IncarnationEpoch {
 			info.IncarnationEpoch = previous.IncarnationEpoch
 		}
@@ -856,7 +869,9 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 
 func (f *BrokerFSM) applyDeregisterCommand(jsonData string) interface{} {
 	var info struct {
-		ID string `json:"id"`
+		ID               string `json:"id"`
+		IncarnationID    string `json:"incarnation_id,omitempty"`
+		IncarnationEpoch uint64 `json:"incarnation_epoch,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(jsonData), &info); err != nil {
 		util.Error("FSM: Failed to unmarshal deregistration: %v", err)
@@ -865,6 +880,10 @@ func (f *BrokerFSM) applyDeregisterCommand(jsonData string) interface{} {
 
 	f.mu.Lock()
 	if b, ok := f.brokers[info.ID]; ok {
+		if b.IncarnationID != "" && (info.IncarnationID != b.IncarnationID || info.IncarnationEpoch != b.IncarnationEpoch) {
+			f.mu.Unlock()
+			return fmt.Errorf("broker_deregistration_fenced broker=%s expected_incarnation=%s expected_epoch=%d", info.ID, b.IncarnationID, b.IncarnationEpoch)
+		}
 		b.Status = "inactive"
 		util.Info("FSM: Member %s marked as inactive", info.ID)
 	}
@@ -874,6 +893,11 @@ func (f *BrokerFSM) applyDeregisterCommand(jsonData string) interface{} {
 		f.notifyTransactionCoordinatorChange(changed)
 	}
 	return nil
+}
+
+func brokerIncarnationRetired(retired map[string]struct{}, incarnationID string) bool {
+	_, exists := retired[incarnationID]
+	return exists
 }
 
 func (f *BrokerFSM) handleUnknownCommand(data string) interface{} {

@@ -219,6 +219,54 @@ func TestBrokerFSMRegistrationAdvancesEpochAndFencesPreviousIncarnation(t *testi
 	}
 }
 
+func TestBrokerFSMRejectsSupersededIncarnationRegistration(t *testing.T) {
+	state := NewBrokerFSM(nil, nil)
+	for index, incarnationID := range []string{"first", "second"} {
+		result := state.Apply(&raft.Log{
+			Index: uint64(index + 1),
+			Data:  []byte(fmt.Sprintf(`REGISTER:{"id":"broker-1","addr":"localhost:9001","status":"active","incarnation_id":%q}`, incarnationID)),
+		})
+		require.Nil(t, result)
+	}
+
+	result := state.Apply(&raft.Log{Index: 3, Data: []byte(`REGISTER:{"id":"broker-1","addr":"localhost:9001","status":"active","incarnation_id":"first"}`)})
+	require.ErrorContains(t, result.(error), "broker_registration_fenced")
+	broker := state.GetBroker("broker-1")
+	require.Equal(t, "second", broker.IncarnationID)
+	require.Equal(t, uint64(2), broker.IncarnationEpoch)
+}
+
+func TestBrokerFSMSnapshotPreservesRetiredIncarnations(t *testing.T) {
+	state := NewBrokerFSM(nil, nil)
+	require.Nil(t, state.Apply(&raft.Log{Index: 1, Data: []byte(`REGISTER:{"id":"broker-1","addr":"localhost:9001","status":"active","incarnation_id":"first"}`)}))
+	require.Nil(t, state.Apply(&raft.Log{Index: 2, Data: []byte(`REGISTER:{"id":"broker-1","addr":"localhost:9001","status":"active","incarnation_id":"second"}`)}))
+
+	snapshot, err := state.Snapshot()
+	require.NoError(t, err)
+	buf := new(bytes.Buffer)
+	require.NoError(t, snapshot.Persist(&MockSnapshotSink{Writer: buf}))
+	restored := NewBrokerFSM(nil, nil)
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))))
+
+	result := restored.Apply(&raft.Log{Index: 3, Data: []byte(`REGISTER:{"id":"broker-1","addr":"localhost:9001","status":"active","incarnation_id":"first"}`)})
+	require.ErrorContains(t, result.(error), "retired_incarnation")
+	require.Equal(t, "second", restored.GetBroker("broker-1").IncarnationID)
+}
+
+func TestBrokerFSMDeregisterFencesPreviousIncarnation(t *testing.T) {
+	state := NewBrokerFSM(nil, nil)
+	require.Nil(t, state.Apply(&raft.Log{Index: 1, Data: []byte(`REGISTER:{"id":"broker-1","addr":"localhost:9001","status":"active","incarnation_id":"first"}`)}))
+	require.Nil(t, state.Apply(&raft.Log{Index: 2, Data: []byte(`REGISTER:{"id":"broker-1","addr":"localhost:9001","status":"active","incarnation_id":"second"}`)}))
+
+	result := state.Apply(&raft.Log{Index: 3, Data: []byte(`DEREGISTER:{"id":"broker-1","incarnation_id":"first","incarnation_epoch":1}`)})
+	require.ErrorContains(t, result.(error), "broker_deregistration_fenced")
+	require.Equal(t, "active", state.GetBroker("broker-1").Status)
+
+	result = state.Apply(&raft.Log{Index: 4, Data: []byte(`DEREGISTER:{"id":"broker-1","incarnation_id":"second","incarnation_epoch":2}`)})
+	require.Nil(t, result)
+	require.Equal(t, "inactive", state.GetBroker("broker-1").Status)
+}
+
 func TestBrokerFSMRejectsLegacyRegistrationAfterIncarnationUpgrade(t *testing.T) {
 	state := NewBrokerFSM(nil, nil)
 	if result := state.Apply(&raft.Log{Index: 1, Data: []byte(`REGISTER:{"id":"broker-1","addr":"localhost:9001","status":"active","incarnation_id":"current"}`)}); result != nil {

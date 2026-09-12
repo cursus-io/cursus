@@ -365,11 +365,15 @@ func (ch *CommandHandler) getTopicAndPartition(topicName string, partitionID int
 	return t, p, nil
 }
 
-func (ch *CommandHandler) resolveConsumerGroup(groupName string) string {
+func (ch *CommandHandler) resolveConsumerGroup(groupName, topicName string) string {
 	if groupName == "" || groupName == "-" {
-		return "default-group"
+		return implicitDefaultGroupName(topicName)
 	}
 	return groupName
+}
+
+func implicitDefaultGroupName(topicName string) string {
+	return "default-group@" + topicName
 }
 
 type CommonArgs struct {
@@ -425,7 +429,7 @@ func (ch *CommandHandler) parseCommonArgs(args map[string]string) (CommonArgs, e
 	return CommonArgs{
 		TopicName:       args["topic"],
 		PartitionID:     pID,
-		GroupName:       ch.resolveConsumerGroup(args["group"]),
+		GroupName:       ch.resolveConsumerGroup(args["group"], args["topic"]),
 		MemberID:        args["member"],
 		Generation:      gen,
 		HasOffset:       hasOffsetKey && offsetStr != "",

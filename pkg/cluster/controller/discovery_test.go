@@ -188,6 +188,7 @@ func TestServiceDiscovery_NodeOperations(t *testing.T) {
 	t.Run("AddNode - Success", func(t *testing.T) {
 		rm.isLeader = true
 		rm.On("GetLeaderAddress").Return("localhost:9001").Once()
+		rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: raft.Configuration{}}).Once()
 		rm.On("AddVoter", "node2", "localhost:9002").Return(nil).Once()
 		rm.On("ApplyCommand", "REGISTER", mock.Anything).Return(nil).Once()
 
@@ -216,6 +217,43 @@ func TestServiceDiscovery_NodeOperations(t *testing.T) {
 		assert.Equal(t, "inactive", brokers[0].Status)
 		rm.AssertExpectations(t)
 	})
+}
+
+func TestServiceDiscoveryExistingVoterJoinIsMembershipNoOp(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	rm.On("GetLeaderAddress").Return("leader:9001").Once()
+	rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: raft.Configuration{Servers: []raft.Server{
+		{ID: "node2", Address: "localhost:9002", Suffrage: raft.Voter},
+	}}}).Once()
+
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	leader, err := sd.AddNodeWithTransactionCoordinatorShards("node2", "localhost:9002", 0)
+
+	assert.NoError(t, err)
+	assert.Equal(t, "leader:9001", leader)
+	rm.AssertNotCalled(t, "AddVoter", mock.Anything, mock.Anything)
+	rm.AssertNotCalled(t, "ApplyCommand", "REGISTER", mock.Anything)
+	rm.AssertExpectations(t)
+}
+
+func TestServiceDiscoveryExistingVoterJoinRejectsAddressChange(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	rm.On("GetLeaderAddress").Return("leader:9001").Once()
+	rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: raft.Configuration{Servers: []raft.Server{
+		{ID: "node2", Address: "localhost:9002", Suffrage: raft.Voter},
+	}}}).Once()
+
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	_, err := sd.AddNodeWithTransactionCoordinatorShards("node2", "localhost:9999", 0)
+
+	assert.ErrorContains(t, err, "already belongs to raft")
+	rm.AssertNotCalled(t, "AddVoter", mock.Anything, mock.Anything)
+	rm.AssertNotCalled(t, "ApplyCommand", "REGISTER", mock.Anything)
+	rm.AssertExpectations(t)
 }
 
 func TestServiceDiscoveryRejectsMismatchedTransactionCoordinatorShardCountBeforeAddingVoter(t *testing.T) {
@@ -329,7 +367,7 @@ func TestServiceDiscoveryRejectsFencedHeartbeat(t *testing.T) {
 	rm.isLeader = true
 	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
 	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node2","addr":"localhost:9002","status":"inactive","incarnation_id":"current","incarnation_epoch":2}`)})
-	rm.On("GetISRManager").Return(nil).Twice()
+	rm.On("GetISRManager").Return(nil).Once()
 	rm.On("ApplyCommand", "REGISTER", mock.Anything).Return(nil).Once()
 
 	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/stretchr/testify/assert"
 )
@@ -229,25 +230,49 @@ func TestStartHeartbeat(t *testing.T) {
 	var port int
 	_, _ = fmt.Sscanf(portStr, "%d", &port)
 
-	received := make(chan bool, 1)
+	received := make(chan wire.CommandPayload, 1)
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
 		defer func() { _ = conn.Close() }()
-		received <- true
+		connection, err := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
+		if err != nil {
+			return
+		}
+		request, err := connection.ReadFrame()
+		if err != nil {
+			return
+		}
+		payload, err := wire.DecodeCommandPayload(request.Payload)
+		if err != nil {
+			return
+		}
+		received <- payload
+		response, _ := json.Marshal(map[string]bool{"success": true})
+		_ = connection.WriteFrame(wire.Frame{
+			Kind: wire.KindResponse, Command: request.Command, Status: wire.StatusOK,
+			RequestID: request.RequestID, Payload: response,
+		})
 	}()
 
 	client := NewTCPClusterClient()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	client.StartHeartbeat(ctx, nil, "node-hb", addr, port, nil)
+	proof := fsm.ISRCatchupProof{Topic: "orders", Partition: 0, BrokerID: "node-hb"}
+	client.StartHeartbeat(ctx, nil, "node-hb", "process-2", addr, port, func() []fsm.ISRCatchupProof {
+		return []fsm.ISRCatchupProof{proof}
+	})
 
 	select {
-	case <-received:
-		// Success
+	case payload := <-received:
+		assert.Equal(t, "node-hb", payload.Fields["node_id"])
+		assert.Equal(t, "process-2", payload.Fields["incarnation_id"])
+		var proofs []fsm.ISRCatchupProof
+		assert.NoError(t, json.Unmarshal([]byte(payload.Fields["catchup_proofs"]), &proofs))
+		assert.Equal(t, []fsm.ISRCatchupProof{proof}, proofs)
 	case <-time.After(3 * time.Second):
 		t.Fatal("Heartbeat not received")
 	}

@@ -108,9 +108,9 @@ func TestIsAuthorizedForPartition_NonDistributed(t *testing.T) {
 func TestResolveConsumerGroup(t *testing.T) {
 	ch, _ := newTestHandler(t)
 
-	assert.Equal(t, "default-group", ch.resolveConsumerGroup(""))
-	assert.Equal(t, "default-group", ch.resolveConsumerGroup("-"))
-	assert.Equal(t, "my-group", ch.resolveConsumerGroup("my-group"))
+	assert.Equal(t, "default-group@orders", ch.resolveConsumerGroup("", "orders"))
+	assert.Equal(t, "default-group@payments", ch.resolveConsumerGroup("-", "payments"))
+	assert.Equal(t, "my-group", ch.resolveConsumerGroup("my-group", "orders"))
 }
 
 func TestErrorResponse(t *testing.T) {
@@ -215,7 +215,7 @@ func TestParseCommonArgs(t *testing.T) {
 			"topic": "t1", "partition": "0",
 		})
 		require.NoError(t, err)
-		assert.Equal(t, "default-group", args.GroupName)
+		assert.Equal(t, "default-group@t1", args.GroupName)
 		assert.Equal(t, -1, args.Generation)
 		assert.False(t, args.HasOffset)
 		assert.Equal(t, DefaultMaxPollRecords, args.BatchSize)
@@ -251,7 +251,7 @@ func TestParseCommonArgs(t *testing.T) {
 			"topic": "t1", "partition": "0", "group": "-",
 		})
 		require.NoError(t, err)
-		assert.Equal(t, "default-group", args.GroupName)
+		assert.Equal(t, "default-group@t1", args.GroupName)
 	})
 }
 
@@ -1087,13 +1087,19 @@ func TestHandleBatchCommit_StaleGeneration(t *testing.T) {
 	assert.Contains(t, resp, "GEN_MISMATCH")
 }
 
-func TestHandleCreate_WithCoordinatorDefaultGroup(t *testing.T) {
-	ch, _, _ := newTestHandlerWithCoordinator(t)
+func TestHandleCreate_WithTopicScopedCoordinatorDefaultGroups(t *testing.T) {
+	ch, _, coord := newTestHandlerWithCoordinator(t)
 	ctx := NewClientContext("", 0)
 
 	resp := ch.HandleCommand("CREATE topic=coord-topic partitions=2", ctx)
 	assert.Contains(t, resp, "coord-topic")
 	assert.Contains(t, resp, "partitions=2")
+	resp = ch.HandleCommand("CREATE topic=next-topic partitions=1", ctx)
+	assert.Contains(t, resp, "next-topic")
+	require.NotNil(t, coord.GetGroup("default-group@coord-topic"))
+	require.NotNil(t, coord.GetGroup("default-group@next-topic"))
+	require.Equal(t, "coord-topic", coord.GetGroup("default-group@coord-topic").TopicName)
+	require.Equal(t, "next-topic", coord.GetGroup("default-group@next-topic").TopicName)
 }
 
 func TestHandleDelete_WithTopic(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,6 +62,7 @@ type BrokerFSMState struct {
 	Applied                          uint64                                         `json:"applied"`
 	Logs                             map[uint64]*ReplicationEntry                   `json:"logs"`
 	Brokers                          map[string]*BrokerInfo                         `json:"brokers"`
+	RetiredBrokerIncarnations        map[string][]string                            `json:"retiredBrokerIncarnations,omitempty"`
 	PartitionMetadata                map[string]*PartitionMetadata                  `json:"partitionMetadata"`
 	ProducerState                    map[string]map[int]map[string]ProducerSequence `json:"producerState"`
 	GroupState                       map[string]*coordinator.GroupStateSnapshot     `json:"groupState,omitempty"`
@@ -76,12 +78,13 @@ type BrokerFSM struct {
 	transitionMu      sync.Mutex
 	materializationMu sync.Mutex
 
-	logs                     map[uint64]*ReplicationEntry
-	brokers                  map[string]*BrokerInfo
-	partitionMetadata        map[string]*PartitionMetadata
-	producerState            map[string]map[int]map[string]ProducerSequence // Topic -> Partition -> ProducerID -> Last Epoch/Seq
-	applied                  uint64
-	partitionRecoveryPending bool
+	logs                      map[uint64]*ReplicationEntry
+	brokers                   map[string]*BrokerInfo
+	retiredBrokerIncarnations map[string]map[string]struct{}
+	partitionMetadata         map[string]*PartitionMetadata
+	producerState             map[string]map[int]map[string]ProducerSequence // Topic -> Partition -> ProducerID -> Last Epoch/Seq
+	applied                   uint64
+	partitionRecoveryPending  bool
 
 	tm                                         *topic.TopicManager
 	cd                                         *coordinator.Coordinator
@@ -94,6 +97,7 @@ type BrokerFSM struct {
 	topicState                                 map[string]*topic.Definition
 	topicMaterialization                       map[string]TopicMaterializationIssue
 	topicMaterializationRuns                   map[string]TopicMaterializationAttempts
+	replicaMaterialization                     map[string]ReplicaMaterializationIssue
 }
 
 func NewBrokerFSM(tm *topic.TopicManager, cd *coordinator.Coordinator) *BrokerFSM {
@@ -108,11 +112,13 @@ func NewBrokerFSMWithTransactionCoordinatorShards(tm *topic.TopicManager, cd *co
 		notifiers:                    make(map[string]chan interface{}),
 		logs:                         make(map[uint64]*ReplicationEntry),
 		brokers:                      make(map[string]*BrokerInfo),
+		retiredBrokerIncarnations:    make(map[string]map[string]struct{}),
 		partitionMetadata:            make(map[string]*PartitionMetadata),
 		producerState:                make(map[string]map[int]map[string]ProducerSequence),
 		topicState:                   make(map[string]*topic.Definition),
 		topicMaterialization:         make(map[string]TopicMaterializationIssue),
 		topicMaterializationRuns:     make(map[string]TopicMaterializationAttempts),
+		replicaMaterialization:       make(map[string]ReplicaMaterializationIssue),
 		transactionCoordinatorShards: make(map[int]TransactionCoordinatorShard),
 		configuredTransactionCoordinatorShardCount: shardCount,
 		transactionCoordinatorChanges:              make(chan []int, 1),
@@ -343,6 +349,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 
 	f.logs = state.Logs
 	f.brokers = state.Brokers
+	f.retiredBrokerIncarnations = importRetiredBrokerIncarnations(state.RetiredBrokerIncarnations)
 	f.partitionMetadata = state.PartitionMetadata
 	f.topicState = restoredTopicState
 	f.transactionCoordinatorShardCount = persistedShardCount
@@ -352,6 +359,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	}
 	f.reconcileTransactionCoordinatorShardsLocked()
 	f.topicMaterialization = make(map[string]TopicMaterializationIssue, len(restoredTopicState))
+	f.replicaMaterialization = make(map[string]ReplicaMaterializationIssue)
 	now := time.Now()
 	for name := range restoredTopicState {
 		f.topicMaterialization[name] = TopicMaterializationIssue{
@@ -404,6 +412,9 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	}
 	if f.brokers == nil {
 		f.brokers = make(map[string]*BrokerInfo)
+	}
+	if f.retiredBrokerIncarnations == nil {
+		f.retiredBrokerIncarnations = make(map[string]map[string]struct{})
 	}
 	if f.partitionMetadata == nil {
 		f.partitionMetadata = make(map[string]*PartitionMetadata)
@@ -610,6 +621,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		brokerCopy := *v
 		brokersCopy[k] = &brokerCopy
 	}
+	retiredBrokerIncarnationsCopy := exportRetiredBrokerIncarnations(f.retiredBrokerIncarnations)
 	metadataCopy := make(map[string]*PartitionMetadata, len(f.partitionMetadata))
 	for k, v := range f.partitionMetadata {
 		if !v.CommittedHWMKnown {
@@ -667,6 +679,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		applied:                          f.applied,
 		logs:                             logsCopy,
 		brokers:                          brokersCopy,
+		retiredBrokerIncarnations:        retiredBrokerIncarnationsCopy,
 		partitionMetadata:                metadataCopy,
 		producerState:                    producerStateCopy,
 		groupState:                       groupState,
@@ -710,6 +723,33 @@ func (f *BrokerFSM) GetBroker(id string) *BrokerInfo {
 		return &copy
 	}
 	return nil
+}
+
+func importRetiredBrokerIncarnations(records map[string][]string) map[string]map[string]struct{} {
+	result := make(map[string]map[string]struct{}, len(records))
+	for brokerID, incarnationIDs := range records {
+		for _, incarnationID := range incarnationIDs {
+			if incarnationID == "" {
+				continue
+			}
+			if result[brokerID] == nil {
+				result[brokerID] = make(map[string]struct{})
+			}
+			result[brokerID][incarnationID] = struct{}{}
+		}
+	}
+	return result
+}
+
+func exportRetiredBrokerIncarnations(records map[string]map[string]struct{}) map[string][]string {
+	result := make(map[string][]string, len(records))
+	for brokerID, incarnationIDs := range records {
+		for incarnationID := range incarnationIDs {
+			result[brokerID] = append(result[brokerID], incarnationID)
+		}
+		sort.Strings(result[brokerID])
+	}
+	return result
 }
 
 func (f *BrokerFSM) RegisterNotifier(reqID string) chan interface{} {

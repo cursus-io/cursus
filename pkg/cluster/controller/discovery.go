@@ -11,6 +11,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/util"
 	"github.com/google/uuid"
+	"github.com/hashicorp/raft"
 )
 
 type ServiceDiscovery interface {
@@ -92,8 +93,17 @@ func (sd *serviceDiscovery) Register() error {
 }
 
 func (sd *serviceDiscovery) Deregister() error {
-	payload := map[string]string{"id": sd.brokerID}
-	data, err := json.Marshal(payload)
+	if sd.fsm == nil {
+		return fmt.Errorf("broker_deregistration_fenced broker=%s reason=fsm_unavailable", sd.brokerID)
+	}
+	broker := sd.fsm.GetBroker(sd.brokerID)
+	if broker == nil {
+		return fmt.Errorf("broker_deregistration_fenced broker=%s reason=registration_not_found", sd.brokerID)
+	}
+	if broker.IncarnationID != "" && broker.IncarnationID != sd.incarnationID {
+		return fmt.Errorf("broker_deregistration_fenced broker=%s reason=incarnation_mismatch", sd.brokerID)
+	}
+	data, err := marshalBrokerDeregistration(broker)
 	if err != nil {
 		util.Error("Failed to marshal payload: %v", err)
 		return fmt.Errorf("marshal payload: %w", err)
@@ -116,13 +126,35 @@ func (sd *serviceDiscovery) UpdateHeartbeat(nodeID string) {
 	sd.UpdateHeartbeatWithIncarnation(nodeID, "")
 }
 
+// ValidateHeartbeat rejects stale broker processes before they can refresh ISR
+// liveness or submit catch-up proofs.
+func (sd *serviceDiscovery) ValidateHeartbeat(nodeID, incarnationID string) error {
+	if sd.rm == nil || !sd.rm.IsLeader() || sd.fsm == nil {
+		return nil
+	}
+	broker := sd.fsm.GetBroker(nodeID)
+	if broker == nil {
+		return fmt.Errorf("broker_heartbeat_fenced broker=%s reason=registration_not_found", nodeID)
+	}
+	if broker.IncarnationID != "" && incarnationID != broker.IncarnationID {
+		return fmt.Errorf("broker_heartbeat_fenced broker=%s reason=incarnation_mismatch", nodeID)
+	}
+	return nil
+}
+
 // UpdateHeartbeatWithIncarnation accepts liveness only on the Raft leader.
 // Followers must not create a second membership view from their local socket
 // observations. The resulting active/inactive transition is still committed
 // through Raft before it becomes visible to coordinator routing.
 func (sd *serviceDiscovery) UpdateHeartbeatWithIncarnation(nodeID, incarnationID string) {
-	if sd.rm != nil && sd.rm.GetISRManager() != nil {
-		sd.rm.GetISRManager().UpdateHeartbeat(nodeID)
+	if err := sd.ValidateHeartbeat(nodeID, incarnationID); err != nil {
+		util.Warn("Ignoring fenced heartbeat from broker %s: %v", nodeID, err)
+		return
+	}
+	if sd.rm != nil {
+		if manager := sd.rm.GetISRManager(); manager != nil {
+			manager.UpdateHeartbeat(nodeID)
+		}
 	}
 	if sd.rm == nil || !sd.rm.IsLeader() || sd.fsm == nil {
 		return
@@ -157,7 +189,6 @@ func (sd *serviceDiscovery) HandleHeartbeat(nodeID string, proofs []fsm.ISRCatch
 		return nil
 	}
 	manager := sd.rm.GetISRManager()
-	manager.UpdateHeartbeat(nodeID)
 	return manager.SubmitCatchupProofs(nodeID, proofs)
 }
 
@@ -169,8 +200,12 @@ func (sd *serviceDiscovery) FetchReplicaCatchup(request fsm.ReplicaCatchupReques
 	if metadata == nil {
 		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("partition metadata not found")
 	}
-	if metadata.Leader != sd.brokerID {
-		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("broker %s is not partition leader; current leader is %s", sd.brokerID, metadata.Leader)
+	sourceBroker := request.SourceBroker
+	if sourceBroker == "" {
+		sourceBroker = request.Leader
+	}
+	if sourceBroker != sd.brokerID {
+		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("broker %s is not selected catch-up source %s", sd.brokerID, sourceBroker)
 	}
 	return sd.fsm.FetchReplicaCatchup(request)
 }
@@ -190,6 +225,19 @@ func (sd *serviceDiscovery) AddNodeWithTransactionCoordinatorShards(nodeID strin
 	}
 	if shardCount != clusterShardCount {
 		return leaderAddr, fmt.Errorf("transaction coordinator shard count mismatch: broker=%s configured=%d cluster=%d", nodeID, shardCount, clusterShardCount)
+	}
+	future := sd.rm.GetConfiguration()
+	if err := future.Error(); err != nil {
+		return leaderAddr, fmt.Errorf("get raft configuration: %w", err)
+	}
+	for _, server := range future.Configuration().Servers {
+		if string(server.ID) != nodeID || server.Suffrage != raft.Voter {
+			continue
+		}
+		if string(server.Address) != addr {
+			return leaderAddr, fmt.Errorf("broker %s already belongs to raft at %s, not %s", nodeID, server.Address, addr)
+		}
+		return leaderAddr, nil
 	}
 
 	if err := sd.rm.AddVoter(nodeID, addr); err != nil {
@@ -236,8 +284,7 @@ func (sd *serviceDiscovery) RemoveNode(nodeID string) (string, error) {
 		return leaderAddr, err
 	}
 
-	payload := map[string]string{"id": nodeID}
-	data, err := json.Marshal(payload)
+	data, err := marshalBrokerDeregistration(sd.fsm.GetBroker(nodeID))
 	if err != nil {
 		util.Error("Failed to marshal payload: %v", err)
 		return leaderAddr, fmt.Errorf("marshal payload: %w", err)
@@ -320,8 +367,7 @@ func (sd *serviceDiscovery) Reconcile() {
 		fsmMap[b.ID] = true
 		if b.Status == "active" && !sd.brokerAlive(b.ID) {
 			util.Warn("Broker %s heartbeat expired; marking inactive", b.ID)
-			payload := map[string]string{"id": b.ID}
-			data, err := json.Marshal(payload)
+			data, err := marshalBrokerDeregistration(&b)
 			if err == nil {
 				if err := sd.rm.ApplyCommand("DEREGISTER", data); err != nil {
 					util.Error("Failed to mark broker %s inactive: %v", b.ID, err)
@@ -331,8 +377,7 @@ func (sd *serviceDiscovery) Reconcile() {
 		}
 		if _, exists := raftMap[b.ID]; !exists {
 			util.Warn("Node %s found in FSM but missing in Raft. Cleaning up...", b.ID)
-			payload := map[string]string{"id": b.ID}
-			data, err := json.Marshal(payload)
+			data, err := marshalBrokerDeregistration(&b)
 			if err != nil {
 				util.Error("Failed to marshal payload: %v", err)
 				continue
@@ -390,4 +435,20 @@ func (sd *serviceDiscovery) brokerAlive(brokerID string) bool {
 	}
 	lastSeen, ok := sd.lastSeen[brokerID]
 	return ok && time.Since(lastSeen) <= sd.heartbeatTimeout
+}
+
+func marshalBrokerDeregistration(broker *fsm.BrokerInfo) ([]byte, error) {
+	if broker == nil || broker.ID == "" {
+		return nil, fmt.Errorf("broker deregistration requires current broker metadata")
+	}
+	payload := struct {
+		ID               string `json:"id"`
+		IncarnationID    string `json:"incarnation_id,omitempty"`
+		IncarnationEpoch uint64 `json:"incarnation_epoch,omitempty"`
+	}{
+		ID:               broker.ID,
+		IncarnationID:    broker.IncarnationID,
+		IncarnationEpoch: broker.IncarnationEpoch,
+	}
+	return json.Marshal(payload)
 }

@@ -16,6 +16,12 @@ func TestRetryClassificationIncludesOnlyIdempotentPublish(t *testing.T) {
 	if !isIdempotent("FETCH_OFFSET topic=orders partition=0 group=workers") {
 		t.Fatal("read-only offset fetch must remain retryable")
 	}
+	if !isIdempotent("CREATE topic=orders partitions=1 idempotent=true") {
+		t.Fatal("idempotent topic creation must be safe to retry after an ambiguous response")
+	}
+	if isIdempotent("CREATE topic=orders partitions=1 idempotent=false") {
+		t.Fatal("non-idempotent topic creation must not be retried after an ambiguous response")
+	}
 }
 
 func TestRetryableBrokerErrorsRequireIdempotentCommands(t *testing.T) {
