@@ -229,7 +229,23 @@ func (bc *BrokerClient) SendCommand(cmdTopic, cmdPayload string, readTimeout tim
 }
 
 func shouldRetryBrokerError(cmdPayload string, brokerErr *wire.BrokerError) bool {
-	return brokerErr != nil && brokerErr.Retryable && isIdempotent(cmdPayload)
+	if brokerErr == nil || !brokerErr.Retryable {
+		return false
+	}
+	if isIdempotent(cmdPayload) {
+		return true
+	}
+
+	command, _, err := wire.ParseCommandText(cmdPayload)
+	if err != nil || command != wire.CommandJoinGroup {
+		return false
+	}
+	// JOIN_GROUP appends a random suffix before persisting the member, so an
+	// ambiguous transport failure must never be replayed. These two explicit
+	// responses are emitted before member creation. A coordinator error carrying
+	// a reason can originate from the durable AddConsumer step and stays fenced.
+	return brokerErr.Code == "topic_materialization_pending" ||
+		(brokerErr.Code == "coordinator_not_available" && brokerErr.Fields["reason"] == "")
 }
 
 func notCoordinatorAddr(brokerErr *wire.BrokerError) (string, bool) {
@@ -358,7 +374,10 @@ func isIdempotent(payload string) bool {
 		wire.CommandGroupStatus, wire.CommandHelp, wire.CommandConsume:
 		return true
 	case wire.CommandCreate:
-		return strings.EqualFold(request.Fields["idempotent"], "true")
+		// The idempotent field configures producer semantics for the topic; it is
+		// not an idempotency key for CREATE. Replaying the same definition patch is
+		// a no-op (or a deterministic conflict), so every CREATE payload is safe.
+		return true
 	case wire.CommandPublish:
 		return strings.EqualFold(request.Fields["isIdempotent"], "true")
 	default:

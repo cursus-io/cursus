@@ -118,6 +118,9 @@ type TopicConfigCommand struct {
 }
 
 func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
+	// Runtime coordinator and transaction references are validated before the
+	// command is submitted. Raft replay must use committed FSM state only:
+	// those runtimes may already contain records written after this command.
 	var topicCmd TopicCommand
 	decoder := json.NewDecoder(strings.NewReader(jsonData))
 	decoder.DisallowUnknownFields()
@@ -154,22 +157,6 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		stagedPartitions := copyPartitionMetadataState(f.partitionMetadata)
 		currentPartitions := 0
 		currentTopic := stagedTopics[topicName]
-		if currentTopic == nil {
-			if f.cd != nil {
-				if references := f.cd.TopicGroupReferences(topicName); len(references) != 0 {
-					return fmt.Errorf("topic %q lifecycle cleanup is pending for consumer group %q", topicName, references[0].Name)
-				}
-			}
-			if f.txn != nil {
-				_, affected, stateErr := f.txn.StateWithoutTopicReferences(topicName)
-				if stateErr != nil {
-					return fmt.Errorf("topic %q lifecycle cleanup is pending: %w", topicName, stateErr)
-				}
-				if len(affected) != 0 {
-					return fmt.Errorf("topic %q lifecycle cleanup is pending for transaction %q", topicName, affected[0])
-				}
-			}
-		}
 
 		definition := base
 		if currentTopic != nil {
@@ -410,29 +397,9 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 			found = true
 		}
 	}
-	coordinatorRef := f.cd
-	transactionManager := f.txn
 	f.mu.RUnlock()
 	if !found && !payload.IfExists {
 		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
-	}
-	if coordinatorRef != nil {
-		for _, reference := range coordinatorRef.TopicGroupReferences(payload.Topic) {
-			if reference.MemberCount != 0 {
-				return fmt.Errorf(
-					"%w: topic %q has active consumer group %q with %d member(s)",
-					topic.ErrTopicDeleteBlocked,
-					payload.Topic,
-					reference.Name,
-					reference.MemberCount,
-				)
-			}
-		}
-	}
-	if transactionManager != nil {
-		if _, _, err := transactionManager.StateWithoutTopicReferences(payload.Topic); err != nil {
-			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
-		}
 	}
 	f.mu.Lock()
 	for key := range f.partitionMetadata {
@@ -475,8 +442,6 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 
 	f.mu.RLock()
 	current := copyTopicDefinition(f.topicState[payload.Topic])
-	coordinatorRef := f.cd
-	transactionManager := f.txn
 	for _, broker := range f.brokers {
 		if broker.Status == "active" && broker.LifecycleProtocol < TopicLifecycleProtocolVersion {
 			f.mu.RUnlock()
@@ -507,21 +472,6 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 		return fmt.Errorf("topic lifecycle counter overflow for %q", payload.Topic)
 	}
 
-	if coordinatorRef != nil {
-		for _, reference := range coordinatorRef.TopicGroupReferences(payload.Topic) {
-			if reference.MemberCount != 0 {
-				return fmt.Errorf(
-					"%w: topic %q has active consumer group %q with %d member(s)",
-					topic.ErrTopicDeleteBlocked, payload.Topic, reference.Name, reference.MemberCount,
-				)
-			}
-		}
-	}
-	if transactionManager != nil {
-		if _, _, err := transactionManager.StateWithoutTopicReferences(payload.Topic); err != nil {
-			return fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
-		}
-	}
 	target := *current
 	target.Revision++
 	target.LifecycleEpoch++

@@ -1,14 +1,21 @@
 package controller
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
+	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
 
@@ -163,4 +170,73 @@ func TestStandaloneTruncateFailsClosedForActiveStateAndInternalTopic(t *testing.
 	require.NoError(t, err)
 	require.Contains(t, handler.HandleCommand("TRUNCATE topic=orders expected_revision=1", ctx), "topic_truncate_blocked")
 	require.Equal(t, uint64(1), handler.TopicManager.GetTopic("orders").LifecycleEpoch)
+}
+
+func TestDistributedLifecycleSubmissionRejectsActiveRuntimeReferences(t *testing.T) {
+	t.Run("delete", func(t *testing.T) {
+		handler, state, groupCoordinator := newDistributedLifecycleHandler(t)
+		ctx := NewClientContext("", 0)
+		require.Contains(t, handler.HandleCommand("CREATE topic=orders partitions=1 replication_factor=1", ctx), "OK topic=orders")
+		require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
+		_, err := groupCoordinator.AddConsumer("workers", "member-1")
+		require.NoError(t, err)
+
+		require.Contains(t, handler.HandleCommand("DELETE topic=orders", ctx), "topic_delete_blocked")
+		_, found := state.GetTopicDefinition("orders")
+		require.True(t, found, "rejected delete must not enter the Raft FSM")
+	})
+
+	t.Run("truncate", func(t *testing.T) {
+		handler, state, groupCoordinator := newDistributedLifecycleHandler(t)
+		ctx := NewClientContext("", 0)
+		require.Contains(t, handler.HandleCommand("CREATE topic=orders partitions=1 replication_factor=1", ctx), "OK topic=orders")
+		require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
+		_, err := groupCoordinator.AddConsumer("workers", "member-1")
+		require.NoError(t, err)
+
+		require.Contains(t, handler.HandleCommand("TRUNCATE topic=orders expected_revision=1", ctx), "topic_truncate_blocked")
+		definition, found := state.GetTopicDefinition("orders")
+		require.True(t, found)
+		require.Equal(t, uint64(1), definition.LifecycleEpoch, "rejected truncate must not enter the Raft FSM")
+	})
+
+	t.Run("recreate", func(t *testing.T) {
+		handler, state, groupCoordinator := newDistributedLifecycleHandler(t)
+		ctx := NewClientContext("", 0)
+		require.Contains(t, handler.HandleCommand("CREATE topic=orders partitions=1 replication_factor=1", ctx), "OK topic=orders")
+		require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
+		_, err := groupCoordinator.AddConsumer("workers", "member-1")
+		require.NoError(t, err)
+
+		// Model an already-committed delete being replayed after the group runtime
+		// was restored. The FSM advances deterministically and records local cleanup
+		// as pending; a new CREATE is still rejected at the controller boundary.
+		result := state.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders"}`), Index: 3})
+		require.Equal(t, topic.DeleteResult{Deleted: true, CleanupPending: true}, result)
+		require.Contains(t, handler.HandleCommand("CREATE topic=orders partitions=1 replication_factor=1", ctx), "lifecycle cleanup is pending")
+		_, found := state.GetTopicDefinition("orders")
+		require.False(t, found)
+	})
+}
+
+func newDistributedLifecycleHandler(t *testing.T) (*CommandHandler, *fsm.BrokerFSM, *coordinator.Coordinator) {
+	t.Helper()
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+	manager := topic.NewTopicManager(cfg, &testMockHandlerProvider{}, nil)
+	groupCoordinator := coordinator.NewCoordinator(context.Background(), cfg, &dummyPublisher{})
+	state := fsm.NewBrokerFSM(manager, groupCoordinator)
+	broker, err := json.Marshal(fsm.BrokerInfo{
+		ID: "broker-1", Addr: "127.0.0.1:9001", ClientAddr: "127.0.0.1:9000", Status: "active",
+		LifecycleProtocol: fsm.BrokerProtocolVersionCurrent,
+	})
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("REGISTER:"), broker...), Index: 1}))
+	raftManager := &MockRaftManagerForForward{isLeader: true, state: state}
+	raftManager.leaderAddress.Store("127.0.0.1:9001")
+	handler := NewCommandHandler(manager, cfg, groupCoordinator, nil, &clusterController.ClusterController{RaftManager: raftManager})
+	groupCoordinator.SetOffsetRecordWriter(func(coordinator.ConsumerMetadataRecord) error { return nil })
+	t.Cleanup(func() { _ = handler.Close() })
+	return handler, state, groupCoordinator
 }

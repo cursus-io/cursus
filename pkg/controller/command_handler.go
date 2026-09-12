@@ -63,6 +63,14 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 				current = &definition
 			}
 		}
+		if current == nil {
+			// Runtime references are deliberately checked at the submission
+			// boundary, not inside the Raft FSM. Applying an old TOPIC entry during
+			// restart must not depend on group/transaction state restored later.
+			if err := ch.ensureTopicRecreationIsClean(topicName); err != nil {
+				return formatCreateTopicError(topicName, err)
+			}
+		}
 		payload, payloadErr := distributedTopicCommandPayload(defaults, patch, current)
 		if payloadErr != nil {
 			return formatCreateTopicError(topicName, payloadErr)
@@ -128,6 +136,12 @@ func (ch *CommandHandler) handleDelete(cmd string, ctx ...*ClientContext) string
 		if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, cmd); forwarded {
 			return resp
 		}
+		if _, err := ch.prepareTopicDependencies(topicName); err != nil {
+			if errors.Is(err, topic.ErrTopicDeleteBlocked) {
+				return fmt.Sprintf("ERROR: topic_delete_blocked topic=%s reason=%q", topicName, err.Error())
+			}
+			return fmt.Sprintf("ERROR: delete_topic_failed topic=%s reason=%q", topicName, err.Error())
+		}
 
 		payload := map[string]interface{}{
 			"topic":     topicName,
@@ -160,7 +174,7 @@ func (ch *CommandHandler) handleDelete(cmd string, ctx ...*ClientContext) string
 	if !exists && !ifExists {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	transactionState, err := ch.prepareStandaloneTopicDependencies(topicName)
+	transactionState, err := ch.prepareTopicDependencies(topicName)
 	if err != nil {
 		if errors.Is(err, topic.ErrTopicDeleteBlocked) {
 			return fmt.Sprintf("ERROR: topic_delete_blocked topic=%s reason=%q", topicName, err.Error())
@@ -218,6 +232,12 @@ func (ch *CommandHandler) handleTruncate(cmd string, ctx ...*ClientContext) stri
 		if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, cmd); forwarded {
 			return resp
 		}
+		if _, err := ch.prepareTopicDependencies(topicName); err != nil {
+			if errors.Is(err, topic.ErrTopicDeleteBlocked) {
+				return fmt.Sprintf("ERROR: topic_truncate_blocked topic=%s reason=%q", topicName, err.Error())
+			}
+			return fmt.Sprintf("ERROR: truncate_topic_failed topic=%s reason=%q", topicName, err.Error())
+		}
 		result, applyErr := ch.applyAndWaitContext(requestCtx, "TOPIC_TRUNCATE", map[string]interface{}{
 			"topic":             topicName,
 			"expected_revision": expectedRevision,
@@ -232,7 +252,7 @@ func (ch *CommandHandler) handleTruncate(cmd string, ctx ...*ClientContext) stri
 		return formatTruncateResult(truncateResult)
 	}
 
-	transactionState, err := ch.prepareStandaloneTopicDependencies(topicName)
+	transactionState, err := ch.prepareTopicDependencies(topicName)
 	if err != nil {
 		if errors.Is(err, topic.ErrTopicDeleteBlocked) {
 			return fmt.Sprintf("ERROR: topic_truncate_blocked topic=%s reason=%q", topicName, err.Error())
@@ -288,7 +308,7 @@ func (ch *CommandHandler) RecoverPendingTruncations() error {
 		if definition.Revision <= topic.InitialDefinitionRevision {
 			return fmt.Errorf("invalid pending truncate revision for topic %q", definition.Name)
 		}
-		transactionState, err := ch.prepareStandaloneTopicDependencies(definition.Name)
+		transactionState, err := ch.prepareTopicDependencies(definition.Name)
 		if err != nil {
 			return err
 		}
@@ -324,7 +344,7 @@ func (ch *CommandHandler) ensureTopicRecreationIsClean(topicName string) error {
 	return nil
 }
 
-func (ch *CommandHandler) prepareStandaloneTopicDependencies(topicName string) (map[string]*transaction.Snapshot, error) {
+func (ch *CommandHandler) prepareTopicDependencies(topicName string) (map[string]*transaction.Snapshot, error) {
 	if ch.Coordinator != nil {
 		for _, reference := range ch.Coordinator.TopicGroupReferences(topicName) {
 			if reference.MemberCount != 0 {
