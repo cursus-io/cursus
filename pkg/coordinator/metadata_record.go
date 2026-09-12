@@ -57,6 +57,7 @@ type GroupLifecycleSnapshot struct {
 	Generation      int                    `json:"generation"`
 	Members         []GroupLifecycleMember `json:"members"`
 	Partitions      []int                  `json:"partitions,omitempty"`
+	LastActivity    time.Time              `json:"last_activity,omitempty"`
 	LastRebalance   time.Time              `json:"last_rebalance,omitempty"`
 }
 
@@ -242,6 +243,8 @@ func canonicalConsumerMetadataRecord(record ConsumerMetadataRecord) ConsumerMeta
 	record.InitialOffsets = initial
 	if record.Lifecycle != nil {
 		lifecycle := *record.Lifecycle
+		lifecycle.LastActivity = lifecycle.LastActivity.UTC()
+		lifecycle.LastRebalance = lifecycle.LastRebalance.UTC()
 		lifecycle.Topics = append([]string(nil), lifecycle.Topics...)
 		sort.Strings(lifecycle.Topics)
 		lifecycle.TopicPartitions = append([]TopicPartition(nil), lifecycle.TopicPartitions...)
@@ -576,6 +579,7 @@ func lifecycleSnapshot(group *GroupMetadata) *GroupLifecycleSnapshot {
 		Generation:      group.Generation,
 		Members:         make([]GroupLifecycleMember, 0, len(group.Members)),
 		Partitions:      append([]int(nil), group.Partitions...),
+		LastActivity:    group.LastActivity,
 		LastRebalance:   group.LastRebalance,
 	}
 	for _, member := range group.Members {
@@ -928,6 +932,15 @@ func materializeConsumerMetadata(
 			return nil, nil, orphans, fmt.Errorf("lifecycle snapshot does not match registration group=%s", groupName)
 		}
 		group.Generation = lifecycle.Generation
+		group.LastActivity = lifecycle.LastActivity
+		if group.LastActivity.IsZero() {
+			// Version-4 snapshots written before last_activity was added still
+			// carry the timestamp of the same lifecycle transition.
+			group.LastActivity = lifecycle.LastRebalance
+		}
+		if group.LastActivity.IsZero() {
+			group.LastActivity = candidate.record.Timestamp
+		}
 		group.LastRebalance = lifecycle.LastRebalance
 		group.Members = make(map[string]*MemberMetadata, len(lifecycle.Members))
 		for _, member := range lifecycle.Members {

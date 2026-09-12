@@ -44,6 +44,11 @@ type Coordinator struct {
 	ownershipSince    map[string]time.Time
 	observationOwner  func(groupName string) (bool, error)
 	observationOwners func(groupNames []string) (map[string]bool, error)
+
+	observationCatalogMu    sync.Mutex
+	observationCatalogAt    time.Time
+	observationCatalog      []consumerGroupObservationRef
+	observationCatalogReady bool
 }
 
 type TopicHandler interface {
@@ -341,17 +346,31 @@ func (c *Coordinator) ObserveConsumerGroups() []ConsumerGroupObservation {
 	}
 
 	c.mu.RLock()
-	refs := make([]consumerGroupObservationRef, 0, len(c.groups))
+	refsByGroup := make(map[string]consumerGroupObservationRef, len(c.groups))
 	for name, group := range c.groups {
 		if group == nil {
 			continue
 		}
-		refs = append(refs, consumerGroupObservationRef{topic: group.TopicName, group: name})
+		refsByGroup[name] = consumerGroupObservationRef{topic: group.TopicName, group: name}
 	}
 	standalone := c.standalone
 	resolver := c.observationOwner
 	batchResolver := c.observationOwners
 	c.mu.RUnlock()
+	if !standalone {
+		// A follower may have the committed __consumer_offsets records before it
+		// has ever owned and loaded the group. Keep the durable catalog visible so
+		// every broker exports coordinator_up=0 for the same bounded group set.
+		if durableRefs, ready := c.durableGroupObservationRefs(); ready {
+			for _, ref := range durableRefs {
+				refsByGroup[ref.group] = ref
+			}
+		}
+	}
+	refs := make([]consumerGroupObservationRef, 0, len(refsByGroup))
+	for _, ref := range refsByGroup {
+		refs = append(refs, ref)
+	}
 	sort.Slice(refs, func(i, j int) bool {
 		if refs[i].topic != refs[j].topic {
 			return refs[i].topic < refs[j].topic
@@ -423,6 +442,59 @@ func (c *Coordinator) ObserveConsumerGroups() []ConsumerGroupObservation {
 	}
 	c.mu.RUnlock()
 	return observations
+}
+
+const groupObservationCatalogTTL = time.Second
+
+func (c *Coordinator) durableGroupObservationRefs() ([]consumerGroupObservationRef, bool) {
+	now := time.Now()
+	c.observationCatalogMu.Lock()
+	defer c.observationCatalogMu.Unlock()
+	if !c.observationCatalogAt.IsZero() && now.Sub(c.observationCatalogAt) < groupObservationCatalogTTL {
+		return append([]consumerGroupObservationRef(nil), c.observationCatalog...), c.observationCatalogReady
+	}
+	c.observationCatalogAt = now
+
+	c.mu.RLock()
+	handler := c.topicHandler
+	offsetTopic := c.offsetTopic
+	partitionCount := c.offsetTopicPartitionCount
+	migrationRecords := append([]ConsumerMetadataRecord(nil), c.migrationRecords...)
+	migrationAuthoritative := c.migrationAuthoritative
+	c.mu.RUnlock()
+	reader, ok := handler.(OffsetLogReader)
+	if !ok {
+		return append([]consumerGroupObservationRef(nil), c.observationCatalog...), c.observationCatalogReady
+	}
+	// Reuse the strict recovery decoder against an isolated coordinator. The
+	// scan is read-only with respect to the live coordinator, so a metrics scrape
+	// cannot reset heartbeats, generations, or ownership grace periods.
+	view := &Coordinator{
+		groups:                    make(map[string]*GroupMetadata),
+		lifecyclePending:          make(map[string]bool),
+		topicHandler:              handler,
+		offsetTopic:               offsetTopic,
+		offsetTopicPartitionCount: partitionCount,
+		standalone:                false,
+		groupEpochs:               make(map[string]uint64),
+		migrationRecords:          migrationRecords,
+		migrationAuthoritative:    migrationAuthoritative,
+		ownershipSince:            make(map[string]time.Time),
+	}
+	if _, err := view.recoverConsumerMetadata(reader); err != nil {
+		return append([]consumerGroupObservationRef(nil), c.observationCatalog...), c.observationCatalogReady
+	}
+	view.mu.RLock()
+	refs := make([]consumerGroupObservationRef, 0, len(view.groups))
+	for name, group := range view.groups {
+		if group != nil {
+			refs = append(refs, consumerGroupObservationRef{topic: group.TopicName, group: name})
+		}
+	}
+	view.mu.RUnlock()
+	c.observationCatalog = refs
+	c.observationCatalogReady = true
+	return append([]consumerGroupObservationRef(nil), refs...), true
 }
 
 // ReloadDistributedConsumerMetadata rebuilds local group fencing state from

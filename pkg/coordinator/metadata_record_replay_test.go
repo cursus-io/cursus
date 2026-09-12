@@ -172,6 +172,7 @@ func TestDistributedLifecycleSnapshotsRecoverGenerationAndAssignments(t *testing
 	require.Equal(t, ConsumerMetadataRecordLifecycleSnapshot, records[1].Type)
 	require.Equal(t, ConsumerMetadataRecordLifecycleSnapshot, records[2].Type)
 	require.Equal(t, uint64(2), records[2].Revision)
+	require.False(t, records[2].Lifecycle.LastActivity.IsZero())
 
 	messages := make([]types.Message, 0, len(records))
 	for offset, record := range records {
@@ -182,6 +183,31 @@ func TestDistributedLifecycleSnapshotsRecoverGenerationAndAssignments(t *testing
 	require.Equal(t, 2, recovered.GetGeneration("workers"))
 	require.Equal(t, []int{0, 1}, recovered.GetMemberAssignments("workers", "member-a"))
 	require.Equal(t, []int{2, 3}, recovered.GetMemberAssignments("workers", "member-b"))
+	require.False(t, recovered.GetGroup("workers").LastActivity.IsZero())
+}
+
+func TestDistributedLifecycleRecoveryBackfillsLegacyLastActivity(t *testing.T) {
+	activity := time.Unix(42, 0).UTC()
+	record := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersionLifecycle, Type: ConsumerMetadataRecordLifecycleSnapshot,
+		Group: "workers", Epoch: 1, Revision: 1,
+		Lifecycle: &GroupLifecycleSnapshot{
+			TopicName: "orders", Generation: 1, Members: []GroupLifecycleMember{{ID: "member-a"}},
+			Partitions: []int{0}, LastRebalance: activity,
+		},
+		Timestamp: activity,
+	}
+	registration := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
+		Group: "workers", Topic: "orders", PartitionCount: 1, Epoch: 1, Timestamp: activity.Add(-time.Second),
+	}
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	recovered, err := NewCoordinatorWithRecovery(context.Background(), cfg, &metadataReplayHandler{messages: map[int][]types.Message{
+		0: {encodedMetadataMessage(t, registration, 0), encodedMetadataMessage(t, record, 1)},
+	}})
+	require.NoError(t, err)
+	require.Equal(t, activity, recovered.GetGroup("workers").LastActivity)
 }
 
 func TestDistributedReloadPreservesMembershipWhenSelectedLifecycleSnapshotIsOrphaned(t *testing.T) {

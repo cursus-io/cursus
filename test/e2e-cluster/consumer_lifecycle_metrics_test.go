@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/test/e2e"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -233,14 +234,33 @@ func lifecycleBrokerAddrs(nodes []int) []string {
 
 func deregisterLifecycleCoordinator(t *testing.T, brokers []int, node int) {
 	t.Helper()
-	payload := fmt.Sprintf(`{"id":"broker-%d-9000"}`, node)
-	command := fmt.Sprintf(
-		"RAFT_APPLY internal_token=cursus-test-internal-token type=DEREGISTER payload=%s",
-		payload,
-	)
+	targetID := fmt.Sprintf("broker-%d-9000", node)
 	err := eventually(t, fmt.Sprintf("deregister coordinator broker-%d", node), clusterFailureWait, func() (bool, string, error) {
 		var failures []string
 		for _, broker := range brokers {
+			lookupClient := e2e.NewBrokerClient([]string{fmt.Sprintf("127.0.0.1:%d", brokerPort(broker))})
+			registration, lookupErr := lifecycleBrokerRegistration(lookupClient, targetID)
+			lookupClient.Close()
+			if lookupErr != nil {
+				failures = append(failures, fmt.Sprintf("broker-%d registration lookup: %v", broker, lookupErr))
+				continue
+			}
+			payload, marshalErr := json.Marshal(struct {
+				ID               string `json:"id"`
+				IncarnationID    string `json:"incarnation_id,omitempty"`
+				IncarnationEpoch uint64 `json:"incarnation_epoch,omitempty"`
+			}{
+				ID:               registration.ID,
+				IncarnationID:    registration.IncarnationID,
+				IncarnationEpoch: registration.IncarnationEpoch,
+			})
+			if marshalErr != nil {
+				return false, "", marshalErr
+			}
+			command := fmt.Sprintf(
+				"RAFT_APPLY internal_token=cursus-test-internal-token type=DEREGISTER payload=%s",
+				payload,
+			)
 			client := e2e.NewBrokerClient([]string{fmt.Sprintf("127.0.0.1:%d", 19000+broker)})
 			response, sendErr := client.SendCommand("", command, 5*time.Second)
 			client.Close()
@@ -252,4 +272,25 @@ func deregisterLifecycleCoordinator(t *testing.T, brokers []int, node int) {
 		return false, strings.Join(failures, "; "), nil
 	})
 	require.NoError(t, err)
+}
+
+func lifecycleBrokerRegistration(client *e2e.BrokerClient, targetID string) (fsm.BrokerInfo, error) {
+	response, err := client.SendCommand("", "LIST_CLUSTER", 5*time.Second)
+	if err != nil {
+		return fsm.BrokerInfo{}, err
+	}
+	const prefix = "OK brokers="
+	if !strings.HasPrefix(response, prefix) {
+		return fsm.BrokerInfo{}, fmt.Errorf("unexpected LIST_CLUSTER response %q", response)
+	}
+	var brokers []fsm.BrokerInfo
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(response, prefix)), &brokers); err != nil {
+		return fsm.BrokerInfo{}, fmt.Errorf("decode LIST_CLUSTER: %w", err)
+	}
+	for _, broker := range brokers {
+		if broker.ID == targetID {
+			return broker, nil
+		}
+	}
+	return fsm.BrokerInfo{}, fmt.Errorf("broker %s not found", targetID)
 }
