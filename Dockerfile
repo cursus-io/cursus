@@ -24,7 +24,10 @@ COPY --from=builder --chown=cursus:cursus /app/cursusctl /app/cursusctl
 COPY --from=builder --chown=cursus:cursus /app/cursus-storage /app/cursus-storage
 COPY --chown=cursus:cursus entrypoint.sh /app/entrypoint.sh
 
-RUN mkdir -p /data/logs && chown -R cursus:cursus /app /data && chmod +x /app/broker /app/cli /app/cursusctl /app/cursus-storage /app/entrypoint.sh
+# Docker initializes a new named volume from the ownership of the image path.
+# Create the broker log directory before switching users so restart-persistent
+# volumes stay writable by the unprivileged process.
+RUN mkdir -p /data/logs /app/cluster-logs && chown -R cursus:cursus /app /data && chmod +x /app/broker /app/cli /app/cursusctl /app/cursus-storage /app/entrypoint.sh
 USER cursus
 
 ENTRYPOINT ["/app/entrypoint.sh"]

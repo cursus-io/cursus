@@ -383,6 +383,20 @@ func (tm *TopicManager) ReadTopicPartition(topicName string, partitionID int, of
 	return p.dh.ReadMessages(offset, max)
 }
 
+// ReadCommittedTopicPartition is the recovery-safe internal topic reader. It
+// excludes replicated records that are durable locally but not yet committed.
+func (tm *TopicManager) ReadCommittedTopicPartition(topicName string, partitionID int, offset uint64, max int) ([]types.Message, error) {
+	t := tm.GetTopic(topicName)
+	if t == nil {
+		return nil, fmt.Errorf("topic '%s' does not exist", topicName)
+	}
+	p, err := t.GetPartition(partitionID)
+	if err != nil {
+		return nil, err
+	}
+	return p.ReadCommitted(offset, max)
+}
+
 // EarliestTopicOffset returns the earliest retained logical offset without
 // creating or mutating a topic. Consumer metadata recovery uses it only after
 // the internal topic has been validated and opened.

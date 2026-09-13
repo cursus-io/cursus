@@ -42,6 +42,18 @@ func TestCleanBootstrapRollingRestartRestoresFullISR(t *testing.T) {
 		waitForStableFullISRAndZeroUnderReplicated(t, ctx, fmt.Sprintf("broker-%d restart", node))
 		requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), ctx.GetTopic(), uint64(ctx.GetNumMessages()))
 	}
+
+	// Lose quorum while preserving each broker's durable volume. Membership can
+	// become active again before a restarted replica has replayed its committed
+	// range, so readiness and the ISR-backed catch-up path must converge data
+	// before this phase can complete.
+	actions.StopBroker(1)
+	actions.StopBroker(2)
+	actions.StartBroker(1)
+	actions.StartBroker(2)
+	actions.WaitForTopicMetadata()
+	waitForStableFullISRAndZeroUnderReplicated(t, ctx, "two-broker quorum-loss restart")
+	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), ctx.GetTopic(), uint64(ctx.GetNumMessages()))
 }
 
 func waitForBrokerEvictedFromISR(t *testing.T, ctx *ClusterTestContext, node int) {

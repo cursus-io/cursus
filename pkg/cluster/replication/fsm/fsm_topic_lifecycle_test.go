@@ -77,11 +77,23 @@ func TestBrokerFSMTopicDeleteCleansLifecycleStateAndIsExplicitlyIdempotent(t *te
 		Messages:  []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	})
-	blocked := fsm.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders"}`), Index: 2})
-	blockedErr, ok := blocked.(error)
-	require.True(t, ok)
-	require.True(t, errors.Is(blockedErr, topic.ErrTopicDeleteBlocked))
-	require.NotNil(t, manager.GetTopic("orders"))
+	fsm.mu.Lock()
+	fsm.producerState["orders"] = map[int]map[string]ProducerSequence{0: {"producer": {Seq: 3}}}
+	fsm.mu.Unlock()
+
+	// The controller rejects new deletes while these references are active. Once
+	// committed, however, replay must advance the authoritative FSM state without
+	// consulting runtime state that may have been restored from a later point in
+	// time. Node-local dependency cleanup remains explicitly retryable.
+	result := fsm.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders"}`), Index: 2})
+	require.Equal(t, topic.DeleteResult{Deleted: true, CleanupPending: true}, result)
+	require.Nil(t, manager.GetTopic("orders"))
+	fsm.mu.RLock()
+	_, authoritativeTopicFound := fsm.topicState["orders"]
+	_, producerStateFound := fsm.producerState["orders"]
+	fsm.mu.RUnlock()
+	require.False(t, authoritativeTopicFound)
+	require.False(t, producerStateFound)
 
 	require.NoError(t, groupCoordinator.RemoveConsumer("workers", "member-1"))
 	transactions.ApplySnapshot(&transaction.Snapshot{
@@ -89,22 +101,14 @@ func TestBrokerFSMTopicDeleteCleansLifecycleStateAndIsExplicitlyIdempotent(t *te
 		Messages:  []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	})
-	fsm.mu.Lock()
-	fsm.producerState["orders"] = map[int]map[string]ProducerSequence{0: {"producer": {Seq: 3}}}
-	fsm.mu.Unlock()
-
-	require.Nil(t, fsm.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders"}`), Index: 3}))
+	require.NoError(t, fsm.ReconcileTopicMaterializations())
 	require.Nil(t, manager.GetTopic("orders"))
 	require.Nil(t, groupCoordinator.GetGroup("workers"))
 	require.Empty(t, transactions.ExportState()["tx-orders"].Messages)
-	fsm.mu.RLock()
-	_, producerStateFound := fsm.producerState["orders"]
-	fsm.mu.RUnlock()
-	require.False(t, producerStateFound)
 
-	result := fsm.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders","if_exists":true}`), Index: 4})
+	result = fsm.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders","if_exists":true}`), Index: 3})
 	require.Equal(t, topic.DeleteResult{Deleted: false}, result)
-	internal := fsm.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"__consumer_offsets","if_exists":true}`), Index: 5})
+	internal := fsm.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"__consumer_offsets","if_exists":true}`), Index: 4})
 	require.Error(t, internal.(error))
 
 	snapshot, err := fsm.Snapshot()
@@ -204,7 +208,7 @@ func TestBrokerFSMLifecycleDependencyCleanupRunsAfterCommitAndReconciles(t *test
 	})
 }
 
-func TestBrokerFSMCreateWaitsForStaleLifecycleCleanup(t *testing.T) {
+func TestBrokerFSMTopicReplayIgnoresAlreadyRecoveredRuntimeReferences(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
 	cfg.LogDir = t.TempDir()
@@ -224,12 +228,10 @@ func TestBrokerFSMCreateWaitsForStaleLifecycleCleanup(t *testing.T) {
 	create, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)
 	result := fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 2})
-	require.ErrorContains(t, result.(error), "lifecycle cleanup is pending")
-
-	require.Equal(t, topic.DeleteResult{Deleted: false}, fsm.Apply(&raft.Log{
-		Data: []byte(`TOPIC_DELETE:{"topic":"orders","if_exists":true}`), Index: 3,
-	}))
-	require.Nil(t, fsm.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: 4}))
+	require.Nil(t, result, "Raft replay must depend only on committed FSM state")
+	definition, found := fsm.GetTopicDefinition("orders")
+	require.True(t, found)
+	require.Equal(t, uint64(1), definition.LifecycleEpoch)
 }
 
 func TestBrokerFSMTopicTruncateResetsStateAndFencesOldLifecycle(t *testing.T) {
@@ -394,15 +396,25 @@ func TestBrokerFSMTopicTruncateRejectsUnsafeClusterAndActiveState(t *testing.T) 
 		require.Equal(t, uint64(1), manager.GetTopic("orders").LifecycleEpoch)
 	})
 
-	t.Run("active group", func(t *testing.T) {
+	t.Run("committed transition leaves runtime cleanup pending", func(t *testing.T) {
 		fsm, manager, groupCoordinator := newFSM(t, TopicLifecycleProtocolVersion)
 		require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 1))
 		_, err := groupCoordinator.AddConsumer("workers", "member-1")
 		require.NoError(t, err)
 		result := fsm.Apply(&raft.Log{Data: []byte(`TOPIC_TRUNCATE:{"topic":"orders","expected_revision":1}`), Index: 3})
-		require.Error(t, result.(error))
-		require.True(t, errors.Is(result.(error), topic.ErrTopicDeleteBlocked))
-		require.Equal(t, uint64(1), manager.GetTopic("orders").Revision)
+		truncateResult := result.(topic.TruncateResult)
+		require.True(t, truncateResult.Truncated)
+		require.True(t, truncateResult.CleanupPending)
+		require.Equal(t, uint64(2), truncateResult.Definition.Revision)
+		require.Equal(t, uint64(2), truncateResult.Definition.LifecycleEpoch)
+		// Local cleanup cannot complete until the already-restored active group is
+		// gone, so the topic remains unavailable instead of exposing a half-truncated
+		// definition.
+		require.Nil(t, manager.GetTopic("orders"))
+		require.NoError(t, groupCoordinator.RemoveConsumer("workers", "member-1"))
+		require.NoError(t, fsm.ReconcileTopicMaterializations())
+		require.Equal(t, uint64(2), manager.GetTopic("orders").Revision)
+		require.Equal(t, uint64(2), manager.GetTopic("orders").LifecycleEpoch)
 	})
 
 	t.Run("revision and internal topic", func(t *testing.T) {

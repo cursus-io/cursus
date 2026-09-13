@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -153,6 +154,34 @@ func TestObserveConsumerGroupsDoesNotFabricateUnknownGroup(t *testing.T) {
 	coordinator := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
 	t.Cleanup(coordinator.Stop)
 	require.Empty(t, coordinator.ObserveConsumerGroups())
+}
+
+func TestObserveConsumerGroupsUsesDurableCatalogWithoutMutatingFollowerState(t *testing.T) {
+	record := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
+		Group: "workers", Topic: "events", PartitionCount: 1, Epoch: 1, Timestamp: time.Now().UTC(),
+	}
+	payload, key, err := encodeConsumerMetadataRecord(record)
+	require.NoError(t, err)
+	handler := &metadataReplayHandler{messages: map[int][]types.Message{
+		0: {{Offset: 0, Key: key, Payload: string(payload)}},
+	}}
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	follower, err := NewCoordinatorWithRecovery(context.Background(), cfg, handler)
+	require.NoError(t, err)
+	t.Cleanup(follower.Stop)
+	follower.mu.Lock()
+	follower.groups = make(map[string]*GroupMetadata)
+	follower.mu.Unlock()
+	follower.SetGroupObservationBatchResolver(func(groupNames []string) (map[string]bool, error) {
+		require.Equal(t, []string{"workers"}, groupNames)
+		return map[string]bool{"workers": false}, nil
+	})
+
+	observation := requireSingleObservation(t, follower)
+	require.False(t, observation.CoordinatorUp)
+	require.Nil(t, follower.GetGroup("workers"), "read-only metrics catalog mutated live coordinator state")
 }
 
 func TestGroupSnapshotRequiresLastActivity(t *testing.T) {

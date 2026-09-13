@@ -23,17 +23,18 @@ import (
 )
 
 type barrierReplicationExecutor struct {
-	mu                sync.Mutex
-	snapshot          clusterController.PartitionReplicationSnapshot
-	started           chan struct{}
-	barrier           chan struct{}
-	replicateErr      error
-	replicateFailures int
-	committedHWM      uint64
-	commitHook        func()
-	replicateCalls    int
-	nonISRCalls       int
-	nonISRBarrier     chan struct{}
+	mu                 sync.Mutex
+	snapshot           clusterController.PartitionReplicationSnapshot
+	started            chan struct{}
+	barrier            chan struct{}
+	replicateErr       error
+	replicateFailures  int
+	committedHWM       uint64
+	commitHook         func()
+	replicateCalls     int
+	replicateSnapshots []clusterController.PartitionReplicationSnapshot
+	nonISRCalls        int
+	nonISRBarrier      chan struct{}
 }
 
 type permanentReplicationError struct{}
@@ -50,9 +51,12 @@ func (e *barrierReplicationExecutor) Snapshot(string, int) (clusterController.Pa
 	return e.snapshot, nil
 }
 
-func (e *barrierReplicationExecutor) ReplicateISR(ctx context.Context, _ partitionReplicationTask, _ clusterController.PartitionReplicationSnapshot) error {
+func (e *barrierReplicationExecutor) ReplicateISR(ctx context.Context, _ partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) error {
 	e.mu.Lock()
 	e.replicateCalls++
+	snapshot.ISR = append([]string(nil), snapshot.ISR...)
+	snapshot.Replicas = append([]string(nil), snapshot.Replicas...)
+	e.replicateSnapshots = append(e.replicateSnapshots, snapshot)
 	started := e.started
 	barrier := e.barrier
 	err := error(nil)
@@ -123,13 +127,18 @@ func newBarrierReplicationExecutor() *barrierReplicationExecutor {
 }
 
 func replicationTaskForMode(executor *barrierReplicationExecutor, mode ackpolicy.Mode) partitionReplicationTask {
+	requiredISR := 0
+	if mode == ackpolicy.All {
+		requiredISR = 2
+	}
 	return partitionReplicationTask{
-		topic:     "orders",
-		partition: 0,
-		commitHWM: 1,
-		ackMode:   mode,
-		snapshot:  executor.snapshot,
-		result:    make(chan error, 1),
+		topic:       "orders",
+		partition:   0,
+		commitHWM:   1,
+		ackMode:     mode,
+		requiredISR: requiredISR,
+		snapshot:    executor.snapshot,
+		result:      make(chan error, 1),
 	}
 }
 
@@ -231,6 +240,83 @@ func TestAllAcknowledgementRetriesTransientFollowerFailureBeforeResponding(t *te
 	}
 	require.NoError(t, <-task.result)
 	require.Equal(t, uint64(1), executor.committed())
+}
+
+func TestAllAcknowledgementRefreshesISRWhileRetrying(t *testing.T) {
+	executor := newBarrierReplicationExecutor()
+	executor.replicateErr = context.DeadlineExceeded
+	executor.replicateFailures = 1
+	coordinator := newPartitionReplicationCoordinator(1, executor)
+	t.Cleanup(coordinator.close)
+	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	task := replicationTaskForMode(executor, ackpolicy.All)
+	reservation.submit(task)
+
+	<-executor.started
+	executor.mu.Lock()
+	executor.snapshot.ISR = []string{"broker-1", "broker-3"}
+	executor.mu.Unlock()
+	close(executor.barrier)
+
+	require.NoError(t, <-task.result)
+	executor.mu.Lock()
+	require.Len(t, executor.replicateSnapshots, 2)
+	require.Equal(t, []string{"broker-1", "broker-2"}, executor.replicateSnapshots[0].ISR)
+	require.Equal(t, []string{"broker-1", "broker-3"}, executor.replicateSnapshots[1].ISR)
+	executor.mu.Unlock()
+	require.Equal(t, uint64(1), executor.committed())
+}
+
+func TestAllAcknowledgementRechecksISRBeforeCommit(t *testing.T) {
+	executor := newBarrierReplicationExecutor()
+	coordinator := newPartitionReplicationCoordinator(1, executor)
+	t.Cleanup(coordinator.close)
+	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	task := replicationTaskForMode(executor, ackpolicy.All)
+	reservation.submit(task)
+
+	<-executor.started
+	executor.mu.Lock()
+	executor.snapshot.ISR = []string{"broker-1", "broker-3"}
+	executor.mu.Unlock()
+	close(executor.barrier)
+
+	require.NoError(t, <-task.result)
+	executor.mu.Lock()
+	require.Len(t, executor.replicateSnapshots, 2)
+	require.Equal(t, []string{"broker-1", "broker-2"}, executor.replicateSnapshots[0].ISR)
+	require.Equal(t, []string{"broker-1", "broker-3"}, executor.replicateSnapshots[1].ISR)
+	executor.mu.Unlock()
+	require.Equal(t, uint64(1), executor.committed())
+}
+
+func TestAllAcknowledgementWaitsForMinimumISRAfterMembershipChange(t *testing.T) {
+	executor := newBarrierReplicationExecutor()
+	close(executor.barrier)
+	executor.snapshot.ISR = []string{"broker-1"}
+	coordinator := newPartitionReplicationCoordinator(1, executor)
+	t.Cleanup(coordinator.close)
+	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	task := replicationTaskForMode(executor, ackpolicy.All)
+	reservation.submit(task)
+
+	require.Never(t, func() bool {
+		executor.mu.Lock()
+		defer executor.mu.Unlock()
+		return executor.replicateCalls != 0
+	}, 50*time.Millisecond, 5*time.Millisecond)
+	executor.mu.Lock()
+	executor.snapshot.ISR = []string{"broker-1", "broker-3"}
+	executor.mu.Unlock()
+
+	require.NoError(t, <-task.result)
+	executor.mu.Lock()
+	require.Equal(t, 1, executor.replicateCalls)
+	require.Equal(t, []string{"broker-1", "broker-3"}, executor.replicateSnapshots[0].ISR)
+	executor.mu.Unlock()
 }
 
 func TestAllAcknowledgementReturnsPermanentFollowerFailureWithoutBlockingLane(t *testing.T) {
@@ -664,11 +750,13 @@ func TestPreparePartitionReplicaAllowsFencedBackfillBelowCommittedHWM(t *testing
 	require.NoError(t, err)
 	release()
 	require.Zero(t, partition.NextOffset())
-	require.NoError(t, handler.ApplyReplicaCatchup(fsm.ReplicaCatchupBatch{
+	catchupBatch, err := fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
 		Topic: "orders", Partition: 0, BrokerID: "broker-2", StartOffset: 0, CommittedHWM: 2,
-		Leader: "broker-1", LeaderEpoch: 7, LifecycleEpoch: topic.InitialLifecycleEpoch,
+		Leader: "broker-1", SourceBroker: "broker-1", LeaderEpoch: 7, LifecycleEpoch: topic.InitialLifecycleEpoch,
 		Messages: []types.Message{{Offset: 0, Payload: "zero"}, {Offset: 1, Payload: "one"}},
-	}))
+	})
+	require.NoError(t, err)
+	require.NoError(t, handler.ApplyReplicaCatchup(catchupBatch))
 	require.Equal(t, uint64(2), partition.NextOffset())
 	require.Equal(t, uint64(2), partition.GetHWM())
 }
@@ -694,12 +782,14 @@ func TestApplyReplicaCatchupAcceptsCompactedOffsetRangeAndPreservesHWM(t *testin
 		diskManager.CloseAllHandlers()
 	})
 
-	require.NoError(t, handler.ApplyReplicaCatchup(fsm.ReplicaCatchupBatch{
+	catchupBatch, err := fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
 		Topic: "state", Partition: 0, BrokerID: "broker-2", StartOffset: 0, EndOffset: 5,
-		CommittedHWM: 5, Leader: "broker-1", LeaderEpoch: 7,
+		CommittedHWM: 5, Leader: "broker-1", SourceBroker: "broker-1", LeaderEpoch: 7,
 		LifecycleEpoch: topic.InitialLifecycleEpoch, Compacted: true,
 		Messages: []types.Message{{Offset: 2, Key: "a", Payload: "current-a"}, {Offset: 4, Key: "b", Payload: "current-b"}},
-	}))
+	})
+	require.NoError(t, err)
+	require.NoError(t, handler.ApplyReplicaCatchup(catchupBatch))
 	partition, err := topicManager.GetTopic("state").GetPartition(0)
 	require.NoError(t, err)
 	require.Equal(t, uint64(5), partition.NextOffset())

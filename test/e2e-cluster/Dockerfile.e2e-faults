@@ -22,7 +22,9 @@ COPY --from=builder --chown=cursus:cursus /app/broker /app/broker
 COPY --from=builder --chown=cursus:cursus /app/cli /app/cli
 COPY --chown=cursus:cursus entrypoint.sh /app/entrypoint.sh
 
-RUN chown -R cursus:cursus /app && chmod +x /app/broker /app/cli /app/entrypoint.sh
+# Keep the fault-injection image's named-volume mount writable for the same
+# unprivileged broker user as the production image.
+RUN mkdir -p /app/cluster-logs && chown -R cursus:cursus /app && chmod +x /app/broker /app/cli /app/entrypoint.sh
 USER cursus
 
 ENTRYPOINT ["/app/entrypoint.sh"]

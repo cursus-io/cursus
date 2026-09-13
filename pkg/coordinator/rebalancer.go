@@ -47,7 +47,7 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 		if existing.OffsetRevisions == nil {
 			existing.OffsetRevisions = make(map[string]uint64)
 		}
-		if existing.RegistrationEpoch != 0 {
+		if existing.RegistrationEpoch != 0 && !existing.RegistrationInferred {
 			if existing.RegistrationEpoch > c.groupEpochs[groupName] {
 				c.groupEpochs[groupName] = existing.RegistrationEpoch
 			}
@@ -96,7 +96,11 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 		}
 		existing.mu.Lock()
 		existing.RegistrationEpoch = epoch
+		existing.RegistrationInferred = false
 		existing.TopicName = topicName
+		existing.Topics = nil
+		existing.TopicPattern = ""
+		existing.TopicPartitions = nil
 		existing.LastActivity = now
 		if len(existing.Partitions) == 0 {
 			existing.Partitions = makePartitions(partitionCount)
@@ -166,7 +170,7 @@ func (c *Coordinator) RegisterGroupSubscription(groupName string, topics []strin
 			c.mu.Unlock()
 			return fmt.Errorf("subscription mismatch for group %q", groupName)
 		}
-		if existing.RegistrationEpoch != 0 {
+		if existing.RegistrationEpoch != 0 && !existing.RegistrationInferred {
 			c.mu.Unlock()
 			return nil
 		}
@@ -207,6 +211,7 @@ func (c *Coordinator) RegisterGroupSubscription(groupName string, topics []strin
 	existing.TopicPattern = pattern
 	existing.TopicPartitions = append([]TopicPartition(nil), topicPartitions...)
 	existing.RegistrationEpoch = epoch
+	existing.RegistrationInferred = false
 	existing.LastActivity = time.Now()
 	c.groupEpochs[groupName] = epoch
 	c.mu.Unlock()
@@ -327,6 +332,9 @@ func (c *Coordinator) DeleteGroup(groupName string) error {
 
 // AddConsumer registers a new consumer in the group and triggers a rebalance.
 func (c *Coordinator) AddConsumer(groupName, consumerID string) ([]int, error) {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	c.mu.Lock()
 	if c.lifecyclePending[groupName] {
 		c.mu.Unlock()
@@ -337,17 +345,38 @@ func (c *Coordinator) AddConsumer(groupName, consumerID string) ([]int, error) {
 		c.mu.Unlock()
 		return nil, fmt.Errorf("group not found")
 	}
+	if group.RegistrationInferred {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("group requires durable registration")
+	}
 
 	now := time.Now()
-	group.Members[consumerID] = &MemberMetadata{
+	candidate := cloneGroupLifecycle(group)
+	candidate.Members[consumerID] = &MemberMetadata{
 		ID:            consumerID,
 		LastHeartbeat: now,
 	}
-	group.Generation++
+	candidate.Generation++
 
-	c.rebalanceRange(groupName)
-	assignments := append([]int(nil), group.Members[consumerID].Assignments...)
-	gen := group.Generation
+	rebalanceGroup(candidate)
+	assignments := append([]int(nil), candidate.Members[consumerID].Assignments...)
+	gen := candidate.Generation
+	c.lifecyclePending[groupName] = true
+	c.mu.Unlock()
+
+	err := c.writeGroupLifecycleSnapshot(groupName, group.RegistrationEpoch, candidate)
+
+	c.mu.Lock()
+	delete(c.lifecyclePending, groupName)
+	if err != nil {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("persist group lifecycle: %w", err)
+	}
+	if c.groups[groupName] != group {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("group %q changed during durable lifecycle update", groupName)
+	}
+	applyGroupLifecycle(group, candidate)
 	c.mu.Unlock()
 
 	util.Info("✅ Consumer '%s' joined (Generation: %d, Assignments: %v)", consumerID, gen, assignments)
@@ -356,10 +385,27 @@ func (c *Coordinator) AddConsumer(groupName, consumerID string) ([]int, error) {
 
 // RemoveConsumer unregisters a consumer and triggers a rebalance.
 func (c *Coordinator) RemoveConsumer(groupName, consumerID string) error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	c.mu.Lock()
-	memberCount, generation, err := c.removeConsumerLocked(groupName, consumerID)
+	group := c.groups[groupName]
+	if group == nil {
+		c.mu.Unlock()
+		return fmt.Errorf("group not found")
+	}
+	if _, exists := group.Members[consumerID]; !exists {
+		c.mu.Unlock()
+		return fmt.Errorf("ERROR: member_not_found member=%s group=%s", consumerID, groupName)
+	}
+	candidate := cloneGroupLifecycle(group)
+	delete(candidate.Members, consumerID)
+	candidate.Generation++
+	rebalanceGroup(candidate)
+	c.lifecyclePending[groupName] = true
+	memberCount, generation := len(candidate.Members), candidate.Generation
 	c.mu.Unlock()
-	if err != nil {
+	if err := c.persistAndApplyLifecycle(groupName, group, candidate); err != nil {
 		return err
 	}
 
@@ -371,14 +417,23 @@ func (c *Coordinator) RemoveConsumer(groupName, consumerID string) error {
 // RemoveConsumerForGeneration prevents a stale session from removing a current
 // group member after ownership has moved to a newer generation.
 func (c *Coordinator) RemoveConsumerForGeneration(groupName, consumerID string, generation int) error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	c.mu.Lock()
 	if errResp := c.validateMemberGenerationLocked(groupName, consumerID, generation); errResp != "" {
 		c.mu.Unlock()
 		return fmt.Errorf("%s", errResp)
 	}
-	memberCount, newGeneration, err := c.removeConsumerLocked(groupName, consumerID)
+	group := c.groups[groupName]
+	candidate := cloneGroupLifecycle(group)
+	delete(candidate.Members, consumerID)
+	candidate.Generation++
+	rebalanceGroup(candidate)
+	c.lifecyclePending[groupName] = true
+	memberCount, newGeneration := len(candidate.Members), candidate.Generation
 	c.mu.Unlock()
-	if err != nil {
+	if err := c.persistAndApplyLifecycle(groupName, group, candidate); err != nil {
 		return err
 	}
 
@@ -391,32 +446,76 @@ func (c *Coordinator) RemoveConsumerForGeneration(groupName, consumerID string, 
 // one generation change. expectedGeneration makes metadata-log replay and retries
 // harmless after a concurrent membership change.
 func (c *Coordinator) ExpireConsumers(groupName string, expectedGeneration int, consumerIDs []string) error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	group := c.groups[groupName]
 	if group == nil {
+		c.mu.Unlock()
 		return fmt.Errorf("ERROR: group_not_found group=%s", groupName)
 	}
 	if group.Generation != expectedGeneration {
+		c.mu.Unlock()
 		return fmt.Errorf("ERROR: GEN_MISMATCH current=%d requested=%d group=%s", group.Generation, expectedGeneration, groupName)
 	}
 
+	candidate := cloneGroupLifecycle(group)
 	removed := 0
 	for _, consumerID := range consumerIDs {
-		if _, exists := group.Members[consumerID]; exists {
-			delete(group.Members, consumerID)
+		if _, exists := candidate.Members[consumerID]; exists {
+			delete(candidate.Members, consumerID)
 			removed++
 		}
 	}
 	if removed == 0 {
+		c.mu.Unlock()
 		return nil
 	}
-	group.Generation++
-	c.rebalanceRange(groupName)
+	candidate.Generation++
+	rebalanceGroup(candidate)
+	c.lifecyclePending[groupName] = true
+	c.mu.Unlock()
+	return c.persistAndApplyLifecycle(groupName, group, candidate)
+}
+
+func (c *Coordinator) persistAndApplyLifecycle(groupName string, group, candidate *GroupMetadata) error {
+	err := c.writeGroupLifecycleSnapshot(groupName, group.RegistrationEpoch, candidate)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.lifecyclePending, groupName)
+	if err != nil {
+		return fmt.Errorf("persist group lifecycle: %w", err)
+	}
+	if c.groups[groupName] != group {
+		return fmt.Errorf("group %q changed during durable lifecycle update", groupName)
+	}
+	applyGroupLifecycle(group, candidate)
 	return nil
 }
 
+func cloneGroupLifecycle(group *GroupMetadata) *GroupMetadata {
+	candidate := &GroupMetadata{
+		TopicName: group.TopicName, Topics: append([]string(nil), group.Topics...), TopicPattern: group.TopicPattern,
+		TopicPartitions: append([]TopicPartition(nil), group.TopicPartitions...), Generation: group.Generation,
+		Members: make(map[string]*MemberMetadata, len(group.Members)), Partitions: append([]int(nil), group.Partitions...),
+		LastActivity: group.LastActivity, LastRebalance: group.LastRebalance, RegistrationEpoch: group.RegistrationEpoch, RegistrationInferred: group.RegistrationInferred,
+	}
+	for id, member := range group.Members {
+		candidate.Members[id] = &MemberMetadata{ID: member.ID, LastHeartbeat: member.LastHeartbeat, Assignments: append([]int(nil), member.Assignments...), TopicAssignments: append([]TopicPartition(nil), member.TopicAssignments...)}
+	}
+	return candidate
+}
+
+func applyGroupLifecycle(group, candidate *GroupMetadata) {
+	group.Generation = candidate.Generation
+	group.Members = candidate.Members
+	group.LastActivity = candidate.LastActivity
+	group.LastRebalance = candidate.LastRebalance
+}
+
+//nolint:unused // Lifecycle mutations use durable snapshot transitions instead.
 func (c *Coordinator) removeConsumerLocked(groupName, consumerID string) (int, int, error) {
 	group := c.groups[groupName]
 	if group == nil {
@@ -445,6 +544,13 @@ func (c *Coordinator) rebalanceRange(groupName string) {
 		util.Error("❌ Cannot rebalance: group '%s' not found", groupName)
 		return
 	}
+	rebalanceGroup(group)
+}
+
+func rebalanceGroup(group *GroupMetadata) {
+	if group == nil {
+		return
+	}
 
 	members := make([]string, 0, len(group.Members))
 	for id := range group.Members {
@@ -456,7 +562,7 @@ func (c *Coordinator) rebalanceRange(groupName string) {
 	group.LastRebalance = now
 
 	if len(members) == 0 {
-		util.Warn("⚠️ No active members in group '%s', skipping rebalance", groupName)
+		util.Warn("⚠️ No active members, skipping rebalance")
 		return
 	}
 

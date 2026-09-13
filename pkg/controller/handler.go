@@ -38,6 +38,8 @@ type CommandHandler struct {
 	coordCacheMu             sync.RWMutex
 	topicLifecycleMu         sync.RWMutex
 	topicCreateMu            sync.Mutex
+	groupRecoveryEpoch       map[uint64]int
+	groupRecoveryMu          sync.Mutex
 	txnJournal               *transaction.Journal
 	transactionStateSyncHook func(string) error
 	transactionStateLocks    [transactionStateLockStripes]sync.Mutex
@@ -113,14 +115,15 @@ func NewCommandHandler(
 	cc *clusterController.ClusterController,
 ) *CommandHandler {
 	ch := &CommandHandler{
-		TopicManager:  tm,
-		Config:        cfg,
-		Coordinator:   cd,
-		StreamManager: sm,
-		coordCache:    make(map[string]coordCacheEntry),
-		Cluster:       cc,
-		ESHandler:     eventsource.NewHandler(tm),
-		TxnManager:    transaction.NewManagerWithExpirationAndShards(transactionalIDExpiration(cfg), transactionCoordinatorShardCount(cfg)),
+		TopicManager:       tm,
+		Config:             cfg,
+		Coordinator:        cd,
+		StreamManager:      sm,
+		coordCache:         make(map[string]coordCacheEntry),
+		groupRecoveryEpoch: make(map[uint64]int),
+		Cluster:            cc,
+		ESHandler:          eventsource.NewHandler(tm),
+		TxnManager:         transaction.NewManagerWithExpirationAndShards(transactionalIDExpiration(cfg), transactionCoordinatorShardCount(cfg)),
 	}
 	if tm != nil {
 		tm.SetTransactionDecisionResolver(ch.TxnManager)

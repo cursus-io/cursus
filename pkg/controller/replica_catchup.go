@@ -19,6 +19,9 @@ func (ch *CommandHandler) ApplyReplicaCatchup(batch replicationFSM.ReplicaCatchu
 	if ch.Cluster.Router == nil || batch.BrokerID != ch.Cluster.Router.BrokerID() {
 		return fmt.Errorf("replica catch-up broker identity mismatch")
 	}
+	if err := replicationFSM.ValidateReplicaCatchupBatchDigest(batch); err != nil {
+		return err
+	}
 	if len(batch.Messages) > replicationFSM.MaxReplicaCatchupRecords || (!batch.Compacted && len(batch.Messages) == 0) {
 		return fmt.Errorf("invalid replica catch-up batch size %d", len(batch.Messages))
 	}
@@ -48,6 +51,9 @@ func (ch *CommandHandler) ApplyReplicaCatchup(batch replicationFSM.ReplicaCatchu
 	}
 	if !containsReplica(metadata.Replicas, batch.BrokerID) {
 		return fmt.Errorf("broker %s is not a configured replica", batch.BrokerID)
+	}
+	if !containsReplica(metadata.Replicas, batch.SourceBroker) || !containsReplica(metadata.ISR, batch.SourceBroker) {
+		return fmt.Errorf("source broker %s is not an in-sync replica", batch.SourceBroker)
 	}
 	localTopic := ch.TopicManager.GetTopic(batch.Topic)
 	if localTopic == nil || localTopic.LifecycleEpoch != batch.LifecycleEpoch {

@@ -62,7 +62,8 @@ func buildErrorRegistry() map[string]ErrorClassification {
 	)
 	register(ErrorClassAvailability, true,
 		"cluster_metadata_unavailable", "cluster_not_available", "coordinator_not_available", "fsm_not_available",
-		"insufficient_in_sync_replicas", "leader_election_result_unavailable", "leader_not_found", "no_raft_leader", "offset_manager_not_available", "replica_offset_gap", "replication_unavailable", "request_cancelled", "router_not_available",
+		"join_group_failed",
+		"insufficient_in_sync_replicas", "leader_election_result_unavailable", "leader_not_found", "no_raft_leader", "offset_manager_not_available", "replica_offset_gap", "replication_unavailable", "request_cancelled", "router_not_available", "topic_materialization_pending",
 		"transaction_abort_marker_failed", "transaction_commit_failed", "transaction_manager_not_available", "transaction_sync_failed",
 		"transaction_offset_materialization_failed", "transaction_offset_prepare_failed",
 	)

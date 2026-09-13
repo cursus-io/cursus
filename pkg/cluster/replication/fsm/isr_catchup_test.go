@@ -115,14 +115,28 @@ func TestBuildReplicaCatchupRequestsUsesLocalLEOAndLeaderFence(t *testing.T) {
 	require.Len(t, requests, 1)
 	require.Equal(t, ReplicaCatchupRequest{
 		Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 0, CommittedHWM: 3,
-		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: topic.InitialLifecycleEpoch,
-		MaxRecords: MaxReplicaCatchupRecords, LeaderAddress: "127.0.0.1:9000",
+		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 4, LifecycleEpoch: topic.InitialLifecycleEpoch,
+		MaxRecords: MaxReplicaCatchupRecords, SourceAddress: "127.0.0.1:9000",
 	}, requests[0])
 	require.Empty(t, brokerFSM.BuildReplicaCatchupRequests("node-1"))
 	brokerFSM.mu.Lock()
 	brokerFSM.partitionMetadata["orders-0"].ISR = []string{"node-1", "node-2"}
 	brokerFSM.mu.Unlock()
 	require.Len(t, brokerFSM.BuildReplicaCatchupRequests("node-2"), 1, "a lagging replica must catch up even before ISR eviction commits")
+}
+
+func TestBuildReplicaCatchupRequestsRepairsLaggingMetadataLeaderFromActiveISR(t *testing.T) {
+	brokerFSM := newISRCatchupTestFSM(t)
+	brokerFSM.mu.Lock()
+	brokerFSM.partitionMetadata["orders-0"].CommittedHWM = 3
+	brokerFSM.partitionMetadata["orders-0"].ISR = []string{"node-2"}
+	brokerFSM.mu.Unlock()
+
+	requests := brokerFSM.BuildReplicaCatchupRequests("node-1")
+	require.Len(t, requests, 1)
+	require.Equal(t, "node-1", requests[0].Leader)
+	require.Equal(t, "node-2", requests[0].SourceBroker)
+	require.Equal(t, "127.0.0.1:9000", requests[0].SourceAddress)
 }
 
 func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
@@ -141,6 +155,8 @@ func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
 	partition.FlushDisk()
 
 	brokerFSM := NewBrokerFSM(topicManager, nil)
+	registerActiveBroker(t, brokerFSM, "node-1")
+	registerActiveBroker(t, brokerFSM, "node-2")
 	definition := topicManager.GetTopic("orders").Definition()
 	brokerFSM.mu.Lock()
 	brokerFSM.topicState["orders"] = &definition
@@ -152,7 +168,7 @@ func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
 	brokerFSM.mu.Unlock()
 	request := ReplicaCatchupRequest{
 		Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 1, CommittedHWM: 3,
-		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch, MaxRecords: 1,
+		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch, MaxRecords: 1,
 	}
 	batch, err := brokerFSM.FetchReplicaCatchup(request)
 	require.NoError(t, err)
@@ -160,6 +176,8 @@ func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
 	require.Equal(t, uint64(2), batch.EndOffset)
 	require.False(t, batch.Compacted)
 	require.Equal(t, uint64(3), batch.CommittedHWM)
+	require.Equal(t, "node-1", batch.SourceBroker)
+	require.NoError(t, ValidateReplicaCatchupBatchDigest(batch))
 	require.Len(t, batch.Messages, 1)
 	require.Equal(t, uint64(1), batch.Messages[0].Offset)
 	require.Equal(t, "one", batch.Messages[0].Payload)
@@ -171,6 +189,23 @@ func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
 	request.LeaderEpoch++
 	_, err = brokerFSM.FetchReplicaCatchup(request)
 	require.ErrorContains(t, err, "stale leader fence")
+	request.LeaderEpoch--
+	request.SourceBroker = "node-2"
+	_, err = brokerFSM.FetchReplicaCatchup(request)
+	require.ErrorContains(t, err, "not an in-sync replica")
+
+	batch.Messages[0].Payload = "tampered"
+	require.ErrorContains(t, ValidateReplicaCatchupBatchDigest(batch), "checksum mismatch")
+
+	brokerFSM.mu.Lock()
+	brokerFSM.partitionMetadata["orders-0"].ISR = []string{"node-2"}
+	brokerFSM.mu.Unlock()
+	request.BrokerID = "node-1"
+	request.SourceBroker = "node-2"
+	batch, err = brokerFSM.FetchReplicaCatchup(request)
+	require.NoError(t, err, "an in-sync non-leader may serve a lagging metadata leader")
+	require.Equal(t, "node-2", batch.SourceBroker)
+	require.NoError(t, ValidateReplicaCatchupBatchDigest(batch))
 }
 
 func TestFetchReplicaCatchupCarriesCompactedOffsetRange(t *testing.T) {
@@ -200,6 +235,8 @@ func TestFetchReplicaCatchupCarriesCompactedOffsetRange(t *testing.T) {
 	require.Equal(t, 1, result.RecordsRemoved)
 
 	brokerFSM := NewBrokerFSM(topicManager, nil)
+	registerActiveBroker(t, brokerFSM, "node-1")
+	registerActiveBroker(t, brokerFSM, "node-2")
 	definition := topicManager.GetTopic("state").Definition()
 	brokerFSM.mu.Lock()
 	brokerFSM.topicState["state"] = &definition
@@ -212,7 +249,7 @@ func TestFetchReplicaCatchupCarriesCompactedOffsetRange(t *testing.T) {
 
 	batch, err := brokerFSM.FetchReplicaCatchup(ReplicaCatchupRequest{
 		Topic: "state", Partition: 0, BrokerID: "node-2", NextOffset: 0, CommittedHWM: 3,
-		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch, MaxRecords: 10,
+		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch, MaxRecords: 10,
 	})
 	require.NoError(t, err)
 	require.True(t, batch.Compacted)

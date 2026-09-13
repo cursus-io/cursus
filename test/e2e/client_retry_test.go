@@ -16,6 +16,14 @@ func TestRetryClassificationIncludesOnlyIdempotentPublish(t *testing.T) {
 	if !isIdempotent("FETCH_OFFSET topic=orders partition=0 group=workers") {
 		t.Fatal("read-only offset fetch must remain retryable")
 	}
+	for _, command := range []string{
+		"CREATE topic=orders partitions=1 idempotent=true",
+		"CREATE topic=orders partitions=1 idempotent=false",
+	} {
+		if !isIdempotent(command) {
+			t.Fatalf("identical topic definition replay must be safe: %s", command)
+		}
+	}
 }
 
 func TestRetryableBrokerErrorsRequireIdempotentCommands(t *testing.T) {
@@ -32,6 +40,26 @@ func TestRetryableBrokerErrorsRequireIdempotentCommands(t *testing.T) {
 	}
 	if shouldRetryBrokerError(idempotent, permanent) {
 		t.Fatal("non-retryable broker error must not be retried")
+	}
+}
+
+func TestRetryableJoinGroupRequiresARejectionBeforeMemberPersistence(t *testing.T) {
+	join := "JOIN_GROUP topic=orders group=workers member=member-1"
+	for _, brokerErr := range []*wire.BrokerError{
+		{Code: "coordinator_not_available", Retryable: true},
+		{Code: "topic_materialization_pending", Retryable: true, Fields: map[string]string{"reason": "local handler unavailable"}},
+	} {
+		if !shouldRetryBrokerError(join, brokerErr) {
+			t.Fatalf("pre-persistence rejection must be retryable: %+v", brokerErr)
+		}
+	}
+
+	possiblyApplied := &wire.BrokerError{
+		Code: "coordinator_not_available", Retryable: true,
+		Fields: map[string]string{"reason": "persist group lifecycle: response lost"},
+	}
+	if shouldRetryBrokerError(join, possiblyApplied) {
+		t.Fatal("JOIN_GROUP must not retry when durable member creation may have run")
 	}
 }
 

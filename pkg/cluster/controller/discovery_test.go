@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -188,6 +189,7 @@ func TestServiceDiscovery_NodeOperations(t *testing.T) {
 	t.Run("AddNode - Success", func(t *testing.T) {
 		rm.isLeader = true
 		rm.On("GetLeaderAddress").Return("localhost:9001").Once()
+		rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: raft.Configuration{}}).Once()
 		rm.On("AddVoter", "node2", "localhost:9002").Return(nil).Once()
 		rm.On("ApplyCommand", "REGISTER", mock.Anything).Return(nil).Once()
 
@@ -216,6 +218,43 @@ func TestServiceDiscovery_NodeOperations(t *testing.T) {
 		assert.Equal(t, "inactive", brokers[0].Status)
 		rm.AssertExpectations(t)
 	})
+}
+
+func TestServiceDiscoveryExistingVoterJoinIsMembershipNoOp(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	rm.On("GetLeaderAddress").Return("leader:9001").Once()
+	rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: raft.Configuration{Servers: []raft.Server{
+		{ID: "node2", Address: "localhost:9002", Suffrage: raft.Voter},
+	}}}).Once()
+
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	leader, err := sd.AddNodeWithTransactionCoordinatorShards("node2", "localhost:9002", 0)
+
+	assert.NoError(t, err)
+	assert.Equal(t, "leader:9001", leader)
+	rm.AssertNotCalled(t, "AddVoter", mock.Anything, mock.Anything)
+	rm.AssertNotCalled(t, "ApplyCommand", "REGISTER", mock.Anything)
+	rm.AssertExpectations(t)
+}
+
+func TestServiceDiscoveryExistingVoterJoinRejectsAddressChange(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	rm.On("GetLeaderAddress").Return("leader:9001").Once()
+	rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: raft.Configuration{Servers: []raft.Server{
+		{ID: "node2", Address: "localhost:9002", Suffrage: raft.Voter},
+	}}}).Once()
+
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	_, err := sd.AddNodeWithTransactionCoordinatorShards("node2", "localhost:9999", 0)
+
+	assert.ErrorContains(t, err, "already belongs to raft")
+	rm.AssertNotCalled(t, "AddVoter", mock.Anything, mock.Anything)
+	rm.AssertNotCalled(t, "ApplyCommand", "REGISTER", mock.Anything)
+	rm.AssertExpectations(t)
 }
 
 func TestServiceDiscoveryRejectsMismatchedTransactionCoordinatorShardCountBeforeAddingVoter(t *testing.T) {
@@ -290,19 +329,53 @@ func TestServiceDiscoveryReconcileMarksHeartbeatExpiredBrokerInactive(t *testing
 	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
 	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node1","addr":"localhost:9001","status":"active"}`)})
 	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node2","addr":"localhost:9002","status":"active"}`)})
-	liveness := &LivenessMockISRManager{alive: map[string]bool{"node1": true, "node2": false}}
 	configuration := raft.Configuration{Servers: []raft.Server{
 		{ID: "node1", Address: "localhost:9001"},
 		{ID: "node2", Address: "localhost:9002"},
 	}}
 	rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: configuration}).Once()
-	rm.On("GetISRManager").Return(liveness)
 	rm.On("ApplyCommand", "DEREGISTER", mock.Anything).Return(nil).Once()
+
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	sd.livenessMu.Lock()
+	sd.leaderSince = time.Now().Add(-2 * sd.heartbeatTimeout)
+	sd.livenessMu.Unlock()
+	sd.Reconcile()
+
+	assert.Equal(t, "inactive", rm.mockFSM.GetBroker("node2").Status)
+	rm.AssertExpectations(t)
+}
+
+func TestServiceDiscoveryLeaderGraceDefersMembershipTransition(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node1","addr":"localhost:9001","status":"active"}`)})
+	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node2","addr":"localhost:9002","status":"active"}`)})
+	configuration := raft.Configuration{Servers: []raft.Server{{ID: "node1", Address: "localhost:9001"}, {ID: "node2", Address: "localhost:9002"}}}
+	rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: configuration}).Once()
 
 	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
 	sd.Reconcile()
 
+	assert.Equal(t, "active", rm.mockFSM.GetBroker("node2").Status)
+	rm.AssertNotCalled(t, "ApplyCommand", "DEREGISTER", mock.Anything)
+	rm.AssertExpectations(t)
+}
+
+func TestServiceDiscoveryRejectsFencedHeartbeat(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node2","addr":"localhost:9002","status":"inactive","incarnation_id":"current","incarnation_epoch":2}`)})
+	rm.On("GetISRManager").Return(nil).Once()
+	rm.On("ApplyCommand", "REGISTER", mock.Anything).Return(nil).Once()
+
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	sd.UpdateHeartbeatWithIncarnation("node2", "stale")
 	assert.Equal(t, "inactive", rm.mockFSM.GetBroker("node2").Status)
+	sd.UpdateHeartbeatWithIncarnation("node2", "current")
+	assert.Equal(t, "active", rm.mockFSM.GetBroker("node2").Status)
 	rm.AssertExpectations(t)
 }
 
@@ -323,4 +396,54 @@ func TestServiceDiscoveryHeartbeatReactivatesBroker(t *testing.T) {
 	assert.Equal(t, "active", rm.mockFSM.GetBroker("node2").Status)
 	rm.AssertExpectations(t)
 	isr.AssertExpectations(t)
+}
+
+func TestServiceDiscoveryLifecycleFencesUnavailableAndStaleBrokers(t *testing.T) {
+	withoutRaft := NewServiceDiscoveryImpl(nil, "node1", "localhost:9001", "")
+	assert.NotEmpty(t, withoutRaft.BrokerIncarnationID())
+	assert.ErrorContains(t, withoutRaft.Deregister(), "fsm_unavailable")
+	assert.NoError(t, withoutRaft.ValidateHeartbeat("node1", "stale"))
+	withoutRaft.UpdateHeartbeatWithIncarnation("node1", "stale")
+	withoutRaft.Reconcile()
+	_, err := withoutRaft.FetchReplicaCatchup(fsm.ReplicaCatchupRequest{Topic: "orders", Partition: 0})
+	assert.ErrorContains(t, err, "FSM is unavailable")
+	_, err = marshalBrokerDeregistration(nil)
+	assert.ErrorContains(t, err, "requires current broker metadata")
+	_, err = marshalBrokerDeregistration(&fsm.BrokerInfo{})
+	assert.ErrorContains(t, err, "requires current broker metadata")
+
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	assert.ErrorContains(t, sd.Deregister(), "registration_not_found")
+	assert.ErrorContains(t, sd.ValidateHeartbeat("missing", "process"), "registration_not_found")
+
+	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node1","addr":"localhost:9001","status":"active","incarnation_id":"current"}`)})
+	assert.ErrorContains(t, sd.Deregister(), "incarnation_mismatch")
+	assert.ErrorContains(t, sd.ValidateHeartbeat("node1", "stale"), "incarnation_mismatch")
+}
+
+func TestServiceDiscoveryReplicaCatchupSourceAndFollowerReconcileFences(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	metadata := fsm.PartitionMetadata{
+		Leader: "leader", LeaderEpoch: 1, LifecycleEpoch: 1,
+		CommittedHWM: 1, CommittedHWMKnown: true, PartitionCount: 1,
+		Replicas: []string{"leader", "follower"}, ISR: []string{"leader"},
+	}
+	payload, err := json.Marshal(metadata)
+	assert.NoError(t, err)
+	assert.Nil(t, rm.mockFSM.Apply(&raft.Log{Data: append([]byte("PARTITION:orders-0:"), payload...)}))
+
+	sd := NewServiceDiscoveryImpl(rm, "follower", "localhost:9002", "")
+	_, err = sd.FetchReplicaCatchup(fsm.ReplicaCatchupRequest{Topic: "orders", Partition: 0, Leader: "leader"})
+	assert.ErrorContains(t, err, "not selected catch-up source")
+	_, err = sd.FetchReplicaCatchup(fsm.ReplicaCatchupRequest{Topic: "missing", Partition: 0})
+	assert.ErrorContains(t, err, "partition metadata not found")
+
+	sd.leaderSince = time.Now()
+	rm.isLeader = false
+	sd.Reconcile()
+	assert.True(t, sd.leaderSince.IsZero())
 }

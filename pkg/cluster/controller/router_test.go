@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -8,9 +10,60 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
 )
+
+func installConsumerOffsetsTopology(t *testing.T, state *fsm.BrokerFSM, index uint64) uint64 {
+	t.Helper()
+	for _, broker := range state.GetBrokers() {
+		broker.LifecycleProtocol = fsm.BrokerProtocolVersionCurrent
+		payload, err := json.Marshal(broker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result := state.Apply(&raft.Log{Index: index, Data: append([]byte("REGISTER:"), payload...)}); result != nil {
+			t.Fatalf("upgrade broker protocol: %v", result)
+		}
+		index++
+	}
+	definition := topic.DefaultDefinition(config.ConsumerOffsetsTopicName, config.DefaultConfig())
+	definition.Partitions = 4
+	definition.ReplicationFactor = 3
+	definition.Policy = topic.ConsumerMetadataPolicy()
+	payload, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := state.Apply(&raft.Log{Index: index, Data: append([]byte("TOPIC:"), payload...)})
+	if result != nil {
+		t.Fatalf("install consumer offsets topology: %v", result)
+	}
+	return index + 1
+}
+
+func setConsumerOffsetsLeaders(t *testing.T, state *fsm.BrokerFSM, index uint64, leader string) uint64 {
+	t.Helper()
+	for partition := 0; partition < 4; partition++ {
+		key := config.ConsumerOffsetsTopicName + "-" + strconv.Itoa(partition)
+		metadata := state.GetPartitionMetadata(key)
+		if metadata == nil {
+			t.Fatalf("missing offsets partition metadata %s", key)
+		}
+		metadata.Leader = leader
+		metadata.LeaderEpoch++
+		data, err := json.Marshal(metadata)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result := state.Apply(&raft.Log{Index: index, Data: []byte("PARTITION:" + key + ":" + string(data))}); result != nil {
+			t.Fatalf("set offsets partition leader: %v", result)
+		}
+		index++
+	}
+	return index
+}
 
 func TestWithInternalTokenPreservesLongRawCommand(t *testing.T) {
 	router := &ClusterRouter{internalToken: "secret"}
@@ -102,6 +155,7 @@ func TestClusterRouter_FindCoordinator(t *testing.T) {
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"node1\",\"addr\":\"localhost:7001\",\"status\":\"active\"}")})
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"node2\",\"addr\":\"localhost:7002\",\"status\":\"active\"}")})
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"node3\",\"addr\":\"localhost:7003\",\"status\":\"active\"}")})
+	installConsumerOffsetsTopology(t, mockFSM, 4)
 
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
 	router := NewClusterRouter("node1", "localhost:7001", nil, rm, 7000, "", nil)
@@ -127,12 +181,13 @@ func TestClusterRouter_FindCoordinator(t *testing.T) {
 	t.Logf("Group %s -> %s (%s)", group1, id1, addr1)
 	t.Logf("Group %s -> %s (%s)", group2, id2, addr2)
 
-	// Verify stability when a node is added
+	// Adding an unrelated broker cannot move a group coordinator. Only the
+	// durable offsets-partition leader may do that.
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"node4\",\"addr\":\"localhost:7004\",\"status\":\"active\"}")})
 	id1_after, _, _ := router.FindCoordinator(group1)
-
-	// With 3->4 nodes, group-a might or might not move, but it shouldn't depend on other groups
-	t.Logf("Group %s after adding node4 -> %s", group1, id1_after)
+	if id1_after != id1 {
+		t.Fatalf("adding broker changed coordinator without offsets leader transition: %s -> %s", id1, id1_after)
+	}
 }
 
 func TestClusterRouterFindTransactionCoordinatorUsesDurableShardOwner(t *testing.T) {
@@ -164,11 +219,13 @@ func TestClusterRouter_FindCoordinator_CacheRebuild(t *testing.T) {
 	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n1\",\"addr\":\"localhost:7001\",\"status\":\"active\"}")})
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n2\",\"addr\":\"localhost:7002\",\"status\":\"active\"}")})
+	installConsumerOffsetsTopology(t, mockFSM, 3)
+	installConsumerOffsetsTopology(t, mockFSM, 3)
 
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
 	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "", nil)
 
-	// First call builds ring
+	// Same group is stable while durable partition metadata is unchanged.
 	id1, _, err := router.FindCoordinator("group-x")
 	if err != nil {
 		t.Fatalf("FindCoordinator failed: %v", err)
@@ -180,19 +237,55 @@ func TestClusterRouter_FindCoordinator_CacheRebuild(t *testing.T) {
 		t.Fatalf("Cached ring returned different result: %s vs %s", id1, id2)
 	}
 
-	// Add broker -> should rebuild ring
+	// An unrelated membership registration must not move the coordinator.
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n3\",\"addr\":\"localhost:7003\",\"status\":\"active\"}")})
 	id3, _, err := router.FindCoordinator("group-x")
 	if err != nil {
 		t.Fatalf("FindCoordinator after adding node failed: %v", err)
 	}
-	t.Logf("group-x: before=%s, after=%s", id1, id3)
+	if id1 != id3 {
+		t.Fatalf("membership changed coordinator without offsets leader transition: %s -> %s", id1, id3)
+	}
+}
+
+func TestClusterRouterFindCoordinatorFollowsDurableOffsetsLeader(t *testing.T) {
+	state := fsm.NewBrokerFSM(nil, nil)
+	for index, id := range []string{"n1", "n2", "n3"} {
+		state.Apply(&raft.Log{Index: uint64(index + 1), Data: []byte(`REGISTER:{"id":"` + id + `","addr":"localhost:700` + string(rune('1'+index)) + `","status":"active"}`)})
+	}
+	next := installConsumerOffsetsTopology(t, state, 4)
+	next = setConsumerOffsetsLeaders(t, state, next, "n2")
+	rm := &MockRaftManager{isLeader: true, mockFSM: state}
+	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "", nil)
+
+	id, _, partition, epoch, err := router.FindCoordinatorWithEpoch("failover-group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "n2" {
+		t.Fatalf("coordinator=%s, want durable offsets leader n2", id)
+	}
+	if partition >= 4 || epoch == 0 {
+		t.Fatalf("invalid durable coordinator fence partition=%d epoch=%d", partition, epoch)
+	}
+	setConsumerOffsetsLeaders(t, state, next, "n1")
+	id, _, nextPartition, nextEpoch, err := router.FindCoordinatorWithEpoch("failover-group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "n1" {
+		t.Fatalf("coordinator=%s, want post-apply offsets leader n1", id)
+	}
+	if nextPartition != partition || nextEpoch <= epoch {
+		t.Fatalf("durable coordinator fence did not advance: partition %d->%d epoch %d->%d", partition, nextPartition, epoch, nextEpoch)
+	}
 }
 
 func TestClusterRouter_FindCoordinatorOwnersUsesOneMembershipSnapshot(t *testing.T) {
 	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n1\",\"addr\":\"localhost:7001\",\"status\":\"active\"}")})
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n2\",\"addr\":\"localhost:7002\",\"status\":\"active\"}")})
+	installConsumerOffsetsTopology(t, mockFSM, 3)
 
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
 	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "", nil)
@@ -240,6 +333,7 @@ func TestClusterRouter_FindCoordinator_NilFSM(t *testing.T) {
 func TestClusterRouter_ForwardToCoordinator_Local(t *testing.T) {
 	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n1\",\"addr\":\"localhost:7001\",\"status\":\"active\"}")})
+	installConsumerOffsetsTopology(t, mockFSM, 2)
 
 	processor := &MockLocalProcessor{}
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}
@@ -262,9 +356,15 @@ func TestClusterRouter_ForwardToPartitionLeader_Local(t *testing.T) {
 	mockFSM := fsm.NewBrokerFSM(nil, nil)
 	mockFSM.Apply(&raft.Log{Data: []byte("REGISTER:{\"id\":\"n1\",\"addr\":\"localhost:7001\",\"status\":\"active\"}")})
 
-	// Create a topic with 1 partition, leader = n1
-	topicData := `{"name":"t1","partitions":1,"leader_id":"n1","replication_factor":1}`
-	mockFSM.Apply(&raft.Log{Data: []byte("TOPIC:" + topicData)})
+	// Create a topic with 1 partition, leader = n1.
+	definition := topic.DefaultDefinition("t1", config.DefaultConfig())
+	definition.Partitions = 1
+	definition.ReplicationFactor = 1
+	payload, err := json.Marshal(fsm.TopicCommand{Definition: &definition, LeaderID: "n1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mockFSM.Apply(&raft.Log{Data: append([]byte("TOPIC:"), payload...)})
 
 	processor := &MockLocalProcessor{}
 	rm := &MockRaftManager{isLeader: true, mockFSM: mockFSM}

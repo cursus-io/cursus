@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -10,6 +11,9 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
@@ -21,10 +25,19 @@ type coordinatorRoutingRaftManager struct {
 
 type coordinatorRoutingTopicHandler struct {
 	coordinator.TopicHandler
+	readErr error
+}
+
+func (coordinatorRoutingTopicHandler) Publish(string, *types.Message) error {
+	return nil
 }
 
 func (coordinatorRoutingTopicHandler) CreateTopic(string, int, bool, bool) error {
 	return nil
+}
+
+func (handler *coordinatorRoutingTopicHandler) ReadTopicPartition(string, int, uint64, int) ([]types.Message, error) {
+	return nil, handler.readErr
 }
 
 func (m *coordinatorRoutingRaftManager) GetFSM() *fsm.BrokerFSM {
@@ -65,14 +78,47 @@ func registerRoutingBroker(t *testing.T, brokerFSM *fsm.BrokerFSM, id string) {
 	t.Helper()
 	result := brokerFSM.Apply(&raft.Log{
 		Index: 1,
-		Data:  []byte(`REGISTER:{"id":"` + id + `","addr":"127.0.0.1:7000","status":"active"}`),
+		Data:  []byte(`REGISTER:{"id":"` + id + `","addr":"127.0.0.1:7000","status":"active","lifecycle_protocol":2}`),
 	})
 	require.Nil(t, result)
+}
+
+func installRoutingOffsetsTopology(t *testing.T, brokerFSM *fsm.BrokerFSM, leader string) {
+	t.Helper()
+	definition := topic.DefaultDefinition(config.ConsumerOffsetsTopicName, config.DefaultConfig())
+	definition.Partitions = 4
+	definition.ReplicationFactor = 1
+	definition.Policy = topic.ConsumerMetadataPolicy()
+	payload, err := json.Marshal(fsm.TopicCommand{Definition: &definition, LeaderID: leader})
+	require.NoError(t, err)
+	result := brokerFSM.Apply(&raft.Log{
+		Index: 2,
+		Data:  append([]byte("TOPIC:"), payload...),
+	})
+	require.Nil(t, result)
+}
+
+func installRoutingTopic(t *testing.T, brokerFSM *fsm.BrokerFSM, name, leader string) {
+	t.Helper()
+	definition := topic.DefaultDefinition(name, config.DefaultConfig())
+	definition.Partitions = 1
+	definition.ReplicationFactor = 1
+	payload, err := json.Marshal(fsm.TopicCommand{Definition: &definition, LeaderID: leader})
+	require.NoError(t, err)
+	require.Nil(t, brokerFSM.Apply(&raft.Log{Index: 3, Data: append([]byte("TOPIC:"), payload...)}))
+}
+
+func markCoordinatorRecovered(t *testing.T, handler *CommandHandler, groupName string) {
+	t.Helper()
+	_, _, partition, epoch, err := handler.Cluster.Router.FindCoordinatorWithEpoch(groupName)
+	require.NoError(t, err)
+	handler.groupRecoveryEpoch[partition] = epoch
 }
 
 func TestCheckCoordinatorNormalLocalAndRemoteRoutes(t *testing.T) {
 	brokerFSM := fsm.NewBrokerFSM(nil, nil)
 	registerRoutingBroker(t, brokerFSM, "node-1")
+	installRoutingOffsetsTopology(t, brokerFSM, "node-1")
 
 	t.Run("local", func(t *testing.T) {
 		handler := newCoordinatorRoutingHandler("node-1", brokerFSM, nil)
@@ -94,12 +140,89 @@ func TestCheckCoordinatorNormalLocalAndRemoteRoutes(t *testing.T) {
 	})
 }
 
+func TestRecoveredCoordinatorRouteRejectsLeadershipChange(t *testing.T) {
+	brokerFSM := fsm.NewBrokerFSM(nil, nil)
+	registerRoutingBroker(t, brokerFSM, "node-1")
+	installRoutingOffsetsTopology(t, brokerFSM, "node-1")
+	handler := newCoordinatorRoutingHandler("node-1", brokerFSM, nil)
+	groupName := "workers"
+	_, _, partition, epoch, err := handler.Cluster.Router.FindCoordinatorWithEpoch(groupName)
+	require.NoError(t, err)
+
+	key := fmt.Sprintf("%s-%d", config.ConsumerOffsetsTopicName, partition)
+	metadata := brokerFSM.GetPartitionMetadata(key)
+	require.NotNil(t, metadata)
+	metadata.LeaderEpoch++
+	payload, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, brokerFSM.Apply(&raft.Log{Index: 3, Data: []byte("PARTITION:" + key + ":" + string(payload))}))
+
+	require.ErrorContains(t, handler.validateRecoveredCoordinatorRoute(groupName, partition, epoch), "ownership changed during recovery")
+}
+
+func TestDistributedJoinFailsClosedWhenLocalCoordinatorIsNil(t *testing.T) {
+	brokerFSM := fsm.NewBrokerFSM(nil, nil)
+	registerRoutingBroker(t, brokerFSM, "node-1")
+	installRoutingOffsetsTopology(t, brokerFSM, "node-1")
+	handler := newCoordinatorRoutingHandler("node-1", brokerFSM, nil)
+
+	response := handler.HandleCommand(
+		"JOIN_GROUP topic=orders group=workers member=worker-1",
+		NewClientContext("workers", 0),
+	)
+	require.Equal(t, coordinatorUnavailableResponse, response)
+}
+
+func TestDistributedRegisterGroupRoutesBeforeLocalTopicAdmission(t *testing.T) {
+	brokerFSM := fsm.NewBrokerFSM(nil, nil)
+	registerRoutingBroker(t, brokerFSM, "node-1")
+	registerRoutingBroker(t, brokerFSM, "node-2")
+	installRoutingOffsetsTopology(t, brokerFSM, "node-1")
+
+	probe := newCoordinatorRoutingHandler("node-1", brokerFSM, nil)
+	owner, _, err := probe.Cluster.Router.FindCoordinator("workers")
+	require.NoError(t, err)
+	nonOwner := "node-1"
+	if owner == nonOwner {
+		nonOwner = "node-2"
+	}
+	handler := newCoordinatorRoutingHandler(nonOwner, brokerFSM, nil)
+	response := handler.HandleCommand("REGISTER_GROUP topic=orders group=workers", NewClientContext("workers", 0))
+	require.Contains(t, response, "ERROR: NOT_COORDINATOR")
+	require.NotContains(t, response, "topic_not_found")
+}
+
+func TestDistributedRegisterGroupDistinguishesPendingFromMissingTopic(t *testing.T) {
+	cfg := config.DefaultConfig()
+	groupCoordinator := coordinator.NewCoordinator(context.Background(), cfg, &coordinatorRoutingTopicHandler{})
+	brokerFSM := fsm.NewBrokerFSM(nil, groupCoordinator)
+	registerRoutingBroker(t, brokerFSM, "node-1")
+	installRoutingOffsetsTopology(t, brokerFSM, "node-1")
+	installRoutingTopic(t, brokerFSM, "orders", "node-1")
+	handler := newCoordinatorRoutingHandler("node-1", brokerFSM, groupCoordinator)
+	markCoordinatorRecovered(t, handler, "workers")
+
+	response := handler.HandleCommand("REGISTER_GROUP topic=orders group=workers", NewClientContext("workers", 0))
+	require.Contains(t, response, "ERROR: topic_materialization_pending")
+	parsed, ok := protocol.ParseErrorResponse(response)
+	require.True(t, ok)
+	require.Equal(t, protocol.ErrorClassAvailability, parsed.Class)
+	require.True(t, parsed.Retryable)
+
+	response = handler.HandleCommand("REGISTER_GROUP topic=missing group=workers", NewClientContext("workers", 0))
+	require.Contains(t, response, "ERROR: topic_not_found")
+
+	response = handler.HandleCommand("REGISTER_GROUP pattern=orders* group=workers", NewClientContext("workers", 0))
+	require.Contains(t, response, "ERROR: topic_materialization_pending")
+}
+
 func TestResolveGroupCoordinatorAcrossThreeBrokersAndMovement(t *testing.T) {
 	brokerFSM := fsm.NewBrokerFSM(nil, nil)
 	brokerIDs := []string{"node-1", "node-2", "node-3"}
 	for _, brokerID := range brokerIDs {
 		registerRoutingBroker(t, brokerFSM, brokerID)
 	}
+	installRoutingOffsetsTopology(t, brokerFSM, brokerIDs[0])
 
 	handlers := make(map[string]*CommandHandler, len(brokerIDs))
 	for _, brokerID := range brokerIDs {
@@ -116,6 +239,16 @@ func TestResolveGroupCoordinatorAcrossThreeBrokersAndMovement(t *testing.T) {
 		Data:  []byte(`DEREGISTER:{"id":"` + ownerID + `"}`),
 	})
 	require.Nil(t, result)
+	for partition := 0; partition < 4; partition++ {
+		key := fmt.Sprintf("%s-%d", config.ConsumerOffsetsTopicName, partition)
+		metadata := brokerFSM.GetPartitionMetadata(key)
+		require.NotNil(t, metadata)
+		metadata.Leader = "node-2"
+		metadata.LeaderEpoch++
+		payload, marshalErr := json.Marshal(metadata)
+		require.NoError(t, marshalErr)
+		require.Nil(t, brokerFSM.Apply(&raft.Log{Index: uint64(3 + partition), Data: []byte("PARTITION:" + key + ":" + string(payload))}))
+	}
 	newOwnerID, _, err := handlers[brokerIDs[0]].Cluster.Router.FindCoordinator(groupName)
 	require.NoError(t, err)
 	require.NotEqual(t, ownerID, newOwnerID)
@@ -144,6 +277,60 @@ func TestResolveGroupCoordinatorsFailsClosedWhenDistributedControlPlaneIsMissing
 	resolved, err := handler.ResolveGroupCoordinators([]string{"workers"})
 	require.ErrorContains(t, err, "raft manager unavailable")
 	require.Nil(t, resolved)
+}
+
+func TestCoordinatorOwnershipChecksRecoverAndFailClosed(t *testing.T) {
+	var nilHandler *CommandHandler
+	resolved, err := nilHandler.ResolveGroupCoordinators([]string{"workers"})
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{"workers": true}, resolved)
+	require.True(t, (&CommandHandler{}).IsGroupCoordinator("workers"))
+
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	reader := &coordinatorRoutingTopicHandler{}
+	groupCoordinator, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, reader)
+	require.NoError(t, err)
+	t.Cleanup(groupCoordinator.Stop)
+
+	withoutRouter := NewCommandHandler(nil, cfg, groupCoordinator, nil, &clusterController.ClusterController{
+		RaftManager: &coordinatorRoutingRaftManager{},
+	})
+	require.False(t, withoutRouter.IsGroupCoordinator("workers"))
+	require.ErrorContains(t, withoutRouter.ExpireGroupMembers("workers", 0, nil), "group_not_found")
+
+	brokerFSM := fsm.NewBrokerFSM(nil, groupCoordinator)
+	registerRoutingBroker(t, brokerFSM, "node-1")
+	registerRoutingBroker(t, brokerFSM, "node-2")
+	installRoutingOffsetsTopology(t, brokerFSM, "node-1")
+	local := newCoordinatorRoutingHandler("node-1", brokerFSM, groupCoordinator)
+	remote := newCoordinatorRoutingHandler("node-2", brokerFSM, groupCoordinator)
+	require.True(t, local.IsGroupCoordinator("workers"))
+	require.False(t, remote.IsGroupCoordinator("workers"))
+
+	resolved, err = local.ResolveGroupCoordinators([]string{"workers", "auditors"})
+	require.NoError(t, err)
+	require.True(t, resolved["workers"])
+	require.True(t, resolved["auditors"])
+
+	_, _, partition, _, err := local.Cluster.Router.FindCoordinatorWithEpoch("workers")
+	require.NoError(t, err)
+	delete(local.groupRecoveryEpoch, partition)
+	reader.readErr = fmt.Errorf("committed metadata unavailable")
+	require.False(t, local.IsGroupCoordinator("workers"))
+	_, err = local.ResolveGroupCoordinators([]string{"workers"})
+	require.ErrorContains(t, err, "committed metadata unavailable")
+}
+
+func TestCoordinatorRecoveryHelpersRejectUnavailableState(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	handler := NewCommandHandler(nil, cfg, nil, nil, nil)
+	require.ErrorContains(t, handler.ensureGroupRecovery(0, 1), "coordinator unavailable")
+	require.ErrorContains(t, handler.ExpireGroupMembers("workers", 1, []string{"member"}), "coordinator not available")
+
+	brokenRoute := newCoordinatorRoutingHandler("node-1", nil, nil)
+	require.ErrorContains(t, brokenRoute.validateRecoveredCoordinatorRoute("workers", 0, 1), "revalidate coordinator ownership")
 }
 
 func resolvedCoordinatorCount(t *testing.T, handlers map[string]*CommandHandler, groupName string) int {
@@ -203,7 +390,13 @@ func TestGroupCommandsFailClosedWhenCoordinatorDiscoveryFails(t *testing.T) {
 func TestDistributedOffsetCommandsMatchStrictRaftSchema(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
-	groupCoordinator := coordinator.NewCoordinator(context.Background(), cfg, &coordinatorRoutingTopicHandler{})
+	// This test exercises command parsing and coordinator routing. Keep the
+	// in-memory group fixture standalone: durable lifecycle recovery is covered
+	// separately by the coordinator replay tests.
+	groupCoordinator := coordinator.NewCoordinator(context.Background(), config.DefaultConfig(), &coordinatorRoutingTopicHandler{})
+	// Live distributed commits are durable in __consumer_offsets, not mirrored
+	// through the controller Raft FSM. The writer models the acknowledged
+	// partition append used by the real command handler.
 	require.NoError(t, groupCoordinator.RegisterGroup("orders", "workers", 2))
 	_, err := groupCoordinator.AddConsumer("workers", "worker-1")
 	require.NoError(t, err)
@@ -211,6 +404,7 @@ func TestDistributedOffsetCommandsMatchStrictRaftSchema(t *testing.T) {
 
 	brokerFSM := fsm.NewBrokerFSM(nil, groupCoordinator)
 	registerRoutingBroker(t, brokerFSM, "node-1")
+	installRoutingOffsetsTopology(t, brokerFSM, "node-1")
 	raftManager := &coordinatorRoutingRaftManager{brokerFSM: brokerFSM}
 	raftManager.state = brokerFSM
 	raftManager.isLeader = true
@@ -222,6 +416,11 @@ func TestDistributedOffsetCommandsMatchStrictRaftSchema(t *testing.T) {
 	handler := NewCommandHandler(nil, cfg, groupCoordinator, nil, &clusterController.ClusterController{
 		RaftManager: raftManager,
 		Router:      router,
+	})
+	writes := 0
+	groupCoordinator.SetOffsetRecordWriter(func(coordinator.ConsumerMetadataRecord) error {
+		writes++
+		return nil
 	})
 	requestContext := NewClientContext("workers", 0)
 
@@ -239,6 +438,7 @@ func TestDistributedOffsetCommandsMatchStrictRaftSchema(t *testing.T) {
 	offset, ok := groupCoordinator.GetOffset("workers", "orders", 1)
 	require.True(t, ok)
 	require.Equal(t, uint64(7), offset)
+	require.GreaterOrEqual(t, writes, 2)
 
 	legacyPositional := handler.HandleCommand(fmt.Sprintf(
 		"BATCH_COMMIT topic=orders group=workers member=worker-1 generation=%d P0:8",

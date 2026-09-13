@@ -46,13 +46,16 @@ func (cc *ClusterController) RunReplicaCatchupOnce(ctx context.Context, fetcher 
 	if fetcher == nil || apply == nil {
 		return fmt.Errorf("replica catch-up dependencies are unavailable")
 	}
-	requests := cc.RaftManager.GetFSM().BuildReplicaCatchupRequests(cc.brokerID)
+	fsmState := cc.RaftManager.GetFSM()
+	_ = fsmState.ReconcileReplicaMaterializations(cc.brokerID)
+	requests := fsmState.BuildReplicaCatchupRequests(cc.brokerID)
 	var catchupErr error
 	for _, request := range requests {
 		if err := cc.catchupReplica(ctx, fetcher, apply, request); err != nil {
 			catchupErr = errors.Join(catchupErr, fmt.Errorf("%s-%d: %w", request.Topic, request.Partition, err))
 		}
 	}
+	_ = fsmState.ReconcileReplicaMaterializations(cc.brokerID)
 	return catchupErr
 }
 
@@ -63,7 +66,7 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 	}
 	for request.NextOffset < request.CommittedHWM {
 		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		batch, err := fetcher.FetchReplicaCatchup(fetchCtx, request.LeaderAddress, discoveryPort, request)
+		batch, err := fetcher.FetchReplicaCatchup(fetchCtx, request.SourceAddress, discoveryPort, request)
 		cancel()
 		if err != nil {
 			return err
@@ -87,8 +90,12 @@ func validateReplicaCatchupBatch(request fsm.ReplicaCatchupRequest, batch fsm.Re
 	if batch.Topic != request.Topic || batch.Partition != request.Partition || batch.BrokerID != request.BrokerID {
 		return fmt.Errorf("replica catch-up response identity mismatch")
 	}
-	if batch.Leader != request.Leader || batch.LeaderEpoch != request.LeaderEpoch || batch.LifecycleEpoch != request.LifecycleEpoch {
+	if batch.Leader != request.Leader || batch.SourceBroker != request.SourceBroker ||
+		batch.LeaderEpoch != request.LeaderEpoch || batch.LifecycleEpoch != request.LifecycleEpoch {
 		return fmt.Errorf("replica catch-up response fence mismatch")
+	}
+	if err := fsm.ValidateReplicaCatchupBatchDigest(batch); err != nil {
+		return err
 	}
 	if batch.CommittedHWM != request.CommittedHWM || batch.StartOffset != request.NextOffset {
 		return fmt.Errorf("replica catch-up response boundary mismatch")

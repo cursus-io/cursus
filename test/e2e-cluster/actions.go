@@ -48,6 +48,22 @@ func (a *ClusterActions) StartCluster() *ClusterActions {
 	}); err != nil {
 		a.ctx.GetT().Fatal(err)
 	}
+	// A broker can be registered before the leader has durably installed the
+	// __consumer_offsets partition topology.  Group clients correctly receive a
+	// retryable coordinator_not_available during that short interval; do not let
+	// unrelated E2Es turn that expected bootstrap state into a one-shot join
+	// failure.  FIND_COORDINATOR is the client-visible readiness boundary.
+	if err := eventually(a.ctx.GetT(), "durable group coordinator route", clusterReadyTimeout, func() (bool, string, error) {
+		client := e2e.NewBrokerClient(a.ctx.GetBrokerAddrs())
+		response, requestErr := client.SendCommand("", "FIND_COORDINATOR group=__cluster_readiness", 2*time.Second)
+		client.Close()
+		if requestErr != nil {
+			return false, "FIND_COORDINATOR failed", requestErr
+		}
+		return strings.HasPrefix(response, "OK coordinator_id="), response, nil
+	}); err != nil {
+		a.ctx.GetT().Fatal(err)
+	}
 	return a
 }
 
