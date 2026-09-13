@@ -1195,6 +1195,9 @@ func (p *Partition) FinalizeSnapshotRecovery(hwm uint64) error {
 	}
 	checkpointHWM := p.recoveryCheckpointHWM
 	snapshotHWM := p.recoverySnapshotHWM
+	if hwm < checkpointHWM {
+		return fmt.Errorf("committed HWM regression: current=%d requested=%d", checkpointHWM, hwm)
+	}
 	p.snapshotRecovery = false
 	p.recoveryCheckpointHWM = 0
 	p.recoverySnapshotHWM = 0
