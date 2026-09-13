@@ -63,6 +63,8 @@ func (ch *CommandHandler) ApplyReplicaCatchup(batch replicationFSM.ReplicaCatchu
 	if err != nil {
 		return err
 	}
+	releaseMutation := partition.BeginReplicationMutation()
+	defer releaseMutation()
 	if partition.NextOffset() != batch.StartOffset {
 		return fmt.Errorf("replica catch-up local LEO changed: current=%d response_start=%d", partition.NextOffset(), batch.StartOffset)
 	}
