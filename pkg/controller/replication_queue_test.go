@@ -216,6 +216,64 @@ func TestIdempotentDuplicateResumesReplicationBeforeAcknowledging(t *testing.T) 
 	require.Equal(t, uint64(1), partition.GetHWM())
 }
 
+func TestLeaderReplicationFenceBlocksStaleCommittedHWMReconcile(t *testing.T) {
+	handler, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 0, Payload: "committed"}}))
+	require.NoError(t, partition.ApplyReplicaHWM(1))
+
+	state := handler.Cluster.RaftManager.GetFSM()
+	applyPartitionMetadata(t, state, "orders", 0, fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 7, CommittedHWM: 1,
+		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1", "broker-2"},
+		PartitionCount: 1,
+	})
+
+	releaseWrite, releaseMutation, _, err := handler.preparePartitionLeaderSnapshot("orders", 0, partition, 2)
+	require.NoError(t, err)
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			releaseMutation()
+			releaseWrite()
+		}
+	})
+
+	inFlight := []types.Message{{Payload: "lifecycle-snapshot"}}
+	require.NoError(t, partition.EnqueueBatchLeader(inFlight))
+	require.Equal(t, uint64(2), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM())
+
+	reconcileResult := make(chan error, 1)
+	go func() {
+		reconcileResult <- partition.ReconcileCommittedHWM(1)
+	}()
+
+	select {
+	case reconcileErr := <-reconcileResult:
+		require.NoError(t, reconcileErr)
+		applyErr := partition.ApplyReplicaHWM(2)
+		require.ErrorContains(t, applyErr, "commit watermark 2 is ahead of local LEO 1")
+		t.Fatal("stale reconcile truncated an in-flight leader append")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	require.NoError(t, partition.ApplyReplicaHWM(2))
+	releaseMutation()
+	releaseWrite()
+	released = true
+	select {
+	case reconcileErr := <-reconcileResult:
+		require.ErrorContains(t, reconcileErr, "committed HWM regression")
+	case <-time.After(time.Second):
+		t.Fatal("stale reconcile did not resume after replication mutation completed")
+	}
+	require.Equal(t, uint64(2), partition.NextOffset())
+	require.Equal(t, uint64(2), partition.GetHWM())
+}
+
 func TestAllAcknowledgementRetriesTransientFollowerFailureBeforeResponding(t *testing.T) {
 	executor := newBarrierReplicationExecutor()
 	executor.replicateErr = context.DeadlineExceeded
@@ -556,9 +614,24 @@ func TestDistributedLeaderAcknowledgementReturnsBeforeFollowerAndKeepsReplicatin
 	require.Equal(t, uint64(1), partition.NextOffset())
 	require.Zero(t, partition.GetHWM(), "leader-only append became consumer-visible")
 	require.Zero(t, executor.committed())
+	reconcileResult := make(chan error, 1)
+	go func() {
+		reconcileResult <- partition.ReconcileCommittedHWM(0)
+	}()
+	select {
+	case reconcileErr := <-reconcileResult:
+		t.Fatalf("stale reconcile bypassed asynchronous replication fence: %v", reconcileErr)
+	case <-time.After(100 * time.Millisecond):
+	}
 
 	close(executor.barrier)
 	require.Eventually(t, func() bool { return executor.committed() == 1 }, time.Second, time.Millisecond)
+	select {
+	case reconcileErr := <-reconcileResult:
+		require.ErrorContains(t, reconcileErr, "committed HWM regression")
+	case <-time.After(time.Second):
+		t.Fatal("stale reconcile did not resume after asynchronous replication completed")
+	}
 }
 
 func TestDistributedLeaderAcknowledgementDoesNotRequireEffectiveMinimumISR(t *testing.T) {

@@ -600,13 +600,13 @@ func (ch *CommandHandler) applyAndWaitContext(ctx context.Context, cmdType strin
 	}
 }
 
-func (ch *CommandHandler) preparePartitionLeaderSnapshot(topicName string, partitionID int, p *topic.Partition, requiredISR int) (func(), clusterController.PartitionReplicationSnapshot, error) {
+func (ch *CommandHandler) preparePartitionLeaderSnapshot(topicName string, partitionID int, p *topic.Partition, requiredISR int) (func(), func(), clusterController.PartitionReplicationSnapshot, error) {
 	writeLock := ch.partitionWriteLock(topicName, partitionID)
 	writeLock.Lock()
 	release := writeLock.Unlock
-	fail := func(err error) (func(), clusterController.PartitionReplicationSnapshot, error) {
+	fail := func(err error) (func(), func(), clusterController.PartitionReplicationSnapshot, error) {
 		release()
-		return nil, clusterController.PartitionReplicationSnapshot{}, err
+		return nil, nil, clusterController.PartitionReplicationSnapshot{}, err
 	}
 	if ch.Cluster == nil || ch.Cluster.RaftManager == nil {
 		return fail(fmt.Errorf("cluster metadata unavailable"))
@@ -647,7 +647,8 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshot(topicName string, parti
 		p.FlushDisk()
 		ch.partitionPreparedEpochs.Store(key, wantedFence)
 	}
-	return release, snapshot, nil
+	releaseMutation := p.BeginReplicationMutation()
+	return release, releaseMutation, snapshot, nil
 }
 
 func (ch *CommandHandler) partitionPreparationErrorResponse(err error) string {
@@ -717,7 +718,11 @@ func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID 
 		}
 		ch.partitionPreparedEpochs.Store(key, wantedFence)
 	}
-	return release, nil
+	releaseMutation := p.BeginReplicationMutation()
+	return func() {
+		releaseMutation()
+		release()
+	}, nil
 }
 
 func (ch *CommandHandler) commitPartitionHWMAtEpoch(topicName string, partitionID int, hwm uint64, leader string, leaderEpoch int, lifecycleEpoch uint64) error {

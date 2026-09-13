@@ -287,11 +287,17 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		if ackSelection.Mode == ackpolicy.All {
 			requiredISR = effectiveMinISR
 		}
-		releaseWrite, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(topicName, partition, p, requiredISR)
+		releaseWrite, releaseMutation, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(topicName, partition, p, requiredISR)
 		if err != nil {
 			return ch.partitionPreparationErrorResponse(err)
 		}
 		defer releaseWrite()
+		mutationSubmitted := false
+		defer func() {
+			if !mutationSubmitted {
+				releaseMutation()
+			}
+		}()
 		if ch.replication == nil {
 			return "ERROR: cluster_metadata_unavailable command=PUBLISH"
 		}
@@ -333,18 +339,20 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 				messageData.Messages = recovered
 				result := make(chan error, 1)
 				reservation.submit(partitionReplicationTask{
-					topic:        topicName,
-					partition:    partition,
-					commitHWM:    lastOffset + 1,
-					ackMode:      ackSelection.Mode,
-					requiredISR:  requiredISR,
-					command:      messageData,
-					duplicate:    true,
-					snapshot:     replicationSnapshot,
-					partitionRef: p,
-					result:       result,
+					topic:           topicName,
+					partition:       partition,
+					commitHWM:       lastOffset + 1,
+					ackMode:         ackSelection.Mode,
+					requiredISR:     requiredISR,
+					command:         messageData,
+					duplicate:       true,
+					snapshot:        replicationSnapshot,
+					partitionRef:    p,
+					releaseMutation: releaseMutation,
+					result:          result,
 				})
 				submitted = true
+				mutationSubmitted = true
 				select {
 				case replicationErr := <-result:
 					if replicationErr != nil {
@@ -377,17 +385,19 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 			replicationResult = make(chan error, 1)
 		}
 		reservation.submit(partitionReplicationTask{
-			topic:        topicName,
-			partition:    partition,
-			command:      messageData,
-			commitHWM:    commitHWM,
-			ackMode:      ackSelection.Mode,
-			requiredISR:  requiredISR,
-			snapshot:     replicationSnapshot,
-			partitionRef: p,
-			result:       replicationResult,
+			topic:           topicName,
+			partition:       partition,
+			command:         messageData,
+			commitHWM:       commitHWM,
+			ackMode:         ackSelection.Mode,
+			requiredISR:     requiredISR,
+			snapshot:        replicationSnapshot,
+			partitionRef:    p,
+			releaseMutation: releaseMutation,
+			result:          replicationResult,
 		})
 		submitted = true
+		mutationSubmitted = true
 		if replicationResult != nil {
 			select {
 			case replicationErr := <-replicationResult:
@@ -668,11 +678,17 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		if ackSelection.Mode == ackpolicy.All {
 			requiredISR = effectiveMinISR
 		}
-		releaseWrite, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(batch.Topic, batch.Partition, p, requiredISR)
+		releaseWrite, releaseMutation, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(batch.Topic, batch.Partition, p, requiredISR)
 		if err != nil {
 			return ch.partitionPreparationErrorResponse(err), nil
 		}
 		defer releaseWrite()
+		mutationSubmitted := false
+		defer func() {
+			if !mutationSubmitted {
+				releaseMutation()
+			}
+		}()
 		if ch.replication == nil {
 			return "ERROR: cluster_metadata_unavailable command=BATCH", nil
 		}
@@ -712,18 +728,20 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 				}
 				result := make(chan error, 1)
 				reservation.submit(partitionReplicationTask{
-					topic:        batch.Topic,
-					partition:    batch.Partition,
-					commitHWM:    lastOffset + 1,
-					ackMode:      ackSelection.Mode,
-					requiredISR:  requiredISR,
-					command:      msgCmd,
-					duplicate:    true,
-					snapshot:     replicationSnapshot,
-					partitionRef: p,
-					result:       result,
+					topic:           batch.Topic,
+					partition:       batch.Partition,
+					commitHWM:       lastOffset + 1,
+					ackMode:         ackSelection.Mode,
+					requiredISR:     requiredISR,
+					command:         msgCmd,
+					duplicate:       true,
+					snapshot:        replicationSnapshot,
+					partitionRef:    p,
+					releaseMutation: releaseMutation,
+					result:          result,
 				})
 				submitted = true
+				mutationSubmitted = true
 				select {
 				case replicationErr := <-result:
 					if replicationErr != nil {
@@ -765,17 +783,19 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			replicationResult = make(chan error, 1)
 		}
 		reservation.submit(partitionReplicationTask{
-			topic:        batch.Topic,
-			partition:    batch.Partition,
-			command:      msgCmd,
-			commitHWM:    commitHWM,
-			ackMode:      ackSelection.Mode,
-			requiredISR:  requiredISR,
-			snapshot:     replicationSnapshot,
-			partitionRef: p,
-			result:       replicationResult,
+			topic:           batch.Topic,
+			partition:       batch.Partition,
+			command:         msgCmd,
+			commitHWM:       commitHWM,
+			ackMode:         ackSelection.Mode,
+			requiredISR:     requiredISR,
+			snapshot:        replicationSnapshot,
+			partitionRef:    p,
+			releaseMutation: releaseMutation,
+			result:          replicationResult,
 		})
 		submitted = true
+		mutationSubmitted = true
 		if replicationResult != nil {
 			select {
 			case replicationErr := <-replicationResult:

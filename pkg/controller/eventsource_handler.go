@@ -33,11 +33,12 @@ func (ch *CommandHandler) handleAppendStream(cmd string) string {
 			return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 		}
 		effectiveMinISR := t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas)
-		releaseWrite, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(topicName, partition, p, effectiveMinISR)
+		releaseWrite, releaseMutation, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(topicName, partition, p, effectiveMinISR)
 		if err != nil {
 			return ch.partitionPreparationErrorResponse(err)
 		}
 		defer releaseWrite()
+		defer releaseMutation()
 		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
 			return indexResp
 		}

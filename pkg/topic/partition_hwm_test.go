@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/disk"
@@ -354,6 +355,41 @@ func TestPartition_ReconcileCommittedHWMTruncatesUncommittedTail(t *testing.T) {
 	require.Equal(t, "replacement", msgs[1].Payload)
 }
 
+func TestPartition_ReplicationMutationBlocksStaleCommittedHWMReconcile(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, dh.Close()) })
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	t.Cleanup(p.Close)
+
+	require.NoError(t, p.EnqueueSync(types.Message{Payload: "committed"}))
+	releaseMutation := p.BeginReplicationMutation()
+	require.NoError(t, p.EnqueueBatchLeader([]types.Message{{Payload: "in-flight"}}))
+
+	reconcileResult := make(chan error, 1)
+	go func() {
+		reconcileResult <- p.ReconcileCommittedHWM(1)
+	}()
+	select {
+	case reconcileErr := <-reconcileResult:
+		t.Fatalf("reconcile bypassed replication mutation fence: %v", reconcileErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	require.NoError(t, p.ApplyReplicaHWM(2))
+	releaseMutation()
+	select {
+	case reconcileErr := <-reconcileResult:
+		require.ErrorContains(t, reconcileErr, "committed HWM regression")
+	case <-time.After(time.Second):
+		t.Fatal("stale reconcile did not resume after replication mutation completed")
+	}
+	require.Equal(t, uint64(2), p.NextOffset())
+	require.Equal(t, uint64(2), p.GetHWM())
+}
+
 func TestPartition_ReconcileSnapshotHWMPreservesLaterCommittedData(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
@@ -372,8 +408,13 @@ func TestPartition_ReconcileSnapshotHWMPreservesLaterCommittedData(t *testing.T)
 	p.SetHWM(2)
 	require.NoError(t, p.ReconcileSnapshotHWM(1))
 	require.True(t, p.SnapshotRecoveryPending())
+	require.ErrorContains(t, p.ReconcileCommittedHWM(2), "snapshot replay is still pending")
+	require.NoError(t, p.ReconcileSnapshotHWM(1), "the same snapshot boundary must be idempotent")
+	require.ErrorContains(t, p.ReconcileSnapshotHWM(0), "snapshot recovery boundary changed")
 	require.Equal(t, uint64(3), p.NextOffset())
 	require.Equal(t, uint64(1), p.GetHWM())
+	require.ErrorContains(t, p.FinalizeSnapshotRecovery(1), "committed HWM regression")
+	require.True(t, p.SnapshotRecoveryPending(), "a stale final boundary must preserve recovery state")
 	require.NoError(t, p.ApplyReplicaHWM(2))
 	require.NoError(t, p.FinalizeSnapshotRecovery(2))
 	require.False(t, p.SnapshotRecoveryPending())
@@ -382,6 +423,16 @@ func TestPartition_ReconcileSnapshotHWMPreservesLaterCommittedData(t *testing.T)
 	messages, err := p.ReadMessages(0, 10)
 	require.NoError(t, err)
 	require.Len(t, messages, 2)
+
+	require.NoError(t, p.EnqueueBatchLeader([]types.Message{{Payload: "post-recovery-commit"}}))
+	require.NoError(t, p.ReconcileSnapshotHWM(1))
+	require.NoError(t, p.ApplyReplicaHWM(3))
+	require.ErrorContains(t, p.FinalizeSnapshotRecovery(2), "committed HWM regression")
+	require.True(t, p.SnapshotRecoveryPending(), "an applied replay HWM must not be truncated by stale finalization")
+	require.NoError(t, p.FinalizeSnapshotRecovery(3))
+	require.False(t, p.SnapshotRecoveryPending())
+	require.Equal(t, uint64(3), p.NextOffset())
+	require.Equal(t, uint64(3), p.GetHWM())
 }
 
 func TestPartition_EnqueueBatchLeaderDoesNotAdvanceStateOnWriteFailure(t *testing.T) {

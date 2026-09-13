@@ -20,16 +20,17 @@ import (
 var errReplicationQueueClosed = errors.New("replication queue closed")
 
 type partitionReplicationTask struct {
-	topic        string
-	partition    int
-	command      types.MessageCommand
-	commitHWM    uint64
-	ackMode      ackpolicy.Mode
-	requiredISR  int
-	duplicate    bool
-	snapshot     clusterController.PartitionReplicationSnapshot
-	partitionRef *topic.Partition
-	result       chan error
+	topic           string
+	partition       int
+	command         types.MessageCommand
+	commitHWM       uint64
+	ackMode         ackpolicy.Mode
+	requiredISR     int
+	duplicate       bool
+	snapshot        clusterController.PartitionReplicationSnapshot
+	partitionRef    *topic.Partition
+	releaseMutation func()
+	result          chan error
 }
 
 type retryableReplicationStateError struct {
@@ -398,6 +399,9 @@ func sameBrokerSet(left, right []string) bool {
 }
 
 func completeReplicationTask(task partitionReplicationTask, err error) {
+	if task.releaseMutation != nil {
+		task.releaseMutation()
+	}
 	if task.result == nil {
 		return
 	}

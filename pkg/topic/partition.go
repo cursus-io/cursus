@@ -63,6 +63,7 @@ type Partition struct {
 	LEO                   atomic.Uint64
 	HWM                   uint64
 	mu                    sync.RWMutex
+	reconcileMu           sync.RWMutex
 	snapshotRecovery      bool
 	recoveryCheckpointHWM uint64
 	recoverySnapshotHWM   uint64
@@ -1110,6 +1111,14 @@ func (p *Partition) NextOffset() uint64 {
 	return p.LEO.Load()
 }
 
+// BeginReplicationMutation prevents a stale materialization reconcile from
+// truncating a locally appended record before its replication decision has
+// applied the corresponding committed HWM.
+func (p *Partition) BeginReplicationMutation() func() {
+	p.reconcileMu.RLock()
+	return p.reconcileMu.RUnlock
+}
+
 func (p *Partition) ReserveOffsets(count int) (uint64, error) {
 	if count <= 0 {
 		return p.LEO.Load(), nil
@@ -1142,6 +1151,8 @@ func (p *Partition) ApplyReplicaHWM(hwm uint64) error {
 // ReconcileCommittedHWM prepares a replica for leadership using the durable cluster watermark.
 // Any local tail beyond that watermark was never committed and must not survive leader promotion.
 func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.snapshotRecovery {
@@ -1154,6 +1165,8 @@ func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
 // deleting any later local records. Raft replays its committed log tail after
 // Restore returns, then FinalizeSnapshotRecovery performs the only truncation.
 func (p *Partition) ReconcileSnapshotHWM(snapshotHWM uint64) error {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.snapshotRecovery {
@@ -1173,6 +1186,8 @@ func (p *Partition) ReconcileSnapshotHWM(snapshotHWM uint64) error {
 // FinalizeSnapshotRecovery reconciles to the FSM watermark after Raft has
 // applied every committed post-snapshot log entry.
 func (p *Partition) FinalizeSnapshotRecovery(hwm uint64) error {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.snapshotRecovery {
@@ -1180,6 +1195,9 @@ func (p *Partition) FinalizeSnapshotRecovery(hwm uint64) error {
 	}
 	checkpointHWM := p.recoveryCheckpointHWM
 	snapshotHWM := p.recoverySnapshotHWM
+	if hwm < checkpointHWM {
+		return fmt.Errorf("committed HWM regression: current=%d requested=%d", checkpointHWM, hwm)
+	}
 	p.snapshotRecovery = false
 	p.recoveryCheckpointHWM = 0
 	p.recoverySnapshotHWM = 0
@@ -1211,6 +1229,9 @@ func (p *Partition) SnapshotRecoveryPending() bool {
 }
 
 func (p *Partition) reconcileCommittedHWMLocked(hwm uint64) error {
+	if hwm < p.HWM {
+		return fmt.Errorf("committed HWM regression: current=%d requested=%d", p.HWM, hwm)
+	}
 	leo := p.LEO.Load()
 	if leo < hwm {
 		return fmt.Errorf("replica is behind committed watermark: leo=%d hwm=%d", leo, hwm)

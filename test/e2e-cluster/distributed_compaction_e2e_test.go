@@ -42,6 +42,7 @@ func TestDistributedCompactionPreservesReplicaAndConsumerOffsets(t *testing.T) {
 	require.True(t, successfulBrokerResponse(createResponse), createResponse)
 	actions.WaitForTopicMetadata()
 	waitForFullISRAndZeroUnderReplicated(t, ctx, "compact topic creation")
+	assertBrokerReadiness(t, []int{1, 2, 3})
 
 	group := "distributed-compaction-reader"
 	groupClient, generation, member := joinClusterGroup(t, ctx.GetBrokerAddrs(), ctx.GetTopic(), group)
@@ -91,6 +92,7 @@ func TestDistributedCompactionPreservesReplicaAndConsumerOffsets(t *testing.T) {
 
 	actions.RecoverFollower(failedLeader)
 	actions.WaitForTopicMetadata()
+	assertBrokerReadiness(t, []int{failedLeader})
 	waitForFullISRAndZeroUnderReplicated(t, ctx, "failed leader recovery")
 	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), ctx.GetTopic(), finalRecordCount)
 
@@ -98,9 +100,11 @@ func TestDistributedCompactionPreservesReplicaAndConsumerOffsets(t *testing.T) {
 		actions.StopBroker(node)
 		actions.StartBroker(node)
 		actions.WaitForTopicMetadata()
+		assertBrokerReadiness(t, []int{node})
 		waitForFullISRAndZeroUnderReplicated(t, ctx, fmt.Sprintf("broker-%d rolling restart", node))
 		requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), ctx.GetTopic(), finalRecordCount)
 	}
+	assertBrokerReadiness(t, []int{1, 2, 3})
 
 	restartedClient, restartedGeneration, restartedMember := joinClusterGroup(t, ctx.GetBrokerAddrs(), ctx.GetTopic(), group)
 	defer restartedClient.Close()
