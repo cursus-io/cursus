@@ -535,7 +535,18 @@ func (c *Coordinator) LoadOffsetsFromLog(reader OffsetLogReader) error {
 // __consumer_offsets partition, so a partition leader can rebuild its local
 // fencing state without consulting controller Raft.
 func (c *Coordinator) loadDistributedOffsetsFromLog(reader OffsetLogReader) (ConsumerMetadataRecoveryStatus, error) {
+	if committed, ok := reader.(committedOffsetLogReader); ok {
+		reader = committedOffsetReaderAdapter{reader: committed}
+	}
 	return c.recoverConsumerMetadata(reader)
+}
+
+type committedOffsetReaderAdapter struct {
+	reader committedOffsetLogReader
+}
+
+func (adapter committedOffsetReaderAdapter) ReadTopicPartition(topic string, partitionID int, offset uint64, max int) ([]types.Message, error) {
+	return adapter.reader.ReadCommittedTopicPartition(topic, partitionID, offset, max)
 }
 
 func parseOffsetLogPayload(payload string) (string, string, []OffsetItem, error) {

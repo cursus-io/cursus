@@ -238,11 +238,11 @@ func (ch *CommandHandler) ResolveGroupCoordinators(groupNames []string) (map[str
 // ExpireGroupMembers durably removes timed-out members through the owning
 // offsets-partition leader. The lifecycle snapshot append is the commit point.
 func (ch *CommandHandler) ExpireGroupMembers(groupName string, generation int, memberIDs []string) error {
+	if ch == nil || ch.Coordinator == nil {
+		return fmt.Errorf("coordinator not available")
+	}
 	if !ch.isDistributed() {
 		return ch.Coordinator.ExpireConsumers(groupName, generation, memberIDs)
-	}
-	if ch.Coordinator == nil {
-		return fmt.Errorf("coordinator not available")
 	}
 	return ch.Coordinator.ExpireConsumers(groupName, generation, memberIDs)
 }

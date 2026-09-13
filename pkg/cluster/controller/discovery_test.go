@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -395,4 +396,54 @@ func TestServiceDiscoveryHeartbeatReactivatesBroker(t *testing.T) {
 	assert.Equal(t, "active", rm.mockFSM.GetBroker("node2").Status)
 	rm.AssertExpectations(t)
 	isr.AssertExpectations(t)
+}
+
+func TestServiceDiscoveryLifecycleFencesUnavailableAndStaleBrokers(t *testing.T) {
+	withoutRaft := NewServiceDiscoveryImpl(nil, "node1", "localhost:9001", "")
+	assert.NotEmpty(t, withoutRaft.BrokerIncarnationID())
+	assert.ErrorContains(t, withoutRaft.Deregister(), "fsm_unavailable")
+	assert.NoError(t, withoutRaft.ValidateHeartbeat("node1", "stale"))
+	withoutRaft.UpdateHeartbeatWithIncarnation("node1", "stale")
+	withoutRaft.Reconcile()
+	_, err := withoutRaft.FetchReplicaCatchup(fsm.ReplicaCatchupRequest{Topic: "orders", Partition: 0})
+	assert.ErrorContains(t, err, "FSM is unavailable")
+	_, err = marshalBrokerDeregistration(nil)
+	assert.ErrorContains(t, err, "requires current broker metadata")
+	_, err = marshalBrokerDeregistration(&fsm.BrokerInfo{})
+	assert.ErrorContains(t, err, "requires current broker metadata")
+
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	assert.ErrorContains(t, sd.Deregister(), "registration_not_found")
+	assert.ErrorContains(t, sd.ValidateHeartbeat("missing", "process"), "registration_not_found")
+
+	rm.mockFSM.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"node1","addr":"localhost:9001","status":"active","incarnation_id":"current"}`)})
+	assert.ErrorContains(t, sd.Deregister(), "incarnation_mismatch")
+	assert.ErrorContains(t, sd.ValidateHeartbeat("node1", "stale"), "incarnation_mismatch")
+}
+
+func TestServiceDiscoveryReplicaCatchupSourceAndFollowerReconcileFences(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	metadata := fsm.PartitionMetadata{
+		Leader: "leader", LeaderEpoch: 1, LifecycleEpoch: 1,
+		CommittedHWM: 1, CommittedHWMKnown: true, PartitionCount: 1,
+		Replicas: []string{"leader", "follower"}, ISR: []string{"leader"},
+	}
+	payload, err := json.Marshal(metadata)
+	assert.NoError(t, err)
+	assert.Nil(t, rm.mockFSM.Apply(&raft.Log{Data: append([]byte("PARTITION:orders-0:"), payload...)}))
+
+	sd := NewServiceDiscoveryImpl(rm, "follower", "localhost:9002", "")
+	_, err = sd.FetchReplicaCatchup(fsm.ReplicaCatchupRequest{Topic: "orders", Partition: 0, Leader: "leader"})
+	assert.ErrorContains(t, err, "not selected catch-up source")
+	_, err = sd.FetchReplicaCatchup(fsm.ReplicaCatchupRequest{Topic: "missing", Partition: 0})
+	assert.ErrorContains(t, err, "partition metadata not found")
+
+	sd.leaderSince = time.Now()
+	rm.isLeader = false
+	sd.Reconcile()
+	assert.True(t, sd.leaderSince.IsZero())
 }

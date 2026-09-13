@@ -60,6 +60,10 @@ type OffsetLogReader interface {
 	ReadTopicPartition(topic string, partitionID int, offset uint64, max int) ([]types.Message, error)
 }
 
+type committedOffsetLogReader interface {
+	ReadCommittedTopicPartition(topic string, partitionID int, offset uint64, max int) ([]types.Message, error)
+}
+
 type offsetTopicPartitionProvider interface {
 	ExistingPartitionCount(topic string) (int, error)
 }
@@ -99,19 +103,20 @@ func (c *Coordinator) SetTransactionalOffsetResolver(resolver TransactionalOffse
 
 // GroupMetadata holds metadata for a single consumer group.
 type GroupMetadata struct {
-	mu                sync.RWMutex               // Per-group lock for offset operations
-	TopicName         string                     // Topic this group consumes
-	Topics            []string                   // Explicit v1 subscription topics
-	TopicPattern      string                     // Optional v1 subscription pattern
-	TopicPartitions   []TopicPartition           // Assignable v1 topic-partitions
-	Members           map[string]*MemberMetadata // Active members
-	Generation        int                        // Current membership generation
-	Partitions        []int                      // All partitions of the topic
-	LastRebalance     time.Time                  // Timestamp of last rebalance
-	LastActivity      time.Time                  // Timestamp of last heartbeat or lifecycle activity
-	Offsets           map[string]map[int]uint64  // topic -> partition -> next offset
-	RegistrationEpoch uint64                     // durable lifecycle epoch
-	OffsetRevisions   map[string]uint64          // topic -> durable snapshot revision
+	mu                   sync.RWMutex               // Per-group lock for offset operations
+	TopicName            string                     // Topic this group consumes
+	Topics               []string                   // Explicit v1 subscription topics
+	TopicPattern         string                     // Optional v1 subscription pattern
+	TopicPartitions      []TopicPartition           // Assignable v1 topic-partitions
+	Members              map[string]*MemberMetadata // Active members
+	Generation           int                        // Current membership generation
+	Partitions           []int                      // All partitions of the topic
+	LastRebalance        time.Time                  // Timestamp of last rebalance
+	LastActivity         time.Time                  // Timestamp of last heartbeat or lifecycle activity
+	Offsets              map[string]map[int]uint64  // topic -> partition -> next offset
+	RegistrationEpoch    uint64                     // durable lifecycle epoch
+	RegistrationInferred bool                       // compatibility shell still requires durable registration
+	OffsetRevisions      map[string]uint64          // topic -> durable snapshot revision
 }
 
 // MemberMetadata holds state for a single consumer instance.
@@ -129,20 +134,21 @@ type TopicPartition struct {
 
 // GroupStateSnapshot is a serializable snapshot of a consumer group's state.
 type GroupStateSnapshot struct {
-	TopicName         string                      `json:"topic"`
-	Topics            []string                    `json:"topics,omitempty"`
-	TopicPattern      string                      `json:"topic_pattern,omitempty"`
-	TopicPartitions   []TopicPartition            `json:"topic_partitions,omitempty"`
-	Generation        int                         `json:"generation"`
-	Members           map[string][]int            `json:"members"`
-	TopicAssignments  map[string][]TopicPartition `json:"topic_assignments,omitempty"`
-	Partitions        []int                       `json:"partitions,omitempty"`
-	LastRebalance     time.Time                   `json:"last_rebalance,omitempty"`
-	LastActivity      time.Time                   `json:"last_activity,omitempty"`
-	Offsets           map[string]map[int]uint64   `json:"offsets"`
-	RegistrationEpoch uint64                      `json:"registration_epoch,omitempty"`
-	OffsetRevisions   map[string]uint64           `json:"offset_revisions,omitempty"`
-	Deleted           bool                        `json:"deleted,omitempty"`
+	TopicName            string                      `json:"topic"`
+	Topics               []string                    `json:"topics,omitempty"`
+	TopicPattern         string                      `json:"topic_pattern,omitempty"`
+	TopicPartitions      []TopicPartition            `json:"topic_partitions,omitempty"`
+	Generation           int                         `json:"generation"`
+	Members              map[string][]int            `json:"members"`
+	TopicAssignments     map[string][]TopicPartition `json:"topic_assignments,omitempty"`
+	Partitions           []int                       `json:"partitions,omitempty"`
+	LastRebalance        time.Time                   `json:"last_rebalance,omitempty"`
+	LastActivity         time.Time                   `json:"last_activity,omitempty"`
+	Offsets              map[string]map[int]uint64   `json:"offsets"`
+	RegistrationEpoch    uint64                      `json:"registration_epoch,omitempty"`
+	RegistrationInferred bool                        `json:"registration_inferred,omitempty"`
+	OffsetRevisions      map[string]uint64           `json:"offset_revisions,omitempty"`
+	Deleted              bool                        `json:"deleted,omitempty"`
 }
 
 // GroupStatus represents the status of a consumer group
@@ -481,7 +487,7 @@ func (c *Coordinator) durableGroupObservationRefs() ([]consumerGroupObservationR
 		migrationAuthoritative:    migrationAuthoritative,
 		ownershipSince:            make(map[string]time.Time),
 	}
-	if _, err := view.recoverConsumerMetadata(reader); err != nil {
+	if _, err := view.loadDistributedOffsetsFromLog(reader); err != nil {
 		return append([]consumerGroupObservationRef(nil), c.observationCatalog...), c.observationCatalogReady
 	}
 	view.mu.RLock()
@@ -887,19 +893,20 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 	for name, group := range c.groups {
 		group.mu.RLock()
 		snap := &GroupStateSnapshot{
-			TopicName:         group.TopicName,
-			Topics:            append([]string(nil), group.Topics...),
-			TopicPattern:      group.TopicPattern,
-			TopicPartitions:   append([]TopicPartition(nil), group.TopicPartitions...),
-			Generation:        group.Generation,
-			Members:           make(map[string][]int, len(group.Members)),
-			TopicAssignments:  make(map[string][]TopicPartition, len(group.Members)),
-			Partitions:        append([]int(nil), group.Partitions...),
-			LastRebalance:     group.LastRebalance,
-			LastActivity:      group.LastActivity,
-			Offsets:           make(map[string]map[int]uint64),
-			RegistrationEpoch: group.RegistrationEpoch,
-			OffsetRevisions:   make(map[string]uint64, len(group.OffsetRevisions)),
+			TopicName:            group.TopicName,
+			Topics:               append([]string(nil), group.Topics...),
+			TopicPattern:         group.TopicPattern,
+			TopicPartitions:      append([]TopicPartition(nil), group.TopicPartitions...),
+			Generation:           group.Generation,
+			Members:              make(map[string][]int, len(group.Members)),
+			TopicAssignments:     make(map[string][]TopicPartition, len(group.Members)),
+			Partitions:           append([]int(nil), group.Partitions...),
+			LastRebalance:        group.LastRebalance,
+			LastActivity:         group.LastActivity,
+			Offsets:              make(map[string]map[int]uint64),
+			RegistrationEpoch:    group.RegistrationEpoch,
+			RegistrationInferred: group.RegistrationInferred,
+			OffsetRevisions:      make(map[string]uint64, len(group.OffsetRevisions)),
 		}
 		for mid, member := range group.Members {
 			assignments := make([]int, len(member.Assignments))
@@ -950,18 +957,19 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) error {
 			continue
 		}
 		group := &GroupMetadata{
-			TopicName:         snap.TopicName,
-			Topics:            append([]string(nil), snap.Topics...),
-			TopicPattern:      snap.TopicPattern,
-			TopicPartitions:   append([]TopicPartition(nil), snap.TopicPartitions...),
-			Generation:        snap.Generation,
-			Members:           make(map[string]*MemberMetadata, len(snap.Members)),
-			Partitions:        append([]int(nil), snap.Partitions...),
-			LastRebalance:     snap.LastRebalance,
-			LastActivity:      snap.LastActivity,
-			Offsets:           make(map[string]map[int]uint64),
-			RegistrationEpoch: snap.RegistrationEpoch,
-			OffsetRevisions:   make(map[string]uint64, len(snap.OffsetRevisions)),
+			TopicName:            snap.TopicName,
+			Topics:               append([]string(nil), snap.Topics...),
+			TopicPattern:         snap.TopicPattern,
+			TopicPartitions:      append([]TopicPartition(nil), snap.TopicPartitions...),
+			Generation:           snap.Generation,
+			Members:              make(map[string]*MemberMetadata, len(snap.Members)),
+			Partitions:           append([]int(nil), snap.Partitions...),
+			LastRebalance:        snap.LastRebalance,
+			LastActivity:         snap.LastActivity,
+			Offsets:              make(map[string]map[int]uint64),
+			RegistrationEpoch:    snap.RegistrationEpoch,
+			RegistrationInferred: snap.RegistrationInferred,
+			OffsetRevisions:      make(map[string]uint64, len(snap.OffsetRevisions)),
 		}
 		for mid, assignments := range snap.Members {
 			group.Members[mid] = &MemberMetadata{
@@ -1003,7 +1011,8 @@ func ValidateImportState(state map[string]*GroupStateSnapshot) error {
 		if snap.Deleted {
 			if snap.TopicName != "" || len(snap.Topics) != 0 || snap.TopicPattern != "" ||
 				len(snap.TopicPartitions) != 0 || snap.Generation != 0 || len(snap.Members) != 0 ||
-				len(snap.TopicAssignments) != 0 || len(snap.Partitions) != 0 || len(snap.Offsets) != 0 || len(snap.OffsetRevisions) != 0 {
+				len(snap.TopicAssignments) != 0 || len(snap.Partitions) != 0 || len(snap.Offsets) != 0 ||
+				len(snap.OffsetRevisions) != 0 || snap.RegistrationInferred {
 				return fmt.Errorf("consumer group %q tombstone contains live state", name)
 			}
 			continue

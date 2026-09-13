@@ -47,7 +47,7 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 		if existing.OffsetRevisions == nil {
 			existing.OffsetRevisions = make(map[string]uint64)
 		}
-		if existing.RegistrationEpoch != 0 {
+		if existing.RegistrationEpoch != 0 && !existing.RegistrationInferred {
 			if existing.RegistrationEpoch > c.groupEpochs[groupName] {
 				c.groupEpochs[groupName] = existing.RegistrationEpoch
 			}
@@ -96,7 +96,11 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 		}
 		existing.mu.Lock()
 		existing.RegistrationEpoch = epoch
+		existing.RegistrationInferred = false
 		existing.TopicName = topicName
+		existing.Topics = nil
+		existing.TopicPattern = ""
+		existing.TopicPartitions = nil
 		existing.LastActivity = now
 		if len(existing.Partitions) == 0 {
 			existing.Partitions = makePartitions(partitionCount)
@@ -166,7 +170,7 @@ func (c *Coordinator) RegisterGroupSubscription(groupName string, topics []strin
 			c.mu.Unlock()
 			return fmt.Errorf("subscription mismatch for group %q", groupName)
 		}
-		if existing.RegistrationEpoch != 0 {
+		if existing.RegistrationEpoch != 0 && !existing.RegistrationInferred {
 			c.mu.Unlock()
 			return nil
 		}
@@ -207,6 +211,7 @@ func (c *Coordinator) RegisterGroupSubscription(groupName string, topics []strin
 	existing.TopicPattern = pattern
 	existing.TopicPartitions = append([]TopicPartition(nil), topicPartitions...)
 	existing.RegistrationEpoch = epoch
+	existing.RegistrationInferred = false
 	existing.LastActivity = time.Now()
 	c.groupEpochs[groupName] = epoch
 	c.mu.Unlock()
@@ -339,6 +344,10 @@ func (c *Coordinator) AddConsumer(groupName, consumerID string) ([]int, error) {
 	if group == nil {
 		c.mu.Unlock()
 		return nil, fmt.Errorf("group not found")
+	}
+	if group.RegistrationInferred {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("group requires durable registration")
 	}
 
 	now := time.Now()
@@ -491,7 +500,7 @@ func cloneGroupLifecycle(group *GroupMetadata) *GroupMetadata {
 		TopicName: group.TopicName, Topics: append([]string(nil), group.Topics...), TopicPattern: group.TopicPattern,
 		TopicPartitions: append([]TopicPartition(nil), group.TopicPartitions...), Generation: group.Generation,
 		Members: make(map[string]*MemberMetadata, len(group.Members)), Partitions: append([]int(nil), group.Partitions...),
-		LastActivity: group.LastActivity, LastRebalance: group.LastRebalance, RegistrationEpoch: group.RegistrationEpoch,
+		LastActivity: group.LastActivity, LastRebalance: group.LastRebalance, RegistrationEpoch: group.RegistrationEpoch, RegistrationInferred: group.RegistrationInferred,
 	}
 	for id, member := range group.Members {
 		candidate.Members[id] = &MemberMetadata{ID: member.ID, LastHeartbeat: member.LastHeartbeat, Assignments: append([]int(nil), member.Assignments...), TopicAssignments: append([]TopicPartition(nil), member.TopicAssignments...)}

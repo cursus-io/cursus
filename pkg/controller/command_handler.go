@@ -346,6 +346,11 @@ func (ch *CommandHandler) ensureTopicRecreationIsClean(topicName string) error {
 
 func (ch *CommandHandler) prepareTopicDependencies(topicName string) (map[string]*transaction.Snapshot, error) {
 	if ch.Coordinator != nil {
+		if ch.isDistributed() {
+			if err := ch.Coordinator.ReloadDistributedConsumerMetadata(); err != nil {
+				return nil, fmt.Errorf("%w: refresh replicated consumer groups: %v", topic.ErrTopicDeleteBlocked, err)
+			}
+		}
 		for _, reference := range ch.Coordinator.TopicGroupReferences(topicName) {
 			if reference.MemberCount != 0 {
 				return nil, fmt.Errorf("%w: consumer group %q has %d active member(s)", topic.ErrTopicDeleteBlocked, reference.Name, reference.MemberCount)

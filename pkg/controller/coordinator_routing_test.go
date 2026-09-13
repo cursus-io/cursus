@@ -25,6 +25,7 @@ type coordinatorRoutingRaftManager struct {
 
 type coordinatorRoutingTopicHandler struct {
 	coordinator.TopicHandler
+	readErr error
 }
 
 func (coordinatorRoutingTopicHandler) Publish(string, *types.Message) error {
@@ -33,6 +34,10 @@ func (coordinatorRoutingTopicHandler) Publish(string, *types.Message) error {
 
 func (coordinatorRoutingTopicHandler) CreateTopic(string, int, bool, bool) error {
 	return nil
+}
+
+func (handler *coordinatorRoutingTopicHandler) ReadTopicPartition(string, int, uint64, int) ([]types.Message, error) {
+	return nil, handler.readErr
 }
 
 func (m *coordinatorRoutingRaftManager) GetFSM() *fsm.BrokerFSM {
@@ -272,6 +277,60 @@ func TestResolveGroupCoordinatorsFailsClosedWhenDistributedControlPlaneIsMissing
 	resolved, err := handler.ResolveGroupCoordinators([]string{"workers"})
 	require.ErrorContains(t, err, "raft manager unavailable")
 	require.Nil(t, resolved)
+}
+
+func TestCoordinatorOwnershipChecksRecoverAndFailClosed(t *testing.T) {
+	var nilHandler *CommandHandler
+	resolved, err := nilHandler.ResolveGroupCoordinators([]string{"workers"})
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{"workers": true}, resolved)
+	require.True(t, (&CommandHandler{}).IsGroupCoordinator("workers"))
+
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	reader := &coordinatorRoutingTopicHandler{}
+	groupCoordinator, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, reader)
+	require.NoError(t, err)
+	t.Cleanup(groupCoordinator.Stop)
+
+	withoutRouter := NewCommandHandler(nil, cfg, groupCoordinator, nil, &clusterController.ClusterController{
+		RaftManager: &coordinatorRoutingRaftManager{},
+	})
+	require.False(t, withoutRouter.IsGroupCoordinator("workers"))
+	require.ErrorContains(t, withoutRouter.ExpireGroupMembers("workers", 0, nil), "group_not_found")
+
+	brokerFSM := fsm.NewBrokerFSM(nil, groupCoordinator)
+	registerRoutingBroker(t, brokerFSM, "node-1")
+	registerRoutingBroker(t, brokerFSM, "node-2")
+	installRoutingOffsetsTopology(t, brokerFSM, "node-1")
+	local := newCoordinatorRoutingHandler("node-1", brokerFSM, groupCoordinator)
+	remote := newCoordinatorRoutingHandler("node-2", brokerFSM, groupCoordinator)
+	require.True(t, local.IsGroupCoordinator("workers"))
+	require.False(t, remote.IsGroupCoordinator("workers"))
+
+	resolved, err = local.ResolveGroupCoordinators([]string{"workers", "auditors"})
+	require.NoError(t, err)
+	require.True(t, resolved["workers"])
+	require.True(t, resolved["auditors"])
+
+	_, _, partition, _, err := local.Cluster.Router.FindCoordinatorWithEpoch("workers")
+	require.NoError(t, err)
+	delete(local.groupRecoveryEpoch, partition)
+	reader.readErr = fmt.Errorf("committed metadata unavailable")
+	require.False(t, local.IsGroupCoordinator("workers"))
+	_, err = local.ResolveGroupCoordinators([]string{"workers"})
+	require.ErrorContains(t, err, "committed metadata unavailable")
+}
+
+func TestCoordinatorRecoveryHelpersRejectUnavailableState(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	handler := NewCommandHandler(nil, cfg, nil, nil, nil)
+	require.ErrorContains(t, handler.ensureGroupRecovery(0, 1), "coordinator unavailable")
+	require.ErrorContains(t, handler.ExpireGroupMembers("workers", 1, []string{"member"}), "coordinator not available")
+
+	brokenRoute := newCoordinatorRoutingHandler("node-1", nil, nil)
+	require.ErrorContains(t, brokenRoute.validateRecoveredCoordinatorRoute("workers", 0, 1), "revalidate coordinator ownership")
 }
 
 func resolvedCoordinatorCount(t *testing.T, handlers map[string]*CommandHandler, groupName string) int {

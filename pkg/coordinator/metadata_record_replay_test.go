@@ -21,6 +21,12 @@ type failingMigrationReplayHandler struct {
 	metadataReplayHandler
 }
 
+type pausedMetadataReplayHandler struct {
+	metadataReplayHandler
+	scanned chan struct{}
+	resume  chan struct{}
+}
+
 func (*failingMigrationReplayHandler) ConsumerMetadataMigrationRecords() ([]ConsumerMetadataRecord, bool, error) {
 	return nil, false, fmt.Errorf("migration unavailable")
 }
@@ -43,6 +49,14 @@ func (h *metadataReplayHandler) ReadTopicPartition(_ string, partition int, offs
 		}
 	}
 	return result, nil
+}
+
+func (h *pausedMetadataReplayHandler) ReadTopicPartition(topic string, partition int, offset uint64, max int) ([]types.Message, error) {
+	if partition == 1 && h.scanned != nil {
+		close(h.scanned)
+		<-h.resume
+	}
+	return h.metadataReplayHandler.ReadTopicPartition(topic, partition, offset, max)
 }
 
 func TestConsumerMetadataReplayRequiresMigrationForRetainedGap(t *testing.T) {
@@ -343,6 +357,73 @@ func TestConsumerMetadataReplayRejectsRegressionAndDroppedKeys(t *testing.T) {
 			require.Empty(t, coordinator.ListGroups(), "failed replay must not expose a partial broker state")
 		})
 	}
+}
+
+func TestDistributedReplayPreservesCommitCompletedDuringScan(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	handler := &pausedMetadataReplayHandler{metadataReplayHandler: metadataReplayHandler{messages: make(map[int][]types.Message)}}
+	c, err := NewCoordinatorWithRecovery(context.Background(), cfg, handler)
+	require.NoError(t, err)
+	t.Cleanup(c.Stop)
+	c.SetOffsetRecordWriter(func(record ConsumerMetadataRecord) error {
+		handler.messages[0] = append(handler.messages[0], encodedMetadataMessage(t, record, uint64(len(handler.messages[0]))))
+		return nil
+	})
+	require.NoError(t, c.RegisterGroup("orders", "workers", 1))
+	_, err = c.AddConsumer("workers", "member-a")
+	require.NoError(t, err)
+	require.NoError(t, c.ValidateAndCommit("workers", "orders", 0, 10, 1, "member-a"))
+
+	handler.scanned = make(chan struct{})
+	handler.resume = make(chan struct{})
+	finished := make(chan error, 1)
+	go func() { finished <- c.ReloadDistributedConsumerMetadata() }()
+	select {
+	case <-handler.scanned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replay did not finish reading partition zero")
+	}
+	require.NoError(t, c.ValidateAndCommit("workers", "orders", 0, 20, 1, "member-a"))
+	close(handler.resume)
+	require.NoError(t, <-finished)
+	require.Equal(t, uint64(20), mustOffset(t, c, "workers", "orders", 0))
+	require.Equal(t, uint64(2), c.GetGroup("workers").OffsetRevisions["orders"])
+}
+
+func TestLegacyOffsetOnlyGroupPersistsRegistrationBeforeLifecycle(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	record := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordOffsetSnapshot,
+		Group: "workers", Topic: "orders", Epoch: 3, Revision: 1,
+		Offsets: []OffsetItem{{Partition: 0, Offset: 12}}, Timestamp: time.Unix(1, 0).UTC(),
+	}
+	handler := &metadataReplayHandler{messages: map[int][]types.Message{0: {encodedMetadataMessage(t, record, 0)}}}
+	c, err := NewCoordinatorWithRecovery(context.Background(), cfg, handler)
+	require.NoError(t, err)
+	t.Cleanup(c.Stop)
+	require.True(t, c.GetGroup("workers").RegistrationInferred)
+	_, err = c.AddConsumer("workers", "member-before-registration")
+	require.ErrorContains(t, err, "requires durable registration")
+
+	snapshotCopy := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
+	t.Cleanup(snapshotCopy.Stop)
+	require.NoError(t, snapshotCopy.ImportState(c.ExportState()))
+	require.True(t, snapshotCopy.GetGroup("workers").RegistrationInferred)
+	c.SetOffsetRecordWriter(func(record ConsumerMetadataRecord) error {
+		handler.messages[0] = append(handler.messages[0], encodedMetadataMessage(t, record, uint64(len(handler.messages[0]))))
+		return nil
+	})
+
+	require.NoError(t, c.RegisterGroup("orders", "workers", 1))
+	require.False(t, c.GetGroup("workers").RegistrationInferred)
+	_, err = c.AddConsumer("workers", "member-a")
+	require.NoError(t, err)
+	require.NoError(t, c.ReloadDistributedConsumerMetadata())
+	require.Equal(t, 1, c.GetGeneration("workers"))
+	require.Contains(t, c.GetGroup("workers").Members, "member-a")
+	require.Equal(t, uint64(12), mustOffset(t, c, "workers", "orders", 0))
 }
 
 func encodedMetadataMessage(t *testing.T, record ConsumerMetadataRecord, offset uint64) types.Message {

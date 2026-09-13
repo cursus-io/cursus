@@ -826,15 +826,33 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 		if recovered == nil || existing == nil {
 			continue
 		}
-		if snapshot, ok := candidates.lifecycleSnapshots[groupName]; ok && snapshot.record.Epoch == recovered.RegistrationEpoch {
-			continue
-		}
 		existing.mu.RLock()
-		recovered.Generation = existing.Generation
-		recovered.LastRebalance = existing.LastRebalance
-		recovered.Members = make(map[string]*MemberMetadata, len(existing.Members))
-		for memberID, member := range existing.Members {
-			recovered.Members[memberID] = &MemberMetadata{ID: member.ID, LastHeartbeat: member.LastHeartbeat, Assignments: append([]int(nil), member.Assignments...), TopicAssignments: append([]TopicPartition(nil), member.TopicAssignments...)}
+		// A durable commit may complete after this scan has passed the group's
+		// offsets partition. Preserve only strictly newer acknowledged revisions
+		// from the still-installed map before replacing it with the replay result.
+		if existing.RegistrationEpoch == recovered.RegistrationEpoch {
+			for topicName, revision := range existing.OffsetRevisions {
+				if revision <= recovered.OffsetRevisions[topicName] {
+					continue
+				}
+				if recovered.Offsets == nil {
+					recovered.Offsets = make(map[string]map[int]uint64)
+				}
+				if recovered.OffsetRevisions == nil {
+					recovered.OffsetRevisions = make(map[string]uint64)
+				}
+				recovered.Offsets[topicName] = clonePartitionOffsets(existing.Offsets[topicName])
+				recovered.OffsetRevisions[topicName] = revision
+			}
+		}
+		if snapshot, ok := candidates.lifecycleSnapshots[groupName]; !ok || snapshot.record.Epoch != recovered.RegistrationEpoch {
+			recovered.Generation = existing.Generation
+			recovered.LastActivity = existing.LastActivity
+			recovered.LastRebalance = existing.LastRebalance
+			recovered.Members = make(map[string]*MemberMetadata, len(existing.Members))
+			for memberID, member := range existing.Members {
+				recovered.Members[memberID] = &MemberMetadata{ID: member.ID, LastHeartbeat: member.LastHeartbeat, Assignments: append([]int(nil), member.Assignments...), TopicAssignments: append([]TopicPartition(nil), member.TopicAssignments...)}
+			}
 		}
 		existing.mu.RUnlock()
 	}
@@ -1022,8 +1040,9 @@ func materializeConsumerMetadata(
 	// Materialize a compatibility shell so those offsets remain readable until
 	// the group is next registered through the v4 lifecycle path.
 	type inferredGroup struct {
-		epoch  uint64
-		topics map[string]int
+		epoch        uint64
+		topics       map[string]int
+		lastActivity time.Time
 	}
 	inferred := make(map[string]*inferredGroup)
 	for _, record := range offsetRecords {
@@ -1035,11 +1054,14 @@ func materializeConsumerMetadata(
 		}
 		entry := inferred[record.Group]
 		if entry == nil || record.Epoch > entry.epoch {
-			entry = &inferredGroup{epoch: record.Epoch, topics: make(map[string]int)}
+			entry = &inferredGroup{epoch: record.Epoch, topics: make(map[string]int), lastActivity: record.Timestamp}
 			inferred[record.Group] = entry
 		}
 		if record.Epoch != entry.epoch {
 			continue
+		}
+		if record.Timestamp.After(entry.lastActivity) {
+			entry.lastActivity = record.Timestamp
 		}
 		for _, item := range record.Offsets {
 			if item.Partition+1 > entry.topics[record.Topic] {
@@ -1059,9 +1081,11 @@ func materializeConsumerMetadata(
 				partitions = append(partitions, TopicPartition{Topic: topicName, Partition: partition})
 			}
 		}
-		group := &GroupMetadata{Topics: topics, TopicPartitions: partitions, Members: make(map[string]*MemberMetadata), Offsets: make(map[string]map[int]uint64), RegistrationEpoch: entry.epoch, OffsetRevisions: make(map[string]uint64)}
+		group := &GroupMetadata{Topics: topics, TopicPartitions: partitions, Members: make(map[string]*MemberMetadata), Offsets: make(map[string]map[int]uint64), LastActivity: entry.lastActivity, RegistrationEpoch: entry.epoch, RegistrationInferred: true, OffsetRevisions: make(map[string]uint64)}
 		if len(topics) == 1 {
 			group.TopicName = topics[0]
+			group.Topics = nil
+			group.TopicPartitions = nil
 			group.Partitions = makePartitions(entry.topics[topics[0]])
 		} else {
 			group.TopicName = subscriptionDisplayName(topics, "")

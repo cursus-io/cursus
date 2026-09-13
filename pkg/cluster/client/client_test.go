@@ -277,3 +277,60 @@ func TestStartHeartbeat(t *testing.T) {
 		t.Fatal("Heartbeat not received")
 	}
 }
+
+func TestStartLeaderHeartbeatTargetsCurrentLeader(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	_, portString, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var discoveryPort int
+	if _, err := fmt.Sscanf(portString, "%d", &discoveryPort); err != nil {
+		t.Fatal(err)
+	}
+
+	received := make(chan wire.CommandPayload, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		connection, handshakeErr := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
+		if handshakeErr != nil {
+			return
+		}
+		request, readErr := connection.ReadFrame()
+		if readErr != nil {
+			return
+		}
+		payload, decodeErr := wire.DecodeCommandPayload(request.Payload)
+		if decodeErr != nil {
+			return
+		}
+		received <- payload
+		response, _ := json.Marshal(map[string]bool{"success": true})
+		_ = connection.WriteFrame(wire.Frame{
+			Kind: wire.KindResponse, Command: request.Command, Status: wire.StatusOK,
+			RequestID: request.RequestID, Payload: response,
+		})
+	}()
+
+	client := NewTCPClusterClient()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client.StartLeaderHeartbeat(ctx, func() string { return "127.0.0.1:7000" }, "node-leader-hb", "process-7", discoveryPort)
+
+	select {
+	case payload := <-received:
+		assert.Equal(t, "node-leader-hb", payload.Fields["node_id"])
+		assert.Equal(t, "process-7", payload.Fields["incarnation_id"])
+	case <-time.After(3 * time.Second):
+		t.Fatal("leader heartbeat not received")
+	}
+}
