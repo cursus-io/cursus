@@ -217,10 +217,16 @@ func assertBrokerReadiness(t *testing.T, nodes []int) {
 	t.Helper()
 	client := &http.Client{Timeout: 3 * time.Second}
 	for _, node := range nodes {
-		response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/ready", healthPort(node))) // #nosec G107 -- fixed loopback test endpoint.
+		node := node
+		err := eventually(t, fmt.Sprintf("broker-%d data readiness", node), clusterReadyTimeout, func() (bool, string, error) {
+			response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/ready", healthPort(node))) // #nosec G107 -- fixed loopback test endpoint.
+			if err != nil {
+				return false, "readiness request failed", err
+			}
+			defer func() { _ = response.Body.Close() }()
+			return response.StatusCode == http.StatusOK, fmt.Sprintf("status=%d", response.StatusCode), nil
+		})
 		require.NoError(t, err)
-		require.Equal(t, http.StatusOK, response.StatusCode)
-		_ = response.Body.Close()
 	}
 }
 
