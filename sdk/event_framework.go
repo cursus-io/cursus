@@ -20,6 +20,9 @@ type EventEnvelope struct {
 	CorrelationID    string          `json:"correlation_id,omitempty"`
 	AssociationKey   string          `json:"association_key,omitempty"`
 	CausationID      string          `json:"causation_id,omitempty"`
+	SourceTopic      string          `json:"source_topic,omitempty"`
+	SourcePartition  int             `json:"source_partition,omitempty"`
+	SourceOffset     uint64          `json:"source_offset,string,omitempty"`
 	Payload          json.RawMessage `json:"payload"`
 }
 

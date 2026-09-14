@@ -703,6 +703,14 @@ func parseInternalCommandArgs(payload string) map[string]string {
 }
 func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler, ctx *controller.ClientContext, conn net.Conn) (bool, error) {
 	resp := cmdHandler.HandleCommand(payload, ctx)
+	if resp == controller.BROWSE_DATA_SIGNAL {
+		cmdHandler.HandleBrowseMessagesCommand(conn, payload)
+		return false, nil
+	}
+	if resp == controller.STREAM_HISTORY_DATA_SIGNAL {
+		cmdHandler.HandleReadStreamHistoryCommand(conn, payload)
+		return false, nil
+	}
 	if resp == controller.STREAM_DATA_SIGNAL {
 		switch {
 		case strings.HasPrefix(strings.ToUpper(payload), "STREAM "):

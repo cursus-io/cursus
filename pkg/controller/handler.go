@@ -22,6 +22,8 @@ import (
 
 const DefaultMaxPollRecords = 8192
 const STREAM_DATA_SIGNAL = "STREAM_DATA"
+const BROWSE_DATA_SIGNAL = "BROWSE_DATA"
+const STREAM_HISTORY_DATA_SIGNAL = "STREAM_HISTORY_DATA"
 const transactionStateLockStripes = 256
 
 type CommandHandler struct {
@@ -193,9 +195,11 @@ func NewCommandHandler(
 		{prefix: "READ_SNAPSHOT ", exact: false, helpOrder: 29, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string {
 			return ch.handleEventSourceRoutedCommand(cmd, "READ_SNAPSHOT ", ch.ESHandler.HandleReadSnapshot)
 		}},
-		{prefix: "READ_STREAM ", exact: false, helpOrder: 27, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return STREAM_DATA_SIGNAL }},
-		{prefix: "METADATA ", exact: false, helpOrder: 31, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleMetadata(cmd) }},
-		{prefix: "FIND_COORDINATOR ", exact: false, helpOrder: 32, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFindCoordinator(cmd) }},
+		{prefix: "BROWSE_MESSAGES ", exact: false, helpOrder: 42, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return BROWSE_DATA_SIGNAL }},
+		{prefix: "READ_STREAM_HISTORY ", exact: false, helpOrder: 43, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return STREAM_HISTORY_DATA_SIGNAL }},
+		{prefix: "READ_STREAM ", exact: false, helpOrder: 26, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return STREAM_DATA_SIGNAL }},
+		{prefix: "METADATA ", exact: false, helpOrder: 30, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleMetadata(cmd) }},
+		{prefix: "FIND_COORDINATOR ", exact: false, helpOrder: 31, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFindCoordinator(cmd) }},
 		{prefix: "REPLICATE_MESSAGE ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateMessage(cmd) }},
 		{prefix: "REPLICATE_SNAPSHOT ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateSnapshot(cmd) }},
 		{prefix: "LIST_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListSnapshots(cmd) }},

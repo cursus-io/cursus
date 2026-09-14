@@ -53,6 +53,7 @@ func NewConsumerClient(cfg *ConsumerConfig) (*ConsumerClient, error) {
 }
 
 func (c *ConsumerClient) UpdateLeader(addr string) {
+	addr = bootstrapAddressForAdvertisedLoopback(addr, c.config.BrokerAddrs, c.config.UseBootstrapAddressForAdvertisedLoopback)
 	oldInfo := c.leader.Load()
 	if oldInfo.addr != addr {
 		c.leader.Store(&consumerLeaderInfo{

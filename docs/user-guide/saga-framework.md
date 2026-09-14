@@ -53,6 +53,40 @@ effect, and command identities.
 
 Do not commit the Cursus consumer offset before the local transaction succeeds. Cursus broker transactions cannot atomically include an external service database.
 
+### Execution history for outbox delivery
+
+When a service uses `sdk.NewTransactionalSagaManager` with Saga history
+enabled, the manager records `command.enqueued` with the same local
+transaction that inserted the command Outbox row. After the **business command
+publisher** receives a broker acknowledgement, it must call
+`manager.RecordCommandPublished(ctx, associationKey, effectID)`. This records
+`command.published` once while the effect remains `PENDING`.
+
+When a handler persists `SagaWaiting`, the same transaction also records
+`run.waiting` after its completed step. Starting compensation records
+`compensation.started`; these two immutable transitions let a collector show
+`WAITING` and `COMPENSATING` without inferring state from an enqueued command.
+
+`command.published` proves only that the command hand-off was acknowledged; it
+does not mean the receiving business operation succeeded. Record an externally
+confirmed result later with `RecordEffectResult`, which emits
+`command.succeeded` or `command.failed`:
+
+```go
+// The command Outbox row was acknowledged by its target broker/topic.
+if err := manager.RecordCommandPublished(ctx, orderID, "reserve:"+orderID); err != nil {
+    return err
+}
+
+// A separate business-result event confirmed the operation.
+if err := manager.RecordEffectResult(ctx, orderID, "reserve:"+orderID, true, nil); err != nil {
+    return err
+}
+```
+
+The Saga-history Outbox publisher is separate: publishing an immutable history
+record must never generate another `command.published` event.
+
 ## Failure and compensation
 
 Handler errors increment `RetryCount`; the failed state and inbox failure

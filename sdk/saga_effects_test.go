@@ -8,43 +8,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSagaManagerAcknowledgesEnqueuedEffectWithCommandFence(t *testing.T) {
-	repository := newMemorySagaRepository()
-	manager := newSagaTestManager(t, repository, func(_ context.Context, saga *SagaState, _ EventEnvelope) ([]Command, error) {
+func TestSagaManagerPersistsPendingEffectAndDoesNotClaimExternalSuccess(t *testing.T) {
+	inbox := &memoryInbox{claimed: map[string]bool{}}
+	state := &memorySagaStore{states: map[string]*SagaState{}}
+	outbox := &memoryOutbox{}
+	manager := newSagaTestManager(t, inbox, state, outbox, func(_ context.Context, saga *SagaState, _ EventEnvelope) ([]Command, error) {
 		saga.Status = SagaWaiting
 		return []Command{{EffectID: "update-elo", Type: "UpdatePlayerElo"}}, nil
 	})
 
-	require.NoError(t, manager.Handle(context.Background(), sagaTestEvent()))
-	effect := repository.states["finish-game:saga-1"].Effects["update-elo"]
-	require.Equal(t, EffectEnqueued, effect.Status)
-	require.Len(t, repository.commands, 1)
-	require.ErrorContains(t, manager.AcknowledgeEffect(context.Background(), "saga-1", "update-elo", "stale-command"), "command fence mismatch")
-	require.NoError(t, manager.AcknowledgeEffect(context.Background(), "saga-1", "update-elo", effect.CommandID))
-	require.NoError(t, manager.AcknowledgeEffect(context.Background(), "saga-1", "update-elo", effect.CommandID))
-	require.Equal(t, EffectSucceeded, repository.states["finish-game:saga-1"].Effects["update-elo"].Status)
-	require.Equal(t, uint64(2), repository.states["finish-game:saga-1"].Version)
+	first := sagaTestEvent()
+	require.NoError(t, manager.Handle(context.Background(), first))
+	require.Len(t, outbox.commands, 1)
+	require.Equal(t, EffectPending, state.states["finish-game:saga-1"].Effects["update-elo"].Status)
 
 	second := sagaTestEvent()
 	second.EventID = "event-2"
 	require.NoError(t, manager.Handle(context.Background(), second))
-	require.Len(t, repository.commands, 1)
-}
-
-func TestSagaManagerRecordsEffectFailureWithCommandFence(t *testing.T) {
-	repository := newMemorySagaRepository()
-	manager := newSagaTestManager(t, repository, func(context.Context, *SagaState, EventEnvelope) ([]Command, error) {
-		return []Command{{EffectID: "update-elo", Type: "UpdatePlayerElo"}}, nil
-	})
-	require.NoError(t, manager.Handle(context.Background(), sagaTestEvent()))
-	effect := repository.states["finish-game:saga-1"].Effects["update-elo"]
-
-	err := manager.FailEffect(context.Background(), "saga-1", "update-elo", effect.CommandID, errors.New("delivery failed"))
-	require.NoError(t, err)
-	persisted := repository.states["finish-game:saga-1"].Effects["update-elo"]
-	require.Equal(t, EffectFailed, persisted.Status)
-	require.Equal(t, "delivery failed", persisted.LastError)
-	require.ErrorContains(t, manager.AcknowledgeEffect(context.Background(), "saga-1", "update-elo", effect.CommandID), "not awaiting acknowledgement")
+	require.Len(t, outbox.commands, 1)
+	require.Equal(t, EffectPending, state.states["finish-game:saga-1"].Effects["update-elo"].Status)
 }
 
 func TestSagaManagerUsesExplicitAssociationKey(t *testing.T) {

@@ -294,6 +294,30 @@ func (ch *CommandHandler) HandleReadStreamCommand(conn net.Conn, cmd string) {
 	ch.ESHandler.HandleReadStream(cmd, conn)
 }
 
+// HandleReadStreamHistoryCommand preserves the leader and committed-index
+// boundary used by READ_STREAM, but delegates to the snapshot-free history
+// path.  It never substitutes READ_STREAM because that command may apply a
+// snapshot and omit older source events.
+func (ch *CommandHandler) HandleReadStreamHistoryCommand(conn net.Conn, cmd string) {
+	partition, errResp := ch.eventStreamPartition(cmd, "READ_STREAM_HISTORY ")
+	if errResp != "" {
+		writeReadStreamError(conn, errResp)
+		return
+	}
+	topicName := eventStreamTopic(cmd, "READ_STREAM_HISTORY ")
+	if ch.Config != nil && ch.Config.EnabledDistribution && ch.Cluster != nil {
+		if !ch.Cluster.IsAuthorized(topicName, partition) {
+			writeReadStreamError(conn, fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", ch.resolvePartitionLeaderAddr(topicName, partition)))
+			return
+		}
+		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
+			writeReadStreamError(conn, indexResp)
+			return
+		}
+	}
+	ch.ESHandler.HandleReadStreamHistory(cmd, conn)
+}
+
 func (ch *CommandHandler) reconcileEventSourceIndex(topicName string, partition int) string {
 	t := ch.TopicManager.GetTopic(topicName)
 	if t == nil {

@@ -14,7 +14,9 @@ import (
 )
 
 type PublisherConfig struct {
-	BrokerAddrs []string `yaml:"broker_addrs" json:"broker_addrs"`
+	BrokerAddrs                              []string `yaml:"broker_addrs" json:"broker_addrs"`
+	CurrentBrokerIndex                       int      `yaml:"-" json:"-"`
+	UseBootstrapAddressForAdvertisedLoopback bool     `yaml:"use_bootstrap_address_for_advertised_loopback" json:"use_bootstrap_address_for_advertised_loopback"`
 
 	MaxRetries     int `yaml:"max_retries" json:"max_retries"`
 	RetryBackoffMS int `yaml:"retry_backoff_ms" json:"retry_backoff_ms"`
@@ -138,11 +140,17 @@ const (
 )
 
 type ConsumerConfig struct {
-	BrokerAddrs []string `yaml:"broker_addrs" json:"broker_addrs"`
+	BrokerAddrs                              []string `yaml:"broker_addrs" json:"broker_addrs"`
+	CurrentBrokerIndex                       int      `yaml:"-" json:"-"`
+	UseBootstrapAddressForAdvertisedLoopback bool     `yaml:"use_bootstrap_address_for_advertised_loopback" json:"use_bootstrap_address_for_advertised_loopback"`
 
 	Topic      string `yaml:"topic" json:"topic"`
 	GroupID    string `yaml:"group_id" json:"group_id"`
 	ConsumerID string `yaml:"consumer_id" json:"consumer_id"`
+	// CoordinatorAddr pins the group coordinator address for deployments that
+	// expose a broker through a host-port mapping different from its advertised
+	// in-container port. Leave empty for normal coordinator discovery.
+	CoordinatorAddr string `yaml:"coordinator_addr" json:"coordinator_addr"`
 
 	Mode ConsumerMode `yaml:"mode" json:"mode"`
 

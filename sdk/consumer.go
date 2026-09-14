@@ -124,6 +124,41 @@ func (c *Consumer) Done() <-chan struct{} {
 	return c.doneCh
 }
 
+// CommitOffset persists the next offset for an assigned partition immediately.
+//
+// It is intended for consumers that disable EnableAutoCommit because they need
+// an external durable side effect to complete before acknowledging a message.
+// Call it with message.Offset + 1 only after that side effect has succeeded.
+// The method waits for the broker acknowledgement and returns an error without
+// advancing the local committed offset when the commit is rejected.
+func (c *Consumer) CommitOffset(partition int, offset uint64) error {
+	if offset == 0 {
+		return fmt.Errorf("commit offset must be greater than zero")
+	}
+	if err := c.mainCtx.Err(); err != nil {
+		return fmt.Errorf("commit cancelled: %w", err)
+	}
+
+	c.mu.RLock()
+	pc, assigned := c.partitionConsumers[partition]
+	c.mu.RUnlock()
+	if !assigned {
+		return fmt.Errorf("partition %d is not assigned to this consumer", partition)
+	}
+
+	if err := pc.commitOffsetWithRetry(offset); err != nil {
+		return err
+	}
+
+	atomic.StoreUint64(&pc.commitOffset, offset)
+	c.mu.Lock()
+	if current := c.offsets[partition]; offset > current {
+		c.offsets[partition] = offset
+	}
+	c.mu.Unlock()
+	return nil
+}
+
 // Start joins the consumer group, begins consuming, and blocks until Close is called.
 func (c *Consumer) Start(handler func(Message) error) error {
 	if err := c.beginStart(); err != nil {
@@ -143,8 +178,10 @@ func (c *Consumer) Start(handler func(Message) error) error {
 	}
 	c.MessageHandler = handler
 
-	if coordAddr, err := c.findCoordinator(); err == nil {
-		c.mu.Lock()
+	if c.config.CoordinatorAddr != "" {
+		c.coordinatorAddr = c.config.CoordinatorAddr
+		LogInfo("Using configured coordinator for group '%s': %s", c.config.GroupID, c.coordinatorAddr)
+	} else if coordAddr, err := c.findCoordinator(); err == nil {
 		c.coordinatorAddr = coordAddr
 		c.mu.Unlock()
 		LogInfo("Coordinator for group '%s': %s", c.config.GroupID, coordAddr)
@@ -620,7 +657,7 @@ func (c *Consumer) fetchMetadata() error {
 	addrs := strings.Split(leadersStr, ",")
 	c.partitionMu.Lock()
 	for i, addr := range addrs {
-		c.partitionLeaders[i] = addr
+		c.partitionLeaders[i] = bootstrapAddressForAdvertisedLoopback(addr, c.config.BrokerAddrs, c.config.UseBootstrapAddressForAdvertisedLoopback)
 	}
 	c.partitionMu.Unlock()
 	c.compactionEnabled.Store(cleanupPolicyIncludesCompaction(cleanupPolicy))
@@ -641,7 +678,7 @@ func (c *Consumer) getPartitionLeaderAddr(partitionID int) string {
 
 func (c *Consumer) updatePartitionLeader(partitionID int, addr string) {
 	c.partitionMu.Lock()
-	c.partitionLeaders[partitionID] = addr
+	c.partitionLeaders[partitionID] = bootstrapAddressForAdvertisedLoopback(addr, c.config.BrokerAddrs, c.config.UseBootstrapAddressForAdvertisedLoopback)
 	c.partitionMu.Unlock()
 }
 
@@ -1075,8 +1112,20 @@ func isLoopbackCoordinatorHost(host string) bool {
 	}
 }
 
-func (c *Consumer) handleNotCoordinatorError(brokerErr *BrokerError) bool {
-	if brokerErr == nil || !strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
+func bootstrapAddressForAdvertisedLoopback(advertised string, bootstrap []string, enabled bool) string {
+	if !enabled || len(bootstrap) == 0 {
+		return advertised
+	}
+	host, _, err := net.SplitHostPort(advertised)
+	if err != nil || !isLoopbackCoordinatorHost(host) {
+		return advertised
+	}
+	return bootstrap[0]
+}
+
+func (c *Consumer) handleNotCoordinator(respStr string) bool {
+	brokerErr, ok := ParseBrokerError(strings.TrimSpace(respStr))
+	if !ok || !strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
 		return false
 	}
 	host, port := brokerErr.Fields["host"], brokerErr.Fields["port"]

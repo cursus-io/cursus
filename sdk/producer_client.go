@@ -149,6 +149,7 @@ func (pc *ProducerClient) GetLeaderAddr() string {
 }
 
 func (pc *ProducerClient) UpdateLeader(leaderAddr string) {
+	leaderAddr = bootstrapAddressForAdvertisedLoopback(leaderAddr, pc.config.BrokerAddrs, pc.config.UseBootstrapAddressForAdvertisedLoopback)
 	old := pc.leader.Load()
 	if old != nil && old.addr == leaderAddr {
 		return

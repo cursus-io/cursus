@@ -54,6 +54,17 @@ func TestConsumerClient_UpdateLeader(t *testing.T) {
 	assert.False(t, info.updated.IsZero())
 }
 
+func TestConsumerMapsAdvertisedLoopbackPartitionLeaderToBootstrap(t *testing.T) {
+	cfg := NewDefaultConsumerConfig()
+	cfg.BrokerAddrs = []string{"127.0.0.1:19000"}
+	cfg.UseBootstrapAddressForAdvertisedLoopback = true
+	consumer := &Consumer{config: cfg, partitionLeaders: make(map[int]string)}
+
+	consumer.updatePartitionLeader(0, "localhost:9000")
+
+	assert.Equal(t, "127.0.0.1:19000", consumer.getPartitionLeaderAddr(0))
+}
+
 func TestConsumerClient_UpdateLeader_SameAddrNoOp(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	client, _ := NewConsumerClient(cfg)
