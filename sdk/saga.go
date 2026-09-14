@@ -40,6 +40,7 @@ type Command struct {
 	ID            string
 	EffectID      string
 	Type          string
+	SagaType      string
 	SagaID        string
 	CorrelationID string
 	CausationID   string
@@ -326,6 +327,9 @@ func (m *SagaManager) loadOrCreateState(tx SagaTransaction, associationKey strin
 		}
 		if command.SagaID == "" {
 			command.SagaID = state.ID
+		}
+		if command.SagaType == "" {
+			command.SagaType = state.Type
 		}
 		if command.CorrelationID == "" {
 			command.CorrelationID = state.CorrelationID

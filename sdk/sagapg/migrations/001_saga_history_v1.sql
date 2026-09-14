@@ -28,6 +28,14 @@ CREATE TABLE IF NOT EXISTS cursus_saga_history (
   correlation_id TEXT NOT NULL DEFAULT '', causation_id TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
   UNIQUE (saga_type, saga_id, run_id, sequence)
 );
+ALTER TABLE cursus_saga_history ADD COLUMN IF NOT EXISTS source_topic TEXT NOT NULL DEFAULT '';
+ALTER TABLE cursus_saga_history ADD COLUMN IF NOT EXISTS source_partition INTEGER;
+ALTER TABLE cursus_saga_history ADD COLUMN IF NOT EXISTS source_offset BIGINT;
+ALTER TABLE cursus_saga_history ADD COLUMN IF NOT EXISTS aggregate_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE cursus_saga_history ADD COLUMN IF NOT EXISTS aggregate_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE cursus_saga_history ADD COLUMN IF NOT EXISTS aggregate_version BIGINT;
+ALTER TABLE cursus_saga_history ADD COLUMN IF NOT EXISTS payload TEXT NOT NULL DEFAULT '';
+ALTER TABLE cursus_saga_history ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS cursus_saga_history_outbox (
   history_event_id UUID PRIMARY KEY REFERENCES cursus_saga_history(history_event_id),
   topic_name TEXT NOT NULL, payload JSONB NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',

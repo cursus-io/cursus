@@ -93,7 +93,11 @@ func (s store) Fail(ctx context.Context, consumer, eventID string, cause error) 
 func (s store) Load(ctx context.Context, typ, id string) (*sdk.SagaState, error) {
 	// A row lock protects established runs. The advisory lock also covers the
 	// first event, before a state row exists to lock.
-	if _, err := s.tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`, typ, id); err != nil {
+	rows, err := s.tx.QueryContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`, typ, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 	row := s.tx.QueryRowContext(ctx, `SELECT association_key,correlation_id,run_id::text,next_sequence,status,outcome,step_id,data,retry_count,last_error,effects,compensation,updated_at FROM cursus_saga_state WHERE saga_type=$1 AND saga_id=$2 FOR UPDATE`, typ, id)
@@ -137,7 +141,7 @@ func (s store) Save(ctx context.Context, v *sdk.SagaState) error {
 	return e
 }
 func (s store) Enqueue(ctx context.Context, c sdk.Command) error {
-	_, e := s.tx.ExecContext(ctx, `INSERT INTO cursus_saga_outbox (command_id,saga_type,saga_id,effect_id,command_type,correlation_id,causation_id,payload,created_at) VALUES ($1,'',$2,$3,$4,$5,$6,$7::jsonb,NOW()) ON CONFLICT (command_id) DO NOTHING`, c.ID, c.SagaID, c.EffectID, c.Type, c.CorrelationID, c.CausationID, objectJSON(c.Payload))
+	_, e := s.tx.ExecContext(ctx, `INSERT INTO cursus_saga_outbox (command_id,saga_type,saga_id,effect_id,command_type,correlation_id,causation_id,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,NOW()) ON CONFLICT (command_id) DO NOTHING`, c.ID, c.SagaType, c.SagaID, c.EffectID, c.Type, c.CorrelationID, c.CausationID, objectJSON(c.Payload))
 	return e
 }
 func (s store) AppendSagaHistory(ctx context.Context, v sdk.SagaHistoryEvent) error {
