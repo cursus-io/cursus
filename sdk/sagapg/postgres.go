@@ -91,6 +91,11 @@ func (s store) Fail(ctx context.Context, consumer, eventID string, cause error) 
 	return e
 }
 func (s store) Load(ctx context.Context, typ, id string) (*sdk.SagaState, error) {
+	// A row lock protects established runs. The advisory lock also covers the
+	// first event, before a state row exists to lock.
+	if _, err := s.tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`, typ, id); err != nil {
+		return nil, err
+	}
 	row := s.tx.QueryRowContext(ctx, `SELECT association_key,correlation_id,run_id::text,next_sequence,status,outcome,step_id,data,retry_count,last_error,effects,compensation,updated_at FROM cursus_saga_state WHERE saga_type=$1 AND saga_id=$2 FOR UPDATE`, typ, id)
 	var v sdk.SagaState
 	var effects, comp []byte
