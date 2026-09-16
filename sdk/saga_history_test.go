@@ -2,10 +2,51 @@ package sdk
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestSagaHistoryJSONMatchesV1Fixture(t *testing.T) {
+	fixture, err := os.ReadFile("../contracts/fixtures/saga-history-v1.json")
+	require.NoError(t, err)
+	var expected map[string]any
+	require.NoError(t, json.Unmarshal(fixture, &expected))
+
+	actual, err := json.Marshal(SagaHistoryEvent{
+		HistorySchemaVersion: SagaHistorySchemaV1,
+		HistoryEventID:       "a4c9f9a0-291e-41e5-babb-3c13b84c4bb4",
+		EnvironmentID:        "development",
+		ServiceName:          "orders",
+		SagaType:             "order-fulfillment",
+		SagaID:               "order-42",
+		RunID:                "de94b8eb-50c4-4a35-b324-59b9318af658",
+		Sequence:             3,
+		EventType:            SagaHistoryCommandEnqueued,
+		OccurredAt:           time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC),
+		RecordedAt:           time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC),
+		StepID:               "reserve-inventory",
+		Attempt:              1,
+		CommandID:            "reserve-42",
+		EffectID:             "reserve-inventory:1",
+		SourceEventID:        "event-order-42",
+		CorrelationID:        "order-42",
+		SourceTopic:          "orders.events",
+		SourcePartition:      2,
+		SourceOffset:         9007199254740993,
+		AggregateType:        "order",
+		AggregateID:          "order-42",
+		AggregateVersion:     7,
+		Payload:              `{"order_id":"order-42"}`,
+	})
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(actual, &got))
+	require.Equal(t, expected, got)
+}
 
 type memoryHistoryStore struct{ events []SagaHistoryEvent }
 
