@@ -3,6 +3,7 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -178,4 +179,31 @@ func TestTransactionalSagaManagerRecordsPublishedCommandWithoutClaimingResult(t 
 	before := len(history.events)
 	require.NoError(t, manager.RecordCommandPublished(context.Background(), "saga-1", "reserve"))
 	require.Len(t, history.events, before)
+}
+
+func TestTransactionalSagaManagerRecordsFailedEffectAndCompensationTerminalHistory(t *testing.T) {
+	inbox := &memoryInbox{claimed: map[string]bool{}}
+	state := &memorySagaStore{states: map[string]*SagaState{}}
+	history := &memoryHistoryStore{}
+	manager, err := NewTransactionalSagaManager(SagaDefinition{Type: "orders", Handlers: map[string]SagaHandler{
+		"OrderCreated": func(_ context.Context, saga *SagaState, _ EventEnvelope) ([]Command, error) {
+			saga.Status = SagaWaiting
+			return []Command{{EffectID: "reserve", Type: "ReserveInventory"}}, nil
+		},
+	}}, memorySagaTransaction{stores: SagaTransactionStores{Inbox: inbox, State: state, Outbox: &memoryOutbox{}, History: history}}, SagaHistoryOptions{EnvironmentID: "test", ServiceName: "orders"})
+	require.NoError(t, err)
+	event := sagaTestEvent()
+	event.EventType = "OrderCreated"
+	require.NoError(t, manager.Handle(context.Background(), event))
+	require.NoError(t, manager.RecordEffectResult(context.Background(), "saga-1", "reserve", false, errors.New("declined")))
+	_, err = manager.StartCompensation(context.Background(), "saga-1", "release", errors.New("declined"))
+	require.NoError(t, err)
+	require.NoError(t, manager.FailCompensation(context.Background(), "saga-1", errors.New("release failed")))
+
+	got := history.events[len(history.events)-4:]
+	require.Equal(t, []string{SagaHistoryCommandFailed, SagaHistoryCompensationStarted, SagaHistoryCompensationFailed, SagaHistoryRunFailed}, []string{got[0].EventType, got[1].EventType, got[2].EventType, got[3].EventType})
+	require.Equal(t, SagaOutcomeFailed, state.states["orders:saga-1"].Outcome)
+	for index, event := range history.events {
+		require.Equal(t, uint64(index+1), event.Sequence)
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/sdk"
+	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/require"
 )
@@ -93,5 +94,9 @@ func verifySagaHistory(t *testing.T, transaction sdk.SagaTransaction, db *sql.DB
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM cursus_saga_history_outbox WHERE topic_name=$1`, "observability.saga-history.v1").Scan(&outbox))
 	require.Greater(t, history, 0)
 	require.Greater(t, outbox, 0)
+	var runID string
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT run_id::text FROM cursus_saga_history WHERE saga_id=$1 ORDER BY sequence LIMIT 1`, id).Scan(&runID))
+	_, err = db.ExecContext(ctx, `INSERT INTO cursus_saga_history (history_event_id,history_schema_version,environment_id,service_name,saga_type,saga_id,run_id,sequence,event_type,occurred_at,recorded_at) VALUES ($1::uuid,1,'test','orders','go-integration',$2,$3::uuid,1,'run.started',NOW(),NOW())`, uuid.NewString(), id, runID)
+	require.Error(t, err, "the per-run sequence unique constraint must reject collisions")
 	return id
 }
