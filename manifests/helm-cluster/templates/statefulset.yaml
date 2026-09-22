@@ -1,0 +1,181 @@
+{{- if ne (int .Values.cluster.minInSyncReplicas) 2 }}
+{{- fail "cluster.minInSyncReplicas must remain 2 for the fixed three-member topology" }}
+{{- end }}
+{{- if ne (int .Values.cluster.defaultReplicationFactor) 3 }}
+{{- fail "cluster.defaultReplicationFactor must remain 3 for the fixed three-member topology" }}
+{{- end }}
+{{- if not .Values.cluster.internalAuthSecret }}
+{{- fail "cluster.internalAuthSecret must name a pre-created Secret containing the shared token" }}
+{{- end }}
+{{- if not .Values.internalTLS.secretName }}
+{{- fail "internalTLS.secretName must name a pre-created Secret containing tls.crt, tls.key, and ca.crt" }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "cursus-cluster.fullname" . }}
+  labels:
+    {{- include "cursus-cluster.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "cursus-cluster.headlessService" . }}
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      {{- include "cursus-cluster.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cursus-cluster.selectorLabels" . | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: broker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              case "${POD_NAME##*-}" in
+                0) export BOOTSTRAP_CLUSTER=true ;;
+                *) export BOOTSTRAP_CLUSTER=false ;;
+              esac
+              exec /app/broker
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: broker
+              containerPort: {{ .Values.service.brokerPort }}
+            - name: health
+              containerPort: {{ .Values.service.healthPort }}
+            - name: metrics
+              containerPort: {{ .Values.service.metricsPort }}
+            - name: internal
+              containerPort: {{ .Values.service.internalPort }}
+            - name: raft
+              containerPort: {{ .Values.service.raftPort }}
+            - name: discovery
+              containerPort: {{ .Values.service.discoveryPort }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ADVERTISED_HOST
+              value: "$(POD_NAME).{{ include "cursus-cluster.headlessService" . }}.$(POD_NAMESPACE).svc.cluster.local"
+            - name: ADVERTISED_CLIENT_HOST
+              value: "$(POD_NAME).{{ include "cursus-cluster.headlessService" . }}.$(POD_NAMESPACE).svc.cluster.local"
+            - name: ENABLE_DISTRIBUTION
+              value: "true"
+            - name: INTERNAL_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.cluster.internalAuthSecret }}
+                  key: {{ .Values.cluster.internalAuthSecretKey }}
+            - name: INTERNAL_BROKER_PORT
+              value: "{{ .Values.service.internalPort }}"
+            - name: RAFT_PORT
+              value: "{{ .Values.service.raftPort }}"
+            - name: DISCOVERY_PORT
+              value: "{{ .Values.service.discoveryPort }}"
+            - name: STATIC_CLUSTER_MEMBERS
+              value: {{ include "cursus-cluster.members" . | quote }}
+            - name: MIN_INSYNC_REPLICAS
+              value: "{{ .Values.cluster.minInSyncReplicas }}"
+            - name: DEFAULT_REPLICATION_FACTOR
+              value: "{{ .Values.cluster.defaultReplicationFactor }}"
+            - name: TRANSACTION_COORDINATOR_SHARDS
+              value: "{{ .Values.cluster.transactionCoordinatorShards }}"
+            - name: LOG_DIR
+              value: /data/logs
+            - name: USE_TLS
+              value: "false"
+            - name: INTERNAL_USE_TLS
+              value: "true"
+            - name: INTERNAL_TLS_CERT_PATH
+              value: /app/internal-tls/tls.crt
+            - name: INTERNAL_TLS_KEY_PATH
+              value: /app/internal-tls/tls.key
+            - name: INTERNAL_TLS_CA_PATH
+              value: /app/internal-tls/ca.crt
+            - name: INTERNAL_TLS_SERVER_NAME
+              value: {{ .Values.internalTLS.serverName | quote }}
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: health
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: {{ .Values.startupProbeFailureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: logs
+              mountPath: /data/logs
+            - name: internal-tls
+              mountPath: /app/internal-tls
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: internal-tls
+          secret:
+            secretName: {{ .Values.internalTLS.secretName }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+              - key: ca.crt
+                path: ca.crt
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "cursus-cluster.selectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: logs
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

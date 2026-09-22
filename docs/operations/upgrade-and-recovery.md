@@ -23,6 +23,8 @@ cursus-storage backup validate --log-dir /backup/cursus-logs
 
 It exits non-zero if the manifest is missing or if validation finds a storage problem. Preserve its JSON output with the backup record; it is the operator evidence that the copy was restorable at the time it was made.
 
+For the fixed three-member Kubernetes topology, use the separate [Kubernetes cluster runbook](kubernetes-cluster.md). Its StatefulSet keeps one PVC per member and requires a one-member-at-a-time restart; never combine PVCs from different backup generations.
+
 Before changing any binary or configuration, stop writes and record the target
 release, `git`/image digest, configuration checksum, member list, leader, ISR,
 and available disk space. Take one immutable backup generation containing the

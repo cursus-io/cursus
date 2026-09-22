@@ -1,0 +1,54 @@
+image:
+  repository: ghcr.io/cursus-io/cursus
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  brokerPort: 9000
+  healthPort: 9080
+  metricsPort: 9100
+  internalPort: 19000
+  raftPort: 9001
+  discoveryPort: 8000
+
+persistence:
+  storageClass: ""
+  size: 20Gi
+  accessModes:
+    - ReadWriteOnce
+
+cluster:
+  # Create this Secret separately. It must contain `token` with the shared
+  # broker-to-broker credential; the chart deliberately never renders it.
+  internalAuthSecret: ""
+  internalAuthSecretKey: token
+  transactionCoordinatorShards: 50
+  minInSyncReplicas: 2
+  defaultReplicationFactor: 3
+
+internalTLS:
+  # The Secret must contain tls.crt, tls.key, and ca.crt. The certificate must
+  # have a SAN for internalTLS.serverName and every StatefulSet DNS name.
+  secretName: ""
+  serverName: cursus.internal
+
+podSecurityContext:
+  fsGroup: 1000
+  supplementalGroups: [1000]
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+terminationGracePeriodSeconds: 90
+startupProbeFailureThreshold: 45
+

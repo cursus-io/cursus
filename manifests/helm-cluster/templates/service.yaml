@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cursus-cluster.fullname" . }}
+  labels:
+    {{- include "cursus-cluster.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: broker
+      port: {{ .Values.service.brokerPort }}
+      targetPort: broker
+      protocol: TCP
+  selector:
+    {{- include "cursus-cluster.selectorLabels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cursus-cluster.headlessService" . }}
+  labels:
+    {{- include "cursus-cluster.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: broker
+      port: {{ .Values.service.brokerPort }}
+    - name: internal
+      port: {{ .Values.service.internalPort }}
+    - name: raft
+      port: {{ .Values.service.raftPort }}
+    - name: discovery
+      port: {{ .Values.service.discoveryPort }}
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+  selector:
+    {{- include "cursus-cluster.selectorLabels" . | nindent 4 }}
+
