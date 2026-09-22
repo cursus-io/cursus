@@ -26,6 +26,13 @@ type journalRecord struct {
 	Transaction *Snapshot `json:"transaction"`
 }
 
+// JournalInspection is a read-only integrity summary for a standalone journal.
+type JournalInspection struct {
+	Present            bool `json:"present"`
+	RecordCount        int  `json:"record_count"`
+	LatestTransactions int  `json:"latest_transactions"`
+}
+
 // Journal durably appends standalone transaction coordinator snapshots.
 type Journal struct {
 	mu                sync.Mutex
@@ -54,6 +61,72 @@ func OpenJournal(path string) (*Journal, error) {
 		return nil, fmt.Errorf("close transaction journal: %w", err)
 	}
 	return &Journal{path: path}, nil
+}
+
+// InspectJournal validates an existing journal without creating, truncating, or
+// repairing it. A missing journal is valid because no transaction may have
+// been persisted yet.
+func InspectJournal(path string) (JournalInspection, error) {
+	if path == "" {
+		return JournalInspection{}, fmt.Errorf("transaction journal path is empty")
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return JournalInspection{}, nil
+	}
+	if err != nil {
+		return JournalInspection{}, fmt.Errorf("inspect transaction journal: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return JournalInspection{}, fmt.Errorf("transaction journal must be a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return JournalInspection{}, fmt.Errorf("open transaction journal for inspection: %w", err)
+	}
+	defer file.Close()
+
+	latest := make(map[string]*Snapshot)
+	var offset int64
+	records := 0
+	for offset < info.Size() {
+		if info.Size()-offset < journalRecordOverhead {
+			return JournalInspection{}, fmt.Errorf("truncated transaction journal record at %d", offset)
+		}
+		var header [4]byte
+		if _, err := file.ReadAt(header[:], offset); err != nil {
+			return JournalInspection{}, fmt.Errorf("read transaction journal header at %d: %w", offset, err)
+		}
+		payloadSize := int64(binary.BigEndian.Uint32(header[:]))
+		if payloadSize <= 0 || payloadSize > maxJournalRecordBytes {
+			return JournalInspection{}, fmt.Errorf("invalid transaction journal record size %d at %d", payloadSize, offset)
+		}
+		recordEnd := offset + journalRecordSize(int(payloadSize))
+		if recordEnd > info.Size() {
+			return JournalInspection{}, fmt.Errorf("truncated transaction journal record at %d", offset)
+		}
+		payload := make([]byte, payloadSize)
+		if _, err := file.ReadAt(payload, offset+4); err != nil {
+			return JournalInspection{}, fmt.Errorf("read transaction journal payload at %d: %w", offset, err)
+		}
+		var checksumBytes [4]byte
+		if _, err := file.ReadAt(checksumBytes[:], offset+4+payloadSize); err != nil {
+			return JournalInspection{}, fmt.Errorf("read transaction journal checksum at %d: %w", offset, err)
+		}
+		if actual, expected := crc32.ChecksumIEEE(payload), binary.BigEndian.Uint32(checksumBytes[:]); actual != expected {
+			return JournalInspection{}, fmt.Errorf("transaction journal checksum mismatch at %d", offset)
+		}
+		snapshot, err := decodeJournalSnapshot(payload)
+		if err != nil {
+			return JournalInspection{}, fmt.Errorf("decode transaction journal record at %d: %w", offset, err)
+		}
+		if err := mergeJournalSnapshot(latest, snapshot); err != nil {
+			return JournalInspection{}, fmt.Errorf("merge transaction journal record at %d: %w", offset, err)
+		}
+		offset = recordEnd
+		records++
+	}
+	return JournalInspection{Present: true, RecordCount: records, LatestTransactions: len(latest)}, nil
 }
 
 func (j *Journal) Append(snap *Snapshot) (err error) {

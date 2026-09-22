@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/stretchr/testify/require"
 )
 
 func TestJournalCompactionKeepsLatestSnapshotPerID(t *testing.T) {
@@ -213,4 +214,28 @@ func TestJournalLoadReturnsIsolatedState(t *testing.T) {
 		private.Messages[0].Message.ControlBatchKey[0] != 1 {
 		t.Fatalf("caller mutated private journal state: %+v", private)
 	}
+}
+
+func TestInspectJournalIsReadOnlyAndRejectsTruncatedTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transactions.journal")
+	journal, err := OpenJournal(path)
+	require.NoError(t, err)
+	require.NoError(t, journal.Append(testJournalSnapshot("inspect", 1, StateCommitted)))
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	inspection, err := InspectJournal(path)
+	require.NoError(t, err)
+	require.Equal(t, JournalInspection{Present: true, RecordCount: 1, LatestTransactions: 1}, inspection)
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+
+	truncated := append(append([]byte(nil), before...), 0, 0, 0)
+	require.NoError(t, os.WriteFile(path, truncated, 0o600))
+	_, err = InspectJournal(path)
+	require.ErrorContains(t, err, "truncated transaction journal record")
+	afterFailure, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, truncated, afterFailure)
 }

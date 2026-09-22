@@ -169,6 +169,34 @@ func InspectStandaloneStorage(logDir string) (StorageInventory, error) {
 	return inventory, nil
 }
 
+// ValidateStandaloneBackup verifies that an inventory has explicit metadata,
+// no discovered storage defects, and definitions that cover the persisted
+// partition layout. It does not open a broker or mutate storage.
+func ValidateStandaloneBackup(logDir string) (StorageInventory, error) {
+	inventory, err := InspectStandaloneStorage(logDir)
+	if err != nil {
+		return StorageInventory{}, err
+	}
+	if !inventory.ManifestPresent {
+		return inventory, fmt.Errorf("backup is not restorable: no topic metadata manifest is present")
+	}
+	if len(inventory.Problems) > 0 {
+		return inventory, fmt.Errorf("backup is not restorable: storage has %d validation problem(s)", len(inventory.Problems))
+	}
+	root, err := safeStorageRoot(logDir)
+	if err != nil {
+		return inventory, err
+	}
+	definitions, err := readStandaloneManifest(filepath.Join(root, TopicMetadataFileName))
+	if err != nil {
+		return inventory, err
+	}
+	if err := definitionsMatchInventory(definitions, inventory.Topics); err != nil {
+		return inventory, fmt.Errorf("backup is not restorable: topic metadata is not aligned with storage: %w", err)
+	}
+	return inventory, nil
+}
+
 func inspectPersistedTopic(root, name, topicPath string) (PersistedTopic, bool, []StorageProblem, error) {
 	entries, err := os.ReadDir(topicPath)
 	if err != nil {

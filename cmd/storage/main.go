@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/transaction"
 )
 
 func main() {
@@ -39,19 +41,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return operationError(stderr, err)
 		}
-		ready := inventory.ManifestPresent && len(inventory.Problems) == 0
+		_, validationErr := topic.ValidateStandaloneBackup(*logDir)
+		journal, journalErr := transaction.InspectJournal(filepath.Join(*logDir, "__transaction_state.journal"))
+		ready := validationErr == nil && journalErr == nil
 		result := struct {
-			Ready     bool                   `json:"ready"`
-			Inventory topic.StorageInventory `json:"inventory"`
-		}{Ready: ready, Inventory: inventory}
+			Ready              bool                          `json:"ready"`
+			Inventory          topic.StorageInventory        `json:"inventory"`
+			TransactionJournal transaction.JournalInspection `json:"transaction_journal"`
+		}{Ready: ready, Inventory: inventory, TransactionJournal: journal}
 		if err := writeJSONValue(stdout, result); err != nil {
 			return operationError(stderr, err)
 		}
-		if !inventory.ManifestPresent {
-			return operationError(stderr, errors.New("backup is not restorable: no topic metadata manifest is present"))
-		}
-		if len(inventory.Problems) > 0 {
-			return operationError(stderr, fmt.Errorf("backup is not restorable: storage has %d validation problem(s)", len(inventory.Problems)))
+		if err := errors.Join(validationErr, journalErr); err != nil {
+			return operationError(stderr, err)
 		}
 		return 0
 

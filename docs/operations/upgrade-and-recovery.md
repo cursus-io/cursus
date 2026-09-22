@@ -15,7 +15,7 @@ upgrade is a coordinated whole-cluster operation.
 
 ## Preflight
 
-Validate a copied backup before using it for a rollback or recovery. The command is read-only: it verifies the explicit topic manifest and scans persisted topic and consumer metadata records without starting a broker.
+Validate a copied backup before using it for a rollback or recovery. The command is read-only: it verifies the explicit topic manifest against the persisted partition layout, scans topic and consumer metadata records, and validates any transaction-journal framing and checksums without starting a broker.
 
 ```bash
 cursus-storage backup validate --log-dir /backup/cursus-logs
