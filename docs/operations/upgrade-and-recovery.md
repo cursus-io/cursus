@@ -15,6 +15,14 @@ upgrade is a coordinated whole-cluster operation.
 
 ## Preflight
 
+Validate a copied backup before using it for a rollback or recovery. The command is read-only: it verifies the explicit topic manifest and scans persisted topic and consumer metadata records without starting a broker.
+
+```bash
+cursus-storage backup validate --log-dir /backup/cursus-logs
+```
+
+It exits non-zero if the manifest is missing or if validation finds a storage problem. Preserve its JSON output with the backup record; it is the operator evidence that the copy was restorable at the time it was made.
+
 Before changing any binary or configuration, stop writes and record the target
 release, `git`/image digest, configuration checksum, member list, leader, ISR,
 and available disk space. Take one immutable backup generation containing the

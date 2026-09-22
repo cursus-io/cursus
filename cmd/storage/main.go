@@ -25,6 +25,36 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	switch args[0] + " " + args[1] {
+	case "backup validate":
+		flags := flag.NewFlagSet("backup validate", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		logDir := flags.String("log-dir", "", "broker log directory")
+		if code := parseCommandFlags(flags, args[2:]); code >= 0 {
+			return code
+		}
+		if *logDir == "" || flags.NArg() != 0 {
+			return usageError(stderr, "--log-dir is required and positional arguments are not accepted")
+		}
+		inventory, err := topic.InspectStandaloneStorage(*logDir)
+		if err != nil {
+			return operationError(stderr, err)
+		}
+		ready := inventory.ManifestPresent && len(inventory.Problems) == 0
+		result := struct {
+			Ready     bool                   `json:"ready"`
+			Inventory topic.StorageInventory `json:"inventory"`
+		}{Ready: ready, Inventory: inventory}
+		if err := writeJSONValue(stdout, result); err != nil {
+			return operationError(stderr, err)
+		}
+		if !inventory.ManifestPresent {
+			return operationError(stderr, errors.New("backup is not restorable: no topic metadata manifest is present"))
+		}
+		if len(inventory.Problems) > 0 {
+			return operationError(stderr, fmt.Errorf("backup is not restorable: storage has %d validation problem(s)", len(inventory.Problems)))
+		}
+		return 0
+
 	case "manifest inspect":
 		flags := flag.NewFlagSet("manifest inspect", flag.ContinueOnError)
 		flags.SetOutput(stderr)
@@ -159,6 +189,7 @@ func usageError(stderr io.Writer, message string) int {
 
 func printUsage(writer io.Writer) {
 	_, _ = fmt.Fprintln(writer, "usage:")
+	_, _ = fmt.Fprintln(writer, "  cursus-storage backup validate --log-dir DIR")
 	_, _ = fmt.Fprintln(writer, "  cursus-storage manifest inspect --log-dir DIR")
 	_, _ = fmt.Fprintln(writer, "  cursus-storage consumer-metadata inspect --log-dir DIR")
 	_, _ = fmt.Fprintln(writer, "  cursus-storage orphan inspect --log-dir DIR")
