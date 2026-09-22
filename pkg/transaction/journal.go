@@ -28,12 +28,14 @@ type journalRecord struct {
 
 // Journal durably appends standalone transaction coordinator snapshots.
 type Journal struct {
-	mu       sync.Mutex
-	path     string
-	validEnd int64
-	loaded   bool
-	latest   map[string]*Snapshot
-	records  int
+	mu                sync.Mutex
+	path              string
+	validEnd          int64
+	loaded            bool
+	latest            map[string]*Snapshot
+	latestBytes       int64
+	latestRecordBytes map[string]int64
+	records           int
 }
 
 func OpenJournal(path string) (*Journal, error) {
@@ -112,14 +114,16 @@ func (j *Journal) Append(snap *Snapshot) (err error) {
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("sync transaction journal: %w", err)
 	}
-	j.validEnd += int64(journalRecordOverhead) + int64(payloadLen)
-	j.latest[snap.ID] = snapshot(transactionFromSnapshot(snap))
+	recordBytes := journalRecordSize(payloadLen)
+	j.validEnd += recordBytes
+	j.replaceLatestLocked(snap, recordBytes)
 	j.records++
 	return nil
 }
 
 func (j *Journal) shouldCompactLocked() bool {
-	return j.records >= journalCompactionRecords || j.validEnd >= journalCompactionBytes
+	return j.records-len(j.latest) >= journalCompactionRecords ||
+		j.validEnd-j.latestBytes >= journalCompactionBytes
 }
 
 // Rewrite atomically replaces the journal with the supplied authoritative
@@ -142,6 +146,8 @@ func (j *Journal) Rewrite(state map[string]*Snapshot) error {
 		next[id] = snapshot(transactionFromSnapshot(snap))
 	}
 	j.latest = next
+	j.latestBytes = 0
+	j.latestRecordBytes = make(map[string]int64, len(next))
 	if err := j.compactLocked(); err != nil {
 		return fmt.Errorf("rewrite transaction journal: %w", err)
 	}
@@ -171,6 +177,7 @@ func (j *Journal) compactLocked() (err error) {
 	sort.Strings(ids)
 
 	var compactedSize int64
+	compactedRecordBytes := make(map[string]int64, len(ids))
 	for _, id := range ids {
 		snap := j.latest[id]
 		if snap == nil || snap.ID == "" {
@@ -196,7 +203,9 @@ func (j *Journal) compactLocked() (err error) {
 		if writeErr := writeFull(temp, checksum[:]); writeErr != nil {
 			return fmt.Errorf("write compacted transaction journal checksum: %w", writeErr)
 		}
-		compactedSize += int64(journalRecordOverhead + len(payload))
+		recordBytes := journalRecordSize(len(payload))
+		compactedSize += recordBytes
+		compactedRecordBytes[id] = recordBytes
 	}
 	if syncErr := temp.Sync(); syncErr != nil {
 		return fmt.Errorf("sync compacted transaction journal: %w", syncErr)
@@ -209,6 +218,8 @@ func (j *Journal) compactLocked() (err error) {
 		return fmt.Errorf("replace transaction journal with compacted state: %w", renameErr)
 	}
 	j.validEnd = compactedSize
+	j.latestBytes = compactedSize
+	j.latestRecordBytes = compactedRecordBytes
 	j.records = len(ids)
 	if syncErr := syncJournalDirectory(dir); syncErr != nil {
 		return syncErr
@@ -235,12 +246,14 @@ func (j *Journal) loadLocked() (map[string]*Snapshot, error) {
 	}
 	size := info.Size()
 	latest := make(map[string]*Snapshot)
+	latestRecordBytes := make(map[string]int64)
+	var latestBytes int64
 	var offset int64
 	records := 0
 
 	for offset < size {
 		if size-offset < 4 {
-			return j.repairTail(file, offset, latest, records)
+			return j.repairTail(file, offset, latest, latestRecordBytes, latestBytes, records)
 		}
 
 		var header [4]byte
@@ -250,14 +263,14 @@ func (j *Journal) loadLocked() (map[string]*Snapshot, error) {
 		payloadSize := int64(binary.BigEndian.Uint32(header[:]))
 		if payloadSize <= 0 || payloadSize > maxJournalRecordBytes {
 			if offset+4 == size {
-				return j.repairTail(file, offset, latest, records)
+				return j.repairTail(file, offset, latest, latestRecordBytes, latestBytes, records)
 			}
 			return nil, fmt.Errorf("invalid transaction journal record size %d at %d", payloadSize, offset)
 		}
 
 		recordEnd := offset + 4 + payloadSize + 4
 		if recordEnd > size {
-			return j.repairTail(file, offset, latest, records)
+			return j.repairTail(file, offset, latest, latestRecordBytes, latestBytes, records)
 		}
 
 		payload := make([]byte, payloadSize)
@@ -272,7 +285,7 @@ func (j *Journal) loadLocked() (map[string]*Snapshot, error) {
 		actual := crc32.ChecksumIEEE(payload)
 		if actual != expected {
 			if recordEnd == size {
-				return j.repairTail(file, offset, latest, records)
+				return j.repairTail(file, offset, latest, latestRecordBytes, latestBytes, records)
 			}
 			return nil, fmt.Errorf("transaction journal checksum mismatch at %d", offset)
 		}
@@ -284,25 +297,48 @@ func (j *Journal) loadLocked() (map[string]*Snapshot, error) {
 		if err := mergeJournalSnapshot(latest, snap); err != nil {
 			return nil, fmt.Errorf("merge transaction journal record at %d: %w", offset, err)
 		}
+		if previousSize, exists := latestRecordBytes[snap.ID]; exists {
+			latestBytes -= previousSize
+		}
+		recordBytes := recordEnd - offset
+		latestRecordBytes[snap.ID] = recordBytes
+		latestBytes += recordBytes
 		records++
 		offset = recordEnd
 	}
 	j.validEnd = offset
 	j.loaded = true
 	j.latest = latest
+	j.latestBytes = latestBytes
+	j.latestRecordBytes = latestRecordBytes
 	j.records = records
 	return cloneJournalState(latest), nil
 }
 
-func (j *Journal) repairTail(file *os.File, offset int64, latest map[string]*Snapshot, records int) (map[string]*Snapshot, error) {
+func (j *Journal) repairTail(file *os.File, offset int64, latest map[string]*Snapshot, latestRecordBytes map[string]int64, latestBytes int64, records int) (map[string]*Snapshot, error) {
 	if err := repairJournalTail(file, offset); err != nil {
 		return nil, err
 	}
 	j.validEnd = offset
 	j.loaded = true
 	j.latest = latest
+	j.latestBytes = latestBytes
+	j.latestRecordBytes = latestRecordBytes
 	j.records = records
 	return cloneJournalState(latest), nil
+}
+
+func (j *Journal) replaceLatestLocked(snap *Snapshot, recordBytes int64) {
+	if previousSize, exists := j.latestRecordBytes[snap.ID]; exists {
+		j.latestBytes -= previousSize
+	}
+	j.latest[snap.ID] = snapshot(transactionFromSnapshot(snap))
+	j.latestRecordBytes[snap.ID] = recordBytes
+	j.latestBytes += recordBytes
+}
+
+func journalRecordSize(payloadLen int) int64 {
+	return int64(journalRecordOverhead) + int64(payloadLen)
 }
 
 func cloneJournalState(state map[string]*Snapshot) map[string]*Snapshot {
