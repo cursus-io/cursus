@@ -26,6 +26,31 @@ go test -v -timeout 30m ./test/e2e-benchmark/...
 
 `make bench` runs the standalone compose workload. See [Benchmark Verification](../benchmark-verification.md) for direct compose commands and cleanup.
 
+## Durable Storage Workload
+
+The checked-in workloads use tmpfs and are not evidence of physical-disk
+durability latency. To run the same standalone correctness workload against a
+host directory on the intended filesystem, use the separate durable compose
+file. The directory must already exist, be dedicated to the run, and have
+enough space for broker logs and temporary compaction files.
+
+```powershell
+$env:RUN_E2E_DURABLE_BENCHMARK = "1"
+$env:CURSUS_DURABLE_BENCHMARK_LOG_DIR = "D:\cursus-benchmark-logs"
+$env:CURSUS_DURABLE_BENCHMARK_RESULT = "D:\cursus-benchmark-results\run.json"
+$env:CURSUS_BENCHMARK_REVISION = (git rev-parse HEAD)
+$env:CURSUS_DURABLE_BENCHMARK_STORAGE = "NVMe model, filesystem, mount options"
+go test -v -timeout 30m ./test/e2e-benchmark/... -run '^TestDurableStandaloneBenchmark$'
+```
+
+The result is versioned JSON containing revision, Go/runtime metadata, the
+operator-declared storage identity, post-run file/byte counts, elapsed time,
+benchmark summaries, and mandatory publish/consume correctness counters. The
+harness refuses to run or publish a result when that metadata or any required
+counter is missing. It is still a standalone workload; transaction, retention,
+compaction, and replica-recovery soak scenarios are separate operational
+validation runs and must be reported with their own workload settings.
+
 ## Correctness Gate
 
 The harness fails on non-zero container exit, timeout, incomplete/verification markers, anchored panic/fatal logs, failed publishes, missing records, duplicate message IDs, or duplicate logical offsets. Multi-digit counters are parsed numerically. A success banner without zero correctness counters is not sufficient.

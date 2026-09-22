@@ -442,6 +442,49 @@ func TestClusterBenchmark(t *testing.T) {
 	assertBenchmarkSuccess(t, consLogs, "Consumer")
 }
 
+// TestDurableStandaloneBenchmark runs the fast correctness workload against an
+// operator-provided host directory and records the storage identity/results.
+// It intentionally remains opt-in: CI's tmpfs benchmark is not durable-disk
+// evidence.
+func TestDurableStandaloneBenchmark(t *testing.T) {
+	config, enabled, err := durableBenchmarkConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !enabled {
+		t.Skip("set RUN_E2E_DURABLE_BENCHMARK=1 with durable benchmark metadata to run")
+	}
+	if testing.Short() {
+		t.Skip("skipping durable benchmark test in short mode")
+	}
+
+	durableComposeFile := composeFile("../docker-compose.durable.yml")
+	composeDown(t, durableComposeFile)
+	t.Cleanup(func() { composeDown(t, durableComposeFile) })
+
+	startedAt := time.Now()
+	composeUp(t, durableComposeFile)
+	pubLogs, pubDone := waitForContainerExit(t, durableComposeFile, "publisher", "bench-publisher", benchmarkTimeout)
+	if !pubDone {
+		t.Fatal("durable benchmark publisher did not complete within timeout")
+	}
+	assertBenchmarkSuccess(t, pubLogs, "Publisher")
+	consLogs, consDone := waitForContainerExit(t, durableComposeFile, "consumer", "bench-consumer", benchmarkTimeout)
+	if !consDone {
+		t.Fatal("durable benchmark consumer did not complete within timeout")
+	}
+	assertBenchmarkSuccess(t, consLogs, "Consumer")
+
+	result, err := durableResult(config, startedAt, time.Now(), pubLogs, consLogs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDurableBenchmarkResult(config.ResultPath, result); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("durable benchmark result written to %s", config.ResultPath)
+}
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 	os.Exit(code)
