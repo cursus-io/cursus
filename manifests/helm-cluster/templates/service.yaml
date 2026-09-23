@@ -36,4 +36,3 @@ spec:
       port: {{ .Values.service.metricsPort }}
   selector:
     {{- include "cursus-cluster.selectorLabels" . | nindent 4 }}
-

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -157,15 +156,8 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 		return nil, fmt.Errorf("failed to create snapshot store: %w", err)
 	}
 
-	advertiseTCPAddr, err := net.ResolveTCPAddr("tcp", localAddr)
-	if err != nil {
-		_ = raftStore.Close()
-		util.Error("Failed to resolve advertised address %s: %v", localAddr, err)
-		return nil, fmt.Errorf("failed to resolve advertised address: %w", err)
-	}
-
 	bindAddr := fmt.Sprintf("0.0.0.0:%d", cfg.RaftPort)
-	transport, err := newRaftNetworkTransport(cfg, bindAddr, advertiseTCPAddr)
+	transport, err := newRaftNetworkTransport(cfg, bindAddr, localAddr)
 	if err != nil {
 		_ = raftStore.Close()
 		util.Error("Failed to create raft transport: %v", err)

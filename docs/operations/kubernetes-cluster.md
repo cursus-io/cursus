@@ -2,7 +2,7 @@
 
 `manifests/helm-cluster` is a deliberately fixed three-member production topology. It is separate from the existing standalone chart so that a values change cannot turn a single PVC into a false cluster deployment.
 
-Each StatefulSet ordinal owns one `ReadWriteOnce` PVC, publishes a stable headless-service DNS name, and uses those three names for Raft membership and discovery. Broker `-0` is the only member permitted to bootstrap an empty cluster; restart recovery uses the existing Raft state on each PVC. The PodDisruptionBudget requires two available members and the default required anti-affinity therefore requires three schedulable nodes.
+Each StatefulSet ordinal owns one `ReadWriteOnce` PVC, publishes a stable headless-service DNS name, and uses those three names for Raft membership and discovery. Initial Pods are created in parallel because the Raft bootstrap needs all three voters; broker `-0` is the only member permitted to bootstrap an empty cluster. Restart recovery uses the existing Raft state on each PVC. The PodDisruptionBudget requires two available members and the default required anti-affinity therefore requires three schedulable nodes.
 
 ## Install
 
@@ -42,4 +42,3 @@ Do not delete PVCs while restarting, scaling, or upgrading the StatefulSet. Repl
 For an irrecoverable node, stop client writes, preserve the failed PVC for forensics, restore that member from the same backup generation as the other members, and then recreate only that Pod. If the Raft membership itself is damaged, stop and follow the coordinated backup/restore procedure in `upgrade-and-recovery.md`; replacing storage from different backup generations is not supported.
 
 The chart guarantees rendered topology and safety constraints, not a completed live cluster qualification. Run the cluster E2E suite and the documented restart, Pod-recreation, quorum-loss, and restore drills on the target Kubernetes distribution before accepting traffic.
-

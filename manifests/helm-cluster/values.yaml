@@ -51,4 +51,3 @@ tolerations: []
 affinity: {}
 terminationGracePeriodSeconds: 90
 startupProbeFailureThreshold: 45
-

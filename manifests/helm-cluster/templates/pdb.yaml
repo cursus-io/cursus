@@ -9,4 +9,3 @@ spec:
   selector:
     matchLabels:
       {{- include "cursus-cluster.selectorLabels" . | nindent 6 }}
-

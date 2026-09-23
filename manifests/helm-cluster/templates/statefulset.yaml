@@ -19,7 +19,9 @@ metadata:
 spec:
   serviceName: {{ include "cursus-cluster.headlessService" . }}
   replicas: 3
-  podManagementPolicy: OrderedReady
+  # Initial Raft bootstrap needs all three voters to be able to start. Ordered
+  # startup would deadlock because the first voter cannot become ready alone.
+  podManagementPolicy: Parallel
   updateStrategy:
     type: OnDelete
   selector:

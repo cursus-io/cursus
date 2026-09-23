@@ -17,7 +17,15 @@ type raftTLSStreamLayer struct {
 	clientConfig *tls.Config
 }
 
-func newRaftTLSStreamLayer(bindAddress string, advertised *net.TCPAddr, serverConfig, clientConfig *tls.Config) (*raftTLSStreamLayer, error) {
+// stableRaftAddress preserves a configured DNS name instead of resolving it to
+// a Pod IP. StatefulSet Pods may be recreated with a different IP while the
+// Raft membership address remains their stable headless-service DNS name.
+type stableRaftAddress string
+
+func (a stableRaftAddress) Network() string { return "tcp" }
+func (a stableRaftAddress) String() string  { return string(a) }
+
+func newRaftTLSStreamLayer(bindAddress string, advertised net.Addr, serverConfig, clientConfig *tls.Config) (*raftTLSStreamLayer, error) {
 	if serverConfig == nil || clientConfig == nil {
 		return nil, fmt.Errorf("raft TLS requires server and client TLS configuration")
 	}
@@ -49,13 +57,17 @@ func (l *raftTLSStreamLayer) Dial(address raft.ServerAddress, timeout time.Durat
 	return tls.DialWithDialer(dialer, "tcp", string(address), l.clientConfig.Clone())
 }
 
-func newRaftNetworkTransport(cfg *config.Config, bindAddress string, advertised *net.TCPAddr) (*raft.NetworkTransport, error) {
+func newRaftNetworkTransport(cfg *config.Config, bindAddress, advertised string) (*raft.NetworkTransport, error) {
 	const timeout = 10 * time.Second
 	if !cfg.InternalUseTLS {
-		return raft.NewTCPTransport(bindAddress, advertised, 3, timeout, os.Stderr)
+		resolved, err := net.ResolveTCPAddr("tcp", advertised)
+		if err != nil {
+			return nil, fmt.Errorf("resolve advertised Raft address %q: %w", advertised, err)
+		}
+		return raft.NewTCPTransport(bindAddress, resolved, 3, timeout, os.Stderr)
 	}
 
-	layer, err := newRaftTLSStreamLayer(bindAddress, advertised, cfg.InternalServerTLSConfig(), cfg.InternalClientTLSConfig())
+	layer, err := newRaftTLSStreamLayer(bindAddress, stableRaftAddress(advertised), cfg.InternalServerTLSConfig(), cfg.InternalClientTLSConfig())
 	if err != nil {
 		return nil, err
 	}
