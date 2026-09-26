@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,10 +26,12 @@ import (
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/observability"
+	"github.com/cursus-io/cursus/pkg/observationgrpc"
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/wire"
+	"github.com/cursus-io/cursus/sdk"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -251,6 +254,25 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			return err
 		}
 		defer shutdownInternal()
+	}
+	if cfg.ObservationGRPCPort > 0 {
+		if (cfg.ObservationGRPCPrincipal == "") != (cfg.ObservationGRPCAuthToken == "") {
+			return fmt.Errorf("observation gRPC principal and auth token must be configured together")
+		}
+		backend, err := sdk.NewAdminClient(&sdk.AdminConfig{
+			BrokerAddrs: []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.BrokerPort))},
+			UseTLS:      cfg.UseTLS, TLSCertPath: cfg.TLSCertPath, TLSKeyPath: cfg.TLSKeyPath,
+			Principal: cfg.ObservationGRPCPrincipal, AuthToken: cfg.ObservationGRPCAuthToken,
+		})
+		if err != nil {
+			return fmt.Errorf("create observation gRPC backend: %w", err)
+		}
+		shutdownObservation, err := observationgrpc.Start(ctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.ObservationGRPCPort)), backend)
+		if err != nil {
+			return err
+		}
+		defer shutdownObservation()
+		util.Info("Read-only observation gRPC listener started on 127.0.0.1:%d", cfg.ObservationGRPCPort)
 	}
 	if err := globalCH.RecoverPreparedTransactions(); err != nil {
 		return fmt.Errorf("failed to recover prepared transactions: %w", err)

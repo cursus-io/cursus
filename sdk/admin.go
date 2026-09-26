@@ -342,6 +342,9 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 		return "", &ambiguousAdminError{err: fmt.Errorf("read admin response from %s: %w", addr, err)}
 	}
 	value := strings.TrimSpace(string(response))
+	if brokerErr, ok := ParseBrokerError(value); ok {
+		return "", brokerErr
+	}
 	if !hasOKStatus(value) {
 		return "", &terminalAdminError{err: fmt.Errorf("unexpected admin response: %s", value)}
 	}

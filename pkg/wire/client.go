@@ -145,7 +145,7 @@ func (c *ClientConn) recordResponse(status Status) bool {
 		return true
 	}
 	switch c.activeCmd {
-	case CommandReadStream:
+	case CommandReadStream, CommandBrowseMessages, CommandReadStreamHistory:
 		return status == StatusStreamEnd || c.received >= 2
 	case CommandStream:
 		return status == StatusStreamEnd

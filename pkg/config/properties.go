@@ -103,6 +103,11 @@ type Config struct {
 	// network
 	MaxClientConnections int `yaml:"max_client_connections" json:"max.client.connections"`
 	ClientIdleTimeoutMS  int `yaml:"client_idle_timeout_ms" json:"client.idle.timeout.ms"`
+	// ObservationGRPCPort enables a loopback-only, read-only gRPC adapter. A
+	// zero value leaves the listener disabled.
+	ObservationGRPCPort      int    `yaml:"observation_grpc_port" json:"observation.grpc.port"`
+	ObservationGRPCPrincipal string `yaml:"observation_grpc_principal" json:"observation.grpc.principal"`
+	ObservationGRPCAuthToken string `yaml:"observation_grpc_auth_token" json:"observation.grpc.auth_token"`
 
 	// stream
 	MaxStreamConnections int           `yaml:"max_stream_connections" json:"max.stream.connections"`
@@ -195,6 +200,7 @@ func DefaultConfig() *Config {
 			// network
 			MaxClientConnections: 1000,
 			ClientIdleTimeoutMS:  60000,
+			ObservationGRPCPort:  0,
 
 			// stream
 			MaxStreamConnections: 1000,
@@ -299,6 +305,9 @@ func LoadConfig() (*Config, error) {
 	flag.IntVar(&cfg.ConsumerHeartbeatCheckMS, "consumer-heartbeat-check", cfg.ConsumerHeartbeatCheckMS, "Heartbeat check")
 	flag.IntVar(&cfg.MaxClientConnections, "max-client-connections", cfg.MaxClientConnections, "Maximum concurrently serviced client connections")
 	flag.IntVar(&cfg.ClientIdleTimeoutMS, "client-idle-timeout-ms", cfg.ClientIdleTimeoutMS, "Idle client connection timeout in milliseconds")
+	flag.IntVar(&cfg.ObservationGRPCPort, "observation-grpc-port", cfg.ObservationGRPCPort, "Loopback-only read-only observation gRPC port; zero disables it")
+	flag.StringVar(&cfg.ObservationGRPCPrincipal, "observation-grpc-principal", cfg.ObservationGRPCPrincipal, "Broker principal used by the local observation gRPC adapter")
+	flag.StringVar(&cfg.ObservationGRPCAuthToken, "observation-grpc-auth-token", cfg.ObservationGRPCAuthToken, "Broker token used by the local observation gRPC adapter")
 
 	// stream
 	flag.IntVar(&cfg.MaxStreamConnections, "max-stream-connections", cfg.MaxStreamConnections, "Max stream connections")

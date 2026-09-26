@@ -145,6 +145,59 @@ func TestClientReadStreamKeepsRoundTripUntilSecondFrame(t *testing.T) {
 	}
 }
 
+func TestClientBoundedReadCommandsKeepRoundTripUntilBatch(t *testing.T) {
+	for _, command := range []Command{CommandBrowseMessages, CommandReadStreamHistory} {
+		t.Run(command.String(), func(t *testing.T) {
+			clientNet, serverNet := net.Pipe()
+			t.Cleanup(func() { _ = clientNet.Close() })
+			t.Cleanup(func() { _ = serverNet.Close() })
+			clientCodec, err := NewCodec(CompressionNone)
+			if err != nil {
+				t.Fatal(err)
+			}
+			serverCodec, err := NewCodec(CompressionNone)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &ClientConn{
+				Conn: clientNet, wire: &Connection{conn: clientNet, codec: clientCodec},
+				activeID: 13, activeCmd: command, awaiting: true,
+			}
+			client.roundTrip.Lock()
+			writeErr := make(chan error, 1)
+			go func() {
+				for _, payload := range [][]byte{[]byte(`{"status":"OK"}`), []byte("batch")} {
+					if err := serverCodec.WriteFrame(serverNet, Frame{
+						Kind: KindResponse, Command: command, Status: StatusOK, RequestID: 13, Payload: payload,
+					}); err != nil {
+						writeErr <- err
+						return
+					}
+				}
+				writeErr <- nil
+			}()
+
+			if payload, err := client.Receive(); err != nil || string(payload) != `{"status":"OK"}` {
+				t.Fatalf("envelope = %q, %v", payload, err)
+			}
+			if client.roundTrip.TryLock() {
+				client.roundTrip.Unlock()
+				t.Fatal("round trip unlocked before bounded-read batch")
+			}
+			if payload, err := client.Receive(); err != nil || string(payload) != "batch" {
+				t.Fatalf("batch = %q, %v", payload, err)
+			}
+			if !client.roundTrip.TryLock() {
+				t.Fatal("round trip remained locked after bounded-read batch")
+			}
+			client.roundTrip.Unlock()
+			if err := <-writeErr; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestClientStreamKeepsRoundTripUntilStreamEnd(t *testing.T) {
 	clientNet, serverNet := net.Pipe()
 	defer func() { _ = clientNet.Close() }()
