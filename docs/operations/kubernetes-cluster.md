@@ -6,9 +6,11 @@ Each StatefulSet ordinal owns one `ReadWriteOnce` PVC, publishes a stable headle
 
 ## Install
 
-Create the shared internal-authentication Secret and a TLS Secret whose certificate is valid for `cursus.internal` and the three generated pod DNS names. Do not use the client TLS Secret for this purpose unless it carries the required client-auth CA and SANs.
+Create the namespace first, then the shared internal-authentication Secret and a TLS Secret whose certificate is valid for `cursus.internal` and the three generated pod DNS names. Do not use the client TLS Secret for this purpose unless it carries the required client-auth CA and SANs.
 
 ```bash
+kubectl create namespace brokers
+
 kubectl -n brokers create secret generic cursus-internal-auth \
   --from-literal=token="$(openssl rand -hex 32)"
 

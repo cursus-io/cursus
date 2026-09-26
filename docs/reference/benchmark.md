@@ -36,6 +36,7 @@ enough space for broker logs and temporary compaction files.
 
 ```powershell
 $env:RUN_E2E_DURABLE_BENCHMARK = "1"
+$null = New-Item -ItemType Directory -Force "D:\cursus-benchmark-results"
 $env:CURSUS_DURABLE_BENCHMARK_LOG_DIR = "D:\cursus-benchmark-logs"
 $env:CURSUS_DURABLE_BENCHMARK_RESULT = "D:\cursus-benchmark-results\run.json"
 $env:CURSUS_BENCHMARK_REVISION = (git rev-parse HEAD)
