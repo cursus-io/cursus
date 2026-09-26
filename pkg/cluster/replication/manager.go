@@ -177,45 +177,15 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 		if confFuture := r.GetConfiguration(); confFuture.Error() == nil {
 			conf := confFuture.Configuration()
 			if len(conf.Servers) == 0 {
-				util.Info("🚀 No Raft servers found, starting static cluster bootstrap (members=%v)", cfg.StaticClusterMembers)
-
-				var servers []raft.Server
-				for _, member := range cfg.StaticClusterMembers {
-					member = strings.TrimSpace(member)
-					if member == "" {
-						continue
-					}
-
-					var memberID, memberAddr string
-					if strings.Contains(member, "@") {
-						parts := strings.SplitN(member, "@", 2)
-						if len(parts) == 2 {
-							memberID = parts[0]
-							memberAddr = parts[1]
-						} else {
-							continue
-						}
-					} else {
-						memberAddr = member
-						memberID = memberAddr
-					}
-
-					util.Info("🔗 Adding Raft voter: ID=%s, Addr=%s", memberID, memberAddr)
-					servers = append(servers, raft.Server{
-						ID:       raft.ServerID(memberID),
-						Address:  raft.ServerAddress(memberAddr),
-						Suffrage: raft.Voter,
-					})
+				util.Info("🚀 No Raft servers found, bootstrapping sole voter %s", brokerID)
+				bootstrapConfig := raft.Configuration{Servers: []raft.Server{{
+					ID: raft.ServerID(brokerID), Address: raft.ServerAddress(localAddr), Suffrage: raft.Voter,
+				}}}
+				if err := r.BootstrapCluster(bootstrapConfig).Error(); err != nil {
+					util.Error("❌ Raft bootstrap failed for node %s: %v", brokerID, err)
+					return nil, fmt.Errorf("bootstrap failed: %w", err)
 				}
-
-				if len(servers) > 0 {
-					bootstrapConfig := raft.Configuration{Servers: servers}
-					if err := r.BootstrapCluster(bootstrapConfig).Error(); err != nil {
-						util.Error("❌ Raft bootstrap failed for node %s: %v", brokerID, err)
-						return nil, fmt.Errorf("bootstrap failed: %w", err)
-					}
-					util.Info("✅ Raft cluster bootstrap initiated with %d servers on node %s", len(servers), brokerID)
-				}
+				util.Info("✅ Raft cluster bootstrap initiated with sole voter %s", brokerID)
 			} else {
 				util.Info("ℹ️ Raft node %s already has %d servers in configuration, skipping bootstrap", brokerID, len(conf.Servers))
 			}
