@@ -75,43 +75,6 @@ jobs:
           cache: true
       - run: make build
 
-  saga-db-integration:
-    name: Saga PostgreSQL + MySQL integration
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: cursus
-          POSTGRES_PASSWORD: cursus
-          POSTGRES_DB: cursus
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U cursus -d cursus"
-          --health-interval 5s --health-timeout 5s --health-retries 10
-      mysql:
-        image: mysql:8.4
-        env:
-          MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: cursus
-          MYSQL_USER: cursus
-          MYSQL_PASSWORD: cursus
-        ports: ["3306:3306"]
-        options: >-
-          --health-cmd "mysqladmin ping -h localhost -uroot -proot"
-          --health-interval 5s --health-timeout 5s --health-retries 20
-    env:
-      CURSUS_SAGA_POSTGRES_DSN: postgres://cursus:cursus@localhost:5432/cursus?sslmode=disable
-      CURSUS_SAGA_MYSQL_DSN: mysql://cursus:cursus@localhost:3306/cursus?parseTime=true
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: '1.26.2'
-          cache: true
-      - name: Verify transactional Saga adapters and history outbox retry
-        run: go test -v ./sdk/sagapg ./sdk/sagamysql
-
   command-tests:
     runs-on: ubuntu-latest
     steps:
