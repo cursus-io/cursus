@@ -43,8 +43,8 @@ spec:
           args:
             - |
               case "${POD_NAME##*-}" in
-                0) export BOOTSTRAP_CLUSTER=true ;;
-                *) export BOOTSTRAP_CLUSTER=false ;;
+                0) export BOOTSTRAP_CLUSTER=true BOOTSTRAP_SOLE_VOTER=true ;;
+                *) export BOOTSTRAP_CLUSTER=false BOOTSTRAP_SOLE_VOTER=false ;;
               esac
               exec /app/broker
           securityContext:
