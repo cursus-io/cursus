@@ -80,6 +80,7 @@ func InspectJournal(path string) (JournalInspection, error) {
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return JournalInspection{}, fmt.Errorf("transaction journal must be a regular file")
 	}
+	// #nosec G304 -- caller supplies the broker-owned journal path; Lstat above rejects links and non-regular files.
 	file, err := os.Open(path)
 	if err != nil {
 		return JournalInspection{}, fmt.Errorf("open transaction journal for inspection: %w", err)

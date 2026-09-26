@@ -2,6 +2,7 @@ package e2e_benchmark
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -168,14 +169,12 @@ func writeDurableBenchmarkResult(path string, result durableBenchmarkResult) err
 		return fmt.Errorf("create durable benchmark result: %w", err)
 	}
 	tempPath := temp.Name()
-	defer os.Remove(tempPath)
+	defer func() { _ = os.Remove(tempPath) }()
 	if _, err := temp.Write(append(encoded, '\n')); err != nil {
-		temp.Close()
-		return fmt.Errorf("write durable benchmark result: %w", err)
+		return fmt.Errorf("write durable benchmark result: %w", errors.Join(err, temp.Close()))
 	}
 	if err := temp.Sync(); err != nil {
-		temp.Close()
-		return fmt.Errorf("sync durable benchmark result: %w", err)
+		return fmt.Errorf("sync durable benchmark result: %w", errors.Join(err, temp.Close()))
 	}
 	if err := temp.Close(); err != nil {
 		return fmt.Errorf("close durable benchmark result: %w", err)
