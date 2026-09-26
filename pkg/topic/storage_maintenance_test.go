@@ -54,6 +54,20 @@ func TestInspectStandaloneStorageReportsCorruptAndMismatchedLogs(t *testing.T) {
 	require.Contains(t, combined, "does not match")
 }
 
+func TestValidateStandaloneBackupRequiresDefinitionsToMatchStorage(t *testing.T) {
+	root := t.TempDir()
+	writePersistedTestSegment(t, root, "orders", 0, 0, nil)
+	store := &topicMetadataStore{path: filepath.Join(root, TopicMetadataFileName)}
+	require.NoError(t, store.Save([]Definition{{Name: "orders", Partitions: 1, Policy: DefaultPolicy()}}))
+
+	_, err := ValidateStandaloneBackup(root)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Save(nil))
+	_, err = ValidateStandaloneBackup(root)
+	require.ErrorContains(t, err, "topic metadata is not aligned with storage")
+}
+
 func TestInspectStandaloneStorageAcceptsOnlyCurrentConsumerMetadata(t *testing.T) {
 	root := t.TempDir()
 	current, err := json.Marshal(coordinator.ConsumerMetadataRecord{

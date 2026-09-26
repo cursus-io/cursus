@@ -2,13 +2,11 @@ package e2e_benchmark
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -326,50 +324,6 @@ func assertBenchmarkSuccess(t *testing.T, logs string, component string) {
 	}
 }
 
-func benchmarkResultSummary(logs string) string {
-	wanted := []string{
-		"PRODUCER BENCHMARK SUMMARY",
-		"CONSUMER BENCHMARK SUMMARY",
-		"Partitions",
-		"Total Batches",
-		"Total Messages",
-		"Failed messages",
-		"Retry Count",
-		"Publish elapsed Time",
-		"Publish Message Throughput",
-		"Latency P95",
-		"Latency P99",
-		"Elapsed Time",
-		"Overall TPS",
-		"Duplicate (MessageID)",
-		"Duplicate (Offset)",
-		"Message missing",
-	}
-
-	var out []string
-	for _, line := range strings.Split(logs, "\n") {
-		for _, token := range wanted {
-			if strings.Contains(line, token) {
-				out = append(out, strings.TrimSpace(line))
-				break
-			}
-		}
-	}
-	return strings.Join(out, "\n")
-}
-func benchmarkCounter(logs, label string) (int, bool) {
-	pattern := regexp.MustCompile(fmt.Sprintf(`(?im)%s[[:space:]]*:[[:space:]]*([0-9]+)`, regexp.QuoteMeta(label)))
-	match := pattern.FindStringSubmatch(logs)
-	if match == nil {
-		return 0, false
-	}
-	count, err := strconv.Atoi(match[1])
-	if err != nil {
-		return 0, false
-	}
-	return count, true
-}
-
 func lastLines(s string, n int) string {
 	lines := strings.Split(s, "\n")
 	if len(lines) <= n {
@@ -440,6 +394,49 @@ func TestClusterBenchmark(t *testing.T) {
 		t.Fatal("Consumer did not complete within timeout")
 	}
 	assertBenchmarkSuccess(t, consLogs, "Consumer")
+}
+
+// TestDurableStandaloneBenchmark runs the fast correctness workload against an
+// operator-provided host directory and records the storage identity/results.
+// It intentionally remains opt-in: CI's tmpfs benchmark is not durable-disk
+// evidence.
+func TestDurableStandaloneBenchmark(t *testing.T) {
+	config, enabled, err := durableBenchmarkConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !enabled {
+		t.Skip("set RUN_E2E_DURABLE_BENCHMARK=1 with durable benchmark metadata to run")
+	}
+	if testing.Short() {
+		t.Skip("skipping durable benchmark test in short mode")
+	}
+
+	durableComposeFile := composeFile("../docker-compose.durable.yml")
+	composeDown(t, durableComposeFile)
+	t.Cleanup(func() { composeDown(t, durableComposeFile) })
+
+	startedAt := time.Now()
+	composeUp(t, durableComposeFile)
+	pubLogs, pubDone := waitForContainerExit(t, durableComposeFile, "publisher", "bench-publisher", benchmarkTimeout)
+	if !pubDone {
+		t.Fatal("durable benchmark publisher did not complete within timeout")
+	}
+	assertBenchmarkSuccess(t, pubLogs, "Publisher")
+	consLogs, consDone := waitForContainerExit(t, durableComposeFile, "consumer", "bench-consumer", benchmarkTimeout)
+	if !consDone {
+		t.Fatal("durable benchmark consumer did not complete within timeout")
+	}
+	assertBenchmarkSuccess(t, consLogs, "Consumer")
+
+	result, err := durableResult(config, startedAt, time.Now(), pubLogs, consLogs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDurableBenchmarkResult(config.ResultPath, result); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("durable benchmark result written to %s", config.ResultPath)
 }
 
 func TestMain(m *testing.M) {

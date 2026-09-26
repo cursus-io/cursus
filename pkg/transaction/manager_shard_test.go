@@ -143,6 +143,30 @@ func TestIndependentManagerShardsSupportConcurrentMutation(t *testing.T) {
 	require.Len(t, manager.ExportState(), manager.ShardCount())
 }
 
+func TestSnapshotDoesNotWaitForUnrelatedShard(t *testing.T) {
+	manager := NewManagerWithExpirationAndShards(time.Hour, 2)
+	targetID := transactionIDForShard(t, 0, manager.ShardCount())
+	blockedID := transactionIDForShard(t, 1, manager.ShardCount())
+	manager.ApplySnapshot(&Snapshot{ID: targetID, State: StateCommitted})
+
+	blockedShard := manager.shardForID(blockedID)
+	blockedShard.mu.Lock()
+	defer blockedShard.mu.Unlock()
+
+	result := make(chan bool, 1)
+	go func() {
+		_, ok := manager.Snapshot(targetID)
+		result <- ok
+	}()
+
+	select {
+	case ok := <-result:
+		require.True(t, ok)
+	case <-time.After(time.Second):
+		t.Fatal("snapshot waited for an unrelated transaction shard")
+	}
+}
+
 func BenchmarkPreparedTransactionsIndexed(b *testing.B) {
 	manager := NewManagerWithExpirationAndShards(time.Hour, 50)
 	for i := 0; i < 100_000; i++ {
@@ -163,5 +187,26 @@ func BenchmarkPreparedTransactionsIndexed(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = manager.PreparedTransactions([]int{0}, 256)
+	}
+}
+
+func BenchmarkSnapshotWithRetainedTransactions(b *testing.B) {
+	manager := NewManagerWithExpirationAndShards(time.Hour, 50)
+	for i := 0; i < 100_000; i++ {
+		id := fmt.Sprintf("retained-%d", i)
+		_, _, _ = manager.InitProducerWithMode(id, ModeProcessingV1)
+	}
+	targetID := ""
+	for i := 0; ; i++ {
+		candidate := fmt.Sprintf("snapshot-%d", i)
+		if CoordinatorShardForCount(candidate, manager.ShardCount()) == 0 {
+			targetID = candidate
+			break
+		}
+	}
+	manager.ApplySnapshot(&Snapshot{ID: targetID, State: StateCommitted})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = manager.Snapshot(targetID)
 	}
 }

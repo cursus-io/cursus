@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -157,15 +156,8 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 		return nil, fmt.Errorf("failed to create snapshot store: %w", err)
 	}
 
-	advertiseTCPAddr, err := net.ResolveTCPAddr("tcp", localAddr)
-	if err != nil {
-		_ = raftStore.Close()
-		util.Error("Failed to resolve advertised address %s: %v", localAddr, err)
-		return nil, fmt.Errorf("failed to resolve advertised address: %w", err)
-	}
-
 	bindAddr := fmt.Sprintf("0.0.0.0:%d", cfg.RaftPort)
-	transport, err := newRaftNetworkTransport(cfg, bindAddr, advertiseTCPAddr)
+	transport, err := newRaftNetworkTransport(cfg, bindAddr, localAddr)
 	if err != nil {
 		_ = raftStore.Close()
 		util.Error("Failed to create raft transport: %v", err)
@@ -185,44 +177,30 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 		if confFuture := r.GetConfiguration(); confFuture.Error() == nil {
 			conf := confFuture.Configuration()
 			if len(conf.Servers) == 0 {
-				util.Info("🚀 No Raft servers found, starting static cluster bootstrap (members=%v)", cfg.StaticClusterMembers)
-
-				var servers []raft.Server
-				for _, member := range cfg.StaticClusterMembers {
-					member = strings.TrimSpace(member)
-					if member == "" {
-						continue
+				var bootstrapConfig raft.Configuration
+				shouldBootstrap := true
+				if cfg.BootstrapSoleVoter {
+					util.Info("🚀 No Raft servers found, bootstrapping sole voter %s", brokerID)
+					bootstrapConfig = raft.Configuration{Servers: []raft.Server{{
+						ID: raft.ServerID(brokerID), Address: raft.ServerAddress(localAddr), Suffrage: raft.Voter,
+					}}}
+				} else if len(cfg.StaticClusterMembers) == 0 {
+					shouldBootstrap = false
+					util.Info("ℹ️ No Raft servers or static cluster members found for node %s, skipping bootstrap", brokerID)
+				} else {
+					util.Info("🚀 No Raft servers found, starting static cluster bootstrap (members=%v)", cfg.StaticClusterMembers)
+					var err error
+					bootstrapConfig, err = bootstrapConfiguration(brokerID, localAddr, cfg.StaticClusterMembers)
+					if err != nil {
+						return nil, fmt.Errorf("build bootstrap configuration: %w", err)
 					}
-
-					var memberID, memberAddr string
-					if strings.Contains(member, "@") {
-						parts := strings.SplitN(member, "@", 2)
-						if len(parts) == 2 {
-							memberID = parts[0]
-							memberAddr = parts[1]
-						} else {
-							continue
-						}
-					} else {
-						memberAddr = member
-						memberID = memberAddr
-					}
-
-					util.Info("🔗 Adding Raft voter: ID=%s, Addr=%s", memberID, memberAddr)
-					servers = append(servers, raft.Server{
-						ID:       raft.ServerID(memberID),
-						Address:  raft.ServerAddress(memberAddr),
-						Suffrage: raft.Voter,
-					})
 				}
-
-				if len(servers) > 0 {
-					bootstrapConfig := raft.Configuration{Servers: servers}
+				if shouldBootstrap {
 					if err := r.BootstrapCluster(bootstrapConfig).Error(); err != nil {
 						util.Error("❌ Raft bootstrap failed for node %s: %v", brokerID, err)
 						return nil, fmt.Errorf("bootstrap failed: %w", err)
 					}
-					util.Info("✅ Raft cluster bootstrap initiated with %d servers on node %s", len(servers), brokerID)
+					util.Info("✅ Raft cluster bootstrap initiated with %d servers on node %s", len(bootstrapConfig.Servers), brokerID)
 				}
 			} else {
 				util.Info("ℹ️ Raft node %s already has %d servers in configuration, skipping bootstrap", brokerID, len(conf.Servers))

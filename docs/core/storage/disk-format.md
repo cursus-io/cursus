@@ -133,7 +133,7 @@ A standalone broker stores coordinator snapshots in `{log_dir}/__transaction_sta
 
 The encoded payload is limited to 32 MiB. Every accepted transition is appended and fsynced. Before appending, the broker truncates bytes beyond the last validated record so a failed partial write cannot hide later acknowledged state. Startup repairs only a torn or checksum-corrupt final frame and rejects corruption before the tail. Every runtime record must use the version-1 envelope; bare transaction snapshots are rejected.
 
-The journal is append-only and currently has no automatic compaction. Backups must keep it consistent with partition logs and the standalone consumer offset store.
+The journal appends every acknowledged transition and automatically compacts only superseded transaction snapshots when removable record or byte debt crosses its threshold. A large useful latest-state set is retained without repeated rewrites. Backups must keep the journal consistent with partition logs and the standalone consumer offset store.
 
 ## Retention And Compaction
 

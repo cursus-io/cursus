@@ -13,7 +13,9 @@ on:
       - 'entrypoint.sh'
       - 'broker.go'
       - 'cmd/**'
+      - 'internal/**'
       - 'pkg/**'
+      - 'sdk/**'
       - 'test/**'
       - 'util/**'
   pull_request:
@@ -28,7 +30,9 @@ on:
       - 'entrypoint.sh'
       - 'broker.go'
       - 'cmd/**'
+      - 'internal/**'
       - 'pkg/**'
+      - 'sdk/**'
       - 'test/**'
       - 'util/**'
 

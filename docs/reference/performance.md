@@ -62,7 +62,7 @@ A broker transaction adds:
 
 Batch related records and offsets into a meaningful transaction, but avoid unbounded transactions: an open transaction holds the stable visibility boundary on touched partitions. All staged source offsets must belong to one consumer scope.
 
-Coordinator synchronization currently persists the complete staged transaction snapshot after each mutation. Very large transactions therefore amplify standalone journal and distributed metadata traffic; keep transaction batches bounded and measure coordinator latency as well as partition throughput. A standalone encoded snapshot record is limited to 32 MiB. The standalone journal is append-only and does not yet compact superseded snapshots automatically.
+Coordinator synchronization currently persists the complete staged transaction snapshot after each mutation. Very large transactions therefore amplify standalone journal and distributed metadata traffic; keep transaction batches bounded and measure coordinator latency as well as partition throughput. A standalone encoded snapshot record is limited to 32 MiB. The standalone journal appends every acknowledged transition and automatically compacts only superseded snapshots when removable record or byte debt crosses its threshold; a large set of live transactional IDs is not repeatedly rewritten merely because useful state is large.
 
 ## Compaction Cost
 

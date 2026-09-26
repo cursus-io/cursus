@@ -24,6 +24,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.RaftTrailingLogs != 10240 {
 		t.Errorf("Expected default RaftTrailingLogs 10240, got %d", cfg.RaftTrailingLogs)
 	}
+	if cfg.BootstrapSoleVoter {
+		t.Error("Expected BootstrapSoleVoter to default to false")
+	}
 	if cfg.TransactionCoordinatorShards != 50 {
 		t.Errorf("Expected default TransactionCoordinatorShards 50, got %d", cfg.TransactionCoordinatorShards)
 	}
@@ -38,6 +41,7 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("RAFT_SNAPSHOT_INTERVAL_MS", "250")
 	t.Setenv("RAFT_SNAPSHOT_THRESHOLD", "16")
 	t.Setenv("RAFT_TRAILING_LOGS", "0")
+	t.Setenv("BOOTSTRAP_SOLE_VOTER", "true")
 	t.Setenv("TRANSACTION_COORDINATOR_SHARDS", "17")
 	t.Setenv("TRANSACTION_RECOVERY_BATCH_SIZE", "19")
 
@@ -60,6 +64,9 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	}
 	if cfg.RaftTrailingLogs != 0 {
 		t.Errorf("Expected RaftTrailingLogs 0 from env, got %d", cfg.RaftTrailingLogs)
+	}
+	if !cfg.BootstrapSoleVoter {
+		t.Error("Expected BootstrapSoleVoter true from env")
 	}
 	if cfg.TransactionCoordinatorShards != 17 {
 		t.Errorf("Expected TransactionCoordinatorShards 17 from env, got %d", cfg.TransactionCoordinatorShards)

@@ -79,6 +79,7 @@ type Config struct {
 	RaftPeers              []string `yaml:"raft_peers" json:"distribution.raft.peers"`
 	StaticClusterMembers   []string `yaml:"static_cluster_members" json:"distribution.static_cluster_members"`
 	BootstrapCluster       bool     `yaml:"bootstrap_cluster" json:"distribution.bootstrap"`
+	BootstrapSoleVoter     bool     `yaml:"bootstrap_sole_voter" json:"distribution.bootstrap_sole_voter"`
 
 	AdvertisedHost           string `yaml:"advertised_host" json:"distribution.advertised_host"`
 	AdvertisedBrokerPort     int    `yaml:"advertised_broker_port" json:"distribution.advertised_broker_port"`
@@ -173,6 +174,7 @@ func DefaultConfig() *Config {
 			RaftPeers:                []string{},
 			StaticClusterMembers:     []string{},
 			BootstrapCluster:         false,
+			BootstrapSoleVoter:       false,
 			AdvertisedHost:           "localhost",
 			AdvertisedBrokerPort:     0,
 			MinInSyncReplicas:        2,
@@ -279,6 +281,7 @@ func LoadConfig() (*Config, error) {
 	flag.IntVar(&cfg.DiscoveryPort, "discovery-port", cfg.DiscoveryPort, "Discovery service port")
 	raftPeersFlag := flag.String("raft-peers", "", "Raft peer addresses (comma-separated)")
 	flag.BoolVar(&cfg.BootstrapCluster, "bootstrap-cluster", cfg.BootstrapCluster, "Bootstrap Raft cluster")
+	flag.BoolVar(&cfg.BootstrapSoleVoter, "bootstrap-sole-voter", cfg.BootstrapSoleVoter, "Bootstrap this broker as the sole initial Raft voter")
 	flag.StringVar(&cfg.AdvertisedHost, "advertised-host", cfg.AdvertisedHost, "Advertised host for discovery")
 	flag.IntVar(&cfg.MinInSyncReplicas, "min-insync-replicas", cfg.MinInSyncReplicas, "Minimum in-sync replicas for writes")
 	flag.IntVar(&cfg.DefaultReplicationFactor, "default-replication-factor", cfg.DefaultReplicationFactor, "Default replication factor for new topics")
@@ -421,6 +424,7 @@ func LoadConfig() (*Config, error) {
 	overrideEnvStringSlice(&cfg.RaftPeers, "RAFT_PEERS")
 	overrideEnvStringSlice(&cfg.StaticClusterMembers, "STATIC_CLUSTER_MEMBERS")
 	overrideEnvBool(&cfg.BootstrapCluster, "BOOTSTRAP_CLUSTER")
+	overrideEnvBool(&cfg.BootstrapSoleVoter, "BOOTSTRAP_SOLE_VOTER")
 	overrideEnvInt(&cfg.MinInSyncReplicas, "MIN_INSYNC_REPLICAS")
 	overrideEnvInt(&cfg.DefaultReplicationFactor, "DEFAULT_REPLICATION_FACTOR")
 

@@ -1,0 +1,61 @@
+services:
+  broker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: bench-broker
+    command: ./broker
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ${CURSUS_DURABLE_BENCHMARK_LOG_DIR:?set a host directory on a durable filesystem}:/app/broker-logs
+    environment:
+      - CONFIG_PATH=/app/config.yaml
+    ports:
+      - "9000:9000"
+      - "9100:9100"
+      - "9080:9080"
+    stdin_open: true
+    tty: true
+    networks:
+      - test_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
+      interval: 2s
+      timeout: 1s
+      retries: 3
+
+  publisher:
+    build:
+      context: ..
+      dockerfile: test/publisher/Dockerfile
+    container_name: bench-publisher
+    depends_on:
+      broker:
+        condition: service_healthy
+    volumes:
+      - ./publisher/config.yaml:/config.yaml
+    command: ["./publisher", "-config", "/config.yaml"]
+    networks:
+      - test_network
+
+  consumer:
+    build:
+      context: ..
+      dockerfile: test/consumer/Dockerfile
+    container_name: bench-consumer
+    depends_on:
+      broker:
+        condition: service_healthy
+      publisher:
+        condition: service_started
+    volumes:
+      - ./consumer/config.yaml:/config.yaml
+    environment:
+      - BROKER_ADDR=broker:9000
+    command: ["./consumer", "-config", "/config.yaml"]
+    networks:
+      - test_network
+
+networks:
+  test_network:
+    driver: bridge

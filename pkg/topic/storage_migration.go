@@ -169,6 +169,62 @@ func InspectStandaloneStorage(logDir string) (StorageInventory, error) {
 	return inventory, nil
 }
 
+// ValidateStandaloneBackup verifies that an inventory has explicit metadata,
+// no discovered storage defects, and definitions that cover the persisted
+// partition layout. It does not open a broker or mutate storage.
+func ValidateStandaloneBackup(logDir string) (StorageInventory, error) {
+	inventory, err := InspectStandaloneStorage(logDir)
+	if err != nil {
+		return StorageInventory{}, err
+	}
+	if !inventory.ManifestPresent {
+		return inventory, fmt.Errorf("backup is not restorable: no topic metadata manifest is present")
+	}
+	if len(inventory.Problems) > 0 {
+		return inventory, fmt.Errorf("backup is not restorable: storage has %d validation problem(s)", len(inventory.Problems))
+	}
+	root, err := safeStorageRoot(logDir)
+	if err != nil {
+		return inventory, err
+	}
+	definitions, err := readStandaloneManifest(filepath.Join(root, TopicMetadataFileName))
+	if err != nil {
+		return inventory, err
+	}
+	if err := definitionsMatchInventory(definitions, inventory.Topics); err != nil {
+		return inventory, fmt.Errorf("backup is not restorable: topic metadata is not aligned with storage: %w", err)
+	}
+	return inventory, nil
+}
+
+func definitionsMatchInventory(definitions []Definition, topics []PersistedTopic) error {
+	if len(definitions) != len(topics) {
+		return fmt.Errorf("explicit definitions cover %d topics but storage contains %d", len(definitions), len(topics))
+	}
+	byName := make(map[string]PersistedTopic, len(topics))
+	for _, topic := range topics {
+		byName[topic.Name] = topic
+	}
+	for _, definition := range definitions {
+		persisted, ok := byName[definition.Name]
+		if !ok {
+			return fmt.Errorf("definition %q has no persisted topic storage", definition.Name)
+		}
+		if len(persisted.Partitions) != definition.Partitions {
+			return fmt.Errorf("topic %q definition has %d partitions but storage has %d", definition.Name, definition.Partitions, len(persisted.Partitions))
+		}
+		for expected, partition := range persisted.Partitions {
+			if partition.ID != expected {
+				return fmt.Errorf("topic %q persisted partition IDs are not contiguous from zero", definition.Name)
+			}
+			if len(partition.Segments) == 0 {
+				return fmt.Errorf("topic %q partition %d has no active log segment; deleted segments require explicit operator recovery", definition.Name, partition.ID)
+			}
+		}
+	}
+	return nil
+}
+
 func inspectPersistedTopic(root, name, topicPath string) (PersistedTopic, bool, []StorageProblem, error) {
 	entries, err := os.ReadDir(topicPath)
 	if err != nil {

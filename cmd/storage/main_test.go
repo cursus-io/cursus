@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -33,6 +35,29 @@ func TestRunManifestInspectWritesJSON(t *testing.T) {
 	require.Empty(t, stderr.String())
 }
 
+func TestRunBackupValidateRequiresManifest(t *testing.T) {
+	root := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	require.Equal(t, 1, run([]string{"backup", "validate", "--log-dir", root}, &stdout, &stderr))
+	require.JSONEq(t, `{"ready":false,"inventory":{"manifest_present":false,"topics":[]},"transaction_journal":{"present":false,"record_count":0,"latest_transactions":0}}`, stdout.String())
+	require.Contains(t, stderr.String(), "no topic metadata manifest is present")
+}
+
+func TestRunBackupValidateIsReadOnly(t *testing.T) {
+	root := t.TempDir()
+	manifest := filepath.Join(root, "__topic_metadata.json")
+	require.NoError(t, os.WriteFile(manifest, []byte("{\"version\":3,\"topics\":[]}\n"), 0o600))
+	before, err := os.ReadFile(manifest)
+	require.NoError(t, err)
+
+	var stdout, stderr bytes.Buffer
+	require.Equal(t, 0, run([]string{"backup", "validate", "--log-dir", root}, &stdout, &stderr))
+	require.JSONEq(t, `{"ready":true,"inventory":{"manifest_present":true,"topics":[]},"transaction_journal":{"present":false,"record_count":0,"latest_transactions":0}}`, stdout.String())
+	require.Empty(t, stderr.String())
+	after, err := os.ReadFile(manifest)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+}
 func TestRunConsumerMetadataInspectIsReadOnly(t *testing.T) {
 	root := t.TempDir()
 	var stdout, stderr bytes.Buffer
