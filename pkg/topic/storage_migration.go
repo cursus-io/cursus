@@ -197,6 +197,34 @@ func ValidateStandaloneBackup(logDir string) (StorageInventory, error) {
 	return inventory, nil
 }
 
+func definitionsMatchInventory(definitions []Definition, topics []PersistedTopic) error {
+	if len(definitions) != len(topics) {
+		return fmt.Errorf("explicit definitions cover %d topics but storage contains %d", len(definitions), len(topics))
+	}
+	byName := make(map[string]PersistedTopic, len(topics))
+	for _, topic := range topics {
+		byName[topic.Name] = topic
+	}
+	for _, definition := range definitions {
+		persisted, ok := byName[definition.Name]
+		if !ok {
+			return fmt.Errorf("definition %q has no persisted topic storage", definition.Name)
+		}
+		if len(persisted.Partitions) != definition.Partitions {
+			return fmt.Errorf("topic %q definition has %d partitions but storage has %d", definition.Name, definition.Partitions, len(persisted.Partitions))
+		}
+		for expected, partition := range persisted.Partitions {
+			if partition.ID != expected {
+				return fmt.Errorf("topic %q persisted partition IDs are not contiguous from zero", definition.Name)
+			}
+			if len(partition.Segments) == 0 {
+				return fmt.Errorf("topic %q partition %d has no active log segment; deleted segments require explicit operator recovery", definition.Name, partition.ID)
+			}
+		}
+	}
+	return nil
+}
+
 func inspectPersistedTopic(root, name, topicPath string) (PersistedTopic, bool, []StorageProblem, error) {
 	entries, err := os.ReadDir(topicPath)
 	if err != nil {

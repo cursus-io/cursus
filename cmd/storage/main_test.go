@@ -46,7 +46,7 @@ func TestRunBackupValidateRequiresManifest(t *testing.T) {
 func TestRunBackupValidateIsReadOnly(t *testing.T) {
 	root := t.TempDir()
 	manifest := filepath.Join(root, "__topic_metadata.json")
-	require.NoError(t, os.WriteFile(manifest, []byte("{\"version\":1,\"topics\":[]}\n"), 0o600))
+	require.NoError(t, os.WriteFile(manifest, []byte("{\"version\":3,\"topics\":[]}\n"), 0o600))
 	before, err := os.ReadFile(manifest)
 	require.NoError(t, err)
 
