@@ -180,6 +180,59 @@ func TestObservationFrameErrorPreservesStructuredErrors(t *testing.T) {
 	require.ErrorContains(t, observationFrameError(""), "broker: ")
 }
 
+func TestAdminClientObservationRejectsMalformedWireResponses(t *testing.T) {
+	t.Run("browse malformed envelope", func(t *testing.T) {
+		client, commands := observationFrameClient(t, "browse_messages_v1", "not-json", []byte("unused"))
+		_, err := client.BrowseMessages(context.Background(), BrowseRequest{Topic: "orders", Partition: 0, FromOffset: 1, MaxRecords: 1, MaxBytes: 1})
+		require.ErrorContains(t, err, "decode observation envelope")
+		require.NotEmpty(t, receiveObservationCommands(t, commands))
+	})
+	t.Run("browse malformed batch", func(t *testing.T) {
+		client, commands := observationFrameClient(t, "browse_messages_v1", `{"status":"OK"}`, []byte("not-a-batch"))
+		_, err := client.BrowseMessages(context.Background(), BrowseRequest{Topic: "orders", Partition: 0, FromOffset: 1, MaxRecords: 1, MaxBytes: 1})
+		require.ErrorContains(t, err, "decode browse batch")
+		require.NotEmpty(t, receiveObservationCommands(t, commands))
+	})
+	t.Run("history malformed envelope", func(t *testing.T) {
+		client, commands := observationFrameClient(t, "stream_history_v1", "not-json", []byte("unused"))
+		_, err := client.ReadStreamHistory(context.Background(), HistoryRequest{Topic: "orders", Key: "order-1", FromVersion: 1, MaxRecords: 1, MaxBytes: 1})
+		require.ErrorContains(t, err, "decode observation envelope")
+		require.NotEmpty(t, receiveObservationCommands(t, commands))
+	})
+	t.Run("history malformed batch", func(t *testing.T) {
+		client, commands := observationFrameClient(t, "stream_history_v1", `{"status":"OK"}`, []byte("not-a-batch"))
+		_, err := client.ReadStreamHistory(context.Background(), HistoryRequest{Topic: "orders", Key: "order-1", FromVersion: 1, MaxRecords: 1, MaxBytes: 1})
+		require.ErrorContains(t, err, "decode history batch")
+		require.NotEmpty(t, receiveObservationCommands(t, commands))
+	})
+	t.Run("snapshot malformed payload", func(t *testing.T) {
+		client, commands := observationAdminClient(t, []string{"OK snapshot=not-json"})
+		_, err := client.ReadSnapshot(context.Background(), "orders", "order-1")
+		require.ErrorContains(t, err, "decode snapshot")
+		require.Equal(t, []string{"READ_SNAPSHOT topic=orders key=order-1"}, receiveObservationCommands(t, commands))
+	})
+}
+
+func TestAdminClientObservationCoversFeatureAndGroupOffsetEdges(t *testing.T) {
+	t.Run("requires requested feature", func(t *testing.T) {
+		client, commands := observationFrameClientWithNegotiation(t, "browse_messages_v1", "OK protocol_version=1 enabled= unsupported=browse_messages_v1", `{"status":"OK"}`, []byte("unused"))
+		_, err := client.BrowseMessages(context.Background(), BrowseRequest{Topic: "orders", Partition: 0, FromOffset: 1, MaxRecords: 1, MaxBytes: 1})
+		require.ErrorContains(t, err, "not fully enabled")
+		// The feature negotiation fails before an observation command is sent.
+		require.Empty(t, receiveObservationCommands(t, commands))
+	})
+	t.Run("clamps negative lag to zero", func(t *testing.T) {
+		client, commands := observationAdminClient(t, []string{
+			"OK topic=orders partitions=1 offsets=P0:earliest=1:latest=8:leo=9:hwm=8",
+			"OK offset=10",
+		})
+		offsets, err := client.GroupOffsets(context.Background(), "workers", "orders")
+		require.NoError(t, err)
+		require.Equal(t, uint64(0), offsets[0].Lag)
+		require.Len(t, receiveObservationCommands(t, commands), 2)
+	})
+}
+
 func observationAdminClient(t *testing.T, responses []string) (*AdminClient, <-chan []string) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -212,6 +265,10 @@ func observationAdminClient(t *testing.T, responses []string) (*AdminClient, <-c
 }
 
 func observationFrameClient(t *testing.T, feature, envelope string, batch []byte) (*AdminClient, <-chan []string) {
+	return observationFrameClientWithNegotiation(t, feature, "OK protocol_version=1 enabled="+feature+" unsupported=", envelope, batch)
+}
+
+func observationFrameClientWithNegotiation(t *testing.T, feature, negotiationResponse, envelope string, batch []byte) (*AdminClient, <-chan []string) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -236,7 +293,7 @@ func observationFrameClient(t *testing.T, feature, envelope string, batch []byte
 		if decodeErr != nil || negotiated.Fields["features"] != feature || negotiated.Fields["require_features"] != "true" {
 			return
 		}
-		if writeErr := writeWireTestResponse(connection, negotiation, "OK protocol_version=1 enabled="+feature+" unsupported="); writeErr != nil {
+		if writeErr := writeWireTestResponse(connection, negotiation, negotiationResponse); writeErr != nil {
 			return
 		}
 		request, readErr := connection.ReadFrame()
