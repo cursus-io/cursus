@@ -37,6 +37,7 @@ const (
 	CommandInitProducerID
 	CommandBeginTxn
 	CommandTxnPublish
+	CommandTxnAppendStream
 	CommandSendOffsetsToTxn
 	CommandEndTxn
 	CommandTxnStatus
@@ -94,6 +95,7 @@ var commandNames = [...]string{
 	CommandInitProducerID:          "INIT_PRODUCER_ID",
 	CommandBeginTxn:                "BEGIN_TXN",
 	CommandTxnPublish:              "TXN_PUBLISH",
+	CommandTxnAppendStream:         "TXN_APPEND_STREAM",
 	CommandSendOffsetsToTxn:        "SEND_OFFSETS_TO_TXN",
 	CommandEndTxn:                  "END_TXN",
 	CommandTxnStatus:               "TXN_STATUS",

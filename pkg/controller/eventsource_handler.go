@@ -15,6 +15,24 @@ import (
 )
 
 func (ch *CommandHandler) handleAppendStream(cmd string) string {
+	if ch.TxnManager == nil {
+		return ch.handleAppendStreamLocked(cmd)
+	}
+	var response string
+	ch.TxnManager.WithStreamKeyLock(eventStreamTopic(cmd, "APPEND_STREAM "), eventStreamKey(cmd, "APPEND_STREAM "), func() {
+		response = ch.handleAppendStreamLocked(cmd)
+	})
+	return response
+}
+
+func (ch *CommandHandler) handleAppendStreamLocked(cmd string) string {
+	if ch.TxnManager != nil {
+		topicName := eventStreamTopic(cmd, "APPEND_STREAM ")
+		key := eventStreamKey(cmd, "APPEND_STREAM ")
+		if transactionalID, reserved := ch.TxnManager.StreamReservation(topicName, key); reserved {
+			return fmt.Sprintf("ERROR: stream_version_reserved topic=%s key=%s transactional_id=%s", topicName, key, transactionalID)
+		}
+	}
 	partition, errResp := ch.eventStreamPartition(cmd, "APPEND_STREAM ")
 	if errResp != "" {
 		return errResp

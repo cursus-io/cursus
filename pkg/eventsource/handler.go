@@ -154,6 +154,31 @@ func (h *Handler) PrepareCommittedIndex(topicName string, partitionID int) error
 	return err
 }
 
+// CurrentVersion returns the committed aggregate version and its partition.
+// Callers that need the latest transactional visibility first advance the
+// committed index to the partition HWM with IndexCommittedToHWM.
+func (h *Handler) CurrentVersion(topicName, key string) (uint64, int, error) {
+	if key == "" {
+		return 0, 0, fmt.Errorf("stream key is required")
+	}
+	t := h.tm.GetTopic(topicName)
+	if t == nil {
+		return 0, 0, fmt.Errorf("topic %s not found", topicName)
+	}
+	if !t.IsEventSourcing {
+		return 0, 0, fmt.Errorf("event sourcing is not enabled for topic %s", topicName)
+	}
+	partition := t.GetPartitionForMessage(types.Message{Key: key})
+	if partition < 0 {
+		return 0, 0, fmt.Errorf("no partitions available")
+	}
+	idx, err := h.getIndex(topicName, partition)
+	if err != nil {
+		return 0, 0, err
+	}
+	return idx.GetVersion(key), partition, nil
+}
+
 // IndexCommittedToHWM advances the derived stream index only through records
 // visible below the partition's stable committed boundary.
 func (h *Handler) IndexCommittedToHWM(topicName string, partitionID int, targetHWM uint64) error {

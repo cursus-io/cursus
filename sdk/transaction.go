@@ -87,6 +87,17 @@ func (p *TransactionalProducer) Publish(topic string, partition int, msg Message
 	return p.client.TransactionalPublish(p.session.TransactionalID, topic, partition, msg)
 }
 
+// AppendStream appends one event-store record as a participant of the open
+// broker transaction. expectedVersion is the next aggregate version, not the
+// prior version. The record is hidden from read_committed until Commit.
+func (p *TransactionalProducer) AppendStream(topic, key string, expectedVersion uint64, msg Message) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	msg.ProducerID = p.session.ProducerID
+	msg.Epoch = p.session.Epoch
+	return p.client.TransactionalAppendStream(p.session.TransactionalID, topic, key, expectedVersion, msg)
+}
+
 func (p *TransactionalProducer) SendOffsets(topic, group, member string, generation int, offsets map[int]uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -185,6 +196,50 @@ func (c *ConsumerClient) TransactionalPublish(transactionalID, topic string, par
 			return fmt.Errorf("transactional publish key must not contain whitespace")
 		}
 		cmd += fmt.Sprintf(" key=%s", msg.Key)
+	}
+	cmd += " message=" + msg.Payload
+	_, err := c.execTxnCommand(transactionalID, cmd)
+	return err
+}
+
+// TransactionalAppendStream stages a version-checked event-store append in
+// the broker transaction coordinator. A retry with the same producer epoch
+// and sequence is idempotent.
+func (c *ConsumerClient) TransactionalAppendStream(transactionalID, topic, key string, expectedVersion uint64, msg Message) error {
+	if err := validateTransactionOwner(transactionalID, msg.ProducerID); err != nil {
+		return err
+	}
+	if err := validateSDKTopicName(topic); err != nil {
+		return err
+	}
+	if key == "" || strings.ContainsAny(key, " \t\r\n") {
+		return fmt.Errorf("transactional stream key is required and must not contain whitespace")
+	}
+	if expectedVersion == 0 {
+		return fmt.Errorf("transactional stream expected version must be greater than zero")
+	}
+	if msg.SeqNum == 0 {
+		return fmt.Errorf("transactional stream sequence must be greater than zero")
+	}
+	if msg.Payload == "" || strings.ContainsAny(msg.Payload, "\r\n") {
+		return fmt.Errorf("transactional stream payload is required and must not contain line breaks")
+	}
+	if msg.EventType != "" && strings.ContainsAny(msg.EventType, " \t\r\n") {
+		return fmt.Errorf("transactional stream event type must not contain whitespace")
+	}
+	if msg.Metadata != "" && strings.ContainsAny(msg.Metadata, " \t\r\n") {
+		return fmt.Errorf("transactional stream metadata must not contain whitespace")
+	}
+	schemaVersion := msg.SchemaVersion
+	if schemaVersion == 0 {
+		schemaVersion = 1
+	}
+	cmd := fmt.Sprintf("TXN_APPEND_STREAM transactional_id=%s topic=%s key=%s expected_version=%d producerId=%s seqNum=%d epoch=%d schema_version=%d", transactionalID, topic, key, expectedVersion, msg.ProducerID, msg.SeqNum, msg.Epoch, schemaVersion)
+	if msg.EventType != "" {
+		cmd += fmt.Sprintf(" event_type=%s", msg.EventType)
+	}
+	if msg.Metadata != "" {
+		cmd += fmt.Sprintf(" metadata=%s", msg.Metadata)
 	}
 	cmd += " message=" + msg.Payload
 	_, err := c.execTxnCommand(transactionalID, cmd)

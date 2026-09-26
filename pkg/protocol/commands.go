@@ -33,6 +33,7 @@ var textCommands = map[string]struct{}{
 	"INIT_PRODUCER_ID":           {},
 	"BEGIN_TXN":                  {},
 	"TXN_PUBLISH":                {},
+	"TXN_APPEND_STREAM":          {},
 	"SEND_OFFSETS_TO_TXN":        {},
 	"END_TXN":                    {},
 	"TXN_STATUS":                 {},

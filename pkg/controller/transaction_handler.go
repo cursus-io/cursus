@@ -202,6 +202,135 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 	return fmt.Sprintf("OK transactional_id=%s staged_messages=1 topic=%s partition=%d", txnID, topicName, partition)
 }
 
+// handleTxnAppendStream stages an optimistic event-store append as a durable
+// transaction participant. The state stream record is appended as unresolved
+// transaction output and becomes readable only with END_TXN(commit).
+func (ch *CommandHandler) handleTxnAppendStream(cmd string, contexts ...*ClientContext) string {
+	args := parseKeyValueArgs(cmd[len("TXN_APPEND_STREAM "):])
+	if ch.TxnManager == nil {
+		return ch.handleTxnAppendStreamLocked(cmd, contexts...)
+	}
+	var response string
+	ch.TxnManager.WithStreamKeyLock(args["topic"], args["key"], func() {
+		response = ch.handleTxnAppendStreamLocked(cmd, contexts...)
+	})
+	return response
+}
+
+func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*ClientContext) string {
+	ctx := firstClientContext(contexts)
+	args := parseKeyValueArgs(cmd[len("TXN_APPEND_STREAM "):])
+	if authResp := ch.authenticateInline(args, ctx); authResp != "" {
+		return authResp
+	}
+	txnID := firstNonEmpty(args["transactional_id"], args["txn"], args["transaction"])
+	if txnID == "" {
+		return "ERROR: missing_transactional_id command=TXN_APPEND_STREAM"
+	}
+	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
+		return resp
+	}
+	stateLock := ch.transactionStateLock(txnID)
+	stateLock.Lock()
+	defer stateLock.Unlock()
+
+	topicName := args["topic"]
+	if topicName == "" {
+		return "ERROR: missing_topic command=TXN_APPEND_STREAM"
+	}
+	key := args["key"]
+	if key == "" {
+		return "ERROR: missing_key command=TXN_APPEND_STREAM"
+	}
+	payload := args["message"]
+	if payload == "" {
+		return "ERROR: missing_message command=TXN_APPEND_STREAM"
+	}
+	expectedVersion, err := parseRequiredPositiveUint64(firstNonEmpty(args["expected_version"], args["version"]))
+	if err != nil {
+		return fmt.Sprintf("ERROR: invalid_expected_version command=TXN_APPEND_STREAM reason=%q", err.Error())
+	}
+	producerID, epoch, errResp := parseTxnProducerEpoch(args, "TXN_APPEND_STREAM")
+	if errResp != "" {
+		return errResp
+	}
+	seqNum, err := parseRequiredPositiveUint64(args["seqNum"])
+	if err != nil {
+		return fmt.Sprintf("ERROR: invalid_seq_num command=TXN_APPEND_STREAM reason=%q", err.Error())
+	}
+
+	t := ch.TopicManager.GetTopic(topicName)
+	if t == nil {
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+	if !t.IsEventSourcing {
+		return fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", topicName)
+	}
+	if authResp := ch.authorizeTopicWrite(t.PolicySnapshot(), ctx); authResp != "" {
+		return fmt.Sprintf("%s topic=%s", authResp, topicName)
+	}
+	if resp := ch.requireTransactionMode(txnID, ctx); resp != "" {
+		return resp
+	}
+	partition := t.GetPartitionForMessage(types.Message{Key: key})
+	if _, err := t.GetPartition(partition); err != nil {
+		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
+	}
+	if resp := ch.reconcileEventSourceIndex(topicName, partition); resp != "" {
+		return resp
+	}
+	currentVersion, currentPartition, versionErr := ch.ESHandler.CurrentVersion(topicName, key)
+	if versionErr != nil {
+		return fmt.Sprintf("ERROR: stream_index_failed reason=%q", versionErr.Error())
+	}
+	if partition != currentPartition {
+		return "ERROR: stream_partition_changed"
+	}
+	if expectedVersion != currentVersion+1 {
+		return fmt.Sprintf("ERROR: stream_version_conflict expected=%d current=%d", expectedVersion, currentVersion)
+	}
+
+	schemaVersion := uint32(1)
+	if raw := args["schema_version"]; raw != "" {
+		parsed, parseErr := strconv.ParseUint(raw, 10, 32)
+		if parseErr != nil {
+			return fmt.Sprintf("ERROR: invalid_schema_version reason=%q", parseErr.Error())
+		}
+		schemaVersion = uint32(parsed)
+	}
+	message := types.Message{
+		Payload:          payload,
+		Key:              key,
+		ProducerID:       producerID,
+		SeqNum:           seqNum,
+		Epoch:            epoch,
+		TransactionalID:  txnID,
+		TransactionState: types.TransactionStateOpen,
+		AggregateVersion: expectedVersion,
+		EventType:        args["event_type"],
+		SchemaVersion:    schemaVersion,
+		Metadata:         args["metadata"],
+	}
+
+	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
+	if err := ch.TxnManager.AddParticipant(txnID, producerID, epoch, transaction.Participant{Topic: topicName, Partition: partition}, time.Time{}); err != nil {
+		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
+	}
+	operation := transaction.StreamOperation{Topic: topicName, Partition: partition, Key: key, ExpectedVersion: expectedVersion, Message: message}
+	if err := ch.TxnManager.AddStream(txnID, producerID, epoch, operation); err != nil {
+		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
+		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
+	}
+	if err := ch.syncTransactionState(txnID); err != nil {
+		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
+		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
+	}
+	if err := ch.publishCommittedTransactionMessage(transaction.MessageOperation{Topic: topicName, Partition: partition, Message: message}); err != nil {
+		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
+	}
+	return fmt.Sprintf("OK transactional_id=%s appended=true topic=%s partition=%d version=%d state=open", txnID, topicName, partition, expectedVersion)
+}
+
 func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string, contexts ...*ClientContext) string {
 	ctx := firstClientContext(contexts)
 	args := parseKeyValueArgs(cmd[len("SEND_OFFSETS_TO_TXN "):])
@@ -731,6 +860,21 @@ func transactionalOffsetRecords(tx *transaction.Transaction) ([]coordinator.Cons
 }
 
 func (ch *CommandHandler) validateTransaction(tx *transaction.Transaction) error {
+	for _, op := range tx.Streams {
+		t := ch.TopicManager.GetTopic(op.Topic)
+		if t == nil {
+			return fmt.Errorf("topic %s not found", op.Topic)
+		}
+		if !t.IsEventSourcing {
+			return fmt.Errorf("event sourcing is not enabled for topic %s", op.Topic)
+		}
+		if !t.PolicySnapshot().CanWrite() {
+			return fmt.Errorf("NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", op.Topic)
+		}
+		if _, err := t.GetPartition(op.Partition); err != nil {
+			return err
+		}
+	}
 	for _, op := range tx.Messages {
 		t := ch.TopicManager.GetTopic(op.Topic)
 		if t == nil {
@@ -941,6 +1085,18 @@ func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.Mess
 		cmd := fmt.Sprintf("PUBLISH topic=%s acks=all producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true internal_txn_publish=true", op.Topic, msg.ProducerID, op.Partition, msg.SeqNum, msg.Epoch)
 		if msg.Key != "" {
 			cmd += fmt.Sprintf(" key=%s", msg.Key)
+		}
+		if msg.AggregateVersion != 0 {
+			cmd += fmt.Sprintf(" aggregate_version=%d", msg.AggregateVersion)
+		}
+		if msg.EventType != "" {
+			cmd += fmt.Sprintf(" event_type=%s", msg.EventType)
+		}
+		if msg.SchemaVersion != 0 {
+			cmd += fmt.Sprintf(" schema_version=%d", msg.SchemaVersion)
+		}
+		if msg.Metadata != "" {
+			cmd += fmt.Sprintf(" metadata=%s", msg.Metadata)
 		}
 		if msg.TransactionalID != "" {
 			cmd += fmt.Sprintf(" transactional_id=%s transaction_state=%s", msg.TransactionalID, msg.TransactionState)

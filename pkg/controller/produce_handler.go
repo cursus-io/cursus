@@ -168,6 +168,26 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		}
 	}
 
+	var aggregateVersion uint64
+	if aggregateVersionStr, ok := args["aggregate_version"]; ok && aggregateVersionStr != "" {
+		aggregateVersion, err = strconv.ParseUint(aggregateVersionStr, 10, 64)
+		if err != nil {
+			return fmt.Sprintf("ERROR: invalid_aggregate_version reason=%q", err)
+		}
+		if aggregateVersion == 0 {
+			return "ERROR: invalid_aggregate_version reason=must_be_positive"
+		}
+	}
+
+	schemaVersion := uint32(0)
+	if schemaVersionStr, ok := args["schema_version"]; ok && schemaVersionStr != "" {
+		parsed, parseErr := strconv.ParseUint(schemaVersionStr, 10, 32)
+		if parseErr != nil {
+			return fmt.Sprintf("ERROR: invalid_schema_version reason=%q", parseErr.Error())
+		}
+		schemaVersion = uint32(parsed)
+	}
+
 	partition := -1
 	if partitionStr, ok := args["partition"]; ok {
 		parsedPartition, parseErr := strconv.Atoi(partitionStr)
@@ -235,6 +255,10 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		ControlBatchCoordinatorEpoch: controlBatchCoordinatorEpoch,
 		ControlBatchKey:              controlBatchKey,
 		ControlBatchValue:            controlBatchValue,
+		AggregateVersion:             aggregateVersion,
+		EventType:                    args["event_type"],
+		SchemaVersion:                schemaVersion,
+		Metadata:                     args["metadata"],
 	}
 
 	if partition < 0 {

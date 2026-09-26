@@ -57,6 +57,17 @@ type MessageOperation struct {
 	Message   types.Message
 }
 
+// StreamOperation is a transactional event-store append.  Its message is
+// persisted as an unresolved partition record before the transaction decision
+// and becomes an event-stream entry only when that decision commits.
+type StreamOperation struct {
+	Topic           string
+	Partition       int
+	Key             string
+	ExpectedVersion uint64
+	Message         types.Message
+}
+
 type OffsetOperation struct {
 	Topic             string
 	Group             string
@@ -84,6 +95,7 @@ type Transaction struct {
 	OffsetsMaterialized bool
 	State               State
 	Messages            []MessageOperation
+	Streams             []StreamOperation
 	Offsets             []OffsetOperation
 	Participants        []Participant
 	Deadline            time.Time
@@ -103,6 +115,7 @@ type Snapshot struct {
 	OffsetsMaterialized bool               `json:"offsets_materialized,omitempty"`
 	State               State              `json:"state"`
 	Messages            []MessageOperation `json:"messages,omitempty"`
+	Streams             []StreamOperation  `json:"streams,omitempty"`
 	Offsets             []OffsetOperation  `json:"offsets,omitempty"`
 	Participants        []Participant      `json:"participants,omitempty"`
 	Deadline            time.Time          `json:"deadline,omitempty"`
@@ -113,11 +126,71 @@ type Snapshot struct {
 type Manager struct {
 	shards              []managerShard
 	expiration          time.Duration
+	reservationMu       sync.Mutex
+	streamReservations  map[streamReservationKey]string
+	streamLocks         sync.Map // map[streamReservationKey]*sync.Mutex
 	committedOffsetMu   sync.RWMutex
 	committedOffsets    map[committedOffsetKey]uint64
 	recoveryScanMu      sync.Mutex
 	preparedShardCursor int
 	timeoutShardCursor  int
+}
+
+type streamReservationKey struct {
+	topic string
+	key   string
+}
+
+// reserveStreamsLocked restores reservations represented by a durable
+// transaction snapshot. Callers hold the transaction shard lock; this method
+// serializes only the cross-transaction reservation map.
+func (m *Manager) reserveStreamsLocked(tx *Transaction) {
+	if tx == nil || tx.State == StateCommitted || tx.State == StateAborted || len(tx.Streams) == 0 {
+		return
+	}
+	m.reservationMu.Lock()
+	defer m.reservationMu.Unlock()
+	for _, op := range tx.Streams {
+		m.streamReservations[streamReservationKey{topic: op.Topic, key: op.Key}] = tx.ID
+	}
+}
+
+// releaseStreamReservationsLocked releases every stream held by this
+// transaction. The snapshot may already have cleared Streams on an abort, so
+// removal is keyed by transactional ID rather than by the operation list.
+func (m *Manager) releaseStreamReservationsLocked(tx *Transaction) {
+	if tx == nil {
+		return
+	}
+	m.reservationMu.Lock()
+	defer m.reservationMu.Unlock()
+	for reservation, owner := range m.streamReservations {
+		if owner == tx.ID {
+			delete(m.streamReservations, reservation)
+		}
+	}
+}
+
+// StreamReservation reports an in-flight transactional append for a stream.
+// A normal APPEND_STREAM must not pass that append's expected-version check
+// while the transaction remains unresolved.
+func (m *Manager) StreamReservation(topic, key string) (string, bool) {
+	m.reservationMu.Lock()
+	defer m.reservationMu.Unlock()
+	owner, ok := m.streamReservations[streamReservationKey{topic: topic, key: key}]
+	return owner, ok
+}
+
+// WithStreamKeyLock serializes a normal append and a transactional reservation
+// for one stream. Reservations themselves remain durable and long-lived; this
+// short lock only closes the check-then-reserve/append race.
+func (m *Manager) WithStreamKeyLock(topic, key string, fn func()) {
+	reservation := streamReservationKey{topic: topic, key: key}
+	value, _ := m.streamLocks.LoadOrStore(reservation, &sync.Mutex{})
+	lock := value.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	fn()
 }
 
 type committedOffsetKey struct {
@@ -142,7 +215,7 @@ func NewManagerWithExpirationAndShards(expiration time.Duration, shardCount int)
 	if shardCount <= 0 {
 		shardCount = DefaultCoordinatorShardCount
 	}
-	m := &Manager{shards: make([]managerShard, shardCount), expiration: expiration, committedOffsets: make(map[committedOffsetKey]uint64)}
+	m := &Manager{shards: make([]managerShard, shardCount), expiration: expiration, streamReservations: make(map[streamReservationKey]string), committedOffsets: make(map[committedOffsetKey]uint64)}
 	for i := range m.shards {
 		m.shards[i] = newManagerShard(expiration)
 	}
@@ -382,6 +455,50 @@ func (m *Manager) AddMessage(id, producer string, epoch int64, op MessageOperati
 	return nil
 }
 
+// AddStream reserves one event-stream version for an open transaction.  The
+// reservation is reconstructed from durable transaction snapshots after a
+// restart, so a competing transaction cannot stage the same stream version.
+func (m *Manager) AddStream(id, producer string, epoch int64, op StreamOperation) error {
+	if op.Topic == "" || op.Key == "" || op.Partition < 0 || op.ExpectedVersion == 0 {
+		return fmt.Errorf("invalid transactional stream operation")
+	}
+	s := m.shardForID(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := activeLocked(s, id)
+	if err != nil {
+		return err
+	}
+	if err := validateOwner(tx, producer, epoch); err != nil {
+		return err
+	}
+	if tx.Mode != ModeProcessingV1 {
+		return fmt.Errorf("transaction %s does not use transactional processing v1", id)
+	}
+	for _, existing := range tx.Streams {
+		if existing.Topic != op.Topic || existing.Key != op.Key {
+			continue
+		}
+		if existing.Partition == op.Partition && existing.ExpectedVersion == op.ExpectedVersion && reflect.DeepEqual(existing.Message, op.Message) {
+			return nil
+		}
+		return fmt.Errorf("transaction %s already stages stream topic=%s key=%s", id, op.Topic, op.Key)
+	}
+
+	reservation := streamReservationKey{topic: op.Topic, key: op.Key}
+	m.reservationMu.Lock()
+	defer m.reservationMu.Unlock()
+	if owner, reserved := m.streamReservations[reservation]; reserved && owner != id {
+		return fmt.Errorf("stream version is reserved topic=%s key=%s transactional_id=%s", op.Topic, op.Key, owner)
+	}
+	m.streamReservations[reservation] = id
+	tx.Streams = append(tx.Streams, op)
+	tx.Revision++
+	tx.UpdatedAt = time.Now()
+	return nil
+}
+
 func (m *Manager) AddOffsets(id, producer string, epoch int64, offsets []OffsetOperation) error {
 	if len(offsets) == 0 {
 		return fmt.Errorf("no offsets supplied")
@@ -488,6 +605,7 @@ func (m *Manager) Commit(id string) error {
 	tx.Revision++
 	tx.UpdatedAt = time.Now()
 	s.reindex(tx)
+	m.releaseStreamReservationsLocked(tx)
 	m.indexCommittedOffsets(tx.Offsets)
 	return nil
 }
@@ -563,10 +681,12 @@ func (m *Manager) Abort(id, producer string, epoch int64) error {
 	}
 	tx.State = StateAborted
 	tx.Messages = nil
+	tx.Streams = nil
 	tx.Offsets = nil
 	tx.Revision++
 	tx.UpdatedAt = time.Now()
 	s.reindex(tx)
+	m.releaseStreamReservationsLocked(tx)
 	return nil
 }
 
@@ -757,12 +877,16 @@ func (m *Manager) replaceStateLocked(state map[string]*Snapshot) {
 		m.shards[i].expiryByID = make(map[string]*deadlineItem)
 	}
 	committed := make(map[committedOffsetKey]uint64)
+	m.reservationMu.Lock()
+	m.streamReservations = make(map[streamReservationKey]string)
+	m.reservationMu.Unlock()
 	for id, snap := range state {
 		if snap == nil {
 			continue
 		}
 		tx := transactionFromSnapshot(snap)
 		m.shards[CoordinatorShardForCount(id, len(m.shards))].put(tx)
+		m.reserveStreamsLocked(tx)
 		if tx.State == StateCommitted {
 			for _, op := range tx.Offsets {
 				key := committedOffsetKey{group: op.Group, topic: op.Topic, partition: op.Partition, registrationEpoch: op.RegistrationEpoch}
@@ -784,7 +908,12 @@ func (m *Manager) ApplySnapshot(snap *Snapshot) {
 	s := m.shardForID(snap.ID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.put(transactionFromSnapshot(snap))
+	if current := s.txns[snap.ID]; current != nil {
+		m.releaseStreamReservationsLocked(current)
+	}
+	tx := transactionFromSnapshot(snap)
+	s.put(tx)
+	m.reserveStreamsLocked(tx)
 	if snap.State == StateCommitted {
 		m.indexCommittedOffsets(snap.Offsets)
 	}
@@ -800,7 +929,12 @@ func (m *Manager) ApplyReplicatedSnapshot(snap *Snapshot) error {
 
 	current, ok := s.txns[snap.ID]
 	if !ok || snapshotIsNewer(current, snap) {
-		s.put(transactionFromSnapshot(snap))
+		if current != nil {
+			m.releaseStreamReservationsLocked(current)
+		}
+		tx := transactionFromSnapshot(snap)
+		s.put(tx)
+		m.reserveStreamsLocked(tx)
 		if snap.State == StateCommitted {
 			m.indexCommittedOffsets(snap.Offsets)
 		}
@@ -854,6 +988,7 @@ func committedSnapshotSucceeds(current *Transaction, incoming *Snapshot) bool {
 		current.OffsetsMaterialized == incoming.OffsetsMaterialized &&
 		current.CreatedAt.Equal(incoming.CreatedAt) &&
 		reflect.DeepEqual(current.Messages, incoming.Messages) &&
+		reflect.DeepEqual(current.Streams, incoming.Streams) &&
 		reflect.DeepEqual(current.Offsets, incoming.Offsets) &&
 		reflect.DeepEqual(current.Participants, incoming.Participants) &&
 		current.Deadline.Equal(incoming.Deadline)
@@ -921,6 +1056,7 @@ func snapshotsEqual(current *Transaction, incoming *Snapshot) bool {
 		current.CreatedAt.Equal(incoming.CreatedAt) &&
 		current.UpdatedAt.Equal(incoming.UpdatedAt) &&
 		reflect.DeepEqual(current.Messages, incoming.Messages) &&
+		reflect.DeepEqual(current.Streams, incoming.Streams) &&
 		reflect.DeepEqual(current.Offsets, incoming.Offsets) &&
 		reflect.DeepEqual(current.Participants, incoming.Participants) &&
 		current.Deadline.Equal(incoming.Deadline)
@@ -930,6 +1066,9 @@ func (m *Manager) Delete(id string) {
 	s := m.shardForID(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if tx := s.txns[id]; tx != nil {
+		m.releaseStreamReservationsLocked(tx)
+	}
 	s.remove(id)
 }
 
@@ -966,6 +1105,7 @@ func clone(tx *Transaction) *Transaction {
 	}
 	out := *tx
 	out.Messages = append([]MessageOperation(nil), tx.Messages...)
+	out.Streams = append([]StreamOperation(nil), tx.Streams...)
 	out.Offsets = append([]OffsetOperation(nil), tx.Offsets...)
 	out.Participants = append([]Participant(nil), tx.Participants...)
 	return &out
@@ -987,6 +1127,7 @@ func snapshot(tx *Transaction) *Snapshot {
 		OffsetsMaterialized: tx.OffsetsMaterialized,
 		State:               tx.State,
 		Messages:            append([]MessageOperation(nil), tx.Messages...),
+		Streams:             append([]StreamOperation(nil), tx.Streams...),
 		Offsets:             append([]OffsetOperation(nil), tx.Offsets...),
 		Participants:        append([]Participant(nil), tx.Participants...),
 		Deadline:            tx.Deadline,
@@ -1008,6 +1149,7 @@ func transactionFromSnapshot(snap *Snapshot) *Transaction {
 		OffsetsMaterialized: snap.OffsetsMaterialized,
 		State:               snap.State,
 		Messages:            append([]MessageOperation(nil), snap.Messages...),
+		Streams:             append([]StreamOperation(nil), snap.Streams...),
 		Offsets:             append([]OffsetOperation(nil), snap.Offsets...),
 		Participants:        append([]Participant(nil), snap.Participants...),
 		Deadline:            snap.Deadline,

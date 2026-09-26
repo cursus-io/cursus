@@ -74,6 +74,33 @@ type Consumer struct {
 	MessageHandler func(Message) error
 }
 
+// TransactionalOffsetMetadata is the active group membership required by
+// SEND_OFFSETS_TO_TXN. It is exposed for broker-native processors such as the
+// Saga runtime; callers must obtain a fresh value for each input because a
+// rebalance fences the previous member/generation pair.
+type TransactionalOffsetMetadata struct {
+	Topic      string
+	Group      string
+	Member     string
+	Generation int
+}
+
+// TransactionalOffsetMetadata returns the consumer's currently assigned group
+// generation. It fails before the consumer joins a group or after a rebalance
+// has cleared the active membership.
+func (c *Consumer) TransactionalOffsetMetadata() (TransactionalOffsetMetadata, error) {
+	if c == nil || c.config == nil {
+		return TransactionalOffsetMetadata{}, fmt.Errorf("consumer is not initialized")
+	}
+	c.mu.RLock()
+	member, generation := c.memberID, c.generation
+	c.mu.RUnlock()
+	if member == "" || generation <= 0 {
+		return TransactionalOffsetMetadata{}, fmt.Errorf("consumer has no active group assignment")
+	}
+	return TransactionalOffsetMetadata{Topic: c.config.Topic, Group: c.config.GroupID, Member: member, Generation: int(generation)}, nil
+}
+
 func NewConsumer(cfg *ConsumerConfig) (*Consumer, error) {
 	return NewConsumerWithContext(context.Background(), cfg)
 }

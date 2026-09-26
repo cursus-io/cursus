@@ -182,6 +182,7 @@ func NewCommandHandler(
 		{prefix: "INIT_PRODUCER_ID ", exact: false, helpOrder: 16, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleInitProducerID(cmd) }},
 		{prefix: "BEGIN_TXN ", exact: false, helpOrder: 17, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBeginTxn(cmd) }},
 		{prefix: "TXN_PUBLISH ", exact: false, helpOrder: 18, permissions: []string{PermissionTransaction, PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnPublish(cmd, ctx) }},
+		{prefix: "TXN_APPEND_STREAM ", exact: false, helpOrder: 18, permissions: []string{PermissionTransaction, PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnAppendStream(cmd, ctx) }},
 		{prefix: "SEND_OFFSETS_TO_TXN ", exact: false, helpOrder: 19, permissions: []string{PermissionTransaction, PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleSendOffsetsToTxn(cmd) }},
 		{prefix: "END_TXN ", exact: false, helpOrder: 20, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleEndTxn(cmd) }},
 		{prefix: "TXN_STATUS ", exact: false, helpOrder: 21, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnStatus(cmd) }},
