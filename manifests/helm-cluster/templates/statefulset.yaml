@@ -73,6 +73,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: ADVERTISED_HOST
               value: "$(POD_NAME).{{ include "cursus-cluster.headlessService" . }}.$(POD_NAMESPACE).svc.cluster.local"
+            - name: BROKER_PORT
+              value: {{ .Values.service.brokerPort | quote }}
             - name: ADVERTISED_CLIENT_HOST
               value: "$(POD_NAME).{{ include "cursus-cluster.headlessService" . }}.$(POD_NAMESPACE).svc.cluster.local"
             - name: ENABLE_DISTRIBUTION

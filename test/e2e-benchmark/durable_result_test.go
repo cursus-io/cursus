@@ -10,6 +10,10 @@ import (
 
 func TestDurableBenchmarkConfigRequiresCompleteMetadata(t *testing.T) {
 	t.Setenv("RUN_E2E_DURABLE_BENCHMARK", "1")
+	t.Setenv("CURSUS_DURABLE_BENCHMARK_LOG_DIR", "")
+	t.Setenv("CURSUS_DURABLE_BENCHMARK_RESULT", "")
+	t.Setenv("CURSUS_BENCHMARK_REVISION", "")
+	t.Setenv("CURSUS_DURABLE_BENCHMARK_STORAGE", "")
 	if _, _, err := durableBenchmarkConfigFromEnv(); err == nil {
 		t.Fatal("expected incomplete durable benchmark configuration to fail")
 	}

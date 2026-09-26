@@ -326,50 +326,6 @@ func assertBenchmarkSuccess(t *testing.T, logs string, component string) {
 	}
 }
 
-func benchmarkResultSummary(logs string) string {
-	wanted := []string{
-		"PRODUCER BENCHMARK SUMMARY",
-		"CONSUMER BENCHMARK SUMMARY",
-		"Partitions",
-		"Total Batches",
-		"Total Messages",
-		"Failed messages",
-		"Retry Count",
-		"Publish elapsed Time",
-		"Publish Message Throughput",
-		"Latency P95",
-		"Latency P99",
-		"Elapsed Time",
-		"Overall TPS",
-		"Duplicate (MessageID)",
-		"Duplicate (Offset)",
-		"Message missing",
-	}
-
-	var out []string
-	for _, line := range strings.Split(logs, "\n") {
-		for _, token := range wanted {
-			if strings.Contains(line, token) {
-				out = append(out, strings.TrimSpace(line))
-				break
-			}
-		}
-	}
-	return strings.Join(out, "\n")
-}
-func benchmarkCounter(logs, label string) (int, bool) {
-	pattern := regexp.MustCompile(fmt.Sprintf(`(?im)%s[[:space:]]*:[[:space:]]*([0-9]+)`, regexp.QuoteMeta(label)))
-	match := pattern.FindStringSubmatch(logs)
-	if match == nil {
-		return 0, false
-	}
-	count, err := strconv.Atoi(match[1])
-	if err != nil {
-		return 0, false
-	}
-	return count, true
-}
-
 func lastLines(s string, n int) string {
 	lines := strings.Split(s, "\n")
 	if len(lines) <= n {
