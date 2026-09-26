@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,27 @@ import (
 const maxTransactionReconcilePagesPerPass = 4
 
 const transactionControlMarkerPayload = "__cursus_txn_control_marker__"
+
+type transactionRequestFingerprint struct {
+	Command            string `json:"command"`
+	Topic              string `json:"topic"`
+	RequestedPartition int    `json:"requested_partition"`
+	Key                string `json:"key"`
+	Payload            string `json:"payload"`
+	ExpectedVersion    uint64 `json:"expected_version"`
+	EventType          string `json:"event_type"`
+	SchemaVersion      uint32 `json:"schema_version"`
+	Metadata           string `json:"metadata"`
+}
+
+func fingerprintTransactionRequest(request transactionRequestFingerprint) string {
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(encoded)
+	return fmt.Sprintf("%x", digest)
+}
 
 func (ch *CommandHandler) handleInitProducerID(cmd string, contexts ...*ClientContext) string {
 	args := parseKeyValueArgs(cmd[len("INIT_PRODUCER_ID "):])
@@ -148,7 +170,8 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 		}
 		partition = parsed
 	}
-	seqNum, err := parseRequiredPositiveUint64(args["seqNum"])
+	requestedPartition := partition
+	clientSequence, err := parseRequiredPositiveUint64(args["seqNum"])
 	if err != nil {
 		return fmt.Sprintf("ERROR: invalid_seq_num command=TXN_PUBLISH reason=%q", err.Error())
 	}
@@ -163,7 +186,7 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 	if authResp := ch.authorizeTopicWrite(t.PolicySnapshot(), clientCtx); authResp != "" {
 		return fmt.Sprintf("%s topic=%s", authResp, topicName)
 	}
-	msg := types.Message{Payload: message, ProducerID: producerID, SeqNum: seqNum, Epoch: epoch, Key: args["key"], TransactionalID: txnID, TransactionState: types.TransactionStateOpen}
+	msg := types.Message{Payload: message, ProducerID: producerID, SeqNum: clientSequence, Epoch: epoch, Key: args["key"], TransactionalID: txnID, TransactionState: types.TransactionStateOpen}
 	if partition < 0 {
 		partition = t.GetPartitionForMessage(msg)
 	}
@@ -179,11 +202,26 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 		return fmt.Sprintf("ERROR: transaction_not_found reason=%q", statusErr.Error())
 	}
 	if current.Mode == transaction.ModeProcessingV1 {
-		seqNum, err = ch.TxnManager.NextPartitionSequence(txnID, producerID, epoch, topicName, partition)
+		assignment, _, err := ch.TxnManager.ResolveRequestAssignment(
+			txnID,
+			producerID,
+			epoch,
+			topicName,
+			clientSequence,
+			partition,
+			fingerprintTransactionRequest(transactionRequestFingerprint{
+				Command:            "TXN_PUBLISH",
+				Topic:              topicName,
+				RequestedPartition: requestedPartition,
+				Key:                args["key"],
+				Payload:            message,
+			}),
+		)
 		if err != nil {
 			return fmt.Sprintf("ERROR: transaction_publish_failed reason=%q", err.Error())
 		}
-		msg.SeqNum = seqNum
+		partition = assignment.Partition
+		msg.SeqNum = assignment.Sequence
 		participant := transaction.Participant{Topic: topicName, Partition: partition}
 		if err := ch.TxnManager.AddParticipant(txnID, producerID, epoch, participant, time.Time{}); err != nil {
 			return fmt.Sprintf("ERROR: transaction_publish_failed reason=%q", err.Error())
@@ -259,7 +297,8 @@ func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*C
 	if errResp != "" {
 		return errResp
 	}
-	if _, err := parseRequiredPositiveUint64(args["seqNum"]); err != nil {
+	clientSequence, err := parseRequiredPositiveUint64(args["seqNum"])
+	if err != nil {
 		return fmt.Sprintf("ERROR: invalid_seq_num command=TXN_APPEND_STREAM reason=%q", err.Error())
 	}
 
@@ -280,6 +319,41 @@ func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*C
 	if _, err := t.GetPartition(partition); err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 	}
+	schemaVersion := uint32(1)
+	if raw := args["schema_version"]; raw != "" {
+		parsed, parseErr := strconv.ParseUint(raw, 10, 32)
+		if parseErr != nil {
+			return fmt.Sprintf("ERROR: invalid_schema_version reason=%q", parseErr.Error())
+		}
+		schemaVersion = uint32(parsed)
+	}
+	fingerprint := fingerprintTransactionRequest(transactionRequestFingerprint{
+		Command:         "TXN_APPEND_STREAM",
+		Topic:           topicName,
+		Key:             key,
+		Payload:         payload,
+		ExpectedVersion: expectedVersion,
+		EventType:       args["event_type"],
+		SchemaVersion:   schemaVersion,
+		Metadata:        args["metadata"],
+	})
+	existing, found, err := ch.TxnManager.FindRequestAssignment(
+		txnID,
+		producerID,
+		epoch,
+		topicName,
+		clientSequence,
+		fingerprint,
+	)
+	if err != nil {
+		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
+	}
+	if found {
+		partition = existing.Partition
+	}
+	if _, err := t.GetPartition(partition); err != nil {
+		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
+	}
 	if resp := ch.reconcileEventSourceIndex(topicName, partition); resp != "" {
 		return resp
 	}
@@ -293,25 +367,25 @@ func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*C
 	if expectedVersion != currentVersion+1 {
 		return fmt.Sprintf("ERROR: stream_version_conflict expected=%d current=%d", expectedVersion, currentVersion)
 	}
-
-	schemaVersion := uint32(1)
-	if raw := args["schema_version"]; raw != "" {
-		parsed, parseErr := strconv.ParseUint(raw, 10, 32)
-		if parseErr != nil {
-			return fmt.Sprintf("ERROR: invalid_schema_version reason=%q", parseErr.Error())
-		}
-		schemaVersion = uint32(parsed)
-	}
 	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
-	seqNum, err := ch.TxnManager.NextPartitionSequence(txnID, producerID, epoch, topicName, partition)
+	assignment, _, err := ch.TxnManager.ResolveRequestAssignment(
+		txnID,
+		producerID,
+		epoch,
+		topicName,
+		clientSequence,
+		partition,
+		fingerprint,
+	)
 	if err != nil {
 		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
 	}
+
 	message := types.Message{
 		Payload:          payload,
 		Key:              key,
 		ProducerID:       producerID,
-		SeqNum:           seqNum,
+		SeqNum:           assignment.Sequence,
 		Epoch:            epoch,
 		TransactionalID:  txnID,
 		TransactionState: types.TransactionStateOpen,

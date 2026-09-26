@@ -74,6 +74,42 @@ func TestTransactionalProcessingV1AppendsBeforeDecisionAndCommitsOffsetsBeforeVi
 	require.True(t, materialized, "committed offset must be materialized for long-term recovery")
 }
 
+func TestTransactionalProcessingV1DeduplicatesAcceptedPublish(t *testing.T) {
+	ch, tm, _, _ := newDiskBackedTransactionHandler(t)
+	require.NoError(t, tm.CreateTopic("eos-retry", 1, false, false))
+	ctx := NewClientContext("", 0)
+
+	producerID, epoch := initTransactionSession(t, ch, ctx, "eos-retry-1")
+	require.True(t, strings.HasPrefix(ch.HandleCommand(fmt.Sprintf("BEGIN_TXN transactional_id=eos-retry-1 producerId=%s epoch=%s", producerID, epoch), ctx), "OK "))
+	publishCommand := fmt.Sprintf("TXN_PUBLISH transactional_id=eos-retry-1 topic=eos-retry partition=0 producerId=%s seqNum=1 epoch=%s message=result", producerID, epoch)
+	require.True(t, strings.HasPrefix(ch.HandleCommand(publishCommand, ctx), "OK "))
+	require.True(t, strings.HasPrefix(ch.HandleCommand(publishCommand, ctx), "OK "), "a retried publish must reuse its broker sequence")
+	conflict := fmt.Sprintf("TXN_PUBLISH transactional_id=eos-retry-1 topic=eos-retry partition=0 producerId=%s seqNum=1 epoch=%s message=changed", producerID, epoch)
+	require.Contains(t, ch.HandleCommand(conflict, ctx), "request conflicts")
+	require.True(t, strings.HasPrefix(ch.HandleCommand(fmt.Sprintf("END_TXN transactional_id=eos-retry-1 producerId=%s epoch=%s result=commit", producerID, epoch), ctx), "OK "))
+	require.Equal(t, []string{"result"}, readCommittedPayloads(t, tm, "eos-retry"))
+}
+
+func TestTransactionalProcessingV1RetriesAcceptedPublishAfterSnapshotRecovery(t *testing.T) {
+	ch, tm, coord, _ := newDiskBackedTransactionHandler(t)
+	require.NoError(t, tm.CreateTopic("eos-retry-recovery", 1, false, false))
+	ctx := NewClientContext("", 0)
+
+	producerID, epoch := initTransactionSession(t, ch, ctx, "eos-retry-recovery-1")
+	require.True(t, strings.HasPrefix(ch.HandleCommand(fmt.Sprintf("BEGIN_TXN transactional_id=eos-retry-recovery-1 producerId=%s epoch=%s", producerID, epoch), ctx), "OK "))
+	publishCommand := fmt.Sprintf("TXN_PUBLISH transactional_id=eos-retry-recovery-1 topic=eos-retry-recovery partition=0 producerId=%s seqNum=1 epoch=%s message=result", producerID, epoch)
+	require.True(t, strings.HasPrefix(ch.HandleCommand(publishCommand, ctx), "OK "))
+
+	snapshot := ch.TxnManager.ExportState()["eos-retry-recovery-1"]
+	restarted := NewCommandHandler(tm, ch.Config, coord, nil, nil)
+	t.Cleanup(func() { _ = restarted.Close() })
+	restarted.TxnManager.ApplySnapshot(snapshot)
+
+	require.True(t, strings.HasPrefix(restarted.HandleCommand(publishCommand, ctx), "OK "), "a retry after coordinator recovery must reuse the durable assignment")
+	require.True(t, strings.HasPrefix(restarted.HandleCommand(fmt.Sprintf("END_TXN transactional_id=eos-retry-recovery-1 producerId=%s epoch=%s result=commit", producerID, epoch), ctx), "OK "))
+	require.Equal(t, []string{"result"}, readCommittedPayloads(t, tm, "eos-retry-recovery"))
+}
+
 func TestTransactionalProcessingV1TimeoutAbortsUnresolvedRecords(t *testing.T) {
 	ch, tm, _, _ := newDiskBackedTransactionHandler(t)
 	require.NoError(t, tm.CreateTopic("eos-timeout", 1, false, false))

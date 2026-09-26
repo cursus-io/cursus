@@ -84,6 +84,17 @@ type Participant struct {
 	Partition int    `json:"partition"`
 }
 
+// RequestAssignment binds a client topic sequence to the partition sequence
+// chosen by the broker. It makes a retry of an accepted transactional request
+// reuse the original idempotent identity after coordinator recovery.
+type RequestAssignment struct {
+	Topic          string `json:"topic"`
+	ClientSequence uint64 `json:"client_sequence"`
+	Partition      int    `json:"partition"`
+	Sequence       uint64 `json:"sequence"`
+	Fingerprint    string `json:"fingerprint"`
+}
+
 type Transaction struct {
 	ID                  string
 	Mode                Mode
@@ -100,30 +111,32 @@ type Transaction struct {
 	Offsets             []OffsetOperation
 	Participants        []Participant
 	SequenceByPartition map[string]uint64
+	RequestAssignments  map[string]RequestAssignment
 	Deadline            time.Time
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 }
 
 type Snapshot struct {
-	ID                  string             `json:"id"`
-	Mode                Mode               `json:"mode,omitempty"`
-	Producer            string             `json:"producer"`
-	Epoch               int64              `json:"epoch"`
-	CoordinatorEpoch    int64              `json:"coordinator_epoch,omitempty"`
-	Revision            uint64             `json:"revision,omitempty"`
-	Ready               bool               `json:"ready,omitempty"`
-	Expired             bool               `json:"expired,omitempty"`
-	OffsetsMaterialized bool               `json:"offsets_materialized,omitempty"`
-	State               State              `json:"state"`
-	Messages            []MessageOperation `json:"messages,omitempty"`
-	Streams             []StreamOperation  `json:"streams,omitempty"`
-	Offsets             []OffsetOperation  `json:"offsets,omitempty"`
-	Participants        []Participant      `json:"participants,omitempty"`
-	SequenceByPartition map[string]uint64  `json:"sequence_by_partition,omitempty"`
-	Deadline            time.Time          `json:"deadline,omitempty"`
-	CreatedAt           time.Time          `json:"created_at"`
-	UpdatedAt           time.Time          `json:"updated_at"`
+	ID                  string                       `json:"id"`
+	Mode                Mode                         `json:"mode,omitempty"`
+	Producer            string                       `json:"producer"`
+	Epoch               int64                        `json:"epoch"`
+	CoordinatorEpoch    int64                        `json:"coordinator_epoch,omitempty"`
+	Revision            uint64                       `json:"revision,omitempty"`
+	Ready               bool                         `json:"ready,omitempty"`
+	Expired             bool                         `json:"expired,omitempty"`
+	OffsetsMaterialized bool                         `json:"offsets_materialized,omitempty"`
+	State               State                        `json:"state"`
+	Messages            []MessageOperation           `json:"messages,omitempty"`
+	Streams             []StreamOperation            `json:"streams,omitempty"`
+	Offsets             []OffsetOperation            `json:"offsets,omitempty"`
+	Participants        []Participant                `json:"participants,omitempty"`
+	SequenceByPartition map[string]uint64            `json:"sequence_by_partition,omitempty"`
+	RequestAssignments  map[string]RequestAssignment `json:"request_assignments,omitempty"`
+	Deadline            time.Time                    `json:"deadline,omitempty"`
+	CreatedAt           time.Time                    `json:"created_at"`
+	UpdatedAt           time.Time                    `json:"updated_at"`
 }
 
 type Manager struct {
@@ -462,31 +475,74 @@ func (m *Manager) AddMessage(id, producer string, epoch int64, op MessageOperati
 	return nil
 }
 
-// NextPartitionSequence allocates an idempotent sequence after the broker has
-// selected the concrete partition.  Transactional processing clients may use
-// automatic routing, for which a topic-only client counter is not sufficient.
-func (m *Manager) NextPartitionSequence(id, producer string, epoch int64, topic string, partition int) (uint64, error) {
-	if topic == "" || partition < 0 {
-		return 0, fmt.Errorf("invalid transaction sequence scope")
+// FindRequestAssignment returns a durable broker assignment for an identical
+// client request. A changed request using the same client topic sequence is
+// rejected rather than being treated as a new publish.
+func (m *Manager) FindRequestAssignment(id, producer string, epoch int64, topic string, clientSequence uint64, fingerprint string) (RequestAssignment, bool, error) {
+	if topic == "" || clientSequence == 0 || fingerprint == "" {
+		return RequestAssignment{}, false, fmt.Errorf("invalid transaction request assignment")
 	}
 	s := m.shardForID(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := activeLocked(s, id)
 	if err != nil {
-		return 0, err
+		return RequestAssignment{}, false, err
 	}
 	if err := validateOwner(tx, producer, epoch); err != nil {
-		return 0, err
+		return RequestAssignment{}, false, err
+	}
+	existing, ok := tx.RequestAssignments[transactionRequestKey(topic, clientSequence)]
+	if !ok {
+		return RequestAssignment{}, false, nil
+	}
+	if existing.Fingerprint != fingerprint {
+		return RequestAssignment{}, false, fmt.Errorf("transaction request conflicts with existing client sequence topic=%s seq_num=%d", topic, clientSequence)
+	}
+	return existing, true, nil
+}
+
+// ResolveRequestAssignment returns the existing broker assignment for an
+// identical client request, or records a new assignment after the broker has
+// selected the concrete partition.
+func (m *Manager) ResolveRequestAssignment(id, producer string, epoch int64, topic string, clientSequence uint64, partition int, fingerprint string) (RequestAssignment, bool, error) {
+	if topic == "" || clientSequence == 0 || partition < 0 || fingerprint == "" {
+		return RequestAssignment{}, false, fmt.Errorf("invalid transaction request assignment")
+	}
+	s := m.shardForID(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := activeLocked(s, id)
+	if err != nil {
+		return RequestAssignment{}, false, err
+	}
+	if err := validateOwner(tx, producer, epoch); err != nil {
+		return RequestAssignment{}, false, err
+	}
+	requestKey := transactionRequestKey(topic, clientSequence)
+	if existing, ok := tx.RequestAssignments[requestKey]; ok {
+		if existing.Fingerprint != fingerprint {
+			return RequestAssignment{}, false, fmt.Errorf("transaction request conflicts with existing client sequence topic=%s seq_num=%d", topic, clientSequence)
+		}
+		return existing, true, nil
 	}
 	if tx.SequenceByPartition == nil {
 		tx.SequenceByPartition = make(map[string]uint64)
 	}
-	key := fmt.Sprintf("%s:%d", topic, partition)
-	tx.SequenceByPartition[key]++
+	if tx.RequestAssignments == nil {
+		tx.RequestAssignments = make(map[string]RequestAssignment)
+	}
+	partitionKey := fmt.Sprintf("%s:%d", topic, partition)
+	tx.SequenceByPartition[partitionKey]++
+	assignment := RequestAssignment{Topic: topic, ClientSequence: clientSequence, Partition: partition, Sequence: tx.SequenceByPartition[partitionKey], Fingerprint: fingerprint}
+	tx.RequestAssignments[requestKey] = assignment
 	tx.Revision++
 	tx.UpdatedAt = time.Now()
-	return tx.SequenceByPartition[key], nil
+	return assignment, false, nil
+}
+
+func transactionRequestKey(topic string, clientSequence uint64) string {
+	return fmt.Sprintf("%d:%s:%d", len(topic), topic, clientSequence)
 }
 
 // AddStream reserves one event-stream version for an open transaction.  The
@@ -1165,6 +1221,7 @@ func snapshot(tx *Transaction) *Snapshot {
 		Offsets:             append([]OffsetOperation(nil), tx.Offsets...),
 		Participants:        append([]Participant(nil), tx.Participants...),
 		SequenceByPartition: maps.Clone(tx.SequenceByPartition),
+		RequestAssignments:  maps.Clone(tx.RequestAssignments),
 		Deadline:            tx.Deadline,
 		CreatedAt:           tx.CreatedAt,
 		UpdatedAt:           tx.UpdatedAt,
@@ -1188,6 +1245,7 @@ func transactionFromSnapshot(snap *Snapshot) *Transaction {
 		Offsets:             append([]OffsetOperation(nil), snap.Offsets...),
 		Participants:        append([]Participant(nil), snap.Participants...),
 		SequenceByPartition: maps.Clone(snap.SequenceByPartition),
+		RequestAssignments:  maps.Clone(snap.RequestAssignments),
 		Deadline:            snap.Deadline,
 		CreatedAt:           snap.CreatedAt,
 		UpdatedAt:           snap.UpdatedAt,

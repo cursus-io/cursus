@@ -64,7 +64,7 @@ func TestManagerRequiresNewEpochForSequentialTransactions(t *testing.T) {
 	}
 }
 
-func TestManagerAllocatesTransactionalSequencesPerResolvedPartition(t *testing.T) {
+func TestManagerPersistsTransactionalRequestAssignments(t *testing.T) {
 	m := NewManager()
 	producer, epoch, err := m.InitProducerWithMode("tx-partition-sequences", ModeProcessingV1)
 	if err != nil {
@@ -73,27 +73,37 @@ func TestManagerAllocatesTransactionalSequencesPerResolvedPartition(t *testing.T
 	if err := m.Begin("tx-partition-sequences", producer, epoch); err != nil {
 		t.Fatal(err)
 	}
-	first, err := m.NextPartitionSequence("tx-partition-sequences", producer, epoch, "history", 0)
+	first, replay, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", 1, 0, "first")
 	if err != nil {
 		t.Fatal(err)
 	}
-	otherPartition, err := m.NextPartitionSequence("tx-partition-sequences", producer, epoch, "history", 1)
+	if replay || first.Sequence != 1 || first.Partition != 0 {
+		t.Fatalf("unexpected first assignment: %+v replay=%t", first, replay)
+	}
+	otherPartition, replay, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", 2, 1, "second")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := m.NextPartitionSequence("tx-partition-sequences", producer, epoch, "history", 0)
+	if replay || otherPartition.Sequence != 1 || otherPartition.Partition != 1 {
+		t.Fatalf("unexpected second-partition assignment: %+v replay=%t", otherPartition, replay)
+	}
+	retry, replay, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", 1, 1, "first")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first != 1 || otherPartition != 1 || second != 2 {
-		t.Fatalf("unexpected partition sequences: first=%d other=%d second=%d", first, otherPartition, second)
+	if !replay || retry != first {
+		t.Fatalf("retry did not reuse assignment: first=%+v retry=%+v replay=%t", first, retry, replay)
+	}
+	if _, _, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", 1, 0, "changed"); err == nil {
+		t.Fatal("expected conflicting request fingerprint to be rejected")
 	}
 	tx, err := m.Status("tx-partition-sequences")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if restored := transactionFromSnapshot(snapshot(tx)); restored.SequenceByPartition["history:1"] != 1 {
-		t.Fatalf("transaction snapshot lost partition sequence state: %+v", restored.SequenceByPartition)
+	restored := transactionFromSnapshot(snapshot(tx))
+	if restored.SequenceByPartition["history:1"] != 1 || restored.RequestAssignments[transactionRequestKey("history", 1)] != first {
+		t.Fatalf("transaction snapshot lost request assignment state: sequences=%+v assignments=%+v", restored.SequenceByPartition, restored.RequestAssignments)
 	}
 }
 
