@@ -171,5 +171,5 @@ func (m *DeadlineManager) RunDue(now time.Time) int {
 
 // FrameworkHelp returns the client-side framework quick reference.
 func FrameworkHelp() string {
-	return "Cursus Client Framework: NewEventEnvelope, NewAggregateRepository, NewSagaManager, Replay, UpcasterRegistry, RetryPolicy, DeadlineManager"
+	return "Cursus Client Framework: NewEventEnvelope, NewAggregateRepository, NewBrokerSagaRuntime, Replay, UpcasterRegistry, RetryPolicy, DeadlineManager"
 }
