@@ -304,10 +304,10 @@ func (ch *CommandHandler) HandleReadStreamCommand(conn net.Conn, cmd string) {
 			writeReadStreamError(conn, fmt.Sprintf("ERROR: NOT_LEADER leader=%s", leaderAddr))
 			return
 		}
-		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
-			writeReadStreamError(conn, indexResp)
-			return
-		}
+	}
+	if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
+		writeReadStreamError(conn, indexResp)
+		return
 	}
 	ch.ESHandler.HandleReadStream(cmd, conn)
 }
@@ -328,10 +328,10 @@ func (ch *CommandHandler) HandleReadStreamHistoryCommand(conn net.Conn, cmd stri
 			writeReadStreamError(conn, fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", ch.resolvePartitionLeaderAddr(topicName, partition)))
 			return
 		}
-		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
-			writeReadStreamError(conn, indexResp)
-			return
-		}
+	}
+	if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
+		writeReadStreamError(conn, indexResp)
+		return
 	}
 	ch.ESHandler.HandleReadStreamHistory(cmd, conn)
 }

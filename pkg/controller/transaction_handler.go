@@ -507,6 +507,9 @@ func (ch *CommandHandler) handleEndTxn(cmd string, contexts ...*ClientContext) s
 	if err := ch.commitTransactionDecision(txnID); err != nil {
 		return fmt.Sprintf("ERROR: transaction_commit_failed reason=%q", err.Error())
 	}
+	if err := ch.indexCommittedTransactionStreams(tx); err != nil {
+		return fmt.Sprintf("ERROR: transaction_stream_index_failed reason=%q", err.Error())
+	}
 	if tx.Mode == transaction.ModeProcessingV1 {
 		if err := ch.materializeAndCheckpointTransactionOffsets(tx.ID, tx.Offsets); err != nil {
 			return fmt.Sprintf("ERROR: transaction_offset_materialization_failed reason=%q", err.Error())
@@ -746,6 +749,24 @@ func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
 		return nil
 	}
 	return ch.withTransactionOffsetFences(tx.Offsets, apply)
+}
+
+// indexCommittedTransactionStreams advances derived event-store indexes only
+// after the broker has committed the transaction decision. Before that point
+// the commit marker is deliberately unreadable to read_committed scans.
+func (ch *CommandHandler) indexCommittedTransactionStreams(tx *transaction.Transaction) error {
+	seen := make(map[transaction.Participant]struct{}, len(tx.Streams))
+	for _, op := range tx.Streams {
+		participant := transaction.Participant{Topic: op.Topic, Partition: op.Partition}
+		if _, exists := seen[participant]; exists {
+			continue
+		}
+		seen[participant] = struct{}{}
+		if resp := ch.reconcileEventSourceIndex(op.Topic, op.Partition); resp != "" {
+			return fmt.Errorf("advance committed stream index: %s", resp)
+		}
+	}
+	return nil
 }
 
 func (ch *CommandHandler) prepareTransactionOffsetRecords(tx *transaction.Transaction) (*transaction.Transaction, error) {

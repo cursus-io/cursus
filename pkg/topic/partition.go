@@ -1043,6 +1043,44 @@ func (p *Partition) RecoverProducerStateFromLog() {
 	p.signalProducerStateCheckpoint()
 }
 
+// ProducerSequenceOffset returns the durable offset assigned to one
+// producer/epoch/sequence tuple. The idempotent producer-state cache retains
+// only the latest sequence, so duplicate acknowledgement and replication
+// recovery use the log as the authoritative lookup source.
+func (p *Partition) ProducerSequenceOffset(producerID string, epoch int64, sequence uint64) (uint64, bool, error) {
+	if producerID == "" || sequence == 0 {
+		return 0, false, fmt.Errorf("producer ID and positive sequence are required")
+	}
+	p.mu.RLock()
+	closed, handler := p.closed, p.dh
+	p.mu.RUnlock()
+	if closed || handler == nil {
+		return 0, false, fmt.Errorf("partition is closed")
+	}
+
+	offset, tail := handler.GetFirstOffset(), handler.GetAbsoluteOffset()
+	for offset < tail {
+		messages, err := p.ReadMessages(offset, 1024)
+		if err != nil {
+			return 0, false, err
+		}
+		if len(messages) == 0 {
+			break
+		}
+		for _, message := range messages {
+			if message.ProducerID == producerID && message.Epoch == epoch && message.SeqNum == sequence {
+				return message.Offset, true, nil
+			}
+		}
+		next := messages[len(messages)-1].Offset + 1
+		if next <= offset {
+			return 0, false, fmt.Errorf("producer sequence scan did not advance from offset %d", offset)
+		}
+		offset = next
+	}
+	return 0, false, nil
+}
+
 func (p *Partition) StartProducerStateMaintenance() {
 	if p.producerStateCh == nil {
 		return

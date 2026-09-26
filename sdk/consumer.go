@@ -1152,7 +1152,11 @@ func bootstrapAddressForAdvertisedLoopback(advertised string, bootstrap []string
 
 func (c *Consumer) handleNotCoordinator(respStr string) bool {
 	brokerErr, ok := ParseBrokerError(strings.TrimSpace(respStr))
-	if !ok || !strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
+	return ok && c.handleNotCoordinatorError(brokerErr)
+}
+
+func (c *Consumer) handleNotCoordinatorError(brokerErr *BrokerError) bool {
+	if brokerErr == nil || !strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
 		return false
 	}
 	host, port := brokerErr.Fields["host"], brokerErr.Fields["port"]

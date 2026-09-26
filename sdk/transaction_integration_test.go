@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -150,12 +151,22 @@ func integrationOKCommand(client *ConsumerClient, command string) (string, error
 			return "", err
 		}
 		value := strings.TrimSpace(string(response))
-		if !hasOKStatus(value) {
+		if !hasIntegrationOKStatus(value) {
 			return "", fmt.Errorf("unexpected response from %s: %s", connAddr, value)
 		}
 		return value, nil
 	}
 	return "", fmt.Errorf("coordinator redirect limit exceeded for %s", command)
+}
+
+func hasIntegrationOKStatus(value string) bool {
+	if hasOKStatus(value) {
+		return true
+	}
+	var envelope struct {
+		Status string `json:"status"`
+	}
+	return json.Unmarshal([]byte(value), &envelope) == nil && envelope.Status == "OK"
 }
 
 func netJoinCoordinator(client *ConsumerClient, host, port string) string {

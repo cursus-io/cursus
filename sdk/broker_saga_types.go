@@ -1,14 +1,69 @@
-//go:build legacy_sql_saga
-
 package sdk
 
 import (
-	"context"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+const (
+	SagaRunning      = "RUNNING"
+	SagaWaiting      = "WAITING"
+	SagaCompleted    = "COMPLETED"
+	SagaCompensating = "COMPENSATING"
+	SagaFailed       = "FAILED"
+)
+
+// SagaState is the broker-native state payload reconstructed from the Saga
+// state topic. It deliberately has no database adapter or local outbox API.
+type SagaState struct {
+	ID             string
+	Type           string
+	AssociationKey string
+	CorrelationID  string
+	Status         string
+	Step           string
+	Data           string
+	RetryCount     int
+	LastError      string
+	RunID          string
+	NextSequence   uint64
+	Outcome        string
+	UpdatedAt      time.Time
+	Version        uint64
+	Effects        map[string]EffectState
+}
+
+const (
+	EffectEnqueued  = "ENQUEUED"
+	EffectSucceeded = "SUCCEEDED"
+	EffectFailed    = "FAILED"
+)
+
+type EffectState struct {
+	ID        string
+	Step      string
+	Status    string
+	CommandID string
+	Published bool
+	Attempts  int
+	LastError string
+	UpdatedAt time.Time
+}
+
+// Command is an application command emitted in the broker transaction with
+// the corresponding Saga state and immutable execution history records.
+type Command struct {
+	ID            string
+	EffectID      string
+	Type          string
+	SagaType      string
+	SagaID        string
+	CorrelationID string
+	CausationID   string
+	Payload       string
+}
 
 const SagaHistorySchemaV1 uint32 = 1
 
@@ -36,9 +91,8 @@ const (
 	SagaOutcomeFailed      = "FAILED"
 )
 
-// SagaHistoryEvent is the language-independent, append-only v1 execution
-// record. Sequence is local to one run; occurred_at is never a cross-service
-// ordering guarantee.
+// SagaHistoryEvent is the language-independent append-only v1 contract.
+// Sequence, source_offset, and aggregate_version are JSON strings.
 type SagaHistoryEvent struct {
 	HistorySchemaVersion uint32    `json:"history_schema_version"`
 	HistoryEventID       string    `json:"history_event_id"`
@@ -68,28 +122,6 @@ type SagaHistoryEvent struct {
 	Error                string    `json:"error,omitempty"`
 }
 
-// SagaHistoryStore persists an event in the service-owned database. It must be
-// called through SagaTransaction when an application needs atomic state,
-// inbox, outbox, and history persistence.
-type SagaHistoryStore interface {
-	AppendSagaHistory(context.Context, SagaHistoryEvent) error
-}
-
-// SagaTransactionStores are the transaction-scoped adapters supplied by a
-// service's database integration.
-type SagaTransactionStores struct {
-	Inbox   InboxStore
-	State   SagaStore
-	Outbox  OutboxStore
-	History SagaHistoryStore
-}
-
-// SagaTransaction is implemented by a real service DB adapter (for example a
-// PostgreSQL transaction). It must commit only when fn returns nil.
-type SagaTransaction interface {
-	WithinSagaTransaction(context.Context, func(context.Context, SagaTransactionStores) error) error
-}
-
 type SagaHistoryOptions struct {
 	EnvironmentID string
 	ServiceName   string
@@ -102,5 +134,4 @@ func (o SagaHistoryOptions) validate() error {
 	return nil
 }
 
-func newSagaRunID() string          { return uuid.NewString() }
 func newSagaHistoryEventID() string { return uuid.NewString() }

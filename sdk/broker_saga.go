@@ -331,17 +331,21 @@ func (r *BrokerSagaRuntime) commit(input BrokerSagaInput, record BrokerSagaState
 		}
 	}()
 
-	sequence := uint64(0)
-	nextMessage := func(payload, key, eventType string) Message {
-		sequence++
-		return Message{SeqNum: sequence, Payload: payload, Key: key, EventType: eventType, SchemaVersion: 1}
+	// Idempotent producer sequences are fenced per topic-partition. A Saga
+	// transaction can atomically touch state, command, and history topics, so
+	// one global counter would make the first write to a later topic start at
+	// sequence 2 and be rejected by its partition.
+	sequences := make(map[string]uint64)
+	nextMessage := func(topic, payload, key, eventType string) Message {
+		sequences[topic]++
+		return Message{SeqNum: sequences[topic], Payload: payload, Key: key, EventType: eventType, SchemaVersion: 1}
 	}
 	if appendState {
 		payload, marshalErr := json.Marshal(record)
 		if marshalErr != nil {
 			return fmt.Errorf("marshal broker saga state: %w", marshalErr)
 		}
-		if err := producer.AppendStream(r.config.Topics.State, r.StreamKey(record.SagaID, record.RunID), expectedVersion, nextMessage(string(payload), r.StreamKey(record.SagaID, record.RunID), "saga.state.transitioned")); err != nil {
+		if err := producer.AppendStream(r.config.Topics.State, r.StreamKey(record.SagaID, record.RunID), expectedVersion, nextMessage(r.config.Topics.State, string(payload), r.StreamKey(record.SagaID, record.RunID), "saga.state.transitioned")); err != nil {
 			return fmt.Errorf("append broker saga state: %w", err)
 		}
 	}
@@ -350,7 +354,7 @@ func (r *BrokerSagaRuntime) commit(input BrokerSagaInput, record BrokerSagaState
 		if marshalErr != nil {
 			return fmt.Errorf("marshal broker saga command: %w", marshalErr)
 		}
-		if err := producer.Publish(r.config.Topics.Commands, -1, nextMessage(string(payload), command.ID, "saga.command.enqueued")); err != nil {
+		if err := producer.Publish(r.config.Topics.Commands, -1, nextMessage(r.config.Topics.Commands, string(payload), command.ID, "saga.command.enqueued")); err != nil {
 			return fmt.Errorf("publish broker saga command: %w", err)
 		}
 	}
@@ -359,7 +363,7 @@ func (r *BrokerSagaRuntime) commit(input BrokerSagaInput, record BrokerSagaState
 		if marshalErr != nil {
 			return fmt.Errorf("marshal broker saga history: %w", marshalErr)
 		}
-		if err := producer.Publish(r.config.Topics.History, -1, nextMessage(string(payload), event.HistoryEventID, event.EventType)); err != nil {
+		if err := producer.Publish(r.config.Topics.History, -1, nextMessage(r.config.Topics.History, string(payload), event.HistoryEventID, event.EventType)); err != nil {
 			return fmt.Errorf("publish broker saga history: %w", err)
 		}
 	}
@@ -415,7 +419,7 @@ func (r *BrokerSagaRuntime) commitStateOnly(input BrokerSagaInput, record Broker
 		if marshalErr != nil {
 			return marshalErr
 		}
-		if err := producer.Publish(r.config.Topics.History, -1, Message{SeqNum: uint64(index + 2), Payload: string(payload), Key: event.HistoryEventID, EventType: event.EventType, SchemaVersion: 1}); err != nil {
+		if err := producer.Publish(r.config.Topics.History, -1, Message{SeqNum: uint64(index + 1), Payload: string(payload), Key: event.HistoryEventID, EventType: event.EventType, SchemaVersion: 1}); err != nil {
 			return err
 		}
 	}
