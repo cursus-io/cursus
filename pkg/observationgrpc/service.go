@@ -51,7 +51,11 @@ func (s *Service) GetCapabilities(ctx context.Context, _ *observationv1.GetCapab
 	if err != nil {
 		return nil, backendError(err)
 	}
-	return &observationv1.GetCapabilitiesResponse{ProtocolVersion: int32(capabilities.Version), Features: append([]string(nil), capabilities.Enabled...)}, nil
+	version, err := protoInt32(capabilities.Version, "protocol version")
+	if err != nil {
+		return nil, err
+	}
+	return &observationv1.GetCapabilitiesResponse{ProtocolVersion: version, Features: append([]string(nil), capabilities.Enabled...)}, nil
 }
 
 func (s *Service) ListTopics(ctx context.Context, _ *observationv1.ListTopicsRequest) (*observationv1.ListTopicsResponse, error) {
@@ -72,7 +76,11 @@ func (s *Service) ListOffsets(ctx context.Context, request *observationv1.ListOf
 	}
 	response := &observationv1.ListOffsetsResponse{Offsets: make([]*observationv1.PartitionOffset, 0, len(offsets))}
 	for _, offset := range offsets {
-		response.Offsets = append(response.Offsets, &observationv1.PartitionOffset{Partition: int32(offset.Partition), EarliestOffset: decimal(offset.Earliest), LatestOffset: decimal(offset.Latest), LogEndOffset: decimal(offset.LEO), HighWatermark: decimal(offset.HWM)})
+		partition, err := protoInt32(offset.Partition, "partition")
+		if err != nil {
+			return nil, err
+		}
+		response.Offsets = append(response.Offsets, &observationv1.PartitionOffset{Partition: partition, EarliestOffset: decimal(offset.Earliest), LatestOffset: decimal(offset.Latest), LogEndOffset: decimal(offset.LEO), HighWatermark: decimal(offset.HWM)})
 	}
 	return response, nil
 }
@@ -95,7 +103,11 @@ func (s *Service) ListGroupOffsets(ctx context.Context, request *observationv1.L
 	}
 	response := &observationv1.ListGroupOffsetsResponse{Offsets: make([]*observationv1.GroupOffset, 0, len(offsets))}
 	for _, offset := range offsets {
-		response.Offsets = append(response.Offsets, &observationv1.GroupOffset{Partition: int32(offset.Partition), CommittedOffset: decimal(offset.Offset), EarliestOffset: decimal(offset.Earliest), LatestOffset: decimal(offset.Latest), Lag: decimal(offset.Lag)})
+		partition, err := protoInt32(offset.Partition, "partition")
+		if err != nil {
+			return nil, err
+		}
+		response.Offsets = append(response.Offsets, &observationv1.GroupOffset{Partition: partition, CommittedOffset: decimal(offset.Offset), EarliestOffset: decimal(offset.Earliest), LatestOffset: decimal(offset.Latest), Lag: decimal(offset.Lag)})
 	}
 	return response, nil
 }
@@ -179,12 +191,40 @@ func (s *Service) GetClusterStatus(ctx context.Context, _ *observationv1.GetClus
 	if err != nil {
 		return nil, backendError(err)
 	}
-	response := &observationv1.GetClusterStatusResponse{RaftLeader: cluster.RaftLeader, RaftState: cluster.RaftState, BrokerCount: int32(cluster.BrokerCount), ActiveBrokers: int32(cluster.ActiveBrokers), InactiveBrokers: int32(cluster.InactiveBrokers), PartitionCount: int32(cluster.PartitionCount), LeaderlessPartitions: int32(cluster.Leaderless), UnderReplicatedPartitions: int32(cluster.UnderReplicated)}
+	brokerCount, err := protoInt32(cluster.BrokerCount, "broker count")
+	if err != nil {
+		return nil, err
+	}
+	activeBrokers, err := protoInt32(cluster.ActiveBrokers, "active broker count")
+	if err != nil {
+		return nil, err
+	}
+	inactiveBrokers, err := protoInt32(cluster.InactiveBrokers, "inactive broker count")
+	if err != nil {
+		return nil, err
+	}
+	partitionCount, err := protoInt32(cluster.PartitionCount, "partition count")
+	if err != nil {
+		return nil, err
+	}
+	leaderless, err := protoInt32(cluster.Leaderless, "leaderless partition count")
+	if err != nil {
+		return nil, err
+	}
+	underReplicated, err := protoInt32(cluster.UnderReplicated, "under-replicated partition count")
+	if err != nil {
+		return nil, err
+	}
+	response := &observationv1.GetClusterStatusResponse{RaftLeader: cluster.RaftLeader, RaftState: cluster.RaftState, BrokerCount: brokerCount, ActiveBrokers: activeBrokers, InactiveBrokers: inactiveBrokers, PartitionCount: partitionCount, LeaderlessPartitions: leaderless, UnderReplicatedPartitions: underReplicated}
 	for _, broker := range cluster.Brokers {
 		response.Brokers = append(response.Brokers, &observationv1.ClusterBroker{Id: broker.ID, Status: broker.Status, Address: broker.Addr})
 	}
 	for _, partition := range cluster.Partitions {
-		response.Partitions = append(response.Partitions, &observationv1.ClusterPartition{Key: partition.Key, Topic: partition.Topic, Partition: int32(partition.Partition), Leader: partition.Leader, Replicas: append([]string(nil), partition.Replicas...), InSyncReplicas: append([]string(nil), partition.ISR...), LeaderAvailable: partition.LeaderAvailable, UnderReplicated: partition.UnderReplicated})
+		partitionNumber, err := protoInt32(partition.Partition, "cluster partition")
+		if err != nil {
+			return nil, err
+		}
+		response.Partitions = append(response.Partitions, &observationv1.ClusterPartition{Key: partition.Key, Topic: partition.Topic, Partition: partitionNumber, Leader: partition.Leader, Replicas: append([]string(nil), partition.Replicas...), InSyncReplicas: append([]string(nil), partition.ISR...), LeaderAvailable: partition.LeaderAvailable, UnderReplicated: partition.UnderReplicated})
 	}
 	return response, nil
 }
@@ -216,6 +256,14 @@ func optionalDecimal(value *string, field string) (*uint64, error) {
 }
 
 func decimal(value uint64) string { return strconv.FormatUint(value, 10) }
+
+func protoInt32(value int, field string) (int32, error) {
+	const maxInt32 = 1<<31 - 1
+	if value < 0 || value > maxInt32 {
+		return 0, status.Errorf(codes.Internal, "observation backend returned invalid %s", field)
+	}
+	return int32(value), nil
+}
 
 func backendError(err error) error {
 	if status.Code(err) != codes.Unknown {

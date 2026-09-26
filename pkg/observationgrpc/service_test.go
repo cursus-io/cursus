@@ -2,6 +2,7 @@ package observationgrpc
 
 import (
 	"context"
+	"math"
 	"net"
 	"testing"
 
@@ -15,11 +16,16 @@ import (
 )
 
 type testBackend struct {
-	offsets []sdk.PartitionOffsetRange
-	browse  sdk.BrowseRequest
+	offsets      []sdk.PartitionOffsetRange
+	browse       sdk.BrowseRequest
+	capabilities *sdk.NegotiatedProtocol
+	cluster      *sdk.ClusterStatus
 }
 
 func (b *testBackend) Capabilities(context.Context) (*sdk.NegotiatedProtocol, error) {
+	if b.capabilities != nil {
+		return b.capabilities, nil
+	}
 	return &sdk.NegotiatedProtocol{Version: 2, Enabled: []string{"browse_messages_v1"}}, nil
 }
 func (b *testBackend) ListTopics(context.Context) ([]string, error) { return []string{"orders"}, nil }
@@ -41,6 +47,9 @@ func (b *testBackend) ReadSnapshot(context.Context, string, string) (*sdk.Snapsh
 	return nil, nil
 }
 func (b *testBackend) ClusterStatus(context.Context) (*sdk.ClusterStatus, error) {
+	if b.cluster != nil {
+		return b.cluster, nil
+	}
 	return &sdk.ClusterStatus{}, nil
 }
 
@@ -86,6 +95,48 @@ func TestReadStreamHistoryPreservesEventOffsetAndSchemaVersion(t *testing.T) {
 	require.Len(t, response.Events, 1)
 	require.Equal(t, "9007199254740993", response.Events[0].Offset)
 	require.Equal(t, uint32(7), response.Events[0].SchemaVersion)
+}
+
+func TestServiceRejectsBackendValuesThatDoNotFitProtoInt32(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(observationv1.ObservationServiceClient) error
+	}{
+		{
+			name: "capability version",
+			call: func(client observationv1.ObservationServiceClient) error {
+				_, err := client.GetCapabilities(context.Background(), &observationv1.GetCapabilitiesRequest{})
+				return err
+			},
+		},
+		{
+			name: "topic partition",
+			call: func(client observationv1.ObservationServiceClient) error {
+				_, err := client.ListOffsets(context.Background(), &observationv1.ListOffsetsRequest{Topic: "orders"})
+				return err
+			},
+		},
+		{
+			name: "cluster count",
+			call: func(client observationv1.ObservationServiceClient) error {
+				_, err := client.GetClusterStatus(context.Background(), &observationv1.GetClusterStatusRequest{})
+				return err
+			},
+		},
+	}
+	backends := []*testBackend{
+		{capabilities: &sdk.NegotiatedProtocol{Version: math.MaxInt32 + 1}},
+		{offsets: []sdk.PartitionOffsetRange{{Partition: math.MaxInt32 + 1}}},
+		{cluster: &sdk.ClusterStatus{BrokerCount: -1}},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, cleanup := testClient(t, backends[index])
+			defer cleanup()
+			err := test.call(client)
+			require.Equal(t, codes.Internal, status.Code(err))
+		})
+	}
 }
 
 func testClient(t *testing.T, backend Backend) (observationv1.ObservationServiceClient, func()) {
