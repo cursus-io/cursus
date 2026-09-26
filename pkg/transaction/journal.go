@@ -70,22 +70,14 @@ func InspectJournal(path string) (JournalInspection, error) {
 	if path == "" {
 		return JournalInspection{}, fmt.Errorf("transaction journal path is empty")
 	}
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
+	file, info, missing, err := openJournalForInspection(path)
+	if missing {
 		return JournalInspection{}, nil
 	}
 	if err != nil {
-		return JournalInspection{}, fmt.Errorf("inspect transaction journal: %w", err)
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return JournalInspection{}, fmt.Errorf("transaction journal must be a regular file")
-	}
-	// #nosec G304 -- caller supplies the broker-owned journal path; Lstat above rejects links and non-regular files.
-	file, err := os.Open(path)
-	if err != nil {
 		return JournalInspection{}, fmt.Errorf("open transaction journal for inspection: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	latest := make(map[string]*Snapshot)
 	var offset int64
