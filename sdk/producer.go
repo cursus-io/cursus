@@ -213,13 +213,11 @@ func (p *Producer) fetchMetadata() {
 		for _, part := range strings.Fields(respStr) {
 			if strings.HasPrefix(part, "leaders=") {
 				addrs := strings.Split(strings.TrimPrefix(part, "leaders="), ",")
-				p.partitionMu.Lock()
 				for i, a := range addrs {
 					if a = strings.TrimSpace(a); a != "" {
-						p.partitionLeaders[i] = a
+						p.setPartitionLeaderAddr(i, a)
 					}
 				}
-				p.partitionMu.Unlock()
 				return
 			}
 		}
@@ -231,6 +229,12 @@ func (p *Producer) getPartitionLeaderAddr(partition int) string {
 	p.partitionMu.RLock()
 	defer p.partitionMu.RUnlock()
 	return p.partitionLeaders[partition]
+}
+
+func (p *Producer) setPartitionLeaderAddr(partition int, addr string) {
+	p.partitionMu.Lock()
+	p.partitionLeaders[partition] = bootstrapAddressForAdvertisedLoopback(addr, p.config.BrokerAddrs, p.config.UseBootstrapAddressForAdvertisedLoopback)
+	p.partitionMu.Unlock()
 }
 
 func (p *Producer) nextPartition() int {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/cursus-io/cursus/util"
@@ -332,6 +333,30 @@ func (si *StreamIndex) Lookup(key string, fromVersion uint64) ([]StreamIndexEntr
 			result = append(result, e)
 		}
 	}
+	return result, nil
+}
+
+// LookupRange returns at most max entries in the inclusive version range. It
+// uses the version-sorted in-memory index and copies only the requested page;
+// callers must not use Lookup and trim the result after materializing an
+// entire long aggregate history.
+func (si *StreamIndex) LookupRange(key string, fromVersion, toVersion uint64, max int) ([]StreamIndexEntry, error) {
+	if fromVersion == 0 || toVersion < fromVersion || max <= 0 {
+		return nil, nil
+	}
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	entries := si.entries[key]
+	start := sort.Search(len(entries), func(i int) bool { return entries[i].AggregateVersion >= fromVersion })
+	if start == len(entries) {
+		return nil, nil
+	}
+	end := start
+	for end < len(entries) && entries[end].AggregateVersion <= toVersion && end-start < max {
+		end++
+	}
+	result := make([]StreamIndexEntry, end-start)
+	copy(result, entries[start:end])
 	return result, nil
 }
 

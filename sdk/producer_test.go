@@ -171,6 +171,17 @@ func TestProducerClient_UpdateLeader(t *testing.T) {
 	assert.False(t, info.updated.IsZero())
 }
 
+func TestProducerMapsAdvertisedLoopbackPartitionLeaderToBootstrap(t *testing.T) {
+	cfg := NewDefaultPublisherConfig()
+	cfg.BrokerAddrs = []string{"127.0.0.1:19000"}
+	cfg.UseBootstrapAddressForAdvertisedLoopback = true
+	producer := &Producer{config: cfg, partitionLeaders: make(map[int]string)}
+
+	producer.setPartitionLeaderAddr(0, "localhost:9000")
+
+	assert.Equal(t, "127.0.0.1:19000", producer.getPartitionLeaderAddr(0))
+}
+
 func TestProducerClient_UpdateLeader_SameAddrNoOp(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	pc, _ := NewProducerClient(cfg)

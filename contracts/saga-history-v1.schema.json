@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cursus.io/contracts/saga-history-v1.schema.json",
+  "title": "Cursus Saga execution history v1",
+  "type": "object",
+  "required": ["history_schema_version", "history_event_id", "environment_id", "service_name", "saga_type", "saga_id", "run_id", "sequence", "event_type", "occurred_at", "recorded_at", "source_partition", "source_offset"],
+  "properties": {
+    "history_schema_version": {"const": 1},
+    "history_event_id": {"type": "string", "format": "uuid"},
+    "environment_id": {"type": "string", "minLength": 1},
+    "service_name": {"type": "string", "minLength": 1},
+    "saga_type": {"type": "string", "minLength": 1},
+    "saga_id": {"type": "string", "minLength": 1},
+    "run_id": {"type": "string", "format": "uuid"},
+    "sequence": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+    "event_type": {"type": "string", "minLength": 1},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "step_id": {"type": "string"}, "attempt": {"type": "integer", "minimum": 1},
+    "command_id": {"type": "string"}, "effect_id": {"type": "string"},
+    "source_event_id": {"type": "string"}, "correlation_id": {"type": "string"},
+    "causation_id": {"type": "string"}, "source_topic": {"type": "string"},
+    "source_partition": {"type": "integer", "minimum": 0}, "source_offset": {"type": "string", "pattern": "^[0-9]+$"},
+    "aggregate_type": {"type": "string"}, "aggregate_id": {"type": "string"},
+    "aggregate_version": {"type": "string", "pattern": "^[0-9]+$"},
+    "payload": {"type": "string"}, "error": {"type": "string"}
+  }
+}

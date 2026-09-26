@@ -19,6 +19,7 @@ func TestCommandDescriptorPermissions(t *testing.T) {
 		{command: "READ_STREAM topic=orders", want: []string{PermissionTopicRead}},
 		{command: "LIST_GROUPS", want: []string{PermissionGroup}},
 		{command: "TXN_PUBLISH transactional_id=tx topic=orders", want: []string{PermissionTransaction, PermissionTopicWrite}},
+		{command: "TXN_APPEND_STREAM transactional_id=tx topic=orders", want: []string{PermissionTransaction, PermissionTopicWrite}},
 		{command: "SEND_OFFSETS_TO_TXN transactional_id=tx", want: []string{PermissionTransaction, PermissionGroup}},
 		{command: "FIND_COORDINATOR group=workers", want: []string{PermissionGroup}},
 		{command: "FIND_COORDINATOR transactional_id=tx", want: []string{PermissionTransaction}},

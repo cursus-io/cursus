@@ -702,3 +702,43 @@ func TestPartitionConsumer_HandlerFailureDoesNotCommitAndRequestsRedelivery(t *t
 	default:
 	}
 }
+
+func TestPartitionConsumerManualCommitDoesNotQueueCommit(t *testing.T) {
+	c := newTestConsumer(t)
+	c.config.EnableAutoCommit = false
+	c.MessageHandler = func(Message) error { return nil }
+
+	pc := &PartitionConsumer{
+		partitionID: 0,
+		consumer:    c,
+		dataCh:      make(chan *messageBatch, 1),
+	}
+	c.wg.Add(1)
+	go pc.runWorker()
+	pc.dataCh <- &messageBatch{messages: []Message{{Offset: 7, Payload: "manual"}}}
+	close(pc.dataCh)
+	c.wg.Wait()
+
+	select {
+	case commit := <-c.commitCh:
+		t.Fatalf("manual commit unexpectedly queued: %+v", commit)
+	default:
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if _, ok := c.offsets[0]; ok {
+		t.Fatalf("manual commit unexpectedly advanced stored offset to %d", c.offsets[0])
+	}
+}
+
+func TestConsumerCommitOffsetRejectsUnassignedPartition(t *testing.T) {
+	c := newTestConsumer(t)
+	err := c.CommitOffset(9, 10)
+	assert.EqualError(t, err, "partition 9 is not assigned to this consumer")
+}
+
+func TestConsumerCommitOffsetRejectsZeroOffset(t *testing.T) {
+	c := newTestConsumer(t)
+	err := c.CommitOffset(0, 0)
+	assert.EqualError(t, err, "commit offset must be greater than zero")
+}

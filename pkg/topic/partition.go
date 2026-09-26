@@ -698,46 +698,9 @@ func (p *Partition) ReadMessages(offset uint64, max int) ([]types.Message, error
 	return p.dh.ReadMessages(offset, max)
 }
 
-// ProducerSequenceOffset resolves the durable offset originally assigned to an
-// idempotent producer sequence. It is used only on duplicate acknowledgements,
-// where returning the current log tail would acknowledge the wrong record.
-func (p *Partition) ProducerSequenceOffset(producerID string, epoch int64, seqNum uint64) (uint64, bool, error) {
-	if producerID == "" || seqNum == 0 {
-		return 0, false, nil
-	}
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	first := p.dh.GetFirstOffset()
-	limit := p.LEO.Load()
-	offset := first
-	const batchSize = 1024
-	for offset < limit {
-		messages, err := p.dh.ReadMessages(offset, batchSize)
-		if err != nil {
-			return 0, false, err
-		}
-		if len(messages) == 0 {
-			break
-		}
-		for _, message := range messages {
-			if message.Offset >= limit {
-				return 0, false, nil
-			}
-			if message.ProducerID == producerID && message.Epoch == epoch && message.SeqNum == seqNum {
-				return message.Offset, true, nil
-			}
-			next := message.Offset + 1
-			if next <= offset {
-				next = offset + 1
-			}
-			offset = next
-		}
-		if len(messages) < batchSize {
-			break
-		}
-	}
-	return 0, false, nil
+// FirstOffset returns the current retention boundary for read-only clients.
+func (p *Partition) FirstOffset() uint64 {
+	return p.dh.GetFirstOffset()
 }
 
 // LastStableOffset returns the first offset that may still be blocked by an
@@ -786,6 +749,35 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 		max = int(canRead) // #nosec G115 -- canRead is bounded by math.MaxInt before narrowing.
 	}
 
+	return p.readVisibleCommitted(offset, max, hwm)
+}
+
+// ReadCommittedRange is the non-consuming counterpart to ReadCommitted for a
+// fixed, exclusive upper bound.  It applies the same transaction visibility
+// rules while ensuring callers cannot accidentally read records appended after
+// a page's captured end offset.
+func (p *Partition) ReadCommittedRange(offset, endOffset uint64, max int) ([]types.Message, error) {
+	p.mu.RLock()
+	hwm := p.HWM
+	p.mu.RUnlock()
+
+	flushed := p.dh.GetFlushedOffset()
+	if flushed < hwm {
+		hwm = flushed
+	}
+	if endOffset < hwm {
+		hwm = endOffset
+	}
+	earliest := p.dh.GetFirstOffset()
+	if offset < earliest {
+		return nil, &types.OffsetOutOfRangeError{Requested: offset, Earliest: earliest, Latest: hwm}
+	}
+	if offset >= hwm {
+		return nil, nil
+	}
+	if remaining := hwm - offset; remaining <= math.MaxInt && max > int(remaining) { // #nosec G115 -- checked before narrowing.
+		max = int(remaining) // #nosec G115 -- checked before narrowing.
+	}
 	return p.readVisibleCommitted(offset, max, hwm)
 }
 
@@ -1049,6 +1041,44 @@ func (p *Partition) RecoverProducerStateFromLog() {
 		}
 	}
 	p.signalProducerStateCheckpoint()
+}
+
+// ProducerSequenceOffset returns the durable offset assigned to one
+// producer/epoch/sequence tuple. The idempotent producer-state cache retains
+// only the latest sequence, so duplicate acknowledgement and replication
+// recovery use the log as the authoritative lookup source.
+func (p *Partition) ProducerSequenceOffset(producerID string, epoch int64, sequence uint64) (uint64, bool, error) {
+	if producerID == "" || sequence == 0 {
+		return 0, false, fmt.Errorf("producer ID and positive sequence are required")
+	}
+	p.mu.RLock()
+	closed, handler := p.closed, p.dh
+	p.mu.RUnlock()
+	if closed || handler == nil {
+		return 0, false, fmt.Errorf("partition is closed")
+	}
+
+	offset, tail := handler.GetFirstOffset(), handler.GetAbsoluteOffset()
+	for offset < tail {
+		messages, err := p.ReadMessages(offset, 1024)
+		if err != nil {
+			return 0, false, err
+		}
+		if len(messages) == 0 {
+			break
+		}
+		for _, message := range messages {
+			if message.ProducerID == producerID && message.Epoch == epoch && message.SeqNum == sequence {
+				return message.Offset, true, nil
+			}
+		}
+		next := messages[len(messages)-1].Offset + 1
+		if next <= offset {
+			return 0, false, fmt.Errorf("producer sequence scan did not advance from offset %d", offset)
+		}
+		offset = next
+	}
+	return 0, false, nil
 }
 
 func (p *Partition) StartProducerStateMaintenance() {

@@ -15,6 +15,24 @@ import (
 )
 
 func (ch *CommandHandler) handleAppendStream(cmd string) string {
+	if ch.TxnManager == nil {
+		return ch.handleAppendStreamLocked(cmd)
+	}
+	var response string
+	ch.TxnManager.WithStreamKeyLock(eventStreamTopic(cmd, "APPEND_STREAM "), eventStreamKey(cmd, "APPEND_STREAM "), func() {
+		response = ch.handleAppendStreamLocked(cmd)
+	})
+	return response
+}
+
+func (ch *CommandHandler) handleAppendStreamLocked(cmd string) string {
+	if ch.TxnManager != nil {
+		topicName := eventStreamTopic(cmd, "APPEND_STREAM ")
+		key := eventStreamKey(cmd, "APPEND_STREAM ")
+		if transactionalID, reserved := ch.TxnManager.StreamReservation(topicName, key); reserved {
+			return fmt.Sprintf("ERROR: stream_version_reserved topic=%s key=%s transactional_id=%s", topicName, key, transactionalID)
+		}
+	}
 	partition, errResp := ch.eventStreamPartition(cmd, "APPEND_STREAM ")
 	if errResp != "" {
 		return errResp
@@ -286,12 +304,36 @@ func (ch *CommandHandler) HandleReadStreamCommand(conn net.Conn, cmd string) {
 			writeReadStreamError(conn, fmt.Sprintf("ERROR: NOT_LEADER leader=%s", leaderAddr))
 			return
 		}
-		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
-			writeReadStreamError(conn, indexResp)
+	}
+	if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
+		writeReadStreamError(conn, indexResp)
+		return
+	}
+	ch.ESHandler.HandleReadStream(cmd, conn)
+}
+
+// HandleReadStreamHistoryCommand preserves the leader and committed-index
+// boundary used by READ_STREAM, but delegates to the snapshot-free history
+// path.  It never substitutes READ_STREAM because that command may apply a
+// snapshot and omit older source events.
+func (ch *CommandHandler) HandleReadStreamHistoryCommand(conn net.Conn, cmd string) {
+	partition, errResp := ch.eventStreamPartition(cmd, "READ_STREAM_HISTORY ")
+	if errResp != "" {
+		writeReadStreamError(conn, errResp)
+		return
+	}
+	topicName := eventStreamTopic(cmd, "READ_STREAM_HISTORY ")
+	if ch.Config != nil && ch.Config.EnabledDistribution && ch.Cluster != nil {
+		if !ch.Cluster.IsAuthorized(topicName, partition) {
+			writeReadStreamError(conn, fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", ch.resolvePartitionLeaderAddr(topicName, partition)))
 			return
 		}
 	}
-	ch.ESHandler.HandleReadStream(cmd, conn)
+	if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
+		writeReadStreamError(conn, indexResp)
+		return
+	}
+	ch.ESHandler.HandleReadStreamHistory(cmd, conn)
 }
 
 func (ch *CommandHandler) reconcileEventSourceIndex(topicName string, partition int) string {

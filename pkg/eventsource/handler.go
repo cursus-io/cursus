@@ -109,7 +109,10 @@ func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, err
 		return nil, fmt.Errorf("partition lookup for stream index %s:%d: %w", topicName, partitionID, err)
 	}
 	h.indexes[key] = idx
-	h.indexedHWM[key] = p.GetHWM()
+	// Recovery reads only the stable committed prefix. Never claim that an
+	// unresolved transactional tail has been indexed merely because it is in
+	// the partition HWM.
+	h.indexedHWM[key] = p.LastStableOffset()
 	return idx, nil
 }
 
@@ -154,6 +157,31 @@ func (h *Handler) PrepareCommittedIndex(topicName string, partitionID int) error
 	return err
 }
 
+// CurrentVersion returns the committed aggregate version and its partition.
+// Callers that need the latest transactional visibility first advance the
+// committed index to the partition HWM with IndexCommittedToHWM.
+func (h *Handler) CurrentVersion(topicName, key string) (uint64, int, error) {
+	if key == "" {
+		return 0, 0, fmt.Errorf("stream key is required")
+	}
+	t := h.tm.GetTopic(topicName)
+	if t == nil {
+		return 0, 0, fmt.Errorf("topic %s not found", topicName)
+	}
+	if !t.IsEventSourcing {
+		return 0, 0, fmt.Errorf("event sourcing is not enabled for topic %s", topicName)
+	}
+	partition := t.GetPartitionForMessage(types.Message{Key: key})
+	if partition < 0 {
+		return 0, 0, fmt.Errorf("no partitions available")
+	}
+	idx, err := h.getIndex(topicName, partition)
+	if err != nil {
+		return 0, 0, err
+	}
+	return idx.GetVersion(key), partition, nil
+}
+
 // IndexCommittedToHWM advances the derived stream index only through records
 // visible below the partition's stable committed boundary.
 func (h *Handler) IndexCommittedToHWM(topicName string, partitionID int, targetHWM uint64) error {
@@ -187,6 +215,7 @@ func (h *Handler) IndexCommittedToHWM(topicName string, partitionID int, targetH
 	}
 
 	const batchSize = 256
+	indexedUntil := start
 	for offset := start; offset < scanEnd; {
 		msgs, err := p.ReadCommitted(offset, batchSize)
 		if err != nil {
@@ -214,11 +243,12 @@ func (h *Handler) IndexCommittedToHWM(topicName string, partitionID int, targetH
 			return fmt.Errorf("stream index scan did not advance from offset %d", offset)
 		}
 		offset = next
+		indexedUntil = next
 	}
 
 	h.mu.Lock()
-	if h.indexedHWM[key] < scanEnd {
-		h.indexedHWM[key] = scanEnd
+	if h.indexedHWM[key] < indexedUntil {
+		h.indexedHWM[key] = indexedUntil
 	}
 	h.mu.Unlock()
 	return nil
@@ -467,7 +497,7 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 
 	indexKey := topicName + ":" + strconv.Itoa(partitionID)
 	h.mu.Lock()
-	if committed := p.GetHWM(); h.indexedHWM[indexKey] < committed {
+	if committed := p.LastStableOffset(); h.indexedHWM[indexKey] < committed {
 		h.indexedHWM[indexKey] = committed
 	}
 	h.mu.Unlock()

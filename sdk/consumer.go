@@ -74,6 +74,33 @@ type Consumer struct {
 	MessageHandler func(Message) error
 }
 
+// TransactionalOffsetMetadata is the active group membership required by
+// SEND_OFFSETS_TO_TXN. It is exposed for broker-native processors such as the
+// Saga runtime; callers must obtain a fresh value for each input because a
+// rebalance fences the previous member/generation pair.
+type TransactionalOffsetMetadata struct {
+	Topic      string
+	Group      string
+	Member     string
+	Generation int
+}
+
+// TransactionalOffsetMetadata returns the consumer's currently assigned group
+// generation. It fails before the consumer joins a group or after a rebalance
+// has cleared the active membership.
+func (c *Consumer) TransactionalOffsetMetadata() (TransactionalOffsetMetadata, error) {
+	if c == nil || c.config == nil {
+		return TransactionalOffsetMetadata{}, fmt.Errorf("consumer is not initialized")
+	}
+	c.mu.RLock()
+	member, generation := c.memberID, c.generation
+	c.mu.RUnlock()
+	if member == "" || generation <= 0 {
+		return TransactionalOffsetMetadata{}, fmt.Errorf("consumer has no active group assignment")
+	}
+	return TransactionalOffsetMetadata{Topic: c.config.Topic, Group: c.config.GroupID, Member: member, Generation: int(generation)}, nil
+}
+
 func NewConsumer(cfg *ConsumerConfig) (*Consumer, error) {
 	return NewConsumerWithContext(context.Background(), cfg)
 }
@@ -124,6 +151,41 @@ func (c *Consumer) Done() <-chan struct{} {
 	return c.doneCh
 }
 
+// CommitOffset persists the next offset for an assigned partition immediately.
+//
+// It is intended for consumers that disable EnableAutoCommit because they need
+// an external durable side effect to complete before acknowledging a message.
+// Call it with message.Offset + 1 only after that side effect has succeeded.
+// The method waits for the broker acknowledgement and returns an error without
+// advancing the local committed offset when the commit is rejected.
+func (c *Consumer) CommitOffset(partition int, offset uint64) error {
+	if offset == 0 {
+		return fmt.Errorf("commit offset must be greater than zero")
+	}
+	if err := c.mainCtx.Err(); err != nil {
+		return fmt.Errorf("commit cancelled: %w", err)
+	}
+
+	c.mu.RLock()
+	pc, assigned := c.partitionConsumers[partition]
+	c.mu.RUnlock()
+	if !assigned {
+		return fmt.Errorf("partition %d is not assigned to this consumer", partition)
+	}
+
+	if err := pc.commitOffsetWithRetry(offset); err != nil {
+		return err
+	}
+
+	atomic.StoreUint64(&pc.commitOffset, offset)
+	c.mu.Lock()
+	if current := c.offsets[partition]; offset > current {
+		c.offsets[partition] = offset
+	}
+	c.mu.Unlock()
+	return nil
+}
+
 // Start joins the consumer group, begins consuming, and blocks until Close is called.
 func (c *Consumer) Start(handler func(Message) error) error {
 	if err := c.beginStart(); err != nil {
@@ -143,7 +205,12 @@ func (c *Consumer) Start(handler func(Message) error) error {
 	}
 	c.MessageHandler = handler
 
-	if coordAddr, err := c.findCoordinator(); err == nil {
+	if c.config.CoordinatorAddr != "" {
+		c.mu.Lock()
+		c.coordinatorAddr = c.config.CoordinatorAddr
+		c.mu.Unlock()
+		LogInfo("Using configured coordinator for group '%s': %s", c.config.GroupID, c.coordinatorAddr)
+	} else if coordAddr, err := c.findCoordinator(); err == nil {
 		c.mu.Lock()
 		c.coordinatorAddr = coordAddr
 		c.mu.Unlock()
@@ -620,7 +687,7 @@ func (c *Consumer) fetchMetadata() error {
 	addrs := strings.Split(leadersStr, ",")
 	c.partitionMu.Lock()
 	for i, addr := range addrs {
-		c.partitionLeaders[i] = addr
+		c.partitionLeaders[i] = bootstrapAddressForAdvertisedLoopback(addr, c.config.BrokerAddrs, c.config.UseBootstrapAddressForAdvertisedLoopback)
 	}
 	c.partitionMu.Unlock()
 	c.compactionEnabled.Store(cleanupPolicyIncludesCompaction(cleanupPolicy))
@@ -641,7 +708,7 @@ func (c *Consumer) getPartitionLeaderAddr(partitionID int) string {
 
 func (c *Consumer) updatePartitionLeader(partitionID int, addr string) {
 	c.partitionMu.Lock()
-	c.partitionLeaders[partitionID] = addr
+	c.partitionLeaders[partitionID] = bootstrapAddressForAdvertisedLoopback(addr, c.config.BrokerAddrs, c.config.UseBootstrapAddressForAdvertisedLoopback)
 	c.partitionMu.Unlock()
 }
 
@@ -1073,6 +1140,17 @@ func isLoopbackCoordinatorHost(host string) bool {
 	default:
 		return false
 	}
+}
+
+func bootstrapAddressForAdvertisedLoopback(advertised string, bootstrap []string, enabled bool) string {
+	if !enabled || len(bootstrap) != 1 {
+		return advertised
+	}
+	host, _, err := net.SplitHostPort(advertised)
+	if err != nil || !isLoopbackCoordinatorHost(host) {
+		return advertised
+	}
+	return bootstrap[0]
 }
 
 func (c *Consumer) handleNotCoordinatorError(brokerErr *BrokerError) bool {

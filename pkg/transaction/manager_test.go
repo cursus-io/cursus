@@ -64,6 +64,49 @@ func TestManagerRequiresNewEpochForSequentialTransactions(t *testing.T) {
 	}
 }
 
+func TestManagerPersistsTransactionalRequestAssignments(t *testing.T) {
+	m := NewManager()
+	producer, epoch, err := m.InitProducerWithMode("tx-partition-sequences", ModeProcessingV1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Begin("tx-partition-sequences", producer, epoch); err != nil {
+		t.Fatal(err)
+	}
+	first, replay, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", -1, 1, 0, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay || first.Sequence != 1 || first.Partition != 0 {
+		t.Fatalf("unexpected first assignment: %+v replay=%t", first, replay)
+	}
+	otherPartition, replay, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", 1, 1, 1, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay || otherPartition.Sequence != 1 || otherPartition.Partition != 1 {
+		t.Fatalf("unexpected second-partition assignment: %+v replay=%t", otherPartition, replay)
+	}
+	retry, replay, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", -1, 1, 1, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replay || retry != first {
+		t.Fatalf("retry did not reuse assignment: first=%+v retry=%+v replay=%t", first, retry, replay)
+	}
+	if _, _, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", -1, 1, 0, "changed"); err == nil {
+		t.Fatal("expected conflicting request fingerprint to be rejected")
+	}
+	tx, err := m.Status("tx-partition-sequences")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := transactionFromSnapshot(snapshot(tx))
+	if restored.SequenceByPartition["history:1"] != 1 || restored.RequestAssignments[transactionRequestKey("history", -1, 1)] != first {
+		t.Fatalf("transaction snapshot lost request assignment state: sequences=%+v assignments=%+v", restored.SequenceByPartition, restored.RequestAssignments)
+	}
+}
+
 func TestManagerPreservesProducerEpochWhenExpiredIDIsReinitialized(t *testing.T) {
 	m := NewManagerWithExpiration(time.Hour)
 	old := time.Now().Add(-2 * time.Hour)
@@ -96,6 +139,16 @@ func TestManagerPreservesProducerEpochWhenExpiredIDIsReinitialized(t *testing.T)
 	}
 	if producer != "producer-tx-expired" || epoch != 8 {
 		t.Fatalf("expired transactional ID reused stale identity producer=%s epoch=%d", producer, epoch)
+	}
+}
+
+func TestManagerSnapshotDoesNotStealAnotherStreamReservation(t *testing.T) {
+	manager := NewManager()
+	manager.ApplySnapshot(&Snapshot{ID: "first", State: StateOpen, Streams: []StreamOperation{{Topic: "orders", Key: "order-42", ExpectedVersion: 1}}})
+	manager.ApplySnapshot(&Snapshot{ID: "second", State: StateOpen, Streams: []StreamOperation{{Topic: "orders", Key: "order-42", ExpectedVersion: 1}}})
+	owner, reserved := manager.StreamReservation("orders", "order-42")
+	if !reserved || owner != "first" {
+		t.Fatalf("reservation owner = %q, reserved=%t; want first owner retained", owner, reserved)
 	}
 }
 

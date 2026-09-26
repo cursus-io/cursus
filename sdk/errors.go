@@ -81,3 +81,30 @@ func brokerErrorFromWire(remote *wire.BrokerError) *BrokerError {
 		Fields:    fields,
 	}
 }
+
+// ParseBrokerError converts the text-protocol error envelope into the same
+// structured error used by the framed transport. It accepts both `ERROR:` and
+// `ERROR ` prefixes because older brokers emit both forms.
+func ParseBrokerError(value string) (*BrokerError, bool) {
+	value = strings.TrimSpace(value)
+	upper := strings.ToUpper(value)
+	if strings.HasPrefix(upper, "ERROR:") {
+		value = strings.TrimSpace(value[len("ERROR:"):])
+	} else if strings.HasPrefix(upper, "ERROR ") {
+		value = strings.TrimSpace(value[len("ERROR "):])
+	} else {
+		return nil, false
+	}
+	parts := strings.Fields(value)
+	if len(parts) == 0 {
+		return nil, false
+	}
+	err := &BrokerError{Code: parts[0], Message: parts[0], Fields: make(map[string]string)}
+	for _, part := range parts[1:] {
+		key, fieldValue, ok := strings.Cut(part, "=")
+		if ok && key != "" {
+			err.Fields[key] = strings.Trim(fieldValue, "\"")
+		}
+	}
+	return err, true
+}

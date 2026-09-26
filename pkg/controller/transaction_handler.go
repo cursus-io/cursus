@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,27 @@ import (
 const maxTransactionReconcilePagesPerPass = 4
 
 const transactionControlMarkerPayload = "__cursus_txn_control_marker__"
+
+type transactionRequestFingerprint struct {
+	Command            string `json:"command"`
+	Topic              string `json:"topic"`
+	RequestedPartition int    `json:"requested_partition"`
+	Key                string `json:"key"`
+	Payload            string `json:"payload"`
+	ExpectedVersion    uint64 `json:"expected_version"`
+	EventType          string `json:"event_type"`
+	SchemaVersion      uint32 `json:"schema_version"`
+	Metadata           string `json:"metadata"`
+}
+
+func fingerprintTransactionRequest(request transactionRequestFingerprint) string {
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(encoded)
+	return fmt.Sprintf("%x", digest)
+}
 
 func (ch *CommandHandler) handleInitProducerID(cmd string, contexts ...*ClientContext) string {
 	args := parseKeyValueArgs(cmd[len("INIT_PRODUCER_ID "):])
@@ -148,7 +170,8 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 		}
 		partition = parsed
 	}
-	seqNum, err := parseRequiredPositiveUint64(args["seqNum"])
+	requestedPartition := partition
+	clientSequence, err := parseRequiredPositiveUint64(args["seqNum"])
 	if err != nil {
 		return fmt.Sprintf("ERROR: invalid_seq_num command=TXN_PUBLISH reason=%q", err.Error())
 	}
@@ -163,7 +186,7 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 	if authResp := ch.authorizeTopicWrite(t.PolicySnapshot(), clientCtx); authResp != "" {
 		return fmt.Sprintf("%s topic=%s", authResp, topicName)
 	}
-	msg := types.Message{Payload: message, ProducerID: producerID, SeqNum: seqNum, Epoch: epoch, Key: args["key"], TransactionalID: txnID, TransactionState: types.TransactionStateOpen}
+	msg := types.Message{Payload: message, ProducerID: producerID, SeqNum: clientSequence, Epoch: epoch, Key: args["key"], TransactionalID: txnID, TransactionState: types.TransactionStateOpen}
 	if partition < 0 {
 		partition = t.GetPartitionForMessage(msg)
 	}
@@ -179,6 +202,27 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 		return fmt.Sprintf("ERROR: transaction_not_found reason=%q", statusErr.Error())
 	}
 	if current.Mode == transaction.ModeProcessingV1 {
+		assignment, _, err := ch.TxnManager.ResolveRequestAssignment(
+			txnID,
+			producerID,
+			epoch,
+			topicName,
+			requestedPartition,
+			clientSequence,
+			partition,
+			fingerprintTransactionRequest(transactionRequestFingerprint{
+				Command:            "TXN_PUBLISH",
+				Topic:              topicName,
+				RequestedPartition: requestedPartition,
+				Key:                args["key"],
+				Payload:            message,
+			}),
+		)
+		if err != nil {
+			return fmt.Sprintf("ERROR: transaction_publish_failed reason=%q", err.Error())
+		}
+		partition = assignment.Partition
+		msg.SeqNum = assignment.Sequence
 		participant := transaction.Participant{Topic: topicName, Partition: partition}
 		if err := ch.TxnManager.AddParticipant(txnID, producerID, epoch, participant, time.Time{}); err != nil {
 			return fmt.Sprintf("ERROR: transaction_publish_failed reason=%q", err.Error())
@@ -200,6 +244,177 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s staged_messages=1 topic=%s partition=%d", txnID, topicName, partition)
+}
+
+// handleTxnAppendStream stages an optimistic event-store append as a durable
+// transaction participant. The state stream record is appended as unresolved
+// transaction output and becomes readable only with END_TXN(commit).
+func (ch *CommandHandler) handleTxnAppendStream(cmd string, contexts ...*ClientContext) string {
+	args := parseKeyValueArgs(cmd[len("TXN_APPEND_STREAM "):])
+	if ch.TxnManager == nil {
+		return ch.handleTxnAppendStreamLocked(cmd, contexts...)
+	}
+	var response string
+	ch.TxnManager.WithStreamKeyLock(args["topic"], args["key"], func() {
+		response = ch.handleTxnAppendStreamLocked(cmd, contexts...)
+	})
+	return response
+}
+
+func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*ClientContext) string {
+	ctx := firstClientContext(contexts)
+	args := parseKeyValueArgs(cmd[len("TXN_APPEND_STREAM "):])
+	if authResp := ch.authenticateInline(args, ctx); authResp != "" {
+		return authResp
+	}
+	txnID := firstNonEmpty(args["transactional_id"], args["txn"], args["transaction"])
+	if txnID == "" {
+		return "ERROR: missing_transactional_id command=TXN_APPEND_STREAM"
+	}
+	if resp := ch.ensureTransactionCoordinator(txnID); resp != "" {
+		return resp
+	}
+	stateLock := ch.transactionStateLock(txnID)
+	stateLock.Lock()
+	defer stateLock.Unlock()
+
+	topicName := args["topic"]
+	if topicName == "" {
+		return "ERROR: missing_topic command=TXN_APPEND_STREAM"
+	}
+	key := args["key"]
+	if key == "" {
+		return "ERROR: missing_key command=TXN_APPEND_STREAM"
+	}
+	payload := args["message"]
+	if payload == "" {
+		return "ERROR: missing_message command=TXN_APPEND_STREAM"
+	}
+	expectedVersion, err := parseRequiredPositiveUint64(firstNonEmpty(args["expected_version"], args["version"]))
+	if err != nil {
+		return fmt.Sprintf("ERROR: invalid_expected_version command=TXN_APPEND_STREAM reason=%q", err.Error())
+	}
+	producerID, epoch, errResp := parseTxnProducerEpoch(args, "TXN_APPEND_STREAM")
+	if errResp != "" {
+		return errResp
+	}
+	clientSequence, err := parseRequiredPositiveUint64(args["seqNum"])
+	if err != nil {
+		return fmt.Sprintf("ERROR: invalid_seq_num command=TXN_APPEND_STREAM reason=%q", err.Error())
+	}
+
+	t := ch.TopicManager.GetTopic(topicName)
+	if t == nil {
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+	if !t.IsEventSourcing {
+		return fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", topicName)
+	}
+	if authResp := ch.authorizeTopicWrite(t.PolicySnapshot(), ctx); authResp != "" {
+		return fmt.Sprintf("%s topic=%s", authResp, topicName)
+	}
+	if resp := ch.requireTransactionMode(txnID, ctx); resp != "" {
+		return resp
+	}
+	partition := t.GetPartitionForMessage(types.Message{Key: key})
+	if _, err := t.GetPartition(partition); err != nil {
+		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
+	}
+	schemaVersion := uint32(1)
+	if raw := args["schema_version"]; raw != "" {
+		parsed, parseErr := strconv.ParseUint(raw, 10, 32)
+		if parseErr != nil {
+			return fmt.Sprintf("ERROR: invalid_schema_version reason=%q", parseErr.Error())
+		}
+		schemaVersion = uint32(parsed)
+	}
+	fingerprint := fingerprintTransactionRequest(transactionRequestFingerprint{
+		Command:         "TXN_APPEND_STREAM",
+		Topic:           topicName,
+		Key:             key,
+		Payload:         payload,
+		ExpectedVersion: expectedVersion,
+		EventType:       args["event_type"],
+		SchemaVersion:   schemaVersion,
+		Metadata:        args["metadata"],
+	})
+	existing, found, err := ch.TxnManager.FindRequestAssignment(
+		txnID,
+		producerID,
+		epoch,
+		topicName,
+		-1,
+		clientSequence,
+		fingerprint,
+	)
+	if err != nil {
+		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
+	}
+	if found {
+		partition = existing.Partition
+	}
+	if _, err := t.GetPartition(partition); err != nil {
+		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
+	}
+	if resp := ch.reconcileEventSourceIndex(topicName, partition); resp != "" {
+		return resp
+	}
+	currentVersion, currentPartition, versionErr := ch.ESHandler.CurrentVersion(topicName, key)
+	if versionErr != nil {
+		return fmt.Sprintf("ERROR: stream_index_failed reason=%q", versionErr.Error())
+	}
+	if partition != currentPartition {
+		return "ERROR: stream_partition_changed"
+	}
+	if expectedVersion != currentVersion+1 {
+		return fmt.Sprintf("ERROR: stream_version_conflict expected=%d current=%d", expectedVersion, currentVersion)
+	}
+	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
+	assignment, _, err := ch.TxnManager.ResolveRequestAssignment(
+		txnID,
+		producerID,
+		epoch,
+		topicName,
+		-1,
+		clientSequence,
+		partition,
+		fingerprint,
+	)
+	if err != nil {
+		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
+	}
+
+	message := types.Message{
+		Payload:          payload,
+		Key:              key,
+		ProducerID:       producerID,
+		SeqNum:           assignment.Sequence,
+		Epoch:            epoch,
+		TransactionalID:  txnID,
+		TransactionState: types.TransactionStateOpen,
+		AggregateVersion: expectedVersion,
+		EventType:        args["event_type"],
+		SchemaVersion:    schemaVersion,
+		Metadata:         args["metadata"],
+	}
+
+	if err := ch.TxnManager.AddParticipant(txnID, producerID, epoch, transaction.Participant{Topic: topicName, Partition: partition}, time.Time{}); err != nil {
+		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
+		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
+	}
+	operation := transaction.StreamOperation{Topic: topicName, Partition: partition, Key: key, ExpectedVersion: expectedVersion, Message: message}
+	if err := ch.TxnManager.AddStream(txnID, producerID, epoch, operation); err != nil {
+		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
+		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
+	}
+	if err := ch.syncTransactionState(txnID); err != nil {
+		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
+		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
+	}
+	if err := ch.publishCommittedTransactionMessage(transaction.MessageOperation{Topic: topicName, Partition: partition, Message: message}); err != nil {
+		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
+	}
+	return fmt.Sprintf("OK transactional_id=%s appended=true topic=%s partition=%d version=%d state=open", txnID, topicName, partition, expectedVersion)
 }
 
 func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string, contexts ...*ClientContext) string {
@@ -378,6 +593,9 @@ func (ch *CommandHandler) handleEndTxn(cmd string, contexts ...*ClientContext) s
 	if err := ch.commitTransactionDecision(txnID); err != nil {
 		return fmt.Sprintf("ERROR: transaction_commit_failed reason=%q", err.Error())
 	}
+	if err := ch.indexCommittedTransactionStreams(tx); err != nil {
+		return fmt.Sprintf("ERROR: transaction_stream_index_failed reason=%q", err.Error())
+	}
 	if tx.Mode == transaction.ModeProcessingV1 {
 		if err := ch.materializeAndCheckpointTransactionOffsets(tx.ID, tx.Offsets); err != nil {
 			return fmt.Sprintf("ERROR: transaction_offset_materialization_failed reason=%q", err.Error())
@@ -445,6 +663,10 @@ func (ch *CommandHandler) recoverPreparedTransactionsBatch(shards []int, limit i
 			if err := ch.commitTransactionDecision(tx.ID); err != nil {
 				stateLock.Unlock()
 				return more, fmt.Errorf("mark recovered transaction %s committed: %w", tx.ID, err)
+			}
+			if err := ch.indexCommittedTransactionStreams(tx); err != nil {
+				stateLock.Unlock()
+				return more, fmt.Errorf("index recovered transaction %s streams: %w", tx.ID, err)
 			}
 		}
 		stateLock.Unlock()
@@ -619,6 +841,24 @@ func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
 	return ch.withTransactionOffsetFences(tx.Offsets, apply)
 }
 
+// indexCommittedTransactionStreams advances derived event-store indexes only
+// after the broker has committed the transaction decision. Before that point
+// the commit marker is deliberately unreadable to read_committed scans.
+func (ch *CommandHandler) indexCommittedTransactionStreams(tx *transaction.Transaction) error {
+	seen := make(map[transaction.Participant]struct{}, len(tx.Streams))
+	for _, op := range tx.Streams {
+		participant := transaction.Participant{Topic: op.Topic, Partition: op.Partition}
+		if _, exists := seen[participant]; exists {
+			continue
+		}
+		seen[participant] = struct{}{}
+		if resp := ch.reconcileEventSourceIndex(op.Topic, op.Partition); resp != "" {
+			return fmt.Errorf("advance committed stream index: %s", resp)
+		}
+	}
+	return nil
+}
+
 func (ch *CommandHandler) prepareTransactionOffsetRecords(tx *transaction.Transaction) (*transaction.Transaction, error) {
 	if tx == nil || tx.State != transaction.StateOpen || tx.Mode != transaction.ModeProcessingV1 {
 		return tx, nil
@@ -731,6 +971,30 @@ func transactionalOffsetRecords(tx *transaction.Transaction) ([]coordinator.Cons
 }
 
 func (ch *CommandHandler) validateTransaction(tx *transaction.Transaction) error {
+	for _, op := range tx.Streams {
+		t := ch.TopicManager.GetTopic(op.Topic)
+		if t == nil {
+			return fmt.Errorf("topic %s not found", op.Topic)
+		}
+		if !t.IsEventSourcing {
+			return fmt.Errorf("event sourcing is not enabled for topic %s", op.Topic)
+		}
+		if !t.PolicySnapshot().CanWrite() {
+			return fmt.Errorf("NOT_AUTHORIZED_FOR_TOPIC topic=%s operation=write", op.Topic)
+		}
+		if _, err := t.GetPartition(op.Partition); err != nil {
+			return err
+		}
+		partition, err := t.GetPartition(op.Partition)
+		if err != nil {
+			return err
+		}
+		if _, found, err := partition.ProducerSequenceOffset(op.Message.ProducerID, op.Message.Epoch, op.Message.SeqNum); err != nil {
+			return fmt.Errorf("verify staged stream record: %w", err)
+		} else if !found {
+			return fmt.Errorf("transaction stream record is not staged topic=%s partition=%d producer=%s sequence=%d", op.Topic, op.Partition, op.Message.ProducerID, op.Message.SeqNum)
+		}
+	}
 	for _, op := range tx.Messages {
 		t := ch.TopicManager.GetTopic(op.Topic)
 		if t == nil {
@@ -941,6 +1205,18 @@ func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.Mess
 		cmd := fmt.Sprintf("PUBLISH topic=%s acks=all producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true internal_txn_publish=true", op.Topic, msg.ProducerID, op.Partition, msg.SeqNum, msg.Epoch)
 		if msg.Key != "" {
 			cmd += fmt.Sprintf(" key=%s", msg.Key)
+		}
+		if msg.AggregateVersion != 0 {
+			cmd += fmt.Sprintf(" aggregate_version=%d", msg.AggregateVersion)
+		}
+		if msg.EventType != "" {
+			cmd += fmt.Sprintf(" event_type=%s", msg.EventType)
+		}
+		if msg.SchemaVersion != 0 {
+			cmd += fmt.Sprintf(" schema_version=%d", msg.SchemaVersion)
+		}
+		if msg.Metadata != "" {
+			cmd += fmt.Sprintf(" metadata=%s", msg.Metadata)
 		}
 		if msg.TransactionalID != "" {
 			cmd += fmt.Sprintf(" transactional_id=%s transaction_state=%s", msg.TransactionalID, msg.TransactionState)
