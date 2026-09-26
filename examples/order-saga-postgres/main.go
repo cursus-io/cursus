@@ -1,6 +1,8 @@
 // order-saga-postgres demonstrates the service-owned side of the B-stage
 // contract. It writes Saga state, inbox, command outbox, immutable history,
 // and history outbox in one PostgreSQL transaction, then publishes history.
+//go:build legacy_sql_saga
+
 package main
 
 import (

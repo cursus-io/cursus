@@ -1,4 +1,6 @@
-// Package sagapg contains the service-owned PostgreSQL transaction adapter.
+//go:build legacy_sql_saga
+
+// Package sagapg contains the retired service-owned PostgreSQL transaction adapter.
 package sagapg
 
 import (

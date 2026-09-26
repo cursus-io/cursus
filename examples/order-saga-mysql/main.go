@@ -1,5 +1,7 @@
 // order-saga-mysql demonstrates the same service-owned v1 history boundary
 // as the PostgreSQL example, using MySQL 8+.
+//go:build legacy_sql_saga
+
 package main
 
 import (

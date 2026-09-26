@@ -1,4 +1,6 @@
 // Package sagamysql contains the service-owned MySQL 8+ Saga transaction adapter.
+//go:build legacy_sql_saga
+
 package sagamysql
 
 import (
