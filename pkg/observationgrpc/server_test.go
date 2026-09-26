@@ -14,7 +14,8 @@ import (
 
 func TestStartRejectsInvalidArguments(t *testing.T) {
 	backend := &testBackend{}
-	if _, err := Start(nil, "127.0.0.1:0", backend); err == nil {
+	var nilContext context.Context
+	if _, err := startForTest(nilContext, "127.0.0.1:0", backend); err == nil {
 		t.Fatal("expected nil context to be rejected")
 	}
 	if _, err := Start(context.Background(), "127.0.0.1:0", nil); err == nil {
@@ -27,6 +28,10 @@ func TestStartRejectsInvalidArguments(t *testing.T) {
 	if _, err := Start(context.Background(), listener.Addr().String(), backend); err == nil {
 		t.Fatal("expected occupied address to fail")
 	}
+}
+
+func startForTest(ctx context.Context, address string, backend Backend) (func(), error) {
+	return Start(ctx, address, backend)
 }
 
 func TestStartServesAndShutsDownObservationService(t *testing.T) {
