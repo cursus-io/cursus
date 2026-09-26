@@ -7,7 +7,11 @@ func TestStreamIndexLookupRangeCopiesOnlyRequestedPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer index.Close()
+	t.Cleanup(func() {
+		if closeErr := index.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
+	})
 	for version := uint64(1); version <= 5; version++ {
 		if err := index.Append("order-1", version, version*10, version); err != nil {
 			t.Fatal(err)

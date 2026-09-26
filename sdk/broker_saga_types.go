@@ -3,8 +3,6 @@ package sdk
 import (
 	"fmt"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 const (
@@ -113,8 +111,8 @@ type SagaHistoryEvent struct {
 	CorrelationID        string    `json:"correlation_id,omitempty"`
 	CausationID          string    `json:"causation_id,omitempty"`
 	SourceTopic          string    `json:"source_topic,omitempty"`
-	SourcePartition      int       `json:"source_partition,omitempty"`
-	SourceOffset         uint64    `json:"source_offset,string,omitempty"`
+	SourcePartition      int       `json:"source_partition"`
+	SourceOffset         uint64    `json:"source_offset,string"`
 	AggregateType        string    `json:"aggregate_type,omitempty"`
 	AggregateID          string    `json:"aggregate_id,omitempty"`
 	AggregateVersion     uint64    `json:"aggregate_version,string,omitempty"`
@@ -133,5 +131,3 @@ func (o SagaHistoryOptions) validate() error {
 	}
 	return nil
 }
-
-func newSagaHistoryEventID() string { return uuid.NewString() }

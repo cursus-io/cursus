@@ -99,6 +99,16 @@ func TestManagerPreservesProducerEpochWhenExpiredIDIsReinitialized(t *testing.T)
 	}
 }
 
+func TestManagerSnapshotDoesNotStealAnotherStreamReservation(t *testing.T) {
+	manager := NewManager()
+	manager.ApplySnapshot(&Snapshot{ID: "first", State: StateOpen, Streams: []StreamOperation{{Topic: "orders", Key: "order-42", ExpectedVersion: 1}}})
+	manager.ApplySnapshot(&Snapshot{ID: "second", State: StateOpen, Streams: []StreamOperation{{Topic: "orders", Key: "order-42", ExpectedVersion: 1}}})
+	owner, reserved := manager.StreamReservation("orders", "order-42")
+	if !reserved || owner != "first" {
+		t.Fatalf("reservation owner = %q, reserved=%t; want first owner retained", owner, reserved)
+	}
+}
+
 func TestManagerDeletesExpiredEpochTombstoneAfterSecondRetentionWindow(t *testing.T) {
 	m := NewManagerWithExpiration(time.Hour)
 	old := time.Now().Add(-2 * time.Hour)

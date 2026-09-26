@@ -37,7 +37,6 @@ const (
 	CommandInitProducerID
 	CommandBeginTxn
 	CommandTxnPublish
-	CommandTxnAppendStream
 	CommandSendOffsetsToTxn
 	CommandEndTxn
 	CommandTxnStatus
@@ -63,6 +62,11 @@ const (
 	CommandReplicaCatchup
 	CommandAggregateReplayProof
 	CommandAggregateEventRangeRead
+	// New Wire v2 commands are appended so existing command IDs remain stable
+	// for mixed-version clients and brokers.
+	CommandTxnAppendStream
+	CommandBrowseMessages
+	CommandReadStreamHistory
 )
 
 var commandNames = [...]string{
@@ -95,7 +99,6 @@ var commandNames = [...]string{
 	CommandInitProducerID:          "INIT_PRODUCER_ID",
 	CommandBeginTxn:                "BEGIN_TXN",
 	CommandTxnPublish:              "TXN_PUBLISH",
-	CommandTxnAppendStream:         "TXN_APPEND_STREAM",
 	CommandSendOffsetsToTxn:        "SEND_OFFSETS_TO_TXN",
 	CommandEndTxn:                  "END_TXN",
 	CommandTxnStatus:               "TXN_STATUS",
@@ -121,6 +124,9 @@ var commandNames = [...]string{
 	CommandReplicaCatchup:          "REPLICA_CATCHUP",
 	CommandAggregateReplayProof:    "AGGREGATE_REPLAY_PROOF",
 	CommandAggregateEventRangeRead: "AGGREGATE_EVENT_RANGE_READ",
+	CommandTxnAppendStream:         "TXN_APPEND_STREAM",
+	CommandBrowseMessages:          "BROWSE_MESSAGES",
+	CommandReadStreamHistory:       "READ_STREAM_HISTORY",
 }
 
 var commandsByName = func() map[string]Command {

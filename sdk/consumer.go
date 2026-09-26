@@ -206,9 +206,12 @@ func (c *Consumer) Start(handler func(Message) error) error {
 	c.MessageHandler = handler
 
 	if c.config.CoordinatorAddr != "" {
+		c.mu.Lock()
 		c.coordinatorAddr = c.config.CoordinatorAddr
+		c.mu.Unlock()
 		LogInfo("Using configured coordinator for group '%s': %s", c.config.GroupID, c.coordinatorAddr)
 	} else if coordAddr, err := c.findCoordinator(); err == nil {
+		c.mu.Lock()
 		c.coordinatorAddr = coordAddr
 		c.mu.Unlock()
 		LogInfo("Coordinator for group '%s': %s", c.config.GroupID, coordAddr)
@@ -1140,7 +1143,7 @@ func isLoopbackCoordinatorHost(host string) bool {
 }
 
 func bootstrapAddressForAdvertisedLoopback(advertised string, bootstrap []string, enabled bool) string {
-	if !enabled || len(bootstrap) == 0 {
+	if !enabled || len(bootstrap) != 1 {
 		return advertised
 	}
 	host, _, err := net.SplitHostPort(advertised)
@@ -1148,11 +1151,6 @@ func bootstrapAddressForAdvertisedLoopback(advertised string, bootstrap []string
 		return advertised
 	}
 	return bootstrap[0]
-}
-
-func (c *Consumer) handleNotCoordinator(respStr string) bool {
-	brokerErr, ok := ParseBrokerError(strings.TrimSpace(respStr))
-	return ok && c.handleNotCoordinatorError(brokerErr)
 }
 
 func (c *Consumer) handleNotCoordinatorError(brokerErr *BrokerError) bool {

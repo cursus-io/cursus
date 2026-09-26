@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -197,13 +198,17 @@ func (r *BrokerSagaRuntime) Handle(ctx context.Context, input BrokerSagaInput, h
 	if record.State.Effects == nil {
 		record.State.Effects = make(map[string]EffectState)
 	}
-	commands, drafts, handleErr := handler(ctx, &record.State, input.Event)
+	// A failed transition must not leak mutations made by the handler into the
+	// failure record. Only a successful handler result becomes the next state.
+	transitionState := cloneBrokerSagaState(record.State)
+	commands, drafts, handleErr := handler(ctx, &transitionState, input.Event)
 	if handleErr != nil {
 		if !newRun {
 			_ = r.recordFailure(ctx, input, record, version, handleErr)
 		}
 		return handleErr
 	}
+	record.State = transitionState
 
 	now := r.now().UTC()
 	if newRun {
@@ -387,7 +392,11 @@ func (r *BrokerSagaRuntime) recordFailure(ctx context.Context, input BrokerSagaI
 	record.State.Version = version + 1
 	record.State.UpdatedAt = now
 	record.RecordedAt = now
-	history := r.materializeHistory(&record.State, input, []BrokerSagaHistoryDraft{{EventType: SagaHistoryStepFailed, StepID: record.State.Step, Attempt: uint32(record.State.RetryCount), Error: cause.Error()}}, now)
+	attempt := uint32(math.MaxUint32)
+	if record.State.RetryCount >= 0 && record.State.RetryCount < math.MaxUint32 {
+		attempt = uint32(record.State.RetryCount) // #nosec G115 -- bounds checked
+	}
+	history := r.materializeHistory(&record.State, input, []BrokerSagaHistoryDraft{{EventType: SagaHistoryStepFailed, StepID: record.State.Step, Attempt: attempt, Error: cause.Error()}}, now)
 	// Do not acknowledge the inbox offset: the source record is retried, while
 	// this separately committed failure remains an immutable diagnostic fact.
 	return r.commitStateOnly(input, record, version+1, history)
@@ -431,7 +440,19 @@ func (r *BrokerSagaRuntime) commitStateOnly(input BrokerSagaInput, record Broker
 }
 
 func (r *BrokerSagaRuntime) transactionID(input BrokerSagaInput, phase string) string {
-	return "saga-" + brokerSagaUUID("transaction", r.config.ServiceName, input.Topic, fmt.Sprintf("%d", input.Partition), fmt.Sprintf("%d", input.Offset), phase).String()
+	return "saga-" + brokerSagaUUID("transaction", r.config.ServiceName, r.config.SagaType, input.Group, input.SagaID, input.RunID, input.Topic, fmt.Sprintf("%d", input.Partition), fmt.Sprintf("%d", input.Offset), phase).String()
+}
+
+func cloneBrokerSagaState(state SagaState) SagaState {
+	clone := state
+	if state.Effects == nil {
+		return clone
+	}
+	clone.Effects = make(map[string]EffectState, len(state.Effects))
+	for id, effect := range state.Effects {
+		clone.Effects[id] = effect
+	}
+	return clone
 }
 
 func containsSagaInput(ids []string, eventID string) bool {

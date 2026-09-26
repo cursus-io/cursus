@@ -578,6 +578,10 @@ func (ch *CommandHandler) recoverPreparedTransactionsBatch(shards []int, limit i
 				stateLock.Unlock()
 				return more, fmt.Errorf("mark recovered transaction %s committed: %w", tx.ID, err)
 			}
+			if err := ch.indexCommittedTransactionStreams(tx); err != nil {
+				stateLock.Unlock()
+				return more, fmt.Errorf("index recovered transaction %s streams: %w", tx.ID, err)
+			}
 		}
 		stateLock.Unlock()
 		util.Info("Recovered prepared transaction %s", tx.ID)
@@ -894,6 +898,15 @@ func (ch *CommandHandler) validateTransaction(tx *transaction.Transaction) error
 		}
 		if _, err := t.GetPartition(op.Partition); err != nil {
 			return err
+		}
+		partition, err := t.GetPartition(op.Partition)
+		if err != nil {
+			return err
+		}
+		if _, found, err := partition.ProducerSequenceOffset(op.Message.ProducerID, op.Message.Epoch, op.Message.SeqNum); err != nil {
+			return fmt.Errorf("verify staged stream record: %w", err)
+		} else if !found {
+			return fmt.Errorf("transaction stream record is not staged topic=%s partition=%d producer=%s sequence=%d", op.Topic, op.Partition, op.Message.ProducerID, op.Message.SeqNum)
 		}
 	}
 	for _, op := range tx.Messages {

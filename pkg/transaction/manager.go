@@ -151,7 +151,11 @@ func (m *Manager) reserveStreamsLocked(tx *Transaction) {
 	m.reservationMu.Lock()
 	defer m.reservationMu.Unlock()
 	for _, op := range tx.Streams {
-		m.streamReservations[streamReservationKey{topic: op.Topic, key: op.Key}] = tx.ID
+		key := streamReservationKey{topic: op.Topic, key: op.Key}
+		if owner, reserved := m.streamReservations[key]; reserved && owner != tx.ID {
+			continue
+		}
+		m.streamReservations[key] = tx.ID
 	}
 }
 

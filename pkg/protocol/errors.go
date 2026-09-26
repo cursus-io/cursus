@@ -78,6 +78,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"topic_not_assigned_to_group", "transaction_aborted", "transaction_already_committed",
 		"transaction_marker_partition_not_touched", "transaction_not_abortable", "transaction_not_committing",
 		"transaction_record_not_staged", "version_conflict", "aggregate_identity_conflict",
+		"stream_partition_changed", "stream_version_conflict", "stream_version_reserved",
 	)
 	register(ErrorClassAuthorization, false,
 		"NOT_AUTHORIZED_FOR_OPERATION", "NOT_AUTHORIZED_FOR_PARTITION", "NOT_AUTHORIZED_FOR_TOPIC", "authentication_failed", "authentication_required",
@@ -89,7 +90,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 	)
 	register(ErrorClassValidation, false,
 		"UNSUPPORTED_FEATURE", "UNSUPPORTED_PROTOCOL_VERSION", "batch_decode_failed", "decode_failed",
-		"consumer_group_subscriptions_feature_required", "distribution_not_enabled", "distribution_required", "duplicate_partition", "empty_command", "empty_messages",
+		"consumer_group_subscriptions_feature_required", "distribution_not_enabled", "distribution_required", "duplicate_partition", "empty_command", "empty_messages", "invalid_aggregate_version", "invalid_expected_version", "missing_min_in_sync_replicas",
 		"empty_required_params", "event_sourcing_not_enabled", "invalid_acks", "invalid_batch_commit_entry", "invalid_batch_commit_format", "invalid_min_in_sync_replicas",
 		"invalid_auth", "invalid_consume_syntax", "invalid_control_batch_bytes", "invalid_control_batch_coordinator_epoch",
 		"invalid_aggregate_replay", "invalid_expected_last_sequence", "invalid_from_sequence", "invalid_max_records", "invalid_producer_epoch", "invalid_producer_sequence", "invalid_to_sequence",
@@ -109,10 +110,10 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"consumer_group_subscriptions_feature_required", "group_epoch_mismatch", "invalid_group_epoch", "invalid_subscription", "missing_version", "no_valid_offsets", "transaction_not_open", "transactional_processing_feature_required", "unknown_command", "unmarshal_failed",
 	)
 	register(ErrorClassInternal, false,
-		"append_stream_failed", "broker_error", "command_failed", "coordinator_error", "create_topic_failed", "aggregate_index_lookup_failed", "aggregate_partition_mismatch", "aggregate_proof_", "aggregate_proof_unavailable", "aggregate_publish_requires_append_stream", "aggregate_range_", "aggregate_range_incomplete", "aggregate_replay_not_enabled", "join_group_failed", "marshal_aggregate_proof_failed", "marshal_aggregate_range_failed",
+		"append_stream_failed", "alter_topic_config_failed", "broker_error", "command_failed", "coordinator_error", "create_topic_failed", "aggregate_index_lookup_failed", "aggregate_partition_mismatch", "aggregate_proof_", "aggregate_proof_unavailable", "aggregate_publish_requires_append_stream", "aggregate_range_", "aggregate_range_incomplete", "aggregate_replay_not_enabled", "marshal_aggregate_proof_failed", "marshal_aggregate_range_failed",
 		"delete_topic_failed", "empty_command_response", "find_coordinator_failed", "forward_to_coordinator_failed",
 		"forward_to_leader_failed", "forward_to_partition_leader_failed", "group_status_failed",
-		"local_processor_not_configured", "marshal_ack_failed", "marshal_brokers_failed", "marshal_cluster_status_failed", "marshal_metadata_failed",
+		"local_processor_not_configured", "marshal_ack_failed", "marshal_brokers_failed", "marshal_cluster_status_failed", "marshal_metadata_failed", "transaction_stream_failed", "transaction_stream_index_failed",
 		"marshal_aggregate_proof_failed", "marshal_aggregate_range_failed", "marshal_snapshot_failed", "marshal_snapshots_failed", "marshal_status_failed", "negotiation_context_required",
 		"no_partitions_available", "offset_sync_failed", "partition_lookup_failed", "raft_apply_failed",
 		"raft_batch_apply_failed", "register_group_failed", "replica_append_failed", "replica_index_failed", "replica_index_prepare_failed",

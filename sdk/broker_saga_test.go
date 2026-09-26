@@ -33,6 +33,30 @@ func TestBrokerSagaHistoryUsesStableRunSequenceIdentity(t *testing.T) {
 	require.Equal(t, "7", record["aggregate_version"])
 }
 
+func TestBrokerSagaHistoryRetainsZeroSourcePosition(t *testing.T) {
+	runtime := &BrokerSagaRuntime{config: BrokerSagaRuntimeConfig{SagaType: "orders", EnvironmentID: "test", ServiceName: "orders", Topics: DefaultBrokerSagaTopics()}}
+	state := &SagaState{ID: "order-42", Type: "orders", RunID: "de94b8eb-50c4-4a35-b324-59b9318af658"}
+	input := BrokerSagaInput{SagaID: state.ID, RunID: state.RunID, Topic: "orders.events", Group: "orders-saga", Member: "member-1", Event: EventEnvelope{EventID: "event-order-42", EventType: "OrderCreated"}}
+	history := runtime.materializeHistory(state, input, []BrokerSagaHistoryDraft{{EventType: SagaHistoryRunStarted}}, time.Now().UTC())
+	encoded, err := json.Marshal(history[0])
+	require.NoError(t, err)
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &record))
+	require.Equal(t, float64(0), record["source_partition"])
+	require.Equal(t, "0", record["source_offset"])
+}
+
+func TestBrokerSagaTransactionIDScopesIndependentConsumersAndRuns(t *testing.T) {
+	runtime := &BrokerSagaRuntime{config: BrokerSagaRuntimeConfig{SagaType: "orders", ServiceName: "orders"}}
+	input := BrokerSagaInput{SagaID: "order-42", RunID: "run-1", Topic: "orders.events", Partition: 0, Offset: 0, Group: "orders-a"}
+	first := runtime.transactionID(input, "apply")
+	input.Group = "orders-b"
+	require.NotEqual(t, first, runtime.transactionID(input, "apply"))
+	input.Group = "orders-a"
+	input.RunID = "run-2"
+	require.NotEqual(t, first, runtime.transactionID(input, "apply"))
+}
+
 func TestBrokerSagaTopicsRejectReservedTopics(t *testing.T) {
 	config := BrokerSagaRuntimeConfig{
 		SagaType: "orders", EnvironmentID: "test", ServiceName: "orders",
