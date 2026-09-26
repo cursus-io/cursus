@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
@@ -147,7 +148,7 @@ func testClient(t *testing.T, backend Backend) (observationv1.ObservationService
 	require.NoError(t, err)
 	observationv1.RegisterObservationServiceServer(server, service)
 	go func() { _ = server.Serve(listener) }()
-	connection, err := grpc.NewClient("passthrough:///test", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithInsecure())
+	connection, err := grpc.NewClient("passthrough:///test", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	return observationv1.NewObservationServiceClient(connection), func() {
 		_ = connection.Close()
