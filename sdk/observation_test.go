@@ -67,6 +67,15 @@ func TestAdminClientClusterStatusMapsStandaloneError(t *testing.T) {
 	require.Equal(t, []string{"CLUSTER_STATUS"}, receiveObservationCommands(t, commands))
 }
 
+func TestAdminClientClusterStatusPreservesNonStandaloneError(t *testing.T) {
+	client, commands := observationAdminClient(t, []string{"ERROR: not_authorized class=authorization retryable=false"})
+	_, err := client.ClusterStatus(context.Background())
+	var brokerErr *BrokerError
+	require.ErrorAs(t, err, &brokerErr)
+	require.Equal(t, "not_authorized", brokerErr.Code)
+	require.Equal(t, []string{"CLUSTER_STATUS"}, receiveObservationCommands(t, commands))
+}
+
 func TestAdminClientBrowseMessagesReadsBoundedFrames(t *testing.T) {
 	batch, err := EncodeBatchMessages("orders", 0, "all", false, []Message{{Offset: 9007199254740993, Key: "order-1", Payload: `{"id":"order-1"}`, Metadata: `{"source":"test"}`, EventType: "OrderCreated", SchemaVersion: 2, AggregateVersion: 4}})
 	require.NoError(t, err)
@@ -229,6 +238,39 @@ func TestAdminClientObservationCoversFeatureAndGroupOffsetEdges(t *testing.T) {
 		offsets, err := client.GroupOffsets(context.Background(), "workers", "orders")
 		require.NoError(t, err)
 		require.Equal(t, uint64(0), offsets[0].Lag)
+		require.Len(t, receiveObservationCommands(t, commands), 2)
+	})
+	t.Run("includes optional upper bounds", func(t *testing.T) {
+		browseBatch, err := EncodeBatchMessages("orders", 0, "all", false, nil)
+		require.NoError(t, err)
+		browseClient, browseCommands := observationFrameClient(t, "browse_messages_v1", `{"status":"OK"}`, browseBatch)
+		toOffset := uint64(4)
+		_, err = browseClient.BrowseMessages(context.Background(), BrowseRequest{Topic: "orders", Partition: 0, FromOffset: 1, ToOffset: &toOffset, MaxRecords: 1, MaxBytes: 1})
+		require.NoError(t, err)
+		require.Contains(t, receiveObservationCommands(t, browseCommands)[1], "to_offset=4")
+
+		historyBatch, err := EncodeBatchMessages("orders", 0, "all", false, nil)
+		require.NoError(t, err)
+		historyClient, historyCommands := observationFrameClient(t, "stream_history_v1", `{"status":"OK"}`, historyBatch)
+		toVersion := uint64(2)
+		_, err = historyClient.ReadStreamHistory(context.Background(), HistoryRequest{Topic: "orders", Key: "order-1", FromVersion: 1, ToVersion: &toVersion, MaxRecords: 1, MaxBytes: 1})
+		require.NoError(t, err)
+		require.Contains(t, receiveObservationCommands(t, historyCommands)[1], "to_version=2")
+	})
+	t.Run("rejects invalid identifiers before connecting", func(t *testing.T) {
+		client := &AdminClient{}
+		_, err := client.ListOffsets(context.Background(), "invalid topic")
+		require.ErrorContains(t, err, "invalid topic")
+		_, err = client.ReadSnapshot(context.Background(), "orders", "invalid key")
+		require.ErrorContains(t, err, "invalid snapshot key")
+	})
+	t.Run("rejects malformed group offset", func(t *testing.T) {
+		client, commands := observationAdminClient(t, []string{
+			"OK topic=orders partitions=1 offsets=P0:earliest=1:latest=8:leo=9:hwm=8",
+			"OK offset=not-a-number",
+		})
+		_, err := client.GroupOffsets(context.Background(), "workers", "orders")
+		require.ErrorContains(t, err, "invalid group offset")
 		require.Len(t, receiveObservationCommands(t, commands), 2)
 	})
 }

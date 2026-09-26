@@ -188,6 +188,18 @@ func TestAdminClientReturnsStructuredBrokerError(t *testing.T) {
 	require.False(t, brokerErr.Retryable)
 }
 
+func TestAdminClientParsesTextBrokerErrorFromOKFrame(t *testing.T) {
+	addr, result := startAdminTextErrorTestServer(t, "ERROR: topic_not_found class=validation retryable=false")
+	client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
+	require.NoError(t, err)
+
+	_, err = client.ListTopics(context.Background())
+	require.Equal(t, "LIST", receiveAdminTestCommand(t, result))
+	var brokerErr *BrokerError
+	require.ErrorAs(t, err, &brokerErr)
+	require.Equal(t, "topic_not_found", brokerErr.Code)
+}
+
 func startAdminCapabilityTestServer(t *testing.T, response string) (string, <-chan adminTestResult) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -293,6 +305,34 @@ func startAdminTestServer(t *testing.T, response string) (string, <-chan adminTe
 			return
 		}
 		result <- adminTestResult{command: command}
+	}()
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener.Addr().String(), result
+}
+
+// startAdminTextErrorTestServer emits a legacy text error inside an OK wire
+// frame. Older brokers used that representation, so executeOnce must parse it
+// before applying its normal successful-response validation.
+func startAdminTextErrorTestServer(t *testing.T, response string) (string, <-chan adminTestResult) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	result := make(chan adminTestResult, 1)
+	go func() {
+		defer close(result)
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			result <- adminTestResult{err: acceptErr}
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		connection, request, command, readErr := acceptWireTestRequest(conn)
+		if readErr != nil {
+			result <- adminTestResult{err: readErr}
+			return
+		}
+		writeErr := connection.WriteFrame(wire.Frame{Kind: wire.KindResponse, Command: request.Command, Status: wire.StatusOK, RequestID: request.RequestID, Payload: []byte(response)})
+		result <- adminTestResult{command: command, err: writeErr}
 	}()
 	t.Cleanup(func() { _ = listener.Close() })
 	return listener.Addr().String(), result

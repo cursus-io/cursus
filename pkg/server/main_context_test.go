@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,6 +68,22 @@ func TestRunServerContextReturnsCancellation(t *testing.T) {
 	cancel()
 	if err := RunServerContext(ctx, cfg, nil, nil, nil, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context cancellation, got %v", err)
+	}
+}
+
+func TestRunServerContextRejectsPartialObservationCredentials(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.BrokerPort = unusedTCPPort(t)
+	cfg.HealthCheckPort = unusedTCPPort(t)
+	cfg.ObservationGRPCPort = unusedTCPPort(t)
+	cfg.ObservationGRPCPrincipal = "observer"
+	cfg.LogDir = t.TempDir()
+	cfg.EnableExporter = false
+	cfg.EnabledDistribution = false
+
+	err := RunServerContext(context.Background(), cfg, nil, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "principal and auth token") {
+		t.Fatalf("expected partial observation credential error, got %v", err)
 	}
 }
 
