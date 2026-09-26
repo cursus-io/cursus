@@ -19,6 +19,7 @@ import (
 
 type testBackend struct {
 	offsets       []sdk.PartitionOffsetRange
+	groupOffsets  []sdk.GroupOffset
 	browse        sdk.BrowseRequest
 	browseResult  *sdk.BrowseResult
 	history       sdk.HistoryRequest
@@ -43,6 +44,9 @@ func (b *testBackend) ListGroups(context.Context) ([]string, error) {
 	return []string{"workers"}, b.err
 }
 func (b *testBackend) GroupOffsets(context.Context, string, string) ([]sdk.GroupOffset, error) {
+	if b.groupOffsets != nil {
+		return b.groupOffsets, b.err
+	}
 	return []sdk.GroupOffset{{Partition: 0, Offset: 11, Earliest: 1, Latest: 20, Lag: 9}}, b.err
 }
 func (b *testBackend) BrowseMessages(_ context.Context, request sdk.BrowseRequest) (*sdk.BrowseResult, error) {
@@ -345,6 +349,50 @@ func TestServiceRejectsBackendValuesThatDoNotFitProtoInt32(t *testing.T) {
 			defer cleanup()
 			err := test.call(client)
 			require.Equal(t, codes.Internal, status.Code(err))
+		})
+	}
+}
+
+func TestServiceRejectsInvalidClusterAndGroupOffsetValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		backend *testBackend
+		call    func(*Service) error
+	}{
+		{"group offset partition", &testBackend{groupOffsets: []sdk.GroupOffset{{Partition: -1}}}, func(service *Service) error {
+			_, err := service.ListGroupOffsets(context.Background(), &observationv1.ListGroupOffsetsRequest{Topic: "orders", Group: "workers"})
+			return err
+		}},
+		{"active broker count", &testBackend{cluster: &sdk.ClusterStatus{BrokerCount: 1, ActiveBrokers: -1}}, func(service *Service) error {
+			_, err := service.GetClusterStatus(context.Background(), &observationv1.GetClusterStatusRequest{})
+			return err
+		}},
+		{"inactive broker count", &testBackend{cluster: &sdk.ClusterStatus{BrokerCount: 1, ActiveBrokers: 1, InactiveBrokers: -1}}, func(service *Service) error {
+			_, err := service.GetClusterStatus(context.Background(), &observationv1.GetClusterStatusRequest{})
+			return err
+		}},
+		{"partition count", &testBackend{cluster: &sdk.ClusterStatus{BrokerCount: 1, ActiveBrokers: 1, PartitionCount: -1}}, func(service *Service) error {
+			_, err := service.GetClusterStatus(context.Background(), &observationv1.GetClusterStatusRequest{})
+			return err
+		}},
+		{"leaderless count", &testBackend{cluster: &sdk.ClusterStatus{BrokerCount: 1, ActiveBrokers: 1, Leaderless: -1}}, func(service *Service) error {
+			_, err := service.GetClusterStatus(context.Background(), &observationv1.GetClusterStatusRequest{})
+			return err
+		}},
+		{"under replicated count", &testBackend{cluster: &sdk.ClusterStatus{BrokerCount: 1, ActiveBrokers: 1, UnderReplicated: -1}}, func(service *Service) error {
+			_, err := service.GetClusterStatus(context.Background(), &observationv1.GetClusterStatusRequest{})
+			return err
+		}},
+		{"partition number", &testBackend{cluster: &sdk.ClusterStatus{BrokerCount: 1, ActiveBrokers: 1, Partitions: []sdk.ClusterPartition{{Partition: -1}}}}, func(service *Service) error {
+			_, err := service.GetClusterStatus(context.Background(), &observationv1.GetClusterStatusRequest{})
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, err := NewService(test.backend)
+			require.NoError(t, err)
+			require.Equal(t, codes.Internal, status.Code(test.call(service)))
 		})
 	}
 }

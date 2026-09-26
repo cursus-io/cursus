@@ -1,9 +1,17 @@
 package sdk
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
+
+func TestErrStandaloneBroker(t *testing.T) {
+	requireError := ErrStandaloneBroker{}
+	if !errors.Is(requireError, ErrStandaloneBroker{}) || requireError.Error() != "broker distribution is not enabled" {
+		t.Fatalf("unexpected standalone broker error: %v", requireError)
+	}
+}
 
 func TestParseClusterStatus(t *testing.T) {
 	value, err := parseClusterStatus(`OK cluster={"raft_leader":"broker-1","raft_state":"leader","broker_count":2,"active_brokers":2,"inactive_brokers":0,"partition_count":1,"leaderless_partitions":0,"under_replicated_partitions":0,"brokers":[{"id":"broker-1","status":"active","addr":"10.0.0.1:7000","client_addr":"broker-1:9000"},{"id":"broker-2","status":"active","addr":"10.0.0.2:7000"}],"partitions":[{"key":"orders-0","topic":"orders","partition":0,"leader":"broker-1","replicas":["broker-1","broker-2"],"isr":["broker-1","broker-2"],"leader_available":true,"under_replicated":false}]}`)
