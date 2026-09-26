@@ -16,3 +16,4 @@ ignore:
   - "manifests/**"
   - "**/bench/**"
   - "broker.go"
+  - "api/gen/**"

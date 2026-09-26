@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -160,6 +161,87 @@ func TestAdminClientRetriesHandshakeTransportFailureOnNextBroker(t *testing.T) {
 	require.Equal(t, "CREATE topic=orders", receiveAdminTestCommand(t, secondResult))
 }
 
+func TestAdminClientCapabilitiesUsesReadOnlyNegotiation(t *testing.T) {
+	addr, result := startAdminCapabilityTestServer(t, "OK protocol_version=1 enabled=browse_messages_v1,stream_history_v1 unsupported=")
+	client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
+	require.NoError(t, err)
+
+	capabilities, err := client.Capabilities(context.Background())
+	command := receiveAdminTestCommand(t, result)
+	require.NoError(t, err)
+	require.Equal(t, 1, capabilities.Version)
+	require.Equal(t, []string{"browse_messages_v1", "stream_history_v1"}, capabilities.Enabled)
+	require.Equal(t, "NEGOTIATE version=1 features=* require_features=false", command)
+}
+
+func TestAdminClientReturnsStructuredBrokerError(t *testing.T) {
+	addr, result := startAdminTestServer(t, "ERROR: topic_not_found class=validation retryable=false topic=orders")
+	client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
+	require.NoError(t, err)
+
+	_, err = client.ListTopics(context.Background())
+	require.Equal(t, "LIST", receiveAdminTestCommand(t, result))
+	var brokerErr *BrokerError
+	require.ErrorAs(t, err, &brokerErr)
+	require.Equal(t, "topic_not_found", brokerErr.Code)
+	require.Equal(t, "validation", string(brokerErr.Class))
+	require.False(t, brokerErr.Retryable)
+}
+
+func TestAdminClientParsesTextBrokerErrorFromOKFrame(t *testing.T) {
+	addr, result := startAdminTextErrorTestServer(t, "ERROR: topic_not_found class=validation retryable=false")
+	client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
+	require.NoError(t, err)
+
+	_, err = client.ListTopics(context.Background())
+	require.Equal(t, "LIST", receiveAdminTestCommand(t, result))
+	var brokerErr *BrokerError
+	require.ErrorAs(t, err, &brokerErr)
+	require.Equal(t, "topic_not_found", brokerErr.Code)
+}
+
+func startAdminCapabilityTestServer(t *testing.T, response string) (string, <-chan adminTestResult) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	result := make(chan adminTestResult, 1)
+	go func() {
+		defer close(result)
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			result <- adminTestResult{err: acceptErr}
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		connection, handshakeErr := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
+		if handshakeErr != nil {
+			result <- adminTestResult{err: handshakeErr}
+			return
+		}
+		request, readErr := connection.ReadFrame()
+		if readErr != nil {
+			result <- adminTestResult{err: readErr}
+			return
+		}
+		payload, decodeErr := wire.DecodeCommandPayload(request.Payload)
+		if decodeErr != nil {
+			result <- adminTestResult{err: decodeErr}
+			return
+		}
+		if request.Command != wire.CommandNegotiate {
+			result <- adminTestResult{err: fmt.Errorf("command = %s, want NEGOTIATE", request.Command)}
+			return
+		}
+		if writeErr := writeWireTestResponse(connection, request, response); writeErr != nil {
+			result <- adminTestResult{err: writeErr}
+			return
+		}
+		result <- adminTestResult{command: fmt.Sprintf("NEGOTIATE version=%s features=%s require_features=%s", payload.Fields["version"], payload.Fields["features"], payload.Fields["require_features"])}
+	}()
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener.Addr().String(), result
+}
+
 func TestAdminClientRetriesAmbiguousDeleteOnlyWhenExplicitlyIdempotent(t *testing.T) {
 	t.Run("non-idempotent delete stops with unknown outcome", func(t *testing.T) {
 		firstAddr, firstResult := startAdminCommandDropServer(t)
@@ -223,6 +305,34 @@ func startAdminTestServer(t *testing.T, response string) (string, <-chan adminTe
 			return
 		}
 		result <- adminTestResult{command: command}
+	}()
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener.Addr().String(), result
+}
+
+// startAdminTextErrorTestServer emits a legacy text error inside an OK wire
+// frame. Older brokers used that representation, so executeOnce must parse it
+// before applying its normal successful-response validation.
+func startAdminTextErrorTestServer(t *testing.T, response string) (string, <-chan adminTestResult) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	result := make(chan adminTestResult, 1)
+	go func() {
+		defer close(result)
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			result <- adminTestResult{err: acceptErr}
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		connection, request, command, readErr := acceptWireTestRequest(conn)
+		if readErr != nil {
+			result <- adminTestResult{err: readErr}
+			return
+		}
+		writeErr := connection.WriteFrame(wire.Frame{Kind: wire.KindResponse, Command: request.Command, Status: wire.StatusOK, RequestID: request.RequestID, Payload: []byte(response)})
+		result <- adminTestResult{command: command, err: writeErr}
 	}()
 	t.Cleanup(func() { _ = listener.Close() })
 	return listener.Addr().String(), result

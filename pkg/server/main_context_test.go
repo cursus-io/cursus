@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,6 +69,85 @@ func TestRunServerContextReturnsCancellation(t *testing.T) {
 	if err := RunServerContext(ctx, cfg, nil, nil, nil, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context cancellation, got %v", err)
 	}
+}
+
+func TestRunServerContextRejectsPartialObservationCredentials(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.BrokerPort = unusedTCPPort(t)
+	cfg.HealthCheckPort = unusedTCPPort(t)
+	cfg.ObservationGRPCPort = unusedTCPPort(t)
+	cfg.ObservationGRPCPrincipal = "observer"
+	cfg.LogDir = t.TempDir()
+	cfg.EnableExporter = false
+	cfg.EnabledDistribution = false
+
+	err := RunServerContext(context.Background(), cfg, nil, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "principal and auth token") {
+		t.Fatalf("expected partial observation credential error, got %v", err)
+	}
+}
+
+func TestStartObservationGRPCValidatesCredentialsAndLifecycle(t *testing.T) {
+	if _, err := startObservationGRPC(context.Background(), nil); err == nil {
+		t.Fatal("expected nil config to be rejected")
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.BrokerPort = 1
+	cfg.ObservationGRPCPort = unusedTCPPort(t)
+	cfg.ObservationGRPCPrincipal = "observer"
+	if _, err := startObservationGRPC(context.Background(), cfg); err == nil {
+		t.Fatal("expected partial observation credentials to be rejected")
+	}
+	occupied, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.ObservationGRPCPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := startObservationGRPC(context.Background(), cfg); err == nil {
+		_ = occupied.Close()
+		t.Fatal("expected occupied observation port to be rejected")
+	}
+	if err := occupied.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.ObservationGRPCPrincipal = ""
+	ctx, cancel := context.WithCancel(context.Background())
+	shutdown, err := startObservationGRPC(ctx, cfg)
+	if err != nil {
+		cancel()
+		t.Fatalf("start observation listener: %v", err)
+	}
+
+	connection, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.ObservationGRPCPort), time.Second)
+	if err != nil {
+		shutdown()
+		cancel()
+		t.Fatalf("dial observation listener: %v", err)
+	}
+	_ = connection.Close()
+	cancel()
+	shutdown()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		connection, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.ObservationGRPCPort), 50*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = connection.Close()
+	}
+	t.Fatal("observation listener remained open after shutdown")
+}
+
+func unusedTCPPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port
 }
 
 func TestInternalBrokerShutdownWaitsForWorkers(t *testing.T) {

@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package cursus.observation.v1;
+
+option go_package = "github.com/cursus-io/cursus/api/gen/go/cursus/observation/v1;observationv1";
+
+// ObservationService exposes only bounded, non-mutating broker queries.
+// It is deliberately separate from the Cursus data-plane protocol.
+service ObservationService {
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+  rpc ListTopics(ListTopicsRequest) returns (ListTopicsResponse);
+  rpc ListOffsets(ListOffsetsRequest) returns (ListOffsetsResponse);
+  rpc ListGroups(ListGroupsRequest) returns (ListGroupsResponse);
+  rpc ListGroupOffsets(ListGroupOffsetsRequest) returns (ListGroupOffsetsResponse);
+  rpc BrowseMessages(BrowseMessagesRequest) returns (BrowseMessagesResponse);
+  rpc ReadStreamHistory(ReadStreamHistoryRequest) returns (ReadStreamHistoryResponse);
+  rpc ReadSnapshot(ReadSnapshotRequest) returns (ReadSnapshotResponse);
+  rpc GetClusterStatus(GetClusterStatusRequest) returns (GetClusterStatusResponse);
+}
+
+message GetCapabilitiesRequest {}
+message GetCapabilitiesResponse {
+  int32 protocol_version = 1;
+  repeated string features = 2;
+}
+
+message ListTopicsRequest {}
+message ListTopicsResponse { repeated string topics = 1; }
+
+message ListOffsetsRequest { string topic = 1; }
+message PartitionOffset {
+  int32 partition = 1;
+  string earliest_offset = 2;
+  string latest_offset = 3;
+  string log_end_offset = 4;
+  string high_watermark = 5;
+}
+message ListOffsetsResponse { repeated PartitionOffset offsets = 1; }
+
+message ListGroupsRequest {}
+message ListGroupsResponse { repeated string groups = 1; }
+
+message ListGroupOffsetsRequest {
+  string group = 1;
+  string topic = 2;
+}
+message GroupOffset {
+  int32 partition = 1;
+  string committed_offset = 2;
+  string earliest_offset = 3;
+  string latest_offset = 4;
+  string lag = 5;
+}
+message ListGroupOffsetsResponse { repeated GroupOffset offsets = 1; }
+
+message BrowseMessagesRequest {
+  string topic = 1;
+  int32 partition = 2;
+  string from_offset = 3;
+  optional string to_offset = 4;
+  int32 max_records = 5;
+  int32 max_bytes = 6;
+}
+message Message {
+  string offset = 1;
+  string key = 2;
+  bytes payload = 3;
+  bytes metadata = 4;
+  string event_type = 5;
+  uint32 schema_version = 6;
+  string aggregate_version = 7;
+}
+message BrowseMessagesResponse {
+  repeated Message messages = 1;
+  string next_offset = 2;
+  string earliest_offset = 3;
+  string readable_end_offset = 4;
+  bool has_more = 5;
+}
+
+message ReadStreamHistoryRequest {
+  string topic = 1;
+  string key = 2;
+  string from_version = 3;
+  optional string to_version = 4;
+  int32 max_records = 5;
+  int32 max_bytes = 6;
+}
+message HistoryEvent {
+  string version = 1;
+  string event_type = 2;
+  bytes payload = 3;
+  bytes metadata = 4;
+  string offset = 5;
+  uint32 schema_version = 6;
+}
+message ReadStreamHistoryResponse {
+  repeated HistoryEvent events = 1;
+  string next_version = 2;
+  string head_version = 3;
+  string completeness = 4;
+  bool has_more = 5;
+}
+
+message ReadSnapshotRequest {
+  string topic = 1;
+  string key = 2;
+}
+message ReadSnapshotResponse {
+  bool found = 1;
+  string version = 2;
+  bytes state = 3;
+}
+
+message GetClusterStatusRequest {}
+message ClusterBroker {
+  string id = 1;
+  string status = 2;
+  string address = 3;
+}
+message ClusterPartition {
+  string key = 1;
+  string topic = 2;
+  int32 partition = 3;
+  string leader = 4;
+  repeated string replicas = 5;
+  repeated string in_sync_replicas = 6;
+  bool leader_available = 7;
+  bool under_replicated = 8;
+}
+message GetClusterStatusResponse {
+  string raft_leader = 1;
+  string raft_state = 2;
+  int32 broker_count = 3;
+  int32 active_brokers = 4;
+  int32 inactive_brokers = 5;
+  int32 partition_count = 6;
+  int32 leaderless_partitions = 7;
+  int32 under_replicated_partitions = 8;
+  repeated ClusterBroker brokers = 9;
+  repeated ClusterPartition partitions = 10;
+}
