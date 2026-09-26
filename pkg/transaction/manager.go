@@ -88,11 +88,12 @@ type Participant struct {
 // chosen by the broker. It makes a retry of an accepted transactional request
 // reuse the original idempotent identity after coordinator recovery.
 type RequestAssignment struct {
-	Topic          string `json:"topic"`
-	ClientSequence uint64 `json:"client_sequence"`
-	Partition      int    `json:"partition"`
-	Sequence       uint64 `json:"sequence"`
-	Fingerprint    string `json:"fingerprint"`
+	Topic              string `json:"topic"`
+	RequestedPartition int    `json:"requested_partition"`
+	ClientSequence     uint64 `json:"client_sequence"`
+	Partition          int    `json:"partition"`
+	Sequence           uint64 `json:"sequence"`
+	Fingerprint        string `json:"fingerprint"`
 }
 
 type Transaction struct {
@@ -478,8 +479,8 @@ func (m *Manager) AddMessage(id, producer string, epoch int64, op MessageOperati
 // FindRequestAssignment returns a durable broker assignment for an identical
 // client request. A changed request using the same client topic sequence is
 // rejected rather than being treated as a new publish.
-func (m *Manager) FindRequestAssignment(id, producer string, epoch int64, topic string, clientSequence uint64, fingerprint string) (RequestAssignment, bool, error) {
-	if topic == "" || clientSequence == 0 || fingerprint == "" {
+func (m *Manager) FindRequestAssignment(id, producer string, epoch int64, topic string, requestedPartition int, clientSequence uint64, fingerprint string) (RequestAssignment, bool, error) {
+	if topic == "" || requestedPartition < -1 || clientSequence == 0 || fingerprint == "" {
 		return RequestAssignment{}, false, fmt.Errorf("invalid transaction request assignment")
 	}
 	s := m.shardForID(id)
@@ -492,7 +493,7 @@ func (m *Manager) FindRequestAssignment(id, producer string, epoch int64, topic 
 	if err := validateOwner(tx, producer, epoch); err != nil {
 		return RequestAssignment{}, false, err
 	}
-	existing, ok := tx.RequestAssignments[transactionRequestKey(topic, clientSequence)]
+	existing, ok := tx.RequestAssignments[transactionRequestKey(topic, requestedPartition, clientSequence)]
 	if !ok {
 		return RequestAssignment{}, false, nil
 	}
@@ -505,8 +506,8 @@ func (m *Manager) FindRequestAssignment(id, producer string, epoch int64, topic 
 // ResolveRequestAssignment returns the existing broker assignment for an
 // identical client request, or records a new assignment after the broker has
 // selected the concrete partition.
-func (m *Manager) ResolveRequestAssignment(id, producer string, epoch int64, topic string, clientSequence uint64, partition int, fingerprint string) (RequestAssignment, bool, error) {
-	if topic == "" || clientSequence == 0 || partition < 0 || fingerprint == "" {
+func (m *Manager) ResolveRequestAssignment(id, producer string, epoch int64, topic string, requestedPartition int, clientSequence uint64, partition int, fingerprint string) (RequestAssignment, bool, error) {
+	if topic == "" || requestedPartition < -1 || clientSequence == 0 || partition < 0 || fingerprint == "" {
 		return RequestAssignment{}, false, fmt.Errorf("invalid transaction request assignment")
 	}
 	s := m.shardForID(id)
@@ -519,7 +520,7 @@ func (m *Manager) ResolveRequestAssignment(id, producer string, epoch int64, top
 	if err := validateOwner(tx, producer, epoch); err != nil {
 		return RequestAssignment{}, false, err
 	}
-	requestKey := transactionRequestKey(topic, clientSequence)
+	requestKey := transactionRequestKey(topic, requestedPartition, clientSequence)
 	if existing, ok := tx.RequestAssignments[requestKey]; ok {
 		if existing.Fingerprint != fingerprint {
 			return RequestAssignment{}, false, fmt.Errorf("transaction request conflicts with existing client sequence topic=%s seq_num=%d", topic, clientSequence)
@@ -534,15 +535,15 @@ func (m *Manager) ResolveRequestAssignment(id, producer string, epoch int64, top
 	}
 	partitionKey := fmt.Sprintf("%s:%d", topic, partition)
 	tx.SequenceByPartition[partitionKey]++
-	assignment := RequestAssignment{Topic: topic, ClientSequence: clientSequence, Partition: partition, Sequence: tx.SequenceByPartition[partitionKey], Fingerprint: fingerprint}
+	assignment := RequestAssignment{Topic: topic, RequestedPartition: requestedPartition, ClientSequence: clientSequence, Partition: partition, Sequence: tx.SequenceByPartition[partitionKey], Fingerprint: fingerprint}
 	tx.RequestAssignments[requestKey] = assignment
 	tx.Revision++
 	tx.UpdatedAt = time.Now()
 	return assignment, false, nil
 }
 
-func transactionRequestKey(topic string, clientSequence uint64) string {
-	return fmt.Sprintf("%d:%s:%d", len(topic), topic, clientSequence)
+func transactionRequestKey(topic string, requestedPartition int, clientSequence uint64) string {
+	return fmt.Sprintf("%d:%s:%d:%d", len(topic), topic, requestedPartition, clientSequence)
 }
 
 // AddStream reserves one event-stream version for an open transaction.  The

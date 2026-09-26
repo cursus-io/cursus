@@ -73,28 +73,28 @@ func TestManagerPersistsTransactionalRequestAssignments(t *testing.T) {
 	if err := m.Begin("tx-partition-sequences", producer, epoch); err != nil {
 		t.Fatal(err)
 	}
-	first, replay, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", 1, 0, "first")
+	first, replay, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", -1, 1, 0, "first")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if replay || first.Sequence != 1 || first.Partition != 0 {
 		t.Fatalf("unexpected first assignment: %+v replay=%t", first, replay)
 	}
-	otherPartition, replay, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", 2, 1, "second")
+	otherPartition, replay, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", 1, 1, 1, "second")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if replay || otherPartition.Sequence != 1 || otherPartition.Partition != 1 {
 		t.Fatalf("unexpected second-partition assignment: %+v replay=%t", otherPartition, replay)
 	}
-	retry, replay, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", 1, 1, "first")
+	retry, replay, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", -1, 1, 1, "first")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !replay || retry != first {
 		t.Fatalf("retry did not reuse assignment: first=%+v retry=%+v replay=%t", first, retry, replay)
 	}
-	if _, _, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", 1, 0, "changed"); err == nil {
+	if _, _, err := m.ResolveRequestAssignment("tx-partition-sequences", producer, epoch, "history", -1, 1, 0, "changed"); err == nil {
 		t.Fatal("expected conflicting request fingerprint to be rejected")
 	}
 	tx, err := m.Status("tx-partition-sequences")
@@ -102,7 +102,7 @@ func TestManagerPersistsTransactionalRequestAssignments(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored := transactionFromSnapshot(snapshot(tx))
-	if restored.SequenceByPartition["history:1"] != 1 || restored.RequestAssignments[transactionRequestKey("history", 1)] != first {
+	if restored.SequenceByPartition["history:1"] != 1 || restored.RequestAssignments[transactionRequestKey("history", -1, 1)] != first {
 		t.Fatalf("transaction snapshot lost request assignment state: sequences=%+v assignments=%+v", restored.SequenceByPartition, restored.RequestAssignments)
 	}
 }

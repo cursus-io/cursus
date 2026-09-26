@@ -207,6 +207,7 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 			producerID,
 			epoch,
 			topicName,
+			requestedPartition,
 			clientSequence,
 			partition,
 			fingerprintTransactionRequest(transactionRequestFingerprint{
@@ -342,6 +343,7 @@ func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*C
 		producerID,
 		epoch,
 		topicName,
+		-1,
 		clientSequence,
 		fingerprint,
 	)
@@ -373,6 +375,7 @@ func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*C
 		producerID,
 		epoch,
 		topicName,
+		-1,
 		clientSequence,
 		partition,
 		fingerprint,
