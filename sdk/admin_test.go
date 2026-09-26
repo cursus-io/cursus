@@ -174,6 +174,20 @@ func TestAdminClientCapabilitiesUsesReadOnlyNegotiation(t *testing.T) {
 	require.Equal(t, "NEGOTIATE version=1 features=* require_features=false", command)
 }
 
+func TestAdminClientReturnsStructuredBrokerError(t *testing.T) {
+	addr, result := startAdminTestServer(t, "ERROR: topic_not_found class=validation retryable=false topic=orders")
+	client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
+	require.NoError(t, err)
+
+	_, err = client.ListTopics(context.Background())
+	require.Equal(t, "LIST", receiveAdminTestCommand(t, result))
+	var brokerErr *BrokerError
+	require.ErrorAs(t, err, &brokerErr)
+	require.Equal(t, "topic_not_found", brokerErr.Code)
+	require.Equal(t, "validation", string(brokerErr.Class))
+	require.False(t, brokerErr.Retryable)
+}
+
 func startAdminCapabilityTestServer(t *testing.T, response string) (string, <-chan adminTestResult) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

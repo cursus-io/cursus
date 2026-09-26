@@ -70,6 +70,69 @@ func TestRunServerContextReturnsCancellation(t *testing.T) {
 	}
 }
 
+func TestStartObservationGRPCValidatesCredentialsAndLifecycle(t *testing.T) {
+	if _, err := startObservationGRPC(context.Background(), nil); err == nil {
+		t.Fatal("expected nil config to be rejected")
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.BrokerPort = 1
+	cfg.ObservationGRPCPort = unusedTCPPort(t)
+	cfg.ObservationGRPCPrincipal = "observer"
+	if _, err := startObservationGRPC(context.Background(), cfg); err == nil {
+		t.Fatal("expected partial observation credentials to be rejected")
+	}
+	occupied, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.ObservationGRPCPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := startObservationGRPC(context.Background(), cfg); err == nil {
+		_ = occupied.Close()
+		t.Fatal("expected occupied observation port to be rejected")
+	}
+	if err := occupied.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.ObservationGRPCPrincipal = ""
+	ctx, cancel := context.WithCancel(context.Background())
+	shutdown, err := startObservationGRPC(ctx, cfg)
+	if err != nil {
+		cancel()
+		t.Fatalf("start observation listener: %v", err)
+	}
+
+	connection, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.ObservationGRPCPort), time.Second)
+	if err != nil {
+		shutdown()
+		cancel()
+		t.Fatalf("dial observation listener: %v", err)
+	}
+	_ = connection.Close()
+	cancel()
+	shutdown()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		connection, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.ObservationGRPCPort), 50*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = connection.Close()
+	}
+	t.Fatal("observation listener remained open after shutdown")
+}
+
+func unusedTCPPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port
+}
+
 func TestInternalBrokerShutdownWaitsForWorkers(t *testing.T) {
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

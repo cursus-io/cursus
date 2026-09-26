@@ -256,18 +256,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		defer shutdownInternal()
 	}
 	if cfg.ObservationGRPCPort > 0 {
-		if (cfg.ObservationGRPCPrincipal == "") != (cfg.ObservationGRPCAuthToken == "") {
-			return fmt.Errorf("observation gRPC principal and auth token must be configured together")
-		}
-		backend, err := sdk.NewAdminClient(&sdk.AdminConfig{
-			BrokerAddrs: []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.BrokerPort))},
-			UseTLS:      cfg.UseTLS, TLSCertPath: cfg.TLSCertPath, TLSKeyPath: cfg.TLSKeyPath,
-			Principal: cfg.ObservationGRPCPrincipal, AuthToken: cfg.ObservationGRPCAuthToken,
-		})
-		if err != nil {
-			return fmt.Errorf("create observation gRPC backend: %w", err)
-		}
-		shutdownObservation, err := observationgrpc.Start(ctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.ObservationGRPCPort)), backend)
+		shutdownObservation, err := startObservationGRPC(ctx, cfg)
 		if err != nil {
 			return err
 		}
@@ -388,6 +377,31 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			return ctx.Err()
 		}
 	}
+}
+
+// startObservationGRPC creates the loopback-only observation adapter used by
+// the broker process. Keeping the listener setup separate from RunServerContext
+// makes its security configuration and lifecycle independently testable.
+func startObservationGRPC(ctx context.Context, cfg *config.Config) (func(), error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("observation gRPC config is nil")
+	}
+	if (cfg.ObservationGRPCPrincipal == "") != (cfg.ObservationGRPCAuthToken == "") {
+		return nil, fmt.Errorf("observation gRPC principal and auth token must be configured together")
+	}
+	backend, err := sdk.NewAdminClient(&sdk.AdminConfig{
+		BrokerAddrs: []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.BrokerPort))},
+		UseTLS:      cfg.UseTLS, TLSCertPath: cfg.TLSCertPath, TLSKeyPath: cfg.TLSKeyPath,
+		Principal: cfg.ObservationGRPCPrincipal, AuthToken: cfg.ObservationGRPCAuthToken,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create observation gRPC backend: %w", err)
+	}
+	shutdown, err := observationgrpc.Start(ctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.ObservationGRPCPort)), backend)
+	if err != nil {
+		return nil, err
+	}
+	return shutdown, nil
 }
 
 func closeListenerOnDone(ctx context.Context, ln net.Listener) {

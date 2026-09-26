@@ -99,6 +99,87 @@ func TestAdminClientObservationRejectsInvalidRequestsBeforeConnecting(t *testing
 	require.ErrorContains(t, err, "invalid group")
 }
 
+func TestNegotiateProtocolCoversFeatureAndResponseFailures(t *testing.T) {
+	t.Run("decodes capability response", func(t *testing.T) {
+		addr, result := startAdminCapabilityTestServer(t, "OK protocol_version=3 enabled=alpha,zeta unsupported=")
+		client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
+		require.NoError(t, err)
+		response, err := client.Capabilities(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, &NegotiatedProtocol{Version: 3, Enabled: []string{"alpha", "zeta"}}, response)
+		require.Equal(t, "NEGOTIATE version=1 features=* require_features=false", receiveAdminTestCommand(t, result))
+	})
+	t.Run("rejects wildcard among multiple features", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		_, err := NegotiateProtocol(client, ProtocolNegotiation{Features: []string{"*", "browse_messages_v1"}})
+		require.ErrorContains(t, err, "invalid protocol feature request")
+	})
+	t.Run("preserves broker errors", func(t *testing.T) {
+		addr, result := startAdminCapabilityTestServer(t, "ERROR: unsupported_feature class=validation retryable=false")
+		client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
+		require.NoError(t, err)
+		_, err = client.Capabilities(context.Background())
+		var brokerErr *BrokerError
+		require.ErrorAs(t, err, &brokerErr)
+		require.Equal(t, "unsupported_feature", brokerErr.Code)
+		require.Equal(t, "NEGOTIATE version=1 features=* require_features=false", receiveAdminTestCommand(t, result))
+	})
+	t.Run("rejects malformed response", func(t *testing.T) {
+		addr, result := startAdminCapabilityTestServer(t, "OK protocol_version=0 enabled= unsupported=")
+		client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
+		require.NoError(t, err)
+		_, err = client.Capabilities(context.Background())
+		require.ErrorContains(t, err, "invalid negotiated protocol version")
+		require.Equal(t, "NEGOTIATE version=1 features=* require_features=false", receiveAdminTestCommand(t, result))
+	})
+}
+
+func TestAdminClientObservationFramesRejectBrokerAndEnvelopeFailures(t *testing.T) {
+	t.Run("broker error", func(t *testing.T) {
+		client, commands := observationFrameClient(t, "browse_messages_v1", `{"status":"ERROR","error":"not_authorized class=authorization retryable=false"}`, []byte("unused"))
+		_, err := client.BrowseMessages(context.Background(), BrowseRequest{Topic: "orders", Partition: 0, FromOffset: 1, MaxRecords: 1, MaxBytes: 1})
+		var brokerErr *BrokerError
+		require.ErrorAs(t, err, &brokerErr)
+		require.Equal(t, "not_authorized", brokerErr.Code)
+		require.NotEmpty(t, receiveObservationCommands(t, commands))
+	})
+	t.Run("non-OK envelope", func(t *testing.T) {
+		batch, err := EncodeBatchMessages("orders", 0, "all", false, nil)
+		require.NoError(t, err)
+		client, commands := observationFrameClient(t, "stream_history_v1", `{"status":"PENDING","error":"not ready"}`, batch)
+		_, err = client.ReadStreamHistory(context.Background(), HistoryRequest{Topic: "orders", Key: "order-1", FromVersion: 1, MaxRecords: 1, MaxBytes: 1})
+		var brokerErr *BrokerError
+		require.ErrorAs(t, err, &brokerErr)
+		require.Equal(t, "not", brokerErr.Code)
+		require.NotEmpty(t, receiveObservationCommands(t, commands))
+	})
+}
+
+func TestAdminClientObservationHandlesEmptySnapshotAndMissingConfiguration(t *testing.T) {
+	client, commands := observationAdminClient(t, []string{"OK snapshot=null"})
+	snapshot, err := client.ReadSnapshot(context.Background(), "orders", "order-1")
+	require.NoError(t, err)
+	require.Nil(t, snapshot)
+	require.Equal(t, []string{"READ_SNAPSHOT topic=orders key=order-1"}, receiveObservationCommands(t, commands))
+
+	_, err = withObservationConnection(context.Background(), nil, func(net.Conn) (string, error) { return "", nil })
+	require.ErrorContains(t, err, "not configured")
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = withObservationConnection(canceled, &AdminClient{config: AdminConfig{BrokerAddrs: []string{"127.0.0.1:1"}}}, func(net.Conn) (string, error) { return "", nil })
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestObservationFrameErrorPreservesStructuredErrors(t *testing.T) {
+	err := observationFrameError("validation_failed class=validation retryable=false")
+	var brokerErr *BrokerError
+	require.ErrorAs(t, err, &brokerErr)
+	require.Equal(t, "validation_failed", brokerErr.Code)
+	require.ErrorContains(t, observationFrameError(""), "broker: ")
+}
+
 func observationAdminClient(t *testing.T, responses []string) (*AdminClient, <-chan []string) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
