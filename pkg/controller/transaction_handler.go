@@ -259,8 +259,7 @@ func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*C
 	if errResp != "" {
 		return errResp
 	}
-	seqNum, err := parseRequiredPositiveUint64(args["seqNum"])
-	if err != nil {
+	if _, err := parseRequiredPositiveUint64(args["seqNum"]); err != nil {
 		return fmt.Sprintf("ERROR: invalid_seq_num command=TXN_APPEND_STREAM reason=%q", err.Error())
 	}
 
@@ -280,10 +279,6 @@ func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*C
 	partition := t.GetPartitionForMessage(types.Message{Key: key})
 	if _, err := t.GetPartition(partition); err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
-	}
-	seqNum, err = ch.TxnManager.NextPartitionSequence(txnID, producerID, epoch, topicName, partition)
-	if err != nil {
-		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
 	}
 	if resp := ch.reconcileEventSourceIndex(topicName, partition); resp != "" {
 		return resp
@@ -307,6 +302,11 @@ func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*C
 		}
 		schemaVersion = uint32(parsed)
 	}
+	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
+	seqNum, err := ch.TxnManager.NextPartitionSequence(txnID, producerID, epoch, topicName, partition)
+	if err != nil {
+		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
+	}
 	message := types.Message{
 		Payload:          payload,
 		Key:              key,
@@ -321,8 +321,8 @@ func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*C
 		Metadata:         args["metadata"],
 	}
 
-	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
 	if err := ch.TxnManager.AddParticipant(txnID, producerID, epoch, transaction.Participant{Topic: topicName, Partition: partition}, time.Time{}); err != nil {
+		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
 		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
 	}
 	operation := transaction.StreamOperation{Topic: topicName, Partition: partition, Key: key, ExpectedVersion: expectedVersion, Message: message}
