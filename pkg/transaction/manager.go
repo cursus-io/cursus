@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"sync"
 	"time"
@@ -98,6 +99,7 @@ type Transaction struct {
 	Streams             []StreamOperation
 	Offsets             []OffsetOperation
 	Participants        []Participant
+	SequenceByPartition map[string]uint64
 	Deadline            time.Time
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
@@ -118,6 +120,7 @@ type Snapshot struct {
 	Streams             []StreamOperation  `json:"streams,omitempty"`
 	Offsets             []OffsetOperation  `json:"offsets,omitempty"`
 	Participants        []Participant      `json:"participants,omitempty"`
+	SequenceByPartition map[string]uint64  `json:"sequence_by_partition,omitempty"`
 	Deadline            time.Time          `json:"deadline,omitempty"`
 	CreatedAt           time.Time          `json:"created_at"`
 	UpdatedAt           time.Time          `json:"updated_at"`
@@ -457,6 +460,33 @@ func (m *Manager) AddMessage(id, producer string, epoch int64, op MessageOperati
 	tx.Revision++
 	tx.UpdatedAt = time.Now()
 	return nil
+}
+
+// NextPartitionSequence allocates an idempotent sequence after the broker has
+// selected the concrete partition.  Transactional processing clients may use
+// automatic routing, for which a topic-only client counter is not sufficient.
+func (m *Manager) NextPartitionSequence(id, producer string, epoch int64, topic string, partition int) (uint64, error) {
+	if topic == "" || partition < 0 {
+		return 0, fmt.Errorf("invalid transaction sequence scope")
+	}
+	s := m.shardForID(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := activeLocked(s, id)
+	if err != nil {
+		return 0, err
+	}
+	if err := validateOwner(tx, producer, epoch); err != nil {
+		return 0, err
+	}
+	if tx.SequenceByPartition == nil {
+		tx.SequenceByPartition = make(map[string]uint64)
+	}
+	key := fmt.Sprintf("%s:%d", topic, partition)
+	tx.SequenceByPartition[key]++
+	tx.Revision++
+	tx.UpdatedAt = time.Now()
+	return tx.SequenceByPartition[key], nil
 }
 
 // AddStream reserves one event-stream version for an open transaction.  The
@@ -1134,6 +1164,7 @@ func snapshot(tx *Transaction) *Snapshot {
 		Streams:             append([]StreamOperation(nil), tx.Streams...),
 		Offsets:             append([]OffsetOperation(nil), tx.Offsets...),
 		Participants:        append([]Participant(nil), tx.Participants...),
+		SequenceByPartition: maps.Clone(tx.SequenceByPartition),
 		Deadline:            tx.Deadline,
 		CreatedAt:           tx.CreatedAt,
 		UpdatedAt:           tx.UpdatedAt,
@@ -1156,6 +1187,7 @@ func transactionFromSnapshot(snap *Snapshot) *Transaction {
 		Streams:             append([]StreamOperation(nil), snap.Streams...),
 		Offsets:             append([]OffsetOperation(nil), snap.Offsets...),
 		Participants:        append([]Participant(nil), snap.Participants...),
+		SequenceByPartition: maps.Clone(snap.SequenceByPartition),
 		Deadline:            snap.Deadline,
 		CreatedAt:           snap.CreatedAt,
 		UpdatedAt:           snap.UpdatedAt,

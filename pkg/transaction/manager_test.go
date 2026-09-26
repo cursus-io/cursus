@@ -64,6 +64,39 @@ func TestManagerRequiresNewEpochForSequentialTransactions(t *testing.T) {
 	}
 }
 
+func TestManagerAllocatesTransactionalSequencesPerResolvedPartition(t *testing.T) {
+	m := NewManager()
+	producer, epoch, err := m.InitProducerWithMode("tx-partition-sequences", ModeProcessingV1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Begin("tx-partition-sequences", producer, epoch); err != nil {
+		t.Fatal(err)
+	}
+	first, err := m.NextPartitionSequence("tx-partition-sequences", producer, epoch, "history", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPartition, err := m.NextPartitionSequence("tx-partition-sequences", producer, epoch, "history", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.NextPartitionSequence("tx-partition-sequences", producer, epoch, "history", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 1 || otherPartition != 1 || second != 2 {
+		t.Fatalf("unexpected partition sequences: first=%d other=%d second=%d", first, otherPartition, second)
+	}
+	tx, err := m.Status("tx-partition-sequences")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored := transactionFromSnapshot(snapshot(tx)); restored.SequenceByPartition["history:1"] != 1 {
+		t.Fatalf("transaction snapshot lost partition sequence state: %+v", restored.SequenceByPartition)
+	}
+}
+
 func TestManagerPreservesProducerEpochWhenExpiredIDIsReinitialized(t *testing.T) {
 	m := NewManagerWithExpiration(time.Hour)
 	old := time.Now().Add(-2 * time.Hour)

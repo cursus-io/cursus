@@ -109,7 +109,10 @@ func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, err
 		return nil, fmt.Errorf("partition lookup for stream index %s:%d: %w", topicName, partitionID, err)
 	}
 	h.indexes[key] = idx
-	h.indexedHWM[key] = p.GetHWM()
+	// Recovery reads only the stable committed prefix. Never claim that an
+	// unresolved transactional tail has been indexed merely because it is in
+	// the partition HWM.
+	h.indexedHWM[key] = p.LastStableOffset()
 	return idx, nil
 }
 
@@ -212,6 +215,7 @@ func (h *Handler) IndexCommittedToHWM(topicName string, partitionID int, targetH
 	}
 
 	const batchSize = 256
+	indexedUntil := start
 	for offset := start; offset < scanEnd; {
 		msgs, err := p.ReadCommitted(offset, batchSize)
 		if err != nil {
@@ -239,11 +243,12 @@ func (h *Handler) IndexCommittedToHWM(topicName string, partitionID int, targetH
 			return fmt.Errorf("stream index scan did not advance from offset %d", offset)
 		}
 		offset = next
+		indexedUntil = next
 	}
 
 	h.mu.Lock()
-	if h.indexedHWM[key] < scanEnd {
-		h.indexedHWM[key] = scanEnd
+	if h.indexedHWM[key] < indexedUntil {
+		h.indexedHWM[key] = indexedUntil
 	}
 	h.mu.Unlock()
 	return nil
@@ -492,7 +497,7 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 
 	indexKey := topicName + ":" + strconv.Itoa(partitionID)
 	h.mu.Lock()
-	if committed := p.GetHWM(); h.indexedHWM[indexKey] < committed {
+	if committed := p.LastStableOffset(); h.indexedHWM[indexKey] < committed {
 		h.indexedHWM[indexKey] = committed
 	}
 	h.mu.Unlock()

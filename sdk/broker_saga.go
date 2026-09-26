@@ -233,7 +233,17 @@ func (r *BrokerSagaRuntime) load(sagaID, runID string) (BrokerSagaStateRecord, u
 		return BrokerSagaStateRecord{}, 0, fmt.Errorf("read broker saga state stream: %w", err)
 	}
 	if len(stream.Events) == 0 {
-		return BrokerSagaStateRecord{}, 0, nil
+		if stream.Snapshot == nil {
+			return BrokerSagaStateRecord{}, 0, nil
+		}
+		var record BrokerSagaStateRecord
+		if err := json.Unmarshal([]byte(stream.Snapshot.Payload), &record); err != nil {
+			return BrokerSagaStateRecord{}, 0, fmt.Errorf("decode broker saga state snapshot: %w", err)
+		}
+		if record.SchemaVersion != 1 || record.SagaType != r.config.SagaType || record.SagaID != sagaID || record.RunID != runID {
+			return BrokerSagaStateRecord{}, 0, fmt.Errorf("broker saga state snapshot identity mismatch")
+		}
+		return record, stream.Snapshot.Version, nil
 	}
 	last := stream.Events[len(stream.Events)-1]
 	var record BrokerSagaStateRecord
