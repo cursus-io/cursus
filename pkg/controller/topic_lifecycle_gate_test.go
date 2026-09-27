@@ -31,8 +31,13 @@ func TestTopicLifecycleGateSeparatesTopicsAndCancelsWaiters(t *testing.T) {
 	for {
 		gates.mu.Lock()
 		entry := gates.byName["topic-a"]
-		waiting := entry != nil && entry.gate.waitingWriters > 0
 		gates.mu.Unlock()
+		waiting := false
+		if entry != nil {
+			entry.gate.mu.Lock()
+			waiting = entry.gate.waitingWriters > 0
+			entry.gate.mu.Unlock()
+		}
 		if waiting {
 			break
 		}
@@ -78,8 +83,13 @@ func TestTopicLifecycleWriterExcludesNewReaders(t *testing.T) {
 	for {
 		gates.mu.Lock()
 		entry := gates.byName["orders"]
-		waiting := entry != nil && entry.gate.waitingWriters > 0
 		gates.mu.Unlock()
+		waiting := false
+		if entry != nil {
+			entry.gate.mu.Lock()
+			waiting = entry.gate.waitingWriters > 0
+			entry.gate.mu.Unlock()
+		}
 		if waiting {
 			break
 		}
