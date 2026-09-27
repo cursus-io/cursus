@@ -601,7 +601,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 	if authResp != "" {
 		return authResp, nil
 	}
-	requestCtx = clientCtx.RequestContext()
+	requestCtx := clientCtx.RequestContext()
 	releaseLifecycle, lockErr := ch.topicLifecycleGates.acquire(requestCtx, batch.Topic, false)
 	if lockErr != nil {
 		return "ERROR: request_cancelled", nil
