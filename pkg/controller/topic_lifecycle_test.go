@@ -225,7 +225,9 @@ func TestInternalRaftTopicLifecycleApplyUsesExclusiveGate(t *testing.T) {
 		command string
 	}{
 		{name: "delete", command: `RAFT_APPLY internal_token=secret-token type=TOPIC_DELETE payload={"topic":"orders","if_exists":false}`},
+		{name: "delete accepts JSON field casing", command: `RAFT_APPLY internal_token=secret-token type=TOPIC_DELETE payload={"Topic":"orders","IfExists":false}`},
 		{name: "truncate", command: `RAFT_APPLY internal_token=secret-token type=TOPIC_TRUNCATE payload={"topic":"orders","expected_revision":1}`},
+		{name: "truncate accepts topic field casing", command: `RAFT_APPLY internal_token=secret-token type=TOPIC_TRUNCATE payload={"Topic":"orders","expected_revision":1}`},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			handler, _, _ := newDistributedLifecycleHandler(t)

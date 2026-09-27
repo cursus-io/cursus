@@ -25,12 +25,11 @@ func lifecycleTopicName(input commandInput) string {
 			return snapshot.Topic
 		}
 	case "RAFT_APPLY":
-		var payload map[string]json.RawMessage
+		var payload struct {
+			Topic string `json:"topic"`
+		}
 		if json.Unmarshal([]byte(commandPayload(input.Raw)), &payload) == nil {
-			var topicName string
-			if json.Unmarshal(payload["topic"], &topicName) == nil {
-				return topicName
-			}
+			return payload.Topic
 		}
 	}
 	return ""
