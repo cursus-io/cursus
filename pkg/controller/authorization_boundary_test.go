@@ -1,10 +1,15 @@
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
+	"github.com/stretchr/testify/require"
 )
 
 func authorizationHandler(t *testing.T, users []config.SASLUser) *CommandHandler {
@@ -138,4 +143,59 @@ func TestEmptyPermissionListDeniesProtectedCommands(t *testing.T) {
 	if !strings.Contains(resp, "permission=admin") {
 		t.Fatalf("user with omitted permissions accessed a protected command: %s", resp)
 	}
+}
+
+func TestBatchPublishUsesPublishAuthenticationAndPermission(t *testing.T) {
+	ch, topics := newTestHandler(t)
+	require.NoError(t, topics.CreateTopic("orders", 1, false, false))
+	ch.Config.EnableSASL = true
+	ch.Config.SASLUsers = []config.SASLUser{
+		{Principal: "reader", Token: "read-secret", Permissions: []string{PermissionTopicRead}},
+		{Principal: "writer", Token: "write-secret", Permissions: []string{PermissionTopicWrite}},
+	}
+	batch, err := util.EncodeBatchMessages("orders", 0, "1", false, []types.Message{{ProducerID: "p1", SeqNum: 1, Payload: "body"}})
+	require.NoError(t, err)
+
+	response, err := ch.HandleBatchMessage(batch, nil, NewClientContext("", 0))
+	require.NoError(t, err)
+	require.Contains(t, response, "authentication_required")
+
+	reader := authenticateTestUser(t, ch, "reader", "read-secret")
+	response, err = ch.HandleBatchMessage(batch, nil, reader)
+	require.NoError(t, err)
+	require.Contains(t, response, "permission=topic.write")
+
+	writer := authenticateTestUser(t, ch, "writer", "write-secret")
+	response, err = ch.HandleBatchMessage(batch, nil, writer)
+	require.NoError(t, err)
+	require.Contains(t, response, `"status":"OK"`)
+}
+
+func TestUnauthorizedDeleteIsRejectedBeforeLifecycleWait(t *testing.T) {
+	ch, topics := newTestHandler(t)
+	require.NoError(t, topics.CreateTopic("orders", 1, false, false))
+	ch.Config.EnableSASL = true
+	ch.Config.SASLUsers = []config.SASLUser{{Principal: "reader", Token: "read-secret", Permissions: []string{PermissionTopicRead}}}
+	reader := authenticateTestUser(t, ch, "reader", "read-secret")
+	release, err := ch.topicLifecycleGates.acquire(context.Background(), "orders", false)
+	require.NoError(t, err)
+	defer release()
+	requestCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	responseCh := make(chan string, 1)
+	go func() { responseCh <- ch.HandleCommandContext(requestCtx, "DELETE topic=orders", reader) }()
+	select {
+	case response := <-responseCh:
+		require.Contains(t, response, "permission=admin")
+	case <-time.After(time.Second):
+		t.Fatal("unauthorized delete waited on the lifecycle gate")
+	}
+}
+
+func TestPublicAndStandaloneSessionsCannotReplicateMessages(t *testing.T) {
+	ch, _ := newTestHandler(t)
+	response := ch.HandleCommand("REPLICATE_MESSAGE payload={}", NewClientContext("", 0))
+	require.Contains(t, response, "internal_command_unauthorized")
+	response = ch.HandleCommand("REPLICATE_MESSAGE payload={}", NewInternalClientContext("", 0))
+	require.Contains(t, response, "distribution_required")
 }

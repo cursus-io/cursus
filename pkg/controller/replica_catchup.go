@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
@@ -26,8 +27,11 @@ func (ch *CommandHandler) ApplyReplicaCatchup(batch replicationFSM.ReplicaCatchu
 		return fmt.Errorf("invalid replica catch-up batch size %d", len(batch.Messages))
 	}
 
-	ch.topicLifecycleMu.RLock()
-	defer ch.topicLifecycleMu.RUnlock()
+	releaseLifecycle, err := ch.topicLifecycleGates.acquire(context.Background(), batch.Topic, false)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	writeLock := ch.partitionWriteLock(batch.Topic, batch.Partition)
 	writeLock.Lock()
 	defer writeLock.Unlock()

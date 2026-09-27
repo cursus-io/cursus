@@ -275,32 +275,7 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 	if ch.Config.EnabledDistribution && ch.Cluster != nil {
 		forwardCmd := cmd
 		if _, explicitPartition := args["partition"]; !explicitPartition {
-			forwardCmd = fmt.Sprintf("PUBLISH topic=%s acks=%s producerId=%s partition=%d seqNum=%d epoch=%d", topicName, acks, producerID, partition, seqNum, epoch)
-			if _, explicitIdempotent := args["isIdempotent"]; explicitIdempotent {
-				forwardCmd += fmt.Sprintf(" isIdempotent=%t", isIdempotent)
-			}
-			if msg.TransactionalID != "" {
-				forwardCmd += fmt.Sprintf(" transactional_id=%s", msg.TransactionalID)
-			}
-			if msg.TransactionState != "" {
-				forwardCmd += fmt.Sprintf(" transaction_state=%s", msg.TransactionState)
-			}
-			if msg.TransactionMarker != "" {
-				forwardCmd += fmt.Sprintf(" transaction_marker=%s", msg.TransactionMarker)
-			}
-			if msg.ControlBatchType != "" {
-				forwardCmd += fmt.Sprintf(" control_batch_type=%s control_batch_version=%d control_batch_coordinator_epoch=%d", msg.ControlBatchType, msg.ControlBatchVersion, msg.ControlBatchCoordinatorEpoch)
-				if len(msg.ControlBatchKey) > 0 {
-					forwardCmd += fmt.Sprintf(" control_batch_key=%s", base64.StdEncoding.EncodeToString(msg.ControlBatchKey))
-				}
-				if len(msg.ControlBatchValue) > 0 {
-					forwardCmd += fmt.Sprintf(" control_batch_value=%s", base64.StdEncoding.EncodeToString(msg.ControlBatchValue))
-				}
-			}
-			if strings.EqualFold(args["internal_txn_publish"], "true") {
-				forwardCmd += " internal_txn_publish=true"
-			}
-			forwardCmd += " message=" + message
+			forwardCmd = publishCommandWithPartition(cmd, partition)
 		}
 		if resp, forwarded, _ := ch.isPartitionLeaderAndForwardContext(requestCtx, topicName, partition, forwardCmd); forwarded {
 			return resp
@@ -495,6 +470,18 @@ Respond:
 	return string(respBytes)
 }
 
+// publishCommandWithPartition preserves the client's complete command and only
+// adds the broker-selected partition before the trailing message payload.
+func publishCommandWithPartition(cmd string, partition int) string {
+	messageIndex := strings.Index(cmd, "message=")
+	if messageIndex < 0 {
+		return strings.TrimSpace(cmd) + fmt.Sprintf(" partition=%d", partition)
+	}
+	prefix := strings.TrimRight(cmd[:messageIndex], " \t\r\n")
+	suffix := cmd[messageIndex:]
+	return prefix + fmt.Sprintf(" partition=%d ", partition) + suffix
+}
+
 func (ch *CommandHandler) waitForTopic(topicName string) *topic.Topic {
 	t, _ := ch.waitForTopicContext(context.Background(), topicName)
 	return t
@@ -598,8 +585,6 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 
 // HandleBatchMessage processes PUBLISH of multiple messages.
 func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...*ClientContext) (response string, returnErr error) {
-	ch.topicLifecycleMu.RLock()
-	defer ch.topicLifecycleMu.RUnlock()
 	var clientCtx *ClientContext
 	if len(ctx) > 0 {
 		clientCtx = ctx[0]
@@ -612,6 +597,27 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 	}
 	if batch.Topic == config.ConsumerOffsetsTopicName {
 		return fmt.Sprintf("ERROR: internal_topic_write_forbidden topic=%s", batch.Topic), nil
+	}
+	authorizedTopic, authResp := ch.authorizeBatchPublish(batch.Topic, clientCtx)
+	if authResp != "" {
+		return authResp, nil
+	}
+	requestCtx = clientCtx.RequestContext()
+	releaseLifecycle, lockErr := ch.topicLifecycleGates.acquire(requestCtx, batch.Topic, false)
+	if lockErr != nil {
+		return "ERROR: request_cancelled", nil
+	}
+	if requestCtx.Err() != nil {
+		releaseLifecycle()
+		return "ERROR: request_cancelled", nil
+	}
+	defer releaseLifecycle()
+	authorizedTopic = ch.TopicManager.GetTopic(batch.Topic)
+	if authorizedTopic == nil {
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
+	}
+	if authResp := ch.authorizeTopicWrite(authorizedTopic.PolicySnapshot(), clientCtx); authResp != "" {
+		return fmt.Sprintf("%s topic=%s", authResp, batch.Topic), nil
 	}
 	if ch.TopicManager != nil && ch.TopicManager.IsTruncationPending(batch.Topic) {
 		return fmt.Sprintf("ERROR: topic_lifecycle_pending topic=%s operation=truncate", batch.Topic), nil
@@ -642,6 +648,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 	var lastMsg *types.Message
 	var lastOffset uint64
 	if ch.Config.EnabledDistribution && ch.Cluster != nil {
+		t := authorizedTopic
 		if !ch.Cluster.IsAuthorized(batch.Topic, batch.Partition) {
 			const maxRetries = 3
 			const retryDelay = 200 * time.Millisecond
@@ -668,18 +675,6 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		}
 
 		util.Debug("Processing BATCH locally as Partition leader for %s:%d", batch.Topic, batch.Partition)
-
-		t, waitErr := ch.waitForTopicContext(requestCtx, batch.Topic)
-		if waitErr != nil {
-			return "ERROR: request_cancelled", nil
-		}
-		if t == nil {
-			util.Error("Batch process failed: topic '%s' not found", batch.Topic)
-			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
-		}
-		if authResp := ch.authorizeTopicWrite(t.PolicySnapshot(), clientCtx); authResp != "" {
-			return fmt.Sprintf("%s topic=%s", authResp, batch.Topic), nil
-		}
 
 		p, err := t.GetPartition(batch.Partition)
 		if err != nil {
@@ -844,16 +839,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 
 	// stand-alone
 	{
-		t, waitErr := ch.waitForTopicContext(requestCtx, batch.Topic)
-		if waitErr != nil {
-			return "ERROR: request_cancelled", nil
-		}
-		if t == nil {
-			return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
-		}
-		if authResp := ch.authorizeTopicWrite(t.PolicySnapshot(), clientCtx); authResp != "" {
-			return fmt.Sprintf("%s topic=%s", authResp, batch.Topic), nil
-		}
+		t := authorizedTopic
 		p, err := t.GetPartition(batch.Partition)
 		if err != nil {
 			return fmt.Sprintf("ERROR: partition_not_found partition=%d", batch.Partition), nil

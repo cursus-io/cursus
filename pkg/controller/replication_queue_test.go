@@ -514,7 +514,6 @@ func TestAllAcknowledgementFailsWhenLeaderEpochChangesAfterCommit(t *testing.T) 
 
 func TestAllAcknowledgementDoesNotWaitForNonISRReplica(t *testing.T) {
 	executor := newBarrierReplicationExecutor()
-	executor.nonISRBarrier = make(chan struct{})
 	coordinator := newPartitionReplicationCoordinator(1, executor)
 	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
 	require.NoError(t, err)
@@ -525,13 +524,14 @@ func TestAllAcknowledgementDoesNotWaitForNonISRReplica(t *testing.T) {
 
 	require.NoError(t, <-task.result)
 	require.Equal(t, uint64(1), executor.committed())
-	close(executor.nonISRBarrier)
+	executor.mu.Lock()
+	require.Zero(t, executor.nonISRCalls, "foreground replication must leave non-ISR catch-up to the bounded range worker")
+	executor.mu.Unlock()
 	coordinator.close()
 }
 
-func TestBlockedNonISRReplicaDoesNotDelayNextPartitionTask(t *testing.T) {
+func TestNonISRRangeCatchupCannotBlockForegroundPartitionLane(t *testing.T) {
 	executor := newBarrierReplicationExecutor()
-	executor.nonISRBarrier = make(chan struct{})
 	coordinator := newPartitionReplicationCoordinator(1, executor)
 	firstReservation, err := coordinator.reserve(context.Background(), "orders", 0)
 	require.NoError(t, err)
@@ -540,11 +540,6 @@ func TestBlockedNonISRReplicaDoesNotDelayNextPartitionTask(t *testing.T) {
 	<-executor.started
 	close(executor.barrier)
 	require.NoError(t, <-first.result)
-	require.Eventually(t, func() bool {
-		executor.mu.Lock()
-		defer executor.mu.Unlock()
-		return executor.nonISRCalls == 1
-	}, time.Second, time.Millisecond)
 
 	secondReservation, err := coordinator.reserve(context.Background(), "orders", 0)
 	require.NoError(t, err)
@@ -555,16 +550,16 @@ func TestBlockedNonISRReplicaDoesNotDelayNextPartitionTask(t *testing.T) {
 	case err := <-second.result:
 		require.NoError(t, err)
 	case <-time.After(time.Second):
-		t.Fatal("non-ISR catch-up blocked the next partition task")
+		t.Fatal("non-ISR catch-up blocked the foreground partition task")
 	}
-
-	close(executor.nonISRBarrier)
+	executor.mu.Lock()
+	require.Zero(t, executor.nonISRCalls)
+	executor.mu.Unlock()
 	coordinator.close()
 }
 
-func TestCommittedNonISRTasksAreNotDroppedWhenCatchupQueueIsFull(t *testing.T) {
+func TestForegroundCommitsDoNotQueueUnboundedPerMessageCatchup(t *testing.T) {
 	executor := newBarrierReplicationExecutor()
-	executor.nonISRBarrier = make(chan struct{})
 	close(executor.barrier)
 	coordinator := newPartitionReplicationCoordinator(1, executor)
 
@@ -575,21 +570,11 @@ func TestCommittedNonISRTasksAreNotDroppedWhenCatchupQueueIsFull(t *testing.T) {
 		task.commitHWM = commitHWM
 		reservation.submit(task)
 		require.NoError(t, <-task.result)
-		if commitHWM == 1 {
-			require.Eventually(t, func() bool {
-				executor.mu.Lock()
-				defer executor.mu.Unlock()
-				return executor.nonISRCalls == 1
-			}, time.Second, time.Millisecond)
-		}
 	}
 
-	close(executor.nonISRBarrier)
-	require.Eventually(t, func() bool {
-		executor.mu.Lock()
-		defer executor.mu.Unlock()
-		return executor.nonISRCalls == 3
-	}, time.Second, time.Millisecond)
+	executor.mu.Lock()
+	require.Zero(t, executor.nonISRCalls)
+	executor.mu.Unlock()
 	coordinator.close()
 }
 

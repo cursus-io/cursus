@@ -47,7 +47,6 @@ func (e *retryableReplicationStateError) ReplicationErrorClass() string { return
 type partitionReplicationExecutor interface {
 	Snapshot(topic string, partition int) (clusterController.PartitionReplicationSnapshot, error)
 	ReplicateISR(ctx context.Context, task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) error
-	ReplicateNonISR(task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) error
 	Commit(task partitionReplicationTask) error
 }
 
@@ -64,13 +63,6 @@ func (e clusterPartitionReplicationExecutor) ReplicateISR(ctx context.Context, t
 		return err
 	}
 	return e.handler.Cluster.ReplicateToISR(task.topic, task.partition, task.command, snapshot)
-}
-
-func (e clusterPartitionReplicationExecutor) ReplicateNonISR(task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) error {
-	commitHWM := task.commitHWM
-	command := task.command
-	command.CommitHWM = &commitHWM
-	return e.handler.Cluster.ReplicateToNonISR(task.topic, task.partition, command, snapshot)
 }
 
 func (e clusterPartitionReplicationExecutor) Commit(task partitionReplicationTask) error {
@@ -106,15 +98,9 @@ type partitionReplicationCoordinator struct {
 }
 
 type partitionReplicationLane struct {
-	owner   *partitionReplicationCoordinator
-	queue   chan partitionReplicationTask
-	catchup chan partitionCatchupTask
-	slots   chan struct{}
-}
-
-type partitionCatchupTask struct {
-	task     partitionReplicationTask
-	snapshot clusterController.PartitionReplicationSnapshot
+	owner *partitionReplicationCoordinator
+	queue chan partitionReplicationTask
+	slots chan struct{}
 }
 
 type partitionReplicationReservation struct {
@@ -152,15 +138,13 @@ func (c *partitionReplicationCoordinator) reserve(ctx context.Context, topicName
 	lane := c.lanes[key]
 	if lane == nil {
 		lane = &partitionReplicationLane{
-			owner:   c,
-			queue:   make(chan partitionReplicationTask, c.capacity),
-			catchup: make(chan partitionCatchupTask, c.capacity),
-			slots:   make(chan struct{}, c.capacity),
+			owner: c,
+			queue: make(chan partitionReplicationTask, c.capacity),
+			slots: make(chan struct{}, c.capacity),
 		}
 		c.lanes[key] = lane
-		c.workers.Add(2)
+		c.workers.Add(1)
 		go lane.run()
-		go lane.runCatchup()
 	}
 	c.submissions.Add(1)
 	c.mu.Unlock()
@@ -237,32 +221,6 @@ func (l *partitionReplicationLane) run() {
 	}
 }
 
-func (l *partitionReplicationLane) runCatchup() {
-	defer l.owner.workers.Done()
-	for {
-		if l.owner.ctx.Err() != nil {
-			return
-		}
-		select {
-		case catchup := <-l.catchup:
-			if err := l.owner.executor.ReplicateNonISR(catchup.task, catchup.snapshot); err != nil {
-				class := replicationErrorClass(err)
-				metrics.AsyncReplicationFailures.WithLabelValues(catchup.task.topic, class).Inc()
-				util.Error("async non-ISR replication failed topic=%s partition=%d ack_mode=%s error_class=%s error=%v", catchup.task.topic, catchup.task.partition, catchup.task.ackMode, class, err)
-			}
-		case <-l.owner.ctx.Done():
-			return
-		}
-	}
-}
-
-func (l *partitionReplicationLane) enqueueCatchup(task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) {
-	select {
-	case l.catchup <- partitionCatchupTask{task: task, snapshot: snapshot}:
-	case <-l.owner.ctx.Done():
-	}
-}
-
 func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 	backoff := 25 * time.Millisecond
 	failures := uint64(0)
@@ -319,7 +277,6 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			if failures > 0 {
 				util.Info("partition replication recovered topic=%s partition=%d ack_mode=%s attempts=%d", task.topic, task.partition, task.ackMode, failures+1)
 			}
-			l.enqueueCatchup(task, snapshot)
 			return
 		}
 		if l.owner.ctx.Err() != nil {
