@@ -47,6 +47,27 @@ func TestRunServerContextRejectsNilContext(t *testing.T) {
 	}
 }
 
+func TestRequestDeadlineResponseReportsAcceptanceOutcome(t *testing.T) {
+	timedOut, cancelTimedOut := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelTimedOut()
+	clientCtx := controller.NewClientContext("", 0)
+	clientCtx.SetRequestContext(timedOut)
+	if got := requestDeadlineResponse("ERROR: request_cancelled", clientCtx); got != "ERROR: request_timeout outcome=not_accepted" {
+		t.Fatalf("deadline response = %q, want not-accepted timeout", got)
+	}
+	unknownOutcome := "ERROR: request_timeout outcome=unknown"
+	if got := requestDeadlineResponse(unknownOutcome, clientCtx); got != unknownOutcome {
+		t.Fatalf("deadline response overwrote uncertain outcome: %q", got)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	clientCtx.SetRequestContext(canceled)
+	if got := requestDeadlineResponse("ERROR: request_cancelled", clientCtx); got != "ERROR: request_cancelled" {
+		t.Fatalf("cancellation response = %q, want request_cancelled", got)
+	}
+}
+
 func TestRunServerContextReturnsCancellation(t *testing.T) {
 	healthListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

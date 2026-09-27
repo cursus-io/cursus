@@ -33,6 +33,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.TransactionRecoveryBatchSize != 256 {
 		t.Errorf("Expected default TransactionRecoveryBatchSize 256, got %d", cfg.TransactionRecoveryBatchSize)
 	}
+	if cfg.ClientRequestTimeoutMS != 30000 {
+		t.Errorf("Expected default ClientRequestTimeoutMS 30000, got %d", cfg.ClientRequestTimeoutMS)
+	}
 }
 
 func TestLoadConfig_EnvOverrides(t *testing.T) {
@@ -44,6 +47,7 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("BOOTSTRAP_SOLE_VOTER", "true")
 	t.Setenv("TRANSACTION_COORDINATOR_SHARDS", "17")
 	t.Setenv("TRANSACTION_RECOVERY_BATCH_SIZE", "19")
+	t.Setenv("CLIENT_REQUEST_TIMEOUT_MS", "45000")
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -73,6 +77,9 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	}
 	if cfg.TransactionRecoveryBatchSize != 19 {
 		t.Errorf("Expected TransactionRecoveryBatchSize 19 from env, got %d", cfg.TransactionRecoveryBatchSize)
+	}
+	if cfg.ClientRequestTimeoutMS != 45000 {
+		t.Errorf("Expected ClientRequestTimeoutMS 45000 from env, got %d", cfg.ClientRequestTimeoutMS)
 	}
 }
 

@@ -64,7 +64,7 @@ func TestRunReplicaCatchupOnceFetchesUntilCommittedHWM(t *testing.T) {
 	cc := NewClusterController(context.Background(), cfg, rm, nil, "node-2", "127.0.0.1:9002")
 	fetcher := &recordingCatchupFetcher{}
 	var applied []fsm.ReplicaCatchupBatch
-	err = cc.RunReplicaCatchupOnce(context.Background(), fetcher, func(batch fsm.ReplicaCatchupBatch) error {
+	err = cc.RunReplicaCatchupOnce(context.Background(), fetcher, func(_ context.Context, batch fsm.ReplicaCatchupBatch) error {
 		applied = append(applied, batch)
 		return nil
 	})

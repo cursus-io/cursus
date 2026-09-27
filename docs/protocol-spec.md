@@ -286,6 +286,8 @@ Response (JSON — `AckResponse`):
 
 `acks` is a publisher/request setting and is never stored in topic metadata. The effective minimum is the topic `min_in_sync_replicas` override when present, otherwise broker `min_insync_replicas`. Read-committed consumers never read beyond committed HWM, so a leader-only `acks=1` tail remains invisible until asynchronous replication commits it. `enable_idempotence=true` requires `acks=all` or `acks=-1`; other combinations fail before append and producer sequence mutation.
 
+The broker's `client_request_timeout_ms` bounds synchronous processing after a complete request has been received. If an `acks=all` publish times out after its local append has been accepted, the broker responds `ERROR: request_timeout outcome=unknown`. The replication task remains owned by the broker and may still commit; clients must treat the result as uncertain and reconcile before retrying non-idempotent writes. A timeout before append is accepted responds `ERROR: request_timeout outcome=not_accepted`.
+
 In standalone mode the local broker is the sole replica. `acks=1`, `all`, and `-1` complete after the same durable local append when the effective minimum is 1; `all` and `-1` reject before append when it is greater than 1. `acks=0` still receives no response frame.
 
 #### Cluster Discovery

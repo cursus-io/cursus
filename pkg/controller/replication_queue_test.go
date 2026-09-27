@@ -814,7 +814,7 @@ func TestPreparePartitionReplicaAllowsFencedBackfillBelowCommittedHWM(t *testing
 		Messages: []types.Message{{Offset: 0, Payload: "zero"}, {Offset: 1, Payload: "one"}},
 	})
 	require.NoError(t, err)
-	require.NoError(t, handler.ApplyReplicaCatchup(catchupBatch))
+	require.NoError(t, handler.ApplyReplicaCatchup(context.Background(), catchupBatch))
 	require.Equal(t, uint64(2), partition.NextOffset())
 	require.Equal(t, uint64(2), partition.GetHWM())
 }
@@ -847,7 +847,7 @@ func TestApplyReplicaCatchupAcceptsCompactedOffsetRangeAndPreservesHWM(t *testin
 		Messages: []types.Message{{Offset: 2, Key: "a", Payload: "current-a"}, {Offset: 4, Key: "b", Payload: "current-b"}},
 	})
 	require.NoError(t, err)
-	require.NoError(t, handler.ApplyReplicaCatchup(catchupBatch))
+	require.NoError(t, handler.ApplyReplicaCatchup(context.Background(), catchupBatch))
 	partition, err := topicManager.GetTopic("state").GetPartition(0)
 	require.NoError(t, err)
 	require.Equal(t, uint64(5), partition.NextOffset())
@@ -958,6 +958,36 @@ func TestDistributedAllRequestCancellationDoesNotLeakOrAbandonReplication(t *tes
 
 	close(executor.barrier)
 	require.Eventually(t, func() bool { return executor.committed() == 1 }, time.Second, time.Millisecond)
+}
+
+func TestDistributedAllRequestDeadlineReturnsUnknownAndKeepsReplication(t *testing.T) {
+	handler, manager, executor := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
+	requestCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	clientCtx := NewClientContext("", 0)
+	clientCtx.SetRequestContext(requestCtx)
+	response := make(chan string, 1)
+	go func() {
+		response <- handler.HandleCommand("PUBLISH topic=orders partition=0 acks=all producerId=p1 message=value", clientCtx)
+	}()
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("replication task did not start")
+	}
+	select {
+	case got := <-response:
+		require.Equal(t, "ERROR: request_timeout outcome=unknown", got)
+	case <-time.After(time.Second):
+		t.Fatal("request did not return after its deadline")
+	}
+	require.Zero(t, executor.committed(), "timed out replication committed before its worker was released")
+
+	close(executor.barrier)
+	require.Eventually(t, func() bool { return executor.committed() == 1 }, time.Second, time.Millisecond,
+		"request timeout canceled replication owned by the broker")
 }
 
 func TestAllAcknowledgementKeepsRetryingFollowerTimeoutUntilShutdown(t *testing.T) {

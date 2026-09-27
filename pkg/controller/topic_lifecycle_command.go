@@ -8,6 +8,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
+// lifecycleTopicName extracts the topic affected by a lifecycle-sensitive command.
 func lifecycleTopicName(input commandInput) string {
 	if topicName := input.Args["topic"]; topicName != "" {
 		return topicName
@@ -33,6 +34,20 @@ func lifecycleTopicName(input commandInput) string {
 		}
 	}
 	return ""
+}
+
+// lifecycleOperationExclusive identifies commands that mutate topic existence or data.
+func lifecycleOperationExclusive(input commandInput) bool {
+	switch input.Name {
+	case "DELETE", "TRUNCATE":
+		return true
+	case "RAFT_APPLY":
+		switch strings.ToUpper(strings.TrimSpace(input.Args["type"])) {
+		case "TOPIC_DELETE", "TOPIC_TRUNCATE":
+			return true
+		}
+	}
+	return false
 }
 
 func commandPayload(command string) string {

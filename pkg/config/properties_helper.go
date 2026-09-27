@@ -149,6 +149,9 @@ func (cfg *Config) Normalize() {
 	if cfg.ClientIdleTimeoutMS <= 0 {
 		cfg.ClientIdleTimeoutMS = 60000
 	}
+	if cfg.ClientRequestTimeoutMS <= 0 {
+		cfg.ClientRequestTimeoutMS = 30000
+	}
 	for i := range cfg.StaticConsumerGroups {
 		g := &cfg.StaticConsumerGroups[i]
 		if strings.TrimSpace(g.Name) == "" {

@@ -302,6 +302,9 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		}
 		reservation, reserveErr := ch.replication.reserve(requestCtx, topicName, partition)
 		if reserveErr != nil {
+			if requestCtx.Err() != nil {
+				return requestTimeoutOutcome(requestCtx, "not_accepted")
+			}
 			return ch.errorResponse(fmt.Sprintf("replication backpressure: %v", reserveErr))
 		}
 		submitted := false
@@ -358,7 +361,7 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 						return ch.replicationErrorResponse(lastOffset, replicationErr)
 					}
 				case <-requestCtx.Done():
-					return "ERROR: request_cancelled"
+					return requestTimeoutOutcome(requestCtx, "unknown")
 				}
 			} else {
 				reservation.release()
@@ -404,7 +407,7 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 					return ch.replicationErrorResponse(assignedOffset, replicationErr)
 				}
 			case <-requestCtx.Done():
-				return "ERROR: request_cancelled"
+				return requestTimeoutOutcome(requestCtx, "unknown")
 			}
 		}
 		ackResp = types.AckResponse{
@@ -712,6 +715,9 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		}
 		reservation, reserveErr := ch.replication.reserve(requestCtx, batch.Topic, batch.Partition)
 		if reserveErr != nil {
+			if requestCtx.Err() != nil {
+				return requestTimeoutOutcome(requestCtx, "not_accepted"), nil
+			}
 			return ch.errorResponse(fmt.Sprintf("replication backpressure: %v", reserveErr)), nil
 		}
 		submitted := false
@@ -766,7 +772,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 						return ch.replicationErrorResponse(lastOffset, replicationErr), nil
 					}
 				case <-requestCtx.Done():
-					return "ERROR: request_cancelled", nil
+					return requestTimeoutOutcome(requestCtx, "unknown"), nil
 				}
 			} else {
 				reservation.release()
@@ -821,7 +827,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 					return ch.replicationErrorResponse(lastOffset, replicationErr), nil
 				}
 			case <-requestCtx.Done():
-				return "ERROR: request_cancelled", nil
+				return requestTimeoutOutcome(requestCtx, "unknown"), nil
 			}
 		}
 

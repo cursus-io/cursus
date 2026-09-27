@@ -304,7 +304,7 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 	}
 
 	if topicName := lifecycleTopicName(input); topicName != "" {
-		exclusive := input.Name == "DELETE" || input.Name == "TRUNCATE"
+		exclusive := lifecycleOperationExclusive(input)
 		requestCtx := ctx.RequestContext()
 		release, lockErr := ch.topicLifecycleGates.acquire(requestCtx, topicName, exclusive)
 		if lockErr != nil {

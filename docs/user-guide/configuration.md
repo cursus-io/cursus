@@ -202,6 +202,7 @@ These values participate in active broker behavior:
 | `advertised_client_host` | empty | Client-facing host returned by routing metadata. |
 | `max_client_connections` | 1000 | Concurrent client connection limit. |
 | `client_idle_timeout_ms` | 60000 | Idle client connection deadline. |
+| `client_request_timeout_ms` | 30000 | Maximum time spent processing one client request after the full request is received. An `acks=all` publish that times out after append returns `request_timeout outcome=unknown`; its accepted replication continues independently. |
 | `max_stream_connections` | 1000 | Concurrent streaming connection limit. |
 | `stream_timeout` | 30m | Maximum broker stream lifetime as a Go duration string. |
 | `consumer_session_timeout_ms` | 10000 | Group member session timeout. |
