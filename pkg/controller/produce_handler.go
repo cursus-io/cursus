@@ -611,7 +611,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		return "ERROR: request_cancelled", nil
 	}
 	defer releaseLifecycle()
-	authorizedTopic = ch.TopicManager.GetTopic(batch.Topic)
+	authorizedTopic := ch.TopicManager.GetTopic(batch.Topic)
 	if authorizedTopic == nil {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", batch.Topic), nil
 	}
