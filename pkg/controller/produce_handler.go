@@ -589,7 +589,6 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 	if len(ctx) > 0 {
 		clientCtx = ctx[0]
 	}
-	requestCtx := clientCtx.RequestContext()
 	batch, err := util.DecodeBatchMessages(data)
 	if err != nil {
 		util.Error("Batch message decoding failed: %v", err)
@@ -598,7 +597,7 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 	if batch.Topic == config.ConsumerOffsetsTopicName {
 		return fmt.Sprintf("ERROR: internal_topic_write_forbidden topic=%s", batch.Topic), nil
 	}
-	authorizedTopic, authResp := ch.authorizeBatchPublish(batch.Topic, clientCtx)
+	_, authResp := ch.authorizeBatchPublish(batch.Topic, clientCtx)
 	if authResp != "" {
 		return authResp, nil
 	}
