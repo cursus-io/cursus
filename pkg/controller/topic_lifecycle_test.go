@@ -219,6 +219,75 @@ func TestDistributedLifecycleSubmissionRejectsActiveRuntimeReferences(t *testing
 	})
 }
 
+func TestInternalRaftTopicLifecycleApplyUsesExclusiveGate(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		command string
+	}{
+		{name: "delete", command: `RAFT_APPLY internal_token=secret-token type=TOPIC_DELETE payload={"topic":"orders","if_exists":false}`},
+		{name: "delete accepts JSON field casing", command: `RAFT_APPLY internal_token=secret-token type=TOPIC_DELETE payload={"Topic":"orders","IfExists":false}`},
+		{name: "truncate", command: `RAFT_APPLY internal_token=secret-token type=TOPIC_TRUNCATE payload={"topic":"orders","expected_revision":1}`},
+		{name: "truncate accepts topic field casing", command: `RAFT_APPLY internal_token=secret-token type=TOPIC_TRUNCATE payload={"Topic":"orders","expected_revision":1}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			handler, _, _ := newDistributedLifecycleHandler(t)
+			handler.Config.InternalAuthToken = "secret-token"
+			ctx := NewInternalClientContext("", 0)
+			require.Contains(t, handler.HandleCommand("CREATE topic=orders partitions=1 replication_factor=1", NewClientContext("", 0)), "OK topic=orders")
+
+			release, err := handler.topicLifecycleGates.acquire(context.Background(), "orders", false)
+			require.NoError(t, err)
+			handler.topicLifecycleGates.mu.Lock()
+			gate := handler.topicLifecycleGates.byName["orders"].gate
+			handler.topicLifecycleGates.mu.Unlock()
+			response := make(chan string, 1)
+			go func() { response <- handler.HandleCommand(testCase.command, ctx) }()
+
+			deadline := time.Now().Add(time.Second)
+			for {
+				select {
+				case got := <-response:
+					t.Fatalf("internal lifecycle apply bypassed the exclusive topic gate: %s", got)
+				default:
+				}
+				gate.mu.Lock()
+				waitingWriter := gate.waitingWriters > 0
+				gate.mu.Unlock()
+				if waitingWriter {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("internal lifecycle apply did not wait for the exclusive topic gate")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			release()
+
+			select {
+			case got := <-response:
+				require.Equal(t, "OK", got)
+			case <-time.After(time.Second):
+				t.Fatal("internal lifecycle apply did not proceed after the gate was released")
+			}
+		})
+	}
+}
+
+func TestInternalRaftTopicLifecycleApplyRejectsConflictingOuterTopic(t *testing.T) {
+	handler, _, _ := newDistributedLifecycleHandler(t)
+	handler.Config.InternalAuthToken = "secret-token"
+	ctx := NewInternalClientContext("", 0)
+	for _, topicName := range []string{"orders", "other"} {
+		response := handler.HandleCommand("CREATE topic="+topicName+" partitions=1 replication_factor=1", NewClientContext("", 0))
+		require.Contains(t, response, "OK topic="+topicName)
+	}
+
+	response := handler.HandleCommand(`RAFT_APPLY internal_token=secret-token type=TOPIC_DELETE topic=other payload={"topic":"orders","if_exists":false}`, ctx)
+	require.Equal(t, "ERROR: raft_apply_topic_mismatch", response)
+	require.NotNil(t, handler.TopicManager.GetTopic("orders"))
+	require.NotNil(t, handler.TopicManager.GetTopic("other"))
+}
+
 func newDistributedLifecycleHandler(t *testing.T) (*CommandHandler, *fsm.BrokerFSM, *coordinator.Coordinator) {
 	t.Helper()
 	cfg := config.DefaultConfig()

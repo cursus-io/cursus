@@ -63,7 +63,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 	register(ErrorClassAvailability, true,
 		"cluster_metadata_unavailable", "cluster_not_available", "coordinator_not_available", "fsm_not_available",
 		"join_group_failed",
-		"insufficient_in_sync_replicas", "leader_election_result_unavailable", "leader_not_found", "no_raft_leader", "offset_manager_not_available", "replica_offset_gap", "replication_unavailable", "request_cancelled", "router_not_available", "topic_materialization_pending",
+		"insufficient_in_sync_replicas", "leader_election_result_unavailable", "leader_not_found", "no_raft_leader", "offset_manager_not_available", "replica_offset_gap", "replication_unavailable", "request_cancelled", "request_timeout", "router_not_available", "topic_materialization_pending",
 		"transaction_abort_marker_failed", "transaction_commit_failed", "transaction_manager_not_available", "transaction_sync_failed",
 		"transaction_offset_materialization_failed", "transaction_offset_prepare_failed",
 	)
@@ -94,7 +94,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"empty_required_params", "event_sourcing_not_enabled", "invalid_acks", "invalid_batch_commit_entry", "invalid_batch_commit_format", "invalid_min_in_sync_replicas",
 		"invalid_auth", "invalid_consume_syntax", "invalid_control_batch_bytes", "invalid_control_batch_coordinator_epoch",
 		"invalid_aggregate_replay", "invalid_expected_last_sequence", "invalid_from_sequence", "invalid_max_records", "invalid_producer_epoch", "invalid_producer_sequence", "invalid_to_sequence",
-		"invalid_control_batch_version", "invalid_commit_watermark", "invalid_epoch", "invalid_generation", "invalid_is_idempotent",
+		"invalid_control_batch_version", "invalid_commit_watermark", "invalid_epoch", "invalid_generation", "invalid_is_idempotent", "raft_apply_topic_mismatch",
 		"invalid_event_sourcing", "invalid_idempotent", "invalid_if_exists", "invalid_offset", "invalid_partition", "invalid_partitions", "invalid_payload", "invalid_payload_json",
 		"invalid_protocol_features", "invalid_protocol_version", "invalid_replication_factor", "invalid_require_features",
 		"invalid_transaction_control_batch", "invalid_transaction_control_epoch", "invalid_transaction_control_record",

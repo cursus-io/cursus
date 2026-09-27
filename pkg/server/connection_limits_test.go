@@ -42,6 +42,13 @@ func TestConnectionLimitDefaults(t *testing.T) {
 	if got := clientIdleTimeout(cfg); got != 123*time.Millisecond {
 		t.Fatalf("configured idle timeout = %s, want 123ms", got)
 	}
+	if got := clientRequestTimeout(nil); got != 30*time.Second {
+		t.Fatalf("default request timeout = %s, want 30s", got)
+	}
+	cfg.ClientRequestTimeoutMS = 250
+	if got := clientRequestTimeout(cfg); got != 250*time.Millisecond {
+		t.Fatalf("configured request timeout = %s, want 250ms", got)
+	}
 }
 
 func TestConnectionLimiterCapsAcceptedAndActiveConnections(t *testing.T) {

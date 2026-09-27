@@ -459,7 +459,8 @@ func (ch *CommandHandler) fallbackClientAddr() string {
 }
 
 // handleRaftApply processes RAFT_APPLY command (internal, from coordinator to leader).
-func (ch *CommandHandler) handleRaftApply(cmd string) string {
+func (ch *CommandHandler) handleRaftApply(cmd string, clientCtx *ClientContext) string {
+	requestCtx := clientCtx.RequestContext()
 	rest := cmd[11:] // len("RAFT_APPLY ") = 11
 
 	typeIdx := strings.Index(rest, "type=")
@@ -484,8 +485,15 @@ func (ch *CommandHandler) handleRaftApply(cmd string) string {
 		return fmt.Sprintf("ERROR: invalid_payload_json reason=%q", err.Error())
 	}
 
-	_, err := ch.applyAndWait(cmdType, payload)
+	_, accepted, err := ch.applyAndWaitContextWithAcceptance(requestCtx, cmdType, payload)
 	if err != nil {
+		if requestCtx.Err() != nil {
+			outcome := "not_accepted"
+			if accepted {
+				outcome = "unknown"
+			}
+			return requestTimeoutOutcome(requestCtx, outcome)
+		}
 		if errors.Is(err, replicationFSM.ErrPartitionCommitFenced) {
 			return "ERROR: PARTITION_LEADER_FENCED"
 		}
@@ -544,28 +552,29 @@ func wireErrorCode(response string) string {
 	return strings.ToUpper(code)
 }
 
-func (ch *CommandHandler) applyAndWait(cmdType string, payload map[string]interface{}) (interface{}, error) {
-	return ch.applyAndWaitContext(context.Background(), cmdType, payload)
+func (ch *CommandHandler) applyAndWaitContext(ctx context.Context, cmdType string, payload map[string]interface{}) (interface{}, error) {
+	result, _, err := ch.applyAndWaitContextWithAcceptance(ctx, cmdType, payload)
+	return result, err
 }
 
-func (ch *CommandHandler) applyAndWaitContext(ctx context.Context, cmdType string, payload map[string]interface{}) (interface{}, error) {
+func (ch *CommandHandler) applyAndWaitContextWithAcceptance(ctx context.Context, cmdType string, payload map[string]interface{}) (interface{}, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, false, ctx.Err()
 	default:
 	}
 	if ch.Cluster == nil {
-		return nil, fmt.Errorf("cluster controller is not initialized")
+		return nil, false, fmt.Errorf("cluster controller is not initialized")
 	}
 	if ch.Cluster.RaftManager == nil {
-		return nil, fmt.Errorf("raft manager not available")
+		return nil, false, fmt.Errorf("raft manager not available")
 	}
 	fsm := ch.Cluster.RaftManager.GetFSM()
 	if fsm == nil {
-		return nil, fmt.Errorf("fsm not available")
+		return nil, false, fmt.Errorf("fsm not available")
 	}
 
 	reqID := uuid.New().String()
@@ -573,7 +582,7 @@ func (ch *CommandHandler) applyAndWaitContext(ctx context.Context, cmdType strin
 
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal payload: %w", err)
+		return nil, false, fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
 	respChan := fsm.RegisterNotifier(reqID)
@@ -581,7 +590,9 @@ func (ch *CommandHandler) applyAndWaitContext(ctx context.Context, cmdType strin
 
 	err = ch.Cluster.RaftManager.ApplyCommand(cmdType, data)
 	if err != nil {
-		return nil, fmt.Errorf("raft apply failed: %w", err)
+		// ApplyCommand may return an error after Raft accepted the entry, so
+		// callers must treat cancellation from this point as an unknown outcome.
+		return nil, true, fmt.Errorf("raft apply failed: %w", err)
 	}
 
 	timer := time.NewTimer(DefaultFSMApplyTimeout)
@@ -590,13 +601,13 @@ func (ch *CommandHandler) applyAndWaitContext(ctx context.Context, cmdType strin
 	select {
 	case res := <-respChan:
 		if err, ok := res.(error); ok && err != nil {
-			return nil, err
+			return nil, true, err
 		}
-		return res, nil
+		return res, true, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, true, ctx.Err()
 	case <-timer.C:
-		return nil, fmt.Errorf("timeout waiting for FSM")
+		return nil, true, fmt.Errorf("timeout waiting for FSM")
 	}
 }
 

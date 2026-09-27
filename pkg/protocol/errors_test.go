@@ -60,6 +60,7 @@ func TestClassifyFencingAndAvailability(t *testing.T) {
 		{"topic_materialization_pending", ErrorClassAvailability, true},
 		{"cluster_metadata_unavailable", ErrorClassAvailability, true},
 		{"request_cancelled", ErrorClassAvailability, true},
+		{"raft_apply_topic_mismatch", ErrorClassValidation, false},
 		{"NOT_PARTITION_LEADER", ErrorClassRouting, true},
 		{"PARTITION_LEADER_FENCED", ErrorClassFencing, false},
 		{"STALE_LEADER_EPOCH", ErrorClassFencing, false},

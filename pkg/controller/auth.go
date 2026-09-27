@@ -105,7 +105,62 @@ func (ch *CommandHandler) authorizeClientCommand(input commandInput, ctx *Client
 	if authResp := ch.authenticateInline(input.Args, ctx); authResp != "" {
 		return authResp
 	}
-	return ch.authorizeClientPermissions(input.Name, input.Args, ctx, permissions...)
+	if authResp := ch.authorizeClientPermissions(input.Name, input.Args, ctx, permissions...); authResp != "" {
+		return authResp
+	}
+	if input.Name != "PUBLISH" {
+		return ""
+	}
+	return ch.authorizeTopicCommandPolicies(input.Args, ctx, permissions...)
+}
+
+func (ch *CommandHandler) authorizeTopicCommandPolicies(args map[string]string, ctx *ClientContext, permissions ...string) string {
+	if ctx != nil && ctx.Internal {
+		return ""
+	}
+	topicName := args["topic"]
+	if topicName == "" || ch == nil || ch.TopicManager == nil {
+		return ""
+	}
+	t := ch.TopicManager.GetTopic(topicName)
+	if t == nil {
+		return ""
+	}
+	policy := t.PolicySnapshot()
+	for _, permission := range permissions {
+		switch permission {
+		case PermissionTopicRead:
+			if resp := ch.authorizeTopicRead(policy, ctx); resp != "" {
+				return fmt.Sprintf("%s topic=%s", resp, topicName)
+			}
+		case PermissionTopicWrite:
+			if resp := ch.authorizeTopicWrite(policy, ctx); resp != "" {
+				return fmt.Sprintf("%s topic=%s", resp, topicName)
+			}
+		}
+	}
+	return ""
+}
+
+func (ch *CommandHandler) authorizeBatchPublish(topicName string, ctx *ClientContext) (*topic.Topic, string) {
+	args := map[string]string{"topic": topicName}
+	if resp := ch.authorizeClientPermissions("PUBLISH", args, ctx, PermissionTopicWrite); resp != "" {
+		return nil, resp
+	}
+	if ch == nil || ch.TopicManager == nil {
+		return nil, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+	t, err := ch.waitForTopicContext(ctx.RequestContext(), topicName)
+	if err != nil {
+		return nil, "ERROR: request_cancelled"
+	}
+	if t == nil {
+		return nil, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
+	if resp := ch.authorizeTopicWrite(t.PolicySnapshot(), ctx); resp != "" {
+		return nil, fmt.Sprintf("%s topic=%s", resp, topicName)
+	}
+	return t, ""
 }
 
 func (ch *CommandHandler) authorizeClientPermissions(command string, args map[string]string, ctx *ClientContext, permissions ...string) string {

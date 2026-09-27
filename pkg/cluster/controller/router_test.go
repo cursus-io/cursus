@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
+	"net"
 	"strconv"
 	"strings"
 	"testing"
@@ -73,6 +75,52 @@ func TestWithInternalTokenPreservesLongRawCommand(t *testing.T) {
 	wantPrefix := "REPLICATE_MESSAGE internal_token=secret payload="
 	if !strings.HasPrefix(got, wantPrefix) {
 		t.Fatalf("command prefix = %q, want %q", got[:min(len(got), len(wantPrefix))], wantPrefix)
+	}
+}
+
+func TestSendDataRequestContextCancelsBlockedHandshake(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+
+	router := &ClusterRouter{timeout: 5 * time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, requestErr := router.sendDataRequestContext(ctx, listener.Addr().String(), []byte("PING"))
+		result <- requestErr
+	}()
+
+	var conn net.Conn
+	select {
+	case conn = <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("request did not connect to the test listener")
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	started := time.Now()
+	cancel()
+	select {
+	case requestErr := <-result:
+		if requestErr == nil {
+			t.Fatal("request succeeded despite context cancellation")
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("request did not stop promptly after cancellation: %v", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked handshake did not stop after context cancellation")
 	}
 }
 

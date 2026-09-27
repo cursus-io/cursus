@@ -101,8 +101,9 @@ type Config struct {
 	StaticConsumerGroups     []ConsumerGroupConfig `yaml:"static_consumer_groups" json:"static_consumer_groups"`
 
 	// network
-	MaxClientConnections int `yaml:"max_client_connections" json:"max.client.connections"`
-	ClientIdleTimeoutMS  int `yaml:"client_idle_timeout_ms" json:"client.idle.timeout.ms"`
+	MaxClientConnections   int `yaml:"max_client_connections" json:"max.client.connections"`
+	ClientIdleTimeoutMS    int `yaml:"client_idle_timeout_ms" json:"client.idle.timeout.ms"`
+	ClientRequestTimeoutMS int `yaml:"client_request_timeout_ms" json:"client.request.timeout.ms"`
 	// ObservationGRPCPort enables a loopback-only, read-only gRPC adapter. A
 	// zero value leaves the listener disabled.
 	ObservationGRPCPort      int    `yaml:"observation_grpc_port" json:"observation.grpc.port"`
@@ -198,9 +199,10 @@ func DefaultConfig() *Config {
 			ConsumerHeartbeatCheckMS: 5000,
 
 			// network
-			MaxClientConnections: 1000,
-			ClientIdleTimeoutMS:  60000,
-			ObservationGRPCPort:  0,
+			MaxClientConnections:   1000,
+			ClientIdleTimeoutMS:    60000,
+			ClientRequestTimeoutMS: 30000,
+			ObservationGRPCPort:    0,
 
 			// stream
 			MaxStreamConnections: 1000,
@@ -305,6 +307,7 @@ func LoadConfig() (*Config, error) {
 	flag.IntVar(&cfg.ConsumerHeartbeatCheckMS, "consumer-heartbeat-check", cfg.ConsumerHeartbeatCheckMS, "Heartbeat check")
 	flag.IntVar(&cfg.MaxClientConnections, "max-client-connections", cfg.MaxClientConnections, "Maximum concurrently serviced client connections")
 	flag.IntVar(&cfg.ClientIdleTimeoutMS, "client-idle-timeout-ms", cfg.ClientIdleTimeoutMS, "Idle client connection timeout in milliseconds")
+	flag.IntVar(&cfg.ClientRequestTimeoutMS, "client-request-timeout-ms", cfg.ClientRequestTimeoutMS, "Maximum client request processing time in milliseconds")
 	flag.IntVar(&cfg.ObservationGRPCPort, "observation-grpc-port", cfg.ObservationGRPCPort, "Loopback-only read-only observation gRPC port; zero disables it")
 	flag.StringVar(&cfg.ObservationGRPCPrincipal, "observation-grpc-principal", cfg.ObservationGRPCPrincipal, "Broker principal used by the local observation gRPC adapter")
 	flag.StringVar(&cfg.ObservationGRPCAuthToken, "observation-grpc-auth-token", cfg.ObservationGRPCAuthToken, "Broker token used by the local observation gRPC adapter")
@@ -418,6 +421,7 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.BroadcastChannelBufferSize, "BROADCAST_CH_BUFFER")
 	overrideEnvInt(&cfg.MaxClientConnections, "MAX_CLIENT_CONNECTIONS")
 	overrideEnvInt(&cfg.ClientIdleTimeoutMS, "CLIENT_IDLE_TIMEOUT_MS")
+	overrideEnvInt(&cfg.ClientRequestTimeoutMS, "CLIENT_REQUEST_TIMEOUT_MS")
 
 	overrideEnvBool(&cfg.EnabledDistribution, "ENABLE_DISTRIBUTION")
 	overrideEnvString(&cfg.InternalAuthToken, "INTERNAL_AUTH_TOKEN")

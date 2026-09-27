@@ -681,67 +681,73 @@ func TestHandlePublish_IdempotentFalseExplicit(t *testing.T) {
 	assert.Equal(t, "OK", ack.Status)
 }
 
+func internalReplicationTestContext(ch *CommandHandler) *ClientContext {
+	ch.Config.EnabledDistribution = true
+	ch.Config.InternalAuthToken = "internal-test-token"
+	return NewInternalClientContext("", 0)
+}
+
 func TestHandleReplicateMessage_MissingPayload(t *testing.T) {
 	ch, _ := newTestHandler(t)
-	ctx := NewClientContext("", 0)
+	ctx := internalReplicationTestContext(ch)
 
-	resp := ch.HandleCommand("REPLICATE_MESSAGE data=something", ctx)
+	resp := ch.HandleCommand("REPLICATE_MESSAGE "+ch.internalAuthPrefix()+"data=something", ctx)
 	assert.Contains(t, resp, "missing_payload")
 }
 
 func TestHandleReplicateMessage_InvalidJSON(t *testing.T) {
 	ch, _ := newTestHandler(t)
-	ctx := NewClientContext("", 0)
+	ctx := internalReplicationTestContext(ch)
 
-	resp := ch.HandleCommand("REPLICATE_MESSAGE payload=not-json", ctx)
+	resp := ch.HandleCommand("REPLICATE_MESSAGE "+ch.internalAuthPrefix()+"payload=not-json", ctx)
 	assert.Contains(t, resp, "unmarshal_failed")
 }
 
 func TestHandleReplicateMessageRejectsUnownedTransactionMetadata(t *testing.T) {
 	ch, tm := newTestHandler(t)
 	require.NoError(t, tm.CreateTopic("rep-spoof-topic", 1, false, false))
-	ctx := NewClientContext("", 0)
+	ctx := internalReplicationTestContext(ch)
 
 	payload := `{"topic":"rep-spoof-topic","partition":0,"messages":[{"Payload":"spoof","ProducerID":"p1","SeqNum":1,"Epoch":0,"TransactionalID":"tx-spoof","TransactionState":"open"}]}`
-	resp := ch.HandleCommand("REPLICATE_MESSAGE payload="+payload, ctx)
+	resp := ch.HandleCommand("REPLICATE_MESSAGE "+ch.internalAuthPrefix()+"payload="+payload, ctx)
 	assert.Contains(t, resp, "transaction_not_found")
 }
 func TestHandleReplicateMessage_TopicNotFound(t *testing.T) {
 	ch, _ := newTestHandler(t)
-	ctx := NewClientContext("", 0)
+	ctx := internalReplicationTestContext(ch)
 
 	payload := `{"topic":"no-such","partition":0,"messages":[{"payload":"hi"}]}`
-	resp := ch.HandleCommand("REPLICATE_MESSAGE payload="+payload, ctx)
+	resp := ch.HandleCommand("REPLICATE_MESSAGE "+ch.internalAuthPrefix()+"payload="+payload, ctx)
 	assert.Contains(t, resp, "topic_not_found topic=no-such")
 }
 
 func TestHandleReplicateMessage_EmptyMessages(t *testing.T) {
 	ch, tm := newTestHandler(t)
 	_ = tm.CreateTopic("rep-topic", 1, false, false)
-	ctx := NewClientContext("", 0)
+	ctx := internalReplicationTestContext(ch)
 
 	payload := `{"topic":"rep-topic","partition":0,"messages":[]}`
-	resp := ch.HandleCommand("REPLICATE_MESSAGE payload="+payload, ctx)
+	resp := ch.HandleCommand("REPLICATE_MESSAGE "+ch.internalAuthPrefix()+"payload="+payload, ctx)
 	assert.Contains(t, resp, "empty_messages")
 }
 
 func TestHandleReplicateMessage_Success(t *testing.T) {
 	ch, tm := newTestHandler(t)
 	_ = tm.CreateTopic("rep-topic2", 1, false, false)
-	ctx := NewClientContext("", 0)
+	ctx := internalReplicationTestContext(ch)
 
 	payload := `{"topic":"rep-topic2","partition":0,"messages":[{"offset":0,"payload":"hello","producer_id":"p1"}]}`
-	resp := ch.HandleCommand("REPLICATE_MESSAGE payload="+payload, ctx)
+	resp := ch.HandleCommand("REPLICATE_MESSAGE "+ch.internalAuthPrefix()+"payload="+payload, ctx)
 	assert.Equal(t, "OK leo=1 hwm=0", resp)
 }
 
 func TestHandleReplicateMessage_InvalidPartition(t *testing.T) {
 	ch, tm := newTestHandler(t)
 	_ = tm.CreateTopic("rep-topic3", 1, false, false)
-	ctx := NewClientContext("", 0)
+	ctx := internalReplicationTestContext(ch)
 
 	payload := `{"topic":"rep-topic3","partition":999,"messages":[{"payload":"hi"}]}`
-	resp := ch.HandleCommand("REPLICATE_MESSAGE payload="+payload, ctx)
+	resp := ch.HandleCommand("REPLICATE_MESSAGE "+ch.internalAuthPrefix()+"payload="+payload, ctx)
 	assert.Contains(t, resp, "partition_not_found partition=999")
 }
 
@@ -1301,10 +1307,10 @@ func TestHandleCommitAndFetchOffset_AllowsQuestionMarkGroupTopic(t *testing.T) {
 func TestHandleReplicateSnapshot_SavesFollowerSnapshot(t *testing.T) {
 	ch, tm, _ := newTestHandlerWithCoordinator(t)
 	require.NoError(t, tm.CreateTopic("snap-rep-topic", 1, false, true))
-	ctx := NewClientContext("", 0)
+	ctx := internalReplicationTestContext(ch)
 
 	payload := `{"topic":"snap-rep-topic","key":"agg-1","version":2,"partition":0,"payload":"{\"state\":\"ok\"}"}`
-	resp := ch.HandleCommand("REPLICATE_SNAPSHOT payload="+payload, ctx)
+	resp := ch.HandleCommand("REPLICATE_SNAPSHOT "+ch.internalAuthPrefix()+"payload="+payload, ctx)
 	assert.Equal(t, "OK", resp)
 
 	resp = ch.HandleCommand("READ_SNAPSHOT topic=snap-rep-topic key=agg-1", ctx)
@@ -1697,7 +1703,7 @@ func TestInternalCommandsRequireTokenInDistributedMode(t *testing.T) {
 func TestInternalCommandsRejectMissingTokenConfigInDistributedMode(t *testing.T) {
 	ch, _ := newTestHandler(t)
 	ch.Config.EnabledDistribution = true
-	ctx := NewClientContext("", 0)
+	ctx := NewInternalClientContext("", 0)
 
 	resp := ch.HandleCommand("REPLICATE_MESSAGE payload={}", ctx)
 	assert.Contains(t, resp, "internal_auth_not_configured")
@@ -1708,7 +1714,7 @@ func TestInternalCommandTokenAllowsHandlerDispatch(t *testing.T) {
 	ch.Config.EnabledDistribution = true
 	ch.Config.InternalAuthToken = "secret-token"
 	require.NoError(t, tm.CreateTopic("secure-rep-topic", 1, false, false))
-	ctx := NewClientContext("", 0)
+	ctx := NewInternalClientContext("", 0)
 
 	payload := `{"topic":"secure-rep-topic","partition":0,"messages":[{"offset":0,"payload":"hello","producer_id":"p1"}]}`
 	resp := ch.HandleCommand("REPLICATE_MESSAGE internal_token=secret-token payload="+payload, ctx)

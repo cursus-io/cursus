@@ -38,7 +38,7 @@ type CommandHandler struct {
 
 	coordCache               map[string]coordCacheEntry
 	coordCacheMu             sync.RWMutex
-	topicLifecycleMu         sync.RWMutex
+	topicLifecycleGates      topicLifecycleGates
 	topicCreateMu            sync.Mutex
 	groupRecoveryEpoch       map[uint64]int
 	groupRecoveryMu          sync.Mutex
@@ -206,7 +206,7 @@ func NewCommandHandler(
 		{prefix: "LIST_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListSnapshots(cmd) }},
 		{prefix: "FETCH_SNAPSHOT ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchSnapshot(cmd) }},
 		{prefix: "CATCHUP_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCatchupSnapshots(cmd) }},
-		{prefix: "RAFT_APPLY ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd) }},
+		{prefix: "RAFT_APPLY ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd, ctx) }},
 	}
 	return ch
 }
@@ -281,17 +281,6 @@ func (ch *CommandHandler) HandleCommandContext(requestCtx context.Context, rawCm
 func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (response string) {
 	started := time.Now()
 	input := decodeCommandInput(rawCmd)
-	if input.Name == "DELETE" || input.Name == "TRUNCATE" {
-		ch.topicLifecycleMu.Lock()
-		defer ch.topicLifecycleMu.Unlock()
-	} else {
-		ch.topicLifecycleMu.RLock()
-		defer ch.topicLifecycleMu.RUnlock()
-	}
-	if input.Name == "CREATE" {
-		ch.topicCreateMu.Lock()
-		defer ch.topicCreateMu.Unlock()
-	}
 	cmd := input.Raw
 	commandName := ch.metricCommandNameInput(input)
 	defer func() {
@@ -305,7 +294,7 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 	}
 
 	if name, ok := ch.internalCommandName(input); ok {
-		if resp := ch.authorizeInternalCommand(name, input); resp != "" {
+		if resp := ch.authorizeInternalCommand(name, input, ctx); resp != "" {
 			return ch.fail(rawCmd, resp)
 		}
 	}
@@ -313,7 +302,28 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 	if resp := ch.authorizeClientCommand(input, ctx); resp != "" {
 		return ch.fail(rawCmd, resp)
 	}
-	if topicName := input.Args["topic"]; topicName != "" && ch.TopicManager != nil && ch.TopicManager.IsTruncationPending(topicName) {
+	if _, topicMismatch := raftApplyLifecycleTopic(input); topicMismatch {
+		return ch.fail(rawCmd, "ERROR: raft_apply_topic_mismatch")
+	}
+
+	if topicName := lifecycleTopicName(input); topicName != "" {
+		exclusive := lifecycleOperationExclusive(input)
+		requestCtx := ctx.RequestContext()
+		release, lockErr := ch.topicLifecycleGates.acquire(requestCtx, topicName, exclusive)
+		if lockErr != nil {
+			return ch.fail(rawCmd, "ERROR: request_cancelled")
+		}
+		if requestCtx.Err() != nil {
+			release()
+			return ch.fail(rawCmd, "ERROR: request_cancelled")
+		}
+		defer release()
+	}
+	if input.Name == "CREATE" {
+		ch.topicCreateMu.Lock()
+		defer ch.topicCreateMu.Unlock()
+	}
+	if topicName := lifecycleTopicName(input); topicName != "" && ch.TopicManager != nil && ch.TopicManager.IsTruncationPending(topicName) {
 		switch input.Name {
 		case "TRUNCATE":
 		default:
@@ -365,9 +375,15 @@ func (ch *CommandHandler) internalCommandName(input commandInput) (string, bool)
 	return "", false
 }
 
-func (ch *CommandHandler) authorizeInternalCommand(name string, input commandInput) string {
-	if ch == nil || ch.Config == nil || !ch.Config.EnabledDistribution {
-		return ""
+func (ch *CommandHandler) authorizeInternalCommand(name string, input commandInput, ctx *ClientContext) string {
+	if ctx == nil || !ctx.Internal {
+		return fmt.Sprintf("ERROR: internal_command_unauthorized command=%s", name)
+	}
+	if ch == nil || ch.Config == nil {
+		return fmt.Sprintf("ERROR: internal_auth_not_configured command=%s", name)
+	}
+	if name == "REPLICATE_MESSAGE" && !ch.Config.EnabledDistribution {
+		return fmt.Sprintf("ERROR: distribution_required command=%s", name)
 	}
 	token := ch.Config.InternalAuthToken
 	if token == "" {

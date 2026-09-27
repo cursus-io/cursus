@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"fmt"
 )
 
 type ClientContext struct {
@@ -57,6 +59,14 @@ func (ctx *ClientContext) RequestContext() context.Context {
 		return context.Background()
 	}
 	return ctx.requestContext
+}
+
+// requestTimeoutOutcome formats a timeout as a deadline or client-cancellation result.
+func requestTimeoutOutcome(ctx context.Context, outcome string) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Sprintf("ERROR: request_timeout outcome=%s", outcome)
+	}
+	return "ERROR: request_cancelled"
 }
 
 func (ctx *ClientContext) SetConsumerGroup(groupName string) {

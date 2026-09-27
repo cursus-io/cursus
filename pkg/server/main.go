@@ -549,7 +549,11 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 
 		lastActivity = time.Now()
 		responseConn.setRequest(request)
+		requestCtx, cancelRequest := context.WithTimeout(clientCtx, clientRequestTimeout(cmdHandler.Config))
+		cmdCtx.SetRequestContext(requestCtx)
 		shouldExit, err := processMessage(request.Payload, cmdHandler, cmdCtx, responseConn)
+		cmdCtx.SetRequestContext(clientCtx)
+		cancelRequest()
 		if err != nil {
 			return
 		}
@@ -632,6 +636,13 @@ func clientIdleTimeout(cfg *config.Config) time.Duration {
 	return defaultIdleTimeout
 }
 
+func clientRequestTimeout(cfg *config.Config) time.Duration {
+	if cfg != nil && cfg.ClientRequestTimeoutMS > 0 {
+		return time.Duration(cfg.ClientRequestTimeoutMS) * time.Millisecond
+	}
+	return 30 * time.Second
+}
+
 func internalAuthPrefix(cfg *config.Config) string {
 	if cfg != nil && cfg.InternalAuthToken != "" {
 		return "internal_token=" + cfg.InternalAuthToken + " "
@@ -655,6 +666,7 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 		if err != nil {
 			return false, err
 		}
+		resp = requestDeadlineResponse(resp, ctx)
 		if !suppressBatchPublishResponse(data, ctx) {
 			writeResponse(conn, decorateServerResponse(resp, ctx))
 		}
@@ -723,7 +735,7 @@ func handleInternalBatchMessage(payload string, cmdHandler *controller.CommandHa
 	if err != nil {
 		return false, err
 	}
-	writeResponse(conn, resp)
+	writeResponse(conn, requestDeadlineResponse(resp, ctx))
 	return false, nil
 }
 
@@ -774,10 +786,18 @@ func handleCommandMessage(payload string, cmdHandler *controller.CommandHandler,
 	if resp == "" {
 		resp = "ERROR: empty_command_response"
 	}
+	resp = requestDeadlineResponse(resp, ctx)
 	if !suppressPublishResponse(payload, ctx) {
 		writeResponse(conn, decorateServerResponse(resp, ctx))
 	}
 	return false, nil
+}
+
+func requestDeadlineResponse(response string, ctx *controller.ClientContext) string {
+	if ctx != nil && errors.Is(ctx.RequestContext().Err(), context.DeadlineExceeded) && response == "ERROR: request_cancelled" {
+		return "ERROR: request_timeout outcome=not_accepted"
+	}
+	return response
 }
 
 func suppressPublishResponse(payload string, ctx *controller.ClientContext) bool {

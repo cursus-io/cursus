@@ -14,7 +14,7 @@ type ReplicaCatchupFetcher interface {
 	FetchReplicaCatchup(context.Context, string, int, fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error)
 }
 
-type ReplicaCatchupApplier func(fsm.ReplicaCatchupBatch) error
+type ReplicaCatchupApplier func(context.Context, fsm.ReplicaCatchupBatch) error
 
 // StartReplicaCatchup periodically fills local replicas that are outside ISR.
 // ISR admission remains separate and happens only through the existing proof
@@ -40,6 +40,9 @@ func (cc *ClusterController) StartReplicaCatchup(ctx context.Context, fetcher Re
 }
 
 func (cc *ClusterController) RunReplicaCatchupOnce(ctx context.Context, fetcher ReplicaCatchupFetcher, apply ReplicaCatchupApplier) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
 		return fmt.Errorf("FSM is unavailable")
 	}
@@ -51,6 +54,9 @@ func (cc *ClusterController) RunReplicaCatchupOnce(ctx context.Context, fetcher 
 	requests := fsmState.BuildReplicaCatchupRequests(cc.brokerID)
 	var catchupErr error
 	for _, request := range requests {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(catchupErr, err)
+		}
 		if err := cc.catchupReplica(ctx, fetcher, apply, request); err != nil {
 			catchupErr = errors.Join(catchupErr, fmt.Errorf("%s-%d: %w", request.Topic, request.Partition, err))
 		}
@@ -65,6 +71,9 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		discoveryPort = cc.Config.DiscoveryPort
 	}
 	for request.NextOffset < request.CommittedHWM {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		batch, err := fetcher.FetchReplicaCatchup(fetchCtx, request.SourceAddress, discoveryPort, request)
 		cancel()
@@ -74,7 +83,7 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		if err := validateReplicaCatchupBatch(request, batch); err != nil {
 			return err
 		}
-		if err := apply(batch); err != nil {
+		if err := apply(ctx, batch); err != nil {
 			return err
 		}
 		nextOffset := batch.EndOffset

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
@@ -12,7 +13,7 @@ import (
 // local replica. Compacted ranges may contain physical offset holes. It advances
 // HWM only when the complete committed range is present; ISR admission remains
 // the heartbeat proof's responsibility.
-func (ch *CommandHandler) ApplyReplicaCatchup(batch replicationFSM.ReplicaCatchupBatch) error {
+func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replicationFSM.ReplicaCatchupBatch) error {
 	if ch == nil || ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.TopicManager == nil {
 		return fmt.Errorf("replica catch-up dependencies are unavailable")
 	}
@@ -26,8 +27,14 @@ func (ch *CommandHandler) ApplyReplicaCatchup(batch replicationFSM.ReplicaCatchu
 		return fmt.Errorf("invalid replica catch-up batch size %d", len(batch.Messages))
 	}
 
-	ch.topicLifecycleMu.RLock()
-	defer ch.topicLifecycleMu.RUnlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	releaseLifecycle, err := ch.topicLifecycleGates.acquire(ctx, batch.Topic, false)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	writeLock := ch.partitionWriteLock(batch.Topic, batch.Partition)
 	writeLock.Lock()
 	defer writeLock.Unlock()
