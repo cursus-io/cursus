@@ -10,6 +10,11 @@ import (
 
 // lifecycleTopicName extracts the topic affected by a lifecycle-sensitive command.
 func lifecycleTopicName(input commandInput) string {
+	if input.Name == "RAFT_APPLY" && lifecycleOperationExclusive(input) {
+		if topicName, _ := raftApplyLifecycleTopic(input); topicName != "" {
+			return topicName
+		}
+	}
 	if topicName := input.Args["topic"]; topicName != "" {
 		return topicName
 	}
@@ -33,6 +38,22 @@ func lifecycleTopicName(input commandInput) string {
 		}
 	}
 	return ""
+}
+
+// raftApplyLifecycleTopic returns the topic used by the mutation payload and
+// whether the optional outer topic argument conflicts with it.
+func raftApplyLifecycleTopic(input commandInput) (string, bool) {
+	if input.Name != "RAFT_APPLY" || !lifecycleOperationExclusive(input) {
+		return "", false
+	}
+	var payload struct {
+		Topic string `json:"topic"`
+	}
+	if err := json.Unmarshal([]byte(commandPayload(input.Raw)), &payload); err != nil || payload.Topic == "" {
+		return "", false
+	}
+	outerTopic := input.Args["topic"]
+	return payload.Topic, outerTopic != "" && outerTopic != payload.Topic
 }
 
 // lifecycleOperationExclusive identifies commands that mutate topic existence or data.

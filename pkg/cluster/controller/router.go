@@ -249,6 +249,10 @@ func (r *ClusterRouter) forwardWithTimeout(addr, req string) (string, error) {
 }
 
 func (r *ClusterRouter) ForwardDataToLeader(data []byte) (string, error) {
+	return r.ForwardDataToLeaderContext(context.Background(), data)
+}
+
+func (r *ClusterRouter) ForwardDataToLeaderContext(ctx context.Context, data []byte) (string, error) {
 	leader, err := r.getLeader()
 	if err != nil {
 		return "", err
@@ -258,19 +262,23 @@ func (r *ClusterRouter) ForwardDataToLeader(data []byte) (string, error) {
 		return "", fmt.Errorf("internal routing error: cannot forward batch data to self")
 	}
 
-	return r.forwardDataWithTimeout(leader, data)
+	return r.forwardDataWithTimeoutContext(ctx, leader, data)
 }
 
 func (r *ClusterRouter) ForwardDataToPartitionLeader(topic string, partition int, data []byte) (string, error) {
+	return r.ForwardDataToPartitionLeaderContext(context.Background(), topic, partition, data)
+}
+
+func (r *ClusterRouter) ForwardDataToPartitionLeaderContext(ctx context.Context, topic string, partition int, data []byte) (string, error) {
 	fsm := r.rm.GetFSM()
 	if fsm == nil {
-		return r.ForwardDataToLeader(data)
+		return r.ForwardDataToLeaderContext(ctx, data)
 	}
 
 	partitionKey := topic + "-" + strconv.Itoa(partition)
 	meta := fsm.GetPartitionMetadata(partitionKey)
 	if meta == nil {
-		return r.ForwardDataToLeader(data)
+		return r.ForwardDataToLeaderContext(ctx, data)
 	}
 
 	if meta.Leader == r.brokerID {
@@ -282,17 +290,17 @@ func (r *ClusterRouter) ForwardDataToPartitionLeader(topic string, partition int
 		return "", fmt.Errorf("partition leader broker %s not found in registry", meta.Leader)
 	}
 
-	return r.forwardDataWithTimeout(broker.Addr, data)
+	return r.forwardDataWithTimeoutContext(ctx, broker.Addr, data)
 }
 
-func (r *ClusterRouter) forwardDataWithTimeout(addr string, data []byte) (string, error) {
+func (r *ClusterRouter) forwardDataWithTimeoutContext(ctx context.Context, addr string, data []byte) (string, error) {
 	host, _, splitErr := net.SplitHostPort(addr)
 	if splitErr != nil {
 		return "", fmt.Errorf("invalid address format %s: %w", addr, splitErr)
 	}
 
 	clientAddr := r.brokerCommandAddr(host)
-	return r.sendDataRequest(clientAddr, r.wrapInternalBatch(data))
+	return r.sendDataRequestContext(ctx, clientAddr, r.wrapInternalBatch(data))
 }
 
 func (r *ClusterRouter) brokerCommandAddr(host string) string {
@@ -354,22 +362,38 @@ func (r *ClusterRouter) sendRequest(addr, command string) (string, error) {
 }
 
 func (r *ClusterRouter) sendDataRequest(addr string, data []byte) (string, error) {
+	return r.sendDataRequestContext(context.Background(), addr, data)
+}
+
+func (r *ClusterRouter) sendDataRequestContext(ctx context.Context, addr string, data []byte) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
 	var conn net.Conn
 	var err error
 	if r.internalTLS != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
-		defer cancel()
 		tlsDialer := &tls.Dialer{NetDialer: &net.Dialer{}, Config: r.internalTLS}
-		conn, err = tlsDialer.DialContext(ctx, "tcp", addr)
+		conn, err = tlsDialer.DialContext(dialCtx, "tcp", addr)
 	} else {
-		conn, err = (&net.Dialer{Timeout: r.timeout}).Dial("tcp", addr)
+		conn, err = (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
 	}
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = conn.Close() }()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stopCancel()
 
-	if err := conn.SetDeadline(time.Now().Add(r.timeout)); err != nil {
+	deadline := time.Now().Add(r.timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
 		return "", err
 	}
 

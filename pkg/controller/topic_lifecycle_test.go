@@ -273,6 +273,21 @@ func TestInternalRaftTopicLifecycleApplyUsesExclusiveGate(t *testing.T) {
 	}
 }
 
+func TestInternalRaftTopicLifecycleApplyRejectsConflictingOuterTopic(t *testing.T) {
+	handler, _, _ := newDistributedLifecycleHandler(t)
+	handler.Config.InternalAuthToken = "secret-token"
+	ctx := NewInternalClientContext("", 0)
+	for _, topicName := range []string{"orders", "other"} {
+		response := handler.HandleCommand("CREATE topic="+topicName+" partitions=1 replication_factor=1", NewClientContext("", 0))
+		require.Contains(t, response, "OK topic="+topicName)
+	}
+
+	response := handler.HandleCommand(`RAFT_APPLY internal_token=secret-token type=TOPIC_DELETE topic=other payload={"topic":"orders","if_exists":false}`, ctx)
+	require.Equal(t, "ERROR: raft_apply_topic_mismatch", response)
+	require.NotNil(t, handler.TopicManager.GetTopic("orders"))
+	require.NotNil(t, handler.TopicManager.GetTopic("other"))
+}
+
 func newDistributedLifecycleHandler(t *testing.T) (*CommandHandler, *fsm.BrokerFSM, *coordinator.Coordinator) {
 	t.Helper()
 	cfg := config.DefaultConfig()

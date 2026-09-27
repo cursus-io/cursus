@@ -657,17 +657,23 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			var lastErr error
 
 			for i := 0; i < maxRetries; i++ {
+				if requestCtx.Err() != nil {
+					return requestTimeoutOutcome(requestCtx, "not_accepted"), nil
+				}
 				util.Debug("Not Partition leader, forwarding BATCH (Attempt %d/%d)", i+1, maxRetries)
-				resp, forwardErr := ch.Cluster.Router.ForwardDataToPartitionLeader(batch.Topic, batch.Partition, data)
+				resp, forwardErr := ch.Cluster.Router.ForwardDataToPartitionLeaderContext(requestCtx, batch.Topic, batch.Partition, data)
 				if forwardErr == nil {
 					return resp, nil
+				}
+				if requestCtx.Err() != nil {
+					return requestTimeoutOutcome(requestCtx, "unknown"), nil
 				}
 
 				util.Debug("Failed to forward batch to Partition leader: %v", forwardErr)
 
 				if i < maxRetries-1 {
 					if err := waitForContext(requestCtx, retryDelay); err != nil {
-						return "ERROR: request_cancelled", nil
+						return requestTimeoutOutcome(requestCtx, "unknown"), nil
 					}
 				}
 				lastErr = forwardErr

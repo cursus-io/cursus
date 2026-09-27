@@ -206,7 +206,7 @@ func NewCommandHandler(
 		{prefix: "LIST_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListSnapshots(cmd) }},
 		{prefix: "FETCH_SNAPSHOT ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchSnapshot(cmd) }},
 		{prefix: "CATCHUP_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCatchupSnapshots(cmd) }},
-		{prefix: "RAFT_APPLY ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd) }},
+		{prefix: "RAFT_APPLY ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd, ctx) }},
 	}
 	return ch
 }
@@ -301,6 +301,9 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 
 	if resp := ch.authorizeClientCommand(input, ctx); resp != "" {
 		return ch.fail(rawCmd, resp)
+	}
+	if _, topicMismatch := raftApplyLifecycleTopic(input); topicMismatch {
+		return ch.fail(rawCmd, "ERROR: raft_apply_topic_mismatch")
 	}
 
 	if topicName := lifecycleTopicName(input); topicName != "" {
