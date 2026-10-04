@@ -204,12 +204,68 @@ func (p *Partition) validateProducerMessageWithStage(msg *types.Message, staged 
 		return p.validateAgainstProducerState(msg, entry.lastEpoch, entry.lastSeq, true)
 	}
 
+	recovered, err := p.recoverProducerState(msg.ProducerID)
+	if err != nil {
+		return false, fmt.Errorf("recover producer state for %s: %w", msg.ProducerID, err)
+	}
+	if recovered != nil {
+		p.producerState.Store(msg.ProducerID, recovered)
+		return p.validateAgainstProducerState(msg, recovered.lastEpoch, recovered.lastSeq, true)
+	}
+
 	if msg.SeqNum != 1 {
 		return false, fmt.Errorf("idempotency error: first message for producer %s must have seqNum 1, got %d", msg.ProducerID, msg.SeqNum)
 	}
 
 	return false, nil
 }
+
+// recoverProducerState reconstructs an evicted producer cache entry from the
+// retained durable log. The in-memory TTL bounds cache growth, but it must not
+// make a live idempotent producer unusable after a quiet period.
+//
+// The caller holds p.mu, so no local append can race this scan.
+func (p *Partition) recoverProducerState(producerID string) (*producerEntry, error) {
+	if producerID == "" || p.dh == nil || p.producerStatePath == "" {
+		return nil, nil
+	}
+
+	offset := p.dh.GetFirstOffset()
+	tail := p.dh.GetAbsoluteOffset()
+	var recovered *producerEntry
+	for offset < tail {
+		messages, err := p.dh.ReadMessages(offset, 1024)
+		if err != nil {
+			return nil, err
+		}
+		if len(messages) == 0 {
+			break
+		}
+
+		for i := range messages {
+			message := &messages[i]
+			if message.ProducerID != producerID || message.SeqNum == 0 {
+				continue
+			}
+			if recovered == nil || message.Epoch > recovered.lastEpoch ||
+				(message.Epoch == recovered.lastEpoch && message.SeqNum > recovered.lastSeq) {
+				recovered = &producerEntry{lastEpoch: message.Epoch, lastSeq: message.SeqNum}
+			}
+		}
+
+		next := messages[len(messages)-1].Offset + 1
+		if next <= offset {
+			return nil, fmt.Errorf("producer state scan did not advance from offset %d", offset)
+		}
+		offset = next
+	}
+
+	if recovered != nil {
+		recovered.lastSeen = time.Now()
+	}
+	return recovered, nil
+}
+
 func (p *Partition) validateAgainstProducerState(msg *types.Message, lastEpoch int64, lastSeq uint64, allowDuplicate bool) (bool, error) {
 	if msg.Epoch < lastEpoch {
 		return false, fmt.Errorf("stale_producer_epoch producer=%s current=%d got=%d", msg.ProducerID, lastEpoch, msg.Epoch)
@@ -1633,6 +1689,9 @@ func producerStateTTLFromConfig(cfg *config.Config) time.Duration {
 
 // cleanStaleProducers removes producer entries that have not been seen within the TTL.
 func (p *Partition) cleanStaleProducers() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	ttl := p.producerStateTTL
 	if ttl <= 0 {
 		ttl = defaultProducerStateTTL
