@@ -292,6 +292,11 @@ func (c *Coordinator) DeleteGroup(groupName string) error {
 		c.mu.Unlock()
 		return fmt.Errorf("cannot delete group %q with active members", groupName)
 	}
+	if len(group.OffsetReservations) != 0 {
+		group.mu.Unlock()
+		c.mu.Unlock()
+		return fmt.Errorf("cannot delete group %q with pending transaction offset reservations", groupName)
+	}
 	epoch := c.groupEpochs[groupName]
 	if group.RegistrationEpoch > epoch {
 		epoch = group.RegistrationEpoch

@@ -124,6 +124,87 @@ func TestStandaloneCorruptConsumerRecordFailsRecovery(t *testing.T) {
 	require.Equal(t, 1, restarted.RecoverySnapshot().CorruptRecords)
 }
 
+func TestStandaloneTransactionOffsetReservationSurvivesDiskRestart(t *testing.T) {
+	for _, committed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "abort", true: "commit"}[committed], func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			cfg.LogDir = t.TempDir()
+			dm, tm, cd := startStandaloneCoordinator(t, cfg, false)
+			require.NoError(t, tm.CreateTopic("events", 2, false, false))
+			require.NoError(t, cd.RegisterGroup("events", "workers", 2))
+			_, err := cd.AddConsumer("workers", "worker")
+			require.NoError(t, err)
+			require.NoError(t, cd.CommitOffset("workers", "events", 0, 3))
+			epoch := cd.GetRegistrationEpoch("workers")
+			reservation := coordinator.TransactionOffsetReservation{
+				TransactionalID: "tx", ProducerID: "producer", MemberID: "worker", Generation: cd.GetGeneration("workers"),
+				Offsets: []coordinator.ReservedTransactionOffset{{Topic: "events", Partition: 0, Offset: 10}},
+			}
+			require.NoError(t, cd.PrepareOffsetReservation("workers", epoch, reservation))
+			require.NoError(t, cd.RemoveConsumerForGeneration("workers", "worker", reservation.Generation))
+			cd.Stop()
+			tm.Stop()
+			dm.CloseAllHandlers()
+
+			restartedDM, restartedTM, restarted := startStandaloneCoordinator(t, cfg, true)
+			require.Empty(t, restarted.GetGroup("workers").Members, "the old consumer departed before restart")
+			_, _, err = restarted.GetStableOffset("workers", "events", 0)
+			require.ErrorContains(t, err, "unstable_offset_commit", "the durable reservation must fence replacement consumers after restart")
+			require.NoError(t, restarted.PrepareOffsetReservation("workers", epoch, reservation), "the existing authorization survives loss of membership")
+			require.NoError(t, restarted.ResolveOffsetReservation("workers", epoch, "tx", "producer", 0, committed))
+			restarted.Stop()
+			restartedTM.Stop()
+			restartedDM.CloseAllHandlers()
+
+			_, _, final := startStandaloneCoordinator(t, cfg, true)
+			offset, found, err := final.GetStableOffset("workers", "events", 0)
+			require.NoError(t, err, "the release checkpoint must survive a second restart")
+			require.True(t, found)
+			want := uint64(3)
+			if committed {
+				want = 10
+			}
+			require.Equal(t, want, offset)
+			require.Empty(t, final.GetGroup("workers").OffsetReservations)
+			require.NoError(t, final.ResolveOffsetReservation("workers", epoch, "tx", "producer", 0, committed))
+		})
+	}
+}
+
+func TestDistributedReservationRecoveryPastUnresolvedTransaction(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	_, tm, cd := startStandaloneCoordinator(t, cfg, false)
+	require.NoError(t, tm.CreateTopic("events", 1, false, false))
+	require.NoError(t, cd.RegisterGroup("events", "workers", 1))
+	_, err := cd.AddConsumer("workers", "worker")
+	require.NoError(t, err)
+	require.NoError(t, cd.CommitOffset("workers", "events", 0, 3))
+	reservation := coordinator.TransactionOffsetReservation{
+		TransactionalID: "tx", ProducerID: "producer", MemberID: "worker", Generation: cd.GetGeneration("workers"),
+		Offsets: []coordinator.ReservedTransactionOffset{{Topic: "events", Partition: 0, Offset: 10}},
+	}
+	// Unrelated unresolved transactional records pin the ordinary read_committed
+	// view. Later nontransactional metadata is still replication-committed.
+	for partition := range tm.GetTopic(config.ConsumerOffsetsTopicName).Partitions {
+		require.NoError(t, tm.PublishToPartitionWithAck(config.ConsumerOffsetsTopicName, partition, &types.Message{
+			Key: "unresolved", Payload: "pending", ProducerID: "pending-producer", SeqNum: 1,
+			TransactionalID: "unresolved", TransactionState: types.TransactionStateOpen,
+		}))
+	}
+	require.NoError(t, cd.PrepareOffsetReservation("workers", cd.GetRegistrationEpoch("workers"), reservation))
+	require.NoError(t, cd.RemoveConsumerForGeneration("workers", "worker", reservation.Generation))
+	cd.Stop()
+	distributed := *cfg
+	distributed.EnabledDistribution = true
+	recovered, err := coordinator.NewCoordinatorWithRecovery(context.Background(), &distributed, tm)
+	t.Cleanup(recovered.Stop)
+	require.NoError(t, err)
+	require.Empty(t, recovered.GetGroup("workers").Members, "later durable membership must not disappear behind an unrelated transaction")
+	_, _, err = recovered.GetStableOffset("workers", "events", 0)
+	require.ErrorContains(t, err, "unstable_offset_commit", "recovery must see the reservation beyond the last stable offset")
+}
+
 func startStandaloneCoordinator(t *testing.T, cfg *config.Config, restore bool) (*disk.DiskManager, *topic.TopicManager, *coordinator.Coordinator) {
 	t.Helper()
 	dm := disk.NewDiskManager(cfg)

@@ -64,6 +64,10 @@ type committedOffsetLogReader interface {
 	ReadCommittedTopicPartition(topic string, partitionID int, offset uint64, max int) ([]types.Message, error)
 }
 
+type committedConsumerMetadataReader interface {
+	ReadCommittedConsumerMetadata(topic string, partitionID int, offset uint64, max int) ([]types.Message, error)
+}
+
 type offsetTopicPartitionProvider interface {
 	ExistingPartitionCount(topic string) (int, error)
 }
@@ -117,6 +121,8 @@ type GroupMetadata struct {
 	RegistrationEpoch    uint64                     // durable lifecycle epoch
 	RegistrationInferred bool                       // compatibility shell still requires durable registration
 	OffsetRevisions      map[string]uint64          // topic -> durable snapshot revision
+	OffsetReservations   []TransactionOffsetReservation
+	ReservationRevision  uint64
 }
 
 // MemberMetadata holds state for a single consumer instance.
@@ -134,21 +140,23 @@ type TopicPartition struct {
 
 // GroupStateSnapshot is a serializable snapshot of a consumer group's state.
 type GroupStateSnapshot struct {
-	TopicName            string                      `json:"topic"`
-	Topics               []string                    `json:"topics,omitempty"`
-	TopicPattern         string                      `json:"topic_pattern,omitempty"`
-	TopicPartitions      []TopicPartition            `json:"topic_partitions,omitempty"`
-	Generation           int                         `json:"generation"`
-	Members              map[string][]int            `json:"members"`
-	TopicAssignments     map[string][]TopicPartition `json:"topic_assignments,omitempty"`
-	Partitions           []int                       `json:"partitions,omitempty"`
-	LastRebalance        time.Time                   `json:"last_rebalance,omitempty"`
-	LastActivity         time.Time                   `json:"last_activity,omitempty"`
-	Offsets              map[string]map[int]uint64   `json:"offsets"`
-	RegistrationEpoch    uint64                      `json:"registration_epoch,omitempty"`
-	RegistrationInferred bool                        `json:"registration_inferred,omitempty"`
-	OffsetRevisions      map[string]uint64           `json:"offset_revisions,omitempty"`
-	Deleted              bool                        `json:"deleted,omitempty"`
+	TopicName            string                         `json:"topic"`
+	Topics               []string                       `json:"topics,omitempty"`
+	TopicPattern         string                         `json:"topic_pattern,omitempty"`
+	TopicPartitions      []TopicPartition               `json:"topic_partitions,omitempty"`
+	Generation           int                            `json:"generation"`
+	Members              map[string][]int               `json:"members"`
+	TopicAssignments     map[string][]TopicPartition    `json:"topic_assignments,omitempty"`
+	Partitions           []int                          `json:"partitions,omitempty"`
+	LastRebalance        time.Time                      `json:"last_rebalance,omitempty"`
+	LastActivity         time.Time                      `json:"last_activity,omitempty"`
+	Offsets              map[string]map[int]uint64      `json:"offsets"`
+	RegistrationEpoch    uint64                         `json:"registration_epoch,omitempty"`
+	RegistrationInferred bool                           `json:"registration_inferred,omitempty"`
+	OffsetRevisions      map[string]uint64              `json:"offset_revisions,omitempty"`
+	OffsetReservations   []TransactionOffsetReservation `json:"offset_reservations,omitempty"`
+	ReservationRevision  uint64                         `json:"reservation_revision,omitempty"`
+	Deleted              bool                           `json:"deleted,omitempty"`
 }
 
 // GroupStatus represents the status of a consumer group
@@ -907,6 +915,8 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 			RegistrationEpoch:    group.RegistrationEpoch,
 			RegistrationInferred: group.RegistrationInferred,
 			OffsetRevisions:      make(map[string]uint64, len(group.OffsetRevisions)),
+			OffsetReservations:   cloneOffsetReservations(group.OffsetReservations),
+			ReservationRevision:  group.ReservationRevision,
 		}
 		for mid, member := range group.Members {
 			assignments := make([]int, len(member.Assignments))
@@ -970,6 +980,8 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) error {
 			RegistrationEpoch:    snap.RegistrationEpoch,
 			RegistrationInferred: snap.RegistrationInferred,
 			OffsetRevisions:      make(map[string]uint64, len(snap.OffsetRevisions)),
+			OffsetReservations:   cloneOffsetReservations(snap.OffsetReservations),
+			ReservationRevision:  snap.ReservationRevision,
 		}
 		for mid, assignments := range snap.Members {
 			group.Members[mid] = &MemberMetadata{
@@ -1009,6 +1021,9 @@ func ValidateImportState(state map[string]*GroupStateSnapshot) error {
 			return fmt.Errorf("consumer group %q snapshot is missing registration epoch; clean bootstrap is required", name)
 		}
 		if snap.Deleted {
+			if len(snap.OffsetReservations) != 0 || snap.ReservationRevision != 0 {
+				return fmt.Errorf("consumer group %q tombstone contains offset reservations", name)
+			}
 			if snap.TopicName != "" || len(snap.Topics) != 0 || snap.TopicPattern != "" ||
 				len(snap.TopicPartitions) != 0 || snap.Generation != 0 || len(snap.Members) != 0 ||
 				len(snap.TopicAssignments) != 0 || len(snap.Partitions) != 0 || len(snap.Offsets) != 0 ||
@@ -1019,6 +1034,19 @@ func ValidateImportState(state map[string]*GroupStateSnapshot) error {
 		}
 		if snap.Generation < 0 {
 			return fmt.Errorf("consumer group %q snapshot has negative generation %d", name, snap.Generation)
+		}
+		if len(snap.OffsetReservations) != 0 && snap.ReservationRevision == 0 {
+			return fmt.Errorf("consumer group %q reservations lack a durable revision", name)
+		}
+		if err := validateOffsetReservations(snap.OffsetReservations); err != nil {
+			return fmt.Errorf("consumer group %q reservations: %w", name, err)
+		}
+		for _, reservation := range snap.OffsetReservations {
+			for _, offset := range reservation.Offsets {
+				if !snapshotTopicMatches(snap, offset.Topic) || !snapshotPartitionDeclared(snap, offset.Topic, offset.Partition) {
+					return fmt.Errorf("consumer group %q reservation references an undeclared partition", name)
+				}
+			}
 		}
 		if snap.LastActivity.IsZero() {
 			return fmt.Errorf("consumer group %q snapshot is missing last activity; clean bootstrap is required", name)

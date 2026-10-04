@@ -58,6 +58,9 @@ func (c *Coordinator) commitOffsetForGroup(gm *GroupMetadata, groupName, topic s
 }
 
 func (c *Coordinator) commitOffsetForGroupLocked(gm *GroupMetadata, groupName, topic string, partition int, offset uint64) error {
+	if err := reservedOffsetError(gm, groupName, topic, partition); err != nil {
+		return err
+	}
 	if err := validateGroupTopicLocked(gm, groupName, topic); err != nil {
 		return err
 	}
@@ -424,6 +427,9 @@ func validateOffsetBatchLocked(group *GroupMetadata, groupName, topic string, of
 		if _, exists := seen[item.Partition]; exists {
 			return fmt.Errorf("ERROR: duplicate_partition partition=%d group=%s topic=%s", item.Partition, groupName, topic)
 		}
+		if err := reservedOffsetError(group, groupName, topic, item.Partition); err != nil {
+			return err
+		}
 		seen[item.Partition] = struct{}{}
 		if current, exists := group.getOffsetSafe(topic, item.Partition); exists && item.Offset < current {
 			return fmt.Errorf(
@@ -535,10 +541,20 @@ func (c *Coordinator) LoadOffsetsFromLog(reader OffsetLogReader) error {
 // __consumer_offsets partition, so a partition leader can rebuild its local
 // fencing state without consulting controller Raft.
 func (c *Coordinator) loadDistributedOffsetsFromLog(reader OffsetLogReader) (ConsumerMetadataRecoveryStatus, error) {
-	if committed, ok := reader.(committedOffsetLogReader); ok {
+	if metadata, ok := reader.(committedConsumerMetadataReader); ok {
+		reader = committedConsumerMetadataAdapter{reader: metadata}
+	} else if committed, ok := reader.(committedOffsetLogReader); ok {
 		reader = committedOffsetReaderAdapter{reader: committed}
 	}
 	return c.recoverConsumerMetadata(reader)
+}
+
+type committedConsumerMetadataAdapter struct {
+	reader committedConsumerMetadataReader
+}
+
+func (adapter committedConsumerMetadataAdapter) ReadTopicPartition(topic string, partitionID int, offset uint64, max int) ([]types.Message, error) {
+	return adapter.reader.ReadCommittedConsumerMetadata(topic, partitionID, offset, max)
 }
 
 type committedOffsetReaderAdapter struct {

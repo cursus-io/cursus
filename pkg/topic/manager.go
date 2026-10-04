@@ -397,6 +397,25 @@ func (tm *TopicManager) ReadCommittedTopicPartition(topicName string, partitionI
 	return p.ReadCommitted(offset, max)
 }
 
+// ReadCommittedConsumerMetadata recovers durable control records even when an
+// unrelated open transaction precedes them. It remains bounded by replication
+// commitment and filters unresolved transactional records, but does not stop at
+// the last stable offset used for application consumers.
+func (tm *TopicManager) ReadCommittedConsumerMetadata(topicName string, partitionID int, offset uint64, max int) ([]types.Message, error) {
+	if topicName != config.ConsumerOffsetsTopicName {
+		return nil, fmt.Errorf("consumer metadata recovery reader cannot read topic %q", topicName)
+	}
+	t := tm.GetTopic(topicName)
+	if t == nil {
+		return nil, fmt.Errorf("topic %q does not exist", topicName)
+	}
+	p, err := t.GetPartition(partitionID)
+	if err != nil {
+		return nil, err
+	}
+	return p.readCommittedMetadata(offset, max)
+}
+
 // EarliestTopicOffset returns the earliest retained logical offset without
 // creating or mutating a topic. Consumer metadata recovery uses it only after
 // the internal topic has been validated and opened.

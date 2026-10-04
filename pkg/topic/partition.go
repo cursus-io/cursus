@@ -861,6 +861,25 @@ func (p *Partition) ReadCommittedRange(offset, endOffset uint64, max int) ([]typ
 	return p.readVisibleCommitted(offset, max, hwm, readEnd)
 }
 
+func (p *Partition) readCommittedMetadata(offset uint64, max int) ([]types.Message, error) {
+	if max <= 0 {
+		return nil, nil
+	}
+	p.mu.RLock()
+	hwm := p.HWM
+	p.mu.RUnlock()
+	if flushed := p.dh.GetFlushedOffset(); flushed < hwm {
+		hwm = flushed
+	}
+	earliest := p.dh.GetFirstOffset()
+	if offset < earliest {
+		return nil, &types.OffsetOutOfRangeError{Requested: offset, Earliest: earliest, Latest: hwm}
+	}
+	p.txnMarkerMu.RLock()
+	defer p.txnMarkerMu.RUnlock()
+	return p.readCommittedScanRange(offset, hwm, hwm, max, p.txnMarkers, p.txnResolver)
+}
+
 func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm, readEnd uint64) ([]types.Message, error) {
 	messages, _, _, err := p.readVisibleCommittedBounded(offset, max, 0, true, hwm, readEnd)
 	return messages, err

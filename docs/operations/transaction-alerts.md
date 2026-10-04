@@ -33,3 +33,26 @@ continuing the remaining batch. A storage or coordinator failure for one
 transaction must not suppress timeout resolution for unrelated transactions.
 Prepared commit recovery after consumer membership changes remains a separate
 operational risk until its fencing and offset-visibility contracts are resolved.
+
+The coordinator persistence layer supports version 5 offset-reservation
+snapshots. These bind a transaction and producer epoch to its input partitions
+independently of later membership changes. A pending reservation fences stable
+offset reads, ordinary offset commits, and group deletion; commit resolution
+persists monotonic offsets before releasing the fence. Ambiguous append errors
+retain the fence and retries use a new snapshot revision. Older brokers cannot
+read version 5 records, so a data directory containing them must not be opened
+with an older binary.
+
+Distributed consumer-metadata recovery scans replication-committed control
+records beyond unrelated open transactions. Application read-committed reads
+still stop at the last stable offset. Recovery filters unresolved transactional
+records and never reads past the flushed replication high-water mark; otherwise
+a pending transaction could hide a later membership or reservation checkpoint.
+An unreadable reservation record fails recovery instead of silently dropping
+its input fence.
+
+This storage layer alone does not resolve the prepared-commit risk above.
+Transaction commands do not yet create these reservations or use stable offset
+reads. Controller integration must validate all group-coordinator RPCs, cover
+abort and timeout cleanup, and gate activation on cluster compatibility before
+claiming recovery across membership changes.
