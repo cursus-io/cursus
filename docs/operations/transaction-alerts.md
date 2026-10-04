@@ -52,7 +52,21 @@ An unreadable reservation record fails recovery instead of silently dropping
 its input fence.
 
 This storage layer alone does not resolve the prepared-commit risk above.
-Transaction commands do not yet create these reservations or use stable offset
-reads. Controller integration must validate all group-coordinator RPCs, cover
-abort and timeout cleanup, and gate activation on cluster compatibility before
-claiming recovery across membership changes.
+Transaction commands do not yet create these reservations. Controller integration
+must validate all reservation RPCs, cover abort and timeout cleanup, and gate
+activation on cluster compatibility before claiming recovery across membership
+changes.
+
+`FETCH_OFFSET`, `CONSUME`, and `STREAM` use the group coordinator's stable offset
+view. A pending reservation returns the retryable availability error
+`unstable_offset_commit`; existing consume caches and running streams also check
+this fence. Consume caches are scoped to the group, member, and generation so a
+reused connection cannot skip another consumer's input. A failed coordinator read
+never falls back to a partition leader's potentially stale local group state.
+
+Internal resume lookups request `FETCH_OFFSET ... include_found=true` to
+distinguish a committed zero from a group with no committed offset. The default
+public response remains `OK offset=N`. Old coordinators without the explicit
+`found` field fail these internal lookups closed. Mixed-version consumption is
+therefore not yet a supported upgrade path; reservation activation and rollout
+compatibility remain a release gate.

@@ -165,16 +165,20 @@ func (ch *CommandHandler) readFromTopicBounded(topicName string, cArgs CommonArg
 		return nil, 0, fmt.Errorf("%s topic=%s", authResp, topicName)
 	}
 
-	cacheKey := fmt.Sprintf("%s-%d", topicName, cArgs.PartitionID)
-	var currentOffset uint64
+	// Check stability even on a reused connection: cached positions cannot
+	// authorize reads while the group's coordinator is resolving a transaction.
+	savedOffset, found, err := ch.stableGroupOffset(cArgs.GroupName, topicName, cArgs.PartitionID)
+	if err != nil {
+		return nil, 0, err
+	}
+	currentOffset := savedOffset
+	cacheKey := consumerOffsetCacheKey(topicName, cArgs)
 	if cached, ok := ctx.OffsetCache[cacheKey]; ok {
-		currentOffset = cached
-	} else {
-		actualOffset, err := ch.resolveOffset(p, topicName, cArgs)
-		if err != nil {
-			return nil, 0, err
+		if cached > currentOffset {
+			currentOffset = cached
 		}
-		currentOffset = actualOffset
+	} else if !found {
+		currentOffset = resetConsumerOffset(p, cArgs)
 	}
 
 	messages, decodedBytes, nextScan, err := readPartitionPage(p, currentOffset, batchSize, maxBytes, allowOversizedFirst, cArgs.ReadIsolation)
@@ -255,6 +259,10 @@ func waitForConsumeNotification(ctx context.Context, timeout time.Duration, noti
 	default:
 		return nil
 	}
+}
+
+func consumerOffsetCacheKey(topicName string, args CommonArgs) string {
+	return fmt.Sprintf("%q/%q/%q/%d/%d", args.GroupName, args.MemberID, topicName, args.Generation, args.PartitionID)
 }
 
 func (ch *CommandHandler) matchTopicPattern(pattern string) ([]string, error) {
@@ -349,6 +357,13 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	// delivered offset so empty filtered pages cannot strand later visible data.
 	scanOffset := actualOffset
 	readFn := func(offset uint64, max int) ([]types.Message, error) {
+		stable, found, err := ch.stableGroupOffset(cArgs.GroupName, cArgs.TopicName, cArgs.PartitionID)
+		if err != nil {
+			return nil, err
+		}
+		if found && stable > offset {
+			offset = stable
+		}
 		if offset > scanOffset {
 			scanOffset = offset
 		}

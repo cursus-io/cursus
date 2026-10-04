@@ -883,9 +883,12 @@ func (ch *CommandHandler) handleFetchOffset(cmd string) string {
 		}
 	}
 
-	offset, isFind := ch.Coordinator.GetOffset(groupName, offsetTopic, partition)
-	if !isFind {
-		return "OK offset=0"
+	offset, isFind, readErr := ch.Coordinator.GetStableOffset(groupName, offsetTopic, partition)
+	if readErr != nil {
+		return formatCoordinatorError(readErr)
+	}
+	if strings.EqualFold(args["include_found"], "true") {
+		return fmt.Sprintf("OK offset=%d found=%t", offset, isFind)
 	}
 
 	return fmt.Sprintf("OK offset=%d", offset)

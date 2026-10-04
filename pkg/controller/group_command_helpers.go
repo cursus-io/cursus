@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -84,26 +85,82 @@ func formatCoordinatorError(err error) string {
 
 // resolveOffset determines the starting offset for a consumer.
 func (ch *CommandHandler) resolveOffset(p *topic.Partition, topicName string, cArgs CommonArgs) (uint64, error) {
-	if ch.Coordinator != nil {
-		savedOffset, found := ch.Coordinator.GetOffset(cArgs.GroupName, topicName, cArgs.PartitionID)
-		if found {
-			return savedOffset, nil
-		}
+	savedOffset, found, err := ch.stableGroupOffset(cArgs.GroupName, topicName, cArgs.PartitionID)
+	if err != nil {
+		return 0, err
 	}
+	if found {
+		return savedOffset, nil
+	}
+	return resetConsumerOffset(p, cArgs), nil
+}
 
+func resetConsumerOffset(p *topic.Partition, cArgs CommonArgs) uint64 {
 	if cArgs.HasOffset {
 		util.Debug("Using explicitly requested offset %d", cArgs.Offset)
-		return cArgs.Offset, nil
+		return cArgs.Offset
 	}
 
 	if cArgs.AutoOffsetReset == "latest" {
 		latest := p.OffsetRange().Latest
 		util.Debug("Reset policy 'latest': starting at %d", latest)
-		return latest, nil
+		return latest
 	}
 
 	util.Debug("Reset policy 'earliest': starting at 0")
-	return 0, nil
+	return 0
+}
+
+// stableGroupOffset consults the owner of the group's metadata, which need not
+// be the input partition leader. A follower's local offset view is insufficient
+// to decide whether an input has a pending transaction reservation.
+func (ch *CommandHandler) stableGroupOffset(groupName, topicName string, partition int) (uint64, bool, error) {
+	if ch.Config != nil && ch.Config.EnabledDistribution {
+		if ch.Cluster == nil || ch.Cluster.Router == nil {
+			return 0, false, fmt.Errorf("ERROR: coordinator_not_available")
+		}
+		owner, _, err := ch.Cluster.Router.FindCoordinator(groupName)
+		if err != nil {
+			return 0, false, fmt.Errorf("%s", coordinatorUnavailableResponse)
+		}
+		if owner != ch.Cluster.Router.BrokerID() {
+			cmd := fmt.Sprintf("FETCH_OFFSET topic=%s partition=%d group=%s include_found=true", topicName, partition, groupName)
+			response, err := ch.Cluster.Router.ForwardToCoordinator(groupName, cmd)
+			if err != nil {
+				return 0, false, fmt.Errorf("ERROR: coordinator_not_available reason=%q", err.Error())
+			}
+			return parseStableOffsetResponse(response)
+		}
+		if _, local, err := ch.checkCoordinator(groupName); err != nil || !local {
+			return 0, false, fmt.Errorf("%s", coordinatorUnavailableResponse)
+		}
+	}
+	if ch.Coordinator == nil {
+		if ch.Config != nil && ch.Config.EnabledDistribution {
+			return 0, false, fmt.Errorf("ERROR: coordinator_not_available")
+		}
+		return 0, false, nil
+	}
+	return ch.Coordinator.GetStableOffset(groupName, topicName, partition)
+}
+
+func parseStableOffsetResponse(response string) (uint64, bool, error) {
+	if parsed, ok := protocol.ParseErrorResponse(response); ok {
+		if parsed.Code == "group_not_found" {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("%s", response)
+	}
+	if !strings.HasPrefix(response, "OK ") {
+		return 0, false, fmt.Errorf("ERROR: coordinator_not_available reason=%q", "invalid stable offset response")
+	}
+	fields := parseKeyValueArgs(strings.TrimPrefix(response, "OK "))
+	offset, offsetErr := strconv.ParseUint(fields["offset"], 10, 64)
+	found, foundErr := strconv.ParseBool(fields["found"])
+	if offsetErr != nil || foundErr != nil || (!found && offset != 0) {
+		return 0, false, fmt.Errorf("ERROR: coordinator_not_available reason=%q", "coordinator lacks a valid stable offset response")
+	}
+	return offset, found, nil
 }
 
 func (ch *CommandHandler) ValidateOwnership(groupName, memberID string, generation int, partition int) bool {

@@ -65,7 +65,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"join_group_failed",
 		"insufficient_in_sync_replicas", "leader_election_result_unavailable", "leader_not_found", "no_raft_leader", "offset_manager_not_available", "replica_offset_gap", "replication_unavailable", "request_cancelled", "request_timeout", "router_not_available", "topic_materialization_pending",
 		"transaction_abort_marker_failed", "transaction_commit_failed", "transaction_manager_not_available", "transaction_sync_failed",
-		"transaction_offset_materialization_failed", "transaction_offset_prepare_failed",
+		"transaction_offset_materialization_failed", "transaction_offset_prepare_failed", "unstable_offset_commit",
 	)
 	register(ErrorClassFencing, false,
 		"GEN_MISMATCH", "NOT_OWNER", "PARTITION_LEADER_FENCED", "STALE_LEADER_EPOCH", "STALE_TOPIC_LIFECYCLE_EPOCH", "member_not_found",
