@@ -126,4 +126,4 @@ A useful report includes:
 - all retry/failure/missing/duplicate counters,
 - broker errors, leader changes, and commit redirects.
 
-Do not commit generated benchmark result files unless they are intentionally curated evidence for a release or design document.
+Do not commit generated benchmark result files unless they are intentionally curated evidence for a release or published performance analysis.

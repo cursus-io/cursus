@@ -175,14 +175,17 @@ func TestPartition_RecoversProducerStateFromLogWithoutCheckpoint(t *testing.T) {
 	require.Equal(t, "first", msgs[0].Payload)
 }
 
-func TestDecodeProducerStateCheckpointRequiresVersionTwo(t *testing.T) {
+func TestDecodeProducerStateCheckpointRequiresVersionThree(t *testing.T) {
 	_, err := decodeProducerStateCheckpoint([]byte(`{"producer-1":1}`))
 	require.ErrorContains(t, err, "clean bootstrap required")
 
-	checkpoint, err := decodeProducerStateCheckpoint([]byte(`{"version":2,"producers":{"producer-1":{"epoch":3,"seq":7}}}`))
+	_, err = decodeProducerStateCheckpoint([]byte(`{"version":2,"producers":{"producer-1":{"epoch":3,"seq":7}}}`))
+	require.ErrorContains(t, err, "unsupported producer state checkpoint version 2")
+
+	checkpoint, err := decodeProducerStateCheckpoint([]byte(`{"version":3,"producers":{"producer-1":{"epoch":3,"seq":7,"offset":11}}}`))
 	require.NoError(t, err)
 	require.Equal(t, producerStateCheckpointVersion, checkpoint.Version)
-	require.Equal(t, producerStateCheckpointEntry{Epoch: 3, Seq: 7}, checkpoint.Producers["producer-1"])
+	require.Equal(t, producerStateCheckpointEntry{Epoch: 3, Seq: 7, Offset: 11}, checkpoint.Producers["producer-1"])
 }
 
 func TestPartition_ProducerEpochFencing(t *testing.T) {
@@ -353,6 +356,59 @@ func TestPartition_ReconcileCommittedHWMTruncatesUncommittedTail(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
 	require.Equal(t, "replacement", msgs[1].Payload)
+}
+
+func TestPartition_ReconcileCommittedHWMPersistsClearedProducerCheckpoint(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 1
+
+	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	p := NewPartition(0, "orders", dh, nil, cfg)
+
+	batch := []types.Message{
+		{Payload: "committed", ProducerID: "producer-1", Epoch: 7, SeqNum: 1},
+		{Payload: "uncommitted", ProducerID: "producer-1", Epoch: 7, SeqNum: 2},
+	}
+	require.NoError(t, p.EnqueueBatchLeaderWithMode(batch, true))
+	require.NoError(t, p.ApplyReplicaHWM(1))
+	p.FlushDisk()
+
+	before, err := os.ReadFile(p.producerStatePath)
+	require.NoError(t, err)
+	checkpoint, err := decodeProducerStateCheckpoint(before)
+	require.NoError(t, err)
+	require.Equal(t, producerStateCheckpointEntry{Epoch: 7, Seq: 2, Offset: 1}, checkpoint.Producers["producer-1"])
+
+	require.NoError(t, p.ReconcileCommittedHWM(1))
+	after, err := os.ReadFile(p.producerStatePath)
+	require.NoError(t, err)
+	checkpoint, err = decodeProducerStateCheckpoint(after)
+	require.NoError(t, err)
+	require.Empty(t, checkpoint.Producers, "the truncated tail must not survive in the durable checkpoint")
+	recovered, ok := p.lookupProducerState("producer-1")
+	require.True(t, ok)
+	require.Equal(t, producerStateCheckpointEntry{Epoch: 7, Seq: 1, Offset: 0}, recovered)
+
+	p.Close()
+	require.NoError(t, dh.Close())
+
+	restartedDH, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, restartedDH.Close()) }()
+	restarted := NewPartition(0, "orders", restartedDH, nil, cfg)
+	defer restarted.Close()
+	restarted.RecoverProducerStateFromLog()
+
+	require.NoError(t, restarted.EnqueueSyncIdempotent(types.Message{
+		Payload: "duplicate", ProducerID: "producer-1", Epoch: 7, SeqNum: 1,
+	}))
+	require.Equal(t, uint64(1), restarted.NextOffset())
+	require.NoError(t, restarted.EnqueueSyncIdempotent(types.Message{
+		Payload: "replacement", ProducerID: "producer-1", Epoch: 7, SeqNum: 2,
+	}))
+	require.Equal(t, uint64(2), restarted.NextOffset())
 }
 
 func TestPartition_ReplicationMutationBlocksStaleCommittedHWMReconcile(t *testing.T) {

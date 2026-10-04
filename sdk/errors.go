@@ -43,10 +43,14 @@ func (e *BrokerError) Error() string {
 	if e == nil {
 		return "<nil>"
 	}
-	if e.Message == "" {
+	message := e.Message
+	if message == "" && e.Fields != nil {
+		message = e.Fields["reason"]
+	}
+	if message == "" {
 		return fmt.Sprintf("broker error %s (%s)", e.Code, e.Class)
 	}
-	return fmt.Sprintf("broker error %s (%s): %s", e.Code, e.Class, e.Message)
+	return fmt.Sprintf("broker error %s (%s): %s", e.Code, e.Class, message)
 }
 
 func (e *BrokerError) Is(target error) bool {

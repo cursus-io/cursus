@@ -76,9 +76,11 @@ type Partition struct {
 	hwmCheckpointWG       sync.WaitGroup
 	producerStatePath     string
 	producerStateCh       chan struct{}
-	producerStateMu       sync.Mutex
+	producerStateMu       sync.RWMutex
+	producerCheckpointMu  sync.Mutex
 	producerStateWG       sync.WaitGroup
 	producerState         sync.Map // map[string]*producerEntry
+	producerStateIndex    map[string]producerStateCheckpointEntry
 	isIdempotent          bool
 	producerStateTTL      time.Duration
 	txnMarkerMu           sync.RWMutex
@@ -126,15 +128,16 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	initialOffset := dh.GetLatestOffset()
 
 	p := &Partition{
-		id:               id,
-		topic:            topic,
-		dh:               dh,
-		streamManager:    sm,
-		messageNotifyCh:  make(chan struct{}),
-		closeCh:          make(chan struct{}),
-		txnMarkers:       make(map[transactionMarkerKey]transactionMarkerInfo),
-		txnOpenOffsets:   make(map[transactionMarkerKey]uint64),
-		producerStateTTL: producerStateTTLFromConfig(cfg),
+		id:                 id,
+		topic:              topic,
+		dh:                 dh,
+		streamManager:      sm,
+		messageNotifyCh:    make(chan struct{}),
+		closeCh:            make(chan struct{}),
+		txnMarkers:         make(map[transactionMarkerKey]transactionMarkerInfo),
+		txnOpenOffsets:     make(map[transactionMarkerKey]uint64),
+		producerStateIndex: make(map[string]producerStateCheckpointEntry),
+		producerStateTTL:   producerStateTTLFromConfig(cfg),
 	}
 
 	p.LEO.Store(initialOffset)
@@ -204,12 +207,29 @@ func (p *Partition) validateProducerMessageWithStage(msg *types.Message, staged 
 		return p.validateAgainstProducerState(msg, entry.lastEpoch, entry.lastSeq, true)
 	}
 
+	if recovered, ok := p.lookupProducerState(msg.ProducerID); ok {
+		p.producerState.Store(msg.ProducerID, &producerEntry{
+			lastEpoch: recovered.Epoch,
+			lastSeq:   recovered.Seq,
+			lastSeen:  time.Now(),
+		})
+		return p.validateAgainstProducerState(msg, recovered.Epoch, recovered.Seq, true)
+	}
+
 	if msg.SeqNum != 1 {
 		return false, fmt.Errorf("idempotency error: first message for producer %s must have seqNum 1, got %d", msg.ProducerID, msg.SeqNum)
 	}
 
 	return false, nil
 }
+
+func (p *Partition) lookupProducerState(producerID string) (producerStateCheckpointEntry, bool) {
+	p.producerStateMu.RLock()
+	defer p.producerStateMu.RUnlock()
+	entry, ok := p.producerStateIndex[producerID]
+	return entry, ok
+}
+
 func (p *Partition) validateAgainstProducerState(msg *types.Message, lastEpoch int64, lastSeq uint64, allowDuplicate bool) (bool, error) {
 	if msg.Epoch < lastEpoch {
 		return false, fmt.Errorf("stale_producer_epoch producer=%s current=%d got=%d", msg.ProducerID, lastEpoch, msg.Epoch)
@@ -230,11 +250,11 @@ func (p *Partition) validateAgainstProducerState(msg *types.Message, lastEpoch i
 	return false, nil
 }
 
-func (p *Partition) updateProducerState(msg *types.Message) {
-	p.updateProducerStateWithMode(msg, false)
+func (p *Partition) updateProducerState(msg *types.Message, offset uint64) {
+	p.updateProducerStateWithMode(msg, false, offset)
 }
 
-func (p *Partition) updateProducerStateWithMode(msg *types.Message, force bool) {
+func (p *Partition) updateProducerStateWithMode(msg *types.Message, force bool, offset uint64) {
 	if (!p.isIdempotent && !force) || msg.ProducerID == "" {
 		return
 	}
@@ -254,6 +274,11 @@ func (p *Partition) updateProducerStateWithMode(msg *types.Message, force bool) 
 		lastSeq:   msg.SeqNum,
 		lastSeen:  time.Now(),
 	})
+	if msg.SeqNum > 0 {
+		p.producerStateMu.Lock()
+		p.producerStateIndex[msg.ProducerID] = producerStateCheckpointEntry{Epoch: msg.Epoch, Seq: msg.SeqNum, Offset: offset}
+		p.producerStateMu.Unlock()
+	}
 	p.signalProducerStateCheckpoint()
 }
 
@@ -283,7 +308,7 @@ func (p *Partition) Enqueue(msg types.Message) error {
 		return err
 	}
 
-	p.updateProducerState(&msg)
+	p.updateProducerState(&msg, offset)
 	msg.Offset = offset
 	p.indexTransactionMessage(msg)
 	p.LEO.Store(offset + 1)
@@ -322,7 +347,7 @@ func (p *Partition) enqueueSync(msg types.Message, forceIdempotent bool) error {
 		return fmt.Errorf("disk write failed: %w", err)
 	}
 
-	p.updateProducerStateWithMode(&msg, forceIdempotent)
+	p.updateProducerStateWithMode(&msg, forceIdempotent, offset)
 	msg.Offset = offset
 	p.indexTransactionMessage(msg)
 	p.LEO.Store(offset + 1)
@@ -371,7 +396,7 @@ func (p *Partition) EnqueueBatchSyncWithMode(msgs []types.Message, forceIdempote
 			return fmt.Errorf("disk write failed for partition %d: %w", p.id, err)
 		}
 
-		p.updateProducerStateWithMode(&msgs[i], forceIdempotent)
+		p.updateProducerStateWithMode(&msgs[i], forceIdempotent, offset)
 		msgs[i].Offset = offset
 		p.indexTransactionMessage(msgs[i])
 		p.LEO.Store(offset + 1)
@@ -405,7 +430,7 @@ func (p *Partition) EnqueueBatch(msgs []types.Message) error {
 			return fmt.Errorf("batch enqueue failed at index %d: %w", i, err)
 		}
 
-		p.updateProducerState(&msgs[i])
+		p.updateProducerState(&msgs[i], offset)
 		msgs[i].Offset = offset
 		p.indexTransactionMessage(msgs[i])
 		p.LEO.Store(offset + 1)
@@ -506,7 +531,7 @@ func (p *Partition) EnqueueBatchLeaderWithMode(msgs []types.Message, forceIdempo
 	}
 
 	for _, msg := range pending {
-		p.updateProducerStateWithMode(&msgs[msg.index], forceIdempotent)
+		p.updateProducerStateWithMode(&msgs[msg.index], forceIdempotent, msgs[msg.index].Offset)
 		p.indexTransactionMessage(msgs[msg.index])
 	}
 	p.LEO.Store(nextOffset)
@@ -576,7 +601,7 @@ func (p *Partition) ReplicaAppendWithMode(msgs []types.Message, forceIdempotent 
 		return fmt.Errorf("replica batch append failed: %w", err)
 	}
 	for _, i := range pending {
-		p.updateProducerStateWithMode(&msgs[i], forceIdempotent || msgs[i].TransactionalID != "")
+		p.updateProducerStateWithMode(&msgs[i], forceIdempotent || msgs[i].TransactionalID != "", msgs[i].Offset)
 		p.indexTransactionMessage(msgs[i])
 	}
 	if len(pending) > 0 {
@@ -620,7 +645,7 @@ func (p *Partition) ReplicaAppendCompactedRange(msgs []types.Message, endOffset 
 		return fmt.Errorf("compacted replica range append failed: %w", err)
 	}
 	for i := range msgs {
-		p.updateProducerStateWithMode(&msgs[i], true)
+		p.updateProducerStateWithMode(&msgs[i], true, msgs[i].Offset)
 		p.indexTransactionMessage(msgs[i])
 	}
 	p.LEO.Store(endOffset)
@@ -1020,6 +1045,7 @@ func (p *Partition) RecoverProducerStateFromLog() {
 	offset := first
 	const batchSize = 1024
 	now := time.Now()
+	recovered := make(map[string]producerStateCheckpointEntry)
 
 	for {
 		msgs, err := p.dh.ReadMessages(offset, batchSize)
@@ -1028,7 +1054,10 @@ func (p *Partition) RecoverProducerStateFromLog() {
 		}
 		for _, msg := range msgs {
 			if msg.ProducerID != "" && msg.SeqNum > 0 {
-				p.producerState.Store(msg.ProducerID, &producerEntry{lastEpoch: msg.Epoch, lastSeq: msg.SeqNum, lastSeen: now})
+				candidate := producerStateCheckpointEntry{Epoch: msg.Epoch, Seq: msg.SeqNum, Offset: msg.Offset}
+				if current, ok := recovered[msg.ProducerID]; !ok || producerStateAfter(candidate, current) {
+					recovered[msg.ProducerID] = candidate
+				}
 			}
 			next := msg.Offset + 1
 			if next <= offset {
@@ -1040,7 +1069,23 @@ func (p *Partition) RecoverProducerStateFromLog() {
 			break
 		}
 	}
+	p.producerStateMu.Lock()
+	for producerID, entry := range recovered {
+		if current, ok := p.producerStateIndex[producerID]; ok && !producerStateAfter(entry, current) {
+			entry = current
+		} else {
+			p.producerStateIndex[producerID] = entry
+		}
+		p.producerState.Store(producerID, &producerEntry{lastEpoch: entry.Epoch, lastSeq: entry.Seq, lastSeen: now})
+	}
+	p.producerStateMu.Unlock()
 	p.signalProducerStateCheckpoint()
+}
+
+func producerStateAfter(candidate, current producerStateCheckpointEntry) bool {
+	return candidate.Epoch > current.Epoch ||
+		candidate.Epoch == current.Epoch && candidate.Seq > current.Seq ||
+		candidate.Epoch == current.Epoch && candidate.Seq == current.Seq && candidate.Offset > current.Offset
 }
 
 // ProducerSequenceOffset returns the durable offset assigned to one
@@ -1094,7 +1139,9 @@ func (p *Partition) StartProducerStateMaintenance() {
 func (p *Partition) FlushDisk() {
 	p.dh.Flush()
 	p.persistHWMCheckpoint()
-	p.persistProducerStateCheckpoint()
+	if err := p.persistProducerStateCheckpoint(); err != nil {
+		util.Warn("failed to persist producer state checkpoint %s during flush: %v", p.producerStatePath, err)
+	}
 }
 
 func (p *Partition) GetFirstOffset() uint64 {
@@ -1295,6 +1342,12 @@ func (p *Partition) reconcileCommittedHWMLocked(hwm uint64) error {
 		p.producerState.Delete(key)
 		return true
 	})
+	p.producerStateMu.Lock()
+	p.producerStateIndex = make(map[string]producerStateCheckpointEntry)
+	p.producerStateMu.Unlock()
+	if err := p.persistProducerStateCheckpoint(); err != nil {
+		return fmt.Errorf("persist cleared producer state after truncation: %w", err)
+	}
 	p.RecoverProducerStateFromLog()
 	return nil
 }
@@ -1440,7 +1493,7 @@ func loadHWMCheckpoint(path string) (uint64, bool) {
 	return hwm, true
 }
 
-const producerStateCheckpointVersion = 2
+const producerStateCheckpointVersion = 3
 
 type producerStateCheckpoint struct {
 	Version   int                                     `json:"version"`
@@ -1448,8 +1501,9 @@ type producerStateCheckpoint struct {
 }
 
 type producerStateCheckpointEntry struct {
-	Epoch int64  `json:"epoch"`
-	Seq   uint64 `json:"seq"`
+	Epoch  int64  `json:"epoch"`
+	Seq    uint64 `json:"seq"`
+	Offset uint64 `json:"offset"`
 }
 
 func (p *Partition) signalProducerStateCheckpoint() {
@@ -1475,11 +1529,16 @@ func (p *Partition) runProducerStateCheckpointLoop() {
 			dirty = true
 		case <-ticker.C:
 			if dirty {
-				p.persistProducerStateCheckpoint()
-				dirty = false
+				if err := p.persistProducerStateCheckpoint(); err != nil {
+					util.Warn("failed to persist producer state checkpoint %s: %v", p.producerStatePath, err)
+				} else {
+					dirty = false
+				}
 			}
 		case <-p.closeCh:
-			p.persistProducerStateCheckpoint()
+			if err := p.persistProducerStateCheckpoint(); err != nil {
+				util.Warn("failed to persist producer state checkpoint %s during shutdown: %v", p.producerStatePath, err)
+			}
 			return
 		}
 	}
@@ -1500,10 +1559,15 @@ func (p *Partition) loadProducerStateCheckpoint() {
 		return
 	}
 	now := time.Now()
+	first := p.dh.GetFirstOffset()
+	durableTail := p.dh.GetAbsoluteOffset()
+	p.producerStateMu.Lock()
+	defer p.producerStateMu.Unlock()
 	for producerID, entry := range checkpoint.Producers {
-		if producerID == "" || entry.Seq == 0 {
+		if producerID == "" || entry.Seq == 0 || entry.Offset < first || entry.Offset >= durableTail {
 			continue
 		}
+		p.producerStateIndex[producerID] = entry
 		p.producerState.Store(producerID, &producerEntry{lastEpoch: entry.Epoch, lastSeq: entry.Seq, lastSeen: now})
 	}
 }
@@ -1522,64 +1586,55 @@ func decodeProducerStateCheckpoint(data []byte) (producerStateCheckpoint, error)
 	return checkpoint, nil
 }
 
-func (p *Partition) persistProducerStateCheckpoint() {
+func (p *Partition) persistProducerStateCheckpoint() error {
 	if p.producerStatePath == "" {
-		return
+		return nil
+	}
+
+	p.producerCheckpointMu.Lock()
+	defer p.producerCheckpointMu.Unlock()
+	if p.dh != nil {
+		p.pruneProducerStateIndex(p.dh.GetFirstOffset())
 	}
 
 	checkpoint := producerStateCheckpoint{
 		Version:   producerStateCheckpointVersion,
 		Producers: make(map[string]producerStateCheckpointEntry),
 	}
-	p.producerState.Range(func(key, value any) bool {
-		producerID, ok := key.(string)
-		if !ok || producerID == "" {
-			return true
-		}
-		entry, ok := value.(*producerEntry)
-		if !ok || entry.lastSeq == 0 {
-			return true
-		}
-		checkpoint.Producers[producerID] = producerStateCheckpointEntry{Epoch: entry.lastEpoch, Seq: entry.lastSeq}
-		return true
-	})
-
-	p.producerStateMu.Lock()
-	defer p.producerStateMu.Unlock()
+	p.producerStateMu.RLock()
+	for producerID, entry := range p.producerStateIndex {
+		checkpoint.Producers[producerID] = entry
+	}
+	p.producerStateMu.RUnlock()
 
 	tmp := p.producerStatePath + ".tmp"
 	data, err := json.Marshal(checkpoint)
 	if err != nil {
-		util.Warn("failed to marshal producer state checkpoint %s: %v", p.producerStatePath, err)
-		return
+		return fmt.Errorf("marshal producer state checkpoint: %w", err)
 	}
 	data = append(data, '\n')
 
 	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		util.Warn("failed to open producer state checkpoint %s: %v", tmp, err)
-		return
+		return fmt.Errorf("open producer state checkpoint %s: %w", tmp, err)
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
-		util.Warn("failed to write producer state checkpoint %s: %v", tmp, err)
-		return
+		return fmt.Errorf("write producer state checkpoint %s: %w", tmp, err)
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
-		util.Warn("failed to sync producer state checkpoint %s: %v", tmp, err)
-		return
+		return fmt.Errorf("sync producer state checkpoint %s: %w", tmp, err)
 	}
 	if err := f.Close(); err != nil {
-		util.Warn("failed to close producer state checkpoint %s: %v", tmp, err)
-		return
+		return fmt.Errorf("close producer state checkpoint %s: %w", tmp, err)
 	}
 	if err := replaceCheckpointFile(tmp, p.producerStatePath); err != nil {
-		util.Warn("failed to rename producer state checkpoint %s: %v", p.producerStatePath, err)
-		return
+		return fmt.Errorf("replace producer state checkpoint %s: %w", p.producerStatePath, err)
 	}
 	syncParentDir(filepath.Dir(p.producerStatePath))
+	return nil
 }
 
 func producerStateCheckpointPath(dh types.StorageHandler, partitionID int) string {
@@ -1633,6 +1688,9 @@ func producerStateTTLFromConfig(cfg *config.Config) time.Duration {
 
 // cleanStaleProducers removes producer entries that have not been seen within the TTL.
 func (p *Partition) cleanStaleProducers() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	ttl := p.producerStateTTL
 	if ttl <= 0 {
 		ttl = defaultProducerStateTTL
@@ -1644,6 +1702,29 @@ func (p *Partition) cleanStaleProducers() {
 		}
 		return true
 	})
+	if p.dh != nil && p.pruneProducerStateIndex(p.dh.GetFirstOffset()) {
+		p.signalProducerStateCheckpoint()
+	}
+}
+
+// pruneProducerStateIndex bounds fencing and deduplication state to records
+// that are still represented in the retained log.
+func (p *Partition) pruneProducerStateIndex(retentionFloor uint64) bool {
+	if retentionFloor == 0 {
+		return false
+	}
+	pruned := false
+	p.producerStateMu.Lock()
+	defer p.producerStateMu.Unlock()
+	for producerID, entry := range p.producerStateIndex {
+		if entry.Offset >= retentionFloor {
+			continue
+		}
+		delete(p.producerStateIndex, producerID)
+		p.producerState.Delete(producerID)
+		pruned = true
+	}
+	return pruned
 }
 
 // runProducerCleanup periodically evicts stale producer state to bound memory usage.

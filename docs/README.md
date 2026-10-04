@@ -40,7 +40,7 @@ This index separates normative contracts from implementation notes. When prose c
 - [Benchmarks](reference/benchmark.md): tools, workload model, and result interpretation.
 - [Benchmark Verification](benchmark-verification.md): local standalone and cluster verification.
 - [Comparison](reference/comparison.md): product scope, strengths, and explicit maturity gaps.
-- [Release Automation](specs/release-automation-design.md): release workflow and artifacts.
+- [Container Publishing](operations/container-publishing.md): GHCR image publication, tags, permissions, and verification.
 
 ## Contributing
 

@@ -16,3 +16,7 @@ coverage-server/
 
 bin/
 pkg/controller/broker-logs/
+
+# Local design documents
+/docs/superpowers/
+/docs/specs/
