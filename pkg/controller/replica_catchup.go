@@ -88,9 +88,12 @@ func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replica
 		if message.Offset >= endOffset || (!batch.Compacted && message.Offset != next) || (batch.Compacted && message.Offset < next) {
 			return fmt.Errorf("invalid replica catch-up offset: expected=%d got=%d hwm=%d", next, message.Offset, batch.CommittedHWM)
 		}
-		if errResp := ch.validateReplicatedTransactionMessage(batch.Topic, batch.Partition, message); errResp != "" {
-			return fmt.Errorf("replica catch-up transaction validation failed: %s", errResp)
-		}
+		// This authenticated ISR transfer copies an already committed log
+		// range, including unresolved/aborted records and old control markers.
+		// Rechecking live producer or transaction state would reject history
+		// after commit, reinitialization, expiry, or a coordinator change.
+		// Source, lifecycle, leader, digest, and committed HWM fences above
+		// authorize the copy; live replication retains admission validation.
 		next = message.Offset + 1
 	}
 	if batch.Compacted {

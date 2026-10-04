@@ -19,8 +19,10 @@ type BrokerFSMSnapshot struct {
 	producerState                    map[string]map[int]map[string]ProducerSequence
 	groupState                       map[string]*coordinator.GroupStateSnapshot
 	transactionState                 map[string]*transaction.Snapshot
+	nextProducerEpoch                uint64
 	transactionCoordinatorShards     map[int]TransactionCoordinatorShard
 	transactionCoordinatorShardCount int
+	offsetReservationsActivated      bool
 	topicState                       map[string]*topic.Definition
 }
 
@@ -35,8 +37,10 @@ func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 		ProducerState:                    s.producerState,
 		GroupState:                       s.groupState,
 		TransactionState:                 s.transactionState,
+		NextProducerEpoch:                &s.nextProducerEpoch,
 		TransactionCoordinatorShards:     s.transactionCoordinatorShards,
 		TransactionCoordinatorShardCount: s.transactionCoordinatorShardCount,
+		OffsetReservationsActivated:      s.offsetReservationsActivated,
 		TopicState:                       s.topicState,
 	}
 

@@ -179,7 +179,7 @@ func NewCommandHandler(
 		{prefix: "DESCRIBE ", exact: false, helpOrder: 26, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDescribeTopic(cmd, ctx) }},
 		{prefix: "HEARTBEAT ", exact: false, helpOrder: 11, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHeartbeat(cmd) }},
 		{prefix: "COMMIT_OFFSET ", exact: false, helpOrder: 12, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCommitOffset(cmd) }},
-		{prefix: "BATCH_COMMIT ", exact: false, helpOrder: 13, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd) }},
+		{prefix: "BATCH_COMMIT ", exact: false, helpOrder: 13, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd, ctx) }},
 		{prefix: "INIT_PRODUCER_ID ", exact: false, helpOrder: 16, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleInitProducerID(cmd) }},
 		{prefix: "BEGIN_TXN ", exact: false, helpOrder: 17, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBeginTxn(cmd) }},
 		{prefix: "TXN_PUBLISH ", exact: false, helpOrder: 18, permissions: []string{PermissionTransaction, PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnPublish(cmd, ctx) }},

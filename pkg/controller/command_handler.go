@@ -888,6 +888,9 @@ func (ch *CommandHandler) handleFetchOffset(cmd string) string {
 		return formatCoordinatorError(readErr)
 	}
 	if strings.EqualFold(args["include_found"], "true") {
+		if strings.EqualFold(args["include_epoch"], "true") {
+			return fmt.Sprintf("OK offset=%d found=%t registration_epoch=%d", offset, isFind, ch.Coordinator.GetRegistrationEpoch(groupName))
+		}
 		return fmt.Sprintf("OK offset=%d found=%t", offset, isFind)
 	}
 
@@ -1024,6 +1027,12 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 	if ch.Coordinator == nil {
 		return "ERROR: offset_manager_not_available"
 	}
+	if text := args["registration_epoch"]; text != "" {
+		epoch, parseErr := strconv.ParseUint(text, 10, 64)
+		if parseErr != nil || epoch == 0 || epoch != ch.Coordinator.GetRegistrationEpoch(groupID) {
+			return fmt.Sprintf("ERROR: group_epoch_mismatch group=%s", groupID)
+		}
+	}
 	memberID := args["member"]
 	if memberID == "" {
 		return "ERROR: missing_member command=COMMIT_OFFSET"
@@ -1062,8 +1071,11 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 }
 
 // handleBatchCommit processes BATCH_COMMIT topic=T1 group=G1 generation=1 member=M1 offsets=P0:10,P1:20...
-func (ch *CommandHandler) handleBatchCommit(cmd string) string {
+func (ch *CommandHandler) handleBatchCommit(cmd string, contexts ...*ClientContext) string {
 	args := parseKeyValueArgs(cmd[13:])
+	if args["reservation_action"] != "" {
+		return ch.handleTransactionReservationCommand(cmd, firstClientContext(contexts))
+	}
 
 	topicName := args["topic"]
 	encodedTopicOffsets := args["topic_offsets"]

@@ -25,6 +25,9 @@ func (ch *CommandHandler) ConfigureTransactionJournal(path string) error {
 	if ch.isDistributed() {
 		return fmt.Errorf("standalone transaction journal cannot be enabled in distributed mode")
 	}
+	if ch.TopicManager == nil {
+		return fmt.Errorf("standalone transaction recovery requires a topic manager")
+	}
 	journal, err := transaction.OpenJournal(path)
 	if err != nil {
 		return err
@@ -35,6 +38,32 @@ func (ch *CommandHandler) ConfigureTransactionJournal(path string) error {
 	}
 	if err := ch.TxnManager.ImportState(state); err != nil {
 		return fmt.Errorf("validate recovered transaction journal: %w", err)
+	}
+	if err := ch.TxnManager.RestoreProducerEpochWatermark(journal.NextProducerEpoch()); err != nil {
+		return fmt.Errorf("restore producer epoch watermark: %w", err)
+	}
+	if !journal.HasProducerEpochWatermark() {
+		next, err := ch.TopicManager.RetainedTransactionProducerEpoch()
+		if err != nil {
+			return fmt.Errorf("migrate transaction journal epoch watermark: %w", err)
+		}
+		if ch.Coordinator != nil {
+			for _, group := range ch.Coordinator.ExportState() {
+				for _, reservation := range group.OffsetReservations {
+					next = max(next, uint64(reservation.ProducerEpoch)+1)
+				}
+				for _, decision := range group.ReservationDecisions {
+					next = max(next, uint64(decision.ProducerEpoch)+1)
+				}
+			}
+		}
+		if err := ch.TxnManager.RestoreProducerEpochWatermark(next); err != nil {
+			return fmt.Errorf("migrate transaction producer epoch: %w", err)
+		}
+		state, next := ch.TxnManager.ExportStateWithProducerEpoch()
+		if err := journal.RewriteWithProducerEpoch(state, next); err != nil {
+			return fmt.Errorf("persist migrated producer epoch watermark: %w", err)
+		}
 	}
 	if ch.TxnManager.PruneExpired(time.Now()) > 0 {
 		if err := journal.Rewrite(ch.TxnManager.ExportState()); err != nil {
@@ -90,7 +119,14 @@ func (ch *CommandHandler) abortTransactionDecision(txnID, producerID string, epo
 	if err != nil {
 		return err
 	}
-	return ch.persistFinalTransactionDecision(snapshot)
+	if err := ch.persistFinalTransactionDecision(snapshot); err != nil {
+		return err
+	}
+	tx, err := ch.TxnManager.Status(txnID)
+	if err != nil {
+		return err
+	}
+	return ch.resolveAndCheckpointTransactionReservations(tx)
 }
 
 func (ch *CommandHandler) persistFinalTransactionDecision(snapshot *transaction.Snapshot) error {
@@ -124,7 +160,8 @@ func (ch *CommandHandler) waitForTransactionDecision(snapshot *transaction.Snaps
 	defer ticker.Stop()
 	for {
 		current, ok := ch.TxnManager.Snapshot(snapshot.ID)
-		if ok && current.Epoch == snapshot.Epoch && current.Revision >= snapshot.Revision && current.State == snapshot.State {
+		if ok && current.Epoch == snapshot.Epoch && current.Revision >= snapshot.Revision && current.State == snapshot.State &&
+			(snapshot.OffsetReservationsPending || !current.OffsetReservationsPending) && (!snapshot.OffsetsMaterialized || current.OffsetsMaterialized) {
 			return nil
 		}
 		select {
@@ -148,7 +185,7 @@ func (ch *CommandHandler) transactionSyncPayload(snapshot *transaction.Snapshot)
 		return nil, err
 	}
 	localOwner := ch.Cluster.Router.BrokerID()
-	if owner != localOwner || snapshot.CoordinatorEpoch != epoch {
+	if owner != localOwner || (snapshot.CoordinatorEpoch != epoch && !ch.TxnManager.IsOffsetReservationCleanupSnapshot(snapshot)) {
 		return nil, fmt.Errorf(
 			"transaction coordinator fenced transactional_id=%s current_owner=%s current_epoch=%d local_owner=%s local_epoch=%d",
 			snapshot.ID, owner, epoch, localOwner, snapshot.CoordinatorEpoch,

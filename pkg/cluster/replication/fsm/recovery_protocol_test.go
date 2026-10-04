@@ -33,7 +33,7 @@ func TestRestoreRejectsLegacySnapshotsBeforeMutatingState(t *testing.T) {
 func TestRestoreVersionNineRejectsMissingHWMMarkerBeforeMaterialization(t *testing.T) {
 	definition := snapshotTopicDefinition("orders", 1)
 	state := map[string]interface{}{
-		"version": SnapshotVersionCurrent,
+		"version": SnapshotVersionCurrent, "nextProducerEpoch": 0,
 		"topicState": map[string]interface{}{
 			"orders": definition,
 		},

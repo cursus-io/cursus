@@ -51,6 +51,7 @@ func emptyTopicSnapshot(t *testing.T) io.ReadCloser {
 	t.Helper()
 	data, err := json.Marshal(BrokerFSMState{
 		Version:           SnapshotVersionCurrent,
+		NextProducerEpoch: testProducerEpochWatermark(),
 		TopicState:        map[string]*topic.Definition{},
 		PartitionMetadata: map[string]*PartitionMetadata{},
 	})

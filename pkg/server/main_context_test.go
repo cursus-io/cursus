@@ -11,6 +11,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
+	"github.com/cursus-io/cursus/pkg/topic"
 )
 
 func TestCloseListenerOnDone(t *testing.T) {
@@ -87,7 +88,7 @@ func TestRunServerContextReturnsCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := RunServerContext(ctx, cfg, nil, nil, nil, nil); !errors.Is(err, context.Canceled) {
+	if err := RunServerContext(ctx, cfg, topic.NewTopicManager(cfg, nil, nil), nil, nil, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context cancellation, got %v", err)
 	}
 }
@@ -102,7 +103,7 @@ func TestRunServerContextRejectsPartialObservationCredentials(t *testing.T) {
 	cfg.EnableExporter = false
 	cfg.EnabledDistribution = false
 
-	err := RunServerContext(context.Background(), cfg, nil, nil, nil, nil)
+	err := RunServerContext(context.Background(), cfg, topic.NewTopicManager(cfg, nil, nil), nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "principal and auth token") {
 		t.Fatalf("expected partial observation credential error, got %v", err)
 	}

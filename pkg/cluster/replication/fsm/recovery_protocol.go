@@ -9,8 +9,10 @@ import (
 )
 
 const (
-	SnapshotVersionCurrent     = 9
-	CommittedHWMVersionCurrent = 1
+	SnapshotVersionProducerEpoch = 10
+	SnapshotVersionCurrent       = SnapshotVersionProducerEpoch
+	SnapshotVersionLegacyEpoch   = 9
+	CommittedHWMVersionCurrent   = 1
 )
 
 var ErrUnsupportedRecoveryProtocol = errors.New("unsupported recovery protocol")

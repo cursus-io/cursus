@@ -754,6 +754,10 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 	info.TransactionCoordinatorShards = 0
 
 	f.mu.Lock()
+	if f.offsetReservationsActivated && info.LifecycleProtocol < OffsetReservationsProtocolVersion {
+		f.mu.Unlock()
+		return fmt.Errorf("broker_registration_fenced broker=%s reason=offset_reservations_protocol required=%d", info.ID, OffsetReservationsProtocolVersion)
+	}
 	if f.retiredBrokerIncarnations == nil {
 		f.retiredBrokerIncarnations = make(map[string]map[string]struct{})
 	}

@@ -46,7 +46,7 @@ func stateWithoutTopicReferencesLocked(current map[string]*Snapshot, topicName s
 			next[id] = snap
 			continue
 		}
-		recoveryPending := snap.State == StateCommitted && snap.Mode == ModeProcessingV1 && len(snap.Offsets) > 0 && !snap.OffsetsMaterialized
+		recoveryPending := snap.OffsetReservationsPending || (snap.State == StateCommitted && snap.Mode == ModeProcessingV1 && len(snap.Offsets) > 0 && !snap.OffsetsMaterialized)
 		if !snap.Expired && (snap.State == StateOpen || snap.State == StateCommitting ||
 			snap.State == StatePrepareCommit || snap.State == StatePrepareAbort || recoveryPending) {
 			active = append(active, id)

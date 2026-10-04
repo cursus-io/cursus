@@ -150,7 +150,7 @@ func (c *Coordinator) PrepareOffsetReservation(groupName string, registrationEpo
 	}
 	reservation = cloneOffsetReservations([]TransactionOffsetReservation{reservation})[0]
 	if decision, ok := group.ReservationDecisions[reservation.TransactionalID]; ok {
-		if decision.ProducerID != reservation.ProducerID || reservation.ProducerEpoch <= decision.ProducerEpoch {
+		if reservation.ProducerEpoch <= decision.ProducerEpoch {
 			return fmt.Errorf("transaction offset reservation already resolved or producer fenced")
 		}
 	}
@@ -213,11 +213,18 @@ func (c *Coordinator) PrepareOffsetReservation(groupName string, registrationEpo
 // durable final decision. A commit materializes offsets before releasing the
 // reservation; failure keeps stable reads fenced for an idempotent retry.
 func (c *Coordinator) ResolveOffsetReservation(groupName string, registrationEpoch uint64, transactionalID, producerID string, producerEpoch int64, committed bool) error {
-	if transactionalID == "" || producerID == "" || producerEpoch < 0 {
+	if transactionalID == "" || producerID == "" || producerEpoch < 0 || registrationEpoch == 0 {
 		return fmt.Errorf("invalid transaction reservation identity")
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	// Deletion cannot pass an outstanding reservation. A durable lifecycle
+	// epoch newer than this request therefore proves its fence is obsolete,
+	// even if the release ACK or subsequent transaction checkpoint was lost.
+	// Never write the old offset into a newly registered incarnation.
+	if c.groupEpochs[groupName] > registrationEpoch && !c.lifecyclePending[groupName] {
+		return nil
+	}
 	group := c.groups[groupName]
 	if group == nil {
 		return fmt.Errorf("group %q not found", groupName)
@@ -232,14 +239,16 @@ func (c *Coordinator) ResolveOffsetReservation(groupName string, registrationEpo
 	}
 	decision, decided := group.ReservationDecisions[transactionalID]
 	if decided {
-		if decision.ProducerID != producerID {
-			return fmt.Errorf("transaction offset reservation producer fenced")
-		}
 		if producerEpoch < decision.ProducerEpoch {
 			return nil // A completed newer epoch already supersedes this request.
 		}
-		if producerEpoch == decision.ProducerEpoch && committed != decision.Committed {
-			return fmt.Errorf("transaction offset reservation decision conflict")
+		if producerEpoch == decision.ProducerEpoch {
+			if decision.ProducerID != producerID {
+				return fmt.Errorf("transaction offset reservation producer fenced")
+			}
+			if committed != decision.Committed {
+				return fmt.Errorf("transaction offset reservation decision conflict")
+			}
 		}
 	}
 	index := -1

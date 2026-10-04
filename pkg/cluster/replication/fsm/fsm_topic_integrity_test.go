@@ -144,7 +144,8 @@ func TestBrokerFSMDeleteMissingTopicReturnsNotFound(t *testing.T) {
 
 func TestBrokerFSMRestoreRejectsIncompleteLegacyPartitionMetadata(t *testing.T) {
 	state := BrokerFSMState{
-		Version: SnapshotVersionCurrent,
+		Version:           SnapshotVersionCurrent,
+		NextProducerEpoch: testProducerEpochWatermark(),
 		TopicState: map[string]*topic.Definition{
 			"orders": snapshotTopicDefinition("orders", 2),
 		},
@@ -181,7 +182,8 @@ func TestBrokerFSMRestoreRejectsTopicMetadataConflicts(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.metadata.Idempotent = tt.name == "partition count"
 			state := BrokerFSMState{
-				Version: SnapshotVersionCurrent,
+				Version:           SnapshotVersionCurrent,
+				NextProducerEpoch: testProducerEpochWatermark(),
 				TopicState: map[string]*topic.Definition{
 					"orders": func() *topic.Definition {
 						definition := snapshotTopicDefinition("orders", 1)
@@ -208,7 +210,8 @@ func TestBrokerFSMRestoreDefersLocalTopicMaterializationFailure(t *testing.T) {
 	manager := topic.NewTopicManager(cfg, provider, nil)
 	f := NewBrokerFSM(manager, nil)
 	state := BrokerFSMState{
-		Version: SnapshotVersionCurrent,
+		Version:           SnapshotVersionCurrent,
+		NextProducerEpoch: testProducerEpochWatermark(),
 		TopicState: map[string]*topic.Definition{
 			"orders": snapshotTopicDefinition("orders", 1),
 		},

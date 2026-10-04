@@ -22,7 +22,8 @@ import (
 const (
 	TopicLifecycleProtocolVersion        = 1
 	DistributedCompactionProtocolVersion = 2
-	BrokerProtocolVersionCurrent         = DistributedCompactionProtocolVersion
+	OffsetReservationsProtocolVersion    = 3
+	BrokerProtocolVersionCurrent         = OffsetReservationsProtocolVersion
 )
 
 type ReplicationEntry struct {
@@ -67,8 +68,10 @@ type BrokerFSMState struct {
 	ProducerState                    map[string]map[int]map[string]ProducerSequence `json:"producerState"`
 	GroupState                       map[string]*coordinator.GroupStateSnapshot     `json:"groupState,omitempty"`
 	TransactionState                 map[string]*transaction.Snapshot               `json:"transactionState,omitempty"`
+	NextProducerEpoch                *uint64                                        `json:"nextProducerEpoch,omitempty"`
 	TransactionCoordinatorShards     map[int]TransactionCoordinatorShard            `json:"transactionCoordinatorShards,omitempty"`
 	TransactionCoordinatorShardCount int                                            `json:"transactionCoordinatorShardCount,omitempty"`
+	OffsetReservationsActivated      bool                                           `json:"offsetReservationsActivated,omitempty"`
 	TopicState                       map[string]*topic.Definition                   `json:"topicState,omitempty"`
 }
 
@@ -90,9 +93,11 @@ type BrokerFSM struct {
 	cd                                         *coordinator.Coordinator
 	txn                                        *transaction.Manager
 	restoredTransactionState                   map[string]*transaction.Snapshot
+	restoredNextProducerEpoch                  uint64
 	transactionCoordinatorShards               map[int]TransactionCoordinatorShard
 	configuredTransactionCoordinatorShardCount int
 	transactionCoordinatorShardCount           int
+	offsetReservationsActivated                bool
 	transactionCoordinatorChanges              chan []int
 	topicState                                 map[string]*topic.Definition
 	topicMaterialization                       map[string]TopicMaterializationIssue
@@ -192,6 +197,9 @@ func (f *BrokerFSM) SetTransactionManager(txn *transaction.Manager) {
 		f.restoredTransactionState = nil
 	}
 	if f.txn != nil {
+		// Restore already validated this bounded watermark. Restore it even if
+		// retention left no transactions to import.
+		_ = f.txn.RestoreProducerEpochWatermark(f.restoredNextProducerEpoch)
 		f.txn.ReconcileCoordinatorEpochs(f.transactionCoordinatorEpochsLocked(), f.effectiveTransactionCoordinatorShardCountLocked())
 	}
 }
@@ -292,7 +300,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Error("Failed to decode snapshot: %v", err)
 		return fmt.Errorf("failed to restore snapshot: %w", err)
 	}
-	if header.Version != SnapshotVersionCurrent {
+	if header.Version != SnapshotVersionCurrent && header.Version != SnapshotVersionLegacyEpoch {
 		return fmt.Errorf("%w: snapshot version %d is not supported; remove all Cursus persistent state and clean bootstrap version %d", ErrUnsupportedRecoveryProtocol, header.Version, SnapshotVersionCurrent)
 	}
 	var state BrokerFSMState
@@ -332,6 +340,22 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	if err := transaction.ValidateImportState(state.TransactionState); err != nil {
 		return fmt.Errorf("restore transactions: %w", err)
 	}
+	nextProducerEpoch, err := producerEpochWatermarkForRestore(&state)
+	if err != nil {
+		return fmt.Errorf("restore transaction epochs: %w", err)
+	}
+	for _, tx := range state.TransactionState {
+		if tx.OffsetReservationsPending && !state.OffsetReservationsActivated {
+			return fmt.Errorf("pending offset reservations require durable protocol activation")
+		}
+	}
+	if state.OffsetReservationsActivated {
+		for _, broker := range state.Brokers {
+			if broker == nil || broker.LifecycleProtocol < OffsetReservationsProtocolVersion {
+				return fmt.Errorf("activated offset reservations require broker protocol %d", OffsetReservationsProtocolVersion)
+			}
+		}
+	}
 	f.materializationMu.Lock()
 	localDefinitions := []topic.Definition(nil)
 	persistedTopicStorage := []string(nil)
@@ -353,6 +377,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	f.partitionMetadata = state.PartitionMetadata
 	f.topicState = restoredTopicState
 	f.transactionCoordinatorShardCount = persistedShardCount
+	f.offsetReservationsActivated = state.OffsetReservationsActivated
 	f.transactionCoordinatorShards = state.TransactionCoordinatorShards
 	if f.transactionCoordinatorShards == nil {
 		f.transactionCoordinatorShards = make(map[int]TransactionCoordinatorShard)
@@ -434,7 +459,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		util.Info("FSM Restore: Restored %d consumer groups from snapshot", len(state.GroupState))
 	}
 
-	if state.TransactionState != nil {
+	{
 		if f.txn != nil {
 			if err := f.txn.ImportState(state.TransactionState); err != nil {
 				f.mu.Unlock()
@@ -444,10 +469,15 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 			util.Info("FSM Restore: Restored %d transactions from snapshot", len(state.TransactionState))
 		} else {
 			f.restoredTransactionState = state.TransactionState
+			if f.restoredTransactionState == nil {
+				f.restoredTransactionState = make(map[string]*transaction.Snapshot)
+			}
 			util.Info("FSM Restore: Deferred %d transactions until transaction manager is attached", len(state.TransactionState))
 		}
 	}
+	f.restoredNextProducerEpoch = nextProducerEpoch
 	if f.txn != nil {
+		_ = f.txn.RestoreProducerEpochWatermark(nextProducerEpoch)
 		f.txn.ReconcileCoordinatorEpochs(f.transactionCoordinatorEpochsLocked(), f.transactionCoordinatorShardCount)
 	}
 
@@ -665,9 +695,10 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	if f.cd != nil {
 		groupState = f.cd.ExportState()
 	}
-	var transactionState map[string]*transaction.Snapshot
+	transactionState := f.restoredTransactionState
+	nextProducerEpoch := f.restoredNextProducerEpoch
 	if f.txn != nil {
-		transactionState = f.txn.ExportState()
+		transactionState, nextProducerEpoch = f.txn.ExportStateWithProducerEpoch()
 	}
 	transactionCoordinatorShards := make(map[int]TransactionCoordinatorShard, len(f.transactionCoordinatorShards))
 	for shard, ownership := range f.transactionCoordinatorShards {
@@ -684,8 +715,10 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		producerState:                    producerStateCopy,
 		groupState:                       groupState,
 		transactionState:                 transactionState,
+		nextProducerEpoch:                nextProducerEpoch,
 		transactionCoordinatorShards:     transactionCoordinatorShards,
 		transactionCoordinatorShardCount: f.effectiveTransactionCoordinatorShardCountLocked(),
+		offsetReservationsActivated:      f.offsetReservationsActivated,
 		topicState:                       topicStateCopy,
 	}, nil
 }

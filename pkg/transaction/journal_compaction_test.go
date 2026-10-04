@@ -133,8 +133,8 @@ func TestJournalCompactsSupersededBytes(t *testing.T) {
 	if err := journal.Append(snap); err != nil {
 		t.Fatal(err)
 	}
-	if journal.records != 2 {
-		t.Fatalf("records after byte compaction = %d, want 2", journal.records)
+	if journal.records != 3 {
+		t.Fatalf("records after byte compaction = %d, want 3 (watermark plus two transaction records)", journal.records)
 	}
 	state, err := journal.Load()
 	if err != nil {

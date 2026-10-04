@@ -15,15 +15,16 @@ import (
 
 const (
 	maxJournalRecordBytes    = 32 << 20
-	journalFormatVersion     = 1
+	journalFormatVersion     = 2
 	journalRecordOverhead    = 8
 	journalCompactionBytes   = 16 << 20
 	journalCompactionRecords = 256
 )
 
 type journalRecord struct {
-	Version     int       `json:"version"`
-	Transaction *Snapshot `json:"transaction"`
+	Version           int       `json:"version"`
+	Transaction       *Snapshot `json:"transaction,omitempty"`
+	NextProducerEpoch *uint64   `json:"next_producer_epoch,omitempty"`
 }
 
 // JournalInspection is a read-only integrity summary for a standalone journal.
@@ -35,14 +36,16 @@ type JournalInspection struct {
 
 // Journal durably appends standalone transaction coordinator snapshots.
 type Journal struct {
-	mu                sync.Mutex
-	path              string
-	validEnd          int64
-	loaded            bool
-	latest            map[string]*Snapshot
-	latestBytes       int64
-	latestRecordBytes map[string]int64
-	records           int
+	mu                        sync.Mutex
+	path                      string
+	validEnd                  int64
+	loaded                    bool
+	latest                    map[string]*Snapshot
+	latestBytes               int64
+	latestRecordBytes         map[string]int64
+	records                   int
+	nextProducerEpoch         uint64
+	hasProducerEpochWatermark bool
 }
 
 func OpenJournal(path string) (*Journal, error) {
@@ -109,12 +112,14 @@ func InspectJournal(path string) (JournalInspection, error) {
 		if actual, expected := crc32.ChecksumIEEE(payload), binary.BigEndian.Uint32(checksumBytes[:]); actual != expected {
 			return JournalInspection{}, fmt.Errorf("transaction journal checksum mismatch at %d", offset)
 		}
-		snapshot, err := decodeJournalSnapshot(payload)
+		snapshot, _, err := decodeJournalRecord(payload)
 		if err != nil {
 			return JournalInspection{}, fmt.Errorf("decode transaction journal record at %d: %w", offset, err)
 		}
-		if err := mergeJournalSnapshot(latest, snapshot); err != nil {
-			return JournalInspection{}, fmt.Errorf("merge transaction journal record at %d: %w", offset, err)
+		if snapshot != nil {
+			if err := mergeJournalSnapshot(latest, snapshot); err != nil {
+				return JournalInspection{}, fmt.Errorf("merge transaction journal record at %d: %w", offset, err)
+			}
 		}
 		offset = recordEnd
 		records++
@@ -125,6 +130,9 @@ func InspectJournal(path string) (JournalInspection, error) {
 func (j *Journal) Append(snap *Snapshot) (err error) {
 	if snap == nil || snap.ID == "" {
 		return fmt.Errorf("invalid transaction snapshot")
+	}
+	if snap.Epoch < 0 {
+		return fmt.Errorf("invalid producer epoch %d", snap.Epoch)
 	}
 	payload, err := json.Marshal(journalRecord{Version: journalFormatVersion, Transaction: snap})
 	if err != nil {
@@ -183,6 +191,7 @@ func (j *Journal) Append(snap *Snapshot) (err error) {
 	recordBytes := journalRecordSize(payloadLen)
 	j.validEnd += recordBytes
 	j.replaceLatestLocked(snap, recordBytes)
+	j.nextProducerEpoch = max(j.nextProducerEpoch, uint64(snap.Epoch)+1)
 	j.records++
 	return nil
 }
@@ -196,6 +205,15 @@ func (j *Journal) shouldCompactLocked() bool {
 // transaction state. Callers use this after pruning expired tombstones so a
 // removed transactional ID cannot be resurrected during restart recovery.
 func (j *Journal) Rewrite(state map[string]*Snapshot) error {
+	return j.RewriteWithProducerEpoch(state, 0)
+}
+
+// RewriteWithProducerEpoch also records an allocator floor recovered from
+// retained partition data during migration of a pre-watermark journal.
+func (j *Journal) RewriteWithProducerEpoch(state map[string]*Snapshot, nextEpoch uint64) error {
+	if err := ValidateProducerEpochWatermark(nextEpoch); err != nil {
+		return err
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if !j.loaded {
@@ -203,13 +221,18 @@ func (j *Journal) Rewrite(state map[string]*Snapshot) error {
 			return fmt.Errorf("recover transaction journal before rewrite: %w", err)
 		}
 	}
+	j.nextProducerEpoch = max(j.nextProducerEpoch, nextEpoch)
 
 	next := make(map[string]*Snapshot, len(state))
 	for id, snap := range state {
 		if snap == nil || id == "" || snap.ID != id {
 			return fmt.Errorf("invalid transaction snapshot for %q during rewrite", id)
 		}
+		if snap.Epoch < 0 {
+			return fmt.Errorf("invalid producer epoch %d", snap.Epoch)
+		}
 		next[id] = snapshot(transactionFromSnapshot(snap))
+		j.nextProducerEpoch = max(j.nextProducerEpoch, uint64(snap.Epoch)+1)
 	}
 	j.latest = next
 	j.latestBytes = 0
@@ -242,7 +265,12 @@ func (j *Journal) compactLocked() (err error) {
 	}
 	sort.Strings(ids)
 
-	var compactedSize int64
+	// The watermark precedes transaction records and survives an empty rewrite.
+	// The whole compacted file is synced and atomically installed together.
+	compactedSize, err := writeJournalRecord(temp, journalRecord{Version: journalFormatVersion, NextProducerEpoch: &j.nextProducerEpoch})
+	if err != nil {
+		return fmt.Errorf("write producer epoch watermark: %w", err)
+	}
 	compactedRecordBytes := make(map[string]int64, len(ids))
 	for _, id := range ids {
 		snap := j.latest[id]
@@ -286,7 +314,8 @@ func (j *Journal) compactLocked() (err error) {
 	j.validEnd = compactedSize
 	j.latestBytes = compactedSize
 	j.latestRecordBytes = compactedRecordBytes
-	j.records = len(ids)
+	j.records = len(ids) + 1
+	j.hasProducerEpochWatermark = true
 	if syncErr := syncJournalDirectory(dir); syncErr != nil {
 		return syncErr
 	}
@@ -300,6 +329,8 @@ func (j *Journal) Load() (map[string]*Snapshot, error) {
 }
 
 func (j *Journal) loadLocked() (map[string]*Snapshot, error) {
+	j.loaded = false
+	j.hasProducerEpochWatermark = false
 	file, err := os.OpenFile(j.path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open transaction journal for recovery: %w", err)
@@ -311,6 +342,7 @@ func (j *Journal) loadLocked() (map[string]*Snapshot, error) {
 		return nil, fmt.Errorf("stat transaction journal: %w", err)
 	}
 	size := info.Size()
+	j.nextProducerEpoch = 0
 	latest := make(map[string]*Snapshot)
 	latestRecordBytes := make(map[string]int64)
 	var latestBytes int64
@@ -350,25 +382,31 @@ func (j *Journal) loadLocked() (map[string]*Snapshot, error) {
 		expected := binary.BigEndian.Uint32(checksumBytes[:])
 		actual := crc32.ChecksumIEEE(payload)
 		if actual != expected {
-			if recordEnd == size {
-				return j.repairTail(file, offset, latest, latestRecordBytes, latestBytes, records)
-			}
+			// A complete record may be an acknowledged transaction or the sole
+			// epoch watermark after compaction. Never discard it as an
+			// unacknowledged tail: doing so could reuse a persisted identity.
 			return nil, fmt.Errorf("transaction journal checksum mismatch at %d", offset)
 		}
 
-		snap, err := decodeJournalSnapshot(payload)
+		snap, nextEpoch, err := decodeJournalRecord(payload)
 		if err != nil {
 			return nil, fmt.Errorf("decode transaction journal record at %d: %w", offset, err)
 		}
-		if err := mergeJournalSnapshot(latest, snap); err != nil {
-			return nil, fmt.Errorf("merge transaction journal record at %d: %w", offset, err)
+		j.nextProducerEpoch = max(j.nextProducerEpoch, nextEpoch)
+		if snap != nil {
+			if err := mergeJournalSnapshot(latest, snap); err != nil {
+				return nil, fmt.Errorf("merge transaction journal record at %d: %w", offset, err)
+			}
+			if previousSize, exists := latestRecordBytes[snap.ID]; exists {
+				latestBytes -= previousSize
+			}
+			recordBytes := recordEnd - offset
+			latestRecordBytes[snap.ID] = recordBytes
+			latestBytes += recordBytes
+		} else {
+			latestBytes += recordEnd - offset
+			j.hasProducerEpochWatermark = true
 		}
-		if previousSize, exists := latestRecordBytes[snap.ID]; exists {
-			latestBytes -= previousSize
-		}
-		recordBytes := recordEnd - offset
-		latestRecordBytes[snap.ID] = recordBytes
-		latestBytes += recordBytes
 		records++
 		offset = recordEnd
 	}
@@ -382,6 +420,9 @@ func (j *Journal) loadLocked() (map[string]*Snapshot, error) {
 }
 
 func (j *Journal) repairTail(file *os.File, offset int64, latest map[string]*Snapshot, latestRecordBytes map[string]int64, latestBytes int64, records int) (map[string]*Snapshot, error) {
+	if offset == 0 {
+		return nil, fmt.Errorf("incomplete first transaction journal record; cannot safely recover producer epoch watermark")
+	}
 	if err := repairJournalTail(file, offset); err != nil {
 		return nil, err
 	}
@@ -427,23 +468,73 @@ func cloneJournalState(state map[string]*Snapshot) map[string]*Snapshot {
 }
 
 func decodeJournalSnapshot(payload []byte) (*Snapshot, error) {
+	snap, _, err := decodeJournalRecord(payload)
+	return snap, err
+}
+
+func decodeJournalRecord(payload []byte) (*Snapshot, uint64, error) {
 	var record journalRecord
 	if err := json.Unmarshal(payload, &record); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	if record.Version != journalFormatVersion {
-		return nil, fmt.Errorf("unsupported transaction journal version %d; clean bootstrap required", record.Version)
+	if record.Version != 1 && record.Version != journalFormatVersion {
+		return nil, 0, fmt.Errorf("unsupported transaction journal version %d", record.Version)
+	}
+	if record.NextProducerEpoch != nil {
+		if record.Version != journalFormatVersion || record.Transaction != nil {
+			return nil, 0, fmt.Errorf("invalid producer epoch watermark record")
+		}
+		if err := ValidateProducerEpochWatermark(*record.NextProducerEpoch); err != nil {
+			return nil, 0, err
+		}
+		return nil, *record.NextProducerEpoch, nil
 	}
 	if record.Transaction == nil || record.Transaction.ID == "" {
-		return nil, fmt.Errorf("journal transaction is missing")
+		return nil, 0, fmt.Errorf("journal transaction is missing")
 	}
-	return record.Transaction, nil
+	if record.Transaction.Epoch < 0 {
+		return nil, 0, fmt.Errorf("invalid producer epoch %d", record.Transaction.Epoch)
+	}
+	return record.Transaction, uint64(record.Transaction.Epoch) + 1, nil
+}
+
+// NextProducerEpoch is recovered by Load, including from a journal with no
+// remaining transactions after retention. Callers restore it before serving.
+func (j *Journal) NextProducerEpoch() uint64 {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.nextProducerEpoch
+}
+
+func (j *Journal) HasProducerEpochWatermark() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.hasProducerEpochWatermark
+}
+
+func writeJournalRecord(w io.Writer, record journalRecord) (int64, error) {
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return 0, err
+	}
+	if len(payload) == 0 || len(payload) > maxJournalRecordBytes {
+		return 0, fmt.Errorf("journal record exceeds size limit")
+	}
+	var header, checksum [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(payload))) // #nosec G115 -- bounded above.
+	binary.BigEndian.PutUint32(checksum[:], crc32.ChecksumIEEE(payload))
+	for _, part := range [][]byte{header[:], payload, checksum[:]} {
+		if err := writeFull(w, part); err != nil {
+			return 0, err
+		}
+	}
+	return journalRecordSize(len(payload)), nil
 }
 
 func mergeJournalSnapshot(latest map[string]*Snapshot, incoming *Snapshot) error {
 	// Per-transaction controller locks serialize journal appends. The final
-	// record is authoritative even when an expired transactional ID starts a
-	// fresh producer epoch with lower revision metadata.
+	// record is authoritative; epoch allocation remains monotonic even when
+	// retention removes an ID's previous revision metadata.
 	latest[incoming.ID] = incoming
 	return nil
 }

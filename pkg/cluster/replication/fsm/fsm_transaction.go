@@ -8,6 +8,12 @@ import (
 	"github.com/cursus-io/cursus/util"
 )
 
+func (f *BrokerFSM) OffsetReservationsEnabled() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.offsetReservationsActivated
+}
+
 func (f *BrokerFSM) applyTransactionSyncCommand(jsonData string) interface{} {
 	var cmd struct {
 		Transaction      *transaction.Snapshot `json:"transaction"`
@@ -23,6 +29,14 @@ func (f *BrokerFSM) applyTransactionSyncCommand(jsonData string) interface{} {
 	}
 	f.mu.RLock()
 	txn := f.txn
+	if cmd.Transaction.OffsetReservationsPending {
+		for _, broker := range f.brokers {
+			if broker.LifecycleProtocol < OffsetReservationsProtocolVersion {
+				f.mu.RUnlock()
+				return fmt.Errorf("offset reservations require broker protocol %d on every registered broker", OffsetReservationsProtocolVersion)
+			}
+		}
+	}
 	for _, operation := range cmd.Transaction.Messages {
 		if f.topicState[operation.Topic] == nil {
 			f.mu.RUnlock()
@@ -42,15 +56,29 @@ func (f *BrokerFSM) applyTransactionSyncCommand(jsonData string) interface{} {
 		return fmt.Errorf("transaction manager not available")
 	}
 	if cmd.Transaction.Mode == transaction.ModeProcessingV1 {
+		if current, ok := txn.Snapshot(cmd.Transaction.ID); ok && !current.Ready &&
+			(current.State == transaction.StateCommitted || current.State == transaction.StateAborted) &&
+			current.Epoch == cmd.Transaction.Epoch && current.CoordinatorEpoch != cmd.Transaction.CoordinatorEpoch {
+			return fmt.Errorf("terminal transaction decision epoch is immutable transactional_id=%s", cmd.Transaction.ID)
+		}
 		if ownership.Owner == "" || ownership.Epoch <= 0 {
 			return fmt.Errorf("transaction coordinator unavailable for shard %d", shard)
 		}
-		if cmd.CoordinatorOwner != ownership.Owner || cmd.CoordinatorEpoch != ownership.Epoch || cmd.Transaction.CoordinatorEpoch != ownership.Epoch {
+		if cmd.CoordinatorOwner != ownership.Owner || cmd.CoordinatorEpoch != ownership.Epoch ||
+			(cmd.Transaction.CoordinatorEpoch != ownership.Epoch && !txn.IsOffsetReservationCleanupSnapshot(cmd.Transaction)) {
 			return fmt.Errorf(
 				"transaction coordinator fenced transactional_id=%s current_owner=%s current_epoch=%d requested_owner=%s requested_epoch=%d",
 				cmd.Transaction.ID, ownership.Owner, ownership.Epoch, cmd.CoordinatorOwner, cmd.CoordinatorEpoch,
 			)
 		}
 	}
-	return txn.ApplyReplicatedSnapshot(cmd.Transaction)
+	if err := txn.ApplyReplicatedSnapshot(cmd.Transaction); err != nil {
+		return err
+	}
+	if cmd.Transaction.OffsetReservationsPending {
+		f.mu.Lock()
+		f.offsetReservationsActivated = true
+		f.mu.Unlock()
+	}
+	return nil
 }

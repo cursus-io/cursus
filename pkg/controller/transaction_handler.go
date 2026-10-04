@@ -60,7 +60,7 @@ func (ch *CommandHandler) handleInitProducerID(cmd string, contexts ...*ClientCo
 	defer stateLock.Unlock()
 
 	previousSnap, hadPrevious := ch.TxnManager.Snapshot(txnID)
-	if hadPrevious && (previousSnap.State == transaction.StateOpen || previousSnap.State == transaction.StatePrepareAbort) {
+	if hadPrevious && (previousSnap.State == transaction.StateOpen || previousSnap.State == transaction.StatePrepareAbort || (previousSnap.State == transaction.StateAborted && previousSnap.OffsetReservationsPending)) {
 		previous, err := ch.TxnManager.Status(txnID)
 		if err != nil {
 			return fmt.Sprintf("ERROR: init_producer_failed reason=%q", err.Error())
@@ -484,6 +484,13 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string, contexts ...*Client
 		return fmt.Sprintf("ERROR: invalid_txn_offsets reason=%q", err.Error())
 	}
 	registrationEpoch := ch.Coordinator.GetRegistrationEpoch(groupID)
+	if ch.isDistributed() && len(offsetPairs) > 0 {
+		var epochErr error
+		registrationEpoch, epochErr = ch.transactionGroupRegistrationEpoch(groupID, offsetTopic, offsetPairs[0].Partition)
+		if epochErr != nil {
+			return fmt.Sprintf("ERROR: transaction_offset_prepare_failed reason=%q", epochErr.Error())
+		}
+	}
 	ops := make([]transaction.OffsetOperation, 0, len(offsetPairs))
 	for _, pair := range offsetPairs {
 		op := transaction.OffsetOperation{Topic: offsetTopic, Group: groupID, Member: memberID, Generation: generation, Partition: pair.Partition, Offset: pair.Offset, RegistrationEpoch: registrationEpoch}
@@ -537,6 +544,9 @@ func (ch *CommandHandler) handleEndTxn(cmd string, contexts ...*ClientContext) s
 			return fmt.Sprintf("ERROR: transaction_already_committed transactional_id=%s", txnID)
 		}
 		if current.State == transaction.StateAborted {
+			if err := ch.resolveAndCheckpointTransactionReservations(current); err != nil {
+				return fmt.Sprintf("ERROR: transaction_offset_materialization_failed reason=%q", err.Error())
+			}
 			return fmt.Sprintf("OK transactional_id=%s state=aborted", txnID)
 		}
 		if current.State == transaction.StateCommitting || current.State == transaction.StatePrepareCommit {
@@ -576,16 +586,33 @@ func (ch *CommandHandler) handleEndTxn(cmd string, contexts ...*ClientContext) s
 	if current.State == transaction.StateAborted {
 		return fmt.Sprintf("ERROR: transaction_aborted transactional_id=%s", txnID)
 	}
-	if current.State == transaction.StateOpen {
+	if current.State == transaction.StateOpen && !current.OffsetReservationsPending {
 		if err := ch.validateTransaction(current); err != nil {
 			return fmt.Sprintf("ERROR: transaction_commit_failed state=open reason=%q", err.Error())
 		}
 		if current.Mode == transaction.ModeProcessingV1 && len(current.Offsets) > 0 {
+			if err := ch.requireOffsetReservationProtocol(); err != nil {
+				return fmt.Sprintf("ERROR: transaction_offset_prepare_failed state=open reason=%q", err.Error())
+			}
 			var err error
 			current, err = ch.prepareTransactionOffsetRecords(current)
 			if err != nil {
 				return fmt.Sprintf("ERROR: transaction_offset_prepare_failed state=open reason=%q", err.Error())
 			}
+			current, err = ch.TxnManager.BeginOffsetReservations(txnID, producerID, epoch)
+			if err != nil {
+				return fmt.Sprintf("ERROR: transaction_offset_prepare_failed state=open reason=%q", err.Error())
+			}
+		}
+	}
+	if current.State == transaction.StateOpen && current.OffsetReservationsPending {
+		// Retain the frozen state on an uncertain sync or reservation response.
+		// Abort/timeout recovery will use the same durable input scope.
+		if err := ch.syncTransactionState(txnID); err != nil {
+			return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
+		}
+		if err := ch.routeTransactionReservation(current, "prepare"); err != nil {
+			return fmt.Sprintf("ERROR: transaction_offset_prepare_failed state=open reason=%q", err.Error())
 		}
 	}
 
@@ -670,6 +697,11 @@ func (ch *CommandHandler) recoverPreparedTransactionsBatch(shards []int, limit i
 			failures = append(failures, fmt.Errorf("reload transaction %s for recovery: %w", pendingTx.ID, err))
 			continue
 		}
+		if resp := ch.ensureTransactionCoordinator(tx.ID); resp != "" {
+			stateLock.Unlock()
+			util.Debug("Skipping transaction recovery for %s on non-coordinator: %s", tx.ID, resp)
+			continue
+		}
 		if tx.State == transaction.StateCommitted && tx.Mode == transaction.ModeProcessingV1 && !tx.OffsetsMaterialized {
 			err = ch.materializeAndCheckpointTransactionOffsets(tx.ID, tx.Offsets)
 			stateLock.Unlock()
@@ -678,13 +710,16 @@ func (ch *CommandHandler) recoverPreparedTransactionsBatch(shards []int, limit i
 			}
 			continue
 		}
-		if tx.State != transaction.StateCommitting && tx.State != transaction.StatePrepareCommit && tx.State != transaction.StatePrepareAbort {
+		if tx.State == transaction.StateAborted && tx.OffsetReservationsPending {
+			err = ch.resolveAndCheckpointTransactionReservations(tx)
 			stateLock.Unlock()
+			if err != nil {
+				failures = append(failures, fmt.Errorf("release aborted transaction %s offsets: %w", tx.ID, err))
+			}
 			continue
 		}
-		if resp := ch.ensureTransactionCoordinator(tx.ID); resp != "" {
+		if tx.State != transaction.StateCommitting && tx.State != transaction.StatePrepareCommit && tx.State != transaction.StatePrepareAbort {
 			stateLock.Unlock()
-			util.Debug("Skipping transaction recovery for %s on non-coordinator: %s", tx.ID, resp)
 			continue
 		}
 		if tx.State == transaction.StatePrepareAbort {
@@ -715,6 +750,13 @@ func (ch *CommandHandler) recoverPreparedTransactionsBatch(shards []int, limit i
 				stateLock.Unlock()
 				failures = append(failures, fmt.Errorf("index recovered transaction %s streams: %w", tx.ID, err))
 				continue
+			}
+			if tx.Mode == transaction.ModeProcessingV1 {
+				if err := ch.materializeAndCheckpointTransactionOffsets(tx.ID, tx.Offsets); err != nil {
+					stateLock.Unlock()
+					failures = append(failures, fmt.Errorf("materialize recovered transaction %s offsets: %w", tx.ID, err))
+					continue
+				}
 			}
 		}
 		stateLock.Unlock()
@@ -857,6 +899,11 @@ func (ch *CommandHandler) handleTxnStatus(cmd string, contexts ...*ClientContext
 }
 
 func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
+	if tx.OffsetReservationsPending {
+		if err := ch.routeTransactionReservation(tx, "prepare"); err != nil {
+			return err
+		}
+	}
 	if err := ch.validateTransaction(tx); err != nil {
 		return err
 	}
@@ -875,6 +922,9 @@ func (ch *CommandHandler) applyTransaction(tx *transaction.Transaction) error {
 			return err
 		}
 		return nil
+	}
+	if tx.OffsetReservationsPending {
+		return apply()
 	}
 	return ch.withTransactionOffsetFences(tx.Offsets, apply)
 }
@@ -1058,6 +1108,9 @@ func (ch *CommandHandler) validateTransaction(tx *transaction.Transaction) error
 		}
 	}
 	for _, op := range tx.Offsets {
+		if tx.OffsetReservationsPending {
+			break
+		}
 		if err := ch.validateTransactionOffset(op, true); err != nil {
 			return err
 		}
@@ -1100,6 +1153,9 @@ func (ch *CommandHandler) validateTransactionOffset(op transaction.OffsetOperati
 	}
 	if ch.isDistributed() && ch.Cluster != nil && ch.Cluster.Router != nil {
 		cmd := fmt.Sprintf("COMMIT_OFFSET topic=%s partition=%d group=%s offset=%d member=%s generation=%d validate_only=true", op.Topic, op.Partition, op.Group, op.Offset, op.Member, op.Generation)
+		if op.RegistrationEpoch != 0 {
+			cmd += fmt.Sprintf(" registration_epoch=%d", op.RegistrationEpoch)
+		}
 		if !checkRegression {
 			cmd += " ownership_only=true"
 		}
@@ -1499,6 +1555,11 @@ func (ch *CommandHandler) materializeCommittedTransactionOffsets(ops []transacti
 }
 
 func (ch *CommandHandler) materializeAndCheckpointTransactionOffsets(txnID string, ops []transaction.OffsetOperation) error {
+	if tx, err := ch.TxnManager.Status(txnID); err != nil {
+		return err
+	} else if tx.OffsetReservationsPending {
+		return ch.resolveAndCheckpointTransactionReservations(tx)
+	}
 	if len(ops) == 0 {
 		return nil
 	}
