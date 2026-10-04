@@ -31,3 +31,18 @@ func TestSentinelErrors_Wrapping(t *testing.T) {
 	assert.True(t, errors.Is(wrapped, ErrProducerClosed))
 	assert.False(t, errors.Is(wrapped, ErrConsumerClosed))
 }
+
+func TestParseBrokerErrorPreservesClassificationAndQuotedFields(t *testing.T) {
+	err, ok := ParseBrokerError(`ERROR: NOT_LEADER leader="[::1]:9000" class=routing retryable=true reason="leadership moved"`)
+	assert.True(t, ok)
+	assert.Equal(t, ErrorClassRouting, err.Class)
+	assert.True(t, err.Retryable)
+	assert.Equal(t, "[::1]:9000", err.Fields["leader"])
+	assert.Equal(t, "leadership moved", err.Message)
+	err, ok = ParseBrokerError("ERROR NOT_LEADER retryable=false")
+	assert.True(t, ok)
+	assert.False(t, err.Retryable)
+	err, ok = ParseBrokerError("ERROR: NOT_LEADER leader=localhost:9000")
+	assert.True(t, ok)
+	assert.True(t, err.Retryable, "legacy responses use the shared protocol classification")
+}

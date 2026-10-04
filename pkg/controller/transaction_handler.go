@@ -60,6 +60,24 @@ func (ch *CommandHandler) handleInitProducerID(cmd string, contexts ...*ClientCo
 	defer stateLock.Unlock()
 
 	previousSnap, hadPrevious := ch.TxnManager.Snapshot(txnID)
+	if hadPrevious && (previousSnap.State == transaction.StateOpen || previousSnap.State == transaction.StatePrepareAbort) {
+		previous, err := ch.TxnManager.Status(txnID)
+		if err != nil {
+			return fmt.Sprintf("ERROR: init_producer_failed reason=%q", err.Error())
+		}
+		if err := ch.completeTransactionAbort(previous); err != nil {
+			return fmt.Sprintf("ERROR: init_producer_failed reason=%q", err.Error())
+		}
+		// Roll back a failed new epoch to the durable abort, never to the old
+		// open snapshot whose records have already received abort markers.
+		previousSnap, hadPrevious = ch.TxnManager.Snapshot(txnID)
+	}
+	if hadPrevious && previousSnap.Mode == transaction.ModeProcessingV1 && previousSnap.State == transaction.StateCommitted && !previousSnap.OffsetsMaterialized {
+		if err := ch.materializeAndCheckpointTransactionOffsets(txnID, previousSnap.Offsets); err != nil {
+			return fmt.Sprintf("ERROR: init_producer_failed reason=%q", err.Error())
+		}
+		previousSnap, hadPrevious = ch.TxnManager.Snapshot(txnID)
+	}
 	mode := transaction.ModeProcessingV1
 	producerID, epoch, err := ch.TxnManager.InitProducerWithMode(txnID, mode)
 	if err != nil {
@@ -609,6 +627,27 @@ func (ch *CommandHandler) RecoverPreparedTransactions() error {
 	return err
 }
 
+// completeTransactionAbort requires the transaction state lock. Every abort
+// entry point must persist the prepared decision before writing markers and
+// retain it on failure so a retry can finish the same epoch.
+func (ch *CommandHandler) completeTransactionAbort(tx *transaction.Transaction) error {
+	if tx.Mode == transaction.ModeProcessingV1 {
+		prepared, err := ch.TxnManager.PrepareAbort(tx.ID, tx.Producer, tx.Epoch)
+		if err != nil {
+			return err
+		}
+		if prepared.State == transaction.StatePrepareAbort {
+			if err := ch.syncTransactionState(tx.ID); err != nil {
+				return err
+			}
+			if err := ch.appendTransactionMarkers(prepared, types.TransactionMarkerAbort); err != nil {
+				return err
+			}
+		}
+	}
+	return ch.abortTransactionDecision(tx.ID, tx.Producer, tx.Epoch)
+}
+
 func (ch *CommandHandler) recoverPreparedTransactionsBatch(shards []int, limit int) (bool, error) {
 	if ch.TxnManager == nil {
 		return false, nil
@@ -617,6 +656,7 @@ func (ch *CommandHandler) recoverPreparedTransactionsBatch(shards []int, limit i
 	if len(pending) == 0 {
 		return more, nil
 	}
+	var failures []error
 	for _, pendingTx := range pending {
 		if pendingTx == nil {
 			continue
@@ -627,13 +667,14 @@ func (ch *CommandHandler) recoverPreparedTransactionsBatch(shards []int, limit i
 		tx, err := ch.TxnManager.Status(pendingTx.ID)
 		if err != nil {
 			stateLock.Unlock()
-			return more, fmt.Errorf("reload transaction %s for recovery: %w", pendingTx.ID, err)
+			failures = append(failures, fmt.Errorf("reload transaction %s for recovery: %w", pendingTx.ID, err))
+			continue
 		}
 		if tx.State == transaction.StateCommitted && tx.Mode == transaction.ModeProcessingV1 && !tx.OffsetsMaterialized {
 			err = ch.materializeAndCheckpointTransactionOffsets(tx.ID, tx.Offsets)
 			stateLock.Unlock()
 			if err != nil {
-				return more, fmt.Errorf("materialize recovered transaction %s offsets: %w", tx.ID, err)
+				failures = append(failures, fmt.Errorf("materialize recovered transaction %s offsets: %w", tx.ID, err))
 			}
 			continue
 		}
@@ -647,32 +688,39 @@ func (ch *CommandHandler) recoverPreparedTransactionsBatch(shards []int, limit i
 			continue
 		}
 		if tx.State == transaction.StatePrepareAbort {
-			if err := ch.appendTransactionMarkers(tx, types.TransactionMarkerAbort); err != nil {
+			if err := ch.completeTransactionAbort(tx); err != nil {
 				stateLock.Unlock()
-				return more, fmt.Errorf("recover aborted transaction %s: %w", tx.ID, err)
-			}
-			if err := ch.abortTransactionDecision(tx.ID, tx.Producer, tx.Epoch); err != nil {
-				stateLock.Unlock()
-				return more, fmt.Errorf("mark recovered transaction %s aborted: %w", tx.ID, err)
+				failures = append(failures, fmt.Errorf("recover aborted transaction %s: %w", tx.ID, err))
+				continue
 			}
 		} else {
+			// An earlier sync may have failed while leaving the local state
+			// prepared. Re-establish the durable decision before any markers.
+			if err := ch.syncTransactionState(tx.ID); err != nil {
+				stateLock.Unlock()
+				failures = append(failures, fmt.Errorf("sync recovered transaction %s: %w", tx.ID, err))
+				continue
+			}
 			if err := ch.applyTransaction(tx); err != nil {
 				stateLock.Unlock()
-				return more, fmt.Errorf("recover transaction %s: %w", tx.ID, err)
+				failures = append(failures, fmt.Errorf("recover transaction %s: %w", tx.ID, err))
+				continue
 			}
 			if err := ch.commitTransactionDecision(tx.ID); err != nil {
 				stateLock.Unlock()
-				return more, fmt.Errorf("mark recovered transaction %s committed: %w", tx.ID, err)
+				failures = append(failures, fmt.Errorf("mark recovered transaction %s committed: %w", tx.ID, err))
+				continue
 			}
 			if err := ch.indexCommittedTransactionStreams(tx); err != nil {
 				stateLock.Unlock()
-				return more, fmt.Errorf("index recovered transaction %s streams: %w", tx.ID, err)
+				failures = append(failures, fmt.Errorf("index recovered transaction %s streams: %w", tx.ID, err))
+				continue
 			}
 		}
 		stateLock.Unlock()
 		util.Info("Recovered prepared transaction %s", tx.ID)
 	}
-	return more, nil
+	return more, errors.Join(failures...)
 }
 
 // AbortTimedOutTransactions resolves expired open v1 transactions so their
@@ -684,6 +732,7 @@ func (ch *CommandHandler) AbortTimedOutTransactions(now time.Time) error {
 
 func (ch *CommandHandler) abortTimedOutTransactionsBatch(shards []int, now time.Time, limit int) (bool, error) {
 	candidates, more := ch.TxnManager.TimedOutTransactions(shards, now, limit)
+	var failures []error
 	for _, candidate := range candidates {
 		stateLock := ch.transactionStateLock(candidate.ID)
 		stateLock.Lock()
@@ -694,24 +743,15 @@ func (ch *CommandHandler) abortTimedOutTransactionsBatch(shards []int, now time.
 		}
 		if tx.State == transaction.StateOpen && !now.Before(tx.Deadline) {
 			if resp := ch.ensureTransactionCoordinator(tx.ID); resp == "" {
-				tx, err = ch.TxnManager.PrepareAbort(tx.ID, tx.Producer, tx.Epoch)
-				if err == nil {
-					err = ch.syncTransactionState(tx.ID)
-				}
-				if err == nil {
-					err = ch.appendTransactionMarkers(tx, types.TransactionMarkerAbort)
-				}
-				if err == nil {
-					err = ch.abortTransactionDecision(tx.ID, tx.Producer, tx.Epoch)
-				}
+				err = ch.completeTransactionAbort(tx)
 			}
 		}
 		stateLock.Unlock()
 		if err != nil {
-			return more, fmt.Errorf("abort timed out transaction %s: %w", candidate.ID, err)
+			failures = append(failures, fmt.Errorf("abort timed out transaction %s: %w", candidate.ID, err))
 		}
 	}
-	return more, nil
+	return more, errors.Join(failures...)
 }
 
 func (ch *CommandHandler) StartTransactionTimeoutMonitor(ctx context.Context) {
@@ -735,12 +775,10 @@ func (ch *CommandHandler) StartTransactionTimeoutMonitor(ctx context.Context) {
 			preparedMore, err := ch.recoverPreparedTransactionsBatch(shards, limit)
 			if err != nil {
 				util.Error("Prepared transaction recovery failed: %v", err)
-				return
 			}
 			timeoutMore, err := ch.abortTimedOutTransactionsBatch(shards, now, limit)
 			if err != nil {
 				util.Error("Transaction timeout resolution failed: %v", err)
-				return
 			}
 			if !preparedMore && !timeoutMore {
 				return
@@ -1246,6 +1284,7 @@ func isRetryableTransactionStateLag(resp string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(resp))
 	for _, code := range []string{
 		"transaction_not_found",
+		"transaction_not_open",
 		"transaction_not_committing",
 		"transaction_record_not_staged",
 		"transaction_marker_partition_not_touched",

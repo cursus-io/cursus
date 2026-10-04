@@ -17,3 +17,19 @@ Alert thresholds are workload-specific. Compare age and counts with broker
 readiness, storage errors, Raft leadership, and consumer metadata recovery
 metrics before taking recovery action. Metrics and diagnostic commands are
 read-only and never create groups, transactions, topics, or offsets.
+
+Reinitializing an open transactional producer first persists an abort decision
+and writes abort markers for the old epoch. The broker issues the new epoch
+only after that work succeeds. A failed initialization can be retried; do not
+delete its topic or transaction journal to bypass a recovery error. Reinitializing
+a committed transaction also waits for its consumer offsets to be materialized.
+In a cluster, the transaction coordinator waits for the replicated final
+decision to be applied locally before completing the request, even when it is
+not the Raft leader. A local apply timeout leaves the durable decision intact
+for retry and recovery.
+
+Recovery and timeout sweeps report individual transaction failures while
+continuing the remaining batch. A storage or coordinator failure for one
+transaction must not suppress timeout resolution for unrelated transactions.
+Prepared commit recovery after consumer membership changes remains a separate
+operational risk until its fencing and offset-visibility contracts are resolved.

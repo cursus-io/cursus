@@ -2,8 +2,8 @@ package sdk
 
 import (
 	"context"
-	"fmt"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -84,7 +84,7 @@ func TestAdminClientBrowseMessagesReadsBoundedFrames(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(9007199254740994), result.NextOffset)
 	require.Equal(t, []AdminMessage{{Offset: 9007199254740993, Key: "order-1", Payload: `{"id":"order-1"}`, Metadata: `{"source":"test"}`, EventType: "OrderCreated", SchemaVersion: 2, AggregateVersion: 4}}, result.Messages)
-	require.Equal(t, []string{"NEGOTIATE version=1 features=browse_messages_v1 require_features=true", "BROWSE_MESSAGES topic=orders partition=0 from_offset=1 max_records=10 max_bytes=1024"}, receiveObservationCommands(t, commands))
+	require.Equal(t, []string{"BROWSE_MESSAGES topic=orders partition=0 from_offset=1 max_records=10 max_bytes=1024"}, receiveObservationCommands(t, commands))
 }
 
 func TestAdminClientReadStreamHistoryReadsBoundedFrames(t *testing.T) {
@@ -95,7 +95,7 @@ func TestAdminClientReadStreamHistoryReadsBoundedFrames(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), result.NextVersion)
 	require.Equal(t, []StreamEvent{{Version: 2, Offset: 9, Type: "OrderPaid", SchemaVersion: 3, Payload: `{"state":"paid"}`}}, result.Events)
-	require.Equal(t, []string{"NEGOTIATE version=1 features=stream_history_v1 require_features=true", "READ_STREAM_HISTORY topic=orders key=order-1 from_version=2 max_records=10 max_bytes=1024"}, receiveObservationCommands(t, commands))
+	require.Equal(t, []string{"READ_STREAM_HISTORY topic=orders key=order-1 from_version=2 max_records=10 max_bytes=1024"}, receiveObservationCommands(t, commands))
 }
 
 func TestAdminClientObservationRejectsInvalidRequestsBeforeConnecting(t *testing.T) {
@@ -109,14 +109,39 @@ func TestAdminClientObservationRejectsInvalidRequestsBeforeConnecting(t *testing
 }
 
 func TestNegotiateProtocolCoversFeatureAndResponseFailures(t *testing.T) {
+	t.Run("rejects obsolete application protocol version", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		_, err := NegotiateProtocol(client, ProtocolNegotiation{Version: 1})
+		require.ErrorContains(t, err, "unsupported Wire protocol version 1")
+	})
+	for _, required := range []bool{false, true} {
+		t.Run("feature selection required="+strconv.FormatBool(required), func(t *testing.T) {
+			addr, result := startAdminCapabilityTestServer(t, "OK commands=BROWSE_MESSAGES")
+			client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
+			require.NoError(t, err)
+			response, err := withObservationConnection(context.Background(), client, func(conn net.Conn) (*NegotiatedProtocol, error) {
+				return NegotiateProtocol(conn, ProtocolNegotiation{Version: 2, Features: []string{"stream_history_v1", "browse_messages_v1", "browse_messages_v1"}, RequireFeatures: required})
+			})
+			if required {
+				require.ErrorContains(t, err, "not fully enabled")
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, []string{"browse_messages_v1"}, response.Enabled)
+				require.Equal(t, []string{"stream_history_v1"}, response.Unsupported)
+			}
+			require.Equal(t, "HELP", receiveAdminTestCommand(t, result))
+		})
+	}
 	t.Run("decodes capability response", func(t *testing.T) {
-		addr, result := startAdminCapabilityTestServer(t, "OK protocol_version=3 enabled=alpha,zeta unsupported=")
+		addr, result := startAdminCapabilityTestServer(t, "OK commands=BROWSE_MESSAGES,READ_STREAM_HISTORY")
 		client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
 		require.NoError(t, err)
 		response, err := client.Capabilities(context.Background())
 		require.NoError(t, err)
-		require.Equal(t, &NegotiatedProtocol{Version: 3, Enabled: []string{"alpha", "zeta"}}, response)
-		require.Equal(t, "NEGOTIATE version=1 features=* require_features=false", receiveAdminTestCommand(t, result))
+		require.Equal(t, &NegotiatedProtocol{Version: 2, Enabled: []string{"browse_messages_v1", "stream_history_v1", "structured_errors_v1"}}, response)
+		require.Equal(t, "HELP", receiveAdminTestCommand(t, result))
 	})
 	t.Run("rejects wildcard among multiple features", func(t *testing.T) {
 		client, server := net.Pipe()
@@ -133,15 +158,15 @@ func TestNegotiateProtocolCoversFeatureAndResponseFailures(t *testing.T) {
 		var brokerErr *BrokerError
 		require.ErrorAs(t, err, &brokerErr)
 		require.Equal(t, "unsupported_feature", brokerErr.Code)
-		require.Equal(t, "NEGOTIATE version=1 features=* require_features=false", receiveAdminTestCommand(t, result))
+		require.Equal(t, "HELP", receiveAdminTestCommand(t, result))
 	})
 	t.Run("rejects malformed response", func(t *testing.T) {
 		addr, result := startAdminCapabilityTestServer(t, "OK protocol_version=0 enabled= unsupported=")
 		client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
 		require.NoError(t, err)
 		_, err = client.Capabilities(context.Background())
-		require.ErrorContains(t, err, "invalid negotiated protocol version")
-		require.Equal(t, "NEGOTIATE version=1 features=* require_features=false", receiveAdminTestCommand(t, result))
+		require.ErrorContains(t, err, "capability response is missing commands")
+		require.Equal(t, "HELP", receiveAdminTestCommand(t, result))
 	})
 }
 
@@ -223,13 +248,6 @@ func TestAdminClientObservationRejectsMalformedWireResponses(t *testing.T) {
 }
 
 func TestAdminClientObservationCoversFeatureAndGroupOffsetEdges(t *testing.T) {
-	t.Run("requires requested feature", func(t *testing.T) {
-		client, commands := observationFrameClientWithNegotiation(t, "browse_messages_v1", "OK protocol_version=1 enabled= unsupported=browse_messages_v1", `{"status":"OK"}`, []byte("unused"))
-		_, err := client.BrowseMessages(context.Background(), BrowseRequest{Topic: "orders", Partition: 0, FromOffset: 1, MaxRecords: 1, MaxBytes: 1})
-		require.ErrorContains(t, err, "not fully enabled")
-		// The feature negotiation fails before an observation command is sent.
-		require.Empty(t, receiveObservationCommands(t, commands))
-	})
 	t.Run("clamps negative lag to zero", func(t *testing.T) {
 		client, commands := observationAdminClient(t, []string{
 			"OK topic=orders partitions=1 offsets=P0:earliest=1:latest=8:leo=9:hwm=8",
@@ -247,7 +265,7 @@ func TestAdminClientObservationCoversFeatureAndGroupOffsetEdges(t *testing.T) {
 		toOffset := uint64(4)
 		_, err = browseClient.BrowseMessages(context.Background(), BrowseRequest{Topic: "orders", Partition: 0, FromOffset: 1, ToOffset: &toOffset, MaxRecords: 1, MaxBytes: 1})
 		require.NoError(t, err)
-		require.Contains(t, receiveObservationCommands(t, browseCommands)[1], "to_offset=4")
+		require.Contains(t, receiveObservationCommands(t, browseCommands)[0], "to_offset=4")
 
 		historyBatch, err := EncodeBatchMessages("orders", 0, "all", false, nil)
 		require.NoError(t, err)
@@ -255,7 +273,7 @@ func TestAdminClientObservationCoversFeatureAndGroupOffsetEdges(t *testing.T) {
 		toVersion := uint64(2)
 		_, err = historyClient.ReadStreamHistory(context.Background(), HistoryRequest{Topic: "orders", Key: "order-1", FromVersion: 1, ToVersion: &toVersion, MaxRecords: 1, MaxBytes: 1})
 		require.NoError(t, err)
-		require.Contains(t, receiveObservationCommands(t, historyCommands)[1], "to_version=2")
+		require.Contains(t, receiveObservationCommands(t, historyCommands)[0], "to_version=2")
 	})
 	t.Run("rejects invalid identifiers before connecting", func(t *testing.T) {
 		client := &AdminClient{}
@@ -307,10 +325,6 @@ func observationAdminClient(t *testing.T, responses []string) (*AdminClient, <-c
 }
 
 func observationFrameClient(t *testing.T, feature, envelope string, batch []byte) (*AdminClient, <-chan []string) {
-	return observationFrameClientWithNegotiation(t, feature, "OK protocol_version=1 enabled="+feature+" unsupported=", envelope, batch)
-}
-
-func observationFrameClientWithNegotiation(t *testing.T, feature, negotiationResponse, envelope string, batch []byte) (*AdminClient, <-chan []string) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -325,17 +339,6 @@ func observationFrameClientWithNegotiation(t *testing.T, feature, negotiationRes
 		defer func() { _ = conn.Close() }()
 		connection, handshakeErr := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
 		if handshakeErr != nil {
-			return
-		}
-		negotiation, readErr := connection.ReadFrame()
-		if readErr != nil || negotiation.Command != wire.CommandNegotiate {
-			return
-		}
-		negotiated, decodeErr := wire.DecodeCommandPayload(negotiation.Payload)
-		if decodeErr != nil || negotiated.Fields["features"] != feature || negotiated.Fields["require_features"] != "true" {
-			return
-		}
-		if writeErr := writeWireTestResponse(connection, negotiation, negotiationResponse); writeErr != nil {
 			return
 		}
 		request, readErr := connection.ReadFrame()
@@ -356,7 +359,7 @@ func observationFrameClientWithNegotiation(t *testing.T, feature, negotiationRes
 		if writeErr := connection.WriteFrame(wire.Frame{Kind: wire.KindResponse, Command: request.Command, Status: wire.StatusOK, RequestID: request.RequestID, Payload: batch}); writeErr != nil {
 			return
 		}
-		commands <- []string{fmt.Sprintf("NEGOTIATE version=%s features=%s require_features=%s", negotiated.Fields["version"], negotiated.Fields["features"], negotiated.Fields["require_features"]), command}
+		commands <- []string{command}
 	}()
 	client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{listener.Addr().String()}, RequestTimeoutMS: 1000})
 	require.NoError(t, err)

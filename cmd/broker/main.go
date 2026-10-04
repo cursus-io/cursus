@@ -54,6 +54,11 @@ func main() {
 }
 
 func runBroker(ctx context.Context, cfg *config.Config) error {
+	storageLock, err := disk.LockStorageDirectory(cfg.LogDir)
+	if err != nil {
+		return fmt.Errorf("lock broker storage: %w", err)
+	}
+	defer func() { _ = storageLock.Close() }()
 	dm := disk.NewDiskManager(cfg)
 	defer dm.CloseAllHandlers()
 	sm := stream.NewStreamManager(cfg.MaxStreamConnections, cfg.StreamTimeout)

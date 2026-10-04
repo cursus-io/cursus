@@ -3,3 +3,4 @@
 Dockerfile text eol=lf
 go.mod text
 go.sum text
+testdata/client-conformance/wire-v2.json text eol=lf

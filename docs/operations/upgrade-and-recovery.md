@@ -13,6 +13,15 @@ Mixed-version rolling upgrades across a format boundary are unsupported. A
 normal restart of the same compatible release is supported; a format-changing
 upgrade is a coordinated whole-cluster operation.
 
+Each broker exclusively locks its log directory before opening metadata or
+recovering partitions. A second broker using the same directory fails startup;
+each partition also rejects a second storage handler. The filesystem must
+support the operating system's exclusive file locks. Locks are released on
+normal shutdown or process exit, including a crash. The `.cursus.lock` and
+`partition_<id>.lock` files remain on disk and are safe to retain in backups.
+Do not delete or replace them while a broker is running: the file's existence
+does not indicate a stale lock, and removing it can defeat mutual exclusion.
+
 ## Preflight
 
 Validate a copied backup before using it for a rollback or recovery. The command is read-only: it verifies the explicit topic manifest against the persisted partition layout, scans topic and consumer metadata records, and validates any transaction-journal framing and checksums without starting a broker.

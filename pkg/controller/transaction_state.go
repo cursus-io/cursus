@@ -100,7 +100,14 @@ func (ch *CommandHandler) persistFinalTransactionDecision(snapshot *transaction.
 			return err
 		}
 		_, err = ch.applyViaLeader("TXN_SYNC", payload)
-		return err
+		if err != nil {
+			return err
+		}
+		// The transaction coordinator can be a Raft follower. A successful
+		// forwarded apply confirms the leader's decision, but does not mean
+		// this node has applied it yet. Do not initialize another epoch or
+		// materialize offsets while the local state is still prepared.
+		return ch.waitForTransactionDecision(snapshot)
 	}
 	if ch.txnJournal != nil {
 		if err := ch.txnJournal.Append(snapshot); err != nil {
@@ -108,6 +115,24 @@ func (ch *CommandHandler) persistFinalTransactionDecision(snapshot *transaction.
 		}
 	}
 	return ch.TxnManager.ApplyReplicatedSnapshot(snapshot)
+}
+
+func (ch *CommandHandler) waitForTransactionDecision(snapshot *transaction.Snapshot) error {
+	timer := time.NewTimer(DefaultFSMApplyTimeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		current, ok := ch.TxnManager.Snapshot(snapshot.ID)
+		if ok && current.Epoch == snapshot.Epoch && current.Revision >= snapshot.Revision && current.State == snapshot.State {
+			return nil
+		}
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			return fmt.Errorf("timed out waiting for local transaction decision transactional_id=%s epoch=%d revision=%d", snapshot.ID, snapshot.Epoch, snapshot.Revision)
+		}
+	}
 }
 
 func (ch *CommandHandler) transactionSyncPayload(snapshot *transaction.Snapshot) (map[string]interface{}, error) {

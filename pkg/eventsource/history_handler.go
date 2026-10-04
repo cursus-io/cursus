@@ -109,17 +109,19 @@ func (h *Handler) HandleReadStreamHistory(cmd string, conn net.Conn) {
 		expected++
 		next = expected
 	}
-	hasMore := next != 0 && next <= to && (len(messages) == maxRecords || next <= to)
+	hasMore := next != 0 && next <= to
 	if len(entries) == 0 {
 		if from <= to {
 			completeness = "unknown"
 		}
 		next = 0
 		hasMore = false
-	} else if completeness == "complete" && next != 0 && next <= to && len(entries) < maxRecords {
+	} else if completeness == "complete" && next != 0 && next <= to && len(entries) < maxRecords && len(messages) == len(entries) {
 		// A fixed range ended before its advertised upper bound. The index can no
 		// longer prove continuity (for example after retention), so never describe
 		// this as a complete history or offer a cursor that repeats the gap.
+		// If the byte budget stopped before the last entry, the next indexed
+		// version is still available and must remain a resumable page.
 		completeness = "partial"
 		hasMore = false
 	} else if completeness != "complete" {

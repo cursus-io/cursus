@@ -828,7 +828,7 @@ func (p *Partition) ReadCommittedPage(offset uint64, max, maxBytes int, allowOve
 		max = int(canRead) // #nosec G115 -- canRead is bounded by math.MaxInt before narrowing.
 	}
 
-	return p.readVisibleCommittedBounded(offset, max, maxBytes, allowOversizedFirst, hwm)
+	return p.readVisibleCommittedBounded(offset, max, maxBytes, allowOversizedFirst, hwm, hwm)
 }
 
 // ReadCommittedRange is the non-consuming counterpart to ReadCommitted for a
@@ -844,28 +844,29 @@ func (p *Partition) ReadCommittedRange(offset, endOffset uint64, max int) ([]typ
 	if flushed < hwm {
 		hwm = flushed
 	}
-	if endOffset < hwm {
-		hwm = endOffset
-	}
+	readEnd := min(endOffset, hwm)
 	earliest := p.dh.GetFirstOffset()
 	if offset < earliest {
-		return nil, &types.OffsetOutOfRangeError{Requested: offset, Earliest: earliest, Latest: hwm}
+		return nil, &types.OffsetOutOfRangeError{Requested: offset, Earliest: earliest, Latest: readEnd}
 	}
-	if offset >= hwm {
+	if offset >= readEnd {
 		return nil, nil
 	}
-	if remaining := hwm - offset; remaining <= math.MaxInt && max > int(remaining) { // #nosec G115 -- checked before narrowing.
+	p.pruneTransactionIndex(earliest)
+	if remaining := readEnd - offset; remaining <= math.MaxInt && max > int(remaining) { // #nosec G115 -- checked before narrowing.
 		max = int(remaining) // #nosec G115 -- checked before narrowing.
 	}
-	return p.readVisibleCommitted(offset, max, hwm)
+	// The page bound limits returned records, not the commit decision. A
+	// transaction's durable marker may lie beyond this page's end offset.
+	return p.readVisibleCommitted(offset, max, hwm, readEnd)
 }
 
-func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm uint64) ([]types.Message, error) {
-	messages, _, _, err := p.readVisibleCommittedBounded(offset, max, 0, true, hwm)
+func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm, readEnd uint64) ([]types.Message, error) {
+	messages, _, _, err := p.readVisibleCommittedBounded(offset, max, 0, true, hwm, readEnd)
 	return messages, err
 }
 
-func (p *Partition) readVisibleCommittedBounded(offset uint64, max, maxBytes int, allowOversizedFirst bool, hwm uint64) ([]types.Message, int, uint64, error) {
+func (p *Partition) readVisibleCommittedBounded(offset uint64, max, maxBytes int, allowOversizedFirst bool, hwm, readEnd uint64) ([]types.Message, int, uint64, error) {
 	if max <= 0 {
 		return nil, 0, offset, nil
 	}
@@ -874,7 +875,7 @@ func (p *Partition) readVisibleCommittedBounded(offset uint64, max, maxBytes int
 	defer p.txnMarkerMu.RUnlock()
 	resolver := p.txnResolver
 	lso := firstUnresolvedOpenOffset(hwm, p.txnRetentionFloor, p.txnOpenOffsets, p.txnMarkers, resolver)
-	scanLimit := hwm
+	scanLimit := min(readEnd, hwm)
 	if lso < scanLimit {
 		scanLimit = lso
 	}

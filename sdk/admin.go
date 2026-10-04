@@ -321,12 +321,9 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 	if err := conn.SetDeadline(deadline); err != nil {
 		return "", fmt.Errorf("set admin request deadline: %w", err)
 	}
-	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopCancellation()
 
-	if err := conn.SetDeadline(deadline); err != nil {
-		return "", fmt.Errorf("restore admin request deadline: %w", err)
-	}
 	if err := WriteWithLength(conn, []byte(command)); err != nil {
 		return "", &ambiguousAdminError{err: fmt.Errorf("send admin command to %s: %w", addr, err)}
 	}

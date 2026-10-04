@@ -82,6 +82,14 @@ flowchart TB
 | Framework Integration | — | Spring Boot | FastAPI |
 | Iterator Pattern | — | — | ✅ for/async for |
 
+## Go Producer Initialization
+
+`NewProducerWithContext` applies its context throughout connection establishment, authentication, optional topic creation, metadata discovery, and partition connections. Cancellation closes initialization sockets and returns a context error; sender workers start only after initialization succeeds. After success, canceling the context closes the producer.
+
+`AckTimeoutMS` also bounds each producer `CREATE` and `METADATA` exchange, including connection establishment and authentication. Zero uses 5000 ms for these control requests. A metadata request timeout allows discovery to try the next bootstrap address; canceling the constructor context stops initialization.
+
+TLS settings apply to every connection, including `AutoCreateTopics` initialization. The connection address supplies the TLS verification hostname when no explicit server name is configured. Certificate and hostname verification remain enabled.
+
 ## Go Producer Delivery Errors
 
 `Producer.Flush() error` waits for queued batches and returns a drain timeout or the first permanent delivery failure. `Producer.Close() error` also reports that failure, including when shutdown times out. Check both return values: accepting a message into the local buffer is not proof of broker delivery. Permanent delivery errors remain visible for the lifetime of the producer.
@@ -140,6 +148,14 @@ cfg.HandshakeTimeoutMS = 5000
 ```
 
 The handshake runs for every newly opened or reconnected TCP connection. `HandshakeTimeoutMS` bounds it; zero uses 5000 ms and negative values fail configuration validation. A version or compression mismatch closes the connection before use. The SDK has no application-level feature negotiation or legacy protocol mode.
+
+Observation methods send `BROWSE_MESSAGES` and `READ_STREAM_HISTORY` directly
+after that handshake. `AdminClient.Capabilities` uses the read-only `HELP`
+command and maps the exposed command families to Wire v2 feature names; its
+`Version` is 2. This describes command availability, not the caller's permissions.
+The retained `NegotiateProtocol` API performs the same capability query and
+local feature filtering. Its optional `Version` must be 2, and it never sends
+an application `NEGOTIATE` command or enables server-side connection features.
 
 Go, Java, and Python encode the same canonical conformance vectors for
 negotiation, requests, batches, stream controls, errors, and compression. The

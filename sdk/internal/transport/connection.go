@@ -71,8 +71,15 @@ func Dial(ctx context.Context, addr string, config DialConfig) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
+	// A canceled context without a deadline must also interrupt the Wire
+	// handshake. Closing avoids races with handshake deadline changes.
+	stopCancellation := context.AfterFunc(ctx, func() { _ = raw.Close() })
+	defer stopCancellation()
 	closeOnError := func(err error) (*Conn, error) {
 		_ = raw.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	if tcpConn, ok := raw.(*net.TCPConn); ok {
@@ -84,7 +91,15 @@ func Dial(ctx context.Context, addr string, config DialConfig) (*Conn, error) {
 	}
 	conn := raw
 	if config.TLS != nil {
-		tlsConn := tls.Client(raw, config.TLS.Clone())
+		tlsConfig := config.TLS.Clone()
+		if tlsConfig.ServerName == "" {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				return closeOnError(fmt.Errorf("parse TLS peer address: %w", err))
+			}
+			tlsConfig.ServerName = host
+		}
+		tlsConn := tls.Client(raw, tlsConfig)
 		handshakeCtx, cancel := context.WithTimeout(ctx, config.HandshakeTimeout)
 		err = tlsConn.HandshakeContext(handshakeCtx)
 		cancel()
@@ -106,6 +121,9 @@ func Dial(ctx context.Context, addr string, config DialConfig) (*Conn, error) {
 	}
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return closeOnError(fmt.Errorf("clear Wire v2 handshake deadline: %w", err))
+	}
+	if !stopCancellation() || ctx.Err() != nil {
+		return closeOnError(ctx.Err())
 	}
 	return framed, nil
 }

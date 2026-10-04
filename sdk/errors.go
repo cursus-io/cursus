@@ -99,16 +99,13 @@ func ParseBrokerError(value string) (*BrokerError, bool) {
 	} else {
 		return nil, false
 	}
-	parts := strings.Fields(value)
-	if len(parts) == 0 {
+	parsed, ok := wireprotocol.ParseErrorResponse("ERROR: " + value)
+	if !ok {
 		return nil, false
 	}
-	err := &BrokerError{Code: parts[0], Message: parts[0], Fields: make(map[string]string)}
-	for _, part := range parts[1:] {
-		key, fieldValue, ok := strings.Cut(part, "=")
-		if ok && key != "" {
-			err.Fields[key] = strings.Trim(fieldValue, "\"")
-		}
+	message := parsed.Fields["reason"]
+	if message == "" {
+		message = parsed.Code
 	}
-	return err, true
+	return &BrokerError{Code: parsed.Code, Class: parsed.Class, Retryable: parsed.Retryable, Message: message, Fields: parsed.Fields}, true
 }

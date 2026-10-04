@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
@@ -251,7 +252,7 @@ func TestProducerClient_ConnectPartition_NoBroker(t *testing.T) {
 func TestProducerClient_ConnectPartitionLocked_NegativeIndex(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	pc, _ := NewProducerClient(cfg)
-	err := pc.connectPartitionLocked(-1, "localhost:9000")
+	err := pc.connectPartitionLocked(context.Background(), -1, "localhost:9000")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid partition index")
 }

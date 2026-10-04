@@ -5,6 +5,7 @@ import "testing"
 func TestRetryableTransactionStateLagUsesStructuredCodes(t *testing.T) {
 	for _, response := range []string{
 		"ERROR: transaction_not_found transactional_id=tx-1",
+		"ERROR: transaction_not_open transactional_id=tx-1 state=aborted",
 		"ERROR: transaction_not_committing transactional_id=tx-1 state=open",
 		"ERROR: transaction_record_not_staged transactional_id=tx-1",
 		"ERROR: transaction_marker_partition_not_touched transactional_id=tx-1",

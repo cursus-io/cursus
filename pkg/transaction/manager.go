@@ -278,6 +278,9 @@ func expireTransactionLocked(tx *Transaction, cutoff, now time.Time) bool {
 	if tx.State != StateCommitted && tx.State != StateAborted {
 		return false
 	}
+	if tx.State == StateCommitted && tx.Mode == ModeProcessingV1 && len(tx.Offsets) > 0 && !tx.OffsetsMaterialized {
+		return false
+	}
 	tx.Messages = nil
 	tx.Offsets = nil
 	tx.Ready = false
@@ -310,6 +313,12 @@ func (m *Manager) InitProducerWithMode(id string, mode Mode) (string, int64, err
 	epoch := int64(0)
 	revision := uint64(1)
 	if tx := previous; tx != nil {
+		if tx.Mode == ModeProcessingV1 && tx.State == StateOpen {
+			return "", 0, fmt.Errorf("transaction %s must be aborted before reinitializing producer", id)
+		}
+		if tx.Mode == ModeProcessingV1 && tx.State == StateCommitted && len(tx.Offsets) > 0 && !tx.OffsetsMaterialized {
+			return "", 0, fmt.Errorf("transaction %s offsets must be materialized before reinitializing producer", id)
+		}
 		if tx.State == StateCommitting || tx.State == StatePrepareCommit || tx.State == StatePrepareAbort {
 			return "", 0, fmt.Errorf("transaction %s is committing; retry END_TXN before reinitializing producer", id)
 		}

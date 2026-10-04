@@ -3,6 +3,7 @@ package transaction
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // StateWithoutTopicReferences returns a detached state in which completed
@@ -54,6 +55,18 @@ func stateWithoutTopicReferencesLocked(current map[string]*Snapshot, topicName s
 		}
 		snap.Messages = filterTopicMessages(snap.Messages, topicName)
 		snap.Offsets = filterTopicOffsets(snap.Offsets, topicName)
+		snap.Streams = filterTopicStreams(snap.Streams, topicName)
+		snap.Participants = filterTopicParticipants(snap.Participants, topicName)
+		for key, assignment := range snap.RequestAssignments {
+			if assignment.Topic == topicName {
+				delete(snap.RequestAssignments, key)
+			}
+		}
+		for key := range snap.SequenceByPartition {
+			if sequenceKeyReferencesTopic(key, topicName) {
+				delete(snap.SequenceByPartition, key)
+			}
+		}
 		next[id] = snap
 		affected = append(affected, id)
 	}
@@ -66,6 +79,26 @@ func stateWithoutTopicReferencesLocked(current map[string]*Snapshot, topicName s
 }
 
 func transactionReferencesTopic(snap *Snapshot, topicName string) bool {
+	for _, operation := range snap.Streams {
+		if operation.Topic == topicName {
+			return true
+		}
+	}
+	for _, participant := range snap.Participants {
+		if participant.Topic == topicName {
+			return true
+		}
+	}
+	for _, assignment := range snap.RequestAssignments {
+		if assignment.Topic == topicName {
+			return true
+		}
+	}
+	for key := range snap.SequenceByPartition {
+		if sequenceKeyReferencesTopic(key, topicName) {
+			return true
+		}
+	}
 	for _, operation := range snap.Messages {
 		if operation.Topic == topicName {
 			return true
@@ -77,6 +110,31 @@ func transactionReferencesTopic(snap *Snapshot, topicName string) bool {
 		}
 	}
 	return false
+}
+
+func sequenceKeyReferencesTopic(key, topicName string) bool {
+	separator := strings.LastIndexByte(key, ':')
+	return separator >= 0 && key[:separator] == topicName
+}
+
+func filterTopicStreams(operations []StreamOperation, topicName string) []StreamOperation {
+	filtered := make([]StreamOperation, 0, len(operations))
+	for _, operation := range operations {
+		if operation.Topic != topicName {
+			filtered = append(filtered, operation)
+		}
+	}
+	return filtered
+}
+
+func filterTopicParticipants(participants []Participant, topicName string) []Participant {
+	filtered := make([]Participant, 0, len(participants))
+	for _, participant := range participants {
+		if participant.Topic != topicName {
+			filtered = append(filtered, participant)
+		}
+	}
+	return filtered
 }
 
 func filterTopicMessages(operations []MessageOperation, topicName string) []MessageOperation {

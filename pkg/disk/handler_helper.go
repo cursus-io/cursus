@@ -83,6 +83,9 @@ func (d *DiskHandler) Close() error {
 		if err := d.segmentReaders.close(); err != nil {
 			errs = append(errs, fmt.Errorf("segment reader cache cleanup error: %w", err))
 		}
+		if err := d.storageLock.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("storage lock cleanup error: %w", err))
+		}
 	})
 
 	if len(errs) > 0 {

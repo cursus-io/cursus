@@ -75,6 +75,10 @@ spec:
               value: "$(POD_NAME).{{ include "cursus-cluster.headlessService" . }}.$(POD_NAMESPACE).svc.cluster.local"
             - name: BROKER_PORT
               value: {{ .Values.service.brokerPort | quote }}
+            - name: HEALTH_CHECK_PORT
+              value: {{ .Values.service.healthPort | quote }}
+            - name: EXPORTER_PORT
+              value: {{ .Values.service.metricsPort | quote }}
             - name: ADVERTISED_CLIENT_HOST
               value: "$(POD_NAME).{{ include "cursus-cluster.headlessService" . }}.$(POD_NAMESPACE).svc.cluster.local"
             - name: ENABLE_DISTRIBUTION

@@ -73,9 +73,12 @@ func TestBrokerFSMTopicDeleteCleansLifecycleStateAndIsExplicitlyIdempotent(t *te
 	require.NoError(t, err)
 
 	transactions.ApplySnapshot(&transaction.Snapshot{
-		ID: "tx-orders", Producer: "producer", Revision: 1, State: transaction.StateOpen,
-		Messages:  []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
-		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		ID: "tx-orders", Producer: "producer", Revision: 1, State: transaction.StateOpen, Mode: transaction.ModeProcessingV1,
+		Participants:        []transaction.Participant{{Topic: "orders", Partition: 0}},
+		Streams:             []transaction.StreamOperation{{Topic: "orders", Partition: 0, Key: "order-1"}},
+		RequestAssignments:  map[string]transaction.RequestAssignment{"request": {Topic: "orders"}},
+		SequenceByPartition: map[string]uint64{"orders:0": 1},
+		CreatedAt:           time.Now(), UpdatedAt: time.Now(),
 	})
 	fsm.mu.Lock()
 	fsm.producerState["orders"] = map[int]map[string]ProducerSequence{0: {"producer": {Seq: 3}}}
@@ -97,14 +100,21 @@ func TestBrokerFSMTopicDeleteCleansLifecycleStateAndIsExplicitlyIdempotent(t *te
 
 	require.NoError(t, groupCoordinator.RemoveConsumer("workers", "member-1"))
 	transactions.ApplySnapshot(&transaction.Snapshot{
-		ID: "tx-orders", Producer: "producer", Revision: 2, State: transaction.StateCommitted,
-		Messages:  []transaction.MessageOperation{{Topic: "orders", Partition: 0}},
-		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		ID: "tx-orders", Producer: "producer", Revision: 2, State: transaction.StateCommitted, Mode: transaction.ModeProcessingV1,
+		Participants:        []transaction.Participant{{Topic: "orders", Partition: 0}},
+		Streams:             []transaction.StreamOperation{{Topic: "orders", Partition: 0, Key: "order-1"}},
+		RequestAssignments:  map[string]transaction.RequestAssignment{"request": {Topic: "orders"}},
+		SequenceByPartition: map[string]uint64{"orders:0": 1},
+		CreatedAt:           time.Now(), UpdatedAt: time.Now(),
 	})
 	require.NoError(t, fsm.ReconcileTopicMaterializations())
 	require.Nil(t, manager.GetTopic("orders"))
 	require.Nil(t, groupCoordinator.GetGroup("workers"))
 	require.Empty(t, transactions.ExportState()["tx-orders"].Messages)
+	require.Empty(t, transactions.ExportState()["tx-orders"].Participants)
+	require.Empty(t, transactions.ExportState()["tx-orders"].Streams)
+	require.Empty(t, transactions.ExportState()["tx-orders"].RequestAssignments)
+	require.Empty(t, transactions.ExportState()["tx-orders"].SequenceByPartition)
 
 	result = fsm.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders","if_exists":true}`), Index: 3})
 	require.Equal(t, topic.DeleteResult{Deleted: false}, result)
@@ -126,6 +136,10 @@ func TestBrokerFSMTopicDeleteCleansLifecycleStateAndIsExplicitlyIdempotent(t *te
 	require.Nil(t, restoredManager.GetTopic("orders"))
 	require.Nil(t, restoredCoordinator.GetGroup("workers"))
 	require.Empty(t, restoredTransactions.ExportState()["tx-orders"].Messages)
+	require.Empty(t, restoredTransactions.ExportState()["tx-orders"].Participants)
+	require.Empty(t, restoredTransactions.ExportState()["tx-orders"].Streams)
+	require.Empty(t, restoredTransactions.ExportState()["tx-orders"].RequestAssignments)
+	require.Empty(t, restoredTransactions.ExportState()["tx-orders"].SequenceByPartition)
 }
 
 func TestBrokerFSMTopicDeleteReportsCommittedDeletionWhenLocalCleanupIsPending(t *testing.T) {

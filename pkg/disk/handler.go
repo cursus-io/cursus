@@ -86,8 +86,9 @@ type DiskHandler struct {
 	file   *os.File
 	writer *bufio.Writer
 
-	closeOnce sync.Once
-	shutdown  sync.WaitGroup
+	closeOnce   sync.Once
+	shutdown    sync.WaitGroup
+	storageLock *StorageLock
 }
 
 func (d *DiskHandler) SetOnSync(callback func(uint64)) {
@@ -167,6 +168,16 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	if err := os.MkdirAll(filepath.Dir(base), 0o750); err != nil {
 		return nil, err
 	}
+	storageLock, err := lockStorageFile(base + ".lock")
+	if err != nil {
+		return nil, err
+	}
+	initialized := false
+	defer func() {
+		if !initialized {
+			_ = storageLock.Close()
+		}
+	}()
 
 	internalMetadata := topicName == config.ConsumerOffsetsTopicName
 	standaloneInternalMetadata := internalMetadata && !cfg.EnabledDistribution
@@ -191,7 +202,6 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	sort.Strings(files)
 
 	var currentSegmentBase uint64
-	var err error
 	prefix := fmt.Sprintf("partition_%d_segment_", partitionID)
 	var recovery segmentRecovery
 
@@ -239,6 +249,7 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	}
 
 	dh := &DiskHandler{
+		storageLock:    storageLock,
 		BaseName:       base,
 		SegmentSize:    uint64(cfg.SegmentSize),
 		IndexSize:      uint64(cfg.IndexSize),
@@ -277,6 +288,8 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	}
 
 	if err := dh.openIndexFiles(); err != nil {
+		_ = dh.closeIndexFiles()
+		_ = file.Close()
 		return nil, err
 	}
 	if internalMetadata {
@@ -325,6 +338,7 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		dh.retentionLoop(cfg)
 	}()
 
+	initialized = true
 	return dh, nil
 }
 
