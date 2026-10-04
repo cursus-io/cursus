@@ -69,25 +69,26 @@ type GroupLifecycleSnapshot struct {
 // re-created groups, while offset revisions make replay independent of the
 // physical internal-topic partition order.
 type ConsumerMetadataRecord struct {
-	Version          int                            `json:"version"`
-	Type             string                         `json:"type"`
-	Group            string                         `json:"group"`
-	Topic            string                         `json:"topic,omitempty"`
-	PartitionCount   int                            `json:"partition_count,omitempty"`
-	Topics           []string                       `json:"topics,omitempty"`
-	TopicPattern     string                         `json:"topic_pattern,omitempty"`
-	TopicPartitions  []TopicPartition               `json:"topic_partitions,omitempty"`
-	Epoch            uint64                         `json:"epoch"`
-	Revision         uint64                         `json:"revision,omitempty"`
-	Offsets          []OffsetItem                   `json:"offsets,omitempty"`
-	InitialOffsets   []TopicOffsetSnapshot          `json:"initial_offsets,omitempty"`
-	Timestamp        time.Time                      `json:"timestamp"`
-	TransactionalID  string                         `json:"transactional_id,omitempty"`
-	ProducerID       string                         `json:"producer_id,omitempty"`
-	ProducerEpoch    int64                          `json:"producer_epoch,omitempty"`
-	CoordinatorEpoch int64                          `json:"coordinator_epoch,omitempty"`
-	Lifecycle        *GroupLifecycleSnapshot        `json:"lifecycle,omitempty"`
-	Reservations     []TransactionOffsetReservation `json:"reservations,omitempty"`
+	Version              int                                  `json:"version"`
+	Type                 string                               `json:"type"`
+	Group                string                               `json:"group"`
+	Topic                string                               `json:"topic,omitempty"`
+	PartitionCount       int                                  `json:"partition_count,omitempty"`
+	Topics               []string                             `json:"topics,omitempty"`
+	TopicPattern         string                               `json:"topic_pattern,omitempty"`
+	TopicPartitions      []TopicPartition                     `json:"topic_partitions,omitempty"`
+	Epoch                uint64                               `json:"epoch"`
+	Revision             uint64                               `json:"revision,omitempty"`
+	Offsets              []OffsetItem                         `json:"offsets,omitempty"`
+	InitialOffsets       []TopicOffsetSnapshot                `json:"initial_offsets,omitempty"`
+	Timestamp            time.Time                            `json:"timestamp"`
+	TransactionalID      string                               `json:"transactional_id,omitempty"`
+	ProducerID           string                               `json:"producer_id,omitempty"`
+	ProducerEpoch        int64                                `json:"producer_epoch,omitempty"`
+	CoordinatorEpoch     int64                                `json:"coordinator_epoch,omitempty"`
+	Lifecycle            *GroupLifecycleSnapshot              `json:"lifecycle,omitempty"`
+	Reservations         []TransactionOffsetReservation       `json:"reservations,omitempty"`
+	ReservationDecisions map[string]OffsetReservationDecision `json:"reservation_decisions,omitempty"`
 }
 
 // ConsumerMetadataRecoveryStatus is safe to expose through readiness and
@@ -232,6 +233,7 @@ func (c *Coordinator) setRecoveryFailureStatus(status ConsumerMetadataRecoverySt
 
 func canonicalConsumerMetadataRecord(record ConsumerMetadataRecord) ConsumerMetadataRecord {
 	record.Reservations = cloneOffsetReservations(record.Reservations)
+	record.ReservationDecisions = cloneReservationDecisions(record.ReservationDecisions)
 	record.Timestamp = record.Timestamp.UTC()
 	record.Offsets = canonicalOffsetItems(record.Offsets)
 	record.Topics = append([]string(nil), record.Topics...)
@@ -304,9 +306,12 @@ func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
 		if record.Topic != "" || record.PartitionCount != 0 || len(record.Topics) != 0 || record.TopicPattern != "" || len(record.TopicPartitions) != 0 || len(record.Offsets) != 0 || len(record.InitialOffsets) != 0 || record.Lifecycle != nil || hasConsumerMetadataTransactionFields(record) {
 			return fmt.Errorf("offset reservations contain unrelated metadata fields")
 		}
-		return validateOffsetReservations(record.Reservations)
+		if err := validateOffsetReservations(record.Reservations); err != nil {
+			return err
+		}
+		return validateReservationDecisions(record.ReservationDecisions)
 	}
-	if record.Version == ConsumerMetadataRecordVersionReservations || len(record.Reservations) != 0 {
+	if record.Version == ConsumerMetadataRecordVersionReservations || len(record.Reservations) != 0 || len(record.ReservationDecisions) != 0 {
 		return fmt.Errorf("reservation metadata requires an offset reservations snapshot")
 	}
 	if record.Version == ConsumerMetadataRecordVersionTransactions && record.Type != ConsumerMetadataRecordTransactionalOffsetSnapshot {
@@ -867,6 +872,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 			if existing.ReservationRevision > recovered.ReservationRevision {
 				recovered.OffsetReservations = cloneOffsetReservations(existing.OffsetReservations)
 				recovered.ReservationRevision = existing.ReservationRevision
+				recovered.ReservationDecisions = cloneReservationDecisions(existing.ReservationDecisions)
 			}
 			for topicName, revision := range existing.OffsetRevisions {
 				if revision <= recovered.OffsetRevisions[topicName] {

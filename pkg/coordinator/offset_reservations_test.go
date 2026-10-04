@@ -26,6 +26,47 @@ func newReservationCoordinator(t *testing.T) (*Coordinator, TransactionOffsetRes
 	return c, reservation, c.GetRegistrationEpoch("workers")
 }
 
+func TestDelayedPrepareCannotResurrectResolvedReservation(t *testing.T) {
+	for _, committed := range []bool{false, true} {
+		t.Run(fmt.Sprint(committed), func(t *testing.T) {
+			c, reservation, epoch := newReservationCoordinator(t)
+			require.NoError(t, c.PrepareOffsetReservation("workers", epoch, reservation))
+			require.NoError(t, c.ResolveOffsetReservation("workers", epoch, "tx", "producer", 0, committed))
+			require.ErrorContains(t, c.PrepareOffsetReservation("workers", epoch, reservation), "resolved")
+			require.ErrorContains(t, c.ResolveOffsetReservation("workers", epoch, "tx", "producer", 0, !committed), "decision conflict")
+			_, _, err := c.GetStableOffset("workers", "orders", 0)
+			require.NoError(t, err)
+			state := c.ExportState()
+			require.NoError(t, c.ImportState(state))
+			state["workers"].ReservationDecisions["tx"] = OffsetReservationDecision{ProducerID: "other", ProducerEpoch: 99}
+			require.ErrorContains(t, c.PrepareOffsetReservation("workers", epoch, reservation), "resolved", "snapshot import must retain an independent copy of the decision")
+			reservation.ProducerEpoch++
+			require.NoError(t, c.PrepareOffsetReservation("workers", epoch, reservation))
+			require.ErrorContains(t, c.ResolveOffsetReservation("workers", epoch, "tx", "producer", 0, committed), "fenced", "an old resolution cannot release a newer active epoch")
+			require.NoError(t, c.ResolveOffsetReservation("workers", epoch, "tx", "producer", 1, committed))
+			require.NoError(t, c.ResolveOffsetReservation("workers", epoch, "tx", "producer", 0, committed))
+		})
+	}
+}
+
+func TestAbortDecisionFencesPrepareEvenWhenAcknowledgementIsLost(t *testing.T) {
+	c, reservation, epoch := newReservationCoordinator(t)
+	c.SetOffsetRecordWriter(func(ConsumerMetadataRecord) error { return fmt.Errorf("acknowledgement lost") })
+	require.ErrorContains(t, c.ResolveOffsetReservation("workers", epoch, "tx", "producer", 0, false), "acknowledgement lost")
+	require.ErrorContains(t, c.PrepareOffsetReservation("workers", epoch, reservation), "resolved", "abort may precede a delayed prepare request")
+	c.SetOffsetRecordWriter(func(record ConsumerMetadataRecord) error {
+		require.Equal(t, int64(0), record.ReservationDecisions["tx"].ProducerEpoch)
+		require.Empty(t, record.Reservations)
+		return nil
+	})
+	require.NoError(t, c.ResolveOffsetReservation("workers", epoch, "tx", "producer", 0, false))
+}
+
+func TestCommitRequiresReservationOrMatchingDurableDecision(t *testing.T) {
+	c, _, epoch := newReservationCoordinator(t)
+	require.ErrorContains(t, c.ResolveOffsetReservation("workers", epoch, "tx", "producer", 0, true), "missing for commit")
+}
+
 func TestOffsetReservationSurvivesMemberDepartureUntilDecision(t *testing.T) {
 	for _, committed := range []bool{false, true} {
 		t.Run(map[bool]string{false: "abort", true: "commit"}[committed], func(t *testing.T) {

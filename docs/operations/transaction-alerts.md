@@ -43,6 +43,14 @@ retain the fence and retries use a new snapshot revision. Older brokers cannot
 read version 5 records, so a data directory containing them must not be opened
 with an older binary.
 
+Reservation snapshots also retain the latest terminal decision for each
+transactional ID and producer epoch. A delayed prepare cannot resurrect a
+released fence, including when abort reaches the coordinator before prepare.
+Unknown commits and contradictory terminal decisions fail closed. These
+watermarks survive restart and group snapshots; they are retained until group
+deletion and do not expire on a timer. Capacity validation for workloads with
+unbounded distinct transactional IDs remains part of the resource-bounds gate.
+
 Distributed consumer-metadata recovery scans replication-committed control
 records beyond unrelated open transactions. Application read-committed reads
 still stop at the last stable offset. Recovery filters unresolved transactional

@@ -28,6 +28,35 @@ type TransactionOffsetReservation struct {
 	Offsets         []ReservedTransactionOffset `json:"offsets"`
 }
 
+// OffsetReservationDecision retains the highest resolved producer epoch for a
+// transactional ID. Releasing an input fence must also fence delayed prepare
+// requests; an empty reservation snapshot alone cannot do that.
+type OffsetReservationDecision struct {
+	ProducerID    string `json:"producer_id"`
+	ProducerEpoch int64  `json:"producer_epoch"`
+	Committed     bool   `json:"committed"`
+}
+
+func cloneReservationDecisions(decisions map[string]OffsetReservationDecision) map[string]OffsetReservationDecision {
+	if len(decisions) == 0 {
+		return nil
+	}
+	result := make(map[string]OffsetReservationDecision, len(decisions))
+	for id, decision := range decisions {
+		result[id] = decision
+	}
+	return result
+}
+
+func validateReservationDecisions(decisions map[string]OffsetReservationDecision) error {
+	for id, decision := range decisions {
+		if id == "" || decision.ProducerID == "" || decision.ProducerEpoch < 0 {
+			return fmt.Errorf("invalid offset reservation decision")
+		}
+	}
+	return nil
+}
+
 func cloneOffsetReservations(reservations []TransactionOffsetReservation) []TransactionOffsetReservation {
 	if len(reservations) == 0 {
 		return nil
@@ -92,6 +121,7 @@ func restoreOffsetReservations(groups map[string]*GroupMetadata, snapshots map[s
 			}
 		}
 		group.OffsetReservations = cloneOffsetReservations(record.Reservations)
+		group.ReservationDecisions = cloneReservationDecisions(record.ReservationDecisions)
 		group.ReservationRevision = record.Revision
 	}
 	return orphans, nil
@@ -119,6 +149,11 @@ func (c *Coordinator) PrepareOffsetReservation(groupName string, registrationEpo
 		return fmt.Errorf("group %q lifecycle update in progress", groupName)
 	}
 	reservation = cloneOffsetReservations([]TransactionOffsetReservation{reservation})[0]
+	if decision, ok := group.ReservationDecisions[reservation.TransactionalID]; ok {
+		if decision.ProducerID != reservation.ProducerID || reservation.ProducerEpoch <= decision.ProducerEpoch {
+			return fmt.Errorf("transaction offset reservation already resolved or producer fenced")
+		}
+	}
 	for _, existing := range group.OffsetReservations {
 		if existing.TransactionalID == reservation.TransactionalID {
 			if reflect.DeepEqual(existing, reservation) {
@@ -195,6 +230,18 @@ func (c *Coordinator) ResolveOffsetReservation(groupName string, registrationEpo
 	if c.lifecyclePending[groupName] {
 		return fmt.Errorf("group %q lifecycle update in progress", groupName)
 	}
+	decision, decided := group.ReservationDecisions[transactionalID]
+	if decided {
+		if decision.ProducerID != producerID {
+			return fmt.Errorf("transaction offset reservation producer fenced")
+		}
+		if producerEpoch < decision.ProducerEpoch {
+			return nil // A completed newer epoch already supersedes this request.
+		}
+		if producerEpoch == decision.ProducerEpoch && committed != decision.Committed {
+			return fmt.Errorf("transaction offset reservation decision conflict")
+		}
+	}
 	index := -1
 	for i, reservation := range group.OffsetReservations {
 		if reservation.TransactionalID != transactionalID {
@@ -207,7 +254,9 @@ func (c *Coordinator) ResolveOffsetReservation(groupName string, registrationEpo
 		break
 	}
 	if index < 0 && committed {
-		return nil
+		if !decided || decision.ProducerEpoch != producerEpoch {
+			return fmt.Errorf("transaction offset reservation missing for commit")
+		}
 	}
 	if index >= 0 && committed {
 		byTopic := make(map[string][]OffsetItem)
@@ -252,8 +301,13 @@ func (c *Coordinator) ResolveOffsetReservation(groupName string, registrationEpo
 			}
 		}
 	}
-	// Even an absent abort writes a checkpoint: an earlier failed prepare
-	// append may have reached disk without being installed in memory.
+	// Keep the terminal watermark even on an ambiguous append error, while
+	// retaining the old input fence until a retry confirms the checkpoint.
+	// This also covers abort arriving before its delayed prepare request.
+	if group.ReservationDecisions == nil {
+		group.ReservationDecisions = make(map[string]OffsetReservationDecision)
+	}
+	group.ReservationDecisions[transactionalID] = OffsetReservationDecision{ProducerID: producerID, ProducerEpoch: producerEpoch, Committed: committed}
 	return c.persistOffsetReservationsLocked(groupName, group, next)
 }
 
@@ -265,7 +319,7 @@ func (c *Coordinator) persistOffsetReservationsLocked(groupName string, group *G
 		return fmt.Errorf("reservation revision overflow")
 	}
 	group.ReservationRevision++
-	record := ConsumerMetadataRecord{Version: ConsumerMetadataRecordVersionReservations, Type: ConsumerMetadataRecordOffsetReservations, Group: groupName, Epoch: group.RegistrationEpoch, Revision: group.ReservationRevision, Reservations: cloneOffsetReservations(reservations), Timestamp: time.Now().UTC()}
+	record := ConsumerMetadataRecord{Version: ConsumerMetadataRecordVersionReservations, Type: ConsumerMetadataRecordOffsetReservations, Group: groupName, Epoch: group.RegistrationEpoch, Revision: group.ReservationRevision, Reservations: cloneOffsetReservations(reservations), ReservationDecisions: cloneReservationDecisions(group.ReservationDecisions), Timestamp: time.Now().UTC()}
 	if err := c.writeConsumerMetadataRecord(record); err != nil {
 		return err
 	}

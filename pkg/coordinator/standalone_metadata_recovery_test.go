@@ -166,6 +166,7 @@ func TestStandaloneTransactionOffsetReservationSurvivesDiskRestart(t *testing.T)
 			}
 			require.Equal(t, want, offset)
 			require.Empty(t, final.GetGroup("workers").OffsetReservations)
+			require.ErrorContains(t, final.PrepareOffsetReservation("workers", epoch, reservation), "resolved", "a delayed prepare must stay fenced across disk restart")
 			require.NoError(t, final.ResolveOffsetReservation("workers", epoch, "tx", "producer", 0, committed))
 		})
 	}

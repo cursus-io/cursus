@@ -123,6 +123,7 @@ type GroupMetadata struct {
 	OffsetRevisions      map[string]uint64          // topic -> durable snapshot revision
 	OffsetReservations   []TransactionOffsetReservation
 	ReservationRevision  uint64
+	ReservationDecisions map[string]OffsetReservationDecision
 }
 
 // MemberMetadata holds state for a single consumer instance.
@@ -140,23 +141,24 @@ type TopicPartition struct {
 
 // GroupStateSnapshot is a serializable snapshot of a consumer group's state.
 type GroupStateSnapshot struct {
-	TopicName            string                         `json:"topic"`
-	Topics               []string                       `json:"topics,omitempty"`
-	TopicPattern         string                         `json:"topic_pattern,omitempty"`
-	TopicPartitions      []TopicPartition               `json:"topic_partitions,omitempty"`
-	Generation           int                            `json:"generation"`
-	Members              map[string][]int               `json:"members"`
-	TopicAssignments     map[string][]TopicPartition    `json:"topic_assignments,omitempty"`
-	Partitions           []int                          `json:"partitions,omitempty"`
-	LastRebalance        time.Time                      `json:"last_rebalance,omitempty"`
-	LastActivity         time.Time                      `json:"last_activity,omitempty"`
-	Offsets              map[string]map[int]uint64      `json:"offsets"`
-	RegistrationEpoch    uint64                         `json:"registration_epoch,omitempty"`
-	RegistrationInferred bool                           `json:"registration_inferred,omitempty"`
-	OffsetRevisions      map[string]uint64              `json:"offset_revisions,omitempty"`
-	OffsetReservations   []TransactionOffsetReservation `json:"offset_reservations,omitempty"`
-	ReservationRevision  uint64                         `json:"reservation_revision,omitempty"`
-	Deleted              bool                           `json:"deleted,omitempty"`
+	TopicName            string                               `json:"topic"`
+	Topics               []string                             `json:"topics,omitempty"`
+	TopicPattern         string                               `json:"topic_pattern,omitempty"`
+	TopicPartitions      []TopicPartition                     `json:"topic_partitions,omitempty"`
+	Generation           int                                  `json:"generation"`
+	Members              map[string][]int                     `json:"members"`
+	TopicAssignments     map[string][]TopicPartition          `json:"topic_assignments,omitempty"`
+	Partitions           []int                                `json:"partitions,omitempty"`
+	LastRebalance        time.Time                            `json:"last_rebalance,omitempty"`
+	LastActivity         time.Time                            `json:"last_activity,omitempty"`
+	Offsets              map[string]map[int]uint64            `json:"offsets"`
+	RegistrationEpoch    uint64                               `json:"registration_epoch,omitempty"`
+	RegistrationInferred bool                                 `json:"registration_inferred,omitempty"`
+	OffsetRevisions      map[string]uint64                    `json:"offset_revisions,omitempty"`
+	OffsetReservations   []TransactionOffsetReservation       `json:"offset_reservations,omitempty"`
+	ReservationRevision  uint64                               `json:"reservation_revision,omitempty"`
+	ReservationDecisions map[string]OffsetReservationDecision `json:"reservation_decisions,omitempty"`
+	Deleted              bool                                 `json:"deleted,omitempty"`
 }
 
 // GroupStatus represents the status of a consumer group
@@ -917,6 +919,7 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 			OffsetRevisions:      make(map[string]uint64, len(group.OffsetRevisions)),
 			OffsetReservations:   cloneOffsetReservations(group.OffsetReservations),
 			ReservationRevision:  group.ReservationRevision,
+			ReservationDecisions: cloneReservationDecisions(group.ReservationDecisions),
 		}
 		for mid, member := range group.Members {
 			assignments := make([]int, len(member.Assignments))
@@ -982,6 +985,7 @@ func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) error {
 			OffsetRevisions:      make(map[string]uint64, len(snap.OffsetRevisions)),
 			OffsetReservations:   cloneOffsetReservations(snap.OffsetReservations),
 			ReservationRevision:  snap.ReservationRevision,
+			ReservationDecisions: cloneReservationDecisions(snap.ReservationDecisions),
 		}
 		for mid, assignments := range snap.Members {
 			group.Members[mid] = &MemberMetadata{
@@ -1021,7 +1025,7 @@ func ValidateImportState(state map[string]*GroupStateSnapshot) error {
 			return fmt.Errorf("consumer group %q snapshot is missing registration epoch; clean bootstrap is required", name)
 		}
 		if snap.Deleted {
-			if len(snap.OffsetReservations) != 0 || snap.ReservationRevision != 0 {
+			if len(snap.OffsetReservations) != 0 || snap.ReservationRevision != 0 || len(snap.ReservationDecisions) != 0 {
 				return fmt.Errorf("consumer group %q tombstone contains offset reservations", name)
 			}
 			if snap.TopicName != "" || len(snap.Topics) != 0 || snap.TopicPattern != "" ||
@@ -1035,11 +1039,14 @@ func ValidateImportState(state map[string]*GroupStateSnapshot) error {
 		if snap.Generation < 0 {
 			return fmt.Errorf("consumer group %q snapshot has negative generation %d", name, snap.Generation)
 		}
-		if len(snap.OffsetReservations) != 0 && snap.ReservationRevision == 0 {
+		if (len(snap.OffsetReservations) != 0 || len(snap.ReservationDecisions) != 0) && snap.ReservationRevision == 0 {
 			return fmt.Errorf("consumer group %q reservations lack a durable revision", name)
 		}
 		if err := validateOffsetReservations(snap.OffsetReservations); err != nil {
 			return fmt.Errorf("consumer group %q reservations: %w", name, err)
+		}
+		if err := validateReservationDecisions(snap.ReservationDecisions); err != nil {
+			return fmt.Errorf("consumer group %q reservation decisions: %w", name, err)
 		}
 		for _, reservation := range snap.OffsetReservations {
 			for _, offset := range reservation.Offsets {
