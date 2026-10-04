@@ -1,6 +1,7 @@
 package topic
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -26,6 +27,8 @@ func TestIdempotentProducerContinuesAfterInMemoryStateExpires(t *testing.T) {
 	first := types.Message{Payload: "first", ProducerID: "producer-1", Epoch: 7, SeqNum: 1}
 	require.NoError(t, partition.EnqueueSyncIdempotent(first))
 	expireProducerState(t, partition, first.ProducerID)
+	storageReads := &readCountingStorage{StorageHandler: storage}
+	partition.dh = storageReads
 
 	second := types.Message{Payload: "second", ProducerID: first.ProducerID, Epoch: first.Epoch, SeqNum: 2}
 	require.NoError(t, partition.EnqueueSyncIdempotent(second))
@@ -53,6 +56,14 @@ func TestIdempotentProducerContinuesAfterInMemoryStateExpires(t *testing.T) {
 	})
 	require.ErrorContains(t, err, "expected 3, got 4")
 	require.Equal(t, uint64(2), partition.NextOffset(), "rejected messages changed the log")
+	require.Zero(t, storageReads.readCalls, "producer validation must not scan the retained log")
+
+	partition.persistProducerStateCheckpoint()
+	data, err := os.ReadFile(partition.producerStatePath)
+	require.NoError(t, err)
+	checkpoint, err := decodeProducerStateCheckpoint(data)
+	require.NoError(t, err)
+	require.Equal(t, producerStateCheckpointEntry{Epoch: first.Epoch, Seq: second.SeqNum}, checkpoint.Producers[first.ProducerID])
 }
 
 func TestUnknownIdempotentProducerStillStartsAtSequenceOne(t *testing.T) {
@@ -62,6 +73,8 @@ func TestUnknownIdempotentProducerStillStartsAtSequenceOne(t *testing.T) {
 	storage, err := disk.NewDiskHandler(cfg, "orders", 0)
 	require.NoError(t, err)
 	partition := NewPartition(0, "orders", storage, nil, cfg)
+	storageReads := &readCountingStorage{StorageHandler: storage}
+	partition.dh = storageReads
 	t.Cleanup(func() {
 		partition.Close()
 		require.NoError(t, storage.Close())
@@ -75,6 +88,17 @@ func TestUnknownIdempotentProducerStillStartsAtSequenceOne(t *testing.T) {
 	})
 	require.ErrorContains(t, err, "first message for producer never-seen must have seqNum 1")
 	require.Equal(t, uint64(0), partition.NextOffset())
+	require.Zero(t, storageReads.readCalls, "unknown producers must not trigger a retained-log scan")
+}
+
+type readCountingStorage struct {
+	types.StorageHandler
+	readCalls int
+}
+
+func (s *readCountingStorage) ReadMessages(offset uint64, max int) ([]types.Message, error) {
+	s.readCalls++
+	return s.StorageHandler.ReadMessages(offset, max)
 }
 
 func expireProducerState(t *testing.T, partition *Partition, producerID string) {
