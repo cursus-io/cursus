@@ -6,10 +6,48 @@ import (
 	"net"
 	"testing"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
+	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBrowseRejectsNonAuthoritativeLocalReplica(t *testing.T) {
+	ch, tm, _, _ := newDiskBackedTransactionHandler(t)
+	require.NoError(t, tm.CreateTopic("browse-orders", 1, false, true))
+	brokerFSM := fsm.NewBrokerFSM(nil, nil)
+	require.Nil(t, brokerFSM.Apply(&raft.Log{Index: 1, Data: []byte(`REGISTER:{"id":"leader","addr":"127.0.0.1:7000","client_addr":"leader.example:9000","status":"active","lifecycle_protocol":2}`)}))
+	installRoutingTopic(t, brokerFSM, "browse-orders", "leader")
+	routed := newCoordinatorRoutingHandler("follower", brokerFSM, nil)
+	t.Cleanup(func() { require.NoError(t, routed.Close()) })
+	ch.Config.EnabledDistribution = true
+	ch.Cluster = routed.Cluster
+	envelope, batch := browseMessagesForTest(t, ch, "BROWSE_MESSAGES topic=browse-orders partition=0 from_offset=0")
+	require.Nil(t, batch)
+	require.Equal(t, "NOT_LEADER leader=leader.example:9000", envelope["error"], "an empty local replica is not an authoritative empty result")
+
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = client.Close() })
+	done := make(chan struct{})
+	go func() {
+		ch.HandleReadStreamHistoryCommand(server, "READ_STREAM_HISTORY topic=browse-orders key=order from_version=1")
+		_ = server.Close()
+		close(done)
+	}()
+	redirect, err := util.ReadWithLength(client)
+	require.NoError(t, err)
+	<-done
+	require.Equal(t, "ERROR: NOT_LEADER leader=leader.example:9000", string(redirect), "Wire v2 retains key=value routing fields, not free-form LEADER_IS text")
+
+	envelope, batch = browseMessagesForTest(t, ch, "BROWSE_MESSAGES topic=missing partition=0 from_offset=0")
+	require.Nil(t, batch)
+	require.Contains(t, envelope["error"], "leader_not_found")
+	ch.Cluster = nil
+	envelope, batch = browseMessagesForTest(t, ch, "BROWSE_MESSAGES topic=browse-orders partition=0 from_offset=0")
+	require.Nil(t, batch)
+	require.Equal(t, "cluster_metadata_unavailable", envelope["error"])
+}
 
 func browseMessagesForTest(t *testing.T, ch *CommandHandler, cmd string) (map[string]any, *types.Batch) {
 	t.Helper()

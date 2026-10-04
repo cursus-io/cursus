@@ -325,7 +325,7 @@ func (ch *CommandHandler) HandleReadStreamHistoryCommand(conn net.Conn, cmd stri
 	topicName := eventStreamTopic(cmd, "READ_STREAM_HISTORY ")
 	if ch.Config != nil && ch.Config.EnabledDistribution && ch.Cluster != nil {
 		if !ch.Cluster.IsAuthorized(topicName, partition) {
-			writeReadStreamError(conn, fmt.Sprintf("ERROR: NOT_LEADER LEADER_IS %s", ch.resolvePartitionLeaderAddr(topicName, partition)))
+			writeReadStreamError(conn, fmt.Sprintf("ERROR: NOT_LEADER leader=%s", ch.resolvePartitionLeaderAddr(topicName, partition)))
 			return
 		}
 	}

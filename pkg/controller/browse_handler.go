@@ -47,6 +47,21 @@ func (ch *CommandHandler) HandleBrowseMessagesCommand(conn net.Conn, cmd string)
 		writeBrowseError(conn, err.Error())
 		return
 	}
+	if ch.Config != nil && ch.Config.EnabledDistribution {
+		if ch.Cluster == nil || ch.Cluster.RaftManager == nil {
+			writeBrowseError(conn, "cluster_metadata_unavailable")
+			return
+		}
+		if !ch.Cluster.IsAuthorized(topicName, partition) {
+			leader := ch.resolvePartitionLeaderAddr(topicName, partition)
+			if leader == "" {
+				writeBrowseError(conn, fmt.Sprintf("leader_not_found topic=%s partition=%d", topicName, partition))
+			} else {
+				writeBrowseError(conn, fmt.Sprintf("NOT_LEADER leader=%s", leader))
+			}
+			return
+		}
+	}
 	t := ch.TopicManager.GetTopic(topicName)
 	if t == nil {
 		writeBrowseError(conn, fmt.Sprintf("topic_not_found topic=%s", topicName))
