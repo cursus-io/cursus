@@ -129,13 +129,13 @@ func TestPartition_Basic(t *testing.T) {
 
 	t.Run("ProducerStateOnlyTracksIdempotentTopics", func(t *testing.T) {
 		nonIdempotent := NewPartition(1, "bench-topic", mh, sm, cfg)
-		nonIdempotent.updateProducerState(&types.Message{ProducerID: "producer-1", SeqNum: 10})
+		nonIdempotent.updateProducerState(&types.Message{ProducerID: "producer-1", SeqNum: 10}, 9)
 		_, found := nonIdempotent.producerState.Load("producer-1")
 		assert.False(t, found)
 
 		idempotent := NewPartition(2, "idem-topic", mh, sm, cfg)
 		idempotent.isIdempotent = true
-		idempotent.updateProducerState(&types.Message{ProducerID: "producer-1", SeqNum: 10})
+		idempotent.updateProducerState(&types.Message{ProducerID: "producer-1", SeqNum: 10}, 9)
 		_, found = idempotent.producerState.Load("producer-1")
 		assert.True(t, found)
 	})
