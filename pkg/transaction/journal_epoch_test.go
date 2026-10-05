@@ -78,7 +78,7 @@ func TestJournalRejectsInvalidWatermarkRecords(t *testing.T) {
 		`{"version":2,"next_producer_epoch":1,"transaction":{"id":"a","epoch":0}}`,
 		`{"version":2,"transaction":{"id":"a","epoch":-1}}`,
 	} {
-		_, _, err := decodeJournalRecord([]byte(payload))
+		_, _, _, err := decodeJournalRecord([]byte(payload))
 		require.Error(t, err)
 	}
 }

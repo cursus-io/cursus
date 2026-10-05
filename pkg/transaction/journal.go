@@ -9,23 +9,45 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/cursus-io/cursus/pkg/types"
 )
 
 const (
 	maxJournalRecordBytes    = 32 << 20
-	journalFormatVersion     = 2
+	journalFormatVersion     = 3
 	journalRecordOverhead    = 8
 	journalCompactionBytes   = 16 << 20
 	journalCompactionRecords = 256
 )
 
 type journalRecord struct {
-	Version           int       `json:"version"`
-	Transaction       *Snapshot `json:"transaction,omitempty"`
-	NextProducerEpoch *uint64   `json:"next_producer_epoch,omitempty"`
+	Version           int            `json:"version"`
+	Transaction       *Snapshot      `json:"transaction,omitempty"`
+	Delta             *snapshotDelta `json:"delta,omitempty"`
+	NextProducerEpoch *uint64        `json:"next_producer_epoch,omitempty"`
+}
+
+// snapshotDelta stores the append-only portion of a transaction mutation and
+// the small mutable maps separately. The metadata snapshot deliberately has
+// all collections cleared. Periodic journal compaction turns the delta chain
+// back into one full snapshot.
+type snapshotDelta struct {
+	BaseEpoch                int64                        `json:"base_epoch"`
+	BaseRevision             uint64                       `json:"base_revision"`
+	Metadata                 Snapshot                     `json:"metadata"`
+	Messages                 []MessageOperation           `json:"messages_append,omitempty"`
+	Streams                  []StreamOperation            `json:"streams_append,omitempty"`
+	Offsets                  []OffsetOperation            `json:"offsets_append,omitempty"`
+	Participants             []Participant                `json:"participants_append,omitempty"`
+	SequenceUpdates          map[string]uint64            `json:"sequence_updates,omitempty"`
+	SequenceDeletes          []string                     `json:"sequence_deletes,omitempty"`
+	RequestAssignmentUpdates map[string]RequestAssignment `json:"request_assignment_updates,omitempty"`
+	RequestAssignmentDeletes []string                     `json:"request_assignment_deletes,omitempty"`
 }
 
 // JournalInspection is a read-only integrity summary for a standalone journal.
@@ -183,16 +205,16 @@ func InspectJournal(path string) (JournalInspection, error) {
 		if actual, expected := crc32.ChecksumIEEE(payload), binary.BigEndian.Uint32(checksumBytes[:]); actual != expected {
 			return JournalInspection{}, fmt.Errorf("transaction journal checksum mismatch at %d", offset)
 		}
-		snapshot, nextEpoch, err := decodeJournalRecord(payload)
+		snapshot, delta, nextEpoch, err := decodeJournalRecord(payload)
 		if err != nil {
 			return JournalInspection{}, fmt.Errorf("decode transaction journal record at %d: %w", offset, err)
 		}
-		if snapshot != nil {
-			if err := mergeJournalSnapshot(latest, snapshot); err != nil {
+		if snapshot != nil || delta != nil {
+			if _, _, err := mergeJournalRecord(latest, snapshot, delta); err != nil {
 				return JournalInspection{}, fmt.Errorf("merge transaction journal record at %d: %w", offset, err)
 			}
 		}
-		if snapshot == nil {
+		if snapshot == nil && delta == nil {
 			hasProducerEpochWatermark = true
 		}
 		nextProducerEpoch = max(nextProducerEpoch, nextEpoch)
@@ -256,21 +278,6 @@ func (j *Journal) Append(snap *Snapshot) (err error) {
 	if snap.Epoch < 0 {
 		return fmt.Errorf("invalid producer epoch %d", snap.Epoch)
 	}
-	payload, err := json.Marshal(journalRecord{Version: journalFormatVersion, Transaction: snap})
-	if err != nil {
-		return fmt.Errorf("marshal transaction snapshot: %w", err)
-	}
-	payloadLen := len(payload)
-	if payloadLen == 0 || payloadLen > maxJournalRecordBytes {
-		return fmt.Errorf("transaction snapshot size %d exceeds journal limit", payloadLen)
-	}
-
-	var header [4]byte
-	payloadSize := uint32(payloadLen) // #nosec G115 -- bounded by maxJournalRecordBytes above.
-	binary.BigEndian.PutUint32(header[:], payloadSize)
-	var checksum [4]byte
-	binary.BigEndian.PutUint32(checksum[:], crc32.ChecksumIEEE(payload))
-
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if !j.loaded {
@@ -283,6 +290,16 @@ func (j *Journal) Append(snap *Snapshot) (err error) {
 			return fmt.Errorf("compact transaction journal: %w", err)
 		}
 	}
+	payload, delta, err := j.encodeAppendRecordLocked(snap)
+	if err != nil {
+		return err
+	}
+	payloadLen := len(payload)
+	var header [4]byte
+	payloadSize := uint32(payloadLen) // #nosec G115 -- bounded by maxJournalRecordBytes above.
+	binary.BigEndian.PutUint32(header[:], payloadSize)
+	var checksum [4]byte
+	binary.BigEndian.PutUint32(checksum[:], crc32.ChecksumIEEE(payload))
 
 	file, err := os.OpenFile(j.path, os.O_RDWR, 0o600)
 	if err != nil {
@@ -312,10 +329,86 @@ func (j *Journal) Append(snap *Snapshot) (err error) {
 	}
 	recordBytes := journalRecordSize(payloadLen)
 	j.validEnd += recordBytes
-	j.replaceLatestLocked(snap, recordBytes)
+	j.replaceLatestLocked(snap, recordBytes, delta)
 	j.nextProducerEpoch = max(j.nextProducerEpoch, uint64(snap.Epoch)+1)
 	j.records++
 	return j.writeManifestLocked()
+}
+
+func (j *Journal) encodeAppendRecordLocked(snap *Snapshot) ([]byte, bool, error) {
+	full, err := json.Marshal(journalRecord{Version: journalFormatVersion, Transaction: snap})
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal transaction snapshot: %w", err)
+	}
+	if len(full) == 0 || len(full) > maxJournalRecordBytes {
+		return nil, false, fmt.Errorf("transaction snapshot size %d exceeds journal limit", len(full))
+	}
+	previous := j.latest[snap.ID]
+	if previous == nil {
+		return full, false, nil
+	}
+	delta, ok := buildSnapshotDelta(previous, snap)
+	if !ok {
+		return full, false, nil
+	}
+	encoded, err := json.Marshal(journalRecord{Version: journalFormatVersion, Delta: delta})
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal transaction snapshot delta: %w", err)
+	}
+	if len(encoded) == 0 || len(encoded) >= len(full) {
+		return full, false, nil
+	}
+	return encoded, true, nil
+}
+
+func buildSnapshotDelta(previous, current *Snapshot) (*snapshotDelta, bool) {
+	if previous == nil || current == nil || previous.ID != current.ID || previous.Epoch != current.Epoch ||
+		len(current.Messages) < len(previous.Messages) || len(current.Streams) < len(previous.Streams) ||
+		len(current.Offsets) < len(previous.Offsets) || len(current.Participants) < len(previous.Participants) ||
+		!reflect.DeepEqual(previous.Messages, current.Messages[:len(previous.Messages)]) ||
+		!reflect.DeepEqual(previous.Streams, current.Streams[:len(previous.Streams)]) ||
+		!reflect.DeepEqual(previous.Offsets, current.Offsets[:len(previous.Offsets)]) ||
+		!reflect.DeepEqual(previous.Participants, current.Participants[:len(previous.Participants)]) {
+		return nil, false
+	}
+	metadata := *current
+	metadata.Messages = nil
+	metadata.Streams = nil
+	metadata.Offsets = nil
+	metadata.Participants = nil
+	metadata.SequenceByPartition = nil
+	metadata.RequestAssignments = nil
+	delta := &snapshotDelta{
+		BaseEpoch:    previous.Epoch,
+		BaseRevision: previous.Revision,
+		Metadata:     metadata,
+		Messages:     append([]MessageOperation(nil), current.Messages[len(previous.Messages):]...),
+		Streams:      append([]StreamOperation(nil), current.Streams[len(previous.Streams):]...),
+		Offsets:      append([]OffsetOperation(nil), current.Offsets[len(previous.Offsets):]...),
+		Participants: append([]Participant(nil), current.Participants[len(previous.Participants):]...),
+	}
+	delta.SequenceUpdates, delta.SequenceDeletes = mapDelta(previous.SequenceByPartition, current.SequenceByPartition)
+	delta.RequestAssignmentUpdates, delta.RequestAssignmentDeletes = mapDelta(previous.RequestAssignments, current.RequestAssignments)
+	return delta, true
+}
+
+func mapDelta[K comparable, V comparable](previous, current map[K]V) (map[K]V, []K) {
+	var updates map[K]V
+	for key, value := range current {
+		if old, ok := previous[key]; !ok || old != value {
+			if updates == nil {
+				updates = make(map[K]V)
+			}
+			updates[key] = value
+		}
+	}
+	var deletes []K
+	for key := range previous {
+		if _, ok := current[key]; !ok {
+			deletes = append(deletes, key)
+		}
+	}
+	return updates, deletes
 }
 
 func (j *Journal) shouldCompactLocked() bool {
@@ -556,20 +649,25 @@ func (j *Journal) loadLocked() (map[string]*Snapshot, error) {
 			return nil, fmt.Errorf("transaction journal checksum mismatch at %d", offset)
 		}
 
-		snap, nextEpoch, err := decodeJournalRecord(payload)
+		snap, delta, nextEpoch, err := decodeJournalRecord(payload)
 		if err != nil {
 			return nil, fmt.Errorf("decode transaction journal record at %d: %w", offset, err)
 		}
 		j.nextProducerEpoch = max(j.nextProducerEpoch, nextEpoch)
-		if snap != nil {
-			if err := mergeJournalSnapshot(latest, snap); err != nil {
+		if snap != nil || delta != nil {
+			id, isDelta, err := mergeJournalRecord(latest, snap, delta)
+			if err != nil {
 				return nil, fmt.Errorf("merge transaction journal record at %d: %w", offset, err)
 			}
-			if previousSize, exists := latestRecordBytes[snap.ID]; exists {
+			if previousSize, exists := latestRecordBytes[id]; exists && !isDelta {
 				latestBytes -= previousSize
 			}
 			recordBytes := recordEnd - offset
-			latestRecordBytes[snap.ID] = recordBytes
+			if isDelta {
+				latestRecordBytes[id] += recordBytes
+			} else {
+				latestRecordBytes[id] = recordBytes
+			}
 			latestBytes += recordBytes
 		} else {
 			latestBytes += recordEnd - offset
@@ -603,12 +701,16 @@ func (j *Journal) repairTail(file *os.File, offset int64, latest map[string]*Sna
 	return cloneJournalState(latest), nil
 }
 
-func (j *Journal) replaceLatestLocked(snap *Snapshot, recordBytes int64) {
-	if previousSize, exists := j.latestRecordBytes[snap.ID]; exists {
+func (j *Journal) replaceLatestLocked(snap *Snapshot, recordBytes int64, delta bool) {
+	if previousSize, exists := j.latestRecordBytes[snap.ID]; exists && !delta {
 		j.latestBytes -= previousSize
 	}
-	j.latest[snap.ID] = snapshot(transactionFromSnapshot(snap))
-	j.latestRecordBytes[snap.ID] = recordBytes
+	j.latest[snap.ID] = cloneSnapshot(snap)
+	if delta {
+		j.latestRecordBytes[snap.ID] += recordBytes
+	} else {
+		j.latestRecordBytes[snap.ID] = recordBytes
+	}
 	j.latestBytes += recordBytes
 }
 
@@ -622,48 +724,88 @@ func cloneJournalState(state map[string]*Snapshot) map[string]*Snapshot {
 		if snap == nil {
 			continue
 		}
-		copySnapshot := *snap
-		copySnapshot.Messages = append([]MessageOperation(nil), snap.Messages...)
-		for i := range copySnapshot.Messages {
-			message := &copySnapshot.Messages[i].Message
-			message.ControlBatchKey = append([]byte(nil), message.ControlBatchKey...)
-			message.ControlBatchValue = append([]byte(nil), message.ControlBatchValue...)
-		}
-		copySnapshot.Offsets = append([]OffsetOperation(nil), snap.Offsets...)
-		cloned[id] = &copySnapshot
+		cloned[id] = cloneSnapshot(snap)
 	}
 	return cloned
 }
 
+func cloneSnapshot(snap *Snapshot) *Snapshot {
+	if snap == nil {
+		return nil
+	}
+	copySnapshot := *snap
+	copySnapshot.Messages = append([]MessageOperation(nil), snap.Messages...)
+	for i := range copySnapshot.Messages {
+		cloneMessageBytes(&copySnapshot.Messages[i].Message)
+	}
+	copySnapshot.Streams = append([]StreamOperation(nil), snap.Streams...)
+	for i := range copySnapshot.Streams {
+		cloneMessageBytes(&copySnapshot.Streams[i].Message)
+	}
+	copySnapshot.Offsets = append([]OffsetOperation(nil), snap.Offsets...)
+	copySnapshot.Participants = append([]Participant(nil), snap.Participants...)
+	copySnapshot.SequenceByPartition = cloneMap(snap.SequenceByPartition)
+	copySnapshot.RequestAssignments = cloneMap(snap.RequestAssignments)
+	return &copySnapshot
+}
+
+func cloneMessageBytes(message *types.Message) {
+	message.ControlBatchKey = append([]byte(nil), message.ControlBatchKey...)
+	message.ControlBatchValue = append([]byte(nil), message.ControlBatchValue...)
+}
+
+func cloneMap[K comparable, V any](source map[K]V) map[K]V {
+	if source == nil {
+		return nil
+	}
+	result := make(map[K]V, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
 func decodeJournalSnapshot(payload []byte) (*Snapshot, error) {
-	snap, _, err := decodeJournalRecord(payload)
+	snap, delta, _, err := decodeJournalRecord(payload)
+	if err == nil && delta != nil {
+		return nil, fmt.Errorf("journal delta requires a baseline snapshot")
+	}
 	return snap, err
 }
 
-func decodeJournalRecord(payload []byte) (*Snapshot, uint64, error) {
+func decodeJournalRecord(payload []byte) (*Snapshot, *snapshotDelta, uint64, error) {
 	var record journalRecord
 	if err := json.Unmarshal(payload, &record); err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
-	if record.Version != 1 && record.Version != journalFormatVersion {
-		return nil, 0, fmt.Errorf("unsupported transaction journal version %d", record.Version)
+	if record.Version != 1 && record.Version != 2 && record.Version != journalFormatVersion {
+		return nil, nil, 0, fmt.Errorf("unsupported transaction journal version %d", record.Version)
 	}
 	if record.NextProducerEpoch != nil {
-		if record.Version != journalFormatVersion || record.Transaction != nil {
-			return nil, 0, fmt.Errorf("invalid producer epoch watermark record")
+		if record.Version == 1 || record.Transaction != nil || record.Delta != nil {
+			return nil, nil, 0, fmt.Errorf("invalid producer epoch watermark record")
 		}
 		if err := ValidateProducerEpochWatermark(*record.NextProducerEpoch); err != nil {
-			return nil, 0, err
+			return nil, nil, 0, err
 		}
-		return nil, *record.NextProducerEpoch, nil
+		return nil, nil, *record.NextProducerEpoch, nil
+	}
+	if record.Delta != nil {
+		if record.Version != journalFormatVersion || record.Transaction != nil || record.Delta.Metadata.ID == "" {
+			return nil, nil, 0, fmt.Errorf("invalid transaction journal delta")
+		}
+		if record.Delta.Metadata.Epoch < 0 || record.Delta.BaseEpoch < 0 {
+			return nil, nil, 0, fmt.Errorf("invalid producer epoch in transaction journal delta")
+		}
+		return nil, record.Delta, uint64(record.Delta.Metadata.Epoch) + 1, nil
 	}
 	if record.Transaction == nil || record.Transaction.ID == "" {
-		return nil, 0, fmt.Errorf("journal transaction is missing")
+		return nil, nil, 0, fmt.Errorf("journal transaction is missing")
 	}
 	if record.Transaction.Epoch < 0 {
-		return nil, 0, fmt.Errorf("invalid producer epoch %d", record.Transaction.Epoch)
+		return nil, nil, 0, fmt.Errorf("invalid producer epoch %d", record.Transaction.Epoch)
 	}
-	return record.Transaction, uint64(record.Transaction.Epoch) + 1, nil
+	return record.Transaction, nil, uint64(record.Transaction.Epoch) + 1, nil
 }
 
 // NextProducerEpoch is recovered by Load, including from a journal with no
@@ -699,12 +841,71 @@ func writeJournalRecord(w io.Writer, record journalRecord) (int64, error) {
 	return journalRecordSize(len(payload)), nil
 }
 
-func mergeJournalSnapshot(latest map[string]*Snapshot, incoming *Snapshot) error {
-	// Per-transaction controller locks serialize journal appends. The final
-	// record is authoritative; epoch allocation remains monotonic even when
-	// retention removes an ID's previous revision metadata.
-	latest[incoming.ID] = incoming
-	return nil
+func mergeJournalRecord(latest map[string]*Snapshot, incoming *Snapshot, delta *snapshotDelta) (string, bool, error) {
+	if delta == nil {
+		if incoming == nil || incoming.ID == "" {
+			return "", false, fmt.Errorf("journal transaction is missing")
+		}
+		// Per-transaction controller locks serialize journal appends. The final
+		// full record is authoritative; epoch allocation remains monotonic even
+		// when retention removes an ID's previous revision metadata.
+		latest[incoming.ID] = cloneSnapshot(incoming)
+		return incoming.ID, false, nil
+	}
+	id := delta.Metadata.ID
+	base := latest[id]
+	if base == nil {
+		return "", false, fmt.Errorf("transaction journal delta for %q has no baseline", id)
+	}
+	if base.Epoch != delta.BaseEpoch || base.Revision != delta.BaseRevision {
+		return "", false, fmt.Errorf("transaction journal delta for %q expects epoch=%d revision=%d, have epoch=%d revision=%d",
+			id, delta.BaseEpoch, delta.BaseRevision, base.Epoch, base.Revision)
+	}
+	if len(delta.Metadata.Messages) != 0 || len(delta.Metadata.Streams) != 0 || len(delta.Metadata.Offsets) != 0 ||
+		len(delta.Metadata.Participants) != 0 || len(delta.Metadata.SequenceByPartition) != 0 || len(delta.Metadata.RequestAssignments) != 0 {
+		return "", false, fmt.Errorf("transaction journal delta for %q contains invalid metadata collections", id)
+	}
+	next := cloneSnapshot(base)
+	metadata := delta.Metadata
+	next.ID = metadata.ID
+	next.Mode = metadata.Mode
+	next.Producer = metadata.Producer
+	next.Epoch = metadata.Epoch
+	next.CoordinatorEpoch = metadata.CoordinatorEpoch
+	next.Revision = metadata.Revision
+	next.Ready = metadata.Ready
+	next.Expired = metadata.Expired
+	next.OffsetsMaterialized = metadata.OffsetsMaterialized
+	next.OffsetReservationsPending = metadata.OffsetReservationsPending
+	next.State = metadata.State
+	next.Deadline = metadata.Deadline
+	next.CreatedAt = metadata.CreatedAt
+	next.UpdatedAt = metadata.UpdatedAt
+	next.Messages = append(next.Messages, delta.Messages...)
+	next.Streams = append(next.Streams, delta.Streams...)
+	next.Offsets = append(next.Offsets, delta.Offsets...)
+	next.Participants = append(next.Participants, delta.Participants...)
+	next.SequenceByPartition = applyMapDelta(next.SequenceByPartition, delta.SequenceUpdates, delta.SequenceDeletes)
+	next.RequestAssignments = applyMapDelta(next.RequestAssignments, delta.RequestAssignmentUpdates, delta.RequestAssignmentDeletes)
+	latest[id] = next
+	return id, true, nil
+}
+
+func applyMapDelta[K comparable, V any](base map[K]V, updates map[K]V, deletes []K) map[K]V {
+	result := cloneMap(base)
+	if result == nil && len(updates) > 0 {
+		result = make(map[K]V, len(updates))
+	}
+	for key, value := range updates {
+		result[key] = value
+	}
+	for _, key := range deletes {
+		delete(result, key)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func repairJournalTail(file *os.File, offset int64) error {
