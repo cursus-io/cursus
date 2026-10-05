@@ -14,6 +14,8 @@ service:
 
 persistence:
   storageClass: ""
+  # Install-time claim template size. For an existing release, use
+  # scripts/expand-helm-cluster-storage.sh before changing this value.
   size: 20Gi
   accessModes:
     - ReadWriteOnce

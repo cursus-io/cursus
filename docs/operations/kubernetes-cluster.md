@@ -45,6 +45,16 @@ kubectl -n brokers get events --field-selector reason=FailedCreate
 
 Do not delete PVCs while restarting, scaling, or upgrading the StatefulSet. Replace one Pod at a time and wait for it to become ready before touching the next member; a concurrent two-member outage removes the configured write quorum. `updateStrategy: OnDelete` makes that operator action explicit.
 
+`persistence.size` is install-only during a normal Helm upgrade because Kubernetes makes StatefulSet `volumeClaimTemplates` immutable. The chart rejects a changed value before submitting an invalid StatefulSet update. Expand storage as its own release operation before combining it with an image or configuration upgrade:
+
+```bash
+scripts/expand-helm-cluster-storage.sh cursus brokers 30Gi
+helm upgrade cursus manifests/helm-cluster --namespace brokers --reuse-values \
+  --set image.tag=NEW_VERSION
+```
+
+The expansion command validates all three PVCs and their StorageClasses before mutation. Kubernetes server-side validation rejects a shrink. It patches every claim, performs one-member-at-a-time restarts only when the CSI driver requires filesystem expansion, waits for all three members between restarts, verifies requested and filesystem capacity, orphans the running Pods and claims, and uses an atomic Helm upgrade to recreate the StatefulSet with the new claim template. Do not edit `persistence.size` directly or combine unrelated release changes into the expansion command. Keep a current backup and verify a known acknowledged payload and committed consumer offset before and after this procedure.
+
 For an irrecoverable node, stop client writes, preserve the failed PVC for forensics, restore that member from the same backup generation as the other members, and then recreate only that Pod. If the Raft membership itself is damaged, stop and follow the coordinated backup/restore procedure in `upgrade-and-recovery.md`; replacing storage from different backup generations is not supported.
 
 The chart guarantees rendered topology and safety constraints, not a completed live cluster qualification. Run the cluster E2E suite and the documented restart, Pod-recreation, quorum-loss, and restore drills on the target Kubernetes distribution before accepting traffic.

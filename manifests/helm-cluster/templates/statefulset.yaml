@@ -10,10 +10,19 @@
 {{- if not .Values.internalTLS.secretName }}
 {{- fail "internalTLS.secretName must name a pre-created Secret containing tls.crt, tls.key, and ca.crt" }}
 {{- end }}
+{{- $statefulSetName := include "cursus-cluster.fullname" . }}
+{{- with (lookup "apps/v1" "StatefulSet" .Release.Namespace $statefulSetName) }}
+{{- $claim := index .spec.volumeClaimTemplates 0 }}
+{{- $installedSize := index $claim.spec.resources.requests "storage" | toString }}
+{{- $requestedSize := $.Values.persistence.size | toString }}
+{{- if ne $installedSize $requestedSize }}
+{{- fail (printf "persistence.size is install-only during a normal Helm upgrade (installed=%s requested=%s); run scripts/expand-helm-cluster-storage.sh before upgrading other release settings" $installedSize $requestedSize) }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "cursus-cluster.fullname" . }}
+  name: {{ $statefulSetName }}
   labels:
     {{- include "cursus-cluster.labels" . | nindent 4 }}
 spec:
