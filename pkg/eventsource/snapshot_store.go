@@ -38,25 +38,67 @@ type SnapshotRecord struct {
 //
 // The in-memory index keeps only the latest snapshot per key (last write wins).
 type SnapshotStore struct {
-	mu    sync.RWMutex
-	file  *os.File
-	index map[string]*snapshotPointer
+	mu         sync.RWMutex
+	file       *os.File
+	index      map[string]*snapshotPointer
+	syncFileFn func() error
 	// writeOffset tracks the current end-of-file position for appends.
 	writeOffset uint64
 }
 
+var syncSnapshotCreationDirectory = syncSnapshotDirectory
+
 // NewSnapshotStore opens (or creates) the snapshot file for the given partition
 // and rebuilds the in-memory index by scanning the file sequentially.
 func NewSnapshotStore(dir string, partitionID int) (*SnapshotStore, error) {
+	_, statErr := os.Stat(dir)
+	dirCreated := os.IsNotExist(statErr)
+	if statErr != nil && !dirCreated {
+		return nil, fmt.Errorf("snapshot store: stat directory: %w", statErr)
+	}
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("snapshot store: mkdir: %w", err)
 	}
 
 	path := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots.dat", partitionID))
+	// O_EXCL identifies the call that introduced the authoritative snapshot
+	// filename. Existing files are opened without O_CREATE so later operations
+	// cannot silently replace a missing store with an empty one.
 	// #nosec G304 -- the file name is fixed by the partition and dir is the configured storage root.
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	fileCreated := err == nil
+	if os.IsExist(err) {
+		// #nosec G304 -- path is the same broker-owned snapshot path validated above.
+		f, err = os.OpenFile(path, os.O_RDWR, 0o600)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("snapshot store: open file: %w", err)
+	}
+	if fileCreated {
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			_ = os.Remove(path)
+			return nil, fmt.Errorf("snapshot store: sync new file: %w", err)
+		}
+	}
+	// Sync on every open to migrate files created by older releases. The parent
+	// sync also persists the per-partition directory created by the handler.
+	if err := syncSnapshotCreationDirectory(dir); err != nil {
+		_ = f.Close()
+		if fileCreated {
+			_ = os.Remove(path)
+		}
+		return nil, fmt.Errorf("snapshot store: persist file entry: %w", err)
+	}
+	if err := syncSnapshotCreationDirectory(filepath.Dir(dir)); err != nil {
+		_ = f.Close()
+		if fileCreated {
+			_ = os.Remove(path)
+			if dirCreated {
+				_ = os.Remove(dir)
+			}
+		}
+		return nil, fmt.Errorf("snapshot store: persist directory entry: %w", err)
 	}
 
 	s := &SnapshotStore{
@@ -70,6 +112,13 @@ func NewSnapshotStore(dir string, partitionID int) (*SnapshotStore, error) {
 	}
 
 	return s, nil
+}
+
+func (s *SnapshotStore) syncFile() error {
+	if s.syncFileFn != nil {
+		return s.syncFileFn()
+	}
+	return s.file.Sync()
 }
 
 // loadFromDisk scans the file sequentially and populates the in-memory index.
@@ -224,7 +273,7 @@ func (s *SnapshotStore) Save(key string, version uint64, payload string) error {
 	}
 
 	// Sync to disk.
-	if err := s.file.Sync(); err != nil {
+	if err := s.syncFile(); err != nil {
 		return fmt.Errorf("snapshot store: sync: %w", err)
 	}
 
