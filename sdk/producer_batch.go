@@ -12,6 +12,7 @@ import (
 	"github.com/cursus-io/cursus/util"
 )
 
+// sendBatch records the terminal delivery result without requeueing exhausted batches.
 func (p *Producer) sendBatch(part int, batch []Message) {
 	if len(batch) == 0 {
 		return
@@ -144,6 +145,7 @@ func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error)
 	return p.sendWithRetryForBatch(payload, part, Message{}, Message{})
 }
 
+// sendWithRetryForBatch spends one shared attempt budget, including reconnects.
 func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last Message) (*AckResponse, error) {
 	maxAttempts := p.config.MaxRetries + 1
 	backoff := p.config.RetryBackoffMS
@@ -198,11 +200,12 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 
 		if err := WriteWithLength(conn, payload); err != nil {
 			lastErr = fmt.Errorf("write failed: %w", err)
-			brokerAddr := p.getPartitionLeaderAddr(part)
-			_ = p.client.ReconnectPartition(part, brokerAddr)
 			if attempt == maxAttempts {
+				p.client.discardPartitionConnection(part, conn)
 				break
 			}
+			brokerAddr := p.getPartitionLeaderAddr(part)
+			_ = p.client.ReconnectPartition(part, brokerAddr)
 			if !p.waitForRetry(backoff) {
 				return nil, fmt.Errorf("producer is closed")
 			}
@@ -223,11 +226,12 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 			if isNonRetryableProducerError(err) {
 				return nil, lastErr
 			}
-			brokerAddr := p.getPartitionLeaderAddr(part)
-			_ = p.client.ReconnectPartition(part, brokerAddr)
 			if attempt == maxAttempts {
+				p.client.discardPartitionConnection(part, conn)
 				break
 			}
+			brokerAddr := p.getPartitionLeaderAddr(part)
+			_ = p.client.ReconnectPartition(part, brokerAddr)
 			if !p.waitForRetry(backoff) {
 				return nil, fmt.Errorf("producer is closed")
 			}
@@ -241,11 +245,12 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 			if isNonRetryableProducerError(err) {
 				return nil, lastErr
 			}
-			brokerAddr := p.getPartitionLeaderAddr(part)
-			_ = p.client.ReconnectPartition(part, brokerAddr)
 			if attempt == maxAttempts {
+				p.client.discardPartitionConnection(part, conn)
 				break
 			}
+			brokerAddr := p.getPartitionLeaderAddr(part)
+			_ = p.client.ReconnectPartition(part, brokerAddr)
 			if !p.waitForRetry(backoff) {
 				return nil, fmt.Errorf("producer is closed")
 			}

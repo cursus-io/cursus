@@ -219,3 +219,18 @@ func (pc *ProducerClient) ReconnectPartition(idx int, addr string) error {
 
 	return pc.connectPartitionLocked(idx, addr)
 }
+
+// discardPartitionConnection removes a failed connection without dialing another
+// broker, and cannot discard a replacement installed by another goroutine.
+func (pc *ProducerClient) discardPartitionConnection(idx int, failed net.Conn) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	ptr := pc.conns.Load()
+	if ptr == nil || idx < 0 || idx >= len(*ptr) || (*ptr)[idx] != failed {
+		return
+	}
+	replacement := append([]net.Conn(nil), (*ptr)...)
+	replacement[idx] = nil
+	pc.conns.Store(&replacement)
+	_ = failed.Close()
+}

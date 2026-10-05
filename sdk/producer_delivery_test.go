@@ -169,6 +169,7 @@ func TestProducerFlushAndCloseReportPermanentDeliveryFailure(t *testing.T) {
 	require.NoError(t, (<-result).err)
 }
 
+// TestProducerRetryBudgetBoundsLogicalBatchDelivery preserves the final broker error.
 func TestProducerRetryBudgetBoundsLogicalBatchDelivery(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -275,4 +276,50 @@ func TestProducerReconnectFailureRemovesOldConnection(t *testing.T) {
 	require.Nil(t, client.GetConn(0))
 	_, err := server.Read(make([]byte, 1))
 	require.ErrorIs(t, err, io.EOF)
+}
+
+// TestProducerFinalFailureDoesNotReconnect covers terminal write, read, and parse errors.
+func TestProducerFinalFailureDoesNotReconnect(t *testing.T) {
+	for _, failure := range []string{"write", "read", "parse"} {
+		t.Run(failure, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer listener.Close()
+			cfg := NewDefaultPublisherConfig()
+			cfg.BrokerAddrs = []string{listener.Addr().String()}
+			cfg.MaxRetries = 0
+			cfg.AckTimeoutMS = 50
+			cfg.HandshakeTimeoutMS = 1000
+			client := mustNewProducerClient(cfg)
+			defer client.Close()
+			server, conn := net.Pipe()
+			defer server.Close()
+			client.conns.Store(&[]net.Conn{conn})
+			p := &Producer{config: cfg, client: client, done: make(chan struct{})}
+			go func() {
+				if failure == "write" {
+					server.Close()
+					return
+				}
+				if _, err := ReadWithLength(server); err != nil {
+					return
+				}
+				if failure == "parse" {
+					_ = WriteWithLength(server, []byte("invalid ack"))
+				}
+				server.Close()
+			}()
+			started := time.Now()
+			_, err = p.sendWithRetryForBatch([]byte("batch"), 0, Message{}, Message{})
+			require.Error(t, err)
+			require.Less(t, time.Since(started), 500*time.Millisecond)
+			require.Nil(t, client.GetConn(0))
+			require.NoError(t, listener.(*net.TCPListener).SetDeadline(time.Now().Add(20*time.Millisecond)))
+			unexpected, acceptErr := listener.Accept()
+			if unexpected != nil {
+				unexpected.Close()
+			}
+			require.Error(t, acceptErr, "terminal failure must not open a replacement connection")
+		})
+	}
 }
