@@ -10,6 +10,9 @@ on:
       - 'cmd/**'
       - 'pkg/**'
       - 'manifests/helm/**'
+      - 'manifests/helm-cluster/**'
+      - 'docs/operations/kubernetes-cluster.md'
+      - '.github/kind-three-node.yaml'
       - 'test/**'
       - 'go.mod'
       - 'go.sum'
@@ -44,14 +47,77 @@ jobs:
             exit 1
           fi
 
-  docker:
+      - name: Lint and render restricted cluster chart
+        run: |
+          helm lint manifests/helm-cluster \
+            --set cluster.internalAuthSecret=cursus-internal-auth \
+            --set internalTLS.secretName=cursus-internal-tls
+          helm template cursus manifests/helm-cluster \
+            --namespace brokers \
+            --set cluster.internalAuthSecret=cursus-internal-auth \
+            --set internalTLS.secretName=cursus-internal-tls > /tmp/cursus-cluster.yaml
+          grep -q 'type: RuntimeDefault' /tmp/cursus-cluster.yaml
+
+  docker-and-restricted-cluster:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - uses: azure/setup-helm@v4
+      - name: Create three-node Kubernetes cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          cluster_name: cursus-ci
+          config: .github/kind-three-node.yaml
+          node_image: kindest/node:v1.34.0
       - name: Build production image without publishing
         run: docker build --tag cursus:pr-validation .
+      - name: Install chart under restricted Pod Security
+        run: |
+          kind load docker-image cursus:pr-validation --name cursus-ci
+          kubectl create namespace brokers
+          kubectl label namespace brokers \
+            pod-security.kubernetes.io/enforce=restricted \
+            pod-security.kubernetes.io/enforce-version=latest
+          kubectl -n brokers create secret generic cursus-internal-auth \
+            --from-literal=token=ci-internal-token
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj '/CN=cursus.internal' \
+            -addext 'subjectAltName=DNS:cursus.internal,DNS:cursus-cursus-cluster-0.cursus-cursus-cluster-headless.brokers.svc.cluster.local,DNS:cursus-cursus-cluster-1.cursus-cursus-cluster-headless.brokers.svc.cluster.local,DNS:cursus-cursus-cluster-2.cursus-cursus-cluster-headless.brokers.svc.cluster.local' \
+            -keyout /tmp/tls.key -out /tmp/tls.crt
+          kubectl -n brokers create secret generic cursus-internal-tls \
+            --from-file=tls.crt=/tmp/tls.crt \
+            --from-file=tls.key=/tmp/tls.key \
+            --from-file=ca.crt=/tmp/tls.crt
+          helm upgrade --install cursus manifests/helm-cluster \
+            --namespace brokers \
+            --set image.repository=cursus \
+            --set image.tag=pr-validation \
+            --set image.pullPolicy=Never \
+            --set cluster.internalAuthSecret=cursus-internal-auth \
+            --set internalTLS.secretName=cursus-internal-tls \
+            --wait --timeout 5m
+          kubectl -n brokers wait --for=condition=Ready pod \
+            -l app.kubernetes.io/instance=cursus --timeout=5m
+      - name: Verify restricted security controls
+        run: |
+          test "$(kubectl -n brokers get pods -l app.kubernetes.io/instance=cursus -o jsonpath='{range .items[*]}{.status.containerStatuses[0].ready}{"\n"}{end}' | grep -c '^true$')" -eq 3
+          test "$(kubectl -n brokers get statefulset cursus-cursus-cluster -o jsonpath='{.spec.template.spec.securityContext.seccompProfile.type}')" = RuntimeDefault
+          test "$(kubectl -n brokers get statefulset cursus-cursus-cluster -o jsonpath='{.spec.template.spec.containers[0].securityContext.runAsNonRoot}')" = true
+          test "$(kubectl -n brokers get statefulset cursus-cursus-cluster -o jsonpath='{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}')" = true
+          test "$(kubectl -n brokers get statefulset cursus-cursus-cluster -o jsonpath='{.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation}')" = false
+          test "$(kubectl -n brokers get statefulset cursus-cursus-cluster -o jsonpath='{.spec.template.spec.containers[0].securityContext.capabilities.drop[0]}')" = ALL
+          if kubectl -n brokers get events --field-selector reason=FailedCreate -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' | grep -q 'violates PodSecurity'; then
+            echo 'restricted Pod Security rejected a broker Pod'
+            exit 1
+          fi
+      - name: Show restricted cluster diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n brokers get pods,pvc,statefulset,pdb -o wide
+          kubectl -n brokers get events --sort-by=.metadata.creationTimestamp
+          kubectl -n brokers logs -l app.kubernetes.io/instance=cursus --all-containers --tail=200 || true
 
   cluster-chaos:
     runs-on: ubuntu-latest

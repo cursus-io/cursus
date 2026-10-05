@@ -4,6 +4,8 @@
 
 Each StatefulSet ordinal owns one `ReadWriteOnce` PVC, publishes a stable headless-service DNS name, and uses those three names for Raft membership and discovery. Initial Pods are created in parallel because the Raft bootstrap needs all three voters; broker `-0` is the only member permitted to bootstrap an empty cluster. Restart recovery uses the existing Raft state on each PVC. The PodDisruptionBudget requires two available members and the default required anti-affinity therefore requires three schedulable nodes.
 
+The default Pod and container security contexts satisfy Kubernetes restricted Pod Security: the broker runs as UID 1000 without privilege escalation or Linux capabilities, uses a read-only root filesystem, and inherits a `RuntimeDefault` seccomp profile from the Pod. A platform that requires an approved local profile may override `podSecurityContext.seccompProfile` with `type: Localhost` and `localhostProfile`; validate that profile on every node before installation.
+
 ## Install
 
 Create the namespace first, then the shared internal-authentication Secret and a TLS Secret whose certificate is valid for `cursus.internal` and the three generated pod DNS names. Do not use the client TLS Secret for this purpose unless it carries the required client-auth CA and SANs.
@@ -33,8 +35,10 @@ helm lint manifests/helm-cluster \
 helm template cursus manifests/helm-cluster --namespace brokers \
   --set cluster.internalAuthSecret=cursus-internal-auth \
   --set internalTLS.secretName=cursus-internal-tls | kubectl apply --dry-run=client -f -
-kubectl -n brokers rollout status statefulset/cursus-cursus-cluster
+kubectl -n brokers wait --for=condition=Ready pod \
+  -l app.kubernetes.io/instance=cursus --timeout=5m
 kubectl -n brokers get pods,pvc,pdb
+kubectl -n brokers get events --field-selector reason=FailedCreate
 ```
 
 ## Restart, recovery, and upgrades

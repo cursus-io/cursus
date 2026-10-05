@@ -36,6 +36,8 @@ internalTLS:
 podSecurityContext:
   fsGroup: 1000
   supplementalGroups: [1000]
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
   runAsNonRoot: true
