@@ -874,11 +874,6 @@ func (p *Partition) readVisibleCommittedBounded(offset uint64, max, maxBytes int
 	return p.readCommittedScanRangeBounded(offset, scanLimit, hwm, max, maxBytes, allowOversizedFirst, p.txnMarkers, resolver)
 }
 
-func (p *Partition) readCommittedScanRange(offset, scanLimit, committedHWM uint64, maxVisible int, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) ([]types.Message, error) {
-	messages, _, err := p.readCommittedScanRangeBounded(offset, scanLimit, committedHWM, maxVisible, 0, true, markers, resolver)
-	return messages, err
-}
-
 func (p *Partition) readCommittedScanRangeBounded(offset, scanLimit, committedHWM uint64, maxVisible, maxBytes int, allowOversizedFirst bool, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) ([]types.Message, int, error) {
 	if offset >= scanLimit {
 		return nil, 0, nil

@@ -594,12 +594,6 @@ func (dh *DiskHandler) ReadMessagesBounded(offset uint64, maxRecords, maxBytes i
 	return messages, decodedBytes, nil
 }
 
-// readMessagesFromPosition reads messages starting from a specific byte position
-func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position uint64, max int, targetOffset, segmentBase uint64, allowPartialTail, allowOffsetGaps bool) ([]types.Message, error) {
-	messages, _, _, err := dh.readMessagesFromPositionBounded(reader, position, max, 0, true, targetOffset, segmentBase, allowPartialTail, allowOffsetGaps)
-	return messages, err
-}
-
 func (dh *DiskHandler) readMessagesFromPositionBounded(reader *mmap.ReaderAt, position uint64, max, maxBytes int, allowOversizedFirst bool, targetOffset, segmentBase uint64, allowPartialTail, allowOffsetGaps bool) ([]types.Message, int, bool, error) {
 	if position > math.MaxInt {
 		return nil, 0, false, fmt.Errorf("read position %d exceeds int range", position)

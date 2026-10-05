@@ -346,13 +346,6 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	return ch.StreamManager.AddStream(streamKey, streamConn, readFn)
 }
 
-func readPartitionMessages(p *topic.Partition, offset uint64, max int, isolation string) ([]types.Message, error) {
-	if isolation == ReadIsolationUncommitted {
-		return p.ReadMessages(offset, max)
-	}
-	return p.ReadCommitted(offset, max)
-}
-
 func readPartitionMessagesBounded(p *topic.Partition, offset uint64, maxRecords, maxBytes int, allowOversizedFirst bool, isolation string) ([]types.Message, int, error) {
 	if isolation == ReadIsolationUncommitted {
 		return p.ReadMessagesBounded(offset, maxRecords, maxBytes, allowOversizedFirst)
