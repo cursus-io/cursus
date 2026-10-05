@@ -42,8 +42,9 @@ type Consumer struct {
 	commitMu       sync.Mutex
 	commitRetryMap map[int]retryCommit
 
-	currentOffsets map[int]uint64
-	offsetsMu      sync.Mutex
+	currentOffsets           map[int]uint64
+	currentOffsetGenerations map[int]uint64
+	offsetsMu                sync.Mutex
 
 	wg          sync.WaitGroup
 	commitWg    sync.WaitGroup
@@ -129,20 +130,21 @@ func NewConsumerWithContext(ctx context.Context, cfg *ConsumerConfig) (*Consumer
 	workerCtx, cancel := context.WithCancel(rootCtx)
 
 	c := &Consumer{
-		config:             cfg,
-		client:             client,
-		partitionConsumers: make(map[int]*PartitionConsumer),
-		offsets:            make(map[int]uint64),
-		currentOffsets:     make(map[int]uint64),
-		partitionLeaders:   make(map[int]string),
-		commitRetryMap:     make(map[int]retryCommit),
-		rebalanceSig:       make(chan struct{}, 1),
-		doneCh:             make(chan struct{}),
-		closeDone:          make(chan struct{}),
-		mainCtx:            workerCtx,
-		rootCtx:            rootCtx,
-		rootCancel:         rootCancel,
-		mainCancel:         cancel,
+		config:                   cfg,
+		client:                   client,
+		partitionConsumers:       make(map[int]*PartitionConsumer),
+		offsets:                  make(map[int]uint64),
+		currentOffsets:           make(map[int]uint64),
+		currentOffsetGenerations: make(map[int]uint64),
+		partitionLeaders:         make(map[int]string),
+		commitRetryMap:           make(map[int]retryCommit),
+		rebalanceSig:             make(chan struct{}, 1),
+		doneCh:                   make(chan struct{}),
+		closeDone:                make(chan struct{}),
+		mainCtx:                  workerCtx,
+		rootCtx:                  rootCtx,
+		rootCancel:               rootCancel,
+		mainCancel:               cancel,
 	}
 
 	c.commitCh = make(chan commitEntry, 1024)
@@ -349,10 +351,10 @@ func (c *Consumer) startCommitWorker() {
 				}
 
 			case <-ticker.C:
-				if c.config.EnableAutoCommit {
-					c.flushOffsets()
-				}
 				flush()
+				if c.config.EnableAutoCommit {
+					c.flushAutoCommitOffsets(false)
+				}
 				c.processRetryQueue()
 
 			case <-c.doneCh:
@@ -403,6 +405,15 @@ func (c *Consumer) flushOffsets() {
 	}
 
 	for pid, offset := range c.currentOffsets {
+		generation := c.currentOffsetGenerations[pid]
+		if generation == 0 {
+			generation = assignmentGeneration
+		}
+		if generation != assignmentGeneration {
+			delete(c.currentOffsets, pid)
+			delete(c.currentOffsetGenerations, pid)
+			continue
+		}
 		c.mu.RLock()
 		lastCommitted := c.offsets[pid]
 		c.mu.RUnlock()
@@ -416,6 +427,63 @@ func (c *Consumer) flushOffsets() {
 		}
 	}
 	c.currentOffsets = make(map[int]uint64)
+	c.currentOffsetGenerations = make(map[int]uint64)
+}
+
+func (c *Consumer) recordAutoCommitOffset(partition int, offset, assignmentGeneration uint64) {
+	c.offsetsMu.Lock()
+	defer c.offsetsMu.Unlock()
+	if c.currentOffsets == nil {
+		c.currentOffsets = make(map[int]uint64)
+	}
+	if c.currentOffsetGenerations == nil {
+		c.currentOffsetGenerations = make(map[int]uint64)
+	}
+	if currentGeneration := c.currentOffsetGenerations[partition]; currentGeneration != 0 && currentGeneration != assignmentGeneration {
+		delete(c.currentOffsets, partition)
+	}
+	if current, ok := c.currentOffsets[partition]; !ok || offset > current {
+		c.currentOffsets[partition] = offset
+		c.currentOffsetGenerations[partition] = assignmentGeneration
+	}
+}
+
+func (c *Consumer) flushAutoCommitOffsets(allowClosing bool) bool {
+	assignmentGeneration := c.assignmentGeneration.Load()
+	if !c.assignmentCanCommit(assignmentGeneration, allowClosing) {
+		return false
+	}
+
+	c.offsetsMu.Lock()
+	offsets := make(map[int]uint64)
+	for partition, offset := range c.currentOffsets {
+		generation := c.currentOffsetGenerations[partition]
+		if generation == 0 {
+			generation = assignmentGeneration
+		}
+		if generation == assignmentGeneration {
+			offsets[partition] = offset
+		}
+	}
+	c.offsetsMu.Unlock()
+	if len(offsets) == 0 {
+		return true
+	}
+
+	if !c.sendBatchCommitWithState(offsets, assignmentGeneration, allowClosing) {
+		return false
+	}
+	c.offsetsMu.Lock()
+	for partition, committed := range offsets {
+		generation := c.currentOffsetGenerations[partition]
+		if generation == assignmentGeneration && c.currentOffsets[partition] <= committed {
+			delete(c.currentOffsets, partition)
+			delete(c.currentOffsetGenerations, partition)
+		}
+	}
+	c.offsetsMu.Unlock()
+	c.recordCommittedOffsets(offsets, assignmentGeneration)
+	return true
 }
 
 func (c *Consumer) processRetryQueue() {
@@ -439,31 +507,41 @@ func (c *Consumer) processRetryQueue() {
 	c.commitMu.Unlock()
 
 	LogDebug("Retrying failed commits for %d partitions", len(toRetry))
-	if len(toRetry) > 0 && !c.sendBatchCommit(toRetry, assignmentGeneration) {
-		LogError("Retry batch commit failed, re-queuing")
-		c.commitMu.Lock()
-		for partition, offset := range toRetry {
-			if current, ok := c.commitRetryMap[partition]; !ok || offset > current.offset {
-				c.commitRetryMap[partition] = retryCommit{offset: offset, assignmentGeneration: assignmentGeneration}
+	if len(toRetry) > 0 {
+		if c.sendBatchCommit(toRetry, assignmentGeneration) {
+			c.recordCommittedOffsets(toRetry, assignmentGeneration)
+		} else {
+			LogError("Retry batch commit failed, re-queuing")
+			c.commitMu.Lock()
+			for partition, offset := range toRetry {
+				if current, ok := c.commitRetryMap[partition]; !ok || offset > current.offset {
+					c.commitRetryMap[partition] = retryCommit{offset: offset, assignmentGeneration: assignmentGeneration}
+				}
 			}
+			c.commitMu.Unlock()
 		}
-		c.commitMu.Unlock()
 	}
 }
 
 func (c *Consumer) commitBatch(offsets map[int]uint64, respChannels map[int][]chan error, assignmentGeneration uint64) {
 	success := c.sendBatchCommit(offsets, assignmentGeneration)
+	if success {
+		c.recordCommittedOffsets(offsets, assignmentGeneration)
+	} else {
+		c.commitMu.Lock()
+		if c.assignmentActive(assignmentGeneration) {
+			for partition, offset := range offsets {
+				if current, ok := c.commitRetryMap[partition]; !ok || offset > current.offset {
+					c.commitRetryMap[partition] = retryCommit{offset: offset, assignmentGeneration: assignmentGeneration}
+				}
+			}
+		}
+		c.commitMu.Unlock()
+	}
 
 	for pid, channels := range respChannels {
 		var err error
 		if !success {
-			c.commitMu.Lock()
-			if c.assignmentActive(assignmentGeneration) {
-				if current, ok := c.commitRetryMap[pid]; !ok || offsets[pid] > current.offset {
-					c.commitRetryMap[pid] = retryCommit{offset: offsets[pid], assignmentGeneration: assignmentGeneration}
-				}
-			}
-			c.commitMu.Unlock()
 			err = fmt.Errorf("batch commit failed for partition %d", pid)
 		}
 		for _, ch := range channels {
@@ -494,7 +572,11 @@ func (c *Consumer) validateCommitConn() bool {
 }
 
 func (c *Consumer) sendBatchCommit(offsets map[int]uint64, assignmentGeneration uint64) bool {
-	if !c.assignmentActive(assignmentGeneration) {
+	return c.sendBatchCommitWithState(offsets, assignmentGeneration, false)
+}
+
+func (c *Consumer) sendBatchCommitWithState(offsets map[int]uint64, assignmentGeneration uint64, allowClosing bool) bool {
+	if !c.assignmentCanCommit(assignmentGeneration, allowClosing) {
 		return false
 	}
 	c.commitMu.Lock()
@@ -534,7 +616,7 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64, assignmentGeneration 
 		c.config.Topic, c.config.GroupID, generation, memberID, encodedOffsets)
 
 	c.lifecycleMu.Lock()
-	if !c.assignmentActive(assignmentGeneration) {
+	if !c.assignmentCanCommit(assignmentGeneration, allowClosing) {
 		c.lifecycleMu.Unlock()
 		return false
 	}
@@ -587,6 +669,30 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64, assignmentGeneration 
 
 	LogError("Batch commit rejected: %s", respStr)
 	return false
+}
+
+func (c *Consumer) assignmentCanCommit(generation uint64, allowClosing bool) bool {
+	if generation == 0 || c.assignmentGeneration.Load() != generation {
+		return false
+	}
+	state := c.State()
+	return state == ConsumerStateRunning || (allowClosing && state == ConsumerStateClosing)
+}
+
+func (c *Consumer) recordCommittedOffsets(offsets map[int]uint64, assignmentGeneration uint64) {
+	if c.assignmentGeneration.Load() != assignmentGeneration {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for partition, offset := range offsets {
+		if offset > c.offsets[partition] {
+			c.offsets[partition] = offset
+		}
+		if pc := c.partitionConsumers[partition]; pc != nil && pc.assignmentGeneration == assignmentGeneration {
+			atomic.StoreUint64(&pc.commitOffset, offset)
+		}
+	}
 }
 
 func (c *Consumer) closeCommitConn(conn net.Conn) {
@@ -1001,12 +1107,20 @@ func (c *Consumer) Close() error {
 	c.cancelAssignment()
 	c.closeActiveConnections()
 	c.wg.Wait()
+	var closeErr error
+	if c.config.EnableAutoCommit && !c.flushAutoCommitOffsets(true) {
+		c.offsetsMu.Lock()
+		pending := len(c.currentOffsets)
+		c.offsetsMu.Unlock()
+		if pending > 0 {
+			closeErr = fmt.Errorf("flush pending auto-commit offsets during close")
+		}
+	}
 
 	close(c.commitCh)
 	c.commitWg.Wait()
 	c.lifecycleWg.Wait()
 
-	var closeErr error
 	c.mu.RLock()
 	memberID := c.memberID
 	generation := c.generation
@@ -1016,15 +1130,15 @@ func (c *Consumer) Close() error {
 			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
 				c.config.Topic, c.config.GroupID, memberID, generation)
 			if err := WriteWithLength(conn, []byte(leaveCmd)); err != nil {
-				closeErr = fmt.Errorf("leave consumer group: %w", err)
+				closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: %w", err))
 			} else if response, err := ReadWithLength(conn); err != nil {
-				closeErr = fmt.Errorf("leave consumer group: %w", err)
+				closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: %w", err))
 			} else if !hasOKStatus(strings.TrimSpace(string(response))) {
-				closeErr = fmt.Errorf("leave consumer group: unexpected response %q", strings.TrimSpace(string(response)))
+				closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: unexpected response %q", strings.TrimSpace(string(response))))
 			}
 			_ = conn.Close()
 		} else {
-			closeErr = fmt.Errorf("connect to leave consumer group: %w", err)
+			closeErr = errors.Join(closeErr, fmt.Errorf("connect to leave consumer group: %w", err))
 		}
 	}
 

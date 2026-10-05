@@ -171,7 +171,10 @@ type ConsumerConfig struct {
 	HeartbeatIntervalMS     int `yaml:"heartbeat_interval_ms" json:"heartbeat_interval_ms"`
 	StreamingReadDeadlineMS int `yaml:"streaming_read_deadline_ms" json:"streaming_read_deadline_ms"`
 
-	EnableAutoCommit   bool          `yaml:"enable_auto_commit" json:"enable_auto_commit"`
+	EnableAutoCommit bool `yaml:"enable_auto_commit" json:"enable_auto_commit"`
+	// AutoCommitInterval batches the highest successfully processed next offset
+	// for every assigned partition. Close attempts one bounded final flush;
+	// failed or fenced commits are redelivered from the durable broker offset.
 	AutoCommitInterval time.Duration `yaml:"auto_commit_interval" json:"auto_commit_interval"`
 
 	MaxCommitRetries      int           `yaml:"max_commit_retries" json:"max_commit_retries"`

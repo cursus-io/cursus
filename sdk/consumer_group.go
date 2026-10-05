@@ -278,6 +278,9 @@ func (c *Consumer) scheduleRebalanceRetry() {
 }
 
 func (c *Consumer) handleRebalanceSignal() {
+	if c.config.EnableAutoCommit {
+		c.flushAutoCommitOffsets(false)
+	}
 	assignmentGeneration, ok := c.beginRebalance()
 	if !ok {
 		return

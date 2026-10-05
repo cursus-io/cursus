@@ -143,19 +143,7 @@ func (pc *PartitionConsumer) runWorker() {
 		if !pc.consumer.config.EnableAutoCommit {
 			continue
 		}
-
-		if err := pc.commitOffsetWithRetry(commitOffset); err != nil {
-			LogError("Partition [%d] failed to commit offset %d: %v", pc.partitionID, commitOffset, err)
-		} else {
-			if !pc.assignmentActive() {
-				continue
-			}
-			atomic.StoreUint64(&pc.commitOffset, commitOffset)
-
-			pc.consumer.mu.Lock()
-			pc.consumer.offsets[pc.partitionID] = commitOffset
-			pc.consumer.mu.Unlock()
-		}
+		pc.consumer.recordAutoCommitOffset(pc.partitionID, commitOffset, pc.assignmentToken())
 	}
 }
 
