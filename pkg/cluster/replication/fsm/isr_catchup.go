@@ -18,17 +18,18 @@ const MaxReplicaCatchupRecords = 1024
 // ReplicaCatchupRequest asks a current in-sync replica for a bounded raw
 // committed-log range. SourceAddress is local routing metadata and is not sent.
 type ReplicaCatchupRequest struct {
-	Topic          string `json:"topic"`
-	Partition      int    `json:"partition"`
-	BrokerID       string `json:"broker_id"`
-	NextOffset     uint64 `json:"next_offset"`
-	CommittedHWM   uint64 `json:"committed_hwm"`
-	Leader         string `json:"leader"`
-	SourceBroker   string `json:"source_broker,omitempty"`
-	LeaderEpoch    int    `json:"leader_epoch"`
-	LifecycleEpoch uint64 `json:"lifecycle_epoch"`
-	MaxRecords     int    `json:"max_records"`
-	SourceAddress  string `json:"-"`
+	Topic           string `json:"topic"`
+	Partition       int    `json:"partition"`
+	BrokerID        string `json:"broker_id"`
+	NextOffset      uint64 `json:"next_offset"`
+	CommittedHWM    uint64 `json:"committed_hwm"`
+	Leader          string `json:"leader"`
+	SourceBroker    string `json:"source_broker,omitempty"`
+	LeaderEpoch     int    `json:"leader_epoch"`
+	LifecycleEpoch  uint64 `json:"lifecycle_epoch"`
+	MaxRecords      int    `json:"max_records"`
+	SourceAddress   string `json:"-"`
+	SnapshotCatchup bool   `json:"-"`
 }
 
 // ReplicaCatchupBatch carries a committed logical range under the same
@@ -323,6 +324,15 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 					partition.FlushDisk()
 				}
 			}
+			if leo == meta.CommittedHWM && localTopic.IsEventSourcing && !containsString(meta.ISR, brokerID) {
+				requests = append(requests, ReplicaCatchupRequest{
+					Topic: topicName, Partition: partitionID, BrokerID: brokerID,
+					NextOffset: leo, CommittedHWM: meta.CommittedHWM,
+					Leader: meta.Leader, SourceBroker: source.ID,
+					LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch,
+					MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr, SnapshotCatchup: true,
+				})
+			}
 			continue
 		}
 		requests = append(requests, ReplicaCatchupRequest{
@@ -330,7 +340,7 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 			NextOffset: leo, CommittedHWM: meta.CommittedHWM,
 			Leader: meta.Leader, SourceBroker: source.ID,
 			LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch,
-			MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr,
+			MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr, SnapshotCatchup: localTopic.IsEventSourcing,
 		})
 	}
 	sort.Slice(requests, func(i, j int) bool {

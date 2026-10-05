@@ -316,6 +316,22 @@ func (si *StreamIndex) GetVersion(key string) uint64 {
 	return st.currentVersion
 }
 
+// SeedVersion establishes a retention checkpoint in the rebuilt in-memory
+// index. It is derived from a durable application snapshot and is not written
+// to the disposable stream index files.
+func (si *StreamIndex) SeedVersion(key string, version uint64) error {
+	if key == "" || version == 0 {
+		return fmt.Errorf("invalid stream snapshot seed")
+	}
+	si.mu.Lock()
+	defer si.mu.Unlock()
+	if current := si.states[key]; current != nil && current.currentVersion != version {
+		return fmt.Errorf("stream snapshot seed conflict key=%s current=%d incoming=%d", key, current.currentVersion, version)
+	}
+	si.states[key] = &streamState{currentVersion: version}
+	return nil
+}
+
 // Lookup returns all index entries for the given key with AggregateVersion >= fromVersion.
 // Returns nil if the key is not found.
 func (si *StreamIndex) Lookup(key string, fromVersion uint64) ([]StreamIndexEntry, error) {

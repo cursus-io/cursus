@@ -247,6 +247,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	}
 	if cc != nil {
 		cc.SetLocalProcessor(globalCH)
+		cc.SetReplicaSnapshotCatchup(globalCH.CatchupReplicaSnapshots)
 		cc.StartTopologyReconciler(ctx)
 		cc.StartReplicaCatchup(ctx, clusterClient, globalCH.ApplyReplicaCatchup)
 	}

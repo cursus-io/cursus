@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -267,25 +268,68 @@ func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *St
 		return fmt.Errorf("partition lookup for index recovery topic=%s partition=%d: %w", topicName, partitionID, err)
 	}
 
-	latest := p.GetHWM()
+	first := p.GetFirstOffset()
+	latest := p.LastStableOffset()
+	if first > latest {
+		return fmt.Errorf("stream retention floor %d exceeds stable tail %d", first, latest)
+	}
+	if first > 0 {
+		// The stream index is disposable. Once retention removes its prefix,
+		// application snapshots are the durable proof of each aggregate's
+		// preceding version.
+		ss, err := NewSnapshotStore(h.tm.GetLogDir(topicName, partitionID), partitionID)
+		if err != nil {
+			return fmt.Errorf("open snapshot checkpoint for stream index recovery: %w", err)
+		}
+		records, listErr := ss.List()
+		closeErr := ss.Close()
+		if err := errors.Join(listErr, closeErr); err != nil {
+			return fmt.Errorf("load snapshot checkpoint for stream index recovery: %w", err)
+		}
+		if len(records) == 0 {
+			return fmt.Errorf("cannot recover retained event stream at offset %d without a snapshot checkpoint", first)
+		}
+		for _, record := range records {
+			if err := idx.SeedVersion(record.Key, record.Version); err != nil {
+				return fmt.Errorf("seed stream index from snapshot: %w", err)
+			}
+		}
+	}
 	const batchSize = 256
-	for offset := uint64(0); offset < latest; {
+	for offset := first; offset < latest; {
 		msgs, err := p.ReadCommitted(offset, batchSize)
 		if err != nil {
-			if offset == 0 {
-				return nil
-			}
 			return fmt.Errorf("recover stream index from log offset=%d: %w", offset, err)
 		}
 		if len(msgs) == 0 {
-			break
+			return fmt.Errorf("recover stream index stopped before stable tail at offset=%d tail=%d", offset, latest)
 		}
-		if err := h.indexMessages(idx, msgs); err != nil {
+		bounded := msgs[:0]
+		for _, msg := range msgs {
+			if msg.Offset >= latest {
+				break
+			}
+			bounded = append(bounded, msg)
+		}
+		if len(bounded) == 0 {
+			return fmt.Errorf("recover stream index did not reach stable tail at offset=%d tail=%d", offset, latest)
+		}
+		if err := h.indexMessages(idx, bounded); err != nil {
 			return err
 		}
-		offset = msgs[len(msgs)-1].Offset + 1
+		next := bounded[len(bounded)-1].Offset + 1
+		if next <= offset {
+			return fmt.Errorf("recover stream index did not advance from offset=%d", offset)
+		}
+		offset = next
 	}
 	return nil
+}
+
+type SnapshotPage struct {
+	Snapshots []SnapshotResult `json:"snapshots"`
+	Revision  uint64           `json:"revision"`
+	Done      bool             `json:"done"`
 }
 
 func (h *Handler) indexMessages(idx *StreamIndex, messages []types.Message) error {
@@ -733,14 +777,23 @@ func (h *Handler) SaveSnapshot(cmd string, afterSave func(result SnapshotResult)
 		return nil, fmt.Sprintf("ERROR: snapshot_version_exceeds_stream version=%d current=%d", version, currentVersion)
 	}
 
-	result := SnapshotResult{Topic: topicName, Key: key, Version: version, Partition: partitionID, Payload: payload}
-	if errResp := h.SaveSnapshotReplica(result); errResp != "" {
-		return nil, errResp
+	ss, err := h.getSnapshot(topicName, partitionID)
+	if err != nil {
+		return nil, fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", partitionID, err.Error())
 	}
+	if err := ss.ValidateSave(key, version, payload); err != nil {
+		return nil, fmt.Sprintf("ERROR: snapshot_save_failed reason=%q", err.Error())
+	}
+	result := SnapshotResult{Topic: topicName, Key: key, Version: version, Partition: partitionID, Payload: payload}
 	if afterSave != nil {
 		if err := afterSave(result); err != nil {
 			return nil, fmt.Sprintf("ERROR: snapshot_replicate_failed reason=%q", err.Error())
 		}
+	}
+	// Publish locally only after the distributed callback has reached the
+	// required replica quorum.
+	if err := ss.Save(key, version, payload); err != nil {
+		return nil, fmt.Sprintf("ERROR: snapshot_save_failed reason=%q", err.Error())
 	}
 	return &result, ""
 }
@@ -768,29 +821,39 @@ func (h *Handler) SaveSnapshotReplica(result SnapshotResult) string {
 
 // ListSnapshots returns all latest snapshots for a topic partition.
 func (h *Handler) ListSnapshots(topicName string, partitionID int) ([]SnapshotResult, string) {
+	return h.ListSnapshotsPage(topicName, partitionID, "", 0)
+}
+
+// ListSnapshotsPage returns a key-ordered page for bounded replica catch-up.
+func (h *Handler) ListSnapshotsPage(topicName string, partitionID int, afterKey string, limit int) ([]SnapshotResult, string) {
+	page, errResp := h.ListSnapshotsPageAtRevision(topicName, partitionID, afterKey, limit, 0)
+	return page.Snapshots, errResp
+}
+
+func (h *Handler) ListSnapshotsPageAtRevision(topicName string, partitionID int, afterKey string, limit int, expectedRevision uint64) (SnapshotPage, string) {
 	t := h.tm.GetTopic(topicName)
 	if t == nil {
-		return nil, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+		return SnapshotPage{}, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
 	if !t.IsEventSourcing {
-		return nil, fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", topicName)
+		return SnapshotPage{}, fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", topicName)
 	}
 	if _, err := t.GetPartition(partitionID); err != nil {
-		return nil, fmt.Sprintf("ERROR: partition_lookup_failed partition=%d reason=%q", partitionID, err.Error())
+		return SnapshotPage{}, fmt.Sprintf("ERROR: partition_lookup_failed partition=%d reason=%q", partitionID, err.Error())
 	}
 	ss, err := h.getSnapshot(topicName, partitionID)
 	if err != nil {
-		return nil, fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", partitionID, err.Error())
+		return SnapshotPage{}, fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", partitionID, err.Error())
 	}
-	records, err := ss.List()
+	records, revision, done, err := ss.ListPageAtRevision(afterKey, limit, expectedRevision)
 	if err != nil {
-		return nil, fmt.Sprintf("ERROR: snapshot_list_failed reason=%q", err.Error())
+		return SnapshotPage{}, fmt.Sprintf("ERROR: snapshot_list_failed reason=%q", err.Error())
 	}
 	result := make([]SnapshotResult, 0, len(records))
 	for _, rec := range records {
 		result = append(result, SnapshotResult{Topic: topicName, Key: rec.Key, Version: rec.Version, Partition: partitionID, Payload: rec.Payload})
 	}
-	return result, ""
+	return SnapshotPage{Snapshots: result, Revision: revision, Done: done}, ""
 }
 
 // FetchSnapshot returns the latest snapshot for a topic partition and aggregate key.
