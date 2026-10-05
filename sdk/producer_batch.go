@@ -12,6 +12,7 @@ import (
 	"github.com/cursus-io/cursus/util"
 )
 
+// sendBatch records the terminal delivery result without requeueing exhausted batches.
 func (p *Producer) sendBatch(part int, batch []Message) {
 	if len(batch) == 0 {
 		return
@@ -56,11 +57,7 @@ func (p *Producer) sendBatch(part int, batch []Message) {
 			producerSendErrors.WithLabelValues(p.config.Topic).Add(float64(len(batch)))
 		}
 		p.cleanupBatchState(part, batchID)
-		if isNonRetryableProducerError(err) {
-			p.recordDeliveryFailure(fmt.Errorf("deliver batch %s: %w", batchID, err))
-			return
-		}
-		p.handleSendFailure(part, batch)
+		p.recordDeliveryFailure(fmt.Errorf("deliver batch %s: %w", batchID, err))
 		return
 	}
 
@@ -120,40 +117,6 @@ func (p *Producer) cleanupBatchState(part int, batchID string) {
 	p.partitionBatchMus[part].Unlock()
 }
 
-func (p *Producer) handleSendFailure(part int, batch []Message) {
-	if len(batch) == 0 {
-		return
-	}
-
-	buf := p.buffers[part]
-	buf.mu.Lock()
-	defer buf.mu.Unlock()
-
-	p.partitionSentMus[part].Lock()
-	var retryBatch []Message
-	for _, msg := range batch {
-		if _, exists := p.partitionSentSeqs[part][msg.SeqNum]; !exists {
-			msg.Retry = true
-			retryBatch = append(retryBatch, msg)
-		}
-	}
-	p.partitionSentMus[part].Unlock()
-
-	allMsgs := append(buf.msgs, retryBatch...)
-	sort.Slice(allMsgs, func(i, j int) bool {
-		if allMsgs[i].Retry && !allMsgs[j].Retry {
-			return true
-		}
-		if !allMsgs[i].Retry && allMsgs[j].Retry {
-			return false
-		}
-		return allMsgs[i].SeqNum < allMsgs[j].SeqNum
-	})
-
-	buf.msgs = allMsgs
-	buf.cond.Signal()
-}
-
 func (p *Producer) handlePartialFailure(part int, batch []Message, ackResp *AckResponse) {
 	lastSuccessSeq := ackResp.SeqEnd
 
@@ -182,6 +145,7 @@ func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error)
 	return p.sendWithRetryForBatch(payload, part, Message{}, Message{})
 }
 
+// sendWithRetryForBatch spends one shared attempt budget, including reconnects.
 func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last Message) (*AckResponse, error) {
 	maxAttempts := p.config.MaxRetries + 1
 	backoff := p.config.RetryBackoffMS
@@ -199,6 +163,9 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 			brokerAddr := p.getPartitionLeaderAddr(part)
 			if err := p.client.ReconnectPartition(part, brokerAddr); err != nil {
 				lastErr = fmt.Errorf("reconnect failed: %w", err)
+				if attempt == maxAttempts {
+					break
+				}
 				if !p.waitForRetry(backoff) {
 					return nil, fmt.Errorf("producer is closed")
 				}
@@ -208,6 +175,9 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 			conn = p.client.GetConn(part)
 			if conn == nil {
 				lastErr = fmt.Errorf("no connection after reconnect")
+				if attempt == maxAttempts {
+					break
+				}
 				if !p.waitForRetry(backoff) {
 					return nil, fmt.Errorf("producer is closed")
 				}
@@ -218,6 +188,9 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 
 		if err := conn.SetWriteDeadline(time.Now().Add(time.Duration(p.config.WriteTimeoutMS) * time.Millisecond)); err != nil {
 			lastErr = fmt.Errorf("set write deadline failed: %w", err)
+			if attempt == maxAttempts {
+				break
+			}
 			if !p.waitForRetry(backoff) {
 				return nil, fmt.Errorf("producer is closed")
 			}
@@ -227,6 +200,10 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 
 		if err := WriteWithLength(conn, payload); err != nil {
 			lastErr = fmt.Errorf("write failed: %w", err)
+			if attempt == maxAttempts {
+				p.client.discardPartitionConnection(part, conn)
+				break
+			}
 			brokerAddr := p.getPartitionLeaderAddr(part)
 			_ = p.client.ReconnectPartition(part, brokerAddr)
 			if !p.waitForRetry(backoff) {
@@ -249,6 +226,10 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 			if isNonRetryableProducerError(err) {
 				return nil, lastErr
 			}
+			if attempt == maxAttempts {
+				p.client.discardPartitionConnection(part, conn)
+				break
+			}
 			brokerAddr := p.getPartitionLeaderAddr(part)
 			_ = p.client.ReconnectPartition(part, brokerAddr)
 			if !p.waitForRetry(backoff) {
@@ -263,6 +244,10 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 			lastErr = err
 			if isNonRetryableProducerError(err) {
 				return nil, lastErr
+			}
+			if attempt == maxAttempts {
+				p.client.discardPartitionConnection(part, conn)
+				break
 			}
 			brokerAddr := p.getPartitionLeaderAddr(part)
 			_ = p.client.ReconnectPartition(part, brokerAddr)
