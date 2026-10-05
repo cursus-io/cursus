@@ -9,7 +9,10 @@ import (
 	"github.com/cursus-io/cursus/sdk/internal/transport"
 )
 
-const MaxMessageSize = wire.MaxFramePayload
+const (
+	MaxMessageSize          = wire.MaxFramePayload
+	MaxConsumerBatchRecords = wire.MaxFetchRecords
+)
 
 func EncodeBatchMessages(topic string, partition int, acks string, isIdempotent bool, messages []Message) ([]byte, error) {
 	return wire.EncodeBatch(wire.Batch{

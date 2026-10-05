@@ -92,7 +92,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"UNSUPPORTED_FEATURE", "UNSUPPORTED_PROTOCOL_VERSION", "batch_decode_failed", "decode_failed",
 		"consumer_group_subscriptions_feature_required", "distribution_not_enabled", "distribution_required", "duplicate_partition", "empty_command", "empty_messages", "invalid_aggregate_version", "invalid_expected_version", "missing_min_in_sync_replicas",
 		"empty_required_params", "event_sourcing_not_enabled", "invalid_acks", "invalid_batch_commit_entry", "invalid_batch_commit_format", "invalid_min_in_sync_replicas",
-		"invalid_auth", "invalid_consume_syntax", "invalid_control_batch_bytes", "invalid_control_batch_coordinator_epoch",
+		"fetch_batch_too_large", "fetch_wait_too_large", "invalid_auth", "invalid_batch", "invalid_consume_syntax", "invalid_control_batch_bytes", "invalid_control_batch_coordinator_epoch", "invalid_wait_ms",
 		"invalid_aggregate_replay", "invalid_expected_last_sequence", "invalid_from_sequence", "invalid_max_records", "invalid_producer_epoch", "invalid_producer_sequence", "invalid_to_sequence",
 		"invalid_control_batch_version", "invalid_commit_watermark", "invalid_epoch", "invalid_generation", "invalid_is_idempotent", "raft_apply_topic_mismatch",
 		"invalid_event_sourcing", "invalid_idempotent", "invalid_if_exists", "invalid_offset", "invalid_partition", "invalid_partitions", "invalid_payload", "invalid_payload_json",

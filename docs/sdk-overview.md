@@ -286,6 +286,10 @@ partition marker and final coordinator decision are durable. They skip aborted
 transactions and stop at the earliest unresolved transaction. Uncommitted reads
 return the raw committed partition log, including transaction control records.
 
+`ConsumerConfig.BatchSize` and `MaxPollRecords` must each be between 1 and
+`sdk.MaxConsumerBatchRecords` (8,192). The SDK rejects larger values before it
+opens a broker connection, matching the broker's `CONSUME` and `STREAM` limit.
+
 ## Go Client Authentication
 
 Publisher and consumer configs accept connection credentials:

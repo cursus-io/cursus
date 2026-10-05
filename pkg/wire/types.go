@@ -7,6 +7,17 @@ const (
 	HeaderSize             = 32
 	MaxFramePayload        = 64 * 1024 * 1024
 	MaxBatchRecords        = 100_000
+	// MaxFetchRecords bounds records decoded for one CONSUME or STREAM fetch.
+	// It is deliberately lower than MaxBatchRecords because fetches are driven
+	// by untrusted remote request arguments and may run concurrently.
+	MaxFetchRecords = 8_192
+	// MaxFetchDecodedBytes bounds decoded storage data retained by one fetch.
+	// A single record may consume this entire budget, but never exceeds the
+	// protocol frame limit enforced when it was published.
+	MaxFetchDecodedBytes = MaxFramePayload
+	// MaxFetchWaitMillis bounds a broker-side CONSUME long poll independently
+	// of the configured per-request deadline.
+	MaxFetchWaitMillis = 30_000
 )
 
 type Kind uint8

@@ -518,36 +518,23 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 	}
 	_ = conn.SetDeadline(time.Time{})
 
+	requests := make(chan wire.Frame, 1)
+	readPumpCtx, stopReadPump := context.WithCancel(clientCtx)
+	defer stopReadPump()
+	go pumpWireRequests(readPumpCtx, cancel, conn, wireConnection, idleTimeout, requests)
+
 	for {
+		var request wire.Frame
 		select {
 		case <-clientCtx.Done():
 			return
-		default:
-		}
-		deadline := time.Now().Add(readDeadlinePoll)
-		idleDeadline := lastActivity.Add(idleTimeout)
-		if idleDeadline.Before(deadline) {
-			deadline = idleDeadline
-		}
-		if err := conn.SetReadDeadline(deadline); err != nil {
-			util.Error("⚠️ SetReadDeadline error: %v", err)
-			return
-		}
-
-		request, err := readWireRequest(wireConnection)
-		if err != nil {
-			select {
-			case <-clientCtx.Done():
-				return
-			default:
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() && time.Since(lastActivity) < idleTimeout {
-					continue
-				}
+		case next, ok := <-requests:
+			if !ok {
 				return
 			}
+			request = next
 		}
 
-		lastActivity = time.Now()
 		responseConn.setRequest(request)
 		requestCtx, cancelRequest := context.WithTimeout(clientCtx, clientRequestTimeout(cmdHandler.Config))
 		cmdCtx.SetRequestContext(requestCtx)
@@ -561,6 +548,52 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 			if request.Command == wire.CommandStream {
 				isStreamed = true
 			}
+			stopReadPump()
+			_ = conn.SetReadDeadline(time.Now())
+			return
+		}
+	}
+}
+
+// pumpWireRequests keeps connection liveness observable while a handler is
+// processing a request. A terminal read error cancels the connection context,
+// which releases request handlers such as CONSUME long polls immediately.
+func pumpWireRequests(ctx context.Context, cancelConnection context.CancelFunc, conn net.Conn, connection *wire.Connection, idleTimeout time.Duration, requests chan<- wire.Frame) {
+	defer close(requests)
+	lastActivity := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		deadline := time.Now().Add(readDeadlinePoll)
+		idleDeadline := lastActivity.Add(idleTimeout)
+		if idleDeadline.Before(deadline) {
+			deadline = idleDeadline
+		}
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			util.Error("⚠️ SetReadDeadline error: %v", err)
+			cancelConnection()
+			return
+		}
+
+		request, err := readWireRequest(connection)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() && time.Since(lastActivity) < idleTimeout {
+				continue
+			}
+			cancelConnection()
+			return
+		}
+		lastActivity = time.Now()
+		select {
+		case requests <- request:
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -837,6 +870,12 @@ func suppressBatchPublishResponse(data []byte, ctx *controller.ClientContext) bo
 
 func commandErrorResponse(err error, ctx *controller.ClientContext) string {
 	resp := err.Error()
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		resp = "ERROR: request_timeout outcome=not_accepted"
+	case errors.Is(err, context.Canceled):
+		resp = "ERROR: request_cancelled"
+	}
 	if !wireprotocol.IsErrorResponse(resp) {
 		resp = fmt.Sprintf("ERROR: command_failed reason=%q", resp)
 	}

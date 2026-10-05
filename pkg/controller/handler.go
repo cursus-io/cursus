@@ -17,10 +17,11 @@ import (
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
-const DefaultMaxPollRecords = 8192
+const DefaultMaxPollRecords = wire.MaxFetchRecords
 const STREAM_DATA_SIGNAL = "STREAM_DATA"
 const BROWSE_DATA_SIGNAL = "BROWSE_DATA"
 const STREAM_HISTORY_DATA_SIGNAL = "STREAM_HISTORY_DATA"

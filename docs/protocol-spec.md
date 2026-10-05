@@ -432,8 +432,8 @@ CONSUME topic=<name> partition=<N> offset=<N> member=<id> group=<name> [autoOffs
 | group | No | default-group | Consumer group |
 | autoOffsetReset | No | earliest | `earliest` (0) or `latest` (HWM) |
 | isolation | No | read_committed | `read_committed` hides unresolved/aborted transactional records; `read_uncommitted` returns the raw committed log, including transaction metadata and control markers. |
-| batch | No | 8192 | Max messages per poll |
-| wait_ms | No | 0 | Long-poll timeout in ms |
+| batch | No | 8192 | Maximum messages to return; valid range is 1..8192 |
+| wait_ms | No | 0 | Long-poll timeout in ms; when supplied, valid range is 1..30000 |
 
 Response: Binary batch frame (Section 5)
 
@@ -448,6 +448,14 @@ starts at the partition high-water mark.
 partition leader does not validate consumer group ownership, member liveness, or
 generation on the data path. Ownership and generation fencing are enforced by
 coordinator commands such as `HEARTBEAT`, `COMMIT_OFFSET`, and `BATCH_COMMIT`.
+
+Each `CONSUME` or `STREAM` storage read is limited to 8,192 records and 64 MiB
+of decoded record data. The record limit applies to the requested `batch`; the
+byte limit is broker-enforced and may return a smaller batch. A single valid
+record may occupy the entire byte budget. Long polls wake on partition commit
+notifications and stop when the request context is cancelled or its deadline
+expires. A `wait_ms` value larger than the remaining request deadline is
+clamped to that deadline.
 
 **STREAM** (continuous push)
 ```

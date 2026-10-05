@@ -231,6 +231,9 @@ func (c *ConsumerConfig) Validate() error {
 	if c.BatchSize <= 0 || c.MaxPollRecords <= 0 || c.WorkerChannelSize <= 0 {
 		return fmt.Errorf("consumer batch size, max poll records, and worker channel size must be positive")
 	}
+	if c.BatchSize > MaxConsumerBatchRecords || c.MaxPollRecords > MaxConsumerBatchRecords {
+		return fmt.Errorf("consumer batch size and max poll records must not exceed %d", MaxConsumerBatchRecords)
+	}
 	if c.MaxConnectRetries < 0 || c.MaxCommitRetries < 0 {
 		return fmt.Errorf("consumer retry limits must not be negative")
 	}
