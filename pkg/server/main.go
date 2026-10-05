@@ -230,6 +230,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	}
 
 	globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
+	requestBudget := newRequestMemoryBudget(cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes)
 	defer func() {
 		if err := globalCH.Close(); err != nil {
 			util.Error("Failed to close command handler: %v", err)
@@ -252,7 +253,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		cc.StartReplicaCatchup(ctx, clusterClient, globalCH.ApplyReplicaCatchup)
 	}
 	if cfg.EnabledDistribution && cfg.InternalBrokerPort > 0 {
-		shutdownInternal, err := startInternalBrokerListener(ctx, cfg, globalCH)
+		shutdownInternal, err := startInternalBrokerListener(ctx, cfg, globalCH, requestBudget)
 		if err != nil {
 			return err
 		}
@@ -341,7 +342,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		go func() {
 			defer workerWG.Done()
 			for conn := range workerCh {
-				handleConn(ctx, conn, globalCH)
+				handleConn(ctx, conn, globalCH, requestBudget)
 			}
 		}()
 	}
@@ -424,7 +425,7 @@ func closeListenerOnDone(ctx context.Context, ln net.Listener) {
 	_ = ln.Close()
 }
 
-func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHandler *controller.CommandHandler) (func(), error) {
+func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHandler *controller.CommandHandler, budgets ...*requestMemoryBudget) (func(), error) {
 	addr := fmt.Sprintf(":%d", cfg.InternalBrokerPort)
 	var ln net.Listener
 	var err error
@@ -440,6 +441,10 @@ func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHan
 	util.Info("🔒 Internal broker listener started on %s (mTLS=%v)", addr, cfg.InternalUseTLS)
 	internalCtx, cancel := context.WithCancel(ctx)
 	workerCount := maxClientConnections(cfg)
+	requestBudget := newRequestMemoryBudget(cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes)
+	if len(budgets) > 0 && budgets[0] != nil {
+		requestBudget = budgets[0]
+	}
 	workerCh := make(chan net.Conn, workerCount)
 	connectionSlots := newConnectionLimiter(workerCount)
 	var workerWG sync.WaitGroup
@@ -448,7 +453,7 @@ func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHan
 		go func() {
 			defer workerWG.Done()
 			for conn := range workerCh {
-				handleInternalConn(internalCtx, conn, cmdHandler)
+				handleConnWithBudget(internalCtx, conn, cmdHandler, controller.NewInternalClientContext("default-group", 0), requestBudget)
 			}
 		}()
 	}
@@ -504,12 +509,21 @@ func observeClientConnection() func() {
 }
 
 // handleConn processes a connection using a shared CommandHandler.
-func handleConn(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler) {
+func handleConn(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler, budgets ...*requestMemoryBudget) {
 	defer observeClientConnection()()
-	handleConnWithContext(ctx, conn, cmdHandler, controller.NewClientContext("default-group", 0))
+	budget := newRequestMemoryBudget(cmdHandler.Config.MaxInflightRequests, cmdHandler.Config.MaxInflightRequestBytes)
+	if len(budgets) > 0 && budgets[0] != nil {
+		budget = budgets[0]
+	}
+	handleConnWithBudget(ctx, conn, cmdHandler, controller.NewClientContext("default-group", 0), budget)
 }
 
 func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler, cmdCtx *controller.ClientContext) {
+	budget := newRequestMemoryBudget(cmdHandler.Config.MaxInflightRequests, cmdHandler.Config.MaxInflightRequestBytes)
+	handleConnWithBudget(ctx, conn, cmdHandler, cmdCtx, budget)
+}
+
+func handleConnWithBudget(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler, cmdCtx *controller.ClientContext, budget *requestMemoryBudget) {
 	isStreamed := false
 	defer func() {
 		if !isStreamed {
@@ -544,7 +558,7 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 	wireConnection.SetReader(reader)
 	go func() {
 		defer close(pumpDone)
-		pumpWireRequests(readPumpCtx, cancel, wireConnection, activity, requests)
+		pumpWireRequests(readPumpCtx, cancel, wireConnection, activity, budget, requests)
 	}()
 	defer func() {
 		stopReadPump()

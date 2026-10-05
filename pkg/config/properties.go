@@ -112,9 +112,11 @@ type Config struct {
 	StaticConsumerGroups     []ConsumerGroupConfig `yaml:"static_consumer_groups" json:"static_consumer_groups"`
 
 	// network
-	MaxClientConnections   int `yaml:"max_client_connections" json:"max.client.connections"`
-	ClientIdleTimeoutMS    int `yaml:"client_idle_timeout_ms" json:"client.idle.timeout.ms"`
-	ClientRequestTimeoutMS int `yaml:"client_request_timeout_ms" json:"client.request.timeout.ms"`
+	MaxClientConnections    int   `yaml:"max_client_connections" json:"max.client.connections"`
+	MaxInflightRequests     int   `yaml:"max_inflight_requests" json:"max.inflight.requests"`
+	MaxInflightRequestBytes int64 `yaml:"max_inflight_request_bytes" json:"max.inflight.request.bytes"`
+	ClientIdleTimeoutMS     int   `yaml:"client_idle_timeout_ms" json:"client.idle.timeout.ms"`
+	ClientRequestTimeoutMS  int   `yaml:"client_request_timeout_ms" json:"client.request.timeout.ms"`
 	// ObservationGRPCPort enables a loopback-only, read-only gRPC adapter. A
 	// zero value leaves the listener disabled.
 	ObservationGRPCPort      int    `yaml:"observation_grpc_port" json:"observation.grpc.port"`
@@ -221,10 +223,12 @@ func DefaultConfig() *Config {
 			ConsumerHeartbeatCheckMS: 5000,
 
 			// network
-			MaxClientConnections:   1000,
-			ClientIdleTimeoutMS:    60000,
-			ClientRequestTimeoutMS: 30000,
-			ObservationGRPCPort:    0,
+			MaxClientConnections:    1000,
+			MaxInflightRequests:     256,
+			MaxInflightRequestBytes: 256 * 1024 * 1024,
+			ClientIdleTimeoutMS:     60000,
+			ClientRequestTimeoutMS:  30000,
+			ObservationGRPCPort:     0,
 
 			// stream
 			MaxStreamConnections: 1000,
@@ -339,6 +343,8 @@ func LoadConfig() (*Config, error) {
 	flag.IntVar(&cfg.ConsumerSessionTimeoutMS, "consumer-session-timeout", cfg.ConsumerSessionTimeoutMS, "Session timeout")
 	flag.IntVar(&cfg.ConsumerHeartbeatCheckMS, "consumer-heartbeat-check", cfg.ConsumerHeartbeatCheckMS, "Heartbeat check")
 	flag.IntVar(&cfg.MaxClientConnections, "max-client-connections", cfg.MaxClientConnections, "Maximum concurrently serviced client connections")
+	flag.IntVar(&cfg.MaxInflightRequests, "max-inflight-requests", cfg.MaxInflightRequests, "Maximum requests queued or processed across all client and internal connections")
+	flag.Int64Var(&cfg.MaxInflightRequestBytes, "max-inflight-request-bytes", cfg.MaxInflightRequestBytes, "Maximum encoded and decoded request payload bytes retained across the broker")
 	flag.IntVar(&cfg.ClientIdleTimeoutMS, "client-idle-timeout-ms", cfg.ClientIdleTimeoutMS, "Idle client connection timeout in milliseconds")
 	flag.IntVar(&cfg.ClientRequestTimeoutMS, "client-request-timeout-ms", cfg.ClientRequestTimeoutMS, "Maximum client request processing time in milliseconds")
 	flag.IntVar(&cfg.ObservationGRPCPort, "observation-grpc-port", cfg.ObservationGRPCPort, "Loopback-only read-only observation gRPC port; zero disables it")
@@ -455,6 +461,8 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.ConsumerChannelBufSize, "CONSUMER_CH_BUFFER")
 	overrideEnvInt(&cfg.BroadcastChannelBufferSize, "BROADCAST_CH_BUFFER")
 	overrideEnvInt(&cfg.MaxClientConnections, "MAX_CLIENT_CONNECTIONS")
+	overrideEnvInt(&cfg.MaxInflightRequests, "MAX_INFLIGHT_REQUESTS")
+	overrideEnvInt64(&cfg.MaxInflightRequestBytes, "MAX_INFLIGHT_REQUEST_BYTES")
 	overrideEnvInt(&cfg.ClientIdleTimeoutMS, "CLIENT_IDLE_TIMEOUT_MS")
 	overrideEnvInt(&cfg.ClientRequestTimeoutMS, "CLIENT_REQUEST_TIMEOUT_MS")
 

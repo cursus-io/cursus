@@ -173,6 +173,13 @@ func (cfg *Config) Normalize() {
 	if cfg.MaxClientConnections <= 0 {
 		cfg.MaxClientConnections = 1000
 	}
+	if cfg.MaxInflightRequests <= 0 {
+		cfg.MaxInflightRequests = 256
+	}
+	minimumInflightBytes := int64(2 * util.MaxMessageSize)
+	if cfg.MaxInflightRequestBytes < minimumInflightBytes {
+		cfg.MaxInflightRequestBytes = 256 * 1024 * 1024
+	}
 	if cfg.ClientIdleTimeoutMS <= 0 {
 		cfg.ClientIdleTimeoutMS = 60000
 	}

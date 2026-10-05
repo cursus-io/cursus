@@ -80,6 +80,10 @@ spec:
               value: {{ .Values.limits.maxTransactionBytes | quote }}
             - name: MAX_TRANSACTION_OFFSETS
               value: {{ .Values.limits.maxTransactionOffsets | quote }}
+            - name: MAX_INFLIGHT_REQUESTS
+              value: {{ .Values.limits.maxInflightRequests | quote }}
+            - name: MAX_INFLIGHT_REQUEST_BYTES
+              value: {{ .Values.limits.maxInflightRequestBytes | quote }}
             {{- if .Values.tls.enabled }}  
             - name: USE_TLS
               value: "true"

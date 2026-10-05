@@ -164,6 +164,10 @@ In diagnostics-only mode, `/ready` includes the retained `consumer_metadata` fai
 | `cursus_storage_filesystem_free_bytes` | Gauge / bytes | Space currently available on the filesystem containing `log_dir` |
 | `cursus_storage_filesystem_total_bytes` | Gauge / bytes | Total capacity of the filesystem containing `log_dir` |
 | `cursus_storage_filesystem_headroom_ready` | Gauge / boolean | `1` while the configured byte and percentage free-space reserve permits new writes |
+| `cursus_broker_requests_inflight` | Gauge / requests | Decoded requests queued or processed across both broker listeners |
+| `cursus_broker_request_bytes_inflight` | Gauge / bytes | Reserved encoded and decoded request payload memory |
+| `cursus_broker_request_admission_waiters` | Gauge / connections | Connections blocked before payload allocation by the global request budget |
+| `cursus_broker_request_admission_rejections_total{reason}` | Counter / requests | Admission failures caused by `bytes` or connection `context` cancellation |
 
 In standalone mode the local coordinator is authoritative. In distributed
 mode, replicated membership can remain present on a broker that no longer owns

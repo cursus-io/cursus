@@ -54,6 +54,8 @@ limits:
   maxTransactionRecords: 10000
   maxTransactionBytes: 67108864
   maxTransactionOffsets: 10000
+  maxInflightRequests: 256
+  maxInflightRequestBytes: 268435456
 
 storage:
   minFreeBytes: 268435456

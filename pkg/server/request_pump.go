@@ -2,35 +2,12 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/wire"
 )
-
-// requestPayloadBudget bounds encoded plus decoded request payloads across all
-// connections, including reads in progress and requests executing in handlers.
-const requestPayloadBudget = 256 * 1024 * 1024
-
-var incomingPayloads = payloadBudget{limit: requestPayloadBudget}
-
-type payloadBudget struct {
-	mu          sync.Mutex
-	used, limit int
-}
-
-func (b *payloadBudget) reserve(size int) (func(), error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if size < 0 || size > b.limit-b.used {
-		return nil, fmt.Errorf("request payload budget exhausted")
-	}
-	b.used += size
-	var once sync.Once
-	return func() { once.Do(func() { b.mu.Lock(); b.used -= size; b.mu.Unlock() }) }, nil
-}
 
 type requestActivity struct {
 	conn   net.Conn
@@ -109,29 +86,24 @@ type admittedRequest struct {
 // previous handler must finish before another payload can be allocated. STREAM
 // additionally suspends header reads until registration either fails or cancels
 // the pump as part of ownership transfer.
-func pumpWireRequests(ctx context.Context, cancelConnection context.CancelFunc, connection *wire.Connection, activity *requestActivity, requests chan<- admittedRequest) {
+func pumpWireRequests(ctx context.Context, cancelConnection context.CancelFunc, connection *wire.Connection, activity *requestActivity, budget *requestMemoryBudget, requests chan<- admittedRequest) {
 	defer close(requests)
 	previousDone := make(chan struct{})
 	close(previousDone)
 	for {
 		var release func()
-		request, err := readWireRequestWithAdmission(connection, func(encoded, decoded int) error {
+		request, release, err := readWireRequestReserved(connection, func(bytes uint64) (func(), error) {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return nil, ctx.Err()
 			case <-previousDone:
 			}
 			if err := ctx.Err(); err != nil {
-				return err
+				return nil, err
 			}
-			var err error
-			release, err = incomingPayloads.reserve(encoded + decoded)
-			return err
+			return budget.reserve(ctx, bytes)
 		})
 		if err != nil {
-			if release != nil {
-				release()
-			}
 			if ctx.Err() == nil {
 				cancelConnection()
 			}

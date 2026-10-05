@@ -45,6 +45,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.DiskMinFreeBytes != 256*1024*1024 || cfg.DiskMinFreePercent != 5 {
 		t.Errorf("unexpected default disk headroom: bytes=%d percent=%v", cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent)
 	}
+	if cfg.MaxInflightRequests != 256 || cfg.MaxInflightRequestBytes != 256*1024*1024 {
+		t.Errorf("unexpected default request limits: requests=%d bytes=%d", cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes)
+	}
 }
 
 func TestLoadConfig_EnvOverrides(t *testing.T) {
@@ -66,6 +69,8 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("MAX_TRANSACTION_OFFSETS", "22")
 	t.Setenv("DISK_MIN_FREE_BYTES", "1048576")
 	t.Setenv("DISK_MIN_FREE_PERCENT", "7.5")
+	t.Setenv("MAX_INFLIGHT_REQUESTS", "17")
+	t.Setenv("MAX_INFLIGHT_REQUEST_BYTES", "134217728")
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -107,6 +112,9 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	}
 	if cfg.DiskMinFreeBytes != 1048576 || cfg.DiskMinFreePercent != 7.5 {
 		t.Errorf("unexpected disk headroom from env: bytes=%d percent=%v", cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent)
+	}
+	if cfg.MaxInflightRequests != 17 || cfg.MaxInflightRequestBytes != 134217728 {
+		t.Errorf("unexpected request limits from env: requests=%d bytes=%d", cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes)
 	}
 }
 
@@ -154,5 +162,8 @@ func TestConfig_Normalize(t *testing.T) {
 	}
 	if cfg.DiskMinFreeBytes != 256*1024*1024 || cfg.DiskMinFreePercent != 5 {
 		t.Errorf("Normalize should restore disk headroom, got bytes=%d percent=%v", cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent)
+	}
+	if cfg.MaxInflightRequests != 256 || cfg.MaxInflightRequestBytes != 256*1024*1024 {
+		t.Errorf("Normalize should restore request limits, got requests=%d bytes=%d", cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes)
 	}
 }

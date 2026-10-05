@@ -83,6 +83,14 @@ spec:
           annotations:
             summary: Cursus failed to write client responses
             description: The broker could not deliver one or more client responses during the last five minutes.
+        - alert: CursusRequestAdmissionSaturated
+          expr: cursus_broker_request_admission_waiters{namespace={{ .Release.Namespace | quote }}} > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Cursus request admission is saturated
+            description: Client connections have waited for global request count or memory capacity for five minutes.
     - name: cursus.data-safety
       rules:
         - alert: CursusConsumerOffsetOutOfRange

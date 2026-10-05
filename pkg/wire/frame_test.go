@@ -11,6 +11,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestReadFrameReservedAccountsForCompressedPeakMemory(t *testing.T) {
+	codec, err := wire.NewCodec(wire.CompressionGZIP)
+	require.NoError(t, err)
+	payload := bytes.Repeat([]byte("compressible-payload-"), 128)
+	encoded, err := codec.Encode(wire.Frame{Kind: wire.KindRequest, Command: wire.CommandPublish, RequestID: 1, Payload: payload})
+	require.NoError(t, err)
+
+	var reserved uint64
+	released := false
+	frame, release, err := codec.ReadFrameReserved(bytes.NewReader(encoded), func(bytes uint64) (func(), error) {
+		reserved = bytes
+		return func() { released = true }, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, payload, frame.Payload)
+	require.Greater(t, reserved, uint64(len(payload)))
+	require.False(t, released)
+	release()
+	require.True(t, released)
+}
+
 func TestFrameGoldenUncompressedRequest(t *testing.T) {
 	codec, err := wire.NewCodec(wire.CompressionNone)
 	require.NoError(t, err)

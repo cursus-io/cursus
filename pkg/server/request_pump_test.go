@@ -72,20 +72,6 @@ func TestPipelinedPayloadWaitsForActiveHandler(t *testing.T) {
 	require.Equal(t, uint64(2), second.RequestID)
 }
 
-func TestPayloadBudgetReservationsAreBoundedAndReusable(t *testing.T) {
-	budget := payloadBudget{limit: 16}
-	release, err := budget.reserve(12)
-	require.NoError(t, err)
-	_, err = budget.reserve(5)
-	require.Error(t, err)
-	release()
-	release()
-	release, err = budget.reserve(16)
-	require.NoError(t, err)
-	release()
-	require.Zero(t, budget.used)
-}
-
 func TestRejectedStreamResumesRequestPump(t *testing.T) {
 	handler := newPublishTestHandler(t)
 	handler.StreamManager = stream.NewStreamManager(0, time.Second)
@@ -197,7 +183,8 @@ func TestPumpWireRequestsAcceptsCompleteFrameBeforeDisconnectCancellation(t *tes
 	activity := &requestActivity{conn: server.raw, last: time.Now()}
 	server.conn.SetReader(&requestReader{Conn: server.raw, ctx: ctx, activity: activity, idleTimeout: time.Second})
 	requests := make(chan admittedRequest)
-	go pumpWireRequests(ctx, cancelConnection, server.conn, activity, requests)
+	budget := newRequestMemoryBudget(1, 1<<20)
+	go pumpWireRequests(ctx, cancelConnection, server.conn, activity, budget, requests)
 
 	command, parsed, err := wire.ParseCommandText("PUBLISH topic=orders partition=0 acks=0 producerId=p1 message=value")
 	require.NoError(t, err)

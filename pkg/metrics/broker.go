@@ -54,6 +54,26 @@ var (
 		Help: "Broker client response write failures by bounded reason",
 	}, []string{"reason"})
 
+	RequestsInflight = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "cursus_broker_requests_inflight",
+		Help: "Decoded requests currently queued or processed by the broker",
+	})
+
+	RequestBytesInflight = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "cursus_broker_request_bytes_inflight",
+		Help: "Encoded and decoded request payload bytes reserved by the broker",
+	})
+
+	RequestAdmissionWaiters = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "cursus_broker_request_admission_waiters",
+		Help: "Connections waiting for global request count or memory capacity",
+	})
+
+	RequestAdmissionRejections = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "cursus_broker_request_admission_rejections_total",
+		Help: "Requests rejected by bounded global admission reason",
+	}, []string{"reason"})
+
 	CommandsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "cursus_broker_commands_total",
 		Help: "Broker text commands completed by command and result",

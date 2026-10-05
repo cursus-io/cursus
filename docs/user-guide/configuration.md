@@ -209,6 +209,8 @@ These values participate in active broker behavior:
 | `advertised_broker_port` | 0 | Broker port advertised to peers when different from the listener. |
 | `advertised_client_host` | empty | Client-facing host returned by routing metadata. |
 | `max_client_connections` | 1000 | Concurrent client connection limit. |
+| `max_inflight_requests` | 256 | Global number of decoded requests that may be queued or processed across client and internal listeners. |
+| `max_inflight_request_bytes` | 268435456 | Global encoded-plus-decoded request payload budget. Values below 128 MiB are normalized because one maximally compressed protocol frame can require that much peak memory. |
 | `client_idle_timeout_ms` | 60000 | Idle client connection deadline. |
 | `client_request_timeout_ms` | 30000 | Timeout applied to request processing and response writes. A response produced at the processing deadline gets one write attempt bounded by the same value. It is also the rolling per-frame write timeout for streams and, together with the idle timeout, bounds Wire v2 negotiation. An `acks=all` publish that times out after append returns `request_timeout outcome=unknown`; its accepted replication continues independently. |
 | `max_stream_connections` | 1000 | Concurrent streaming connection limit. |
@@ -353,7 +355,11 @@ The Config struct uses both YAML and JSON tags to support both formats. Here's h
 | MaxTransactionRecords     | `max_transaction_records`    | `max.transaction.records`    | --max-transaction-records    |
 | MaxTransactionBytes       | `max_transaction_bytes`      | `max.transaction.bytes`      | --max-transaction-bytes      |
 | MaxTransactionOffsets     | `max_transaction_offsets`    | `max.transaction.offsets`    | --max-transaction-offsets    |
+| MaxInflightRequests       | `max_inflight_requests`      | `max.inflight.requests`      | --max-inflight-requests      |
+| MaxInflightRequestBytes   | `max_inflight_request_bytes` | `max.inflight.request.bytes` | --max-inflight-request-bytes |
 | DiskFlushBatchSize        | `disk_flush_batch_size`      | `disk.flush.batch.size`       | --disk-flush-batch       |
+| DiskMinFreeBytes          | `disk_min_free_bytes`        | `disk.min.free.bytes`         | --disk-min-free-bytes    |
+| DiskMinFreePercent        | `disk_min_free_percent`      | `disk.min.free.percent`       | --disk-min-free-percent  |
 | LingerMS                  | `linger_ms`                  | `linger.ms`                   | --linger-ms              |
 | ChannelBufferSize         | `channel_buffer_size`        | `channel.buffer.size`         | --channel-buffer         |
 | DiskWriteTimeoutMS        | `disk_write_timeout_ms`      | `disk.write.timeout.ms`       | --disk-write-timeout     |
