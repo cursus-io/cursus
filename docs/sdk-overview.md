@@ -131,6 +131,12 @@ some records: reconcile delivery or use application-level deduplication before
 resubmitting, especially with a new producer identity. An error alone does not
 prove that resubmission is safe from duplicates.
 
+The producer lifecycle is observable through `Producer.State()` as `Open`,
+`Closing`, or `Closed`. A `Flush()` that races with or follows `Close()` waits
+for the same bounded drain and returns the same final delivery or cleanup
+error. It cannot report success while a message accepted before shutdown is
+still waiting for its configured acknowledgement.
+
 ## Cluster Consumer Routing
 
 ```mermaid

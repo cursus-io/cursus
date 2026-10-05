@@ -74,7 +74,7 @@ type Producer struct {
 	partitionMu      sync.RWMutex
 
 	done      chan struct{}
-	closed    int32
+	state     atomic.Uint32
 	closeMu   sync.Mutex
 	closeDone chan struct{}
 	closeErr  error
@@ -464,7 +464,7 @@ func isSafeTopicOptionValue(value string, allowEmpty bool) bool {
 
 // Send enqueues payload for delivery and returns the assigned sequence number.
 func (p *Producer) Send(payload string) (uint64, error) {
-	if atomic.LoadInt32(&p.closed) == 1 {
+	if p.State() != ProducerStateOpen {
 		return 0, fmt.Errorf("send: %w", ErrProducerClosed)
 	}
 
@@ -623,9 +623,17 @@ func (p *Producer) Flush() error {
 	timeout := p.flushTimeout()
 
 	p.closeMu.Lock()
-	if atomic.LoadInt32(&p.closed) == 1 {
+	if p.State() != ProducerStateOpen {
+		closeDone := p.closeDone
 		p.closeMu.Unlock()
-		return p.deliveryError()
+		if closeDone == nil {
+			return fmt.Errorf("flush: %w", ErrProducerClosed)
+		}
+		<-closeDone
+		p.closeMu.Lock()
+		err := p.closeErr
+		p.closeMu.Unlock()
+		return err
 	}
 	waiters := p.requestDrain(false)
 	p.closeMu.Unlock()
@@ -840,7 +848,7 @@ func (p *Producer) Close() (result error) {
 	if p.closeDone == nil {
 		p.closeDone = make(chan struct{})
 	}
-	if atomic.LoadInt32(&p.closed) == 1 {
+	if p.State() != ProducerStateOpen {
 		closeDone := p.closeDone
 		p.closeMu.Unlock()
 		<-closeDone
@@ -848,12 +856,13 @@ func (p *Producer) Close() (result error) {
 		defer p.closeMu.Unlock()
 		return p.closeErr
 	}
-	atomic.StoreInt32(&p.closed, 1)
+	p.state.Store(uint32(ProducerStateClosing))
 	waiters := p.requestDrain(true)
 	p.closeMu.Unlock()
 	defer func() {
 		p.closeMu.Lock()
 		p.closeErr = result
+		p.state.Store(uint32(ProducerStateClosed))
 		close(p.closeDone)
 		p.closeMu.Unlock()
 	}()
