@@ -284,21 +284,21 @@ func TestProducerFinalFailureDoesNotReconnect(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
 			require.NoError(t, err)
-			defer listener.Close()
+			defer func() { _ = listener.Close() }()
 			cfg := NewDefaultPublisherConfig()
 			cfg.BrokerAddrs = []string{listener.Addr().String()}
 			cfg.MaxRetries = 0
 			cfg.AckTimeoutMS = 50
 			cfg.HandshakeTimeoutMS = 1000
 			client := mustNewProducerClient(cfg)
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 			server, conn := net.Pipe()
-			defer server.Close()
+			defer func() { _ = server.Close() }()
 			client.conns.Store(&[]net.Conn{conn})
 			p := &Producer{config: cfg, client: client, done: make(chan struct{})}
 			go func() {
 				if failure == "write" {
-					server.Close()
+					_ = server.Close()
 					return
 				}
 				if _, err := ReadWithLength(server); err != nil {
@@ -307,7 +307,7 @@ func TestProducerFinalFailureDoesNotReconnect(t *testing.T) {
 				if failure == "parse" {
 					_ = WriteWithLength(server, []byte("invalid ack"))
 				}
-				server.Close()
+				_ = server.Close()
 			}()
 			started := time.Now()
 			_, err = p.sendWithRetryForBatch([]byte("batch"), 0, Message{}, Message{})
@@ -317,7 +317,7 @@ func TestProducerFinalFailureDoesNotReconnect(t *testing.T) {
 			require.NoError(t, listener.(*net.TCPListener).SetDeadline(time.Now().Add(20*time.Millisecond)))
 			unexpected, acceptErr := listener.Accept()
 			if unexpected != nil {
-				unexpected.Close()
+				_ = unexpected.Close()
 			}
 			require.Error(t, acceptErr, "terminal failure must not open a replacement connection")
 		})
