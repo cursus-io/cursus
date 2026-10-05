@@ -2,9 +2,12 @@ package sdk
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -164,6 +167,99 @@ func TestProducerFlushAndCloseReportPermanentDeliveryFailure(t *testing.T) {
 	require.ErrorContains(t, p.Close(), "NOT_AUTHORIZED_FOR_TOPIC")
 	require.Zero(t, p.GetUniqueAckCount())
 	require.NoError(t, (<-result).err)
+}
+
+func TestProducerRetryBudgetBoundsLogicalBatchDelivery(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	var requests atomic.Int32
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			framed, request, _, requestErr := acceptWireTestRequest(conn)
+			if requestErr == nil {
+				requests.Add(1)
+				requestErr = writeWireTestResponse(
+					framed,
+					request,
+					"ERROR: insufficient_in_sync_replicas current=1 required=2",
+				)
+			}
+			_ = conn.Close()
+			if requestErr != nil {
+				return
+			}
+		}
+	}()
+
+	cfg := NewDefaultPublisherConfig()
+	cfg.BrokerAddrs = []string{listener.Addr().String()}
+	cfg.Topic = "producer-retry-budget"
+	cfg.Partitions = 1
+	cfg.BatchSize = 1
+	cfg.BufferSize = 4
+	cfg.LingerMS = 0
+	cfg.MaxRetries = 0
+	cfg.RetryBackoffMS = 2_000
+	cfg.MaxBackoffMS = 2_000
+	cfg.AckTimeoutMS = 250
+	cfg.WriteTimeoutMS = 250
+	cfg.FlushTimeoutMS = 500
+
+	client := mustNewProducerClient(cfg)
+	require.NoError(t, client.ConnectPartition(0, listener.Addr().String()))
+
+	p := &Producer{
+		config:               cfg,
+		client:               client,
+		partitions:           1,
+		buffers:              []*partitionBuffer{newPartitionBuffer()},
+		inFlight:             make([]int32, 1),
+		partitionSentMus:     make([]sync.Mutex, 1),
+		partitionSentSeqs:    []map[uint64]struct{}{{}},
+		partitionBatchStates: []map[string]*BatchState{{}},
+		partitionBatchMus:    make([]sync.Mutex, 1),
+		gcTicker:             time.NewTicker(time.Hour),
+		partitionLeaders:     map[int]string{0: listener.Addr().String()},
+		done:                 make(chan struct{}),
+		closeDone:            make(chan struct{}),
+		bmTotalTime:          make(map[int]time.Duration),
+		bmTotalCount:         make(map[int]int),
+		bmLatencies:          make([]time.Duration, 0),
+	}
+	p.sendersWG.Add(1)
+	go p.partitionSender(0)
+
+	_, err = p.Send("one-logical-record")
+	require.NoError(t, err)
+
+	flushErr := p.Flush()
+	require.ErrorContains(t, flushErr, "insufficient_in_sync_replicas")
+	require.NotContains(t, flushErr.Error(), "producer flush timeout")
+	require.Equal(t, int32(cfg.MaxRetries+1), requests.Load())
+	var brokerErr *BrokerError
+	require.True(t, errors.As(flushErr, &brokerErr))
+	require.Equal(t, "insufficient_in_sync_replicas", brokerErr.Code)
+	require.Equal(t, ErrorClassAvailability, brokerErr.Class)
+	require.True(t, brokerErr.Retryable)
+
+	closeErr := p.Close()
+	require.ErrorContains(t, closeErr, "insufficient_in_sync_replicas")
+	require.NotContains(t, closeErr.Error(), "producer close: drain timeout")
+
+	_ = listener.Close()
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("test broker did not stop")
+	}
 }
 
 func TestProducerReconnectFailureRemovesOldConnection(t *testing.T) {
