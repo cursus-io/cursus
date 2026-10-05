@@ -1,12 +1,15 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/metrics"
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/wire"
 )
@@ -24,20 +27,29 @@ type serverWireConn struct {
 	net.Conn
 	connection *wire.Connection
 
-	mu      sync.Mutex
-	request wire.Frame
+	mu              sync.Mutex
+	request         wire.Frame
+	requestDeadline time.Time
+	writeTimeout    time.Duration
 }
 
-func newServerWireConn(conn net.Conn, connection *wire.Connection) *serverWireConn {
-	return &serverWireConn{Conn: conn, connection: connection}
+func newServerWireConn(conn net.Conn, connection *wire.Connection, writeTimeout time.Duration) *serverWireConn {
+	if writeTimeout <= 0 {
+		writeTimeout = 30 * time.Second
+	}
+	return &serverWireConn{Conn: conn, connection: connection, writeTimeout: writeTimeout}
 }
 
-func (c *serverWireConn) setRequest(request wire.Frame) {
+func (c *serverWireConn) setRequest(request wire.Frame, requestCtx context.Context) {
 	// Responses need only correlation metadata. Retaining the payload here would
 	// keep a completed request alive after its admission reservation is released.
 	request.Payload = nil
 	c.mu.Lock()
 	c.request = request
+	c.requestDeadline = time.Time{}
+	if requestCtx != nil {
+		c.requestDeadline, _ = requestCtx.Deadline()
+	}
 	c.mu.Unlock()
 }
 
@@ -79,9 +91,35 @@ func (c *serverWireConn) writeMessage(payload []byte) error {
 			status = wire.StatusStreamEnd
 		}
 	}
-	return c.connection.WriteFrame(wire.Frame{
+	now := time.Now()
+	deadline := c.requestDeadline
+	if c.request.Command == wire.CommandStream || deadline.IsZero() || !deadline.After(now) {
+		deadline = now.Add(c.writeTimeout)
+	}
+	if err := c.Conn.SetWriteDeadline(deadline); err != nil {
+		return c.failWrite("set response write deadline", err)
+	}
+	err := c.connection.WriteFrame(wire.Frame{
 		Kind: kind, Command: c.request.Command, Status: status, RequestID: c.request.RequestID, Payload: payload,
 	})
+	if err != nil {
+		return c.failWrite("write response frame", err)
+	}
+	if err := c.Conn.SetWriteDeadline(time.Time{}); err != nil {
+		return c.failWrite("clear response write deadline", err)
+	}
+	return nil
+}
+
+func (c *serverWireConn) failWrite(operation string, err error) error {
+	reason := "error"
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		reason = "timeout"
+	}
+	metrics.ClientResponseWriteFailures.WithLabelValues(reason).Inc()
+	_ = c.Conn.Close()
+	return fmt.Errorf("%s: %w", operation, err)
 }
 
 func joinErrorDetails(details []string) string {
@@ -102,12 +140,12 @@ func isStreamClosePayload(payload []byte) bool {
 	return false
 }
 
-func negotiateServerConnection(conn net.Conn) (*wire.Connection, *serverWireConn, error) {
+func negotiateServerConnection(conn net.Conn, writeTimeout time.Duration) (*wire.Connection, *serverWireConn, error) {
 	connection, err := wire.ServerHandshake(conn, brokerCompressions)
 	if err != nil {
 		return nil, nil, err
 	}
-	return connection, newServerWireConn(conn, connection), nil
+	return connection, newServerWireConn(conn, connection, writeTimeout), nil
 }
 
 func readWireRequestWithAdmission(connection *wire.Connection, admit func(int, int) error) (wire.Frame, error) {

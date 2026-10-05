@@ -877,7 +877,7 @@ func (p *Partition) readCommittedMetadata(offset uint64, max int) ([]types.Messa
 	}
 	p.txnMarkerMu.RLock()
 	defer p.txnMarkerMu.RUnlock()
-	messages, _, err := p.readCommittedScanRangeBounded(offset, hwm, hwm, max, 0, true, p.txnMarkers, p.txnResolver)
+	messages, _, _, err := p.readCommittedScanRangeBounded(offset, hwm, hwm, max, 0, true, p.txnMarkers, p.txnResolver)
 	return messages, err
 }
 

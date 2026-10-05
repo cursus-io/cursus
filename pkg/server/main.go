@@ -515,11 +515,12 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 	defer stopContextClose()
 	cmdCtx.SetRequestContext(clientCtx)
 	idleTimeout := clientIdleTimeout(cmdHandler.Config)
+	requestTimeout := clientRequestTimeout(cmdHandler.Config)
 	lastActivity := time.Now()
-	if err := conn.SetDeadline(lastActivity.Add(idleTimeout)); err != nil {
+	if err := conn.SetDeadline(lastActivity.Add(min(idleTimeout, requestTimeout))); err != nil {
 		return
 	}
-	wireConnection, responseConn, err := negotiateServerConnection(conn)
+	wireConnection, responseConn, err := negotiateServerConnection(conn, requestTimeout)
 	if err != nil {
 		return
 	}
@@ -561,8 +562,8 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 		if request.frame.Command == wire.CommandStream {
 			_ = conn.SetReadDeadline(time.Time{})
 		}
-		responseConn.setRequest(request.frame)
-		requestCtx, cancelRequest := context.WithTimeout(clientCtx, clientRequestTimeout(cmdHandler.Config))
+		requestCtx, cancelRequest := context.WithTimeout(clientCtx, requestTimeout)
+		responseConn.setRequest(request.frame, requestCtx)
 		cmdCtx.SetRequestContext(requestCtx)
 		shouldExit, err := processMessage(request.frame.Payload, cmdHandler, cmdCtx, responseConn)
 		cmdCtx.SetRequestContext(clientCtx)

@@ -49,6 +49,11 @@ var (
 		Help: "Client TCP connections currently handled by the broker",
 	})
 
+	ClientResponseWriteFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "cursus_broker_client_response_write_failures_total",
+		Help: "Broker client response write failures by bounded reason",
+	}, []string{"reason"})
+
 	CommandsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "cursus_broker_commands_total",
 		Help: "Broker text commands completed by command and result",
