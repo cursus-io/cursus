@@ -99,6 +99,16 @@ type Partition struct {
 func (p *Partition) SetTransactionDecisionResolver(resolver TransactionDecisionResolver) {
 	p.txnMarkerMu.Lock()
 	p.txnResolver = resolver
+	for key, marker := range p.txnMarkers {
+		if !marker.hasOpenOffset || marker.offset <= marker.openOffset {
+			continue
+		}
+		if transactionDecisionMatchesMarker(key, marker, resolver) {
+			delete(p.txnOpenOffsets, key)
+		} else {
+			p.txnOpenOffsets[key] = marker.openOffset
+		}
+	}
 	p.txnMarkerMu.Unlock()
 }
 
@@ -454,29 +464,82 @@ func (p *Partition) EnqueueBatchSyncWithMode(msgs []types.Message, forceIdempote
 	if p.closed {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
+	if p.id > math.MaxInt32 {
+		return fmt.Errorf("partition ID %d exceeds int32 range", p.id)
+	}
 
+	durable, supportsDurableBatch := p.dh.(types.DurableBatchStorage)
+	if !supportsDurableBatch {
+		// Preserve compatibility for lightweight alternate storage. Production
+		// DiskHandler always takes the single-sync batch path below.
+		for i := range msgs {
+			duplicate, err := p.validateProducerMessageWithStage(&msgs[i], nil, forceIdempotent)
+			if err != nil {
+				return err
+			}
+			if duplicate {
+				continue
+			}
+			offset, err := p.dh.AppendMessageSync(p.topic, p.id, &msgs[i])
+			if err != nil {
+				p.NotifyNewMessage()
+				return fmt.Errorf("disk write failed for partition %d: %w", p.id, err)
+			}
+			p.updateProducerStateWithMode(&msgs[i], forceIdempotent, offset)
+			msgs[i].Offset = offset
+			p.indexTransactionMessage(msgs[i])
+			p.LEO.Store(offset + 1)
+			p.setHWMLocked(offset + 1)
+		}
+		p.NotifyNewMessage()
+		return nil
+	}
+
+	partitionID := int32(p.id) // #nosec G115 -- validated above.
+	nextOffset := p.LEO.Load()
+	pending := make([]int, 0, len(msgs))
+	diskBatch := make([]types.DiskMessage, 0, len(msgs))
+	staged := make(map[string]stagedProducerEntry)
+	effectiveIdempotent := forceIdempotent || batchHasTransactionalMessages(msgs)
 	for i := range msgs {
-		duplicate, err := p.validateProducerMessageWithStage(&msgs[i], nil, forceIdempotent)
+		duplicate, err := p.validateProducerMessageWithStage(&msgs[i], staged, effectiveIdempotent)
 		if err != nil {
 			return err
 		}
 		if duplicate {
-			util.Debug("Partition %d: skipping duplicate message from producer %s (epoch %d seq %d) in batch sync", p.id, msgs[i].ProducerID, msgs[i].Epoch, msgs[i].SeqNum)
 			continue
 		}
-
-		offset, err := p.dh.AppendMessageSync(p.topic, p.id, &msgs[i])
-		if err != nil {
-			p.NotifyNewMessage()
-			return fmt.Errorf("disk write failed for partition %d: %w", p.id, err)
+		if effectiveIdempotent && msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
+			staged[msgs[i].ProducerID] = stagedProducerEntry{lastEpoch: msgs[i].Epoch, lastSeq: msgs[i].SeqNum}
 		}
-
-		p.updateProducerStateWithMode(&msgs[i], forceIdempotent, offset)
-		msgs[i].Offset = offset
-		p.indexTransactionMessage(msgs[i])
-		p.LEO.Store(offset + 1)
-		p.setHWMLocked(offset + 1)
+		stagedMessage := msgs[i]
+		stagedMessage.Offset = nextOffset
+		diskMessage := diskMessageFromMessage(p.topic, partitionID, stagedMessage)
+		serialized, err := util.SerializeDiskMessage(diskMessage)
+		if err != nil {
+			return fmt.Errorf("serialize message at index %d: %w", i, err)
+		}
+		if len(serialized) > disk.MaxMessageSize {
+			return fmt.Errorf("message at index %d exceeds maximum size: %d > %d", i, len(serialized), disk.MaxMessageSize)
+		}
+		pending = append(pending, i)
+		diskBatch = append(diskBatch, diskMessage)
+		nextOffset++
 	}
+	if len(diskBatch) == 0 {
+		return nil
+	}
+	if err := durable.WriteBatchSync(diskBatch); err != nil {
+		return fmt.Errorf("durable standalone batch write failed: %w", err)
+	}
+	for batchIndex, messageIndex := range pending {
+		offset := diskBatch[batchIndex].Offset
+		msgs[messageIndex].Offset = offset
+		p.updateProducerStateWithMode(&msgs[messageIndex], effectiveIdempotent, offset)
+		p.indexTransactionMessage(msgs[messageIndex])
+	}
+	p.LEO.Store(nextOffset)
+	p.setHWMLocked(nextOffset)
 	p.NotifyNewMessage()
 	return nil
 }
@@ -878,8 +941,8 @@ func (p *Partition) LastStableOffset() uint64 {
 		hwm = flushed
 	}
 	p.pruneTransactionIndex(p.dh.GetFirstOffset())
-	p.txnMarkerMu.RLock()
-	defer p.txnMarkerMu.RUnlock()
+	p.txnMarkerMu.Lock()
+	defer p.txnMarkerMu.Unlock()
 	return firstUnresolvedOpenOffset(hwm, p.txnRetentionFloor, p.txnOpenOffsets, p.txnMarkers, p.txnResolver)
 }
 func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, error) {
@@ -1007,8 +1070,8 @@ func (p *Partition) readVisibleCommittedBounded(offset uint64, max, maxBytes int
 		return nil, 0, offset, nil
 	}
 
-	p.txnMarkerMu.RLock()
-	defer p.txnMarkerMu.RUnlock()
+	p.txnMarkerMu.Lock()
+	defer p.txnMarkerMu.Unlock()
 	resolver := p.txnResolver
 	lso := firstUnresolvedOpenOffset(hwm, p.txnRetentionFloor, p.txnOpenOffsets, p.txnMarkers, resolver)
 	scanLimit := min(readEnd, hwm)
@@ -1102,11 +1165,28 @@ func (p *Partition) indexTransactionMessage(msg types.Message) {
 	}
 	if msg.TransactionMarker != types.TransactionMarkerNone {
 		if existing, ok := p.txnMarkers[key]; !ok || msg.Offset >= existing.offset {
-			p.txnMarkers[key] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset, coordinatorEpoch: msg.ControlBatchCoordinatorEpoch}
+			marker := transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset, coordinatorEpoch: msg.ControlBatchCoordinatorEpoch}
+			if openOffset, open := p.txnOpenOffsets[key]; open && msg.Offset > openOffset {
+				marker.openOffset = openOffset
+				marker.hasOpenOffset = true
+				if transactionDecisionMatchesMarker(key, marker, p.txnResolver) {
+					delete(p.txnOpenOffsets, key)
+				}
+			}
+			p.txnMarkers[key] = marker
 		}
 		return
 	}
 	if msg.TransactionState == types.TransactionStateOpen {
+		if marker, ok := p.txnMarkers[key]; ok && marker.offset > msg.Offset {
+			marker.openOffset = msg.Offset
+			marker.hasOpenOffset = true
+			p.txnMarkers[key] = marker
+			if transactionDecisionMatchesMarker(key, marker, p.txnResolver) {
+				delete(p.txnOpenOffsets, key)
+				return
+			}
+		}
 		if existing, ok := p.txnOpenOffsets[key]; !ok || msg.Offset < existing {
 			p.txnOpenOffsets[key] = msg.Offset
 		}
@@ -1162,15 +1242,33 @@ func (p *Partition) rebuildTransactionMarkerIndex() error {
 			if msg.TransactionalID != "" && msg.TransactionMarker != types.TransactionMarkerNone {
 				key := messageTransactionMarkerKey(msg)
 				if existing, ok := markers[key]; !ok || msg.Offset >= existing.offset {
-					markers[key] = transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset, coordinatorEpoch: msg.ControlBatchCoordinatorEpoch}
+					marker := transactionMarkerInfo{marker: msg.TransactionMarker, offset: msg.Offset, coordinatorEpoch: msg.ControlBatchCoordinatorEpoch}
+					if openOffset, open := openOffsets[key]; open && msg.Offset > openOffset {
+						marker.openOffset = openOffset
+						marker.hasOpenOffset = true
+						if transactionDecisionMatchesMarker(key, marker, p.txnResolver) {
+							delete(openOffsets, key)
+						}
+					}
+					markers[key] = marker
 				}
 			}
 			if msg.TransactionalID != "" && msg.TransactionMarker == types.TransactionMarkerNone && msg.TransactionState == types.TransactionStateOpen {
 				key := messageTransactionMarkerKey(msg)
+				if marker, ok := markers[key]; ok && marker.offset > msg.Offset {
+					marker.openOffset = msg.Offset
+					marker.hasOpenOffset = true
+					markers[key] = marker
+					if transactionDecisionMatchesMarker(key, marker, p.txnResolver) {
+						delete(openOffsets, key)
+						goto transactionIndexed
+					}
+				}
 				if existing, ok := openOffsets[key]; !ok || msg.Offset < existing {
 					openOffsets[key] = msg.Offset
 				}
 			}
+		transactionIndexed:
 			next := msg.Offset + 1
 			if next <= offset {
 				return fmt.Errorf("transaction recovery did not advance from offset %d", offset)
@@ -1195,6 +1293,8 @@ type transactionMarkerInfo struct {
 	marker           string
 	offset           uint64
 	coordinatorEpoch int64
+	openOffset       uint64
+	hasOpenOffset    bool
 }
 
 func messageTransactionMarkerKey(msg types.Message) transactionMarkerKey {
@@ -1209,6 +1309,7 @@ func firstUnresolvedOpenOffset(hwm, retentionFloor uint64, openOffsets map[trans
 		}
 		marker, ok := markers[key]
 		if ok && marker.offset < hwm && marker.offset > offset && transactionDecisionMatchesMarker(key, marker, resolver) {
+			delete(openOffsets, key)
 			continue
 		}
 		if offset < retentionFloor {

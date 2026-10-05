@@ -29,6 +29,37 @@ type Codec struct {
 	compression Compression
 }
 
+// FrameReadError reports whether a failed read consumed bytes belonging to the
+// current frame. A caller must close the stream after a partial read because a
+// fresh decoder cannot safely reinterpret the remaining suffix as a header.
+type FrameReadError struct {
+	Stage    string
+	Consumed int
+	Expected int
+	Err      error
+}
+
+func (e *FrameReadError) Error() string {
+	return fmt.Sprintf("read Wire v2 %s: consumed=%d expected=%d: %v", e.Stage, e.Consumed, e.Expected, e.Err)
+}
+
+func (e *FrameReadError) Unwrap() error { return e.Err }
+
+func (e *FrameReadError) Timeout() bool {
+	var netErr interface{ Timeout() bool }
+	return errors.As(e.Err, &netErr) && netErr.Timeout()
+}
+
+func (e *FrameReadError) Temporary() bool {
+	var netErr interface{ Temporary() bool }
+	return errors.As(e.Err, &netErr) && netErr.Temporary()
+}
+
+func IsPartialFrameRead(err error) bool {
+	var readErr *FrameReadError
+	return errors.As(err, &readErr) && readErr.Consumed > 0
+}
+
 func NewCodec(compression Compression) (*Codec, error) {
 	if !compression.valid() {
 		return nil, fmt.Errorf("%w: unsupported compression %d", ErrCompressionMismatch, compression)
@@ -139,8 +170,12 @@ func (c *Codec) ReadFrameWithAdmission(reader io.Reader, admit func(int, int) er
 		return Frame{}, fmt.Errorf("%w: nil codec", ErrInvalidFrame)
 	}
 	headerBytes := make([]byte, HeaderSize)
-	if _, err := io.ReadFull(reader, headerBytes); err != nil {
-		return Frame{}, fmt.Errorf("read Wire v2 header: %w", err)
+	if read, err := io.ReadFull(reader, headerBytes); err != nil {
+		readErr := &FrameReadError{Stage: "header", Consumed: read, Expected: HeaderSize, Err: err}
+		if read > 0 {
+			recordProtocolFailure(readErr)
+		}
+		return Frame{}, readErr
 	}
 	header, err := c.decodeHeader(headerBytes)
 	if err != nil {
@@ -153,8 +188,10 @@ func (c *Codec) ReadFrameWithAdmission(reader io.Reader, admit func(int, int) er
 		}
 	}
 	payload := make([]byte, header.encodedSize)
-	if _, err := io.ReadFull(reader, payload); err != nil {
-		return Frame{}, fmt.Errorf("read Wire v2 payload: %w", err)
+	if read, err := io.ReadFull(reader, payload); err != nil {
+		readErr := &FrameReadError{Stage: "payload", Consumed: HeaderSize + read, Expected: HeaderSize + len(payload), Err: err}
+		recordProtocolFailure(readErr)
+		return Frame{}, readErr
 	}
 	frame, err := c.decodePayload(header, payload)
 	if err != nil {
