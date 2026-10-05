@@ -199,6 +199,12 @@ jobs:
         run: |
           go test -v -timeout 20m ./test/e2e-cluster/... -run '^TestConsumerLifecycleMetricsAcrossThreeBrokerCluster$' -count=1
 
+      - name: Run durable group coordinator failover E2E
+        env:
+          RUN_E2E_GROUP_COORDINATOR_FAILOVER: "1"
+        run: |
+          go test -v -timeout 20m ./test/e2e-cluster/... -run '^TestGroupCoordinatorFailoverUsesDurableMembership$' -count=1
+
       - name: Show cluster logs on failure
         if: failure()
         working-directory: test/e2e-cluster

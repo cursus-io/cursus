@@ -48,6 +48,13 @@ func TestGroupCoordinatorFailoverUsesDurableMembership(t *testing.T) {
 	if _, err := client.SyncGroup(topic, group, generation, member); err != nil {
 		t.Fatalf("sync group: %v", err)
 	}
+	const preFailureOffset uint64 = 50
+	if err := client.CommitOffset(topic, 0, group, preFailureOffset); err != nil {
+		t.Fatalf("commit offset before coordinator failure: %v", err)
+	}
+	if offset, err := client.FetchCommittedOffset(topic, 0, group); err != nil || offset != preFailureOffset {
+		t.Fatalf("offset before coordinator failure=%d err=%v, want %d", offset, err, preFailureOffset)
+	}
 
 	oldID := findGroupCoordinator(t, 1, group)
 	oldNode := coordinatorNode(t, oldID)
@@ -80,6 +87,10 @@ func TestGroupCoordinatorFailoverUsesDurableMembership(t *testing.T) {
 
 	commitClient := e2e.NewBrokerClient(clusterBrokerAddrsForNodes(survivors))
 	commitClient.SetMemberID(member)
+	if offset, err := commitClient.FetchCommittedOffset(topic, 0, group); err != nil || offset != preFailureOffset {
+		commitClient.Close()
+		t.Fatalf("durable offset after coordinator failover=%d err=%v, want %d", offset, err, preFailureOffset)
+	}
 	if _, err := commitClient.SyncGroup(topic, group, generation, member); err != nil {
 		// Membership fencing is an allowed fail-closed outcome. Rejoin before
 		// committing rather than treating the prior generation as successful.
@@ -93,21 +104,27 @@ func TestGroupCoordinatorFailoverUsesDurableMembership(t *testing.T) {
 			t.Fatalf("sync after coordinator fence: %v", err)
 		}
 	}
-	commitResp, err := commitClient.SendCommand("", fmt.Sprintf("COMMIT_OFFSET topic=%s partition=0 group=%s offset=1 generation=%d member=%s", topic, group, generation, member), 15*time.Second)
+	const postFailureOffset uint64 = 51
+	commitResp, err := commitClient.SendCommand("", fmt.Sprintf("COMMIT_OFFSET topic=%s partition=0 group=%s offset=%d generation=%d member=%s", topic, group, postFailureOffset, generation, member), 15*time.Second)
 	if err != nil || strings.HasPrefix(commitResp, "ERROR:") {
 		commitClient.Close()
 		t.Fatalf("commit through recovered coordinator: response=%q err=%v", commitResp, err)
 	}
 	offset, err := commitClient.FetchCommittedOffset(topic, 0, group)
 	commitClient.Close()
-	if err != nil || offset != 1 {
-		t.Fatalf("durable recovered offset=%d err=%v, want 1", offset, err)
+	if err != nil || offset != postFailureOffset {
+		t.Fatalf("durable recovered offset=%d err=%v, want %d", offset, err, postFailureOffset)
 	}
 
 	// Recovery registers a new broker incarnation and reintroduces it only
 	// after the leader commits active membership.
 	startComposeBroker(t, oldNode)
 	waitForAllBrokerReadiness(t, []int{1, 2, 3})
+	verificationClient := e2e.NewBrokerClient(clusterBrokerAddrs(3))
+	defer verificationClient.Close()
+	if offset, err := verificationClient.FetchCommittedOffset(topic, 0, group); err != nil || offset != postFailureOffset {
+		t.Fatalf("offset after failed coordinator recovery=%d err=%v, want %d", offset, err, postFailureOffset)
+	}
 }
 
 func waitForGroupRegistration(topic, group string) error {
