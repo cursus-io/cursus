@@ -605,6 +605,25 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 		}
 		fromVersion = v
 	}
+	paginated := args["max_events"] != "" || args["max_bytes"] != ""
+	maxEvents := 256
+	if raw := args["max_events"]; raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > 4096 {
+			writeError(conn, "invalid_max_events")
+			return
+		}
+		maxEvents = value
+	}
+	maxBytes := 8 << 20
+	if raw := args["max_bytes"]; raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1024 || value > 32<<20 {
+			writeError(conn, "invalid_max_bytes")
+			return
+		}
+		maxBytes = value
+	}
 
 	t := h.tm.GetTopic(topicName)
 	if t == nil {
@@ -648,7 +667,14 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 		actualFromVersion = snap.Version + 1
 	}
 
-	entries, err := idx.Lookup(key, actualFromVersion)
+	currentVersion := idx.GetVersion(key)
+	var entries []StreamIndexEntry
+	if paginated {
+		entries, err = idx.LookupRange(key, actualFromVersion, currentVersion, maxEvents+1)
+	} else {
+		entries, err = idx.Lookup(key, actualFromVersion)
+		maxBytes = util.MaxMessageSize
+	}
 	if err != nil {
 		writeError(conn, fmt.Sprintf("index_lookup_failed reason=%q", err.Error()))
 		return
@@ -660,33 +686,70 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 		return
 	}
 
-	// Collect messages from the partition for each index entry.
-	var msgs []types.Message
+	moreByCount := paginated && len(entries) > maxEvents
+	if moreByCount {
+		entries = entries[:maxEvents]
+	}
+
+	// Collect one bounded page before sending its success envelope.
+	msgs := make([]types.Message, 0, len(entries))
+	usedBytes := 0
+	moreByBytes := false
 	for _, entry := range entries {
 		batch, err := p.ReadCommitted(entry.Offset, 1)
 		if err != nil {
 			writeError(conn, fmt.Sprintf("partition_read_failed offset=%d reason=%q", entry.Offset, err.Error()))
 			return
 		}
-		if len(batch) > 0 && batch[0].Key == key {
-			msgs = append(msgs, batch[0])
+		if len(batch) == 0 || batch[0].Key != key || batch[0].AggregateVersion != entry.AggregateVersion {
+			writeError(conn, fmt.Sprintf("stream_index_record_mismatch offset=%d", entry.Offset))
+			return
 		}
+		size := estimateEventMessageBytes(batch[0])
+		if usedBytes+size > maxBytes {
+			if !paginated {
+				writeError(conn, fmt.Sprintf("stream_requires_pagination bytes>%d", maxBytes))
+				return
+			}
+			if len(msgs) == 0 {
+				writeError(conn, fmt.Sprintf("event_exceeds_page_budget version=%d bytes=%d maximum=%d", entry.AggregateVersion, size, maxBytes))
+				return
+			}
+			moreByBytes = true
+			break
+		}
+		msgs = append(msgs, batch[0])
+		usedBytes += size
+	}
+	batchData, err := util.EncodeBatchMessages(topicName, partitionID, "1", false, msgs)
+	if err != nil {
+		writeError(conn, fmt.Sprintf("encode_stream_page_failed reason=%q", err.Error()))
+		return
+	}
+	hasMore := moreByCount || moreByBytes
+	nextVersion := uint64(0)
+	if hasMore && len(msgs) > 0 {
+		nextVersion = msgs[len(msgs)-1].AggregateVersion + 1
 	}
 
 	// Build JSON envelope.
 	envelope := struct {
-		Status    string        `json:"status"`
-		Topic     string        `json:"topic"`
-		Key       string        `json:"key"`
-		Partition int           `json:"partition"`
-		Count     int           `json:"count"`
-		Snapshot  *SnapshotData `json:"snapshot,omitempty"`
+		Status      string        `json:"status"`
+		Topic       string        `json:"topic"`
+		Key         string        `json:"key"`
+		Partition   int           `json:"partition"`
+		Count       int           `json:"count"`
+		Snapshot    *SnapshotData `json:"snapshot,omitempty"`
+		HasMore     bool          `json:"has_more"`
+		NextVersion uint64        `json:"next_version,omitempty"`
 	}{
-		Status:    "OK",
-		Topic:     topicName,
-		Key:       key,
-		Partition: partitionID,
-		Count:     len(msgs),
+		Status:      "OK",
+		Topic:       topicName,
+		Key:         key,
+		Partition:   partitionID,
+		Count:       len(msgs),
+		HasMore:     hasMore,
+		NextVersion: nextVersion,
 	}
 	if snap != nil && snap.Version >= fromVersion {
 		envelope.Snapshot = snap
@@ -697,20 +760,25 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 		writeError(conn, fmt.Sprintf("marshal envelope: %v", err))
 		return
 	}
+	if len(envJSON) > util.MaxMessageSize {
+		writeError(conn, fmt.Sprintf("stream_envelope_too_large bytes=%d maximum=%d", len(envJSON), util.MaxMessageSize))
+		return
+	}
 
-	// Frame 1: JSON envelope.
+	// Frame 1: JSON envelope. The batch has already been encoded and bounded.
 	if err := util.WriteWithLength(conn, envJSON); err != nil {
 		return
 	}
 
 	// Frame 2: binary batch.
-	batchData, err := util.EncodeBatchMessages(topicName, partitionID, "1", false, msgs)
-	if err != nil {
-		// Envelope already sent; best effort write of empty batch.
-		_ = util.WriteWithLength(conn, []byte{})
-		return
-	}
 	_ = util.WriteWithLength(conn, batchData)
+}
+
+func estimateEventMessageBytes(message types.Message) int {
+	return 256 + len(message.Topic) + len(message.ProducerID) + len(message.Payload) + len(message.Key) +
+		len(message.EventType) + len(message.Metadata) + len(message.EventID) + len(message.PayloadDigest) +
+		len(message.TransactionalID) + len(message.TransactionState) + len(message.TransactionMarker) +
+		len(message.ControlBatchType) + len(message.ControlBatchKey) + len(message.ControlBatchValue)
 }
 
 // HandleSaveSnapshot processes:

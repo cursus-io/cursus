@@ -292,11 +292,6 @@ func (es *EventStore) ReadStreamFromContext(ctx context.Context, key string, fro
 	requestCtx, cancel := boundedRequestContext(ctx, es.requestTimeout)
 	defer cancel()
 
-	cmd := fmt.Sprintf("READ_STREAM topic=%s key=%s", es.topic, key)
-	if fromVersion > 0 {
-		cmd += fmt.Sprintf(" from_version=%d", fromVersion)
-	}
-
 	conn, err := es.getConn(requestCtx)
 	if err != nil {
 		return nil, err
@@ -308,67 +303,77 @@ func (es *EventStore) ReadStreamFromContext(ctx context.Context, key string, fro
 	}
 	defer cleanup()
 
-	data := []byte(cmd)
-	if err := WriteWithLength(conn, data); err != nil {
-		es.resetConn()
-		return nil, fmt.Errorf("write: %w", err)
-	}
-
-	// Frame 1: JSON envelope
-	envData, err := ReadWithLength(conn)
-	if err != nil {
-		es.resetConn()
-		return nil, fmt.Errorf("read envelope: %w", err)
-	}
-
-	var envelope struct {
-		Status   string    `json:"status"`
-		Error    string    `json:"error"`
-		Snapshot *Snapshot `json:"snapshot"`
-		Count    int       `json:"count"`
-	}
-	if err := json.Unmarshal(envData, &envelope); err != nil {
-		return nil, fmt.Errorf("unmarshal envelope: %w", err)
-	}
-	if envelope.Status == "ERROR" {
-		if envelope.Error == "" {
-			envelope.Error = "read stream failed"
+	result := &StreamData{}
+	nextFrom := fromVersion
+	for page := 0; page < 1_000_000; page++ {
+		cmd := fmt.Sprintf("READ_STREAM topic=%s key=%s max_events=256 max_bytes=%d", es.topic, key, 8<<20)
+		if nextFrom > 0 {
+			cmd += fmt.Sprintf(" from_version=%d", nextFrom)
 		}
-		return nil, fmt.Errorf("broker: %s", envelope.Error)
-	}
-	if envelope.Status != "OK" {
-		return nil, fmt.Errorf("unexpected read stream status: %s", envelope.Status)
-	}
+		if err := WriteWithLength(conn, []byte(cmd)); err != nil {
+			es.resetConn()
+			return nil, fmt.Errorf("write stream page: %w", err)
+		}
 
-	// Frame 2: Binary batch
-	batchData, err := ReadWithLength(conn)
-	if err != nil {
-		es.resetConn()
-		return nil, fmt.Errorf("read batch: %w", err)
-	}
+		envData, err := ReadWithLength(conn)
+		if err != nil {
+			es.resetConn()
+			return nil, fmt.Errorf("read envelope: %w", err)
+		}
+		if strings.HasPrefix(string(envData), "ERROR:") {
+			return nil, fmt.Errorf("broker: %s", strings.TrimSpace(string(envData)))
+		}
+		var envelope struct {
+			Status      string    `json:"status"`
+			Error       string    `json:"error"`
+			Snapshot    *Snapshot `json:"snapshot"`
+			Count       int       `json:"count"`
+			HasMore     bool      `json:"has_more"`
+			NextVersion uint64    `json:"next_version"`
+		}
+		if err := json.Unmarshal(envData, &envelope); err != nil {
+			return nil, fmt.Errorf("unmarshal envelope: %w", err)
+		}
+		if envelope.Status == "ERROR" {
+			if envelope.Error == "" {
+				envelope.Error = "read stream failed"
+			}
+			return nil, fmt.Errorf("broker: %s", envelope.Error)
+		}
+		if envelope.Status != "OK" {
+			return nil, fmt.Errorf("unexpected read stream status: %s", envelope.Status)
+		}
 
-	result := &StreamData{
-		Snapshot: envelope.Snapshot,
-	}
-
-	if len(batchData) > 0 {
+		batchData, err := ReadWithLength(conn)
+		if err != nil {
+			es.resetConn()
+			return nil, fmt.Errorf("read batch: %w", err)
+		}
 		msgs, _, _, err := DecodeBatchMessages(batchData)
 		if err != nil {
 			return nil, fmt.Errorf("decode batch: %w", err)
 		}
+		if len(msgs) != envelope.Count {
+			return nil, fmt.Errorf("stream page count mismatch: envelope=%d batch=%d", envelope.Count, len(msgs))
+		}
+		if result.Snapshot == nil && envelope.Snapshot != nil {
+			result.Snapshot = envelope.Snapshot
+		}
 		for _, m := range msgs {
 			result.Events = append(result.Events, StreamEvent{
-				Version:       m.AggregateVersion,
-				Offset:        m.Offset,
-				Type:          m.EventType,
-				SchemaVersion: m.SchemaVersion,
-				Payload:       m.Payload,
-				Metadata:      m.Metadata,
+				Version: m.AggregateVersion, Offset: m.Offset, Type: m.EventType,
+				SchemaVersion: m.SchemaVersion, Payload: m.Payload, Metadata: m.Metadata,
 			})
 		}
+		if !envelope.HasMore {
+			return result, nil
+		}
+		if envelope.NextVersion == 0 || envelope.NextVersion <= nextFrom || len(msgs) == 0 || envelope.NextVersion != msgs[len(msgs)-1].AggregateVersion+1 {
+			return nil, fmt.Errorf("stream page cursor did not advance: current=%d next=%d count=%d", nextFrom, envelope.NextVersion, len(msgs))
+		}
+		nextFrom = envelope.NextVersion
 	}
-
-	return result, nil
+	return nil, fmt.Errorf("stream page limit exceeded")
 }
 
 // SaveSnapshot saves a snapshot for an aggregate at the given version.
