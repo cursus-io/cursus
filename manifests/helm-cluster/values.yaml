@@ -50,6 +50,10 @@ limits:
   maxTopics: 10000
   maxPartitionsPerTopic: 1024
   maxPartitions: 100000
+  maxTransactions: 100000
+  maxTransactionRecords: 10000
+  maxTransactionBytes: 67108864
+  maxTransactionOffsets: 10000
 
 internalTLS:
   # The Secret must contain tls.crt, tls.key, and ca.crt. The certificate must

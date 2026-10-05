@@ -170,6 +170,14 @@ spec:
               value: {{ .Values.limits.maxPartitionsPerTopic | quote }}
             - name: MAX_PARTITIONS
               value: {{ .Values.limits.maxPartitions | quote }}
+            - name: MAX_TRANSACTIONS
+              value: {{ .Values.limits.maxTransactions | quote }}
+            - name: MAX_TRANSACTION_RECORDS
+              value: {{ .Values.limits.maxTransactionRecords | quote }}
+            - name: MAX_TRANSACTION_BYTES
+              value: {{ .Values.limits.maxTransactionBytes | quote }}
+            - name: MAX_TRANSACTION_OFFSETS
+              value: {{ .Values.limits.maxTransactionOffsets | quote }}
             - name: TRANSACTION_COORDINATOR_SHARDS
               value: "{{ .Values.cluster.transactionCoordinatorShards }}"
             - name: LOG_DIR

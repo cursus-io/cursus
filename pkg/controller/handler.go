@@ -83,6 +83,18 @@ func transactionCoordinatorShardCount(cfg *config.Config) int {
 	return cfg.TransactionCoordinatorShards
 }
 
+func transactionLimits(cfg *config.Config) transaction.Limits {
+	if cfg == nil {
+		return transaction.DefaultLimits()
+	}
+	return transaction.Limits{
+		MaxTransactions: cfg.MaxTransactions,
+		MaxRecords:      cfg.MaxTransactionRecords,
+		MaxBytes:        cfg.MaxTransactionBytes,
+		MaxOffsets:      cfg.MaxTransactionOffsets,
+	}
+}
+
 // commandEntry defines a single command routing rule.
 type commandEntry struct {
 	prefix      string
@@ -126,7 +138,7 @@ func NewCommandHandler(
 		groupRecoveryEpoch: make(map[uint64]int),
 		Cluster:            cc,
 		ESHandler:          eventsource.NewHandler(tm),
-		TxnManager:         transaction.NewManagerWithExpirationAndShards(transactionalIDExpiration(cfg), transactionCoordinatorShardCount(cfg)),
+		TxnManager:         transaction.NewManagerWithLimits(transactionalIDExpiration(cfg), transactionCoordinatorShardCount(cfg), transactionLimits(cfg)),
 	}
 	if tm != nil {
 		tm.SetTransactionDecisionResolver(ch.TxnManager)

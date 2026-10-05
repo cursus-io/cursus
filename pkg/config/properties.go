@@ -93,12 +93,16 @@ type Config struct {
 	MaxPartitions            int    `yaml:"max_partitions" json:"max.partitions"`
 
 	// idempotency
-	EnableIdempotence            bool `yaml:"enable_idempotence" json:"enable.idempotence"`
-	ProducerStateTTLMS           int  `yaml:"producer_state_ttl_ms" json:"producer.state.ttl.ms"`
-	TransactionalIDExpirationMS  int  `yaml:"transactional_id_expiration_ms" json:"transactional.id.expiration.ms"`
-	TransactionTimeoutMS         int  `yaml:"transaction_timeout_ms" json:"transaction.timeout.ms"`
-	TransactionCoordinatorShards int  `yaml:"transaction_coordinator_shards" json:"transaction.coordinator.shards"`
-	TransactionRecoveryBatchSize int  `yaml:"transaction_recovery_batch_size" json:"transaction.recovery.batch.size"`
+	EnableIdempotence            bool  `yaml:"enable_idempotence" json:"enable.idempotence"`
+	ProducerStateTTLMS           int   `yaml:"producer_state_ttl_ms" json:"producer.state.ttl.ms"`
+	TransactionalIDExpirationMS  int   `yaml:"transactional_id_expiration_ms" json:"transactional.id.expiration.ms"`
+	TransactionTimeoutMS         int   `yaml:"transaction_timeout_ms" json:"transaction.timeout.ms"`
+	TransactionCoordinatorShards int   `yaml:"transaction_coordinator_shards" json:"transaction.coordinator.shards"`
+	TransactionRecoveryBatchSize int   `yaml:"transaction_recovery_batch_size" json:"transaction.recovery.batch.size"`
+	MaxTransactions              int   `yaml:"max_transactions" json:"max.transactions"`
+	MaxTransactionRecords        int   `yaml:"max_transaction_records" json:"max.transaction.records"`
+	MaxTransactionBytes          int64 `yaml:"max_transaction_bytes" json:"max.transaction.bytes"`
+	MaxTransactionOffsets        int   `yaml:"max_transaction_offsets" json:"max.transaction.offsets"`
 
 	// consumer
 	ConsumerSessionTimeoutMS int                   `yaml:"consumer_session_timeout_ms" json:"consumer.session.timeout.ms"`
@@ -203,6 +207,10 @@ func DefaultConfig() *Config {
 			TransactionTimeoutMS:         60 * 1000,
 			TransactionCoordinatorShards: 50,
 			TransactionRecoveryBatchSize: 256,
+			MaxTransactions:              100000,
+			MaxTransactionRecords:        10000,
+			MaxTransactionBytes:          64 * 1024 * 1024,
+			MaxTransactionOffsets:        10000,
 
 			// consumer
 			ConsumerSessionTimeoutMS: 10000,
@@ -316,6 +324,10 @@ func LoadConfig() (*Config, error) {
 	flag.IntVar(&cfg.TransactionTimeoutMS, "transaction-timeout-ms", cfg.TransactionTimeoutMS, "Maximum open transaction duration in milliseconds")
 	flag.IntVar(&cfg.TransactionCoordinatorShards, "transaction-coordinator-shards", cfg.TransactionCoordinatorShards, "Logical transaction coordinator shard count (immutable after cluster creation)")
 	flag.IntVar(&cfg.TransactionRecoveryBatchSize, "transaction-recovery-batch-size", cfg.TransactionRecoveryBatchSize, "Maximum transaction recovery candidates processed per pass")
+	flag.IntVar(&cfg.MaxTransactions, "max-transactions", cfg.MaxTransactions, "Maximum retained transaction identities")
+	flag.IntVar(&cfg.MaxTransactionRecords, "max-transaction-records", cfg.MaxTransactionRecords, "Maximum staged records in one transaction")
+	flag.Int64Var(&cfg.MaxTransactionBytes, "max-transaction-bytes", cfg.MaxTransactionBytes, "Maximum staged dynamic payload bytes in one transaction")
+	flag.IntVar(&cfg.MaxTransactionOffsets, "max-transaction-offsets", cfg.MaxTransactionOffsets, "Maximum staged offsets in one transaction")
 
 	// consumer
 	flag.IntVar(&cfg.ConsumerSessionTimeoutMS, "consumer-session-timeout", cfg.ConsumerSessionTimeoutMS, "Session timeout")
@@ -467,6 +479,10 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.TransactionTimeoutMS, "TRANSACTION_TIMEOUT_MS")
 	overrideEnvInt(&cfg.TransactionCoordinatorShards, "TRANSACTION_COORDINATOR_SHARDS")
 	overrideEnvInt(&cfg.TransactionRecoveryBatchSize, "TRANSACTION_RECOVERY_BATCH_SIZE")
+	overrideEnvInt(&cfg.MaxTransactions, "MAX_TRANSACTIONS")
+	overrideEnvInt(&cfg.MaxTransactionRecords, "MAX_TRANSACTION_RECORDS")
+	overrideEnvInt64(&cfg.MaxTransactionBytes, "MAX_TRANSACTION_BYTES")
+	overrideEnvInt(&cfg.MaxTransactionOffsets, "MAX_TRANSACTION_OFFSETS")
 
 	overrideEnvInt(&cfg.ConsumerSessionTimeoutMS, "CONSUMER_SESSION_TIMEOUT")
 	overrideEnvInt(&cfg.ConsumerHeartbeatCheckMS, "CONSUMER_HEARTBEAT_CHECK")

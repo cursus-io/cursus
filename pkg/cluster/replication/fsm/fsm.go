@@ -94,6 +94,7 @@ type BrokerFSM struct {
 	cd                                         *coordinator.Coordinator
 	txn                                        *transaction.Manager
 	restoredTransactionState                   map[string]*transaction.Snapshot
+	transactionRestoreFailure                  string
 	restoredNextProducerEpoch                  uint64
 	transactionCoordinatorShards               map[int]TransactionCoordinatorShard
 	configuredTransactionCoordinatorShardCount int
@@ -206,9 +207,11 @@ func (f *BrokerFSM) SetTransactionManager(txn *transaction.Manager) {
 	f.txn = txn
 	if f.txn != nil && f.restoredTransactionState != nil {
 		if err := f.txn.ImportState(f.restoredTransactionState); err != nil {
+			f.transactionRestoreFailure = err.Error()
 			util.Error("FSM: Rejected deferred restored transactions: %v", err)
 			return
 		}
+		f.transactionRestoreFailure = ""
 		util.Info("FSM: Imported %d deferred restored transactions", len(f.restoredTransactionState))
 		f.restoredTransactionState = nil
 	}
@@ -218,6 +221,18 @@ func (f *BrokerFSM) SetTransactionManager(txn *transaction.Manager) {
 		_ = f.txn.RestoreProducerEpochWatermark(f.restoredNextProducerEpoch)
 		f.txn.ReconcileCoordinatorEpochs(f.transactionCoordinatorEpochsLocked(), f.effectiveTransactionCoordinatorShardCountLocked())
 	}
+}
+
+// TransactionRecoveryReadinessError keeps a broker out of service when a
+// replicated snapshot could not be installed into the bounded transaction
+// manager.
+func (f *BrokerFSM) TransactionRecoveryReadinessError() error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.transactionRestoreFailure != "" {
+		return fmt.Errorf("transaction state recovery failed: %s", f.transactionRestoreFailure)
+	}
+	return nil
 }
 
 func (f *BrokerFSM) Apply(log *raft.Log) interface{} {

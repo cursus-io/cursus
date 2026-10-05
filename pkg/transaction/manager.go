@@ -146,8 +146,10 @@ type Snapshot struct {
 
 type Manager struct {
 	nextProducerEpoch   atomic.Uint64
+	transactionCount    atomic.Int64
 	shards              []managerShard
 	expiration          time.Duration
+	limits              Limits
 	reservationMu       sync.Mutex
 	streamReservations  map[streamReservationKey]string
 	streamLocks         sync.Map // map[streamReservationKey]*sync.Mutex
@@ -235,17 +237,39 @@ func NewManagerWithExpiration(expiration time.Duration) *Manager {
 }
 
 func NewManagerWithExpirationAndShards(expiration time.Duration, shardCount int) *Manager {
+	return NewManagerWithLimits(expiration, shardCount, DefaultLimits())
+}
+
+func NewManagerWithLimits(expiration time.Duration, shardCount int, limits Limits) *Manager {
 	if expiration <= 0 {
 		expiration = 7 * 24 * time.Hour
 	}
 	if shardCount <= 0 {
 		shardCount = DefaultCoordinatorShardCount
 	}
-	m := &Manager{shards: make([]managerShard, shardCount), expiration: expiration, streamReservations: make(map[streamReservationKey]string), committedOffsets: make(map[committedOffsetKey]uint64)}
+	m := &Manager{shards: make([]managerShard, shardCount), expiration: expiration, limits: normalizeLimits(limits), streamReservations: make(map[streamReservationKey]string), committedOffsets: make(map[committedOffsetKey]uint64)}
 	for i := range m.shards {
 		m.shards[i] = newManagerShard(expiration)
 	}
 	return m
+}
+
+func (m *Manager) reserveTransactionSlot() error {
+	for {
+		current := m.transactionCount.Load()
+		if current >= int64(m.limits.MaxTransactions) {
+			return fmt.Errorf("transaction capacity exceeded: transactions=%d max_transactions=%d", current, m.limits.MaxTransactions)
+		}
+		if m.transactionCount.CompareAndSwap(current, current+1) {
+			return nil
+		}
+	}
+}
+
+func (m *Manager) releaseTransactionSlot() {
+	if m.transactionCount.Add(-1) < 0 {
+		m.transactionCount.Store(0)
+	}
 }
 
 func (m *Manager) PruneExpired(now time.Time) int {
@@ -261,6 +285,7 @@ func (m *Manager) PruneExpired(now time.Time) int {
 			tx := s.txns[id]
 			if tx == nil || tx.Expired {
 				s.remove(id)
+				m.releaseTransactionSlot()
 				removed++
 				continue
 			}
@@ -344,8 +369,16 @@ func (m *Manager) InitProducerWithMode(id string, mode Mode) (string, int64, err
 			return "", 0, err
 		}
 	}
+	if previous == nil {
+		if err := m.reserveTransactionSlot(); err != nil {
+			return "", 0, err
+		}
+	}
 	epoch, err := m.allocateProducerEpoch()
 	if err != nil {
+		if previous == nil {
+			m.releaseTransactionSlot()
+		}
 		return "", 0, err
 	}
 
@@ -477,6 +510,12 @@ func (m *Manager) AddParticipant(id, producer string, epoch int64, participant P
 			return nil
 		}
 	}
+	if len(tx.Participants) >= m.limits.MaxRecords {
+		return fmt.Errorf("transaction capacity exceeded: participants=%d max_transaction_records=%d", len(tx.Participants)+1, m.limits.MaxRecords)
+	}
+	if transactionDynamicBytes(tx.Messages, tx.Streams, tx.Offsets, append(tx.Participants, participant), tx.RequestAssignments) > m.limits.MaxBytes {
+		return fmt.Errorf("transaction capacity exceeded: max_transaction_bytes=%d", m.limits.MaxBytes)
+	}
 	tx.Participants = append(tx.Participants, participant)
 	if tx.Deadline.IsZero() && !deadline.IsZero() {
 		tx.Deadline = deadline
@@ -498,6 +537,12 @@ func (m *Manager) AddMessage(id, producer string, epoch int64, op MessageOperati
 	}
 	if err := validateOwner(tx, producer, epoch); err != nil {
 		return err
+	}
+	if transactionRecordCount(len(tx.Messages)+1, len(tx.Streams), len(tx.RequestAssignments)) > m.limits.MaxRecords {
+		return fmt.Errorf("transaction capacity exceeded: records=%d max_transaction_records=%d", transactionRecordCount(len(tx.Messages)+1, len(tx.Streams), len(tx.RequestAssignments)), m.limits.MaxRecords)
+	}
+	if transactionDynamicBytes(append(tx.Messages, op), tx.Streams, tx.Offsets, tx.Participants, tx.RequestAssignments) > m.limits.MaxBytes {
+		return fmt.Errorf("transaction capacity exceeded: max_transaction_bytes=%d", m.limits.MaxBytes)
 	}
 	tx.Messages = append(tx.Messages, op)
 	tx.Revision++
@@ -556,15 +601,27 @@ func (m *Manager) ResolveRequestAssignment(id, producer string, epoch int64, top
 		}
 		return existing, true, nil
 	}
+	partitionKey := fmt.Sprintf("%s:%d", topic, partition)
+	nextSequence := tx.SequenceByPartition[partitionKey] + 1
+	assignment := RequestAssignment{Topic: topic, RequestedPartition: requestedPartition, ClientSequence: clientSequence, Partition: partition, Sequence: nextSequence, Fingerprint: fingerprint}
+	if transactionRecordCount(len(tx.Messages), len(tx.Streams), len(tx.RequestAssignments)+1) > m.limits.MaxRecords {
+		return RequestAssignment{}, false, fmt.Errorf("transaction capacity exceeded: records=%d max_transaction_records=%d", transactionRecordCount(len(tx.Messages), len(tx.Streams), len(tx.RequestAssignments)+1), m.limits.MaxRecords)
+	}
+	candidateAssignments := maps.Clone(tx.RequestAssignments)
+	if candidateAssignments == nil {
+		candidateAssignments = make(map[string]RequestAssignment, 1)
+	}
+	candidateAssignments[requestKey] = assignment
+	if transactionDynamicBytes(tx.Messages, tx.Streams, tx.Offsets, tx.Participants, candidateAssignments) > m.limits.MaxBytes {
+		return RequestAssignment{}, false, fmt.Errorf("transaction capacity exceeded: max_transaction_bytes=%d", m.limits.MaxBytes)
+	}
 	if tx.SequenceByPartition == nil {
 		tx.SequenceByPartition = make(map[string]uint64)
 	}
 	if tx.RequestAssignments == nil {
 		tx.RequestAssignments = make(map[string]RequestAssignment)
 	}
-	partitionKey := fmt.Sprintf("%s:%d", topic, partition)
-	tx.SequenceByPartition[partitionKey]++
-	assignment := RequestAssignment{Topic: topic, RequestedPartition: requestedPartition, ClientSequence: clientSequence, Partition: partition, Sequence: tx.SequenceByPartition[partitionKey], Fingerprint: fingerprint}
+	tx.SequenceByPartition[partitionKey] = nextSequence
 	tx.RequestAssignments[requestKey] = assignment
 	tx.Revision++
 	tx.UpdatedAt = time.Now()
@@ -604,6 +661,12 @@ func (m *Manager) AddStream(id, producer string, epoch int64, op StreamOperation
 			return nil
 		}
 		return fmt.Errorf("transaction %s already stages stream topic=%s key=%s", id, op.Topic, op.Key)
+	}
+	if transactionRecordCount(len(tx.Messages), len(tx.Streams)+1, len(tx.RequestAssignments)) > m.limits.MaxRecords {
+		return fmt.Errorf("transaction capacity exceeded: records=%d max_transaction_records=%d", transactionRecordCount(len(tx.Messages), len(tx.Streams)+1, len(tx.RequestAssignments)), m.limits.MaxRecords)
+	}
+	if transactionDynamicBytes(tx.Messages, append(tx.Streams, op), tx.Offsets, tx.Participants, tx.RequestAssignments) > m.limits.MaxBytes {
+		return fmt.Errorf("transaction capacity exceeded: max_transaction_bytes=%d", m.limits.MaxBytes)
 	}
 
 	reservation := streamReservationKey{topic: op.Topic, key: op.Key}
@@ -649,10 +712,11 @@ func (m *Manager) AddOffsets(id, producer string, epoch int64, offsets []OffsetO
 		}
 	}
 
+	candidateOffsets := append([]OffsetOperation(nil), tx.Offsets...)
 	for _, op := range offsets {
 		updated := false
-		for i := range tx.Offsets {
-			current := &tx.Offsets[i]
+		for i := range candidateOffsets {
+			current := &candidateOffsets[i]
 			if current.Topic != op.Topic || current.Group != op.Group || current.Partition != op.Partition {
 				continue
 			}
@@ -667,9 +731,15 @@ func (m *Manager) AddOffsets(id, producer string, epoch int64, offsets []OffsetO
 			break
 		}
 		if !updated {
-			tx.Offsets = append(tx.Offsets, op)
+			candidateOffsets = append(candidateOffsets, op)
 		}
 	}
+	candidate := *tx
+	candidate.Offsets = candidateOffsets
+	if err := m.validateTransactionLimits(&candidate); err != nil {
+		return err
+	}
+	tx.Offsets = candidateOffsets
 	tx.Revision++
 	tx.UpdatedAt = time.Now()
 	return nil
@@ -986,6 +1056,14 @@ func (m *Manager) ImportState(state map[string]*Snapshot) error {
 	if err := ValidateImportState(state); err != nil {
 		return err
 	}
+	if len(state) > m.limits.MaxTransactions {
+		return fmt.Errorf("transaction capacity exceeded: transactions=%d max_transactions=%d", len(state), m.limits.MaxTransactions)
+	}
+	for id, snap := range state {
+		if err := m.validateSnapshotLimits(snap); err != nil {
+			return fmt.Errorf("transaction snapshot %q: %w", id, err)
+		}
+	}
 	m.lockAllShards()
 	defer m.unlockAllShards()
 	m.replaceStateLocked(state)
@@ -1026,6 +1104,7 @@ func (m *Manager) replaceStateLocked(state map[string]*Snapshot) {
 	m.committedOffsetMu.Lock()
 	m.committedOffsets = committed
 	m.committedOffsetMu.Unlock()
+	m.transactionCount.Store(int64(len(state)))
 }
 
 func (m *Manager) ApplySnapshot(snap *Snapshot) {
@@ -1037,6 +1116,8 @@ func (m *Manager) ApplySnapshot(snap *Snapshot) {
 	defer s.mu.Unlock()
 	if current := s.txns[snap.ID]; current != nil {
 		m.releaseStreamReservationsLocked(current)
+	} else {
+		m.transactionCount.Add(1)
 	}
 	tx := transactionFromSnapshot(snap)
 	m.observeProducerEpoch(snap.Epoch)
@@ -1051,12 +1132,20 @@ func (m *Manager) ApplyReplicatedSnapshot(snap *Snapshot) error {
 	if err := validateSnapshot(snap); err != nil {
 		return err
 	}
+	if err := m.validateSnapshotLimits(snap); err != nil {
+		return err
+	}
 	s := m.shardForID(snap.ID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	current, ok := s.txns[snap.ID]
 	if !ok || snapshotIsNewer(current, snap) {
+		if !ok {
+			if err := m.reserveTransactionSlot(); err != nil {
+				return err
+			}
+		}
 		if current != nil {
 			m.releaseStreamReservationsLocked(current)
 		}
@@ -1202,6 +1291,7 @@ func (m *Manager) Delete(id string) {
 	defer s.mu.Unlock()
 	if tx := s.txns[id]; tx != nil {
 		m.releaseStreamReservationsLocked(tx)
+		m.releaseTransactionSlot()
 	}
 	s.remove(id)
 }

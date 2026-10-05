@@ -191,6 +191,10 @@ These values participate in active broker behavior:
 | `transaction_timeout_ms` | 60000 | Maximum duration of an open broker transaction before durable timeout abort. |
 | `transaction_coordinator_shards` | 50 | Logical transaction-coordinator shard count. Immutable after cluster creation. |
 | `transaction_recovery_batch_size` | 256 | Maximum prepared or timed-out transactions handled per recovery batch. |
+| `max_transactions` | 100000 | Maximum retained transaction identities, including completed identities kept for fencing. |
+| `max_transaction_records` | 10000 | Maximum staged records or durable request assignments retained by one transaction. |
+| `max_transaction_bytes` | 67108864 | Maximum dynamic staged payload bytes retained by one transaction. |
+| `max_transaction_offsets` | 10000 | Maximum distinct consumer offsets staged by one transaction. |
 | `producer_state_ttl_ms` | 1800000 | In-memory producer state cleanup window; durable records/checkpoints remain recovery sources. |
 | `raft_port` | 9001 | Raft transport listener. |
 | `discovery_port` | 8000 | Broker discovery and internal replication HTTP listener. |
@@ -343,6 +347,10 @@ The Config struct uses both YAML and JSON tags to support both formats. Here's h
 | TransactionTimeoutMS       | `transaction_timeout_ms`       | `transaction.timeout.ms`       | --transaction-timeout-ms    |
 | TransactionCoordinatorShards | `transaction_coordinator_shards` | `transaction.coordinator.shards` | --transaction-coordinator-shards |
 | TransactionRecoveryBatchSize | `transaction_recovery_batch_size` | `transaction.recovery.batch.size` | --transaction-recovery-batch-size |
+| MaxTransactions           | `max_transactions`           | `max.transactions`           | --max-transactions           |
+| MaxTransactionRecords     | `max_transaction_records`    | `max.transaction.records`    | --max-transaction-records    |
+| MaxTransactionBytes       | `max_transaction_bytes`      | `max.transaction.bytes`      | --max-transaction-bytes      |
+| MaxTransactionOffsets     | `max_transaction_offsets`    | `max.transaction.offsets`    | --max-transaction-offsets    |
 | DiskFlushBatchSize        | `disk_flush_batch_size`      | `disk.flush.batch.size`       | --disk-flush-batch       |
 | LingerMS                  | `linger_ms`                  | `linger.ms`                   | --linger-ms              |
 | ChannelBufferSize         | `channel_buffer_size`        | `channel.buffer.size`         | --channel-buffer         |
@@ -533,6 +541,16 @@ the same limits while materializing or restoring definitions. Lowering a limit
 below persisted state therefore makes readiness fail instead of loading an
 unbounded registry; raise the limit or deliberately remove topics before the
 change.
+
+Transaction memory and journal growth are bounded by `max_transactions`,
+`max_transaction_records`, `max_transaction_bytes`, and
+`max_transaction_offsets`. The corresponding environment variables are the
+upper-case YAML names. Limits are checked before mutation and again when
+installing journal or Raft snapshot state. Lowering a limit below durable state
+causes startup or readiness to fail with the offending bound rather than
+silently dropping transaction state. Completed identities continue to count
+until `transactional_id_expiration_ms` pruning removes them because their
+producer epochs are part of the fencing contract.
 
 Cleanup policy values normalize to `delete`, `compact`, or canonical `delete,compact`; unknown values fall back to `delete` with a warning. Distributed application topics accept compact policies only after every active broker advertises lifecycle protocol version 2, and cleaner passes wait for full ISR plus authoritative, matching HWM/lifecycle/policy state. Event-sourcing topics always require `delete`. Operators should treat normalization and policy errors as configuration/provisioning failures and verify the effective topic policy with `METADATA`.
 

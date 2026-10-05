@@ -39,6 +39,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.MaxTopics != 10000 || cfg.MaxPartitionsPerTopic != 1024 || cfg.MaxPartitions != 100000 {
 		t.Errorf("unexpected default topic limits: topics=%d per_topic=%d total=%d", cfg.MaxTopics, cfg.MaxPartitionsPerTopic, cfg.MaxPartitions)
 	}
+	if cfg.MaxTransactions != 100000 || cfg.MaxTransactionRecords != 10000 || cfg.MaxTransactionBytes != 64*1024*1024 || cfg.MaxTransactionOffsets != 10000 {
+		t.Errorf("unexpected default transaction limits: transactions=%d records=%d bytes=%d offsets=%d", cfg.MaxTransactions, cfg.MaxTransactionRecords, cfg.MaxTransactionBytes, cfg.MaxTransactionOffsets)
+	}
 }
 
 func TestLoadConfig_EnvOverrides(t *testing.T) {
@@ -54,6 +57,10 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("MAX_TOPICS", "123")
 	t.Setenv("MAX_PARTITIONS_PER_TOPIC", "17")
 	t.Setenv("MAX_PARTITIONS", "456")
+	t.Setenv("MAX_TRANSACTIONS", "789")
+	t.Setenv("MAX_TRANSACTION_RECORDS", "21")
+	t.Setenv("MAX_TRANSACTION_BYTES", "8192")
+	t.Setenv("MAX_TRANSACTION_OFFSETS", "22")
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -89,6 +96,9 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	}
 	if cfg.MaxTopics != 123 || cfg.MaxPartitionsPerTopic != 17 || cfg.MaxPartitions != 456 {
 		t.Errorf("unexpected topic limits from env: topics=%d per_topic=%d total=%d", cfg.MaxTopics, cfg.MaxPartitionsPerTopic, cfg.MaxPartitions)
+	}
+	if cfg.MaxTransactions != 789 || cfg.MaxTransactionRecords != 21 || cfg.MaxTransactionBytes != 8192 || cfg.MaxTransactionOffsets != 22 {
+		t.Errorf("unexpected transaction limits from env: transactions=%d records=%d bytes=%d offsets=%d", cfg.MaxTransactions, cfg.MaxTransactionRecords, cfg.MaxTransactionBytes, cfg.MaxTransactionOffsets)
 	}
 }
 
@@ -130,5 +140,8 @@ func TestConfig_Normalize(t *testing.T) {
 	}
 	if cfg.MaxTopics != 10000 || cfg.MaxPartitionsPerTopic != 1024 || cfg.MaxPartitions != 100000 {
 		t.Errorf("Normalize should restore topic limits, got topics=%d per_topic=%d total=%d", cfg.MaxTopics, cfg.MaxPartitionsPerTopic, cfg.MaxPartitions)
+	}
+	if cfg.MaxTransactions != 100000 || cfg.MaxTransactionRecords != 10000 || cfg.MaxTransactionBytes != 64*1024*1024 || cfg.MaxTransactionOffsets != 10000 {
+		t.Errorf("Normalize should restore transaction limits, got transactions=%d records=%d bytes=%d offsets=%d", cfg.MaxTransactions, cfg.MaxTransactionRecords, cfg.MaxTransactionBytes, cfg.MaxTransactionOffsets)
 	}
 }

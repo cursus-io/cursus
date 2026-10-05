@@ -141,6 +141,18 @@ func (cfg *Config) Normalize() {
 	if cfg.TransactionRecoveryBatchSize <= 0 {
 		cfg.TransactionRecoveryBatchSize = 256
 	}
+	if cfg.MaxTransactions <= 0 {
+		cfg.MaxTransactions = 100000
+	}
+	if cfg.MaxTransactionRecords <= 0 {
+		cfg.MaxTransactionRecords = 10000
+	}
+	if cfg.MaxTransactionBytes <= 0 {
+		cfg.MaxTransactionBytes = 64 * 1024 * 1024
+	}
+	if cfg.MaxTransactionOffsets <= 0 {
+		cfg.MaxTransactionOffsets = 10000
+	}
 
 	// consumer
 	if cfg.ConsumerSessionTimeoutMS <= 0 {

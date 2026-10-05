@@ -296,6 +296,12 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			}
 			return cc.RaftManager.GetFSM().TopicMaterializationReadinessError()
 		})
+		healthState.AddCheck("cluster_transactions", func(context.Context) error {
+			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
+				return fmt.Errorf("cluster transaction state unavailable")
+			}
+			return cc.RaftManager.GetFSM().TransactionRecoveryReadinessError()
+		})
 		healthState.AddCheck("replica_materialization", func(context.Context) error {
 			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
 				return fmt.Errorf("replica materialization state unavailable")
