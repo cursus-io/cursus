@@ -354,8 +354,30 @@ last broker-committed offset, providing at-least-once processing.
 
 `AutoOffsetResetEarliest` and `AutoOffsetResetLatest` are sent as
 `autoOffsetReset=earliest|latest` in polling and streaming commands.
+When a broker-owned committed offset has fallen outside the retained readable
+range, the broker applies that policy before reading without overwriting the
+committed offset; a successful handler commit advances it normally.
 `AutoOffsetResetError` leaves reset selection disabled and surfaces an
-out-of-range condition.
+out-of-range condition as `*sdk.ConsumerOffsetOutOfRangeError`. The consumer
+enters the failed state, stops every assignment worker, completes cleanup, and
+returns the retained cause from `Start`. `Consumer.Err()` keeps the first fatal
+cause available after `Done()` closes.
+
+Record handler failures are retried on the same partition and record. The
+default is three retries after the first attempt, starting at 100 ms and capped
+at 1 second. Configure `HandlerMaxRetries`, `HandlerRetryBackoff`, and
+`HandlerRetryMaxBackoff` to change that budget. When it is exhausted, `Start`
+returns `*sdk.ConsumerHandlerError`; the failed batch is not committed and no
+rebalance is used as an implicit retry loop. A later consumer restart resumes
+from the last broker-committed offset, so handlers must remain safe for
+at-least-once delivery.
+
+`Consumer.Done()` closes only after assignment, commit, lifecycle, connection,
+and group cleanup has completed and `Consumer.State()` is
+`ConsumerStateClosed`. Code waiting for full shutdown can receive from `Done()`
+and then inspect `Consumer.Err()`. `Close()` waits for the coordinator's
+`LEAVE_GROUP` acknowledgement and returns the same cleanup error to every
+concurrent or repeated caller.
 
 After each metadata refresh the consumer records whether the authoritative
 `cleanup_policy` includes `compact`. Forward jumps on such a topic are valid

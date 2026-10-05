@@ -644,6 +644,20 @@ func TestPartitionConsumer_HandleBrokerError_OffsetOutOfRangeError(t *testing.T)
 	result := pc.handleBrokerError(offsetOutOfRangeBrokerError())
 	assert.True(t, result)
 	assert.Error(t, c.mainCtx.Err())
+	assert.Error(t, c.rootCtx.Err())
+	assert.Equal(t, ConsumerStateFailed, c.State())
+	var offsetErr *ConsumerOffsetOutOfRangeError
+	require.ErrorAs(t, c.Err(), &offsetErr)
+	assert.Equal(t, 0, offsetErr.Partition)
+	assert.Equal(t, uint64(1), offsetErr.Requested)
+	assert.Equal(t, uint64(5), offsetErr.Earliest)
+	assert.Equal(t, uint64(9), offsetErr.Latest)
+	assert.Equal(t, uint64(1), atomic.LoadUint64(&pc.fetchOffset))
+	select {
+	case <-c.rebalanceSig:
+		t.Fatal("offset failure unexpectedly requested a rebalance")
+	default:
+	}
 }
 
 func offsetOutOfRangeBrokerError() *BrokerError {
@@ -663,12 +677,31 @@ func TestPartitionConsumer_HandleStreamControl_OffsetOutOfRange(t *testing.T) {
 	assert.Equal(t, uint64(5), atomic.LoadUint64(&pc.fetchOffset))
 }
 
-func TestPartitionConsumer_HandlerFailureDoesNotCommitAndRequestsRedelivery(t *testing.T) {
+func TestPartitionConsumer_HandleStreamControl_OffsetOutOfRangeError(t *testing.T) {
 	c := newTestConsumer(t)
+	c.config.AutoOffsetReset = AutoOffsetResetError
+	pc := &PartitionConsumer{partitionID: 2, consumer: c, fetchOffset: 4}
+
+	result := pc.handleStreamControl([]byte("STREAM_CONTROL type=CLOSE reason=offset_out_of_range offset=4 requested=4 earliest=8 latest=12"))
+	require.True(t, result)
+	require.Equal(t, ConsumerStateFailed, c.State())
+	var offsetErr *ConsumerOffsetOutOfRangeError
+	require.ErrorAs(t, c.Err(), &offsetErr)
+	require.Equal(t, 2, offsetErr.Partition)
+	require.Equal(t, uint64(4), atomic.LoadUint64(&pc.fetchOffset))
+}
+
+func TestPartitionConsumer_HandlerFailureStopsConsumerWithoutCommitOrRebalance(t *testing.T) {
+	c := newTestConsumer(t)
+	c.config.HandlerMaxRetries = 2
+	c.config.HandlerRetryBackoff = time.Millisecond
+	c.config.HandlerRetryMaxBackoff = time.Millisecond
 	c.mu.Lock()
 	c.offsets[0] = 3
 	c.mu.Unlock()
+	attempts := 0
 	c.MessageHandler = func(Message) error {
+		attempts++
 		return assert.AnError
 	}
 
@@ -689,13 +722,26 @@ func TestPartitionConsumer_HandlerFailureDoesNotCommitAndRequestsRedelivery(t *t
 	}
 
 	select {
-	case <-c.rebalanceSig:
+	case <-c.rootCtx.Done():
 	case <-time.After(time.Second):
-		t.Fatal("handler failure did not request a rebalance")
+		t.Fatal("handler failure did not stop the consumer")
 	}
 	c.wg.Wait()
 
+	assert.Equal(t, 3, attempts)
 	assert.Equal(t, uint64(3), atomic.LoadUint64(&pc.fetchOffset))
+	assert.Equal(t, ConsumerStateFailed, c.State())
+	var handlerErr *ConsumerHandlerError
+	require.ErrorAs(t, c.Err(), &handlerErr)
+	assert.Equal(t, 0, handlerErr.Partition)
+	assert.Equal(t, uint64(3), handlerErr.Offset)
+	assert.Equal(t, 3, handlerErr.Attempts)
+	assert.ErrorIs(t, handlerErr, assert.AnError)
+	select {
+	case <-c.rebalanceSig:
+		t.Fatal("handler failure unexpectedly requested a rebalance")
+	default:
+	}
 	select {
 	case commit := <-c.commitCh:
 		t.Fatalf("handler failure unexpectedly queued commit: %+v", commit)
@@ -737,6 +783,84 @@ func TestPartitionConsumerNilHandlerDoesNotAdvanceOrCommit(t *testing.T) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	assert.Equal(t, uint64(41), c.offsets[0])
+}
+
+func TestPartitionConsumer_HandlerRetriesLocallyAndContinues(t *testing.T) {
+	c := newTestConsumer(t)
+	c.config.EnableAutoCommit = false
+	c.config.HandlerMaxRetries = 2
+	c.config.HandlerRetryBackoff = time.Millisecond
+	c.config.HandlerRetryMaxBackoff = time.Millisecond
+	attempts := 0
+	c.MessageHandler = func(Message) error {
+		attempts++
+		if attempts < 3 {
+			return assert.AnError
+		}
+		return nil
+	}
+
+	pc := &PartitionConsumer{
+		partitionID: 0,
+		consumer:    c,
+		dataCh:      make(chan *messageBatch, 1),
+	}
+	c.wg.Add(1)
+	go pc.runWorker()
+	pc.dataCh <- &messageBatch{messages: []Message{{Offset: 7, Payload: "transient"}}}
+	close(pc.dataCh)
+	c.wg.Wait()
+
+	assert.Equal(t, 3, attempts)
+	assert.NoError(t, c.Err())
+	assert.NoError(t, c.rootCtx.Err())
+	assert.Equal(t, ConsumerStateRunning, c.State())
+	select {
+	case <-c.rebalanceSig:
+		t.Fatal("transient handler error unexpectedly requested a rebalance")
+	default:
+	}
+}
+
+func TestPartitionConsumer_ShutdownDuringHandlerBackoffIsNotFatal(t *testing.T) {
+	c := newTestConsumer(t)
+	c.config.HandlerMaxRetries = 10
+	c.config.HandlerRetryBackoff = time.Second
+	c.config.HandlerRetryMaxBackoff = time.Second
+	handlerCalled := make(chan struct{})
+	var attempts atomic.Int32
+	c.MessageHandler = func(Message) error {
+		if attempts.Add(1) == 1 {
+			close(handlerCalled)
+		}
+		return assert.AnError
+	}
+
+	pc := &PartitionConsumer{
+		partitionID: 0,
+		consumer:    c,
+		dataCh:      make(chan *messageBatch, 1),
+	}
+	c.wg.Add(1)
+	go pc.runWorker()
+	pc.dataCh <- &messageBatch{messages: []Message{{Offset: 0, Payload: "shutdown"}}}
+	select {
+	case <-handlerCalled:
+	case <-time.After(time.Second):
+		t.Fatal("handler was not called")
+	}
+
+	closeReturned := make(chan error, 1)
+	go func() { closeReturned <- c.Close() }()
+	select {
+	case err := <-closeReturned:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Close did not interrupt handler retry backoff")
+	}
+	require.Equal(t, int32(1), attempts.Load())
+	require.NoError(t, c.Err())
+	require.Equal(t, ConsumerStateClosed, c.State())
 }
 
 func TestPartitionConsumerManualCommitDoesNotQueueCommit(t *testing.T) {

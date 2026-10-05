@@ -148,6 +148,15 @@ func TestNewDefaultConsumerConfig(t *testing.T) {
 	if cfg.MaxCommitRetries != 5 {
 		t.Errorf("expected MaxCommitRetries=5, got %d", cfg.MaxCommitRetries)
 	}
+	if cfg.HandlerMaxRetries != 3 {
+		t.Errorf("expected HandlerMaxRetries=3, got %d", cfg.HandlerMaxRetries)
+	}
+	if cfg.HandlerRetryBackoff != 100*time.Millisecond {
+		t.Errorf("expected HandlerRetryBackoff=100ms, got %v", cfg.HandlerRetryBackoff)
+	}
+	if cfg.HandlerRetryMaxBackoff != time.Second {
+		t.Errorf("expected HandlerRetryMaxBackoff=1s, got %v", cfg.HandlerRetryMaxBackoff)
+	}
 	if cfg.Mode != ModePolling {
 		t.Errorf("expected Mode=polling, got %s", cfg.Mode)
 	}
@@ -435,8 +444,18 @@ func TestConsumerConfigRejectsInvalidRuntimeSettings(t *testing.T) {
 		"offset reset": func(config *ConsumerConfig) {
 			config.AutoOffsetReset = "middle"
 		},
-		"isolation":  func(config *ConsumerConfig) { config.ReadIsolation = "dirty" },
-		"duration":   func(config *ConsumerConfig) { config.PollInterval = -time.Second },
+		"isolation": func(config *ConsumerConfig) { config.ReadIsolation = "dirty" },
+		"duration":  func(config *ConsumerConfig) { config.PollInterval = -time.Second },
+		"handler retries": func(config *ConsumerConfig) {
+			config.HandlerMaxRetries = -1
+		},
+		"handler backoff": func(config *ConsumerConfig) {
+			config.HandlerRetryBackoff = -time.Millisecond
+		},
+		"handler backoff range": func(config *ConsumerConfig) {
+			config.HandlerRetryBackoff = time.Second
+			config.HandlerRetryMaxBackoff = time.Millisecond
+		},
 		"batch size": func(config *ConsumerConfig) { config.BatchSize = 0 },
 		"worker channel": func(config *ConsumerConfig) {
 			config.WorkerChannelSize = 0

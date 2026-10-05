@@ -472,6 +472,15 @@ Both `PublisherConfig` and `ConsumerConfig` support an `enable_metrics` field to
 | `enable_metrics`| bool | false   | Enable Prometheus runtime metric collection |
 | `auto_offset_reset` | string | `earliest` | Missing/out-of-range offset policy: `earliest`, `latest`, or `error` |
 | `read_isolation` | string | `read_committed` | Consumer visibility: `read_committed` or `read_uncommitted` |
+| `handler_max_retries` | int | `3` | Additional attempts for the same record after a handler error |
+| `handler_retry_backoff` | duration | `100ms` | Initial delay between handler attempts |
+| `handler_retry_max_backoff` | duration | `1s` | Maximum delay between handler attempts |
+
+Exhausting the handler retry budget stops the consumer and returns a typed
+`ConsumerHandlerError` from `Start`; it does not commit the failed batch or
+trigger a group rebalance. `auto_offset_reset: error` similarly stops the
+consumer with `ConsumerOffsetOutOfRangeError`. After `Done()` closes,
+`Consumer.Err()` returns the first fatal runtime cause.
 
 When enabled, the SDK registers the following metrics in a dedicated Prometheus registry:
 

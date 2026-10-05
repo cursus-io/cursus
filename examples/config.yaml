@@ -17,3 +17,6 @@ group_id: "example-group"
 consumer_id: "example-consumer-1"
 mode: "streaming"
 auto_commit_interval: "1s"
+handler_max_retries: 3
+handler_retry_backoff: "100ms"
+handler_retry_max_backoff: "1s"

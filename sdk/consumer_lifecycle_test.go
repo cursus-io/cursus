@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,6 +61,10 @@ func TestConsumerStartRejectsNilHandlerBeforeBrokerIO(t *testing.T) {
 }
 
 func TestConsumerLifecycleTransitionsAndAssignmentFence(t *testing.T) {
+	require.Equal(t, ConsumerStateClosing, ConsumerState(3), "existing state value must remain stable")
+	require.Equal(t, ConsumerStateClosed, ConsumerState(4), "existing state value must remain stable")
+	require.Equal(t, "failed", ConsumerStateFailed.String())
+
 	consumer, err := NewConsumer(NewDefaultConsumerConfig())
 	require.NoError(t, err)
 	require.Equal(t, ConsumerStateNew, consumer.State())
@@ -125,5 +130,62 @@ func TestPartitionConsumerRejectsStaleAssignmentBeforeDial(t *testing.T) {
 
 	err = partition.ensureConnection()
 	require.ErrorContains(t, err, "consumer shutting down")
+	require.NoError(t, consumer.Close())
+}
+
+func TestConsumerFailureKeepsFirstCauseAndStartWaitReturnsItAfterCleanup(t *testing.T) {
+	consumer, err := NewConsumer(NewDefaultConsumerConfig())
+	require.NoError(t, err)
+	require.NoError(t, consumer.beginStart())
+
+	first := errors.New("first failure")
+	consumer.fail(first)
+	consumer.fail(errors.New("later failure"))
+	require.Equal(t, ConsumerStateFailed, consumer.State())
+	require.ErrorIs(t, consumer.Err(), first)
+
+	returned := make(chan error, 1)
+	go func() { returned <- consumer.waitForShutdown() }()
+	select {
+	case err := <-returned:
+		require.ErrorIs(t, err, first)
+	case <-time.After(time.Second):
+		t.Fatal("consumer shutdown did not return the retained failure")
+	}
+	require.Equal(t, ConsumerStateClosed, consumer.State())
+	select {
+	case <-consumer.Done():
+	default:
+		t.Fatal("Done remained open after failed consumer cleanup")
+	}
+}
+
+func TestConsumerConcurrentFailuresRetainOneStableCause(t *testing.T) {
+	consumer, err := NewConsumer(NewDefaultConsumerConfig())
+	require.NoError(t, err)
+	require.NoError(t, consumer.beginStart())
+
+	causes := []error{errors.New("partition 0"), errors.New("partition 1"), errors.New("partition 2")}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, cause := range causes {
+		cause := cause
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			consumer.fail(cause)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	retained := consumer.Err()
+	require.Error(t, retained)
+	require.Contains(t, causes, retained)
+	consumer.fail(errors.New("late failure"))
+	require.Same(t, retained, consumer.Err())
+	require.Equal(t, ConsumerStateFailed, consumer.State())
+	require.Error(t, consumer.rootCtx.Err())
 	require.NoError(t, consumer.Close())
 }

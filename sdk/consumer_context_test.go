@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -17,6 +18,64 @@ func TestNewConsumerWithContextPropagatesCancellation(t *testing.T) {
 	case <-consumer.mainCtx.Done():
 	default:
 		t.Fatal("consumer worker context was not canceled")
+	}
+}
+
+func TestConsumerDoneWaitsForEachWorkerClass(t *testing.T) {
+	tests := map[string]func(*Consumer) func(){
+		"assignment": func(consumer *Consumer) func() {
+			consumer.wg.Add(1)
+			return consumer.wg.Done
+		},
+		"commit": func(consumer *Consumer) func() {
+			consumer.commitWg.Add(1)
+			return consumer.commitWg.Done
+		},
+		"lifecycle": func(consumer *Consumer) func() {
+			consumer.lifecycleWg.Add(1)
+			return consumer.lifecycleWg.Done
+		},
+	}
+
+	for name, hold := range tests {
+		t.Run(name, func(t *testing.T) {
+			consumer, err := NewConsumer(NewDefaultConsumerConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			release := sync.OnceFunc(hold(consumer))
+			t.Cleanup(release)
+
+			closeReturned := make(chan error, 1)
+			go func() { closeReturned <- consumer.Close() }()
+			deadline := time.Now().Add(time.Second)
+			for consumer.State() != ConsumerStateClosing && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if consumer.State() != ConsumerStateClosing {
+				t.Fatalf("Close did not enter closing state: %s", consumer.State())
+			}
+			select {
+			case <-consumer.Done():
+				t.Fatalf("Done closed while %s worker cleanup was pending", name)
+			default:
+			}
+
+			release()
+			select {
+			case err := <-closeReturned:
+				if err != nil {
+					t.Fatalf("Close failed: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Close did not finish after cleanup was released")
+			}
+			select {
+			case <-consumer.Done():
+			default:
+				t.Fatal("Done remained open after cleanup")
+			}
+		})
 	}
 }
 
@@ -48,11 +107,31 @@ func TestConsumerCloseIsIdempotentAndWaitsForShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	consumer.wg.Add(1)
+	cleanupStarted := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	if !consumer.startLifecycleWorker(func() {
+		<-consumer.rootCtx.Done()
+		close(cleanupStarted)
+		<-releaseCleanup
+	}) {
+		t.Fatal("lifecycle worker did not start")
+	}
 
 	firstDone := make(chan error, 1)
 	go func() { firstDone <- consumer.Close() }()
-	<-consumer.Done()
+	select {
+	case <-cleanupStarted:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not reach lifecycle cleanup")
+	}
+	select {
+	case <-consumer.Done():
+		t.Fatal("Done closed before lifecycle cleanup completed")
+	default:
+	}
+	if consumer.State() != ConsumerStateClosing {
+		t.Fatalf("expected closing state during cleanup, got %s", consumer.State())
+	}
 
 	secondDone := make(chan error, 1)
 	go func() { secondDone <- consumer.Close() }()
@@ -62,11 +141,19 @@ func TestConsumerCloseIsIdempotentAndWaitsForShutdown(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	consumer.wg.Done()
+	close(releaseCleanup)
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first Close failed: %v", err)
 	}
 	if err := <-secondDone; err != nil {
 		t.Fatalf("second Close failed: %v", err)
+	}
+	select {
+	case <-consumer.Done():
+	default:
+		t.Fatal("Done remained open after cleanup completed")
+	}
+	if consumer.State() != ConsumerStateClosed {
+		t.Fatalf("expected closed state after Done, got %s", consumer.State())
 	}
 }

@@ -49,6 +49,8 @@ type Consumer struct {
 	commitWg    sync.WaitGroup
 	lifecycleWg sync.WaitGroup
 	lifecycleMu sync.Mutex
+	failureMu   sync.Mutex
+	failureErr  error
 
 	mainCtx    context.Context
 	mainCancel context.CancelFunc
@@ -62,6 +64,7 @@ type Consumer struct {
 	offsets   map[int]uint64
 	doneCh    chan struct{}
 	closeDone chan struct{}
+	closeErr  error
 	mu        sync.RWMutex
 
 	partitionLeaders  map[int]string
@@ -279,12 +282,12 @@ func (c *Consumer) Start(handler func(Message) error) error {
 	c.startAssignmentWorkers(c.assignmentContext(), assignmentGeneration)
 	started = true
 
+	return c.waitForShutdown()
+}
+
+func (c *Consumer) waitForShutdown() error {
 	<-c.rootCtx.Done()
-	if state := c.State(); state != ConsumerStateClosing && state != ConsumerStateClosed {
-		return c.Close()
-	}
-	<-c.closeDone
-	return nil
+	return errors.Join(c.Err(), c.Close())
 }
 
 // ─── Commit Worker ────────────────────────────────────────────────────────────
@@ -292,7 +295,7 @@ func (c *Consumer) Start(handler func(Message) error) error {
 func (c *Consumer) startCommitWorker() {
 	c.lifecycleMu.Lock()
 	state := c.State()
-	if state == ConsumerStateClosing || state == ConsumerStateClosed {
+	if state != ConsumerStateRunning {
 		c.lifecycleMu.Unlock()
 		return
 	}
@@ -986,12 +989,14 @@ func (c *Consumer) Close() error {
 	if state == ConsumerStateClosing || state == ConsumerStateClosed {
 		c.lifecycleMu.Unlock()
 		<-c.closeDone
-		return nil
+		c.lifecycleMu.Lock()
+		err := c.closeErr
+		c.lifecycleMu.Unlock()
+		return err
 	}
 	c.state.Store(uint32(ConsumerStateClosing))
 	c.lifecycleMu.Unlock()
 
-	close(c.doneCh)
 	c.rootCancel()
 	c.cancelAssignment()
 	c.closeActiveConnections()
@@ -1001,6 +1006,7 @@ func (c *Consumer) Close() error {
 	c.commitWg.Wait()
 	c.lifecycleWg.Wait()
 
+	var closeErr error
 	c.mu.RLock()
 	memberID := c.memberID
 	generation := c.generation
@@ -1009,8 +1015,16 @@ func (c *Consumer) Close() error {
 		if conn, err := c.getCoordinatorConn(); err == nil {
 			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
 				c.config.Topic, c.config.GroupID, memberID, generation)
-			_ = WriteWithLength(conn, []byte(leaveCmd))
+			if err := WriteWithLength(conn, []byte(leaveCmd)); err != nil {
+				closeErr = fmt.Errorf("leave consumer group: %w", err)
+			} else if response, err := ReadWithLength(conn); err != nil {
+				closeErr = fmt.Errorf("leave consumer group: %w", err)
+			} else if !hasOKStatus(strings.TrimSpace(string(response))) {
+				closeErr = fmt.Errorf("leave consumer group: unexpected response %q", strings.TrimSpace(string(response)))
+			}
 			_ = conn.Close()
+		} else {
+			closeErr = fmt.Errorf("connect to leave consumer group: %w", err)
 		}
 	}
 
@@ -1032,9 +1046,11 @@ func (c *Consumer) Close() error {
 
 	c.lifecycleMu.Lock()
 	c.state.Store(uint32(ConsumerStateClosed))
+	c.closeErr = closeErr
+	close(c.doneCh)
 	close(c.closeDone)
 	c.lifecycleMu.Unlock()
-	return nil
+	return closeErr
 }
 
 func (c *Consumer) closeActiveConnections() {

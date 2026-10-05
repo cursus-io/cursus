@@ -47,6 +47,45 @@ func (e *ProducerOutcomeUnknownError) Unwrap() []error {
 	return []error{ErrProducerOutcomeUnknown, e.Cause}
 }
 
+// ConsumerOffsetOutOfRangeError reports a retained offset that is no longer
+// readable while AutoOffsetResetError is configured.
+type ConsumerOffsetOutOfRangeError struct {
+	Partition int
+	Requested uint64
+	Earliest  uint64
+	Latest    uint64
+}
+
+func (e *ConsumerOffsetOutOfRangeError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("consumer partition %d offset %d is out of range (earliest=%d latest=%d)", e.Partition, e.Requested, e.Earliest, e.Latest)
+}
+
+// ConsumerHandlerError reports a record handler that exhausted its bounded
+// retry budget. The failed record is not committed.
+type ConsumerHandlerError struct {
+	Partition int
+	Offset    uint64
+	Attempts  int
+	Cause     error
+}
+
+func (e *ConsumerHandlerError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("consumer handler failed for partition %d offset %d after %d attempts: %v", e.Partition, e.Offset, e.Attempts, e.Cause)
+}
+
+func (e *ConsumerHandlerError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
 type ErrorClass = wireprotocol.ErrorClass
 
 const (

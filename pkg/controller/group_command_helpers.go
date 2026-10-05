@@ -90,6 +90,11 @@ func (ch *CommandHandler) resolveOffset(p *topic.Partition, topicName string, cA
 		return 0, err
 	}
 	if found {
+		if resetOffset, reset := resetRetainedOffset(savedOffset, p.OffsetRange(), cArgs.AutoOffsetReset); reset {
+			util.Warn("Committed offset %d for group %s topic %s partition %d is outside the readable range; resetting to %d (%s)",
+				savedOffset, cArgs.GroupName, topicName, cArgs.PartitionID, resetOffset, cArgs.AutoOffsetReset)
+			return resetOffset, nil
+		}
 		return savedOffset, nil
 	}
 	return resetConsumerOffset(p, cArgs), nil
@@ -161,6 +166,20 @@ func parseStableOffsetResponse(response string) (uint64, bool, error) {
 		return 0, false, fmt.Errorf("ERROR: coordinator_not_available reason=%q", "coordinator lacks a valid stable offset response")
 	}
 	return offset, found, nil
+}
+
+func resetRetainedOffset(savedOffset uint64, offsetRange topic.PartitionOffsetRange, policy string) (uint64, bool) {
+	if savedOffset >= offsetRange.Earliest && savedOffset <= offsetRange.Latest {
+		return savedOffset, false
+	}
+	switch policy {
+	case "earliest":
+		return offsetRange.Earliest, true
+	case "latest":
+		return offsetRange.Latest, true
+	default:
+		return savedOffset, false
+	}
 }
 
 func (ch *CommandHandler) ValidateOwnership(groupName, memberID string, generation int, partition int) bool {

@@ -178,6 +178,13 @@ type ConsumerConfig struct {
 	CommitRetryBackoff    time.Duration `yaml:"commit_retry_backoff" json:"commit_retry_backoff"`
 	CommitRetryMaxBackoff time.Duration `yaml:"commit_retry_max_backoff" json:"commit_retry_max_backoff"`
 
+	// HandlerMaxRetries is the number of additional delivery attempts for the
+	// same record after the handler first returns an error. Exhaustion stops the
+	// consumer and leaves the record uncommitted for a later restart.
+	HandlerMaxRetries      int           `yaml:"handler_max_retries" json:"handler_max_retries"`
+	HandlerRetryBackoff    time.Duration `yaml:"handler_retry_backoff" json:"handler_retry_backoff"`
+	HandlerRetryMaxBackoff time.Duration `yaml:"handler_retry_max_backoff" json:"handler_retry_max_backoff"`
+
 	UseTLS        bool   `yaml:"use_tls" json:"use_tls"`
 	TLSCAPath     string `yaml:"tls_ca_path" json:"tls_ca_path"`
 	TLSServerName string `yaml:"tls_server_name" json:"tls_server_name"`
@@ -227,7 +234,8 @@ func (c *ConsumerConfig) Validate() error {
 		return fmt.Errorf("unsupported read isolation %q", c.ReadIsolation)
 	}
 	if c.PollInterval < 0 || c.AutoCommitInterval < 0 || c.CommitRetryBackoff < 0 ||
-		c.CommitRetryMaxBackoff < 0 || c.LeaderStaleness < 0 ||
+		c.CommitRetryMaxBackoff < 0 || c.HandlerRetryBackoff < 0 ||
+		c.HandlerRetryMaxBackoff < 0 || c.LeaderStaleness < 0 ||
 		c.MetadataRefreshInterval < 0 || c.PollTimeoutMS < 0 ||
 		c.ConnectRetryBackoffMS < 0 || c.HeartbeatIntervalMS < 0 || c.StreamingReadDeadlineMS < 0 ||
 		c.HandshakeTimeoutMS < 0 {
@@ -239,8 +247,11 @@ func (c *ConsumerConfig) Validate() error {
 	if c.BatchSize > MaxConsumerBatchRecords || c.MaxPollRecords > MaxConsumerBatchRecords {
 		return fmt.Errorf("consumer batch size and max poll records must not exceed %d", MaxConsumerBatchRecords)
 	}
-	if c.MaxConnectRetries < 0 || c.MaxCommitRetries < 0 {
+	if c.MaxConnectRetries < 0 || c.MaxCommitRetries < 0 || c.HandlerMaxRetries < 0 {
 		return fmt.Errorf("consumer retry limits must not be negative")
+	}
+	if c.HandlerRetryMaxBackoff > 0 && c.HandlerRetryBackoff > c.HandlerRetryMaxBackoff {
+		return fmt.Errorf("consumer handler retry max backoff must be greater than or equal to retry backoff")
 	}
 	if len(c.BrokerAddrs) == 0 {
 		return fmt.Errorf("consumer requires at least one broker address")
@@ -300,6 +311,9 @@ func NewDefaultConsumerConfig() *ConsumerConfig {
 		MaxCommitRetries:        5,
 		CommitRetryBackoff:      500 * time.Millisecond,
 		CommitRetryMaxBackoff:   2 * time.Second,
+		HandlerMaxRetries:       3,
+		HandlerRetryBackoff:     100 * time.Millisecond,
+		HandlerRetryMaxBackoff:  time.Second,
 		HeartbeatIntervalMS:     3000,
 		HandshakeTimeoutMS:      5000,
 		CompressionType:         "none",

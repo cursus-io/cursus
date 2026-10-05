@@ -14,6 +14,7 @@ const (
 	ConsumerStateRebalancing
 	ConsumerStateClosing
 	ConsumerStateClosed
+	ConsumerStateFailed
 )
 
 func (s ConsumerState) String() string {
@@ -24,6 +25,8 @@ func (s ConsumerState) String() string {
 		return "running"
 	case ConsumerStateRebalancing:
 		return "rebalancing"
+	case ConsumerStateFailed:
+		return "failed"
 	case ConsumerStateClosing:
 		return "closing"
 	case ConsumerStateClosed:
@@ -35,6 +38,37 @@ func (s ConsumerState) String() string {
 
 func (c *Consumer) State() ConsumerState {
 	return ConsumerState(c.state.Load())
+}
+
+// Err returns the first fatal runtime failure observed by the consumer. It
+// remains available after Done is closed and Close has returned.
+func (c *Consumer) Err() error {
+	c.failureMu.Lock()
+	defer c.failureMu.Unlock()
+	return c.failureErr
+}
+
+func (c *Consumer) fail(err error) {
+	if err == nil {
+		return
+	}
+
+	c.failureMu.Lock()
+	if c.failureErr == nil {
+		c.failureErr = err
+	}
+	c.failureMu.Unlock()
+
+	c.lifecycleMu.Lock()
+	state := c.State()
+	if state != ConsumerStateClosing && state != ConsumerStateClosed {
+		c.state.Store(uint32(ConsumerStateFailed))
+	}
+	c.lifecycleMu.Unlock()
+
+	c.rootCancel()
+	c.cancelAssignment()
+	c.closeActiveConnections()
 }
 
 func (c *Consumer) beginStart() error {
@@ -103,7 +137,7 @@ func (c *Consumer) replaceAssignmentContext() context.Context {
 func (c *Consumer) startLifecycleWorker(worker func()) bool {
 	c.lifecycleMu.Lock()
 	state := c.State()
-	if state == ConsumerStateClosing || state == ConsumerStateClosed {
+	if state == ConsumerStateFailed || state == ConsumerStateClosing || state == ConsumerStateClosed {
 		c.lifecycleMu.Unlock()
 		return false
 	}
