@@ -31,7 +31,11 @@ func TestReplicaCatchupPreservesHistoricalTransactionsAfterStateChanges(t *testi
 			rm := &MockRaftManagerForForward{state: state}
 			cluster := clusterController.NewClusterController(context.Background(), cfg, rm, nil, "broker-2", "broker-2:9001")
 			ch := NewCommandHandler(tm, cfg, nil, nil, cluster)
-			t.Cleanup(func() { _ = ch.Close(); dm.CloseAllHandlers() })
+			t.Cleanup(func() {
+				_ = ch.Close()
+				tm.Stop()
+				dm.CloseAllHandlers()
+			})
 			producer, epoch, err := ch.TxnManager.InitProducerWithMode("history", transaction.ModeProcessingV1)
 			require.NoError(t, err)
 			require.NoError(t, ch.TxnManager.SetCoordinatorEpoch("history", 4))

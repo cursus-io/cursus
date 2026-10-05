@@ -232,7 +232,7 @@ func (p *Partition) hwmReadinessError() error {
 
 func (p *Partition) hwmReadinessErrorLocked() error {
 	if p.distributed && !p.hwmAuthoritative {
-		return fmt.Errorf("authoritative committed HWM is not established")
+		return types.ErrCommittedHWMUnavailable
 	}
 	return nil
 }
@@ -1470,7 +1470,7 @@ func (p *Partition) StartProducerStateMaintenance() {
 	if p.producerStateCh == nil {
 		return
 	}
-	p.producerStateWG.Add(1)
+	p.producerStateWG.Add(2)
 	go p.runProducerStateCheckpointLoop()
 	go p.runProducerCleanup()
 }
@@ -2131,6 +2131,7 @@ func (p *Partition) pruneProducerStateIndex(retentionFloor uint64) bool {
 
 // runProducerCleanup periodically evicts stale producer state to bound memory usage.
 func (p *Partition) runProducerCleanup() {
+	defer p.producerStateWG.Done()
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {

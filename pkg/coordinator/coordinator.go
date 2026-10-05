@@ -243,6 +243,21 @@ func NewCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandle
 // NewCoordinatorWithRecovery initializes the internal metadata topic and
 // completes consumer metadata replay before returning success.
 func NewCoordinatorWithRecovery(ctx context.Context, cfg *config.Config, handler TopicHandler) (*Coordinator, error) {
+	return newCoordinator(ctx, cfg, handler, true)
+}
+
+// NewCoordinatorAwaitingDistributedRecovery initializes a distributed
+// coordinator without reading the local offsets log. Raft must first restore
+// topic topology and authoritative committed HWMs; the server then calls
+// ReloadDistributedConsumerMetadata before opening its client listener.
+func NewCoordinatorAwaitingDistributedRecovery(ctx context.Context, cfg *config.Config, handler TopicHandler) (*Coordinator, error) {
+	if cfg == nil || !cfg.EnabledDistribution {
+		return nil, fmt.Errorf("deferred coordinator recovery requires distribution")
+	}
+	return newCoordinator(ctx, cfg, handler, false)
+}
+
+func newCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandler, recoverDistributed bool) (*Coordinator, error) {
 	if handler == nil {
 		return nil, fmt.Errorf("coordinator requires a non-nil topic handler")
 	}
@@ -308,6 +323,10 @@ func NewCoordinatorWithRecovery(ctx context.Context, cfg *config.Config, handler
 				c.setRecoveryFailure(wrapped)
 				return c, wrapped
 			}
+		} else if !recoverDistributed {
+			c.recoveryMu.Lock()
+			c.recovery = ConsumerMetadataRecoveryStatus{Phase: "awaiting_cluster_recovery"}
+			c.recoveryMu.Unlock()
 		} else if status, recoveryErr := c.loadDistributedOffsetsFromLog(reader); recoveryErr != nil {
 			wrapped := fmt.Errorf("replay distributed consumer metadata from %q: %w", c.offsetTopic, recoveryErr)
 			c.setRecoveryFailure(wrapped)

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/ackpolicy"
@@ -31,6 +32,7 @@ import (
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/sdk"
 	"github.com/cursus-io/cursus/util"
@@ -42,6 +44,10 @@ const (
 	readDeadlinePoll       = 5 * time.Second
 	DefaultHealthCheckPort = 9080
 )
+
+// ErrConsumerMetadataRecovery routes a post-Raft replay failure into the
+// diagnostics-only server instead of opening the client listener.
+var ErrConsumerMetadataRecovery = errors.New("consumer metadata recovery failed")
 
 // RunServer starts the broker with optional TLS and gzip
 func RunServer(cfg *config.Config, tm *topic.TopicManager, dm *disk.DiskManager, cd *coordinator.Coordinator, sm *stream.StreamManager) error {
@@ -56,36 +62,34 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	addr := fmt.Sprintf(":%d", cfg.BrokerPort)
-	var ln net.Listener
-	var err error
-	if cfg.UseTLS {
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cfg.TLSCert},
-			MinVersion:   tls.VersionTLS12,
-		}
-		ln, err = tls.Listen("tcp", addr, tlsConfig)
-	} else {
-		ln, err = net.Listen("tcp", addr)
-	}
-	if err != nil {
-		return err
-	}
-
-	defer func() { _ = ln.Close() }()
-	go closeListenerOnDone(ctx, ln)
-	util.Info("🧩 Broker listening on %s (TLS=%v, Compression=%v)", addr, cfg.UseTLS, cfg.CompressionType)
-
-	if cd != nil {
-		cd.Start()
-		util.Info("🔄 Coordinator started with heartbeat monitoring")
-	}
-
 	var cc *clusterController.ClusterController
 	var rm *replication.RaftReplicationManager
 	var clusterClient *client.TCPClusterClient
 	var discoveryListener net.Listener
+	healthState := NewHealthState()
+	var startupComplete atomic.Bool
+	healthState.AddCheck("broker_startup", func(context.Context) error {
+		if !startupComplete.Load() {
+			return fmt.Errorf("broker initialization is in progress")
+		}
+		return nil
+	})
+	addStorageReadinessChecks(healthState, tm, dm)
+	if cd != nil {
+		addConsumerMetadataReadinessCheck(healthState, cd)
+	}
+	healthState.SetReady(true)
+	healthPort := cfg.HealthCheckPort
+	if healthPort == 0 {
+		healthPort = DefaultHealthCheckPort
+	}
+	healthServer, healthErr := startHealthCheckServer(healthPort, healthState)
+	if healthErr != nil {
+		return fmt.Errorf("start health server: %w", healthErr)
+	}
 	defer func() {
+		healthState.SetReady(false)
+		shutdownHTTPServer(healthServer)
 		if discoveryListener != nil {
 			_ = discoveryListener.Close()
 		}
@@ -228,6 +232,14 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 
 		util.Info("🌐 Distributed clustering enabled (brokerID=%s, localAddr=%s)", brokerID, localAddr)
 	}
+	if cfg.EnabledDistribution {
+		if cd == nil {
+			return fmt.Errorf("%w: coordinator unavailable", ErrConsumerMetadataRecovery)
+		}
+		if err := awaitDistributedConsumerMetadataRecovery(ctx, cd, tm); err != nil {
+			return err
+		}
+	}
 
 	globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
 	requestBudget := newRequestMemoryBudget(cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes)
@@ -245,6 +257,8 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	if cd != nil {
 		cd.SetGroupSessionCallbacks(globalCH.IsGroupCoordinator, globalCH.ExpireGroupMembers)
 		cd.SetGroupObservationBatchResolver(globalCH.ResolveGroupCoordinators)
+		cd.Start()
+		util.Info("🔄 Coordinator started with heartbeat monitoring")
 	}
 	if cc != nil {
 		cc.SetLocalProcessor(globalCH)
@@ -259,6 +273,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		}
 		defer shutdownInternal()
 	}
+	if err := registerStaticConsumerGroups(cfg, tm, globalCH); err != nil {
+		return fmt.Errorf("register static consumer groups: %w", err)
+	}
 	if cfg.ObservationGRPCPort > 0 {
 		shutdownObservation, err := startObservationGRPC(ctx, cfg)
 		if err != nil {
@@ -272,11 +289,25 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	}
 	globalCH.StartTransactionTimeoutMonitor(ctx)
 
-	healthState := NewHealthState()
-	addStorageReadinessChecks(healthState, tm, dm)
-	if cd != nil {
-		addConsumerMetadataReadinessCheck(healthState, cd)
+	addr := fmt.Sprintf(":%d", cfg.BrokerPort)
+	var ln net.Listener
+	var err error
+	if cfg.UseTLS {
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cfg.TLSCert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		ln, err = tls.Listen("tcp", addr, tlsConfig)
+	} else {
+		ln, err = net.Listen("tcp", addr)
 	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = ln.Close() }()
+	go closeListenerOnDone(ctx, ln)
+	util.Info("🧩 Broker listening on %s (TLS=%v, Compression=%v)", addr, cfg.UseTLS, cfg.CompressionType)
+
 	if cfg.EnabledDistribution {
 		healthState.AddCheck("cluster_leader", func(context.Context) error {
 			if cc == nil {
@@ -323,16 +354,6 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		util.Info("📉 Exporter disabled")
 	}
 
-	healthPort := cfg.HealthCheckPort
-	if healthPort == 0 {
-		healthPort = DefaultHealthCheckPort
-	}
-	healthServer, healthErr := startHealthCheckServer(healthPort, healthState)
-	if healthErr != nil {
-		return fmt.Errorf("start health server: %w", healthErr)
-	}
-	defer shutdownHTTPServer(healthServer)
-
 	workerCount := maxClientConnections(cfg)
 	workerCh := make(chan net.Conn, workerCount)
 	connectionSlots := newConnectionLimiter(workerCount)
@@ -352,6 +373,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		close(workerCh)
 		workerWG.Wait()
 	}()
+	startupComplete.Store(true)
 
 	var temporaryDelay time.Duration
 	for {
@@ -418,6 +440,114 @@ func startObservationGRPC(ctx context.Context, cfg *config.Config) (func(), erro
 		return nil, err
 	}
 	return shutdown, nil
+}
+
+func awaitDistributedConsumerMetadataRecovery(ctx context.Context, cd *coordinator.Coordinator, tm *topic.TopicManager) error {
+	const retryInterval = 100 * time.Millisecond
+	for {
+		if consumerMetadataHWMReady(tm) {
+			err := cd.ReloadDistributedConsumerMetadata()
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, types.ErrCommittedHWMUnavailable) {
+				return fmt.Errorf("%w: %w", ErrConsumerMetadataRecovery, err)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(retryInterval):
+		}
+	}
+}
+
+func consumerMetadataHWMReady(tm *topic.TopicManager) bool {
+	if tm == nil {
+		return false
+	}
+	current := tm.GetTopic(config.ConsumerOffsetsTopicName)
+	if current == nil || len(current.Partitions) == 0 {
+		return false
+	}
+	for _, partition := range current.Partitions {
+		if partition == nil || !partition.HWMKnown() {
+			return false
+		}
+	}
+	return true
+}
+
+func registerStaticConsumerGroups(cfg *config.Config, tm *topic.TopicManager, handler *controller.CommandHandler) error {
+	if cfg == nil {
+		return fmt.Errorf("config is nil")
+	}
+	if len(cfg.StaticConsumerGroups) == 0 {
+		return nil
+	}
+	if tm == nil {
+		return fmt.Errorf("topic manager is unavailable")
+	}
+	if handler == nil || handler.Coordinator == nil {
+		return fmt.Errorf("consumer group coordinator is unavailable")
+	}
+	for _, group := range cfg.StaticConsumerGroups {
+		if strings.TrimSpace(group.Name) == "" {
+			return fmt.Errorf("static consumer group name is empty")
+		}
+		if group.ConsumerCount <= 0 {
+			return fmt.Errorf("static consumer group %q has invalid consumer count %d", group.Name, group.ConsumerCount)
+		}
+		if len(group.Topics) == 0 {
+			return fmt.Errorf("static consumer group %q has no topics", group.Name)
+		}
+
+		localTopics := make([]*topic.Topic, 0, len(group.Topics))
+		partitionCounts := make(map[string]int, len(group.Topics))
+		for _, topicName := range group.Topics {
+			current := tm.GetTopic(topicName)
+			if current == nil {
+				return fmt.Errorf("static consumer group %q references missing topic %q", group.Name, topicName)
+			}
+			actualPartitions := len(current.Partitions)
+			if actualPartitions == 0 {
+				return fmt.Errorf("static consumer group %q topic %q has no partitions", group.Name, topicName)
+			}
+			if configured := group.TopicPartitions[topicName]; configured > 0 && configured != actualPartitions {
+				return fmt.Errorf(
+					"static consumer group %q topic %q partition count mismatch: configured=%d actual=%d",
+					group.Name, topicName, configured, actualPartitions,
+				)
+			}
+			localTopics = append(localTopics, current)
+			partitionCounts[topicName] = actualPartitions
+		}
+
+		owned := true
+		if cfg.EnabledDistribution {
+			var err error
+			owned, err = handler.ResolveGroupCoordinator(group.Name)
+			if err != nil {
+				return fmt.Errorf("resolve coordinator for static consumer group %q: %w", group.Name, err)
+			}
+		}
+		if owned {
+			var err error
+			if len(group.Topics) == 1 {
+				topicName := group.Topics[0]
+				err = handler.Coordinator.RegisterGroup(topicName, group.Name, partitionCounts[topicName])
+			} else {
+				err = handler.Coordinator.RegisterGroupSubscription(group.Name, group.Topics, "", partitionCounts)
+			}
+			if err != nil {
+				return fmt.Errorf("persist static consumer group %q: %w", group.Name, err)
+			}
+		}
+		for _, current := range localTopics {
+			current.RegisterConsumerGroup(group.Name, group.ConsumerCount)
+		}
+	}
+	return nil
 }
 
 func closeListenerOnDone(ctx context.Context, ln net.Listener) {

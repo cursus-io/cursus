@@ -189,6 +189,7 @@ func TestIdempotentDuplicateResumesReplicationBeforeAcknowledging(t *testing.T) 
 	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
 	partition, err := manager.GetTopic("orders").GetPartition(0)
 	require.NoError(t, err)
+	partition.SetHWM(0)
 	messages := []types.Message{{Payload: "value", ProducerID: "p1", Epoch: 7, SeqNum: 1}}
 	require.NoError(t, partition.EnqueueBatchLeaderWithMode(messages, true))
 	require.Zero(t, partition.GetHWM())
@@ -718,6 +719,7 @@ func TestReplicaNewLeaderEpochReconcilesUncommittedOldLeaderTail(t *testing.T) {
 	})
 	partition, err := manager.GetTopic("orders").GetPartition(0)
 	require.NoError(t, err)
+	partition.SetHWM(0)
 	oldTail := []types.Message{{Payload: "old-uncommitted"}}
 	require.NoError(t, partition.EnqueueBatchLeader(oldTail))
 	require.Equal(t, uint64(1), partition.NextOffset())
@@ -763,6 +765,7 @@ func TestAllInsufficientISRRejectsBeforeLeadershipReconciliation(t *testing.T) {
 
 	partition, err := manager.GetTopic("orders").GetPartition(0)
 	require.NoError(t, err)
+	partition.SetHWM(0)
 	oldTail := []types.Message{{Payload: "old-uncommitted"}}
 	require.NoError(t, partition.EnqueueBatchLeader(oldTail))
 	require.Equal(t, uint64(1), partition.NextOffset())

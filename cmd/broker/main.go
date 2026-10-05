@@ -96,7 +96,12 @@ func runBroker(ctx context.Context, cfg *config.Config) (runErr error) {
 		return runErr
 	}
 
-	cd, err := coordinator.NewCoordinatorWithRecovery(ctx, cfg, tm)
+	var cd *coordinator.Coordinator
+	if cfg.EnabledDistribution {
+		cd, err = coordinator.NewCoordinatorAwaitingDistributedRecovery(ctx, cfg, tm)
+	} else {
+		cd, err = coordinator.NewCoordinatorWithRecovery(ctx, cfg, tm)
+	}
 	if cd != nil {
 		defer cd.Stop()
 	}
@@ -109,20 +114,12 @@ func runBroker(ctx context.Context, cfg *config.Config) (runErr error) {
 		return runErr
 	}
 	tm.SetCoordinator(cd)
-	for _, gcfg := range cfg.StaticConsumerGroups {
-		for _, topicName := range gcfg.Topics {
-			current := tm.GetTopic(topicName)
-			if current == nil {
-				util.Error("⚠️ Topic %q does not exist; skipping static consumer group registration", topicName)
-				continue
-			}
-			if _, err := tm.RegisterConsumerGroup(topicName, gcfg.Name, gcfg.ConsumerCount); err != nil {
-				util.Error("⚠️ Failed to register static consumer group %q on topic %q: %v", gcfg.Name, topicName, err)
-			}
-		}
-	}
 
 	runErr = runServerContext(ctx, cfg, tm, dm, cd, sm)
+	if errors.Is(runErr, server.ErrConsumerMetadataRecovery) {
+		util.Error("Failed to recover durable consumer metadata; serving diagnostics only: %v", runErr)
+		runErr = runConsumerMetadataDiagnostics(ctx, cfg, tm, dm, cd)
+	}
 	if errors.Is(runErr, context.Canceled) {
 		runErr = nil
 	}

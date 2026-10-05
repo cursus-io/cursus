@@ -94,7 +94,7 @@ spec:
             {{- end }}  
           startupProbe:
             httpGet:
-              path: /ready
+              path: /live
               port: health
             periodSeconds: 2
             timeoutSeconds: 2
