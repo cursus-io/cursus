@@ -240,10 +240,15 @@ ERROR: replica_index_failed reason="..."
 ### CONSUME
 
 ```text
-CONSUME topic=<name> group=<group> partition=<N> offset=<N> member=<member-id> [isolation=<read_committed|read_uncommitted>] [batch=<N>]
+CONSUME topic=<name> group=<group> partition=<N> offset=<N> member=<member-id> [isolation=<read_committed|read_uncommitted>] [batch=<1..8192>] [wait_ms=<1..30000>]
 ```
 
 `CONSUME` returns binary message frames. For consumer groups, the broker uses the committed offset for `(topic, group, partition)` as the authoritative resume point when one exists; otherwise the earliest offset policy is `0`. `CONSUME` is a stateless partition-leader read: ownership, liveness, and generation fencing are enforced by coordinator commands, not on the data path. The default isolation is `read_committed`, which hides unresolved and aborted transactional records. `isolation=read_uncommitted` returns the raw committed log, including transaction metadata and control markers.
+
+The broker caps each fetch at 8,192 records and 64 MiB of decoded record data,
+so the returned batch can contain fewer records than requested. `wait_ms` enables
+a notification-driven long poll. It stops on request cancellation or deadline,
+and the effective wait never exceeds the remaining request deadline.
 
 Common errors:
 
@@ -256,6 +261,10 @@ ERROR: missing_member command=CONSUME
 ERROR: invalid_partition
 ERROR: invalid_offset
 ERROR: invalid_isolation isolation=<value>
+ERROR: invalid_batch maximum=8192
+ERROR: fetch_batch_too_large requested=<N> maximum=8192
+ERROR: invalid_wait_ms maximum=30000
+ERROR: fetch_wait_too_large requested=<N> maximum=30000
 ERROR: NOT_LEADER leader=<host:port>
 ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>
 ```
@@ -265,7 +274,7 @@ ERROR: OFFSET_OUT_OF_RANGE requested=<N> earliest=<N> latest=<N>
 Continuous push-mode consume command.
 
 ```text
-STREAM topic=<name> group=<group> partition=<N> offset=<N> member=<member-id> [isolation=<read_committed|read_uncommitted>]
+STREAM topic=<name> group=<group> partition=<N> offset=<N> member=<member-id> [isolation=<read_committed|read_uncommitted>] [batch=<1..8192>]
 ```
 
 `STREAM` returns one or more correlated Wire stream frames:
@@ -277,6 +286,9 @@ STREAM topic=<name> group=<group> partition=<N> offset=<N> member=<member-id> [i
 ```
 
 Clients must treat zero-length frames as keepalive. Like `CONSUME`, `STREAM` is a stateless partition-leader data path and does not validate group ownership or generation on every read. `STREAM` uses the same `isolation` contract as `CONSUME`; the default is `read_committed`. A `STREAM_CONTROL type=CLOSE` frame is a graceful terminator; `reason=offset_out_of_range` means the requested stream offset is older than the retained log. Clients should close the socket and resume through the consumer group offset contract or reset according to policy. Raw TCP disconnect without a close control frame remains possible on broker crash or network failure and should be treated as retryable.
+
+`STREAM` uses the same 8,192-record and 64 MiB decoded-data limits for each
+pushed batch.
 
 The broker does not commit offsets when records are written to a stream socket or when the stream closes. The client must commit the next offset explicitly after processing, using its current member and generation. This keeps stream delivery consistent with the at-least-once consumer-group contract.
 
@@ -718,3 +730,19 @@ ERROR: empty_command_response
 ERROR: unknown_command command=<name>
 ERROR: empty_command
 ```
+
+
+### Bounded fetch continuation and connection lifecycle
+
+`CONSUME` returns an empty batch when its effective long-poll deadline expires;
+explicit cancellation remains an error. In-flight requests do not consume the
+connection's idle timeout. An empty read caused by filtered transaction records
+retains its scan position for the next poll on the same connection. This scan
+position is not a consumer-group commit; reconnecting uses the normal offset
+resolution rules. `STREAM` likewise retains scan progress without advancing its
+delivered offset until records are written.
+
+Request payload admission allows one executing payload per connection, with only
+a fixed-size header read ahead. A broker-wide 256 MiB limit reserves encoded plus
+decoded request payload sizes until processing finishes. Admission failure closes
+the connection before payload allocation; clients should reconnect with backoff.

@@ -22,6 +22,13 @@ type StorageHandler interface {
 	Close() error
 }
 
+// BoundedStorageReader lets a storage implementation stop decoding once a
+// fetch reaches its byte budget. DecodedBytes describes storage bytes retained
+// by the returned records; production disk storage implements this interface.
+type BoundedStorageReader interface {
+	ReadMessagesBounded(offset uint64, maxRecords, maxBytes int, allowOversizedFirst bool) (messages []Message, decodedBytes int, err error)
+}
+
 // DurableBatchStorage extends StorageHandler with a batch append that does not
 // return until the batch has crossed the filesystem sync boundary. Production
 // disk handlers implement this contract; lightweight test or alternate storage

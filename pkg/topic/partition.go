@@ -723,6 +723,46 @@ func (p *Partition) ReadMessages(offset uint64, max int) ([]types.Message, error
 	return p.dh.ReadMessages(offset, max)
 }
 
+// ReadMessagesBounded keeps production disk reads within the caller's decoded
+// byte budget. Alternate in-memory storage retains compatibility and reports a
+// conservative estimate for the records it returns.
+func (p *Partition) ReadMessagesBounded(offset uint64, maxRecords, maxBytes int, allowOversizedFirst bool) ([]types.Message, int, error) {
+	if reader, ok := p.dh.(types.BoundedStorageReader); ok {
+		return reader.ReadMessagesBounded(offset, maxRecords, maxBytes, allowOversizedFirst)
+	}
+	messages, err := p.dh.ReadMessages(offset, maxRecords)
+	if err != nil {
+		return nil, 0, err
+	}
+	return fitMessagesToDecodedBudget(messages, maxBytes, allowOversizedFirst)
+}
+
+func fitMessagesToDecodedBudget(messages []types.Message, maxBytes int, allowOversizedFirst bool) ([]types.Message, int, error) {
+	if maxBytes <= 0 {
+		return messages, estimateDecodedMessageBytes(messages), nil
+	}
+	used := 0
+	for index, message := range messages {
+		size := estimateDecodedMessageBytes([]types.Message{message})
+		if used+size > maxBytes && (!allowOversizedFirst || index > 0) {
+			return messages[:index], used, nil
+		}
+		used += size
+	}
+	return messages, used, nil
+}
+
+func estimateDecodedMessageBytes(messages []types.Message) int {
+	total := 0
+	for _, message := range messages {
+		total += 128 + len(message.Topic) + len(message.ProducerID) + len(message.Payload) + len(message.Key) +
+			len(message.EventType) + len(message.Metadata) + len(message.EventID) + len(message.PayloadDigest) +
+			len(message.TransactionalID) + len(message.TransactionState) + len(message.TransactionMarker) +
+			len(message.ControlBatchType) + len(message.ControlBatchKey) + len(message.ControlBatchValue)
+	}
+	return total
+}
+
 // FirstOffset returns the current retention boundary for read-only clients.
 func (p *Partition) FirstOffset() uint64 {
 	return p.dh.GetFirstOffset()
@@ -745,6 +785,20 @@ func (p *Partition) LastStableOffset() uint64 {
 	return firstUnresolvedOpenOffset(hwm, p.txnRetentionFloor, p.txnOpenOffsets, p.txnMarkers, p.txnResolver)
 }
 func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, error) {
+	messages, _, err := p.ReadCommittedBounded(offset, max, 0, true)
+	return messages, err
+}
+
+// ReadCommittedBounded applies transaction visibility while bounding storage
+// bytes decoded during the scan.
+func (p *Partition) ReadCommittedBounded(offset uint64, max, maxBytes int, allowOversizedFirst bool) ([]types.Message, int, error) {
+	messages, decodedBytes, _, err := p.ReadCommittedPage(offset, max, maxBytes, allowOversizedFirst)
+	return messages, decodedBytes, err
+}
+
+// ReadCommittedPage returns the next scanned offset even when every decoded
+// record was filtered out. Callers retain it separately from delivered offsets.
+func (p *Partition) ReadCommittedPage(offset uint64, max, maxBytes int, allowOversizedFirst bool) ([]types.Message, int, uint64, error) {
 	p.mu.RLock()
 	hwm := p.HWM
 	p.mu.RUnlock()
@@ -757,7 +811,7 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 
 	earliest := p.dh.GetFirstOffset()
 	if offset < earliest {
-		return nil, &types.OffsetOutOfRangeError{
+		return nil, 0, offset, &types.OffsetOutOfRangeError{
 			Requested: offset,
 			Earliest:  earliest,
 			Latest:    hwm,
@@ -765,7 +819,7 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 	}
 
 	if offset >= hwm {
-		return nil, nil
+		return nil, 0, offset, nil
 	}
 	p.pruneTransactionIndex(earliest)
 
@@ -774,7 +828,7 @@ func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, erro
 		max = int(canRead) // #nosec G115 -- canRead is bounded by math.MaxInt before narrowing.
 	}
 
-	return p.readVisibleCommitted(offset, max, hwm)
+	return p.readVisibleCommittedBounded(offset, max, maxBytes, allowOversizedFirst, hwm)
 }
 
 // ReadCommittedRange is the non-consuming counterpart to ReadCommitted for a
@@ -807,8 +861,13 @@ func (p *Partition) ReadCommittedRange(offset, endOffset uint64, max int) ([]typ
 }
 
 func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm uint64) ([]types.Message, error) {
+	messages, _, _, err := p.readVisibleCommittedBounded(offset, max, 0, true, hwm)
+	return messages, err
+}
+
+func (p *Partition) readVisibleCommittedBounded(offset uint64, max, maxBytes int, allowOversizedFirst bool, hwm uint64) ([]types.Message, int, uint64, error) {
 	if max <= 0 {
-		return nil, nil
+		return nil, 0, offset, nil
 	}
 
 	p.txnMarkerMu.RLock()
@@ -819,15 +878,20 @@ func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm uint64) ([]
 	if lso < scanLimit {
 		scanLimit = lso
 	}
-	return p.readCommittedScanRange(offset, scanLimit, hwm, max, p.txnMarkers, resolver)
+	return p.readCommittedScanRangeBounded(offset, scanLimit, hwm, max, maxBytes, allowOversizedFirst, p.txnMarkers, resolver)
 }
 
-func (p *Partition) readCommittedScanRange(offset, scanLimit, committedHWM uint64, maxVisible int, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) ([]types.Message, error) {
+func (p *Partition) readCommittedScanRangeBounded(offset, scanLimit, committedHWM uint64, maxVisible, maxBytes int, allowOversizedFirst bool, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) ([]types.Message, int, uint64, error) {
 	if offset >= scanLimit {
-		return nil, nil
+		return nil, 0, offset, nil
 	}
 
-	visible := make([]types.Message, 0, maxVisible)
+	capacity := maxVisible
+	if capacity > 1024 {
+		capacity = 1024
+	}
+	visible := make([]types.Message, 0, capacity)
+	decodedBytes := 0
 	current := offset
 	const scanBatchSize = 1024
 	for current < scanLimit && len(visible) < maxVisible {
@@ -840,10 +904,18 @@ func (p *Partition) readCommittedScanRange(offset, scanLimit, committedHWM uint6
 			break
 		}
 
-		batch, err := p.ReadMessages(current, readMax)
-		if err != nil {
-			return nil, err
+		remainingBytes := 0
+		if maxBytes > 0 {
+			remainingBytes = maxBytes - decodedBytes
+			if remainingBytes <= 0 && decodedBytes > 0 {
+				break
+			}
 		}
+		batch, batchBytes, err := p.ReadMessagesBounded(current, readMax, remainingBytes, allowOversizedFirst && decodedBytes == 0)
+		if err != nil {
+			return nil, decodedBytes, offset, err
+		}
+		decodedBytes += batchBytes
 		if len(batch) == 0 {
 			break
 		}
@@ -866,8 +938,11 @@ func (p *Partition) readCommittedScanRange(offset, scanLimit, committedHWM uint6
 		if len(batch) < readMax {
 			break
 		}
+		if maxBytes > 0 && decodedBytes >= maxBytes {
+			break
+		}
 	}
-	return visible, nil
+	return visible, decodedBytes, current, nil
 }
 
 func (p *Partition) indexTransactionMessage(msg types.Message) {

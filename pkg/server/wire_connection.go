@@ -33,6 +33,9 @@ func newServerWireConn(conn net.Conn, connection *wire.Connection) *serverWireCo
 }
 
 func (c *serverWireConn) setRequest(request wire.Frame) {
+	// Responses need only correlation metadata. Retaining the payload here would
+	// keep a completed request alive after its admission reservation is released.
+	request.Payload = nil
 	c.mu.Lock()
 	c.request = request
 	c.mu.Unlock()
@@ -107,8 +110,8 @@ func negotiateServerConnection(conn net.Conn) (*wire.Connection, *serverWireConn
 	return connection, newServerWireConn(conn, connection), nil
 }
 
-func readWireRequest(connection *wire.Connection) (wire.Frame, error) {
-	frame, err := connection.ReadFrame()
+func readWireRequestWithAdmission(connection *wire.Connection, admit func(int, int) error) (wire.Frame, error) {
+	frame, err := connection.ReadFrameWithAdmission(admit)
 	if err != nil {
 		return wire.Frame{}, err
 	}

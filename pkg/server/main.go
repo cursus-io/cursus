@@ -518,49 +518,58 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 	}
 	_ = conn.SetDeadline(time.Time{})
 
+	activity := &requestActivity{conn: conn, last: time.Now()}
+	requests := make(chan admittedRequest)
+	readPumpCtx, stopReadPump := context.WithCancel(clientCtx)
+	pumpDone := make(chan struct{})
+	// Keep partial headers/payloads across polling deadlines instead of restarting
+	// frame decoding after a timeout in the middle of a frame.
+	reader := &requestReader{Conn: conn, ctx: readPumpCtx, activity: activity, idleTimeout: idleTimeout}
+	wireConnection.SetReader(reader)
+	go func() {
+		defer close(pumpDone)
+		pumpWireRequests(readPumpCtx, cancel, wireConnection, activity, requests)
+	}()
+	defer func() {
+		stopReadPump()
+		_ = conn.SetReadDeadline(time.Now())
+		<-pumpDone
+		if isStreamed {
+			_ = conn.SetReadDeadline(time.Time{})
+		}
+	}()
 	for {
+		var request admittedRequest
 		select {
 		case <-clientCtx.Done():
 			return
-		default:
-		}
-		deadline := time.Now().Add(readDeadlinePoll)
-		idleDeadline := lastActivity.Add(idleTimeout)
-		if idleDeadline.Before(deadline) {
-			deadline = idleDeadline
-		}
-		if err := conn.SetReadDeadline(deadline); err != nil {
-			util.Error("⚠️ SetReadDeadline error: %v", err)
-			return
-		}
-
-		request, err := readWireRequest(wireConnection)
-		if err != nil {
-			select {
-			case <-clientCtx.Done():
-				return
-			default:
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() && time.Since(lastActivity) < idleTimeout {
-					continue
-				}
+		case next, ok := <-requests:
+			if !ok {
 				return
 			}
+			request = next
 		}
-
-		lastActivity = time.Now()
-		responseConn.setRequest(request)
+		// A STREAM frame is a pump barrier. No subsequent read starts until this
+		// request fails; successful registration transfers the connection completely.
+		if request.frame.Command == wire.CommandStream {
+			_ = conn.SetReadDeadline(time.Time{})
+		}
+		responseConn.setRequest(request.frame)
 		requestCtx, cancelRequest := context.WithTimeout(clientCtx, clientRequestTimeout(cmdHandler.Config))
 		cmdCtx.SetRequestContext(requestCtx)
-		shouldExit, err := processMessage(request.Payload, cmdHandler, cmdCtx, responseConn)
+		shouldExit, err := processMessage(request.frame.Payload, cmdHandler, cmdCtx, responseConn)
 		cmdCtx.SetRequestContext(clientCtx)
 		cancelRequest()
+		if shouldExit || err != nil {
+			stopReadPump()
+		}
+		request.frame.Payload = nil
+		request.finish()
 		if err != nil {
 			return
 		}
 		if shouldExit {
-			if request.Command == wire.CommandStream {
-				isStreamed = true
-			}
+			isStreamed = request.frame.Command == wire.CommandStream
 			return
 		}
 	}
@@ -837,6 +846,12 @@ func suppressBatchPublishResponse(data []byte, ctx *controller.ClientContext) bo
 
 func commandErrorResponse(err error, ctx *controller.ClientContext) string {
 	resp := err.Error()
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		resp = "ERROR: request_timeout outcome=not_accepted"
+	case errors.Is(err, context.Canceled):
+		resp = "ERROR: request_cancelled"
+	}
 	if !wireprotocol.IsErrorResponse(resp) {
 		resp = fmt.Sprintf("ERROR: command_failed reason=%q", resp)
 	}

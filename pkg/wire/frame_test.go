@@ -123,3 +123,20 @@ func FuzzCodecDecode(f *testing.F) {
 		_, _ = codec.Decode(data)
 	})
 }
+
+func TestFrameAdmissionPrecedesPayloadRead(t *testing.T) {
+	codec, err := wire.NewCodec(wire.CompressionNone)
+	require.NoError(t, err)
+	encoded, err := codec.Encode(wire.Frame{Kind: wire.KindRequest, Command: wire.CommandPublish, RequestID: 1, Payload: make([]byte, 4096)})
+	require.NoError(t, err)
+	reader := bytes.NewReader(encoded)
+	rejected := errors.New("capacity exhausted")
+	_, err = codec.ReadFrameWithAdmission(reader, func(encoded, decoded int) error {
+		require.Equal(t, 4096, encoded)
+		require.Equal(t, 4096, decoded)
+		require.Equal(t, 4096, reader.Len())
+		return rejected
+	})
+	require.ErrorIs(t, err, rejected)
+	require.Equal(t, 4096, reader.Len())
+}

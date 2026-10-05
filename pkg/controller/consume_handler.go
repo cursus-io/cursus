@@ -1,9 +1,11 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -13,6 +15,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -57,52 +60,73 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 	}
 
 	totalStreamed := 0
+	remainingBytes := wire.MaxFetchDecodedBytes
+	fetchBudgetExhausted := false
 	var allMessages []types.Message
 
-	for _, tName := range matchedTopics {
-		if totalStreamed >= cArgs.BatchSize {
-			break
-		}
+	readAvailable := func() error {
+		for _, tName := range matchedTopics {
+			if totalStreamed >= cArgs.BatchSize {
+				break
+			}
 
-		remainingBatch := cArgs.BatchSize - totalStreamed
-		messages, err := ch.readFromTopic(tName, cArgs, ctx, remainingBatch)
+			remainingBatch := cArgs.BatchSize - totalStreamed
+			messages, decodedBytes, err := ch.readFromTopicBounded(tName, cArgs, ctx, remainingBatch, remainingBytes, totalStreamed == 0)
+			if err != nil {
+				return err
+			}
+			remainingBytes -= decodedBytes
+			if remainingBytes <= 0 || (len(messages) == 0 && decodedBytes > 0) {
+				fetchBudgetExhausted = true
+			}
+			if len(messages) > 0 {
+				allMessages = append(allMessages, messages...)
+				totalStreamed += len(messages)
+			}
+			if fetchBudgetExhausted {
+				break
+			}
+		}
+		return nil
+	}
+
+	if cArgs.WaitTimeout > 0 {
+		requestCtx := ctx.RequestContext()
+		waitTimeout, err := effectiveConsumeWait(requestCtx, cArgs.WaitTimeout)
 		if err != nil {
-			if ch.writeConsumeReadError(conn, err) {
-				return totalStreamed, nil
+			return 0, err
+		}
+		deadline := time.Now().Add(waitTimeout)
+		for waitTimeout > 0 && totalStreamed == 0 && !fetchBudgetExhausted {
+			// Subscribe before reading so an append between the read and wait
+			// closes the captured generation instead of being missed.
+			notifications, err := ch.consumeNotifications(matchedTopics, cArgs.PartitionID)
+			if err != nil {
+				return 0, err
 			}
-			return totalStreamed, err
-		}
-		if len(messages) > 0 {
-			allMessages = append(allMessages, messages...)
-			totalStreamed += len(messages)
-		}
-	}
-
-	if totalStreamed == 0 && cArgs.WaitTimeout > 0 {
-		startTime := time.Now()
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-
-		for time.Since(startTime) < cArgs.WaitTimeout {
-			<-ticker.C
-			for _, tName := range matchedTopics {
-				messages, err := ch.readFromTopic(tName, cArgs, ctx, cArgs.BatchSize)
-				if err != nil {
-					if ch.writeConsumeReadError(conn, err) {
-						return 0, nil
-					}
-					return 0, err
+			if err := readAvailable(); err != nil {
+				if ch.writeConsumeReadError(conn, err) {
+					return 0, nil
 				}
-				if len(messages) > 0 {
-					allMessages = append(allMessages, messages...)
-					totalStreamed += len(messages)
-					goto sendBatch
+				return 0, err
+			}
+			if totalStreamed > 0 || fetchBudgetExhausted {
+				break
+			}
+			if err := waitForConsumeNotification(requestCtx, time.Until(deadline), notifications); err != nil {
+				if errors.Is(err, errConsumeWaitElapsed) {
+					break
 				}
+				return 0, err
 			}
 		}
+	} else if err := readAvailable(); err != nil {
+		if ch.writeConsumeReadError(conn, err) {
+			return totalStreamed, nil
+		}
+		return totalStreamed, err
 	}
 
-sendBatch:
 	batchData, err := util.EncodeBatchMessages(cArgs.TopicName, cArgs.PartitionID, "1", false, allMessages)
 	if err != nil {
 		return 0, fmt.Errorf("failed to encode batch: %w", err)
@@ -128,12 +152,17 @@ func (ch *CommandHandler) writeConsumeReadError(conn net.Conn, err error) bool {
 	return true
 }
 func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx *ClientContext, batchSize int) ([]types.Message, error) {
+	messages, _, err := ch.readFromTopicBounded(topicName, cArgs, ctx, batchSize, wire.MaxFetchDecodedBytes, true)
+	return messages, err
+}
+
+func (ch *CommandHandler) readFromTopicBounded(topicName string, cArgs CommonArgs, ctx *ClientContext, batchSize, maxBytes int, allowOversizedFirst bool) ([]types.Message, int, error) {
 	t, p, err := ch.getTopicAndPartition(topicName, cArgs.PartitionID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if authResp := ch.authorizeTopicRead(t.PolicySnapshot(), ctx); authResp != "" {
-		return nil, fmt.Errorf("%s topic=%s", authResp, topicName)
+		return nil, 0, fmt.Errorf("%s topic=%s", authResp, topicName)
 	}
 
 	cacheKey := fmt.Sprintf("%s-%d", topicName, cArgs.PartitionID)
@@ -143,23 +172,89 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 	} else {
 		actualOffset, err := ch.resolveOffset(p, topicName, cArgs)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		currentOffset = actualOffset
 	}
 
-	messages, err := readPartitionMessages(p, currentOffset, batchSize, cArgs.ReadIsolation)
+	messages, decodedBytes, nextScan, err := readPartitionPage(p, currentOffset, batchSize, maxBytes, allowOversizedFirst, cArgs.ReadIsolation)
 	if err != nil {
 		util.Error("Failed to read messages from topic %s: %v", topicName, err)
-		return nil, err
+		return nil, 0, err
 	}
 
-	if len(messages) > 0 {
-		lastMsg := messages[len(messages)-1]
-		ctx.OffsetCache[cacheKey] = lastMsg.Offset + 1
+	// This connection-local cursor can advance through aborted/control records
+	// without acknowledging or exposing them to the consumer group.
+	if nextScan > currentOffset {
+		ctx.OffsetCache[cacheKey] = nextScan
 	}
 
-	return messages, nil
+	return messages, decodedBytes, nil
+}
+
+var errConsumeWaitElapsed = errors.New("consume wait elapsed")
+
+func effectiveConsumeWait(ctx context.Context, requested time.Duration) (time.Duration, error) {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return 0, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, nil
+		}
+		if remaining < requested {
+			return remaining, nil
+		}
+	}
+	return requested, nil
+}
+
+func (ch *CommandHandler) consumeNotifications(topicNames []string, partitionID int) ([]<-chan struct{}, error) {
+	notifications := make([]<-chan struct{}, 0, len(topicNames))
+	for _, topicName := range topicNames {
+		_, partition, err := ch.getTopicAndPartition(topicName, partitionID)
+		if err != nil {
+			return nil, err
+		}
+		_, notification := partition.MessageNotification()
+		notifications = append(notifications, notification)
+	}
+	return notifications, nil
+}
+
+func waitForConsumeNotification(ctx context.Context, timeout time.Duration, notifications []<-chan struct{}) error {
+	if timeout <= 0 {
+		return errConsumeWaitElapsed
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	if len(notifications) > 65_534 {
+		return fmt.Errorf("consume topic pattern matches too many partitions: %d", len(notifications))
+	}
+	cases := make([]reflect.SelectCase, 0, len(notifications)+2)
+	cases = append(cases,
+		reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())},
+		reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(timer.C)},
+	)
+	for _, notification := range notifications {
+		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(notification)})
+	}
+	selected, _, _ := reflect.Select(cases)
+	switch selected {
+	case 0:
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return errConsumeWaitElapsed
+		}
+		return ctx.Err()
+	case 1:
+		return errConsumeWaitElapsed
+	default:
+		return nil
+	}
 }
 
 func (ch *CommandHandler) matchTopicPattern(pattern string) ([]string, error) {
@@ -250,18 +345,33 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 
 	streamConn.SetMessageSource(p.MessageNotification)
 
+	// The stream invokes readFn serially. Keep scan progress distinct from its
+	// delivered offset so empty filtered pages cannot strand later visible data.
+	scanOffset := actualOffset
 	readFn := func(offset uint64, max int) ([]types.Message, error) {
-		return readPartitionMessages(p, offset, max, cArgs.ReadIsolation)
+		if offset > scanOffset {
+			scanOffset = offset
+		}
+		messages, _, next, err := readPartitionPage(p, scanOffset, max, wire.MaxFetchDecodedBytes, true, cArgs.ReadIsolation)
+		if err == nil {
+			scanOffset = next
+		}
+		return messages, err
 	}
 
 	return ch.StreamManager.AddStream(streamKey, streamConn, readFn)
 }
 
-func readPartitionMessages(p *topic.Partition, offset uint64, max int, isolation string) ([]types.Message, error) {
+func readPartitionPage(p *topic.Partition, offset uint64, maxRecords, maxBytes int, allowOversizedFirst bool, isolation string) ([]types.Message, int, uint64, error) {
 	if isolation == ReadIsolationUncommitted {
-		return p.ReadMessages(offset, max)
+		messages, bytes, err := p.ReadMessagesBounded(offset, maxRecords, maxBytes, allowOversizedFirst)
+		next := offset
+		if err == nil && len(messages) > 0 {
+			next = messages[len(messages)-1].Offset + 1
+		}
+		return messages, bytes, next, err
 	}
-	return p.ReadCommitted(offset, max)
+	return p.ReadCommittedPage(offset, maxRecords, maxBytes, allowOversizedFirst)
 }
 
 func (ch *CommandHandler) validateStreamSyntax(cmd, raw string) string {
@@ -417,12 +527,26 @@ func (ch *CommandHandler) parseCommonArgs(args map[string]string) (CommonArgs, e
 	}
 
 	batch := DefaultMaxPollRecords
-	if b, err := strconv.Atoi(args["batch"]); err == nil && b > 0 {
+	if rawBatch, supplied := args["batch"]; supplied {
+		b, err := strconv.Atoi(rawBatch)
+		if err != nil || b <= 0 {
+			return CommonArgs{}, fmt.Errorf("ERROR: invalid_batch maximum=%d", wire.MaxFetchRecords)
+		}
+		if b > wire.MaxFetchRecords {
+			return CommonArgs{}, fmt.Errorf("ERROR: fetch_batch_too_large requested=%d maximum=%d", b, wire.MaxFetchRecords)
+		}
 		batch = b
 	}
 
 	wait := 0 * time.Millisecond
-	if w, err := strconv.Atoi(args["wait_ms"]); err == nil && w > 0 {
+	if rawWait, supplied := args["wait_ms"]; supplied {
+		w, err := strconv.Atoi(rawWait)
+		if err != nil || w <= 0 {
+			return CommonArgs{}, fmt.Errorf("ERROR: invalid_wait_ms maximum=%d", wire.MaxFetchWaitMillis)
+		}
+		if w > wire.MaxFetchWaitMillis {
+			return CommonArgs{}, fmt.Errorf("ERROR: fetch_wait_too_large requested=%d maximum=%d", w, wire.MaxFetchWaitMillis)
+		}
 		wait = time.Duration(w) * time.Millisecond
 	}
 

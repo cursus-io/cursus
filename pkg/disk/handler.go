@@ -455,22 +455,30 @@ func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Mess
 
 // ReadMessages reads a batch of messages from the disk log, starting from the given offset.
 func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, error) {
+	messages, _, err := dh.ReadMessagesBounded(offset, max, 0, true)
+	return messages, err
+}
+
+// ReadMessagesBounded reads at most maxRecords while limiting the serialized
+// storage bytes retained by the result. A first record larger than maxBytes is
+// returned on its own so every valid record remains consumable.
+func (dh *DiskHandler) ReadMessagesBounded(offset uint64, maxRecords, maxBytes int, allowOversizedFirst bool) ([]types.Message, int, error) {
 	atomic.AddInt32(&dh.activeReaders, 1)
 	defer atomic.AddInt32(&dh.activeReaders, -1)
 
-	if max <= 0 {
-		return nil, nil
+	if maxRecords <= 0 {
+		return nil, 0, nil
 	}
 	_, targetSeg, err := dh.findSegmentForOffset(offset)
 	if err != nil {
 		util.Error("Segment not found for offset %d", offset)
-		return nil, err
+		return nil, 0, err
 	}
 
 	position, err := dh.findOffsetPosition(offset, targetSeg)
 	if err != nil {
 		util.Error("Position not found for offset %d", offset)
-		return nil, err
+		return nil, 0, err
 	}
 
 	dh.mu.Lock()
@@ -483,6 +491,7 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 	dh.mu.Unlock()
 
 	var messages []types.Message
+	decodedBytes := 0
 	startReading := false
 
 	for _, segBase := range readableSegments {
@@ -497,7 +506,7 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 		currentFile := dh.GetSegmentPath(segBase)
 		fi, err := os.Stat(currentFile)
 		if err != nil {
-			return nil, fmt.Errorf("stat segment %d: %w", segBase, err)
+			return nil, decodedBytes, fmt.Errorf("stat segment %d: %w", segBase, err)
 		}
 
 		actualSize := fi.Size()
@@ -512,18 +521,26 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 			// active segment because an append would leave the mapping stale.
 			reader, openErr := mmap.Open(currentFile)
 			if openErr != nil {
-				return nil, fmt.Errorf("open segment %d: %w", segBase, openErr)
+				return nil, decodedBytes, fmt.Errorf("open segment %d: %w", segBase, openErr)
 			}
 			lease = &segmentReaderLease{reader: reader}
 		} else {
 			lease, err = dh.segmentReaders.acquire(segBase, currentFile)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("open segment %d: %w", segBase, err)
+			return nil, decodedBytes, fmt.Errorf("open segment %d: %w", segBase, err)
 		}
 		reader := lease.Reader()
 
-		remaining := max - len(messages)
+		remaining := maxRecords - len(messages)
+		remainingBytes := 0
+		if maxBytes > 0 {
+			remainingBytes = maxBytes - decodedBytes
+			if remainingBytes <= 0 && len(messages) > 0 {
+				_ = lease.Close()
+				break
+			}
+		}
 		readPos := uint64(0)
 		if segBase == targetSeg {
 			readPos = position
@@ -531,35 +548,37 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 
 		activeSegment := segBase == currentSegment
 		allowOffsetGaps := !activeSegment && dh.segmentAllowsOffsetGaps(segBase, actualSize)
-		batch, readErr := dh.readMessagesFromPosition(reader, readPos, remaining, offset, segBase, activeSegment, allowOffsetGaps)
+		allowOversized := allowOversizedFirst && len(messages) == 0
+		batch, batchBytes, hitByteLimit, readErr := dh.readMessagesFromPositionBounded(reader, readPos, remaining, remainingBytes, allowOversized, offset, segBase, activeSegment, allowOffsetGaps)
 		if readErr != nil {
 			_ = lease.Close()
-			return nil, fmt.Errorf("read segment %d: %w", segBase, readErr)
+			return nil, decodedBytes, fmt.Errorf("read segment %d: %w", segBase, readErr)
 		}
-		if activeSegment && len(batch) == 0 && actualSize > 0 && uint64(actualSize) > readPos+4 {
+		if activeSegment && !hitByteLimit && len(batch) == 0 && actualSize > 0 && uint64(actualSize) > readPos+4 {
 			if err := lease.Close(); err != nil {
 				util.Debug("error closing reader: %v", err)
 			}
 
 			reader, reErr := mmap.Open(currentFile)
 			if reErr != nil {
-				return nil, fmt.Errorf("reopen segment %d: %w", segBase, reErr)
+				return nil, decodedBytes, fmt.Errorf("reopen segment %d: %w", segBase, reErr)
 			}
 			lease = &segmentReaderLease{reader: reader}
 
-			batch, readErr = dh.readMessagesFromPosition(reader, readPos, remaining, offset, segBase, activeSegment, allowOffsetGaps)
+			batch, batchBytes, hitByteLimit, readErr = dh.readMessagesFromPositionBounded(reader, readPos, remaining, remainingBytes, allowOversized, offset, segBase, activeSegment, allowOffsetGaps)
 			if readErr != nil {
 				_ = lease.Close()
-				return nil, fmt.Errorf("reread segment %d: %w", segBase, readErr)
+				return nil, decodedBytes, fmt.Errorf("reread segment %d: %w", segBase, readErr)
 			}
 		}
 
 		messages = append(messages, batch...)
+		decodedBytes += batchBytes
 		if err := lease.Close(); err != nil {
 			util.Debug("error closing reader: %v", err)
 		}
 
-		if len(messages) >= max {
+		if hitByteLimit || len(messages) >= maxRecords || (maxBytes > 0 && decodedBytes >= maxBytes) {
 			break
 		}
 		if len(messages) > 0 {
@@ -572,15 +591,22 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 		last := messages[len(messages)-1].Offset
 		util.Debug("Success: From=%d To=%d (Count=%d, Range: [%d-%d])", first, last, len(messages), messages[0].Offset, messages[len(messages)-1].Offset)
 	}
-	return messages, nil
+	return messages, decodedBytes, nil
 }
 
-// readMessagesFromPosition reads messages starting from a specific byte position
-func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position uint64, max int, targetOffset, segmentBase uint64, allowPartialTail, allowOffsetGaps bool) ([]types.Message, error) {
+func (dh *DiskHandler) readMessagesFromPositionBounded(reader *mmap.ReaderAt, position uint64, max, maxBytes int, allowOversizedFirst bool, targetOffset, segmentBase uint64, allowPartialTail, allowOffsetGaps bool) ([]types.Message, int, bool, error) {
 	if position > math.MaxInt {
-		return nil, fmt.Errorf("read position %d exceeds int range", position)
+		return nil, 0, false, fmt.Errorf("read position %d exceeds int range", position)
 	}
-	messages := make([]types.Message, 0, max)
+	capacity := max
+	if maxBytes > 0 && capacity > maxBytes/64+1 {
+		capacity = maxBytes/64 + 1
+	}
+	if capacity > 1024 {
+		capacity = 1024
+	}
+	messages := make([]types.Message, 0, capacity)
+	decodedBytes := 0
 	pos := int(position)
 	var lenBuf [4]byte
 	var dataBuf []byte
@@ -589,19 +615,22 @@ func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position 
 
 	for len(messages) < max && pos+4 <= reader.Len() {
 		if _, err := reader.ReadAt(lenBuf[:], int64(pos)); err != nil {
-			return nil, fmt.Errorf("read length at byte %d: %w", pos, err)
+			return nil, decodedBytes, false, fmt.Errorf("read length at byte %d: %w", pos, err)
 		}
 
 		msgLen := binary.BigEndian.Uint32(lenBuf[:])
 		if msgLen == 0 || msgLen > MaxMessageSize {
-			return nil, fmt.Errorf("corrupt message length %d at byte %d", msgLen, pos)
+			return nil, decodedBytes, false, fmt.Errorf("corrupt message length %d at byte %d", msgLen, pos)
 		}
 
 		if pos+4+int(msgLen) > reader.Len() {
 			if allowPartialTail {
-				return messages, nil
+				return messages, decodedBytes, false, nil
 			}
-			return nil, fmt.Errorf("truncated message at byte %d: expected %d payload bytes", pos, msgLen)
+			return nil, decodedBytes, false, fmt.Errorf("truncated message at byte %d: expected %d payload bytes", pos, msgLen)
+		}
+		if maxBytes > 0 && (!allowOversizedFirst || len(messages) > 0) && int64(decodedBytes)+int64(msgLen) > int64(maxBytes) {
+			return messages, decodedBytes, true, nil
 		}
 
 		if cap(dataBuf) < int(msgLen) {
@@ -610,21 +639,21 @@ func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position 
 			dataBuf = dataBuf[:msgLen]
 		}
 		if _, err := reader.ReadAt(dataBuf, int64(pos+4)); err != nil {
-			return nil, fmt.Errorf("read payload at byte %d: %w", pos, err)
+			return nil, decodedBytes, false, fmt.Errorf("read payload at byte %d: %w", pos, err)
 		}
 
 		diskMsg, err := util.DeserializeDiskMessage(dataBuf)
 		if err != nil {
-			return nil, fmt.Errorf("decode message at byte %d: %w", pos, err)
+			return nil, decodedBytes, false, fmt.Errorf("decode message at byte %d: %w", pos, err)
 		}
 		if !havePreviousOffset && pos == 0 && !allowOffsetGaps && diskMsg.Offset != segmentBase {
-			return nil, fmt.Errorf("unexpected first offset at byte %d: got %d for segment base %d", pos, diskMsg.Offset, segmentBase)
+			return nil, decodedBytes, false, fmt.Errorf("unexpected first offset at byte %d: got %d for segment base %d", pos, diskMsg.Offset, segmentBase)
 		}
 		if havePreviousOffset && diskMsg.Offset <= previousOffset {
-			return nil, fmt.Errorf("non-increasing offset at byte %d: got %d after %d", pos, diskMsg.Offset, previousOffset)
+			return nil, decodedBytes, false, fmt.Errorf("non-increasing offset at byte %d: got %d after %d", pos, diskMsg.Offset, previousOffset)
 		}
 		if havePreviousOffset && !allowOffsetGaps && diskMsg.Offset != previousOffset+1 {
-			return nil, fmt.Errorf("non-contiguous offset at byte %d: got %d after %d", pos, diskMsg.Offset, previousOffset)
+			return nil, decodedBytes, false, fmt.Errorf("non-contiguous offset at byte %d: got %d after %d", pos, diskMsg.Offset, previousOffset)
 		}
 		previousOffset = diskMsg.Offset
 		havePreviousOffset = true
@@ -656,15 +685,16 @@ func (dh *DiskHandler) readMessagesFromPosition(reader *mmap.ReaderAt, position 
 			ControlBatchKey:              diskMsg.ControlBatchKey,
 			ControlBatchValue:            diskMsg.ControlBatchValue,
 		})
+		decodedBytes += int(msgLen)
 		pos += 4 + int(msgLen)
 	}
 	if len(messages) < max && pos < reader.Len() {
 		if allowPartialTail {
-			return messages, nil
+			return messages, decodedBytes, false, nil
 		}
-		return nil, fmt.Errorf("truncated record length at byte %d", pos)
+		return nil, decodedBytes, false, fmt.Errorf("truncated record length at byte %d", pos)
 	}
-	return messages, nil
+	return messages, decodedBytes, false, nil
 }
 
 func (d *DiskHandler) countMessagesInSegment() (int, error) {

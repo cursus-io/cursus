@@ -430,3 +430,17 @@ func TestConsumerConfigRejectsInvalidRuntimeSettings(t *testing.T) {
 	}
 	require.Error(t, (*ConsumerConfig)(nil).Validate())
 }
+
+func TestConsumerConfigRejectsFetchesAboveBrokerLimit(t *testing.T) {
+	config := NewDefaultConsumerConfig()
+	config.BatchSize = MaxConsumerBatchRecords + 1
+	err := config.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must not exceed")
+
+	config = NewDefaultConsumerConfig()
+	config.MaxPollRecords = MaxConsumerBatchRecords + 1
+	err = config.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must not exceed")
+}
