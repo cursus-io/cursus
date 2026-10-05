@@ -35,9 +35,9 @@ func TestProducerAutoCreateSwitchIsAuthoritative(t *testing.T) {
 	cfg.BrokerAddrs = []string{"127.0.0.1:0"}
 	producer := &Producer{config: cfg}
 
-	require.NoError(t, producer.createConfiguredTopic())
+	require.NoError(t, producer.createConfiguredTopic(context.Background()))
 	cfg.AutoCreateTopics = true
-	require.ErrorContains(t, producer.createConfiguredTopic(), "auto-create topic")
+	require.ErrorContains(t, producer.createConfiguredTopic(context.Background()), "auto-create topic")
 }
 
 func TestProducerContextCancellationClosesProducer(t *testing.T) {

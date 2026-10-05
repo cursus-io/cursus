@@ -74,7 +74,7 @@ type Producer struct {
 	partitionMu      sync.RWMutex
 
 	done      chan struct{}
-	closed    int32
+	state     atomic.Uint32
 	closeMu   sync.Mutex
 	closeDone chan struct{}
 	closeErr  error
@@ -96,6 +96,9 @@ func NewProducerWithContext(ctx context.Context, cfg *PublisherConfig) (*Produce
 	if ctx == nil {
 		return nil, fmt.Errorf("producer context must not be nil")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if cfg == nil {
 		return nil, fmt.Errorf("publisher config is required")
 	}
@@ -113,12 +116,34 @@ func NewProducerWithContext(ctx context.Context, cfg *PublisherConfig) (*Produce
 	if err != nil {
 		return nil, fmt.Errorf("create producer client: %w", err)
 	}
-	bootstrap := &Producer{config: cfg}
-	if err := bootstrap.createConfiguredTopic(); err != nil {
+	bootstrap := &Producer{config: cfg, client: client, partitionLeaders: make(map[int]string)}
+	if err := bootstrap.createConfiguredTopic(ctx); err != nil {
 		_ = client.Close()
 		return nil, err
 	}
+	if err := bootstrap.fetchMetadata(ctx); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	connectedCount := 0
+	for i := 0; i < cfg.Partitions; i++ {
+		if err := client.connectPartition(ctx, i, bootstrap.getPartitionLeaderAddr(i)); err != nil {
+			LogError("Failed to connect partition %d: %v", i, err)
+		} else {
+			connectedCount++
+		}
+		if err := ctx.Err(); err != nil {
+			_ = client.Close()
+			return nil, err
+		}
+	}
+	if connectedCount == 0 {
+		_ = client.Close()
+		return nil, fmt.Errorf("failed to connect to any partition")
+	}
 
+	// Start workers only after initialization has succeeded, so failures and
+	// cancellation cannot leave partially initialized buffers or senders.
 	p := &Producer{
 		config:           cfg,
 		client:           client,
@@ -131,7 +156,7 @@ func NewProducerWithContext(ctx context.Context, cfg *PublisherConfig) (*Produce
 		bmLatencies:      make([]time.Duration, 0),
 		inFlight:         make([]int32, cfg.Partitions),
 		gcTicker:         time.NewTicker(1 * time.Minute),
-		partitionLeaders: make(map[int]string),
+		partitionLeaders: bootstrap.partitionLeaders,
 	}
 
 	p.partitionSentSeqs = make([]map[uint64]struct{}, cfg.Partitions)
@@ -146,25 +171,10 @@ func NewProducerWithContext(ctx context.Context, cfg *PublisherConfig) (*Produce
 		p.partitionBatchStates[i] = make(map[string]*BatchState)
 	}
 
-	p.fetchMetadata()
-
-	connectedCount := 0
 	for i := 0; i < cfg.Partitions; i++ {
 		p.buffers[i] = newPartitionBuffer()
-		brokerAddr := p.getPartitionLeaderAddr(i)
-		if err := p.client.ConnectPartition(i, brokerAddr); err != nil {
-			LogError("Failed to connect partition %d: %v", i, err)
-		} else {
-			connectedCount++
-		}
 		p.sendersWG.Add(1)
 		go p.partitionSender(i)
-	}
-	if connectedCount == 0 {
-		if closeErr := p.Close(); closeErr != nil {
-			LogWarn("failed to clean up producer after connection failure: %v", closeErr)
-		}
-		return nil, fmt.Errorf("failed to connect to any partition")
 	}
 
 	go p.batchStateGC()
@@ -182,27 +192,17 @@ func (p *Producer) closeOnContext(ctx context.Context) {
 	}()
 }
 
-func (p *Producer) fetchMetadata() {
+func (p *Producer) fetchMetadata(ctx context.Context) error {
 	addrs := p.config.BrokerAddrs
 	if len(addrs) == 0 {
-		return
+		return ctx.Err()
 	}
 	for _, addr := range addrs {
-		conn, err := dialAuthenticatedWireConnection(
-			context.Background(), addr, 5*time.Second,
-			p.config.HandshakeTimeoutMS, p.config.CompressionType, p.wireTLSConfig(),
-			p.config.Principal, p.config.AuthToken,
-		)
-		if err != nil {
-			continue
-		}
 		cmd := fmt.Sprintf("METADATA topic=%s", p.config.Topic)
-		if err := WriteWithLength(conn, []byte(cmd)); err != nil {
-			_ = conn.Close()
-			continue
+		resp, err := p.controlRequest(ctx, addr, cmd)
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		resp, err := ReadWithLength(conn)
-		_ = conn.Close()
 		if err != nil {
 			continue
 		}
@@ -218,11 +218,12 @@ func (p *Producer) fetchMetadata() {
 						p.setPartitionLeaderAddr(i, a)
 					}
 				}
-				return
+				return nil
 			}
 		}
-		return
+		return nil
 	}
+	return nil
 }
 
 func (p *Producer) getPartitionLeaderAddr(partition int) string {
@@ -275,11 +276,11 @@ func (p *Producer) CreateTopic(topic string, partitions int) error {
 	return p.CreateTopicWithOptions(topic, TopicOptions{Partitions: partitions})
 }
 
-func (p *Producer) createConfiguredTopic() error {
+func (p *Producer) createConfiguredTopic(ctx context.Context) error {
 	if p == nil || p.config == nil || !p.config.AutoCreateTopics {
 		return nil
 	}
-	if err := p.CreateTopic(p.config.Topic, p.config.Partitions); err != nil {
+	if err := p.createTopicWithOptions(ctx, p.config.Topic, TopicOptions{Partitions: p.config.Partitions}); err != nil {
 		return fmt.Errorf("auto-create topic %q: %w", p.config.Topic, err)
 	}
 	return nil
@@ -287,6 +288,10 @@ func (p *Producer) createConfiguredTopic() error {
 
 // CreateTopicWithOptions creates or updates a topic with explicit policy options.
 func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) error {
+	return p.createTopicWithOptions(context.Background(), topic, options)
+}
+
+func (p *Producer) createTopicWithOptions(ctx context.Context, topic string, options TopicOptions) error {
 	createCmd, err := buildCreateTopicCommand(topic, options, p.config.EnableIdempotence)
 	if err != nil {
 		return err
@@ -295,24 +300,9 @@ func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) er
 		return fmt.Errorf("no broker addresses available")
 	}
 	brokerAddr := p.config.BrokerAddrs[0]
-	conn, err := dialAuthenticatedWireConnection(
-		context.Background(), brokerAddr, 5*time.Second,
-		p.config.HandshakeTimeoutMS, p.config.CompressionType, p.wireTLSConfig(),
-		p.config.Principal, p.config.AuthToken,
-	)
+	resp, err := p.controlRequest(ctx, brokerAddr, createCmd)
 	if err != nil {
-		return fmt.Errorf("connect: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
-	cmdBytes := []byte(createCmd)
-
-	if err := WriteWithLength(conn, cmdBytes); err != nil {
-		return fmt.Errorf("send command: %w", err)
-	}
-
-	resp, err := ReadWithLength(conn)
-	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+		return err
 	}
 
 	respStr := strings.TrimSpace(string(resp))
@@ -322,6 +312,42 @@ func (p *Producer) CreateTopicWithOptions(topic string, options TopicOptions) er
 
 	LogInfo("create topic %s partition %d", topic, options.Partitions)
 	return nil
+}
+
+// controlRequest bounds initialization and topic-management exchanges even
+// when the caller has no deadline. AckTimeoutMS covers the entire exchange.
+func (p *Producer) controlRequest(ctx context.Context, addr, command string) ([]byte, error) {
+	timeout := 5 * time.Second
+	if p.config.AckTimeoutMS > 0 {
+		timeout = time.Duration(p.config.AckTimeoutMS) * time.Millisecond
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := dialAuthenticatedWireConnection(
+		requestCtx, addr, 5*time.Second,
+		p.config.HandshakeTimeoutMS, p.config.CompressionType, p.wireTLSConfig(),
+		p.config.Principal, p.config.AuthToken,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	stopCancellation := context.AfterFunc(requestCtx, func() { _ = conn.Close() })
+	defer stopCancellation()
+	if err := WriteWithLength(conn, []byte(command)); err != nil {
+		if requestCtx.Err() != nil {
+			return nil, requestCtx.Err()
+		}
+		return nil, fmt.Errorf("send command: %w", err)
+	}
+	response, err := ReadWithLength(conn)
+	if requestCtx.Err() != nil {
+		return nil, requestCtx.Err()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	return response, nil
 }
 
 func buildCreateTopicCommand(topic string, options TopicOptions, idempotent bool) (string, error) {
@@ -438,7 +464,7 @@ func isSafeTopicOptionValue(value string, allowEmpty bool) bool {
 
 // Send enqueues payload for delivery and returns the assigned sequence number.
 func (p *Producer) Send(payload string) (uint64, error) {
-	if atomic.LoadInt32(&p.closed) == 1 {
+	if p.State() != ProducerStateOpen {
 		return 0, fmt.Errorf("send: %w", ErrProducerClosed)
 	}
 
@@ -597,9 +623,17 @@ func (p *Producer) Flush() error {
 	timeout := p.flushTimeout()
 
 	p.closeMu.Lock()
-	if atomic.LoadInt32(&p.closed) == 1 {
+	if p.State() != ProducerStateOpen {
+		closeDone := p.closeDone
 		p.closeMu.Unlock()
-		return p.deliveryError()
+		if closeDone == nil {
+			return fmt.Errorf("flush: %w", ErrProducerClosed)
+		}
+		<-closeDone
+		p.closeMu.Lock()
+		err := p.closeErr
+		p.closeMu.Unlock()
+		return err
 	}
 	waiters := p.requestDrain(false)
 	p.closeMu.Unlock()
@@ -814,7 +848,7 @@ func (p *Producer) Close() (result error) {
 	if p.closeDone == nil {
 		p.closeDone = make(chan struct{})
 	}
-	if atomic.LoadInt32(&p.closed) == 1 {
+	if p.State() != ProducerStateOpen {
 		closeDone := p.closeDone
 		p.closeMu.Unlock()
 		<-closeDone
@@ -822,12 +856,13 @@ func (p *Producer) Close() (result error) {
 		defer p.closeMu.Unlock()
 		return p.closeErr
 	}
-	atomic.StoreInt32(&p.closed, 1)
+	p.state.Store(uint32(ProducerStateClosing))
 	waiters := p.requestDrain(true)
 	p.closeMu.Unlock()
 	defer func() {
 		p.closeMu.Lock()
 		p.closeErr = result
+		p.state.Store(uint32(ProducerStateClosed))
 		close(p.closeDone)
 		p.closeMu.Unlock()
 	}()

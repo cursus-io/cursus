@@ -1,9 +1,22 @@
 image:
   repository: ghcr.io/cursus-io/cursus
-  tag: "0.1.0"
+  # Production installs must use the digest and source revision from the same
+  # published image. Mutable tags are reserved for source-built CI validation.
+  digest: ""
+  revision: ""
+  tag: ""
+  allowMutableTag: false
   pullPolicy: IfNotPresent
 
+compatibility:
+  wireProtocol: "2"
+  brokerProtocol: "4"
+  snapshotFormat: "10"
+  recordFormat: "CDM4"
+
 service:
+  # Brokers advertise their stable in-cluster Pod DNS names. NodePort and
+  # LoadBalancer would return unreachable broker addresses to external clients.
   type: ClusterIP
   brokerPort: 9000
   healthPort: 9080
@@ -14,6 +27,8 @@ service:
 
 persistence:
   storageClass: ""
+  # Install-time claim template size. For an existing release, use
+  # scripts/expand-helm-cluster-storage.sh before changing this value.
   size: 20Gi
   accessModes:
     - ReadWriteOnce
@@ -23,9 +38,28 @@ cluster:
   # broker-to-broker credential; the chart deliberately never renders it.
   internalAuthSecret: ""
   internalAuthSecretKey: token
+  # Optional overlap token used only while rotating credentials. The Secret
+  # may omit this key outside a rotation window.
+  internalAuthNextSecretKey: next-token
+  internalAuthGeneration: "1"
   transactionCoordinatorShards: 50
   minInSyncReplicas: 2
   defaultReplicationFactor: 3
+
+limits:
+  maxTopics: 10000
+  maxPartitionsPerTopic: 1024
+  maxPartitions: 100000
+  maxTransactions: 100000
+  maxTransactionRecords: 10000
+  maxTransactionBytes: 67108864
+  maxTransactionOffsets: 10000
+  maxInflightRequests: 256
+  maxInflightRequestBytes: 268435456
+
+storage:
+  minFreeBytes: 268435456
+  minFreePercent: 5
 
 internalTLS:
   # The Secret must contain tls.crt, tls.key, and ca.crt. The certificate must
@@ -33,9 +67,36 @@ internalTLS:
   secretName: ""
   serverName: cursus.internal
 
+# Production client traffic is encrypted and authenticated independently from
+# broker-to-broker transport. The auth Secret must contain `users` in the
+# broker's SASL_USERS format, for example
+# `operator:random-token:admin|topic.read|topic.write|group|transaction`.
+clientSecurity:
+  allowInsecure: false
+  tls:
+    secretName: ""
+  sasl:
+    secretName: ""
+    secretKey: users
+
+networkPolicy:
+  enabled: false
+  # When enabled, only matching client Pods may reach the public broker port.
+  # An empty namespace selector means this release namespace, not every
+  # namespace. An empty Pod selector allows every Pod in that namespace.
+  # Broker-to-broker ports remain restricted to this StatefulSet's Pods.
+  clientNamespaceSelector: {}
+  clientPodSelector: {}
+  # Metrics access is rendered only when monitoring.enabled is true. Empty
+  # selectors have the same release-namespace meaning as the client selectors.
+  monitoringNamespaceSelector: {}
+  monitoringPodSelector: {}
+
 podSecurityContext:
   fsGroup: 1000
   supplementalGroups: [1000]
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
   runAsNonRoot: true
@@ -45,9 +106,33 @@ securityContext:
   capabilities:
     drop: [ALL]
 
-resources: {}
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
 nodeSelector: {}
 tolerations: []
 affinity: {}
 terminationGracePeriodSeconds: 90
 startupProbeFailureThreshold: 45
+
+monitoring:
+  enabled: false
+  # Add labels required by the Prometheus Operator's ServiceMonitor and
+  # PrometheusRule selectors (for example, release: kube-prometheus-stack).
+  labels: {}
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+  prometheusRule:
+    enabled: true
+    brokerNotReadyFor: 5m
+    storagePendingFor: 10m
+    transactionOldestSeconds: 300
+    consumerLag: 10000
+  grafanaDashboard:
+    enabled: true
+    # Grafana's dashboard sidecar selects ConfigMaps carrying this label by default.
+    labels:
+      grafana_dashboard: "1"

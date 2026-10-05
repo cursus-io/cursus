@@ -294,6 +294,31 @@ func TestResolveOffset(t *testing.T) {
 	})
 }
 
+func TestResetRetainedOffset(t *testing.T) {
+	offsetRange := topic.PartitionOffsetRange{Earliest: 10, Latest: 20, LEO: 22, HWM: 20}
+	tests := []struct {
+		name       string
+		saved      uint64
+		policy     string
+		wantOffset uint64
+		wantReset  bool
+	}{
+		{name: "in range is unchanged", saved: 15, policy: "earliest", wantOffset: 15},
+		{name: "latest boundary is valid", saved: 20, policy: "earliest", wantOffset: 20},
+		{name: "retained offset resets earliest", saved: 1, policy: "earliest", wantOffset: 10, wantReset: true},
+		{name: "retained offset resets latest", saved: 1, policy: "latest", wantOffset: 20, wantReset: true},
+		{name: "future offset resets earliest", saved: 21, policy: "earliest", wantOffset: 10, wantReset: true},
+		{name: "error policy preserves invalid offset", saved: 1, policy: "", wantOffset: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			offset, reset := resetRetainedOffset(test.saved, offsetRange, test.policy)
+			assert.Equal(t, test.wantOffset, offset)
+			assert.Equal(t, test.wantReset, reset)
+		})
+	}
+}
+
 func TestValidateOwnership_NilCoordinator(t *testing.T) {
 	ch, _ := newTestHandler(t)
 	assert.False(t, ch.ValidateOwnership("g1", "m1", 1, 0))

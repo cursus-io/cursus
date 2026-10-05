@@ -43,7 +43,7 @@ type heartbeatRequest struct {
 
 type ClusterServer struct {
 	sd             controller.ServiceDiscovery
-	authToken      string
+	authTokens     []string
 	tlsConfig      *tls.Config
 	connectionSlot chan struct{}
 	requestTimeout time.Duration

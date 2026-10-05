@@ -10,7 +10,8 @@ The upstream image is:
 ghcr.io/cursus-io/cursus
 ```
 
-The current build target is `linux/amd64` and uses the repository `Dockerfile`.
+Each published tag is a manifest list containing `linux/amd64` and
+`linux/arm64` images built from the repository `Dockerfile`.
 
 ## Publication Triggers And Tags
 
@@ -33,16 +34,21 @@ The publishing workflow runs on:
 The workflow:
 
 1. checks out the repository without persisting credentials;
-2. configures Docker Buildx;
+2. configures QEMU and Docker Buildx;
 3. authenticates to `ghcr.io` with the workflow-scoped `GITHUB_TOKEN`;
 4. generates OCI labels and tags; and
-5. builds and publishes the image.
+5. builds and publishes the amd64 and arm64 manifest list.
+
+The Docker build embeds the exact Git commit in the broker binary and writes
+it to the OCI `org.opencontainers.image.revision` label. The cluster Helm chart
+requires both the immutable manifest digest and this revision, then runs the
+broker's deployment-contract check before starting any member.
 
 The job uses read-only repository contents permission and `packages: write`. The repository organization owns the package. Package visibility and anonymous pull access are managed separately in the GitHub package settings.
 
 ## Release Scope
 
-The repository currently publishes container images only. It does not create GitHub Releases, cross-compile binary archives, upload checksums, or publish multi-architecture images.
+The repository currently publishes container images only. It does not create GitHub Releases, cross-compile binary archives, or upload checksums.
 
 ## Verification
 

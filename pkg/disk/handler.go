@@ -3,6 +3,7 @@ package disk
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -81,14 +82,42 @@ type DiskHandler struct {
 
 	writeFailureMu sync.RWMutex
 	writeFailure   error
+	transientMu    sync.RWMutex
+	transientWrite error
+	headroom       *diskHeadroomGuard
 	syncFileFn     func(*os.File) error
 
 	file   *os.File
 	writer *bufio.Writer
 
-	closeOnce sync.Once
-	shutdown  sync.WaitGroup
+	closeOnce   sync.Once
+	closeErr    error
+	shutdownErr error
+	shutdownMu  sync.Mutex
+	shutdown    sync.WaitGroup
+	storageLock *StorageLock
 }
+
+func (d *DiskHandler) recordShutdownError(err error) {
+	if err == nil {
+		return
+	}
+	d.shutdownMu.Lock()
+	d.shutdownErr = errors.Join(d.shutdownErr, err)
+	d.shutdownMu.Unlock()
+}
+
+func (d *DiskHandler) shutdownError() error {
+	d.shutdownMu.Lock()
+	defer d.shutdownMu.Unlock()
+	return d.shutdownErr
+}
+
+// syncAuthoritativeDirectory is a seam for verifying that newly created log
+// and index directory entries cross a filesystem durability boundary. Keep the
+// operating-system implementation in syncDirectory so compaction and retention
+// continue to share the same primitive.
+var syncAuthoritativeDirectory = syncDirectory
 
 func (d *DiskHandler) SetOnSync(callback func(uint64)) {
 	d.onSyncMu.Lock()
@@ -135,6 +164,35 @@ func (d *DiskHandler) writeAvailabilityError() error {
 	return fmt.Errorf("disk handler write unavailable until restart: %w", failure)
 }
 
+func (d *DiskHandler) recordTransientWriteFailure(err error) error {
+	d.transientMu.Lock()
+	d.transientWrite = err
+	d.transientMu.Unlock()
+	return err
+}
+
+func (d *DiskHandler) clearTransientWriteFailure() {
+	d.transientMu.Lock()
+	d.transientWrite = nil
+	d.transientMu.Unlock()
+}
+
+func (d *DiskHandler) transientWriteError() error {
+	d.transientMu.RLock()
+	err := d.transientWrite
+	d.transientMu.RUnlock()
+	return err
+}
+
+func (d *DiskHandler) ensureWriteHeadroom(required uint64) error {
+	_, err := d.headroom.reserve(required, false)
+	if err != nil {
+		return d.recordTransientWriteFailure(err)
+	}
+	d.clearTransientWriteFailure()
+	return nil
+}
+
 func (d *DiskHandler) GetActiveReaders() int32 {
 	return atomic.LoadInt32(&d.activeReaders)
 }
@@ -167,6 +225,16 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	if err := os.MkdirAll(filepath.Dir(base), 0o750); err != nil {
 		return nil, err
 	}
+	storageLock, err := lockStorageFile(base + ".lock")
+	if err != nil {
+		return nil, err
+	}
+	initialized := false
+	defer func() {
+		if !initialized {
+			_ = storageLock.Close()
+		}
+	}()
 
 	internalMetadata := topicName == config.ConsumerOffsetsTopicName
 	standaloneInternalMetadata := internalMetadata && !cfg.EnabledDistribution
@@ -191,7 +259,6 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	sort.Strings(files)
 
 	var currentSegmentBase uint64
-	var err error
 	prefix := fmt.Sprintf("partition_%d_segment_", partitionID)
 	var recovery segmentRecovery
 
@@ -239,6 +306,7 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	}
 
 	dh := &DiskHandler{
+		storageLock:    storageLock,
 		BaseName:       base,
 		SegmentSize:    uint64(cfg.SegmentSize),
 		IndexSize:      uint64(cfg.IndexSize),
@@ -269,6 +337,7 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		internalMetadata:       internalMetadata,
 		compactedSegments:      compactedSegments,
 		segmentReaders:         newSegmentReaderCache(defaultSegmentReaderCacheEntries),
+		headroom:               newDiskHeadroomGuard(cfg.LogDir, cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent),
 		file:                   file,
 		writer:                 bufio.NewWriter(file),
 	}
@@ -277,17 +346,23 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	}
 
 	if err := dh.openIndexFiles(); err != nil {
+		_ = dh.closeIndexFiles()
+		_ = file.Close()
 		return nil, err
 	}
-	if internalMetadata {
-		// A successful metadata append may be the first record in this
-		// partition. Persist the segment/index directory entries before the
-		// coordinator can acknowledge that record.
-		if err := syncDirectory(filepath.Dir(base)); err != nil {
-			_ = dh.closeIndexFiles()
-			_ = file.Close()
-			return nil, fmt.Errorf("sync internal metadata partition directory: %w", err)
-		}
+	// The segment and index may have been created by this open, or by an earlier
+	// process that crashed before syncing their directory entries. Sync both the
+	// topic directory and its parent before exposing the handler to any ACK path.
+	// Repeating this on reopen also repairs files created by pre-fix versions.
+	if err := syncAuthoritativeDirectory(filepath.Dir(base)); err != nil {
+		_ = dh.closeIndexFiles()
+		_ = file.Close()
+		return nil, fmt.Errorf("sync partition files directory: %w", err)
+	}
+	if err := syncAuthoritativeDirectory(filepath.Dir(filepath.Dir(base))); err != nil {
+		_ = dh.closeIndexFiles()
+		_ = file.Close()
+		return nil, fmt.Errorf("sync topic directory entry: %w", err)
 	}
 
 	for _, f := range files {
@@ -325,12 +400,16 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		dh.retentionLoop(cfg)
 	}()
 
+	initialized = true
 	return dh, nil
 }
 
 func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.Message) (uint64, error) {
 	if partition < 0 || partition > math.MaxInt32 {
 		return 0, fmt.Errorf("partition out of int32 range: %d", partition)
+	}
+	if err := d.ensureWriteHeadroom(0); err != nil {
+		return 0, err
 	}
 	if err := d.writeAvailabilityError(); err != nil {
 		return 0, err
@@ -355,6 +434,9 @@ func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.
 	default:
 	}
 	if err := d.writeAvailabilityError(); err != nil {
+		return 0, err
+	}
+	if err := d.transientWriteError(); err != nil {
 		return 0, err
 	}
 	atomic.StoreUint64(&d.AbsoluteOffset, offset+1)
@@ -413,6 +495,9 @@ func (d *DiskHandler) AppendMessageWithOffset(topic string, partition int, msg *
 func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Message) (uint64, error) {
 	if partition < 0 || partition > math.MaxInt32 {
 		return 0, fmt.Errorf("partition out of int32 range: %d", partition)
+	}
+	if err := d.ensureWriteHeadroom(0); err != nil {
+		return 0, err
 	}
 	if err := d.writeAvailabilityError(); err != nil {
 		return 0, err

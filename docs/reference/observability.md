@@ -39,15 +39,22 @@ Standalone response:
 {"status":"ready","checks":{"consumer_metadata":"ok","storage":"ok","topic_metadata":"ok"}}
 ```
 
-In distributed mode, readiness also requires a resolvable cluster leader. A
-broker process can therefore remain live while returning `503` from `/ready`
-during election or loss of cluster leadership.
+In distributed mode, readiness also requires a resolvable cluster leader and a
+serviceable durable topology. Every partition must have the replica assignment
+declared by its topic definition, an active leader, and enough active ISR
+members to satisfy its effective `min.insync.replicas`. A broker remains ready
+when one replica is offline or catching up but the minimum ISR is still met;
+`CLUSTER_STATUS`, `cursus_cluster_under_replicated_partitions`, and the
+replication alerts continue to report that degraded state. A broker process can
+remain live while returning `503` during an election, below-minimum ISR, or an
+incomplete legacy assignment repair.
 
 ```json
 {
   "status": "not_ready",
   "checks": {
     "cluster_leader": "no cluster leader available",
+    "cluster_topology": "cluster topology unhealthy: offline=0 under_replicated=1 assignment_deficient=1 inactive_replica_partitions=0 min_isr_unsatisfied=1",
     "storage": "ok"
   }
 }
@@ -86,6 +93,7 @@ partition leaders.
 | `cursus_broker_commands_total{command,result}` | Counter | Completed text command dispatches |
 | `cursus_broker_command_duration_seconds{command}` | Histogram | Command dispatch latency |
 | `cursus_broker_command_errors_total{command,code}` | Counter | Wire errors by bounded command and error code |
+| `cursus_broker_client_response_write_failures_total{reason}` | Counter | Client responses that could not be delivered, with a bounded failure reason |
 | `cursus_broker_publish_acknowledgements_total{ack_mode,result}` | Counter | Publish requests by normalized acknowledgement mode and bounded result |
 | `cursus_broker_async_replication_failures_total{topic,error_class}` | Counter | Follower failures after an `acks=1` leader acknowledgement |
 | `cursus_broker_replication_retries_total{topic,ack_mode,error_class}` | Counter | Retried partition replication attempts, including pending duplicate commit barriers |
@@ -155,6 +163,13 @@ In diagnostics-only mode, `/ready` includes the retained `consumer_metadata` fai
 | `cursus_consumer_group_committed_offset{group,topic,partition}` | Gauge / offsets | Durable next offset |
 | `cursus_consumer_group_lag{group,topic,partition}` | Gauge / messages | `max(HWM - committedNextOffset, 0)` |
 | `cursus_consumer_group_offset_out_of_range{group,topic,partition}` | Gauge / boolean | Commit is below log start or above the high watermark |
+| `cursus_storage_filesystem_free_bytes` | Gauge / bytes | Space currently available on the filesystem containing `log_dir` |
+| `cursus_storage_filesystem_total_bytes` | Gauge / bytes | Total capacity of the filesystem containing `log_dir` |
+| `cursus_storage_filesystem_headroom_ready` | Gauge / boolean | `1` while the configured byte and percentage free-space reserve permits new writes |
+| `cursus_broker_requests_inflight` | Gauge / requests | Decoded requests queued or processed across both broker listeners |
+| `cursus_broker_request_bytes_inflight` | Gauge / bytes | Reserved encoded and decoded request payload memory |
+| `cursus_broker_request_admission_waiters` | Gauge / connections | Connections blocked before payload allocation by the global request budget |
+| `cursus_broker_request_admission_rejections_total{reason}` | Counter / requests | Admission failures caused by `bytes` or connection `context` cancellation |
 
 In standalone mode the local coordinator is authoritative. In distributed
 mode, replicated membership can remain present on a broker that no longer owns
@@ -236,10 +251,18 @@ offsets removed by a cleanup policy that includes `compact`.
 | `cursus_cluster_brokers` | Brokers in replicated metadata |
 | `cursus_cluster_has_leader` | This broker resolves a cluster leader |
 | `cursus_cluster_is_leader` | This broker is the current cluster leader |
-| `cursus_cluster_offline_partitions` | Partitions without a leader assignment |
-| `cursus_cluster_under_replicated_partitions` | Partitions where ISR size is below replica count |
-| `cursus_cluster_partition_replicas{topic,partition}` | Configured replicas |
-| `cursus_cluster_partition_in_sync_replicas{topic,partition}` | Current ISR size |
+| `cursus_cluster_offline_partitions` | Partitions without an active assigned leader |
+| `cursus_cluster_under_replicated_partitions` | Partitions where active ISR size is below the topic replication factor |
+| `cursus_cluster_assignment_deficient_partitions` | Partitions whose distinct assignment does not match the topic replication factor |
+| `cursus_cluster_inactive_replica_partitions` | Partitions assigned to an inactive or unknown broker |
+| `cursus_cluster_inactive_replicas` | Replica assignments that reference inactive or unknown brokers |
+| `cursus_cluster_min_insync_unsatisfied_partitions` | Partitions whose active ISR size is below effective `min.insync.replicas` |
+| `cursus_cluster_partition_replicas{topic,partition}` | Actual assigned replica count |
+| `cursus_cluster_partition_expected_replicas{topic,partition}` | Replica count declared by the topic definition |
+| `cursus_cluster_partition_active_replicas{topic,partition}` | Assigned replicas backed by active brokers |
+| `cursus_cluster_partition_in_sync_replicas{topic,partition}` | Current active ISR size |
+| `cursus_cluster_partition_min_insync_replicas{topic,partition}` | Effective `min.insync.replicas` |
+| `cursus_cluster_partition_topology_healthy{topic,partition}` | Assignment, leader, and ISR satisfy the durable topic contract |
 | `cursus_cluster_partition_leader_epoch{topic,partition}` | Current leader epoch |
 | `cursus_cluster_partition_leader{topic,partition,broker_id}` | Current leader identity (`1`) |
 | `cursus_cluster_isr_catchup_proofs_total{outcome,reason}` | ISR catch-up proofs accepted or rejected by bounded reason |
@@ -281,6 +304,32 @@ scrape_configs:
       - targets: ["broker-1:9100", "broker-2:9100", "broker-3:9100"]
 ```
 
+The standalone and three-member Helm charts can create a metrics Service,
+`ServiceMonitor`, and `PrometheusRule` baseline. The Prometheus Operator CRDs
+must already be installed. Add any labels required by the operator's selectors;
+for kube-prometheus-stack this is commonly:
+
+```yaml
+monitoring:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack
+```
+
+`monitoring.serviceMonitor.enabled` and `monitoring.prometheusRule.enabled`
+control the two CRD-backed resources independently. Tune
+`consumerLag`, `transactionOldestSeconds`, and the alert durations to the
+application’s throughput and transaction timeout before enabling paging.
+
+`monitoring.grafanaDashboard.enabled` installs the **Cursus production
+overview** dashboard as a ConfigMap. The default `grafana_dashboard: "1"`
+label is compatible with the common Grafana sidecar selector and can be
+replaced through `monitoring.grafanaDashboard.labels`. The dashboard uses a
+Prometheus datasource variable and a namespace variable; select the datasource
+that scrapes the Cursus ServiceMonitor after import. See the
+[production incident runbook](../operations/production-runbook.md) for the
+response attached to each panel and alert.
+
 ## Alert Baseline
 
 ```promql
@@ -290,11 +339,20 @@ up{job="cursus"} == 0
 # Process is reachable but cannot serve client work
 cursus_broker_ready == 0
 
+# Writes are blocked before the filesystem reserve is consumed
+cursus_storage_filesystem_headroom_ready == 0
+
 # No cluster leader
 cursus_distribution_enabled == 1 and cursus_cluster_has_leader == 0
 
 # Replication safety degraded
 cursus_cluster_under_replicated_partitions > 0
+
+# Durable definition and actual assignment disagree
+cursus_cluster_assignment_deficient_partitions > 0
+
+# Effective write quorum cannot be satisfied
+cursus_cluster_min_insync_unsatisfied_partitions > 0
 
 # Group commit no longer points into retained data
 cursus_consumer_group_offset_out_of_range == 1
@@ -306,7 +364,10 @@ sum by (topic, group) (cursus_consumer_group_coordinator_up) != 1
 max_over_time(cursus_consumer_group_lag[10m]) > 10000
 
 # Storage writer backlog
-cursus_storage_pending_writes > 0
+min_over_time(cursus_storage_pending_writes[10m]) > 0
+
+# Client responses could not be delivered
+increase(cursus_broker_client_response_write_failures_total[5m]) > 0
 
 # Compaction errors (inspect the bounded reason label)
 increase(cursus_broker_log_compaction_runs_total{result="error"}[10m]) > 0

@@ -42,13 +42,16 @@ type Consumer struct {
 	commitMu       sync.Mutex
 	commitRetryMap map[int]retryCommit
 
-	currentOffsets map[int]uint64
-	offsetsMu      sync.Mutex
+	currentOffsets           map[int]uint64
+	currentOffsetGenerations map[int]uint64
+	offsetsMu                sync.Mutex
 
 	wg          sync.WaitGroup
 	commitWg    sync.WaitGroup
 	lifecycleWg sync.WaitGroup
 	lifecycleMu sync.Mutex
+	failureMu   sync.Mutex
+	failureErr  error
 
 	mainCtx    context.Context
 	mainCancel context.CancelFunc
@@ -62,6 +65,7 @@ type Consumer struct {
 	offsets   map[int]uint64
 	doneCh    chan struct{}
 	closeDone chan struct{}
+	closeErr  error
 	mu        sync.RWMutex
 
 	partitionLeaders  map[int]string
@@ -126,20 +130,21 @@ func NewConsumerWithContext(ctx context.Context, cfg *ConsumerConfig) (*Consumer
 	workerCtx, cancel := context.WithCancel(rootCtx)
 
 	c := &Consumer{
-		config:             cfg,
-		client:             client,
-		partitionConsumers: make(map[int]*PartitionConsumer),
-		offsets:            make(map[int]uint64),
-		currentOffsets:     make(map[int]uint64),
-		partitionLeaders:   make(map[int]string),
-		commitRetryMap:     make(map[int]retryCommit),
-		rebalanceSig:       make(chan struct{}, 1),
-		doneCh:             make(chan struct{}),
-		closeDone:          make(chan struct{}),
-		mainCtx:            workerCtx,
-		rootCtx:            rootCtx,
-		rootCancel:         rootCancel,
-		mainCancel:         cancel,
+		config:                   cfg,
+		client:                   client,
+		partitionConsumers:       make(map[int]*PartitionConsumer),
+		offsets:                  make(map[int]uint64),
+		currentOffsets:           make(map[int]uint64),
+		currentOffsetGenerations: make(map[int]uint64),
+		partitionLeaders:         make(map[int]string),
+		commitRetryMap:           make(map[int]retryCommit),
+		rebalanceSig:             make(chan struct{}, 1),
+		doneCh:                   make(chan struct{}),
+		closeDone:                make(chan struct{}),
+		mainCtx:                  workerCtx,
+		rootCtx:                  rootCtx,
+		rootCancel:               rootCancel,
+		mainCancel:               cancel,
 	}
 
 	c.commitCh = make(chan commitEntry, 1024)
@@ -197,6 +202,9 @@ func (c *Consumer) Start(handler func(Message) error) error {
 			_ = c.Close()
 		}
 	}()
+	if handler == nil {
+		return ErrConsumerHandlerRequired
+	}
 	if err := c.rootCtx.Err(); err != nil {
 		return fmt.Errorf("consumer context is already done: %w", err)
 	}
@@ -210,7 +218,7 @@ func (c *Consumer) Start(handler func(Message) error) error {
 		c.coordinatorAddr = c.config.CoordinatorAddr
 		c.mu.Unlock()
 		LogInfo("Using configured coordinator for group '%s': %s", c.config.GroupID, c.coordinatorAddr)
-	} else if coordAddr, err := c.findCoordinator(); err == nil {
+	} else if coordAddr, err := c.findCoordinatorContext(c.assignmentContext()); err == nil {
 		c.mu.Lock()
 		c.coordinatorAddr = coordAddr
 		c.mu.Unlock()
@@ -276,12 +284,12 @@ func (c *Consumer) Start(handler func(Message) error) error {
 	c.startAssignmentWorkers(c.assignmentContext(), assignmentGeneration)
 	started = true
 
+	return c.waitForShutdown()
+}
+
+func (c *Consumer) waitForShutdown() error {
 	<-c.rootCtx.Done()
-	if state := c.State(); state != ConsumerStateClosing && state != ConsumerStateClosed {
-		return c.Close()
-	}
-	<-c.closeDone
-	return nil
+	return errors.Join(c.Err(), c.Close())
 }
 
 // ─── Commit Worker ────────────────────────────────────────────────────────────
@@ -289,7 +297,7 @@ func (c *Consumer) Start(handler func(Message) error) error {
 func (c *Consumer) startCommitWorker() {
 	c.lifecycleMu.Lock()
 	state := c.State()
-	if state == ConsumerStateClosing || state == ConsumerStateClosed {
+	if state != ConsumerStateRunning {
 		c.lifecycleMu.Unlock()
 		return
 	}
@@ -343,10 +351,10 @@ func (c *Consumer) startCommitWorker() {
 				}
 
 			case <-ticker.C:
-				if c.config.EnableAutoCommit {
-					c.flushOffsets()
-				}
 				flush()
+				if c.config.EnableAutoCommit {
+					c.flushAutoCommitOffsets(false)
+				}
 				c.processRetryQueue()
 
 			case <-c.doneCh:
@@ -397,6 +405,15 @@ func (c *Consumer) flushOffsets() {
 	}
 
 	for pid, offset := range c.currentOffsets {
+		generation := c.currentOffsetGenerations[pid]
+		if generation == 0 {
+			generation = assignmentGeneration
+		}
+		if generation != assignmentGeneration {
+			delete(c.currentOffsets, pid)
+			delete(c.currentOffsetGenerations, pid)
+			continue
+		}
 		c.mu.RLock()
 		lastCommitted := c.offsets[pid]
 		c.mu.RUnlock()
@@ -410,6 +427,63 @@ func (c *Consumer) flushOffsets() {
 		}
 	}
 	c.currentOffsets = make(map[int]uint64)
+	c.currentOffsetGenerations = make(map[int]uint64)
+}
+
+func (c *Consumer) recordAutoCommitOffset(partition int, offset, assignmentGeneration uint64) {
+	c.offsetsMu.Lock()
+	defer c.offsetsMu.Unlock()
+	if c.currentOffsets == nil {
+		c.currentOffsets = make(map[int]uint64)
+	}
+	if c.currentOffsetGenerations == nil {
+		c.currentOffsetGenerations = make(map[int]uint64)
+	}
+	if currentGeneration := c.currentOffsetGenerations[partition]; currentGeneration != 0 && currentGeneration != assignmentGeneration {
+		delete(c.currentOffsets, partition)
+	}
+	if current, ok := c.currentOffsets[partition]; !ok || offset > current {
+		c.currentOffsets[partition] = offset
+		c.currentOffsetGenerations[partition] = assignmentGeneration
+	}
+}
+
+func (c *Consumer) flushAutoCommitOffsets(allowClosing bool) bool {
+	assignmentGeneration := c.assignmentGeneration.Load()
+	if !c.assignmentCanCommit(assignmentGeneration, allowClosing) {
+		return false
+	}
+
+	c.offsetsMu.Lock()
+	offsets := make(map[int]uint64)
+	for partition, offset := range c.currentOffsets {
+		generation := c.currentOffsetGenerations[partition]
+		if generation == 0 {
+			generation = assignmentGeneration
+		}
+		if generation == assignmentGeneration {
+			offsets[partition] = offset
+		}
+	}
+	c.offsetsMu.Unlock()
+	if len(offsets) == 0 {
+		return true
+	}
+
+	if !c.sendBatchCommitWithState(offsets, assignmentGeneration, allowClosing) {
+		return false
+	}
+	c.offsetsMu.Lock()
+	for partition, committed := range offsets {
+		generation := c.currentOffsetGenerations[partition]
+		if generation == assignmentGeneration && c.currentOffsets[partition] <= committed {
+			delete(c.currentOffsets, partition)
+			delete(c.currentOffsetGenerations, partition)
+		}
+	}
+	c.offsetsMu.Unlock()
+	c.recordCommittedOffsets(offsets, assignmentGeneration)
+	return true
 }
 
 func (c *Consumer) processRetryQueue() {
@@ -433,31 +507,41 @@ func (c *Consumer) processRetryQueue() {
 	c.commitMu.Unlock()
 
 	LogDebug("Retrying failed commits for %d partitions", len(toRetry))
-	if len(toRetry) > 0 && !c.sendBatchCommit(toRetry, assignmentGeneration) {
-		LogError("Retry batch commit failed, re-queuing")
-		c.commitMu.Lock()
-		for partition, offset := range toRetry {
-			if current, ok := c.commitRetryMap[partition]; !ok || offset > current.offset {
-				c.commitRetryMap[partition] = retryCommit{offset: offset, assignmentGeneration: assignmentGeneration}
+	if len(toRetry) > 0 {
+		if c.sendBatchCommit(toRetry, assignmentGeneration) {
+			c.recordCommittedOffsets(toRetry, assignmentGeneration)
+		} else {
+			LogError("Retry batch commit failed, re-queuing")
+			c.commitMu.Lock()
+			for partition, offset := range toRetry {
+				if current, ok := c.commitRetryMap[partition]; !ok || offset > current.offset {
+					c.commitRetryMap[partition] = retryCommit{offset: offset, assignmentGeneration: assignmentGeneration}
+				}
 			}
+			c.commitMu.Unlock()
 		}
-		c.commitMu.Unlock()
 	}
 }
 
 func (c *Consumer) commitBatch(offsets map[int]uint64, respChannels map[int][]chan error, assignmentGeneration uint64) {
 	success := c.sendBatchCommit(offsets, assignmentGeneration)
+	if success {
+		c.recordCommittedOffsets(offsets, assignmentGeneration)
+	} else {
+		c.commitMu.Lock()
+		if c.assignmentActive(assignmentGeneration) {
+			for partition, offset := range offsets {
+				if current, ok := c.commitRetryMap[partition]; !ok || offset > current.offset {
+					c.commitRetryMap[partition] = retryCommit{offset: offset, assignmentGeneration: assignmentGeneration}
+				}
+			}
+		}
+		c.commitMu.Unlock()
+	}
 
 	for pid, channels := range respChannels {
 		var err error
 		if !success {
-			c.commitMu.Lock()
-			if c.assignmentActive(assignmentGeneration) {
-				if current, ok := c.commitRetryMap[pid]; !ok || offsets[pid] > current.offset {
-					c.commitRetryMap[pid] = retryCommit{offset: offsets[pid], assignmentGeneration: assignmentGeneration}
-				}
-			}
-			c.commitMu.Unlock()
 			err = fmt.Errorf("batch commit failed for partition %d", pid)
 		}
 		for _, ch := range channels {
@@ -488,15 +572,25 @@ func (c *Consumer) validateCommitConn() bool {
 }
 
 func (c *Consumer) sendBatchCommit(offsets map[int]uint64, assignmentGeneration uint64) bool {
-	if !c.assignmentActive(assignmentGeneration) {
+	return c.sendBatchCommitWithState(offsets, assignmentGeneration, false)
+}
+
+func (c *Consumer) sendBatchCommitWithState(offsets map[int]uint64, assignmentGeneration uint64, allowClosing bool) bool {
+	if !c.assignmentCanCommit(assignmentGeneration, allowClosing) {
 		return false
 	}
+	requestParent := c.assignmentContext()
+	if allowClosing {
+		requestParent = context.Background()
+	}
+	requestCtx, cancelRequest := boundedRequestContext(requestParent, c.requestTimeout())
+	defer cancelRequest()
 	c.commitMu.Lock()
 	needsNewConn := c.commitConn == nil || !c.validateCommitConn()
 	c.commitMu.Unlock()
 
 	if needsNewConn {
-		newConn, err := c.getCoordinatorConn()
+		newConn, err := c.getCoordinatorConnContext(requestCtx)
 		if err != nil {
 			LogError("Batch commit: failed to get connection: %v", err)
 			return false
@@ -509,6 +603,12 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64, assignmentGeneration 
 	c.commitMu.Lock()
 	conn := c.commitConn
 	c.commitMu.Unlock()
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		c.closeCommitConn(conn)
+		return false
+	}
+	defer cleanup()
 
 	c.mu.RLock()
 	generation := c.generation
@@ -528,7 +628,7 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64, assignmentGeneration 
 		c.config.Topic, c.config.GroupID, generation, memberID, encodedOffsets)
 
 	c.lifecycleMu.Lock()
-	if !c.assignmentActive(assignmentGeneration) {
+	if !c.assignmentCanCommit(assignmentGeneration, allowClosing) {
 		c.lifecycleMu.Unlock()
 		return false
 	}
@@ -583,6 +683,30 @@ func (c *Consumer) sendBatchCommit(offsets map[int]uint64, assignmentGeneration 
 	return false
 }
 
+func (c *Consumer) assignmentCanCommit(generation uint64, allowClosing bool) bool {
+	if generation == 0 || c.assignmentGeneration.Load() != generation {
+		return false
+	}
+	state := c.State()
+	return state == ConsumerStateRunning || (allowClosing && state == ConsumerStateClosing)
+}
+
+func (c *Consumer) recordCommittedOffsets(offsets map[int]uint64, assignmentGeneration uint64) {
+	if c.assignmentGeneration.Load() != assignmentGeneration {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for partition, offset := range offsets {
+		if offset > c.offsets[partition] {
+			c.offsets[partition] = offset
+		}
+		if pc := c.partitionConsumers[partition]; pc != nil && pc.assignmentGeneration == assignmentGeneration {
+			atomic.StoreUint64(&pc.commitOffset, offset)
+		}
+	}
+}
+
 func (c *Consumer) closeCommitConn(conn net.Conn) {
 	c.commitMu.Lock()
 	if c.commitConn == conn {
@@ -601,11 +725,18 @@ func (c *Consumer) directCommit(partition int, offset uint64, assignmentGenerati
 	memberID := c.memberID
 	c.mu.RUnlock()
 
-	conn, err := c.getCoordinatorConn()
+	requestCtx, cancelRequest := boundedRequestContext(c.assignmentContext(), c.requestTimeout())
+	defer cancelRequest()
+	conn, err := c.getCoordinatorConnContext(requestCtx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close() }()
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 
 	commitCmd := fmt.Sprintf("COMMIT_OFFSET topic=%s partition=%d group=%s offset=%d generation=%d member=%s",
 		c.config.Topic, partition, c.config.GroupID, offset, generation, memberID)
@@ -648,20 +779,24 @@ func (c *Consumer) directCommit(partition int, offset uint64, assignmentGenerati
 // ─── Metadata ─────────────────────────────────────────────────────────────────
 
 func (c *Consumer) fetchMetadata() error {
-	conn, _, err := c.client.ConnectWithFailover()
+	requestCtx, cancelRequest := boundedRequestContext(c.assignmentContext(), c.requestTimeout())
+	defer cancelRequest()
+	conn, _, err := c.client.ConnectWithFailoverContext(requestCtx)
 	if err != nil {
 		return fmt.Errorf("connect for metadata: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
-
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 	cmd := fmt.Sprintf("METADATA topic=%s", c.config.Topic)
 	if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 		return fmt.Errorf("send metadata: %w", err)
 	}
 
 	resp, err := ReadWithLength(conn)
-	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
 		return fmt.Errorf("read metadata: %w", err)
 	}
@@ -762,13 +897,18 @@ func (c *Consumer) joinGroupWithRetry() (int64, string, []int, error) {
 }
 
 func (c *Consumer) joinGroup() (int64, string, []int, error) {
-	conn, err := c.getCoordinatorConn()
+	requestCtx, cancelRequest := boundedRequestContext(c.assignmentContext(), c.requestTimeout())
+	defer cancelRequest()
+	conn, err := c.getCoordinatorConnContext(requestCtx)
 	if err != nil {
 		return 0, "", nil, err
 	}
 	defer func() { _ = conn.Close() }()
-
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	defer cleanup()
 
 	c.mu.RLock()
 	mID := c.memberID
@@ -788,7 +928,6 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 	}
 
 	resp, err := ReadWithLength(conn)
-	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
 		var brokerErr *BrokerError
 		if !errors.As(err, &brokerErr) {
@@ -839,11 +978,18 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 }
 
 func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
-	conn, err := c.getCoordinatorConn()
+	requestCtx, cancelRequest := boundedRequestContext(c.assignmentContext(), c.requestTimeout())
+	defer cancelRequest()
+	conn, err := c.getCoordinatorConnContext(requestCtx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 
 	syncCmd := fmt.Sprintf("SYNC_GROUP topic=%s group=%s member=%s generation=%d",
 		c.config.Topic, c.config.GroupID, memberID, generation)
@@ -916,13 +1062,18 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 		return 0, err
 	}
 
-	conn, err := c.getCoordinatorConn()
+	requestCtx, cancelRequest := boundedRequestContext(c.assignmentContext(), c.requestTimeout())
+	defer cancelRequest()
+	conn, err := c.getCoordinatorConnContext(requestCtx)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = conn.Close() }()
-
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return 0, err
+	}
+	defer cleanup()
 	fetchCmd := fmt.Sprintf("FETCH_OFFSET topic=%s partition=%d group=%s",
 		c.config.Topic, partition, c.config.GroupID)
 	if err := WriteWithLength(conn, []byte(fetchCmd)); err != nil {
@@ -983,16 +1134,27 @@ func (c *Consumer) Close() error {
 	if state == ConsumerStateClosing || state == ConsumerStateClosed {
 		c.lifecycleMu.Unlock()
 		<-c.closeDone
-		return nil
+		c.lifecycleMu.Lock()
+		err := c.closeErr
+		c.lifecycleMu.Unlock()
+		return err
 	}
 	c.state.Store(uint32(ConsumerStateClosing))
 	c.lifecycleMu.Unlock()
 
-	close(c.doneCh)
 	c.rootCancel()
 	c.cancelAssignment()
 	c.closeActiveConnections()
 	c.wg.Wait()
+	var closeErr error
+	if c.config.EnableAutoCommit && !c.flushAutoCommitOffsets(true) {
+		c.offsetsMu.Lock()
+		pending := len(c.currentOffsets)
+		c.offsetsMu.Unlock()
+		if pending > 0 {
+			closeErr = fmt.Errorf("flush pending auto-commit offsets during close")
+		}
+	}
 
 	close(c.commitCh)
 	c.commitWg.Wait()
@@ -1003,11 +1165,30 @@ func (c *Consumer) Close() error {
 	generation := c.generation
 	c.mu.RUnlock()
 	if memberID != "" && generation > 0 {
-		if conn, err := c.getCoordinatorConn(); err == nil {
-			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
-				c.config.Topic, c.config.GroupID, memberID, generation)
-			_ = WriteWithLength(conn, []byte(leaveCmd))
-			_ = conn.Close()
+		requestCtx, cancelRequest := boundedRequestContext(context.Background(), c.requestTimeout())
+		if conn, err := c.getCoordinatorConnContext(requestCtx); err == nil {
+			cleanup, bindErr := bindConnectionToContext(requestCtx, conn)
+			if bindErr != nil {
+				closeErr = errors.Join(closeErr, bindErr)
+				_ = conn.Close()
+				cancelRequest()
+			} else {
+				leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
+					c.config.Topic, c.config.GroupID, memberID, generation)
+				if err := WriteWithLength(conn, []byte(leaveCmd)); err != nil {
+					closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: %w", err))
+				} else if response, err := ReadWithLength(conn); err != nil {
+					closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: %w", err))
+				} else if !hasOKStatus(strings.TrimSpace(string(response))) {
+					closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: unexpected response %q", strings.TrimSpace(string(response))))
+				}
+				cleanup()
+				_ = conn.Close()
+				cancelRequest()
+			}
+		} else {
+			cancelRequest()
+			closeErr = errors.Join(closeErr, fmt.Errorf("connect to leave consumer group: %w", err))
 		}
 	}
 
@@ -1029,9 +1210,11 @@ func (c *Consumer) Close() error {
 
 	c.lifecycleMu.Lock()
 	c.state.Store(uint32(ConsumerStateClosed))
+	c.closeErr = closeErr
+	close(c.doneCh)
 	close(c.closeDone)
 	c.lifecycleMu.Unlock()
-	return nil
+	return closeErr
 }
 
 func (c *Consumer) closeActiveConnections() {
@@ -1058,19 +1241,31 @@ func (c *Consumer) closeActiveConnections() {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-func (c *Consumer) getLeaderConn() (net.Conn, error) {
-	conn, _, err := c.client.ConnectWithFailover()
+func (c *Consumer) requestTimeout() time.Duration {
+	if c.config != nil && c.config.RequestTimeoutMS > 0 {
+		return time.Duration(c.config.RequestTimeoutMS) * time.Millisecond
+	}
+	return defaultSDKRequestTimeout
+}
+
+func (c *Consumer) getLeaderConnContext(ctx context.Context) (net.Conn, error) {
+	conn, _, err := c.client.ConnectWithFailoverContext(ctx)
 	return conn, err
 }
 
-func (c *Consumer) findCoordinator() (string, error) {
-	conn, _, err := c.client.ConnectWithFailover()
+func (c *Consumer) findCoordinatorContext(ctx context.Context) (string, error) {
+	requestCtx, cancelRequest := boundedRequestContext(ctx, c.requestTimeout())
+	defer cancelRequest()
+	conn, _, err := c.client.ConnectWithFailoverContext(requestCtx)
 	if err != nil {
 		return "", fmt.Errorf("connect for find_coordinator: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
-
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
 	cmd := fmt.Sprintf("FIND_COORDINATOR group=%s", c.config.GroupID)
 	if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 		return "", fmt.Errorf("send find_coordinator: %w", err)
@@ -1095,32 +1290,30 @@ func (c *Consumer) findCoordinator() (string, error) {
 	return c.coordinatorAddrFromHostPort(host, port), nil
 }
 
-func (c *Consumer) getCoordinatorConn() (net.Conn, error) {
+func (c *Consumer) getCoordinatorConnContext(ctx context.Context) (net.Conn, error) {
 	c.mu.RLock()
 	addr := c.coordinatorAddr
 	c.mu.RUnlock()
 
 	if addr != "" {
-		conn, err := c.client.ConnectToAddr(addr)
+		conn, err := c.client.ConnectContext(ctx, addr)
 		if err == nil {
-			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 			return conn, nil
 		}
 		LogWarn("Coordinator %s unreachable: %v, rediscovering", addr, err)
 	}
 
-	newAddr, err := c.findCoordinator()
+	newAddr, err := c.findCoordinatorContext(ctx)
 	if err != nil {
-		return c.getLeaderConn()
+		return c.getLeaderConnContext(ctx)
 	}
 	c.mu.Lock()
 	c.coordinatorAddr = newAddr
 	c.mu.Unlock()
-	conn, err := c.client.ConnectToAddr(newAddr)
+	conn, err := c.client.ConnectContext(ctx, newAddr)
 	if err != nil {
 		return nil, err
 	}
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	return conn, nil
 }
 

@@ -48,14 +48,11 @@ func NewProducerClient(config *PublisherConfig) (*ProducerClient, error) {
 	})
 
 	if config.UseTLS {
-		cert, err := tls.LoadX509KeyPair(config.TLSCertPath, config.TLSKeyPath)
+		tlsConfig, err := buildClientTLSConfig(config.TLSCAPath, config.TLSServerName, config.TLSCertPath, config.TLSKeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("load TLS cert: %w", err)
+			return nil, err
 		}
-		pc.tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
+		pc.tlsConfig = tlsConfig
 	}
 
 	return pc, nil
@@ -70,7 +67,7 @@ func (pc *ProducerClient) NextSeqNum(partition int) uint64 {
 	return val.(*atomic.Uint64).Add(1)
 }
 
-func (pc *ProducerClient) connectPartitionLocked(idx int, addr string) error {
+func (pc *ProducerClient) connectPartitionLocked(ctx context.Context, idx int, addr string) error {
 	if pc.closed.Load() {
 		return fmt.Errorf("producer client is closed")
 	}
@@ -79,10 +76,10 @@ func (pc *ProducerClient) connectPartitionLocked(idx int, addr string) error {
 	}
 
 	if pc.config.UseTLS && pc.tlsConfig == nil {
-		return fmt.Errorf("TLS enabled but certificate not loaded")
+		return fmt.Errorf("TLS enabled but configuration not loaded")
 	}
 	conn, err := dialAuthenticatedWireConnection(
-		context.Background(), addr, 5*time.Second,
+		ctx, addr, 5*time.Second,
 		pc.config.HandshakeTimeoutMS, pc.config.CompressionType, pc.tlsConfig,
 		pc.config.Principal, pc.config.AuthToken,
 	)
@@ -180,6 +177,13 @@ func (pc *ProducerClient) selectBroker() string {
 }
 
 func (pc *ProducerClient) ConnectPartition(idx int, addr string) error {
+	return pc.connectPartition(context.Background(), idx, addr)
+}
+
+func (pc *ProducerClient) connectPartition(ctx context.Context, idx int, addr string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if addr == "" {
 		addr = pc.selectBroker()
 	}
@@ -190,7 +194,7 @@ func (pc *ProducerClient) ConnectPartition(idx int, addr string) error {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 
-	return pc.connectPartitionLocked(idx, addr)
+	return pc.connectPartitionLocked(ctx, idx, addr)
 }
 
 func (pc *ProducerClient) ReconnectPartition(idx int, addr string) error {
@@ -200,6 +204,21 @@ func (pc *ProducerClient) ReconnectPartition(idx int, addr string) error {
 		return fmt.Errorf("invalid partition index: %d", idx)
 	}
 
+	pc.discardPartitionLocked(idx)
+	if addr == "" {
+		addr = pc.selectBroker()
+	}
+	if addr == "" {
+		return fmt.Errorf("no broker address available for partition %d", idx)
+	}
+
+	return pc.connectPartitionLocked(context.Background(), idx, addr)
+}
+
+func (pc *ProducerClient) discardPartitionLocked(idx int) {
+	if idx < 0 {
+		return
+	}
 	oldPtr := pc.conns.Load()
 	if oldPtr != nil {
 		conns := *oldPtr
@@ -210,14 +229,6 @@ func (pc *ProducerClient) ReconnectPartition(idx int, addr string) error {
 			pc.conns.Store(&replacement)
 		}
 	}
-	if addr == "" {
-		addr = pc.selectBroker()
-	}
-	if addr == "" {
-		return fmt.Errorf("no broker address available for partition %d", idx)
-	}
-
-	return pc.connectPartitionLocked(idx, addr)
 }
 
 // discardPartitionConnection removes a failed connection without dialing another

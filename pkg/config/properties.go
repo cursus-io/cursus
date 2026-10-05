@@ -41,12 +41,14 @@ type Config struct {
 	LogLevel        util.LogLevel `yaml:"log_level" json:"log_level"`
 
 	// disk storage
-	LogDir              string `yaml:"log_dir" json:"log.dir"`
-	DiskFlushBatchSize  int    `yaml:"disk_flush_batch_size" json:"disk.flush.batch.size"`
-	DiskFlushIntervalMS int    `yaml:"disk_flush_interval_ms" json:"disk.flush.interval.ms"`
-	DiskWriteTimeoutMS  int    `yaml:"disk_write_timeout_ms" json:"disk.write.timeout.ms"`
-	LingerMS            int    `yaml:"linger_ms" json:"linger.ms"`
-	CompressionType     string `yaml:"compression_type" json:"compression.type"` // "none", "gzip", "snappy", "lz4"
+	LogDir              string  `yaml:"log_dir" json:"log.dir"`
+	DiskFlushBatchSize  int     `yaml:"disk_flush_batch_size" json:"disk.flush.batch.size"`
+	DiskFlushIntervalMS int     `yaml:"disk_flush_interval_ms" json:"disk.flush.interval.ms"`
+	DiskWriteTimeoutMS  int     `yaml:"disk_write_timeout_ms" json:"disk.write.timeout.ms"`
+	DiskMinFreeBytes    int64   `yaml:"disk_min_free_bytes" json:"disk.min.free.bytes"`
+	DiskMinFreePercent  float64 `yaml:"disk_min_free_percent" json:"disk.min.free.percent"`
+	LingerMS            int     `yaml:"linger_ms" json:"linger.ms"`
+	CompressionType     string  `yaml:"compression_type" json:"compression.type"` // "none", "gzip", "snappy", "lz4"
 
 	// log segment
 	CleanupInterval           int     `yaml:"log_cleanup_interval" json:"log.cleanup.interval"`
@@ -70,6 +72,8 @@ type Config struct {
 	// distributed cluster
 	EnabledDistribution    bool     `yaml:"enabled_distribution" json:"distribution.enabled"`
 	InternalAuthToken      string   `yaml:"internal_auth_token" json:"distribution.internal_auth_token"`
+	InternalAuthTokenNext  string   `yaml:"internal_auth_token_next" json:"distribution.internal_auth_token_next"`
+	InternalAuthGeneration string   `yaml:"internal_auth_generation" json:"distribution.internal_auth_generation"`
 	InternalBrokerPort     int      `yaml:"internal_broker_port" json:"distribution.internal_broker_port"`
 	RaftPort               int      `yaml:"raft_port" json:"distribution.raft.port"`
 	RaftSnapshotIntervalMS int      `yaml:"raft_snapshot_interval_ms" json:"distribution.raft.snapshot.interval.ms"`
@@ -86,14 +90,21 @@ type Config struct {
 	AdvertisedClientHost     string `yaml:"advertised_client_host" json:"distribution.advertised_client_host"`
 	MinInSyncReplicas        int    `yaml:"min_insync_replicas" json:"min.insync.replicas"`
 	DefaultReplicationFactor int    `yaml:"default_replication_factor" json:"default.replication.factor"`
+	MaxTopics                int    `yaml:"max_topics" json:"max.topics"`
+	MaxPartitionsPerTopic    int    `yaml:"max_partitions_per_topic" json:"max.partitions.per.topic"`
+	MaxPartitions            int    `yaml:"max_partitions" json:"max.partitions"`
 
 	// idempotency
-	EnableIdempotence            bool `yaml:"enable_idempotence" json:"enable.idempotence"`
-	ProducerStateTTLMS           int  `yaml:"producer_state_ttl_ms" json:"producer.state.ttl.ms"`
-	TransactionalIDExpirationMS  int  `yaml:"transactional_id_expiration_ms" json:"transactional.id.expiration.ms"`
-	TransactionTimeoutMS         int  `yaml:"transaction_timeout_ms" json:"transaction.timeout.ms"`
-	TransactionCoordinatorShards int  `yaml:"transaction_coordinator_shards" json:"transaction.coordinator.shards"`
-	TransactionRecoveryBatchSize int  `yaml:"transaction_recovery_batch_size" json:"transaction.recovery.batch.size"`
+	EnableIdempotence            bool  `yaml:"enable_idempotence" json:"enable.idempotence"`
+	ProducerStateTTLMS           int   `yaml:"producer_state_ttl_ms" json:"producer.state.ttl.ms"`
+	TransactionalIDExpirationMS  int   `yaml:"transactional_id_expiration_ms" json:"transactional.id.expiration.ms"`
+	TransactionTimeoutMS         int   `yaml:"transaction_timeout_ms" json:"transaction.timeout.ms"`
+	TransactionCoordinatorShards int   `yaml:"transaction_coordinator_shards" json:"transaction.coordinator.shards"`
+	TransactionRecoveryBatchSize int   `yaml:"transaction_recovery_batch_size" json:"transaction.recovery.batch.size"`
+	MaxTransactions              int   `yaml:"max_transactions" json:"max.transactions"`
+	MaxTransactionRecords        int   `yaml:"max_transaction_records" json:"max.transaction.records"`
+	MaxTransactionBytes          int64 `yaml:"max_transaction_bytes" json:"max.transaction.bytes"`
+	MaxTransactionOffsets        int   `yaml:"max_transaction_offsets" json:"max.transaction.offsets"`
 
 	// consumer
 	ConsumerSessionTimeoutMS int                   `yaml:"consumer_session_timeout_ms" json:"consumer.session.timeout.ms"`
@@ -101,9 +112,11 @@ type Config struct {
 	StaticConsumerGroups     []ConsumerGroupConfig `yaml:"static_consumer_groups" json:"static_consumer_groups"`
 
 	// network
-	MaxClientConnections   int `yaml:"max_client_connections" json:"max.client.connections"`
-	ClientIdleTimeoutMS    int `yaml:"client_idle_timeout_ms" json:"client.idle.timeout.ms"`
-	ClientRequestTimeoutMS int `yaml:"client_request_timeout_ms" json:"client.request.timeout.ms"`
+	MaxClientConnections    int   `yaml:"max_client_connections" json:"max.client.connections"`
+	MaxInflightRequests     int   `yaml:"max_inflight_requests" json:"max.inflight.requests"`
+	MaxInflightRequestBytes int64 `yaml:"max_inflight_request_bytes" json:"max.inflight.request.bytes"`
+	ClientIdleTimeoutMS     int   `yaml:"client_idle_timeout_ms" json:"client.idle.timeout.ms"`
+	ClientRequestTimeoutMS  int   `yaml:"client_request_timeout_ms" json:"client.request.timeout.ms"`
 	// ObservationGRPCPort enables a loopback-only, read-only gRPC adapter. A
 	// zero value leaves the listener disabled.
 	ObservationGRPCPort      int    `yaml:"observation_grpc_port" json:"observation.grpc.port"`
@@ -146,6 +159,8 @@ func DefaultConfig() *Config {
 			DiskFlushBatchSize:  50,
 			DiskFlushIntervalMS: 500,
 			DiskWriteTimeoutMS:  10,
+			DiskMinFreeBytes:    256 * 1024 * 1024,
+			DiskMinFreePercent:  5,
 			LingerMS:            50,
 			CompressionType:     "none",
 
@@ -171,6 +186,8 @@ func DefaultConfig() *Config {
 			// distributed cluster
 			EnabledDistribution:      false,
 			InternalAuthToken:        "",
+			InternalAuthTokenNext:    "",
+			InternalAuthGeneration:   "",
 			InternalBrokerPort:       0,
 			RaftPort:                 9001,
 			RaftSnapshotIntervalMS:   120000,
@@ -185,6 +202,9 @@ func DefaultConfig() *Config {
 			AdvertisedBrokerPort:     0,
 			MinInSyncReplicas:        2,
 			DefaultReplicationFactor: 3,
+			MaxTopics:                10000,
+			MaxPartitionsPerTopic:    1024,
+			MaxPartitions:            100000,
 
 			// idempotency
 			EnableIdempotence:            false,
@@ -193,16 +213,22 @@ func DefaultConfig() *Config {
 			TransactionTimeoutMS:         60 * 1000,
 			TransactionCoordinatorShards: 50,
 			TransactionRecoveryBatchSize: 256,
+			MaxTransactions:              100000,
+			MaxTransactionRecords:        10000,
+			MaxTransactionBytes:          64 * 1024 * 1024,
+			MaxTransactionOffsets:        10000,
 
 			// consumer
 			ConsumerSessionTimeoutMS: 10000,
 			ConsumerHeartbeatCheckMS: 5000,
 
 			// network
-			MaxClientConnections:   1000,
-			ClientIdleTimeoutMS:    60000,
-			ClientRequestTimeoutMS: 30000,
-			ObservationGRPCPort:    0,
+			MaxClientConnections:    1000,
+			MaxInflightRequests:     256,
+			MaxInflightRequestBytes: 256 * 1024 * 1024,
+			ClientIdleTimeoutMS:     60000,
+			ClientRequestTimeoutMS:  30000,
+			ObservationGRPCPort:     0,
 
 			// stream
 			MaxStreamConnections: 1000,
@@ -248,6 +274,8 @@ func LoadConfig() (*Config, error) {
 	flag.IntVar(&cfg.DiskFlushBatchSize, "disk-flush-batch", cfg.DiskFlushBatchSize, "Disk flush batch")
 	flag.IntVar(&cfg.DiskFlushIntervalMS, "disk-flush-interval-ms", cfg.DiskFlushIntervalMS, "Disk sync interval in milliseconds")
 	flag.IntVar(&cfg.DiskWriteTimeoutMS, "disk-write-timeout", cfg.DiskWriteTimeoutMS, "Disk write timeout")
+	flag.Int64Var(&cfg.DiskMinFreeBytes, "disk-min-free-bytes", cfg.DiskMinFreeBytes, "Minimum filesystem bytes that must remain after a broker write")
+	flag.Float64Var(&cfg.DiskMinFreePercent, "disk-min-free-percent", cfg.DiskMinFreePercent, "Minimum filesystem percentage that must remain after a broker write")
 	flag.IntVar(&cfg.LingerMS, "linger-ms", cfg.LingerMS, "Linger ms")
 	flag.StringVar(&cfg.CompressionType, "compression-type", "none", "Compression type (none, gzip, snappy, lz4)")
 
@@ -281,6 +309,8 @@ func LoadConfig() (*Config, error) {
 	// distributed cluster
 	flag.BoolVar(&cfg.EnabledDistribution, "enable-distribution", cfg.EnabledDistribution, "Enable distributed clustering")
 	flag.StringVar(&cfg.InternalAuthToken, "internal-auth-token", cfg.InternalAuthToken, "Shared token for broker-to-broker internal text commands")
+	flag.StringVar(&cfg.InternalAuthTokenNext, "internal-auth-token-next", cfg.InternalAuthTokenNext, "Additional accepted broker token used during staged rotation")
+	flag.StringVar(&cfg.InternalAuthGeneration, "internal-auth-generation", cfg.InternalAuthGeneration, "Non-secret identifier for the active internal credential generation")
 	flag.IntVar(&cfg.InternalBrokerPort, "internal-broker-port", cfg.InternalBrokerPort, "Dedicated broker-to-broker internal command port")
 	flag.IntVar(&cfg.RaftPort, "raft-port", cfg.RaftPort, "Raft port for replication")
 	flag.IntVar(&cfg.RaftSnapshotIntervalMS, "raft-snapshot-interval-ms", cfg.RaftSnapshotIntervalMS, "Raft snapshot check interval in milliseconds")
@@ -293,6 +323,9 @@ func LoadConfig() (*Config, error) {
 	flag.StringVar(&cfg.AdvertisedHost, "advertised-host", cfg.AdvertisedHost, "Advertised host for discovery")
 	flag.IntVar(&cfg.MinInSyncReplicas, "min-insync-replicas", cfg.MinInSyncReplicas, "Minimum in-sync replicas for writes")
 	flag.IntVar(&cfg.DefaultReplicationFactor, "default-replication-factor", cfg.DefaultReplicationFactor, "Default replication factor for new topics")
+	flag.IntVar(&cfg.MaxTopics, "max-topics", cfg.MaxTopics, "Maximum number of topics materialized by a broker")
+	flag.IntVar(&cfg.MaxPartitionsPerTopic, "max-partitions-per-topic", cfg.MaxPartitionsPerTopic, "Maximum partitions in one topic")
+	flag.IntVar(&cfg.MaxPartitions, "max-partitions", cfg.MaxPartitions, "Maximum total partitions materialized by a broker")
 
 	// idempotency
 	flag.BoolVar(&cfg.EnableIdempotence, "enable-idempotence", cfg.EnableIdempotence, "Enable producer idempotency")
@@ -301,11 +334,17 @@ func LoadConfig() (*Config, error) {
 	flag.IntVar(&cfg.TransactionTimeoutMS, "transaction-timeout-ms", cfg.TransactionTimeoutMS, "Maximum open transaction duration in milliseconds")
 	flag.IntVar(&cfg.TransactionCoordinatorShards, "transaction-coordinator-shards", cfg.TransactionCoordinatorShards, "Logical transaction coordinator shard count (immutable after cluster creation)")
 	flag.IntVar(&cfg.TransactionRecoveryBatchSize, "transaction-recovery-batch-size", cfg.TransactionRecoveryBatchSize, "Maximum transaction recovery candidates processed per pass")
+	flag.IntVar(&cfg.MaxTransactions, "max-transactions", cfg.MaxTransactions, "Maximum retained transaction identities")
+	flag.IntVar(&cfg.MaxTransactionRecords, "max-transaction-records", cfg.MaxTransactionRecords, "Maximum staged records in one transaction")
+	flag.Int64Var(&cfg.MaxTransactionBytes, "max-transaction-bytes", cfg.MaxTransactionBytes, "Maximum staged dynamic payload bytes in one transaction")
+	flag.IntVar(&cfg.MaxTransactionOffsets, "max-transaction-offsets", cfg.MaxTransactionOffsets, "Maximum staged offsets in one transaction")
 
 	// consumer
 	flag.IntVar(&cfg.ConsumerSessionTimeoutMS, "consumer-session-timeout", cfg.ConsumerSessionTimeoutMS, "Session timeout")
 	flag.IntVar(&cfg.ConsumerHeartbeatCheckMS, "consumer-heartbeat-check", cfg.ConsumerHeartbeatCheckMS, "Heartbeat check")
 	flag.IntVar(&cfg.MaxClientConnections, "max-client-connections", cfg.MaxClientConnections, "Maximum concurrently serviced client connections")
+	flag.IntVar(&cfg.MaxInflightRequests, "max-inflight-requests", cfg.MaxInflightRequests, "Maximum requests queued or processed across all client and internal connections")
+	flag.Int64Var(&cfg.MaxInflightRequestBytes, "max-inflight-request-bytes", cfg.MaxInflightRequestBytes, "Maximum encoded and decoded request payload bytes retained across the broker")
 	flag.IntVar(&cfg.ClientIdleTimeoutMS, "client-idle-timeout-ms", cfg.ClientIdleTimeoutMS, "Idle client connection timeout in milliseconds")
 	flag.IntVar(&cfg.ClientRequestTimeoutMS, "client-request-timeout-ms", cfg.ClientRequestTimeoutMS, "Maximum client request processing time in milliseconds")
 	flag.IntVar(&cfg.ObservationGRPCPort, "observation-grpc-port", cfg.ObservationGRPCPort, "Loopback-only read-only observation gRPC port; zero disables it")
@@ -403,6 +442,8 @@ func LoadConfig() (*Config, error) {
 
 	overrideEnvInt(&cfg.DiskFlushBatchSize, "DISK_FLUSH_BATCH")
 	overrideEnvInt(&cfg.DiskFlushIntervalMS, "DISK_FLUSH_INTERVAL_MS")
+	overrideEnvInt64(&cfg.DiskMinFreeBytes, "DISK_MIN_FREE_BYTES")
+	overrideEnvFloat64(&cfg.DiskMinFreePercent, "DISK_MIN_FREE_PERCENT")
 	overrideEnvInt(&cfg.LingerMS, "LINGER_MS")
 	overrideEnvString(&cfg.CompressionType, "COMPRESSION_TYPE")
 
@@ -420,11 +461,15 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.ConsumerChannelBufSize, "CONSUMER_CH_BUFFER")
 	overrideEnvInt(&cfg.BroadcastChannelBufferSize, "BROADCAST_CH_BUFFER")
 	overrideEnvInt(&cfg.MaxClientConnections, "MAX_CLIENT_CONNECTIONS")
+	overrideEnvInt(&cfg.MaxInflightRequests, "MAX_INFLIGHT_REQUESTS")
+	overrideEnvInt64(&cfg.MaxInflightRequestBytes, "MAX_INFLIGHT_REQUEST_BYTES")
 	overrideEnvInt(&cfg.ClientIdleTimeoutMS, "CLIENT_IDLE_TIMEOUT_MS")
 	overrideEnvInt(&cfg.ClientRequestTimeoutMS, "CLIENT_REQUEST_TIMEOUT_MS")
 
 	overrideEnvBool(&cfg.EnabledDistribution, "ENABLE_DISTRIBUTION")
 	overrideEnvString(&cfg.InternalAuthToken, "INTERNAL_AUTH_TOKEN")
+	overrideEnvString(&cfg.InternalAuthTokenNext, "INTERNAL_AUTH_TOKEN_NEXT")
+	overrideEnvString(&cfg.InternalAuthGeneration, "INTERNAL_AUTH_GENERATION")
 	overrideEnvInt(&cfg.InternalBrokerPort, "INTERNAL_BROKER_PORT")
 	overrideEnvString(&cfg.AdvertisedHost, "ADVERTISED_HOST")
 	overrideEnvInt(&cfg.AdvertisedBrokerPort, "ADVERTISED_BROKER_PORT")
@@ -440,6 +485,9 @@ func LoadConfig() (*Config, error) {
 	overrideEnvBool(&cfg.BootstrapSoleVoter, "BOOTSTRAP_SOLE_VOTER")
 	overrideEnvInt(&cfg.MinInSyncReplicas, "MIN_INSYNC_REPLICAS")
 	overrideEnvInt(&cfg.DefaultReplicationFactor, "DEFAULT_REPLICATION_FACTOR")
+	overrideEnvInt(&cfg.MaxTopics, "MAX_TOPICS")
+	overrideEnvInt(&cfg.MaxPartitionsPerTopic, "MAX_PARTITIONS_PER_TOPIC")
+	overrideEnvInt(&cfg.MaxPartitions, "MAX_PARTITIONS")
 
 	overrideEnvBool(&cfg.EnableIdempotence, "ENABLE_IDEMPOTENCE")
 	overrideEnvInt(&cfg.ProducerStateTTLMS, "PRODUCER_STATE_TTL_MS")
@@ -447,6 +495,10 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.TransactionTimeoutMS, "TRANSACTION_TIMEOUT_MS")
 	overrideEnvInt(&cfg.TransactionCoordinatorShards, "TRANSACTION_COORDINATOR_SHARDS")
 	overrideEnvInt(&cfg.TransactionRecoveryBatchSize, "TRANSACTION_RECOVERY_BATCH_SIZE")
+	overrideEnvInt(&cfg.MaxTransactions, "MAX_TRANSACTIONS")
+	overrideEnvInt(&cfg.MaxTransactionRecords, "MAX_TRANSACTION_RECORDS")
+	overrideEnvInt64(&cfg.MaxTransactionBytes, "MAX_TRANSACTION_BYTES")
+	overrideEnvInt(&cfg.MaxTransactionOffsets, "MAX_TRANSACTION_OFFSETS")
 
 	overrideEnvInt(&cfg.ConsumerSessionTimeoutMS, "CONSUMER_SESSION_TIMEOUT")
 	overrideEnvInt(&cfg.ConsumerHeartbeatCheckMS, "CONSUMER_HEARTBEAT_CHECK")
@@ -541,6 +593,15 @@ func (cfg *Config) ValidateClusterTransport() error {
 	}
 	if strings.ContainsAny(cfg.InternalAuthToken, " \t\r\n") {
 		return fmt.Errorf("internal_auth_token must not contain whitespace")
+	}
+	if strings.ContainsAny(cfg.InternalAuthTokenNext, " \t\r\n") {
+		return fmt.Errorf("internal_auth_token_next must not contain whitespace")
+	}
+	if cfg.InternalAuthTokenNext != "" && cfg.InternalAuthTokenNext == cfg.InternalAuthToken {
+		return fmt.Errorf("internal_auth_token_next must differ from internal_auth_token")
+	}
+	if strings.ContainsAny(cfg.InternalAuthGeneration, " \t\r\n") {
+		return fmt.Errorf("internal_auth_generation must not contain whitespace")
 	}
 	if !cfg.InternalUseTLS && !cfg.AllowInsecureClusterTransport {
 		return fmt.Errorf("distributed mode requires internal TLS; set allow_insecure_cluster_transport only for isolated test environments")

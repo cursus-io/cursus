@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
@@ -251,7 +252,7 @@ func TestProducerClient_ConnectPartition_NoBroker(t *testing.T) {
 func TestProducerClient_ConnectPartitionLocked_NegativeIndex(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	pc, _ := NewProducerClient(cfg)
-	err := pc.connectPartitionLocked(-1, "localhost:9000")
+	err := pc.connectPartitionLocked(context.Background(), -1, "localhost:9000")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid partition index")
 }
@@ -453,6 +454,7 @@ func TestProducer_ParseAckResponse_ErrorStatus(t *testing.T) {
 
 func TestProducer_ParseAckResponse_LeaderUpdate(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
+	cfg.EnableIdempotence = false
 	p := &Producer{
 		config: cfg,
 		client: mustNewProducerClient(cfg),
@@ -867,7 +869,7 @@ func TestNewProducerClient_TLSError(t *testing.T) {
 	client, err := NewProducerClient(cfg)
 	assert.Nil(t, client)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "load TLS cert")
+	assert.Contains(t, err.Error(), "load TLS client certificate")
 }
 
 func TestProducerClient_ReconnectPartition_EmptyAddrFallsBackToSelectBroker(t *testing.T) {

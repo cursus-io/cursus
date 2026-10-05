@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
@@ -59,14 +61,14 @@ func TestReadStreamTextErrorBecomesTypedWireError(t *testing.T) {
 			serverError <- err
 			return
 		}
-		serverResult <- newServerWireConn(serverRaw, connection)
+		serverResult <- newServerWireConn(serverRaw, connection, time.Second)
 	}()
 	client, err := wire.ClientHandshake(clientRaw, []wire.Compression{wire.CompressionNone})
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := <-serverResult
-	server.setRequest(wire.Frame{Command: wire.CommandReadStream, RequestID: 17})
+	server.setRequest(wire.Frame{Command: wire.CommandReadStream, RequestID: 17}, context.Background())
 	go func() { serverError <- server.WritePayload([]byte("ERROR: invalid_from_version")) }()
 
 	frame, err := client.ReadFrame()

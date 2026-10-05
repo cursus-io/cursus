@@ -11,6 +11,7 @@ const (
 	ProtocolFailureChecksumMismatch    = "checksum_mismatch"
 	ProtocolFailureCompressionMismatch = "compression_mismatch"
 	ProtocolFailureDecompression       = "decompression_rejected"
+	ProtocolFailurePartialFrame        = "partial_frame_read"
 	ProtocolFailureUnknown             = "unknown"
 
 	DecompressionRejectionInvalidPayload = "invalid_payload"
@@ -22,6 +23,7 @@ var protocolFailureReasons = [...]string{
 	ProtocolFailureChecksumMismatch,
 	ProtocolFailureCompressionMismatch,
 	ProtocolFailureDecompression,
+	ProtocolFailurePartialFrame,
 	ProtocolFailureUnknown,
 }
 
@@ -59,6 +61,8 @@ func RuntimeMetrics() RuntimeMetricsSnapshot {
 func recordProtocolFailure(err error) {
 	reason := ProtocolFailureUnknown
 	switch {
+	case IsPartialFrameRead(err):
+		reason = ProtocolFailurePartialFrame
 	case errors.Is(err, ErrDecompressionRejected):
 		reason = ProtocolFailureDecompression
 	case errors.Is(err, ErrCompressionMismatch):

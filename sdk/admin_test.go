@@ -161,17 +161,17 @@ func TestAdminClientRetriesHandshakeTransportFailureOnNextBroker(t *testing.T) {
 	require.Equal(t, "CREATE topic=orders", receiveAdminTestCommand(t, secondResult))
 }
 
-func TestAdminClientCapabilitiesUsesReadOnlyNegotiation(t *testing.T) {
-	addr, result := startAdminCapabilityTestServer(t, "OK protocol_version=1 enabled=browse_messages_v1,stream_history_v1 unsupported=")
+func TestAdminClientCapabilitiesUsesReadOnlyHelp(t *testing.T) {
+	addr, result := startAdminCapabilityTestServer(t, "OK commands=BROWSE_MESSAGES,READ_STREAM_HISTORY")
 	client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
 	require.NoError(t, err)
 
 	capabilities, err := client.Capabilities(context.Background())
 	command := receiveAdminTestCommand(t, result)
 	require.NoError(t, err)
-	require.Equal(t, 1, capabilities.Version)
-	require.Equal(t, []string{"browse_messages_v1", "stream_history_v1"}, capabilities.Enabled)
-	require.Equal(t, "NEGOTIATE version=1 features=* require_features=false", command)
+	require.Equal(t, 2, capabilities.Version)
+	require.Equal(t, []string{"browse_messages_v1", "stream_history_v1", "structured_errors_v1"}, capabilities.Enabled)
+	require.Equal(t, "HELP", command)
 }
 
 func TestAdminClientReturnsStructuredBrokerError(t *testing.T) {
@@ -228,15 +228,16 @@ func startAdminCapabilityTestServer(t *testing.T, response string) (string, <-ch
 			result <- adminTestResult{err: decodeErr}
 			return
 		}
-		if request.Command != wire.CommandNegotiate {
-			result <- adminTestResult{err: fmt.Errorf("command = %s, want NEGOTIATE", request.Command)}
+		command, renderErr := wire.RenderCommand(request.Command, payload)
+		if renderErr != nil || command != "HELP" {
+			result <- adminTestResult{err: fmt.Errorf("command = %s, want HELP: %v", request.Command, renderErr)}
 			return
 		}
 		if writeErr := writeWireTestResponse(connection, request, response); writeErr != nil {
 			result <- adminTestResult{err: writeErr}
 			return
 		}
-		result <- adminTestResult{command: fmt.Sprintf("NEGOTIATE version=%s features=%s require_features=%s", payload.Fields["version"], payload.Fields["features"], payload.Fields["require_features"])}
+		result <- adminTestResult{command: command}
 	}()
 	t.Cleanup(func() { _ = listener.Close() })
 	return listener.Addr().String(), result

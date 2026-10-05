@@ -79,18 +79,21 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 		}},
 		fixedDisk{snapshot: disk.RuntimeSnapshot{
 			Handlers: 1, Segments: 2, Bytes: 4096, PendingWrites: 4, ActiveReaders: 2,
+			FilesystemFreeBytes: 8192, FilesystemTotalBytes: 16384, FilesystemHeadroomOK: true,
 			SegmentCacheEntries: 3, SegmentCacheHits: 11, SegmentCacheMisses: 5, SegmentCacheEvictions: 2,
 		}},
 		fixedStreams(2),
 		fixedCluster{snapshot: clustercontroller.RuntimeSnapshot{
 			Enabled: true, BrokerCount: 3, HasLeader: true, IsLeader: true, UnderReplicated: 1,
+			AssignmentDeficient: 1, InactiveReplicaPartitions: 1, InactiveReplicas: 2, MinISRUnsatisfied: 1,
 			TopicMaterializationsPending: map[string]int{"create": 2},
 			TopicMaterializationAttempts: map[string]clustercontroller.MaterializationAttemptsSnapshot{
 				"create": {Success: 4, Failure: 3},
 			},
 			TopicMaterializationOldestPending: 12.5,
 			PartitionDetails: []clustercontroller.PartitionRuntimeSnapshot{{
-				Topic: "orders", Partition: 0, Leader: "broker-1", LeaderEpoch: 4, Replicas: 3, InSync: 2,
+				Topic: "orders", Partition: 0, Leader: "broker-1", LeaderEpoch: 4,
+				Replicas: 1, ExpectedReplicas: 3, ActiveReplicas: 1, InSync: 1, MinInSyncReplicas: 2,
 			}},
 		}},
 		fixedReadiness(true),
@@ -115,6 +118,9 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 	assertGauge(t, families, "cursus_consumer_group_offset_out_of_range", map[string]string{"group": "new-workers", "topic": "orders", "partition": "0"}, 1)
 	assertGauge(t, families, "cursus_consumer_group_offset_out_of_range", map[string]string{"group": "ahead-workers", "topic": "orders", "partition": "0"}, 1)
 	assertGauge(t, families, "cursus_storage_bytes", nil, 4096)
+	assertGauge(t, families, "cursus_storage_filesystem_free_bytes", nil, 8192)
+	assertGauge(t, families, "cursus_storage_filesystem_total_bytes", nil, 16384)
+	assertGauge(t, families, "cursus_storage_filesystem_headroom_ready", nil, 1)
 	assertGauge(t, families, "cursus_storage_segment_cache_entries", nil, 3)
 	assertGauge(t, families, "cursus_storage_segment_cache_hits", nil, 11)
 	assertGauge(t, families, "cursus_storage_segment_cache_misses", nil, 5)
@@ -124,10 +130,19 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 	assertMetricExists(t, families, "cursus_wire_decompression_rejections_total", map[string]string{"reason": "invalid_payload"})
 	assertMetricExists(t, families, "cursus_cluster_isr_catchup_proofs_total", map[string]string{"outcome": "accepted", "reason": "applied"})
 	assertGauge(t, families, "cursus_cluster_under_replicated_partitions", nil, 1)
+	assertGauge(t, families, "cursus_cluster_assignment_deficient_partitions", nil, 1)
+	assertGauge(t, families, "cursus_cluster_inactive_replica_partitions", nil, 1)
+	assertGauge(t, families, "cursus_cluster_inactive_replicas", nil, 2)
+	assertGauge(t, families, "cursus_cluster_min_insync_unsatisfied_partitions", nil, 1)
 	assertGauge(t, families, "cursus_cluster_topic_materializations_pending", map[string]string{"operation": "create"}, 2)
 	assertCounter(t, families, "cursus_cluster_topic_materialization_attempts_total", map[string]string{"operation": "create", "result": "success"}, 4)
 	assertCounter(t, families, "cursus_cluster_topic_materialization_attempts_total", map[string]string{"operation": "create", "result": "failure"}, 3)
 	assertGauge(t, families, "cursus_cluster_topic_materialization_oldest_pending_seconds", nil, 12.5)
+	assertGauge(t, families, "cursus_cluster_partition_replicas", map[string]string{"topic": "orders", "partition": "0"}, 1)
+	assertGauge(t, families, "cursus_cluster_partition_expected_replicas", map[string]string{"topic": "orders", "partition": "0"}, 3)
+	assertGauge(t, families, "cursus_cluster_partition_active_replicas", map[string]string{"topic": "orders", "partition": "0"}, 1)
+	assertGauge(t, families, "cursus_cluster_partition_min_insync_replicas", map[string]string{"topic": "orders", "partition": "0"}, 2)
+	assertGauge(t, families, "cursus_cluster_partition_topology_healthy", map[string]string{"topic": "orders", "partition": "0"}, 0)
 	assertGauge(t, families, "cursus_cluster_partition_leader", map[string]string{"topic": "orders", "partition": "0", "broker_id": "broker-1"}, 1)
 }
 

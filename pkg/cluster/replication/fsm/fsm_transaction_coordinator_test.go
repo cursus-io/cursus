@@ -183,6 +183,7 @@ func TestRestoreRejectsLegacyTransactionCoordinatorSnapshot(t *testing.T) {
 func TestRestoreRejectsTransactionCoordinatorShardOutsidePersistedCount(t *testing.T) {
 	state := BrokerFSMState{
 		Version:                          SnapshotVersionCurrent,
+		NextProducerEpoch:                testProducerEpochWatermark(),
 		TransactionCoordinatorShardCount: 7,
 		TransactionCoordinatorShards: map[int]TransactionCoordinatorShard{
 			7: {Owner: "node-a", Epoch: 1},

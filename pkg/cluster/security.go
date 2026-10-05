@@ -16,12 +16,23 @@ const (
 )
 
 func NewSecureClusterServer(sd controller.ServiceDiscovery, authToken string, tlsConfig *tls.Config) *ClusterServer {
+	return NewSecureClusterServerWithTokens(sd, authToken, "", tlsConfig)
+}
+
+func NewSecureClusterServerWithTokens(sd controller.ServiceDiscovery, activeToken, nextToken string, tlsConfig *tls.Config) *ClusterServer {
 	if tlsConfig != nil {
 		tlsConfig = tlsConfig.Clone()
 	}
+	authTokens := make([]string, 0, 2)
+	if activeToken != "" {
+		authTokens = append(authTokens, activeToken)
+	}
+	if nextToken != "" && nextToken != activeToken {
+		authTokens = append(authTokens, nextToken)
+	}
 	return &ClusterServer{
 		sd:             sd,
-		authToken:      authToken,
+		authTokens:     authTokens,
 		tlsConfig:      tlsConfig,
 		connectionSlot: make(chan struct{}, defaultClusterMaxConnections),
 		requestTimeout: defaultClusterRequestTimeout,
@@ -40,9 +51,13 @@ func listenCluster(address string, tlsConfig *tls.Config) (net.Listener, error) 
 }
 
 func (h *ClusterServer) authenticate(payload wire.CommandPayload) bool {
-	if h.authToken == "" {
+	if len(h.authTokens) == 0 {
 		return true
 	}
 	supplied := payload.Fields["auth_token"]
-	return subtle.ConstantTimeCompare([]byte(supplied), []byte(h.authToken)) == 1
+	authenticated := 0
+	for _, token := range h.authTokens {
+		authenticated |= subtle.ConstantTimeCompare([]byte(supplied), []byte(token))
+	}
+	return authenticated == 1
 }

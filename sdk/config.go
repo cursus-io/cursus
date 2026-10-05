@@ -37,9 +37,11 @@ type PublisherConfig struct {
 	BufferSize        int    `yaml:"buffer_size" json:"buffer_size"`
 	LingerMS          int    `yaml:"linger_ms" json:"linger_ms"`
 
-	UseTLS      bool   `yaml:"use_tls" json:"use_tls"`
-	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
-	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
+	UseTLS        bool   `yaml:"use_tls" json:"use_tls"`
+	TLSCAPath     string `yaml:"tls_ca_path" json:"tls_ca_path"`
+	TLSServerName string `yaml:"tls_server_name" json:"tls_server_name"`
+	TLSCertPath   string `yaml:"tls_cert_path" json:"tls_cert_path"`
+	TLSKeyPath    string `yaml:"tls_key_path" json:"tls_key_path"`
 
 	Principal string `yaml:"principal" json:"principal"`
 	AuthToken string `yaml:"auth_token" json:"auth_token"`
@@ -90,7 +92,7 @@ func (c *PublisherConfig) Validate() error {
 			return fmt.Errorf("publisher broker address must not be empty")
 		}
 	}
-	if err := validateTLSFiles(c.UseTLS, c.TLSCertPath, c.TLSKeyPath); err != nil {
+	if err := validateTLSFiles(c.UseTLS, c.TLSCAPath, c.TLSServerName, c.TLSCertPath, c.TLSKeyPath); err != nil {
 		return err
 	}
 	return nil
@@ -112,7 +114,8 @@ func NewDefaultPublisherConfig() *PublisherConfig {
 		WriteTimeoutMS:     5000,
 		FlushTimeoutMS:     30000,
 		HandshakeTimeoutMS: 5000,
-		Acks:               "1",
+		Acks:               "all",
+		EnableIdempotence:  true,
 		CompressionType:    "none",
 	}
 }
@@ -168,21 +171,34 @@ type ConsumerConfig struct {
 	HeartbeatIntervalMS     int `yaml:"heartbeat_interval_ms" json:"heartbeat_interval_ms"`
 	StreamingReadDeadlineMS int `yaml:"streaming_read_deadline_ms" json:"streaming_read_deadline_ms"`
 
-	EnableAutoCommit   bool          `yaml:"enable_auto_commit" json:"enable_auto_commit"`
+	EnableAutoCommit bool `yaml:"enable_auto_commit" json:"enable_auto_commit"`
+	// AutoCommitInterval batches the highest successfully processed next offset
+	// for every assigned partition. Close attempts one bounded final flush;
+	// failed or fenced commits are redelivered from the durable broker offset.
 	AutoCommitInterval time.Duration `yaml:"auto_commit_interval" json:"auto_commit_interval"`
 
 	MaxCommitRetries      int           `yaml:"max_commit_retries" json:"max_commit_retries"`
 	CommitRetryBackoff    time.Duration `yaml:"commit_retry_backoff" json:"commit_retry_backoff"`
 	CommitRetryMaxBackoff time.Duration `yaml:"commit_retry_max_backoff" json:"commit_retry_max_backoff"`
 
-	UseTLS      bool   `yaml:"use_tls" json:"use_tls"`
-	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
-	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
+	// HandlerMaxRetries is the number of additional delivery attempts for the
+	// same record after the handler first returns an error. Exhaustion stops the
+	// consumer and leaves the record uncommitted for a later restart.
+	HandlerMaxRetries      int           `yaml:"handler_max_retries" json:"handler_max_retries"`
+	HandlerRetryBackoff    time.Duration `yaml:"handler_retry_backoff" json:"handler_retry_backoff"`
+	HandlerRetryMaxBackoff time.Duration `yaml:"handler_retry_max_backoff" json:"handler_retry_max_backoff"`
+
+	UseTLS        bool   `yaml:"use_tls" json:"use_tls"`
+	TLSCAPath     string `yaml:"tls_ca_path" json:"tls_ca_path"`
+	TLSServerName string `yaml:"tls_server_name" json:"tls_server_name"`
+	TLSCertPath   string `yaml:"tls_cert_path" json:"tls_cert_path"`
+	TLSKeyPath    string `yaml:"tls_key_path" json:"tls_key_path"`
 
 	Principal string `yaml:"principal" json:"principal"`
 	AuthToken string `yaml:"auth_token" json:"auth_token"`
 
 	HandshakeTimeoutMS int `yaml:"handshake_timeout_ms" json:"handshake_timeout_ms"`
+	RequestTimeoutMS   int `yaml:"request_timeout_ms" json:"request_timeout_ms"`
 
 	LeaderStaleness         time.Duration `yaml:"leader_staleness" json:"leader_staleness"`
 	MetadataRefreshInterval time.Duration `yaml:"metadata_refresh_interval" json:"metadata_refresh_interval"`
@@ -208,7 +224,7 @@ func (c *ConsumerConfig) Validate() error {
 	if strings.TrimSpace(c.ConsumerID) == "" || strings.ContainsAny(c.ConsumerID, " \t\r\n") {
 		return fmt.Errorf("consumer ID must be non-empty and contain no whitespace")
 	}
-	if err := validateTLSFiles(c.UseTLS, c.TLSCertPath, c.TLSKeyPath); err != nil {
+	if err := validateTLSFiles(c.UseTLS, c.TLSCAPath, c.TLSServerName, c.TLSCertPath, c.TLSKeyPath); err != nil {
 		return err
 	}
 	if c.Mode != "" && c.Mode != ModePolling && c.Mode != ModeStreaming {
@@ -222,10 +238,11 @@ func (c *ConsumerConfig) Validate() error {
 		return fmt.Errorf("unsupported read isolation %q", c.ReadIsolation)
 	}
 	if c.PollInterval < 0 || c.AutoCommitInterval < 0 || c.CommitRetryBackoff < 0 ||
-		c.CommitRetryMaxBackoff < 0 || c.LeaderStaleness < 0 ||
+		c.CommitRetryMaxBackoff < 0 || c.HandlerRetryBackoff < 0 ||
+		c.HandlerRetryMaxBackoff < 0 || c.LeaderStaleness < 0 ||
 		c.MetadataRefreshInterval < 0 || c.PollTimeoutMS < 0 ||
 		c.ConnectRetryBackoffMS < 0 || c.HeartbeatIntervalMS < 0 || c.StreamingReadDeadlineMS < 0 ||
-		c.HandshakeTimeoutMS < 0 {
+		c.HandshakeTimeoutMS < 0 || c.RequestTimeoutMS < 0 {
 		return fmt.Errorf("consumer durations must not be negative")
 	}
 	if c.BatchSize <= 0 || c.MaxPollRecords <= 0 || c.WorkerChannelSize <= 0 {
@@ -234,8 +251,11 @@ func (c *ConsumerConfig) Validate() error {
 	if c.BatchSize > MaxConsumerBatchRecords || c.MaxPollRecords > MaxConsumerBatchRecords {
 		return fmt.Errorf("consumer batch size and max poll records must not exceed %d", MaxConsumerBatchRecords)
 	}
-	if c.MaxConnectRetries < 0 || c.MaxCommitRetries < 0 {
+	if c.MaxConnectRetries < 0 || c.MaxCommitRetries < 0 || c.HandlerMaxRetries < 0 {
 		return fmt.Errorf("consumer retry limits must not be negative")
+	}
+	if c.HandlerRetryMaxBackoff > 0 && c.HandlerRetryBackoff > c.HandlerRetryMaxBackoff {
+		return fmt.Errorf("consumer handler retry max backoff must be greater than or equal to retry backoff")
 	}
 	if len(c.BrokerAddrs) == 0 {
 		return fmt.Errorf("consumer requires at least one broker address")
@@ -261,12 +281,18 @@ func validateWireClientSettings(compression, principal, token string) error {
 	return nil
 }
 
-func validateTLSFiles(enabled bool, certificate, key string) error {
+func validateTLSFiles(enabled bool, ca, serverName, certificate, key string) error {
 	if !enabled {
 		return nil
 	}
-	if strings.TrimSpace(certificate) == "" || strings.TrimSpace(key) == "" {
-		return fmt.Errorf("TLS certificate and key paths are required when TLS is enabled")
+	if (strings.TrimSpace(certificate) == "") != (strings.TrimSpace(key) == "") {
+		return fmt.Errorf("TLS client certificate and key paths must be configured together")
+	}
+	if ca != strings.TrimSpace(ca) {
+		return fmt.Errorf("TLS CA path must not have surrounding whitespace")
+	}
+	if serverName != strings.TrimSpace(serverName) || strings.ContainsAny(serverName, " \t\r\n") {
+		return fmt.Errorf("TLS server name must not contain whitespace")
 	}
 	return nil
 }
@@ -289,8 +315,12 @@ func NewDefaultConsumerConfig() *ConsumerConfig {
 		MaxCommitRetries:        5,
 		CommitRetryBackoff:      500 * time.Millisecond,
 		CommitRetryMaxBackoff:   2 * time.Second,
+		HandlerMaxRetries:       3,
+		HandlerRetryBackoff:     100 * time.Millisecond,
+		HandlerRetryMaxBackoff:  time.Second,
 		HeartbeatIntervalMS:     3000,
 		HandshakeTimeoutMS:      5000,
+		RequestTimeoutMS:        10000,
 		CompressionType:         "none",
 		LeaderStaleness:         30 * time.Second,
 		StreamingReadDeadlineMS: 300000,

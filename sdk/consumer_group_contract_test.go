@@ -164,13 +164,83 @@ func TestConsumerHeartbeatIncludesMemberAndGeneration(t *testing.T) {
 }
 
 func TestConsumerCloseLeavesCurrentGeneration(t *testing.T) {
-	addr, commands := startSDKCommandServer(t, "")
+	addr, commands := startSDKCommandServer(t, "OK group=workers member=worker-1234 left=true")
 	consumer := newGroupContractConsumer(t, addr)
 	consumer.memberID = "worker-1234"
 	consumer.generation = 7
 
 	require.NoError(t, consumer.Close())
 	assert.Equal(t, "LEAVE_GROUP topic=events group=workers member=worker-1234 generation=7", requireSDKCommand(t, commands))
+}
+
+func TestConsumerDoneWaitsForLeaveGroupAcknowledgement(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	commandReceived := make(chan string, 1)
+	releaseResponse := make(chan struct{})
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		connection, request, command, readErr := acceptWireTestRequest(conn)
+		if readErr != nil {
+			return
+		}
+		commandReceived <- command
+		<-releaseResponse
+		_ = writeWireTestResponse(connection, request, "OK group=workers member=worker-1234 left=true")
+	}()
+
+	consumer := newGroupContractConsumer(t, listener.Addr().String())
+	consumer.memberID = "worker-1234"
+	consumer.generation = 7
+
+	closeReturned := make(chan error, 1)
+	go func() { closeReturned <- consumer.Close() }()
+	require.Equal(t, "LEAVE_GROUP topic=events group=workers member=worker-1234 generation=7", <-commandReceived)
+	select {
+	case <-consumer.Done():
+		t.Fatal("Done closed before LEAVE_GROUP was acknowledged")
+	default:
+	}
+	select {
+	case err := <-closeReturned:
+		t.Fatalf("Close returned before LEAVE_GROUP was acknowledged: %v", err)
+	default:
+	}
+
+	close(releaseResponse)
+	require.NoError(t, <-closeReturned)
+	select {
+	case <-consumer.Done():
+	default:
+		t.Fatal("Done remained open after LEAVE_GROUP acknowledgement")
+	}
+}
+
+func TestConsumerConcurrentCloseReturnsSameLeaveGroupFailure(t *testing.T) {
+	addr, commands := startSDKCommandServer(t, "ERROR: GEN_MISMATCH class=conflict retryable=false current=8 requested=7")
+	consumer := newGroupContractConsumer(t, addr)
+	consumer.memberID = "worker-1234"
+	consumer.generation = 7
+
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+	go func() { first <- consumer.Close() }()
+	require.Equal(t, "LEAVE_GROUP topic=events group=workers member=worker-1234 generation=7", requireSDKCommand(t, commands))
+	go func() { second <- consumer.Close() }()
+
+	firstErr := <-first
+	secondErr := <-second
+	require.Error(t, firstErr)
+	require.EqualError(t, secondErr, firstErr.Error())
+	var brokerErr *BrokerError
+	require.ErrorAs(t, firstErr, &brokerErr)
+	require.Equal(t, "GEN_MISMATCH", brokerErr.Code)
 }
 
 func TestConsumerSchedulesRebalanceRetryUntilClosed(t *testing.T) {

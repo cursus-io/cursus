@@ -1,10 +1,17 @@
 {{- if .Values.persistence.enabled }}
+{{- if and .Values.persistence.classless .Values.persistence.storageClass }}
+{{- fail "persistence.classless and persistence.storageClass cannot both be set" }}
+{{- end }}
 apiVersion: v1  
 kind: PersistentVolumeClaim  
 metadata:  
   name: {{ include "cursus.fullname" . }}-logs  
 spec:  
-  storageClassName: {{ .Values.persistence.storageClass | default "" }}  
+{{ if .Values.persistence.classless }}
+  storageClassName: ""
+{{ else if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+{{ end }}
   accessModes:  
     - ReadWriteOnce
   resources:  

@@ -71,12 +71,19 @@ type RaftManager interface {
 }
 
 type ClusterController struct {
-	RaftManager RaftManager
-	Discovery   ServiceDiscovery
-	Election    *ControllerElection
-	Router      *ClusterRouter
-	Config      *config.Config
-	brokerID    string
+	RaftManager     RaftManager
+	Discovery       ServiceDiscovery
+	Election        *ControllerElection
+	Router          *ClusterRouter
+	Config          *config.Config
+	brokerID        string
+	snapshotCatchup func(context.Context, fsm.ReplicaCatchupRequest) error
+}
+
+func (cc *ClusterController) SetReplicaSnapshotCatchup(callback func(context.Context, fsm.ReplicaCatchupRequest) error) {
+	if cc != nil {
+		cc.snapshotCatchup = callback
+	}
 }
 
 // PartitionReplicationSnapshot is an immutable view of the replication fence

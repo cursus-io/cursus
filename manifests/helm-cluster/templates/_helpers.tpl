@@ -27,6 +27,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{ include "cursus-cluster.fullname" . }}-headless
 {{- end }}
 
+{{- define "cursus-cluster.image" -}}
+{{- if .Values.image.digest -}}
+{{ printf "%s@%s" .Values.image.repository .Values.image.digest }}
+{{- else -}}
+{{ printf "%s:%s" .Values.image.repository .Values.image.tag }}
+{{- end -}}
+{{- end }}
+
 {{- define "cursus-cluster.memberHost" -}}
 {{- $ordinal := index . 0 -}}
 {{- $ctx := index . 1 -}}

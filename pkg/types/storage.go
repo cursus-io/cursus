@@ -1,6 +1,13 @@
 package types
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrCommittedHWMUnavailable fences committed reads until cluster recovery
+// establishes the authoritative high-water mark for a partition.
+var ErrCommittedHWMUnavailable = errors.New("authoritative committed HWM is not established")
 
 type StorageHandler interface {
 	ReadMessages(offset uint64, max int) ([]Message, error)

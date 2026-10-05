@@ -73,29 +73,6 @@ func TestClusterDataConsistency(t *testing.T) {
 		Expect(ExpectDataConsistent())
 }
 
-// TestDistributedOffsetResilience verifies committed offsets are preserved after leader failover
-func TestDistributedOffsetResilience(t *testing.T) {
-	t.Skip("Unstable: Offset replication after failover needs further stabilizing")
-	ctx := GivenClusterRestart(t).
-		WithClusterSize(3).
-		WithTopic("offset-test").
-		WithPartitions(1)
-	defer ctx.Cleanup()
-
-	ctx.WhenCluster().
-		StartCluster().
-		CreateTopic()
-
-	ctx.WhenCluster().WaitForTopicMetadata()
-	ctx.WhenCluster().
-		JoinGroup().
-		CommitOffset(0, 50)
-	ctx.WhenCluster().SimulateLeaderFailure()
-
-	ctx.Then().
-		Expect(ExpectOffsetMatched(0, 50))
-}
-
 // TestClusterWideDeduplication verifies exactly-once delivery across cluster failover
 func TestClusterWideDeduplication(t *testing.T) {
 	ctx := GivenClusterRestart(t).
@@ -116,27 +93,4 @@ func TestClusterWideDeduplication(t *testing.T) {
 		RetryPublishMessages().
 		Then().
 		Expect(ExpectDataConsistent())
-}
-
-// TestConsumerGroupRebalanceFailover verifies group stability during node failure
-func TestConsumerGroupRebalanceFailover(t *testing.T) {
-	t.Skip("Unstable: Rebalance timing and member session timeouts are flaky in CI")
-	ctx := GivenClusterRestart(t).
-		WithClusterSize(3).
-		WithTopic("rebalance-test").
-		WithPartitions(2)
-	defer ctx.Cleanup()
-
-	ctx.WhenCluster().
-		StartCluster().
-		CreateTopic()
-
-	ctx.WhenCluster().WaitForTopicMetadata()
-	ctx.WhenCluster().
-		JoinGroup().
-		SyncGroup()
-	ctx.WhenCluster().SimulateLeaderFailure()
-
-	ctx.Then().
-		Expect(ISRMaintained())
 }

@@ -1,0 +1,54 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "cursus-cluster.fullname" . }}
+  labels:
+    {{- include "cursus-cluster.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "cursus-cluster.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "cursus-cluster.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: {{ .Values.service.internalPort }}
+          protocol: TCP
+        - port: {{ .Values.service.raftPort }}
+          protocol: TCP
+        - port: {{ .Values.service.discoveryPort }}
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            {{- if empty .Values.networkPolicy.clientNamespaceSelector }}
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+            {{- else }}
+            {{- toYaml .Values.networkPolicy.clientNamespaceSelector | nindent 12 }}
+            {{- end }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.clientPodSelector | nindent 12 }}
+      ports:
+        - port: {{ .Values.service.brokerPort }}
+          protocol: TCP
+    {{- if .Values.monitoring.enabled }}
+    - from:
+        - namespaceSelector:
+            {{- if empty .Values.networkPolicy.monitoringNamespaceSelector }}
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+            {{- else }}
+            {{- toYaml .Values.networkPolicy.monitoringNamespaceSelector | nindent 12 }}
+            {{- end }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.monitoringPodSelector | nindent 12 }}
+      ports:
+        - port: {{ .Values.service.metricsPort }}
+          protocol: TCP
+    {{- end }}
+{{- end }}

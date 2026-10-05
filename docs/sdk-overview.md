@@ -82,13 +82,45 @@ flowchart TB
 | Framework Integration | — | Spring Boot | FastAPI |
 | Iterator Pattern | — | — | ✅ for/async for |
 
+## Go Producer Initialization
+
+`NewProducerWithContext` applies its context throughout connection establishment, authentication, optional topic creation, metadata discovery, and partition connections. Cancellation closes initialization sockets and returns a context error; sender workers start only after initialization succeeds. After success, canceling the context closes the producer.
+
+`AckTimeoutMS` also bounds each producer `CREATE` and `METADATA` exchange, including connection establishment and authentication. Zero uses 5000 ms for these control requests. A metadata request timeout allows discovery to try the next bootstrap address; canceling the constructor context stops initialization.
+
+TLS settings apply to every connection, including `AutoCreateTopics` initialization. The connection address supplies the TLS verification hostname when no explicit server name is configured. Certificate and hostname verification remain enabled.
+
 ## Go Producer Delivery Errors
 
-`Producer.Flush() error` waits for queued batches and returns a drain timeout or the first permanent delivery failure. `Producer.Close() error` also reports that failure, including when shutdown times out. Check both return values: accepting a message into the local buffer is not proof of broker delivery. Permanent delivery errors remain visible for the lifetime of the producer.
+The default Go producer uses `Acks="all"` and `EnableIdempotence=true`. This
+allows the SDK to retry the same producer epoch and sequence range when an
+acknowledgement is lost without appending the record twice. The broker's
+effective `min_in_sync_replicas` still determines how many replicas must be in
+sync before `acks=all` can accept the batch.
 
 Producer delivery is bounded to `MaxRetries + 1` attempts for each logical batch, including attempts that reconnect or refresh partition routing. Backoff and replacement connections run only when another attempt remains. The final failed connection is discarded without another dial or handshake. When the budget is exhausted, the producer does not put the batch back into its local queue; `Flush` and `Close` return the underlying structured broker or transport error so the application can decide whether to retry or dead-letter the records.
 
-For acknowledged batches, success requires an `OK` acknowledgement matching the batch's producer ID, epoch, and complete sequence range. Read timeouts, incomplete responses, and invalid acknowledgements discard the partition connection before retrying the unchanged batch. `Acks="0"` does not wait for broker acknowledgement and cannot establish delivery.
+`Producer.Flush() error` waits for queued batches and returns a drain timeout
+or the first permanent delivery failure. `Producer.Close() error` also reports
+that failure, including when shutdown times out. Check both return values:
+accepting a message into the local buffer is not proof of broker delivery.
+Permanent delivery errors remain visible for the lifetime of the producer.
+
+For acknowledged batches, success requires an `OK` acknowledgement matching
+the batch's producer ID, epoch, and complete sequence range. Read timeouts,
+partial writes, incomplete responses, and invalid acknowledgements discard the
+partition connection. They are retried only when the encoded request carries
+the end-to-end idempotence contract.
+
+An application can explicitly select weaker delivery with both
+`Acks="1"` and `EnableIdempotence=false`. In that mode the SDK retries only a
+failure proven to occur before broker acceptance, such as a connection failure
+before the write or an explicit `NOT_LEADER`/`outcome=not_accepted` response.
+After a partial write or missing acknowledgement it returns
+`*sdk.ProducerOutcomeUnknownError`, which matches
+`sdk.ErrProducerOutcomeUnknown` through `errors.Is`. Reconcile application
+state before publishing that record again. `Acks="0"` does not wait for broker
+acknowledgement and cannot establish delivery.
 
 Retain the original records until delivery is confirmed. For example, keep a
 caller-owned batch in durable storage, call `Send` for its records, and check both
@@ -98,6 +130,16 @@ missing acknowledgement, or interrupted shutdown can mean the broker accepted
 some records: reconcile delivery or use application-level deduplication before
 resubmitting, especially with a new producer identity. An error alone does not
 prove that resubmission is safe from duplicates.
+
+The producer lifecycle is observable through `Producer.State()` as `Open`,
+`Closing`, or `Closed`. A `Flush()` that races with or follows `Close()` waits
+for the same bounded drain and returns the same final delivery or cleanup
+error. It cannot report success while a message accepted before shutdown is
+still waiting for its configured acknowledgement.
+
+## Go Consumer Handler Contract
+
+`Consumer.Start` requires a non-nil message handler in polling and streaming modes. It returns `sdk.ErrConsumerHandlerRequired` and closes the consumer before coordinator discovery, group membership, or broker I/O when the handler is missing. A partition advances or automatically commits its next offset only after the handler successfully processes every preceding record in that batch. Disable `EnableAutoCommit` and call `CommitOffset` after the application's durable side effect when processing and offset acknowledgement must share an application-controlled boundary.
 
 ## Cluster Consumer Routing
 
@@ -141,11 +183,50 @@ cfg.HandshakeTimeoutMS = 5000
 
 The handshake runs for every newly opened or reconnected TCP connection. `HandshakeTimeoutMS` bounds it; zero uses 5000 ms and negative values fail configuration validation. A version or compression mismatch closes the connection before use. The SDK has no application-level feature negotiation or legacy protocol mode.
 
+`ConsumerConfig.RequestTimeoutMS` defaults to 10000 ms and bounds offset, metadata, group lifecycle, heartbeat, and commit exchanges after the handshake. `ListOffsetsContext` accepts an earlier caller deadline; cancellation closes a blocked socket so the connection cannot be reused after a partial frame. The non-Context `ListOffsets` method uses the configured default.
+
+`EventStore` applies a 10-second default to connection establishment, command writes, and every response frame, including the second frame of `ReadStream`. Use `NewEventStoreWithTimeout` to select another positive default and the `CreateTopicContext`, `AppendContext`, `ReadStreamContext`, `ReadStreamFromContext`, `SaveSnapshotContext`, `ReadSnapshotContext`, and `StreamVersionContext` methods for caller cancellation. A connection interrupted during I/O is closed. If an append was fully written but its response cannot be read, the SDK returns `*RequestOutcomeUnknownError`; reconcile the stream version before retrying.
+
+Observation methods send `BROWSE_MESSAGES` and `READ_STREAM_HISTORY` directly
+after that handshake. `AdminClient.Capabilities` uses the read-only `HELP`
+command and maps the exposed command families to Wire v2 feature names; its
+`Version` is 2. This describes command availability, not the caller's permissions.
+The retained `NegotiateProtocol` API performs the same capability query and
+local feature filtering. Its optional `Version` must be 2, and it never sends
+an application `NEGOTIATE` command or enables server-side connection features.
+
 Go, Java, and Python encode the same canonical conformance vectors for
 negotiation, requests, batches, stream controls, errors, and compression. The
 fixture protects byte-level compatibility; it does not replace each SDK's
 required live-broker producer, consumer, administration, transaction, and
 EventStore tests.
+
+## TLS verification
+
+Producer, consumer, and administration connections share one verified TLS
+configuration. Set `UseTLS` for server-authenticated TLS. `TLSCAPath` can point
+to a private PEM CA bundle; its certificates extend the platform trust store.
+Set `TLSServerName` when the certificate name differs from the host used to
+dial the broker, as is common with Kubernetes service names or load balancers.
+When it is empty, the dialed host is verified. Hostname verification cannot be
+disabled.
+
+`TLSCertPath` and `TLSKeyPath` are an optional client identity for mutual TLS.
+They must either both be empty or both be set:
+
+```go
+cfg := sdk.NewDefaultPublisherConfig()
+cfg.UseTLS = true
+cfg.TLSCAPath = "/var/run/secrets/cursus/ca.crt"
+cfg.TLSServerName = "broker.cursus.svc.cluster.local"
+
+// Add these only when the broker requires mutual TLS.
+cfg.TLSCertPath = "/var/run/secrets/cursus/tls.crt"
+cfg.TLSKeyPath = "/var/run/secrets/cursus/tls.key"
+```
+
+Certificate files are loaded when a client is created. Applications should
+replace and drain SDK clients after rotating mounted certificate files.
 
 Broker failures returned by application requests are available as `*sdk.BrokerError`:
 
@@ -277,8 +358,30 @@ last broker-committed offset, providing at-least-once processing.
 
 `AutoOffsetResetEarliest` and `AutoOffsetResetLatest` are sent as
 `autoOffsetReset=earliest|latest` in polling and streaming commands.
+When a broker-owned committed offset has fallen outside the retained readable
+range, the broker applies that policy before reading without overwriting the
+committed offset; a successful handler commit advances it normally.
 `AutoOffsetResetError` leaves reset selection disabled and surfaces an
-out-of-range condition.
+out-of-range condition as `*sdk.ConsumerOffsetOutOfRangeError`. The consumer
+enters the failed state, stops every assignment worker, completes cleanup, and
+returns the retained cause from `Start`. `Consumer.Err()` keeps the first fatal
+cause available after `Done()` closes.
+
+Record handler failures are retried on the same partition and record. The
+default is three retries after the first attempt, starting at 100 ms and capped
+at 1 second. Configure `HandlerMaxRetries`, `HandlerRetryBackoff`, and
+`HandlerRetryMaxBackoff` to change that budget. When it is exhausted, `Start`
+returns `*sdk.ConsumerHandlerError`; the failed batch is not committed and no
+rebalance is used as an implicit retry loop. A later consumer restart resumes
+from the last broker-committed offset, so handlers must remain safe for
+at-least-once delivery.
+
+`Consumer.Done()` closes only after assignment, commit, lifecycle, connection,
+and group cleanup has completed and `Consumer.State()` is
+`ConsumerStateClosed`. Code waiting for full shutdown can receive from `Done()`
+and then inspect `Consumer.Err()`. `Close()` waits for the coordinator's
+`LEAVE_GROUP` acknowledgement and returns the same cleanup error to every
+concurrent or repeated caller.
 
 After each metadata refresh the consumer records whether the authoritative
 `cleanup_policy` includes `compact`. Forward jumps on such a topic are valid

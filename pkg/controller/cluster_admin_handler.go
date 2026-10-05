@@ -19,34 +19,49 @@ type clusterBrokerStatus struct {
 }
 
 type clusterPartitionStatus struct {
-	Key             string   `json:"key"`
-	Topic           string   `json:"topic"`
-	Partition       int      `json:"partition"`
-	Leader          string   `json:"leader"`
-	LeaderEpoch     int      `json:"leader_epoch"`
-	Replicas        []string `json:"replicas"`
-	ISR             []string `json:"isr"`
-	CommittedHWM    uint64   `json:"committed_hwm"`
-	LeaderAvailable bool     `json:"leader_available"`
-	UnderReplicated bool     `json:"under_replicated"`
+	Key                string   `json:"key"`
+	Topic              string   `json:"topic"`
+	Partition          int      `json:"partition"`
+	Leader             string   `json:"leader"`
+	LeaderEpoch        int      `json:"leader_epoch"`
+	Replicas           []string `json:"replicas"`
+	ISR                []string `json:"isr"`
+	CommittedHWM       uint64   `json:"committed_hwm"`
+	ExpectedReplicas   int      `json:"expected_replicas"`
+	ActiveReplicas     int      `json:"active_replicas"`
+	InactiveReplicas   int      `json:"inactive_replicas"`
+	InSyncReplicas     int      `json:"in_sync_replicas"`
+	MinInSyncReplicas  int      `json:"min_in_sync_replicas"`
+	LeaderAvailable    bool     `json:"leader_available"`
+	AssignmentComplete bool     `json:"assignment_complete"`
+	UnderReplicated    bool     `json:"under_replicated"`
+	MinISRUnsatisfied  bool     `json:"min_isr_unsatisfied"`
+	Healthy            bool     `json:"healthy"`
+	Reasons            []string `json:"reasons,omitempty"`
 }
 
 type clusterStatus struct {
-	RaftLeader            string                   `json:"raft_leader"`
-	RaftState             string                   `json:"raft_state"`
-	RaftAppliedIndex      uint64                   `json:"raft_applied_index"`
-	RaftCommitIndex       uint64                   `json:"raft_commit_index"`
-	RaftLastLogIndex      uint64                   `json:"raft_last_log_index"`
-	RaftLastSnapshotIndex uint64                   `json:"raft_last_snapshot_index"`
-	RaftLastSnapshotTerm  uint64                   `json:"raft_last_snapshot_term"`
-	BrokerCount           int                      `json:"broker_count"`
-	ActiveBrokers         int                      `json:"active_brokers"`
-	InactiveBrokers       int                      `json:"inactive_brokers"`
-	PartitionCount        int                      `json:"partition_count"`
-	Leaderless            int                      `json:"leaderless_partitions"`
-	UnderReplicated       int                      `json:"under_replicated_partitions"`
-	Brokers               []clusterBrokerStatus    `json:"brokers"`
-	Partitions            []clusterPartitionStatus `json:"partitions"`
+	InternalCredentialGeneration string                   `json:"internal_credential_generation,omitempty"`
+	RaftLeader                   string                   `json:"raft_leader"`
+	RaftState                    string                   `json:"raft_state"`
+	RaftAppliedIndex             uint64                   `json:"raft_applied_index"`
+	RaftCommitIndex              uint64                   `json:"raft_commit_index"`
+	RaftLastLogIndex             uint64                   `json:"raft_last_log_index"`
+	RaftLastSnapshotIndex        uint64                   `json:"raft_last_snapshot_index"`
+	RaftLastSnapshotTerm         uint64                   `json:"raft_last_snapshot_term"`
+	BrokerCount                  int                      `json:"broker_count"`
+	ActiveBrokers                int                      `json:"active_brokers"`
+	InactiveBrokers              int                      `json:"inactive_brokers"`
+	PartitionCount               int                      `json:"partition_count"`
+	Leaderless                   int                      `json:"leaderless_partitions"`
+	UnderReplicated              int                      `json:"under_replicated_partitions"`
+	AssignmentDeficient          int                      `json:"assignment_deficient_partitions"`
+	InactiveReplicaPartitions    int                      `json:"inactive_replica_partitions"`
+	InactiveReplicas             int                      `json:"inactive_replicas"`
+	MinISRUnsatisfied            int                      `json:"min_isr_unsatisfied_partitions"`
+	Healthy                      bool                     `json:"healthy"`
+	Brokers                      []clusterBrokerStatus    `json:"brokers"`
+	Partitions                   []clusterPartitionStatus `json:"partitions"`
 }
 
 // handleListCluster processes the read-only LIST_CLUSTER command.
@@ -76,7 +91,14 @@ func (ch *CommandHandler) handleClusterStatus() string {
 		return "ERROR: fsm_not_available command=CLUSTER_STATUS"
 	}
 
-	status := buildClusterStatus(state, ch.Cluster.RaftManager.GetLeaderAddress())
+	defaultMinISR := 1
+	if ch.Config != nil {
+		defaultMinISR = ch.Config.MinInSyncReplicas
+	}
+	status := buildClusterStatus(state, ch.Cluster.RaftManager.GetLeaderAddress(), defaultMinISR)
+	if ch.Config != nil {
+		status.InternalCredentialGeneration = ch.Config.InternalAuthGeneration
+	}
 	if provider, ok := ch.Cluster.RaftManager.(interface {
 		GetRaftStatus() (replication.RaftStatus, error)
 	}); ok {
@@ -99,14 +121,12 @@ func (ch *CommandHandler) handleClusterStatus() string {
 	return "OK cluster=" + string(data)
 }
 
-func buildClusterStatus(state *fsm.BrokerFSM, raftLeader string) clusterStatus {
+func buildClusterStatus(state *fsm.BrokerFSM, raftLeader string, defaultMinISR int) clusterStatus {
 	status := clusterStatus{RaftLeader: raftLeader}
 	brokers := state.GetBrokers()
 	sort.Slice(brokers, func(i, j int) bool { return brokers[i].ID < brokers[j].ID })
-	active := make(map[string]bool, len(brokers))
 	for _, broker := range brokers {
 		isActive := strings.EqualFold(broker.Status, "active")
-		active[broker.ID] = isActive
 		if isActive {
 			status.ActiveBrokers++
 		} else {
@@ -118,49 +138,30 @@ func buildClusterStatus(state *fsm.BrokerFSM, raftLeader string) clusterStatus {
 	}
 	status.BrokerCount = len(status.Brokers)
 
-	keys := state.GetAllPartitionKeys()
-	sort.Strings(keys)
-	for _, key := range keys {
-		metadata := state.GetPartitionMetadata(key)
-		if metadata == nil {
-			continue
-		}
-		topicName, partition := splitPartitionMetadataKey(key)
-		leaderAvailable := metadata.Leader != "" && active[metadata.Leader]
-		underReplicated := len(metadata.ISR) < len(metadata.Replicas)
-		if !leaderAvailable {
-			status.Leaderless++
-		}
-		if underReplicated {
-			status.UnderReplicated++
-		}
+	topology := state.EvaluateTopology(defaultMinISR)
+	status.PartitionCount = topology.PartitionCount
+	status.Leaderless = topology.Offline
+	status.UnderReplicated = topology.UnderReplicated
+	status.AssignmentDeficient = topology.AssignmentDeficient
+	status.InactiveReplicaPartitions = topology.InactiveReplicaPartitions
+	status.InactiveReplicas = topology.InactiveReplicas
+	status.MinISRUnsatisfied = topology.MinISRUnsatisfied
+	status.Healthy = topology.Healthy
+	for _, partition := range topology.Partitions {
 		status.Partitions = append(status.Partitions, clusterPartitionStatus{
-			Key:             key,
-			Topic:           topicName,
-			Partition:       partition,
-			Leader:          metadata.Leader,
-			LeaderEpoch:     metadata.LeaderEpoch,
-			Replicas:        append([]string(nil), metadata.Replicas...),
-			ISR:             append([]string(nil), metadata.ISR...),
-			CommittedHWM:    metadata.CommittedHWM,
-			LeaderAvailable: leaderAvailable,
-			UnderReplicated: underReplicated,
+			Key: partition.Key, Topic: partition.Topic, Partition: partition.Partition,
+			Leader: partition.Leader, LeaderEpoch: partition.LeaderEpoch,
+			Replicas: append([]string(nil), partition.Replicas...), ISR: append([]string(nil), partition.ISR...),
+			CommittedHWM:     partition.CommittedHWM,
+			ExpectedReplicas: partition.ExpectedReplicas, ActiveReplicas: partition.ActiveReplicas,
+			InactiveReplicas: partition.InactiveReplicas,
+			InSyncReplicas:   partition.InSyncReplicas, MinInSyncReplicas: partition.MinInSyncReplicas,
+			LeaderAvailable: partition.LeaderAvailable, AssignmentComplete: partition.AssignmentComplete,
+			UnderReplicated: partition.UnderReplicated, MinISRUnsatisfied: partition.MinISRUnsatisfied,
+			Healthy: partition.Healthy, Reasons: append([]string(nil), partition.Reasons...),
 		})
 	}
-	status.PartitionCount = len(status.Partitions)
 	return status
-}
-
-func splitPartitionMetadataKey(key string) (string, int) {
-	idx := strings.LastIndexByte(key, '-')
-	if idx < 1 || idx+1 >= len(key) {
-		return key, -1
-	}
-	partition, err := strconv.Atoi(key[idx+1:])
-	if err != nil {
-		return key, -1
-	}
-	return key[:idx], partition
 }
 
 func (ch *CommandHandler) handleElectLeader(cmd string, ctx ...*ClientContext) string {

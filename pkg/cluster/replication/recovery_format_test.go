@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestEnsureRaftRecoveryFormatCreatesAndValidatesVersionNineMarker(t *testing.T) {
+func TestEnsureRaftRecoveryFormatCreatesAndValidatesCurrentMarker(t *testing.T) {
 	directory := t.TempDir()
 	require.NoError(t, ensureRaftRecoveryFormat(directory))
 	// #nosec G304 -- the marker path is fixed beneath t.TempDir.
@@ -19,6 +19,29 @@ func TestEnsureRaftRecoveryFormatCreatesAndValidatesVersionNineMarker(t *testing
 	require.NoError(t, err)
 	require.Equal(t, strconv.Itoa(fsm.SnapshotVersionCurrent)+"\n", string(data))
 	require.NoError(t, ensureRaftRecoveryFormat(directory))
+}
+
+func TestEnsureRaftRecoveryFormatAcceptsLegacyMarkerWithoutMutatingIt(t *testing.T) {
+	directory := t.TempDir()
+	markerPath := filepath.Join(directory, raftFormatMarkerName)
+	require.NoError(t, os.WriteFile(markerPath, []byte(strconv.Itoa(fsm.SnapshotVersionLegacyEpoch)+"\n"), 0o600))
+
+	require.NoError(t, ensureRaftRecoveryFormat(directory))
+	data, err := os.ReadFile(markerPath)
+	require.NoError(t, err)
+	require.Equal(t, strconv.Itoa(fsm.SnapshotVersionLegacyEpoch)+"\n", string(data))
+}
+
+func TestUpgradeRaftRecoveryFormatAtomicallyMigratesLegacyMarker(t *testing.T) {
+	directory := t.TempDir()
+	markerPath := filepath.Join(directory, raftFormatMarkerName)
+	require.NoError(t, os.WriteFile(markerPath, []byte(strconv.Itoa(fsm.SnapshotVersionLegacyEpoch)+"\n"), 0o600))
+
+	require.NoError(t, upgradeRaftRecoveryFormat(directory))
+	data, err := os.ReadFile(markerPath)
+	require.NoError(t, err)
+	require.Equal(t, strconv.Itoa(fsm.SnapshotVersionCurrent)+"\n", string(data))
+	require.NoError(t, upgradeRaftRecoveryFormat(directory))
 }
 
 func TestEnsureRaftRecoveryFormatRejectsUnmarkedPersistedState(t *testing.T) {

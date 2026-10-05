@@ -7,7 +7,35 @@ import (
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	replicationFSM "github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/protocol"
 )
+
+// CatchupReplicaSnapshots converges the application snapshot catalog after the
+// committed log reaches its authoritative tail and before ISR admission.
+func (ch *CommandHandler) CatchupReplicaSnapshots(ctx context.Context, request replicationFSM.ReplicaCatchupRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ch == nil || ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.ESHandler == nil {
+		return fmt.Errorf("snapshot catch-up dependencies are unavailable")
+	}
+	fsmRef := ch.Cluster.RaftManager.GetFSM()
+	if fsmRef == nil {
+		return fmt.Errorf("snapshot catch-up metadata is unavailable")
+	}
+	metadata := fsmRef.GetPartitionMetadata(fmt.Sprintf("%s-%d", request.Topic, request.Partition))
+	if metadata == nil || metadata.LifecycleEpoch != request.LifecycleEpoch || metadata.LeaderEpoch != request.LeaderEpoch {
+		return fmt.Errorf("snapshot catch-up fence changed")
+	}
+	if request.SourceAddress == "" {
+		return fmt.Errorf("snapshot catch-up source address is unavailable")
+	}
+	response := ch.handleCatchupSnapshots(fmt.Sprintf("CATCHUP_SNAPSHOTS topic=%s partition=%d leader=%s", request.Topic, request.Partition, request.SourceAddress))
+	if protocol.IsErrorResponse(response) {
+		return fmt.Errorf("%s", response)
+	}
+	return nil
+}
 
 // ApplyReplicaCatchup appends one leader-fenced committed logical range to a
 // local replica. Compacted ranges may contain physical offset holes. It advances
@@ -88,9 +116,12 @@ func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replica
 		if message.Offset >= endOffset || (!batch.Compacted && message.Offset != next) || (batch.Compacted && message.Offset < next) {
 			return fmt.Errorf("invalid replica catch-up offset: expected=%d got=%d hwm=%d", next, message.Offset, batch.CommittedHWM)
 		}
-		if errResp := ch.validateReplicatedTransactionMessage(batch.Topic, batch.Partition, message); errResp != "" {
-			return fmt.Errorf("replica catch-up transaction validation failed: %s", errResp)
-		}
+		// This authenticated ISR transfer copies an already committed log
+		// range, including unresolved/aborted records and old control markers.
+		// Rechecking live producer or transaction state would reject history
+		// after commit, reinitialization, expiry, or a coordinator change.
+		// Source, lifecycle, leader, digest, and committed HWM fences above
+		// authorize the copy; live replication retains admission validation.
 		next = message.Offset + 1
 	}
 	if batch.Compacted {

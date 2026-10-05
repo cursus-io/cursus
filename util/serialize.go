@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"sync"
 
 	"github.com/cursus-io/cursus/pkg/types"
@@ -148,15 +149,21 @@ var diskMsgBufPool = sync.Pool{
 }
 
 const (
-	diskMessageMagic       = "CDM3"
-	legacyDiskMessageMagic = "CDM2"
+	diskMessageMagic               = "CDM4"
+	replayIdentityDiskMessageMagic = "CDM3"
+	legacyDiskMessageMagic         = "CDM2"
+)
+
+var (
+	ErrDiskMessageChecksumMismatch = errors.New("disk message checksum mismatch")
+	diskMessageChecksumTable       = crc32.MakeTable(crc32.Castagnoli)
 )
 
 // EstimateDiskMessageSize returns the serialized size of a DiskMessage without allocating.
 func EstimateDiskMessageSize(msg types.DiskMessage) int {
 	return len(diskMessageMagic) + 2 + len(msg.Topic) + 4 + 8 + 2 + len(msg.ProducerID) + 8 + 8 +
 		4 + len(msg.Payload) + 2 + len(msg.Key) +
-		2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata) + 2 + len(msg.TransactionalID) + 2 + len(msg.TransactionState) + 2 + len(msg.TransactionMarker) + 2 + len(msg.ControlBatchType) + 2 + 8 + 2 + len(msg.ControlBatchKey) + 2 + len(msg.ControlBatchValue) + 2 + len(msg.EventID) + 2 + len(msg.PayloadDigest)
+		2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata) + 2 + len(msg.TransactionalID) + 2 + len(msg.TransactionState) + 2 + len(msg.TransactionMarker) + 2 + len(msg.ControlBatchType) + 2 + 8 + 2 + len(msg.ControlBatchKey) + 2 + len(msg.ControlBatchValue) + 2 + len(msg.EventID) + 2 + len(msg.PayloadDigest) + 4
 }
 
 // SerializeDiskMessage serializes a DiskMessage for disk storage
@@ -334,6 +341,10 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	buf = append(buf, tmp[:2]...)
 	buf = append(buf, msg.PayloadDigest...)
 
+	checksum := crc32.Checksum(buf, diskMessageChecksumTable)
+	binary.BigEndian.PutUint32(tmp[:4], checksum)
+	buf = append(buf, tmp[:4]...)
+
 	// Return a copy so the pooled buffer can be reused
 	result := make([]byte, len(buf))
 	copy(result, buf)
@@ -350,8 +361,20 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 		return msg, fmt.Errorf("unsupported disk message format: clean bootstrap required")
 	}
 	magic := string(data[:len(diskMessageMagic)])
-	if magic != diskMessageMagic && magic != legacyDiskMessageMagic {
+	if magic != diskMessageMagic && magic != replayIdentityDiskMessageMagic && magic != legacyDiskMessageMagic {
 		return msg, fmt.Errorf("unsupported disk message format: clean bootstrap required")
+	}
+	if magic == diskMessageMagic {
+		if len(data) < len(diskMessageMagic)+4 {
+			return msg, fmt.Errorf("%w: truncated checksum", ErrDiskMessageChecksumMismatch)
+		}
+		checksumOffset := len(data) - 4
+		expected := binary.BigEndian.Uint32(data[checksumOffset:])
+		actual := crc32.Checksum(data[:checksumOffset], diskMessageChecksumTable)
+		if actual != expected {
+			return msg, fmt.Errorf("%w: expected=%08x actual=%08x", ErrDiskMessageChecksumMismatch, expected, actual)
+		}
+		data = data[:checksumOffset]
 	}
 	offset := len(diskMessageMagic)
 
@@ -490,7 +513,7 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	if err := readDiskBytes(data, &offset, &msg.ControlBatchValue, "control batch value"); err != nil {
 		return msg, err
 	}
-	if magic == diskMessageMagic {
+	if magic == diskMessageMagic || magic == replayIdentityDiskMessageMagic {
 		if err := readDiskString(data, &offset, &msg.EventID, "event ID"); err != nil {
 			return msg, err
 		}

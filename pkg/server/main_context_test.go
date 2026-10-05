@@ -11,6 +11,9 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
+	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/topic"
 )
 
 func TestCloseListenerOnDone(t *testing.T) {
@@ -87,7 +90,7 @@ func TestRunServerContextReturnsCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := RunServerContext(ctx, cfg, nil, nil, nil, nil); !errors.Is(err, context.Canceled) {
+	if err := RunServerContext(ctx, cfg, topic.NewTopicManager(cfg, nil, nil), nil, nil, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context cancellation, got %v", err)
 	}
 }
@@ -102,9 +105,152 @@ func TestRunServerContextRejectsPartialObservationCredentials(t *testing.T) {
 	cfg.EnableExporter = false
 	cfg.EnabledDistribution = false
 
-	err := RunServerContext(context.Background(), cfg, nil, nil, nil, nil)
+	err := RunServerContext(context.Background(), cfg, topic.NewTopicManager(cfg, nil, nil), nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "principal and auth token") {
 		t.Fatalf("expected partial observation credential error, got %v", err)
+	}
+}
+
+func TestDistributedConsumerMetadataRecoveryWaitsForAuthoritativeHWMs(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+
+	diskManager := disk.NewDiskManager(cfg)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	c, err := coordinator.NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, topicManager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Stop)
+	t.Cleanup(func() {
+		topicManager.Stop()
+		diskManager.CloseAllHandlers()
+	})
+
+	if consumerMetadataHWMReady(topicManager) {
+		t.Fatal("consumer metadata recovery was ready before Raft established committed HWMs")
+	}
+	recoveryDone := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() {
+		recoveryDone <- awaitDistributedConsumerMetadataRecovery(ctx, c, topicManager)
+	}()
+
+	select {
+	case err := <-recoveryDone:
+		t.Fatalf("consumer metadata recovery returned before committed HWMs were authoritative: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	offsetsTopic := topicManager.GetTopic(config.ConsumerOffsetsTopicName)
+	if offsetsTopic == nil {
+		t.Fatal("consumer offsets topic was not initialized")
+	}
+	for _, partition := range offsetsTopic.Partitions {
+		partition.SetHWM(0)
+	}
+	if !consumerMetadataHWMReady(topicManager) {
+		t.Fatal("consumer metadata recovery remained blocked after all committed HWMs became authoritative")
+	}
+
+	select {
+	case err := <-recoveryDone:
+		if err != nil {
+			t.Fatalf("consumer metadata recovery failed after HWM establishment: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("consumer metadata recovery did not finish after HWM establishment: %v", ctx.Err())
+	}
+}
+
+func TestRegisterStaticConsumerGroupsPersistsMultiTopicSubscription(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = false
+	cfg.LogDir = t.TempDir()
+	cfg.StaticConsumerGroups = []config.ConsumerGroupConfig{{
+		Name:          "workers",
+		ConsumerCount: 2,
+		Topics:        []string{"payments", "orders"},
+		TopicPartitions: map[string]int{
+			"orders":   2,
+			"payments": 1,
+		},
+	}}
+
+	diskManager := disk.NewDiskManager(cfg)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	if err := topicManager.CreateTopic("orders", 2, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := topicManager.CreateTopic("payments", 1, false, false); err != nil {
+		t.Fatal(err)
+	}
+	c, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, topicManager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicManager.SetCoordinator(c)
+	handler := controller.NewCommandHandler(topicManager, cfg, c, nil, nil)
+	t.Cleanup(func() {
+		if err := handler.Close(); err != nil {
+			t.Errorf("close command handler: %v", err)
+		}
+		c.Stop()
+		topicManager.Stop()
+		diskManager.CloseAllHandlers()
+	})
+
+	if err := registerStaticConsumerGroups(cfg, topicManager, handler); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerStaticConsumerGroups(cfg, topicManager, handler); err != nil {
+		t.Fatalf("idempotent static consumer group registration failed: %v", err)
+	}
+	group := c.GetGroup("workers")
+	if group == nil {
+		t.Fatal("static consumer group was not durably registered")
+	}
+	if got := strings.Join(group.Topics, ","); got != "orders,payments" {
+		t.Fatalf("static consumer group topics = %q, want orders,payments", got)
+	}
+	if len(group.TopicPartitions) != 3 {
+		t.Fatalf("static consumer group assignments = %d, want 3", len(group.TopicPartitions))
+	}
+}
+
+func TestRegisterStaticConsumerGroupsRejectsPartitionDrift(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.StaticConsumerGroups = []config.ConsumerGroupConfig{{
+		Name: "workers", ConsumerCount: 1, Topics: []string{"orders"},
+		TopicPartitions: map[string]int{"orders": 1},
+	}}
+	diskManager := disk.NewDiskManager(cfg)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	if err := topicManager.CreateTopic("orders", 2, false, false); err != nil {
+		t.Fatal(err)
+	}
+	c, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, topicManager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicManager.SetCoordinator(c)
+	handler := controller.NewCommandHandler(topicManager, cfg, c, nil, nil)
+	t.Cleanup(func() {
+		_ = handler.Close()
+		c.Stop()
+		topicManager.Stop()
+		diskManager.CloseAllHandlers()
+	})
+
+	err = registerStaticConsumerGroups(cfg, topicManager, handler)
+	if err == nil || !strings.Contains(err.Error(), "partition count mismatch") {
+		t.Fatalf("expected static partition drift to fail startup, got %v", err)
+	}
+	if c.GetGroup("workers") != nil {
+		t.Fatal("partition drift registered a durable consumer group")
 	}
 }
 

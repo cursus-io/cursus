@@ -219,7 +219,7 @@ func TestNewConsumerClient_TLSError(t *testing.T) {
 	client, err := NewConsumerClient(cfg)
 	assert.Nil(t, client)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "load TLS cert")
+	assert.Contains(t, err.Error(), "load TLS client certificate")
 }
 
 func TestConsumerClient_Connect_TLSEnabledButNilConfig(t *testing.T) {
@@ -235,7 +235,7 @@ func TestConsumerClient_Connect_TLSEnabledButNilConfig(t *testing.T) {
 	conn, err := client.Connect("localhost:9999")
 	assert.Nil(t, conn)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "TLS enabled but certificate not loaded")
+	assert.Contains(t, err.Error(), "TLS enabled but configuration not loaded")
 }
 
 func TestConsumer_GetOrDialHeartbeatConn_ExistingConn(t *testing.T) {

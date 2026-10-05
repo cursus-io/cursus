@@ -629,10 +629,10 @@ func TestBrokerFSM_TopicCreation_ReplicaSubset(t *testing.T) {
 	}
 }
 
-func TestBrokerFSM_TopicCreation_DefaultRF_Capped(t *testing.T) {
+func TestBrokerFSM_TopicCreation_RejectsUnsatisfiedDefaultRF(t *testing.T) {
 	fsm := newTestFSM()
 
-	// Register only 2 brokers - default RF=3 should be capped to 2.
+	// Register only 2 brokers. The default RF=3 must not be silently weakened.
 	for i := 1; i <= 2; i++ {
 		data, _ := json.Marshal(BrokerInfo{
 			ID:     fmt.Sprintf("broker-%d", i),
@@ -644,17 +644,16 @@ func TestBrokerFSM_TopicCreation_DefaultRF_Capped(t *testing.T) {
 
 	topicCmd := testTopicCommand("capped-rf-topic", 4, 0)
 	data, _ := json.Marshal(topicCmd)
-	fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", data)), Index: 10})
+	result := fsm.Apply(&raft.Log{Data: []byte(fmt.Sprintf("TOPIC:%s", data)), Index: 10})
+	resultErr, ok := result.(error)
+	require.True(t, ok, "expected TOPIC apply error, got %T", result)
+	require.ErrorContains(t, resultErr, "replication factor 3 requires 3 active brokers; only 2 available")
+	_, found := fsm.GetTopicDefinition("capped-rf-topic")
+	require.False(t, found, "rejected topic definition must not be committed")
 
 	for i := 0; i < 4; i++ {
 		key := fmt.Sprintf("capped-rf-topic-%d", i)
-		meta := fsm.GetPartitionMetadata(key)
-		if meta == nil {
-			t.Fatalf("Partition %s metadata not found", key)
-		}
-		if len(meta.Replicas) != 2 {
-			t.Errorf("Partition %s: expected 2 replicas (capped from default 3), got %d: %v", key, len(meta.Replicas), meta.Replicas)
-		}
+		require.Nil(t, fsm.GetPartitionMetadata(key), "rejected topic must not create partition metadata")
 	}
 }
 

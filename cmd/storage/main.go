@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/cursus-io/cursus/pkg/eventsource"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
 )
@@ -43,16 +44,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		_, validationErr := topic.ValidateStandaloneBackup(*logDir)
 		journal, journalErr := transaction.InspectJournal(filepath.Join(*logDir, "__transaction_state.journal"))
-		ready := validationErr == nil && journalErr == nil
+		journalManifest, manifestErr := transaction.InspectJournalManifest(filepath.Join(*logDir, "__transaction_state.journal"), journal)
+		if manifestErr == nil && !journalManifest.Present && len(inventory.Topics) > 0 {
+			manifestErr = errors.New("transaction state manifest is missing; cannot distinguish unused state from an omitted journal")
+		}
+		snapshots, snapshotErr := eventsource.InspectSnapshotCatalog(*logDir)
+		ready := validationErr == nil && journalErr == nil && manifestErr == nil && snapshotErr == nil
 		result := struct {
-			Ready              bool                          `json:"ready"`
-			Inventory          topic.StorageInventory        `json:"inventory"`
-			TransactionJournal transaction.JournalInspection `json:"transaction_journal"`
-		}{Ready: ready, Inventory: inventory, TransactionJournal: journal}
+			Ready               bool                                  `json:"ready"`
+			Inventory           topic.StorageInventory                `json:"inventory"`
+			TransactionJournal  transaction.JournalInspection         `json:"transaction_journal"`
+			TransactionManifest transaction.JournalManifestInspection `json:"transaction_manifest"`
+			Snapshots           eventsource.SnapshotInspection        `json:"snapshots"`
+		}{Ready: ready, Inventory: inventory, TransactionJournal: journal, TransactionManifest: journalManifest, Snapshots: snapshots}
 		if err := writeJSONValue(stdout, result); err != nil {
 			return operationError(stderr, err)
 		}
-		if err := errors.Join(validationErr, journalErr); err != nil {
+		if err := errors.Join(validationErr, journalErr, manifestErr, snapshotErr); err != nil {
 			return operationError(stderr, err)
 		}
 		return 0

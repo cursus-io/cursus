@@ -386,7 +386,9 @@ func (r *ClusterRouter) sendDataRequestContext(ctx context.Context, addr string,
 		return "", err
 	}
 	defer func() { _ = conn.Close() }()
-	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	// This connection belongs to one request. Closing it cannot be undone
+	// by the handshake or request deadline being installed concurrently.
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopCancel()
 
 	deadline := time.Now().Add(r.timeout)

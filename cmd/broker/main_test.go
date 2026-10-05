@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -13,6 +14,26 @@ import (
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 )
+
+func TestRunBrokerRejectsOwnedDirectoryBeforeRecovery(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	lock, err := disk.LockStorageDirectory(cfg.LogDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := runBroker(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "lock broker storage") {
+		t.Fatalf("expected storage ownership rejection, got %v", err)
+	}
+	entries, err := os.ReadDir(cfg.LogDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != ".cursus.lock" {
+		t.Fatalf("rejected broker modified storage before acquiring ownership: %v", entries)
+	}
+}
 
 func TestRunBrokerUsesDiagnosticsWhenTopicManifestRestoreFails(t *testing.T) {
 	cfg := config.DefaultConfig()

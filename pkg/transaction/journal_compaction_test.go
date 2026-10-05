@@ -116,10 +116,14 @@ func TestJournalCompactsSupersededBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := strings.Repeat("x", journalCompactionBytes/2)
+	payloads := []string{
+		strings.Repeat("x", journalCompactionBytes/2),
+		strings.Repeat("y", journalCompactionBytes/2),
+		strings.Repeat("z", journalCompactionBytes/2),
+	}
 	for revision := uint64(1); revision <= 3; revision++ {
 		snap := testJournalSnapshot("large-repeated", revision, StateCommitted)
-		snap.Messages = []MessageOperation{{Message: types.Message{Payload: payload}}}
+		snap.Messages = []MessageOperation{{Message: types.Message{Payload: payloads[revision-1]}}}
 		if err := journal.Append(snap); err != nil {
 			t.Fatalf("append revision %d: %v", revision, err)
 		}
@@ -129,12 +133,12 @@ func TestJournalCompactsSupersededBytes(t *testing.T) {
 	}
 
 	snap := testJournalSnapshot("large-repeated", 4, StateCommitted)
-	snap.Messages = []MessageOperation{{Message: types.Message{Payload: payload}}}
+	snap.Messages = []MessageOperation{{Message: types.Message{Payload: strings.Repeat("w", journalCompactionBytes/2)}}}
 	if err := journal.Append(snap); err != nil {
 		t.Fatal(err)
 	}
-	if journal.records != 2 {
-		t.Fatalf("records after byte compaction = %d, want 2", journal.records)
+	if journal.records != 3 {
+		t.Fatalf("records after byte compaction = %d, want 3 (watermark plus two transaction records)", journal.records)
 	}
 	state, err := journal.Load()
 	if err != nil {
@@ -226,7 +230,7 @@ func TestInspectJournalIsReadOnlyAndRejectsTruncatedTail(t *testing.T) {
 
 	inspection, err := InspectJournal(path)
 	require.NoError(t, err)
-	require.Equal(t, JournalInspection{Present: true, RecordCount: 1, LatestTransactions: 1}, inspection)
+	require.Equal(t, JournalInspection{Present: true, RecordCount: 1, LatestTransactions: 1, NextProducerEpoch: 2}, inspection)
 	after, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, before, after)

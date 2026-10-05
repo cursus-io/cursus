@@ -25,3 +25,9 @@ for the advertised hostname used by peers. The configured
 `internal_tls_server_name` must match the certificate SAN. A discovery bind
 failure, TLS validation failure, Raft initialization error, or missing security
 configuration prevents readiness instead of falling back to plaintext.
+
+The Kubernetes production chart treats the public broker listener as a
+separate security boundary. It requires a client-listener TLS Secret and a
+SASL user Secret, enables both controls on port 9000, and rejects an insecure
+render unless the test-only `clientSecurity.allowInsecure=true` escape hatch is
+explicitly set. Internal mTLS credentials do not grant client API access.

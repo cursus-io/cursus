@@ -87,7 +87,7 @@ func TestBrokerFSMAllowsCompactedTopicWhenAllBrokersSupportProtocol(t *testing.T
 
 func TestBrokerFSMRejectsCompactedTopicDuringMixedVersionRollout(t *testing.T) {
 	f := newTestFSM()
-	for index, protocolVersion := range []int{BrokerProtocolVersionCurrent, BrokerProtocolVersionCurrent - 1} {
+	for index, protocolVersion := range []int{BrokerProtocolVersionCurrent, DistributedCompactionProtocolVersion - 1} {
 		payload, err := json.Marshal(BrokerInfo{
 			ID: fmt.Sprintf("broker-%d", index+1), Addr: "127.0.0.1:9000", Status: "active",
 			LifecycleProtocol: protocolVersion,
@@ -148,8 +148,9 @@ func TestBrokerFSMRestoreTruncatesTailBeyondExplicitCommittedHWMZero(t *testing.
 
 	definition := manager.GetTopic("current-orders").Definition()
 	state := BrokerFSMState{
-		Version:    SnapshotVersionCurrent,
-		TopicState: map[string]*topic.Definition{"current-orders": &definition},
+		Version:           SnapshotVersionCurrent,
+		NextProducerEpoch: testProducerEpochWatermark(),
+		TopicState:        map[string]*topic.Definition{"current-orders": &definition},
 		PartitionMetadata: map[string]*PartitionMetadata{
 			"current-orders-0": {
 				Leader: "broker-1", LeaderEpoch: 7, LifecycleEpoch: definition.LifecycleEpoch,
@@ -246,8 +247,9 @@ func currentSnapshotData(t *testing.T, manager *topic.TopicManager, name string,
 	t.Helper()
 	definition := manager.GetTopic(name).Definition()
 	state := BrokerFSMState{
-		Version:    SnapshotVersionCurrent,
-		TopicState: map[string]*topic.Definition{name: &definition},
+		Version:           SnapshotVersionCurrent,
+		NextProducerEpoch: testProducerEpochWatermark(),
+		TopicState:        map[string]*topic.Definition{name: &definition},
 		PartitionMetadata: map[string]*PartitionMetadata{
 			name + "-0": {
 				Leader: "broker-1", LeaderEpoch: 7, LifecycleEpoch: definition.LifecycleEpoch,
@@ -273,6 +275,7 @@ func newDurableFSMTopic(t *testing.T, name string) (*topic.TopicManager, *topic.
 	require.NoError(t, manager.CreateTopic(name, 1, false, false))
 	partition, err := manager.GetTopic(name).GetPartition(0)
 	require.NoError(t, err)
+	partition.SetHWM(0)
 	t.Cleanup(partition.Close)
 	return manager, partition
 }
@@ -281,6 +284,7 @@ func TestBrokerFSMPatchCommandsMergeAgainstSerializedAuthoritativeState(t *testi
 	f := newTestFSM()
 	registerActiveBroker(t, f, "broker-1")
 	defaults := topic.DefaultDefinition("orders", nil)
+	defaults.ReplicationFactor = 1
 	partitions := 1
 	retentionHours := 24
 	readACL := []string{"reader"}
@@ -298,7 +302,7 @@ func TestBrokerFSMPatchCommandsMergeAgainstSerializedAuthoritativeState(t *testi
 
 	definition := f.tm.GetTopic("orders").Definition()
 	require.Equal(t, uint64(3), definition.Revision)
-	require.Equal(t, topic.DefaultReplicationFactor, definition.ReplicationFactor)
+	require.Equal(t, 1, definition.ReplicationFactor)
 	require.Equal(t, 24, definition.Policy.RetentionHours)
 	require.Equal(t, int64(8192), definition.Policy.RetentionBytes)
 	require.Equal(t, []string{"reader"}, definition.Policy.ReadACL)
@@ -381,8 +385,9 @@ func TestBrokerFSMRestoreVersionNineRequiresDefinitionFields(t *testing.T) {
 				definition.LifecycleEpoch = 0
 			}
 			state := BrokerFSMState{
-				Version:    SnapshotVersionCurrent,
-				TopicState: map[string]*topic.Definition{"orders": definition},
+				Version:           SnapshotVersionCurrent,
+				NextProducerEpoch: testProducerEpochWatermark(),
+				TopicState:        map[string]*topic.Definition{"orders": definition},
 				PartitionMetadata: map[string]*PartitionMetadata{
 					"orders-0": authoritativePartitionMetadata(1),
 				},
@@ -398,7 +403,8 @@ func TestBrokerFSMRestoreVersionNineRequiresDefinitionFields(t *testing.T) {
 
 func TestBrokerFSMRestoreRejectsVersionNineWithoutTopicState(t *testing.T) {
 	state := BrokerFSMState{
-		Version: SnapshotVersionCurrent,
+		Version:           SnapshotVersionCurrent,
+		NextProducerEpoch: testProducerEpochWatermark(),
 		PartitionMetadata: map[string]*PartitionMetadata{
 			"orders-0": authoritativePartitionMetadata(1),
 		},
@@ -412,7 +418,8 @@ func TestBrokerFSMRestoreRejectsVersionNineWithoutTopicState(t *testing.T) {
 
 func TestBrokerFSMRestoreRejectsMissingPartitionMetadata(t *testing.T) {
 	state := BrokerFSMState{
-		Version: SnapshotVersionCurrent,
+		Version:           SnapshotVersionCurrent,
+		NextProducerEpoch: testProducerEpochWatermark(),
 		TopicState: map[string]*topic.Definition{
 			"orders": snapshotTopicDefinition("orders", 2),
 		},
@@ -429,7 +436,8 @@ func TestBrokerFSMRestoreRejectsMissingPartitionMetadata(t *testing.T) {
 
 func TestBrokerFSMRestoreRejectsPartitionWithoutTopicDefinition(t *testing.T) {
 	state := BrokerFSMState{
-		Version: SnapshotVersionCurrent,
+		Version:           SnapshotVersionCurrent,
+		NextProducerEpoch: testProducerEpochWatermark(),
 		TopicState: map[string]*topic.Definition{
 			"orders": snapshotTopicDefinition("orders", 1),
 		},

@@ -53,25 +53,39 @@ type AppendResult struct {
 
 // EventStore provides event sourcing operations against a Cursus broker.
 type EventStore struct {
-	topic      string
-	producerID string
-	addr       string
-	requestMu  sync.Mutex
-	mu         sync.Mutex
-	conn       net.Conn
+	topic          string
+	producerID     string
+	addr           string
+	requestMu      sync.Mutex
+	mu             sync.Mutex
+	conn           net.Conn
+	requestTimeout time.Duration
 }
 
 // NewEventStore creates an EventStore for the given topic.
 func NewEventStore(addr, topic, producerID string) *EventStore {
 	return &EventStore{
-		topic:      topic,
-		producerID: producerID,
-		addr:       addr,
+		topic:          topic,
+		producerID:     producerID,
+		addr:           addr,
+		requestTimeout: defaultSDKRequestTimeout,
 	}
 }
 
+// NewEventStoreWithTimeout creates an EventStore with a bounded default for
+// every dial, write, and response read. Use the Context methods for an earlier
+// caller deadline or cancellation.
+func NewEventStoreWithTimeout(addr, topic, producerID string, requestTimeout time.Duration) (*EventStore, error) {
+	if requestTimeout <= 0 {
+		return nil, fmt.Errorf("event store request timeout must be positive")
+	}
+	es := NewEventStore(addr, topic, producerID)
+	es.requestTimeout = requestTimeout
+	return es, nil
+}
+
 // getConn returns an existing or new TCP connection.
-func (es *EventStore) getConn() (net.Conn, error) {
+func (es *EventStore) getConn(ctx context.Context) (net.Conn, error) {
 	if err := validateSDKTopicName(es.topic); err != nil {
 		return nil, err
 	}
@@ -84,7 +98,7 @@ func (es *EventStore) getConn() (net.Conn, error) {
 	}
 	es.mu.Unlock()
 
-	conn, err := transport.Dial(context.Background(), es.addr, transport.DialConfig{
+	conn, err := transport.Dial(ctx, es.addr, transport.DialConfig{
 		DialTimeout: 5 * time.Second, HandshakeTimeout: 5 * time.Second, Compression: "none",
 	})
 	if err != nil {
@@ -114,15 +128,26 @@ func (es *EventStore) resetConn() {
 	}
 }
 
-// sendCommand sends a text command and returns the response string.
-func (es *EventStore) sendCommand(cmd string) (string, error) {
+func (es *EventStore) sendCommandContext(ctx context.Context, cmd string) (string, error) {
+	return es.sendCommandContextWithOutcome(ctx, cmd, "")
+}
+
+func (es *EventStore) sendCommandContextWithOutcome(ctx context.Context, cmd, unknownOperation string) (string, error) {
 	es.requestMu.Lock()
 	defer es.requestMu.Unlock()
+	requestCtx, cancel := boundedRequestContext(ctx, es.requestTimeout)
+	defer cancel()
 
-	conn, err := es.getConn()
+	conn, err := es.getConn(requestCtx)
 	if err != nil {
 		return "", err
 	}
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		es.resetConn()
+		return "", err
+	}
+	defer cleanup()
 
 	data := []byte(cmd)
 	if err := WriteWithLength(conn, data); err != nil {
@@ -133,7 +158,14 @@ func (es *EventStore) sendCommand(cmd string) (string, error) {
 	resp, err := ReadWithLength(conn)
 	if err != nil {
 		es.resetConn()
-		return "", fmt.Errorf("read: %w", err)
+		cause := err
+		if requestCtx.Err() != nil {
+			cause = requestCtx.Err()
+		}
+		if unknownOperation != "" {
+			return "", &RequestOutcomeUnknownError{Operation: unknownOperation, Cause: cause}
+		}
+		return "", fmt.Errorf("read: %w", cause)
 	}
 
 	return string(resp), nil
@@ -141,7 +173,11 @@ func (es *EventStore) sendCommand(cmd string) (string, error) {
 
 // CreateTopic creates an event-sourcing-enabled topic if it doesn't exist.
 func (es *EventStore) CreateTopic(partitions int) error {
-	resp, err := es.sendCommand(fmt.Sprintf("CREATE topic=%s partitions=%d event_sourcing=true cleanup_policy=delete", es.topic, partitions))
+	return es.CreateTopicContext(context.Background(), partitions)
+}
+
+func (es *EventStore) CreateTopicContext(ctx context.Context, partitions int) error {
+	resp, err := es.sendCommandContext(ctx, fmt.Sprintf("CREATE topic=%s partitions=%d event_sourcing=true cleanup_policy=delete", es.topic, partitions))
 	if err != nil {
 		return err
 	}
@@ -155,6 +191,10 @@ func (es *EventStore) CreateTopic(partitions int) error {
 // Append appends an event to an aggregate stream with optimistic concurrency.
 // expectedVersion is the current version of the aggregate (0 for new aggregates).
 func (es *EventStore) Append(key string, expectedVersion uint64, event *Event) (*AppendResult, error) {
+	return es.AppendContext(context.Background(), key, expectedVersion, event)
+}
+
+func (es *EventStore) AppendContext(ctx context.Context, key string, expectedVersion uint64, event *Event) (*AppendResult, error) {
 	sv := event.SchemaVersion
 	if sv == 0 {
 		sv = 1
@@ -168,7 +208,7 @@ func (es *EventStore) Append(key string, expectedVersion uint64, event *Event) (
 	}
 	cmd += fmt.Sprintf(" message=%s", event.Payload)
 
-	resp, err := es.sendCommand(cmd)
+	resp, err := es.sendCommandContextWithOutcome(ctx, cmd, "append event")
 	if err != nil {
 		return nil, err
 	}
@@ -228,94 +268,119 @@ func parseAppendResponse(resp string) (*AppendResult, error) {
 
 // ReadStream reads all events for an aggregate, automatically using snapshots.
 func (es *EventStore) ReadStream(key string) (*StreamData, error) {
-	return es.ReadStreamFrom(key, 0)
+	return es.ReadStreamContext(context.Background(), key)
+}
+
+func (es *EventStore) ReadStreamContext(ctx context.Context, key string) (*StreamData, error) {
+	return es.ReadStreamFromContext(ctx, key, 0)
 }
 
 // ReadStreamFrom reads events starting from a specific version.
 // If fromVersion is 0, the broker auto-resolves using snapshots.
 func (es *EventStore) ReadStreamFrom(key string, fromVersion uint64) (*StreamData, error) {
+	return es.ReadStreamFromContext(context.Background(), key, fromVersion)
+}
+
+func (es *EventStore) ReadStreamFromContext(ctx context.Context, key string, fromVersion uint64) (*StreamData, error) {
 	es.requestMu.Lock()
 	defer es.requestMu.Unlock()
+	requestCtx, cancel := boundedRequestContext(ctx, es.requestTimeout)
+	defer cancel()
 
-	cmd := fmt.Sprintf("READ_STREAM topic=%s key=%s", es.topic, key)
-	if fromVersion > 0 {
-		cmd += fmt.Sprintf(" from_version=%d", fromVersion)
-	}
-
-	conn, err := es.getConn()
+	conn, err := es.getConn(requestCtx)
 	if err != nil {
 		return nil, err
 	}
-
-	data := []byte(cmd)
-	if err := WriteWithLength(conn, data); err != nil {
-		es.resetConn()
-		return nil, fmt.Errorf("write: %w", err)
-	}
-
-	// Frame 1: JSON envelope
-	envData, err := ReadWithLength(conn)
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
 	if err != nil {
 		es.resetConn()
-		return nil, fmt.Errorf("read envelope: %w", err)
+		return nil, err
 	}
+	defer cleanup()
 
-	var envelope struct {
-		Status   string    `json:"status"`
-		Error    string    `json:"error"`
-		Snapshot *Snapshot `json:"snapshot"`
-		Count    int       `json:"count"`
-	}
-	if err := json.Unmarshal(envData, &envelope); err != nil {
-		return nil, fmt.Errorf("unmarshal envelope: %w", err)
-	}
-	if envelope.Status == "ERROR" {
-		if envelope.Error == "" {
-			envelope.Error = "read stream failed"
+	result := &StreamData{}
+	nextFrom := fromVersion
+	for page := 0; page < 1_000_000; page++ {
+		cmd := fmt.Sprintf("READ_STREAM topic=%s key=%s max_events=256 max_bytes=%d", es.topic, key, 8<<20)
+		if nextFrom > 0 {
+			cmd += fmt.Sprintf(" from_version=%d", nextFrom)
 		}
-		return nil, fmt.Errorf("broker: %s", envelope.Error)
-	}
-	if envelope.Status != "OK" {
-		return nil, fmt.Errorf("unexpected read stream status: %s", envelope.Status)
-	}
+		if err := WriteWithLength(conn, []byte(cmd)); err != nil {
+			es.resetConn()
+			return nil, fmt.Errorf("write stream page: %w", err)
+		}
 
-	// Frame 2: Binary batch
-	batchData, err := ReadWithLength(conn)
-	if err != nil {
-		es.resetConn()
-		return nil, fmt.Errorf("read batch: %w", err)
-	}
+		envData, err := ReadWithLength(conn)
+		if err != nil {
+			es.resetConn()
+			return nil, fmt.Errorf("read envelope: %w", err)
+		}
+		if strings.HasPrefix(string(envData), "ERROR:") {
+			return nil, fmt.Errorf("broker: %s", strings.TrimSpace(string(envData)))
+		}
+		var envelope struct {
+			Status      string    `json:"status"`
+			Error       string    `json:"error"`
+			Snapshot    *Snapshot `json:"snapshot"`
+			Count       int       `json:"count"`
+			HasMore     bool      `json:"has_more"`
+			NextVersion uint64    `json:"next_version"`
+		}
+		if err := json.Unmarshal(envData, &envelope); err != nil {
+			return nil, fmt.Errorf("unmarshal envelope: %w", err)
+		}
+		if envelope.Status == "ERROR" {
+			if envelope.Error == "" {
+				envelope.Error = "read stream failed"
+			}
+			return nil, fmt.Errorf("broker: %s", envelope.Error)
+		}
+		if envelope.Status != "OK" {
+			return nil, fmt.Errorf("unexpected read stream status: %s", envelope.Status)
+		}
 
-	result := &StreamData{
-		Snapshot: envelope.Snapshot,
-	}
-
-	if len(batchData) > 0 {
+		batchData, err := ReadWithLength(conn)
+		if err != nil {
+			es.resetConn()
+			return nil, fmt.Errorf("read batch: %w", err)
+		}
 		msgs, _, _, err := DecodeBatchMessages(batchData)
 		if err != nil {
 			return nil, fmt.Errorf("decode batch: %w", err)
 		}
+		if len(msgs) != envelope.Count {
+			return nil, fmt.Errorf("stream page count mismatch: envelope=%d batch=%d", envelope.Count, len(msgs))
+		}
+		if result.Snapshot == nil && envelope.Snapshot != nil {
+			result.Snapshot = envelope.Snapshot
+		}
 		for _, m := range msgs {
 			result.Events = append(result.Events, StreamEvent{
-				Version:       m.AggregateVersion,
-				Offset:        m.Offset,
-				Type:          m.EventType,
-				SchemaVersion: m.SchemaVersion,
-				Payload:       m.Payload,
-				Metadata:      m.Metadata,
+				Version: m.AggregateVersion, Offset: m.Offset, Type: m.EventType,
+				SchemaVersion: m.SchemaVersion, Payload: m.Payload, Metadata: m.Metadata,
 			})
 		}
+		if !envelope.HasMore {
+			return result, nil
+		}
+		if envelope.NextVersion == 0 || envelope.NextVersion <= nextFrom || len(msgs) == 0 || envelope.NextVersion != msgs[len(msgs)-1].AggregateVersion+1 {
+			return nil, fmt.Errorf("stream page cursor did not advance: current=%d next=%d count=%d", nextFrom, envelope.NextVersion, len(msgs))
+		}
+		nextFrom = envelope.NextVersion
 	}
-
-	return result, nil
+	return nil, fmt.Errorf("stream page limit exceeded")
 }
 
 // SaveSnapshot saves a snapshot for an aggregate at the given version.
 func (es *EventStore) SaveSnapshot(key string, version uint64, payload string) error {
+	return es.SaveSnapshotContext(context.Background(), key, version, payload)
+}
+
+func (es *EventStore) SaveSnapshotContext(ctx context.Context, key string, version uint64, payload string) error {
 	cmd := fmt.Sprintf("SAVE_SNAPSHOT topic=%s key=%s version=%d message=%s",
 		es.topic, key, version, payload)
 
-	resp, err := es.sendCommand(cmd)
+	resp, err := es.sendCommandContext(ctx, cmd)
 	if err != nil {
 		return err
 	}
@@ -328,7 +393,11 @@ func (es *EventStore) SaveSnapshot(key string, version uint64, payload string) e
 
 // ReadSnapshot reads the latest snapshot for an aggregate.
 func (es *EventStore) ReadSnapshot(key string) (*Snapshot, error) {
-	resp, err := es.sendCommand(fmt.Sprintf("READ_SNAPSHOT topic=%s key=%s", es.topic, key))
+	return es.ReadSnapshotContext(context.Background(), key)
+}
+
+func (es *EventStore) ReadSnapshotContext(ctx context.Context, key string) (*Snapshot, error) {
+	resp, err := es.sendCommandContext(ctx, fmt.Sprintf("READ_SNAPSHOT topic=%s key=%s", es.topic, key))
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +419,11 @@ func (es *EventStore) ReadSnapshot(key string) (*Snapshot, error) {
 
 // StreamVersion returns the current version of an aggregate stream.
 func (es *EventStore) StreamVersion(key string) (uint64, error) {
-	resp, err := es.sendCommand(fmt.Sprintf("STREAM_VERSION topic=%s key=%s", es.topic, key))
+	return es.StreamVersionContext(context.Background(), key)
+}
+
+func (es *EventStore) StreamVersionContext(ctx context.Context, key string) (uint64, error) {
+	resp, err := es.sendCommandContext(ctx, fmt.Sprintf("STREAM_VERSION topic=%s key=%s", es.topic, key))
 	if err != nil {
 		return 0, err
 	}

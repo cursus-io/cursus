@@ -14,6 +14,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/hashicorp/raft"
 )
 
@@ -32,7 +33,15 @@ func installConsumerOffsetsTopology(t *testing.T, state *fsm.BrokerFSM, index ui
 	}
 	definition := topic.DefaultDefinition(config.ConsumerOffsetsTopicName, config.DefaultConfig())
 	definition.Partitions = 4
-	definition.ReplicationFactor = 3
+	definition.ReplicationFactor = 0
+	for _, broker := range state.GetBrokers() {
+		if strings.EqualFold(broker.Status, "active") {
+			definition.ReplicationFactor++
+		}
+	}
+	if definition.ReplicationFactor == 0 {
+		t.Fatal("consumer offsets test topology requires an active broker")
+	}
 	definition.Policy = topic.ConsumerMetadataPolicy()
 	payload, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
 	if err != nil {
@@ -121,6 +130,61 @@ func TestSendDataRequestContextCancelsBlockedHandshake(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("blocked handshake did not stop after context cancellation")
+	}
+}
+
+func TestSendDataRequestContextCancelsBlockedResponse(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	received := make(chan struct{})
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		raw, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer raw.Close()
+		_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
+		conn, err := wire.ServerHandshake(raw, []wire.Compression{wire.CompressionNone})
+		if err != nil {
+			return
+		}
+		if _, err := conn.ReadFrame(); err != nil {
+			return
+		}
+		close(received)
+		_, _ = raw.Read(make([]byte, 1))
+	}()
+	router := &ClusterRouter{timeout: 5 * time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := router.sendDataRequestContext(ctx, listener.Addr().String(), []byte("LIST"))
+		result <- err
+	}()
+	select {
+	case <-received:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive request")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("cancelled request succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked response did not stop after cancellation")
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled connection was not closed")
 	}
 }
 

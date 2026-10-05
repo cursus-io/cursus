@@ -31,6 +31,12 @@ func (cfg *Config) Normalize() {
 	if cfg.DiskWriteTimeoutMS <= 0 {
 		cfg.DiskWriteTimeoutMS = 10
 	}
+	if cfg.DiskMinFreeBytes <= 0 {
+		cfg.DiskMinFreeBytes = 256 * 1024 * 1024
+	}
+	if cfg.DiskMinFreePercent <= 0 || cfg.DiskMinFreePercent >= 100 {
+		cfg.DiskMinFreePercent = 5
+	}
 	if cfg.DiskFlushIntervalMS <= 0 {
 		util.Warn("Invalid DiskFlushIntervalMS (%d), defaulting to 1000ms", cfg.DiskFlushIntervalMS)
 		cfg.DiskFlushIntervalMS = 1000
@@ -116,6 +122,15 @@ func (cfg *Config) Normalize() {
 	if cfg.MinInSyncReplicas <= 0 {
 		cfg.MinInSyncReplicas = 2
 	}
+	if cfg.MaxTopics <= 0 {
+		cfg.MaxTopics = 10000
+	}
+	if cfg.MaxPartitionsPerTopic <= 0 {
+		cfg.MaxPartitionsPerTopic = 1024
+	}
+	if cfg.MaxPartitions <= 0 {
+		cfg.MaxPartitions = 100000
+	}
 
 	if cfg.ProducerStateTTLMS <= 0 {
 		cfg.ProducerStateTTLMS = 30 * 60 * 1000
@@ -132,6 +147,18 @@ func (cfg *Config) Normalize() {
 	if cfg.TransactionRecoveryBatchSize <= 0 {
 		cfg.TransactionRecoveryBatchSize = 256
 	}
+	if cfg.MaxTransactions <= 0 {
+		cfg.MaxTransactions = 100000
+	}
+	if cfg.MaxTransactionRecords <= 0 {
+		cfg.MaxTransactionRecords = 10000
+	}
+	if cfg.MaxTransactionBytes <= 0 {
+		cfg.MaxTransactionBytes = 64 * 1024 * 1024
+	}
+	if cfg.MaxTransactionOffsets <= 0 {
+		cfg.MaxTransactionOffsets = 10000
+	}
 
 	// consumer
 	if cfg.ConsumerSessionTimeoutMS <= 0 {
@@ -145,6 +172,13 @@ func (cfg *Config) Normalize() {
 	}
 	if cfg.MaxClientConnections <= 0 {
 		cfg.MaxClientConnections = 1000
+	}
+	if cfg.MaxInflightRequests <= 0 {
+		cfg.MaxInflightRequests = 256
+	}
+	minimumInflightBytes := int64(2 * util.MaxMessageSize)
+	if cfg.MaxInflightRequestBytes < minimumInflightBytes {
+		cfg.MaxInflightRequestBytes = 256 * 1024 * 1024
 	}
 	if cfg.ClientIdleTimeoutMS <= 0 {
 		cfg.ClientIdleTimeoutMS = 60000

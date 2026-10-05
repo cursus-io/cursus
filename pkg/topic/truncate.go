@@ -202,6 +202,14 @@ func (tm *TopicManager) resetTopicStorageLocked(target Definition) error {
 	if err != nil {
 		return fmt.Errorf("create empty lifecycle storage %q: %w", target.Name, err)
 	}
+	for _, partition := range recreated.Partitions {
+		if err := partition.ReconcileCommittedHWM(0); err != nil {
+			for _, created := range recreated.Partitions {
+				created.Close()
+			}
+			return fmt.Errorf("establish empty lifecycle watermark %q[%d]: %w", target.Name, partition.ID(), err)
+		}
+	}
 	recreated.SetTransactionDecisionResolver(tm.txnResolver)
 	tm.topics[target.Name] = recreated
 	return nil

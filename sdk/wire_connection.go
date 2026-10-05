@@ -36,9 +36,18 @@ func dialAuthenticatedWireConnection(
 	if err != nil {
 		return nil, err
 	}
+	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancellation()
 	if err := authenticateConfiguredClient(conn, principal, authToken); err != nil {
 		_ = conn.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("authenticate with %s: %w", addr, err)
+	}
+	if !stopCancellation() || ctx.Err() != nil {
+		_ = conn.Close()
+		return nil, ctx.Err()
 	}
 	return conn, nil
 }

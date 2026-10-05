@@ -197,6 +197,9 @@ func (tm *TopicManager) CreateTopicWithPatch(defaults Definition, patch Definiti
 				return Definition{}, err
 			}
 		}
+		if err := ValidateTargetCapacity(tm.cfg, tm.definitionsLocked(nil, ""), target); err != nil {
+			return Definition{}, err
+		}
 		if err := existing.applyFullDefinition(target, tm.hp, tm.persistDefinitionLocked); err != nil {
 			return Definition{}, fmt.Errorf("update topic '%s': %w", defaults.Name, err)
 		}
@@ -221,6 +224,9 @@ func (tm *TopicManager) CreateTopicWithPatch(defaults Definition, patch Definiti
 		if err := validateCleanupPolicyForTopic(target.Policy, tm.cfg, target.EventSourcing); err != nil {
 			return Definition{}, err
 		}
+	}
+	if err := ValidateTargetCapacity(tm.cfg, tm.definitionsLocked(nil, ""), target); err != nil {
+		return Definition{}, err
 	}
 	if err := tm.rejectOrphanedStorageLocked(target.Name); err != nil {
 		return Definition{}, err
@@ -267,6 +273,9 @@ func (tm *TopicManager) ApplyDefinition(raw Definition) error {
 	}
 	if _, pending := tm.pendingTruncations[definition.Name]; pending {
 		return fmt.Errorf("topic %q lifecycle cleanup is pending", definition.Name)
+	}
+	if err := ValidateTargetCapacity(tm.cfg, tm.definitionsLocked(nil, ""), definition); err != nil {
+		return err
 	}
 	if existing := tm.topics[definition.Name]; existing != nil {
 		current := existing.Definition()
@@ -395,6 +404,25 @@ func (tm *TopicManager) ReadCommittedTopicPartition(topicName string, partitionI
 		return nil, err
 	}
 	return p.ReadCommitted(offset, max)
+}
+
+// ReadCommittedConsumerMetadata recovers durable control records even when an
+// unrelated open transaction precedes them. It remains bounded by replication
+// commitment and filters unresolved transactional records, but does not stop at
+// the last stable offset used for application consumers.
+func (tm *TopicManager) ReadCommittedConsumerMetadata(topicName string, partitionID int, offset uint64, max int) ([]types.Message, error) {
+	if topicName != config.ConsumerOffsetsTopicName {
+		return nil, fmt.Errorf("consumer metadata recovery reader cannot read topic %q", topicName)
+	}
+	t := tm.GetTopic(topicName)
+	if t == nil {
+		return nil, fmt.Errorf("topic %q does not exist", topicName)
+	}
+	p, err := t.GetPartition(partitionID)
+	if err != nil {
+		return nil, err
+	}
+	return p.readCommittedMetadata(offset, max)
 }
 
 // EarliestTopicOffset returns the earliest retained logical offset without

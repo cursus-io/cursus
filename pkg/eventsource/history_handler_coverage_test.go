@@ -95,3 +95,42 @@ func TestHandleReadStreamHistoryDetectsRangeGaps(t *testing.T) {
 	require.Equal(t, "ERROR", envelope["status"])
 	require.Contains(t, envelope["error"], "record_too_large")
 }
+
+func TestHandleReadStreamHistoryResumesByteLimitedPages(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+	for version := 1; version <= 3; version++ {
+		require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=byte-page version="+strconv.Itoa(version)+" message=event"), "OK ")
+	}
+	// Each record costs 78 bytes under the history byte-budget contract.
+	for version := 1; version <= 3; version++ {
+		envelope, batch := readStreamHistoryForTest(t, h, "READ_STREAM_HISTORY topic=orders key=byte-page from_version="+strconv.Itoa(version)+" to_version=3 max_records=100 max_bytes=78")
+		require.Equal(t, "complete", envelope["completeness"])
+		require.Equal(t, version < 3, envelope["has_more"])
+		require.Equal(t, float64(version+1), envelope["next_version"])
+		require.Len(t, batch.Messages, 1)
+		require.Equal(t, uint64(version), batch.Messages[0].AggregateVersion)
+	}
+}
+
+func TestHandleReadStreamHistoryDistinguishesMissingIndexTailFromByteLimit(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+	for version := 1; version <= 3; version++ {
+		require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=missing-tail version="+strconv.Itoa(version)+" message=event"), "OK ")
+	}
+	idx, err := h.getIndex("orders", 0)
+	require.NoError(t, err)
+	idx.mu.Lock()
+	idx.entries["missing-tail"] = idx.entries["missing-tail"][:2]
+	idx.mu.Unlock()
+	first, batch := readStreamHistoryForTest(t, h, "READ_STREAM_HISTORY topic=orders key=missing-tail from_version=1 max_records=100 max_bytes=82")
+	require.Len(t, batch.Messages, 1)
+	require.Equal(t, "complete", first["completeness"])
+	require.Equal(t, true, first["has_more"])
+	last, batch := readStreamHistoryForTest(t, h, "READ_STREAM_HISTORY topic=orders key=missing-tail from_version=2 max_records=100 max_bytes=82")
+	require.Len(t, batch.Messages, 1)
+	require.Equal(t, uint64(2), batch.Messages[0].AggregateVersion)
+	require.Equal(t, "partial", last["completeness"])
+	require.Equal(t, false, last["has_more"])
+}

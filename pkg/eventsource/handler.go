@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -267,25 +268,68 @@ func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *St
 		return fmt.Errorf("partition lookup for index recovery topic=%s partition=%d: %w", topicName, partitionID, err)
 	}
 
-	latest := p.GetHWM()
+	first := p.GetFirstOffset()
+	latest := p.LastStableOffset()
+	if first > latest {
+		return fmt.Errorf("stream retention floor %d exceeds stable tail %d", first, latest)
+	}
+	if first > 0 {
+		// The stream index is disposable. Once retention removes its prefix,
+		// application snapshots are the durable proof of each aggregate's
+		// preceding version.
+		ss, err := NewSnapshotStore(h.tm.GetLogDir(topicName, partitionID), partitionID)
+		if err != nil {
+			return fmt.Errorf("open snapshot checkpoint for stream index recovery: %w", err)
+		}
+		records, listErr := ss.List()
+		closeErr := ss.Close()
+		if err := errors.Join(listErr, closeErr); err != nil {
+			return fmt.Errorf("load snapshot checkpoint for stream index recovery: %w", err)
+		}
+		if len(records) == 0 {
+			return fmt.Errorf("cannot recover retained event stream at offset %d without a snapshot checkpoint", first)
+		}
+		for _, record := range records {
+			if err := idx.SeedVersion(record.Key, record.Version); err != nil {
+				return fmt.Errorf("seed stream index from snapshot: %w", err)
+			}
+		}
+	}
 	const batchSize = 256
-	for offset := uint64(0); offset < latest; {
+	for offset := first; offset < latest; {
 		msgs, err := p.ReadCommitted(offset, batchSize)
 		if err != nil {
-			if offset == 0 {
-				return nil
-			}
 			return fmt.Errorf("recover stream index from log offset=%d: %w", offset, err)
 		}
 		if len(msgs) == 0 {
-			break
+			return fmt.Errorf("recover stream index stopped before stable tail at offset=%d tail=%d", offset, latest)
 		}
-		if err := h.indexMessages(idx, msgs); err != nil {
+		bounded := msgs[:0]
+		for _, msg := range msgs {
+			if msg.Offset >= latest {
+				break
+			}
+			bounded = append(bounded, msg)
+		}
+		if len(bounded) == 0 {
+			return fmt.Errorf("recover stream index did not reach stable tail at offset=%d tail=%d", offset, latest)
+		}
+		if err := h.indexMessages(idx, bounded); err != nil {
 			return err
 		}
-		offset = msgs[len(msgs)-1].Offset + 1
+		next := bounded[len(bounded)-1].Offset + 1
+		if next <= offset {
+			return fmt.Errorf("recover stream index did not advance from offset=%d", offset)
+		}
+		offset = next
 	}
 	return nil
+}
+
+type SnapshotPage struct {
+	Snapshots []SnapshotResult `json:"snapshots"`
+	Revision  uint64           `json:"revision"`
+	Done      bool             `json:"done"`
 }
 
 func (h *Handler) indexMessages(idx *StreamIndex, messages []types.Message) error {
@@ -561,6 +605,25 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 		}
 		fromVersion = v
 	}
+	paginated := args["max_events"] != "" || args["max_bytes"] != ""
+	maxEvents := 256
+	if raw := args["max_events"]; raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > 4096 {
+			writeError(conn, "invalid_max_events")
+			return
+		}
+		maxEvents = value
+	}
+	maxBytes := 8 << 20
+	if raw := args["max_bytes"]; raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1024 || value > 32<<20 {
+			writeError(conn, "invalid_max_bytes")
+			return
+		}
+		maxBytes = value
+	}
 
 	t := h.tm.GetTopic(topicName)
 	if t == nil {
@@ -604,7 +667,14 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 		actualFromVersion = snap.Version + 1
 	}
 
-	entries, err := idx.Lookup(key, actualFromVersion)
+	currentVersion := idx.GetVersion(key)
+	var entries []StreamIndexEntry
+	if paginated {
+		entries, err = idx.LookupRange(key, actualFromVersion, currentVersion, maxEvents+1)
+	} else {
+		entries, err = idx.Lookup(key, actualFromVersion)
+		maxBytes = util.MaxMessageSize
+	}
 	if err != nil {
 		writeError(conn, fmt.Sprintf("index_lookup_failed reason=%q", err.Error()))
 		return
@@ -616,33 +686,70 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 		return
 	}
 
-	// Collect messages from the partition for each index entry.
-	var msgs []types.Message
+	moreByCount := paginated && len(entries) > maxEvents
+	if moreByCount {
+		entries = entries[:maxEvents]
+	}
+
+	// Collect one bounded page before sending its success envelope.
+	msgs := make([]types.Message, 0, len(entries))
+	usedBytes := 0
+	moreByBytes := false
 	for _, entry := range entries {
 		batch, err := p.ReadCommitted(entry.Offset, 1)
 		if err != nil {
 			writeError(conn, fmt.Sprintf("partition_read_failed offset=%d reason=%q", entry.Offset, err.Error()))
 			return
 		}
-		if len(batch) > 0 && batch[0].Key == key {
-			msgs = append(msgs, batch[0])
+		if len(batch) == 0 || batch[0].Key != key || batch[0].AggregateVersion != entry.AggregateVersion {
+			writeError(conn, fmt.Sprintf("stream_index_record_mismatch offset=%d", entry.Offset))
+			return
 		}
+		size := estimateEventMessageBytes(batch[0])
+		if usedBytes+size > maxBytes {
+			if !paginated {
+				writeError(conn, fmt.Sprintf("stream_requires_pagination bytes>%d", maxBytes))
+				return
+			}
+			if len(msgs) == 0 {
+				writeError(conn, fmt.Sprintf("event_exceeds_page_budget version=%d bytes=%d maximum=%d", entry.AggregateVersion, size, maxBytes))
+				return
+			}
+			moreByBytes = true
+			break
+		}
+		msgs = append(msgs, batch[0])
+		usedBytes += size
+	}
+	batchData, err := util.EncodeBatchMessages(topicName, partitionID, "1", false, msgs)
+	if err != nil {
+		writeError(conn, fmt.Sprintf("encode_stream_page_failed reason=%q", err.Error()))
+		return
+	}
+	hasMore := moreByCount || moreByBytes
+	nextVersion := uint64(0)
+	if hasMore && len(msgs) > 0 {
+		nextVersion = msgs[len(msgs)-1].AggregateVersion + 1
 	}
 
 	// Build JSON envelope.
 	envelope := struct {
-		Status    string        `json:"status"`
-		Topic     string        `json:"topic"`
-		Key       string        `json:"key"`
-		Partition int           `json:"partition"`
-		Count     int           `json:"count"`
-		Snapshot  *SnapshotData `json:"snapshot,omitempty"`
+		Status      string        `json:"status"`
+		Topic       string        `json:"topic"`
+		Key         string        `json:"key"`
+		Partition   int           `json:"partition"`
+		Count       int           `json:"count"`
+		Snapshot    *SnapshotData `json:"snapshot,omitempty"`
+		HasMore     bool          `json:"has_more"`
+		NextVersion uint64        `json:"next_version,omitempty"`
 	}{
-		Status:    "OK",
-		Topic:     topicName,
-		Key:       key,
-		Partition: partitionID,
-		Count:     len(msgs),
+		Status:      "OK",
+		Topic:       topicName,
+		Key:         key,
+		Partition:   partitionID,
+		Count:       len(msgs),
+		HasMore:     hasMore,
+		NextVersion: nextVersion,
 	}
 	if snap != nil && snap.Version >= fromVersion {
 		envelope.Snapshot = snap
@@ -653,20 +760,25 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 		writeError(conn, fmt.Sprintf("marshal envelope: %v", err))
 		return
 	}
+	if len(envJSON) > util.MaxMessageSize {
+		writeError(conn, fmt.Sprintf("stream_envelope_too_large bytes=%d maximum=%d", len(envJSON), util.MaxMessageSize))
+		return
+	}
 
-	// Frame 1: JSON envelope.
+	// Frame 1: JSON envelope. The batch has already been encoded and bounded.
 	if err := util.WriteWithLength(conn, envJSON); err != nil {
 		return
 	}
 
 	// Frame 2: binary batch.
-	batchData, err := util.EncodeBatchMessages(topicName, partitionID, "1", false, msgs)
-	if err != nil {
-		// Envelope already sent; best effort write of empty batch.
-		_ = util.WriteWithLength(conn, []byte{})
-		return
-	}
 	_ = util.WriteWithLength(conn, batchData)
+}
+
+func estimateEventMessageBytes(message types.Message) int {
+	return 256 + len(message.Topic) + len(message.ProducerID) + len(message.Payload) + len(message.Key) +
+		len(message.EventType) + len(message.Metadata) + len(message.EventID) + len(message.PayloadDigest) +
+		len(message.TransactionalID) + len(message.TransactionState) + len(message.TransactionMarker) +
+		len(message.ControlBatchType) + len(message.ControlBatchKey) + len(message.ControlBatchValue)
 }
 
 // HandleSaveSnapshot processes:
@@ -733,14 +845,23 @@ func (h *Handler) SaveSnapshot(cmd string, afterSave func(result SnapshotResult)
 		return nil, fmt.Sprintf("ERROR: snapshot_version_exceeds_stream version=%d current=%d", version, currentVersion)
 	}
 
-	result := SnapshotResult{Topic: topicName, Key: key, Version: version, Partition: partitionID, Payload: payload}
-	if errResp := h.SaveSnapshotReplica(result); errResp != "" {
-		return nil, errResp
+	ss, err := h.getSnapshot(topicName, partitionID)
+	if err != nil {
+		return nil, fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", partitionID, err.Error())
 	}
+	if err := ss.ValidateSave(key, version, payload); err != nil {
+		return nil, fmt.Sprintf("ERROR: snapshot_save_failed reason=%q", err.Error())
+	}
+	result := SnapshotResult{Topic: topicName, Key: key, Version: version, Partition: partitionID, Payload: payload}
 	if afterSave != nil {
 		if err := afterSave(result); err != nil {
 			return nil, fmt.Sprintf("ERROR: snapshot_replicate_failed reason=%q", err.Error())
 		}
+	}
+	// Publish locally only after the distributed callback has reached the
+	// required replica quorum.
+	if err := ss.Save(key, version, payload); err != nil {
+		return nil, fmt.Sprintf("ERROR: snapshot_save_failed reason=%q", err.Error())
 	}
 	return &result, ""
 }
@@ -768,29 +889,39 @@ func (h *Handler) SaveSnapshotReplica(result SnapshotResult) string {
 
 // ListSnapshots returns all latest snapshots for a topic partition.
 func (h *Handler) ListSnapshots(topicName string, partitionID int) ([]SnapshotResult, string) {
+	return h.ListSnapshotsPage(topicName, partitionID, "", 0)
+}
+
+// ListSnapshotsPage returns a key-ordered page for bounded replica catch-up.
+func (h *Handler) ListSnapshotsPage(topicName string, partitionID int, afterKey string, limit int) ([]SnapshotResult, string) {
+	page, errResp := h.ListSnapshotsPageAtRevision(topicName, partitionID, afterKey, limit, 0)
+	return page.Snapshots, errResp
+}
+
+func (h *Handler) ListSnapshotsPageAtRevision(topicName string, partitionID int, afterKey string, limit int, expectedRevision uint64) (SnapshotPage, string) {
 	t := h.tm.GetTopic(topicName)
 	if t == nil {
-		return nil, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+		return SnapshotPage{}, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
 	if !t.IsEventSourcing {
-		return nil, fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", topicName)
+		return SnapshotPage{}, fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", topicName)
 	}
 	if _, err := t.GetPartition(partitionID); err != nil {
-		return nil, fmt.Sprintf("ERROR: partition_lookup_failed partition=%d reason=%q", partitionID, err.Error())
+		return SnapshotPage{}, fmt.Sprintf("ERROR: partition_lookup_failed partition=%d reason=%q", partitionID, err.Error())
 	}
 	ss, err := h.getSnapshot(topicName, partitionID)
 	if err != nil {
-		return nil, fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", partitionID, err.Error())
+		return SnapshotPage{}, fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", partitionID, err.Error())
 	}
-	records, err := ss.List()
+	records, revision, done, err := ss.ListPageAtRevision(afterKey, limit, expectedRevision)
 	if err != nil {
-		return nil, fmt.Sprintf("ERROR: snapshot_list_failed reason=%q", err.Error())
+		return SnapshotPage{}, fmt.Sprintf("ERROR: snapshot_list_failed reason=%q", err.Error())
 	}
 	result := make([]SnapshotResult, 0, len(records))
 	for _, rec := range records {
 		result = append(result, SnapshotResult{Topic: topicName, Key: rec.Key, Version: rec.Version, Partition: partitionID, Payload: rec.Payload})
 	}
-	return result, ""
+	return SnapshotPage{Snapshots: result, Revision: revision, Done: done}, ""
 }
 
 // FetchSnapshot returns the latest snapshot for a topic partition and aggregate key.

@@ -72,20 +72,6 @@ func TestPipelinedPayloadWaitsForActiveHandler(t *testing.T) {
 	require.Equal(t, uint64(2), second.RequestID)
 }
 
-func TestPayloadBudgetReservationsAreBoundedAndReusable(t *testing.T) {
-	budget := payloadBudget{limit: 16}
-	release, err := budget.reserve(12)
-	require.NoError(t, err)
-	_, err = budget.reserve(5)
-	require.Error(t, err)
-	release()
-	release()
-	release, err = budget.reserve(16)
-	require.NoError(t, err)
-	release()
-	require.Zero(t, budget.used)
-}
-
 func TestRejectedStreamResumesRequestPump(t *testing.T) {
 	handler := newPublishTestHandler(t)
 	handler.StreamManager = stream.NewStreamManager(0, time.Second)
@@ -152,4 +138,82 @@ func TestStreamHandoffStopsReadsAndClearsDeadline(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, wire.KindStream, response.Kind)
 	require.Equal(t, wire.StatusOK, response.Status)
+}
+
+func TestPumpWireRequestsAcceptsCompleteFrameBeforeDisconnectCancellation(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+
+	type serverResult struct {
+		conn *wire.Connection
+		raw  net.Conn
+		err  error
+	}
+	serverReady := make(chan serverResult, 1)
+	go func() {
+		raw, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverReady <- serverResult{err: acceptErr}
+			return
+		}
+		connection, handshakeErr := wire.ServerHandshake(raw, []wire.Compression{wire.CompressionNone})
+		serverReady <- serverResult{conn: connection, raw: raw, err: handshakeErr}
+	}()
+
+	clientRaw, err := net.Dial("tcp", listener.Addr().String())
+	require.NoError(t, err)
+	client, err := wire.ClientHandshake(clientRaw, []wire.Compression{wire.CompressionNone})
+	require.NoError(t, err)
+	server := <-serverReady
+	require.NoError(t, server.err)
+	defer server.raw.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelled := make(chan struct{})
+	cancelConnection := func() {
+		select {
+		case <-cancelled:
+		default:
+			close(cancelled)
+		}
+		cancel()
+	}
+	activity := &requestActivity{conn: server.raw, last: time.Now()}
+	server.conn.SetReader(&requestReader{Conn: server.raw, ctx: ctx, activity: activity, idleTimeout: time.Second})
+	requests := make(chan admittedRequest)
+	budget := newRequestMemoryBudget(1, 1<<20)
+	go pumpWireRequests(ctx, cancelConnection, server.conn, activity, budget, requests)
+
+	command, parsed, err := wire.ParseCommandText("PUBLISH topic=orders partition=0 acks=0 producerId=p1 message=value")
+	require.NoError(t, err)
+	payload, err := wire.EncodeCommandPayload(parsed)
+	require.NoError(t, err)
+	require.NoError(t, client.WriteFrame(wire.Frame{
+		Kind: wire.KindRequest, Command: command, RequestID: 1, Payload: payload,
+	}))
+	require.NoError(t, clientRaw.Close())
+
+	select {
+	case <-cancelled:
+		t.Fatal("disconnect cancelled the connection before the complete frame was accepted")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	var request admittedRequest
+	select {
+	case request = <-requests:
+	case <-time.After(time.Second):
+		t.Fatal("complete request was not admitted")
+	}
+	require.Equal(t, wire.CommandPublish, request.frame.Command)
+	close(request.accepted)
+	request.finish()
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("disconnect was not observed after request acceptance")
+	}
 }

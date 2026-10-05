@@ -13,7 +13,10 @@ service:
 
 persistence:
   enabled: true
+  # Leave storageClass empty to use the cluster's default StorageClass.
   storageClass: ""
+  # Set classless to true only for a pre-provisioned, classless PersistentVolume.
+  classless: false
   config:
     path: /app/config.yaml
     size: 1Gi
@@ -44,9 +47,27 @@ broker:
   config:
     logLevel: {}
 
+limits:
+  maxTopics: 10000
+  maxPartitionsPerTopic: 1024
+  maxPartitions: 100000
+  maxTransactions: 100000
+  maxTransactionRecords: 10000
+  maxTransactionBytes: 67108864
+  maxTransactionOffsets: 10000
+  maxInflightRequests: 256
+  maxInflightRequestBytes: 268435456
+
+storage:
+  minFreeBytes: 268435456
+  minFreePercent: 5
+
 nodeSelector: {}
 affinity: {}
-resources: {}
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
 tolerations: []
 terminationGracePeriodSeconds: 60
 startupProbeFailureThreshold: 30
@@ -54,9 +75,24 @@ startupProbeFailureThreshold: 30
 
 monitoring:
   enabled: false
+  # Add labels required by the Prometheus Operator's ServiceMonitor and
+  # PrometheusRule selectors (for example, release: kube-prometheus-stack).
+  labels: {}
   serviceMonitor:
+    enabled: true
     interval: 30s
     scrapeTimeout: 10s
+  prometheusRule:
+    enabled: true
+    brokerNotReadyFor: 5m
+    storagePendingFor: 10m
+    transactionOldestSeconds: 300
+    consumerLag: 10000
+  grafanaDashboard:
+    enabled: true
+    # Grafana's dashboard sidecar selects ConfigMaps carrying this label by default.
+    labels:
+      grafana_dashboard: "1"
 
 performanceProfile: balanced  
   

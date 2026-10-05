@@ -215,6 +215,12 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 		_ = transport.Close()
 		return nil, err
 	}
+	if err := upgradeRaftRecoveryFormat(dataDir); err != nil {
+		_ = r.Shutdown().Error()
+		_ = raftStore.Close()
+		_ = transport.Close()
+		return nil, err
+	}
 
 	rm := &RaftReplicationManager{
 		raft:      r,

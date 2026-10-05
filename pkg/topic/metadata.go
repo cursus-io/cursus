@@ -384,6 +384,23 @@ func (tm *TopicManager) RestoreDefinitions(definitions []Definition) error {
 
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
+	candidate := tm.definitionsLocked(nil, "")
+	for _, definition := range normalized {
+		updated := false
+		for index := range candidate {
+			if candidate[index].Name == definition.Name {
+				candidate[index] = definition
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			candidate = append(candidate, definition)
+		}
+	}
+	if err := ValidateDefinitionCapacity(tm.cfg, candidate); err != nil {
+		return fmt.Errorf("restore topic registry: %w", err)
+	}
 
 	for _, definition := range normalized {
 		if existing := tm.topics[definition.Name]; existing != nil {

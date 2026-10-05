@@ -1,324 +1,586 @@
 package eventsource
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/cursus-io/cursus/util"
 )
 
-// snapshotPointer holds the in-memory index entry for a snapshot.
+var (
+	snapshotV2Header = []byte("CRSSNP2\n")
+	snapshotCRC      = crc32.MakeTable(crc32.Castagnoli)
+)
+
+const maxSnapshotPayloadBytes = 64 << 20
+
+// snapshotPointer holds the location and identity of one visible snapshot.
+// Legacy records remain readable, but every new record is written to the
+// checksummed v2 companion file.
 type snapshotPointer struct {
 	fileOffset uint64
 	version    uint64
+	legacy     bool
 }
 
-// SnapshotData represents a snapshot read back from the store.
 type SnapshotData struct {
 	Version uint64 `json:"version"`
 	Payload string `json:"payload"`
 }
 
-// SnapshotRecord represents the latest snapshot for one aggregate key.
 type SnapshotRecord struct {
 	Key     string
 	Version uint64
 	Payload string
 }
 
-// SnapshotStore is a per-partition append-only snapshot store.
-// Each entry on disk has the format:
-//
-//	[KeyLen:2][Key:K][Version:8][PayloadLen:4][Payload:P]
-//
-// The in-memory index keeps only the latest snapshot per key (last write wins).
-type SnapshotStore struct {
-	mu    sync.RWMutex
-	file  *os.File
-	index map[string]*snapshotPointer
-	// writeOffset tracks the current end-of-file position for appends.
-	writeOffset uint64
+// SnapshotInspection is the read-only backup inventory for application
+// snapshots. LegacyFiles marks catalogs that still depend on the pre-checksum
+// compatibility boundary.
+type SnapshotInspection struct {
+	Files       int `json:"files"`
+	LegacyFiles int `json:"legacy_files"`
+	Snapshots   int `json:"snapshots"`
 }
 
-// NewSnapshotStore opens (or creates) the snapshot file for the given partition
-// and rebuilds the in-memory index by scanning the file sequentially.
+type SnapshotStore struct {
+	mu          sync.RWMutex
+	file        *os.File
+	legacyFile  *os.File
+	index       map[string]*snapshotPointer
+	syncFileFn  func() error
+	writeOffset uint64
+	revision    uint64
+}
+
+var syncSnapshotCreationDirectory = syncSnapshotDirectory
+
+// InspectSnapshotCatalog validates every standalone snapshot file without
+// creating, truncating, or repairing broker state.
+func InspectSnapshotCatalog(logDir string) (SnapshotInspection, error) {
+	inspection := SnapshotInspection{}
+	patterns := []string{
+		filepath.Join(logDir, "*", "partition_*_snapshots.dat"),
+		filepath.Join(logDir, "*", "partition_*_snapshots_v2.dat"),
+	}
+	paths := make([]string, 0)
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return inspection, fmt.Errorf("snapshot inventory pattern: %w", err)
+		}
+		paths = append(paths, matches...)
+	}
+	sort.Strings(paths)
+	catalogs := make(map[string]*SnapshotStore)
+	for _, path := range paths {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return inspection, fmt.Errorf("stat snapshot file %q: %w", path, err)
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return inspection, fmt.Errorf("snapshot file %q is not a regular file", path)
+		}
+		legacy := !bytes.HasSuffix([]byte(filepath.Base(path)), []byte("_v2.dat"))
+		catalogKey := filepath.Join(filepath.Dir(path), strings.TrimSuffix(strings.TrimSuffix(filepath.Base(path), "_v2.dat"), ".dat"))
+		store := catalogs[catalogKey]
+		if store == nil {
+			store = &SnapshotStore{index: make(map[string]*snapshotPointer), revision: 1}
+			catalogs[catalogKey] = store
+		}
+		file, err := openExistingSnapshotFile(path, os.O_RDONLY)
+		if err != nil {
+			return inspection, fmt.Errorf("open snapshot file %q: %w", path, err)
+		}
+		if legacy {
+			store.legacyFile = file
+			inspection.LegacyFiles++
+			if err := store.scanFile(file, true, 0, false); err != nil {
+				_ = file.Close()
+				return inspection, fmt.Errorf("validate snapshot file %q: %w", path, err)
+			}
+		} else {
+			store.file = file
+			header := make([]byte, len(snapshotV2Header))
+			if _, err := file.ReadAt(header, 0); err != nil || !bytes.Equal(header, snapshotV2Header) {
+				_ = file.Close()
+				return inspection, fmt.Errorf("validate snapshot file %q: invalid checksummed format header", path)
+			}
+			if err := store.scanFile(file, false, uint64(len(snapshotV2Header)), false); err != nil {
+				_ = file.Close()
+				return inspection, fmt.Errorf("validate snapshot file %q: %w", path, err)
+			}
+		}
+		inspection.Files++
+	}
+	for _, store := range catalogs {
+		inspection.Snapshots += len(store.index)
+		if store.file != nil {
+			_ = store.file.Close()
+		}
+		if store.legacyFile != nil {
+			_ = store.legacyFile.Close()
+		}
+	}
+	return inspection, nil
+}
+
 func NewSnapshotStore(dir string, partitionID int) (*SnapshotStore, error) {
+	dirInfo, statErr := os.Lstat(dir)
+	dirCreated := os.IsNotExist(statErr)
+	if statErr != nil && !dirCreated {
+		return nil, fmt.Errorf("snapshot store: stat directory: %w", statErr)
+	}
+	if statErr == nil && (!dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0) {
+		return nil, fmt.Errorf("snapshot store: path is not a regular directory")
+	}
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("snapshot store: mkdir: %w", err)
 	}
 
-	path := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots.dat", partitionID))
-	// #nosec G304 -- the file name is fixed by the partition and dir is the configured storage root.
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	legacyPath := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots.dat", partitionID))
+	var legacyFile *os.File
+	if _, err := os.Lstat(legacyPath); err == nil {
+		legacyFile, err = openExistingSnapshotFile(legacyPath, os.O_RDONLY)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot store: open legacy file: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("snapshot store: stat legacy file: %w", err)
+	}
+
+	path := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots_v2.dat", partitionID))
+	// #nosec G304 -- the name is fixed by the partition under the configured storage root.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	fileCreated := err == nil
+	if errors.Is(err, os.ErrExist) {
+		f, err = openExistingSnapshotFile(path, os.O_RDWR)
+	}
 	if err != nil {
+		if legacyFile != nil {
+			_ = legacyFile.Close()
+		}
 		return nil, fmt.Errorf("snapshot store: open file: %w", err)
 	}
-
-	s := &SnapshotStore{
-		file:  f,
-		index: make(map[string]*snapshotPointer),
+	cleanup := func() {
+		_ = f.Close()
+		if legacyFile != nil {
+			_ = legacyFile.Close()
+		}
+	}
+	if fileCreated {
+		if err := writeSnapshotFull(f, snapshotV2Header); err != nil {
+			cleanup()
+			_ = os.Remove(path)
+			return nil, fmt.Errorf("snapshot store: write format header: %w", err)
+		}
+		if err := f.Sync(); err != nil {
+			cleanup()
+			_ = os.Remove(path)
+			return nil, fmt.Errorf("snapshot store: sync new file: %w", err)
+		}
+	}
+	if err := syncSnapshotCreationDirectory(dir); err != nil {
+		cleanup()
+		if fileCreated {
+			_ = os.Remove(path)
+		}
+		return nil, fmt.Errorf("snapshot store: persist file entry: %w", err)
+	}
+	if err := syncSnapshotCreationDirectory(filepath.Dir(dir)); err != nil {
+		cleanup()
+		if fileCreated {
+			_ = os.Remove(path)
+			if dirCreated {
+				_ = os.Remove(dir)
+			}
+		}
+		return nil, fmt.Errorf("snapshot store: persist directory entry: %w", err)
 	}
 
+	s := &SnapshotStore{file: f, legacyFile: legacyFile, index: make(map[string]*snapshotPointer), revision: 1}
 	if err := s.loadFromDisk(); err != nil {
-		_ = f.Close()
+		cleanup()
 		return nil, fmt.Errorf("snapshot store: load: %w", err)
 	}
-
 	return s, nil
 }
 
-// loadFromDisk scans the file sequentially and populates the in-memory index.
-// For duplicate keys the last entry wins.
-func (s *SnapshotStore) loadFromDisk() error {
-	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
-		return err
+func (s *SnapshotStore) syncFile() error {
+	if s.syncFileFn != nil {
+		return s.syncFileFn()
 	}
+	return s.file.Sync()
+}
 
-	fileInfo, err := s.file.Stat()
+func (s *SnapshotStore) loadFromDisk() error {
+	if s.legacyFile != nil {
+		if err := s.scanFile(s.legacyFile, true, 0, false); err != nil {
+			return fmt.Errorf("legacy snapshot file: %w", err)
+		}
+	}
+	info, err := s.file.Stat()
 	if err != nil {
 		return err
 	}
-	if fileInfo.Size() < 0 {
-		return fmt.Errorf("negative snapshot file size: %d", fileInfo.Size())
+	if info.Size() < int64(len(snapshotV2Header)) {
+		return fmt.Errorf("checksummed snapshot header is truncated")
 	}
-	// #nosec G115 -- the file size is explicitly non-negative above.
-	fileSize := uint64(fileInfo.Size())
-
-	var offset uint64
-	var lastGoodOffset uint64
-	for {
-		entryOffset := offset
-
-		// Read KeyLen (2 bytes).
-		var keyLen uint16
-		if err := binary.Read(s.file, binary.BigEndian, &keyLen); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
-			}
-			return err
-		}
-		offset += 2
-
-		// Read Key.
-		keyBuf := make([]byte, keyLen)
-		if _, err := io.ReadFull(s.file, keyBuf); err != nil {
-			if err == io.ErrUnexpectedEOF {
-				// Truncate to last good entry.
-				if truncErr := s.file.Truncate(int64(lastGoodOffset)); truncErr != nil {
-					return fmt.Errorf("snapshot store: truncate after partial key: %w", truncErr)
-				}
-				break
-			}
-			return err
-		}
-		offset += uint64(keyLen)
-
-		// Read Version (8 bytes).
-		var version uint64
-		if err := binary.Read(s.file, binary.BigEndian, &version); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				if truncErr := s.file.Truncate(int64(lastGoodOffset)); truncErr != nil {
-					return fmt.Errorf("snapshot store: truncate after partial version: %w", truncErr)
-				}
-				break
-			}
-			return err
-		}
-		offset += 8
-
-		// Read PayloadLen (4 bytes).
-		var payloadLen uint32
-		if err := binary.Read(s.file, binary.BigEndian, &payloadLen); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				if truncErr := s.file.Truncate(int64(lastGoodOffset)); truncErr != nil {
-					return fmt.Errorf("snapshot store: truncate after partial payload len: %w", truncErr)
-				}
-				break
-			}
-			return err
-		}
-		offset += 4
-
-		// Check that the declared payload fits in the file before seeking. Seeking
-		// beyond EOF succeeds, so it cannot be used to detect a partial payload.
-		if offset > fileSize || uint64(payloadLen) > fileSize-offset {
-			if truncErr := s.file.Truncate(int64(lastGoodOffset)); truncErr != nil {
-				return fmt.Errorf("snapshot store: truncate after partial payload: %w", truncErr)
-			}
-			break
-		}
-
-		// Skip the validated payload bytes.
-		if _, err := s.file.Seek(int64(payloadLen), io.SeekCurrent); err != nil {
-			return fmt.Errorf("snapshot store: seek payload: %w", err)
-		}
-		offset += uint64(payloadLen)
-
-		key := string(keyBuf)
-		s.index[key] = &snapshotPointer{
-			fileOffset: entryOffset,
-			version:    version,
-		}
-		lastGoodOffset = offset
+	header := make([]byte, len(snapshotV2Header))
+	if _, err := s.file.ReadAt(header, 0); err != nil {
+		return fmt.Errorf("read snapshot header: %w", err)
 	}
-
-	s.writeOffset = lastGoodOffset
+	if !bytes.Equal(header, snapshotV2Header) {
+		return fmt.Errorf("unsupported snapshot format header %q", header)
+	}
+	if err := s.scanFile(s.file, false, uint64(len(snapshotV2Header)), true); err != nil {
+		return err
+	}
+	info, err = s.file.Stat()
+	if err != nil {
+		return err
+	}
+	writeOffset, ok := util.SafeInt64ToUint64(info.Size())
+	if !ok {
+		return fmt.Errorf("negative snapshot file size")
+	}
+	s.writeOffset = writeOffset
 	return nil
 }
 
-// Save appends a new snapshot entry to the file and updates the in-memory index.
+func (s *SnapshotStore) scanFile(file *os.File, legacy bool, start uint64, repairTail bool) error {
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() < 0 {
+		return fmt.Errorf("negative snapshot file size")
+	}
+	end, ok := util.SafeInt64ToUint64(info.Size())
+	if !ok {
+		return fmt.Errorf("negative snapshot file size")
+	}
+	for offset := start; offset < end; {
+		entryOffset := offset
+		key, version, payload, next, err := readSnapshotRecord(file, offset, end, legacy)
+		if err != nil {
+			if repairTail && errors.Is(err, io.ErrUnexpectedEOF) {
+				truncateOffset, convErr := snapshotFileOffset(entryOffset)
+				if convErr != nil {
+					return convErr
+				}
+				if err := file.Truncate(truncateOffset); err != nil {
+					return fmt.Errorf("truncate incomplete record at %d: %w", entryOffset, err)
+				}
+				if err := file.Sync(); err != nil {
+					return fmt.Errorf("sync repaired snapshot file at %d: %w", entryOffset, err)
+				}
+				util.Warn("discarded incomplete snapshot record at offset %d", entryOffset)
+				return nil
+			}
+			return fmt.Errorf("record at %d: %w", offset, err)
+		}
+		if ptr, ok := s.index[key]; ok {
+			current, err := s.readAt(ptr)
+			if err != nil {
+				return err
+			}
+			switch {
+			case version < current.Version:
+				return fmt.Errorf("snapshot version regression for %q: current=%d incoming=%d", key, current.Version, version)
+			case version == current.Version && payload != current.Payload:
+				return fmt.Errorf("snapshot version collision for %q at version %d", key, version)
+			case version == current.Version:
+				offset = next
+				continue
+			}
+		}
+		s.index[key] = &snapshotPointer{fileOffset: entryOffset, version: version, legacy: legacy}
+		s.revision++
+		offset = next
+	}
+	return nil
+}
+
+func readSnapshotRecord(file *os.File, offset, fileSize uint64, legacy bool) (string, uint64, string, uint64, error) {
+	const fixed = uint64(2 + 8 + 4)
+	if offset > fileSize || fileSize-offset < fixed {
+		return "", 0, "", offset, io.ErrUnexpectedEOF
+	}
+	readOffset, err := snapshotFileOffset(offset)
+	if err != nil {
+		return "", 0, "", offset, err
+	}
+	var keyLenBuf [2]byte
+	if _, err := file.ReadAt(keyLenBuf[:], readOffset); err != nil {
+		return "", 0, "", offset, err
+	}
+	keyLen := uint64(binary.BigEndian.Uint16(keyLenBuf[:]))
+	headerEnd := offset + 2 + keyLen + 8 + 4
+	checksumBytes := uint64(0)
+	if !legacy {
+		checksumBytes = 4
+	}
+	if headerEnd > fileSize || fileSize-headerEnd < checksumBytes {
+		return "", 0, "", offset, io.ErrUnexpectedEOF
+	}
+	header := make([]byte, 2+keyLen+8+4)
+	if _, err := file.ReadAt(header, readOffset); err != nil {
+		return "", 0, "", offset, err
+	}
+	versionPos := 2 + keyLen
+	version := binary.BigEndian.Uint64(header[versionPos : versionPos+8])
+	payloadLen := uint64(binary.BigEndian.Uint32(header[versionPos+8 : versionPos+12]))
+	if payloadLen > maxSnapshotPayloadBytes {
+		return "", 0, "", offset, fmt.Errorf("snapshot payload length %d exceeds limit", payloadLen)
+	}
+	recordEnd := headerEnd + payloadLen + checksumBytes
+	if recordEnd > fileSize {
+		return "", 0, "", offset, io.ErrUnexpectedEOF
+	}
+	payload := make([]byte, payloadLen)
+	payloadOffset, err := snapshotFileOffset(headerEnd)
+	if err != nil {
+		return "", 0, "", offset, err
+	}
+	if _, err := file.ReadAt(payload, payloadOffset); err != nil {
+		return "", 0, "", offset, err
+	}
+	if !legacy {
+		var checksum [4]byte
+		checksumOffset, err := snapshotFileOffset(headerEnd + payloadLen)
+		if err != nil {
+			return "", 0, "", offset, err
+		}
+		if _, err := file.ReadAt(checksum[:], checksumOffset); err != nil {
+			return "", 0, "", offset, err
+		}
+		crc := crc32.New(snapshotCRC)
+		_, _ = crc.Write(header)
+		_, _ = crc.Write(payload)
+		if crc.Sum32() != binary.BigEndian.Uint32(checksum[:]) {
+			return "", 0, "", offset, fmt.Errorf("snapshot checksum mismatch")
+		}
+	}
+	return string(header[2 : 2+keyLen]), version, string(payload), recordEnd, nil
+}
+
 func (s *SnapshotStore) Save(key string, version uint64, payload string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	keyBytes := []byte(key)
+	if err := s.validateSaveLocked(key, version, payload); err != nil {
+		return err
+	}
+	if ptr, ok := s.index[key]; ok && ptr.version == version {
+		return nil
+	}
+	keyBytes, payloadBytes := []byte(key), []byte(payload)
 	keyLen, ok := util.SafeIntToUint16(len(keyBytes))
 	if !ok {
 		return fmt.Errorf("snapshot key length %d exceeds uint16 format limit", len(keyBytes))
 	}
-	payloadBytes := []byte(payload)
 	payloadLen, ok := util.SafeIntToUint32(len(payloadBytes))
-	if !ok {
-		return fmt.Errorf("snapshot payload length %d exceeds uint32 format limit", len(payloadBytes))
+	if !ok || len(payloadBytes) > maxSnapshotPayloadBytes {
+		return fmt.Errorf("snapshot payload length %d exceeds format limit", len(payloadBytes))
 	}
-
-	// Seek to the append position.
-	writePosition, ok := util.SafeUint64ToInt64(s.writeOffset)
-	if !ok {
-		return fmt.Errorf("snapshot write offset %d exceeds file offset limit", s.writeOffset)
-	}
-	if _, err := s.file.Seek(writePosition, io.SeekStart); err != nil {
-		return fmt.Errorf("snapshot store: seek: %w", err)
-	}
-
+	record := make([]byte, 2+len(keyBytes)+8+4+len(payloadBytes)+4)
+	binary.BigEndian.PutUint16(record[0:2], keyLen)
+	copy(record[2:], keyBytes)
+	versionPos := 2 + len(keyBytes)
+	binary.BigEndian.PutUint64(record[versionPos:versionPos+8], version)
+	binary.BigEndian.PutUint32(record[versionPos+8:versionPos+12], payloadLen)
+	copy(record[versionPos+12:], payloadBytes)
+	checksumPos := len(record) - 4
+	binary.BigEndian.PutUint32(record[checksumPos:], crc32.Checksum(record[:checksumPos], snapshotCRC))
 	entryOffset := s.writeOffset
-
-	// Write KeyLen.
-	if err := binary.Write(s.file, binary.BigEndian, keyLen); err != nil {
-		return fmt.Errorf("snapshot store: write key len: %w", err)
+	recordBytes := uint64(len(record))
+	if recordBytes > ^uint64(0)-entryOffset {
+		return fmt.Errorf("snapshot write offset overflow")
 	}
-
-	// Write Key.
-	if _, err := s.file.Write(keyBytes); err != nil {
-		return fmt.Errorf("snapshot store: write key: %w", err)
+	nextWriteOffset := entryOffset + recordBytes
+	writeOffset, err := snapshotFileOffset(entryOffset)
+	if err != nil {
+		return err
 	}
-
-	// Write Version.
-	if err := binary.Write(s.file, binary.BigEndian, version); err != nil {
-		return fmt.Errorf("snapshot store: write version: %w", err)
+	if _, err := snapshotFileOffset(nextWriteOffset); err != nil {
+		return fmt.Errorf("snapshot record exceeds file offset limit: %w", err)
 	}
-
-	// Write PayloadLen.
-	if err := binary.Write(s.file, binary.BigEndian, payloadLen); err != nil {
-		return fmt.Errorf("snapshot store: write payload len: %w", err)
+	if _, err := s.file.WriteAt(record, writeOffset); err != nil {
+		return fmt.Errorf("snapshot store: write: %w", err)
 	}
-
-	// Write Payload.
-	if _, err := s.file.Write(payloadBytes); err != nil {
-		return fmt.Errorf("snapshot store: write payload: %w", err)
+	if err := s.syncFile(); err != nil {
+		rollbackErr := s.file.Truncate(writeOffset)
+		return errors.Join(fmt.Errorf("snapshot store: sync: %w", err), rollbackErr)
 	}
-
-	// Sync to disk.
-	if err := s.file.Sync(); err != nil {
-		return fmt.Errorf("snapshot store: sync: %w", err)
-	}
-
-	// Update write offset and index.
-	s.writeOffset = entryOffset + 2 + uint64(keyLen) + 8 + 4 + uint64(payloadLen)
-	s.index[key] = &snapshotPointer{
-		fileOffset: entryOffset,
-		version:    version,
-	}
-
+	s.writeOffset = nextWriteOffset
+	s.index[key] = &snapshotPointer{fileOffset: entryOffset, version: version}
+	s.revision++
 	return nil
 }
 
-// Read returns the latest snapshot for the given key, or nil if not found.
-// List returns the latest snapshot for every aggregate key in this partition.
-func (s *SnapshotStore) List() ([]SnapshotRecord, error) {
+// ValidateSave applies the same monotonicity and collision checks as Save
+// without making the snapshot visible or touching disk.
+func (s *SnapshotStore) ValidateSave(key string, version uint64, payload string) error {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.validateSaveLocked(key, version, payload)
+}
+
+func (s *SnapshotStore) validateSaveLocked(key string, version uint64, payload string) error {
+	if ptr, ok := s.index[key]; ok {
+		current, err := s.readAt(ptr)
+		if err != nil {
+			return err
+		}
+		switch {
+		case version < current.Version:
+			return fmt.Errorf("snapshot version regression for %q: current=%d incoming=%d", key, current.Version, version)
+		case version == current.Version && payload != current.Payload:
+			return fmt.Errorf("snapshot version collision for %q at version %d", key, version)
+		}
+	}
+	return nil
+}
+
+func (s *SnapshotStore) List() ([]SnapshotRecord, error) {
+	return s.ListPage("", 0)
+}
+
+// ListPage returns a deterministic bounded page. afterKey is exclusive; a
+// non-positive limit returns the complete catalog for compatibility.
+func (s *SnapshotStore) ListPage(afterKey string, limit int) ([]SnapshotRecord, error) {
+	records, _, _, err := s.ListPageAtRevision(afterKey, limit, 0)
+	return records, err
+}
+
+// ListPageAtRevision keeps a multi-request catalog scan on one immutable
+// revision. expectedRevision zero starts a new scan.
+func (s *SnapshotStore) ListPageAtRevision(afterKey string, limit int, expectedRevision uint64) ([]SnapshotRecord, uint64, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if expectedRevision != 0 && expectedRevision != s.revision {
+		return nil, s.revision, false, fmt.Errorf("snapshot catalog changed: expected=%d current=%d", expectedRevision, s.revision)
+	}
 	keys := make([]string, 0, len(s.index))
 	for key := range s.index {
-		keys = append(keys, key)
+		if key > afterKey {
+			keys = append(keys, key)
+		}
 	}
-	s.mu.RUnlock()
-
 	sort.Strings(keys)
+	done := limit <= 0 || len(keys) <= limit
+	if limit > 0 && len(keys) > limit {
+		keys = keys[:limit]
+	}
 	records := make([]SnapshotRecord, 0, len(keys))
 	for _, key := range keys {
-		snap, err := s.Read(key)
+		ptr := s.index[key]
+		snap, err := s.readAt(ptr)
 		if err != nil {
-			return nil, err
+			return nil, s.revision, false, err
 		}
-		if snap == nil {
-			continue
+		if snap != nil {
+			records = append(records, SnapshotRecord{Key: key, Version: snap.Version, Payload: snap.Payload})
 		}
-		records = append(records, SnapshotRecord{Key: key, Version: snap.Version, Payload: snap.Payload})
 	}
-	return records, nil
+	return records, s.revision, done, nil
 }
 
 func (s *SnapshotStore) Read(key string) (*SnapshotData, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
 	ptr, ok := s.index[key]
 	if !ok {
 		return nil, nil
 	}
-
-	pos, ok := util.SafeUint64ToInt64(ptr.fileOffset)
-	if !ok {
-		return nil, fmt.Errorf("snapshot file offset %d exceeds file offset limit", ptr.fileOffset)
-	}
-
-	// Read KeyLen (2 bytes).
-	var keyLenBuf [2]byte
-	if _, err := s.file.ReadAt(keyLenBuf[:], pos); err != nil {
-		return nil, fmt.Errorf("snapshot store: read key len: %w", err)
-	}
-	keyLen := binary.BigEndian.Uint16(keyLenBuf[:])
-	pos += 2
-
-	// Skip Key.
-	pos += int64(keyLen)
-
-	// Read Version (8 bytes).
-	var versionBuf [8]byte
-	if _, err := s.file.ReadAt(versionBuf[:], pos); err != nil {
-		return nil, fmt.Errorf("snapshot store: read version: %w", err)
-	}
-	version := binary.BigEndian.Uint64(versionBuf[:])
-	pos += 8
-
-	// Read PayloadLen (4 bytes).
-	var payloadLenBuf [4]byte
-	if _, err := s.file.ReadAt(payloadLenBuf[:], pos); err != nil {
-		return nil, fmt.Errorf("snapshot store: read payload len: %w", err)
-	}
-	payloadLen := binary.BigEndian.Uint32(payloadLenBuf[:])
-	pos += 4
-
-	// Read Payload.
-	payloadBuf := make([]byte, payloadLen)
-	if _, err := s.file.ReadAt(payloadBuf, pos); err != nil {
-		return nil, fmt.Errorf("snapshot store: read payload: %w", err)
-	}
-
-	return &SnapshotData{
-		Version: version,
-		Payload: string(payloadBuf),
-	}, nil
+	return s.readAt(ptr)
 }
 
-// Close closes the underlying file.
+func (s *SnapshotStore) readAt(ptr *snapshotPointer) (*SnapshotData, error) {
+	file := s.file
+	if ptr.legacy {
+		file = s.legacyFile
+	}
+	if file == nil {
+		return nil, fmt.Errorf("snapshot backing file is unavailable")
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	fileSize, ok := util.SafeInt64ToUint64(info.Size())
+	if !ok {
+		return nil, fmt.Errorf("snapshot store: negative file size")
+	}
+	_, version, payload, _, err := readSnapshotRecord(file, ptr.fileOffset, fileSize, ptr.legacy)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot store: read record: %w", err)
+	}
+	return &SnapshotData{Version: version, Payload: payload}, nil
+}
+
+func snapshotFileOffset(offset uint64) (int64, error) {
+	converted, ok := util.SafeUint64ToInt64(offset)
+	if !ok {
+		return 0, fmt.Errorf("snapshot file offset %d exceeds int64", offset)
+	}
+	return converted, nil
+}
+
+func openExistingSnapshotFile(path string, flag int) (*os.File, error) {
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("snapshot path %q is not a regular file", path)
+	}
+	// #nosec G304 -- callers provide deterministic snapshot paths and the opened file identity is verified against Lstat.
+	file, err := os.OpenFile(path, flag, 0)
+	if err != nil {
+		return nil, err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if !after.Mode().IsRegular() || !os.SameFile(before, after) {
+		_ = file.Close()
+		return nil, fmt.Errorf("snapshot path %q changed while opening", path)
+	}
+	return file, nil
+}
+
 func (s *SnapshotStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.file.Close()
+	err := s.file.Close()
+	if s.legacyFile != nil {
+		err = errors.Join(err, s.legacyFile.Close())
+	}
+	return err
+}
+
+func writeSnapshotFull(writer io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := writer.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }

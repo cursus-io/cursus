@@ -181,7 +181,9 @@ These values participate in active broker behavior:
 | `min_insync_replicas` | 2 | Broker fallback minimum for `acks=all`/`-1` when a topic has no `min_in_sync_replicas` override. |
 | `default_replication_factor` | 3 | Default replica count for new distributed topics. |
 | `internal_broker_port` | 0 | Dedicated broker-to-broker command listener; configure in production clusters. |
-| `internal_auth_token` | empty | Shared internal command credential; always required when distribution is enabled. |
+| `internal_auth_token` | empty | Active outbound internal command credential; always required when distribution is enabled. |
+| `internal_auth_token_next` | empty | Additional inbound credential accepted during a staged rotation. Brokers never send it until it becomes the active token. |
+| `internal_auth_generation` | empty | Non-secret identifier exposed in configuration diagnostics and `CLUSTER_STATUS`. |
 | `internal_use_tls` | false | Enables broker-internal TLS and client-certificate verification. |
 | `allow_insecure_cluster_transport` | false | Explicit test-only opt-out from the distributed mTLS requirement. |
 | `raft_peers` | [] | Initial Raft peer addresses. |
@@ -189,6 +191,12 @@ These values participate in active broker behavior:
 | `transaction_timeout_ms` | 60000 | Maximum duration of an open broker transaction before durable timeout abort. |
 | `transaction_coordinator_shards` | 50 | Logical transaction-coordinator shard count. Immutable after cluster creation. |
 | `transaction_recovery_batch_size` | 256 | Maximum prepared or timed-out transactions handled per recovery batch. |
+| `max_transactions` | 100000 | Maximum retained transaction identities, including completed identities kept for fencing. |
+| `max_transaction_records` | 10000 | Maximum staged records or durable request assignments retained by one transaction. |
+| `max_transaction_bytes` | 67108864 | Maximum dynamic staged payload bytes retained by one transaction. |
+| `max_transaction_offsets` | 10000 | Maximum distinct consumer offsets staged by one transaction. |
+| `disk_min_free_bytes` | 268435456 | Minimum filesystem bytes reserved after each admitted storage batch. |
+| `disk_min_free_percent` | 5 | Minimum filesystem percentage reserved after each admitted storage batch. The stricter byte or percentage threshold wins. |
 | `producer_state_ttl_ms` | 1800000 | In-memory producer state cleanup window; durable records/checkpoints remain recovery sources. |
 | `raft_port` | 9001 | Raft transport listener. |
 | `discovery_port` | 8000 | Broker discovery and internal replication HTTP listener. |
@@ -201,8 +209,10 @@ These values participate in active broker behavior:
 | `advertised_broker_port` | 0 | Broker port advertised to peers when different from the listener. |
 | `advertised_client_host` | empty | Client-facing host returned by routing metadata. |
 | `max_client_connections` | 1000 | Concurrent client connection limit. |
+| `max_inflight_requests` | 256 | Global number of decoded requests that may be queued or processed across client and internal listeners. |
+| `max_inflight_request_bytes` | 268435456 | Global encoded-plus-decoded request payload budget. Values below 128 MiB are normalized because one maximally compressed protocol frame can require that much peak memory. |
 | `client_idle_timeout_ms` | 60000 | Idle client connection deadline. |
-| `client_request_timeout_ms` | 30000 | Maximum time spent processing one client request after the full request is received. An `acks=all` publish that times out after append returns `request_timeout outcome=unknown`; its accepted replication continues independently. |
+| `client_request_timeout_ms` | 30000 | Timeout applied to request processing and response writes. A response produced at the processing deadline gets one write attempt bounded by the same value. It is also the rolling per-frame write timeout for streams and, together with the idle timeout, bounds Wire v2 negotiation. An `acks=all` publish that times out after append returns `request_timeout outcome=unknown`; its accepted replication continues independently. |
 | `max_stream_connections` | 1000 | Concurrent streaming connection limit. |
 | `stream_timeout` | 30m | Maximum broker stream lifetime as a Go duration string. |
 | `consumer_session_timeout_ms` | 10000 | Group member session timeout. |
@@ -264,13 +274,17 @@ In docker-compose deployments, configuration is typically mounted as a volume an
 services:
   broker:
     volumes:
-      - ./config.yaml:/root/config.yaml
+      - ./config.yaml:/app/config.yaml:ro
+      - cursus-data:/data/logs
     environment:
-      - CONFIG_PATH=/root/config.yaml
+      - CONFIG_PATH=/app/config.yaml
+      - LOG_DIR=/data/logs
     ports:
       - "9000:9000"
       - "9100:9100"
       - "9080:9080"
+volumes:
+  cursus-data:
 ```
 
 ## Scenario 4: Deployment-Time Overrides
@@ -337,7 +351,15 @@ The Config struct uses both YAML and JSON tags to support both formats. Here's h
 | TransactionTimeoutMS       | `transaction_timeout_ms`       | `transaction.timeout.ms`       | --transaction-timeout-ms    |
 | TransactionCoordinatorShards | `transaction_coordinator_shards` | `transaction.coordinator.shards` | --transaction-coordinator-shards |
 | TransactionRecoveryBatchSize | `transaction_recovery_batch_size` | `transaction.recovery.batch.size` | --transaction-recovery-batch-size |
+| MaxTransactions           | `max_transactions`           | `max.transactions`           | --max-transactions           |
+| MaxTransactionRecords     | `max_transaction_records`    | `max.transaction.records`    | --max-transaction-records    |
+| MaxTransactionBytes       | `max_transaction_bytes`      | `max.transaction.bytes`      | --max-transaction-bytes      |
+| MaxTransactionOffsets     | `max_transaction_offsets`    | `max.transaction.offsets`    | --max-transaction-offsets    |
+| MaxInflightRequests       | `max_inflight_requests`      | `max.inflight.requests`      | --max-inflight-requests      |
+| MaxInflightRequestBytes   | `max_inflight_request_bytes` | `max.inflight.request.bytes` | --max-inflight-request-bytes |
 | DiskFlushBatchSize        | `disk_flush_batch_size`      | `disk.flush.batch.size`       | --disk-flush-batch       |
+| DiskMinFreeBytes          | `disk_min_free_bytes`        | `disk.min.free.bytes`         | --disk-min-free-bytes    |
+| DiskMinFreePercent        | `disk_min_free_percent`      | `disk.min.free.percent`       | --disk-min-free-percent  |
 | LingerMS                  | `linger_ms`                  | `linger.ms`                   | --linger-ms              |
 | ChannelBufferSize         | `channel_buffer_size`        | `channel.buffer.size`         | --channel-buffer         |
 | DiskWriteTimeoutMS        | `disk_write_timeout_ms`      | `disk.write.timeout.ms`       | --disk-write-timeout     |
@@ -386,15 +408,38 @@ bootstrap_servers: "broker1:9000,broker2:9000,broker3:9000"
 
 ## SDK Client Configuration
 
-### Consumer TLS
+### Producer delivery
 
-The Go SDK consumer now supports TLS connections, matching the producer's TLS capabilities. Add the following fields to `ConsumerConfig`:
+`NewDefaultPublisherConfig` chooses duplicate-safe acknowledged delivery:
 
-| Parameter      | Type   | Default | Description                          |
-|---------------|--------|---------|--------------------------------------|
-| `use_tls`      | bool   | false   | Enable TLS for consumer connections  |
-| `tls_cert_path`| string | ""      | Path to TLS certificate file         |
-| `tls_key_path` | string | ""      | Path to TLS private key file         |
+| Parameter | Default | Meaning |
+|---|---|---|
+| `acks` | `all` | Wait for the captured in-sync replica set and committed HWM |
+| `enable_idempotence` | `true` | Fence and deduplicate retries by producer epoch and partition sequence |
+| `max_retries` | `3` | Bound retries inside one send attempt |
+
+Keep `acks=all` and size the broker or topic `min_in_sync_replicas` for the
+required failure tolerance. To opt into leader-only delivery, set both
+`acks: "1"` and `enable_idempotence: false`; setting only `acks: "1"` fails
+validation. This explicit weak mode can lose a leader-only tail during failover.
+It also stops automatic retry after a partial write or lost acknowledgement and
+returns `ProducerOutcomeUnknownError`, because the broker may already have
+stored the record.
+
+### Client TLS
+
+`PublisherConfig`, `ConsumerConfig`, and `AdminConfig` use the same TLS settings and verification rules:
+
+| Parameter         | Type   | Default | Description |
+|------------------|--------|---------|-------------|
+| `use_tls`         | bool   | false   | Enable TLS for every broker connection |
+| `tls_ca_path`     | string | ""      | Optional PEM CA bundle added to the platform trust store |
+| `tls_server_name` | string | ""      | Optional certificate DNS name; when empty, the SDK verifies the dialed broker host |
+| `tls_cert_path`   | string | ""      | Optional PEM client certificate for mutual TLS |
+| `tls_key_path`    | string | ""      | Optional PEM private key; must be set together with `tls_cert_path` |
+
+Server-authenticated TLS only needs a CA bundle when the broker certificate is
+not already trusted by the host:
 
 ```yaml
 consumer:
@@ -402,11 +447,43 @@ consumer:
   topic: "orders"
   group_id: "my-group"
   use_tls: true
-  tls_cert_path: "certs/client.crt"
-  tls_key_path: "certs/client.key"
+  tls_ca_path: "/var/run/secrets/cursus/ca.crt"
+  tls_server_name: "broker.cursus.svc.cluster.local"
 ```
 
-When `use_tls` is enabled, every SDK client uses the shared transport dialer and performs a context-bounded TLS handshake with TLS 1.2 minimum before Wire v2 negotiation.
+For mutual TLS, also set both client identity paths:
+
+```yaml
+  tls_cert_path: "/var/run/secrets/cursus/tls.crt"
+  tls_key_path: "/var/run/secrets/cursus/tls.key"
+```
+
+When `use_tls` is enabled, every SDK client uses the shared transport dialer
+and performs a context-bounded TLS handshake with TLS 1.2 minimum before Wire
+v2 negotiation. Certificate and hostname verification are always enabled; the
+SDK does not expose an insecure verification bypass.
+
+Mount CA and client identity files from a read-only Kubernetes Secret rather
+than putting PEM data in a ConfigMap or image:
+
+```yaml
+volumes:
+  - name: cursus-client-tls
+    secret:
+      secretName: cursus-client-tls
+containers:
+  - name: application
+    volumeMounts:
+      - name: cursus-client-tls
+        mountPath: /var/run/secrets/cursus
+        readOnly: true
+```
+
+The SDK reads certificates when the client is constructed. After Kubernetes
+updates a mounted Secret, create replacement SDK clients and drain the old
+ones. Rotate a private CA in three stages: first distribute a bundle containing
+both old and new CA certificates, then rotate broker and client identities, and
+finally remove the old CA after all processes have reloaded the new bundle.
 
 ### SDK Metrics (Prometheus)
 
@@ -417,6 +494,15 @@ Both `PublisherConfig` and `ConsumerConfig` support an `enable_metrics` field to
 | `enable_metrics`| bool | false   | Enable Prometheus runtime metric collection |
 | `auto_offset_reset` | string | `earliest` | Missing/out-of-range offset policy: `earliest`, `latest`, or `error` |
 | `read_isolation` | string | `read_committed` | Consumer visibility: `read_committed` or `read_uncommitted` |
+| `handler_max_retries` | int | `3` | Additional attempts for the same record after a handler error |
+| `handler_retry_backoff` | duration | `100ms` | Initial delay between handler attempts |
+| `handler_retry_max_backoff` | duration | `1s` | Maximum delay between handler attempts |
+
+Exhausting the handler retry budget stops the consumer and returns a typed
+`ConsumerHandlerError` from `Start`; it does not commit the failed batch or
+trigger a group rebalance. `auto_offset_reset: error` similarly stops the
+consumer with `ConsumerOffsetOutOfRangeError`. After `Done()` closes,
+`Consumer.Err()` returns the first fatal runtime cause.
 
 When enabled, the SDK registers the following metrics in a dedicated Prometheus registry:
 
@@ -452,7 +538,27 @@ log.Fatal(http.ListenAndServe(":2112", nil))
 
 ## Configuration Validation
 
-`Config.Normalize()` applies safe fallbacks for invalid or non-positive values, including write batching, sync intervals, segment/index sizes, retention intervals, channel capacities, replica settings, and transaction/producer retention. TLS certificate loading still fails startup when configured files are invalid.
+`Config.Normalize()` applies safe fallbacks for invalid or non-positive values, including write batching, sync intervals, segment/index sizes, retention intervals, channel capacities, replica settings, transaction/producer retention, and topic registry limits. TLS certificate loading still fails startup when configured files are invalid.
+
+Topic materialization is bounded by `max_topics` (default `10000`),
+`max_partitions_per_topic` (default `1024`), and `max_partitions` (default
+`100000`). The matching environment variables are `MAX_TOPICS`,
+`MAX_PARTITIONS_PER_TOPIC`, and `MAX_PARTITIONS`. CREATE validates distributed
+authoritative metadata before committing a Raft entry, and every broker checks
+the same limits while materializing or restoring definitions. Lowering a limit
+below persisted state therefore makes readiness fail instead of loading an
+unbounded registry; raise the limit or deliberately remove topics before the
+change.
+
+Transaction memory and journal growth are bounded by `max_transactions`,
+`max_transaction_records`, `max_transaction_bytes`, and
+`max_transaction_offsets`. The corresponding environment variables are the
+upper-case YAML names. Limits are checked before mutation and again when
+installing journal or Raft snapshot state. Lowering a limit below durable state
+causes startup or readiness to fail with the offending bound rather than
+silently dropping transaction state. Completed identities continue to count
+until `transactional_id_expiration_ms` pruning removes them because their
+producer epochs are part of the fencing contract.
 
 Cleanup policy values normalize to `delete`, `compact`, or canonical `delete,compact`; unknown values fall back to `delete` with a warning. Distributed application topics accept compact policies only after every active broker advertises lifecycle protocol version 2, and cleaner passes wait for full ISR plus authoritative, matching HWM/lifecycle/policy state. Event-sourcing topics always require `delete`. Operators should treat normalization and policy errors as configuration/provisioning failures and verify the effective topic policy with `METADATA`.
 

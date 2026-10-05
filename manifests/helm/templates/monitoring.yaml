@@ -17,10 +17,16 @@ spec:
   selector:
     {{- include "cursus.selectorLabels" . | nindent 4 }}
 ---
+{{- if .Values.monitoring.serviceMonitor.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: {{ include "cursus.fullname" . }}
+  labels:
+    {{- include "cursus.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   selector:
     matchLabels:
@@ -31,4 +37,92 @@ spec:
     - port: metrics
       interval: {{ .Values.monitoring.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.monitoring.serviceMonitor.scrapeTimeout }}
+{{- end }}
+{{- if .Values.monitoring.prometheusRule.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "cursus.fullname" . }}
+  labels:
+    {{- include "cursus.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: cursus.availability
+      rules:
+        - alert: CursusBrokerNotReady
+          expr: cursus_broker_ready{namespace={{ .Release.Namespace | quote }}} == 0
+          for: {{ .Values.monitoring.prometheusRule.brokerNotReadyFor }}
+          labels:
+            severity: critical
+          annotations:
+            summary: Cursus broker is not ready
+            description: A Cursus broker has failed readiness for longer than the configured grace period.
+        - alert: CursusStorageWritesStalled
+          expr: min_over_time(cursus_storage_pending_writes{namespace={{ .Release.Namespace | quote }}}[{{ .Values.monitoring.prometheusRule.storagePendingFor }}]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: Cursus storage writes are stalled
+            description: Pending storage writes have remained non-zero for the full observation window.
+        - alert: CursusStorageDiskHeadroomLow
+          expr: cursus_storage_filesystem_headroom_ready{namespace={{ .Release.Namespace | quote }}} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: Cursus storage filesystem headroom is exhausted
+            description: The broker is rejecting writes because the log filesystem is below its configured free-space reserve.
+        - alert: CursusResponseWriteFailures
+          expr: increase(cursus_broker_client_response_write_failures_total{namespace={{ .Release.Namespace | quote }}}[5m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: Cursus failed to write client responses
+            description: The broker could not deliver one or more client responses during the last five minutes.
+        - alert: CursusRequestAdmissionSaturated
+          expr: cursus_broker_request_admission_waiters{namespace={{ .Release.Namespace | quote }}} > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Cursus request admission is saturated
+            description: Client connections have waited for global request count or memory capacity for five minutes.
+    - name: cursus.data-safety
+      rules:
+        - alert: CursusConsumerOffsetOutOfRange
+          expr: cursus_consumer_group_offset_out_of_range{namespace={{ .Release.Namespace | quote }}} == 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Cursus consumer offset is outside retained data
+            description: A committed consumer offset is below the log start or above the high watermark.
+        - alert: CursusConsumerLagHigh
+          expr: max_over_time(cursus_consumer_group_lag{namespace={{ .Release.Namespace | quote }}}[10m]) > {{ .Values.monitoring.prometheusRule.consumerLag }}
+          labels:
+            severity: warning
+          annotations:
+            summary: Cursus consumer lag is sustained
+            description: Consumer lag has exceeded the configured threshold during the last ten minutes.
+        - alert: CursusTransactionRecoveryNotReady
+          expr: cursus_transaction_recovery_ready{namespace={{ .Release.Namespace | quote }}} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Cursus transaction recovery is incomplete
+            description: Transaction state has not recovered and the broker cannot safely process transactional work.
+        - alert: CursusTransactionOpenTooLong
+          expr: cursus_transaction_oldest_active_seconds{namespace={{ .Release.Namespace | quote }}} > {{ .Values.monitoring.prometheusRule.transactionOldestSeconds }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Cursus transaction has remained open too long
+            description: The oldest active transaction exceeds the configured operating threshold.
+{{- end }}
 {{- end }}

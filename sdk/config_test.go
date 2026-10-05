@@ -53,8 +53,11 @@ func TestNewDefaultPublisherConfig(t *testing.T) {
 	if cfg.BufferSize != 1024 {
 		t.Errorf("expected BufferSize=1024, got %d", cfg.BufferSize)
 	}
-	if cfg.Acks != "1" {
-		t.Errorf("expected Acks=1, got %s", cfg.Acks)
+	if cfg.Acks != "all" {
+		t.Errorf("expected Acks=all, got %s", cfg.Acks)
+	}
+	if !cfg.EnableIdempotence {
+		t.Error("expected idempotence to be enabled by default")
 	}
 	if cfg.CompressionType != "none" {
 		t.Errorf("expected CompressionType=none, got %s", cfg.CompressionType)
@@ -68,6 +71,7 @@ func TestPublisherConfigValidatesAcknowledgementsAndIdempotence(t *testing.T) {
 	for _, value := range []string{"0", "1", "all", "-1", " ALL "} {
 		cfg := NewDefaultPublisherConfig()
 		cfg.Acks = value
+		cfg.EnableIdempotence = false
 		require.NoError(t, cfg.Validate(), value)
 	}
 	for _, value := range []string{"2", "leader", "-2"} {
@@ -143,6 +147,15 @@ func TestNewDefaultConsumerConfig(t *testing.T) {
 	}
 	if cfg.MaxCommitRetries != 5 {
 		t.Errorf("expected MaxCommitRetries=5, got %d", cfg.MaxCommitRetries)
+	}
+	if cfg.HandlerMaxRetries != 3 {
+		t.Errorf("expected HandlerMaxRetries=3, got %d", cfg.HandlerMaxRetries)
+	}
+	if cfg.HandlerRetryBackoff != 100*time.Millisecond {
+		t.Errorf("expected HandlerRetryBackoff=100ms, got %v", cfg.HandlerRetryBackoff)
+	}
+	if cfg.HandlerRetryMaxBackoff != time.Second {
+		t.Errorf("expected HandlerRetryMaxBackoff=1s, got %v", cfg.HandlerRetryMaxBackoff)
 	}
 	if cfg.Mode != ModePolling {
 		t.Errorf("expected Mode=polling, got %s", cfg.Mode)
@@ -232,10 +245,12 @@ func TestNewDefaultPublisherConfig_AllDefaults(t *testing.T) {
 	assert.Equal(t, 100, cfg.RetryBackoffMS)
 	assert.Equal(t, 2000, cfg.MaxBackoffMS)
 	assert.False(t, cfg.UseTLS)
+	assert.Equal(t, "", cfg.TLSCAPath)
+	assert.Equal(t, "", cfg.TLSServerName)
 	assert.Equal(t, "", cfg.TLSCertPath)
 	assert.Equal(t, "", cfg.TLSKeyPath)
 	assert.False(t, cfg.EnableMetrics)
-	assert.False(t, cfg.EnableIdempotence)
+	assert.True(t, cfg.EnableIdempotence)
 	assert.False(t, cfg.EnableBenchmark)
 	assert.False(t, cfg.AutoCreateTopics)
 }
@@ -248,6 +263,8 @@ func TestNewDefaultConsumerConfig_AllDefaults(t *testing.T) {
 	assert.Equal(t, 2*time.Second, cfg.CommitRetryMaxBackoff)
 	assert.Equal(t, 300000, cfg.StreamingReadDeadlineMS)
 	assert.False(t, cfg.UseTLS)
+	assert.Equal(t, "", cfg.TLSCAPath)
+	assert.Equal(t, "", cfg.TLSServerName)
 	assert.Equal(t, "", cfg.TLSCertPath)
 	assert.Equal(t, "", cfg.TLSKeyPath)
 	assert.False(t, cfg.EnableMetrics)
@@ -258,10 +275,14 @@ func TestNewDefaultConsumerConfig_AllDefaults(t *testing.T) {
 func TestConsumerConfig_TLSFields(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	cfg.UseTLS = true
+	cfg.TLSCAPath = "/path/to/ca.pem"
+	cfg.TLSServerName = "broker.internal"
 	cfg.TLSCertPath = "/path/to/cert.pem"
 	cfg.TLSKeyPath = "/path/to/key.pem"
 
 	assert.True(t, cfg.UseTLS)
+	assert.Equal(t, "/path/to/ca.pem", cfg.TLSCAPath)
+	assert.Equal(t, "broker.internal", cfg.TLSServerName)
 	assert.Equal(t, "/path/to/cert.pem", cfg.TLSCertPath)
 	assert.Equal(t, "/path/to/key.pem", cfg.TLSKeyPath)
 }
@@ -269,10 +290,14 @@ func TestConsumerConfig_TLSFields(t *testing.T) {
 func TestPublisherConfig_TLSFields(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	cfg.UseTLS = true
+	cfg.TLSCAPath = "/path/to/ca.pem"
+	cfg.TLSServerName = "broker.internal"
 	cfg.TLSCertPath = "/path/to/cert.pem"
 	cfg.TLSKeyPath = "/path/to/key.pem"
 
 	assert.True(t, cfg.UseTLS)
+	assert.Equal(t, "/path/to/ca.pem", cfg.TLSCAPath)
+	assert.Equal(t, "broker.internal", cfg.TLSServerName)
 	assert.Equal(t, "/path/to/cert.pem", cfg.TLSCertPath)
 	assert.Equal(t, "/path/to/key.pem", cfg.TLSKeyPath)
 }
@@ -316,6 +341,8 @@ func TestLoadConfig_PublisherYAMLWithTLSAndMetrics(t *testing.T) {
 	yamlData := `topic: yaml-topic
 partitions: 4
 use_tls: true
+tls_ca_path: /ca
+tls_server_name: broker.internal
 tls_cert_path: /cert
 tls_key_path: /key
 enable_metrics: true`
@@ -330,6 +357,8 @@ enable_metrics: true`
 	assert.Equal(t, "yaml-topic", loaded.Topic)
 	assert.Equal(t, 4, loaded.Partitions)
 	assert.True(t, loaded.UseTLS)
+	assert.Equal(t, "/ca", loaded.TLSCAPath)
+	assert.Equal(t, "broker.internal", loaded.TLSServerName)
 	assert.Equal(t, "/cert", loaded.TLSCertPath)
 	assert.Equal(t, "/key", loaded.TLSKeyPath)
 	assert.True(t, loaded.EnableMetrics)
@@ -340,6 +369,8 @@ func TestLoadConfig_ConsumerYAMLWithTLSAndMetrics(t *testing.T) {
 	path := filepath.Join(dir, "c.yaml")
 	yamlData := `group_id: tls-group
 use_tls: true
+tls_ca_path: /consumer/ca
+tls_server_name: broker.internal
 tls_cert_path: /consumer/cert
 tls_key_path: /consumer/key
 enable_metrics: true`
@@ -353,6 +384,8 @@ enable_metrics: true`
 	}
 	assert.Equal(t, "tls-group", loaded.GroupID)
 	assert.True(t, loaded.UseTLS)
+	assert.Equal(t, "/consumer/ca", loaded.TLSCAPath)
+	assert.Equal(t, "broker.internal", loaded.TLSServerName)
 	assert.Equal(t, "/consumer/cert", loaded.TLSCertPath)
 	assert.Equal(t, "/consumer/key", loaded.TLSKeyPath)
 	assert.True(t, loaded.EnableMetrics)
@@ -389,7 +422,10 @@ func TestPublisherConfigRejectsInvalidWireSettingsBeforeConnect(t *testing.T) {
 		"buffer size": func(config *PublisherConfig) { config.BufferSize = 0 },
 		"brokers":     func(config *PublisherConfig) { config.BrokerAddrs = nil },
 		"topic":       func(config *PublisherConfig) { config.Topic = "bad topic" },
-		"tls paths":   func(config *PublisherConfig) { config.UseTLS = true },
+		"tls partial client identity": func(config *PublisherConfig) {
+			config.UseTLS = true
+			config.TLSCertPath = "/cert"
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -408,8 +444,18 @@ func TestConsumerConfigRejectsInvalidRuntimeSettings(t *testing.T) {
 		"offset reset": func(config *ConsumerConfig) {
 			config.AutoOffsetReset = "middle"
 		},
-		"isolation":  func(config *ConsumerConfig) { config.ReadIsolation = "dirty" },
-		"duration":   func(config *ConsumerConfig) { config.PollInterval = -time.Second },
+		"isolation": func(config *ConsumerConfig) { config.ReadIsolation = "dirty" },
+		"duration":  func(config *ConsumerConfig) { config.PollInterval = -time.Second },
+		"handler retries": func(config *ConsumerConfig) {
+			config.HandlerMaxRetries = -1
+		},
+		"handler backoff": func(config *ConsumerConfig) {
+			config.HandlerRetryBackoff = -time.Millisecond
+		},
+		"handler backoff range": func(config *ConsumerConfig) {
+			config.HandlerRetryBackoff = time.Second
+			config.HandlerRetryMaxBackoff = time.Millisecond
+		},
 		"batch size": func(config *ConsumerConfig) { config.BatchSize = 0 },
 		"worker channel": func(config *ConsumerConfig) {
 			config.WorkerChannelSize = 0
@@ -419,6 +465,10 @@ func TestConsumerConfigRejectsInvalidRuntimeSettings(t *testing.T) {
 		"group":   func(config *ConsumerConfig) { config.GroupID = "bad group" },
 		"consumer": func(config *ConsumerConfig) {
 			config.ConsumerID = ""
+		},
+		"tls partial client identity": func(config *ConsumerConfig) {
+			config.UseTLS = true
+			config.TLSKeyPath = "/key"
 		},
 	}
 	for name, mutate := range tests {

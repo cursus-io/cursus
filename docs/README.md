@@ -35,6 +35,8 @@ This index separates normative contracts from implementation notes. When prose c
 ## Operations And Evaluation
 
 - [Observability](reference/observability.md): health, readiness, metrics, alerts, and security boundaries.
+- [Production Incident Runbook](operations/production-runbook.md): first response and remediation for the alerts shipped by the Helm charts.
+- [Upgrade And Recovery](operations/upgrade-and-recovery.md): storage compatibility, coordinated rollout, rollback, and restore boundaries.
 - [Consumer Lifecycle Alerts](operations/consumer-lifecycle-alerts.md): external minimum-member contracts and canary validation.
 - [Performance](reference/performance.md): tuning knobs and durability/latency trade-offs.
 - [Benchmarks](reference/benchmark.md): tools, workload model, and result interpretation.

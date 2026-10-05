@@ -39,7 +39,7 @@ func TestRunBackupValidateRequiresManifest(t *testing.T) {
 	root := t.TempDir()
 	var stdout, stderr bytes.Buffer
 	require.Equal(t, 1, run([]string{"backup", "validate", "--log-dir", root}, &stdout, &stderr))
-	require.JSONEq(t, `{"ready":false,"inventory":{"manifest_present":false,"topics":[]},"transaction_journal":{"present":false,"record_count":0,"latest_transactions":0}}`, stdout.String())
+	require.JSONEq(t, `{"ready":false,"inventory":{"manifest_present":false,"topics":[]},"transaction_journal":{"present":false,"record_count":0,"latest_transactions":0,"next_producer_epoch":0,"has_producer_epoch_watermark":false},"transaction_manifest":{"present":false},"snapshots":{"files":0,"legacy_files":0,"snapshots":0}}`, stdout.String())
 	require.Contains(t, stderr.String(), "no topic metadata manifest is present")
 }
 
@@ -52,7 +52,7 @@ func TestRunBackupValidateIsReadOnly(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	require.Equal(t, 0, run([]string{"backup", "validate", "--log-dir", root}, &stdout, &stderr))
-	require.JSONEq(t, `{"ready":true,"inventory":{"manifest_present":true,"topics":[]},"transaction_journal":{"present":false,"record_count":0,"latest_transactions":0}}`, stdout.String())
+	require.JSONEq(t, `{"ready":true,"inventory":{"manifest_present":true,"topics":[]},"transaction_journal":{"present":false,"record_count":0,"latest_transactions":0,"next_producer_epoch":0,"has_producer_epoch_watermark":false},"transaction_manifest":{"present":false},"snapshots":{"files":0,"legacy_files":0,"snapshots":0}}`, stdout.String())
 	require.Empty(t, stderr.String())
 	after, err := os.ReadFile(manifest)
 	require.NoError(t, err)

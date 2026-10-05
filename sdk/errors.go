@@ -10,13 +10,104 @@ import (
 )
 
 var (
-	ErrProducerClosed      = errors.New("producer closed")
-	ErrConsumerClosed      = errors.New("consumer closed")
-	ErrConsumerRebalancing = errors.New("consumer assignment is rebalancing")
-	ErrTopicNotFound       = errors.New("topic not found")
-	ErrInvalidPartition    = errors.New("invalid partition")
-	ErrNotLeader           = errors.New("not leader")
+	ErrProducerClosed          = errors.New("producer closed")
+	ErrProducerOutcomeUnknown  = errors.New("producer delivery outcome unknown")
+	ErrRequestOutcomeUnknown   = errors.New("request outcome unknown")
+	ErrConsumerClosed          = errors.New("consumer closed")
+	ErrConsumerRebalancing     = errors.New("consumer assignment is rebalancing")
+	ErrConsumerHandlerRequired = errors.New("consumer message handler is required")
+	ErrTopicNotFound           = errors.New("topic not found")
+	ErrInvalidPartition        = errors.New("invalid partition")
+	ErrNotLeader               = errors.New("not leader")
 )
+
+// RequestOutcomeUnknownError means a mutating request was fully written but
+// its response could not be read. Callers must reconcile server state before
+// retrying an operation that is not idempotent.
+type RequestOutcomeUnknownError struct {
+	Operation string
+	Cause     error
+}
+
+func (e *RequestOutcomeUnknownError) Error() string {
+	if e == nil {
+		return ErrRequestOutcomeUnknown.Error()
+	}
+	return fmt.Sprintf("%s during %s: %v", ErrRequestOutcomeUnknown, e.Operation, e.Cause)
+}
+
+func (e *RequestOutcomeUnknownError) Unwrap() []error {
+	if e == nil || e.Cause == nil {
+		return []error{ErrRequestOutcomeUnknown}
+	}
+	return []error{ErrRequestOutcomeUnknown, e.Cause}
+}
+
+// ProducerOutcomeUnknownError means a non-idempotent publish may have reached
+// the broker, but the SDK could not obtain a trustworthy acknowledgement. The
+// caller must reconcile application state before deciding whether to publish
+// the record again.
+type ProducerOutcomeUnknownError struct {
+	Partition int
+	Stage     string
+	Cause     error
+}
+
+func (e *ProducerOutcomeUnknownError) Error() string {
+	if e == nil {
+		return ErrProducerOutcomeUnknown.Error()
+	}
+	if e.Cause == nil {
+		return fmt.Sprintf("%s for partition %d during %s", ErrProducerOutcomeUnknown, e.Partition, e.Stage)
+	}
+	return fmt.Sprintf("%s for partition %d during %s: %v", ErrProducerOutcomeUnknown, e.Partition, e.Stage, e.Cause)
+}
+
+func (e *ProducerOutcomeUnknownError) Unwrap() []error {
+	if e == nil || e.Cause == nil {
+		return []error{ErrProducerOutcomeUnknown}
+	}
+	return []error{ErrProducerOutcomeUnknown, e.Cause}
+}
+
+// ConsumerOffsetOutOfRangeError reports a retained offset that is no longer
+// readable while AutoOffsetResetError is configured.
+type ConsumerOffsetOutOfRangeError struct {
+	Partition int
+	Requested uint64
+	Earliest  uint64
+	Latest    uint64
+}
+
+func (e *ConsumerOffsetOutOfRangeError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("consumer partition %d offset %d is out of range (earliest=%d latest=%d)", e.Partition, e.Requested, e.Earliest, e.Latest)
+}
+
+// ConsumerHandlerError reports a record handler that exhausted its bounded
+// retry budget. The failed record is not committed.
+type ConsumerHandlerError struct {
+	Partition int
+	Offset    uint64
+	Attempts  int
+	Cause     error
+}
+
+func (e *ConsumerHandlerError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("consumer handler failed for partition %d offset %d after %d attempts: %v", e.Partition, e.Offset, e.Attempts, e.Cause)
+}
+
+func (e *ConsumerHandlerError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
 
 type ErrorClass = wireprotocol.ErrorClass
 
@@ -99,16 +190,13 @@ func ParseBrokerError(value string) (*BrokerError, bool) {
 	} else {
 		return nil, false
 	}
-	parts := strings.Fields(value)
-	if len(parts) == 0 {
+	parsed, ok := wireprotocol.ParseErrorResponse("ERROR: " + value)
+	if !ok {
 		return nil, false
 	}
-	err := &BrokerError{Code: parts[0], Message: parts[0], Fields: make(map[string]string)}
-	for _, part := range parts[1:] {
-		key, fieldValue, ok := strings.Cut(part, "=")
-		if ok && key != "" {
-			err.Fields[key] = strings.Trim(fieldValue, "\"")
-		}
+	message := parsed.Fields["reason"]
+	if message == "" {
+		message = parsed.Code
 	}
-	return err, true
+	return &BrokerError{Code: parsed.Code, Class: parsed.Class, Retryable: parsed.Retryable, Message: message, Fields: parsed.Fields}, true
 }

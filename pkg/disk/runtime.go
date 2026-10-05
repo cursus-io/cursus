@@ -17,6 +17,9 @@ type RuntimeSnapshot struct {
 	SegmentCacheHits      uint64
 	SegmentCacheMisses    uint64
 	SegmentCacheEvictions uint64
+	FilesystemFreeBytes   uint64
+	FilesystemTotalBytes  uint64
+	FilesystemHeadroomOK  bool
 }
 
 // RuntimeSnapshot returns storage state without retaining manager locks during I/O.
@@ -33,6 +36,13 @@ func (dm *DiskManager) RuntimeSnapshot() RuntimeSnapshot {
 	dm.mu.Unlock()
 
 	snapshot := RuntimeSnapshot{Handlers: len(handlers)}
+	if space, err := dm.headroom.snapshot(true); err == nil {
+		snapshot.FilesystemFreeBytes = space.Free
+		snapshot.FilesystemTotalBytes = space.Total
+		snapshot.FilesystemHeadroomOK = space.Ready
+	} else {
+		snapshot.StatFailures++
+	}
 	for _, handler := range handlers {
 		if handler == nil {
 			continue
@@ -90,6 +100,9 @@ func (dm *DiskManager) Ready() error {
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("log path is not a directory")
+	}
+	if _, err := dm.headroom.snapshot(true); err != nil {
+		return fmt.Errorf("storage admission unavailable: %w", err)
 	}
 
 	dm.mu.Lock()

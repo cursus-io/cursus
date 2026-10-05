@@ -18,6 +18,12 @@ func MarshalRedactedJSON(cfg *Config) ([]byte, error) {
 	if safe.InternalAuthToken != "" {
 		safe.InternalAuthToken = redactedConfigValue
 	}
+	if safe.InternalAuthTokenNext != "" {
+		safe.InternalAuthTokenNext = redactedConfigValue
+	}
+	if safe.ObservationGRPCAuthToken != "" {
+		safe.ObservationGRPCAuthToken = redactedConfigValue
+	}
 	safe.SASLUsers = append([]SASLUser(nil), cfg.SASLUsers...)
 	for i := range safe.SASLUsers {
 		if safe.SASLUsers[i].Token != "" {
@@ -32,5 +38,6 @@ func MarshalRedactedJSON(cfg *Config) ([]byte, error) {
 	safe.InternalTLSClientCAPool = nil
 	safe.InternalTLSRootCAPool = nil
 
+	// #nosec G117 -- every credential-bearing field is replaced above before serialization.
 	return json.MarshalIndent(&safe, "", "  ")
 }

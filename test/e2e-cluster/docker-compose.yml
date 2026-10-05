@@ -15,7 +15,7 @@ services:
       - ENABLE_EXPORTER=true
       - EXPORTER_PORT=9100
       - BOOTSTRAP_CLUSTER=true
-      - TRANSACTION_TIMEOUT_MS=5000
+      - TRANSACTION_TIMEOUT_MS=${TRANSACTION_TIMEOUT_MS:-5000}
     ports:
       - "9001:9000"
       - "8000:8000"
@@ -51,7 +51,7 @@ services:
       - ENABLE_EXPORTER=true
       - EXPORTER_PORT=9100
       - BOOTSTRAP_CLUSTER=true
-      - TRANSACTION_TIMEOUT_MS=5000
+      - TRANSACTION_TIMEOUT_MS=${TRANSACTION_TIMEOUT_MS:-5000}
     ports:
       - "9002:9000"
       - "8001:8000"
@@ -88,7 +88,7 @@ services:
       - ENABLE_EXPORTER=true
       - EXPORTER_PORT=9100
       - BOOTSTRAP_CLUSTER=true
-      - TRANSACTION_TIMEOUT_MS=5000
+      - TRANSACTION_TIMEOUT_MS=${TRANSACTION_TIMEOUT_MS:-5000}
     ports:
       - "9003:9000"
       - "8002:8000"

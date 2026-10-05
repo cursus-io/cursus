@@ -246,8 +246,11 @@ func DuplicatesAllowed() Expectation {
 
 func MessageLossAllowed() Expectation {
 	return func(ctx *TestContext) error {
-		if ctx.consumedCount == 0 && ctx.publishedCount > 0 {
-			return fmt.Errorf("all messages lost: published %d, but consumed 0", ctx.publishedCount)
+		// The scenario sends the original fire-and-forget attempts once more.
+		// Zero delivery is valid for acks=0, but more than both attempt sets
+		// indicates duplication inside the broker or transport.
+		if ctx.consumedCount > ctx.publishedCount*2 {
+			return fmt.Errorf("unexpected delivery amplification: published %d twice, consumed %d", ctx.publishedCount, ctx.consumedCount)
 		}
 		ctx.t.Logf("Consumption verified (message loss allowed): Published %d, Consumed %d", ctx.publishedCount, ctx.consumedCount)
 		return nil

@@ -127,6 +127,21 @@ func (c *Connection) ReadFrameWithAdmission(admit func(int, int) error) (Frame, 
 	return c.codec.ReadFrameWithAdmission(reader, admit)
 }
 
+// ReadFrameReserved applies a caller-owned global memory reservation before
+// allocating the frame payload. The caller must invoke release exactly once.
+func (c *Connection) ReadFrameReserved(reserve FrameReservation) (Frame, func(), error) {
+	if c == nil || c.conn == nil || c.codec == nil {
+		return Frame{}, func() {}, fmt.Errorf("wire v2 connection is not initialized")
+	}
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	reader := c.reader
+	if reader == nil {
+		reader = c.conn
+	}
+	return c.codec.ReadFrameReserved(reader, reserve)
+}
+
 func (c *Connection) WriteFrame(frame Frame) error {
 	if c == nil || c.conn == nil || c.codec == nil {
 		return fmt.Errorf("wire v2 connection is not initialized")

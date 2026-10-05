@@ -216,7 +216,8 @@ func TestVersionConflict(t *testing.T) {
 
 // TestSnapshotVersionValidation verifies that snapshot versions are validated
 // against the current stream version: a snapshot version exceeding the stream
-// version is invalid, while saving at the current version succeeds.
+// version is invalid, while saving at the current version succeeds. The store
+// also rejects regressions so direct callers cannot bypass handler validation.
 func TestSnapshotVersionValidation(t *testing.T) {
 	dir := t.TempDir()
 
@@ -257,15 +258,15 @@ func TestSnapshotVersionValidation(t *testing.T) {
 	assert.Equal(t, uint64(3), snap.Version)
 	assert.Equal(t, `{"items":["a","b","c"]}`, snap.Payload)
 
-	// Overwrite with a lower version — the store allows it (last write wins),
-	// but the handler would prevent this in production via its version check.
+	// A lower version must not replace the current durable snapshot.
 	err = ss.Save(key, 2, `{"items":["a","b"]}`)
-	require.NoError(t, err)
+	require.ErrorContains(t, err, "snapshot version regression")
 
 	snap, err = ss.Read(key)
 	require.NoError(t, err)
 	require.NotNil(t, snap)
-	assert.Equal(t, uint64(2), snap.Version, "snapshot store uses last-write-wins; handler prevents version regression")
+	assert.Equal(t, uint64(3), snap.Version)
+	assert.Equal(t, `{"items":["a","b","c"]}`, snap.Payload)
 }
 
 // TestMultipleAggregates verifies that events appended to different aggregate keys

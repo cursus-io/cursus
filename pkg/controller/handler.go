@@ -83,6 +83,18 @@ func transactionCoordinatorShardCount(cfg *config.Config) int {
 	return cfg.TransactionCoordinatorShards
 }
 
+func transactionLimits(cfg *config.Config) transaction.Limits {
+	if cfg == nil {
+		return transaction.DefaultLimits()
+	}
+	return transaction.Limits{
+		MaxTransactions: cfg.MaxTransactions,
+		MaxRecords:      cfg.MaxTransactionRecords,
+		MaxBytes:        cfg.MaxTransactionBytes,
+		MaxOffsets:      cfg.MaxTransactionOffsets,
+	}
+}
+
 // commandEntry defines a single command routing rule.
 type commandEntry struct {
 	prefix      string
@@ -126,7 +138,7 @@ func NewCommandHandler(
 		groupRecoveryEpoch: make(map[uint64]int),
 		Cluster:            cc,
 		ESHandler:          eventsource.NewHandler(tm),
-		TxnManager:         transaction.NewManagerWithExpirationAndShards(transactionalIDExpiration(cfg), transactionCoordinatorShardCount(cfg)),
+		TxnManager:         transaction.NewManagerWithLimits(transactionalIDExpiration(cfg), transactionCoordinatorShardCount(cfg), transactionLimits(cfg)),
 	}
 	if tm != nil {
 		tm.SetTransactionDecisionResolver(ch.TxnManager)
@@ -179,7 +191,7 @@ func NewCommandHandler(
 		{prefix: "DESCRIBE ", exact: false, helpOrder: 26, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDescribeTopic(cmd, ctx) }},
 		{prefix: "HEARTBEAT ", exact: false, helpOrder: 11, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleHeartbeat(cmd) }},
 		{prefix: "COMMIT_OFFSET ", exact: false, helpOrder: 12, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCommitOffset(cmd) }},
-		{prefix: "BATCH_COMMIT ", exact: false, helpOrder: 13, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd) }},
+		{prefix: "BATCH_COMMIT ", exact: false, helpOrder: 13, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBatchCommit(cmd, ctx) }},
 		{prefix: "INIT_PRODUCER_ID ", exact: false, helpOrder: 16, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleInitProducerID(cmd) }},
 		{prefix: "BEGIN_TXN ", exact: false, helpOrder: 17, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleBeginTxn(cmd) }},
 		{prefix: "TXN_PUBLISH ", exact: false, helpOrder: 18, permissions: []string{PermissionTransaction, PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnPublish(cmd, ctx) }},
@@ -386,11 +398,14 @@ func (ch *CommandHandler) authorizeInternalCommand(name string, input commandInp
 	if name == "REPLICATE_MESSAGE" && !ch.Config.EnabledDistribution {
 		return fmt.Sprintf("ERROR: distribution_required command=%s", name)
 	}
-	token := ch.Config.InternalAuthToken
-	if token == "" {
+	activeToken := ch.Config.InternalAuthToken
+	if activeToken == "" {
 		return fmt.Sprintf("ERROR: internal_auth_not_configured command=%s", name)
 	}
-	if !constantTimeStringEqual(input.Args["internal_token"], token) {
+	supplied := input.Args["internal_token"]
+	activeMatch := constantTimeStringEqual(supplied, activeToken)
+	nextMatch := ch.Config.InternalAuthTokenNext != "" && constantTimeStringEqual(supplied, ch.Config.InternalAuthTokenNext)
+	if !activeMatch && !nextMatch {
 		return fmt.Sprintf("ERROR: internal_command_unauthorized command=%s", name)
 	}
 	return ""

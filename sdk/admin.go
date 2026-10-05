@@ -19,9 +19,11 @@ type AdminConfig struct {
 	RetryBackoffMS   int      `yaml:"retry_backoff_ms" json:"retry_backoff_ms"`
 	RequestTimeoutMS int      `yaml:"request_timeout_ms" json:"request_timeout_ms"`
 
-	UseTLS      bool   `yaml:"use_tls" json:"use_tls"`
-	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
-	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
+	UseTLS        bool   `yaml:"use_tls" json:"use_tls"`
+	TLSCAPath     string `yaml:"tls_ca_path" json:"tls_ca_path"`
+	TLSServerName string `yaml:"tls_server_name" json:"tls_server_name"`
+	TLSCertPath   string `yaml:"tls_cert_path" json:"tls_cert_path"`
+	TLSKeyPath    string `yaml:"tls_key_path" json:"tls_key_path"`
 
 	Principal string `yaml:"principal" json:"principal"`
 	AuthToken string `yaml:"auth_token" json:"auth_token"`
@@ -140,7 +142,7 @@ func NewAdminClient(config *AdminConfig) (*AdminClient, error) {
 	if err := validateWireClientSettings(config.CompressionType, config.Principal, config.AuthToken); err != nil {
 		return nil, err
 	}
-	if err := validateTLSFiles(config.UseTLS, config.TLSCertPath, config.TLSKeyPath); err != nil {
+	if err := validateTLSFiles(config.UseTLS, config.TLSCAPath, config.TLSServerName, config.TLSCertPath, config.TLSKeyPath); err != nil {
 		return nil, err
 	}
 	if config.MaxRetries < 0 {
@@ -164,14 +166,11 @@ func NewAdminClient(config *AdminConfig) (*AdminClient, error) {
 		return nil, fmt.Errorf("retry backoff must be non-negative")
 	}
 	if config.UseTLS {
-		cert, err := tls.LoadX509KeyPair(config.TLSCertPath, config.TLSKeyPath)
+		tlsConfig, err := buildClientTLSConfig(config.TLSCAPath, config.TLSServerName, config.TLSCertPath, config.TLSKeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("load TLS cert: %w", err)
+			return nil, err
 		}
-		client.tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
+		client.tlsConfig = tlsConfig
 	}
 	return client, nil
 }
@@ -321,12 +320,9 @@ func (c *AdminClient) executeOnce(ctx context.Context, addr, command string) (st
 	if err := conn.SetDeadline(deadline); err != nil {
 		return "", fmt.Errorf("set admin request deadline: %w", err)
 	}
-	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopCancellation()
 
-	if err := conn.SetDeadline(deadline); err != nil {
-		return "", fmt.Errorf("restore admin request deadline: %w", err)
-	}
 	if err := WriteWithLength(conn, []byte(command)); err != nil {
 		return "", &ambiguousAdminError{err: fmt.Errorf("send admin command to %s: %w", addr, err)}
 	}

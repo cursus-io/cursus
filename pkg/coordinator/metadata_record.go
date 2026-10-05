@@ -10,6 +10,7 @@ import (
 	"io"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
@@ -20,12 +21,14 @@ const (
 	ConsumerMetadataRecordVersionSubscriptions = 2
 	ConsumerMetadataRecordVersionTransactions  = 3
 	ConsumerMetadataRecordVersionLifecycle     = 4
+	ConsumerMetadataRecordVersionReservations  = 5
 
 	ConsumerMetadataRecordRegistration                = "group_registration"
 	ConsumerMetadataRecordOffsetSnapshot              = "offset_snapshot"
 	ConsumerMetadataRecordTransactionalOffsetSnapshot = "transactional_offset_snapshot"
 	ConsumerMetadataRecordTombstone                   = "group_tombstone"
 	ConsumerMetadataRecordLifecycleSnapshot           = "group_lifecycle_snapshot"
+	ConsumerMetadataRecordOffsetReservations          = "transaction_offset_reservations"
 )
 
 // TopicOffsetSnapshot is a complete durable next-offset snapshot for one
@@ -66,24 +69,26 @@ type GroupLifecycleSnapshot struct {
 // re-created groups, while offset revisions make replay independent of the
 // physical internal-topic partition order.
 type ConsumerMetadataRecord struct {
-	Version          int                     `json:"version"`
-	Type             string                  `json:"type"`
-	Group            string                  `json:"group"`
-	Topic            string                  `json:"topic,omitempty"`
-	PartitionCount   int                     `json:"partition_count,omitempty"`
-	Topics           []string                `json:"topics,omitempty"`
-	TopicPattern     string                  `json:"topic_pattern,omitempty"`
-	TopicPartitions  []TopicPartition        `json:"topic_partitions,omitempty"`
-	Epoch            uint64                  `json:"epoch"`
-	Revision         uint64                  `json:"revision,omitempty"`
-	Offsets          []OffsetItem            `json:"offsets,omitempty"`
-	InitialOffsets   []TopicOffsetSnapshot   `json:"initial_offsets,omitempty"`
-	Timestamp        time.Time               `json:"timestamp"`
-	TransactionalID  string                  `json:"transactional_id,omitempty"`
-	ProducerID       string                  `json:"producer_id,omitempty"`
-	ProducerEpoch    int64                   `json:"producer_epoch,omitempty"`
-	CoordinatorEpoch int64                   `json:"coordinator_epoch,omitempty"`
-	Lifecycle        *GroupLifecycleSnapshot `json:"lifecycle,omitempty"`
+	Version              int                                  `json:"version"`
+	Type                 string                               `json:"type"`
+	Group                string                               `json:"group"`
+	Topic                string                               `json:"topic,omitempty"`
+	PartitionCount       int                                  `json:"partition_count,omitempty"`
+	Topics               []string                             `json:"topics,omitempty"`
+	TopicPattern         string                               `json:"topic_pattern,omitempty"`
+	TopicPartitions      []TopicPartition                     `json:"topic_partitions,omitempty"`
+	Epoch                uint64                               `json:"epoch"`
+	Revision             uint64                               `json:"revision,omitempty"`
+	Offsets              []OffsetItem                         `json:"offsets,omitempty"`
+	InitialOffsets       []TopicOffsetSnapshot                `json:"initial_offsets,omitempty"`
+	Timestamp            time.Time                            `json:"timestamp"`
+	TransactionalID      string                               `json:"transactional_id,omitempty"`
+	ProducerID           string                               `json:"producer_id,omitempty"`
+	ProducerEpoch        int64                                `json:"producer_epoch,omitempty"`
+	CoordinatorEpoch     int64                                `json:"coordinator_epoch,omitempty"`
+	Lifecycle            *GroupLifecycleSnapshot              `json:"lifecycle,omitempty"`
+	Reservations         []TransactionOffsetReservation       `json:"reservations,omitempty"`
+	ReservationDecisions map[string]OffsetReservationDecision `json:"reservation_decisions,omitempty"`
 }
 
 // ConsumerMetadataRecoveryStatus is safe to expose through readiness and
@@ -118,21 +123,25 @@ type offsetCandidate struct {
 type legacyRecoveryState map[string]map[string]map[int]uint64
 
 type consumerMetadataCandidates struct {
-	lifecycles         map[string]lifecycleCandidate
-	lifecycleSnapshots map[string]lifecycleSnapshotCandidate
-	offsetSnapshots    map[string]offsetCandidate
+	lifecycles           map[string]lifecycleCandidate
+	lifecycleSnapshots   map[string]lifecycleSnapshotCandidate
+	reservationSnapshots map[string]lifecycleSnapshotCandidate
+	offsetSnapshots      map[string]offsetCandidate
 }
 
 func newConsumerMetadataCandidates() consumerMetadataCandidates {
 	return consumerMetadataCandidates{
-		lifecycles:         make(map[string]lifecycleCandidate),
-		lifecycleSnapshots: make(map[string]lifecycleSnapshotCandidate),
-		offsetSnapshots:    make(map[string]offsetCandidate),
+		lifecycles:           make(map[string]lifecycleCandidate),
+		lifecycleSnapshots:   make(map[string]lifecycleSnapshotCandidate),
+		reservationSnapshots: make(map[string]lifecycleSnapshotCandidate),
+		offsetSnapshots:      make(map[string]offsetCandidate),
 	}
 }
 
 func (candidates *consumerMetadataCandidates) selectRecord(record ConsumerMetadataRecord, status *ConsumerMetadataRecoveryStatus) error {
 	switch record.Type {
+	case ConsumerMetadataRecordOffsetReservations:
+		return selectLifecycleSnapshot(candidates.reservationSnapshots, record, status)
 	case ConsumerMetadataRecordRegistration, ConsumerMetadataRecordTombstone:
 		status.RegistrationRecords++
 		candidate, exists := candidates.lifecycles[record.Group]
@@ -223,6 +232,8 @@ func (c *Coordinator) setRecoveryFailureStatus(status ConsumerMetadataRecoverySt
 }
 
 func canonicalConsumerMetadataRecord(record ConsumerMetadataRecord) ConsumerMetadataRecord {
+	record.Reservations = cloneOffsetReservations(record.Reservations)
+	record.ReservationDecisions = cloneReservationDecisions(record.ReservationDecisions)
 	record.Timestamp = record.Timestamp.UTC()
 	record.Offsets = canonicalOffsetItems(record.Offsets)
 	record.Topics = append([]string(nil), record.Topics...)
@@ -282,11 +293,26 @@ func canonicalOffsetItems(offsets []OffsetItem) []OffsetItem {
 }
 
 func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
-	if record.Version != ConsumerMetadataRecordVersion && record.Version != ConsumerMetadataRecordVersionSubscriptions && record.Version != ConsumerMetadataRecordVersionTransactions && record.Version != ConsumerMetadataRecordVersionLifecycle {
+	if record.Version != ConsumerMetadataRecordVersion && record.Version != ConsumerMetadataRecordVersionSubscriptions && record.Version != ConsumerMetadataRecordVersionTransactions && record.Version != ConsumerMetadataRecordVersionLifecycle && record.Version != ConsumerMetadataRecordVersionReservations {
 		return fmt.Errorf("unsupported consumer metadata record version %d", record.Version)
 	}
 	if record.Group == "" || record.Epoch == 0 {
 		return fmt.Errorf("consumer metadata record is missing group or epoch")
+	}
+	if record.Type == ConsumerMetadataRecordOffsetReservations {
+		if record.Version != ConsumerMetadataRecordVersionReservations || record.Revision == 0 {
+			return fmt.Errorf("offset reservations require version 5 and a nonzero revision")
+		}
+		if record.Topic != "" || record.PartitionCount != 0 || len(record.Topics) != 0 || record.TopicPattern != "" || len(record.TopicPartitions) != 0 || len(record.Offsets) != 0 || len(record.InitialOffsets) != 0 || record.Lifecycle != nil || hasConsumerMetadataTransactionFields(record) {
+			return fmt.Errorf("offset reservations contain unrelated metadata fields")
+		}
+		if err := validateOffsetReservations(record.Reservations); err != nil {
+			return err
+		}
+		return validateReservationDecisions(record.ReservationDecisions)
+	}
+	if record.Version == ConsumerMetadataRecordVersionReservations || len(record.Reservations) != 0 || len(record.ReservationDecisions) != 0 {
+		return fmt.Errorf("reservation metadata requires an offset reservations snapshot")
 	}
 	if record.Version == ConsumerMetadataRecordVersionTransactions && record.Type != ConsumerMetadataRecordTransactionalOffsetSnapshot {
 		return fmt.Errorf("consumer metadata version 3 requires a transactional offset snapshot")
@@ -458,6 +484,9 @@ func consumerMetadataRecordKey(record ConsumerMetadataRecord) string {
 	prefix := "group"
 	if record.Type == ConsumerMetadataRecordLifecycleSnapshot {
 		prefix = "lifecycle"
+	}
+	if record.Type == ConsumerMetadataRecordOffsetReservations {
+		prefix = "offset-reservations"
 	}
 	if record.Type == ConsumerMetadataRecordOffsetSnapshot || record.Type == ConsumerMetadataRecordTransactionalOffsetSnapshot {
 		identity += "\x00" + record.Topic
@@ -731,15 +760,19 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 				record, versioned, decodeErr := decodeConsumerMetadataRecord(message.Payload)
 				if decodeErr != nil {
 					status.CorruptRecords++
-					if !c.standalone {
+					if !c.standalone && !strings.HasPrefix(message.Key, "cursus.consumer.offset-reservations.") {
 						continue
 					}
 					return status, fmt.Errorf("decode internal metadata partition=%d offset=%d: %w", partition, message.Offset, decodeErr)
 				}
+				if strings.HasPrefix(message.Key, "cursus.consumer.offset-reservations.") && (!versioned || record.Type != ConsumerMetadataRecordOffsetReservations) {
+					status.CorruptRecords++
+					return status, fmt.Errorf("invalid reservation record type partition=%d offset=%d", partition, message.Offset)
+				}
 				if versioned {
 					if message.Key != consumerMetadataRecordKey(record) {
 						status.CorruptRecords++
-						if !c.standalone {
+						if !c.standalone && record.Type != ConsumerMetadataRecordOffsetReservations && !strings.HasPrefix(message.Key, "cursus.consumer.offset-reservations.") {
 							continue
 						}
 						return status, fmt.Errorf("internal metadata key mismatch partition=%d offset=%d", partition, message.Offset)
@@ -811,6 +844,11 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 
 	status.Phase = "group_registration_replay"
 	groups, groupEpochs, orphanCount, err := materializeConsumerMetadata(candidates.lifecycles, candidates.lifecycleSnapshots, candidates.offsetSnapshots, legacy, legacyRecordCounts, &status)
+	if err == nil {
+		var reservationOrphans int
+		reservationOrphans, err = restoreOffsetReservations(groups, candidates.reservationSnapshots)
+		orphanCount += reservationOrphans
+	}
 	status.OrphanRecords += orphanCount
 	if err != nil {
 		status.CorruptRecords++
@@ -831,6 +869,11 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 		// offsets partition. Preserve only strictly newer acknowledged revisions
 		// from the still-installed map before replacing it with the replay result.
 		if existing.RegistrationEpoch == recovered.RegistrationEpoch {
+			if existing.ReservationRevision > recovered.ReservationRevision {
+				recovered.OffsetReservations = cloneOffsetReservations(existing.OffsetReservations)
+				recovered.ReservationRevision = existing.ReservationRevision
+				recovered.ReservationDecisions = cloneReservationDecisions(existing.ReservationDecisions)
+			}
 			for topicName, revision := range existing.OffsetRevisions {
 				if revision <= recovered.OffsetRevisions[topicName] {
 					continue

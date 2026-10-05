@@ -10,10 +10,61 @@
 {{- if not .Values.internalTLS.secretName }}
 {{- fail "internalTLS.secretName must name a pre-created Secret containing tls.crt, tls.key, and ca.crt" }}
 {{- end }}
+{{- if not (kindIs "bool" .Values.clientSecurity.allowInsecure) }}
+{{- fail "clientSecurity.allowInsecure must be a boolean" }}
+{{- end }}
+{{- if not (kindIs "bool" .Values.networkPolicy.enabled) }}
+{{- fail "networkPolicy.enabled must be a boolean" }}
+{{- end }}
+{{- if and (not .Values.clientSecurity.allowInsecure) (not .Values.clientSecurity.tls.secretName) }}
+{{- fail "clientSecurity.tls.secretName must name a pre-created Secret containing tls.crt and tls.key" }}
+{{- end }}
+{{- if and (not .Values.clientSecurity.allowInsecure) (not .Values.clientSecurity.sasl.secretName) }}
+{{- fail "clientSecurity.sasl.secretName must name a pre-created Secret containing the configured users key" }}
+{{- end }}
+{{- if and .Values.clientSecurity.sasl.secretName (not (.Values.clientSecurity.sasl.secretKey | toString | trim)) }}
+{{- fail "clientSecurity.sasl.secretKey must identify the SASL_USERS entry in the client auth Secret" }}
+{{- end }}
+{{- if not (.Values.cluster.internalAuthGeneration | toString | trim) }}
+{{- fail "cluster.internalAuthGeneration must identify the active non-secret credential generation" }}
+{{- end }}
+{{- if not (regexMatch "^[0-9a-fA-F]{40}$" (.Values.image.revision | toString)) }}
+{{- fail "image.revision must be the 40-character source commit embedded in the broker image" }}
+{{- end }}
+{{- if .Values.image.digest }}
+{{- if not (regexMatch "^sha256:[0-9a-fA-F]{64}$" (.Values.image.digest | toString)) }}
+{{- fail "image.digest must be a sha256 OCI image digest" }}
+{{- end }}
+{{- else if not .Values.image.allowMutableTag }}
+{{- fail "image.digest is required for production; mutable image tags require image.allowMutableTag=true for source-built validation only" }}
+{{- else if not (.Values.image.tag | toString | trim) }}
+{{- fail "image.tag is required when image.allowMutableTag=true" }}
+{{- end }}
+{{- if ne (.Values.compatibility.wireProtocol | toString) "2" }}
+{{- fail "compatibility.wireProtocol must remain 2 for this chart" }}
+{{- end }}
+{{- if ne (.Values.compatibility.brokerProtocol | toString) "4" }}
+{{- fail "compatibility.brokerProtocol must remain 4 for this chart" }}
+{{- end }}
+{{- if ne (.Values.compatibility.snapshotFormat | toString) "10" }}
+{{- fail "compatibility.snapshotFormat must remain 10 for this chart" }}
+{{- end }}
+{{- if ne (.Values.compatibility.recordFormat | toString) "CDM4" }}
+{{- fail "compatibility.recordFormat must remain CDM4 for this chart" }}
+{{- end }}
+{{- $statefulSetName := include "cursus-cluster.fullname" . }}
+{{- with (lookup "apps/v1" "StatefulSet" .Release.Namespace $statefulSetName) }}
+{{- $claim := index .spec.volumeClaimTemplates 0 }}
+{{- $installedSize := index $claim.spec.resources.requests "storage" | toString }}
+{{- $requestedSize := $.Values.persistence.size | toString }}
+{{- if ne $installedSize $requestedSize }}
+{{- fail (printf "persistence.size is install-only during a normal Helm upgrade (installed=%s requested=%s); run scripts/expand-helm-cluster-storage.sh before upgrading other release settings" $installedSize $requestedSize) }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "cursus-cluster.fullname" . }}
+  name: {{ $statefulSetName }}
   labels:
     {{- include "cursus-cluster.labels" . | nindent 4 }}
 spec:
@@ -31,13 +82,33 @@ spec:
     metadata:
       labels:
         {{- include "cursus-cluster.selectorLabels" . | nindent 8 }}
+      annotations:
+        cursus.io/internal-credential-generation: {{ .Values.cluster.internalAuthGeneration | quote }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        - name: verify-image-contract
+          image: {{ include "cursus-cluster.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/app/broker", "--verify-deployment-contract"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: EXPECTED_IMAGE_REVISION
+              value: {{ .Values.image.revision | quote }}
+            - name: EXPECTED_WIRE_PROTOCOL
+              value: {{ .Values.compatibility.wireProtocol | quote }}
+            - name: EXPECTED_BROKER_PROTOCOL
+              value: {{ .Values.compatibility.brokerProtocol | quote }}
+            - name: EXPECTED_SNAPSHOT_FORMAT
+              value: {{ .Values.compatibility.snapshotFormat | quote }}
+            - name: EXPECTED_RECORD_FORMAT
+              value: {{ .Values.compatibility.recordFormat | quote }}
       containers:
         - name: broker
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "cursus-cluster.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/bin/sh", "-ec"]
           args:
@@ -75,6 +146,10 @@ spec:
               value: "$(POD_NAME).{{ include "cursus-cluster.headlessService" . }}.$(POD_NAMESPACE).svc.cluster.local"
             - name: BROKER_PORT
               value: {{ .Values.service.brokerPort | quote }}
+            - name: HEALTH_CHECK_PORT
+              value: {{ .Values.service.healthPort | quote }}
+            - name: EXPORTER_PORT
+              value: {{ .Values.service.metricsPort | quote }}
             - name: ADVERTISED_CLIENT_HOST
               value: "$(POD_NAME).{{ include "cursus-cluster.headlessService" . }}.$(POD_NAMESPACE).svc.cluster.local"
             - name: ENABLE_DISTRIBUTION
@@ -84,6 +159,14 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.cluster.internalAuthSecret }}
                   key: {{ .Values.cluster.internalAuthSecretKey }}
+            - name: INTERNAL_AUTH_TOKEN_NEXT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.cluster.internalAuthSecret }}
+                  key: {{ .Values.cluster.internalAuthNextSecretKey }}
+                  optional: true
+            - name: INTERNAL_AUTH_GENERATION
+              value: {{ .Values.cluster.internalAuthGeneration | quote }}
             - name: INTERNAL_BROKER_PORT
               value: "{{ .Values.service.internalPort }}"
             - name: RAFT_PORT
@@ -96,12 +179,49 @@ spec:
               value: "{{ .Values.cluster.minInSyncReplicas }}"
             - name: DEFAULT_REPLICATION_FACTOR
               value: "{{ .Values.cluster.defaultReplicationFactor }}"
+            - name: MAX_TOPICS
+              value: {{ .Values.limits.maxTopics | quote }}
+            - name: MAX_PARTITIONS_PER_TOPIC
+              value: {{ .Values.limits.maxPartitionsPerTopic | quote }}
+            - name: MAX_PARTITIONS
+              value: {{ .Values.limits.maxPartitions | quote }}
+            - name: MAX_TRANSACTIONS
+              value: {{ .Values.limits.maxTransactions | quote }}
+            - name: MAX_TRANSACTION_RECORDS
+              value: {{ .Values.limits.maxTransactionRecords | quote }}
+            - name: MAX_TRANSACTION_BYTES
+              value: {{ int64 .Values.limits.maxTransactionBytes | quote }}
+            - name: MAX_TRANSACTION_OFFSETS
+              value: {{ .Values.limits.maxTransactionOffsets | quote }}
+            - name: MAX_INFLIGHT_REQUESTS
+              value: {{ .Values.limits.maxInflightRequests | quote }}
+            - name: MAX_INFLIGHT_REQUEST_BYTES
+              value: {{ int64 .Values.limits.maxInflightRequestBytes | quote }}
             - name: TRANSACTION_COORDINATOR_SHARDS
               value: "{{ .Values.cluster.transactionCoordinatorShards }}"
             - name: LOG_DIR
               value: /data/logs
+            - name: DISK_MIN_FREE_BYTES
+              value: {{ int64 .Values.storage.minFreeBytes | quote }}
+            - name: DISK_MIN_FREE_PERCENT
+              value: {{ .Values.storage.minFreePercent | quote }}
             - name: USE_TLS
-              value: "false"
+              value: {{ ternary "true" "false" (not (empty .Values.clientSecurity.tls.secretName)) | quote }}
+            {{- if .Values.clientSecurity.tls.secretName }}
+            - name: TLS_CERT_PATH
+              value: /app/client-tls/tls.crt
+            - name: TLS_KEY_PATH
+              value: /app/client-tls/tls.key
+            {{- end }}
+            - name: ENABLE_SASL
+              value: {{ ternary "true" "false" (not (empty .Values.clientSecurity.sasl.secretName)) | quote }}
+            {{- if .Values.clientSecurity.sasl.secretName }}
+            - name: SASL_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.clientSecurity.sasl.secretName }}
+                  key: {{ .Values.clientSecurity.sasl.secretKey }}
+            {{- end }}
             - name: INTERNAL_USE_TLS
               value: "true"
             - name: INTERNAL_TLS_CERT_PATH
@@ -114,7 +234,7 @@ spec:
               value: {{ .Values.internalTLS.serverName | quote }}
           startupProbe:
             httpGet:
-              path: /ready
+              path: /live
               port: health
             periodSeconds: 2
             timeoutSeconds: 2
@@ -138,6 +258,11 @@ spec:
             - name: internal-tls
               mountPath: /app/internal-tls
               readOnly: true
+            {{- if .Values.clientSecurity.tls.secretName }}
+            - name: client-tls
+              mountPath: /app/client-tls
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
@@ -151,6 +276,16 @@ spec:
                 path: tls.key
               - key: ca.crt
                 path: ca.crt
+        {{- if .Values.clientSecurity.tls.secretName }}
+        - name: client-tls
+          secret:
+            secretName: {{ .Values.clientSecurity.tls.secretName }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        {{- end }}
       {{- with .Values.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}

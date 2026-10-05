@@ -92,6 +92,14 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		}
 		request.NextOffset = nextOffset
 	}
+	if request.SnapshotCatchup {
+		if cc.snapshotCatchup == nil {
+			return fmt.Errorf("event snapshot catch-up is unavailable")
+		}
+		if err := cc.snapshotCatchup(ctx, request); err != nil {
+			return fmt.Errorf("event snapshot catch-up: %w", err)
+		}
+	}
 	return nil
 }
 

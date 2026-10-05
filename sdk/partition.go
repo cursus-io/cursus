@@ -108,27 +108,25 @@ func (pc *PartitionConsumer) runWorker() {
 
 		// Deliver messages to user handler.
 		handler := pc.consumer.MessageHandler
-		processingFailed := false
-		if handler != nil {
-			for _, msg := range batch.messages {
-				if err := handler(msg); err != nil {
-					LogError("Partition [%d] handler error at offset %d: %v", pc.partitionID, msg.Offset, err)
-					processingFailed = true
-					break
-				}
-			}
-		}
-		if processingFailed {
-			pc.consumer.mu.RLock()
-			committed := pc.consumer.offsets[pc.partitionID]
-			pc.consumer.mu.RUnlock()
-			atomic.StoreUint64(&pc.fetchOffset, committed)
-			pc.closeConnection()
+		if handler == nil {
+			LogError("Partition [%d] cannot process records without a message handler", pc.partitionID)
+			pc.rollbackFetchOffset()
 			select {
 			case pc.consumer.rebalanceSig <- struct{}{}:
 			default:
 			}
+			pc.consumer.fail(ErrConsumerHandlerRequired)
 			return
+		}
+		for _, msg := range batch.messages {
+			if err := pc.deliverWithRetry(handler, msg); err != nil {
+				pc.rollbackFetchOffset()
+				pc.closeConnection()
+				if pc.workerContext().Err() == nil {
+					pc.consumer.fail(err)
+				}
+				return
+			}
 		}
 
 		if !pc.assignmentActive() || pc.workerContext().Err() != nil {
@@ -145,20 +143,43 @@ func (pc *PartitionConsumer) runWorker() {
 		if !pc.consumer.config.EnableAutoCommit {
 			continue
 		}
+		pc.consumer.recordAutoCommitOffset(pc.partitionID, commitOffset, pc.assignmentToken())
+	}
+}
 
-		if err := pc.commitOffsetWithRetry(commitOffset); err != nil {
-			LogError("Partition [%d] failed to commit offset %d: %v", pc.partitionID, commitOffset, err)
-		} else {
-			if !pc.assignmentActive() {
-				continue
+func (pc *PartitionConsumer) deliverWithRetry(handler func(Message) error, msg Message) error {
+	maxRetries := pc.consumer.config.HandlerMaxRetries
+	backoff := newBackoff(pc.consumer.config.HandlerRetryBackoff, pc.consumer.config.HandlerRetryMaxBackoff)
+	totalAttempts := maxRetries + 1
+	for attempt := 1; attempt <= totalAttempts; attempt++ {
+		err := handler(msg)
+		if err == nil {
+			return nil
+		}
+		if attempt == totalAttempts {
+			return &ConsumerHandlerError{Partition: pc.partitionID, Offset: msg.Offset, Attempts: attempt, Cause: err}
+		}
+
+		delay := backoff.duration()
+		if maxDelay := pc.consumer.config.HandlerRetryMaxBackoff; maxDelay > 0 && delay > maxDelay {
+			delay = maxDelay
+		}
+		LogWarn("Partition [%d] handler error at offset %d (attempt %d/%d): %v; retrying in %v", pc.partitionID, msg.Offset, attempt, totalAttempts, err, delay)
+		if !pc.waitDuration(delay) {
+			if err := pc.workerContext().Err(); err != nil {
+				return err
 			}
-			atomic.StoreUint64(&pc.commitOffset, commitOffset)
-
-			pc.consumer.mu.Lock()
-			pc.consumer.offsets[pc.partitionID] = commitOffset
-			pc.consumer.mu.Unlock()
+			return context.Canceled
 		}
 	}
+	return nil
+}
+
+func (pc *PartitionConsumer) rollbackFetchOffset() {
+	pc.consumer.mu.RLock()
+	committed := pc.consumer.offsets[pc.partitionID]
+	pc.consumer.mu.RUnlock()
+	atomic.StoreUint64(&pc.fetchOffset, committed)
 }
 
 // pollAndProcess sends one CONSUME command and pushes the resulting batch to dataCh.
@@ -648,8 +669,13 @@ func (pc *PartitionConsumer) handleOffsetOutOfRange(frame offsetOutOfRangeFrame)
 		next = frame.Latest
 	case AutoOffsetResetError:
 		LogError("Partition [%d] offset out of range requested=%d earliest=%d latest=%d", pc.partitionID, frame.Requested, frame.Earliest, frame.Latest)
-		pc.consumer.cancelAssignment()
 		pc.closeConnection()
+		pc.consumer.fail(&ConsumerOffsetOutOfRangeError{
+			Partition: pc.partitionID,
+			Requested: frame.Requested,
+			Earliest:  frame.Earliest,
+			Latest:    frame.Latest,
+		})
 		return true
 	default:
 		LogWarn("Partition [%d] unknown auto_offset_reset=%q, defaulting to earliest", pc.partitionID, policy)

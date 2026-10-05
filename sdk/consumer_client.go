@@ -39,14 +39,11 @@ func NewConsumerClient(cfg *ConsumerConfig) (*ConsumerClient, error) {
 	c.leader.Store(&consumerLeaderInfo{addr: "", updated: time.Time{}})
 
 	if cfg.UseTLS {
-		cert, err := tls.LoadX509KeyPair(cfg.TLSCertPath, cfg.TLSKeyPath)
+		tlsConfig, err := buildClientTLSConfig(cfg.TLSCAPath, cfg.TLSServerName, cfg.TLSCertPath, cfg.TLSKeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("load TLS cert: %w", err)
+			return nil, err
 		}
-		c.tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
+		c.tlsConfig = tlsConfig
 	}
 
 	return c, nil
@@ -66,11 +63,15 @@ func (c *ConsumerClient) UpdateLeader(addr string) {
 
 // Connect opens a TCP (or TLS) connection to addr with socket tuning applied.
 func (c *ConsumerClient) Connect(addr string) (net.Conn, error) {
+	return c.ConnectContext(context.Background(), addr)
+}
+
+func (c *ConsumerClient) ConnectContext(ctx context.Context, addr string) (net.Conn, error) {
 	if c.config.UseTLS && c.tlsConfig == nil {
-		return nil, fmt.Errorf("TLS enabled but certificate not loaded")
+		return nil, fmt.Errorf("TLS enabled but configuration not loaded")
 	}
 	return dialAuthenticatedWireConnection(
-		context.Background(), addr, 5*time.Second,
+		ctx, addr, 5*time.Second,
 		c.config.HandshakeTimeoutMS, c.config.CompressionType, c.tlsConfig,
 		c.config.Principal, c.config.AuthToken,
 	)
@@ -83,6 +84,10 @@ func (c *ConsumerClient) ConnectToAddr(addr string) (net.Conn, error) {
 
 // ConnectWithFailover tries the cached leader first, then each broker in order.
 func (c *ConsumerClient) ConnectWithFailover() (net.Conn, string, error) {
+	return c.ConnectWithFailoverContext(context.Background())
+}
+
+func (c *ConsumerClient) ConnectWithFailoverContext(ctx context.Context) (net.Conn, string, error) {
 	addrs := c.config.BrokerAddrs
 	if len(addrs) == 0 {
 		return nil, "", fmt.Errorf("no broker addresses configured")
@@ -98,7 +103,7 @@ func (c *ConsumerClient) ConnectWithFailover() (net.Conn, string, error) {
 	}
 
 	if leaderAddr != "" {
-		conn, err := c.Connect(leaderAddr)
+		conn, err := c.ConnectContext(ctx, leaderAddr)
 		if err == nil {
 			return conn, leaderAddr, nil
 		}
@@ -107,10 +112,13 @@ func (c *ConsumerClient) ConnectWithFailover() (net.Conn, string, error) {
 
 	var lastErr error
 	for _, addr := range addrs {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
 		if addr == leaderAddr {
 			continue
 		}
-		conn, err := c.Connect(addr)
+		conn, err := c.ConnectContext(ctx, addr)
 		if err == nil {
 			c.UpdateLeader(addr)
 			return conn, addr, nil
@@ -126,6 +134,10 @@ func (c *ConsumerClient) ConnectWithFailover() (net.Conn, string, error) {
 
 // ListOffsets queries the broker for retained and readable offsets on a topic.
 func (c *ConsumerClient) ListOffsets(topic string, partition ...int) ([]PartitionOffsetRange, error) {
+	return c.ListOffsetsContext(context.Background(), topic, partition...)
+}
+
+func (c *ConsumerClient) ListOffsetsContext(ctx context.Context, topic string, partition ...int) ([]PartitionOffsetRange, error) {
 	if err := validateSDKTopicName(topic); err != nil {
 		return nil, err
 	}
@@ -133,11 +145,18 @@ func (c *ConsumerClient) ListOffsets(topic string, partition ...int) ([]Partitio
 		return nil, fmt.Errorf("at most one partition can be requested")
 	}
 
-	conn, _, err := c.ConnectWithFailover()
+	requestCtx, cancel := boundedRequestContext(ctx, time.Duration(c.config.RequestTimeoutMS)*time.Millisecond)
+	defer cancel()
+	conn, _, err := c.ConnectWithFailoverContext(requestCtx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 
 	cmd := fmt.Sprintf("LIST_OFFSETS topic=%s", topic)
 	if len(partition) == 1 {

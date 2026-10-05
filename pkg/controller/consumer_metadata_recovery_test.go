@@ -26,15 +26,12 @@ func TestDistributedRecoveryExcludesUncommittedMetadataTail(t *testing.T) {
 	cfg.LogDir = t.TempDir()
 	diskManager := disk.NewDiskManager(cfg)
 	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
-	c, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, topicManager)
+	c, err := coordinator.NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, topicManager)
 	require.NoError(t, err)
+	require.ErrorContains(t, c.RecoveryReadinessError(), "awaiting_cluster_recovery")
 	t.Cleanup(c.Stop)
 	t.Cleanup(func() {
-		for _, name := range topicManager.ListTopics() {
-			for _, partition := range topicManager.GetTopic(name).Partitions {
-				partition.Close()
-			}
-		}
+		topicManager.Stop()
 		diskManager.CloseAllHandlers()
 	})
 
@@ -47,7 +44,12 @@ func TestDistributedRecoveryExcludesUncommittedMetadataTail(t *testing.T) {
 		Group: "workers", Topic: "orders", Epoch: 1, Revision: 1,
 		Offsets: []coordinator.OffsetItem{{Partition: 0, Offset: 10}}, Timestamp: time.Unix(2, 0),
 	}
-	partition, err := topicManager.GetTopic(config.ConsumerOffsetsTopicName).GetPartition(0)
+	offsetsTopic := topicManager.GetTopic(config.ConsumerOffsetsTopicName)
+	require.NotNil(t, offsetsTopic)
+	for _, internalPartition := range offsetsTopic.Partitions {
+		internalPartition.SetHWM(0)
+	}
+	partition, err := offsetsTopic.GetPartition(0)
 	require.NoError(t, err)
 	require.NoError(t, partition.ReplicaAppend([]types.Message{
 		consumerMetadataMessage(t, registration, 0),

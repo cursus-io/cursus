@@ -1,6 +1,7 @@
 package transaction
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"maps"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
@@ -97,52 +99,57 @@ type RequestAssignment struct {
 }
 
 type Transaction struct {
-	ID                  string
-	Mode                Mode
-	Producer            string
-	Epoch               int64
-	CoordinatorEpoch    int64
-	Revision            uint64
-	Ready               bool
-	Expired             bool
-	OffsetsMaterialized bool
-	State               State
-	Messages            []MessageOperation
-	Streams             []StreamOperation
-	Offsets             []OffsetOperation
-	Participants        []Participant
-	SequenceByPartition map[string]uint64
-	RequestAssignments  map[string]RequestAssignment
-	Deadline            time.Time
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                        string
+	Mode                      Mode
+	Producer                  string
+	Epoch                     int64
+	CoordinatorEpoch          int64
+	Revision                  uint64
+	Ready                     bool
+	Expired                   bool
+	OffsetsMaterialized       bool
+	OffsetReservationsPending bool
+	State                     State
+	Messages                  []MessageOperation
+	Streams                   []StreamOperation
+	Offsets                   []OffsetOperation
+	Participants              []Participant
+	SequenceByPartition       map[string]uint64
+	RequestAssignments        map[string]RequestAssignment
+	Deadline                  time.Time
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
 }
 
 type Snapshot struct {
-	ID                  string                       `json:"id"`
-	Mode                Mode                         `json:"mode,omitempty"`
-	Producer            string                       `json:"producer"`
-	Epoch               int64                        `json:"epoch"`
-	CoordinatorEpoch    int64                        `json:"coordinator_epoch,omitempty"`
-	Revision            uint64                       `json:"revision,omitempty"`
-	Ready               bool                         `json:"ready,omitempty"`
-	Expired             bool                         `json:"expired,omitempty"`
-	OffsetsMaterialized bool                         `json:"offsets_materialized,omitempty"`
-	State               State                        `json:"state"`
-	Messages            []MessageOperation           `json:"messages,omitempty"`
-	Streams             []StreamOperation            `json:"streams,omitempty"`
-	Offsets             []OffsetOperation            `json:"offsets,omitempty"`
-	Participants        []Participant                `json:"participants,omitempty"`
-	SequenceByPartition map[string]uint64            `json:"sequence_by_partition,omitempty"`
-	RequestAssignments  map[string]RequestAssignment `json:"request_assignments,omitempty"`
-	Deadline            time.Time                    `json:"deadline,omitempty"`
-	CreatedAt           time.Time                    `json:"created_at"`
-	UpdatedAt           time.Time                    `json:"updated_at"`
+	ID                        string                       `json:"id"`
+	Mode                      Mode                         `json:"mode,omitempty"`
+	Producer                  string                       `json:"producer"`
+	Epoch                     int64                        `json:"epoch"`
+	CoordinatorEpoch          int64                        `json:"coordinator_epoch,omitempty"`
+	Revision                  uint64                       `json:"revision,omitempty"`
+	Ready                     bool                         `json:"ready,omitempty"`
+	Expired                   bool                         `json:"expired,omitempty"`
+	OffsetsMaterialized       bool                         `json:"offsets_materialized,omitempty"`
+	OffsetReservationsPending bool                         `json:"offset_reservations_pending,omitempty"`
+	State                     State                        `json:"state"`
+	Messages                  []MessageOperation           `json:"messages,omitempty"`
+	Streams                   []StreamOperation            `json:"streams,omitempty"`
+	Offsets                   []OffsetOperation            `json:"offsets,omitempty"`
+	Participants              []Participant                `json:"participants,omitempty"`
+	SequenceByPartition       map[string]uint64            `json:"sequence_by_partition,omitempty"`
+	RequestAssignments        map[string]RequestAssignment `json:"request_assignments,omitempty"`
+	Deadline                  time.Time                    `json:"deadline,omitempty"`
+	CreatedAt                 time.Time                    `json:"created_at"`
+	UpdatedAt                 time.Time                    `json:"updated_at"`
 }
 
 type Manager struct {
+	nextProducerEpoch   atomic.Uint64
+	transactionCount    atomic.Int64
 	shards              []managerShard
 	expiration          time.Duration
+	limits              Limits
 	reservationMu       sync.Mutex
 	streamReservations  map[streamReservationKey]string
 	streamLocks         sync.Map // map[streamReservationKey]*sync.Mutex
@@ -230,17 +237,39 @@ func NewManagerWithExpiration(expiration time.Duration) *Manager {
 }
 
 func NewManagerWithExpirationAndShards(expiration time.Duration, shardCount int) *Manager {
+	return NewManagerWithLimits(expiration, shardCount, DefaultLimits())
+}
+
+func NewManagerWithLimits(expiration time.Duration, shardCount int, limits Limits) *Manager {
 	if expiration <= 0 {
 		expiration = 7 * 24 * time.Hour
 	}
 	if shardCount <= 0 {
 		shardCount = DefaultCoordinatorShardCount
 	}
-	m := &Manager{shards: make([]managerShard, shardCount), expiration: expiration, streamReservations: make(map[streamReservationKey]string), committedOffsets: make(map[committedOffsetKey]uint64)}
+	m := &Manager{shards: make([]managerShard, shardCount), expiration: expiration, limits: normalizeLimits(limits), streamReservations: make(map[streamReservationKey]string), committedOffsets: make(map[committedOffsetKey]uint64)}
 	for i := range m.shards {
 		m.shards[i] = newManagerShard(expiration)
 	}
 	return m
+}
+
+func (m *Manager) reserveTransactionSlot() error {
+	for {
+		current := m.transactionCount.Load()
+		if current >= int64(m.limits.MaxTransactions) {
+			return fmt.Errorf("transaction capacity exceeded: transactions=%d max_transactions=%d", current, m.limits.MaxTransactions)
+		}
+		if m.transactionCount.CompareAndSwap(current, current+1) {
+			return nil
+		}
+	}
+}
+
+func (m *Manager) releaseTransactionSlot() {
+	if m.transactionCount.Add(-1) < 0 {
+		m.transactionCount.Store(0)
+	}
 }
 
 func (m *Manager) PruneExpired(now time.Time) int {
@@ -256,6 +285,7 @@ func (m *Manager) PruneExpired(now time.Time) int {
 			tx := s.txns[id]
 			if tx == nil || tx.Expired {
 				s.remove(id)
+				m.releaseTransactionSlot()
 				removed++
 				continue
 			}
@@ -276,6 +306,12 @@ func expireTransactionLocked(tx *Transaction, cutoff, now time.Time) bool {
 		return false
 	}
 	if tx.State != StateCommitted && tx.State != StateAborted {
+		return false
+	}
+	if tx.OffsetReservationsPending {
+		return false
+	}
+	if tx.State == StateCommitted && tx.Mode == ModeProcessingV1 && len(tx.Offsets) > 0 && !tx.OffsetsMaterialized {
 		return false
 	}
 	tx.Messages = nil
@@ -306,18 +342,44 @@ func (m *Manager) InitProducerWithMode(id string, mode Mode) (string, int64, err
 	previous := s.txns[id]
 	expireTransactionLocked(previous, now.Add(-m.expiration), now)
 
-	producer := producerIDForTransactionalID(id)
-	epoch := int64(0)
+	producer := ""
 	revision := uint64(1)
 	if tx := previous; tx != nil {
+		if tx.OffsetReservationsPending {
+			return "", 0, fmt.Errorf("transaction %s offset reservations must be resolved before reinitializing producer", id)
+		}
+		if tx.Mode == ModeProcessingV1 && tx.State == StateOpen {
+			return "", 0, fmt.Errorf("transaction %s must be aborted before reinitializing producer", id)
+		}
+		if tx.Mode == ModeProcessingV1 && tx.State == StateCommitted && len(tx.Offsets) > 0 && !tx.OffsetsMaterialized {
+			return "", 0, fmt.Errorf("transaction %s offsets must be materialized before reinitializing producer", id)
+		}
 		if tx.State == StateCommitting || tx.State == StatePrepareCommit || tx.State == StatePrepareAbort {
 			return "", 0, fmt.Errorf("transaction %s is committing; retry END_TXN before reinitializing producer", id)
 		}
 		if tx.Producer != "" {
 			producer = tx.Producer
 		}
-		epoch = tx.Epoch + 1
 		revision = tx.Revision + 1
+	}
+	if producer == "" {
+		var err error
+		producer, err = newProducerID()
+		if err != nil {
+			return "", 0, err
+		}
+	}
+	if previous == nil {
+		if err := m.reserveTransactionSlot(); err != nil {
+			return "", 0, err
+		}
+	}
+	epoch, err := m.allocateProducerEpoch()
+	if err != nil {
+		if previous == nil {
+			m.releaseTransactionSlot()
+		}
+		return "", 0, err
 	}
 
 	s.put(&Transaction{
@@ -448,6 +510,12 @@ func (m *Manager) AddParticipant(id, producer string, epoch int64, participant P
 			return nil
 		}
 	}
+	if len(tx.Participants) >= m.limits.MaxRecords {
+		return fmt.Errorf("transaction capacity exceeded: participants=%d max_transaction_records=%d", len(tx.Participants)+1, m.limits.MaxRecords)
+	}
+	if transactionDynamicBytes(tx.Messages, tx.Streams, tx.Offsets, append(tx.Participants, participant), tx.RequestAssignments) > m.limits.MaxBytes {
+		return fmt.Errorf("transaction capacity exceeded: max_transaction_bytes=%d", m.limits.MaxBytes)
+	}
 	tx.Participants = append(tx.Participants, participant)
 	if tx.Deadline.IsZero() && !deadline.IsZero() {
 		tx.Deadline = deadline
@@ -469,6 +537,12 @@ func (m *Manager) AddMessage(id, producer string, epoch int64, op MessageOperati
 	}
 	if err := validateOwner(tx, producer, epoch); err != nil {
 		return err
+	}
+	if transactionRecordCount(len(tx.Messages)+1, len(tx.Streams), len(tx.RequestAssignments)) > m.limits.MaxRecords {
+		return fmt.Errorf("transaction capacity exceeded: records=%d max_transaction_records=%d", transactionRecordCount(len(tx.Messages)+1, len(tx.Streams), len(tx.RequestAssignments)), m.limits.MaxRecords)
+	}
+	if transactionDynamicBytes(append(tx.Messages, op), tx.Streams, tx.Offsets, tx.Participants, tx.RequestAssignments) > m.limits.MaxBytes {
+		return fmt.Errorf("transaction capacity exceeded: max_transaction_bytes=%d", m.limits.MaxBytes)
 	}
 	tx.Messages = append(tx.Messages, op)
 	tx.Revision++
@@ -527,15 +601,27 @@ func (m *Manager) ResolveRequestAssignment(id, producer string, epoch int64, top
 		}
 		return existing, true, nil
 	}
+	partitionKey := fmt.Sprintf("%s:%d", topic, partition)
+	nextSequence := tx.SequenceByPartition[partitionKey] + 1
+	assignment := RequestAssignment{Topic: topic, RequestedPartition: requestedPartition, ClientSequence: clientSequence, Partition: partition, Sequence: nextSequence, Fingerprint: fingerprint}
+	if transactionRecordCount(len(tx.Messages), len(tx.Streams), len(tx.RequestAssignments)+1) > m.limits.MaxRecords {
+		return RequestAssignment{}, false, fmt.Errorf("transaction capacity exceeded: records=%d max_transaction_records=%d", transactionRecordCount(len(tx.Messages), len(tx.Streams), len(tx.RequestAssignments)+1), m.limits.MaxRecords)
+	}
+	candidateAssignments := maps.Clone(tx.RequestAssignments)
+	if candidateAssignments == nil {
+		candidateAssignments = make(map[string]RequestAssignment, 1)
+	}
+	candidateAssignments[requestKey] = assignment
+	if transactionDynamicBytes(tx.Messages, tx.Streams, tx.Offsets, tx.Participants, candidateAssignments) > m.limits.MaxBytes {
+		return RequestAssignment{}, false, fmt.Errorf("transaction capacity exceeded: max_transaction_bytes=%d", m.limits.MaxBytes)
+	}
 	if tx.SequenceByPartition == nil {
 		tx.SequenceByPartition = make(map[string]uint64)
 	}
 	if tx.RequestAssignments == nil {
 		tx.RequestAssignments = make(map[string]RequestAssignment)
 	}
-	partitionKey := fmt.Sprintf("%s:%d", topic, partition)
-	tx.SequenceByPartition[partitionKey]++
-	assignment := RequestAssignment{Topic: topic, RequestedPartition: requestedPartition, ClientSequence: clientSequence, Partition: partition, Sequence: tx.SequenceByPartition[partitionKey], Fingerprint: fingerprint}
+	tx.SequenceByPartition[partitionKey] = nextSequence
 	tx.RequestAssignments[requestKey] = assignment
 	tx.Revision++
 	tx.UpdatedAt = time.Now()
@@ -575,6 +661,12 @@ func (m *Manager) AddStream(id, producer string, epoch int64, op StreamOperation
 			return nil
 		}
 		return fmt.Errorf("transaction %s already stages stream topic=%s key=%s", id, op.Topic, op.Key)
+	}
+	if transactionRecordCount(len(tx.Messages), len(tx.Streams)+1, len(tx.RequestAssignments)) > m.limits.MaxRecords {
+		return fmt.Errorf("transaction capacity exceeded: records=%d max_transaction_records=%d", transactionRecordCount(len(tx.Messages), len(tx.Streams)+1, len(tx.RequestAssignments)), m.limits.MaxRecords)
+	}
+	if transactionDynamicBytes(tx.Messages, append(tx.Streams, op), tx.Offsets, tx.Participants, tx.RequestAssignments) > m.limits.MaxBytes {
+		return fmt.Errorf("transaction capacity exceeded: max_transaction_bytes=%d", m.limits.MaxBytes)
 	}
 
 	reservation := streamReservationKey{topic: op.Topic, key: op.Key}
@@ -620,10 +712,11 @@ func (m *Manager) AddOffsets(id, producer string, epoch int64, offsets []OffsetO
 		}
 	}
 
+	candidateOffsets := append([]OffsetOperation(nil), tx.Offsets...)
 	for _, op := range offsets {
 		updated := false
-		for i := range tx.Offsets {
-			current := &tx.Offsets[i]
+		for i := range candidateOffsets {
+			current := &candidateOffsets[i]
 			if current.Topic != op.Topic || current.Group != op.Group || current.Partition != op.Partition {
 				continue
 			}
@@ -638,9 +731,15 @@ func (m *Manager) AddOffsets(id, producer string, epoch int64, offsets []OffsetO
 			break
 		}
 		if !updated {
-			tx.Offsets = append(tx.Offsets, op)
+			candidateOffsets = append(candidateOffsets, op)
 		}
 	}
+	candidate := *tx
+	candidate.Offsets = candidateOffsets
+	if err := m.validateTransactionLimits(&candidate); err != nil {
+		return err
+	}
+	tx.Offsets = candidateOffsets
 	tx.Revision++
 	tx.UpdatedAt = time.Now()
 	return nil
@@ -711,6 +810,9 @@ func (m *Manager) MarkOffsetsMaterialized(id string) error {
 	if tx == nil || tx.State != StateCommitted {
 		return fmt.Errorf("transaction %s is not committed", id)
 	}
+	if tx.OffsetReservationsPending {
+		return fmt.Errorf("transaction %s offset reservations must be resolved before materialization checkpoint", id)
+	}
 	if tx.OffsetsMaterialized {
 		return nil
 	}
@@ -766,6 +868,9 @@ func (m *Manager) Abort(id, producer string, epoch int64) error {
 	}
 	if tx.State == StateAborted {
 		return nil
+	}
+	if tx.OffsetReservationsPending {
+		return fmt.Errorf("transaction %s requires a durable abort decision and reservation cleanup", id)
 	}
 	if tx.State == StateCommitting || tx.State == StatePrepareCommit || tx.State == StatePrepareAbort {
 		return fmt.Errorf("transaction %s cannot be aborted from state %s", id, tx.State)
@@ -951,6 +1056,14 @@ func (m *Manager) ImportState(state map[string]*Snapshot) error {
 	if err := ValidateImportState(state); err != nil {
 		return err
 	}
+	if len(state) > m.limits.MaxTransactions {
+		return fmt.Errorf("transaction capacity exceeded: transactions=%d max_transactions=%d", len(state), m.limits.MaxTransactions)
+	}
+	for id, snap := range state {
+		if err := m.validateSnapshotLimits(snap); err != nil {
+			return fmt.Errorf("transaction snapshot %q: %w", id, err)
+		}
+	}
 	m.lockAllShards()
 	defer m.unlockAllShards()
 	m.replaceStateLocked(state)
@@ -976,6 +1089,7 @@ func (m *Manager) replaceStateLocked(state map[string]*Snapshot) {
 			continue
 		}
 		tx := transactionFromSnapshot(snap)
+		m.observeProducerEpoch(snap.Epoch)
 		m.shards[CoordinatorShardForCount(id, len(m.shards))].put(tx)
 		m.reserveStreamsLocked(tx)
 		if tx.State == StateCommitted {
@@ -990,6 +1104,7 @@ func (m *Manager) replaceStateLocked(state map[string]*Snapshot) {
 	m.committedOffsetMu.Lock()
 	m.committedOffsets = committed
 	m.committedOffsetMu.Unlock()
+	m.transactionCount.Store(int64(len(state)))
 }
 
 func (m *Manager) ApplySnapshot(snap *Snapshot) {
@@ -1001,8 +1116,11 @@ func (m *Manager) ApplySnapshot(snap *Snapshot) {
 	defer s.mu.Unlock()
 	if current := s.txns[snap.ID]; current != nil {
 		m.releaseStreamReservationsLocked(current)
+	} else {
+		m.transactionCount.Add(1)
 	}
 	tx := transactionFromSnapshot(snap)
+	m.observeProducerEpoch(snap.Epoch)
 	s.put(tx)
 	m.reserveStreamsLocked(tx)
 	if snap.State == StateCommitted {
@@ -1014,16 +1132,25 @@ func (m *Manager) ApplyReplicatedSnapshot(snap *Snapshot) error {
 	if err := validateSnapshot(snap); err != nil {
 		return err
 	}
+	if err := m.validateSnapshotLimits(snap); err != nil {
+		return err
+	}
 	s := m.shardForID(snap.ID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	current, ok := s.txns[snap.ID]
 	if !ok || snapshotIsNewer(current, snap) {
+		if !ok {
+			if err := m.reserveTransactionSlot(); err != nil {
+				return err
+			}
+		}
 		if current != nil {
 			m.releaseStreamReservationsLocked(current)
 		}
 		tx := transactionFromSnapshot(snap)
+		m.observeProducerEpoch(snap.Epoch)
 		s.put(tx)
 		m.reserveStreamsLocked(tx)
 		if snap.State == StateCommitted {
@@ -1077,6 +1204,7 @@ func committedSnapshotSucceeds(current *Transaction, incoming *Snapshot) bool {
 		current.Ready == incoming.Ready &&
 		current.Expired == incoming.Expired &&
 		current.OffsetsMaterialized == incoming.OffsetsMaterialized &&
+		current.OffsetReservationsPending == incoming.OffsetReservationsPending &&
 		current.CreatedAt.Equal(incoming.CreatedAt) &&
 		reflect.DeepEqual(current.Messages, incoming.Messages) &&
 		reflect.DeepEqual(current.Streams, incoming.Streams) &&
@@ -1122,6 +1250,9 @@ func validateSnapshot(snap *Snapshot) error {
 	if snap.Revision == 0 {
 		return fmt.Errorf("transaction snapshot is missing revision; clean bootstrap required")
 	}
+	if snap.OffsetReservationsPending && (snap.Mode != ModeProcessingV1 || len(snap.Offsets) == 0 || snap.Expired || snap.Ready || snap.OffsetsMaterialized) {
+		return fmt.Errorf("invalid pending offset reservation snapshot")
+	}
 	switch snap.State {
 	case StateOpen, StateCommitting, StatePrepareCommit, StatePrepareAbort, StateCommitted, StateAborted:
 	default:
@@ -1143,6 +1274,7 @@ func snapshotsEqual(current *Transaction, incoming *Snapshot) bool {
 		current.Ready == incoming.Ready &&
 		current.Expired == incoming.Expired &&
 		current.OffsetsMaterialized == incoming.OffsetsMaterialized &&
+		current.OffsetReservationsPending == incoming.OffsetReservationsPending &&
 		current.State == incoming.State &&
 		current.CreatedAt.Equal(incoming.CreatedAt) &&
 		current.UpdatedAt.Equal(incoming.UpdatedAt) &&
@@ -1159,6 +1291,7 @@ func (m *Manager) Delete(id string) {
 	defer s.mu.Unlock()
 	if tx := s.txns[id]; tx != nil {
 		m.releaseStreamReservationsLocked(tx)
+		m.releaseTransactionSlot()
 	}
 	s.remove(id)
 }
@@ -1170,6 +1303,9 @@ func activeLocked(s *managerShard, id string) (*Transaction, error) {
 	}
 	if tx.State != StateOpen {
 		return nil, fmt.Errorf("transaction %s is %s", id, tx.State)
+	}
+	if tx.OffsetReservationsPending {
+		return nil, fmt.Errorf("transaction %s is frozen for offset reservation", id)
 	}
 	return tx, nil
 }
@@ -1207,49 +1343,51 @@ func snapshot(tx *Transaction) *Snapshot {
 		return nil
 	}
 	return &Snapshot{
-		ID:                  tx.ID,
-		Mode:                tx.Mode,
-		Producer:            tx.Producer,
-		Epoch:               tx.Epoch,
-		CoordinatorEpoch:    tx.CoordinatorEpoch,
-		Revision:            tx.Revision,
-		Ready:               tx.Ready,
-		Expired:             tx.Expired,
-		OffsetsMaterialized: tx.OffsetsMaterialized,
-		State:               tx.State,
-		Messages:            append([]MessageOperation(nil), tx.Messages...),
-		Streams:             append([]StreamOperation(nil), tx.Streams...),
-		Offsets:             append([]OffsetOperation(nil), tx.Offsets...),
-		Participants:        append([]Participant(nil), tx.Participants...),
-		SequenceByPartition: maps.Clone(tx.SequenceByPartition),
-		RequestAssignments:  maps.Clone(tx.RequestAssignments),
-		Deadline:            tx.Deadline,
-		CreatedAt:           tx.CreatedAt,
-		UpdatedAt:           tx.UpdatedAt,
+		ID:                        tx.ID,
+		Mode:                      tx.Mode,
+		Producer:                  tx.Producer,
+		Epoch:                     tx.Epoch,
+		CoordinatorEpoch:          tx.CoordinatorEpoch,
+		Revision:                  tx.Revision,
+		Ready:                     tx.Ready,
+		Expired:                   tx.Expired,
+		OffsetsMaterialized:       tx.OffsetsMaterialized,
+		OffsetReservationsPending: tx.OffsetReservationsPending,
+		State:                     tx.State,
+		Messages:                  append([]MessageOperation(nil), tx.Messages...),
+		Streams:                   append([]StreamOperation(nil), tx.Streams...),
+		Offsets:                   append([]OffsetOperation(nil), tx.Offsets...),
+		Participants:              append([]Participant(nil), tx.Participants...),
+		SequenceByPartition:       maps.Clone(tx.SequenceByPartition),
+		RequestAssignments:        maps.Clone(tx.RequestAssignments),
+		Deadline:                  tx.Deadline,
+		CreatedAt:                 tx.CreatedAt,
+		UpdatedAt:                 tx.UpdatedAt,
 	}
 }
 
 func transactionFromSnapshot(snap *Snapshot) *Transaction {
 	return &Transaction{
-		ID:                  snap.ID,
-		Mode:                normalizeMode(snap.Mode),
-		Producer:            snap.Producer,
-		Epoch:               snap.Epoch,
-		CoordinatorEpoch:    snap.CoordinatorEpoch,
-		Revision:            snap.Revision,
-		Ready:               snap.Ready,
-		Expired:             snap.Expired,
-		OffsetsMaterialized: snap.OffsetsMaterialized,
-		State:               snap.State,
-		Messages:            append([]MessageOperation(nil), snap.Messages...),
-		Streams:             append([]StreamOperation(nil), snap.Streams...),
-		Offsets:             append([]OffsetOperation(nil), snap.Offsets...),
-		Participants:        append([]Participant(nil), snap.Participants...),
-		SequenceByPartition: maps.Clone(snap.SequenceByPartition),
-		RequestAssignments:  maps.Clone(snap.RequestAssignments),
-		Deadline:            snap.Deadline,
-		CreatedAt:           snap.CreatedAt,
-		UpdatedAt:           snap.UpdatedAt,
+		ID:                        snap.ID,
+		Mode:                      normalizeMode(snap.Mode),
+		Producer:                  snap.Producer,
+		Epoch:                     snap.Epoch,
+		CoordinatorEpoch:          snap.CoordinatorEpoch,
+		Revision:                  snap.Revision,
+		Ready:                     snap.Ready,
+		Expired:                   snap.Expired,
+		OffsetsMaterialized:       snap.OffsetsMaterialized,
+		OffsetReservationsPending: snap.OffsetReservationsPending,
+		State:                     snap.State,
+		Messages:                  append([]MessageOperation(nil), snap.Messages...),
+		Streams:                   append([]StreamOperation(nil), snap.Streams...),
+		Offsets:                   append([]OffsetOperation(nil), snap.Offsets...),
+		Participants:              append([]Participant(nil), snap.Participants...),
+		SequenceByPartition:       maps.Clone(snap.SequenceByPartition),
+		RequestAssignments:        maps.Clone(snap.RequestAssignments),
+		Deadline:                  snap.Deadline,
+		CreatedAt:                 snap.CreatedAt,
+		UpdatedAt:                 snap.UpdatedAt,
 	}
 }
 
@@ -1260,7 +1398,10 @@ func normalizeMode(mode Mode) Mode {
 	return mode
 }
 
-func producerIDForTransactionalID(id string) string {
-	sum := sha256.Sum256([]byte(id))
-	return "txn-" + hex.EncodeToString(sum[:8])
+func newProducerID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", fmt.Errorf("generate producer id: %w", err)
+	}
+	return "txn-" + hex.EncodeToString(id[:]), nil
 }

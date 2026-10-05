@@ -3,6 +3,7 @@ package disk
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -183,6 +184,11 @@ func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error
 		serializedMsgs[i] = serialized
 		totalSize += 4 + len(serialized)
 	}
+	maxIndexEntries := (uint64(totalSize) / interval) + 1
+	requiredBytes := uint64(totalSize) + maxIndexEntries*uint64(types.IndexEntrySize)
+	if err := d.ensureWriteHeadroom(requiredBytes); err != nil {
+		return err
+	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -201,7 +207,6 @@ func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error
 	const entrySize = uint64(types.IndexEntrySize)
 	willExceedData := d.CurrentOffset+uint64(totalSize) > d.SegmentSize
 
-	maxIndexEntries := (uint64(totalSize) / interval) + 1
 	requiredIndexSpace := maxIndexEntries * entrySize
 	willExceedIndex := d.indexBytesWritten+requiredIndexSpace > d.IndexSize
 
@@ -338,6 +343,9 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	}
 
 	totalLen := uint64(4 + len(serialized))
+	if err := d.ensureWriteHeadroom(totalLen + uint64(types.IndexEntrySize)); err != nil {
+		return err
+	}
 	const entrySize = uint64(types.IndexEntrySize)
 	msgPosition := d.CurrentOffset
 
@@ -457,15 +465,16 @@ func (d *DiskHandler) rotateSegment(nextBaseOffset uint64) error {
 
 	if err := d.openSegment(); err != nil {
 		util.Error("Failed to open new segment: %v", err)
-		return err
+		return d.markWriteUnavailable(fmt.Errorf("open new segment: %w", err))
 	}
 	if err := d.openIndexFiles(); err != nil {
-		return err
+		return d.markWriteUnavailable(fmt.Errorf("open new segment index: %w", err))
 	}
-	if d.internalMetadata {
-		if err := syncDirectory(filepath.Dir(d.BaseName)); err != nil {
-			return fmt.Errorf("sync internal metadata segment rotation: %w", err)
-		}
+	// The new log and index names must be durable before a write to this segment
+	// can be acknowledged. A failure is terminal because retrying with the files
+	// already open could otherwise bypass this directory durability boundary.
+	if err := syncAuthoritativeDirectory(filepath.Dir(d.BaseName)); err != nil {
+		return d.markWriteUnavailable(fmt.Errorf("sync rotated segment directory: %w", err))
 	}
 	return nil
 }
@@ -488,7 +497,7 @@ func (d *DiskHandler) RollSegmentAt(nextBaseOffset uint64) error {
 	if err := d.rotateSegment(nextBaseOffset); err != nil {
 		return err
 	}
-	return syncDirectory(filepath.Dir(d.BaseName))
+	return nil
 }
 
 // openSegment opens or creates the current segment file for writing.
@@ -540,6 +549,7 @@ func (d *DiskHandler) GetCurrentSegment() uint64 {
 }
 
 func (d *DiskHandler) drainAndShutdown(batch []types.DiskMessage) {
+	var shutdownErr error
 	for {
 		stop := false
 		select {
@@ -556,6 +566,7 @@ func (d *DiskHandler) drainAndShutdown(batch []types.DiskMessage) {
 		if len(batch) >= d.batchSize {
 			if err := d.WriteBatch(batch); err != nil {
 				util.Error("WriteBatch failed: %v", err)
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("drain write batch: %w", err))
 			}
 			batch = batch[:0]
 		}
@@ -568,6 +579,7 @@ func (d *DiskHandler) drainAndShutdown(batch []types.DiskMessage) {
 	if len(batch) > 0 {
 		if err := d.WriteBatch(batch); err != nil {
 			util.Error("finalize WriteBatch failed: %v", err)
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("final drain write batch: %w", err))
 		}
 	}
 
@@ -577,23 +589,28 @@ func (d *DiskHandler) drainAndShutdown(batch []types.DiskMessage) {
 	if d.writer != nil {
 		if err := d.writer.Flush(); err != nil {
 			util.Error("writer flush failed: %v", err)
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("final data writer flush: %w", err))
 		}
 		d.writer = nil
 	}
 
 	if d.file != nil {
-		if err := d.file.Sync(); err != nil {
+		if err := d.syncFile(d.file); err != nil {
 			util.Error("file sync failed: %v", err)
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("final data file sync: %w", err))
 		}
 		if err := d.file.Close(); err != nil {
 			util.Error("file close failed: %v", err)
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("final data file close: %w", err))
 		}
 		d.file = nil
 	}
 
 	if err := d.closeIndexFiles(); err != nil {
 		util.Error("close index files failed during shutdown: %v", err)
+		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("final index cleanup: %w", err))
 	}
+	d.recordShutdownError(shutdownErr)
 }
 
 func (d *DiskHandler) getSegmentTickerChan(ticker *time.Ticker) <-chan time.Time {

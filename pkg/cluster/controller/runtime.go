@@ -1,19 +1,18 @@
 package controller
 
-import (
-	"sort"
-	"strconv"
-	"strings"
-)
-
 // PartitionRuntimeSnapshot describes replicated partition placement.
 type PartitionRuntimeSnapshot struct {
-	Topic       string
-	Partition   int
-	Leader      string
-	LeaderEpoch int
-	Replicas    int
-	InSync      int
+	Topic             string
+	Partition         int
+	Leader            string
+	LeaderEpoch       int
+	Replicas          int
+	ExpectedReplicas  int
+	ActiveReplicas    int
+	InactiveReplicas  int
+	InSync            int
+	MinInSyncReplicas int
+	Healthy           bool
 }
 
 // MaterializationAttemptsSnapshot counts local convergence attempts by result.
@@ -31,6 +30,10 @@ type RuntimeSnapshot struct {
 	IsLeader                          bool
 	Offline                           int
 	UnderReplicated                   int
+	AssignmentDeficient               int
+	InactiveReplicaPartitions         int
+	InactiveReplicas                  int
+	MinISRUnsatisfied                 int
 	TopicMaterializationsPending      map[string]int
 	TopicMaterializationAttempts      map[string]MaterializationAttemptsSnapshot
 	TopicMaterializationOldestPending float64
@@ -68,35 +71,25 @@ func (cc *ClusterController) RuntimeSnapshot() RuntimeSnapshot {
 		}
 	}
 	snapshot.TopicMaterializationOldestPending = materialization.OldestPending.Seconds()
-	keys := fsmState.GetAllPartitionKeys()
-	sort.Strings(keys)
-	for _, key := range keys {
-		separator := strings.LastIndexByte(key, '-')
-		if separator <= 0 || separator == len(key)-1 {
-			continue
-		}
-		partition, err := strconv.Atoi(key[separator+1:])
-		if err != nil {
-			continue
-		}
-		metadata := fsmState.GetPartitionMetadata(key)
-		if metadata == nil {
-			continue
-		}
-
+	defaultMinISR := 1
+	if cc.Config != nil {
+		defaultMinISR = cc.Config.MinInSyncReplicas
+	}
+	topology := fsmState.EvaluateTopology(defaultMinISR)
+	snapshot.Offline = topology.Offline
+	snapshot.UnderReplicated = topology.UnderReplicated
+	snapshot.AssignmentDeficient = topology.AssignmentDeficient
+	snapshot.InactiveReplicaPartitions = topology.InactiveReplicaPartitions
+	snapshot.InactiveReplicas = topology.InactiveReplicas
+	snapshot.MinISRUnsatisfied = topology.MinISRUnsatisfied
+	for _, partition := range topology.Partitions {
 		detail := PartitionRuntimeSnapshot{
-			Topic:       key[:separator],
-			Partition:   partition,
-			Leader:      metadata.Leader,
-			LeaderEpoch: metadata.LeaderEpoch,
-			Replicas:    len(metadata.Replicas),
-			InSync:      len(metadata.ISR),
-		}
-		if detail.Leader == "" {
-			snapshot.Offline++
-		}
-		if detail.InSync < detail.Replicas {
-			snapshot.UnderReplicated++
+			Topic: partition.Topic, Partition: partition.Partition,
+			Leader: partition.Leader, LeaderEpoch: partition.LeaderEpoch,
+			Replicas: len(partition.Replicas), ExpectedReplicas: partition.ExpectedReplicas,
+			ActiveReplicas: partition.ActiveReplicas, InactiveReplicas: partition.InactiveReplicas,
+			InSync:            partition.InSyncReplicas,
+			MinInSyncReplicas: partition.MinInSyncReplicas, Healthy: partition.Healthy,
 		}
 		snapshot.PartitionDetails = append(snapshot.PartitionDetails, detail)
 	}

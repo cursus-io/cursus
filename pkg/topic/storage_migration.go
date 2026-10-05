@@ -377,8 +377,8 @@ func inspectPersistedHWM(root, topicPath string, partition int) (*uint64, *Stora
 	if err != nil {
 		return nil, nil, fmt.Errorf("read HWM checkpoint: %w", err)
 	}
-	hwm, parseErr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
-	if parseErr != nil {
+	hwm, valid, _ := decodeHWMCheckpoint(data)
+	if !valid {
 		problem := storageProblem(root, path, "invalid HWM checkpoint")
 		return nil, &problem, nil
 	}
