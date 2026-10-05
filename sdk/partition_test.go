@@ -703,6 +703,42 @@ func TestPartitionConsumer_HandlerFailureDoesNotCommitAndRequestsRedelivery(t *t
 	}
 }
 
+func TestPartitionConsumerNilHandlerDoesNotAdvanceOrCommit(t *testing.T) {
+	c := newTestConsumer(t)
+	c.mu.Lock()
+	c.offsets[0] = 41
+	c.mu.Unlock()
+
+	pc := &PartitionConsumer{
+		partitionID:          0,
+		consumer:             c,
+		fetchOffset:          42,
+		assignmentGeneration: c.assignmentGeneration.Load(),
+		dataCh:               make(chan *messageBatch, 1),
+	}
+	c.wg.Add(1)
+	go pc.runWorker()
+	pc.dataCh <- &messageBatch{messages: []Message{{Offset: 41, Payload: "must-not-be-discarded"}}}
+
+	select {
+	case <-c.rebalanceSig:
+	case <-time.After(time.Second):
+		t.Fatal("nil handler did not stop the partition worker")
+	}
+	c.wg.Wait()
+
+	assert.Equal(t, uint64(41), atomic.LoadUint64(&pc.fetchOffset))
+	assert.Equal(t, uint64(0), atomic.LoadUint64(&pc.commitOffset))
+	select {
+	case commit := <-c.commitCh:
+		t.Fatalf("nil handler unexpectedly queued commit: %+v", commit)
+	default:
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	assert.Equal(t, uint64(41), c.offsets[0])
+}
+
 func TestPartitionConsumerManualCommitDoesNotQueueCommit(t *testing.T) {
 	c := newTestConsumer(t)
 	c.config.EnableAutoCommit = false

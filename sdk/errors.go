@@ -10,13 +10,14 @@ import (
 )
 
 var (
-	ErrProducerClosed         = errors.New("producer closed")
-	ErrProducerOutcomeUnknown = errors.New("producer delivery outcome unknown")
-	ErrConsumerClosed         = errors.New("consumer closed")
-	ErrConsumerRebalancing    = errors.New("consumer assignment is rebalancing")
-	ErrTopicNotFound          = errors.New("topic not found")
-	ErrInvalidPartition       = errors.New("invalid partition")
-	ErrNotLeader              = errors.New("not leader")
+	ErrProducerClosed          = errors.New("producer closed")
+	ErrProducerOutcomeUnknown  = errors.New("producer delivery outcome unknown")
+	ErrConsumerClosed          = errors.New("consumer closed")
+	ErrConsumerRebalancing     = errors.New("consumer assignment is rebalancing")
+	ErrConsumerHandlerRequired = errors.New("consumer message handler is required")
+	ErrTopicNotFound           = errors.New("topic not found")
+	ErrInvalidPartition        = errors.New("invalid partition")
+	ErrNotLeader               = errors.New("not leader")
 )
 
 // ProducerOutcomeUnknownError means a non-idempotent publish may have reached

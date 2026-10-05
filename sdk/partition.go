@@ -109,7 +109,10 @@ func (pc *PartitionConsumer) runWorker() {
 		// Deliver messages to user handler.
 		handler := pc.consumer.MessageHandler
 		processingFailed := false
-		if handler != nil {
+		if handler == nil {
+			LogError("Partition [%d] cannot process records without a message handler", pc.partitionID)
+			processingFailed = true
+		} else {
 			for _, msg := range batch.messages {
 				if err := handler(msg); err != nil {
 					LogError("Partition [%d] handler error at offset %d: %v", pc.partitionID, msg.Offset, err)

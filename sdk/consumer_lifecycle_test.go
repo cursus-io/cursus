@@ -3,11 +3,61 @@ package sdk
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestConsumerStartRejectsNilHandlerBeforeBrokerIO(t *testing.T) {
+	for _, mode := range []ConsumerMode{ModePolling, ModeStreaming} {
+		for _, autoCommit := range []bool{true, false} {
+			t.Run(string(mode)+"/auto_commit="+fmt.Sprint(autoCommit), func(t *testing.T) {
+				listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+				require.NoError(t, err)
+				defer func() { _ = listener.Close() }()
+
+				cfg := NewDefaultConsumerConfig()
+				cfg.BrokerAddrs = []string{listener.Addr().String()}
+				cfg.Mode = mode
+				cfg.EnableAutoCommit = autoCommit
+				consumer, err := NewConsumer(cfg)
+				require.NoError(t, err)
+				consumer.offsets[0] = 42
+
+				err = consumer.Start(nil)
+				require.ErrorIs(t, err, ErrConsumerHandlerRequired)
+				require.Equal(t, ConsumerStateClosed, consumer.State())
+				require.Equal(t, uint64(42), consumer.offsets[0])
+				require.Empty(t, consumer.partitionConsumers)
+				require.Empty(t, consumer.memberID)
+				require.Error(t, consumer.rootCtx.Err())
+				select {
+				case <-consumer.Done():
+				default:
+					t.Fatal("Done remained open after rejected Start cleanup")
+				}
+				select {
+				case <-consumer.closeDone:
+				default:
+					t.Fatal("closeDone remained open after rejected Start cleanup")
+				}
+
+				require.NoError(t, listener.SetDeadline(time.Now().Add(25*time.Millisecond)))
+				conn, acceptErr := listener.Accept()
+				if conn != nil {
+					_ = conn.Close()
+				}
+				var netErr net.Error
+				require.ErrorAs(t, acceptErr, &netErr)
+				require.True(t, netErr.Timeout(), "unexpected accept error: %v", acceptErr)
+				require.NoError(t, consumer.Close())
+			})
+		}
+	}
+}
 
 func TestConsumerLifecycleTransitionsAndAssignmentFence(t *testing.T) {
 	consumer, err := NewConsumer(NewDefaultConsumerConfig())

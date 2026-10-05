@@ -197,6 +197,9 @@ func (c *Consumer) Start(handler func(Message) error) error {
 			_ = c.Close()
 		}
 	}()
+	if handler == nil {
+		return ErrConsumerHandlerRequired
+	}
 	if err := c.rootCtx.Err(); err != nil {
 		return fmt.Errorf("consumer context is already done: %w", err)
 	}
