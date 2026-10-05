@@ -457,15 +457,16 @@ func (d *DiskHandler) rotateSegment(nextBaseOffset uint64) error {
 
 	if err := d.openSegment(); err != nil {
 		util.Error("Failed to open new segment: %v", err)
-		return err
+		return d.markWriteUnavailable(fmt.Errorf("open new segment: %w", err))
 	}
 	if err := d.openIndexFiles(); err != nil {
-		return err
+		return d.markWriteUnavailable(fmt.Errorf("open new segment index: %w", err))
 	}
-	if d.internalMetadata {
-		if err := syncDirectory(filepath.Dir(d.BaseName)); err != nil {
-			return fmt.Errorf("sync internal metadata segment rotation: %w", err)
-		}
+	// The new log and index names must be durable before a write to this segment
+	// can be acknowledged. A failure is terminal because retrying with the files
+	// already open could otherwise bypass this directory durability boundary.
+	if err := syncAuthoritativeDirectory(filepath.Dir(d.BaseName)); err != nil {
+		return d.markWriteUnavailable(fmt.Errorf("sync rotated segment directory: %w", err))
 	}
 	return nil
 }
@@ -488,7 +489,7 @@ func (d *DiskHandler) RollSegmentAt(nextBaseOffset uint64) error {
 	if err := d.rotateSegment(nextBaseOffset); err != nil {
 		return err
 	}
-	return syncDirectory(filepath.Dir(d.BaseName))
+	return nil
 }
 
 // openSegment opens or creates the current segment file for writing.

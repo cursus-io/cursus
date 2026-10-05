@@ -91,6 +91,12 @@ type DiskHandler struct {
 	storageLock *StorageLock
 }
 
+// syncAuthoritativeDirectory is a seam for verifying that newly created log
+// and index directory entries cross a filesystem durability boundary. Keep the
+// operating-system implementation in syncDirectory so compaction and retention
+// continue to share the same primitive.
+var syncAuthoritativeDirectory = syncDirectory
+
 func (d *DiskHandler) SetOnSync(callback func(uint64)) {
 	d.onSyncMu.Lock()
 	defer d.onSyncMu.Unlock()
@@ -292,15 +298,19 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		_ = file.Close()
 		return nil, err
 	}
-	if internalMetadata {
-		// A successful metadata append may be the first record in this
-		// partition. Persist the segment/index directory entries before the
-		// coordinator can acknowledge that record.
-		if err := syncDirectory(filepath.Dir(base)); err != nil {
-			_ = dh.closeIndexFiles()
-			_ = file.Close()
-			return nil, fmt.Errorf("sync internal metadata partition directory: %w", err)
-		}
+	// The segment and index may have been created by this open, or by an earlier
+	// process that crashed before syncing their directory entries. Sync both the
+	// topic directory and its parent before exposing the handler to any ACK path.
+	// Repeating this on reopen also repairs files created by pre-fix versions.
+	if err := syncAuthoritativeDirectory(filepath.Dir(base)); err != nil {
+		_ = dh.closeIndexFiles()
+		_ = file.Close()
+		return nil, fmt.Errorf("sync partition files directory: %w", err)
+	}
+	if err := syncAuthoritativeDirectory(filepath.Dir(filepath.Dir(base))); err != nil {
+		_ = dh.closeIndexFiles()
+		_ = file.Close()
+		return nil, fmt.Errorf("sync topic directory entry: %w", err)
 	}
 
 	for _, f := range files {
