@@ -53,8 +53,11 @@ func TestNewDefaultPublisherConfig(t *testing.T) {
 	if cfg.BufferSize != 1024 {
 		t.Errorf("expected BufferSize=1024, got %d", cfg.BufferSize)
 	}
-	if cfg.Acks != "1" {
-		t.Errorf("expected Acks=1, got %s", cfg.Acks)
+	if cfg.Acks != "all" {
+		t.Errorf("expected Acks=all, got %s", cfg.Acks)
+	}
+	if !cfg.EnableIdempotence {
+		t.Error("expected idempotence to be enabled by default")
 	}
 	if cfg.CompressionType != "none" {
 		t.Errorf("expected CompressionType=none, got %s", cfg.CompressionType)
@@ -68,6 +71,7 @@ func TestPublisherConfigValidatesAcknowledgementsAndIdempotence(t *testing.T) {
 	for _, value := range []string{"0", "1", "all", "-1", " ALL "} {
 		cfg := NewDefaultPublisherConfig()
 		cfg.Acks = value
+		cfg.EnableIdempotence = false
 		require.NoError(t, cfg.Validate(), value)
 	}
 	for _, value := range []string{"2", "leader", "-2"} {
@@ -237,7 +241,7 @@ func TestNewDefaultPublisherConfig_AllDefaults(t *testing.T) {
 	assert.Equal(t, "", cfg.TLSCertPath)
 	assert.Equal(t, "", cfg.TLSKeyPath)
 	assert.False(t, cfg.EnableMetrics)
-	assert.False(t, cfg.EnableIdempotence)
+	assert.True(t, cfg.EnableIdempotence)
 	assert.False(t, cfg.EnableBenchmark)
 	assert.False(t, cfg.AutoCreateTopics)
 }

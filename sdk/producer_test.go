@@ -454,6 +454,7 @@ func TestProducer_ParseAckResponse_ErrorStatus(t *testing.T) {
 
 func TestProducer_ParseAckResponse_LeaderUpdate(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
+	cfg.EnableIdempotence = false
 	p := &Producer{
 		config: cfg,
 		client: mustNewProducerClient(cfg),

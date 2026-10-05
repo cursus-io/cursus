@@ -67,13 +67,15 @@ func TestProducerBatchRetryDiscardsUnusableConnection(t *testing.T) {
 			cfg.MaxRetries = 1
 			cfg.RetryBackoffMS = 1
 			cfg.AckTimeoutMS = 100
+			require.True(t, cfg.EnableIdempotence)
+			require.Equal(t, "all", cfg.Acks)
 			client := mustNewProducerClient(cfg)
 			defer func() { _ = client.Close() }()
 			p := &Producer{config: cfg, client: client, done: make(chan struct{})}
 			first := Message{ProducerID: client.ID, Epoch: client.Epoch, SeqNum: 11, Payload: "one"}
 			last := first
 			last.SeqNum = 12
-			payload, err := EncodeBatchMessages(cfg.Topic, 0, cfg.Acks, false, []Message{first, last})
+			payload, err := EncodeBatchMessages(cfg.Topic, 0, cfg.Acks, cfg.EnableIdempotence, []Message{first, last})
 			require.NoError(t, err)
 			finished := make(chan error, 1)
 			go func() {
@@ -156,6 +158,200 @@ func TestProducerBatchRetryDiscardsUnusableConnection(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNonIdempotentProducerDoesNotRetryLostAcknowledgement(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		_, _, command, requestErr := acceptWireTestRequest(conn)
+		_ = conn.Close()
+		if requestErr != nil {
+			serverDone <- requestErr
+			return
+		}
+		if command != "PUBLISH_BATCH" {
+			serverDone <- fmt.Errorf("unexpected command %q", command)
+			return
+		}
+
+		tcpListener := listener.(*net.TCPListener)
+		_ = tcpListener.SetDeadline(time.Now().Add(200 * time.Millisecond))
+		second, secondErr := listener.Accept()
+		if secondErr == nil {
+			_ = second.Close()
+			serverDone <- fmt.Errorf("non-idempotent batch was retried after lost acknowledgement")
+			return
+		}
+		if netErr, ok := secondErr.(net.Error); !ok || !netErr.Timeout() {
+			serverDone <- secondErr
+			return
+		}
+		serverDone <- nil
+	}()
+
+	cfg := NewDefaultPublisherConfig()
+	cfg.BrokerAddrs = []string{listener.Addr().String()}
+	cfg.Acks = "1"
+	cfg.EnableIdempotence = false
+	cfg.MaxRetries = 3
+	cfg.RetryBackoffMS = 1
+	cfg.AckTimeoutMS = 100
+	client := mustNewProducerClient(cfg)
+	defer func() { _ = client.Close() }()
+	require.NoError(t, client.ConnectPartition(0, listener.Addr().String()))
+	p := &Producer{config: cfg, client: client, done: make(chan struct{}), partitionLeaders: map[int]string{0: listener.Addr().String()}}
+	message := Message{ProducerID: client.ID, Epoch: client.Epoch, SeqNum: 1, Payload: "order-created"}
+	payload, err := EncodeBatchMessages(cfg.Topic, 0, cfg.Acks, false, []Message{message})
+	require.NoError(t, err)
+
+	_, err = p.sendWithRetryForBatch(payload, 0, message, message)
+	require.ErrorIs(t, err, ErrProducerOutcomeUnknown)
+	var outcomeErr *ProducerOutcomeUnknownError
+	require.ErrorAs(t, err, &outcomeErr)
+	require.Equal(t, 0, outcomeErr.Partition)
+	require.Equal(t, "acknowledgement", outcomeErr.Stage)
+	require.NoError(t, <-serverDone)
+}
+
+type partialWriteAfterHandshakeConn struct {
+	net.Conn
+	failWrites bool
+}
+
+func (c *partialWriteAfterHandshakeConn) Write(payload []byte) (int, error) {
+	if !c.failWrites {
+		return c.Conn.Write(payload)
+	}
+	count := len(payload) / 2
+	if count == 0 && len(payload) > 0 {
+		count = 1
+	}
+	written, err := c.Conn.Write(payload[:count])
+	if err != nil {
+		return written, err
+	}
+	return written, io.ErrUnexpectedEOF
+}
+
+func TestNonIdempotentProducerReturnsUnknownOutcomeAfterPartialWrite(t *testing.T) {
+	clientRaw, serverRaw := net.Pipe()
+	wrapped := &partialWriteAfterHandshakeConn{Conn: clientRaw}
+	serverDone := make(chan error, 1)
+	go func() {
+		_, err := wire.ServerHandshake(serverRaw, []wire.Compression{wire.CompressionNone})
+		if err == nil {
+			_, err = io.Copy(io.Discard, serverRaw)
+		}
+		_ = serverRaw.Close()
+		serverDone <- err
+	}()
+	framed, err := wire.NewClientConn(wrapped, "none")
+	require.NoError(t, err)
+	wrapped.failWrites = true
+
+	cfg := NewDefaultPublisherConfig()
+	cfg.Acks = "1"
+	cfg.EnableIdempotence = false
+	cfg.MaxRetries = 3
+	client := mustNewProducerClient(cfg)
+	connections := []net.Conn{framed}
+	client.conns.Store(&connections)
+	p := &Producer{config: cfg, client: client, done: make(chan struct{})}
+	message := Message{ProducerID: client.ID, Epoch: client.Epoch, SeqNum: 1, Payload: "order-created"}
+	payload, err := EncodeBatchMessages(cfg.Topic, 0, cfg.Acks, false, []Message{message})
+	require.NoError(t, err)
+
+	_, err = p.sendWithRetryForBatch(payload, 0, message, message)
+	require.ErrorIs(t, err, ErrProducerOutcomeUnknown)
+	var outcomeErr *ProducerOutcomeUnknownError
+	require.ErrorAs(t, err, &outcomeErr)
+	require.Equal(t, "request write", outcomeErr.Stage)
+	require.Nil(t, client.GetConn(0), "a partially written connection must be discarded")
+	require.NoError(t, <-serverDone)
+}
+
+func TestNonIdempotentProducerRetriesExplicitLeaderRejection(t *testing.T) {
+	leader, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = leader.Close() }()
+	stale, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = stale.Close() }()
+
+	serverDone := make(chan error, 2)
+	go func() {
+		conn, acceptErr := stale.Accept()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		framed, request, _, requestErr := acceptWireTestRequest(conn)
+		if requestErr == nil {
+			requestErr = writeWireTestResponse(framed, request, "ERROR: NOT_LEADER class=routing retryable=true leader="+leader.Addr().String())
+		}
+		serverDone <- requestErr
+	}()
+	go func() {
+		conn, acceptErr := leader.Accept()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		framed, request, _, requestErr := acceptWireTestRequest(conn)
+		if requestErr != nil {
+			serverDone <- requestErr
+			return
+		}
+		batch, decodeErr := wire.DecodeBatch(request.Payload)
+		if decodeErr != nil {
+			serverDone <- decodeErr
+			return
+		}
+		if batch.IsIdempotent {
+			serverDone <- errors.New("test batch unexpectedly idempotent")
+			return
+		}
+		ack, marshalErr := json.Marshal(AckResponse{
+			Status: "OK", ProducerID: batch.Messages[0].ProducerID, ProducerEpoch: batch.Messages[0].Epoch,
+			SeqStart: batch.Messages[0].SeqNum, SeqEnd: batch.Messages[len(batch.Messages)-1].SeqNum,
+		})
+		if marshalErr == nil {
+			marshalErr = writeWireTestResponse(framed, request, string(ack))
+		}
+		serverDone <- marshalErr
+	}()
+
+	cfg := NewDefaultPublisherConfig()
+	cfg.BrokerAddrs = []string{stale.Addr().String()}
+	cfg.Acks = "1"
+	cfg.EnableIdempotence = false
+	cfg.MaxRetries = 1
+	cfg.RetryBackoffMS = 1
+	client := mustNewProducerClient(cfg)
+	defer func() { _ = client.Close() }()
+	require.NoError(t, client.ConnectPartition(0, stale.Addr().String()))
+	p := &Producer{config: cfg, client: client, done: make(chan struct{}), partitionLeaders: map[int]string{0: stale.Addr().String()}}
+	message := Message{ProducerID: client.ID, Epoch: client.Epoch, SeqNum: 1, Payload: "order-created"}
+	payload, err := EncodeBatchMessages(cfg.Topic, 0, cfg.Acks, false, []Message{message})
+	require.NoError(t, err)
+
+	ack, err := p.sendWithRetryForBatch(payload, 0, message, message)
+	require.NoError(t, err)
+	require.Equal(t, "OK", ack.Status)
+	require.Equal(t, leader.Addr().String(), p.getPartitionLeaderAddr(0))
+	require.NoError(t, <-serverDone)
+	require.NoError(t, <-serverDone)
 }
 
 func TestProducerFlushAndCloseReportPermanentDeliveryFailure(t *testing.T) {
@@ -261,6 +457,21 @@ func TestProducerRetryBudgetBoundsLogicalBatchDelivery(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("test broker did not stop")
 	}
+}
+
+func TestProducerFlushAndCloseExposeUnknownDeliveryOutcome(t *testing.T) {
+	p, result := newProducerDrainTestHarness(t, "{invalid-ack")
+	p.config.Acks = "1"
+	p.config.EnableIdempotence = false
+	p.config.MaxRetries = 3
+	_, err := p.Send("uncertain")
+	require.NoError(t, err)
+	require.ErrorIs(t, p.Flush(), ErrProducerOutcomeUnknown)
+	require.ErrorIs(t, p.Close(), ErrProducerOutcomeUnknown)
+	require.Zero(t, p.GetUniqueAckCount())
+	brokerResult := <-result
+	require.NoError(t, brokerResult.err)
+	require.Len(t, brokerResult.messages, 1, "unknown batch must not be requeued")
 }
 
 func TestProducerReconnectFailureRemovesOldConnection(t *testing.T) {

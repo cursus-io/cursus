@@ -204,6 +204,27 @@ func (pc *ProducerClient) ReconnectPartition(idx int, addr string) error {
 		return fmt.Errorf("invalid partition index: %d", idx)
 	}
 
+	pc.discardPartitionLocked(idx)
+	if addr == "" {
+		addr = pc.selectBroker()
+	}
+	if addr == "" {
+		return fmt.Errorf("no broker address available for partition %d", idx)
+	}
+
+	return pc.connectPartitionLocked(context.Background(), idx, addr)
+}
+
+func (pc *ProducerClient) discardPartition(idx int) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.discardPartitionLocked(idx)
+}
+
+func (pc *ProducerClient) discardPartitionLocked(idx int) {
+	if idx < 0 {
+		return
+	}
 	oldPtr := pc.conns.Load()
 	if oldPtr != nil {
 		conns := *oldPtr
@@ -214,14 +235,6 @@ func (pc *ProducerClient) ReconnectPartition(idx int, addr string) error {
 			pc.conns.Store(&replacement)
 		}
 	}
-	if addr == "" {
-		addr = pc.selectBroker()
-	}
-	if addr == "" {
-		return fmt.Errorf("no broker address available for partition %d", idx)
-	}
-
-	return pc.connectPartitionLocked(context.Background(), idx, addr)
 }
 
 // discardPartitionConnection removes a failed connection without dialing another

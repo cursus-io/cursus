@@ -92,11 +92,35 @@ TLS settings apply to every connection, including `AutoCreateTopics` initializat
 
 ## Go Producer Delivery Errors
 
-`Producer.Flush() error` waits for queued batches and returns a drain timeout or the first permanent delivery failure. `Producer.Close() error` also reports that failure, including when shutdown times out. Check both return values: accepting a message into the local buffer is not proof of broker delivery. Permanent delivery errors remain visible for the lifetime of the producer.
+The default Go producer uses `Acks="all"` and `EnableIdempotence=true`. This
+allows the SDK to retry the same producer epoch and sequence range when an
+acknowledgement is lost without appending the record twice. The broker's
+effective `min_in_sync_replicas` still determines how many replicas must be in
+sync before `acks=all` can accept the batch.
 
 Producer delivery is bounded to `MaxRetries + 1` attempts for each logical batch, including attempts that reconnect or refresh partition routing. Backoff and replacement connections run only when another attempt remains. The final failed connection is discarded without another dial or handshake. When the budget is exhausted, the producer does not put the batch back into its local queue; `Flush` and `Close` return the underlying structured broker or transport error so the application can decide whether to retry or dead-letter the records.
 
-For acknowledged batches, success requires an `OK` acknowledgement matching the batch's producer ID, epoch, and complete sequence range. Read timeouts, incomplete responses, and invalid acknowledgements discard the partition connection before retrying the unchanged batch. `Acks="0"` does not wait for broker acknowledgement and cannot establish delivery.
+`Producer.Flush() error` waits for queued batches and returns a drain timeout
+or the first permanent delivery failure. `Producer.Close() error` also reports
+that failure, including when shutdown times out. Check both return values:
+accepting a message into the local buffer is not proof of broker delivery.
+Permanent delivery errors remain visible for the lifetime of the producer.
+
+For acknowledged batches, success requires an `OK` acknowledgement matching
+the batch's producer ID, epoch, and complete sequence range. Read timeouts,
+partial writes, incomplete responses, and invalid acknowledgements discard the
+partition connection. They are retried only when the encoded request carries
+the end-to-end idempotence contract.
+
+An application can explicitly select weaker delivery with both
+`Acks="1"` and `EnableIdempotence=false`. In that mode the SDK retries only a
+failure proven to occur before broker acceptance, such as a connection failure
+before the write or an explicit `NOT_LEADER`/`outcome=not_accepted` response.
+After a partial write or missing acknowledgement it returns
+`*sdk.ProducerOutcomeUnknownError`, which matches
+`sdk.ErrProducerOutcomeUnknown` through `errors.Is`. Reconcile application
+state before publishing that record again. `Acks="0"` does not wait for broker
+acknowledgement and cannot establish delivery.
 
 Retain the original records until delivery is confirmed. For example, keep a
 caller-owned batch in durable storage, call `Send` for its records, and check both

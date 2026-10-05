@@ -7,7 +7,8 @@ topic: "example-topic"
 partitions: 1
 
 # Publisher Settings
-acks: "1"
+acks: "all"
+enable_idempotence: true
 batch_size: 1
 linger_ms: 0
 

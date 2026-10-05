@@ -114,7 +114,8 @@ func NewDefaultPublisherConfig() *PublisherConfig {
 		WriteTimeoutMS:     5000,
 		FlushTimeoutMS:     30000,
 		HandshakeTimeoutMS: 5000,
-		Acks:               "1",
+		Acks:               "all",
+		EnableIdempotence:  true,
 		CompressionType:    "none",
 	}
 }

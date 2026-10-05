@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/ackpolicy"
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -103,6 +105,9 @@ func isNonRetryableProducerError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, ErrProducerOutcomeUnknown) {
+		return true
+	}
 	var brokerErr *BrokerError
 	if errors.As(err, &brokerErr) {
 		return !brokerErr.Retryable
@@ -149,6 +154,7 @@ func (p *Producer) sendWithRetry(payload []byte, part int) (*AckResponse, error)
 func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last Message) (*AckResponse, error) {
 	maxAttempts := p.config.MaxRetries + 1
 	backoff := p.config.RetryBackoffMS
+	ambiguousRetrySafe := publishAllowsAmbiguousRetry(payload)
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -200,8 +206,11 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 
 		if err := WriteWithLength(conn, payload); err != nil {
 			lastErr = fmt.Errorf("write failed: %w", err)
+			p.client.discardPartitionConnection(part, conn)
+			if !ambiguousRetrySafe {
+				return nil, unknownProducerOutcome(part, "request write", lastErr)
+			}
 			if attempt == maxAttempts {
-				p.client.discardPartitionConnection(part, conn)
 				break
 			}
 			brokerAddr := p.getPartitionLeaderAddr(part)
@@ -226,8 +235,12 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 			if isNonRetryableProducerError(err) {
 				return nil, lastErr
 			}
+			p.applyProducerRedirect(part, err)
+			p.client.discardPartitionConnection(part, conn)
+			if !ambiguousRetrySafe && !producerErrorProvesNotAccepted(err) {
+				return nil, unknownProducerOutcome(part, "acknowledgement", lastErr)
+			}
 			if attempt == maxAttempts {
-				p.client.discardPartitionConnection(part, conn)
 				break
 			}
 			brokerAddr := p.getPartitionLeaderAddr(part)
@@ -245,8 +258,11 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 			if isNonRetryableProducerError(err) {
 				return nil, lastErr
 			}
+			p.client.discardPartitionConnection(part, conn)
+			if !ambiguousRetrySafe {
+				return nil, unknownProducerOutcome(part, "acknowledgement validation", lastErr)
+			}
 			if attempt == maxAttempts {
-				p.client.discardPartitionConnection(part, conn)
 				break
 			}
 			brokerAddr := p.getPartitionLeaderAddr(part)
@@ -261,6 +277,48 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 		return ackResp, nil
 	}
 	return nil, lastErr
+}
+
+func publishAllowsAmbiguousRetry(payload []byte) bool {
+	batch, err := wire.DecodeBatch(payload)
+	if err != nil || !batch.IsIdempotent {
+		return false
+	}
+	selection, err := ackpolicy.Parse(batch.Acks)
+	return err == nil && selection.SupportsIdempotence()
+}
+
+func producerErrorProvesNotAccepted(err error) bool {
+	var brokerErr *BrokerError
+	if !errors.As(err, &brokerErr) || brokerErr == nil || !brokerErr.Retryable {
+		return false
+	}
+	switch strings.ToLower(brokerErr.Fields["outcome"]) {
+	case "not_accepted":
+		return true
+	case "unknown":
+		return false
+	}
+	code := strings.ToUpper(brokerErr.Code)
+	if brokerErr.Class == ErrorClassRouting && (code == "NOT_LEADER" || code == "NOT_PARTITION_LEADER") {
+		return true
+	}
+	return code == "INSUFFICIENT_IN_SYNC_REPLICAS"
+}
+
+func unknownProducerOutcome(part int, stage string, cause error) error {
+	return &ProducerOutcomeUnknownError{Partition: part, Stage: stage, Cause: cause}
+}
+
+func (p *Producer) applyProducerRedirect(part int, err error) {
+	var brokerErr *BrokerError
+	if !errors.As(err, &brokerErr) || brokerErr == nil {
+		return
+	}
+	if leader := brokerErr.Fields["leader"]; leader != "" {
+		p.setPartitionLeaderAddr(part, leader)
+		p.client.UpdateLeader(leader)
+	}
 }
 
 func (p *Producer) parseAckResponseForBatch(resp []byte, part int, first, last Message) (*AckResponse, error) {

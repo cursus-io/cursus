@@ -10,13 +10,41 @@ import (
 )
 
 var (
-	ErrProducerClosed      = errors.New("producer closed")
-	ErrConsumerClosed      = errors.New("consumer closed")
-	ErrConsumerRebalancing = errors.New("consumer assignment is rebalancing")
-	ErrTopicNotFound       = errors.New("topic not found")
-	ErrInvalidPartition    = errors.New("invalid partition")
-	ErrNotLeader           = errors.New("not leader")
+	ErrProducerClosed         = errors.New("producer closed")
+	ErrProducerOutcomeUnknown = errors.New("producer delivery outcome unknown")
+	ErrConsumerClosed         = errors.New("consumer closed")
+	ErrConsumerRebalancing    = errors.New("consumer assignment is rebalancing")
+	ErrTopicNotFound          = errors.New("topic not found")
+	ErrInvalidPartition       = errors.New("invalid partition")
+	ErrNotLeader              = errors.New("not leader")
 )
+
+// ProducerOutcomeUnknownError means a non-idempotent publish may have reached
+// the broker, but the SDK could not obtain a trustworthy acknowledgement. The
+// caller must reconcile application state before deciding whether to publish
+// the record again.
+type ProducerOutcomeUnknownError struct {
+	Partition int
+	Stage     string
+	Cause     error
+}
+
+func (e *ProducerOutcomeUnknownError) Error() string {
+	if e == nil {
+		return ErrProducerOutcomeUnknown.Error()
+	}
+	if e.Cause == nil {
+		return fmt.Sprintf("%s for partition %d during %s", ErrProducerOutcomeUnknown, e.Partition, e.Stage)
+	}
+	return fmt.Sprintf("%s for partition %d during %s: %v", ErrProducerOutcomeUnknown, e.Partition, e.Stage, e.Cause)
+}
+
+func (e *ProducerOutcomeUnknownError) Unwrap() []error {
+	if e == nil || e.Cause == nil {
+		return []error{ErrProducerOutcomeUnknown}
+	}
+	return []error{ErrProducerOutcomeUnknown, e.Cause}
+}
 
 type ErrorClass = wireprotocol.ErrorClass
 

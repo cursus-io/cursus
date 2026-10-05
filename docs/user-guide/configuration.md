@@ -386,6 +386,24 @@ bootstrap_servers: "broker1:9000,broker2:9000,broker3:9000"
 
 ## SDK Client Configuration
 
+### Producer delivery
+
+`NewDefaultPublisherConfig` chooses duplicate-safe acknowledged delivery:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `acks` | `all` | Wait for the captured in-sync replica set and committed HWM |
+| `enable_idempotence` | `true` | Fence and deduplicate retries by producer epoch and partition sequence |
+| `max_retries` | `3` | Bound retries inside one send attempt |
+
+Keep `acks=all` and size the broker or topic `min_in_sync_replicas` for the
+required failure tolerance. To opt into leader-only delivery, set both
+`acks: "1"` and `enable_idempotence: false`; setting only `acks: "1"` fails
+validation. This explicit weak mode can lose a leader-only tail during failover.
+It also stops automatic retry after a partial write or lost acknowledgement and
+returns `ProducerOutcomeUnknownError`, because the broker may already have
+stored the record.
+
 ### Client TLS
 
 `PublisherConfig`, `ConsumerConfig`, and `AdminConfig` use the same TLS settings and verification rules:
