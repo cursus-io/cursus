@@ -4,6 +4,7 @@
 
 | Persistent artifact | Current writer | Older reader support | Upgrade rule |
 |---|---:|---|---|
+| Application record | CDM4 (CRC32C) | CDM2 and CDM3 records remain readable | Upgrade every reader before a CDM4 writer appends; older binaries cannot read the new records. |
 | Topic manifest | 1 | pre-manifest storage requires offline migration | Do not start a current broker against undeclared persisted topics. |
 | Transaction journal | 1 | bare legacy snapshots are readable | Preserve the journal with all partition and offset data. |
 | Consumer metadata records | 3 | earlier record forms are replayed | Upgrade readers before enabling a newer writer contract. |
@@ -12,6 +13,16 @@
 Mixed-version rolling upgrades across a format boundary are unsupported. A
 normal restart of the same compatible release is supported; a format-changing
 upgrade is a coordinated whole-cluster operation.
+
+CDM4 checksums cover every serialized authoritative field, including topic,
+partition, offset, producer and transaction metadata, event identity, and
+payload. Existing CDM2/CDM3 records are an explicit legacy read boundary and
+are not rewritten in place. New appends use CDM4, so a segment may contain
+legacy and checksummed records after an upgrade. Backup validation, startup
+recovery, ordinary reads, compaction, and replica transfer all use the same
+decoder and reject a CDM4 checksum mismatch. Treat a reported segment and
+offset as unavailable; restore an immutable validated backup or repair it from
+a checksum-valid committed replica instead of editing bytes in place.
 
 Each broker exclusively locks its log directory before opening metadata or
 recovering partitions. A second broker using the same directory fails startup;
