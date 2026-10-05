@@ -3,6 +3,7 @@ package eventsource
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,28 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSnapshotFileOffsetRejectsValuesBeyondInt64(t *testing.T) {
+	got, err := snapshotFileOffset(math.MaxInt64)
+	require.NoError(t, err)
+	require.Equal(t, int64(math.MaxInt64), got)
+	_, err = snapshotFileOffset(uint64(math.MaxInt64) + 1)
+	require.ErrorContains(t, err, "exceeds int64")
+}
+
+func TestSnapshotStoreRejectsExistingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "target.dat")
+	require.NoError(t, os.WriteFile(target, snapshotV2Header, 0o600))
+	path := filepath.Join(dir, "partition_0_snapshots_v2.dat")
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlink creation is unavailable: %v", err)
+	}
+
+	store, err := NewSnapshotStore(dir, 0)
+	require.Nil(t, store)
+	require.ErrorContains(t, err, "not a regular file")
+}
 
 func TestSnapshotStoreRejectsKeyBeyondWireLength(t *testing.T) {
 	store, err := NewSnapshotStore(t.TempDir(), 0)

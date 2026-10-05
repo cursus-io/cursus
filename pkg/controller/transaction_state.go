@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/transaction"
+	"github.com/cursus-io/cursus/util"
 )
 
 func (ch *CommandHandler) snapshotTransaction(txnID string) (*transaction.Snapshot, bool) {
@@ -46,12 +47,18 @@ func (ch *CommandHandler) ConfigureTransactionJournal(path string) error {
 			return fmt.Errorf("migrate transaction journal epoch watermark: %w", err)
 		}
 		if ch.Coordinator != nil {
-			for _, group := range ch.Coordinator.ExportState() {
+			for groupName, group := range ch.Coordinator.ExportState() {
 				for _, reservation := range group.OffsetReservations {
-					next = max(next, uint64(reservation.ProducerEpoch)+1)
+					next, err = advanceRecoveredProducerEpoch(next, reservation.ProducerEpoch)
+					if err != nil {
+						return fmt.Errorf("migrate transaction journal epoch watermark from group %q reservation: %w", groupName, err)
+					}
 				}
 				for _, decision := range group.ReservationDecisions {
-					next = max(next, uint64(decision.ProducerEpoch)+1)
+					next, err = advanceRecoveredProducerEpoch(next, decision.ProducerEpoch)
+					if err != nil {
+						return fmt.Errorf("migrate transaction journal epoch watermark from group %q decision: %w", groupName, err)
+					}
 				}
 			}
 		}
@@ -73,6 +80,14 @@ func (ch *CommandHandler) ConfigureTransactionJournal(path string) error {
 		return fmt.Errorf("recover pending topic truncation: %w", err)
 	}
 	return nil
+}
+
+func advanceRecoveredProducerEpoch(current uint64, producerEpoch int64) (uint64, error) {
+	epoch, ok := util.SafeInt64ToUint64(producerEpoch)
+	if !ok {
+		return current, fmt.Errorf("negative producer epoch %d", producerEpoch)
+	}
+	return max(current, epoch+1), nil
 }
 
 func (ch *CommandHandler) syncTransactionState(txnID string) error {

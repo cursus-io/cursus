@@ -9,6 +9,13 @@ import (
 
 const filesystemSpaceCacheTTL = time.Second
 
+func checkedFilesystemBytes(blocks, blockSize uint64) (uint64, error) {
+	if blockSize != 0 && blocks > math.MaxUint64/blockSize {
+		return 0, fmt.Errorf("block count overflow: blocks=%d size=%d", blocks, blockSize)
+	}
+	return blocks * blockSize, nil
+}
+
 type filesystemSpaceSnapshot struct {
 	Free  uint64
 	Total uint64

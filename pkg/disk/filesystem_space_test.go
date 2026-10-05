@@ -1,10 +1,24 @@
 package disk
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestCheckedFilesystemBytesRejectsOverflow(t *testing.T) {
+	if _, err := checkedFilesystemBytes(math.MaxUint64, 2); err == nil {
+		t.Fatal("expected overflowing filesystem capacity to be rejected")
+	}
+	got, err := checkedFilesystemBytes(1024, 4096)
+	if err != nil {
+		t.Fatalf("valid filesystem capacity failed: %v", err)
+	}
+	if got != 4<<20 {
+		t.Fatalf("filesystem capacity = %d, want %d", got, 4<<20)
+	}
+}
 
 func TestDiskHeadroomGuardReservesAgainstByteAndPercentThresholds(t *testing.T) {
 	guard := &diskHeadroomGuard{

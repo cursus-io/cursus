@@ -595,7 +595,7 @@ func (ch *CommandHandler) handleEndTxn(cmd string, contexts ...*ClientContext) s
 				return fmt.Sprintf("ERROR: transaction_offset_prepare_failed state=open reason=%q", err.Error())
 			}
 			var err error
-			current, err = ch.prepareTransactionOffsetRecords(current)
+			_, err = ch.prepareTransactionOffsetRecords(current)
 			if err != nil {
 				return fmt.Sprintf("ERROR: transaction_offset_prepare_failed state=open reason=%q", err.Error())
 			}

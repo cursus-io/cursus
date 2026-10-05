@@ -190,7 +190,7 @@ func TestConsumeRetainsScanProgressThroughFilteredPages(t *testing.T) {
 	first, _, err := handler.readFromTopicBounded("scan-progress", args, ctx, 1, 1, true)
 	require.NoError(t, err)
 	require.Empty(t, first)
-	require.Equal(t, uint64(1), ctx.OffsetCache["scan-progress-0"])
+	require.Equal(t, uint64(1), ctx.OffsetCache[consumerOffsetCacheKey("scan-progress", args)])
 	next, _, err := handler.readFromTopicBounded("scan-progress", args, ctx, 1, 1, true)
 	require.NoError(t, err)
 	require.Len(t, next, 1)

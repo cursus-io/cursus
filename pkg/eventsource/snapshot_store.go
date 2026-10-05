@@ -97,8 +97,7 @@ func InspectSnapshotCatalog(logDir string) (SnapshotInspection, error) {
 			store = &SnapshotStore{index: make(map[string]*snapshotPointer), revision: 1}
 			catalogs[catalogKey] = store
 		}
-		// #nosec G304 -- path comes from a bounded glob under the configured storage root.
-		file, err := os.Open(path)
+		file, err := openExistingSnapshotFile(path, os.O_RDONLY)
 		if err != nil {
 			return inspection, fmt.Errorf("open snapshot file %q: %w", path, err)
 		}
@@ -136,10 +135,13 @@ func InspectSnapshotCatalog(logDir string) (SnapshotInspection, error) {
 }
 
 func NewSnapshotStore(dir string, partitionID int) (*SnapshotStore, error) {
-	_, statErr := os.Stat(dir)
+	dirInfo, statErr := os.Lstat(dir)
 	dirCreated := os.IsNotExist(statErr)
 	if statErr != nil && !dirCreated {
 		return nil, fmt.Errorf("snapshot store: stat directory: %w", statErr)
+	}
+	if statErr == nil && (!dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0) {
+		return nil, fmt.Errorf("snapshot store: path is not a regular directory")
 	}
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("snapshot store: mkdir: %w", err)
@@ -147,9 +149,8 @@ func NewSnapshotStore(dir string, partitionID int) (*SnapshotStore, error) {
 
 	legacyPath := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots.dat", partitionID))
 	var legacyFile *os.File
-	if _, err := os.Stat(legacyPath); err == nil {
-		// #nosec G304 -- the name is fixed by the partition under the configured storage root.
-		legacyFile, err = os.Open(legacyPath)
+	if _, err := os.Lstat(legacyPath); err == nil {
+		legacyFile, err = openExistingSnapshotFile(legacyPath, os.O_RDONLY)
 		if err != nil {
 			return nil, fmt.Errorf("snapshot store: open legacy file: %w", err)
 		}
@@ -162,7 +163,7 @@ func NewSnapshotStore(dir string, partitionID int) (*SnapshotStore, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	fileCreated := err == nil
 	if errors.Is(err, os.ErrExist) {
-		f, err = os.OpenFile(path, os.O_RDWR, 0o600)
+		f, err = openExistingSnapshotFile(path, os.O_RDWR)
 	}
 	if err != nil {
 		if legacyFile != nil {
@@ -248,7 +249,11 @@ func (s *SnapshotStore) loadFromDisk() error {
 	if err != nil {
 		return err
 	}
-	s.writeOffset = uint64(info.Size())
+	writeOffset, ok := util.SafeInt64ToUint64(info.Size())
+	if !ok {
+		return fmt.Errorf("negative snapshot file size")
+	}
+	s.writeOffset = writeOffset
 	return nil
 }
 
@@ -260,13 +265,20 @@ func (s *SnapshotStore) scanFile(file *os.File, legacy bool, start uint64, repai
 	if info.Size() < 0 {
 		return fmt.Errorf("negative snapshot file size")
 	}
-	end := uint64(info.Size())
+	end, ok := util.SafeInt64ToUint64(info.Size())
+	if !ok {
+		return fmt.Errorf("negative snapshot file size")
+	}
 	for offset := start; offset < end; {
 		entryOffset := offset
 		key, version, payload, next, err := readSnapshotRecord(file, offset, end, legacy)
 		if err != nil {
 			if repairTail && errors.Is(err, io.ErrUnexpectedEOF) {
-				if err := file.Truncate(int64(entryOffset)); err != nil {
+				truncateOffset, convErr := snapshotFileOffset(entryOffset)
+				if convErr != nil {
+					return convErr
+				}
+				if err := file.Truncate(truncateOffset); err != nil {
 					return fmt.Errorf("truncate incomplete record at %d: %w", entryOffset, err)
 				}
 				if err := file.Sync(); err != nil {
@@ -301,11 +313,15 @@ func (s *SnapshotStore) scanFile(file *os.File, legacy bool, start uint64, repai
 
 func readSnapshotRecord(file *os.File, offset, fileSize uint64, legacy bool) (string, uint64, string, uint64, error) {
 	const fixed = uint64(2 + 8 + 4)
-	if fileSize-offset < fixed {
+	if offset > fileSize || fileSize-offset < fixed {
 		return "", 0, "", offset, io.ErrUnexpectedEOF
 	}
+	readOffset, err := snapshotFileOffset(offset)
+	if err != nil {
+		return "", 0, "", offset, err
+	}
 	var keyLenBuf [2]byte
-	if _, err := file.ReadAt(keyLenBuf[:], int64(offset)); err != nil {
+	if _, err := file.ReadAt(keyLenBuf[:], readOffset); err != nil {
 		return "", 0, "", offset, err
 	}
 	keyLen := uint64(binary.BigEndian.Uint16(keyLenBuf[:]))
@@ -318,7 +334,7 @@ func readSnapshotRecord(file *os.File, offset, fileSize uint64, legacy bool) (st
 		return "", 0, "", offset, io.ErrUnexpectedEOF
 	}
 	header := make([]byte, 2+keyLen+8+4)
-	if _, err := file.ReadAt(header, int64(offset)); err != nil {
+	if _, err := file.ReadAt(header, readOffset); err != nil {
 		return "", 0, "", offset, err
 	}
 	versionPos := 2 + keyLen
@@ -332,12 +348,20 @@ func readSnapshotRecord(file *os.File, offset, fileSize uint64, legacy bool) (st
 		return "", 0, "", offset, io.ErrUnexpectedEOF
 	}
 	payload := make([]byte, payloadLen)
-	if _, err := file.ReadAt(payload, int64(headerEnd)); err != nil {
+	payloadOffset, err := snapshotFileOffset(headerEnd)
+	if err != nil {
+		return "", 0, "", offset, err
+	}
+	if _, err := file.ReadAt(payload, payloadOffset); err != nil {
 		return "", 0, "", offset, err
 	}
 	if !legacy {
 		var checksum [4]byte
-		if _, err := file.ReadAt(checksum[:], int64(headerEnd+payloadLen)); err != nil {
+		checksumOffset, err := snapshotFileOffset(headerEnd + payloadLen)
+		if err != nil {
+			return "", 0, "", offset, err
+		}
+		if _, err := file.ReadAt(checksum[:], checksumOffset); err != nil {
 			return "", 0, "", offset, err
 		}
 		crc := crc32.New(snapshotCRC)
@@ -378,14 +402,26 @@ func (s *SnapshotStore) Save(key string, version uint64, payload string) error {
 	checksumPos := len(record) - 4
 	binary.BigEndian.PutUint32(record[checksumPos:], crc32.Checksum(record[:checksumPos], snapshotCRC))
 	entryOffset := s.writeOffset
-	if _, err := s.file.WriteAt(record, int64(entryOffset)); err != nil {
+	recordBytes := uint64(len(record))
+	if recordBytes > ^uint64(0)-entryOffset {
+		return fmt.Errorf("snapshot write offset overflow")
+	}
+	nextWriteOffset := entryOffset + recordBytes
+	writeOffset, err := snapshotFileOffset(entryOffset)
+	if err != nil {
+		return err
+	}
+	if _, err := snapshotFileOffset(nextWriteOffset); err != nil {
+		return fmt.Errorf("snapshot record exceeds file offset limit: %w", err)
+	}
+	if _, err := s.file.WriteAt(record, writeOffset); err != nil {
 		return fmt.Errorf("snapshot store: write: %w", err)
 	}
 	if err := s.syncFile(); err != nil {
-		rollbackErr := s.file.Truncate(int64(entryOffset))
+		rollbackErr := s.file.Truncate(writeOffset)
 		return errors.Join(fmt.Errorf("snapshot store: sync: %w", err), rollbackErr)
 	}
-	s.writeOffset += uint64(len(record))
+	s.writeOffset = nextWriteOffset
 	s.index[key] = &snapshotPointer{fileOffset: entryOffset, version: version}
 	s.revision++
 	return nil
@@ -481,11 +517,48 @@ func (s *SnapshotStore) readAt(ptr *snapshotPointer) (*SnapshotData, error) {
 	if err != nil {
 		return nil, err
 	}
-	_, version, payload, _, err := readSnapshotRecord(file, ptr.fileOffset, uint64(info.Size()), ptr.legacy)
+	fileSize, ok := util.SafeInt64ToUint64(info.Size())
+	if !ok {
+		return nil, fmt.Errorf("snapshot store: negative file size")
+	}
+	_, version, payload, _, err := readSnapshotRecord(file, ptr.fileOffset, fileSize, ptr.legacy)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot store: read record: %w", err)
 	}
 	return &SnapshotData{Version: version, Payload: payload}, nil
+}
+
+func snapshotFileOffset(offset uint64) (int64, error) {
+	converted, ok := util.SafeUint64ToInt64(offset)
+	if !ok {
+		return 0, fmt.Errorf("snapshot file offset %d exceeds int64", offset)
+	}
+	return converted, nil
+}
+
+func openExistingSnapshotFile(path string, flag int) (*os.File, error) {
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("snapshot path %q is not a regular file", path)
+	}
+	// #nosec G304 -- callers provide deterministic snapshot paths and the opened file identity is verified against Lstat.
+	file, err := os.OpenFile(path, flag, 0)
+	if err != nil {
+		return nil, err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if !after.Mode().IsRegular() || !os.SameFile(before, after) {
+		_ = file.Close()
+		return nil, fmt.Errorf("snapshot path %q changed while opening", path)
+	}
+	return file, nil
 }
 
 func (s *SnapshotStore) Close() error {
