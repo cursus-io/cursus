@@ -39,6 +39,9 @@ func TestReadCommittedDoesNotUseMarkerAtHWM(t *testing.T) {
 	storage.On("GetLatestOffset").Return(uint64(0)).Once()
 	storage.On("GetFlushedOffset").Return(uint64(2)).Twice()
 	storage.On("GetFirstOffset").Return(uint64(0)).Twice()
+	storage.On("ReadMessages", uint64(0), 1).Return([]types.Message{
+		{Offset: 0, Payload: "transactional", TransactionalID: "tx", TransactionState: types.TransactionStateOpen},
+	}, nil).Once()
 	storage.On("ReadMessages", uint64(0), 2).Return([]types.Message{
 		{Offset: 0, Payload: "transactional", TransactionalID: "tx", TransactionState: types.TransactionStateOpen},
 		{Offset: 1, Payload: "marker", TransactionalID: "tx", TransactionMarker: types.TransactionMarkerCommit},

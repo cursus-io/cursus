@@ -319,6 +319,9 @@ func (sc *StreamConnection) StopWithReason(reason string) {
 	sc.setStopReason(reason)
 	sc.stopOnce.Do(func() {
 		close(sc.stopCh)
+		// Run normally sends a final control frame before closing. Bound resource
+		// retention even when its goroutine is starved or the peer never reads.
+		time.AfterFunc(300*time.Millisecond, sc.closeConn)
 	})
 }
 

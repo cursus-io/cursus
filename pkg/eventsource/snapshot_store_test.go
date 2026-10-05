@@ -231,7 +231,8 @@ func TestSnapshotStore_OverwriteKey(t *testing.T) {
 }
 
 func TestSnapshotStore_PartialWriteRecovery(t *testing.T) {
-	dir := t.TempDir()
+	root := t.TempDir()
+	dir := filepath.Join(root, "orders")
 
 	// Write one good entry manually, then append truncated data to simulate
 	// a partial write (e.g., crash mid-save).
@@ -240,7 +241,9 @@ func TestSnapshotStore_PartialWriteRecovery(t *testing.T) {
 	require.NoError(t, store.Save("good-key", 3, `{"ok":true}`))
 	require.NoError(t, store.Close())
 
-	path := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots.dat", 0))
+	path := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots_v2.dat", 0))
+	goodInfo, err := os.Stat(path)
+	require.NoError(t, err)
 	// #nosec G304 -- path is the snapshot file created beneath t.TempDir.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
 	require.NoError(t, err)
@@ -253,11 +256,25 @@ func TestSnapshotStore_PartialWriteRecovery(t *testing.T) {
 	_, err = f.Write([]byte("abc")) // only 3 bytes, not 200
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
+	corruptInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Greater(t, corruptInfo.Size(), goodInfo.Size())
+
+	// Backup validation is read-only and must report the torn record without
+	// silently changing the source being inspected.
+	_, err = InspectSnapshotCatalog(root)
+	require.ErrorContains(t, err, "unexpected EOF")
+	afterInspection, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, corruptInfo.Size(), afterInspection.Size())
 
 	// Reopen: loadFromDisk should truncate the partial entry and recover the good one.
 	store2, err := NewSnapshotStore(dir, 0)
 	require.NoError(t, err)
 	defer func() { _ = store2.Close() }()
+	repairedInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, goodInfo.Size(), repairedInfo.Size())
 
 	snap, err := store2.Read("good-key")
 	require.NoError(t, err)
@@ -286,7 +303,7 @@ func TestSnapshotStore_PartialPayloadRecovery(t *testing.T) {
 	require.NoError(t, store.Save("good-key", 3, `{"ok":true}`))
 	require.NoError(t, store.Close())
 
-	path := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots.dat", 0))
+	path := filepath.Join(dir, fmt.Sprintf("partition_%d_snapshots_v2.dat", 0))
 	// #nosec G304 -- path is the snapshot file created beneath t.TempDir.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
 	require.NoError(t, err)

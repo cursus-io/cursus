@@ -18,8 +18,8 @@ func TestReadCommittedRangeKeepsCommitVisibilitySeparateFromPageBound(t *testing
 		{"marker inside page", "committed", "commit", 3, 3, 2, true, true},
 		{"prepared decision", "prepare_commit", "commit", 3, 3, 1, false, false},
 		{"abort marker", "aborted", "abort", 3, 3, 1, true, false},
-		{"marker not replicated", "committed", "commit", 1, 3, 1, false, false},
-		{"marker not flushed", "committed", "commit", 3, 1, 1, false, false},
+		{"marker not replicated", "committed", "commit", 1, 3, 1, true, false},
+		{"marker not flushed", "committed", "commit", 3, 1, 1, true, false},
 		{"empty page", "committed", "commit", 3, 3, 0, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -68,6 +68,9 @@ func TestApplyTruncateDefinitionFencesBeforeFallibleLocalCleanup(t *testing.T) {
 	t.Cleanup(manager.Stop)
 
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	partition.SetHWM(0)
 	require.NoError(t, manager.PublishToPartitionWithAck("orders", 0, &types.Message{Payload: "old"}))
 	target := manager.GetTopic("orders").Definition()
 	target.Revision++

@@ -275,6 +275,7 @@ func newDurableFSMTopic(t *testing.T, name string) (*topic.TopicManager, *topic.
 	require.NoError(t, manager.CreateTopic(name, 1, false, false))
 	partition, err := manager.GetTopic(name).GetPartition(0)
 	require.NoError(t, err)
+	partition.SetHWM(0)
 	t.Cleanup(partition.Close)
 	return manager, partition
 }

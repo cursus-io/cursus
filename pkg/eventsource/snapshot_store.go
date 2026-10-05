@@ -105,7 +105,7 @@ func InspectSnapshotCatalog(logDir string) (SnapshotInspection, error) {
 		if legacy {
 			store.legacyFile = file
 			inspection.LegacyFiles++
-			if err := store.scanFile(file, true, 0); err != nil {
+			if err := store.scanFile(file, true, 0, false); err != nil {
 				_ = file.Close()
 				return inspection, fmt.Errorf("validate snapshot file %q: %w", path, err)
 			}
@@ -116,7 +116,7 @@ func InspectSnapshotCatalog(logDir string) (SnapshotInspection, error) {
 				_ = file.Close()
 				return inspection, fmt.Errorf("validate snapshot file %q: invalid checksummed format header", path)
 			}
-			if err := store.scanFile(file, false, uint64(len(snapshotV2Header))); err != nil {
+			if err := store.scanFile(file, false, uint64(len(snapshotV2Header)), false); err != nil {
 				_ = file.Close()
 				return inspection, fmt.Errorf("validate snapshot file %q: %w", path, err)
 			}
@@ -223,7 +223,7 @@ func (s *SnapshotStore) syncFile() error {
 
 func (s *SnapshotStore) loadFromDisk() error {
 	if s.legacyFile != nil {
-		if err := s.scanFile(s.legacyFile, true, 0); err != nil {
+		if err := s.scanFile(s.legacyFile, true, 0, false); err != nil {
 			return fmt.Errorf("legacy snapshot file: %w", err)
 		}
 	}
@@ -241,14 +241,18 @@ func (s *SnapshotStore) loadFromDisk() error {
 	if !bytes.Equal(header, snapshotV2Header) {
 		return fmt.Errorf("unsupported snapshot format header %q", header)
 	}
-	if err := s.scanFile(s.file, false, uint64(len(snapshotV2Header))); err != nil {
+	if err := s.scanFile(s.file, false, uint64(len(snapshotV2Header)), true); err != nil {
+		return err
+	}
+	info, err = s.file.Stat()
+	if err != nil {
 		return err
 	}
 	s.writeOffset = uint64(info.Size())
 	return nil
 }
 
-func (s *SnapshotStore) scanFile(file *os.File, legacy bool, start uint64) error {
+func (s *SnapshotStore) scanFile(file *os.File, legacy bool, start uint64, repairTail bool) error {
 	info, err := file.Stat()
 	if err != nil {
 		return err
@@ -261,6 +265,16 @@ func (s *SnapshotStore) scanFile(file *os.File, legacy bool, start uint64) error
 		entryOffset := offset
 		key, version, payload, next, err := readSnapshotRecord(file, offset, end, legacy)
 		if err != nil {
+			if repairTail && errors.Is(err, io.ErrUnexpectedEOF) {
+				if err := file.Truncate(int64(entryOffset)); err != nil {
+					return fmt.Errorf("truncate incomplete record at %d: %w", entryOffset, err)
+				}
+				if err := file.Sync(); err != nil {
+					return fmt.Errorf("sync repaired snapshot file at %d: %w", entryOffset, err)
+				}
+				util.Warn("discarded incomplete snapshot record at offset %d", entryOffset)
+				return nil
+			}
 			return fmt.Errorf("record at %d: %w", offset, err)
 		}
 		if ptr, ok := s.index[key]; ok {

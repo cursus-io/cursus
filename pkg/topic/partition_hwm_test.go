@@ -175,16 +175,20 @@ func TestPartition_RecoversProducerStateFromLogWithoutCheckpoint(t *testing.T) {
 	require.Equal(t, "first", msgs[0].Payload)
 }
 
-func TestDecodeProducerStateCheckpointRequiresVersionThree(t *testing.T) {
+func TestDecodeProducerStateCheckpointRequiresVersionFour(t *testing.T) {
 	_, err := decodeProducerStateCheckpoint([]byte(`{"producer-1":1}`))
 	require.ErrorContains(t, err, "clean bootstrap required")
 
 	_, err = decodeProducerStateCheckpoint([]byte(`{"version":2,"producers":{"producer-1":{"epoch":3,"seq":7}}}`))
 	require.ErrorContains(t, err, "unsupported producer state checkpoint version 2")
 
-	checkpoint, err := decodeProducerStateCheckpoint([]byte(`{"version":3,"producers":{"producer-1":{"epoch":3,"seq":7,"offset":11}}}`))
+	_, err = decodeProducerStateCheckpoint([]byte(`{"version":3,"producers":{"producer-1":{"epoch":3,"seq":7,"offset":11}}}`))
+	require.ErrorContains(t, err, "unsupported producer state checkpoint version 3")
+
+	checkpoint, err := decodeProducerStateCheckpoint([]byte(`{"version":4,"covered_offset":11,"producers":{"producer-1":{"epoch":3,"seq":7,"offset":11}}}`))
 	require.NoError(t, err)
 	require.Equal(t, producerStateCheckpointVersion, checkpoint.Version)
+	require.Equal(t, uint64(11), checkpoint.CoveredOffset)
 	require.Equal(t, producerStateCheckpointEntry{Epoch: 3, Seq: 7, Offset: 11}, checkpoint.Producers["producer-1"])
 }
 

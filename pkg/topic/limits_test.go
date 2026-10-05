@@ -10,28 +10,31 @@ import (
 func TestValidateTargetCapacityBoundsRegistryGrowth(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.MaxTopics = 2
-	cfg.MaxPartitionsPerTopic = 3
+	cfg.MaxPartitionsPerTopic = 4
 	cfg.MaxPartitions = 4
-	definitions := []Definition{
-		DefaultDefinition("first", cfg),
-		DefaultDefinition("second", cfg),
-	}
+	first := DefaultDefinition("first", cfg)
+	first.Partitions = 1
+	second := DefaultDefinition("second", cfg)
+	second.Partitions = 1
+	definitions := []Definition{first, second}
 
 	t.Run("topic count", func(t *testing.T) {
-		err := ValidateTargetCapacity(cfg, definitions, DefaultDefinition("third", cfg))
+		third := DefaultDefinition("third", cfg)
+		third.Partitions = 1
+		err := ValidateTargetCapacity(cfg, definitions, third)
 		require.ErrorContains(t, err, "max_topics=2")
 	})
 
 	t.Run("partitions per topic", func(t *testing.T) {
 		target := definitions[0]
-		target.Partitions = 4
+		target.Partitions = 5
 		err := ValidateTargetCapacity(cfg, definitions, target)
-		require.ErrorContains(t, err, "max_partitions_per_topic=3")
+		require.ErrorContains(t, err, "max_partitions_per_topic=4")
 	})
 
 	t.Run("total partitions", func(t *testing.T) {
 		target := definitions[0]
-		target.Partitions = 3
+		target.Partitions = 4
 		err := ValidateTargetCapacity(cfg, definitions, target)
 		require.ErrorContains(t, err, "max_partitions=4")
 	})

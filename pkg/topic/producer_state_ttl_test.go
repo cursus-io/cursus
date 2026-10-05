@@ -131,7 +131,8 @@ func TestProducerStateIndexPrunesEntriesBeforeRetentionFloor(t *testing.T) {
 func TestLoadProducerStateCheckpointUsesRetainedOffsetRange(t *testing.T) {
 	checkpointPath := filepath.Join(t.TempDir(), "partition_0.producers")
 	require.NoError(t, os.WriteFile(checkpointPath, []byte(`{
-  "version": 3,
+  "version": 4,
+  "covered_offset": 10,
   "producers": {
     "before-floor": {"epoch": 1, "seq": 1, "offset": 4},
     "retained": {"epoch": 2, "seq": 3, "offset": 5},

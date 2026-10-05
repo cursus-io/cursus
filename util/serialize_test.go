@@ -78,7 +78,8 @@ func TestDeserializeMessage_ErrorCases(t *testing.T) {
 func TestDeserializeDiskMessageSupportsV2RecordsWithoutReplayIdentity(t *testing.T) {
 	data, err := SerializeDiskMessage(types.DiskMessage{Topic: "orders", Payload: "created"})
 	assert.NoError(t, err)
-	legacy := append([]byte("CDM2"), data[4:len(data)-4]...)
+	// CDM2 predates both replay-identity fields and the CDM4 checksum.
+	legacy := append([]byte("CDM2"), data[4:len(data)-8]...)
 
 	got, err := DeserializeDiskMessage(legacy)
 	assert.NoError(t, err)
@@ -135,7 +136,7 @@ func TestDeserializeDiskMessage_TruncatedEventSourcingFields(t *testing.T) {
 	truncated := data[:len(data)-10]
 	_, err = DeserializeDiskMessage(truncated)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "incomplete")
+	assert.ErrorIs(t, err, ErrDiskMessageChecksumMismatch)
 }
 
 func TestDeserializeDiskMessageRejectsIncompleteStorageV2Record(t *testing.T) {
@@ -154,7 +155,7 @@ func TestDeserializeDiskMessageRejectsIncompleteStorageV2Record(t *testing.T) {
 
 	_, err = DeserializeDiskMessage(data[:len(data)-40])
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "incomplete")
+	assert.ErrorIs(t, err, ErrDiskMessageChecksumMismatch)
 }
 
 func TestDeserializeDiskMessageRejectsLegacyUnversionedRecord(t *testing.T) {
