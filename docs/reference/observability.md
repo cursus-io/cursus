@@ -317,7 +317,16 @@ monitoring:
 `monitoring.serviceMonitor.enabled` and `monitoring.prometheusRule.enabled`
 control the two CRD-backed resources independently. Tune
 `consumerLag`, `transactionOldestSeconds`, and the alert durations to the
-application's throughput and transaction timeout before enabling paging.
+application’s throughput and transaction timeout before enabling paging.
+
+`monitoring.grafanaDashboard.enabled` installs the **Cursus production
+overview** dashboard as a ConfigMap. The default `grafana_dashboard: "1"`
+label is compatible with the common Grafana sidecar selector and can be
+replaced through `monitoring.grafanaDashboard.labels`. The dashboard uses a
+Prometheus datasource variable and a namespace variable; select the datasource
+that scrapes the Cursus ServiceMonitor after import. See the
+[production incident runbook](../operations/production-runbook.md) for the
+response attached to each panel and alert.
 
 ## Alert Baseline
 

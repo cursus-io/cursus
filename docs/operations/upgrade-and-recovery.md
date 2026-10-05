@@ -5,11 +5,11 @@
 | Persistent artifact | Current writer | Older reader support | Upgrade rule |
 |---|---:|---|---|
 | Application record | CDM4 (CRC32C) | CDM2 and CDM3 records remain readable | Upgrade every reader before a CDM4 writer appends; older binaries cannot read the new records. |
-| Topic manifest | 1 | pre-manifest storage requires offline migration | Do not start a current broker against undeclared persisted topics. |
-| Transaction journal | 2 plus checksummed cut manifest | version-1 journal records remain readable | Preserve the journal and its manifest with all partition and offset data. |
+| Topic manifest | 3 | older manifests are rejected | Migrate and validate an offline copy before starting current brokers. |
+| Transaction journal | 3 plus checksummed cut manifest | version-1 and version-2 records remain readable | Preserve the journal and its manifest with all partition and offset data. Version 3 writes bounded deltas between full checkpoints. |
 | Event snapshot catalog | v2 (CRC32C) | legacy snapshot files remain readable beside v2 | Preserve both snapshot files until a clean bootstrap removes the legacy boundary. |
-| Consumer metadata records | 3 | earlier record forms are replayed | Upgrade readers before enabling a newer writer contract. |
-| Raft FSM snapshot | 8 | versions 0-7 are restored with documented defaults | Do not run binaries that cannot decode the persisted snapshot version. |
+| Consumer metadata records | 5 | versions 1-4 remain replayable | Upgrade readers before writing offset-reservation records. |
+| Raft FSM snapshot | 10 | version 9 is accepted only for the supported one-way recovery transition | Older formats require a clean bootstrap; never downgrade a volume after writing version 10. |
 
 Mixed-version rolling upgrades across a format boundary are unsupported. A
 normal restart of the same compatible release is supported; a format-changing
@@ -74,6 +74,13 @@ identifier with the change record.
 5. Start a quorum, then wait for leader election, ISR recovery, and readiness.
 6. Validate topics, groups, committed offsets, transaction recovery, and an
    acknowledged test publish/consume before restoring client traffic.
+
+During a Kubernetes rolling restart, delete one Pod at a time and wait for the
+replacement to become Ready, regain its expected replica state, and return to
+ISR before continuing. The StatefulSet uses `OnDelete`; changing the image does
+not itself restart Pods. Use the production dashboard and baseline alerts as
+the release gate, and abort the rollout on request admission, disk headroom,
+recovery, or replication safety alerts.
 
 ## Rollback And Restore
 

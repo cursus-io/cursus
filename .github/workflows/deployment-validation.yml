@@ -51,6 +51,8 @@ jobs:
             --set-string monitoring.labels.release=kube-prometheus-stack \
             > /tmp/cursus-monitoring.yaml
           grep -q 'kind: PrometheusRule' /tmp/cursus-monitoring.yaml
+          grep -q 'cursus-production-overview' /tmp/cursus-monitoring.yaml
+          grep -q 'grafana_dashboard: "1"' /tmp/cursus-monitoring.yaml
           grep -q 'release: kube-prometheus-stack' /tmp/cursus-monitoring.yaml
           grep -q 'cpu: 250m' /tmp/cursus.yaml
       - name: Reject unsafe deployment overrides
@@ -94,6 +96,8 @@ jobs:
             --set-string monitoring.labels.release=kube-prometheus-stack \
             > /tmp/cursus-cluster-monitoring.yaml
           grep -q 'kind: PrometheusRule' /tmp/cursus-cluster-monitoring.yaml
+          grep -q 'cursus-production-overview' /tmp/cursus-cluster-monitoring.yaml
+          grep -q 'grafana_dashboard: "1"' /tmp/cursus-cluster-monitoring.yaml
           grep -q 'CursusClusterReplicationUnsafe' /tmp/cursus-cluster-monitoring.yaml
           grep -q 'release: kube-prometheus-stack' /tmp/cursus-cluster-monitoring.yaml
           grep -q 'cpu: 500m' /tmp/cursus-cluster.yaml

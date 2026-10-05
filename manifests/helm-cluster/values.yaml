@@ -106,3 +106,8 @@ monitoring:
     storagePendingFor: 10m
     transactionOldestSeconds: 300
     consumerLag: 10000
+  grafanaDashboard:
+    enabled: true
+    # Grafana's dashboard sidecar selects ConfigMaps carrying this label by default.
+    labels:
+      grafana_dashboard: "1"

@@ -90,6 +90,13 @@ When Prometheus Operator CRDs are installed, enable the metrics Service,
 ServiceMonitor, and baseline alerts with `monitoring.enabled=true`. Set
 `monitoring.labels` to the labels selected by the installed operator, and tune
 the lag and transaction-age thresholds before routing alerts to responders.
+The same switch installs a Grafana sidecar ConfigMap labeled
+`grafana_dashboard: "1"` by default. Override
+`monitoring.grafanaDashboard.labels` when the Grafana sidecar uses a different
+selector. The **Cursus production overview** dashboard covers readiness, disk
+headroom, request admission, storage pressure, replication, transactions, and
+consumer lag; use the [production incident runbook](production-runbook.md) for
+the corresponding response steps.
 
 The expansion command validates all three PVCs and their StorageClasses before mutation. Kubernetes server-side validation rejects a shrink. It patches every claim, performs one-member-at-a-time restarts only when the CSI driver requires filesystem expansion, waits for all three members between restarts, verifies requested and filesystem capacity, orphans the running Pods and claims, and uses an atomic Helm upgrade to recreate the StatefulSet with the new claim template. Do not edit `persistence.size` directly or combine unrelated release changes into the expansion command. Keep a current backup and verify a known acknowledged payload and committed consumer offset before and after this procedure.
 

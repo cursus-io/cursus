@@ -1,0 +1,14 @@
+{{- if and .Values.monitoring.enabled .Values.monitoring.grafanaDashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cursus-cluster.fullname" . }}-grafana-dashboard
+  labels:
+    {{- include "cursus-cluster.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.grafanaDashboard.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+data:
+  cursus-overview.json: |-
+{{ .Files.Get "dashboards/cursus-overview.json" | indent 4 }}
+{{- end }}

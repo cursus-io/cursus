@@ -1,0 +1,121 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"mappings": [{"options": {"0": {"color": "red", "text": "NOT READY"}, "1": {"color": "green", "text": "READY"}}, "type": "value"}], "thresholds": {"mode": "absolute", "steps": [{"color": "red"}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"expr": "min(cursus_broker_ready{namespace=~\"$namespace\"})", "refId": "A"}],
+      "title": "Broker readiness",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"mappings": [{"options": {"0": {"color": "red", "text": "BLOCKED"}, "1": {"color": "green", "text": "WRITABLE"}}, "type": "value"}], "thresholds": {"mode": "absolute", "steps": [{"color": "red"}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"expr": "min(cursus_storage_filesystem_headroom_ready{namespace=~\"$namespace\"})", "refId": "A"}],
+      "title": "Storage headroom",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 12, "x": 12, "y": 0},
+      "id": 3,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "cursus_storage_filesystem_free_bytes{namespace=~\"$namespace\"}", "legendFormat": "{{pod}} free", "refId": "A"},
+        {"expr": "cursus_storage_filesystem_total_bytes{namespace=~\"$namespace\"}", "legendFormat": "{{pod}} total", "refId": "B"}
+      ],
+      "title": "Filesystem capacity",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+      "id": 4,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "cursus_broker_requests_inflight{namespace=~\"$namespace\"}", "legendFormat": "{{pod}} requests", "refId": "A"},
+        {"expr": "cursus_broker_request_admission_waiters{namespace=~\"$namespace\"}", "legendFormat": "{{pod}} waiters", "refId": "B"},
+        {"expr": "rate(cursus_broker_request_admission_rejections_total{namespace=~\"$namespace\"}[5m])", "legendFormat": "{{pod}} rejected/s {{reason}}", "refId": "C"}
+      ],
+      "title": "Request admission",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"min": 0}, "overrides": [{"matcher": {"id": "byName", "options": "inflight bytes"}, "properties": [{"id": "unit", "value": "bytes"}]}]},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
+      "id": 5,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum(cursus_storage_pending_writes{namespace=~\"$namespace\"})", "legendFormat": "pending writes", "refId": "A"},
+        {"expr": "sum(cursus_broker_request_bytes_inflight{namespace=~\"$namespace\"})", "legendFormat": "inflight bytes", "refId": "B"},
+        {"expr": "sum(rate(cursus_broker_client_response_write_failures_total{namespace=~\"$namespace\"}[5m]))", "legendFormat": "response failures/s", "refId": "C"}
+      ],
+      "title": "Storage and response pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+      "id": 6,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "max(cursus_cluster_offline_partitions{namespace=~\"$namespace\"})", "legendFormat": "offline", "refId": "A"},
+        {"expr": "max(cursus_cluster_under_replicated_partitions{namespace=~\"$namespace\"})", "legendFormat": "under replicated", "refId": "B"},
+        {"expr": "max(cursus_cluster_min_insync_unsatisfied_partitions{namespace=~\"$namespace\"})", "legendFormat": "min ISR unsatisfied", "refId": "C"}
+      ],
+      "title": "Cluster replication safety",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 13},
+      "id": 7,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum by (state) (cursus_transactions{namespace=~\"$namespace\"})", "legendFormat": "{{state}}", "refId": "A"},
+        {"expr": "max(cursus_transaction_oldest_active_seconds{namespace=~\"$namespace\"})", "legendFormat": "oldest active seconds", "refId": "B"},
+        {"expr": "min(cursus_transaction_recovery_ready{namespace=~\"$namespace\"})", "legendFormat": "recovery ready", "refId": "C"}
+      ],
+      "title": "Transactions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 21},
+      "id": 8,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "topk(10, max by (topic, group) (cursus_consumer_group_lag{namespace=~\"$namespace\"}))", "legendFormat": "{{topic}} / {{group}}", "refId": "A"}],
+      "title": "Top consumer lag",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["cursus", "broker", "production"],
+  "templating": {
+    "list": [
+      {"current": {}, "label": "Prometheus", "name": "datasource", "query": "prometheus", "refresh": 1, "type": "datasource"},
+      {"allValue": ".*", "current": {}, "datasource": {"type": "prometheus", "uid": "${datasource}"}, "includeAll": true, "label": "Namespace", "name": "namespace", "query": {"query": "label_values(cursus_broker_ready, namespace)", "refId": "StandardVariableQuery"}, "refresh": 1, "sort": 1, "type": "query"}
+    ]
+  },
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Cursus production overview",
+  "uid": "cursus-production-overview",
+  "version": 1
+}
