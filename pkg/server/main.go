@@ -232,15 +232,6 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 
 		util.Info("🌐 Distributed clustering enabled (brokerID=%s, localAddr=%s)", brokerID, localAddr)
 	}
-	if cfg.EnabledDistribution {
-		if cd == nil {
-			return fmt.Errorf("%w: coordinator unavailable", ErrConsumerMetadataRecovery)
-		}
-		if err := awaitDistributedConsumerMetadataRecovery(ctx, cd, tm); err != nil {
-			return err
-		}
-	}
-
 	globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
 	requestBudget := newRequestMemoryBudget(cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes)
 	defer func() {
@@ -267,11 +258,23 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		cc.StartReplicaCatchup(ctx, clusterClient, globalCH.ApplyReplicaCatchup)
 	}
 	if cfg.EnabledDistribution && cfg.InternalBrokerPort > 0 {
+		// Followers use this authenticated listener to forward their durable
+		// broker registration to the Raft leader. Consumer-offset topology
+		// bootstrap waits for those registrations, so this listener must be
+		// available before consumer metadata recovery begins.
 		shutdownInternal, err := startInternalBrokerListener(ctx, cfg, globalCH, requestBudget)
 		if err != nil {
 			return err
 		}
 		defer shutdownInternal()
+	}
+	if cfg.EnabledDistribution {
+		if cd == nil {
+			return fmt.Errorf("%w: coordinator unavailable", ErrConsumerMetadataRecovery)
+		}
+		if err := awaitDistributedConsumerMetadataRecovery(ctx, cd, tm); err != nil {
+			return err
+		}
 	}
 	if err := registerStaticConsumerGroups(cfg, tm, globalCH); err != nil {
 		return fmt.Errorf("register static consumer groups: %w", err)
