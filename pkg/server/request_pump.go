@@ -100,8 +100,9 @@ func (r *requestReader) Read(p []byte) (int, error) {
 }
 
 type admittedRequest struct {
-	frame  wire.Frame
-	finish func()
+	frame    wire.Frame
+	finish   func()
+	accepted chan struct{}
 }
 
 // pumpWireRequests reads at most one header ahead of the active request. The
@@ -140,8 +141,18 @@ func pumpWireRequests(ctx context.Context, cancelConnection context.CancelFunc, 
 		done := make(chan struct{})
 		var once sync.Once
 		finish := func() { once.Do(func() { release(); activity.finish(); close(done) }) }
+		accepted := make(chan struct{})
 		select {
-		case requests <- admittedRequest{frame: request, finish: finish}:
+		case requests <- admittedRequest{frame: request, finish: finish, accepted: accepted}:
+		case <-ctx.Done():
+			finish()
+			return
+		}
+		// Do not observe a post-frame EOF until the handler owns the complete
+		// request. Otherwise disconnect cancellation can discard an accepted
+		// fire-and-forget publish before it reaches processMessage.
+		select {
+		case <-accepted:
 		case <-ctx.Done():
 			finish()
 			return

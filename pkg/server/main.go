@@ -565,12 +565,20 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 			}
 			request = next
 		}
+		close(request.accepted)
 		// A STREAM frame is a pump barrier. No subsequent read starts until this
 		// request fails; successful registration transfers the connection completely.
 		if request.frame.Command == wire.CommandStream {
 			_ = conn.SetReadDeadline(time.Time{})
 		}
-		requestCtx, cancelRequest := context.WithTimeout(clientCtx, requestTimeout)
+		requestParent := clientCtx
+		if requestSuppressesResponse(request.frame.Payload, cmdCtx) {
+			// Once a complete fire-and-forget frame is accepted, a subsequent
+			// client close must not race it out of the broker. Server shutdown and
+			// the request timeout still bound the detached work.
+			requestParent = ctx
+		}
+		requestCtx, cancelRequest := context.WithTimeout(requestParent, requestTimeout)
 		responseConn.setRequest(request.frame, requestCtx)
 		cmdCtx.SetRequestContext(requestCtx)
 		shouldExit, err := processMessage(request.frame.Payload, cmdHandler, cmdCtx, responseConn)
@@ -589,6 +597,13 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 			return
 		}
 	}
+}
+
+func requestSuppressesResponse(data []byte, ctx *controller.ClientContext) bool {
+	if wire.IsBatch(data) {
+		return suppressBatchPublishResponse(data, ctx)
+	}
+	return suppressPublishResponse(string(data), ctx)
 }
 
 type connectionLimiter struct {

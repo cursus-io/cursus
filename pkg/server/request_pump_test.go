@@ -153,3 +153,80 @@ func TestStreamHandoffStopsReadsAndClearsDeadline(t *testing.T) {
 	require.Equal(t, wire.KindStream, response.Kind)
 	require.Equal(t, wire.StatusOK, response.Status)
 }
+
+func TestPumpWireRequestsAcceptsCompleteFrameBeforeDisconnectCancellation(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+
+	type serverResult struct {
+		conn *wire.Connection
+		raw  net.Conn
+		err  error
+	}
+	serverReady := make(chan serverResult, 1)
+	go func() {
+		raw, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverReady <- serverResult{err: acceptErr}
+			return
+		}
+		connection, handshakeErr := wire.ServerHandshake(raw, []wire.Compression{wire.CompressionNone})
+		serverReady <- serverResult{conn: connection, raw: raw, err: handshakeErr}
+	}()
+
+	clientRaw, err := net.Dial("tcp", listener.Addr().String())
+	require.NoError(t, err)
+	client, err := wire.ClientHandshake(clientRaw, []wire.Compression{wire.CompressionNone})
+	require.NoError(t, err)
+	server := <-serverReady
+	require.NoError(t, server.err)
+	defer server.raw.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelled := make(chan struct{})
+	cancelConnection := func() {
+		select {
+		case <-cancelled:
+		default:
+			close(cancelled)
+		}
+		cancel()
+	}
+	activity := &requestActivity{conn: server.raw, last: time.Now()}
+	server.conn.SetReader(&requestReader{Conn: server.raw, ctx: ctx, activity: activity, idleTimeout: time.Second})
+	requests := make(chan admittedRequest)
+	go pumpWireRequests(ctx, cancelConnection, server.conn, activity, requests)
+
+	command, parsed, err := wire.ParseCommandText("PUBLISH topic=orders partition=0 acks=0 producerId=p1 message=value")
+	require.NoError(t, err)
+	payload, err := wire.EncodeCommandPayload(parsed)
+	require.NoError(t, err)
+	require.NoError(t, client.WriteFrame(wire.Frame{
+		Kind: wire.KindRequest, Command: command, RequestID: 1, Payload: payload,
+	}))
+	require.NoError(t, clientRaw.Close())
+
+	select {
+	case <-cancelled:
+		t.Fatal("disconnect cancelled the connection before the complete frame was accepted")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	var request admittedRequest
+	select {
+	case request = <-requests:
+	case <-time.After(time.Second):
+		t.Fatal("complete request was not admitted")
+	}
+	require.Equal(t, wire.CommandPublish, request.frame.Command)
+	close(request.accepted)
+	request.finish()
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("disconnect was not observed after request acceptance")
+	}
+}
