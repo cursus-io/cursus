@@ -2,9 +2,9 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "cursus.fullname" . }}-monitoring
+  name: {{ include "cursus-cluster.fullname" . }}-monitoring
   labels:
-    {{- include "cursus.labels" . | nindent 4 }}
+    {{- include "cursus-cluster.labels" . | nindent 4 }}
     app.kubernetes.io/component: monitoring
 spec:
   ports:
@@ -15,22 +15,22 @@ spec:
       port: {{ .Values.service.metricsPort }}
       targetPort: metrics
   selector:
-    {{- include "cursus.selectorLabels" . | nindent 4 }}
----
+    {{- include "cursus-cluster.selectorLabels" . | nindent 4 }}
 {{- if .Values.monitoring.serviceMonitor.enabled }}
+---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "cursus.fullname" . }}
+  name: {{ include "cursus-cluster.fullname" . }}
   labels:
-    {{- include "cursus.labels" . | nindent 4 }}
+    {{- include "cursus-cluster.labels" . | nindent 4 }}
     {{- with .Values.monitoring.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "cursus.name" . }}
+      app.kubernetes.io/name: {{ include "cursus-cluster.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: monitoring
   endpoints:
@@ -43,9 +43,9 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
-  name: {{ include "cursus.fullname" . }}
+  name: {{ include "cursus-cluster.fullname" . }}
   labels:
-    {{- include "cursus.labels" . | nindent 4 }}
+    {{- include "cursus-cluster.labels" . | nindent 4 }}
     {{- with .Values.monitoring.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -61,6 +61,22 @@ spec:
           annotations:
             summary: Cursus broker is not ready
             description: A Cursus broker has failed readiness for longer than the configured grace period.
+        - alert: CursusClusterHasNoLeader
+          expr: cursus_distribution_enabled{namespace={{ .Release.Namespace | quote }}} == 1 and cursus_cluster_has_leader{namespace={{ .Release.Namespace | quote }}} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: Cursus cluster has no leader
+            description: A broker cannot resolve the replicated metadata leader.
+        - alert: CursusClusterReplicationUnsafe
+          expr: (cursus_cluster_under_replicated_partitions{namespace={{ .Release.Namespace | quote }}} > 0) or (cursus_cluster_assignment_deficient_partitions{namespace={{ .Release.Namespace | quote }}} > 0) or (cursus_cluster_min_insync_unsatisfied_partitions{namespace={{ .Release.Namespace | quote }}} > 0)
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: Cursus cluster replication is unsafe
+            description: At least one partition lacks its declared replicas, assignment, or minimum in-sync quorum.
         - alert: CursusStorageWritesStalled
           expr: min_over_time(cursus_storage_pending_writes{namespace={{ .Release.Namespace | quote }}}[{{ .Values.monitoring.prometheusRule.storagePendingFor }}]) > 0
           labels:

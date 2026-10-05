@@ -91,6 +91,7 @@ partition leaders.
 | `cursus_broker_commands_total{command,result}` | Counter | Completed text command dispatches |
 | `cursus_broker_command_duration_seconds{command}` | Histogram | Command dispatch latency |
 | `cursus_broker_command_errors_total{command,code}` | Counter | Wire errors by bounded command and error code |
+| `cursus_broker_client_response_write_failures_total{reason}` | Counter | Client responses that could not be delivered, with a bounded failure reason |
 | `cursus_broker_publish_acknowledgements_total{ack_mode,result}` | Counter | Publish requests by normalized acknowledgement mode and bounded result |
 | `cursus_broker_async_replication_failures_total{topic,error_class}` | Counter | Follower failures after an `acks=1` leader acknowledgement |
 | `cursus_broker_replication_retries_total{topic,ack_mode,error_class}` | Counter | Retried partition replication attempts, including pending duplicate commit barriers |
@@ -294,6 +295,23 @@ scrape_configs:
       - targets: ["broker-1:9100", "broker-2:9100", "broker-3:9100"]
 ```
 
+The standalone and three-member Helm charts can create a metrics Service,
+`ServiceMonitor`, and `PrometheusRule` baseline. The Prometheus Operator CRDs
+must already be installed. Add any labels required by the operator's selectors;
+for kube-prometheus-stack this is commonly:
+
+```yaml
+monitoring:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack
+```
+
+`monitoring.serviceMonitor.enabled` and `monitoring.prometheusRule.enabled`
+control the two CRD-backed resources independently. Tune
+`consumerLag`, `transactionOldestSeconds`, and the alert durations to the
+application's throughput and transaction timeout before enabling paging.
+
 ## Alert Baseline
 
 ```promql
@@ -325,7 +343,10 @@ sum by (topic, group) (cursus_consumer_group_coordinator_up) != 1
 max_over_time(cursus_consumer_group_lag[10m]) > 10000
 
 # Storage writer backlog
-cursus_storage_pending_writes > 0
+min_over_time(cursus_storage_pending_writes[10m]) > 0
+
+# Client responses could not be delivered
+increase(cursus_broker_client_response_write_failures_total[5m]) > 0
 
 # Compaction errors (inspect the bounded reason label)
 increase(cursus_broker_log_compaction_runs_total{result="error"}[10m]) > 0

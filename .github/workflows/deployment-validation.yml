@@ -46,6 +46,13 @@ jobs:
           helm template cursus manifests/helm \
             --set persistence.classless=true > /tmp/cursus-classless-storage.yaml
           grep -q 'storageClassName: ""' /tmp/cursus-classless-storage.yaml
+          helm template cursus manifests/helm --namespace brokers \
+            --set monitoring.enabled=true \
+            --set-string monitoring.labels.release=kube-prometheus-stack \
+            > /tmp/cursus-monitoring.yaml
+          grep -q 'kind: PrometheusRule' /tmp/cursus-monitoring.yaml
+          grep -q 'release: kube-prometheus-stack' /tmp/cursus-monitoring.yaml
+          grep -q 'cpu: 250m' /tmp/cursus.yaml
       - name: Reject unsafe deployment overrides
         run: |
           if helm template cursus manifests/helm --set replicaCount=2; then
@@ -77,6 +84,19 @@ jobs:
             --set cluster.internalAuthSecret=cursus-internal-auth \
             --set internalTLS.secretName=cursus-internal-tls > /tmp/cursus-cluster.yaml
           grep -q 'type: RuntimeDefault' /tmp/cursus-cluster.yaml
+          helm template cursus manifests/helm-cluster \
+            --namespace brokers \
+            --set-string image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+            --set-string image.revision=0000000000000000000000000000000000000000 \
+            --set cluster.internalAuthSecret=cursus-internal-auth \
+            --set internalTLS.secretName=cursus-internal-tls \
+            --set monitoring.enabled=true \
+            --set-string monitoring.labels.release=kube-prometheus-stack \
+            > /tmp/cursus-cluster-monitoring.yaml
+          grep -q 'kind: PrometheusRule' /tmp/cursus-cluster-monitoring.yaml
+          grep -q 'CursusClusterReplicationUnsafe' /tmp/cursus-cluster-monitoring.yaml
+          grep -q 'release: kube-prometheus-stack' /tmp/cursus-cluster-monitoring.yaml
+          grep -q 'cpu: 500m' /tmp/cursus-cluster.yaml
 
   docker-and-restricted-cluster:
     runs-on: ubuntu-latest

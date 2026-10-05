@@ -49,7 +49,10 @@ broker:
 
 nodeSelector: {}
 affinity: {}
-resources: {}
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
 tolerations: []
 terminationGracePeriodSeconds: 60
 startupProbeFailureThreshold: 30
@@ -57,9 +60,19 @@ startupProbeFailureThreshold: 30
 
 monitoring:
   enabled: false
+  # Add labels required by the Prometheus Operator's ServiceMonitor and
+  # PrometheusRule selectors (for example, release: kube-prometheus-stack).
+  labels: {}
   serviceMonitor:
+    enabled: true
     interval: 30s
     scrapeTimeout: 10s
+  prometheusRule:
+    enabled: true
+    brokerNotReadyFor: 5m
+    storagePendingFor: 10m
+    transactionOldestSeconds: 300
+    consumerLag: 10000
 
 performanceProfile: balanced  
   

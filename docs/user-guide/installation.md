@@ -104,6 +104,13 @@ docker run --rm \
 
 A Helm chart is available under `manifests/helm`. Review `values.yaml`, persistent volume settings, TLS/internal mTLS secrets, advertised addresses, replica/quorum values, and resource limits before installing. Do not treat chart defaults as a production security profile.
 
+The standalone chart requests `250m` CPU and `512Mi` memory. It does not set a
+generic memory limit because the safe value depends on workload and recovery
+size; measure peak use and set limits in production values. With Prometheus
+Operator CRDs installed, `monitoring.enabled=true` creates a metrics Service,
+ServiceMonitor, and baseline PrometheusRule alerts. Use `monitoring.labels` for
+operator selector labels and tune the alert thresholds before paging.
+
 The standalone chart omits `storageClassName` by default, so Kubernetes uses
 the cluster's default StorageClass. Set `persistence.storageClass` to select a
 named class. For a pre-provisioned PersistentVolume that deliberately has no
