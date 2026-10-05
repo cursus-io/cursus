@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -29,9 +30,27 @@ type journalRecord struct {
 
 // JournalInspection is a read-only integrity summary for a standalone journal.
 type JournalInspection struct {
-	Present            bool `json:"present"`
-	RecordCount        int  `json:"record_count"`
-	LatestTransactions int  `json:"latest_transactions"`
+	Present                   bool   `json:"present"`
+	RecordCount               int    `json:"record_count"`
+	LatestTransactions        int    `json:"latest_transactions"`
+	NextProducerEpoch         uint64 `json:"next_producer_epoch"`
+	HasProducerEpochWatermark bool   `json:"has_producer_epoch_watermark"`
+}
+
+type journalManifest struct {
+	Version                   int    `json:"version"`
+	State                     string `json:"state"`
+	JournalSize               int64  `json:"journal_size"`
+	RecordCount               int    `json:"record_count"`
+	LatestTransactions        int    `json:"latest_transactions"`
+	NextProducerEpoch         uint64 `json:"next_producer_epoch"`
+	HasProducerEpochWatermark bool   `json:"has_producer_epoch_watermark"`
+	Checksum                  uint32 `json:"checksum"`
+}
+
+type JournalManifestInspection struct {
+	Present bool   `json:"present"`
+	State   string `json:"state,omitempty"`
 }
 
 // Journal durably appends standalone transaction coordinator snapshots.
@@ -103,7 +122,17 @@ func OpenJournal(path string) (*Journal, error) {
 			return nil, fmt.Errorf("persist transaction journal directory: %w", err)
 		}
 	}
-	return &Journal{path: path}, nil
+	journal := &Journal{path: path}
+	if _, err := journal.Load(); err != nil {
+		return nil, fmt.Errorf("recover transaction journal: %w", err)
+	}
+	journal.mu.Lock()
+	err = journal.writeManifestLocked()
+	journal.mu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("write transaction journal manifest: %w", err)
+	}
+	return journal, nil
 }
 
 // InspectJournal validates an existing journal without creating, truncating, or
@@ -125,6 +154,8 @@ func InspectJournal(path string) (JournalInspection, error) {
 	latest := make(map[string]*Snapshot)
 	var offset int64
 	records := 0
+	var nextProducerEpoch uint64
+	hasProducerEpochWatermark := false
 	for offset < info.Size() {
 		if info.Size()-offset < journalRecordOverhead {
 			return JournalInspection{}, fmt.Errorf("truncated transaction journal record at %d", offset)
@@ -152,7 +183,7 @@ func InspectJournal(path string) (JournalInspection, error) {
 		if actual, expected := crc32.ChecksumIEEE(payload), binary.BigEndian.Uint32(checksumBytes[:]); actual != expected {
 			return JournalInspection{}, fmt.Errorf("transaction journal checksum mismatch at %d", offset)
 		}
-		snapshot, _, err := decodeJournalRecord(payload)
+		snapshot, nextEpoch, err := decodeJournalRecord(payload)
 		if err != nil {
 			return JournalInspection{}, fmt.Errorf("decode transaction journal record at %d: %w", offset, err)
 		}
@@ -161,10 +192,61 @@ func InspectJournal(path string) (JournalInspection, error) {
 				return JournalInspection{}, fmt.Errorf("merge transaction journal record at %d: %w", offset, err)
 			}
 		}
+		if snapshot == nil {
+			hasProducerEpochWatermark = true
+		}
+		nextProducerEpoch = max(nextProducerEpoch, nextEpoch)
 		offset = recordEnd
 		records++
 	}
-	return JournalInspection{Present: true, RecordCount: records, LatestTransactions: len(latest)}, nil
+	return JournalInspection{
+		Present: true, RecordCount: records, LatestTransactions: len(latest),
+		NextProducerEpoch: nextProducerEpoch, HasProducerEpochWatermark: hasProducerEpochWatermark,
+	}, nil
+}
+
+func InspectJournalManifest(journalPath string, journal JournalInspection) (JournalManifestInspection, error) {
+	manifestPath := strings.TrimSuffix(journalPath, filepath.Ext(journalPath)) + ".manifest"
+	data, err := os.ReadFile(manifestPath) // #nosec G304 -- derived from the configured broker journal path.
+	if errors.Is(err, os.ErrNotExist) {
+		if journal.Present {
+			return JournalManifestInspection{}, fmt.Errorf("transaction journal manifest is missing")
+		}
+		return JournalManifestInspection{}, nil
+	}
+	if err != nil {
+		return JournalManifestInspection{}, fmt.Errorf("read transaction journal manifest: %w", err)
+	}
+	var manifest journalManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return JournalManifestInspection{}, fmt.Errorf("decode transaction journal manifest: %w", err)
+	}
+	checksum := manifest.Checksum
+	manifest.Checksum = 0
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		return JournalManifestInspection{}, err
+	}
+	if checksum != crc32.Checksum(encoded, crc32.MakeTable(crc32.Castagnoli)) {
+		return JournalManifestInspection{}, fmt.Errorf("transaction journal manifest checksum mismatch")
+	}
+	info, err := os.Stat(journalPath)
+	if err != nil {
+		return JournalManifestInspection{}, fmt.Errorf("stat transaction journal for manifest: %w", err)
+	}
+	if manifest.Version != 1 || manifest.JournalSize != info.Size() ||
+		manifest.RecordCount != journal.RecordCount || manifest.LatestTransactions != journal.LatestTransactions ||
+		manifest.NextProducerEpoch != journal.NextProducerEpoch || manifest.HasProducerEpochWatermark != journal.HasProducerEpochWatermark {
+		return JournalManifestInspection{}, fmt.Errorf("transaction journal manifest is stale or does not match the journal cut")
+	}
+	wantState := "active"
+	if journal.LatestTransactions == 0 && journal.NextProducerEpoch == 0 {
+		wantState = "unused"
+	}
+	if manifest.State != wantState {
+		return JournalManifestInspection{}, fmt.Errorf("transaction journal manifest state %q does not match %q", manifest.State, wantState)
+	}
+	return JournalManifestInspection{Present: true, State: manifest.State}, nil
 }
 
 func (j *Journal) Append(snap *Snapshot) (err error) {
@@ -233,7 +315,7 @@ func (j *Journal) Append(snap *Snapshot) (err error) {
 	j.replaceLatestLocked(snap, recordBytes)
 	j.nextProducerEpoch = max(j.nextProducerEpoch, uint64(snap.Epoch)+1)
 	j.records++
-	return nil
+	return j.writeManifestLocked()
 }
 
 func (j *Journal) shouldCompactLocked() bool {
@@ -358,6 +440,52 @@ func (j *Journal) compactLocked() (err error) {
 	j.hasProducerEpochWatermark = true
 	if syncErr := syncJournalDirectory(dir); syncErr != nil {
 		return syncErr
+	}
+	return j.writeManifestLocked()
+}
+
+func (j *Journal) writeManifestLocked() error {
+	info, err := os.Stat(j.path)
+	if err != nil {
+		return fmt.Errorf("stat transaction journal: %w", err)
+	}
+	state := "active"
+	if len(j.latest) == 0 && j.nextProducerEpoch == 0 {
+		state = "unused"
+	}
+	manifest := journalManifest{
+		Version: 1, State: state, JournalSize: info.Size(), RecordCount: j.records,
+		LatestTransactions: len(j.latest), NextProducerEpoch: j.nextProducerEpoch,
+		HasProducerEpochWatermark: j.hasProducerEpochWatermark,
+	}
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	manifest.Checksum = crc32.Checksum(encoded, crc32.MakeTable(crc32.Castagnoli))
+	encoded, err = json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	manifestPath := strings.TrimSuffix(j.path, filepath.Ext(j.path)) + ".manifest"
+	file, err := os.OpenFile(manifestPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) // #nosec G304 -- derived from broker-owned journal path.
+	if err != nil {
+		return fmt.Errorf("open transaction journal manifest: %w", err)
+	}
+	if err := writeFull(file, encoded); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write transaction journal manifest: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync transaction journal manifest: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close transaction journal manifest: %w", err)
+	}
+	if err := syncJournalDirectory(filepath.Dir(manifestPath)); err != nil {
+		return fmt.Errorf("persist transaction journal manifest: %w", err)
 	}
 	return nil
 }

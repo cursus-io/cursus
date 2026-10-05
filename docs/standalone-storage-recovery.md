@@ -18,7 +18,8 @@ Standalone startup is ordered and fail-closed:
    topic directory.
 3. Validate the broker-owned `__consumer_offsets` topic and replay only
    version-1 metadata records with their required stable keys.
-4. Replay the current checksummed transaction journal.
+4. Replay the current checksummed transaction journal and refresh its
+   checksummed cut manifest before accepting traffic.
 5. Reconcile partition checkpoints and expose the client listener only after
    every recovery dependency is ready.
 
@@ -65,7 +66,7 @@ broker action:
 4. Take a volume snapshot or move the verified state to a read-only forensic
    archive when retention is required.
 5. Remove the complete Cursus persistence unit: topic manifest, every topic
-   partition directory including `__consumer_offsets`, transaction journal,
+   partition directory including `__consumer_offsets`, transaction journal and manifest,
    HWM checkpoints, producer state, event indexes/snapshots, and temporary
    recovery artifacts. Partial deletion is unsupported.
 6. Start the current binary against the empty verified storage root and create

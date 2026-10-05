@@ -6,7 +6,8 @@
 |---|---:|---|---|
 | Application record | CDM4 (CRC32C) | CDM2 and CDM3 records remain readable | Upgrade every reader before a CDM4 writer appends; older binaries cannot read the new records. |
 | Topic manifest | 1 | pre-manifest storage requires offline migration | Do not start a current broker against undeclared persisted topics. |
-| Transaction journal | 1 | bare legacy snapshots are readable | Preserve the journal with all partition and offset data. |
+| Transaction journal | 2 plus checksummed cut manifest | version-1 journal records remain readable | Preserve the journal and its manifest with all partition and offset data. |
+| Event snapshot catalog | v2 (CRC32C) | legacy snapshot files remain readable beside v2 | Preserve both snapshot files until a clean bootstrap removes the legacy boundary. |
 | Consumer metadata records | 3 | earlier record forms are replayed | Upgrade readers before enabling a newer writer contract. |
 | Raft FSM snapshot | 8 | versions 0-7 are restored with documented defaults | Do not run binaries that cannot decode the persisted snapshot version. |
 
@@ -35,7 +36,7 @@ does not indicate a stale lock, and removing it can defeat mutual exclusion.
 
 ## Preflight
 
-Validate a copied backup before using it for a rollback or recovery. The command is read-only: it verifies the explicit topic manifest against the persisted partition layout, scans topic and consumer metadata records, and validates any transaction-journal framing and checksums without starting a broker.
+Validate a copied backup before using it for a rollback or recovery. The command is read-only: it verifies the explicit topic manifest against the persisted partition layout, scans topic and consumer metadata records, validates the transaction journal against its checksummed cut manifest, and checks every event snapshot record without starting a broker.
 
 ```bash
 cursus-storage backup validate --log-dir /backup/cursus-logs
@@ -48,8 +49,9 @@ For the fixed three-member Kubernetes topology, use the separate [Kubernetes clu
 Before changing any binary or configuration, stop writes and record the target
 release, `git`/image digest, configuration checksum, member list, leader, ISR,
 and available disk space. Take one immutable backup generation containing the
-topic manifest, transaction journal, consumer-offset logs, every `.log`, its
-matching `.index`, and each `.log.compacted-<size>` sidecar.
+topic manifest, transaction journal and its `.manifest`, event snapshot files,
+consumer-offset logs, every `.log`, its matching `.index`, and each
+`.log.compacted-<size>` sidecar.
 
 Run these read-only checks against the copy, not the production volume:
 
