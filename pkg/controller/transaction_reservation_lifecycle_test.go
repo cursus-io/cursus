@@ -159,6 +159,7 @@ func TestReservationRPCWaitsForReplicatedActivationAndFinalDecision(t *testing.T
 	f.SetTransactionManager(ch.TxnManager)
 	require.Nil(t, f.Apply(&raft.Log{Index: 1, Data: []byte(`REGISTER:{"id":"node-1","addr":"127.0.0.1:7000","status":"active","lifecycle_protocol":3}`)}))
 	definition := topic.DefaultDefinition("input", ch.Config)
+	definition.ReplicationFactor = 1
 	payload, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
 	require.NoError(t, err)
 	require.Nil(t, f.Apply(&raft.Log{Index: 2, Data: append([]byte("TOPIC:"), payload...)}))
@@ -236,6 +237,7 @@ func TestTerminalReservationCleanupTransfersOwnershipWithoutChangingDecisionEpoc
 			f.SetTransactionManager(ch.TxnManager)
 			require.Nil(t, f.Apply(&raft.Log{Index: 1, Data: []byte(`REGISTER:{"id":"node-1","addr":"127.0.0.1:7000","status":"active","lifecycle_protocol":3}`)}))
 			definition := topic.DefaultDefinition("input", ch.Config)
+			definition.ReplicationFactor = 1
 			payload, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
 			require.NoError(t, err)
 			require.Nil(t, f.Apply(&raft.Log{Index: 2, Data: append([]byte("TOPIC:"), payload...)}))
