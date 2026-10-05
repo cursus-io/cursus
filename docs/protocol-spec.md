@@ -455,7 +455,25 @@ byte limit is broker-enforced and may return a smaller batch. A single valid
 record may occupy the entire byte budget. Long polls wake on partition commit
 notifications and stop when the request context is cancelled or its deadline
 expires. A `wait_ms` value larger than the remaining request deadline is
-clamped to that deadline.
+clamped to that deadline and returns an empty batch when the wait expires.
+Explicit cancellation remains an error. The connection idle timer is suspended
+while a request executes and restarts after its response completes.
+
+Bounded committed reads preserve a connection-local scan position across pages
+containing only aborted records or transaction control markers. An empty page
+can therefore mean that scanning will continue on the next poll; it does not
+advance the consumer group's committed offset. STREAM keeps the same scan
+continuation separately from its delivered offset. Reconnecting resumes from
+the normal requested/committed offset and may rescan filtered history.
+
+The broker reads at most one fixed-size frame header ahead of an executing
+request. It admits the next payload only after that request completes. Encoded
+and decoded request payloads share a 256 MiB broker-wide reservation limit,
+including reads in progress and handlers still processing their request. When
+capacity is unavailable, the connection is closed before allocating the payload;
+clients can reconnect with backoff. This limit does not include storage caches
+or all handler allocations. STREAM registration suspends further request reads;
+rejected registration resumes normal request processing.
 
 **STREAM** (continuous push)
 ```

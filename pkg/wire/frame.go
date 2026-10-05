@@ -128,6 +128,13 @@ func (c *Codec) WriteFrame(writer io.Writer, frame Frame) error {
 }
 
 func (c *Codec) ReadFrame(reader io.Reader) (Frame, error) {
+	return c.ReadFrameWithAdmission(reader, nil)
+}
+
+// ReadFrameWithAdmission validates the header, then admits its encoded and decoded
+// payload sizes before allocating either payload. Admission errors consume only
+// the header; callers must close the connection rather than retry that frame.
+func (c *Codec) ReadFrameWithAdmission(reader io.Reader, admit func(int, int) error) (Frame, error) {
 	if c == nil {
 		return Frame{}, fmt.Errorf("%w: nil codec", ErrInvalidFrame)
 	}
@@ -139,6 +146,11 @@ func (c *Codec) ReadFrame(reader io.Reader) (Frame, error) {
 	if err != nil {
 		recordProtocolFailure(err)
 		return Frame{}, err
+	}
+	if admit != nil {
+		if err := admit(int(header.encodedSize), int(header.decodedSize)); err != nil {
+			return Frame{}, err
+		}
 	}
 	payload := make([]byte, header.encodedSize)
 	if _, err := io.ReadFull(reader, payload); err != nil {

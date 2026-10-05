@@ -305,3 +305,13 @@ before application commands. The two fields must be configured together.
 Authentication and authorization failures are returned as typed
 `*sdk.BrokerError` values. TLS remains required when credentials cross an
 untrusted network.
+
+
+### Empty bounded fetches
+
+An empty `CONSUME` batch can indicate an elapsed long poll or a scan page containing
+only invisible transactional records. Continue polling on the same connection so
+the broker can resume its bounded scan. Reconnecting resolves the requested or
+committed offset again and may rescan that history. Empty batches do not commit
+consumer offsets. Request payload capacity rejection closes the connection;
+reconnect with backoff rather than opening an unbounded retry loop.

@@ -730,3 +730,19 @@ ERROR: empty_command_response
 ERROR: unknown_command command=<name>
 ERROR: empty_command
 ```
+
+
+### Bounded fetch continuation and connection lifecycle
+
+`CONSUME` returns an empty batch when its effective long-poll deadline expires;
+explicit cancellation remains an error. In-flight requests do not consume the
+connection's idle timeout. An empty read caused by filtered transaction records
+retains its scan position for the next poll on the same connection. This scan
+position is not a consumer-group commit; reconnecting uses the normal offset
+resolution rules. `STREAM` likewise retains scan progress without advancing its
+delivered offset until records are written.
+
+Request payload admission allows one executing payload per connection, with only
+a fixed-size header read ahead. A broker-wide 256 MiB limit reserves encoded plus
+decoded request payload sizes until processing finishes. Admission failure closes
+the connection before payload allocation; clients should reconnect with backoff.

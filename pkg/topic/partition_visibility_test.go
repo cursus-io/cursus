@@ -117,3 +117,33 @@ func BenchmarkPartitionReadCommittedLargeVisibilityIndex(b *testing.B) {
 		}
 	}
 }
+
+func TestReadCommittedPagePreservesFilteredScanPosition(t *testing.T) {
+	storage := new(MockStorageHandler)
+	storage.On("GetLatestOffset").Return(uint64(0)).Once()
+	storage.On("GetFlushedOffset").Return(uint64(3))
+	storage.On("GetFirstOffset").Return(uint64(0))
+	records := []types.Message{
+		{Offset: 0, Payload: "aborted", TransactionalID: "tx", TransactionState: types.TransactionStateAborted},
+		{Offset: 1, TransactionalID: "tx", TransactionMarker: types.TransactionMarkerAbort},
+		{Offset: 2, Payload: "visible"},
+	}
+	for i := range records {
+		storage.On("ReadMessages", uint64(i), len(records)-i).Return(records[i:], nil)
+	}
+	partition := NewPartition(0, "orders", storage, nil, config.DefaultConfig())
+	partition.SetHWM(3)
+	offset := uint64(0)
+	for i := 0; i < 3; i++ {
+		messages, _, next, err := partition.ReadCommittedPage(offset, 1, 1, true)
+		require.NoError(t, err)
+		require.Greater(t, next, offset)
+		if i < 2 {
+			require.Empty(t, messages)
+		} else {
+			require.Len(t, messages, 1)
+			require.Equal(t, "visible", messages[0].Payload)
+		}
+		offset = next
+	}
+}

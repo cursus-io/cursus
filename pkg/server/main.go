@@ -518,13 +518,28 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 	}
 	_ = conn.SetDeadline(time.Time{})
 
-	requests := make(chan wire.Frame, 1)
+	activity := &requestActivity{conn: conn, last: time.Now()}
+	requests := make(chan admittedRequest)
 	readPumpCtx, stopReadPump := context.WithCancel(clientCtx)
-	defer stopReadPump()
-	go pumpWireRequests(readPumpCtx, cancel, conn, wireConnection, idleTimeout, requests)
-
+	pumpDone := make(chan struct{})
+	// Keep partial headers/payloads across polling deadlines instead of restarting
+	// frame decoding after a timeout in the middle of a frame.
+	reader := &requestReader{Conn: conn, ctx: readPumpCtx, activity: activity, idleTimeout: idleTimeout}
+	wireConnection.SetReader(reader)
+	go func() {
+		defer close(pumpDone)
+		pumpWireRequests(readPumpCtx, cancel, wireConnection, activity, requests)
+	}()
+	defer func() {
+		stopReadPump()
+		_ = conn.SetReadDeadline(time.Now())
+		<-pumpDone
+		if isStreamed {
+			_ = conn.SetReadDeadline(time.Time{})
+		}
+	}()
 	for {
-		var request wire.Frame
+		var request admittedRequest
 		select {
 		case <-clientCtx.Done():
 			return
@@ -534,66 +549,27 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 			}
 			request = next
 		}
-
-		responseConn.setRequest(request)
+		// A STREAM frame is a pump barrier. No subsequent read starts until this
+		// request fails; successful registration transfers the connection completely.
+		if request.frame.Command == wire.CommandStream {
+			_ = conn.SetReadDeadline(time.Time{})
+		}
+		responseConn.setRequest(request.frame)
 		requestCtx, cancelRequest := context.WithTimeout(clientCtx, clientRequestTimeout(cmdHandler.Config))
 		cmdCtx.SetRequestContext(requestCtx)
-		shouldExit, err := processMessage(request.Payload, cmdHandler, cmdCtx, responseConn)
+		shouldExit, err := processMessage(request.frame.Payload, cmdHandler, cmdCtx, responseConn)
 		cmdCtx.SetRequestContext(clientCtx)
 		cancelRequest()
+		if shouldExit || err != nil {
+			stopReadPump()
+		}
+		request.frame.Payload = nil
+		request.finish()
 		if err != nil {
 			return
 		}
 		if shouldExit {
-			if request.Command == wire.CommandStream {
-				isStreamed = true
-			}
-			stopReadPump()
-			_ = conn.SetReadDeadline(time.Now())
-			return
-		}
-	}
-}
-
-// pumpWireRequests keeps connection liveness observable while a handler is
-// processing a request. A terminal read error cancels the connection context,
-// which releases request handlers such as CONSUME long polls immediately.
-func pumpWireRequests(ctx context.Context, cancelConnection context.CancelFunc, conn net.Conn, connection *wire.Connection, idleTimeout time.Duration, requests chan<- wire.Frame) {
-	defer close(requests)
-	lastActivity := time.Now()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		deadline := time.Now().Add(readDeadlinePoll)
-		idleDeadline := lastActivity.Add(idleTimeout)
-		if idleDeadline.Before(deadline) {
-			deadline = idleDeadline
-		}
-		if err := conn.SetReadDeadline(deadline); err != nil {
-			util.Error("⚠️ SetReadDeadline error: %v", err)
-			cancelConnection()
-			return
-		}
-
-		request, err := readWireRequest(connection)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() && time.Since(lastActivity) < idleTimeout {
-				continue
-			}
-			cancelConnection()
-			return
-		}
-		lastActivity = time.Now()
-		select {
-		case requests <- request:
-		case <-ctx.Done():
+			isStreamed = request.frame.Command == wire.CommandStream
 			return
 		}
 	}

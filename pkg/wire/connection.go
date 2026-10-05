@@ -2,6 +2,7 @@ package wire
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"sync"
 )
@@ -12,6 +13,7 @@ import (
 type Connection struct {
 	conn    net.Conn
 	codec   *Codec
+	reader  io.Reader
 	readMu  sync.Mutex
 	writeMu sync.Mutex
 }
@@ -108,12 +110,21 @@ func (c *Connection) Compression() Compression {
 }
 
 func (c *Connection) ReadFrame() (Frame, error) {
+	return c.ReadFrameWithAdmission(nil)
+}
+
+// ReadFrameWithAdmission reserves payload capacity before the codec allocates it.
+func (c *Connection) ReadFrameWithAdmission(admit func(int, int) error) (Frame, error) {
 	if c == nil || c.conn == nil || c.codec == nil {
 		return Frame{}, fmt.Errorf("wire v2 connection is not initialized")
 	}
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
-	return c.codec.ReadFrame(c.conn)
+	reader := c.reader
+	if reader == nil {
+		reader = c.conn
+	}
+	return c.codec.ReadFrameWithAdmission(reader, admit)
 }
 
 func (c *Connection) WriteFrame(frame Frame) error {
@@ -123,4 +134,12 @@ func (c *Connection) WriteFrame(frame Frame) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return c.codec.WriteFrame(c.conn, frame)
+}
+
+// SetReader installs a framing reader before request processing starts. It must
+// refer to the same byte stream as the negotiated connection.
+func (c *Connection) SetReader(reader io.Reader) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	c.reader = reader
 }

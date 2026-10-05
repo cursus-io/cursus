@@ -9,7 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/stream"
+	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/pkg/wire"
+	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -155,4 +160,80 @@ func cloneStringMap(source map[string]string) map[string]string {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+func TestConsumeNotificationDeadlineIsAnElapsedWait(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	require.ErrorIs(t, waitForConsumeNotification(ctx, time.Hour, nil), errConsumeWaitElapsed)
+	canceled, stop := context.WithCancel(context.Background())
+	stop()
+	require.ErrorIs(t, waitForConsumeNotification(canceled, time.Hour, nil), context.Canceled)
+}
+
+func TestConsumeRetainsScanProgressThroughFilteredPages(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	storage := &authTestStorage{messages: []types.Message{
+		{Offset: 0, Payload: "invisible", TransactionalID: "aborted", TransactionState: types.TransactionStateAborted},
+		{Offset: 1, Payload: "visible"},
+	}}
+	topics := topic.NewTopicManager(cfg, &authStorageProvider{storage: storage}, nil)
+	require.NoError(t, topics.CreateTopic("scan-progress", 1, false, false))
+	handler := NewCommandHandler(topics, cfg, nil, nil, nil)
+	defer handler.Close()
+	partition, err := topics.GetTopic("scan-progress").GetPartition(0)
+	require.NoError(t, err)
+	partition.SetHWM(2)
+	ctx := NewClientContext("g", 0)
+	args := CommonArgs{TopicName: "scan-progress", PartitionID: 0, HasOffset: true, Offset: 0}
+	first, _, err := handler.readFromTopicBounded("scan-progress", args, ctx, 1, 1, true)
+	require.NoError(t, err)
+	require.Empty(t, first)
+	require.Equal(t, uint64(1), ctx.OffsetCache["scan-progress-0"])
+	next, _, err := handler.readFromTopicBounded("scan-progress", args, ctx, 1, 1, true)
+	require.NoError(t, err)
+	require.Len(t, next, 1)
+	require.Equal(t, "visible", next[0].Payload)
+}
+
+// A small fixture models a disk page that consumes the complete byte budget.
+type fullPageStorage struct{ *authTestStorage }
+
+func (s *fullPageStorage) ReadMessagesBounded(offset uint64, max, maxBytes int, allow bool) ([]types.Message, int, error) {
+	messages, err := s.ReadMessages(offset, 1)
+	if len(messages) == 0 {
+		return messages, 0, err
+	}
+	return messages, maxBytes, err
+}
+
+func TestStreamAdvancesPastEmptyFilteredPage(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	storage := &fullPageStorage{&authTestStorage{messages: []types.Message{
+		{Offset: 0, Payload: "hidden", TransactionalID: "tx", TransactionState: types.TransactionStateAborted},
+		{Offset: 1, Payload: "visible"},
+	}}}
+	topics := topic.NewTopicManager(cfg, &authStorageProvider{storage: storage}, nil)
+	require.NoError(t, topics.CreateTopic("scan-stream", 1, false, false))
+	partition, err := topics.GetTopic("scan-stream").GetPartition(0)
+	require.NoError(t, err)
+	partition.SetHWM(2)
+	manager := stream.NewStreamManager(1, time.Minute)
+	handler := NewCommandHandler(topics, cfg, nil, manager, nil)
+	defer handler.Close()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer manager.RemoveStream("scan-stream:0:g")
+	defer client.Close()
+	require.NoError(t, handler.HandleStreamCommand(server, "STREAM topic=scan-stream partition=0 group=g batch=1", NewClientContext("g", 0)))
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(2*time.Second)))
+	payload, err := util.ReadWithLength(client)
+	require.NoError(t, err)
+	batch, err := util.DecodeBatchMessages(payload)
+	require.NoError(t, err)
+	require.Len(t, batch.Messages, 1)
+	require.Equal(t, "visible", batch.Messages[0].Payload)
+	require.Equal(t, uint64(1), batch.Messages[0].Offset)
 }

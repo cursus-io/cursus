@@ -76,7 +76,7 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 				return err
 			}
 			remainingBytes -= decodedBytes
-			if remainingBytes <= 0 {
+			if remainingBytes <= 0 || (len(messages) == 0 && decodedBytes > 0) {
 				fetchBudgetExhausted = true
 			}
 			if len(messages) > 0 {
@@ -97,7 +97,7 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 			return 0, err
 		}
 		deadline := time.Now().Add(waitTimeout)
-		for totalStreamed == 0 && !fetchBudgetExhausted {
+		for waitTimeout > 0 && totalStreamed == 0 && !fetchBudgetExhausted {
 			// Subscribe before reading so an append between the read and wait
 			// closes the captured generation instead of being missed.
 			notifications, err := ch.consumeNotifications(matchedTopics, cArgs.PartitionID)
@@ -110,7 +110,7 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 				}
 				return 0, err
 			}
-			if totalStreamed > 0 {
+			if totalStreamed > 0 || fetchBudgetExhausted {
 				break
 			}
 			if err := waitForConsumeNotification(requestCtx, time.Until(deadline), notifications); err != nil {
@@ -177,15 +177,16 @@ func (ch *CommandHandler) readFromTopicBounded(topicName string, cArgs CommonArg
 		currentOffset = actualOffset
 	}
 
-	messages, decodedBytes, err := readPartitionMessagesBounded(p, currentOffset, batchSize, maxBytes, allowOversizedFirst, cArgs.ReadIsolation)
+	messages, decodedBytes, nextScan, err := readPartitionPage(p, currentOffset, batchSize, maxBytes, allowOversizedFirst, cArgs.ReadIsolation)
 	if err != nil {
 		util.Error("Failed to read messages from topic %s: %v", topicName, err)
 		return nil, 0, err
 	}
 
-	if len(messages) > 0 {
-		lastMsg := messages[len(messages)-1]
-		ctx.OffsetCache[cacheKey] = lastMsg.Offset + 1
+	// This connection-local cursor can advance through aborted/control records
+	// without acknowledging or exposing them to the consumer group.
+	if nextScan > currentOffset {
+		ctx.OffsetCache[cacheKey] = nextScan
 	}
 
 	return messages, decodedBytes, nil
@@ -194,13 +195,16 @@ func (ch *CommandHandler) readFromTopicBounded(topicName string, cArgs CommonArg
 var errConsumeWaitElapsed = errors.New("consume wait elapsed")
 
 func effectiveConsumeWait(ctx context.Context, requested time.Duration) (time.Duration, error) {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return 0, nil
+	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return 0, context.DeadlineExceeded
+			return 0, nil
 		}
 		if remaining < requested {
 			return remaining, nil
@@ -242,6 +246,9 @@ func waitForConsumeNotification(ctx context.Context, timeout time.Duration, noti
 	selected, _, _ := reflect.Select(cases)
 	switch selected {
 	case 0:
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return errConsumeWaitElapsed
+		}
 		return ctx.Err()
 	case 1:
 		return errConsumeWaitElapsed
@@ -338,19 +345,33 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 
 	streamConn.SetMessageSource(p.MessageNotification)
 
+	// The stream invokes readFn serially. Keep scan progress distinct from its
+	// delivered offset so empty filtered pages cannot strand later visible data.
+	scanOffset := actualOffset
 	readFn := func(offset uint64, max int) ([]types.Message, error) {
-		messages, _, err := readPartitionMessagesBounded(p, offset, max, wire.MaxFetchDecodedBytes, true, cArgs.ReadIsolation)
+		if offset > scanOffset {
+			scanOffset = offset
+		}
+		messages, _, next, err := readPartitionPage(p, scanOffset, max, wire.MaxFetchDecodedBytes, true, cArgs.ReadIsolation)
+		if err == nil {
+			scanOffset = next
+		}
 		return messages, err
 	}
 
 	return ch.StreamManager.AddStream(streamKey, streamConn, readFn)
 }
 
-func readPartitionMessagesBounded(p *topic.Partition, offset uint64, maxRecords, maxBytes int, allowOversizedFirst bool, isolation string) ([]types.Message, int, error) {
+func readPartitionPage(p *topic.Partition, offset uint64, maxRecords, maxBytes int, allowOversizedFirst bool, isolation string) ([]types.Message, int, uint64, error) {
 	if isolation == ReadIsolationUncommitted {
-		return p.ReadMessagesBounded(offset, maxRecords, maxBytes, allowOversizedFirst)
+		messages, bytes, err := p.ReadMessagesBounded(offset, maxRecords, maxBytes, allowOversizedFirst)
+		next := offset
+		if err == nil && len(messages) > 0 {
+			next = messages[len(messages)-1].Offset + 1
+		}
+		return messages, bytes, next, err
 	}
-	return p.ReadCommittedBounded(offset, maxRecords, maxBytes, allowOversizedFirst)
+	return p.ReadCommittedPage(offset, maxRecords, maxBytes, allowOversizedFirst)
 }
 
 func (ch *CommandHandler) validateStreamSyntax(cmd, raw string) string {
