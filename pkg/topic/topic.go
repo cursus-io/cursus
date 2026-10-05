@@ -134,8 +134,18 @@ func newTopicWithDefinition(definition Definition, hp HandlerProvider, cfg *conf
 			return nil, fmt.Errorf("open handler for %s[%d]: %w", definition.Name, i, err)
 		}
 		p := NewPartition(i, definition.Name, dh, sm, cfg)
+		if err := p.RecoveryError(); err != nil {
+			p.Close()
+			closePartiallyInitializedTopic(definition.Name, hp, partitions[:i])
+			return nil, fmt.Errorf("recover partition %s[%d]: %w", definition.Name, i, err)
+		}
 		p.isIdempotent = definition.Idempotent
-		p.RecoverProducerStateFromLog()
+		if err := p.RecoverProducerStateFromLog(); err != nil {
+			p.setRecoveryError(fmt.Errorf("recover producer state: %w", err))
+			p.Close()
+			closePartiallyInitializedTopic(definition.Name, hp, partitions[:i])
+			return nil, fmt.Errorf("recover producer state for %s[%d]: %w", definition.Name, i, err)
+		}
 		p.StartProducerStateMaintenance()
 		partitions[i] = p
 	}
@@ -289,10 +299,18 @@ func (t *Topic) applyFullDefinitionLocked(definition Definition, hp HandlerProvi
 			return fmt.Errorf("failed to attach partition %d for topic '%s': %w", idx, t.Name, err)
 		}
 		partition := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
+		if err := partition.RecoveryError(); err != nil {
+			closePreparedPartitions(t.Name, hp, append(staged, partition))
+			return fmt.Errorf("recover partition %d for topic '%s': %w", idx, t.Name, err)
+		}
 		partition.SetTransactionDecisionResolver(t.txnResolver)
 		partition.SetDistributedCompactionGate(t.compactionGate)
 		partition.isIdempotent = t.IsIdempotent
-		partition.RecoverProducerStateFromLog()
+		if err := partition.RecoverProducerStateFromLog(); err != nil {
+			partition.setRecoveryError(fmt.Errorf("recover producer state: %w", err))
+			closePreparedPartitions(t.Name, hp, append(staged, partition))
+			return fmt.Errorf("recover producer state for partition %d of topic '%s': %w", idx, t.Name, err)
+		}
 		partition.StartProducerStateMaintenance()
 		staged = append(staged, partition)
 	}

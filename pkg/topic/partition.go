@@ -55,40 +55,45 @@ type transactionCoordinatorEpochResolver interface {
 
 // Partition handles messages for one shard of a topic.
 type Partition struct {
-	id                    int
-	topic                 string
-	messageNotifyMu       sync.Mutex
-	messageGeneration     uint64
-	messageNotifyCh       chan struct{}
-	LEO                   atomic.Uint64
-	HWM                   uint64
-	mu                    sync.RWMutex
-	reconcileMu           sync.RWMutex
-	snapshotRecovery      bool
-	recoveryCheckpointHWM uint64
-	recoverySnapshotHWM   uint64
-	dh                    types.StorageHandler
-	closed                bool
-	streamManager         StreamManager
-	hwmCheckpointPath     string
-	hwmCheckpointCh       chan struct{}
-	hwmCheckpointMu       sync.Mutex
-	hwmCheckpointWG       sync.WaitGroup
-	producerStatePath     string
-	producerStateCh       chan struct{}
-	producerStateMu       sync.RWMutex
-	producerCheckpointMu  sync.Mutex
-	producerStateWG       sync.WaitGroup
-	producerState         sync.Map // map[string]*producerEntry
-	producerStateIndex    map[string]producerStateCheckpointEntry
-	isIdempotent          bool
-	producerStateTTL      time.Duration
-	txnMarkerMu           sync.RWMutex
-	txnResolver           TransactionDecisionResolver
-	txnMarkers            map[transactionMarkerKey]transactionMarkerInfo
-	txnOpenOffsets        map[transactionMarkerKey]uint64
-	txnRetentionFloor     uint64
-	closeCh               chan struct{}
+	id                         int
+	topic                      string
+	messageNotifyMu            sync.Mutex
+	messageGeneration          uint64
+	messageNotifyCh            chan struct{}
+	LEO                        atomic.Uint64
+	HWM                        uint64
+	hwmAuthoritative           bool
+	distributed                bool
+	mu                         sync.RWMutex
+	reconcileMu                sync.RWMutex
+	recoveryMu                 sync.RWMutex
+	recoveryErr                error
+	snapshotRecovery           bool
+	recoveryCheckpointHWM      uint64
+	recoverySnapshotHWM        uint64
+	dh                         types.StorageHandler
+	closed                     bool
+	streamManager              StreamManager
+	hwmCheckpointPath          string
+	hwmCheckpointCh            chan struct{}
+	hwmCheckpointMu            sync.Mutex
+	hwmCheckpointWG            sync.WaitGroup
+	producerStatePath          string
+	producerStateCh            chan struct{}
+	producerStateMu            sync.RWMutex
+	producerCheckpointMu       sync.Mutex
+	producerStateWG            sync.WaitGroup
+	producerState              sync.Map // map[string]*producerEntry
+	producerStateIndex         map[string]producerStateCheckpointEntry
+	producerStateCoveredOffset uint64
+	isIdempotent               bool
+	producerStateTTL           time.Duration
+	txnMarkerMu                sync.RWMutex
+	txnResolver                TransactionDecisionResolver
+	txnMarkers                 map[transactionMarkerKey]transactionMarkerInfo
+	txnOpenOffsets             map[transactionMarkerKey]uint64
+	txnRetentionFloor          uint64
+	closeCh                    chan struct{}
 }
 
 func (p *Partition) SetTransactionDecisionResolver(resolver TransactionDecisionResolver) {
@@ -138,6 +143,8 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		txnOpenOffsets:     make(map[transactionMarkerKey]uint64),
 		producerStateIndex: make(map[string]producerStateCheckpointEntry),
 		producerStateTTL:   producerStateTTLFromConfig(cfg),
+		hwmAuthoritative:   cfg == nil || !cfg.EnabledDistribution,
+		distributed:        cfg != nil && cfg.EnabledDistribution,
 	}
 
 	p.LEO.Store(initialOffset)
@@ -149,15 +156,29 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		p.producerStatePath = producerStateCheckpointPath(handler, id)
 		p.producerStateCh = make(chan struct{}, 1)
 		durableTail := handler.GetAbsoluteOffset()
-		if persistedHWM, ok := loadHWMCheckpoint(p.hwmCheckpointPath); ok {
+		if persistedHWM, ok, versioned := loadHWMCheckpoint(p.hwmCheckpointPath); ok {
 			if persistedHWM > durableTail {
-				util.Warn("clamping HWM checkpoint %s from %d to durable tail %d", p.hwmCheckpointPath, persistedHWM, durableTail)
-				p.HWM = durableTail
+				if p.distributed {
+					util.Warn("fencing distributed partition with HWM checkpoint %s ahead of durable tail: hwm=%d tail=%d", p.hwmCheckpointPath, persistedHWM, durableTail)
+					p.HWM = 0
+					p.hwmAuthoritative = false
+				} else {
+					util.Warn("clamping HWM checkpoint %s from %d to durable tail %d", p.hwmCheckpointPath, persistedHWM, durableTail)
+					p.HWM = durableTail
+				}
 			} else {
 				p.HWM = persistedHWM
+				if p.distributed {
+					p.hwmAuthoritative = versioned
+				}
 			}
 		} else {
-			p.HWM = durableTail
+			if p.distributed {
+				p.HWM = 0
+				p.hwmAuthoritative = false
+			} else {
+				p.HWM = durableTail
+			}
 		}
 		handler.SetOnSync(func(uint64) { p.NotifyNewMessage() })
 	}
@@ -170,10 +191,46 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		p.loadProducerStateCheckpoint()
 	}
 	if _, ok := dh.(*disk.DiskHandler); ok {
-		p.rebuildTransactionMarkerIndex()
+		if err := p.rebuildTransactionMarkerIndex(); err != nil {
+			p.setRecoveryError(fmt.Errorf("rebuild transaction visibility index: %w", err))
+		}
 	}
 
 	return p
+}
+
+func (p *Partition) setRecoveryError(err error) {
+	if err == nil {
+		return
+	}
+	p.recoveryMu.Lock()
+	p.recoveryErr = errors.Join(p.recoveryErr, err)
+	p.recoveryMu.Unlock()
+}
+
+func (p *Partition) RecoveryError() error {
+	p.recoveryMu.RLock()
+	defer p.recoveryMu.RUnlock()
+	return p.recoveryErr
+}
+
+func (p *Partition) hwmReadinessError() error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.hwmReadinessErrorLocked()
+}
+
+func (p *Partition) hwmReadinessErrorLocked() error {
+	if p.distributed && !p.hwmAuthoritative {
+		return fmt.Errorf("authoritative committed HWM is not established")
+	}
+	return nil
+}
+
+func (p *Partition) HWMKnown() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return !p.distributed || p.hwmAuthoritative
 }
 
 func (p *Partition) validateProducerMessage(msg *types.Message) (bool, error) {
@@ -287,6 +344,12 @@ func (p *Partition) Enqueue(msg types.Message) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if err := p.RecoveryError(); err != nil {
+		return fmt.Errorf("partition recovery incomplete: %w", err)
+	}
+	if err := p.hwmReadinessErrorLocked(); err != nil {
+		return err
+	}
 	if p.closed {
 		util.Warn("⚠️ Partition closed, dropping message [partition-%d]", p.id)
 		return fmt.Errorf("partition %d is closed", p.id)
@@ -329,6 +392,12 @@ func (p *Partition) EnqueueSyncIdempotent(msg types.Message) error {
 func (p *Partition) enqueueSync(msg types.Message, forceIdempotent bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := p.RecoveryError(); err != nil {
+		return fmt.Errorf("partition recovery incomplete: %w", err)
+	}
+	if err := p.hwmReadinessErrorLocked(); err != nil {
+		return err
+	}
 	if p.closed {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
@@ -376,6 +445,12 @@ func (p *Partition) EnqueueBatchSyncWithMode(msgs []types.Message, forceIdempote
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if err := p.RecoveryError(); err != nil {
+		return fmt.Errorf("partition recovery incomplete: %w", err)
+	}
+	if err := p.hwmReadinessErrorLocked(); err != nil {
+		return err
+	}
 	if p.closed {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
@@ -410,6 +485,12 @@ func (p *Partition) EnqueueBatchSyncWithMode(msgs []types.Message, forceIdempote
 func (p *Partition) EnqueueBatch(msgs []types.Message) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := p.RecoveryError(); err != nil {
+		return fmt.Errorf("partition recovery incomplete: %w", err)
+	}
+	if err := p.hwmReadinessErrorLocked(); err != nil {
+		return err
+	}
 	if p.closed {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
@@ -452,6 +533,12 @@ func (p *Partition) EnqueueBatchLeader(msgs []types.Message) error {
 func (p *Partition) EnqueueBatchLeaderWithMode(msgs []types.Message, forceIdempotent bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := p.RecoveryError(); err != nil {
+		return fmt.Errorf("partition recovery incomplete: %w", err)
+	}
+	if err := p.hwmReadinessErrorLocked(); err != nil {
+		return err
+	}
 	if p.closed {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
@@ -543,7 +630,12 @@ func (p *Partition) EnqueueBatchLeaderWithMode(msgs []types.Message, forceIdempo
 func (p *Partition) AdvanceHWM() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.setHWMLocked(p.LEO.Load())
+	wasAuthoritative := p.hwmAuthoritative
+	p.hwmAuthoritative = true
+	if !p.setHWMLocked(p.LEO.Load()) && !wasAuthoritative {
+		p.signalHWMCheckpointLocked()
+		p.NotifyNewMessage()
+	}
 }
 
 // ReplicaAppend writes messages with pre-assigned offsets from the leader
@@ -771,6 +863,12 @@ func (p *Partition) FirstOffset() uint64 {
 // LastStableOffset returns the first offset that may still be blocked by an
 // unresolved transaction, capped by the committed and flushed partition tail.
 func (p *Partition) LastStableOffset() uint64 {
+	if p.RecoveryError() != nil {
+		return 0
+	}
+	if p.hwmReadinessError() != nil {
+		return 0
+	}
 	p.mu.RLock()
 	hwm := p.HWM
 	p.mu.RUnlock()
@@ -799,6 +897,12 @@ func (p *Partition) ReadCommittedBounded(offset uint64, max, maxBytes int, allow
 // ReadCommittedPage returns the next scanned offset even when every decoded
 // record was filtered out. Callers retain it separately from delivered offsets.
 func (p *Partition) ReadCommittedPage(offset uint64, max, maxBytes int, allowOversizedFirst bool) ([]types.Message, int, uint64, error) {
+	if err := p.RecoveryError(); err != nil {
+		return nil, 0, offset, fmt.Errorf("partition recovery incomplete: %w", err)
+	}
+	if err := p.hwmReadinessError(); err != nil {
+		return nil, 0, offset, err
+	}
 	p.mu.RLock()
 	hwm := p.HWM
 	p.mu.RUnlock()
@@ -836,6 +940,12 @@ func (p *Partition) ReadCommittedPage(offset uint64, max, maxBytes int, allowOve
 // rules while ensuring callers cannot accidentally read records appended after
 // a page's captured end offset.
 func (p *Partition) ReadCommittedRange(offset, endOffset uint64, max int) ([]types.Message, error) {
+	if err := p.RecoveryError(); err != nil {
+		return nil, fmt.Errorf("partition recovery incomplete: %w", err)
+	}
+	if err := p.hwmReadinessError(); err != nil {
+		return nil, err
+	}
 	p.mu.RLock()
 	hwm := p.HWM
 	p.mu.RUnlock()
@@ -862,6 +972,12 @@ func (p *Partition) ReadCommittedRange(offset, endOffset uint64, max int) ([]typ
 }
 
 func (p *Partition) readCommittedMetadata(offset uint64, max int) ([]types.Message, error) {
+	if err := p.RecoveryError(); err != nil {
+		return nil, fmt.Errorf("partition recovery incomplete: %w", err)
+	}
+	if err := p.hwmReadinessError(); err != nil {
+		return nil, err
+	}
 	if max <= 0 {
 		return nil, nil
 	}
@@ -1013,14 +1129,19 @@ func (p *Partition) pruneTransactionIndex(retentionFloor uint64) {
 	p.txnRetentionFloor = retentionFloor
 }
 
-func (p *Partition) rebuildTransactionMarkerIndex() {
+func (p *Partition) rebuildTransactionMarkerIndex() error {
 	if p.dh == nil {
-		return
+		return nil
 	}
 	first := p.dh.GetFirstOffset()
 	durableTail := p.dh.GetAbsoluteOffset()
 	if durableTail <= first {
-		return
+		p.txnMarkerMu.Lock()
+		p.txnMarkers = make(map[transactionMarkerKey]transactionMarkerInfo)
+		p.txnOpenOffsets = make(map[transactionMarkerKey]uint64)
+		p.txnRetentionFloor = first
+		p.txnMarkerMu.Unlock()
+		return nil
 	}
 	markers := make(map[transactionMarkerKey]transactionMarkerInfo)
 	openOffsets := make(map[transactionMarkerKey]uint64)
@@ -1028,10 +1149,16 @@ func (p *Partition) rebuildTransactionMarkerIndex() {
 	const batchSize = 1024
 	for offset < durableTail {
 		msgs, err := p.dh.ReadMessages(offset, batchSize)
-		if err != nil || len(msgs) == 0 {
-			break
+		if err != nil {
+			return fmt.Errorf("read transaction recovery page at offset %d: %w", offset, err)
+		}
+		if len(msgs) == 0 {
+			return fmt.Errorf("transaction recovery returned an empty page before durable tail: offset=%d tail=%d", offset, durableTail)
 		}
 		for _, msg := range msgs {
+			if msg.Offset < offset || msg.Offset >= durableTail {
+				return fmt.Errorf("transaction recovery returned invalid offset %d for range [%d,%d)", msg.Offset, offset, durableTail)
+			}
 			if msg.TransactionalID != "" && msg.TransactionMarker != types.TransactionMarkerNone {
 				key := messageTransactionMarkerKey(msg)
 				if existing, ok := markers[key]; !ok || msg.Offset >= existing.offset {
@@ -1046,12 +1173,9 @@ func (p *Partition) rebuildTransactionMarkerIndex() {
 			}
 			next := msg.Offset + 1
 			if next <= offset {
-				next = offset + 1
+				return fmt.Errorf("transaction recovery did not advance from offset %d", offset)
 			}
 			offset = next
-		}
-		if len(msgs) < batchSize {
-			break
 		}
 	}
 	p.txnMarkerMu.Lock()
@@ -1059,6 +1183,7 @@ func (p *Partition) rebuildTransactionMarkerIndex() {
 	p.txnOpenOffsets = openOffsets
 	p.txnRetentionFloor = first
 	p.txnMarkerMu.Unlock()
+	return nil
 }
 
 type transactionMarkerKey struct {
@@ -1133,27 +1258,37 @@ func isReadCommittedVisible(msg types.Message, hwm uint64, markers map[transacti
 		transactionDecisionMatchesMarker(key, marker, resolver)
 }
 
-func (p *Partition) RecoverProducerStateFromLog() {
+func (p *Partition) RecoverProducerStateFromLog() error {
 	if p.dh == nil || p.producerStateCh == nil {
-		return
+		return nil
 	}
 
 	first := p.dh.GetFirstOffset()
 	durableTail := p.dh.GetAbsoluteOffset()
 	if durableTail <= first {
-		return
+		p.producerStateMu.Lock()
+		p.producerStateIndex = make(map[string]producerStateCheckpointEntry)
+		p.producerStateCoveredOffset = durableTail
+		p.producerStateMu.Unlock()
+		return nil
 	}
 	offset := first
 	const batchSize = 1024
 	now := time.Now()
 	recovered := make(map[string]producerStateCheckpointEntry)
 
-	for {
+	for offset < durableTail {
 		msgs, err := p.dh.ReadMessages(offset, batchSize)
-		if err != nil || len(msgs) == 0 {
-			break
+		if err != nil {
+			return fmt.Errorf("read producer recovery page at offset %d: %w", offset, err)
+		}
+		if len(msgs) == 0 {
+			return fmt.Errorf("producer recovery returned an empty page before durable tail: offset=%d tail=%d", offset, durableTail)
 		}
 		for _, msg := range msgs {
+			if msg.Offset < offset || msg.Offset >= durableTail {
+				return fmt.Errorf("producer recovery returned invalid offset %d for range [%d,%d)", msg.Offset, offset, durableTail)
+			}
 			if msg.ProducerID != "" && msg.SeqNum > 0 {
 				candidate := producerStateCheckpointEntry{Epoch: msg.Epoch, Seq: msg.SeqNum, Offset: msg.Offset}
 				if current, ok := recovered[msg.ProducerID]; !ok || producerStateAfter(candidate, current) {
@@ -1162,25 +1297,25 @@ func (p *Partition) RecoverProducerStateFromLog() {
 			}
 			next := msg.Offset + 1
 			if next <= offset {
-				next = offset + 1
+				return fmt.Errorf("producer recovery did not advance from offset %d", offset)
 			}
 			offset = next
 		}
-		if len(msgs) < batchSize || offset >= durableTail {
-			break
-		}
 	}
 	p.producerStateMu.Lock()
+	p.producerStateIndex = make(map[string]producerStateCheckpointEntry, len(recovered))
+	p.producerState.Range(func(key, _ any) bool {
+		p.producerState.Delete(key)
+		return true
+	})
 	for producerID, entry := range recovered {
-		if current, ok := p.producerStateIndex[producerID]; ok && !producerStateAfter(entry, current) {
-			entry = current
-		} else {
-			p.producerStateIndex[producerID] = entry
-		}
+		p.producerStateIndex[producerID] = entry
 		p.producerState.Store(producerID, &producerEntry{lastEpoch: entry.Epoch, lastSeq: entry.Seq, lastSeen: now})
 	}
+	p.producerStateCoveredOffset = durableTail
 	p.producerStateMu.Unlock()
 	p.signalProducerStateCheckpoint()
+	return nil
 }
 
 func producerStateAfter(candidate, current producerStateCheckpointEntry) bool {
@@ -1194,6 +1329,9 @@ func producerStateAfter(candidate, current producerStateCheckpointEntry) bool {
 // only the latest sequence, so duplicate acknowledgement and replication
 // recovery use the log as the authoritative lookup source.
 func (p *Partition) ProducerSequenceOffset(producerID string, epoch int64, sequence uint64) (uint64, bool, error) {
+	if err := p.RecoveryError(); err != nil {
+		return 0, false, fmt.Errorf("partition recovery incomplete: %w", err)
+	}
 	if producerID == "" || sequence == 0 {
 		return 0, false, fmt.Errorf("producer ID and positive sequence are required")
 	}
@@ -1320,7 +1458,12 @@ func (p *Partition) ApplyReplicaHWM(hwm uint64) error {
 	if hwm > p.LEO.Load() {
 		return fmt.Errorf("commit watermark %d is ahead of local LEO %d", hwm, p.LEO.Load())
 	}
+	wasAuthoritative := p.hwmAuthoritative
+	p.hwmAuthoritative = true
 	if p.setHWMLocked(hwm) {
+		p.NotifyNewMessage()
+	} else if !wasAuthoritative {
+		p.signalHWMCheckpointLocked()
 		p.NotifyNewMessage()
 	}
 	return nil
@@ -1336,7 +1479,16 @@ func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
 	if p.snapshotRecovery {
 		return fmt.Errorf("snapshot replay is still pending: visible_hwm=%d durable_hwm=%d requested_hwm=%d", p.HWM, p.recoveryCheckpointHWM, hwm)
 	}
-	return p.reconcileCommittedHWMLocked(hwm)
+	if err := p.reconcileCommittedHWMLocked(hwm); err != nil {
+		return err
+	}
+	wasAuthoritative := p.hwmAuthoritative
+	p.hwmAuthoritative = true
+	if !wasAuthoritative {
+		p.signalHWMCheckpointLocked()
+		p.NotifyNewMessage()
+	}
+	return nil
 }
 
 // ReconcileSnapshotHWM stages the snapshot visibility boundary without
@@ -1357,6 +1509,7 @@ func (p *Partition) ReconcileSnapshotHWM(snapshotHWM uint64) error {
 	p.recoveryCheckpointHWM = p.HWM
 	p.recoverySnapshotHWM = snapshotHWM
 	p.HWM = min(snapshotHWM, leo)
+	p.hwmAuthoritative = true
 	p.snapshotRecovery = true
 	return nil
 }
@@ -1369,7 +1522,12 @@ func (p *Partition) FinalizeSnapshotRecovery(hwm uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.snapshotRecovery {
-		return p.reconcileCommittedHWMLocked(hwm)
+		if err := p.reconcileCommittedHWMLocked(hwm); err != nil {
+			return err
+		}
+		p.hwmAuthoritative = true
+		p.signalHWMCheckpointLocked()
+		return nil
 	}
 	checkpointHWM := p.recoveryCheckpointHWM
 	snapshotHWM := p.recoverySnapshotHWM
@@ -1397,6 +1555,7 @@ func (p *Partition) FinalizeSnapshotRecovery(hwm uint64) error {
 	if checkpointHWM != hwm {
 		p.signalHWMCheckpointLocked()
 	}
+	p.hwmAuthoritative = true
 	return nil
 }
 
@@ -1438,7 +1597,10 @@ func (p *Partition) reconcileCommittedHWMLocked(hwm uint64) error {
 	p.txnOpenOffsets = make(map[transactionMarkerKey]uint64)
 	p.txnRetentionFloor = 0
 	p.txnMarkerMu.Unlock()
-	p.rebuildTransactionMarkerIndex()
+	if err := p.rebuildTransactionMarkerIndex(); err != nil {
+		p.setRecoveryError(fmt.Errorf("rebuild transaction visibility index after truncation: %w", err))
+		return p.RecoveryError()
+	}
 	p.producerState.Range(func(key, _ any) bool {
 		p.producerState.Delete(key)
 		return true
@@ -1449,13 +1611,21 @@ func (p *Partition) reconcileCommittedHWMLocked(hwm uint64) error {
 	if err := p.persistProducerStateCheckpoint(); err != nil {
 		return fmt.Errorf("persist cleared producer state after truncation: %w", err)
 	}
-	p.RecoverProducerStateFromLog()
+	if err := p.RecoverProducerStateFromLog(); err != nil {
+		p.setRecoveryError(fmt.Errorf("recover producer state after truncation: %w", err))
+		return p.RecoveryError()
+	}
 	return nil
 }
 func (p *Partition) SetHWM(hwm uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	wasAuthoritative := p.hwmAuthoritative
+	p.hwmAuthoritative = true
 	if p.setHWMLocked(hwm) {
+		p.NotifyNewMessage()
+	} else if !wasAuthoritative {
+		p.signalHWMCheckpointLocked()
 		p.NotifyNewMessage()
 	}
 }
@@ -1508,9 +1678,10 @@ func (p *Partition) persistHWMCheckpoint() {
 	p.mu.RLock()
 	checkpointPath := p.hwmCheckpointPath
 	hwm := p.HWM
+	authoritative := p.hwmAuthoritative
 	p.mu.RUnlock()
 
-	if checkpointPath == "" {
+	if checkpointPath == "" || !authoritative {
 		return
 	}
 
@@ -1518,7 +1689,12 @@ func (p *Partition) persistHWMCheckpoint() {
 	defer p.hwmCheckpointMu.Unlock()
 
 	tmp := checkpointPath + ".tmp"
-	data := []byte(strconv.FormatUint(hwm, 10) + "\n")
+	data, err := json.Marshal(hwmCheckpoint{Version: hwmCheckpointVersion, HWM: hwm})
+	if err != nil {
+		util.Warn("failed to marshal HWM checkpoint %s: %v", checkpointPath, err)
+		return
+	}
+	data = append(data, '\n')
 	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -1577,28 +1753,46 @@ func hwmCheckpointPath(dh types.StorageHandler, partitionID int) string {
 	return filepath.Join(filepath.Dir(segmentPath), fmt.Sprintf("partition_%d.hwm", partitionID))
 }
 
-func loadHWMCheckpoint(path string) (uint64, bool) {
+const hwmCheckpointVersion = 2
+
+type hwmCheckpoint struct {
+	Version int    `json:"version"`
+	HWM     uint64 `json:"hwm"`
+}
+
+func loadHWMCheckpoint(path string) (uint64, bool, bool) {
 	if path == "" {
-		return 0, false
+		return 0, false, false
 	}
 	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return 0, false
+		return 0, false, false
+	}
+	return decodeHWMCheckpoint(data)
+}
+
+func decodeHWMCheckpoint(data []byte) (uint64, bool, bool) {
+	var checkpoint hwmCheckpoint
+	if err := json.Unmarshal(data, &checkpoint); err == nil {
+		if checkpoint.Version != hwmCheckpointVersion {
+			return 0, false, false
+		}
+		return checkpoint.HWM, true, true
 	}
 	hwm, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 	if err != nil {
-		util.Warn("ignoring invalid HWM checkpoint %s: %v", path, err)
-		return 0, false
+		return 0, false, false
 	}
-	return hwm, true
+	return hwm, true, false
 }
 
-const producerStateCheckpointVersion = 3
+const producerStateCheckpointVersion = 4
 
 type producerStateCheckpoint struct {
-	Version   int                                     `json:"version"`
-	Producers map[string]producerStateCheckpointEntry `json:"producers"`
+	Version       int                                     `json:"version"`
+	CoveredOffset uint64                                  `json:"covered_offset"`
+	Producers     map[string]producerStateCheckpointEntry `json:"producers"`
 }
 
 type producerStateCheckpointEntry struct {
@@ -1662,8 +1856,13 @@ func (p *Partition) loadProducerStateCheckpoint() {
 	now := time.Now()
 	first := p.dh.GetFirstOffset()
 	durableTail := p.dh.GetAbsoluteOffset()
+	if checkpoint.CoveredOffset < first || checkpoint.CoveredOffset > durableTail {
+		util.Warn("ignoring producer state checkpoint %s with invalid covered offset %d outside [%d,%d]", p.producerStatePath, checkpoint.CoveredOffset, first, durableTail)
+		return
+	}
 	p.producerStateMu.Lock()
 	defer p.producerStateMu.Unlock()
+	p.producerStateCoveredOffset = checkpoint.CoveredOffset
 	for producerID, entry := range checkpoint.Producers {
 		if producerID == "" || entry.Seq == 0 || entry.Offset < first || entry.Offset >= durableTail {
 			continue
@@ -1699,8 +1898,9 @@ func (p *Partition) persistProducerStateCheckpoint() error {
 	}
 
 	checkpoint := producerStateCheckpoint{
-		Version:   producerStateCheckpointVersion,
-		Producers: make(map[string]producerStateCheckpointEntry),
+		Version:       producerStateCheckpointVersion,
+		CoveredOffset: p.producerStateCoveredOffset,
+		Producers:     make(map[string]producerStateCheckpointEntry),
 	}
 	p.producerStateMu.RLock()
 	for producerID, entry := range p.producerStateIndex {
