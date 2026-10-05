@@ -23,7 +23,8 @@ const (
 	TopicLifecycleProtocolVersion        = 1
 	DistributedCompactionProtocolVersion = 2
 	OffsetReservationsProtocolVersion    = 3
-	BrokerProtocolVersionCurrent         = OffsetReservationsProtocolVersion
+	ReplicaReassignmentProtocolVersion   = 4
+	BrokerProtocolVersionCurrent         = ReplicaReassignmentProtocolVersion
 )
 
 type ReplicationEntry struct {
@@ -250,6 +251,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyPartitionCommand(strings.TrimPrefix(data, "PARTITION:"))
 	case strings.HasPrefix(data, "PARTITION_COMMIT:"):
 		res = f.applyPartitionCommitCommand(strings.TrimPrefix(data, "PARTITION_COMMIT:"))
+	case strings.HasPrefix(data, "REPLICA_REASSIGN:"):
+		res = f.applyReplicaReassignmentCommand(strings.TrimPrefix(data, "REPLICA_REASSIGN:"))
 	case strings.HasPrefix(data, "ISR_CATCHUP:"):
 		res = f.applyISRCatchupCommand(strings.TrimPrefix(data, "ISR_CATCHUP:"))
 	case strings.HasPrefix(data, "LEADER_ELECTION:"):
