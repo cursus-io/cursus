@@ -97,6 +97,9 @@ type Collector struct {
 	storageHandlers                 *prometheus.Desc
 	storageSegments                 *prometheus.Desc
 	storageBytes                    *prometheus.Desc
+	storageFilesystemFreeBytes      *prometheus.Desc
+	storageFilesystemTotalBytes     *prometheus.Desc
+	storageFilesystemHeadroom       *prometheus.Desc
 	storagePendingWrites            *prometheus.Desc
 	storageActiveReaders            *prometheus.Desc
 	storageStatFailures             *prometheus.Desc
@@ -191,6 +194,9 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		storageHandlers:                 prometheus.NewDesc("cursus_storage_handlers", "Open partition storage handlers.", nil, nil),
 		storageSegments:                 prometheus.NewDesc("cursus_storage_segments", "Open storage segments including active segments.", nil, nil),
 		storageBytes:                    prometheus.NewDesc("cursus_storage_bytes", "Bytes used by segment and offset index files for open handlers.", nil, nil),
+		storageFilesystemFreeBytes:      prometheus.NewDesc("cursus_storage_filesystem_free_bytes", "Filesystem bytes available to the broker log directory.", nil, nil),
+		storageFilesystemTotalBytes:     prometheus.NewDesc("cursus_storage_filesystem_total_bytes", "Total filesystem bytes containing the broker log directory.", nil, nil),
+		storageFilesystemHeadroom:       prometheus.NewDesc("cursus_storage_filesystem_headroom_ready", "Whether filesystem free space satisfies broker write admission thresholds.", nil, nil),
 		storagePendingWrites:            prometheus.NewDesc("cursus_storage_pending_writes", "Messages waiting in storage write queues.", nil, nil),
 		storageActiveReaders:            prometheus.NewDesc("cursus_storage_active_readers", "Readers currently accessing storage segments.", nil, nil),
 		storageStatFailures:             prometheus.NewDesc("cursus_storage_stat_failures", "Storage files that could not be inspected during this scrape.", nil, nil),
@@ -242,7 +248,8 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		c.consumerMetadataRecovery, c.consumerMetadataRestoredGroups, c.consumerMetadataRestoredOffsets,
 		c.consumerMetadataReplayedRecords, c.consumerMetadataOrphanRecords, c.consumerMetadataCorruptRecords,
 		c.activeStreams, c.storageHandlers,
-		c.storageSegments, c.storageBytes, c.storagePendingWrites, c.storageActiveReaders,
+		c.storageSegments, c.storageBytes, c.storageFilesystemFreeBytes, c.storageFilesystemTotalBytes,
+		c.storageFilesystemHeadroom, c.storagePendingWrites, c.storageActiveReaders,
 		c.storageStatFailures, c.storageSegmentCacheEntries, c.storageSegmentCacheHits,
 		c.storageSegmentCacheMisses, c.storageSegmentCacheEvictions,
 		c.wireProtocolFailures, c.wireDecompressionRejections,
@@ -542,6 +549,9 @@ func (c *Collector) collectStorage(ch chan<- prometheus.Metric) {
 	ch <- gauge(c.storageHandlers, float64(state.Handlers))
 	ch <- gauge(c.storageSegments, float64(state.Segments))
 	ch <- gauge(c.storageBytes, float64(state.Bytes))
+	ch <- gauge(c.storageFilesystemFreeBytes, float64(state.FilesystemFreeBytes))
+	ch <- gauge(c.storageFilesystemTotalBytes, float64(state.FilesystemTotalBytes))
+	ch <- gauge(c.storageFilesystemHeadroom, boolValue(state.FilesystemHeadroomOK))
 	ch <- gauge(c.storagePendingWrites, float64(state.PendingWrites))
 	ch <- gauge(c.storageActiveReaders, float64(state.ActiveReaders))
 	ch <- gauge(c.storageStatFailures, float64(state.StatFailures))

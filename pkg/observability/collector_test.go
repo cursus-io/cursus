@@ -79,6 +79,7 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 		}},
 		fixedDisk{snapshot: disk.RuntimeSnapshot{
 			Handlers: 1, Segments: 2, Bytes: 4096, PendingWrites: 4, ActiveReaders: 2,
+			FilesystemFreeBytes: 8192, FilesystemTotalBytes: 16384, FilesystemHeadroomOK: true,
 			SegmentCacheEntries: 3, SegmentCacheHits: 11, SegmentCacheMisses: 5, SegmentCacheEvictions: 2,
 		}},
 		fixedStreams(2),
@@ -117,6 +118,9 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 	assertGauge(t, families, "cursus_consumer_group_offset_out_of_range", map[string]string{"group": "new-workers", "topic": "orders", "partition": "0"}, 1)
 	assertGauge(t, families, "cursus_consumer_group_offset_out_of_range", map[string]string{"group": "ahead-workers", "topic": "orders", "partition": "0"}, 1)
 	assertGauge(t, families, "cursus_storage_bytes", nil, 4096)
+	assertGauge(t, families, "cursus_storage_filesystem_free_bytes", nil, 8192)
+	assertGauge(t, families, "cursus_storage_filesystem_total_bytes", nil, 16384)
+	assertGauge(t, families, "cursus_storage_filesystem_headroom_ready", nil, 1)
 	assertGauge(t, families, "cursus_storage_segment_cache_entries", nil, 3)
 	assertGauge(t, families, "cursus_storage_segment_cache_hits", nil, 11)
 	assertGauge(t, families, "cursus_storage_segment_cache_misses", nil, 5)

@@ -184,6 +184,11 @@ func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error
 		serializedMsgs[i] = serialized
 		totalSize += 4 + len(serialized)
 	}
+	maxIndexEntries := (uint64(totalSize) / interval) + 1
+	requiredBytes := uint64(totalSize) + maxIndexEntries*uint64(types.IndexEntrySize)
+	if err := d.ensureWriteHeadroom(requiredBytes); err != nil {
+		return err
+	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -202,7 +207,6 @@ func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error
 	const entrySize = uint64(types.IndexEntrySize)
 	willExceedData := d.CurrentOffset+uint64(totalSize) > d.SegmentSize
 
-	maxIndexEntries := (uint64(totalSize) / interval) + 1
 	requiredIndexSpace := maxIndexEntries * entrySize
 	willExceedIndex := d.indexBytesWritten+requiredIndexSpace > d.IndexSize
 
@@ -339,6 +343,9 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	}
 
 	totalLen := uint64(4 + len(serialized))
+	if err := d.ensureWriteHeadroom(totalLen + uint64(types.IndexEntrySize)); err != nil {
+		return err
+	}
 	const entrySize = uint64(types.IndexEntrySize)
 	msgPosition := d.CurrentOffset
 

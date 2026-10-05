@@ -41,12 +41,14 @@ type Config struct {
 	LogLevel        util.LogLevel `yaml:"log_level" json:"log_level"`
 
 	// disk storage
-	LogDir              string `yaml:"log_dir" json:"log.dir"`
-	DiskFlushBatchSize  int    `yaml:"disk_flush_batch_size" json:"disk.flush.batch.size"`
-	DiskFlushIntervalMS int    `yaml:"disk_flush_interval_ms" json:"disk.flush.interval.ms"`
-	DiskWriteTimeoutMS  int    `yaml:"disk_write_timeout_ms" json:"disk.write.timeout.ms"`
-	LingerMS            int    `yaml:"linger_ms" json:"linger.ms"`
-	CompressionType     string `yaml:"compression_type" json:"compression.type"` // "none", "gzip", "snappy", "lz4"
+	LogDir              string  `yaml:"log_dir" json:"log.dir"`
+	DiskFlushBatchSize  int     `yaml:"disk_flush_batch_size" json:"disk.flush.batch.size"`
+	DiskFlushIntervalMS int     `yaml:"disk_flush_interval_ms" json:"disk.flush.interval.ms"`
+	DiskWriteTimeoutMS  int     `yaml:"disk_write_timeout_ms" json:"disk.write.timeout.ms"`
+	DiskMinFreeBytes    int64   `yaml:"disk_min_free_bytes" json:"disk.min.free.bytes"`
+	DiskMinFreePercent  float64 `yaml:"disk_min_free_percent" json:"disk.min.free.percent"`
+	LingerMS            int     `yaml:"linger_ms" json:"linger.ms"`
+	CompressionType     string  `yaml:"compression_type" json:"compression.type"` // "none", "gzip", "snappy", "lz4"
 
 	// log segment
 	CleanupInterval           int     `yaml:"log_cleanup_interval" json:"log.cleanup.interval"`
@@ -155,6 +157,8 @@ func DefaultConfig() *Config {
 			DiskFlushBatchSize:  50,
 			DiskFlushIntervalMS: 500,
 			DiskWriteTimeoutMS:  10,
+			DiskMinFreeBytes:    256 * 1024 * 1024,
+			DiskMinFreePercent:  5,
 			LingerMS:            50,
 			CompressionType:     "none",
 
@@ -266,6 +270,8 @@ func LoadConfig() (*Config, error) {
 	flag.IntVar(&cfg.DiskFlushBatchSize, "disk-flush-batch", cfg.DiskFlushBatchSize, "Disk flush batch")
 	flag.IntVar(&cfg.DiskFlushIntervalMS, "disk-flush-interval-ms", cfg.DiskFlushIntervalMS, "Disk sync interval in milliseconds")
 	flag.IntVar(&cfg.DiskWriteTimeoutMS, "disk-write-timeout", cfg.DiskWriteTimeoutMS, "Disk write timeout")
+	flag.Int64Var(&cfg.DiskMinFreeBytes, "disk-min-free-bytes", cfg.DiskMinFreeBytes, "Minimum filesystem bytes that must remain after a broker write")
+	flag.Float64Var(&cfg.DiskMinFreePercent, "disk-min-free-percent", cfg.DiskMinFreePercent, "Minimum filesystem percentage that must remain after a broker write")
 	flag.IntVar(&cfg.LingerMS, "linger-ms", cfg.LingerMS, "Linger ms")
 	flag.StringVar(&cfg.CompressionType, "compression-type", "none", "Compression type (none, gzip, snappy, lz4)")
 
@@ -430,6 +436,8 @@ func LoadConfig() (*Config, error) {
 
 	overrideEnvInt(&cfg.DiskFlushBatchSize, "DISK_FLUSH_BATCH")
 	overrideEnvInt(&cfg.DiskFlushIntervalMS, "DISK_FLUSH_INTERVAL_MS")
+	overrideEnvInt64(&cfg.DiskMinFreeBytes, "DISK_MIN_FREE_BYTES")
+	overrideEnvFloat64(&cfg.DiskMinFreePercent, "DISK_MIN_FREE_PERCENT")
 	overrideEnvInt(&cfg.LingerMS, "LINGER_MS")
 	overrideEnvString(&cfg.CompressionType, "COMPRESSION_TYPE")
 

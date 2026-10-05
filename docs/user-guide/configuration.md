@@ -195,6 +195,8 @@ These values participate in active broker behavior:
 | `max_transaction_records` | 10000 | Maximum staged records or durable request assignments retained by one transaction. |
 | `max_transaction_bytes` | 67108864 | Maximum dynamic staged payload bytes retained by one transaction. |
 | `max_transaction_offsets` | 10000 | Maximum distinct consumer offsets staged by one transaction. |
+| `disk_min_free_bytes` | 268435456 | Minimum filesystem bytes reserved after each admitted storage batch. |
+| `disk_min_free_percent` | 5 | Minimum filesystem percentage reserved after each admitted storage batch. The stricter byte or percentage threshold wins. |
 | `producer_state_ttl_ms` | 1800000 | In-memory producer state cleanup window; durable records/checkpoints remain recovery sources. |
 | `raft_port` | 9001 | Raft transport listener. |
 | `discovery_port` | 8000 | Broker discovery and internal replication HTTP listener. |

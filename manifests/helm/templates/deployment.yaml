@@ -62,6 +62,10 @@ spec:
               value: {{ .Values.logLevel | quote }}  
             - name: LOG_DIR  
               value: {{ .Values.persistence.logDir.path }}  
+            - name: DISK_MIN_FREE_BYTES
+              value: {{ .Values.storage.minFreeBytes | quote }}
+            - name: DISK_MIN_FREE_PERCENT
+              value: {{ .Values.storage.minFreePercent | quote }}
             - name: MAX_TOPICS
               value: {{ .Values.limits.maxTopics | quote }}
             - name: MAX_PARTITIONS_PER_TOPIC

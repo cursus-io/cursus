@@ -24,12 +24,14 @@ type DiskManager struct {
 	mu       sync.Mutex
 	handlers map[string]*DiskHandler
 	cfg      *config.Config
+	headroom *diskHeadroomGuard
 }
 
 func NewDiskManager(cfg *config.Config) *DiskManager {
 	return &DiskManager{
 		handlers: make(map[string]*DiskHandler),
 		cfg:      cfg,
+		headroom: newDiskHeadroomGuard(cfg.LogDir, cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent),
 	}
 }
 
@@ -87,6 +89,7 @@ func (dm *DiskManager) getHandlerLocked(topic string, partitionID int, policy *i
 	if err != nil {
 		return nil, err
 	}
+	handler.headroom = dm.headroom
 	dm.handlers[key] = handler
 	return handler, nil
 }

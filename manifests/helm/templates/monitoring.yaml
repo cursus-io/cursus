@@ -68,6 +68,14 @@ spec:
           annotations:
             summary: Cursus storage writes are stalled
             description: Pending storage writes have remained non-zero for the full observation window.
+        - alert: CursusStorageDiskHeadroomLow
+          expr: cursus_storage_filesystem_headroom_ready{namespace={{ .Release.Namespace | quote }}} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: Cursus storage filesystem headroom is exhausted
+            description: The broker is rejecting writes because the log filesystem is below its configured free-space reserve.
         - alert: CursusResponseWriteFailures
           expr: increase(cursus_broker_client_response_write_failures_total{namespace={{ .Release.Namespace | quote }}}[5m]) > 0
           labels:

@@ -55,6 +55,10 @@ limits:
   maxTransactionBytes: 67108864
   maxTransactionOffsets: 10000
 
+storage:
+  minFreeBytes: 268435456
+  minFreePercent: 5
+
 internalTLS:
   # The Secret must contain tls.crt, tls.key, and ca.crt. The certificate must
   # have a SAN for internalTLS.serverName and every StatefulSet DNS name.

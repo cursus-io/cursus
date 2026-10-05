@@ -56,6 +56,10 @@ limits:
   maxTransactionBytes: 67108864
   maxTransactionOffsets: 10000
 
+storage:
+  minFreeBytes: 268435456
+  minFreePercent: 5
+
 nodeSelector: {}
 affinity: {}
 resources:

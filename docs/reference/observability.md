@@ -161,6 +161,9 @@ In diagnostics-only mode, `/ready` includes the retained `consumer_metadata` fai
 | `cursus_consumer_group_committed_offset{group,topic,partition}` | Gauge / offsets | Durable next offset |
 | `cursus_consumer_group_lag{group,topic,partition}` | Gauge / messages | `max(HWM - committedNextOffset, 0)` |
 | `cursus_consumer_group_offset_out_of_range{group,topic,partition}` | Gauge / boolean | Commit is below log start or above the high watermark |
+| `cursus_storage_filesystem_free_bytes` | Gauge / bytes | Space currently available on the filesystem containing `log_dir` |
+| `cursus_storage_filesystem_total_bytes` | Gauge / bytes | Total capacity of the filesystem containing `log_dir` |
+| `cursus_storage_filesystem_headroom_ready` | Gauge / boolean | `1` while the configured byte and percentage free-space reserve permits new writes |
 
 In standalone mode the local coordinator is authoritative. In distributed
 mode, replicated membership can remain present on a broker that no longer owns
@@ -320,6 +323,9 @@ up{job="cursus"} == 0
 
 # Process is reachable but cannot serve client work
 cursus_broker_ready == 0
+
+# Writes are blocked before the filesystem reserve is consumed
+cursus_storage_filesystem_headroom_ready == 0
 
 # No cluster leader
 cursus_distribution_enabled == 1 and cursus_cluster_has_leader == 0

@@ -42,6 +42,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.MaxTransactions != 100000 || cfg.MaxTransactionRecords != 10000 || cfg.MaxTransactionBytes != 64*1024*1024 || cfg.MaxTransactionOffsets != 10000 {
 		t.Errorf("unexpected default transaction limits: transactions=%d records=%d bytes=%d offsets=%d", cfg.MaxTransactions, cfg.MaxTransactionRecords, cfg.MaxTransactionBytes, cfg.MaxTransactionOffsets)
 	}
+	if cfg.DiskMinFreeBytes != 256*1024*1024 || cfg.DiskMinFreePercent != 5 {
+		t.Errorf("unexpected default disk headroom: bytes=%d percent=%v", cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent)
+	}
 }
 
 func TestLoadConfig_EnvOverrides(t *testing.T) {
@@ -61,6 +64,8 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("MAX_TRANSACTION_RECORDS", "21")
 	t.Setenv("MAX_TRANSACTION_BYTES", "8192")
 	t.Setenv("MAX_TRANSACTION_OFFSETS", "22")
+	t.Setenv("DISK_MIN_FREE_BYTES", "1048576")
+	t.Setenv("DISK_MIN_FREE_PERCENT", "7.5")
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -99,6 +104,9 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	}
 	if cfg.MaxTransactions != 789 || cfg.MaxTransactionRecords != 21 || cfg.MaxTransactionBytes != 8192 || cfg.MaxTransactionOffsets != 22 {
 		t.Errorf("unexpected transaction limits from env: transactions=%d records=%d bytes=%d offsets=%d", cfg.MaxTransactions, cfg.MaxTransactionRecords, cfg.MaxTransactionBytes, cfg.MaxTransactionOffsets)
+	}
+	if cfg.DiskMinFreeBytes != 1048576 || cfg.DiskMinFreePercent != 7.5 {
+		t.Errorf("unexpected disk headroom from env: bytes=%d percent=%v", cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent)
 	}
 }
 
@@ -143,5 +151,8 @@ func TestConfig_Normalize(t *testing.T) {
 	}
 	if cfg.MaxTransactions != 100000 || cfg.MaxTransactionRecords != 10000 || cfg.MaxTransactionBytes != 64*1024*1024 || cfg.MaxTransactionOffsets != 10000 {
 		t.Errorf("Normalize should restore transaction limits, got transactions=%d records=%d bytes=%d offsets=%d", cfg.MaxTransactions, cfg.MaxTransactionRecords, cfg.MaxTransactionBytes, cfg.MaxTransactionOffsets)
+	}
+	if cfg.DiskMinFreeBytes != 256*1024*1024 || cfg.DiskMinFreePercent != 5 {
+		t.Errorf("Normalize should restore disk headroom, got bytes=%d percent=%v", cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent)
 	}
 }

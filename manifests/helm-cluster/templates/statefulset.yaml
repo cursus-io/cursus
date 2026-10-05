@@ -182,6 +182,10 @@ spec:
               value: "{{ .Values.cluster.transactionCoordinatorShards }}"
             - name: LOG_DIR
               value: /data/logs
+            - name: DISK_MIN_FREE_BYTES
+              value: {{ .Values.storage.minFreeBytes | quote }}
+            - name: DISK_MIN_FREE_PERCENT
+              value: {{ .Values.storage.minFreePercent | quote }}
             - name: USE_TLS
               value: "false"
             - name: INTERNAL_USE_TLS

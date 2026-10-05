@@ -31,6 +31,12 @@ func (cfg *Config) Normalize() {
 	if cfg.DiskWriteTimeoutMS <= 0 {
 		cfg.DiskWriteTimeoutMS = 10
 	}
+	if cfg.DiskMinFreeBytes <= 0 {
+		cfg.DiskMinFreeBytes = 256 * 1024 * 1024
+	}
+	if cfg.DiskMinFreePercent <= 0 || cfg.DiskMinFreePercent >= 100 {
+		cfg.DiskMinFreePercent = 5
+	}
 	if cfg.DiskFlushIntervalMS <= 0 {
 		util.Warn("Invalid DiskFlushIntervalMS (%d), defaulting to 1000ms", cfg.DiskFlushIntervalMS)
 		cfg.DiskFlushIntervalMS = 1000

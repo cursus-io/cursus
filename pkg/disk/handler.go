@@ -82,6 +82,9 @@ type DiskHandler struct {
 
 	writeFailureMu sync.RWMutex
 	writeFailure   error
+	transientMu    sync.RWMutex
+	transientWrite error
+	headroom       *diskHeadroomGuard
 	syncFileFn     func(*os.File) error
 
 	file   *os.File
@@ -159,6 +162,35 @@ func (d *DiskHandler) writeAvailabilityError() error {
 		return nil
 	}
 	return fmt.Errorf("disk handler write unavailable until restart: %w", failure)
+}
+
+func (d *DiskHandler) recordTransientWriteFailure(err error) error {
+	d.transientMu.Lock()
+	d.transientWrite = err
+	d.transientMu.Unlock()
+	return err
+}
+
+func (d *DiskHandler) clearTransientWriteFailure() {
+	d.transientMu.Lock()
+	d.transientWrite = nil
+	d.transientMu.Unlock()
+}
+
+func (d *DiskHandler) transientWriteError() error {
+	d.transientMu.RLock()
+	err := d.transientWrite
+	d.transientMu.RUnlock()
+	return err
+}
+
+func (d *DiskHandler) ensureWriteHeadroom(required uint64) error {
+	_, err := d.headroom.reserve(required, false)
+	if err != nil {
+		return d.recordTransientWriteFailure(err)
+	}
+	d.clearTransientWriteFailure()
+	return nil
 }
 
 func (d *DiskHandler) GetActiveReaders() int32 {
@@ -305,6 +337,7 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		internalMetadata:       internalMetadata,
 		compactedSegments:      compactedSegments,
 		segmentReaders:         newSegmentReaderCache(defaultSegmentReaderCacheEntries),
+		headroom:               newDiskHeadroomGuard(cfg.LogDir, cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent),
 		file:                   file,
 		writer:                 bufio.NewWriter(file),
 	}
@@ -375,6 +408,9 @@ func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.
 	if partition < 0 || partition > math.MaxInt32 {
 		return 0, fmt.Errorf("partition out of int32 range: %d", partition)
 	}
+	if err := d.ensureWriteHeadroom(0); err != nil {
+		return 0, err
+	}
 	if err := d.writeAvailabilityError(); err != nil {
 		return 0, err
 	}
@@ -398,6 +434,9 @@ func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.
 	default:
 	}
 	if err := d.writeAvailabilityError(); err != nil {
+		return 0, err
+	}
+	if err := d.transientWriteError(); err != nil {
 		return 0, err
 	}
 	atomic.StoreUint64(&d.AbsoluteOffset, offset+1)
@@ -456,6 +495,9 @@ func (d *DiskHandler) AppendMessageWithOffset(topic string, partition int, msg *
 func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Message) (uint64, error) {
 	if partition < 0 || partition > math.MaxInt32 {
 		return 0, fmt.Errorf("partition out of int32 range: %d", partition)
+	}
+	if err := d.ensureWriteHeadroom(0); err != nil {
+		return 0, err
 	}
 	if err := d.writeAvailabilityError(); err != nil {
 		return 0, err
