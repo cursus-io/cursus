@@ -48,20 +48,60 @@ type Journal struct {
 	hasProducerEpochWatermark bool
 }
 
+var syncJournalCreationDirectory = syncJournalDirectory
+
 func OpenJournal(path string) (*Journal, error) {
 	if path == "" {
 		return nil, fmt.Errorf("transaction journal path is empty")
 	}
 	path = filepath.Clean(path)
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+	dir := filepath.Dir(path)
+	_, statErr := os.Stat(dir)
+	dirCreated := errors.Is(statErr, os.ErrNotExist)
+	if statErr != nil && !dirCreated {
+		return nil, fmt.Errorf("stat transaction journal directory: %w", statErr)
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("create transaction journal directory: %w", err)
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+
+	// O_EXCL tells us whether this call introduced the authoritative filename.
+	// Existing journals are opened without O_CREATE so later append/recovery
+	// paths cannot silently recreate a deleted, unsynced journal.
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	fileCreated := err == nil
+	if errors.Is(err, os.ErrExist) {
+		file, err = os.OpenFile(path, os.O_RDWR, 0o600)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("open transaction journal: %w", err)
 	}
+	if fileCreated {
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			_ = os.Remove(path)
+			return nil, fmt.Errorf("sync new transaction journal: %w", err)
+		}
+	}
 	if err := file.Close(); err != nil {
 		return nil, fmt.Errorf("close transaction journal: %w", err)
+	}
+	// Sync on every open so journals created by an older release also acquire a
+	// durable directory entry before their first post-upgrade ACK.
+	if err := syncJournalCreationDirectory(dir); err != nil {
+		if fileCreated {
+			_ = os.Remove(path)
+		}
+		return nil, fmt.Errorf("persist transaction journal entry: %w", err)
+	}
+	if dirCreated {
+		if err := syncJournalCreationDirectory(filepath.Dir(dir)); err != nil {
+			if fileCreated {
+				_ = os.Remove(path)
+				_ = os.Remove(dir)
+			}
+			return nil, fmt.Errorf("persist transaction journal directory: %w", err)
+		}
 	}
 	return &Journal{path: path}, nil
 }
@@ -162,7 +202,7 @@ func (j *Journal) Append(snap *Snapshot) (err error) {
 		}
 	}
 
-	file, err := os.OpenFile(j.path, os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := os.OpenFile(j.path, os.O_RDWR, 0o600)
 	if err != nil {
 		return fmt.Errorf("open transaction journal for append: %w", err)
 	}
@@ -331,7 +371,7 @@ func (j *Journal) Load() (map[string]*Snapshot, error) {
 func (j *Journal) loadLocked() (map[string]*Snapshot, error) {
 	j.loaded = false
 	j.hasProducerEpochWatermark = false
-	file, err := os.OpenFile(j.path, os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := os.OpenFile(j.path, os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open transaction journal for recovery: %w", err)
 	}
