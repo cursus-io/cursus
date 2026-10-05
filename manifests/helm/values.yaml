@@ -13,7 +13,10 @@ service:
 
 persistence:
   enabled: true
+  # Leave storageClass empty to use the cluster's default StorageClass.
   storageClass: ""
+  # Set classless to true only for a pre-provisioned, classless PersistentVolume.
+  classless: false
   config:
     path: /app/config.yaml
     size: 1Gi

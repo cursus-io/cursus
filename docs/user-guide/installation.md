@@ -104,6 +104,12 @@ docker run --rm \
 
 A Helm chart is available under `manifests/helm`. Review `values.yaml`, persistent volume settings, TLS/internal mTLS secrets, advertised addresses, replica/quorum values, and resource limits before installing. Do not treat chart defaults as a production security profile.
 
+The standalone chart omits `storageClassName` by default, so Kubernetes uses
+the cluster's default StorageClass. Set `persistence.storageClass` to select a
+named class. For a pre-provisioned PersistentVolume that deliberately has no
+class, set `persistence.classless=true`; it cannot be combined with a named
+storage class.
+
 ## Verify
 
 ```bash

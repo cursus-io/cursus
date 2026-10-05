@@ -36,6 +36,16 @@ jobs:
             echo 'rendered chart contains placeholder credentials'
             exit 1
           fi
+          if grep -q 'storageClassName:' /tmp/cursus.yaml; then
+            echo 'default render unexpectedly disables the cluster default StorageClass'
+            exit 1
+          fi
+          helm template cursus manifests/helm \
+            --set-string persistence.storageClass=fast-ssd > /tmp/cursus-named-storage.yaml
+          grep -q 'storageClassName: "fast-ssd"' /tmp/cursus-named-storage.yaml
+          helm template cursus manifests/helm \
+            --set persistence.classless=true > /tmp/cursus-classless-storage.yaml
+          grep -q 'storageClassName: ""' /tmp/cursus-classless-storage.yaml
       - name: Reject unsafe deployment overrides
         run: |
           if helm template cursus manifests/helm --set replicaCount=2; then
@@ -44,6 +54,12 @@ jobs:
           fi
           if helm template cursus manifests/helm --set tls.enabled=true --set tls.certPath=/tmp/cert.pem; then
             echo 'chart unexpectedly accepted a TLS certificate path outside the mounted Secret'
+            exit 1
+          fi
+          if helm template cursus manifests/helm \
+            --set persistence.classless=true \
+            --set-string persistence.storageClass=fast-ssd; then
+            echo 'chart unexpectedly accepted conflicting storage class settings'
             exit 1
           fi
 
