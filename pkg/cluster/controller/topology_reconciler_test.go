@@ -40,7 +40,7 @@ func TestTopologyReconcilerWaitsForEveryVoterCapability(t *testing.T) {
 	controller := &ClusterController{RaftManager: manager}
 
 	err := controller.RunTopologyReconciliationOnce()
-	require.ErrorContains(t, err, "replica reassignment requires 3")
+	require.ErrorContains(t, err, fmt.Sprintf("replica reassignment requires %d", fsm.ReplicaReassignmentProtocolVersion))
 	require.Equal(t, 0, manager.applyCount)
 	require.Len(t, state.GetPartitionMetadata("orders-0").Replicas, 1)
 }
