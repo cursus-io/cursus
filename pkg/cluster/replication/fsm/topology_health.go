@@ -45,11 +45,13 @@ type TopologyHealth struct {
 	Partitions                []PartitionTopologyHealth
 }
 
-// ReadinessError converts the shared topology evaluation into a bounded
-// readiness failure. Individual partition reasons remain available through
-// CLUSTER_STATUS rather than being copied into the health response.
+// ReadinessError reports whether every partition can still serve its declared
+// durability contract. A partition may remain available while a replica is
+// catching up or offline, provided its assignment is intact, its leader is
+// active, and its effective minimum ISR is satisfied. Full-replica health is
+// exposed separately through CLUSTER_STATUS and replication metrics.
 func (health TopologyHealth) ReadinessError() error {
-	if health.Healthy {
+	if health.Offline == 0 && health.AssignmentDeficient == 0 && health.MinISRUnsatisfied == 0 {
 		return nil
 	}
 	return fmt.Errorf(

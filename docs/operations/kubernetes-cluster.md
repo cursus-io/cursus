@@ -4,6 +4,14 @@
 
 Each StatefulSet ordinal owns one `ReadWriteOnce` PVC, publishes a stable headless-service DNS name, and uses those three names for Raft membership and discovery. Initial Pods are created in parallel because the Raft bootstrap needs all three voters; broker `-0` is the only member permitted to bootstrap an empty cluster. Restart recovery uses the existing Raft state on each PVC. The PodDisruptionBudget requires two available members and the default required anti-affinity therefore requires three schedulable nodes.
 
+Cluster DNS is part of the quorum network path because every Raft, replication,
+and internal command address is a StatefulSet DNS name. Before installing,
+verify that the Kubernetes DNS service has at least two Ready replicas on
+different node failure domains and a disruption policy that preserves one of
+them. A single CoreDNS Pod can turn one node loss into loss of name resolution
+between both surviving brokers. The Cursus PodDisruptionBudget cannot protect a
+DNS Deployment in `kube-system`.
+
 The chart supports in-cluster clients only. Brokers advertise their stable Pod
 DNS names in metadata, so the chart rejects `NodePort` and `LoadBalancer`
 services rather than returning unreachable addresses to external clients. Use
@@ -72,6 +80,19 @@ kubectl -n brokers wait --for=condition=Ready pod \
 kubectl -n brokers get pods,pvc,pdb
 kubectl -n brokers get events --field-selector reason=FailedCreate
 ```
+
+Also inspect the platform DNS deployment and placement. The resource name is
+provider-specific; a common CoreDNS installation can be checked with:
+
+```bash
+kubectl -n kube-system get deployment coredns
+kubectl -n kube-system get pods -l k8s-app=kube-dns -o wide
+kubectl -n kube-system get pdb
+```
+
+Do not accept the cluster when all Ready DNS replicas share one node or failure
+domain. Repeat the one-node-loss drill while issuing `acks=all` writes and
+resolving every broker's headless-service name from both surviving Pods.
 
 ## Restart, recovery, and upgrades
 

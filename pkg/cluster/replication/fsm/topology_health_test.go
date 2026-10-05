@@ -51,6 +51,32 @@ func TestEvaluateTopologyReportsInactiveReplicaAndLeader(t *testing.T) {
 	require.Equal(t, 1, health.UnderReplicated)
 	require.False(t, health.Partitions[0].LeaderAvailable)
 	require.Contains(t, health.Partitions[0].Reasons, "leader_inactive")
+	require.Error(t, health.ReadinessError())
+}
+
+func TestEvaluateTopologyReadinessAllowsDegradedReplicaAboveMinISR(t *testing.T) {
+	state := newTestFSM()
+	for _, brokerID := range []string{"broker-1", "broker-2", "broker-3"} {
+		registerTopologyHealthBroker(t, state, brokerID, "active")
+	}
+	require.Nil(t, state.Apply(&raft.Log{Data: topicCommandData(t, testTopicCommand("orders", 1, 3)), Index: 4}))
+
+	state.mu.Lock()
+	state.brokers["broker-3"].Status = "inactive"
+	state.mu.Unlock()
+
+	health := state.EvaluateTopology(2)
+	require.False(t, health.Healthy, "full-replica health must still report degradation")
+	require.Equal(t, 1, health.UnderReplicated)
+	require.Equal(t, 1, health.InactiveReplicaPartitions)
+	require.Zero(t, health.Offline)
+	require.Zero(t, health.AssignmentDeficient)
+	require.Zero(t, health.MinISRUnsatisfied)
+	require.NoError(t, health.ReadinessError(), "a writable min-ISR quorum must stay in service")
+
+	belowMinISR := state.EvaluateTopology(3)
+	require.Equal(t, 1, belowMinISR.MinISRUnsatisfied)
+	require.Error(t, belowMinISR.ReadinessError(), "readiness must fail when the durability quorum is unavailable")
 }
 
 func TestEvaluateTopologyReportsMissingPartitionMetadata(t *testing.T) {

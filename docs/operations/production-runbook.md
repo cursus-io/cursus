@@ -78,6 +78,13 @@ lost, stop the cluster and follow the coordinated restore procedure in
 [Upgrade and recovery](upgrade-and-recovery.md). Never combine PVCs from
 different backup generations.
 
+An under-replicated partition may remain ready while its active ISR still meets
+the effective minimum. Treat that as degraded operation, page on the shipped
+replication alert, and restore the missing replica before any other voluntary
+disruption. If multiple surviving brokers become inactive together, test DNS
+resolution for every StatefulSet name and verify that the platform DNS replicas
+span failure domains before changing Cursus membership.
+
 ## Transaction recovery not ready
 
 Keep transactional producers drained. Capture the oldest active transaction,

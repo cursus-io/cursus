@@ -40,12 +40,14 @@ Standalone response:
 ```
 
 In distributed mode, readiness also requires a resolvable cluster leader and a
-healthy durable topology. Every partition must have the replica count declared
-by its topic definition, all assigned brokers must be active, the leader must
-be active, and active ISR membership must satisfy both the replication factor
-and effective `min.insync.replicas`. A broker process can therefore remain live
-while returning `503` during an election, replica catch-up, or an incomplete
-legacy assignment repair.
+serviceable durable topology. Every partition must have the replica assignment
+declared by its topic definition, an active leader, and enough active ISR
+members to satisfy its effective `min.insync.replicas`. A broker remains ready
+when one replica is offline or catching up but the minimum ISR is still met;
+`CLUSTER_STATUS`, `cursus_cluster_under_replicated_partitions`, and the
+replication alerts continue to report that degraded state. A broker process can
+remain live while returning `503` during an election, below-minimum ISR, or an
+incomplete legacy assignment repair.
 
 ```json
 {
