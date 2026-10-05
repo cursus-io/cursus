@@ -12,6 +12,7 @@ import (
 var (
 	ErrProducerClosed          = errors.New("producer closed")
 	ErrProducerOutcomeUnknown  = errors.New("producer delivery outcome unknown")
+	ErrRequestOutcomeUnknown   = errors.New("request outcome unknown")
 	ErrConsumerClosed          = errors.New("consumer closed")
 	ErrConsumerRebalancing     = errors.New("consumer assignment is rebalancing")
 	ErrConsumerHandlerRequired = errors.New("consumer message handler is required")
@@ -19,6 +20,28 @@ var (
 	ErrInvalidPartition        = errors.New("invalid partition")
 	ErrNotLeader               = errors.New("not leader")
 )
+
+// RequestOutcomeUnknownError means a mutating request was fully written but
+// its response could not be read. Callers must reconcile server state before
+// retrying an operation that is not idempotent.
+type RequestOutcomeUnknownError struct {
+	Operation string
+	Cause     error
+}
+
+func (e *RequestOutcomeUnknownError) Error() string {
+	if e == nil {
+		return ErrRequestOutcomeUnknown.Error()
+	}
+	return fmt.Sprintf("%s during %s: %v", ErrRequestOutcomeUnknown, e.Operation, e.Cause)
+}
+
+func (e *RequestOutcomeUnknownError) Unwrap() []error {
+	if e == nil || e.Cause == nil {
+		return []error{ErrRequestOutcomeUnknown}
+	}
+	return []error{ErrRequestOutcomeUnknown, e.Cause}
+}
 
 // ProducerOutcomeUnknownError means a non-idempotent publish may have reached
 // the broker, but the SDK could not obtain a trustworthy acknowledgement. The

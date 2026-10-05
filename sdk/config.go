@@ -198,6 +198,7 @@ type ConsumerConfig struct {
 	AuthToken string `yaml:"auth_token" json:"auth_token"`
 
 	HandshakeTimeoutMS int `yaml:"handshake_timeout_ms" json:"handshake_timeout_ms"`
+	RequestTimeoutMS   int `yaml:"request_timeout_ms" json:"request_timeout_ms"`
 
 	LeaderStaleness         time.Duration `yaml:"leader_staleness" json:"leader_staleness"`
 	MetadataRefreshInterval time.Duration `yaml:"metadata_refresh_interval" json:"metadata_refresh_interval"`
@@ -241,7 +242,7 @@ func (c *ConsumerConfig) Validate() error {
 		c.HandlerRetryMaxBackoff < 0 || c.LeaderStaleness < 0 ||
 		c.MetadataRefreshInterval < 0 || c.PollTimeoutMS < 0 ||
 		c.ConnectRetryBackoffMS < 0 || c.HeartbeatIntervalMS < 0 || c.StreamingReadDeadlineMS < 0 ||
-		c.HandshakeTimeoutMS < 0 {
+		c.HandshakeTimeoutMS < 0 || c.RequestTimeoutMS < 0 {
 		return fmt.Errorf("consumer durations must not be negative")
 	}
 	if c.BatchSize <= 0 || c.MaxPollRecords <= 0 || c.WorkerChannelSize <= 0 {
@@ -319,6 +320,7 @@ func NewDefaultConsumerConfig() *ConsumerConfig {
 		HandlerRetryMaxBackoff:  time.Second,
 		HeartbeatIntervalMS:     3000,
 		HandshakeTimeoutMS:      5000,
+		RequestTimeoutMS:        10000,
 		CompressionType:         "none",
 		LeaderStaleness:         30 * time.Second,
 		StreamingReadDeadlineMS: 300000,

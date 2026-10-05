@@ -183,6 +183,10 @@ cfg.HandshakeTimeoutMS = 5000
 
 The handshake runs for every newly opened or reconnected TCP connection. `HandshakeTimeoutMS` bounds it; zero uses 5000 ms and negative values fail configuration validation. A version or compression mismatch closes the connection before use. The SDK has no application-level feature negotiation or legacy protocol mode.
 
+`ConsumerConfig.RequestTimeoutMS` defaults to 10000 ms and bounds offset, metadata, group lifecycle, heartbeat, and commit exchanges after the handshake. `ListOffsetsContext` accepts an earlier caller deadline; cancellation closes a blocked socket so the connection cannot be reused after a partial frame. The non-Context `ListOffsets` method uses the configured default.
+
+`EventStore` applies a 10-second default to connection establishment, command writes, and every response frame, including the second frame of `ReadStream`. Use `NewEventStoreWithTimeout` to select another positive default and the `CreateTopicContext`, `AppendContext`, `ReadStreamContext`, `ReadStreamFromContext`, `SaveSnapshotContext`, `ReadSnapshotContext`, and `StreamVersionContext` methods for caller cancellation. A connection interrupted during I/O is closed. If an append was fully written but its response cannot be read, the SDK returns `*RequestOutcomeUnknownError`; reconcile the stream version before retrying.
+
 Observation methods send `BROWSE_MESSAGES` and `READ_STREAM_HISTORY` directly
 after that handshake. `AdminClient.Capabilities` uses the read-only `HELP`
 command and maps the exposed command families to Wire v2 feature names; its

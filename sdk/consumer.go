@@ -218,7 +218,7 @@ func (c *Consumer) Start(handler func(Message) error) error {
 		c.coordinatorAddr = c.config.CoordinatorAddr
 		c.mu.Unlock()
 		LogInfo("Using configured coordinator for group '%s': %s", c.config.GroupID, c.coordinatorAddr)
-	} else if coordAddr, err := c.findCoordinator(); err == nil {
+	} else if coordAddr, err := c.findCoordinatorContext(c.assignmentContext()); err == nil {
 		c.mu.Lock()
 		c.coordinatorAddr = coordAddr
 		c.mu.Unlock()
@@ -579,12 +579,18 @@ func (c *Consumer) sendBatchCommitWithState(offsets map[int]uint64, assignmentGe
 	if !c.assignmentCanCommit(assignmentGeneration, allowClosing) {
 		return false
 	}
+	requestParent := c.assignmentContext()
+	if allowClosing {
+		requestParent = context.Background()
+	}
+	requestCtx, cancelRequest := boundedRequestContext(requestParent, c.requestTimeout())
+	defer cancelRequest()
 	c.commitMu.Lock()
 	needsNewConn := c.commitConn == nil || !c.validateCommitConn()
 	c.commitMu.Unlock()
 
 	if needsNewConn {
-		newConn, err := c.getCoordinatorConn()
+		newConn, err := c.getCoordinatorConnContext(requestCtx)
 		if err != nil {
 			LogError("Batch commit: failed to get connection: %v", err)
 			return false
@@ -597,6 +603,12 @@ func (c *Consumer) sendBatchCommitWithState(offsets map[int]uint64, assignmentGe
 	c.commitMu.Lock()
 	conn := c.commitConn
 	c.commitMu.Unlock()
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		c.closeCommitConn(conn)
+		return false
+	}
+	defer cleanup()
 
 	c.mu.RLock()
 	generation := c.generation
@@ -713,11 +725,18 @@ func (c *Consumer) directCommit(partition int, offset uint64, assignmentGenerati
 	memberID := c.memberID
 	c.mu.RUnlock()
 
-	conn, err := c.getCoordinatorConn()
+	requestCtx, cancelRequest := boundedRequestContext(c.assignmentContext(), c.requestTimeout())
+	defer cancelRequest()
+	conn, err := c.getCoordinatorConnContext(requestCtx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close() }()
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 
 	commitCmd := fmt.Sprintf("COMMIT_OFFSET topic=%s partition=%d group=%s offset=%d generation=%d member=%s",
 		c.config.Topic, partition, c.config.GroupID, offset, generation, memberID)
@@ -760,20 +779,24 @@ func (c *Consumer) directCommit(partition int, offset uint64, assignmentGenerati
 // ─── Metadata ─────────────────────────────────────────────────────────────────
 
 func (c *Consumer) fetchMetadata() error {
-	conn, _, err := c.client.ConnectWithFailover()
+	requestCtx, cancelRequest := boundedRequestContext(c.assignmentContext(), c.requestTimeout())
+	defer cancelRequest()
+	conn, _, err := c.client.ConnectWithFailoverContext(requestCtx)
 	if err != nil {
 		return fmt.Errorf("connect for metadata: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
-
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 	cmd := fmt.Sprintf("METADATA topic=%s", c.config.Topic)
 	if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 		return fmt.Errorf("send metadata: %w", err)
 	}
 
 	resp, err := ReadWithLength(conn)
-	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
 		return fmt.Errorf("read metadata: %w", err)
 	}
@@ -874,13 +897,18 @@ func (c *Consumer) joinGroupWithRetry() (int64, string, []int, error) {
 }
 
 func (c *Consumer) joinGroup() (int64, string, []int, error) {
-	conn, err := c.getCoordinatorConn()
+	requestCtx, cancelRequest := boundedRequestContext(c.assignmentContext(), c.requestTimeout())
+	defer cancelRequest()
+	conn, err := c.getCoordinatorConnContext(requestCtx)
 	if err != nil {
 		return 0, "", nil, err
 	}
 	defer func() { _ = conn.Close() }()
-
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	defer cleanup()
 
 	c.mu.RLock()
 	mID := c.memberID
@@ -900,7 +928,6 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 	}
 
 	resp, err := ReadWithLength(conn)
-	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
 		var brokerErr *BrokerError
 		if !errors.As(err, &brokerErr) {
@@ -951,11 +978,18 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 }
 
 func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
-	conn, err := c.getCoordinatorConn()
+	requestCtx, cancelRequest := boundedRequestContext(c.assignmentContext(), c.requestTimeout())
+	defer cancelRequest()
+	conn, err := c.getCoordinatorConnContext(requestCtx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 
 	syncCmd := fmt.Sprintf("SYNC_GROUP topic=%s group=%s member=%s generation=%d",
 		c.config.Topic, c.config.GroupID, memberID, generation)
@@ -1028,13 +1062,18 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 		return 0, err
 	}
 
-	conn, err := c.getCoordinatorConn()
+	requestCtx, cancelRequest := boundedRequestContext(c.assignmentContext(), c.requestTimeout())
+	defer cancelRequest()
+	conn, err := c.getCoordinatorConnContext(requestCtx)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = conn.Close() }()
-
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return 0, err
+	}
+	defer cleanup()
 	fetchCmd := fmt.Sprintf("FETCH_OFFSET topic=%s partition=%d group=%s",
 		c.config.Topic, partition, c.config.GroupID)
 	if err := WriteWithLength(conn, []byte(fetchCmd)); err != nil {
@@ -1126,18 +1165,29 @@ func (c *Consumer) Close() error {
 	generation := c.generation
 	c.mu.RUnlock()
 	if memberID != "" && generation > 0 {
-		if conn, err := c.getCoordinatorConn(); err == nil {
-			leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
-				c.config.Topic, c.config.GroupID, memberID, generation)
-			if err := WriteWithLength(conn, []byte(leaveCmd)); err != nil {
-				closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: %w", err))
-			} else if response, err := ReadWithLength(conn); err != nil {
-				closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: %w", err))
-			} else if !hasOKStatus(strings.TrimSpace(string(response))) {
-				closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: unexpected response %q", strings.TrimSpace(string(response))))
+		requestCtx, cancelRequest := boundedRequestContext(context.Background(), c.requestTimeout())
+		if conn, err := c.getCoordinatorConnContext(requestCtx); err == nil {
+			cleanup, bindErr := bindConnectionToContext(requestCtx, conn)
+			if bindErr != nil {
+				closeErr = errors.Join(closeErr, bindErr)
+				_ = conn.Close()
+				cancelRequest()
+			} else {
+				leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
+					c.config.Topic, c.config.GroupID, memberID, generation)
+				if err := WriteWithLength(conn, []byte(leaveCmd)); err != nil {
+					closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: %w", err))
+				} else if response, err := ReadWithLength(conn); err != nil {
+					closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: %w", err))
+				} else if !hasOKStatus(strings.TrimSpace(string(response))) {
+					closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: unexpected response %q", strings.TrimSpace(string(response))))
+				}
+				cleanup()
+				_ = conn.Close()
+				cancelRequest()
 			}
-			_ = conn.Close()
 		} else {
+			cancelRequest()
 			closeErr = errors.Join(closeErr, fmt.Errorf("connect to leave consumer group: %w", err))
 		}
 	}
@@ -1191,19 +1241,39 @@ func (c *Consumer) closeActiveConnections() {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+func (c *Consumer) requestTimeout() time.Duration {
+	if c.config != nil && c.config.RequestTimeoutMS > 0 {
+		return time.Duration(c.config.RequestTimeoutMS) * time.Millisecond
+	}
+	return defaultSDKRequestTimeout
+}
+
 func (c *Consumer) getLeaderConn() (net.Conn, error) {
-	conn, _, err := c.client.ConnectWithFailover()
+	return c.getLeaderConnContext(context.Background())
+}
+
+func (c *Consumer) getLeaderConnContext(ctx context.Context) (net.Conn, error) {
+	conn, _, err := c.client.ConnectWithFailoverContext(ctx)
 	return conn, err
 }
 
 func (c *Consumer) findCoordinator() (string, error) {
-	conn, _, err := c.client.ConnectWithFailover()
+	return c.findCoordinatorContext(context.Background())
+}
+
+func (c *Consumer) findCoordinatorContext(ctx context.Context) (string, error) {
+	requestCtx, cancelRequest := boundedRequestContext(ctx, c.requestTimeout())
+	defer cancelRequest()
+	conn, _, err := c.client.ConnectWithFailoverContext(requestCtx)
 	if err != nil {
 		return "", fmt.Errorf("connect for find_coordinator: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
-
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
 	cmd := fmt.Sprintf("FIND_COORDINATOR group=%s", c.config.GroupID)
 	if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 		return "", fmt.Errorf("send find_coordinator: %w", err)
@@ -1229,31 +1299,33 @@ func (c *Consumer) findCoordinator() (string, error) {
 }
 
 func (c *Consumer) getCoordinatorConn() (net.Conn, error) {
+	return c.getCoordinatorConnContext(context.Background())
+}
+
+func (c *Consumer) getCoordinatorConnContext(ctx context.Context) (net.Conn, error) {
 	c.mu.RLock()
 	addr := c.coordinatorAddr
 	c.mu.RUnlock()
 
 	if addr != "" {
-		conn, err := c.client.ConnectToAddr(addr)
+		conn, err := c.client.ConnectContext(ctx, addr)
 		if err == nil {
-			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 			return conn, nil
 		}
 		LogWarn("Coordinator %s unreachable: %v, rediscovering", addr, err)
 	}
 
-	newAddr, err := c.findCoordinator()
+	newAddr, err := c.findCoordinatorContext(ctx)
 	if err != nil {
-		return c.getLeaderConn()
+		return c.getLeaderConnContext(ctx)
 	}
 	c.mu.Lock()
 	c.coordinatorAddr = newAddr
 	c.mu.Unlock()
-	conn, err := c.client.ConnectToAddr(newAddr)
+	conn, err := c.client.ConnectContext(ctx, newAddr)
 	if err != nil {
 		return nil, err
 	}
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	return conn, nil
 }
 

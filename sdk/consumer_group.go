@@ -34,7 +34,13 @@ func (c *Consumer) heartbeatLoop(ctx context.Context, assignmentGeneration uint6
 				continue
 			}
 
-			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			requestCtx, cancelRequest := boundedRequestContext(ctx, c.requestTimeout())
+			cleanup, bindErr := bindConnectionToContext(requestCtx, conn)
+			if bindErr != nil {
+				cancelRequest()
+				c.cleanupHbConn(conn)
+				continue
+			}
 			c.mu.RLock()
 			memberID := c.memberID
 			generation := c.generation
@@ -42,13 +48,16 @@ func (c *Consumer) heartbeatLoop(ctx context.Context, assignmentGeneration uint6
 			hb := fmt.Sprintf("HEARTBEAT topic=%s group=%s member=%s generation=%d",
 				c.config.Topic, c.config.GroupID, memberID, generation)
 			if err := WriteWithLength(conn, []byte(hb)); err != nil {
+				cleanup()
+				cancelRequest()
 				LogError("Heartbeat send failed: %v", err)
 				c.cleanupHbConn(conn)
 				continue
 			}
 
 			resp, err := ReadWithLength(conn)
-			_ = conn.SetDeadline(time.Time{})
+			cleanup()
+			cancelRequest()
 			if err != nil {
 				var brokerErr *BrokerError
 				if errors.As(err, &brokerErr) {
@@ -105,7 +114,7 @@ func (c *Consumer) getOrDialHeartbeatConn(ctx context.Context) net.Conn {
 	}
 	c.hbMu.Unlock()
 
-	newConn, err := c.getCoordinatorConn()
+	newConn, err := c.getCoordinatorConnContext(ctx)
 	if err != nil {
 		LogError("Heartbeat: failed to connect: %v", err)
 		return nil
@@ -318,7 +327,7 @@ func (c *Consumer) handleRebalanceSignal() {
 
 	assignmentCtx := c.replaceAssignmentContext()
 
-	if coordAddr, err := c.findCoordinator(); err == nil {
+	if coordAddr, err := c.findCoordinatorContext(assignmentCtx); err == nil {
 		c.mu.Lock()
 		c.coordinatorAddr = coordAddr
 		c.mu.Unlock()
