@@ -37,9 +37,11 @@ type PublisherConfig struct {
 	BufferSize        int    `yaml:"buffer_size" json:"buffer_size"`
 	LingerMS          int    `yaml:"linger_ms" json:"linger_ms"`
 
-	UseTLS      bool   `yaml:"use_tls" json:"use_tls"`
-	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
-	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
+	UseTLS        bool   `yaml:"use_tls" json:"use_tls"`
+	TLSCAPath     string `yaml:"tls_ca_path" json:"tls_ca_path"`
+	TLSServerName string `yaml:"tls_server_name" json:"tls_server_name"`
+	TLSCertPath   string `yaml:"tls_cert_path" json:"tls_cert_path"`
+	TLSKeyPath    string `yaml:"tls_key_path" json:"tls_key_path"`
 
 	Principal string `yaml:"principal" json:"principal"`
 	AuthToken string `yaml:"auth_token" json:"auth_token"`
@@ -90,7 +92,7 @@ func (c *PublisherConfig) Validate() error {
 			return fmt.Errorf("publisher broker address must not be empty")
 		}
 	}
-	if err := validateTLSFiles(c.UseTLS, c.TLSCertPath, c.TLSKeyPath); err != nil {
+	if err := validateTLSFiles(c.UseTLS, c.TLSCAPath, c.TLSServerName, c.TLSCertPath, c.TLSKeyPath); err != nil {
 		return err
 	}
 	return nil
@@ -175,9 +177,11 @@ type ConsumerConfig struct {
 	CommitRetryBackoff    time.Duration `yaml:"commit_retry_backoff" json:"commit_retry_backoff"`
 	CommitRetryMaxBackoff time.Duration `yaml:"commit_retry_max_backoff" json:"commit_retry_max_backoff"`
 
-	UseTLS      bool   `yaml:"use_tls" json:"use_tls"`
-	TLSCertPath string `yaml:"tls_cert_path" json:"tls_cert_path"`
-	TLSKeyPath  string `yaml:"tls_key_path" json:"tls_key_path"`
+	UseTLS        bool   `yaml:"use_tls" json:"use_tls"`
+	TLSCAPath     string `yaml:"tls_ca_path" json:"tls_ca_path"`
+	TLSServerName string `yaml:"tls_server_name" json:"tls_server_name"`
+	TLSCertPath   string `yaml:"tls_cert_path" json:"tls_cert_path"`
+	TLSKeyPath    string `yaml:"tls_key_path" json:"tls_key_path"`
 
 	Principal string `yaml:"principal" json:"principal"`
 	AuthToken string `yaml:"auth_token" json:"auth_token"`
@@ -208,7 +212,7 @@ func (c *ConsumerConfig) Validate() error {
 	if strings.TrimSpace(c.ConsumerID) == "" || strings.ContainsAny(c.ConsumerID, " \t\r\n") {
 		return fmt.Errorf("consumer ID must be non-empty and contain no whitespace")
 	}
-	if err := validateTLSFiles(c.UseTLS, c.TLSCertPath, c.TLSKeyPath); err != nil {
+	if err := validateTLSFiles(c.UseTLS, c.TLSCAPath, c.TLSServerName, c.TLSCertPath, c.TLSKeyPath); err != nil {
 		return err
 	}
 	if c.Mode != "" && c.Mode != ModePolling && c.Mode != ModeStreaming {
@@ -261,12 +265,18 @@ func validateWireClientSettings(compression, principal, token string) error {
 	return nil
 }
 
-func validateTLSFiles(enabled bool, certificate, key string) error {
+func validateTLSFiles(enabled bool, ca, serverName, certificate, key string) error {
 	if !enabled {
 		return nil
 	}
-	if strings.TrimSpace(certificate) == "" || strings.TrimSpace(key) == "" {
-		return fmt.Errorf("TLS certificate and key paths are required when TLS is enabled")
+	if (strings.TrimSpace(certificate) == "") != (strings.TrimSpace(key) == "") {
+		return fmt.Errorf("TLS client certificate and key paths must be configured together")
+	}
+	if ca != strings.TrimSpace(ca) {
+		return fmt.Errorf("TLS CA path must not have surrounding whitespace")
+	}
+	if serverName != strings.TrimSpace(serverName) || strings.ContainsAny(serverName, " \t\r\n") {
+		return fmt.Errorf("TLS server name must not contain whitespace")
 	}
 	return nil
 }

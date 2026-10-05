@@ -232,6 +232,8 @@ func TestNewDefaultPublisherConfig_AllDefaults(t *testing.T) {
 	assert.Equal(t, 100, cfg.RetryBackoffMS)
 	assert.Equal(t, 2000, cfg.MaxBackoffMS)
 	assert.False(t, cfg.UseTLS)
+	assert.Equal(t, "", cfg.TLSCAPath)
+	assert.Equal(t, "", cfg.TLSServerName)
 	assert.Equal(t, "", cfg.TLSCertPath)
 	assert.Equal(t, "", cfg.TLSKeyPath)
 	assert.False(t, cfg.EnableMetrics)
@@ -248,6 +250,8 @@ func TestNewDefaultConsumerConfig_AllDefaults(t *testing.T) {
 	assert.Equal(t, 2*time.Second, cfg.CommitRetryMaxBackoff)
 	assert.Equal(t, 300000, cfg.StreamingReadDeadlineMS)
 	assert.False(t, cfg.UseTLS)
+	assert.Equal(t, "", cfg.TLSCAPath)
+	assert.Equal(t, "", cfg.TLSServerName)
 	assert.Equal(t, "", cfg.TLSCertPath)
 	assert.Equal(t, "", cfg.TLSKeyPath)
 	assert.False(t, cfg.EnableMetrics)
@@ -258,10 +262,14 @@ func TestNewDefaultConsumerConfig_AllDefaults(t *testing.T) {
 func TestConsumerConfig_TLSFields(t *testing.T) {
 	cfg := NewDefaultConsumerConfig()
 	cfg.UseTLS = true
+	cfg.TLSCAPath = "/path/to/ca.pem"
+	cfg.TLSServerName = "broker.internal"
 	cfg.TLSCertPath = "/path/to/cert.pem"
 	cfg.TLSKeyPath = "/path/to/key.pem"
 
 	assert.True(t, cfg.UseTLS)
+	assert.Equal(t, "/path/to/ca.pem", cfg.TLSCAPath)
+	assert.Equal(t, "broker.internal", cfg.TLSServerName)
 	assert.Equal(t, "/path/to/cert.pem", cfg.TLSCertPath)
 	assert.Equal(t, "/path/to/key.pem", cfg.TLSKeyPath)
 }
@@ -269,10 +277,14 @@ func TestConsumerConfig_TLSFields(t *testing.T) {
 func TestPublisherConfig_TLSFields(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	cfg.UseTLS = true
+	cfg.TLSCAPath = "/path/to/ca.pem"
+	cfg.TLSServerName = "broker.internal"
 	cfg.TLSCertPath = "/path/to/cert.pem"
 	cfg.TLSKeyPath = "/path/to/key.pem"
 
 	assert.True(t, cfg.UseTLS)
+	assert.Equal(t, "/path/to/ca.pem", cfg.TLSCAPath)
+	assert.Equal(t, "broker.internal", cfg.TLSServerName)
 	assert.Equal(t, "/path/to/cert.pem", cfg.TLSCertPath)
 	assert.Equal(t, "/path/to/key.pem", cfg.TLSKeyPath)
 }
@@ -316,6 +328,8 @@ func TestLoadConfig_PublisherYAMLWithTLSAndMetrics(t *testing.T) {
 	yamlData := `topic: yaml-topic
 partitions: 4
 use_tls: true
+tls_ca_path: /ca
+tls_server_name: broker.internal
 tls_cert_path: /cert
 tls_key_path: /key
 enable_metrics: true`
@@ -330,6 +344,8 @@ enable_metrics: true`
 	assert.Equal(t, "yaml-topic", loaded.Topic)
 	assert.Equal(t, 4, loaded.Partitions)
 	assert.True(t, loaded.UseTLS)
+	assert.Equal(t, "/ca", loaded.TLSCAPath)
+	assert.Equal(t, "broker.internal", loaded.TLSServerName)
 	assert.Equal(t, "/cert", loaded.TLSCertPath)
 	assert.Equal(t, "/key", loaded.TLSKeyPath)
 	assert.True(t, loaded.EnableMetrics)
@@ -340,6 +356,8 @@ func TestLoadConfig_ConsumerYAMLWithTLSAndMetrics(t *testing.T) {
 	path := filepath.Join(dir, "c.yaml")
 	yamlData := `group_id: tls-group
 use_tls: true
+tls_ca_path: /consumer/ca
+tls_server_name: broker.internal
 tls_cert_path: /consumer/cert
 tls_key_path: /consumer/key
 enable_metrics: true`
@@ -353,6 +371,8 @@ enable_metrics: true`
 	}
 	assert.Equal(t, "tls-group", loaded.GroupID)
 	assert.True(t, loaded.UseTLS)
+	assert.Equal(t, "/consumer/ca", loaded.TLSCAPath)
+	assert.Equal(t, "broker.internal", loaded.TLSServerName)
 	assert.Equal(t, "/consumer/cert", loaded.TLSCertPath)
 	assert.Equal(t, "/consumer/key", loaded.TLSKeyPath)
 	assert.True(t, loaded.EnableMetrics)
@@ -389,7 +409,10 @@ func TestPublisherConfigRejectsInvalidWireSettingsBeforeConnect(t *testing.T) {
 		"buffer size": func(config *PublisherConfig) { config.BufferSize = 0 },
 		"brokers":     func(config *PublisherConfig) { config.BrokerAddrs = nil },
 		"topic":       func(config *PublisherConfig) { config.Topic = "bad topic" },
-		"tls paths":   func(config *PublisherConfig) { config.UseTLS = true },
+		"tls partial client identity": func(config *PublisherConfig) {
+			config.UseTLS = true
+			config.TLSCertPath = "/cert"
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -419,6 +442,10 @@ func TestConsumerConfigRejectsInvalidRuntimeSettings(t *testing.T) {
 		"group":   func(config *ConsumerConfig) { config.GroupID = "bad group" },
 		"consumer": func(config *ConsumerConfig) {
 			config.ConsumerID = ""
+		},
+		"tls partial client identity": func(config *ConsumerConfig) {
+			config.UseTLS = true
+			config.TLSKeyPath = "/key"
 		},
 	}
 	for name, mutate := range tests {

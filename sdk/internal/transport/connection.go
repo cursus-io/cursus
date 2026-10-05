@@ -93,9 +93,9 @@ func Dial(ctx context.Context, addr string, config DialConfig) (*Conn, error) {
 	if config.TLS != nil {
 		tlsConfig := config.TLS.Clone()
 		if tlsConfig.ServerName == "" {
-			host, _, err := net.SplitHostPort(addr)
-			if err != nil {
-				return closeOnError(fmt.Errorf("parse TLS peer address: %w", err))
+			host, _, splitErr := net.SplitHostPort(addr)
+			if splitErr != nil {
+				return closeOnError(fmt.Errorf("derive TLS server name from %s: %w", addr, splitErr))
 			}
 			tlsConfig.ServerName = host
 		}

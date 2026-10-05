@@ -163,6 +163,33 @@ fixture protects byte-level compatibility; it does not replace each SDK's
 required live-broker producer, consumer, administration, transaction, and
 EventStore tests.
 
+## TLS verification
+
+Producer, consumer, and administration connections share one verified TLS
+configuration. Set `UseTLS` for server-authenticated TLS. `TLSCAPath` can point
+to a private PEM CA bundle; its certificates extend the platform trust store.
+Set `TLSServerName` when the certificate name differs from the host used to
+dial the broker, as is common with Kubernetes service names or load balancers.
+When it is empty, the dialed host is verified. Hostname verification cannot be
+disabled.
+
+`TLSCertPath` and `TLSKeyPath` are an optional client identity for mutual TLS.
+They must either both be empty or both be set:
+
+```go
+cfg := sdk.NewDefaultPublisherConfig()
+cfg.UseTLS = true
+cfg.TLSCAPath = "/var/run/secrets/cursus/ca.crt"
+cfg.TLSServerName = "broker.cursus.svc.cluster.local"
+
+// Add these only when the broker requires mutual TLS.
+cfg.TLSCertPath = "/var/run/secrets/cursus/tls.crt"
+cfg.TLSKeyPath = "/var/run/secrets/cursus/tls.key"
+```
+
+Certificate files are loaded when a client is created. Applications should
+replace and drain SDK clients after rotating mounted certificate files.
+
 Broker failures returned by application requests are available as `*sdk.BrokerError`:
 
 ```go

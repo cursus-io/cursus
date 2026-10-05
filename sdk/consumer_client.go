@@ -39,14 +39,11 @@ func NewConsumerClient(cfg *ConsumerConfig) (*ConsumerClient, error) {
 	c.leader.Store(&consumerLeaderInfo{addr: "", updated: time.Time{}})
 
 	if cfg.UseTLS {
-		cert, err := tls.LoadX509KeyPair(cfg.TLSCertPath, cfg.TLSKeyPath)
+		tlsConfig, err := buildClientTLSConfig(cfg.TLSCAPath, cfg.TLSServerName, cfg.TLSCertPath, cfg.TLSKeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("load TLS cert: %w", err)
+			return nil, err
 		}
-		c.tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
+		c.tlsConfig = tlsConfig
 	}
 
 	return c, nil
@@ -67,7 +64,7 @@ func (c *ConsumerClient) UpdateLeader(addr string) {
 // Connect opens a TCP (or TLS) connection to addr with socket tuning applied.
 func (c *ConsumerClient) Connect(addr string) (net.Conn, error) {
 	if c.config.UseTLS && c.tlsConfig == nil {
-		return nil, fmt.Errorf("TLS enabled but certificate not loaded")
+		return nil, fmt.Errorf("TLS enabled but configuration not loaded")
 	}
 	return dialAuthenticatedWireConnection(
 		context.Background(), addr, 5*time.Second,

@@ -48,14 +48,11 @@ func NewProducerClient(config *PublisherConfig) (*ProducerClient, error) {
 	})
 
 	if config.UseTLS {
-		cert, err := tls.LoadX509KeyPair(config.TLSCertPath, config.TLSKeyPath)
+		tlsConfig, err := buildClientTLSConfig(config.TLSCAPath, config.TLSServerName, config.TLSCertPath, config.TLSKeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("load TLS cert: %w", err)
+			return nil, err
 		}
-		pc.tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
+		pc.tlsConfig = tlsConfig
 	}
 
 	return pc, nil
@@ -79,7 +76,7 @@ func (pc *ProducerClient) connectPartitionLocked(ctx context.Context, idx int, a
 	}
 
 	if pc.config.UseTLS && pc.tlsConfig == nil {
-		return fmt.Errorf("TLS enabled but certificate not loaded")
+		return fmt.Errorf("TLS enabled but configuration not loaded")
 	}
 	conn, err := dialAuthenticatedWireConnection(
 		ctx, addr, 5*time.Second,

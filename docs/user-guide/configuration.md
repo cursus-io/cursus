@@ -386,15 +386,20 @@ bootstrap_servers: "broker1:9000,broker2:9000,broker3:9000"
 
 ## SDK Client Configuration
 
-### Consumer TLS
+### Client TLS
 
-The Go SDK consumer now supports TLS connections, matching the producer's TLS capabilities. Add the following fields to `ConsumerConfig`:
+`PublisherConfig`, `ConsumerConfig`, and `AdminConfig` use the same TLS settings and verification rules:
 
-| Parameter      | Type   | Default | Description                          |
-|---------------|--------|---------|--------------------------------------|
-| `use_tls`      | bool   | false   | Enable TLS for consumer connections  |
-| `tls_cert_path`| string | ""      | Path to TLS certificate file         |
-| `tls_key_path` | string | ""      | Path to TLS private key file         |
+| Parameter         | Type   | Default | Description |
+|------------------|--------|---------|-------------|
+| `use_tls`         | bool   | false   | Enable TLS for every broker connection |
+| `tls_ca_path`     | string | ""      | Optional PEM CA bundle added to the platform trust store |
+| `tls_server_name` | string | ""      | Optional certificate DNS name; when empty, the SDK verifies the dialed broker host |
+| `tls_cert_path`   | string | ""      | Optional PEM client certificate for mutual TLS |
+| `tls_key_path`    | string | ""      | Optional PEM private key; must be set together with `tls_cert_path` |
+
+Server-authenticated TLS only needs a CA bundle when the broker certificate is
+not already trusted by the host:
 
 ```yaml
 consumer:
@@ -402,11 +407,43 @@ consumer:
   topic: "orders"
   group_id: "my-group"
   use_tls: true
-  tls_cert_path: "certs/client.crt"
-  tls_key_path: "certs/client.key"
+  tls_ca_path: "/var/run/secrets/cursus/ca.crt"
+  tls_server_name: "broker.cursus.svc.cluster.local"
 ```
 
-When `use_tls` is enabled, every SDK client uses the shared transport dialer and performs a context-bounded TLS handshake with TLS 1.2 minimum before Wire v2 negotiation.
+For mutual TLS, also set both client identity paths:
+
+```yaml
+  tls_cert_path: "/var/run/secrets/cursus/tls.crt"
+  tls_key_path: "/var/run/secrets/cursus/tls.key"
+```
+
+When `use_tls` is enabled, every SDK client uses the shared transport dialer
+and performs a context-bounded TLS handshake with TLS 1.2 minimum before Wire
+v2 negotiation. Certificate and hostname verification are always enabled; the
+SDK does not expose an insecure verification bypass.
+
+Mount CA and client identity files from a read-only Kubernetes Secret rather
+than putting PEM data in a ConfigMap or image:
+
+```yaml
+volumes:
+  - name: cursus-client-tls
+    secret:
+      secretName: cursus-client-tls
+containers:
+  - name: application
+    volumeMounts:
+      - name: cursus-client-tls
+        mountPath: /var/run/secrets/cursus
+        readOnly: true
+```
+
+The SDK reads certificates when the client is constructed. After Kubernetes
+updates a mounted Secret, create replacement SDK clients and drain the old
+ones. Rotate a private CA in three stages: first distribute a bundle containing
+both old and new CA certificates, then rotate broker and client identities, and
+finally remove the old CA after all processes have reloaded the new bundle.
 
 ### SDK Metrics (Prometheus)
 

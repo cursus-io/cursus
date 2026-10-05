@@ -868,7 +868,7 @@ func TestNewProducerClient_TLSError(t *testing.T) {
 	client, err := NewProducerClient(cfg)
 	assert.Nil(t, client)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "load TLS cert")
+	assert.Contains(t, err.Error(), "load TLS client certificate")
 }
 
 func TestProducerClient_ReconnectPartition_EmptyAddrFallsBackToSelectBroker(t *testing.T) {
