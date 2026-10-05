@@ -301,9 +301,37 @@ func (ctx *TestContext) Then() *Consequences {
 func (ctx *TestContext) Cleanup() {
 	ctx.t.Log("Cleaning up test resources...")
 
+	if ctx.client != nil && ctx.topic != "" && ctx.consumerGroup != "" {
+		memberID, generation := ctx.client.GetSyncInfo()
+		if memberID != "" && generation > 0 {
+			if status, err := ctx.client.GetConsumerGroupStatus(ctx.consumerGroup); err == nil {
+				generation = status.Generation
+				memberPresent := false
+				for _, member := range status.Members {
+					if member.MemberID == memberID {
+						memberPresent = true
+						break
+					}
+				}
+				if !memberPresent {
+					generation = 0
+				}
+			}
+		}
+		if memberID != "" && generation > 0 {
+			command := fmt.Sprintf(
+				"LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
+				ctx.topic, ctx.consumerGroup, memberID, generation,
+			)
+			if _, err := ctx.client.SendCommand(ctx.topic, command, 2*time.Second); err != nil {
+				ctx.t.Logf("Failed to leave consumer group %s before cleanup: %v", ctx.consumerGroup, err)
+			}
+		}
+	}
+
 	if ctx.topic != "" {
 		if err := ctx.getClient().DeleteTopic(ctx.topic); err != nil {
-			if !strings.Contains(err.Error(), "not found") {
+			if !strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "topic_not_found") {
 				ctx.t.Logf("Failed to delete topic %s: %v", ctx.topic, err)
 			}
 		} else {

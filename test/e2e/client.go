@@ -33,6 +33,7 @@ type ConsumerGroupStatus struct {
 	GroupName      string       `json:"group_name"`
 	TopicName      string       `json:"topic_name"`
 	State          string       `json:"state"`
+	Generation     int          `json:"generation"`
 	MemberCount    int          `json:"member_count"`
 	PartitionCount int          `json:"partition_count"`
 	Members        []MemberInfo `json:"members"`
