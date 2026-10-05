@@ -67,7 +67,7 @@ Asynchronous writes enter a buffered `writeCh` (default capacity 1024). `flushLo
 - an explicit flush or shutdown drains pending records,
 - a segment roll is required.
 
-`WriteBatch` flushes the Go buffered data and index writers to the operating-system file descriptors. `syncLoop` calls `Sync` for data and index files at `disk_flush_interval_ms` (default 500 ms) and advances the partition durability callback after a successful sync. Explicit `Flush`, segment rotation, and shutdown also sync data.
+`WriteBatch` flushes the Go buffered data and index writers to the operating-system file descriptors. `syncLoop` calls `Sync` for data and index files at `disk_flush_interval_ms` (default 500 ms) and advances the partition durability callback after a successful sync. Explicit `Flush`, segment rotation, and shutdown also sync data. Initial and rolled segment/index filenames are published by syncing their parent directories before the handler can acknowledge a write. A failure at that boundary makes the handler unavailable for writes until restart.
 
 A write being visible in the process page cache is different from surviving power loss. Client acknowledgements and replicated HWM advancement must be interpreted according to the selected publish/replication path and the synced committed-tail contract, not merely successful channel enqueue.
 
@@ -131,9 +131,13 @@ A standalone broker stores coordinator snapshots in `{log_dir}/__transaction_sta
     byte[payloadLength] JSON {"version":1,"transaction":{...}}
     uint32_be crc32(payload)
 
-The encoded payload is limited to 32 MiB. Every accepted transition is appended and fsynced. Before appending, the broker truncates bytes beyond the last validated record so a failed partial write cannot hide later acknowledged state. Startup repairs only a torn or checksum-corrupt final frame and rejects corruption before the tail. Every runtime record must use the version-1 envelope; bare transaction snapshots are rejected.
+The encoded payload is limited to 32 MiB. Every accepted transition is appended and fsynced. Initial creation syncs the journal file and its directory entry before the journal becomes available. Existing journals receive the same directory sync during startup, and append/recovery never recreate a missing authoritative path. Before appending, the broker truncates bytes beyond the last validated record so a failed partial write cannot hide later acknowledged state. Startup repairs only a torn or checksum-corrupt final frame and rejects corruption before the tail. Every runtime record must use the version-1 envelope; bare transaction snapshots are rejected.
 
 The journal appends every acknowledged transition and automatically compacts only superseded transaction snapshots when removable record or byte debt crosses its threshold. A large useful latest-state set is retained without repeated rewrites. Backups must keep the journal consistent with partition logs and the standalone consumer offset store.
+
+## Event Snapshot Store
+
+Event-sourcing snapshots are append-only files under `{log_dir}/{topic}/partition_{partition}/`. Creation syncs the new file, its containing partition directory, and the topic directory before the store accepts `SAVE_SNAPSHOT`. Each successful save fsyncs the appended record before updating the in-memory snapshot index or returning success. A creation-sync failure leaves the store unavailable, and a record-sync failure does not publish the failed snapshot through reads.
 
 ## Retention And Compaction
 

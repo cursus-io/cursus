@@ -87,6 +87,38 @@ func TestSegmentDirectorySyncFailureMakesWritesUnavailable(t *testing.T) {
 	}
 }
 
+func TestReplicatedWriteRejectsRolledSegmentDirectorySyncFailure(t *testing.T) {
+	originalSync := syncAuthoritativeDirectory
+	t.Cleanup(func() { syncAuthoritativeDirectory = originalSync })
+
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.SegmentSize = 256
+	cfg.DiskFlushIntervalMS = 60_000
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = handler.Close() })
+
+	if err := handler.WriteDirect("orders", 0, types.Message{Offset: 0, Payload: strings.Repeat("a", 192)}); err != nil {
+		t.Fatal(err)
+	}
+	syncAuthoritativeDirectory = func(string) error {
+		return errors.New("injected replicated directory sync failure")
+	}
+	err = handler.WriteDirect("orders", 0, types.Message{Offset: 1, Payload: strings.Repeat("b", 192)})
+	if err == nil || !strings.Contains(err.Error(), "sync rotated segment directory") {
+		t.Fatalf("replicated roll error = %v, want directory sync failure", err)
+	}
+
+	syncAuthoritativeDirectory = originalSync
+	err = handler.WriteDirect("orders", 0, types.Message{Offset: 1, Payload: "retry"})
+	if err == nil || !strings.Contains(err.Error(), "unavailable until restart") {
+		t.Fatalf("replicated retry error = %v, want terminal write failure", err)
+	}
+}
+
 func TestSegmentDirectorySyncFailureRejectsHandlerCreation(t *testing.T) {
 	originalSync := syncAuthoritativeDirectory
 	t.Cleanup(func() { syncAuthoritativeDirectory = originalSync })
