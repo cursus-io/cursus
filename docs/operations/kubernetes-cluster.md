@@ -41,7 +41,14 @@ REVISION=$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Image.Con
 test "${#REVISION}" -eq 40
 ```
 
-Create the namespace first, then the shared internal-authentication Secret and a TLS Secret whose certificate is valid for `cursus.internal` and the three generated pod DNS names. Do not use the client TLS Secret for this purpose unless it carries the required client-auth CA and SANs.
+Create the namespace first, then the shared internal-authentication Secret and
+an internal TLS Secret whose certificate is valid for `cursus.internal` and
+the three generated pod DNS names. Create a separate client-listener TLS Secret
+and SASL Secret. The client certificate must be valid for the server name used
+by every SDK, and the `users` value uses
+`principal:token:permission1|permission2` entries separated by commas. Do not
+reuse the internal certificate unless its key usage, SANs, ownership, and
+rotation policy are also appropriate for client traffic.
 
 ```bash
 kubectl create namespace brokers
@@ -54,12 +61,21 @@ kubectl -n brokers create secret generic cursus-internal-tls \
   --from-file=tls.key=broker.key \
   --from-file=ca.crt=ca.crt
 
+kubectl -n brokers create secret generic cursus-client-tls \
+  --from-file=tls.crt=client-listener.crt \
+  --from-file=tls.key=client-listener.key
+
+kubectl -n brokers create secret generic cursus-client-auth \
+  --from-literal="users=operator:$(openssl rand -hex 32):*"
+
 helm upgrade --install cursus manifests/helm-cluster --namespace brokers --create-namespace \
   --set-string image.digest="$DIGEST" \
   --set-string image.revision="$REVISION" \
   --set cluster.internalAuthSecret=cursus-internal-auth \
   --set-string cluster.internalAuthGeneration=1 \
-  --set internalTLS.secretName=cursus-internal-tls
+  --set internalTLS.secretName=cursus-internal-tls \
+  --set clientSecurity.tls.secretName=cursus-client-tls \
+  --set clientSecurity.sasl.secretName=cursus-client-auth
 ```
 
 Before production use, render and inspect the exact release:
@@ -69,17 +85,36 @@ helm lint manifests/helm-cluster \
   --set-string image.digest="$DIGEST" \
   --set-string image.revision="$REVISION" \
   --set cluster.internalAuthSecret=cursus-internal-auth \
-  --set internalTLS.secretName=cursus-internal-tls
+  --set internalTLS.secretName=cursus-internal-tls \
+  --set clientSecurity.tls.secretName=cursus-client-tls \
+  --set clientSecurity.sasl.secretName=cursus-client-auth
 helm template cursus manifests/helm-cluster --namespace brokers \
   --set-string image.digest="$DIGEST" \
   --set-string image.revision="$REVISION" \
   --set cluster.internalAuthSecret=cursus-internal-auth \
-  --set internalTLS.secretName=cursus-internal-tls | kubectl apply --dry-run=client -f -
+  --set internalTLS.secretName=cursus-internal-tls \
+  --set clientSecurity.tls.secretName=cursus-client-tls \
+  --set clientSecurity.sasl.secretName=cursus-client-auth | kubectl apply --dry-run=client -f -
 kubectl -n brokers wait --for=condition=Ready pod \
   -l app.kubernetes.io/instance=cursus --timeout=5m
 kubectl -n brokers get pods,pvc,pdb
 kubectl -n brokers get events --field-selector reason=FailedCreate
 ```
+
+The production chart rejects a plaintext or unauthenticated client listener.
+`clientSecurity.allowInsecure=true` exists only for isolated source-built
+fixtures and must not be used for production. Configure every SDK with TLS,
+the client certificate server name, a principal, and its token. Use
+`cursusctl --tls-ca ... --tls-server-name ... --principal ...
+--auth-token-env ...` for an authenticated operator probe.
+
+Set `networkPolicy.enabled=true` when the cluster CNI enforces Kubernetes
+NetworkPolicy. With empty selectors, the broker port accepts clients only from
+the release namespace; set `clientNamespaceSelector` and `clientPodSelector`
+to narrower workload labels when possible. When monitoring is enabled, set the
+monitoring selectors to the Prometheus namespace and Pod labels. The policy
+always restricts Raft, discovery, and internal replication ports to this
+StatefulSet's broker Pods.
 
 Also inspect the platform DNS deployment and placement. The resource name is
 provider-specific; a common CoreDNS installation can be checked with:

@@ -10,6 +10,21 @@
 {{- if not .Values.internalTLS.secretName }}
 {{- fail "internalTLS.secretName must name a pre-created Secret containing tls.crt, tls.key, and ca.crt" }}
 {{- end }}
+{{- if not (kindIs "bool" .Values.clientSecurity.allowInsecure) }}
+{{- fail "clientSecurity.allowInsecure must be a boolean" }}
+{{- end }}
+{{- if not (kindIs "bool" .Values.networkPolicy.enabled) }}
+{{- fail "networkPolicy.enabled must be a boolean" }}
+{{- end }}
+{{- if and (not .Values.clientSecurity.allowInsecure) (not .Values.clientSecurity.tls.secretName) }}
+{{- fail "clientSecurity.tls.secretName must name a pre-created Secret containing tls.crt and tls.key" }}
+{{- end }}
+{{- if and (not .Values.clientSecurity.allowInsecure) (not .Values.clientSecurity.sasl.secretName) }}
+{{- fail "clientSecurity.sasl.secretName must name a pre-created Secret containing the configured users key" }}
+{{- end }}
+{{- if and .Values.clientSecurity.sasl.secretName (not (.Values.clientSecurity.sasl.secretKey | toString | trim)) }}
+{{- fail "clientSecurity.sasl.secretKey must identify the SASL_USERS entry in the client auth Secret" }}
+{{- end }}
 {{- if not (.Values.cluster.internalAuthGeneration | toString | trim) }}
 {{- fail "cluster.internalAuthGeneration must identify the active non-secret credential generation" }}
 {{- end }}
@@ -175,23 +190,38 @@ spec:
             - name: MAX_TRANSACTION_RECORDS
               value: {{ .Values.limits.maxTransactionRecords | quote }}
             - name: MAX_TRANSACTION_BYTES
-              value: {{ .Values.limits.maxTransactionBytes | quote }}
+              value: {{ int64 .Values.limits.maxTransactionBytes | quote }}
             - name: MAX_TRANSACTION_OFFSETS
               value: {{ .Values.limits.maxTransactionOffsets | quote }}
             - name: MAX_INFLIGHT_REQUESTS
               value: {{ .Values.limits.maxInflightRequests | quote }}
             - name: MAX_INFLIGHT_REQUEST_BYTES
-              value: {{ .Values.limits.maxInflightRequestBytes | quote }}
+              value: {{ int64 .Values.limits.maxInflightRequestBytes | quote }}
             - name: TRANSACTION_COORDINATOR_SHARDS
               value: "{{ .Values.cluster.transactionCoordinatorShards }}"
             - name: LOG_DIR
               value: /data/logs
             - name: DISK_MIN_FREE_BYTES
-              value: {{ .Values.storage.minFreeBytes | quote }}
+              value: {{ int64 .Values.storage.minFreeBytes | quote }}
             - name: DISK_MIN_FREE_PERCENT
               value: {{ .Values.storage.minFreePercent | quote }}
             - name: USE_TLS
-              value: "false"
+              value: {{ ternary "true" "false" (not (empty .Values.clientSecurity.tls.secretName)) | quote }}
+            {{- if .Values.clientSecurity.tls.secretName }}
+            - name: TLS_CERT_PATH
+              value: /app/client-tls/tls.crt
+            - name: TLS_KEY_PATH
+              value: /app/client-tls/tls.key
+            {{- end }}
+            - name: ENABLE_SASL
+              value: {{ ternary "true" "false" (not (empty .Values.clientSecurity.sasl.secretName)) | quote }}
+            {{- if .Values.clientSecurity.sasl.secretName }}
+            - name: SASL_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.clientSecurity.sasl.secretName }}
+                  key: {{ .Values.clientSecurity.sasl.secretKey }}
+            {{- end }}
             - name: INTERNAL_USE_TLS
               value: "true"
             - name: INTERNAL_TLS_CERT_PATH
@@ -228,6 +258,11 @@ spec:
             - name: internal-tls
               mountPath: /app/internal-tls
               readOnly: true
+            {{- if .Values.clientSecurity.tls.secretName }}
+            - name: client-tls
+              mountPath: /app/client-tls
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
@@ -241,6 +276,16 @@ spec:
                 path: tls.key
               - key: ca.crt
                 path: ca.crt
+        {{- if .Values.clientSecurity.tls.secretName }}
+        - name: client-tls
+          secret:
+            secretName: {{ .Values.clientSecurity.tls.secretName }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        {{- end }}
       {{- with .Values.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}

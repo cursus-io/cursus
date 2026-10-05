@@ -17,6 +17,10 @@ persist credentials or execute a command file.
 
 When SASL is enabled, pass `--principal` plus `--auth-token-env NAME`. The
 token is read only from `NAME` and is never accepted as a command-line value.
+For a TLS listener, add `--tls-ca PATH` and, when the dial address differs from
+the certificate SAN, `--tls-server-name NAME`. Mutual TLS additionally accepts
+`--tls-cert PATH --tls-key PATH`; the certificate and key flags must be used
+together.
 
 ## Command Map
 

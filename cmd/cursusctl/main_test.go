@@ -137,6 +137,14 @@ func TestRunRejectsIncompleteAuthenticationFlags(t *testing.T) {
 	}
 }
 
+func TestRunRejectsIncompleteTLSClientIdentity(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--broker", "127.0.0.1:9000", "--tls-cert", "client.crt", "LIST"}, func(string) string { return "" }, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "--tls-cert and --tls-key must be provided together") {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+}
+
 type unexpectedFrameError struct{}
 
 func (*unexpectedFrameError) Error() string { return "unexpected Wire v2 frame" }

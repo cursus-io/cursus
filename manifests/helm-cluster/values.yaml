@@ -67,6 +67,31 @@ internalTLS:
   secretName: ""
   serverName: cursus.internal
 
+# Production client traffic is encrypted and authenticated independently from
+# broker-to-broker transport. The auth Secret must contain `users` in the
+# broker's SASL_USERS format, for example
+# `operator:random-token:admin|topic.read|topic.write|group|transaction`.
+clientSecurity:
+  allowInsecure: false
+  tls:
+    secretName: ""
+  sasl:
+    secretName: ""
+    secretKey: users
+
+networkPolicy:
+  enabled: false
+  # When enabled, only matching client Pods may reach the public broker port.
+  # An empty namespace selector means this release namespace, not every
+  # namespace. An empty Pod selector allows every Pod in that namespace.
+  # Broker-to-broker ports remain restricted to this StatefulSet's Pods.
+  clientNamespaceSelector: {}
+  clientPodSelector: {}
+  # Metrics access is rendered only when monitoring.enabled is true. Empty
+  # selectors have the same release-namespace meaning as the client selectors.
+  monitoringNamespaceSelector: {}
+  monitoringPodSelector: {}
+
 podSecurityContext:
   fsGroup: 1000
   supplementalGroups: [1000]

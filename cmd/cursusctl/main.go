@@ -5,6 +5,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -32,6 +34,10 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 	timeout := flags.Duration("timeout", defaultTimeout, "dial, handshake, and command timeout")
 	principal := flags.String("principal", "", "optional authenticated principal")
 	authTokenEnv := flags.String("auth-token-env", "", "environment variable containing the principal token")
+	tlsCA := flags.String("tls-ca", "", "optional PEM CA bundle; enables TLS")
+	tlsServerName := flags.String("tls-server-name", "", "optional TLS certificate server name")
+	tlsCert := flags.String("tls-cert", "", "optional TLS client certificate")
+	tlsKey := flags.String("tls-key", "", "optional TLS client private key")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: cursusctl --broker host:port [options] COMMAND [key=value ...]")
 		fmt.Fprintln(stderr, "Examples: cursusctl --broker broker:9000 LIST")
@@ -49,6 +55,10 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 		fmt.Fprintln(stderr, "--principal and --auth-token-env must be provided together")
 		return 2
 	}
+	if (*tlsCert == "") != (*tlsKey == "") {
+		fmt.Fprintln(stderr, "--tls-cert and --tls-key must be provided together")
+		return 2
+	}
 	command := strings.Join(flags.Args(), " ")
 	if _, _, err := wire.ParseCommandText(command); err != nil {
 		fmt.Fprintf(stderr, "invalid Wire v2 command: %v\n", err)
@@ -57,8 +67,7 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", *broker)
+	conn, err := dialBroker(ctx, *broker, *tlsCA, *tlsServerName, *tlsCert, *tlsKey)
 	if err != nil {
 		fmt.Fprintf(stderr, "connect broker: %v\n", err)
 		return 1
@@ -94,6 +103,38 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 		return 1
 	}
 	return 0
+}
+
+func dialBroker(ctx context.Context, address, caPath, serverName, certPath, keyPath string) (net.Conn, error) {
+	dialer := net.Dialer{}
+	useTLS := caPath != "" || serverName != "" || certPath != ""
+	if !useTLS {
+		return dialer.DialContext(ctx, "tcp", address)
+	}
+	config := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName}
+	if caPath != "" {
+		roots, err := x509.SystemCertPool()
+		if err != nil || roots == nil {
+			roots = x509.NewCertPool()
+		}
+		caPEM, err := os.ReadFile(caPath) // #nosec G304 -- explicit operator-supplied trust path.
+		if err != nil {
+			return nil, fmt.Errorf("read TLS CA bundle: %w", err)
+		}
+		if !roots.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("TLS CA bundle contains no valid certificates")
+		}
+		config.RootCAs = roots
+	}
+	if certPath != "" {
+		certificate, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("load TLS client certificate: %w", err)
+		}
+		config.Certificates = []tls.Certificate{certificate}
+	}
+	tlsDialer := tls.Dialer{NetDialer: &dialer, Config: config}
+	return tlsDialer.DialContext(ctx, "tcp", address)
 }
 
 func execute(client *wire.ClientConn, command string, stdout io.Writer) error {

@@ -78,13 +78,18 @@ jobs:
             --set-string image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
             --set-string image.revision=0000000000000000000000000000000000000000 \
             --set cluster.internalAuthSecret=cursus-internal-auth \
-            --set internalTLS.secretName=cursus-internal-tls
+            --set internalTLS.secretName=cursus-internal-tls \
+            --set clientSecurity.tls.secretName=cursus-client-tls \
+            --set clientSecurity.sasl.secretName=cursus-client-auth
           helm template cursus manifests/helm-cluster \
             --namespace brokers \
             --set-string image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
             --set-string image.revision=0000000000000000000000000000000000000000 \
             --set cluster.internalAuthSecret=cursus-internal-auth \
-            --set internalTLS.secretName=cursus-internal-tls > /tmp/cursus-cluster.yaml
+            --set internalTLS.secretName=cursus-internal-tls \
+            --set clientSecurity.tls.secretName=cursus-client-tls \
+            --set clientSecurity.sasl.secretName=cursus-client-auth \
+            --set networkPolicy.enabled=true > /tmp/cursus-cluster.yaml
           grep -q 'type: RuntimeDefault' /tmp/cursus-cluster.yaml
           helm template cursus manifests/helm-cluster \
             --namespace brokers \
@@ -92,6 +97,8 @@ jobs:
             --set-string image.revision=0000000000000000000000000000000000000000 \
             --set cluster.internalAuthSecret=cursus-internal-auth \
             --set internalTLS.secretName=cursus-internal-tls \
+            --set clientSecurity.tls.secretName=cursus-client-tls \
+            --set clientSecurity.sasl.secretName=cursus-client-auth \
             --set monitoring.enabled=true \
             --set-string monitoring.labels.release=kube-prometheus-stack \
             > /tmp/cursus-cluster-monitoring.yaml
@@ -101,6 +108,34 @@ jobs:
           grep -q 'CursusClusterReplicationUnsafe' /tmp/cursus-cluster-monitoring.yaml
           grep -q 'release: kube-prometheus-stack' /tmp/cursus-cluster-monitoring.yaml
           grep -q 'cpu: 500m' /tmp/cursus-cluster.yaml
+          grep -q 'kind: NetworkPolicy' /tmp/cursus-cluster.yaml
+          grep -q 'name: ENABLE_SASL' /tmp/cursus-cluster.yaml
+          grep -q 'name: SASL_USERS' /tmp/cursus-cluster.yaml
+          grep -q 'name: TLS_CERT_PATH' /tmp/cursus-cluster.yaml
+          grep -q 'value: "67108864"' /tmp/cursus-cluster.yaml
+          grep -q 'value: "268435456"' /tmp/cursus-cluster.yaml
+
+      - name: Reject insecure cluster client transport
+        run: |
+          if helm template cursus manifests/helm-cluster \
+            --namespace brokers \
+            --set-string image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+            --set-string image.revision=0000000000000000000000000000000000000000 \
+            --set cluster.internalAuthSecret=cursus-internal-auth \
+            --set internalTLS.secretName=cursus-internal-tls; then
+            echo 'cluster chart unexpectedly accepted plaintext unauthenticated client transport'
+            exit 1
+          fi
+          if helm template cursus manifests/helm-cluster \
+            --namespace brokers \
+            --set-string image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+            --set-string image.revision=0000000000000000000000000000000000000000 \
+            --set cluster.internalAuthSecret=cursus-internal-auth \
+            --set internalTLS.secretName=cursus-internal-tls \
+            --set-string clientSecurity.allowInsecure=false; then
+            echo 'cluster chart accepted a string that bypasses the insecure-client boolean guard'
+            exit 1
+          fi
 
   docker-and-restricted-cluster:
     runs-on: ubuntu-latest
@@ -108,6 +143,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.2'
+          cache: true
       - uses: azure/setup-helm@v4
       - name: Create three-node Kubernetes cluster
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
@@ -134,6 +173,11 @@ jobs:
             --from-file=tls.crt=/tmp/tls.crt \
             --from-file=tls.key=/tmp/tls.key \
             --from-file=ca.crt=/tmp/tls.crt
+          kubectl -n brokers create secret generic cursus-client-tls \
+            --from-file=tls.crt=/tmp/tls.crt \
+            --from-file=tls.key=/tmp/tls.key
+          kubectl -n brokers create secret generic cursus-client-auth \
+            --from-literal='users=ci-admin:ci-client-token:*'
           helm upgrade --install cursus manifests/helm-cluster \
             --namespace brokers \
             --set image.repository=cursus \
@@ -143,6 +187,9 @@ jobs:
             --set image.pullPolicy=Never \
             --set cluster.internalAuthSecret=cursus-internal-auth \
             --set internalTLS.secretName=cursus-internal-tls \
+            --set clientSecurity.tls.secretName=cursus-client-tls \
+            --set clientSecurity.sasl.secretName=cursus-client-auth \
+            --set networkPolicy.enabled=true \
             --wait --timeout 5m
           kubectl -n brokers wait --for=condition=Ready pod \
             -l app.kubernetes.io/instance=cursus --timeout=5m
@@ -154,10 +201,33 @@ jobs:
           test "$(kubectl -n brokers get statefulset cursus-cursus-cluster -o jsonpath='{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}')" = true
           test "$(kubectl -n brokers get statefulset cursus-cursus-cluster -o jsonpath='{.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation}')" = false
           test "$(kubectl -n brokers get statefulset cursus-cursus-cluster -o jsonpath='{.spec.template.spec.containers[0].securityContext.capabilities.drop[0]}')" = ALL
+          test "$(kubectl -n brokers get statefulset cursus-cursus-cluster -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="USE_TLS")].value}')" = true
+          test "$(kubectl -n brokers get statefulset cursus-cursus-cluster -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENABLE_SASL")].value}')" = true
+          kubectl -n brokers get networkpolicy cursus-cursus-cluster
           if kubectl -n brokers get events --field-selector reason=FailedCreate -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' | grep -q 'violates PodSecurity'; then
             echo 'restricted Pod Security rejected a broker Pod'
             exit 1
           fi
+      - name: Verify TLS and SASL client boundary
+        env:
+          CURSUS_CLIENT_TOKEN: ci-client-token
+        run: |
+          kubectl -n brokers port-forward service/cursus-cursus-cluster 19000:9000 >/tmp/cursus-port-forward.log 2>&1 &
+          forward_pid=$!
+          trap 'kill "$forward_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if nc -z 127.0.0.1 19000; then break; fi
+            sleep 1
+          done
+          ! go run ./cmd/cursusctl --broker 127.0.0.1:19000 --timeout 3s LIST_CLUSTER
+          ! CURSUS_BAD_TOKEN=wrong go run ./cmd/cursusctl \
+            --broker 127.0.0.1:19000 --timeout 3s \
+            --tls-ca /tmp/tls.crt --tls-server-name cursus.internal \
+            --principal ci-admin --auth-token-env CURSUS_BAD_TOKEN LIST_CLUSTER
+          go run ./cmd/cursusctl \
+            --broker 127.0.0.1:19000 --timeout 10s \
+            --tls-ca /tmp/tls.crt --tls-server-name cursus.internal \
+            --principal ci-admin --auth-token-env CURSUS_CLIENT_TOKEN LIST_CLUSTER
       - name: Show restricted cluster diagnostics on failure
         if: failure()
         run: |

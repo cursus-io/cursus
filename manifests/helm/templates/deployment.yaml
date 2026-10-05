@@ -63,7 +63,7 @@ spec:
             - name: LOG_DIR  
               value: {{ .Values.persistence.logDir.path }}  
             - name: DISK_MIN_FREE_BYTES
-              value: {{ .Values.storage.minFreeBytes | quote }}
+              value: {{ int64 .Values.storage.minFreeBytes | quote }}
             - name: DISK_MIN_FREE_PERCENT
               value: {{ .Values.storage.minFreePercent | quote }}
             - name: MAX_TOPICS
@@ -77,13 +77,13 @@ spec:
             - name: MAX_TRANSACTION_RECORDS
               value: {{ .Values.limits.maxTransactionRecords | quote }}
             - name: MAX_TRANSACTION_BYTES
-              value: {{ .Values.limits.maxTransactionBytes | quote }}
+              value: {{ int64 .Values.limits.maxTransactionBytes | quote }}
             - name: MAX_TRANSACTION_OFFSETS
               value: {{ .Values.limits.maxTransactionOffsets | quote }}
             - name: MAX_INFLIGHT_REQUESTS
               value: {{ .Values.limits.maxInflightRequests | quote }}
             - name: MAX_INFLIGHT_REQUEST_BYTES
-              value: {{ .Values.limits.maxInflightRequestBytes | quote }}
+              value: {{ int64 .Values.limits.maxInflightRequestBytes | quote }}
             {{- if .Values.tls.enabled }}  
             - name: USE_TLS
               value: "true"
