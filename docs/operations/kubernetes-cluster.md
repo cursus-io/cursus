@@ -15,6 +15,17 @@ The default Pod and container security contexts satisfy Kubernetes restricted Po
 
 ## Install
 
+Resolve the immutable digest and 40-character source revision for one published
+image. They must refer to the same build. The chart has no runnable default
+image and rejects mutable tags in production:
+
+```bash
+IMAGE=ghcr.io/cursus-io/cursus:VERSION
+DIGEST=$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')
+REVISION=$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Image.Config.Labels."org.opencontainers.image.revision"}}' | tr -d '"')
+test "${#REVISION}" -eq 40
+```
+
 Create the namespace first, then the shared internal-authentication Secret and a TLS Secret whose certificate is valid for `cursus.internal` and the three generated pod DNS names. Do not use the client TLS Secret for this purpose unless it carries the required client-auth CA and SANs.
 
 ```bash
@@ -29,6 +40,8 @@ kubectl -n brokers create secret generic cursus-internal-tls \
   --from-file=ca.crt=ca.crt
 
 helm upgrade --install cursus manifests/helm-cluster --namespace brokers --create-namespace \
+  --set-string image.digest="$DIGEST" \
+  --set-string image.revision="$REVISION" \
   --set cluster.internalAuthSecret=cursus-internal-auth \
   --set-string cluster.internalAuthGeneration=1 \
   --set internalTLS.secretName=cursus-internal-tls
@@ -38,9 +51,13 @@ Before production use, render and inspect the exact release:
 
 ```bash
 helm lint manifests/helm-cluster \
+  --set-string image.digest="$DIGEST" \
+  --set-string image.revision="$REVISION" \
   --set cluster.internalAuthSecret=cursus-internal-auth \
   --set internalTLS.secretName=cursus-internal-tls
 helm template cursus manifests/helm-cluster --namespace brokers \
+  --set-string image.digest="$DIGEST" \
+  --set-string image.revision="$REVISION" \
   --set cluster.internalAuthSecret=cursus-internal-auth \
   --set internalTLS.secretName=cursus-internal-tls | kubectl apply --dry-run=client -f -
 kubectl -n brokers wait --for=condition=Ready pod \
@@ -58,10 +75,17 @@ Do not delete PVCs while restarting, scaling, or upgrading the StatefulSet. Repl
 ```bash
 scripts/expand-helm-cluster-storage.sh cursus brokers 30Gi
 helm upgrade cursus manifests/helm-cluster --namespace brokers --reuse-values \
-  --set image.tag=NEW_VERSION
+  --set-string image.digest="$NEW_DIGEST" \
+  --set-string image.revision="$NEW_REVISION"
 ```
 
 The expansion command validates all three PVCs and their StorageClasses before mutation. Kubernetes server-side validation rejects a shrink. It patches every claim, performs one-member-at-a-time restarts only when the CSI driver requires filesystem expansion, waits for all three members between restarts, verifies requested and filesystem capacity, orphans the running Pods and claims, and uses an atomic Helm upgrade to recreate the StatefulSet with the new claim template. Do not edit `persistence.size` directly or combine unrelated release changes into the expansion command. Keep a current backup and verify a known acknowledged payload and committed consumer offset before and after this procedure.
+
+Every Pod first runs the selected image as an init container. The binary must
+report the exact image revision, Wire protocol, broker lifecycle protocol,
+Raft snapshot format, and disk record format required by this chart. A stale
+image, a digest/revision mismatch, or an unsupported storage/protocol contract
+prevents the broker container from starting.
 
 ## Rotate internal credentials without losing quorum
 

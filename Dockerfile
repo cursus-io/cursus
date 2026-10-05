@@ -1,18 +1,28 @@
+ARG VERSION=dev
+ARG VCS_REF=unknown
+
 # Stage 1:
 FROM golang:1.26.6 AS builder
+ARG VERSION
+ARG VCS_REF
 
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o /app/broker ./cmd/broker \
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w -X github.com/cursus-io/cursus/pkg/buildinfo.Version=${VERSION} -X github.com/cursus-io/cursus/pkg/buildinfo.Revision=${VCS_REF}" -o /app/broker ./cmd/broker \
 	&& CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o /app/cli ./cmd/cli \
 	&& CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o /app/cursusctl ./cmd/cursusctl \
 	&& CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o /app/cursus-storage ./cmd/storage
 
 # Stage 2:
 FROM alpine:3.20
+ARG VERSION
+ARG VCS_REF
+
+LABEL org.opencontainers.image.version=$VERSION \
+      org.opencontainers.image.revision=$VCS_REF
 
 RUN apk add --no-cache bash curl
 RUN addgroup -g 1000 cursus && adduser -D -u 1000 -G cursus cursus

@@ -39,6 +39,11 @@ The workflow:
 4. generates OCI labels and tags; and
 5. builds and publishes the amd64 and arm64 manifest list.
 
+The Docker build embeds the exact Git commit in the broker binary and writes
+it to the OCI `org.opencontainers.image.revision` label. The cluster Helm chart
+requires both the immutable manifest digest and this revision, then runs the
+broker's deployment-contract check before starting any member.
+
 The job uses read-only repository contents permission and `packages: write`. The repository organization owns the package. Package visibility and anonymous pull access are managed separately in the GitHub package settings.
 
 ## Release Scope

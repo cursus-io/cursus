@@ -1,7 +1,18 @@
 image:
   repository: ghcr.io/cursus-io/cursus
-  tag: "0.1.0"
+  # Production installs must use the digest and source revision from the same
+  # published image. Mutable tags are reserved for source-built CI validation.
+  digest: ""
+  revision: ""
+  tag: ""
+  allowMutableTag: false
   pullPolicy: IfNotPresent
+
+compatibility:
+  wireProtocol: "2"
+  brokerProtocol: "4"
+  snapshotFormat: "10"
+  recordFormat: "CDM4"
 
 service:
   # Brokers advertise their stable in-cluster Pod DNS names. NodePort and

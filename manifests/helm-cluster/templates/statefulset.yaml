@@ -13,6 +13,30 @@
 {{- if not (.Values.cluster.internalAuthGeneration | toString | trim) }}
 {{- fail "cluster.internalAuthGeneration must identify the active non-secret credential generation" }}
 {{- end }}
+{{- if not (regexMatch "^[0-9a-fA-F]{40}$" (.Values.image.revision | toString)) }}
+{{- fail "image.revision must be the 40-character source commit embedded in the broker image" }}
+{{- end }}
+{{- if .Values.image.digest }}
+{{- if not (regexMatch "^sha256:[0-9a-fA-F]{64}$" (.Values.image.digest | toString)) }}
+{{- fail "image.digest must be a sha256 OCI image digest" }}
+{{- end }}
+{{- else if not .Values.image.allowMutableTag }}
+{{- fail "image.digest is required for production; mutable image tags require image.allowMutableTag=true for source-built validation only" }}
+{{- else if not (.Values.image.tag | toString | trim) }}
+{{- fail "image.tag is required when image.allowMutableTag=true" }}
+{{- end }}
+{{- if ne (.Values.compatibility.wireProtocol | toString) "2" }}
+{{- fail "compatibility.wireProtocol must remain 2 for this chart" }}
+{{- end }}
+{{- if ne (.Values.compatibility.brokerProtocol | toString) "4" }}
+{{- fail "compatibility.brokerProtocol must remain 4 for this chart" }}
+{{- end }}
+{{- if ne (.Values.compatibility.snapshotFormat | toString) "10" }}
+{{- fail "compatibility.snapshotFormat must remain 10 for this chart" }}
+{{- end }}
+{{- if ne (.Values.compatibility.recordFormat | toString) "CDM4" }}
+{{- fail "compatibility.recordFormat must remain CDM4 for this chart" }}
+{{- end }}
 {{- $statefulSetName := include "cursus-cluster.fullname" . }}
 {{- with (lookup "apps/v1" "StatefulSet" .Release.Namespace $statefulSetName) }}
 {{- $claim := index .spec.volumeClaimTemplates 0 }}
@@ -49,9 +73,27 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        - name: verify-image-contract
+          image: {{ include "cursus-cluster.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/app/broker", "--verify-deployment-contract"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: EXPECTED_IMAGE_REVISION
+              value: {{ .Values.image.revision | quote }}
+            - name: EXPECTED_WIRE_PROTOCOL
+              value: {{ .Values.compatibility.wireProtocol | quote }}
+            - name: EXPECTED_BROKER_PROTOCOL
+              value: {{ .Values.compatibility.brokerProtocol | quote }}
+            - name: EXPECTED_SNAPSHOT_FORMAT
+              value: {{ .Values.compatibility.snapshotFormat | quote }}
+            - name: EXPECTED_RECORD_FORMAT
+              value: {{ .Values.compatibility.recordFormat | quote }}
       containers:
         - name: broker
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "cursus-cluster.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/bin/sh", "-ec"]
           args:

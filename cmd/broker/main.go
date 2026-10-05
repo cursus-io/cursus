@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/cursus-io/cursus/pkg/buildinfo"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
@@ -21,6 +23,13 @@ var runTopicMetadataDiagnostics = server.RunTopicMetadataDiagnostics
 var runConsumerMetadataDiagnostics = server.RunConsumerMetadataDiagnostics
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--verify-deployment-contract" {
+		if err := buildinfo.VerifyDeploymentContract(); err != nil {
+			util.Fatal("deployment contract verification failed: %v", err)
+		}
+		fmt.Printf("version=%s revision=%s wire=%s broker=%s snapshot=%s record=%s\n", buildinfo.Version, buildinfo.Revision, buildinfo.WireProtocolVersion, buildinfo.BrokerProtocolVersion, buildinfo.SnapshotFormatVersion, buildinfo.RecordFormatVersion)
+		return
+	}
 	// Configuration
 	cfg, err := config.LoadConfig()
 	if err != nil {

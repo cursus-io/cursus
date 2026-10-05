@@ -50,10 +50,14 @@ jobs:
       - name: Lint and render restricted cluster chart
         run: |
           helm lint manifests/helm-cluster \
+            --set-string image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+            --set-string image.revision=0000000000000000000000000000000000000000 \
             --set cluster.internalAuthSecret=cursus-internal-auth \
             --set internalTLS.secretName=cursus-internal-tls
           helm template cursus manifests/helm-cluster \
             --namespace brokers \
+            --set-string image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+            --set-string image.revision=0000000000000000000000000000000000000000 \
             --set cluster.internalAuthSecret=cursus-internal-auth \
             --set internalTLS.secretName=cursus-internal-tls > /tmp/cursus-cluster.yaml
           grep -q 'type: RuntimeDefault' /tmp/cursus-cluster.yaml
@@ -72,7 +76,7 @@ jobs:
           config: .github/kind-three-node.yaml
           node_image: kindest/node:v1.34.0
       - name: Build production image without publishing
-        run: docker build --tag cursus:pr-validation .
+        run: docker build --build-arg VERSION=pr-validation --build-arg VCS_REF=${{ github.sha }} --tag cursus:pr-validation .
       - name: Install chart under restricted Pod Security
         run: |
           kind load docker-image cursus:pr-validation --name cursus-ci
@@ -94,6 +98,8 @@ jobs:
             --namespace brokers \
             --set image.repository=cursus \
             --set image.tag=pr-validation \
+            --set image.allowMutableTag=true \
+            --set-string image.revision=${{ github.sha }} \
             --set image.pullPolicy=Never \
             --set cluster.internalAuthSecret=cursus-internal-auth \
             --set internalTLS.secretName=cursus-internal-tls \
