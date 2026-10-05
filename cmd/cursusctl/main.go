@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -96,6 +97,10 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 }
 
 func execute(client *wire.ClientConn, command string, stdout io.Writer) error {
+	commandType, _, err := wire.ParseCommandText(command)
+	if err != nil {
+		return err
+	}
 	if err := client.Send([]byte(command)); err != nil {
 		return err
 	}
@@ -103,6 +108,27 @@ func execute(client *wire.ClientConn, command string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(stdout, string(response))
-	return err
+	if _, err := fmt.Fprintln(stdout, string(response)); err != nil {
+		return err
+	}
+
+	switch commandType {
+	case wire.CommandBrowseMessages, wire.CommandReadStream, wire.CommandReadStreamHistory:
+		batchPayload, err := client.Receive()
+		if err != nil {
+			return err
+		}
+		batch, err := wire.DecodeBatch(batchPayload)
+		if err != nil {
+			return fmt.Errorf("decode %s batch: %w", commandType, err)
+		}
+		encoded, err := json.Marshal(batch)
+		if err != nil {
+			return fmt.Errorf("encode %s batch output: %w", commandType, err)
+		}
+		_, err = fmt.Fprintln(stdout, string(encoded))
+		return err
+	default:
+		return nil
+	}
 }

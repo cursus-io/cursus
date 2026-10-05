@@ -24,10 +24,10 @@ token is read only from `NAME` and is never accepted as a command-line value.
 |---|---|---|
 | Connection and auth | Wire v2 binary handshake, `AUTH` | Any broker |
 | Topic admin | `CREATE`, `DELETE`, `TRUNCATE`, `LIST`, `DESCRIBE`, `HELP` | Any broker; distributed mutations use metadata consensus |
-| Produce and read | `PUBLISH`, `CONSUME`, `STREAM`, `LIST_OFFSETS` | Partition leader |
+| Produce and read | `PUBLISH`, `CONSUME`, `STREAM`, `LIST_OFFSETS`, `BROWSE_MESSAGES` | Partition leader |
 | Consumer groups | `REGISTER_GROUP`, `FIND_COORDINATOR`, `JOIN_GROUP`, `SYNC_GROUP`, `HEARTBEAT`, `LEAVE_GROUP`, `GROUP_STATUS`, `FETCH_OFFSET`, `COMMIT_OFFSET`, `BATCH_COMMIT` | Group coordinator except discovery |
 | Transactions | `INIT_PRODUCER_ID`, `BEGIN_TXN`, `TXN_PUBLISH`, `SEND_OFFSETS_TO_TXN`, `END_TXN`, `TXN_STATUS` | Transaction coordinator selected by `transactional_id` |
-| Event sourcing | `APPEND_STREAM`, `READ_STREAM`, `STREAM_VERSION`, `SAVE_SNAPSHOT`, `READ_SNAPSHOT` | Aggregate partition leader |
+| Event sourcing | `APPEND_STREAM`, `READ_STREAM`, `READ_STREAM_HISTORY`, `STREAM_VERSION`, `SAVE_SNAPSHOT`, `READ_SNAPSHOT` | Aggregate partition leader |
 | Cluster admin | `METADATA`, `CLUSTER_STATUS`, `ELECT_LEADER` | Any broker or current metadata leader as documented |
 
 ## Routing Rules
@@ -58,3 +58,8 @@ The second `CREATE` is a patch: omitted fields retain their current values. Expl
 `DELETE` is admin-only and `if_exists=true` is an explicit idempotency choice for approved retries. Do not derive it from a topic missing from desired state or use delete-and-create as a reset substitute. `TRUNCATE` is also admin-only; it requires the current definition revision and returns a new revision and lifecycle epoch. Active groups or transactions block it, and old-epoch writes are fenced after it commits.
 
 `COMMIT_OFFSET` values are next offsets, not last processed offsets. Stored offsets are monotonic and authoritative for resume. Refer to the [API reference](api-reference.md) for complete parameters and responses; internal replication commands are intentionally excluded from the client interface.
+
+`BROWSE_MESSAGES`, `READ_STREAM`, and `READ_STREAM_HISTORY` return two lines
+from `cursusctl`: the bounded-page envelope followed by the decoded Wire v2
+batch as JSON. Both lines belong to the same correlated request; an envelope
+alone is not a complete successful result.
