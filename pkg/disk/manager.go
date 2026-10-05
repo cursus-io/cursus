@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -135,18 +136,33 @@ func (dm *DiskManager) RemoveTopicStorage(path string) error {
 	return os.RemoveAll(path)
 }
 
-// CloseAllHandlers should be implemented to ensure all DiskHandlers are closed properly
+// CloseAllHandlers preserves the legacy cleanup callback shape. Broker
+// shutdown uses Shutdown so close failures remain machine-visible.
 func (dm *DiskManager) CloseAllHandlers() {
+	if err := dm.Shutdown(); err != nil {
+		util.Warn("Failed to close all disk handlers: %v", err)
+	}
+}
+
+// Shutdown closes every owned handler and reports every durability or cleanup
+// failure after attempting the complete set.
+func (dm *DiskManager) Shutdown() error {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
+	var errs []error
 	for name, dh := range dm.handlers {
 		util.Debug("Closing DiskHandler for %s", name)
 		if err := dh.Close(); err != nil {
 			util.Warn("Failed to close DiskHandler for %s: %v", name, err)
+			errs = append(errs, fmt.Errorf("close %s: %w", name, err))
 		}
 		delete(dm.handlers, name)
 	}
+	if len(errs) > 0 {
+		return fmt.Errorf("close disk handlers: %w", errors.Join(errs...))
+	}
+	return nil
 }
 
 // CloseTopicHandlers closes and forgets all handlers for a topic so its log

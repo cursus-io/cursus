@@ -53,14 +53,18 @@ func main() {
 	}
 }
 
-func runBroker(ctx context.Context, cfg *config.Config) error {
+func runBroker(ctx context.Context, cfg *config.Config) (runErr error) {
 	storageLock, err := disk.LockStorageDirectory(cfg.LogDir)
 	if err != nil {
 		return fmt.Errorf("lock broker storage: %w", err)
 	}
 	defer func() { _ = storageLock.Close() }()
 	dm := disk.NewDiskManager(cfg)
-	defer dm.CloseAllHandlers()
+	defer func() {
+		if err := dm.Shutdown(); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("shutdown broker storage: %w", err))
+		}
+	}()
 	sm := stream.NewStreamManager(cfg.MaxStreamConnections, cfg.StreamTimeout)
 	smAdapter, err := topic.NewStreamManagerAdapter(sm)
 	if err != nil {
@@ -76,7 +80,11 @@ func runBroker(ctx context.Context, cfg *config.Config) error {
 	defer tm.Stop()
 	if err := tm.RestoreTopics(); err != nil {
 		util.Error("Failed to restore durable topic metadata; serving diagnostics only: %v", err)
-		return runTopicMetadataDiagnostics(ctx, cfg, tm, dm)
+		runErr = runTopicMetadataDiagnostics(ctx, cfg, tm, dm)
+		if errors.Is(runErr, context.Canceled) {
+			runErr = nil
+		}
+		return runErr
 	}
 
 	cd, err := coordinator.NewCoordinatorWithRecovery(ctx, cfg, tm)
@@ -85,7 +93,11 @@ func runBroker(ctx context.Context, cfg *config.Config) error {
 	}
 	if err != nil {
 		util.Error("Failed to recover durable consumer metadata; serving diagnostics only: %v", err)
-		return runConsumerMetadataDiagnostics(ctx, cfg, tm, dm, cd)
+		runErr = runConsumerMetadataDiagnostics(ctx, cfg, tm, dm, cd)
+		if errors.Is(runErr, context.Canceled) {
+			runErr = nil
+		}
+		return runErr
 	}
 	tm.SetCoordinator(cd)
 	for _, gcfg := range cfg.StaticConsumerGroups {
@@ -101,5 +113,9 @@ func runBroker(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
-	return runServerContext(ctx, cfg, tm, dm, cd, sm)
+	runErr = runServerContext(ctx, cfg, tm, dm, cd, sm)
+	if errors.Is(runErr, context.Canceled) {
+		runErr = nil
+	}
+	return runErr
 }

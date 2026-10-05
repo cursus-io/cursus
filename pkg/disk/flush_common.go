@@ -3,6 +3,7 @@ package disk
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -541,6 +542,7 @@ func (d *DiskHandler) GetCurrentSegment() uint64 {
 }
 
 func (d *DiskHandler) drainAndShutdown(batch []types.DiskMessage) {
+	var shutdownErr error
 	for {
 		stop := false
 		select {
@@ -557,6 +559,7 @@ func (d *DiskHandler) drainAndShutdown(batch []types.DiskMessage) {
 		if len(batch) >= d.batchSize {
 			if err := d.WriteBatch(batch); err != nil {
 				util.Error("WriteBatch failed: %v", err)
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("drain write batch: %w", err))
 			}
 			batch = batch[:0]
 		}
@@ -569,6 +572,7 @@ func (d *DiskHandler) drainAndShutdown(batch []types.DiskMessage) {
 	if len(batch) > 0 {
 		if err := d.WriteBatch(batch); err != nil {
 			util.Error("finalize WriteBatch failed: %v", err)
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("final drain write batch: %w", err))
 		}
 	}
 
@@ -578,23 +582,28 @@ func (d *DiskHandler) drainAndShutdown(batch []types.DiskMessage) {
 	if d.writer != nil {
 		if err := d.writer.Flush(); err != nil {
 			util.Error("writer flush failed: %v", err)
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("final data writer flush: %w", err))
 		}
 		d.writer = nil
 	}
 
 	if d.file != nil {
-		if err := d.file.Sync(); err != nil {
+		if err := d.syncFile(d.file); err != nil {
 			util.Error("file sync failed: %v", err)
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("final data file sync: %w", err))
 		}
 		if err := d.file.Close(); err != nil {
 			util.Error("file close failed: %v", err)
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("final data file close: %w", err))
 		}
 		d.file = nil
 	}
 
 	if err := d.closeIndexFiles(); err != nil {
 		util.Error("close index files failed during shutdown: %v", err)
+		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("final index cleanup: %w", err))
 	}
+	d.recordShutdownError(shutdownErr)
 }
 
 func (d *DiskHandler) getSegmentTickerChan(ticker *time.Ticker) <-chan time.Time {

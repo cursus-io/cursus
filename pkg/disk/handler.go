@@ -3,6 +3,7 @@ package disk
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -87,8 +88,26 @@ type DiskHandler struct {
 	writer *bufio.Writer
 
 	closeOnce   sync.Once
+	closeErr    error
+	shutdownErr error
+	shutdownMu  sync.Mutex
 	shutdown    sync.WaitGroup
 	storageLock *StorageLock
+}
+
+func (d *DiskHandler) recordShutdownError(err error) {
+	if err == nil {
+		return
+	}
+	d.shutdownMu.Lock()
+	d.shutdownErr = errors.Join(d.shutdownErr, err)
+	d.shutdownMu.Unlock()
+}
+
+func (d *DiskHandler) shutdownError() error {
+	d.shutdownMu.Lock()
+	defer d.shutdownMu.Unlock()
+	return d.shutdownErr
 }
 
 // syncAuthoritativeDirectory is a seam for verifying that newly created log
