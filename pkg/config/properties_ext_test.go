@@ -36,6 +36,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.ClientRequestTimeoutMS != 30000 {
 		t.Errorf("Expected default ClientRequestTimeoutMS 30000, got %d", cfg.ClientRequestTimeoutMS)
 	}
+	if cfg.MaxTopics != 10000 || cfg.MaxPartitionsPerTopic != 1024 || cfg.MaxPartitions != 100000 {
+		t.Errorf("unexpected default topic limits: topics=%d per_topic=%d total=%d", cfg.MaxTopics, cfg.MaxPartitionsPerTopic, cfg.MaxPartitions)
+	}
 }
 
 func TestLoadConfig_EnvOverrides(t *testing.T) {
@@ -48,6 +51,9 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("TRANSACTION_COORDINATOR_SHARDS", "17")
 	t.Setenv("TRANSACTION_RECOVERY_BATCH_SIZE", "19")
 	t.Setenv("CLIENT_REQUEST_TIMEOUT_MS", "45000")
+	t.Setenv("MAX_TOPICS", "123")
+	t.Setenv("MAX_PARTITIONS_PER_TOPIC", "17")
+	t.Setenv("MAX_PARTITIONS", "456")
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -80,6 +86,9 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	}
 	if cfg.ClientRequestTimeoutMS != 45000 {
 		t.Errorf("Expected ClientRequestTimeoutMS 45000 from env, got %d", cfg.ClientRequestTimeoutMS)
+	}
+	if cfg.MaxTopics != 123 || cfg.MaxPartitionsPerTopic != 17 || cfg.MaxPartitions != 456 {
+		t.Errorf("unexpected topic limits from env: topics=%d per_topic=%d total=%d", cfg.MaxTopics, cfg.MaxPartitionsPerTopic, cfg.MaxPartitions)
 	}
 }
 
@@ -118,5 +127,8 @@ func TestConfig_Normalize(t *testing.T) {
 	}
 	if cfg.TransactionRecoveryBatchSize != 256 {
 		t.Errorf("Normalize should have reset TransactionRecoveryBatchSize to 256, got %d", cfg.TransactionRecoveryBatchSize)
+	}
+	if cfg.MaxTopics != 10000 || cfg.MaxPartitionsPerTopic != 1024 || cfg.MaxPartitions != 100000 {
+		t.Errorf("Normalize should restore topic limits, got topics=%d per_topic=%d total=%d", cfg.MaxTopics, cfg.MaxPartitionsPerTopic, cfg.MaxPartitions)
 	}
 }

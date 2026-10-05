@@ -47,6 +47,11 @@ broker:
   config:
     logLevel: {}
 
+limits:
+  maxTopics: 10000
+  maxPartitionsPerTopic: 1024
+  maxPartitions: 100000
+
 nodeSelector: {}
 affinity: {}
 resources:

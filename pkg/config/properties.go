@@ -88,6 +88,9 @@ type Config struct {
 	AdvertisedClientHost     string `yaml:"advertised_client_host" json:"distribution.advertised_client_host"`
 	MinInSyncReplicas        int    `yaml:"min_insync_replicas" json:"min.insync.replicas"`
 	DefaultReplicationFactor int    `yaml:"default_replication_factor" json:"default.replication.factor"`
+	MaxTopics                int    `yaml:"max_topics" json:"max.topics"`
+	MaxPartitionsPerTopic    int    `yaml:"max_partitions_per_topic" json:"max.partitions.per.topic"`
+	MaxPartitions            int    `yaml:"max_partitions" json:"max.partitions"`
 
 	// idempotency
 	EnableIdempotence            bool `yaml:"enable_idempotence" json:"enable.idempotence"`
@@ -189,6 +192,9 @@ func DefaultConfig() *Config {
 			AdvertisedBrokerPort:     0,
 			MinInSyncReplicas:        2,
 			DefaultReplicationFactor: 3,
+			MaxTopics:                10000,
+			MaxPartitionsPerTopic:    1024,
+			MaxPartitions:            100000,
 
 			// idempotency
 			EnableIdempotence:            false,
@@ -299,6 +305,9 @@ func LoadConfig() (*Config, error) {
 	flag.StringVar(&cfg.AdvertisedHost, "advertised-host", cfg.AdvertisedHost, "Advertised host for discovery")
 	flag.IntVar(&cfg.MinInSyncReplicas, "min-insync-replicas", cfg.MinInSyncReplicas, "Minimum in-sync replicas for writes")
 	flag.IntVar(&cfg.DefaultReplicationFactor, "default-replication-factor", cfg.DefaultReplicationFactor, "Default replication factor for new topics")
+	flag.IntVar(&cfg.MaxTopics, "max-topics", cfg.MaxTopics, "Maximum number of topics materialized by a broker")
+	flag.IntVar(&cfg.MaxPartitionsPerTopic, "max-partitions-per-topic", cfg.MaxPartitionsPerTopic, "Maximum partitions in one topic")
+	flag.IntVar(&cfg.MaxPartitions, "max-partitions", cfg.MaxPartitions, "Maximum total partitions materialized by a broker")
 
 	// idempotency
 	flag.BoolVar(&cfg.EnableIdempotence, "enable-idempotence", cfg.EnableIdempotence, "Enable producer idempotency")
@@ -448,6 +457,9 @@ func LoadConfig() (*Config, error) {
 	overrideEnvBool(&cfg.BootstrapSoleVoter, "BOOTSTRAP_SOLE_VOTER")
 	overrideEnvInt(&cfg.MinInSyncReplicas, "MIN_INSYNC_REPLICAS")
 	overrideEnvInt(&cfg.DefaultReplicationFactor, "DEFAULT_REPLICATION_FACTOR")
+	overrideEnvInt(&cfg.MaxTopics, "MAX_TOPICS")
+	overrideEnvInt(&cfg.MaxPartitionsPerTopic, "MAX_PARTITIONS_PER_TOPIC")
+	overrideEnvInt(&cfg.MaxPartitions, "MAX_PARTITIONS")
 
 	overrideEnvBool(&cfg.EnableIdempotence, "ENABLE_IDEMPOTENCE")
 	overrideEnvInt(&cfg.ProducerStateTTLMS, "PRODUCER_STATE_TTL_MS")

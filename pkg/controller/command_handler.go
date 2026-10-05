@@ -75,6 +75,21 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 		if payloadErr != nil {
 			return formatCreateTopicError(topicName, payloadErr)
 		}
+		base := defaults
+		if current != nil {
+			base = *current
+		}
+		target, targetErr := topic.MergeDefinitionPatch(base, patch, current != nil)
+		if targetErr != nil {
+			return formatCreateTopicError(topicName, targetErr)
+		}
+		definitions := tm.ExportDefinitions()
+		if fsmRef := ch.Cluster.RaftManager.GetFSM(); fsmRef != nil {
+			definitions = fsmRef.GetTopicDefinitions()
+		}
+		if err := topic.ValidateTargetCapacity(ch.Config, definitions, target); err != nil {
+			return formatCreateTopicError(topicName, err)
+		}
 		_, err := ch.applyAndWaitContext(requestCtx, "TOPIC", payload)
 		if err != nil {
 			return formatCreateTopicError(topicName, err)

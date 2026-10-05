@@ -46,6 +46,11 @@ cluster:
   minInSyncReplicas: 2
   defaultReplicationFactor: 3
 
+limits:
+  maxTopics: 10000
+  maxPartitionsPerTopic: 1024
+  maxPartitions: 100000
+
 internalTLS:
   # The Secret must contain tls.crt, tls.key, and ca.crt. The certificate must
   # have a SAN for internalTLS.serverName and every StatefulSet DNS name.

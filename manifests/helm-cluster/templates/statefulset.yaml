@@ -164,6 +164,12 @@ spec:
               value: "{{ .Values.cluster.minInSyncReplicas }}"
             - name: DEFAULT_REPLICATION_FACTOR
               value: "{{ .Values.cluster.defaultReplicationFactor }}"
+            - name: MAX_TOPICS
+              value: {{ .Values.limits.maxTopics | quote }}
+            - name: MAX_PARTITIONS_PER_TOPIC
+              value: {{ .Values.limits.maxPartitionsPerTopic | quote }}
+            - name: MAX_PARTITIONS
+              value: {{ .Values.limits.maxPartitions | quote }}
             - name: TRANSACTION_COORDINATOR_SHARDS
               value: "{{ .Values.cluster.transactionCoordinatorShards }}"
             - name: LOG_DIR

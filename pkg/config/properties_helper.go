@@ -116,6 +116,15 @@ func (cfg *Config) Normalize() {
 	if cfg.MinInSyncReplicas <= 0 {
 		cfg.MinInSyncReplicas = 2
 	}
+	if cfg.MaxTopics <= 0 {
+		cfg.MaxTopics = 10000
+	}
+	if cfg.MaxPartitionsPerTopic <= 0 {
+		cfg.MaxPartitionsPerTopic = 1024
+	}
+	if cfg.MaxPartitions <= 0 {
+		cfg.MaxPartitions = 100000
+	}
 
 	if cfg.ProducerStateTTLMS <= 0 {
 		cfg.ProducerStateTTLMS = 30 * 60 * 1000

@@ -179,6 +179,21 @@ func (f *BrokerFSM) GetTopicDefinition(name string) (topic.Definition, bool) {
 	return *copyTopicDefinition(definition), true
 }
 
+// GetTopicDefinitions returns a detached snapshot of authoritative topic
+// definitions for admission checks that must run before a new Raft command is
+// committed.
+func (f *BrokerFSM) GetTopicDefinitions() []topic.Definition {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	definitions := make([]topic.Definition, 0, len(f.topicState))
+	for _, definition := range f.topicState {
+		if definition != nil {
+			definitions = append(definitions, *copyTopicDefinition(definition))
+		}
+	}
+	return definitions
+}
+
 func (f *BrokerFSM) SetCoordinator(cd *coordinator.Coordinator) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

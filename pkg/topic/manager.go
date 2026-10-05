@@ -197,6 +197,9 @@ func (tm *TopicManager) CreateTopicWithPatch(defaults Definition, patch Definiti
 				return Definition{}, err
 			}
 		}
+		if err := ValidateTargetCapacity(tm.cfg, tm.definitionsLocked(nil, ""), target); err != nil {
+			return Definition{}, err
+		}
 		if err := existing.applyFullDefinition(target, tm.hp, tm.persistDefinitionLocked); err != nil {
 			return Definition{}, fmt.Errorf("update topic '%s': %w", defaults.Name, err)
 		}
@@ -221,6 +224,9 @@ func (tm *TopicManager) CreateTopicWithPatch(defaults Definition, patch Definiti
 		if err := validateCleanupPolicyForTopic(target.Policy, tm.cfg, target.EventSourcing); err != nil {
 			return Definition{}, err
 		}
+	}
+	if err := ValidateTargetCapacity(tm.cfg, tm.definitionsLocked(nil, ""), target); err != nil {
+		return Definition{}, err
 	}
 	if err := tm.rejectOrphanedStorageLocked(target.Name); err != nil {
 		return Definition{}, err
@@ -267,6 +273,9 @@ func (tm *TopicManager) ApplyDefinition(raw Definition) error {
 	}
 	if _, pending := tm.pendingTruncations[definition.Name]; pending {
 		return fmt.Errorf("topic %q lifecycle cleanup is pending", definition.Name)
+	}
+	if err := ValidateTargetCapacity(tm.cfg, tm.definitionsLocked(nil, ""), definition); err != nil {
+		return err
 	}
 	if existing := tm.topics[definition.Name]; existing != nil {
 		current := existing.Definition()

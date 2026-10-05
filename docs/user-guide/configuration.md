@@ -522,7 +522,17 @@ log.Fatal(http.ListenAndServe(":2112", nil))
 
 ## Configuration Validation
 
-`Config.Normalize()` applies safe fallbacks for invalid or non-positive values, including write batching, sync intervals, segment/index sizes, retention intervals, channel capacities, replica settings, and transaction/producer retention. TLS certificate loading still fails startup when configured files are invalid.
+`Config.Normalize()` applies safe fallbacks for invalid or non-positive values, including write batching, sync intervals, segment/index sizes, retention intervals, channel capacities, replica settings, transaction/producer retention, and topic registry limits. TLS certificate loading still fails startup when configured files are invalid.
+
+Topic materialization is bounded by `max_topics` (default `10000`),
+`max_partitions_per_topic` (default `1024`), and `max_partitions` (default
+`100000`). The matching environment variables are `MAX_TOPICS`,
+`MAX_PARTITIONS_PER_TOPIC`, and `MAX_PARTITIONS`. CREATE validates distributed
+authoritative metadata before committing a Raft entry, and every broker checks
+the same limits while materializing or restoring definitions. Lowering a limit
+below persisted state therefore makes readiness fail instead of loading an
+unbounded registry; raise the limit or deliberately remove topics before the
+change.
 
 Cleanup policy values normalize to `delete`, `compact`, or canonical `delete,compact`; unknown values fall back to `delete` with a warning. Distributed application topics accept compact policies only after every active broker advertises lifecycle protocol version 2, and cleaner passes wait for full ISR plus authoritative, matching HWM/lifecycle/policy state. Event-sourcing topics always require `delete`. Operators should treat normalization and policy errors as configuration/provisioning failures and verify the effective topic policy with `METADATA`.
 
