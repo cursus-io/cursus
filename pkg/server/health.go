@@ -13,12 +13,20 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/util"
 )
 
 const healthCheckTimeout = 2 * time.Second
 
 type readinessCheck func(context.Context) error
+
+func clusterTopologyReadinessError(state *fsm.BrokerFSM, defaultMinISR int) error {
+	if state == nil {
+		return fmt.Errorf("cluster topology state unavailable")
+	}
+	return state.EvaluateTopology(defaultMinISR).ReadinessError()
+}
 
 // HealthState tracks startup readiness and dynamic dependency checks.
 type HealthState struct {

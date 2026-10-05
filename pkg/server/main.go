@@ -282,6 +282,12 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			_, leaderErr := cc.GetClusterLeader()
 			return leaderErr
 		})
+		healthState.AddCheck("cluster_topology", func(context.Context) error {
+			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
+				return clusterTopologyReadinessError(nil, cfg.MinInSyncReplicas)
+			}
+			return clusterTopologyReadinessError(cc.RaftManager.GetFSM(), cfg.MinInSyncReplicas)
+		})
 		healthState.AddCheck("topic_materialization", func(context.Context) error {
 			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
 				return fmt.Errorf("topic materialization state unavailable")

@@ -112,11 +112,19 @@ type Collector struct {
 	clusterIsLeader                 *prometheus.Desc
 	clusterOffline                  *prometheus.Desc
 	clusterUnderReplicated          *prometheus.Desc
+	clusterAssignmentDeficient      *prometheus.Desc
+	clusterInactivePartitions       *prometheus.Desc
+	clusterInactiveReplicas         *prometheus.Desc
+	clusterMinISRUnsatisfied        *prometheus.Desc
 	topicMaterializationPending     *prometheus.Desc
 	topicMaterializationAttempts    *prometheus.Desc
 	topicMaterializationOldest      *prometheus.Desc
 	partitionReplicas               *prometheus.Desc
+	partitionExpectedReplicas       *prometheus.Desc
+	partitionActiveReplicas         *prometheus.Desc
 	partitionInSync                 *prometheus.Desc
+	partitionMinInSyncReplicas      *prometheus.Desc
+	partitionTopologyHealthy        *prometheus.Desc
 	partitionLeaderEpoch            *prometheus.Desc
 	partitionLeader                 *prometheus.Desc
 	isrCatchupProofs                *prometheus.Desc
@@ -197,12 +205,20 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		clusterHasLeader:                prometheus.NewDesc("cursus_cluster_has_leader", "Whether this broker can resolve the cluster leader.", nil, nil),
 		clusterIsLeader:                 prometheus.NewDesc("cursus_cluster_is_leader", "Whether this broker is the current cluster leader.", nil, nil),
 		clusterOffline:                  prometheus.NewDesc("cursus_cluster_offline_partitions", "Partitions without an assigned leader.", nil, nil),
-		clusterUnderReplicated:          prometheus.NewDesc("cursus_cluster_under_replicated_partitions", "Partitions whose in-sync replica count is below their replica count.", nil, nil),
+		clusterUnderReplicated:          prometheus.NewDesc("cursus_cluster_under_replicated_partitions", "Partitions whose active in-sync replica count is below the topic replication factor.", nil, nil),
+		clusterAssignmentDeficient:      prometheus.NewDesc("cursus_cluster_assignment_deficient_partitions", "Partitions whose distinct assignment does not match the topic replication factor.", nil, nil),
+		clusterInactivePartitions:       prometheus.NewDesc("cursus_cluster_inactive_replica_partitions", "Partitions assigned to at least one inactive or unknown broker.", nil, nil),
+		clusterInactiveReplicas:         prometheus.NewDesc("cursus_cluster_inactive_replicas", "Replica assignments that reference inactive or unknown brokers.", nil, nil),
+		clusterMinISRUnsatisfied:        prometheus.NewDesc("cursus_cluster_min_insync_unsatisfied_partitions", "Partitions whose active in-sync replica count is below effective min.insync.replicas.", nil, nil),
 		topicMaterializationPending:     prometheus.NewDesc("cursus_cluster_topic_materializations_pending", "Node-local topic materialization operations waiting to converge.", []string{"operation"}, nil),
 		topicMaterializationAttempts:    prometheus.NewDesc("cursus_cluster_topic_materialization_attempts_total", "Node-local topic materialization attempts by operation and result.", []string{"operation", "result"}, nil),
 		topicMaterializationOldest:      prometheus.NewDesc("cursus_cluster_topic_materialization_oldest_pending_seconds", "Age of the oldest pending node-local topic materialization.", nil, nil),
 		partitionReplicas:               prometheus.NewDesc("cursus_cluster_partition_replicas", "Configured replica count for a partition.", []string{"topic", "partition"}, nil),
+		partitionExpectedReplicas:       prometheus.NewDesc("cursus_cluster_partition_expected_replicas", "Replica count declared by the durable topic definition.", []string{"topic", "partition"}, nil),
+		partitionActiveReplicas:         prometheus.NewDesc("cursus_cluster_partition_active_replicas", "Assigned replicas backed by active brokers.", []string{"topic", "partition"}, nil),
 		partitionInSync:                 prometheus.NewDesc("cursus_cluster_partition_in_sync_replicas", "In-sync replica count for a partition.", []string{"topic", "partition"}, nil),
+		partitionMinInSyncReplicas:      prometheus.NewDesc("cursus_cluster_partition_min_insync_replicas", "Effective min.insync.replicas for a partition.", []string{"topic", "partition"}, nil),
+		partitionTopologyHealthy:        prometheus.NewDesc("cursus_cluster_partition_topology_healthy", "Whether assignment, leader, and ISR satisfy the durable topic contract.", []string{"topic", "partition"}, nil),
 		partitionLeaderEpoch:            prometheus.NewDesc("cursus_cluster_partition_leader_epoch", "Current partition leader epoch.", []string{"topic", "partition"}, nil),
 		partitionLeader:                 prometheus.NewDesc("cursus_cluster_partition_leader", "Current partition leader identity.", []string{"topic", "partition", "broker_id"}, nil),
 		isrCatchupProofs:                prometheus.NewDesc("cursus_cluster_isr_catchup_proofs_total", "ISR catch-up proofs by outcome and bounded reason.", []string{"outcome", "reason"}, nil),
@@ -231,9 +247,13 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		c.storageSegmentCacheMisses, c.storageSegmentCacheEvictions,
 		c.wireProtocolFailures, c.wireDecompressionRejections,
 		c.distributionEnabled, c.clusterBrokers, c.clusterHasLeader,
-		c.clusterIsLeader, c.clusterOffline, c.clusterUnderReplicated, c.topicMaterializationPending,
+		c.clusterIsLeader, c.clusterOffline, c.clusterUnderReplicated, c.clusterAssignmentDeficient,
+		c.clusterInactivePartitions, c.clusterInactiveReplicas, c.clusterMinISRUnsatisfied,
+		c.topicMaterializationPending,
 		c.topicMaterializationAttempts, c.topicMaterializationOldest, c.partitionReplicas,
-		c.partitionInSync, c.partitionLeaderEpoch, c.partitionLeader, c.isrCatchupProofs,
+		c.partitionExpectedReplicas, c.partitionActiveReplicas, c.partitionInSync,
+		c.partitionMinInSyncReplicas, c.partitionTopologyHealthy,
+		c.partitionLeaderEpoch, c.partitionLeader, c.isrCatchupProofs,
 		c.transactionRecovery, c.transactionStates, c.transactionExpired, c.transactionOldestActive,
 	}
 	return c
@@ -552,6 +572,10 @@ func (c *Collector) collectCluster(ch chan<- prometheus.Metric) {
 	ch <- gauge(c.clusterIsLeader, boolValue(state.IsLeader))
 	ch <- gauge(c.clusterOffline, float64(state.Offline))
 	ch <- gauge(c.clusterUnderReplicated, float64(state.UnderReplicated))
+	ch <- gauge(c.clusterAssignmentDeficient, float64(state.AssignmentDeficient))
+	ch <- gauge(c.clusterInactivePartitions, float64(state.InactiveReplicaPartitions))
+	ch <- gauge(c.clusterInactiveReplicas, float64(state.InactiveReplicas))
+	ch <- gauge(c.clusterMinISRUnsatisfied, float64(state.MinISRUnsatisfied))
 	for _, metric := range replication.ISRProofMetrics() {
 		ch <- counter(c.isrCatchupProofs, float64(metric.Count), metric.Outcome, metric.Reason)
 	}
@@ -565,7 +589,11 @@ func (c *Collector) collectCluster(ch chan<- prometheus.Metric) {
 	for _, partition := range state.PartitionDetails {
 		partitionLabel := strconv.Itoa(partition.Partition)
 		ch <- gauge(c.partitionReplicas, float64(partition.Replicas), partition.Topic, partitionLabel)
+		ch <- gauge(c.partitionExpectedReplicas, float64(partition.ExpectedReplicas), partition.Topic, partitionLabel)
+		ch <- gauge(c.partitionActiveReplicas, float64(partition.ActiveReplicas), partition.Topic, partitionLabel)
 		ch <- gauge(c.partitionInSync, float64(partition.InSync), partition.Topic, partitionLabel)
+		ch <- gauge(c.partitionMinInSyncReplicas, float64(partition.MinInSyncReplicas), partition.Topic, partitionLabel)
+		ch <- gauge(c.partitionTopologyHealthy, boolValue(partition.Healthy), partition.Topic, partitionLabel)
 		ch <- gauge(c.partitionLeaderEpoch, float64(partition.LeaderEpoch), partition.Topic, partitionLabel)
 		if partition.Leader != "" {
 			ch <- gauge(c.partitionLeader, 1, partition.Topic, partitionLabel, partition.Leader)

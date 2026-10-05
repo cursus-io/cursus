@@ -39,15 +39,20 @@ Standalone response:
 {"status":"ready","checks":{"consumer_metadata":"ok","storage":"ok","topic_metadata":"ok"}}
 ```
 
-In distributed mode, readiness also requires a resolvable cluster leader. A
-broker process can therefore remain live while returning `503` from `/ready`
-during election or loss of cluster leadership.
+In distributed mode, readiness also requires a resolvable cluster leader and a
+healthy durable topology. Every partition must have the replica count declared
+by its topic definition, all assigned brokers must be active, the leader must
+be active, and active ISR membership must satisfy both the replication factor
+and effective `min.insync.replicas`. A broker process can therefore remain live
+while returning `503` during an election, replica catch-up, or an incomplete
+legacy assignment repair.
 
 ```json
 {
   "status": "not_ready",
   "checks": {
     "cluster_leader": "no cluster leader available",
+    "cluster_topology": "cluster topology unhealthy: offline=0 under_replicated=1 assignment_deficient=1 inactive_replica_partitions=0 min_isr_unsatisfied=1",
     "storage": "ok"
   }
 }
@@ -236,10 +241,18 @@ offsets removed by a cleanup policy that includes `compact`.
 | `cursus_cluster_brokers` | Brokers in replicated metadata |
 | `cursus_cluster_has_leader` | This broker resolves a cluster leader |
 | `cursus_cluster_is_leader` | This broker is the current cluster leader |
-| `cursus_cluster_offline_partitions` | Partitions without a leader assignment |
-| `cursus_cluster_under_replicated_partitions` | Partitions where ISR size is below replica count |
-| `cursus_cluster_partition_replicas{topic,partition}` | Configured replicas |
-| `cursus_cluster_partition_in_sync_replicas{topic,partition}` | Current ISR size |
+| `cursus_cluster_offline_partitions` | Partitions without an active assigned leader |
+| `cursus_cluster_under_replicated_partitions` | Partitions where active ISR size is below the topic replication factor |
+| `cursus_cluster_assignment_deficient_partitions` | Partitions whose distinct assignment does not match the topic replication factor |
+| `cursus_cluster_inactive_replica_partitions` | Partitions assigned to an inactive or unknown broker |
+| `cursus_cluster_inactive_replicas` | Replica assignments that reference inactive or unknown brokers |
+| `cursus_cluster_min_insync_unsatisfied_partitions` | Partitions whose active ISR size is below effective `min.insync.replicas` |
+| `cursus_cluster_partition_replicas{topic,partition}` | Actual assigned replica count |
+| `cursus_cluster_partition_expected_replicas{topic,partition}` | Replica count declared by the topic definition |
+| `cursus_cluster_partition_active_replicas{topic,partition}` | Assigned replicas backed by active brokers |
+| `cursus_cluster_partition_in_sync_replicas{topic,partition}` | Current active ISR size |
+| `cursus_cluster_partition_min_insync_replicas{topic,partition}` | Effective `min.insync.replicas` |
+| `cursus_cluster_partition_topology_healthy{topic,partition}` | Assignment, leader, and ISR satisfy the durable topic contract |
 | `cursus_cluster_partition_leader_epoch{topic,partition}` | Current leader epoch |
 | `cursus_cluster_partition_leader{topic,partition,broker_id}` | Current leader identity (`1`) |
 | `cursus_cluster_isr_catchup_proofs_total{outcome,reason}` | ISR catch-up proofs accepted or rejected by bounded reason |
@@ -295,6 +308,12 @@ cursus_distribution_enabled == 1 and cursus_cluster_has_leader == 0
 
 # Replication safety degraded
 cursus_cluster_under_replicated_partitions > 0
+
+# Durable definition and actual assignment disagree
+cursus_cluster_assignment_deficient_partitions > 0
+
+# Effective write quorum cannot be satisfied
+cursus_cluster_min_insync_unsatisfied_partitions > 0
 
 # Group commit no longer points into retained data
 cursus_consumer_group_offset_out_of_range == 1
