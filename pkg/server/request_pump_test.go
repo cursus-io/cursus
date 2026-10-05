@@ -17,7 +17,7 @@ import (
 func startPumpTestConnection(t *testing.T, handler *controller.CommandHandler) (net.Conn, *wire.Connection, <-chan struct{}) {
 	t.Helper()
 	server, client := net.Pipe()
-	t.Cleanup(func() { server.Close(); client.Close() })
+	t.Cleanup(func() { _ = server.Close(); _ = client.Close() })
 	done := make(chan struct{})
 	go func() { defer close(done); handleConn(context.Background(), server, handler) }()
 	require.NoError(t, client.SetDeadline(time.Now().Add(5*time.Second)))
@@ -127,8 +127,8 @@ func TestStreamHandoffStopsReadsAndClearsDeadline(t *testing.T) {
 	handler.StreamManager = stream.NewStreamManager(1, time.Minute)
 	defer handler.StreamManager.RemoveStream("ack-zero:0:g")
 	server, clientConn := net.Pipe()
-	defer server.Close()
-	defer clientConn.Close()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = clientConn.Close() }()
 	observed := &observedReadConn{Conn: server}
 	done := make(chan struct{})
 	go func() { defer close(done); handleConn(context.Background(), observed, handler) }()

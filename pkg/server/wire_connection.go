@@ -110,10 +110,6 @@ func negotiateServerConnection(conn net.Conn) (*wire.Connection, *serverWireConn
 	return connection, newServerWireConn(conn, connection), nil
 }
 
-func readWireRequest(connection *wire.Connection) (wire.Frame, error) {
-	return readWireRequestWithAdmission(connection, nil)
-}
-
 func readWireRequestWithAdmission(connection *wire.Connection, admit func(int, int) error) (wire.Frame, error) {
 	frame, err := connection.ReadFrameWithAdmission(admit)
 	if err != nil {
