@@ -64,3 +64,19 @@ func TestBootstrapConsumerOffsetsTopicWaitsForEveryRaftVoter(t *testing.T) {
 	require.Equal(t, 0, manager.applyCount)
 	require.Nil(t, state.GetPartitionMetadata(config.ConsumerOffsetsTopicName+"-0"))
 }
+
+func TestBootstrapConsumerOffsetsTopicWaitsForConfiguredReplicationFactor(t *testing.T) {
+	state := fsm.NewBrokerFSM(nil, nil)
+	state.Apply(&raft.Log{Index: 1, Data: []byte(`REGISTER:{"id":"n1","addr":"localhost:7001","status":"active","lifecycle_protocol":2}`)})
+	manager := &bootstrapRaftManager{
+		MockRaftManager: &MockRaftManager{isLeader: true, mockFSM: state},
+		configuration: raft.Configuration{Servers: []raft.Server{
+			{ID: "n1", Suffrage: raft.Voter},
+		}},
+	}
+
+	err := BootstrapConsumerOffsetsTopic(manager, config.DefaultConfig())
+	require.ErrorContains(t, err, "waiting for 3 durable active brokers; only 1 registered")
+	require.Equal(t, 0, manager.applyCount)
+	require.Nil(t, state.GetPartitionMetadata(config.ConsumerOffsetsTopicName+"-0"))
+}

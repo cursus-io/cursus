@@ -283,6 +283,7 @@ func TestBrokerFSMPatchCommandsMergeAgainstSerializedAuthoritativeState(t *testi
 	f := newTestFSM()
 	registerActiveBroker(t, f, "broker-1")
 	defaults := topic.DefaultDefinition("orders", nil)
+	defaults.ReplicationFactor = 1
 	partitions := 1
 	retentionHours := 24
 	readACL := []string{"reader"}
@@ -300,7 +301,7 @@ func TestBrokerFSMPatchCommandsMergeAgainstSerializedAuthoritativeState(t *testi
 
 	definition := f.tm.GetTopic("orders").Definition()
 	require.Equal(t, uint64(3), definition.Revision)
-	require.Equal(t, topic.DefaultReplicationFactor, definition.ReplicationFactor)
+	require.Equal(t, 1, definition.ReplicationFactor)
 	require.Equal(t, 24, definition.Policy.RetentionHours)
 	require.Equal(t, int64(8192), definition.Policy.RetentionBytes)
 	require.Equal(t, []string{"reader"}, definition.Policy.ReadACL)

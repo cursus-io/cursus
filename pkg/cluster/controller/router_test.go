@@ -33,7 +33,15 @@ func installConsumerOffsetsTopology(t *testing.T, state *fsm.BrokerFSM, index ui
 	}
 	definition := topic.DefaultDefinition(config.ConsumerOffsetsTopicName, config.DefaultConfig())
 	definition.Partitions = 4
-	definition.ReplicationFactor = 3
+	definition.ReplicationFactor = 0
+	for _, broker := range state.GetBrokers() {
+		if strings.EqualFold(broker.Status, "active") {
+			definition.ReplicationFactor++
+		}
+	}
+	if definition.ReplicationFactor == 0 {
+		t.Fatal("consumer offsets test topology requires an active broker")
+	}
 	definition.Policy = topic.ConsumerMetadataPolicy()
 	payload, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
 	if err != nil {

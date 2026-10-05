@@ -220,8 +220,12 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 
 		replicationFactor := definition.ReplicationFactor
 		if replicationFactor > len(brokers) {
-			util.Warn("FSM: Requested RF %d exceeds active brokers %d. Capping to %d", replicationFactor, len(brokers), len(brokers))
-			replicationFactor = len(brokers)
+			return fmt.Errorf(
+				"replication factor %d requires %d active brokers; only %d available",
+				replicationFactor,
+				replicationFactor,
+				len(brokers),
+			)
 		}
 		if definition.Policy.MinInSyncReplicas != nil && *definition.Policy.MinInSyncReplicas > replicationFactor {
 			return fmt.Errorf(

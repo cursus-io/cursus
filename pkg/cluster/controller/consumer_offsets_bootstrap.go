@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
@@ -30,6 +31,23 @@ func BootstrapConsumerOffsetsTopic(rm RaftManager, cfg *config.Config) error {
 	if rm.GetFSM().GetPartitionMetadata(config.ConsumerOffsetsTopicName+"-0") != nil {
 		return nil
 	}
+	replicationFactor := 3
+	if cfg != nil && cfg.DefaultReplicationFactor > 0 {
+		replicationFactor = cfg.DefaultReplicationFactor
+	}
+	activeBrokers := 0
+	for _, broker := range rm.GetFSM().GetBrokers() {
+		if strings.EqualFold(broker.Status, "active") {
+			activeBrokers++
+		}
+	}
+	if activeBrokers < replicationFactor {
+		return fmt.Errorf(
+			"waiting for %d durable active brokers; only %d registered",
+			replicationFactor,
+			activeBrokers,
+		)
+	}
 	configuration := rm.GetConfiguration()
 	if err := configuration.Error(); err != nil {
 		return fmt.Errorf("read raft voter configuration: %w", err)
@@ -44,10 +62,6 @@ func BootstrapConsumerOffsetsTopic(rm RaftManager, cfg *config.Config) error {
 		}
 	}
 
-	replicationFactor := 3
-	if cfg != nil && cfg.DefaultReplicationFactor > 0 {
-		replicationFactor = cfg.DefaultReplicationFactor
-	}
 	definition := topic.DefaultDefinition(config.ConsumerOffsetsTopicName, cfg)
 	definition.Partitions = consumerOffsetsPartitionCount
 	definition.ReplicationFactor = replicationFactor
