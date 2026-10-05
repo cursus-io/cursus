@@ -55,7 +55,8 @@ or:
 make run
 ```
 
-Without `-config`/`CONFIG_PATH`, built-in defaults are used. A missing explicitly named file logs a warning and falls back to effective flag defaults; malformed readable configuration fails startup.
+Without `--config`/`CONFIG_PATH`, built-in defaults are used. A missing,
+unreadable, or malformed explicitly selected configuration file fails startup.
 
 ## Container Image
 
@@ -65,7 +66,7 @@ Pull the published GHCR image:
 docker pull ghcr.io/cursus-io/cursus:latest
 docker run --rm \
   -p 9000:9000 -p 9080:9080 -p 9100:9100 \
-  -v cursus-data:/root/broker-logs \
+  -v cursus-data:/data/logs \
   ghcr.io/cursus-io/cursus:latest
 ```
 
@@ -81,15 +82,21 @@ Build locally:
 docker build -t cursus:local .
 ```
 
-The multi-stage Dockerfile builds `/root/broker` and `/root/cli` with Go 1.25.0 on Alpine 3.20. `entrypoint.sh` executes the broker with `-config ./config.yaml`; if no file is mounted, the broker uses defaults after warning. Production deployments should mount a configuration and durable log volume explicitly.
+The multi-stage Dockerfile builds `/app/broker`, `/app/cli`, `/app/cursusctl`,
+and `/app/cursus-storage` with the Go version declared by the builder image on
+Alpine 3.20. `entrypoint.sh` executes `/app/broker`. The image sets
+`LOG_DIR=/data/logs`; mount durable storage there. A configuration file is
+optional, but when one is selected with `CONFIG_PATH` it must exist and be
+readable.
 
 Example configuration mount:
 
 ```bash
 docker run --rm \
   -p 9000:9000 -p 9080:9080 -p 9100:9100 \
-  -v "$PWD/config.yaml:/root/config.yaml:ro" \
-  -v cursus-data:/root/broker-logs \
+  -e CONFIG_PATH=/app/config.yaml \
+  -v "$PWD/config.yaml:/app/config.yaml:ro" \
+  -v cursus-data:/data/logs \
   ghcr.io/cursus-io/cursus:latest
 ```
 

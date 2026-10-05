@@ -8,7 +8,7 @@ This guide starts one local broker and exercises it with the in-repository Go SD
 docker pull ghcr.io/cursus-io/cursus:latest
 docker run --rm --name cursus \
   -p 9000:9000 -p 9080:9080 -p 9100:9100 \
-  -v cursus-data:/root/broker-logs \
+  -v cursus-data:/data/logs \
   ghcr.io/cursus-io/cursus:latest
 ```
 

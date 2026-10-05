@@ -18,6 +18,7 @@ RUN apk add --no-cache bash curl
 RUN addgroup -g 1000 cursus && adduser -D -u 1000 -G cursus cursus
 
 WORKDIR /app
+ENV LOG_DIR=/data/logs
 COPY --from=builder --chown=cursus:cursus /app/broker /app/broker
 COPY --from=builder --chown=cursus:cursus /app/cli /app/cli
 COPY --from=builder --chown=cursus:cursus /app/cursusctl /app/cursusctl

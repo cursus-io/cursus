@@ -266,13 +266,17 @@ In docker-compose deployments, configuration is typically mounted as a volume an
 services:
   broker:
     volumes:
-      - ./config.yaml:/root/config.yaml
+      - ./config.yaml:/app/config.yaml:ro
+      - cursus-data:/data/logs
     environment:
-      - CONFIG_PATH=/root/config.yaml
+      - CONFIG_PATH=/app/config.yaml
+      - LOG_DIR=/data/logs
     ports:
       - "9000:9000"
       - "9100:9100"
       - "9080:9080"
+volumes:
+  cursus-data:
 ```
 
 ## Scenario 4: Deployment-Time Overrides

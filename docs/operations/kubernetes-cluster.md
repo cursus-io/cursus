@@ -4,6 +4,13 @@
 
 Each StatefulSet ordinal owns one `ReadWriteOnce` PVC, publishes a stable headless-service DNS name, and uses those three names for Raft membership and discovery. Initial Pods are created in parallel because the Raft bootstrap needs all three voters; broker `-0` is the only member permitted to bootstrap an empty cluster. Restart recovery uses the existing Raft state on each PVC. The PodDisruptionBudget requires two available members and the default required anti-affinity therefore requires three schedulable nodes.
 
+The chart supports in-cluster clients only. Brokers advertise their stable Pod
+DNS names in metadata, so the chart rejects `NodePort` and `LoadBalancer`
+services rather than returning unreachable addresses to external clients. Use
+an in-cluster application, a port-forward for administration, or a gateway
+that understands broker metadata until an external advertised-address
+topology is implemented.
+
 The default Pod and container security contexts satisfy Kubernetes restricted Pod Security: the broker runs as UID 1000 without privilege escalation or Linux capabilities, uses a read-only root filesystem, and inherits a `RuntimeDefault` seccomp profile from the Pod. A platform that requires an approved local profile may override `podSecurityContext.seccompProfile` with `type: Localhost` and `localhostProfile`; validate that profile on every node before installation.
 
 ## Install

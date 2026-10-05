@@ -1,3 +1,6 @@
+{{- if ne .Values.service.type "ClusterIP" }}
+{{- fail "service.type must remain ClusterIP because brokers advertise in-cluster StatefulSet DNS names; expose clients through an in-cluster gateway or port-forward" }}
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:

@@ -4,6 +4,8 @@ image:
   pullPolicy: IfNotPresent
 
 service:
+  # Brokers advertise their stable in-cluster Pod DNS names. NodePort and
+  # LoadBalancer would return unreachable broker addresses to external clients.
   type: ClusterIP
   brokerPort: 9000
   healthPort: 9080
