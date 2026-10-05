@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
@@ -42,6 +43,64 @@ func TestTopologyReconcilerWaitsForEveryVoterCapability(t *testing.T) {
 	require.ErrorContains(t, err, "replica reassignment requires 3")
 	require.Equal(t, 0, manager.applyCount)
 	require.Len(t, state.GetPartitionMetadata("orders-0").Replicas, 1)
+}
+
+func TestTopologyReconcilerRepairsLegacyConsumerOffsetsBeforeReadiness(t *testing.T) {
+	state := fsm.NewBrokerFSM(nil, nil)
+	servers := make([]raft.Server, 0, 3)
+	for index, brokerID := range []string{"n1", "n2", "n3"} {
+		broker := fsm.BrokerInfo{
+			ID: brokerID, Addr: fmt.Sprintf("127.0.0.1:%d", 9001+index),
+			Status: "active", LifecycleProtocol: fsm.BrokerProtocolVersionCurrent,
+		}
+		payload, err := json.Marshal(broker)
+		require.NoError(t, err)
+		require.Nil(t, state.Apply(&raft.Log{Index: uint64(index + 1), Data: append([]byte("REGISTER:"), payload...)}))
+		servers = append(servers, raft.Server{ID: raft.ServerID(brokerID), Suffrage: raft.Voter})
+	}
+	definition := topic.DefaultDefinition(config.ConsumerOffsetsTopicName, nil)
+	definition.Partitions = consumerOffsetsPartitionCount
+	definition.ReplicationFactor = 3
+	definition.Policy = topic.ConsumerMetadataPolicy()
+	payload, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Index: 10, Data: append([]byte("TOPIC:"), payload...)}))
+
+	for partition := 0; partition < consumerOffsetsPartitionCount; partition++ {
+		key := fmt.Sprintf("%s-%d", config.ConsumerOffsetsTopicName, partition)
+		metadata := state.GetPartitionMetadata(key)
+		metadata.Replicas = []string{metadata.Leader}
+		metadata.ISR = []string{metadata.Leader}
+		encoded, marshalErr := json.Marshal(metadata)
+		require.NoError(t, marshalErr)
+		require.Nil(t, state.Apply(&raft.Log{Index: uint64(11 + partition), Data: []byte("PARTITION:" + key + ":" + string(encoded))}))
+	}
+
+	manager := &bootstrapRaftManager{
+		MockRaftManager: &MockRaftManager{isLeader: true, mockFSM: state},
+		configuration:   raft.Configuration{Servers: servers},
+	}
+	controller := &ClusterController{RaftManager: manager}
+	for range consumerOffsetsPartitionCount {
+		require.NoError(t, controller.RunTopologyReconciliationOnce())
+	}
+	require.Equal(t, consumerOffsetsPartitionCount, manager.applyCount)
+
+	health := state.EvaluateTopology(2)
+	require.Equal(t, 0, health.AssignmentDeficient)
+	require.Equal(t, consumerOffsetsPartitionCount, health.UnderReplicated)
+	require.Equal(t, consumerOffsetsPartitionCount, health.MinISRUnsatisfied)
+	require.Error(t, health.ReadinessError(), "assignment repair must not imply ISR catch-up")
+
+	for partition := 0; partition < consumerOffsetsPartitionCount; partition++ {
+		key := fmt.Sprintf("%s-%d", config.ConsumerOffsetsTopicName, partition)
+		metadata := state.GetPartitionMetadata(key)
+		metadata.ISR = append([]string(nil), metadata.Replicas...)
+		encoded, marshalErr := json.Marshal(metadata)
+		require.NoError(t, marshalErr)
+		require.Nil(t, state.Apply(&raft.Log{Index: uint64(20 + partition), Data: []byte("PARTITION:" + key + ":" + string(encoded))}))
+	}
+	require.NoError(t, state.EvaluateTopology(2).ReadinessError())
 }
 
 func underfilledTopologyState(t *testing.T, protocol int) (*fsm.BrokerFSM, raft.Configuration, string) {

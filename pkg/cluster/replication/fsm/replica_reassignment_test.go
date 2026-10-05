@@ -1,8 +1,10 @@
 package fsm
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"testing"
 
@@ -25,6 +27,33 @@ func TestReplicaReassignmentExpandsLegacyAssignmentWithoutAdmittingISR(t *testin
 
 	require.Nil(t, state.Apply(&raft.Log{Index: 21, Data: append([]byte("REPLICA_REASSIGN:"), payload...)}), "replay must be idempotent")
 	require.Equal(t, command.TargetReplicas, state.GetPartitionMetadata("orders-0").Replicas)
+}
+
+func TestReplicaReassignmentSurvivesSnapshotRestoreBeforeISRCatchup(t *testing.T) {
+	state, command := legacyUnderfilledReplicaState(t)
+	payload, err := json.Marshal(command)
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Index: 20, Data: append([]byte("REPLICA_REASSIGN:"), payload...)}))
+
+	snapshot, err := state.Snapshot()
+	require.NoError(t, err)
+	buffer := new(bytes.Buffer)
+	require.NoError(t, snapshot.Persist(&MockSnapshotSink{Writer: buffer}))
+
+	restored := newTestFSM()
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(buffer.Bytes()))))
+	metadata := restored.GetPartitionMetadata("orders-0")
+	require.Equal(t, command.TargetReplicas, metadata.Replicas)
+	require.Equal(t, []string{command.Leader}, metadata.ISR)
+	definition, found := restored.GetTopicDefinition("orders")
+	require.True(t, found)
+	require.Equal(t, 3, definition.ReplicationFactor)
+
+	health := restored.EvaluateTopology(2)
+	require.Equal(t, 0, health.AssignmentDeficient)
+	require.Equal(t, 1, health.UnderReplicated)
+	require.Equal(t, 1, health.MinISRUnsatisfied)
+	require.Error(t, health.ReadinessError(), "restart must not admit uncaught-up replicas into ISR")
 }
 
 func TestReplicaReassignmentRejectsUnsafeOrStaleExpansion(t *testing.T) {
