@@ -25,6 +25,10 @@ cluster:
   # broker-to-broker credential; the chart deliberately never renders it.
   internalAuthSecret: ""
   internalAuthSecretKey: token
+  # Optional overlap token used only while rotating credentials. The Secret
+  # may omit this key outside a rotation window.
+  internalAuthNextSecretKey: next-token
+  internalAuthGeneration: "1"
   transactionCoordinatorShards: 50
   minInSyncReplicas: 2
   defaultReplicationFactor: 3

@@ -181,7 +181,9 @@ These values participate in active broker behavior:
 | `min_insync_replicas` | 2 | Broker fallback minimum for `acks=all`/`-1` when a topic has no `min_in_sync_replicas` override. |
 | `default_replication_factor` | 3 | Default replica count for new distributed topics. |
 | `internal_broker_port` | 0 | Dedicated broker-to-broker command listener; configure in production clusters. |
-| `internal_auth_token` | empty | Shared internal command credential; always required when distribution is enabled. |
+| `internal_auth_token` | empty | Active outbound internal command credential; always required when distribution is enabled. |
+| `internal_auth_token_next` | empty | Additional inbound credential accepted during a staged rotation. Brokers never send it until it becomes the active token. |
+| `internal_auth_generation` | empty | Non-secret identifier exposed in configuration diagnostics and `CLUSTER_STATUS`. |
 | `internal_use_tls` | false | Enables broker-internal TLS and client-certificate verification. |
 | `allow_insecure_cluster_transport` | false | Explicit test-only opt-out from the distributed mTLS requirement. |
 | `raft_peers` | [] | Initial Raft peer addresses. |

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -118,7 +119,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 
 		sd := clusterController.NewServiceDiscovery(rm, brokerID, localAddr, clientAddr)
 		discoveryAddr := fmt.Sprintf(":%d", cfg.DiscoveryPort)
-		cs := cluster.NewSecureClusterServer(sd, cfg.InternalAuthToken, cfg.InternalServerTLSConfig())
+		cs := cluster.NewSecureClusterServerWithTokens(sd, cfg.InternalAuthToken, cfg.InternalAuthTokenNext, cfg.InternalServerTLSConfig())
 		discoveryListener, err = cs.Start(discoveryAddr)
 		if err != nil {
 			return fmt.Errorf("start discovery server: %w", err)
@@ -719,11 +720,14 @@ func authorizeInternalListenerCommand(payload string, cmdHandler *controller.Com
 	if cmdHandler.Config.InternalUseTLS {
 		return ""
 	}
-	token := strings.TrimSpace(cmdHandler.Config.InternalAuthToken)
-	if token == "" {
+	activeToken := strings.TrimSpace(cmdHandler.Config.InternalAuthToken)
+	if activeToken == "" {
 		return "ERROR: internal_auth_not_configured command=INTERNAL_LISTENER"
 	}
-	if parseInternalCommandArgs(payload)["internal_token"] != token {
+	supplied := parseInternalCommandArgs(payload)["internal_token"]
+	activeMatch := subtle.ConstantTimeCompare([]byte(supplied), []byte(activeToken)) == 1
+	nextMatch := cmdHandler.Config.InternalAuthTokenNext != "" && subtle.ConstantTimeCompare([]byte(supplied), []byte(cmdHandler.Config.InternalAuthTokenNext)) == 1
+	if !activeMatch && !nextMatch {
 		return "ERROR: internal_command_unauthorized command=INTERNAL_LISTENER"
 	}
 	return ""

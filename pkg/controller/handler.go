@@ -386,11 +386,14 @@ func (ch *CommandHandler) authorizeInternalCommand(name string, input commandInp
 	if name == "REPLICATE_MESSAGE" && !ch.Config.EnabledDistribution {
 		return fmt.Sprintf("ERROR: distribution_required command=%s", name)
 	}
-	token := ch.Config.InternalAuthToken
-	if token == "" {
+	activeToken := ch.Config.InternalAuthToken
+	if activeToken == "" {
 		return fmt.Sprintf("ERROR: internal_auth_not_configured command=%s", name)
 	}
-	if !constantTimeStringEqual(input.Args["internal_token"], token) {
+	supplied := input.Args["internal_token"]
+	activeMatch := constantTimeStringEqual(supplied, activeToken)
+	nextMatch := ch.Config.InternalAuthTokenNext != "" && constantTimeStringEqual(supplied, ch.Config.InternalAuthTokenNext)
+	if !activeMatch && !nextMatch {
 		return fmt.Sprintf("ERROR: internal_command_unauthorized command=%s", name)
 	}
 	return ""

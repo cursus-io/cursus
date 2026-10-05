@@ -41,26 +41,27 @@ type clusterPartitionStatus struct {
 }
 
 type clusterStatus struct {
-	RaftLeader                string                   `json:"raft_leader"`
-	RaftState                 string                   `json:"raft_state"`
-	RaftAppliedIndex          uint64                   `json:"raft_applied_index"`
-	RaftCommitIndex           uint64                   `json:"raft_commit_index"`
-	RaftLastLogIndex          uint64                   `json:"raft_last_log_index"`
-	RaftLastSnapshotIndex     uint64                   `json:"raft_last_snapshot_index"`
-	RaftLastSnapshotTerm      uint64                   `json:"raft_last_snapshot_term"`
-	BrokerCount               int                      `json:"broker_count"`
-	ActiveBrokers             int                      `json:"active_brokers"`
-	InactiveBrokers           int                      `json:"inactive_brokers"`
-	PartitionCount            int                      `json:"partition_count"`
-	Leaderless                int                      `json:"leaderless_partitions"`
-	UnderReplicated           int                      `json:"under_replicated_partitions"`
-	AssignmentDeficient       int                      `json:"assignment_deficient_partitions"`
-	InactiveReplicaPartitions int                      `json:"inactive_replica_partitions"`
-	InactiveReplicas          int                      `json:"inactive_replicas"`
-	MinISRUnsatisfied         int                      `json:"min_isr_unsatisfied_partitions"`
-	Healthy                   bool                     `json:"healthy"`
-	Brokers                   []clusterBrokerStatus    `json:"brokers"`
-	Partitions                []clusterPartitionStatus `json:"partitions"`
+	InternalCredentialGeneration string                   `json:"internal_credential_generation,omitempty"`
+	RaftLeader                   string                   `json:"raft_leader"`
+	RaftState                    string                   `json:"raft_state"`
+	RaftAppliedIndex             uint64                   `json:"raft_applied_index"`
+	RaftCommitIndex              uint64                   `json:"raft_commit_index"`
+	RaftLastLogIndex             uint64                   `json:"raft_last_log_index"`
+	RaftLastSnapshotIndex        uint64                   `json:"raft_last_snapshot_index"`
+	RaftLastSnapshotTerm         uint64                   `json:"raft_last_snapshot_term"`
+	BrokerCount                  int                      `json:"broker_count"`
+	ActiveBrokers                int                      `json:"active_brokers"`
+	InactiveBrokers              int                      `json:"inactive_brokers"`
+	PartitionCount               int                      `json:"partition_count"`
+	Leaderless                   int                      `json:"leaderless_partitions"`
+	UnderReplicated              int                      `json:"under_replicated_partitions"`
+	AssignmentDeficient          int                      `json:"assignment_deficient_partitions"`
+	InactiveReplicaPartitions    int                      `json:"inactive_replica_partitions"`
+	InactiveReplicas             int                      `json:"inactive_replicas"`
+	MinISRUnsatisfied            int                      `json:"min_isr_unsatisfied_partitions"`
+	Healthy                      bool                     `json:"healthy"`
+	Brokers                      []clusterBrokerStatus    `json:"brokers"`
+	Partitions                   []clusterPartitionStatus `json:"partitions"`
 }
 
 // handleListCluster processes the read-only LIST_CLUSTER command.
@@ -95,6 +96,9 @@ func (ch *CommandHandler) handleClusterStatus() string {
 		defaultMinISR = ch.Config.MinInSyncReplicas
 	}
 	status := buildClusterStatus(state, ch.Cluster.RaftManager.GetLeaderAddress(), defaultMinISR)
+	if ch.Config != nil {
+		status.InternalCredentialGeneration = ch.Config.InternalAuthGeneration
+	}
 	if provider, ok := ch.Cluster.RaftManager.(interface {
 		GetRaftStatus() (replication.RaftStatus, error)
 	}); ok {

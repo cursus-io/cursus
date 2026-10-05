@@ -520,7 +520,7 @@ ERROR: distribution_not_enabled
 
 ### CLUSTER_STATUS
 
-`CLUSTER_STATUS` returns `OK cluster=<json>` in distributed mode. The JSON document contains the Raft leader address, active/inactive broker counts, partition leader epochs and committed HWMs, plus the expected, assigned, active, and in-sync replica counts. Cluster totals include leaderless, under-replicated, assignment-deficient, inactive-replica, and `min.insync.replicas`-unsatisfied partitions. Each partition includes a bounded `reasons` list when its durable definition, assignment, leader, or ISR does not converge. `healthy=true` requires every defined partition to have its exact distinct replica count on active brokers, an active assigned leader, and a full active ISR that also satisfies the effective minimum.
+`CLUSTER_STATUS` returns `OK cluster=<json>` in distributed mode. The JSON document contains the non-secret active internal credential generation, Raft leader address, active/inactive broker counts, partition leader epochs and committed HWMs, plus the expected, assigned, active, and in-sync replica counts. Cluster totals include leaderless, under-replicated, assignment-deficient, inactive-replica, and `min.insync.replicas`-unsatisfied partitions. Each partition includes a bounded `reasons` list when its durable definition, assignment, leader, or ISR does not converge. `healthy=true` requires every defined partition to have its exact distinct replica count on active brokers, an active assigned leader, and a full active ISR that also satisfies the effective minimum.
 
 Common errors are `ERROR: distribution_required command=CLUSTER_STATUS`, `ERROR: fsm_not_available command=CLUSTER_STATUS`, and `ERROR: marshal_cluster_status_failed reason="..."`.
 

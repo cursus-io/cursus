@@ -23,6 +23,7 @@ kubectl -n brokers create secret generic cursus-internal-tls \
 
 helm upgrade --install cursus manifests/helm-cluster --namespace brokers --create-namespace \
   --set cluster.internalAuthSecret=cursus-internal-auth \
+  --set-string cluster.internalAuthGeneration=1 \
   --set internalTLS.secretName=cursus-internal-tls
 ```
 
@@ -54,6 +55,18 @@ helm upgrade cursus manifests/helm-cluster --namespace brokers --reuse-values \
 ```
 
 The expansion command validates all three PVCs and their StorageClasses before mutation. Kubernetes server-side validation rejects a shrink. It patches every claim, performs one-member-at-a-time restarts only when the CSI driver requires filesystem expansion, waits for all three members between restarts, verifies requested and filesystem capacity, orphans the running Pods and claims, and uses an atomic Helm upgrade to recreate the StatefulSet with the new claim template. Do not edit `persistence.size` directly or combine unrelated release changes into the expansion command. Keep a current backup and verify a known acknowledged payload and committed consumer offset before and after this procedure.
+
+## Rotate internal credentials without losing quorum
+
+The token Secret may contain `token` (the active outbound credential) and `next-token` (an additional inbound credential). `cluster.internalAuthGeneration` is a non-secret label surfaced on Pods and by `CLUSTER_STATUS`. Rotate in three complete one-Pod-at-a-time passes, waiting for all three Pods to be Ready and checking `CLUSTER_STATUS` after every Pod:
+
+1. Add the new value as `next-token` while retaining the old `token`, increment the generation label to an overlap value, and restart all three Pods one at a time. Every broker still sends the old token and now accepts both.
+2. Exchange the Secret values so `token` is new and `next-token` is old, set the new active generation, and restart all three Pods one at a time. New senders remain accepted by peers from the first pass.
+3. Remove `next-token` and restart all three Pods one at a time. Verify that an internal request signed with the old token fails after the final Pod is Ready.
+
+If the active token may already be compromised, do not wait between passes for routine scheduling windows: keep client writes observed, execute the same overlap sequence immediately, and revoke the old token in the third pass. Skipping the overlap pass can split internal traffic and remove write quorum.
+
+Internal mTLS rotates with the same trust sequence. First publish a `ca.crt` bundle containing both old and new CA certificates while keeping the old leaf certificate, then restart all three Pods one at a time. Next publish the new `tls.crt` and `tls.key` while retaining both CAs and repeat the rolling restart. Finally remove the old CA and repeat the rolling restart. Certificates must keep the documented StatefulSet DNS SANs and client-auth usage. After the final pass, verify the old client certificate and old token are both rejected while continuous `acks=all` writes, committed offsets, and a known payload remain intact.
 
 For an irrecoverable node, stop client writes, preserve the failed PVC for forensics, restore that member from the same backup generation as the other members, and then recreate only that Pod. If the Raft membership itself is damaged, stop and follow the coordinated backup/restore procedure in `upgrade-and-recovery.md`; replacing storage from different backup generations is not supported.
 

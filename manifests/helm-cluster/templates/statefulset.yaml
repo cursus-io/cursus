@@ -10,6 +10,9 @@
 {{- if not .Values.internalTLS.secretName }}
 {{- fail "internalTLS.secretName must name a pre-created Secret containing tls.crt, tls.key, and ca.crt" }}
 {{- end }}
+{{- if not (.Values.cluster.internalAuthGeneration | toString | trim) }}
+{{- fail "cluster.internalAuthGeneration must identify the active non-secret credential generation" }}
+{{- end }}
 {{- $statefulSetName := include "cursus-cluster.fullname" . }}
 {{- with (lookup "apps/v1" "StatefulSet" .Release.Namespace $statefulSetName) }}
 {{- $claim := index .spec.volumeClaimTemplates 0 }}
@@ -40,6 +43,8 @@ spec:
     metadata:
       labels:
         {{- include "cursus-cluster.selectorLabels" . | nindent 8 }}
+      annotations:
+        cursus.io/internal-credential-generation: {{ .Values.cluster.internalAuthGeneration | quote }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
@@ -97,6 +102,14 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.cluster.internalAuthSecret }}
                   key: {{ .Values.cluster.internalAuthSecretKey }}
+            - name: INTERNAL_AUTH_TOKEN_NEXT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.cluster.internalAuthSecret }}
+                  key: {{ .Values.cluster.internalAuthNextSecretKey }}
+                  optional: true
+            - name: INTERNAL_AUTH_GENERATION
+              value: {{ .Values.cluster.internalAuthGeneration | quote }}
             - name: INTERNAL_BROKER_PORT
               value: "{{ .Values.service.internalPort }}"
             - name: RAFT_PORT

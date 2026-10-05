@@ -18,6 +18,9 @@ func MarshalRedactedJSON(cfg *Config) ([]byte, error) {
 	if safe.InternalAuthToken != "" {
 		safe.InternalAuthToken = redactedConfigValue
 	}
+	if safe.InternalAuthTokenNext != "" {
+		safe.InternalAuthTokenNext = redactedConfigValue
+	}
 	safe.SASLUsers = append([]SASLUser(nil), cfg.SASLUsers...)
 	for i := range safe.SASLUsers {
 		if safe.SASLUsers[i].Token != "" {

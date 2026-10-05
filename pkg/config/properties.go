@@ -70,6 +70,8 @@ type Config struct {
 	// distributed cluster
 	EnabledDistribution    bool     `yaml:"enabled_distribution" json:"distribution.enabled"`
 	InternalAuthToken      string   `yaml:"internal_auth_token" json:"distribution.internal_auth_token"`
+	InternalAuthTokenNext  string   `yaml:"internal_auth_token_next" json:"distribution.internal_auth_token_next"`
+	InternalAuthGeneration string   `yaml:"internal_auth_generation" json:"distribution.internal_auth_generation"`
 	InternalBrokerPort     int      `yaml:"internal_broker_port" json:"distribution.internal_broker_port"`
 	RaftPort               int      `yaml:"raft_port" json:"distribution.raft.port"`
 	RaftSnapshotIntervalMS int      `yaml:"raft_snapshot_interval_ms" json:"distribution.raft.snapshot.interval.ms"`
@@ -171,6 +173,8 @@ func DefaultConfig() *Config {
 			// distributed cluster
 			EnabledDistribution:      false,
 			InternalAuthToken:        "",
+			InternalAuthTokenNext:    "",
+			InternalAuthGeneration:   "",
 			InternalBrokerPort:       0,
 			RaftPort:                 9001,
 			RaftSnapshotIntervalMS:   120000,
@@ -281,6 +285,8 @@ func LoadConfig() (*Config, error) {
 	// distributed cluster
 	flag.BoolVar(&cfg.EnabledDistribution, "enable-distribution", cfg.EnabledDistribution, "Enable distributed clustering")
 	flag.StringVar(&cfg.InternalAuthToken, "internal-auth-token", cfg.InternalAuthToken, "Shared token for broker-to-broker internal text commands")
+	flag.StringVar(&cfg.InternalAuthTokenNext, "internal-auth-token-next", cfg.InternalAuthTokenNext, "Additional accepted broker token used during staged rotation")
+	flag.StringVar(&cfg.InternalAuthGeneration, "internal-auth-generation", cfg.InternalAuthGeneration, "Non-secret identifier for the active internal credential generation")
 	flag.IntVar(&cfg.InternalBrokerPort, "internal-broker-port", cfg.InternalBrokerPort, "Dedicated broker-to-broker internal command port")
 	flag.IntVar(&cfg.RaftPort, "raft-port", cfg.RaftPort, "Raft port for replication")
 	flag.IntVar(&cfg.RaftSnapshotIntervalMS, "raft-snapshot-interval-ms", cfg.RaftSnapshotIntervalMS, "Raft snapshot check interval in milliseconds")
@@ -425,6 +431,8 @@ func LoadConfig() (*Config, error) {
 
 	overrideEnvBool(&cfg.EnabledDistribution, "ENABLE_DISTRIBUTION")
 	overrideEnvString(&cfg.InternalAuthToken, "INTERNAL_AUTH_TOKEN")
+	overrideEnvString(&cfg.InternalAuthTokenNext, "INTERNAL_AUTH_TOKEN_NEXT")
+	overrideEnvString(&cfg.InternalAuthGeneration, "INTERNAL_AUTH_GENERATION")
 	overrideEnvInt(&cfg.InternalBrokerPort, "INTERNAL_BROKER_PORT")
 	overrideEnvString(&cfg.AdvertisedHost, "ADVERTISED_HOST")
 	overrideEnvInt(&cfg.AdvertisedBrokerPort, "ADVERTISED_BROKER_PORT")
@@ -541,6 +549,15 @@ func (cfg *Config) ValidateClusterTransport() error {
 	}
 	if strings.ContainsAny(cfg.InternalAuthToken, " \t\r\n") {
 		return fmt.Errorf("internal_auth_token must not contain whitespace")
+	}
+	if strings.ContainsAny(cfg.InternalAuthTokenNext, " \t\r\n") {
+		return fmt.Errorf("internal_auth_token_next must not contain whitespace")
+	}
+	if cfg.InternalAuthTokenNext != "" && cfg.InternalAuthTokenNext == cfg.InternalAuthToken {
+		return fmt.Errorf("internal_auth_token_next must differ from internal_auth_token")
+	}
+	if strings.ContainsAny(cfg.InternalAuthGeneration, " \t\r\n") {
+		return fmt.Errorf("internal_auth_generation must not contain whitespace")
 	}
 	if !cfg.InternalUseTLS && !cfg.AllowInsecureClusterTransport {
 		return fmt.Errorf("distributed mode requires internal TLS; set allow_insecure_cluster_transport only for isolated test environments")
