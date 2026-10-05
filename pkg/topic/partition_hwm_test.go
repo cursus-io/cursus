@@ -165,7 +165,7 @@ func TestPartition_RecoversProducerStateFromLogWithoutCheckpoint(t *testing.T) {
 	defer func() { _ = restartedDH.Close() }()
 	restarted := NewPartition(0, "orders", restartedDH, nil, cfg)
 	defer restarted.Close()
-	restarted.RecoverProducerStateFromLog()
+	require.NoError(t, restarted.RecoverProducerStateFromLog())
 
 	retry := types.Message{Payload: "duplicate", ProducerID: "producer-1", SeqNum: 1, TransactionalID: "tx-1", TransactionState: types.TransactionStateCommitted}
 	require.NoError(t, restarted.EnqueueSyncIdempotent(retry))
@@ -403,7 +403,7 @@ func TestPartition_ReconcileCommittedHWMPersistsClearedProducerCheckpoint(t *tes
 	defer func() { require.NoError(t, restartedDH.Close()) }()
 	restarted := NewPartition(0, "orders", restartedDH, nil, cfg)
 	defer restarted.Close()
-	restarted.RecoverProducerStateFromLog()
+	require.NoError(t, restarted.RecoverProducerStateFromLog())
 
 	require.NoError(t, restarted.EnqueueSyncIdempotent(types.Message{
 		Payload: "duplicate", ProducerID: "producer-1", Epoch: 7, SeqNum: 1,

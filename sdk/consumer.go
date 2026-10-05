@@ -1248,17 +1248,9 @@ func (c *Consumer) requestTimeout() time.Duration {
 	return defaultSDKRequestTimeout
 }
 
-func (c *Consumer) getLeaderConn() (net.Conn, error) {
-	return c.getLeaderConnContext(context.Background())
-}
-
 func (c *Consumer) getLeaderConnContext(ctx context.Context) (net.Conn, error) {
 	conn, _, err := c.client.ConnectWithFailoverContext(ctx)
 	return conn, err
-}
-
-func (c *Consumer) findCoordinator() (string, error) {
-	return c.findCoordinatorContext(context.Background())
 }
 
 func (c *Consumer) findCoordinatorContext(ctx context.Context) (string, error) {
@@ -1296,10 +1288,6 @@ func (c *Consumer) findCoordinatorContext(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("find_coordinator: missing host/port in response: %s", respStr)
 	}
 	return c.coordinatorAddrFromHostPort(host, port), nil
-}
-
-func (c *Consumer) getCoordinatorConn() (net.Conn, error) {
-	return c.getCoordinatorConnContext(context.Background())
 }
 
 func (c *Consumer) getCoordinatorConnContext(ctx context.Context) (net.Conn, error) {

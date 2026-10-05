@@ -631,10 +631,6 @@ func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHan
 	return shutdown, nil
 }
 
-func handleInternalConn(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler) {
-	handleConnWithContext(ctx, conn, cmdHandler, controller.NewInternalClientContext("default-group", 0))
-}
-
 func observeClientConnection() func() {
 	metrics.ClientConnectionsTotal.Inc()
 	metrics.ClientConnectionsActive.Inc()

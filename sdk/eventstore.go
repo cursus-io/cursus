@@ -128,11 +128,6 @@ func (es *EventStore) resetConn() {
 	}
 }
 
-// sendCommand sends a text command and returns the response string.
-func (es *EventStore) sendCommand(cmd string) (string, error) {
-	return es.sendCommandContext(context.Background(), cmd)
-}
-
 func (es *EventStore) sendCommandContext(ctx context.Context, cmd string) (string, error) {
 	return es.sendCommandContextWithOutcome(ctx, cmd, "")
 }

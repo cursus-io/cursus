@@ -164,18 +164,6 @@ func buildClusterStatus(state *fsm.BrokerFSM, raftLeader string, defaultMinISR i
 	return status
 }
 
-func splitPartitionMetadataKey(key string) (string, int) {
-	idx := strings.LastIndexByte(key, '-')
-	if idx < 1 || idx+1 >= len(key) {
-		return key, -1
-	}
-	partition, err := strconv.Atoi(key[idx+1:])
-	if err != nil {
-		return key, -1
-	}
-	return key[:idx], partition
-}
-
 func (ch *CommandHandler) handleElectLeader(cmd string, ctx ...*ClientContext) string {
 	requestCtx := firstClientContext(ctx).RequestContext()
 	if !ch.isDistributed() {

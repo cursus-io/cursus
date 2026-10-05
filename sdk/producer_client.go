@@ -215,12 +215,6 @@ func (pc *ProducerClient) ReconnectPartition(idx int, addr string) error {
 	return pc.connectPartitionLocked(context.Background(), idx, addr)
 }
 
-func (pc *ProducerClient) discardPartition(idx int) {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-	pc.discardPartitionLocked(idx)
-}
-
 func (pc *ProducerClient) discardPartitionLocked(idx int) {
 	if idx < 0 {
 		return
