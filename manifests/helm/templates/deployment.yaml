@@ -1,6 +1,12 @@
 {{- if ne (int .Values.replicaCount) 1 }}
 {{- fail "the Deployment chart supports exactly one standalone replica; use an explicit distributed StatefulSet topology for clustering" }}
 {{- end }}
+{{- if not (kindIs "bool" .Values.tls.enabled) }}
+{{- fail "tls.enabled must be a boolean" }}
+{{- end }}
+{{- if not (kindIs "bool" .Values.clientSecurity.allowInsecure) }}
+{{- fail "clientSecurity.allowInsecure must be a boolean" }}
+{{- end }}
 {{- if .Values.tls.enabled }}
 {{- if ne .Values.tls.certPath "/app/tls/cert.pem" }}
 {{- fail "tls.certPath must be /app/tls/cert.pem because the TLS Secret is mounted at /app/tls" }}
