@@ -237,7 +237,6 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	}()
 
 	internalMetadata := topicName == config.ConsumerOffsetsTopicName
-	standaloneInternalMetadata := internalMetadata && !cfg.EnabledDistribution
 	tempDh := &DiskHandler{BaseName: base}
 	// Recovery must run before generic compaction-temp cleanup because a pending
 	// compacted range still owns its staged .range.compacting files.
@@ -273,11 +272,7 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 				return nil, fmt.Errorf("critical: failed to parse last segment filename %s: %w", fileName, err)
 			}
 		}
-		if standaloneInternalMetadata {
-			recovery, err = recoverActiveSegmentStrict(lastFile, tempDh.GetIndexPath(currentSegmentBase), currentSegmentBase)
-		} else {
-			recovery, err = recoverActiveSegment(lastFile, tempDh.GetIndexPath(currentSegmentBase), currentSegmentBase)
-		}
+		recovery, err = recoverActiveSegment(lastFile, currentSegmentBase)
 		if err != nil {
 			return nil, fmt.Errorf("recover active segment %s: %w", lastFile, err)
 		}
@@ -451,6 +446,7 @@ func diskMessageFromMessage(topic string, partition int32, msg types.Message) ty
 		ProducerID:                   msg.ProducerID,
 		SeqNum:                       msg.SeqNum,
 		Epoch:                        msg.Epoch,
+		LeaderEpoch:                  msg.LeaderEpoch,
 		Payload:                      msg.Payload,
 		Key:                          msg.Key,
 		EventType:                    msg.EventType,
@@ -754,6 +750,7 @@ func (dh *DiskHandler) readMessagesFromPositionBounded(reader *mmap.ReaderAt, po
 			ProducerID:                   diskMsg.ProducerID,
 			SeqNum:                       diskMsg.SeqNum,
 			Epoch:                        diskMsg.Epoch,
+			LeaderEpoch:                  diskMsg.LeaderEpoch,
 			Key:                          diskMsg.Key,
 			EventType:                    diskMsg.EventType,
 			SchemaVersion:                diskMsg.SchemaVersion,

@@ -39,7 +39,7 @@ func (d *DiskHandler) flushLoop() {
 			if len(batch) >= d.batchSize {
 				util.Debug("Batch size threshold reached, flushing %d messages", len(batch))
 				if err := d.WriteBatch(batch); err != nil {
-					util.Error("WriteBatch failed: %v", err)
+					util.Error("WriteBatch failed: %v", d.markWriteUnavailable(fmt.Errorf("async batch write: %w", err)))
 				}
 				batch = batch[:0]
 			}
@@ -59,7 +59,7 @@ func (d *DiskHandler) flushLoop() {
 			}
 			if len(batch) > 0 {
 				if err := d.WriteBatch(batch); err != nil {
-					util.Error("WriteBatch failed during flush: %v", err)
+					util.Error("WriteBatch failed during flush: %v", d.markWriteUnavailable(fmt.Errorf("async batch flush: %w", err)))
 				}
 				batch = batch[:0]
 			}
@@ -80,7 +80,7 @@ func (d *DiskHandler) flushLoop() {
 			if len(batch) > 0 {
 				util.Debug("Flushing %d messages on timer", len(batch))
 				if err := d.WriteBatch(batch); err != nil {
-					util.Error("WriteBatch failed: %v", err)
+					util.Error("WriteBatch failed: %v", d.markWriteUnavailable(fmt.Errorf("async timer batch write: %w", err)))
 				}
 				batch = batch[:0]
 			}
@@ -88,7 +88,7 @@ func (d *DiskHandler) flushLoop() {
 			d.mu.Lock()
 			d.ioMu.Lock()
 			if time.Since(d.segmentCreatedAt) >= d.segmentRollTime {
-				if err := d.rotateSegment(d.AbsoluteOffset); err != nil {
+				if err := d.rotateSegment(atomic.LoadUint64(&d.FlushedOffset)); err != nil {
 					util.Error("time-based segment rotation failed: %v", err)
 				}
 			}
@@ -311,6 +311,7 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 		ProducerID:                   msg.ProducerID,
 		SeqNum:                       msg.SeqNum,
 		Epoch:                        msg.Epoch,
+		LeaderEpoch:                  msg.LeaderEpoch,
 		Payload:                      msg.Payload,
 		Key:                          msg.Key,
 		EventType:                    msg.EventType,
@@ -425,11 +426,9 @@ func (d *DiskHandler) rotateSegment(nextBaseOffset uint64) error {
 	}
 
 	if d.file != nil {
-		if err := d.file.Sync(); err != nil {
+		if err := d.syncFile(d.file); err != nil {
 			util.Error("failed to sync disk file: %v", err)
-			if d.internalMetadata {
-				errs = append(errs, err)
-			}
+			errs = append(errs, err)
 		}
 		if err := d.file.Close(); err != nil {
 			util.Error("close failed during rotation: %v", err)
@@ -452,7 +451,7 @@ func (d *DiskHandler) rotateSegment(nextBaseOffset uint64) error {
 	d.indexMu.Unlock()
 
 	if len(errs) > 0 {
-		return fmt.Errorf("rotation completed with errors: %v", errs)
+		return d.markWriteUnavailable(fmt.Errorf("rotate segment: %w", errors.Join(errs...)))
 	}
 
 	d.CurrentSegment = nextBaseOffset

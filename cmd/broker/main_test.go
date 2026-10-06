@@ -22,7 +22,7 @@ func TestRunBrokerRejectsOwnedDirectoryBeforeRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 	if err := runBroker(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "lock broker storage") {
 		t.Fatalf("expected storage ownership rejection, got %v", err)
 	}

@@ -130,9 +130,8 @@ func TestJoinCluster_FailsOverFromUnresponsiveSeed(t *testing.T) {
 	}
 
 	// Cluster membership stores hosts while the discovery port is shared by all
-	// seeds, so bind the healthy seed to a second loopback address on the same
-	// port.
-	healthyListener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.2", portStr))
+	// seeds, so bind the healthy seed to IPv6 loopback on the same port.
+	healthyListener, err := net.Listen("tcp6", net.JoinHostPort("::1", portStr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +193,7 @@ func TestJoinCluster_FailsOverFromUnresponsiveSeed(t *testing.T) {
 
 	err = client.joinClusterWithContext(
 		ctx,
-		[]string{"127.0.0.1:ignored", "127.0.0.2:ignored"},
+		[]string{"127.0.0.1:ignored", "[::1]:ignored"},
 		"test-node",
 		"127.0.0.3:9000",
 		port,

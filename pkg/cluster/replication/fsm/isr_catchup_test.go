@@ -30,7 +30,23 @@ func newISRCatchupTestFSM(t *testing.T) *BrokerFSM {
 	metadata.CommittedHWM = 0
 	metadata.CommittedHWMKnown = true
 	brokerFSM.mu.Unlock()
+	partition, err := brokerFSM.tm.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	partition.MarkReplicaCatchupVerified(4, topic.InitialLifecycleEpoch, 0)
 	return brokerFSM
+}
+
+func TestBuildISRCatchupProofsRequiresCurrentPrefixVerification(t *testing.T) {
+	brokerFSM := newISRCatchupTestFSM(t)
+	brokerFSM.mu.Lock()
+	brokerFSM.partitionMetadata["orders-0"].LeaderEpoch = 5
+	brokerFSM.mu.Unlock()
+	require.Empty(t, brokerFSM.BuildISRCatchupProofs("node-2"))
+
+	partition, err := brokerFSM.tm.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	partition.MarkReplicaCatchupVerified(5, topic.InitialLifecycleEpoch, 0)
+	require.Len(t, brokerFSM.BuildISRCatchupProofs("node-2"), 1)
 }
 
 func TestBuildISRCatchupProofsIncludesOnlySynchronizedOutOfISRReplica(t *testing.T) {
@@ -149,9 +165,9 @@ func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
 	partition, err := topicManager.GetTopic("orders").GetPartition(0)
 	require.NoError(t, err)
 	t.Cleanup(partition.Close)
-	require.NoError(t, partition.EnqueueSync(types.Message{Payload: "zero"}))
-	require.NoError(t, partition.EnqueueSync(types.Message{Payload: "one"}))
-	require.NoError(t, partition.EnqueueSync(types.Message{Payload: "two"}))
+	require.NoError(t, partition.EnqueueSync(types.Message{Payload: "zero", LeaderEpoch: 1}))
+	require.NoError(t, partition.EnqueueSync(types.Message{Payload: "one", LeaderEpoch: 1}))
+	require.NoError(t, partition.EnqueueSync(types.Message{Payload: "two", LeaderEpoch: 2}))
 	partition.FlushDisk()
 
 	brokerFSM := NewBrokerFSM(topicManager, nil)
@@ -181,6 +197,20 @@ func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
 	require.Len(t, batch.Messages, 1)
 	require.Equal(t, uint64(1), batch.Messages[0].Offset)
 	require.Equal(t, "one", batch.Messages[0].Payload)
+
+	divergent := types.Message{Offset: 2, Payload: "divergent", LeaderEpoch: 1}
+	previousDigest, err := replicaRecordDigest(divergent)
+	require.NoError(t, err)
+	divergentRequest := request
+	divergentRequest.NextOffset = 3
+	divergentRequest.PreviousLeaderEpoch = 1
+	divergentRequest.PreviousRecordDigest = previousDigest
+	rollback, err := brokerFSM.FetchReplicaCatchup(divergentRequest)
+	require.NoError(t, err)
+	require.NotNil(t, rollback.TruncateTo)
+	require.Equal(t, uint64(2), *rollback.TruncateTo)
+	require.Empty(t, rollback.Messages)
+	require.NoError(t, ValidateReplicaCatchupBatchDigest(rollback))
 
 	request.BrokerID = "node-3"
 	_, err = brokerFSM.FetchReplicaCatchup(request)

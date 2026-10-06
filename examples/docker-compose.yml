@@ -8,5 +8,7 @@ services:
       - "9000:9000"
     environment:
       - CURSUS_BROKER_PORT=9000
+      - BROKER_BIND_ADDRESS=0.0.0.0
+      - ALLOW_INSECURE_CLIENT_TRANSPORT=true
     volumes:
       - ./data:/data

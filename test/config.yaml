@@ -1,4 +1,6 @@
 broker_port: 9000
+broker_bind_address: "0.0.0.0"
+allow_insecure_client_transport: true
 health_check_port: 9080
 enable_exporter: true
 exporter_port: 9100

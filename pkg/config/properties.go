@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -34,11 +35,12 @@ type ConsumerGroupConfig struct {
 }
 
 type Config struct {
-	BrokerPort      int           `yaml:"broker_port" json:"broker.port"`
-	HealthCheckPort int           `yaml:"health_check_port" json:"health.check.port"`
-	EnableExporter  bool          `yaml:"enable_exporter" json:"enable.exporter"`
-	ExporterPort    int           `yaml:"exporter_port" json:"exporter.port"`
-	LogLevel        util.LogLevel `yaml:"log_level" json:"log_level"`
+	BrokerBindAddress string        `yaml:"broker_bind_address" json:"broker.bind.address"`
+	BrokerPort        int           `yaml:"broker_port" json:"broker.port"`
+	HealthCheckPort   int           `yaml:"health_check_port" json:"health.check.port"`
+	EnableExporter    bool          `yaml:"enable_exporter" json:"enable.exporter"`
+	ExporterPort      int           `yaml:"exporter_port" json:"exporter.port"`
+	LogLevel          util.LogLevel `yaml:"log_level" json:"log_level"`
 
 	// disk storage
 	LogDir              string  `yaml:"log_dir" json:"log.dir"`
@@ -129,6 +131,7 @@ type Config struct {
 
 	// security
 	UseTLS                        bool `yaml:"use_tls" json:"tls.enable"`
+	AllowInsecureClientTransport  bool `yaml:"allow_insecure_client_transport" json:"client.allow_insecure_transport"`
 	TLSCert                       tls.Certificate
 	TLSCertPath                   string `yaml:"tls_cert_path" json:"tls.cert_path"`
 	TLSKeyPath                    string `yaml:"tls_key_path" json:"tls.key_path"`
@@ -148,11 +151,12 @@ type Config struct {
 func DefaultConfig() *Config {
 	defaultOnce.Do(func() {
 		defaultConfig = &Config{
-			BrokerPort:      9000,
-			HealthCheckPort: 9080,
-			EnableExporter:  true,
-			ExporterPort:    9100,
-			LogLevel:        util.LogLevelInfo,
+			BrokerBindAddress: "127.0.0.1",
+			BrokerPort:        9000,
+			HealthCheckPort:   9080,
+			EnableExporter:    true,
+			ExporterPort:      9100,
+			LogLevel:          util.LogLevelInfo,
 
 			// disk storage
 			LogDir:              "broker-logs",
@@ -264,6 +268,7 @@ func LoadConfig() (*Config, error) {
 	configPath := flag.String("config", "", "Path to YAML/JSON config file")
 
 	flag.IntVar(&cfg.BrokerPort, "port", cfg.BrokerPort, "Broker port")
+	flag.StringVar(&cfg.BrokerBindAddress, "bind-address", cfg.BrokerBindAddress, "Broker listener bind address")
 	flag.IntVar(&cfg.HealthCheckPort, "health-port", cfg.HealthCheckPort, "Health port")
 	flag.BoolVar(&cfg.EnableExporter, "exporter", cfg.EnableExporter, "Enable exporter")
 	flag.IntVar(&cfg.ExporterPort, "exporter-port", cfg.ExporterPort, "Exporter port")
@@ -357,6 +362,7 @@ func LoadConfig() (*Config, error) {
 
 	// security
 	flag.BoolVar(&cfg.UseTLS, "tls", cfg.UseTLS, "Enable TLS")
+	flag.BoolVar(&cfg.AllowInsecureClientTransport, "allow-insecure-client-transport", cfg.AllowInsecureClientTransport, "Explicitly allow an unauthenticated or plaintext non-loopback client listener")
 	flag.StringVar(&cfg.TLSCertPath, "tls-cert", cfg.TLSCertPath, "TLS cert")
 	flag.StringVar(&cfg.TLSKeyPath, "tls-key", cfg.TLSKeyPath, "TLS key")
 	flag.BoolVar(&cfg.InternalUseTLS, "internal-tls", cfg.InternalUseTLS, "Enable mutual TLS on the internal broker listener")
@@ -368,17 +374,8 @@ func LoadConfig() (*Config, error) {
 	flag.BoolVar(&cfg.EnableSASL, "enable-sasl", cfg.EnableSASL, "Enable SASL-style token authentication for client commands")
 
 	flag.Parse()
-
-	switch strings.ToLower(*logLevelStr) {
-	case "debug":
-		cfg.LogLevel = util.LogLevelDebug
-	case "warn", "warning":
-		cfg.LogLevel = util.LogLevelWarn
-	case "error":
-		cfg.LogLevel = util.LogLevelError
-	default:
-		cfg.LogLevel = util.LogLevelInfo
-	}
+	explicitFlags := make(map[string]string)
+	flag.Visit(func(current *flag.Flag) { explicitFlags[current.Name] = current.Value.String() })
 
 	if env := os.Getenv("CONFIG_PATH"); env != "" && *configPath == "" {
 		*configPath = env
@@ -405,7 +402,30 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	if *raftPeersFlag != "" {
+	// Config files replace defaults, while explicitly supplied command-line
+	// flags retain precedence over the file.
+	for name, value := range explicitFlags {
+		if current := flag.Lookup(name); current != nil {
+			if err := current.Value.Set(value); err != nil {
+				return nil, fmt.Errorf("restore command-line flag %s: %w", name, err)
+			}
+		}
+	}
+
+	if _, set := explicitFlags["log-level"]; set {
+		switch strings.ToLower(*logLevelStr) {
+		case "debug":
+			cfg.LogLevel = util.LogLevelDebug
+		case "warn", "warning":
+			cfg.LogLevel = util.LogLevelWarn
+		case "error":
+			cfg.LogLevel = util.LogLevelError
+		default:
+			cfg.LogLevel = util.LogLevelInfo
+		}
+	}
+
+	if _, set := explicitFlags["raft-peers"]; set {
 		parts := strings.Split(*raftPeersFlag, ",")
 		cfg.RaftPeers = make([]string, 0, len(parts))
 		for _, s := range parts {
@@ -415,26 +435,31 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	if segmentSizeInt64 <= 0 {
-		cfg.SegmentSize = DefaultConfig().SegmentSize
-	} else {
-		segmentSize, valid := util.SafeInt64ToUint64(segmentSizeInt64)
-		if !valid {
-			return nil, fmt.Errorf("segment size %d must be non-negative", segmentSizeInt64)
+	if _, set := explicitFlags["segment-size"]; set {
+		if segmentSizeInt64 <= 0 {
+			cfg.SegmentSize = DefaultConfig().SegmentSize
+		} else {
+			segmentSize, valid := util.SafeInt64ToUint64(segmentSizeInt64)
+			if !valid {
+				return nil, fmt.Errorf("segment size %d must be non-negative", segmentSizeInt64)
+			}
+			cfg.SegmentSize = segmentSize
 		}
-		cfg.SegmentSize = segmentSize
 	}
-	if indexSizeInt64 <= 0 {
-		cfg.IndexSize = DefaultConfig().IndexSize
-	} else {
-		indexSize, valid := util.SafeInt64ToUint64(indexSizeInt64)
-		if !valid {
-			return nil, fmt.Errorf("index size %d must be non-negative", indexSizeInt64)
+	if _, set := explicitFlags["index-size"]; set {
+		if indexSizeInt64 <= 0 {
+			cfg.IndexSize = DefaultConfig().IndexSize
+		} else {
+			indexSize, valid := util.SafeInt64ToUint64(indexSizeInt64)
+			if !valid {
+				return nil, fmt.Errorf("index size %d must be non-negative", indexSizeInt64)
+			}
+			cfg.IndexSize = indexSize
 		}
-		cfg.IndexSize = indexSize
 	}
 
 	overrideEnvInt(&cfg.BrokerPort, "BROKER_PORT")
+	overrideEnvString(&cfg.BrokerBindAddress, "BROKER_BIND_ADDRESS")
 	overrideEnvInt(&cfg.HealthCheckPort, "HEALTH_CHECK_PORT")
 	overrideEnvBool(&cfg.EnableExporter, "ENABLE_EXPORTER")
 	overrideEnvString(&cfg.LogDir, "LOG_DIR")
@@ -503,6 +528,7 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.ConsumerSessionTimeoutMS, "CONSUMER_SESSION_TIMEOUT")
 	overrideEnvInt(&cfg.ConsumerHeartbeatCheckMS, "CONSUMER_HEARTBEAT_CHECK")
 	overrideEnvBool(&cfg.UseTLS, "USE_TLS")
+	overrideEnvBool(&cfg.AllowInsecureClientTransport, "ALLOW_INSECURE_CLIENT_TRANSPORT")
 	overrideEnvString(&cfg.TLSCertPath, "TLS_CERT_PATH")
 	overrideEnvString(&cfg.TLSKeyPath, "TLS_KEY_PATH")
 	overrideEnvBool(&cfg.InternalUseTLS, "INTERNAL_USE_TLS")
@@ -525,6 +551,9 @@ func LoadConfig() (*Config, error) {
 	if err := cfg.ValidateClientAuthentication(); err != nil {
 		return nil, err
 	}
+	if err := cfg.ValidateClientTransport(); err != nil {
+		return nil, err
+	}
 	if err := cfg.loadInternalTLSConfig(); err != nil {
 		return nil, err
 	}
@@ -541,6 +570,29 @@ func LoadConfig() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// ValidateClientTransport keeps the insecure development default on loopback.
+// Exposing the listener requires both TLS and authentication unless the
+// operator explicitly acknowledges the insecure deployment.
+func (cfg *Config) ValidateClientTransport() error {
+	if cfg == nil {
+		return nil
+	}
+	host := strings.TrimSpace(cfg.BrokerBindAddress)
+	if host == "" {
+		return fmt.Errorf("broker_bind_address is required")
+	}
+	if host == "localhost" || (net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback()) {
+		return nil
+	}
+	if cfg.AllowInsecureClientTransport {
+		return nil
+	}
+	if !cfg.UseTLS || !cfg.EnableSASL {
+		return fmt.Errorf("non-loopback client listener requires TLS and SASL; set allow_insecure_client_transport only for isolated environments")
+	}
+	return nil
 }
 
 // ValidateClientAuthentication requires an explicit least-privilege contract

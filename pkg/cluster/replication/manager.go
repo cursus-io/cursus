@@ -32,6 +32,7 @@ type RaftInterface interface {
 	State() raft.RaftState
 	GetConfiguration() raft.ConfigurationFuture
 	BootstrapCluster(raft.Configuration) raft.Future
+	LeadershipTransfer() raft.Future
 	Shutdown() raft.Future
 	Stats() map[string]string
 }
@@ -621,4 +622,13 @@ func (rm *RaftReplicationManager) Shutdown() error {
 		}
 	}
 	return shutdownErr
+}
+
+// TransferLeadership asks Raft to hand leadership to an eligible follower
+// before this broker shuts down.
+func (rm *RaftReplicationManager) TransferLeadership() error {
+	if rm == nil || rm.raft == nil || !rm.IsLeader() {
+		return nil
+	}
+	return rm.raft.LeadershipTransfer().Error()
 }

@@ -143,7 +143,7 @@ func stalledInitializationServer(t *testing.T, stage string) (*PublisherConfig, 
 				defer workers.Done()
 				defer active.Add(-1)
 				defer connections.Delete(raw)
-				defer raw.Close()
+				defer func() { _ = raw.Close() }()
 				_ = raw.SetDeadline(time.Now().Add(10 * time.Second))
 				block := func() {
 					select {
@@ -229,7 +229,7 @@ func TestProducerTLSAutocreateDoesNotSendPlaintextCredentials(t *testing.T) {
 	_, _, certPath, keyPath := producerInitializationCertificate(t)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	observed := make(chan bool, 1)
 	go func() {
 		raw, err := listener.Accept()
@@ -237,7 +237,7 @@ func TestProducerTLSAutocreateDoesNotSendPlaintextCredentials(t *testing.T) {
 			observed <- false
 			return
 		}
-		defer raw.Close()
+		defer func() { _ = raw.Close() }()
 		_ = raw.SetDeadline(time.Now().Add(time.Second))
 		conn, err := wire.ServerHandshake(raw, []wire.Compression{wire.CompressionNone})
 		if err != nil {
@@ -277,7 +277,7 @@ func verifyProducerControlTLS(t *testing.T, scenario string) {
 	certificate, roots, certPath, keyPath := producerInitializationCertificate(t)
 	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12})
 	require.NoError(t, err)
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	serverDone := make(chan error, 1)
 	go func() {
 		raw, err := listener.Accept()
@@ -285,7 +285,7 @@ func verifyProducerControlTLS(t *testing.T, scenario string) {
 			serverDone <- err
 			return
 		}
-		defer raw.Close()
+		defer func() { _ = raw.Close() }()
 		_ = raw.SetDeadline(time.Now().Add(3 * time.Second))
 		conn, request, _, err := acceptWireTestRequest(raw)
 		if err == nil {
@@ -308,11 +308,12 @@ func verifyProducerControlTLS(t *testing.T, scenario string) {
 	require.NoError(t, err)
 	// Trust only this test server; hostname verification remains enabled.
 	client.tlsConfig.RootCAs = roots
-	if scenario == "explicit-hostname" {
+	switch scenario {
+	case "explicit-hostname":
 		client.tlsConfig.ServerName = "127.0.0.1"
-	} else if scenario == "wrong-hostname" {
+	case "wrong-hostname":
 		client.tlsConfig.ServerName = "wrong.example"
-	} else if scenario == "untrusted-certificate" {
+	case "untrusted-certificate":
 		client.tlsConfig.RootCAs = x509.NewCertPool()
 	}
 	originalName := client.tlsConfig.ServerName

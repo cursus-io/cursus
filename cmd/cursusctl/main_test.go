@@ -15,7 +15,7 @@ func TestRunExecutesWireV2Command(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	serverDone := make(chan error, 1)
 	go func() {
 		conn, err := listener.Accept()
@@ -23,7 +23,7 @@ func TestRunExecutesWireV2Command(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		server, err := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
 		if err != nil {
 			serverDone <- err
@@ -64,7 +64,7 @@ func TestRunPrintsBrowseMessagesBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	serverDone := make(chan error, 1)
 	go func() {
 		conn, err := listener.Accept()
@@ -72,7 +72,7 @@ func TestRunPrintsBrowseMessagesBatch(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		server, err := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
 		if err != nil {
 			serverDone <- err

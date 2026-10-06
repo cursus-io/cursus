@@ -1,6 +1,10 @@
 package config_test
 
 import (
+	"flag"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -51,6 +55,11 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 func TestLoadConfig_EnvOverrides(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("log_segment_bytes: 123456\nlog_index_size_bytes: 2097152\ndisk_flush_batch_size: 7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CONFIG_PATH", configPath)
 	t.Setenv("BROKER_PORT", "9999")
 	t.Setenv("LOG_RETENTION_HOURS", "24")
 	t.Setenv("RAFT_SNAPSHOT_INTERVAL_MS", "250")
@@ -116,6 +125,38 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	if cfg.MaxInflightRequests != 17 || cfg.MaxInflightRequestBytes != 134217728 {
 		t.Errorf("unexpected request limits from env: requests=%d bytes=%d", cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes)
 	}
+	if cfg.SegmentSize != 123456 || cfg.IndexSize != 2097152 {
+		t.Errorf("config file segment sizes were overwritten: segment=%d index=%d", cfg.SegmentSize, cfg.IndexSize)
+	}
+	if cfg.DiskFlushBatchSize != 7 {
+		t.Errorf("Expected DiskFlushBatchSize 7 from config file, got %d", cfg.DiskFlushBatchSize)
+	}
+}
+
+func TestLoadConfig_ExplicitFlagOverridesFile(t *testing.T) {
+	if os.Getenv("CURSUS_CONFIG_FLAG_HELPER") == "1" {
+		configPath := os.Getenv("CURSUS_CONFIG_FLAG_PATH")
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+		os.Args = []string{os.Args[0], "--config", configPath, "--port", "9123", "--log-level", "error"}
+		cfg, err := config.LoadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.BrokerPort != 9123 || cfg.LogLevel != util.LogLevelError || cfg.DiskFlushBatchSize != 7 {
+			t.Fatalf("unexpected precedence result: port=%d log=%v batch=%d", cfg.BrokerPort, cfg.LogLevel, cfg.DiskFlushBatchSize)
+		}
+		return
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("broker_port: 9001\nlog_level: 1\ndisk_flush_batch_size: 7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLoadConfig_ExplicitFlagOverridesFile$")
+	cmd.Env = append(os.Environ(), "CURSUS_CONFIG_FLAG_HELPER=1", "CURSUS_CONFIG_FLAG_PATH="+configPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("config flag helper failed: %v\n%s", err, output)
+	}
 }
 
 func TestConfigNormalizeCleanupPolicies(t *testing.T) {
@@ -165,5 +206,16 @@ func TestConfig_Normalize(t *testing.T) {
 	}
 	if cfg.MaxInflightRequests != 256 || cfg.MaxInflightRequestBytes != 256*1024*1024 {
 		t.Errorf("Normalize should restore request limits, got requests=%d bytes=%d", cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes)
+	}
+}
+
+func TestConfigNormalizeReservesOneMaximumFramePerListener(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.InternalBrokerPort = 9002
+	cfg.MaxInflightRequestBytes = 128 * 1024 * 1024
+	cfg.Normalize()
+	if cfg.MaxInflightRequestBytes != 256*1024*1024 {
+		t.Fatalf("distributed request budget = %d, want 256 MiB", cfg.MaxInflightRequestBytes)
 	}
 }

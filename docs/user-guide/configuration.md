@@ -21,17 +21,14 @@ Broker configuration is a flat `Config` value. YAML uses snake-case keys and JSO
 cursus applies configuration in this order:
 
 1. built-in defaults,
-2. parsed command-line flags,
-3. the YAML or JSON file selected by `--config` or `CONFIG_PATH`,
+2. the YAML or JSON file selected by `--config` or `CONFIG_PATH`,
+3. explicitly supplied command-line flags,
 4. supported environment-variable overrides,
 5. normalization and security validation.
 
-The configuration file therefore overrides ordinary value flags, and supported
-environment variables override both. `--raft-peers` is the one value flag
-applied after file loading and before environment overrides. Use `--config`
-to select a file and environment variables for deliberate deployment-time
-overrides; do not assume that `--port` or another ordinary flag overrides a
-value present in that file.
+Values omitted from the command line remain available from the configuration
+file. Explicit flags override the file, and supported environment variables
+override both. `CONFIG_PATH` selects a file only when `--config` is absent.
 
 ## Configuration File Format
 
@@ -97,6 +94,7 @@ The configuration is represented by the Config struct in the codebase, which org
 | Parameter           | Type       | Default        | Description                                      |
 |--------------------|------------|----------------|--------------------------------------------------|
 | `broker_port`        | int        | 9000           | Main broker TCP port for client connections     |
+| `broker_bind_address` | string    | "127.0.0.1"  | Client listener bind address; non-loopback binds require TLS and SASL by default |
 | `health_check_port`  | int        | 9080           | HTTP port for `/live` and `/ready`                         |
 | `log_dir`            | string     | "broker-logs"  | Directory path for persistent log segments      |
 | `enable_exporter`    | bool       | true           | Enable Prometheus metrics exporter              |
@@ -125,9 +123,10 @@ The health and metrics listeners are unauthenticated operations endpoints. Restr
 | `internal_tls_server_name` | string | "" | Server name used by broker-to-broker mTLS clients |
 | `enable_sasl` | bool | false | Enable SASL-PLAIN-style token authentication for text commands |
 | `sasl_users` | list | [] | Principal/token/permissions entries accepted by `AUTH` and inline authentication |
+| `allow_insecure_client_transport` | bool | false | Explicit test-only opt-out that permits a non-loopback client listener without both TLS and SASL |
 | `compression_type` | string | "none" | Preferred codec: `none`, `gzip`, `snappy`, or `lz4` |
 
-When `use_tls` is enabled and certificate paths are provided, the broker loads the certificate using `tls.LoadX509KeyPair()` during initialization. In distributed mode, `internal_broker_port` moves broker-to-broker text commands away from the public client listener. If `internal_use_tls` is enabled, the internal listener requires client certificates signed by `internal_tls_ca_path`, and peer routers dial the internal port with mTLS using `internal_tls_server_name` for certificate verification.
+When `use_tls` is enabled and certificate paths are provided, the broker loads the certificate using `tls.LoadX509KeyPair()` during initialization. The default `broker_bind_address` is loopback. A wildcard or other non-loopback address fails validation unless TLS and SASL are both configured or `allow_insecure_client_transport=true` is explicitly set. In distributed mode, `internal_broker_port` moves broker-to-broker text commands away from the public client listener. If `internal_use_tls` is enabled, the internal listener requires client certificates signed by `internal_tls_ca_path`, and peer routers dial the internal port with mTLS using `internal_tls_server_name` for certificate verification.
 
 When `enable_sasl` is enabled, protected commands require `AUTH principal=<principal> token=<token>` or inline `principal=<principal> auth_token=<token>`. Every user must declare at least one permission from `admin`, `topic.read`, `topic.write`, `group`, `transaction`, and `*`; startup rejects missing, unknown, repeated, or duplicate-principal entries. `CONSUME`/`STREAM` require both `topic.read` and `group`; `TXN_PUBLISH` requires `transaction` and `topic.write`; `SEND_OFFSETS_TO_TXN` requires `transaction` and `group`. Topic `auth_policy=acl` is evaluated after the coarse permission check. The environment form is `SASL_USERS=principal:token:permission1|permission2`, with comma-separated users.
 
@@ -209,8 +208,8 @@ These values participate in active broker behavior:
 | `advertised_broker_port` | 0 | Broker port advertised to peers when different from the listener. |
 | `advertised_client_host` | empty | Client-facing host returned by routing metadata. |
 | `max_client_connections` | 1000 | Concurrent client connection limit. |
-| `max_inflight_requests` | 256 | Global number of decoded requests that may be queued or processed across client and internal listeners. |
-| `max_inflight_request_bytes` | 268435456 | Global encoded-plus-decoded request payload budget. Values below 128 MiB are normalized because one maximally compressed protocol frame can require that much peak memory. |
+| `max_inflight_requests` | 256 | Request count budget. Distributed mode divides it evenly between client and internal listeners so client traffic cannot stop replication; standalone mode uses the full value for clients. Values below 2 are normalized to 256. |
+| `max_inflight_request_bytes` | 268435456 | Encoded-plus-decoded payload budget. Distributed mode divides it evenly between client and internal listeners; standalone mode uses the full value for clients. Values below 128 MiB in standalone mode or 256 MiB with an internal listener are normalized to 256 MiB so each active pool can admit one maximum-size compressed frame. |
 | `client_idle_timeout_ms` | 60000 | Idle client connection deadline. |
 | `client_request_timeout_ms` | 30000 | Timeout applied to request processing and response writes. A response produced at the processing deadline gets one write attempt bounded by the same value. It is also the rolling per-frame write timeout for streams and, together with the idle timeout, bounds Wire v2 negotiation. An `acks=all` publish that times out after append returns `request_timeout outcome=unknown`; its accepted replication continues independently. |
 | `max_stream_connections` | 1000 | Concurrent streaming connection limit. |

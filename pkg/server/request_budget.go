@@ -17,6 +17,17 @@ type requestMemoryBudget struct {
 	changed     chan struct{}
 }
 
+func newBrokerRequestBudgets(maxRequests int, maxBytes int64, reserveInternal bool) (*requestMemoryBudget, *requestMemoryBudget) {
+	if !reserveInternal {
+		return newRequestMemoryBudget(maxRequests, maxBytes), nil
+	}
+	clientRequests := maxRequests / 2
+	internalRequests := maxRequests - clientRequests
+	clientBytes := maxBytes / 2
+	internalBytes := maxBytes - clientBytes
+	return newRequestMemoryBudget(clientRequests, clientBytes), newRequestMemoryBudget(internalRequests, internalBytes)
+}
+
 func newRequestMemoryBudget(maxRequests int, maxBytes int64) *requestMemoryBudget {
 	if maxRequests <= 0 {
 		maxRequests = 1
@@ -44,8 +55,8 @@ func (b *requestMemoryBudget) reserve(ctx context.Context, bytes uint64) (func()
 		if b.requests < b.maxRequests && bytes <= b.maxBytes-b.bytes {
 			b.requests++
 			b.bytes += bytes
-			metrics.RequestsInflight.Set(float64(b.requests))
-			metrics.RequestBytesInflight.Set(float64(b.bytes))
+			metrics.RequestsInflight.Inc()
+			metrics.RequestBytesInflight.Add(float64(bytes))
 			b.mu.Unlock()
 
 			var once sync.Once
@@ -78,8 +89,8 @@ func (b *requestMemoryBudget) release(bytes uint64) {
 	} else {
 		b.bytes -= bytes
 	}
-	metrics.RequestsInflight.Set(float64(b.requests))
-	metrics.RequestBytesInflight.Set(float64(b.bytes))
+	metrics.RequestsInflight.Dec()
+	metrics.RequestBytesInflight.Sub(float64(bytes))
 	close(b.changed)
 	b.changed = make(chan struct{})
 	b.mu.Unlock()

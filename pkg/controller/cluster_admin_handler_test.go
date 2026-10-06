@@ -76,6 +76,7 @@ func TestClusterAdminCommandsAreRegisteredOutsideDistributedMode(t *testing.T) {
 	for _, command := range []string{
 		"CLUSTER_STATUS",
 		"ELECT_LEADER topic=orders partition=0 broker=broker-2",
+		"REASSIGN_PARTITION topic=orders partition=0 replicas=broker-1,broker-2,broker-3",
 	} {
 		resp := ch.HandleCommand(command, NewClientContext("", 0))
 		if strings.Contains(resp, "unknown_command") || !strings.Contains(resp, "distribution_required") {

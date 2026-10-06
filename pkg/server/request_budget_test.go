@@ -35,3 +35,27 @@ func TestRequestMemoryBudgetRejectsSingleOversizedReservation(t *testing.T) {
 		t.Fatal("expected oversized reservation to fail")
 	}
 }
+
+func TestInternalRequestBudgetIsIndependentFromClientBudget(t *testing.T) {
+	clientBudget, internalBudget := newBrokerRequestBudgets(2, 128, true)
+	if clientBudget.maxRequests != 1 || internalBudget.maxRequests != 1 || clientBudget.maxBytes != 64 || internalBudget.maxBytes != 64 {
+		t.Fatalf("unexpected budget split: client=(%d,%d) internal=(%d,%d)", clientBudget.maxRequests, clientBudget.maxBytes, internalBudget.maxRequests, internalBudget.maxBytes)
+	}
+	releaseClient, err := clientBudget.reserve(context.Background(), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseClient()
+	releaseInternal, err := internalBudget.reserve(context.Background(), 64)
+	if err != nil {
+		t.Fatalf("internal request blocked by exhausted client budget: %v", err)
+	}
+	releaseInternal()
+}
+
+func TestStandaloneRequestBudgetKeepsFullCapacity(t *testing.T) {
+	clientBudget, internalBudget := newBrokerRequestBudgets(2, 128, false)
+	if internalBudget != nil || clientBudget.maxRequests != 2 || clientBudget.maxBytes != 128 {
+		t.Fatalf("unexpected standalone budgets: client=(%d,%d) internal=%v", clientBudget.maxRequests, clientBudget.maxBytes, internalBudget)
+	}
+}

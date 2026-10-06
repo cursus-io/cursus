@@ -4,7 +4,7 @@
 
 | Persistent artifact | Current writer | Older reader support | Upgrade rule |
 |---|---:|---|---|
-| Application record | CDM4 (CRC32C) | CDM2 and CDM3 records remain readable | Upgrade every reader before a CDM4 writer appends; older binaries cannot read the new records. |
+| Application record | CDM5 (CRC32C and leader epoch) | CDM2, CDM3, and CDM4 records remain readable | Upgrade every reader before a CDM5 writer appends; older binaries cannot read the new records. |
 | Topic manifest | 3 | older manifests are rejected | Migrate and validate an offline copy before starting current brokers. |
 | Transaction journal | 3 plus checksummed cut manifest | version-1 and version-2 records remain readable | Preserve the journal and its manifest with all partition and offset data. Version 3 writes bounded deltas between full checkpoints. |
 | Event snapshot catalog | v2 (CRC32C) | legacy snapshot files remain readable beside v2 | Preserve both snapshot files until a clean bootstrap removes the legacy boundary. |
@@ -15,13 +15,14 @@ Mixed-version rolling upgrades across a format boundary are unsupported. A
 normal restart of the same compatible release is supported; a format-changing
 upgrade is a coordinated whole-cluster operation.
 
-CDM4 checksums cover every serialized authoritative field, including topic,
+CDM5 checksums cover every serialized authoritative field, including topic,
 partition, offset, producer and transaction metadata, event identity, and
-payload. Existing CDM2/CDM3 records are an explicit legacy read boundary and
-are not rewritten in place. New appends use CDM4, so a segment may contain
+payload. CDM5 also stores the partition leader epoch used for divergent-tail
+recovery. Existing CDM2/CDM3/CDM4 records are an explicit legacy read boundary
+and are not rewritten in place. New appends use CDM5, so a segment may contain
 legacy and checksummed records after an upgrade. Backup validation, startup
 recovery, ordinary reads, compaction, and replica transfer all use the same
-decoder and reject a CDM4 checksum mismatch. Treat a reported segment and
+decoder and reject a CDM5 checksum mismatch. Treat a reported segment and
 offset as unavailable; restore an immutable validated backup or repair it from
 a checksum-valid committed replica instead of editing bytes in place.
 

@@ -9,9 +9,9 @@ import (
 	"github.com/cursus-io/cursus/util"
 )
 
-// ReplicaReassignmentCommand expands one durable partition assignment. New
-// replicas deliberately remain outside ISR until the existing catch-up proof
-// protocol confirms that they hold the authoritative committed range.
+// ReplicaReassignmentCommand changes one durable partition assignment. Moving
+// a replica is a two-step operation: add one target, wait for ISR catch-up,
+// then remove the old replica.
 type ReplicaReassignmentCommand struct {
 	Topic            string   `json:"topic"`
 	Partition        int      `json:"partition"`
@@ -54,10 +54,10 @@ func (f *BrokerFSM) applyReplicaReassignmentCommand(jsonData string) interface{}
 	if command.Partition >= definition.Partitions {
 		return fmt.Errorf("partition %d outside topic %q partition count %d", command.Partition, command.Topic, definition.Partitions)
 	}
-	if len(command.TargetReplicas) != definition.ReplicationFactor {
+	if len(command.TargetReplicas) < definition.ReplicationFactor || len(command.TargetReplicas) > definition.ReplicationFactor+1 {
 		return fmt.Errorf(
-			"target replica count %d does not match topic %q replication factor %d",
-			len(command.TargetReplicas), command.Topic, definition.ReplicationFactor,
+			"target replica count %d must be replication factor %d or temporary catch-up size %d for topic %q",
+			len(command.TargetReplicas), definition.ReplicationFactor, definition.ReplicationFactor+1, command.Topic,
 		)
 	}
 	metadata := f.partitionMetadata[key]
@@ -103,9 +103,24 @@ func (f *BrokerFSM) applyReplicaReassignmentCommand(jsonData string) interface{}
 	if err := validateDistinctReplicaIDs(metadata.Replicas, "current"); err != nil {
 		return fmt.Errorf("partition %s: %w", key, err)
 	}
+	adding, removing := false, false
+	for _, replica := range command.TargetReplicas {
+		adding = adding || !containsReplica(metadata.Replicas, replica)
+	}
 	for _, replica := range metadata.Replicas {
-		if !containsReplica(command.TargetReplicas, replica) {
-			return fmt.Errorf("replica reassignment for %s cannot remove current replica %q", key, replica)
+		removing = removing || !containsReplica(command.TargetReplicas, replica)
+	}
+	if adding && removing {
+		return fmt.Errorf("replica reassignment for %s must add and remove in separate steps", key)
+	}
+	if removing {
+		if len(command.TargetReplicas) != definition.ReplicationFactor {
+			return fmt.Errorf("replica removal for %s must restore replication factor %d", key, definition.ReplicationFactor)
+		}
+		for _, replica := range command.TargetReplicas {
+			if !containsReplica(metadata.ISR, replica) {
+				return fmt.Errorf("target replica %q for %s has not joined ISR", replica, key)
+			}
 		}
 	}
 	for _, replica := range metadata.ISR {
@@ -116,9 +131,14 @@ func (f *BrokerFSM) applyReplicaReassignmentCommand(jsonData string) interface{}
 
 	updated := *metadata
 	updated.Replicas = append([]string(nil), command.TargetReplicas...)
-	updated.ISR = append([]string(nil), metadata.ISR...)
+	updated.ISR = make([]string, 0, len(command.TargetReplicas))
+	for _, replica := range command.TargetReplicas {
+		if containsReplica(metadata.ISR, replica) {
+			updated.ISR = append(updated.ISR, replica)
+		}
+	}
 	f.partitionMetadata[key] = &updated
-	util.Info("FSM: Expanded replicas for %s from %v to %v", key, metadata.Replicas, updated.Replicas)
+	util.Info("FSM: Reassigned replicas for %s from %v to %v", key, metadata.Replicas, updated.Replicas)
 	return nil
 }
 

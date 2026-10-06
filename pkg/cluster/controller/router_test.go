@@ -138,7 +138,7 @@ func TestSendDataRequestContextCancelsBlockedResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	received := make(chan struct{})
 	serverDone := make(chan struct{})
 	go func() {
@@ -147,7 +147,7 @@ func TestSendDataRequestContextCancelsBlockedResponse(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer raw.Close()
+		defer func() { _ = raw.Close() }()
 		_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
 		conn, err := wire.ServerHandshake(raw, []wire.Compression{wire.CompressionNone})
 		if err != nil {

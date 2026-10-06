@@ -149,7 +149,8 @@ var diskMsgBufPool = sync.Pool{
 }
 
 const (
-	diskMessageMagic               = "CDM4"
+	diskMessageMagic               = "CDM5"
+	checksumDiskMessageMagic       = "CDM4"
 	replayIdentityDiskMessageMagic = "CDM3"
 	legacyDiskMessageMagic         = "CDM2"
 )
@@ -161,7 +162,7 @@ var (
 
 // EstimateDiskMessageSize returns the serialized size of a DiskMessage without allocating.
 func EstimateDiskMessageSize(msg types.DiskMessage) int {
-	return len(diskMessageMagic) + 2 + len(msg.Topic) + 4 + 8 + 2 + len(msg.ProducerID) + 8 + 8 +
+	return len(diskMessageMagic) + 2 + len(msg.Topic) + 4 + 8 + 2 + len(msg.ProducerID) + 8 + 8 + 8 +
 		4 + len(msg.Payload) + 2 + len(msg.Key) +
 		2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata) + 2 + len(msg.TransactionalID) + 2 + len(msg.TransactionState) + 2 + len(msg.TransactionMarker) + 2 + len(msg.ControlBatchType) + 2 + 8 + 2 + len(msg.ControlBatchKey) + 2 + len(msg.ControlBatchValue) + 2 + len(msg.EventID) + 2 + len(msg.PayloadDigest) + 4
 }
@@ -232,6 +233,10 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("negative epoch: %d", msg.Epoch)
 	}
+	leaderEpochVal, ok := SafeInt64ToUint64(msg.LeaderEpoch)
+	if !ok {
+		return nil, fmt.Errorf("negative leader epoch: %d", msg.LeaderEpoch)
+	}
 
 	size := EstimateDiskMessageSize(msg)
 	bufp := diskMsgBufPool.Get().(*[]byte)
@@ -267,6 +272,10 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 
 	// Epoch (8 bytes)
 	binary.BigEndian.PutUint64(tmp[:8], epochVal)
+	buf = append(buf, tmp[:8]...)
+
+	// Leader epoch (8 bytes)
+	binary.BigEndian.PutUint64(tmp[:8], leaderEpochVal)
 	buf = append(buf, tmp[:8]...)
 
 	// Payload (length + string)
@@ -361,10 +370,10 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 		return msg, fmt.Errorf("unsupported disk message format: clean bootstrap required")
 	}
 	magic := string(data[:len(diskMessageMagic)])
-	if magic != diskMessageMagic && magic != replayIdentityDiskMessageMagic && magic != legacyDiskMessageMagic {
+	if magic != diskMessageMagic && magic != checksumDiskMessageMagic && magic != replayIdentityDiskMessageMagic && magic != legacyDiskMessageMagic {
 		return msg, fmt.Errorf("unsupported disk message format: clean bootstrap required")
 	}
-	if magic == diskMessageMagic {
+	if magic == diskMessageMagic || magic == checksumDiskMessageMagic {
 		if len(data) < len(diskMessageMagic)+4 {
 			return msg, fmt.Errorf("%w: truncated checksum", ErrDiskMessageChecksumMismatch)
 		}
@@ -440,6 +449,18 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	}
 	msg.Epoch = diskEpochVal
 	offset += 8
+	if magic == diskMessageMagic {
+		if offset+8 > len(data) {
+			return msg, errors.New("data too short for leader epoch")
+		}
+		leaderEpochRaw := binary.BigEndian.Uint64(data[offset : offset+8])
+		leaderEpochVal, ok := SafeUint64ToInt64(leaderEpochRaw)
+		if !ok {
+			return msg, fmt.Errorf("leader epoch value %d exceeds int64 max", leaderEpochRaw)
+		}
+		msg.LeaderEpoch = leaderEpochVal
+		offset += 8
+	}
 
 	// Payload
 	if offset+4 > len(data) {
@@ -513,7 +534,7 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	if err := readDiskBytes(data, &offset, &msg.ControlBatchValue, "control batch value"); err != nil {
 		return msg, err
 	}
-	if magic == diskMessageMagic || magic == replayIdentityDiskMessageMagic {
+	if magic == diskMessageMagic || magic == checksumDiskMessageMagic || magic == replayIdentityDiskMessageMagic {
 		if err := readDiskString(data, &offset, &msg.EventID, "event ID"); err != nil {
 			return msg, err
 		}

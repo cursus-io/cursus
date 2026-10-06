@@ -92,30 +92,50 @@ func TestReplicaReassignmentRejectsUnsafeOrStaleExpansion(t *testing.T) {
 	}
 }
 
-func TestReplicaReassignmentCannotRemoveExistingReplica(t *testing.T) {
+func TestReplicaReassignmentRemovesOnlyAfterReplacementJoinsISR(t *testing.T) {
 	state, command := legacyUnderfilledReplicaState(t)
-	metadata := state.GetPartitionMetadata("orders-0")
-	second := command.TargetReplicas[1]
-	metadata.Replicas = []string{command.Leader, second}
-	metadata.ISR = []string{command.Leader}
-	encoded, err := json.Marshal(metadata)
-	require.NoError(t, err)
-	require.Nil(t, state.Apply(&raft.Log{Index: 19, Data: []byte("PARTITION:orders-0:" + string(encoded))}))
-
-	command.ExpectedReplicas = []string{command.Leader, second}
-	command.TargetReplicas = []string{command.Leader}
-	for _, brokerID := range []string{"n1", "n2", "n3", "n4"} {
-		if brokerID != command.Leader && brokerID != second && len(command.TargetReplicas) < 3 {
-			command.TargetReplicas = append(command.TargetReplicas, brokerID)
-		}
-	}
 	payload, err := json.Marshal(command)
 	require.NoError(t, err)
-	result := state.Apply(&raft.Log{Index: 20, Data: append([]byte("REPLICA_REASSIGN:"), payload...)})
+	require.Nil(t, state.Apply(&raft.Log{Index: 20, Data: append([]byte("REPLICA_REASSIGN:"), payload...)}))
+
+	metadata := state.GetPartitionMetadata("orders-0")
+	expanded := append([]string(nil), metadata.Replicas...)
+	for _, brokerID := range []string{"n1", "n2", "n3", "n4"} {
+		if !containsReplica(expanded, brokerID) {
+			expanded = append(expanded, brokerID)
+			break
+		}
+	}
+	command.ExpectedReplicas = append([]string(nil), metadata.Replicas...)
+	command.TargetReplicas = expanded
+	payload, err = json.Marshal(command)
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Index: 21, Data: append([]byte("REPLICA_REASSIGN:"), payload...)}))
+
+	final := ReplicaReassignmentCommand{
+		Topic: command.Topic, Partition: command.Partition, LifecycleEpoch: command.LifecycleEpoch,
+		Leader: command.Leader, LeaderEpoch: command.LeaderEpoch,
+		ExpectedReplicas: expanded, TargetReplicas: append([]string(nil), expanded[1:]...),
+	}
+	if !containsReplica(final.TargetReplicas, command.Leader) {
+		final.TargetReplicas[0] = command.Leader
+	}
+	payload, err = json.Marshal(final)
+	require.NoError(t, err)
+	result := state.Apply(&raft.Log{Index: 22, Data: append([]byte("REPLICA_REASSIGN:"), payload...)})
 	resultErr, ok := result.(error)
 	require.True(t, ok)
-	require.ErrorContains(t, resultErr, "cannot remove current replica")
-	require.Equal(t, []string{command.Leader, second}, state.GetPartitionMetadata("orders-0").Replicas)
+	require.ErrorContains(t, resultErr, "has not joined ISR")
+
+	metadata = state.GetPartitionMetadata("orders-0")
+	metadata.ISR = append([]string(nil), expanded...)
+	encoded, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Index: 23, Data: []byte("PARTITION:orders-0:" + string(encoded))}))
+	require.Nil(t, state.Apply(&raft.Log{Index: 24, Data: append([]byte("REPLICA_REASSIGN:"), payload...)}))
+	metadata = state.GetPartitionMetadata("orders-0")
+	require.Equal(t, final.TargetReplicas, metadata.Replicas)
+	require.Equal(t, final.TargetReplicas, metadata.ISR)
 }
 
 func legacyUnderfilledReplicaState(t *testing.T) (*BrokerFSM, ReplicaReassignmentCommand) {

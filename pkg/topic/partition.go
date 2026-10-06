@@ -63,6 +63,10 @@ type Partition struct {
 	LEO                        atomic.Uint64
 	HWM                        uint64
 	hwmAuthoritative           bool
+	replicaVerifiedLeaderEpoch int
+	replicaVerifiedLifecycle   uint64
+	replicaVerifiedHWM         uint64
+	replicaVerified            bool
 	distributed                bool
 	mu                         sync.RWMutex
 	reconcileMu                sync.RWMutex
@@ -648,6 +652,7 @@ func (p *Partition) EnqueueBatchLeaderWithMode(msgs []types.Message, forceIdempo
 			ProducerID:                   msgs[i].ProducerID,
 			SeqNum:                       msgs[i].SeqNum,
 			Epoch:                        msgs[i].Epoch,
+			LeaderEpoch:                  msgs[i].LeaderEpoch,
 			Payload:                      msgs[i].Payload,
 			Key:                          msgs[i].Key,
 			EventType:                    msgs[i].EventType,
@@ -826,6 +831,7 @@ func diskMessageFromMessage(topic string, partition int32, msg types.Message) ty
 		ProducerID:                   msg.ProducerID,
 		SeqNum:                       msg.SeqNum,
 		Epoch:                        msg.Epoch,
+		LeaderEpoch:                  msg.LeaderEpoch,
 		Payload:                      msg.Payload,
 		Key:                          msg.Key,
 		EventType:                    msg.EventType,
@@ -846,7 +852,7 @@ func diskMessageFromMessage(topic string, partition int32, msg types.Message) ty
 }
 
 func sameReplicatedMessage(a, b types.Message) bool {
-	return a.Offset == b.Offset && a.ProducerID == b.ProducerID && a.SeqNum == b.SeqNum &&
+	return a.Offset == b.Offset && a.ProducerID == b.ProducerID && a.SeqNum == b.SeqNum && a.LeaderEpoch == b.LeaderEpoch &&
 		a.Payload == b.Payload && a.Key == b.Key && a.Epoch == b.Epoch &&
 		a.EventType == b.EventType && a.SchemaVersion == b.SchemaVersion &&
 		a.AggregateVersion == b.AggregateVersion && a.Metadata == b.Metadata &&
@@ -1563,6 +1569,26 @@ func (p *Partition) ApplyReplicaHWM(hwm uint64) error {
 		p.NotifyNewMessage()
 	}
 	return nil
+}
+
+// MarkReplicaCatchupVerified records the exact cluster boundary whose prefix
+// was checked against an in-sync replica. The tuple prevents a stale check
+// from admitting the replica after a leader, topic, or HWM change.
+func (p *Partition) MarkReplicaCatchupVerified(leaderEpoch int, lifecycleEpoch, hwm uint64) {
+	p.mu.Lock()
+	p.replicaVerifiedLeaderEpoch = leaderEpoch
+	p.replicaVerifiedLifecycle = lifecycleEpoch
+	p.replicaVerifiedHWM = hwm
+	p.replicaVerified = true
+	p.mu.Unlock()
+}
+
+func (p *Partition) ReplicaCatchupVerified(leaderEpoch int, lifecycleEpoch, hwm uint64) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.replicaVerified && p.replicaVerifiedLeaderEpoch == leaderEpoch &&
+		p.replicaVerifiedLifecycle == lifecycleEpoch &&
+		p.replicaVerifiedHWM == hwm
 }
 
 // ReconcileCommittedHWM prepares a replica for leadership using the durable cluster watermark.

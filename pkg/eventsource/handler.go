@@ -32,6 +32,7 @@ type Handler struct {
 
 type AppendOptions struct {
 	LeaderAppend bool
+	LeaderEpoch  int64
 	AfterAppend  func(topic string, partition int, msg types.Message) error
 	AfterCommit  func(topic string, partition int, hwm uint64) error
 }
@@ -487,6 +488,7 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 	var appendedMsg types.Message
 	ok, current, err := idx.CheckEnqueueAndAppend(key, expectedVersion, func() (uint64, error) {
 		if opts.LeaderAppend {
+			msg.LeaderEpoch = opts.LeaderEpoch
 			batch := []types.Message{msg}
 			if err := p.EnqueueBatchLeader(batch); err != nil {
 				return 0, err

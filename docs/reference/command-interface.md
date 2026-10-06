@@ -32,7 +32,7 @@ together.
 | Consumer groups | `REGISTER_GROUP`, `FIND_COORDINATOR`, `JOIN_GROUP`, `SYNC_GROUP`, `HEARTBEAT`, `LEAVE_GROUP`, `GROUP_STATUS`, `FETCH_OFFSET`, `COMMIT_OFFSET`, `BATCH_COMMIT` | Group coordinator except discovery |
 | Transactions | `INIT_PRODUCER_ID`, `BEGIN_TXN`, `TXN_PUBLISH`, `SEND_OFFSETS_TO_TXN`, `END_TXN`, `TXN_STATUS` | Transaction coordinator selected by `transactional_id` |
 | Event sourcing | `APPEND_STREAM`, `READ_STREAM`, `READ_STREAM_HISTORY`, `STREAM_VERSION`, `SAVE_SNAPSHOT`, `READ_SNAPSHOT` | Aggregate partition leader |
-| Cluster admin | `METADATA`, `CLUSTER_STATUS`, `ELECT_LEADER` | Any broker or current metadata leader as documented |
+| Cluster admin | `METADATA`, `CLUSTER_STATUS`, `ELECT_LEADER`, `REASSIGN_PARTITION` | Any broker or current metadata leader as documented |
 
 ## Routing Rules
 

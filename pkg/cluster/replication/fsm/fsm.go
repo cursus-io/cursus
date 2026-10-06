@@ -24,7 +24,8 @@ const (
 	DistributedCompactionProtocolVersion = 2
 	OffsetReservationsProtocolVersion    = 3
 	ReplicaReassignmentProtocolVersion   = 4
-	BrokerProtocolVersionCurrent         = ReplicaReassignmentProtocolVersion
+	LeaderEpochRecoveryProtocolVersion   = 5
+	BrokerProtocolVersionCurrent         = LeaderEpochRecoveryProtocolVersion
 )
 
 type ReplicationEntry struct {

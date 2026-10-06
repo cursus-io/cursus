@@ -30,7 +30,7 @@ jobs:
       - name: Run GoSec
         uses: securego/gosec@v2.29.0
         with:
-          args: '-no-fail -exclude-dir=api/gen -fmt sarif -out gosec-results.sarif ./...'
+          args: '-exclude-dir=api/gen -fmt sarif -out gosec-results.sarif ./...'
 
       - name: Upload SARIF
         uses: github/codeql-action/upload-sarif@v4.37.9

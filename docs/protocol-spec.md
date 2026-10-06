@@ -150,7 +150,7 @@ Topic names are a portable on-disk identifier: 1-249 ASCII bytes containing only
 
 A missing topic is built from broker defaults and the supplied fields. For an existing topic, `CREATE` is a presence-aware patch: omitted fields retain their authoritative value, while explicit `0`, `false`, and empty `read_acl=`/`write_acl=` values are applied. Partition count can only increase. `replication_factor`, `idempotent`, and `event_sourcing` may be restated with the current value but cannot be changed. A no-op keeps the current `revision`; every effective definition change increments it.
 
-A successful standalone `CREATE` means the revisioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. Broker restart restores the optional `min_in_sync_replicas` override; omission uses the broker `min_insync_replicas` fallback. Manifest format 3 carries lifecycle epochs after truncate. Distributed state uses only Raft snapshot version 9 and requires every partition to carry `committed_hwm_version=1`, an explicit numeric `committed_hwm` (including zero), leader epoch, ISR, and lifecycle epoch.
+A successful standalone `CREATE` means the revisioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. Broker restart restores the optional `min_in_sync_replicas` override; omission uses the broker `min_insync_replicas` fallback. Manifest format 3 carries lifecycle epochs after truncate. Distributed state writes Raft snapshot version 10 and requires every partition to carry `committed_hwm_version=1`, an explicit numeric `committed_hwm` (including zero), leader epoch, ISR, and lifecycle epoch.
 
 **ALTER_TOPIC_CONFIG**
 ```
@@ -339,6 +339,13 @@ Response: `OK topic=<name> partition=<N> previous_leader=<broker-id> leader=<bro
 The target must be an active broker in both the replica set and ISR. The Raft FSM compares the expected current leader epoch before changing leaders, increments the epoch exactly once, and preserves the committed HWM and replica membership. A retry against the already selected leader is idempotent. `ELECT_LEADER` is not a partition reassignment or broker-drain command and never promotes an out-of-sync replica.
 
 Missing targets return `ERROR: missing_broker command=ELECT_LEADER`; rejected state changes return `ERROR: leader_election_rejected ...`; an unavailable apply result returns `ERROR: leader_election_result_unavailable ...` and may be retried because election is idempotent.
+
+**REASSIGN_PARTITION**
+```
+REASSIGN_PARTITION topic=<name> partition=<N> replicas=<broker-a,broker-b,...>
+```
+
+The command changes the replica set through the Raft metadata log. Expansion may contain one more replica than the topic replication factor. Removal requires every target replica to be in ISR, must retain the current leader, and must return the set to the configured replication factor. Operators move a replica by adding the destination, waiting for catch-up and ISR admission, and then removing the source.
 
 #### Consumer Group Coordination
 
@@ -568,7 +575,7 @@ missing, an entry is malformed, or the same partition appears more than once.
 
 Cursus exposes a broker-managed transaction coordinator for consume-process-produce workflows. In distributed mode, each `transactional_id` maps to a stable logical coordinator shard. `transaction_coordinator_shards` selects the count when a cluster is first created and defaults to 50. Raft metadata persists the immutable count plus each shard's owner and coordinator epoch; a broker with a different configured count is rejected before joining. Clients can discover the current owner with `FIND_COORDINATOR transactional_id=<id>` and must retry on `ERROR: NOT_COORDINATOR host=<host> port=<port>`.
 
-Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Snapshot version 9 requires explicit committed-HWM provenance for every partition. On restore, local data above the authoritative committed HWM is truncated before service, while an HWM above local LEO or missing provenance fails startup rather than guessing.
+Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Snapshot version 10 requires explicit committed-HWM provenance for every partition. On restore, local data above the authoritative committed HWM is truncated before service, while an HWM above local LEO or missing provenance fails startup rather than guessing.
 
 `INIT_PRODUCER_ID` selects the exactly-once processing path by default. The broker returns the authoritative `(producerId, epoch)` session and bumps `epoch` on re-initialization to fence older producers. Open transactions receive a deadline from `transaction_timeout_ms` (default 60000); the broker durably prepares and writes abort markers after timeout. After `transactional_id_expiration_ms`, completed transactions discard operation payloads but retain a compact epoch tombstone. Previously persisted legacy transactions remain readable and recoverable.
 
@@ -981,7 +988,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - Broker tracks the last seen `(epoch, seqNum)` per `(producerId)` per partition
 - Disk-backed partitions persist producer sequence checkpoints, rebuild producer state from partition logs on broker restart, and use that state to make transactional commit recovery idempotent
 - Distributed FSM snapshots also include producer sequence state for replicated message commands
-- Distributed recovery writes and accepts only FSM snapshot version 9. Every partition includes explicit committed-HWM provenance; older persistent state requires a full clean bootstrap.
+- Distributed recovery writes FSM snapshot version 10 and accepts version 9 only for its supported one-way transition. Every partition includes explicit committed-HWM provenance; older persistent state requires a full clean bootstrap.
 - Producer state expires from memory after `producer_state_ttl_ms` of inactivity (default 30 minutes); durable checkpoints retain the last persisted sequence until the partition data is removed
 
 ---

@@ -39,22 +39,18 @@ Standalone response:
 {"status":"ready","checks":{"consumer_metadata":"ok","storage":"ok","topic_metadata":"ok"}}
 ```
 
-In distributed mode, readiness also requires a resolvable cluster leader and a
-serviceable durable topology. Every partition must have the replica assignment
-declared by its topic definition, an active leader, and enough active ISR
-members to satisfy its effective `min.insync.replicas`. A broker remains ready
-when one replica is offline or catching up but the minimum ISR is still met;
-`CLUSTER_STATUS`, `cursus_cluster_under_replicated_partitions`, and the
-replication alerts continue to report that degraded state. A broker process can
-remain live while returning `503` during an election, below-minimum ISR, or an
-incomplete legacy assignment repair.
+In distributed mode, readiness also requires a resolvable cluster leader and
+successful node-local topic, replica, and transaction-state materialization.
+Cluster-wide partition health does not gate a broker's readiness because one
+bad partition would otherwise make every pod unready at once. `CLUSTER_STATUS`,
+the topology metrics, and replication alerts report under-replication,
+incomplete assignments, inactive replicas, and minimum-ISR failures.
 
 ```json
 {
   "status": "not_ready",
   "checks": {
     "cluster_leader": "no cluster leader available",
-    "cluster_topology": "cluster topology unhealthy: offline=0 under_replicated=1 assignment_deficient=1 inactive_replica_partitions=0 min_isr_unsatisfied=1",
     "storage": "ok"
   }
 }
@@ -166,9 +162,9 @@ In diagnostics-only mode, `/ready` includes the retained `consumer_metadata` fai
 | `cursus_storage_filesystem_free_bytes` | Gauge / bytes | Space currently available on the filesystem containing `log_dir` |
 | `cursus_storage_filesystem_total_bytes` | Gauge / bytes | Total capacity of the filesystem containing `log_dir` |
 | `cursus_storage_filesystem_headroom_ready` | Gauge / boolean | `1` while the configured byte and percentage free-space reserve permits new writes |
-| `cursus_broker_requests_inflight` | Gauge / requests | Decoded requests queued or processed across both broker listeners |
+| `cursus_broker_requests_inflight` | Gauge / requests | Decoded requests queued or processed across the client and internal admission pools |
 | `cursus_broker_request_bytes_inflight` | Gauge / bytes | Reserved encoded and decoded request payload memory |
-| `cursus_broker_request_admission_waiters` | Gauge / connections | Connections blocked before payload allocation by the global request budget |
+| `cursus_broker_request_admission_waiters` | Gauge / connections | Connections blocked before payload allocation by their listener's request budget |
 | `cursus_broker_request_admission_rejections_total{reason}` | Counter / requests | Admission failures caused by `bytes` or connection `context` cancellation |
 
 In standalone mode the local coordinator is authoritative. In distributed

@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -154,5 +155,70 @@ func TestWriteBatchSyncFailureMakesHandlerTerminal(t *testing.T) {
 	handler.syncFileFn = nil
 	if err := handler.WriteBatchSync(batch); err == nil || !strings.Contains(err.Error(), "unavailable until restart") {
 		t.Fatalf("durable batch retry = %v, want terminal unavailable error", err)
+	}
+}
+
+func TestRotationSyncFailureMakesHandlerTerminal(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.SegmentSize = 256
+	cfg.DiskFlushIntervalMS = 60_000
+
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		handler.syncFileFn = nil
+		_ = handler.Close()
+	})
+	first := []types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 0, Payload: strings.Repeat("a", 192)}}
+	if err := handler.WriteBatch(first); err != nil {
+		t.Fatal(err)
+	}
+	handler.syncFileFn = func(*os.File) error { return errors.New("injected rotation fsync failure") }
+	second := []types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 1, Payload: strings.Repeat("b", 192)}}
+	if err := handler.WriteBatch(second); err == nil || !strings.Contains(err.Error(), "unavailable until restart") {
+		t.Fatalf("rotation sync error = %v, want terminal unavailable error", err)
+	}
+}
+
+func TestAsyncHeadroomFailureDoesNotLeaveDurableOffsetGap(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushBatchSize = 1
+	cfg.DiskFlushIntervalMS = 60_000
+
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.headroom = &diskHeadroomGuard{
+		path: cfg.LogDir, minFreeBytes: 100, checkedAt: time.Now(), free: 100, total: 100,
+	}
+	if offset, err := handler.AppendMessage("orders", 0, &types.Message{Payload: "rejected"}); err != nil || offset != 0 {
+		t.Fatalf("async append = (%d, %v), want accepted offset 0", offset, err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for handler.writeAvailabilityError() == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if err := handler.writeAvailabilityError(); err == nil || !strings.Contains(err.Error(), "insufficient filesystem headroom") {
+		t.Fatalf("async flush error = %v, want terminal headroom error", err)
+	}
+	if _, err := handler.AppendMessage("orders", 0, &types.Message{Payload: "must-not-pass-gap"}); err == nil {
+		t.Fatal("append after asynchronous write failure succeeded")
+	}
+	if err := handler.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewDiskHandler(cfg, "orders", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = restarted.Close() }()
+	if offset := restarted.GetAbsoluteOffset(); offset != 0 {
+		t.Fatalf("recovered offset = %d, want 0", offset)
 	}
 }

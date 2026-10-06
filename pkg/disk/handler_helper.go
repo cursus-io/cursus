@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 )
 
 func (dh *DiskHandler) GetFirstOffset() uint64 {
@@ -16,10 +17,7 @@ func (dh *DiskHandler) GetFirstOffset() uint64 {
 	return dh.segments[0]
 }
 func (dh *DiskHandler) GetLatestOffset() uint64 {
-	dh.mu.Lock()
-	defer dh.mu.Unlock()
-
-	return dh.AbsoluteOffset
+	return atomic.LoadUint64(&dh.AbsoluteOffset)
 }
 
 // GetIndexFile returns the current index file

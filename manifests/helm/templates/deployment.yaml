@@ -9,6 +9,12 @@
 {{- fail "tls.keyPath must be /app/tls/key.pem because the TLS Secret is mounted at /app/tls" }}
 {{- end }}
 {{- end }}
+{{- if and (not .Values.clientSecurity.allowInsecure) (not .Values.tls.enabled) }}
+{{- fail "tls.enabled must be true unless clientSecurity.allowInsecure=true" }}
+{{- end }}
+{{- if and (not .Values.clientSecurity.allowInsecure) (not .Values.clientSecurity.sasl.secretName) }}
+{{- fail "clientSecurity.sasl.secretName is required unless clientSecurity.allowInsecure=true" }}
+{{- end }}
 apiVersion: apps/v1  
 kind: Deployment  
 metadata:  
@@ -39,6 +45,10 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}  
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"  
           imagePullPolicy: {{ .Values.image.pullPolicy }}  
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
           ports:  
             - name: broker  
               containerPort: {{ .Values.service.port }}  
@@ -54,6 +64,10 @@ spec:
               value: {{ .Values.persistence.config.path }}  
             - name: BROKER_PORT  
               value: "{{ .Values.service.port }}"  
+            - name: BROKER_BIND_ADDRESS
+              value: "0.0.0.0"
+            - name: ALLOW_INSECURE_CLIENT_TRANSPORT
+              value: {{ .Values.clientSecurity.allowInsecure | quote }}
             - name: HEALTH_CHECK_PORT  
               value: "{{ .Values.service.healthPort }}"  
             - name: EXPORTER_PORT  
@@ -92,6 +106,15 @@ spec:
             - name: TLS_KEY_PATH  
               value: {{ .Values.tls.keyPath }}  
             {{- end }}  
+            - name: ENABLE_SASL
+              value: {{ ternary "true" "false" (not (empty .Values.clientSecurity.sasl.secretName)) | quote }}
+            {{- if .Values.clientSecurity.sasl.secretName }}
+            - name: SASL_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.clientSecurity.sasl.secretName }}
+                  key: {{ .Values.clientSecurity.sasl.secretKey }}
+            {{- end }}
           startupProbe:
             httpGet:
               path: /live

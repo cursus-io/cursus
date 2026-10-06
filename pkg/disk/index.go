@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"sync/atomic"
 
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -284,10 +285,10 @@ func (dh *DiskHandler) findSegmentForOffset(offset uint64) (string, uint64, erro
 		earliest = dh.segments[0]
 	}
 	if offset < earliest {
-		return "", 0, &types.OffsetOutOfRangeError{Requested: offset, Earliest: earliest, Latest: dh.AbsoluteOffset}
+		return "", 0, &types.OffsetOutOfRangeError{Requested: offset, Earliest: earliest, Latest: atomic.LoadUint64(&dh.AbsoluteOffset)}
 	}
-	if offset > dh.AbsoluteOffset {
-		return "", 0, &types.OffsetOutOfRangeError{Requested: offset, Earliest: earliest, Latest: dh.AbsoluteOffset}
+	if latest := atomic.LoadUint64(&dh.AbsoluteOffset); offset > latest {
+		return "", 0, &types.OffsetOutOfRangeError{Requested: offset, Earliest: earliest, Latest: latest}
 	}
 
 	if offset >= dh.CurrentSegment {
@@ -312,13 +313,16 @@ func (dh *DiskHandler) findSegmentForOffset(offset uint64) (string, uint64, erro
 }
 
 func (d *DiskHandler) findOffsetPosition(offset uint64, segmentBase ...uint64) (uint64, error) {
+	d.mu.Lock()
 	base := d.CurrentSegment
 	if len(segmentBase) > 0 {
 		base = segmentBase[0]
 	}
 	if base != d.CurrentSegment {
+		d.mu.Unlock()
 		return d.findOffsetPositionInIndex(offset, base)
 	}
+	defer d.mu.Unlock()
 
 	d.indexMu.RLock()
 	defer d.indexMu.RUnlock()

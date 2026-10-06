@@ -326,6 +326,9 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		}
 
 		markLeaderOffsetsUnassigned(messageData.Messages)
+		for i := range messageData.Messages {
+			messageData.Messages[i].LeaderEpoch = int64(replicationSnapshot.LeaderEpoch)
+		}
 		// Duplicate producer sequences remain unassigned and must not be
 		// replicated or committed again.
 		if err := p.EnqueueBatchLeaderWithMode(messageData.Messages, effectiveIdempotent); err != nil {
@@ -548,6 +551,9 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 		return "ERROR: empty_messages command=REPLICATE_MESSAGE"
 	}
 	for i := range msgCmd.Messages {
+		if int(msgCmd.Messages[i].LeaderEpoch) != msgCmd.LeaderEpoch {
+			return fmt.Sprintf("ERROR: STALE_LEADER_EPOCH current=%d record=%d", msgCmd.LeaderEpoch, msgCmd.Messages[i].LeaderEpoch)
+		}
 		if t.PolicySnapshot().AggregateReplay {
 			message := msgCmd.Messages[i]
 			if message.Key == "" || message.AggregateVersion == 0 || message.EventID == "" || message.ProducerID == "" || message.SeqNum == 0 || message.PayloadDigest != aggregate.Digest(message.Payload) {
@@ -734,6 +740,9 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		}()
 
 		markLeaderOffsetsUnassigned(batch.Messages)
+		for i := range batch.Messages {
+			batch.Messages[i].LeaderEpoch = int64(replicationSnapshot.LeaderEpoch)
+		}
 		// Duplicate producer sequences remain unassigned and are acknowledged
 		// without another replication round.
 		if err := p.EnqueueBatchLeaderWithMode(batch.Messages, effectiveIdempotent); err != nil {

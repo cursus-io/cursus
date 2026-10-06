@@ -55,7 +55,7 @@ func (r *requestReader) Read(p []byte) (int, error) {
 		if !r.activity.active && r.activity.last.Add(r.idleTimeout).Before(deadline) {
 			deadline = r.activity.last.Add(r.idleTimeout)
 		}
-		err := r.Conn.SetReadDeadline(deadline)
+		err := r.SetReadDeadline(deadline)
 		r.activity.mu.Unlock()
 		if err != nil {
 			return 0, err

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
@@ -18,18 +19,20 @@ const MaxReplicaCatchupRecords = 1024
 // ReplicaCatchupRequest asks a current in-sync replica for a bounded raw
 // committed-log range. SourceAddress is local routing metadata and is not sent.
 type ReplicaCatchupRequest struct {
-	Topic           string `json:"topic"`
-	Partition       int    `json:"partition"`
-	BrokerID        string `json:"broker_id"`
-	NextOffset      uint64 `json:"next_offset"`
-	CommittedHWM    uint64 `json:"committed_hwm"`
-	Leader          string `json:"leader"`
-	SourceBroker    string `json:"source_broker,omitempty"`
-	LeaderEpoch     int    `json:"leader_epoch"`
-	LifecycleEpoch  uint64 `json:"lifecycle_epoch"`
-	MaxRecords      int    `json:"max_records"`
-	SourceAddress   string `json:"-"`
-	SnapshotCatchup bool   `json:"-"`
+	Topic                string `json:"topic"`
+	Partition            int    `json:"partition"`
+	BrokerID             string `json:"broker_id"`
+	NextOffset           uint64 `json:"next_offset"`
+	CommittedHWM         uint64 `json:"committed_hwm"`
+	Leader               string `json:"leader"`
+	SourceBroker         string `json:"source_broker,omitempty"`
+	LeaderEpoch          int    `json:"leader_epoch"`
+	LifecycleEpoch       uint64 `json:"lifecycle_epoch"`
+	MaxRecords           int    `json:"max_records"`
+	PreviousLeaderEpoch  int64  `json:"previous_leader_epoch,omitempty"`
+	PreviousRecordDigest string `json:"previous_record_digest,omitempty"`
+	SourceAddress        string `json:"-"`
+	SnapshotCatchup      bool   `json:"-"`
 }
 
 // ReplicaCatchupBatch carries a committed logical range under the same
@@ -47,6 +50,8 @@ type ReplicaCatchupBatch struct {
 	LeaderEpoch    int             `json:"leader_epoch"`
 	LifecycleEpoch uint64          `json:"lifecycle_epoch"`
 	Compacted      bool            `json:"compacted,omitempty"`
+	Verified       bool            `json:"verified,omitempty"`
+	TruncateTo     *uint64         `json:"truncate_to,omitempty"`
 	Messages       []types.Message `json:"messages"`
 	Digest         string          `json:"digest"`
 }
@@ -246,6 +251,9 @@ func (f *BrokerFSM) BuildISRCatchupProofs(brokerID string) []ISRCatchupProof {
 		if leo != partitionMetadata.CommittedHWM || hwm != partitionMetadata.CommittedHWM {
 			continue
 		}
+		if !partition.ReplicaCatchupVerified(partitionMetadata.LeaderEpoch, partitionMetadata.LifecycleEpoch, partitionMetadata.CommittedHWM) {
+			continue
+		}
 		proofs = append(proofs, ISRCatchupProof{
 			Topic: topicName, Partition: partitionID, BrokerID: brokerID,
 			CommittedHWM: partitionMetadata.CommittedHWM, LocalLEO: leo, LocalHWM: hwm,
@@ -259,6 +267,37 @@ func (f *BrokerFSM) BuildISRCatchupProofs(brokerID string) []ISRCatchupProof {
 		return proofs[i].Partition < proofs[j].Partition
 	})
 	return proofs
+}
+
+// MarkReplicaCatchupVerified records a completed, leader-fenced prefix check.
+// A later ISR proof must still match the current metadata tuple.
+func (f *BrokerFSM) MarkReplicaCatchupVerified(request ReplicaCatchupRequest) error {
+	key := request.Topic + "-" + strconv.Itoa(request.Partition)
+	f.mu.RLock()
+	meta := f.partitionMetadata[key]
+	topicManager := f.tm
+	if meta == nil || meta.Leader != request.Leader || meta.LeaderEpoch != request.LeaderEpoch ||
+		meta.LifecycleEpoch != request.LifecycleEpoch || meta.CommittedHWM != request.CommittedHWM {
+		f.mu.RUnlock()
+		return fmt.Errorf("replica catch-up fence changed for %s", key)
+	}
+	f.mu.RUnlock()
+	if topicManager == nil {
+		return fmt.Errorf("topic manager is not available")
+	}
+	localTopic := topicManager.GetTopic(request.Topic)
+	if localTopic == nil || localTopic.Definition().LifecycleEpoch != request.LifecycleEpoch {
+		return fmt.Errorf("local topic lifecycle changed for %s", key)
+	}
+	partition, err := localTopic.GetPartition(request.Partition)
+	if err != nil {
+		return err
+	}
+	if partition.NextOffset() != request.CommittedHWM || partition.GetHWM() != request.CommittedHWM {
+		return fmt.Errorf("replica catch-up boundary changed for %s", key)
+	}
+	partition.MarkReplicaCatchupVerified(request.LeaderEpoch, request.LifecycleEpoch, request.CommittedHWM)
+	return nil
 }
 
 // BuildReplicaCatchupRequests returns one bounded-range request for each local
@@ -324,24 +363,30 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 					partition.FlushDisk()
 				}
 			}
-			if leo == meta.CommittedHWM && localTopic.IsEventSourcing && !containsString(meta.ISR, brokerID) {
-				requests = append(requests, ReplicaCatchupRequest{
+			if leo == meta.CommittedHWM && !containsString(meta.ISR, brokerID) {
+				request := ReplicaCatchupRequest{
 					Topic: topicName, Partition: partitionID, BrokerID: brokerID,
 					NextOffset: leo, CommittedHWM: meta.CommittedHWM,
 					Leader: meta.Leader, SourceBroker: source.ID,
 					LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch,
-					MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr, SnapshotCatchup: true,
-				})
+					MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr, SnapshotCatchup: localTopic.IsEventSourcing,
+				}
+				if err := addPreviousReplicaRecord(partition, &request); err == nil {
+					requests = append(requests, request)
+				}
 			}
 			continue
 		}
-		requests = append(requests, ReplicaCatchupRequest{
+		request := ReplicaCatchupRequest{
 			Topic: topicName, Partition: partitionID, BrokerID: brokerID,
 			NextOffset: leo, CommittedHWM: meta.CommittedHWM,
 			Leader: meta.Leader, SourceBroker: source.ID,
 			LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch,
 			MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr, SnapshotCatchup: localTopic.IsEventSourcing,
-		})
+		}
+		if err := addPreviousReplicaRecord(partition, &request); err == nil {
+			requests = append(requests, request)
+		}
 	}
 	sort.Slice(requests, func(i, j int) bool {
 		if requests[i].Topic != requests[j].Topic {
@@ -350,6 +395,28 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 		return requests[i].Partition < requests[j].Partition
 	})
 	return requests
+}
+
+func addPreviousReplicaRecord(partition *topic.Partition, request *ReplicaCatchupRequest) error {
+	if request.NextOffset == 0 || request.NextOffset <= partition.FirstOffset() {
+		return nil
+	}
+	messages, err := partition.ReadMessages(request.NextOffset-1, 1)
+	if err != nil || len(messages) != 1 || messages[0].Offset != request.NextOffset-1 {
+		return fmt.Errorf("read previous replica record at %d", request.NextOffset-1)
+	}
+	request.PreviousLeaderEpoch = messages[0].LeaderEpoch
+	request.PreviousRecordDigest, err = replicaRecordDigest(messages[0])
+	return err
+}
+
+func replicaRecordDigest(message types.Message) (string, error) {
+	data, err := json.Marshal(message)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func selectReplicaCatchupSource(meta PartitionMetadata, localBrokerID string, brokers map[string]BrokerInfo) (BrokerInfo, bool) {
@@ -420,6 +487,29 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 	if request.NextOffset > current.CommittedHWM {
 		return ReplicaCatchupBatch{}, fmt.Errorf("catch-up offset %d exceeds committed HWM %d", request.NextOffset, current.CommittedHWM)
 	}
+	if request.PreviousRecordDigest != "" {
+		previous, err := f.ReadCommittedLogRange(request.Topic, request.Partition, request.NextOffset-1, request.NextOffset, 1)
+		if err != nil || len(previous) != 1 || previous[0].Offset != request.NextOffset-1 {
+			return ReplicaCatchupBatch{}, fmt.Errorf("read source record before catch-up offset %d: %v", request.NextOffset, err)
+		}
+		digest, err := replicaRecordDigest(previous[0])
+		if err != nil {
+			return ReplicaCatchupBatch{}, err
+		}
+		if digest != request.PreviousRecordDigest {
+			truncateTo, err := f.replicaLeaderEpochEndOffset(request.Topic, request.Partition, request.PreviousLeaderEpoch, request.NextOffset)
+			if err != nil {
+				return ReplicaCatchupBatch{}, fmt.Errorf("find replica divergence boundary: %w", err)
+			}
+			return SealReplicaCatchupBatch(ReplicaCatchupBatch{
+				Topic: request.Topic, Partition: request.Partition, BrokerID: request.BrokerID,
+				StartOffset: request.NextOffset, EndOffset: request.NextOffset, CommittedHWM: current.CommittedHWM,
+				Leader: current.Leader, SourceBroker: sourceBroker,
+				LeaderEpoch: current.LeaderEpoch, LifecycleEpoch: current.LifecycleEpoch,
+				TruncateTo: &truncateTo,
+			})
+		}
+	}
 	messages, err := f.ReadCommittedLogRange(request.Topic, request.Partition, request.NextOffset, current.CommittedHWM, request.MaxRecords)
 	if err != nil {
 		return ReplicaCatchupBatch{}, err
@@ -460,8 +550,51 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 		StartOffset: request.NextOffset, EndOffset: endOffset, CommittedHWM: current.CommittedHWM,
 		Leader: current.Leader, SourceBroker: sourceBroker,
 		LeaderEpoch: current.LeaderEpoch, LifecycleEpoch: current.LifecycleEpoch,
-		Compacted: compacted, Messages: messages,
+		Compacted: compacted, Verified: endOffset == current.CommittedHWM, Messages: messages,
 	})
+}
+
+func (f *BrokerFSM) replicaLeaderEpochEndOffset(topicName string, partitionID int, leaderEpoch int64, before uint64) (uint64, error) {
+	if leaderEpoch <= 0 {
+		return 0, fmt.Errorf("legacy record has no leader epoch; clean bootstrap required")
+	}
+	f.mu.RLock()
+	topicManager := f.tm
+	f.mu.RUnlock()
+	if topicManager == nil {
+		return 0, fmt.Errorf("topic manager is not available")
+	}
+	localTopic := topicManager.GetTopic(topicName)
+	if localTopic == nil {
+		return 0, fmt.Errorf("topic %s is not materialized", topicName)
+	}
+	partition, err := localTopic.GetPartition(partitionID)
+	if err != nil {
+		return 0, err
+	}
+	offset := partition.FirstOffset()
+	for offset < before {
+		messages, err := partition.ReadMessages(offset, MaxReplicaCatchupRecords)
+		if err != nil {
+			return 0, err
+		}
+		if len(messages) == 0 {
+			return 0, fmt.Errorf("leader epoch scan stopped at offset %d", offset)
+		}
+		for _, message := range messages {
+			if message.Offset >= before {
+				break
+			}
+			if message.LeaderEpoch == 0 {
+				return 0, fmt.Errorf("record %d has no leader epoch; clean bootstrap required", message.Offset)
+			}
+			if message.LeaderEpoch > leaderEpoch {
+				return message.Offset, nil
+			}
+			offset = message.Offset + 1
+		}
+	}
+	return 0, fmt.Errorf("source has no epoch boundary after follower epoch %d", leaderEpoch)
 }
 
 // ReadCommittedLogRange returns raw log records for replica catch-up. Unlike a

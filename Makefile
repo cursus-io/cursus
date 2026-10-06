@@ -4,8 +4,11 @@ STORAGE_NAME := cursus-storage
 
 GO := go
 GOLINT := golangci-lint
+GOLINT_VERSION := v2.14.0
 TEST_FLAGS := -v -race
-BUILD_FLAGS := -ldflags="-s -w"
+VERSION := $(shell cat VERSION)
+REVISION := $(shell git rev-parse --verify HEAD 2>/dev/null)
+BUILD_FLAGS := -ldflags="-s -w -X github.com/cursus-io/cursus/pkg/buildinfo.Version=$(VERSION) -X github.com/cursus-io/cursus/pkg/buildinfo.Revision=$(REVISION)"
 
 E2E_COMPOSE_FILE := test/e2e/docker-compose.yml
 COMPOSE_PROJECT := e2e
@@ -33,7 +36,7 @@ test:
 .PHONY: e2e
 e2e: e2e-build e2e-up
 	@echo "Running E2E tests..."
-	$(call run_e2e_test,$(GO) test -v -timeout 10m ./test/e2e/...)
+	$(call run_e2e_test,$(GO) test -v -race -timeout 10m ./test/e2e/...)
 
 .PHONY: e2e-verbose
 e2e-verbose: e2e-build e2e-up
@@ -202,7 +205,7 @@ cli:
 .PHONY: tools
 tools:
 	@echo "Installing/updating tools..."
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLINT_VERSION)
   
 .PHONY: fmt  
 fmt:  
