@@ -5,7 +5,7 @@ services:
       context: ..
       dockerfile: Dockerfile
     ports:
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"
     environment:
       - CURSUS_BROKER_PORT=9000
       - BROKER_BIND_ADDRESS=0.0.0.0

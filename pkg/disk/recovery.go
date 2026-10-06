@@ -17,8 +17,9 @@ type segmentRecovery struct {
 	modTime    int64
 }
 
-// recoverActiveSegment validates the active log tail. A malformed final record
-// is treated as a torn write; malformed records before the tail fail startup.
+// recoverActiveSegment validates the active log tail. A record that is shorter
+// than its declared length is treated as a torn write. Fully present malformed
+// records fail startup so checksum corruption cannot silently delete data.
 func recoverActiveSegment(logPath string, baseOffset uint64) (segmentRecovery, error) {
 	info, err := os.Stat(logPath)
 	if err != nil {
@@ -96,9 +97,6 @@ func scanSegmentTail(logPath string, startPosition, expectedOffset uint64) (uint
 		}
 		message, err := util.DeserializeDiskMessage(data)
 		if err != nil {
-			if recordEnd == logSize {
-				return position, nextOffset, true, nil
-			}
 			return 0, 0, false, fmt.Errorf("decode record at byte %d: %w", position, err)
 		}
 		if message.Offset != nextOffset {

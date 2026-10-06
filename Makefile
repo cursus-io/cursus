@@ -7,7 +7,7 @@ GOLINT := golangci-lint
 GOLINT_VERSION := v2.14.0
 TEST_FLAGS := -v -race
 VERSION := $(shell cat VERSION)
-REVISION := $(shell git rev-parse --verify HEAD 2>/dev/null)
+REVISION := $(shell git rev-parse --verify HEAD 2>/dev/null || echo unknown)
 BUILD_FLAGS := -ldflags="-s -w -X github.com/cursus-io/cursus/pkg/buildinfo.Version=$(VERSION) -X github.com/cursus-io/cursus/pkg/buildinfo.Revision=$(REVISION)"
 
 E2E_COMPOSE_FILE := test/e2e/docker-compose.yml

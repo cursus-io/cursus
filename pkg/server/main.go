@@ -60,8 +60,8 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		return fmt.Errorf("server context must not be nil")
 	}
 	shutdownCtx := ctx
-	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	defer cancel()
+	drainCtx, cancelDrain := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelDrain()
 
 	var cc *clusterController.ClusterController
 	var rm *replication.RaftReplicationManager
@@ -379,7 +379,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 					continue
 				default:
 				}
-				handleConnWithBudgetAndDrain(ctx, conn, globalCH, controller.NewClientContext("default-group", 0), requestBudget, drainConnections)
+				handleConnWithBudgetAndDrain(drainCtx, conn, globalCH, controller.NewClientContext("default-group", 0), requestBudget, drainConnections)
 			}
 		}()
 	}
@@ -388,7 +388,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		close(drainConnections)
 		close(workerCh)
 		workerWG.Wait()
-		cancel()
+		cancelDrain()
 	}()
 	startupComplete.Store(true)
 
@@ -404,8 +404,6 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			select {
 			case <-shutdownCtx.Done():
 				return shutdownCtx.Err()
-			case <-ctx.Done():
-				return ctx.Err()
 			default:
 			}
 			if errors.Is(err, net.ErrClosed) {
@@ -431,10 +429,6 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		case <-shutdownCtx.Done():
 			_ = conn.Close()
 			return shutdownCtx.Err()
-		case <-ctx.Done():
-			_ = conn.Close()
-			connectionSlots.Release()
-			return ctx.Err()
 		}
 	}
 }
@@ -450,7 +444,7 @@ func startObservationGRPC(ctx context.Context, cfg *config.Config) (func(), erro
 		return nil, fmt.Errorf("observation gRPC principal and auth token must be configured together")
 	}
 	backend, err := sdk.NewAdminClient(&sdk.AdminConfig{
-		BrokerAddrs: []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.BrokerPort))},
+		BrokerAddrs: []string{net.JoinHostPort(observationBackendHost(cfg.BrokerBindAddress), strconv.Itoa(cfg.BrokerPort))},
 		UseTLS:      cfg.UseTLS, TLSCertPath: cfg.TLSCertPath, TLSKeyPath: cfg.TLSKeyPath,
 		Principal: cfg.ObservationGRPCPrincipal, AuthToken: cfg.ObservationGRPCAuthToken,
 	})
@@ -462,6 +456,21 @@ func startObservationGRPC(ctx context.Context, cfg *config.Config) (func(), erro
 		return nil, err
 	}
 	return shutdown, nil
+}
+
+func observationBackendHost(bindAddress string) string {
+	host := strings.TrimSpace(bindAddress)
+	if host == "" {
+		return "127.0.0.1"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsUnspecified() {
+		return host
+	}
+	if ip.To4() != nil {
+		return "127.0.0.1"
+	}
+	return "::1"
 }
 
 func awaitDistributedConsumerMetadataRecovery(ctx context.Context, cd *coordinator.Coordinator, tm *topic.TopicManager) error {

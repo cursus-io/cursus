@@ -307,6 +307,25 @@ func TestStartObservationGRPCValidatesCredentialsAndLifecycle(t *testing.T) {
 	t.Fatal("observation listener remained open after shutdown")
 }
 
+func TestObservationBackendHostFollowsBrokerBindAddress(t *testing.T) {
+	tests := map[string]string{
+		"":          "127.0.0.1",
+		"0.0.0.0":   "127.0.0.1",
+		"::":        "::1",
+		"127.0.0.1": "127.0.0.1",
+		"::1":       "::1",
+		"10.0.0.8":  "10.0.0.8",
+		"localhost": "localhost",
+	}
+	for bindAddress, want := range tests {
+		t.Run(bindAddress, func(t *testing.T) {
+			if got := observationBackendHost(bindAddress); got != want {
+				t.Fatalf("observation backend host for %q = %q, want %q", bindAddress, got, want)
+			}
+		})
+	}
+}
+
 func unusedTCPPort(t *testing.T) int {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
