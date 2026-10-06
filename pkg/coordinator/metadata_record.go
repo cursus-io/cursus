@@ -854,33 +854,41 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 		status.CorruptRecords++
 		return status, err
 	}
-	versionedOffsetGroups := make(map[string]struct{}, len(candidates.offsetSnapshots))
+	authoritativeEpochs := make(map[string]uint64, len(candidates.lifecycles)+len(candidates.offsetSnapshots))
+	for groupName, candidate := range candidates.lifecycles {
+		authoritativeEpochs[groupName] = candidate.record.Epoch
+	}
 	for _, candidate := range candidates.offsetSnapshots {
-		versionedOffsetGroups[candidate.record.Group] = struct{}{}
+		if candidate.record.Epoch > authoritativeEpochs[candidate.record.Group] {
+			authoritativeEpochs[candidate.record.Group] = candidate.record.Epoch
+		}
 	}
 	c.mu.Lock()
 	// Pre-v4 distributed brokers stored registrations and committed offsets in
 	// Raft but did not write a lifecycle record to __consumer_offsets. Replay
 	// of an empty (or legacy-only) offsets topic must not erase that restored
-	// state. A versioned registration/tombstone or an explicitly selected
-	// migration is authoritative and bypasses this compatibility path.
+	// state. A same-or-newer versioned registration/tombstone or an explicitly
+	// selected migration is authoritative and bypasses this compatibility path.
 	if !c.migrationAuthoritative {
-		for groupName, recovered := range groups {
+		for groupName, offsetsByTopic := range legacy {
+			if authoritativeEpochs[groupName] != 0 {
+				continue
+			}
 			existing := c.groups[groupName]
-			if existing == nil || recovered == nil || recovered.RegistrationEpoch != 0 {
-				continue
-			}
-			if _, hasLifecycle := candidates.lifecycles[groupName]; hasLifecycle {
-				continue
-			}
-			if _, hasVersionedOffset := versionedOffsetGroups[groupName]; hasVersionedOffset {
-				continue
-			}
-			if _, fenced := groupEpochs[groupName]; fenced {
+			if existing == nil {
+				if len(offsetsByTopic) != 1 {
+					c.mu.Unlock()
+					status.CorruptRecords++
+					return status, fmt.Errorf("legacy group %q has offsets for %d topics and no durable registration", groupName, len(offsetsByTopic))
+				}
 				continue
 			}
 			existing.mu.RLock()
-			for topicName, offsets := range recovered.Offsets {
+			if authoritativeEpochs[groupName] >= existing.RegistrationEpoch {
+				existing.mu.RUnlock()
+				continue
+			}
+			for topicName, offsets := range offsetsByTopic {
 				if !groupAcceptsTopic(existing, topicName) {
 					existing.mu.RUnlock()
 					c.mu.Unlock()
@@ -901,24 +909,17 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 			if existing == nil {
 				continue
 			}
-			if _, hasLifecycle := candidates.lifecycles[groupName]; hasLifecycle {
+			existing.mu.RLock()
+			epoch := existing.RegistrationEpoch
+			existing.mu.RUnlock()
+			if epoch == 0 || authoritativeEpochs[groupName] >= epoch {
 				continue
 			}
-			if _, hasVersionedOffset := versionedOffsetGroups[groupName]; hasVersionedOffset {
-				continue
-			}
-			if _, fenced := groupEpochs[groupName]; fenced {
-				continue
-			}
-			recovered := groups[groupName]
-			if recovered != nil {
-				// A legacy offset-only shell has no registration epoch. Keep the
-				// Raft registration and advance only offsets for its topic.
-				if recovered.RegistrationEpoch != 0 {
-					continue
-				}
+			if authoritativeEpochs[groupName] == 0 {
+				// Legacy offsets have no registration epoch. Keep the Raft
+				// registration and advance only offsets for its topics.
 				existing.mu.Lock()
-				for topicName, offsets := range recovered.Offsets {
+				for topicName, offsets := range legacy[groupName] {
 					if existing.Offsets == nil {
 						existing.Offsets = make(map[string]map[int]uint64)
 					}
@@ -933,12 +934,6 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 				}
 				existing.mu.Unlock()
 			}
-			existing.mu.RLock()
-			epoch := existing.RegistrationEpoch
-			existing.mu.RUnlock()
-			if epoch == 0 {
-				continue
-			}
 			groups[groupName] = existing
 			groupEpochs[groupName] = epoch
 		}
@@ -950,6 +945,9 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 	for groupName, existing := range c.groups {
 		recovered := groups[groupName]
 		if recovered == nil || existing == nil {
+			continue
+		}
+		if recovered == existing {
 			continue
 		}
 		existing.mu.RLock()
@@ -974,6 +972,25 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 				}
 				recovered.Offsets[topicName] = clonePartitionOffsets(existing.Offsets[topicName])
 				recovered.OffsetRevisions[topicName] = revision
+			}
+			for topicName, offsets := range existing.Offsets {
+				if !groupAcceptsTopic(recovered, topicName) {
+					existing.mu.RUnlock()
+					c.mu.Unlock()
+					status.CorruptRecords++
+					return status, fmt.Errorf("restored Raft offset topic %q conflicts with replayed group %q", topicName, groupName)
+				}
+				if recovered.Offsets == nil {
+					recovered.Offsets = make(map[string]map[int]uint64)
+				}
+				if recovered.Offsets[topicName] == nil {
+					recovered.Offsets[topicName] = make(map[int]uint64)
+				}
+				for partition, offset := range offsets {
+					if offset > recovered.Offsets[topicName][partition] {
+						recovered.Offsets[topicName][partition] = offset
+					}
+				}
 			}
 		}
 		if snapshot, ok := candidates.lifecycleSnapshots[groupName]; !ok || snapshot.record.Epoch != recovered.RegistrationEpoch {
@@ -1124,7 +1141,10 @@ func materializeConsumerMetadata(
 		}
 		sort.Strings(topics)
 		if len(topics) != 1 {
-			return nil, nil, orphans, fmt.Errorf("legacy group %q has offsets for %d topics and no durable registration", groupName, len(topics))
+			// A pre-v4 multi-topic registration may exist only in the Raft
+			// snapshot. Reconcile these offsets with that registration after
+			// replay instead of inventing an ambiguous offset-only shell.
+			continue
 		}
 		topicName := topics[0]
 		partitionCount := 0

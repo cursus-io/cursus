@@ -111,7 +111,7 @@ func TestDistributedRecoveryPreservesRaftOnlyGroupAndOffset(t *testing.T) {
 	t.Cleanup(coordinator.Stop)
 	require.NoError(t, coordinator.ImportState(map[string]*GroupStateSnapshot{
 		"workers": {
-			TopicName: "orders", Partitions: []int{0}, Members: map[string][]int{},
+			TopicName: "orders", Partitions: []int{0}, Members: map[string][]int{"member-a": {0}}, Generation: 1,
 			Offsets:           map[string]map[int]uint64{"orders": {0: 11}},
 			RegistrationEpoch: 2, LastActivity: time.Unix(1, 0).UTC(),
 		},
@@ -121,8 +121,88 @@ func TestDistributedRecoveryPreservesRaftOnlyGroupAndOffset(t *testing.T) {
 	require.Equal(t, []string{"workers"}, coordinator.ListGroups())
 	require.Equal(t, uint64(11), mustOffset(t, coordinator, "workers", "orders", 0))
 	require.Equal(t, uint64(2), coordinator.GetRegistrationEpoch("workers"))
+	require.Equal(t, 1, coordinator.GetGeneration("workers"))
+	require.Equal(t, []int{0}, coordinator.GetMemberAssignments("workers", "member-a"))
 	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
 	require.Equal(t, uint64(11), mustOffset(t, coordinator, "workers", "orders", 0))
+	require.Equal(t, []int{0}, coordinator.GetMemberAssignments("workers", "member-a"))
+}
+
+func TestDistributedRecoveryDoesNotReplaceNewerRaftGroupWithStaleOffsetSnapshot(t *testing.T) {
+	stale := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordOffsetSnapshot,
+		Group: "workers", Topic: "orders", Epoch: 1, Revision: 1,
+		Offsets: []OffsetItem{{Partition: 0, Offset: 4}}, Timestamp: time.Unix(1, 0).UTC(),
+	}
+	handler := &metadataReplayHandler{messages: map[int][]types.Message{0: {encodedMetadataMessage(t, stale, 0)}}}
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	coordinator, err := NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, handler)
+	require.NoError(t, err)
+	t.Cleanup(coordinator.Stop)
+	require.NoError(t, coordinator.ImportState(map[string]*GroupStateSnapshot{
+		"workers": {
+			TopicName: "orders", Partitions: []int{0}, Members: map[string][]int{"member-a": {0}}, Generation: 1,
+			Offsets:           map[string]map[int]uint64{"orders": {0: 11}},
+			RegistrationEpoch: 2, LastActivity: time.Unix(2, 0).UTC(),
+		},
+	}))
+
+	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.Equal(t, uint64(2), coordinator.GetRegistrationEpoch("workers"))
+	require.Equal(t, uint64(11), mustOffset(t, coordinator, "workers", "orders", 0))
+	require.Equal(t, []int{0}, coordinator.GetMemberAssignments("workers", "member-a"))
+}
+
+func TestDistributedRecoveryMergesMultiTopicLegacyOffsetsWithRaftRegistration(t *testing.T) {
+	messages := make([]types.Message, 0, 2)
+	for index, item := range []struct {
+		topic  string
+		offset uint64
+	}{{"orders", 13}, {"returns", 7}} {
+		payload, err := json.Marshal(OffsetCommitMessage{
+			Group: "workers", Topic: item.topic, Partition: 0, Offset: item.offset, Timestamp: time.Unix(2, 0).UTC(),
+		})
+		require.NoError(t, err)
+		messages = append(messages, types.Message{Offset: uint64(index), Payload: string(payload)})
+	}
+	handler := &metadataReplayHandler{messages: map[int][]types.Message{0: messages}}
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	coordinator, err := NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, handler)
+	require.NoError(t, err)
+	t.Cleanup(coordinator.Stop)
+	require.NoError(t, coordinator.ImportState(map[string]*GroupStateSnapshot{
+		"workers": {
+			TopicName:         subscriptionDisplayName([]string{"orders", "returns"}, ""),
+			Topics:            []string{"orders", "returns"},
+			TopicPartitions:   []TopicPartition{{Topic: "orders", Partition: 0}, {Topic: "returns", Partition: 0}},
+			Members:           map[string][]int{},
+			Offsets:           map[string]map[int]uint64{"orders": {0: 11}, "returns": {0: 9}},
+			RegistrationEpoch: 2, LastActivity: time.Unix(1, 0).UTC(),
+		},
+	}))
+
+	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.Equal(t, uint64(2), coordinator.GetRegistrationEpoch("workers"))
+	require.Equal(t, uint64(13), mustOffset(t, coordinator, "workers", "orders", 0))
+	require.Equal(t, uint64(9), mustOffset(t, coordinator, "workers", "returns", 0))
+}
+
+func TestDistributedRecoveryRejectsMultiTopicLegacyOffsetsWithoutRegistration(t *testing.T) {
+	messages := make([]types.Message, 0, 2)
+	for index, topic := range []string{"orders", "returns"} {
+		payload, err := json.Marshal(OffsetCommitMessage{
+			Group: "workers", Topic: topic, Partition: 0, Offset: 1, Timestamp: time.Unix(1, 0).UTC(),
+		})
+		require.NoError(t, err)
+		messages = append(messages, types.Message{Offset: uint64(index), Payload: string(payload)})
+	}
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	coordinator, err := NewCoordinatorWithRecovery(context.Background(), cfg, &metadataReplayHandler{messages: map[int][]types.Message{0: messages}})
+	require.ErrorContains(t, err, "no durable registration")
+	require.False(t, coordinator.RecoverySnapshot().Ready)
 }
 
 func TestDistributedRecoveryMergesLegacyOffsetWithoutLosingRaftRegistration(t *testing.T) {
