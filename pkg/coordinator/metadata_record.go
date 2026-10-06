@@ -854,7 +854,95 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 		status.CorruptRecords++
 		return status, err
 	}
+	versionedOffsetGroups := make(map[string]struct{}, len(candidates.offsetSnapshots))
+	for _, candidate := range candidates.offsetSnapshots {
+		versionedOffsetGroups[candidate.record.Group] = struct{}{}
+	}
 	c.mu.Lock()
+	// Pre-v4 distributed brokers stored registrations and committed offsets in
+	// Raft but did not write a lifecycle record to __consumer_offsets. Replay
+	// of an empty (or legacy-only) offsets topic must not erase that restored
+	// state. A versioned registration/tombstone or an explicitly selected
+	// migration is authoritative and bypasses this compatibility path.
+	if !c.migrationAuthoritative {
+		for groupName, recovered := range groups {
+			existing := c.groups[groupName]
+			if existing == nil || recovered == nil || recovered.RegistrationEpoch != 0 {
+				continue
+			}
+			if _, hasLifecycle := candidates.lifecycles[groupName]; hasLifecycle {
+				continue
+			}
+			if _, hasVersionedOffset := versionedOffsetGroups[groupName]; hasVersionedOffset {
+				continue
+			}
+			if _, fenced := groupEpochs[groupName]; fenced {
+				continue
+			}
+			existing.mu.RLock()
+			for topicName, offsets := range recovered.Offsets {
+				if !groupAcceptsTopic(existing, topicName) {
+					existing.mu.RUnlock()
+					c.mu.Unlock()
+					return status, fmt.Errorf("legacy offset topic %q conflicts with restored Raft group %q", topicName, groupName)
+				}
+				partitionCount := groupTopicPartitionCount(existing, topicName)
+				for partition := range offsets {
+					if partition < 0 || partition >= partitionCount {
+						existing.mu.RUnlock()
+						c.mu.Unlock()
+						return status, fmt.Errorf("legacy offset partition %d conflicts with restored Raft group %q", partition, groupName)
+					}
+				}
+			}
+			existing.mu.RUnlock()
+		}
+		for groupName, existing := range c.groups {
+			if existing == nil {
+				continue
+			}
+			if _, hasLifecycle := candidates.lifecycles[groupName]; hasLifecycle {
+				continue
+			}
+			if _, hasVersionedOffset := versionedOffsetGroups[groupName]; hasVersionedOffset {
+				continue
+			}
+			if _, fenced := groupEpochs[groupName]; fenced {
+				continue
+			}
+			recovered := groups[groupName]
+			if recovered != nil {
+				// A legacy offset-only shell has no registration epoch. Keep the
+				// Raft registration and advance only offsets for its topic.
+				if recovered.RegistrationEpoch != 0 {
+					continue
+				}
+				existing.mu.Lock()
+				for topicName, offsets := range recovered.Offsets {
+					if existing.Offsets == nil {
+						existing.Offsets = make(map[string]map[int]uint64)
+					}
+					if existing.Offsets[topicName] == nil {
+						existing.Offsets[topicName] = make(map[int]uint64)
+					}
+					for partition, offset := range offsets {
+						if offset > existing.Offsets[topicName][partition] {
+							existing.Offsets[topicName][partition] = offset
+						}
+					}
+				}
+				existing.mu.Unlock()
+			}
+			existing.mu.RLock()
+			epoch := existing.RegistrationEpoch
+			existing.mu.RUnlock()
+			if epoch == 0 {
+				continue
+			}
+			groups[groupName] = existing
+			groupEpochs[groupName] = epoch
+		}
+	}
 	// origin/main placed membership in GROUP_SYNC. Its offsets records have no
 	// v4 lifecycle snapshot, so retain that restored FSM membership while
 	// replacing only the committed-offset view. Once a v4 snapshot exists it

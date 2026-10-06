@@ -103,6 +103,88 @@ func TestDistributedRecoveryPreservesLegacyBestEffortReplay(t *testing.T) {
 	require.Equal(t, uint64(9), offset)
 }
 
+func TestDistributedRecoveryPreservesRaftOnlyGroupAndOffset(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	coordinator, err := NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, &metadataReplayHandler{})
+	require.NoError(t, err)
+	t.Cleanup(coordinator.Stop)
+	require.NoError(t, coordinator.ImportState(map[string]*GroupStateSnapshot{
+		"workers": {
+			TopicName: "orders", Partitions: []int{0}, Members: map[string][]int{},
+			Offsets:           map[string]map[int]uint64{"orders": {0: 11}},
+			RegistrationEpoch: 2, LastActivity: time.Unix(1, 0).UTC(),
+		},
+	}))
+
+	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.Equal(t, []string{"workers"}, coordinator.ListGroups())
+	require.Equal(t, uint64(11), mustOffset(t, coordinator, "workers", "orders", 0))
+	require.Equal(t, uint64(2), coordinator.GetRegistrationEpoch("workers"))
+	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.Equal(t, uint64(11), mustOffset(t, coordinator, "workers", "orders", 0))
+}
+
+func TestDistributedRecoveryMergesLegacyOffsetWithoutLosingRaftRegistration(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		legacyOffset uint64
+		wantOffset   uint64
+	}{
+		{name: "newer legacy offset", legacyOffset: 13, wantOffset: 13},
+		{name: "older legacy offset", legacyOffset: 9, wantOffset: 11},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			legacy, err := json.Marshal(OffsetCommitMessage{
+				Group: "workers", Topic: "orders", Partition: 0, Offset: test.legacyOffset, Timestamp: time.Unix(2, 0).UTC(),
+			})
+			require.NoError(t, err)
+			handler := &metadataReplayHandler{messages: map[int][]types.Message{0: {{Offset: 0, Payload: string(legacy)}}}}
+			cfg := config.DefaultConfig()
+			cfg.EnabledDistribution = true
+			coordinator, err := NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, handler)
+			require.NoError(t, err)
+			t.Cleanup(coordinator.Stop)
+			require.NoError(t, coordinator.ImportState(map[string]*GroupStateSnapshot{
+				"workers": {
+					TopicName: "orders", Partitions: []int{0}, Members: map[string][]int{},
+					Offsets:           map[string]map[int]uint64{"orders": {0: 11}},
+					RegistrationEpoch: 2, LastActivity: time.Unix(1, 0).UTC(),
+				},
+			}))
+
+			require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+			require.Equal(t, test.wantOffset, mustOffset(t, coordinator, "workers", "orders", 0))
+			require.Equal(t, uint64(2), coordinator.GetRegistrationEpoch("workers"))
+		})
+	}
+}
+
+func TestDistributedRecoveryDoesNotResurrectRaftGroupAfterTombstone(t *testing.T) {
+	tombstone := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordTombstone,
+		Group: "workers", Epoch: 3, Timestamp: time.Unix(2, 0).UTC(),
+	}
+	handler := &metadataReplayHandler{messages: map[int][]types.Message{0: {encodedMetadataMessage(t, tombstone, 0)}}}
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	coordinator, err := NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, handler)
+	require.NoError(t, err)
+	t.Cleanup(coordinator.Stop)
+	require.NoError(t, coordinator.ImportState(map[string]*GroupStateSnapshot{
+		"workers": {
+			TopicName: "orders", Partitions: []int{0}, Members: map[string][]int{},
+			Offsets:           map[string]map[int]uint64{"orders": {0: 11}},
+			RegistrationEpoch: 2, LastActivity: time.Unix(1, 0).UTC(),
+		},
+	}))
+
+	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.Nil(t, coordinator.GetGroup("workers"))
+	require.Equal(t, uint64(3), coordinator.ExportState()["workers"].RegistrationEpoch)
+	require.True(t, coordinator.ExportState()["workers"].Deleted)
+}
+
 func TestDistributedRecoverySkipsMismatchedKeysAndNegativeLegacyPartitions(t *testing.T) {
 	record := ConsumerMetadataRecord{
 		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
