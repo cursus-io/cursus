@@ -1,3 +1,7 @@
+# Development-only plaintext example. Docker Engine 28.3.3 or newer is
+# required so loopback-published ports remain host-local across firewall
+# reloads. Use TLS and SASL instead of ALLOW_INSECURE_CLIENT_TRANSPORT for any
+# shared or production environment.
 services:
   broker:
     image: cursus-broker:latest
@@ -5,8 +9,10 @@ services:
       context: ..
       dockerfile: Dockerfile
     ports:
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"
     environment:
       - CURSUS_BROKER_PORT=9000
+      - BROKER_BIND_ADDRESS=0.0.0.0
+      - ALLOW_INSECURE_CLIENT_TRANSPORT=true
     volumes:
       - ./data:/data

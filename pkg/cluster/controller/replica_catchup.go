@@ -70,7 +70,7 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 	if cc.Config != nil {
 		discoveryPort = cc.Config.DiscoveryPort
 	}
-	for request.NextOffset < request.CommittedHWM {
+	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -86,11 +86,19 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		if err := apply(ctx, batch); err != nil {
 			return err
 		}
-		nextOffset := batch.EndOffset
-		if nextOffset == 0 && len(batch.Messages) > 0 {
-			nextOffset = batch.Messages[len(batch.Messages)-1].Offset + 1
+		if batch.TruncateTo != nil {
+			return nil
 		}
-		request.NextOffset = nextOffset
+		if err := fsm.AdvanceReplicaCatchupRequest(&request, batch); err != nil {
+			return err
+		}
+		nextOffset := request.NextOffset
+		if nextOffset == request.CommittedHWM {
+			if !batch.Verified {
+				return fmt.Errorf("replica catch-up completed without prefix verification")
+			}
+			break
+		}
 	}
 	if request.SnapshotCatchup {
 		if cc.snapshotCatchup == nil {
@@ -100,7 +108,7 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 			return fmt.Errorf("event snapshot catch-up: %w", err)
 		}
 	}
-	return nil
+	return cc.RaftManager.GetFSM().MarkReplicaCatchupVerified(request)
 }
 
 func validateReplicaCatchupBatch(request fsm.ReplicaCatchupRequest, batch fsm.ReplicaCatchupBatch) error {
@@ -116,6 +124,18 @@ func validateReplicaCatchupBatch(request fsm.ReplicaCatchupRequest, batch fsm.Re
 	}
 	if batch.CommittedHWM != request.CommittedHWM || batch.StartOffset != request.NextOffset {
 		return fmt.Errorf("replica catch-up response boundary mismatch")
+	}
+	if batch.TruncateTo != nil {
+		if len(batch.Messages) != 0 || batch.Verified || *batch.TruncateTo >= batch.StartOffset || batch.EndOffset != batch.StartOffset {
+			return fmt.Errorf("invalid replica catch-up truncation boundary")
+		}
+		return nil
+	}
+	if batch.Verified && batch.StartOffset == request.CommittedHWM {
+		if len(batch.Messages) != 0 || batch.EndOffset != batch.StartOffset {
+			return fmt.Errorf("invalid replica catch-up verification batch")
+		}
+		return nil
 	}
 	if len(batch.Messages) > request.MaxRecords || (!batch.Compacted && len(batch.Messages) == 0) {
 		return fmt.Errorf("invalid replica catch-up batch size %d", len(batch.Messages))

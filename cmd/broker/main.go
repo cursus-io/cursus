@@ -23,6 +23,10 @@ var runTopicMetadataDiagnostics = server.RunTopicMetadataDiagnostics
 var runConsumerMetadataDiagnostics = server.RunConsumerMetadataDiagnostics
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--version" {
+		fmt.Printf("cursus %s (%s)\n", buildinfo.Version, buildinfo.Revision)
+		return
+	}
 	if len(os.Args) == 2 && os.Args[1] == "--verify-deployment-contract" {
 		if err := buildinfo.VerifyDeploymentContract(); err != nil {
 			util.Fatal("deployment contract verification failed: %v", err)
@@ -43,14 +47,14 @@ func main() {
 		util.Info("Configuration:\n%s", string(data))
 	}
 
-	fmt.Print(`
+	fmt.Printf(`
                          _______  ______________  _______
                         / ___/ / / / ___/ ___/ / / / ___/
                        / /__/ /_/ / /  (__  ) /_/ (__  )
                        \___/\__,_/_/  /____/\__,_/____/
 
-                                            version.0.1.0
-`)
+											version.%s
+`, buildinfo.Version)
 
 	util.Info("🚀 Starting broker on port %d\n", cfg.BrokerPort)
 	util.Info("📊 Exporter: %v\n", cfg.EnableExporter)

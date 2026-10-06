@@ -96,7 +96,7 @@ func (c *serverWireConn) writeMessage(payload []byte) error {
 	if c.request.Command == wire.CommandStream || deadline.IsZero() || !deadline.After(now) {
 		deadline = now.Add(c.writeTimeout)
 	}
-	if err := c.Conn.SetWriteDeadline(deadline); err != nil {
+	if err := c.SetWriteDeadline(deadline); err != nil {
 		return c.failWrite("set response write deadline", err)
 	}
 	err := c.connection.WriteFrame(wire.Frame{
@@ -105,7 +105,7 @@ func (c *serverWireConn) writeMessage(payload []byte) error {
 	if err != nil {
 		return c.failWrite("write response frame", err)
 	}
-	if err := c.Conn.SetWriteDeadline(time.Time{}); err != nil {
+	if err := c.SetWriteDeadline(time.Time{}); err != nil {
 		return c.failWrite("clear response write deadline", err)
 	}
 	return nil
@@ -118,7 +118,7 @@ func (c *serverWireConn) failWrite(operation string, err error) error {
 		reason = "timeout"
 	}
 	metrics.ClientResponseWriteFailures.WithLabelValues(reason).Inc()
-	_ = c.Conn.Close()
+	_ = c.Close()
 	return fmt.Errorf("%s: %w", operation, err)
 }
 

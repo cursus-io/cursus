@@ -173,10 +173,15 @@ func (cfg *Config) Normalize() {
 	if cfg.MaxClientConnections <= 0 {
 		cfg.MaxClientConnections = 1000
 	}
-	if cfg.MaxInflightRequests <= 0 {
+	if cfg.MaxInflightRequests < 2 {
 		cfg.MaxInflightRequests = 256
 	}
 	minimumInflightBytes := int64(2 * util.MaxMessageSize)
+	if cfg.EnabledDistribution && cfg.InternalBrokerPort > 0 {
+		// Client and internal traffic have independent halves so unauthenticated
+		// client traffic cannot consume the replication reserve.
+		minimumInflightBytes *= 2
+	}
 	if cfg.MaxInflightRequestBytes < minimumInflightBytes {
 		cfg.MaxInflightRequestBytes = 256 * 1024 * 1024
 	}

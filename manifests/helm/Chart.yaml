@@ -1,7 +1,7 @@
-apiVersion: v2  
+apiVersion: v2
 name: cursus
 description: lightweight message broker 
-type: application  
-version: 0.1.0  
-appVersion: "0.1.0"
+type: application
+version: 0.2.0
+appVersion: "0.2.0"
 icon: https://raw.githubusercontent.com/cursus-io/cursus/main/.github/cursus.png

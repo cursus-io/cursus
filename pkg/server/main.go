@@ -59,8 +59,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	if ctx == nil {
 		return fmt.Errorf("server context must not be nil")
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	shutdownCtx := ctx
+	drainCtx, cancelDrain := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelDrain()
 
 	var cc *clusterController.ClusterController
 	var rm *replication.RaftReplicationManager
@@ -94,6 +95,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			_ = discoveryListener.Close()
 		}
 		if rm != nil {
+			if transferErr := rm.TransferLeadership(); transferErr != nil {
+				util.Warn("raft leadership transfer failed during shutdown: %v", transferErr)
+			}
 			if shutdownErr := rm.Shutdown(); shutdownErr != nil {
 				util.Error("raft shutdown failed: %v", shutdownErr)
 			}
@@ -233,7 +237,11 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		util.Info("🌐 Distributed clustering enabled (brokerID=%s, localAddr=%s)", brokerID, localAddr)
 	}
 	globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
-	requestBudget := newRequestMemoryBudget(cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes)
+	requestBudget, internalRequestBudget := newBrokerRequestBudgets(
+		cfg.MaxInflightRequests,
+		cfg.MaxInflightRequestBytes,
+		cfg.EnabledDistribution && cfg.InternalBrokerPort > 0,
+	)
 	defer func() {
 		if err := globalCH.Close(); err != nil {
 			util.Error("Failed to close command handler: %v", err)
@@ -262,7 +270,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		// broker registration to the Raft leader. Consumer-offset topology
 		// bootstrap waits for those registrations, so this listener must be
 		// available before consumer metadata recovery begins.
-		shutdownInternal, err := startInternalBrokerListener(ctx, cfg, globalCH, requestBudget)
+		shutdownInternal, err := startInternalBrokerListener(ctx, cfg, globalCH, internalRequestBudget)
 		if err != nil {
 			return err
 		}
@@ -292,7 +300,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	}
 	globalCH.StartTransactionTimeoutMonitor(ctx)
 
-	addr := fmt.Sprintf(":%d", cfg.BrokerPort)
+	addr := net.JoinHostPort(cfg.BrokerBindAddress, strconv.Itoa(cfg.BrokerPort))
 	var ln net.Listener
 	var err error
 	if cfg.UseTLS {
@@ -308,7 +316,11 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		return err
 	}
 	defer func() { _ = ln.Close() }()
-	go closeListenerOnDone(ctx, ln)
+	go func() {
+		<-shutdownCtx.Done()
+		healthState.SetReady(false)
+		_ = ln.Close()
+	}()
 	util.Info("🧩 Broker listening on %s (TLS=%v, Compression=%v)", addr, cfg.UseTLS, cfg.CompressionType)
 
 	if cfg.EnabledDistribution {
@@ -318,12 +330,6 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			}
 			_, leaderErr := cc.GetClusterLeader()
 			return leaderErr
-		})
-		healthState.AddCheck("cluster_topology", func(context.Context) error {
-			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
-				return clusterTopologyReadinessError(nil, cfg.MinInSyncReplicas)
-			}
-			return clusterTopologyReadinessError(cc.RaftManager.GetFSM(), cfg.MinInSyncReplicas)
 		})
 		healthState.AddCheck("topic_materialization", func(context.Context) error {
 			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
@@ -359,6 +365,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 
 	workerCount := maxClientConnections(cfg)
 	workerCh := make(chan net.Conn, workerCount)
+	drainConnections := make(chan struct{})
 	connectionSlots := newConnectionLimiter(workerCount)
 	var workerWG sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
@@ -366,30 +373,37 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		go func() {
 			defer workerWG.Done()
 			for conn := range workerCh {
-				handleConn(ctx, conn, globalCH, requestBudget)
+				select {
+				case <-drainConnections:
+					_ = conn.Close()
+					continue
+				default:
+				}
+				handleConnWithBudgetAndDrain(drainCtx, conn, globalCH, controller.NewClientContext("default-group", 0), requestBudget, drainConnections)
 			}
 		}()
 	}
 	defer func() {
 		healthState.SetReady(false)
-		cancel()
+		close(drainConnections)
 		close(workerCh)
 		workerWG.Wait()
+		cancelDrain()
 	}()
 	startupComplete.Store(true)
 
 	var temporaryDelay time.Duration
 	for {
 		healthState.SetReady(true)
-		if err := connectionSlots.Acquire(ctx); err != nil {
+		if err := connectionSlots.Acquire(shutdownCtx); err != nil {
 			return err
 		}
 		conn, err := ln.Accept()
 		if err != nil {
 			connectionSlots.Release()
 			select {
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-shutdownCtx.Done():
+				return shutdownCtx.Err()
 			default:
 			}
 			if errors.Is(err, net.ErrClosed) {
@@ -412,10 +426,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		conn = newLimitedConnection(conn, connectionSlots.Release)
 		select {
 		case workerCh <- conn:
-		case <-ctx.Done():
+		case <-shutdownCtx.Done():
 			_ = conn.Close()
-			connectionSlots.Release()
-			return ctx.Err()
+			return shutdownCtx.Err()
 		}
 	}
 }
@@ -431,7 +444,7 @@ func startObservationGRPC(ctx context.Context, cfg *config.Config) (func(), erro
 		return nil, fmt.Errorf("observation gRPC principal and auth token must be configured together")
 	}
 	backend, err := sdk.NewAdminClient(&sdk.AdminConfig{
-		BrokerAddrs: []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.BrokerPort))},
+		BrokerAddrs: []string{net.JoinHostPort(observationBackendHost(cfg.BrokerBindAddress), strconv.Itoa(cfg.BrokerPort))},
 		UseTLS:      cfg.UseTLS, TLSCertPath: cfg.TLSCertPath, TLSKeyPath: cfg.TLSKeyPath,
 		Principal: cfg.ObservationGRPCPrincipal, AuthToken: cfg.ObservationGRPCAuthToken,
 	})
@@ -443,6 +456,21 @@ func startObservationGRPC(ctx context.Context, cfg *config.Config) (func(), erro
 		return nil, err
 	}
 	return shutdown, nil
+}
+
+func observationBackendHost(bindAddress string) string {
+	host := strings.TrimSpace(bindAddress)
+	if host == "" {
+		return "127.0.0.1"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsUnspecified() {
+		return host
+	}
+	if ip.To4() != nil {
+		return "127.0.0.1"
+	}
+	return "::1"
 }
 
 func awaitDistributedConsumerMetadataRecovery(ctx context.Context, cd *coordinator.Coordinator, tm *topic.TopicManager) error {
@@ -574,7 +602,7 @@ func startInternalBrokerListener(ctx context.Context, cfg *config.Config, cmdHan
 	util.Info("🔒 Internal broker listener started on %s (mTLS=%v)", addr, cfg.InternalUseTLS)
 	internalCtx, cancel := context.WithCancel(ctx)
 	workerCount := maxClientConnections(cfg)
-	requestBudget := newRequestMemoryBudget(cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes)
+	_, requestBudget := newBrokerRequestBudgets(cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes, true)
 	if len(budgets) > 0 && budgets[0] != nil {
 		requestBudget = budgets[0]
 	}
@@ -653,6 +681,10 @@ func handleConnWithContext(ctx context.Context, conn net.Conn, cmdHandler *contr
 }
 
 func handleConnWithBudget(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler, cmdCtx *controller.ClientContext, budget *requestMemoryBudget) {
+	handleConnWithBudgetAndDrain(ctx, conn, cmdHandler, cmdCtx, budget, nil)
+}
+
+func handleConnWithBudgetAndDrain(ctx context.Context, conn net.Conn, cmdHandler *controller.CommandHandler, cmdCtx *controller.ClientContext, budget *requestMemoryBudget, drain <-chan struct{}) {
 	isStreamed := false
 	defer func() {
 		if !isStreamed {
@@ -701,6 +733,8 @@ func handleConnWithBudget(ctx context.Context, conn net.Conn, cmdHandler *contro
 		var request admittedRequest
 		select {
 		case <-clientCtx.Done():
+			return
+		case <-drain:
 			return
 		case next, ok := <-requests:
 			if !ok {

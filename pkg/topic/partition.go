@@ -63,6 +63,10 @@ type Partition struct {
 	LEO                        atomic.Uint64
 	HWM                        uint64
 	hwmAuthoritative           bool
+	replicaVerifiedLeaderEpoch int
+	replicaVerifiedLifecycle   uint64
+	replicaVerifiedHWM         uint64
+	replicaVerified            bool
 	distributed                bool
 	mu                         sync.RWMutex
 	reconcileMu                sync.RWMutex
@@ -648,6 +652,7 @@ func (p *Partition) EnqueueBatchLeaderWithMode(msgs []types.Message, forceIdempo
 			ProducerID:                   msgs[i].ProducerID,
 			SeqNum:                       msgs[i].SeqNum,
 			Epoch:                        msgs[i].Epoch,
+			LeaderEpoch:                  msgs[i].LeaderEpoch,
 			Payload:                      msgs[i].Payload,
 			Key:                          msgs[i].Key,
 			EventType:                    msgs[i].EventType,
@@ -826,6 +831,7 @@ func diskMessageFromMessage(topic string, partition int32, msg types.Message) ty
 		ProducerID:                   msg.ProducerID,
 		SeqNum:                       msg.SeqNum,
 		Epoch:                        msg.Epoch,
+		LeaderEpoch:                  msg.LeaderEpoch,
 		Payload:                      msg.Payload,
 		Key:                          msg.Key,
 		EventType:                    msg.EventType,
@@ -846,7 +852,7 @@ func diskMessageFromMessage(topic string, partition int32, msg types.Message) ty
 }
 
 func sameReplicatedMessage(a, b types.Message) bool {
-	return a.Offset == b.Offset && a.ProducerID == b.ProducerID && a.SeqNum == b.SeqNum &&
+	return a.Offset == b.Offset && a.ProducerID == b.ProducerID && a.SeqNum == b.SeqNum && a.LeaderEpoch == b.LeaderEpoch &&
 		a.Payload == b.Payload && a.Key == b.Key && a.Epoch == b.Epoch &&
 		a.EventType == b.EventType && a.SchemaVersion == b.SchemaVersion &&
 		a.AggregateVersion == b.AggregateVersion && a.Metadata == b.Metadata &&
@@ -1565,6 +1571,26 @@ func (p *Partition) ApplyReplicaHWM(hwm uint64) error {
 	return nil
 }
 
+// MarkReplicaCatchupVerified records the exact cluster boundary whose prefix
+// was checked against an in-sync replica. The tuple prevents a stale check
+// from admitting the replica after a leader, topic, or HWM change.
+func (p *Partition) MarkReplicaCatchupVerified(leaderEpoch int, lifecycleEpoch, hwm uint64) {
+	p.mu.Lock()
+	p.replicaVerifiedLeaderEpoch = leaderEpoch
+	p.replicaVerifiedLifecycle = lifecycleEpoch
+	p.replicaVerifiedHWM = hwm
+	p.replicaVerified = true
+	p.mu.Unlock()
+}
+
+func (p *Partition) ReplicaCatchupVerified(leaderEpoch int, lifecycleEpoch, hwm uint64) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.replicaVerified && p.replicaVerifiedLeaderEpoch == leaderEpoch &&
+		p.replicaVerifiedLifecycle == lifecycleEpoch &&
+		p.replicaVerifiedHWM == hwm
+}
+
 // ReconcileCommittedHWM prepares a replica for leadership using the durable cluster watermark.
 // Any local tail beyond that watermark was never committed and must not survive leader promotion.
 func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
@@ -1585,6 +1611,22 @@ func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
 		p.NotifyNewMessage()
 	}
 	return nil
+}
+
+// TruncateReplicaTail removes only records above a repair boundary. It does not
+// publish that boundary as committed; prefix verification must complete first.
+func (p *Partition) TruncateReplicaTail(offset uint64) error {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.snapshotRecovery {
+		return fmt.Errorf("snapshot replay is still pending: visible_hwm=%d durable_hwm=%d requested_offset=%d", p.HWM, p.recoveryCheckpointHWM, offset)
+	}
+	if offset < p.HWM {
+		return fmt.Errorf("replica tail truncation crosses committed HWM: hwm=%d requested_offset=%d", p.HWM, offset)
+	}
+	return p.truncateReplicaTailLocked(offset)
 }
 
 // ReconcileSnapshotHWM stages the snapshot visibility boundary without
@@ -1665,28 +1707,29 @@ func (p *Partition) reconcileCommittedHWMLocked(hwm uint64) error {
 	if hwm < p.HWM {
 		return fmt.Errorf("committed HWM regression: current=%d requested=%d", p.HWM, hwm)
 	}
-	leo := p.LEO.Load()
-	if leo < hwm {
-		return fmt.Errorf("replica is behind committed watermark: leo=%d hwm=%d", leo, hwm)
-	}
-	if leo == hwm && p.HWM == hwm {
-		return nil
-	}
-	truncated := false
-	if leo > hwm {
-		if err := p.dh.TruncateTo(hwm); err != nil {
-			return fmt.Errorf("truncate uncommitted tail to %d: %w", hwm, err)
-		}
-		p.LEO.Store(hwm)
-		truncated = true
+	if err := p.truncateReplicaTailLocked(hwm); err != nil {
+		return err
 	}
 	if p.HWM != hwm {
 		p.HWM = hwm
 		p.signalHWMCheckpointLocked()
 	}
-	if !truncated {
+	return nil
+}
+
+func (p *Partition) truncateReplicaTailLocked(offset uint64) error {
+	leo := p.LEO.Load()
+	if leo < offset {
+		return fmt.Errorf("replica is behind repair boundary: leo=%d offset=%d", leo, offset)
+	}
+	if leo == offset {
 		return nil
 	}
+	if err := p.dh.TruncateTo(offset); err != nil {
+		return fmt.Errorf("truncate replica tail to %d: %w", offset, err)
+	}
+	p.LEO.Store(offset)
+	p.replicaVerified = false
 
 	p.txnMarkerMu.Lock()
 	p.txnMarkers = make(map[transactionMarkerKey]transactionMarkerInfo)

@@ -51,7 +51,7 @@ A broker/network crash can close TCP without a stream terminator. SDKs treat tha
 
 ## Security
 
-Client TLS and token authentication are independent controls. When authentication is enabled, the connection must use `AUTH` or documented inline credentials before protected commands. Coarse permissions and topic ACLs are evaluated before mutation.
+Client TLS and token authentication are independent controls. The default client listener binds to `127.0.0.1`. A non-loopback bind requires both TLS and SASL unless `allow_insecure_client_transport=true` is explicitly set for a test environment. When authentication is enabled, the connection must use `AUTH` or documented inline credentials before protected commands. Coarse permissions and topic ACLs are evaluated before mutation.
 
 Distributed production deployments should configure a dedicated internal broker port and mTLS CA/cert/key. The public listener rejects internal-only commands even when a client guesses their syntax. Protect all token traffic with TLS.
 
@@ -62,13 +62,13 @@ Distributed production deployments should configure a dedicated internal broker 
 | `/live` | Process and health handler are alive. |
 | `/ready` | Listener initialization and required dynamic broker/cluster dependencies are ready. |
 
-A distributed broker can be live but not ready while it has no resolvable Raft leader or required authority. Metrics startup/bind errors are surfaced during initialization rather than silently ignored.
+A distributed broker can be live but not ready while it has no resolvable Raft leader or its node-local materialization has failed. Cluster-wide partition degradation is reported through cluster status, metrics, and alerts without making every broker unready. Metrics startup/bind errors are surfaced during initialization rather than silently ignored.
 
 ## Lifecycle
 
 Startup loads normalized configuration, opens storage/coordinator/cluster state, restores recoverable indexes and prepared transactions, starts listeners/workers, and only then reports readiness.
 
-Shutdown cancels listeners and connections, closes stream activity, drains topic/storage writes, syncs files/checkpoints, and stops coordinator/cluster resources. Abrupt kill relies on active-tail, HWM, producer, group, transaction, and stream recovery.
+Shutdown first marks readiness false and closes the client listener. Workers finish requests that the broker already accepted, then close idle client connections. The broker subsequently attempts Raft leadership transfer, closes stream activity, drains topic/storage writes, syncs files/checkpoints, and stops coordinator/cluster resources. Abrupt kill relies on active-tail, HWM, producer, group, transaction, and stream recovery.
 
 ## Errors And Logging
 

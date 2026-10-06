@@ -188,7 +188,7 @@ Transaction metadata fields are not accepted on client `PUBLISH`; use the transa
 
 `acks` belongs to the publish request or publisher configuration; it is not topic metadata. For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. `acks=0` emits no external response frame. `acks=1` responds after the leader's durable local append while bounded ordered follower replication continues; a leader failure before commit can lose the record. `acks=all` and `acks=-1` are aliases: the broker first requires the current ISR to meet the topic-effective minimum, then waits for the captured ISR and lifecycle-fenced committed HWM. Read-committed consumers remain bounded by committed HWM. Non-ISR failures do not delay the success response.
 
-`PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Distributed recovery writes and accepts only FSM snapshot version 9 with explicit committed-HWM provenance; older persistent state requires a full clean bootstrap.
+`PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Distributed recovery writes snapshot version 10 and accepts version 9 only for its supported one-way recovery transition; older persistent state requires a full clean bootstrap.
 
 The effective minimum is the topic `min_in_sync_replicas` override when present and broker `min_insync_replicas` otherwise. Standalone has one replica, so `1`, `all`, and `-1` share the local durable-append completion point when the effective minimum is 1; `all`/`-1` reject when it is greater than 1. Idempotent publishers must use `all` or `-1`; `0` and `1` fail before append or sequence mutation.
 
@@ -544,7 +544,11 @@ ERROR: leader_election_rejected topic=<name> partition=<N> broker=<id> reason=".
 ERROR: leader_election_result_unavailable topic=<name> partition=<N>
 ```
 
-This command does not add replicas, expand ISR, or perform data movement. Reassignment and broker draining require a separate catch-up-aware workflow.
+This command does not add replicas, expand ISR, or perform data movement.
+
+### REASSIGN_PARTITION
+
+`REASSIGN_PARTITION topic=<name> partition=<N> replicas=<broker-a,broker-b,...>` changes one partition's replica set through the Raft metadata log. Expansion may add one replica beyond the configured replication factor so that the destination can catch up. Removal is accepted only when every target replica is already in ISR, the current leader remains, and the result has exactly the configured replication factor. A safe move uses two calls: add the destination, wait until it enters ISR, then submit the final replica set without the source.
 
 ### RAFT_APPLY
 

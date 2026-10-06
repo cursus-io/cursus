@@ -44,3 +44,27 @@ func TestOverrideEnvSASLUsersRequiresPermissions(t *testing.T) {
 		t.Fatal("overrideEnvSASLUsers() accepted an entry without permissions")
 	}
 }
+
+func TestValidateClientTransportRequiresSecurityOffLoopback(t *testing.T) {
+	cfg := DefaultConfig()
+	if err := cfg.ValidateClientTransport(); err != nil {
+		t.Fatalf("loopback transport validation failed: %v", err)
+	}
+
+	cfg.BrokerBindAddress = "0.0.0.0"
+	if err := cfg.ValidateClientTransport(); err == nil || !strings.Contains(err.Error(), "requires TLS and SASL") {
+		t.Fatalf("insecure public transport error = %v", err)
+	}
+	cfg.UseTLS = true
+	cfg.EnableSASL = true
+	if err := cfg.ValidateClientTransport(); err != nil {
+		t.Fatalf("secured public transport validation failed: %v", err)
+	}
+
+	cfg.UseTLS = false
+	cfg.EnableSASL = false
+	cfg.AllowInsecureClientTransport = true
+	if err := cfg.ValidateClientTransport(); err != nil {
+		t.Fatalf("explicit insecure transport validation failed: %v", err)
+	}
+}

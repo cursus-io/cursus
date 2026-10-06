@@ -30,8 +30,13 @@ jobs:
       - uses: azure/setup-helm@v5
       - name: Lint and render standalone chart
         run: |
-          helm lint manifests/helm
-          helm template cursus manifests/helm > /tmp/cursus.yaml
+          helm lint manifests/helm \
+            --set tls.enabled=true \
+            --set clientSecurity.sasl.secretName=cursus-client-auth
+          helm template cursus manifests/helm \
+            --set tls.enabled=true \
+            --set clientSecurity.sasl.secretName=cursus-client-auth \
+            > /tmp/cursus.yaml
           if grep -q '<base64-encoded' /tmp/cursus.yaml; then
             echo 'rendered chart contains placeholder credentials'
             exit 1
@@ -41,12 +46,18 @@ jobs:
             exit 1
           fi
           helm template cursus manifests/helm \
+            --set tls.enabled=true \
+            --set clientSecurity.sasl.secretName=cursus-client-auth \
             --set-string persistence.storageClass=fast-ssd > /tmp/cursus-named-storage.yaml
           grep -q 'storageClassName: "fast-ssd"' /tmp/cursus-named-storage.yaml
           helm template cursus manifests/helm \
+            --set tls.enabled=true \
+            --set clientSecurity.sasl.secretName=cursus-client-auth \
             --set persistence.classless=true > /tmp/cursus-classless-storage.yaml
           grep -q 'storageClassName: ""' /tmp/cursus-classless-storage.yaml
           helm template cursus manifests/helm --namespace brokers \
+            --set tls.enabled=true \
+            --set clientSecurity.sasl.secretName=cursus-client-auth \
             --set monitoring.enabled=true \
             --set-string monitoring.labels.release=kube-prometheus-stack \
             > /tmp/cursus-monitoring.yaml
@@ -57,15 +68,32 @@ jobs:
           grep -q 'cpu: 250m' /tmp/cursus.yaml
       - name: Reject unsafe deployment overrides
         run: |
-          if helm template cursus manifests/helm --set replicaCount=2; then
+          if helm template cursus manifests/helm; then
+            echo 'chart unexpectedly accepted plaintext unauthenticated client transport'
+            exit 1
+          fi
+          if helm template cursus manifests/helm \
+            --set-string clientSecurity.allowInsecure=false; then
+            echo 'chart accepted a string that bypasses the insecure-client boolean guard'
+            exit 1
+          fi
+          if helm template cursus manifests/helm \
+            --set tls.enabled=true \
+            --set clientSecurity.sasl.secretName=cursus-client-auth \
+            --set replicaCount=2; then
             echo 'chart unexpectedly accepted more than one standalone replica'
             exit 1
           fi
-          if helm template cursus manifests/helm --set tls.enabled=true --set tls.certPath=/tmp/cert.pem; then
+          if helm template cursus manifests/helm \
+            --set tls.enabled=true \
+            --set clientSecurity.sasl.secretName=cursus-client-auth \
+            --set tls.certPath=/tmp/cert.pem; then
             echo 'chart unexpectedly accepted a TLS certificate path outside the mounted Secret'
             exit 1
           fi
           if helm template cursus manifests/helm \
+            --set tls.enabled=true \
+            --set clientSecurity.sasl.secretName=cursus-client-auth \
             --set persistence.classless=true \
             --set-string persistence.storageClass=fast-ssd; then
             echo 'chart unexpectedly accepted conflicting storage class settings'

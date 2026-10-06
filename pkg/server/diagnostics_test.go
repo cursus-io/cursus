@@ -35,6 +35,7 @@ func TestRunTopicMetadataDiagnosticsServesFailureWithoutBrokerListener(t *testin
 	dm := disk.NewDiskManager(cfg)
 	t.Cleanup(dm.CloseAllHandlers)
 	tm := topic.NewTopicManager(cfg, dm, nil)
+	t.Cleanup(tm.Stop)
 	if err := tm.RestoreTopics(); err == nil {
 		t.Fatal("expected corrupt manifest restore error")
 	}
@@ -49,7 +50,6 @@ func TestRunTopicMetadataDiagnosticsServesFailureWithoutBrokerListener(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("ready status = %d, want %d", response.StatusCode, http.StatusServiceUnavailable)
 	}
@@ -57,6 +57,7 @@ func TestRunTopicMetadataDiagnosticsServesFailureWithoutBrokerListener(t *testin
 	if err := json.NewDecoder(response.Body).Decode(&report); err != nil {
 		t.Fatal(err)
 	}
+	_ = response.Body.Close()
 	if !strings.Contains(report.Checks["topic_metadata"], "manifest load failure") {
 		t.Fatalf("topic_metadata check = %q", report.Checks["topic_metadata"])
 	}
@@ -125,6 +126,7 @@ func TestRunConsumerMetadataDiagnosticsExposesFailureAndMetrics(t *testing.T) {
 	dm := disk.NewDiskManager(cfg)
 	t.Cleanup(dm.CloseAllHandlers)
 	tm := topic.NewTopicManager(cfg, dm, nil)
+	t.Cleanup(tm.Stop)
 	if err := tm.RestoreTopics(); err != nil {
 		t.Fatal(err)
 	}
@@ -221,6 +223,7 @@ func waitForHTTPStatus(t *testing.T, url string, status int) {
 	for time.Now().Before(deadline) {
 		response, err := http.Get(url) // #nosec G107 -- loopback test address.
 		if err == nil {
+			_, _ = io.Copy(io.Discard, response.Body)
 			_ = response.Body.Close()
 			if response.StatusCode == status {
 				return

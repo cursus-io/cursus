@@ -23,7 +23,7 @@ uint32_be serializedLength
 byte[serializedLength] serializedDiskMessage
 ```
 
-The maximum accepted serialized record size is 16 MiB. The serialized message uses big-endian fixed-width integers and length-prefixed strings/bytes in this order:
+The maximum accepted serialized record size is 16 MiB. New records use the `CDM5` magic. The serialized message uses big-endian fixed-width integers and length-prefixed strings/bytes in this order:
 
 | Field | Encoding |
 |---|---|
@@ -33,6 +33,7 @@ The maximum accepted serialized record size is 16 MiB. The serialized message us
 | producer id | `uint16` length + bytes |
 | producer sequence | `uint64` |
 | producer epoch | `uint64` representation of non-negative `int64` |
+| partition leader epoch | `uint64` representation of `int64` |
 | payload | `uint32` length + bytes |
 | event type | `uint16` length + bytes |
 | schema version | `uint32` |
@@ -44,8 +45,10 @@ The maximum accepted serialized record size is 16 MiB. The serialized message us
 | control batch version | `int16` |
 | control coordinator epoch | `int64` |
 | control key/value | two `uint16` length-prefixed byte arrays |
+| event id/payload digest | two `uint16` length-prefixed values |
+| checksum | CRC32C over every preceding byte, including `CDM5` |
 
-The transaction/control fields are empty for ordinary records. Control records remain in the raw log and are filtered by `read_committed`.
+The transaction/control fields are empty for ordinary records. Control records remain in the raw log and are filtered by `read_committed`. CDM2, CDM3, and CDM4 records remain readable, but they do not contain the CDM5 leader epoch required to find a divergent replica boundary. A mismatch against such a legacy tail requires a clean bootstrap.
 
 ## Sparse Offset Index
 
@@ -121,7 +124,7 @@ Backups of a standalone broker must keep this manifest with topic partition dire
 
 `__consumer_offsets` stores version-1 group registration, complete committed-next-offset snapshot, and group tombstone JSON payloads inside ordinary segment frames. Stable semantic keys support compaction; lifecycle epochs fence delete/re-create, and snapshot revisions make replay deterministic across physical internal partitions. Runtime replay rejects unversioned single/bulk offset JSON records.
 
-The internal topic is forced to compact cleanup and unlimited time/size retention regardless of broker defaults, manifest input, or application `CREATE`. Registration/commit acknowledgement synchronously flushes and fsyncs its authoritative log. Corrupt, truncated, conflicting, regressing, unversioned, or key-mismatched records fail readiness instead of being skipped. See [Standalone Clean-Bootstrap Recovery](../../standalone-storage-recovery.md) for the supported reset boundary.
+The internal topic is forced to compact cleanup and unlimited time/size retention regardless of broker defaults, manifest input, or application `CREATE`. Registration/commit acknowledgement synchronously flushes and fsyncs its authoritative log. A partial or undecodable final record is treated as a torn write and truncated; corruption before the tail, conflicting or regressing offsets, unversioned records, and key mismatches fail readiness instead of being skipped. See [Standalone Clean-Bootstrap Recovery](../../standalone-storage-recovery.md) for the supported reset boundary.
 
 ## Standalone Transaction Journal
 

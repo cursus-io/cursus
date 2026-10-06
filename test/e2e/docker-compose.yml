@@ -18,18 +18,12 @@ services:
       - "10080:9080"    
     stdin_open: true    
     tty: true    
-    networks:    
-      - test_network  
+    network_mode: bridge
     healthcheck:    
       test: ["CMD", "curl", "-f", "http://localhost:9080/ready"]
       interval: 10s    
       timeout: 5s    
       retries: 5    
-  
-networks:  
-  test_network:  
-    name: test_network
-    driver: bridge  
   
 volumes:  
   broker-data:

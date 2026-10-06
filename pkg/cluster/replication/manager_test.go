@@ -124,8 +124,26 @@ func (m *MockRaft) BootstrapCluster(cfg raft.Configuration) raft.Future {
 	return m.Called(cfg).Get(0).(raft.Future)
 }
 
+func (m *MockRaft) LeadershipTransfer() raft.Future {
+	return m.Called().Get(0).(raft.Future)
+}
+
 func (m *MockRaft) Shutdown() raft.Future {
 	return m.Called().Get(0).(raft.Future)
+}
+
+func TestTransferLeadershipOnlyWhenLeader(t *testing.T) {
+	raftNode := &MockRaft{}
+	manager := &RaftReplicationManager{raft: raftNode}
+	require.NoError(t, manager.TransferLeadership())
+
+	future := &MockIndexFuture{}
+	future.On("Error").Return(nil).Once()
+	raftNode.On("LeadershipTransfer").Return(future).Once()
+	manager.isLeader.Store(true)
+	require.NoError(t, manager.TransferLeadership())
+	raftNode.AssertExpectations(t)
+	future.AssertExpectations(t)
 }
 
 func (m *MockRaft) Stats() map[string]string {

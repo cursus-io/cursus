@@ -26,7 +26,7 @@ func startObservationRoutingServer(t *testing.T, handle func(*wire.Connection, w
 				return
 			}
 			func() {
-				defer raw.Close()
+				defer func() { _ = raw.Close() }()
 				_ = raw.SetDeadline(time.Now().Add(3 * time.Second))
 				conn, err := wire.ServerHandshake(raw, []wire.Compression{wire.CompressionNone})
 				if err != nil {

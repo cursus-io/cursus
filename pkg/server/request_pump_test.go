@@ -42,6 +42,35 @@ func TestLongPollSurvivesIdleTimeoutAndIdleResumesAfterResponse(t *testing.T) {
 	}
 }
 
+func TestShutdownDrainLetsAcceptedRequestFinish(t *testing.T) {
+	handler := newPublishTestHandler(t)
+	handler.Config.ClientIdleTimeoutMS = 1000
+	handler.Config.ClientRequestTimeoutMS = 2000
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() { _ = clientConn.Close() })
+	drain := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleConnWithBudgetAndDrain(context.Background(), serverConn, handler, controller.NewClientContext("default-group", 0), newRequestMemoryBudget(4, 1<<20), drain)
+	}()
+	require.NoError(t, clientConn.SetDeadline(time.Now().Add(3*time.Second)))
+	client := newWireTestClient(t, clientConn)
+	started := time.Now()
+	writeWireCommand(t, client, wire.CommandConsume, 1, "CONSUME topic=ack-zero partition=0 offset=0 group=g member=m batch=1 wait_ms=150")
+	time.Sleep(40 * time.Millisecond)
+	close(drain)
+	frame, err := client.ReadFrame()
+	require.NoError(t, err)
+	require.Equal(t, wire.StatusOK, frame.Status)
+	require.GreaterOrEqual(t, time.Since(started), 120*time.Millisecond)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("drained connection stayed open after the accepted request completed")
+	}
+}
+
 func TestPipelinedPayloadWaitsForActiveHandler(t *testing.T) {
 	handler := newPublishTestHandler(t)
 	raw, client, _ := startPumpTestConnection(t, handler)
@@ -143,7 +172,7 @@ func TestStreamHandoffStopsReadsAndClearsDeadline(t *testing.T) {
 func TestPumpWireRequestsAcceptsCompleteFrameBeforeDisconnectCancellation(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	type serverResult struct {
 		conn *wire.Connection
@@ -167,7 +196,7 @@ func TestPumpWireRequestsAcceptsCompleteFrameBeforeDisconnectCancellation(t *tes
 	require.NoError(t, err)
 	server := <-serverReady
 	require.NoError(t, server.err)
-	defer server.raw.Close()
+	defer func() { _ = server.raw.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

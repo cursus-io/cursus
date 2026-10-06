@@ -223,3 +223,54 @@ func (ch *CommandHandler) handleElectLeader(cmd string, ctx ...*ClientContext) s
 		election.Topic, election.Partition, election.PreviousLeader, election.Leader, election.LeaderEpoch, election.Changed,
 	)
 }
+
+func (ch *CommandHandler) handleReassignPartition(cmd string, ctx ...*ClientContext) string {
+	requestCtx := firstClientContext(ctx).RequestContext()
+	if !ch.isDistributed() {
+		return "ERROR: distribution_required command=REASSIGN_PARTITION"
+	}
+	if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, cmd); forwarded {
+		return resp
+	}
+	args := parseKeyValueArgs(cmd[len("REASSIGN_PARTITION "):])
+	topicName := strings.TrimSpace(args["topic"])
+	partition, err := strconv.Atoi(args["partition"])
+	if topicName == "" || err != nil || partition < 0 {
+		return "ERROR: invalid_partition_identity command=REASSIGN_PARTITION"
+	}
+	target := splitCSV(args["replicas"])
+	if len(target) == 0 {
+		return "ERROR: missing_replicas command=REASSIGN_PARTITION"
+	}
+	state := ch.Cluster.RaftManager.GetFSM()
+	if state == nil {
+		return "ERROR: fsm_not_available command=REASSIGN_PARTITION"
+	}
+	key := fmt.Sprintf("%s-%d", topicName, partition)
+	metadata := state.GetPartitionMetadata(key)
+	if metadata == nil {
+		return fmt.Sprintf("ERROR: partition_not_found topic=%s partition=%d", topicName, partition)
+	}
+	_, err = ch.applyAndWaitContext(requestCtx, "REPLICA_REASSIGN", map[string]interface{}{
+		"topic": topicName, "partition": partition,
+		"lifecycle_epoch": metadata.LifecycleEpoch,
+		"leader":          metadata.Leader, "leader_epoch": metadata.LeaderEpoch,
+		"expected_replicas": append([]string(nil), metadata.Replicas...),
+		"target_replicas":   target,
+	})
+	if err != nil {
+		return fmt.Sprintf("ERROR: replica_reassignment_rejected topic=%s partition=%d reason=%q", topicName, partition, err.Error())
+	}
+	return fmt.Sprintf("OK topic=%s partition=%d replicas=%s", topicName, partition, strings.Join(target, ","))
+}
+
+func splitCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
+}

@@ -111,8 +111,8 @@ func TestAdminClientObservationRejectsInvalidRequestsBeforeConnecting(t *testing
 func TestNegotiateProtocolCoversFeatureAndResponseFailures(t *testing.T) {
 	t.Run("rejects obsolete application protocol version", func(t *testing.T) {
 		client, server := net.Pipe()
-		defer client.Close()
-		defer server.Close()
+		defer func() { _ = client.Close() }()
+		defer func() { _ = server.Close() }()
 		_, err := NegotiateProtocol(client, ProtocolNegotiation{Version: 1})
 		require.ErrorContains(t, err, "unsupported Wire protocol version 1")
 	})
@@ -145,8 +145,8 @@ func TestNegotiateProtocolCoversFeatureAndResponseFailures(t *testing.T) {
 	})
 	t.Run("rejects wildcard among multiple features", func(t *testing.T) {
 		client, server := net.Pipe()
-		defer client.Close()
-		defer server.Close()
+		defer func() { _ = client.Close() }()
+		defer func() { _ = server.Close() }()
 		_, err := NegotiateProtocol(client, ProtocolNegotiation{Features: []string{"*", "browse_messages_v1"}})
 		require.ErrorContains(t, err, "invalid protocol feature request")
 	})

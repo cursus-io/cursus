@@ -15,7 +15,7 @@ func TestAdminAndObservationCancellationClosesBlockedRequest(t *testing.T) {
 		t.Run(phase, func(t *testing.T) {
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
 			require.NoError(t, err)
-			defer listener.Close()
+			defer func() { _ = listener.Close() }()
 			reached := make(chan struct{})
 			closed := make(chan error, 1)
 			go func() {
@@ -24,7 +24,7 @@ func TestAdminAndObservationCancellationClosesBlockedRequest(t *testing.T) {
 					closed <- err
 					return
 				}
-				defer raw.Close()
+				defer func() { _ = raw.Close() }()
 				_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
 				conn, err := wire.ServerHandshake(raw, []wire.Compression{wire.CompressionNone})
 				if err != nil {
@@ -50,11 +50,12 @@ func TestAdminAndObservationCancellationClosesBlockedRequest(t *testing.T) {
 			result := make(chan error, 1)
 			go func() {
 				var err error
-				if phase == "admin response" {
+				switch phase {
+				case "admin response":
 					_, err = client.ListTopics(ctx)
-				} else if phase == "capabilities" {
+				case "capabilities":
 					_, err = client.Capabilities(ctx)
-				} else {
+				default:
 					_, err = client.ReadStreamHistory(ctx, HistoryRequest{Topic: "orders", Key: "order", FromVersion: 1, MaxRecords: 10, MaxBytes: 1024})
 				}
 				result <- err

@@ -194,6 +194,7 @@ func TestDiskHandlerRotation(t *testing.T) {
 		if offset != uint64(i) {
 			t.Errorf("AppendMessage %d (rotation): expected offset %d, got %d", i, i, offset)
 		}
+		dh.Flush()
 	}
 
 	pattern := filepath.Join(cfg.LogDir, topic, "partition_0_segment_*.log")

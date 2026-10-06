@@ -12,7 +12,7 @@ type commandHelpEntry struct {
 }
 
 var standaloneHelpEntries = []commandHelpEntry{
-	{name: "EXIT", order: 39},
+	{name: "EXIT", order: 40},
 }
 
 func (ch *CommandHandler) handleHelp() string {

@@ -79,7 +79,9 @@ func TestDeserializeDiskMessageSupportsV2RecordsWithoutReplayIdentity(t *testing
 	data, err := SerializeDiskMessage(types.DiskMessage{Topic: "orders", Payload: "created"})
 	assert.NoError(t, err)
 	// CDM2 predates both replay-identity fields and the CDM4 checksum.
-	legacy := append([]byte("CDM2"), data[4:len(data)-8]...)
+	leaderEpochOffset := 4 + 2 + len("orders") + 4 + 8 + 2 + 8 + 8
+	legacy := append([]byte("CDM2"), data[4:leaderEpochOffset]...)
+	legacy = append(legacy, data[leaderEpochOffset+8:len(data)-8]...)
 
 	got, err := DeserializeDiskMessage(legacy)
 	assert.NoError(t, err)

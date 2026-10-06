@@ -42,7 +42,7 @@ Brokers upgraded from versions without the manifest do not guess security or eve
 
 The internal offset topic is recreated by the coordinator and then enters the manifest on a new data directory. Existing pre-manifest offset logs are unsupported and require the same complete clean bootstrap as application topics.
 
-Distributed brokers keep topic definitions in the FSM. Snapshot restore accepts only version 9, validates every definition and nested group/transaction snapshot before mutation, rebuilds the topic registry, and reconciles each partition to its explicit committed HWM. Snapshots through version 8 and version-9 state with missing markers or required fields fail with a clean-bootstrap error.
+Distributed brokers keep topic definitions in the FSM. Snapshot restore writes version 10 and accepts version 9 only for its supported one-way transition. It validates every definition and nested group/transaction snapshot before mutation, rebuilds the topic registry, and reconciles each partition to its explicit committed HWM. Snapshots through version 8 and version-9 state with missing markers or required fields fail with a clean-bootstrap error.
 
 ## Delete
 
@@ -58,7 +58,7 @@ In standalone mode the command preflights active references without mutation, th
 
 Successful truncation removes inactive groups and offsets, producer sequence state, terminal transaction references, and event-sourcing indexes/snapshots. In standalone mode the version 3 manifest commits the new epoch before physical storage reset. A synced epoch marker is the publication boundary; an absent or mismatched marker fences all access, makes broker readiness fail, and restart resumes cleanup. In distributed mode one serialized `TOPIC_TRUNCATE` transition updates definition and partition metadata, advances partition leader epochs, drops replicated record/producer state, and records node-local failures for reconciliation. Message replication, HWM commits, and event snapshots carry the lifecycle epoch so delayed pre-truncate work cannot enter the empty generation.
 
-Distributed truncate is rejected unless every active broker advertises lifecycle protocol version 1. Mixed protocol generations are not a supported runtime mode. Snapshot version 9 and manifest version 3 require a clean bootstrap when deploying from an earlier recovery format, and downgrade is unsupported. `DELETE` followed by `CREATE` is still not a substitute because it changes topic identity and has a different retry contract.
+Distributed truncate is rejected unless every active broker advertises lifecycle protocol version 1. Mixed protocol generations are not a supported runtime mode. Snapshot version 10 and manifest version 3 require a clean bootstrap when deploying from an earlier recovery format, and downgrade is unsupported. `DELETE` followed by `CREATE` is still not a substitute because it changes topic identity and has a different retry contract.
 
 ## Publish Entry Points
 

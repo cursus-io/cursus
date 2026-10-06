@@ -67,6 +67,7 @@ const (
 	CommandTxnAppendStream
 	CommandBrowseMessages
 	CommandReadStreamHistory
+	CommandReassignPartition
 )
 
 var commandNames = [...]string{
@@ -127,6 +128,7 @@ var commandNames = [...]string{
 	CommandTxnAppendStream:         "TXN_APPEND_STREAM",
 	CommandBrowseMessages:          "BROWSE_MESSAGES",
 	CommandReadStreamHistory:       "READ_STREAM_HISTORY",
+	CommandReassignPartition:       "REASSIGN_PARTITION",
 }
 
 var commandsByName = func() map[string]Command {

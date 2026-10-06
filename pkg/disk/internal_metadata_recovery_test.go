@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestConsumerMetadataTruncatedTailFailsClosedWithoutRepair(t *testing.T) {
+func TestConsumerMetadataTruncatedTailIsRepaired(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
 
@@ -37,9 +37,10 @@ func TestConsumerMetadataTruncatedTailFailsClosedWithoutRepair(t *testing.T) {
 	require.NoError(t, err)
 
 	restarted, err := NewDiskHandler(cfg, config.ConsumerOffsetsTopicName, 0)
-	require.Nil(t, restarted)
-	require.ErrorContains(t, err, "truncated internal metadata record")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), restarted.GetAbsoluteOffset())
 	after, statErr := os.Stat(segmentPath)
 	require.NoError(t, statErr)
-	require.Equal(t, before.Size(), after.Size(), "fail-closed recovery must preserve corrupt evidence")
+	require.Less(t, after.Size(), before.Size())
+	require.NoError(t, restarted.Close())
 }

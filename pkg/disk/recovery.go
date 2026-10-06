@@ -17,17 +17,10 @@ type segmentRecovery struct {
 	modTime    int64
 }
 
-// recoverActiveSegment validates the active log tail and removes only a
-// trailing partial record. Complete but malformed records fail startup.
-func recoverActiveSegment(logPath, indexPath string, baseOffset uint64) (segmentRecovery, error) {
-	return recoverActiveSegmentMode(logPath, indexPath, baseOffset, false)
-}
-
-func recoverActiveSegmentStrict(logPath, indexPath string, baseOffset uint64) (segmentRecovery, error) {
-	return recoverActiveSegmentMode(logPath, indexPath, baseOffset, true)
-}
-
-func recoverActiveSegmentMode(logPath, indexPath string, baseOffset uint64, rejectPartialTail bool) (segmentRecovery, error) {
+// recoverActiveSegment validates the active log tail. A record that is shorter
+// than its declared length is treated as a torn write. Fully present malformed
+// records fail startup so checksum corruption cannot silently delete data.
+func recoverActiveSegment(logPath string, baseOffset uint64) (segmentRecovery, error) {
 	info, err := os.Stat(logPath)
 	if err != nil {
 		return segmentRecovery{}, err
@@ -35,31 +28,11 @@ func recoverActiveSegmentMode(logPath, indexPath string, baseOffset uint64, reje
 	if info.Size() < 0 {
 		return segmentRecovery{}, fmt.Errorf("negative segment size for %s", logPath)
 	}
-	// #nosec G115 -- negative sizes are rejected above.
-	logSize := uint64(info.Size())
-
-	startPosition := uint64(0)
-	expectedOffset := baseOffset
-	if entry, ok := lastUsableIndexEntry(indexPath, logSize); ok {
-		valid, validateErr := indexEntryMatchesRecord(logPath, entry)
-		if validateErr == nil && valid {
-			startPosition = entry.Position
-			expectedOffset = entry.Offset
-		}
-	}
-
-	validBytes, nextOffset, partial, err := scanSegmentTail(logPath, startPosition, expectedOffset)
-	if err != nil && startPosition != 0 {
-		// A stale or corrupt index is recoverable because the log is authoritative.
-		validBytes, nextOffset, partial, err = scanSegmentTail(logPath, 0, baseOffset)
-	}
+	validBytes, nextOffset, partial, err := scanSegmentTail(logPath, 0, baseOffset)
 	if err != nil {
 		return segmentRecovery{}, err
 	}
 	if partial {
-		if rejectPartialTail {
-			return segmentRecovery{}, fmt.Errorf("truncated internal metadata record at byte %d", validBytes)
-		}
 		if err := truncateAndSync(logPath, validBytes); err != nil {
 			return segmentRecovery{}, fmt.Errorf("truncate partial segment tail: %w", err)
 		}

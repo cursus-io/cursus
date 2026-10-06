@@ -51,10 +51,6 @@ func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replica
 	if err := replicationFSM.ValidateReplicaCatchupBatchDigest(batch); err != nil {
 		return err
 	}
-	if len(batch.Messages) > replicationFSM.MaxReplicaCatchupRecords || (!batch.Compacted && len(batch.Messages) == 0) {
-		return fmt.Errorf("invalid replica catch-up batch size %d", len(batch.Messages))
-	}
-
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -98,10 +94,33 @@ func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replica
 	if err != nil {
 		return err
 	}
-	releaseMutation := partition.BeginReplicationMutation()
-	defer releaseMutation()
 	if partition.NextOffset() != batch.StartOffset {
 		return fmt.Errorf("replica catch-up local LEO changed: current=%d response_start=%d", partition.NextOffset(), batch.StartOffset)
+	}
+	if batch.TruncateTo != nil {
+		if len(batch.Messages) != 0 || batch.Verified || *batch.TruncateTo >= batch.StartOffset || batch.EndOffset != batch.StartOffset {
+			return fmt.Errorf("invalid replica catch-up truncation boundary")
+		}
+		if err := partition.ReconcileCommittedHWM(*batch.TruncateTo); err != nil {
+			return err
+		}
+		partition.FlushDisk()
+		return nil
+	}
+	releaseMutation := partition.BeginReplicationMutation()
+	defer releaseMutation()
+	if batch.Verified && batch.StartOffset == batch.CommittedHWM {
+		if len(batch.Messages) != 0 || batch.EndOffset != batch.StartOffset {
+			return fmt.Errorf("invalid replica catch-up verification batch")
+		}
+		if err := partition.ApplyReplicaHWM(batch.CommittedHWM); err != nil {
+			return err
+		}
+		partition.FlushDisk()
+		return nil
+	}
+	if len(batch.Messages) > replicationFSM.MaxReplicaCatchupRecords || (!batch.Compacted && len(batch.Messages) == 0) {
+		return fmt.Errorf("invalid replica catch-up batch size %d", len(batch.Messages))
 	}
 	endOffset := batch.EndOffset
 	if endOffset == 0 && len(batch.Messages) > 0 {
@@ -136,6 +155,9 @@ func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replica
 	}
 	if endOffset != batch.CommittedHWM {
 		return nil
+	}
+	if !batch.Verified {
+		return fmt.Errorf("replica catch-up completed without prefix verification")
 	}
 	if localTopic.IsEventSourcing && ch.ESHandler != nil {
 		if err := ch.ESHandler.PrepareCommittedIndex(batch.Topic, batch.Partition); err != nil {

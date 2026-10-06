@@ -20,12 +20,14 @@ type recordingCatchupFetcher struct {
 
 func (f *recordingCatchupFetcher) FetchReplicaCatchup(_ context.Context, _ string, _ int, request fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error) {
 	f.requests = append(f.requests, request)
+	endOffset := request.NextOffset + 1
 	return fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
 		Topic: request.Topic, Partition: request.Partition, BrokerID: request.BrokerID,
-		StartOffset: request.NextOffset, CommittedHWM: request.CommittedHWM,
+		StartOffset: request.NextOffset, EndOffset: endOffset, CommittedHWM: request.CommittedHWM,
 		Leader: request.Leader, SourceBroker: request.SourceBroker,
 		LeaderEpoch: request.LeaderEpoch, LifecycleEpoch: request.LifecycleEpoch,
-		Messages: []types.Message{{Offset: request.NextOffset, Payload: "backfill"}},
+		Verified: endOffset == request.CommittedHWM,
+		Messages: []types.Message{{Offset: request.NextOffset, Payload: "backfill", LeaderEpoch: int64(request.LeaderEpoch)}},
 	})
 }
 
@@ -63,10 +65,13 @@ func TestRunReplicaCatchupOnceFetchesUntilCommittedHWM(t *testing.T) {
 	rm := &MockRaftManager{mockFSM: brokerFSM}
 	cc := NewClusterController(context.Background(), cfg, rm, nil, "node-2", "127.0.0.1:9002")
 	fetcher := &recordingCatchupFetcher{}
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
 	var applied []fsm.ReplicaCatchupBatch
 	err = cc.RunReplicaCatchupOnce(context.Background(), fetcher, func(_ context.Context, batch fsm.ReplicaCatchupBatch) error {
 		applied = append(applied, batch)
-		return nil
+		partition.UpdateLEO(batch.EndOffset)
+		return partition.ApplyReplicaHWM(batch.EndOffset)
 	})
 	require.NoError(t, err)
 	require.Len(t, fetcher.requests, 3)
@@ -74,6 +79,12 @@ func TestRunReplicaCatchupOnceFetchesUntilCommittedHWM(t *testing.T) {
 	require.Equal(t, []uint64{0, 1, 2}, []uint64{
 		fetcher.requests[0].NextOffset, fetcher.requests[1].NextOffset, fetcher.requests[2].NextOffset,
 	})
+	require.Empty(t, fetcher.requests[0].PreviousRecordDigest)
+	require.NotEmpty(t, fetcher.requests[1].PreviousRecordDigest)
+	require.NotEmpty(t, fetcher.requests[2].PreviousRecordDigest)
+	require.NotEqual(t, fetcher.requests[1].PreviousRecordDigest, fetcher.requests[2].PreviousRecordDigest)
+	require.Equal(t, int64(fetcher.requests[0].LeaderEpoch), fetcher.requests[1].PreviousLeaderEpoch)
+	require.Equal(t, int64(fetcher.requests[0].LeaderEpoch), fetcher.requests[2].PreviousLeaderEpoch)
 }
 
 func TestValidateReplicaCatchupBatchRejectsFenceAndGap(t *testing.T) {

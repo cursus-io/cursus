@@ -14,21 +14,23 @@ import (
 
 // DiskMessage mirrors types.DiskMessage for standalone verification.
 type DiskMessage struct {
-	Topic      string
-	Partition  int32
-	Offset     uint64
-	ProducerID string
-	SeqNum     uint64
-	Epoch      int64
-	Payload    string
+	Topic       string
+	Partition   int32
+	Offset      uint64
+	ProducerID  string
+	SeqNum      uint64
+	Epoch       int64
+	LeaderEpoch int64
+	Payload     string
 }
 
 func deserializeDiskMessage(data []byte) (DiskMessage, error) {
 	var msg DiskMessage
 	pos := 0
-	if len(data) < 4 || (string(data[:4]) != "CDM2" && string(data[:4]) != "CDM3" && string(data[:4]) != "CDM4") {
+	if len(data) < 4 || (string(data[:4]) != "CDM2" && string(data[:4]) != "CDM3" && string(data[:4]) != "CDM4" && string(data[:4]) != "CDM5") {
 		return msg, fmt.Errorf("unsupported disk message format")
 	}
+	format := string(data[:4])
 	pos = 4
 
 	if pos+2 > len(data) {
@@ -76,6 +78,13 @@ func deserializeDiskMessage(data []byte) (DiskMessage, error) {
 	}
 	msg.Epoch = int64(binary.BigEndian.Uint64(data[pos : pos+8]))
 	pos += 8
+	if format == "CDM5" {
+		if pos+8 > len(data) {
+			return msg, fmt.Errorf("too short for leader epoch")
+		}
+		msg.LeaderEpoch = int64(binary.BigEndian.Uint64(data[pos : pos+8]))
+		pos += 8
+	}
 
 	if pos+4 > len(data) {
 		return msg, fmt.Errorf("too short for payload length")

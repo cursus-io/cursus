@@ -39,10 +39,10 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 	tlsCert := flags.String("tls-cert", "", "optional TLS client certificate")
 	tlsKey := flags.String("tls-key", "", "optional TLS client private key")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: cursusctl --broker host:port [options] COMMAND [key=value ...]")
-		fmt.Fprintln(stderr, "Examples: cursusctl --broker broker:9000 LIST")
-		fmt.Fprintln(stderr, "          cursusctl --broker broker:9000 CREATE topic=orders partitions=3")
-		fmt.Fprintln(stderr, "          cursusctl --broker broker:9000 REGISTER_GROUP topic=orders group=workers")
+		_, _ = fmt.Fprintln(stderr, "Usage: cursusctl --broker host:port [options] COMMAND [key=value ...]")
+		_, _ = fmt.Fprintln(stderr, "Examples: cursusctl --broker broker:9000 LIST")
+		_, _ = fmt.Fprintln(stderr, "          cursusctl --broker broker:9000 CREATE topic=orders partitions=3")
+		_, _ = fmt.Fprintln(stderr, "          cursusctl --broker broker:9000 REGISTER_GROUP topic=orders group=workers")
 	}
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -52,16 +52,16 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 		return 2
 	}
 	if (*principal == "") != (*authTokenEnv == "") {
-		fmt.Fprintln(stderr, "--principal and --auth-token-env must be provided together")
+		_, _ = fmt.Fprintln(stderr, "--principal and --auth-token-env must be provided together")
 		return 2
 	}
 	if (*tlsCert == "") != (*tlsKey == "") {
-		fmt.Fprintln(stderr, "--tls-cert and --tls-key must be provided together")
+		_, _ = fmt.Fprintln(stderr, "--tls-cert and --tls-key must be provided together")
 		return 2
 	}
 	command := strings.Join(flags.Args(), " ")
 	if _, _, err := wire.ParseCommandText(command); err != nil {
-		fmt.Fprintf(stderr, "invalid Wire v2 command: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "invalid Wire v2 command: %v\n", err)
 		return 2
 	}
 
@@ -69,36 +69,36 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 	defer cancel()
 	conn, err := dialBroker(ctx, *broker, *tlsCA, *tlsServerName, *tlsCert, *tlsKey)
 	if err != nil {
-		fmt.Fprintf(stderr, "connect broker: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "connect broker: %v\n", err)
 		return 1
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := conn.SetDeadline(time.Now().Add(*timeout)); err != nil {
-		fmt.Fprintf(stderr, "set connection deadline: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "set connection deadline: %v\n", err)
 		return 1
 	}
 	client, err := wire.NewClientConn(conn, *compression)
 	if err != nil {
-		fmt.Fprintf(stderr, "negotiate Wire v2: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "negotiate Wire v2: %v\n", err)
 		return 1
 	}
 	if *principal != "" {
 		token := getenv(*authTokenEnv)
 		if token == "" {
-			fmt.Fprintf(stderr, "authentication token environment variable %q is empty\n", *authTokenEnv)
+			_, _ = fmt.Fprintf(stderr, "authentication token environment variable %q is empty\n", *authTokenEnv)
 			return 2
 		}
 		if err := execute(client, "AUTH principal="+*principal+" token="+token, stdout); err != nil {
-			fmt.Fprintf(stderr, "authenticate: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "authenticate: %v\n", err)
 			return 1
 		}
 	}
 	if err := execute(client, command, stdout); err != nil {
 		var brokerErr *wire.BrokerError
 		if errors.As(err, &brokerErr) {
-			fmt.Fprintf(stderr, "broker rejected command: %v\n", brokerErr)
+			_, _ = fmt.Fprintf(stderr, "broker rejected command: %v\n", brokerErr)
 		} else {
-			fmt.Fprintf(stderr, "execute command: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "execute command: %v\n", err)
 		}
 		return 1
 	}

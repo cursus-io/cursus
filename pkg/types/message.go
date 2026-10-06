@@ -23,14 +23,15 @@ type Batch = wire.Batch
 
 // DiskMessage represents a message stored on disk with full metadata
 type DiskMessage struct {
-	Topic      string
-	Partition  int32
-	Offset     uint64
-	ProducerID string
-	SeqNum     uint64
-	Epoch      int64
-	Payload    string
-	Key        string
+	Topic       string
+	Partition   int32
+	Offset      uint64
+	ProducerID  string
+	SeqNum      uint64
+	Epoch       int64
+	LeaderEpoch int64
+	Payload     string
+	Key         string
 
 	EventType        string
 	SchemaVersion    uint32

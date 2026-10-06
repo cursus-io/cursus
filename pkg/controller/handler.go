@@ -171,10 +171,11 @@ func NewCommandHandler(
 		{prefix: "LIST_CLUSTER", exact: true, helpOrder: 35, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListCluster() }},
 		{prefix: "CLUSTER_STATUS", exact: true, helpOrder: 36, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleClusterStatus() }},
 		{prefix: "ELECT_LEADER ", exact: false, helpOrder: 37, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleElectLeader(cmd, ctx) }},
+		{prefix: "REASSIGN_PARTITION ", exact: false, helpOrder: 39, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReassignPartition(cmd, ctx) }},
 		{prefix: "LIST", exact: true, helpOrder: 4, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleList(ctx) }},
 		{prefix: "LIST_GROUPS", exact: true, helpOrder: 25, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListGroups() }},
 		{prefix: "CREATE ", exact: false, helpOrder: 1, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCreate(cmd, ctx) }},
-		{prefix: "ALTER_TOPIC_CONFIG ", exact: false, helpOrder: 40, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAlterTopicConfig(cmd, ctx) }},
+		{prefix: "ALTER_TOPIC_CONFIG ", exact: false, helpOrder: 41, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAlterTopicConfig(cmd, ctx) }},
 		{prefix: "DELETE ", exact: false, helpOrder: 2, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd, ctx) }},
 		{prefix: "TRUNCATE ", exact: false, helpOrder: 3, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTruncate(cmd, ctx) }},
 		{prefix: "PUBLISH ", exact: false, helpOrder: 5, permissions: []string{PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd, ctx) }},
@@ -200,8 +201,8 @@ func NewCommandHandler(
 		{prefix: "END_TXN ", exact: false, helpOrder: 21, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleEndTxn(cmd) }},
 		{prefix: "TXN_STATUS ", exact: false, helpOrder: 22, permissions: []string{PermissionTransaction}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTxnStatus(cmd) }},
 		{prefix: "APPEND_STREAM ", exact: false, helpOrder: 27, permissions: []string{PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAppendStream(cmd) }},
-		{prefix: "AGGREGATE_REPLAY_PROOF ", exact: false, helpOrder: 41, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAggregateReplayProof(cmd) }},
-		{prefix: "AGGREGATE_EVENT_RANGE_READ ", exact: false, helpOrder: 42, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAggregateEventRangeRead(cmd) }},
+		{prefix: "AGGREGATE_REPLAY_PROOF ", exact: false, helpOrder: 42, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAggregateReplayProof(cmd) }},
+		{prefix: "AGGREGATE_EVENT_RANGE_READ ", exact: false, helpOrder: 43, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAggregateEventRangeRead(cmd) }},
 		{prefix: "STREAM_VERSION ", exact: false, helpOrder: 31, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string {
 			return ch.handleEventSourceRoutedCommand(cmd, "STREAM_VERSION ", ch.ESHandler.HandleStreamVersion)
 		}},
@@ -209,8 +210,8 @@ func NewCommandHandler(
 		{prefix: "READ_SNAPSHOT ", exact: false, helpOrder: 30, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string {
 			return ch.handleEventSourceRoutedCommand(cmd, "READ_SNAPSHOT ", ch.ESHandler.HandleReadSnapshot)
 		}},
-		{prefix: "BROWSE_MESSAGES ", exact: false, helpOrder: 43, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return BROWSE_DATA_SIGNAL }},
-		{prefix: "READ_STREAM_HISTORY ", exact: false, helpOrder: 44, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return STREAM_HISTORY_DATA_SIGNAL }},
+		{prefix: "BROWSE_MESSAGES ", exact: false, helpOrder: 44, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return BROWSE_DATA_SIGNAL }},
+		{prefix: "READ_STREAM_HISTORY ", exact: false, helpOrder: 45, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return STREAM_HISTORY_DATA_SIGNAL }},
 		{prefix: "READ_STREAM ", exact: false, helpOrder: 28, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return STREAM_DATA_SIGNAL }},
 		{prefix: "METADATA ", exact: false, helpOrder: 32, permissions: []string{PermissionTopicRead}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleMetadata(cmd) }},
 		{prefix: "FIND_COORDINATOR ", exact: false, helpOrder: 33, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFindCoordinator(cmd) }},

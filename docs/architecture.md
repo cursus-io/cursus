@@ -303,7 +303,7 @@ sequenceDiagram
 
 In distributed mode, authoritative group and transaction-coordinator changes are persisted through the Raft FSM and snapshots. Consumer offsets are different: new ordinary and transactional offset writes use the replicated `__consumer_offsets` partition log in both standalone and distributed modes. `OFFSET_SYNC` and `BATCH_OFFSET` remain decodable only to replay older metadata logs. Standalone transaction snapshots use an append-only fsynced journal under `log_dir`. The final transaction snapshot is persisted before its decision opens `read_committed` output and offset visibility.
 
-Current distributed storage uses Raft snapshot format 9 and requires explicit
+Current distributed storage uses Raft snapshot format 10 and requires explicit
 committed-HWM provenance. Older, unmarked, or ambiguous persistent state is a
 clean-bootstrap boundary; mixed-version rolling upgrade and downgrade are not
 supported across that boundary. During supported current-format startup, the

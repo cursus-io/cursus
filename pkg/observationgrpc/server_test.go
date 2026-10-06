@@ -24,7 +24,7 @@ func TestStartRejectsInvalidArguments(t *testing.T) {
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	if _, err := Start(context.Background(), listener.Addr().String(), backend); err == nil {
 		t.Fatal("expected occupied address to fail")
 	}
@@ -43,7 +43,7 @@ func TestStartServesAndShutsDownObservationService(t *testing.T) {
 
 	connection, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
-	defer connection.Close()
+	defer func() { _ = connection.Close() }()
 	client := observationv1.NewObservationServiceClient(connection)
 
 	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), time.Second)

@@ -6,15 +6,15 @@ import (
 )
 
 var (
-	Version  = "dev"
+	Version  = "0.2.0"
 	Revision = "unknown"
 )
 
 const (
 	WireProtocolVersion   = "2"
-	BrokerProtocolVersion = "4"
+	BrokerProtocolVersion = "5"
 	SnapshotFormatVersion = "10"
-	RecordFormatVersion   = "CDM4"
+	RecordFormatVersion   = "CDM5"
 )
 
 func VerifyDeploymentContract() error {

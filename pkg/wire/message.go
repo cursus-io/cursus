@@ -29,6 +29,9 @@ type Message struct {
 	Payload    string
 	Key        string
 	Epoch      int64
+	// LeaderEpoch is broker-assigned replication provenance. Client-provided
+	// values are ignored by distributed leaders.
+	LeaderEpoch int64
 
 	EventType        string
 	SchemaVersion    uint32

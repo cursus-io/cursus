@@ -38,7 +38,7 @@ func TestDiskHandlerRejectsSecondWriterAndPreservesAcknowledgedData(t *testing.T
 	require.NoError(t, first.Close())
 	reopened, err := NewDiskHandler(cfg, "exclusive", 0)
 	require.NoError(t, err)
-	defer reopened.Close()
+	defer func() { _ = reopened.Close() }()
 	messages, err := reopened.ReadMessages(0, 10)
 	require.NoError(t, err)
 	require.Len(t, messages, 2)
@@ -75,7 +75,7 @@ func TestStorageLockProcessHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 	fmt.Println("LOCKED")
 	_, _ = io.Copy(io.Discard, os.Stdin)
 }
@@ -84,7 +84,7 @@ func TestStorageDirectoryLockIsProcessExclusive(t *testing.T) {
 	dir := t.TempDir()
 	lock, err := LockStorageDirectory(dir)
 	require.NoError(t, err)
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 	executable, err := os.Executable()
 	require.NoError(t, err)
 	child := exec.Command(executable, "-test.run=^TestStorageLockProcessHelper$")
@@ -105,7 +105,7 @@ func TestStorageDirectoryLockIsReleasedWhenOwnerIsKilled(t *testing.T) {
 	child.Env = append(os.Environ(), "CURSUS_STORAGE_LOCK_HELPER_DIR="+dir, "CURSUS_STORAGE_LOCK_HELPER_MODE=hold")
 	input, err := child.StdinPipe()
 	require.NoError(t, err)
-	defer input.Close()
+	defer func() { _ = input.Close() }()
 	output, err := child.StdoutPipe()
 	require.NoError(t, err)
 	require.NoError(t, child.Start())

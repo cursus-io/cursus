@@ -126,9 +126,10 @@ func TestTopicLifecycleBlocksActiveV1Transactions(t *testing.T) {
 				producer, epoch := stageOperationalTransaction(t, ch, "active-txn", "active-topic", stream)
 				ep, err := strconv.ParseInt(epoch, 10, 64)
 				require.NoError(t, err)
-				if state == transaction.StatePrepareCommit {
+				switch state {
+				case transaction.StatePrepareCommit:
 					_, err = ch.TxnManager.PrepareCommit("active-txn", producer, ep)
-				} else if state == transaction.StatePrepareAbort {
+				case transaction.StatePrepareAbort:
 					_, err = ch.TxnManager.PrepareAbort("active-txn", producer, ep)
 				}
 				require.NoError(t, err)

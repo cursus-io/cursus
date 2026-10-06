@@ -33,12 +33,12 @@ func TestCommittedTransactionAppearsInBoundedBrowseAndStreamHistory(t *testing.T
 	require.Equal(t, "committed", batch.Messages[0].Payload)
 
 	client, server := net.Pipe()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	require.NoError(t, client.SetDeadline(time.Now().Add(3*time.Second)))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		defer server.Close()
+		defer func() { _ = server.Close() }()
 		ch.ESHandler.HandleReadStreamHistory("READ_STREAM_HISTORY topic=history-state key=run from_version=1", server)
 	}()
 	data, err := util.ReadWithLength(client)

@@ -70,7 +70,7 @@ func TestReplicaCatchupPreservesHistoricalTransactionsAfterStateChanges(t *testi
 			}
 			batch, err := fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
 				Topic: "orders", Partition: 0, BrokerID: "broker-2", StartOffset: 0, EndOffset: 2, CommittedHWM: 2,
-				Leader: "broker-1", SourceBroker: "broker-1", LeaderEpoch: 7, LifecycleEpoch: topic.InitialLifecycleEpoch, Messages: messages,
+				Leader: "broker-1", SourceBroker: "broker-1", LeaderEpoch: 7, LifecycleEpoch: topic.InitialLifecycleEpoch, Verified: true, Messages: messages,
 			})
 			require.NoError(t, err)
 			require.NoError(t, ch.ApplyReplicaCatchup(context.Background(), batch))

@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/cursus-io/cursus
-  tag: "0.1.0"
+  tag: "0.2.0"
   pullPolicy: IfNotPresent
 
 service:
@@ -29,6 +29,14 @@ tls:
   secretName: cursus-tls
   certPath: /app/tls/cert.pem
   keyPath: /app/tls/key.pem
+
+clientSecurity:
+  # Production installs require TLS and SASL. Set allowInsecure only for an
+  # isolated development namespace.
+  allowInsecure: false
+  sasl:
+    secretName: ""
+    secretKey: users
 
 podSecurityContext:
   fsGroup: 1000

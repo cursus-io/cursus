@@ -10,9 +10,9 @@ image:
 
 compatibility:
   wireProtocol: "2"
-  brokerProtocol: "4"
+  brokerProtocol: "5"
   snapshotFormat: "10"
-  recordFormat: "CDM4"
+  recordFormat: "CDM5"
 
 service:
   # Brokers advertise their stable in-cluster Pod DNS names. NodePort and
