@@ -362,6 +362,31 @@ func TestPartition_ReconcileCommittedHWMTruncatesUncommittedTail(t *testing.T) {
 	require.Equal(t, "replacement", msgs[1].Payload)
 }
 
+func TestPartition_TruncateReplicaTailPreservesCommittedHWM(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 1
+
+	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	t.Cleanup(func() {
+		p.Close()
+		require.NoError(t, dh.Close())
+	})
+
+	require.NoError(t, p.EnqueueSync(types.Message{Payload: "committed"}))
+	require.NoError(t, p.EnqueueBatchLeader([]types.Message{{Payload: "tail-1"}, {Payload: "tail-2"}}))
+	require.Equal(t, uint64(3), p.NextOffset())
+	require.Equal(t, uint64(1), p.GetHWM())
+
+	require.ErrorContains(t, p.TruncateReplicaTail(0), "crosses committed HWM")
+	require.Equal(t, uint64(3), p.NextOffset())
+	require.NoError(t, p.TruncateReplicaTail(2))
+	require.Equal(t, uint64(2), p.NextOffset())
+	require.Equal(t, uint64(1), p.GetHWM())
+}
+
 func TestPartition_ReconcileCommittedHWMPersistsClearedProducerCheckpoint(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

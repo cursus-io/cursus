@@ -27,7 +27,7 @@ func (f *recordingCatchupFetcher) FetchReplicaCatchup(_ context.Context, _ strin
 		Leader: request.Leader, SourceBroker: request.SourceBroker,
 		LeaderEpoch: request.LeaderEpoch, LifecycleEpoch: request.LifecycleEpoch,
 		Verified: endOffset == request.CommittedHWM,
-		Messages: []types.Message{{Offset: request.NextOffset, Payload: "backfill"}},
+		Messages: []types.Message{{Offset: request.NextOffset, Payload: "backfill", LeaderEpoch: int64(request.LeaderEpoch)}},
 	})
 }
 
@@ -79,6 +79,12 @@ func TestRunReplicaCatchupOnceFetchesUntilCommittedHWM(t *testing.T) {
 	require.Equal(t, []uint64{0, 1, 2}, []uint64{
 		fetcher.requests[0].NextOffset, fetcher.requests[1].NextOffset, fetcher.requests[2].NextOffset,
 	})
+	require.Empty(t, fetcher.requests[0].PreviousRecordDigest)
+	require.NotEmpty(t, fetcher.requests[1].PreviousRecordDigest)
+	require.NotEmpty(t, fetcher.requests[2].PreviousRecordDigest)
+	require.NotEqual(t, fetcher.requests[1].PreviousRecordDigest, fetcher.requests[2].PreviousRecordDigest)
+	require.Equal(t, int64(fetcher.requests[0].LeaderEpoch), fetcher.requests[1].PreviousLeaderEpoch)
+	require.Equal(t, int64(fetcher.requests[0].LeaderEpoch), fetcher.requests[2].PreviousLeaderEpoch)
 }
 
 func TestValidateReplicaCatchupBatchRejectsFenceAndGap(t *testing.T) {

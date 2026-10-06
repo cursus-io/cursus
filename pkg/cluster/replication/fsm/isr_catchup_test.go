@@ -141,6 +141,67 @@ func TestBuildReplicaCatchupRequestsUsesLocalLEOAndLeaderFence(t *testing.T) {
 	require.Len(t, brokerFSM.BuildReplicaCatchupRequests("node-2"), 1, "a lagging replica must catch up even before ISR eviction commits")
 }
 
+func TestAdvanceReplicaCatchupRequestMovesBoundaryAndPrefixProof(t *testing.T) {
+	request := ReplicaCatchupRequest{NextOffset: 2, CommittedHWM: 4}
+	batch := ReplicaCatchupBatch{
+		StartOffset: 2,
+		EndOffset:   3,
+		Messages:    []types.Message{{Offset: 2, Payload: "next", LeaderEpoch: 7}},
+	}
+	require.NoError(t, AdvanceReplicaCatchupRequest(&request, batch))
+	require.Equal(t, uint64(3), request.NextOffset)
+	require.Equal(t, int64(7), request.PreviousLeaderEpoch)
+	require.NotEmpty(t, request.PreviousRecordDigest)
+
+	verified := ReplicaCatchupBatch{StartOffset: 3, EndOffset: 3, CommittedHWM: 3, Verified: true}
+	request.CommittedHWM = 3
+	require.NoError(t, AdvanceReplicaCatchupRequest(&request, verified))
+	require.Equal(t, uint64(3), request.NextOffset)
+}
+
+func TestBuildReplicaCatchupRequestsTruncatesTailWithoutPublishingHWM(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	t.Cleanup(partition.Close)
+	require.NoError(t, partition.ReplicaAppendWithMode([]types.Message{
+		{Offset: 0, Payload: "common", LeaderEpoch: 1},
+		{Offset: 1, Payload: "committed-but-unverified", LeaderEpoch: 1},
+		{Offset: 2, Payload: "uncommitted-tail", LeaderEpoch: 2},
+	}, true))
+	require.Equal(t, uint64(3), partition.NextOffset())
+	require.Zero(t, partition.GetHWM())
+
+	brokerFSM := NewBrokerFSM(topicManager, nil)
+	registerActiveBroker(t, brokerFSM, "node-1")
+	registerActiveBroker(t, brokerFSM, "node-2")
+	definition := topicManager.GetTopic("orders").Definition()
+	brokerFSM.mu.Lock()
+	brokerFSM.topicState["orders"] = &definition
+	brokerFSM.partitionMetadata["orders-0"] = &PartitionMetadata{
+		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch,
+		CommittedHWM: 2, CommittedHWMKnown: true, PartitionCount: 1,
+		Replicas: []string{"node-1", "node-2"}, ISR: []string{"node-1"},
+	}
+	brokerFSM.mu.Unlock()
+
+	requests := brokerFSM.BuildReplicaCatchupRequests("node-2")
+	require.Len(t, requests, 1)
+	require.Equal(t, uint64(2), requests[0].NextOffset)
+	require.NotEmpty(t, requests[0].PreviousRecordDigest)
+	require.Equal(t, uint64(2), partition.NextOffset())
+	require.Zero(t, partition.GetHWM(), "prefix verification must precede committed HWM publication")
+	require.NoError(t, partition.ReconcileCommittedHWM(1), "a verified divergence boundary must remain repairable")
+	require.Equal(t, uint64(1), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM())
+}
+
 func TestBuildReplicaCatchupRequestsRepairsLaggingMetadataLeaderFromActiveISR(t *testing.T) {
 	brokerFSM := newISRCatchupTestFSM(t)
 	brokerFSM.mu.Lock()

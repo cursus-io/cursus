@@ -89,20 +89,16 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		if batch.TruncateTo != nil {
 			return nil
 		}
-		nextOffset := batch.EndOffset
-		if nextOffset == 0 && len(batch.Messages) > 0 {
-			nextOffset = batch.Messages[len(batch.Messages)-1].Offset + 1
+		if err := fsm.AdvanceReplicaCatchupRequest(&request, batch); err != nil {
+			return err
 		}
+		nextOffset := request.NextOffset
 		if nextOffset == request.CommittedHWM {
 			if !batch.Verified {
 				return fmt.Errorf("replica catch-up completed without prefix verification")
 			}
 			break
 		}
-		if nextOffset <= request.NextOffset {
-			return fmt.Errorf("replica catch-up made no progress at offset %d", request.NextOffset)
-		}
-		request.NextOffset = nextOffset
 	}
 	if request.SnapshotCatchup {
 		if cc.snapshotCatchup == nil {

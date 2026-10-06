@@ -82,6 +82,41 @@ func ValidateReplicaCatchupBatchDigest(batch ReplicaCatchupBatch) error {
 	return nil
 }
 
+// AdvanceReplicaCatchupRequest moves the request boundary and its prefix proof
+// together after a batch has been validated and durably applied.
+func AdvanceReplicaCatchupRequest(request *ReplicaCatchupRequest, batch ReplicaCatchupBatch) error {
+	if request == nil {
+		return fmt.Errorf("replica catch-up request is nil")
+	}
+	endOffset := batch.EndOffset
+	if endOffset == 0 && len(batch.Messages) > 0 {
+		endOffset = batch.Messages[len(batch.Messages)-1].Offset + 1
+	}
+	if endOffset == request.NextOffset && batch.Verified && endOffset == request.CommittedHWM {
+		return nil
+	}
+	if endOffset <= request.NextOffset {
+		return fmt.Errorf("replica catch-up made no progress at offset %d", request.NextOffset)
+	}
+	request.NextOffset = endOffset
+	request.PreviousLeaderEpoch = 0
+	request.PreviousRecordDigest = ""
+	if len(batch.Messages) == 0 {
+		return nil
+	}
+	previous := batch.Messages[len(batch.Messages)-1]
+	if previous.Offset+1 != endOffset {
+		return nil
+	}
+	request.PreviousLeaderEpoch = previous.LeaderEpoch
+	digest, err := replicaRecordDigest(previous)
+	if err != nil {
+		return fmt.Errorf("encode replica catch-up prefix proof: %w", err)
+	}
+	request.PreviousRecordDigest = digest
+	return nil
+}
+
 func replicaCatchupBatchDigest(batch ReplicaCatchupBatch) (string, error) {
 	batch.Digest = ""
 	data, err := json.Marshal(batch)
@@ -357,13 +392,21 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 			continue
 		}
 		leo := partition.NextOffset()
+		inISR := containsString(meta.ISR, brokerID)
+		if leo > meta.CommittedHWM && !inISR {
+			if err := partition.TruncateReplicaTail(meta.CommittedHWM); err != nil {
+				continue
+			}
+			partition.FlushDisk()
+			leo = partition.NextOffset()
+		}
 		if leo >= meta.CommittedHWM {
-			if leo == meta.CommittedHWM || !containsString(meta.ISR, brokerID) {
+			if leo == meta.CommittedHWM && inISR {
 				if err := partition.ReconcileCommittedHWM(meta.CommittedHWM); err == nil {
 					partition.FlushDisk()
 				}
 			}
-			if leo == meta.CommittedHWM && !containsString(meta.ISR, brokerID) {
+			if leo == meta.CommittedHWM && !inISR {
 				request := ReplicaCatchupRequest{
 					Topic: topicName, Partition: partitionID, BrokerID: brokerID,
 					NextOffset: leo, CommittedHWM: meta.CommittedHWM,

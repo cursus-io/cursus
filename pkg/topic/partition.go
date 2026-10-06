@@ -1613,6 +1613,22 @@ func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
 	return nil
 }
 
+// TruncateReplicaTail removes only records above a repair boundary. It does not
+// publish that boundary as committed; prefix verification must complete first.
+func (p *Partition) TruncateReplicaTail(offset uint64) error {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.snapshotRecovery {
+		return fmt.Errorf("snapshot replay is still pending: visible_hwm=%d durable_hwm=%d requested_offset=%d", p.HWM, p.recoveryCheckpointHWM, offset)
+	}
+	if offset < p.HWM {
+		return fmt.Errorf("replica tail truncation crosses committed HWM: hwm=%d requested_offset=%d", p.HWM, offset)
+	}
+	return p.truncateReplicaTailLocked(offset)
+}
+
 // ReconcileSnapshotHWM stages the snapshot visibility boundary without
 // deleting any later local records. Raft replays its committed log tail after
 // Restore returns, then FinalizeSnapshotRecovery performs the only truncation.
@@ -1691,28 +1707,29 @@ func (p *Partition) reconcileCommittedHWMLocked(hwm uint64) error {
 	if hwm < p.HWM {
 		return fmt.Errorf("committed HWM regression: current=%d requested=%d", p.HWM, hwm)
 	}
-	leo := p.LEO.Load()
-	if leo < hwm {
-		return fmt.Errorf("replica is behind committed watermark: leo=%d hwm=%d", leo, hwm)
-	}
-	if leo == hwm && p.HWM == hwm {
-		return nil
-	}
-	truncated := false
-	if leo > hwm {
-		if err := p.dh.TruncateTo(hwm); err != nil {
-			return fmt.Errorf("truncate uncommitted tail to %d: %w", hwm, err)
-		}
-		p.LEO.Store(hwm)
-		truncated = true
+	if err := p.truncateReplicaTailLocked(hwm); err != nil {
+		return err
 	}
 	if p.HWM != hwm {
 		p.HWM = hwm
 		p.signalHWMCheckpointLocked()
 	}
-	if !truncated {
+	return nil
+}
+
+func (p *Partition) truncateReplicaTailLocked(offset uint64) error {
+	leo := p.LEO.Load()
+	if leo < offset {
+		return fmt.Errorf("replica is behind repair boundary: leo=%d offset=%d", leo, offset)
+	}
+	if leo == offset {
 		return nil
 	}
+	if err := p.dh.TruncateTo(offset); err != nil {
+		return fmt.Errorf("truncate replica tail to %d: %w", offset, err)
+	}
+	p.LEO.Store(offset)
+	p.replicaVerified = false
 
 	p.txnMarkerMu.Lock()
 	p.txnMarkers = make(map[transactionMarkerKey]transactionMarkerInfo)
