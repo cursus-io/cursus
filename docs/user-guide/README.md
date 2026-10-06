@@ -7,10 +7,14 @@ This guide starts one local broker and exercises it with the in-repository Go SD
 ```bash
 docker pull ghcr.io/cursus-io/cursus:latest
 docker run --rm --name cursus \
-  -p 9000:9000 -p 9080:9080 -p 9100:9100 \
+  -p 127.0.0.1:9000:9000 -p 127.0.0.1:9080:9080 -p 127.0.0.1:9100:9100 \
+  -e BROKER_BIND_ADDRESS=0.0.0.0 \
+  -e ALLOW_INSECURE_CLIENT_TRANSPORT=true \
   -v cursus-data:/data/logs \
   ghcr.io/cursus-io/cursus:latest
 ```
+
+This development-only plaintext command requires Docker Engine 28.3.3 or newer so loopback-published ports remain host-local. On older engines, configure TLS and SASL before publishing the broker port.
 
 The default ports are:
 

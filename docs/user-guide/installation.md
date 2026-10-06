@@ -3,7 +3,7 @@
 ## Requirements
 
 - Go 1.25.0 or newer for source builds (`go.mod` is authoritative).
-- Docker Engine with Compose for containerized E2E and benchmark workloads.
+- [Docker Engine 28.3.3 or newer](https://docs.docker.com/engine/release-notes/28/#2833) with Compose for bundled local plaintext examples. Older engines require TLS and SASL because loopback-published ports may be reachable from the local network.
 - GNU Make and Bash for Makefile convenience targets on Unix-like systems.
 
 ## Build From Source
@@ -65,10 +65,14 @@ Pull the published GHCR image:
 ```bash
 docker pull ghcr.io/cursus-io/cursus:latest
 docker run --rm \
-  -p 9000:9000 -p 9080:9080 -p 9100:9100 \
+  -p 127.0.0.1:9000:9000 -p 127.0.0.1:9080:9080 -p 127.0.0.1:9100:9100 \
+  -e BROKER_BIND_ADDRESS=0.0.0.0 \
+  -e ALLOW_INSECURE_CLIENT_TRANSPORT=true \
   -v cursus-data:/data/logs \
   ghcr.io/cursus-io/cursus:latest
 ```
+
+The command above is a development-only plaintext listener. Keep the host bindings on loopback and use Docker Engine 28.3.3 or newer. For shared or production access, enable TLS and SASL and remove `ALLOW_INSECURE_CLIENT_TRANSPORT`.
 
 Use a version tag for repeatable deployment:
 
@@ -93,7 +97,8 @@ Example configuration mount:
 
 ```bash
 docker run --rm \
-  -p 9000:9000 -p 9080:9080 -p 9100:9100 \
+  -p 127.0.0.1:9000:9000 -p 127.0.0.1:9080:9080 -p 127.0.0.1:9100:9100 \
+  -e BROKER_BIND_ADDRESS=0.0.0.0 \
   -e CONFIG_PATH=/app/config.yaml \
   -v "$PWD/config.yaml:/app/config.yaml:ro" \
   -v cursus-data:/data/logs \

@@ -1,3 +1,7 @@
+# Development-only plaintext example. Docker Engine 28.3.3 or newer is
+# required so loopback-published ports remain host-local across firewall
+# reloads. Use TLS and SASL instead of ALLOW_INSECURE_CLIENT_TRANSPORT for any
+# shared or production environment.
 services:
   broker:
     image: cursus-broker:latest

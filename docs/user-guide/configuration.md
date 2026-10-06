@@ -278,13 +278,16 @@ services:
     environment:
       - CONFIG_PATH=/app/config.yaml
       - LOG_DIR=/data/logs
+      - BROKER_BIND_ADDRESS=0.0.0.0
     ports:
-      - "9000:9000"
-      - "9100:9100"
-      - "9080:9080"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9100:9100"
+      - "127.0.0.1:9080:9080"
 volumes:
   cursus-data:
 ```
+
+These loopback bindings are for local inspection and require Docker Engine 28.3.3 or newer. Configure TLS and SASL before publishing the broker listener on a non-loopback host address.
 
 ## Scenario 4: Deployment-Time Overrides
 

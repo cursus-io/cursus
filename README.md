@@ -44,10 +44,14 @@ Cursus is a lightweight, partitioned-log message broker written in Go. It runs a
 
 ```bash
 docker pull ghcr.io/cursus-io/cursus:latest
-docker run --rm -p 9000:9000 -p 9080:9080 -p 9100:9100 ghcr.io/cursus-io/cursus:latest
+docker run --rm \
+  -p 127.0.0.1:9000:9000 -p 127.0.0.1:9080:9080 -p 127.0.0.1:9100:9100 \
+  -e BROKER_BIND_ADDRESS=0.0.0.0 \
+  -e ALLOW_INSECURE_CLIENT_TRANSPORT=true \
+  ghcr.io/cursus-io/cursus:latest
 ```
 
-The client protocol listens on `9000`, health probes on `9080`, and Prometheus metrics on `9100` by default. Production deployments should mount durable storage and configure TLS/authentication explicitly.
+The client protocol listens on `9000`, health probes on `9080`, and Prometheus metrics on `9100` by default. This plaintext local example requires Docker Engine 28.3.3 or newer so loopback-published ports remain host-local. Production deployments should mount durable storage and configure TLS/authentication explicitly.
 
 ## Documentation
 
