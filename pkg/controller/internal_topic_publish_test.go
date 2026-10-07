@@ -8,6 +8,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -56,9 +57,12 @@ func TestCoordinatorCanWriteConsumerMetadataTopicInternally(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
 	cfg.MinInSyncReplicas = 1
-	topicManager := topic.NewTopicManager(cfg, &testMockHandlerProvider{}, nil)
+	cfg.EnableIdempotence = true
+	diskManager := disk.NewDiskManager(cfg)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
 	handler := NewCommandHandler(topicManager, cfg, nil, nil, nil)
 	t.Cleanup(func() { require.NoError(t, handler.Close()) })
+	t.Cleanup(func() { topicManager.Stop(); diskManager.CloseAllHandlers() })
 	require.NoError(t, topicManager.CreateTopic(config.ConsumerOffsetsTopicName, 1, false, false))
 	record := coordinator.ConsumerMetadataRecord{
 		Version:        coordinator.ConsumerMetadataRecordVersion,
@@ -70,6 +74,12 @@ func TestCoordinatorCanWriteConsumerMetadataTopicInternally(t *testing.T) {
 		Timestamp:      time.Now(),
 	}
 	require.NoError(t, handler.writeConsumerOffsetRecord(record))
+	record.Epoch++
+	record.Timestamp = record.Timestamp.Add(time.Second)
+	require.NoError(t, handler.writeConsumerOffsetRecord(record))
+	messages, err := topicManager.ReadTopicPartition(config.ConsumerOffsetsTopicName, 0, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
 }
 
 func TestConsumerOffsetWriterUsesDurablePartitionCount(t *testing.T) {
