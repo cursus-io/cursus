@@ -139,7 +139,7 @@ func TestBrokerFSMRestoreRejectsLegacySnapshotBeforeReconciliation(t *testing.T)
 	require.Equal(t, uint64(1), partition.GetHWM())
 }
 
-func TestBrokerFSMRestoreTruncatesTailBeyondExplicitCommittedHWMZero(t *testing.T) {
+func TestBrokerFSMRestoreKeepsTailHiddenUntilAuthoritativeReconciliation(t *testing.T) {
 	manager, partition := newDurableFSMTopic(t, "current-orders")
 	uncommitted := []types.Message{{Payload: "uncommitted"}}
 	require.NoError(t, partition.EnqueueBatchLeader(uncommitted))
@@ -167,14 +167,16 @@ func TestBrokerFSMRestoreTruncatesTailBeyondExplicitCommittedHWMZero(t *testing.
 	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(data))))
 	require.Equal(t, uint64(1), partition.NextOffset(), "restore stages the tail until replay is finalized")
 	require.NoError(t, restored.FinalizeRecoveredPartitions())
-	require.Zero(t, partition.NextOffset())
+	require.Equal(t, uint64(1), partition.NextOffset(), "a late Raft commit may still acknowledge the tail")
 	require.Zero(t, partition.GetHWM())
-	messages, err := partition.ReadMessages(0, 10)
+	messages, err := partition.ReadCommitted(0, 10)
 	require.NoError(t, err)
 	require.Empty(t, messages)
+	require.NoError(t, partition.ReconcileCommittedHWM(0), "leadership reconciliation can discard an uncommitted tail")
+	require.Zero(t, partition.NextOffset())
 }
 
-func TestBrokerFSMRestoreTruncatesTailToAuthoritativeCommittedHWM(t *testing.T) {
+func TestBrokerFSMRestoreDefersTailTruncationUntilAuthoritativeReconciliation(t *testing.T) {
 	manager, partition := newDurableFSMTopic(t, "bounded-orders")
 	require.NoError(t, partition.EnqueueBatchLeader([]types.Message{
 		{Payload: "committed"},
@@ -187,12 +189,14 @@ func TestBrokerFSMRestoreTruncatesTailToAuthoritativeCommittedHWM(t *testing.T) 
 	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(data))))
 	require.Equal(t, uint64(2), partition.NextOffset(), "restore must not truncate before Raft replay completes")
 	require.NoError(t, restored.FinalizeRecoveredPartitions())
-	require.Equal(t, uint64(1), partition.NextOffset())
+	require.Equal(t, uint64(2), partition.NextOffset())
 	require.Equal(t, uint64(1), partition.GetHWM())
-	messages, err := partition.ReadMessages(0, 10)
+	messages, err := partition.ReadCommitted(0, 10)
 	require.NoError(t, err)
 	require.Len(t, messages, 1)
 	require.Equal(t, "committed", messages[0].Payload)
+	require.NoError(t, partition.ReconcileCommittedHWM(1))
+	require.Equal(t, uint64(1), partition.NextOffset())
 }
 
 func TestBrokerFSMRestorePreservesLocallyCommittedPostSnapshotTail(t *testing.T) {
@@ -220,13 +224,86 @@ func TestBrokerFSMRestorePreservesLocallyCommittedPostSnapshotTail(t *testing.T)
 	require.Equal(t, uint64(2), partition.GetHWM())
 	require.Equal(t, uint64(3), partition.NextOffset())
 	require.NoError(t, restored.FinalizeRecoveredPartitions())
-	require.Equal(t, uint64(2), partition.NextOffset())
+	require.Equal(t, uint64(3), partition.NextOffset())
 	require.Equal(t, uint64(2), partition.GetHWM())
-	messages, err := partition.ReadMessages(0, 10)
+	messages, err := partition.ReadCommitted(0, 10)
 	require.NoError(t, err)
 	require.Len(t, messages, 2)
 	require.Equal(t, "in-snapshot", messages[0].Payload)
 	require.Equal(t, "committed-after-snapshot", messages[1].Payload)
+}
+
+func TestBrokerFSMRestoreAcceptsCommitAppliedAfterFinalization(t *testing.T) {
+	manager, partition := newDurableFSMTopic(t, "late-commit")
+	require.NoError(t, partition.EnqueueBatchLeader([]types.Message{{Payload: "acknowledged-later"}}))
+	partition.FlushDisk()
+
+	restored := NewBrokerFSM(manager, nil)
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(currentSnapshotData(t, manager, "late-commit", 0)))))
+	require.NoError(t, restored.FinalizeRecoveredPartitions())
+	require.Equal(t, uint64(1), partition.NextOffset())
+	require.Zero(t, partition.GetHWM())
+	messages, err := partition.ReadCommitted(0, 1)
+	require.NoError(t, err)
+	require.Empty(t, messages, "the retained tail must remain invisible before its commit applies")
+
+	definition := manager.GetTopic("late-commit").Definition()
+	commit, err := json.Marshal(partitionCommitCommand{
+		Topic: "late-commit", Partition: 0, Leader: "broker-1", LeaderEpoch: 7,
+		HWM: 1, LifecycleEpoch: definition.LifecycleEpoch,
+	})
+	require.NoError(t, err)
+	require.Nil(t, restored.Apply(&raft.Log{Data: append([]byte("PARTITION_COMMIT:"), commit...), Index: 2}))
+	require.Equal(t, uint64(1), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM())
+	messages, err = partition.ReadCommitted(0, 1)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	require.Equal(t, "acknowledged-later", messages[0].Payload)
+}
+
+func TestBrokerFSMRestorePreservesTopicCreatedAfterSnapshot(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	manager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, manager.CreateTopic("snapshot-topic", 1, false, false))
+	require.NoError(t, manager.CreateTopic("post-snapshot-topic", 1, false, false))
+	partition, err := manager.GetTopic("post-snapshot-topic").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 0, Payload: "acknowledged"}}))
+	require.NoError(t, partition.ApplyReplicaHWM(1))
+	partition.FlushDisk()
+
+	var state BrokerFSMState
+	require.NoError(t, json.Unmarshal(currentSnapshotData(t, manager, "snapshot-topic", 0), &state))
+	state.Brokers = map[string]*BrokerInfo{"broker-1": {ID: "broker-1", Status: "active"}}
+	snapshot, err := json.Marshal(state)
+	require.NoError(t, err)
+
+	restored := NewBrokerFSM(manager, nil)
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(snapshot))))
+	require.True(t, restored.HasPendingPartitionRecovery())
+	require.Equal(t, uint64(1), partition.NextOffset(), "a post-snapshot topic is not an orphan before Raft replay")
+
+	create, err := json.Marshal(testTopicCommand("post-snapshot-topic", 1, 1))
+	require.NoError(t, err)
+	require.Nil(t, restored.Apply(&raft.Log{Data: append([]byte("TOPIC:"), create...), Index: 2}))
+	commit, err := json.Marshal(partitionCommitCommand{
+		Topic: "post-snapshot-topic", Partition: 0, Leader: "broker-1", LeaderEpoch: 1,
+		HWM: 1, LifecycleEpoch: topic.InitialLifecycleEpoch,
+	})
+	require.NoError(t, err)
+	require.Nil(t, restored.Apply(&raft.Log{Data: append([]byte("PARTITION_COMMIT:"), commit...), Index: 3}))
+	require.NoError(t, restored.FinalizeRecoveredPartitions())
+	require.False(t, restored.HasPendingPartitionRecovery())
+	require.Equal(t, uint64(1), partition.NextOffset())
+	messages, err := partition.ReadMessages(0, 1)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	require.Equal(t, "acknowledged", messages[0].Payload)
 }
 
 func TestBrokerFSMRestoreLeavesReplicaBelowCommittedHWMForCatchup(t *testing.T) {

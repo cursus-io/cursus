@@ -1638,8 +1638,15 @@ func (p *Partition) ReconcileSnapshotHWM(snapshotHWM uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.snapshotRecovery {
-		if p.recoverySnapshotHWM != snapshotHWM {
+		if snapshotHWM < p.recoverySnapshotHWM {
 			return fmt.Errorf("snapshot recovery boundary changed: current=%d requested=%d", p.recoverySnapshotHWM, snapshotHWM)
+		}
+		// Raft can install a newer snapshot while this node is still
+		// recovering. Advance the staged boundary without discarding a
+		// locally retained tail or a later commit already applied here.
+		p.recoverySnapshotHWM = snapshotHWM
+		if visible := min(snapshotHWM, p.LEO.Load()); visible > p.HWM {
+			p.HWM = visible
 		}
 		return nil
 	}
@@ -1652,25 +1659,31 @@ func (p *Partition) ReconcileSnapshotHWM(snapshotHWM uint64) error {
 	return nil
 }
 
-// FinalizeSnapshotRecovery reconciles to the FSM watermark after Raft has
-// applied every committed post-snapshot log entry.
+// FinalizeSnapshotRecovery publishes the applied FSM watermark after snapshot
+// replay. A later Raft commit can still be in flight, so keep any local tail
+// hidden above that watermark until leadership or replica catch-up reconciles it.
 func (p *Partition) FinalizeSnapshotRecovery(hwm uint64) error {
 	p.reconcileMu.Lock()
 	defer p.reconcileMu.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.snapshotRecovery {
-		if err := p.reconcileCommittedHWMLocked(hwm); err != nil {
-			return err
+		if hwm < p.HWM {
+			return fmt.Errorf("committed HWM regression: current=%d requested=%d", p.HWM, hwm)
+		}
+		if hwm <= p.LEO.Load() {
+			p.HWM = hwm
 		}
 		p.hwmAuthoritative = true
 		p.signalHWMCheckpointLocked()
 		return nil
 	}
 	checkpointHWM := p.recoveryCheckpointHWM
-	snapshotHWM := p.recoverySnapshotHWM
 	if hwm < checkpointHWM {
 		return fmt.Errorf("committed HWM regression: current=%d requested=%d", checkpointHWM, hwm)
+	}
+	if hwm < p.HWM {
+		return fmt.Errorf("committed HWM regression: current=%d requested=%d", p.HWM, hwm)
 	}
 	p.snapshotRecovery = false
 	p.recoveryCheckpointHWM = 0
@@ -1684,12 +1697,7 @@ func (p *Partition) FinalizeSnapshotRecovery(hwm uint64) error {
 		}
 		return nil
 	}
-	if err := p.reconcileCommittedHWMLocked(hwm); err != nil {
-		p.snapshotRecovery = true
-		p.recoveryCheckpointHWM = checkpointHWM
-		p.recoverySnapshotHWM = snapshotHWM
-		return err
-	}
+	p.HWM = hwm
 	if checkpointHWM != hwm {
 		p.signalHWMCheckpointLocked()
 	}
