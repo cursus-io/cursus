@@ -229,6 +229,50 @@ func TestBrokerFSMRestorePreservesLocallyCommittedPostSnapshotTail(t *testing.T)
 	require.Equal(t, "committed-after-snapshot", messages[1].Payload)
 }
 
+func TestBrokerFSMRestorePreservesTopicCreatedAfterSnapshot(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	manager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, manager.CreateTopic("snapshot-topic", 1, false, false))
+	require.NoError(t, manager.CreateTopic("post-snapshot-topic", 1, false, false))
+	partition, err := manager.GetTopic("post-snapshot-topic").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 0, Payload: "acknowledged"}}))
+	require.NoError(t, partition.ApplyReplicaHWM(1))
+	partition.FlushDisk()
+
+	var state BrokerFSMState
+	require.NoError(t, json.Unmarshal(currentSnapshotData(t, manager, "snapshot-topic", 0), &state))
+	state.Brokers = map[string]*BrokerInfo{"broker-1": {ID: "broker-1", Status: "active"}}
+	snapshot, err := json.Marshal(state)
+	require.NoError(t, err)
+
+	restored := NewBrokerFSM(manager, nil)
+	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(snapshot))))
+	require.True(t, restored.HasPendingPartitionRecovery())
+	require.Equal(t, uint64(1), partition.NextOffset(), "a post-snapshot topic is not an orphan before Raft replay")
+
+	create, err := json.Marshal(testTopicCommand("post-snapshot-topic", 1, 1))
+	require.NoError(t, err)
+	require.Nil(t, restored.Apply(&raft.Log{Data: append([]byte("TOPIC:"), create...), Index: 2}))
+	commit, err := json.Marshal(partitionCommitCommand{
+		Topic: "post-snapshot-topic", Partition: 0, Leader: "broker-1", LeaderEpoch: 1,
+		HWM: 1, LifecycleEpoch: topic.InitialLifecycleEpoch,
+	})
+	require.NoError(t, err)
+	require.Nil(t, restored.Apply(&raft.Log{Data: append([]byte("PARTITION_COMMIT:"), commit...), Index: 3}))
+	require.NoError(t, restored.FinalizeRecoveredPartitions())
+	require.False(t, restored.HasPendingPartitionRecovery())
+	require.Equal(t, uint64(1), partition.NextOffset())
+	messages, err := partition.ReadMessages(0, 1)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	require.Equal(t, "acknowledged", messages[0].Payload)
+}
+
 func TestBrokerFSMRestoreLeavesReplicaBelowCommittedHWMForCatchup(t *testing.T) {
 	manager, partition := newDurableFSMTopic(t, "behind-orders")
 	data := currentSnapshotData(t, manager, "behind-orders", 1)

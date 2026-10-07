@@ -90,6 +90,9 @@ type BrokerFSM struct {
 	producerState             map[string]map[int]map[string]ProducerSequence // Topic -> Partition -> ProducerID -> Last Epoch/Seq
 	applied                   uint64
 	partitionRecoveryPending  bool
+	// Raft may replay topic creation and commits after restoring a snapshot.
+	// Until that replay finishes, local data beyond the snapshot is not orphaned.
+	recoveryReplayPending bool
 
 	tm                                         *topic.TopicManager
 	cd                                         *coordinator.Coordinator
@@ -166,7 +169,7 @@ func (f *BrokerFSM) AppliedIndex() uint64 {
 func (f *BrokerFSM) HasPendingPartitionRecovery() bool {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.partitionRecoveryPending
+	return f.partitionRecoveryPending || f.recoveryReplayPending
 }
 
 // GetTopicDefinition returns a detached copy of the authoritative replicated
@@ -461,6 +464,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		f.topicMaterializationRuns = make(map[string]TopicMaterializationAttempts)
 	}
 	f.applied = state.Applied
+	f.recoveryReplayPending = true
 	f.producerState = state.ProducerState
 	if f.producerState == nil {
 		f.producerState = make(map[string]map[int]map[string]ProducerSequence)
@@ -591,6 +595,7 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 	if tm == nil {
 		f.mu.Lock()
 		f.partitionRecoveryPending = false
+		f.recoveryReplayPending = false
 		f.mu.Unlock()
 		return nil
 	}
@@ -621,7 +626,11 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 	}
 	f.mu.Lock()
 	f.partitionRecoveryPending = false
+	f.recoveryReplayPending = false
 	f.mu.Unlock()
+	if err := f.ReconcileTopicMaterializations(); err != nil {
+		util.Warn("FSM: Topic materialization pending after Raft replay: %v", err)
+	}
 	return nil
 }
 

@@ -70,7 +70,27 @@ func TestBrokerFSMRestoreRemovesLocalTopicMissingFromSnapshot(t *testing.T) {
 	f := NewBrokerFSM(manager, nil)
 
 	require.NoError(t, f.Restore(emptyTopicSnapshot(t)))
+	require.NotNil(t, manager.GetTopic("stale"), "Raft replay may still restore this topic")
+	require.NoError(t, f.FinalizeRecoveredPartitions())
 	require.Nil(t, manager.GetTopic("stale"))
+	require.NoError(t, f.TopicMaterializationReadinessError())
+}
+
+func TestBrokerFSMReplayDefersCommittedTopicDeleteUntilReplayCompletes(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+	dm := disk.NewDiskManager(cfg)
+	t.Cleanup(dm.CloseAllHandlers)
+	manager := topic.NewTopicManager(cfg, dm, nil)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	f := NewBrokerFSM(manager, nil)
+	require.NoError(t, f.Restore(io.NopCloser(bytes.NewReader(currentSnapshotData(t, manager, "orders", 0)))))
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders"}`), Index: 2}))
+	require.NotNil(t, manager.GetTopic("orders"), "cleanup waits for all committed commands to replay")
+	require.Equal(t, TopicMaterializationDelete, f.TopicMaterializationIssues()[0].Operation)
+	require.NoError(t, f.FinalizeRecoveredPartitions())
+	require.Nil(t, manager.GetTopic("orders"))
 	require.NoError(t, f.TopicMaterializationReadinessError())
 }
 
@@ -120,6 +140,7 @@ func TestBrokerFSMRestorePreservesPendingDeleteUntilRetrySucceeds(t *testing.T) 
 	require.NoError(t, f.Restore(emptyTopicSnapshot(t)))
 	require.Error(t, f.TopicMaterializationReadinessError())
 	require.Equal(t, TopicMaterializationDelete, f.TopicMaterializationIssues()[0].Operation)
+	require.NoError(t, f.FinalizeRecoveredPartitions())
 
 	require.NoError(t, os.RemoveAll(manifestPath))
 	require.NoError(t, f.ReconcileTopicMaterializations())
@@ -156,6 +177,7 @@ func TestBrokerFSMRestoreSerializesWithReconcileAndCleansStaleResult(t *testing.
 	close(provider.release)
 	require.NoError(t, <-reconcileDone)
 	require.NoError(t, <-restoreDone)
+	require.NoError(t, f.FinalizeRecoveredPartitions())
 	require.Nil(t, manager.GetTopic("stale"))
 	require.NoError(t, f.TopicMaterializationReadinessError())
 }
@@ -219,6 +241,8 @@ func TestBrokerFSMRestoreCleansPersistedTopicMissingFromRegistryAndSnapshot(t *t
 	f := NewBrokerFSM(manager, nil)
 
 	require.NoError(t, f.Restore(emptyTopicSnapshot(t)))
+	require.DirExists(t, staleDir, "post-snapshot data remains until Raft replay finishes")
+	require.NoError(t, f.FinalizeRecoveredPartitions())
 	require.NoDirExists(t, staleDir)
 	require.NoError(t, f.TopicMaterializationReadinessError())
 }

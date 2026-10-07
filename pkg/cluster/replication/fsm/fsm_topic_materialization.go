@@ -157,6 +157,7 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 
 	f.mu.RLock()
 	current := copyTopicDefinition(f.topicState[definition.Name])
+	replaying := f.recoveryReplayPending
 	f.mu.RUnlock()
 	if !reflect.DeepEqual(current, definition) {
 		return nil
@@ -175,7 +176,7 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 		err = f.tm.ApplyDefinition(*definition)
 	}
 	if err == nil {
-		err = f.reconcileMaterializedTopicHWM(definition.Name, false)
+		err = f.reconcileMaterializedTopicHWM(definition.Name, replaying)
 	}
 	f.recordTopicMaterialization(definition.Name, TopicMaterializationCreate, err)
 	if err != nil {
@@ -256,7 +257,9 @@ func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string, restoringSna
 		}
 		var reconcileErr error
 		if restoringSnapshot {
-			reconcileErr = currentPartition.ReconcileSnapshotHWM(partitionMetadata.CommittedHWM)
+			if !currentPartition.SnapshotRecoveryPending() {
+				reconcileErr = currentPartition.ReconcileSnapshotHWM(partitionMetadata.CommittedHWM)
+			}
 		} else {
 			reconcileErr = currentPartition.ReconcileCommittedHWM(partitionMetadata.CommittedHWM)
 		}
@@ -310,8 +313,24 @@ func (f *BrokerFSM) materializeTopicDelete(name string) error {
 
 	f.mu.RLock()
 	desired := f.topicState[name]
+	replaying := f.recoveryReplayPending
 	f.mu.RUnlock()
 	if desired != nil {
+		return nil
+	}
+	if replaying {
+		// A topic absent from the snapshot may be recreated by committed
+		// Raft commands still waiting to replay. Its local log must survive.
+		// Keep cleanup pending even when the delete itself is replayed.
+		f.mu.Lock()
+		pendingSince := time.Now()
+		if old := f.topicMaterialization[name]; old.Operation == TopicMaterializationDelete && !old.PendingSince.IsZero() {
+			pendingSince = old.PendingSince
+		}
+		f.topicMaterialization[name] = TopicMaterializationIssue{
+			Topic: name, Operation: TopicMaterializationDelete, PendingSince: pendingSince,
+		}
+		f.mu.Unlock()
 		return nil
 	}
 
