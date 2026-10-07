@@ -240,6 +240,153 @@ func TestDistributedRecoveryMergesLegacyOffsetWithoutLosingRaftRegistration(t *t
 	}
 }
 
+func TestDistributedRecoveryRejectsLegacyOffsetsOutsideRaftRegistration(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		topic     string
+		partition int
+		want      string
+	}{
+		{name: "topic", topic: "returns", partition: 0, want: "legacy offset topic"},
+		{name: "partition", topic: "orders", partition: 1, want: "legacy offset partition"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := json.Marshal(OffsetCommitMessage{
+				Group: "workers", Topic: test.topic, Partition: test.partition, Offset: 13, Timestamp: time.Unix(2, 0).UTC(),
+			})
+			require.NoError(t, err)
+			cfg := config.DefaultConfig()
+			cfg.EnabledDistribution = true
+			coordinator, err := NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, &metadataReplayHandler{
+				messages: map[int][]types.Message{0: {{Offset: 0, Payload: string(payload)}}},
+			})
+			require.NoError(t, err)
+			t.Cleanup(coordinator.Stop)
+			require.NoError(t, coordinator.ImportState(map[string]*GroupStateSnapshot{
+				"workers": {
+					TopicName: "orders", Partitions: []int{0}, Members: map[string][]int{},
+					Offsets:           map[string]map[int]uint64{"orders": {0: 11}},
+					RegistrationEpoch: 2, LastActivity: time.Unix(1, 0).UTC(),
+				},
+			}))
+
+			require.ErrorContains(t, coordinator.ReloadDistributedConsumerMetadata(), test.want)
+			require.False(t, coordinator.RecoverySnapshot().Ready)
+			require.Equal(t, uint64(11), mustOffset(t, coordinator, "workers", "orders", 0))
+		})
+	}
+}
+
+func TestDistributedRecoveryMergesLegacyOffsetIntoRaftGroupWithoutPriorCommit(t *testing.T) {
+	payload, err := json.Marshal(OffsetCommitMessage{
+		Group: "workers", Topic: "orders", Partition: 0, Offset: 13, Timestamp: time.Unix(2, 0).UTC(),
+	})
+	require.NoError(t, err)
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	coordinator, err := NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, &metadataReplayHandler{
+		messages: map[int][]types.Message{0: {{Offset: 0, Payload: string(payload)}}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(coordinator.Stop)
+	require.NoError(t, coordinator.ImportState(map[string]*GroupStateSnapshot{
+		"workers": {
+			TopicName: "orders", Partitions: []int{0}, Members: map[string][]int{},
+			RegistrationEpoch: 2, LastActivity: time.Unix(1, 0).UTC(),
+		},
+	}))
+
+	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.Equal(t, uint64(13), mustOffset(t, coordinator, "workers", "orders", 0))
+	require.Equal(t, uint64(2), coordinator.GetRegistrationEpoch("workers"))
+}
+
+func TestDistributedRecoveryRepeatedLegacyOnlyReplay(t *testing.T) {
+	payload, err := json.Marshal(OffsetCommitMessage{
+		Group: "workers", Topic: "orders", Partition: 0, Offset: 13, Timestamp: time.Unix(2, 0).UTC(),
+	})
+	require.NoError(t, err)
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	coordinator, err := NewCoordinatorWithRecovery(context.Background(), cfg, &metadataReplayHandler{
+		messages: map[int][]types.Message{0: {{Offset: 0, Payload: string(payload)}}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(coordinator.Stop)
+	require.Equal(t, uint64(13), mustOffset(t, coordinator, "workers", "orders", 0))
+
+	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.Equal(t, uint64(13), mustOffset(t, coordinator, "workers", "orders", 0))
+	require.Equal(t, uint64(0), coordinator.GetRegistrationEpoch("workers"))
+}
+
+func TestDistributedRecoveryRejectsSameEpochTopicConflict(t *testing.T) {
+	registration := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
+		Group: "workers", Topic: "returns", PartitionCount: 1, Epoch: 2, Timestamp: time.Unix(2, 0).UTC(),
+	}
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	coordinator, err := NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, &metadataReplayHandler{
+		messages: map[int][]types.Message{0: {encodedMetadataMessage(t, registration, 0)}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(coordinator.Stop)
+	require.NoError(t, coordinator.ImportState(map[string]*GroupStateSnapshot{
+		"workers": {
+			TopicName: "orders", Partitions: []int{0}, Members: map[string][]int{},
+			Offsets:           map[string]map[int]uint64{"orders": {0: 11}},
+			RegistrationEpoch: 2, LastActivity: time.Unix(1, 0).UTC(),
+		},
+	}))
+
+	require.ErrorContains(t, coordinator.ReloadDistributedConsumerMetadata(), "restored Raft offset topic")
+	require.False(t, coordinator.RecoverySnapshot().Ready)
+	require.Equal(t, uint64(11), mustOffset(t, coordinator, "workers", "orders", 0))
+}
+
+func TestDistributedRecoveryDoesNotRegressSameEpochRaftOffset(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		replayedOffset uint64
+		wantOffset     uint64
+	}{
+		{name: "older replay", replayedOffset: 9, wantOffset: 11},
+		{name: "newer replay", replayedOffset: 13, wantOffset: 13},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registration := ConsumerMetadataRecord{
+				Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
+				Group: "workers", Topic: "orders", PartitionCount: 1, Epoch: 2, Timestamp: time.Unix(1, 0).UTC(),
+			}
+			snapshot := ConsumerMetadataRecord{
+				Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordOffsetSnapshot,
+				Group: "workers", Topic: "orders", Epoch: 2, Revision: 1,
+				Offsets: []OffsetItem{{Partition: 0, Offset: test.replayedOffset}}, Timestamp: time.Unix(2, 0).UTC(),
+			}
+			cfg := config.DefaultConfig()
+			cfg.EnabledDistribution = true
+			coordinator, err := NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, &metadataReplayHandler{
+				messages: map[int][]types.Message{0: {encodedMetadataMessage(t, registration, 0), encodedMetadataMessage(t, snapshot, 1)}},
+			})
+			require.NoError(t, err)
+			t.Cleanup(coordinator.Stop)
+			require.NoError(t, coordinator.ImportState(map[string]*GroupStateSnapshot{
+				"workers": {
+					TopicName: "orders", Partitions: []int{0}, Members: map[string][]int{"member-a": {0}}, Generation: 1,
+					Offsets:           map[string]map[int]uint64{"orders": {0: 11}},
+					RegistrationEpoch: 2, LastActivity: time.Unix(1, 0).UTC(),
+				},
+			}))
+
+			require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+			require.Equal(t, test.wantOffset, mustOffset(t, coordinator, "workers", "orders", 0))
+			require.Equal(t, []int{0}, coordinator.GetMemberAssignments("workers", "member-a"))
+			require.Equal(t, uint64(1), coordinator.ExportState()["workers"].OffsetRevisions["orders"])
+		})
+	}
+}
+
 func TestDistributedRecoveryDoesNotResurrectRaftGroupAfterTombstone(t *testing.T) {
 	tombstone := ConsumerMetadataRecord{
 		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordTombstone,
