@@ -37,24 +37,38 @@ does not indicate a stale lock, and removing it can defeat mutual exclusion.
 
 ## Preflight
 
-Validate a copied backup before using it for a rollback or recovery. The command is read-only: it verifies the explicit topic manifest against the persisted partition layout, scans topic and consumer metadata records, validates the transaction journal against its checksummed cut manifest, and checks every event snapshot record without starting a broker.
+For a **standalone** broker, validate a copied backup before using it for a
+rollback or recovery. The command is read-only: it verifies the explicit topic
+manifest against the persisted partition layout, scans topic and consumer
+metadata records, validates the transaction journal against its checksummed
+cut manifest, and checks every event snapshot record without starting a broker.
 
 ```bash
 cursus-storage backup validate --log-dir /backup/cursus-logs
 ```
 
-It exits non-zero if the manifest is missing or if validation finds a storage problem. Preserve its JSON output with the backup record; it is the operator evidence that the copy was restorable at the time it was made.
+It exits non-zero if the manifest is missing or if validation finds a storage
+problem. Distributed brokers keep topic and group metadata in Raft and do not
+write standalone topic manifests. Do not apply this validator to a distributed
+PVC: its missing-manifest error does not establish corruption or restorable
+state. For a distributed backup, stop all members, copy every member's complete
+log directory into one immutable generation, compare source/copy file digests,
+and start the previous image on **writable clones** of all member copies in an
+isolated cluster. Verify topics, group registrations, committed offsets, and a
+known record before upgrading the original volumes.
 
 For the fixed three-member Kubernetes topology, use the separate [Kubernetes cluster runbook](kubernetes-cluster.md). Its StatefulSet keeps one PVC per member and requires a one-member-at-a-time restart; never combine PVCs from different backup generations.
 
 Before changing any binary or configuration, stop writes and record the target
 release, `git`/image digest, configuration checksum, member list, leader, ISR,
-and available disk space. Take one immutable backup generation containing the
-topic manifest, transaction journal and its `.manifest`, event snapshot files,
-consumer-offset logs, every `.log`, its matching `.index`, and each
-`.log.compacted-<size>` sidecar.
+groups and committed offsets, and available disk space. Take one immutable
+backup generation containing every storage artifact present in the member
+directories. Standalone backups include a topic manifest, transaction journal
+and its `.manifest`, event snapshot files, consumer-offset logs, every `.log`,
+its matching `.index`, and each `.log.compacted-<size>` sidecar.
 
-Run these read-only checks against the copy, not the production volume:
+For standalone backups, run these read-only checks against the copy, not the
+production volume:
 
 ```sh
 cursus-storage manifest inspect --log-dir /var/lib/cursus/logs > inventory.json
@@ -62,7 +76,8 @@ cursus-storage consumer-metadata inspect --log-dir /var/lib/cursus/logs > consum
 ```
 
 Do not proceed if either output reports problems, orphaned topic directories,
-or an invalid compaction sidecar. Keep the inventory and the backup generation
+or an invalid compaction sidecar. For distributed backups, use the full-cluster
+clone-and-restore check above. Keep the inventory and backup generation
 identifier with the change record.
 
 ## Coordinated Upgrade
@@ -72,11 +87,17 @@ identifier with the change record.
 3. Stop every broker; do not leave old writers running.
 4. Deploy the candidate binaries and exact reviewed configuration to all
    members.
+   The published image exports `LOG_DIR=/data/logs`, which overrides YAML
+   `log_dir`; explicitly set `LOG_DIR` to the mounted persisted data path and
+   verify that effective value in each broker's startup log.
 5. Start a quorum, then wait for leader election, ISR recovery, and readiness.
-6. Validate topics, groups, committed offsets, transaction recovery, and an
-   acknowledged test publish/consume before restoring client traffic.
+6. Compare every recorded group and committed offset with the preflight
+   inventory. In particular, pre-v4 distributed groups may exist only in the
+   Raft snapshot and must not disappear when `__consumer_offsets` is empty.
+   Validate topics, transaction recovery, and an acknowledged test
+   publish/consume before restoring client traffic.
 
-During a Kubernetes rolling restart, delete one Pod at a time and wait for the
+For a format-compatible Kubernetes rolling restart, delete one Pod at a time and wait for the
 replacement to become Ready, regain its expected replica state, and return to
 ISR before continuing. The StatefulSet uses `OnDelete`; changing the image does
 not itself restart Pods. Use the production dashboard and baseline alerts as
