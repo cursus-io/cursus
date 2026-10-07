@@ -220,6 +220,11 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		return fmt.Sprintf("%s topic=%s", authResp, topicName)
 	}
 	effectiveIdempotent := isIdempotent || ch.Config.EnableIdempotence || t.IsIdempotent
+	if topicName == config.ConsumerOffsetsTopicName && clientCtx != nil && clientCtx.Internal {
+		// Broker-owned metadata uses committed record revisions for replay.
+		// Its writer has no producer sequence, even when global idempotence is on.
+		effectiveIdempotent = t.IsIdempotent
+	}
 	if effectiveIdempotent && !ackSelection.SupportsIdempotence() {
 		return "ERROR: invalid_acks reason=\"idempotent publish requires acks=all or acks=-1\""
 	}
