@@ -576,9 +576,8 @@ func (f *BrokerFSM) reconcileCommittedPartitions() error {
 	return nil
 }
 
-// FinalizeRecoveredPartitions performs destructive reconciliation only after
-// the replication manager has observed every committed post-snapshot command
-// applied to this FSM.
+// FinalizeRecoveredPartitions publishes replayed commit boundaries without
+// truncating a local tail that a later Raft commit may still acknowledge.
 func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 	f.transitionMu.Lock()
 	defer f.transitionMu.Unlock()
