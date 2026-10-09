@@ -3,7 +3,9 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -55,6 +57,7 @@ type AppendResult struct {
 type EventStore struct {
 	topic          string
 	producerID     string
+	bootstrapAddr  string
 	addr           string
 	requestMu      sync.Mutex
 	mu             sync.Mutex
@@ -67,6 +70,7 @@ func NewEventStore(addr, topic, producerID string) *EventStore {
 	return &EventStore{
 		topic:          topic,
 		producerID:     producerID,
+		bootstrapAddr:  addr,
 		addr:           addr,
 		requestTimeout: defaultSDKRequestTimeout,
 	}
@@ -98,11 +102,21 @@ func (es *EventStore) getConn(ctx context.Context) (net.Conn, error) {
 	}
 	es.mu.Unlock()
 
-	conn, err := transport.Dial(ctx, es.addr, transport.DialConfig{
+	addr := es.addr
+	conn, err := transport.Dial(ctx, addr, transport.DialConfig{
 		DialTimeout: 5 * time.Second, HandshakeTimeout: 5 * time.Second, Compression: "none",
 	})
+	if err != nil && addr != es.bootstrapAddr && ctx.Err() == nil {
+		conn, err = transport.Dial(ctx, es.bootstrapAddr, transport.DialConfig{
+			DialTimeout: 5 * time.Second, HandshakeTimeout: 5 * time.Second, Compression: "none",
+		})
+		if err == nil {
+			es.addr = es.bootstrapAddr
+			addr = es.bootstrapAddr
+		}
+	}
 	if err != nil {
-		return nil, fmt.Errorf("connect to %s: %w", es.addr, err)
+		return nil, fmt.Errorf("connect to %s: %w", addr, err)
 	}
 
 	es.mu.Lock()
@@ -128,6 +142,41 @@ func (es *EventStore) resetConn() {
 	}
 }
 
+const eventStoreMaxLeaderRedirects = 3
+
+func eventStoreNotLeaderError(response string) (*BrokerError, bool) {
+	brokerErr, ok := ParseBrokerError(response)
+	return brokerErr, ok && strings.EqualFold(brokerErr.Code, "NOT_LEADER")
+}
+
+// followLeader handles only an explicit broker rejection. A lost response to a
+// mutating command is never retried because its outcome may be committed.
+func (es *EventStore) followLeader(err error) bool {
+	var brokerErr *BrokerError
+	if !errors.As(err, &brokerErr) || !brokerErr.Retryable || !strings.EqualFold(brokerErr.Code, "NOT_LEADER") {
+		return false
+	}
+	es.resetConn()
+	if leader := brokerErr.Fields["leader"]; leader != "" {
+		if _, _, splitErr := net.SplitHostPort(leader); splitErr == nil {
+			es.addr = leader
+		}
+	}
+	return true
+}
+
+func (es *EventStore) retryReadConnection(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var netErr net.Error
+	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, net.ErrClosed) && !errors.As(err, &netErr) {
+		return false
+	}
+	es.resetConn()
+	return true
+}
+
 func (es *EventStore) sendCommandContext(ctx context.Context, cmd string) (string, error) {
 	return es.sendCommandContextWithOutcome(ctx, cmd, "")
 }
@@ -138,36 +187,54 @@ func (es *EventStore) sendCommandContextWithOutcome(ctx context.Context, cmd, un
 	requestCtx, cancel := boundedRequestContext(ctx, es.requestTimeout)
 	defer cancel()
 
-	conn, err := es.getConn(requestCtx)
+	var lastErr error
+	for redirect := 0; redirect <= eventStoreMaxLeaderRedirects; redirect++ {
+		resp, err := es.sendCommandOnce(requestCtx, cmd, unknownOperation)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if redirect == eventStoreMaxLeaderRedirects || !es.followLeader(err) {
+			return "", err
+		}
+	}
+	return "", lastErr
+}
+
+func (es *EventStore) sendCommandOnce(ctx context.Context, cmd, unknownOperation string) (string, error) {
+	conn, err := es.getConn(ctx)
 	if err != nil {
 		return "", err
 	}
-	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	cleanup, err := bindConnectionToContext(ctx, conn)
 	if err != nil {
 		es.resetConn()
 		return "", err
 	}
 	defer cleanup()
-
-	data := []byte(cmd)
-	if err := WriteWithLength(conn, data); err != nil {
+	if err := WriteWithLength(conn, []byte(cmd)); err != nil {
 		es.resetConn()
 		return "", fmt.Errorf("write: %w", err)
 	}
-
 	resp, err := ReadWithLength(conn)
 	if err != nil {
 		es.resetConn()
+		var brokerErr *BrokerError
+		if errors.As(err, &brokerErr) {
+			return "", brokerErr
+		}
 		cause := err
-		if requestCtx.Err() != nil {
-			cause = requestCtx.Err()
+		if ctx.Err() != nil {
+			cause = ctx.Err()
 		}
 		if unknownOperation != "" {
 			return "", &RequestOutcomeUnknownError{Operation: unknownOperation, Cause: cause}
 		}
 		return "", fmt.Errorf("read: %w", cause)
 	}
-
+	if brokerErr, ok := eventStoreNotLeaderError(string(resp)); ok {
+		return "", brokerErr
+	}
 	return string(resp), nil
 }
 
@@ -287,11 +354,26 @@ func (es *EventStore) ReadStreamFromContext(ctx context.Context, key string, fro
 	requestCtx, cancel := boundedRequestContext(ctx, es.requestTimeout)
 	defer cancel()
 
-	conn, err := es.getConn(requestCtx)
+	var lastErr error
+	for redirect := 0; redirect <= eventStoreMaxLeaderRedirects; redirect++ {
+		result, err := es.readStreamFromOnce(requestCtx, key, fromVersion)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if redirect == eventStoreMaxLeaderRedirects || (!es.followLeader(err) && !es.retryReadConnection(requestCtx, err)) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func (es *EventStore) readStreamFromOnce(ctx context.Context, key string, fromVersion uint64) (*StreamData, error) {
+	conn, err := es.getConn(ctx)
 	if err != nil {
 		return nil, err
 	}
-	cleanup, err := bindConnectionToContext(requestCtx, conn)
+	cleanup, err := bindConnectionToContext(ctx, conn)
 	if err != nil {
 		es.resetConn()
 		return nil, err
@@ -315,6 +397,9 @@ func (es *EventStore) ReadStreamFromContext(ctx context.Context, key string, fro
 			es.resetConn()
 			return nil, fmt.Errorf("read envelope: %w", err)
 		}
+		if brokerErr, ok := eventStoreNotLeaderError(string(envData)); ok {
+			return nil, brokerErr
+		}
 		if strings.HasPrefix(string(envData), "ERROR:") {
 			return nil, fmt.Errorf("broker: %s", strings.TrimSpace(string(envData)))
 		}
@@ -332,6 +417,9 @@ func (es *EventStore) ReadStreamFromContext(ctx context.Context, key string, fro
 		if envelope.Status == "ERROR" {
 			if envelope.Error == "" {
 				envelope.Error = "read stream failed"
+			}
+			if brokerErr, ok := eventStoreNotLeaderError("ERROR: " + envelope.Error); ok {
+				return nil, brokerErr
 			}
 			return nil, fmt.Errorf("broker: %s", envelope.Error)
 		}
