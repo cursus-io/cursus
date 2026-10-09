@@ -64,6 +64,9 @@ func (f *BrokerFSM) applyReplicaReassignmentCommand(jsonData string) interface{}
 	if metadata == nil {
 		return fmt.Errorf("partition metadata %q not found", key)
 	}
+	if len(metadata.RecoveryReplicas) > 0 {
+		return fmt.Errorf("replica recovery pending for %s", key)
+	}
 	if metadata.LifecycleEpoch != command.LifecycleEpoch || definition.LifecycleEpoch != command.LifecycleEpoch {
 		return fmt.Errorf(
 			"stale lifecycle epoch for %s: definition=%d partition=%d requested=%d",

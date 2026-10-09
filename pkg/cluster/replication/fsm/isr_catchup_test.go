@@ -202,6 +202,44 @@ func TestBuildReplicaCatchupRequestsTruncatesTailWithoutPublishingHWM(t *testing
 	require.Equal(t, uint64(1), partition.GetHWM())
 }
 
+func TestBuildReplicaCatchupRequestsNeverTruncatesInISRAppendTail(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	t.Cleanup(partition.Close)
+	require.NoError(t, partition.ReplicaAppendWithMode([]types.Message{
+		{Offset: 0, Payload: "committed", LeaderEpoch: 4},
+		{Offset: 1, Payload: "in-flight", LeaderEpoch: 4},
+	}, true))
+
+	brokerFSM := NewBrokerFSM(topicManager, nil)
+	registerActiveBroker(t, brokerFSM, "node-1")
+	registerActiveBroker(t, brokerFSM, "node-2")
+	definition := topicManager.GetTopic("orders").Definition()
+	brokerFSM.mu.Lock()
+	brokerFSM.topicState["orders"] = &definition
+	brokerFSM.partitionMetadata["orders-0"] = &PartitionMetadata{
+		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch,
+		CommittedHWM: 1, CommittedHWMKnown: true, PartitionCount: 1,
+		Replicas: []string{"node-1", "node-2"}, ISR: []string{"node-1", "node-2"},
+	}
+	brokerFSM.mu.Unlock()
+
+	require.Empty(t, brokerFSM.BuildReplicaCatchupRequests("node-2"))
+	require.Equal(t, uint64(2), partition.NextOffset(), "an ISR scan must preserve a direct append beyond its metadata snapshot")
+	require.Equal(t, uint64(1), partition.GetHWM(), "the scan may only publish the known committed boundary")
+	messages, err := partition.ReadMessages(1, 1)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	require.Equal(t, "in-flight", messages[0].Payload)
+}
+
 func TestBuildReplicaCatchupRequestsRepairsLaggingMetadataLeaderFromActiveISR(t *testing.T) {
 	brokerFSM := newISRCatchupTestFSM(t)
 	brokerFSM.mu.Lock()

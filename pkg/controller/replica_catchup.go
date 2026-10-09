@@ -48,6 +48,9 @@ func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replica
 	if ch.Cluster.Router == nil || batch.BrokerID != ch.Cluster.Router.BrokerID() {
 		return fmt.Errorf("replica catch-up broker identity mismatch")
 	}
+	if err := injectedReplicaCatchupError(batch.Topic); err != nil {
+		return err
+	}
 	if err := replicationFSM.ValidateReplicaCatchupBatchDigest(batch); err != nil {
 		return err
 	}

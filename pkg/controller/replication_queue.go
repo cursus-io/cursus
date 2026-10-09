@@ -48,7 +48,14 @@ func (e *retryableReplicationStateError) ReplicationErrorClass() string { return
 type partitionReplicationExecutor interface {
 	Snapshot(topic string, partition int) (clusterController.PartitionReplicationSnapshot, error)
 	ReplicateISR(ctx context.Context, task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) error
+	RecoverReplicaGap(task partitionReplicationTask, cause error) (replicaGapRecoveryResult, error)
 	Commit(task partitionReplicationTask) (partitionCommitResult, error)
+}
+
+type replicaGapRecoveryResult struct {
+	resolved            bool
+	authoritativeHWM    uint64
+	hasAuthoritativeHWM bool
 }
 
 type partitionCommitResult struct {
@@ -69,6 +76,63 @@ func (e clusterPartitionReplicationExecutor) ReplicateISR(ctx context.Context, t
 		return err
 	}
 	return e.handler.Cluster.ReplicateToISR(task.topic, task.partition, task.command, snapshot)
+}
+
+func (e clusterPartitionReplicationExecutor) RecoverReplicaGap(task partitionReplicationTask, cause error) (replicaGapRecoveryResult, error) {
+	var gap interface {
+		ReplicationErrorCode() string
+		ReplicaBrokerID() string
+	}
+	if !errors.As(cause, &gap) || gap.ReplicationErrorCode() != "replica_offset_gap" {
+		return replicaGapRecoveryResult{}, cause
+	}
+	metadata := e.handler.Cluster.RaftManager.GetFSM().GetPartitionMetadata(fmt.Sprintf("%s-%d", task.topic, task.partition))
+	if metadata == nil || !metadata.CommittedHWMKnown {
+		return replicaGapRecoveryResult{resolved: true}, fmt.Errorf("authoritative committed HWM unavailable before replica quarantine")
+	}
+	_, err := e.handler.applyViaLeader("ISR_QUARANTINE", map[string]interface{}{
+		"topic": task.topic, "partition": task.partition, "broker_id": gap.ReplicaBrokerID(),
+		"leader": task.snapshot.Leader, "leader_epoch": task.snapshot.LeaderEpoch,
+		"lifecycle_epoch": task.snapshot.LifecycleEpoch, "committed_hwm": metadata.CommittedHWM,
+		"expected_isr": append([]string(nil), metadata.ISR...), "expected_replicas": append([]string(nil), metadata.Replicas...),
+	})
+	if err != nil {
+		return replicaGapRecoveryResult{resolved: true}, fmt.Errorf("quarantine divergent replica %s: %w", gap.ReplicaBrokerID(), err)
+	}
+	key := fmt.Sprintf("%s-%d", task.topic, task.partition)
+	deadline := time.Now().Add(DefaultFSMApplyTimeout)
+	for {
+		metadata = e.handler.Cluster.RaftManager.GetFSM().GetPartitionMetadata(key)
+		if metadata != nil && metadata.Leader == task.snapshot.Leader && metadata.LeaderEpoch == task.snapshot.LeaderEpoch &&
+			metadata.LifecycleEpoch == task.snapshot.LifecycleEpoch && containsReplica(metadata.RecoveryReplicas, gap.ReplicaBrokerID()) &&
+			!containsReplica(metadata.ISR, gap.ReplicaBrokerID()) {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			return replicaGapRecoveryResult{resolved: true}, fmt.Errorf("local Raft state did not apply replica quarantine for %s before recovery decision", gap.ReplicaBrokerID())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	current, err := e.Snapshot(task.topic, task.partition)
+	if err != nil {
+		return replicaGapRecoveryResult{resolved: true}, err
+	}
+	metadata = e.handler.Cluster.RaftManager.GetFSM().GetPartitionMetadata(key)
+	if metadata == nil || !metadata.CommittedHWMKnown {
+		return replicaGapRecoveryResult{resolved: true}, fmt.Errorf("authoritative committed HWM unavailable after replica quarantine")
+	}
+	if metadata.CommittedHWM >= task.commitHWM {
+		if task.partitionRef == nil {
+			return replicaGapRecoveryResult{resolved: true}, fmt.Errorf("local partition unavailable after replica quarantine")
+		}
+		return replicaGapRecoveryResult{
+			resolved: true, authoritativeHWM: metadata.CommittedHWM, hasAuthoritativeHWM: true,
+		}, nil
+	}
+	if task.ackMode == ackpolicy.All && len(current.ISR) < task.requiredISR {
+		return replicaGapRecoveryResult{resolved: true}, fmt.Errorf("insufficient in-sync replicas after gap quarantine: got %d, want minISR %d", len(current.ISR), task.requiredISR)
+	}
+	return replicaGapRecoveryResult{}, nil
 }
 
 func (e clusterPartitionReplicationExecutor) Commit(task partitionReplicationTask) (partitionCommitResult, error) {
@@ -313,6 +377,26 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			completeReplicationTask(task, errReplicationQueueClosed)
 			return
 		}
+		if replicaGapError(err) {
+			recovery, recoveryErr := l.owner.executor.RecoverReplicaGap(task, err)
+			if recovery.resolved {
+				if recovery.hasAuthoritativeHWM {
+					completeReplicationTaskAtHWM(task, recoveryErr, recovery.authoritativeHWM)
+				} else {
+					completeReplicationTask(task, recoveryErr)
+				}
+				return
+			}
+			if recoveryErr != nil {
+				completeReplicationTask(task, recoveryErr)
+				return
+			}
+			failures++
+			metrics.ReplicationRetries.WithLabelValues(task.topic, string(task.ackMode), "replica_offset_gap").Inc()
+			util.Error("partition replica quarantined after offset gap topic=%s partition=%d broker=%s ack_mode=%s error=%v", task.topic, task.partition, replicaGapBrokerID(err), task.ackMode, err)
+			backoff = 25 * time.Millisecond
+			continue
+		}
 
 		class := replicationErrorClass(err)
 		if isReplicationFenceError(err) {
@@ -341,6 +425,19 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			return
 		}
 	}
+}
+
+func replicaGapError(err error) bool {
+	var classified interface{ ReplicationErrorCode() string }
+	return errors.As(err, &classified) && classified.ReplicationErrorCode() == "replica_offset_gap"
+}
+
+func replicaGapBrokerID(err error) string {
+	var classified interface{ ReplicaBrokerID() string }
+	if errors.As(err, &classified) {
+		return classified.ReplicaBrokerID()
+	}
+	return "unknown"
 }
 
 func (l *partitionReplicationLane) replicationSnapshot(task partitionReplicationTask) (clusterController.PartitionReplicationSnapshot, error) {

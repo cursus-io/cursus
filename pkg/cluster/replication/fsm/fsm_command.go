@@ -18,11 +18,12 @@ import (
 var ErrPartitionCommitFenced = errors.New("partition commit fenced")
 
 type PartitionMetadata struct {
-	Leader       string   `json:"leader"`
-	Replicas     []string `json:"replicas"`
-	ISR          []string `json:"isr"`
-	LeaderEpoch  int      `json:"leader_epoch"`
-	CommittedHWM uint64   `json:"-"`
+	Leader           string   `json:"leader"`
+	Replicas         []string `json:"replicas"`
+	ISR              []string `json:"isr"`
+	RecoveryReplicas []string `json:"recovery_replicas,omitempty"`
+	LeaderEpoch      int      `json:"leader_epoch"`
+	CommittedHWM     uint64   `json:"-"`
 	// CommittedHWMKnown is an internal initialization invariant. Current wire
 	// data always carries an explicit version and numeric committed watermark.
 	CommittedHWMKnown bool   `json:"-"`
@@ -35,6 +36,7 @@ type partitionMetadataJSON struct {
 	Leader              string   `json:"leader"`
 	Replicas            []string `json:"replicas"`
 	ISR                 []string `json:"isr"`
+	RecoveryReplicas    []string `json:"recovery_replicas,omitempty"`
 	LeaderEpoch         int      `json:"leader_epoch"`
 	CommittedHWMVersion *int     `json:"committed_hwm_version,omitempty"`
 	CommittedHWM        *uint64  `json:"committed_hwm,omitempty"`
@@ -50,6 +52,7 @@ func (m PartitionMetadata) MarshalJSON() ([]byte, error) {
 		Leader:              m.Leader,
 		Replicas:            m.Replicas,
 		ISR:                 m.ISR,
+		RecoveryReplicas:    m.RecoveryReplicas,
 		LeaderEpoch:         m.LeaderEpoch,
 		CommittedHWMVersion: &version,
 		CommittedHWM:        &committed,
@@ -80,6 +83,7 @@ func (m *PartitionMetadata) UnmarshalJSON(data []byte) error {
 		Leader:            decoded.Leader,
 		Replicas:          decoded.Replicas,
 		ISR:               decoded.ISR,
+		RecoveryReplicas:  decoded.RecoveryReplicas,
 		LeaderEpoch:       decoded.LeaderEpoch,
 		PartitionCount:    decoded.PartitionCount,
 		Idempotent:        decoded.Idempotent,
@@ -497,6 +501,7 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 		}
 		metadata.CommittedHWM = 0
 		metadata.CommittedHWMKnown = true
+		metadata.RecoveryReplicas = nil
 		metadata.LeaderEpoch++
 		metadata.LifecycleEpoch = target.LifecycleEpoch
 	}
@@ -761,6 +766,14 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 	if f.offsetReservationsActivated && info.LifecycleProtocol < OffsetReservationsProtocolVersion {
 		f.mu.Unlock()
 		return fmt.Errorf("broker_registration_fenced broker=%s reason=offset_reservations_protocol required=%d", info.ID, OffsetReservationsProtocolVersion)
+	}
+	if info.LifecycleProtocol < ReplicaGapRecoveryProtocolVersion {
+		for _, metadata := range f.partitionMetadata {
+			if metadata != nil && len(metadata.RecoveryReplicas) > 0 {
+				f.mu.Unlock()
+				return fmt.Errorf("broker_registration_fenced broker=%s reason=replica_gap_recovery_protocol required=%d", info.ID, ReplicaGapRecoveryProtocolVersion)
+			}
+		}
 	}
 	if f.retiredBrokerIncarnations == nil {
 		f.retiredBrokerIncarnations = make(map[string]map[string]struct{})

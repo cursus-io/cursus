@@ -10,6 +10,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
@@ -214,6 +215,45 @@ func TestBuildRaftConfigRejectsUnsafeSnapshotSettings(t *testing.T) {
 	}
 }
 
+func TestLocalPartitionsNeedRecoveryFenceIgnoresEmptyTopicDefinitions(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	topicManager := topic.NewTopicManager(cfg, &FakeHandlerProvider{}, nil)
+	t.Cleanup(topicManager.Stop)
+	require.NoError(t, topicManager.CreateTopic("empty-internal", 1, false, false))
+
+	require.False(t, localPartitionsNeedRecoveryFence(topicManager))
+}
+
+func TestLocalPartitionsNeedRecoveryFenceProtectsPersistedWatermark(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	topicManager := topic.NewTopicManager(cfg, &FakeHandlerProvider{}, nil)
+	t.Cleanup(topicManager.Stop)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	partition.SetHWM(1)
+
+	require.True(t, localPartitionsNeedRecoveryFence(topicManager))
+}
+
+func TestLocalPartitionsNeedRecoveryFenceProtectsUncommittedTail(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	topicManager := topic.NewTopicManager(cfg, &FakeHandlerProvider{}, nil)
+	t.Cleanup(topicManager.Stop)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ApplyReplicaHWM(0))
+	require.NoError(t, partition.EnqueueBatchLeader([]types.Message{{Payload: "tail"}}))
+	require.Zero(t, partition.GetHWM())
+
+	require.True(t, localPartitionsNeedRecoveryFence(topicManager))
+}
+
 func TestHighestFSMCommandIndexIgnoresNonCommandEntries(t *testing.T) {
 	store := raft.NewInmemStore()
 	require.NoError(t, store.StoreLogs([]*raft.Log{
@@ -293,6 +333,34 @@ func TestAwaitRecoveredPartitionReplayScansStableCommitRangeOnce(t *testing.T) {
 	err := awaitRecoveredPartitionReplay(context.Background(), stats, store, brokerFSM, "broker-1", time.Second)
 	require.NoError(t, err)
 	require.Equal(t, int64(3), store.reads.Load())
+}
+
+func TestAwaitRecoveredPartitionReplayWaitsForRaftAuthority(t *testing.T) {
+	store := raft.NewInmemStore()
+	require.NoError(t, store.StoreLog(&raft.Log{
+		Index: 6, Type: raft.LogCommand, Data: []byte("PARTITION_COMMIT:{}"),
+	}))
+	stats := &mutableRaftStats{stats: map[string]string{
+		"state":               raft.Follower.String(),
+		"last_contact":        "never",
+		"last_snapshot_index": "5",
+		"commit_index":        "6",
+		"last_log_index":      "6",
+	}}
+	brokerFSM := &fakeRecoveredPartitionFSM{pending: true, applied: 6}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- awaitRecoveredPartitionReplay(context.Background(), stats, store, brokerFSM, "broker-1", time.Second)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("recovery finalized before Raft authority was known: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	stats.set("last_contact", "1ms")
+	require.NoError(t, <-done)
+	require.True(t, brokerFSM.wasFinalized())
 }
 
 func TestRaftReplicationManagerGetRaftStatus(t *testing.T) {

@@ -17,6 +17,7 @@ type PartitionTopologyHealth struct {
 	LeaderEpoch        int
 	Replicas           []string
 	ISR                []string
+	RecoveryReplicas   []string
 	CommittedHWM       uint64
 	ExpectedReplicas   int
 	ActiveReplicas     int
@@ -27,6 +28,7 @@ type PartitionTopologyHealth struct {
 	AssignmentComplete bool
 	UnderReplicated    bool
 	MinISRUnsatisfied  bool
+	RecoveryPending    bool
 	Healthy            bool
 	Reasons            []string
 }
@@ -42,6 +44,7 @@ type TopologyHealth struct {
 	InactiveReplicaPartitions int
 	InactiveReplicas          int
 	MinISRUnsatisfied         int
+	RecoveryPending           int
 	Partitions                []PartitionTopologyHealth
 }
 
@@ -51,16 +54,17 @@ type TopologyHealth struct {
 // active, and its effective minimum ISR is satisfied. Full-replica health is
 // exposed separately through CLUSTER_STATUS and replication metrics.
 func (health TopologyHealth) ReadinessError() error {
-	if health.Offline == 0 && health.AssignmentDeficient == 0 && health.MinISRUnsatisfied == 0 {
+	if health.Offline == 0 && health.AssignmentDeficient == 0 && health.MinISRUnsatisfied == 0 && health.RecoveryPending == 0 {
 		return nil
 	}
 	return fmt.Errorf(
-		"cluster topology unhealthy: offline=%d under_replicated=%d assignment_deficient=%d inactive_replica_partitions=%d min_isr_unsatisfied=%d",
+		"cluster topology unhealthy: offline=%d under_replicated=%d assignment_deficient=%d inactive_replica_partitions=%d min_isr_unsatisfied=%d recovery_pending=%d",
 		health.Offline,
 		health.UnderReplicated,
 		health.AssignmentDeficient,
 		health.InactiveReplicaPartitions,
 		health.MinISRUnsatisfied,
+		health.RecoveryPending,
 	)
 }
 
@@ -169,6 +173,7 @@ func evaluatePartitionTopology(
 	health.LeaderEpoch = metadata.LeaderEpoch
 	health.Replicas = append([]string(nil), metadata.Replicas...)
 	health.ISR = append([]string(nil), metadata.ISR...)
+	health.RecoveryReplicas = append([]string(nil), metadata.RecoveryReplicas...)
 	health.CommittedHWM = metadata.CommittedHWM
 
 	replicaSet := make(map[string]struct{}, len(metadata.Replicas))
@@ -250,6 +255,10 @@ func evaluatePartitionTopology(
 	if health.MinISRUnsatisfied {
 		health.addReason("isr_below_minimum")
 	}
+	if len(metadata.RecoveryReplicas) > 0 {
+		health.RecoveryPending = true
+		health.addReason("replica_recovery_pending")
+	}
 	health.Healthy = len(health.Reasons) == 0
 	return health
 }
@@ -281,6 +290,9 @@ func (health *TopologyHealth) addPartition(partition PartitionTopologyHealth) {
 	}
 	if partition.MinISRUnsatisfied {
 		health.MinISRUnsatisfied++
+	}
+	if partition.RecoveryPending {
+		health.RecoveryPending++
 	}
 	if !partition.Healthy {
 		health.Healthy = false

@@ -15,10 +15,12 @@ import (
 )
 
 const (
-	RuntimeGateEnvironment = "CURSUS_E2E_FAULTS"
-	SentinelRoot           = "/run/cursus-e2e-faults"
-	HandlerOpenOperation   = "handler-open"
-	CleanupOperation       = "cleanup"
+	RuntimeGateEnvironment       = "CURSUS_E2E_FAULTS"
+	SentinelRoot                 = "/run/cursus-e2e-faults"
+	HandlerOpenOperation         = "handler-open"
+	CleanupOperation             = "cleanup"
+	ReplicaAppendSkipOperation   = "replica-append-skip"
+	ReplicaCatchupPauseOperation = "replica-catchup-pause"
 )
 
 // StorageProvider injects node-local storage faults only in e2e_faults builds.
@@ -27,6 +29,24 @@ type StorageProvider struct {
 	*disk.DiskManager
 	logRoot      string
 	sentinelRoot string
+}
+
+// ConsumeReplicaAppendSkip atomically consumes a one-shot follower append
+// sentinel. It is only compiled into the dedicated e2e fault image.
+func ConsumeReplicaAppendSkip(topicName string, partition int, offset uint64) bool {
+	name := fmt.Sprintf("%s-%d-%d", topicName, partition, offset)
+	path := filepath.Join(SentinelRoot, ReplicaAppendSkipOperation, name)
+	if err := os.Remove(path); err == nil {
+		return true
+	}
+	return false
+}
+
+// ReplicaCatchupPaused keeps the divergent replica outside ISR until the test
+// removes its topic-scoped sentinel.
+func ReplicaCatchupPaused(topicName string) bool {
+	_, err := os.Stat(filepath.Join(SentinelRoot, ReplicaCatchupPauseOperation, topicName))
+	return err == nil
 }
 
 var (

@@ -228,6 +228,7 @@ func (f *BrokerFSM) applyISRCatchupCommand(jsonData string) interface{} {
 		}
 	}
 	metadata.ISR = ordered
+	metadata.RecoveryReplicas = removeString(metadata.RecoveryReplicas, proof.BrokerID)
 	return nil
 }
 
@@ -245,6 +246,7 @@ func (f *BrokerFSM) BuildISRCatchupProofs(brokerID string) []ISRCatchupProof {
 			copy := *value
 			copy.Replicas = append([]string(nil), value.Replicas...)
 			copy.ISR = append([]string(nil), value.ISR...)
+			copy.RecoveryReplicas = append([]string(nil), value.RecoveryReplicas...)
 			metadata[key] = copy
 		}
 	}
@@ -350,6 +352,7 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 			copy := *value
 			copy.Replicas = append([]string(nil), value.Replicas...)
 			copy.ISR = append([]string(nil), value.ISR...)
+			copy.RecoveryReplicas = append([]string(nil), value.RecoveryReplicas...)
 			metadata[key] = copy
 		}
 	}
@@ -393,6 +396,16 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 		}
 		leo := partition.NextOffset()
 		inISR := containsString(meta.ISR, brokerID)
+		if inISR && leo >= meta.CommittedHWM {
+			// An ISR member can receive a direct append after leo is sampled.
+			// Publishing the known committed boundary is safe and monotonic;
+			// reconciling here is not, because a stale scan could truncate that
+			// newly appended record before the leader commits it.
+			if err := partition.ApplyReplicaHWM(meta.CommittedHWM); err == nil {
+				partition.FlushDisk()
+			}
+			continue
+		}
 		if leo > meta.CommittedHWM && !inISR {
 			if err := partition.TruncateReplicaTail(meta.CommittedHWM); err != nil {
 				continue
@@ -401,11 +414,6 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 			leo = partition.NextOffset()
 		}
 		if leo >= meta.CommittedHWM {
-			if leo == meta.CommittedHWM && inISR {
-				if err := partition.ReconcileCommittedHWM(meta.CommittedHWM); err == nil {
-					partition.FlushDisk()
-				}
-			}
 			if leo == meta.CommittedHWM && !inISR {
 				request := ReplicaCatchupRequest{
 					Topic: topicName, Partition: partitionID, BrokerID: brokerID,
@@ -685,4 +693,14 @@ func containsString(values []string, wanted string) bool {
 		}
 	}
 	return false
+}
+
+func removeString(values []string, unwanted string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != unwanted {
+			result = append(result, value)
+		}
+	}
+	return result
 }

@@ -550,7 +550,7 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", msgCmd.Partition)
 	}
 	if ch.isDistributed() {
-		releaseWrite, prepareErr := ch.preparePartitionReplica(msgCmd.Topic, msgCmd.Partition, p, msgCmd.LeaderID, msgCmd.LeaderEpoch)
+		releaseWrite, prepareErr := ch.preparePartitionReplica(msgCmd.Topic, msgCmd.Partition, p, msgCmd.LeaderID, msgCmd.LeaderEpoch, msgCmd.CommitHWM)
 		if prepareErr != nil {
 			return ch.errorResponse(prepareErr.Error())
 		}
@@ -576,6 +576,10 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 	}
 
 	if len(msgCmd.Messages) > 0 {
+		if injectedReplicaAppendSkip(msgCmd.Topic, msgCmd.Partition, msgCmd.Messages) {
+			util.Warn("Injected one-shot replica append skip topic=%s partition=%d offset=%d", msgCmd.Topic, msgCmd.Partition, msgCmd.Messages[0].Offset)
+			return fmt.Sprintf("OK leo=%d hwm=%d", p.NextOffset(), p.GetHWM())
+		}
 		if err := p.ReplicaAppendWithMode(msgCmd.Messages, msgCmd.IsIdempotent); err != nil {
 			if errors.Is(err, topic.ErrReplicaOffsetGap) {
 				return fmt.Sprintf("ERROR: replica_offset_gap reason=%q", err.Error())

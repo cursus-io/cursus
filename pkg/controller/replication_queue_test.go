@@ -37,6 +37,15 @@ type barrierReplicationExecutor struct {
 	replicateSnapshots []clusterController.PartitionReplicationSnapshot
 	nonISRCalls        int
 	nonISRBarrier      chan struct{}
+	recoverGap         func(partitionReplicationTask, error) (replicaGapRecoveryResult, error)
+	state              *fsm.BrokerFSM
+}
+
+func (e *barrierReplicationExecutor) RecoverReplicaGap(task partitionReplicationTask, cause error) (replicaGapRecoveryResult, error) {
+	if e.recoverGap != nil {
+		return e.recoverGap(task, cause)
+	}
+	return replicaGapRecoveryResult{}, cause
 }
 
 type permanentReplicationError struct{}
@@ -46,6 +55,14 @@ func (permanentReplicationError) Error() string { return "invalid replica append
 func (permanentReplicationError) Retryable() bool { return false }
 
 func (permanentReplicationError) ReplicationErrorClass() string { return "validation" }
+
+type replicaGapTestError struct{ brokerID string }
+
+func (e replicaGapTestError) Error() string                 { return "replica_offset_gap" }
+func (e replicaGapTestError) Retryable() bool               { return true }
+func (e replicaGapTestError) ReplicationErrorClass() string { return "availability" }
+func (e replicaGapTestError) ReplicationErrorCode() string  { return "replica_offset_gap" }
+func (e replicaGapTestError) ReplicaBrokerID() string       { return e.brokerID }
 
 func (e *barrierReplicationExecutor) Snapshot(string, int) (clusterController.PartitionReplicationSnapshot, error) {
 	e.mu.Lock()
@@ -106,6 +123,23 @@ func (e *barrierReplicationExecutor) Commit(task partitionReplicationTask) (part
 	}
 	if hook != nil {
 		hook()
+	}
+	if e.state != nil {
+		metadata := e.state.GetPartitionMetadata(fmt.Sprintf("%s-%d", task.topic, task.partition))
+		if metadata != nil {
+			metadata.CommittedHWM = task.commitHWM
+			metadata.CommittedHWMKnown = true
+			encoded, err := json.Marshal(metadata)
+			if err != nil {
+				return partitionCommitResult{accepted: true, hwm: task.commitHWM}, err
+			}
+			if result := e.state.Apply(&raft.Log{Data: []byte(fmt.Sprintf("PARTITION:%s-%d:%s", task.topic, task.partition, encoded))}); result != nil {
+				if applyErr, ok := result.(error); ok {
+					return partitionCommitResult{accepted: true, hwm: task.commitHWM}, applyErr
+				}
+				return partitionCommitResult{accepted: true, hwm: task.commitHWM}, fmt.Errorf("unexpected partition metadata apply result: %v", result)
+			}
+		}
 	}
 	return partitionCommitResult{accepted: true, hwm: task.commitHWM}, commitErr
 }
@@ -303,6 +337,122 @@ func TestAllAcknowledgementRetriesTransientFollowerFailureBeforeResponding(t *te
 	}
 	require.NoError(t, <-task.result)
 	require.Equal(t, uint64(1), executor.committed())
+}
+
+func TestReplicaOffsetGapQuarantinesOnceAndContinuesWithReducedISR(t *testing.T) {
+	executor := newBarrierReplicationExecutor()
+	executor.replicateErr = replicaGapTestError{brokerID: "broker-2"}
+	executor.replicateFailures = 1
+	executor.recoverGap = func(_ partitionReplicationTask, cause error) (replicaGapRecoveryResult, error) {
+		require.True(t, replicaGapError(cause))
+		executor.mu.Lock()
+		executor.snapshot.ISR = []string{"broker-1", "broker-3"}
+		executor.snapshot.RecoveryReplicas = []string{"broker-2"}
+		executor.mu.Unlock()
+		return replicaGapRecoveryResult{}, nil
+	}
+	close(executor.barrier)
+	coordinator := newPartitionReplicationCoordinator(1, executor)
+	t.Cleanup(coordinator.close)
+	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	task := replicationTaskForMode(executor, ackpolicy.All)
+	reservation.submit(task)
+
+	require.NoError(t, <-task.result)
+	executor.mu.Lock()
+	require.Equal(t, 2, executor.replicateCalls)
+	require.Equal(t, []string{"broker-1", "broker-2"}, executor.replicateSnapshots[0].ISR)
+	require.Equal(t, []string{"broker-1", "broker-3"}, executor.replicateSnapshots[1].ISR)
+	executor.mu.Unlock()
+	require.Equal(t, uint64(1), executor.committed())
+}
+
+func TestRecoverReplicaGapDefersAuthoritativeReconcileUntilMutationRelease(t *testing.T) {
+	handler, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 0, Payload: "committed"}}))
+	applyPartitionMetadata(t, handler.Cluster.RaftManager.GetFSM(), "orders", 0, fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 7, CommittedHWM: 1,
+		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1", "broker-2"},
+		PartitionCount: 1,
+	})
+	snapshot, err := handler.Cluster.GetPartitionReplicationSnapshot("orders", 0)
+	require.NoError(t, err)
+	releaseMutation := partition.BeginReplicationMutation()
+	t.Cleanup(releaseMutation)
+
+	type recoveryResponse struct {
+		result replicaGapRecoveryResult
+		err    error
+	}
+	done := make(chan recoveryResponse, 1)
+	go func() {
+		result, recoverErr := (clusterPartitionReplicationExecutor{handler: handler}).RecoverReplicaGap(
+			partitionReplicationTask{
+				topic: "orders", partition: 0, commitHWM: 1, ackMode: ackpolicy.All, requiredISR: 2,
+				snapshot: snapshot, partitionRef: partition,
+			},
+			replicaGapTestError{brokerID: "broker-2"},
+		)
+		done <- recoveryResponse{result: result, err: recoverErr}
+	}()
+	select {
+	case response := <-done:
+		require.NoError(t, response.err)
+		require.True(t, response.result.resolved)
+		require.True(t, response.result.hasAuthoritativeHWM)
+		require.Equal(t, uint64(1), response.result.authoritativeHWM)
+	case <-time.After(time.Second):
+		t.Fatal("replica gap recovery reconciled while holding the mutation read lock")
+	}
+}
+
+func TestSameEpochPrepareTrimsUncommittedTailBeforeNextAppend(t *testing.T) {
+	handler, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
+	applyPartitionMetadata(t, handler.Cluster.RaftManager.GetFSM(), "orders", 0, fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 7, CommittedHWM: 1,
+		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1", "broker-2"},
+		PartitionCount: 1,
+	})
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 0, Payload: "committed"}}))
+	require.NoError(t, partition.ApplyReplicaHWM(1))
+
+	releaseWrite, releaseMutation, _, err := handler.preparePartitionLeaderSnapshot("orders", 0, partition, 2)
+	require.NoError(t, err)
+	releaseMutation()
+	releaseWrite()
+	require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 1, Payload: "uncommitted"}}))
+	require.Equal(t, uint64(2), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM())
+
+	releaseWrite, releaseMutation, _, err = handler.preparePartitionLeaderSnapshot("orders", 0, partition, 2)
+	require.NoError(t, err)
+	releaseMutation()
+	releaseWrite()
+	require.Equal(t, uint64(1), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM())
+}
+
+func TestRecoveryPendingPartitionRejectsNewLeaderAppend(t *testing.T) {
+	handler, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	state := handler.Cluster.RaftManager.GetFSM()
+	applyPartitionMetadata(t, state, "orders", 0, fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 7, CommittedHWM: 0,
+		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1"},
+		RecoveryReplicas: []string{"broker-2"}, PartitionCount: 1,
+	})
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	_, _, _, err = handler.preparePartitionLeaderSnapshot("orders", 0, partition, 1)
+	require.ErrorContains(t, err, "replica_recovery_pending")
 }
 
 func TestAllAcknowledgementRefreshesISRWhileRetrying(t *testing.T) {
@@ -919,7 +1069,7 @@ func TestPreparePartitionReplicaAllowsFencedBackfillBelowCommittedHWM(t *testing
 	partition, err := topicManager.GetTopic("orders").GetPartition(0)
 	require.NoError(t, err)
 
-	release, err := handler.preparePartitionReplica("orders", 0, partition, "broker-1", 7)
+	release, err := handler.preparePartitionReplica("orders", 0, partition, "broker-1", 7, nil)
 	require.NoError(t, err)
 	release()
 	require.Zero(t, partition.NextOffset())
@@ -932,6 +1082,41 @@ func TestPreparePartitionReplicaAllowsFencedBackfillBelowCommittedHWM(t *testing
 	require.NoError(t, handler.ApplyReplicaCatchup(context.Background(), catchupBatch))
 	require.Equal(t, uint64(2), partition.NextOffset())
 	require.Equal(t, uint64(2), partition.GetHWM())
+}
+
+func TestPreparePartitionReplicaUsesLeaderCommittedHWMWhileLocalRaftApplyLags(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	diskManager := disk.NewDiskManager(cfg)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	state := fsm.NewBrokerFSM(topicManager, nil)
+	applyPartitionMetadata(t, state, "orders", 0, fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 7, CommittedHWM: 0, CommittedHWMKnown: true,
+		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1", "broker-2"}, PartitionCount: 1,
+	})
+	cluster := clusterController.NewClusterController(
+		context.Background(), cfg, &MockRaftManagerForForward{state: state}, nil, "broker-2", "broker-2:9001",
+	)
+	handler := NewCommandHandler(topicManager, cfg, nil, nil, cluster)
+	t.Cleanup(func() {
+		_ = handler.Close()
+		topicManager.Stop()
+		diskManager.CloseAllHandlers()
+	})
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	messages := []types.Message{{Offset: 0, Payload: "committed"}}
+	require.NoError(t, partition.ReplicaAppend(messages))
+	require.NoError(t, partition.ApplyReplicaHWM(1))
+
+	leaderCommittedHWM := uint64(1)
+	release, err := handler.preparePartitionReplica("orders", 0, partition, "broker-1", 7, &leaderCommittedHWM)
+	require.NoError(t, err)
+	release()
+	require.Equal(t, uint64(1), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM())
 }
 
 func TestApplyReplicaCatchupAcceptsCompactedOffsetRangeAndPreservesHWM(t *testing.T) {
@@ -1300,6 +1485,7 @@ func newDistributedAckTestHandler(t *testing.T, brokerMinISR int) (*CommandHandl
 	handler := NewCommandHandler(manager, cfg, nil, nil, cluster)
 	handler.replication.close()
 	executor := newBarrierReplicationExecutor()
+	executor.state = state
 	handler.replication = newPartitionReplicationCoordinator(2, executor)
 	t.Cleanup(func() {
 		_ = handler.Close()

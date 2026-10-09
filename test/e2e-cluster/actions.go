@@ -3,6 +3,7 @@ package e2e_cluster
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os/exec"
 	"strings"
@@ -81,7 +82,11 @@ func (a *ClusterActions) waitForNodeHealth(nodeIndex int, healthURL string) erro
 			return true, "healthy", nil
 		}
 		if resp != nil {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
+			if readErr == nil {
+				return false, fmt.Sprintf("health endpoint status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body))), err
+			}
 		}
 		return false, "health endpoint not ready", err
 	})
@@ -241,6 +246,42 @@ func (a *ClusterActions) StartBroker(nodeIndex int) {
 			a.ctx.GetT().Logf("%s logs:\n%s", containerName, string(output))
 		}
 		a.ctx.GetT().Fatalf("broker %d did not recover: %v", nodeIndex, err)
+	}
+	brokerID := fmt.Sprintf("broker-%d-9000", nodeIndex)
+	if err := eventually(a.ctx.GetT(), fmt.Sprintf("active registration for %s", brokerID), clusterReadyTimeout, func() (bool, string, error) {
+		observers := 0
+		unavailable := make([]string, 0)
+		for _, addr := range a.ctx.GetBrokerAddrs() {
+			client := e2e.NewBrokerClient([]string{addr})
+			response, requestErr := client.SendCommand("", "LIST_CLUSTER", 2*time.Second)
+			client.Close()
+			if requestErr != nil {
+				unavailable = append(unavailable, addr)
+				continue
+			}
+			payload := strings.TrimPrefix(strings.TrimSpace(response), "OK brokers=")
+			var brokers []fsm.BrokerInfo
+			if err := json.Unmarshal([]byte(payload), &brokers); err != nil {
+				return false, response, err
+			}
+			active := false
+			for _, broker := range brokers {
+				if broker.ID == brokerID && broker.Status == "active" {
+					active = true
+					break
+				}
+			}
+			if !active {
+				return false, fmt.Sprintf("%s does not observe %s active", addr, brokerID), nil
+			}
+			observers++
+		}
+		if observers < a.ctx.minInSyncReplicas {
+			return false, fmt.Sprintf("%s active on %d observers; need %d (unavailable=%v)", brokerID, observers, a.ctx.minInSyncReplicas, unavailable), nil
+		}
+		return true, fmt.Sprintf("%s active on %d observers (unavailable=%v)", brokerID, observers, unavailable), nil
+	}); err != nil {
+		a.ctx.GetT().Fatalf("broker %d registration did not converge: %v", nodeIndex, err)
 	}
 }
 func (a *ClusterActions) DescribeTopic() *ClusterActions {
