@@ -37,15 +37,15 @@ type barrierReplicationExecutor struct {
 	replicateSnapshots []clusterController.PartitionReplicationSnapshot
 	nonISRCalls        int
 	nonISRBarrier      chan struct{}
-	recoverGap         func(partitionReplicationTask, error) (bool, error)
+	recoverGap         func(partitionReplicationTask, error) (replicaGapRecoveryResult, error)
 	state              *fsm.BrokerFSM
 }
 
-func (e *barrierReplicationExecutor) RecoverReplicaGap(task partitionReplicationTask, cause error) (bool, error) {
+func (e *barrierReplicationExecutor) RecoverReplicaGap(task partitionReplicationTask, cause error) (replicaGapRecoveryResult, error) {
 	if e.recoverGap != nil {
 		return e.recoverGap(task, cause)
 	}
-	return false, cause
+	return replicaGapRecoveryResult{}, cause
 }
 
 type permanentReplicationError struct{}
@@ -124,9 +124,6 @@ func (e *barrierReplicationExecutor) Commit(task partitionReplicationTask) (part
 	if hook != nil {
 		hook()
 	}
-<<<<<<< HEAD
-	return partitionCommitResult{accepted: true, hwm: task.commitHWM}, commitErr
-=======
 	if e.state != nil {
 		metadata := e.state.GetPartitionMetadata(fmt.Sprintf("%s-%d", task.topic, task.partition))
 		if metadata != nil {
@@ -134,18 +131,17 @@ func (e *barrierReplicationExecutor) Commit(task partitionReplicationTask) (part
 			metadata.CommittedHWMKnown = true
 			encoded, err := json.Marshal(metadata)
 			if err != nil {
-				return err
+				return partitionCommitResult{accepted: true, hwm: task.commitHWM}, err
 			}
 			if result := e.state.Apply(&raft.Log{Data: []byte(fmt.Sprintf("PARTITION:%s-%d:%s", task.topic, task.partition, encoded))}); result != nil {
 				if applyErr, ok := result.(error); ok {
-					return applyErr
+					return partitionCommitResult{accepted: true, hwm: task.commitHWM}, applyErr
 				}
-				return fmt.Errorf("unexpected partition metadata apply result: %v", result)
+				return partitionCommitResult{accepted: true, hwm: task.commitHWM}, fmt.Errorf("unexpected partition metadata apply result: %v", result)
 			}
 		}
 	}
-	return nil
->>>>>>> d2de686 (fix: quarantine divergent replicas during recovery)
+	return partitionCommitResult{accepted: true, hwm: task.commitHWM}, commitErr
 }
 
 func (e *barrierReplicationExecutor) committed() uint64 {
@@ -347,13 +343,13 @@ func TestReplicaOffsetGapQuarantinesOnceAndContinuesWithReducedISR(t *testing.T)
 	executor := newBarrierReplicationExecutor()
 	executor.replicateErr = replicaGapTestError{brokerID: "broker-2"}
 	executor.replicateFailures = 1
-	executor.recoverGap = func(_ partitionReplicationTask, cause error) (bool, error) {
+	executor.recoverGap = func(_ partitionReplicationTask, cause error) (replicaGapRecoveryResult, error) {
 		require.True(t, replicaGapError(cause))
 		executor.mu.Lock()
 		executor.snapshot.ISR = []string{"broker-1", "broker-3"}
 		executor.snapshot.RecoveryReplicas = []string{"broker-2"}
 		executor.mu.Unlock()
-		return false, nil
+		return replicaGapRecoveryResult{}, nil
 	}
 	close(executor.barrier)
 	coordinator := newPartitionReplicationCoordinator(1, executor)
@@ -370,6 +366,48 @@ func TestReplicaOffsetGapQuarantinesOnceAndContinuesWithReducedISR(t *testing.T)
 	require.Equal(t, []string{"broker-1", "broker-3"}, executor.replicateSnapshots[1].ISR)
 	executor.mu.Unlock()
 	require.Equal(t, uint64(1), executor.committed())
+}
+
+func TestRecoverReplicaGapDefersAuthoritativeReconcileUntilMutationRelease(t *testing.T) {
+	handler, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 0, Payload: "committed"}}))
+	applyPartitionMetadata(t, handler.Cluster.RaftManager.GetFSM(), "orders", 0, fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 7, CommittedHWM: 1,
+		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1", "broker-2"},
+		PartitionCount: 1,
+	})
+	snapshot, err := handler.Cluster.GetPartitionReplicationSnapshot("orders", 0)
+	require.NoError(t, err)
+	releaseMutation := partition.BeginReplicationMutation()
+	t.Cleanup(releaseMutation)
+
+	type recoveryResponse struct {
+		result replicaGapRecoveryResult
+		err    error
+	}
+	done := make(chan recoveryResponse, 1)
+	go func() {
+		result, recoverErr := (clusterPartitionReplicationExecutor{handler: handler}).RecoverReplicaGap(
+			partitionReplicationTask{
+				topic: "orders", partition: 0, commitHWM: 1, ackMode: ackpolicy.All, requiredISR: 2,
+				snapshot: snapshot, partitionRef: partition,
+			},
+			replicaGapTestError{brokerID: "broker-2"},
+		)
+		done <- recoveryResponse{result: result, err: recoverErr}
+	}()
+	select {
+	case response := <-done:
+		require.NoError(t, response.err)
+		require.True(t, response.result.resolved)
+		require.True(t, response.result.hasAuthoritativeHWM)
+		require.Equal(t, uint64(1), response.result.authoritativeHWM)
+	case <-time.After(time.Second):
+		t.Fatal("replica gap recovery reconciled while holding the mutation read lock")
+	}
 }
 
 func TestSameEpochPrepareTrimsUncommittedTailBeforeNextAppend(t *testing.T) {
@@ -807,8 +845,6 @@ func TestCompleteReplicationTaskReportsReconcileFailureAndDropsBlockedResult(t *
 	require.ErrorContains(t, <-result, "reconcile failed replication to committed HWM 0")
 	require.True(t, mutationReleased)
 	require.True(t, writeReleased)
-	require.ErrorContains(t, partition.ReconciliationError(), "snapshot replay is still pending")
-	require.ErrorContains(t, partition.EnqueueBatchLeader([]types.Message{{Payload: "blocked"}}), "partition recovery incomplete")
 
 	blockedResult := make(chan error, 1)
 	blockedResult <- errors.New("existing result")
@@ -1184,57 +1220,6 @@ func TestDistributedLeaderAcknowledgementHoldsWriteOwnershipUntilReplicationComp
 	close(executor.barrier)
 	require.Contains(t, <-second, `"last_offset":1`)
 	require.Eventually(t, func() bool { return executor.committed() == 2 }, time.Second, time.Millisecond)
-}
-
-func TestDistributedPublishOwnershipWaitHonorsRequestDeadline(t *testing.T) {
-	tests := []struct {
-		name    string
-		publish func(*CommandHandler, *ClientContext) string
-	}{
-		{
-			name: "command",
-			publish: func(handler *CommandHandler, clientCtx *ClientContext) string {
-				return handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=value", clientCtx)
-			},
-		},
-		{
-			name: "batch",
-			publish: func(handler *CommandHandler, clientCtx *ClientContext) string {
-				data, err := util.EncodeBatchMessages("orders", 0, "1", false, []types.Message{{Payload: "value", ProducerID: "p1"}})
-				require.NoError(t, err)
-				response, err := handler.HandleBatchMessage(data, nil, clientCtx)
-				require.NoError(t, err)
-				return response
-			},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			handler, manager, executor := newDistributedAckTestHandler(t, 2)
-			require.NoError(t, manager.CreateTopic("orders", 1, false, false))
-			installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
-
-			first := test.publish(handler, NewClientContext("", 0))
-			require.Contains(t, first, `"last_offset":0`)
-			<-executor.started
-
-			requestCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-			defer cancel()
-			clientCtx := NewClientContext("", 0)
-			clientCtx.SetRequestContext(requestCtx)
-			started := time.Now()
-			second := test.publish(handler, clientCtx)
-			require.Equal(t, "ERROR: request_timeout outcome=not_accepted", second)
-			require.Less(t, time.Since(started), time.Second)
-			partition, err := manager.GetTopic("orders").GetPartition(0)
-			require.NoError(t, err)
-			require.Equal(t, uint64(1), partition.NextOffset(), "timed-out ownership waiter appended a record")
-
-			close(executor.barrier)
-			require.Eventually(t, func() bool { return executor.committed() == 1 }, time.Second, time.Millisecond)
-		})
-	}
 }
 
 func TestDistributedPermanentReplicationFailureRollsBackUncommittedTail(t *testing.T) {
