@@ -144,6 +144,11 @@ func (es *EventStore) resetConn() {
 
 const eventStoreMaxLeaderRedirects = 3
 
+func eventStoreNotLeaderError(response string) (*BrokerError, bool) {
+	brokerErr, ok := ParseBrokerError(response)
+	return brokerErr, ok && strings.EqualFold(brokerErr.Code, "NOT_LEADER")
+}
+
 // followLeader handles only an explicit broker rejection. A lost response to a
 // mutating command is never retried because its outcome may be committed.
 func (es *EventStore) followLeader(err error) bool {
@@ -227,7 +232,7 @@ func (es *EventStore) sendCommandOnce(ctx context.Context, cmd, unknownOperation
 		}
 		return "", fmt.Errorf("read: %w", cause)
 	}
-	if brokerErr, ok := ParseBrokerError(string(resp)); ok {
+	if brokerErr, ok := eventStoreNotLeaderError(string(resp)); ok {
 		return "", brokerErr
 	}
 	return string(resp), nil
@@ -392,8 +397,11 @@ func (es *EventStore) readStreamFromOnce(ctx context.Context, key string, fromVe
 			es.resetConn()
 			return nil, fmt.Errorf("read envelope: %w", err)
 		}
-		if brokerErr, ok := ParseBrokerError(string(envData)); ok {
+		if brokerErr, ok := eventStoreNotLeaderError(string(envData)); ok {
 			return nil, brokerErr
+		}
+		if strings.HasPrefix(string(envData), "ERROR:") {
+			return nil, fmt.Errorf("broker: %s", strings.TrimSpace(string(envData)))
 		}
 		var envelope struct {
 			Status      string    `json:"status"`
@@ -410,7 +418,7 @@ func (es *EventStore) readStreamFromOnce(ctx context.Context, key string, fromVe
 			if envelope.Error == "" {
 				envelope.Error = "read stream failed"
 			}
-			if brokerErr, ok := ParseBrokerError("ERROR: " + envelope.Error); ok {
+			if brokerErr, ok := eventStoreNotLeaderError("ERROR: " + envelope.Error); ok {
 				return nil, brokerErr
 			}
 			return nil, fmt.Errorf("broker: %s", envelope.Error)

@@ -3,6 +3,7 @@ package sdk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -24,24 +25,39 @@ func writeEmptyStreamPage(conn *wire.Connection, request wire.Frame) error {
 }
 
 func TestEventStoreReadStreamFollowsLeaderAndCachesConnection(t *testing.T) {
-	var seedCalls, leaderCalls atomic.Int32
-	leader := startObservationRoutingServer(t, func(conn *wire.Connection, request wire.Frame) error {
-		leaderCalls.Add(1)
-		return writeEmptyStreamPage(conn, request)
-	})
+	for _, envelope := range []bool{false, true} {
+		t.Run(fmt.Sprintf("envelope=%t", envelope), func(t *testing.T) {
+			var seedCalls, leaderCalls atomic.Int32
+			leader := startObservationRoutingServer(t, func(conn *wire.Connection, request wire.Frame) error {
+				leaderCalls.Add(1)
+				return writeEmptyStreamPage(conn, request)
+			})
+			seed := startObservationRoutingServer(t, func(conn *wire.Connection, request wire.Frame) error {
+				seedCalls.Add(1)
+				return observationRoutingError(conn, request, leader, true, envelope)
+			})
+			store, err := NewEventStoreWithTimeout(seed, "state", "producer", time.Second)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, store.Close()) }()
+			stream, err := store.ReadStream("saga-1")
+			require.NoError(t, err)
+			require.Empty(t, stream.Events)
+			require.Equal(t, leader, store.addr)
+			require.Equal(t, int32(1), seedCalls.Load())
+			require.Equal(t, int32(1), leaderCalls.Load())
+		})
+	}
+}
+
+func TestEventStorePreservesUnstructuredStreamError(t *testing.T) {
 	seed := startObservationRoutingServer(t, func(conn *wire.Connection, request wire.Frame) error {
-		seedCalls.Add(1)
-		return observationRoutingError(conn, request, leader, true, false)
+		return writeWireTestResponse(conn, request, `{"status":"ERROR","error":"read stream failed"}`)
 	})
 	store, err := NewEventStoreWithTimeout(seed, "state", "producer", time.Second)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, store.Close()) }()
-	stream, err := store.ReadStream("saga-1")
-	require.NoError(t, err)
-	require.Empty(t, stream.Events)
-	require.Equal(t, leader, store.addr)
-	require.Equal(t, int32(1), seedCalls.Load())
-	require.Equal(t, int32(1), leaderCalls.Load())
+	_, err = store.ReadStream("saga-1")
+	require.ErrorContains(t, err, "read stream failed")
 }
 
 func TestEventStoreReadStreamRetriesClosedConnection(t *testing.T) {
