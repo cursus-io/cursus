@@ -379,6 +379,33 @@ func TestConsumer_ProcessRetryQueue_DuringRebalance(t *testing.T) {
 	c.commitMu.Unlock()
 }
 
+func TestConsumer_ProcessRetryQueue_DropsSupersededOffset(t *testing.T) {
+	c := newTestConsumer(t)
+	c.commitMu.Lock()
+	c.commitRetryMap[0] = retryCommit{offset: 13, assignmentGeneration: 1}
+	c.commitMu.Unlock()
+	c.recordCommittedOffsets(map[int]uint64{0: 35}, 1)
+
+	c.processRetryQueue()
+
+	c.commitMu.Lock()
+	assert.Empty(t, c.commitRetryMap, "committed offset 35 supersedes retry 13")
+	c.commitMu.Unlock()
+}
+
+func TestConsumer_DropSupersededCommitRetries_PreservesEqualAndUnknown(t *testing.T) {
+	c := newTestConsumer(t)
+	c.mu.Lock()
+	c.offsets[0] = 35
+	c.offsets[1] = 35
+	c.mu.Unlock()
+	retries := map[int]uint64{0: 13, 1: 35, 2: 0}
+
+	c.dropSupersededCommitRetries(retries)
+
+	assert.Equal(t, map[int]uint64{1: 35, 2: 0}, retries)
+}
+
 func TestConsumer_Close_AlreadyClosed(t *testing.T) {
 	c := newTestConsumer(t)
 
