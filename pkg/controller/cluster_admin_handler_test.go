@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/hashicorp/raft"
 )
@@ -68,6 +70,53 @@ func TestBuildClusterStatusReportsAvailabilityAndReplication(t *testing.T) {
 	}
 	if status.Partitions[0].Topic != "orders-eu" || status.Partitions[0].Partition != 0 {
 		t.Fatalf("hyphenated topic was not parsed correctly: %+v", status.Partitions[0])
+	}
+}
+
+func TestBuildClusterStatusFailsHealthForLocalReplicaMaterializationGap(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	t.Cleanup(topicManager.Stop)
+	state := fsm.NewBrokerFSM(topicManager, nil)
+
+	broker, err := json.Marshal(fsm.BrokerInfo{
+		ID: "broker-1", Addr: "broker-1:9001", Status: "active", LifecycleProtocol: fsm.BrokerProtocolVersionCurrent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Apply(&raft.Log{Data: append([]byte("REGISTER:"), broker...)})
+	definition := topic.DefaultDefinition("orders", cfg)
+	definition.ReplicationFactor = 1
+	create, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := state.Apply(&raft.Log{Data: append([]byte("TOPIC:"), create...)}); result != nil {
+		t.Fatalf("create topic: %v", result)
+	}
+	metadata := fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 1, LifecycleEpoch: definition.LifecycleEpoch,
+		CommittedHWM: 1, CommittedHWMKnown: true, PartitionCount: 1,
+		Replicas: []string{"broker-1"}, ISR: []string{"broker-1"},
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := state.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + string(encoded))}); result != nil {
+		t.Fatalf("install partition metadata: %v", result)
+	}
+	if err := state.ReconcileReplicaMaterializations("broker-1"); err == nil {
+		t.Fatal("expected local replica materialization gap")
+	}
+
+	status := buildClusterStatus(state, "broker-1:9001", 1)
+	if status.ReplicaMaterializationPending != 1 || status.Healthy {
+		t.Fatalf("local replica gap was hidden by topology health: %+v", status)
 	}
 }
 

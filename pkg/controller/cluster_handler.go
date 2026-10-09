@@ -612,8 +612,14 @@ func (ch *CommandHandler) applyAndWaitContextWithAcceptance(ctx context.Context,
 }
 
 func (ch *CommandHandler) preparePartitionLeaderSnapshot(topicName string, partitionID int, p *topic.Partition, requiredISR int) (func(), func(), clusterController.PartitionReplicationSnapshot, error) {
+	return ch.preparePartitionLeaderSnapshotContext(context.Background(), topicName, partitionID, p, requiredISR)
+}
+
+func (ch *CommandHandler) preparePartitionLeaderSnapshotContext(ctx context.Context, topicName string, partitionID int, p *topic.Partition, requiredISR int) (func(), func(), clusterController.PartitionReplicationSnapshot, error) {
 	writeLock := ch.partitionWriteLock(topicName, partitionID)
-	writeLock.Lock()
+	if err := writeLock.LockContext(ctx); err != nil {
+		return nil, nil, clusterController.PartitionReplicationSnapshot{}, err
+	}
 	release := writeLock.Unlock
 	fail := func(err error) (func(), func(), clusterController.PartitionReplicationSnapshot, error) {
 		release()
@@ -651,7 +657,7 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshot(topicName string, parti
 	key := fmt.Sprintf("%s-%d", topicName, partitionID)
 	wantedFence := partitionLeadershipFence{leader: snapshot.Leader, epoch: snapshot.LeaderEpoch}
 	preparedFence, prepared := ch.partitionPreparedEpochs.Load(key)
-	if !prepared || preparedFence.(partitionLeadershipFence) != wantedFence {
+	if !prepared || preparedFence.(partitionLeadershipFence) != wantedFence || p.ReconciliationError() != nil {
 		if err := p.ReconcileCommittedHWM(metadata.CommittedHWM); err != nil {
 			return fail(fmt.Errorf("partition is not ready for leadership: %w", err))
 		}

@@ -46,7 +46,7 @@ type CommandHandler struct {
 	txnJournal               *transaction.Journal
 	transactionStateSyncHook func(string) error
 	transactionStateLocks    [transactionStateLockStripes]sync.Mutex
-	partitionWriteLocks      sync.Map // map[string]*sync.Mutex
+	partitionWriteLocks      sync.Map // map[string]*contextMutex
 	partitionPreparedEpochs  sync.Map // map[string]partitionLeadershipFence
 	replication              *partitionReplicationCoordinator
 }
@@ -56,10 +56,40 @@ func (ch *CommandHandler) transactionStateLock(transactionalID string) *sync.Mut
 	return &ch.transactionStateLocks[stripe]
 }
 
-func (ch *CommandHandler) partitionWriteLock(topicName string, partitionID int) *sync.Mutex {
+type contextMutex struct {
+	token chan struct{}
+}
+
+func newContextMutex() *contextMutex {
+	lock := &contextMutex{token: make(chan struct{}, 1)}
+	lock.token <- struct{}{}
+	return lock
+}
+
+func (m *contextMutex) Lock() {
+	<-m.token
+}
+
+func (m *contextMutex) LockContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-m.token:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *contextMutex) Unlock() {
+	m.token <- struct{}{}
+}
+
+func (ch *CommandHandler) partitionWriteLock(topicName string, partitionID int) *contextMutex {
 	key := fmt.Sprintf("%s-%d", topicName, partitionID)
-	lock, _ := ch.partitionWriteLocks.LoadOrStore(key, &sync.Mutex{})
-	return lock.(*sync.Mutex)
+	lock, _ := ch.partitionWriteLocks.LoadOrStore(key, newContextMutex())
+	return lock.(*contextMutex)
 }
 
 func transactionalIDExpiration(cfg *config.Config) time.Duration {

@@ -41,27 +41,29 @@ type clusterPartitionStatus struct {
 }
 
 type clusterStatus struct {
-	InternalCredentialGeneration string                   `json:"internal_credential_generation,omitempty"`
-	RaftLeader                   string                   `json:"raft_leader"`
-	RaftState                    string                   `json:"raft_state"`
-	RaftAppliedIndex             uint64                   `json:"raft_applied_index"`
-	RaftCommitIndex              uint64                   `json:"raft_commit_index"`
-	RaftLastLogIndex             uint64                   `json:"raft_last_log_index"`
-	RaftLastSnapshotIndex        uint64                   `json:"raft_last_snapshot_index"`
-	RaftLastSnapshotTerm         uint64                   `json:"raft_last_snapshot_term"`
-	BrokerCount                  int                      `json:"broker_count"`
-	ActiveBrokers                int                      `json:"active_brokers"`
-	InactiveBrokers              int                      `json:"inactive_brokers"`
-	PartitionCount               int                      `json:"partition_count"`
-	Leaderless                   int                      `json:"leaderless_partitions"`
-	UnderReplicated              int                      `json:"under_replicated_partitions"`
-	AssignmentDeficient          int                      `json:"assignment_deficient_partitions"`
-	InactiveReplicaPartitions    int                      `json:"inactive_replica_partitions"`
-	InactiveReplicas             int                      `json:"inactive_replicas"`
-	MinISRUnsatisfied            int                      `json:"min_isr_unsatisfied_partitions"`
-	Healthy                      bool                     `json:"healthy"`
-	Brokers                      []clusterBrokerStatus    `json:"brokers"`
-	Partitions                   []clusterPartitionStatus `json:"partitions"`
+	InternalCredentialGeneration  string                   `json:"internal_credential_generation,omitempty"`
+	RaftLeader                    string                   `json:"raft_leader"`
+	RaftState                     string                   `json:"raft_state"`
+	RaftAppliedIndex              uint64                   `json:"raft_applied_index"`
+	RaftCommitIndex               uint64                   `json:"raft_commit_index"`
+	RaftLastLogIndex              uint64                   `json:"raft_last_log_index"`
+	RaftLastSnapshotIndex         uint64                   `json:"raft_last_snapshot_index"`
+	RaftLastSnapshotTerm          uint64                   `json:"raft_last_snapshot_term"`
+	BrokerCount                   int                      `json:"broker_count"`
+	ActiveBrokers                 int                      `json:"active_brokers"`
+	InactiveBrokers               int                      `json:"inactive_brokers"`
+	PartitionCount                int                      `json:"partition_count"`
+	Leaderless                    int                      `json:"leaderless_partitions"`
+	UnderReplicated               int                      `json:"under_replicated_partitions"`
+	AssignmentDeficient           int                      `json:"assignment_deficient_partitions"`
+	InactiveReplicaPartitions     int                      `json:"inactive_replica_partitions"`
+	InactiveReplicas              int                      `json:"inactive_replicas"`
+	MinISRUnsatisfied             int                      `json:"min_isr_unsatisfied_partitions"`
+	TopicMaterializationPending   int                      `json:"topic_materialization_pending"`
+	ReplicaMaterializationPending int                      `json:"replica_materialization_pending"`
+	Healthy                       bool                     `json:"healthy"`
+	Brokers                       []clusterBrokerStatus    `json:"brokers"`
+	Partitions                    []clusterPartitionStatus `json:"partitions"`
 }
 
 // handleListCluster processes the read-only LIST_CLUSTER command.
@@ -95,6 +97,7 @@ func (ch *CommandHandler) handleClusterStatus() string {
 	if ch.Config != nil {
 		defaultMinISR = ch.Config.MinInSyncReplicas
 	}
+	_ = state.ReconcileReplicaMaterializations(ch.Cluster.BrokerID())
 	status := buildClusterStatus(state, ch.Cluster.RaftManager.GetLeaderAddress(), defaultMinISR)
 	if ch.Config != nil {
 		status.InternalCredentialGeneration = ch.Config.InternalAuthGeneration
@@ -146,7 +149,9 @@ func buildClusterStatus(state *fsm.BrokerFSM, raftLeader string, defaultMinISR i
 	status.InactiveReplicaPartitions = topology.InactiveReplicaPartitions
 	status.InactiveReplicas = topology.InactiveReplicas
 	status.MinISRUnsatisfied = topology.MinISRUnsatisfied
-	status.Healthy = topology.Healthy
+	status.TopicMaterializationPending = len(state.TopicMaterializationIssues())
+	status.ReplicaMaterializationPending = len(state.ReplicaMaterializationIssues())
+	status.Healthy = topology.Healthy && status.TopicMaterializationPending == 0 && status.ReplicaMaterializationPending == 0
 	for _, partition := range topology.Partitions {
 		status.Partitions = append(status.Partitions, clusterPartitionStatus{
 			Key: partition.Key, Topic: partition.Topic, Partition: partition.Partition,

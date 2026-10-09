@@ -291,15 +291,18 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		if ackSelection.Mode == ackpolicy.All {
 			requiredISR = effectiveMinISR
 		}
-		releaseWrite, releaseMutation, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(topicName, partition, p, requiredISR)
+		releaseWrite, releaseMutation, replicationSnapshot, err := ch.preparePartitionLeaderSnapshotContext(requestCtx, topicName, partition, p, requiredISR)
 		if err != nil {
+			if requestCtx.Err() != nil {
+				return requestTimeoutOutcome(requestCtx, "not_accepted")
+			}
 			return ch.partitionPreparationErrorResponse(err)
 		}
-		defer releaseWrite()
-		mutationSubmitted := false
+		ownershipSubmitted := false
 		defer func() {
-			if !mutationSubmitted {
+			if !ownershipSubmitted {
 				releaseMutation()
+				releaseWrite()
 			}
 		}()
 		if ch.replication == nil {
@@ -359,10 +362,11 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 					snapshot:        replicationSnapshot,
 					partitionRef:    p,
 					releaseMutation: releaseMutation,
+					releaseWrite:    releaseWrite,
 					result:          result,
 				})
 				submitted = true
-				mutationSubmitted = true
+				ownershipSubmitted = true
 				select {
 				case replicationErr := <-result:
 					if replicationErr != nil {
@@ -404,10 +408,11 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 			snapshot:        replicationSnapshot,
 			partitionRef:    p,
 			releaseMutation: releaseMutation,
+			releaseWrite:    releaseWrite,
 			result:          replicationResult,
 		})
 		submitted = true
-		mutationSubmitted = true
+		ownershipSubmitted = true
 		if replicationResult != nil {
 			select {
 			case replicationErr := <-replicationResult:
@@ -716,15 +721,18 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		if ackSelection.Mode == ackpolicy.All {
 			requiredISR = effectiveMinISR
 		}
-		releaseWrite, releaseMutation, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(batch.Topic, batch.Partition, p, requiredISR)
+		releaseWrite, releaseMutation, replicationSnapshot, err := ch.preparePartitionLeaderSnapshotContext(requestCtx, batch.Topic, batch.Partition, p, requiredISR)
 		if err != nil {
+			if requestCtx.Err() != nil {
+				return requestTimeoutOutcome(requestCtx, "not_accepted"), nil
+			}
 			return ch.partitionPreparationErrorResponse(err), nil
 		}
-		defer releaseWrite()
-		mutationSubmitted := false
+		ownershipSubmitted := false
 		defer func() {
-			if !mutationSubmitted {
+			if !ownershipSubmitted {
 				releaseMutation()
+				releaseWrite()
 			}
 		}()
 		if ch.replication == nil {
@@ -782,10 +790,11 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 					snapshot:        replicationSnapshot,
 					partitionRef:    p,
 					releaseMutation: releaseMutation,
+					releaseWrite:    releaseWrite,
 					result:          result,
 				})
 				submitted = true
-				mutationSubmitted = true
+				ownershipSubmitted = true
 				select {
 				case replicationErr := <-result:
 					if replicationErr != nil {
@@ -836,10 +845,11 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 			snapshot:        replicationSnapshot,
 			partitionRef:    p,
 			releaseMutation: releaseMutation,
+			releaseWrite:    releaseWrite,
 			result:          replicationResult,
 		})
 		submitted = true
-		mutationSubmitted = true
+		ownershipSubmitted = true
 		if replicationResult != nil {
 			select {
 			case replicationErr := <-replicationResult:

@@ -30,6 +30,7 @@ type partitionReplicationTask struct {
 	snapshot        clusterController.PartitionReplicationSnapshot
 	partitionRef    *topic.Partition
 	releaseMutation func()
+	releaseWrite    func()
 	result          chan error
 }
 
@@ -47,7 +48,12 @@ func (e *retryableReplicationStateError) ReplicationErrorClass() string { return
 type partitionReplicationExecutor interface {
 	Snapshot(topic string, partition int) (clusterController.PartitionReplicationSnapshot, error)
 	ReplicateISR(ctx context.Context, task partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) error
-	Commit(task partitionReplicationTask) error
+	Commit(task partitionReplicationTask) (partitionCommitResult, error)
+}
+
+type partitionCommitResult struct {
+	accepted bool
+	hwm      uint64
 }
 
 type clusterPartitionReplicationExecutor struct {
@@ -65,7 +71,8 @@ func (e clusterPartitionReplicationExecutor) ReplicateISR(ctx context.Context, t
 	return e.handler.Cluster.ReplicateToISR(task.topic, task.partition, task.command, snapshot)
 }
 
-func (e clusterPartitionReplicationExecutor) Commit(task partitionReplicationTask) error {
+func (e clusterPartitionReplicationExecutor) Commit(task partitionReplicationTask) (partitionCommitResult, error) {
+	result := partitionCommitResult{hwm: task.commitHWM}
 	if err := e.handler.commitPartitionHWMAtEpoch(
 		task.topic,
 		task.partition,
@@ -74,13 +81,31 @@ func (e clusterPartitionReplicationExecutor) Commit(task partitionReplicationTas
 		task.snapshot.LeaderEpoch,
 		task.snapshot.LifecycleEpoch,
 	); err != nil {
-		return err
+		metadata := e.handler.Cluster.RaftManager.GetFSM().GetPartitionMetadata(fmt.Sprintf("%s-%d", task.topic, task.partition))
+		result.accepted = metadata != nil && metadata.Leader == task.snapshot.Leader &&
+			metadata.LeaderEpoch == task.snapshot.LeaderEpoch && metadata.LifecycleEpoch == task.snapshot.LifecycleEpoch &&
+			metadata.CommittedHWMKnown && metadata.CommittedHWM >= task.commitHWM
+		return result, err
+	}
+	result.accepted = true
+	deadline := time.Now().Add(DefaultFSMApplyTimeout)
+	key := fmt.Sprintf("%s-%d", task.topic, task.partition)
+	for {
+		metadata := e.handler.Cluster.RaftManager.GetFSM().GetPartitionMetadata(key)
+		if metadata != nil && metadata.Leader == task.snapshot.Leader && metadata.LeaderEpoch == task.snapshot.LeaderEpoch &&
+			metadata.LifecycleEpoch == task.snapshot.LifecycleEpoch && metadata.CommittedHWMKnown && metadata.CommittedHWM >= task.commitHWM {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			return result, fmt.Errorf("local Raft state did not apply committed HWM %d before replication ownership release", task.commitHWM)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if err := task.partitionRef.ApplyReplicaHWM(task.commitHWM); err != nil {
-		return fmt.Errorf("apply local commit watermark: %w", err)
+		return result, fmt.Errorf("apply local commit watermark: %w", err)
 	}
 	task.partitionRef.FlushDisk()
-	return nil
+	return result, nil
 }
 
 type partitionReplicationCoordinator struct {
@@ -261,8 +286,9 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 				}
 			}
 		}
+		commitResult := partitionCommitResult{}
 		if err == nil {
-			err = l.owner.executor.Commit(task)
+			commitResult, err = l.owner.executor.Commit(task)
 		}
 		if err == nil {
 			current, snapshotErr := l.owner.executor.Snapshot(task.topic, task.partition)
@@ -277,6 +303,10 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			if failures > 0 {
 				util.Info("partition replication recovered topic=%s partition=%d ack_mode=%s attempts=%d", task.topic, task.partition, task.ackMode, failures+1)
 			}
+			return
+		}
+		if commitResult.accepted {
+			completeReplicationTaskAtHWM(task, err, commitResult.hwm)
 			return
 		}
 		if l.owner.ctx.Err() != nil {
@@ -356,8 +386,31 @@ func sameBrokerSet(left, right []string) bool {
 }
 
 func completeReplicationTask(task partitionReplicationTask, err error) {
+	completeReplicationTaskWithHWM(task, err, 0, false)
+}
+
+func completeReplicationTaskAtHWM(task partitionReplicationTask, err error, authoritativeHWM uint64) {
+	completeReplicationTaskWithHWM(task, err, authoritativeHWM, true)
+}
+
+func completeReplicationTaskWithHWM(task partitionReplicationTask, err error, authoritativeHWM uint64, hasAuthoritativeHWM bool) {
 	if task.releaseMutation != nil {
 		task.releaseMutation()
+	}
+	if (err != nil || hasAuthoritativeHWM) && task.partitionRef != nil {
+		committedHWM := task.partitionRef.GetHWM()
+		if hasAuthoritativeHWM {
+			committedHWM = authoritativeHWM
+		}
+		if reconcileErr := task.partitionRef.ReconcileCommittedHWM(committedHWM); reconcileErr != nil {
+			task.partitionRef.MarkReconciliationPending(reconcileErr)
+			err = errors.Join(err, fmt.Errorf("reconcile failed replication to committed HWM %d: %w", committedHWM, reconcileErr))
+		} else {
+			task.partitionRef.FlushDisk()
+		}
+	}
+	if task.releaseWrite != nil {
+		task.releaseWrite()
 	}
 	if task.result == nil {
 		return

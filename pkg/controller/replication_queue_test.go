@@ -31,6 +31,8 @@ type barrierReplicationExecutor struct {
 	replicateFailures  int
 	committedHWM       uint64
 	commitHook         func()
+	commitErr          error
+	skipLocalCommit    bool
 	replicateCalls     int
 	replicateSnapshots []clusterController.PartitionReplicationSnapshot
 	nonISRCalls        int
@@ -90,20 +92,22 @@ func (e *barrierReplicationExecutor) ReplicateNonISR(partitionReplicationTask, c
 	return nil
 }
 
-func (e *barrierReplicationExecutor) Commit(task partitionReplicationTask) error {
+func (e *barrierReplicationExecutor) Commit(task partitionReplicationTask) (partitionCommitResult, error) {
 	e.mu.Lock()
 	e.committedHWM = task.commitHWM
 	hook := e.commitHook
+	commitErr := e.commitErr
+	skipLocalCommit := e.skipLocalCommit
 	e.mu.Unlock()
-	if task.partitionRef != nil {
+	if task.partitionRef != nil && !skipLocalCommit {
 		if err := task.partitionRef.ApplyReplicaHWM(task.commitHWM); err != nil {
-			return err
+			return partitionCommitResult{accepted: true, hwm: task.commitHWM}, err
 		}
 	}
 	if hook != nil {
 		hook()
 	}
-	return nil
+	return partitionCommitResult{accepted: true, hwm: task.commitHWM}, commitErr
 }
 
 func (e *barrierReplicationExecutor) committed() uint64 {
@@ -650,6 +654,113 @@ func TestDistributedPublishRejectsMarkerlessHWMMetadata(t *testing.T) {
 	close(executor.barrier)
 }
 
+func TestDistributedPublishReleasesPartitionOwnershipWhenReplicationCoordinatorIsUnavailable(t *testing.T) {
+	handler, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	handler.replication.close()
+	handler.replication = nil
+
+	response := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=value", NewClientContext("", 0))
+	require.Equal(t, "ERROR: cluster_metadata_unavailable command=PUBLISH", response)
+	requirePartitionOwnershipAvailable(t, handler, partition)
+
+	data, err := util.EncodeBatchMessages("orders", 0, "1", false, []types.Message{{Payload: "value", ProducerID: "p1"}})
+	require.NoError(t, err)
+	response, err = handler.HandleBatchMessage(data, nil, NewClientContext("", 0))
+	require.NoError(t, err)
+	require.Equal(t, "ERROR: cluster_metadata_unavailable command=BATCH", response)
+	requirePartitionOwnershipAvailable(t, handler, partition)
+	require.Zero(t, partition.NextOffset())
+}
+
+func TestCompleteReplicationTaskReportsReconcileFailureAndDropsBlockedResult(t *testing.T) {
+	_, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReconcileSnapshotHWM(0))
+
+	mutationReleased := false
+	writeReleased := false
+	result := make(chan error, 1)
+	completeReplicationTask(partitionReplicationTask{
+		partitionRef:    partition,
+		releaseMutation: func() { mutationReleased = true },
+		releaseWrite:    func() { writeReleased = true },
+		result:          result,
+	}, errors.New("replication failed"))
+	require.ErrorContains(t, <-result, "reconcile failed replication to committed HWM 0")
+	require.True(t, mutationReleased)
+	require.True(t, writeReleased)
+	require.ErrorContains(t, partition.ReconciliationError(), "snapshot replay is still pending")
+	require.ErrorContains(t, partition.EnqueueBatchLeader([]types.Message{{Payload: "blocked"}}), "partition recovery incomplete")
+
+	blockedResult := make(chan error, 1)
+	blockedResult <- errors.New("existing result")
+	completeReplicationTask(partitionReplicationTask{result: blockedResult}, errors.New("discarded result"))
+	require.ErrorContains(t, <-blockedResult, "existing result")
+}
+
+func TestCompleteReplicationTaskReleasesMutationBeforeAuthoritativeReconcile(t *testing.T) {
+	_, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 0, Payload: "committed"}}))
+	require.Zero(t, partition.GetHWM())
+
+	result := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		completeReplicationTaskAtHWM(partitionReplicationTask{
+			partitionRef: partition, releaseMutation: partition.BeginReplicationMutation(), result: result,
+		}, errors.New("post-commit response failed"), 1)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("completion reconciled while still holding the replication mutation lock")
+	}
+	require.ErrorContains(t, <-result, "post-commit response failed")
+	require.Equal(t, uint64(1), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM())
+	messages, err := partition.ReadCommitted(0, 1)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+}
+
+func TestPostCommitErrorUsesAuthoritativeTaskHWM(t *testing.T) {
+	_, manager, executor := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 0, Payload: "committed"}}))
+	require.Zero(t, partition.GetHWM())
+
+	executor.commitErr = errors.New("local commit observation timed out")
+	executor.skipLocalCommit = true
+	close(executor.barrier)
+	coordinator := newPartitionReplicationCoordinator(1, executor)
+	t.Cleanup(coordinator.close)
+	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	task := replicationTaskForMode(executor, ackpolicy.All)
+	task.partitionRef = partition
+	task.releaseMutation = partition.BeginReplicationMutation()
+	reservation.submit(task)
+
+	require.ErrorContains(t, <-task.result, "local commit observation timed out")
+	require.Equal(t, uint64(1), partition.NextOffset(), "post-commit cleanup truncated a committed record")
+	require.Equal(t, uint64(1), partition.GetHWM())
+	executor.mu.Lock()
+	require.Equal(t, 1, executor.replicateCalls, "an accepted commit was retried")
+	executor.mu.Unlock()
+}
+
 func TestDistributedIdempotentDuplicateAllUsesFenceBarrierOnly(t *testing.T) {
 	handler, manager, executor := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
@@ -901,7 +1012,7 @@ func TestApplyReplicaCatchupTruncatesDivergentTail(t *testing.T) {
 	require.Equal(t, uint64(1), partition.GetHWM())
 }
 
-func TestDistributedLeaderAcknowledgementsPreserveOrderedUncommittedTail(t *testing.T) {
+func TestDistributedLeaderAcknowledgementHoldsWriteOwnershipUntilReplicationCompletes(t *testing.T) {
 	handler, manager, executor := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
 	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
@@ -911,13 +1022,93 @@ func TestDistributedLeaderAcknowledgementsPreserveOrderedUncommittedTail(t *test
 	first := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=one", NewClientContext("", 0))
 	require.Contains(t, first, `"last_offset":0`)
 	<-executor.started
-	second := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=two", NewClientContext("", 0))
-	require.Contains(t, second, `"last_offset":1`)
-	require.Equal(t, uint64(2), partition.NextOffset(), "next publish truncated the prior uncommitted tail")
+	second := make(chan string, 1)
+	go func() {
+		second <- handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=two", NewClientContext("", 0))
+	}()
+	select {
+	case response := <-second:
+		t.Fatalf("next append crossed unresolved replication ownership: %s", response)
+	case <-time.After(100 * time.Millisecond):
+	}
+	require.Equal(t, uint64(1), partition.NextOffset(), "next publish appended behind an unresolved tail")
 	require.Zero(t, partition.GetHWM())
 
 	close(executor.barrier)
+	require.Contains(t, <-second, `"last_offset":1`)
 	require.Eventually(t, func() bool { return executor.committed() == 2 }, time.Second, time.Millisecond)
+}
+
+func TestDistributedPublishOwnershipWaitHonorsRequestDeadline(t *testing.T) {
+	tests := []struct {
+		name    string
+		publish func(*CommandHandler, *ClientContext) string
+	}{
+		{
+			name: "command",
+			publish: func(handler *CommandHandler, clientCtx *ClientContext) string {
+				return handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=value", clientCtx)
+			},
+		},
+		{
+			name: "batch",
+			publish: func(handler *CommandHandler, clientCtx *ClientContext) string {
+				data, err := util.EncodeBatchMessages("orders", 0, "1", false, []types.Message{{Payload: "value", ProducerID: "p1"}})
+				require.NoError(t, err)
+				response, err := handler.HandleBatchMessage(data, nil, clientCtx)
+				require.NoError(t, err)
+				return response
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler, manager, executor := newDistributedAckTestHandler(t, 2)
+			require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+			installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
+
+			first := test.publish(handler, NewClientContext("", 0))
+			require.Contains(t, first, `"last_offset":0`)
+			<-executor.started
+
+			requestCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			clientCtx := NewClientContext("", 0)
+			clientCtx.SetRequestContext(requestCtx)
+			started := time.Now()
+			second := test.publish(handler, clientCtx)
+			require.Equal(t, "ERROR: request_timeout outcome=not_accepted", second)
+			require.Less(t, time.Since(started), time.Second)
+			partition, err := manager.GetTopic("orders").GetPartition(0)
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), partition.NextOffset(), "timed-out ownership waiter appended a record")
+
+			close(executor.barrier)
+			require.Eventually(t, func() bool { return executor.committed() == 1 }, time.Second, time.Millisecond)
+		})
+	}
+}
+
+func TestDistributedPermanentReplicationFailureRollsBackUncommittedTail(t *testing.T) {
+	handler, manager, executor := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	executor.replicateErr = permanentReplicationError{}
+	executor.replicateFailures = 1
+	close(executor.barrier)
+
+	failed := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=all producerId=p1 message=failed", NewClientContext("", 0))
+	require.Contains(t, failed, "invalid replica append")
+	require.Zero(t, partition.NextOffset(), "terminal replication failure left an uncommitted offset reservation")
+	require.Zero(t, partition.GetHWM())
+
+	retried := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=all producerId=p1 message=retried", NewClientContext("", 0))
+	require.Contains(t, retried, `"last_offset":0`)
+	require.Equal(t, uint64(1), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM())
 }
 
 func TestDistributedAllAcknowledgementBlocksUntilFollower(t *testing.T) {
@@ -1025,9 +1216,22 @@ func TestDistributedAllRequestDeadlineReturnsUnknownAndKeepsReplication(t *testi
 		t.Fatal("request did not return after its deadline")
 	}
 	require.Zero(t, executor.committed(), "timed out replication committed before its worker was released")
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	second := make(chan string, 1)
+	go func() {
+		second <- handler.HandleCommand("PUBLISH topic=orders partition=0 acks=all producerId=p1 message=next", NewClientContext("", 0))
+	}()
+	select {
+	case got := <-second:
+		t.Fatalf("next append crossed timed-out replication ownership: %s", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	require.Equal(t, uint64(1), partition.NextOffset())
 
 	close(executor.barrier)
-	require.Eventually(t, func() bool { return executor.committed() == 1 }, time.Second, time.Millisecond,
+	require.Contains(t, <-second, `"last_offset":1`)
+	require.Eventually(t, func() bool { return executor.committed() == 2 }, time.Second, time.Millisecond,
 		"request timeout canceled replication owned by the broker")
 }
 
@@ -1114,6 +1318,25 @@ func installPartitionMetadata(t *testing.T, handler *CommandHandler, topicName s
 	metadata := fmt.Sprintf(`{"leader":"broker-1","leader_epoch":7,"lifecycle_epoch":1,"committed_hwm_version":1,"committed_hwm":0,"replicas":["broker-1","broker-2"],"isr":["%s"],"partition_count":1}`, strings.Join(isr, `","`))
 	result := handler.Cluster.RaftManager.GetFSM().Apply(&raft.Log{Data: []byte("PARTITION:" + topicName + "-0:" + metadata)})
 	require.Nil(t, result)
+}
+
+func requirePartitionOwnershipAvailable(t *testing.T, handler *CommandHandler, partition *topic.Partition) {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() {
+		releaseWrite, releaseMutation, _, err := handler.preparePartitionLeaderSnapshot("orders", 0, partition, 0)
+		if err == nil {
+			releaseMutation()
+			releaseWrite()
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("partition ownership was not released")
+	}
 }
 
 func applyPartitionMetadata(t *testing.T, state *fsm.BrokerFSM, topicName string, partition int, metadata fsm.PartitionMetadata) {

@@ -72,6 +72,7 @@ type Partition struct {
 	reconcileMu                sync.RWMutex
 	recoveryMu                 sync.RWMutex
 	recoveryErr                error
+	reconciliationErr          error
 	snapshotRecovery           bool
 	recoveryCheckpointHWM      uint64
 	recoverySnapshotHWM        uint64
@@ -225,7 +226,30 @@ func (p *Partition) setRecoveryError(err error) {
 func (p *Partition) RecoveryError() error {
 	p.recoveryMu.RLock()
 	defer p.recoveryMu.RUnlock()
-	return p.recoveryErr
+	return errors.Join(p.recoveryErr, p.reconciliationErr)
+}
+
+// MarkReconciliationPending fences leader appends after a failed tail repair.
+func (p *Partition) MarkReconciliationPending(err error) {
+	if err == nil {
+		return
+	}
+	p.recoveryMu.Lock()
+	p.reconciliationErr = fmt.Errorf("committed HWM reconciliation pending: %w", err)
+	p.recoveryMu.Unlock()
+}
+
+// ReconciliationError reports whether leader appends are waiting for tail repair.
+func (p *Partition) ReconciliationError() error {
+	p.recoveryMu.RLock()
+	defer p.recoveryMu.RUnlock()
+	return p.reconciliationErr
+}
+
+func (p *Partition) clearReconciliationError() {
+	p.recoveryMu.Lock()
+	p.reconciliationErr = nil
+	p.recoveryMu.Unlock()
 }
 
 func (p *Partition) hwmReadinessError() error {
@@ -1597,11 +1621,13 @@ func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
 	p.reconcileMu.Lock()
 	defer p.reconcileMu.Unlock()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.snapshotRecovery {
-		return fmt.Errorf("snapshot replay is still pending: visible_hwm=%d durable_hwm=%d requested_hwm=%d", p.HWM, p.recoveryCheckpointHWM, hwm)
+		err := fmt.Errorf("snapshot replay is still pending: visible_hwm=%d durable_hwm=%d requested_hwm=%d", p.HWM, p.recoveryCheckpointHWM, hwm)
+		p.mu.Unlock()
+		return err
 	}
 	if err := p.reconcileCommittedHWMLocked(hwm); err != nil {
+		p.mu.Unlock()
 		return err
 	}
 	wasAuthoritative := p.hwmAuthoritative
@@ -1610,6 +1636,8 @@ func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
 		p.signalHWMCheckpointLocked()
 		p.NotifyNewMessage()
 	}
+	p.mu.Unlock()
+	p.clearReconciliationError()
 	return nil
 }
 
