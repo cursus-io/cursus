@@ -25,7 +25,8 @@ const (
 	OffsetReservationsProtocolVersion    = 3
 	ReplicaReassignmentProtocolVersion   = 4
 	LeaderEpochRecoveryProtocolVersion   = 5
-	BrokerProtocolVersionCurrent         = LeaderEpochRecoveryProtocolVersion
+	ReplicaGapRecoveryProtocolVersion    = 6
+	BrokerProtocolVersionCurrent         = ReplicaGapRecoveryProtocolVersion
 )
 
 type ReplicationEntry struct {
@@ -289,6 +290,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyReplicaReassignmentCommand(strings.TrimPrefix(data, "REPLICA_REASSIGN:"))
 	case strings.HasPrefix(data, "ISR_CATCHUP:"):
 		res = f.applyISRCatchupCommand(strings.TrimPrefix(data, "ISR_CATCHUP:"))
+	case strings.HasPrefix(data, "ISR_QUARANTINE:"):
+		res = f.applyISRQuarantineCommand(strings.TrimPrefix(data, "ISR_QUARANTINE:"))
 	case strings.HasPrefix(data, "LEADER_ELECTION:"):
 		res = f.applyLeaderElectionCommand(strings.TrimPrefix(data, "LEADER_ELECTION:"))
 	case strings.HasPrefix(data, "GROUP_SYNC:"):
@@ -708,6 +711,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 			metaCopy.ISR = make([]string, len(v.ISR))
 			copy(metaCopy.ISR, v.ISR)
 		}
+		metaCopy.RecoveryReplicas = append([]string(nil), v.RecoveryReplicas...)
 		metadataCopy[k] = &metaCopy
 	}
 	producerStateCopy := make(map[string]map[int]map[string]ProducerSequence, len(f.producerState))
@@ -784,6 +788,7 @@ func (f *BrokerFSM) GetPartitionMetadata(key string) *PartitionMetadata {
 				copy.ISR[i] = r
 			}
 		}
+		copy.RecoveryReplicas = append([]string(nil), meta.RecoveryReplicas...)
 		return &copy
 	}
 	return nil

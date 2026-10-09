@@ -81,6 +81,7 @@ func copyPartitionMetadataState(metadata map[string]*PartitionMetadata) map[stri
 		copy := *current
 		copy.Replicas = append([]string(nil), current.Replicas...)
 		copy.ISR = append([]string(nil), current.ISR...)
+		copy.RecoveryReplicas = append([]string(nil), current.RecoveryReplicas...)
 		cloned[key] = &copy
 	}
 	return cloned
@@ -166,6 +167,14 @@ func validateTopicState(
 				"partition metadata %q lifecycle epoch %d conflicts with topic %q epoch %d",
 				key, partitionMetadata.LifecycleEpoch, name, definition.LifecycleEpoch,
 			)
+		}
+		for _, brokerID := range partitionMetadata.RecoveryReplicas {
+			if !containsString(partitionMetadata.Replicas, brokerID) {
+				return nil, fmt.Errorf("partition metadata %q recovery broker %q is not a configured replica", key, brokerID)
+			}
+			if containsString(partitionMetadata.ISR, brokerID) {
+				return nil, fmt.Errorf("partition metadata %q recovery broker %q is still in ISR", key, brokerID)
+			}
 		}
 		if partition >= definition.Partitions {
 			return nil, fmt.Errorf(

@@ -26,6 +26,7 @@ type clusterPartitionStatus struct {
 	LeaderEpoch        int      `json:"leader_epoch"`
 	Replicas           []string `json:"replicas"`
 	ISR                []string `json:"isr"`
+	RecoveryReplicas   []string `json:"recovery_replicas,omitempty"`
 	CommittedHWM       uint64   `json:"committed_hwm"`
 	ExpectedReplicas   int      `json:"expected_replicas"`
 	ActiveReplicas     int      `json:"active_replicas"`
@@ -36,6 +37,7 @@ type clusterPartitionStatus struct {
 	AssignmentComplete bool     `json:"assignment_complete"`
 	UnderReplicated    bool     `json:"under_replicated"`
 	MinISRUnsatisfied  bool     `json:"min_isr_unsatisfied"`
+	RecoveryPending    bool     `json:"recovery_pending"`
 	Healthy            bool     `json:"healthy"`
 	Reasons            []string `json:"reasons,omitempty"`
 }
@@ -59,6 +61,7 @@ type clusterStatus struct {
 	InactiveReplicaPartitions     int                      `json:"inactive_replica_partitions"`
 	InactiveReplicas              int                      `json:"inactive_replicas"`
 	MinISRUnsatisfied             int                      `json:"min_isr_unsatisfied_partitions"`
+	RecoveryPending               int                      `json:"recovery_pending_partitions"`
 	TopicMaterializationPending   int                      `json:"topic_materialization_pending"`
 	ReplicaMaterializationPending int                      `json:"replica_materialization_pending"`
 	Healthy                       bool                     `json:"healthy"`
@@ -149,6 +152,7 @@ func buildClusterStatus(state *fsm.BrokerFSM, raftLeader string, defaultMinISR i
 	status.InactiveReplicaPartitions = topology.InactiveReplicaPartitions
 	status.InactiveReplicas = topology.InactiveReplicas
 	status.MinISRUnsatisfied = topology.MinISRUnsatisfied
+	status.RecoveryPending = topology.RecoveryPending
 	status.TopicMaterializationPending = len(state.TopicMaterializationIssues())
 	status.ReplicaMaterializationPending = len(state.ReplicaMaterializationIssues())
 	status.Healthy = topology.Healthy && status.TopicMaterializationPending == 0 && status.ReplicaMaterializationPending == 0
@@ -157,13 +161,15 @@ func buildClusterStatus(state *fsm.BrokerFSM, raftLeader string, defaultMinISR i
 			Key: partition.Key, Topic: partition.Topic, Partition: partition.Partition,
 			Leader: partition.Leader, LeaderEpoch: partition.LeaderEpoch,
 			Replicas: append([]string(nil), partition.Replicas...), ISR: append([]string(nil), partition.ISR...),
+			RecoveryReplicas: append([]string(nil), partition.RecoveryReplicas...),
 			CommittedHWM:     partition.CommittedHWM,
 			ExpectedReplicas: partition.ExpectedReplicas, ActiveReplicas: partition.ActiveReplicas,
 			InactiveReplicas: partition.InactiveReplicas,
 			InSyncReplicas:   partition.InSyncReplicas, MinInSyncReplicas: partition.MinInSyncReplicas,
 			LeaderAvailable: partition.LeaderAvailable, AssignmentComplete: partition.AssignmentComplete,
 			UnderReplicated: partition.UnderReplicated, MinISRUnsatisfied: partition.MinISRUnsatisfied,
-			Healthy: partition.Healthy, Reasons: append([]string(nil), partition.Reasons...),
+			RecoveryPending: partition.RecoveryPending,
+			Healthy:         partition.Healthy, Reasons: append([]string(nil), partition.Reasons...),
 		})
 	}
 	return status

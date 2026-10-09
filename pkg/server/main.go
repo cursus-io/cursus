@@ -331,6 +331,22 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			_, leaderErr := cc.GetClusterLeader()
 			return leaderErr
 		})
+		healthState.AddCheck("cluster_registration", func(context.Context) error {
+			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
+				return fmt.Errorf("cluster registration state unavailable")
+			}
+			broker := cc.RaftManager.GetFSM().GetBroker(cc.BrokerID())
+			if broker == nil || !strings.EqualFold(broker.Status, "active") {
+				return fmt.Errorf("local broker registration is not active")
+			}
+			return nil
+		})
+		healthState.AddCheck("cluster_topology", func(context.Context) error {
+			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
+				return fmt.Errorf("cluster topology state unavailable")
+			}
+			return cc.RaftManager.GetFSM().EvaluateTopology(cfg.MinInSyncReplicas).ReadinessError()
+		})
 		healthState.AddCheck("topic_materialization", func(context.Context) error {
 			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
 				return fmt.Errorf("topic materialization state unavailable")

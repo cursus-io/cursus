@@ -89,11 +89,13 @@ func (cc *ClusterController) SetReplicaSnapshotCatchup(callback func(context.Con
 // PartitionReplicationSnapshot is an immutable view of the replication fence
 // and replica sets used by one partition append.
 type PartitionReplicationSnapshot struct {
-	Leader         string
-	LeaderEpoch    int
-	LifecycleEpoch uint64
-	ISR            []string
-	Replicas       []string
+	Leader           string
+	LeaderEpoch      int
+	LifecycleEpoch   uint64
+	CommittedHWM     uint64
+	ISR              []string
+	Replicas         []string
+	RecoveryReplicas []string
 }
 
 func NewClusterController(ctx context.Context, cfg *config.Config, rm RaftManager, sd ServiceDiscovery, brokerID, localAddr string) *ClusterController {
@@ -307,11 +309,13 @@ func (cc *ClusterController) GetPartitionReplicationSnapshot(topic string, parti
 		lifecycleEpoch = topicpkg.InitialLifecycleEpoch
 	}
 	return PartitionReplicationSnapshot{
-		Leader:         meta.Leader,
-		LeaderEpoch:    meta.LeaderEpoch,
-		LifecycleEpoch: lifecycleEpoch,
-		ISR:            append([]string(nil), meta.ISR...),
-		Replicas:       append([]string(nil), meta.Replicas...),
+		Leader:           meta.Leader,
+		LeaderEpoch:      meta.LeaderEpoch,
+		LifecycleEpoch:   lifecycleEpoch,
+		CommittedHWM:     meta.CommittedHWM,
+		ISR:              append([]string(nil), meta.ISR...),
+		Replicas:         append([]string(nil), meta.Replicas...),
+		RecoveryReplicas: append([]string(nil), meta.RecoveryReplicas...),
 	}, nil
 }
 
@@ -319,12 +323,20 @@ func (cc *ClusterController) GetPartitionReplicationSnapshot(topic string, parti
 // deliberately sequential: the partition replication lane already provides
 // concurrency, so a publish never creates an unbounded set of goroutines.
 func (cc *ClusterController) ReplicateToISR(topic string, partition int, msgCmd types.MessageCommand, snapshot PartitionReplicationSnapshot) error {
+	if msgCmd.CommitHWM == nil {
+		committedHWM := snapshot.CommittedHWM
+		msgCmd.CommitHWM = &committedHWM
+	}
 	return cc.replicateToReplicaSet(topic, partition, msgCmd, snapshot, snapshot.ISR, true)
 }
 
 // ReplicateToNonISR makes one best-effort catch-up pass after the committed HWM
 // is visible. Failures here never change the producer acknowledgement.
 func (cc *ClusterController) ReplicateToNonISR(topic string, partition int, msgCmd types.MessageCommand, snapshot PartitionReplicationSnapshot) error {
+	if msgCmd.CommitHWM == nil {
+		committedHWM := snapshot.CommittedHWM
+		msgCmd.CommitHWM = &committedHWM
+	}
 	isr := make(map[string]struct{}, len(snapshot.ISR))
 	for _, brokerID := range snapshot.ISR {
 		isr[brokerID] = struct{}{}
@@ -339,6 +351,7 @@ func (cc *ClusterController) ReplicateToNonISR(topic string, partition int, msgC
 }
 
 type replicaResponseError struct {
+	brokerID  string
 	response  string
 	code      string
 	class     protocol.ErrorClass
@@ -361,12 +374,15 @@ func (e *replicaResponseError) ReplicationErrorClass() string {
 	return string(e.class)
 }
 
+func (e *replicaResponseError) ReplicaBrokerID() string { return e.brokerID }
+
 func classifiedReplicaResponseError(brokerID, response string) error {
 	parsed, ok := protocol.ParseErrorResponse(response)
 	if !ok {
 		return fmt.Errorf("replica %s rejected append: %s", brokerID, response)
 	}
 	return fmt.Errorf("replica %s rejected append: %w", brokerID, &replicaResponseError{
+		brokerID:  brokerID,
 		response:  response,
 		code:      parsed.Code,
 		class:     parsed.Class,
