@@ -654,3 +654,23 @@ func TestHandler_RecoverIndexFromCommittedLog(t *testing.T) {
 	result = h2.HandleStreamVersion("STREAM_VERSION topic=orders key=recover-key")
 	assert.Equal(t, "OK version=1", result)
 }
+
+func TestHandler_RecoverIndexPastTransactionMarkerTail(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+	require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=recover-key version=1 message=event1"), "OK version=1")
+
+	p, err := h.tm.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, p.EnqueueBatchLeader([]types.Message{{
+		Topic: "orders", TransactionalID: "completed-transaction", TransactionMarker: types.TransactionMarkerCommit,
+	}}))
+	p.FlushDisk()
+	require.NoError(t, p.ApplyReplicaHWM(2))
+	require.Equal(t, uint64(2), p.LastStableOffset())
+
+	idx, err := h.getIndex("orders", 0)
+	require.NoError(t, err)
+	require.NoError(t, h.RecoverIndexFromLog("orders", 0, idx))
+	require.Equal(t, uint64(1), idx.GetVersion("recover-key"))
+}

@@ -298,11 +298,11 @@ func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *St
 	}
 	const batchSize = 256
 	for offset := first; offset < latest; {
-		msgs, err := p.ReadCommitted(offset, batchSize)
+		msgs, _, next, err := p.ReadCommittedPage(offset, batchSize, 0, true)
 		if err != nil {
 			return fmt.Errorf("recover stream index from log offset=%d: %w", offset, err)
 		}
-		if len(msgs) == 0 {
+		if next <= offset {
 			return fmt.Errorf("recover stream index stopped before stable tail at offset=%d tail=%d", offset, latest)
 		}
 		bounded := msgs[:0]
@@ -312,17 +312,12 @@ func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *St
 			}
 			bounded = append(bounded, msg)
 		}
-		if len(bounded) == 0 {
-			return fmt.Errorf("recover stream index did not reach stable tail at offset=%d tail=%d", offset, latest)
+		if len(bounded) != 0 {
+			if err := h.indexMessages(idx, bounded); err != nil {
+				return err
+			}
 		}
-		if err := h.indexMessages(idx, bounded); err != nil {
-			return err
-		}
-		next := bounded[len(bounded)-1].Offset + 1
-		if next <= offset {
-			return fmt.Errorf("recover stream index did not advance from offset=%d", offset)
-		}
-		offset = next
+		offset = min(next, latest)
 	}
 	return nil
 }
