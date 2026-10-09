@@ -845,6 +845,8 @@ func TestCompleteReplicationTaskReportsReconcileFailureAndDropsBlockedResult(t *
 	require.ErrorContains(t, <-result, "reconcile failed replication to committed HWM 0")
 	require.True(t, mutationReleased)
 	require.True(t, writeReleased)
+	require.ErrorContains(t, partition.ReconciliationError(), "snapshot replay is still pending")
+	require.ErrorContains(t, partition.EnqueueBatchLeader([]types.Message{{Payload: "blocked"}}), "partition recovery incomplete")
 
 	blockedResult := make(chan error, 1)
 	blockedResult <- errors.New("existing result")
@@ -1220,6 +1222,57 @@ func TestDistributedLeaderAcknowledgementHoldsWriteOwnershipUntilReplicationComp
 	close(executor.barrier)
 	require.Contains(t, <-second, `"last_offset":1`)
 	require.Eventually(t, func() bool { return executor.committed() == 2 }, time.Second, time.Millisecond)
+}
+
+func TestDistributedPublishOwnershipWaitHonorsRequestDeadline(t *testing.T) {
+	tests := []struct {
+		name    string
+		publish func(*CommandHandler, *ClientContext) string
+	}{
+		{
+			name: "command",
+			publish: func(handler *CommandHandler, clientCtx *ClientContext) string {
+				return handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=value", clientCtx)
+			},
+		},
+		{
+			name: "batch",
+			publish: func(handler *CommandHandler, clientCtx *ClientContext) string {
+				data, err := util.EncodeBatchMessages("orders", 0, "1", false, []types.Message{{Payload: "value", ProducerID: "p1"}})
+				require.NoError(t, err)
+				response, err := handler.HandleBatchMessage(data, nil, clientCtx)
+				require.NoError(t, err)
+				return response
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler, manager, executor := newDistributedAckTestHandler(t, 2)
+			require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+			installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
+
+			first := test.publish(handler, NewClientContext("", 0))
+			require.Contains(t, first, `"last_offset":0`)
+			<-executor.started
+
+			requestCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			clientCtx := NewClientContext("", 0)
+			clientCtx.SetRequestContext(requestCtx)
+			started := time.Now()
+			second := test.publish(handler, clientCtx)
+			require.Equal(t, "ERROR: request_timeout outcome=not_accepted", second)
+			require.Less(t, time.Since(started), time.Second)
+			partition, err := manager.GetTopic("orders").GetPartition(0)
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), partition.NextOffset(), "timed-out ownership waiter appended a record")
+
+			close(executor.barrier)
+			require.Eventually(t, func() bool { return executor.committed() == 1 }, time.Second, time.Millisecond)
+		})
+	}
 }
 
 func TestDistributedPermanentReplicationFailureRollsBackUncommittedTail(t *testing.T) {

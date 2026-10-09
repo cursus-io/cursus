@@ -654,20 +654,8 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshotContext(ctx context.Cont
 	if !metadata.CommittedHWMKnown {
 		return fail(fmt.Errorf("partition committed HWM is not initialized; clean bootstrap required"))
 	}
-<<<<<<< HEAD
-	key := fmt.Sprintf("%s-%d", topicName, partitionID)
-	wantedFence := partitionLeadershipFence{leader: snapshot.Leader, epoch: snapshot.LeaderEpoch}
-	preparedFence, prepared := ch.partitionPreparedEpochs.Load(key)
-	if !prepared || preparedFence.(partitionLeadershipFence) != wantedFence || p.ReconciliationError() != nil {
-		if err := p.ReconcileCommittedHWM(metadata.CommittedHWM); err != nil {
-			return fail(fmt.Errorf("partition is not ready for leadership: %w", err))
-		}
-		p.FlushDisk()
-		ch.partitionPreparedEpochs.Store(key, wantedFence)
-=======
 	if len(metadata.RecoveryReplicas) > 0 {
 		return fail(fmt.Errorf("replica_recovery_pending brokers=%s", strings.Join(metadata.RecoveryReplicas, ",")))
->>>>>>> d2de686 (fix: quarantine divergent replicas during recovery)
 	}
 	if p.NextOffset() < metadata.CommittedHWM || p.GetHWM() > metadata.CommittedHWM {
 		return fail(fmt.Errorf("partition is behind authoritative committed HWM: leo=%d hwm=%d committed=%d", p.NextOffset(), p.GetHWM(), metadata.CommittedHWM))

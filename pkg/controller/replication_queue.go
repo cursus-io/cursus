@@ -500,6 +500,7 @@ func completeReplicationTaskWithHWM(task partitionReplicationTask, err error, au
 			committedHWM = authoritativeHWM
 		}
 		if reconcileErr := task.partitionRef.ReconcileCommittedHWM(committedHWM); reconcileErr != nil {
+			task.partitionRef.MarkReconciliationPending(reconcileErr)
 			err = errors.Join(err, fmt.Errorf("reconcile failed replication to committed HWM %d: %w", committedHWM, reconcileErr))
 		} else {
 			task.partitionRef.FlushDisk()
