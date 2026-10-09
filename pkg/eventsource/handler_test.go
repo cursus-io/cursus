@@ -21,14 +21,24 @@ import (
 // --- test helpers ---
 
 type fakeStorageHandler struct {
-	mu     sync.Mutex
-	msgs   []types.Message
-	offset uint64
+	mu          sync.Mutex
+	msgs        []types.Message
+	offset      uint64
+	first       uint64
+	readErr     error
+	beforeRead  func(uint64)
+	beforeFlush func()
 }
 
 func (f *fakeStorageHandler) ReadMessages(off uint64, max int) ([]types.Message, error) {
+	if f.beforeRead != nil {
+		f.beforeRead(off)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
 	var result []types.Message
 	for _, m := range f.msgs {
 		if m.Offset >= off && len(result) < max {
@@ -38,9 +48,15 @@ func (f *fakeStorageHandler) ReadMessages(off uint64, max int) ([]types.Message,
 	return result, nil
 }
 
-func (f *fakeStorageHandler) GetAbsoluteOffset() uint64      { return f.offset }
-func (f *fakeStorageHandler) GetFirstOffset() uint64         { return 0 }
-func (f *fakeStorageHandler) GetFlushedOffset() uint64       { return f.offset }
+func (f *fakeStorageHandler) GetAbsoluteOffset() uint64 { return f.offset }
+func (f *fakeStorageHandler) GetFirstOffset() uint64    { return f.first }
+func (f *fakeStorageHandler) GetFlushedOffset() uint64 {
+	if beforeFlush := f.beforeFlush; beforeFlush != nil {
+		f.beforeFlush = nil
+		beforeFlush()
+	}
+	return f.offset
+}
 func (f *fakeStorageHandler) GetLatestOffset() uint64        { return f.offset }
 func (f *fakeStorageHandler) GetSegmentPath(_ uint64) string { return "" }
 
@@ -127,6 +143,11 @@ func (f *fakeStreamManager) StopStream(_ string) {}
 
 // newTestHandler creates a Handler backed by a TopicManager with a single event-sourcing topic.
 func newTestHandler(t *testing.T) *Handler {
+	h, _ := newTestHandlerWithProvider(t)
+	return h
+}
+
+func newTestHandlerWithProvider(t *testing.T) (*Handler, *fakeHandlerProvider) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := &config.Config{LogDir: dir}
@@ -138,7 +159,7 @@ func newTestHandler(t *testing.T) *Handler {
 	// Also create a non-event-sourcing topic for negative tests.
 	err = tm.CreateTopic("plain", 1, false, false)
 	require.NoError(t, err)
-	return NewHandler(tm)
+	return NewHandler(tm), hp
 }
 
 // TestAppendAndReadStream_Integration verifies that appending events updates
@@ -653,4 +674,159 @@ func TestHandler_RecoverIndexFromCommittedLog(t *testing.T) {
 
 	result = h2.HandleStreamVersion("STREAM_VERSION topic=orders key=recover-key")
 	assert.Equal(t, "OK version=1", result)
+}
+
+func TestHandler_RecoverIndexPastTransactionMarkerTailAfterRestart(t *testing.T) {
+	h := newTestHandler(t)
+	require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=recover-key version=1 message=event1"), "OK version=1")
+
+	p, err := h.tm.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, p.EnqueueBatchLeader([]types.Message{{
+		Topic: "orders", TransactionalID: "completed-transaction", TransactionMarker: types.TransactionMarkerCommit,
+	}}))
+	p.FlushDisk()
+	require.NoError(t, p.ApplyReplicaHWM(2))
+	require.Equal(t, uint64(2), p.LastStableOffset())
+
+	dir := h.tm.GetLogDir("orders", 0)
+	require.NoError(t, h.Close())
+	require.NoError(t, os.Remove(filepath.Join(dir, "partition_0_stream.idx")))
+	require.NoError(t, os.Remove(filepath.Join(dir, "partition_0_stream_keys.dat")))
+
+	h2 := NewHandler(h.tm)
+	defer func() { _ = h2.Close() }()
+	require.Equal(t, "OK version=1", h2.HandleStreamVersion("STREAM_VERSION topic=orders key=recover-key"))
+}
+
+func TestHandler_RecoverIndexSkipsTransactionRecordsAcrossPages(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	p, err := h.tm.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	messages := make([]types.Message, 0, 523)
+	for i := 0; i < 260; i++ {
+		messages = append(messages,
+			types.Message{Topic: "orders", Key: fmt.Sprintf("visible-%03d", i), AggregateVersion: 1},
+			types.Message{Topic: "orders", TransactionalID: fmt.Sprintf("committed-%03d", i), TransactionMarker: types.TransactionMarkerCommit},
+		)
+	}
+	messages = append(messages,
+		types.Message{Topic: "orders", Key: "aborted-key", AggregateVersion: 1, TransactionalID: "aborted", TransactionState: types.TransactionStateAborted},
+		types.Message{Topic: "orders", TransactionalID: "aborted", TransactionMarker: types.TransactionMarkerAbort},
+		types.Message{Topic: "orders", Key: "final-visible", AggregateVersion: 1},
+	)
+	require.NoError(t, p.EnqueueBatchLeader(messages))
+	p.FlushDisk()
+	require.NoError(t, p.ApplyReplicaHWM(uint64(len(messages))))
+
+	idx, err := h.getIndex("orders", 0)
+	require.NoError(t, err)
+	require.NoError(t, h.RecoverIndexFromLog("orders", 0, idx))
+	require.Equal(t, uint64(1), idx.GetVersion("visible-000"))
+	require.Equal(t, uint64(1), idx.GetVersion("visible-259"))
+	require.Equal(t, uint64(1), idx.GetVersion("final-visible"))
+	require.Zero(t, idx.GetVersion("aborted-key"))
+}
+
+func TestHandler_RecoverIndexUsesCapturedStableTail(t *testing.T) {
+	h, hp := newTestHandlerWithProvider(t)
+	defer func() { _ = h.Close() }()
+	require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=stable-key version=1 message=stable"), "OK version=1")
+
+	p, err := h.tm.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	storage := hp.handlers["orders:0"]
+	storage.beforeFlush = func() {
+		require.NoError(t, p.EnqueueBatchLeader([]types.Message{{
+			Topic: "orders", Key: "late-key", Payload: "late", AggregateVersion: 1,
+		}}))
+		p.FlushDisk()
+		require.NoError(t, p.ApplyReplicaHWM(2))
+	}
+
+	idx, err := h.getIndex("orders", 0)
+	require.NoError(t, err)
+	require.NoError(t, h.RecoverIndexFromLog("orders", 0, idx))
+	require.Equal(t, uint64(1), idx.GetVersion("stable-key"))
+	require.Zero(t, idx.GetVersion("late-key"))
+}
+
+func TestHandler_RecoverIndexFromRetentionCheckpoint(t *testing.T) {
+	h, hp := newTestHandlerWithProvider(t)
+	defer func() { _ = h.Close() }()
+	require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=retained-key version=1 message=event1"), "OK version=1")
+	require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=retained-key version=2 message=event2"), "OK version=2")
+
+	ss, err := NewSnapshotStore(h.tm.GetLogDir("orders", 0), 0)
+	require.NoError(t, err)
+	require.NoError(t, ss.Save("retained-key", 1, "snapshot"))
+	require.NoError(t, ss.Close())
+	hp.handlers["orders:0"].first = 1
+
+	idx, err := h.getIndex("orders", 0)
+	require.NoError(t, err)
+	require.NoError(t, h.RecoverIndexFromLog("orders", 0, idx))
+	require.Equal(t, uint64(2), idx.GetVersion("retained-key"))
+}
+
+func TestHandler_RecoverIndexRejectsRetentionWithoutCheckpoint(t *testing.T) {
+	h, hp := newTestHandlerWithProvider(t)
+	defer func() { _ = h.Close() }()
+	require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=retained-key version=1 message=event1"), "OK version=1")
+	hp.handlers["orders:0"].first = 1
+
+	idx, err := h.getIndex("orders", 0)
+	require.NoError(t, err)
+	err = h.RecoverIndexFromLog("orders", 0, idx)
+	require.ErrorContains(t, err, "cannot recover retained event stream at offset 1 without a snapshot checkpoint")
+}
+
+func TestHandler_RecoverIndexKeepsDurableReadFailuresFailClosed(t *testing.T) {
+	h, hp := newTestHandlerWithProvider(t)
+	defer func() { _ = h.Close() }()
+	require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=unreadable-key version=1 message=event1"), "OK version=1")
+	hp.handlers["orders:0"].readErr = fmt.Errorf("unreadable durable record")
+
+	idx, err := h.getIndex("orders", 0)
+	require.NoError(t, err)
+	err = h.RecoverIndexFromLog("orders", 0, idx)
+	require.ErrorContains(t, err, "recover stream index from log offset=0")
+	require.ErrorContains(t, err, "unreadable durable record")
+}
+
+func TestHandler_RecoverIndexRejectsGapBeforeStableTail(t *testing.T) {
+	h, hp := newTestHandlerWithProvider(t)
+	defer func() { _ = h.Close() }()
+	require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=gap-key version=1 message=event1"), "OK version=1")
+
+	p, err := h.tm.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	storage := hp.handlers["orders:0"]
+	storage.mu.Lock()
+	storage.offset = 2
+	storage.mu.Unlock()
+	p.SetHWM(2)
+
+	idx, err := h.getIndex("orders", 0)
+	require.NoError(t, err)
+	err = h.RecoverIndexFromLog("orders", 0, idx)
+	require.ErrorContains(t, err, "recover stream index stopped before stable tail at offset=1 tail=2")
+}
+
+func TestHandler_RecoverIndexReturnsStreamVersionGap(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	p, err := h.tm.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, p.EnqueueBatchLeader([]types.Message{{
+		Topic: "orders", Key: "gap-key", AggregateVersion: 2,
+	}}))
+	p.FlushDisk()
+	require.NoError(t, p.ApplyReplicaHWM(1))
+
+	_, err = h.getIndex("orders", 0)
+	require.ErrorContains(t, err, "stream index gap key=gap-key current=0 next=2")
 }
