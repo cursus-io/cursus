@@ -30,6 +30,7 @@ type partitionReplicationTask struct {
 	snapshot        clusterController.PartitionReplicationSnapshot
 	partitionRef    *topic.Partition
 	releaseMutation func()
+	releaseWrite    func()
 	result          chan error
 }
 
@@ -358,6 +359,17 @@ func sameBrokerSet(left, right []string) bool {
 func completeReplicationTask(task partitionReplicationTask, err error) {
 	if task.releaseMutation != nil {
 		task.releaseMutation()
+	}
+	if err != nil && task.partitionRef != nil {
+		committedHWM := task.partitionRef.GetHWM()
+		if reconcileErr := task.partitionRef.ReconcileCommittedHWM(committedHWM); reconcileErr != nil {
+			err = errors.Join(err, fmt.Errorf("reconcile failed replication to committed HWM %d: %w", committedHWM, reconcileErr))
+		} else {
+			task.partitionRef.FlushDisk()
+		}
+	}
+	if task.releaseWrite != nil {
+		task.releaseWrite()
 	}
 	if task.result == nil {
 		return

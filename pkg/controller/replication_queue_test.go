@@ -901,7 +901,7 @@ func TestApplyReplicaCatchupTruncatesDivergentTail(t *testing.T) {
 	require.Equal(t, uint64(1), partition.GetHWM())
 }
 
-func TestDistributedLeaderAcknowledgementsPreserveOrderedUncommittedTail(t *testing.T) {
+func TestDistributedLeaderAcknowledgementHoldsWriteOwnershipUntilReplicationCompletes(t *testing.T) {
 	handler, manager, executor := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
 	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
@@ -911,13 +911,42 @@ func TestDistributedLeaderAcknowledgementsPreserveOrderedUncommittedTail(t *test
 	first := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=one", NewClientContext("", 0))
 	require.Contains(t, first, `"last_offset":0`)
 	<-executor.started
-	second := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=two", NewClientContext("", 0))
-	require.Contains(t, second, `"last_offset":1`)
-	require.Equal(t, uint64(2), partition.NextOffset(), "next publish truncated the prior uncommitted tail")
+	second := make(chan string, 1)
+	go func() {
+		second <- handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=two", NewClientContext("", 0))
+	}()
+	select {
+	case response := <-second:
+		t.Fatalf("next append crossed unresolved replication ownership: %s", response)
+	case <-time.After(100 * time.Millisecond):
+	}
+	require.Equal(t, uint64(1), partition.NextOffset(), "next publish appended behind an unresolved tail")
 	require.Zero(t, partition.GetHWM())
 
 	close(executor.barrier)
+	require.Contains(t, <-second, `"last_offset":1`)
 	require.Eventually(t, func() bool { return executor.committed() == 2 }, time.Second, time.Millisecond)
+}
+
+func TestDistributedPermanentReplicationFailureRollsBackUncommittedTail(t *testing.T) {
+	handler, manager, executor := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	executor.replicateErr = permanentReplicationError{}
+	executor.replicateFailures = 1
+	close(executor.barrier)
+
+	failed := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=all producerId=p1 message=failed", NewClientContext("", 0))
+	require.Contains(t, failed, "invalid replica append")
+	require.Zero(t, partition.NextOffset(), "terminal replication failure left an uncommitted offset reservation")
+	require.Zero(t, partition.GetHWM())
+
+	retried := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=all producerId=p1 message=retried", NewClientContext("", 0))
+	require.Contains(t, retried, `"last_offset":0`)
+	require.Equal(t, uint64(1), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM())
 }
 
 func TestDistributedAllAcknowledgementBlocksUntilFollower(t *testing.T) {
@@ -1025,9 +1054,22 @@ func TestDistributedAllRequestDeadlineReturnsUnknownAndKeepsReplication(t *testi
 		t.Fatal("request did not return after its deadline")
 	}
 	require.Zero(t, executor.committed(), "timed out replication committed before its worker was released")
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	second := make(chan string, 1)
+	go func() {
+		second <- handler.HandleCommand("PUBLISH topic=orders partition=0 acks=all producerId=p1 message=next", NewClientContext("", 0))
+	}()
+	select {
+	case got := <-second:
+		t.Fatalf("next append crossed timed-out replication ownership: %s", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	require.Equal(t, uint64(1), partition.NextOffset())
 
 	close(executor.barrier)
-	require.Eventually(t, func() bool { return executor.committed() == 1 }, time.Second, time.Millisecond,
+	require.Contains(t, <-second, `"last_offset":1`)
+	require.Eventually(t, func() bool { return executor.committed() == 2 }, time.Second, time.Millisecond,
 		"request timeout canceled replication owned by the broker")
 }
 
