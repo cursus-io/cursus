@@ -506,6 +506,16 @@ func (c *Consumer) processRetryQueue() {
 	c.commitRetryMap = make(map[int]retryCommit)
 	c.commitMu.Unlock()
 
+	// A later commit can succeed while an older failed commit remains queued.
+	// Replaying that older offset would be rejected as a regression forever.
+	c.mu.RLock()
+	for partition, offset := range toRetry {
+		if c.offsets[partition] >= offset {
+			delete(toRetry, partition)
+		}
+	}
+	c.mu.RUnlock()
+
 	LogDebug("Retrying failed commits for %d partitions", len(toRetry))
 	if len(toRetry) > 0 {
 		if c.sendBatchCommit(toRetry, assignmentGeneration) {
