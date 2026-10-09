@@ -108,7 +108,10 @@ func (f *BrokerFSM) ReconcileReplicaMaterializations(brokerID string) error {
 				} else {
 					issue.LocalLEO = partition.NextOffset()
 					issue.LocalHWM = partition.GetHWM()
+					recoveryErr := partition.RecoveryError()
 					switch {
+					case recoveryErr != nil:
+						issueErr = fmt.Errorf("local partition recovery pending: %w", recoveryErr)
 					case issue.LocalHWM > current.CommittedHWM:
 						issueErr = fmt.Errorf("local HWM %d is ahead of committed HWM %d", issue.LocalHWM, current.CommittedHWM)
 					case issue.LocalLEO < current.CommittedHWM:

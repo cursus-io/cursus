@@ -368,6 +368,74 @@ func TestReplicaOffsetGapQuarantinesOnceAndContinuesWithReducedISR(t *testing.T)
 	require.Equal(t, uint64(1), executor.committed())
 }
 
+func TestLeaderAcknowledgedGapDecisionFailurePreservesTailAndRetries(t *testing.T) {
+	_, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 0, Payload: "acknowledged"}}))
+
+	executor := newBarrierReplicationExecutor()
+	executor.replicateErr = replicaGapTestError{brokerID: "broker-2"}
+	executor.replicateFailures = 1
+	secondRecoveryStarted := make(chan struct{})
+	allowRecovery := make(chan struct{})
+	recoveryCalls := 0
+	executor.recoverGap = func(_ partitionReplicationTask, cause error) (replicaGapRecoveryResult, error) {
+		require.True(t, replicaGapError(cause))
+		recoveryCalls++
+		if recoveryCalls == 1 {
+			return replicaGapRecoveryResult{resolved: true}, errors.New("quarantine decision unavailable")
+		}
+		close(secondRecoveryStarted)
+		<-allowRecovery
+		executor.mu.Lock()
+		executor.snapshot.ISR = []string{"broker-1", "broker-3"}
+		executor.snapshot.RecoveryReplicas = []string{"broker-2"}
+		executor.mu.Unlock()
+		return replicaGapRecoveryResult{}, nil
+	}
+	close(executor.barrier)
+	coordinator := newPartitionReplicationCoordinator(1, executor)
+	t.Cleanup(coordinator.close)
+	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	writeReleased := make(chan struct{})
+	task := replicationTaskForMode(executor, ackpolicy.Leader)
+	task.partitionRef = partition
+	task.releaseMutation = partition.BeginReplicationMutation()
+	task.releaseWrite = func() { close(writeReleased) }
+	reservation.submit(task)
+
+	select {
+	case <-secondRecoveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("leader-acknowledged gap recovery did not retry its decision")
+	}
+	require.Equal(t, uint64(1), partition.NextOffset(), "the acknowledged tail must not be rolled back")
+	require.Zero(t, partition.GetHWM())
+	require.ErrorContains(t, partition.RecoveryError(), "quarantine decision unavailable")
+	executor.mu.Lock()
+	require.Equal(t, 1, executor.replicateCalls, "replication must pause until the gap decision succeeds")
+	executor.mu.Unlock()
+	select {
+	case <-writeReleased:
+		t.Fatal("write ownership was released before the gap decision completed")
+	default:
+	}
+
+	close(allowRecovery)
+	require.NoError(t, <-task.result)
+	require.Equal(t, uint64(1), partition.GetHWM())
+	require.Equal(t, uint64(1), partition.NextOffset())
+	require.NoError(t, partition.RecoveryError())
+	select {
+	case <-writeReleased:
+	case <-time.After(time.Second):
+		t.Fatal("write ownership was not released after commit")
+	}
+}
+
 func TestRecoverReplicaGapDefersAuthoritativeReconcileUntilMutationRelease(t *testing.T) {
 	handler, manager, _ := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
@@ -453,6 +521,24 @@ func TestRecoveryPendingPartitionRejectsNewLeaderAppend(t *testing.T) {
 	require.NoError(t, err)
 	_, _, _, err = handler.preparePartitionLeaderSnapshot("orders", 0, partition, 1)
 	require.ErrorContains(t, err, "replica_recovery_pending")
+}
+
+func TestLocalReconciliationPendingRejectsNewLeaderAppend(t *testing.T) {
+	handler, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	state := handler.Cluster.RaftManager.GetFSM()
+	applyPartitionMetadata(t, state, "orders", 0, fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 7, CommittedHWM: 0,
+		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1"},
+		PartitionCount: 1,
+	})
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	partition.MarkReconciliationPending(errors.New("quarantine decision unavailable"))
+
+	_, _, _, err = handler.preparePartitionLeaderSnapshot("orders", 0, partition, 1)
+	require.ErrorContains(t, err, "partition recovery pending")
+	require.ErrorContains(t, err, "quarantine decision unavailable")
 }
 
 func TestAllAcknowledgementRefreshesISRWhileRetrying(t *testing.T) {

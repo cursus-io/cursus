@@ -43,8 +43,8 @@
 {{- if ne (.Values.compatibility.wireProtocol | toString) "2" }}
 {{- fail "compatibility.wireProtocol must remain 2 for this chart" }}
 {{- end }}
-{{- if ne (.Values.compatibility.brokerProtocol | toString) "5" }}
-{{- fail "compatibility.brokerProtocol must remain 5 for this chart" }}
+{{- if ne (.Values.compatibility.brokerProtocol | toString) "6" }}
+{{- fail "compatibility.brokerProtocol must remain 6 for this chart" }}
 {{- end }}
 {{- if ne (.Values.compatibility.snapshotFormat | toString) "10" }}
 {{- fail "compatibility.snapshotFormat must remain 10 for this chart" }}

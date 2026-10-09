@@ -82,6 +82,35 @@ jobs:
         working-directory: test/e2e-cluster
         run: docker compose -f docker-compose.yml -f docker-compose.faults.yml down -v --remove-orphans
 
+  distributed-truncate-replica-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.2'
+          cache: false
+
+      - name: Run distributed truncate and consumer offset recovery E2E
+        env:
+          RUN_E2E_CHAOS: "1"
+        run: |
+          go test -v -count=1 -timeout 25m ./test/e2e-cluster \
+            -run '^TestDistributedTruncateRecoveryPreservesConsumerOffsetReplication$'
+
+      - name: Show replica recovery cluster logs on failure
+        if: failure()
+        working-directory: test/e2e-cluster
+        run: docker compose -f docker-compose.yml -f docker-compose.faults.yml logs --no-color
+
+      - name: Clean replica recovery cluster environment
+        if: always()
+        working-directory: test/e2e-cluster
+        run: docker compose -f docker-compose.yml -f docker-compose.faults.yml down -v --remove-orphans
+
   raft-snapshot-restore:
     runs-on: ubuntu-latest
     timeout-minutes: 30

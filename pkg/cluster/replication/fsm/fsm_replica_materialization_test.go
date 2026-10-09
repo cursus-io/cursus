@@ -1,6 +1,7 @@
 package fsm
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -78,6 +79,39 @@ func TestReplicaMaterializationReadinessAllowsUncommittedLocalTail(t *testing.T)
 	state.mu.Unlock()
 
 	require.NoError(t, state.ReplicaMaterializationReadinessError("broker-1"))
+}
+
+func TestReplicaMaterializationReadinessRejectsLocalRecoveryPending(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	localTopic := topicManager.GetTopic("orders")
+	partition, err := localTopic.GetPartition(0)
+	require.NoError(t, err)
+	partition.MarkReconciliationPending(errors.New("quarantine decision unavailable"))
+
+	state := NewBrokerFSM(topicManager, nil)
+	definition := localTopic.Definition()
+	state.mu.Lock()
+	state.topicState["orders"] = &definition
+	state.partitionMetadata["orders-0"] = &PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 7, LifecycleEpoch: definition.LifecycleEpoch,
+		CommittedHWM: 0, CommittedHWMKnown: true, PartitionCount: 1,
+		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1"},
+	}
+	state.mu.Unlock()
+
+	err = state.ReplicaMaterializationReadinessError("broker-1")
+	require.ErrorContains(t, err, "local partition recovery pending")
+	require.ErrorContains(t, err, "quarantine decision unavailable")
+	require.Len(t, state.ReplicaMaterializationIssues(), 1)
+
+	require.NoError(t, partition.ReconcileCommittedHWM(0))
+	require.NoError(t, state.ReplicaMaterializationReadinessError("broker-1"))
+	require.Empty(t, state.ReplicaMaterializationIssues())
 }
 
 func TestReplicaMaterializationReadinessIgnoresUnassignedPartition(t *testing.T) {
