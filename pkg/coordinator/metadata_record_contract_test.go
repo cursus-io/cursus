@@ -138,8 +138,43 @@ func TestLifecycleSnapshotSelectionIsMonotonic(t *testing.T) {
 	conflict := newer
 	conflict.Lifecycle = cloneLifecycle(newer.Lifecycle)
 	conflict.Lifecycle.Members = []GroupLifecycleMember{{ID: "other"}}
-	require.ErrorContains(t, selectLifecycleSnapshot(candidates, conflict, &status), "conflicting lifecycle snapshots")
+	require.NoError(t, selectLifecycleSnapshot(candidates, conflict, &status))
+	require.ErrorContains(t, validateSelectedLifecycleSnapshots(candidates, nil, &status), "conflicting lifecycle snapshots")
 	require.Equal(t, 1, status.CorruptRecords)
+
+	latest := newer
+	latest.Revision = 3
+	latest.Lifecycle = cloneLifecycle(newer.Lifecycle)
+	latest.Lifecycle.Generation = 3
+	require.NoError(t, selectLifecycleSnapshot(candidates, latest, &status))
+	require.NoError(t, validateSelectedLifecycleSnapshots(candidates, nil, &status))
+}
+
+func TestLifecycleSnapshotSelectionAcceptsOnlyEmptyGroupTimestampRefresh(t *testing.T) {
+	first := validLifecycleRecord()
+	first.Lifecycle.Members = nil
+	first.Timestamp = time.Unix(100, 0).UTC()
+	first.Lifecycle.LastActivity = first.Timestamp
+	first.Lifecycle.LastRebalance = first.Timestamp
+	second := first
+	second.Lifecycle = cloneLifecycle(first.Lifecycle)
+	second.Timestamp = time.Unix(200, 0).UTC()
+	second.Lifecycle.LastActivity = second.Timestamp
+	second.Lifecycle.LastRebalance = second.Timestamp
+
+	candidates := make(map[string]lifecycleSnapshotCandidate)
+	status := ConsumerMetadataRecoveryStatus{}
+	require.NoError(t, selectLifecycleSnapshot(candidates, first, &status))
+	require.NoError(t, selectLifecycleSnapshot(candidates, second, &status))
+	require.NoError(t, validateSelectedLifecycleSnapshots(candidates, nil, &status))
+	require.Equal(t, second.Timestamp, candidates[first.Group].record.Timestamp)
+	require.Zero(t, status.CorruptRecords)
+
+	conflict := second
+	conflict.Lifecycle = cloneLifecycle(second.Lifecycle)
+	conflict.Lifecycle.Members = []GroupLifecycleMember{{ID: "unexpected-member"}}
+	require.NoError(t, selectLifecycleSnapshot(candidates, conflict, &status))
+	require.ErrorContains(t, validateSelectedLifecycleSnapshots(candidates, nil, &status), "conflicting lifecycle snapshots")
 }
 
 func TestConsumerMetadataValidationRejectsMalformedLifecycleRecords(t *testing.T) {

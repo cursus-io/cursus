@@ -59,6 +59,50 @@ func (h *pausedMetadataReplayHandler) ReadTopicPartition(topic string, partition
 	return h.metadataReplayHandler.ReadTopicPartition(topic, partition, offset, max)
 }
 
+func TestDistributedRecoveryIgnoresOnlySupersededLifecycleConflicts(t *testing.T) {
+	registration := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
+		Group: "experiment-server", Topic: "commerce.experiment.events", PartitionCount: 1, Epoch: 1,
+	}
+	snapshot := func(generation uint64, member string) ConsumerMetadataRecord {
+		return ConsumerMetadataRecord{
+			Version: ConsumerMetadataRecordVersionLifecycle, Type: ConsumerMetadataRecordLifecycleSnapshot,
+			Group: "experiment-server", Epoch: 1, Revision: generation,
+			Lifecycle: &GroupLifecycleSnapshot{
+				TopicName: "commerce.experiment.events", Generation: int(generation),
+				Members: []GroupLifecycleMember{{ID: member, Assignments: []int{0}}}, Partitions: []int{0},
+			},
+		}
+	}
+	records := []ConsumerMetadataRecord{
+		registration,
+		snapshot(11, "first-11"), snapshot(12, "first-12"), snapshot(13, "first-13"),
+		snapshot(11, "second-11"), snapshot(12, "second-12"), snapshot(13, "second-13"),
+		snapshot(14, "latest"),
+	}
+	makeHandler := func(records []ConsumerMetadataRecord) *metadataReplayHandler {
+		messages := make([]types.Message, 0, len(records))
+		for offset, record := range records {
+			messages = append(messages, encodedMetadataMessage(t, record, uint64(offset)))
+		}
+		return &metadataReplayHandler{messages: map[int][]types.Message{0: messages}}
+	}
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	recovered, err := NewCoordinatorWithRecovery(context.Background(), cfg, makeHandler(records))
+	require.NoError(t, err)
+	t.Cleanup(recovered.Stop)
+	require.True(t, recovered.RecoverySnapshot().Ready)
+	require.Zero(t, recovered.RecoverySnapshot().CorruptRecords)
+	require.Equal(t, 14, recovered.GetGeneration("experiment-server"))
+	require.Equal(t, []int{0}, recovered.GetMemberAssignments("experiment-server", "latest"))
+
+	conflicted, err := NewCoordinatorWithRecovery(context.Background(), cfg, makeHandler(records[:len(records)-1]))
+	require.ErrorContains(t, err, "conflicting lifecycle snapshots group=experiment-server epoch=1 generation=13")
+	t.Cleanup(conflicted.Stop)
+	require.False(t, conflicted.RecoverySnapshot().Ready)
+}
+
 func TestConsumerMetadataReplayRequiresMigrationForRetainedGap(t *testing.T) {
 	handler := &metadataReplayHandler{starts: map[int]uint64{0: 42}}
 	coordinator, err := NewCoordinatorWithRecovery(context.Background(), config.DefaultConfig(), handler)
