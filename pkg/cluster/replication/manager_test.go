@@ -10,6 +10,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
@@ -212,6 +213,45 @@ func TestBuildRaftConfigRejectsUnsafeSnapshotSettings(t *testing.T) {
 			assert.ErrorContains(t, err, test.want)
 		})
 	}
+}
+
+func TestLocalPartitionsNeedRecoveryFenceIgnoresEmptyTopicDefinitions(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	topicManager := topic.NewTopicManager(cfg, &FakeHandlerProvider{}, nil)
+	t.Cleanup(topicManager.Stop)
+	require.NoError(t, topicManager.CreateTopic("empty-internal", 1, false, false))
+
+	require.False(t, localPartitionsNeedRecoveryFence(topicManager))
+}
+
+func TestLocalPartitionsNeedRecoveryFenceProtectsPersistedWatermark(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	topicManager := topic.NewTopicManager(cfg, &FakeHandlerProvider{}, nil)
+	t.Cleanup(topicManager.Stop)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	partition.SetHWM(1)
+
+	require.True(t, localPartitionsNeedRecoveryFence(topicManager))
+}
+
+func TestLocalPartitionsNeedRecoveryFenceProtectsUncommittedTail(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	topicManager := topic.NewTopicManager(cfg, &FakeHandlerProvider{}, nil)
+	t.Cleanup(topicManager.Stop)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ApplyReplicaHWM(0))
+	require.NoError(t, partition.EnqueueBatchLeader([]types.Message{{Payload: "tail"}}))
+	require.Zero(t, partition.GetHWM())
+
+	require.True(t, localPartitionsNeedRecoveryFence(topicManager))
 }
 
 func TestHighestFSMCommandIndexIgnoresNonCommandEntries(t *testing.T) {

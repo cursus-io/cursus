@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 type MockISRManager struct {
@@ -359,6 +360,33 @@ func TestServiceDiscoveryLeaderGraceDefersMembershipTransition(t *testing.T) {
 	sd.Reconcile()
 
 	assert.Equal(t, "active", rm.mockFSM.GetBroker("node2").Status)
+	rm.AssertNotCalled(t, "ApplyCommand", "DEREGISTER", mock.Anything)
+	rm.AssertExpectations(t)
+}
+
+func TestServiceDiscoveryRegistrationGraceDefersInactiveTransitionUntilHeartbeat(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.isLeader = true
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	registered := time.Now()
+	payload, err := json.Marshal(fsm.BrokerInfo{
+		ID: "node2", Addr: "localhost:9002", Status: "active", LastSeen: registered,
+	})
+	require.NoError(t, err)
+	require.Nil(t, rm.mockFSM.Apply(&raft.Log{Data: append([]byte("REGISTER:"), payload...)}))
+	configuration := raft.Configuration{Servers: []raft.Server{{ID: "node2", Address: "localhost:9002"}}}
+	rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: configuration}).Once()
+
+	sd := NewServiceDiscoveryImpl(rm, "node1", "localhost:9001", "")
+	sd.livenessMu.Lock()
+	sd.leaderSince = registered.Add(-2 * sd.heartbeatTimeout)
+	sd.livenessMu.Unlock()
+	sd.Reconcile()
+
+	assert.Equal(t, "active", rm.mockFSM.GetBroker("node2").Status)
+	assert.False(t, sd.brokerAlive(fsm.BrokerInfo{
+		ID: "node3", LastSeen: registered.Add(2 * sd.heartbeatTimeout),
+	}), "an unbounded future registration timestamp must not extend liveness")
 	rm.AssertNotCalled(t, "ApplyCommand", "DEREGISTER", mock.Anything)
 	rm.AssertExpectations(t)
 }

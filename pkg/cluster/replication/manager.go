@@ -154,11 +154,14 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 		_ = raftStore.Close()
 		return nil, fmt.Errorf("inspect durable raft log: %w", err)
 	}
-	hasLocalTopics := topicManager != nil && len(topicManager.ExportDefinitions()) > 0
-	if lastLogIndex > 0 || hasLocalTopics {
+	hasLocalPartitionState := localPartitionsNeedRecoveryFence(topicManager)
+	if lastLogIndex > 0 || hasLocalPartitionState {
 		// A restart can recover by receiving committed logs from its peers without
-		// first invoking Restore or retaining a local log entry. Existing topic
-		// definitions therefore also prove that local HWM checkpoints need staging.
+		// first invoking Restore or retaining a local log entry. A non-empty local
+		// partition therefore also proves that an HWM checkpoint or uncommitted tail
+		// needs staging. Topic definitions alone are not enough: clean bootstrap
+		// creates the empty internal topic before Raft starts, and fencing that state
+		// would prevent fresh followers from joining the cluster.
 		// Do this before NewRaft starts applying commands so an early topic command
 		// cannot treat a later committed local boundary as a regression.
 		brokerFSM.BeginRecoveredPartitionReplay()
@@ -254,6 +257,24 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	go rm.reconcileTopicMaterializations(ctx, 5*time.Second)
 
 	return rm, nil
+}
+
+func localPartitionsNeedRecoveryFence(topicManager *topic.TopicManager) bool {
+	if topicManager == nil {
+		return false
+	}
+	for _, definition := range topicManager.ExportDefinitions() {
+		localTopic := topicManager.GetTopic(definition.Name)
+		if localTopic == nil {
+			continue
+		}
+		for _, partition := range localTopic.Partitions {
+			if partition != nil && (partition.NextOffset() > 0 || partition.GetHWM() > 0 || partition.SnapshotRecoveryPending()) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func awaitRecoveredPartitionReplay(ctx context.Context, r raftStatsReader, logStore raft.LogStore, brokerFSM recoveredPartitionState, brokerID string, noProgressTimeout time.Duration) error {

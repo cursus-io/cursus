@@ -365,7 +365,7 @@ func (sd *serviceDiscovery) Reconcile() {
 
 	for _, b := range fsmBrokers {
 		fsmMap[b.ID] = true
-		if b.Status == "active" && !sd.brokerAlive(b.ID) {
+		if b.Status == "active" && !sd.brokerAlive(b) {
 			util.Warn("Broker %s heartbeat expired; marking inactive", b.ID)
 			data, err := marshalBrokerDeregistration(&b)
 			if err == nil {
@@ -424,8 +424,8 @@ func (sd *serviceDiscovery) transactionCoordinatorShardCount() int {
 	return sd.fsm.ConfiguredTransactionCoordinatorShardCount()
 }
 
-func (sd *serviceDiscovery) brokerAlive(brokerID string) bool {
-	if brokerID == sd.brokerID {
+func (sd *serviceDiscovery) brokerAlive(broker fsm.BrokerInfo) bool {
+	if broker.ID == sd.brokerID {
 		return true
 	}
 	sd.livenessMu.RLock()
@@ -433,8 +433,16 @@ func (sd *serviceDiscovery) brokerAlive(brokerID string) bool {
 	if !sd.leaderSince.IsZero() && time.Since(sd.leaderSince) <= sd.heartbeatTimeout {
 		return true
 	}
-	lastSeen, ok := sd.lastSeen[brokerID]
-	return ok && time.Since(lastSeen) <= sd.heartbeatTimeout
+	lastSeen, ok := sd.lastSeen[broker.ID]
+	if ok && time.Since(lastSeen) <= sd.heartbeatTimeout {
+		return true
+	}
+	// A registration is a durable liveness observation. Give its process one
+	// heartbeat interval to establish the leader-local heartbeat session instead
+	// of immediately overwriting a fresh active registration with an inactive
+	// transition left over from the previous process lifetime.
+	registrationAge := time.Since(broker.LastSeen)
+	return !broker.LastSeen.IsZero() && registrationAge >= -sd.heartbeatTimeout && registrationAge <= sd.heartbeatTimeout
 }
 
 func marshalBrokerDeregistration(broker *fsm.BrokerInfo) ([]byte, error) {

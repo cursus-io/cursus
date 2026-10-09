@@ -3,6 +3,7 @@ package e2e_cluster
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os/exec"
 	"strings"
@@ -81,7 +82,11 @@ func (a *ClusterActions) waitForNodeHealth(nodeIndex int, healthURL string) erro
 			return true, "healthy", nil
 		}
 		if resp != nil {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
+			if readErr == nil {
+				return false, fmt.Sprintf("health endpoint status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body))), err
+			}
 		}
 		return false, "health endpoint not ready", err
 	})
