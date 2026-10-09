@@ -520,7 +520,11 @@ ERROR: distribution_not_enabled
 
 ### CLUSTER_STATUS
 
-`CLUSTER_STATUS` returns `OK cluster=<json>` in distributed mode. The JSON document contains the non-secret active internal credential generation, Raft leader address, active/inactive broker counts, partition leader epochs and committed HWMs, plus the expected, assigned, active, and in-sync replica counts. Cluster totals include leaderless, under-replicated, assignment-deficient, inactive-replica, and `min.insync.replicas`-unsatisfied partitions. Each partition includes a bounded `reasons` list when its durable definition, assignment, leader, or ISR does not converge. `healthy=true` requires every defined partition to have its exact distinct replica count on active brokers, an active assigned leader, and a full active ISR that also satisfies the effective minimum.
+`CLUSTER_STATUS` returns `OK cluster=<json>` in distributed mode. The JSON document contains the non-secret active internal credential generation, Raft leader address and indexes, active/inactive broker counts, partition leader epochs and committed HWMs, plus the expected, assigned, active, and in-sync replica counts. Cluster totals include leaderless, under-replicated, assignment-deficient, inactive-replica, `min.insync.replicas`-unsatisfied, and recovery-pending partitions. It also reports node-local topic and replica materialization counts.
+
+`recovery_pending_partitions` counts partitions with one or more replicas quarantined after a verified replication gap. Each affected partition sets `recovery_pending=true`, lists the broker IDs in `recovery_replicas`, and includes `replica_recovery_pending` in its bounded `reasons` list. The quarantined broker remains assigned but stays outside ISR until bounded catch-up and prefix verification succeed. New leader writes to the partition are rejected while that recovery marker is active.
+
+`topic_materialization_pending` and `replica_materialization_pending` distinguish metadata that has not materialized locally from topology-only under-replication. `healthy=true` requires every defined partition to have its exact distinct replica count on active brokers, an active assigned leader, a full active ISR that satisfies the effective minimum, no recovery marker, and no pending local materialization.
 
 Common errors are `ERROR: distribution_required command=CLUSTER_STATUS`, `ERROR: fsm_not_available command=CLUSTER_STATUS`, and `ERROR: marshal_cluster_status_failed reason="..."`.
 
