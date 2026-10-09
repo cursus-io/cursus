@@ -113,7 +113,8 @@ type lifecycleCandidate struct {
 }
 
 type lifecycleSnapshotCandidate struct {
-	record ConsumerMetadataRecord
+	record     ConsumerMetadataRecord
+	conflicted bool
 }
 
 type offsetCandidate struct {
@@ -841,6 +842,12 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 			return status, fmt.Errorf("select migration record for group %q: %w", record.Group, err)
 		}
 	}
+	if err := validateSelectedLifecycleSnapshots(candidates.lifecycleSnapshots, candidates.lifecycles, &status); err != nil {
+		return status, err
+	}
+	if err := validateSelectedLifecycleSnapshots(candidates.reservationSnapshots, candidates.lifecycles, &status); err != nil {
+		return status, err
+	}
 
 	status.Phase = "group_registration_replay"
 	groups, groupEpochs, orphanCount, err := materializeConsumerMetadata(candidates.lifecycles, candidates.lifecycleSnapshots, candidates.offsetSnapshots, legacy, legacyRecordCounts, &status)
@@ -1029,13 +1036,63 @@ func selectLifecycleSnapshot(candidates map[string]lifecycleSnapshotCandidate, r
 		candidates[record.Group] = lifecycleSnapshotCandidate{record: record}
 	case record.Epoch == candidate.record.Epoch && record.Revision == candidate.record.Revision && !sameConsumerMetadataRecord(record, candidate.record):
 		if status != nil {
-			status.CorruptRecords++
+			status.OrphanRecords++
 		}
-		return fmt.Errorf("conflicting lifecycle snapshots group=%s epoch=%d generation=%d", record.Group, record.Epoch, record.Revision)
+		if sameEmptyLifecycleState(record, candidate.record) {
+			// The log order is authoritative. An empty group can be observed
+			// again at the same generation with refreshed activity timestamps.
+			// There is no member or assignment to reconcile in this case.
+			candidate.record = record
+			candidates[record.Group] = candidate
+			return nil
+		}
+		candidate.conflicted = true
+		candidates[record.Group] = candidate
 	default:
 		if status != nil {
 			status.OrphanRecords++
 		}
+	}
+	return nil
+}
+
+func sameEmptyLifecycleState(left, right ConsumerMetadataRecord) bool {
+	if left.Type != ConsumerMetadataRecordLifecycleSnapshot || right.Type != ConsumerMetadataRecordLifecycleSnapshot ||
+		left.Lifecycle == nil || right.Lifecycle == nil || len(left.Lifecycle.Members) != 0 || len(right.Lifecycle.Members) != 0 {
+		return false
+	}
+	leftLifecycle := *left.Lifecycle
+	rightLifecycle := *right.Lifecycle
+	left.Lifecycle = &leftLifecycle
+	right.Lifecycle = &rightLifecycle
+	left.Lifecycle.LastActivity = time.Time{}
+	left.Lifecycle.LastRebalance = time.Time{}
+	right.Lifecycle.LastActivity = time.Time{}
+	right.Lifecycle.LastRebalance = time.Time{}
+	return sameConsumerMetadataRecord(left, right)
+}
+
+// A duplicate generation can be superseded by a later durable snapshot. Only
+// the selected generation must be unambiguous; conflicting current state still
+// fails closed instead of choosing a record based on scan order.
+func validateSelectedLifecycleSnapshots(snapshots map[string]lifecycleSnapshotCandidate, lifecycles map[string]lifecycleCandidate, status *ConsumerMetadataRecoveryStatus) error {
+	names := make([]string, 0, len(snapshots))
+	for name := range snapshots {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		candidate := snapshots[name]
+		if !candidate.conflicted {
+			continue
+		}
+		if lifecycle, ok := lifecycles[name]; ok && lifecycle.record.Epoch > candidate.record.Epoch {
+			continue
+		}
+		if status != nil {
+			status.CorruptRecords++
+		}
+		return fmt.Errorf("conflicting lifecycle snapshots group=%s epoch=%d generation=%d", name, candidate.record.Epoch, candidate.record.Revision)
 	}
 	return nil
 }

@@ -361,7 +361,8 @@ func TestOffsetReservationReplayRejectsConflictsAndFencesGroupIncarnations(t *te
 	require.NoError(t, candidates.selectRecord(record, &status))
 	conflict := reservationFixture()
 	conflict.Reservations[0].Offsets[0].Offset++
-	require.ErrorContains(t, candidates.selectRecord(conflict, &status), "conflicting")
+	require.NoError(t, candidates.selectRecord(conflict, &status))
+	require.ErrorContains(t, validateSelectedLifecycleSnapshots(candidates.reservationSnapshots, candidates.lifecycles, &status), "conflicting")
 	groups := map[string]*GroupMetadata{"workers": {TopicName: "orders", Partitions: []int{0, 1}, RegistrationEpoch: 4}}
 	orphans, err := restoreOffsetReservations(groups, candidates.reservationSnapshots)
 	require.NoError(t, err)
