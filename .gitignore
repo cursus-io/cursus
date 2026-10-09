@@ -17,6 +17,6 @@ coverage-server/
 bin/
 pkg/controller/broker-logs/
 
-# Local design documents
+# Local planning and design artifacts; never commit these files
 /docs/superpowers/
 /docs/specs/

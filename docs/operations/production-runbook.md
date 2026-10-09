@@ -85,6 +85,35 @@ disruption. If multiple surviving brokers become inactive together, test DNS
 resolution for every StatefulSet name and verify that the platform DNS replicas
 span failure domains before changing Cursus membership.
 
+## Replica gap or recovery pending
+
+Treat `replica_offset_gap`, `recovery_pending_partitions > 0`, or a partition
+with `replica_recovery_pending` as a data-integrity incident. Stop voluntary
+restarts and drain writes to the affected partition. Capture `CLUSTER_STATUS`,
+the current Raft leader and indexes, topic lifecycle and leader epochs, ISR and
+replica assignments, committed HWM, and every replica's LEO/HWM before changing
+state. A client timeout is an unknown outcome until those authoritative
+boundaries establish whether its write committed.
+
+Do not skip or reset offsets, backfill a missing offset without prefix
+verification, delete an internal topic, issue additional truncations, or edit
+PVC, segment, index, HWM checkpoint, or Raft files in place. Before any manual
+recovery, stop all members and obtain one consistent immutable backup generation
+of every broker volume and Raft state. Validate writable clones in an isolated
+three-member cluster first.
+
+Automatic recovery removes the divergent broker from ISR while retaining its
+replica assignment, rejects new writes to the partition, catches the replica up
+to the Raft-committed HWM, and requires a leader/lifecycle/HWM-fenced prefix
+proof before ISR re-admission. Do not declare recovery complete from
+`healthy=true` or Pod readiness alone. Confirm all of the following:
+
+1. `recovery_pending_partitions` and both materialization-pending counts are zero;
+2. the partition has its expected full ISR and no `recovery_replicas`;
+3. every replica reports the exact expected LEO/HWM at the committed boundary;
+4. all brokers are ready and Raft applied/commit indexes have converged;
+5. consumer registration, heartbeat, committed offset, resume position, and leave succeed for affected internal offset partitions.
+
 ## Transaction recovery not ready
 
 Keep transactional producers drained. Capture the oldest active transaction,

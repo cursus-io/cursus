@@ -657,6 +657,9 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshotContext(ctx context.Cont
 	if len(metadata.RecoveryReplicas) > 0 {
 		return fail(fmt.Errorf("replica_recovery_pending brokers=%s", strings.Join(metadata.RecoveryReplicas, ",")))
 	}
+	if recoveryErr := p.RecoveryError(); recoveryErr != nil {
+		return fail(fmt.Errorf("partition recovery pending: %w", recoveryErr))
+	}
 	if p.NextOffset() < metadata.CommittedHWM || p.GetHWM() > metadata.CommittedHWM {
 		return fail(fmt.Errorf("partition is behind authoritative committed HWM: leo=%d hwm=%d committed=%d", p.NextOffset(), p.GetHWM(), metadata.CommittedHWM))
 	}

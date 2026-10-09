@@ -10,6 +10,7 @@
 | Event snapshot catalog | v2 (CRC32C) | legacy snapshot files remain readable beside v2 | Preserve both snapshot files until a clean bootstrap removes the legacy boundary. |
 | Consumer metadata records | 5 | versions 1-4 remain replayable | Upgrade readers before writing offset-reservation records. |
 | Raft FSM snapshot | 10 | version 9 is accepted only for the supported one-way recovery transition | Older formats require a clean bootstrap; never downgrade a volume after writing version 10. |
+| Replica-gap recovery control state | broker lifecycle protocol 6 | An older active broker blocks a new quarantine transition and cannot register while a durable recovery marker exists | Complete the rolling upgrade before relying on automatic gap quarantine and proof-based ISR re-admission. |
 
 Mixed-version rolling upgrades across a format boundary are unsupported. A
 normal restart of the same compatible release is supported; a format-changing
@@ -103,6 +104,13 @@ ISR before continuing. The StatefulSet uses `OnDelete`; changing the image does
 not itself restart Pods. Use the production dashboard and baseline alerts as
 the release gate, and abort the rollout on request admission, disk headroom,
 recovery, or replication safety alerts.
+
+Replica-gap quarantine requires every active broker to advertise lifecycle
+protocol 6. During a mixed-protocol rolling window, do not rely on that recovery
+path: drain affected writes, finish or abort the rollout, and preserve the first
+gap evidence instead of retrying truncation or editing offsets. If a durable
+recovery marker already exists, an older broker is fenced from registration
+until catch-up and prefix-proof admission clear the marker.
 
 ## Rollback And Restore
 

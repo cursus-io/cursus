@@ -39,12 +39,22 @@ Standalone response:
 {"status":"ready","checks":{"consumer_metadata":"ok","storage":"ok","topic_metadata":"ok"}}
 ```
 
-In distributed mode, readiness also requires a resolvable cluster leader and
-successful node-local topic, replica, and transaction-state materialization.
-Cluster-wide partition health does not gate a broker's readiness because one
-bad partition would otherwise make every pod unready at once. `CLUSTER_STATUS`,
-the topology metrics, and replication alerts report under-replication,
-incomplete assignments, inactive replicas, and minimum-ISR failures.
+In distributed mode, readiness also requires a resolvable cluster leader,
+active local broker registration, successful node-local topic, replica, and
+transaction-state materialization, and a topology that can safely admit
+writes. An offline leader, incomplete assignment, unsatisfied effective
+minimum ISR, or active replica-recovery marker makes every broker unready.
+Ordinary under-replication alone does not fail readiness when the leader is
+active, the assignment is complete, and the remaining ISR still satisfies the
+effective minimum. `CLUSTER_STATUS` remains stricter: `healthy=true` requires a
+full active ISR and no pending recovery or materialization.
+
+During replica-gap recovery, `CLUSTER_STATUS` reports
+`recovery_pending_partitions > 0`; the affected partition lists
+`recovery_replicas` and the `replica_recovery_pending` reason. New writes to
+that partition fail closed until bounded catch-up and prefix verification
+re-admit the quarantined replica. Use these fields with `/ready` rather than
+treating process liveness or an otherwise sufficient ISR as recovery success.
 
 ```json
 {

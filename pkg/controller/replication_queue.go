@@ -313,10 +313,54 @@ func (l *partitionReplicationLane) run() {
 func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 	backoff := 25 * time.Millisecond
 	failures := uint64(0)
+	acknowledgedRecoveryPending := false
+	var pendingGapCause error
+	waitForGapDecision := func(cause, pendingErr error) bool {
+		if pendingErr == nil {
+			pendingErr = errors.New("replica gap recovery decision has no authoritative committed HWM")
+		}
+		if task.partitionRef != nil {
+			task.partitionRef.MarkReconciliationPending(pendingErr)
+		}
+		acknowledgedRecoveryPending = true
+		failures++
+		metrics.ReplicationRetries.WithLabelValues(task.topic, string(task.ackMode), "replica_offset_gap_recovery").Inc()
+		if failures == 1 || failures&(failures-1) == 0 {
+			util.Error("acknowledged partition replication awaiting replica gap decision topic=%s partition=%d broker=%s attempt=%d error=%v", task.topic, task.partition, replicaGapBrokerID(cause), failures, pendingErr)
+		}
+		select {
+		case <-time.After(backoff):
+			backoff = min(backoff*2, time.Second)
+			return true
+		case <-l.owner.ctx.Done():
+			completeReplicationTaskPreservingTail(task, errReplicationQueueClosed)
+			return false
+		}
+	}
 	for {
 		if l.owner.ctx.Err() != nil {
-			completeReplicationTask(task, errReplicationQueueClosed)
+			if acknowledgedRecoveryPending {
+				completeReplicationTaskPreservingTail(task, errReplicationQueueClosed)
+			} else {
+				completeReplicationTask(task, errReplicationQueueClosed)
+			}
 			return
+		}
+		if pendingGapCause != nil {
+			recovery, recoveryErr := l.owner.executor.RecoverReplicaGap(task, pendingGapCause)
+			if recovery.hasAuthoritativeHWM {
+				completeReplicationTaskAtHWM(task, recoveryErr, recovery.authoritativeHWM)
+				return
+			}
+			if recoveryErr == nil && !recovery.resolved {
+				pendingGapCause = nil
+				backoff = 25 * time.Millisecond
+				continue
+			}
+			if !waitForGapDecision(pendingGapCause, recoveryErr) {
+				return
+			}
+			continue
 		}
 
 		snapshot, err := l.replicationSnapshot(task)
@@ -363,7 +407,11 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			}
 		}
 		if err == nil {
-			completeReplicationTask(task, nil)
+			if acknowledgedRecoveryPending {
+				completeReplicationTaskAtHWM(task, nil, task.commitHWM)
+			} else {
+				completeReplicationTask(task, nil)
+			}
 			if failures > 0 {
 				util.Info("partition replication recovered topic=%s partition=%d ack_mode=%s attempts=%d", task.topic, task.partition, task.ackMode, failures+1)
 			}
@@ -374,11 +422,22 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			return
 		}
 		if l.owner.ctx.Err() != nil {
-			completeReplicationTask(task, errReplicationQueueClosed)
+			if acknowledgedRecoveryPending {
+				completeReplicationTaskPreservingTail(task, errReplicationQueueClosed)
+			} else {
+				completeReplicationTask(task, errReplicationQueueClosed)
+			}
 			return
 		}
 		if replicaGapError(err) {
 			recovery, recoveryErr := l.owner.executor.RecoverReplicaGap(task, err)
+			if task.ackMode == ackpolicy.Leader && !recovery.hasAuthoritativeHWM && (recovery.resolved || recoveryErr != nil) {
+				pendingGapCause = err
+				if !waitForGapDecision(err, recoveryErr) {
+					return
+				}
+				continue
+			}
 			if recovery.resolved {
 				if recovery.hasAuthoritativeHWM {
 					completeReplicationTaskAtHWM(task, recoveryErr, recovery.authoritativeHWM)
@@ -401,12 +460,20 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 		class := replicationErrorClass(err)
 		if isReplicationFenceError(err) {
 			util.Error("partition replication fenced topic=%s partition=%d ack_mode=%s error_class=%s error=%v", task.topic, task.partition, task.ackMode, class, err)
-			completeReplicationTask(task, err)
+			if acknowledgedRecoveryPending {
+				completeReplicationTaskPreservingTail(task, err)
+			} else {
+				completeReplicationTask(task, err)
+			}
 			return
 		}
 		if !isRetryableReplicationError(err) {
 			util.Error("partition replication failed permanently topic=%s partition=%d ack_mode=%s error_class=%s error=%v", task.topic, task.partition, task.ackMode, class, err)
-			completeReplicationTask(task, err)
+			if acknowledgedRecoveryPending {
+				completeReplicationTaskPreservingTail(task, err)
+			} else {
+				completeReplicationTask(task, err)
+			}
 			return
 		}
 		failures++
@@ -421,7 +488,11 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 		case <-time.After(backoff):
 			backoff = min(backoff*2, time.Second)
 		case <-l.owner.ctx.Done():
-			completeReplicationTask(task, errReplicationQueueClosed)
+			if acknowledgedRecoveryPending {
+				completeReplicationTaskPreservingTail(task, errReplicationQueueClosed)
+			} else {
+				completeReplicationTask(task, errReplicationQueueClosed)
+			}
 			return
 		}
 	}
@@ -488,6 +559,26 @@ func completeReplicationTask(task partitionReplicationTask, err error) {
 
 func completeReplicationTaskAtHWM(task partitionReplicationTask, err error, authoritativeHWM uint64) {
 	completeReplicationTaskWithHWM(task, err, authoritativeHWM, true)
+}
+
+// completeReplicationTaskPreservingTail releases ownership without rolling an
+// already acknowledged append back to the previous local HWM. The recovery
+// marker remains set so readiness and future leader writes stay fail-closed
+// until verified recovery reconciles an authoritative committed HWM.
+func completeReplicationTaskPreservingTail(task partitionReplicationTask, err error) {
+	if task.releaseMutation != nil {
+		task.releaseMutation()
+	}
+	if task.releaseWrite != nil {
+		task.releaseWrite()
+	}
+	if task.result == nil {
+		return
+	}
+	select {
+	case task.result <- err:
+	default:
+	}
 }
 
 func completeReplicationTaskWithHWM(task partitionReplicationTask, err error, authoritativeHWM uint64, hasAuthoritativeHWM bool) {
