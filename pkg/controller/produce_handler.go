@@ -291,8 +291,11 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		if ackSelection.Mode == ackpolicy.All {
 			requiredISR = effectiveMinISR
 		}
-		releaseWrite, releaseMutation, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(topicName, partition, p, requiredISR)
+		releaseWrite, releaseMutation, replicationSnapshot, err := ch.preparePartitionLeaderSnapshotContext(requestCtx, topicName, partition, p, requiredISR)
 		if err != nil {
+			if requestCtx.Err() != nil {
+				return requestTimeoutOutcome(requestCtx, "not_accepted")
+			}
 			return ch.partitionPreparationErrorResponse(err)
 		}
 		ownershipSubmitted := false
@@ -718,8 +721,11 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		if ackSelection.Mode == ackpolicy.All {
 			requiredISR = effectiveMinISR
 		}
-		releaseWrite, releaseMutation, replicationSnapshot, err := ch.preparePartitionLeaderSnapshot(batch.Topic, batch.Partition, p, requiredISR)
+		releaseWrite, releaseMutation, replicationSnapshot, err := ch.preparePartitionLeaderSnapshotContext(requestCtx, batch.Topic, batch.Partition, p, requiredISR)
 		if err != nil {
+			if requestCtx.Err() != nil {
+				return requestTimeoutOutcome(requestCtx, "not_accepted"), nil
+			}
 			return ch.partitionPreparationErrorResponse(err), nil
 		}
 		ownershipSubmitted := false

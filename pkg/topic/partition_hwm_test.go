@@ -362,6 +362,26 @@ func TestPartition_ReconcileCommittedHWMTruncatesUncommittedTail(t *testing.T) {
 	require.Equal(t, "replacement", msgs[1].Payload)
 }
 
+func TestPartition_ReconciliationPendingBlocksWritesUntilSuccessfulRepair(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	t.Cleanup(func() {
+		p.Close()
+		require.NoError(t, dh.Close())
+	})
+
+	p.MarkReconciliationPending(errors.New("storage repair failed"))
+	require.ErrorContains(t, p.RecoveryError(), "committed HWM reconciliation pending")
+	require.ErrorContains(t, p.EnqueueBatchLeader([]types.Message{{Payload: "blocked"}}), "partition recovery incomplete")
+
+	require.NoError(t, p.ReconcileCommittedHWM(0))
+	require.NoError(t, p.RecoveryError())
+	require.NoError(t, p.EnqueueBatchLeader([]types.Message{{Payload: "after-repair"}}))
+}
+
 func TestPartition_TruncateReplicaTailPreservesCommittedHWM(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
