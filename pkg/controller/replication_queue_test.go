@@ -31,6 +31,8 @@ type barrierReplicationExecutor struct {
 	replicateFailures  int
 	committedHWM       uint64
 	commitHook         func()
+	commitErr          error
+	skipLocalCommit    bool
 	replicateCalls     int
 	replicateSnapshots []clusterController.PartitionReplicationSnapshot
 	nonISRCalls        int
@@ -90,20 +92,22 @@ func (e *barrierReplicationExecutor) ReplicateNonISR(partitionReplicationTask, c
 	return nil
 }
 
-func (e *barrierReplicationExecutor) Commit(task partitionReplicationTask) error {
+func (e *barrierReplicationExecutor) Commit(task partitionReplicationTask) (partitionCommitResult, error) {
 	e.mu.Lock()
 	e.committedHWM = task.commitHWM
 	hook := e.commitHook
+	commitErr := e.commitErr
+	skipLocalCommit := e.skipLocalCommit
 	e.mu.Unlock()
-	if task.partitionRef != nil {
+	if task.partitionRef != nil && !skipLocalCommit {
 		if err := task.partitionRef.ApplyReplicaHWM(task.commitHWM); err != nil {
-			return err
+			return partitionCommitResult{accepted: true, hwm: task.commitHWM}, err
 		}
 	}
 	if hook != nil {
 		hook()
 	}
-	return nil
+	return partitionCommitResult{accepted: true, hwm: task.commitHWM}, commitErr
 }
 
 func (e *barrierReplicationExecutor) committed() uint64 {
@@ -696,6 +700,63 @@ func TestCompleteReplicationTaskReportsReconcileFailureAndDropsBlockedResult(t *
 	blockedResult <- errors.New("existing result")
 	completeReplicationTask(partitionReplicationTask{result: blockedResult}, errors.New("discarded result"))
 	require.ErrorContains(t, <-blockedResult, "existing result")
+}
+
+func TestCompleteReplicationTaskReleasesMutationBeforeAuthoritativeReconcile(t *testing.T) {
+	_, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 0, Payload: "committed"}}))
+	require.Zero(t, partition.GetHWM())
+
+	result := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		completeReplicationTaskAtHWM(partitionReplicationTask{
+			partitionRef: partition, releaseMutation: partition.BeginReplicationMutation(), result: result,
+		}, errors.New("post-commit response failed"), 1)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("completion reconciled while still holding the replication mutation lock")
+	}
+	require.ErrorContains(t, <-result, "post-commit response failed")
+	require.Equal(t, uint64(1), partition.NextOffset())
+	require.Equal(t, uint64(1), partition.GetHWM())
+	messages, err := partition.ReadCommitted(0, 1)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+}
+
+func TestPostCommitErrorUsesAuthoritativeTaskHWM(t *testing.T) {
+	_, manager, executor := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 0, Payload: "committed"}}))
+	require.Zero(t, partition.GetHWM())
+
+	executor.commitErr = errors.New("local commit observation timed out")
+	executor.skipLocalCommit = true
+	close(executor.barrier)
+	coordinator := newPartitionReplicationCoordinator(1, executor)
+	t.Cleanup(coordinator.close)
+	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	task := replicationTaskForMode(executor, ackpolicy.All)
+	task.partitionRef = partition
+	task.releaseMutation = partition.BeginReplicationMutation()
+	reservation.submit(task)
+
+	require.ErrorContains(t, <-task.result, "local commit observation timed out")
+	require.Equal(t, uint64(1), partition.NextOffset(), "post-commit cleanup truncated a committed record")
+	require.Equal(t, uint64(1), partition.GetHWM())
+	executor.mu.Lock()
+	require.Equal(t, 1, executor.replicateCalls, "an accepted commit was retried")
+	executor.mu.Unlock()
 }
 
 func TestDistributedIdempotentDuplicateAllUsesFenceBarrierOnly(t *testing.T) {
