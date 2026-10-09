@@ -295,6 +295,34 @@ func TestAwaitRecoveredPartitionReplayScansStableCommitRangeOnce(t *testing.T) {
 	require.Equal(t, int64(3), store.reads.Load())
 }
 
+func TestAwaitRecoveredPartitionReplayWaitsForRaftAuthority(t *testing.T) {
+	store := raft.NewInmemStore()
+	require.NoError(t, store.StoreLog(&raft.Log{
+		Index: 6, Type: raft.LogCommand, Data: []byte("PARTITION_COMMIT:{}"),
+	}))
+	stats := &mutableRaftStats{stats: map[string]string{
+		"state":               raft.Follower.String(),
+		"last_contact":        "never",
+		"last_snapshot_index": "5",
+		"commit_index":        "6",
+		"last_log_index":      "6",
+	}}
+	brokerFSM := &fakeRecoveredPartitionFSM{pending: true, applied: 6}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- awaitRecoveredPartitionReplay(context.Background(), stats, store, brokerFSM, "broker-1", time.Second)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("recovery finalized before Raft authority was known: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	stats.set("last_contact", "1ms")
+	require.NoError(t, <-done)
+	require.True(t, brokerFSM.wasFinalized())
+}
+
 func TestRaftReplicationManagerGetRaftStatus(t *testing.T) {
 	mr := new(MockRaft)
 	mr.On("Stats").Return(map[string]string{

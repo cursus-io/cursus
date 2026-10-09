@@ -149,6 +149,20 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	if err != nil {
 		return nil, fmt.Errorf("failed to open durable raft store: %w", err)
 	}
+	lastLogIndex, err := raftStore.LastIndex()
+	if err != nil {
+		_ = raftStore.Close()
+		return nil, fmt.Errorf("inspect durable raft log: %w", err)
+	}
+	hasLocalTopics := topicManager != nil && len(topicManager.ExportDefinitions()) > 0
+	if lastLogIndex > 0 || hasLocalTopics {
+		// A restart can recover by receiving committed logs from its peers without
+		// first invoking Restore or retaining a local log entry. Existing topic
+		// definitions therefore also prove that local HWM checkpoints need staging.
+		// Do this before NewRaft starts applying commands so an early topic command
+		// cannot treat a later committed local boundary as a regression.
+		brokerFSM.BeginRecoveredPartitionReplay()
+	}
 
 	snapshots, err := raft.NewFileSnapshotStore(dataDir, 3, os.Stderr)
 	if err != nil {
@@ -296,7 +310,7 @@ func awaitRecoveredPartitionReplay(ctx context.Context, r raftStatsReader, logSt
 				}
 			}
 			latestProgress.targetIndex = targetIndex
-			if targetKnown && latestProgress.appliedIndex >= targetIndex {
+			if targetKnown && latestProgress.appliedIndex >= targetIndex && recoveredRaftAuthorityKnown(stats) {
 				latestCommit, parseErr := strconv.ParseUint(r.Stats()["commit_index"], 10, 64)
 				if parseErr == nil && latestCommit == commitIndex {
 					if err := brokerFSM.FinalizeRecoveredPartitions(); err != nil {
@@ -348,6 +362,23 @@ func awaitRecoveredPartitionReplay(ctx context.Context, r raftStatsReader, logSt
 		case <-ticker.C:
 		}
 	}
+}
+
+func recoveredRaftAuthorityKnown(stats map[string]string) bool {
+	state := strings.TrimSpace(stats["state"])
+	if state == "" {
+		// Keep compatibility with narrow test/status implementations. Hashicorp
+		// Raft always publishes state in production.
+		return true
+	}
+	if state == raft.Leader.String() {
+		return true
+	}
+	if state != raft.Follower.String() {
+		return false
+	}
+	lastContact := strings.TrimSpace(stats["last_contact"])
+	return lastContact != "" && !strings.EqualFold(lastContact, "never")
 }
 
 func highestFSMCommandIndex(logStore raft.LogStore, snapshotIndex, commitIndex uint64) (uint64, error) {

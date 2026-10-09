@@ -244,12 +244,15 @@ func (a *ClusterActions) StartBroker(nodeIndex int) {
 	}
 	brokerID := fmt.Sprintf("broker-%d-9000", nodeIndex)
 	if err := eventually(a.ctx.GetT(), fmt.Sprintf("active registration for %s", brokerID), clusterReadyTimeout, func() (bool, string, error) {
+		observers := 0
+		unavailable := make([]string, 0)
 		for _, addr := range a.ctx.GetBrokerAddrs() {
 			client := e2e.NewBrokerClient([]string{addr})
 			response, requestErr := client.SendCommand("", "LIST_CLUSTER", 2*time.Second)
 			client.Close()
 			if requestErr != nil {
-				return false, fmt.Sprintf("%s: LIST_CLUSTER failed", addr), requestErr
+				unavailable = append(unavailable, addr)
+				continue
 			}
 			payload := strings.TrimPrefix(strings.TrimSpace(response), "OK brokers=")
 			var brokers []fsm.BrokerInfo
@@ -266,8 +269,12 @@ func (a *ClusterActions) StartBroker(nodeIndex int) {
 			if !active {
 				return false, fmt.Sprintf("%s does not observe %s active", addr, brokerID), nil
 			}
+			observers++
 		}
-		return true, fmt.Sprintf("%s active on all brokers", brokerID), nil
+		if observers < a.ctx.minInSyncReplicas {
+			return false, fmt.Sprintf("%s active on %d observers; need %d (unavailable=%v)", brokerID, observers, a.ctx.minInSyncReplicas, unavailable), nil
+		}
+		return true, fmt.Sprintf("%s active on %d observers (unavailable=%v)", brokerID, observers, unavailable), nil
 	}); err != nil {
 		a.ctx.GetT().Fatalf("broker %d registration did not converge: %v", nodeIndex, err)
 	}

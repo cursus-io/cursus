@@ -173,6 +173,17 @@ func (f *BrokerFSM) HasPendingPartitionRecovery() bool {
 	return f.partitionRecoveryPending || f.recoveryReplayPending
 }
 
+// BeginRecoveredPartitionReplay protects locally persisted commit boundaries
+// while an existing Raft log is replayed without first installing a snapshot.
+// The replayed PARTITION_COMMIT commands establish the authoritative boundary;
+// FinalizeRecoveredPartitions publishes it after replay reaches the committed
+// log target.
+func (f *BrokerFSM) BeginRecoveredPartitionReplay() {
+	f.mu.Lock()
+	f.recoveryReplayPending = true
+	f.mu.Unlock()
+}
+
 // GetTopicDefinition returns a detached copy of the authoritative replicated
 // topic definition, including when node-local materialization is pending.
 func (f *BrokerFSM) GetTopicDefinition(name string) (topic.Definition, bool) {
