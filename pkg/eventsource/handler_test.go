@@ -21,12 +21,13 @@ import (
 // --- test helpers ---
 
 type fakeStorageHandler struct {
-	mu         sync.Mutex
-	msgs       []types.Message
-	offset     uint64
-	first      uint64
-	readErr    error
-	beforeRead func(uint64)
+	mu          sync.Mutex
+	msgs        []types.Message
+	offset      uint64
+	first       uint64
+	readErr     error
+	beforeRead  func(uint64)
+	beforeFlush func()
 }
 
 func (f *fakeStorageHandler) ReadMessages(off uint64, max int) ([]types.Message, error) {
@@ -47,9 +48,15 @@ func (f *fakeStorageHandler) ReadMessages(off uint64, max int) ([]types.Message,
 	return result, nil
 }
 
-func (f *fakeStorageHandler) GetAbsoluteOffset() uint64      { return f.offset }
-func (f *fakeStorageHandler) GetFirstOffset() uint64         { return f.first }
-func (f *fakeStorageHandler) GetFlushedOffset() uint64       { return f.offset }
+func (f *fakeStorageHandler) GetAbsoluteOffset() uint64 { return f.offset }
+func (f *fakeStorageHandler) GetFirstOffset() uint64    { return f.first }
+func (f *fakeStorageHandler) GetFlushedOffset() uint64 {
+	if beforeFlush := f.beforeFlush; beforeFlush != nil {
+		f.beforeFlush = nil
+		beforeFlush()
+	}
+	return f.offset
+}
 func (f *fakeStorageHandler) GetLatestOffset() uint64        { return f.offset }
 func (f *fakeStorageHandler) GetSegmentPath(_ uint64) string { return "" }
 
@@ -731,15 +738,12 @@ func TestHandler_RecoverIndexUsesCapturedStableTail(t *testing.T) {
 	p, err := h.tm.GetTopic("orders").GetPartition(0)
 	require.NoError(t, err)
 	storage := hp.handlers["orders:0"]
-	var appendOnce sync.Once
-	storage.beforeRead = func(uint64) {
-		appendOnce.Do(func() {
-			require.NoError(t, p.EnqueueBatchLeader([]types.Message{{
-				Topic: "orders", Key: "late-key", Payload: "late", AggregateVersion: 1,
-			}}))
-			p.FlushDisk()
-			require.NoError(t, p.ApplyReplicaHWM(2))
-		})
+	storage.beforeFlush = func() {
+		require.NoError(t, p.EnqueueBatchLeader([]types.Message{{
+			Topic: "orders", Key: "late-key", Payload: "late", AggregateVersion: 1,
+		}}))
+		p.FlushDisk()
+		require.NoError(t, p.ApplyReplicaHWM(2))
 	}
 
 	idx, err := h.getIndex("orders", 0)
@@ -809,4 +813,20 @@ func TestHandler_RecoverIndexRejectsGapBeforeStableTail(t *testing.T) {
 	require.NoError(t, err)
 	err = h.RecoverIndexFromLog("orders", 0, idx)
 	require.ErrorContains(t, err, "recover stream index stopped before stable tail at offset=1 tail=2")
+}
+
+func TestHandler_RecoverIndexReturnsStreamVersionGap(t *testing.T) {
+	h := newTestHandler(t)
+	defer func() { _ = h.Close() }()
+
+	p, err := h.tm.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, p.EnqueueBatchLeader([]types.Message{{
+		Topic: "orders", Key: "gap-key", AggregateVersion: 2,
+	}}))
+	p.FlushDisk()
+	require.NoError(t, p.ApplyReplicaHWM(1))
+
+	_, err = h.getIndex("orders", 0)
+	require.ErrorContains(t, err, "stream index gap key=gap-key current=0 next=2")
 }
