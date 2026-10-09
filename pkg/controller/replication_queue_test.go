@@ -650,6 +650,54 @@ func TestDistributedPublishRejectsMarkerlessHWMMetadata(t *testing.T) {
 	close(executor.barrier)
 }
 
+func TestDistributedPublishReleasesPartitionOwnershipWhenReplicationCoordinatorIsUnavailable(t *testing.T) {
+	handler, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	handler.replication.close()
+	handler.replication = nil
+
+	response := handler.HandleCommand("PUBLISH topic=orders partition=0 acks=1 producerId=p1 message=value", NewClientContext("", 0))
+	require.Equal(t, "ERROR: cluster_metadata_unavailable command=PUBLISH", response)
+	requirePartitionOwnershipAvailable(t, handler, partition)
+
+	data, err := util.EncodeBatchMessages("orders", 0, "1", false, []types.Message{{Payload: "value", ProducerID: "p1"}})
+	require.NoError(t, err)
+	response, err = handler.HandleBatchMessage(data, nil, NewClientContext("", 0))
+	require.NoError(t, err)
+	require.Equal(t, "ERROR: cluster_metadata_unavailable command=BATCH", response)
+	requirePartitionOwnershipAvailable(t, handler, partition)
+	require.Zero(t, partition.NextOffset())
+}
+
+func TestCompleteReplicationTaskReportsReconcileFailureAndDropsBlockedResult(t *testing.T) {
+	_, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, partition.ReconcileSnapshotHWM(0))
+
+	mutationReleased := false
+	writeReleased := false
+	result := make(chan error, 1)
+	completeReplicationTask(partitionReplicationTask{
+		partitionRef:    partition,
+		releaseMutation: func() { mutationReleased = true },
+		releaseWrite:    func() { writeReleased = true },
+		result:          result,
+	}, errors.New("replication failed"))
+	require.ErrorContains(t, <-result, "reconcile failed replication to committed HWM 0")
+	require.True(t, mutationReleased)
+	require.True(t, writeReleased)
+
+	blockedResult := make(chan error, 1)
+	blockedResult <- errors.New("existing result")
+	completeReplicationTask(partitionReplicationTask{result: blockedResult}, errors.New("discarded result"))
+	require.ErrorContains(t, <-blockedResult, "existing result")
+}
+
 func TestDistributedIdempotentDuplicateAllUsesFenceBarrierOnly(t *testing.T) {
 	handler, manager, executor := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
@@ -1156,6 +1204,25 @@ func installPartitionMetadata(t *testing.T, handler *CommandHandler, topicName s
 	metadata := fmt.Sprintf(`{"leader":"broker-1","leader_epoch":7,"lifecycle_epoch":1,"committed_hwm_version":1,"committed_hwm":0,"replicas":["broker-1","broker-2"],"isr":["%s"],"partition_count":1}`, strings.Join(isr, `","`))
 	result := handler.Cluster.RaftManager.GetFSM().Apply(&raft.Log{Data: []byte("PARTITION:" + topicName + "-0:" + metadata)})
 	require.Nil(t, result)
+}
+
+func requirePartitionOwnershipAvailable(t *testing.T, handler *CommandHandler, partition *topic.Partition) {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() {
+		releaseWrite, releaseMutation, _, err := handler.preparePartitionLeaderSnapshot("orders", 0, partition, 0)
+		if err == nil {
+			releaseMutation()
+			releaseWrite()
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("partition ownership was not released")
+	}
 }
 
 func applyPartitionMetadata(t *testing.T, state *fsm.BrokerFSM, topicName string, partition int, metadata fsm.PartitionMetadata) {
