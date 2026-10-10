@@ -640,6 +640,20 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 			}
 			return fmt.Errorf("%w: topic %s has local durable state but no authoritative definition", ErrRecoveredPartitionAuthorityPending, localDefinition.Name)
 		}
+		for partitionID := authoritativeDefinition.Partitions; partitionID < localDefinition.Partitions; partitionID++ {
+			partition, err := localTopic.GetPartition(partitionID)
+			if err != nil {
+				continue
+			}
+			if partition.NextOffset() > 0 || partition.GetHWM() > 0 || partition.SnapshotRecoveryPending() {
+				return fmt.Errorf(
+					"%w: partition %s-%d has local durable state but is outside the authoritative definition",
+					ErrRecoveredPartitionAuthorityPending,
+					localDefinition.Name,
+					partitionID,
+				)
+			}
+		}
 		for partitionID := 0; partitionID < authoritativeDefinition.Partitions; partitionID++ {
 			partition, err := localTopic.GetPartition(partitionID)
 			if err != nil {

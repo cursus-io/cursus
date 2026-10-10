@@ -298,6 +298,41 @@ func TestBrokerFSMLogOnlyReplayWaitsForAuthoritativePartitionState(t *testing.T)
 	require.Equal(t, uint64(1), partition.GetHWM())
 }
 
+func TestBrokerFSMLogOnlyReplayWaitsForDurablePartitionOutsideAuthoritativeDefinition(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 1
+	cfg.DiskMinFreeBytes = 0
+	cfg.DiskMinFreePercent = 0
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	manager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, manager.CreateTopic("partition-count-recovery", 2, false, false))
+	localTopic := manager.GetTopic("partition-count-recovery")
+	require.NotNil(t, localTopic)
+	extraPartition, err := localTopic.GetPartition(1)
+	require.NoError(t, err)
+	extraPartition.SetHWM(0)
+	require.NoError(t, extraPartition.EnqueueBatchLeader([]types.Message{{Payload: "durable-extra-partition"}}))
+	require.NoError(t, extraPartition.ApplyReplicaHWM(1))
+	extraPartition.FlushDisk()
+
+	replayed := NewBrokerFSM(manager, nil)
+	replayed.BeginRecoveredPartitionReplay()
+	authoritativeDefinition := localTopic.Definition()
+	authoritativeDefinition.Partitions = 1
+	replayed.mu.Lock()
+	replayed.topicState[authoritativeDefinition.Name] = &authoritativeDefinition
+	replayed.partitionMetadata[authoritativeDefinition.Name+"-0"] = authoritativePartitionMetadata(1)
+	replayed.mu.Unlock()
+
+	err = replayed.FinalizeRecoveredPartitions()
+	require.ErrorIs(t, err, ErrRecoveredPartitionAuthorityPending)
+	require.ErrorContains(t, err, "outside the authoritative definition")
+	require.True(t, replayed.HasPendingPartitionRecovery())
+}
+
 func TestBrokerFSMRestoreAcceptsCommitAppliedAfterFinalization(t *testing.T) {
 	manager, partition := newDurableFSMTopic(t, "late-commit")
 	require.NoError(t, partition.EnqueueBatchLeader([]types.Message{{Payload: "acknowledged-later"}}))
@@ -411,6 +446,8 @@ func newDurableFSMTopic(t *testing.T, name string) (*topic.TopicManager, *topic.
 	cfg.EnabledDistribution = true
 	cfg.LogDir = t.TempDir()
 	cfg.DiskFlushIntervalMS = 1
+	cfg.DiskMinFreeBytes = 0
+	cfg.DiskMinFreePercent = 0
 	diskManager := disk.NewDiskManager(cfg)
 	t.Cleanup(diskManager.CloseAllHandlers)
 	manager := topic.NewTopicManager(cfg, diskManager, nil)
