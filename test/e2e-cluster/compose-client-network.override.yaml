@@ -1,0 +1,13 @@
+services:
+  broker-1:
+    environment:
+      ADVERTISED_CLIENT_HOST: broker-1
+      ADVERTISED_BROKER_PORT: 9000
+  broker-2:
+    environment:
+      ADVERTISED_CLIENT_HOST: broker-2
+      ADVERTISED_BROKER_PORT: 9000
+  broker-3:
+    environment:
+      ADVERTISED_CLIENT_HOST: broker-3
+      ADVERTISED_BROKER_PORT: 9000

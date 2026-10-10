@@ -5,7 +5,49 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
+
+type transactionDeadlineConn struct {
+	net.Conn
+	deadline time.Time
+}
+
+func (c *transactionDeadlineConn) SetDeadline(deadline time.Time) error {
+	c.deadline = deadline
+	return c.Conn.SetDeadline(deadline)
+}
+
+func TestEndTransactionWaitsForBrokerCommitBudget(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = client.Close() })
+	t.Cleanup(func() { _ = server.Close() })
+	tracked := &transactionDeadlineConn{Conn: client}
+	serverDone := make(chan error, 1)
+	go func() {
+		connection, request, _, err := acceptWireTestRequest(server)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- writeWireTestResponse(connection, request, "OK transactional_id=tx-1 state=committed")
+	}()
+	framed, err := openWireConnection(tracked, 1000, "none")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, err = executeTransactionCommand(framed, "END_TXN transactional_id=tx-1 producerId=p-1 epoch=2 result=commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if budget := tracked.deadline.Sub(started); budget < 29*time.Second || budget > 31*time.Second {
+		t.Fatalf("END_TXN deadline must cover the broker request budget, got %s", budget)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestExecuteTransactionCommandPreservesStructuredBrokerError(t *testing.T) {
 	client, server := net.Pipe()
