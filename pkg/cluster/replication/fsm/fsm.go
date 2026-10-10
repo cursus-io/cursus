@@ -603,6 +603,11 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 			metadata[key] = *value
 		}
 	}
+	topicState := copyTopicState(f.topicState)
+	pendingDeletes := make(map[string]bool)
+	for name, issue := range f.topicMaterialization {
+		pendingDeletes[name] = issue.Operation == TopicMaterializationDelete
+	}
 	tm := f.tm
 	f.mu.RUnlock()
 	if tm == nil {
@@ -611,6 +616,67 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 		f.recoveryReplayPending = false
 		f.mu.Unlock()
 		return nil
+	}
+	for _, localDefinition := range tm.ExportDefinitions() {
+		localTopic := tm.GetTopic(localDefinition.Name)
+		if localTopic == nil {
+			continue
+		}
+		recoveryRelevant := false
+		for partitionID := 0; partitionID < localDefinition.Partitions; partitionID++ {
+			partition, err := localTopic.GetPartition(partitionID)
+			if err == nil && (partition.NextOffset() > 0 || partition.GetHWM() > 0 || partition.SnapshotRecoveryPending()) {
+				recoveryRelevant = true
+				break
+			}
+		}
+		if !recoveryRelevant {
+			continue
+		}
+		authoritativeDefinition := topicState[localDefinition.Name]
+		if authoritativeDefinition == nil {
+			if pendingDeletes[localDefinition.Name] {
+				continue
+			}
+			return fmt.Errorf("%w: topic %s has local durable state but no authoritative definition", ErrRecoveredPartitionAuthorityPending, localDefinition.Name)
+		}
+		for partitionID := authoritativeDefinition.Partitions; partitionID < localDefinition.Partitions; partitionID++ {
+			partition, err := localTopic.GetPartition(partitionID)
+			if err != nil {
+				continue
+			}
+			if partition.NextOffset() > 0 || partition.GetHWM() > 0 || partition.SnapshotRecoveryPending() {
+				return fmt.Errorf(
+					"%w: partition %s-%d has local durable state but is outside the authoritative definition",
+					ErrRecoveredPartitionAuthorityPending,
+					localDefinition.Name,
+					partitionID,
+				)
+			}
+		}
+		for partitionID := 0; partitionID < authoritativeDefinition.Partitions; partitionID++ {
+			partition, err := localTopic.GetPartition(partitionID)
+			if err != nil {
+				continue
+			}
+			key := fmt.Sprintf("%s-%d", localDefinition.Name, partitionID)
+			meta, ok := metadata[key]
+			if !ok {
+				return fmt.Errorf("%w: partition %s has local durable state but no authoritative metadata", ErrRecoveredPartitionAuthorityPending, key)
+			}
+			if !meta.CommittedHWMKnown {
+				return fmt.Errorf("%w: partition %s has no authoritative committed HWM", ErrUnsupportedRecoveryProtocol, key)
+			}
+			if floor := partition.RecoveryCommittedHWMFloor(); meta.CommittedHWM < floor {
+				return fmt.Errorf(
+					"%w: partition %s local committed HWM %d is ahead of replayed HWM %d",
+					ErrRecoveredPartitionAuthorityPending,
+					key,
+					floor,
+					meta.CommittedHWM,
+				)
+			}
+		}
 	}
 	for key, meta := range metadata {
 		if !meta.CommittedHWMKnown {

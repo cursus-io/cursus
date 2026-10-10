@@ -335,12 +335,15 @@ func awaitRecoveredPartitionReplay(ctx context.Context, r raftStatsReader, logSt
 				latestCommit, parseErr := strconv.ParseUint(r.Stats()["commit_index"], 10, 64)
 				if parseErr == nil && latestCommit == commitIndex {
 					if err := brokerFSM.FinalizeRecoveredPartitions(); err != nil {
-						return fmt.Errorf("finalize recovered partitions after Raft replay: %w", err)
+						if !errors.Is(err, fsm.ErrRecoveredPartitionAuthorityPending) {
+							return fmt.Errorf("finalize recovered partitions after Raft replay: %w", err)
+						}
+					} else {
+						if err := brokerFSM.ValidateLocalLeaderLogs(brokerID); err != nil {
+							return err
+						}
+						return nil
 					}
-					if err := brokerFSM.ValidateLocalLeaderLogs(brokerID); err != nil {
-						return err
-					}
-					return nil
 				}
 			}
 		}

@@ -15,7 +15,10 @@ const (
 	CommittedHWMVersionCurrent   = 1
 )
 
-var ErrUnsupportedRecoveryProtocol = errors.New("unsupported recovery protocol")
+var (
+	ErrUnsupportedRecoveryProtocol        = errors.New("unsupported recovery protocol")
+	ErrRecoveredPartitionAuthorityPending = errors.New("recovered partition authority pending")
+)
 
 func decodeStrictJSON(data []byte, target interface{}) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))

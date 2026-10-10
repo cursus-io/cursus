@@ -194,6 +194,7 @@ func (p *Producer) sendWithRetryForBatch(payload []byte, part int, first, last M
 
 		if err := conn.SetWriteDeadline(time.Now().Add(time.Duration(p.config.WriteTimeoutMS) * time.Millisecond)); err != nil {
 			lastErr = fmt.Errorf("set write deadline failed: %w", err)
+			p.client.discardPartitionConnection(part, conn)
 			if attempt == maxAttempts {
 				break
 			}

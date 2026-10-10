@@ -503,28 +503,50 @@ func TestProducerFinalFailureDoesNotReconnect(t *testing.T) {
 			cfg.HandshakeTimeoutMS = 1000
 			client := mustNewProducerClient(cfg)
 			defer func() { _ = client.Close() }()
-			server, conn := net.Pipe()
-			defer func() { _ = server.Close() }()
-			client.conns.Store(&[]net.Conn{conn})
-			p := &Producer{config: cfg, client: client, done: make(chan struct{})}
+			clientRaw, serverRaw := net.Pipe()
+			serverReady := make(chan error, 1)
+			serverDone := make(chan error, 1)
 			go func() {
-				if failure == "write" {
-					_ = server.Close()
+				connection, handshakeErr := wire.ServerHandshake(serverRaw, []wire.Compression{wire.CompressionNone})
+				serverReady <- handshakeErr
+				if handshakeErr != nil {
+					serverDone <- handshakeErr
 					return
 				}
-				if _, err := ReadWithLength(server); err != nil {
+				defer func() { _ = serverRaw.Close() }()
+				if failure == "write" {
+					serverDone <- nil
+					return
+				}
+				request, readErr := connection.ReadFrame()
+				if readErr != nil {
+					serverDone <- readErr
 					return
 				}
 				if failure == "parse" {
-					_ = WriteWithLength(server, []byte("invalid ack"))
+					serverDone <- writeWireTestResponse(connection, request, "invalid ack")
+					return
 				}
-				_ = server.Close()
+				serverDone <- nil
 			}()
+			conn, err := wire.NewClientConn(clientRaw, "none")
+			require.NoError(t, err)
+			require.NoError(t, <-serverReady)
+			if failure == "write" {
+				require.NoError(t, <-serverDone)
+			}
+			client.conns.Store(&[]net.Conn{conn})
+			p := &Producer{config: cfg, client: client, done: make(chan struct{})}
+			payload, err := EncodeBatchMessages(cfg.Topic, 0, cfg.Acks, false, []Message{{Payload: "batch"}})
+			require.NoError(t, err)
 			started := time.Now()
-			_, err = p.sendWithRetryForBatch([]byte("batch"), 0, Message{}, Message{})
+			_, err = p.sendWithRetryForBatch(payload, 0, Message{}, Message{})
 			require.Error(t, err)
+			if failure != "write" {
+				require.NoError(t, <-serverDone)
+			}
 			require.Less(t, time.Since(started), 500*time.Millisecond)
-			require.Nil(t, client.GetConn(0))
+			require.Nil(t, client.GetConn(0), "terminal %s failure left its connection installed: %v", failure, err)
 			require.NoError(t, listener.(*net.TCPListener).SetDeadline(time.Now().Add(20*time.Millisecond)))
 			unexpected, acceptErr := listener.Accept()
 			if unexpected != nil {
