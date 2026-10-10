@@ -64,10 +64,10 @@ func (e replicaGapTestError) ReplicationErrorClass() string { return "availabili
 func (e replicaGapTestError) ReplicationErrorCode() string  { return "replica_offset_gap" }
 func (e replicaGapTestError) ReplicaBrokerID() string       { return e.brokerID }
 
-type replicaTransactionStateLagTestError struct{}
+type replicaTransactionStateLagTestError struct{ retryable bool }
 
 func (replicaTransactionStateLagTestError) Error() string                 { return "transaction_record_not_staged" }
-func (replicaTransactionStateLagTestError) Retryable() bool               { return false }
+func (e replicaTransactionStateLagTestError) Retryable() bool             { return e.retryable }
 func (replicaTransactionStateLagTestError) ReplicationErrorClass() string { return "conflict" }
 func (replicaTransactionStateLagTestError) ReplicationErrorCode() string {
 	return "transaction_record_not_staged"
@@ -689,25 +689,29 @@ func TestReplicaTransactionStateLagDoesNotRetryUnrelatedMessages(t *testing.T) {
 }
 
 func TestAllAcknowledgementBoundsReplicaTransactionStateLag(t *testing.T) {
-	executor := newBarrierReplicationExecutor()
-	executor.replicateErr = replicaTransactionStateLagTestError{}
-	executor.replicateFailures = -1
-	close(executor.barrier)
-	coordinator := newPartitionReplicationCoordinator(1, executor)
-	t.Cleanup(coordinator.close)
+	for _, retryable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retryable=%t", retryable), func(t *testing.T) {
+			executor := newBarrierReplicationExecutor()
+			executor.replicateErr = replicaTransactionStateLagTestError{retryable: retryable}
+			executor.replicateFailures = -1
+			close(executor.barrier)
+			coordinator := newPartitionReplicationCoordinator(1, executor)
+			t.Cleanup(coordinator.close)
 
-	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
-	require.NoError(t, err)
-	task := replicationTaskForMode(executor, ackpolicy.All)
-	task.command.Messages = []types.Message{{TransactionalID: "txn-1"}}
-	reservation.submit(task)
-	select {
-	case err := <-task.result:
-		require.ErrorContains(t, err, "transaction_record_not_staged")
-	case <-time.After(DefaultFSMApplyTimeout + 3*time.Second):
-		t.Fatal("replica transaction state lag did not fail within the bounded retry window")
+			reservation, err := coordinator.reserve(context.Background(), "orders", 0)
+			require.NoError(t, err)
+			task := replicationTaskForMode(executor, ackpolicy.All)
+			task.command.Messages = []types.Message{{TransactionalID: "txn-1"}}
+			reservation.submit(task)
+			select {
+			case err := <-task.result:
+				require.ErrorContains(t, err, "transaction_record_not_staged")
+			case <-time.After(DefaultFSMApplyTimeout + 3*time.Second):
+				t.Fatal("replica transaction state lag did not fail within the bounded retry window")
+			}
+			require.Zero(t, executor.committed(), "failed transaction record must not commit")
+		})
 	}
-	require.Zero(t, executor.committed(), "failed transaction record must not commit")
 }
 
 func TestReplicationQueueAppliesBoundedBackpressure(t *testing.T) {

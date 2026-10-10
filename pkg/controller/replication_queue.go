@@ -469,7 +469,8 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			return
 		}
 		retryTransactionStateLag := false
-		if replicaTransactionStateLag(task, err) {
+		transactionStateLag := replicaTransactionStateLag(task, err)
+		if transactionStateLag {
 			if transactionStateLagSince.IsZero() {
 				transactionStateLagSince = time.Now()
 			}
@@ -478,7 +479,7 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 				class = "transaction_state_lag"
 			}
 		}
-		if !retryTransactionStateLag && !isRetryableReplicationError(err) {
+		if !retryTransactionStateLag && (transactionStateLag || !isRetryableReplicationError(err)) {
 			util.Error("partition replication failed permanently topic=%s partition=%d ack_mode=%s error_class=%s error=%v", task.topic, task.partition, task.ackMode, class, err)
 			if acknowledgedRecoveryPending {
 				completeReplicationTaskPreservingTail(task, err)
