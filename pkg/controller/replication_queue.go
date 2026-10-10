@@ -313,6 +313,7 @@ func (l *partitionReplicationLane) run() {
 func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 	backoff := 25 * time.Millisecond
 	failures := uint64(0)
+	var transactionStateLagSince time.Time
 	acknowledgedRecoveryPending := false
 	var pendingGapCause error
 	waitForGapDecision := func(cause, pendingErr error) bool {
@@ -467,7 +468,17 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			}
 			return
 		}
-		if !isRetryableReplicationError(err) {
+		retryTransactionStateLag := false
+		if replicaTransactionStateLag(task, err) {
+			if transactionStateLagSince.IsZero() {
+				transactionStateLagSince = time.Now()
+			}
+			retryTransactionStateLag = time.Since(transactionStateLagSince) < DefaultFSMApplyTimeout
+			if retryTransactionStateLag {
+				class = "transaction_state_lag"
+			}
+		}
+		if !retryTransactionStateLag && !isRetryableReplicationError(err) {
 			util.Error("partition replication failed permanently topic=%s partition=%d ack_mode=%s error_class=%s error=%v", task.topic, task.partition, task.ackMode, class, err)
 			if acknowledgedRecoveryPending {
 				completeReplicationTaskPreservingTail(task, err)
@@ -496,6 +507,29 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			return
 		}
 	}
+}
+
+// A committed TXN_SYNC may reach the partition leader before another ISR
+// replica has applied it. Only that replica's staged-record response is a
+// transient replication error, and the lane retries it for a bounded window.
+func replicaTransactionStateLag(task partitionReplicationTask, err error) bool {
+	var replicaErr interface {
+		ReplicationErrorCode() string
+		ReplicaBrokerID() string
+	}
+	if !errors.As(err, &replicaErr) || replicaErr.ReplicationErrorCode() != "transaction_record_not_staged" || replicaErr.ReplicaBrokerID() == "" || len(task.command.Messages) == 0 {
+		return false
+	}
+	transactionalID := task.command.Messages[0].TransactionalID
+	if transactionalID == "" {
+		return false
+	}
+	for _, message := range task.command.Messages[1:] {
+		if message.TransactionalID != transactionalID {
+			return false
+		}
+	}
+	return true
 }
 
 func replicaGapError(err error) bool {
