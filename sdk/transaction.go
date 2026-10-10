@@ -12,7 +12,10 @@ import (
 	"github.com/cursus-io/cursus/pkg/wire"
 )
 
-const transactionCommandTimeout = 10 * time.Second
+const (
+	transactionCommandTimeout    = 10 * time.Second
+	transactionEndCommandTimeout = 30 * time.Second
+)
 
 type ProducerSession struct {
 	TransactionalID string
@@ -412,7 +415,15 @@ func executeTransactionCommand(conn net.Conn, cmd string) (string, error) {
 	if conn == nil {
 		return "", fmt.Errorf("transaction command connection is nil")
 	}
-	if err := conn.SetDeadline(time.Now().Add(transactionCommandTimeout)); err != nil {
+	timeout := transactionCommandTimeout
+	if strings.HasPrefix(cmd, "END_TXN ") {
+		// END_TXN can synchronously replicate records and materialize offsets
+		// across several partitions. The broker's default request budget is 30s;
+		// a shorter client deadline reports an ambiguous failure while the
+		// transaction is still committing.
+		timeout = transactionEndCommandTimeout
+	}
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return "", fmt.Errorf("set transaction command deadline: %w", err)
 	}
 	if err := WriteWithLength(conn, []byte(cmd)); err != nil {
