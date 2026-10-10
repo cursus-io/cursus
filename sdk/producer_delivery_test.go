@@ -507,24 +507,24 @@ func TestProducerFinalFailureDoesNotReconnect(t *testing.T) {
 			defer func() { _ = server.Close() }()
 			client.conns.Store(&[]net.Conn{conn})
 			p := &Producer{config: cfg, client: client, done: make(chan struct{})}
-			go func() {
-				if failure == "write" {
+			if failure == "write" {
+				require.NoError(t, server.Close())
+			} else {
+				go func() {
+					if _, err := ReadWithLength(server); err != nil {
+						return
+					}
+					if failure == "parse" {
+						_ = WriteWithLength(server, []byte("invalid ack"))
+					}
 					_ = server.Close()
-					return
-				}
-				if _, err := ReadWithLength(server); err != nil {
-					return
-				}
-				if failure == "parse" {
-					_ = WriteWithLength(server, []byte("invalid ack"))
-				}
-				_ = server.Close()
-			}()
+				}()
+			}
 			started := time.Now()
 			_, err = p.sendWithRetryForBatch([]byte("batch"), 0, Message{}, Message{})
 			require.Error(t, err)
 			require.Less(t, time.Since(started), 500*time.Millisecond)
-			require.Nil(t, client.GetConn(0))
+			require.Nil(t, client.GetConn(0), "terminal %s failure left its connection installed: %v", failure, err)
 			require.NoError(t, listener.(*net.TCPListener).SetDeadline(time.Now().Add(20*time.Millisecond)))
 			unexpected, acceptErr := listener.Accept()
 			if unexpected != nil {
