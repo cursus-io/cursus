@@ -6,4 +6,6 @@ import "github.com/cursus-io/cursus/pkg/types"
 
 func injectedReplicaAppendSkip(string, int, []types.Message) bool { return false }
 
+func injectedReplicaAppendFailure(string, int, []types.Message) bool { return false }
+
 func injectedReplicaCatchupError(string) error { return nil }

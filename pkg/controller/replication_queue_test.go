@@ -37,15 +37,15 @@ type barrierReplicationExecutor struct {
 	replicateSnapshots []clusterController.PartitionReplicationSnapshot
 	nonISRCalls        int
 	nonISRBarrier      chan struct{}
-	recoverGap         func(partitionReplicationTask, error) (replicaGapRecoveryResult, error)
+	recoverReplica     func(partitionReplicationTask, error) (replicaRecoveryResult, error)
 	state              *fsm.BrokerFSM
 }
 
-func (e *barrierReplicationExecutor) RecoverReplicaGap(task partitionReplicationTask, cause error) (replicaGapRecoveryResult, error) {
-	if e.recoverGap != nil {
-		return e.recoverGap(task, cause)
+func (e *barrierReplicationExecutor) RecoverReplicaDivergence(task partitionReplicationTask, cause error) (replicaRecoveryResult, error) {
+	if e.recoverReplica != nil {
+		return e.recoverReplica(task, cause)
 	}
-	return replicaGapRecoveryResult{}, cause
+	return replicaRecoveryResult{}, cause
 }
 
 type permanentReplicationError struct{}
@@ -63,6 +63,12 @@ func (e replicaGapTestError) Retryable() bool               { return true }
 func (e replicaGapTestError) ReplicationErrorClass() string { return "availability" }
 func (e replicaGapTestError) ReplicationErrorCode() string  { return "replica_offset_gap" }
 func (e replicaGapTestError) ReplicaBrokerID() string       { return e.brokerID }
+
+type replicaConflictTestError struct{ replicaGapTestError }
+
+func (replicaConflictTestError) Error() string                { return "replica_offset_conflict" }
+func (replicaConflictTestError) ReplicationErrorCode() string { return "replica_offset_conflict" }
+func (replicaConflictTestError) Retryable() bool              { return false }
 
 type replicaTransactionStateLagTestError struct{ retryable bool }
 
@@ -353,13 +359,13 @@ func TestReplicaOffsetGapQuarantinesOnceAndContinuesWithReducedISR(t *testing.T)
 	executor := newBarrierReplicationExecutor()
 	executor.replicateErr = replicaGapTestError{brokerID: "broker-2"}
 	executor.replicateFailures = 1
-	executor.recoverGap = func(_ partitionReplicationTask, cause error) (replicaGapRecoveryResult, error) {
-		require.True(t, replicaGapError(cause))
+	executor.recoverReplica = func(_ partitionReplicationTask, cause error) (replicaRecoveryResult, error) {
+		require.True(t, replicaDivergenceError(cause))
 		executor.mu.Lock()
 		executor.snapshot.ISR = []string{"broker-1", "broker-3"}
 		executor.snapshot.RecoveryReplicas = []string{"broker-2"}
 		executor.mu.Unlock()
-		return replicaGapRecoveryResult{}, nil
+		return replicaRecoveryResult{}, nil
 	}
 	close(executor.barrier)
 	coordinator := newPartitionReplicationCoordinator(1, executor)
@@ -378,6 +384,123 @@ func TestReplicaOffsetGapQuarantinesOnceAndContinuesWithReducedISR(t *testing.T)
 	require.Equal(t, uint64(1), executor.committed())
 }
 
+func TestReplicaOffsetConflictQuarantinesBeforeRetry(t *testing.T) {
+	executor := newBarrierReplicationExecutor()
+	executor.replicateErr = replicaConflictTestError{replicaGapTestError{brokerID: "broker-2"}}
+	executor.replicateFailures = 1
+	recoveries := 0
+	recoveryPending := errors.New("replica conflict recovery pending")
+	executor.recoverReplica = func(_ partitionReplicationTask, cause error) (replicaRecoveryResult, error) {
+		recoveries++
+		executor.mu.Lock()
+		executor.snapshot.ISR = []string{"broker-1", "broker-3"}
+		executor.snapshot.RecoveryReplicas = []string{"broker-2"}
+		executor.mu.Unlock()
+		return replicaRecoveryResult{resolved: true}, recoveryPending
+	}
+	close(executor.barrier)
+	coordinator := newPartitionReplicationCoordinator(1, executor)
+	t.Cleanup(coordinator.close)
+	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	task := replicationTaskForMode(executor, ackpolicy.All)
+	reservation.submit(task)
+
+	require.ErrorIs(t, <-task.result, recoveryPending)
+	require.Equal(t, 1, recoveries)
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	require.Equal(t, 1, executor.replicateCalls)
+	require.Zero(t, executor.committedHWM)
+}
+
+func TestConflictRecoveryCannotCommitOverDivergentTailWithSufficientISR(t *testing.T) {
+	handler, manager, _ := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2", "broker-3"})
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	snapshot, err := handler.Cluster.GetPartitionReplicationSnapshot("orders", 0)
+	require.NoError(t, err)
+	result, err := (clusterPartitionReplicationExecutor{handler: handler}).RecoverReplicaDivergence(
+		partitionReplicationTask{topic: "orders", partition: 0, commitHWM: 1, ackMode: ackpolicy.All, requiredISR: 2, snapshot: snapshot, partitionRef: partition},
+		replicaConflictTestError{replicaGapTestError{brokerID: "broker-2"}},
+	)
+	require.ErrorContains(t, err, "retry after catch-up")
+	require.True(t, result.resolved)
+	metadata := handler.Cluster.RaftManager.GetFSM().GetPartitionMetadata("orders-0")
+	require.Equal(t, []string{"broker-1", "broker-3"}, metadata.ISR)
+	require.Equal(t, []string{"broker-2"}, metadata.RecoveryReplicas)
+	require.Zero(t, metadata.CommittedHWM)
+}
+
+func TestAcknowledgedConflictWaitsForCatchupAndPreservesTailOnShutdown(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shutdown=%t", shutdown), func(t *testing.T) {
+			_, manager, _ := newDistributedAckTestHandler(t, 2)
+			require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+			partition, err := manager.GetTopic("orders").GetPartition(0)
+			require.NoError(t, err)
+			require.NoError(t, partition.ReplicaAppend([]types.Message{{Offset: 0, Payload: "acknowledged"}}))
+			executor := newBarrierReplicationExecutor()
+			executor.replicateErr = replicaConflictTestError{replicaGapTestError{brokerID: "broker-2"}}
+			executor.replicateFailures = 1
+			quarantined := make(chan struct{})
+			executor.recoverReplica = func(partitionReplicationTask, error) (replicaRecoveryResult, error) {
+				executor.mu.Lock()
+				executor.snapshot.ISR = []string{"broker-1"}
+				executor.snapshot.RecoveryReplicas = []string{"broker-2"}
+				executor.mu.Unlock()
+				close(quarantined)
+				return replicaRecoveryResult{waitForReplica: "broker-2"}, nil
+			}
+			close(executor.barrier)
+			coordinator := newPartitionReplicationCoordinator(1, executor)
+			t.Cleanup(coordinator.close)
+			reservation, err := coordinator.reserve(context.Background(), "orders", 0)
+			require.NoError(t, err)
+			task := replicationTaskForMode(executor, ackpolicy.Leader)
+			task.partitionRef = partition
+			task.releaseMutation = partition.BeginReplicationMutation()
+			released := make(chan struct{})
+			task.releaseWrite = func() { close(released) }
+			reservation.submit(task)
+			select {
+			case <-quarantined:
+			case <-time.After(time.Second):
+				t.Fatal("conflict was not quarantined")
+			}
+			select {
+			case <-task.result:
+				t.Fatal("acknowledged write completed before catch-up")
+			case <-time.After(75 * time.Millisecond):
+			}
+			require.Zero(t, partition.GetHWM())
+			require.Equal(t, uint64(1), partition.NextOffset())
+			select {
+			case <-released:
+				t.Fatal("write ownership released before catch-up")
+			default:
+			}
+			if shutdown {
+				coordinator.close()
+				require.ErrorIs(t, <-task.result, errReplicationQueueClosed)
+				require.Zero(t, partition.GetHWM())
+				require.Equal(t, uint64(1), partition.NextOffset())
+				require.ErrorContains(t, partition.RecoveryError(), "awaiting conflicting replica")
+			} else {
+				executor.mu.Lock()
+				executor.snapshot.ISR = []string{"broker-1", "broker-2"}
+				executor.snapshot.RecoveryReplicas = nil
+				executor.mu.Unlock()
+				require.NoError(t, <-task.result)
+				require.Equal(t, uint64(1), partition.GetHWM())
+				require.NoError(t, partition.RecoveryError())
+			}
+		})
+	}
+}
+
 func TestLeaderAcknowledgedGapDecisionFailurePreservesTailAndRetries(t *testing.T) {
 	_, manager, _ := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
@@ -391,11 +514,11 @@ func TestLeaderAcknowledgedGapDecisionFailurePreservesTailAndRetries(t *testing.
 	secondRecoveryStarted := make(chan struct{})
 	allowRecovery := make(chan struct{})
 	recoveryCalls := 0
-	executor.recoverGap = func(_ partitionReplicationTask, cause error) (replicaGapRecoveryResult, error) {
-		require.True(t, replicaGapError(cause))
+	executor.recoverReplica = func(_ partitionReplicationTask, cause error) (replicaRecoveryResult, error) {
+		require.True(t, replicaDivergenceError(cause))
 		recoveryCalls++
 		if recoveryCalls == 1 {
-			return replicaGapRecoveryResult{resolved: true}, errors.New("quarantine decision unavailable")
+			return replicaRecoveryResult{resolved: true}, errors.New("quarantine decision unavailable")
 		}
 		close(secondRecoveryStarted)
 		<-allowRecovery
@@ -403,7 +526,7 @@ func TestLeaderAcknowledgedGapDecisionFailurePreservesTailAndRetries(t *testing.
 		executor.snapshot.ISR = []string{"broker-1", "broker-3"}
 		executor.snapshot.RecoveryReplicas = []string{"broker-2"}
 		executor.mu.Unlock()
-		return replicaGapRecoveryResult{}, nil
+		return replicaRecoveryResult{}, nil
 	}
 	close(executor.barrier)
 	coordinator := newPartitionReplicationCoordinator(1, executor)
@@ -446,7 +569,7 @@ func TestLeaderAcknowledgedGapDecisionFailurePreservesTailAndRetries(t *testing.
 	}
 }
 
-func TestRecoverReplicaGapDefersAuthoritativeReconcileUntilMutationRelease(t *testing.T) {
+func TestRecoverReplicaDivergenceDefersAuthoritativeReconcileUntilMutationRelease(t *testing.T) {
 	handler, manager, _ := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
 	partition, err := manager.GetTopic("orders").GetPartition(0)
@@ -463,12 +586,12 @@ func TestRecoverReplicaGapDefersAuthoritativeReconcileUntilMutationRelease(t *te
 	t.Cleanup(releaseMutation)
 
 	type recoveryResponse struct {
-		result replicaGapRecoveryResult
+		result replicaRecoveryResult
 		err    error
 	}
 	done := make(chan recoveryResponse, 1)
 	go func() {
-		result, recoverErr := (clusterPartitionReplicationExecutor{handler: handler}).RecoverReplicaGap(
+		result, recoverErr := (clusterPartitionReplicationExecutor{handler: handler}).RecoverReplicaDivergence(
 			partitionReplicationTask{
 				topic: "orders", partition: 0, commitHWM: 1, ackMode: ackpolicy.All, requiredISR: 2,
 				snapshot: snapshot, partitionRef: partition,

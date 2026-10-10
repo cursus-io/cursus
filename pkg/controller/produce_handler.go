@@ -584,7 +584,13 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 			if errors.Is(err, topic.ErrReplicaOffsetGap) {
 				return fmt.Sprintf("ERROR: replica_offset_gap reason=%q", err.Error())
 			}
+			if errors.Is(err, topic.ErrReplicaOffsetConflict) {
+				return fmt.Sprintf("ERROR: replica_offset_conflict reason=%q", err.Error())
+			}
 			return fmt.Sprintf("ERROR: replica_append_failed reason=%q", err.Error())
+		}
+		if injectedReplicaAppendFailure(msgCmd.Topic, msgCmd.Partition, msgCmd.Messages) {
+			return "ERROR: replica_index_failed reason=\"injected failure after durable replica append\""
 		}
 	}
 	if msgCmd.CommitHWM != nil {

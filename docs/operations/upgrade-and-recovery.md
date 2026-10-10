@@ -112,6 +112,48 @@ gap evidence instead of retrying truncation or editing offsets. If a durable
 recovery marker already exists, an older broker is fenced from registration
 until catch-up and prefix-proof admission clear the marker.
 
+## Replica Offset Conflicts
+
+A follower can retain an uncommitted record after a replication attempt fails
+and the leader reconciles its local tail to the authoritative committed HWM.
+A different append at that offset, in the same leader epoch, then returns
+`replica_offset_conflict`. Previously this was reported as the terminal
+`replica_append_failed`, leaving the divergent follower in ISR without starting
+catch-up. Storage read errors remain distinct from confirmed record conflicts.
+
+The partition leader now quarantines the conflicting follower through the
+existing fenced Raft transition. An `acks=all` attempt fails without advancing
+the committed HWM, even when the remaining ISR satisfies minISR. A write
+already acknowledged with `acks=1` keeps its tail and write ownership while
+waiting for catch-up. The existing recovery marker fences new writes and keeps
+readiness closed until catch-up and prefix-proof admission complete. The
+follower removes only its uncommitted tail at the authoritative boundary;
+consumer offsets are not reset or skipped. This adds no storage format change.
+
+After a conflict, check `CLUSTER_STATUS` for the affected partition's
+`recovery_pending`, `recovery_replicas`, ISR, and `committed_hwm`. Look for
+`partition replica quarantined after offset conflict` and the
+`replica_offset_conflict` retry label. Recovery is complete only after the
+marker clears, the expected ISR returns, readiness succeeds, and a subsequent
+write/consume advances normally. A persistent committed-prefix mismatch must
+remain unavailable; do not delete records or force an offset reset to clear it.
+
+The dedicated fault image can reproduce a follower failing after a durable
+append, followed by a conflicting append in the same epoch:
+
+```sh
+RUN_E2E_CHAOS=1 go test -v -count=1 -timeout=20m ./test/e2e-cluster \
+  -run '^TestReplicaConflictRecoveryAfterPartialAppend$'
+```
+
+This runs both `acks=all` and `acks=1` with an isolated three-broker Docker
+fixture and verifies quarantine,
+closed readiness while catch-up is paused, follower restart, committed-prefix
+preservation, resumed writes, and consumer membership/offset stability for more
+than twice the fixture's session timeout. It models the durable-tail failure
+state; it does not establish the cause of an earlier network or transaction
+timeout in a particular deployment.
+
 ## Rollback And Restore
 
 If the candidate cannot read or safely operate on the persisted format, stop

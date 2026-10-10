@@ -24,6 +24,8 @@ import (
 
 var ErrReplicaOffsetGap = errors.New("replica offset gap")
 
+var ErrReplicaOffsetConflict = errors.New("replica offset conflict")
+
 // producerEntry tracks the last producer epoch, sequence number, and activity time for a producer.
 type producerEntry struct {
 	lastEpoch int64
@@ -761,14 +763,19 @@ func (p *Partition) ReplicaAppendWithMode(msgs []types.Message, forceIdempotent 
 		switch {
 		case msgs[i].Offset < initialLEO:
 			existing, err := p.dh.ReadMessages(msgs[i].Offset, 1)
-			if err != nil || len(existing) != 1 || !sameReplicatedMessage(existing[0], msgs[i]) {
-				return fmt.Errorf("replica offset conflict at offset %d", msgs[i].Offset)
+			if err != nil {
+				return fmt.Errorf("read replica offset %d: %w", msgs[i].Offset, err)
+			}
+			if len(existing) != 1 || !sameReplicatedMessage(existing[0], msgs[i]) {
+				return fmt.Errorf("%w at offset %d", ErrReplicaOffsetConflict, msgs[i].Offset)
 			}
 			continue
 		case msgs[i].Offset < nextOffset:
 			existing, ok := stagedByOffset[msgs[i].Offset]
 			if !ok || !sameReplicatedMessage(existing, msgs[i]) {
-				return fmt.Errorf("replica offset conflict at offset %d", msgs[i].Offset)
+				// An inconsistent request batch is not evidence of a divergent
+				// durable replica. Do not trigger replica quarantine for it.
+				return fmt.Errorf("conflicting replica batch records at offset %d", msgs[i].Offset)
 			}
 			continue
 		case msgs[i].Offset > nextOffset:

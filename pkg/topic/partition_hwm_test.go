@@ -287,11 +287,52 @@ func TestPartition_ReplicaAppendRetryIsIdempotentAndRejectsConflictOrGap(t *test
 	dh.AssertNumberOfCalls(t, "WriteBatch", 1)
 
 	dh.On("ReadMessages", uint64(0), 1).Return([]types.Message{{Offset: 0, Payload: "different"}}, nil).Once()
-	require.ErrorContains(t, p.ReplicaAppend([]types.Message{msg}), "offset conflict")
+	require.ErrorIs(t, p.ReplicaAppend([]types.Message{msg}), ErrReplicaOffsetConflict)
 	gapErr := p.ReplicaAppend([]types.Message{{Offset: 2, Payload: "gap"}})
 	require.ErrorIs(t, gapErr, ErrReplicaOffsetGap)
 	require.ErrorContains(t, gapErr, "offset gap")
 	dh.AssertExpectations(t)
+}
+
+func TestPartition_ReplicaConflictRequiresDurableEvidence(t *testing.T) {
+	readErr := errors.New("disk read failed")
+	for _, tc := range []struct {
+		name     string
+		existing []types.Message
+		readErr  error
+		conflict bool
+	}{
+		{name: "missing stored offset", conflict: true},
+		{name: "different stored record", existing: []types.Message{{Offset: 0, Payload: "old"}}, conflict: true},
+		{name: "read failure", readErr: readErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dh := new(MockStorageHandler)
+			dh.On("GetLatestOffset").Return(uint64(1)).Once()
+			dh.On("ReadMessages", uint64(0), 1).Return(tc.existing, tc.readErr).Once()
+			p := NewPartition(0, "orders", dh, nil, config.DefaultConfig())
+			err := p.ReplicaAppend([]types.Message{{Offset: 0, Payload: "new"}})
+			require.Error(t, err)
+			require.Equal(t, tc.conflict, errors.Is(err, ErrReplicaOffsetConflict))
+			if tc.readErr != nil {
+				require.ErrorIs(t, err, readErr)
+			}
+			require.Equal(t, uint64(1), p.NextOffset())
+			dh.AssertNotCalled(t, "WriteBatch", mock.Anything)
+			dh.AssertExpectations(t)
+		})
+	}
+
+	t.Run("inconsistent request does not quarantine replica", func(t *testing.T) {
+		dh := new(MockStorageHandler)
+		dh.On("GetLatestOffset").Return(uint64(0)).Once()
+		p := NewPartition(0, "orders", dh, nil, config.DefaultConfig())
+		err := p.ReplicaAppend([]types.Message{{Offset: 0, Payload: "a"}, {Offset: 0, Payload: "b"}})
+		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrReplicaOffsetConflict)
+		require.Zero(t, p.NextOffset())
+		dh.AssertNotCalled(t, "WriteBatch", mock.Anything)
+	})
 }
 
 func TestPartition_ReplicaAppendPreservesRequestIdempotenceForPromotion(t *testing.T) {

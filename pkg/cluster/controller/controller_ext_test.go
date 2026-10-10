@@ -127,6 +127,17 @@ func TestReplicaResponsePreservesWireRetryClassification(t *testing.T) {
 	require.ErrorAs(t, lagging, &laggingClassification)
 	require.True(t, laggingClassification.Retryable())
 
+	conflict := classifiedReplicaResponseError("node2", `ERROR: replica_offset_conflict reason="replica offset conflict at offset 95"`)
+	var divergence interface {
+		Retryable() bool
+		ReplicationErrorCode() string
+		ReplicaBrokerID() string
+	}
+	require.ErrorAs(t, conflict, &divergence)
+	require.True(t, divergence.Retryable())
+	require.Equal(t, "replica_offset_conflict", divergence.ReplicationErrorCode())
+	require.Equal(t, "node2", divergence.ReplicaBrokerID())
+
 	terminal := classifiedReplicaResponseError("node2", "ERROR: STALE_LEADER_EPOCH current=8")
 	var terminalClassification interface{ Retryable() bool }
 	require.ErrorAs(t, terminal, &terminalClassification)
