@@ -50,10 +50,11 @@ func (s *mutableRaftStats) set(key, value string) {
 }
 
 type fakeRecoveredPartitionFSM struct {
-	mu        sync.RWMutex
-	applied   uint64
-	pending   bool
-	finalized bool
+	mu          sync.RWMutex
+	applied     uint64
+	pending     bool
+	finalized   bool
+	finalizeErr error
 }
 
 func (f *fakeRecoveredPartitionFSM) AppliedIndex() uint64 {
@@ -71,6 +72,9 @@ func (f *fakeRecoveredPartitionFSM) HasPendingPartitionRecovery() bool {
 func (f *fakeRecoveredPartitionFSM) FinalizeRecoveredPartitions() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.finalizeErr != nil {
+		return f.finalizeErr
+	}
 	f.finalized = true
 	f.pending = false
 	return nil
@@ -82,6 +86,12 @@ func (f *fakeRecoveredPartitionFSM) setApplied(index uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.applied = index
+}
+
+func (f *fakeRecoveredPartitionFSM) setFinalizeError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.finalizeErr = err
 }
 
 func (f *fakeRecoveredPartitionFSM) wasFinalized() bool {
@@ -359,6 +369,42 @@ func TestAwaitRecoveredPartitionReplayWaitsForRaftAuthority(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	stats.set("last_contact", "1ms")
+	require.NoError(t, <-done)
+	require.True(t, brokerFSM.wasFinalized())
+}
+
+func TestAwaitRecoveredPartitionReplayWaitsForPartitionAuthority(t *testing.T) {
+	store := raft.NewInmemStore()
+	require.NoError(t, store.StoreLog(&raft.Log{Index: 1, Type: raft.LogConfiguration}))
+	stats := &mutableRaftStats{stats: map[string]string{
+		"state":               raft.Follower.String(),
+		"last_contact":        "1ms",
+		"last_snapshot_index": "0",
+		"commit_index":        "1",
+		"last_log_index":      "1",
+	}}
+	brokerFSM := &fakeRecoveredPartitionFSM{
+		pending:     true,
+		finalizeErr: fsm.ErrRecoveredPartitionAuthorityPending,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- awaitRecoveredPartitionReplay(context.Background(), stats, store, brokerFSM, "broker-1", time.Second)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("recovery stopped while partition authority was still pending: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	require.NoError(t, store.StoreLog(&raft.Log{
+		Index: 2, Type: raft.LogCommand, Data: []byte("PARTITION_COMMIT:{}"),
+	}))
+	stats.set("commit_index", "2")
+	stats.set("last_log_index", "2")
+	brokerFSM.setApplied(2)
+	brokerFSM.setFinalizeError(nil)
 	require.NoError(t, <-done)
 	require.True(t, brokerFSM.wasFinalized())
 }

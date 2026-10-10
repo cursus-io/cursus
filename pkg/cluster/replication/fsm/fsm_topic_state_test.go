@@ -266,6 +266,38 @@ func TestBrokerFSMLogOnlyReplayPreservesLocallyCommittedBoundary(t *testing.T) {
 	require.Len(t, messages, 2)
 }
 
+func TestBrokerFSMLogOnlyReplayWaitsForAuthoritativePartitionState(t *testing.T) {
+	manager, partition := newDurableFSMTopic(t, "delayed-replay-orders")
+	require.NoError(t, partition.EnqueueBatchLeader([]types.Message{{Payload: "committed"}}))
+	require.NoError(t, partition.ApplyReplicaHWM(1))
+	partition.FlushDisk()
+
+	replayed := NewBrokerFSM(manager, nil)
+	replayed.BeginRecoveredPartitionReplay()
+	err := replayed.FinalizeRecoveredPartitions()
+	require.ErrorIs(t, err, ErrRecoveredPartitionAuthorityPending)
+	require.True(t, replayed.HasPendingPartitionRecovery())
+
+	registerActiveBroker(t, replayed, "broker-1")
+	create, err := json.Marshal(testTopicCommand("delayed-replay-orders", 1, 1))
+	require.NoError(t, err)
+	require.Nil(t, replayed.Apply(&raft.Log{Data: append([]byte("TOPIC:"), create...), Index: 2}))
+	require.True(t, partition.SnapshotRecoveryPending())
+	err = replayed.FinalizeRecoveredPartitions()
+	require.ErrorIs(t, err, ErrRecoveredPartitionAuthorityPending)
+	require.True(t, replayed.HasPendingPartitionRecovery())
+
+	commit, err := json.Marshal(partitionCommitCommand{
+		Topic: "delayed-replay-orders", Partition: 0, Leader: "broker-1", LeaderEpoch: 1,
+		HWM: 1, LifecycleEpoch: topic.InitialLifecycleEpoch,
+	})
+	require.NoError(t, err)
+	require.Nil(t, replayed.Apply(&raft.Log{Data: append([]byte("PARTITION_COMMIT:"), commit...), Index: 3}))
+	require.NoError(t, replayed.FinalizeRecoveredPartitions())
+	require.False(t, replayed.HasPendingPartitionRecovery())
+	require.Equal(t, uint64(1), partition.GetHWM())
+}
+
 func TestBrokerFSMRestoreAcceptsCommitAppliedAfterFinalization(t *testing.T) {
 	manager, partition := newDurableFSMTopic(t, "late-commit")
 	require.NoError(t, partition.EnqueueBatchLeader([]types.Message{{Payload: "acknowledged-later"}}))

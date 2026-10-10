@@ -1739,6 +1739,18 @@ func (p *Partition) SnapshotRecoveryPending() bool {
 	return p.snapshotRecovery
 }
 
+// RecoveryCommittedHWMFloor returns the lowest authoritative watermark that
+// can safely finish recovery without hiding data that was already committed
+// in the local durable checkpoint.
+func (p *Partition) RecoveryCommittedHWMFloor() uint64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.snapshotRecovery && p.recoveryCheckpointHWM > p.HWM {
+		return p.recoveryCheckpointHWM
+	}
+	return p.HWM
+}
+
 func (p *Partition) reconcileCommittedHWMLocked(hwm uint64) error {
 	if hwm < p.HWM {
 		return fmt.Errorf("committed HWM regression: current=%d requested=%d", p.HWM, hwm)
