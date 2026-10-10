@@ -16,6 +16,7 @@ import (
 type messageBatch struct {
 	topic    string
 	messages []Message
+	done     chan struct{}
 }
 
 // PartitionConsumer handles consuming and committing for a single partition.
@@ -27,10 +28,11 @@ type PartitionConsumer struct {
 	assignmentGeneration uint64
 	ctx                  context.Context
 
-	conn   net.Conn
-	mu     sync.Mutex
-	closed bool
-	bo     *backoff
+	conn         net.Conn
+	mu           sync.Mutex
+	closed       bool
+	bo           *backoff
+	resetPending bool
 
 	dataCh    chan *messageBatch
 	once      sync.Once
@@ -141,9 +143,15 @@ func (pc *PartitionConsumer) runWorker() {
 		lastOffset := batch.messages[len(batch.messages)-1].Offset
 		commitOffset := lastOffset + 1
 		if !pc.consumer.config.EnableAutoCommit {
+			if batch.done != nil {
+				close(batch.done)
+			}
 			continue
 		}
 		pc.consumer.recordAutoCommitOffset(pc.partitionID, commitOffset, pc.assignmentToken())
+		if batch.done != nil {
+			close(batch.done)
+		}
 	}
 }
 
@@ -294,8 +302,18 @@ func (pc *PartitionConsumer) startStreamLoop() {
 	c := pc.consumer
 	bo := pc.getBackoff()
 	defer pc.closeDataCh()
+	var pendingBatch <-chan struct{}
 
 	for {
+		if pendingBatch != nil {
+			select {
+			case <-pendingBatch:
+			case <-pc.workerContext().Done():
+				pc.closeConnection()
+				return
+			}
+			pendingBatch = nil
+		}
 		select {
 		case <-pc.workerContext().Done():
 			pc.closeConnection()
@@ -308,21 +326,48 @@ func (pc *PartitionConsumer) startStreamLoop() {
 			return
 		}
 
+		// Manual handlers may commit offsets through a separate transaction. The
+		// broker is authoritative after all previously queued handlers finish.
+		if !c.config.EnableAutoCommit {
+			pc.mu.Lock()
+			resetPending := pc.resetPending
+			pc.mu.Unlock()
+			if !resetPending {
+				committed, err := c.fetchOffsetWithRetry(pid)
+				if err != nil {
+					LogWarn("Partition [%d] cannot refresh committed offset: %v", pid, err)
+					pc.closeConnection()
+					if !pc.waitWithBackoff(bo) {
+						return
+					}
+					continue
+				}
+				if !pc.assignmentActive() || pc.workerContext().Err() != nil {
+					pc.closeConnection()
+					return
+				}
+				c.mu.Lock()
+				c.offsets[pid] = committed
+				c.mu.Unlock()
+				atomic.StoreUint64(&pc.fetchOffset, committed)
+				LogInfo("Partition [%d] streaming from broker committed offset %d", pid, committed)
+			}
+		} else {
+			c.mu.RLock()
+			committed, ok := c.offsets[pid]
+			c.mu.RUnlock()
+			if ok {
+				atomic.StoreUint64(&pc.fetchOffset, committed)
+				LogInfo("Partition [%d] reconnected, rolling back to committed offset %d", pid, committed)
+			}
+		}
+
 		if err := pc.ensureConnection(); err != nil {
 			LogWarn("Partition [%d] stream connection failed, retrying: %v", pid, err)
 			if !pc.waitWithBackoff(bo) {
 				return
 			}
 			continue
-		}
-
-		// On reconnect, roll back to the last committed offset to avoid gaps.
-		c.mu.RLock()
-		committed, ok := c.offsets[pid]
-		c.mu.RUnlock()
-		if ok {
-			atomic.StoreUint64(&pc.fetchOffset, committed)
-			LogInfo("Partition [%d] reconnected, rolling back to committed offset %d", pid, committed)
 		}
 
 		pc.mu.Lock()
@@ -345,6 +390,9 @@ func (pc *PartitionConsumer) startStreamLoop() {
 			}
 			continue
 		}
+		pc.mu.Lock()
+		pc.resetPending = false
+		pc.mu.Unlock()
 
 		LogInfo("Partition [%d] streaming from offset %d", pid, currentOffset)
 
@@ -427,8 +475,15 @@ func (pc *PartitionConsumer) startStreamLoop() {
 				consumerMessagesReceived.WithLabelValues(c.config.Topic, c.config.GroupID).Add(float64(len(messages)))
 			}
 
+			batch := &messageBatch{topic: topic, messages: messages}
+			if !c.config.EnableAutoCommit {
+				batch.done = make(chan struct{})
+			}
 			select {
-			case pc.dataCh <- &messageBatch{topic: topic, messages: messages}:
+			case pc.dataCh <- batch:
+				if batch.done != nil {
+					pendingBatch = batch.done
+				}
 			case <-pc.workerContext().Done():
 				return
 			}
@@ -686,6 +741,9 @@ func (pc *PartitionConsumer) handleOffsetOutOfRange(frame offsetOutOfRangeFrame)
 	pc.consumer.mu.Lock()
 	pc.consumer.offsets[pc.partitionID] = next
 	pc.consumer.mu.Unlock()
+	pc.mu.Lock()
+	pc.resetPending = true
+	pc.mu.Unlock()
 	LogWarn("Partition [%d] offset out of range requested=%d earliest=%d latest=%d; reset fetch offset to %d (%s)", pc.partitionID, frame.Requested, frame.Earliest, frame.Latest, next, policy)
 	pc.closeConnection()
 	return true
