@@ -45,7 +45,7 @@ func verifyReplicaConflictRecovery(t *testing.T, acks string) {
 	}
 	client := e2e.NewBrokerClient(ctx.GetBrokerAddrs())
 	defer client.Close()
-	response, err := client.SendCommand("", "PUBLISH topic="+history+" partition=0 acks=all producerId=failed message=uncommitted-tail", 15*time.Second)
+	_, err := client.SendCommand("", "PUBLISH topic="+history+" partition=0 acks=all producerId=failed message=uncommitted-tail", 15*time.Second)
 	require.ErrorContains(t, err, "replica_index_failed")
 	divergent := 0
 	for node, addr := range ctx.GetBrokerAddrs() {
@@ -64,7 +64,7 @@ func verifyReplicaConflictRecovery(t *testing.T, acks string) {
 		setReplicaFaultSentinel(t, node+1, "replica-append-failure", history+"-0-1", false)
 	}
 	require.Equal(t, 1, divergent, "the first follower retains the failed append; replication stops before the second")
-	response, err = client.SendCommand("", "PUBLISH topic="+history+" partition=0 acks="+acks+" producerId=replacement message=replacement", 15*time.Second)
+	response, err := client.SendCommand("", "PUBLISH topic="+history+" partition=0 acks="+acks+" producerId=replacement message=replacement", 15*time.Second)
 	if acks == "all" {
 		require.True(t, err != nil || strings.HasPrefix(response, "ERROR"), "must not commit over the divergent tail even with sufficient minISR: %s", response)
 	} else {
