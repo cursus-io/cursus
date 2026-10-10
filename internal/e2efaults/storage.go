@@ -15,12 +15,13 @@ import (
 )
 
 const (
-	RuntimeGateEnvironment       = "CURSUS_E2E_FAULTS"
-	SentinelRoot                 = "/run/cursus-e2e-faults"
-	HandlerOpenOperation         = "handler-open"
-	CleanupOperation             = "cleanup"
-	ReplicaAppendSkipOperation   = "replica-append-skip"
-	ReplicaCatchupPauseOperation = "replica-catchup-pause"
+	RuntimeGateEnvironment        = "CURSUS_E2E_FAULTS"
+	SentinelRoot                  = "/run/cursus-e2e-faults"
+	HandlerOpenOperation          = "handler-open"
+	CleanupOperation              = "cleanup"
+	ReplicaAppendSkipOperation    = "replica-append-skip"
+	ReplicaAppendFailureOperation = "replica-append-failure"
+	ReplicaCatchupPauseOperation  = "replica-catchup-pause"
 )
 
 // StorageProvider injects node-local storage faults only in e2e_faults builds.
@@ -34,8 +35,18 @@ type StorageProvider struct {
 // ConsumeReplicaAppendSkip atomically consumes a one-shot follower append
 // sentinel. It is only compiled into the dedicated e2e fault image.
 func ConsumeReplicaAppendSkip(topicName string, partition int, offset uint64) bool {
+	return consumeReplicaAppendFault(ReplicaAppendSkipOperation, topicName, partition, offset)
+}
+
+// ConsumeReplicaAppendFailure models a follower failing after a durable append
+// but before acknowledging it. No committed records are changed by this fault.
+func ConsumeReplicaAppendFailure(topicName string, partition int, offset uint64) bool {
+	return consumeReplicaAppendFault(ReplicaAppendFailureOperation, topicName, partition, offset)
+}
+
+func consumeReplicaAppendFault(operation, topicName string, partition int, offset uint64) bool {
 	name := fmt.Sprintf("%s-%d-%d", topicName, partition, offset)
-	path := filepath.Join(SentinelRoot, ReplicaAppendSkipOperation, name)
+	path := filepath.Join(SentinelRoot, operation, name)
 	if err := os.Remove(path); err == nil {
 		return true
 	}

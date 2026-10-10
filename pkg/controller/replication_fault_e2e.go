@@ -22,3 +22,10 @@ func injectedReplicaCatchupError(topicName string) error {
 	}
 	return nil
 }
+
+func injectedReplicaAppendFailure(topicName string, partition int, messages []types.Message) bool {
+	if len(messages) == 0 {
+		return false
+	}
+	return e2efaults.ConsumeReplicaAppendFailure(topicName, partition, messages[0].Offset)
+}
