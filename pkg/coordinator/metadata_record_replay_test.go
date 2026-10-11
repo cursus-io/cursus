@@ -59,7 +59,7 @@ func (h *pausedMetadataReplayHandler) ReadTopicPartition(topic string, partition
 	return h.metadataReplayHandler.ReadTopicPartition(topic, partition, offset, max)
 }
 
-func TestDistributedRecoveryIgnoresOnlySupersededLifecycleConflicts(t *testing.T) {
+func TestDistributedRecoveryUsesCommittedOrderForLifecycleGenerations(t *testing.T) {
 	registration := ConsumerMetadataRecord{
 		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
 		Group: "experiment-server", Topic: "commerce.experiment.events", PartitionCount: 1, Epoch: 1,
@@ -97,10 +97,13 @@ func TestDistributedRecoveryIgnoresOnlySupersededLifecycleConflicts(t *testing.T
 	require.Equal(t, 14, recovered.GetGeneration("experiment-server"))
 	require.Equal(t, []int{0}, recovered.GetMemberAssignments("experiment-server", "latest"))
 
-	conflicted, err := NewCoordinatorWithRecovery(context.Background(), cfg, makeHandler(records[:len(records)-1]))
-	require.ErrorContains(t, err, "conflicting lifecycle snapshots group=experiment-server epoch=1 generation=13")
-	t.Cleanup(conflicted.Stop)
-	require.False(t, conflicted.RecoverySnapshot().Ready)
+	latestRepeatedGeneration, err := NewCoordinatorWithRecovery(context.Background(), cfg, makeHandler(records[:len(records)-1]))
+	require.NoError(t, err)
+	t.Cleanup(latestRepeatedGeneration.Stop)
+	require.True(t, latestRepeatedGeneration.RecoverySnapshot().Ready)
+	require.Equal(t, 13, latestRepeatedGeneration.GetGeneration("experiment-server"))
+	require.Empty(t, latestRepeatedGeneration.GetMemberAssignments("experiment-server", "first-13"))
+	require.Equal(t, []int{0}, latestRepeatedGeneration.GetMemberAssignments("experiment-server", "second-13"))
 }
 
 func TestConsumerMetadataReplayRequiresMigrationForRetainedGap(t *testing.T) {
@@ -551,6 +554,101 @@ func TestDistributedLifecycleSnapshotsRecoverGenerationAndAssignments(t *testing
 	require.Equal(t, []int{0, 1}, recovered.GetMemberAssignments("workers", "member-a"))
 	require.Equal(t, []int{2, 3}, recovered.GetMemberAssignments("workers", "member-b"))
 	require.False(t, recovered.GetGroup("workers").LastActivity.IsZero())
+}
+
+func TestDistributedLifecycleRecoveryUsesLaterCommittedSnapshotForReusedGeneration(t *testing.T) {
+	const (
+		group = "settlement-workers"
+		topic = "settlement.events"
+	)
+	registration := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
+		Group: group, Topic: topic, PartitionCount: 1, Epoch: 1, Timestamp: time.Unix(1, 0).UTC(),
+	}
+	lifecycle := func(generation int, member string, timestamp int64) ConsumerMetadataRecord {
+		members := []GroupLifecycleMember(nil)
+		if member != "" {
+			members = []GroupLifecycleMember{{ID: member, Assignments: []int{0}}}
+		}
+		observedAt := time.Unix(timestamp, 0).UTC()
+		return ConsumerMetadataRecord{
+			Version: ConsumerMetadataRecordVersionLifecycle, Type: ConsumerMetadataRecordLifecycleSnapshot,
+			Group: group, Epoch: 1, Revision: uint64(generation), Timestamp: observedAt,
+			Lifecycle: &GroupLifecycleSnapshot{
+				TopicName: topic, Generation: generation, Members: members, Partitions: []int{0},
+				LastActivity: observedAt, LastRebalance: observedAt,
+			},
+		}
+	}
+
+	// This is the observed failure shape. A stale coordinator temporarily
+	// wrote lower generations after 30864, then the durable log advanced back
+	// to 30864 with a different member. The later committed record at offset 6
+	// is the authoritative full lifecycle snapshot for that generation.
+	records := []ConsumerMetadataRecord{
+		registration,
+		lifecycle(30864, "member-before-recovery", 2),
+		lifecycle(30768, "stale-member", 3),
+		lifecycle(30861, "replacement-a", 4),
+		lifecycle(30862, "replacement-a", 5),
+		lifecycle(30863, "", 6),
+		lifecycle(30864, "member-after-recovery", 7),
+	}
+	messages := make([]types.Message, 0, len(records))
+	for offset, record := range records {
+		messages = append(messages, encodedMetadataMessage(t, record, uint64(offset)))
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	recovered, err := NewCoordinatorWithRecovery(context.Background(), cfg, &metadataReplayHandler{
+		messages: map[int][]types.Message{2: messages},
+	})
+	require.NoError(t, err)
+	t.Cleanup(recovered.Stop)
+	require.Equal(t, 30864, recovered.GetGeneration(group))
+	require.Empty(t, recovered.GetMemberAssignments(group, "member-before-recovery"))
+	require.Equal(t, []int{0}, recovered.GetMemberAssignments(group, "member-after-recovery"))
+
+	recovered.SetOffsetRecordWriter(func(ConsumerMetadataRecord) error { return nil })
+	_, err = recovered.AddConsumer(group, "next-member")
+	require.NoError(t, err)
+	require.Equal(t, 30865, recovered.GetGeneration(group))
+}
+
+func TestDistributedLifecycleRecoveryRejectsReusedGenerationAcrossPartitions(t *testing.T) {
+	registration := ConsumerMetadataRecord{
+		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
+		Group: "workers", Topic: "orders", PartitionCount: 1, Epoch: 1,
+	}
+	first := validLifecycleRecord()
+	first.Group = registration.Group
+	first.Epoch = registration.Epoch
+	first.Revision = 12
+	first.Lifecycle.Generation = 12
+	first.Lifecycle.TopicName = registration.Topic
+	first.Lifecycle.Members = []GroupLifecycleMember{{ID: "member-a", Assignments: []int{0}}}
+	later := first
+	later.Lifecycle = cloneLifecycle(first.Lifecycle)
+	later.Lifecycle.Members = []GroupLifecycleMember{{ID: "member-b", Assignments: []int{0}}}
+	latestOnOriginalPartition := first
+	latestOnOriginalPartition.Lifecycle = cloneLifecycle(first.Lifecycle)
+	latestOnOriginalPartition.Lifecycle.Members = []GroupLifecycleMember{{ID: "member-c", Assignments: []int{0}}}
+
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	coordinator, err := NewCoordinatorWithRecovery(context.Background(), cfg, &metadataReplayHandler{
+		messages: map[int][]types.Message{
+			0: {
+				encodedMetadataMessage(t, registration, 0),
+				encodedMetadataMessage(t, first, 1),
+				encodedMetadataMessage(t, latestOnOriginalPartition, 2),
+			},
+			1: {encodedMetadataMessage(t, later, 0)},
+		},
+	})
+	require.ErrorContains(t, err, "conflicting lifecycle snapshots")
+	require.False(t, coordinator.RecoverySnapshot().Ready)
 }
 
 func TestDistributedLifecycleRecoveryBackfillsLegacyLastActivity(t *testing.T) {
