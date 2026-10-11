@@ -1,8 +1,11 @@
 package e2e_cluster
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -132,7 +135,7 @@ func TestPreparedOffsetsRecoverAfterMemberDepartureAndCoordinatorFailure(t *test
 	stopComposeBroker(t, offline)
 	survivors := survivorNodes(offline)
 	waitForSingleRaftLeader(t, survivors, offline)
-	waitForAllBrokerReadiness(t, survivors)
+	waitForPreparedTransactionQuorum(t, survivors)
 	waitForBrokerEvictedFromISR(t, ctx, offline)
 	var brokerErr *wire.BrokerError
 	require.NoError(t, eventually(t, "commit prepared while output lacks required replicas", 45*time.Second, func() (bool, string, error) {
@@ -163,7 +166,7 @@ func TestPreparedOffsetsRecoverAfterMemberDepartureAndCoordinatorFailure(t *test
 	startComposeBroker(t, offline)
 	newSurvivors := survivorNodes(failedCoordinator)
 	waitForSingleRaftLeader(t, newSurvivors, failedCoordinator)
-	waitForAllBrokerReadiness(t, newSurvivors)
+	waitForPreparedTransactionQuorum(t, newSurvivors)
 	recoveryClient := e2e.NewBrokerClient(clusterBrokerAddrsForNodes(newSurvivors))
 	defer recoveryClient.Close()
 	require.NoError(t, eventually(t, "prepared transaction reassigned after coordinator failure", clusterReadyTimeout, func() (bool, string, error) {
@@ -184,4 +187,35 @@ func TestPreparedOffsetsRecoverAfterMemberDepartureAndCoordinatorFailure(t *test
 	outputReader, outputGeneration, outputMember := joinClusterGroup(t, ctx.GetBrokerAddrs(), output, "prepared-output-readers")
 	defer outputReader.Close()
 	require.Equal(t, []string{"recovered-once"}, consumeFromPartitionLeader(t, ctx.GetBrokerAddrs(), output, 0, "prepared-output-readers", outputMember, outputGeneration))
+}
+
+// This scenario intentionally keeps one replica offline while output minISR=3.
+// Global readiness must stay false until that replica returns; require all
+// non-topology checks during the outage, then full readiness after restoring it.
+func waitForPreparedTransactionQuorum(t *testing.T, nodes []int) {
+	t.Helper()
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+	pollClusterFailure(t, "prepared transaction quorum", func() (bool, string) {
+		for _, node := range nodes {
+			url := fmt.Sprintf("http://127.0.0.1:%d/ready", healthPort(node))
+			response, err := httpClient.Get(url) // #nosec G107 -- loopback ports are fixed by the test compose file.
+			if err != nil {
+				return false, fmt.Sprintf("broker-%d: %v", node, err)
+			}
+			var report struct {
+				Checks map[string]string `json:"checks"`
+			}
+			err = json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&report)
+			_ = response.Body.Close()
+			if err != nil || len(report.Checks) == 0 || report.Checks["cluster_topology"] == "" {
+				return false, fmt.Sprintf("broker-%d invalid readiness report: %v", node, err)
+			}
+			for check, result := range report.Checks {
+				if check != "cluster_topology" && result != "ok" {
+					return false, fmt.Sprintf("broker-%d %s: %s", node, check, result)
+				}
+			}
+		}
+		return true, "quorum ready except for intentionally unavailable replica"
+	})
 }

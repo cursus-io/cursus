@@ -92,10 +92,10 @@ func waitForAllBrokerReadiness(t *testing.T, nodes []int) {
 			if err != nil {
 				return false, fmt.Sprintf("broker-%d: %v", node, err)
 			}
-			_, _ = io.Copy(io.Discard, response.Body)
+			body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 			_ = response.Body.Close()
 			if response.StatusCode != http.StatusOK {
-				return false, fmt.Sprintf("broker-%d readiness status=%d", node, response.StatusCode)
+				return false, fmt.Sprintf("broker-%d readiness status=%d body=%s", node, response.StatusCode, strings.TrimSpace(string(body)))
 			}
 		}
 		return true, "all requested brokers ready"

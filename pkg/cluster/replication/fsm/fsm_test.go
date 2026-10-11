@@ -1121,7 +1121,10 @@ func TestBrokerFSM_Snapshot_Restore_TransactionState(t *testing.T) {
 		t.Fatalf("Restore failed: %v", err)
 	}
 
-	tx, err := restoredTxnManager.Status("tx-restore")
+	if newFSM.GetTransactionManager() != restoredTxnManager {
+		t.Fatal("restore replaced the attached transaction manager")
+	}
+	tx, err := newFSM.GetTransactionManager().Status("tx-restore")
 	if err != nil {
 		t.Fatalf("restored transaction missing: %v", err)
 	}
@@ -1162,9 +1165,15 @@ func TestBrokerFSM_RestoreDefersTransactionStateUntilManagerAttached(t *testing.
 	if err := restored.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
 		t.Fatalf("Restore failed: %v", err)
 	}
+	if restored.GetTransactionManager() != nil {
+		t.Fatal("deferred restore must not create an unconfigured transaction manager")
+	}
 	restoredManager := transaction.NewManager()
 	restored.SetTransactionManager(restoredManager)
-	tx, err := restoredManager.Status("tx-deferred")
+	if restored.GetTransactionManager() != restoredManager {
+		t.Fatal("handler must observe the manager containing deferred recovered state")
+	}
+	tx, err := restored.GetTransactionManager().Status("tx-deferred")
 	if err != nil {
 		t.Fatalf("restored transaction missing: %v", err)
 	}

@@ -159,6 +159,15 @@ func NewCommandHandler(
 	sm *stream.StreamManager,
 	cc *clusterController.ClusterController,
 ) *CommandHandler {
+	var transactions *transaction.Manager
+	if cc != nil && cc.RaftManager != nil {
+		if brokerFSM := cc.RaftManager.GetFSM(); brokerFSM != nil {
+			transactions = brokerFSM.GetTransactionManager()
+		}
+	}
+	if transactions == nil {
+		transactions = transaction.NewManagerWithLimits(transactionalIDExpiration(cfg), transactionCoordinatorShardCount(cfg), transactionLimits(cfg))
+	}
 	ch := &CommandHandler{
 		TopicManager:       tm,
 		Config:             cfg,
@@ -168,7 +177,7 @@ func NewCommandHandler(
 		groupRecoveryEpoch: make(map[uint64]int),
 		Cluster:            cc,
 		ESHandler:          eventsource.NewHandler(tm),
-		TxnManager:         transaction.NewManagerWithLimits(transactionalIDExpiration(cfg), transactionCoordinatorShardCount(cfg), transactionLimits(cfg)),
+		TxnManager:         transactions,
 	}
 	if tm != nil {
 		tm.SetTransactionDecisionResolver(ch.TxnManager)
@@ -184,7 +193,7 @@ func NewCommandHandler(
 		}
 	}
 	if cc != nil && cc.RaftManager != nil {
-		if fsm := cc.RaftManager.GetFSM(); fsm != nil {
+		if fsm := cc.RaftManager.GetFSM(); fsm != nil && fsm.GetTransactionManager() == nil {
 			fsm.SetTransactionManager(ch.TxnManager)
 		}
 	}
