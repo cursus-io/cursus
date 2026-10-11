@@ -217,6 +217,12 @@ func (f *BrokerFSM) SetCoordinator(cd *coordinator.Coordinator) {
 	f.cd = cd
 }
 
+func (f *BrokerFSM) GetTransactionManager() *transaction.Manager {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.txn
+}
+
 func (f *BrokerFSM) SetTransactionManager(txn *transaction.Manager) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

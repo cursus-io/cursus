@@ -18,6 +18,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 	"github.com/hashicorp/raft"
@@ -122,6 +123,19 @@ type RaftReplicationManager struct {
 
 func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID string, topicManager *topic.TopicManager, coordinator *coordinator.Coordinator, client client.TCPClusterClient) (*RaftReplicationManager, error) {
 	brokerFSM := fsm.NewBrokerFSMWithTransactionCoordinatorShards(topicManager, coordinator, cfg.TransactionCoordinatorShards)
+	// NewRaft can restore and replay committed TXN_SYNC entries before the
+	// command handler exists. The manager must already be attached, and the
+	// handler must later reuse it rather than replacing the recovered state.
+	brokerFSM.SetTransactionManager(transaction.NewManagerWithLimits(
+		time.Duration(cfg.TransactionalIDExpirationMS)*time.Millisecond,
+		cfg.TransactionCoordinatorShards,
+		transaction.Limits{
+			MaxTransactions: cfg.MaxTransactions,
+			MaxRecords:      cfg.MaxTransactionRecords,
+			MaxBytes:        cfg.MaxTransactionBytes,
+			MaxOffsets:      cfg.MaxTransactionOffsets,
+		},
+	))
 
 	localAddr := fmt.Sprintf("%s:%d", cfg.AdvertisedHost, cfg.RaftPort)
 	raftCfg, err := buildRaftConfig(cfg, brokerID)
