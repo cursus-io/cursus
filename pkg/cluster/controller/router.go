@@ -30,9 +30,15 @@ type ClusterRouter struct {
 	internalPort   int
 	internalTLS    *tls.Config
 	internalToken  string
-	timeout        time.Duration
+	dialTimeout    time.Duration
+	requestTimeout time.Duration
 	localProcessor LocalProcessor
 }
+
+const (
+	defaultInternalDialTimeout    = 5 * time.Second
+	defaultInternalRequestTimeout = 30 * time.Second
+)
 
 func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm RaftManager, clientPort int, clientHost string, cfg *config.Config) *ClusterRouter {
 	internalPort := 0
@@ -43,6 +49,10 @@ func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm R
 		internalTLS = cfg.InternalClientTLSConfig()
 		internalToken = cfg.InternalAuthToken
 	}
+	requestTimeout := defaultInternalRequestTimeout
+	if cfg != nil && cfg.ClientRequestTimeoutMS > 0 {
+		requestTimeout = time.Duration(cfg.ClientRequestTimeoutMS) * time.Millisecond
+	}
 	return &ClusterRouter{
 		brokerID:       brokerID,
 		LocalAddr:      localAddr,
@@ -52,7 +62,8 @@ func NewClusterRouter(brokerID, localAddr string, processor LocalProcessor, rm R
 		internalPort:   internalPort,
 		internalTLS:    internalTLS,
 		internalToken:  internalToken,
-		timeout:        5 * time.Second,
+		dialTimeout:    defaultInternalDialTimeout,
+		requestTimeout: requestTimeout,
 		localProcessor: processor,
 	}
 }
@@ -372,7 +383,7 @@ func (r *ClusterRouter) sendDataRequestContext(ctx context.Context, addr string,
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	dialCtx, cancel := context.WithTimeout(ctx, r.dialTimeout)
 	defer cancel()
 	var conn net.Conn
 	var err error
@@ -391,7 +402,7 @@ func (r *ClusterRouter) sendDataRequestContext(ctx context.Context, addr string,
 	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopCancel()
 
-	deadline := time.Now().Add(r.timeout)
+	deadline := time.Now().Add(r.requestTimeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
 	}

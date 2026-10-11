@@ -102,7 +102,7 @@ func TestSendDataRequestContextCancelsBlockedHandshake(t *testing.T) {
 		}
 	}()
 
-	router := &ClusterRouter{timeout: 5 * time.Second}
+	router := &ClusterRouter{dialTimeout: 5 * time.Second, requestTimeout: 5 * time.Second}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
@@ -159,7 +159,7 @@ func TestSendDataRequestContextCancelsBlockedResponse(t *testing.T) {
 		close(received)
 		_, _ = raw.Read(make([]byte, 1))
 	}()
-	router := &ClusterRouter{timeout: 5 * time.Second}
+	router := &ClusterRouter{dialTimeout: 5 * time.Second, requestTimeout: 5 * time.Second}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	result := make(chan error, 1)
@@ -185,6 +185,75 @@ func TestSendDataRequestContextCancelsBlockedResponse(t *testing.T) {
 	case <-serverDone:
 	case <-time.After(time.Second):
 		t.Fatal("cancelled connection was not closed")
+	}
+}
+
+func TestNewClusterRouterUsesClientRequestBudgetForForwardedResponses(t *testing.T) {
+	rm := &MockRaftManager{isLeader: true}
+	defaultRouter := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "", nil)
+	if defaultRouter.requestTimeout != 30*time.Second {
+		t.Fatalf("default request timeout = %v, want 30s", defaultRouter.requestTimeout)
+	}
+
+	router := NewClusterRouter("n1", "localhost:7001", nil, rm, 7000, "", &config.Config{
+		ClientRequestTimeoutMS: 27_000,
+	})
+
+	if router.dialTimeout != 5*time.Second {
+		t.Fatalf("dial timeout = %v, want 5s", router.dialTimeout)
+	}
+	if router.requestTimeout != 27*time.Second {
+		t.Fatalf("request timeout = %v, want 27s", router.requestTimeout)
+	}
+}
+
+func TestSendDataRequestContextKeepsResponseBudgetAfterDial(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		raw, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = raw.Close() }()
+		conn, handshakeErr := wire.ServerHandshake(raw, []wire.Compression{wire.CompressionNone})
+		if handshakeErr != nil {
+			return
+		}
+		request, readErr := conn.ReadFrame()
+		if readErr != nil {
+			return
+		}
+		time.Sleep(350 * time.Millisecond)
+		_ = conn.WriteFrame(wire.Frame{
+			Kind:      wire.KindResponse,
+			Command:   request.Command,
+			Status:    wire.StatusOK,
+			RequestID: request.RequestID,
+			Payload:   []byte("OK"),
+		})
+	}()
+
+	router := &ClusterRouter{
+		dialTimeout:    250 * time.Millisecond,
+		requestTimeout: 2 * time.Second,
+	}
+	response, err := router.sendDataRequestContext(context.Background(), listener.Addr().String(), []byte("LIST"))
+	if err != nil {
+		t.Fatalf("forwarded response exceeded dial budget but not request budget: %v", err)
+	}
+	if response != "OK" {
+		t.Fatalf("response = %q, want OK", response)
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("test server did not finish")
 	}
 }
 
