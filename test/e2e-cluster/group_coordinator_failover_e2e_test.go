@@ -125,6 +125,53 @@ func TestGroupCoordinatorFailoverUsesDurableMembership(t *testing.T) {
 	if offset, err := verificationClient.FetchCommittedOffset(topic, 0, group); err != nil || offset != postFailureOffset {
 		t.Fatalf("offset after failed coordinator recovery=%d err=%v, want %d", offset, err, postFailureOffset)
 	}
+	recoveredGeneration := readLifecycleGroupGeneration(t, verificationClient, group)
+	if recoveredGeneration < generation {
+		t.Fatalf("generation after broker restart=%d, want at least %d", recoveredGeneration, generation)
+	}
+
+	// A join after the failed coordinator has replayed its local metadata must
+	// advance from the recovered generation. This catches startup replay that
+	// selects an earlier lifecycle snapshot or rejects a later committed one.
+	postRestartClient := e2e.NewBrokerClient(clusterBrokerAddrs(3))
+	defer postRestartClient.Close()
+	postRestartGeneration, postRestartMember, err := postRestartClient.JoinGroup(topic, group)
+	if err != nil {
+		t.Fatalf("join group after failed coordinator restart: %v", err)
+	}
+	if postRestartGeneration <= recoveredGeneration {
+		t.Fatalf("generation after post-restart join=%d, want greater than recovered %d", postRestartGeneration, recoveredGeneration)
+	}
+	if _, err := postRestartClient.SyncGroup(topic, group, postRestartGeneration, postRestartMember); err != nil {
+		t.Fatalf("sync group after failed coordinator restart: %v", err)
+	}
+	status, err := postRestartClient.GetConsumerGroupStatus(group)
+	if err != nil {
+		t.Fatalf("group status after failed coordinator restart: %v", err)
+	}
+	owner := ""
+	for _, candidate := range status.Members {
+		for _, assignment := range candidate.Assignments {
+			if assignment == 0 {
+				owner = candidate.MemberID
+				break
+			}
+		}
+	}
+	if owner == "" {
+		t.Fatal("partition 0 has no owner after failed coordinator restart")
+	}
+	const postRestartOffset uint64 = 52
+	commitResp, err = postRestartClient.SendCommand("", fmt.Sprintf(
+		"COMMIT_OFFSET topic=%s partition=0 group=%s offset=%d generation=%d member=%s",
+		topic, group, postRestartOffset, status.Generation, owner,
+	), 15*time.Second)
+	if err != nil || strings.HasPrefix(commitResp, "ERROR:") {
+		t.Fatalf("commit offset after failed coordinator restart: response=%q err=%v", commitResp, err)
+	}
+	if offset, err := postRestartClient.FetchCommittedOffset(topic, 0, group); err != nil || offset != postRestartOffset {
+		t.Fatalf("offset after post-restart join=%d err=%v, want %d", offset, err, postRestartOffset)
+	}
 }
 
 func waitForGroupRegistration(topic, group string) error {

@@ -177,6 +177,23 @@ func TestLifecycleSnapshotSelectionAcceptsOnlyEmptyGroupTimestampRefresh(t *test
 	require.ErrorContains(t, validateSelectedLifecycleSnapshots(candidates, nil, &status), "conflicting lifecycle snapshots")
 }
 
+func TestOrderedLifecycleSelectionDoesNotClearCrossPartitionConflict(t *testing.T) {
+	first := validLifecycleRecord()
+	crossPartition := first
+	crossPartition.Lifecycle = cloneLifecycle(first.Lifecycle)
+	crossPartition.Lifecycle.Members = []GroupLifecycleMember{{ID: "cross-partition"}}
+	laterOnOriginalPartition := first
+	laterOnOriginalPartition.Lifecycle = cloneLifecycle(first.Lifecycle)
+	laterOnOriginalPartition.Lifecycle.Members = []GroupLifecycleMember{{ID: "later-local"}}
+
+	candidates := make(map[string]lifecycleSnapshotCandidate)
+	status := ConsumerMetadataRecoveryStatus{}
+	require.NoError(t, selectLifecycleSnapshotAt(candidates, first, &status, consumerMetadataRecordPosition{partition: 0, offset: 1, ordered: true}, true))
+	require.NoError(t, selectLifecycleSnapshotAt(candidates, crossPartition, &status, consumerMetadataRecordPosition{partition: 1, offset: 1, ordered: true}, true))
+	require.NoError(t, selectLifecycleSnapshotAt(candidates, laterOnOriginalPartition, &status, consumerMetadataRecordPosition{partition: 0, offset: 2, ordered: true}, true))
+	require.ErrorContains(t, validateSelectedLifecycleSnapshots(candidates, nil, &status), "conflicting lifecycle snapshots")
+}
+
 func TestConsumerMetadataValidationRejectsMalformedLifecycleRecords(t *testing.T) {
 	valid := validLifecycleRecord()
 	require.NoError(t, validateConsumerMetadataRecord(valid))

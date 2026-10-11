@@ -114,7 +114,14 @@ type lifecycleCandidate struct {
 
 type lifecycleSnapshotCandidate struct {
 	record     ConsumerMetadataRecord
+	position   consumerMetadataRecordPosition
 	conflicted bool
+}
+
+type consumerMetadataRecordPosition struct {
+	partition int
+	offset    uint64
+	ordered   bool
 }
 
 type offsetCandidate struct {
@@ -140,9 +147,17 @@ func newConsumerMetadataCandidates() consumerMetadataCandidates {
 }
 
 func (candidates *consumerMetadataCandidates) selectRecord(record ConsumerMetadataRecord, status *ConsumerMetadataRecoveryStatus) error {
+	return candidates.selectRecordAt(record, status, consumerMetadataRecordPosition{})
+}
+
+func (candidates *consumerMetadataCandidates) selectLogRecord(record ConsumerMetadataRecord, status *ConsumerMetadataRecoveryStatus, partition int, offset uint64) error {
+	return candidates.selectRecordAt(record, status, consumerMetadataRecordPosition{partition: partition, offset: offset, ordered: true})
+}
+
+func (candidates *consumerMetadataCandidates) selectRecordAt(record ConsumerMetadataRecord, status *ConsumerMetadataRecoveryStatus, position consumerMetadataRecordPosition) error {
 	switch record.Type {
 	case ConsumerMetadataRecordOffsetReservations:
-		return selectLifecycleSnapshot(candidates.reservationSnapshots, record, status)
+		return selectLifecycleSnapshotAt(candidates.reservationSnapshots, record, status, consumerMetadataRecordPosition{}, false)
 	case ConsumerMetadataRecordRegistration, ConsumerMetadataRecordTombstone:
 		status.RegistrationRecords++
 		candidate, exists := candidates.lifecycles[record.Group]
@@ -161,7 +176,7 @@ func (candidates *consumerMetadataCandidates) selectRecord(record ConsumerMetada
 			status.OrphanRecords++
 		}
 	case ConsumerMetadataRecordLifecycleSnapshot:
-		if err := selectLifecycleSnapshot(candidates.lifecycleSnapshots, record, status); err != nil {
+		if err := selectLifecycleSnapshotAt(candidates.lifecycleSnapshots, record, status, position, true); err != nil {
 			return err
 		}
 	case ConsumerMetadataRecordOffsetSnapshot:
@@ -778,7 +793,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 						}
 						return status, fmt.Errorf("internal metadata key mismatch partition=%d offset=%d", partition, message.Offset)
 					}
-					if err := candidates.selectRecord(record, &status); err != nil {
+					if err := candidates.selectLogRecord(record, &status, partition, message.Offset); err != nil {
 						return status, fmt.Errorf("select internal metadata partition=%d offset=%d: %w", partition, message.Offset, err)
 					}
 					continue
@@ -1027,13 +1042,17 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 }
 
 func selectLifecycleSnapshot(candidates map[string]lifecycleSnapshotCandidate, record ConsumerMetadataRecord, status *ConsumerMetadataRecoveryStatus) error {
+	return selectLifecycleSnapshotAt(candidates, record, status, consumerMetadataRecordPosition{}, false)
+}
+
+func selectLifecycleSnapshotAt(candidates map[string]lifecycleSnapshotCandidate, record ConsumerMetadataRecord, status *ConsumerMetadataRecoveryStatus, position consumerMetadataRecordPosition, orderedSupersession bool) error {
 	candidate, exists := candidates[record.Group]
 	switch {
 	case !exists || record.Epoch > candidate.record.Epoch || (record.Epoch == candidate.record.Epoch && record.Revision > candidate.record.Revision):
 		if exists && status != nil {
 			status.OrphanRecords++
 		}
-		candidates[record.Group] = lifecycleSnapshotCandidate{record: record}
+		candidates[record.Group] = lifecycleSnapshotCandidate{record: record, position: position}
 	case record.Epoch == candidate.record.Epoch && record.Revision == candidate.record.Revision && !sameConsumerMetadataRecord(record, candidate.record):
 		if status != nil {
 			status.OrphanRecords++
@@ -1043,6 +1062,18 @@ func selectLifecycleSnapshot(candidates map[string]lifecycleSnapshotCandidate, r
 			// again at the same generation with refreshed activity timestamps.
 			// There is no member or assignment to reconcile in this case.
 			candidate.record = record
+			candidate.position = position
+			candidates[record.Group] = candidate
+			return nil
+		}
+		if orderedSupersession && candidate.position.ordered && position.ordered && candidate.position.partition == position.partition && candidate.position.offset < position.offset {
+			// A consumer group's lifecycle records share one durable
+			// __consumer_offsets partition. Within that partition the committed
+			// log offset, rather than the client-facing generation, orders full
+			// lifecycle snapshots. This also recovers logs written by an older
+			// coordinator that reused a generation after failover.
+			candidate.record = record
+			candidate.position = position
 			candidates[record.Group] = candidate
 			return nil
 		}
@@ -1072,9 +1103,8 @@ func sameEmptyLifecycleState(left, right ConsumerMetadataRecord) bool {
 	return sameConsumerMetadataRecord(left, right)
 }
 
-// A duplicate generation can be superseded by a later durable snapshot. Only
-// the selected generation must be unambiguous; conflicting current state still
-// fails closed instead of choosing a record based on scan order.
+// A duplicate generation from one committed log partition is superseded by its
+// later offset. Conflicts without that single-partition order still fail closed.
 func validateSelectedLifecycleSnapshots(snapshots map[string]lifecycleSnapshotCandidate, lifecycles map[string]lifecycleCandidate, status *ConsumerMetadataRecoveryStatus) error {
 	names := make([]string, 0, len(snapshots))
 	for name := range snapshots {
