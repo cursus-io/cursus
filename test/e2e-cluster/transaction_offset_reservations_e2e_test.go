@@ -45,19 +45,25 @@ func TestTransactionOffsetsCommitAcrossDifferentCoordinators(t *testing.T) {
 		}
 	}
 	require.NotEmpty(t, txnID)
-	t.Logf("transaction coordinator=%s group coordinator=%s", txnOwner, groupOwner)
-	producer, err := client.InitTransactionProducer(txnID)
+	ingressNode := 1
+	if coordinatorNode(t, txnOwner) == ingressNode {
+		ingressNode = 2
+	}
+	transactionClient := e2e.NewBrokerClient([]string{fmt.Sprintf("localhost:%d", brokerPort(ingressNode))})
+	defer transactionClient.Close()
+	t.Logf("transaction ingress=broker-%d coordinator=%s group coordinator=%s", ingressNode, txnOwner, groupOwner)
+	producer, err := transactionClient.InitTransactionProducer(txnID)
 	require.NoError(t, err)
-	require.NoError(t, client.BeginTransaction(txnID, producer))
-	require.NoError(t, client.TransactionalPublish(txnID, output, 0, producer, 1, "processed"))
-	require.NoError(t, client.SendOffsetsToTransaction(txnID, ctx.GetTopic(), group, member, generation, producer, map[int]uint64{0: 1}))
-	err = client.EndTransaction(txnID, producer, "commit")
+	require.NoError(t, transactionClient.BeginTransaction(txnID, producer))
+	require.NoError(t, transactionClient.TransactionalPublish(txnID, output, 0, producer, 1, "processed"))
+	require.NoError(t, transactionClient.SendOffsetsToTransaction(txnID, ctx.GetTopic(), group, member, generation, producer, map[int]uint64{0: 1}))
+	err = transactionClient.EndTransaction(txnID, producer, "commit")
 	var brokerErr *wire.BrokerError
 	if errors.As(err, &brokerErr) {
 		t.Logf("END_TXN error code=%s fields=%v", brokerErr.Code, brokerErr.Fields)
 	}
 	require.NoError(t, err)
-	require.NoError(t, client.EndTransaction(txnID, producer, "commit"), "retry must not append duplicate output")
+	require.NoError(t, transactionClient.EndTransaction(txnID, producer, "commit"), "retry must not append duplicate output")
 	offset, err := reader.FetchCommittedOffset(ctx.GetTopic(), 0, group)
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), offset)
