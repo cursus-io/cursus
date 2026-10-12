@@ -273,10 +273,6 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 	if err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 	}
-	if errResp := ch.validateTransactionPublishMetadata(args, topicName, partition, msg); errResp != "" {
-		return errResp
-	}
-
 	if ch.Config.EnabledDistribution && ch.Cluster != nil {
 		forwardCmd := cmd
 		if _, explicitPartition := args["partition"]; !explicitPartition {
@@ -285,6 +281,26 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		if resp, forwarded, _ := ch.isPartitionLeaderAndForwardContext(requestCtx, topicName, partition, forwardCmd); forwarded {
 			return resp
 		}
+	}
+
+	// The partition owner must keep an open transaction stable from validation
+	// through its local append. Coordinator-local calls already hold this lock;
+	// forwarded calls acquire the destination broker's corresponding lock.
+	releaseTransactionState := ch.lockTransactionPublishState(clientCtx, msg)
+	defer releaseTransactionState()
+	if errResp := ch.validateTransactionPublishMetadata(args, topicName, partition, msg); errResp != "" {
+		return errResp
+	}
+	requiredTransactionRevision := uint64(0)
+	if msg.TransactionalID != "" {
+		tx, statusErr := ch.TxnManager.Status(msg.TransactionalID)
+		if statusErr != nil {
+			return fmt.Sprintf("ERROR: transaction_not_found transactional_id=%s", msg.TransactionalID)
+		}
+		requiredTransactionRevision = tx.Revision
+	}
+
+	if ch.Config.EnabledDistribution && ch.Cluster != nil {
 
 		effectiveMinISR := t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas)
 		requiredISR := 0
@@ -324,13 +340,14 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 
 		scope := "partition"
 		messageData := types.MessageCommand{
-			Topic:          topicName,
-			Partition:      partition,
-			LifecycleEpoch: t.LifecycleEpoch,
-			IsIdempotent:   effectiveIdempotent,
-			SequenceScope:  scope,
-			Messages:       []types.Message{*msg},
-			Acks:           acks,
+			Topic:                       topicName,
+			Partition:                   partition,
+			LifecycleEpoch:              t.LifecycleEpoch,
+			RequiredTransactionRevision: requiredTransactionRevision,
+			IsIdempotent:                effectiveIdempotent,
+			SequenceScope:               scope,
+			Messages:                    []types.Message{*msg},
+			Acks:                        acks,
 		}
 
 		markLeaderOffsetsUnassigned(messageData.Messages)
@@ -486,6 +503,18 @@ Respond:
 	return string(respBytes)
 }
 
+func (ch *CommandHandler) lockTransactionPublishState(clientCtx *ClientContext, msg *types.Message) func() {
+	if msg == nil || msg.TransactionalID == "" || msg.TransactionMarker != types.TransactionMarkerNone {
+		return func() {}
+	}
+	if clientCtx != nil && clientCtx.transactionStateLockHeld {
+		return func() {}
+	}
+	stateLock := ch.transactionStateLock(msg.TransactionalID)
+	stateLock.Lock()
+	return stateLock.Unlock
+}
+
 // publishCommandWithPartition preserves the client's complete command and only
 // adds the broker-selected partition before the trailing message payload.
 func publishCommandWithPartition(cmd string, partition int) string {
@@ -559,6 +588,9 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 
 	if len(msgCmd.Messages) == 0 && msgCmd.CommitHWM == nil {
 		return "ERROR: empty_messages command=REPLICATE_MESSAGE"
+	}
+	if errResp := ch.waitForReplicatedTransactionState(msgCmd.Messages, msgCmd.RequiredTransactionRevision, DefaultFSMApplyTimeout); errResp != "" {
+		return errResp
 	}
 	for i := range msgCmd.Messages {
 		if int(msgCmd.Messages[i].LeaderEpoch) != msgCmd.LeaderEpoch {

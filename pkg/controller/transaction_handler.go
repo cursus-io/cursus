@@ -1325,7 +1325,9 @@ func (ch *CommandHandler) publishInternalTransactionCommand(cmd string) error {
 	deadline := time.Now().Add(DefaultFSMApplyTimeout)
 	var lastResp string
 	for {
-		lastResp = ch.handlePublish(cmd, NewInternalClientContext("default-group", 0))
+		ctx := NewInternalClientContext("default-group", 0)
+		ctx.transactionStateLockHeld = true
+		lastResp = ch.handlePublish(cmd, ctx)
 		if strings.HasPrefix(lastResp, "OK") || strings.HasPrefix(lastResp, "{") {
 			return nil
 		}
@@ -1413,6 +1415,59 @@ func (ch *CommandHandler) validateTransactionRecordPublish(tx *transaction.Trans
 	return fmt.Sprintf("ERROR: transaction_record_not_staged transactional_id=%s", tx.ID)
 }
 
+// waitForReplicatedTransactionState prevents the data plane from overtaking
+// the Raft-applied transaction snapshot on an ISR replica. The revision is an
+// internal replication fence and is not persisted with the message.
+func (ch *CommandHandler) waitForReplicatedTransactionState(messages []types.Message, requiredRevision uint64, timeout time.Duration) string {
+	if requiredRevision == 0 {
+		return ""
+	}
+	if ch.TxnManager == nil {
+		return "ERROR: transaction_manager_not_available command=REPLICATE_MESSAGE"
+	}
+	transactionalID := ""
+	producerEpoch := int64(0)
+	for i := range messages {
+		msg := messages[i]
+		hasTransactionMetadata := msg.TransactionalID != "" || msg.TransactionState != "" || msg.TransactionMarker != ""
+		if !hasTransactionMetadata {
+			continue
+		}
+		if msg.TransactionalID == "" {
+			return "ERROR: missing_transactional_id command=REPLICATE_MESSAGE"
+		}
+		if transactionalID == "" {
+			transactionalID = msg.TransactionalID
+			producerEpoch = msg.Epoch
+			continue
+		}
+		if msg.TransactionalID != transactionalID || msg.Epoch != producerEpoch {
+			return "ERROR: transaction_record_not_staged reason=\"mixed transaction replication fence\""
+		}
+	}
+	if transactionalID == "" {
+		return "ERROR: missing_transactional_id command=REPLICATE_MESSAGE"
+	}
+
+	deadline := time.Now().Add(timeout)
+	currentRevision := uint64(0)
+	for {
+		if snapshot, ok := ch.TxnManager.Snapshot(transactionalID); ok {
+			currentRevision = snapshot.Revision
+			if snapshot.Epoch > producerEpoch {
+				return fmt.Sprintf("ERROR: producer_fenced transactional_id=%s current_epoch=%d requested_epoch=%d", transactionalID, snapshot.Epoch, producerEpoch)
+			}
+			if snapshot.Epoch == producerEpoch && snapshot.Revision >= requiredRevision {
+				return ""
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Sprintf("ERROR: transaction_record_not_staged transactional_id=%s required_revision=%d current_revision=%d", transactionalID, requiredRevision, currentRevision)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func (ch *CommandHandler) validateTransactionMarkerPublish(tx *transaction.Transaction, topicName string, partition int, msg *types.Message) string {
 	if msg.ControlBatchType != types.ControlBatchTransaction || msg.ControlBatchVersion != types.ControlBatchVersionCursusV2 {
 		return fmt.Sprintf("ERROR: invalid_transaction_control_batch transactional_id=%s type=%s version=%d", tx.ID, msg.ControlBatchType, msg.ControlBatchVersion)
@@ -1489,7 +1544,28 @@ func (ch *CommandHandler) validateReplicatedTransactionMessage(topicName string,
 	if tx.Producer != msg.ProducerID {
 		return fmt.Sprintf("ERROR: producer_fenced transactional_id=%s current_epoch=%d requested_epoch=%d", msg.TransactionalID, tx.Epoch, msg.Epoch)
 	}
+	if tx.Mode == transaction.ModeProcessingV1 {
+		return validateReplicatedProcessingRecord(tx, topicName, partition)
+	}
 	return ch.validateTransactionRecordPublish(tx, topicName, partition, msg)
+}
+
+// validateReplicatedProcessingRecord accepts a record authorized by an open
+// transaction even when this replica has already applied a later decision.
+// The partition offset and idempotent producer sequence still fence the
+// append; public/internal leader-side publishes remain restricted to open.
+func validateReplicatedProcessingRecord(tx *transaction.Transaction, topicName string, partition int) string {
+	switch tx.State {
+	case transaction.StateOpen, transaction.StatePrepareCommit, transaction.StateCommitting, transaction.StateCommitted, transaction.StatePrepareAbort, transaction.StateAborted:
+	default:
+		return fmt.Sprintf("ERROR: invalid_transaction_state transactional_id=%s state=%s", tx.ID, tx.State)
+	}
+	for _, participant := range tx.Participants {
+		if participant.Topic == topicName && participant.Partition == partition {
+			return ""
+		}
+	}
+	return fmt.Sprintf("ERROR: transaction_record_not_staged transactional_id=%s", tx.ID)
 }
 func (ch *CommandHandler) commitTransactionOffsets(ops []transaction.OffsetOperation) error {
 	if len(ops) == 0 {

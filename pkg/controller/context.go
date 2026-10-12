@@ -7,16 +7,21 @@ import (
 )
 
 type ClientContext struct {
-	ConsumerGroup  string
-	ConsumerIdx    int
-	CurrentTopics  map[string]struct{}
-	MemberID       string
-	Generation     int
-	OffsetCache    map[string]uint64
-	Principal      string
-	Authenticated  bool
-	Internal       bool
-	requestContext context.Context
+	ConsumerGroup string
+	ConsumerIdx   int
+	CurrentTopics map[string]struct{}
+	MemberID      string
+	Generation    int
+	OffsetCache   map[string]uint64
+	Principal     string
+	Authenticated bool
+	Internal      bool
+
+	// transactionStateLockHeld is local-only state. It is set for an internal
+	// transaction publish invoked by a coordinator that already holds the
+	// transaction lock; forwarded requests intentionally do not inherit it.
+	transactionStateLockHeld bool
+	requestContext           context.Context
 }
 
 func NewClientContext(group string, idx int) *ClientContext {
