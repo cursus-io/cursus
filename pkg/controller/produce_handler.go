@@ -276,6 +276,14 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 	if errResp := ch.validateTransactionPublishMetadata(args, topicName, partition, msg); errResp != "" {
 		return errResp
 	}
+	requiredTransactionRevision := uint64(0)
+	if msg.TransactionalID != "" {
+		tx, statusErr := ch.TxnManager.Status(msg.TransactionalID)
+		if statusErr != nil {
+			return fmt.Sprintf("ERROR: transaction_not_found transactional_id=%s", msg.TransactionalID)
+		}
+		requiredTransactionRevision = tx.Revision
+	}
 
 	if ch.Config.EnabledDistribution && ch.Cluster != nil {
 		forwardCmd := cmd
@@ -324,13 +332,14 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 
 		scope := "partition"
 		messageData := types.MessageCommand{
-			Topic:          topicName,
-			Partition:      partition,
-			LifecycleEpoch: t.LifecycleEpoch,
-			IsIdempotent:   effectiveIdempotent,
-			SequenceScope:  scope,
-			Messages:       []types.Message{*msg},
-			Acks:           acks,
+			Topic:                       topicName,
+			Partition:                   partition,
+			LifecycleEpoch:              t.LifecycleEpoch,
+			RequiredTransactionRevision: requiredTransactionRevision,
+			IsIdempotent:                effectiveIdempotent,
+			SequenceScope:               scope,
+			Messages:                    []types.Message{*msg},
+			Acks:                        acks,
 		}
 
 		markLeaderOffsetsUnassigned(messageData.Messages)
@@ -559,6 +568,9 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 
 	if len(msgCmd.Messages) == 0 && msgCmd.CommitHWM == nil {
 		return "ERROR: empty_messages command=REPLICATE_MESSAGE"
+	}
+	if errResp := ch.waitForReplicatedTransactionState(msgCmd.Messages, msgCmd.RequiredTransactionRevision, DefaultFSMApplyTimeout); errResp != "" {
+		return errResp
 	}
 	for i := range msgCmd.Messages {
 		if int(msgCmd.Messages[i].LeaderEpoch) != msgCmd.LeaderEpoch {
