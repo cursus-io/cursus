@@ -43,6 +43,7 @@ type CommandHandler struct {
 	topicCreateMu            sync.Mutex
 	groupRecoveryEpoch       map[uint64]int
 	groupRecoveryMu          sync.Mutex
+	groupRecoveryReloadMu    sync.Mutex
 	txnJournal               *transaction.Journal
 	transactionStateSyncHook func(string) error
 	transactionStateLocks    [transactionStateLockStripes]sync.Mutex

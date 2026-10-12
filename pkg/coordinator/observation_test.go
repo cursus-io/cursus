@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -156,32 +157,36 @@ func TestObserveConsumerGroupsDoesNotFabricateUnknownGroup(t *testing.T) {
 	require.Empty(t, coordinator.ObserveConsumerGroups())
 }
 
-func TestObserveConsumerGroupsUsesDurableCatalogWithoutMutatingFollowerState(t *testing.T) {
-	record := ConsumerMetadataRecord{
-		Version: ConsumerMetadataRecordVersion, Type: ConsumerMetadataRecordRegistration,
-		Group: "workers", Topic: "events", PartitionCount: 1, Epoch: 1, Timestamp: time.Now().UTC(),
-	}
-	payload, key, err := encodeConsumerMetadataRecord(record)
-	require.NoError(t, err)
-	handler := &metadataReplayHandler{messages: map[int][]types.Message{
-		0: {{Offset: 0, Key: key, Payload: string(payload)}},
-	}}
+// TestObserveConsumerGroupsNeverReadsDurableMetadata verifies that collecting
+// lifecycle metrics cannot trigger an offsets-log replay.
+func TestObserveConsumerGroupsNeverReadsDurableMetadata(t *testing.T) {
+	handler := &observationReadTrap{}
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
-	follower, err := NewCoordinatorWithRecovery(context.Background(), cfg, handler)
+	coordinator, err := NewCoordinatorWithRecovery(context.Background(), cfg, handler)
 	require.NoError(t, err)
-	t.Cleanup(follower.Stop)
-	follower.mu.Lock()
-	follower.groups = make(map[string]*GroupMetadata)
-	follower.mu.Unlock()
-	follower.SetGroupObservationBatchResolver(func(groupNames []string) (map[string]bool, error) {
+	t.Cleanup(coordinator.Stop)
+	handler.reads.Store(0)
+	require.NoError(t, coordinator.RegisterGroup("events", "workers", 1))
+	coordinator.SetGroupObservationBatchResolver(func(groupNames []string) (map[string]bool, error) {
 		require.Equal(t, []string{"workers"}, groupNames)
-		return map[string]bool{"workers": false}, nil
+		return map[string]bool{"workers": true}, nil
 	})
 
-	observation := requireSingleObservation(t, follower)
-	require.False(t, observation.CoordinatorUp)
-	require.Nil(t, follower.GetGroup("workers"), "read-only metrics catalog mutated live coordinator state")
+	observation := requireSingleObservation(t, coordinator)
+	require.True(t, observation.CoordinatorUp)
+	require.Zero(t, handler.reads.Load(), "metrics observation scanned the durable consumer metadata log")
+}
+
+type observationReadTrap struct {
+	DummyPublisher
+	reads atomic.Int32
+}
+
+// ReadTopicPartition records any forbidden durable read made by observation.
+func (h *observationReadTrap) ReadTopicPartition(string, int, uint64, int) ([]types.Message, error) {
+	h.reads.Add(1)
+	return nil, nil
 }
 
 func TestGroupSnapshotRequiresLastActivity(t *testing.T) {

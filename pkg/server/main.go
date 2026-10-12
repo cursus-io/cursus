@@ -280,8 +280,14 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		if cd == nil {
 			return fmt.Errorf("%w: coordinator unavailable", ErrConsumerMetadataRecovery)
 		}
+		if err := globalCH.CaptureGroupRecoveryOwnership(); err != nil {
+			return fmt.Errorf("%w: capture ownership baseline: %w", ErrConsumerMetadataRecovery, err)
+		}
 		if err := awaitDistributedConsumerMetadataRecovery(ctx, cd, tm); err != nil {
 			return err
+		}
+		if err := globalCH.StartGroupRecoveryMonitor(ctx); err != nil {
+			return fmt.Errorf("%w: reconcile ownership after startup replay: %w", ErrConsumerMetadataRecovery, err)
 		}
 	}
 	if err := registerStaticConsumerGroups(cfg, tm, globalCH); err != nil {

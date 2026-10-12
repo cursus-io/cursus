@@ -32,6 +32,7 @@ func TestConsumerLifecycleMetricsAcrossThreeBrokerCluster(t *testing.T) {
 	joined := waitForLifecycleAggregate(t, []int{1, 2, 3}, ctx.GetTopic(), groupName, 1, "stable", clusterReadyTimeout)
 	require.Positive(t, joined.lastActivity)
 	require.Positive(t, joined.lastRebalance)
+	assertLifecycleScrapesKeepMembershipStable(t, first, []int{1, 2, 3}, ctx.GetTopic(), groupName, firstGeneration)
 
 	second := e2e.NewBrokerClient(clusterBrokerAddrs(3))
 	t.Cleanup(second.Close)
@@ -74,13 +75,14 @@ func TestConsumerLifecycleMetricsAcrossThreeBrokerCluster(t *testing.T) {
 }
 
 type lifecycleAggregate struct {
-	coordinatorSum float64
-	memberSeries   int
-	members        float64
-	state          float64
-	lastActivity   float64
-	lastRebalance  float64
-	owner          int
+	coordinatorSum    float64
+	coordinatorSeries int
+	memberSeries      int
+	members           float64
+	state             float64
+	lastActivity      float64
+	lastRebalance     float64
+	owner             int
 }
 
 func waitForLifecycleAggregate(
@@ -100,12 +102,13 @@ func waitForLifecycleAggregate(
 			return false, "metrics unavailable", err
 		}
 		ready := aggregate.coordinatorSum == 1 &&
+			aggregate.coordinatorSeries >= 1 &&
 			aggregate.memberSeries == 1 &&
 			aggregate.members == float64(wantMembers) &&
 			aggregate.state == 1 &&
 			aggregate.lastActivity > 0 &&
 			aggregate.lastRebalance > 0
-		detail := fmt.Sprintf("coordinator_sum=%v member_series=%d members=%v state=%v owner=%d", aggregate.coordinatorSum, aggregate.memberSeries, aggregate.members, aggregate.state, aggregate.owner)
+		detail := fmt.Sprintf("coordinator_sum=%v coordinator_series=%d member_series=%d members=%v state=%v owner=%d", aggregate.coordinatorSum, aggregate.coordinatorSeries, aggregate.memberSeries, aggregate.members, aggregate.state, aggregate.owner)
 		return ready, detail, nil
 	})
 	require.NoError(t, err)
@@ -121,12 +124,12 @@ func scrapeLifecycleAggregate(nodes []int, topicName, groupName, state string) (
 		}
 		labels := map[string]string{"topic": topicName, "group": groupName}
 		up, found := lifecycleGauge(families, "cursus_consumer_group_coordinator_up", labels)
-		if !found {
-			return aggregate, fmt.Errorf("broker-%d coordinator metric missing", node)
-		}
-		aggregate.coordinatorSum += up
-		if up == 1 {
-			aggregate.owner = node
+		if found {
+			aggregate.coordinatorSeries++
+			aggregate.coordinatorSum += up
+			if up == 1 {
+				aggregate.owner = node
+			}
 		}
 		if members, ok := lifecycleGauge(families, "cursus_consumer_group_members", labels); ok {
 			aggregate.memberSeries++
@@ -146,6 +149,34 @@ func scrapeLifecycleAggregate(nodes []int, topicName, groupName, state string) (
 		}
 	}
 	return aggregate, nil
+}
+
+// assertLifecycleScrapesKeepMembershipStable proves that repeated metrics
+// collection cannot starve a healthy member beyond its session timeout.
+func assertLifecycleScrapesKeepMembershipStable(
+	t *testing.T,
+	client *e2e.BrokerClient,
+	nodes []int,
+	topicName, groupName string,
+	wantGeneration int,
+) {
+	t.Helper()
+	deadline := time.Now().Add(35 * time.Second)
+	samples := 0
+	for time.Now().Before(deadline) {
+		started := time.Now()
+		aggregate, err := scrapeLifecycleAggregate(nodes, topicName, groupName, "stable")
+		require.NoError(t, err)
+		require.Less(t, time.Since(started), 2*time.Second, "metrics scrape blocked the consumer request path")
+		require.Equal(t, float64(1), aggregate.coordinatorSum)
+		require.Equal(t, 1, aggregate.memberSeries)
+		require.Equal(t, float64(1), aggregate.members)
+		require.NoError(t, client.SendHeartbeat())
+		require.Equal(t, wantGeneration, readLifecycleGroupGeneration(t, client, groupName))
+		samples++
+		time.Sleep(time.Second)
+	}
+	require.GreaterOrEqual(t, samples, 20, "insufficient scrape samples across the session timeout")
 }
 
 func scrapeBrokerMetricFamilies(node int) (map[string]*dto.MetricFamily, error) {

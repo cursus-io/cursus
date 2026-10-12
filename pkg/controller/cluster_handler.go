@@ -13,6 +13,7 @@ import (
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	replicationFSM "github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -22,6 +23,7 @@ import (
 )
 
 const DefaultFSMApplyTimeout = 5 * time.Second
+const groupRecoveryMonitorInterval = 500 * time.Millisecond
 
 type partitionLeadershipFence struct {
 	leader string
@@ -220,13 +222,16 @@ func (ch *CommandHandler) ResolveGroupCoordinators(groupNames []string) (map[str
 		}
 		ownerID, _, partition, epoch, recoveryErr := ch.Cluster.Router.FindCoordinatorWithEpoch(groupName)
 		if recoveryErr != nil {
-			return nil, fmt.Errorf("refresh coordinator recovery fence for group %q: %w", groupName, recoveryErr)
+			return nil, fmt.Errorf("check coordinator recovery fence for group %q: %w", groupName, recoveryErr)
 		}
 		if ownerID != localID {
-			return nil, fmt.Errorf("coordinator ownership changed while refreshing group %q", groupName)
+			return nil, fmt.Errorf("coordinator ownership changed while observing group %q", groupName)
 		}
-		if err := ch.ensureGroupRecovery(partition, epoch); err != nil {
-			return nil, fmt.Errorf("reload distributed consumer metadata: %w", err)
+		ch.groupRecoveryMu.Lock()
+		recovered := ch.groupRecoveryEpoch[partition] == epoch
+		ch.groupRecoveryMu.Unlock()
+		if !recovered {
+			return nil, fmt.Errorf("consumer metadata recovery pending for group %q", groupName)
 		}
 		if err := ch.validateRecoveredCoordinatorRoute(groupName, partition, epoch); err != nil {
 			return nil, err
@@ -304,13 +309,25 @@ func (ch *CommandHandler) validateRecoveredCoordinatorRoute(coordKey string, exp
 	return nil
 }
 
+// ensureGroupRecovery restores durable consumer metadata for a coordinator
+// request without holding the observation fence during disk I/O.
 func (ch *CommandHandler) ensureGroupRecovery(partition uint64, epoch int) error {
 	if ch.Coordinator == nil {
 		return fmt.Errorf("coordinator unavailable")
 	}
 	ch.groupRecoveryMu.Lock()
-	defer ch.groupRecoveryMu.Unlock()
-	if ch.groupRecoveryEpoch[partition] == epoch {
+	recovered := ch.groupRecoveryEpoch[partition] == epoch
+	ch.groupRecoveryMu.Unlock()
+	if recovered {
+		return nil
+	}
+
+	ch.groupRecoveryReloadMu.Lock()
+	defer ch.groupRecoveryReloadMu.Unlock()
+	ch.groupRecoveryMu.Lock()
+	recovered = ch.groupRecoveryEpoch[partition] == epoch
+	ch.groupRecoveryMu.Unlock()
+	if recovered {
 		return nil
 	}
 	// The internal topic is broker-owned and permanently compacted. Replay the
@@ -319,8 +336,143 @@ func (ch *CommandHandler) ensureGroupRecovery(partition uint64, epoch int) error
 	if err := ch.Coordinator.ReloadDistributedConsumerMetadata(); err != nil {
 		return err
 	}
-	ch.groupRecoveryEpoch[partition] = epoch
+	epochs, err := ch.localGroupRecoveryEpochs()
+	if err != nil {
+		return err
+	}
+	if epochs[partition] != epoch {
+		return fmt.Errorf("consumer metadata ownership changed during recovery: partition=%d", partition)
+	}
+	ch.groupRecoveryMu.Lock()
+	ch.groupRecoveryEpoch = epochs
+	ch.groupRecoveryMu.Unlock()
 	return nil
+}
+
+// StartGroupRecoveryMonitor restores consumer metadata when this broker gains
+// ownership of an offsets partition. Recovery is tied to topology changes so
+// request and metrics paths never need to scan the durable metadata log.
+func (ch *CommandHandler) StartGroupRecoveryMonitor(ctx context.Context) error {
+	if ch == nil || !ch.isDistributed() || ch.Coordinator == nil || !ch.hasRouter() {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Reconcile synchronously before the public listener starts. The ownership
+	// baseline is captured before startup replay, so an ownership change during
+	// that replay cannot be mistaken for already recovered state.
+	if err := ch.refreshLocalGroupRecovery(); err != nil {
+		return err
+	}
+	go func() {
+		ticker := time.NewTicker(groupRecoveryMonitorInterval)
+		defer ticker.Stop()
+		lastFailure := ""
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := ch.refreshLocalGroupRecovery(); err != nil {
+					if err.Error() != lastFailure {
+						util.Warn("Consumer metadata ownership recovery pending: %v", err)
+						lastFailure = err.Error()
+					}
+					continue
+				}
+				lastFailure = ""
+			}
+		}
+	}()
+	return nil
+}
+
+// CaptureGroupRecoveryOwnership records the ownership baseline that the next
+// successful durable replay covers. Call it before startup metadata recovery.
+func (ch *CommandHandler) CaptureGroupRecoveryOwnership() error {
+	epochs, err := ch.localGroupRecoveryEpochs()
+	if err != nil {
+		return err
+	}
+	ch.groupRecoveryMu.Lock()
+	ch.groupRecoveryEpoch = epochs
+	ch.groupRecoveryMu.Unlock()
+	return nil
+}
+
+// refreshLocalGroupRecovery reloads durable consumer metadata after this
+// broker acquires an offsets partition at a new leader epoch.
+func (ch *CommandHandler) refreshLocalGroupRecovery() error {
+	ch.groupRecoveryReloadMu.Lock()
+	defer ch.groupRecoveryReloadMu.Unlock()
+
+	epochs, err := ch.localGroupRecoveryEpochs()
+	if err != nil {
+		return err
+	}
+	recoveryRequired := false
+	ch.groupRecoveryMu.Lock()
+	for partition, epoch := range epochs {
+		if ch.groupRecoveryEpoch[partition] != epoch {
+			recoveryRequired = true
+			break
+		}
+	}
+	if !recoveryRequired {
+		ch.groupRecoveryEpoch = epochs
+		ch.groupRecoveryMu.Unlock()
+		return nil
+	}
+	ch.groupRecoveryMu.Unlock()
+	if err := ch.Coordinator.ReloadDistributedConsumerMetadata(); err != nil {
+		return err
+	}
+	confirmed, err := ch.localGroupRecoveryEpochs()
+	if err != nil {
+		return err
+	}
+	for partition, epoch := range epochs {
+		if confirmed[partition] != epoch {
+			return fmt.Errorf("consumer metadata ownership changed during recovery: partition=%d", partition)
+		}
+	}
+	ch.groupRecoveryMu.Lock()
+	ch.groupRecoveryEpoch = confirmed
+	ch.groupRecoveryMu.Unlock()
+	return nil
+}
+
+// localGroupRecoveryEpochs returns the offsets partitions currently owned by
+// this broker and the leader epoch that fences each ownership term.
+func (ch *CommandHandler) localGroupRecoveryEpochs() (map[uint64]int, error) {
+	if ch == nil || ch.Cluster == nil || ch.Cluster.RaftManager == nil {
+		return nil, fmt.Errorf("raft manager unavailable")
+	}
+	if ch.Cluster.Router == nil {
+		return nil, fmt.Errorf("coordinator router unavailable")
+	}
+	fsmRef := ch.Cluster.RaftManager.GetFSM()
+	if fsmRef == nil {
+		return nil, fmt.Errorf("broker state unavailable")
+	}
+	localID := ch.Cluster.Router.BrokerID()
+	prefix := config.ConsumerOffsetsTopicName + "-"
+	epochs := make(map[uint64]int)
+	for _, key := range fsmRef.GetAllPartitionKeys() {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		partition, err := strconv.ParseUint(strings.TrimPrefix(key, prefix), 10, 64)
+		if err != nil {
+			continue
+		}
+		metadata := fsmRef.GetPartitionMetadata(key)
+		if metadata != nil && metadata.Leader == localID && metadata.LeaderEpoch > 0 {
+			epochs[partition] = metadata.LeaderEpoch
+		}
+	}
+	return epochs, nil
 }
 
 func (ch *CommandHandler) checkResolvedCoordinator(id, raftAddr, findCmd string, forward func(string) (string, error)) (AdvertisedAddr, bool, error) {
