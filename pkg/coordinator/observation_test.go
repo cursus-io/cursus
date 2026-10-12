@@ -157,6 +157,8 @@ func TestObserveConsumerGroupsDoesNotFabricateUnknownGroup(t *testing.T) {
 	require.Empty(t, coordinator.ObserveConsumerGroups())
 }
 
+// TestObserveConsumerGroupsNeverReadsDurableMetadata verifies that collecting
+// lifecycle metrics cannot trigger an offsets-log replay.
 func TestObserveConsumerGroupsNeverReadsDurableMetadata(t *testing.T) {
 	handler := &observationReadTrap{}
 	cfg := config.DefaultConfig()
@@ -181,6 +183,7 @@ type observationReadTrap struct {
 	reads atomic.Int32
 }
 
+// ReadTopicPartition records any forbidden durable read made by observation.
 func (h *observationReadTrap) ReadTopicPartition(string, int, uint64, int) ([]types.Message, error) {
 	h.reads.Add(1)
 	return nil, nil

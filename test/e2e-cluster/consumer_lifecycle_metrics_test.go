@@ -151,6 +151,8 @@ func scrapeLifecycleAggregate(nodes []int, topicName, groupName, state string) (
 	return aggregate, nil
 }
 
+// assertLifecycleScrapesKeepMembershipStable proves that repeated metrics
+// collection cannot starve a healthy member beyond its session timeout.
 func assertLifecycleScrapesKeepMembershipStable(
 	t *testing.T,
 	client *e2e.BrokerClient,
