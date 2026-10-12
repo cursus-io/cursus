@@ -16,6 +16,8 @@ type ReplicaCatchupFetcher interface {
 
 type ReplicaCatchupApplier func(context.Context, fsm.ReplicaCatchupBatch) error
 
+const replicaCatchupFetchTimeout = 30 * time.Second
+
 // StartReplicaCatchup periodically fills local replicas that are outside ISR.
 // ISR admission remains separate and happens only through the existing proof
 // emitted by a later heartbeat.
@@ -74,7 +76,7 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		fetchCtx, cancel := context.WithTimeout(ctx, replicaCatchupFetchTimeout)
 		batch, err := fetcher.FetchReplicaCatchup(fetchCtx, request.SourceAddress, discoveryPort, request)
 		cancel()
 		if err != nil {
@@ -89,6 +91,10 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		if batch.TruncateTo != nil {
 			return nil
 		}
+		// The committed HWM may advance while a live partition is being
+		// recovered. Treat the source's authenticated HWM as the next target
+		// instead of restarting from the old boundary on every write.
+		request.CommittedHWM = batch.CommittedHWM
 		if err := fsm.AdvanceReplicaCatchupRequest(&request, batch); err != nil {
 			return err
 		}
@@ -122,7 +128,7 @@ func validateReplicaCatchupBatch(request fsm.ReplicaCatchupRequest, batch fsm.Re
 	if err := fsm.ValidateReplicaCatchupBatchDigest(batch); err != nil {
 		return err
 	}
-	if batch.CommittedHWM != request.CommittedHWM || batch.StartOffset != request.NextOffset {
+	if batch.CommittedHWM < request.CommittedHWM || batch.StartOffset != request.NextOffset {
 		return fmt.Errorf("replica catch-up response boundary mismatch")
 	}
 	if batch.TruncateTo != nil {

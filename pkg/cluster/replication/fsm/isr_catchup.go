@@ -17,7 +17,9 @@ import (
 const MaxReplicaCatchupRecords = 1024
 
 // ReplicaCatchupRequest asks a current in-sync replica for a bounded raw
-// committed-log range. SourceAddress is local routing metadata and is not sent.
+// committed-log range. CommittedHWM is the follower's observed lower bound;
+// the source may return a newer committed boundary. SourceAddress is local
+// routing metadata and is not sent.
 type ReplicaCatchupRequest struct {
 	Topic                string `json:"topic"`
 	Partition            int    `json:"partition"`
@@ -532,8 +534,8 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 	if request.LifecycleEpoch != current.LifecycleEpoch {
 		return ReplicaCatchupBatch{}, fmt.Errorf("stale topic lifecycle epoch for %s", key)
 	}
-	if request.CommittedHWM != current.CommittedHWM {
-		return ReplicaCatchupBatch{}, fmt.Errorf("stale committed HWM for %s: current=%d requested=%d", key, current.CommittedHWM, request.CommittedHWM)
+	if request.CommittedHWM > current.CommittedHWM {
+		return ReplicaCatchupBatch{}, fmt.Errorf("committed HWM regressed for %s: current=%d requested=%d", key, current.CommittedHWM, request.CommittedHWM)
 	}
 	if request.NextOffset > current.CommittedHWM {
 		return ReplicaCatchupBatch{}, fmt.Errorf("catch-up offset %d exceeds committed HWM %d", request.NextOffset, current.CommittedHWM)

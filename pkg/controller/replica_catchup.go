@@ -80,8 +80,8 @@ func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replica
 	if metadata.LifecycleEpoch != batch.LifecycleEpoch {
 		return fmt.Errorf("%w: stale replica catch-up lifecycle fence", clusterController.ErrPartitionLeaderFenced)
 	}
-	if metadata.CommittedHWM != batch.CommittedHWM {
-		return fmt.Errorf("replica catch-up HWM changed: current=%d response=%d", metadata.CommittedHWM, batch.CommittedHWM)
+	if metadata.CommittedHWM < batch.CommittedHWM {
+		return fmt.Errorf("replica catch-up HWM regressed: current=%d response=%d", metadata.CommittedHWM, batch.CommittedHWM)
 	}
 	if !containsReplica(metadata.Replicas, batch.BrokerID) {
 		return fmt.Errorf("broker %s is not a configured replica", batch.BrokerID)
