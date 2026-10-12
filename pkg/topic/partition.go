@@ -1679,19 +1679,25 @@ func (p *Partition) ApplyReplicaRollback(offset uint64) error {
 		p.mu.Unlock()
 		return err
 	}
-	if err := p.truncateReplicaTailLocked(offset); err != nil {
-		p.mu.Unlock()
-		return err
-	}
-	wasAuthoritative := p.hwmAuthoritative
-	p.hwmAuthoritative = true
-	if p.HWM != offset {
-		p.HWM = offset
-		p.signalHWMCheckpointLocked()
-	} else if !wasAuthoritative {
-		p.signalHWMCheckpointLocked()
+	err := p.truncateReplicaTailLocked(offset)
+	// TruncateTo is the irreversible step. Once it succeeds, LEO already
+	// reflects offset even if rebuilding transaction or producer state fails.
+	// Publish the same boundary for HWM before returning so retries never
+	// observe a committed watermark beyond the durable tail.
+	if p.LEO.Load() == offset {
+		wasAuthoritative := p.hwmAuthoritative
+		p.hwmAuthoritative = true
+		if p.HWM != offset {
+			p.HWM = offset
+			p.signalHWMCheckpointLocked()
+		} else if !wasAuthoritative {
+			p.signalHWMCheckpointLocked()
+		}
 	}
 	p.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	p.clearReconciliationError()
 	return nil
 }

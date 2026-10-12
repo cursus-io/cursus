@@ -481,6 +481,28 @@ func TestPartition_ApplyReplicaRollbackPersistsLowerRecoveryBoundary(t *testing.
 	require.True(t, restarted.HWMKnown())
 }
 
+func TestPartition_ApplyReplicaRollbackKeepsWatermarksConsistentAfterRecoveryFailure(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+
+	storage := new(MockStorageHandler)
+	storage.On("GetLatestOffset").Return(uint64(3)).Once()
+	storage.On("TruncateTo", uint64(1)).Return(nil).Once()
+	storage.On("GetFirstOffset").Return(uint64(0)).Once()
+	storage.On("GetAbsoluteOffset").Return(uint64(1)).Once()
+	storage.On("ReadMessages", uint64(0), 1024).Return(nil, errors.New("injected recovery read failure")).Once()
+
+	p := NewPartition(0, "orders", storage, nil, cfg)
+	p.SetHWM(3)
+	err := p.ApplyReplicaRollback(1)
+	require.ErrorContains(t, err, "injected recovery read failure")
+	require.Equal(t, uint64(1), p.NextOffset())
+	require.Equal(t, uint64(1), p.GetHWM())
+	require.True(t, p.HWMKnown())
+	require.ErrorContains(t, p.RecoveryError(), "injected recovery read failure")
+	storage.AssertExpectations(t)
+}
+
 func TestPartition_ReconcileCommittedHWMPersistsClearedProducerCheckpoint(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
