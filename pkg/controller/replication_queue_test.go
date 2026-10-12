@@ -1444,6 +1444,8 @@ func TestApplyReplicaCatchupTruncatesDivergentTail(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
 	cfg.EnabledDistribution = true
+	cfg.DiskMinFreeBytes = 1
+	cfg.DiskMinFreePercent = 0.1
 	diskManager := disk.NewDiskManager(cfg)
 	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
 	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
@@ -1463,6 +1465,7 @@ func TestApplyReplicaCatchupTruncatesDivergentTail(t *testing.T) {
 	require.NoError(t, err)
 	partition.SetHWM(0)
 	require.NoError(t, partition.EnqueueBatchLeader([]types.Message{{Payload: "common"}, {Payload: "divergent"}}))
+	require.NoError(t, partition.ApplyReplicaHWM(2))
 
 	truncateTo := uint64(1)
 	batch, err := fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
@@ -1474,6 +1477,25 @@ func TestApplyReplicaCatchupTruncatesDivergentTail(t *testing.T) {
 	require.NoError(t, handler.ApplyReplicaCatchup(context.Background(), batch))
 	require.Equal(t, uint64(1), partition.NextOffset())
 	require.Equal(t, uint64(1), partition.GetHWM())
+
+	catchup, err := fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
+		Topic: "orders", Partition: 0, BrokerID: "broker-2", StartOffset: 1, EndOffset: 3, CommittedHWM: 3,
+		Leader: "broker-1", SourceBroker: "broker-1", LeaderEpoch: 8, LifecycleEpoch: topic.InitialLifecycleEpoch,
+		Verified: true,
+		Messages: []types.Message{
+			{Offset: 1, Payload: "authoritative-1", LeaderEpoch: 8},
+			{Offset: 2, Payload: "authoritative-2", LeaderEpoch: 8},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, handler.ApplyReplicaCatchup(context.Background(), catchup))
+	require.Equal(t, uint64(3), partition.NextOffset())
+	require.Equal(t, uint64(3), partition.GetHWM())
+	messages, err := partition.ReadCommitted(0, 10)
+	require.NoError(t, err)
+	require.Equal(t, []string{"common", "authoritative-1", "authoritative-2"}, []string{
+		messages[0].Payload, messages[1].Payload, messages[2].Payload,
+	})
 }
 
 func TestDistributedLeaderAcknowledgementHoldsWriteOwnershipUntilReplicationCompletes(t *testing.T) {

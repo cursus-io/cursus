@@ -104,7 +104,7 @@ func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replica
 		if len(batch.Messages) != 0 || batch.Verified || *batch.TruncateTo >= batch.StartOffset || batch.EndOffset != batch.StartOffset {
 			return fmt.Errorf("invalid replica catch-up truncation boundary")
 		}
-		if err := partition.ReconcileCommittedHWM(*batch.TruncateTo); err != nil {
+		if err := partition.ApplyReplicaRollback(*batch.TruncateTo); err != nil {
 			return err
 		}
 		partition.FlushDisk()

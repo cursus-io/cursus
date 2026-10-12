@@ -448,6 +448,39 @@ func TestPartition_TruncateReplicaTailPreservesCommittedHWM(t *testing.T) {
 	require.Equal(t, uint64(1), p.GetHWM())
 }
 
+func TestPartition_ApplyReplicaRollbackPersistsLowerRecoveryBoundary(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	cfg.DiskFlushIntervalMS = 1
+	cfg.DiskMinFreeBytes = 1
+	cfg.DiskMinFreePercent = 0.1
+
+	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.SetHWM(0)
+	require.NoError(t, p.EnqueueBatchLeader([]types.Message{
+		{Payload: "common"}, {Payload: "divergent-1"}, {Payload: "divergent-2"},
+	}))
+	require.NoError(t, p.ApplyReplicaHWM(3))
+	require.NoError(t, p.ApplyReplicaRollback(1))
+	require.Equal(t, uint64(1), p.NextOffset())
+	require.Equal(t, uint64(1), p.GetHWM())
+	p.FlushDisk()
+	p.Close()
+	require.NoError(t, dh.Close())
+
+	restartedDH, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, restartedDH.Close()) }()
+	restarted := NewPartition(0, "orders", restartedDH, nil, cfg)
+	defer restarted.Close()
+	require.Equal(t, uint64(1), restarted.NextOffset())
+	require.Equal(t, uint64(1), restarted.GetHWM())
+	require.True(t, restarted.HWMKnown())
+}
+
 func TestPartition_ReconcileCommittedHWMPersistsClearedProducerCheckpoint(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
