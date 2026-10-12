@@ -1664,6 +1664,44 @@ func (p *Partition) TruncateReplicaTail(offset uint64) error {
 	return p.truncateReplicaTailLocked(offset)
 }
 
+// ApplyReplicaRollback moves a recovering follower to a leader-proven
+// divergence boundary. Callers must validate the source replica, leader and
+// lifecycle epochs, and authoritative committed HWM before invoking it. The
+// public replica-tail helper deliberately cannot cross the local committed
+// HWM; this internal recovery transition may move that stale local watermark
+// backward so the follower can refetch the authoritative prefix.
+func (p *Partition) ApplyReplicaRollback(offset uint64) error {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
+	p.mu.Lock()
+	if p.snapshotRecovery {
+		err := fmt.Errorf("snapshot replay is still pending: visible_hwm=%d durable_hwm=%d requested_offset=%d", p.HWM, p.recoveryCheckpointHWM, offset)
+		p.mu.Unlock()
+		return err
+	}
+	err := p.truncateReplicaTailLocked(offset)
+	// TruncateTo is the irreversible step. Once it succeeds, LEO already
+	// reflects offset even if rebuilding transaction or producer state fails.
+	// Publish the same boundary for HWM before returning so retries never
+	// observe a committed watermark beyond the durable tail.
+	if p.LEO.Load() == offset {
+		wasAuthoritative := p.hwmAuthoritative
+		p.hwmAuthoritative = true
+		if p.HWM != offset {
+			p.HWM = offset
+			p.signalHWMCheckpointLocked()
+		} else if !wasAuthoritative {
+			p.signalHWMCheckpointLocked()
+		}
+	}
+	p.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	p.clearReconciliationError()
+	return nil
+}
+
 // ReconcileSnapshotHWM stages the snapshot visibility boundary without
 // deleting any later local records. Raft replays its committed log tail after
 // Restore returns, then FinalizeSnapshotRecovery performs the only truncation.

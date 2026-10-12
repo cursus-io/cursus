@@ -448,6 +448,61 @@ func TestPartition_TruncateReplicaTailPreservesCommittedHWM(t *testing.T) {
 	require.Equal(t, uint64(1), p.GetHWM())
 }
 
+func TestPartition_ApplyReplicaRollbackPersistsLowerRecoveryBoundary(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	cfg.DiskFlushIntervalMS = 1
+	cfg.DiskMinFreeBytes = 1
+	cfg.DiskMinFreePercent = 0.1
+
+	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	p := NewPartition(0, "orders", dh, nil, cfg)
+	p.SetHWM(0)
+	require.NoError(t, p.EnqueueBatchLeader([]types.Message{
+		{Payload: "common"}, {Payload: "divergent-1"}, {Payload: "divergent-2"},
+	}))
+	require.NoError(t, p.ApplyReplicaHWM(3))
+	require.NoError(t, p.ApplyReplicaRollback(1))
+	require.Equal(t, uint64(1), p.NextOffset())
+	require.Equal(t, uint64(1), p.GetHWM())
+	p.FlushDisk()
+	p.Close()
+	require.NoError(t, dh.Close())
+
+	restartedDH, err := disk.NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, restartedDH.Close()) }()
+	restarted := NewPartition(0, "orders", restartedDH, nil, cfg)
+	defer restarted.Close()
+	require.Equal(t, uint64(1), restarted.NextOffset())
+	require.Equal(t, uint64(1), restarted.GetHWM())
+	require.True(t, restarted.HWMKnown())
+}
+
+func TestPartition_ApplyReplicaRollbackKeepsWatermarksConsistentAfterRecoveryFailure(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+
+	storage := new(MockStorageHandler)
+	storage.On("GetLatestOffset").Return(uint64(3)).Once()
+	storage.On("TruncateTo", uint64(1)).Return(nil).Once()
+	storage.On("GetFirstOffset").Return(uint64(0)).Once()
+	storage.On("GetAbsoluteOffset").Return(uint64(1)).Once()
+	storage.On("ReadMessages", uint64(0), 1024).Return(nil, errors.New("injected recovery read failure")).Once()
+
+	p := NewPartition(0, "orders", storage, nil, cfg)
+	p.SetHWM(3)
+	err := p.ApplyReplicaRollback(1)
+	require.ErrorContains(t, err, "injected recovery read failure")
+	require.Equal(t, uint64(1), p.NextOffset())
+	require.Equal(t, uint64(1), p.GetHWM())
+	require.True(t, p.HWMKnown())
+	require.ErrorContains(t, p.RecoveryError(), "injected recovery read failure")
+	storage.AssertExpectations(t)
+}
+
 func TestPartition_ReconcileCommittedHWMPersistsClearedProducerCheckpoint(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
