@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,17 +27,19 @@ type coordinatorRoutingRaftManager struct {
 type coordinatorRoutingTopicHandler struct {
 	coordinator.TopicHandler
 	readErr error
+	reads   atomic.Int32
 }
 
-func (coordinatorRoutingTopicHandler) Publish(string, *types.Message) error {
+func (*coordinatorRoutingTopicHandler) Publish(string, *types.Message) error {
 	return nil
 }
 
-func (coordinatorRoutingTopicHandler) CreateTopic(string, int, bool, bool) error {
+func (*coordinatorRoutingTopicHandler) CreateTopic(string, int, bool, bool) error {
 	return nil
 }
 
 func (handler *coordinatorRoutingTopicHandler) ReadTopicPartition(string, int, uint64, int) ([]types.Message, error) {
+	handler.reads.Add(1)
 	return nil, handler.readErr
 }
 
@@ -305,6 +308,8 @@ func TestCoordinatorOwnershipChecksRecoverAndFailClosed(t *testing.T) {
 	installRoutingOffsetsTopology(t, brokerFSM, "node-1")
 	local := newCoordinatorRoutingHandler("node-1", brokerFSM, groupCoordinator)
 	remote := newCoordinatorRoutingHandler("node-2", brokerFSM, groupCoordinator)
+	require.NoError(t, local.seedLocalGroupRecoveryEpochs())
+	require.NoError(t, remote.seedLocalGroupRecoveryEpochs())
 	require.True(t, local.IsGroupCoordinator("workers"))
 	require.False(t, remote.IsGroupCoordinator("workers"))
 
@@ -318,8 +323,46 @@ func TestCoordinatorOwnershipChecksRecoverAndFailClosed(t *testing.T) {
 	delete(local.groupRecoveryEpoch, partition)
 	reader.readErr = fmt.Errorf("committed metadata unavailable")
 	require.False(t, local.IsGroupCoordinator("workers"))
+	readsAfterRecoveryAttempt := reader.reads.Load()
 	_, err = local.ResolveGroupCoordinators([]string{"workers"})
-	require.ErrorContains(t, err, "committed metadata unavailable")
+	require.ErrorContains(t, err, "consumer metadata recovery pending")
+	require.Equal(t, readsAfterRecoveryAttempt, reader.reads.Load(), "metrics ownership resolution read durable metadata")
+}
+
+func TestGroupRecoveryRefreshesOnceAfterOffsetsOwnershipChange(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	reader := &coordinatorRoutingTopicHandler{}
+	groupCoordinator, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, reader)
+	require.NoError(t, err)
+	t.Cleanup(groupCoordinator.Stop)
+
+	brokerFSM := fsm.NewBrokerFSM(nil, groupCoordinator)
+	registerRoutingBroker(t, brokerFSM, "node-1")
+	registerRoutingBroker(t, brokerFSM, "node-2")
+	installRoutingOffsetsTopology(t, brokerFSM, "node-2")
+	handler := newCoordinatorRoutingHandler("node-1", brokerFSM, groupCoordinator)
+	require.NoError(t, handler.seedLocalGroupRecoveryEpochs())
+	require.Empty(t, handler.groupRecoveryEpoch)
+
+	for partition := 0; partition < 4; partition++ {
+		key := fmt.Sprintf("%s-%d", config.ConsumerOffsetsTopicName, partition)
+		metadata := brokerFSM.GetPartitionMetadata(key)
+		require.NotNil(t, metadata)
+		metadata.Leader = "node-1"
+		metadata.LeaderEpoch++
+		payload, marshalErr := json.Marshal(metadata)
+		require.NoError(t, marshalErr)
+		require.Nil(t, brokerFSM.Apply(&raft.Log{Index: uint64(3 + partition), Data: []byte("PARTITION:" + key + ":" + string(payload))}))
+	}
+
+	reader.reads.Store(0)
+	require.NoError(t, handler.refreshLocalGroupRecovery())
+	require.Len(t, handler.groupRecoveryEpoch, 4)
+	readsAfterOwnershipChange := reader.reads.Load()
+	require.Positive(t, readsAfterOwnershipChange)
+	require.NoError(t, handler.refreshLocalGroupRecovery())
+	require.Equal(t, readsAfterOwnershipChange, reader.reads.Load(), "stable ownership repeated durable recovery")
 }
 
 func TestCoordinatorRecoveryHelpersRejectUnavailableState(t *testing.T) {

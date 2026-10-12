@@ -283,6 +283,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		if err := awaitDistributedConsumerMetadataRecovery(ctx, cd, tm); err != nil {
 			return err
 		}
+		globalCH.StartGroupRecoveryMonitor(ctx)
 	}
 	if err := registerStaticConsumerGroups(cfg, tm, globalCH); err != nil {
 		return fmt.Errorf("register static consumer groups: %w", err)
