@@ -273,6 +273,21 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 	if err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 	}
+	if ch.Config.EnabledDistribution && ch.Cluster != nil {
+		forwardCmd := cmd
+		if _, explicitPartition := args["partition"]; !explicitPartition {
+			forwardCmd = publishCommandWithPartition(cmd, partition)
+		}
+		if resp, forwarded, _ := ch.isPartitionLeaderAndForwardContext(requestCtx, topicName, partition, forwardCmd); forwarded {
+			return resp
+		}
+	}
+
+	// The partition owner must keep an open transaction stable from validation
+	// through its local append. Coordinator-local calls already hold this lock;
+	// forwarded calls acquire the destination broker's corresponding lock.
+	releaseTransactionState := ch.lockTransactionPublishState(clientCtx, msg)
+	defer releaseTransactionState()
 	if errResp := ch.validateTransactionPublishMetadata(args, topicName, partition, msg); errResp != "" {
 		return errResp
 	}
@@ -286,13 +301,6 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 	}
 
 	if ch.Config.EnabledDistribution && ch.Cluster != nil {
-		forwardCmd := cmd
-		if _, explicitPartition := args["partition"]; !explicitPartition {
-			forwardCmd = publishCommandWithPartition(cmd, partition)
-		}
-		if resp, forwarded, _ := ch.isPartitionLeaderAndForwardContext(requestCtx, topicName, partition, forwardCmd); forwarded {
-			return resp
-		}
 
 		effectiveMinISR := t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas)
 		requiredISR := 0
@@ -493,6 +501,18 @@ Respond:
 		return "ERROR: marshal_ack_failed"
 	}
 	return string(respBytes)
+}
+
+func (ch *CommandHandler) lockTransactionPublishState(clientCtx *ClientContext, msg *types.Message) func() {
+	if msg == nil || msg.TransactionalID == "" || msg.TransactionMarker != types.TransactionMarkerNone {
+		return func() {}
+	}
+	if clientCtx != nil && clientCtx.transactionStateLockHeld {
+		return func() {}
+	}
+	stateLock := ch.transactionStateLock(msg.TransactionalID)
+	stateLock.Lock()
+	return stateLock.Unlock
 }
 
 // publishCommandWithPartition preserves the client's complete command and only

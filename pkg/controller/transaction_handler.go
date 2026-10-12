@@ -1325,7 +1325,9 @@ func (ch *CommandHandler) publishInternalTransactionCommand(cmd string) error {
 	deadline := time.Now().Add(DefaultFSMApplyTimeout)
 	var lastResp string
 	for {
-		lastResp = ch.handlePublish(cmd, NewInternalClientContext("default-group", 0))
+		ctx := NewInternalClientContext("default-group", 0)
+		ctx.transactionStateLockHeld = true
+		lastResp = ch.handlePublish(cmd, ctx)
 		if strings.HasPrefix(lastResp, "OK") || strings.HasPrefix(lastResp, "{") {
 			return nil
 		}

@@ -101,3 +101,74 @@ func TestLeaderProcessingRecordStillRejectsTerminalState(t *testing.T) {
 	msg := &types.Message{TransactionalID: "tx-1", ProducerID: "producer-1", Epoch: 2}
 	require.Contains(t, ch.validateTransactionRecordPublish(tx, "orders", 0, msg), "transaction_not_open")
 }
+
+func TestTransactionRecordPublishAcquiresPartitionOwnerStateFence(t *testing.T) {
+	ch := &CommandHandler{}
+	stateLock := ch.transactionStateLock("tx-1")
+	stateLock.Lock()
+
+	acquired := make(chan func(), 1)
+	go func() {
+		acquired <- ch.lockTransactionPublishState(
+			NewInternalClientContext("", 0),
+			&types.Message{TransactionalID: "tx-1"},
+		)
+	}()
+
+	select {
+	case release := <-acquired:
+		release()
+		t.Fatal("publish acquired the transaction fence before the owner released it")
+	case <-time.After(20 * time.Millisecond):
+	}
+	stateLock.Unlock()
+	select {
+	case release := <-acquired:
+		release()
+	case <-time.After(time.Second):
+		t.Fatal("publish did not acquire the released transaction fence")
+	}
+}
+
+func TestCoordinatorLocalTransactionPublishDoesNotRelockStateFence(t *testing.T) {
+	ch := &CommandHandler{}
+	ctx := NewInternalClientContext("", 0)
+	ctx.transactionStateLockHeld = true
+	stateLock := ch.transactionStateLock("tx-1")
+	stateLock.Lock()
+	defer stateLock.Unlock()
+
+	completed := make(chan struct{})
+	go func() {
+		ch.lockTransactionPublishState(ctx, &types.Message{TransactionalID: "tx-1"})()
+		close(completed)
+	}()
+
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("coordinator-local publish attempted to reacquire its transaction fence")
+	}
+}
+
+func TestTransactionMarkerPublishDoesNotAcquireRecordFence(t *testing.T) {
+	ch := &CommandHandler{}
+	stateLock := ch.transactionStateLock("tx-1")
+	stateLock.Lock()
+	defer stateLock.Unlock()
+
+	completed := make(chan struct{})
+	go func() {
+		ch.lockTransactionPublishState(
+			NewInternalClientContext("", 0),
+			&types.Message{TransactionalID: "tx-1", TransactionMarker: types.TransactionMarkerCommit},
+		)()
+		close(completed)
+	}()
+
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("transaction marker attempted to acquire the open-record fence")
+	}
+}
