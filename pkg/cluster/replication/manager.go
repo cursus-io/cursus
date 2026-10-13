@@ -47,7 +47,10 @@ type RaftStatus struct {
 	LastSnapshotTerm  uint64
 }
 
-const recoveredPartitionReplayNoProgressTimeout = 2 * time.Minute
+const (
+	recoveredPartitionReplayNoProgressTimeout = 2 * time.Minute
+	recoveredPartitionReplayPollInterval      = 500 * time.Millisecond
+)
 
 type raftStatsReader interface {
 	Stats() map[string]string
@@ -268,9 +271,55 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	go rm.isrManager.Start()
 
 	go rm.observeLeadership(notifyCh)
+	go watchRecoveredPartitionReplay(
+		ctx,
+		rm.raft,
+		rm.raftStore,
+		rm.fsm,
+		rm.brokerID,
+		recoveredPartitionReplayPollInterval,
+		recoveredPartitionReplayNoProgressTimeout,
+	)
 	go rm.reconcileTopicMaterializations(ctx, 5*time.Second)
 
 	return rm, nil
+}
+
+// watchRecoveredPartitionReplay closes recovery fences raised by snapshots
+// installed after startup. NewRaft can return after replaying local state and
+// receive a newer leader snapshot later, so the one startup wait above is not
+// sufficient for the lifetime of a follower.
+func watchRecoveredPartitionReplay(
+	ctx context.Context,
+	r raftStatsReader,
+	logStore raft.LogStore,
+	brokerFSM recoveredPartitionState,
+	brokerID string,
+	pollInterval time.Duration,
+	noProgressTimeout time.Duration,
+) {
+	if pollInterval <= 0 {
+		pollInterval = recoveredPartitionReplayPollInterval
+	}
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if !brokerFSM.HasPendingPartitionRecovery() {
+			continue
+		}
+		if err := awaitRecoveredPartitionReplay(ctx, r, logStore, brokerFSM, brokerID, noProgressTimeout); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			util.Warn("Recovered partition replay remains pending on broker %s: %v", brokerID, err)
+		}
+	}
 }
 
 func localPartitionsNeedRecoveryFence(topicManager *topic.TopicManager) bool {
@@ -348,14 +397,18 @@ func awaitRecoveredPartitionReplay(ctx context.Context, r raftStatsReader, logSt
 			if targetKnown && latestProgress.appliedIndex >= targetIndex && recoveredRaftAuthorityKnown(stats) {
 				latestCommit, parseErr := strconv.ParseUint(r.Stats()["commit_index"], 10, 64)
 				if parseErr == nil && latestCommit == commitIndex {
+					// Validate before finalization because finalization clears the
+					// recovery fence. A missing committed leader range must keep the
+					// broker fenced so readiness remains failed and a later retry can
+					// recover after leadership or local data changes.
+					if err := brokerFSM.ValidateLocalLeaderLogs(brokerID); err != nil {
+						return err
+					}
 					if err := brokerFSM.FinalizeRecoveredPartitions(); err != nil {
 						if !errors.Is(err, fsm.ErrRecoveredPartitionAuthorityPending) {
 							return fmt.Errorf("finalize recovered partitions after Raft replay: %w", err)
 						}
 					} else {
-						if err := brokerFSM.ValidateLocalLeaderLogs(brokerID); err != nil {
-							return err
-						}
 						return nil
 					}
 				}

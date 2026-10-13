@@ -50,11 +50,13 @@ func (s *mutableRaftStats) set(key, value string) {
 }
 
 type fakeRecoveredPartitionFSM struct {
-	mu          sync.RWMutex
-	applied     uint64
-	pending     bool
-	finalized   bool
-	finalizeErr error
+	mu            sync.RWMutex
+	applied       uint64
+	pending       bool
+	finalized     bool
+	finalizeCount int
+	finalizeErr   error
+	validateErr   error
 }
 
 func (f *fakeRecoveredPartitionFSM) AppliedIndex() uint64 {
@@ -76,16 +78,27 @@ func (f *fakeRecoveredPartitionFSM) FinalizeRecoveredPartitions() error {
 		return f.finalizeErr
 	}
 	f.finalized = true
+	f.finalizeCount++
 	f.pending = false
 	return nil
 }
 
-func (f *fakeRecoveredPartitionFSM) ValidateLocalLeaderLogs(string) error { return nil }
+func (f *fakeRecoveredPartitionFSM) ValidateLocalLeaderLogs(string) error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.validateErr
+}
 
 func (f *fakeRecoveredPartitionFSM) setApplied(index uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.applied = index
+}
+
+func (f *fakeRecoveredPartitionFSM) setPending(pending bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pending = pending
 }
 
 func (f *fakeRecoveredPartitionFSM) setFinalizeError(err error) {
@@ -94,10 +107,22 @@ func (f *fakeRecoveredPartitionFSM) setFinalizeError(err error) {
 	f.finalizeErr = err
 }
 
+func (f *fakeRecoveredPartitionFSM) setValidateError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.validateErr = err
+}
+
 func (f *fakeRecoveredPartitionFSM) wasFinalized() bool {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.finalized
+}
+
+func (f *fakeRecoveredPartitionFSM) finalizations() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.finalizeCount
 }
 
 type MockRaft struct {
@@ -407,6 +432,74 @@ func TestAwaitRecoveredPartitionReplayWaitsForPartitionAuthority(t *testing.T) {
 	brokerFSM.setFinalizeError(nil)
 	require.NoError(t, <-done)
 	require.True(t, brokerFSM.wasFinalized())
+}
+
+func TestAwaitRecoveredPartitionReplayKeepsFenceOnLeaderLogValidationFailure(t *testing.T) {
+	store := raft.NewInmemStore()
+	require.NoError(t, store.StoreLog(&raft.Log{Index: 1, Type: raft.LogConfiguration}))
+	stats := &mutableRaftStats{stats: map[string]string{
+		"state":               raft.Follower.String(),
+		"last_contact":        "1ms",
+		"last_snapshot_index": "0",
+		"commit_index":        "1",
+		"last_log_index":      "1",
+	}}
+	brokerFSM := &fakeRecoveredPartitionFSM{
+		pending:     true,
+		applied:     1,
+		validateErr: errors.New("missing committed leader range"),
+	}
+
+	err := awaitRecoveredPartitionReplay(context.Background(), stats, store, brokerFSM, "broker-1", time.Second)
+	require.ErrorContains(t, err, "missing committed leader range")
+	require.True(t, brokerFSM.HasPendingPartitionRecovery())
+	require.Zero(t, brokerFSM.finalizations())
+
+	brokerFSM.setValidateError(nil)
+	require.NoError(t, awaitRecoveredPartitionReplay(context.Background(), stats, store, brokerFSM, "broker-1", time.Second))
+	require.False(t, brokerFSM.HasPendingPartitionRecovery())
+	require.Equal(t, 1, brokerFSM.finalizations())
+}
+
+func TestWatchRecoveredPartitionReplayFinalizesRecoveryRaisedAfterStartup(t *testing.T) {
+	store := raft.NewInmemStore()
+	require.NoError(t, store.StoreLog(&raft.Log{Index: 1, Type: raft.LogConfiguration}))
+	stats := &mutableRaftStats{stats: map[string]string{
+		"state":               raft.Follower.String(),
+		"last_contact":        "1ms",
+		"last_snapshot_index": "0",
+		"commit_index":        "1",
+		"last_log_index":      "1",
+	}}
+	brokerFSM := &fakeRecoveredPartitionFSM{applied: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		watchRecoveredPartitionReplay(ctx, stats, store, brokerFSM, "broker-1", time.Millisecond, time.Second)
+	}()
+
+	brokerFSM.setPending(true)
+	require.Eventually(t, func() bool {
+		return brokerFSM.finalizations() == 1
+	}, time.Second, time.Millisecond)
+
+	// Installing another leader snapshot must raise and close a fresh fence;
+	// the watcher is a lifetime responsibility rather than a startup-only wait.
+	brokerFSM.setPending(true)
+	require.Eventually(t, func() bool {
+		return brokerFSM.finalizations() == 2
+	}, time.Second, time.Millisecond)
+
+	cancel()
+	require.Eventually(t, func() bool {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
 }
 
 func TestRaftReplicationManagerGetRaftStatus(t *testing.T) {
