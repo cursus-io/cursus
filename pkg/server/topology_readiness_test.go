@@ -43,6 +43,23 @@ func TestClusterTopologyDegradationDoesNotGateNodeReadiness(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.Code)
 }
 
+func TestBrokerRegistrationReadinessRequiresCurrentIncarnation(t *testing.T) {
+	state := fsm.NewBrokerFSM(nil, nil)
+	registerBroker := func(incarnationID string) {
+		payload, err := json.Marshal(fsm.BrokerInfo{
+			ID: "broker-1", Status: "active", IncarnationID: incarnationID,
+		})
+		require.NoError(t, err)
+		require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("REGISTER:"), payload...)}))
+	}
+
+	registerBroker("previous-process")
+	require.ErrorContains(t, brokerRegistrationReadinessError(state, "broker-1", "current-process"), "previous process incarnation")
+
+	registerBroker("current-process")
+	require.NoError(t, brokerRegistrationReadinessError(state, "broker-1", "current-process"))
+}
+
 func applyPartitionMetadata(t *testing.T, state *fsm.BrokerFSM, key string, metadata fsm.PartitionMetadata) {
 	t.Helper()
 	payload, err := json.Marshal(metadata)

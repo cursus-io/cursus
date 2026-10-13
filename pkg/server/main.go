@@ -67,6 +67,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	var rm *replication.RaftReplicationManager
 	var clusterClient *client.TCPClusterClient
 	var discoveryListener net.Listener
+	var brokerIncarnationID string
 	healthState := NewHealthState()
 	var startupComplete atomic.Bool
 	healthState.AddCheck("broker_startup", func(context.Context) error {
@@ -140,6 +141,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		if identity, ok := sd.(interface{ BrokerIncarnationID() string }); ok {
 			incarnationID = identity.BrokerIncarnationID()
 		}
+		brokerIncarnationID = incarnationID
 		cc.SetReplicaCatchupProofSubmitter(func(ctx context.Context, proof fsm.ISRCatchupProof) error {
 			return clusterClient.SubmitCatchupProof(ctx, rm.GetLeaderAddress(), brokerID, incarnationID, cfg.DiscoveryPort, proof)
 		})
@@ -172,10 +174,11 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 				util.Info("✅ Successfully joined cluster")
 			}
 
-			// Register self with ClientAddr — try local first, then forward to leader
+			// Register self with ClientAddr immediately after joining. A restarted
+			// process has a new incarnation, so its heartbeats are intentionally
+			// fenced until this durable registration reaches the leader.
 			go func() {
 				for i := 0; i < 15; i++ {
-					time.Sleep(3 * time.Second)
 					// Try direct Raft apply (works if we're the leader)
 					if err := sd.Register(); err == nil {
 						util.Info("✅ Registered with client address %s", clientAddr)
@@ -192,6 +195,11 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 							util.Info("✅ Registered via leader with client address %s", clientAddr)
 							return
 						}
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(3 * time.Second):
 					}
 				}
 			}()
@@ -344,11 +352,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {
 				return fmt.Errorf("cluster registration state unavailable")
 			}
-			broker := cc.RaftManager.GetFSM().GetBroker(cc.BrokerID())
-			if broker == nil || !strings.EqualFold(broker.Status, "active") {
-				return fmt.Errorf("local broker registration is not active")
-			}
-			return nil
+			return brokerRegistrationReadinessError(cc.RaftManager.GetFSM(), cc.BrokerID(), brokerIncarnationID)
 		})
 		healthState.AddCheck("cluster_topology", func(context.Context) error {
 			if cc == nil || cc.RaftManager == nil || cc.RaftManager.GetFSM() == nil {

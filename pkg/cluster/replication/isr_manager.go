@@ -128,10 +128,13 @@ func (i *ISRManager) IsBrokerAlive(brokerID string) bool {
 	}
 	i.mu.RLock()
 	defer i.mu.RUnlock()
+	return i.isBrokerAliveLocked(brokerID, time.Now())
+}
+
+func (i *ISRManager) isBrokerAliveLocked(brokerID string, now time.Time) bool {
 	if brokerID == i.brokerID {
 		return true
 	}
-	now := time.Now()
 	if !i.leaderSince.IsZero() && now.Sub(i.leaderSince) <= i.heartbeatTimeout {
 		return true
 	}
@@ -223,14 +226,13 @@ func (i *ISRManager) ComputeISR(topic string, partition int) []string {
 	// A heartbeat proves liveness, not log synchronization. Only existing ISR
 	// members may remain in ISR; catch-up must explicitly re-admit a replica.
 	i.mu.RLock()
+	now := time.Now()
 	for _, replica := range metadata.ISR {
 		if broker := i.fsm.GetBroker(replica); broker != nil && broker.Status != "active" {
 			continue
 		}
-		if lastSeen, ok := i.lastSeen[replica]; ok {
-			if time.Since(lastSeen) < i.heartbeatTimeout {
-				currentISR = append(currentISR, replica)
-			}
+		if i.isBrokerAliveLocked(replica, now) {
+			currentISR = append(currentISR, replica)
 		}
 	}
 	i.mu.RUnlock()
