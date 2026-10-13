@@ -6,9 +6,12 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/cursus-io/cursus/pkg/config"
 )
 
 const rollingRestartISRStabilityWindow = 6 * time.Second
+const rollingRestartLiveCommitInterval = 250 * time.Millisecond
 
 func TestCleanBootstrapRollingRestartRestoresFullISR(t *testing.T) {
 	if os.Getenv("RUN_E2E_ROLLING_RESTART") != "1" {
@@ -43,6 +46,8 @@ func TestCleanBootstrapRollingRestartRestoresFullISR(t *testing.T) {
 		requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), ctx.GetTopic(), uint64(ctx.GetNumMessages()))
 	}
 
+	verifyLiveConsumerOffsetCatchup(t, ctx, actions)
+
 	// Lose quorum while preserving each broker's durable volume. Membership can
 	// become active again before a restarted replica has replayed its committed
 	// range, so readiness and the ISR-backed catch-up path must converge data
@@ -54,6 +59,116 @@ func TestCleanBootstrapRollingRestartRestoresFullISR(t *testing.T) {
 	actions.WaitForTopicMetadata()
 	waitForStableFullISRAndZeroUnderReplicated(t, ctx, "two-broker quorum-loss restart")
 	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), ctx.GetTopic(), uint64(ctx.GetNumMessages()))
+}
+
+func verifyLiveConsumerOffsetCatchup(t *testing.T, ctx *ClusterTestContext, actions *ClusterActions) {
+	t.Helper()
+	const group = "rolling-restart-live-offsets"
+	client, generation, member := joinClusterGroup(t, ctx.GetBrokerAddrs(), ctx.GetTopic(), group)
+	defer client.Close()
+	commitGroupOffset(t, client, ctx.GetTopic(), group, 1, generation, member)
+	offsetPartition, _ := consumerOffsetPartition(t, ctx.GetBrokerAddrs(), group)
+	coordinator := coordinatorNode(t, findGroupCoordinator(t, 1, group))
+	recoveryNode := 1
+	if recoveryNode == coordinator {
+		recoveryNode = 2
+	}
+
+	actions.StopBroker(recoveryNode)
+	waitForBrokerEvictedFromPartitionISR(t, ctx, config.ConsumerOffsetsTopicName, offsetPartition, recoveryNode)
+	for offset := uint64(2); offset <= 64; offset++ {
+		commitGroupOffset(t, client, ctx.GetTopic(), group, offset, generation, member)
+		heartbeatGroup(t, client, ctx.GetTopic(), group, generation, member)
+	}
+	actions.StartBroker(recoveryNode)
+	actions.WaitForTopicMetadata()
+
+	deadline := time.Now().Add(4 * clusterReadyTimeout)
+	var stableSince time.Time
+	latestOffset := uint64(64)
+	liveCommitCount := 0
+	for time.Now().Before(deadline) {
+		latestOffset++
+		commitGroupOffset(t, client, ctx.GetTopic(), group, latestOffset, generation, member)
+		liveCommitCount++
+		heartbeatGroup(t, client, ctx.GetTopic(), group, generation, member)
+		ready, _, err := partitionFullISRAndZeroUnderReplicated(ctx, config.ConsumerOffsetsTopicName, offsetPartition)
+		if err == nil && ready {
+			if stableSince.IsZero() {
+				stableSince = time.Now()
+			} else if time.Since(stableSince) >= rollingRestartISRStabilityWindow {
+				if liveCommitCount < 10 {
+					t.Fatalf("replica recovered before sustained live commits were exercised: commits=%d", liveCommitCount)
+				}
+				requireReplicaPartitionOffsetsConverge(t, ctx.GetBrokerAddrs(), config.ConsumerOffsetsTopicName, offsetPartition)
+				if committed := fetchCommittedOffset(t, client, ctx.GetTopic(), group); committed != latestOffset {
+					t.Fatalf("live committed offset=%d want=%d", committed, latestOffset)
+				}
+				return
+			}
+		} else {
+			stableSince = time.Time{}
+		}
+		time.Sleep(rollingRestartLiveCommitInterval)
+	}
+	t.Fatalf("consumer-offset partition %d did not restore full ISR while commits continued", offsetPartition)
+}
+
+func waitForBrokerEvictedFromPartitionISR(t *testing.T, ctx *ClusterTestContext, topicName string, partitionID, node int) {
+	t.Helper()
+	brokerID := fmt.Sprintf("broker-%d-%d", node, baseBrokerPort)
+	err := eventually(t, fmt.Sprintf("%s eviction from %s-%d ISR", brokerID, topicName, partitionID), clusterReadyTimeout, func() (bool, string, error) {
+		response, err := ctx.GetClient().SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topicName), 5*time.Second)
+		if err != nil {
+			return false, "DESCRIBE failed", err
+		}
+		var metadata topicMetadata
+		if err := json.Unmarshal([]byte(response), &metadata); err != nil {
+			return false, response, err
+		}
+		for _, partition := range metadata.Partitions {
+			if partition.ID != partitionID {
+				continue
+			}
+			for _, member := range partition.ISR {
+				if member == brokerID {
+					return false, fmt.Sprintf("broker=%s still present in isr=%v", brokerID, partition.ISR), nil
+				}
+			}
+			return len(partition.ISR) == ctx.clusterSize-1, fmt.Sprintf("partition=%d isr=%v", partitionID, partition.ISR), nil
+		}
+		return false, fmt.Sprintf("partition=%d missing", partitionID), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func partitionFullISRAndZeroUnderReplicated(ctx *ClusterTestContext, topicName string, partitionID int) (bool, string, error) {
+	response, err := ctx.GetClient().SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topicName), 5*time.Second)
+	if err != nil {
+		return false, "DESCRIBE failed", err
+	}
+	var metadata topicMetadata
+	if err := json.Unmarshal([]byte(response), &metadata); err != nil {
+		return false, response, err
+	}
+	for _, partition := range metadata.Partitions {
+		if partition.ID != partitionID {
+			continue
+		}
+		if len(partition.Replicas) != ctx.clusterSize || len(partition.ISR) != ctx.clusterSize {
+			return false, fmt.Sprintf("partition=%d replicas=%v isr=%v", partitionID, partition.Replicas, partition.ISR), nil
+		}
+		for node := 1; node <= ctx.clusterSize; node++ {
+			value, metricErr := fetchMetric(node, "cursus_cluster_under_replicated_partitions")
+			if metricErr != nil || value != 0 {
+				return false, fmt.Sprintf("broker-%d under_replicated=%v err=%v", node, value, metricErr), nil
+			}
+		}
+		return true, fmt.Sprintf("partition=%d full ISR", partitionID), nil
+	}
+	return false, fmt.Sprintf("partition=%d missing", partitionID), nil
 }
 
 func waitForBrokerEvictedFromISR(t *testing.T, ctx *ClusterTestContext, node int) {

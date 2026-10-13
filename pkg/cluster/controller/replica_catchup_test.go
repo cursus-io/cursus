@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
@@ -15,18 +16,31 @@ import (
 )
 
 type recordingCatchupFetcher struct {
-	requests []fsm.ReplicaCatchupRequest
+	requests     []fsm.ReplicaCatchupRequest
+	committedHWM uint64
 }
 
 func (f *recordingCatchupFetcher) FetchReplicaCatchup(_ context.Context, _ string, _ int, request fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error) {
 	f.requests = append(f.requests, request)
+	committedHWM := request.CommittedHWM
+	if f.committedHWM > committedHWM {
+		committedHWM = f.committedHWM
+	}
+	if request.NextOffset == committedHWM {
+		return fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
+			Topic: request.Topic, Partition: request.Partition, BrokerID: request.BrokerID,
+			StartOffset: request.NextOffset, EndOffset: request.NextOffset, CommittedHWM: committedHWM,
+			Leader: request.Leader, SourceBroker: request.SourceBroker,
+			LeaderEpoch: request.LeaderEpoch, LifecycleEpoch: request.LifecycleEpoch, Verified: true,
+		})
+	}
 	endOffset := request.NextOffset + 1
 	return fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
 		Topic: request.Topic, Partition: request.Partition, BrokerID: request.BrokerID,
-		StartOffset: request.NextOffset, EndOffset: endOffset, CommittedHWM: request.CommittedHWM,
+		StartOffset: request.NextOffset, EndOffset: endOffset, CommittedHWM: committedHWM,
 		Leader: request.Leader, SourceBroker: request.SourceBroker,
 		LeaderEpoch: request.LeaderEpoch, LifecycleEpoch: request.LifecycleEpoch,
-		Verified: endOffset == request.CommittedHWM,
+		Verified: endOffset == committedHWM,
 		Messages: []types.Message{{Offset: request.NextOffset, Payload: "backfill", LeaderEpoch: int64(request.LeaderEpoch)}},
 	})
 }
@@ -87,6 +101,72 @@ func TestRunReplicaCatchupOnceFetchesUntilCommittedHWM(t *testing.T) {
 	require.Equal(t, int64(fetcher.requests[0].LeaderEpoch), fetcher.requests[2].PreviousLeaderEpoch)
 }
 
+func TestCatchupReplicaFollowsCommittedHWMThatAdvancesDuringRecovery(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	cfg.DiskMinFreeBytes = 1
+	cfg.DiskMinFreePercent = 0.1
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	brokerFSM := fsm.NewBrokerFSM(topicManager, nil)
+	for _, broker := range []fsm.BrokerInfo{
+		{ID: "node-1", Addr: "127.0.0.1:9001", Status: "active"},
+		{ID: "node-2", Addr: "127.0.0.1:9002", Status: "active"},
+	} {
+		data, err := json.Marshal(broker)
+		require.NoError(t, err)
+		require.Nil(t, brokerFSM.Apply(&raft.Log{Data: append([]byte("REGISTER:"), data...)}))
+	}
+	definition := topic.DefaultDefinition("orders", cfg)
+	definition.Partitions = 1
+	definition.ReplicationFactor = 2
+	command, err := json.Marshal(fsm.TopicCommand{Definition: &definition, LeaderID: "node-1"})
+	require.NoError(t, err)
+	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: append([]byte("TOPIC:"), command...)}))
+	metadata := brokerFSM.GetPartitionMetadata("orders-0")
+	require.NotNil(t, metadata)
+	metadata.CommittedHWM = 3
+	metadata.CommittedHWMKnown = true
+	metadata.ISR = []string{"node-1"}
+	data, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: append([]byte("PARTITION:orders-0:"), data...)}))
+
+	cc := NewClusterController(context.Background(), cfg, &MockRaftManager{mockFSM: brokerFSM}, nil, "node-2", "127.0.0.1:9002")
+	proofAttempts := 0
+	cc.SetReplicaCatchupProofSubmitter(func(_ context.Context, proof fsm.ISRCatchupProof) error {
+		proofAttempts++
+		require.Equal(t, uint64(3), proof.CommittedHWM)
+		if proofAttempts == 1 {
+			return fmt.Errorf("authoritative HWM advanced")
+		}
+		return nil
+	})
+	fetcher := &recordingCatchupFetcher{committedHWM: 3}
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	request := fsm.ReplicaCatchupRequest{
+		Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 0, CommittedHWM: 2,
+		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: metadata.LeaderEpoch,
+		LifecycleEpoch: metadata.LifecycleEpoch, MaxRecords: fsm.MaxReplicaCatchupRecords,
+		SourceAddress: "127.0.0.1:9001",
+	}
+	err = cc.catchupReplica(context.Background(), fetcher, func(_ context.Context, batch fsm.ReplicaCatchupBatch) error {
+		if len(batch.Messages) > 0 {
+			require.NoError(t, partition.ReplicaAppendWithMode(batch.Messages, true))
+		}
+		return partition.ApplyReplicaHWM(batch.EndOffset)
+	}, request)
+	require.NoError(t, err)
+	require.Len(t, fetcher.requests, 4)
+	require.Equal(t, 2, proofAttempts)
+	require.Equal(t, uint64(2), fetcher.requests[0].CommittedHWM)
+	require.Equal(t, uint64(3), fetcher.requests[1].CommittedHWM)
+	require.Equal(t, uint64(3), partition.GetHWM())
+}
+
 func TestValidateReplicaCatchupBatchRejectsFenceAndGap(t *testing.T) {
 	request := fsm.ReplicaCatchupRequest{
 		Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 4, CommittedHWM: 6,
@@ -100,6 +180,16 @@ func TestValidateReplicaCatchupBatchRejectsFenceAndGap(t *testing.T) {
 	batch, err := fsm.SealReplicaCatchupBatch(batch)
 	require.NoError(t, err)
 	require.NoError(t, validateReplicaCatchupBatch(request, batch))
+	advanced := batch
+	advanced.CommittedHWM = 8
+	advanced, err = fsm.SealReplicaCatchupBatch(advanced)
+	require.NoError(t, err)
+	require.NoError(t, validateReplicaCatchupBatch(request, advanced))
+	regressed := batch
+	regressed.CommittedHWM = request.CommittedHWM - 1
+	regressed, err = fsm.SealReplicaCatchupBatch(regressed)
+	require.NoError(t, err)
+	require.ErrorContains(t, validateReplicaCatchupBatch(request, regressed), "boundary")
 	batch.LeaderEpoch++
 	require.ErrorContains(t, validateReplicaCatchupBatch(request, batch), "fence")
 	batch.LeaderEpoch = request.LeaderEpoch

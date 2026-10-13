@@ -1363,6 +1363,74 @@ func TestPreparePartitionReplicaAllowsFencedBackfillBelowCommittedHWM(t *testing
 	require.Equal(t, uint64(2), partition.GetHWM())
 }
 
+func TestApplyReplicaCatchupAcceptsCommittedBatchWhenHWMAdvanced(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	cfg.DiskMinFreeBytes = 1
+	cfg.DiskMinFreePercent = 0.1
+	diskManager := disk.NewDiskManager(cfg)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	state := fsm.NewBrokerFSM(topicManager, nil)
+	applyPartitionMetadata(t, state, "orders", 0, fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 7, CommittedHWM: 3, CommittedHWMKnown: true,
+		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1"}, PartitionCount: 1,
+	})
+	cluster := clusterController.NewClusterController(
+		context.Background(), cfg, &MockRaftManagerForForward{state: state}, nil, "broker-2", "broker-2:9001",
+	)
+	handler := NewCommandHandler(topicManager, cfg, nil, nil, cluster)
+	t.Cleanup(func() {
+		_ = handler.Close()
+		topicManager.Stop()
+		diskManager.CloseAllHandlers()
+	})
+	batch, err := fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
+		Topic: "orders", Partition: 0, BrokerID: "broker-2", StartOffset: 0, EndOffset: 2, CommittedHWM: 2,
+		Leader: "broker-1", SourceBroker: "broker-1", LeaderEpoch: 7, LifecycleEpoch: topic.InitialLifecycleEpoch,
+		Verified: true, Messages: []types.Message{{Offset: 0, Payload: "zero"}, {Offset: 1, Payload: "one"}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, handler.ApplyReplicaCatchup(context.Background(), batch))
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), partition.NextOffset())
+	require.Equal(t, uint64(2), partition.GetHWM())
+}
+
+func TestApplyReplicaCatchupRejectsBatchAheadOfAuthoritativeHWM(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	cfg.DiskMinFreeBytes = 1
+	cfg.DiskMinFreePercent = 0.1
+	diskManager := disk.NewDiskManager(cfg)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	state := fsm.NewBrokerFSM(topicManager, nil)
+	applyPartitionMetadata(t, state, "orders", 0, fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 7, CommittedHWM: 2, CommittedHWMKnown: true,
+		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1"}, PartitionCount: 1,
+	})
+	cluster := clusterController.NewClusterController(
+		context.Background(), cfg, &MockRaftManagerForForward{state: state}, nil, "broker-2", "broker-2:9001",
+	)
+	handler := NewCommandHandler(topicManager, cfg, nil, nil, cluster)
+	t.Cleanup(func() {
+		_ = handler.Close()
+		topicManager.Stop()
+		diskManager.CloseAllHandlers()
+	})
+	batch, err := fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
+		Topic: "orders", Partition: 0, BrokerID: "broker-2", StartOffset: 0, EndOffset: 3, CommittedHWM: 3,
+		Leader: "broker-1", SourceBroker: "broker-1", LeaderEpoch: 7, LifecycleEpoch: topic.InitialLifecycleEpoch,
+		Verified: true, Messages: []types.Message{{Offset: 0}, {Offset: 1}, {Offset: 2}},
+	})
+	require.NoError(t, err)
+	require.ErrorContains(t, handler.ApplyReplicaCatchup(context.Background(), batch), "HWM regressed")
+}
+
 func TestPreparePartitionReplicaUsesLeaderCommittedHWMWhileLocalRaftApplyLags(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

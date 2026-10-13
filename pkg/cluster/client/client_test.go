@@ -12,6 +12,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func serveJoinResponse(conn net.Conn, success bool, errorMessage string) {
@@ -334,4 +335,59 @@ func TestStartLeaderHeartbeatTargetsCurrentLeader(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("leader heartbeat not received")
 	}
+}
+
+func TestSubmitCatchupProofWaitsForLeaderResponse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+
+	_, portString, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
+	var discoveryPort int
+	_, err = fmt.Sscanf(portString, "%d", &discoveryPort)
+	require.NoError(t, err)
+
+	received := make(chan wire.CommandPayload, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		connection, handshakeErr := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
+		if handshakeErr != nil {
+			return
+		}
+		request, readErr := connection.ReadFrame()
+		if readErr != nil {
+			return
+		}
+		payload, decodeErr := wire.DecodeCommandPayload(request.Payload)
+		if decodeErr != nil {
+			return
+		}
+		received <- payload
+		response, _ := json.Marshal(map[string]bool{"success": true})
+		_ = connection.WriteFrame(wire.Frame{
+			Kind: wire.KindResponse, Command: request.Command, Status: wire.StatusOK,
+			RequestID: request.RequestID, Payload: response,
+		})
+	}()
+
+	proof := fsm.ISRCatchupProof{
+		Topic: "orders", Partition: 0, BrokerID: "node-2", CommittedHWM: 12,
+		LocalLEO: 12, LocalHWM: 12, LeaderEpoch: 4, LifecycleEpoch: 1,
+	}
+	client := NewTCPClusterClient()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, client.SubmitCatchupProof(ctx, ln.Addr().String(), "node-2", "process-2", discoveryPort, proof))
+
+	payload := <-received
+	require.Equal(t, "node-2", payload.Fields["node_id"])
+	require.Equal(t, "process-2", payload.Fields["incarnation_id"])
+	var proofs []fsm.ISRCatchupProof
+	require.NoError(t, json.Unmarshal([]byte(payload.Fields["catchup_proofs"]), &proofs))
+	require.Equal(t, []fsm.ISRCatchupProof{proof}, proofs)
 }

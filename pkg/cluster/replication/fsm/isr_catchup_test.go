@@ -141,6 +141,53 @@ func TestBuildReplicaCatchupRequestsUsesLocalLEOAndLeaderFence(t *testing.T) {
 	require.Len(t, brokerFSM.BuildReplicaCatchupRequests("node-2"), 1, "a lagging replica must catch up even before ISR eviction commits")
 }
 
+func TestFetchReplicaCatchupUsesCurrentHWMWhenFollowerObservedOlderBoundary(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskMinFreeBytes = 1
+	cfg.DiskMinFreePercent = 0.1
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	t.Cleanup(partition.Close)
+	require.NoError(t, partition.ReplicaAppendWithMode([]types.Message{
+		{Offset: 0, Payload: "zero", LeaderEpoch: 4},
+		{Offset: 1, Payload: "one", LeaderEpoch: 4},
+	}, true))
+	require.NoError(t, partition.ApplyReplicaHWM(2))
+
+	brokerFSM := NewBrokerFSM(topicManager, nil)
+	registerActiveBroker(t, brokerFSM, "node-1")
+	registerActiveBroker(t, brokerFSM, "node-2")
+	definition := topicManager.GetTopic("orders").Definition()
+	brokerFSM.mu.Lock()
+	brokerFSM.topicState["orders"] = &definition
+	brokerFSM.partitionMetadata["orders-0"] = &PartitionMetadata{
+		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch,
+		CommittedHWM: 2, CommittedHWMKnown: true, PartitionCount: 1,
+		Replicas: []string{"node-1", "node-2"}, ISR: []string{"node-1"},
+	}
+	brokerFSM.mu.Unlock()
+
+	request := ReplicaCatchupRequest{
+		Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 0, CommittedHWM: 1,
+		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 4,
+		LifecycleEpoch: definition.LifecycleEpoch, MaxRecords: MaxReplicaCatchupRecords,
+	}
+	batch, err := brokerFSM.FetchReplicaCatchup(request)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), batch.CommittedHWM)
+	require.Equal(t, uint64(2), batch.EndOffset)
+	require.True(t, batch.Verified)
+
+	request.CommittedHWM = 3
+	_, err = brokerFSM.FetchReplicaCatchup(request)
+	require.ErrorContains(t, err, "regressed")
+}
+
 func TestAdvanceReplicaCatchupRequestMovesBoundaryAndPrefixProof(t *testing.T) {
 	request := ReplicaCatchupRequest{NextOffset: 2, CommittedHWM: 4}
 	batch := ReplicaCatchupBatch{

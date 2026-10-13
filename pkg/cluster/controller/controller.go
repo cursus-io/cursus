@@ -78,11 +78,20 @@ type ClusterController struct {
 	Config          *config.Config
 	brokerID        string
 	snapshotCatchup func(context.Context, fsm.ReplicaCatchupRequest) error
+	proofSubmitter  func(context.Context, fsm.ISRCatchupProof) error
 }
 
 func (cc *ClusterController) SetReplicaSnapshotCatchup(callback func(context.Context, fsm.ReplicaCatchupRequest) error) {
 	if cc != nil {
 		cc.snapshotCatchup = callback
+	}
+}
+
+// SetReplicaCatchupProofSubmitter installs the synchronous leader notification
+// used to close the final catch-up-to-ISR race on a live partition.
+func (cc *ClusterController) SetReplicaCatchupProofSubmitter(callback func(context.Context, fsm.ISRCatchupProof) error) {
+	if cc != nil {
+		cc.proofSubmitter = callback
 	}
 }
 
