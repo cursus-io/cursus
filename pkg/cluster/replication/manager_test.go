@@ -56,6 +56,7 @@ type fakeRecoveredPartitionFSM struct {
 	finalized     bool
 	finalizeCount int
 	finalizeErr   error
+	validateErr   error
 }
 
 func (f *fakeRecoveredPartitionFSM) AppliedIndex() uint64 {
@@ -82,7 +83,11 @@ func (f *fakeRecoveredPartitionFSM) FinalizeRecoveredPartitions() error {
 	return nil
 }
 
-func (f *fakeRecoveredPartitionFSM) ValidateLocalLeaderLogs(string) error { return nil }
+func (f *fakeRecoveredPartitionFSM) ValidateLocalLeaderLogs(string) error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.validateErr
+}
 
 func (f *fakeRecoveredPartitionFSM) setApplied(index uint64) {
 	f.mu.Lock()
@@ -100,6 +105,12 @@ func (f *fakeRecoveredPartitionFSM) setFinalizeError(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.finalizeErr = err
+}
+
+func (f *fakeRecoveredPartitionFSM) setValidateError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.validateErr = err
 }
 
 func (f *fakeRecoveredPartitionFSM) wasFinalized() bool {
@@ -421,6 +432,33 @@ func TestAwaitRecoveredPartitionReplayWaitsForPartitionAuthority(t *testing.T) {
 	brokerFSM.setFinalizeError(nil)
 	require.NoError(t, <-done)
 	require.True(t, brokerFSM.wasFinalized())
+}
+
+func TestAwaitRecoveredPartitionReplayKeepsFenceOnLeaderLogValidationFailure(t *testing.T) {
+	store := raft.NewInmemStore()
+	require.NoError(t, store.StoreLog(&raft.Log{Index: 1, Type: raft.LogConfiguration}))
+	stats := &mutableRaftStats{stats: map[string]string{
+		"state":               raft.Follower.String(),
+		"last_contact":        "1ms",
+		"last_snapshot_index": "0",
+		"commit_index":        "1",
+		"last_log_index":      "1",
+	}}
+	brokerFSM := &fakeRecoveredPartitionFSM{
+		pending:     true,
+		applied:     1,
+		validateErr: errors.New("missing committed leader range"),
+	}
+
+	err := awaitRecoveredPartitionReplay(context.Background(), stats, store, brokerFSM, "broker-1", time.Second)
+	require.ErrorContains(t, err, "missing committed leader range")
+	require.True(t, brokerFSM.HasPendingPartitionRecovery())
+	require.Zero(t, brokerFSM.finalizations())
+
+	brokerFSM.setValidateError(nil)
+	require.NoError(t, awaitRecoveredPartitionReplay(context.Background(), stats, store, brokerFSM, "broker-1", time.Second))
+	require.False(t, brokerFSM.HasPendingPartitionRecovery())
+	require.Equal(t, 1, brokerFSM.finalizations())
 }
 
 func TestWatchRecoveredPartitionReplayFinalizesRecoveryRaisedAfterStartup(t *testing.T) {

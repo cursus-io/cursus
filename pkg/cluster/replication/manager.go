@@ -397,14 +397,18 @@ func awaitRecoveredPartitionReplay(ctx context.Context, r raftStatsReader, logSt
 			if targetKnown && latestProgress.appliedIndex >= targetIndex && recoveredRaftAuthorityKnown(stats) {
 				latestCommit, parseErr := strconv.ParseUint(r.Stats()["commit_index"], 10, 64)
 				if parseErr == nil && latestCommit == commitIndex {
+					// Validate before finalization because finalization clears the
+					// recovery fence. A missing committed leader range must keep the
+					// broker fenced so readiness remains failed and a later retry can
+					// recover after leadership or local data changes.
+					if err := brokerFSM.ValidateLocalLeaderLogs(brokerID); err != nil {
+						return err
+					}
 					if err := brokerFSM.FinalizeRecoveredPartitions(); err != nil {
 						if !errors.Is(err, fsm.ErrRecoveredPartitionAuthorityPending) {
 							return fmt.Errorf("finalize recovered partitions after Raft replay: %w", err)
 						}
 					} else {
-						if err := brokerFSM.ValidateLocalLeaderLogs(brokerID); err != nil {
-							return err
-						}
 						return nil
 					}
 				}
