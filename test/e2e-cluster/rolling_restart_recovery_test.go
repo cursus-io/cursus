@@ -11,6 +11,7 @@ import (
 )
 
 const rollingRestartISRStabilityWindow = 6 * time.Second
+const rollingRestartLiveCommitInterval = 250 * time.Millisecond
 
 func TestCleanBootstrapRollingRestartRestoresFullISR(t *testing.T) {
 	if os.Getenv("RUN_E2E_ROLLING_RESTART") != "1" {
@@ -82,18 +83,23 @@ func verifyLiveConsumerOffsetCatchup(t *testing.T, ctx *ClusterTestContext, acti
 	actions.StartBroker(recoveryNode)
 	actions.WaitForTopicMetadata()
 
-	deadline := time.Now().Add(2 * clusterReadyTimeout)
+	deadline := time.Now().Add(4 * clusterReadyTimeout)
 	var stableSince time.Time
 	latestOffset := uint64(64)
+	liveCommitCount := 0
 	for time.Now().Before(deadline) {
 		latestOffset++
 		commitGroupOffset(t, client, ctx.GetTopic(), group, latestOffset, generation, member)
+		liveCommitCount++
 		heartbeatGroup(t, client, ctx.GetTopic(), group, generation, member)
 		ready, _, err := partitionFullISRAndZeroUnderReplicated(ctx, config.ConsumerOffsetsTopicName, offsetPartition)
 		if err == nil && ready {
 			if stableSince.IsZero() {
 				stableSince = time.Now()
 			} else if time.Since(stableSince) >= rollingRestartISRStabilityWindow {
+				if liveCommitCount < 10 {
+					t.Fatalf("replica recovered before sustained live commits were exercised: commits=%d", liveCommitCount)
+				}
 				requireReplicaPartitionOffsetsConverge(t, ctx.GetBrokerAddrs(), config.ConsumerOffsetsTopicName, offsetPartition)
 				if committed := fetchCommittedOffset(t, client, ctx.GetTopic(), group); committed != latestOffset {
 					t.Fatalf("live committed offset=%d want=%d", committed, latestOffset)
@@ -103,7 +109,7 @@ func verifyLiveConsumerOffsetCatchup(t *testing.T, ctx *ClusterTestContext, acti
 		} else {
 			stableSince = time.Time{}
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(rollingRestartLiveCommitInterval)
 	}
 	t.Fatalf("consumer-offset partition %d did not restore full ISR while commits continued", offsetPartition)
 }

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
@@ -24,6 +25,14 @@ func (f *recordingCatchupFetcher) FetchReplicaCatchup(_ context.Context, _ strin
 	committedHWM := request.CommittedHWM
 	if f.committedHWM > committedHWM {
 		committedHWM = f.committedHWM
+	}
+	if request.NextOffset == committedHWM {
+		return fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
+			Topic: request.Topic, Partition: request.Partition, BrokerID: request.BrokerID,
+			StartOffset: request.NextOffset, EndOffset: request.NextOffset, CommittedHWM: committedHWM,
+			Leader: request.Leader, SourceBroker: request.SourceBroker,
+			LeaderEpoch: request.LeaderEpoch, LifecycleEpoch: request.LifecycleEpoch, Verified: true,
+		})
 	}
 	endOffset := request.NextOffset + 1
 	return fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{
@@ -126,6 +135,15 @@ func TestCatchupReplicaFollowsCommittedHWMThatAdvancesDuringRecovery(t *testing.
 	require.Nil(t, brokerFSM.Apply(&raft.Log{Data: append([]byte("PARTITION:orders-0:"), data...)}))
 
 	cc := NewClusterController(context.Background(), cfg, &MockRaftManager{mockFSM: brokerFSM}, nil, "node-2", "127.0.0.1:9002")
+	proofAttempts := 0
+	cc.SetReplicaCatchupProofSubmitter(func(_ context.Context, proof fsm.ISRCatchupProof) error {
+		proofAttempts++
+		require.Equal(t, uint64(3), proof.CommittedHWM)
+		if proofAttempts == 1 {
+			return fmt.Errorf("authoritative HWM advanced")
+		}
+		return nil
+	})
 	fetcher := &recordingCatchupFetcher{committedHWM: 3}
 	partition, err := topicManager.GetTopic("orders").GetPartition(0)
 	require.NoError(t, err)
@@ -136,11 +154,14 @@ func TestCatchupReplicaFollowsCommittedHWMThatAdvancesDuringRecovery(t *testing.
 		SourceAddress: "127.0.0.1:9001",
 	}
 	err = cc.catchupReplica(context.Background(), fetcher, func(_ context.Context, batch fsm.ReplicaCatchupBatch) error {
-		partition.UpdateLEO(batch.EndOffset)
+		if len(batch.Messages) > 0 {
+			require.NoError(t, partition.ReplicaAppendWithMode(batch.Messages, true))
+		}
 		return partition.ApplyReplicaHWM(batch.EndOffset)
 	}, request)
 	require.NoError(t, err)
-	require.Len(t, fetcher.requests, 3)
+	require.Len(t, fetcher.requests, 4)
+	require.Equal(t, 2, proofAttempts)
 	require.Equal(t, uint64(2), fetcher.requests[0].CommittedHWM)
 	require.Equal(t, uint64(3), fetcher.requests[1].CommittedHWM)
 	require.Equal(t, uint64(3), partition.GetHWM())
@@ -164,6 +185,11 @@ func TestValidateReplicaCatchupBatchRejectsFenceAndGap(t *testing.T) {
 	advanced, err = fsm.SealReplicaCatchupBatch(advanced)
 	require.NoError(t, err)
 	require.NoError(t, validateReplicaCatchupBatch(request, advanced))
+	regressed := batch
+	regressed.CommittedHWM = request.CommittedHWM - 1
+	regressed, err = fsm.SealReplicaCatchupBatch(regressed)
+	require.NoError(t, err)
+	require.ErrorContains(t, validateReplicaCatchupBatch(request, regressed), "boundary")
 	batch.LeaderEpoch++
 	require.ErrorContains(t, validateReplicaCatchupBatch(request, batch), "fence")
 	batch.LeaderEpoch = request.LeaderEpoch

@@ -93,6 +93,25 @@ func (c *TCPClusterClient) sendHeartbeatToLeader(ctx context.Context, leaderAddr
 	return err
 }
 
+// SubmitCatchupProof synchronously presents one completed replica catch-up
+// proof to the current Raft leader. Periodic heartbeats remain the fallback,
+// while this path prevents live writes from making the proof stale in transit.
+func (c *TCPClusterClient) SubmitCatchupProof(
+	ctx context.Context,
+	leaderAddr, nodeID, incarnationID string,
+	discoveryPort int,
+	proof fsm.ISRCatchupProof,
+) error {
+	body, err := json.Marshal([]fsm.ISRCatchupProof{proof})
+	if err != nil {
+		return fmt.Errorf("marshal ISR catch-up proof: %w", err)
+	}
+	_, err = c.sendRequest(ctx, heartbeatTarget(leaderAddr, discoveryPort), wire.CommandHeartbeatCluster, map[string]string{
+		"node_id": nodeID, "incarnation_id": incarnationID, "catchup_proofs": string(body),
+	})
+	return err
+}
+
 func (c *TCPClusterClient) sendHeartbeat(
 	ctx context.Context,
 	peers []string,

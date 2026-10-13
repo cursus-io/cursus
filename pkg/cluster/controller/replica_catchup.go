@@ -17,6 +17,8 @@ type ReplicaCatchupFetcher interface {
 type ReplicaCatchupApplier func(context.Context, fsm.ReplicaCatchupBatch) error
 
 const replicaCatchupFetchTimeout = 30 * time.Second
+const replicaCatchupProofSubmitTimeout = 5 * time.Second
+const replicaCatchupProofRetryBackoff = 25 * time.Millisecond
 
 // StartReplicaCatchup periodically fills local replicas that are outside ISR.
 // ISR admission remains separate and happens only through the existing proof
@@ -99,22 +101,71 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 			return err
 		}
 		nextOffset := request.NextOffset
-		if nextOffset == request.CommittedHWM {
-			if !batch.Verified {
-				return fmt.Errorf("replica catch-up completed without prefix verification")
+		if nextOffset != request.CommittedHWM {
+			continue
+		}
+		if !batch.Verified {
+			return fmt.Errorf("replica catch-up completed without prefix verification")
+		}
+		if request.SnapshotCatchup {
+			if cc.snapshotCatchup == nil {
+				return fmt.Errorf("event snapshot catch-up is unavailable")
 			}
-			break
+			if err := cc.snapshotCatchup(ctx, request); err != nil {
+				return fmt.Errorf("event snapshot catch-up: %w", err)
+			}
+		}
+		if err := cc.RaftManager.GetFSM().MarkReplicaCatchupVerified(request); err != nil {
+			refreshed, ok := cc.refreshReplicaCatchupRequest(request)
+			if !ok {
+				return err
+			}
+			request = refreshed
+			continue
+		}
+		if cc.proofSubmitter == nil {
+			return nil
+		}
+		proof := fsm.ISRCatchupProof{
+			Topic: request.Topic, Partition: request.Partition, BrokerID: request.BrokerID,
+			CommittedHWM: request.CommittedHWM, LocalLEO: request.CommittedHWM, LocalHWM: request.CommittedHWM,
+			LeaderEpoch: request.LeaderEpoch, LifecycleEpoch: request.LifecycleEpoch,
+		}
+		proofCtx, cancel := context.WithTimeout(ctx, replicaCatchupProofSubmitTimeout)
+		err = cc.proofSubmitter(proofCtx, proof)
+		cancel()
+		if err != nil {
+			refreshed, ok := cc.refreshReplicaCatchupRequest(request)
+			if !ok {
+				metadata := cc.RaftManager.GetFSM().GetPartitionMetadata(fmt.Sprintf("%s-%d", request.Topic, request.Partition))
+				if metadata != nil && containsBroker(metadata.ISR, request.BrokerID) {
+					return nil
+				}
+				return fmt.Errorf("submit ISR catch-up proof: %w", err)
+			}
+			if refreshed.Leader != request.Leader || refreshed.LeaderEpoch != request.LeaderEpoch ||
+				refreshed.LifecycleEpoch != request.LifecycleEpoch {
+				return fmt.Errorf("submit ISR catch-up proof after fence change: %w", err)
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(replicaCatchupProofRetryBackoff):
+			}
+			request = refreshed
+			continue
+		}
+		return nil
+	}
+}
+
+func (cc *ClusterController) refreshReplicaCatchupRequest(previous fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupRequest, bool) {
+	for _, candidate := range cc.RaftManager.GetFSM().BuildReplicaCatchupRequests(cc.brokerID) {
+		if candidate.Topic == previous.Topic && candidate.Partition == previous.Partition && candidate.BrokerID == previous.BrokerID {
+			return candidate, true
 		}
 	}
-	if request.SnapshotCatchup {
-		if cc.snapshotCatchup == nil {
-			return fmt.Errorf("event snapshot catch-up is unavailable")
-		}
-		if err := cc.snapshotCatchup(ctx, request); err != nil {
-			return fmt.Errorf("event snapshot catch-up: %w", err)
-		}
-	}
-	return cc.RaftManager.GetFSM().MarkReplicaCatchupVerified(request)
+	return fsm.ReplicaCatchupRequest{}, false
 }
 
 func validateReplicaCatchupBatch(request fsm.ReplicaCatchupRequest, batch fsm.ReplicaCatchupBatch) error {

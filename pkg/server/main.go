@@ -140,6 +140,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		if identity, ok := sd.(interface{ BrokerIncarnationID() string }); ok {
 			incarnationID = identity.BrokerIncarnationID()
 		}
+		cc.SetReplicaCatchupProofSubmitter(func(ctx context.Context, proof fsm.ISRCatchupProof) error {
+			return clusterClient.SubmitCatchupProof(ctx, rm.GetLeaderAddress(), brokerID, incarnationID, cfg.DiscoveryPort, proof)
+		})
 		clusterClient.StartLeaderHeartbeat(ctx, rm.GetLeaderAddress, brokerID, incarnationID, cfg.DiscoveryPort)
 		// ISR proof propagation remains peer based; coordinator membership does not.
 		clusterClient.StartHeartbeat(
