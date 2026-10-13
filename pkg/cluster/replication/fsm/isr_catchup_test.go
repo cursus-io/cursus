@@ -384,6 +384,84 @@ func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
 	require.NoError(t, ValidateReplicaCatchupBatchDigest(batch))
 }
 
+func TestFetchReplicaCatchupWalksBackLegacyDivergentTail(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	diskManager := disk.NewDiskManager(cfg)
+	t.Cleanup(diskManager.CloseAllHandlers)
+	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+	partition, err := topicManager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	t.Cleanup(partition.Close)
+	for _, payload := range []string{"common", "source-one", "source-two"} {
+		require.NoError(t, partition.EnqueueSync(types.Message{Payload: payload}))
+	}
+	partition.FlushDisk()
+
+	brokerFSM := NewBrokerFSM(topicManager, nil)
+	registerActiveBroker(t, brokerFSM, "node-1")
+	registerActiveBroker(t, brokerFSM, "node-2")
+	definition := topicManager.GetTopic("orders").Definition()
+	brokerFSM.mu.Lock()
+	brokerFSM.topicState["orders"] = &definition
+	brokerFSM.partitionMetadata["orders-0"] = &PartitionMetadata{
+		Leader: "node-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch,
+		CommittedHWM: 3, CommittedHWMKnown: true, PartitionCount: 1,
+		Replicas: []string{"node-1", "node-2"}, ISR: []string{"node-1"},
+	}
+	brokerFSM.mu.Unlock()
+
+	request := ReplicaCatchupRequest{
+		Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 3, CommittedHWM: 3,
+		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 4,
+		LifecycleEpoch: definition.LifecycleEpoch, MaxRecords: MaxReplicaCatchupRecords,
+		PreviousLeaderEpoch: 0,
+	}
+
+	request.PreviousRecordDigest, err = replicaRecordDigest(types.Message{Offset: 2, Payload: "follower-two"})
+	require.NoError(t, err)
+	firstRollback, err := brokerFSM.FetchReplicaCatchup(request)
+	require.NoError(t, err)
+	require.NotNil(t, firstRollback.TruncateTo)
+	require.Equal(t, uint64(2), *firstRollback.TruncateTo)
+	require.NoError(t, ValidateReplicaCatchupBatchDigest(firstRollback))
+
+	request.NextOffset = *firstRollback.TruncateTo
+	request.PreviousRecordDigest, err = replicaRecordDigest(types.Message{Offset: 1, Payload: "follower-one"})
+	require.NoError(t, err)
+	secondRollback, err := brokerFSM.FetchReplicaCatchup(request)
+	require.NoError(t, err)
+	require.NotNil(t, secondRollback.TruncateTo)
+	require.Equal(t, uint64(1), *secondRollback.TruncateTo)
+	require.NoError(t, ValidateReplicaCatchupBatchDigest(secondRollback))
+
+	request.NextOffset = *secondRollback.TruncateTo
+	commonPrefix, err := brokerFSM.ReadCommittedLogRange("orders", 0, 0, 1, 1)
+	require.NoError(t, err)
+	require.Len(t, commonPrefix, 1)
+	request.PreviousRecordDigest, err = replicaRecordDigest(commonPrefix[0])
+	require.NoError(t, err)
+	catchup, err := brokerFSM.FetchReplicaCatchup(request)
+	require.NoError(t, err)
+	require.Nil(t, catchup.TruncateTo)
+	require.True(t, catchup.Verified)
+	require.Equal(t, uint64(3), catchup.EndOffset)
+	require.Equal(t, []string{"source-one", "source-two"}, []string{catchup.Messages[0].Payload, catchup.Messages[1].Payload})
+	require.NoError(t, ValidateReplicaCatchupBatchDigest(catchup))
+}
+
+func TestFetchReplicaCatchupRejectsPrefixProofAtOffsetZero(t *testing.T) {
+	brokerFSM := newISRCatchupTestFSM(t)
+	_, err := brokerFSM.FetchReplicaCatchup(ReplicaCatchupRequest{
+		Topic: "orders", Partition: 0, BrokerID: "node-2", CommittedHWM: 0,
+		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 4,
+		LifecycleEpoch: topic.InitialLifecycleEpoch, MaxRecords: MaxReplicaCatchupRecords,
+		PreviousRecordDigest: "impossible-at-offset-zero",
+	})
+	require.ErrorContains(t, err, "offset zero")
+}
+
 func TestFetchReplicaCatchupCarriesCompactedOffsetRange(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

@@ -541,6 +541,9 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 		return ReplicaCatchupBatch{}, fmt.Errorf("catch-up offset %d exceeds committed HWM %d", request.NextOffset, current.CommittedHWM)
 	}
 	if request.PreviousRecordDigest != "" {
+		if request.NextOffset == 0 {
+			return ReplicaCatchupBatch{}, fmt.Errorf("replica prefix proof cannot precede offset zero")
+		}
 		previous, err := f.ReadCommittedLogRange(request.Topic, request.Partition, request.NextOffset-1, request.NextOffset, 1)
 		if err != nil || len(previous) != 1 || previous[0].Offset != request.NextOffset-1 {
 			return ReplicaCatchupBatch{}, fmt.Errorf("read source record before catch-up offset %d: %v", request.NextOffset, err)
@@ -550,9 +553,16 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 			return ReplicaCatchupBatch{}, err
 		}
 		if digest != request.PreviousRecordDigest {
-			truncateTo, err := f.replicaLeaderEpochEndOffset(request.Topic, request.Partition, request.PreviousLeaderEpoch, request.NextOffset)
-			if err != nil {
-				return ReplicaCatchupBatch{}, fmt.Errorf("find replica divergence boundary: %w", err)
+			// Records written before leader epochs were persisted have no epoch
+			// boundary to jump to. Remove only the mismatched follower record;
+			// the next request must prove the preceding prefix before recovery
+			// can append authoritative committed records.
+			truncateTo := request.NextOffset - 1
+			if request.PreviousLeaderEpoch > 0 {
+				truncateTo, err = f.replicaLeaderEpochEndOffset(request.Topic, request.Partition, request.PreviousLeaderEpoch, request.NextOffset)
+				if err != nil {
+					return ReplicaCatchupBatch{}, fmt.Errorf("find replica divergence boundary: %w", err)
+				}
 			}
 			return SealReplicaCatchupBatch(ReplicaCatchupBatch{
 				Topic: request.Topic, Partition: request.Partition, BrokerID: request.BrokerID,
