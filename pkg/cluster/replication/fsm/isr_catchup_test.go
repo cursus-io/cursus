@@ -358,6 +358,10 @@ func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
 	require.Empty(t, rollback.Messages)
 	require.NoError(t, ValidateReplicaCatchupBatchDigest(rollback))
 
+	divergentRequest.PreviousLeaderEpoch = 99
+	_, err = brokerFSM.FetchReplicaCatchup(divergentRequest)
+	require.ErrorContains(t, err, "source has no epoch boundary")
+
 	request.BrokerID = "node-3"
 	_, err = brokerFSM.FetchReplicaCatchup(request)
 	require.ErrorContains(t, err, "not a configured replica")
