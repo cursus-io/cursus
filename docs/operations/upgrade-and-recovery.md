@@ -161,8 +161,10 @@ and legacy records encountered while scanning the source. Each subsequent
 request must prove the preceding prefix before records can be transferred;
 the authoritative source log is never truncated. Storage or checksum failures,
 unavailable prefix records, stale fences, and invalid committed HWMs still stop
-recovery. Indexed protocol negotiation and bootstrap for prefixes removed by
-retention remain follow-up work in #246.
+recovery. Peers that both advertise recovery protocol 1 use cumulative prefix
+proofs for non-compacted replicas outside ISR. Legacy and one-sided deployments
+continue using record digests. Compacted replicas keep their existing recovery
+path.
 
 Each partition can maintain a derived `partition_N.lineage` sidecar. It stores
 checksummed leader-epoch spans and cumulative record-hash checkpoints. A zero
@@ -188,8 +190,15 @@ the existing compacted recovery path. A sidecar publication failure suspends
 background updates and logs the transition once. It does not reverse a successful
 durable append, but no indexed proof is returned until explicit recovery can
 publish successfully. Recovery logs once and resumes bounded background updates.
-The existing wire protocol still uses record digests until the
-negotiated indexed-recovery layer is enabled.
+Indexed recovery sends at most 64 candidates and rolls back only to a matching
+cumulative prefix below the authoritative HWM. Equal final records cannot conceal
+earlier divergence. Responses are checksummed and fenced by source, receiver,
+leader and lifecycle; stale or unsupported responses cannot mutate local storage.
+Proofs are refreshed after each append. The first request may scan retained history
+while holding the FSM transition fence, which can delay metadata application.
+If retention has removed the common anchor, recovery reports bootstrap required
+and leaves local data unchanged. Automated retained-range bootstrap remains the
+next layer of #246.
 
 The same-epoch restart regression commits a replacement on the two surviving
 brokers before restarting a divergent follower, then checks exact raw-record
