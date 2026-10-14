@@ -20,6 +20,9 @@ func (d *DiskHandler) TruncateTo(nextOffset uint64) error {
 
 	d.maintenanceMu.Lock()
 	defer d.maintenanceMu.Unlock()
+	if err := d.writeAvailabilityError(); err != nil {
+		return err
+	}
 	if readers := atomic.LoadInt32(&d.activeReaders); readers != 0 {
 		return fmt.Errorf("cannot truncate with %d active reader(s)", readers)
 	}
