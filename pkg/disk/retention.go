@@ -32,15 +32,18 @@ func (s *ReadSession) Close() error {
 	s.closeOnce.Do(func() {
 		atomic.AddInt32(&s.handler.activeReaders, -1)
 		s.closeErr = s.File.Close()
+		s.handler.replacementMu.RUnlock()
 	})
 	return s.closeErr
 }
 
 func (d *DiskHandler) OpenForRead(offset uint64) (*ReadSession, error) {
+	d.replacementMu.RLock()
 	atomic.AddInt32(&d.activeReaders, 1)
 	path, _, err := d.findSegmentForOffset(offset)
 	if err != nil {
 		atomic.AddInt32(&d.activeReaders, -1)
+		d.replacementMu.RUnlock()
 		return nil, err
 	}
 
@@ -48,6 +51,7 @@ func (d *DiskHandler) OpenForRead(offset uint64) (*ReadSession, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		atomic.AddInt32(&d.activeReaders, -1)
+		d.replacementMu.RUnlock()
 		return nil, err
 	}
 
@@ -164,6 +168,9 @@ func (d *DiskHandler) EnforceRetention(cfg *config.Config) {
 	}
 	d.maintenanceMu.Lock()
 	defer d.maintenanceMu.Unlock()
+	if d.writeAvailabilityError() != nil {
+		return
+	}
 	if !config.HasCleanupPolicy(d.CleanupPolicy(), config.CleanupPolicyDelete) {
 		return
 	}

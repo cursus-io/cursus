@@ -87,7 +87,7 @@ func (d *DiskHandler) flushLoop() {
 		case <-d.getSegmentTickerChan(segmentTicker):
 			d.mu.Lock()
 			d.ioMu.Lock()
-			if time.Since(d.segmentCreatedAt) >= d.segmentRollTime {
+			if d.writeAvailabilityError() == nil && time.Since(d.segmentCreatedAt) >= d.segmentRollTime {
 				if err := d.rotateSegment(atomic.LoadUint64(&d.FlushedOffset)); err != nil {
 					util.Error("time-based segment rotation failed: %v", err)
 				}
@@ -110,6 +110,10 @@ func (d *DiskHandler) syncLoop() {
 		select {
 		case <-ticker.C:
 			d.mu.Lock()
+			if d.bootstrapPending.Load() {
+				d.mu.Unlock()
+				continue
+			}
 			d.ioMu.Lock()
 			syncSuccess := false
 
@@ -197,6 +201,9 @@ func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if err := d.writeAvailabilityError(); err != nil {
+		return err
+	}
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
 
@@ -309,6 +316,9 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if err := d.writeAvailabilityError(); err != nil {
+		return err
+	}
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
 
@@ -497,6 +507,9 @@ func (d *DiskHandler) RollSegmentAt(nextBaseOffset uint64) error {
 	defer d.maintenanceMu.Unlock()
 	d.appendMu.Lock()
 	defer d.appendMu.Unlock()
+	if err := d.writeAvailabilityError(); err != nil {
+		return err
+	}
 	if nextBaseOffset != atomic.LoadUint64(&d.AbsoluteOffset) {
 		return fmt.Errorf("segment roll boundary %d does not match local tail %d", nextBaseOffset, atomic.LoadUint64(&d.AbsoluteOffset))
 	}
