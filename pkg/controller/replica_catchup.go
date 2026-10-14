@@ -42,17 +42,14 @@ func (ch *CommandHandler) CatchupReplicaSnapshots(ctx context.Context, request r
 // HWM only when the complete committed range is present; ISR admission remains
 // the heartbeat proof's responsibility.
 func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replicationFSM.ReplicaCatchupBatch) error {
-	if ch == nil || ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.TopicManager == nil {
-		return fmt.Errorf("replica catch-up dependencies are unavailable")
-	}
-	if ch.Cluster.Router == nil || batch.BrokerID != ch.Cluster.Router.BrokerID() {
-		return fmt.Errorf("replica catch-up broker identity mismatch")
-	}
-	if err := injectedReplicaCatchupError(batch.Topic); err != nil {
-		return err
-	}
 	if err := replicationFSM.ValidateReplicaCatchupBatchDigest(batch); err != nil {
 		return err
+	}
+	if err := replicationFSM.ValidateReplicaRecoveryMode(batch); err != nil {
+		return err
+	}
+	if ch == nil || ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.TopicManager == nil {
+		return fmt.Errorf("replica catch-up dependencies are unavailable")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -65,7 +62,22 @@ func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replica
 	writeLock := ch.partitionWriteLock(batch.Topic, batch.Partition)
 	writeLock.Lock()
 	defer writeLock.Unlock()
+	if batch.RecoveryProtocol != 0 {
+		if ch.Cluster.RaftManager.GetFSM() == nil {
+			return fmt.Errorf("replica catch-up metadata is unavailable")
+		}
+		return ch.Cluster.RaftManager.GetFSM().WithReplicaRecoveryFence(batch, func() error { return ch.applyReplicaCatchup(batch) })
+	}
+	return ch.applyReplicaCatchup(batch)
+}
 
+func (ch *CommandHandler) applyReplicaCatchup(batch replicationFSM.ReplicaCatchupBatch) error {
+	if ch.Cluster.Router == nil || batch.BrokerID != ch.Cluster.Router.BrokerID() {
+		return fmt.Errorf("replica catch-up broker identity mismatch")
+	}
+	if err := injectedReplicaCatchupError(batch.Topic); err != nil {
+		return err
+	}
 	fsmRef := ch.Cluster.RaftManager.GetFSM()
 	if fsmRef == nil {
 		return fmt.Errorf("FSM is unavailable")
@@ -99,6 +111,15 @@ func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replica
 	}
 	if partition.NextOffset() != batch.StartOffset {
 		return fmt.Errorf("replica catch-up local LEO changed: current=%d response_start=%d", partition.NextOffset(), batch.StartOffset)
+	}
+	if batch.RecoveryProtocol != 0 {
+		matched, err := partition.VerifyReplicaLineage(*batch.MatchedPrefix, batch.CommittedHWM)
+		if err != nil {
+			return err
+		}
+		if !matched {
+			return fmt.Errorf("local retained prefix changed before indexed recovery")
+		}
 	}
 	if batch.TruncateTo != nil {
 		if len(batch.Messages) != 0 || batch.Verified || *batch.TruncateTo >= batch.StartOffset || batch.EndOffset != batch.StartOffset {

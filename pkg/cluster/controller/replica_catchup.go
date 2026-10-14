@@ -102,6 +102,13 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		}
 		nextOffset := request.NextOffset
 		if nextOffset != request.CommittedHWM {
+			if request.RecoveryProtocol != 0 {
+				refreshed, ok := cc.refreshReplicaCatchupRequest(request)
+				if !ok || refreshed.RecoveryProtocol != request.RecoveryProtocol {
+					return fmt.Errorf("indexed recovery proofs could not be refreshed")
+				}
+				request = refreshed
+			}
 			continue
 		}
 		if !batch.Verified {
@@ -179,8 +186,26 @@ func validateReplicaCatchupBatch(request fsm.ReplicaCatchupRequest, batch fsm.Re
 	if err := fsm.ValidateReplicaCatchupBatchDigest(batch); err != nil {
 		return err
 	}
+	if batch.RecoveryProtocol != request.RecoveryProtocol {
+		return fmt.Errorf("replica catch-up response protocol mismatch")
+	}
 	if batch.CommittedHWM < request.CommittedHWM || batch.StartOffset != request.NextOffset {
 		return fmt.Errorf("replica catch-up response boundary mismatch")
+	}
+	if err := fsm.ValidateReplicaRecoveryMode(batch); err != nil {
+		return err
+	}
+	if batch.RecoveryProtocol != 0 {
+		found := false
+		for _, candidate := range request.PrefixCandidates {
+			if candidate == *batch.MatchedPrefix {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("matched recovery prefix was not requested")
+		}
 	}
 	if batch.TruncateTo != nil {
 		if len(batch.Messages) != 0 || batch.Verified || *batch.TruncateTo >= batch.StartOffset || batch.EndOffset != batch.StartOffset {
@@ -188,7 +213,7 @@ func validateReplicaCatchupBatch(request fsm.ReplicaCatchupRequest, batch fsm.Re
 		}
 		return nil
 	}
-	if batch.Verified && batch.StartOffset == request.CommittedHWM {
+	if batch.Verified && batch.StartOffset == batch.CommittedHWM {
 		if len(batch.Messages) != 0 || batch.EndOffset != batch.StartOffset {
 			return fmt.Errorf("invalid replica catch-up verification batch")
 		}
@@ -201,7 +226,7 @@ func validateReplicaCatchupBatch(request fsm.ReplicaCatchupRequest, batch fsm.Re
 	if endOffset == 0 && len(batch.Messages) > 0 {
 		endOffset = batch.Messages[len(batch.Messages)-1].Offset + 1
 	}
-	if endOffset <= request.NextOffset || endOffset > request.CommittedHWM {
+	if endOffset <= request.NextOffset || endOffset > batch.CommittedHWM {
 		return fmt.Errorf("invalid replica catch-up end offset %d", endOffset)
 	}
 	next := request.NextOffset

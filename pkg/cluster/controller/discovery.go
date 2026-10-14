@@ -75,6 +75,7 @@ func (sd *serviceDiscovery) Register() error {
 		IncarnationID:                sd.incarnationID,
 		TransactionCoordinatorShards: sd.transactionCoordinatorShardCount(),
 		LifecycleProtocol:            fsm.BrokerProtocolVersionCurrent,
+		RecoveryProtocol:             fsm.IndexedRecoveryProtocolVersion,
 	}
 
 	data, err := json.Marshal(broker)
