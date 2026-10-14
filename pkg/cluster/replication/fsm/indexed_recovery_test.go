@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -175,10 +176,14 @@ type blockingLineageStorage struct {
 	release chan struct{}
 }
 
-func (s *blockingLineageStorage) MatchLineageCandidates(candidates []disk.LineagePrefix, hwm uint64) (*disk.LineagePrefix, error) {
-	matched, err := s.DiskHandler.MatchLineageCandidates(candidates, hwm)
+func (s *blockingLineageStorage) MatchLineageCandidatesContext(ctx context.Context, candidates []disk.LineagePrefix, hwm uint64) (*disk.LineagePrefix, error) {
+	matched, err := s.DiskHandler.MatchLineageCandidatesContext(ctx, candidates, hwm)
 	close(s.matched)
-	<-s.release
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	return matched, err
 }
 

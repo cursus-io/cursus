@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -19,10 +20,21 @@ var ErrStaleContentGeneration = errors.New("stale disk content generation")
 
 // CaptureContentGeneration checks availability and captures a local witness.
 func (d *DiskHandler) CaptureContentGeneration() (ContentGeneration, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.writeFailureMu.RLock()
-	defer d.writeFailureMu.RUnlock()
+	return d.CaptureContentGenerationContext(context.Background())
+}
+
+func (d *DiskHandler) CaptureContentGenerationContext(ctx context.Context) (ContentGeneration, error) {
+	if ctx == nil {
+		return ContentGeneration{}, fmt.Errorf("content generation requires context")
+	}
+	unlock, err := lockProofContext(ctx, &d.mu, proofReadMutex{&d.writeFailureMu})
+	if err != nil {
+		return ContentGeneration{}, err
+	}
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return ContentGeneration{}, err
+	}
 	if err := d.proofAvailabilityLocked(); err != nil {
 		return ContentGeneration{}, err
 	}
@@ -30,7 +42,18 @@ func (d *DiskHandler) CaptureContentGeneration() (ContentGeneration, error) {
 }
 
 func (d *DiskHandler) CheckContentGeneration(token ContentGeneration) error {
-	return d.PublishIfContentGeneration(token, func() {})
+	return d.CheckContentGenerationContext(context.Background(), token)
+}
+
+func (d *DiskHandler) CheckContentGenerationContext(ctx context.Context, token ContentGeneration) error {
+	actual, err := d.CaptureContentGenerationContext(ctx)
+	if err != nil {
+		return err
+	}
+	if actual != token {
+		return ErrStaleContentGeneration
+	}
+	return nil
 }
 
 // PublishIfContentGeneration holds mu and the availability read lock across the
@@ -84,4 +107,28 @@ func (d *DiskHandler) advanceContentGenerationLocked() {
 		return
 	}
 	d.contentRevision++
+}
+
+// GetFirstOffsetContext reads the retained start without an uncancellable wait
+// behind a proof scan or mutation. A separate generation witness must span its
+// use with later reads, because retention can advance immediately after return.
+func (d *DiskHandler) GetFirstOffsetContext(ctx context.Context) (uint64, error) {
+	if ctx == nil {
+		return 0, fmt.Errorf("retained start requires context")
+	}
+	unlock, err := lockProofContext(ctx, &d.mu, proofReadMutex{&d.writeFailureMu})
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := d.proofAvailabilityLocked(); err != nil {
+		return 0, err
+	}
+	if len(d.segments) == 0 {
+		return d.CurrentSegment, nil
+	}
+	return d.segments[0], nil
 }
