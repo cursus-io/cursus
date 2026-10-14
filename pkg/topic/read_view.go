@@ -37,6 +37,44 @@ func (v *PartitionReadView) check() error {
 	}
 	return nil
 }
+
+// ValidateIdentity checks callback lifetime and the partition whose exclusion
+// protects a caller's derived caches, without reading or advancing any tail.
+func (v *PartitionReadView) ValidateIdentity(name string, partition int) error {
+	if err := v.check(); err != nil {
+		return err
+	}
+	if v.p.topic != name || v.p.id != partition {
+		return fmt.Errorf("partition read view identity mismatch")
+	}
+	return nil
+}
+
+// ValidateBootstrapSource requires the exclusive source callback and its lifecycle.
+func (v *PartitionReadView) ValidateBootstrapSource(name string, partition int, lifecycle uint64) error {
+	return v.validateBootstrap(name, partition, lifecycle, false)
+}
+
+// ValidateBootstrapRecovery requires the exclusive pending recovery callback.
+func (v *PartitionReadView) ValidateBootstrapRecovery(name string, partition int, lifecycle uint64) error {
+	return v.validateBootstrap(name, partition, lifecycle, true)
+}
+
+func (v *PartitionReadView) validateBootstrap(name string, partition int, lifecycle uint64, pending bool) error {
+	if err := v.ValidateIdentity(name, partition); err != nil {
+		return err
+	}
+	if !v.offline || v.p.BootstrapPending() != pending {
+		return fmt.Errorf("bootstrap operation requires its exclusive callback view")
+	}
+	v.p.recoveryMu.RLock()
+	defer v.p.recoveryMu.RUnlock()
+	if v.p.bootstrapDefinitionKnown && v.p.bootstrapLifecycle != lifecycle {
+		return fmt.Errorf("bootstrap view lifecycle mismatch")
+	}
+	return nil
+}
+
 func (v *PartitionReadView) Generation() uint64 {
 	if v.check() != nil {
 		return 0

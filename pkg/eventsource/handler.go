@@ -66,7 +66,35 @@ func NewHandler(tm *topic.TopicManager) *Handler {
 }
 
 // getIndex returns the StreamIndex for the given topic and partition, creating it lazily.
-func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, error) {
+// getIndex is retained for package tests. Production consumers keep their view
+// until all use of the returned cache object has finished.
+func (h *Handler) getIndex(topicName string, partitionID int) (idx *StreamIndex, err error) {
+	err = h.withReadView(topicName, partitionID, func(v *topic.PartitionReadView) error {
+		idx, err = h.getIndexWithView(topicName, partitionID, v)
+		return err
+	})
+	return
+}
+
+func (h *Handler) withReadView(name string, partition int, fn func(*topic.PartitionReadView) error) error {
+	t := h.tm.GetTopic(name)
+	if t == nil {
+		return fmt.Errorf("topic_not_found topic=%s", name)
+	}
+	if !t.IsEventSourcing {
+		return fmt.Errorf("event_sourcing_not_enabled topic=%s", name)
+	}
+	p, err := t.GetPartition(partition)
+	if err != nil {
+		return err
+	}
+	return p.WithReadView(fn)
+}
+
+func (h *Handler) getIndexWithView(topicName string, partitionID int, view *topic.PartitionReadView) (*StreamIndex, error) {
+	if err := view.ValidateIdentity(topicName, partitionID); err != nil {
+		return nil, err
+	}
 	key := topicName + ":" + strconv.Itoa(partitionID)
 
 	h.mu.RLock()
@@ -96,30 +124,24 @@ func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, err
 	if err != nil {
 		return nil, fmt.Errorf("open stream index for %s:%d: %w", topicName, partitionID, err)
 	}
-	if err := h.RecoverIndexFromLog(topicName, partitionID, idx); err != nil {
+	stableTail := view.LastStableOffset()
+	if err := h.recoverIndexWithView(topicName, partitionID, idx, view, stableTail); err != nil {
 		_ = idx.Close()
 		return nil, err
-	}
-	t := h.tm.GetTopic(topicName)
-	if t == nil {
-		_ = idx.Close()
-		return nil, fmt.Errorf("topic %s not found during stream index recovery", topicName)
-	}
-	p, err := t.GetPartition(partitionID)
-	if err != nil {
-		_ = idx.Close()
-		return nil, fmt.Errorf("partition lookup for stream index %s:%d: %w", topicName, partitionID, err)
 	}
 	h.indexes[key] = idx
 	// Recovery reads only the stable committed prefix. Never claim that an
 	// unresolved transactional tail has been indexed merely because it is in
 	// the partition HWM.
-	h.indexedHWM[key] = p.LastStableOffset()
+	h.indexedHWM[key] = stableTail
 	return idx, nil
 }
 
 // getSnapshot returns the SnapshotStore for the given topic and partition, creating it lazily.
-func (h *Handler) getSnapshot(topicName string, partitionID int) (*SnapshotStore, error) {
+func (h *Handler) getSnapshotWithView(topicName string, partitionID int, view *topic.PartitionReadView) (*SnapshotStore, error) {
+	if err := view.ValidateIdentity(topicName, partitionID); err != nil {
+		return nil, err
+	}
 	key := topicName + ":" + strconv.Itoa(partitionID)
 
 	h.mu.RLock()
@@ -155,8 +177,10 @@ func (h *Handler) getSnapshot(topicName string, partitionID int) (*SnapshotStore
 // PrepareCommittedIndex captures the currently indexed committed tail before a
 // follower advances its HWM.
 func (h *Handler) PrepareCommittedIndex(topicName string, partitionID int) error {
-	_, err := h.getIndex(topicName, partitionID)
-	return err
+	return h.withReadView(topicName, partitionID, func(v *topic.PartitionReadView) error {
+		_, err := h.getIndexWithView(topicName, partitionID, v)
+		return err
+	})
 }
 
 // CurrentVersion returns the committed aggregate version and its partition.
@@ -177,100 +201,59 @@ func (h *Handler) CurrentVersion(topicName, key string) (uint64, int, error) {
 	if partition < 0 {
 		return 0, 0, fmt.Errorf("no partitions available")
 	}
-	idx, err := h.getIndex(topicName, partition)
-	if err != nil {
-		return 0, 0, err
-	}
-	return idx.GetVersion(key), partition, nil
+	var version uint64
+	err := h.withReadView(topicName, partition, func(v *topic.PartitionReadView) error {
+		idx, err := h.getIndexWithView(topicName, partition, v)
+		if err != nil {
+			return err
+		}
+		version = idx.GetVersion(key)
+		return nil
+	})
+	return version, partition, err
 }
 
 // IndexCommittedToHWM advances the derived stream index only through records
 // visible below the partition's stable committed boundary.
 func (h *Handler) IndexCommittedToHWM(topicName string, partitionID int, targetHWM uint64) error {
-	h.indexSyncMu.Lock()
-	defer h.indexSyncMu.Unlock()
-
-	idx, err := h.getIndex(topicName, partitionID)
-	if err != nil {
-		return err
-	}
-	t := h.tm.GetTopic(topicName)
-	if t == nil || !t.IsEventSourcing {
-		return nil
-	}
-	p, err := t.GetPartition(partitionID)
-	if err != nil {
-		return fmt.Errorf("partition lookup for committed index topic=%s partition=%d: %w", topicName, partitionID, err)
-	}
-
-	key := topicName + ":" + strconv.Itoa(partitionID)
-	h.mu.RLock()
-	start := h.indexedHWM[key]
-	h.mu.RUnlock()
-
-	scanEnd := targetHWM
-	if stable := p.LastStableOffset(); stable < scanEnd {
-		scanEnd = stable
-	}
-	if scanEnd <= start {
-		return nil
-	}
-
-	const batchSize = 256
-	indexedUntil := start
-	for offset := start; offset < scanEnd; {
-		msgs, err := p.ReadCommitted(offset, batchSize)
+	return h.withReadView(topicName, partitionID, func(v *topic.PartitionReadView) error {
+		h.indexSyncMu.Lock()
+		defer h.indexSyncMu.Unlock()
+		idx, err := h.getIndexWithView(topicName, partitionID, v)
 		if err != nil {
-			return fmt.Errorf("read committed stream index range offset=%d: %w", offset, err)
-		}
-		if len(msgs) == 0 {
-			break
-		}
-
-		bounded := msgs[:0]
-		for _, msg := range msgs {
-			if msg.Offset >= scanEnd {
-				break
-			}
-			bounded = append(bounded, msg)
-		}
-		if len(bounded) == 0 {
-			break
-		}
-		if err := h.indexMessages(idx, bounded); err != nil {
 			return err
 		}
-		next := bounded[len(bounded)-1].Offset + 1
-		if next <= offset {
-			return fmt.Errorf("stream index scan did not advance from offset %d", offset)
+		key := topicName + ":" + strconv.Itoa(partitionID)
+		h.mu.RLock()
+		start := h.indexedHWM[key]
+		h.mu.RUnlock()
+		end := min(targetHWM, v.LastStableOffset())
+		if end <= start {
+			return nil
 		}
-		offset = next
-		indexedUntil = next
-	}
-
-	h.mu.Lock()
-	if h.indexedHWM[key] < indexedUntil {
-		h.indexedHWM[key] = indexedUntil
-	}
-	h.mu.Unlock()
-	return nil
+		if err := h.replayIndex(idx, v, start, end); err != nil {
+			return err
+		}
+		h.mu.Lock()
+		h.indexedHWM[key] = end
+		h.mu.Unlock()
+		return nil
+	})
 }
 
 func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *StreamIndex) error {
-	if err := idx.Reset(); err != nil {
-		return fmt.Errorf("reset stream index topic=%s partition=%d: %w", topicName, partitionID, err)
-	}
-	t := h.tm.GetTopic(topicName)
-	if t == nil || !t.IsEventSourcing {
-		return nil
-	}
-	p, err := t.GetPartition(partitionID)
-	if err != nil {
-		return fmt.Errorf("partition lookup for index recovery topic=%s partition=%d: %w", topicName, partitionID, err)
-	}
+	return h.withReadView(topicName, partitionID, func(v *topic.PartitionReadView) error {
+		h.indexSyncMu.Lock()
+		defer h.indexSyncMu.Unlock()
+		return h.recoverIndexWithView(topicName, partitionID, idx, v, v.LastStableOffset())
+	})
+}
 
-	first := p.GetFirstOffset()
-	latest := p.LastStableOffset()
+func (h *Handler) recoverIndexWithView(topicName string, partitionID int, idx *StreamIndex, view *topic.PartitionReadView, latest uint64) error {
+	if err := idx.Reset(); err != nil {
+		return fmt.Errorf("reset stream index: %w", err)
+	}
+	first := view.FirstOffset()
 	if first > latest {
 		return fmt.Errorf("stream retention floor %d exceeds stable tail %d", first, latest)
 	}
@@ -296,9 +279,13 @@ func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *St
 			}
 		}
 	}
+	return h.replayIndex(idx, view, first, latest)
+}
+
+func (h *Handler) replayIndex(idx *StreamIndex, view *topic.PartitionReadView, first, latest uint64) error {
 	const batchSize = 256
 	for offset := first; offset < latest; {
-		msgs, _, next, err := p.ReadCommittedPage(offset, batchSize, 0, true)
+		msgs, _, next, err := view.ReadCommittedPage(offset, batchSize, 0, true)
 		if err != nil {
 			return fmt.Errorf("recover stream index from log offset=%d: %w", offset, err)
 		}
@@ -362,7 +349,23 @@ func (r *AppendResult) Response() string {
 	return fmt.Sprintf("OK version=%d offset=%d partition=%d", r.Version, r.Offset, r.Partition)
 }
 
+// AppendStream owns replacement exclusion for standalone callers. Callback-bearing
+// callers must use AppendStreamWithControllerFence with the documented locks.
 func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, string) {
+	if opts.AfterAppend != nil || opts.AfterCommit != nil {
+		return nil, "ERROR: append_callbacks_require_controller_fence"
+	}
+	return h.appendStream(cmd, opts, false)
+}
+
+// AppendStreamWithControllerFence requires the caller to hold the topic lifecycle,
+// partition write and BeginReplicationMutation locks through all callbacks. This
+// avoids recursive reconcile locking while a bootstrap writer is waiting.
+func (h *Handler) AppendStreamWithControllerFence(cmd string, opts AppendOptions) (*AppendResult, string) {
+	return h.appendStream(cmd, opts, true)
+}
+
+func (h *Handler) appendStream(cmd string, opts AppendOptions, controllerFenced bool) (*AppendResult, string) {
 	h.wg.Add(1)
 	defer h.wg.Done()
 
@@ -446,37 +449,64 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 		return nil, fmt.Sprintf("ERROR: partition_lookup_failed partition=%d reason=%q", partitionID, err.Error())
 	}
 
-	idx, err := h.getIndex(topicName, partitionID)
+	if !controllerFenced {
+		release := p.BeginReplicationMutation()
+		defer release()
+	}
+	var idx *StreamIndex
+	var duplicate *AppendResult
+	err = p.WithReadView(func(view *topic.PartitionReadView) error {
+		var errResp string
+		duplicate, errResp = func() (*AppendResult, string) {
+			var err error
+			idx, err = h.getIndexWithView(topicName, partitionID, view)
+			if err != nil {
+				return nil, fmt.Sprintf("ERROR: stream_index_failed partition=%d reason=%q", partitionID, err.Error())
+			}
+			if t.Policy.AggregateReplay && expectedVersion <= idx.GetVersion(key) {
+				entries, lookupErr := idx.Lookup(key, expectedVersion)
+				if lookupErr != nil {
+					return nil, fmt.Sprintf("ERROR: aggregate_index_lookup_failed reason=%q", lookupErr.Error())
+				}
+				for _, entry := range entries {
+					if entry.AggregateVersion != expectedVersion {
+						continue
+					}
+					existing, readErr := view.ReadCommittedRange(entry.Offset, entry.Offset+1, 1)
+					if readErr != nil || len(existing) != 1 {
+						return nil, "ERROR: aggregate_proof_unavailable"
+					}
+					if existing[0].EventID == msg.EventID && existing[0].PayloadDigest == msg.PayloadDigest {
+						return &AppendResult{Topic: topicName, Key: key, Version: expectedVersion, Offset: entry.Offset, Partition: partitionID, Message: existing[0]}, ""
+					}
+					return nil, fmt.Sprintf("ERROR: aggregate_identity_conflict sequence=%d", expectedVersion)
+				}
+			}
+			if t.Policy.AggregateReplay {
+				seen, scanErr := aggregateEventIDExists(view, msg.EventID)
+				if scanErr != nil {
+					return nil, fmt.Sprintf("ERROR: aggregate_proof_unavailable reason=%q", scanErr.Error())
+				}
+				if seen {
+					return nil, fmt.Sprintf("ERROR: aggregate_identity_conflict event_id=%s", msg.EventID)
+				}
+			}
+
+			return nil, ""
+		}()
+		if errResp != "" {
+			return errors.New(errResp)
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Sprintf("ERROR: stream_index_failed partition=%d reason=%q", partitionID, err.Error())
+		if strings.HasPrefix(err.Error(), "ERROR:") {
+			return nil, err.Error()
+		}
+		return nil, "ERROR: " + err.Error()
 	}
-	if t.Policy.AggregateReplay && expectedVersion <= idx.GetVersion(key) {
-		entries, lookupErr := idx.Lookup(key, expectedVersion)
-		if lookupErr != nil {
-			return nil, fmt.Sprintf("ERROR: aggregate_index_lookup_failed reason=%q", lookupErr.Error())
-		}
-		for _, entry := range entries {
-			if entry.AggregateVersion != expectedVersion {
-				continue
-			}
-			existing, readErr := p.ReadCommitted(entry.Offset, 1)
-			if readErr != nil || len(existing) != 1 {
-				return nil, "ERROR: aggregate_proof_unavailable"
-			}
-			if existing[0].EventID == msg.EventID && existing[0].PayloadDigest == msg.PayloadDigest {
-				return &AppendResult{Topic: topicName, Key: key, Version: expectedVersion, Offset: entry.Offset, Partition: partitionID, Message: existing[0]}, ""
-			}
-			return nil, fmt.Sprintf("ERROR: aggregate_identity_conflict sequence=%d", expectedVersion)
-		}
-	}
-	if t.Policy.AggregateReplay {
-		seen, scanErr := aggregateEventIDExists(p, msg.EventID)
-		if scanErr != nil {
-			return nil, fmt.Sprintf("ERROR: aggregate_proof_unavailable reason=%q", scanErr.Error())
-		}
-		if seen {
-			return nil, fmt.Sprintf("ERROR: aggregate_identity_conflict event_id=%s", msg.EventID)
-		}
+	if duplicate != nil {
+		return duplicate, ""
 	}
 
 	var appendedOffset uint64
@@ -520,43 +550,45 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 		}
 		return appendedOffset, nil
 	})
+	appendErr := err
 	recoveredCommit := false
-	if err != nil {
-		if recoveryErr := h.RecoverIndexFromLog(topicName, partitionID, idx); recoveryErr != nil {
-			return nil, fmt.Sprintf("ERROR: append_stream_failed reason=%q recovery_reason=%q", err.Error(), recoveryErr.Error())
+	postErr := p.WithReadView(func(view *topic.PartitionReadView) error {
+		if appendErr != nil {
+			if recoveryErr := h.recoverIndexWithView(topicName, partitionID, idx, view, view.LastStableOffset()); recoveryErr != nil {
+				return fmt.Errorf("append_stream_failed reason=%q recovery_reason=%q", appendErr.Error(), recoveryErr.Error())
+			}
+			if idx.GetVersion(key) != expectedVersion {
+				return fmt.Errorf("append_stream_failed reason=%q", appendErr.Error())
+			}
+			recoveredCommit = true
 		}
-		if idx.GetVersion(key) != expectedVersion {
-			return nil, fmt.Sprintf("ERROR: append_stream_failed reason=%q", err.Error())
+		if !ok && !recoveredCommit {
+			return fmt.Errorf("version_conflict current=%d expected=%d", current, expectedVersion)
 		}
-		// The log and HWM commit succeeded even though the derived index append
-		// failed. Recovery found the committed event, so report its success.
-		recoveredCommit = true
+		committed := view.LastStableOffset()
+		indexKey := topicName + ":" + strconv.Itoa(partitionID)
+		h.mu.Lock()
+		if h.indexedHWM[indexKey] < committed {
+			h.indexedHWM[indexKey] = committed
+		}
+		h.mu.Unlock()
+		return nil
+	})
+	if postErr != nil {
+		return nil, "ERROR: " + postErr.Error()
 	}
-	if !ok && !recoveredCommit {
-		return nil, fmt.Sprintf("ERROR: version_conflict current=%d expected=%d", current, expectedVersion)
-	}
-
-	indexKey := topicName + ":" + strconv.Itoa(partitionID)
-	h.mu.Lock()
-	if committed := p.LastStableOffset(); h.indexedHWM[indexKey] < committed {
-		h.indexedHWM[indexKey] = committed
-	}
-	h.mu.Unlock()
 
 	return &AppendResult{Topic: topicName, Key: key, Version: expectedVersion, Offset: appendedOffset, Partition: partitionID, Message: appendedMsg}, ""
 }
 
 // aggregateEventIDExists consults the committed retained log rather than an
 // in-memory index so an event-id uniqueness decision survives broker restart.
-func aggregateEventIDExists(p *topic.Partition, eventID string) (bool, error) {
-	limit := p.LastStableOffset()
-	for offset := p.OffsetRange().Earliest; offset < limit; {
-		messages, err := p.ReadCommitted(offset, 256)
+func aggregateEventIDExists(view *topic.PartitionReadView, eventID string) (bool, error) {
+	limit := view.LastStableOffset()
+	for offset := view.FirstOffset(); offset < limit; {
+		messages, _, next, err := view.ReadCommittedPage(offset, 256, 0, true)
 		if err != nil {
 			return false, err
-		}
-		if len(messages) == 0 {
-			return false, fmt.Errorf("committed log scan made no progress")
 		}
 		for _, existing := range messages {
 			if existing.Offset >= limit {
@@ -566,7 +598,6 @@ func aggregateEventIDExists(p *topic.Partition, eventID string) (bool, error) {
 				return true, nil
 			}
 		}
-		next := messages[len(messages)-1].Offset + 1
 		if next <= offset {
 			return false, fmt.Errorf("committed log scan did not advance")
 		}
@@ -639,84 +670,84 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 		return
 	}
 
-	idx, err := h.getIndex(topicName, partitionID)
-	if err != nil {
-		writeError(conn, err.Error())
-		return
-	}
-
-	// Check snapshot: if one exists with version >= fromVersion, use it as base.
-	ss, err := h.getSnapshot(topicName, partitionID)
-	if err != nil {
-		writeError(conn, err.Error())
-		return
-	}
-
-	snap, err := ss.Read(key)
-	if err != nil {
-		writeError(conn, fmt.Sprintf("snapshot_read_failed reason=%q", err.Error()))
-		return
-	}
-
-	actualFromVersion := fromVersion
-	if snap != nil && snap.Version >= fromVersion {
-		// Start reading from the version after the snapshot.
-		actualFromVersion = snap.Version + 1
-	}
-
-	currentVersion := idx.GetVersion(key)
-	var entries []StreamIndexEntry
-	if paginated {
-		entries, err = idx.LookupRange(key, actualFromVersion, currentVersion, maxEvents+1)
-	} else {
-		entries, err = idx.Lookup(key, actualFromVersion)
-		maxBytes = util.MaxMessageSize
-	}
-	if err != nil {
-		writeError(conn, fmt.Sprintf("index_lookup_failed reason=%q", err.Error()))
-		return
-	}
-
-	p, err := t.GetPartition(partitionID)
-	if err != nil {
-		writeError(conn, err.Error())
-		return
-	}
-
-	moreByCount := paginated && len(entries) > maxEvents
-	if moreByCount {
-		entries = entries[:maxEvents]
-	}
-
-	// Collect one bounded page before sending its success envelope.
-	msgs := make([]types.Message, 0, len(entries))
-	usedBytes := 0
-	moreByBytes := false
-	for _, entry := range entries {
-		batch, err := p.ReadCommitted(entry.Offset, 1)
+	var snap *SnapshotData
+	var msgs []types.Message
+	var moreByCount, moreByBytes bool
+	err := h.withReadView(topicName, partitionID, func(view *topic.PartitionReadView) error {
+		idx, err := h.getIndexWithView(topicName, partitionID, view)
 		if err != nil {
-			writeError(conn, fmt.Sprintf("partition_read_failed offset=%d reason=%q", entry.Offset, err.Error()))
-			return
+			return err
 		}
-		if len(batch) == 0 || batch[0].Key != key || batch[0].AggregateVersion != entry.AggregateVersion {
-			writeError(conn, fmt.Sprintf("stream_index_record_mismatch offset=%d", entry.Offset))
-			return
+
+		// Check snapshot: if one exists with version >= fromVersion, use it as base.
+		ss, err := h.getSnapshotWithView(topicName, partitionID, view)
+		if err != nil {
+			return err
 		}
-		size := estimateEventMessageBytes(batch[0])
-		if usedBytes+size > maxBytes {
-			if !paginated {
-				writeError(conn, fmt.Sprintf("stream_requires_pagination bytes>%d", maxBytes))
-				return
+
+		snap, err = ss.Read(key)
+		if err != nil {
+			return fmt.Errorf("snapshot_read_failed reason=%q", err.Error())
+		}
+
+		actualFromVersion := fromVersion
+		if snap != nil && snap.Version >= fromVersion {
+			// Start reading from the version after the snapshot.
+			actualFromVersion = snap.Version + 1
+		}
+
+		currentVersion := idx.GetVersion(key)
+		var entries []StreamIndexEntry
+		if paginated {
+			entries, err = idx.LookupRange(key, actualFromVersion, currentVersion, maxEvents+1)
+		} else {
+			maxBytes = util.MaxMessageSize
+			maxEvents = maxBytes / 256
+			entries, err = idx.LookupRange(key, actualFromVersion, currentVersion, maxEvents+1)
+			if len(entries) > maxEvents {
+				return fmt.Errorf("stream_requires_pagination bytes>%d", maxBytes)
 			}
-			if len(msgs) == 0 {
-				writeError(conn, fmt.Sprintf("event_exceeds_page_budget version=%d bytes=%d maximum=%d", entry.AggregateVersion, size, maxBytes))
-				return
-			}
-			moreByBytes = true
-			break
 		}
-		msgs = append(msgs, batch[0])
-		usedBytes += size
+		if err != nil {
+			return fmt.Errorf("index_lookup_failed reason=%q", err.Error())
+		}
+
+		moreByCount = paginated && len(entries) > maxEvents
+		if moreByCount {
+			entries = entries[:maxEvents]
+		}
+
+		// Collect one bounded page before sending its success envelope.
+		msgs = make([]types.Message, 0, len(entries))
+		usedBytes := 0
+		moreByBytes = false
+		for _, entry := range entries {
+			batch, err := view.ReadCommittedRange(entry.Offset, entry.Offset+1, 1)
+			if err != nil {
+				return fmt.Errorf("partition_read_failed offset=%d reason=%q", entry.Offset, err.Error())
+			}
+			if len(batch) == 0 || batch[0].Key != key || batch[0].AggregateVersion != entry.AggregateVersion {
+				return fmt.Errorf("stream_index_record_mismatch offset=%d", entry.Offset)
+			}
+			size := estimateEventMessageBytes(batch[0])
+			if usedBytes+size > maxBytes {
+				if !paginated {
+					return fmt.Errorf("stream_requires_pagination bytes>%d", maxBytes)
+				}
+				if len(msgs) == 0 {
+					return fmt.Errorf("event_exceeds_page_budget version=%d bytes=%d maximum=%d", entry.AggregateVersion, size, maxBytes)
+				}
+				moreByBytes = true
+				break
+			}
+			msgs = append(msgs, detachEventMessage(batch[0]))
+			usedBytes += size
+		}
+		return nil
+	})
+	if err != nil {
+		writeError(conn, err.Error())
+		return
 	}
 	batchData, err := util.EncodeBatchMessages(topicName, partitionID, "1", false, msgs)
 	if err != nil {
@@ -833,53 +864,61 @@ func (h *Handler) SaveSnapshot(cmd string, afterSave func(result SnapshotResult)
 		return nil, "ERROR: no_partitions_available"
 	}
 
-	idx, err := h.getIndex(topicName, partitionID)
-	if err != nil {
-		return nil, fmt.Sprintf("ERROR: stream_index_failed partition=%d reason=%q", partitionID, err.Error())
-	}
-	currentVersion := idx.GetVersion(key)
-	if version > currentVersion {
-		return nil, fmt.Sprintf("ERROR: snapshot_version_exceeds_stream version=%d current=%d", version, currentVersion)
-	}
-
-	ss, err := h.getSnapshot(topicName, partitionID)
-	if err != nil {
-		return nil, fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", partitionID, err.Error())
-	}
-	if err := ss.ValidateSave(key, version, payload); err != nil {
-		return nil, fmt.Sprintf("ERROR: snapshot_save_failed reason=%q", err.Error())
-	}
 	result := SnapshotResult{Topic: topicName, Key: key, Version: version, Partition: partitionID, Payload: payload}
+	var generation uint64
+	validate := func(view *topic.PartitionReadView, save bool) error {
+		idx, err := h.getIndexWithView(topicName, partitionID, view)
+		if err != nil {
+			return err
+		}
+		currentVersion := idx.GetVersion(key)
+		if version > currentVersion {
+			return fmt.Errorf("snapshot_version_exceeds_stream version=%d current=%d", version, currentVersion)
+		}
+		ss, err := h.getSnapshotWithView(topicName, partitionID, view)
+		if err != nil {
+			return err
+		}
+		if save {
+			return ss.Save(key, version, payload)
+		}
+		return ss.ValidateSave(key, version, payload)
+	}
+	err = h.withReadView(topicName, partitionID, func(view *topic.PartitionReadView) error {
+		generation = view.Generation()
+		return validate(view, false)
+	})
+	if err != nil {
+		return nil, "ERROR: " + err.Error()
+	}
 	if afterSave != nil {
 		if err := afterSave(result); err != nil {
 			return nil, fmt.Sprintf("ERROR: snapshot_replicate_failed reason=%q", err.Error())
 		}
 	}
-	// Publish locally only after the distributed callback has reached the
-	// required replica quorum.
-	if err := ss.Save(key, version, payload); err != nil {
-		return nil, fmt.Sprintf("ERROR: snapshot_save_failed reason=%q", err.Error())
+	err = h.withReadView(topicName, partitionID, func(view *topic.PartitionReadView) error {
+		if generation != view.Generation() {
+			return fmt.Errorf("snapshot_generation_changed retryable=true")
+		}
+		return validate(view, true)
+	})
+	if err != nil {
+		return nil, "ERROR: " + err.Error()
 	}
 	return &result, ""
+
 }
 
 func (h *Handler) SaveSnapshotReplica(result SnapshotResult) string {
-	t := h.tm.GetTopic(result.Topic)
-	if t == nil {
-		return fmt.Sprintf("ERROR: topic_not_found topic=%s", result.Topic)
-	}
-	if !t.IsEventSourcing {
-		return fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", result.Topic)
-	}
-	if _, err := t.GetPartition(result.Partition); err != nil {
-		return fmt.Sprintf("ERROR: partition_lookup_failed partition=%d reason=%q", result.Partition, err.Error())
-	}
-	ss, err := h.getSnapshot(result.Topic, result.Partition)
+	err := h.withReadView(result.Topic, result.Partition, func(view *topic.PartitionReadView) error {
+		ss, err := h.getSnapshotWithView(result.Topic, result.Partition, view)
+		if err != nil {
+			return err
+		}
+		return ss.Save(result.Key, result.Version, result.Payload)
+	})
 	if err != nil {
-		return fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", result.Partition, err.Error())
-	}
-	if err := ss.Save(result.Key, result.Version, result.Payload); err != nil {
-		return fmt.Sprintf("ERROR: snapshot_save_failed reason=%q", err.Error())
+		return "ERROR: snapshot_save_failed reason=" + strconv.Quote(err.Error())
 	}
 	return ""
 }
@@ -896,29 +935,27 @@ func (h *Handler) ListSnapshotsPage(topicName string, partitionID int, afterKey 
 }
 
 func (h *Handler) ListSnapshotsPageAtRevision(topicName string, partitionID int, afterKey string, limit int, expectedRevision uint64) (SnapshotPage, string) {
-	t := h.tm.GetTopic(topicName)
-	if t == nil {
-		return SnapshotPage{}, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
-	}
-	if !t.IsEventSourcing {
-		return SnapshotPage{}, fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", topicName)
-	}
-	if _, err := t.GetPartition(partitionID); err != nil {
-		return SnapshotPage{}, fmt.Sprintf("ERROR: partition_lookup_failed partition=%d reason=%q", partitionID, err.Error())
-	}
-	ss, err := h.getSnapshot(topicName, partitionID)
+	var page SnapshotPage
+	err := h.withReadView(topicName, partitionID, func(view *topic.PartitionReadView) error {
+		ss, err := h.getSnapshotWithView(topicName, partitionID, view)
+		if err != nil {
+			return err
+		}
+		records, revision, done, err := ss.ListPageAtRevision(afterKey, limit, expectedRevision)
+		if err != nil {
+			return err
+		}
+		result := make([]SnapshotResult, 0, len(records))
+		for _, rec := range records {
+			result = append(result, SnapshotResult{Topic: topicName, Key: rec.Key, Version: rec.Version, Partition: partitionID, Payload: rec.Payload})
+		}
+		page = SnapshotPage{Snapshots: result, Revision: revision, Done: done}
+		return nil
+	})
 	if err != nil {
-		return SnapshotPage{}, fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", partitionID, err.Error())
+		return SnapshotPage{}, "ERROR: snapshot_list_failed reason=" + strconv.Quote(err.Error())
 	}
-	records, revision, done, err := ss.ListPageAtRevision(afterKey, limit, expectedRevision)
-	if err != nil {
-		return SnapshotPage{}, fmt.Sprintf("ERROR: snapshot_list_failed reason=%q", err.Error())
-	}
-	result := make([]SnapshotResult, 0, len(records))
-	for _, rec := range records {
-		result = append(result, SnapshotResult{Topic: topicName, Key: rec.Key, Version: rec.Version, Partition: partitionID, Payload: rec.Payload})
-	}
-	return SnapshotPage{Snapshots: result, Revision: revision, Done: done}, ""
+	return page, ""
 }
 
 // FetchSnapshot returns the latest snapshot for a topic partition and aggregate key.
@@ -926,16 +963,25 @@ func (h *Handler) FetchSnapshot(topicName string, partitionID int, key string) (
 	if key == "" {
 		return nil, "ERROR: missing_key"
 	}
-	snaps, errResp := h.ListSnapshots(topicName, partitionID)
-	if errResp != "" {
-		return nil, errResp
-	}
-	for _, snap := range snaps {
-		if snap.Key == key {
-			return &snap, ""
+	var result *SnapshotResult
+	err := h.withReadView(topicName, partitionID, func(view *topic.PartitionReadView) error {
+		ss, err := h.getSnapshotWithView(topicName, partitionID, view)
+		if err != nil {
+			return err
 		}
+		snap, err := ss.Read(key)
+		if err != nil {
+			return err
+		}
+		if snap != nil {
+			result = &SnapshotResult{Topic: topicName, Partition: partitionID, Key: key, Version: snap.Version, Payload: snap.Payload}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "ERROR: snapshot_read_failed reason=" + strconv.Quote(err.Error())
 	}
-	return nil, ""
+	return result, ""
 }
 
 // HandleReadSnapshot processes:
@@ -969,14 +1015,13 @@ func (h *Handler) HandleReadSnapshot(cmd string) string {
 		return "ERROR: no_partitions_available"
 	}
 
-	ss, err := h.getSnapshot(topicName, partitionID)
-	if err != nil {
-		return fmt.Sprintf("ERROR: snapshot_store_failed partition=%d reason=%q", partitionID, err.Error())
+	result, errResp := h.FetchSnapshot(topicName, partitionID, key)
+	if errResp != "" {
+		return errResp
 	}
-
-	snap, err := ss.Read(key)
-	if err != nil {
-		return fmt.Sprintf("ERROR: snapshot_read_failed reason=%q", err.Error())
+	var snap *SnapshotData
+	if result != nil {
+		snap = &SnapshotData{Version: result.Version, Payload: result.Payload}
 	}
 	if snap == nil {
 		return "OK snapshot=null"
@@ -1020,13 +1065,12 @@ func (h *Handler) HandleStreamVersion(cmd string) string {
 		return "ERROR: no_partitions_available"
 	}
 
-	idx, err := h.getIndex(topicName, partitionID)
+	version, _, err := h.CurrentVersion(topicName, key)
 	if err != nil {
-		return fmt.Sprintf("ERROR: stream_index_failed partition=%d reason=%q", partitionID, err.Error())
+		return "ERROR: " + err.Error()
 	}
-
-	version := idx.GetVersion(key)
 	return fmt.Sprintf("OK version=%d", version)
+
 }
 
 // DeleteTopic closes cached stream indexes and snapshot stores for a deleted topic.
@@ -1124,4 +1168,11 @@ func parseKeyValueArgs(argsStr string) map[string]string {
 		}
 	}
 	return result
+}
+
+// Detach mutable wire fields before releasing the partition generation view.
+func detachEventMessage(message types.Message) types.Message {
+	message.ControlBatchKey = append([]byte(nil), message.ControlBatchKey...)
+	message.ControlBatchValue = append([]byte(nil), message.ControlBatchValue...)
+	return message
 }
