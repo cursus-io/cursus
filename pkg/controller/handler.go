@@ -190,7 +190,7 @@ func NewCommandHandler(
 	if cd != nil {
 		cd.SetTransactionalOffsetResolver(ch.TxnManager)
 		if ch.isDistributed() {
-			cd.SetOffsetRecordWriter(ch.writeConsumerOffsetRecord)
+			cd.SetRoutedOffsetRecordWriter(ch.writeConsumerOffsetRecord)
 		}
 	}
 	if cc != nil && cc.RaftManager != nil {
