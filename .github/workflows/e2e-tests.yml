@@ -99,7 +99,7 @@ jobs:
           RUN_E2E_CHAOS: "1"
         run: |
           go test -v -count=1 -timeout 25m ./test/e2e-cluster \
-            -run '^Test(DistributedTruncateRecoveryPreservesConsumerOffsetReplication|ReplicaConflictRecoveryAfterPartialAppend)$'
+            -run '^Test(DistributedTruncateRecoveryPreservesConsumerOffsetReplication|ReplicaConflictRecoveryAfterPartialAppend|ReplicaRecoveryWithoutLaterEpochBoundary)$'
 
       - name: Show replica recovery cluster logs on failure
         if: failure()

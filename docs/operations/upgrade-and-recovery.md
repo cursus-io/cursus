@@ -154,6 +154,25 @@ than twice the fixture's session timeout. It models the durable-tail failure
 state; it does not establish the cause of an earlier network or transaction
 timeout in a particular deployment.
 
+If a follower's prefix digest differs but the source has no retained epoch
+boundary after the follower's epoch, recovery falls back to the same fenced,
+one-record rollback used for legacy records. This also covers non-zero epochs
+and legacy records encountered while scanning the source. Each subsequent
+request must prove the preceding prefix before records can be transferred;
+the authoritative source log is never truncated. Storage or checksum failures,
+unavailable prefix records, stale fences, and invalid committed HWMs still stop
+recovery. Durable lineage indexes and bootstrap for prefixes removed by
+retention remain follow-up work in #246.
+
+The same-epoch restart regression commits a replacement on the two surviving
+brokers before restarting a divergent follower, then checks exact raw-record
+equality on all three replicas and persistence through a second restart:
+
+```sh
+RUN_E2E_CHAOS=1 go test -v -count=1 -timeout=20m ./test/e2e-cluster \
+  -run '^TestReplicaRecoveryWithoutLaterEpochBoundary$'
+```
+
 ## Rollback And Restore
 
 If the candidate cannot read or safely operate on the persisted format, stop

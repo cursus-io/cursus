@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -15,6 +16,8 @@ import (
 )
 
 const MaxReplicaCatchupRecords = 1024
+
+var errReplicaEpochBoundaryUnavailable = errors.New("replica epoch boundary unavailable")
 
 // ReplicaCatchupRequest asks a current in-sync replica for a bounded raw
 // committed-log range. CommittedHWM is the follower's observed lower bound;
@@ -553,15 +556,18 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 			return ReplicaCatchupBatch{}, err
 		}
 		if digest != request.PreviousRecordDigest {
-			// Records written before leader epochs were persisted have no epoch
-			// boundary to jump to. Remove only the mismatched follower record;
+			// If retained epochs cannot prove a boundary, including legacy logs,
+			// remove only the mismatched follower record;
 			// the next request must prove the preceding prefix before recovery
 			// can append authoritative committed records.
 			truncateTo := request.NextOffset - 1
 			if request.PreviousLeaderEpoch > 0 {
-				truncateTo, err = f.replicaLeaderEpochEndOffset(request.Topic, request.Partition, request.PreviousLeaderEpoch, request.NextOffset)
-				if err != nil {
+				boundary, err := f.replicaLeaderEpochEndOffset(request.Topic, request.Partition, request.PreviousLeaderEpoch, request.NextOffset)
+				if err != nil && !errors.Is(err, errReplicaEpochBoundaryUnavailable) {
 					return ReplicaCatchupBatch{}, fmt.Errorf("find replica divergence boundary: %w", err)
+				}
+				if err == nil {
+					truncateTo = boundary
 				}
 			}
 			return SealReplicaCatchupBatch(ReplicaCatchupBatch{
@@ -617,9 +623,12 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 	})
 }
 
+// replicaLeaderEpochEndOffset finds a later retained epoch before the follower's
+// tail. Missing epoch metadata is distinguished from unreadable storage so only
+// the former permits digest-based rollback.
 func (f *BrokerFSM) replicaLeaderEpochEndOffset(topicName string, partitionID int, leaderEpoch int64, before uint64) (uint64, error) {
 	if leaderEpoch <= 0 {
-		return 0, fmt.Errorf("legacy record has no leader epoch; clean bootstrap required")
+		return 0, fmt.Errorf("%w: legacy record has no leader epoch", errReplicaEpochBoundaryUnavailable)
 	}
 	f.mu.RLock()
 	topicManager := f.tm
@@ -649,7 +658,7 @@ func (f *BrokerFSM) replicaLeaderEpochEndOffset(topicName string, partitionID in
 				break
 			}
 			if message.LeaderEpoch == 0 {
-				return 0, fmt.Errorf("record %d has no leader epoch; clean bootstrap required", message.Offset)
+				return 0, fmt.Errorf("%w: record %d has no leader epoch", errReplicaEpochBoundaryUnavailable, message.Offset)
 			}
 			if message.LeaderEpoch > leaderEpoch {
 				return message.Offset, nil
@@ -657,7 +666,7 @@ func (f *BrokerFSM) replicaLeaderEpochEndOffset(topicName string, partitionID in
 			offset = message.Offset + 1
 		}
 	}
-	return 0, fmt.Errorf("source has no epoch boundary after follower epoch %d", leaderEpoch)
+	return 0, fmt.Errorf("%w: source has no epoch boundary after follower epoch %d", errReplicaEpochBoundaryUnavailable, leaderEpoch)
 }
 
 // ReadCommittedLogRange returns raw log records for replica catch-up. Unlike a
