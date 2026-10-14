@@ -340,7 +340,7 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 	return res
 }
 
-func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
+func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	f.transitionMu.Lock()
 	defer f.transitionMu.Unlock()
 
@@ -403,6 +403,11 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	if err := coordinator.ValidateImportState(state.GroupState); err != nil {
 		return fmt.Errorf("restore consumer groups: %w", err)
 	}
+	if f.cd != nil {
+		if err := f.cd.ValidateConsumerRestoreOrigin(state.ConsumerRecovery); err != nil {
+			return err
+		}
+	}
 	if err := transaction.ValidateImportState(state.TransactionState); err != nil {
 		return fmt.Errorf("restore transactions: %w", err)
 	}
@@ -434,6 +439,10 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		}
 	}
 
+	if f.cd != nil {
+		generation := f.cd.BeginConsumerRestore()
+		defer func() { f.cd.FinishConsumerRestore(generation, restoreErr) }()
+	}
 	f.mu.Lock()
 	previousMaterialization := f.topicMaterialization
 
