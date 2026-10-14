@@ -2,6 +2,7 @@ package topic
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,6 +78,8 @@ type Partition struct {
 	visibilityMu               sync.RWMutex
 	visibilityGeneration       uint64
 	bootstrapPending           atomic.Bool
+	rollbackPending            atomic.Bool
+	rollbackErr                error                   // recoveryMu; only rollback failures
 	bootstrapMetadata          *disk.BootstrapMetadata // recoveryMu
 	bootstrapAttemptErr        error                   // recoveryMu
 	bootstrapLifecycle         uint64                  // recoveryMu
@@ -256,7 +259,7 @@ func (p *Partition) setRecoveryError(err error) {
 func (p *Partition) RecoveryError() error {
 	p.recoveryMu.RLock()
 	defer p.recoveryMu.RUnlock()
-	return errors.Join(p.recoveryErr, p.txnRecoveryErr, p.producerRecoveryErr, p.reconciliationErr, p.bootstrapErrorLocked())
+	return errors.Join(p.recoveryErr, p.txnRecoveryErr, p.producerRecoveryErr, p.reconciliationErr, p.bootstrapErrorLocked(), p.rollbackErrorLocked())
 }
 
 // MarkReconciliationPending fences leader appends after a failed tail repair.
@@ -773,6 +776,9 @@ func (p *Partition) ReplicaAppend(msgs []types.Message) error {
 func (p *Partition) ReplicaAppendWithMode(msgs []types.Message, forceIdempotent bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := p.rollbackError(); err != nil {
+		return err
+	}
 	if p.closed {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
@@ -836,6 +842,9 @@ func (p *Partition) ReplicaAppendWithMode(msgs []types.Message, forceIdempotent 
 func (p *Partition) ReplicaAppendCompactedRange(msgs []types.Message, endOffset uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := p.rollbackError(); err != nil {
+		return err
+	}
 	if p.closed {
 		return fmt.Errorf("partition %d is closed", p.id)
 	}
@@ -1616,6 +1625,14 @@ func (p *Partition) BeginReplicationMutation() func() {
 }
 
 func (p *Partition) ReserveOffsets(count int) (uint64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.RecoveryError(); err != nil {
+		return p.LEO.Load(), err
+	}
+	if p.closed {
+		return p.LEO.Load(), fmt.Errorf("partition is closed")
+	}
 	if count <= 0 {
 		return p.LEO.Load(), nil
 	}
@@ -1638,6 +1655,9 @@ func (p *Partition) ApplyReplicaHWM(hwm uint64) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := p.rollbackError(); err != nil {
+		return err
+	}
 	// Pending may have changed while this operation waited for exclusion.
 	if p.BootstrapPending() {
 		return nil
@@ -1661,11 +1681,14 @@ func (p *Partition) ApplyReplicaHWM(hwm uint64) error {
 // from admitting the replica after a leader, topic, or HWM change.
 func (p *Partition) MarkReplicaCatchupVerified(leaderEpoch int, lifecycleEpoch, hwm uint64) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.BootstrapPending() || p.rollbackError() != nil || p.closed {
+		return
+	}
 	p.replicaVerifiedLeaderEpoch = leaderEpoch
 	p.replicaVerifiedLifecycle = lifecycleEpoch
 	p.replicaVerifiedHWM = hwm
 	p.replicaVerified = true
-	p.mu.Unlock()
 }
 
 func (p *Partition) ReplicaCatchupVerified(leaderEpoch int, lifecycleEpoch, hwm uint64) bool {
@@ -1733,39 +1756,7 @@ func (p *Partition) TruncateReplicaTail(offset uint64) error {
 // HWM; this internal recovery transition may move that stale local watermark
 // backward so the follower can refetch the authoritative prefix.
 func (p *Partition) ApplyReplicaRollback(offset uint64) error {
-	p.reconcileMu.Lock()
-	defer p.reconcileMu.Unlock()
-	p.mu.Lock()
-	if p.BootstrapPending() {
-		p.mu.Unlock()
-		return ErrBootstrapPending
-	}
-	if p.snapshotRecovery {
-		err := fmt.Errorf("snapshot replay is still pending: visible_hwm=%d durable_hwm=%d requested_offset=%d", p.HWM, p.recoveryCheckpointHWM, offset)
-		p.mu.Unlock()
-		return err
-	}
-	err := p.truncateReplicaTailLocked(offset)
-	// TruncateTo is the irreversible step. Once it succeeds, LEO already
-	// reflects offset even if rebuilding transaction or producer state fails.
-	// Publish the same boundary for HWM before returning so retries never
-	// observe a committed watermark beyond the durable tail.
-	if p.LEO.Load() == offset {
-		wasAuthoritative := p.hwmAuthoritative
-		p.hwmAuthoritative = true
-		if p.HWM != offset {
-			p.HWM = offset
-			p.signalHWMCheckpointLocked()
-		} else if !wasAuthoritative {
-			p.signalHWMCheckpointLocked()
-		}
-	}
-	p.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	p.clearReconciliationError()
-	return nil
+	return p.applyReplicaRollback(context.Background(), offset, p.NextOffset(), nil, offset, nil, false)
 }
 
 // ReconcileSnapshotHWM stages the snapshot visibility boundary without
@@ -1935,6 +1926,9 @@ func (p *Partition) SetHWM(hwm uint64) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.rollbackError() != nil {
+		return
+	}
 	// Pending may have changed while this operation waited for exclusion.
 	if p.BootstrapPending() {
 		return
@@ -2222,6 +2216,11 @@ func (p *Partition) GetHWM() uint64 {
 }
 
 func (p *Partition) UpdateLEO(leo uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.BootstrapPending() || p.rollbackError() != nil || p.closed {
+		return
+	}
 	p.LEO.Store(leo)
 }
 

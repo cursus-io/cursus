@@ -18,12 +18,30 @@ type rawRecoveryState struct {
 // Build detached maps under storage exclusion. Resolve transaction authority
 // only after the disk scan has released all storage locks.
 func (p *Partition) scanRawRecoveryState() (*rawRecoveryState, error) {
+	return p.scanRawRecoveryStateContext(context.Background())
+}
+
+func (p *Partition) scanRawRecoveryStateContext(ctx context.Context) (*rawRecoveryState, error) {
 	state := &rawRecoveryState{markers: make(map[transactionMarkerKey]transactionMarkerInfo), open: make(map[transactionMarkerKey]uint64), producers: make(map[string]producerStateCheckpointEntry)}
 	if p.dh == nil {
 		return state, nil
 	}
-	state.first, state.end = p.dh.GetFirstOffset(), p.dh.GetAbsoluteOffset()
+	if storage, ok := p.dh.(interface {
+		GetFirstOffsetContext(context.Context) (uint64, error)
+	}); ok && !p.BootstrapPending() {
+		var err error
+		state.first, err = storage.GetFirstOffsetContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		state.first = p.dh.GetFirstOffset()
+	}
+	state.end = p.dh.GetAbsoluteOffset()
 	visit := func(msg types.Message) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if msg.ProducerID != "" && msg.SeqNum > 0 {
 			candidate := producerStateCheckpointEntry{Epoch: msg.Epoch, Seq: msg.SeqNum, Offset: msg.Offset}
 			if current, ok := state.producers[msg.ProducerID]; !ok || producerStateAfter(candidate, current) {
@@ -51,7 +69,7 @@ func (p *Partition) scanRawRecoveryState() (*rawRecoveryState, error) {
 	if scanner, ok := p.dh.(interface {
 		ScanRetainedRange(context.Context, uint64, uint64, func(types.Message) error) error
 	}); ok {
-		if err := scanner.ScanRetainedRange(context.Background(), state.first, state.end, visit); err != nil {
+		if err := scanner.ScanRetainedRange(ctx, state.first, state.end, visit); err != nil {
 			return nil, err
 		}
 	} else {
