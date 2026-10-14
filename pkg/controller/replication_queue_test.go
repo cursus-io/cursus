@@ -1518,6 +1518,8 @@ func TestApplyReplicaCatchupTruncatesDivergentTail(t *testing.T) {
 	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
 	require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
 	state := fsm.NewBrokerFSM(topicManager, nil)
+	registerRoutingBroker(t, state, "broker-1")
+	registerRoutingBroker(t, state, "broker-2")
 	applyPartitionMetadata(t, state, "orders", 0, fsm.PartitionMetadata{
 		Leader: "broker-1", LeaderEpoch: 8, CommittedHWM: 3, CommittedHWMKnown: true,
 		Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1"}, PartitionCount: 1,

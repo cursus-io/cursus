@@ -2,12 +2,14 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	replicationFSM "github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/cursus-io/cursus/pkg/topic"
 )
 
 // CatchupReplicaSnapshots converges the application snapshot catalog after the
@@ -54,24 +56,40 @@ func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replica
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if batch.TruncateTo != nil && batch.Topic == config.ConsumerOffsetsTopicName {
+		if ch.Coordinator == nil {
+			return fmt.Errorf("consumer log repair coordinator unavailable")
+		}
+		release, err := ch.Coordinator.BeginConsumerMetadataRecovery(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+		if !ch.groupRecoveryReloadMu.TryLock() {
+			return ErrConsumerRecoveryPending
+		}
+		defer ch.groupRecoveryReloadMu.Unlock()
+	}
 	releaseLifecycle, err := ch.topicLifecycleGates.acquire(ctx, batch.Topic, false)
 	if err != nil {
 		return err
 	}
 	defer releaseLifecycle()
 	writeLock := ch.partitionWriteLock(batch.Topic, batch.Partition)
-	writeLock.Lock()
+	if err := writeLock.LockContext(ctx); err != nil {
+		return err
+	}
 	defer writeLock.Unlock()
-	if batch.RecoveryProtocol != 0 {
+	if batch.RecoveryProtocol != 0 || batch.TruncateTo != nil {
 		if ch.Cluster.RaftManager.GetFSM() == nil {
 			return fmt.Errorf("replica catch-up metadata is unavailable")
 		}
-		return ch.Cluster.RaftManager.GetFSM().WithReplicaRecoveryFence(batch, func() error { return ch.applyReplicaCatchup(batch) })
+		return ch.Cluster.RaftManager.GetFSM().WithReplicaRecoveryFence(batch, func() error { return ch.applyReplicaCatchup(ctx, batch) })
 	}
-	return ch.applyReplicaCatchup(batch)
+	return ch.applyReplicaCatchup(ctx, batch)
 }
 
-func (ch *CommandHandler) applyReplicaCatchup(batch replicationFSM.ReplicaCatchupBatch) error {
+func (ch *CommandHandler) applyReplicaCatchup(ctx context.Context, batch replicationFSM.ReplicaCatchupBatch) error {
 	if ch.Cluster.Router == nil || batch.BrokerID != ch.Cluster.Router.BrokerID() {
 		return fmt.Errorf("replica catch-up broker identity mismatch")
 	}
@@ -112,7 +130,7 @@ func (ch *CommandHandler) applyReplicaCatchup(batch replicationFSM.ReplicaCatchu
 	if partition.NextOffset() != batch.StartOffset {
 		return fmt.Errorf("replica catch-up local LEO changed: current=%d response_start=%d", partition.NextOffset(), batch.StartOffset)
 	}
-	if batch.RecoveryProtocol != 0 {
+	if batch.RecoveryProtocol != 0 && batch.TruncateTo == nil {
 		matched, err := partition.VerifyReplicaLineage(*batch.MatchedPrefix, batch.CommittedHWM)
 		if err != nil {
 			return err
@@ -125,11 +143,29 @@ func (ch *CommandHandler) applyReplicaCatchup(batch replicationFSM.ReplicaCatchu
 		if len(batch.Messages) != 0 || batch.Verified || *batch.TruncateTo >= batch.StartOffset || batch.EndOffset != batch.StartOffset {
 			return fmt.Errorf("invalid replica catch-up truncation boundary")
 		}
-		if err := partition.ApplyReplicaRollback(*batch.TruncateTo); err != nil {
-			return err
+		var beforeMutation func() error
+		var generation uint64
+		if batch.Topic == config.ConsumerOffsetsTopicName {
+			if err := ch.Coordinator.ValidateConsumerMetadataBootstrapEligibility(batch.Partition); err != nil {
+				return err
+			}
+			beforeMutation = func() error {
+				var err error
+				generation, err = ch.Coordinator.BeginConsumerLogRepair(batch.Partition)
+				return err
+			}
 		}
-		partition.FlushDisk()
-		return nil
+		err := partition.ApplyReplicaRollbackChecked(ctx, *batch.TruncateTo, batch.StartOffset, batch.MatchedPrefix, batch.CommittedHWM, beforeMutation)
+		if generation != 0 {
+			// A checked pre-mutation rejection restores partition availability.
+			// Destructive/rebuild failures retain their own recovery error.
+			var failure error
+			if errors.Is(err, topic.ErrReplicaRollbackFailed) {
+				failure = err
+			}
+			ch.Coordinator.FinishConsumerLogRepair(generation, failure)
+		}
+		return err
 	}
 	releaseMutation := partition.BeginReplicationMutation()
 	defer releaseMutation()

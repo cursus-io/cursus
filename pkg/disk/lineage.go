@@ -158,22 +158,28 @@ func lineageCandidateEnds(start, tail uint64) []uint64 {
 // caller's authoritative, exclusive committed HWM. Epoch matches alone are
 // never used as evidence; a matching final record cannot hide earlier divergence.
 func (d *DiskHandler) VerifyLineagePrefix(prefix LineagePrefix, committedHWM uint64) (bool, error) {
+	return d.VerifyLineagePrefixContext(context.Background(), prefix, committedHWM)
+}
+
+func (d *DiskHandler) VerifyLineagePrefixContext(ctx context.Context, prefix LineagePrefix, committedHWM uint64) (bool, error) {
+	if ctx == nil {
+		return false, errors.New("lineage requires context")
+	}
 	if prefix.EndOffset < prefix.StartOffset || prefix.EndOffset > committedHWM {
 		return false, nil
 	}
-	d.maintenanceMu.Lock()
-	defer d.maintenanceMu.Unlock()
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.ioMu.Lock()
-	defer d.ioMu.Unlock()
-	if err := d.prepareLineageLocked(context.Background()); err != nil {
+	unlock, err := lockProofContext(ctx, &d.maintenanceMu, &d.mu, &d.ioMu)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	if err := d.prepareLineageLocked(ctx); err != nil {
 		return false, err
 	}
 	if prefix.StartOffset != d.lineage.start || prefix.EndOffset > d.lineage.tail.EndOffset {
 		return false, nil
 	}
-	want, err := d.lineagePrefixLocked(context.Background(), prefix.EndOffset)
+	want, err := d.lineagePrefixLocked(ctx, prefix.EndOffset)
 	return err == nil && want == prefix, err
 }
 
