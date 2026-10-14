@@ -9,7 +9,7 @@ on:
       - 'go.sum'
       - '.github/workflows/codeql-analysis.yml'
   pull_request:
-    branches: [main]
+    branches: [main, feat/replica-lineage-index, feat/indexed-replica-recovery]
     paths:
       - '**/*.go'
       - 'go.mod'

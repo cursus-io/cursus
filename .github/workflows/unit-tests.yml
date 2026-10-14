@@ -20,7 +20,7 @@ on:
       - 'util/**'
       - 'codecov.yml'
   pull_request:
-    branches: [main, release-*]
+    branches: [main, release-*, feat/replica-lineage-index, feat/indexed-replica-recovery]
     paths:
       - '.github/workflows/**'
       - '.github/actions/**'

@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Preserve organization settings while reviewing the dependent recovery layers.
+inheritance: true
+reviews:
+  auto_review:
+    base_branches:
+      - "^feat/replica-lineage-index$"
+      - "^feat/indexed-replica-recovery$"

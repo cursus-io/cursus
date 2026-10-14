@@ -19,7 +19,7 @@ on:
       - 'test/**'
       - 'util/**'
   pull_request:
-    branches: [main, release-*]
+    branches: [main, release-*, feat/replica-lineage-index, feat/indexed-replica-recovery]
     paths:
       - '.github/workflows/**'
       - '.github/actions/**'

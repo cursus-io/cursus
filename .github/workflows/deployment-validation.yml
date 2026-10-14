@@ -2,7 +2,7 @@ name: Deployment Validation
 
 on:
   pull_request:
-    branches: [main, release-*]
+    branches: [main, release-*, feat/replica-lineage-index, feat/indexed-replica-recovery]
     paths:
       - '.github/workflows/deployment-validation.yml'
       - 'Dockerfile'
