@@ -452,6 +452,7 @@ func (r *BootstrapReceiver) Install() error {
 	if err = validateBootstrapTransaction(d.BaseName, tx); err != nil {
 		return err
 	}
+	d.advanceContentGenerationLocked()
 	if err = writeBootstrapEnvelope(bootstrapPendingPath(d.BaseName), tx); err != nil {
 		if _, statErr := os.Stat(bootstrapPendingPath(d.BaseName)); statErr == nil {
 			d.bootstrapPending.Store(true)
@@ -495,6 +496,7 @@ func (r *BootstrapReceiver) Install() error {
 	d.compactionMu.Unlock()
 	atomic.StoreUint64(&d.AbsoluteOffset, t.metadata.EndOffset)
 	atomic.StoreUint64(&d.FlushedOffset, t.metadata.EndOffset)
+	d.writtenTail = t.metadata.EndOffset
 	if err = d.openSegment(); err != nil {
 		return err
 	}
