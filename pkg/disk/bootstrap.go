@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -383,87 +384,38 @@ func (d *DiskHandler) ExportBootstrapContext(ctx context.Context, start, end uin
 		return nil, err
 	}
 	defer func() { _ = log.Close() }()
-	var previous uint64
 	var outputBytes int64
-	havePrevious := false
-	for i, segment := range d.segments {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	m.Compacted, err = d.scanRetainedRangeLocked(ctx, start, end, func(msg types.DiskMessage) error {
+		if msg.Topic != fence.Topic || int(msg.Partition) != fence.Partition {
+			return fmt.Errorf("bootstrap record identity mismatch")
 		}
-		if segment >= end {
-			break
-		}
-		segmentEnd := end
-		closed := i+1 < len(d.segments)
-		if closed && d.segments[i+1] < segmentEnd {
-			segmentEnd = d.segments[i+1]
-		}
-		if segmentEnd <= start {
-			continue
-		}
-		segmentStart := segment
-		if start > segmentStart {
-			segmentStart = start
-		}
-		next := segmentStart
-		info, err := os.Stat(d.GetSegmentPath(segment))
+		canonical, err := util.SerializeDiskMessage(msg)
 		if err != nil {
-			return nil, err
-		}
-		compacted := d.segmentAllowsOffsetGaps(segment, info.Size())
-		if compacted {
-			m.Compacted = true
-		}
-		err = scanCompactionSegment(d.GetSegmentPath(segment), segment, false, compacted, func(frame compactionFrame) error {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			msg := frame.message
-			if msg.Offset < segment || (closed && msg.Offset >= d.segments[i+1]) {
-				return fmt.Errorf("bootstrap record outside physical segment bounds")
-			}
-			if msg.Offset < segmentStart || msg.Offset >= segmentEnd {
-				return nil
-			}
-			if !compacted && msg.Offset != next {
-				return fmt.Errorf("unmarked bootstrap source offset gap")
-			}
-			if msg.Topic != fence.Topic || int(msg.Partition) != fence.Partition || (havePrevious && msg.Offset <= previous) {
-				return fmt.Errorf("bootstrap record identity or ordering mismatch")
-			}
-			previous = msg.Offset
-			havePrevious = true
-			next = msg.Offset + 1
-			canonical, err := util.SerializeDiskMessage(msg)
-			if err != nil {
-				return err
-			}
-			if err = validateSerializedDiskMessageSize(canonical); err != nil {
-				return err
-			}
-			length, ok := util.SafeIntToUint32(len(canonical))
-			if !ok {
-				return fmt.Errorf("bootstrap canonical frame too large")
-			}
-			outputBytes += 4 + int64(len(canonical))
-			if err = reserveBootstrapGrowth(d, t, outputBytes+int64(len(catalog))); err != nil {
-				return err
-			}
-			var header [4]byte
-			binary.BigEndian.PutUint32(header[:], length)
-			if _, err = log.Write(header[:]); err != nil {
-				return err
-			}
-			_, err = log.Write(canonical)
 			return err
-		})
-		if err != nil {
-			return nil, err
 		}
-		if !compacted && next != segmentEnd {
-			return nil, fmt.Errorf("unmarked bootstrap source trailing offset gap")
+		if err = validateSerializedDiskMessageSize(canonical); err != nil {
+			return err
 		}
+		length, ok := util.SafeIntToUint32(len(canonical))
+		if !ok {
+			return fmt.Errorf("bootstrap canonical frame too large")
+		}
+		outputBytes += 4 + int64(len(canonical))
+		if err = reserveBootstrapGrowth(d, t, outputBytes+int64(len(catalog))); err != nil {
+			return err
+		}
+		var header [4]byte
+		binary.BigEndian.PutUint32(header[:], length)
+		if _, err = log.Write(header[:]); err != nil {
+			return err
+		}
+		_, err = log.Write(canonical)
+		return err
+	})
+	if err != nil {
+		return nil, err
 	}
+
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -775,4 +727,10 @@ func metadataDigest(m BootstrapMetadata) string {
 	data, _ := json.Marshal(m)
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+// OwnsBootstrapReceiver prevents installing a receiver belonging to another
+// handler while holding this partition's visibility boundary.
+func (d *DiskHandler) OwnsBootstrapReceiver(r *BootstrapReceiver) bool {
+	return r != nil && r.handler == d
 }

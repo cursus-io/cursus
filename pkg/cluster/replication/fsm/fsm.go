@@ -628,6 +628,7 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 		f.mu.Unlock()
 		return nil
 	}
+	pendingBootstraps := make(map[string]bool)
 	for _, localDefinition := range tm.ExportDefinitions() {
 		localTopic := tm.GetTopic(localDefinition.Name)
 		if localTopic == nil {
@@ -636,9 +637,12 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 		recoveryRelevant := false
 		for partitionID := 0; partitionID < localDefinition.Partitions; partitionID++ {
 			partition, err := localTopic.GetPartition(partitionID)
-			if err == nil && (partition.NextOffset() > 0 || partition.GetHWM() > 0 || partition.SnapshotRecoveryPending()) {
+			if err == nil && partition.BootstrapPending() {
+				pendingBootstraps[fmt.Sprintf("%s-%d", localDefinition.Name, partitionID)] = true
+				continue
+			}
+			if err == nil && !partition.BootstrapPending() && (partition.NextOffset() > 0 || partition.GetHWM() > 0 || partition.SnapshotRecoveryPending()) {
 				recoveryRelevant = true
-				break
 			}
 		}
 		if !recoveryRelevant {
@@ -656,7 +660,7 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 			if err != nil {
 				continue
 			}
-			if partition.NextOffset() > 0 || partition.GetHWM() > 0 || partition.SnapshotRecoveryPending() {
+			if !partition.BootstrapPending() && (partition.NextOffset() > 0 || partition.GetHWM() > 0 || partition.SnapshotRecoveryPending()) {
 				return fmt.Errorf(
 					"%w: partition %s-%d has local durable state but is outside the authoritative definition",
 					ErrRecoveredPartitionAuthorityPending,
@@ -668,6 +672,9 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 		for partitionID := 0; partitionID < authoritativeDefinition.Partitions; partitionID++ {
 			partition, err := localTopic.GetPartition(partitionID)
 			if err != nil {
+				continue
+			}
+			if partition.BootstrapPending() {
 				continue
 			}
 			key := fmt.Sprintf("%s-%d", localDefinition.Name, partitionID)
@@ -690,6 +697,9 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 		}
 	}
 	for key, meta := range metadata {
+		if pendingBootstraps[key] {
+			continue
+		}
 		if !meta.CommittedHWMKnown {
 			return fmt.Errorf("%w: partition %s has no authoritative committed HWM", ErrUnsupportedRecoveryProtocol, key)
 		}
@@ -707,6 +717,9 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 		}
 		partition, err := localTopic.GetPartition(partitionID)
 		if err != nil {
+			continue
+		}
+		if partition.BootstrapPending() {
 			continue
 		}
 		if err := partition.FinalizeSnapshotRecovery(meta.CommittedHWM); err != nil {

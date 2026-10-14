@@ -1,11 +1,12 @@
 package disk
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"os"
+	"github.com/cursus-io/cursus/pkg/types"
 	"sync/atomic"
 
 	"github.com/cursus-io/cursus/util"
@@ -37,67 +38,26 @@ func (d *DiskHandler) RetainedRangeDigest(start, end uint64) (string, error) {
 	binary.BigEndian.PutUint64(bounds[:8], start)
 	binary.BigEndian.PutUint64(bounds[8:], end)
 	_, _ = h.Write(bounds[:])
-	var previous uint64
-	havePrevious := false
-	next := start
-	for i, segment := range d.segments {
-		if segment >= end {
-			break
-		}
-		path := d.GetSegmentPath(segment)
-		info, err := os.Stat(path)
+	_, err := d.scanRetainedRangeLocked(context.Background(), start, end, func(msg types.DiskMessage) error {
+		canonical, err := util.SerializeDiskMessage(msg)
 		if err != nil {
-			return "", err
+			return err
 		}
-		compacted := d.segmentAllowsOffsetGaps(segment, info.Size())
-		segmentEnd := end
-		if i+1 < len(d.segments) && d.segments[i+1] < segmentEnd {
-			segmentEnd = d.segments[i+1]
+		if err = validateSerializedDiskMessageSize(canonical); err != nil {
+			return err
 		}
-		err = scanCompactionSegment(path, segment, false, compacted, func(frame compactionFrame) error {
-			msg := frame.message
-			if msg.Offset < start || msg.Offset >= end {
-				return nil
-			}
-			if havePrevious && msg.Offset <= previous {
-				return fmt.Errorf("non-increasing retained digest offset")
-			}
-			if !compacted && msg.Offset != next {
-				return fmt.Errorf("unmarked retained digest offset gap")
-			}
-			if msg.Offset >= segmentEnd {
-				return fmt.Errorf("record exceeds retained segment bounds")
-			}
-			previous = msg.Offset
-			havePrevious = true
-			next = msg.Offset + 1
-			canonical, err := util.SerializeDiskMessage(msg)
-			if err != nil {
-				return err
-			}
-			if err = validateSerializedDiskMessageSize(canonical); err != nil {
-				return err
-			}
-			length, ok := util.SafeIntToUint32(len(canonical))
-			if !ok {
-				return fmt.Errorf("canonical digest frame too large")
-			}
-			var header [4]byte
-			binary.BigEndian.PutUint32(header[:], length)
-			_, _ = h.Write(header[:])
-			_, _ = h.Write(canonical)
-			return nil
-		})
-		if err != nil {
-			return "", err
+		length, ok := util.SafeIntToUint32(len(canonical))
+		if !ok {
+			return fmt.Errorf("canonical digest frame too large")
 		}
-		if !compacted && next != segmentEnd {
-			return "", fmt.Errorf("unmarked retained digest trailing gap")
-		}
-		next = segmentEnd
-	}
-	if next != end {
-		return "", fmt.Errorf("incomplete retained digest range")
+		var header [4]byte
+		binary.BigEndian.PutUint32(header[:], length)
+		_, _ = h.Write(header[:])
+		_, _ = h.Write(canonical)
+		return nil
+	})
+	if err != nil {
+		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
