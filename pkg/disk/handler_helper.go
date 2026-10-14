@@ -68,7 +68,9 @@ func (d *DiskHandler) CloseIndexFiles() error {
 func (d *DiskHandler) Close() error {
 	d.closeOnce.Do(func() {
 		var errs []error
+		d.mu.Lock()
 		close(d.done)
+		d.mu.Unlock()
 		d.shutdown.Wait()
 		if err := d.shutdownError(); err != nil {
 			errs = append(errs, err)

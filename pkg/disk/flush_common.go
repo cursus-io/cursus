@@ -207,6 +207,13 @@ func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
 
+	for _, msg := range batch {
+		if msg.Offset < d.writtenTail {
+			d.advanceContentGenerationLocked()
+			break
+		}
+	}
+
 	if d.file == nil {
 		if err := d.openSegment(); err != nil {
 			return fmt.Errorf("open segment failed: %w", err)
@@ -293,6 +300,11 @@ func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error
 
 	// Update flushed offset so readers know data is on disk
 	atomic.StoreUint64(&d.FlushedOffset, newAbsOffset)
+	for _, msg := range batch {
+		if msg.Offset >= d.writtenTail {
+			d.writtenTail = msg.Offset + 1
+		}
+	}
 	if d.lineage != nil && batch[0].Offset < d.lineage.tail.EndOffset {
 		d.lineage = nil
 	}
@@ -365,6 +377,9 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	if err := d.ensureWriteHeadroom(totalLen + uint64(types.IndexEntrySize)); err != nil {
 		return err
 	}
+	if msg.Offset < d.writtenTail {
+		d.advanceContentGenerationLocked()
+	}
 	const entrySize = uint64(types.IndexEntrySize)
 	msgPosition := d.CurrentOffset
 
@@ -404,6 +419,9 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 		atomic.StoreUint64(&d.AbsoluteOffset, newAbsOffset)
 	}
 	atomic.StoreUint64(&d.FlushedOffset, newAbsOffset)
+	if newAbsOffset > d.writtenTail {
+		d.writtenTail = newAbsOffset
+	}
 
 	if msgPosition-d.lastIndexPosition >= interval {
 		indexEntry := types.IndexEntry{
@@ -436,6 +454,11 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 func (d *DiskHandler) rotateSegment(nextBaseOffset uint64) error {
 	if nextBaseOffset <= d.CurrentSegment && d.CurrentOffset == 0 {
 		return nil
+	}
+	// FlushedOffset may regress after a legacy overlap. A later timer roll at
+	// that offset changes existing segment bounds rather than extending the log.
+	if nextBaseOffset < d.writtenTail {
+		d.advanceContentGenerationLocked()
 	}
 
 	var errs []error

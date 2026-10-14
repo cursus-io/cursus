@@ -276,7 +276,7 @@ func scanCompactionSegment(path string, expectedBase uint64, includeRaw, allowOf
 	}
 }
 
-func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool, latestKeyOffset, latestProducerOffset map[string]uint64) (int, int64, int64, error) {
+func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool, latestKeyOffset, latestProducerOffset map[string]uint64) (_ int, _ int64, _ int64, resultErr error) {
 	logPath := d.GetSegmentPath(segment)
 	indexPath := d.GetIndexPath(segment)
 	logTemp := logPath + ".compacting"
@@ -401,6 +401,12 @@ func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool,
 	directory := filepath.Dir(logPath)
 	// Invalidate under the same lock as replacement, including partial failure.
 	d.lineage = nil
+	d.advanceContentGenerationLocked()
+	defer func() {
+		if resultErr != nil {
+			resultErr = d.markWriteUnavailable(resultErr)
+		}
+	}()
 	if err := replaceCompactedFile(markerTemp, markerPath); err != nil {
 		return 0, before, after, err
 	}
