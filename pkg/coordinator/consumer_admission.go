@@ -21,6 +21,7 @@ type consumerAdmission struct {
 	active     int
 	recoveries int
 	owned      bool
+	lease      uint64 // Monotonic identity; zero is never an acquired lease.
 	changed    chan struct{}
 }
 
@@ -94,6 +95,7 @@ func (c *Coordinator) BeginConsumerMetadataRecovery(ctx context.Context) (func()
 			return nil, err
 		}
 		if !g.owned && g.active == 0 {
+			g.lease++
 			g.owned = true
 			g.mu.Unlock()
 			var once sync.Once

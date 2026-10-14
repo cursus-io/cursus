@@ -739,6 +739,12 @@ func (c *Coordinator) writeGroupTombstone(groupName, topicName string, epoch uin
 }
 
 func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerMetadataRecoveryStatus, error) {
+	return c.recoverConsumerMetadataWithOptions(reader, false)
+}
+
+// strict is used only on a detached compatibility coordinator. Ordinary replay
+// retains its concurrent-publication merge and tolerant distributed decoding.
+func (c *Coordinator) recoverConsumerMetadataWithOptions(reader OffsetLogReader, strict bool) (ConsumerMetadataRecoveryStatus, error) {
 	const batchSize = 1024
 	status := ConsumerMetadataRecoveryStatus{Phase: "consumer_metadata_scan"}
 	c.mu.RLock()
@@ -750,7 +756,11 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 
 	for partition := 0; partition < c.offsetTopicPartitionCount; partition++ {
 		next := uint64(0)
-		if provider, ok := c.topicHandler.(offsetLogStartProvider); ok {
+		provider, ok := reader.(offsetLogStartProvider)
+		if !strict {
+			provider, ok = c.topicHandler.(offsetLogStartProvider)
+		}
+		if ok {
 			earliest, err := provider.EarliestTopicOffset(c.offsetTopic, partition)
 			if err != nil {
 				return status, fmt.Errorf("inspect internal metadata log start partition=%d: %w", partition, err)
@@ -785,7 +795,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 				record, versioned, decodeErr := decodeConsumerMetadataRecord(message.Payload)
 				if decodeErr != nil {
 					status.CorruptRecords++
-					if !c.standalone && !strings.HasPrefix(message.Key, "cursus.consumer.offset-reservations.") {
+					if !strict && !c.standalone && !strings.HasPrefix(message.Key, "cursus.consumer.offset-reservations.") {
 						continue
 					}
 					return status, fmt.Errorf("decode internal metadata partition=%d offset=%d: %w", partition, message.Offset, decodeErr)
@@ -798,7 +808,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 					c.RecordConsumerMetadataSource(record.Group, partition)
 					if message.Key != consumerMetadataRecordKey(record) {
 						status.CorruptRecords++
-						if !c.standalone && record.Type != ConsumerMetadataRecordOffsetReservations && !strings.HasPrefix(message.Key, "cursus.consumer.offset-reservations.") {
+						if !strict && !c.standalone && record.Type != ConsumerMetadataRecordOffsetReservations && !strings.HasPrefix(message.Key, "cursus.consumer.offset-reservations.") {
 							continue
 						}
 						return status, fmt.Errorf("internal metadata key mismatch partition=%d offset=%d", partition, message.Offset)
@@ -812,7 +822,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 				groupName, topicName, offsets, parseErr := parseOffsetLogPayload(message.Payload)
 				if parseErr != nil {
 					status.CorruptRecords++
-					if !c.standalone {
+					if !strict && !c.standalone {
 						continue
 					}
 					return status, fmt.Errorf("decode legacy offset partition=%d offset=%d: %w", partition, message.Offset, parseErr)
@@ -829,7 +839,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 				for _, item := range offsets {
 					if item.Partition < 0 {
 						status.CorruptRecords++
-						if !c.standalone {
+						if !strict && !c.standalone {
 							continue
 						}
 						return status, fmt.Errorf("legacy offset contains negative partition %d", item.Partition)
@@ -845,7 +855,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 				return status, fmt.Errorf("internal metadata reader made no progress partition=%d offset=%d", partition, next)
 			}
 			next = previous
-			if len(messages) < batchSize {
+			if !strict && len(messages) < batchSize {
 				break
 			}
 		}
@@ -866,6 +876,26 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 		}
 		if err := candidates.selectRecord(record, &status); err != nil {
 			return status, fmt.Errorf("select migration record for group %q: %w", record.Group, err)
+		}
+	}
+	if strict {
+		// Historical tombstones are fences, not synthetic log candidates: a
+		// same-epoch real registration wins without manufacturing a conflict.
+		for name, epoch := range c.groupEpochs {
+			if c.groups[name] != nil {
+				continue
+			}
+			if lifecycle, ok := candidates.lifecycles[name]; ok && lifecycle.record.Epoch >= epoch {
+				continue
+			}
+			delete(candidates.lifecycles, name)
+			delete(legacy, name)
+			delete(legacyRecordCounts, name)
+			for key, candidate := range candidates.offsetSnapshots {
+				if candidate.record.Group == name && candidate.record.Epoch <= epoch {
+					delete(candidates.offsetSnapshots, key)
+				}
+			}
 		}
 	}
 	if err := validateSelectedLifecycleSnapshots(candidates.lifecycleSnapshots, candidates.lifecycles, &status); err != nil {
@@ -921,7 +951,8 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 				continue
 			}
 			existing.mu.RLock()
-			if authoritativeEpochs[groupName] >= existing.RegistrationEpoch {
+			historicalShell := strict && existing.RegistrationEpoch == 0 && authoritativeEpochs[groupName] == 0
+			if authoritativeEpochs[groupName] >= existing.RegistrationEpoch && !historicalShell {
 				existing.mu.RUnlock()
 				continue
 			}
@@ -933,7 +964,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 				}
 				partitionCount := groupTopicPartitionCount(existing, topicName)
 				for partition := range offsets {
-					if partition < 0 || partition >= partitionCount {
+					if partition < 0 || (partition >= partitionCount && !historicalShell) {
 						existing.mu.RUnlock()
 						c.mu.Unlock()
 						return status, fmt.Errorf("legacy offset partition %d conflicts with restored Raft group %q", partition, groupName)
@@ -949,7 +980,8 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 			existing.mu.RLock()
 			epoch := existing.RegistrationEpoch
 			existing.mu.RUnlock()
-			if epoch == 0 || authoritativeEpochs[groupName] >= epoch {
+			historicalShell := strict && epoch == 0 && authoritativeEpochs[groupName] == 0
+			if (epoch == 0 || authoritativeEpochs[groupName] >= epoch) && !historicalShell {
 				continue
 			}
 			if authoritativeEpochs[groupName] == 0 {
@@ -974,6 +1006,14 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 			groups[groupName] = existing
 			groupEpochs[groupName] = epoch
 		}
+		if strict {
+			for name, epoch := range c.groupEpochs {
+				if c.groups[name] == nil && authoritativeEpochs[name] < epoch {
+					delete(groups, name)
+					groupEpochs[name] = epoch
+				}
+			}
+		}
 	}
 	// origin/main placed membership in GROUP_SYNC. Its offsets records have no
 	// v4 lifecycle snapshot, so retain that restored FSM membership while
@@ -991,7 +1031,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 		// A durable commit may complete after this scan has passed the group's
 		// offsets partition. Preserve only strictly newer acknowledged revisions
 		// from the still-installed map before replacing it with the replay result.
-		if existing.RegistrationEpoch == recovered.RegistrationEpoch {
+		if !strict && existing.RegistrationEpoch == recovered.RegistrationEpoch {
 			if existing.ReservationRevision > recovered.ReservationRevision {
 				recovered.OffsetReservations = cloneOffsetReservations(existing.OffsetReservations)
 				recovered.ReservationRevision = existing.ReservationRevision
@@ -1031,6 +1071,10 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 			}
 		}
 		if snapshot, ok := candidates.lifecycleSnapshots[groupName]; !ok || snapshot.record.Epoch != recovered.RegistrationEpoch {
+			if strict && existing.RegistrationEpoch != recovered.RegistrationEpoch {
+				existing.mu.RUnlock()
+				continue
+			}
 			recovered.Generation = existing.Generation
 			recovered.LastActivity = existing.LastActivity
 			recovered.LastRebalance = existing.LastRebalance

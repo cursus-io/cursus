@@ -18,6 +18,7 @@ type Coordinator struct {
 	// Lock order: authorityMu -> lifecycleMu -> mu -> group.mu. Provenance is
 	// copied only after group locks are released; writers may hold those locks.
 	authorityMu              sync.Mutex
+	authorityRevision        uint64 // Guarded by authorityMu; invalidates detached replay results.
 	stateImportGeneration    uint64 // Guarded by mu; fences publications/scans begun before import.
 	raftCompatibility        *Coordinator
 	raftCompatibilityKnown   bool
