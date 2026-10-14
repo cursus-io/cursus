@@ -14,6 +14,15 @@ type TopicGroupReference struct {
 // TopicGroupReferences returns a detached, deterministic view of groups that
 // own or retain offsets for topicName.
 func (c *Coordinator) TopicGroupReferences(topicName string) []TopicGroupReference {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil
+	}
+	defer release()
+	return c.topicGroupReferences(topicName)
+}
+
+func (c *Coordinator) topicGroupReferences(topicName string) []TopicGroupReference {
 	if c == nil || topicName == "" {
 		return nil
 	}
@@ -39,7 +48,12 @@ func (c *Coordinator) TopicGroupReferences(topicName string) []TopicGroupReferen
 // DeleteInactiveGroupsForTopic writes normal lifecycle tombstones before
 // removing groups. Any active member fails the entire preflight.
 func (c *Coordinator) DeleteInactiveGroupsForTopic(topicName string) ([]string, error) {
-	references := c.TopicGroupReferences(topicName)
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	references := c.topicGroupReferences(topicName)
 	for _, reference := range references {
 		if reference.MemberCount != 0 {
 			return nil, fmt.Errorf(
@@ -53,7 +67,7 @@ func (c *Coordinator) DeleteInactiveGroupsForTopic(topicName string) ([]string, 
 
 	deleted := make([]string, 0, len(references))
 	for _, reference := range references {
-		if err := c.DeleteGroup(reference.Name); err != nil {
+		if err := c.deleteGroup(reference.Name); err != nil {
 			return deleted, fmt.Errorf("delete consumer group %q for topic %q: %w", reference.Name, topicName, err)
 		}
 		deleted = append(deleted, reference.Name)
