@@ -27,6 +27,12 @@ type ServiceDiscovery interface {
 	Reconcile()
 }
 
+// LocalRegistrationProvider shares the process-owned registration between direct
+// Raft registration and forwarding to the leader without expanding discovery mocks.
+type LocalRegistrationProvider interface {
+	LocalRegistrationPayload() ([]byte, error)
+}
+
 type serviceDiscovery struct {
 	rm               RaftManager
 	fsm              *fsm.BrokerFSM
@@ -65,7 +71,10 @@ func NewServiceDiscovery(rm RaftManager, brokerID, addr, clientAddr string) Serv
 	return NewServiceDiscoveryImpl(rm, brokerID, addr, clientAddr)
 }
 
-func (sd *serviceDiscovery) Register() error {
+// LocalRegistrationPayload is the sole owner of local advertised capabilities.
+// Indexed protocol 1 is implemented, but retained-range bootstrap is incomplete.
+// Keep production advertisement at zero until the complete recovery bundle exists.
+func (sd *serviceDiscovery) LocalRegistrationPayload() ([]byte, error) {
 	broker := &fsm.BrokerInfo{
 		ID:                           sd.brokerID,
 		Addr:                         sd.addr,
@@ -75,10 +84,13 @@ func (sd *serviceDiscovery) Register() error {
 		IncarnationID:                sd.incarnationID,
 		TransactionCoordinatorShards: sd.transactionCoordinatorShardCount(),
 		LifecycleProtocol:            fsm.BrokerProtocolVersionCurrent,
-		RecoveryProtocol:             fsm.IndexedRecoveryProtocolVersion,
+		RecoveryProtocol:             0,
 	}
+	return json.Marshal(broker)
+}
 
-	data, err := json.Marshal(broker)
+func (sd *serviceDiscovery) Register() error {
+	data, err := sd.LocalRegistrationPayload()
 	if err != nil {
 		util.Error("Failed to marshal broker info: %v", err)
 		return fmt.Errorf("marshal broker info: %w", err)

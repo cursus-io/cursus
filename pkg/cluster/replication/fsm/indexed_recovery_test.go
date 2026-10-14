@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
@@ -267,47 +268,70 @@ func TestIndexedRecoveryNegotiatesMutualCapability(t *testing.T) {
 }
 
 func TestIndexedRecoveryFindsFullPrefixAcrossLongDivergence(t *testing.T) {
-	for _, epoch := range []int64{0, 7} {
-		sourceRecords := make([]types.Message, 1600)
-		followerRecords := make([]types.Message, 1600)
-		for i := range sourceRecords {
-			sourceRecords[i] = types.Message{Offset: uint64(i), Payload: "source", LeaderEpoch: epoch}
-			followerRecords[i] = sourceRecords[i]
-			if i >= 100 && i < 1599 {
-				followerRecords[i].Payload = "divergent"
-			}
+	for _, test := range []struct {
+		name            string
+		count, firstBad int
+		lastSame        bool
+		want            uint64
+	}{
+		{"single bad last record", 1025, 1024, false, 1024},
+		{"early divergence reconvergent last record", 64, 1, true, 1},
+		{"long divergence", 1600, 100, true, 0},
+	} {
+		for _, epoch := range []int64{0, 7} {
+			t.Run(fmt.Sprintf("%s/epoch-%d", test.name, epoch), func(t *testing.T) {
+				sourceRecords := make([]types.Message, test.count)
+				followerRecords := make([]types.Message, test.count)
+				for i := range sourceRecords {
+					sourceRecords[i] = types.Message{Offset: uint64(i), Payload: "source", LeaderEpoch: epoch}
+					followerRecords[i] = sourceRecords[i]
+					if i >= test.firstBad && (!test.lastSame || i != test.count-1) {
+						followerRecords[i].Payload = "divergent"
+					}
+				}
+				source, sp := indexedRecoveryFSM(t, sourceRecords)
+				follower, fp := indexedRecoveryFSM(t, followerRecords)
+				for _, f := range []*BrokerFSM{source, follower} {
+					for _, b := range f.brokers {
+						b.RecoveryProtocol = IndexedRecoveryProtocolVersion
+					}
+				}
+				request := follower.BuildReplicaCatchupRequests("node-2")[0]
+				require.LessOrEqual(t, len(request.PrefixCandidates), 64)
+				batch, err := source.FetchReplicaCatchup(request)
+				require.NoError(t, err)
+				require.NotNil(t, batch.TruncateTo, "identical final records must not hide earlier divergence")
+				require.Equal(t, test.want, *batch.TruncateTo)
+				require.NotNil(t, batch.MatchedPrefix)
+				require.Equal(t, uint64(test.count), sp.NextOffset(), "source must remain intact")
+				require.NoError(t, ValidateReplicaCatchupBatchDigest(batch))
+				require.NoError(t, fp.ApplyReplicaRollback(*batch.TruncateTo))
+				exchanges := 1
+				transferredRecords, transferredBytes := 0, 0
+				for fp.NextOffset() < uint64(test.count) {
+					request = follower.BuildReplicaCatchupRequests("node-2")[0]
+					batch, err = source.FetchReplicaCatchup(request)
+					require.NoError(t, err)
+					require.Nil(t, batch.TruncateTo)
+					require.NoError(t, ValidateReplicaRecoveryMode(batch))
+					require.NoError(t, ValidateReplicaCatchupBatchDigest(batch))
+					encoded, err := json.Marshal(batch)
+					require.NoError(t, err)
+					transferredBytes += len(encoded)
+					transferredRecords += len(batch.Messages)
+					require.NoError(t, fp.ReplicaAppendWithMode(batch.Messages, true))
+					exchanges++
+					require.LessOrEqual(t, exchanges, 3, "one bounded comparison and at most two record batches")
+				}
+				require.Equal(t, test.count-int(test.want), transferredRecords)
+				require.Positive(t, transferredBytes)
+				t.Logf("required rollback=%d actual rollback=%d transferred records=%d JSON record-batch bytes=%d exchanges=%d", test.count-test.firstBad, test.count-int(test.want), transferredRecords, transferredBytes, exchanges)
+				proofs, err := fp.ReplicaLineageCandidates(uint64(test.count))
+				require.NoError(t, err)
+				matched, err := sp.VerifyReplicaLineage(proofs[0], uint64(test.count))
+				require.NoError(t, err)
+				require.True(t, matched)
+			})
 		}
-		source, sp := indexedRecoveryFSM(t, sourceRecords)
-		follower, fp := indexedRecoveryFSM(t, followerRecords)
-		for _, f := range []*BrokerFSM{source, follower} {
-			for _, b := range f.brokers {
-				b.RecoveryProtocol = IndexedRecoveryProtocolVersion
-			}
-		}
-		request := follower.BuildReplicaCatchupRequests("node-2")[0]
-		require.LessOrEqual(t, len(request.PrefixCandidates), 64)
-		batch, err := source.FetchReplicaCatchup(request)
-		require.NoError(t, err)
-		require.NotNil(t, batch.TruncateTo, "identical final records must not hide earlier divergence")
-		require.Equal(t, uint64(100), *batch.TruncateTo)
-		require.NotNil(t, batch.MatchedPrefix)
-		require.Equal(t, uint64(1600), sp.NextOffset(), "source must remain intact")
-		require.NoError(t, ValidateReplicaCatchupBatchDigest(batch))
-		require.NoError(t, fp.ApplyReplicaRollback(*batch.TruncateTo))
-		exchanges := 1
-		for fp.NextOffset() < 1600 {
-			request = follower.BuildReplicaCatchupRequests("node-2")[0]
-			batch, err = source.FetchReplicaCatchup(request)
-			require.NoError(t, err)
-			require.Nil(t, batch.TruncateTo)
-			require.NoError(t, fp.ReplicaAppendWithMode(batch.Messages, true))
-			exchanges++
-			require.LessOrEqual(t, exchanges, 3, "one bounded comparison and two record batches repair 1500 divergent records")
-		}
-		proofs, err := fp.ReplicaLineageCandidates(1600)
-		require.NoError(t, err)
-		matched, err := sp.VerifyReplicaLineage(proofs[0], 1600)
-		require.NoError(t, err)
-		require.True(t, matched)
 	}
 }

@@ -173,6 +173,27 @@ func TestServiceDiscovery_RegisterDeregister(t *testing.T) {
 	})
 }
 
+func TestLocalRegistrationWithholdsIncompleteRecoveryCapability(t *testing.T) {
+	rm := &ComprehensiveMockRaftManager{mockFSM: fsm.NewBrokerFSMWithTransactionCoordinatorShards(nil, nil, 7)}
+	sd := NewServiceDiscoveryImpl(rm, "node-1", "raft:9001", "client:9000")
+	var captured fsm.BrokerInfo
+	rm.On("ApplyCommand", "REGISTER", mock.Anything).Run(func(args mock.Arguments) {
+		require.NoError(t, json.Unmarshal(args.Get(1).([]byte), &captured))
+	}).Return(nil).Once()
+	require.NoError(t, sd.Register())
+	require.Zero(t, captured.RecoveryProtocol, "bootstrap is not complete enough to advertise indexed recovery")
+	require.Equal(t, "node-1", captured.ID)
+	require.Equal(t, "raft:9001", captured.Addr)
+	require.Equal(t, "client:9000", captured.ClientAddr)
+	require.Equal(t, sd.BrokerIncarnationID(), captured.IncarnationID)
+	require.NotEmpty(t, captured.IncarnationID)
+	require.Equal(t, "active", captured.Status)
+	require.False(t, captured.LastSeen.IsZero())
+	require.Equal(t, 7, captured.TransactionCoordinatorShards)
+	require.Equal(t, 6, captured.LifecycleProtocol)
+	rm.AssertExpectations(t)
+}
+
 func TestServiceDiscovery_NodeOperations(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
 	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)

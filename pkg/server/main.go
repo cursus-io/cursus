@@ -5,7 +5,6 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -186,14 +185,14 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 					}
 					// Forward via RAFT_APPLY to leader
 					if cc != nil && cc.Router != nil {
-						brokerJSON, _ := json.Marshal(map[string]interface{}{
-							"id": brokerID, "addr": localAddr, "client_addr": clientAddr,
-							"status": "active", "lifecycle_protocol": fsm.BrokerProtocolVersionCurrent, "recovery_protocol": fsm.IndexedRecoveryProtocolVersion, "incarnation_id": incarnationID, "transaction_coordinator_shards": cfg.TransactionCoordinatorShards,
-						})
-						raftCmd := fmt.Sprintf("RAFT_APPLY %stype=REGISTER payload=%s", internalAuthPrefix(cfg), string(brokerJSON))
-						if resp, err := cc.Router.ForwardToLeader(raftCmd); err == nil && !wireprotocol.IsErrorResponse(resp) {
-							util.Info("✅ Registered via leader with client address %s", clientAddr)
-							return
+						raftCmd, err := forwardedLocalRegistrationCommand(sd, cfg)
+						if err != nil {
+							util.Error("Failed to build local registration: %v", err)
+						} else {
+							if resp, err := cc.Router.ForwardToLeader(raftCmd); err == nil && !wireprotocol.IsErrorResponse(resp) {
+								util.Info("✅ Registered via leader with client address %s", clientAddr)
+								return
+							}
 						}
 					}
 					select {
