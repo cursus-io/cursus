@@ -109,6 +109,37 @@ func (s *BootstrapSession) check() error {
 	}
 	return nil
 }
+
+// Prepared reports whether this open session can expose its retained, rebuilt
+// generation. It does not consult the on-disk manifest, which completion may
+// already have removed before a directory-sync failure.
+func (s *BootstrapSession) Prepared() bool { return s.checkPrepared() == nil }
+
+func (s *BootstrapSession) checkPrepared() error {
+	if err := s.check(); err != nil {
+		return err
+	}
+	if s.completed || !s.prepared || !s.durable || s.metadata == nil || !s.p.BootstrapPending() {
+		return fmt.Errorf("bootstrap session has no pending prepared generation")
+	}
+	s.p.recoveryMu.RLock()
+	retained := s.p.bootstrapPrepared && s.p.bootstrapMetadata != nil && s.p.bootstrapMetadata.TransferID == s.metadata.TransferID
+	s.p.recoveryMu.RUnlock()
+	if !retained {
+		return fmt.Errorf("bootstrap prepared metadata is no longer retained")
+	}
+	return s.validate(*s.metadata)
+}
+
+// WithPreparedReadView reuses the session's owned exclusion and rebuilt indexes.
+// The callback is local, cannot re-enter public partition read wrappers, and its
+// view expires on return. No raw rescan or catalog fetch occurs on this path.
+func (s *BootstrapSession) WithPreparedReadView(fn func(*PartitionReadView) error) error {
+	if err := s.checkPrepared(); err != nil {
+		return err
+	}
+	return s.p.withReadViewLocked(true, s.metadata.EndOffset, fn)
+}
 func (s *BootstrapSession) fail(err error) error {
 	if err != nil {
 		s.p.recoveryMu.Lock()
