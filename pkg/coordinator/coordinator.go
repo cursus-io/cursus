@@ -295,6 +295,10 @@ func newCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandle
 		},
 	}
 	recoveryComplete := false
+	if !standalone && !recoverDistributed {
+		c.consumerAdmission.startupPending = true
+		c.consumerAdmission.requiredGeneration = 1
+	}
 	defer func() {
 		if !recoveryComplete {
 			cancel()

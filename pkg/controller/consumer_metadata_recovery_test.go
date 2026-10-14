@@ -2,14 +2,17 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,6 +37,9 @@ func TestDistributedRecoveryExcludesUncommittedMetadataTail(t *testing.T) {
 		topicManager.Stop()
 		diskManager.CloseAllHandlers()
 	})
+	state := fsm.NewBrokerFSM(topicManager, c)
+	registerRoutingBroker(t, state, "local")
+	installRoutingOffsetsTopology(t, state, "local")
 
 	registration := coordinator.ConsumerMetadataRecord{
 		Version: coordinator.ConsumerMetadataRecordVersion, Type: coordinator.ConsumerMetadataRecordRegistration,
@@ -62,7 +68,14 @@ func TestDistributedRecoveryExcludesUncommittedMetadataTail(t *testing.T) {
 	require.Equal(t, uint64(2), partition.GetHWM())
 	require.Equal(t, uint64(3), partition.NextOffset())
 
-	require.NoError(t, c.ReloadDistributedConsumerMetadata())
+	metadata := state.GetPartitionMetadata(config.ConsumerOffsetsTopicName + "-0")
+	metadata.CommittedHWM = 2
+	data, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("PARTITION:"+config.ConsumerOffsetsTopicName+"-0:"), data...)}))
+	h := newCoordinatorRoutingHandler("local", state, c)
+	h.TopicManager = topicManager
+	require.NoError(t, h.RecoverDistributedConsumerMetadata(context.Background()))
 	recovered, found := c.GetOffset("workers", "orders", 0)
 	require.True(t, found)
 	require.Equal(t, uint64(10), recovered)

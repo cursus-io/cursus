@@ -212,7 +212,7 @@ func (c *Coordinator) RecoverySnapshot() ConsumerMetadataRecoveryStatus {
 func (c *Coordinator) RecoveryReadinessError() error {
 	status := c.RecoverySnapshot()
 	if status.Ready && status.Failure == "" {
-		return nil
+		return c.ConsumerOperationsReadinessError()
 	}
 	if status.Failure != "" {
 		return errors.New(status.Failure)
@@ -757,7 +757,7 @@ func (c *Coordinator) recoverConsumerMetadataWithOptions(reader OffsetLogReader,
 	for partition := 0; partition < c.offsetTopicPartitionCount; partition++ {
 		next := uint64(0)
 		provider, ok := reader.(offsetLogStartProvider)
-		if !strict {
+		if !ok {
 			provider, ok = c.topicHandler.(offsetLogStartProvider)
 		}
 		if ok {

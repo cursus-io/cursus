@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -15,6 +16,34 @@ import (
 type metadataReplayHandler struct {
 	messages map[int][]types.Message
 	starts   map[int]uint64
+}
+
+// Deferred startup fixtures perform the same exclusive prepare/install/complete
+// sequence as the controller, with a fixed in-memory physical generation.
+func recoverDeferredMetadataForTest(t *testing.T, c *Coordinator) error {
+	t.Helper()
+	if !c.ConsumerRecoveryRequirement().Pending() {
+		return c.ReloadDistributedConsumerMetadata()
+	}
+	h := c.topicHandler.(*metadataReplayHandler)
+	release, err := c.BeginConsumerMetadataRecovery(context.Background())
+	if err != nil {
+		return err
+	}
+	defer release()
+	reader := &strictReplayReader{count: 4, messages: h.messages, first: h.starts}
+	p, err := c.PrepareFullConsumerMetadataReplay(reader)
+	if errors.Is(err, ErrConsumerMetadataBootstrapUnknown) {
+		p, err = c.PrepareStartupConsumerMetadataReplay(reader)
+	}
+	if err != nil {
+		c.setRecoveryFailure(err)
+		return err
+	}
+	if err = c.ApplyFullConsumerMetadataReplay(p); err != nil {
+		return err
+	}
+	return c.CompleteConsumerRecovery(c.ConsumerRecoveryRequirement().RequiredGeneration)
 }
 
 type failingMigrationReplayHandler struct {
@@ -164,13 +193,13 @@ func TestDistributedRecoveryPreservesRaftOnlyGroupAndOffset(t *testing.T) {
 		},
 	}))
 
-	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.NoError(t, recoverDeferredMetadataForTest(t, coordinator))
 	require.Equal(t, []string{"workers"}, coordinator.ListGroups())
 	require.Equal(t, uint64(11), mustOffset(t, coordinator, "workers", "orders", 0))
 	require.Equal(t, uint64(2), coordinator.GetRegistrationEpoch("workers"))
 	require.Equal(t, 1, coordinator.GetGeneration("workers"))
 	require.Equal(t, []int{0}, coordinator.GetMemberAssignments("workers", "member-a"))
-	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.NoError(t, recoverDeferredMetadataForTest(t, coordinator))
 	require.Equal(t, uint64(11), mustOffset(t, coordinator, "workers", "orders", 0))
 	require.Equal(t, []int{0}, coordinator.GetMemberAssignments("workers", "member-a"))
 }
@@ -195,7 +224,7 @@ func TestDistributedRecoveryDoesNotReplaceNewerRaftGroupWithStaleOffsetSnapshot(
 		},
 	}))
 
-	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.NoError(t, recoverDeferredMetadataForTest(t, coordinator))
 	require.Equal(t, uint64(2), coordinator.GetRegistrationEpoch("workers"))
 	require.Equal(t, uint64(11), mustOffset(t, coordinator, "workers", "orders", 0))
 	require.Equal(t, []int{0}, coordinator.GetMemberAssignments("workers", "member-a"))
@@ -230,7 +259,7 @@ func TestDistributedRecoveryMergesMultiTopicLegacyOffsetsWithRaftRegistration(t 
 		},
 	}))
 
-	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.NoError(t, recoverDeferredMetadataForTest(t, coordinator))
 	require.Equal(t, uint64(2), coordinator.GetRegistrationEpoch("workers"))
 	require.Equal(t, uint64(13), mustOffset(t, coordinator, "workers", "orders", 0))
 	require.Equal(t, uint64(9), mustOffset(t, coordinator, "workers", "returns", 0))
@@ -280,7 +309,7 @@ func TestDistributedRecoveryMergesLegacyOffsetWithoutLosingRaftRegistration(t *t
 				},
 			}))
 
-			require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+			require.NoError(t, recoverDeferredMetadataForTest(t, coordinator))
 			require.Equal(t, test.wantOffset, mustOffset(t, coordinator, "workers", "orders", 0))
 			require.Equal(t, uint64(2), coordinator.GetRegistrationEpoch("workers"))
 		})
@@ -317,9 +346,9 @@ func TestDistributedRecoveryRejectsLegacyOffsetsOutsideRaftRegistration(t *testi
 				},
 			}))
 
-			require.ErrorContains(t, coordinator.ReloadDistributedConsumerMetadata(), test.want)
+			require.ErrorContains(t, recoverDeferredMetadataForTest(t, coordinator), test.want)
 			require.False(t, coordinator.RecoverySnapshot().Ready)
-			require.Equal(t, uint64(11), mustOffset(t, coordinator, "workers", "orders", 0))
+			require.Equal(t, uint64(11), coordinator.ExportState()["workers"].Offsets["orders"][0])
 		})
 	}
 }
@@ -343,7 +372,7 @@ func TestDistributedRecoveryMergesLegacyOffsetIntoRaftGroupWithoutPriorCommit(t 
 		},
 	}))
 
-	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.NoError(t, recoverDeferredMetadataForTest(t, coordinator))
 	require.Equal(t, uint64(13), mustOffset(t, coordinator, "workers", "orders", 0))
 	require.Equal(t, uint64(2), coordinator.GetRegistrationEpoch("workers"))
 }
@@ -362,7 +391,7 @@ func TestDistributedRecoveryRepeatedLegacyOnlyReplay(t *testing.T) {
 	t.Cleanup(coordinator.Stop)
 	require.Equal(t, uint64(13), mustOffset(t, coordinator, "workers", "orders", 0))
 
-	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.NoError(t, recoverDeferredMetadataForTest(t, coordinator))
 	require.Equal(t, uint64(13), mustOffset(t, coordinator, "workers", "orders", 0))
 	require.Equal(t, uint64(0), coordinator.GetRegistrationEpoch("workers"))
 }
@@ -387,9 +416,9 @@ func TestDistributedRecoveryRejectsSameEpochTopicConflict(t *testing.T) {
 		},
 	}))
 
-	require.ErrorContains(t, coordinator.ReloadDistributedConsumerMetadata(), "restored Raft offset topic")
+	require.ErrorContains(t, recoverDeferredMetadataForTest(t, coordinator), "restored Raft offset topic")
 	require.False(t, coordinator.RecoverySnapshot().Ready)
-	require.Equal(t, uint64(11), mustOffset(t, coordinator, "workers", "orders", 0))
+	require.Equal(t, uint64(11), coordinator.ExportState()["workers"].Offsets["orders"][0])
 }
 
 func TestDistributedRecoveryDoesNotRegressSameEpochRaftOffset(t *testing.T) {
@@ -426,7 +455,7 @@ func TestDistributedRecoveryDoesNotRegressSameEpochRaftOffset(t *testing.T) {
 				},
 			}))
 
-			require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+			require.NoError(t, recoverDeferredMetadataForTest(t, coordinator))
 			require.Equal(t, test.wantOffset, mustOffset(t, coordinator, "workers", "orders", 0))
 			require.Equal(t, []int{0}, coordinator.GetMemberAssignments("workers", "member-a"))
 			require.Equal(t, uint64(1), coordinator.ExportState()["workers"].OffsetRevisions["orders"])
@@ -453,7 +482,7 @@ func TestDistributedRecoveryDoesNotResurrectRaftGroupAfterTombstone(t *testing.T
 		},
 	}))
 
-	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.NoError(t, recoverDeferredMetadataForTest(t, coordinator))
 	require.Nil(t, coordinator.GetGroup("workers"))
 	require.Equal(t, uint64(3), coordinator.ExportState()["workers"].RegistrationEpoch)
 	require.True(t, coordinator.ExportState()["workers"].Deleted)
@@ -698,7 +727,7 @@ func TestDistributedReloadPreservesMembershipWhenSelectedLifecycleSnapshotIsOrph
 	}
 	handler.messages = map[int][]types.Message{0: {encodedMetadataMessage(t, staleLifecycle, 0), encodedMetadataMessage(t, registration, 1)}}
 
-	require.NoError(t, coordinator.ReloadDistributedConsumerMetadata())
+	require.NoError(t, recoverDeferredMetadataForTest(t, coordinator))
 	require.Equal(t, 1, coordinator.GetGeneration("workers"))
 	require.Equal(t, []int{0}, coordinator.GetMemberAssignments("workers", "member-a"))
 }

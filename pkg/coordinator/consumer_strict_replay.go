@@ -53,10 +53,14 @@ type PreparedConsumerMetadataReplay struct {
 	stamp   consumerMetadataReplayStamp
 	scope   *ConsumerMetadataScope
 	scratch *Coordinator
+	status  ConsumerMetadataRecoveryStatus
 }
 
 // A stamp belongs to one operation, not to a reusable conservative scope.
-type consumerMetadataReplayStamp struct{ lease, generation, revision uint64 }
+type consumerMetadataReplayStamp struct {
+	lease, generation, revision, required uint64
+	legacyStartup                         bool
+}
 
 type metadataReadRange struct{ first, end uint64 }
 type boundedMetadataReader struct {
@@ -107,6 +111,10 @@ func metadataBounds(reader ConsumerMetadataBounds, topic string, partition int) 
 }
 
 func (c *Coordinator) captureConsumerMetadataReplayStamp() (consumerMetadataReplayStamp, error) {
+	return c.captureConsumerMetadataReplayStampForStartup(false)
+}
+
+func (c *Coordinator) captureConsumerMetadataReplayStampForStartup(legacy bool) (consumerMetadataReplayStamp, error) {
 	if c == nil || c.standalone {
 		return consumerMetadataReplayStamp{}, ErrConsumerMetadataRecoveryStandalone
 	}
@@ -123,14 +131,20 @@ func (c *Coordinator) captureConsumerMetadataReplayStamp() (consumerMetadataRepl
 	if !g.owned {
 		return consumerMetadataReplayStamp{}, fmt.Errorf("consumer metadata replay requires an active exclusive lease")
 	}
-	if !c.raftCompatibilityKnown || !c.metadataSourcesKnown || c.raftCompatibility == nil {
+	if legacy && !g.startupPending {
 		return consumerMetadataReplayStamp{}, ErrConsumerMetadataBootstrapUnknown
 	}
-	return consumerMetadataReplayStamp{lease: g.lease, generation: c.stateImportGeneration, revision: c.authorityRevision}, nil
+	if legacy && c.raftCompatibilityKnown && c.metadataSourcesKnown && c.raftCompatibility != nil {
+		return consumerMetadataReplayStamp{}, fmt.Errorf("known consumer authority requires strict replay")
+	}
+	if !legacy && (!c.raftCompatibilityKnown || !c.metadataSourcesKnown || c.raftCompatibility == nil) {
+		return consumerMetadataReplayStamp{}, ErrConsumerMetadataBootstrapUnknown
+	}
+	return consumerMetadataReplayStamp{lease: g.lease, generation: c.stateImportGeneration, revision: c.authorityRevision, required: g.requiredGeneration, legacyStartup: legacy}, nil
 }
 
 func (c *Coordinator) validateConsumerMetadataReplayStamp(stamp consumerMetadataReplayStamp) error {
-	current, err := c.captureConsumerMetadataReplayStamp()
+	current, err := c.captureConsumerMetadataReplayStampForStartup(stamp.legacyStartup)
 	if err != nil {
 		return err
 	}
@@ -262,6 +276,17 @@ func (c *Coordinator) PrepareFullConsumerMetadataReplay(reader ConsumerMetadataC
 	return c.prepareConsumerMetadataReplay(reader, nil, stamp)
 }
 
+// PrepareStartupConsumerMetadataReplay is the exclusive compatibility path for
+// an original startup with an unknown historical envelope. It preserves that
+// uncertainty permanently; it cannot be used after startup or for bootstrap.
+func (c *Coordinator) PrepareStartupConsumerMetadataReplay(reader ConsumerMetadataCommittedReader) (*PreparedConsumerMetadataReplay, error) {
+	stamp, err := c.captureConsumerMetadataReplayStampForStartup(true)
+	if err != nil {
+		return nil, err
+	}
+	return c.prepareConsumerMetadataReplay(reader, nil, stamp)
+}
+
 func (c *Coordinator) PrepareScopedConsumerMetadataReplay(reader ConsumerMetadataCommittedReader, replacementRaw ConsumerMetadataRawReader, old *ConsumerMetadataScope, route ConsumerMetadataRoute) (*PreparedConsumerMetadataReplay, error) {
 	stamp, err := c.captureConsumerMetadataReplayStamp()
 	if err != nil {
@@ -305,11 +330,16 @@ func (c *Coordinator) prepareConsumerMetadataReplay(reader ConsumerMetadataCommi
 		}
 	}
 	c.provenanceMu.Unlock()
-	if !known {
+	if !known && !stamp.legacyStartup {
 		c.authorityMu.Unlock()
 		return nil, ErrConsumerMetadataBootstrapUnknown
 	}
-	state := c.raftCompatibility.ExportState()
+	var state map[string]*GroupStateSnapshot
+	if stamp.legacyStartup {
+		state = c.ExportState()
+	} else {
+		state = c.raftCompatibility.ExportState()
+	}
 	c.authorityMu.Unlock()
 	if err := validateCompatibilityState(state); err != nil {
 		return nil, err
@@ -334,13 +364,16 @@ func (c *Coordinator) prepareConsumerMetadataReplay(reader ConsumerMetadataCommi
 	}
 	scratch.offsetTopic = c.offsetTopic
 	scratch.offsetTopicPartitionCount = count
-	if _, err := scratch.recoverConsumerMetadataWithOptions(bounded, true); err != nil {
+	// Unknown original-startup snapshots retain the historical merge policy.
+	// Known authority always uses replacement replay from the Raft baseline.
+	status, err := scratch.recoverConsumerMetadataWithOptions(bounded, !stamp.legacyStartup)
+	if err != nil {
 		return nil, err
 	}
 	if err := validateStrictReplayState(scratch); err != nil {
 		return nil, err
 	}
-	prepared := &PreparedConsumerMetadataReplay{owner: c, stamp: stamp, scope: scope, scratch: scratch}
+	prepared := &PreparedConsumerMetadataReplay{owner: c, stamp: stamp, scope: scope, scratch: scratch, status: status}
 	// Fail preparation too if historical authority moved while local reads ran.
 	if err := c.validateConsumerMetadataReplayStamp(stamp); err != nil {
 		return nil, err
@@ -371,7 +404,7 @@ func validateStrictReplayState(c *Coordinator) error {
 }
 
 func (c *Coordinator) validatePreparedReplayLocked(p *PreparedConsumerMetadataReplay) error {
-	if p == nil || p.owner != c || p.scratch == nil || !c.consumerAdmission.owned || p.stamp.lease != c.consumerAdmission.lease || p.stamp.generation != c.stateImportGeneration || p.stamp.revision != c.authorityRevision {
+	if p == nil || p.owner != c || p.scratch == nil || !c.consumerAdmission.owned || p.stamp.lease != c.consumerAdmission.lease || p.stamp.generation != c.stateImportGeneration || p.stamp.revision != c.authorityRevision || p.stamp.required != c.consumerAdmission.requiredGeneration || c.consumerAdmission.restoreInstalling || c.consumerAdmission.restoreError != nil {
 		return fmt.Errorf("consumer metadata prepared replay is stale or belongs to another coordinator")
 	}
 	return nil
@@ -416,12 +449,20 @@ func (c *Coordinator) applyConsumerMetadataReplay(p *PreparedConsumerMetadataRep
 		c.groups = p.scratch.groups
 		c.groupEpochs = p.scratch.groupEpochs
 		c.ownershipSince = make(map[string]time.Time)
+		c.consumerAdmission.installedGeneration = p.stamp.required
 	}
 	sourcesByGroup := p.scratch.metadataSources
 	c.authorityRevision++
+	if !scoped {
+		c.consumerAdmission.installedLease = c.consumerAdmission.lease
+		c.consumerAdmission.installedRevision = c.authorityRevision
+	}
 	// Drop every prepared reference to installed mutable state.
 	p.scratch = nil
 	c.consumerAdmission.mu.Unlock()
+	if !scoped {
+		c.markRecoveryComplete(p.status)
+	}
 	// Admission never waits for provenance or state locks. Authority and mu
 	// still exclude another install/import until provenance joins the commit.
 	for name, sources := range sourcesByGroup {

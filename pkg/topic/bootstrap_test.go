@@ -53,6 +53,18 @@ func partitionTransfer(t *testing.T, target *disk.DiskHandler, partition int, en
 	}
 	return receiver
 }
+
+func TestBootstrapSessionMissingManifestCannotEraseExistingPending(t *testing.T) {
+	d, cfg := bootstrapPartitionDisk(t, 0)
+	p := NewPartition(0, "orders", d, nil, cfg)
+	t.Cleanup(p.Close)
+	p.bootstrapPending.Store(true)
+	s, err := p.BeginBootstrapSession()
+	require.NoError(t, err)
+	s.Close()
+	require.True(t, p.BootstrapPending())
+	require.Equal(t, BootstrapOutcomeUncertain, s.ClosedOutcome())
+}
 func TestBootstrapPendingConstructorAndOfflineRecovery(t *testing.T) {
 	d, cfg := bootstrapPartitionDisk(t, 0)
 	receiver := partitionTransfer(t, d, 0, 5, []types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 2, ProducerID: "new", SeqNum: 1, Payload: "new"}})

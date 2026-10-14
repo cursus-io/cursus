@@ -17,12 +17,22 @@ var ErrConsumerMetadataRecoveryStandalone = errors.New("exclusive consumer metad
 // themselves be waiting for Raft apply. Waiters keep admission closed across
 // ownership transfers; cancellation removes only the cancelling waiter's claim.
 type consumerAdmission struct {
-	mu         sync.Mutex
-	active     int
-	recoveries int
-	owned      bool
-	lease      uint64 // Monotonic identity; zero is never an acquired lease.
-	changed    chan struct{}
+	mu                           sync.Mutex
+	active                       int
+	recoveries                   int
+	owned                        bool
+	lease                        uint64 // Monotonic identity; zero is never an acquired lease.
+	changed                      chan struct{}
+	requiredGeneration           uint64
+	completedGeneration          uint64
+	installedGeneration          uint64
+	installedLease               uint64
+	installedRevision            uint64
+	startupPending               bool
+	restoreInstalling            bool
+	restoreError                 error
+	tickets                      map[int]*ConsumerBootstrapTicket
+	bootstrapObservationRevision uint64
 }
 
 func (g *consumerAdmission) notifyLocked() {
@@ -39,7 +49,7 @@ func (c *Coordinator) admitConsumerOperation() (func(), error) {
 	g := &c.consumerAdmission
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.recoveries != 0 {
+	if g.unavailableLocked() {
 		return nil, ErrConsumerMetadataRecovering
 	}
 	g.active++
@@ -65,10 +75,14 @@ func (c *Coordinator) ConsumerOperationsReadinessError() error {
 	g := &c.consumerAdmission
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.recoveries != 0 {
+	if g.unavailableLocked() {
 		return ErrConsumerMetadataRecovering
 	}
 	return nil
+}
+
+func (g *consumerAdmission) unavailableLocked() bool {
+	return g.recoveries != 0 || len(g.tickets) != 0 || g.startupPending || g.restoreInstalling || g.restoreError != nil || g.completedGeneration != g.requiredGeneration
 }
 
 // BeginConsumerMetadataRecovery closes ordinary admission and drains admitted
