@@ -9,7 +9,7 @@ on:
       - 'go.sum'
       - '.github/workflows/gosec-analysis.yml'
   pull_request:
-    branches: [main, feat/replica-lineage-index, feat/indexed-replica-recovery]
+    branches: [main]
     paths:
       - '**/*.go'
       - 'go.mod'
