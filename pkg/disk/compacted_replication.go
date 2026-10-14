@@ -57,6 +57,12 @@ func (d *DiskHandler) WriteCompactedReplicaRange(startOffset, endOffset uint64, 
 	defer d.mu.Unlock()
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
+	if err := d.writeAvailabilityError(); err != nil {
+		return err
+	}
+	if startOffset < d.writtenTail {
+		return fmt.Errorf("compacted replica range overlaps written tail %d", d.writtenTail)
+	}
 	d.lineage = nil
 	if d.CurrentSegment != startOffset || d.CurrentOffset != 0 {
 		if err := d.rotateSegment(startOffset); err != nil {
@@ -90,6 +96,7 @@ func (d *DiskHandler) WriteCompactedReplicaRange(startOffset, endOffset uint64, 
 	d.recordCompactedSegment(startOffset, transaction.LogSize)
 	atomic.StoreUint64(&d.AbsoluteOffset, endOffset)
 	atomic.StoreUint64(&d.FlushedOffset, endOffset)
+	d.writtenTail = endOffset
 	return nil
 }
 

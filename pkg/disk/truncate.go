@@ -16,30 +16,52 @@ import (
 // TruncateTo removes records whose offsets are greater than or equal to nextOffset.
 // It is used during leader promotion to discard a locally durable but uncommitted tail.
 func (d *DiskHandler) TruncateTo(nextOffset uint64) error {
+	return d.truncateTo(nextOffset, nil)
+}
+
+// TruncateToIfGeneration rejects stale/foreign tokens even for an equal-tail
+// no-op. Flush precedes maintenance acquisition, as in TruncateTo.
+func (d *DiskHandler) TruncateToIfGeneration(nextOffset uint64, token ContentGeneration) error {
+	return d.truncateTo(nextOffset, &token)
+}
+
+func (d *DiskHandler) truncateTo(nextOffset uint64, token *ContentGeneration) (err error) {
 	d.Flush()
 
 	d.maintenanceMu.Lock()
 	defer d.maintenanceMu.Unlock()
+	d.appendMu.Lock()
+	defer d.appendMu.Unlock()
+	// The initial flush precedes maintenance acquisition, but an automatic
+	// append can reserve/enqueue another offset while we wait. Drain again with
+	// allocation excluded, before taking mu/ioMu needed by the flush worker.
+	// Keep appendMu through the reset so no old reservation can arrive afterward.
+	d.Flush()
 	if err := d.writeAvailabilityError(); err != nil {
 		return err
 	}
 	if readers := atomic.LoadInt32(&d.activeReaders); readers != 0 {
 		return fmt.Errorf("cannot truncate with %d active reader(s)", readers)
 	}
-	if err := d.segmentReaders.invalidateAll(); err != nil {
-		return fmt.Errorf("invalidate segment reader cache before truncation: %w", err)
-	}
-
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
+	d.writeFailureMu.RLock()
+	availabilityErr := d.proofAvailabilityLocked()
+	d.writeFailureMu.RUnlock()
+	if availabilityErr != nil {
+		return availabilityErr
+	}
+	if token != nil && *token != d.contentGenerationLocked() {
+		return ErrStaleContentGeneration
+	}
 
-	currentTail := atomic.LoadUint64(&d.AbsoluteOffset)
+	currentTail := d.writtenTail
 	if nextOffset > currentTail {
 		return fmt.Errorf("truncate offset %d is ahead of durable tail %d", nextOffset, currentTail)
 	}
-	if nextOffset == currentTail {
+	if nextOffset == currentTail && nextOffset == atomic.LoadUint64(&d.AbsoluteOffset) {
 		return nil
 	}
 	if len(d.segments) == 0 {
@@ -69,7 +91,18 @@ func (d *DiskHandler) TruncateTo(nextOffset uint64) error {
 	if err != nil {
 		return err
 	}
+	if err := d.segmentReaders.invalidateAll(); err != nil {
+		return fmt.Errorf("invalidate segment reader cache before truncation: %w", err)
+	}
+	// All caller input and the target boundary have been validated. From here,
+	// even an unsuccessful close/removal may leave an unusable writer or prefix.
+	d.advanceContentGenerationLocked()
 	d.lineage = nil
+	defer func() {
+		if err != nil {
+			err = d.markWriteUnavailable(err)
+		}
+	}()
 
 	if d.writer != nil {
 		if err := d.writer.Flush(); err != nil {
@@ -141,6 +174,7 @@ func (d *DiskHandler) TruncateTo(nextOffset uint64) error {
 	d.segmentCreatedAt = time.Now()
 	atomic.StoreUint64(&d.AbsoluteOffset, nextOffset)
 	atomic.StoreUint64(&d.FlushedOffset, nextOffset)
+	d.writtenTail = nextOffset
 
 	if err := d.openSegment(); err != nil {
 		return fmt.Errorf("reopen truncated segment: %w", err)

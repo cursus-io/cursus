@@ -239,7 +239,7 @@ func (d *DiskHandler) EnforceRetention(cfg *config.Config) {
 
 // markAsDeletedLocked requires maintenanceMu and mu to serialize segment
 // membership, reader invalidation and derived lineage with concurrent syncs.
-func (d *DiskHandler) markAsDeletedLocked(logPath string) error {
+func (d *DiskHandler) markAsDeletedLocked(logPath string) (err error) {
 	prefix := d.BaseName + "_segment_"
 	if !strings.HasPrefix(logPath, prefix) || !strings.HasSuffix(logPath, ".log") {
 		return fmt.Errorf("invalid segment path: %s", logPath)
@@ -258,6 +258,12 @@ func (d *DiskHandler) markAsDeletedLocked(logPath string) error {
 	indexPath := logPath[:len(logPath)-4] + ".index"
 	deletedIndexPath := indexPath + ".deleted"
 	renamedIndex := false
+	d.advanceContentGenerationLocked()
+	defer func() {
+		if err != nil {
+			err = d.markWriteUnavailable(err)
+		}
+	}()
 
 	if _, err := os.Stat(indexPath); err == nil {
 		_ = os.Chmod(indexPath, 0o600)
