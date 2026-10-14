@@ -17,11 +17,12 @@ func setupDiskHandlerWithIndex(t *testing.T) *DiskHandler {
 		DiskFlushIntervalMS: 50,
 		LingerMS:            100,
 		DiskWriteTimeoutMS:  500,
-		SegmentRollTimeMS:   500,
-		SegmentSize:         1024,
-		IndexIntervalBytes:  10,
-		IndexSize:           1024 * 1024,
-		ChannelBufferSize:   100,
+		// These tests inspect the active index; wall-clock rotation is unrelated.
+		SegmentRollTimeMS:  0,
+		SegmentSize:        1024,
+		IndexIntervalBytes: 10,
+		IndexSize:          1024 * 1024,
+		ChannelBufferSize:  100,
 	}
 
 	dh, err := NewDiskHandler(cfg, "testTopic", 0)

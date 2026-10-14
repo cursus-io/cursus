@@ -316,6 +316,11 @@ func (d *DiskHandler) refreshLineageLocked(recordLimit uint64) (err error) {
 	if index != nil && (index.start != d.segments[0] || tail < index.tail.EndOffset) {
 		index = nil
 	}
+	// Timestamps can be preserved or coarsely rounded during an in-place rewrite.
+	// Validate the fixed header before trusting even an unchanged cached tail.
+	if index != nil && !lineageHeaderMatches(path, index) {
+		index = nil
+	}
 	fresh := index == nil
 	if fresh {
 		if recordLimit != 0 {
@@ -357,6 +362,35 @@ func (d *DiskHandler) refreshLineageLocked(recordLimit uint64) (err error) {
 	return nil
 }
 
+// lineageTailRecord builds the exact tail state shared by publication and
+// validation. The caller holds mu/ioMu while accessing the derived index.
+func lineageTailRecord(index *lineageIndex) lineageJournalRecord {
+	tail := lineageJournalRecord{Kind: 1, StartOffset: index.start, EndOffset: index.tail.EndOffset, Segment: index.tail.Segment, Position: index.tail.Position, Digest: index.tail.Digest}
+	if len(index.epochs) != 0 {
+		span := index.epochs[len(index.epochs)-1]
+		tail.LeaderEpoch, tail.EpochStart = span.LeaderEpoch, span.StartOffset
+	}
+	return tail
+}
+
+// lineageHeaderMatches reads only the 128-byte magic and checksummed tail slot.
+// Comparing the complete expected encoding detects stale valid tails as well as
+// corrupt magic/checksums even when size, identity and modification time match.
+func lineageHeaderMatches(path string, index *lineageIndex) bool {
+	// #nosec G304 -- path is the partition-owned derived index.
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	expected := append([]byte(lineageMagic), lineageRecordBytes(lineageTailRecord(index))...)
+	actual := make([]byte, len(expected))
+	if _, err := io.ReadFull(f, actual); err != nil {
+		return false
+	}
+	return bytes.Equal(actual, expected)
+}
+
 // publishLineage appends sparse events and replaces the constant-size tail slot,
 // syncing before updating the cache's file identity. The caller owns mu/ioMu.
 func publishLineage(path string, index *lineageIndex, fresh bool, events []lineageJournalRecord) error {
@@ -370,12 +404,7 @@ func publishLineage(path string, index *lineageIndex, fresh bool, events []linea
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	tail := lineageJournalRecord{Kind: 1, StartOffset: index.start, EndOffset: index.tail.EndOffset, Segment: index.tail.Segment, Position: index.tail.Position, Digest: index.tail.Digest}
-	if len(index.epochs) != 0 {
-		span := index.epochs[len(index.epochs)-1]
-		tail.LeaderEpoch, tail.EpochStart = span.LeaderEpoch, span.StartOffset
-	}
-	encodedTail := lineageRecordBytes(tail)
+	encodedTail := lineageRecordBytes(lineageTailRecord(index))
 	if fresh {
 		if _, err := f.Write(append([]byte(lineageMagic), make([]byte, len(encodedTail))...)); err != nil {
 			return err

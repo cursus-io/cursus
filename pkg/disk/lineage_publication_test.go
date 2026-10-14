@@ -203,3 +203,101 @@ func TestLineageBackgroundDoesNotRebuildInvalidated(t *testing.T) {
 		})
 	}
 }
+
+// rewriteLineagePreservingStat reproduces a same-inode, same-size rewrite whose
+// timestamp is indistinguishable from the last successful publication.
+func rewriteLineagePreservingStat(t *testing.T, path string, content []byte) {
+	t.Helper()
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() != int64(len(content)) {
+		t.Fatal("fixture changed sidecar size")
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(content, 0); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || !os.SameFile(before, after) {
+		t.Fatal("fixture did not preserve cached file metadata")
+	}
+}
+
+func TestLineageHeaderValidationWithUnchangedStat(t *testing.T) {
+	for _, trigger := range []string{"background-idle", "background-append", "explicit"} {
+		for _, damage := range []string{"stale-tail", "magic", "checksum"} {
+			t.Run(trigger+"/"+damage, func(t *testing.T) {
+				d, _ := newLineageHandler(t)
+				appendLineageRecords(t, d, "zero", "one", "two")
+				_ = lineageTail(t, d, 3)
+				old := lineageSidecarBytes(t, d)
+				appendLineageRecords(t, d, "three", "four", "five")
+				want := lineageTail(t, d, 6)
+				published := lineageSidecarBytes(t, d)
+				if len(old) != 128 || len(published) != 128 {
+					t.Fatal("fixture must contain only the fixed header")
+				}
+				damaged := append([]byte(nil), published...)
+				switch damage {
+				case "stale-tail":
+					damaged = old
+				case "magic":
+					damaged[0] ^= 1
+				case "checksum":
+					damaged[len(damaged)-1] ^= 1
+				}
+				rewriteLineagePreservingStat(t, d.BaseName+".lineage", damaged)
+				if trigger == "explicit" {
+					if got := lineageTail(t, d, 6); got != want {
+						t.Fatal("rebuilding changed prefix")
+					}
+					if !bytes.Equal(lineageSidecarBytes(t, d), published) {
+						t.Fatal("unchanged-tail proof reused stale or corrupt publication")
+					}
+					_ = readLineageJournal(t, d)
+					return
+				}
+				if trigger == "background-append" {
+					appendLineageRecords(t, d, "six")
+				}
+				runLineagePeriodicPass(t, d)
+				if !bytes.Equal(lineageSidecarBytes(t, d), damaged) {
+					t.Fatal("background overwrote invalidated publication")
+				}
+				if d.lineage != nil || !d.lineageAutoSuppressed {
+					t.Fatal("background retained cache despite changed header")
+				}
+				appendLineageRecords(t, d, "after-invalidation")
+				runLineagePeriodicPass(t, d)
+				if !bytes.Equal(lineageSidecarBytes(t, d), damaged) {
+					t.Fatal("background retried invalidated publication")
+				}
+				if ok, err := d.VerifyLineagePrefix(want, d.GetFlushedOffset()); err != nil || !ok {
+					t.Fatalf("explicit rebuild changed prefix: %v %v", ok, err)
+				}
+				if records := readLineageJournal(t, d); records[0].EndOffset != d.GetFlushedOffset() {
+					t.Fatal("explicit rebuild did not durably catch up")
+				}
+			})
+		}
+	}
+}
