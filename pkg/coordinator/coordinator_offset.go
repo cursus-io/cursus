@@ -91,7 +91,8 @@ func (c *Coordinator) commitOffsetForGroupLocked(gm *GroupMetadata, groupName, t
 		gm.OffsetRevisions[topic] = revision
 		return nil
 	}
-	// Legacy FSM replay reaches this path without installing a writer.
+	// An ordinary in-memory write without a durable route cannot prove provenance.
+	c.markConsumerMetadataSourcesUnknown()
 	return gm.storeOffsetMonotonic(groupName, topic, partition, offset)
 }
 
@@ -190,7 +191,8 @@ func (c *Coordinator) commitOffsetsBulkForGroupLocked(gm *GroupMetadata, groupNa
 		gm.OffsetRevisions[topic] = revision
 		return nil
 	}
-	// Legacy FSM replay reaches this path without installing a writer.
+	// An ordinary in-memory write without a durable route cannot prove provenance.
+	c.markConsumerMetadataSourcesUnknown()
 	for _, item := range offsets {
 		gm.storeOffset(topic, item.Partition, item.Offset)
 	}
@@ -264,6 +266,7 @@ func (c *Coordinator) ValidateAndCommitTopicOffsetsBulkForEpoch(groupName, membe
 		}
 		return nil
 	}
+	c.markConsumerMetadataSourcesUnknown()
 	for _, topic := range topics {
 		for _, item := range offsets[topic] {
 			group.storeOffset(topic, item.Partition, item.Offset)
@@ -313,7 +316,7 @@ func (c *Coordinator) MaterializeCommittedTransactionOffsets(groupName string, r
 	return nil
 }
 
-func (c *Coordinator) ApplyOffsetUpdateFromFSM(groupName, topic string, offsets []OffsetItem) error {
+func (c *Coordinator) applyOffsetUpdateFromFSM(groupName, topic string, offsets []OffsetItem) error {
 	if groupName == "" || topic == "" {
 		return fmt.Errorf("invalid group or topic name")
 	}
@@ -354,7 +357,7 @@ func (c *Coordinator) ApplyOffsetUpdateFromFSM(groupName, topic string, offsets 
 
 // ApplyFencedTopicOffsetUpdateFromFSM is the replay-only compatibility path
 // for historical BATCH_OFFSET records. It never emits a new offset record.
-func (c *Coordinator) ApplyFencedTopicOffsetUpdateFromFSM(groupName, memberID string, generation int, registrationEpoch uint64, offsets map[string][]OffsetItem) error {
+func (c *Coordinator) applyFencedTopicOffsetUpdateFromFSM(groupName, memberID string, generation int, registrationEpoch uint64, offsets map[string][]OffsetItem) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
@@ -386,7 +389,7 @@ func (c *Coordinator) ApplyFencedTopicOffsetUpdateFromFSM(groupName, memberID st
 
 // ApplyFencedOffsetUpdateFromFSM validates ownership at metadata-log apply time,
 // closing the gap between command handling and the replicated state transition.
-func (c *Coordinator) ApplyFencedOffsetUpdateFromFSM(
+func (c *Coordinator) applyFencedOffsetUpdateFromFSM(
 	groupName, topic, memberID string,
 	generation int,
 	offsets []OffsetItem,

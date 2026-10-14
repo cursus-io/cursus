@@ -33,6 +33,14 @@ func (ch *CommandHandler) writeConsumerOffsetRecord(record coordinator.ConsumerM
 	if err != nil {
 		return err
 	}
+	// Use the resolved route, never recompute the fallback hash after routing.
+	physicalPartition, err := strconv.Atoi(partitionText)
+	if err != nil || physicalPartition < 0 {
+		return fmt.Errorf("invalid consumer metadata route %q", partitionText)
+	}
+	if ch.Coordinator != nil {
+		ch.Coordinator.RecordConsumerMetadataSource(record.Group, physicalPartition)
+	}
 	cmd := fmt.Sprintf("PUBLISH topic=%s partition=%s acks=all producerId=consumer-offset-coordinator key=%s message=%s", config.ConsumerOffsetsTopicName, partitionText, key, payload)
 	resp := ch.handlePublish(cmd, NewInternalClientContext("default-group", 0))
 	if strings.HasPrefix(resp, "OK") {

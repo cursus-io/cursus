@@ -12,6 +12,10 @@ import (
 // RegisterGroup creates a new consumer group for a topic. Standalone success
 // means the versioned registration record has been synchronously persisted.
 func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount int) error {
+	return c.registerGroup(topicName, groupName, partitionCount, publishLifecycle)
+}
+
+func (c *Coordinator) registerGroup(topicName, groupName string, partitionCount int, mode lifecycleWriteMode) error {
 	if topicName == "" || groupName == "" {
 		return fmt.Errorf("topic and group names must not be empty")
 	}
@@ -24,6 +28,7 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 	now := time.Now()
 
 	c.mu.Lock()
+	importGeneration := c.stateImportGeneration
 	existing := c.groups[groupName]
 	if existing != nil {
 		existing.mu.Lock()
@@ -82,7 +87,7 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 		existing.mu.Unlock()
 		c.mu.Unlock()
 
-		err := c.writeGroupRegistration(groupName, topicName, partitionCount, epoch, initial)
+		err := mode.write(func() error { return c.writeGroupRegistration(groupName, topicName, partitionCount, epoch, initial) })
 
 		c.mu.Lock()
 		delete(c.lifecyclePending, groupName)
@@ -90,7 +95,7 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 			c.mu.Unlock()
 			return fmt.Errorf("persist group registration: %w", err)
 		}
-		if c.groups[groupName] != existing {
+		if c.stateImportGeneration != importGeneration || c.groups[groupName] != existing {
 			c.mu.Unlock()
 			return fmt.Errorf("group %q changed during durable registration", groupName)
 		}
@@ -131,7 +136,7 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 	c.lifecyclePending[groupName] = true
 	c.mu.Unlock()
 
-	err := c.writeGroupRegistration(groupName, topicName, partitionCount, epoch, nil)
+	err := mode.write(func() error { return c.writeGroupRegistration(groupName, topicName, partitionCount, epoch, nil) })
 
 	c.mu.Lock()
 	delete(c.lifecyclePending, groupName)
@@ -139,7 +144,7 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 		c.mu.Unlock()
 		return fmt.Errorf("persist group registration: %w", err)
 	}
-	if c.groups[groupName] != nil {
+	if c.stateImportGeneration != importGeneration || c.groups[groupName] != nil {
 		c.mu.Unlock()
 		return fmt.Errorf("group %q changed during durable registration", groupName)
 	}
@@ -147,7 +152,9 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 	c.groupEpochs[groupName] = epoch
 	c.mu.Unlock()
 
-	c.updateOffsetPartitionCount()
+	if mode == publishLifecycle {
+		c.updateOffsetPartitionCount()
+	}
 	util.Info("🆕 Group '%s' registered for topic '%s' (%d partitions)", groupName, topicName, partitionCount)
 	return nil
 }
@@ -155,6 +162,10 @@ func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount 
 // RegisterGroupSubscription durably registers a multi-topic or pattern-backed
 // group. The supplied topics are the concrete expansion used for assignment.
 func (c *Coordinator) RegisterGroupSubscription(groupName string, topics []string, pattern string, partitionCounts map[string]int) error {
+	return c.registerGroupSubscription(groupName, topics, pattern, partitionCounts, publishLifecycle)
+}
+
+func (c *Coordinator) registerGroupSubscription(groupName string, topics []string, pattern string, partitionCounts map[string]int, mode lifecycleWriteMode) error {
 	canonicalTopics, topicPartitions, err := canonicalSubscription(topics, pattern, partitionCounts)
 	if err != nil {
 		return err
@@ -164,6 +175,7 @@ func (c *Coordinator) RegisterGroupSubscription(groupName string, topics []strin
 	defer c.lifecycleMu.Unlock()
 
 	c.mu.Lock()
+	importGeneration := c.stateImportGeneration
 	existing := c.groups[groupName]
 	if existing != nil {
 		if !sameSubscription(existing, canonicalTopics, pattern, topicPartitions) {
@@ -190,13 +202,19 @@ func (c *Coordinator) RegisterGroupSubscription(groupName string, topics []strin
 	c.lifecyclePending[groupName] = true
 	c.mu.Unlock()
 
-	err = c.writeGroupSubscriptionRegistration(groupName, canonicalTopics, pattern, partitionCounts, epoch, initial)
+	err = mode.write(func() error {
+		return c.writeGroupSubscriptionRegistration(groupName, canonicalTopics, pattern, partitionCounts, epoch, initial)
+	})
 
 	c.mu.Lock()
 	delete(c.lifecyclePending, groupName)
 	if err != nil {
 		c.mu.Unlock()
 		return fmt.Errorf("persist group subscription: %w", err)
+	}
+	if c.stateImportGeneration != importGeneration || c.groups[groupName] != existing {
+		c.mu.Unlock()
+		return fmt.Errorf("group %q changed during durable subscription registration", groupName)
 	}
 	if existing == nil {
 		existing = &GroupMetadata{
@@ -215,7 +233,9 @@ func (c *Coordinator) RegisterGroupSubscription(groupName string, topics []strin
 	existing.LastActivity = time.Now()
 	c.groupEpochs[groupName] = epoch
 	c.mu.Unlock()
-	c.updateOffsetPartitionCount()
+	if mode == publishLifecycle {
+		c.updateOffsetPartitionCount()
+	}
 	return nil
 }
 
@@ -337,6 +357,10 @@ func (c *Coordinator) DeleteGroup(groupName string) error {
 
 // AddConsumer registers a new consumer in the group and triggers a rebalance.
 func (c *Coordinator) AddConsumer(groupName, consumerID string) ([]int, error) {
+	return c.addConsumer(groupName, consumerID, publishLifecycle)
+}
+
+func (c *Coordinator) addConsumer(groupName, consumerID string, mode lifecycleWriteMode) ([]int, error) {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
@@ -369,7 +393,7 @@ func (c *Coordinator) AddConsumer(groupName, consumerID string) ([]int, error) {
 	c.lifecyclePending[groupName] = true
 	c.mu.Unlock()
 
-	err := c.writeGroupLifecycleSnapshot(groupName, group.RegistrationEpoch, candidate)
+	err := mode.write(func() error { return c.writeGroupLifecycleSnapshot(groupName, group.RegistrationEpoch, candidate) })
 
 	c.mu.Lock()
 	delete(c.lifecyclePending, groupName)
@@ -410,7 +434,7 @@ func (c *Coordinator) RemoveConsumer(groupName, consumerID string) error {
 	c.lifecyclePending[groupName] = true
 	memberCount, generation := len(candidate.Members), candidate.Generation
 	c.mu.Unlock()
-	if err := c.persistAndApplyLifecycle(groupName, group, candidate); err != nil {
+	if err := c.persistAndApplyLifecycle(groupName, group, candidate, publishLifecycle); err != nil {
 		return err
 	}
 
@@ -422,6 +446,10 @@ func (c *Coordinator) RemoveConsumer(groupName, consumerID string) error {
 // RemoveConsumerForGeneration prevents a stale session from removing a current
 // group member after ownership has moved to a newer generation.
 func (c *Coordinator) RemoveConsumerForGeneration(groupName, consumerID string, generation int) error {
+	return c.removeConsumerForGeneration(groupName, consumerID, generation, publishLifecycle)
+}
+
+func (c *Coordinator) removeConsumerForGeneration(groupName, consumerID string, generation int, mode lifecycleWriteMode) error {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
@@ -438,11 +466,13 @@ func (c *Coordinator) RemoveConsumerForGeneration(groupName, consumerID string, 
 	c.lifecyclePending[groupName] = true
 	memberCount, newGeneration := len(candidate.Members), candidate.Generation
 	c.mu.Unlock()
-	if err := c.persistAndApplyLifecycle(groupName, group, candidate); err != nil {
+	if err := c.persistAndApplyLifecycle(groupName, group, candidate, mode); err != nil {
 		return err
 	}
 
-	c.updateOffsetPartitionCount()
+	if mode == publishLifecycle {
+		c.updateOffsetPartitionCount()
+	}
 	util.Info("Consumer '%s' left group '%s' (generation=%d remaining=%d)", consumerID, groupName, newGeneration, memberCount)
 	return nil
 }
@@ -451,6 +481,10 @@ func (c *Coordinator) RemoveConsumerForGeneration(groupName, consumerID string, 
 // one generation change. expectedGeneration makes metadata-log replay and retries
 // harmless after a concurrent membership change.
 func (c *Coordinator) ExpireConsumers(groupName string, expectedGeneration int, consumerIDs []string) error {
+	return c.expireConsumers(groupName, expectedGeneration, consumerIDs, publishLifecycle)
+}
+
+func (c *Coordinator) expireConsumers(groupName string, expectedGeneration int, consumerIDs []string, mode lifecycleWriteMode) error {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
@@ -482,11 +516,11 @@ func (c *Coordinator) ExpireConsumers(groupName string, expectedGeneration int, 
 	rebalanceGroup(candidate)
 	c.lifecyclePending[groupName] = true
 	c.mu.Unlock()
-	return c.persistAndApplyLifecycle(groupName, group, candidate)
+	return c.persistAndApplyLifecycle(groupName, group, candidate, mode)
 }
 
-func (c *Coordinator) persistAndApplyLifecycle(groupName string, group, candidate *GroupMetadata) error {
-	err := c.writeGroupLifecycleSnapshot(groupName, group.RegistrationEpoch, candidate)
+func (c *Coordinator) persistAndApplyLifecycle(groupName string, group, candidate *GroupMetadata, mode lifecycleWriteMode) error {
+	err := mode.write(func() error { return c.writeGroupLifecycleSnapshot(groupName, group.RegistrationEpoch, candidate) })
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.lifecyclePending, groupName)

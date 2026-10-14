@@ -598,17 +598,23 @@ func sameConsumerMetadataRecord(left, right ConsumerMetadataRecord) bool {
 func (c *Coordinator) writeConsumerMetadataRecord(record ConsumerMetadataRecord) error {
 	c.offsetRecordWriterMu.RLock()
 	writer := c.offsetRecordWriter
+	routed := c.offsetRecordWriterRouted
 	c.offsetRecordWriterMu.RUnlock()
 	if writer != nil {
+		if !routed {
+			c.markConsumerMetadataSourcesUnknown()
+		}
 		return writer(record)
 	}
 	if !c.standalone {
+		c.markConsumerMetadataSourcesUnknown()
 		return nil
 	}
 	payload, key, err := encodeConsumerMetadataRecord(record)
 	if err != nil {
 		return err
 	}
+	c.markConsumerMetadataSourcesUnknown()
 	return c.publishOffsetMessage(&types.Message{Payload: string(payload), Key: key})
 }
 
@@ -735,6 +741,9 @@ func (c *Coordinator) writeGroupTombstone(groupName, topicName string, epoch uin
 func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerMetadataRecoveryStatus, error) {
 	const batchSize = 1024
 	status := ConsumerMetadataRecoveryStatus{Phase: "consumer_metadata_scan"}
+	c.mu.RLock()
+	importGeneration := c.stateImportGeneration
+	c.mu.RUnlock()
 	candidates := newConsumerMetadataCandidates()
 	legacy := make(legacyRecoveryState)
 	legacyRecordCounts := make(map[string]int)
@@ -786,6 +795,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 					return status, fmt.Errorf("invalid reservation record type partition=%d offset=%d", partition, message.Offset)
 				}
 				if versioned {
+					c.RecordConsumerMetadataSource(record.Group, partition)
 					if message.Key != consumerMetadataRecordKey(record) {
 						status.CorruptRecords++
 						if !c.standalone && record.Type != ConsumerMetadataRecordOffsetReservations && !strings.HasPrefix(message.Key, "cursus.consumer.offset-reservations.") {
@@ -807,6 +817,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 					}
 					return status, fmt.Errorf("decode legacy offset partition=%d offset=%d: %w", partition, message.Offset, parseErr)
 				}
+				c.RecordConsumerMetadataSource(groupName, partition)
 				status.LegacyRecords++
 				legacyRecordCounts[groupName]++
 				if legacy[groupName] == nil {
@@ -886,6 +897,10 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 		}
 	}
 	c.mu.Lock()
+	if c.stateImportGeneration != importGeneration {
+		c.mu.Unlock()
+		return status, fmt.Errorf("consumer metadata state imported during replay")
+	}
 	// Pre-v4 distributed brokers stored registrations and committed offsets in
 	// Raft but did not write a lifecycle record to __consumer_offsets. Replay
 	// of an empty (or legacy-only) offsets topic must not erase that restored

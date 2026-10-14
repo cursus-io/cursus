@@ -670,7 +670,7 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 					return fmt.Errorf("partition count mismatch for topic %s: requested=%d actual=%d", topicName, requested, len(t.Partitions))
 				}
 			}
-			return f.cd.RegisterGroupSubscription(cmd.Group, cmd.Topics, cmd.TopicPattern, cmd.PartitionCounts)
+			return f.cd.RegisterGroupSubscriptionFromFSM(cmd.Group, cmd.Topics, cmd.TopicPattern, cmd.PartitionCounts)
 		}
 		if cmd.Group == "" || cmd.Topic == "" || cmd.PartitionCount <= 0 {
 			return fmt.Errorf("GROUP_SYNC REGISTER requires group, topic, and positive partition_count")
@@ -686,18 +686,14 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 		if cmd.PartitionCount != partitionCount {
 			return fmt.Errorf("partition count mismatch for topic %s: requested=%d actual=%d", cmd.Topic, cmd.PartitionCount, partitionCount)
 		}
-		if err := f.cd.RegisterGroup(cmd.Topic, cmd.Group, partitionCount); err != nil {
+		if err := f.cd.RegisterGroupFromFSM(cmd.Topic, cmd.Group, partitionCount); err != nil {
 			return err
 		}
 		util.Info("FSM: Registered group %s for topic %s", cmd.Group, cmd.Topic)
 		return nil
 	case "JOIN":
 		if cmd.Group != "" && cmd.Member != "" && cmd.Topic == "" {
-			if !f.cd.IsSubscriptionGroup(cmd.Group) {
-				return fmt.Errorf("GROUP_SYNC JOIN without topic requires a registered subscription")
-			}
-			_, err := f.cd.AddConsumer(cmd.Group, cmd.Member)
-			return err
+			return f.cd.JoinGroupFromFSM(cmd.Group, cmd.Member, "", 0)
 		}
 		if cmd.Group == "" || cmd.Topic == "" || cmd.Member == "" || cmd.PartitionCount <= 0 {
 			return fmt.Errorf("GROUP_SYNC JOIN requires group, topic, member, and positive partition_count")
@@ -713,16 +709,7 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 		if cmd.PartitionCount != partitionCount {
 			return fmt.Errorf("partition count mismatch for topic %s: requested=%d actual=%d", cmd.Topic, cmd.PartitionCount, partitionCount)
 		}
-		if f.cd.GetGroup(cmd.Group) == nil {
-			if err := f.cd.RegisterGroup(cmd.Topic, cmd.Group, partitionCount); err != nil {
-				return err
-			}
-		}
-
-		_, err := f.cd.AddConsumer(cmd.Group, cmd.Member)
-		if err != nil {
-			return err
-		}
+		return f.cd.JoinGroupFromFSM(cmd.Group, cmd.Member, cmd.Topic, partitionCount)
 	case "LEAVE":
 		if cmd.Group == "" || cmd.Member == "" {
 			return fmt.Errorf("GROUP_SYNC LEAVE requires group and member")
@@ -730,7 +717,7 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 		if cmd.Generation == nil {
 			return fmt.Errorf("missing generation for group leave")
 		}
-		return f.cd.RemoveConsumerForGeneration(cmd.Group, cmd.Member, *cmd.Generation)
+		return f.cd.RemoveConsumerForGenerationFromFSM(cmd.Group, cmd.Member, *cmd.Generation)
 	case "EXPIRE":
 		if cmd.Group == "" {
 			return fmt.Errorf("missing group for group expiration")
@@ -741,11 +728,10 @@ func (f *BrokerFSM) applyGroupSyncCommand(jsonData string) interface{} {
 		if len(cmd.Members) == 0 {
 			return fmt.Errorf("missing members for group expiration")
 		}
-		return f.cd.ExpireConsumers(cmd.Group, *cmd.Generation, cmd.Members)
+		return f.cd.ExpireConsumersFromFSM(cmd.Group, *cmd.Generation, cmd.Members)
 	default:
 		return fmt.Errorf("unsupported GROUP_SYNC type %q", cmd.Type)
 	}
-	return nil
 }
 
 func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
