@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
@@ -33,6 +34,48 @@ func persistAuthorityFSM(t *testing.T, f *BrokerFSM) []byte {
 	var b bytes.Buffer
 	require.NoError(t, snap.Persist(&MockSnapshotSink{Writer: &b}))
 	return b.Bytes()
+}
+
+func TestLiveConsumerRestoreRejectsUnknownBeforeMutation(t *testing.T) {
+	c := authorityCoordinator(t)
+	require.NoError(t, c.RegisterGroupFromFSM("events", "keep", 1))
+	f := NewBrokerFSM(nil, c)
+	before := c.ExportState()
+	raw := persistAuthorityFSM(t, NewBrokerFSM(nil, nil))
+	require.ErrorIs(t, f.Restore(io.NopCloser(bytes.NewReader(raw))), coordinator.ErrConsumerMetadataBootstrapUnknown)
+	require.Equal(t, before, c.ExportState())
+	require.False(t, c.ConsumerRecoveryRequirement().Pending())
+}
+
+func TestLiveConsumerRestoreLeavesPersistentRequirement(t *testing.T) {
+	c := authorityCoordinator(t)
+	f := NewBrokerFSM(nil, c)
+	raw := persistAuthorityFSM(t, NewBrokerFSM(nil, authorityCoordinator(t)))
+	require.NoError(t, f.Restore(io.NopCloser(bytes.NewReader(raw))))
+	require.True(t, c.ConsumerRecoveryRequirement().Pending())
+	require.False(t, c.ConsumerRecoveryRequirement().Installing)
+	require.ErrorIs(t, c.ConsumerOperationsReadinessError(), coordinator.ErrConsumerMetadataRecovering)
+}
+
+func TestConsumerRecoveryFenceDoesNotWaitForBusyMaterialization(t *testing.T) {
+	f := NewBrokerFSM(nil, nil)
+	f.materializationMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		done <- f.WithConsumerMetadataRecoveryFence(func([]PartitionMetadata) error {
+			t.Error("busy fence called recovery")
+			return nil
+		})
+	}()
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		f.materializationMu.Unlock()
+	case <-time.After(time.Second):
+		f.materializationMu.Unlock()
+		<-done
+		t.Fatal("recovery waited while owning its outer admission lease")
+	}
 }
 func TestConsumerRecoveryFSMPairedSnapshotAndEmptyRestore(t *testing.T) {
 	c := authorityCoordinator(t)
@@ -67,7 +110,13 @@ func TestConsumerRecoveryFSMPairedSnapshotAndEmptyRestore(t *testing.T) {
 	require.NoError(t, f.Restore(io.NopCloser(bytes.NewReader(persistAuthorityFSM(t, NewBrokerFSM(nil, empty))))))
 	require.Empty(t, peer.ExportState())
 	require.NoError(t, peer.ValidateConsumerMetadataBootstrapEligibility(0))
-	// A legacy empty snapshot must erase the old authority too.
+	// Only an original startup may accept a legacy empty snapshot.
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	peer, err = coordinator.NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, &authorityTopicHandler{})
+	require.NoError(t, err)
+	t.Cleanup(peer.Stop)
+	f = NewBrokerFSM(nil, peer)
 	raw = persistAuthorityFSM(t, NewBrokerFSM(nil, nil))
 	require.NoError(t, f.Restore(io.NopCloser(bytes.NewReader(raw))))
 	require.ErrorIs(t, peer.ValidateConsumerMetadataBootstrapEligibility(0), coordinator.ErrConsumerMetadataBootstrapUnknown)

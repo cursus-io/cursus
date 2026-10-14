@@ -97,7 +97,7 @@ func (p *Partition) BeginBootstrapSession() (*BootstrapSession, error) {
 	}
 	p.recoveryMu.RUnlock()
 	s.metadata = metadata
-	s.durable = metadata != nil
+	s.durable = wasPending || metadata != nil
 	if metadata != nil {
 		s.remember(metadata)
 	}
@@ -307,6 +307,29 @@ func (s *BootstrapSession) Close() {
 	s.p.hwmCheckpointMu.Unlock()
 	s.p.visibilityMu.Unlock()
 	s.p.reconcileMu.Unlock()
+}
+
+type BootstrapOutcome int
+
+const (
+	BootstrapOutcomeUncertain BootstrapOutcome = iota
+	BootstrapOutcomePreIntentAbort
+	BootstrapOutcomeCompleted
+)
+
+// ClosedOutcome is explicit session evidence. Missing manifests never erase an
+// existing pending intent, and an open session cannot prove cleanup is safe.
+func (s *BootstrapSession) ClosedOutcome() BootstrapOutcome {
+	if s == nil || !s.closed {
+		return BootstrapOutcomeUncertain
+	}
+	if s.completed {
+		return BootstrapOutcomeCompleted
+	}
+	if !s.durable {
+		return BootstrapOutcomePreIntentAbort
+	}
+	return BootstrapOutcomeUncertain
 }
 
 // StageBootstrap prepares immutable bytes without acquiring a visibility view.

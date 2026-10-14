@@ -148,6 +148,9 @@ const coordinatorUnavailableResponse = "ERROR: coordinator_not_available"
 // Discovery failures return false so multiple brokers cannot expire the same
 // group while the coordinator ring is unavailable.
 func (ch *CommandHandler) IsGroupCoordinator(groupName string) bool {
+	if ch.consumerReadinessError() != nil {
+		return false
+	}
 	if !ch.isDistributed() {
 		return true
 	}
@@ -184,6 +187,9 @@ func (ch *CommandHandler) ResolveGroupCoordinator(groupName string) (bool, error
 // broker cannot currently resolve a Raft leader, even if its local FSM still
 // contains an older active-broker view.
 func (ch *CommandHandler) ResolveGroupCoordinators(groupNames []string) (map[string]bool, error) {
+	if err := ch.consumerReadinessError(); err != nil {
+		return nil, err
+	}
 	resolved := make(map[string]bool, len(groupNames))
 	if ch == nil || ch.Config == nil || !ch.Config.EnabledDistribution {
 		for _, groupName := range groupNames {
@@ -315,6 +321,9 @@ func (ch *CommandHandler) ensureGroupRecovery(partition uint64, epoch int) error
 	if ch.Coordinator == nil {
 		return fmt.Errorf("coordinator unavailable")
 	}
+	if err := ch.consumerReadinessError(); err != nil {
+		return err
+	}
 	ch.groupRecoveryMu.Lock()
 	recovered := ch.groupRecoveryEpoch[partition] == epoch
 	ch.groupRecoveryMu.Unlock()
@@ -324,6 +333,9 @@ func (ch *CommandHandler) ensureGroupRecovery(partition uint64, epoch int) error
 
 	ch.groupRecoveryReloadMu.Lock()
 	defer ch.groupRecoveryReloadMu.Unlock()
+	if err := ch.consumerReadinessError(); err != nil {
+		return err
+	}
 	ch.groupRecoveryMu.Lock()
 	recovered = ch.groupRecoveryEpoch[partition] == epoch
 	ch.groupRecoveryMu.Unlock()
@@ -362,7 +374,7 @@ func (ch *CommandHandler) StartGroupRecoveryMonitor(ctx context.Context) error {
 	// Reconcile synchronously before the public listener starts. The ownership
 	// baseline is captured before startup replay, so an ownership change during
 	// that replay cannot be mistaken for already recovered state.
-	if err := ch.refreshLocalGroupRecovery(); err != nil {
+	if err := ch.refreshLocalGroupRecoveryContext(ctx); err != nil {
 		return err
 	}
 	go func() {
@@ -374,7 +386,7 @@ func (ch *CommandHandler) StartGroupRecoveryMonitor(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := ch.refreshLocalGroupRecovery(); err != nil {
+				if err := ch.refreshLocalGroupRecoveryContext(ctx); err != nil {
 					if err.Error() != lastFailure {
 						util.Warn("Consumer metadata ownership recovery pending: %v", err)
 						lastFailure = err.Error()
@@ -404,6 +416,19 @@ func (ch *CommandHandler) CaptureGroupRecoveryOwnership() error {
 // refreshLocalGroupRecovery reloads durable consumer metadata after this
 // broker acquires an offsets partition at a new leader epoch.
 func (ch *CommandHandler) refreshLocalGroupRecovery() error {
+	return ch.refreshLocalGroupRecoveryContext(context.Background())
+}
+
+func (ch *CommandHandler) refreshLocalGroupRecoveryContext(ctx context.Context) error {
+	if err := ch.ReconstructConsumerBootstrapTickets(); err != nil {
+		return err
+	}
+	if ch.Coordinator != nil && ch.Coordinator.ConsumerRecoveryRequirement().Pending() {
+		return ch.RecoverDistributedConsumerMetadata(ctx)
+	}
+	if err := ch.consumerReadinessError(); err != nil {
+		return err
+	}
 	ch.groupRecoveryReloadMu.Lock()
 	defer ch.groupRecoveryReloadMu.Unlock()
 
