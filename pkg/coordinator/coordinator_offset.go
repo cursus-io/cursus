@@ -23,6 +23,11 @@ func (c *Coordinator) authoritativeOffsetWritesEnabled() bool {
 }
 
 func (c *Coordinator) CommitOffset(groupName, topic string, partition int, offset uint64) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	util.Debug("Committing offset: group='%s', topic='%s', partition=%d, offset=%d", groupName, topic, partition, offset)
 
 	c.mu.RLock()
@@ -97,6 +102,11 @@ func (c *Coordinator) commitOffsetForGroupLocked(gm *GroupMetadata, groupName, t
 }
 
 func (c *Coordinator) CommitOffsetsBulk(groupName, topic string, offsets []OffsetItem) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	if len(offsets) == 0 {
 		return nil
 	}
@@ -128,6 +138,11 @@ func (c *Coordinator) CommitOffsetsBulk(groupName, topic string, offsets []Offse
 // ValidateAndCommitOffsetsBulk keeps the membership generation stable until the
 // durable offset record and all in-memory offsets have been applied.
 func (c *Coordinator) ValidateAndCommitOffsetsBulk(groupName, topic, memberID string, generation int, offsets []OffsetItem) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.lifecyclePending[groupName] {
@@ -212,10 +227,24 @@ func memberOwnsTopicPartition(group *GroupMetadata, member *MemberMetadata, topi
 // set under one group membership fence. All new writes append complete
 // snapshots to __consumer_offsets before exposing the in-memory update.
 func (c *Coordinator) ValidateAndCommitTopicOffsetsBulk(groupName, memberID string, generation int, offsets map[string][]OffsetItem) error {
-	return c.ValidateAndCommitTopicOffsetsBulkForEpoch(groupName, memberID, generation, 0, offsets)
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return c.validateAndCommitTopicOffsetsBulkForEpoch(groupName, memberID, generation, 0, offsets)
 }
 
 func (c *Coordinator) ValidateAndCommitTopicOffsetsBulkForEpoch(groupName, memberID string, generation int, registrationEpoch uint64, offsets map[string][]OffsetItem) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return c.validateAndCommitTopicOffsetsBulkForEpoch(groupName, memberID, generation, registrationEpoch, offsets)
+}
+
+func (c *Coordinator) validateAndCommitTopicOffsetsBulkForEpoch(groupName, memberID string, generation int, registrationEpoch uint64, offsets map[string][]OffsetItem) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.lifecyclePending[groupName] {
@@ -279,6 +308,11 @@ func (c *Coordinator) ValidateAndCommitTopicOffsetsBulkForEpoch(groupName, membe
 // snapshot after the transaction decision is committed. During this short
 // materialization window GetOffset is covered by TransactionalOffsetResolver.
 func (c *Coordinator) MaterializeCommittedTransactionOffsets(groupName string, registrationEpoch uint64, offsets map[string][]OffsetItem) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	if len(offsets) == 0 {
 		return nil
 	}
@@ -588,6 +622,11 @@ func parseOffsetLogPayload(payload string) (string, string, []OffsetItem, error)
 }
 
 func (c *Coordinator) GetOffset(groupName, topic string, partition int) (uint64, bool) {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return 0, false
+	}
+	defer release()
 	gm := c.getGroupSafe(groupName)
 	if gm == nil {
 		return 0, false
@@ -635,6 +674,11 @@ func (c *Coordinator) updateOffsetPartitionCount() {
 }
 
 func (c *Coordinator) ValidateAndCommit(groupName, topic string, partition int, offset uint64, generation int, memberID string) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.lifecyclePending[groupName] {
@@ -655,6 +699,11 @@ func (c *Coordinator) getGroupUnsafe(name string) *GroupMetadata {
 }
 
 func (c *Coordinator) ValidateOwnershipAtomic(groupName, memberID string, generation int, partition int) bool {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return false
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
