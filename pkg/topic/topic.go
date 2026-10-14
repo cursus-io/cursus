@@ -134,14 +134,15 @@ func newTopicWithDefinition(definition Definition, hp HandlerProvider, cfg *conf
 			return nil, fmt.Errorf("open handler for %s[%d]: %w", definition.Name, i, err)
 		}
 		p := NewPartition(i, definition.Name, dh, sm, cfg)
-		if err := p.RecoveryError(); err != nil {
+		if err := p.permanentRecoveryError(); err != nil {
 			p.Close()
 			closePartiallyInitializedTopic(definition.Name, hp, partitions[:i])
 			return nil, fmt.Errorf("recover partition %s[%d]: %w", definition.Name, i, err)
 		}
+		p.validateBootstrapDefinition(definition)
 		p.isIdempotent = definition.Idempotent
 		if err := p.RecoverProducerStateFromLog(); err != nil {
-			p.setRecoveryError(fmt.Errorf("recover producer state: %w", err))
+			p.setProducerRecoveryError(fmt.Errorf("recover producer state: %w", err))
 			p.Close()
 			closePartiallyInitializedTopic(definition.Name, hp, partitions[:i])
 			return nil, fmt.Errorf("recover producer state for %s[%d]: %w", definition.Name, i, err)
@@ -299,15 +300,16 @@ func (t *Topic) applyFullDefinitionLocked(definition Definition, hp HandlerProvi
 			return fmt.Errorf("failed to attach partition %d for topic '%s': %w", idx, t.Name, err)
 		}
 		partition := NewPartition(idx, t.Name, dh, t.streamManager, t.cfg)
-		if err := partition.RecoveryError(); err != nil {
+		if err := partition.permanentRecoveryError(); err != nil {
 			closePreparedPartitions(t.Name, hp, append(staged, partition))
 			return fmt.Errorf("recover partition %d for topic '%s': %w", idx, t.Name, err)
 		}
+		partition.validateBootstrapDefinition(definition)
 		partition.SetTransactionDecisionResolver(t.txnResolver)
 		partition.SetDistributedCompactionGate(t.compactionGate)
 		partition.isIdempotent = t.IsIdempotent
 		if err := partition.RecoverProducerStateFromLog(); err != nil {
-			partition.setRecoveryError(fmt.Errorf("recover producer state: %w", err))
+			partition.setProducerRecoveryError(fmt.Errorf("recover producer state: %w", err))
 			closePreparedPartitions(t.Name, hp, append(staged, partition))
 			return fmt.Errorf("recover producer state for partition %d of topic '%s': %w", idx, t.Name, err)
 		}
