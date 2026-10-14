@@ -161,8 +161,16 @@ and legacy records encountered while scanning the source. Each subsequent
 request must prove the preceding prefix before records can be transferred;
 the authoritative source log is never truncated. Storage or checksum failures,
 unavailable prefix records, stale fences, and invalid committed HWMs still stop
-recovery. Indexed protocol negotiation and bootstrap for prefixes removed by
-retention remain follow-up work in #246.
+recovery. Indexed wire protocol 1 is implemented for non-compacted replicas
+outside ISR, and explicit capability-1 fixtures exercise mutual negotiation.
+Production direct and leader-forwarded registration both advertise recovery
+protocol **0** through the same payload builder. This deliberate activation gate
+keeps production on the existing digest path until retained-range bootstrap is
+complete; it does not solve missing retained history. Lifecycle protocol remains
+6. There is no operator switch to enable the incomplete service. A future bundle
+must wire source, transport, receiver, resumable installation, derived-state
+recovery and providers before advertising protocol 2, with startup capability 0
+until ready. Compacted replicas keep their existing recovery path.
 
 Each partition can maintain a derived `partition_N.lineage` sidecar. It stores
 checksummed leader-epoch spans and cumulative record-hash checkpoints. A zero
@@ -188,8 +196,36 @@ the existing compacted recovery path. A sidecar publication failure suspends
 background updates and logs the transition once. It does not reverse a successful
 durable append, but no indexed proof is returned until explicit recovery can
 publish successfully. Recovery logs once and resumes bounded background updates.
-The existing wire protocol still uses record digests until the
-negotiated indexed-recovery layer is enabled.
+Indexed recovery sends at most 64 candidates: the exact tail, tail minus 1, 3,
+7, ... records, and the retained-start anchor. It rolls back only to a matching
+cumulative prefix at or below the authoritative exclusive HWM. On stable,
+contiguous histories with the same anchor, define required rollback as
+`D = tail - min(longest_common_prefix, source_HWM)` and actual rollback as `R`.
+`D = 0` gives `R = 0`, and one bad tail record gives `R = 1`. For positive `D`,
+`D <= R < 2D` when the retained span is at most MaxInt64; the full uint64 range
+has `D <= R < 4D` because the final slot is reserved for the anchor. These are
+record-count bounds, not byte or time budgets. With a fixed source HWM,
+retransferred records within the receiver's original tail are at most `R`;
+ordinary catch-up of newer records beyond that tail is outside the bound.
+Measure transferred bytes separately.
+Equal final records cannot conceal
+earlier divergence. Responses are checksummed and fenced by source, receiver,
+leader and lifecycle; stale or unsupported responses cannot mutate local storage.
+Proofs are refreshed after each append. The first request may scan retained history
+while holding the FSM transition fence, which can delay metadata application.
+If retention has removed the common anchor, recovery reports bootstrap required
+and leaves local data unchanged. Never fall back to legacy truncation or choose
+a larger anchor to bypass `BootstrapRequired`. Automated retained-range bootstrap
+remains the next layer of #246, and production capability remains 0 in this layer.
+
+The [Kafka comparison and regression contract](../replica-recovery-design.md#kafka-comparison-and-regression-contract)
+records which epoch, fencing and independent-retention behavior Cursus adopts
+and why same-epoch/legacy cumulative proofs and a separate bootstrap are needed.
+Outstanding audit follow-ups remain cold sidecar rebuild bytes/time and lock
+contention, compacted full-prefix rescan work, and consumer metadata's global
+strict replay gate under busy unrelated traffic. None is fixed by these probe or
+advertisement changes. Include recovery bytes, hashing/scanning work and elapsed
+time in fault reports alongside request counts.
 
 The same-epoch restart regression commits a replacement on the two surviving
 brokers before restarting a divergent follower, then checks exact raw-record

@@ -27,6 +27,8 @@ const (
 	LeaderEpochRecoveryProtocolVersion   = 5
 	ReplicaGapRecoveryProtocolVersion    = 6
 	BrokerProtocolVersionCurrent         = ReplicaGapRecoveryProtocolVersion
+	// Recovery capabilities are additive and do not raise lifecycle requirements.
+	IndexedRecoveryProtocolVersion = 1
 )
 
 type ReplicationEntry struct {
@@ -43,6 +45,7 @@ type BrokerInfo struct {
 	Status            string    `json:"status"`
 	LastSeen          time.Time `json:"last_seen"`
 	LifecycleProtocol int       `json:"lifecycle_protocol,omitempty"`
+	RecoveryProtocol  int       `json:"recovery_protocol,omitempty"`
 	// IncarnationID identifies one broker process lifetime. IncarnationEpoch is
 	// assigned durably when that lifetime is first registered, so an older
 	// process cannot keep a newer registration alive with heartbeats.

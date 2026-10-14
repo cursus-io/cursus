@@ -138,16 +138,16 @@ func (d *DiskHandler) LineageCandidates(tail uint64) ([]LineagePrefix, error) {
 	return proofs, nil
 }
 
-// lineageCandidateEnds selects geometric endpoints plus the anchor for start <= tail.
+// lineageCandidateEnds selects the exact tail, tail-relative rollback distances
+// 1, 3, 7, ... and the retained-start anchor for start <= tail. Reserve the last
+// slot for the anchor, keeping all uint64 spans within the 64-proof wire limit.
 func lineageCandidateEnds(start, tail uint64) []uint64 {
 	ends := []uint64{tail}
-	for distance := (tail - start) / 2; distance > 0; distance /= 2 {
-		ends = append(ends, start+distance)
+	span := tail - start
+	for distance := uint64(1); distance < span && len(ends) < 63; distance = 2*distance + 1 {
+		ends = append(ends, tail-distance)
 	}
 	if tail != start {
-		if len(ends) == 64 {
-			ends = ends[:63]
-		}
 		ends = append(ends, start)
 	}
 	return ends

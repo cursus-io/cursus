@@ -170,11 +170,11 @@ func TestLineageSparseCheckpointsRotationAndBatchMatching(t *testing.T) {
 		t.Fatal(err)
 	}
 	match, err := a.MatchLineageCandidates(proofs, 1500)
-	if err != nil || match == nil || match.EndOffset != 750 {
+	if err != nil || match == nil || match.EndOffset != 477 {
 		t.Fatalf("match=%+v err=%v", match, err)
 	}
 	match, err = a.MatchLineageCandidates(proofs, 500)
-	if err != nil || match == nil || match.EndOffset != 375 {
+	if err != nil || match == nil || match.EndOffset != 477 {
 		t.Fatalf("HWM match=%+v err=%v", match, err)
 	}
 	for _, end := range []uint64{255, 256, 257, 499, 500, 501, 899, 900} {

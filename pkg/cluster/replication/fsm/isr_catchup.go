@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 )
@@ -24,41 +25,46 @@ var errReplicaEpochBoundaryUnavailable = errors.New("replica epoch boundary unav
 // the source may return a newer committed boundary. SourceAddress is local
 // routing metadata and is not sent.
 type ReplicaCatchupRequest struct {
-	Topic                string `json:"topic"`
-	Partition            int    `json:"partition"`
-	BrokerID             string `json:"broker_id"`
-	NextOffset           uint64 `json:"next_offset"`
-	CommittedHWM         uint64 `json:"committed_hwm"`
-	Leader               string `json:"leader"`
-	SourceBroker         string `json:"source_broker,omitempty"`
-	LeaderEpoch          int    `json:"leader_epoch"`
-	LifecycleEpoch       uint64 `json:"lifecycle_epoch"`
-	MaxRecords           int    `json:"max_records"`
-	PreviousLeaderEpoch  int64  `json:"previous_leader_epoch,omitempty"`
-	PreviousRecordDigest string `json:"previous_record_digest,omitempty"`
-	SourceAddress        string `json:"-"`
-	SnapshotCatchup      bool   `json:"-"`
+	Topic                string               `json:"topic"`
+	Partition            int                  `json:"partition"`
+	BrokerID             string               `json:"broker_id"`
+	NextOffset           uint64               `json:"next_offset"`
+	CommittedHWM         uint64               `json:"committed_hwm"`
+	Leader               string               `json:"leader"`
+	SourceBroker         string               `json:"source_broker,omitempty"`
+	LeaderEpoch          int                  `json:"leader_epoch"`
+	LifecycleEpoch       uint64               `json:"lifecycle_epoch"`
+	MaxRecords           int                  `json:"max_records"`
+	PreviousLeaderEpoch  int64                `json:"previous_leader_epoch,omitempty"`
+	PreviousRecordDigest string               `json:"previous_record_digest,omitempty"`
+	SourceAddress        string               `json:"-"`
+	SnapshotCatchup      bool                 `json:"-"`
+	RecoveryProtocol     int                  `json:"recovery_protocol,omitempty"`
+	PrefixCandidates     []disk.LineagePrefix `json:"prefix_candidates,omitempty"`
 }
 
 // ReplicaCatchupBatch carries a committed logical range under the same
 // partition fences as the request. Compacted batches may omit superseded
 // physical records while EndOffset still advances the logical replica tail.
 type ReplicaCatchupBatch struct {
-	Topic          string          `json:"topic"`
-	Partition      int             `json:"partition"`
-	BrokerID       string          `json:"broker_id"`
-	StartOffset    uint64          `json:"start_offset"`
-	EndOffset      uint64          `json:"end_offset,omitempty"`
-	CommittedHWM   uint64          `json:"committed_hwm"`
-	Leader         string          `json:"leader"`
-	SourceBroker   string          `json:"source_broker,omitempty"`
-	LeaderEpoch    int             `json:"leader_epoch"`
-	LifecycleEpoch uint64          `json:"lifecycle_epoch"`
-	Compacted      bool            `json:"compacted,omitempty"`
-	Verified       bool            `json:"verified,omitempty"`
-	TruncateTo     *uint64         `json:"truncate_to,omitempty"`
-	Messages       []types.Message `json:"messages"`
-	Digest         string          `json:"digest"`
+	Topic             string              `json:"topic"`
+	Partition         int                 `json:"partition"`
+	BrokerID          string              `json:"broker_id"`
+	StartOffset       uint64              `json:"start_offset"`
+	EndOffset         uint64              `json:"end_offset,omitempty"`
+	CommittedHWM      uint64              `json:"committed_hwm"`
+	Leader            string              `json:"leader"`
+	SourceBroker      string              `json:"source_broker,omitempty"`
+	LeaderEpoch       int                 `json:"leader_epoch"`
+	LifecycleEpoch    uint64              `json:"lifecycle_epoch"`
+	Compacted         bool                `json:"compacted,omitempty"`
+	Verified          bool                `json:"verified,omitempty"`
+	TruncateTo        *uint64             `json:"truncate_to,omitempty"`
+	Messages          []types.Message     `json:"messages"`
+	Digest            string              `json:"digest"`
+	RecoveryProtocol  int                 `json:"recovery_protocol,omitempty"`
+	MatchedPrefix     *disk.LineagePrefix `json:"matched_prefix,omitempty"`
+	BootstrapRequired bool                `json:"bootstrap_required,omitempty"`
 }
 
 // SealReplicaCatchupBatch binds the logical range, fences, source, and decoded
@@ -104,6 +110,8 @@ func AdvanceReplicaCatchupRequest(request *ReplicaCatchupRequest, batch ReplicaC
 		return fmt.Errorf("replica catch-up made no progress at offset %d", request.NextOffset)
 	}
 	request.NextOffset = endOffset
+	// Cumulative proofs must be regenerated from durable storage after applying.
+	request.PrefixCandidates = nil
 	request.PreviousLeaderEpoch = 0
 	request.PreviousRecordDigest = ""
 	if len(batch.Messages) == 0 {
@@ -427,7 +435,7 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 					LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch,
 					MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr, SnapshotCatchup: localTopic.IsEventSourcing,
 				}
-				if err := addPreviousReplicaRecord(partition, &request); err == nil {
+				if err := addReplicaRecoveryProof(partition, &request, brokers[brokerID], source, inISR, definition); err == nil {
 					requests = append(requests, request)
 				}
 			}
@@ -440,7 +448,7 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 			LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch,
 			MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr, SnapshotCatchup: localTopic.IsEventSourcing,
 		}
-		if err := addPreviousReplicaRecord(partition, &request); err == nil {
+		if err := addReplicaRecoveryProof(partition, &request, brokers[brokerID], source, inISR, definition); err == nil {
 			requests = append(requests, request)
 		}
 	}
@@ -497,6 +505,20 @@ func selectReplicaCatchupSource(meta PartitionMetadata, localBrokerID string, br
 // FetchReplicaCatchup validates the request against current Raft metadata and
 // returns only raw records below the authoritative committed HWM.
 func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaCatchupBatch, error) {
+	if request.RecoveryProtocol != 0 {
+		// Keep metadata, cumulative proof, record reads, and sealing in the same
+		// topic generation. No controller gates or f.mu are held during I/O.
+		// An initial lineage rebuild can delay Raft Apply for this request; keep
+		// that safe serialization until generation-aware reads prevent restore ABA.
+		f.transitionMu.Lock()
+		defer f.transitionMu.Unlock()
+		f.materializationMu.Lock()
+		defer f.materializationMu.Unlock()
+	}
+	return f.fetchReplicaCatchup(request)
+}
+
+func (f *BrokerFSM) fetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaCatchupBatch, error) {
 	if request.Topic == "" || request.Partition < 0 || request.BrokerID == "" || request.Leader == "" {
 		return ReplicaCatchupBatch{}, fmt.Errorf("invalid replica catch-up identity")
 	}
@@ -517,7 +539,13 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 	if sourceBroker == "" {
 		sourceBroker = request.Leader
 	}
-	source := f.brokers[sourceBroker]
+	var source, receiver BrokerInfo
+	if broker := f.brokers[sourceBroker]; broker != nil {
+		source = *broker
+	}
+	if broker := f.brokers[request.BrokerID]; broker != nil {
+		receiver = *broker
+	}
 	f.mu.RUnlock()
 	if !containsString(current.Replicas, request.BrokerID) {
 		return ReplicaCatchupBatch{}, fmt.Errorf("broker %s is not a configured replica for %s", request.BrokerID, key)
@@ -528,7 +556,7 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 	if !containsString(current.Replicas, sourceBroker) || !containsString(current.ISR, sourceBroker) {
 		return ReplicaCatchupBatch{}, fmt.Errorf("source broker %s is not an in-sync replica for %s", sourceBroker, key)
 	}
-	if source == nil || source.Status != "active" {
+	if source.Status != "active" {
 		return ReplicaCatchupBatch{}, fmt.Errorf("source broker %s is not active", sourceBroker)
 	}
 	if request.Leader != current.Leader || request.LeaderEpoch != current.LeaderEpoch {
@@ -543,6 +571,42 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 	if request.NextOffset > current.CommittedHWM {
 		return ReplicaCatchupBatch{}, fmt.Errorf("catch-up offset %d exceeds committed HWM %d", request.NextOffset, current.CommittedHWM)
 	}
+	if err := validateReplicaRecoveryRequest(request, source, receiver, current); err != nil {
+		return ReplicaCatchupBatch{}, err
+	}
+	var matched *disk.LineagePrefix
+	if request.RecoveryProtocol == IndexedRecoveryProtocolVersion {
+		partition, err := f.replicaRecoveryPartition(request.Topic, request.Partition)
+		if err != nil {
+			return ReplicaCatchupBatch{}, err
+		}
+		f.mu.RLock()
+		localTopic := f.tm.GetTopic(request.Topic)
+		f.mu.RUnlock()
+		if localTopic == nil || localTopic.Definition().LifecycleEpoch != request.LifecycleEpoch {
+			return ReplicaCatchupBatch{}, fmt.Errorf("local source lifecycle changed")
+		}
+		if partition.GetHWM() < current.CommittedHWM {
+			return ReplicaCatchupBatch{}, fmt.Errorf("source committed HWM is behind recovery boundary")
+		}
+		matched, err = partition.MatchReplicaLineage(request.PrefixCandidates, current.CommittedHWM)
+		if err != nil {
+			return ReplicaCatchupBatch{}, err
+		}
+		if matched == nil || matched.EndOffset < request.NextOffset {
+			batch := ReplicaCatchupBatch{
+				Topic: request.Topic, Partition: request.Partition, BrokerID: request.BrokerID,
+				StartOffset: request.NextOffset, EndOffset: request.NextOffset, CommittedHWM: current.CommittedHWM,
+				Leader: current.Leader, SourceBroker: sourceBroker, LeaderEpoch: current.LeaderEpoch, LifecycleEpoch: current.LifecycleEpoch,
+				RecoveryProtocol: IndexedRecoveryProtocolVersion, MatchedPrefix: matched, BootstrapRequired: matched == nil,
+			}
+			if matched != nil {
+				boundary := matched.EndOffset
+				batch.TruncateTo = &boundary
+			}
+			return SealReplicaCatchupBatch(batch)
+		}
+	}
 	if request.PreviousRecordDigest != "" {
 		if request.NextOffset == 0 {
 			return ReplicaCatchupBatch{}, fmt.Errorf("replica prefix proof cannot precede offset zero")
@@ -556,6 +620,9 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 			return ReplicaCatchupBatch{}, err
 		}
 		if digest != request.PreviousRecordDigest {
+			if request.RecoveryProtocol != 0 {
+				return ReplicaCatchupBatch{}, fmt.Errorf("last-record proof conflicts with matched full prefix")
+			}
 			// If retained epochs cannot prove a boundary, including legacy logs,
 			// remove only the mismatched follower record;
 			// the next request must prove the preceding prefix before recovery
@@ -620,6 +687,7 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 		Leader: current.Leader, SourceBroker: sourceBroker,
 		LeaderEpoch: current.LeaderEpoch, LifecycleEpoch: current.LifecycleEpoch,
 		Compacted: compacted, Verified: endOffset == current.CommittedHWM, Messages: messages,
+		RecoveryProtocol: request.RecoveryProtocol, MatchedPrefix: matched,
 	})
 }
 
