@@ -396,6 +396,8 @@ func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool,
 	}
 
 	directory := filepath.Dir(logPath)
+	// Invalidate under the same lock as replacement, including partial failure.
+	d.lineage = nil
 	if err := replaceCompactedFile(markerTemp, markerPath); err != nil {
 		return 0, before, after, err
 	}

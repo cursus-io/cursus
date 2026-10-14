@@ -1,0 +1,484 @@
+package disk
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync/atomic"
+
+	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
+)
+
+const lineageCheckpointInterval = 256
+const lineageMagic = "CLIN0001"
+
+// ErrLineageUnsupported routes compacted/gapped histories to compacted recovery.
+var ErrLineageUnsupported = errors.New("lineage requires a contiguous retained log")
+
+// LineagePrefix proves the entire retained interval [StartOffset, EndOffset).
+// Different retained starts are incomparable, including empty prefixes.
+type LineagePrefix struct {
+	StartOffset uint64 `json:"start_offset"`
+	EndOffset   uint64 `json:"end_offset"`
+	Digest      string `json:"digest"`
+}
+
+// LineageEpochSpan describes decoded records, not proof of common ancestry.
+// LeaderEpoch zero is unknown history and must never establish a shared epoch.
+type LineageEpochSpan struct {
+	StartOffset uint64
+	EndOffset   uint64
+	LeaderEpoch int64
+}
+
+type lineageCursor struct {
+	EndOffset uint64
+	Segment   uint64
+	Position  int64
+	Digest    [sha256.Size]byte
+}
+
+type lineageIndex struct {
+	start       uint64
+	tail        lineageCursor
+	checkpoints []lineageCursor
+	epochs      []LineageEpochSpan
+	info        os.FileInfo
+}
+
+// The fixed tail slot is overwritten after appending sparse checkpoints and
+// completed epoch spans. Every record is independently checksummed. A crash can
+// tear either write: restart always rebuilds from the authoritative retained log
+// rather than trusting even a checksum-valid old version or stale cursor.
+// Storage is O(records/256 + epoch transitions), with a constant-size tail slot.
+type lineageJournalRecord struct {
+	Kind        uint64 // 1: tail, 2: checkpoint, 3: completed epoch span
+	StartOffset uint64
+	EndOffset   uint64
+	LeaderEpoch int64
+	EpochStart  uint64
+	Segment     uint64
+	Position    int64
+	Digest      [sha256.Size]byte
+}
+
+// lineageRecordBytes binds each journal record checksum to the format version.
+func lineageRecordBytes(record lineageJournalRecord) []byte {
+	var b bytes.Buffer
+	_ = binary.Write(&b, binary.BigEndian, record)
+	sum := sha256.Sum256(append([]byte(lineageMagic), b.Bytes()...))
+	return append(b.Bytes(), sum[:]...)
+}
+
+// lineageSeed anchors even an empty proof to its explicit retained start.
+func lineageSeed(start uint64) [sha256.Size]byte {
+	var offset [8]byte
+	binary.BigEndian.PutUint64(offset[:], start)
+	return sha256.Sum256(append([]byte("cursus-retained-lineage-v1"), offset[:]...))
+}
+
+// lineageHash extends the chain with a length-delimited canonical full record.
+func lineageHash(previous [sha256.Size]byte, message types.DiskMessage) ([sha256.Size]byte, error) {
+	// Decode first, then encode every persisted field in one canonical version.
+	// CDM2/CDM3/CDM4 and re-encoded CDM5 records therefore compare identically. If the
+	// canonical encoding changes, bump the lineage format/domain version too.
+	canonical, err := util.SerializeDiskMessage(message)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	h := sha256.New()
+	_, _ = h.Write(previous[:])
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(canonical)))
+	_, _ = h.Write(length[:])
+	_, _ = h.Write(canonical)
+	var digest [sha256.Size]byte
+	copy(digest[:], h.Sum(nil))
+	return digest, nil
+}
+
+// LineageCandidates returns at most 64 cumulative proofs, newest first,
+// including the exact requested tail and the empty retained-start anchor.
+// Checkpoint seeks limit each historical endpoint scan to 255 records.
+func (d *DiskHandler) LineageCandidates(tail uint64) ([]LineagePrefix, error) {
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
+	if err := d.prepareLineageLocked(); err != nil {
+		return nil, err
+	}
+	if tail < d.lineage.start || tail > d.lineage.tail.EndOffset {
+		return nil, fmt.Errorf("lineage tail %d outside retained range [%d,%d]", tail, d.lineage.start, d.lineage.tail.EndOffset)
+	}
+	ends := lineageCandidateEnds(d.lineage.start, tail)
+	proofs := make([]LineagePrefix, 0, len(ends))
+	for _, end := range ends {
+		proof, err := d.lineagePrefixLocked(end)
+		if err != nil {
+			return nil, err
+		}
+		proofs = append(proofs, proof)
+	}
+	return proofs, nil
+}
+
+// lineageCandidateEnds selects geometric endpoints plus the anchor for start <= tail.
+func lineageCandidateEnds(start, tail uint64) []uint64 {
+	ends := []uint64{tail}
+	for distance := (tail - start) / 2; distance > 0; distance /= 2 {
+		ends = append(ends, start+distance)
+	}
+	if tail != start {
+		if len(ends) == 64 {
+			ends = ends[:63]
+		}
+		ends = append(ends, start)
+	}
+	return ends
+}
+
+// VerifyLineagePrefix compares an explicit retained prefix only below the
+// caller's authoritative, exclusive committed HWM. Epoch matches alone are
+// never used as evidence; a matching final record cannot hide earlier divergence.
+func (d *DiskHandler) VerifyLineagePrefix(prefix LineagePrefix, committedHWM uint64) (bool, error) {
+	if prefix.EndOffset < prefix.StartOffset || prefix.EndOffset > committedHWM {
+		return false, nil
+	}
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
+	if err := d.prepareLineageLocked(); err != nil {
+		return false, err
+	}
+	if prefix.StartOffset != d.lineage.start || prefix.EndOffset > d.lineage.tail.EndOffset {
+		return false, nil
+	}
+	want, err := d.lineagePrefixLocked(prefix.EndOffset)
+	return err == nil && want == prefix, err
+}
+
+// MatchLineageCandidates finds the longest matching prefix below committedHWM
+// with a single durability boundary and stable retained-log snapshot. A nil
+// match means no comparable proof, not permission to discard committed data.
+func (d *DiskHandler) MatchLineageCandidates(candidates []LineagePrefix, committedHWM uint64) (*LineagePrefix, error) {
+	if len(candidates) > 64 {
+		return nil, errors.New("too many lineage candidates")
+	}
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
+	if err := d.prepareLineageLocked(); err != nil {
+		return nil, err
+	}
+	ordered := append([]LineagePrefix(nil), candidates...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].EndOffset > ordered[j].EndOffset })
+	for _, candidate := range ordered {
+		if candidate.StartOffset != d.lineage.start || candidate.EndOffset < candidate.StartOffset || candidate.EndOffset > committedHWM || candidate.EndOffset > d.lineage.tail.EndOffset {
+			continue
+		}
+		proof, err := d.lineagePrefixLocked(candidate.EndOffset)
+		if err != nil {
+			return nil, err
+		}
+		if proof == candidate {
+			return &proof, nil
+		}
+	}
+	return nil, nil
+}
+
+// LineageEpochs returns a copy of the durable retained epoch spans.
+func (d *DiskHandler) LineageEpochs() ([]LineageEpochSpan, error) {
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
+	if err := d.prepareLineageLocked(); err != nil {
+		return nil, err
+	}
+	return append([]LineageEpochSpan(nil), d.lineage.epochs...), nil
+}
+
+// prepareLineageLocked requires maintenanceMu, mu and ioMu. Explicit proof
+// requests retry a previously failed publication and resume automatic updates
+// only after the complete durable tail has been successfully indexed.
+func (d *DiskHandler) prepareLineageLocked() error {
+	if err := d.writeAvailabilityError(); err != nil {
+		return err
+	}
+	select {
+	case <-d.done:
+		return errors.New("lineage handler is closed")
+	default:
+	}
+	if d.file == nil {
+		return errors.New("lineage log is closed")
+	}
+	// FlushedOffset means written, not necessarily synced. Never publish a proof
+	// until the data file has crossed the durability boundary under ioMu.
+	if err := d.syncFile(d.file); err != nil {
+		return d.markWriteUnavailable(fmt.Errorf("sync lineage log: %w", err))
+	}
+	if err := d.refreshLineageLocked(); err != nil {
+		d.suspendLineagePublicationLocked(err)
+		return err
+	}
+	if d.lineageAutoSuppressed {
+		d.lineageAutoSuppressed = false
+		util.Info("lineage publication recovered partition=%s tail=%d", d.BaseName, d.lineage.tail.EndOffset)
+	}
+	return nil
+}
+
+// updateLineageAfterSyncLocked is called under mu and ioMu after log sync.
+// A derived publication failure cannot undo an acknowledged durable log write.
+// It invalidates the cache; proof APIs must rebuild and successfully publish
+// before exposing any further evidence.
+func (d *DiskHandler) updateLineageAfterSyncLocked() {
+	if d.lineageAutoSuppressed || d.writeAvailabilityError() != nil {
+		return
+	}
+	if err := d.refreshLineageLocked(); err != nil {
+		d.suspendLineagePublicationLocked(err)
+	}
+}
+
+// suspendLineagePublicationLocked requires mu and ioMu. Do not repeatedly scan
+// retained history on every append/idle sync while a sidecar remains unavailable.
+// Proof calls still retry explicitly and never serve an unpublished cache.
+func (d *DiskHandler) suspendLineagePublicationLocked(err error) {
+	d.lineage = nil
+	if d.lineageAutoSuppressed {
+		return
+	}
+	d.lineageAutoSuppressed = true
+	if errors.Is(err, ErrLineageUnsupported) {
+		util.Debug("lineage publication suspended partition=%s reason=%v", d.BaseName, err)
+	} else {
+		util.Warn("lineage publication suspended partition=%s reason=%v", d.BaseName, err)
+	}
+}
+
+// refreshLineageLocked requires mu and ioMu after data sync. It advances only
+// newly durable records, or rebuilds from retained records after invalidation.
+func (d *DiskHandler) refreshLineageLocked() (err error) {
+	defer func() {
+		if err != nil {
+			d.lineage = nil
+		}
+	}()
+	if len(d.segments) == 0 {
+		return ErrLineageUnsupported
+	}
+	// Compacted ranges can contain logical holes at either edge, including an
+	// entirely empty physical segment. Conservatively defer all marked ranges.
+	d.compactionMu.RLock()
+	compacted := len(d.compactedSegments) != 0
+	d.compactionMu.RUnlock()
+	if compacted {
+		return ErrLineageUnsupported
+	}
+	tail := atomic.LoadUint64(&d.FlushedOffset)
+	index := d.lineage
+	path := d.BaseName + ".lineage"
+	info, statErr := os.Stat(path)
+	if index != nil && (statErr != nil || index.info == nil || info.Size() != index.info.Size() || !info.ModTime().Equal(index.info.ModTime()) || !os.SameFile(info, index.info)) {
+		index = nil
+	}
+	if index != nil && (index.start != d.segments[0] || tail < index.tail.EndOffset) {
+		index = nil
+	}
+	fresh := index == nil
+	if fresh {
+		start := d.segments[0]
+		cursor := lineageCursor{EndOffset: start, Segment: start, Digest: lineageSeed(start)}
+		index = &lineageIndex{start: start, tail: cursor, checkpoints: []lineageCursor{cursor}}
+	}
+	if !fresh && index.tail.EndOffset == tail {
+		return nil
+	}
+	var events []lineageJournalRecord
+	cursor, err := d.scanLineageLocked(index.tail, tail, func(message types.DiskMessage, next lineageCursor) {
+		if len(index.epochs) == 0 || index.epochs[len(index.epochs)-1].LeaderEpoch != message.LeaderEpoch {
+			if len(index.epochs) != 0 {
+				span := index.epochs[len(index.epochs)-1]
+				events = append(events, lineageJournalRecord{Kind: 3, StartOffset: span.StartOffset, EndOffset: span.EndOffset, LeaderEpoch: span.LeaderEpoch})
+			}
+			index.epochs = append(index.epochs, LineageEpochSpan{StartOffset: message.Offset, LeaderEpoch: message.LeaderEpoch})
+		}
+		index.epochs[len(index.epochs)-1].EndOffset = next.EndOffset
+		if (next.EndOffset-index.start)%lineageCheckpointInterval == 0 {
+			index.checkpoints = append(index.checkpoints, next)
+			events = append(events, lineageJournalRecord{Kind: 2, StartOffset: index.start, EndOffset: next.EndOffset, Segment: next.Segment, Position: next.Position, Digest: next.Digest})
+		}
+	})
+	if err != nil {
+		return err
+	}
+	index.tail = cursor
+	if err := publishLineage(path, index, fresh, events); err != nil {
+		return fmt.Errorf("publish derived lineage: %w", err)
+	}
+	d.lineage = index
+	return nil
+}
+
+// publishLineage appends sparse events and replaces the constant-size tail slot,
+// syncing before updating the cache's file identity. The caller owns mu/ioMu.
+func publishLineage(path string, index *lineageIndex, fresh bool, events []lineageJournalRecord) error {
+	flags := os.O_CREATE | os.O_RDWR
+	if fresh {
+		flags |= os.O_TRUNC
+	}
+	// #nosec G304 -- path is the partition-owned derived index.
+	f, err := os.OpenFile(path, flags, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	tail := lineageJournalRecord{Kind: 1, StartOffset: index.start, EndOffset: index.tail.EndOffset, Segment: index.tail.Segment, Position: index.tail.Position, Digest: index.tail.Digest}
+	if len(index.epochs) != 0 {
+		span := index.epochs[len(index.epochs)-1]
+		tail.LeaderEpoch, tail.EpochStart = span.LeaderEpoch, span.StartOffset
+	}
+	encodedTail := lineageRecordBytes(tail)
+	if fresh {
+		if _, err := f.Write(append([]byte(lineageMagic), make([]byte, len(encodedTail))...)); err != nil {
+			return err
+		}
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		return err
+	}
+	for _, event := range events {
+		if _, err := f.Write(lineageRecordBytes(event)); err != nil {
+			return err
+		}
+	}
+	if _, err := f.WriteAt(encodedTail, int64(len(lineageMagic))); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if fresh {
+		if err := syncDirectory(filepath.Dir(path)); err != nil {
+			return err
+		}
+	}
+	// Windows may finalize last-write metadata only when the write handle closes.
+	// Capture it afterwards so normal appends do not look like sidecar damage.
+	if err := f.Close(); err != nil {
+		return err
+	}
+	index.info, err = os.Stat(path)
+	return err
+}
+
+// lineagePrefixLocked requires mu/ioMu and an endpoint inside the prepared index.
+// A checkpoint bounds the remaining canonical record scan to fewer than 256 records.
+func (d *DiskHandler) lineagePrefixLocked(end uint64) (LineagePrefix, error) {
+	index := d.lineage
+	cursor := index.tail
+	if end != cursor.EndOffset {
+		i := sort.Search(len(index.checkpoints), func(i int) bool { return index.checkpoints[i].EndOffset > end })
+		cursor = index.checkpoints[i-1]
+		var err error
+		cursor, err = d.scanLineageLocked(cursor, end, nil)
+		if err != nil {
+			return LineagePrefix{}, err
+		}
+	}
+	return LineagePrefix{StartOffset: index.start, EndOffset: end, Digest: hex.EncodeToString(cursor.Digest[:])}, nil
+}
+
+// scanLineageLocked starts at an indexed physical cursor, never rescanning the
+// retained prefix. mu/ioMu keep segment membership and active bytes stable.
+func (d *DiskHandler) scanLineageLocked(cursor lineageCursor, end uint64, visit func(types.DiskMessage, lineageCursor)) (lineageCursor, error) {
+	if cursor.EndOffset == end {
+		return cursor, nil
+	}
+	first := sort.Search(len(d.segments), func(i int) bool { return d.segments[i] >= cursor.Segment })
+	for i := first; i < len(d.segments); i++ {
+		segment := d.segments[i]
+		position := int64(0)
+		if segment == cursor.Segment {
+			position = cursor.Position
+		}
+		// #nosec G304 -- segment paths are generated beneath the partition root.
+		f, err := os.Open(d.GetSegmentPath(segment))
+		if err != nil {
+			return cursor, err
+		}
+		if _, err := f.Seek(position, io.SeekStart); err != nil {
+			_ = f.Close()
+			return cursor, err
+		}
+		reader := bufio.NewReader(f)
+		for cursor.EndOffset < end {
+			var length [4]byte
+			if _, err := io.ReadFull(reader, length[:]); err != nil {
+				if err == io.EOF {
+					break
+				}
+				_ = f.Close()
+				return cursor, err
+			}
+			size := binary.BigEndian.Uint32(length[:])
+			if size == 0 || size > MaxMessageSize {
+				_ = f.Close()
+				return cursor, fmt.Errorf("invalid lineage record size %d", size)
+			}
+			payload := make([]byte, size)
+			if _, err := io.ReadFull(reader, payload); err != nil {
+				_ = f.Close()
+				return cursor, err
+			}
+			message, err := util.DeserializeDiskMessage(payload)
+			if err != nil {
+				_ = f.Close()
+				return cursor, err
+			}
+			if message.Offset != cursor.EndOffset || message.Offset == math.MaxUint64 {
+				_ = f.Close()
+				return cursor, ErrLineageUnsupported
+			}
+			digest, err := lineageHash(cursor.Digest, message)
+			if err != nil {
+				_ = f.Close()
+				return cursor, err
+			}
+			position += int64(size) + 4
+			cursor = lineageCursor{EndOffset: message.Offset + 1, Segment: segment, Position: position, Digest: digest}
+			if visit != nil {
+				visit(message, cursor)
+			}
+		}
+		_ = f.Close()
+		if cursor.EndOffset == end {
+			return cursor, nil
+		}
+	}
+	return cursor, ErrLineageUnsupported
+}

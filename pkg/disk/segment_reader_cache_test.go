@@ -83,7 +83,12 @@ func TestRetentionRenameInvalidatesCachedSegmentMapping(t *testing.T) {
 	closedBase := handler.segments[0]
 	closedPath := handler.GetSegmentPath(closedBase)
 
-	require.NoError(t, handler.markAsDeleted(closedPath))
+	handler.maintenanceMu.Lock()
+	handler.mu.Lock()
+	err := handler.markAsDeletedLocked(closedPath)
+	handler.mu.Unlock()
+	handler.maintenanceMu.Unlock()
+	require.NoError(t, err)
 	require.Zero(t, handler.segmentReaders.stats().Entries)
 	require.NoFileExists(t, closedPath)
 }

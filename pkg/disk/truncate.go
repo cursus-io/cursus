@@ -66,6 +66,7 @@ func (d *DiskHandler) TruncateTo(nextOffset uint64) error {
 	if err != nil {
 		return err
 	}
+	d.lineage = nil
 
 	if d.writer != nil {
 		if err := d.writer.Flush(); err != nil {
@@ -144,6 +145,7 @@ func (d *DiskHandler) TruncateTo(nextOffset uint64) error {
 	if err := d.openIndexFiles(); err != nil {
 		return fmt.Errorf("reopen truncated index: %w", err)
 	}
+	d.updateLineageAfterSyncLocked()
 	return nil
 }
 

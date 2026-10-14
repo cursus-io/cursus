@@ -161,8 +161,25 @@ and legacy records encountered while scanning the source. Each subsequent
 request must prove the preceding prefix before records can be transferred;
 the authoritative source log is never truncated. Storage or checksum failures,
 unavailable prefix records, stale fences, and invalid committed HWMs still stop
-recovery. Durable lineage indexes and bootstrap for prefixes removed by
+recovery. Indexed protocol negotiation and bootstrap for prefixes removed by
 retention remain follow-up work in #246.
+
+Each partition now maintains a derived `partition_N.lineage` sidecar. It stores
+checksummed leader-epoch spans and cumulative record-hash checkpoints after log
+sync. A zero leader epoch remains unknown history. Prefix hashes cover the whole
+retained interval, so an equal last record cannot hide earlier divergence.
+Checkpoints are sparse (one per 256 records), and the durable tail uses a fixed
+slot rather than growing the file on every append.
+
+The log remains authoritative. Startup rebuilds the sidecar from retained records
+without rewriting them; startup work is proportional to retained history.
+Missing, stale, damaged and unsupported sidecars are rebuilt in the same way.
+Retention changes the prefix anchor, and truncation or compaction invalidates
+previous evidence. Marked compacted histories continue using the existing
+compacted recovery path. A sidecar publication failure does not reverse a
+successful durable append, but no indexed proof is returned until publication
+can succeed. The existing wire protocol still uses record digests until the
+negotiated indexed-recovery layer is enabled.
 
 The same-epoch restart regression commits a replacement on the two surviving
 brokers before restarting a divergent follower, then checks exact raw-record
