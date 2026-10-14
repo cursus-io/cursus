@@ -423,3 +423,13 @@ func (si *StreamIndex) Close() error {
 	}
 	return firstErr
 }
+
+// Sync durably flushes both populated index files before bootstrap publication.
+func (si *StreamIndex) Sync() error {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+	if err := si.indexFile.Sync(); err != nil {
+		return err
+	}
+	return si.sidecarFile.Sync()
+}
