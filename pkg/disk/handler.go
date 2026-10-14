@@ -74,8 +74,12 @@ type DiskHandler struct {
 	compactionStateMu sync.Mutex
 	compactionFailure string
 	segmentReaders    *segmentReaderCache
-	mu                sync.Mutex // metadata(offset, segment), file handler(d.file)
-	ioMu              sync.Mutex // bufio.Writer, flush
+	mu                sync.Mutex    // metadata(offset, segment), file handler(d.file)
+	ioMu              sync.Mutex    // bufio.Writer, flush
+	lineage           *lineageIndex // protected by mu; publication also holds ioMu
+	// A nil index remains uninitialized until an explicit proof request. Failed
+	// background publication also waits for explicit recovery. Protected by mu.
+	lineageAutoSuppressed bool
 
 	// appendMu serializes automatic offset allocation through its write.
 	appendMu sync.Mutex
@@ -377,6 +381,8 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		dh.segments = append(dh.segments, currentSegmentBase)
 	}
 	sort.Slice(dh.segments, func(i, j int) bool { return dh.segments[i] < dh.segments[j] })
+	// Leave lineage uninitialized: only an explicit proof request may rebuild
+	// it from retained records. Startup never trusts or hashes an old sidecar.
 
 	dh.shutdown.Add(2)
 	go func() {

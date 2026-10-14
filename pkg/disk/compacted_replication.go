@@ -57,6 +57,7 @@ func (d *DiskHandler) WriteCompactedReplicaRange(startOffset, endOffset uint64, 
 	defer d.mu.Unlock()
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
+	d.lineage = nil
 	if d.CurrentSegment != startOffset || d.CurrentOffset != 0 {
 		if err := d.rotateSegment(startOffset); err != nil {
 			return fmt.Errorf("roll compacted replica range start: %w", err)

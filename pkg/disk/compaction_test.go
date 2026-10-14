@@ -355,7 +355,12 @@ func TestRetentionRemovesCompactionMarker(t *testing.T) {
 	markerPath := compactionMarkerPath(logPath, info.Size())
 	require.FileExists(t, markerPath)
 
-	require.NoError(t, handler.markAsDeleted(logPath))
+	handler.maintenanceMu.Lock()
+	handler.mu.Lock()
+	err = handler.markAsDeletedLocked(logPath)
+	handler.mu.Unlock()
+	handler.maintenanceMu.Unlock()
+	require.NoError(t, err)
 	require.NoFileExists(t, markerPath)
 	require.False(t, handler.segmentAllowsOffsetGaps(closedSegment, info.Size()))
 }

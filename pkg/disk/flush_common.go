@@ -109,6 +109,7 @@ func (d *DiskHandler) syncLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			d.mu.Lock()
 			d.ioMu.Lock()
 			syncSuccess := false
 
@@ -131,7 +132,11 @@ func (d *DiskHandler) syncLoop() {
 			}
 
 			currentOffset := atomic.LoadUint64(&d.AbsoluteOffset)
+			if syncSuccess {
+				d.updateLineageAfterSyncLocked()
+			}
 			d.ioMu.Unlock()
+			d.mu.Unlock()
 
 			if syncSuccess {
 				d.notifySync(currentOffset)
@@ -281,6 +286,9 @@ func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error
 
 	// Update flushed offset so readers know data is on disk
 	atomic.StoreUint64(&d.FlushedOffset, newAbsOffset)
+	if d.lineage != nil && batch[0].Offset < d.lineage.tail.EndOffset {
+		d.lineage = nil
+	}
 
 	return nil
 }
@@ -407,6 +415,9 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 			d.lastIndexPosition = msgPosition
 			d.indexBytesWritten += uint64(types.IndexEntrySize)
 		}
+	}
+	if d.lineage != nil && msg.Offset < d.lineage.tail.EndOffset {
+		d.lineage = nil
 	}
 	return nil
 }

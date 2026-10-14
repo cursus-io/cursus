@@ -220,7 +220,7 @@ func (d *DiskHandler) EnforceRetention(cfg *config.Config) {
 		isOverCapacity := limits.bytes > 0 && totalSize > limits.bytes
 		if isExpired || isOverCapacity {
 			fileSize := meta.info.Size()
-			if err := d.markAsDeleted(meta.path); err == nil {
+			if err := d.markAsDeletedLocked(meta.path); err == nil {
 				totalSize -= fileSize
 			} else {
 				util.Debug("retention failed to delete %s: %v", meta.path, err)
@@ -230,7 +230,9 @@ func (d *DiskHandler) EnforceRetention(cfg *config.Config) {
 	}
 }
 
-func (d *DiskHandler) markAsDeleted(logPath string) error {
+// markAsDeletedLocked requires maintenanceMu and mu to serialize segment
+// membership, reader invalidation and derived lineage with concurrent syncs.
+func (d *DiskHandler) markAsDeletedLocked(logPath string) error {
 	prefix := d.BaseName + "_segment_"
 	if !strings.HasPrefix(logPath, prefix) || !strings.HasSuffix(logPath, ".log") {
 		return fmt.Errorf("invalid segment path: %s", logPath)
@@ -243,6 +245,7 @@ func (d *DiskHandler) markAsDeleted(logPath string) error {
 	if err := d.segmentReaders.invalidate(segmentOffset); err != nil {
 		return fmt.Errorf("invalidate retained segment %d reader: %w", segmentOffset, err)
 	}
+	d.lineage = nil
 
 	deletedLogPath := logPath + ".deleted"
 	indexPath := logPath[:len(logPath)-4] + ".index"
