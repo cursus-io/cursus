@@ -11,7 +11,7 @@ import (
 // any acquired locks in reverse order, including while queued behind maintenance.
 // Only the context-aware proof APIs use this; ordinary mutation ordering stays
 // unchanged. The retry timer is allocated only when a lock is contended.
-func lockProofContext(ctx context.Context, locks ...*sync.Mutex) (func(), error) {
+func lockProofContext(ctx context.Context, locks ...proofMutex) (func(), error) {
 	acquired := 0
 	unlock := func() {
 		for acquired > 0 {
@@ -67,3 +67,13 @@ func (d *DiskHandler) flushProofContext(ctx context.Context) error {
 		return nil
 	}
 }
+
+// proofReadMutex adapts a read lock to the same cancellable acquisition loop.
+type proofMutex interface {
+	TryLock() bool
+	Unlock()
+}
+type proofReadMutex struct{ mu *sync.RWMutex }
+
+func (m proofReadMutex) TryLock() bool { return m.mu.TryRLock() }
+func (m proofReadMutex) Unlock()       { m.mu.RUnlock() }

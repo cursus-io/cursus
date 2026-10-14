@@ -205,7 +205,23 @@ func (sd *serviceDiscovery) HandleHeartbeat(nodeID string, proofs []fsm.ISRCatch
 	return manager.SubmitCatchupProofs(nodeID, proofs)
 }
 
+// ContextReplicaCatchupSource is optional for compatibility with existing service
+// discovery implementations. The production service always implements it.
+type ContextReplicaCatchupSource interface {
+	FetchReplicaCatchupContext(context.Context, fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error)
+}
+
 func (sd *serviceDiscovery) FetchReplicaCatchup(request fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error) {
+	return sd.FetchReplicaCatchupContext(context.Background(), request)
+}
+
+func (sd *serviceDiscovery) FetchReplicaCatchupContext(ctx context.Context, request fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error) {
+	if ctx == nil {
+		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("catch-up requires context")
+	}
+	if err := ctx.Err(); err != nil {
+		return fsm.ReplicaCatchupBatch{}, err
+	}
 	if sd.fsm == nil {
 		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("FSM is unavailable")
 	}
@@ -220,7 +236,7 @@ func (sd *serviceDiscovery) FetchReplicaCatchup(request fsm.ReplicaCatchupReques
 	if sourceBroker != sd.brokerID {
 		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("broker %s is not selected catch-up source %s", sd.brokerID, sourceBroker)
 	}
-	return sd.fsm.FetchReplicaCatchup(request)
+	return sd.fsm.FetchReplicaCatchupContext(ctx, request)
 }
 
 func (sd *serviceDiscovery) AddNode(nodeID string, addr string) (string, error) {
