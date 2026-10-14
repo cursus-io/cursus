@@ -16,6 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestReplicaRecoveryWithoutLaterEpochBoundary verifies a divergent follower
+// rejoins ISR without a later source epoch and retains its repaired log on restart.
 func TestReplicaRecoveryWithoutLaterEpochBoundary(t *testing.T) {
 	if os.Getenv("RUN_E2E_CHAOS") != "1" {
 		t.Skip("set RUN_E2E_CHAOS=1 to run missing epoch boundary recovery validation")
@@ -25,6 +27,10 @@ func TestReplicaRecoveryWithoutLaterEpochBoundary(t *testing.T) {
 	defer ctx.Cleanup()
 	actions := ctx.WhenCluster().StartCluster()
 	sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "CREATE topic="+history+" partitions=1 replication_factor=3")
+	requireClusterDefinitionEventually(t, ctx.GetBrokerAddrs(), history, map[string]string{
+		"revision": "1", "lifecycle_epoch": "1", "replication_factor": "3",
+	})
+	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), history, 0)
 	client := e2e.NewBrokerClient(ctx.GetBrokerAddrs())
 	defer client.Close()
 	require.NoError(t, client.PublishIdempotentToPartition(history, "seed", 0, 1, 0, "common", "all", true))
@@ -113,6 +119,8 @@ func TestReplicaRecoveryWithoutLaterEpochBoundary(t *testing.T) {
 	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), history, 4)
 }
 
+// readReplicaEpochBoundaryRecords reads authenticated raw records from the
+// selected ISR member so replica equality includes persisted recovery metadata.
 func readReplicaEpochBoundaryRecords(t *testing.T, addrs []string, topicName string, node, epoch int) []types.Message {
 	t.Helper()
 	client := e2e.NewBrokerClient(addrs)

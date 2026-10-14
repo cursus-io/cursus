@@ -623,6 +623,9 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 	})
 }
 
+// replicaLeaderEpochEndOffset finds a later retained epoch before the follower's
+// tail. Missing epoch metadata is distinguished from unreadable storage so only
+// the former permits digest-based rollback.
 func (f *BrokerFSM) replicaLeaderEpochEndOffset(topicName string, partitionID int, leaderEpoch int64, before uint64) (uint64, error) {
 	if leaderEpoch <= 0 {
 		return 0, fmt.Errorf("%w: legacy record has no leader epoch", errReplicaEpochBoundaryUnavailable)

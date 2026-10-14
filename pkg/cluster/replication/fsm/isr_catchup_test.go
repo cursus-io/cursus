@@ -206,6 +206,8 @@ func TestAdvanceReplicaCatchupRequestMovesBoundaryAndPrefixProof(t *testing.T) {
 	require.Equal(t, uint64(3), request.NextOffset)
 }
 
+// TestBuildReplicaCatchupRequestsTruncatesTailWithoutPublishingHWM keeps local
+// visibility fenced until the retained prefix has been verified.
 func TestBuildReplicaCatchupRequestsTruncatesTailWithoutPublishingHWM(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
@@ -251,6 +253,8 @@ func TestBuildReplicaCatchupRequestsTruncatesTailWithoutPublishingHWM(t *testing
 	require.Equal(t, uint64(1), partition.GetHWM())
 }
 
+// TestBuildReplicaCatchupRequestsNeverTruncatesInISRAppendTail protects appends
+// that race an ISR member's metadata snapshot.
 func TestBuildReplicaCatchupRequestsNeverTruncatesInISRAppendTail(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
@@ -305,6 +309,8 @@ func TestBuildReplicaCatchupRequestsRepairsLaggingMetadataLeaderFromActiveISR(t 
 	require.Equal(t, "127.0.0.1:9000", requests[0].SourceAddress)
 }
 
+// TestFetchReplicaCatchupReturnsBoundedRawCommittedRange verifies epoch jumps,
+// fallback, response integrity, and authoritative source selection.
 func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
@@ -396,6 +402,8 @@ func TestFetchReplicaCatchupReturnsBoundedRawCommittedRange(t *testing.T) {
 	require.NoError(t, ValidateReplicaCatchupBatchDigest(batch))
 }
 
+// TestFetchReplicaCatchupWalksBackDivergentTailWithoutEpochBoundary verifies each
+// rollback proves the next prefix before authoritative records are returned.
 func TestFetchReplicaCatchupWalksBackDivergentTailWithoutEpochBoundary(t *testing.T) {
 	for _, tc := range []struct {
 		name                       string
@@ -435,6 +443,11 @@ func TestFetchReplicaCatchupWalksBackDivergentTailWithoutEpochBoundary(t *testin
 				Replicas: []string{"node-1", "node-2"}, ISR: []string{"node-1"},
 			}
 			brokerFSM.mu.Unlock()
+
+			if tc.followerEpoch == 0 {
+				_, err := brokerFSM.replicaLeaderEpochEndOffset("orders", 0, 0, 3)
+				require.ErrorIs(t, err, errReplicaEpochBoundaryUnavailable)
+			}
 
 			request := ReplicaCatchupRequest{
 				Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 3, CommittedHWM: 3,
@@ -488,6 +501,8 @@ func TestFetchReplicaCatchupRejectsPrefixProofAtOffsetZero(t *testing.T) {
 	require.ErrorContains(t, err, "offset zero")
 }
 
+// TestFetchReplicaCatchupCarriesCompactedOffsetRange preserves logical offsets
+// when compaction has removed superseded physical records.
 func TestFetchReplicaCatchupCarriesCompactedOffsetRange(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

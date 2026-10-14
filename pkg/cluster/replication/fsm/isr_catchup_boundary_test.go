@@ -16,6 +16,7 @@ type epochBoundaryStorage struct {
 	read func(uint64, int) ([]types.Message, error)
 }
 
+// ReadMessages injects failures at the prefix proof or the earlier epoch scan.
 func (s *epochBoundaryStorage) ReadMessages(offset uint64, max int) ([]types.Message, error) {
 	if s.read != nil {
 		return s.read(offset, max)
@@ -28,10 +29,12 @@ type epochBoundaryProvider struct {
 	storage *epochBoundaryStorage
 }
 
+// GetHandler uses the same fault wrapper for callers without an explicit policy.
 func (p *epochBoundaryProvider) GetHandler(name string, partition int) (types.StorageHandler, error) {
 	return p.GetHandlerWithPolicy(name, partition, config.CleanupPolicyDelete, 0, 0)
 }
 
+// GetHandlerWithPolicy wraps real disk storage while preserving its cleanup policy.
 func (p *epochBoundaryProvider) GetHandlerWithPolicy(name string, partition int, policy string, hours int, bytes int64) (types.StorageHandler, error) {
 	handler, err := p.DiskManager.GetHandlerWithPolicy(name, partition, policy, hours, bytes)
 	if err != nil {
@@ -41,6 +44,8 @@ func (p *epochBoundaryProvider) GetHandlerWithPolicy(name string, partition int,
 	return p.storage, nil
 }
 
+// TestFetchReplicaCatchupDoesNotFallbackOnReadOrFenceFailure ensures unavailable
+// epoch metadata does not turn storage failures or stale authority into rollback.
 func TestFetchReplicaCatchupDoesNotFallbackOnReadOrFenceFailure(t *testing.T) {
 	readFailure := errors.New("injected storage checksum failure")
 	for _, tc := range []struct {
