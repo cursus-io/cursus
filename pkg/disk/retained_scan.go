@@ -18,15 +18,12 @@ func (d *DiskHandler) ScanRetainedRange(ctx context.Context, start, end uint64, 
 	if ctx == nil || visit == nil {
 		return fmt.Errorf("retained scan requires context and visitor")
 	}
-	d.maintenanceMu.Lock()
-	defer d.maintenanceMu.Unlock()
-	d.appendMu.Lock()
-	defer d.appendMu.Unlock()
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.ioMu.Lock()
-	defer d.ioMu.Unlock()
-	_, err := d.scanRetainedRangeLocked(ctx, start, end, func(m types.DiskMessage) error { return visit(retainedMessage(m)) })
+	unlock, err := lockProofContext(ctx, &d.maintenanceMu, &d.appendMu, &d.mu, &d.ioMu)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	_, err = d.scanRetainedRangeLocked(ctx, start, end, func(m types.DiskMessage) error { return visit(retainedMessage(m)) })
 	return err
 }
 
