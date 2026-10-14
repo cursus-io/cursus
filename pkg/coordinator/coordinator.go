@@ -14,13 +14,23 @@ import (
 
 // Coordinator manages consumer groups, membership, heartbeats, and partition assignment.
 type Coordinator struct {
-	groups           map[string]*GroupMetadata // All consumer groups
-	mu               sync.RWMutex              // Global lock for coordinator state
-	lifecycleMu      sync.Mutex                // Serializes durable group lifecycle transitions
-	lifecyclePending map[string]bool           // Groups whose durable lifecycle write is in progress
-	cfg              *config.Config            // Configuration reference
-	ctx              context.Context
-	cancel           context.CancelFunc
+	// Lock order: authorityMu -> lifecycleMu -> mu -> group.mu. Provenance is
+	// copied only after group locks are released; writers may hold those locks.
+	authorityMu              sync.Mutex
+	stateImportGeneration    uint64 // Guarded by mu; fences publications/scans begun before import.
+	raftCompatibility        *Coordinator
+	raftCompatibilityKnown   bool
+	provenanceMu             sync.Mutex
+	metadataSources          map[string]map[int]struct{}
+	metadataSourcesKnown     bool
+	offsetRecordWriterRouted bool
+	groups                   map[string]*GroupMetadata // All consumer groups
+	mu                       sync.RWMutex              // Global lock for coordinator state
+	lifecycleMu              sync.Mutex                // Serializes durable group lifecycle transitions
+	lifecyclePending         map[string]bool           // Groups whose durable lifecycle write is in progress
+	cfg                      *config.Config            // Configuration reference
+	ctx                      context.Context
+	cancel                   context.CancelFunc
 
 	topicHandler              TopicHandler
 	offsetTopic               string
@@ -91,6 +101,7 @@ type TransactionalOffsetResolver interface {
 func (c *Coordinator) SetOffsetRecordWriter(writer func(ConsumerMetadataRecord) error) {
 	c.offsetRecordWriterMu.Lock()
 	c.offsetRecordWriter = writer
+	c.offsetRecordWriterRouted = false
 	c.offsetRecordWriterMu.Unlock()
 }
 
@@ -262,6 +273,10 @@ func newCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandle
 	childCtx, cancel := context.WithCancel(ctx)
 	standalone := cfg == nil || !cfg.EnabledDistribution
 	c := &Coordinator{
+		raftCompatibility:         newCompatibilityCoordinator(),
+		raftCompatibilityKnown:    true,
+		metadataSources:           make(map[string]map[int]struct{}),
+		metadataSourcesKnown:      true,
 		groups:                    make(map[string]*GroupMetadata),
 		lifecyclePending:          make(map[string]bool),
 		cfg:                       cfg,
@@ -310,6 +325,11 @@ func newCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandle
 		}
 		c.migrationRecords = append([]ConsumerMetadataRecord(nil), records...)
 		c.migrationAuthoritative = authoritative
+		// Migration records and selection do not prove physical partition history.
+		// Only an explicit recovery envelope can restore that authority.
+		if len(records) != 0 || authoritative {
+			c.markConsumerMetadataSourcesUnknown()
+		}
 	}
 	if reader, ok := handler.(OffsetLogReader); ok {
 		if c.standalone {
@@ -849,11 +869,26 @@ func (gm *GroupMetadata) storeOffsetMonotonic(groupName, topic string, partition
 
 // ExportState returns a serializable snapshot of all consumer groups.
 func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
+	return c.exportState(nil)
+}
+
+func (c *Coordinator) exportState(onlyGroup *string) map[string]*GroupStateSnapshot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	result := make(map[string]*GroupStateSnapshot, len(c.groupEpochs))
-	for name, group := range c.groups {
+	groups, epochs := c.groups, c.groupEpochs
+	if onlyGroup != nil {
+		groups = make(map[string]*GroupMetadata, 1)
+		epochs = make(map[string]uint64, 1)
+		if group := c.groups[*onlyGroup]; group != nil {
+			groups[*onlyGroup] = group
+		}
+		if epoch, ok := c.groupEpochs[*onlyGroup]; ok {
+			epochs[*onlyGroup] = epoch
+		}
+	}
+	result := make(map[string]*GroupStateSnapshot, len(epochs))
+	for name, group := range groups {
 		group.mu.RLock()
 		snap := &GroupStateSnapshot{
 			TopicName:            group.TopicName,
@@ -892,8 +927,8 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 		group.mu.RUnlock()
 		result[name] = snap
 	}
-	for name, epoch := range c.groupEpochs {
-		if _, live := c.groups[name]; live {
+	for name, epoch := range epochs {
+		if _, live := groups[name]; live {
 			continue
 		}
 		result[name] = &GroupStateSnapshot{
@@ -906,12 +941,18 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 
 // ImportState restores consumer group state from a current-version snapshot.
 func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) error {
-	if err := ValidateImportState(state); err != nil {
-		return err
-	}
+	return c.ImportStateWithRecovery(state, nil)
+}
 
+// importStateValidated requires validation by the caller and never sets authority.
+func (c *Coordinator) importStateValidated(state map[string]*GroupStateSnapshot) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.importStateLocked(state)
+}
+
+func (c *Coordinator) importStateLocked(state map[string]*GroupStateSnapshot) error {
+	c.stateImportGeneration++
 
 	c.groups = make(map[string]*GroupMetadata, len(state))
 	c.groupEpochs = make(map[string]uint64, len(state))
