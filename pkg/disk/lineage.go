@@ -3,6 +3,7 @@ package disk
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -120,7 +121,7 @@ func (d *DiskHandler) LineageCandidates(tail uint64) ([]LineagePrefix, error) {
 	defer d.mu.Unlock()
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
-	if err := d.prepareLineageLocked(); err != nil {
+	if err := d.prepareLineageLocked(context.Background()); err != nil {
 		return nil, err
 	}
 	if tail < d.lineage.start || tail > d.lineage.tail.EndOffset {
@@ -129,7 +130,7 @@ func (d *DiskHandler) LineageCandidates(tail uint64) ([]LineagePrefix, error) {
 	ends := lineageCandidateEnds(d.lineage.start, tail)
 	proofs := make([]LineagePrefix, 0, len(ends))
 	for _, end := range ends {
-		proof, err := d.lineagePrefixLocked(end)
+		proof, err := d.lineagePrefixLocked(context.Background(), end)
 		if err != nil {
 			return nil, err
 		}
@@ -166,13 +167,13 @@ func (d *DiskHandler) VerifyLineagePrefix(prefix LineagePrefix, committedHWM uin
 	defer d.mu.Unlock()
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
-	if err := d.prepareLineageLocked(); err != nil {
+	if err := d.prepareLineageLocked(context.Background()); err != nil {
 		return false, err
 	}
 	if prefix.StartOffset != d.lineage.start || prefix.EndOffset > d.lineage.tail.EndOffset {
 		return false, nil
 	}
-	want, err := d.lineagePrefixLocked(prefix.EndOffset)
+	want, err := d.lineagePrefixLocked(context.Background(), prefix.EndOffset)
 	return err == nil && want == prefix, err
 }
 
@@ -180,25 +181,35 @@ func (d *DiskHandler) VerifyLineagePrefix(prefix LineagePrefix, committedHWM uin
 // with a single durability boundary and stable retained-log snapshot. A nil
 // match means no comparable proof, not permission to discard committed data.
 func (d *DiskHandler) MatchLineageCandidates(candidates []LineagePrefix, committedHWM uint64) (*LineagePrefix, error) {
+	return d.MatchLineageCandidatesContext(context.Background(), candidates, committedHWM)
+}
+
+// MatchLineageCandidatesContext bounds lock waits and initial derived-index rebuilds.
+func (d *DiskHandler) MatchLineageCandidatesContext(ctx context.Context, candidates []LineagePrefix, committedHWM uint64) (*LineagePrefix, error) {
+	if ctx == nil {
+		return nil, errors.New("lineage requires context")
+	}
 	if len(candidates) > 64 {
 		return nil, errors.New("too many lineage candidates")
 	}
-	d.maintenanceMu.Lock()
-	defer d.maintenanceMu.Unlock()
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.ioMu.Lock()
-	defer d.ioMu.Unlock()
-	if err := d.prepareLineageLocked(); err != nil {
+	unlock, err := lockProofContext(ctx, &d.maintenanceMu, &d.mu, &d.ioMu)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if err := d.prepareLineageLocked(ctx); err != nil {
 		return nil, err
 	}
 	ordered := append([]LineagePrefix(nil), candidates...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].EndOffset > ordered[j].EndOffset })
 	for _, candidate := range ordered {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if candidate.StartOffset != d.lineage.start || candidate.EndOffset < candidate.StartOffset || candidate.EndOffset > committedHWM || candidate.EndOffset > d.lineage.tail.EndOffset {
 			continue
 		}
-		proof, err := d.lineagePrefixLocked(candidate.EndOffset)
+		proof, err := d.lineagePrefixLocked(ctx, candidate.EndOffset)
 		if err != nil {
 			return nil, err
 		}
@@ -217,7 +228,7 @@ func (d *DiskHandler) LineageEpochs() ([]LineageEpochSpan, error) {
 	defer d.mu.Unlock()
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
-	if err := d.prepareLineageLocked(); err != nil {
+	if err := d.prepareLineageLocked(context.Background()); err != nil {
 		return nil, err
 	}
 	return append([]LineageEpochSpan(nil), d.lineage.epochs...), nil
@@ -226,14 +237,18 @@ func (d *DiskHandler) LineageEpochs() ([]LineageEpochSpan, error) {
 // prepareLineageLocked requires maintenanceMu, mu and ioMu. Explicit proof
 // requests retry a previously failed publication and resume automatic updates
 // only after the complete durable tail has been successfully indexed.
-func (d *DiskHandler) prepareLineageLocked() error {
-	if err := d.writeAvailabilityError(); err != nil {
+func (d *DiskHandler) prepareLineageLocked(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	select {
-	case <-d.done:
-		return errors.New("lineage handler is closed")
-	default:
+	unlockAvailability, err := lockProofContext(ctx, proofReadMutex{&d.writeFailureMu})
+	if err != nil {
+		return err
+	}
+	availabilityErr := d.proofAvailabilityLocked()
+	unlockAvailability()
+	if availabilityErr != nil {
+		return availabilityErr
 	}
 	if d.file == nil {
 		return errors.New("lineage log is closed")
@@ -244,7 +259,7 @@ func (d *DiskHandler) prepareLineageLocked() error {
 		return d.markWriteUnavailable(fmt.Errorf("sync lineage log: %w", err))
 	}
 	uninitialized := d.lineage == nil
-	if err := d.refreshLineageLocked(0); err != nil {
+	if err := d.refreshLineageLocked(ctx, 0); err != nil {
 		d.suspendLineagePublicationLocked(err)
 		return err
 	}
@@ -265,7 +280,7 @@ func (d *DiskHandler) updateLineageAfterSyncLocked() {
 	if d.lineage == nil || d.lineageAutoSuppressed || d.writeAvailabilityError() != nil {
 		return
 	}
-	if err := d.refreshLineageLocked(lineageBackgroundRecordLimit); err != nil {
+	if err := d.refreshLineageLocked(context.Background(), lineageBackgroundRecordLimit); err != nil {
 		d.suspendLineagePublicationLocked(err)
 	}
 }
@@ -289,20 +304,26 @@ func (d *DiskHandler) suspendLineagePublicationLocked(err error) {
 // refreshLineageLocked requires mu and ioMu after data sync. A zero record limit
 // permits explicit requests to initialize/rebuild and catch up completely. A
 // positive limit advances only a still-valid cache, bounding background work.
-func (d *DiskHandler) refreshLineageLocked(recordLimit uint64) (err error) {
+func (d *DiskHandler) refreshLineageLocked(ctx context.Context, recordLimit uint64) (err error) {
 	defer func() {
 		if err != nil {
 			d.lineage = nil
 		}
 	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(d.segments) == 0 {
 		return ErrLineageUnsupported
 	}
 	// Compacted ranges can contain logical holes at either edge, including an
 	// entirely empty physical segment. Conservatively defer all marked ranges.
-	d.compactionMu.RLock()
+	unlockCompaction, err := lockProofContext(ctx, proofReadMutex{&d.compactionMu})
+	if err != nil {
+		return err
+	}
 	compacted := len(d.compactedSegments) != 0
-	d.compactionMu.RUnlock()
+	unlockCompaction()
 	if compacted {
 		return ErrLineageUnsupported
 	}
@@ -337,7 +358,7 @@ func (d *DiskHandler) refreshLineageLocked(recordLimit uint64) (err error) {
 		tail = index.tail.EndOffset + recordLimit
 	}
 	var events []lineageJournalRecord
-	cursor, err := d.scanLineageLocked(index.tail, tail, func(message types.DiskMessage, next lineageCursor) {
+	cursor, err := d.scanLineageLocked(ctx, index.tail, tail, func(message types.DiskMessage, next lineageCursor) {
 		if len(index.epochs) == 0 || index.epochs[len(index.epochs)-1].LeaderEpoch != message.LeaderEpoch {
 			if len(index.epochs) != 0 {
 				span := index.epochs[len(index.epochs)-1]
@@ -355,8 +376,11 @@ func (d *DiskHandler) refreshLineageLocked(recordLimit uint64) (err error) {
 		return err
 	}
 	index.tail = cursor
-	if err := publishLineage(path, index, fresh, events); err != nil {
+	if err := publishLineage(ctx, path, index, fresh, events); err != nil {
 		return fmt.Errorf("publish derived lineage: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	d.lineage = index
 	return nil
@@ -393,7 +417,10 @@ func lineageHeaderMatches(path string, index *lineageIndex) bool {
 
 // publishLineage appends sparse events and replaces the constant-size tail slot,
 // syncing before updating the cache's file identity. The caller owns mu/ioMu.
-func publishLineage(path string, index *lineageIndex, fresh bool, events []lineageJournalRecord) error {
+func publishLineage(ctx context.Context, path string, index *lineageIndex, fresh bool, events []lineageJournalRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	flags := os.O_CREATE | os.O_RDWR
 	if fresh {
 		flags |= os.O_TRUNC
@@ -414,9 +441,15 @@ func publishLineage(path string, index *lineageIndex, fresh bool, events []linea
 		return err
 	}
 	for _, event := range events {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if _, err := f.Write(lineageRecordBytes(event)); err != nil {
 			return err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if _, err := f.WriteAt(encodedTail, int64(len(lineageMagic))); err != nil {
 		return err
@@ -440,14 +473,17 @@ func publishLineage(path string, index *lineageIndex, fresh bool, events []linea
 
 // lineagePrefixLocked requires mu/ioMu and an endpoint inside the prepared index.
 // A checkpoint bounds the remaining canonical record scan to fewer than 256 records.
-func (d *DiskHandler) lineagePrefixLocked(end uint64) (LineagePrefix, error) {
+func (d *DiskHandler) lineagePrefixLocked(ctx context.Context, end uint64) (LineagePrefix, error) {
+	if err := ctx.Err(); err != nil {
+		return LineagePrefix{}, err
+	}
 	index := d.lineage
 	cursor := index.tail
 	if end != cursor.EndOffset {
 		i := sort.Search(len(index.checkpoints), func(i int) bool { return index.checkpoints[i].EndOffset > end })
 		cursor = index.checkpoints[i-1]
 		var err error
-		cursor, err = d.scanLineageLocked(cursor, end, nil)
+		cursor, err = d.scanLineageLocked(ctx, cursor, end, nil)
 		if err != nil {
 			return LineagePrefix{}, err
 		}
@@ -457,12 +493,15 @@ func (d *DiskHandler) lineagePrefixLocked(end uint64) (LineagePrefix, error) {
 
 // scanLineageLocked starts at an indexed physical cursor, never rescanning the
 // retained prefix. mu/ioMu keep segment membership and active bytes stable.
-func (d *DiskHandler) scanLineageLocked(cursor lineageCursor, end uint64, visit func(types.DiskMessage, lineageCursor)) (lineageCursor, error) {
+func (d *DiskHandler) scanLineageLocked(ctx context.Context, cursor lineageCursor, end uint64, visit func(types.DiskMessage, lineageCursor)) (lineageCursor, error) {
 	if cursor.EndOffset == end {
 		return cursor, nil
 	}
 	first := sort.Search(len(d.segments), func(i int) bool { return d.segments[i] >= cursor.Segment })
 	for i := first; i < len(d.segments); i++ {
+		if err := ctx.Err(); err != nil {
+			return cursor, err
+		}
 		segment := d.segments[i]
 		position := int64(0)
 		if segment == cursor.Segment {
@@ -479,6 +518,10 @@ func (d *DiskHandler) scanLineageLocked(cursor lineageCursor, end uint64, visit 
 		}
 		reader := bufio.NewReader(f)
 		for cursor.EndOffset < end {
+			if err := ctx.Err(); err != nil {
+				_ = f.Close()
+				return cursor, err
+			}
 			var length [4]byte
 			if _, err := io.ReadFull(reader, length[:]); err != nil {
 				if err == io.EOF {

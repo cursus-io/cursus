@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -495,4 +496,33 @@ func TestServiceDiscoveryReplicaCatchupSourceAndFollowerReconcileFences(t *testi
 	rm.isLeader = false
 	sd.Reconcile()
 	assert.True(t, sd.leaderSince.IsZero())
+}
+
+// The service's first context check succeeds; the FSM fence must observe the
+// next cancellation. Calling the compatibility wrapper would lose this context.
+type catchupForwardContext struct {
+	context.Context
+	calls int
+}
+
+func (c *catchupForwardContext) Err() error {
+	c.calls++
+	if c.calls > 1 {
+		return context.Canceled
+	}
+	return nil
+}
+func TestServiceDiscoveryForwardsCatchupContextToFSM(t *testing.T) {
+	rm := new(ComprehensiveMockRaftManager)
+	rm.mockFSM = fsm.NewBrokerFSM(nil, nil)
+	metadata := fsm.PartitionMetadata{Leader: "leader", LeaderEpoch: 1, LifecycleEpoch: 1, CommittedHWMKnown: true, PartitionCount: 1, Replicas: []string{"leader", "follower"}, ISR: []string{"leader"}}
+	payload, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, rm.mockFSM.Apply(&raft.Log{Data: append([]byte("PARTITION:orders-0:"), payload...)}))
+	sd := NewServiceDiscoveryImpl(rm, "leader", "localhost:9001", "")
+	api, ok := any(sd).(ContextReplicaCatchupSource)
+	require.True(t, ok)
+	ctx := &catchupForwardContext{Context: context.Background()}
+	_, err = api.FetchReplicaCatchupContext(ctx, fsm.ReplicaCatchupRequest{Topic: "orders", Leader: "leader"})
+	require.ErrorIs(t, err, context.Canceled)
 }

@@ -1,6 +1,7 @@
 package fsm
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -128,4 +129,29 @@ func TestFetchReplicaCatchupDoesNotFallbackOnReadOrFenceFailure(t *testing.T) {
 			require.Equal(t, uint64(3), partition.GetHWM())
 		})
 	}
+}
+
+func (s *epochBoundaryStorage) CaptureContentGenerationContext(ctx context.Context) (disk.ContentGeneration, error) {
+	return s.StorageHandler.(*disk.DiskHandler).CaptureContentGenerationContext(ctx)
+}
+func (s *epochBoundaryStorage) CheckContentGenerationContext(ctx context.Context, g disk.ContentGeneration) error {
+	return s.StorageHandler.(*disk.DiskHandler).CheckContentGenerationContext(ctx, g)
+}
+func (s *epochBoundaryStorage) ReadRetainedPage(ctx context.Context, start, end uint64, n, b int) (disk.RetainedPage, error) {
+	// Preserve the existing read-fault seam, including injected empty reads.
+	if s.read != nil {
+		records, err := s.read(start, n)
+		if err != nil {
+			return disk.RetainedPage{}, err
+		}
+		if len(records) == 0 {
+			g, err := s.CaptureContentGenerationContext(ctx)
+			return disk.RetainedPage{EndOffset: start, ContentGeneration: g}, err
+		}
+	}
+	return s.StorageHandler.(*disk.DiskHandler).ReadRetainedPage(ctx, start, end, n, b)
+}
+
+func (s *epochBoundaryStorage) GetFirstOffsetContext(ctx context.Context) (uint64, error) {
+	return s.StorageHandler.(*disk.DiskHandler).GetFirstOffsetContext(ctx)
 }
