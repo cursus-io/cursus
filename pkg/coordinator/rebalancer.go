@@ -12,6 +12,11 @@ import (
 // RegisterGroup creates a new consumer group for a topic. Standalone success
 // means the versioned registration record has been synchronously persisted.
 func (c *Coordinator) RegisterGroup(topicName, groupName string, partitionCount int) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	return c.registerGroup(topicName, groupName, partitionCount, publishLifecycle)
 }
 
@@ -162,6 +167,11 @@ func (c *Coordinator) registerGroup(topicName, groupName string, partitionCount 
 // RegisterGroupSubscription durably registers a multi-topic or pattern-backed
 // group. The supplied topics are the concrete expansion used for assignment.
 func (c *Coordinator) RegisterGroupSubscription(groupName string, topics []string, pattern string, partitionCounts map[string]int) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	return c.registerGroupSubscription(groupName, topics, pattern, partitionCounts, publishLifecycle)
 }
 
@@ -293,6 +303,15 @@ func makePartitions(partitionCount int) []int {
 // DeleteGroup persists a lifecycle tombstone before removing in-memory state.
 // Repeated deletion of an already deleted group is idempotent.
 func (c *Coordinator) DeleteGroup(groupName string) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return c.deleteGroup(groupName)
+}
+
+func (c *Coordinator) deleteGroup(groupName string) error {
 	if groupName == "" {
 		return fmt.Errorf("group name must not be empty")
 	}
@@ -376,6 +395,11 @@ func (c *Coordinator) deleteGroupLocked(groupName, topicName string) error {
 
 // AddConsumer registers a new consumer in the group and triggers a rebalance.
 func (c *Coordinator) AddConsumer(groupName, consumerID string) ([]int, error) {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	return c.addConsumer(groupName, consumerID, publishLifecycle)
 }
 
@@ -433,6 +457,11 @@ func (c *Coordinator) addConsumer(groupName, consumerID string, mode lifecycleWr
 
 // RemoveConsumer unregisters a consumer and triggers a rebalance.
 func (c *Coordinator) RemoveConsumer(groupName, consumerID string) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
@@ -465,6 +494,11 @@ func (c *Coordinator) RemoveConsumer(groupName, consumerID string) error {
 // RemoveConsumerForGeneration prevents a stale session from removing a current
 // group member after ownership has moved to a newer generation.
 func (c *Coordinator) RemoveConsumerForGeneration(groupName, consumerID string, generation int) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	return c.removeConsumerForGeneration(groupName, consumerID, generation, publishLifecycle)
 }
 
@@ -500,6 +534,11 @@ func (c *Coordinator) removeConsumerForGeneration(groupName, consumerID string, 
 // one generation change. expectedGeneration makes metadata-log replay and retries
 // harmless after a concurrent membership change.
 func (c *Coordinator) ExpireConsumers(groupName string, expectedGeneration int, consumerIDs []string) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	return c.expireConsumers(groupName, expectedGeneration, consumerIDs, publishLifecycle)
 }
 
@@ -590,6 +629,11 @@ func (c *Coordinator) removeConsumerLocked(groupName, consumerID string) (int, i
 
 // Rebalance forces a rebalance for a consumer group.
 func (c *Coordinator) Rebalance(groupName string) {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return
+	}
+	defer release()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.rebalanceRange(groupName)
