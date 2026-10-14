@@ -54,6 +54,7 @@ func (c *Coordinator) applyHistorical(group string, apply func(*Coordinator) err
 	if err := apply(c); err != nil {
 		return err
 	}
+	c.authorityRevision++
 	if c.raftCompatibilityKnown {
 		candidate := newCompatibilityCoordinator()
 		if c.raftCompatibility == nil {
@@ -296,6 +297,7 @@ func (c *Coordinator) ImportStateWithRecovery(groups map[string]*GroupStateSnaps
 		return err
 	}
 	c.raftCompatibility = baseline
+	c.authorityRevision++
 	c.raftCompatibilityKnown = envelope != nil && envelope.RaftCompatibilityKnown
 	c.provenanceMu.Lock()
 	c.metadataSources = sources
