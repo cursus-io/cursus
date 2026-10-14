@@ -11,10 +11,15 @@ Canonical decoded records are hashed, so legacy disk encodings compare with thei
 re-encoded replicas. Hashes include all persisted record fields and offsets.
 Epoch zero is unknown history, never evidence of a common generation.
 
-Missing, damaged, stale or unsupported indexes rebuild from retained records.
-Rebuilding cannot rewrite committed log data. Append publication follows log
-durability; failed publication cannot expose evidence ahead of durable data.
-Truncation, retention, compaction and restart invalidate stale evidence. Proofs
+The first explicit proof request rebuilds a missing, damaged, stale or unsupported
+index from retained records. Startup and ordinary writes never rebuild history or
+synchronously publish the sidecar. Once initialized, periodic sync advances the
+index by at most 1,024 durable records per pass; invalidation suspends that work
+until another explicit proof request. Proof APIs sync the log, catch up the index
+and durably publish it before returning evidence. Failed publication fails closed
+and never reverses a successful durable append. Rebuilding cannot rewrite
+committed log data. Truncation, retention, compaction and restart invalidate stale
+evidence. Proofs
 cover explicit start/end offsets; different starts are not comparable. Compacted
 gaps require the existing compacted recovery path or a retained-range bootstrap.
 

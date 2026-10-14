@@ -77,8 +77,8 @@ type DiskHandler struct {
 	mu                sync.Mutex    // metadata(offset, segment), file handler(d.file)
 	ioMu              sync.Mutex    // bufio.Writer, flush
 	lineage           *lineageIndex // protected by mu; publication also holds ioMu
-	// An explicit proof request must recover a failed sidecar before automatic
-	// publication resumes. Protected by mu with lineage.
+	// A nil index remains uninitialized until an explicit proof request. Failed
+	// background publication also waits for explicit recovery. Protected by mu.
 	lineageAutoSuppressed bool
 
 	// appendMu serializes automatic offset allocation through its write.
@@ -381,11 +381,8 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		dh.segments = append(dh.segments, currentSegmentBase)
 	}
 	sort.Slice(dh.segments, func(i, j int) bool { return dh.segments[i] < dh.segments[j] })
-	// Rebuild even checksum-valid sidecars on restart: the retained log alone is
-	// authoritative. Unsupported compacted history remains on its existing path.
-	if err := dh.file.Sync(); err == nil {
-		dh.updateLineageAfterSyncLocked()
-	}
+	// Leave lineage uninitialized: only an explicit proof request may rebuild
+	// it from retained records. Startup never trusts or hashes an old sidecar.
 
 	dh.shutdown.Add(2)
 	go func() {

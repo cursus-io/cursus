@@ -164,21 +164,31 @@ unavailable prefix records, stale fences, and invalid committed HWMs still stop
 recovery. Indexed protocol negotiation and bootstrap for prefixes removed by
 retention remain follow-up work in #246.
 
-Each partition now maintains a derived `partition_N.lineage` sidecar. It stores
-checksummed leader-epoch spans and cumulative record-hash checkpoints after log
-sync. A zero leader epoch remains unknown history. Prefix hashes cover the whole
+Each partition can maintain a derived `partition_N.lineage` sidecar. It stores
+checksummed leader-epoch spans and cumulative record-hash checkpoints. A zero
+leader epoch remains unknown history. Prefix hashes cover the whole
 retained interval, so an equal last record cannot hide earlier divergence.
 Checkpoints are sparse (one per 256 records), and the durable tail uses a fixed
 slot rather than growing the file on every append.
 
-The log remains authoritative. Startup rebuilds the sidecar from retained records
-without rewriting them; startup work is proportional to retained history.
-Missing, stale, damaged and unsupported sidecars are rebuilt in the same way.
+The log remains authoritative. Startup leaves the sidecar uninitialized. The
+first explicit proof request rebuilds it from retained records without rewriting
+them; this request's work is proportional to retained history. Missing, stale,
+damaged and unsupported sidecars are rebuilt on explicit requests in the same way.
+Acknowledged writes, explicit flush, segment rotation and shutdown keep their log
+durability guarantees without synchronously publishing the sidecar. Once the
+index is initialized, periodic log sync advances it by at most 1,024 records per
+pass, so its durable tail can lag the log. Every proof API synchronizes the log,
+catches up the index and durably publishes the sidecar before returning evidence.
+
 Retention changes the prefix anchor, and truncation or compaction invalidates
-previous evidence. Marked compacted histories continue using the existing
-compacted recovery path. A sidecar publication failure does not reverse a
-successful durable append, but no indexed proof is returned until publication
-can succeed. The existing wire protocol still uses record digests until the
+previous evidence. Background publication never rebuilds an invalidated index;
+it waits for an explicit proof request. Marked compacted histories continue using
+the existing compacted recovery path. A sidecar publication failure suspends
+background updates and logs the transition once. It does not reverse a successful
+durable append, but no indexed proof is returned until explicit recovery can
+publish successfully. Recovery logs once and resumes bounded background updates.
+The existing wire protocol still uses record digests until the
 negotiated indexed-recovery layer is enabled.
 
 The same-epoch restart regression commits a replacement on the two surviving

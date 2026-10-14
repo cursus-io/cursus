@@ -20,10 +20,13 @@ import (
 )
 
 const lineageCheckpointInterval = 256
+const lineageBackgroundRecordLimit = 1024
 const lineageMagic = "CLIN0001"
 
 // ErrLineageUnsupported routes compacted/gapped histories to compacted recovery.
 var ErrLineageUnsupported = errors.New("lineage requires a contiguous retained log")
+
+var errLineageRebuildRequired = errors.New("lineage requires an explicit proof request to rebuild")
 
 // LineagePrefix proves the entire retained interval [StartOffset, EndOffset).
 // Different retained starts are incomparable, including empty prefixes.
@@ -58,8 +61,8 @@ type lineageIndex struct {
 
 // The fixed tail slot is overwritten after appending sparse checkpoints and
 // completed epoch spans. Every record is independently checksummed. A crash can
-// tear either write: restart always rebuilds from the authoritative retained log
-// rather than trusting even a checksum-valid old version or stale cursor.
+// tear either write: the first proof request after restart rebuilds from the
+// authoritative retained log, never trusting an old version or stale cursor.
 // Storage is O(records/256 + epoch transitions), with a constant-size tail slot.
 type lineageJournalRecord struct {
 	Kind        uint64 // 1: tail, 2: checkpoint, 3: completed epoch span
@@ -240,32 +243,35 @@ func (d *DiskHandler) prepareLineageLocked() error {
 	if err := d.syncFile(d.file); err != nil {
 		return d.markWriteUnavailable(fmt.Errorf("sync lineage log: %w", err))
 	}
-	if err := d.refreshLineageLocked(); err != nil {
+	uninitialized := d.lineage == nil
+	if err := d.refreshLineageLocked(0); err != nil {
 		d.suspendLineagePublicationLocked(err)
 		return err
 	}
 	if d.lineageAutoSuppressed {
 		d.lineageAutoSuppressed = false
 		util.Info("lineage publication recovered partition=%s tail=%d", d.BaseName, d.lineage.tail.EndOffset)
+	} else if uninitialized {
+		util.Info("lineage publication ready partition=%s tail=%d", d.BaseName, d.lineage.tail.EndOffset)
 	}
 	return nil
 }
 
-// updateLineageAfterSyncLocked is called under mu and ioMu after log sync.
-// A derived publication failure cannot undo an acknowledged durable log write.
-// It invalidates the cache; proof APIs must rebuild and successfully publish
-// before exposing any further evidence.
+// updateLineageAfterSyncLocked runs only from periodic sync under mu and ioMu.
+// It advances an already initialized index by at most 1,024 durable records.
+// It never initializes or rebuilds history, and no acknowledged write waits for
+// its own sidecar publication. Explicit proof requests catch up before returning.
 func (d *DiskHandler) updateLineageAfterSyncLocked() {
-	if d.lineageAutoSuppressed || d.writeAvailabilityError() != nil {
+	if d.lineage == nil || d.lineageAutoSuppressed || d.writeAvailabilityError() != nil {
 		return
 	}
-	if err := d.refreshLineageLocked(); err != nil {
+	if err := d.refreshLineageLocked(lineageBackgroundRecordLimit); err != nil {
 		d.suspendLineagePublicationLocked(err)
 	}
 }
 
 // suspendLineagePublicationLocked requires mu and ioMu. Do not repeatedly scan
-// retained history on every append/idle sync while a sidecar remains unavailable.
+// retained history on every idle sync while a sidecar remains unavailable.
 // Proof calls still retry explicitly and never serve an unpublished cache.
 func (d *DiskHandler) suspendLineagePublicationLocked(err error) {
 	d.lineage = nil
@@ -280,9 +286,10 @@ func (d *DiskHandler) suspendLineagePublicationLocked(err error) {
 	}
 }
 
-// refreshLineageLocked requires mu and ioMu after data sync. It advances only
-// newly durable records, or rebuilds from retained records after invalidation.
-func (d *DiskHandler) refreshLineageLocked() (err error) {
+// refreshLineageLocked requires mu and ioMu after data sync. A zero record limit
+// permits explicit requests to initialize/rebuild and catch up completely. A
+// positive limit advances only a still-valid cache, bounding background work.
+func (d *DiskHandler) refreshLineageLocked(recordLimit uint64) (err error) {
 	defer func() {
 		if err != nil {
 			d.lineage = nil
@@ -311,12 +318,18 @@ func (d *DiskHandler) refreshLineageLocked() (err error) {
 	}
 	fresh := index == nil
 	if fresh {
+		if recordLimit != 0 {
+			return errLineageRebuildRequired
+		}
 		start := d.segments[0]
 		cursor := lineageCursor{EndOffset: start, Segment: start, Digest: lineageSeed(start)}
 		index = &lineageIndex{start: start, tail: cursor, checkpoints: []lineageCursor{cursor}}
 	}
 	if !fresh && index.tail.EndOffset == tail {
 		return nil
+	}
+	if recordLimit != 0 && tail-index.tail.EndOffset > recordLimit {
+		tail = index.tail.EndOffset + recordLimit
 	}
 	var events []lineageJournalRecord
 	cursor, err := d.scanLineageLocked(index.tail, tail, func(message types.DiskMessage, next lineageCursor) {

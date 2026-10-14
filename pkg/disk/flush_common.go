@@ -63,7 +63,6 @@ func (d *DiskHandler) flushLoop() {
 				}
 				batch = batch[:0]
 			}
-			d.mu.Lock()
 			d.ioMu.Lock()
 			if d.writer != nil {
 				if err := d.writer.Flush(); err != nil {
@@ -73,12 +72,9 @@ func (d *DiskHandler) flushLoop() {
 			if d.file != nil {
 				if err := d.syncFile(d.file); err != nil {
 					_ = d.markWriteUnavailable(fmt.Errorf("sync on request: %w", err))
-				} else {
-					d.updateLineageAfterSyncLocked()
 				}
 			}
 			d.ioMu.Unlock()
-			d.mu.Unlock()
 			close(done)
 		case <-ticker.C:
 			if len(batch) > 0 {
@@ -293,9 +289,6 @@ func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error
 	if d.lineage != nil && batch[0].Offset < d.lineage.tail.EndOffset {
 		d.lineage = nil
 	}
-	if syncData {
-		d.updateLineageAfterSyncLocked()
-	}
 
 	return nil
 }
@@ -426,7 +419,6 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	if d.lineage != nil && msg.Offset < d.lineage.tail.EndOffset {
 		d.lineage = nil
 	}
-	d.updateLineageAfterSyncLocked()
 	return nil
 }
 
@@ -448,8 +440,6 @@ func (d *DiskHandler) rotateSegment(nextBaseOffset uint64) error {
 		if err := d.syncFile(d.file); err != nil {
 			util.Error("failed to sync disk file: %v", err)
 			errs = append(errs, err)
-		} else {
-			d.updateLineageAfterSyncLocked()
 		}
 		if err := d.file.Close(); err != nil {
 			util.Error("close failed during rotation: %v", err)
@@ -603,8 +593,6 @@ func (d *DiskHandler) drainAndShutdown(batch []types.DiskMessage) {
 		}
 	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
 
@@ -620,8 +608,6 @@ func (d *DiskHandler) drainAndShutdown(batch []types.DiskMessage) {
 		if err := d.syncFile(d.file); err != nil {
 			util.Error("file sync failed: %v", err)
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("final data file sync: %w", err))
-		} else if shutdownErr == nil {
-			d.updateLineageAfterSyncLocked()
 		}
 		if err := d.file.Close(); err != nil {
 			util.Error("file close failed: %v", err)

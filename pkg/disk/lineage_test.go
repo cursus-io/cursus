@@ -159,7 +159,8 @@ func TestLineageSparseCheckpointsRotationAndBatchMatching(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// The sidecar is already durable before asking for proofs.
+	// An explicit request initializes and durably publishes the full prefix.
+	_ = lineageTail(t, a, 1500)
 	journal := readLineageJournal(t, a)
 	if journal[0].Kind != 1 || journal[0].EndOffset != 1500 || len(journal) != 1+1500/lineageCheckpointInterval {
 		t.Fatalf("unexpected sparse journal: %+v", journal)
@@ -189,6 +190,7 @@ func TestLineageSparseCheckpointsRotationAndBatchMatching(t *testing.T) {
 			t.Fatal("normal append rebuilt the retained prefix")
 		}
 	}
+	runLineagePeriodicPass(t, a)
 	if got := len(readLineageJournal(t, a)); got != len(journal)+1 {
 		t.Fatalf("tail rewrites grew journal: %d -> %d", len(journal), got)
 	}
@@ -216,6 +218,7 @@ func TestLineageSidecarRestartRebuild(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			d, cfg := newLineageHandler(t)
 			appendLineageRecords(t, d, "one")
+			_ = lineageTail(t, d, 1)
 			old, err := os.ReadFile(d.BaseName + ".lineage")
 			if err != nil {
 				t.Fatal(err)
@@ -430,39 +433,37 @@ func TestLineageRetentionReanchorsAndCompactionRejects(t *testing.T) {
 	})
 }
 
-func TestLineageAsyncSyncAndClosed(t *testing.T) {
-	d, _ := newLineageHandler(t)
+func TestLineageExplicitProofSyncAndClosed(t *testing.T) {
+	d, cfg := newLineageHandler(t)
+	_ = lineageTail(t, d, 0)
 	if err := d.WriteBatch([]types.DiskMessage{{Topic: "orders", Offset: 0, Payload: "async"}}); err != nil {
 		t.Fatal(err)
 	}
 	if records := readLineageJournal(t, d); records[0].EndOffset != 0 {
 		t.Fatal("published before log sync")
 	}
-	if err := d.RollSegmentAt(1); err != nil {
-		t.Fatal(err)
-	}
+	_ = lineageTail(t, d, 1)
 	if records := readLineageJournal(t, d); records[0].EndOffset != 1 {
-		t.Fatal("rotation did not publish durable tail")
+		t.Fatal("proof did not publish durable tail")
 	}
-	if err := d.WriteBatch([]types.DiskMessage{{Topic: "orders", Offset: 1, Payload: "flush"}}); err != nil {
-		t.Fatal(err)
-	}
-	d.Flush()
-	if records := readLineageJournal(t, d); records[0].EndOffset != 2 {
-		t.Fatal("flush did not publish durable tail")
-	}
-	if err := d.WriteBatch([]types.DiskMessage{{Topic: "orders", Offset: 2, Payload: "shutdown"}}); err != nil {
+	if err := d.WriteBatch([]types.DiskMessage{{Topic: "orders", Offset: 1, Payload: "shutdown"}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if records := readLineageJournal(t, d); records[0].EndOffset != 3 {
-		t.Fatal("shutdown did not publish durable tail")
+	if records := readLineageJournal(t, d); records[0].EndOffset != 1 {
+		t.Fatal("shutdown unexpectedly published sidecar")
 	}
-	if _, err := d.LineageCandidates(3); err == nil {
+	if _, err := d.LineageCandidates(2); err == nil {
 		t.Fatal("closed handler exposed proof")
 	}
+	reopened, err := NewDiskHandler(cfg, "orders", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reopened.Close() }()
+	_ = lineageTail(t, reopened, 2)
 }
 
 func TestLineageEpochTransitions(t *testing.T) {
@@ -499,6 +500,7 @@ func TestLineagePublicationFailureSuppressesAutomaticRetries(t *testing.T) {
 	if err := d.WriteBatchSync(batch); err != nil {
 		t.Fatal(err)
 	}
+	_ = lineageTail(t, d, 1024)
 	path := d.BaseName + ".lineage"
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
@@ -507,9 +509,11 @@ func TestLineagePublicationFailureSuppressesAutomaticRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	appendLineageRecords(t, d, "publication-fails")
+	runLineagePeriodicPass(t, d)
 	for i := 0; i < 8; i++ {
 		appendLineageRecords(t, d, "still-durable")
 		d.Flush()
+		runLineagePeriodicPass(t, d)
 	}
 	if proofs, err := d.LineageCandidates(1033); err == nil || len(proofs) != 0 {
 		t.Fatalf("proof escaped failed publication: %+v %v", proofs, err)
@@ -521,6 +525,7 @@ func TestLineagePublicationFailureSuppressesAutomaticRetries(t *testing.T) {
 	}
 	appendLineageRecords(t, d, "await-explicit-retry")
 	d.Flush()
+	runLineagePeriodicPass(t, d)
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("automatic rebuild retried after failure: %v", err)
 	}
@@ -530,6 +535,7 @@ func TestLineagePublicationFailureSuppressesAutomaticRetries(t *testing.T) {
 	}
 	cache := d.lineage
 	appendLineageRecords(t, d, "incremental-again")
+	runLineagePeriodicPass(t, d)
 	if d.lineage != cache {
 		t.Fatal("recovery did not resume incremental publication")
 	}
@@ -549,6 +555,7 @@ func TestLineagePeriodicSyncPublishes(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
+	_ = lineageTail(t, d, 0)
 	published := make(chan struct{}, 1)
 	d.SetOnSync(func(offset uint64) {
 		if offset >= 1 {
