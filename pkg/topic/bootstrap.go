@@ -379,11 +379,6 @@ func (p *Partition) WithBootstrapSource(fn func(*BootstrapSource) error) error {
 	return p.withReadViewLocked(true, end, func(v *PartitionReadView) error { return fn(&BootstrapSource{view: v, disk: d}) })
 }
 
-func (p *Partition) setTransactionRecoveryError(err error) {
-	p.recoveryMu.Lock()
-	p.txnRecoveryErr = err
-	p.recoveryMu.Unlock()
-}
 func (p *Partition) setProducerRecoveryError(err error) {
 	p.recoveryMu.Lock()
 	p.producerRecoveryErr = err

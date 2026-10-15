@@ -531,7 +531,7 @@ func TestPartition_ReconcileCommittedHWMPersistsClearedProducerCheckpoint(t *tes
 	require.NoError(t, err)
 	checkpoint, err = decodeProducerStateCheckpoint(after)
 	require.NoError(t, err)
-	require.Empty(t, checkpoint.Producers, "the truncated tail must not survive in the durable checkpoint")
+	require.Equal(t, producerStateCheckpointEntry{Epoch: 7, Seq: 1, Offset: 0}, checkpoint.Producers["producer-1"], "persist the rebuilt retained state, excluding the truncated tail")
 	recovered, ok := p.lookupProducerState("producer-1")
 	require.True(t, ok)
 	require.Equal(t, producerStateCheckpointEntry{Epoch: 7, Seq: 1, Offset: 0}, recovered)

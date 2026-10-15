@@ -155,6 +155,33 @@ full replay finishes: this is a Cursus consumer-transition constraint beyond
 Kafka's epoch/offset eligibility checks, keeping recovery verification available
 if concurrent non-ISR replication advances the boundary before replay.
 
+## Speculative tail and committed-watermark repair
+
+Kafka's [4.1 AbstractFetcherThread, lines 193–208](https://github.com/apache/kafka/blob/4.1/core/src/main/scala/kafka/server/AbstractFetcherThread.scala#L193-L208)
+serializes truncation with current fetch-state validation. This follow-up adopts
+that exclusion for both Cursus tail-repair entry points, reusing the checked
+physical rollback engine. Cursus must retain separate publication policies:
+speculative repair preserves the old HWM and its authority; committed reconciliation
+publishes the Raft watermark only after index rebuild and durable checkpoints.
+Canonical divergence rollback may still lower a stale local HWM.
+
+The shared repair engine releases the partition mutex before disk maintenance or
+raw scans. Compaction can sample LEO equal to the cluster HWM, then wait for the
+partition HWM after a normal append creates a speculative tail; repair waiting
+for maintenance while holding the partition mutex deadlocks that valid interleaving.
+Reconciliation, visibility and checkpoint exclusions keep mutation serialized
+without this lock inversion. A changed reconciliation marker must survive repair.
+Uncertain mutation or rebuild failure keeps the partition unavailable; speculative
+repair must not create an authoritative checkpoint from an unknown watermark.
+
+Regression checks defined before implementation cover that exact sampled-LEO interleaving
+for both entry points, watermark policy and bounds, raw producer/transaction
+rebuild, marker replacement, checkpoint failure, no-op and snapshot/bootstrap
+guards. This changes liveness and publication safety, not recovery asymptotics:
+destructive repair still reads all retained record bytes and rebuilds all retained
+producer/transaction state; no-op tail repair needs no scan. Byte/time budgets and
+incremental recovery remain separate proposals.
+
 ## Outstanding audit follow-ups
 
 - Cold sidecar rebuilds still scan retained history under recovery/storage locks.
