@@ -30,7 +30,7 @@ func TestBootstrapLimitsAdmitNormalSegmentMetadataWithoutLargeBuffers(t *testing
 		require.NoError(t, err)
 		require.Zero(t, info.Size())
 	}
-	require.Greater(t, r.transfer.reserved, int64(512<<20))
+	require.Greater(t, r.transfer.byteOwner.reserved, int64(512<<20))
 	require.NoError(t, r.Abort())
 	require.NoError(t, d.SetBootstrapLimits(BootstrapLimits{MaxTransferBytes: 512 << 20, MaxTotalBytes: 1 << 30}))
 	_, err = d.StageBootstrap(m)

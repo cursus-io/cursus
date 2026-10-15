@@ -129,18 +129,14 @@ type BootstrapMetadata struct {
 	Files       []BootstrapFile `json:"files"`
 }
 
-var bootstrapBudget = struct {
-	sync.Mutex
-	active int
-	bytes  int64
-}{}
-
 type bootstrapTransfer struct {
 	mu              sync.Mutex
 	dir             string
 	metadata        BootstrapMetadata
-	reserved        int64
-	limits          BootstrapLimits
+	activeToken     bootstrapActiveToken
+	byteOwner       bootstrapByteOwner
+	cleanupComplete bool
+	removeAll       func(string) error
 	timer           *time.Timer
 	closed          bool
 	installed       bool
@@ -173,6 +169,13 @@ func cloneBootstrapMetadata(m BootstrapMetadata) BootstrapMetadata {
 }
 
 func newBootstrapTransfer(base string, metadata BootstrapMetadata, size int64, limits BootstrapLimits) (*bootstrapTransfer, error) {
+	retryBootstrapCleanup()
+	return newBootstrapTransferAfterCleanup(base, metadata, size, limits)
+}
+
+// Callers with filesystem headroom checks retry cleanup before checking capacity.
+// This helper admits without a second cleanup attempt for the same request.
+func newBootstrapTransferAfterCleanup(base string, metadata BootstrapMetadata, size int64, limits BootstrapLimits) (*bootstrapTransfer, error) {
 	if err := validateBootstrapLimits(limits); err != nil {
 		return nil, err
 	}
@@ -197,14 +200,20 @@ func newBootstrapTransfer(base string, metadata BootstrapMetadata, size int64, l
 	bootstrapBudget.active++
 	bootstrapBudget.bytes += size
 	bootstrapBudget.Unlock()
-	t := &bootstrapTransfer{metadata: cloneBootstrapMetadata(metadata), reserved: size, limits: limits, received: map[string]int64{}}
+	t := &bootstrapTransfer{
+		metadata:    cloneBootstrapMetadata(metadata),
+		activeToken: bootstrapActiveToken{owned: true},
+		byteOwner:   bootstrapByteOwner{owned: true, reserved: size, limits: limits},
+		removeAll:   os.RemoveAll,
+		received:    map[string]int64{},
+	}
 	id, err := newBootstrapID()
 	if err == nil {
 		t.dir = base + ".bootstrap-" + id
 		err = os.Mkdir(t.dir, 0o700)
 	}
 	if err != nil {
-		t.releaseBudget()
+		t.releaseTransientOwnership()
 		return nil, err
 	}
 	return t, nil
@@ -213,27 +222,39 @@ func newBootstrapTransfer(base string, metadata BootstrapMetadata, size int64, l
 func (t *bootstrapTransfer) startTTL() {
 	t.timer = time.AfterFunc(BootstrapTTL, func() { _ = t.close() })
 }
-func (t *bootstrapTransfer) releaseBudget() {
-	bootstrapBudget.Lock()
-	bootstrapBudget.active--
-	bootstrapBudget.bytes -= t.reserved
-	bootstrapBudget.Unlock()
+
+// releaseTransientOwnership is used only after successful deletion, before a
+// staging directory was created, or after ownership passes to durable intent.
+// The caller holds t.mu or has not published t yet.
+func (t *bootstrapTransfer) releaseTransientOwnership() {
+	t.byteOwner.release()
+	t.activeToken.release()
 }
 func (t *bootstrapTransfer) close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.closed {
-		return nil
-	}
+	return t.cleanupLocked()
+}
+
+func (t *bootstrapTransfer) cleanupLocked() error {
 	if t.installed {
 		return ErrBootstrapPending
+	}
+	if t.cleanupComplete {
+		return nil
 	}
 	t.closed = true
 	if t.timer != nil {
 		t.timer.Stop()
 	}
-	t.releaseBudget()
-	return os.RemoveAll(t.dir)
+	if err := t.removeAll(t.dir); err != nil {
+		retainBootstrapCleanup(t)
+		return err
+	}
+	t.cleanupComplete = true
+	forgetBootstrapCleanup(t)
+	t.releaseTransientOwnership()
+	return nil
 }
 
 func (e *BootstrapExport) Manifest() BootstrapMetadata {
@@ -289,7 +310,7 @@ func (d *DiskHandler) ExportBootstrap(start, end uint64, fence BootstrapFence, c
 }
 
 // ExportBootstrapContext cancels between physical records and checksum chunks.
-// A failed/canceled copy removes staging and never publishes an export handle.
+// A failed/canceled copy retires staging for cleanup and never publishes a handle.
 // Mutex acquisition and individual filesystem calls (including an in-flight
 // fsync) remain synchronous; cancellation is rechecked after each lock boundary.
 func (d *DiskHandler) ExportBootstrapContext(ctx context.Context, start, end uint64, fence BootstrapFence, catalog []byte) (*BootstrapExport, error) {
@@ -367,10 +388,11 @@ func (d *DiskHandler) ExportBootstrapContext(ctx context.Context, start, end uin
 			return nil, &BootstrapLimitError{Resource: "source bytes", Requested: size, Limit: limits.MaxTransferBytes}
 		}
 	}
+	retryBootstrapCleanup()
 	if _, err := d.headroom.reserve(uint64(size), true); err != nil {
 		return nil, err
 	}
-	t, err := newBootstrapTransfer(d.BaseName, m, size, limits)
+	t, err := newBootstrapTransferAfterCleanup(d.BaseName, m, size, limits)
 	if err != nil {
 		return nil, err
 	}
@@ -452,29 +474,7 @@ func (d *DiskHandler) ExportBootstrapContext(ctx context.Context, start, end uin
 }
 
 func reserveBootstrapGrowth(d *DiskHandler, t *bootstrapTransfer, size int64) error {
-	if size <= t.reserved {
-		return nil
-	}
-	if size > t.limits.MaxTransferBytes {
-		return &BootstrapLimitError{Resource: "canonical bytes", Requested: size, Limit: t.limits.MaxTransferBytes}
-	}
-	delta := size - t.reserved
-	bootstrapBudget.Lock()
-	defer bootstrapBudget.Unlock()
-	requested, err := addBootstrapBytes(bootstrapBudget.bytes, delta)
-	if err != nil {
-		return err
-	}
-	if requested > t.limits.MaxTotalBytes {
-		return &BootstrapLimitError{Resource: "total staging bytes", Requested: requested, Limit: t.limits.MaxTotalBytes}
-	}
-	// #nosec G115 -- size > t.reserved >= 0 above, so delta is positive and fits int64.
-	if _, err := d.headroom.reserve(uint64(delta), false); err != nil {
-		return err
-	}
-	bootstrapBudget.bytes += delta
-	t.reserved = size
-	return nil
+	return t.byteOwner.grow(d, size)
 }
 
 func validateBootstrapBounds(m BootstrapMetadata) error {
@@ -576,11 +576,12 @@ func (d *DiskHandler) StageBootstrap(m BootstrapMetadata) (*BootstrapReceiver, e
 	if size > limits.MaxTransferBytes {
 		return nil, &BootstrapLimitError{Resource: "staging with derived indexes", Requested: size, Limit: limits.MaxTransferBytes}
 	}
+	retryBootstrapCleanup()
 	// #nosec G115 -- validated nonnegative file sizes plus bounded derived indexes fit int64; admission above caps their sum.
 	if _, err = d.headroom.reserve(uint64(size), true); err != nil {
 		return nil, err
 	}
-	t, err := newBootstrapTransfer(d.BaseName, m, size, limits)
+	t, err := newBootstrapTransferAfterCleanup(d.BaseName, m, size, limits)
 	if err != nil {
 		return nil, err
 	}
