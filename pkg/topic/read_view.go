@@ -11,11 +11,12 @@ import (
 // Acquire this view BEFORE event-source cache/index locks. Never call public
 // Partition read wrappers from inside a view; they acquire a new read lock.
 type PartitionReadView struct {
-	p          *Partition
-	active     bool
-	generation uint64
-	offline    bool
-	end        uint64
+	replicaIndexWitness *ReplicaRequestWitness
+	p                   *Partition
+	active              bool
+	generation          uint64
+	offline             bool
+	end                 uint64
 }
 
 func (p *Partition) WithReadView(fn func(*PartitionReadView) error) error {
@@ -64,7 +65,7 @@ func (v *PartitionReadView) validateBootstrap(name string, partition int, lifecy
 	if err := v.ValidateIdentity(name, partition); err != nil {
 		return err
 	}
-	if !v.offline || v.p.BootstrapPending() != pending {
+	if !v.offline || v.replicaIndexWitness != nil || v.p.BootstrapPending() != pending {
 		return fmt.Errorf("bootstrap operation requires its exclusive callback view")
 	}
 	v.p.recoveryMu.RLock()

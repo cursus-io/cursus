@@ -244,6 +244,7 @@ func (h *Handler) DetachPartitionForBootstrap(name string, partition int) error 
 		delete(h.snapshots, key)
 	}
 	delete(h.indexedHWM, key)
+	delete(h.replicaIndexGenerations, key)
 	return errors.Join(errs...)
 }
 

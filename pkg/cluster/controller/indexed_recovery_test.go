@@ -68,15 +68,9 @@ func TestIndexedRecoveryRefreshesDurableProofAfterEachBatch(t *testing.T) {
 	receiver, p, cfg := makeFSM(nil)
 	cc := NewClusterController(context.Background(), cfg, &MockRaftManager{mockFSM: receiver}, nil, "node-2", "node-2:9001")
 	fetcher := &indexedSourceFetcher{source: source}
-	require.NoError(t, cc.RunReplicaCatchupOnce(context.Background(), fetcher, func(_ context.Context, batch fsm.ReplicaCatchupBatch) error {
+	require.NoError(t, cc.RunReplicaCatchupOnceVerified(context.Background(), fetcher, func(ctx context.Context, request fsm.ReplicaCatchupRequest, batch fsm.ReplicaCatchupBatch) (*topic.ReplicaCatchupWitness, error) {
 		require.Nil(t, batch.TruncateTo)
-		if err := p.ReplicaAppendWithMode(batch.Messages, true); err != nil {
-			return err
-		}
-		if batch.EndOffset == batch.CommittedHWM {
-			return p.ApplyReplicaHWM(batch.CommittedHWM)
-		}
-		return nil
+		return applySchedulerTestBatch(ctx, p, request, batch)
 	}))
 	require.Len(t, fetcher.requests, 3)
 	for i, request := range fetcher.requests {

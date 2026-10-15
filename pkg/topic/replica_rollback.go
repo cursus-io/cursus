@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -59,7 +60,7 @@ func (p *Partition) applyReplicaRollback(ctx context.Context, offset, expectedLE
 	// normal owner can resolve it. Preserve it without blocking physical repair.
 	err := errors.Join(p.recoveryErr, p.txnRecoveryErr, p.producerRecoveryErr, p.bootstrapErrorLocked(), p.rollbackErrorLocked())
 	p.recoveryMu.RUnlock()
-	if err == nil && (p.closed || p.snapshotRecovery || p.LEO.Load() != expectedLEO || offset > expectedLEO) {
+	if err == nil && (p.closed || p.snapshotRecovery || p.LEO.Load() != expectedLEO || offset > expectedLEO || p.replicaAttempt == math.MaxUint64) {
 		err = fmt.Errorf("replica rollback local state changed")
 	}
 	if err == nil {
@@ -127,6 +128,11 @@ func (p *Partition) applyReplicaRollback(ctx context.Context, offset, expectedLE
 			return err
 		}
 	}
+	// Even a clean disk rejection after consumer repair admission invalidates
+	// older verification attempts whose content generation may remain unchanged.
+	p.mu.Lock()
+	p.replicaAttempt++
+	p.mu.Unlock()
 	if supported {
 		err = storage.TruncateToIfGenerationContext(ctx, offset, generation)
 	} else {

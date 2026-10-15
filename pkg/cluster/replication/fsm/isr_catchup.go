@@ -27,22 +27,23 @@ var errReplicaEpochBoundaryUnavailable = errors.New("replica epoch boundary unav
 // the source may return a newer committed boundary. SourceAddress is local
 // routing metadata and is not sent.
 type ReplicaCatchupRequest struct {
-	Topic                string               `json:"topic"`
-	Partition            int                  `json:"partition"`
-	BrokerID             string               `json:"broker_id"`
-	NextOffset           uint64               `json:"next_offset"`
-	CommittedHWM         uint64               `json:"committed_hwm"`
-	Leader               string               `json:"leader"`
-	SourceBroker         string               `json:"source_broker,omitempty"`
-	LeaderEpoch          int                  `json:"leader_epoch"`
-	LifecycleEpoch       uint64               `json:"lifecycle_epoch"`
-	MaxRecords           int                  `json:"max_records"`
-	PreviousLeaderEpoch  int64                `json:"previous_leader_epoch,omitempty"`
-	PreviousRecordDigest string               `json:"previous_record_digest,omitempty"`
-	SourceAddress        string               `json:"-"`
-	SnapshotCatchup      bool                 `json:"-"`
-	RecoveryProtocol     int                  `json:"recovery_protocol,omitempty"`
-	PrefixCandidates     []disk.LineagePrefix `json:"prefix_candidates,omitempty"`
+	LocalWitness         *topic.ReplicaRequestWitness `json:"-"`
+	Topic                string                       `json:"topic"`
+	Partition            int                          `json:"partition"`
+	BrokerID             string                       `json:"broker_id"`
+	NextOffset           uint64                       `json:"next_offset"`
+	CommittedHWM         uint64                       `json:"committed_hwm"`
+	Leader               string                       `json:"leader"`
+	SourceBroker         string                       `json:"source_broker,omitempty"`
+	LeaderEpoch          int                          `json:"leader_epoch"`
+	LifecycleEpoch       uint64                       `json:"lifecycle_epoch"`
+	MaxRecords           int                          `json:"max_records"`
+	PreviousLeaderEpoch  int64                        `json:"previous_leader_epoch,omitempty"`
+	PreviousRecordDigest string                       `json:"previous_record_digest,omitempty"`
+	SourceAddress        string                       `json:"-"`
+	SnapshotCatchup      bool                         `json:"-"`
+	RecoveryProtocol     int                          `json:"recovery_protocol,omitempty"`
+	PrefixCandidates     []disk.LineagePrefix         `json:"prefix_candidates,omitempty"`
 }
 
 // ReplicaCatchupBatch carries a committed logical range under the same
@@ -111,6 +112,7 @@ func AdvanceReplicaCatchupRequest(request *ReplicaCatchupRequest, batch ReplicaC
 	if endOffset <= request.NextOffset {
 		return fmt.Errorf("replica catch-up made no progress at offset %d", request.NextOffset)
 	}
+	request.LocalWitness = nil
 	request.NextOffset = endOffset
 	// Cumulative proofs must be regenerated from durable storage after applying.
 	request.PrefixCandidates = nil
@@ -250,6 +252,10 @@ func (f *BrokerFSM) applyISRCatchupCommand(jsonData string) interface{} {
 // BuildISRCatchupProofs returns proofs only for local, synchronized replicas
 // that are currently outside ISR under the same topic lifecycle generation.
 func (f *BrokerFSM) BuildISRCatchupProofs(brokerID string) []ISRCatchupProof {
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
+	f.materializationMu.Lock()
+	defer f.materializationMu.Unlock()
 	if brokerID == "" {
 		return nil
 	}
@@ -267,6 +273,7 @@ func (f *BrokerFSM) BuildISRCatchupProofs(brokerID string) []ISRCatchupProof {
 	}
 	definitions := copyTopicState(f.topicState)
 	topicManager := f.tm
+	consumerCoordinator := f.cd
 	f.mu.RUnlock()
 	if topicManager == nil {
 		return nil
@@ -288,6 +295,12 @@ func (f *BrokerFSM) BuildISRCatchupProofs(brokerID string) []ISRCatchupProof {
 			continue
 		}
 		topicName := key[:separator]
+		// Keep a repaired offsets log eligible for recovery verification until
+		// full overlay replay discharges its requirement. Joining ISR first can
+		// stale the exact witness on a subsequent append without a recovery path.
+		if topicName == config.ConsumerOffsetsTopicName && consumerCoordinator.PendingConsumerLogRepair(partitionID) != 0 {
+			continue
+		}
 		definition := definitions[topicName]
 		localTopic := topicManager.GetTopic(topicName)
 		if definition == nil || localTopic == nil ||
@@ -323,7 +336,14 @@ func (f *BrokerFSM) BuildISRCatchupProofs(brokerID string) []ISRCatchupProof {
 
 // MarkReplicaCatchupVerified records a completed, leader-fenced prefix check.
 // A later ISR proof must still match the current metadata tuple.
-func (f *BrokerFSM) MarkReplicaCatchupVerified(request ReplicaCatchupRequest) error {
+func (f *BrokerFSM) MarkReplicaCatchupVerified(request ReplicaCatchupRequest, witnesses ...*topic.ReplicaCatchupWitness) error {
+	if len(witnesses) != 1 || witnesses[0] == nil {
+		return fmt.Errorf("actual receiver verification witness is required")
+	}
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
+	f.materializationMu.Lock()
+	defer f.materializationMu.Unlock()
 	key := request.Topic + "-" + strconv.Itoa(request.Partition)
 	f.mu.RLock()
 	meta := f.partitionMetadata[key]
@@ -348,8 +368,7 @@ func (f *BrokerFSM) MarkReplicaCatchupVerified(request ReplicaCatchupRequest) er
 	if partition.NextOffset() != request.CommittedHWM || partition.GetHWM() != request.CommittedHWM {
 		return fmt.Errorf("replica catch-up boundary changed for %s", key)
 	}
-	partition.MarkReplicaCatchupVerified(request.LeaderEpoch, request.LifecycleEpoch, request.CommittedHWM)
-	return nil
+	return partition.AcceptReplicaCatchupWitness(witnesses[0], request.Leader, request.LeaderEpoch, request.LifecycleEpoch, request.CommittedHWM)
 }
 
 // BuildReplicaCatchupRequests returns one bounded-range request for each local
@@ -474,6 +493,24 @@ func addPreviousReplicaRecord(partition *topic.Partition, request *ReplicaCatchu
 	request.PreviousLeaderEpoch = messages[0].LeaderEpoch
 	request.PreviousRecordDigest, err = replicaRecordDigest(messages[0])
 	return err
+}
+
+// ValidateReplicaRequestChallenge rechecks the immutable legacy challenge on
+// the original receiver. Mode zero remains a last-record proof, not a full-prefix
+// equivalence proof; the local witness separately excludes concurrent rewrites.
+func ValidateReplicaRequestChallenge(partition *topic.Partition, request ReplicaCatchupRequest) error {
+	if request.RecoveryProtocol != 0 {
+		return nil
+	}
+	actual := request
+	actual.PreviousLeaderEpoch, actual.PreviousRecordDigest = 0, ""
+	if err := addPreviousReplicaRecord(partition, &actual); err != nil {
+		return err
+	}
+	if actual.PreviousLeaderEpoch != request.PreviousLeaderEpoch || actual.PreviousRecordDigest != request.PreviousRecordDigest {
+		return fmt.Errorf("local previous-record challenge changed")
+	}
+	return nil
 }
 
 func replicaRecordDigest(message types.Message) (string, error) {

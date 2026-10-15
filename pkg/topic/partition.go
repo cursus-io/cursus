@@ -68,10 +68,9 @@ type Partition struct {
 	LEO                        atomic.Uint64
 	HWM                        uint64
 	hwmAuthoritative           bool
-	replicaVerifiedLeaderEpoch int
-	replicaVerifiedLifecycle   uint64
-	replicaVerifiedHWM         uint64
 	replicaVerified            bool
+	replicaWitness             *ReplicaCatchupWitness
+	replicaAttempt             uint64
 	distributed                bool
 	mu                         sync.RWMutex
 	reconcileMu                sync.RWMutex
@@ -92,6 +91,7 @@ type Partition struct {
 	txnRecoveryErr             error
 	producerRecoveryErr        error
 	reconciliationErr          error
+	reconciliationRevision     uint64
 	snapshotRecovery           bool
 	recoveryCheckpointHWM      uint64
 	recoverySnapshotHWM        uint64
@@ -172,6 +172,14 @@ func (p *Partition) SetDistributedCompactionGate(gate func(topic string, partiti
 }
 
 // NewPartition creates a partition instance.
+// Durable storage adapters must retain checkpoint and pending-install recovery,
+// even when they wrap the concrete disk handler with additional capabilities.
+type durablePartitionStorage interface {
+	types.StorageHandler
+	PendingBootstrap() (*disk.BootstrapMetadata, error)
+	SetOnSync(func(uint64))
+}
+
 func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManager, cfg *config.Config) *Partition {
 	// Storage exposes the next assignable offset, not the last record offset.
 	initialOffset := dh.GetLatestOffset()
@@ -194,7 +202,7 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	p.LEO.Store(initialOffset)
 	p.HWM = initialOffset
 
-	if handler, ok := dh.(*disk.DiskHandler); ok {
+	if handler, ok := dh.(durablePartitionStorage); ok {
 		p.hwmCheckpointPath = hwmCheckpointPath(handler, id)
 		p.hwmCheckpointCh = make(chan struct{}, 1)
 		p.producerStatePath = producerStateCheckpointPath(handler, id)
@@ -253,7 +261,7 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	if p.producerStateCh != nil {
 		p.loadProducerStateCheckpoint()
 	}
-	if _, ok := dh.(*disk.DiskHandler); ok {
+	if _, ok := dh.(durablePartitionStorage); ok {
 		if err := p.rebuildTransactionMarkerIndex(); err != nil {
 			p.txnRecoveryErr = fmt.Errorf("rebuild transaction visibility index: %w", err)
 		}
@@ -284,6 +292,12 @@ func (p *Partition) MarkReconciliationPending(err error) {
 	}
 	p.recoveryMu.Lock()
 	p.reconciliationErr = fmt.Errorf("committed HWM reconciliation pending: %w", err)
+	if p.reconciliationRevision == math.MaxUint64 {
+		p.recoveryErr = errors.Join(p.recoveryErr, errors.New("reconciliation revision exhausted"))
+		p.recoveryMu.Unlock()
+		return
+	}
+	p.reconciliationRevision++
 	p.recoveryMu.Unlock()
 }
 
@@ -1721,23 +1735,11 @@ func (p *Partition) ApplyReplicaHWM(hwm uint64) error {
 // was checked against an in-sync replica. The tuple prevents a stale check
 // from admitting the replica after a leader, topic, or HWM change.
 func (p *Partition) MarkReplicaCatchupVerified(leaderEpoch int, lifecycleEpoch, hwm uint64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.BootstrapPending() || p.rollbackError() != nil || p.closed {
-		return
-	}
-	p.replicaVerifiedLeaderEpoch = leaderEpoch
-	p.replicaVerifiedLifecycle = lifecycleEpoch
-	p.replicaVerifiedHWM = hwm
-	p.replicaVerified = true
+	// Compatibility only: a metadata tuple cannot certify local log contents.
 }
 
 func (p *Partition) ReplicaCatchupVerified(leaderEpoch int, lifecycleEpoch, hwm uint64) bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.replicaVerified && p.replicaVerifiedLeaderEpoch == leaderEpoch &&
-		p.replicaVerifiedLifecycle == lifecycleEpoch &&
-		p.replicaVerifiedHWM == hwm
+	return p.ValidateReplicaCatchupEligibility(leaderEpoch, lifecycleEpoch, hwm, 0) == nil
 }
 
 // ReconcileCommittedHWM prepares a replica for leadership using the durable cluster watermark.

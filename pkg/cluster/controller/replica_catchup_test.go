@@ -82,10 +82,9 @@ func TestRunReplicaCatchupOnceFetchesUntilCommittedHWM(t *testing.T) {
 	partition, err := topicManager.GetTopic("orders").GetPartition(0)
 	require.NoError(t, err)
 	var applied []fsm.ReplicaCatchupBatch
-	err = cc.RunReplicaCatchupOnce(context.Background(), fetcher, func(_ context.Context, batch fsm.ReplicaCatchupBatch) error {
+	err = cc.RunReplicaCatchupOnceVerified(context.Background(), fetcher, func(ctx context.Context, request fsm.ReplicaCatchupRequest, batch fsm.ReplicaCatchupBatch) (*topic.ReplicaCatchupWitness, error) {
 		applied = append(applied, batch)
-		partition.UpdateLEO(batch.EndOffset)
-		return partition.ApplyReplicaHWM(batch.EndOffset)
+		return applySchedulerTestBatch(ctx, partition, request, batch)
 	})
 	require.NoError(t, err)
 	require.Len(t, fetcher.requests, 3)
@@ -153,11 +152,10 @@ func TestCatchupReplicaFollowsCommittedHWMThatAdvancesDuringRecovery(t *testing.
 		LifecycleEpoch: metadata.LifecycleEpoch, MaxRecords: fsm.MaxReplicaCatchupRecords,
 		SourceAddress: "127.0.0.1:9001",
 	}
-	err = cc.catchupReplica(context.Background(), fetcher, func(_ context.Context, batch fsm.ReplicaCatchupBatch) error {
-		if len(batch.Messages) > 0 {
-			require.NoError(t, partition.ReplicaAppendWithMode(batch.Messages, true))
-		}
-		return partition.ApplyReplicaHWM(batch.EndOffset)
+	request.LocalWitness, err = partition.CaptureReplicaRequestWitness(context.Background(), 0)
+	require.NoError(t, err)
+	err = cc.catchupReplica(context.Background(), fetcher, func(ctx context.Context, request fsm.ReplicaCatchupRequest, batch fsm.ReplicaCatchupBatch) (*topic.ReplicaCatchupWitness, error) {
+		return applySchedulerTestBatch(ctx, partition, request, batch)
 	}, request)
 	require.NoError(t, err)
 	require.Len(t, fetcher.requests, 4)
@@ -195,4 +193,37 @@ func TestValidateReplicaCatchupBatchRejectsFenceAndGap(t *testing.T) {
 	batch.LeaderEpoch = request.LeaderEpoch
 	batch.Messages[1].Offset = 7
 	require.ErrorContains(t, validateReplicaCatchupBatch(request, batch), "checksum")
+}
+
+func applySchedulerTestBatch(ctx context.Context, partition *topic.Partition, request fsm.ReplicaCatchupRequest, batch fsm.ReplicaCatchupBatch) (*topic.ReplicaCatchupWitness, error) {
+	release := partition.BeginReplicationMutation()
+	defer release()
+	if err := partition.ValidateReplicaRequestWitness(ctx, request.LocalWitness, batch.StartOffset); err != nil {
+		return nil, err
+	}
+	if request.RecoveryProtocol == 0 {
+		if err := fsm.ValidateReplicaRequestChallenge(partition, request); err != nil {
+			return nil, err
+		}
+	} else {
+		matched, err := partition.VerifyReplicaLineage(*batch.MatchedPrefix, batch.CommittedHWM)
+		if err != nil {
+			return nil, err
+		}
+		if !matched {
+			return nil, fmt.Errorf("prefix mismatch")
+		}
+	}
+	if len(batch.Messages) != 0 {
+		if err := partition.ReplicaAppendWithMode(batch.Messages, true); err != nil {
+			return nil, err
+		}
+	}
+	if !batch.Verified || batch.EndOffset != batch.CommittedHWM {
+		return nil, nil
+	}
+	if err := partition.ApplyReplicaHWMChecked(ctx, request.LocalWitness, batch.CommittedHWM); err != nil {
+		return nil, err
+	}
+	return partition.CompleteReplicaCatchupVerification(ctx, request.LocalWitness, batch.Leader, batch.LeaderEpoch, batch.LifecycleEpoch, batch.CommittedHWM, 0)
 }

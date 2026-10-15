@@ -1,6 +1,7 @@
 package fsm
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -64,7 +65,15 @@ func TestIdleISRCatchupPreservesCheckpointFiles(t *testing.T) {
 
 func newISRCatchupTestFSM(t *testing.T) *BrokerFSM {
 	t.Helper()
-	brokerFSM := newTestFSM()
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	cfg.DiskMinFreeBytes = 1
+	cfg.DiskMinFreePercent = 0.1
+	dm := disk.NewDiskManager(cfg)
+	tm := topic.NewTopicManager(cfg, dm, nil)
+	t.Cleanup(func() { tm.Stop(); dm.CloseAllHandlers() })
+	brokerFSM := NewBrokerFSM(tm, nil)
 	registerActiveBroker(t, brokerFSM, "node-1")
 	registerActiveBroker(t, brokerFSM, "node-2")
 	topicCommand := testTopicCommand("orders", 1, 2)
@@ -80,9 +89,7 @@ func newISRCatchupTestFSM(t *testing.T) *BrokerFSM {
 	metadata.CommittedHWM = 0
 	metadata.CommittedHWMKnown = true
 	brokerFSM.mu.Unlock()
-	partition, err := brokerFSM.tm.GetTopic("orders").GetPartition(0)
-	require.NoError(t, err)
-	partition.MarkReplicaCatchupVerified(4, topic.InitialLifecycleEpoch, 0)
+	verifyEmptyReplica(t, brokerFSM)
 	return brokerFSM
 }
 
@@ -93,9 +100,7 @@ func TestBuildISRCatchupProofsRequiresCurrentPrefixVerification(t *testing.T) {
 	brokerFSM.mu.Unlock()
 	require.Empty(t, brokerFSM.BuildISRCatchupProofs("node-2"))
 
-	partition, err := brokerFSM.tm.GetTopic("orders").GetPartition(0)
-	require.NoError(t, err)
-	partition.MarkReplicaCatchupVerified(5, topic.InitialLifecycleEpoch, 0)
+	verifyEmptyReplica(t, brokerFSM)
 	require.Len(t, brokerFSM.BuildISRCatchupProofs("node-2"), 1)
 }
 
@@ -179,8 +184,10 @@ func TestBuildReplicaCatchupRequestsUsesLocalLEOAndLeaderFence(t *testing.T) {
 
 	requests := brokerFSM.BuildReplicaCatchupRequests("node-2")
 	require.Len(t, requests, 1)
+	require.NotNil(t, requests[0].LocalWitness)
 	require.Equal(t, ReplicaCatchupRequest{
-		Topic: "orders", Partition: 0, BrokerID: "node-2", NextOffset: 0, CommittedHWM: 3,
+		LocalWitness: requests[0].LocalWitness,
+		Topic:        "orders", Partition: 0, BrokerID: "node-2", NextOffset: 0, CommittedHWM: 3,
 		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 4, LifecycleEpoch: topic.InitialLifecycleEpoch,
 		MaxRecords: MaxReplicaCatchupRecords, SourceAddress: "127.0.0.1:9000",
 	}, requests[0])
@@ -602,4 +609,22 @@ func TestFetchReplicaCatchupCarriesCompactedOffsetRange(t *testing.T) {
 	require.True(t, batch.Compacted)
 	require.Equal(t, uint64(3), batch.EndOffset)
 	require.Equal(t, []uint64{1, 2}, []uint64{batch.Messages[0].Offset, batch.Messages[1].Offset})
+}
+
+func verifyEmptyReplica(t *testing.T, state *BrokerFSM) {
+	t.Helper()
+	requests := state.BuildReplicaCatchupRequests("node-2")
+	require.Len(t, requests, 1)
+	request := requests[0]
+	require.Zero(t, request.NextOffset)
+	batch, err := state.FetchReplicaCatchup(request)
+	require.NoError(t, err)
+	require.True(t, batch.Verified)
+	partition, err := state.tm.GetTopic(request.Topic).GetPartition(request.Partition)
+	require.NoError(t, err)
+	release := partition.BeginReplicationMutation()
+	witness, err := partition.CompleteReplicaCatchupVerification(context.Background(), request.LocalWitness, request.Leader, request.LeaderEpoch, request.LifecycleEpoch, 0, 0)
+	release()
+	require.NoError(t, err)
+	require.NoError(t, state.MarkReplicaCatchupVerified(request, witness))
 }
