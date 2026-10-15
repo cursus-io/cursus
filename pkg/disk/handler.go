@@ -74,28 +74,30 @@ type DiskHandler struct {
 
 	maintenanceMu sync.Mutex
 	// replacementMu excludes physical replacement for the entire raw read session.
-	replacementMu      sync.RWMutex
-	bootstrapPending   atomic.Bool
-	bootstrapInstalled atomic.Bool
-	bootstrapLimitsMu  sync.RWMutex
-	bootstrapLimits    BootstrapLimits
-	compactionMu       sync.RWMutex
-	compactedSegments  map[uint64]int64
-	compactionGateMu   sync.RWMutex
-	compactionGate     func() (bool, string)
-	compactionStateMu  sync.Mutex
-	compactionFailure  string
-	segmentReaders     *segmentReaderCache
-	mu                 sync.Mutex    // metadata(offset, segment), file handler(d.file)
-	ioMu               sync.Mutex    // bufio.Writer, flush
-	lineage            *lineageIndex // immutable published scalar view, protected by mu
-	lineageMu          sync.Mutex    // builder gate, always acquired BEFORE storage locks
-	retainedPageMu     sync.Mutex    // page gate, always acquired BEFORE storage locks
-	retainedPageWork   RetainedPageWork
-	retainedCursors    []rawFrameCursor
-	lineageProgress    *lineageBuild // owned exclusively by lineageMu
-	lineageRequests    chan struct{}
-	lineageSyncFn      func(*os.File) error // optional sidecar sync test seam
+	replacementMu           sync.RWMutex
+	bootstrapPending        atomic.Bool
+	bootstrapInstalled      atomic.Bool
+	bootstrapLimitsMu       sync.RWMutex
+	bootstrapLimits         BootstrapLimits
+	compactionMu            sync.RWMutex
+	compactedSegments       map[uint64]int64
+	compactionGateMu        sync.RWMutex
+	compactionGate          func() (bool, string)
+	compactionStateMu       sync.Mutex
+	compactionFailure       string
+	segmentReaders          *segmentReaderCache
+	mu                      sync.Mutex    // metadata(offset, segment), file handler(d.file)
+	ioMu                    sync.Mutex    // bufio.Writer, flush
+	lineage                 *lineageIndex // immutable published scalar view, protected by mu
+	lineageMu               sync.Mutex    // builder gate, always acquired BEFORE storage locks
+	retainedPageMu          sync.Mutex    // page gate, always acquired BEFORE storage locks
+	retainedPageWork        RetainedPageWork
+	retainedBootstrapWorkMu sync.Mutex
+	retainedBootstrapWork   RetainedBootstrapWork
+	retainedCursors         []rawFrameCursor
+	lineageProgress         *lineageBuild // owned exclusively by lineageMu
+	lineageRequests         chan struct{}
+	lineageSyncFn           func(*os.File) error // optional sidecar sync test seam
 	// A nil index remains uninitialized until an explicit proof request. Failed
 	// background publication also waits for explicit recovery. Protected by mu.
 	lineageAutoSuppressed bool

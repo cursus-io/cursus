@@ -22,8 +22,9 @@ This separation is required for recovery after an operator lowers limits.
 
 Records are streamed in at most 256 KiB chunks and canonicalized one record at a
 time. Raising byte limits does not allocate a transfer-sized memory buffer. The
-catalog remains capped at 16 MiB; eight active transfers and a five-minute transfer
-TTL remain fixed. Limit failures return `BootstrapLimitError` with resource,
+catalog remains capped at 16 MiB; eight active transfers and the generic export/receive
+five-minute TTL remain fixed. Private paged exports use caller-owned lifetimes as
+described below. Limit failures return `BootstrapLimitError` with resource,
 requested bytes/count, and limit; they never trigger reset or truncation.
 
 Network source capture should call `ExportBootstrapContext(ctx, start, end,
@@ -34,6 +35,51 @@ Mutex acquisition and individual filesystem calls, especially an in-flight fsync
 are synchronous. Cancellation is checked after lock acquisition and flushing, so
 this bounds ongoing copy/hash work rather than guaranteeing a strict lock-wait
 deadline.
+
+## Private paged metadata export
+
+`ExportRetainedBootstrapContext(ctx, expected, expectedAnchor, start, end, fence)`
+prepares a canonical records file and empty catalog without copying the entire
+range under storage or partition locks. Capture the original local content token
+before reading the retained anchor or fixed logical bounds. The retained anchor
+is independent of a suffix start; the fixed end cannot exceed the fence's committed
+HWM. The caller must hold no storage/partition locks and must establish a bounded
+creating owner with a finite lifetime and cancellation before calling. Success
+transfers `Close` responsibility to that owner. This path starts no TTL and returns
+only a private prepared handle; a future registry must check the original token
+again at publication and establish the ready-state TTL. Production networking,
+registry ownership, and recovery capability negotiation are not wired to this API.
+
+Admission retries one cleanup, checks headroom, and acquires the shared active
+slot before the first page. Pages request at most 1 MiB of serialized payload and
+1,024 records. A first oversized record retries alone with a 64 MiB limit. Every
+page checks the original generation and contributes its range-local marked-gap
+authority; an empty range still reads one page for availability and bounds checks.
+Appends and normal rolls may proceed while the fixed export is built. Destructive
+changes reject it, including truncate-and-restore ABA. After file syncs, checksums,
+and directory sync, the original generation and anchor are checked once more.
+
+All disk fields survive canonicalization, including legacy defaults, aborted
+records, and transaction controls. Exact canonical bytes plus four-byte headers
+are reserved before writes, with filesystem headroom probes outside the global
+accounting mutex. Serialization, export-file writes, checksums, and syncs hold no
+storage locks. Context checks occur between records and 256 KiB checksum reads;
+an individual filesystem operation is still non-preemptible. Failed copies return
+no handle, and failed deletion retains the active slot and complete byte charge
+in the existing cleanup queue.
+
+`RetainedWork()` reports this successful export's page attempts, actual canonical
+write bytes including headers, and checksum read bytes.
+`RetainedBootstrapWorkSnapshot()` preserves these counters across all completed
+attempts, including partial writes, failed checksums, and cancellation; concurrent
+exports contribute to its deltas. The accounting lock never covers file I/O.
+Source physical bytes, decoded frames, and segment transitions remain visible through the cumulative
+handler-wide `RetainedPageWorkSnapshot`; concurrent readers contribute to its
+deltas. Warm suffix export reuses validated checkpoints. Cold seeks and checkpoint
+eviction can scan prior segment bytes again. Tests compare that source work with
+canonical write/hash costs, and cover mixed marked/unmarked cache extensions,
+admission before reading/writing, cancellation, failed I/O and cleanup debt, and
+append progress during blocked export I/O.
 
 ## Transient ownership and failed cleanup
 
@@ -137,11 +183,15 @@ proof.
 An adopted store exposes `Bounds()`, `Acquire()`, `AppendPrepared(ctx, expected,
 suffix)`, and `Close()`. Bounds and acquisition do not hash, scan, or rebuild
 indexes. Append requires an exclusively prepared suffix in the same root with
-the same topic, partition, and compaction format, adjacent increasing logical
+the same topic and partition, adjacent increasing logical
 bounds, and a match against the entire expected published extent. The upper layer
 must certify source continuity and fences; disk does not equate transfer IDs or
 claim membership authority. The incoming manifest and its SHA-256 descriptors
 remain immutable evidence of the original transfer, separate from grown extents.
+The `Compacted` flag belongs to each original range's gap validation. Prepared
+marked and unmarked ranges may be adjacent in either order, including a fully
+compacted empty extension. Preparation still rejects actual gaps in an unmarked
+range; append never changes or ORs flags into the original manifest.
 
 Append reserves destination growth while both the old destination and the complete
 suffix remain charged. It copies only suffix records and adjusted suffix index

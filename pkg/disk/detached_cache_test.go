@@ -3,6 +3,7 @@ package disk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -379,7 +380,7 @@ func TestDetachedAppendCommittedSuffixCleanupDebtIsNotAppendFailure(t *testing.T
 }
 
 func TestDetachedAppendPreflightPreservesSuffixOwnership(t *testing.T) {
-	for _, invalid := range []string{"start", "end", "raw", "index", "topic", "partition", "format", "gap", "overlap", "empty", "root", "leased", "adopted", "self", "canceled", "limit"} {
+	for _, invalid := range []string{"start", "end", "raw", "index", "topic", "partition", "gap", "overlap", "empty", "root", "leased", "adopted", "self", "canceled", "limit"} {
 		t.Run(invalid, func(t *testing.T) {
 			root := detachedTestRoot(t)
 			prepared := detachedPreparedRange(t, root, 0, 1, nil, true)
@@ -407,8 +408,6 @@ func TestDetachedAppendPreflightPreservesSuffixOwnership(t *testing.T) {
 				suffix.transfer.metadata.Fence.Topic = "other"
 			case "partition":
 				suffix.transfer.metadata.Fence.Partition++
-			case "format":
-				suffix.transfer.metadata.Compacted = false
 			case "gap":
 				suffix.transfer.detached.extent.StartOffset++
 			case "overlap":
@@ -610,4 +609,60 @@ func TestDetachedAppendPreservesOldLeaseAndPhysicalIdentity(t *testing.T) {
 	require.Equal(t, []types.DiskMessage{first, second}, page.Messages)
 	require.Equal(t, result.Bounds, newLease.Bounds())
 	require.NoDirExists(t, suffix.transfer.dir)
+}
+
+func TestDetachedAppendMixedRangeGapAuthority(t *testing.T) {
+	for _, prefixMarked := range []bool{false, true} {
+		for _, empty := range []bool{false, true} {
+			if empty && prefixMarked {
+				continue
+			}
+			t.Run(fmt.Sprintf("prefix-marked=%t/empty=%t", prefixMarked, empty), func(t *testing.T) {
+				root := detachedTestRoot(t)
+				first := detachedCacheRecords(0, 2, 5000)
+				prepared := detachedPreparedRange(t, root, 0, 2, first, prefixMarked)
+				original := cloneBootstrapMetadata(prepared.transfer.metadata)
+				adopted, err := root.Adopt(prepared)
+				require.NoError(t, err)
+				old, err := adopted.Acquire()
+				require.NoError(t, err)
+				defer func() { require.NoError(t, old.Close()) }()
+				path := filepath.Join(prepared.transfer.dir, "records")
+				before, err := os.Stat(path)
+				require.NoError(t, err)
+				second := detachedCacheRecords(2, 2, 5000)
+				if empty {
+					second = nil
+				}
+				suffix := detachedPreparedRange(t, root, 2, 4, second, !prefixMarked)
+				raw, index := suffix.transfer.detached.extent.RawBytes, suffix.transfer.detached.extent.IndexBytes
+				result, err := adopted.AppendPrepared(context.Background(), old.Bounds(), suffix)
+				require.NoError(t, err)
+				require.NoError(t, result.CleanupError)
+				require.Equal(t, uint64(raw), result.Work.RawReadBytes)
+				require.Equal(t, uint64(raw), result.Work.RawBytes)
+				require.Equal(t, uint64(index), result.Work.IndexReadBytes)
+				require.Equal(t, original, prepared.transfer.metadata)
+				after, err := os.Stat(path)
+				require.NoError(t, err)
+				require.True(t, os.SameFile(before, after))
+				page, err := old.ReadRaw(context.Background(), 0, 10, 1<<20)
+				require.NoError(t, err)
+				require.Equal(t, first, page.Messages)
+				require.Equal(t, uint64(2), old.Bounds().EndOffset)
+				fresh, err := adopted.Acquire()
+				require.NoError(t, err)
+				defer func() { require.NoError(t, fresh.Close()) }()
+				page, err = fresh.ReadRaw(context.Background(), 0, 10, 1<<20)
+				require.NoError(t, err)
+				require.Equal(t, append(first, second...), page.Messages)
+				require.Equal(t, uint64(4), fresh.Bounds().EndOffset)
+			})
+		}
+	}
+	root := detachedTestRoot(t)
+	m, raw := detachedTestMetadata(t, detachedCacheRecords(1, 1, 100), 3, false)
+	store, err := detachedTestStage(t, root, m, raw).Prepare(context.Background())
+	require.Error(t, err, "unmarked actual gaps must still fail preparation")
+	require.Nil(t, store)
 }
