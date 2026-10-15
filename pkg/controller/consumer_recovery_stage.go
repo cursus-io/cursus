@@ -53,6 +53,7 @@ type consumerRecoveryPlan struct {
 	missing    []int
 	staged     StagedConsumerMetadataRecovery
 	sources    map[int]ConsumerMetadataRecoverySource
+	requester  fsm.BootstrapProcessIdentity
 }
 
 func cloneConsumerRecoveryMetadata(metadata []fsm.PartitionMetadata) []fsm.PartitionMetadata {
@@ -128,6 +129,11 @@ func (ch *CommandHandler) prepareConsumerRecoveryPlan(ctx context.Context, metad
 	if provider == nil {
 		return nil, fmt.Errorf("%w: nonreplica metadata staging provider unavailable", ErrConsumerRecoveryPending)
 	}
+	requester := ch.Cluster.RaftManager.GetFSM().GetBroker(localID)
+	if !consumerRecoveryProcess(requester) {
+		return nil, fmt.Errorf("%w: metadata requester unavailable", ErrConsumerRecoveryPending)
+	}
+	plan.requester = fsm.BootstrapProcessIdentity{BrokerID: requester.ID, IncarnationID: requester.IncarnationID, IncarnationEpoch: requester.IncarnationEpoch}
 	staged, err := provider(ctx, ConsumerMetadataRecoveryStageRequest{RequiredGeneration: plan.generation, Metadata: cloneConsumerRecoveryMetadata(metadata), Partitions: append([]int(nil), plan.missing...)})
 	if err != nil {
 		if staged != nil {
@@ -178,10 +184,16 @@ func (ch *CommandHandler) validateConsumerRecoveryPlan(plan *consumerRecoveryPla
 		}
 	}
 	state := ch.Cluster.RaftManager.GetFSM()
+	if len(plan.missing) > 0 {
+		requester := state.GetBroker(ch.Cluster.Router.BrokerID())
+		if !consumerRecoveryProcess(requester) || requester.ID != plan.requester.BrokerID || requester.IncarnationID != plan.requester.IncarnationID || requester.IncarnationEpoch != plan.requester.IncarnationEpoch {
+			return fmt.Errorf("%w: staged metadata requester changed", ErrConsumerRecoveryPending)
+		}
+	}
 	for _, i := range plan.missing {
 		source, ok := plan.sources[i]
 		broker := state.GetBroker(source.BrokerID)
-		if !ok || broker == nil || broker.Status != "active" || broker.IncarnationID != source.IncarnationID || broker.IncarnationEpoch != source.IncarnationEpoch || !containsReplica(metadata[i].Replicas, source.BrokerID) || !containsReplica(metadata[i].ISR, source.BrokerID) {
+		if !ok || !consumerRecoveryProcess(broker) || broker.IncarnationID != source.IncarnationID || broker.IncarnationEpoch != source.IncarnationEpoch || !containsReplica(metadata[i].Replicas, source.BrokerID) || !containsReplica(metadata[i].ISR, source.BrokerID) {
 			return fmt.Errorf("%w: staged metadata source changed", ErrConsumerRecoveryPending)
 		}
 		end, err := plan.staged.EndTopicOffset(config.ConsumerOffsetsTopicName, i)

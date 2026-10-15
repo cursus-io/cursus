@@ -201,8 +201,8 @@ Neither checkpoint size/mtime nor the process-local content generation establish
 restart authority. Durable restart reuse remains a separate proposal; the existing
 sidecar is preserved. A private paged metadata export is implemented in disk
 storage, as documented in `pkg/disk/BOOTSTRAP.md`. The metadata source registry
-and authenticated transport are implemented; provider and receiver integration
-remain separate work.
+and authenticated transport are implemented, together with the consumer metadata
+recovery provider. General replica receiver integration remains separate work.
 
 The regression contract is bounded physical reads (bytes including headers,
 records, and empty-segment transitions), completed-chunk resume after cancellation,
@@ -282,6 +282,21 @@ Discovery shutdown cancels requests, closes listeners and active sockets, then
 joins handlers before closing the source registry and its storage. A filesystem
 read already in progress remains joined even after its socket closes. Remote
 cancellation, deadline, fencing, capacity, continuity and storage failures retain
-distinct structured classifications. Production recovery capability remains zero;
-the metadata provider, receiver integration and general replica bootstrap bundle
-are not active.
+distinct structured classifications.
+
+The process command handler owns the consumer metadata recovery cache under
+`@recovery/consumer-metadata`, outside valid topic directories. Staging requires
+current active source and requester incarnations advertising capability 2. It
+downloads raw records and transaction markers before consumer recovery gates;
+fixed local leases evaluate the receiver's current transaction decisions on every
+read. Fresh source certificates allow same-end reuse or suffix-only transfer and
+history construction; a certificate miss requires a full replacement. Old leases
+retain their fixed ends through appends and replacements.
+
+Two process-wide inbound permits cover transfer and local publication work,
+independently of six source captures. The adopted-store limit is the effective
+partition limit plus two, including retired, pinned and undeleted generations;
+shared disk and metadata-history budgets remain charged until ownership ends.
+Shutdown joins staging and readers, and reports physical cleanup debt without
+spinning. Production recovery capability remains zero until the general replica
+receiver, resumable installation and remaining recovery bundle are complete.
