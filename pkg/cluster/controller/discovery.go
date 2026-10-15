@@ -42,9 +42,11 @@ type serviceDiscovery struct {
 	incarnationID    string
 	heartbeatTimeout time.Duration
 
-	livenessMu  sync.RWMutex
-	lastSeen    map[string]time.Time
-	leaderSince time.Time
+	livenessMu      sync.RWMutex
+	lastSeen        map[string]time.Time
+	leaderSince     time.Time
+	bootstrapMu     sync.RWMutex
+	bootstrapSource BootstrapTransferSource
 }
 
 func NewServiceDiscoveryImpl(rm RaftManager, brokerID, addr, clientAddr string) *serviceDiscovery {
