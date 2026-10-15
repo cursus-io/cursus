@@ -78,11 +78,7 @@ func TestReplicaRecoveryIndexReusesGenerationAndReadsOnlyAppendedSuffix(t *testi
 }
 
 func TestReplicaRecoveryIndexCertificateInvalidatedByPartialReplayFailure(t *testing.T) {
-	for _, reset := range []bool{false, true} {
-		name := "incremental"
-		if reset {
-			name = "explicit_reset"
-		}
+	for _, name := range []string{"incremental", "explicit_reset", "replica_catchup"} {
 		t.Run(name, func(t *testing.T) {
 			h, p := newBootstrapHandler(t)
 			require.NoError(t, p.ReplicaAppend([]types.Message{{Offset: 0, Key: "stream", AggregateVersion: 1, Payload: "first"}}))
@@ -101,17 +97,29 @@ func TestReplicaRecoveryIndexCertificateInvalidatedByPartialReplayFailure(t *tes
 			// Replay changes the index before discovering the later version gap.
 			require.NoError(t, p.ReplicaAppend([]types.Message{{Offset: 1, Key: "stream", AggregateVersion: 2, Payload: "valid suffix"}, {Offset: 2, Key: "stream", AggregateVersion: 4, Payload: "gap"}}))
 			require.NoError(t, p.ApplyReplicaHWM(3))
-			if reset {
+			switch name {
+			case "explicit_reset":
 				err = h.RecoverIndexFromLog("orders", 0, idx)
-			} else {
+			case "replica_catchup":
+				release := p.BeginReplicationMutation()
+				witness, captureErr := p.CaptureReplicaRequestWitness(context.Background(), 3)
+				require.NoError(t, captureErr)
+				err = p.WithReplicaCatchupIndexView(context.Background(), witness, 3, func(v *topic.PartitionReadView) error { return h.IndexReplicaCatchupWithView("orders", 0, 3, v) })
+				release()
+			default:
 				err = h.IndexCommittedToHWM("orders", 0, 3)
 			}
 			require.ErrorContains(t, err, "stream index gap")
-			require.Equal(t, uint64(2), idx.GetVersion("stream"), "error occurs after partial derived-state mutation")
+			_, versionErr := idx.CheckedVersion("stream")
+			require.ErrorIs(t, versionErr, ErrStreamIndexInvalid, "partial derived-state mutation is never readable")
 			h.mu.RLock()
 			_, certified = h.replicaIndexGenerations["orders:0"]
+			_, cached := h.indexes["orders:0"]
 			h.mu.RUnlock()
+			require.False(t, cached, "a partially rebuilt index must be retired")
 			require.False(t, certified, "a partially changed index cannot retain its recovery certificate")
+			require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=stream version=3 message=unsafe"), "stream index gap", "the next append must recover from the log, not continue from partial version 2")
+			require.Equal(t, uint64(3), p.NextOffset())
 		})
 	}
 }
