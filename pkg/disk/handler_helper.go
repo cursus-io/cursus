@@ -72,6 +72,9 @@ func (d *DiskHandler) Close() error {
 		close(d.done)
 		d.mu.Unlock()
 		d.shutdown.Wait()
+		// No storage lock may be held while joining a detached proof builder.
+		d.lineageMu.Lock()
+		defer d.lineageMu.Unlock()
 		if err := d.shutdownError(); err != nil {
 			errs = append(errs, err)
 		}

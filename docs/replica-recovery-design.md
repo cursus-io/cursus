@@ -116,14 +116,10 @@ resolved before handoff. PR merging remains user-owned.
 
 ## Receiver verification authority
 
-Kafka's [4.1 AbstractFetcherThread](https://github.com/apache/kafka/blob/4.1/core/src/main/scala/kafka/server/AbstractFetcherThread.scala)
-checks the original request offset and current leader epoch before consuming a
-fetch response. Its [4.1 Partition](https://github.com/apache/kafka/blob/4.1/core/src/main/scala/kafka/cluster/Partition.scala)
-checks replica eligibility, the committed boundary and leader-epoch start before
-ISR expansion. Cursus adopts request-bound response validation and a separate
-admission check. Its Raft-authoritative HWM, push replication and possible
-same-epoch content divergence require additional local content-generation
-evidence; matching epoch/offset tuples alone cannot certify a repaired log.
+Response validation is bound to the original request, with a separate ISR
+admission check. The Raft-authoritative HWM, push replication and possible
+same-epoch content divergence require local content-generation evidence;
+matching epoch/offset tuples alone cannot certify a repaired log.
 
 Implemented receiver witnesses bind the original partition, pre-challenge disk
 generation, verification attempt and reconciliation-marker revision. The actual
@@ -151,16 +147,14 @@ requirements. Regression checks cover earlier-prefix rewrites with identical
 tails, snapshot-transfer races, marker replacement, repeated and multi-partition
 repairs, and a raw disk rewrite immediately before replay publication.
 The shared proof builder withholds offsets-partition ISR admission until pending
-full replay finishes: this is a Cursus consumer-transition constraint beyond
-Kafka's epoch/offset eligibility checks, keeping recovery verification available
+full replay finishes, keeping recovery verification available
 if concurrent non-ISR replication advances the boundary before replay.
 
 ## Speculative tail and committed-watermark repair
 
-Kafka's [4.1 AbstractFetcherThread, lines 193–208](https://github.com/apache/kafka/blob/4.1/core/src/main/scala/kafka/server/AbstractFetcherThread.scala#L193-L208)
-serializes truncation with current fetch-state validation. This follow-up adopts
-that exclusion for both Cursus tail-repair entry points, reusing the checked
-physical rollback engine. Cursus must retain separate publication policies:
+Both tail-repair entry points serialize truncation with current recovery-state
+validation through the checked physical rollback engine. They retain separate
+publication policies:
 speculative repair preserves the old HWM and its authority; committed reconciliation
 publishes the Raft watermark only after index rebuild and durable checkpoints.
 Canonical divergence rollback may still lower a stale local HWM.
@@ -184,13 +178,43 @@ incremental recovery remain separate proposals.
 
 ## Outstanding audit follow-ups
 
-- Cold sidecar rebuilds still scan retained history under recovery/storage locks.
-  Measure bytes hashed, disk I/O, fence/lock contention and elapsed time; introduce
-  byte/time budgets separately. Cursus currently rebuilds authoritative cumulative
-  evidence on its first explicit proof request. A record cap on later
-  periodic updates does not fix cold-start work or variable-size records.
+- Lineage now rebuilds through resumable physical chunks bounded by 1 MiB,
+  1,024 records and 64 segment EOF transitions, with one MaxMessageSize-bounded
+  first-record allowance. Hashing and sidecar I/O occur outside storage locks;
+  an immutable scalar publication is separate from mutable builder progress.
+  A 128-entry endpoint cache and byte-aware checkpoints bound repeated historical
+  work. Cold restart still scans the retained bytes once and never trusts the old
+  sidecar; durable restart reuse remains a separate proposal. Budgets cannot
+  preempt a filesystem operation already in progress.
 - Compacted recovery retains full-prefix rescans. Measure repeated scan bytes and
   work before claiming an efficient retained-range solution.
 - Consumer metadata still has a transitional global strict replay gate. Validate
   availability under busy unrelated traffic and prepare partition-scoped recovery.
   This layer does not change that architecture or claim to fix its availability cost.
+
+## Bounded lineage reconstruction contract
+
+Derived-index work proceeds incrementally outside the acknowledgement path,
+preserving canonical same-epoch content proofs and rebuilding cold from the log.
+Neither checkpoint size/mtime nor the process-local content generation establishes
+restart authority. Durable restart reuse and detached retained export remain
+separate proposals; the existing sidecar is preserved.
+
+The regression contract is bounded physical reads (bytes including headers,
+records, and empty-segment transitions), completed-chunk resume after cancellation,
+zero historical work for cached endpoints, suffix-only append work, canonical
+hash equivalence, byte-aware sparse checkpoints, marked-hole validation, corrupt
+EOF rejection, append/rotation cursor continuation and destructive-generation
+invalidation. A fixed prefix may stop at its certified boundary; a durable tail
+requires clean EOF. Tests must also cover mutation during publication, one builder
+under concurrent requests, slow sidecar sync without delayed data acknowledgement,
+shutdown without late publication, and cold restart ignoring old sidecar progress.
+Measure physical bytes and journal work, not just request counts. Budgets are
+cooperative: a filesystem read or fsync already in progress cannot be preempted;
+one first oversized frame is explicitly limited by MaxMessageSize.
+
+Public lineage requests continue to prepare the entire captured durable tail
+before answering an earlier endpoint. They therefore still fail closed on later
+corruption in that captured tail. The private cursor's fixed-prefix stop rule is
+for bounded internal endpoint work and future reuse; it does not change that
+public API contract or make arbitrary public historical proofs ignore corruption.

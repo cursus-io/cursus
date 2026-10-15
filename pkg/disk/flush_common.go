@@ -136,14 +136,12 @@ func (d *DiskHandler) syncLoop() {
 			}
 
 			currentOffset := atomic.LoadUint64(&d.AbsoluteOffset)
-			if syncSuccess {
-				d.updateLineageAfterSyncLocked()
-			}
 			d.ioMu.Unlock()
 			d.mu.Unlock()
 
 			if syncSuccess {
 				d.notifySync(currentOffset)
+				d.requestLineageUpdate()
 			}
 		case <-d.done:
 			return
