@@ -113,8 +113,8 @@ Stale stage/prepared handles cannot acquire or delete an adopted generation;
 existing prepared leases remain valid. The caller derives `maxAdoptedStores` from
 its bounded partition vector plus an allowance for retired generations, rather
 than from the eight-active-transfer limit. Pinned, retired, zero-byte, and
-failed-cleanup generations all occupy their slot until actual deletion. There is
-no topic adapter or production provider integration yet.
+failed-cleanup generations all occupy their slot until actual deletion. A topic
+visibility adapter is available; production provider integration is not yet wired.
 
 `store.Acquire()` opens a `DetachedRawLease` with its own records/index handles,
 fixed logical start/end, fixed raw byte length, and fixed index extent. Acquisition
@@ -189,3 +189,14 @@ deterministic cleanup rotation, atomic extent changes, old lease visibility,
 suffix-only read/write costs, bounded seeks after repeated small appends,
 aggregate peak admission, prepublication rollback, retained tail debt with retry,
 committed suffix cleanup failure, identity/CAS rejection, and ownership races.
+
+`topic.DetachedMetadataStore` filters committed metadata using the current receiver
+resolver supplied on each read. Marker history respects each lease's fixed end;
+append scans only the prepared suffix. All adapters must share one
+`DetachedMetadataBudget`, which bounds retained keys, ID bytes, marker backing
+capacities (including replacement peaks), and concurrent decode scratch. Visible
+pages contain at most 1 MiB of serialized payloads or 1024 records; a first
+oversized record up to 64 MiB is returned alone. Store and budget work counters
+include actual failed attempts and retries, including failed constructor scans
+in the budget totals. After retirement, the last lease releases history charges
+even when physical cleanup reports an error.
