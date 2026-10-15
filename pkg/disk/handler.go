@@ -88,7 +88,11 @@ type DiskHandler struct {
 	segmentReaders     *segmentReaderCache
 	mu                 sync.Mutex    // metadata(offset, segment), file handler(d.file)
 	ioMu               sync.Mutex    // bufio.Writer, flush
-	lineage            *lineageIndex // protected by mu; publication also holds ioMu
+	lineage            *lineageIndex // immutable published scalar view, protected by mu
+	lineageMu          sync.Mutex    // builder gate, always acquired BEFORE storage locks
+	lineageProgress    *lineageBuild // owned exclusively by lineageMu
+	lineageRequests    chan struct{}
+	lineageSyncFn      func(*os.File) error // optional sidecar sync test seam
 	// A nil index remains uninitialized until an explicit proof request. Failed
 	// background publication also waits for explicit recovery. Protected by mu.
 	lineageAutoSuppressed bool
@@ -424,7 +428,12 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	// Leave lineage uninitialized: only an explicit proof request may rebuild
 	// it from retained records. Startup never trusts or hashes an old sidecar.
 
-	dh.shutdown.Add(2)
+	dh.lineageRequests = make(chan struct{}, 1)
+	dh.shutdown.Add(3)
+	go func() {
+		defer dh.shutdown.Done()
+		dh.lineageLoop()
+	}()
 	go func() {
 		defer dh.shutdown.Done()
 		dh.flushLoop()
