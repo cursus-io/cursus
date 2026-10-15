@@ -145,7 +145,10 @@ type bootstrapTransfer struct {
 	received        map[string]int64
 }
 
-type BootstrapExport struct{ transfer *bootstrapTransfer }
+type BootstrapExport struct {
+	transfer     *bootstrapTransfer
+	retainedWork RetainedBootstrapWork
+}
 type BootstrapReceiver struct {
 	transfer *bootstrapTransfer
 	handler  *DiskHandler

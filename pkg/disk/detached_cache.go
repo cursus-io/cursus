@@ -210,7 +210,7 @@ func repairDetachedTail(t *bootstrapTransfer, raw, index *os.File) error {
 }
 
 // AppendPrepared appends a verified suffix to this generation. The upper layer
-// must certify source continuity and fencing; disk checks identity, format,
+// must certify source continuity and fencing; disk checks identity,
 // adjacency, and the entire expected extent, without equating transfer IDs.
 // Validation, file-open, and reservation failures leave suffix caller-owned.
 // Once copying starts, suffix is consumed and retired on every outcome. A nil
@@ -245,8 +245,10 @@ func (s *AdoptedRawStore) AppendPrepared(ctx context.Context, expected DetachedR
 		return result, fmt.Errorf("detached suffix is not exclusively prepared in this root")
 	}
 	old, incoming := c.extent, source.extent
-	if expected != old || t.metadata.Fence.Topic != u.metadata.Fence.Topic || t.metadata.Fence.Partition != u.metadata.Fence.Partition || t.metadata.Compacted != u.metadata.Compacted || incoming.StartOffset != old.EndOffset || incoming.EndOffset <= old.EndOffset {
-		return result, fmt.Errorf("detached suffix identity, format, adjacency, or expected extent mismatch")
+	// Compacted is each prepared range's gap authority, not a cache format.
+	// Preparation already validated both ranges; the original manifest stays immutable.
+	if expected != old || t.metadata.Fence.Topic != u.metadata.Fence.Topic || t.metadata.Fence.Partition != u.metadata.Fence.Partition || incoming.StartOffset != old.EndOffset || incoming.EndOffset <= old.EndOffset {
+		return result, fmt.Errorf("detached suffix identity, adjacency, or expected extent mismatch")
 	}
 	raw, index, err := openDetachedAppendFiles(t)
 	if err != nil {
