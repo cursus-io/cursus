@@ -90,6 +90,9 @@ type DiskHandler struct {
 	ioMu               sync.Mutex    // bufio.Writer, flush
 	lineage            *lineageIndex // immutable published scalar view, protected by mu
 	lineageMu          sync.Mutex    // builder gate, always acquired BEFORE storage locks
+	retainedPageMu     sync.Mutex    // page gate, always acquired BEFORE storage locks
+	retainedPageWork   RetainedPageWork
+	retainedCursors    []rawFrameCursor
 	lineageProgress    *lineageBuild // owned exclusively by lineageMu
 	lineageRequests    chan struct{}
 	lineageSyncFn      func(*os.File) error // optional sidecar sync test seam

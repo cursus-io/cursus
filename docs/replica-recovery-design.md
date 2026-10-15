@@ -186,8 +186,9 @@ incremental recovery remain separate proposals.
   work. Cold restart still scans the retained bytes once and never trusts the old
   sidecar; durable restart reuse remains a separate proposal. Budgets cannot
   preempt a filesystem operation already in progress.
-- Compacted recovery retains full-prefix rescans. Measure repeated scan bytes and
-  work before claiming an efficient retained-range solution.
+- Full-prefix compacted proofs and bootstrap reconstruction retain full scans.
+  Ordinary retained pages reuse process-local validated physical positions as
+  described below; that does not remove the work of those separate proofs.
 - Consumer metadata still has a transitional global strict replay gate. Validate
   availability under busy unrelated traffic and prepare partition-scoped recovery.
   This layer does not change that architecture or claim to fix its availability cost.
@@ -218,3 +219,47 @@ before answering an earlier endpoint. They therefore still fail closed on later
 corruption in that captured tail. The private cursor's fixed-prefix stop rule is
 for bounded internal endpoint work and future reuse; it does not change that
 public API contract or make arbitrary public historical proofs ignore corruption.
+
+## Retained-page physical progress
+
+Ordinary retained pages reuse a bounded cache of 128 validated raw cursor
+checkpoints. Each checkpoint contains the local content generation, retained
+anchor, exact segment, byte position and certified logical predecessor boundary;
+it contains no record payload and is never persisted or transmitted. Cold seeks
+start at the intersecting segment base and validate every skipped frame, ignoring
+the sparse index. Append and normal rotation preserve progress; destructive
+generation changes, handler replacement and restart require cold validation.
+The API does not detect out-of-band rewriting of bytes already certified in the
+same process generation.
+
+A context-aware page gate owns the cache. It is never nested with the lineage
+builder gate. Storage locks cover durability capture and individual raw chunks,
+bounded by 1 MiB, 256 records and 64 EOF transitions; one first oversized record
+may exceed the byte budget by at most MaxMessageSize plus its frame header.
+Decode, identity/order/gap validation and page assembly occur after releasing
+storage locks. The capture budget shrinks with the remaining page limits so a
+one-record previous-record proof does not read a large suffix. Read counters
+include actual header, payload and read-ahead bytes, including failed requests.
+A filesystem read or fsync already in progress remains non-preemptible.
+
+Checkpoint publication and successful page return recheck availability, generation,
+retained anchor and segment membership. Completed skipped-prefix chunks survive
+cancellation; canceled calls return no partial page. Selection never skips past
+the next request's start. The cache keeps the position before the last included
+record and before the first omitted record, allowing sequential source catch-up
+to interleave previous-record digests with suffix pages without rescanning history.
+The first omitted frame still requires identity/order/gap validation. Marked
+leading, interior and trailing holes retain segment-local authority; unmarked
+holes fail. Fixed prefixes can stop at their certified boundary, while a captured
+durable tail needs clean EOF including partial-header rejection.
+
+Regression checks cover actual source catch-up with previous-record digests,
+record and byte limits, physical bytes and decoded frames, cold corruption before
+arbitrary starts and forged indexes, bounded metadata eviction, concurrent seeks,
+marked empty-segment transitions, queued and in-flight cancellation with exact
+retry, mutation before publication, append/rotation, destructive ABA and cold
+reopen. Sequential pages have source-byte work plus bounded boundary rereads.
+Arbitrary seeks or enough interleaved followers can evict useful checkpoints and
+repeat cold segment work; no unconditional linear-work guarantee is made for
+those workloads. Full retained scans, bootstrap and ordinary readers keep their
+existing contracts.
