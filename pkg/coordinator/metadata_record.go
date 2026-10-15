@@ -732,6 +732,9 @@ func (c *Coordinator) writeGroupTombstone(groupName, topicName string, epoch uin
 	})
 }
 
+// recoverConsumerMetadata scans durable metadata and reconciles it with installed
+// group state. Distributed registration timestamps can fill unknown activity;
+// matching lifecycle snapshots remain authoritative, including their fallbacks.
 func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerMetadataRecoveryStatus, error) {
 	const batchSize = 1024
 	status := ConsumerMetadataRecoveryStatus{Phase: "consumer_metadata_scan"}
@@ -1129,6 +1132,9 @@ func validateSelectedLifecycleSnapshots(snapshots map[string]lifecycleSnapshotCa
 	return nil
 }
 
+// materializeConsumerMetadata builds groups from selected replay candidates.
+// restoreRegistrationActivity enables the distributed registration timestamp
+// fallback; zero timestamps remain unknown and lifecycle state takes precedence.
 func materializeConsumerMetadata(
 	lifecycles map[string]lifecycleCandidate,
 	lifecycleSnapshots map[string]lifecycleSnapshotCandidate,

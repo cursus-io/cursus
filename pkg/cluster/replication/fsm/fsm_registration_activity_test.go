@@ -14,14 +14,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// registrationActivityReader measures scan calls, returned records, and payload
+// bytes so registration recovery cannot silently add another log scan.
 type registrationActivityReader struct {
 	messages                     []types.Message
 	calls, records, payloadBytes int
 }
 
-func (*registrationActivityReader) Publish(string, *types.Message) error       { return nil }
-func (*registrationActivityReader) CreateTopic(string, int, bool, bool) error  { return nil }
+// Publish satisfies coordinator setup without changing the replay fixture.
+func (*registrationActivityReader) Publish(string, *types.Message) error { return nil }
+
+// CreateTopic keeps the fixture's internal topic available without storage setup.
+func (*registrationActivityReader) CreateTopic(string, int, bool, bool) error { return nil }
+
+// ExistingPartitionCount exposes four partitions, including three empty scans.
 func (*registrationActivityReader) ExistingPartitionCount(string) (int, error) { return 4, nil }
+
+// ReadTopicPartition returns the requested fixture batch and counts its actual
+// payload bytes, including repeated reads if recovery scans a record again.
 func (r *registrationActivityReader) ReadTopicPartition(_ string, partition int, offset uint64, max int) ([]types.Message, error) {
 	r.calls++
 	var result []types.Message
@@ -37,6 +47,8 @@ func (r *registrationActivityReader) ReadTopicPartition(_ string, partition int,
 	return result, nil
 }
 
+// recoverRegistrationActivity replays one distributed registration and verifies
+// readiness and scan cost without assuming its timestamp is known.
 func recoverRegistrationActivity(t *testing.T, registration coordinator.ConsumerMetadataRecord) (*coordinator.Coordinator, *registrationActivityReader) {
 	t.Helper()
 	payload, key, err := coordinator.EncodeConsumerMetadataRecord(registration)
@@ -54,6 +66,8 @@ func recoverRegistrationActivity(t *testing.T, registration coordinator.Consumer
 	return c, reader
 }
 
+// TestDistributedRegistrationActivitySnapshotRoundTrip preserves exact registration
+// activity and group state through the real FSM snapshot, persist, and restore path.
 func TestDistributedRegistrationActivitySnapshotRoundTrip(t *testing.T) {
 	registeredAt := time.Unix(100, 123).UTC()
 	for _, test := range []struct {
@@ -95,6 +109,8 @@ func TestDistributedRegistrationActivitySnapshotRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDistributedRegistrationActivityUnknownRefusesSnapshot permits historical
+// unknown timestamps during replay but prevents publishing an unrestorable snapshot.
 func TestDistributedRegistrationActivityUnknownRefusesSnapshot(t *testing.T) {
 	c, _ := recoverRegistrationActivity(t, coordinator.ConsumerMetadataRecord{
 		Version: coordinator.ConsumerMetadataRecordVersion, Type: coordinator.ConsumerMetadataRecordRegistration,
@@ -106,6 +122,8 @@ func TestDistributedRegistrationActivityUnknownRefusesSnapshot(t *testing.T) {
 	require.Nil(t, snapshot)
 }
 
+// TestRegistrationActivityRestoreRejectsExistingInvalidSnapshotAtomically verifies
+// that old zero-activity snapshots cannot replace valid installed group state.
 func TestRegistrationActivityRestoreRejectsExistingInvalidSnapshotAtomically(t *testing.T) {
 	c, _ := recoverRegistrationActivity(t, coordinator.ConsumerMetadataRecord{
 		Version: coordinator.ConsumerMetadataRecordVersion, Type: coordinator.ConsumerMetadataRecordRegistration,

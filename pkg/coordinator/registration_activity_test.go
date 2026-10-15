@@ -10,6 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestDistributedRegistrationActivityMerge verifies that replay fills unknown
+// activity while preserving an existing nonzero observation, older or newer.
 func TestDistributedRegistrationActivityMerge(t *testing.T) {
 	registeredAt := time.Unix(100, 0).UTC()
 	for _, existingActivity := range []time.Time{{}, registeredAt.Add(-time.Minute), registeredAt.Add(time.Minute)} {
@@ -40,6 +42,8 @@ func TestDistributedRegistrationActivityMerge(t *testing.T) {
 	}
 }
 
+// TestDistributedRegistrationActivityLifecyclePrecedence keeps lifecycle activity
+// and its legacy fallbacks authoritative even when all lifecycle times are unknown.
 func TestDistributedRegistrationActivityLifecyclePrecedence(t *testing.T) {
 	registeredAt := time.Unix(100, 0).UTC()
 	activity := registeredAt.Add(time.Second)
