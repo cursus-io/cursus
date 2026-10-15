@@ -233,18 +233,19 @@ func (h *Handler) CaptureBootstrapCatalog(name string, partition int, view *topi
 func (h *Handler) DetachPartitionForBootstrap(name string, partition int) error {
 	key := name + ":" + strconv.Itoa(partition)
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	var errs []error
-	if idx := h.indexes[key]; idx != nil {
-		errs = append(errs, idx.Close())
-		delete(h.indexes, key)
-	}
-	if ss := h.snapshots[key]; ss != nil {
-		errs = append(errs, ss.Close())
-		delete(h.snapshots, key)
-	}
+	idx, ss := h.indexes[key], h.snapshots[key]
+	delete(h.indexes, key)
+	delete(h.snapshots, key)
 	delete(h.indexedHWM, key)
 	delete(h.replicaIndexGenerations, key)
+	h.mu.Unlock()
+	var errs []error
+	if idx != nil {
+		errs = append(errs, idx.Close())
+	}
+	if ss != nil {
+		errs = append(errs, ss.Close())
+	}
 	return errors.Join(errs...)
 }
 

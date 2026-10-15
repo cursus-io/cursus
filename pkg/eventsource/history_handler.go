@@ -58,7 +58,10 @@ func (h *Handler) HandleReadStreamHistory(cmd string, conn net.Conn) {
 		if err != nil {
 			return fmt.Errorf("stream_index_failed: %w", err)
 		}
-		head = idx.GetVersion(key)
+		head, err = idx.CheckedVersion(key)
+		if err != nil {
+			return err
+		}
 		to := head
 		if supplied := args["to_version"]; supplied != "" {
 			to, err = strconv.ParseUint(supplied, 10, 64)
