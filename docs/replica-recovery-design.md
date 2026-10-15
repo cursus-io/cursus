@@ -8,32 +8,22 @@ Production registration advertises recovery protocol **0** until the complete
 bootstrap bundle is installed. The retained-range bootstrap section below is
 planned behavior, not an available recovery service in this layer.
 
-## Kafka comparison and regression contract
+## Recovery design and regression contract
 
-[KIP-101](https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=177052956)
-uses leader-epoch boundaries to avoid discarding a valid prefix unnecessarily.
-Cursus adopts that recovery-cost objective, but must prove cumulative record
-equality for same-epoch divergence and legacy epoch-zero records. An epoch match
-alone cannot justify truncation in Cursus. Tail-relative probes preserve the last
-good record when only the final record diverges; a matching final record cannot
-hide earlier divergence.
+Recovery must preserve proven common records while detecting same-epoch
+divergence and legacy epoch-zero records. An epoch match alone cannot justify
+truncation. Tail-relative probes preserve the last good record when only the
+final record diverges; a matching final record cannot hide earlier divergence.
 
-[KIP-320](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/87295403/KIP-320%2BAllow%2Bfetchers%2Bto%2Bdetect%2Band%2Bhandle%2Blog%2Btruncation)
-fences fetchers using leader epochs. Cursus keeps its source, receiver, leader,
-leader-epoch and lifecycle fences through storage mutation. The existing legacy
-wire fields and lifecycle protocol 6 remain compatible; unknown mandatory
-recovery versions fail closed.
+Source, receiver, leader, leader-epoch and lifecycle fences remain in force
+through storage mutation. The existing legacy wire fields and lifecycle
+protocol 6 remain compatible; unknown mandatory recovery versions fail closed.
 
-[KIP-392](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/95653762/KIP-392%2BAllow%2Bconsumers%2Bto%2Bfetch%2Bfrom%2Bclosest%2Breplica)
-accounts for replicas retaining different log starts. The implemented epoch and
-out-of-range paths in Kafka's versioned
-[4.1 AbstractFetcherThread](https://github.com/apache/kafka/blob/4.1/core/src/main/scala/kafka/server/AbstractFetcherThread.scala)
-also distinguish truncation from recovery below a retained start. Cursus cannot
-make different cumulative-hash anchors comparable by selecting the larger start.
-It requires a separately fenced retained-range bootstrap with derived-state
-recovery. Until that is complete, unavailable recovery stays unavailable: this
-layer's capability gate prevents premature activation, but does not solve
-retention recovery.
+Different cumulative-hash anchors cannot be made comparable by selecting the
+larger start. Recovery below a retained start requires a separately fenced
+retained-range bootstrap with derived-state recovery. Until that is complete,
+unavailable recovery stays unavailable: this layer's capability gate prevents
+premature activation, but does not solve retention recovery.
 
 Regression checks derived before implementation cover every small-span rollback
 boundary, nonzero anchors, a near-million-record tail with one bad record,
@@ -128,15 +118,11 @@ resolved before handoff. PR merging remains user-owned.
 
 - Cold sidecar rebuilds still scan retained history under recovery/storage locks.
   Measure bytes hashed, disk I/O, fence/lock contention and elapsed time; introduce
-  byte/time budgets separately. Kafka's
-  [4.1 LeaderEpochFileCache](https://github.com/apache/kafka/blob/4.1/storage/src/main/java/org/apache/kafka/storage/internals/epoch/LeaderEpochFileCache.java)
-  loads persisted epoch checkpoints, while Cursus currently rebuilds authoritative
-  cumulative evidence on its first explicit proof request. A record cap on later
+  byte/time budgets separately. Cursus currently rebuilds authoritative cumulative
+  evidence on its first explicit proof request. A record cap on later
   periodic updates does not fix cold-start work or variable-size records.
 - Compacted recovery retains full-prefix rescans. Measure repeated scan bytes and
   work before claiming an efficient retained-range solution.
 - Consumer metadata still has a transitional global strict replay gate. Validate
-  availability under busy unrelated traffic and prepare partition-scoped recovery;
-  Kafka's [4.1 GroupCoordinatorService](https://github.com/apache/kafka/blob/4.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java)
-  has per-partition election/resignation hooks. This layer does not change that
-  architecture or claim to fix its availability cost.
+  availability under busy unrelated traffic and prepare partition-scoped recovery.
+  This layer does not change that architecture or claim to fix its availability cost.

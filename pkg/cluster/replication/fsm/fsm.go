@@ -767,6 +767,8 @@ func (f *BrokerFSM) ValidateLocalLeaderLogs(brokerID string) error {
 	return nil
 }
 
+// Snapshot captures FSM state and rejects consumer groups that Restore cannot
+// accept, including live groups whose last activity is still unknown.
 func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.transitionMu.Lock()
 	defer f.transitionMu.Unlock()
@@ -828,6 +830,9 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	var groupState map[string]*coordinator.GroupStateSnapshot
 	if f.cd != nil {
 		groupState = f.cd.ExportState()
+		if err := coordinator.ValidateImportState(groupState); err != nil {
+			return nil, fmt.Errorf("snapshot consumer groups: %w", err)
+		}
 	}
 	transactionState := f.restoredTransactionState
 	nextProducerEpoch := f.restoredNextProducerEpoch

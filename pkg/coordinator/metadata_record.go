@@ -732,6 +732,9 @@ func (c *Coordinator) writeGroupTombstone(groupName, topicName string, epoch uin
 	})
 }
 
+// recoverConsumerMetadata scans durable metadata and reconciles it with installed
+// group state. Distributed registration timestamps can fill unknown activity;
+// matching lifecycle snapshots remain authoritative, including their fallbacks.
 func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerMetadataRecoveryStatus, error) {
 	const batchSize = 1024
 	status := ConsumerMetadataRecoveryStatus{Phase: "consumer_metadata_scan"}
@@ -865,7 +868,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 	}
 
 	status.Phase = "group_registration_replay"
-	groups, groupEpochs, orphanCount, err := materializeConsumerMetadata(candidates.lifecycles, candidates.lifecycleSnapshots, candidates.offsetSnapshots, legacy, legacyRecordCounts, &status)
+	groups, groupEpochs, orphanCount, err := materializeConsumerMetadata(candidates.lifecycles, candidates.lifecycleSnapshots, candidates.offsetSnapshots, legacy, legacyRecordCounts, !c.standalone, &status)
 	if err == nil {
 		var reservationOrphans int
 		reservationOrphans, err = restoreOffsetReservations(groups, candidates.reservationSnapshots)
@@ -1017,7 +1020,9 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 		}
 		if snapshot, ok := candidates.lifecycleSnapshots[groupName]; !ok || snapshot.record.Epoch != recovered.RegistrationEpoch {
 			recovered.Generation = existing.Generation
-			recovered.LastActivity = existing.LastActivity
+			if c.standalone || !existing.LastActivity.IsZero() {
+				recovered.LastActivity = existing.LastActivity
+			}
 			recovered.LastRebalance = existing.LastRebalance
 			recovered.Members = make(map[string]*MemberMetadata, len(existing.Members))
 			for memberID, member := range existing.Members {
@@ -1127,12 +1132,16 @@ func validateSelectedLifecycleSnapshots(snapshots map[string]lifecycleSnapshotCa
 	return nil
 }
 
+// materializeConsumerMetadata builds groups from selected replay candidates.
+// restoreRegistrationActivity enables the distributed registration timestamp
+// fallback; zero timestamps remain unknown and lifecycle state takes precedence.
 func materializeConsumerMetadata(
 	lifecycles map[string]lifecycleCandidate,
 	lifecycleSnapshots map[string]lifecycleSnapshotCandidate,
 	offsetSnapshots map[string]offsetCandidate,
 	legacy legacyRecoveryState,
 	legacyRecordCounts map[string]int,
+	restoreRegistrationActivity bool,
 	status *ConsumerMetadataRecoveryStatus,
 ) (map[string]*GroupMetadata, map[string]uint64, int, error) {
 	groups := make(map[string]*GroupMetadata)
@@ -1164,6 +1173,11 @@ func materializeConsumerMetadata(
 			Offsets:           make(map[string]map[int]uint64),
 			RegistrationEpoch: record.Epoch,
 			OffsetRevisions:   make(map[string]uint64),
+		}
+		if restoreRegistrationActivity {
+			// A durable registration is the only observed activity for a group
+			// with no lifecycle snapshot. Historical zero timestamps stay unknown.
+			group.LastActivity = record.Timestamp
 		}
 		if record.Version == ConsumerMetadataRecordVersionSubscriptions {
 			group.TopicName = subscriptionDisplayName(record.Topics, record.TopicPattern)

@@ -218,9 +218,9 @@ and leaves local data unchanged. Never fall back to legacy truncation or choose
 a larger anchor to bypass `BootstrapRequired`. Automated retained-range bootstrap
 remains the next layer of #246, and production capability remains 0 in this layer.
 
-The [Kafka comparison and regression contract](../replica-recovery-design.md#kafka-comparison-and-regression-contract)
-records which epoch, fencing and independent-retention behavior Cursus adopts
-and why same-epoch/legacy cumulative proofs and a separate bootstrap are needed.
+The [recovery design and regression contract](../replica-recovery-design.md#recovery-design-and-regression-contract)
+describes epoch and lifecycle fencing, same-epoch/legacy cumulative proofs,
+and the separate bootstrap required when retained anchors differ.
 Outstanding audit follow-ups remain cold sidecar rebuild bytes/time and lock
 contention, compacted full-prefix rescan work, and consumer metadata's global
 strict replay gate under busy unrelated traffic. None is fixed by these probe or
