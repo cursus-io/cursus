@@ -865,7 +865,7 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 	}
 
 	status.Phase = "group_registration_replay"
-	groups, groupEpochs, orphanCount, err := materializeConsumerMetadata(candidates.lifecycles, candidates.lifecycleSnapshots, candidates.offsetSnapshots, legacy, legacyRecordCounts, &status)
+	groups, groupEpochs, orphanCount, err := materializeConsumerMetadata(candidates.lifecycles, candidates.lifecycleSnapshots, candidates.offsetSnapshots, legacy, legacyRecordCounts, !c.standalone, &status)
 	if err == nil {
 		var reservationOrphans int
 		reservationOrphans, err = restoreOffsetReservations(groups, candidates.reservationSnapshots)
@@ -1017,7 +1017,9 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 		}
 		if snapshot, ok := candidates.lifecycleSnapshots[groupName]; !ok || snapshot.record.Epoch != recovered.RegistrationEpoch {
 			recovered.Generation = existing.Generation
-			recovered.LastActivity = existing.LastActivity
+			if c.standalone || !existing.LastActivity.IsZero() {
+				recovered.LastActivity = existing.LastActivity
+			}
 			recovered.LastRebalance = existing.LastRebalance
 			recovered.Members = make(map[string]*MemberMetadata, len(existing.Members))
 			for memberID, member := range existing.Members {
@@ -1133,6 +1135,7 @@ func materializeConsumerMetadata(
 	offsetSnapshots map[string]offsetCandidate,
 	legacy legacyRecoveryState,
 	legacyRecordCounts map[string]int,
+	restoreRegistrationActivity bool,
 	status *ConsumerMetadataRecoveryStatus,
 ) (map[string]*GroupMetadata, map[string]uint64, int, error) {
 	groups := make(map[string]*GroupMetadata)
@@ -1164,6 +1167,11 @@ func materializeConsumerMetadata(
 			Offsets:           make(map[string]map[int]uint64),
 			RegistrationEpoch: record.Epoch,
 			OffsetRevisions:   make(map[string]uint64),
+		}
+		if restoreRegistrationActivity {
+			// A durable registration is the only observed activity for a group
+			// with no lifecycle snapshot. Historical zero timestamps stay unknown.
+			group.LastActivity = record.Timestamp
 		}
 		if record.Version == ConsumerMetadataRecordVersionSubscriptions {
 			group.TopicName = subscriptionDisplayName(record.Topics, record.TopicPattern)

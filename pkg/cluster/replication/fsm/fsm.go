@@ -828,6 +828,9 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	var groupState map[string]*coordinator.GroupStateSnapshot
 	if f.cd != nil {
 		groupState = f.cd.ExportState()
+		if err := coordinator.ValidateImportState(groupState); err != nil {
+			return nil, fmt.Errorf("snapshot consumer groups: %w", err)
+		}
 	}
 	transactionState := f.restoredTransactionState
 	nextProducerEpoch := f.restoredNextProducerEpoch
