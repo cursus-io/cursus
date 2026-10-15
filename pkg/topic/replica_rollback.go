@@ -21,6 +21,14 @@ type replicaRollbackStorage interface {
 	ScanRetainedRange(context.Context, uint64, uint64, func(types.Message) error) error
 }
 
+type replicaRepairPolicy uint8
+
+const (
+	canonicalReplicaRollback replicaRepairPolicy = iota
+	speculativeReplicaTail
+	committedReplicaReconcile
+)
+
 func (p *Partition) rollbackErrorLocked() error {
 	if p.rollbackPending.Load() {
 		return errors.Join(ErrReplicaRollbackPending, p.rollbackErr)
@@ -43,6 +51,13 @@ func (p *Partition) ApplyReplicaRollbackChecked(ctx context.Context, offset, exp
 }
 
 func (p *Partition) applyReplicaRollback(ctx context.Context, offset, expectedLEO uint64, prefix *disk.LineagePrefix, hwm uint64, beforeMutation func() error, checked bool) (result error) {
+	return p.repairReplicaTail(ctx, offset, expectedLEO, prefix, hwm, beforeMutation, checked, canonicalReplicaRollback)
+}
+
+// repairReplicaTail shares physical repair while keeping the distinct authority
+// rules of canonical divergence rollback, speculative tail repair and Raft HWM
+// reconciliation. No maintenance lock or retained-log scan runs under p.mu.
+func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO uint64, prefix *disk.LineagePrefix, hwm uint64, beforeMutation func() error, checked bool, policy replicaRepairPolicy) (result error) {
 	if ctx == nil {
 		return fmt.Errorf("replica rollback requires context")
 	}
@@ -59,7 +74,27 @@ func (p *Partition) applyReplicaRollback(ctx context.Context, offset, expectedLE
 	// A separate reconciliation marker may need canonical catch-up before its
 	// normal owner can resolve it. Preserve it without blocking physical repair.
 	err := errors.Join(p.recoveryErr, p.txnRecoveryErr, p.producerRecoveryErr, p.bootstrapErrorLocked(), p.rollbackErrorLocked())
+	marker := p.reconciliationRevision
 	p.recoveryMu.RUnlock()
+	oldHWM, wasAuthoritative := p.HWM, p.hwmAuthoritative
+	if policy != canonicalReplicaRollback {
+		// Public repair boundaries are not tied to an earlier fetch request.
+		// Sample LEO only after excluding concurrent replication and writers.
+		expectedLEO = p.LEO.Load()
+		if err == nil && p.snapshotRecovery {
+			err = fmt.Errorf("snapshot replay is still pending: visible_hwm=%d durable_hwm=%d requested_offset=%d", p.HWM, p.recoveryCheckpointHWM, offset)
+		}
+		if err == nil && offset < oldHWM {
+			if policy == speculativeReplicaTail {
+				err = fmt.Errorf("replica tail truncation crosses committed HWM: hwm=%d requested_offset=%d", oldHWM, offset)
+			} else {
+				err = fmt.Errorf("committed HWM regression: current=%d requested=%d", oldHWM, offset)
+			}
+		}
+		if err == nil && offset > expectedLEO {
+			err = fmt.Errorf("replica is behind repair boundary: leo=%d offset=%d", expectedLEO, offset)
+		}
+	}
 	if err == nil && (p.closed || p.snapshotRecovery || p.LEO.Load() != expectedLEO || offset > expectedLEO || p.replicaAttempt == math.MaxUint64) {
 		err = fmt.Errorf("replica rollback local state changed")
 	}
@@ -73,6 +108,19 @@ func (p *Partition) applyReplicaRollback(ctx context.Context, offset, expectedLE
 	if err != nil {
 		p.mu.Unlock()
 		return err
+	}
+	if policy != canonicalReplicaRollback && offset == expectedLEO {
+		if policy == committedReplicaReconcile {
+			p.HWM = offset
+			p.hwmAuthoritative = true
+			if oldHWM != offset || !wasAuthoritative {
+				p.signalHWMCheckpointLocked()
+				p.NotifyNewMessage()
+			}
+			p.clearOwnedReconciliationError(marker)
+		}
+		p.mu.Unlock()
+		return nil
 	}
 	p.replicaVerified = false
 	p.rollbackPending.Store(true)
@@ -132,6 +180,7 @@ func (p *Partition) applyReplicaRollback(ctx context.Context, offset, expectedLE
 	// older verification attempts whose content generation may remain unchanged.
 	p.mu.Lock()
 	p.replicaAttempt++
+	p.eventIDGeneration.Add(1)
 	p.mu.Unlock()
 	if supported {
 		err = storage.TruncateToIfGenerationContext(ctx, offset, generation)
@@ -148,8 +197,10 @@ func (p *Partition) applyReplicaRollback(ctx context.Context, offset, expectedLE
 	uncertain = true
 	p.mu.Lock()
 	p.LEO.Store(offset)
-	p.HWM = offset
-	p.hwmAuthoritative = true
+	if policy == canonicalReplicaRollback {
+		p.HWM = offset
+		p.hwmAuthoritative = true
+	}
 	p.mu.Unlock()
 	p.visibilityGeneration++
 	if supported {
@@ -172,11 +223,25 @@ func (p *Partition) applyReplicaRollback(ctx context.Context, offset, expectedLE
 	}
 	p.installTransactionState(state)
 	p.installProducerState(state)
-	if err := p.persistProducerStateCheckpointLocked(checked || supported); err != nil {
-		return err
+	_, durable := p.dh.(durablePartitionStorage)
+	strictCheckpoint := checked || supported || durable
+	// Explicitly non-durable legacy adapters have no checkpoint files. Real
+	// durable storage must still reject absent paths and failed persistence.
+	if strictCheckpoint || p.producerStatePath != "" {
+		if err := p.persistProducerStateCheckpointLocked(strictCheckpoint); err != nil {
+			return err
+		}
 	}
-	if err := p.persistHWMCheckpointLocked(offset, checked || supported); err != nil {
-		return err
+	checkpointHWM := offset
+	if policy == speculativeReplicaTail {
+		checkpointHWM = oldHWM
+	}
+	// A versioned checkpoint is authoritative on restart. Never certify an
+	// unknown old watermark merely because its speculative tail was removed.
+	if (policy != speculativeReplicaTail || wasAuthoritative) && (strictCheckpoint || p.hwmCheckpointPath != "") {
+		if err := p.persistHWMCheckpointLocked(checkpointHWM, strictCheckpoint); err != nil {
+			return err
+		}
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -186,11 +251,34 @@ func (p *Partition) applyReplicaRollback(ctx context.Context, offset, expectedLE
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	publish := func() {
+		if policy == committedReplicaReconcile {
+			p.HWM = offset
+			p.hwmAuthoritative = true
+		}
+		p.rollbackPending.Store(false)
+	}
 	if supported {
 		// Only an already-excluded scalar is published under the disk check.
-		if err := storage.PublishIfContentGeneration(generation, func() { p.rollbackPending.Store(false) }); err != nil {
+		if err := storage.PublishIfContentGeneration(generation, publish); err != nil {
 			return err
+		}
+	} else {
+		publish()
+	}
+	if policy == committedReplicaReconcile {
+		p.clearOwnedReconciliationError(marker)
+		if oldHWM != offset || !wasAuthoritative {
+			p.NotifyNewMessage()
 		}
 	}
 	return nil
+}
+
+func (p *Partition) clearOwnedReconciliationError(revision uint64) {
+	p.recoveryMu.Lock()
+	defer p.recoveryMu.Unlock()
+	if p.reconciliationRevision == revision {
+		p.reconciliationErr = nil
+	}
 }

@@ -183,6 +183,7 @@ func (s *BootstrapSession) Install(receiver *disk.BootstrapReceiver, detach func
 		}
 	}
 	// Installation may remove checkpoints independently of the normal writers.
+	s.p.eventIDGeneration.Add(1)
 	s.p.hwmCheckpointSaved = nil
 	s.p.producerCheckpointSaved = nil
 	err := receiver.Install()
@@ -382,11 +383,6 @@ func (p *Partition) WithBootstrapSource(fn func(*BootstrapSource) error) error {
 	return p.withReadViewLocked(true, end, func(v *PartitionReadView) error { return fn(&BootstrapSource{view: v, disk: d}) })
 }
 
-func (p *Partition) setTransactionRecoveryError(err error) {
-	p.recoveryMu.Lock()
-	p.txnRecoveryErr = err
-	p.recoveryMu.Unlock()
-}
 func (p *Partition) setProducerRecoveryError(err error) {
 	p.recoveryMu.Lock()
 	p.producerRecoveryErr = err
