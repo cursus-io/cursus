@@ -30,6 +30,21 @@ func (*registrationActivityReader) CreateTopic(string, int, bool, bool) error { 
 // ExistingPartitionCount exposes four partitions, including three empty scans.
 func (*registrationActivityReader) ExistingPartitionCount(string) (int, error) { return 4, nil }
 
+func (*registrationActivityReader) EarliestTopicOffset(string, int) (uint64, error) {
+	return 0, nil
+}
+
+func (r *registrationActivityReader) EndTopicOffset(_ string, partition int) (uint64, error) {
+	if partition != 0 || len(r.messages) == 0 {
+		return 0, nil
+	}
+	return r.messages[len(r.messages)-1].Offset + 1, nil
+}
+
+func (r *registrationActivityReader) ReadCommittedConsumerMetadata(topic string, partition int, offset uint64, max int) ([]types.Message, error) {
+	return r.ReadTopicPartition(topic, partition, offset, max)
+}
+
 // ReadTopicPartition returns the requested fixture batch and counts its actual
 // payload bytes, including repeated reads if recovery scans a record again.
 func (r *registrationActivityReader) ReadTopicPartition(_ string, partition int, offset uint64, max int) ([]types.Message, error) {
@@ -139,4 +154,85 @@ func TestRegistrationActivityRestoreRejectsExistingInvalidSnapshotAtomically(t *
 	err = NewBrokerFSM(nil, c).Restore(io.NopCloser(bytes.NewReader(payload)))
 	require.ErrorContains(t, err, "missing last activity")
 	require.Equal(t, before, c.ExportState())
+}
+
+func TestStrictRegistrationActivitySnapshotRoundTrip(t *testing.T) {
+	registeredAt := time.Unix(100, 123).UTC()
+	for _, test := range []struct {
+		name   string
+		record coordinator.ConsumerMetadataRecord
+	}{
+		{"single", coordinator.ConsumerMetadataRecord{Version: coordinator.ConsumerMetadataRecordVersion, Topic: "orders", PartitionCount: 2}},
+		{"subscription", coordinator.ConsumerMetadataRecord{Version: coordinator.ConsumerMetadataRecordVersionSubscriptions, Topics: []string{"orders", "payments"}, TopicPartitions: []coordinator.TopicPartition{{Topic: "orders", Partition: 0}, {Topic: "payments", Partition: 0}}}},
+	} {
+		for _, knownActivity := range []bool{true, false} {
+			name := "unknown"
+			if knownActivity {
+				name = "durable"
+			}
+			t.Run(test.name+"/"+name, func(t *testing.T) {
+				c := authorityCoordinator(t)
+				// A prior incarnation must not lend membership or activity to the
+				// registration reconstructed from the committed log.
+				require.NoError(t, c.RegisterGroupFromFSM("orders", "workers", 2))
+				require.NoError(t, c.JoinGroupFromFSM("workers", "old-member", "orders", 2))
+				c.RecordConsumerMetadataSource("compacted", 3)
+				_, baseline, err := c.ExportStateWithRecovery()
+				require.NoError(t, err)
+				require.True(t, baseline.KnownComplete)
+				record := test.record
+				record.Type, record.Group, record.Epoch = coordinator.ConsumerMetadataRecordRegistration, "workers", 7
+				if knownActivity {
+					record.Timestamp = registeredAt
+				}
+				payload, key, err := coordinator.EncodeConsumerMetadataRecord(record)
+				require.NoError(t, err)
+				reader := &registrationActivityReader{messages: []types.Message{{Key: key, Payload: string(payload)}}}
+				release, err := c.BeginConsumerMetadataRecovery(context.Background())
+				require.NoError(t, err)
+				defer release()
+				require.ErrorIs(t, c.ConsumerOperationsReadinessError(), coordinator.ErrConsumerMetadataRecovering)
+				prepared, err := c.PrepareFullConsumerMetadataReplay(reader)
+				require.NoError(t, err)
+				require.NoError(t, c.ApplyFullConsumerMetadataReplay(prepared))
+				release()
+				groups, proof, err := c.ExportStateWithRecovery()
+				require.NoError(t, err)
+				require.Equal(t, record.Timestamp, groups["workers"].LastActivity)
+				require.Zero(t, groups["workers"].Generation)
+				require.Empty(t, groups["workers"].Members)
+				require.Empty(t, groups["workers"].Offsets)
+				require.Equal(t, uint64(7), groups["workers"].RegistrationEpoch)
+				if test.name == "single" {
+					require.Equal(t, []int{0, 1}, groups["workers"].Partitions)
+				} else {
+					require.Equal(t, record.Topics, groups["workers"].Topics)
+					require.Equal(t, record.TopicPartitions, groups["workers"].TopicPartitions)
+				}
+				require.Equal(t, baseline.RaftCompatibilityState, proof.RaftCompatibilityState)
+				require.Equal(t, map[string][]int{"workers": {0}, "compacted": {3}}, proof.SourcePartitions)
+				f := NewBrokerFSM(nil, c)
+				if knownActivity {
+					raw := persistAuthorityFSM(t, f)
+					peer := authorityCoordinator(t)
+					require.NoError(t, NewBrokerFSM(nil, peer).Restore(io.NopCloser(bytes.NewReader(raw))))
+					restoredGroups, restoredProof, err := peer.ExportStateWithRecovery()
+					require.NoError(t, err)
+					require.Equal(t, groups, restoredGroups)
+					requirePersistedConsumerStateEqual(t, proof, restoredProof)
+				} else {
+					snapshot, err := f.Snapshot()
+					require.ErrorContains(t, err, "missing last activity")
+					require.Nil(t, snapshot)
+					afterGroups, afterProof, err := c.ExportStateWithRecovery()
+					require.NoError(t, err)
+					require.Equal(t, groups, afterGroups)
+					require.Equal(t, proof, afterProof)
+				}
+				require.Equal(t, 1, reader.calls, "empty bounded partitions need no payload reads")
+				require.Equal(t, 1, reader.records)
+				require.Equal(t, len(payload), reader.payloadBytes)
+			})
+		}
+	}
 }
