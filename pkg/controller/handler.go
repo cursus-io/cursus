@@ -52,6 +52,11 @@ type CommandHandler struct {
 	partitionWriteLocks        sync.Map // map[string]*contextMutex
 	partitionPreparedEpochs    sync.Map // map[string]partitionLeadershipFence
 	replication                *partitionReplicationCoordinator
+	bootstrapMu                sync.Mutex
+	bootstrapSource            *bootstrapTransferSource
+	closed                     bool
+	closeOnce                  sync.Once
+	closeErr                   error
 }
 
 func (ch *CommandHandler) transactionStateLock(transactionalID string) *sync.Mutex {
@@ -489,13 +494,25 @@ func (ch *CommandHandler) replicationErrorResponse(offset uint64, err error) str
 
 // Close releases resources held by the command handler (e.g., event-sourcing indexes and snapshots).
 func (ch *CommandHandler) Close() error {
-	if ch.replication != nil {
-		ch.replication.close()
+	if ch == nil {
+		return nil
 	}
-	if ch.ESHandler != nil {
-		return ch.ESHandler.Close()
-	}
-	return nil
+	ch.closeOnce.Do(func() {
+		ch.bootstrapMu.Lock()
+		ch.closed = true
+		source := ch.bootstrapSource
+		ch.bootstrapMu.Unlock()
+		if source != nil {
+			ch.closeErr = source.close()
+		}
+		if ch.replication != nil {
+			ch.replication.close()
+		}
+		if ch.ESHandler != nil {
+			ch.closeErr = errors.Join(ch.closeErr, ch.ESHandler.Close())
+		}
+	})
+	return ch.closeErr
 }
 
 func parseKeyValueArgs(argsStr string) map[string]string {
