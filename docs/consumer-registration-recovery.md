@@ -1,18 +1,8 @@
 # Consumer registration activity recovery
 
-## Kafka comparison and decision
+## Recovery contract
 
-Apache Kafka 4.1.0 implements classic-group replay using persisted generation,
-members, and state timestamp, retaining `-1` as unknown. Its `onLoaded` path
-establishes member sessions separately from durable group history:
-[GroupMetadataManager](https://github.com/apache/kafka/blob/4.1.0/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L5545).
-Election schedules partition loading in
-[GroupCoordinatorService](https://github.com/apache/kafka/blob/4.1.0/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java#L2020),
-and [CoordinatorRuntime](https://github.com/apache/kafka/blob/4.1.0/coordinator-common/src/main/java/org/apache/kafka/coordinator/common/runtime/CoordinatorRuntime.java#L650)
-transitions loading to active or failed. These are implemented Kafka behaviors,
-not proposals for changing Cursus ownership or session handling.
-
-Cursus adopts recovery from a durable observed timestamp: distributed replay
+Activity is recovered from a durable observed timestamp: distributed replay
 sets registration-only group activity from the selected registration record.
 Lifecycle activity remains authoritative, with the existing last-rebalance and
 lifecycle-record timestamp fallbacks. Existing nonzero in-memory activity is
@@ -20,7 +10,7 @@ preserved when no matching lifecycle snapshot exists; existing zero activity
 does not erase recovered activity. Standalone registration replay keeps its
 existing unknown-activity contract.
 
-Cursus differs because live groups in its Raft snapshot format require nonzero
+Live groups in the Raft snapshot format require nonzero
 activity. Snapshot creation must validate exported groups using the same
 validator as restore, refusing an unrestorable snapshot before publication.
 Restore validation remains strict; already persisted invalid snapshots are not
