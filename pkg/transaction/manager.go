@@ -146,6 +146,7 @@ type Snapshot struct {
 
 type Manager struct {
 	nextProducerEpoch   atomic.Uint64
+	decisionGeneration  atomic.Uint64
 	transactionCount    atomic.Int64
 	shards              []managerShard
 	expiration          time.Duration
@@ -285,11 +286,13 @@ func (m *Manager) PruneExpired(now time.Time) int {
 			tx := s.txns[id]
 			if tx == nil || tx.Expired {
 				s.remove(id)
+				m.recordDecisionChangeLocked(s, id, transactionDecisionTuple(tx))
 				m.releaseTransactionSlot()
 				removed++
 				continue
 			}
 			if expireTransactionLocked(tx, now.Add(-m.expiration), now) {
+				m.advanceDecisionGenerationLocked()
 				s.reindex(tx)
 				removed++
 				continue
@@ -335,6 +338,7 @@ func (m *Manager) InitProducerWithMode(id string, mode Mode) (string, int64, err
 	s := m.shardForID(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer m.recordDecisionChangeLocked(s, id, transactionDecisionTuple(s.txns[id]))
 	now := time.Now()
 	if mode == "" {
 		mode = ModeLegacy
@@ -403,6 +407,7 @@ func (m *Manager) SetCoordinatorEpoch(id string, epoch int64) error {
 	s := m.shardForID(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer m.recordDecisionChangeLocked(s, id, transactionDecisionTuple(s.txns[id]))
 	tx, ok := s.txns[id]
 	if !ok {
 		return fmt.Errorf("transaction %s not found", id)
@@ -429,7 +434,9 @@ func (m *Manager) ReconcileCoordinatorEpochs(epochs map[int]int64, shardCount in
 		s.mu.Lock()
 		for id := range s.nonTerminal {
 			if tx := s.txns[id]; tx != nil && tx.Mode == ModeProcessingV1 {
+				before := transactionDecisionTuple(tx)
 				tx.CoordinatorEpoch = epoch
+				m.recordDecisionChangeLocked(s, id, before)
 			}
 		}
 		s.mu.Unlock()
@@ -450,6 +457,7 @@ func (m *Manager) BeginWithDeadline(id, producer string, epoch int64, deadline t
 	s := m.shardForID(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer m.recordDecisionChangeLocked(s, id, transactionDecisionTuple(s.txns[id]))
 
 	tx, ok := s.txns[id]
 	if !ok || tx.Expired {
@@ -749,6 +757,7 @@ func (m *Manager) PrepareCommit(id, producer string, epoch int64) (*Transaction,
 	s := m.shardForID(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer m.recordDecisionChangeLocked(s, id, transactionDecisionTuple(s.txns[id]))
 
 	tx, ok := s.txns[id]
 	if !ok {
@@ -783,6 +792,7 @@ func (m *Manager) Commit(id string) error {
 	s := m.shardForID(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer m.recordDecisionChangeLocked(s, id, transactionDecisionTuple(s.txns[id]))
 
 	tx, ok := s.txns[id]
 	if !ok {
@@ -828,6 +838,7 @@ func (m *Manager) PrepareAbort(id, producer string, epoch int64) (*Transaction, 
 	s := m.shardForID(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer m.recordDecisionChangeLocked(s, id, transactionDecisionTuple(s.txns[id]))
 	tx, ok := s.txns[id]
 	if !ok {
 		return nil, fmt.Errorf("transaction %s not found", id)
@@ -855,6 +866,7 @@ func (m *Manager) Abort(id, producer string, epoch int64) error {
 	s := m.shardForID(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer m.recordDecisionChangeLocked(s, id, transactionDecisionTuple(s.txns[id]))
 
 	tx, ok := s.txns[id]
 	if !ok {
@@ -1071,6 +1083,9 @@ func (m *Manager) ImportState(state map[string]*Snapshot) error {
 }
 
 func (m *Manager) replaceStateLocked(state map[string]*Snapshot) {
+	if !m.decisionStateMatchesLocked(state) {
+		m.advanceDecisionGenerationLocked()
+	}
 	for i := range m.shards {
 		m.shards[i].txns = make(map[string]*Transaction)
 		m.shards[i].prepared = make(map[string]struct{})
@@ -1114,6 +1129,7 @@ func (m *Manager) ApplySnapshot(snap *Snapshot) {
 	s := m.shardForID(snap.ID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer m.recordDecisionChangeLocked(s, snap.ID, transactionDecisionTuple(s.txns[snap.ID]))
 	if current := s.txns[snap.ID]; current != nil {
 		m.releaseStreamReservationsLocked(current)
 	} else {
@@ -1138,6 +1154,7 @@ func (m *Manager) ApplyReplicatedSnapshot(snap *Snapshot) error {
 	s := m.shardForID(snap.ID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer m.recordDecisionChangeLocked(s, snap.ID, transactionDecisionTuple(s.txns[snap.ID]))
 
 	current, ok := s.txns[snap.ID]
 	if !ok || snapshotIsNewer(current, snap) {
@@ -1289,6 +1306,7 @@ func (m *Manager) Delete(id string) {
 	s := m.shardForID(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer m.recordDecisionChangeLocked(s, id, transactionDecisionTuple(s.txns[id]))
 	if tx := s.txns[id]; tx != nil {
 		m.releaseStreamReservationsLocked(tx)
 		m.releaseTransactionSlot()
