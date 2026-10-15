@@ -3,7 +3,7 @@
 `DiskHandler.SetBootstrapLimits(BootstrapLimits{MaxTransferBytes: ..., MaxTotalBytes: ...})`
 sets positive byte limits for new exports and receives. `BootstrapLimits()` returns
 the effective settings. Defaults are 8 GiB per transfer and 32 GiB across active
-process-wide reservations, so a normal 1 GiB segment fits. Receiving reserves
+process-wide reservations, including adopted cache bytes, so a normal 1 GiB segment fits. Receiving reserves
 space for the incoming records/catalog and locally generated indexes. Existing
 filesystem headroom checks still apply independently.
 
@@ -43,7 +43,8 @@ estimate and any growth reserved before a write; it is not a measurement of live
 file lengths. A failed or partial deletion retains the entire reservation and the
 active token until deletion succeeds. Closing retires the handle immediately, so
 reads, writes, and installation cannot reuse partially removed staging. Repeated
-close/abort calls retry cleanup.
+close/abort calls retry cleanup. Detached cache adoption transfers ownership to a
+separate bounded generation slot, as described below.
 
 Failed cleanup owners remain reachable in a process-wide deduplicated queue.
 The eight-active-transfer limit also bounds this queue, including zero-byte
@@ -73,7 +74,7 @@ bytes before and after each operation; partial deletion must not reduce charges.
 
 ## Detached canonical staging
 
-`NewDetachedBootstrapRoot(dir, limits, minFreeBytes, minFreePercent)` opens a
+`NewDetachedBootstrapRoot(dir, limits, minFreeBytes, minFreePercent, maxAdoptedStores)` opens a
 private ephemeral root with its own `.cursus.lock`. A future caller can place it
 under the broker log directory, for example `.recovery-metadata`. The root has no
 partition handler or worker. Startup removes only directories named
@@ -92,7 +93,7 @@ bytes, overlapping extensions, and out-of-bounds requests.
 
 `stage.Prepare(ctx)` verifies completeness, regular files, checksums, canonical
 record identity/order, fixed logical bounds, and gap authority, then syncs the
-files and builds the immutable on-disk sparse index. Durable installation and
+files and builds the on-disk sparse index. Durable installation and
 preparation share these checks. Preparation alone creates no live partition
 files, tail index, compaction marker, pending manifest, or HWM. An empty detached
 index uses zero bytes; durable installation retains its live-index preallocation.
@@ -102,9 +103,18 @@ and decoding; individual filesystem operations remain synchronous.
 Preparation moves the same child and reservation to `DetachedRawStore` and stops
 its transfer TTL. A callback that was already running must observe the ownership
 transition under the transfer mutex. Old stage abort, write, and prepare handles
-cannot delete or mutate the prepared store. This first primitive retains its
-active-transfer token until physical deletion, including while leases exist.
-There is no metadata cache adoption or production provider integration yet.
+cannot delete or mutate the prepared store. A prepared store retains its
+active-transfer token until deletion or successful cache adoption.
+
+`root.Adopt(prepared)` registers a bounded cache-generation slot before releasing
+the active-transfer token. It moves the same child, files, and byte owner without
+copying or releasing bytes. Failed adoption leaves the prepared owner intact.
+Stale stage/prepared handles cannot acquire or delete an adopted generation;
+existing prepared leases remain valid. The caller derives `maxAdoptedStores` from
+its bounded partition vector plus an allowance for retired generations, rather
+than from the eight-active-transfer limit. Pinned, retired, zero-byte, and
+failed-cleanup generations all occupy their slot until actual deletion. There is
+no topic adapter or production provider integration yet.
 
 `store.Acquire()` opens a `DetachedRawLease` with its own records/index handles,
 fixed logical start/end, fixed raw byte length, and fixed index extent. Acquisition
@@ -121,22 +131,61 @@ Sequential pages reuse the lease cursor. Non-contiguous requests binary-search
 Logical holes advance toward the fixed end without filtering physical records.
 `lease.Work()` reports cumulative actual raw read bytes, index read bytes, and
 decoded records, separately from the conservative staging-byte reservation.
-Immutable ownership assumes no out-of-band file mutation; it is not a tampering
+Immutable published prefixes assume no out-of-band file mutation; this is not a tampering
 proof.
+
+An adopted store exposes `Bounds()`, `Acquire()`, `AppendPrepared(ctx, expected,
+suffix)`, and `Close()`. Bounds and acquisition do not hash, scan, or rebuild
+indexes. Append requires an exclusively prepared suffix in the same root with
+the same topic, partition, and compaction format, adjacent increasing logical
+bounds, and a match against the entire expected published extent. The upper layer
+must certify source continuity and fences; disk does not equate transfer IDs or
+claim membership authority. The incoming manifest and its SHA-256 descriptors
+remain immutable evidence of the original transfer, separate from grown extents.
+
+Append reserves destination growth while both the old destination and the complete
+suffix remain charged. It copies only suffix records and adjusted suffix index
+entries, adding a boundary anchor when needed to keep repeated small appends
+searchable. Initial reservation slack does not grow on each append. After both
+files sync, one publication advances the logical end and raw/index extents. Old
+leases retain fixed bounds and see only their original prefix; a new lease sees
+the complete extended range. A fully compacted logical extension with no raw
+bytes is valid. `DetachedAppendWork` reports source `RawReadBytes` and
+`IndexReadBytes`, and destination `RawBytes` and `IndexBytes` actually written,
+including partial work on failure. No old prefix is copied, hashed, or indexed.
+
+Validation, open, and reservation failures leave the suffix caller-owned. Once
+copying starts, append consumes and retires it on every outcome. A prepublication
+write, sync, cancellation, or root-close failure attempts both file truncations
+and both syncs before releasing growth charges. Failed rollback retains the peak
+charge and blocks further append until a next-append repair succeeds. Old-prefix
+reads and acquisition still work with the unchanged published extent. A nil
+append error means publication committed: `CleanupError` separately reports
+suffix deletion failure and must not cause append replay. The failed suffix
+retains its active slot and bytes in the existing bounded cleanup queue.
 
 Store close retires new leases while existing leases remain readable. Root close
 retires new work, skips busy child locks, and returns
 `ErrDetachedBootstrapPending` while work, pins, or failed cleanup remain. Closing
 is repeatable; individual deletion operations can still block. The nested kernel
 lock remains held until an explicit root-close retry observes every child
-physically removed. Failed cleanup enters the existing bounded process-wide
-queue only after the last lease closes. Successful admission-triggered cleanup
-also removes the root's child bookkeeping, without filesystem I/O under the root,
-queue, or budget mutex. Neither reserved bytes nor active tokens are released
-while pinned or unsuccessfully deleted files remain.
+physically removed. A nonadopted owner's failed cleanup enters the existing
+bounded process-wide queue only after the last lease closes. Adopted failed
+cleanup stays in the root registry and never enters that active-token queue.
+Stage and adoption each attempt at most one eligible retired cache cleanup in
+round-robin order, skipping busy children; explicit root close retries all
+available children. Successful cleanup removes the root's child and cache-slot
+bookkeeping. Filesystem work runs outside root, queue, and budget mutexes,
+including append headroom probes. Physical bytes and the applicable active or
+cache slot remain charged until deletion succeeds.
 
 Regression coverage includes shared install/preparation rejection cases,
 field-preserving sparse pages, actual read/decode costs, cancellation, a running
 TTL callback during ownership transfer, creation/preparation versus root close,
 lease survival after retirement, cleanup failure and admission retry, recognized
-startup cleanup, and partial handle-open failure.
+startup cleanup, and partial handle-open failure. Adoption/append coverage adds
+more than eight retained generations, zero-byte and pinned slot saturation,
+deterministic cleanup rotation, atomic extent changes, old lease visibility,
+suffix-only read/write costs, bounded seeks after repeated small appends,
+aggregate peak admission, prepublication rollback, retained tail debt with retry,
+committed suffix cleanup failure, identity/CAS rejection, and ownership races.

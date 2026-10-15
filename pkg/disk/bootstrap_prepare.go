@@ -74,6 +74,9 @@ func buildBootstrapCanonicalIndex(ctx context.Context, t *bootstrapTransfer, int
 			return fmt.Errorf("unmarked bootstrap offset gap")
 		}
 		next = msg.Offset + 1
+		if t.detached != nil && position == 0 {
+			t.detached.firstOffset = msg.Offset
+		}
 		if position-lastIndex >= interval {
 			if err := binary.Write(index, binary.BigEndian, types.IndexEntry{Offset: msg.Offset, Position: position}); err != nil {
 				return err
@@ -100,6 +103,9 @@ func buildBootstrapCanonicalIndex(ctx context.Context, t *bootstrapTransfer, int
 	}
 	if err = index.Sync(); err != nil {
 		return err
+	}
+	if t.detached != nil {
+		t.detached.lastIndex = lastIndex
 	}
 	if err = index.Close(); err != nil {
 		return err

@@ -21,27 +21,35 @@ const detachedIndexInterval uint64 = 4096
 // DetachedBootstrapRoot owns ephemeral recovery files and their exclusive lock.
 // It has no partition handler, durable intent, or background cleanup worker.
 type DetachedBootstrapRoot struct {
-	mu        sync.Mutex
-	closeMu   sync.Mutex
-	dir       string
-	limits    BootstrapLimits
-	headroom  *diskHeadroomGuard
-	lock      *StorageLock
-	closing   bool
-	finalized bool
-	children  map[*bootstrapTransfer]struct{}
+	mu           sync.Mutex
+	closeMu      sync.Mutex
+	dir          string
+	limits       BootstrapLimits
+	headroom     *diskHeadroomGuard
+	lock         *StorageLock
+	closing      bool
+	finalized    bool
+	children     map[*bootstrapTransfer]struct{}
+	maxAdopted   int
+	adopted      map[*bootstrapTransfer]struct{}
+	adoptedOrder []*bootstrapTransfer
 	// Instance seams run outside mu; configure before concurrent use.
 	beforeCreate         func()
 	beforePreparePublish func()
 	openFile             func(string) (*os.File, error)
+	appendIO             detachedAppendIO
 }
 
 type detachedBootstrapChild struct {
-	root       *DetachedBootstrapRoot
-	prepared   bool
-	retired    bool
-	leases     int
-	indexBytes int64
+	root        *DetachedBootstrapRoot
+	prepared    bool
+	retired     bool
+	leases      int
+	adopted     bool
+	extent      DetachedRawBounds
+	firstOffset uint64
+	lastIndex   uint64
+	tailDebt    *detachedTailDebt
 }
 
 type DetachedBootstrapStage struct{ transfer *bootstrapTransfer }
@@ -49,11 +57,17 @@ type DetachedRawStore struct{ transfer *bootstrapTransfer }
 
 // NewDetachedBootstrapRoot removes only recognized ephemeral child directories.
 // Unknown names, lock files, and durable partition bootstrap names are preserved.
-func NewDetachedBootstrapRoot(dir string, limits BootstrapLimits, minFreeBytes int64, minFreePercent float64) (*DetachedBootstrapRoot, error) {
-	return newDetachedBootstrapRoot(dir, limits, minFreeBytes, minFreePercent, os.RemoveAll)
+// maxAdoptedStores bounds all cached generations, including retired, pinned, and
+// failed-cleanup stores. Callers derive it from their bounded partition vector
+// plus retired-generation allowance, independently of active-transfer limits.
+func NewDetachedBootstrapRoot(dir string, limits BootstrapLimits, minFreeBytes int64, minFreePercent float64, maxAdoptedStores int) (*DetachedBootstrapRoot, error) {
+	return newDetachedBootstrapRoot(dir, limits, minFreeBytes, minFreePercent, maxAdoptedStores, os.RemoveAll)
 }
 
-func newDetachedBootstrapRoot(dir string, limits BootstrapLimits, minFreeBytes int64, minFreePercent float64, removeOrphan func(string) error) (*DetachedBootstrapRoot, error) {
+func newDetachedBootstrapRoot(dir string, limits BootstrapLimits, minFreeBytes int64, minFreePercent float64, maxAdoptedStores int, removeOrphan func(string) error) (*DetachedBootstrapRoot, error) {
+	if maxAdoptedStores <= 0 {
+		return nil, fmt.Errorf("detached bootstrap requires positive adopted-store limit")
+	}
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("detached bootstrap directory is empty")
 	}
@@ -105,12 +119,21 @@ func newDetachedBootstrapRoot(dir string, limits BootstrapLimits, minFreeBytes i
 		_ = lock.Close()
 		return nil, err
 	}
-	return &DetachedBootstrapRoot{dir: path, limits: limits, headroom: newDiskHeadroomGuard(path, minFreeBytes, minFreePercent), lock: lock, children: make(map[*bootstrapTransfer]struct{}), openFile: os.Open}, nil
+	return &DetachedBootstrapRoot{dir: path, limits: limits, headroom: newDiskHeadroomGuard(path, minFreeBytes, minFreePercent), lock: lock, children: make(map[*bootstrapTransfer]struct{}), openFile: os.Open, maxAdopted: maxAdoptedStores, adopted: make(map[*bootstrapTransfer]struct{}), appendIO: defaultDetachedAppendIO()}, nil
 }
 
 func (r *DetachedBootstrapRoot) forget(t *bootstrapTransfer) {
 	r.mu.Lock()
 	delete(r.children, t)
+	delete(r.adopted, t)
+	for i, child := range r.adoptedOrder {
+		if child == t {
+			copy(r.adoptedOrder[i:], r.adoptedOrder[i+1:])
+			r.adoptedOrder[len(r.adoptedOrder)-1] = nil
+			r.adoptedOrder = r.adoptedOrder[:len(r.adoptedOrder)-1]
+			break
+		}
+	}
 	r.mu.Unlock()
 }
 
@@ -164,6 +187,7 @@ func (r *DetachedBootstrapRoot) Close() error {
 // Stage reserves all incoming and derived bytes before creating a private child.
 // This metadata-only format requires the empty snapshot-catalog descriptor.
 func (r *DetachedBootstrapRoot) Stage(topic string, partition int, metadata BootstrapMetadata) (*DetachedBootstrapStage, error) {
+	r.retryAdoptedCleanup()
 	size, err := validateBootstrapMetadata(metadata)
 	if err != nil {
 		return nil, err
@@ -294,7 +318,7 @@ func (s *DetachedBootstrapStage) Prepare(ctx context.Context) (*DetachedRawStore
 	if r.closing {
 		return nil, ErrDetachedBootstrapClosed
 	}
-	t.detached.indexBytes = info.Size()
+	t.detached.extent = DetachedRawBounds{StartOffset: t.metadata.StartOffset, EndOffset: t.metadata.EndOffset, RawBytes: t.metadata.Files[0].Size, IndexBytes: info.Size()}
 	t.detached.prepared = true
 	t.timer.Stop()
 	ok = true
@@ -306,6 +330,9 @@ func (s *DetachedRawStore) Close() error {
 	t := s.transfer
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.detached.adopted {
+		return nil
+	}
 	t.detached.retired = true
 	return t.cleanupLocked()
 }
@@ -314,6 +341,13 @@ func (s *DetachedRawStore) Acquire() (*DetachedRawLease, error) {
 	t := s.transfer
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.detached.adopted {
+		return nil, ErrDetachedBootstrapClosed
+	}
+	return acquireDetachedLocked(t)
+}
+
+func acquireDetachedLocked(t *bootstrapTransfer) (*DetachedRawLease, error) {
 	child := t.detached
 	if child.retired || t.closed || child.root.isClosing() {
 		return nil, ErrDetachedBootstrapClosed
@@ -336,6 +370,6 @@ func (s *DetachedRawStore) Acquire() (*DetachedRawLease, error) {
 	}
 	child.leases++
 	child.root.mu.Unlock()
-	m := t.metadata
-	return &DetachedRawLease{transfer: t, records: records, index: index, start: m.StartOffset, end: m.EndOffset, rawBytes: m.Files[0].Size, indexBytes: child.indexBytes, next: m.StartOffset}, nil
+	b := child.extent
+	return &DetachedRawLease{transfer: t, records: records, index: index, start: b.StartOffset, end: b.EndOffset, rawBytes: b.RawBytes, indexBytes: b.IndexBytes, next: b.StartOffset}, nil
 }

@@ -43,7 +43,7 @@ func setDetachedTestDescriptors(m *BootstrapMetadata, raw []byte) {
 
 func detachedTestRoot(t *testing.T) *DetachedBootstrapRoot {
 	t.Helper()
-	root, err := NewDetachedBootstrapRoot(t.TempDir(), DefaultBootstrapLimits(), 0, 0)
+	root, err := NewDetachedBootstrapRoot(t.TempDir(), DefaultBootstrapLimits(), 0, 0, 16)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, root.Close()) })
 	return root
@@ -63,13 +63,13 @@ func detachedTestStage(t *testing.T, root *DetachedBootstrapRoot, m BootstrapMet
 
 func TestDetachedBootstrapRootLifecycle(t *testing.T) {
 	dir := t.TempDir()
-	root, err := NewDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0)
+	root, err := NewDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0, 16)
 	require.NoError(t, err)
-	_, err = NewDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0)
+	_, err = NewDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0, 16)
 	require.Error(t, err)
 	require.NoError(t, root.Close())
 	require.NoError(t, root.Close())
-	next, err := NewDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0)
+	next, err := NewDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0, 16)
 	require.NoError(t, err)
 	require.NoError(t, next.Close())
 }
@@ -103,7 +103,7 @@ func TestDetachedRawPreservesFieldsPinsAndPhysicalOwnership(t *testing.T) {
 	require.ErrorIs(t, root.Close(), ErrDetachedBootstrapPending)
 	_, err = store.Acquire()
 	require.ErrorIs(t, err, ErrDetachedBootstrapClosed)
-	_, err = NewDetachedBootstrapRoot(root.dir, root.limits, 0, 0)
+	_, err = NewDetachedBootstrapRoot(root.dir, root.limits, 0, 0, 16)
 	require.Error(t, err, "pinned root must retain kernel lock")
 	page, err := lease.ReadRaw(context.Background(), 0, 10, 1<<20)
 	require.NoError(t, err)
@@ -309,7 +309,7 @@ func TestDetachedCreationAndPreparationRaceRootClose(t *testing.T) {
 			}
 			<-entered
 			require.ErrorIs(t, root.Close(), ErrDetachedBootstrapPending)
-			_, err := NewDetachedBootstrapRoot(root.dir, root.limits, 0, 0)
+			_, err := NewDetachedBootstrapRoot(root.dir, root.limits, 0, 0, 16)
 			require.Error(t, err)
 			close(release)
 			require.ErrorIs(t, <-result, ErrDetachedBootstrapClosed)
@@ -366,7 +366,7 @@ func TestDetachedStartupPreservesUnknownAndRejectsRecognizedNonDirectory(t *test
 	for _, name := range []string{"unknown", ".detached.bootstrap-invalid", "partition_1.bootstrap.pending"} {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(name), 0600))
 	}
-	root, err := NewDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0)
+	root, err := NewDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0, 16)
 	require.NoError(t, err)
 	require.NoDirExists(t, recognized)
 	for _, name := range []string{"unknown", ".detached.bootstrap-invalid", "partition_1.bootstrap.pending"} {
@@ -374,7 +374,7 @@ func TestDetachedStartupPreservesUnknownAndRejectsRecognizedNonDirectory(t *test
 	}
 	require.NoError(t, root.Close())
 	require.NoError(t, os.WriteFile(recognized, []byte("not directory"), 0600))
-	_, err = NewDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0)
+	_, err = NewDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0, 16)
 	require.Error(t, err)
 	require.FileExists(t, recognized)
 }
@@ -410,10 +410,10 @@ func TestDetachedStartupDeletionFailureBlocksOpenAndReleasesLock(t *testing.T) {
 	orphan := filepath.Join(dir, detachedBootstrapPrefix+id)
 	require.NoError(t, os.Mkdir(orphan, 0700))
 	injected := errors.New("orphan deletion denied")
-	_, err = newDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0, func(path string) error { require.Equal(t, orphan, path); return injected })
+	_, err = newDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0, 16, func(path string) error { require.Equal(t, orphan, path); return injected })
 	require.ErrorIs(t, err, injected)
 	require.DirExists(t, orphan)
-	root, err := NewDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0)
+	root, err := NewDetachedBootstrapRoot(dir, DefaultBootstrapLimits(), 0, 0, 16)
 	require.NoError(t, err)
 	require.NoDirExists(t, orphan)
 	require.NoError(t, root.Close())
