@@ -169,7 +169,11 @@ func TestSourceMissingOptionalAuthorityFailsClosed(t *testing.T) {
 	f, _ := indexedRecoveryFSMWithProvider(t, nil, func(dm *disk.DiskManager) topic.HandlerProvider {
 		return &sourceMutationProvider{DiskManager: dm, hide: true}
 	})
-	r := f.BuildReplicaCatchupRequests("node-2")[0]
+	require.Empty(t, f.BuildReplicaCatchupRequests("node-2"), "unsupported local storage cannot capture receiver authority")
+	meta := f.GetPartitionMetadata("orders-0")
+	// Source-side validation receives only the remote wire request; its local
+	// handler deliberately lacks authority, independently of receiver capture.
+	r := ReplicaCatchupRequest{Topic: "orders", BrokerID: "node-2", Leader: meta.Leader, SourceBroker: "node-1", LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch, CommittedHWM: meta.CommittedHWM, MaxRecords: MaxReplicaCatchupRecords}
 	batch, err := f.FetchReplicaCatchup(r)
 	require.Error(t, err)
 	require.Empty(t, batch.Digest)
@@ -326,7 +330,10 @@ func TestSourceMissingPageAuthorityFailsClosed(t *testing.T) {
 	f, _ := indexedRecoveryFSMWithProvider(t, nil, func(dm *disk.DiskManager) topic.HandlerProvider {
 		return &sourceMutationProvider{DiskManager: dm, hidePage: true}
 	})
-	r := f.BuildReplicaCatchupRequests("node-2")[0]
+	require.Empty(t, f.BuildReplicaCatchupRequests("node-2"), "incomplete local storage authority cannot capture receiver proof")
+	meta := f.GetPartitionMetadata("orders-0")
+	// Model the remote wire request independently of unsupported local receiver storage.
+	r := ReplicaCatchupRequest{Topic: "orders", BrokerID: "node-2", Leader: meta.Leader, SourceBroker: "node-1", LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch, CommittedHWM: meta.CommittedHWM, MaxRecords: MaxReplicaCatchupRecords}
 	batch, err := f.FetchReplicaCatchup(r)
 	require.ErrorIs(t, err, topic.ErrReplicaSourceUnsupported)
 	require.Empty(t, batch.Digest)

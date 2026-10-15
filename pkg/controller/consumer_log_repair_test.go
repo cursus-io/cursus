@@ -19,12 +19,19 @@ import (
 )
 
 func consumerRollbackFixture(t *testing.T) (*CommandHandler, *topic.Partition, uint64, *disk.DiskHandler) {
+	return consumerRollbackFixtureWithProvider(t, nil)
+}
+func consumerRollbackFixtureWithProvider(t *testing.T, makeProvider func(*disk.DiskManager) topic.HandlerProvider) (*CommandHandler, *topic.Partition, uint64, *disk.DiskHandler) {
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
 	cfg.LogDir = t.TempDir()
 	dm := disk.NewDiskManager(cfg)
-	tm := topic.NewTopicManager(cfg, dm, nil)
+	var provider topic.HandlerProvider = dm
+	if makeProvider != nil {
+		provider = makeProvider(dm)
+	}
+	tm := topic.NewTopicManager(cfg, provider, nil)
 	c, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, &dummyPublisher{})
 	require.NoError(t, err)
 	state := fsm.NewBrokerFSM(tm, c)
@@ -110,7 +117,12 @@ func TestConsumerReplicaRollbackStrictReplayDiscardsDeletedOverlay(t *testing.T)
 			}
 			sealed, err = fsm.SealReplicaCatchupBatch(batch)
 			require.NoError(t, err)
-			require.NoError(t, h.ApplyReplicaCatchup(context.Background(), sealed), "infrastructure catch-up continues while consumers are closed")
+			request := localRecoveryRequest(t, state, "local", config.ConsumerOffsetsTopicName, 0)
+			witness, err := h.ApplyReplicaCatchupVerified(context.Background(), request, sealed)
+			require.NoError(t, err, "infrastructure catch-up continues while consumers are closed")
+			require.NotNil(t, witness)
+			require.NoError(t, fsm.AdvanceReplicaCatchupRequest(&request, sealed))
+			require.NoError(t, state.MarkReplicaCatchupVerified(request, witness))
 			require.Equal(t, generation, c.ConsumerRecoveryRequirement().RequiredGeneration)
 			require.ErrorIs(t, c.ConsumerOperationsReadinessError(), coordinator.ErrConsumerMetadataRecovering)
 			require.NoError(t, h.refreshLocalGroupRecovery())

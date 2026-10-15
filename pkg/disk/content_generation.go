@@ -17,6 +17,56 @@ type ContentGeneration struct {
 }
 
 var ErrStaleContentGeneration = errors.New("stale disk content generation")
+var ErrContentPublicationBusy = errors.New("disk content publication busy")
+
+// TryPublishIfContentGenerations validates all local generations atomically.
+// It never waits while holding another handler's locks: contention releases the
+// entire set so callers may retry without imposing a global handler order.
+// publish may only mutate caller-owned state whose locks are ALREADY held.
+func TryPublishIfContentGenerations(tokens []ContentGeneration, publish func()) error {
+	if publish == nil {
+		return fmt.Errorf("content publication requires callback")
+	}
+	owners := make(map[*DiskHandler]ContentGeneration, len(tokens))
+	locked := make([]*DiskHandler, 0, len(tokens))
+	defer func() {
+		for i := len(locked) - 1; i >= 0; i-- {
+			locked[i].writeFailureMu.RUnlock()
+			locked[i].mu.Unlock()
+		}
+	}()
+	for _, token := range tokens {
+		d := token.owner
+		if d == nil {
+			return ErrStaleContentGeneration
+		}
+		if previous, exists := owners[d]; exists {
+			if previous != token {
+				return ErrStaleContentGeneration
+			}
+			continue
+		}
+		if !d.mu.TryLock() {
+			return ErrContentPublicationBusy
+		}
+		if !d.writeFailureMu.TryRLock() {
+			d.mu.Unlock()
+			return ErrContentPublicationBusy
+		}
+		locked = append(locked, d)
+		owners[d] = token
+	}
+	for d, token := range owners {
+		if err := d.proofAvailabilityLocked(); err != nil {
+			return err
+		}
+		if token != d.contentGenerationLocked() {
+			return ErrStaleContentGeneration
+		}
+	}
+	publish()
+	return nil
+}
 
 // CaptureContentGeneration checks availability and captures a local witness.
 func (d *DiskHandler) CaptureContentGeneration() (ContentGeneration, error) {

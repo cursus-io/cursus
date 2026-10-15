@@ -1,6 +1,7 @@
 package fsm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"github.com/cursus-io/cursus/pkg/config"
@@ -12,6 +13,23 @@ import (
 var ErrReplicaBootstrapRequired = errors.New("replica bootstrap required: no common retained prefix")
 
 func addReplicaRecoveryProof(partition *topic.Partition, request *ReplicaCatchupRequest, receiver, source BrokerInfo, inISR bool, definition *topic.Definition) error {
+	release := partition.BeginReplicationMutation()
+	defer release()
+	witness, err := partition.CaptureReplicaRequestWitness(context.Background(), request.NextOffset)
+	if err != nil {
+		return err
+	}
+	if err := addReplicaRecoveryChallenge(partition, request, receiver, source, inISR, definition); err != nil {
+		return err
+	}
+	if err := partition.ValidateReplicaRequestWitness(context.Background(), witness, request.NextOffset); err != nil {
+		return err
+	}
+	request.LocalWitness = witness
+	return nil
+}
+
+func addReplicaRecoveryChallenge(partition *topic.Partition, request *ReplicaCatchupRequest, receiver, source BrokerInfo, inISR bool, definition *topic.Definition) error {
 	if err := addPreviousReplicaRecord(partition, request); err != nil {
 		return err
 	}
@@ -135,7 +153,7 @@ func (f *BrokerFSM) WithReplicaRecoveryFence(batch ReplicaCatchupBatch, apply fu
 	source := f.brokers[batch.SourceBroker]
 	receiver := f.brokers[batch.BrokerID]
 	valid := meta != nil && meta.CommittedHWMKnown && meta.Leader == batch.Leader && meta.LeaderEpoch == batch.LeaderEpoch && meta.LifecycleEpoch == batch.LifecycleEpoch && meta.CommittedHWM >= batch.CommittedHWM && containsString(meta.Replicas, batch.BrokerID) && containsString(meta.Replicas, batch.SourceBroker) && containsString(meta.ISR, batch.SourceBroker) && source != nil && source.Status == "active" && receiver != nil && receiver.Status == "active"
-	if valid && batch.TruncateTo != nil {
+	if valid {
 		valid = !containsString(meta.ISR, batch.BrokerID)
 	}
 	if valid && batch.RecoveryProtocol == IndexedRecoveryProtocolVersion {

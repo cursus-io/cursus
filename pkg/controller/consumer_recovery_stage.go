@@ -195,7 +195,7 @@ func (ch *CommandHandler) validateConsumerRecoveryPlan(plan *consumerRecoveryPla
 // withConsumerRecoveryPlan opens only local fixed views. Remote bytes were
 // staged before the lease, reload mutex, lifecycle gates, and FSM fence.
 func (ch *CommandHandler) withConsumerRecoveryPlan(ctx context.Context, plan *consumerRecoveryPlan, target int, targetView *topic.PartitionReadView, fn func(*consumerRecoveryReader) error) error {
-	reader := &consumerRecoveryReader{ctx: ctx, views: make([]*topic.PartitionReadView, len(plan.metadata)), ends: make([]uint64, len(plan.metadata)), staged: plan.staged}
+	reader := &consumerRecoveryReader{ctx: ctx, views: make([]*topic.PartitionReadView, len(plan.metadata)), ends: make([]uint64, len(plan.metadata)), staged: plan.staged, metadata: plan.metadata}
 	var visit func(int) error
 	visit = func(i int) error {
 		if err := ctx.Err(); err != nil {

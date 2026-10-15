@@ -20,10 +20,63 @@ func (c *Coordinator) BeginConsumerLogRepair(partition int) (uint64, error) {
 		return 0, fmt.Errorf("consumer log repair requires an available exclusive recovery lease")
 	}
 	g.requiredGeneration++
+	if g.pendingLogRepairs == nil {
+		g.pendingLogRepairs = make(map[int]uint64)
+	}
+	g.pendingLogRepairs[partition] = g.requiredGeneration
 	g.restoreInstalling = true
 	g.logRepairGeneration, g.logRepairLease = g.requiredGeneration, g.lease
 	g.notifyLocked()
 	return g.requiredGeneration, nil
+}
+
+// PendingConsumerLogRepair is a local admission requirement, never snapshot or
+// Raft authority. Only validated full replay may discharge it.
+func (c *Coordinator) PendingConsumerLogRepair(partition int) uint64 {
+	if c == nil {
+		return 0
+	}
+	c.consumerAdmission.mu.Lock()
+	defer c.consumerAdmission.mu.Unlock()
+	return c.consumerAdmission.pendingLogRepairs[partition]
+}
+
+// ConsumerLogRepairValidator binds replay to actual receiver verification.
+type ConsumerLogRepairValidator interface {
+	ValidateConsumerLogRepair(partition int, repairGeneration uint64) error
+}
+
+type ConsumerLogRepairPublisher interface {
+	AcquireConsumerLogRepairPublication(map[int]uint64) (ConsumerLogRepairPublication, error)
+}
+
+// ConsumerLogRepairPublication owns partition verification guards acquired
+// before coordinator locks. Publish changes only already-locked scalar/map state.
+type ConsumerLogRepairPublication interface {
+	Publish(func()) error
+	Close()
+}
+
+func (c *Coordinator) pendingConsumerLogRepairs() map[int]uint64 {
+	c.consumerAdmission.mu.Lock()
+	defer c.consumerAdmission.mu.Unlock()
+	repairs := make(map[int]uint64, len(c.consumerAdmission.pendingLogRepairs))
+	for p, g := range c.consumerAdmission.pendingLogRepairs {
+		repairs[p] = g
+	}
+	return repairs
+}
+
+func validateConsumerLogRepairs(validator ConsumerLogRepairValidator, repairs map[int]uint64) error {
+	if len(repairs) != 0 && validator == nil {
+		return fmt.Errorf("consumer log repair requires verified local authority")
+	}
+	for p, g := range repairs {
+		if err := validator.ValidateConsumerLogRepair(p, g); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // FinishConsumerLogRepair leaves full strict replay required after lease release.

@@ -40,9 +40,10 @@ func TestConsumerLogRepairCleanRejectionRequiresStrictReplay(t *testing.T) {
 	require.ErrorIs(t, c.ConsumerOperationsReadinessError(), ErrConsumerMetadataRecovering)
 	release = acquireReplay(t, c)
 	require.Error(t, c.CompleteConsumerRecovery(generation))
-	prepared, err := c.PrepareFullConsumerMetadataReplay(strictReader(c))
+	reader := &repairReplayReader{strictReplayReader: strictReader(c), verified: map[int]uint64{0: generation}}
+	prepared, err := c.PrepareFullConsumerMetadataReplay(reader)
 	require.NoError(t, err)
-	require.NoError(t, c.ApplyFullConsumerMetadataReplay(prepared))
+	require.NoError(t, c.ApplyFullConsumerMetadataReplayAndComplete(prepared))
 	require.NoError(t, c.CompleteConsumerRecovery(generation))
 	release()
 	require.NoError(t, c.ConsumerOperationsReadinessError())

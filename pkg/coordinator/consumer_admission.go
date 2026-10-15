@@ -33,6 +33,7 @@ type consumerAdmission struct {
 	restoreError                 error
 	logRepairGeneration          uint64
 	logRepairLease               uint64
+	pendingLogRepairs            map[int]uint64
 	tickets                      map[int]*ConsumerBootstrapTicket
 	bootstrapObservationRevision uint64
 }

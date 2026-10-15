@@ -44,6 +44,21 @@ func (ch *CommandHandler) CatchupReplicaSnapshots(ctx context.Context, request r
 // HWM only when the complete committed range is present; ISR admission remains
 // the heartbeat proof's responsibility.
 func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replicationFSM.ReplicaCatchupBatch) error {
+	return ch.applyReplicaCatchupRequest(ctx, nil, batch, nil)
+}
+
+// ApplyReplicaCatchupVerified binds actual local application to the immutable
+// challenge that preceded the network fetch. Tuple-only callers get no authority.
+func (ch *CommandHandler) ApplyReplicaCatchupVerified(ctx context.Context, request replicationFSM.ReplicaCatchupRequest, batch replicationFSM.ReplicaCatchupBatch) (*topic.ReplicaCatchupWitness, error) {
+	if err := clusterController.ValidateReplicaCatchupBatch(request, batch); err != nil {
+		return nil, err
+	}
+	var witness *topic.ReplicaCatchupWitness
+	err := ch.applyReplicaCatchupRequest(ctx, &request, batch, &witness)
+	return witness, err
+}
+
+func (ch *CommandHandler) applyReplicaCatchupRequest(ctx context.Context, request *replicationFSM.ReplicaCatchupRequest, batch replicationFSM.ReplicaCatchupBatch, witness **topic.ReplicaCatchupWitness) error {
 	if err := replicationFSM.ValidateReplicaCatchupBatchDigest(batch); err != nil {
 		return err
 	}
@@ -80,16 +95,16 @@ func (ch *CommandHandler) ApplyReplicaCatchup(ctx context.Context, batch replica
 		return err
 	}
 	defer writeLock.Unlock()
-	if batch.RecoveryProtocol != 0 || batch.TruncateTo != nil {
+	if request != nil || batch.RecoveryProtocol != 0 || batch.TruncateTo != nil {
 		if ch.Cluster.RaftManager.GetFSM() == nil {
 			return fmt.Errorf("replica catch-up metadata is unavailable")
 		}
-		return ch.Cluster.RaftManager.GetFSM().WithReplicaRecoveryFence(batch, func() error { return ch.applyReplicaCatchup(ctx, batch) })
+		return ch.Cluster.RaftManager.GetFSM().WithReplicaRecoveryFence(batch, func() error { return ch.applyReplicaCatchup(ctx, request, batch, witness) })
 	}
-	return ch.applyReplicaCatchup(ctx, batch)
+	return ch.applyReplicaCatchup(ctx, request, batch, witness)
 }
 
-func (ch *CommandHandler) applyReplicaCatchup(ctx context.Context, batch replicationFSM.ReplicaCatchupBatch) error {
+func (ch *CommandHandler) applyReplicaCatchup(ctx context.Context, request *replicationFSM.ReplicaCatchupRequest, batch replicationFSM.ReplicaCatchupBatch, witness **topic.ReplicaCatchupWitness) error {
 	if ch.Cluster.Router == nil || batch.BrokerID != ch.Cluster.Router.BrokerID() {
 		return fmt.Errorf("replica catch-up broker identity mismatch")
 	}
@@ -127,6 +142,25 @@ func (ch *CommandHandler) applyReplicaCatchup(ctx context.Context, batch replica
 	if err != nil {
 		return err
 	}
+	if batch.TruncateTo == nil {
+		releaseMutation := partition.BeginReplicationMutation()
+		defer releaseMutation()
+	}
+	if request != nil {
+		if err := partition.ValidateReplicaRequestWitness(ctx, request.LocalWitness, batch.StartOffset); err != nil {
+			return err
+		}
+		if err := replicationFSM.ValidateReplicaRequestChallenge(partition, *request); err != nil {
+			return err
+		}
+	}
+	repairGeneration := uint64(0)
+	if request != nil && batch.Topic == config.ConsumerOffsetsTopicName {
+		if ch.Coordinator == nil {
+			return fmt.Errorf("consumer repair coordinator unavailable")
+		}
+		repairGeneration = ch.Coordinator.PendingConsumerLogRepair(batch.Partition)
+	}
 	if partition.NextOffset() != batch.StartOffset {
 		return fmt.Errorf("replica catch-up local LEO changed: current=%d response_start=%d", partition.NextOffset(), batch.StartOffset)
 	}
@@ -144,12 +178,20 @@ func (ch *CommandHandler) applyReplicaCatchup(ctx context.Context, batch replica
 			return fmt.Errorf("invalid replica catch-up truncation boundary")
 		}
 		var beforeMutation func() error
+		if request != nil {
+			beforeMutation = func() error { return partition.CheckReplicaRequestGeneration(ctx, request.LocalWitness) }
+		}
 		var generation uint64
 		if batch.Topic == config.ConsumerOffsetsTopicName {
 			if err := ch.Coordinator.ValidateConsumerMetadataBootstrapEligibility(batch.Partition); err != nil {
 				return err
 			}
 			beforeMutation = func() error {
+				if request != nil {
+					if err := partition.CheckReplicaRequestGeneration(ctx, request.LocalWitness); err != nil {
+						return err
+					}
+				}
 				var err error
 				generation, err = ch.Coordinator.BeginConsumerLogRepair(batch.Partition)
 				return err
@@ -167,17 +209,49 @@ func (ch *CommandHandler) applyReplicaCatchup(ctx context.Context, batch replica
 		}
 		return err
 	}
-	releaseMutation := partition.BeginReplicationMutation()
-	defer releaseMutation()
+	finish := func() error {
+		if localTopic.IsEventSourcing {
+			if ch.ESHandler == nil {
+				return fmt.Errorf("event sourcing index unavailable")
+			}
+			if request == nil {
+				if err := ch.ESHandler.PrepareCommittedIndex(batch.Topic, batch.Partition); err != nil {
+					return err
+				}
+			}
+		}
+		var err error
+		if request != nil {
+			err = partition.ApplyReplicaHWMChecked(ctx, request.LocalWitness, batch.CommittedHWM)
+		} else {
+			err = partition.ApplyReplicaHWM(batch.CommittedHWM)
+		}
+		if err != nil {
+			return err
+		}
+		partition.FlushDisk()
+		if localTopic.IsEventSourcing {
+			if request != nil {
+				err := partition.WithReplicaCatchupIndexView(ctx, request.LocalWitness, batch.CommittedHWM, func(view *topic.PartitionReadView) error {
+					return ch.ESHandler.IndexReplicaCatchupWithView(batch.Topic, batch.Partition, batch.CommittedHWM, view)
+				})
+				if err != nil {
+					return err
+				}
+			} else if err := ch.ESHandler.IndexCommittedToHWM(batch.Topic, batch.Partition, batch.CommittedHWM); err != nil {
+				return err
+			}
+		}
+		if request != nil {
+			*witness, err = partition.CompleteReplicaCatchupVerification(ctx, request.LocalWitness, batch.Leader, batch.LeaderEpoch, batch.LifecycleEpoch, batch.CommittedHWM, repairGeneration)
+		}
+		return err
+	}
 	if batch.Verified && batch.StartOffset == batch.CommittedHWM {
 		if len(batch.Messages) != 0 || batch.EndOffset != batch.StartOffset {
 			return fmt.Errorf("invalid replica catch-up verification batch")
 		}
-		if err := partition.ApplyReplicaHWM(batch.CommittedHWM); err != nil {
-			return err
-		}
-		partition.FlushDisk()
-		return nil
+		return finish()
 	}
 	if len(batch.Messages) > replicationFSM.MaxReplicaCatchupRecords || (!batch.Compacted && len(batch.Messages) == 0) {
 		return fmt.Errorf("invalid replica catch-up batch size %d", len(batch.Messages))
@@ -219,21 +293,7 @@ func (ch *CommandHandler) applyReplicaCatchup(ctx context.Context, batch replica
 	if !batch.Verified {
 		return fmt.Errorf("replica catch-up completed without prefix verification")
 	}
-	if localTopic.IsEventSourcing && ch.ESHandler != nil {
-		if err := ch.ESHandler.PrepareCommittedIndex(batch.Topic, batch.Partition); err != nil {
-			return err
-		}
-	}
-	if err := partition.ApplyReplicaHWM(batch.CommittedHWM); err != nil {
-		return err
-	}
-	partition.FlushDisk()
-	if localTopic.IsEventSourcing && ch.ESHandler != nil {
-		if err := ch.ESHandler.IndexCommittedToHWM(batch.Topic, batch.Partition, batch.CommittedHWM); err != nil {
-			return err
-		}
-	}
-	return nil
+	return finish()
 }
 
 func containsReplica(replicas []string, brokerID string) bool {
