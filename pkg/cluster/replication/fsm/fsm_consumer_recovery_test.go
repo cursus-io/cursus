@@ -31,9 +31,63 @@ func persistAuthorityFSM(t *testing.T, f *BrokerFSM) []byte {
 	t.Helper()
 	snap, err := f.Snapshot()
 	require.NoError(t, err)
+	defer snap.Release()
 	var b bytes.Buffer
 	require.NoError(t, snap.Persist(&MockSnapshotSink{Writer: &b}))
 	return b.Bytes()
+}
+
+func requirePersistedConsumerStateEqual(t *testing.T, expected, actual any) {
+	t.Helper()
+	// Snapshot serialization preserves wall time, not process-local monotonic
+	// clock readings or time.Location pointers.
+	want, err := json.Marshal(expected)
+	require.NoError(t, err)
+	got, err := json.Marshal(actual)
+	require.NoError(t, err)
+	require.JSONEq(t, string(want), string(got))
+}
+
+func TestConsumerRecoveryFSMHistoricalShellBaselineRoundTrip(t *testing.T) {
+	c := authorityCoordinator(t)
+	require.NoError(t, c.ApplyOffsetUpdateFromFSM("shell", "events", []coordinator.OffsetItem{{Partition: 0, Offset: 7}}))
+	release, err := c.BeginConsumerMetadataRecovery(context.Background())
+	require.NoError(t, err)
+	defer release()
+	reader := &registrationActivityReader{}
+	prepared, err := c.PrepareFullConsumerMetadataReplay(reader)
+	require.NoError(t, err)
+	require.NoError(t, c.ApplyFullConsumerMetadataReplay(prepared))
+	release()
+	require.Equal(t, uint64(7), c.ExportState()["shell"].Offsets["events"][0])
+	// Strict replay accepts an incomplete historical shell, but a live shell
+	// cannot become a snapshot until modern registration completes it.
+	snapshot, err := NewBrokerFSM(nil, c).Snapshot()
+	require.Error(t, err)
+	require.Nil(t, snapshot)
+	c.SetRoutedOffsetRecordWriter(func(record coordinator.ConsumerMetadataRecord) error {
+		c.RecordConsumerMetadataSource(record.Group, 0)
+		return nil
+	})
+	require.NoError(t, c.RegisterGroup("events", "shell", 1))
+	groups, proof, err := c.ExportStateWithRecovery()
+	require.NoError(t, err)
+	require.NoError(t, coordinator.ValidateImportState(groups))
+	require.True(t, proof.KnownComplete)
+	require.Zero(t, proof.RaftCompatibilityState["shell"].RegistrationEpoch)
+	require.Error(t, coordinator.ValidateImportState(proof.RaftCompatibilityState))
+	raw := persistAuthorityFSM(t, NewBrokerFSM(nil, c))
+	peer := authorityCoordinator(t)
+	require.NoError(t, NewBrokerFSM(nil, peer).Restore(io.NopCloser(bytes.NewReader(raw))))
+	restoredGroups, restoredProof, err := peer.ExportStateWithRecovery()
+	require.NoError(t, err)
+	requirePersistedConsumerStateEqual(t, groups, restoredGroups)
+	requirePersistedConsumerStateEqual(t, proof, restoredProof)
+	require.Equal(t, uint64(7), restoredProof.RaftCompatibilityState["shell"].Offsets["events"][0])
+	require.Equal(t, []int{0}, restoredProof.SourcePartitions["shell"])
+	require.Zero(t, reader.calls)
+	require.Zero(t, reader.records)
+	require.Zero(t, reader.payloadBytes)
 }
 
 func TestLiveConsumerRestoreRejectsUnknownBeforeMutation(t *testing.T) {
