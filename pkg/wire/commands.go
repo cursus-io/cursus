@@ -68,6 +68,9 @@ const (
 	CommandBrowseMessages
 	CommandReadStreamHistory
 	CommandReassignPartition
+	CommandBootstrapBegin
+	CommandBootstrapChunk
+	CommandBootstrapRelease
 )
 
 var commandNames = [...]string{
@@ -129,6 +132,9 @@ var commandNames = [...]string{
 	CommandBrowseMessages:          "BROWSE_MESSAGES",
 	CommandReadStreamHistory:       "READ_STREAM_HISTORY",
 	CommandReassignPartition:       "REASSIGN_PARTITION",
+	CommandBootstrapBegin:          "BOOTSTRAP_BEGIN",
+	CommandBootstrapChunk:          "BOOTSTRAP_CHUNK",
+	CommandBootstrapRelease:        "BOOTSTRAP_RELEASE",
 }
 
 var commandsByName = func() map[string]Command {
