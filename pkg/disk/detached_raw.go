@@ -36,7 +36,8 @@ type detachedRawFrame struct {
 }
 
 // DetachedRawLease owns independent handles and a serialized forward cursor.
-// Immutable files are trusted after preparation; out-of-band mutation is unsupported.
+// Append-only files have an immutable published prefix. Each lease retains fixed
+// raw/index extents and logical bounds; out-of-band mutation is unsupported.
 type DetachedRawLease struct {
 	mu                   sync.Mutex
 	transfer             *bootstrapTransfer

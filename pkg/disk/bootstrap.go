@@ -263,7 +263,9 @@ func (t *bootstrapTransfer) cleanupLocked() error {
 		t.timer.Stop()
 	}
 	if err := t.removeAll(t.dir); err != nil {
-		retainBootstrapCleanup(t)
+		if t.detached == nil || !t.detached.adopted {
+			retainBootstrapCleanup(t)
+		}
 		return err
 	}
 	t.cleanupComplete = true
