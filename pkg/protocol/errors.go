@@ -61,6 +61,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"NOT_COORDINATOR", "NOT_LEADER", "NOT_PARTITION_LEADER",
 	)
 	register(ErrorClassAvailability, true,
+		"snapshot_generation_changed",
 		"consumer_metadata_recovering",
 		"replica_offset_conflict",
 		"cluster_metadata_unavailable", "cluster_not_available", "coordinator_not_available", "fsm_not_available",
@@ -70,6 +71,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"snapshot_catalog_revision_changed", "transaction_offset_materialization_failed", "transaction_offset_prepare_failed", "unstable_offset_commit",
 	)
 	register(ErrorClassFencing, false,
+		"snapshot_lifecycle_changed",
 		"GEN_MISMATCH", "NOT_OWNER", "PARTITION_LEADER_FENCED", "STALE_LEADER_EPOCH", "STALE_TOPIC_LIFECYCLE_EPOCH", "member_not_found",
 		"group_epoch_mismatch", "missing_topic_lifecycle_epoch", "producer_fenced", "stale_producer_epoch",
 	)
