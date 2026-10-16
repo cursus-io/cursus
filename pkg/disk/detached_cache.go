@@ -155,6 +155,7 @@ func (owner *bootstrapByteOwner) growDetached(headroom *diskHeadroomGuard, size 
 		return &BootstrapLimitError{Resource: "canonical bytes", Requested: size, Limit: owner.limits.MaxTransferBytes}
 	}
 	delta := size - owner.reserved
+	// #nosec G115 -- size > owner.reserved >= 0 above, so delta is positive and fits int64.
 	if _, err := headroom.reserve(uint64(delta), false); err != nil {
 		return err
 	}
