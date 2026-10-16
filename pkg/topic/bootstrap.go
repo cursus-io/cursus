@@ -177,12 +177,22 @@ func (s *BootstrapSession) Install(receiver *disk.BootstrapReceiver, detach func
 	if s.metadata != nil && s.metadata.TransferID != m.TransferID {
 		return s.fail(fmt.Errorf("different bootstrap already pending"))
 	}
+	// The session owns checkpoint exclusion. Read committed authority only on
+	// fresh install, before detaching caches or persisting a replacement intent.
+	// Pending replay may already have deleted this checkpoint on restart.
+	floor, err := loadBootstrapCommittedHWM(s.p.hwmCheckpointPath)
+	if err != nil {
+		return s.fail(err)
+	}
+	if m.EndOffset < floor {
+		return s.fail(fmt.Errorf("bootstrap end %d is below committed checkpoint %d", m.EndOffset, floor))
+	}
 	if detach != nil {
 		if err := detach(); err != nil {
 			return s.fail(err)
 		}
 	}
-	err := receiver.Install()
+	err = receiver.Install()
 	pending, pendingErr := s.disk.PendingBootstrap()
 	if pending != nil {
 		s.durable = true
@@ -210,6 +220,11 @@ func (s *BootstrapSession) validate(m disk.BootstrapMetadata) error {
 	p.recoveryMu.RUnlock()
 	if known && epoch != m.Fence.LifecycleEpoch {
 		return fmt.Errorf("bootstrap lifecycle mismatch")
+	}
+	// A retained same-process floor also constrains pending/prepared resume.
+	// After restart, the validated pending manifest supplies the boundary.
+	if floor := p.RecoveryCommittedHWMFloor(); m.EndOffset < floor {
+		return fmt.Errorf("bootstrap end %d is below retained committed floor %d", m.EndOffset, floor)
 	}
 	return nil
 }
