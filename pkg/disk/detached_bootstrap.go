@@ -224,6 +224,7 @@ func (r *DetachedBootstrapRoot) Stage(topic string, partition int, metadata Boot
 		return nil, ErrDetachedBootstrapClosed
 	}
 	retryBootstrapCleanup()
+	// #nosec G115 -- validateBootstrapMetadata and checked derived-index addition produced a nonnegative int64 size.
 	if _, err = r.headroom.reserve(uint64(size), true); err != nil {
 		r.forget(t)
 		return nil, err

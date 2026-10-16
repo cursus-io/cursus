@@ -268,6 +268,7 @@ func (s *AdoptedRawStore) AppendPrepared(ctx context.Context, expected DetachedR
 		return result, err
 	}
 	defer func() { _ = sourceIndex.Close() }()
+	// #nosec G115 -- published extents contain validated nonnegative file sizes; lastIndex is within the old raw extent.
 	boundary := incoming.RawBytes != 0 && uint64(old.RawBytes)-c.lastIndex >= detachedIndexInterval
 	indexGrowth := incoming.IndexBytes
 	if boundary {
@@ -350,11 +351,13 @@ func copyDetachedSuffix(ctx context.Context, ops detachedAppendIO, target, sourc
 		}
 		chunk := buffer[:min(int64(len(buffer)), size-position)]
 		n, err := source.ReadAt(chunk, position)
+		// #nosec G115 -- os.File.ReadAt returns a nonnegative byte count, including partial failures.
 		work.RawReadBytes += uint64(n)
 		if err != nil {
 			return err
 		}
 		n, err = ops.writeAt(target, chunk, offset+position)
+		// #nosec G115 -- the private I/O adapter follows os.File.WriteAt's nonnegative byte-count contract.
 		work.RawBytes += uint64(n)
 		if err != nil {
 			return err
@@ -374,6 +377,7 @@ func appendDetachedIndex(ctx context.Context, ops detachedAppendIO, target, sour
 			return err
 		}
 		n, err := ops.writeAt(target, entry, position)
+		// #nosec G115 -- the private I/O adapter follows os.File.WriteAt's nonnegative byte-count contract.
 		work.IndexBytes += uint64(n)
 		if err != nil {
 			return err
@@ -388,6 +392,7 @@ func appendDetachedIndex(ctx context.Context, ops detachedAppendIO, target, sour
 	var entry [16]byte
 	if boundary {
 		binary.BigEndian.PutUint64(entry[:8], suffix.firstOffset)
+		// #nosec G115 -- old.RawBytes is a published, validated nonnegative extent size.
 		binary.BigEndian.PutUint64(entry[8:], uint64(old.RawBytes))
 		if err := write(entry[:]); err != nil {
 			return lastIndex, err
@@ -398,10 +403,12 @@ func appendDetachedIndex(ctx context.Context, ops detachedAppendIO, target, sour
 			return lastIndex, err
 		}
 		n, err := source.ReadAt(entry[:], pos)
+		// #nosec G115 -- os.File.ReadAt returns a nonnegative byte count bounded by the entry buffer.
 		work.IndexReadBytes += uint64(n)
 		if err != nil {
 			return lastIndex, err
 		}
+		// #nosec G115 -- old.RawBytes is nonnegative; the combined raw extent was checked by addBootstrapBytes before append.
 		physical := binary.BigEndian.Uint64(entry[8:]) + uint64(old.RawBytes)
 		binary.BigEndian.PutUint64(entry[8:], physical)
 		if err := write(entry[:]); err != nil {
