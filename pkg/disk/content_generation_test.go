@@ -220,6 +220,10 @@ func TestContentGenerationDestructivePartialFailures(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, os.Remove(d.GetIndexPath(0)))
 		require.NoError(t, os.Mkdir(d.GetIndexPath(0), 0o700))
+		// Compaction makes its replacement destination owner-writable before
+		// rename. Restore traversal on this deliberately invalid directory so
+		// non-root test cleanup can remove the failure-injection fixture.
+		t.Cleanup(func() { require.NoError(t, os.Chmod(d.GetIndexPath(0), 0o700)) })
 		require.NoError(t, os.WriteFile(filepath.Join(d.GetIndexPath(0), "block"), []byte("x"), 0o600))
 		_, err = d.EnforceCompaction()
 		require.Error(t, err)
