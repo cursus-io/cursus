@@ -205,6 +205,7 @@ func (d *DiskHandler) exportRetainedBootstrap(ctx context.Context, expected Cont
 					return nil, err
 				}
 				n, writeErr := ops.write(log, data)
+				// #nosec G115 -- the private I/O adapter follows os.File.Write's nonnegative byte-count contract.
 				work.CanonicalWriteBytes += uint64(n)
 				if writeErr != nil {
 					return nil, writeErr
@@ -266,6 +267,7 @@ func describeRetainedExportFile(ctx context.Context, path, id, role string, ops 
 	if err := ctx.Err(); err != nil {
 		return BootstrapFile{}, err
 	}
+	// #nosec G304 -- the only caller builds path from its private staging directory and fixed records/catalog names.
 	f, err := os.Open(path)
 	if err != nil {
 		return BootstrapFile{}, err
@@ -285,6 +287,7 @@ func describeRetainedExportFile(ctx context.Context, path, id, role string, ops 
 			return BootstrapFile{}, err
 		}
 		n, readErr := ops.read(f, buffer)
+		// #nosec G115 -- the private I/O adapter follows os.File.Read's nonnegative byte-count contract.
 		work.HashReadBytes += uint64(n)
 		if n > 0 {
 			_, _ = h.Write(buffer[:n])
@@ -309,6 +312,7 @@ func describeRetainedExportFile(ctx context.Context, path, id, role string, ops 
 // normalization of transaction, control, identity, or event metadata.
 func retainedDiskMessage(m types.Message) types.DiskMessage {
 	return types.DiskMessage{
+		// #nosec G115 -- retainedMessage widened this validated on-disk int32 partition; this restores its original type.
 		Topic: m.Topic, Partition: int32(m.Partition), Offset: m.Offset, Payload: m.Payload,
 		ProducerID: m.ProducerID, SeqNum: m.SeqNum, Epoch: m.Epoch, LeaderEpoch: m.LeaderEpoch,
 		Key: m.Key, EventType: m.EventType, SchemaVersion: m.SchemaVersion, AggregateVersion: m.AggregateVersion,

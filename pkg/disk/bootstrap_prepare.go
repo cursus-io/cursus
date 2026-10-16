@@ -83,6 +83,7 @@ func buildBootstrapCanonicalIndex(ctx context.Context, t *bootstrapTransfer, int
 			}
 			lastIndex = position
 		}
+		// #nosec G115 -- scanCompactionSegmentContext supplies only validated positive frame sizes.
 		position += uint64(frame.size)
 		return nil
 	})

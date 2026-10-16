@@ -96,16 +96,19 @@ func (l *DetachedRawLease) seek(ctx context.Context, start uint64) error {
 		mid := lo + (hi-lo)/2
 		var entry [16]byte
 		n, err := l.index.ReadAt(entry[:], mid*16)
+		// #nosec G115 -- os.File.ReadAt returns a nonnegative byte count even on partial failure.
 		l.work.IndexReadBytes += uint64(n)
 		if err != nil {
 			return err
 		}
 		offset, physical := binary.BigEndian.Uint64(entry[:8]), binary.BigEndian.Uint64(entry[8:])
+		// #nosec G115 -- rawBytes comes from the nonnegative descriptor size validated before publishing the lease.
 		if offset < l.start || offset >= l.end || physical >= uint64(l.rawBytes) {
 			return fmt.Errorf("invalid detached sparse index entry")
 		}
 		if offset <= start {
 			lo = mid + 1
+			// #nosec G115 -- the preceding check bounds physical below the nonnegative int64 rawBytes.
 			position = int64(physical)
 		} else {
 			hi = mid
@@ -127,6 +130,7 @@ func (l *DetachedRawLease) readFrame(ctx context.Context) (*detachedRawFrame, er
 	}
 	var header [4]byte
 	n, err := l.records.ReadAt(header[:], l.position)
+	// #nosec G115 -- os.File.ReadAt returns a nonnegative count bounded by the header buffer.
 	l.work.ReadBytes += uint64(n)
 	if err != nil {
 		return nil, err
@@ -140,6 +144,7 @@ func (l *DetachedRawLease) readFrame(ctx context.Context) (*detachedRawFrame, er
 	}
 	payload := make([]byte, length)
 	n, err = l.records.ReadAt(payload, l.position+4)
+	// #nosec G115 -- os.File.ReadAt returns a nonnegative count bounded by the payload buffer.
 	l.work.ReadBytes += uint64(n)
 	if err != nil {
 		return nil, err
