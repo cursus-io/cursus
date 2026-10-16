@@ -353,14 +353,35 @@ func (h *Handler) validateSnapshotCandidate(ctx context.Context, result Snapshot
 // ExportBootstrapWithCatalog keeps the original decision guard through the
 // potentially long raw export. Failed exports remain unpublished and are closed.
 func (h *Handler) ExportBootstrapWithCatalog(ctx context.Context, name string, partition int, source *topic.BootstrapSource, lifecycle uint64, fence disk.BootstrapFence) (*disk.BootstrapExport, error) {
+	return h.exportBootstrapWithCatalog(ctx, name, partition, source, lifecycle, fence, false)
+}
+
+// ExportBootstrapWithCatalogOwnedContext preserves the same original catalog
+// guard across copying, with lifetime owned only by the transfer registry.
+func (h *Handler) ExportBootstrapWithCatalogOwnedContext(ctx context.Context, name string, partition int, source *topic.BootstrapSource, lifecycle uint64, fence disk.BootstrapFence) (*disk.BootstrapExport, error) {
+	if h == nil || h.tm == nil {
+		return nil, fmt.Errorf("bootstrap catalog source unavailable")
+	}
+	return h.exportBootstrapWithCatalog(ctx, name, partition, source, lifecycle, fence, true)
+}
+
+func (h *Handler) exportBootstrapWithCatalog(ctx context.Context, name string, partition int, source *topic.BootstrapSource, lifecycle uint64, fence disk.BootstrapFence, owned bool) (*disk.BootstrapExport, error) {
 	captured, err := h.captureBootstrapCatalog(ctx, name, partition, source, lifecycle)
 	if err != nil {
 		return nil, err
 	}
-	return captured.export(ctx, source, fence)
+	return captured.exportOwned(ctx, source, fence, owned)
 }
 func (captured *capturedBootstrapCatalog) export(ctx context.Context, source *topic.BootstrapSource, fence disk.BootstrapFence) (*disk.BootstrapExport, error) {
-	exported, err := source.Export(ctx, fence, captured.data)
+	return captured.exportOwned(ctx, source, fence, false)
+}
+
+func (captured *capturedBootstrapCatalog) exportOwned(ctx context.Context, source *topic.BootstrapSource, fence disk.BootstrapFence, owned bool) (*disk.BootstrapExport, error) {
+	exportFn := source.Export
+	if owned {
+		exportFn = source.ExportOwnedContext
+	}
+	exported, err := exportFn(ctx, fence, captured.data)
 	if err != nil {
 		return nil, errors.Join(err, captured.validate(ctx))
 	}

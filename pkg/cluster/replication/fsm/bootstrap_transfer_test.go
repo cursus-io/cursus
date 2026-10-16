@@ -145,7 +145,7 @@ func TestBootstrapTransferStrictBegin(t *testing.T) {
 	r.Version++
 	require.ErrorIs(t, r.Validate(), ErrBootstrapTransferUnsupported)
 	r = metadataBeginRequest()
-	r.Purpose = BootstrapPurposeReplica
+	r.Purpose = "unknown"
 	require.ErrorIs(t, r.Validate(), ErrBootstrapTransferUnsupported)
 }
 
