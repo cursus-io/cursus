@@ -110,6 +110,7 @@ func (p *Partition) scanRawRecoveryStateContext(ctx context.Context) (*rawRecove
 func (p *Partition) installTransactionState(state *rawRecoveryState) {
 	p.txnMarkerMu.Lock()
 	p.txnMarkers, p.txnOpenOffsets, p.txnRetentionFloor = state.markers, state.open, state.first
+	p.advanceTransactionEvidenceRevisionLocked()
 	p.txnMarkerMu.Unlock()
 }
 func (p *Partition) installProducerState(state *rawRecoveryState) {
