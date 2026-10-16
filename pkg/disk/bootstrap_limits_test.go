@@ -7,9 +7,24 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBootstrapLimitsFromBrokerConfig(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.BootstrapMaxTransferBytes = 3 << 20
+	cfg.BootstrapMaxTotalBytes = 9 << 20
+	d, err := NewDiskHandler(cfg, "orders", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, d.Close()) }()
+	require.Equal(t, BootstrapLimits{MaxTransferBytes: 3 << 20, MaxTotalBytes: 9 << 20}, d.BootstrapLimits())
+	cfg.BootstrapMaxTransferBytes = 0
+	_, err = NewDiskHandler(cfg, "invalid", 0)
+	require.Error(t, err)
+}
 
 func TestBootstrapLimitsAdmitNormalSegmentMetadataWithoutLargeBuffers(t *testing.T) {
 	d, _ := bootstrapTestHandler(t, 1)

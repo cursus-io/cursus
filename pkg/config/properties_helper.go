@@ -22,6 +22,10 @@ func (cfg *Config) Normalize() {
 	}
 
 	// disk storage
+	if cfg.BootstrapMaxTransferBytes == 0 && cfg.BootstrapMaxTotalBytes == 0 {
+		cfg.BootstrapMaxTransferBytes = DefaultBootstrapMaxTransferBytes
+		cfg.BootstrapMaxTotalBytes = DefaultBootstrapMaxTotalBytes
+	}
 	if strings.TrimSpace(cfg.LogDir) == "" {
 		cfg.LogDir = "broker-logs"
 	}

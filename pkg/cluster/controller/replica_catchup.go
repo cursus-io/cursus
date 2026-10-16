@@ -15,6 +15,18 @@ type ReplicaCatchupFetcher interface {
 	FetchReplicaCatchup(context.Context, string, int, fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error)
 }
 
+// ReplicaBootstrapRecovery owns asynchronous full transfers and local pending
+// recovery. Configure before starting the catch-up loop; capability is separate.
+type ReplicaBootstrapRecovery interface {
+	RecoverReplicaBootstrap(context.Context, fsm.ReplicaCatchupRequest, fsm.ReplicaCatchupBatch) error
+	ResumePendingReplicaBootstraps(context.Context) (map[string]bool, error)
+	ReplicaBootstrapExcluded(string, int) bool
+}
+
+func (cc *ClusterController) SetReplicaBootstrapRecovery(recovery ReplicaBootstrapRecovery) {
+	cc.replicaBootstrap = recovery
+}
+
 type ReplicaCatchupApplier func(context.Context, fsm.ReplicaCatchupBatch) error
 type VerifiedReplicaCatchupApplier func(context.Context, fsm.ReplicaCatchupRequest, fsm.ReplicaCatchupBatch) (*topic.ReplicaCatchupWitness, error)
 
@@ -56,9 +68,15 @@ func (cc *ClusterController) RunReplicaCatchupOnceVerified(ctx context.Context, 
 		return fmt.Errorf("replica catch-up dependencies are unavailable")
 	}
 	fsmState := cc.RaftManager.GetFSM()
-	_ = fsmState.ReconcileReplicaMaterializations(cc.brokerID)
-	requests := fsmState.BuildReplicaCatchupRequests(cc.brokerID)
 	var catchupErr error
+	var excluded map[string]bool
+	if cc.replicaBootstrap != nil {
+		excluded, catchupErr = cc.replicaBootstrap.ResumePendingReplicaBootstraps(ctx)
+	}
+	_ = fsmState.ReconcileReplicaMaterializations(cc.brokerID)
+	requests := fsmState.BuildReplicaCatchupRequestsExcluding(cc.brokerID, func(name string, id int) bool {
+		return excluded[fmt.Sprintf("%s-%d", name, id)] || (cc.replicaBootstrap != nil && cc.replicaBootstrap.ReplicaBootstrapExcluded(name, id))
+	})
 	for _, request := range requests {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(catchupErr, err)
@@ -87,6 +105,9 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 			return err
 		}
 		if err := validateReplicaCatchupBatch(request, batch); err != nil {
+			if errors.Is(err, fsm.ErrReplicaBootstrapRequired) && cc.replicaBootstrap != nil {
+				return cc.replicaBootstrap.RecoverReplicaBootstrap(ctx, request, batch)
+			}
 			return err
 		}
 		witness, err := apply(ctx, request, batch)
@@ -181,7 +202,12 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 }
 
 func (cc *ClusterController) refreshReplicaCatchupRequest(previous fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupRequest, bool) {
-	for _, candidate := range cc.RaftManager.GetFSM().BuildReplicaCatchupRequests(cc.brokerID) {
+	// Refresh only the requested partition. Building another partition's
+	// request can mutate its tail/HWM, including a bootstrap completed this pass.
+	excluded := func(name string, id int) bool {
+		return name != previous.Topic || id != previous.Partition || (cc.replicaBootstrap != nil && cc.replicaBootstrap.ReplicaBootstrapExcluded(name, id))
+	}
+	for _, candidate := range cc.RaftManager.GetFSM().BuildReplicaCatchupRequestsExcluding(cc.brokerID, excluded) {
 		if candidate.Topic == previous.Topic && candidate.Partition == previous.Partition && candidate.BrokerID == previous.BrokerID {
 			return candidate, true
 		}
