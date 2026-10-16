@@ -142,6 +142,7 @@ type bootstrapTransfer struct {
 	installed       bool
 	installFinished bool
 	received        map[string]int64
+	preparedFiles   []bootstrapInstallFile
 }
 
 type BootstrapExport struct {
@@ -698,6 +699,9 @@ func (r *BootstrapReceiver) WriteChunk(fileID string, offset int64, data []byte)
 		}
 		return nil
 	}
+	if len(t.preparedFiles) != 0 {
+		return fmt.Errorf("prepared bootstrap transfer no longer accepts chunks")
+	}
 	return writeBootstrapChunkLocked(t, fileID, offset, data)
 }
 
@@ -735,10 +739,6 @@ func writeBootstrapChunkLocked(t *bootstrapTransfer, fileID string, offset int64
 	}
 	t.received[fileID] += int64(n)
 	return nil
-}
-
-func describeBootstrapFile(path, id, role string) (BootstrapFile, error) {
-	return describeBootstrapFileContext(context.Background(), path, id, role)
 }
 
 type bootstrapContextReader struct {
