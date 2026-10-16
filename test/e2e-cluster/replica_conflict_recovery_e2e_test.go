@@ -72,8 +72,21 @@ func verifyReplicaConflictRecovery(t *testing.T, acks string) {
 	}
 	recoveryNode := requireRecoveryPendingAndNotReady(t, ctx.GetBrokerAddrs(), history, 0, epoch)
 	t.Log("same-epoch conflict quarantined; readiness closed while catch-up is paused")
+	beforeRestart, err := actions.LocalClusterStatus(recoveryNode)
+	require.NoError(t, err)
+	require.Positive(t, beforeRestart.RaftCommitIndex)
 	actions.StopBroker(recoveryNode)
 	restartBrokerDuringRecovery(t, recoveryNode)
+	// Peer recovery state and HTTP not-ready can precede local metadata replay.
+	// Keep business catch-up paused while waiting for the fixed committed cut.
+	require.NoError(t, eventually(t, "restarted broker metadata replay", clusterReadyTimeout, func() (bool, string, error) {
+		status, statusErr := actions.LocalClusterStatus(recoveryNode)
+		if statusErr != nil {
+			return false, fmt.Sprintf("broker-%d: %v", recoveryNode, statusErr), nil
+		}
+		return status.RaftAppliedIndex >= beforeRestart.RaftCommitIndex,
+			fmt.Sprintf("broker-%d applied=%d required=%d", recoveryNode, status.RaftAppliedIndex, beforeRestart.RaftCommitIndex), nil
+	}))
 	requireRecoveryPendingAndNotReady(t, ctx.GetBrokerAddrs(), history, 0, epoch)
 
 	// Consumer metadata remains usable on unrelated partitions during recovery.
