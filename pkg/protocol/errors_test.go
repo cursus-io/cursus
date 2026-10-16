@@ -2,6 +2,17 @@ package protocol
 
 import "testing"
 
+func TestConsumerMetadataRecoveringClassification(t *testing.T) {
+	const code = "consumer_metadata_recovering"
+	if !IsKnownErrorCode(code) {
+		t.Fatal("consumer recovery error is missing from the registry")
+	}
+	parsed, ok := ParseErrorResponse("ERROR: " + code)
+	if !ok || parsed.Class != ErrorClassAvailability || !parsed.Retryable {
+		t.Fatalf("unexpected consumer recovery classification: %+v", parsed)
+	}
+}
+
 func TestAppendCallbacksRequireControllerFenceClassification(t *testing.T) {
 	const code = "append_callbacks_require_controller_fence"
 	if !IsKnownErrorCode(code) {
