@@ -184,6 +184,7 @@ func (ch *CommandHandler) runConsumerBootstrapSession(ctx context.Context, ident
 	}
 	route := func(group string) (int, error) {
 		_, _, partition, _, err := ch.Cluster.Router.FindCoordinatorWithEpoch(group)
+		// #nosec G115 -- the router reduces partition modulo the positive int PartitionCount; error paths return zero.
 		return int(partition), err
 	}
 	if !p.BootstrapPending() {
