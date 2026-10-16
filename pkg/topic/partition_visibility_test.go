@@ -39,9 +39,6 @@ func TestReadCommittedDoesNotUseMarkerAtHWM(t *testing.T) {
 	storage.On("GetLatestOffset").Return(uint64(0)).Once()
 	storage.On("GetFlushedOffset").Return(uint64(2)).Twice()
 	storage.On("GetFirstOffset").Return(uint64(0)).Twice()
-	storage.On("ReadMessages", uint64(0), 1).Return([]types.Message{
-		{Offset: 0, Payload: "transactional", TransactionalID: "tx", TransactionState: types.TransactionStateOpen},
-	}, nil).Once()
 	storage.On("ReadMessages", uint64(0), 2).Return([]types.Message{
 		{Offset: 0, Payload: "transactional", TransactionalID: "tx", TransactionState: types.TransactionStateOpen},
 		{Offset: 1, Payload: "marker", TransactionalID: "tx", TransactionMarker: types.TransactionMarkerCommit},
@@ -51,6 +48,8 @@ func TestReadCommittedDoesNotUseMarkerAtHWM(t *testing.T) {
 	partition.indexTransactionMessage(types.Message{Offset: 1, TransactionalID: "tx", TransactionMarker: types.TransactionMarkerCommit})
 
 	partition.SetHWM(1)
+	// The unresolved transaction stops the cursor before any log scan.
+	require.Zero(t, firstUnresolvedOpenOffset(1, 0, partition.txnOpenOffsets, partition.txnMarkers, nil))
 	messages, err := partition.ReadCommitted(0, 10)
 	require.NoError(t, err)
 	require.Empty(t, messages)

@@ -73,6 +73,29 @@ func bootstrapRawRecords(t *testing.T, path string) []types.DiskMessage {
 	return records
 }
 
+func TestBootstrapNilDuplicateChunks(t *testing.T) {
+	for _, catalog := range [][]byte{nil, []byte(`{"snapshots":[]}`)} {
+		t.Run(fmt.Sprintf("catalog_bytes_%d", len(catalog)), func(t *testing.T) {
+			source, _ := bootstrapTestHandler(t, 1)
+			export, err := source.ExportBootstrap(0, 0, bootstrapTestFence(1, 0), catalog)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, export.Close()) }()
+			target, _ := bootstrapTestHandler(t, 1)
+			receiver := bootstrapTestReceive(t, target, export)
+			for _, file := range export.Manifest().Files {
+				require.NoError(t, receiver.WriteChunk(file.ID, 0, nil))
+			}
+			require.NoError(t, receiver.Install())
+			for _, file := range export.Manifest().Files {
+				require.NoError(t, receiver.WriteChunk(file.ID, 0, nil))
+				if file.Size > 0 {
+					require.ErrorContains(t, receiver.WriteChunk(file.ID, 0, []byte("!")), "conflicting duplicate")
+				}
+			}
+		})
+	}
+}
+
 func TestBootstrapPreservesCompactedLogicalBoundsAndRawTransactions(t *testing.T) {
 	source, _ := bootstrapTestHandler(t, 1)
 	records := []types.DiskMessage{

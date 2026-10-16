@@ -423,6 +423,46 @@ func TestBootstrapRebuildPreservesCoordinatorEpochResolver(t *testing.T) {
 	require.Equal(t, uint64(0), records[0].Offset)
 }
 
+func TestRawRecoveryPreservesTransactionAfterMarker(t *testing.T) {
+	for _, bootstrap := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bootstrap_%t", bootstrap), func(t *testing.T) {
+			d, cfg := bootstrapPartitionDisk(t, 0)
+			records := []types.DiskMessage{
+				{Topic: "orders", Offset: 0, TransactionalID: "tx", Epoch: 1, TransactionState: types.TransactionStateOpen},
+				{Topic: "orders", Offset: 2, TransactionalID: "tx", Epoch: 1, TransactionMarker: types.TransactionMarkerCommit, ControlBatchCoordinatorEpoch: 7},
+				{Topic: "orders", Offset: 5, TransactionalID: "tx", Epoch: 1, TransactionState: types.TransactionStateOpen},
+			}
+			var p *Partition
+			if bootstrap {
+				p = NewPartition(0, "orders", d, nil, cfg)
+				receiver := partitionTransfer(t, d, 0, 6, records)
+				session, err := p.BeginBootstrapSession()
+				require.NoError(t, err)
+				require.NoError(t, session.Install(receiver, nil))
+				require.NoError(t, session.Complete(nil))
+				session.Close()
+			} else {
+				require.NoError(t, d.WriteCompactedReplicaRange(0, 6, records))
+				p = NewPartition(0, "orders", d, nil, cfg)
+			}
+			t.Cleanup(p.Close)
+			require.NoError(t, p.RecoveryError())
+			require.Equal(t, uint64(5), p.LastStableOffset())
+			p.SetTransactionDecisionResolver(&testCoordinatorEpochDecisionResolver{state: types.TransactionStateCommitted, coordinatorEpoch: 8, known: true})
+			require.Zero(t, p.LastStableOffset())
+			// Rebuilding with unresolved older evidence must retain the later open.
+			require.NoError(t, p.rebuildTransactionMarkerIndex())
+			require.Zero(t, p.LastStableOffset())
+			p.SetTransactionDecisionResolver(&testCoordinatorEpochDecisionResolver{state: types.TransactionStateCommitted, coordinatorEpoch: 7, known: true})
+			require.Equal(t, uint64(5), p.LastStableOffset())
+			visible, err := p.ReadCommitted(0, 10)
+			require.NoError(t, err)
+			require.Len(t, visible, 1)
+			require.Zero(t, visible[0].Offset)
+		})
+	}
+}
+
 func TestBootstrapSourceCapturesOneAvailableGeneration(t *testing.T) {
 	d, cfg := bootstrapPartitionDisk(t, 0)
 	p := NewPartition(0, "orders", d, nil, cfg)

@@ -87,6 +87,7 @@ func readBootstrapEnvelope(path string, value any) error {
 	if !info.Mode().IsRegular() || info.Size() > bootstrapManifestMaxBytes {
 		return fmt.Errorf("invalid bootstrap manifest file")
 	}
+	// #nosec G304 -- callers use partition-owned pending/completed manifest paths; Lstat above rejects nonregular files.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -263,6 +264,7 @@ func validateBootstrapTransaction(base string, tx bootstrapTransaction) error {
 func stageBootstrapIndex(d *DiskHandler, t *bootstrapTransfer) ([]bootstrapInstallFile, error) {
 	m := t.metadata
 	indexPath := filepath.Join(t.dir, "range-index")
+	// #nosec G304 -- the filename is fixed and t.dir is the private staging directory created by StageBootstrap.
 	index, err := os.OpenFile(indexPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
@@ -289,7 +291,7 @@ func stageBootstrapIndex(d *DiskHandler, t *bootstrapTransfer) ([]bootstrapInsta
 			}
 			lastIndex = position
 		}
-		position += uint64(frame.size)
+		position += uint64(frame.size) // #nosec G115 -- scanCompactionSegment supplies the positive frame header plus payload size.
 		return nil
 	})
 	if err != nil {
@@ -302,6 +304,7 @@ func stageBootstrapIndex(d *DiskHandler, t *bootstrapTransfer) ([]bootstrapInsta
 		return nil, fmt.Errorf("nonempty bootstrap empty range")
 	}
 	if m.StartOffset == m.EndOffset {
+		// #nosec G115 -- StageBootstrap admitted IndexSize <= MaxTransferBytes <= bootstrapStructuralMaxBytes before creating this transfer.
 		if err = index.Truncate(int64(d.IndexSize)); err != nil {
 			return nil, err
 		}
@@ -326,6 +329,7 @@ func stageBootstrapIndex(d *DiskHandler, t *bootstrapTransfer) ([]bootstrapInsta
 		if err != nil {
 			return nil, err
 		}
+		// #nosec G115 -- StageBootstrap admitted IndexSize <= MaxTransferBytes <= bootstrapStructuralMaxBytes before creating this transfer.
 		if err = f.Truncate(int64(d.IndexSize)); err != nil {
 			_ = f.Close()
 			return nil, err
@@ -377,6 +381,7 @@ func (r *BootstrapReceiver) Install() error {
 		if err := validateCompactedRangeFile(path, f.Size, f.SHA256); err != nil {
 			return err
 		}
+		// #nosec G304 -- StageBootstrap validated fixed descriptor IDs; path is in its private staging directory and was checksum-verified above.
 		file, err := os.OpenFile(path, os.O_RDWR, 0o600)
 		if err != nil {
 			return err
@@ -610,6 +615,7 @@ func (d *DiskHandler) PendingBootstrapCatalog() ([]byte, error) {
 	if err := validateBootstrapRegularFile(path, f.Size, f.SHA256); err != nil {
 		return nil, err
 	}
+	// #nosec G304 -- validateBootstrapTransaction checked the staging ID and fixed catalog ID; the regular file and checksum were verified above.
 	return os.ReadFile(path)
 }
 

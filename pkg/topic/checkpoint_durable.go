@@ -16,6 +16,7 @@ func writePartitionCheckpoint(path string, value any, strict bool, syncDir func(
 		return err
 	}
 	tmp := path + ".tmp"
+	// #nosec G304 -- callers use this partition's internally constructed HWM or producer checkpoint path.
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return err

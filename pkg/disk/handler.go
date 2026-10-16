@@ -327,7 +327,7 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		}
 		for _, f := range pendingBootstrap.Files {
 			if f.ID == indexID {
-				indexCapacity = uint64(f.Size)
+				indexCapacity = uint64(f.Size) // #nosec G115 -- recoverPendingBootstrap validated all replacement sizes as nonnegative and structurally bounded.
 				break
 			}
 		}
