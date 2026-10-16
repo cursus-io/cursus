@@ -62,6 +62,20 @@ func TestReadCommittedDoesNotUseMarkerAtHWM(t *testing.T) {
 	storage.AssertExpectations(t)
 }
 
+func TestTransactionVisibilityPreservesLaterOpenAcrossResolverChange(t *testing.T) {
+	storage := new(MockStorageHandler)
+	storage.On("GetLatestOffset").Return(uint64(0)).Once()
+	p := NewPartition(0, "orders", storage, nil, config.DefaultConfig())
+	p.SetTransactionDecisionResolver(&testCoordinatorEpochDecisionResolver{state: types.TransactionStateCommitted, coordinatorEpoch: 8, known: true})
+	p.indexTransactionMessage(types.Message{Offset: 0, TransactionalID: "tx", Epoch: 1, TransactionState: types.TransactionStateOpen})
+	p.indexTransactionMessage(types.Message{Offset: 2, TransactionalID: "tx", Epoch: 1, TransactionMarker: types.TransactionMarkerCommit, ControlBatchCoordinatorEpoch: 7})
+	p.indexTransactionMessage(types.Message{Offset: 5, TransactionalID: "tx", Epoch: 1, TransactionState: types.TransactionStateOpen})
+	require.Zero(t, firstUnresolvedOpenOffset(6, 0, p.txnOpenOffsets, p.txnMarkers, p.txnResolver))
+	p.SetTransactionDecisionResolver(&testCoordinatorEpochDecisionResolver{state: types.TransactionStateCommitted, coordinatorEpoch: 7, known: true})
+	require.Equal(t, uint64(5), firstUnresolvedOpenOffset(6, 0, p.txnOpenOffsets, p.txnMarkers, p.txnResolver))
+	storage.AssertExpectations(t)
+}
+
 type visibilityBenchmarkStorage struct {
 	messages []types.Message
 }

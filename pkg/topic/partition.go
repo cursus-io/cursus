@@ -1273,7 +1273,10 @@ func (p *Partition) indexTransactionMessage(msg types.Message) {
 				return
 			}
 		}
-		if existing, ok := p.txnOpenOffsets[key]; !ok || msg.Offset < existing {
+		marker, hasMarker := p.txnMarkers[key]
+		existing, open := p.txnOpenOffsets[key]
+		startsAfterMarker := hasMarker && existing < marker.offset && msg.Offset > marker.offset
+		if !open || msg.Offset < existing || startsAfterMarker {
 			p.txnOpenOffsets[key] = msg.Offset
 		}
 	}
