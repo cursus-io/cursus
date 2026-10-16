@@ -377,20 +377,49 @@ func readSnapshotRecord(file *os.File, offset, fileSize uint64, legacy bool) (st
 func (s *SnapshotStore) Save(key string, version uint64, payload string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.saveLocked(key, version, payload)
+}
+func (s *SnapshotStore) savePreparedAtRevision(key string, version uint64, payload string, record []byte, revision uint64, validate func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if revision != s.revision {
+		return fmt.Errorf("snapshot catalog revision changed")
+	}
+	if err := s.validateSaveLocked(key, version, payload); err != nil {
+		return err
+	}
+	if validate != nil {
+		if err := validate(); err != nil {
+			return err
+		}
+	}
+	if ptr, ok := s.index[key]; ok && ptr.version == version {
+		return nil
+	}
+	return s.writeRecordLocked(key, version, record)
+}
+func (s *SnapshotStore) saveLocked(key string, version uint64, payload string) error {
 	if err := s.validateSaveLocked(key, version, payload); err != nil {
 		return err
 	}
 	if ptr, ok := s.index[key]; ok && ptr.version == version {
 		return nil
 	}
+	record, err := encodeSnapshotRecord(key, version, payload)
+	if err != nil {
+		return err
+	}
+	return s.writeRecordLocked(key, version, record)
+}
+func encodeSnapshotRecord(key string, version uint64, payload string) ([]byte, error) {
 	keyBytes, payloadBytes := []byte(key), []byte(payload)
 	keyLen, ok := util.SafeIntToUint16(len(keyBytes))
 	if !ok {
-		return fmt.Errorf("snapshot key length %d exceeds uint16 format limit", len(keyBytes))
+		return nil, fmt.Errorf("snapshot key length %d exceeds uint16 format limit", len(keyBytes))
 	}
 	payloadLen, ok := util.SafeIntToUint32(len(payloadBytes))
 	if !ok || len(payloadBytes) > maxSnapshotPayloadBytes {
-		return fmt.Errorf("snapshot payload length %d exceeds format limit", len(payloadBytes))
+		return nil, fmt.Errorf("snapshot payload length %d exceeds format limit", len(payloadBytes))
 	}
 	record := make([]byte, 2+len(keyBytes)+8+4+len(payloadBytes)+4)
 	binary.BigEndian.PutUint16(record[0:2], keyLen)
@@ -401,6 +430,9 @@ func (s *SnapshotStore) Save(key string, version uint64, payload string) error {
 	copy(record[versionPos+12:], payloadBytes)
 	checksumPos := len(record) - 4
 	binary.BigEndian.PutUint32(record[checksumPos:], crc32.Checksum(record[:checksumPos], snapshotCRC))
+	return record, nil
+}
+func (s *SnapshotStore) writeRecordLocked(key string, version uint64, record []byte) error {
 	entryOffset := s.writeOffset
 	recordBytes := uint64(len(record))
 	if recordBytes > ^uint64(0)-entryOffset {
@@ -436,6 +468,13 @@ func (s *SnapshotStore) ValidateSave(key string, version uint64, payload string)
 }
 
 func (s *SnapshotStore) validateSaveLocked(key string, version uint64, payload string) error {
+	if len(key) > maxSidecarKeyLen {
+		return fmt.Errorf("snapshot key length exceeds uint16 format limit")
+	}
+	if len(payload) > maxSnapshotPayloadBytes {
+		return fmt.Errorf("snapshot payload length exceeds format limit")
+	}
+
 	if ptr, ok := s.index[key]; ok {
 		current, err := s.readAt(ptr)
 		if err != nil {

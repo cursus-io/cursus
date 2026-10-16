@@ -2,6 +2,7 @@ package eventsource
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -170,12 +171,38 @@ func rejectDuplicateJSONKeys(d *json.Decoder, snapshot bool) error {
 	return err
 }
 
-// CaptureBootstrapCatalog must run inside WithBootstrapSource using source.View().
-// It holds no network or Raft callbacks and fails instead of truncating inventory.
-func (h *Handler) CaptureBootstrapCatalog(name string, partition int, view *topic.PartitionReadView, lifecycle uint64) ([]byte, error) {
+type capturedBootstrapCatalog struct {
+	data     []byte
+	validate func(context.Context) error
+}
+
+// CaptureBootstrapCatalog requires the active exclusive source and fixed cut.
+func (h *Handler) CaptureBootstrapCatalog(ctx context.Context, name string, partition int, source *topic.BootstrapSource, lifecycle uint64) ([]byte, error) {
+	captured, err := h.captureBootstrapCatalog(ctx, name, partition, source, lifecycle)
+	if err != nil {
+		return nil, err
+	}
+	return captured.data, nil
+}
+func (h *Handler) captureBootstrapCatalog(ctx context.Context, name string, partition int, source *topic.BootstrapSource, lifecycle uint64) (*capturedBootstrapCatalog, error) {
+	if source == nil {
+		return nil, fmt.Errorf("bootstrap catalog requires exclusive callback source")
+	}
+	view := source.View()
 	if err := view.ValidateBootstrapSource(name, partition, lifecycle); err != nil {
 		return nil, err
 	}
+	cut, err := source.SnapshotReadCut()
+	if err != nil {
+		return nil, err
+	}
+	h.indexSyncMu.Lock()
+	defer h.indexSyncMu.Unlock()
+	proof, err := h.certifySnapshotIndex(ctx, name, partition, cut)
+	if err != nil {
+		return nil, err
+	}
+
 	ss, err := h.getSnapshotWithView(name, partition, view)
 	if err != nil {
 		return nil, err
@@ -204,6 +231,13 @@ func (h *Handler) CaptureBootstrapCatalog(name string, partition int, view *topi
 		if err != nil {
 			return nil, err
 		}
+		current, err := proof.idx.VersionBefore(key, cut.LastStableOffset())
+		if err != nil {
+			return nil, err
+		}
+		if snap.Version > current {
+			return nil, fmt.Errorf("snapshot_version_exceeds_stream key=%s version=%d current=%d", key, snap.Version, current)
+		}
 		record := bootstrapSnapshot{Key: key, Version: snap.Version, Payload: snap.Payload}
 		encoded, err := json.Marshal(record)
 		if err != nil {
@@ -225,7 +259,17 @@ func (h *Handler) CaptureBootstrapCatalog(name string, partition int, view *topi
 	if _, err := decodeBootstrapCatalog(data, name, partition, lifecycle); err != nil {
 		return nil, err
 	}
-	return data, nil
+	guard := func(ctx context.Context) error {
+		err := h.validateSnapshotIndex(ctx, snapshotCacheKey(name, partition), cut, proof, ss)
+		if err != nil {
+			h.retireIndex(snapshotCacheKey(name, partition), proof.idx, err)
+		}
+		return err
+	}
+	if err := guard(ctx); err != nil {
+		return nil, err
+	}
+	return &capturedBootstrapCatalog{data: data, validate: guard}, nil
 }
 
 // DetachPartitionForBootstrap requires the partition's exclusive bootstrap

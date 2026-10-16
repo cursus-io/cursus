@@ -479,7 +479,7 @@ func TestHandler_HandleSaveSnapshot_Validation(t *testing.T) {
 }
 
 func TestHandler_HandleSaveSnapshot_VersionExceedsStream(t *testing.T) {
-	h := newTestHandler(t)
+	h, _ := newBootstrapHandler(t)
 	defer func() { _ = h.Close() }()
 
 	// Stream is at version 0 (no events). Saving snapshot at version 5 should fail.
@@ -488,7 +488,7 @@ func TestHandler_HandleSaveSnapshot_VersionExceedsStream(t *testing.T) {
 }
 
 func TestHandler_HandleSaveAndReadSnapshot(t *testing.T) {
-	h := newTestHandler(t)
+	h, _ := newBootstrapHandler(t)
 	defer func() { _ = h.Close() }()
 
 	// Append an event so the stream reaches version 1.
