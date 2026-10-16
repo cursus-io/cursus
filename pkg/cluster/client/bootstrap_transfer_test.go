@@ -77,6 +77,35 @@ func TestBootstrapClientBeginOutlivesOrdinaryDeadline(t *testing.T) {
 	require.NoError(t, response.ValidateFor(r))
 }
 
+func TestBootstrapClientReplicaPurposeResponse(t *testing.T) {
+	for _, forbidden := range []bool{false, true} {
+		t.Run(fmt.Sprint(forbidden), func(t *testing.T) {
+			r := clientBootstrapRequest()
+			r.Purpose = fsm.BootstrapPurposeReplica
+			r.MinimumEnd = 1
+			response := clientBootstrapResponse(r)
+			response.CertificateID = ""
+			response.Manifest.EndOffset, response.Manifest.Fence.CommittedHWM = 2, 2
+			response.Manifest.Files[1].Size = 10
+			encoded, err := json.Marshal(response)
+			require.NoError(t, err)
+			if forbidden {
+				encoded = []byte(strings.Replace(string(encoded), `"minimum_end":1`, `"minimum_end":1,"fixed_end":0`, 1))
+			}
+			port := bootstrapResponder(t, func(request wire.Frame) wire.Frame {
+				return wire.Frame{Kind: wire.KindResponse, Command: request.Command, RequestID: request.RequestID, Status: wire.StatusOK, Payload: encoded}
+			})
+			got, err := NewSecureTCPClusterClient("secret", nil).BeginBootstrapTransfer(context.Background(), "127.0.0.1", port, r)
+			if forbidden {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, response, got)
+			}
+		})
+	}
+}
+
 func TestBootstrapClientCancellationClosesSocketWithoutRelease(t *testing.T) {
 	for _, deadline := range []bool{false, true} {
 		t.Run(map[bool]string{false: "cancel", true: "deadline"}[deadline], func(t *testing.T) {

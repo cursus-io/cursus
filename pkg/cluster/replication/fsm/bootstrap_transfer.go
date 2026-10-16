@@ -12,6 +12,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/topic"
 )
 
 const (
@@ -62,17 +63,27 @@ type BootstrapBeginRequest struct {
 	LeaderEpoch        int                      `json:"leader_epoch"`
 	LifecycleEpoch     uint64                   `json:"lifecycle_epoch"`
 	AttemptID          string                   `json:"attempt_id"`
-	FixedEnd           uint64                   `json:"fixed_end"`
+	FixedEnd           uint64                   `json:"fixed_end,omitempty"`
+	MinimumEnd         uint64                   `json:"minimum_end,omitempty"`
 	PriorCertificateID string                   `json:"prior_certificate_id,omitempty"`
-	SuffixStart        uint64                   `json:"suffix_start"`
+	SuffixStart        uint64                   `json:"suffix_start,omitempty"`
 }
 
 func (r BootstrapBeginRequest) Validate() error {
-	if r.Version != BootstrapTransferVersion || r.Purpose != BootstrapPurposeMetadata {
+	if r.Version != BootstrapTransferVersion || (r.Purpose != BootstrapPurposeMetadata && r.Purpose != BootstrapPurposeReplica) {
 		return ErrBootstrapTransferUnsupported
 	}
-	if !r.Requester.valid() || !r.Source.valid() || r.Topic != config.ConsumerOffsetsTopicName || r.Partition < 0 || r.Leader == "" || r.LeaderEpoch < 0 || r.LifecycleEpoch == 0 || !validTransferID(r.AttemptID) {
+	if !r.Requester.valid() || !r.Source.valid() || topic.ValidateName(r.Topic) != nil || r.Partition < 0 || r.Leader == "" || r.LeaderEpoch < 0 || r.LifecycleEpoch == 0 || !validTransferID(r.AttemptID) {
 		return fmt.Errorf("invalid bootstrap begin identity or fence")
+	}
+	if r.Purpose == BootstrapPurposeReplica {
+		if r.FixedEnd != 0 || r.PriorCertificateID != "" || r.SuffixStart != 0 {
+			return fmt.Errorf("replica bootstrap requires only minimum end")
+		}
+		return nil
+	}
+	if r.Topic != config.ConsumerOffsetsTopicName || r.MinimumEnd != 0 {
+		return fmt.Errorf("invalid metadata bootstrap topic or minimum end")
 	}
 	if r.PriorCertificateID == "" {
 		if r.SuffixStart != 0 {
@@ -93,7 +104,7 @@ type BootstrapBeginResponse struct {
 	CaptureMode   string                 `json:"capture_mode"`
 	StartOffset   uint64                 `json:"start_offset"`
 	Manifest      disk.BootstrapMetadata `json:"manifest"`
-	CertificateID string                 `json:"certificate_id"`
+	CertificateID string                 `json:"certificate_id,omitempty"`
 }
 
 func (r BootstrapBeginResponse) ValidateFor(request BootstrapBeginRequest) error {
@@ -103,11 +114,20 @@ func (r BootstrapBeginResponse) ValidateFor(request BootstrapBeginRequest) error
 	if r.Version != BootstrapTransferVersion {
 		return ErrBootstrapTransferUnsupported
 	}
-	if r.Request != request || !validTransferID(r.CertificateID) {
+	if r.Request != request || (request.Purpose == BootstrapPurposeMetadata && !validTransferID(r.CertificateID)) || (request.Purpose == BootstrapPurposeReplica && r.CertificateID != "") {
 		return fmt.Errorf("bootstrap response identity mismatch")
 	}
 	m := r.Manifest
-	if m.Version != disk.BootstrapVersion || !validTransferID(m.TransferID) || m.Fence != request.diskFence() || m.StartOffset != r.StartOffset || m.EndOffset != request.FixedEnd || m.StartOffset > m.EndOffset {
+	fence := request.diskFence()
+	if request.Purpose == BootstrapPurposeReplica {
+		fence.CommittedHWM = m.EndOffset
+		if m.EndOffset < request.MinimumEnd || r.CaptureMode != BootstrapCaptureFull {
+			return fmt.Errorf("invalid replica bootstrap range or mode")
+		}
+	} else if m.EndOffset != request.FixedEnd {
+		return fmt.Errorf("metadata bootstrap end mismatch")
+	}
+	if m.Version != disk.BootstrapVersion || !validTransferID(m.TransferID) || m.Fence != fence || m.StartOffset != r.StartOffset || m.StartOffset > m.EndOffset {
 		return fmt.Errorf("bootstrap manifest fence or range mismatch")
 	}
 	if r.CaptureMode != BootstrapCaptureFull && r.CaptureMode != BootstrapCaptureSuffix {
@@ -117,15 +137,15 @@ func (r BootstrapBeginResponse) ValidateFor(request BootstrapBeginRequest) error
 		return fmt.Errorf("bootstrap suffix mismatch")
 	}
 	if len(m.Files) != 2 {
-		return fmt.Errorf("bootstrap requires records and empty catalog")
+		return fmt.Errorf("bootstrap requires records and catalog")
 	}
 	for i, f := range m.Files {
 		id, role := "records", "canonical-log"
 		if i == 1 {
 			id, role = "catalog", "snapshot-catalog"
 		}
-		if f.ID != id || f.Role != role || f.Size < 0 || !validHex(f.SHA256, 32) || (i == 1 && f.Size != 0) {
-			return fmt.Errorf("invalid metadata bootstrap file")
+		if f.ID != id || f.Role != role || f.Size < 0 || !validHex(f.SHA256, 32) || (i == 1 && (f.Size > disk.BootstrapCatalogBytes || (request.Purpose == BootstrapPurposeMetadata && f.Size != 0))) {
+			return fmt.Errorf("invalid bootstrap file")
 		}
 	}
 	return nil
@@ -249,6 +269,11 @@ func requireTransferFields(data []byte, kind reflect.Type) error {
 		if err != nil {
 			return err
 		}
+		if kind == reflect.TypeFor[BootstrapBeginRequest]() || kind == reflect.TypeFor[bootstrapBeginWire]() {
+			if err := requireBootstrapPurposeFields(fields); err != nil {
+				return err
+			}
+		}
 		for i := 0; i < kind.NumField(); i++ {
 			field := kind.Field(i)
 			tag := strings.Split(field.Tag.Get("json"), ",")
@@ -312,9 +337,55 @@ func transferObjectFields(data []byte) (map[string]json.RawMessage, error) {
 	}
 	return fields, nil
 }
+
+type bootstrapBeginWire BootstrapBeginRequest
+
+// Explicit pointer fields select the wire schema while the request itself stays
+// comparable. Zero is an explicit boundary, never an omitted optional value.
+func (r BootstrapBeginRequest) MarshalJSON() ([]byte, error) {
+	v := struct {
+		bootstrapBeginWire
+		FixedEnd    *uint64 `json:"fixed_end,omitempty"`
+		MinimumEnd  *uint64 `json:"minimum_end,omitempty"`
+		SuffixStart *uint64 `json:"suffix_start,omitempty"`
+	}{bootstrapBeginWire: bootstrapBeginWire(r)}
+	if r.Purpose == BootstrapPurposeReplica {
+		v.MinimumEnd = &r.MinimumEnd
+		v.PriorCertificateID = ""
+	} else {
+		v.FixedEnd, v.SuffixStart = &r.FixedEnd, &r.SuffixStart
+	}
+	return json.Marshal(v)
+}
+
+func requireBootstrapPurposeFields(fields map[string]json.RawMessage) error {
+	var purpose string
+	if err := json.Unmarshal(fields["purpose"], &purpose); err != nil {
+		return err
+	}
+	required, forbidden := []string{"fixed_end", "suffix_start"}, []string{"minimum_end"}
+	switch purpose {
+	case BootstrapPurposeMetadata:
+	case BootstrapPurposeReplica:
+		required, forbidden = []string{"minimum_end"}, []string{"fixed_end", "prior_certificate_id", "suffix_start"}
+	default:
+		return ErrBootstrapTransferUnsupported
+	}
+	for _, key := range required {
+		if _, ok := fields[key]; !ok {
+			return fmt.Errorf("missing bootstrap field %s", key)
+		}
+	}
+	for _, key := range forbidden {
+		if _, ok := fields[key]; ok {
+			return fmt.Errorf("forbidden bootstrap field %s", key)
+		}
+	}
+	return nil
+}
+
 func (r *BootstrapBeginRequest) UnmarshalJSON(data []byte) error {
-	type wire BootstrapBeginRequest
-	var v wire
+	var v bootstrapBeginWire
 	if err := decodeTransferJSON(data, &v); err != nil {
 		return err
 	}
@@ -330,6 +401,14 @@ func (r *BootstrapBeginResponse) UnmarshalJSON(data []byte) error {
 	var v wire
 	if err := decodeTransferJSON(data, &v); err != nil {
 		return err
+	}
+	fields, err := transferObjectFields(data)
+	if err != nil {
+		return err
+	}
+	_, certificatePresent := fields["certificate_id"]
+	if certificatePresent != (v.Request.Purpose == BootstrapPurposeMetadata) {
+		return fmt.Errorf("invalid bootstrap certificate presence")
 	}
 	candidate := BootstrapBeginResponse(v)
 	if err := candidate.ValidateFor(candidate.Request); err != nil {

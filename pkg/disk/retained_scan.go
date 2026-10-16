@@ -42,9 +42,10 @@ func (d *DiskHandler) scanRetainedRangeLocked(ctx context.Context, start, end ui
 var errRetainedPageStop = errors.New("certified retained page stop")
 
 type retainedScanResult struct {
-	end       uint64
-	exhausted bool
-	compacted bool
+	end                              uint64
+	exhausted                        bool
+	compacted                        bool
+	decodedFrames, decodedFrameBytes uint64
 }
 
 func (d *DiskHandler) scanRetainedFramesLocked(ctx context.Context, start, end uint64, bounded bool, visit func(compactionFrame) (bool, error)) (retainedScanResult, error) {
@@ -83,6 +84,8 @@ func (d *DiskHandler) scanRetainedFramesLocked(ctx context.Context, start, end u
 		result.compacted = result.compacted || compacted
 		next := base
 		err = scanCompactionSegment(path, base, false, compacted, func(frame compactionFrame) error {
+			result.decodedFrames++
+			result.decodedFrameBytes += uint64(frame.size)
 			if err := ctx.Err(); err != nil {
 				return err
 			}

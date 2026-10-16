@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/topic"
 )
 
 // ConfigureBootstrapTransferSource installs the optional process-owned source.
@@ -43,7 +45,17 @@ func (ch *CommandHandler) ConfigureBootstrapTransferSource(ctx context.Context, 
 		}
 		return fsm.BootstrapProcessIdentity{BrokerID: brokerID, IncarnationID: incarnation, IncarnationEpoch: b.IncarnationEpoch}, nil
 	}
-	ch.bootstrapSource = newBootstrapTransferSource(ctx, state, identity)
+	source := newBootstrapTransferSource(ctx, state, identity)
+	// Capture the dependency before admission. Missing catalog authority disables
+	// only replica capture; metadata sources remain independently available.
+	if handler := ch.ESHandler; handler != nil {
+		source.replicaCapture = func(ctx context.Context, ticket *fsm.ReplicaBootstrapSourceTicket) (*fsm.ReplicaBootstrapCapture, error) {
+			return ticket.CaptureContext(ctx, func(source *topic.BootstrapSource, fence disk.BootstrapFence) (*disk.BootstrapExport, error) {
+				return handler.ExportBootstrapWithCatalogOwnedContext(ctx, fence.Topic, fence.Partition, source, fence.LifecycleEpoch, fence)
+			})
+		}
+	}
+	ch.bootstrapSource = source
 	return nil
 }
 
@@ -59,7 +71,7 @@ func (ch *CommandHandler) transferSource() (*bootstrapTransferSource, error) {
 	return ch.bootstrapSource, nil
 }
 
-// BeginBootstrapTransfer creates or joins one exact metadata capture attempt.
+// BeginBootstrapTransfer creates or joins one exact source capture attempt.
 func (ch *CommandHandler) BeginBootstrapTransfer(ctx context.Context, r fsm.BootstrapBeginRequest) (fsm.BootstrapBeginResponse, error) {
 	s, err := ch.transferSource()
 	if err != nil {

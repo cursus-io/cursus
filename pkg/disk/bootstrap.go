@@ -18,7 +18,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -148,7 +147,21 @@ type bootstrapTransfer struct {
 type BootstrapExport struct {
 	transfer     *bootstrapTransfer
 	retainedWork RetainedBootstrapWork
+	fullWork     FullBootstrapWork
 }
+
+// FullBootstrapWork describes a successful full export. DecodedFrameBytes is
+// the encoded size of decoded source frames (including frames outside the cut
+// in intersecting segments); it excludes parser headers and buffered read-ahead.
+// Write/hash counts are user-space file I/O, never physical device I/O. Catalog
+// certification/replay is separate and is not included in these counters.
+type FullBootstrapWork struct {
+	DecodedFrames, DecodedFrameBytes                      uint64
+	CanonicalWriteBytes, CatalogWriteBytes, HashReadBytes uint64
+}
+
+func (e *BootstrapExport) FullWork() FullBootstrapWork { return e.fullWork }
+
 type BootstrapReceiver struct {
 	transfer *bootstrapTransfer
 	handler  *DiskHandler
@@ -337,6 +350,17 @@ func (d *DiskHandler) ExportBootstrap(start, end uint64, fence BootstrapFence, c
 // Mutex acquisition and individual filesystem calls (including an in-flight
 // fsync) remain synchronous; cancellation is rechecked after each lock boundary.
 func (d *DiskHandler) ExportBootstrapContext(ctx context.Context, start, end uint64, fence BootstrapFence, catalog []byte) (*BootstrapExport, error) {
+	return d.exportBootstrapContext(ctx, start, end, fence, catalog, true)
+}
+
+// ExportBootstrapOwnedContext transfers lifetime responsibility to the caller.
+// The caller must Close every returned export, including unpublished captures.
+// No inner timer may race a registry's ready lifetime or pinned chunk reads.
+func (d *DiskHandler) ExportBootstrapOwnedContext(ctx context.Context, start, end uint64, fence BootstrapFence, catalog []byte) (*BootstrapExport, error) {
+	return d.exportBootstrapContext(ctx, start, end, fence, catalog, false)
+}
+
+func (d *DiskHandler) exportBootstrapContext(ctx context.Context, start, end uint64, fence BootstrapFence, catalog []byte, automaticTTL bool) (_ *BootstrapExport, resultErr error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("bootstrap export context is nil")
 	}
@@ -422,7 +446,7 @@ func (d *DiskHandler) ExportBootstrapContext(ctx context.Context, start, end uin
 	ok := false
 	defer func() {
 		if !ok {
-			_ = t.close()
+			resultErr = errors.Join(resultErr, t.close())
 		}
 	}()
 	log, err := os.OpenFile(filepath.Join(t.dir, "records"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -431,36 +455,43 @@ func (d *DiskHandler) ExportBootstrapContext(ctx context.Context, start, end uin
 	}
 	defer func() { _ = log.Close() }()
 	var outputBytes int64
-	m.Compacted, err = d.scanRetainedRangeLocked(ctx, start, end, func(msg types.DiskMessage) error {
+	var work FullBootstrapWork
+	scan, err := d.scanRetainedFramesLocked(ctx, start, end, false, func(frame compactionFrame) (bool, error) {
+		msg := frame.message
 		if msg.Topic != fence.Topic || int(msg.Partition) != fence.Partition {
-			return fmt.Errorf("bootstrap record identity mismatch")
+			return false, fmt.Errorf("bootstrap record identity mismatch")
 		}
 		canonical, err := util.SerializeDiskMessage(msg)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if err = validateSerializedDiskMessageSize(canonical); err != nil {
-			return err
+			return false, err
 		}
 		length, ok := util.SafeIntToUint32(len(canonical))
 		if !ok {
-			return fmt.Errorf("bootstrap canonical frame too large")
+			return false, fmt.Errorf("bootstrap canonical frame too large")
 		}
 		outputBytes += 4 + int64(len(canonical))
 		if err = reserveBootstrapGrowth(d, t, outputBytes+int64(len(catalog))); err != nil {
-			return err
+			return false, err
 		}
 		var header [4]byte
 		binary.BigEndian.PutUint32(header[:], length)
-		if _, err = log.Write(header[:]); err != nil {
-			return err
+		n, err := log.Write(header[:])
+		work.CanonicalWriteBytes += uint64(n)
+		if err != nil {
+			return false, err
 		}
-		_, err = log.Write(canonical)
-		return err
+		n, err = log.Write(canonical)
+		work.CanonicalWriteBytes += uint64(n)
+		return true, err
 	})
 	if err != nil {
 		return nil, err
 	}
+	m.Compacted = scan.compacted
+	work.DecodedFrames, work.DecodedFrameBytes = scan.decodedFrames, scan.decodedFrameBytes
 
 	if err = ctx.Err(); err != nil {
 		return nil, err
@@ -477,8 +508,10 @@ func (d *DiskHandler) ExportBootstrapContext(ctx context.Context, start, end uin
 	if err = writeBootstrapFile(filepath.Join(t.dir, "catalog"), catalog); err != nil {
 		return nil, err
 	}
+	work.CatalogWriteBytes = uint64(len(catalog))
 	for _, entry := range []struct{ id, role string }{{"records", "canonical-log"}, {"catalog", "snapshot-catalog"}} {
-		f, err := describeBootstrapFileContext(ctx, filepath.Join(t.dir, entry.id), entry.id, entry.role)
+		f, readBytes, err := describeBootstrapFileWorkContext(ctx, filepath.Join(t.dir, entry.id), entry.id, entry.role)
+		work.HashReadBytes += uint64(readBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -491,9 +524,11 @@ func (d *DiskHandler) ExportBootstrapContext(ctx context.Context, start, end uin
 		return nil, err
 	}
 	t.metadata = m
-	t.startTTL()
+	if automaticTTL {
+		t.startTTL()
+	}
 	ok = true
-	return &BootstrapExport{transfer: t}, nil
+	return &BootstrapExport{transfer: t, fullWork: work}, nil
 }
 
 func reserveBootstrapGrowth(d *DiskHandler, t *bootstrapTransfer, size int64) error {
@@ -719,30 +754,36 @@ func (r *bootstrapContextReader) Read(data []byte) (int, error) {
 }
 
 func describeBootstrapFileContext(ctx context.Context, path, id, role string) (BootstrapFile, error) {
+	file, _, err := describeBootstrapFileWorkContext(ctx, path, id, role)
+	return file, err
+}
+
+func describeBootstrapFileWorkContext(ctx context.Context, path, id, role string) (BootstrapFile, int64, error) {
 	if err := ctx.Err(); err != nil {
-		return BootstrapFile{}, err
+		return BootstrapFile{}, 0, err
 	}
 	// #nosec G304 -- callers construct path from a private staging directory and fixed local bootstrap filenames.
 	f, err := os.Open(path)
 	if err != nil {
-		return BootstrapFile{}, err
+		return BootstrapFile{}, 0, err
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
-		return BootstrapFile{}, err
+		return BootstrapFile{}, 0, err
 	}
 	if !info.Mode().IsRegular() {
-		return BootstrapFile{}, fmt.Errorf("bootstrap file is not regular")
+		return BootstrapFile{}, 0, fmt.Errorf("bootstrap file is not regular")
 	}
 	h := sha256.New()
-	if _, err = io.CopyBuffer(h, &bootstrapContextReader{context: ctx, reader: f}, make([]byte, BootstrapChunkBytes)); err != nil {
-		return BootstrapFile{}, err
+	readBytes, err := io.CopyBuffer(h, &bootstrapContextReader{context: ctx, reader: f}, make([]byte, BootstrapChunkBytes))
+	if err != nil {
+		return BootstrapFile{}, readBytes, err
 	}
 	if err = ctx.Err(); err != nil {
-		return BootstrapFile{}, err
+		return BootstrapFile{}, readBytes, err
 	}
-	return BootstrapFile{ID: id, Role: role, Size: info.Size(), SHA256: hex.EncodeToString(h.Sum(nil))}, nil
+	return BootstrapFile{ID: id, Role: role, Size: info.Size(), SHA256: hex.EncodeToString(h.Sum(nil))}, readBytes, nil
 }
 
 func writeBootstrapFile(path string, data []byte) error {

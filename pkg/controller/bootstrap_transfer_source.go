@@ -79,9 +79,11 @@ type bootstrapTransferSource struct {
 	cleanupErr      error
 	// Immutable after construction/admission. Tests can wrap a real export to
 	// pause non-preemptible I/O or simulate a completed cleanup-debt handoff.
-	export func(context.Context, *fsm.MetadataBootstrapSourceTicket) (bootstrapSourceExport, error)
-	fence  func(context.Context, *fsm.MetadataBootstrapSourceTicket, func(*fsm.MetadataBootstrapPublication) error) error
-	ttl    time.Duration
+	export         func(context.Context, *fsm.MetadataBootstrapSourceTicket) (bootstrapSourceExport, error)
+	fence          func(context.Context, *fsm.MetadataBootstrapSourceTicket, func(*fsm.MetadataBootstrapPublication) error) error
+	replicaCapture func(context.Context, *fsm.ReplicaBootstrapSourceTicket) (*fsm.ReplicaBootstrapCapture, error)
+	replicaFence   func(context.Context, *fsm.ReplicaBootstrapCapture, func(*fsm.ReplicaBootstrapPublication) error) error
+	ttl            time.Duration
 }
 
 func newBootstrapTransferSource(ctx context.Context, state *fsm.BrokerFSM, identity func() (fsm.BootstrapProcessIdentity, error)) *bootstrapTransferSource {
@@ -95,6 +97,7 @@ func newBootstrapTransferSource(ctx context.Context, state *fsm.BrokerFSM, ident
 		return export, nil
 	}
 	s.fence = state.WithMetadataBootstrapSourceFence
+	s.replicaFence = state.WithReplicaBootstrapSourceFence
 	// A canceled configured owner also retires idle ready exports. close waits
 	// only for admitted owners, so this callback cannot join itself.
 	context.AfterFunc(owner, func() { _ = s.close() })

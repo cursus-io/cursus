@@ -145,32 +145,7 @@ func (s *AdoptedRawStore) Close() error {
 // caller holds the private transfer mutex; admission checks and charging remain
 // atomic across all active and adopted owners.
 func (owner *bootstrapByteOwner) growDetached(headroom *diskHeadroomGuard, size int64) error {
-	if size < 0 || !owner.owned {
-		return fmt.Errorf("invalid detached byte ownership or size")
-	}
-	if size <= owner.reserved {
-		return nil
-	}
-	if size > owner.limits.MaxTransferBytes {
-		return &BootstrapLimitError{Resource: "canonical bytes", Requested: size, Limit: owner.limits.MaxTransferBytes}
-	}
-	delta := size - owner.reserved
-	// #nosec G115 -- size > owner.reserved >= 0 above, so delta is positive and fits int64.
-	if _, err := headroom.reserve(uint64(delta), false); err != nil {
-		return err
-	}
-	bootstrapBudget.Lock()
-	defer bootstrapBudget.Unlock()
-	requested, err := addBootstrapBytes(bootstrapBudget.bytes, delta)
-	if err != nil {
-		return err
-	}
-	if requested > owner.limits.MaxTotalBytes {
-		return &BootstrapLimitError{Resource: "total staging bytes", Requested: requested, Limit: owner.limits.MaxTotalBytes}
-	}
-	bootstrapBudget.bytes = requested
-	owner.reserved = size
-	return nil
+	return owner.growWithHeadroom(headroom, size)
 }
 
 func (owner *bootstrapByteOwner) shrinkDetached(size int64) {
