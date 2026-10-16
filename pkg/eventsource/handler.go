@@ -1,6 +1,7 @@
 package eventsource
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -909,7 +910,8 @@ func (h *Handler) SaveSnapshot(cmd string, afterSave func(result SnapshotResult)
 	if t == nil {
 		return nil, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	if !t.IsEventSourcing {
+	definition := t.Definition()
+	if !definition.EventSourcing {
 		return nil, fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", topicName)
 	}
 
@@ -918,62 +920,69 @@ func (h *Handler) SaveSnapshot(cmd string, afterSave func(result SnapshotResult)
 		return nil, "ERROR: no_partitions_available"
 	}
 
-	result := SnapshotResult{Topic: topicName, Key: key, Version: version, Partition: partitionID, Payload: payload}
-	var generation uint64
-	validate := func(view *topic.PartitionReadView, save bool) error {
-		idx, err := h.getIndexWithView(topicName, partitionID, view)
-		if err != nil {
-			return err
-		}
-		currentVersion, err := idx.CheckedVersion(key)
-		if err != nil {
-			return err
-		}
-		if version > currentVersion {
-			return fmt.Errorf("snapshot_version_exceeds_stream version=%d current=%d", version, currentVersion)
-		}
-		ss, err := h.getSnapshotWithView(topicName, partitionID, view)
-		if err != nil {
-			return err
-		}
-		if save {
-			return ss.Save(key, version, payload)
-		}
-		return ss.ValidateSave(key, version, payload)
+	p, err := t.GetPartition(partitionID)
+	if err != nil {
+		return nil, "ERROR: " + err.Error()
 	}
-	err = h.withReadView(topicName, partitionID, func(view *topic.PartitionReadView) error {
-		generation = view.Generation()
-		return validate(view, false)
+	result := SnapshotResult{Topic: topicName, Key: key, Version: version, Partition: partitionID, Payload: payload, LifecycleEpoch: definition.LifecycleEpoch}
+	ctx := context.Background()
+	var visibility uint64
+	var generation disk.ContentGeneration
+	firstIndex, err := h.withSnapshotCandidate(ctx, p, result, false, func(cut *topic.SnapshotReadCut) error {
+		visibility, generation = cut.View().Generation(), cut.ContentGeneration()
+		return nil
 	})
 	if err != nil {
 		return nil, "ERROR: " + err.Error()
 	}
 	if afterSave != nil {
-		if err := afterSave(result); err != nil {
+		if err = afterSave(result); err != nil {
 			return nil, fmt.Sprintf("ERROR: snapshot_replicate_failed reason=%q", err.Error())
 		}
 	}
-	err = h.withReadView(topicName, partitionID, func(view *topic.PartitionReadView) error {
-		if generation != view.Generation() {
+	currentTopic := h.tm.GetTopic(topicName)
+	if currentTopic != t || currentTopic.Definition().LifecycleEpoch != definition.LifecycleEpoch {
+		h.retireIndex(snapshotCacheKey(topicName, partitionID), firstIndex, fmt.Errorf("snapshot generation changed"))
+		return nil, "ERROR: snapshot_generation_changed retryable=true"
+	}
+	currentPartition, err := currentTopic.GetPartition(partitionID)
+	if err != nil || currentPartition != p {
+		h.retireIndex(snapshotCacheKey(topicName, partitionID), firstIndex, fmt.Errorf("snapshot generation changed"))
+		return nil, "ERROR: snapshot_generation_changed retryable=true"
+	}
+	_, err = h.withSnapshotCandidate(ctx, p, result, true, func(cut *topic.SnapshotReadCut) error {
+		if visibility != cut.View().Generation() || generation != cut.ContentGeneration() {
+			h.retireIndex(snapshotCacheKey(topicName, partitionID), firstIndex, fmt.Errorf("snapshot generation changed"))
 			return fmt.Errorf("snapshot_generation_changed retryable=true")
 		}
-		return validate(view, true)
+		return nil
 	})
 	if err != nil {
 		return nil, "ERROR: " + err.Error()
 	}
+
 	return &result, ""
 
 }
 
 func (h *Handler) SaveSnapshotReplica(result SnapshotResult) string {
-	err := h.withReadView(result.Topic, result.Partition, func(view *topic.PartitionReadView) error {
-		ss, err := h.getSnapshotWithView(result.Topic, result.Partition, view)
-		if err != nil {
-			return err
-		}
-		return ss.Save(result.Key, result.Version, result.Payload)
-	})
+	t := h.tm.GetTopic(result.Topic)
+	if t == nil {
+		return "ERROR: topic_not_found"
+	}
+	definition := t.Definition()
+	if !definition.EventSourcing {
+		return "ERROR: event_sourcing_not_enabled"
+	}
+	if result.LifecycleEpoch != 0 && result.LifecycleEpoch != definition.LifecycleEpoch {
+		return "ERROR: snapshot_lifecycle_changed"
+	}
+	p, err := t.GetPartition(result.Partition)
+	if err != nil {
+		return "ERROR: " + err.Error()
+	}
+	ctx := context.Background()
+	_, err = h.withSnapshotCandidate(ctx, p, result, true, nil)
 	if err != nil {
 		return "ERROR: snapshot_save_failed reason=" + strconv.Quote(err.Error())
 	}

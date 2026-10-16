@@ -118,16 +118,16 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		if !batch.Verified {
 			return fmt.Errorf("replica catch-up completed without prefix verification")
 		}
+		if witness == nil {
+			return fmt.Errorf("actual receiver verification witness is required")
+		}
 		if request.SnapshotCatchup {
 			if cc.snapshotCatchup == nil {
 				return fmt.Errorf("event snapshot catch-up is unavailable")
 			}
-			if err := cc.snapshotCatchup(ctx, request); err != nil {
+			if err := cc.snapshotCatchup(ctx, request, witness); err != nil {
 				return fmt.Errorf("event snapshot catch-up: %w", err)
 			}
-		}
-		if witness == nil {
-			return fmt.Errorf("actual receiver verification witness is required")
 		}
 		if err := cc.RaftManager.GetFSM().MarkReplicaCatchupVerified(request, witness); err != nil {
 			refreshed, ok := cc.refreshReplicaCatchupRequest(request)

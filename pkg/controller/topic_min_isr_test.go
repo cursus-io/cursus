@@ -91,6 +91,11 @@ func TestSnapshotReplicationUsesTopicEffectiveMinInSyncReplicas(t *testing.T) {
 	require.NoError(t, manager.CreateTopic("strict-snapshots", 1, false, true))
 	installPartitionMetadata(t, handler, "available-snapshots", []string{"broker-1", "broker-2"})
 	installPartitionMetadata(t, handler, "strict-snapshots", []string{"broker-1", "broker-2"})
+	for _, name := range []string{"available-snapshots", "strict-snapshots"} {
+		p, err := manager.GetTopic(name).GetPartition(0)
+		require.NoError(t, err)
+		require.NoError(t, p.ApplyReplicaHWM(0))
+	}
 
 	available := handler.HandleCommand(
 		`SAVE_SNAPSHOT topic=available-snapshots key=aggregate-1 version=0 message={}`,

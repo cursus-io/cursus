@@ -39,10 +39,15 @@ type streamState struct {
 // a hash collision, after a restart, entries for colliding keys may appear under all keys
 // that share the same hash. This is a known imprecision with negligible probability.
 type StreamIndex struct {
-	mu            sync.RWMutex
-	invalid       error
-	closed        bool
-	resetRevision uint64
+	mu             sync.RWMutex
+	invalid        error
+	closed         bool
+	resetRevision  uint64
+	seeds          map[string]uint64
+	seedAnchors    map[string]uint64
+	offsetVersions map[string][]offsetVersion
+	orderedRecords []indexedStreamRecord
+	certificate    *snapshotIndexCertificate
 
 	dir         string
 	partitionID int
@@ -153,6 +158,7 @@ func (si *StreamIndex) loadFromDisk() error {
 		// the in-memory entries will be resolved by the caller's key lookup.
 		for _, key := range keys {
 			si.entries[key] = append(si.entries[key], entry)
+			si.rememberEntryLocked(key, entry)
 
 			st, exists := si.states[key]
 			if !exists {
@@ -286,6 +292,7 @@ func (si *StreamIndex) appendLocked(key string, aggregateVersion, offset, positi
 
 	// Update in-memory state.
 	si.entries[key] = append(si.entries[key], entry)
+	si.rememberEntryLocked(key, entry)
 
 	st, exists := si.states[key]
 	if !exists {
@@ -387,6 +394,10 @@ func (si *StreamIndex) ResetRevision() (uint64, error) {
 // index. It is derived from a durable application snapshot and is not written
 // to the disposable stream index files.
 func (si *StreamIndex) SeedVersion(key string, version uint64) error {
+	return si.seedVersionAt(key, version, 0)
+}
+
+func (si *StreamIndex) seedVersionAt(key string, version, anchor uint64) error {
 	if key == "" || version == 0 {
 		return fmt.Errorf("invalid stream snapshot seed")
 	}
@@ -395,10 +406,29 @@ func (si *StreamIndex) SeedVersion(key string, version uint64) error {
 	if err := si.checkLocked(); err != nil {
 		return err
 	}
-	if current := si.states[key]; current != nil && current.currentVersion != version {
-		return fmt.Errorf("stream snapshot seed conflict key=%s current=%d incoming=%d", key, current.currentVersion, version)
+	if si.seeds[key] == version && si.seedAnchors[key] == anchor {
+		return nil
 	}
-	si.states[key] = &streamState{currentVersion: version}
+	if si.resetRevision == ^uint64(0) {
+		si.invalidateLocked(fmt.Errorf("stream index seed revision exhausted"))
+		return si.checkLocked()
+	}
+	if si.seeds == nil {
+		si.seeds = make(map[string]uint64)
+	}
+	if si.seedAnchors == nil {
+		si.seedAnchors = make(map[string]uint64)
+	}
+	si.seeds[key] = version
+	si.seedAnchors[key] = anchor
+	si.resetRevision++
+	si.certificate = nil
+	if current := si.states[key]; current == nil {
+		si.states[key] = &streamState{currentVersion: version}
+	} else if current.currentVersion < version {
+		current.currentVersion = version
+	}
+
 	return nil
 }
 
@@ -456,6 +486,10 @@ func (si *StreamIndex) LookupRange(key string, fromVersion, toVersion uint64, ma
 func (si *StreamIndex) Reset() (err error) {
 	si.mu.Lock()
 	defer si.mu.Unlock()
+	return si.resetLocked()
+}
+
+func (si *StreamIndex) resetLocked() (err error) {
 	if err := si.checkLocked(); err != nil {
 		return err
 	}
@@ -488,6 +522,11 @@ func (si *StreamIndex) Reset() (err error) {
 		return fmt.Errorf("sync sidecar file: %w", err)
 	}
 
+	si.seeds = nil
+	si.seedAnchors = nil
+	si.offsetVersions = nil
+	si.orderedRecords = nil
+	si.certificate = nil
 	si.states = make(map[string]*streamState)
 	si.entries = make(map[string][]StreamIndexEntry)
 	si.knownKeys = make(map[string]bool)
