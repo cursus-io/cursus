@@ -55,6 +55,7 @@ func (d *DiskHandler) ReadRetainedPage(ctx context.Context, start, end uint64, m
 		return finish(true, end)
 	}
 	for {
+		// #nosec G115 -- maxRecords is positive and the page returns as soon as len(Messages) reaches it.
 		records := uint64(min(retainedPageChunkRecords-1, maxRecords-len(page.Messages))) + 1
 		if cursor.End < start {
 			records = retainedPageChunkRecords

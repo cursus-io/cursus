@@ -107,6 +107,7 @@ func (d *DiskHandler) captureRawFramesLocked(ctx context.Context, cursor rawFram
 			frame := rawFrame{Before: cursor, After: cursor, Base: base, Limit: limit, Marked: marked, Last: i+1 == len(d.segments)}
 			var header [4]byte
 			n, err := f.ReadAt(header[:], cursor.Position)
+			// #nosec G115 -- os.File.ReadAt returns a nonnegative count, including partial reads.
 			b.BytesRead += uint64(n)
 			if err == io.EOF && n == 0 {
 				if cursor.Position != info.Size() {
@@ -149,6 +150,7 @@ func (d *DiskHandler) captureRawFramesLocked(ctx context.Context, cursor rawFram
 			}
 			frame.Payload = make([]byte, size)
 			n, err = f.ReadAt(frame.Payload, cursor.Position+4)
+			// #nosec G115 -- os.File.ReadAt returns a nonnegative count bounded by the supplied payload buffer.
 			b.BytesRead += uint64(n)
 			if err != nil {
 				_ = f.Close()
