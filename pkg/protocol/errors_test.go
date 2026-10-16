@@ -2,6 +2,25 @@ package protocol
 
 import "testing"
 
+func TestSnapshotRecoveryErrorClassification(t *testing.T) {
+	for _, test := range []struct {
+		code      string
+		class     ErrorClass
+		retryable bool
+	}{
+		{"snapshot_generation_changed", ErrorClassAvailability, true},
+		{"snapshot_lifecycle_changed", ErrorClassFencing, false},
+	} {
+		if !IsKnownErrorCode(test.code) {
+			t.Fatalf("snapshot recovery error %s is missing from the registry", test.code)
+		}
+		parsed, ok := ParseErrorResponse("ERROR: " + test.code)
+		if !ok || parsed.Class != test.class || parsed.Retryable != test.retryable {
+			t.Fatalf("unexpected snapshot recovery classification: %+v", parsed)
+		}
+	}
+}
+
 func TestConsumerMetadataRecoveringClassification(t *testing.T) {
 	const code = "consumer_metadata_recovering"
 	if !IsKnownErrorCode(code) {
