@@ -609,6 +609,8 @@ func (h *Handler) appendStream(cmd string, opts AppendOptions, controllerFenced 
 	recoveredCommit := false
 	postErr := p.WithReadView(func(view *topic.PartitionReadView) error {
 		if appendErr != nil {
+			h.indexSyncMu.Lock()
+			defer h.indexSyncMu.Unlock()
 			if recoveryErr := h.publishRecoveredIndex(topicName, partitionID, idx, view); recoveryErr != nil {
 				return fmt.Errorf("append_stream_failed reason=%q recovery_reason=%q", appendErr.Error(), recoveryErr.Error())
 			}

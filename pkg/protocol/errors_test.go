@@ -2,6 +2,17 @@ package protocol
 
 import "testing"
 
+func TestAppendCallbacksRequireControllerFenceClassification(t *testing.T) {
+	const code = "append_callbacks_require_controller_fence"
+	if !IsKnownErrorCode(code) {
+		t.Fatal("controller-fence contract error is missing from the registry")
+	}
+	parsed, ok := ParseErrorResponse("ERROR: " + code)
+	if !ok || parsed.Class != ErrorClassInternal || parsed.Retryable {
+		t.Fatalf("unexpected controller-fence contract classification: %+v", parsed)
+	}
+}
+
 func TestParseErrorResponseUsesExplicitMetadata(t *testing.T) {
 	parsed, ok := ParseErrorResponse(`ERROR: broker_error class=availability retryable=true reason="temporary failure"`)
 	if !ok {

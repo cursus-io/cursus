@@ -39,6 +39,7 @@ func (p *Partition) scanRawRecoveryState() (*rawRecoveryState, error) {
 			if offset, ok := state.open[key]; ok && offset < msg.Offset {
 				marker.openOffset = offset
 				marker.hasOpenOffset = true
+				delete(state.open, key)
 			}
 			state.markers[key] = marker
 		} else if msg.TransactionState == types.TransactionStateOpen {
@@ -78,8 +79,12 @@ func (p *Partition) scanRawRecoveryState() (*rawRecoveryState, error) {
 	resolver := p.txnResolver
 	p.txnMarkerMu.RUnlock()
 	for key, marker := range state.markers {
-		if marker.hasOpenOffset && transactionDecisionMatchesMarker(key, marker, resolver) {
-			delete(state.open, key)
+		if marker.hasOpenOffset && !transactionDecisionMatchesMarker(key, marker, resolver) {
+			// Keep a later transaction independently; the unresolved marker's
+			// earlier boundary is also considered when computing the LSO.
+			if _, exists := state.open[key]; !exists {
+				state.open[key] = marker.openOffset
+			}
 		}
 	}
 	return state, nil

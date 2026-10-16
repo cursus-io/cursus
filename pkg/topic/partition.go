@@ -131,9 +131,13 @@ func (p *Partition) SetTransactionDecisionResolver(resolver TransactionDecisionR
 			continue
 		}
 		if transactionDecisionMatchesMarker(key, marker, resolver) {
-			delete(p.txnOpenOffsets, key)
+			if offset, exists := p.txnOpenOffsets[key]; exists && offset < marker.offset {
+				delete(p.txnOpenOffsets, key)
+			}
 		} else {
-			p.txnOpenOffsets[key] = marker.openOffset
+			if offset, exists := p.txnOpenOffsets[key]; !exists || offset < marker.offset {
+				p.txnOpenOffsets[key] = marker.openOffset
+			}
 		}
 	}
 	p.txnMarkerMu.Unlock()
@@ -1396,6 +1400,11 @@ func messageTransactionMarkerKey(msg types.Message) transactionMarkerKey {
 
 func firstUnresolvedOpenOffset(hwm, retentionFloor uint64, openOffsets map[transactionMarkerKey]uint64, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) uint64 {
 	firstUnresolved := hwm
+	for key, marker := range markers {
+		if marker.hasOpenOffset && (marker.offset >= hwm || !transactionDecisionMatchesMarker(key, marker, resolver)) {
+			firstUnresolved = min(firstUnresolved, max(marker.openOffset, retentionFloor))
+		}
+	}
 	for key, offset := range openOffsets {
 		if offset >= hwm {
 			continue

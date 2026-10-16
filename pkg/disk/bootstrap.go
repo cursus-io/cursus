@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -13,7 +14,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -268,6 +268,7 @@ func (e *BootstrapExport) ReadChunk(fileID string, offset int64, maxBytes int) (
 		maxBytes = int(descriptor.Size - offset)
 	}
 	data := make([]byte, maxBytes)
+	// #nosec G304 -- fileID matched an internally generated export descriptor; t.dir is the private staging directory.
 	f, err := os.Open(filepath.Join(t.dir, fileID))
 	if err != nil {
 		return nil, err
@@ -467,6 +468,7 @@ func reserveBootstrapGrowth(d *DiskHandler, t *bootstrapTransfer, size int64) er
 	if requested > t.limits.MaxTotalBytes {
 		return &BootstrapLimitError{Resource: "total staging bytes", Requested: requested, Limit: t.limits.MaxTotalBytes}
 	}
+	// #nosec G115 -- size > t.reserved >= 0 above, so delta is positive and fits int64.
 	if _, err := d.headroom.reserve(uint64(delta), false); err != nil {
 		return err
 	}
@@ -556,21 +558,25 @@ func (d *DiskHandler) StageBootstrap(m BootstrapMetadata) (*BootstrapReceiver, e
 	}
 	// Bound all locally generated index/tail bytes before accepting a transfer.
 	limits := d.BootstrapLimits()
+	// #nosec G115 -- BootstrapLimits admits only positive MaxTransferBytes <= bootstrapStructuralMaxBytes.
 	if d.IndexSize > uint64(limits.MaxTransferBytes) {
 		return nil, &BootstrapLimitError{Resource: "tail index bytes", Requested: limits.MaxTransferBytes + 1, Limit: limits.MaxTransferBytes}
 	}
-	size += int64(d.IndexSize)
+	size += int64(d.IndexSize) // #nosec G115 -- the preceding guard bounds IndexSize by MaxTransferBytes <= MaxInt64/32.
 	if m.StartOffset < m.EndOffset {
 		interval := d.indexInterval
 		if interval == 0 {
 			interval = 4096
 		}
+		// #nosec G115 -- validateBootstrapMetadata proved the records size is nonnegative and <= MaxInt64/32.
 		indexBound := (uint64(m.Files[0].Size)/interval + 1) * 16
+		// #nosec G115 -- interval >= 1 and records size <= MaxInt64/32 bound indexBound below MaxInt64.
 		size += int64(indexBound) + int64(len(compactionMarkerVersion))
 	}
 	if size > limits.MaxTransferBytes {
 		return nil, &BootstrapLimitError{Resource: "staging with derived indexes", Requested: size, Limit: limits.MaxTransferBytes}
 	}
+	// #nosec G115 -- validated nonnegative file sizes plus bounded derived indexes fit int64; admission above caps their sum.
 	if _, err = d.headroom.reserve(uint64(size), true); err != nil {
 		return nil, err
 	}
@@ -618,6 +624,7 @@ func (r *BootstrapReceiver) WriteChunk(fileID string, offset int64, data []byte)
 		if fileID == "records" {
 			path = r.handler.GetSegmentPath(t.metadata.StartOffset)
 		}
+		// #nosec G304 -- fileID matched a validated descriptor; path is its private staging file or this handler's generated segment path.
 		file, err := os.Open(path)
 		if err != nil {
 			return err
@@ -627,12 +634,13 @@ func (r *BootstrapReceiver) WriteChunk(fileID string, offset int64, data []byte)
 		if _, err = file.ReadAt(old, offset); err != nil && (len(old) != 0 || !errors.Is(err, io.EOF)) {
 			return err
 		}
-		if !reflect.DeepEqual(old, data) {
+		if !bytes.Equal(old, data) {
 			return fmt.Errorf("conflicting duplicate bootstrap chunk")
 		}
 		return nil
 	}
 	position := t.received[fileID]
+	// #nosec G304 -- fileID matched the fixed records/catalog descriptors validated by StageBootstrap; t.dir is privately generated.
 	file, err := os.OpenFile(filepath.Join(t.dir, fileID), os.O_RDWR, 0o600)
 	if err != nil {
 		return err
@@ -646,7 +654,7 @@ func (r *BootstrapReceiver) WriteChunk(fileID string, offset int64, data []byte)
 		if _, err = file.ReadAt(old, offset); err != nil {
 			return err
 		}
-		if !reflect.DeepEqual(old, data) {
+		if !bytes.Equal(old, data) {
 			return fmt.Errorf("conflicting duplicate bootstrap chunk")
 		}
 		return nil
@@ -685,6 +693,7 @@ func describeBootstrapFileContext(ctx context.Context, path, id, role string) (B
 	if err := ctx.Err(); err != nil {
 		return BootstrapFile{}, err
 	}
+	// #nosec G304 -- callers construct path from a private staging directory and fixed local bootstrap filenames.
 	f, err := os.Open(path)
 	if err != nil {
 		return BootstrapFile{}, err
@@ -708,6 +717,7 @@ func describeBootstrapFileContext(ctx context.Context, path, id, role string) (B
 }
 
 func writeBootstrapFile(path string, data []byte) error {
+	// #nosec G304 -- callers supply fixed staging filenames or partition-owned manifest paths; no sender-selected paths are accepted.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err

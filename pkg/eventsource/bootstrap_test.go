@@ -499,6 +499,53 @@ type observedWriteConn struct {
 	once    sync.Once
 }
 
+func TestAppendErrorRecoveryWaitsForIndexSynchronization(t *testing.T) {
+	h, p := newBootstrapHandler(t)
+	require.NoError(t, h.PrepareCommittedIndex("orders", 0))
+	h.indexSyncMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			h.indexSyncMu.Unlock()
+		}
+	}()
+	committed := make(chan struct{})
+	completed := make(chan string, 1)
+	go func() {
+		_, response := h.AppendStreamWithControllerFence("APPEND_STREAM topic=orders key=a version=1 message=event", AppendOptions{
+			LeaderAppend: true,
+			AfterCommit: func(_ string, _ int, hwm uint64) error {
+				err := p.ApplyReplicaHWM(hwm)
+				close(committed)
+				return errors.Join(err, errors.New("commit acknowledgement lost"))
+			},
+		})
+		completed <- response
+	}()
+	select {
+	case <-committed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("append did not reach commit callback")
+	}
+	select {
+	case response := <-completed:
+		t.Fatalf("recovery bypassed index synchronization: %s", response)
+	case <-time.After(30 * time.Millisecond):
+	}
+	h.indexSyncMu.Unlock()
+	locked = false
+	select {
+	case response := <-completed:
+		require.Empty(t, response)
+	case <-time.After(3 * time.Second):
+		t.Fatal("append recovery did not finish")
+	}
+	version, partition, err := h.CurrentVersion("orders", "a")
+	require.NoError(t, err)
+	require.Zero(t, partition)
+	require.Equal(t, uint64(1), version)
+}
+
 func (c *observedWriteConn) Write(data []byte) (int, error) {
 	c.once.Do(func() { close(c.started) })
 	return c.Conn.Write(data)
