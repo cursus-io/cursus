@@ -43,14 +43,16 @@ type Config struct {
 	LogLevel          util.LogLevel `yaml:"log_level" json:"log_level"`
 
 	// disk storage
-	LogDir              string  `yaml:"log_dir" json:"log.dir"`
-	DiskFlushBatchSize  int     `yaml:"disk_flush_batch_size" json:"disk.flush.batch.size"`
-	DiskFlushIntervalMS int     `yaml:"disk_flush_interval_ms" json:"disk.flush.interval.ms"`
-	DiskWriteTimeoutMS  int     `yaml:"disk_write_timeout_ms" json:"disk.write.timeout.ms"`
-	DiskMinFreeBytes    int64   `yaml:"disk_min_free_bytes" json:"disk.min.free.bytes"`
-	DiskMinFreePercent  float64 `yaml:"disk_min_free_percent" json:"disk.min.free.percent"`
-	LingerMS            int     `yaml:"linger_ms" json:"linger.ms"`
-	CompressionType     string  `yaml:"compression_type" json:"compression.type"` // "none", "gzip", "snappy", "lz4"
+	BootstrapMaxTransferBytes int64   `yaml:"bootstrap_max_transfer_bytes" json:"bootstrap.max.transfer.bytes"`
+	BootstrapMaxTotalBytes    int64   `yaml:"bootstrap_max_total_bytes" json:"bootstrap.max.total.bytes"`
+	LogDir                    string  `yaml:"log_dir" json:"log.dir"`
+	DiskFlushBatchSize        int     `yaml:"disk_flush_batch_size" json:"disk.flush.batch.size"`
+	DiskFlushIntervalMS       int     `yaml:"disk_flush_interval_ms" json:"disk.flush.interval.ms"`
+	DiskWriteTimeoutMS        int     `yaml:"disk_write_timeout_ms" json:"disk.write.timeout.ms"`
+	DiskMinFreeBytes          int64   `yaml:"disk_min_free_bytes" json:"disk.min.free.bytes"`
+	DiskMinFreePercent        float64 `yaml:"disk_min_free_percent" json:"disk.min.free.percent"`
+	LingerMS                  int     `yaml:"linger_ms" json:"linger.ms"`
+	CompressionType           string  `yaml:"compression_type" json:"compression.type"` // "none", "gzip", "snappy", "lz4"
 
 	// log segment
 	CleanupInterval           int     `yaml:"log_cleanup_interval" json:"log.cleanup.interval"`
@@ -151,12 +153,14 @@ type Config struct {
 func DefaultConfig() *Config {
 	defaultOnce.Do(func() {
 		defaultConfig = &Config{
-			BrokerBindAddress: "127.0.0.1",
-			BrokerPort:        9000,
-			HealthCheckPort:   9080,
-			EnableExporter:    true,
-			ExporterPort:      9100,
-			LogLevel:          util.LogLevelInfo,
+			BootstrapMaxTransferBytes: DefaultBootstrapMaxTransferBytes,
+			BootstrapMaxTotalBytes:    DefaultBootstrapMaxTotalBytes,
+			BrokerBindAddress:         "127.0.0.1",
+			BrokerPort:                9000,
+			HealthCheckPort:           9080,
+			EnableExporter:            true,
+			ExporterPort:              9100,
+			LogLevel:                  util.LogLevelInfo,
 
 			// disk storage
 			LogDir:              "broker-logs",
@@ -275,6 +279,8 @@ func LoadConfig() (*Config, error) {
 	logLevelStr := flag.String("log-level", "info", "Log level")
 
 	// disk storage
+	flag.Int64Var(&cfg.BootstrapMaxTransferBytes, "bootstrap-max-transfer-bytes", cfg.BootstrapMaxTransferBytes, "Maximum bytes reserved by one new bootstrap transfer, including generated files")
+	flag.Int64Var(&cfg.BootstrapMaxTotalBytes, "bootstrap-max-total-bytes", cfg.BootstrapMaxTotalBytes, "Maximum process-wide bootstrap staging bytes")
 	flag.StringVar(&cfg.LogDir, "log-dir", cfg.LogDir, "Log directory")
 	flag.IntVar(&cfg.DiskFlushBatchSize, "disk-flush-batch", cfg.DiskFlushBatchSize, "Disk flush batch")
 	flag.IntVar(&cfg.DiskFlushIntervalMS, "disk-flush-interval-ms", cfg.DiskFlushIntervalMS, "Disk sync interval in milliseconds")
@@ -373,7 +379,9 @@ func LoadConfig() (*Config, error) {
 	flag.StringVar(&cfg.InternalTLSServerName, "internal-tls-server-name", cfg.InternalTLSServerName, "Server name used by broker-to-broker mTLS clients")
 	flag.BoolVar(&cfg.EnableSASL, "enable-sasl", cfg.EnableSASL, "Enable SASL-style token authentication for client commands")
 
-	flag.Parse()
+	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
+		return nil, err
+	}
 	explicitFlags := make(map[string]string)
 	flag.Visit(func(current *flag.Flag) { explicitFlags[current.Name] = current.Value.String() })
 
@@ -542,6 +550,9 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
+	if err := cfg.loadBootstrapAdmissionEnvironment(); err != nil {
+		return nil, err
+	}
 	cfg.Normalize()
 	util.SetLevel(cfg.LogLevel)
 

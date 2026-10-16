@@ -13,6 +13,11 @@ import (
 )
 
 func replicaBootstrapFSM(t *testing.T) (*BrokerFSM, *topic.Partition, *disk.DiskHandler, BootstrapBeginRequest) {
+	f, p, d, r, _ := replicaBootstrapFSMWithManager(t)
+	return f, p, d, r
+}
+
+func replicaBootstrapFSMWithManager(t *testing.T) (*BrokerFSM, *topic.Partition, *disk.DiskHandler, BootstrapBeginRequest, *disk.DiskManager) {
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
@@ -44,7 +49,7 @@ func replicaBootstrapFSM(t *testing.T) (*BrokerFSM, *topic.Partition, *disk.Disk
 	require.NoError(t, p.ApplyReplicaHWM(1))
 	h, err := dm.GetHandler(r.Topic, 0)
 	require.NoError(t, err)
-	return f, p, h.(*disk.DiskHandler), r
+	return f, p, h.(*disk.DiskHandler), r, dm
 }
 
 func replicaCapture(t *testing.T, ticket *ReplicaBootstrapSourceTicket) *ReplicaBootstrapCapture {

@@ -102,7 +102,11 @@ func (ch *CommandHandler) ConfigureConsumerMetadataRecovery(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	root, err := disk.NewDetachedBootstrapRoot(filepath.Join(ch.Config.LogDir, "@recovery", "consumer-metadata"), disk.DefaultBootstrapLimits(), ch.Config.DiskMinFreeBytes, ch.Config.DiskMinFreePercent, p+2)
+	limits, err := disk.BootstrapLimitsFromConfig(ch.Config)
+	if err != nil {
+		return err
+	}
+	root, err := disk.NewDetachedBootstrapRoot(filepath.Join(ch.Config.LogDir, "@recovery", "consumer-metadata"), limits, ch.Config.DiskMinFreeBytes, ch.Config.DiskMinFreePercent, p+2)
 	if err != nil {
 		return err
 	}

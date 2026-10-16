@@ -30,6 +30,24 @@ Values omitted from the command line remain available from the configuration
 file. Explicit flags override the file, and supported environment variables
 override both. `CONFIG_PATH` selects a file only when `--config` is absent.
 
+### Bootstrap admission bytes
+
+New bootstrap transfers use `bootstrap_max_transfer_bytes` (default 8589934592,
+8 GiB) and `bootstrap_max_total_bytes` (default 34359738368, 32 GiB process-wide).
+JSON keys are `bootstrap.max.transfer.bytes` and `bootstrap.max.total.bytes`;
+flags are `--bootstrap-max-transfer-bytes` and `--bootstrap-max-total-bytes`;
+environment variables are `BOOTSTRAP_MAX_TRANSFER_BYTES` and
+`BOOTSTRAP_MAX_TOTAL_BYTES`. Both values must be positive, total must be at least
+transfer, and transfer cannot exceed 288230376151711743 bytes. Invalid or
+overflowing inputs are errors, including explicit zero.
+
+Both partition receivers and detached consumer metadata recovery share these
+limits. The transfer reservation includes generated indexes and tail files, so
+8 GiB is not a promise of 8 GiB of raw payload. Lower limits affect new admission;
+they do not revoke existing transfers or block durable pending replay. The
+independent limits remain eight active disk transfers, a 16 MiB catalog, 256 KiB
+chunks and a five-minute staging lifetime.
+
 ## Configuration File Format
 
 Configuration files can be in either YAML or JSON format. The format is detected automatically based on the file extension.

@@ -245,7 +245,7 @@ func TestBootstrapPendingRejectsCachedPublicRootsBeforeReset(t *testing.T) {
 	h, p := newBootstrapHandler(t)
 	require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=a version=1 message=old"), "OK")
 	require.Empty(t, h.SaveSnapshotReplica(SnapshotResult{Topic: "orders", Key: "a", Version: 1, Payload: "old"}))
-	receiver := stageEventBootstrap(t, p, 0, 0, catalogBytes(t))
+	receiver := stageEventBootstrap(t, p, 0, 1, catalogBytes(t), types.DiskMessage{Topic: "orders", Partition: 0, Offset: 0, Key: "a", AggregateVersion: 1, Payload: "old"})
 	session := installEventBootstrap(t, h, p, receiver)
 	session.Close()
 	// Model an accidentally retained cache entry: every public root must still
@@ -296,7 +296,7 @@ func TestBootstrapPendingRejectsCachedPublicRootsBeforeReset(t *testing.T) {
 func TestSnapshotCallbackBootstrapGenerationFence(t *testing.T) {
 	h, p := newBootstrapHandler(t)
 	require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=a version=1 message=old"), "OK")
-	receiver := stageEventBootstrap(t, p, 0, 0, catalogBytes(t))
+	receiver := stageEventBootstrap(t, p, 0, 1, catalogBytes(t), types.DiskMessage{Topic: "orders", Partition: 0, Offset: 0, Key: "a", AggregateVersion: 1, Payload: "old"})
 	_, resp := h.SaveSnapshot("SAVE_SNAPSHOT topic=orders key=a version=1 message=stale", func(SnapshotResult) error {
 		session := installEventBootstrap(t, h, p, receiver)
 		defer session.Close()

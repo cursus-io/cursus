@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -25,15 +26,15 @@ const (
 	BootstrapVersion                       = 1
 	BootstrapChunkBytes                    = 256 << 10
 	BootstrapCatalogBytes                  = 16 << 20
-	DefaultBootstrapMaxTransferBytes int64 = 8 << 30
-	DefaultBootstrapMaxTotalBytes    int64 = 32 << 30
+	DefaultBootstrapMaxTransferBytes int64 = config.DefaultBootstrapMaxTransferBytes
+	DefaultBootstrapMaxTotalBytes    int64 = config.DefaultBootstrapMaxTotalBytes
 	BootstrapMaxActive                     = 8
 	BootstrapTTL                           = 5 * time.Minute
 )
 
 // This format bound is independent of operational admission limits. It leaves
 // ample int64 arithmetic space for derived indexes and never sizes a buffer.
-const bootstrapStructuralMaxBytes int64 = math.MaxInt64 / 32
+const bootstrapStructuralMaxBytes int64 = config.BootstrapStructuralMaxBytes
 
 // BootstrapLimits applies to NEW transfers; replay and matching pending/completed
 // retries use stable format validation. Configure the same MaxTotalBytes on all
@@ -45,6 +46,12 @@ type BootstrapLimits struct {
 
 func DefaultBootstrapLimits() BootstrapLimits {
 	return BootstrapLimits{MaxTransferBytes: DefaultBootstrapMaxTransferBytes, MaxTotalBytes: DefaultBootstrapMaxTotalBytes}
+}
+
+// BootstrapLimitsFromConfig is shared by partition and detached storage roots.
+func BootstrapLimitsFromConfig(cfg *config.Config) (BootstrapLimits, error) {
+	transfer, total, err := cfg.BootstrapAdmissionBytes()
+	return BootstrapLimits{MaxTransferBytes: transfer, MaxTotalBytes: total}, err
 }
 
 func validateBootstrapLimits(limits BootstrapLimits) error {
