@@ -487,11 +487,13 @@ func (d *DiskHandler) exportBootstrapContext(ctx context.Context, start, end uin
 		var header [4]byte
 		binary.BigEndian.PutUint32(header[:], length)
 		n, err := log.Write(header[:])
+		// #nosec G115 -- os.File.Write returns a nonnegative count bounded by the supplied buffer length.
 		work.CanonicalWriteBytes += uint64(n)
 		if err != nil {
 			return false, err
 		}
 		n, err = log.Write(canonical)
+		// #nosec G115 -- os.File.Write returns a nonnegative count even on a partial write error.
 		work.CanonicalWriteBytes += uint64(n)
 		return true, err
 	})
@@ -519,6 +521,7 @@ func (d *DiskHandler) exportBootstrapContext(ctx context.Context, start, end uin
 	work.CatalogWriteBytes = uint64(len(catalog))
 	for _, entry := range []struct{ id, role string }{{"records", "canonical-log"}, {"catalog", "snapshot-catalog"}} {
 		f, readBytes, err := describeBootstrapFileWorkContext(ctx, filepath.Join(t.dir, entry.id), entry.id, entry.role)
+		// #nosec G115 -- the helper returns zero or io.CopyBuffer's nonnegative byte count, including partial failures.
 		work.HashReadBytes += uint64(readBytes)
 		if err != nil {
 			return nil, err
