@@ -21,7 +21,10 @@ func (f *BrokerFSM) ConsumerMetadataRoutes(groups []string) (map[string]types.Co
 	routes := make(map[string]types.ConsumerMetadataRoute, len(groups))
 	addresses := make(map[string]string, len(groups))
 	for _, group := range groups {
-		partition := int(util.GenerateID(coordinator.ConsumerMetadataGroupPartitionKey(group)) % uint64(root.PartitionCount))
+		partition, err := consumerRoutePartition(group, root.PartitionCount)
+		if err != nil {
+			return nil, nil, err
+		}
 		meta := f.partitionMetadata[fmt.Sprintf("%s-%d", config.ConsumerOffsetsTopicName, partition)]
 		if meta == nil || meta.Leader == "" || meta.PartitionCount != root.PartitionCount || meta.LifecycleEpoch != root.LifecycleEpoch {
 			return nil, nil, fmt.Errorf("consumer offsets partition %d has no consistent durable route", partition)
@@ -52,10 +55,23 @@ func (f *BrokerFSM) validateConsumerMetadataRouteLocked(topic string, partition 
 	}
 	root := f.partitionMetadata[config.ConsumerOffsetsTopicName+"-0"]
 	meta := f.partitionMetadata[fmt.Sprintf("%s-%d", topic, partition)]
+	expectedPartition, err := consumerRoutePartition(route.Group, route.PartitionCount)
 	if root == nil || meta == nil || root.PartitionCount != route.PartitionCount || meta.PartitionCount != route.PartitionCount ||
 		root.LifecycleEpoch != route.LifecycleEpoch || meta.LifecycleEpoch != route.LifecycleEpoch || meta.Leader != route.Owner || meta.LeaderEpoch != route.LeaderEpoch ||
-		int(util.GenerateID(coordinator.ConsumerMetadataGroupPartitionKey(route.Group))%uint64(route.PartitionCount)) != partition {
+		err != nil || expectedPartition != partition {
 		return fmt.Errorf("%w: stale consumer metadata route", ErrPartitionCommitFenced)
 	}
 	return nil
+}
+
+func consumerRoutePartition(group string, count int) (int, error) {
+	unsignedCount, ok := util.SafeIntToUint64(count)
+	if !ok || unsignedCount == 0 {
+		return 0, fmt.Errorf("invalid consumer metadata partition count %d", count)
+	}
+	partition, ok := util.SafeUint64ToInt(util.GenerateID(coordinator.ConsumerMetadataGroupPartitionKey(group)) % unsignedCount)
+	if !ok {
+		return 0, fmt.Errorf("consumer metadata partition out of range")
+	}
+	return partition, nil
 }

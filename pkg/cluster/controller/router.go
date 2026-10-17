@@ -13,6 +13,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/wire"
+	"github.com/cursus-io/cursus/util"
 )
 
 type LocalProcessor interface {
@@ -187,7 +188,11 @@ func (r *ClusterRouter) coordinatorRoutes(groupNames []string) (map[string]coord
 	routes := make(map[string]coordinatorRoute, len(groupNames))
 	for _, groupName := range groupNames {
 		route := captured[groupName]
-		routes[groupName] = coordinatorRoute{id: route.Owner, addr: addresses[groupName], partition: uint64(route.Partition), epoch: route.LeaderEpoch}
+		partition, ok := util.SafeIntToUint64(route.Partition)
+		if !ok {
+			return nil, fmt.Errorf("invalid consumer metadata partition %d", route.Partition)
+		}
+		routes[groupName] = coordinatorRoute{id: route.Owner, addr: addresses[groupName], partition: partition, epoch: route.LeaderEpoch}
 	}
 	return routes, nil
 }
