@@ -18,6 +18,10 @@ import (
 )
 
 func recoverySchedulerFixture(t *testing.T, ends ...uint64) (*ClusterController, []*topic.Partition) {
+	return recoverySchedulerFixtureWithSnapshots(t, false, ends...)
+}
+
+func recoverySchedulerFixtureWithSnapshots(t *testing.T, event bool, ends ...uint64) (*ClusterController, []*topic.Partition) {
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
@@ -35,6 +39,7 @@ func recoverySchedulerFixture(t *testing.T, ends ...uint64) (*ClusterController,
 	}
 	def := topic.DefaultDefinition("orders", cfg)
 	def.Partitions, def.ReplicationFactor = len(ends), 2
+	def.EventSourcing = event
 	apply("TOPIC:", fsm.TopicCommand{Definition: &def, LeaderID: "source"})
 	var partitions []*topic.Partition
 	for id, end := range ends {

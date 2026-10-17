@@ -7,82 +7,96 @@ import (
 	"fmt"
 	"strings"
 
+	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/eventsource"
 	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/topic"
 )
 
-// CatchupReplicaSnapshots fetches each bounded page outside every local gate.
-// Only the actual terminal apply witness can authorize pending-replica saves.
+// CatchupReplicaSnapshots is the synchronous compatibility entry point. The
+// production scheduler uses CatchupReplicaSnapshotPage to retain progress.
 func (ch *CommandHandler) CatchupReplicaSnapshots(ctx context.Context, request fsm.ReplicaCatchupRequest, actual *topic.ReplicaCatchupWitness) error {
+	progress := &clusterController.ReplicaSnapshotProgress{}
+	for {
+		done, err := ch.CatchupReplicaSnapshotPage(ctx, request, actual, progress)
+		if err != nil || done {
+			return err
+		}
+	}
+}
+
+// CatchupReplicaSnapshotPage fetches one bounded page outside every local gate.
+// Only the original terminal apply witness authorizes pending-replica saves.
+func (ch *CommandHandler) CatchupReplicaSnapshotPage(ctx context.Context, request fsm.ReplicaCatchupRequest, actual *topic.ReplicaCatchupWitness, progress *clusterController.ReplicaSnapshotProgress) (bool, error) {
 	if ctx == nil {
-		return fmt.Errorf("snapshot catch-up requires context")
+		return false, fmt.Errorf("snapshot catch-up requires context")
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
-	if actual == nil {
-		return fmt.Errorf("actual receiver verification witness is required")
+	if actual == nil || progress == nil {
+		return false, fmt.Errorf("actual receiver verification witness and progress are required")
 	}
 	if ch == nil || ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.ESHandler == nil || ch.TopicManager == nil || ch.Cluster.RaftManager.GetFSM() == nil {
-		return fmt.Errorf("snapshot catch-up dependencies are unavailable")
+		return false, fmt.Errorf("snapshot catch-up dependencies are unavailable")
 	}
 	if request.SourceAddress == "" {
-		return fmt.Errorf("snapshot catch-up source address is unavailable")
+		return false, fmt.Errorf("snapshot catch-up source address is unavailable")
 	}
 	if ch.Cluster.Router == nil || ch.Cluster.Router.BrokerID() != request.BrokerID {
-		return fmt.Errorf("snapshot catch-up receiver identity mismatch")
+		return false, fmt.Errorf("snapshot catch-up receiver identity mismatch")
 	}
-	cursor := ""
-	var revision uint64
-	for pageNumber := 0; pageNumber < 1_000_000; pageNumber++ {
-		command := fmt.Sprintf("LIST_SNAPSHOTS %stopic=%s partition=%d limit=256", ch.internalAuthPrefix(), request.Topic, request.Partition)
-		if cursor != "" {
-			command += " after_key=" + base64.RawURLEncoding.EncodeToString([]byte(cursor))
-		}
-		if revision != 0 {
-			command += fmt.Sprintf(" revision=%d", revision)
-		}
-		response, err := ch.Cluster.ForwardCommandToBrokerContext(ctx, request.SourceAddress, command)
-		if err != nil {
-			return err
-		}
-		if protocol.IsErrorResponse(response) {
-			return fmt.Errorf("%s", response)
-		}
-		payload := strings.TrimPrefix(response, "OK snapshot_page=")
-		if payload == response {
-			return fmt.Errorf("invalid snapshot catch-up response")
-		}
-		var page eventsource.SnapshotPage
-		if err = json.Unmarshal([]byte(payload), &page); err != nil {
-			return err
-		}
-		if page.Revision == 0 || (revision != 0 && page.Revision != revision) {
-			return fmt.Errorf("snapshot catalog revision changed")
-		}
-		if len(page.Snapshots) > 256 {
-			return fmt.Errorf("snapshot catalog page exceeds record limit")
-		}
-		revision = page.Revision
-		for _, candidate := range page.Snapshots {
-			if candidate.Topic != request.Topic || candidate.Partition != request.Partition || candidate.LifecycleEpoch != request.LifecycleEpoch || candidate.Key <= cursor {
-				return fmt.Errorf("snapshot catch-up candidate identity or order mismatch")
-			}
-			if err = ch.publishCatchupSnapshot(ctx, request, actual, candidate); err != nil {
-				return err
-			}
-			cursor = candidate.Key
-		}
-		if page.Done {
-			return nil
-		}
-		if len(page.Snapshots) == 0 {
-			return fmt.Errorf("snapshot catalog page did not advance")
-		}
+	if err := ch.Cluster.RaftManager.GetFSM().WithReplicaSnapshotRecoveryFenceContext(ctx, request, func() error { return nil }); err != nil {
+		return false, err
 	}
-	return fmt.Errorf("snapshot catalog page limit exceeded")
+	cursor, revision := progress.AfterKey, progress.Revision
+	command := fmt.Sprintf("LIST_SNAPSHOTS %stopic=%s partition=%d limit=256", ch.internalAuthPrefix(), request.Topic, request.Partition)
+	if cursor != "" {
+		command += " after_key=" + base64.RawURLEncoding.EncodeToString([]byte(cursor))
+	}
+	if revision != 0 {
+		command += fmt.Sprintf(" revision=%d", revision)
+	}
+	response, err := ch.Cluster.ForwardCommandToBrokerContext(ctx, request.SourceAddress, command)
+	if err != nil {
+		return false, err
+	}
+	if protocol.IsErrorResponse(response) {
+		return false, fmt.Errorf("%s", response)
+	}
+	payload := strings.TrimPrefix(response, "OK snapshot_page=")
+	if payload == response {
+		return false, fmt.Errorf("invalid snapshot catch-up response")
+	}
+	var page eventsource.SnapshotPage
+	if err = json.Unmarshal([]byte(payload), &page); err != nil {
+		return false, err
+	}
+	if page.Revision == 0 || (revision != 0 && page.Revision != revision) {
+		return false, fmt.Errorf("snapshot catalog revision changed")
+	}
+	if len(page.Snapshots) > 256 {
+		return false, fmt.Errorf("snapshot catalog page exceeds record limit")
+	}
+	progress.Revision = page.Revision
+	for _, candidate := range page.Snapshots {
+		if candidate.Topic != request.Topic || candidate.Partition != request.Partition || candidate.LifecycleEpoch != request.LifecycleEpoch || candidate.Key <= cursor {
+			return false, fmt.Errorf("snapshot catch-up candidate identity or order mismatch")
+		}
+		if err = ch.publishCatchupSnapshot(ctx, request, actual, candidate); err != nil {
+			return false, err
+		}
+		cursor = candidate.Key
+		progress.AfterKey = cursor
+	}
+	if page.Done {
+		return true, ch.Cluster.RaftManager.GetFSM().WithReplicaSnapshotRecoveryFenceContext(ctx, request, func() error { return nil })
+	}
+	if len(page.Snapshots) == 0 {
+		return false, fmt.Errorf("snapshot catalog page did not advance")
+	}
+	return false, nil
 }
 
 func (ch *CommandHandler) publishCatchupSnapshot(ctx context.Context, request fsm.ReplicaCatchupRequest, actual *topic.ReplicaCatchupWitness, candidate eventsource.SnapshotResult) error {
@@ -118,7 +132,7 @@ func (ch *CommandHandler) publishCatchupSnapshot(ctx context.Context, request fs
 		return err
 	}
 	// Replay has released all partition/index gates before acquiring the FSM.
-	return ch.Cluster.RaftManager.GetFSM().WithReplicaSnapshotRecoveryFence(request, func() error {
+	return ch.Cluster.RaftManager.GetFSM().WithReplicaSnapshotRecoveryFenceContext(ctx, request, func() error {
 		current := ch.TopicManager.GetTopic(request.Topic)
 		if current != local || current.Definition().LifecycleEpoch != request.LifecycleEpoch {
 			return fmt.Errorf("snapshot catch-up owner changed")

@@ -27,6 +27,7 @@ var errReplicaEpochBoundaryUnavailable = errors.New("replica epoch boundary unav
 // the source may return a newer committed boundary. SourceAddress is local
 // routing metadata and is not sent.
 type ReplicaCatchupRequest struct {
+	localAuthority       *replicaRequestState
 	LocalWitness         *topic.ReplicaRequestWitness `json:"-"`
 	Topic                string                       `json:"topic"`
 	Partition            int                          `json:"partition"`
@@ -352,6 +353,9 @@ func (f *BrokerFSM) MarkReplicaCatchupVerified(request ReplicaCatchupRequest, wi
 	defer f.transitionMu.Unlock()
 	f.materializationMu.Lock()
 	defer f.materializationMu.Unlock()
+	if err := f.validateReplicaRequestAuthority(request); err != nil {
+		return err
+	}
 	key := request.Topic + "-" + strconv.Itoa(request.Partition)
 	f.mu.RLock()
 	meta := f.partitionMetadata[key]

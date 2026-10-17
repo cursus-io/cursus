@@ -328,7 +328,16 @@ and shutdown cancels and joins it before closing its dependencies.
 
 Cold proof construction and validation can scan retained bytes; warm proofs reuse
 their bounded caches. This scheduling limit does not imply bounded total disk
-work, a hard filesystem deadline, or a bound on the legacy snapshot callback's
-page count. Resumable snapshot turns, complete runtime ownership, metadata routing
-activation, metrics and mixed-version acceptance remain required before advertising
-production recovery capability 2.
+work or a hard filesystem deadline.
+
+Production snapshot recovery shares the remaining turn budget with log fetches.
+Each snapshot step transfers at most one 256-record catalog page; the next turn
+resumes its revision and last successfully published key using the original
+terminal receiver witness. Request rebuilding cannot invalidate that witness
+between pages. Cancellation preserves completed progress; changed process,
+membership, lifecycle, catalog revision or storage authority discards the attempt.
+Only completed catalog recovery can publish verification and submit an ISR proof.
+Snapshot certification may still replay retained bytes within a step.
+
+Complete runtime ownership, metadata routing activation, metrics and mixed-version
+acceptance remain required before advertising production recovery capability 2.

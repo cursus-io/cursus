@@ -1,12 +1,14 @@
 package fsm
 
 import (
+	"context"
 	"github.com/stretchr/testify/require"
 	"testing"
+	"time"
 )
 
 func TestReplicaSnapshotFenceCurrentAuthority(t *testing.T) {
-	for _, change := range []string{"none", "leader", "epoch", "lifecycle", "source-isr", "source-config", "source-inactive", "receiver-isr", "receiver-config", "receiver-inactive", "hwm-unknown", "hwm-regressed"} {
+	for _, change := range []string{"none", "leader", "epoch", "lifecycle", "source-isr", "source-config", "source-inactive", "receiver-isr", "receiver-config", "receiver-inactive", "source-process", "receiver-process", "source-capability", "receiver-capability", "hwm-unknown", "hwm-regressed"} {
 		t.Run(change, func(t *testing.T) {
 			f, _ := indexedRecoveryFSM(t, nil)
 			request := f.BuildReplicaCatchupRequests("node-2")[0]
@@ -32,6 +34,14 @@ func TestReplicaSnapshotFenceCurrentAuthority(t *testing.T) {
 				meta.Replicas = []string{request.SourceBroker}
 			case "receiver-inactive":
 				f.brokers["node-2"].Status = "inactive"
+			case "source-process":
+				f.brokers[request.SourceBroker].IncarnationID = "replacement-source"
+			case "receiver-process":
+				f.brokers["node-2"].IncarnationID = "replacement-receiver"
+			case "source-capability":
+				f.brokers[request.SourceBroker].RecoveryProtocol++
+			case "receiver-capability":
+				f.brokers["node-2"].RecoveryProtocol++
 			case "hwm-unknown":
 				meta.CommittedHWMKnown = false
 			case "hwm-regressed":
@@ -53,4 +63,17 @@ func TestReplicaSnapshotFenceCurrentAuthority(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReplicaSnapshotFenceQueuedCancellation(t *testing.T) {
+	f, _ := indexedRecoveryFSM(t, nil)
+	request := f.BuildReplicaCatchupRequests("node-2")[0]
+	f.transitionMu.Lock()
+	defer f.transitionMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, f.WithReplicaSnapshotRecoveryFenceContext(ctx, request, func() error {
+		t.Fatal("canceled callback must not run")
+		return nil
+	}), context.DeadlineExceeded)
 }
