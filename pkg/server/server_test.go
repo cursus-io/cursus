@@ -986,13 +986,12 @@ func newPublishTestHandler(t *testing.T) *controller.CommandHandler {
 	cfg.MinInSyncReplicas = 1
 	cfg.InternalUseTLS = true
 	dm := disk.NewDiskManager(cfg)
+	t.Cleanup(dm.CloseAllHandlers)
 	tm := topic.NewTopicManager(cfg, dm, nil)
+	t.Cleanup(tm.Stop)
 	require.NoError(t, tm.CreateTopic("ack-zero", 1, false, false))
 	handler := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
-	t.Cleanup(func() {
-		_ = handler.Close()
-		dm.CloseAllHandlers()
-	})
+	t.Cleanup(func() { _ = handler.Close() })
 	return handler
 }
 
