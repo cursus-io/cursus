@@ -198,8 +198,10 @@ incremental recovery remain separate proposals.
 Derived-index work proceeds incrementally outside the acknowledgement path,
 preserving canonical same-epoch content proofs and rebuilding cold from the log.
 Neither checkpoint size/mtime nor the process-local content generation establishes
-restart authority. Durable restart reuse and detached retained export remain
-separate proposals; the existing sidecar is preserved.
+restart authority. Durable restart reuse remains a separate proposal; the existing
+sidecar is preserved. A private paged metadata export is implemented in disk
+storage, as documented in `pkg/disk/BOOTSTRAP.md`; production registry and network
+integration remain separate work.
 
 The regression contract is bounded physical reads (bytes including headers,
 records, and empty-segment transitions), completed-chunk resume after cancellation,

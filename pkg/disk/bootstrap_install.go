@@ -1,8 +1,8 @@
 package disk
 
 import (
+	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,7 +15,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -263,58 +262,10 @@ func validateBootstrapTransaction(base string, tx bootstrapTransaction) error {
 
 func stageBootstrapIndex(d *DiskHandler, t *bootstrapTransfer) ([]bootstrapInstallFile, error) {
 	m := t.metadata
-	indexPath := filepath.Join(t.dir, "range-index")
-	// #nosec G304 -- the filename is fixed and t.dir is the private staging directory created by StageBootstrap.
-	index, err := os.OpenFile(indexPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
+	if err := buildBootstrapCanonicalIndex(context.Background(), t, d.indexInterval, d.IndexSize); err != nil {
 		return nil, err
 	}
-	defer func() { _ = index.Close() }()
-	var position, lastIndex, next uint64
-	next = m.StartOffset
-	interval := d.indexInterval
-	if interval == 0 {
-		interval = 4096
-	}
-	err = scanCompactionSegment(filepath.Join(t.dir, "records"), m.StartOffset, false, m.Compacted, func(frame compactionFrame) error {
-		msg := frame.message
-		if msg.Offset < m.StartOffset || msg.Offset >= m.EndOffset || msg.Topic != m.Fence.Topic || int(msg.Partition) != m.Fence.Partition {
-			return fmt.Errorf("bootstrap record outside logical identity or bounds")
-		}
-		if !m.Compacted && msg.Offset != next {
-			return fmt.Errorf("unmarked bootstrap offset gap")
-		}
-		next = msg.Offset + 1
-		if position-lastIndex >= interval {
-			if err := binary.Write(index, binary.BigEndian, types.IndexEntry{Offset: msg.Offset, Position: position}); err != nil {
-				return err
-			}
-			lastIndex = position
-		}
-		position += uint64(frame.size) // #nosec G115 -- scanCompactionSegment supplies the positive frame header plus payload size.
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if !m.Compacted && next != m.EndOffset {
-		return nil, fmt.Errorf("unmarked bootstrap trailing offset gap")
-	}
-	if m.StartOffset == m.EndOffset && m.Files[0].Size != 0 {
-		return nil, fmt.Errorf("nonempty bootstrap empty range")
-	}
-	if m.StartOffset == m.EndOffset {
-		// #nosec G115 -- StageBootstrap admitted IndexSize <= MaxTransferBytes <= bootstrapStructuralMaxBytes before creating this transfer.
-		if err = index.Truncate(int64(d.IndexSize)); err != nil {
-			return nil, err
-		}
-	}
-	if err = index.Sync(); err != nil {
-		return nil, err
-	}
-	if err = index.Close(); err != nil {
-		return nil, err
-	}
+	var err error
 	names := []struct{ id, dest string }{{"records", filepath.Base(d.GetSegmentPath(m.StartOffset))}, {"range-index", filepath.Base(d.GetIndexPath(m.StartOffset))}}
 	if m.StartOffset < m.EndOffset {
 		if m.Compacted {
@@ -373,27 +324,8 @@ func (r *BootstrapReceiver) Install() error {
 	if t.closed {
 		return fmt.Errorf("bootstrap transfer expired or closed")
 	}
-	for _, f := range t.metadata.Files {
-		if t.received[f.ID] != f.Size {
-			return fmt.Errorf("bootstrap file is incomplete")
-		}
-		path := filepath.Join(t.dir, f.ID)
-		if err := validateCompactedRangeFile(path, f.Size, f.SHA256); err != nil {
-			return err
-		}
-		// #nosec G304 -- StageBootstrap validated fixed descriptor IDs; path is in its private staging directory and was checksum-verified above.
-		file, err := os.OpenFile(path, os.O_RDWR, 0o600)
-		if err != nil {
-			return err
-		}
-		err = file.Sync()
-		closeErr := file.Close()
-		if err != nil {
-			return err
-		}
-		if closeErr != nil {
-			return closeErr
-		}
+	if err := verifyBootstrapIncoming(context.Background(), t); err != nil {
+		return err
 	}
 	// A pre-intent failure may leave locally generated files. Regenerate these
 	// on retry without touching the verified incoming records/catalog. Once a
