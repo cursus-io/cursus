@@ -54,6 +54,8 @@ type CommandHandler struct {
 	replication                *partitionReplicationCoordinator
 	bootstrapMu                sync.Mutex
 	bootstrapSource            *bootstrapTransferSource
+	consumerRecoveryInitMu     sync.Mutex
+	consumerRecoveryCache      *consumerMetadataRecoveryCache
 	closed                     bool
 	closeOnce                  sync.Once
 	closeErr                   error
@@ -498,12 +500,18 @@ func (ch *CommandHandler) Close() error {
 		return nil
 	}
 	ch.closeOnce.Do(func() {
+		ch.consumerRecoveryInitMu.Lock()
 		ch.bootstrapMu.Lock()
 		ch.closed = true
 		source := ch.bootstrapSource
+		cache := ch.consumerRecoveryCache
 		ch.bootstrapMu.Unlock()
+		ch.consumerRecoveryInitMu.Unlock()
+		if cache != nil {
+			ch.closeErr = cache.close()
+		}
 		if source != nil {
-			ch.closeErr = source.close()
+			ch.closeErr = errors.Join(ch.closeErr, source.close())
 		}
 		if ch.replication != nil {
 			ch.replication.close()

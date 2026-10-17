@@ -60,7 +60,8 @@ func (r *stagedConsumerTestReader) Sources() map[int]ConsumerMetadataRecoverySou
 func TestConsumerBootstrapStagesNonlocalOtherPartitionBeforeLease(t *testing.T) {
 	h, p, receiver, identity := consumerBootstrapFixture(t)
 	state := h.Cluster.RaftManager.GetFSM()
-	registerRoutingBroker(t, state, "remote")
+	transferRegister(t, state, "remote", "remote-process", "active", 2)
+	transferRegister(t, state, h.Cluster.Router.BrokerID(), "local-process", "active", 2)
 	m := state.GetPartitionMetadata(config.ConsumerOffsetsTopicName + "-1")
 	m.Replicas, m.ISR, m.Leader = []string{"remote"}, []string{"remote"}, "remote"
 	m.LeaderEpoch++
@@ -82,13 +83,15 @@ func TestConsumerBootstrapStagesNonlocalOtherPartitionBeforeLease(t *testing.T) 
 	require.NoError(t, h.Coordinator.RegisterGroupFromFSM("orders", group, 1))
 	require.NoError(t, h.Coordinator.ApplyOffsetUpdateFromFSM(group, "orders", []coordinator.OffsetItem{{Partition: 0, Offset: 11}}))
 	staged := &stagedConsumerTestReader{ends: []uint64{0, 5, 0, 0}, sources: map[int]ConsumerMetadataRecoverySource{1: {BrokerID: "remote"}}, records: map[int][]types.Message{1: stagedConsumerRecords(t, group)}}
+	remote := state.GetBroker("remote")
+	staged.sources[1] = ConsumerMetadataRecoverySource{BrokerID: remote.ID, IncarnationID: remote.IncarnationID, IncarnationEpoch: remote.IncarnationEpoch}
 	staged.readHook = func() { assertConsumerReadUnderFSMFence(t, state) }
 	h.SetConsumerMetadataRecoveryProvider(func(ctx context.Context, request ConsumerMetadataRecoveryStageRequest) (StagedConsumerMetadataRecovery, error) {
 		require.Equal(t, []int{1}, request.Partitions)
 		release, err := h.Coordinator.BeginConsumerMetadataRecovery(ctx)
 		require.NoError(t, err)
 		release()
-		registerRoutingBroker(t, state, "remote")
+		transferRegister(t, state, "remote", "remote-process", "active", 2)
 		return staged, nil
 	})
 	require.NoError(t, h.RunConsumerMetadataBootstrap(context.Background(), identity, receiver, nil, nil))
@@ -145,7 +148,7 @@ func TestUnknownOriginalStartupUsesLocalCompatibilityWithoutRemoteCoverage(t *te
 }
 
 func TestNonReplicaConsumerRecoveryStagesWithoutLeaseOrFSMFence(t *testing.T) {
-	for _, mutation := range []string{"none", "generation", "metadata", "source incarnation"} {
+	for _, mutation := range []string{"none", "generation", "metadata", "source incarnation", "requester incarnation", "source capability", "requester capability"} {
 		t.Run(mutation, func(t *testing.T) {
 			cfg := config.DefaultConfig()
 			cfg.EnabledDistribution = true
@@ -156,7 +159,8 @@ func TestNonReplicaConsumerRecoveryStagesWithoutLeaseOrFSMFence(t *testing.T) {
 			require.NoError(t, err)
 			t.Cleanup(c.Stop)
 			state := fsm.NewBrokerFSM(tm, c)
-			registerRoutingBroker(t, state, "remote")
+			transferRegister(t, state, "remote", "remote-process", "active", 2)
+			transferRegister(t, state, "unassigned", "local-process", "active", 2)
 			installRoutingOffsetsTopology(t, state, "remote")
 			m := state.GetPartitionMetadata(config.ConsumerOffsetsTopicName + "-0")
 			m.CommittedHWM = 5
@@ -167,6 +171,8 @@ func TestNonReplicaConsumerRecoveryStagesWithoutLeaseOrFSMFence(t *testing.T) {
 			h.TopicManager = tm
 			require.ErrorIs(t, h.RecoverDistributedConsumerMetadata(context.Background()), ErrConsumerRecoveryPending)
 			staged := &stagedConsumerTestReader{ends: []uint64{5, 0, 0, 0}, records: map[int][]types.Message{0: stagedConsumerRecords(t, "remote-workers")}}
+			remote := state.GetBroker("remote")
+			staged.sources = map[int]ConsumerMetadataRecoverySource{0: {BrokerID: remote.ID, IncarnationID: remote.IncarnationID, IncarnationEpoch: remote.IncarnationEpoch}}
 			staged.readHook = func() { assertConsumerReadUnderFSMFence(t, state) }
 			called := false
 			h.SetConsumerMetadataRecoveryProvider(func(ctx context.Context, request ConsumerMetadataRecoveryStageRequest) (StagedConsumerMetadataRecovery, error) {
@@ -176,8 +182,14 @@ func TestNonReplicaConsumerRecoveryStagesWithoutLeaseOrFSMFence(t *testing.T) {
 				require.NoError(t, err)
 				release()
 				// A normal FSM transition must not wait for a fence held by staging.
-				registerRoutingBroker(t, state, "remote")
+				transferRegister(t, state, "remote", "remote-process", "active", 2)
 				switch mutation {
+				case "requester incarnation":
+					transferRegister(t, state, "unassigned", "replacement", "active", 2)
+				case "source capability":
+					transferRegister(t, state, "remote", "remote-process", "active", 0)
+				case "requester capability":
+					transferRegister(t, state, "unassigned", "local-process", "active", 0)
 				case "generation":
 					generation := c.BeginConsumerRestore()
 					c.FinishConsumerRestore(generation, nil)
