@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
@@ -98,6 +99,7 @@ func (l *DetachedRawLease) seek(ctx context.Context, start uint64) error {
 		n, err := l.index.ReadAt(entry[:], mid*16)
 		// #nosec G115 -- os.File.ReadAt returns a nonnegative byte count even on partial failure.
 		l.work.IndexReadBytes += uint64(n)
+		metrics.RecordRecoveryBytes(metrics.RecoveryDetachedRead, metrics.RecoveryReadBytes, int64(n))
 		if err != nil {
 			return err
 		}
@@ -132,6 +134,7 @@ func (l *DetachedRawLease) readFrame(ctx context.Context) (*detachedRawFrame, er
 	n, err := l.records.ReadAt(header[:], l.position)
 	// #nosec G115 -- os.File.ReadAt returns a nonnegative count bounded by the header buffer.
 	l.work.ReadBytes += uint64(n)
+	metrics.RecordRecoveryBytes(metrics.RecoveryDetachedRead, metrics.RecoveryReadBytes, int64(n))
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +149,7 @@ func (l *DetachedRawLease) readFrame(ctx context.Context) (*detachedRawFrame, er
 	n, err = l.records.ReadAt(payload, l.position+4)
 	// #nosec G115 -- os.File.ReadAt returns a nonnegative count bounded by the payload buffer.
 	l.work.ReadBytes += uint64(n)
+	metrics.RecordRecoveryBytes(metrics.RecoveryDetachedRead, metrics.RecoveryReadBytes, int64(n))
 	if err != nil {
 		return nil, err
 	}
@@ -154,6 +158,8 @@ func (l *DetachedRawLease) readFrame(ctx context.Context) (*detachedRawFrame, er
 	}
 	message, err := util.DeserializeDiskMessage(payload)
 	l.work.DecodedRecords++
+	metrics.RecordRecoveryWork(metrics.RecoveryDetachedRead, metrics.RecoveryDecodedFrames, 1)
+	metrics.RecordRecoveryBytes(metrics.RecoveryDetachedRead, metrics.RecoveryDecodedBytes, int64(len(payload)))
 	if err != nil {
 		return nil, err
 	}

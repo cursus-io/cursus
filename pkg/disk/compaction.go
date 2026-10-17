@@ -222,6 +222,10 @@ func scanCompactionSegment(path string, expectedBase uint64, includeRaw, allowOf
 }
 
 func scanCompactionSegmentContext(ctx context.Context, path string, expectedBase uint64, includeRaw, allowOffsetGaps bool, visit func(compactionFrame) error) error {
+	return scanCompactionSegmentObserved(ctx, path, expectedBase, includeRaw, allowOffsetGaps, visit, nil)
+}
+
+func scanCompactionSegmentObserved(ctx context.Context, path string, expectedBase uint64, includeRaw, allowOffsetGaps bool, visit func(compactionFrame) error, observe func(int)) error {
 	// #nosec G304 -- path is generated from the broker-owned log directory and a numeric segment ID.
 	file, err := os.Open(path)
 	if err != nil {
@@ -229,7 +233,7 @@ func scanCompactionSegmentContext(ctx context.Context, path string, expectedBase
 	}
 	defer func() { _ = file.Close() }()
 
-	reader := bufio.NewReader(&bootstrapContextReader{context: ctx, reader: file})
+	reader := bufio.NewReader(&bootstrapContextReader{context: ctx, reader: file, observe: observe})
 	var position uint64
 	var previousOffset uint64
 	havePrevious := false

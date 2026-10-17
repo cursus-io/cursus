@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync/atomic"
 
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
@@ -83,7 +84,7 @@ func (d *DiskHandler) scanRetainedFramesLocked(ctx context.Context, start, end u
 		compacted := d.segmentAllowsOffsetGaps(base, info.Size())
 		result.compacted = result.compacted || compacted
 		next := base
-		err = scanCompactionSegment(path, base, false, compacted, func(frame compactionFrame) error {
+		err = scanCompactionSegmentObserved(ctx, path, base, false, compacted, func(frame compactionFrame) error {
 			result.decodedFrames++
 			// #nosec G115 -- scanCompactionSegment invokes the visitor only with a validated positive frame size.
 			result.decodedFrameBytes += uint64(frame.size)
@@ -123,6 +124,8 @@ func (d *DiskHandler) scanRetainedFramesLocked(ctx context.Context, start, end u
 				}
 			}
 			return nil
+		}, func(n int) {
+			metrics.RecordRecoveryBytes(metrics.RecoveryRetainedScan, metrics.RecoveryReadBytes, int64(n))
 		})
 		if bounded && errors.Is(err, errRetainedPageStop) {
 			return result, nil
