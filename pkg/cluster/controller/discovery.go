@@ -296,8 +296,25 @@ func (sd *serviceDiscovery) AddNodeWithRegistration(nodeID string, addr string, 
 	membership, ok := sd.rm.(interface {
 		AddVoterAtIndex(string, string, uint64) error
 	})
-	if !ok || future.Index() == 0 {
+	if !ok {
 		return leaderAddr, fmt.Errorf("conditional voter admission unavailable")
+	}
+	configurationIndex := future.Index()
+	if configurationIndex == 0 {
+		provider, available := sd.rm.(interface {
+			VoterAdmissionIndex(raft.Configuration) (uint64, error)
+		})
+		if !available {
+			return leaderAddr, fmt.Errorf("conditional voter admission index unavailable")
+		}
+		var err error
+		configurationIndex, err = provider.VoterAdmissionIndex(future.Configuration())
+		if err != nil {
+			return leaderAddr, err
+		}
+	}
+	if configurationIndex == 0 {
+		return leaderAddr, fmt.Errorf("conditional voter admission index is zero")
 	}
 	broker := *registration
 	broker.IncarnationEpoch = 0 // Only REGISTER assigns the durable process epoch.
@@ -311,7 +328,7 @@ func (sd *serviceDiscovery) AddNodeWithRegistration(nodeID string, addr string, 
 	}
 	// A concurrent membership change invalidates the captured configuration.
 	// Failure leaves registration retryable; never remove a voter as rollback.
-	if err := membership.AddVoterAtIndex(nodeID, addr, future.Index()); err != nil {
+	if err := membership.AddVoterAtIndex(nodeID, addr, configurationIndex); err != nil {
 		return leaderAddr, fmt.Errorf("admit registered voter: %w", err)
 	}
 

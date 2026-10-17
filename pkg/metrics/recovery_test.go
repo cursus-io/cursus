@@ -10,6 +10,8 @@ import (
 )
 
 func TestRecoveryExporterIncludesWorkFailuresAndBoundedLabels(t *testing.T) {
+	recoveryWork.Reset()
+	recoveryAttempts.Reset()
 	RecordRecoveryBytes(RecoveryChunkRead, RecoveryReadBytes, 7)
 	RecordRecoveryBytes(RecoveryChunkRead, RecoveryReadBytes, -1)
 	RecordRecoveryWork(RecoveryStage(255), RecoveryUnit(255), 42)

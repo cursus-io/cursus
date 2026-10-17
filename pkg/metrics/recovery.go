@@ -25,6 +25,7 @@ const (
 	RecoveryReplicaRPC
 	RecoveryRetainedScan
 	RecoveryBootstrapFile
+	RecoveryLineage
 )
 
 const (
@@ -39,10 +40,11 @@ const (
 	RecoveryCacheHits
 	RecoveryCacheMisses
 	RecoveryRetries
+	RecoveryCanonicalHashBytes
 )
 
-var recoveryStages = [...]string{"full_export", "retained_export", "retained_page", "checksum", "chunk_read", "chunk_receive", "detached_copy", "detached_read", "metadata_rpc", "replica_rpc", "retained_scan", "bootstrap_file"}
-var recoveryUnits = [...]string{"read_bytes", "write_bytes", "hash_bytes", "transfer_bytes", "decoded_frames", "decoded_bytes", "sync_calls", "pages", "cache_hits", "cache_misses", "retries"}
+var recoveryStages = [...]string{"full_export", "retained_export", "retained_page", "checksum", "chunk_read", "chunk_receive", "detached_copy", "detached_read", "metadata_rpc", "replica_rpc", "retained_scan", "bootstrap_file", "lineage"}
+var recoveryUnits = [...]string{"read_bytes", "write_bytes", "hash_bytes", "transfer_bytes", "decoded_frames", "decoded_bytes", "sync_calls", "pages", "cache_hits", "cache_misses", "retries", "canonical_hash_bytes"}
 
 var recoveryWork = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "cursus_recovery_work_total",

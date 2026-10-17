@@ -6,9 +6,38 @@ import (
 	"os"
 	"testing"
 
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRecoveryMetricsRetainCanceledLineageWork(t *testing.T) {
+	d, _ := newLineageHandler(t)
+	batch := make([]types.DiskMessage, 1200)
+	for i := range batch {
+		batch[i] = types.DiskMessage{Topic: "orders", Offset: uint64(i), Payload: "record"}
+	}
+	require.NoError(t, d.WriteBatchSync(batch))
+	read := recoveryMetric(t, "lineage", "read_bytes")
+	written := recoveryMetric(t, "lineage", "write_bytes")
+	hashed := recoveryMetric(t, "lineage", "canonical_hash_bytes")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.lineageSyncFn = func(file *os.File) error {
+		err := file.Sync()
+		cancel()
+		return err
+	}
+	_, err := d.MatchLineageCandidatesContext(ctx, nil, 1200)
+	d.lineageSyncFn = nil
+	require.ErrorIs(t, err, context.Canceled)
+	require.Greater(t, recoveryMetric(t, "lineage", "read_bytes"), read)
+	require.Greater(t, recoveryMetric(t, "lineage", "write_bytes"), written)
+	require.Greater(t, recoveryMetric(t, "lineage", "canonical_hash_bytes"), hashed)
+	_, err = d.MatchLineageCandidatesContext(context.Background(), nil, 1200)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1200), d.lineageProgress.recordsHashed)
+}
 
 func recoveryMetric(t *testing.T, stage, unit string) float64 {
 	t.Helper()

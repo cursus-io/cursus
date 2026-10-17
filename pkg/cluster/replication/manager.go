@@ -119,6 +119,7 @@ type RaftReplicationManager struct {
 	peers     map[string]string // brokerID -> addr
 	mu        sync.RWMutex
 	raftStore *raftboltdb.BoltStore
+	snapshots raft.SnapshotStore
 
 	isLeader          atomic.Bool
 	leaderCh          chan bool
@@ -267,6 +268,7 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 		peers:     make(map[string]string),
 		leaderCh:  make(chan bool, 10),
 		raftStore: raftStore,
+		snapshots: snapshots,
 	}
 
 	ctx, rm.backgroundCancel = context.WithCancel(ctx)

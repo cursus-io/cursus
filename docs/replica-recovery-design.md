@@ -104,6 +104,12 @@ Transaction, producer, consumer-offset and application snapshot state must remai
 consistent with the installed range. Only a configured recovering replica outside
 ISR can replace its local log. A stale fence is rejected before any mutation.
 
+Ordinary topics transfer an empty application catalog and rebuild producer and
+transaction state from the raw retained records. Event-sourcing topics additionally
+require a certified snapshot catalog when retained history no longer starts at
+zero. Both source capture and receiver installation select this behavior from
+the authoritative topic definition, never a request-supplied flag.
+
 HWM advances only after durable installation and derived-index preparation.
 Incremental catchup and existing prefix proof/readmission checks follow bootstrap.
 Never expose a public reset endpoint or mutate the source's committed records.
@@ -357,8 +363,10 @@ FSM reflects the current process identity and advertised configuration; an older
 successful request cannot suppress a later update. Handler shutdown also joins
 consumer recovery and transaction monitors, including synchronous initialization.
 
-Complete bundle activation, metadata routing activation, metrics and mixed-version
-acceptance remain required before advertising production recovery capability 2.
+The installed runtime bundle advertises recovery capability 2. Metadata routing
+activation is a separate durable decision requiring compatible registrations
+from every registered broker and every current voter. Mixed-version clusters
+retain the compatible digest path until both recovery peers support the new mode.
 
 Consumer metadata writers capture the group partition, partition count, original
 owner, leader epoch and topic lifecycle from one metadata view. Forwarding keeps
@@ -405,6 +413,14 @@ failure that returns no payload contributes an attempt but no observable payload
 bytes. Sync counts count attempted calls, not completed durability. A checksum
 read belongs to `hash_bytes`; do not add it to a separately inferred file-read
 estimate. Decode bytes and read bytes overlap and must not be summed as disk I/O.
+
+The `lineage` stage records retained-frame and sidecar-header reads, journal
+writes, attempted source/journal syncs and endpoint-cache hits/misses.
+`canonical_hash_bytes` counts bytes fed to cumulative hashes, including the
+previous digest and encoded length. It is computation input, not disk I/O.
+Canceled rebuilds retain their work counters. A background call that requires
+an explicit foreground rebuild is counted as a failed preparation call; this
+does not by itself indicate corrupt authoritative records.
 
 For example, `sum by (stage, unit) (increase(cursus_recovery_work_total[5m]))`
 shows work during a recovery interval. Compare `metadata_rpc` transfer bytes and

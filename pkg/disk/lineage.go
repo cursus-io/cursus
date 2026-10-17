@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
@@ -103,6 +104,7 @@ func lineageHash(previous [sha256.Size]byte, message types.DiskMessage) ([sha256
 	binary.BigEndian.PutUint64(length[:], uint64(len(canonical)))
 	_, _ = h.Write(length[:])
 	_, _ = h.Write(canonical)
+	metrics.RecordRecoveryBytes(metrics.RecoveryLineage, metrics.RecoveryCanonicalHashBytes, int64(len(previous)+len(length)+len(canonical)))
 	var digest [sha256.Size]byte
 	copy(digest[:], h.Sum(nil))
 	return digest, nil
@@ -285,7 +287,9 @@ func lineageHeaderMatches(path string, index *lineageIndex) bool {
 	defer func() { _ = f.Close() }()
 	expected := append([]byte(lineageMagic), lineageRecordBytes(lineageTailRecord(index))...)
 	actual := make([]byte, len(expected))
-	if _, err := io.ReadFull(f, actual); err != nil {
+	n, err := io.ReadFull(f, actual)
+	metrics.RecordRecoveryBytes(metrics.RecoveryLineage, metrics.RecoveryReadBytes, int64(n))
+	if err != nil {
 		return false
 	}
 	return bytes.Equal(actual, expected)
@@ -309,8 +313,13 @@ func (d *DiskHandler) publishLineage(ctx context.Context, path string, index *li
 	}
 	defer func() { _ = f.Close() }()
 	encodedTail := lineageRecordBytes(lineageTailRecord(index))
+	write := func(data []byte) error {
+		n, err := f.Write(data)
+		metrics.RecordRecoveryBytes(metrics.RecoveryLineage, metrics.RecoveryWriteBytes, int64(n))
+		return err
+	}
 	if fresh {
-		if _, err := f.Write(append([]byte(lineageMagic), make([]byte, len(encodedTail))...)); err != nil {
+		if err := write(append([]byte(lineageMagic), make([]byte, len(encodedTail))...)); err != nil {
 			return err
 		}
 	}
@@ -321,24 +330,28 @@ func (d *DiskHandler) publishLineage(ctx context.Context, path string, index *li
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if _, err := f.Write(lineageRecordBytes(event)); err != nil {
+		if err := write(lineageRecordBytes(event)); err != nil {
 			return err
 		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if _, err := f.WriteAt(encodedTail, int64(len(lineageMagic))); err != nil {
+	n, err := f.WriteAt(encodedTail, int64(len(lineageMagic)))
+	metrics.RecordRecoveryBytes(metrics.RecoveryLineage, metrics.RecoveryWriteBytes, int64(n))
+	if err != nil {
 		return err
 	}
 	syncFn := d.lineageSyncFn
 	if syncFn == nil {
 		syncFn = (*os.File).Sync
 	}
+	metrics.RecordRecoveryWork(metrics.RecoveryLineage, metrics.RecoverySyncCalls, 1)
 	if err := syncFn(f); err != nil {
 		return err
 	}
 	if fresh {
+		metrics.RecordRecoveryWork(metrics.RecoveryLineage, metrics.RecoverySyncCalls, 1)
 		if err := syncDirectory(filepath.Dir(path)); err != nil {
 			return err
 		}

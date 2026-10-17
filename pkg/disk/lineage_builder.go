@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync/atomic"
 
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -73,6 +74,7 @@ func (d *DiskHandler) lineageSnapshot(ctx context.Context, background bool) (raw
 		return rawFrameCursor{}, 0, errors.New("lineage log is closed")
 	}
 	// FlushedOffset is a written tail. Capture its fsync witness under ioMu.
+	metrics.RecordRecoveryWork(metrics.RecoveryLineage, metrics.RecoverySyncCalls, 1)
 	if err := d.syncFile(d.file); err != nil {
 		return rawFrameCursor{}, 0, d.markWriteUnavailable(fmt.Errorf("sync lineage log: %w", err))
 	}
@@ -88,6 +90,7 @@ func lineageSidecarMatches(path string, index *lineageIndex) bool {
 // prepareLineage owns lineageMu. Each call captures a fixed durable target;
 // appends while hashing cannot make the builder chase a moving log forever.
 func (d *DiskHandler) prepareLineage(ctx context.Context, background bool) (err error) {
+	defer func() { metrics.RecordRecoveryAttempt(metrics.RecoveryLineage, err) }()
 	defer func() {
 		if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errLineageRebuildRequired) {
 			return
@@ -154,6 +157,7 @@ func (d *DiskHandler) captureLineageBatch(ctx context.Context, cursor rawFrameCu
 		return rawFrameBatch{}, err
 	}
 	b := d.captureRawFramesLocked(ctx, cursor, budget)
+	metrics.RecordRecoveryWork(metrics.RecoveryLineage, metrics.RecoveryReadBytes, b.BytesRead)
 	d.lineageProgress.bytesRead += b.BytesRead
 	return b, nil
 }
@@ -278,8 +282,10 @@ func (d *DiskHandler) lineagePrefix(ctx context.Context, end uint64) (LineagePre
 	cursor := p.index.tail
 	if end != cursor.EndOffset {
 		if cached, ok := p.endpoints[end]; ok {
+			metrics.RecordRecoveryWork(metrics.RecoveryLineage, metrics.RecoveryCacheHits, 1)
 			cursor = cached
 		} else {
+			metrics.RecordRecoveryWork(metrics.RecoveryLineage, metrics.RecoveryCacheMisses, 1)
 			i := sort.Search(len(p.index.checkpoints), func(i int) bool { return p.index.checkpoints[i].EndOffset > end })
 			cursor = p.index.checkpoints[i-1]
 			for cursor.EndOffset < end {

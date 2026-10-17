@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -143,6 +144,7 @@ func (r *replicaBootstrapRecovery) receive(ctx context.Context, a *replicaBootst
 
 func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partition, manifest disk.BootstrapMetadata, receiver *disk.BootstrapReceiver, ticket *fsm.ReplicaBootstrapReceiverTicket, fenced func(bool)) error {
 	ch := r.ch
+	eventSourcing := false
 	if fenced != nil {
 		defer fenced(false)
 	}
@@ -172,6 +174,11 @@ func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partiti
 				return err
 			}
 		}
+		var err error
+		eventSourcing, err = r.state.ReplicaBootstrapEventSourcingPrelocked(p, manifest)
+		if err != nil {
+			return err
+		}
 		// Controller gates and the actual FSM fence are now held. Metadata
 		// cannot change until this local attempt leaves the validated boundary.
 		if fenced != nil {
@@ -183,6 +190,13 @@ func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partiti
 		return ch.ESHandler.DetachPartitionForBootstrap(manifest.Fence.Topic, manifest.Fence.Partition)
 	}
 	rebuild := func(view *topic.PartitionReadView, catalog []byte) error {
+		if !eventSourcing {
+			if len(catalog) != 0 {
+				return fmt.Errorf("ordinary topic bootstrap contains an application snapshot catalog")
+			}
+			// BootstrapSession already rebuilt raw producer and transaction state.
+			return nil
+		}
 		return ch.ESHandler.RebuildBootstrapState(manifest.Fence.Topic, manifest.Fence.Partition, view, catalog, manifest.Fence.LifecycleEpoch)
 	}
 	if manifest.Fence.Topic == config.ConsumerOffsetsTopicName {
