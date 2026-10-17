@@ -43,6 +43,32 @@ func TestServerWorkerStopJoinsBeforeDependenciesClose(t *testing.T) {
 	stop()
 }
 
+func TestRegistrationWaitsForRecoveryRuntimeOrCancellation(t *testing.T) {
+	for _, cancelFirst := range []bool{false, true} {
+		ready := make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan bool, 1)
+		go func() { result <- awaitRecoveryRuntime(ctx, ready) }()
+		select {
+		case <-result:
+			t.Fatal("registration passed an incomplete runtime")
+		default:
+		}
+		if cancelFirst {
+			cancel()
+		} else {
+			close(ready)
+		}
+		select {
+		case admitted := <-result:
+			require.Equal(t, !cancelFirst, admitted)
+		case <-time.After(time.Second):
+			t.Fatal("runtime wait did not finish")
+		}
+		cancel()
+	}
+}
+
 type runtimeRegistrationDiscovery struct {
 	clusterController.ServiceDiscovery
 	mu               sync.Mutex

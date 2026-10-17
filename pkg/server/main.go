@@ -70,6 +70,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	var cs *cluster.ClusterServer
 	var brokerIncarnationID string
 	var runtimeStops []func()
+	recoveryRuntimeReady := make(chan struct{})
 	stopRuntime := func() {
 		cancelRun()
 		for i := len(runtimeStops) - 1; i >= 0; i-- {
@@ -188,6 +189,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 
 		// Every node should attempt to join the cluster via seeds
 		runtimeStops = append(runtimeStops, startServerWorker(ctx, func(ctx context.Context) {
+			if !awaitRecoveryRuntime(ctx, recoveryRuntimeReady) {
+				return
+			}
 			util.Info("🚀 Attempting to join cluster via seeds...")
 			for {
 				select {
@@ -203,10 +207,16 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 			}
 		}))
 		runtimeStops = append(runtimeStops, startServerWorker(ctx, func(ctx context.Context) {
+			if !awaitRecoveryRuntime(ctx, recoveryRuntimeReady) {
+				return
+			}
 			runLocalRegistration(ctx, sd, cc, cfg)
 		}))
 
 		runtimeStops = append(runtimeStops, startServerWorker(ctx, func(ctx context.Context) {
+			if !awaitRecoveryRuntime(ctx, recoveryRuntimeReady) {
+				return
+			}
 			util.Info("🔄 Starting cluster leader election monitor...")
 			for {
 				var isLeader bool
@@ -237,6 +247,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		// to choose the internal topic's replica set. This loop does no local
 		// mutation and becomes a no-op after the single durable TOPIC command.
 		runtimeStops = append(runtimeStops, startServerWorker(ctx, func(ctx context.Context) {
+			if !awaitRecoveryRuntime(ctx, recoveryRuntimeReady) {
+				return
+			}
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 			for {
@@ -322,6 +335,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		}
 		defer shutdownInternal()
 	}
+	// Registration and JOIN may publish this process only after all recovery
+	// components and the authenticated registration endpoint are installed.
+	close(recoveryRuntimeReady)
 	if cfg.EnabledDistribution {
 		if cd == nil {
 			return fmt.Errorf("%w: coordinator unavailable", ErrConsumerMetadataRecovery)

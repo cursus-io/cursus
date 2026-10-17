@@ -26,6 +26,15 @@ func startServerWorker(parent context.Context, work func(context.Context)) func(
 	return func() { cancel(); <-done }
 }
 
+func awaitRecoveryRuntime(ctx context.Context, ready <-chan struct{}) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-ready:
+		return ctx.Err() == nil
+	}
+}
+
 func localRegistrationCurrent(sd clusterController.ServiceDiscovery, state *fsm.BrokerFSM) bool {
 	provider, ok := sd.(clusterController.LocalRegistrationProvider)
 	if !ok || state == nil {
