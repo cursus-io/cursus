@@ -134,6 +134,9 @@ func verifyRetainedBootstrap(t *testing.T, crash bool) {
 		imageID := docker("inspect", "--format={{.Image}}", container)
 		for _, damage := range []string{"missing", "damaged"} {
 			actions.StopBroker(offline)
+			// Rebuild is driven by a fresh recovery proof. A fast restart can
+			// retain the old ISR membership and legitimately skip that work.
+			waitForBrokerEvictedFromISR(t, ctx, offline)
 			command := "test -s " + indexPath + " && rm " + indexPath
 			if damage == "damaged" {
 				command = "test -s " + indexPath + " && printf invalid > " + indexPath
