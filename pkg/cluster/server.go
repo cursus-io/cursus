@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/controller"
@@ -48,6 +50,14 @@ type ClusterServer struct {
 	tlsConfig      *tls.Config
 	connectionSlot chan struct{}
 	requestTimeout time.Duration
+	ctx            context.Context
+	cancel         context.CancelFunc
+	lifecycleMu    sync.Mutex
+	closed         bool
+	listeners      map[net.Listener]struct{}
+	connections    map[net.Conn]struct{}
+	workers        sync.WaitGroup
+	closeDone      chan struct{}
 }
 
 func NewClusterServer(sd controller.ServiceDiscovery) *ClusterServer {
@@ -55,30 +65,43 @@ func NewClusterServer(sd controller.ServiceDiscovery) *ClusterServer {
 }
 
 func (h *ClusterServer) Start(addr string) (net.Listener, error) {
+	h.lifecycleMu.Lock()
+	closed := h.closed
+	h.lifecycleMu.Unlock()
+	if closed {
+		return nil, net.ErrClosed
+	}
 	listener, err := listenCluster(addr, h.tlsConfig)
 	if err != nil {
 		return nil, err
 	}
 
+	h.lifecycleMu.Lock()
+	if h.closed {
+		h.lifecycleMu.Unlock()
+		_ = listener.Close()
+		return nil, net.ErrClosed
+	}
+	h.listeners[listener] = struct{}{}
+	h.workers.Add(1)
+	h.lifecycleMu.Unlock()
 	util.Info("TCP cluster server listening at %s (TLS=%v)", addr, h.tlsConfig != nil)
 
 	go func() {
+		defer h.workers.Done()
+		defer func() { h.lifecycleMu.Lock(); delete(h.listeners, listener); h.lifecycleMu.Unlock() }()
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
+				if errors.Is(err, net.ErrClosed) {
 					return // graceful shutdown
 				}
 				util.Error("cluster accept error: %v", err)
 				continue
 			}
-			select {
-			case h.connectionSlot <- struct{}{}:
-				go func() {
-					defer func() { <-h.connectionSlot }()
-					h.handleConnection(conn)
-				}()
-			default:
+			if h.admitConnection(conn) {
+				go h.serveConnection(conn)
+			} else {
 				_ = conn.Close()
 			}
 		}
@@ -87,6 +110,16 @@ func (h *ClusterServer) Start(addr string) (net.Listener, error) {
 }
 
 func (h *ClusterServer) handleConnection(conn net.Conn) {
+	if !h.admitConnection(conn) {
+		_ = conn.Close()
+		return
+	}
+	h.serveConnection(conn)
+}
+
+func (h *ClusterServer) serveConnection(conn net.Conn) {
+	defer h.workers.Done()
+	defer func() { h.lifecycleMu.Lock(); delete(h.connections, conn); h.lifecycleMu.Unlock(); <-h.connectionSlot }()
 	defer func() { _ = conn.Close() }()
 	if err := conn.SetDeadline(time.Now().Add(h.requestTimeout)); err != nil {
 		return
@@ -135,9 +168,11 @@ func (h *ClusterServer) handleConnection(conn net.Conn) {
 		case wire.CommandHeartbeatCluster:
 			response, requestError = h.handleHeartbeatCluster(payload)
 		case wire.CommandReplicaCatchup:
-			ctx, cancel := context.WithDeadline(context.Background(), deadline)
+			ctx, cancel := context.WithDeadline(h.ctx, deadline)
 			response, requestError = h.handleReplicaCatchupContext(ctx, payload)
 			cancel()
+		case wire.CommandBootstrapBegin, wire.CommandBootstrapChunk, wire.CommandBootstrapRelease:
+			response, requestError = h.handleBootstrapTransfer(conn, request.Command, payload, deadline)
 		case wire.CommandListCluster:
 			response, requestError = h.handleListCluster()
 		default:
@@ -185,7 +220,7 @@ func (h *ClusterServer) handleHeartbeatCluster(payload wire.CommandPayload) (any
 }
 
 func (h *ClusterServer) handleReplicaCatchup(payload wire.CommandPayload) (any, *wire.ErrorPayload) {
-	ctx, cancel := context.WithTimeout(context.Background(), h.requestTimeout)
+	ctx, cancel := context.WithTimeout(h.ctx, h.requestTimeout)
 	defer cancel()
 	return h.handleReplicaCatchupContext(ctx, payload)
 }

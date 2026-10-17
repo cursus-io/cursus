@@ -100,6 +100,10 @@ func (p *Partition) ReplicaFirstOffsetContext(ctx context.Context) (uint64, erro
 // ReplicaSourceHWMContext bounds the wait behind leader writes that hold p.mu
 // through durable storage I/O. Release p.mu before any source disk maintenance.
 func (p *Partition) ReplicaSourceHWMContext(ctx context.Context) (uint64, error) {
+	return p.replicaSourceHWMContext(ctx, false)
+}
+
+func (p *Partition) replicaSourceHWMContext(ctx context.Context, requireReady bool) (uint64, error) {
 	if ctx == nil {
 		return 0, errors.New("replica source HWM requires context")
 	}
@@ -115,7 +119,17 @@ func (p *Partition) ReplicaSourceHWMContext(ctx context.Context) (uint64, error)
 		}
 		if p.mu.TryRLock() {
 			hwm := p.HWM
+			var readiness error
+			if requireReady {
+				readiness = p.hwmReadinessErrorLocked()
+				if p.closed || p.snapshotRecovery {
+					readiness = errors.New("metadata bootstrap source partition is not ready")
+				}
+			}
 			p.mu.RUnlock()
+			if readiness != nil {
+				return 0, readiness
+			}
 			return hwm, nil
 		}
 		if ticker == nil {

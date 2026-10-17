@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"crypto/subtle"
 	"crypto/tls"
 	"net"
@@ -30,7 +31,10 @@ func NewSecureClusterServerWithTokens(sd controller.ServiceDiscovery, activeToke
 	if nextToken != "" && nextToken != activeToken {
 		authTokens = append(authTokens, nextToken)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &ClusterServer{
+		ctx: ctx, cancel: cancel, closeDone: make(chan struct{}),
+		listeners: make(map[net.Listener]struct{}), connections: make(map[net.Conn]struct{}),
 		sd:             sd,
 		authTokens:     authTokens,
 		tlsConfig:      tlsConfig,

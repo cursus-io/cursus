@@ -200,8 +200,9 @@ preserving canonical same-epoch content proofs and rebuilding cold from the log.
 Neither checkpoint size/mtime nor the process-local content generation establishes
 restart authority. Durable restart reuse remains a separate proposal; the existing
 sidecar is preserved. A private paged metadata export is implemented in disk
-storage, as documented in `pkg/disk/BOOTSTRAP.md`; production registry and network
-integration remain separate work.
+storage, as documented in `pkg/disk/BOOTSTRAP.md`. The metadata source registry
+and authenticated transport are implemented; provider and receiver integration
+remain separate work.
 
 The regression contract is bounded physical reads (bytes including headers,
 records, and empty-segment transitions), completed-chunk resume after cancellation,
@@ -265,3 +266,22 @@ Arbitrary seeks or enough interleaved followers can evict useful checkpoints and
 repeat cold segment work; no unconditional linear-work guarantee is made for
 those workloads. Full retained scans, bootstrap and ordinary readers keep their
 existing contracts.
+
+## Metadata bootstrap transport
+
+The discovery endpoint binds the process-owned metadata source before consumer
+metadata recovery waits. `BOOTSTRAP_BEGIN`, `BOOTSTRAP_CHUNK`, and
+`BOOTSTRAP_RELEASE` require cluster authentication and strict version-1 DTOs.
+Only a valid authenticated Begin extends the server request deadline to 120
+seconds; handshake and ordinary request deadlines remain unchanged. Client
+cancellation closes its private connection. It never releases a shared attempt:
+the attempt owner explicitly releases after consumption or abandonment, while
+source creation deadlines and ready-export expiry bound uncertain delivery.
+
+Discovery shutdown cancels requests, closes listeners and active sockets, then
+joins handlers before closing the source registry and its storage. A filesystem
+read already in progress remains joined even after its socket closes. Remote
+cancellation, deadline, fencing, capacity, continuity and storage failures retain
+distinct structured classifications. Production recovery capability remains zero;
+the metadata provider, receiver integration and general replica bootstrap bundle
+are not active.
