@@ -92,6 +92,7 @@ func TestClassifyFencingAndAvailability(t *testing.T) {
 	}{
 		{"GEN_MISMATCH", ErrorClassFencing, false},
 		{"producer_fenced", ErrorClassFencing, false},
+		{"consumer_route_fenced", ErrorClassFencing, false},
 		{"transaction_manager_not_available", ErrorClassAvailability, true},
 		{"replication_unavailable", ErrorClassAvailability, true},
 		{"replica_offset_gap", ErrorClassAvailability, true},
