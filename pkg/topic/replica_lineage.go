@@ -53,6 +53,18 @@ type replicaLineageContextStorage interface {
 	MatchLineageCandidatesContext(context.Context, []disk.LineagePrefix, uint64) (*disk.LineagePrefix, error)
 }
 
+// ReplicaRetainedPrefixContext certifies raw retained records, including marked
+// holes. It must run without p.mu; the caller fences partition replacement.
+func (p *Partition) ReplicaRetainedPrefixContext(ctx context.Context, start, end uint64) (disk.RetainedPrefixResult, error) {
+	storage, ok := p.dh.(interface {
+		RetainedPrefixContext(context.Context, uint64, uint64) (disk.RetainedPrefixResult, error)
+	})
+	if !ok {
+		return disk.RetainedPrefixResult{}, ErrReplicaSourceUnsupported
+	}
+	return storage.RetainedPrefixContext(ctx, start, end)
+}
+
 // These optional accessors never hold p.mu across disk maintenance. Compaction
 // may call GetHWM while holding maintenanceMu, so reversing that order deadlocks.
 // The FSM caller fences partition replacement; disk tokens fence prefix rewrites.
