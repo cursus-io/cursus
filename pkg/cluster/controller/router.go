@@ -246,13 +246,16 @@ func (r *ClusterRouter) ForwardToCoordinator(groupName, req string) (string, err
 }
 
 func (r *ClusterRouter) forwardWithTimeout(addr, req string) (string, error) {
+	return r.forwardWithTimeoutContext(context.Background(), addr, req)
+}
+func (r *ClusterRouter) forwardWithTimeoutContext(ctx context.Context, addr, req string) (string, error) {
 	host, _, splitErr := net.SplitHostPort(addr)
 	if splitErr != nil {
 		return "", fmt.Errorf("invalid address format %s: %w", addr, splitErr)
 	}
 
 	clientAddr := r.brokerCommandAddr(host)
-	resp, err := r.sendRequest(clientAddr, req)
+	resp, err := r.sendDataRequestContext(ctx, clientAddr, []byte(r.withInternalToken(req)))
 	if err != nil {
 		return "", fmt.Errorf("failed to forward request to %s: %w", clientAddr, err)
 	}
@@ -368,14 +371,6 @@ func (r *ClusterRouter) wrapInternalBatch(data []byte) []byte {
 	payload := base64.StdEncoding.EncodeToString(data)
 	return []byte("INTERNAL_BATCH internal_token=" + r.internalToken + " payload=" + payload)
 }
-func (r *ClusterRouter) sendRequest(addr, command string) (string, error) {
-	return r.sendDataRequest(addr, []byte(r.withInternalToken(command)))
-}
-
-func (r *ClusterRouter) sendDataRequest(addr string, data []byte) (string, error) {
-	return r.sendDataRequestContext(context.Background(), addr, data)
-}
-
 func (r *ClusterRouter) sendDataRequestContext(ctx context.Context, addr string, data []byte) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()

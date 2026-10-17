@@ -1,6 +1,7 @@
 package eventsource
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -138,11 +139,12 @@ func TestBootstrapExactCatalogReplacementAndReopen(t *testing.T) {
 			record = binary.BigEndian.AppendUint32(record, uint32(len("legacy")))
 			record = append(record, []byte("legacy")...)
 			require.NoError(t, os.WriteFile(legacy, record, 0o600))
-			require.Empty(t, h.SaveSnapshotReplica(SnapshotResult{Topic: "orders", Partition: 0, Key: "stale", Version: 99, Payload: "old"}))
+			require.NoError(t, seedStaleSnapshotFixture(h, SnapshotResult{Topic: "orders", Partition: 0, Key: "stale", Version: 99, Payload: "old"}))
 			require.NotNil(t, h.snapshots["orders:0"].legacyFile)
 
-			require.Empty(t, h.SaveSnapshotReplica(SnapshotResult{Topic: "orders", Partition: 0, Key: "receiver-only", Version: 9, Payload: "old"}))
+			require.NoError(t, seedStaleSnapshotFixture(h, SnapshotResult{Topic: "orders", Partition: 0, Key: "receiver-only", Version: 9, Payload: "old"}))
 			require.NoError(t, h.PrepareCommittedIndex("orders", 0))
+			appendSnapshotFixtureHistory(t, h, SnapshotResult{Topic: "neighbor", Partition: 0, Key: "keep", Version: 9, Payload: "keep"})
 			require.Empty(t, h.SaveSnapshotReplica(SnapshotResult{Topic: "neighbor", Partition: 0, Key: "keep", Version: 9, Payload: "keep"}))
 			require.NoError(t, h.PrepareCommittedIndex("neighbor", 0))
 			neighborIndex, neighborStore := h.indexes["neighbor:0"], h.snapshots["neighbor:0"]
@@ -375,30 +377,33 @@ func TestAppendCallbackRequiresControllerFence(t *testing.T) {
 
 func TestBootstrapViewIdentityAndLifetime(t *testing.T) {
 	h, p := newBootstrapHandler(t)
+	appendSnapshotFixtureHistory(t, h, SnapshotResult{Topic: "neighbor", Key: "keep", Version: 1, Payload: "keep"})
 	require.Empty(t, h.SaveSnapshotReplica(SnapshotResult{Topic: "neighbor", Key: "keep", Version: 1, Payload: "keep"}))
 	var escaped *topic.PartitionReadView
+	var escapedSource *topic.BootstrapSource
 	require.NoError(t, p.WithReadView(func(view *topic.PartitionReadView) error {
 		require.ErrorContains(t, h.RebuildBootstrapState("orders", 0, view, catalogBytes(t), 1), "exclusive callback")
-		_, err := h.CaptureBootstrapCatalog("orders", 0, view, 1)
+		_, err := h.CaptureBootstrapCatalog(context.Background(), "orders", 0, nil, 1)
 		require.ErrorContains(t, err, "exclusive callback")
 		return nil
 	}))
 	require.NoError(t, p.WithBootstrapSource(func(source *topic.BootstrapSource) error {
 		escaped = source.View()
-		_, wrongEpoch := h.CaptureBootstrapCatalog("orders", 0, escaped, 2)
+		escapedSource = source
+		_, wrongEpoch := h.CaptureBootstrapCatalog(context.Background(), "orders", 0, source, 2)
 		require.ErrorContains(t, wrongEpoch, "lifecycle mismatch")
-		_, err := h.CaptureBootstrapCatalog("neighbor", 0, escaped, 1)
+		_, err := h.CaptureBootstrapCatalog(context.Background(), "neighbor", 0, source, 1)
 		require.ErrorContains(t, err, "identity mismatch")
 		partition, lifecycle := 0, uint64(1)
 		data, err := json.Marshal(bootstrapCatalog{Version: 1, Topic: "neighbor", Partition: &partition, LifecycleEpoch: &lifecycle, Snapshots: []bootstrapSnapshot{}})
 		require.NoError(t, err)
 		require.ErrorContains(t, h.RebuildBootstrapState("neighbor", 0, escaped, data, 1), "identity mismatch")
-		data, err = h.CaptureBootstrapCatalog("orders", 0, escaped, 1)
+		data, err = h.CaptureBootstrapCatalog(context.Background(), "orders", 0, escapedSource, 1)
 		require.NoError(t, err)
 		_, err = decodeBootstrapCatalog(data, "orders", 0, 1)
 		return err
 	}))
-	_, err := h.CaptureBootstrapCatalog("orders", 0, escaped, 1)
+	_, err := h.CaptureBootstrapCatalog(context.Background(), "orders", 0, escapedSource, 1)
 	require.ErrorContains(t, err, "expired")
 	snaps, resp := h.ListSnapshots("neighbor", 0)
 	require.Empty(t, resp)
@@ -409,9 +414,10 @@ func TestBootstrapCaptureRejectsBase64OversizeCatalog(t *testing.T) {
 	h, p := newBootstrapHandler(t)
 	// Base64 expansion makes the encoded inventory exceed 16 MiB even though
 	// its raw payload fits, and capture must never silently omit it.
+	appendSnapshotFixtureHistory(t, h, SnapshotResult{Topic: "orders", Key: "a", Version: 1, Payload: strings.Repeat("<", disk.BootstrapCatalogBytes*3/4)})
 	require.Empty(t, h.SaveSnapshotReplica(SnapshotResult{Topic: "orders", Key: "a", Version: 1, Payload: strings.Repeat("<", disk.BootstrapCatalogBytes*3/4)}))
 	require.NoError(t, p.WithBootstrapSource(func(source *topic.BootstrapSource) error {
-		data, err := h.CaptureBootstrapCatalog("orders", 0, source.View(), 1)
+		data, err := h.CaptureBootstrapCatalog(context.Background(), "orders", 0, source, 1)
 		require.ErrorContains(t, err, "byte limit")
 		require.Nil(t, data)
 		return nil
@@ -562,9 +568,10 @@ func TestBootstrapCaptureExactEncodedLimit(t *testing.T) {
 	}
 	base = catalogBytes(t, bootstrapSnapshot{Key: "a", Version: version, Payload: ""})
 	payloadBytes := (disk.BootstrapCatalogBytes - len(base)) / 4 * 3
+	appendSnapshotFixtureHistory(t, h, SnapshotResult{Topic: "orders", Key: "a", Version: version, Payload: strings.Repeat("x", payloadBytes)})
 	require.Empty(t, h.SaveSnapshotReplica(SnapshotResult{Topic: "orders", Key: "a", Version: version, Payload: strings.Repeat("x", payloadBytes)}))
 	require.NoError(t, p.WithBootstrapSource(func(source *topic.BootstrapSource) error {
-		data, err := h.CaptureBootstrapCatalog("orders", 0, source.View(), 1)
+		data, err := h.CaptureBootstrapCatalog(context.Background(), "orders", 0, source, 1)
 		require.NoError(t, err)
 		require.Len(t, data, disk.BootstrapCatalogBytes)
 		return nil
@@ -591,7 +598,7 @@ func TestDetachPartitionPreservesSameTopicNeighbors(t *testing.T) {
 	require.NoError(t, h.tm.CreateTopic("many", 11, false, true))
 	for _, id := range []int{1, 10} {
 		require.NoError(t, h.PrepareCommittedIndex("many", id))
-		require.Empty(t, h.SaveSnapshotReplica(SnapshotResult{Topic: "many", Partition: id, Key: "keep", Version: 1, Payload: "value"}))
+		require.NoError(t, seedStaleSnapshotFixture(h, SnapshotResult{Topic: "many", Partition: id, Key: "keep", Version: 1, Payload: "value"}))
 	}
 	neighborIndex, neighborSnapshots := h.indexes["many:10"], h.snapshots["many:10"]
 	require.NoError(t, h.DetachPartitionForBootstrap("many", 1))
@@ -636,12 +643,13 @@ func TestBootstrapPreservesSnapshotBytesThroughRebuildAndReopen(t *testing.T) {
 		{Topic: "orders", Key: string([]byte{'k', 0xfe, 0x00}), Version: 2, Payload: string([]byte{0xed, 0xa0, 0x80, 0xff})},
 	}
 	for _, snapshot := range snapshots {
+		appendSnapshotFixtureHistory(t, source, snapshot)
 		require.Empty(t, source.SaveSnapshotReplica(snapshot))
 	}
 	var data []byte
 	require.NoError(t, sourcePartition.WithBootstrapSource(func(sourceView *topic.BootstrapSource) error {
 		var err error
-		data, err = source.CaptureBootstrapCatalog("orders", 0, sourceView.View(), 1)
+		data, err = source.CaptureBootstrapCatalog(context.Background(), "orders", 0, sourceView, 1)
 		return err
 	}))
 	require.NotContains(t, string(data), "\ufffd")
@@ -664,4 +672,28 @@ func TestBootstrapPreservesSnapshotBytesThroughRebuildAndReopen(t *testing.T) {
 		}
 		require.NoError(t, target.DetachPartitionForBootstrap("orders", 0))
 	}
+}
+
+// This fixture intentionally models stale state replaced by an exact bootstrap
+// inventory. Production save authority must never be used to invent its proof.
+func seedStaleSnapshotFixture(h *Handler, snapshot SnapshotResult) error {
+	return h.withReadView(snapshot.Topic, snapshot.Partition, func(v *topic.PartitionReadView) error {
+		ss, err := h.getSnapshotWithView(snapshot.Topic, snapshot.Partition, v)
+		if err != nil {
+			return err
+		}
+		return ss.Save(snapshot.Key, snapshot.Version, snapshot.Payload)
+	})
+}
+func appendSnapshotFixtureHistory(t *testing.T, h *Handler, snapshot SnapshotResult) {
+	t.Helper()
+	p, err := h.tm.GetTopic(snapshot.Topic).GetPartition(snapshot.Partition)
+	require.NoError(t, err)
+	start := p.NextOffset()
+	records := make([]types.Message, snapshot.Version)
+	for i := range records {
+		records[i] = types.Message{Offset: start + uint64(i), Key: snapshot.Key, AggregateVersion: uint64(i + 1), Payload: "event"}
+	}
+	require.NoError(t, p.ReplicaAppend(records))
+	require.NoError(t, p.ApplyReplicaHWM(start+snapshot.Version))
 }

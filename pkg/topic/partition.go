@@ -112,6 +112,8 @@ type Partition struct {
 	producerStateTTL           time.Duration
 	txnMarkerMu                sync.RWMutex
 	txnResolver                TransactionDecisionResolver
+	txnResolverRevision        uint64 // txnMarkerMu; saturated revisions cannot certify decisions
+	txnEvidenceRevision        uint64 // txnMarkerMu; fences live marker/open/floor evidence
 	txnMarkers                 map[transactionMarkerKey]transactionMarkerInfo
 	txnOpenOffsets             map[transactionMarkerKey]uint64
 	txnRetentionFloor          uint64
@@ -120,6 +122,10 @@ type Partition struct {
 
 func (p *Partition) SetTransactionDecisionResolver(resolver TransactionDecisionResolver) {
 	p.txnMarkerMu.Lock()
+	if p.txnResolverRevision != math.MaxUint64 {
+		p.txnResolverRevision++
+	}
+	p.advanceTransactionEvidenceRevisionLocked()
 	p.txnResolver = resolver
 	for key, marker := range p.txnMarkers {
 		if !marker.hasOpenOffset || marker.offset <= marker.openOffset {
@@ -1214,6 +1220,15 @@ func (p *Partition) indexTransactionMessage(msg types.Message) {
 	key := messageTransactionMarkerKey(msg)
 	p.txnMarkerMu.Lock()
 	defer p.txnMarkerMu.Unlock()
+	beforeMarker, hadMarker := p.txnMarkers[key]
+	beforeOpen, hadOpen := p.txnOpenOffsets[key]
+	defer func() {
+		marker, hasMarker := p.txnMarkers[key]
+		open, hasOpen := p.txnOpenOffsets[key]
+		if beforeMarker != marker || hadMarker != hasMarker || beforeOpen != open || hadOpen != hasOpen {
+			p.advanceTransactionEvidenceRevisionLocked()
+		}
+	}()
 	if p.txnMarkers == nil {
 		p.txnMarkers = make(map[transactionMarkerKey]transactionMarkerInfo)
 	}
@@ -1267,6 +1282,16 @@ func (p *Partition) pruneTransactionIndex(retentionFloor uint64) {
 		delete(p.txnOpenOffsets, key)
 	}
 	p.txnRetentionFloor = retentionFloor
+	p.advanceTransactionEvidenceRevisionLocked()
+}
+
+// This revision covers authoritative visibility evidence even when appends do
+// not take the snapshot cut's gates. Saturation permanently disables transaction
+// certification; ordinary reads and nontransactional raw certification continue.
+func (p *Partition) advanceTransactionEvidenceRevisionLocked() {
+	if p.txnEvidenceRevision != math.MaxUint64 {
+		p.txnEvidenceRevision++
+	}
 }
 
 func (p *Partition) rebuildTransactionMarkerIndex() error {
@@ -1308,6 +1333,9 @@ func firstUnresolvedOpenOffset(hwm, retentionFloor uint64, openOffsets map[trans
 		}
 		marker, ok := markers[key]
 		if ok && marker.offset < hwm && marker.offset > offset && transactionDecisionMatchesMarker(key, marker, resolver) {
+			// This is a derived-cache deletion, not a loss of authoritative
+			// evidence: marker.hasOpenOffset retains the open for scratch cuts.
+			// Marker replacement, pruning and state installation are revisioned.
 			delete(openOffsets, key)
 			continue
 		}

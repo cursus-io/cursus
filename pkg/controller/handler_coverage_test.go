@@ -1330,8 +1330,12 @@ func TestHandleCommitAndFetchOffset_AllowsQuestionMarkGroupTopic(t *testing.T) {
 }
 
 func TestHandleReplicateSnapshot_SavesFollowerSnapshot(t *testing.T) {
-	ch, tm, _ := newTestHandlerWithCoordinator(t)
+	ch, tm := newDiskSnapshotCommandHandler(t)
 	require.NoError(t, tm.CreateTopic("snap-rep-topic", 1, false, true))
+	p, err := tm.GetTopic("snap-rep-topic").GetPartition(0)
+	require.NoError(t, err)
+	require.NoError(t, p.ReplicaAppend([]types.Message{{Offset: 0, Key: "agg-1", AggregateVersion: 1}, {Offset: 1, Key: "agg-1", AggregateVersion: 2}}))
+	require.NoError(t, p.ApplyReplicaHWM(2))
 	ctx := internalReplicationTestContext(ch)
 
 	payload := `{"topic":"snap-rep-topic","key":"agg-1","version":2,"partition":0,"payload":"{\"state\":\"ok\"}"}`

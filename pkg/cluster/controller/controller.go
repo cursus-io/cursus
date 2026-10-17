@@ -77,11 +77,11 @@ type ClusterController struct {
 	Router          *ClusterRouter
 	Config          *config.Config
 	brokerID        string
-	snapshotCatchup func(context.Context, fsm.ReplicaCatchupRequest) error
+	snapshotCatchup func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error
 	proofSubmitter  func(context.Context, fsm.ISRCatchupProof) error
 }
 
-func (cc *ClusterController) SetReplicaSnapshotCatchup(callback func(context.Context, fsm.ReplicaCatchupRequest) error) {
+func (cc *ClusterController) SetReplicaSnapshotCatchup(callback func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error) {
 	if cc != nil {
 		cc.snapshotCatchup = callback
 	}
@@ -204,10 +204,13 @@ func (cc *ClusterController) internalAuthPrefix() string {
 }
 
 func (cc *ClusterController) ForwardCommandToBroker(addr, command string) (string, error) {
+	return cc.ForwardCommandToBrokerContext(context.Background(), addr, command)
+}
+func (cc *ClusterController) ForwardCommandToBrokerContext(ctx context.Context, addr, command string) (string, error) {
 	if cc.Router == nil {
 		return "", fmt.Errorf("cluster router not available")
 	}
-	return cc.Router.forwardWithTimeout(addr, command)
+	return cc.Router.forwardWithTimeoutContext(ctx, addr, command)
 }
 
 func (cc *ClusterController) ReplicateCommandToFollowers(topic string, partition int, command string, minISR int) error {

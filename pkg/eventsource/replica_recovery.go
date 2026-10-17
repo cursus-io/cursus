@@ -3,7 +3,6 @@ package eventsource
 import (
 	"strconv"
 
-	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 )
 
@@ -35,19 +34,14 @@ func (h *Handler) IndexReplicaCatchupWithView(name string, partition int, end ui
 	stable := view.LastStableOffset()
 	if existing && (!certified || previous != generation || start > stable) {
 		if err := h.recoverIndexWithView(name, partition, idx, view, stable); err != nil {
+			h.retireIndex(key, idx, err)
 			return err
 		}
 	} else if stable > start {
 		if err := h.replayIndex(idx, view, start, stable); err != nil {
+			h.retireIndex(key, idx, err)
 			return err
 		}
 	}
-	h.mu.Lock()
-	if h.replicaIndexGenerations == nil {
-		h.replicaIndexGenerations = make(map[string]disk.ContentGeneration)
-	}
-	h.indexedHWM[key] = stable
-	h.replicaIndexGenerations[key] = generation
-	h.mu.Unlock()
-	return nil
+	return h.publishIndexProgress(key, idx, &stable, &generation)
 }
