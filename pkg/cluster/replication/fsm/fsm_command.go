@@ -759,6 +759,10 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 		f.mu.Unlock()
 		return fmt.Errorf("broker_registration_fenced broker=%s reason=offset_reservations_protocol required=%d", info.ID, OffsetReservationsProtocolVersion)
 	}
+	if f.consumerMetadataRoutingActivated && (info.RecoveryProtocol < BootstrapRecoveryProtocolVersion || info.LifecycleProtocol < BrokerProtocolVersionCurrent || info.IncarnationID == "") {
+		f.mu.Unlock()
+		return fmt.Errorf("broker_registration_fenced broker=%s reason=consumer_metadata_routing", info.ID)
+	}
 	if info.LifecycleProtocol < ReplicaGapRecoveryProtocolVersion {
 		for _, metadata := range f.partitionMetadata {
 			if metadata != nil && len(metadata.RecoveryReplicas) > 0 {

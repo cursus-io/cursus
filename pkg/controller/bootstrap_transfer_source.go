@@ -64,6 +64,7 @@ type bootstrapSourceCertificate struct {
 	expires    time.Time
 }
 type bootstrapTransferSource struct {
+	incarnation     string
 	mu              sync.Mutex
 	state           *fsm.BrokerFSM
 	identity        func() (fsm.BootstrapProcessIdentity, error)

@@ -197,7 +197,12 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 					return
 				case <-time.After(2 * time.Second):
 				}
-				if err := clusterClient.JoinClusterContext(ctx, cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort, cfg.TransactionCoordinatorShards); err == nil {
+				registration, err := sd.(clusterController.LocalRegistrationProvider).LocalRegistrationPayload()
+				if err != nil {
+					util.Error("prepare cluster join registration: %v", err)
+					continue
+				}
+				if err := clusterClient.JoinClusterRegistrationContext(ctx, cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort, rm.GetFSM().TransactionCoordinatorShardCount(), registration); err == nil {
 					return
 				} else if ctx.Err() == nil {
 					util.Debug("cluster join pending: %v", err)
@@ -255,6 +260,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
+					if err := clusterController.ActivateConsumerMetadataRouting(rm); err != nil {
+						util.Debug("consumer routing activation pending: %v", err)
+					}
 					if !rm.IsLeader() || rm.GetFSM().GetPartitionMetadata(config.ConsumerOffsetsTopicName+"-0") != nil {
 						continue
 					}
@@ -335,6 +343,15 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	}
 	// Registration and JOIN may publish this process only after all recovery
 	// components and the authenticated registration endpoint are installed.
+	if cfg.EnabledDistribution {
+		activation, ok := sd.(interface{ ActivateRecoveryRuntime() error })
+		if !ok {
+			return fmt.Errorf("discovery recovery activation unavailable")
+		}
+		if err := activation.ActivateRecoveryRuntime(); err != nil {
+			return fmt.Errorf("activate installed recovery runtime: %w", err)
+		}
+	}
 	close(recoveryRuntimeReady)
 	if cfg.EnabledDistribution {
 		if cd == nil {

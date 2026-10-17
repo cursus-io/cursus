@@ -35,6 +35,11 @@ func (ch *CommandHandler) parseConsumerRoute(encoded, topic string, partition in
 	if !ch.isDistributed() || ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.Cluster.RaftManager.GetFSM() == nil {
 		return nil, fmt.Errorf("consumer metadata route requires distributed metadata")
 	}
+	if proof := route.Transaction; proof != nil {
+		if response := ch.waitForReplicatedTransactionState([]types.Message{{TransactionalID: proof.ID, Epoch: proof.ProducerEpoch}}, proof.Revision, DefaultFSMApplyTimeout); response != "" {
+			return nil, fmt.Errorf("transaction route state pending: %s", response)
+		}
+	}
 	if err := ch.Cluster.RaftManager.GetFSM().ValidateConsumerMetadataRoute(topic, partition, &route); err != nil {
 		return nil, err
 	}
@@ -46,4 +51,22 @@ func validateConsumerRouteSnapshot(route *types.ConsumerMetadataRoute, snapshot 
 		return fmt.Errorf("consumer metadata route changed before append")
 	}
 	return nil
+}
+
+func (ch *CommandHandler) transactionConsumerRouteArgument(topic string, partition int, id string) (string, error) {
+	if topic != config.ConsumerOffsetsTopicName || !ch.isDistributed() {
+		return "", nil
+	}
+	if !ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() {
+		return "", nil
+	}
+	route, err := ch.Cluster.RaftManager.GetFSM().ConsumerTransactionMetadataRoute(ch.Cluster.Router.BrokerID(), id, partition)
+	if err != nil {
+		return "", err
+	}
+	data, err := json.Marshal(route)
+	if err != nil {
+		return "", err
+	}
+	return " consumer_route=" + base64.RawURLEncoding.EncodeToString(data), nil
 }

@@ -53,6 +53,10 @@ func (r *consumerRecoveryReader) ReadCommittedConsumerMetadata(_ string, p int, 
 // RecoverDistributedConsumerMetadata makes one bounded local attempt. Waiting
 // for topology, Restore, catchup or pending installation owns no exclusive lease.
 func (ch *CommandHandler) RecoverDistributedConsumerMetadata(ctx context.Context) error {
+	return ch.recoverDistributedConsumerMetadata(ctx, false)
+}
+
+func (ch *CommandHandler) recoverDistributedConsumerMetadata(ctx context.Context, ownershipChange bool) error {
 	if ch == nil || ch.Coordinator == nil || ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.Cluster.RaftManager.GetFSM() == nil {
 		return fmt.Errorf("consumer metadata recovery dependencies unavailable")
 	}
@@ -60,7 +64,7 @@ func (ch *CommandHandler) RecoverDistributedConsumerMetadata(ctx context.Context
 		return fmt.Errorf("%w: %v", ErrConsumerRecoveryPending, err)
 	}
 	requirement := ch.Coordinator.ConsumerRecoveryRequirement()
-	if !requirement.Pending() {
+	if !requirement.Pending() && !ownershipChange {
 		return ch.consumerReadinessError()
 	}
 	if requirement.Installing {
@@ -113,15 +117,20 @@ func (ch *CommandHandler) RecoverDistributedConsumerMetadata(ctx context.Context
 			if err != nil {
 				return err
 			}
-			epochs, err := ch.localGroupRecoveryEpochs()
-			if err != nil {
-				return err
+			epochs := make(map[uint64]int, len(plan.owned))
+			for partition, proof := range plan.owned {
+				epochs[partition] = proof.Epoch
 			}
 			if err := ch.Coordinator.ApplyFullConsumerMetadataReplayAndComplete(prepared); err != nil {
 				return err
 			}
 			ch.groupRecoveryMu.Lock()
 			ch.groupRecoveryEpoch = epochs
+			if plan.finite {
+				ch.groupRecoveryOwnership = plan.owned
+			} else {
+				ch.groupRecoveryOwnership = nil
+			}
 			ch.groupRecoveryMu.Unlock()
 			return nil
 		})

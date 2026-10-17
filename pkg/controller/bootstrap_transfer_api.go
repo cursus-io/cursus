@@ -46,6 +46,7 @@ func (ch *CommandHandler) ConfigureBootstrapTransferSource(ctx context.Context, 
 		return fsm.BootstrapProcessIdentity{BrokerID: brokerID, IncarnationID: incarnation, IncarnationEpoch: b.IncarnationEpoch}, nil
 	}
 	source := newBootstrapTransferSource(ctx, state, identity)
+	source.incarnation = incarnation
 	// Capture the dependency before admission. Missing catalog authority disables
 	// only replica capture; metadata sources remain independently available.
 	if handler := ch.ESHandler; handler != nil {

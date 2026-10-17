@@ -233,9 +233,7 @@ func (ch *CommandHandler) ResolveGroupCoordinators(groupNames []string) (map[str
 		if ownerID != localID {
 			return nil, fmt.Errorf("coordinator ownership changed while observing group %q", groupName)
 		}
-		ch.groupRecoveryMu.Lock()
-		recovered := ch.groupRecoveryEpoch[partition] == epoch
-		ch.groupRecoveryMu.Unlock()
+		recovered := ch.consumerOwnershipRecovered(partition, epoch)
 		if !recovered {
 			return nil, fmt.Errorf("consumer metadata recovery pending for group %q", groupName)
 		}
@@ -324,11 +322,14 @@ func (ch *CommandHandler) ensureGroupRecovery(partition uint64, epoch int) error
 	if err := ch.consumerReadinessError(); err != nil {
 		return err
 	}
-	ch.groupRecoveryMu.Lock()
-	recovered := ch.groupRecoveryEpoch[partition] == epoch
-	ch.groupRecoveryMu.Unlock()
+	recovered := ch.consumerOwnershipRecovered(partition, epoch)
 	if recovered {
 		return nil
+	}
+	if ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() {
+		// The monitor performs owned recovery outside ordinary admission. A
+		// request cannot drain the admission lease it is currently holding.
+		return ErrConsumerRecoveryPending
 	}
 
 	ch.groupRecoveryReloadMu.Lock()
@@ -434,6 +435,18 @@ func (ch *CommandHandler) refreshLocalGroupRecoveryContext(ctx context.Context) 
 	}
 	if err := ch.consumerReadinessError(); err != nil {
 		return err
+	}
+	if ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() {
+		epochs, err := ch.localGroupRecoveryEpochs()
+		if err != nil {
+			return err
+		}
+		for partition, epoch := range epochs {
+			if !ch.consumerOwnershipRecovered(partition, epoch) {
+				return ch.recoverDistributedConsumerMetadata(ctx, true)
+			}
+		}
+		return nil
 	}
 	ch.groupRecoveryReloadMu.Lock()
 	defer ch.groupRecoveryReloadMu.Unlock()
@@ -959,7 +972,7 @@ func (ch *CommandHandler) validateReplicaLeader(cmd types.MessageCommand) string
 	if ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.Cluster.RaftManager.GetFSM() == nil {
 		return "ERROR: cluster_metadata_unavailable command=REPLICATE_MESSAGE"
 	}
-	if err := ch.Cluster.RaftManager.GetFSM().ValidateConsumerMetadataRoute(cmd.Topic, cmd.Partition, cmd.ConsumerRoute); err != nil {
+	if err := ch.Cluster.RaftManager.GetFSM().ValidateConsumerMetadataMessages(cmd); err != nil {
 		return fmt.Sprintf("ERROR: consumer_route_fenced reason=%q", err)
 	}
 	metadata := ch.Cluster.RaftManager.GetFSM().GetPartitionMetadata(fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition))

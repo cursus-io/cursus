@@ -633,7 +633,11 @@ func (rm *RaftReplicationManager) ApplyCommand(prefix string, data []byte) error
 }
 
 func (rm *RaftReplicationManager) AddVoter(id string, addr string) error {
-	future := rm.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(addr), 0, 10*time.Second)
+	return rm.AddVoterAtIndex(id, addr, 0)
+}
+
+func (rm *RaftReplicationManager) AddVoterAtIndex(id string, addr string, configurationIndex uint64) error {
+	future := rm.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(addr), configurationIndex, 10*time.Second)
 	if err := future.Error(); err != nil {
 		return err
 	}

@@ -20,6 +20,23 @@ type BootstrapTransferSourceBinder interface {
 	BindBootstrapTransferSource(BootstrapTransferSource) error
 }
 
+// ActivateRecoveryRuntime publishes one immutable process capability only after
+// source, receiver and metadata recovery owners report a complete installation.
+// The server calls this after installing the internal listener and scheduler.
+func (sd *serviceDiscovery) ActivateRecoveryRuntime() error {
+	sd.bootstrapMu.Lock()
+	defer sd.bootstrapMu.Unlock()
+	runtime, ok := sd.bootstrapSource.(interface{ RecoveryRuntimeReady(string) error })
+	if !ok {
+		return fsm.ErrBootstrapTransferUnavailable
+	}
+	if err := runtime.RecoveryRuntimeReady(sd.incarnationID); err != nil {
+		return err
+	}
+	sd.recoveryProtocol = fsm.BootstrapRecoveryProtocolVersion
+	return nil
+}
+
 func (sd *serviceDiscovery) BindBootstrapTransferSource(source BootstrapTransferSource) error {
 	if source == nil {
 		return fmt.Errorf("bootstrap source must not be nil")
