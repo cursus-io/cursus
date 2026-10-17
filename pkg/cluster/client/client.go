@@ -226,11 +226,15 @@ func (c *TCPClusterClient) JoinClusterContext(ctx context.Context, peers []strin
 	return c.joinClusterWithContextAndShards(ctx, peers, nodeID, addr, discoveryPort, shardCount)
 }
 
+func (c *TCPClusterClient) JoinClusterRegistrationContext(ctx context.Context, peers []string, nodeID, addr string, discoveryPort, shardCount int, registration []byte) error {
+	return c.joinClusterWithContextAndShards(ctx, peers, nodeID, addr, discoveryPort, shardCount, string(registration))
+}
+
 func (c *TCPClusterClient) joinClusterWithContext(ctx context.Context, peers []string, nodeID, addr string, discoveryPort int) error {
 	return c.joinClusterWithContextAndShards(ctx, peers, nodeID, addr, discoveryPort, 0)
 }
 
-func (c *TCPClusterClient) joinClusterWithContextAndShards(ctx context.Context, peers []string, nodeID, addr string, discoveryPort, shardCount int) error {
+func (c *TCPClusterClient) joinClusterWithContextAndShards(ctx context.Context, peers []string, nodeID, addr string, discoveryPort, shardCount int, registration ...string) error {
 	apiPort := discoveryPort
 	if apiPort == 0 {
 		apiPort = 8000
@@ -255,7 +259,7 @@ func (c *TCPClusterClient) joinClusterWithContextAndShards(ctx context.Context, 
 			// deadline. Keep each connection attempt bounded while retaining the
 			// caller's cancellation and overall deadline as the outer limit.
 			attemptCtx, cancel := context.WithTimeout(ctx, c.timeout)
-			err := c.sendJoinCommand(attemptCtx, targetAddr, nodeID, addr, shardCount)
+			err := c.sendJoinCommand(attemptCtx, targetAddr, nodeID, addr, shardCount, registration...)
 			cancel()
 			if err == nil {
 				return nil
@@ -272,8 +276,11 @@ func (c *TCPClusterClient) joinClusterWithContextAndShards(ctx context.Context, 
 	return fmt.Errorf("failed to join cluster after 5 attempts")
 }
 
-func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, localAddr string, shardCount int) error {
+func (c *TCPClusterClient) sendJoinCommand(ctx context.Context, addr, nodeID, localAddr string, shardCount int, registration ...string) error {
 	fields := map[string]string{"node_id": nodeID, "address": localAddr}
+	if len(registration) > 0 && registration[0] != "" {
+		fields["registration"] = registration[0]
+	}
 	if shardCount > 0 {
 		fields["transaction_coordinator_shards"] = strconv.Itoa(shardCount)
 	}

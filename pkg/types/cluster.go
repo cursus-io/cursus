@@ -3,12 +3,21 @@ package types
 // ConsumerMetadataRoute is captured by the originating coordinator. Forwarding
 // and replication preserve it unchanged through the durable commit boundary.
 type ConsumerMetadataRoute struct {
-	Group          string `json:"group"`
-	Owner          string `json:"owner"`
-	LeaderEpoch    int    `json:"leader_epoch"`
-	LifecycleEpoch uint64 `json:"lifecycle_epoch"`
-	PartitionCount int    `json:"partition_count"`
-	Partition      int    `json:"partition"`
+	Group          string                    `json:"group"`
+	Owner          string                    `json:"owner"`
+	LeaderEpoch    int                       `json:"leader_epoch"`
+	LifecycleEpoch uint64                    `json:"lifecycle_epoch"`
+	PartitionCount int                       `json:"partition_count"`
+	Partition      int                       `json:"partition"`
+	Transaction    *ConsumerTransactionRoute `json:"transaction,omitempty"`
+}
+
+type ConsumerTransactionRoute struct {
+	ID               string `json:"id"`
+	Owner            string `json:"owner"`
+	CoordinatorEpoch int64  `json:"coordinator_epoch"`
+	ProducerEpoch    int64  `json:"producer_epoch"`
+	Revision         uint64 `json:"revision"`
 }
 
 type MessageCommand struct {

@@ -81,6 +81,7 @@ type BrokerFSMState struct {
 	TransactionCoordinatorShards     map[int]TransactionCoordinatorShard            `json:"transactionCoordinatorShards,omitempty"`
 	TransactionCoordinatorShardCount int                                            `json:"transactionCoordinatorShardCount,omitempty"`
 	OffsetReservationsActivated      bool                                           `json:"offsetReservationsActivated,omitempty"`
+	ConsumerMetadataRoutingActivated bool                                           `json:"consumerMetadataRoutingActivated,omitempty"`
 	TopicState                       map[string]*topic.Definition                   `json:"topicState,omitempty"`
 }
 
@@ -111,6 +112,7 @@ type BrokerFSM struct {
 	configuredTransactionCoordinatorShardCount int
 	transactionCoordinatorShardCount           int
 	offsetReservationsActivated                bool
+	consumerMetadataRoutingActivated           bool
 	transactionCoordinatorChanges              chan []int
 	topicState                                 map[string]*topic.Definition
 	topicMaterialization                       map[string]TopicMaterializationIssue
@@ -291,6 +293,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 
 	var res interface{}
 	switch {
+	case strings.HasPrefix(data, "CONSUMER_ROUTING_ACTIVATE:"):
+		res = f.applyConsumerRoutingActivation(strings.TrimPrefix(data, "CONSUMER_ROUTING_ACTIVATE:"))
 	case strings.HasPrefix(data, "REGISTER:"):
 		res = f.applyRegisterCommand(strings.TrimPrefix(data, "REGISTER:"))
 	case strings.HasPrefix(data, "DEREGISTER:"):
@@ -429,6 +433,11 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 			}
 		}
 	}
+	if state.ConsumerMetadataRoutingActivated {
+		if err := validateConsumerRoutingBrokers(state.Brokers); err != nil {
+			return err
+		}
+	}
 	f.materializationMu.Lock()
 	localDefinitions := []topic.Definition(nil)
 	persistedTopicStorage := []string(nil)
@@ -455,6 +464,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	f.topicState = restoredTopicState
 	f.transactionCoordinatorShardCount = persistedShardCount
 	f.offsetReservationsActivated = state.OffsetReservationsActivated
+	f.consumerMetadataRoutingActivated = state.ConsumerMetadataRoutingActivated
 	f.transactionCoordinatorShards = state.TransactionCoordinatorShards
 	if f.transactionCoordinatorShards == nil {
 		f.transactionCoordinatorShards = make(map[int]TransactionCoordinatorShard)
@@ -891,6 +901,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		transactionCoordinatorShards:     transactionCoordinatorShards,
 		transactionCoordinatorShardCount: f.effectiveTransactionCoordinatorShardCountLocked(),
 		offsetReservationsActivated:      f.offsetReservationsActivated,
+		consumerMetadataRoutingActivated: f.consumerMetadataRoutingActivated,
 		topicState:                       topicStateCopy,
 	}, nil
 }

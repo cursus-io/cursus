@@ -38,7 +38,7 @@ func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
 	partitionKey := cmd.Topic + "-" + strconv.Itoa(cmd.Partition)
 
 	f.mu.Lock()
-	if err := f.validateConsumerMetadataRouteLocked(cmd.Topic, cmd.Partition, cmd.ConsumerRoute); err != nil {
+	if err := f.validateConsumerMetadataMessagesLocked(*cmd); err != nil {
 		f.mu.Unlock()
 		return errorAckResponse(err.Error(), first.ProducerID, first.Epoch)
 	}

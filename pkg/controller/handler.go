@@ -42,6 +42,7 @@ type CommandHandler struct {
 	topicLifecycleGates        topicLifecycleGates
 	topicCreateMu              sync.Mutex
 	groupRecoveryEpoch         map[uint64]int
+	groupRecoveryOwnership     map[uint64]consumerRecoveryOwnership
 	groupRecoveryMu            sync.Mutex
 	groupRecoveryReloadMu      sync.Mutex
 	consumerRecoveryProviderMu sync.RWMutex

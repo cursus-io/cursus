@@ -45,9 +45,41 @@ func (f *BrokerFSM) ValidateConsumerMetadataRoute(topic string, partition int, r
 	return f.validateConsumerMetadataRouteLocked(topic, partition, route)
 }
 
+func (f *BrokerFSM) ValidateConsumerMetadataMessages(cmd types.MessageCommand) error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.validateConsumerMetadataMessagesLocked(cmd)
+}
+
+func (f *BrokerFSM) validateConsumerMetadataMessagesLocked(cmd types.MessageCommand) error {
+	if err := f.validateConsumerMetadataRouteLocked(cmd.Topic, cmd.Partition, cmd.ConsumerRoute); err != nil {
+		return err
+	}
+	if cmd.ConsumerRoute == nil {
+		return nil
+	}
+	for _, msg := range cmd.Messages {
+		if cmd.ConsumerRoute.Transaction != nil {
+			if err := f.validateConsumerTransactionMessageLocked(cmd.ConsumerRoute, msg); err != nil {
+				return err
+			}
+			continue
+		}
+		record, versioned, err := coordinator.DecodeConsumerMetadataRecord(msg.Payload)
+		if err != nil || !versioned || record.Group != cmd.ConsumerRoute.Group || msg.TransactionalID != "" || msg.TransactionMarker != "" ||
+			record.Type == coordinator.ConsumerMetadataRecordTransactionalOffsetSnapshot {
+			return fmt.Errorf("%w: consumer metadata payload does not match original group route", ErrPartitionCommitFenced)
+		}
+	}
+	return nil
+}
+
 func (f *BrokerFSM) validateConsumerMetadataRouteLocked(topic string, partition int, route *types.ConsumerMetadataRoute) error {
 	// Legacy writes remain compatible until durable routing activation.
 	if route == nil {
+		if topic == config.ConsumerOffsetsTopicName && f.consumerMetadataRoutingActivated {
+			return fmt.Errorf("%w: original consumer metadata route is required", ErrPartitionCommitFenced)
+		}
 		return nil
 	}
 	if topic != config.ConsumerOffsetsTopicName || route.PartitionCount <= 0 || route.Partition != partition || route.Owner == "" || route.LeaderEpoch <= 0 {
@@ -55,11 +87,17 @@ func (f *BrokerFSM) validateConsumerMetadataRouteLocked(topic string, partition 
 	}
 	root := f.partitionMetadata[config.ConsumerOffsetsTopicName+"-0"]
 	meta := f.partitionMetadata[fmt.Sprintf("%s-%d", topic, partition)]
-	expectedPartition, err := consumerRoutePartition(route.Group, route.PartitionCount)
 	if root == nil || meta == nil || root.PartitionCount != route.PartitionCount || meta.PartitionCount != route.PartitionCount ||
-		root.LifecycleEpoch != route.LifecycleEpoch || meta.LifecycleEpoch != route.LifecycleEpoch || meta.Leader != route.Owner || meta.LeaderEpoch != route.LeaderEpoch ||
-		err != nil || expectedPartition != partition {
+		root.LifecycleEpoch != route.LifecycleEpoch || meta.LifecycleEpoch != route.LifecycleEpoch || meta.Leader != route.Owner || meta.LeaderEpoch != route.LeaderEpoch {
 		return fmt.Errorf("%w: stale consumer metadata route", ErrPartitionCommitFenced)
+	}
+	if route.Transaction != nil {
+		_, err := f.consumerTransactionSnapshotLocked(route)
+		return err
+	}
+	expectedPartition, err := consumerRoutePartition(route.Group, route.PartitionCount)
+	if err != nil || expectedPartition != partition {
+		return fmt.Errorf("%w: consumer group partition changed", ErrPartitionCommitFenced)
 	}
 	return nil
 }
