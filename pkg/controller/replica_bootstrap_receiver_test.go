@@ -70,6 +70,15 @@ func (c *replicaReceiverClient) ReleaseBootstrapTransfer(ctx context.Context, _ 
 
 func replicaReceiverFixture(t *testing.T) (*CommandHandler, *CommandHandler, *replicaReceiverClient, fsm.ReplicaCatchupRequest, fsm.ReplicaCatchupBatch) {
 	t.Helper()
+	return replicaReceiverFixtureOptions(t, false, false)
+}
+
+func replicaReceiverFixtureOptions(t *testing.T, retained, eventSourcing bool) (*CommandHandler, *CommandHandler, *replicaReceiverClient, fsm.ReplicaCatchupRequest, fsm.ReplicaCatchupBatch) {
+	t.Helper()
+	end := uint64(1)
+	if retained {
+		end = 2
+	}
 	node := func(id string) *CommandHandler {
 		cfg := config.DefaultConfig()
 		cfg.LogDir = t.TempDir()
@@ -85,6 +94,7 @@ func replicaReceiverFixture(t *testing.T) (*CommandHandler, *CommandHandler, *re
 		def := topic.DefaultDefinition("orders", cfg)
 		def.ReplicationFactor = 2
 		def.Partitions = 2
+		def.EventSourcing = eventSourcing
 		data, err := json.Marshal(fsm.TopicCommand{Definition: &def, LeaderID: "source"})
 		require.NoError(t, err)
 		require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("TOPIC:"), data...)}))
@@ -99,12 +109,23 @@ func replicaReceiverFixture(t *testing.T) (*CommandHandler, *CommandHandler, *re
 			if id == "source" {
 				require.NoError(t, partition.ReplicaAppendWithMode([]types.Message{{Offset: 0, Key: "key", Payload: "payload"}}, true))
 				require.NoError(t, partition.ApplyReplicaHWM(1))
+				if retained {
+					storage, err := dm.GetHandler("orders", p)
+					require.NoError(t, err)
+					d := storage.(*disk.DiskHandler)
+					require.NoError(t, d.RollSegmentAt(1))
+					require.NoError(t, partition.ReplicaAppendWithMode([]types.Message{{Offset: 1, Key: "retained", Payload: "survives"}}, true))
+					require.NoError(t, partition.ApplyReplicaHWM(end))
+					d.SetRetentionPolicy(0, 1)
+					d.EnforceRetention(cfg)
+					require.EqualValues(t, 1, d.GetFirstOffset())
+				}
 			}
 			key := fmt.Sprintf("orders-%d", p)
 			m := state.GetPartitionMetadata(key)
 			m.ISR = []string{"source"}
 			m.CommittedHWMKnown = true
-			m.CommittedHWM = 1
+			m.CommittedHWM = end
 			data, err := json.Marshal(m)
 			require.NoError(t, err)
 			require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("PARTITION:"+key+":"), data...)}))
@@ -120,7 +141,36 @@ func replicaReceiverFixture(t *testing.T) (*CommandHandler, *CommandHandler, *re
 	request := fsm.ReplicaCatchupRequest{Topic: "orders", Partition: 0, BrokerID: "requester", SourceBroker: "source", SourceAddress: "127.0.0.1:7000", Leader: m.Leader, LeaderEpoch: m.LeaderEpoch, LifecycleEpoch: m.LifecycleEpoch, CommittedHWM: 1, RecoveryProtocol: fsm.IndexedRecoveryProtocolVersion, MaxRecords: 100}
 	batch, err := fsm.SealReplicaCatchupBatch(fsm.ReplicaCatchupBatch{Topic: request.Topic, Partition: 0, BrokerID: request.BrokerID, SourceBroker: request.SourceBroker, Leader: request.Leader, LeaderEpoch: request.LeaderEpoch, LifecycleEpoch: request.LifecycleEpoch, CommittedHWM: 1, RecoveryProtocol: request.RecoveryProtocol, BootstrapRequired: true})
 	require.NoError(t, err)
+	request.CommittedHWM = end
+	batch.CommittedHWM = end
+	batch, err = fsm.SealReplicaCatchupBatch(batch)
+	require.NoError(t, err)
 	return receiver, source, client, request, batch
+}
+
+func TestReplicaBootstrapRetainedOrdinaryLogDoesNotRequireApplicationSnapshot(t *testing.T) {
+	for _, eventSourcing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("event_sourcing_%t", eventSourcing), func(t *testing.T) {
+			h, _, client, request, batch := replicaReceiverFixtureOptions(t, true, eventSourcing)
+			require.NoError(t, h.RecoverReplicaBootstrap(context.Background(), request, batch))
+			a := receiverAttempt(t, h, 0)
+			transferWait(t, a.done)
+			p := receiverPartition(t, h)
+			if eventSourcing {
+				require.ErrorContains(t, a.err, "durable snapshot checkpoint")
+				require.Zero(t, p.NextOffset())
+				require.Zero(t, client.chunks.Load())
+				return
+			}
+			require.NoError(t, a.err)
+			require.EqualValues(t, 2, p.NextOffset())
+			first, err := p.ReplicaFirstOffsetContext(context.Background())
+			require.NoError(t, err)
+			require.EqualValues(t, 1, first)
+			require.False(t, p.BootstrapPending())
+			require.Positive(t, client.bytes.Load())
+		})
+	}
 }
 
 func receiverAttempt(t *testing.T, h *CommandHandler, partition int) *replicaBootstrapAttempt {

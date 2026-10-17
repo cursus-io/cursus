@@ -21,6 +21,19 @@ type ReplicaBootstrapReceiverTicket struct {
 
 func (t *ReplicaBootstrapReceiverTicket) Partition() *topic.Partition { return t.partition }
 
+// ReplicaBootstrapEventSourcingPrelocked selects derived-state recovery from
+// local authoritative metadata while the caller owns the install fence.
+func (f *BrokerFSM) ReplicaBootstrapEventSourcingPrelocked(p *topic.Partition, manifest disk.BootstrapMetadata) (bool, error) {
+	d, err := f.replicaBootstrapReceiverDefinitionPrelocked(manifest.Fence.Topic, manifest.Fence.Partition, p)
+	if err != nil {
+		return false, err
+	}
+	if d.LifecycleEpoch != manifest.Fence.LifecycleEpoch {
+		return false, ErrBootstrapTransferStaleFence
+	}
+	return d.EventSourcing, nil
+}
+
 // ReplicaBootstrapReceiverCurrent is an observational cancellation check only.
 // A true result grants no installation authority; final validation still runs
 // under transition/materialization exclusion. It never waits for those gates.

@@ -52,6 +52,9 @@ func (ch *CommandHandler) ConfigureBootstrapTransferSource(ctx context.Context, 
 	if handler := ch.ESHandler; handler != nil {
 		source.replicaCapture = func(ctx context.Context, ticket *fsm.ReplicaBootstrapSourceTicket) (*fsm.ReplicaBootstrapCapture, error) {
 			return ticket.CaptureContext(ctx, func(source *topic.BootstrapSource, fence disk.BootstrapFence) (*disk.BootstrapExport, error) {
+				if !ticket.EventSourcing() {
+					return source.ExportOwnedContext(ctx, fence, nil)
+				}
 				return handler.ExportBootstrapWithCatalogOwnedContext(ctx, fence.Topic, fence.Partition, source, fence.LifecycleEpoch, fence)
 			})
 		}
