@@ -102,6 +102,74 @@ func TestReplicaRequestCancelsQueuedMetadataFence(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestReplicaRequestAllowsCommittedAdvanceDuringProof(t *testing.T) {
+	var provider *retainedSourceTestProvider
+	f, p := indexedRecoveryFSMWithProvider(t, nil, func(dm *disk.DiskManager) topic.HandlerProvider {
+		provider = &retainedSourceTestProvider{DiskManager: dm}
+		return provider
+	})
+	retainedRecoveryCapabilities(f)
+	require.NoError(t, p.ReplicaAppendCompactedRange([]types.Message{{Offset: 1, Payload: "kept"}}, 3))
+	provider.storage.afterPrefix = func() {
+		f.transitionMu.Lock()
+		defer f.transitionMu.Unlock()
+		f.mu.Lock()
+		f.partitionMetadata["orders-0"].CommittedHWM = 2
+		f.mu.Unlock()
+	}
+	r, ok, err := f.BuildReplicaCatchupRequestContext(context.Background(), "node-2", "orders", 0)
+	require.NoError(t, err)
+	require.True(t, ok, "ordinary commits during proof work must not starve recovery")
+	require.Zero(t, r.CommittedHWM, "keep the original request boundary")
+	require.Equal(t, uint64(3), p.NextOffset())
+	require.NotNil(t, r.LocalWitness)
+}
+
+type advancingLineageProvider struct {
+	*disk.DiskManager
+	after func()
+}
+type advancingLineageStorage struct {
+	*disk.DiskHandler
+	owner *advancingLineageProvider
+}
+
+func (p *advancingLineageProvider) GetHandlerWithPolicy(name string, id int, cleanup string, hours int, bytes int64) (types.StorageHandler, error) {
+	h, err := p.DiskManager.GetHandlerWithPolicy(name, id, cleanup, hours, bytes)
+	if err != nil {
+		return nil, err
+	}
+	return &advancingLineageStorage{h.(*disk.DiskHandler), p}, nil
+}
+func (s *advancingLineageStorage) LineageCandidatesContext(ctx context.Context, tail uint64) ([]disk.LineagePrefix, error) {
+	proofs, err := s.DiskHandler.LineageCandidatesContext(ctx, tail)
+	if s.owner.after != nil {
+		s.owner.after()
+	}
+	return proofs, err
+}
+
+func TestReplicaRequestStillRejectsAdvanceBeforeDestructiveTrim(t *testing.T) {
+	var provider *advancingLineageProvider
+	f, p := indexedRecoveryFSMWithProvider(t, []types.Message{{Offset: 0, Payload: "a"}, {Offset: 1, Payload: "b"}, {Offset: 2, Payload: "c"}}, func(dm *disk.DiskManager) topic.HandlerProvider {
+		provider = &advancingLineageProvider{DiskManager: dm}
+		return provider
+	})
+	retainedRecoveryCapabilities(f)
+	f.partitionMetadata["orders-0"].CommittedHWM = 1
+	provider.after = func() {
+		f.transitionMu.Lock()
+		defer f.transitionMu.Unlock()
+		f.mu.Lock()
+		f.partitionMetadata["orders-0"].CommittedHWM = 2
+		f.mu.Unlock()
+	}
+	_, ok, err := f.BuildReplicaCatchupRequestContext(context.Background(), "node-2", "orders", 0)
+	require.ErrorContains(t, err, "metadata changed")
+	require.False(t, ok)
+	require.Equal(t, uint64(3), p.NextOffset(), "never trim to an obsolete committed boundary")
+}
+
 func TestReplicaRequestDiscoveryAndMissingTargetDoNotMutateTail(t *testing.T) {
 	f, p := indexedRecoveryFSM(t, nil)
 	require.NoError(t, p.ReplicaAppendCompactedRange([]types.Message{{Offset: 1, Payload: "kept"}}, 3))

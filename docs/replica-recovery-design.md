@@ -330,6 +330,12 @@ Cold proof construction and validation can scan retained bytes; warm proofs reus
 their bounded caches. This scheduling limit does not imply bounded total disk
 work or a hard filesystem deadline.
 
+Proof preparation permits the committed boundary to advance during non-mutating
+work while retaining the original request. Truncation and local watermark changes
+still require the exact captured boundary. Recovery lock waits use a cancellable
+queue: later readers cannot continually bypass a waiting witness writer, and
+cancellation leaves no detached goroutine holding a partition or metadata gate.
+
 Production snapshot recovery shares the remaining turn budget with log fetches.
 Each snapshot step transfers at most one 256-record catalog page; the next turn
 resumes its revision and last successfully published key using the original

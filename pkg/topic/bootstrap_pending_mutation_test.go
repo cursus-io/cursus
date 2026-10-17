@@ -19,7 +19,7 @@ func waitForQueuedPartitionMutation(t *testing.T, method string) {
 		stack := make([]byte, 1<<20)
 		n := runtime.Stack(stack, true)
 		for _, goroutine := range strings.Split(string(stack[:n]), "\n\n") {
-			if strings.Contains(goroutine, "(*Partition)."+method+"(") && strings.Contains(goroutine, "sync.(*RWMutex).Lock(") {
+			if strings.Contains(goroutine, "(*Partition)."+method+"(") && strings.Contains(goroutine, "semaphore.(*Weighted).Acquire(") {
 				return true
 			}
 		}

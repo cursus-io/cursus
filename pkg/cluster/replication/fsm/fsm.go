@@ -16,6 +16,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
+	"github.com/cursus-io/cursus/util/contextlock"
 	"github.com/hashicorp/raft"
 )
 
@@ -86,8 +87,8 @@ type BrokerFSMState struct {
 type BrokerFSM struct {
 	notifiers         map[string]chan interface{}
 	mu                sync.RWMutex
-	transitionMu      sync.Mutex
-	materializationMu sync.Mutex
+	transitionMu      contextlock.RWMutex
+	materializationMu contextlock.RWMutex
 
 	logs                      map[uint64]*ReplicationEntry
 	brokers                   map[string]*BrokerInfo

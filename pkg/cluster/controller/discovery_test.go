@@ -502,15 +502,12 @@ func TestServiceDiscoveryReplicaCatchupSourceAndFollowerReconcileFences(t *testi
 // next cancellation. Calling the compatibility wrapper would lose this context.
 type catchupForwardContext struct {
 	context.Context
-	calls int
+	cancel context.CancelFunc
 }
 
-func (c *catchupForwardContext) Err() error {
-	c.calls++
-	if c.calls > 1 {
-		return context.Canceled
-	}
-	return nil
+func (c *catchupForwardContext) Done() <-chan struct{} {
+	c.cancel()
+	return c.Context.Done()
 }
 func TestServiceDiscoveryForwardsCatchupContextToFSM(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
@@ -522,7 +519,9 @@ func TestServiceDiscoveryForwardsCatchupContextToFSM(t *testing.T) {
 	sd := NewServiceDiscoveryImpl(rm, "leader", "localhost:9001", "")
 	api, ok := any(sd).(ContextReplicaCatchupSource)
 	require.True(t, ok)
-	ctx := &catchupForwardContext{Context: context.Background()}
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &catchupForwardContext{Context: parent, cancel: cancel}
 	_, err = api.FetchReplicaCatchupContext(ctx, fsm.ReplicaCatchupRequest{Topic: "orders", Leader: "leader"})
 	require.ErrorIs(t, err, context.Canceled)
 }
