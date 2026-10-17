@@ -66,17 +66,23 @@ type DiskHandler struct {
 	distributed            bool
 	internalMetadata       bool
 
-	maintenanceMu     sync.Mutex
-	compactionMu      sync.RWMutex
-	compactedSegments map[uint64]int64
-	compactionGateMu  sync.RWMutex
-	compactionGate    func() (bool, string)
-	compactionStateMu sync.Mutex
-	compactionFailure string
-	segmentReaders    *segmentReaderCache
-	mu                sync.Mutex    // metadata(offset, segment), file handler(d.file)
-	ioMu              sync.Mutex    // bufio.Writer, flush
-	lineage           *lineageIndex // protected by mu; publication also holds ioMu
+	maintenanceMu sync.Mutex
+	// replacementMu excludes physical replacement for the entire raw read session.
+	replacementMu      sync.RWMutex
+	bootstrapPending   atomic.Bool
+	bootstrapInstalled atomic.Bool
+	bootstrapLimitsMu  sync.RWMutex
+	bootstrapLimits    BootstrapLimits
+	compactionMu       sync.RWMutex
+	compactedSegments  map[uint64]int64
+	compactionGateMu   sync.RWMutex
+	compactionGate     func() (bool, string)
+	compactionStateMu  sync.Mutex
+	compactionFailure  string
+	segmentReaders     *segmentReaderCache
+	mu                 sync.Mutex    // metadata(offset, segment), file handler(d.file)
+	ioMu               sync.Mutex    // bufio.Writer, flush
+	lineage            *lineageIndex // protected by mu; publication also holds ioMu
 	// A nil index remains uninitialized until an explicit proof request. Failed
 	// background publication also waits for explicit recovery. Protected by mu.
 	lineageAutoSuppressed bool
@@ -159,6 +165,9 @@ func (d *DiskHandler) markWriteUnavailable(err error) error {
 }
 
 func (d *DiskHandler) writeAvailabilityError() error {
+	if d.bootstrapPending.Load() {
+		return ErrBootstrapPending
+	}
 	d.writeFailureMu.RLock()
 	failure := d.writeFailure
 	d.writeFailureMu.RUnlock()
@@ -242,6 +251,10 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 
 	internalMetadata := topicName == config.ConsumerOffsetsTopicName
 	tempDh := &DiskHandler{BaseName: base}
+	pendingBootstrap, err := recoverPendingBootstrap(base)
+	if err != nil {
+		return nil, fmt.Errorf("recover pending bootstrap: %w", err)
+	}
 	// Recovery must run before generic compaction-temp cleanup because a pending
 	// compacted range still owns its staged .range.compacting files.
 	if err := recoverPendingCompactedRange(base); err != nil {
@@ -303,12 +316,28 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	if minCleanableDirtyRatio <= 0 || minCleanableDirtyRatio >= 1 {
 		minCleanableDirtyRatio = 0.5
 	}
+	indexCapacity := uint64(cfg.IndexSize)
+	if pendingBootstrap != nil {
+		// The pending descriptor authenticates the moved tail index on every
+		// replay. Preserve that geometry until completion, even if configuration
+		// changed; a later ordinary reopen applies the new configured capacity.
+		indexID := "tail-index"
+		if pendingBootstrap.Metadata.StartOffset == pendingBootstrap.Metadata.EndOffset {
+			indexID = "range-index"
+		}
+		for _, f := range pendingBootstrap.Files {
+			if f.ID == indexID {
+				indexCapacity = uint64(f.Size) // #nosec G115 -- recoverPendingBootstrap validated all replacement sizes as nonnegative and structurally bounded.
+				break
+			}
+		}
+	}
 
 	dh := &DiskHandler{
 		storageLock:    storageLock,
 		BaseName:       base,
 		SegmentSize:    uint64(cfg.SegmentSize),
-		IndexSize:      uint64(cfg.IndexSize),
+		IndexSize:      indexCapacity,
 		CurrentSegment: currentSegmentBase,
 		segments:       make([]uint64, 0),
 		CurrentOffset:  recovery.validBytes,
@@ -343,6 +372,8 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	if recovery.modTime != 0 {
 		dh.segmentCreatedAt = time.Unix(0, recovery.modTime)
 	}
+	dh.bootstrapPending.Store(pendingBootstrap != nil)
+	dh.bootstrapInstalled.Store(pendingBootstrap != nil)
 
 	if err := dh.openIndexFiles(); err != nil {
 		_ = dh.closeIndexFiles()
@@ -417,6 +448,9 @@ func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.
 	}
 	d.appendMu.Lock()
 	defer d.appendMu.Unlock()
+	if err := d.writeAvailabilityError(); err != nil {
+		return 0, err
+	}
 	offset := atomic.LoadUint64(&d.AbsoluteOffset)
 	msg.Offset = offset
 	diskMsg := diskMessageFromMessage(topic, int32(partition), *msg)
@@ -506,6 +540,9 @@ func (d *DiskHandler) AppendMessage(topic string, partition int, msg *types.Mess
 	}
 	d.appendMu.Lock()
 	defer d.appendMu.Unlock()
+	if err := d.writeAvailabilityError(); err != nil {
+		return 0, err
+	}
 	offset := atomic.LoadUint64(&d.AbsoluteOffset)
 
 	msg.Offset = offset
@@ -550,6 +587,8 @@ func (dh *DiskHandler) ReadMessages(offset uint64, max int) ([]types.Message, er
 // storage bytes retained by the result. A first record larger than maxBytes is
 // returned on its own so every valid record remains consumable.
 func (dh *DiskHandler) ReadMessagesBounded(offset uint64, maxRecords, maxBytes int, allowOversizedFirst bool) ([]types.Message, int, error) {
+	dh.replacementMu.RLock()
+	defer dh.replacementMu.RUnlock()
 	atomic.AddInt32(&dh.activeReaders, 1)
 	defer atomic.AddInt32(&dh.activeReaders, -1)
 

@@ -39,9 +39,6 @@ func TestReadCommittedDoesNotUseMarkerAtHWM(t *testing.T) {
 	storage.On("GetLatestOffset").Return(uint64(0)).Once()
 	storage.On("GetFlushedOffset").Return(uint64(2)).Twice()
 	storage.On("GetFirstOffset").Return(uint64(0)).Twice()
-	storage.On("ReadMessages", uint64(0), 1).Return([]types.Message{
-		{Offset: 0, Payload: "transactional", TransactionalID: "tx", TransactionState: types.TransactionStateOpen},
-	}, nil).Once()
 	storage.On("ReadMessages", uint64(0), 2).Return([]types.Message{
 		{Offset: 0, Payload: "transactional", TransactionalID: "tx", TransactionState: types.TransactionStateOpen},
 		{Offset: 1, Payload: "marker", TransactionalID: "tx", TransactionMarker: types.TransactionMarkerCommit},
@@ -51,6 +48,8 @@ func TestReadCommittedDoesNotUseMarkerAtHWM(t *testing.T) {
 	partition.indexTransactionMessage(types.Message{Offset: 1, TransactionalID: "tx", TransactionMarker: types.TransactionMarkerCommit})
 
 	partition.SetHWM(1)
+	// The unresolved transaction stops the cursor before any log scan.
+	require.Zero(t, firstUnresolvedOpenOffset(1, 0, partition.txnOpenOffsets, partition.txnMarkers, nil))
 	messages, err := partition.ReadCommitted(0, 10)
 	require.NoError(t, err)
 	require.Empty(t, messages)
@@ -60,6 +59,20 @@ func TestReadCommittedDoesNotUseMarkerAtHWM(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, messages, 1)
 	require.Equal(t, "transactional", messages[0].Payload)
+	storage.AssertExpectations(t)
+}
+
+func TestTransactionVisibilityPreservesLaterOpenAcrossResolverChange(t *testing.T) {
+	storage := new(MockStorageHandler)
+	storage.On("GetLatestOffset").Return(uint64(0)).Once()
+	p := NewPartition(0, "orders", storage, nil, config.DefaultConfig())
+	p.SetTransactionDecisionResolver(&testCoordinatorEpochDecisionResolver{state: types.TransactionStateCommitted, coordinatorEpoch: 8, known: true})
+	p.indexTransactionMessage(types.Message{Offset: 0, TransactionalID: "tx", Epoch: 1, TransactionState: types.TransactionStateOpen})
+	p.indexTransactionMessage(types.Message{Offset: 2, TransactionalID: "tx", Epoch: 1, TransactionMarker: types.TransactionMarkerCommit, ControlBatchCoordinatorEpoch: 7})
+	p.indexTransactionMessage(types.Message{Offset: 5, TransactionalID: "tx", Epoch: 1, TransactionState: types.TransactionStateOpen})
+	require.Zero(t, firstUnresolvedOpenOffset(6, 0, p.txnOpenOffsets, p.txnMarkers, p.txnResolver))
+	p.SetTransactionDecisionResolver(&testCoordinatorEpochDecisionResolver{state: types.TransactionStateCommitted, coordinatorEpoch: 7, known: true})
+	require.Equal(t, uint64(5), firstUnresolvedOpenOffset(6, 0, p.txnOpenOffsets, p.txnMarkers, p.txnResolver))
 	storage.AssertExpectations(t)
 }
 

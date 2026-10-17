@@ -42,6 +42,9 @@ func (d *DiskHandler) EnforceCompaction() (CompactionResult, error) {
 	var result CompactionResult
 	d.maintenanceMu.Lock()
 	defer d.maintenanceMu.Unlock()
+	if err := d.writeAvailabilityError(); err != nil {
+		return result, err
+	}
 	if !config.HasCleanupPolicy(d.CleanupPolicy(), config.CleanupPolicyCompact) {
 		result.SkippedReason = "policy_disabled"
 		return result, nil

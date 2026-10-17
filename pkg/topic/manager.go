@@ -389,7 +389,7 @@ func (tm *TopicManager) ReadTopicPartition(topicName string, partitionID int, of
 	if err != nil {
 		return nil, err
 	}
-	return p.dh.ReadMessages(offset, max)
+	return p.ReadMessages(offset, max)
 }
 
 // ReadCommittedTopicPartition is the recovery-safe internal topic reader. It
