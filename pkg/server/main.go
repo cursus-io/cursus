@@ -69,6 +69,22 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	var sd clusterController.ServiceDiscovery
 	var cs *cluster.ClusterServer
 	var brokerIncarnationID string
+	var runtimeStops []func()
+	stopRuntime := func() {
+		cancelRun()
+		for i := len(runtimeStops) - 1; i >= 0; i-- {
+			runtimeStops[i]()
+		}
+		if owner, ok := sd.(interface{ StopReconciler() }); ok {
+			owner.StopReconciler()
+		}
+		if cc != nil {
+			cc.StopReplicaCatchup()
+		}
+		if rm != nil {
+			rm.StopBackgroundWork()
+		}
+	}
 	healthState := NewHealthState()
 	var startupComplete atomic.Bool
 	healthState.AddCheck("broker_startup", func(context.Context) error {
@@ -91,10 +107,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		return fmt.Errorf("start health server: %w", healthErr)
 	}
 	defer func() {
-		cancelRun()
-		if cc != nil {
-			cc.StopReplicaCatchup()
-		}
+		stopRuntime()
 		healthState.SetReady(false)
 		shutdownHTTPServer(healthServer)
 		if cs != nil {
@@ -154,9 +167,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		cc.SetReplicaCatchupProofSubmitter(func(ctx context.Context, proof fsm.ISRCatchupProof) error {
 			return clusterClient.SubmitCatchupProof(ctx, rm.GetLeaderAddress(), brokerID, incarnationID, cfg.DiscoveryPort, proof)
 		})
-		clusterClient.StartLeaderHeartbeat(ctx, rm.GetLeaderAddress, brokerID, incarnationID, cfg.DiscoveryPort)
+		runtimeStops = append(runtimeStops, clusterClient.StartLeaderHeartbeat(ctx, rm.GetLeaderAddress, brokerID, incarnationID, cfg.DiscoveryPort))
 		// ISR proof propagation remains peer based; coordinator membership does not.
-		clusterClient.StartHeartbeat(
+		runtimeStops = append(runtimeStops, clusterClient.StartHeartbeat(
 			ctx,
 			cfg.StaticClusterMembers,
 			brokerID,
@@ -169,54 +182,41 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 				}
 				return nil
 			},
-		)
+		))
 
 		// Every node should attempt to join the cluster via seeds
-		go func() {
+		runtimeStops = append(runtimeStops, startServerWorker(ctx, func(ctx context.Context) {
 			util.Info("🚀 Attempting to join cluster via seeds...")
-			// Wait a bit for Raft to initialize
-			time.Sleep(2 * time.Second)
-
-			if err := clusterClient.JoinClusterWithTransactionCoordinatorShards(cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort, cfg.TransactionCoordinatorShards); err != nil {
-				util.Warn("⚠️ Join cluster attempt failed: %v. This is normal if already part of the cluster.", err)
-			} else {
-				util.Info("✅ Successfully joined cluster")
-			}
-
-			// Register self with ClientAddr immediately after joining. A restarted
-			// process has a new incarnation, so its heartbeats are intentionally
-			// fenced until this durable registration reaches the leader.
-			go func() {
-				for i := 0; i < 15; i++ {
-					// Try direct Raft apply (works if we're the leader)
-					if err := sd.Register(); err == nil {
-						util.Info("✅ Registered with client address %s", clientAddr)
-						return
-					}
-					// Forward via RAFT_APPLY to leader
-					if cc != nil && cc.Router != nil {
-						raftCmd, err := forwardedLocalRegistrationCommand(sd, cfg)
-						if err != nil {
-							util.Error("Failed to build local registration: %v", err)
-						} else {
-							if resp, err := cc.Router.ForwardToLeader(raftCmd); err == nil && !wireprotocol.IsErrorResponse(resp) {
-								util.Info("✅ Registered via leader with client address %s", clientAddr)
-								return
-							}
-						}
-					}
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(3 * time.Second):
-					}
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
 				}
-			}()
-		}()
+				if err := clusterClient.JoinClusterContext(ctx, cfg.StaticClusterMembers, brokerID, localAddr, cfg.DiscoveryPort, cfg.TransactionCoordinatorShards); err == nil {
+					return
+				} else if ctx.Err() == nil {
+					util.Debug("cluster join pending: %v", err)
+				}
+			}
+		}))
+		runtimeStops = append(runtimeStops, startServerWorker(ctx, func(ctx context.Context) {
+			runLocalRegistration(ctx, sd, cc, cfg)
+		}))
 
-		go func() {
+		runtimeStops = append(runtimeStops, startServerWorker(ctx, func(ctx context.Context) {
 			util.Info("🔄 Starting cluster leader election monitor...")
-			for isLeader := range rm.LeaderCh() {
+			for {
+				var isLeader bool
+				select {
+				case <-ctx.Done():
+					return
+				case value, ok := <-rm.LeaderCh():
+					if !ok {
+						return
+					}
+					isLeader = value
+				}
 				if isLeader {
 					util.Info("🎉 Became cluster leader! Syncing all members with FSM.")
 					if regErr := sd.Register(); regErr != nil {
@@ -228,13 +228,13 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 					util.Info("💀 Lost cluster leadership.")
 				}
 			}
-		}()
+		}))
 
 		// Bootstrap only after every current Raft voter is durably registered.
 		// Followers register asynchronously, so a leader event alone is too early
 		// to choose the internal topic's replica set. This loop does no local
 		// mutation and becomes a no-op after the single durable TOPIC command.
-		go func() {
+		runtimeStops = append(runtimeStops, startServerWorker(ctx, func(ctx context.Context) {
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 			for {
@@ -252,7 +252,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 					}
 				}
 			}
-		}()
+		}))
 
 		util.Info("🌐 Distributed clustering enabled (brokerID=%s, localAddr=%s)", brokerID, localAddr)
 	}
@@ -263,10 +263,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		cfg.EnabledDistribution && cfg.InternalBrokerPort > 0,
 	)
 	defer func() {
-		cancelRun()
-		if cc != nil {
-			cc.StopReplicaCatchup()
-		}
+		stopRuntime()
 		// Join discovery reads before the source closes exports and storage.
 		if cs != nil {
 			_ = cs.Close()
@@ -289,6 +286,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		if err := globalCH.ConfigureConsumerMetadataRecovery(ctx, brokerIncarnationID, clusterClient); err != nil {
 			return fmt.Errorf("configure consumer metadata recovery: %w", err)
 		}
+		if err := globalCH.ConfigureReplicaBootstrapRecovery(ctx, brokerIncarnationID, clusterClient); err != nil {
+			return fmt.Errorf("configure replica bootstrap recovery: %w", err)
+		}
 	}
 	if !cfg.EnabledDistribution {
 		journalPath := filepath.Join(cfg.LogDir, "__transaction_state.journal")
@@ -306,7 +306,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	if cc != nil {
 		cc.SetLocalProcessor(globalCH)
 		cc.SetReplicaSnapshotCatchupStep(globalCH.CatchupReplicaSnapshotPage)
-		cc.StartTopologyReconciler(ctx)
+		runtimeStops = append(runtimeStops, cc.StartTopologyReconciler(ctx))
 		cc.StartReplicaCatchupVerified(ctx, clusterClient, globalCH.ApplyReplicaCatchupVerified)
 	}
 	if cfg.EnabledDistribution && cfg.InternalBrokerPort > 0 {
@@ -367,11 +367,11 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		return err
 	}
 	defer func() { _ = ln.Close() }()
-	go func() {
-		<-shutdownCtx.Done()
+	runtimeStops = append(runtimeStops, startServerWorker(ctx, func(ctx context.Context) {
+		<-ctx.Done()
 		healthState.SetReady(false)
 		_ = ln.Close()
-	}()
+	}))
 	util.Info("🧩 Broker listening on %s (TLS=%v, Compression=%v)", addr, cfg.UseTLS, cfg.CompressionType)
 
 	if cfg.EnabledDistribution {

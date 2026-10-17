@@ -47,6 +47,10 @@ type serviceDiscovery struct {
 	leaderSince     time.Time
 	bootstrapMu     sync.RWMutex
 	bootstrapSource BootstrapTransferSource
+	reconcileMu     sync.Mutex
+	reconcileCancel context.CancelFunc
+	reconcileDone   chan struct{}
+	reconcileClosed bool
 }
 
 func NewServiceDiscoveryImpl(rm RaftManager, brokerID, addr, clientAddr string) *serviceDiscovery {
@@ -329,8 +333,18 @@ func (sd *serviceDiscovery) RemoveNode(nodeID string) (string, error) {
 }
 
 func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
+	sd.reconcileMu.Lock()
+	if sd.reconcileClosed || sd.reconcileDone != nil {
+		sd.reconcileMu.Unlock()
+		return
+	}
+	ctx, sd.reconcileCancel = context.WithCancel(ctx)
+	done := make(chan struct{})
+	sd.reconcileDone = done
+	sd.reconcileMu.Unlock()
 	ticker := time.NewTicker(time.Second)
 	go func() {
+		defer close(done)
 		defer ticker.Stop()
 		util.Debug("reconciler started for broker %s", sd.brokerID)
 
@@ -348,6 +362,19 @@ func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (sd *serviceDiscovery) StopReconciler() {
+	sd.reconcileMu.Lock()
+	sd.reconcileClosed = true
+	if sd.reconcileCancel != nil {
+		sd.reconcileCancel()
+	}
+	done := sd.reconcileDone
+	sd.reconcileMu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 // ensureClientAddrs re-registers self if ClientAddr is missing in FSM.

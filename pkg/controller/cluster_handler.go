@@ -371,13 +371,19 @@ func (ch *CommandHandler) StartGroupRecoveryMonitor(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, finish, err := ch.beginMonitor(ctx, "consumer-recovery")
+	if err != nil {
+		return err
+	}
 	// Reconcile synchronously before the public listener starts. The ownership
 	// baseline is captured before startup replay, so an ownership change during
 	// that replay cannot be mistaken for already recovered state.
 	if err := ch.refreshLocalGroupRecoveryContext(ctx); err != nil {
+		finish()
 		return err
 	}
 	go func() {
+		defer finish()
 		ticker := time.NewTicker(groupRecoveryMonitorInterval)
 		defer ticker.Stop()
 		lastFailure := ""

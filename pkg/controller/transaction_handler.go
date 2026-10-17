@@ -797,6 +797,10 @@ func (ch *CommandHandler) abortTimedOutTransactionsBatch(shards []int, now time.
 }
 
 func (ch *CommandHandler) StartTransactionTimeoutMonitor(ctx context.Context) {
+	ctx, finish, err := ch.beginMonitor(ctx, "transaction-timeout")
+	if err != nil {
+		return
+	}
 	interval := transactionTimeout(ch.Config) / 4
 	if interval < time.Second {
 		interval = time.Second
@@ -829,6 +833,7 @@ func (ch *CommandHandler) StartTransactionTimeoutMonitor(ctx context.Context) {
 		}
 	}
 	go func() {
+		defer finish()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {

@@ -33,6 +33,7 @@ type ISRManager struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	startOnce sync.Once
+	done      chan struct{}
 }
 
 // NewISRManager creates a new ISRManager. The provided ctx controls the lifetime
@@ -57,17 +58,22 @@ func NewISRManager(ctx context.Context, fsm *fsm.BrokerFSM, brokerID string, hea
 		heartbeatTimeout: heartbeatTimeout,
 		ctx:              childCtx,
 		cancel:           cancel,
+		done:             make(chan struct{}),
 	}
 }
 
 func (i *ISRManager) Start() {
 	i.startOnce.Do(func() {
 		go func() {
+			defer close(i.done)
 			// Check ISR and Heartbeats more frequently
 			ticker := time.NewTicker(1 * time.Second)
 			defer ticker.Stop()
 
 			for {
+				if i.ctx.Err() != nil {
+					return
+				}
 				select {
 				case <-ticker.C:
 					i.UpdateHeartbeat(i.brokerID)
@@ -81,11 +87,13 @@ func (i *ISRManager) Start() {
 	})
 }
 
-// Stop cancels the ISR manager's context, shutting down the background goroutine.
+// Stop cancels and joins the ISR owner, including when it has not started yet.
 func (i *ISRManager) Stop() {
 	if i.cancel != nil {
 		i.cancel()
 	}
+	i.startOnce.Do(func() { close(i.done) })
+	<-i.done
 }
 
 func (i *ISRManager) refreshAllISRs() {
