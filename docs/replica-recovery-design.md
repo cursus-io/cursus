@@ -430,8 +430,34 @@ verification and full derived-state rebuilds may still read retained history.
 `sum by (stage, outcome) (increase(cursus_recovery_attempts_total[5m]))` separates
 successful calls, failures and cancellations without exposing error identities.
 
+`catchup_rpc` counts incremental response JSON bytes before decoding, including
+rejected payloads; `replica_rpc` counts bootstrap chunk payloads. These units
+exclude framing and are distinct from decoded application payload size.
+`bootstrap_install` counts completed installation/resume attempts.
+
+Run with `--log-level=debug` to inspect `replica_recovery` turn events: protocol,
+source, leader/lifecycle epochs, start/current/target offsets, remaining lag,
+exchange count, elapsed milliseconds and quoted failure reason. Phases distinguish
+incremental work, repaired divergence, bootstrap selection, snapshot replay,
+prefix verification and proof submission. Proof submission is not an assertion
+that the leader already admitted ISR. Bootstrap installation start and completion
+are logged at info level, including local resume and failures. A stale-fence or
+connection error requires a new attempt; checksum/catalog/safety failures keep
+readiness closed and require investigation rather than an operator offset reset.
+
 Validate convergence with full ISR held for at least twice the ISR heartbeat
 expiry interval while committing consumer offsets. Preserve separate evidence
 for mixed binaries, retention bootstrap, interrupted installation, stale fences,
 transaction decisions and unrelated partitions; one healthy restart test does
 not establish all of those conditions.
+
+The retained recovery acceptance suite runs with Docker and
+`RUN_E2E_RETAINED_BOOTSTRAP=1 go test -v -count=1 -timeout 30m ./test/e2e-cluster -run 'Test(RetainedBootstrap|IndexedRecoveryBoundsLargeLegacyTailOnThreeNodes)'`.
+It verifies retained bootstrap, missing/damaged lineage rebuild and a later
+restart, a 10,000-record divergent legacy tail, delayed old-leader responses,
+and process exits after durable truncation, bootstrap replacement and incremental
+append. Each recovery requires stable full ISR and compares committed records;
+the bootstrap cases also retain transaction decisions and unrelated group offsets.
+Process-exit hooks and the offline tail fixture exist only in the dedicated
+`e2e_faults` image. The fixture changes only a stopped test broker's uncommitted
+tail, and is not an operator recovery command.

@@ -159,7 +159,16 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 	return cc.catchupReplicaTurn(turnCtx, fetcher, apply, request)
 }
 
-func (cc *ClusterController) catchupReplicaTurn(ctx context.Context, fetcher ReplicaCatchupFetcher, apply VerifiedReplicaCatchupApplier, request fsm.ReplicaCatchupRequest) error {
+func (cc *ClusterController) catchupReplicaTurn(ctx context.Context, fetcher ReplicaCatchupFetcher, apply VerifiedReplicaCatchupApplier, request fsm.ReplicaCatchupRequest) (result error) {
+	started, start := time.Now(), request.NextOffset
+	phase, exchanges := "incremental", 0
+	defer func() {
+		var lag uint64
+		if request.CommittedHWM > request.NextOffset {
+			lag = request.CommittedHWM - request.NextOffset
+		}
+		util.Debug("replica_recovery phase=%s protocol=%d topic=%q partition=%d source=%q leader_epoch=%d lifecycle=%d start=%d current=%d target=%d remaining=%d exchanges=%d elapsed_ms=%d error=%q", phase, request.RecoveryProtocol, request.Topic, request.Partition, request.SourceBroker, request.LeaderEpoch, request.LifecycleEpoch, start, request.NextOffset, request.CommittedHWM, lag, exchanges, time.Since(started).Milliseconds(), fmt.Sprint(result))
+	}()
 	discoveryPort := 0
 	if cc.Config != nil {
 		discoveryPort = cc.Config.DiscoveryPort
@@ -170,12 +179,14 @@ func (cc *ClusterController) catchupReplicaTurn(ctx context.Context, fetcher Rep
 		}
 		fetchCtx, cancel := context.WithTimeout(ctx, replicaCatchupFetchTimeout)
 		batch, err := fetcher.FetchReplicaCatchup(fetchCtx, request.SourceAddress, discoveryPort, request)
+		exchanges++
 		cancel()
 		if err != nil {
 			return err
 		}
 		if err := validateReplicaCatchupBatch(request, batch); err != nil {
 			if errors.Is(err, fsm.ErrReplicaBootstrapRequired) && cc.replicaBootstrap != nil {
+				phase = "bootstrap_required"
 				return cc.replicaBootstrap.RecoverReplicaBootstrap(ctx, request, batch)
 			}
 			return err
@@ -186,6 +197,8 @@ func (cc *ClusterController) catchupReplicaTurn(ctx context.Context, fetcher Rep
 		}
 
 		if batch.TruncateTo != nil {
+			phase = "divergence_repaired"
+			request.NextOffset = *batch.TruncateTo
 			return nil
 		}
 		// The committed HWM may advance while a live partition is being
@@ -216,6 +229,7 @@ func (cc *ClusterController) catchupReplicaTurn(ctx context.Context, fetcher Rep
 			return fmt.Errorf("actual receiver verification witness is required")
 		}
 		if request.SnapshotCatchup {
+			phase = "snapshot_replay"
 			if cc.snapshotStep != nil {
 				if cc.snapshotPending == nil {
 					cc.snapshotPending = make(map[fsm.ReplicaCatchupCandidate]*replicaSnapshotContinuation)
@@ -243,6 +257,7 @@ func (cc *ClusterController) catchupReplicaTurn(ctx context.Context, fetcher Rep
 			continue
 		}
 		if cc.proofSubmitter == nil {
+			phase = "prefix_verified"
 			return nil
 		}
 		var proof fsm.ISRCatchupProof
@@ -284,6 +299,7 @@ func (cc *ClusterController) catchupReplicaTurn(ctx context.Context, fetcher Rep
 			request = refreshed
 			continue
 		}
+		phase = "proof_submitted"
 		return nil
 	}
 	return nil

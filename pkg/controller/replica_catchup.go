@@ -46,6 +46,9 @@ func (ch *CommandHandler) applyReplicaCatchupRequest(ctx context.Context, reques
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := injectedReplicaResponseDelay(ctx, batch.Topic); err != nil {
+		return err
+	}
 	if batch.TruncateTo != nil && batch.Topic == config.ConsumerOffsetsTopicName {
 		if ch.Coordinator == nil {
 			return fmt.Errorf("consumer log repair coordinator unavailable")
@@ -285,6 +288,7 @@ func (ch *CommandHandler) applyReplicaCatchup(ctx context.Context, request *repl
 	} else if err := partition.ReplicaAppendWithMode(batch.Messages, true); err != nil {
 		return err
 	}
+	injectedReplicaCatchupCrash(batch.Topic, batch.Partition)
 	if endOffset != batch.CommittedHWM {
 		return nil
 	}

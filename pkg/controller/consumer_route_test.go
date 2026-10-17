@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
@@ -13,6 +14,37 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/stretchr/testify/require"
 )
+
+func TestConsumerRouteRejectsMalformedInternalAuthority(t *testing.T) {
+	state := fsm.NewBrokerFSM(nil, nil)
+	registerRoutingBroker(t, state, "node-1")
+	installRoutingOffsetsTopology(t, state, "node-1")
+	h := newCoordinatorRoutingHandler("node-1", state, nil)
+	t.Cleanup(func() { require.NoError(t, h.Close()) })
+	encode := func(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
+	for _, tc := range []struct{ name, encoded, want string }{
+		{"invalid base64", "!", "decode consumer metadata route"},
+		{"incomplete JSON", encode(`{"owner":`), "decode consumer metadata route"},
+		{"unknown field", encode(`{"unrecognized_authority":true}`), "decode consumer metadata route"},
+		{"trailing object", encode(`{} {}`), "trailing consumer metadata route data"},
+		{"trailing garbage", encode(`{} x`), "trailing consumer metadata route data"},
+		{"oversized", strings.Repeat("a", 16385), "requires internal offsets publish"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			route, err := h.parseConsumerRoute(tc.encoded, config.ConsumerOffsetsTopicName, 0, NewInternalClientContext("", 0))
+			require.ErrorContains(t, err, tc.want)
+			require.Nil(t, route)
+		})
+	}
+	route, err := h.parseConsumerRoute("", "ordinary", 0, nil)
+	require.NoError(t, err)
+	require.Nil(t, route)
+	_, err = h.parseConsumerRoute(encode(`{}`), config.ConsumerOffsetsTopicName, 0, nil)
+	require.ErrorContains(t, err, "requires internal offsets publish")
+	standalone := &CommandHandler{}
+	_, err = standalone.parseConsumerRoute(encode(`{}`), config.ConsumerOffsetsTopicName, 0, NewInternalClientContext("", 0))
+	require.ErrorContains(t, err, "requires distributed metadata")
+}
 
 func TestConsumerRoutePreservedAcrossForwardingAndFencesRestamp(t *testing.T) {
 	state := fsm.NewBrokerFSM(nil, nil)

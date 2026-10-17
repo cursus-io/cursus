@@ -195,6 +195,7 @@ func (d *DiskHandler) truncateTo(ctx context.Context, nextOffset uint64, token *
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close target segment %d: %w", targetBase, err)
 	}
+	truncateProcessCrashFault(d.BaseName)
 
 	d.segments = kept
 	d.CurrentSegment = targetBase

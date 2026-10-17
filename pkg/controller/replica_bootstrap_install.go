@@ -14,6 +14,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/util"
 )
 
 // Delivery retries retain the exact fingerprint and original minimum end until
@@ -142,7 +143,13 @@ func (r *replicaBootstrapRecovery) receive(ctx context.Context, a *replicaBootst
 	})
 }
 
-func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partition, manifest disk.BootstrapMetadata, receiver *disk.BootstrapReceiver, ticket *fsm.ReplicaBootstrapReceiverTicket, fenced func(bool)) error {
+func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partition, manifest disk.BootstrapMetadata, receiver *disk.BootstrapReceiver, ticket *fsm.ReplicaBootstrapReceiverTicket, fenced func(bool)) (result error) {
+	started := time.Now()
+	util.Info("replica_recovery phase=bootstrap_install topic=%q partition=%d start=%d end=%d resume=%t", manifest.Fence.Topic, manifest.Fence.Partition, manifest.StartOffset, manifest.EndOffset, receiver == nil)
+	defer func() {
+		metrics.RecordRecoveryAttempt(metrics.RecoveryBootstrapInstall, result)
+		util.Info("replica_recovery phase=bootstrap_install_finished topic=%q partition=%d start=%d end=%d elapsed_ms=%d error=%q", manifest.Fence.Topic, manifest.Fence.Partition, manifest.StartOffset, manifest.EndOffset, time.Since(started).Milliseconds(), fmt.Sprint(result))
+	}()
 	ch := r.ch
 	eventSourcing := false
 	if fenced != nil {

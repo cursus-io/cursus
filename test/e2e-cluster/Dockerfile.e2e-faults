@@ -6,6 +6,7 @@ RUN go mod download
 COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build -tags=e2e_faults -a -installsuffix cgo -ldflags="-s -w" -o /app/broker ./cmd/broker
+RUN CGO_ENABLED=0 GOOS=linux go build -tags=e2e_faults -ldflags="-s -w" -o /app/recovery-fixture ./test/e2e-cluster/fixture
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o /app/cli ./cmd/cli
 
 FROM alpine:3.20
@@ -19,6 +20,7 @@ RUN apk add --no-cache bash curl \
 
 WORKDIR /app
 COPY --from=builder --chown=cursus:cursus /app/broker /app/broker
+COPY --from=builder --chown=cursus:cursus /app/recovery-fixture /app/recovery-fixture
 COPY --from=builder --chown=cursus:cursus /app/cli /app/cli
 COPY --chown=cursus:cursus entrypoint.sh /app/entrypoint.sh
 

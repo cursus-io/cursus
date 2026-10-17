@@ -542,6 +542,7 @@ func replayBootstrapTransaction(base string, tx bootstrapTransaction) error {
 				return err
 			}
 		}
+		bootstrapProcessCrashFault(base)
 	}
 	for _, name := range tx.Delete {
 		path, err := bootstrapSafePath(base, name)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/wire"
 )
 
@@ -179,7 +180,8 @@ func (c *TCPClusterClient) FetchReplicaCatchup(
 	leaderAddr string,
 	discoveryPort int,
 	request fsm.ReplicaCatchupRequest,
-) (fsm.ReplicaCatchupBatch, error) {
+) (result fsm.ReplicaCatchupBatch, resultErr error) {
+	defer func() { metrics.RecordRecoveryAttempt(metrics.RecoveryCatchupRPC, resultErr) }()
 	data, err := json.Marshal(request)
 	if err != nil {
 		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("marshal replica catch-up request: %w", err)
@@ -187,6 +189,7 @@ func (c *TCPClusterClient) FetchReplicaCatchup(
 	response, err := c.sendRequest(ctx, heartbeatTarget(leaderAddr, discoveryPort), wire.CommandReplicaCatchup, map[string]string{
 		"request": string(data),
 	})
+	metrics.RecordRecoveryBytes(metrics.RecoveryCatchupRPC, metrics.RecoveryTransferBytes, int64(len(response)))
 	if err != nil {
 		return fsm.ReplicaCatchupBatch{}, err
 	}

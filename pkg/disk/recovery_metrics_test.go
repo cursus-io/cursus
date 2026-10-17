@@ -4,12 +4,22 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRecoveryMetricsIncludeRejectedInstallationChecksum(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checkpoint")
+	data := []byte("durable data")
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	before := recoveryMetric(t, "checksum", "hash_bytes")
+	require.ErrorContains(t, validateCompactedRangeFile(path, int64(len(data)), "wrong"), "checksum")
+	require.Equal(t, float64(len(data)), recoveryMetric(t, "checksum", "hash_bytes")-before)
+}
 
 func TestRecoveryMetricsRetainCanceledLineageWork(t *testing.T) {
 	d, _ := newLineageHandler(t)
