@@ -65,7 +65,18 @@ func (ch *CommandHandler) handleAppendStreamLocked(cmd string) string {
 			LeaderAppend: true,
 			LeaderEpoch:  int64(replicationSnapshot.LeaderEpoch),
 			AfterCommit: func(topic string, partition int, hwm uint64) error {
-				return ch.commitPartitionHWMAtEpoch(topic, partition, hwm, replicationSnapshot.Leader, replicationSnapshot.LeaderEpoch, replicationSnapshot.LifecycleEpoch)
+				// A forwarded Raft success may precede local FSM application. Keep
+				// ownership until both metadata and the local HWM reflect this append.
+				_, err := (clusterPartitionReplicationExecutor{handler: ch}).Commit(partitionReplicationTask{
+					topic: topic, partition: partition, commitHWM: hwm,
+					snapshot: replicationSnapshot, partitionRef: p,
+				})
+				if err != nil {
+					// A failed reply can still refer to an accepted Raft entry. The
+					// next writer must not truncate this tail using stale metadata.
+					p.MarkReconciliationPending(fmt.Errorf("stream commit outcome requires reconciliation: %w", err))
+				}
+				return err
 			},
 			AfterAppend: func(topic string, partition int, msg types.Message) error {
 				msgCmd := types.MessageCommand{
@@ -76,7 +87,13 @@ func (ch *CommandHandler) handleAppendStreamLocked(cmd string) string {
 					Acks:           "all",
 					SequenceScope:  "partition",
 				}
-				return ch.Cluster.ReplicateToFollowers(topic, partition, msgCmd, effectiveMinISR)
+				if err := ch.Cluster.ReplicateToFollowers(topic, partition, msgCmd, effectiveMinISR); err != nil {
+					// Some replicas may already have persisted the assigned offset.
+					// Preserve it until fenced recovery establishes a common history.
+					p.MarkReconciliationPending(fmt.Errorf("stream replication outcome requires reconciliation: %w", err))
+					return err
+				}
+				return nil
 			},
 		})
 		if errResp != "" {
