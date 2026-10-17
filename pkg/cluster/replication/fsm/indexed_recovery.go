@@ -46,6 +46,9 @@ func addReplicaRecoveryChallenge(partition *topic.Partition, request *ReplicaCat
 }
 
 func validateReplicaRecoveryRequest(request ReplicaCatchupRequest, source, receiver BrokerInfo, meta PartitionMetadata) error {
+	if request.RecoveryProtocol != BootstrapRecoveryProtocolVersion && request.RetainedPrefix != nil {
+		return fmt.Errorf("unexpected retained prefix in recovery request")
+	}
 	switch request.RecoveryProtocol {
 	case 0:
 		if len(request.PrefixCandidates) != 0 {
@@ -76,6 +79,17 @@ func validateReplicaRecoveryRequest(request ReplicaCatchupRequest, source, recei
 			return fmt.Errorf("indexed recovery exact-tail proof is missing")
 		}
 		return nil
+	case BootstrapRecoveryProtocolVersion:
+		if source.RecoveryProtocol < BootstrapRecoveryProtocolVersion || receiver.RecoveryProtocol < BootstrapRecoveryProtocolVersion {
+			return fmt.Errorf("retained recovery capability is not mutual")
+		}
+		if containsString(meta.ISR, request.BrokerID) {
+			return fmt.Errorf("retained recovery receiver must be outside ISR")
+		}
+		if len(request.PrefixCandidates) != 0 || request.PreviousRecordDigest != "" || request.PreviousLeaderEpoch != 0 || !validRetainedPrefix(request.RetainedPrefix) || request.RetainedPrefix.End != request.NextOffset {
+			return fmt.Errorf("invalid retained recovery challenge")
+		}
+		return nil
 	default:
 		return fmt.Errorf("%w: recovery protocol %d", ErrUnsupportedRecoveryProtocol, request.RecoveryProtocol)
 	}
@@ -97,6 +111,9 @@ func (f *BrokerFSM) replicaRecoveryPartition(name string, id int) (*topic.Partit
 
 // ValidateReplicaRecoveryMode checks additive fields before any local mutation.
 func ValidateReplicaRecoveryMode(batch ReplicaCatchupBatch) error {
+	if batch.RecoveryProtocol != BootstrapRecoveryProtocolVersion && (batch.RetainedPrefix != nil || batch.MatchedRetainedPrefix != nil) {
+		return fmt.Errorf("unexpected retained fields in recovery response")
+	}
 	switch batch.RecoveryProtocol {
 	case 0:
 		if batch.MatchedPrefix != nil || batch.BootstrapRequired {
@@ -130,6 +147,22 @@ func ValidateReplicaRecoveryMode(batch ReplicaCatchupBatch) error {
 		if batch.TruncateTo == nil && endOffset == batch.CommittedHWM && !batch.Verified {
 			return fmt.Errorf("replica catch-up completed without prefix verification")
 		}
+	case BootstrapRecoveryProtocolVersion:
+		if batch.MatchedPrefix != nil || batch.TruncateTo != nil || !validRetainedPrefix(batch.RetainedPrefix) || batch.RetainedPrefix.End != batch.StartOffset {
+			return fmt.Errorf("invalid retained recovery response")
+		}
+		if batch.BootstrapRequired {
+			if batch.MatchedRetainedPrefix != nil || len(batch.Messages) != 0 || batch.Verified || batch.Compacted || batch.EndOffset != batch.StartOffset {
+				return fmt.Errorf("invalid retained bootstrap-required response")
+			}
+			return ErrReplicaBootstrapRequired
+		}
+		if !validRetainedPrefix(batch.MatchedRetainedPrefix) || *batch.MatchedRetainedPrefix != *batch.RetainedPrefix || batch.StartOffset > batch.CommittedHWM {
+			return fmt.Errorf("retained recovery match differs from challenge")
+		}
+		if batch.Verified != (batch.EndOffset == batch.CommittedHWM) {
+			return fmt.Errorf("retained recovery verification does not match committed boundary")
+		}
 	default:
 		return fmt.Errorf("%w: recovery protocol %d", ErrUnsupportedRecoveryProtocol, batch.RecoveryProtocol)
 	}
@@ -158,6 +191,9 @@ func (f *BrokerFSM) WithReplicaRecoveryFence(batch ReplicaCatchupBatch, apply fu
 	}
 	if valid && batch.RecoveryProtocol == IndexedRecoveryProtocolVersion {
 		valid = !containsString(meta.ISR, batch.BrokerID) && source.RecoveryProtocol >= IndexedRecoveryProtocolVersion && receiver.RecoveryProtocol >= IndexedRecoveryProtocolVersion
+	}
+	if valid && batch.RecoveryProtocol == BootstrapRecoveryProtocolVersion {
+		valid = source.RecoveryProtocol >= BootstrapRecoveryProtocolVersion && receiver.RecoveryProtocol >= BootstrapRecoveryProtocolVersion
 	}
 	f.mu.RUnlock()
 	if !valid {

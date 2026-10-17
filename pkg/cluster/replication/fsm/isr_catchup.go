@@ -44,6 +44,7 @@ type ReplicaCatchupRequest struct {
 	SnapshotCatchup      bool                         `json:"-"`
 	RecoveryProtocol     int                          `json:"recovery_protocol,omitempty"`
 	PrefixCandidates     []disk.LineagePrefix         `json:"prefix_candidates,omitempty"`
+	RetainedPrefix       *disk.RetainedPrefix         `json:"retained_prefix,omitempty"`
 }
 
 // ReplicaCatchupBatch carries a committed logical range under the same
@@ -68,6 +69,9 @@ type ReplicaCatchupBatch struct {
 	RecoveryProtocol  int                 `json:"recovery_protocol,omitempty"`
 	MatchedPrefix     *disk.LineagePrefix `json:"matched_prefix,omitempty"`
 	BootstrapRequired bool                `json:"bootstrap_required,omitempty"`
+	// RetainedPrefix echoes the exact challenge even when bootstrap is required.
+	RetainedPrefix        *disk.RetainedPrefix `json:"retained_prefix,omitempty"`
+	MatchedRetainedPrefix *disk.RetainedPrefix `json:"matched_retained_prefix,omitempty"`
 }
 
 // SealReplicaCatchupBatch binds the logical range, fences, source, and decoded
@@ -116,8 +120,12 @@ func AdvanceReplicaCatchupRequest(request *ReplicaCatchupRequest, batch ReplicaC
 	request.NextOffset = endOffset
 	// Cumulative proofs must be regenerated from durable storage after applying.
 	request.PrefixCandidates = nil
+	request.RetainedPrefix = nil
 	request.PreviousLeaderEpoch = 0
 	request.PreviousRecordDigest = ""
+	if request.RecoveryProtocol == BootstrapRecoveryProtocolVersion {
+		return nil
+	}
 	if len(batch.Messages) == 0 {
 		return nil
 	}
@@ -559,11 +567,15 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 	return f.FetchReplicaCatchupContext(context.Background(), request)
 }
 
-// FetchReplicaCatchupContext fences metadata and partition replacement through
-// proof, raw page reads and sealing. f.mu is released before disk maintenance.
+// FetchReplicaCatchupContext uses short prepare/publication fences for mutually
+// capable retained sources. Older modes retain their original fence lifetime.
+// f.mu is always released before disk maintenance.
 func (f *BrokerFSM) FetchReplicaCatchupContext(ctx context.Context, request ReplicaCatchupRequest) (ReplicaCatchupBatch, error) {
 	if ctx == nil {
 		return ReplicaCatchupBatch{}, fmt.Errorf("catch-up requires context")
+	}
+	if request.RecoveryProtocol == BootstrapRecoveryProtocolVersion || f.retainedSourceAvailable(request) {
+		return f.fetchRetainedRecovery(ctx, request)
 	}
 	unlock, err := lockSourceContext(ctx, &f.transitionMu, &f.materializationMu)
 	if err != nil {

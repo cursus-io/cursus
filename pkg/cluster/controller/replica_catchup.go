@@ -232,10 +232,15 @@ func validateReplicaCatchupBatch(request fsm.ReplicaCatchupRequest, batch fsm.Re
 	if batch.CommittedHWM < request.CommittedHWM || batch.StartOffset != request.NextOffset {
 		return fmt.Errorf("replica catch-up response boundary mismatch")
 	}
+	if batch.RecoveryProtocol == fsm.BootstrapRecoveryProtocolVersion {
+		if request.RetainedPrefix == nil || batch.RetainedPrefix == nil || *request.RetainedPrefix != *batch.RetainedPrefix {
+			return fmt.Errorf("retained recovery response challenge mismatch")
+		}
+	}
 	if err := fsm.ValidateReplicaRecoveryMode(batch); err != nil {
 		return err
 	}
-	if batch.RecoveryProtocol != 0 {
+	if batch.RecoveryProtocol == fsm.IndexedRecoveryProtocolVersion {
 		found := false
 		for _, candidate := range request.PrefixCandidates {
 			if candidate == *batch.MatchedPrefix {
