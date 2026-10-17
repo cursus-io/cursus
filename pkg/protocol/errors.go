@@ -71,6 +71,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"snapshot_catalog_revision_changed", "transaction_offset_materialization_failed", "transaction_offset_prepare_failed", "unstable_offset_commit",
 	)
 	register(ErrorClassFencing, false,
+		"consumer_route_fenced",
 		"snapshot_lifecycle_changed",
 		"GEN_MISMATCH", "NOT_OWNER", "PARTITION_LEADER_FENCED", "STALE_LEADER_EPOCH", "STALE_TOPIC_LIFECYCLE_EPOCH", "member_not_found",
 		"group_epoch_mismatch", "missing_topic_lifecycle_epoch", "producer_fenced", "stale_producer_epoch",

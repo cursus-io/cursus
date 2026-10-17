@@ -2,13 +2,12 @@ package fsm
 
 import (
 	"context"
-	"sync"
-	"time"
+	"github.com/cursus-io/cursus/util/contextlock"
 )
 
-// Wait in the established transition -> materialization order without leaving a
-// background goroutine holding fences after the request has expired.
-func lockSourceContext(ctx context.Context, locks ...*sync.Mutex) (func(), error) {
+// Acquire in transition -> materialization order. Cancellation removes queued
+// waiters and releases earlier gates without leaving background lock owners.
+func lockSourceContext(ctx context.Context, locks ...*contextlock.RWMutex) (func(), error) {
 	acquired := 0
 	unlock := func() {
 		for acquired > 0 {
@@ -16,30 +15,12 @@ func lockSourceContext(ctx context.Context, locks ...*sync.Mutex) (func(), error
 			locks[acquired].Unlock()
 		}
 	}
-	var ticker *time.Ticker
-	defer func() {
-		if ticker != nil {
-			ticker.Stop()
-		}
-	}()
-	for acquired < len(locks) {
-		if err := ctx.Err(); err != nil {
+	for _, lock := range locks {
+		if err := lock.LockContext(ctx); err != nil {
 			unlock()
 			return nil, err
 		}
-		if locks[acquired].TryLock() {
-			acquired++
-			continue
-		}
-		if ticker == nil {
-			ticker = time.NewTicker(time.Millisecond)
-		}
-		select {
-		case <-ctx.Done():
-			unlock()
-			return nil, ctx.Err()
-		case <-ticker.C:
-		}
+		acquired++
 	}
 	return unlock, nil
 }

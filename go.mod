@@ -11,7 +11,10 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require go.yaml.in/yaml/v3 v3.0.5 // indirect
+require (
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	golang.org/x/sync v0.22.0
+)
 
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect

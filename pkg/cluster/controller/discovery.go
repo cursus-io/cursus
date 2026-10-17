@@ -42,11 +42,16 @@ type serviceDiscovery struct {
 	incarnationID    string
 	heartbeatTimeout time.Duration
 
-	livenessMu      sync.RWMutex
-	lastSeen        map[string]time.Time
-	leaderSince     time.Time
-	bootstrapMu     sync.RWMutex
-	bootstrapSource BootstrapTransferSource
+	livenessMu       sync.RWMutex
+	lastSeen         map[string]time.Time
+	leaderSince      time.Time
+	bootstrapMu      sync.RWMutex
+	bootstrapSource  BootstrapTransferSource
+	recoveryProtocol int
+	reconcileMu      sync.Mutex
+	reconcileCancel  context.CancelFunc
+	reconcileDone    chan struct{}
+	reconcileClosed  bool
 }
 
 func NewServiceDiscoveryImpl(rm RaftManager, brokerID, addr, clientAddr string) *serviceDiscovery {
@@ -74,9 +79,11 @@ func NewServiceDiscovery(rm RaftManager, brokerID, addr, clientAddr string) Serv
 }
 
 // LocalRegistrationPayload is the sole owner of local advertised capabilities.
-// Indexed protocol 1 is implemented, but retained-range bootstrap is incomplete.
-// Keep production advertisement at zero until the complete recovery bundle exists.
+// Capability remains zero until the installed runtime is explicitly activated.
 func (sd *serviceDiscovery) LocalRegistrationPayload() ([]byte, error) {
+	sd.bootstrapMu.RLock()
+	version := sd.recoveryProtocol
+	sd.bootstrapMu.RUnlock()
 	broker := &fsm.BrokerInfo{
 		ID:                           sd.brokerID,
 		Addr:                         sd.addr,
@@ -86,7 +93,7 @@ func (sd *serviceDiscovery) LocalRegistrationPayload() ([]byte, error) {
 		IncarnationID:                sd.incarnationID,
 		TransactionCoordinatorShards: sd.transactionCoordinatorShardCount(),
 		LifecycleProtocol:            fsm.BrokerProtocolVersionCurrent,
-		RecoveryProtocol:             0,
+		RecoveryProtocol:             version,
 	}
 	return json.Marshal(broker)
 }
@@ -238,6 +245,12 @@ func (sd *serviceDiscovery) FetchReplicaCatchupContext(ctx context.Context, requ
 	if sourceBroker != sd.brokerID {
 		return fsm.ReplicaCatchupBatch{}, fmt.Errorf("broker %s is not selected catch-up source %s", sd.brokerID, sourceBroker)
 	}
+	if request.RecoveryProtocol > 0 {
+		local := sd.fsm.GetBroker(sd.brokerID)
+		if local == nil || local.Status != "active" || local.IncarnationID != sd.incarnationID || local.IncarnationEpoch == 0 || local.RecoveryProtocol < request.RecoveryProtocol {
+			return fsm.ReplicaCatchupBatch{}, fmt.Errorf("catch-up source process registration is not current")
+		}
+	}
 	return sd.fsm.FetchReplicaCatchupContext(ctx, request)
 }
 
@@ -246,6 +259,10 @@ func (sd *serviceDiscovery) AddNode(nodeID string, addr string) (string, error) 
 }
 
 func (sd *serviceDiscovery) AddNodeWithTransactionCoordinatorShards(nodeID string, addr string, shardCount int) (string, error) {
+	return sd.AddNodeWithRegistration(nodeID, addr, shardCount, nil)
+}
+
+func (sd *serviceDiscovery) AddNodeWithRegistration(nodeID string, addr string, shardCount int, registration *fsm.BrokerInfo) (string, error) {
 	leaderAddr := sd.rm.GetLeaderAddress()
 	if !sd.rm.IsLeader() {
 		return leaderAddr, fmt.Errorf("not leader; contact leader at %s", leaderAddr)
@@ -271,34 +288,48 @@ func (sd *serviceDiscovery) AddNodeWithTransactionCoordinatorShards(nodeID strin
 		return leaderAddr, nil
 	}
 
-	if err := sd.rm.AddVoter(nodeID, addr); err != nil {
-		util.Error("Failed to add Raft voter: %v", err)
-		return leaderAddr, err
+	if registration == nil || registration.ID != nodeID || registration.Addr != addr || registration.Status != "active" ||
+		registration.IncarnationID == "" || registration.RecoveryProtocol != fsm.BootstrapRecoveryProtocolVersion ||
+		registration.LifecycleProtocol != fsm.BrokerProtocolVersionCurrent || registration.TransactionCoordinatorShards != shardCount {
+		return leaderAddr, fmt.Errorf("new voter requires current process registration and installed recovery runtime")
 	}
-
-	broker := &fsm.BrokerInfo{
-		ID:                           nodeID,
-		Addr:                         addr,
-		Status:                       "active",
-		LastSeen:                     time.Now(),
-		TransactionCoordinatorShards: shardCount,
+	membership, ok := sd.rm.(interface {
+		AddVoterAtIndex(string, string, uint64) error
+	})
+	if !ok {
+		return leaderAddr, fmt.Errorf("conditional voter admission unavailable")
 	}
-
-	data, err := json.Marshal(broker)
-	if err != nil {
-		util.Error("Marshal failed after AddVoter. Node added to Raft but not to FSM: id=%s err=%v", nodeID, err)
-		return leaderAddr, fmt.Errorf("marshal failed after AddVoter: %w", err)
-	}
-
-	if err := sd.rm.ApplyCommand("REGISTER", data); err != nil {
-		util.Error("REGISTER command failed after AddVoter. Attempting rollback: id=%s err=%v", nodeID, err)
-		if rollbackErr := sd.rm.RemoveServer(nodeID); rollbackErr != nil {
-			util.Error("CRITICAL: Rollback RemoveServer failed after REGISTER failure: id=%s err=%v", nodeID, rollbackErr)
-			return leaderAddr, fmt.Errorf("REGISTER failed and rollback failed: %v (rollback error: %v)", err, rollbackErr)
-		} else {
-			util.Info("Successfully rolled back AddVoter for node %s", nodeID)
+	configurationIndex := future.Index()
+	if configurationIndex == 0 {
+		provider, available := sd.rm.(interface {
+			VoterAdmissionIndex(raft.Configuration) (uint64, error)
+		})
+		if !available {
+			return leaderAddr, fmt.Errorf("conditional voter admission index unavailable")
 		}
-		return leaderAddr, fmt.Errorf("REGISTER command failed (rolled back): %w", err)
+		var err error
+		configurationIndex, err = provider.VoterAdmissionIndex(future.Configuration())
+		if err != nil {
+			return leaderAddr, err
+		}
+	}
+	if configurationIndex == 0 {
+		return leaderAddr, fmt.Errorf("conditional voter admission index is zero")
+	}
+	broker := *registration
+	broker.IncarnationEpoch = 0 // Only REGISTER assigns the durable process epoch.
+	broker.LastSeen = time.Now()
+	data, err := json.Marshal(&broker)
+	if err != nil {
+		return leaderAddr, fmt.Errorf("marshal voter registration: %w", err)
+	}
+	if err := sd.rm.ApplyCommand("REGISTER", data); err != nil {
+		return leaderAddr, fmt.Errorf("register voter before admission: %w", err)
+	}
+	// A concurrent membership change invalidates the captured configuration.
+	// Failure leaves registration retryable; never remove a voter as rollback.
+	if err := membership.AddVoterAtIndex(nodeID, addr, configurationIndex); err != nil {
+		return leaderAddr, fmt.Errorf("admit registered voter: %w", err)
 	}
 
 	return leaderAddr, nil
@@ -329,8 +360,18 @@ func (sd *serviceDiscovery) RemoveNode(nodeID string) (string, error) {
 }
 
 func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
+	sd.reconcileMu.Lock()
+	if sd.reconcileClosed || sd.reconcileDone != nil {
+		sd.reconcileMu.Unlock()
+		return
+	}
+	ctx, sd.reconcileCancel = context.WithCancel(ctx)
+	done := make(chan struct{})
+	sd.reconcileDone = done
+	sd.reconcileMu.Unlock()
 	ticker := time.NewTicker(time.Second)
 	go func() {
+		defer close(done)
 		defer ticker.Stop()
 		util.Debug("reconciler started for broker %s", sd.brokerID)
 
@@ -348,6 +389,19 @@ func (sd *serviceDiscovery) StartReconciler(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (sd *serviceDiscovery) StopReconciler() {
+	sd.reconcileMu.Lock()
+	sd.reconcileClosed = true
+	if sd.reconcileCancel != nil {
+		sd.reconcileCancel()
+	}
+	done := sd.reconcileDone
+	sd.reconcileMu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 // ensureClientAddrs re-registers self if ClientAddr is missing in FSM.

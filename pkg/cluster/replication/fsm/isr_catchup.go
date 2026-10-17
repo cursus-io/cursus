@@ -27,6 +27,7 @@ var errReplicaEpochBoundaryUnavailable = errors.New("replica epoch boundary unav
 // the source may return a newer committed boundary. SourceAddress is local
 // routing metadata and is not sent.
 type ReplicaCatchupRequest struct {
+	localAuthority       *replicaRequestState
 	LocalWitness         *topic.ReplicaRequestWitness `json:"-"`
 	Topic                string                       `json:"topic"`
 	Partition            int                          `json:"partition"`
@@ -44,6 +45,7 @@ type ReplicaCatchupRequest struct {
 	SnapshotCatchup      bool                         `json:"-"`
 	RecoveryProtocol     int                          `json:"recovery_protocol,omitempty"`
 	PrefixCandidates     []disk.LineagePrefix         `json:"prefix_candidates,omitempty"`
+	RetainedPrefix       *disk.RetainedPrefix         `json:"retained_prefix,omitempty"`
 }
 
 // ReplicaCatchupBatch carries a committed logical range under the same
@@ -68,6 +70,9 @@ type ReplicaCatchupBatch struct {
 	RecoveryProtocol  int                 `json:"recovery_protocol,omitempty"`
 	MatchedPrefix     *disk.LineagePrefix `json:"matched_prefix,omitempty"`
 	BootstrapRequired bool                `json:"bootstrap_required,omitempty"`
+	// RetainedPrefix echoes the exact challenge even when bootstrap is required.
+	RetainedPrefix        *disk.RetainedPrefix `json:"retained_prefix,omitempty"`
+	MatchedRetainedPrefix *disk.RetainedPrefix `json:"matched_retained_prefix,omitempty"`
 }
 
 // SealReplicaCatchupBatch binds the logical range, fences, source, and decoded
@@ -116,8 +121,12 @@ func AdvanceReplicaCatchupRequest(request *ReplicaCatchupRequest, batch ReplicaC
 	request.NextOffset = endOffset
 	// Cumulative proofs must be regenerated from durable storage after applying.
 	request.PrefixCandidates = nil
+	request.RetainedPrefix = nil
 	request.PreviousLeaderEpoch = 0
 	request.PreviousRecordDigest = ""
+	if request.RecoveryProtocol == BootstrapRecoveryProtocolVersion {
+		return nil
+	}
 	if len(batch.Messages) == 0 {
 		return nil
 	}
@@ -344,6 +353,9 @@ func (f *BrokerFSM) MarkReplicaCatchupVerified(request ReplicaCatchupRequest, wi
 	defer f.transitionMu.Unlock()
 	f.materializationMu.Lock()
 	defer f.materializationMu.Unlock()
+	if err := f.validateReplicaRequestAuthority(request); err != nil {
+		return err
+	}
 	key := request.Topic + "-" + strconv.Itoa(request.Partition)
 	f.mu.RLock()
 	meta := f.partitionMetadata[key]
@@ -382,115 +394,16 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 // Exclusions run before any tail/HWM mutation. A pending durable install always
 // wins, even when no runtime bootstrap receiver is configured yet.
 func (f *BrokerFSM) BuildReplicaCatchupRequestsExcluding(brokerID string, excluded func(string, int) bool) []ReplicaCatchupRequest {
-	if brokerID == "" {
-		return nil
-	}
-	f.mu.RLock()
-	metadata := make(map[string]PartitionMetadata, len(f.partitionMetadata))
-	for key, value := range f.partitionMetadata {
-		if value != nil {
-			copy := *value
-			copy.Replicas = append([]string(nil), value.Replicas...)
-			copy.ISR = append([]string(nil), value.ISR...)
-			copy.RecoveryReplicas = append([]string(nil), value.RecoveryReplicas...)
-			metadata[key] = copy
-		}
-	}
-	definitions := copyTopicState(f.topicState)
-	topicManager := f.tm
-	brokers := make(map[string]BrokerInfo, len(f.brokers))
-	for id, broker := range f.brokers {
-		if broker != nil {
-			brokers[id] = *broker
-		}
-	}
-	f.mu.RUnlock()
-	if topicManager == nil {
-		return nil
-	}
-
-	requests := make([]ReplicaCatchupRequest, 0)
-	for key, meta := range metadata {
-		if !meta.CommittedHWMKnown || !containsString(meta.Replicas, brokerID) {
+	var requests []ReplicaCatchupRequest
+	for _, key := range f.ReplicaCatchupCandidates(brokerID) {
+		if excluded != nil && excluded(key.Topic, key.Partition) {
 			continue
 		}
-		separator := strings.LastIndex(key, "-")
-		if separator <= 0 {
-			continue
-		}
-		partitionID, err := strconv.Atoi(key[separator+1:])
-		if err != nil {
-			continue
-		}
-		topicName := key[:separator]
-		if excluded != nil && excluded(topicName, partitionID) {
-			continue
-		}
-		definition := definitions[topicName]
-		localTopic := topicManager.GetTopic(topicName)
-		source, sourceKnown := selectReplicaCatchupSource(meta, brokerID, brokers)
-		if definition == nil || localTopic == nil || !sourceKnown || source.Addr == "" ||
-			definition.LifecycleEpoch != meta.LifecycleEpoch || localTopic.Definition().LifecycleEpoch != meta.LifecycleEpoch {
-			continue
-		}
-		partition, err := localTopic.GetPartition(partitionID)
-		if err != nil {
-			continue
-		}
-		if partition.BootstrapPending() {
-			continue
-		}
-		leo := partition.NextOffset()
-		inISR := containsString(meta.ISR, brokerID)
-		if inISR && leo >= meta.CommittedHWM {
-			// An ISR member can receive a direct append after leo is sampled.
-			// Publishing the known committed boundary is safe and monotonic;
-			// reconciling here is not, because a stale scan could truncate that
-			// newly appended record before the leader commits it.
-			if err := partition.ApplyReplicaHWM(meta.CommittedHWM); err == nil {
-				partition.FlushDisk()
-			}
-			continue
-		}
-		if leo > meta.CommittedHWM && !inISR {
-			if err := partition.TruncateReplicaTail(meta.CommittedHWM); err != nil {
-				continue
-			}
-			partition.FlushDisk()
-			leo = partition.NextOffset()
-		}
-		if leo >= meta.CommittedHWM {
-			if leo == meta.CommittedHWM && !inISR {
-				request := ReplicaCatchupRequest{
-					Topic: topicName, Partition: partitionID, BrokerID: brokerID,
-					NextOffset: leo, CommittedHWM: meta.CommittedHWM,
-					Leader: meta.Leader, SourceBroker: source.ID,
-					LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch,
-					MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr, SnapshotCatchup: localTopic.IsEventSourcing,
-				}
-				if err := addReplicaRecoveryProof(partition, &request, brokers[brokerID], source, inISR, definition); err == nil {
-					requests = append(requests, request)
-				}
-			}
-			continue
-		}
-		request := ReplicaCatchupRequest{
-			Topic: topicName, Partition: partitionID, BrokerID: brokerID,
-			NextOffset: leo, CommittedHWM: meta.CommittedHWM,
-			Leader: meta.Leader, SourceBroker: source.ID,
-			LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch,
-			MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr, SnapshotCatchup: localTopic.IsEventSourcing,
-		}
-		if err := addReplicaRecoveryProof(partition, &request, brokers[brokerID], source, inISR, definition); err == nil {
+		request, ok, err := f.BuildReplicaCatchupRequestContext(context.Background(), brokerID, key.Topic, key.Partition)
+		if err == nil && ok {
 			requests = append(requests, request)
 		}
 	}
-	sort.Slice(requests, func(i, j int) bool {
-		if requests[i].Topic != requests[j].Topic {
-			return requests[i].Topic < requests[j].Topic
-		}
-		return requests[i].Partition < requests[j].Partition
-	})
 	return requests
 }
 
@@ -559,11 +472,15 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 	return f.FetchReplicaCatchupContext(context.Background(), request)
 }
 
-// FetchReplicaCatchupContext fences metadata and partition replacement through
-// proof, raw page reads and sealing. f.mu is released before disk maintenance.
+// FetchReplicaCatchupContext uses short prepare/publication fences for mutually
+// capable retained sources. Older modes retain their original fence lifetime.
+// f.mu is always released before disk maintenance.
 func (f *BrokerFSM) FetchReplicaCatchupContext(ctx context.Context, request ReplicaCatchupRequest) (ReplicaCatchupBatch, error) {
 	if ctx == nil {
 		return ReplicaCatchupBatch{}, fmt.Errorf("catch-up requires context")
+	}
+	if request.RecoveryProtocol == BootstrapRecoveryProtocolVersion || f.retainedSourceAvailable(request) {
+		return f.fetchRetainedRecovery(ctx, request)
 	}
 	unlock, err := lockSourceContext(ctx, &f.transitionMu, &f.materializationMu)
 	if err != nil {

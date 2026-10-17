@@ -5,31 +5,42 @@ import (
 	"errors"
 	"fmt"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/util"
 )
 
 // ErrReplicaBootstrapRequired means retained histories have no comparable anchor.
 // It never authorizes truncation or an empty-log reset.
 var ErrReplicaBootstrapRequired = errors.New("replica bootstrap required: no common retained prefix")
 
-func addReplicaRecoveryProof(partition *topic.Partition, request *ReplicaCatchupRequest, receiver, source BrokerInfo, inISR bool, definition *topic.Definition) error {
-	release := partition.BeginReplicationMutation()
-	defer release()
-	witness, err := partition.CaptureReplicaRequestWitness(context.Background(), request.NextOffset)
+func addReplicaRecoveryProofContext(ctx context.Context, partition *topic.Partition, request *ReplicaCatchupRequest, receiver, source BrokerInfo, inISR bool, definition *topic.Definition) error {
+	release, err := partition.BeginReplicationMutationContext(ctx)
 	if err != nil {
 		return err
 	}
-	if err := addReplicaRecoveryChallenge(partition, request, receiver, source, inISR, definition); err != nil {
+	defer release()
+	witness, err := partition.CaptureReplicaRequestWitness(ctx, request.NextOffset)
+	if err != nil {
 		return err
 	}
-	if err := partition.ValidateReplicaRequestWitness(context.Background(), witness, request.NextOffset); err != nil {
+	if err := addReplicaRecoveryChallengeContext(ctx, partition, request, receiver, source, inISR, definition); err != nil {
+		return err
+	}
+	if err := partition.ValidateReplicaRequestWitness(ctx, witness, request.NextOffset); err != nil {
 		return err
 	}
 	request.LocalWitness = witness
 	return nil
 }
 
-func addReplicaRecoveryChallenge(partition *topic.Partition, request *ReplicaCatchupRequest, receiver, source BrokerInfo, inISR bool, definition *topic.Definition) error {
+func addReplicaRecoveryChallengeContext(ctx context.Context, partition *topic.Partition, request *ReplicaCatchupRequest, receiver, source BrokerInfo, inISR bool, definition *topic.Definition) error {
+	if !inISR && receiver.RecoveryProtocol >= BootstrapRecoveryProtocolVersion && source.RecoveryProtocol >= BootstrapRecoveryProtocolVersion {
+		return addCapableReplicaChallenge(ctx, partition, request, definition)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := addPreviousReplicaRecord(partition, request); err != nil {
 		return err
 	}
@@ -45,7 +56,60 @@ func addReplicaRecoveryChallenge(partition *topic.Partition, request *ReplicaCat
 	return nil
 }
 
+func addCapableReplicaChallenge(ctx context.Context, partition *topic.Partition, request *ReplicaCatchupRequest, definition *topic.Definition) error {
+	compacted := config.HasCleanupPolicy(definition.Policy.CleanupPolicy, config.CleanupPolicyCompact)
+	if !compacted {
+		proofs, err := partition.ReplicaLineageCandidatesContext(ctx, request.NextOffset)
+		if err == nil {
+			request.RecoveryProtocol, request.PrefixCandidates = IndexedRecoveryProtocolVersion, proofs
+			return addPreviousReplicaRecordContext(ctx, partition, request)
+		}
+		if !errors.Is(err, disk.ErrLineageUnsupported) {
+			return err
+		}
+	}
+	anchor, err := partition.ReplicaFirstOffsetContext(ctx)
+	if err != nil {
+		return err
+	}
+	proof, err := partition.ReplicaRetainedPrefixContext(ctx, anchor, request.NextOffset)
+	if err != nil {
+		return err
+	}
+	if !compacted && !proof.UsedMarkedAuthority {
+		return fmt.Errorf("unsupported lineage lacks marked retained authority")
+	}
+	request.RecoveryProtocol, request.RetainedPrefix = BootstrapRecoveryProtocolVersion, &proof.Proof
+	request.PrefixCandidates, request.PreviousRecordDigest, request.PreviousLeaderEpoch = nil, "", 0
+	return nil
+}
+
+func addPreviousReplicaRecordContext(ctx context.Context, partition *topic.Partition, request *ReplicaCatchupRequest) error {
+	first, err := partition.ReplicaFirstOffsetContext(ctx)
+	if err != nil {
+		return err
+	}
+	if request.NextOffset == 0 || request.NextOffset <= first {
+		return nil
+	}
+	page, err := partition.ReadReplicaRetainedPage(ctx, request.NextOffset-1, request.NextOffset, 1, util.MaxMessageSize)
+	if err != nil {
+		return err
+	}
+	if len(page.Messages) != 1 || page.Messages[0].Offset != request.NextOffset-1 {
+		return fmt.Errorf("previous replica record is unavailable")
+	}
+	message := page.Messages[0]
+	message.Topic, message.Partition = "", 0
+	request.PreviousLeaderEpoch = message.LeaderEpoch
+	request.PreviousRecordDigest, err = replicaRecordDigest(message)
+	return err
+}
+
 func validateReplicaRecoveryRequest(request ReplicaCatchupRequest, source, receiver BrokerInfo, meta PartitionMetadata) error {
+	if request.RecoveryProtocol != BootstrapRecoveryProtocolVersion && request.RetainedPrefix != nil {
+		return fmt.Errorf("unexpected retained prefix in recovery request")
+	}
 	switch request.RecoveryProtocol {
 	case 0:
 		if len(request.PrefixCandidates) != 0 {
@@ -76,6 +140,17 @@ func validateReplicaRecoveryRequest(request ReplicaCatchupRequest, source, recei
 			return fmt.Errorf("indexed recovery exact-tail proof is missing")
 		}
 		return nil
+	case BootstrapRecoveryProtocolVersion:
+		if source.RecoveryProtocol < BootstrapRecoveryProtocolVersion || receiver.RecoveryProtocol < BootstrapRecoveryProtocolVersion {
+			return fmt.Errorf("retained recovery capability is not mutual")
+		}
+		if containsString(meta.ISR, request.BrokerID) {
+			return fmt.Errorf("retained recovery receiver must be outside ISR")
+		}
+		if len(request.PrefixCandidates) != 0 || request.PreviousRecordDigest != "" || request.PreviousLeaderEpoch != 0 || !validRetainedPrefix(request.RetainedPrefix) || request.RetainedPrefix.End != request.NextOffset {
+			return fmt.Errorf("invalid retained recovery challenge")
+		}
+		return nil
 	default:
 		return fmt.Errorf("%w: recovery protocol %d", ErrUnsupportedRecoveryProtocol, request.RecoveryProtocol)
 	}
@@ -97,6 +172,9 @@ func (f *BrokerFSM) replicaRecoveryPartition(name string, id int) (*topic.Partit
 
 // ValidateReplicaRecoveryMode checks additive fields before any local mutation.
 func ValidateReplicaRecoveryMode(batch ReplicaCatchupBatch) error {
+	if batch.RecoveryProtocol != BootstrapRecoveryProtocolVersion && (batch.RetainedPrefix != nil || batch.MatchedRetainedPrefix != nil) {
+		return fmt.Errorf("unexpected retained fields in recovery response")
+	}
 	switch batch.RecoveryProtocol {
 	case 0:
 		if batch.MatchedPrefix != nil || batch.BootstrapRequired {
@@ -130,6 +208,22 @@ func ValidateReplicaRecoveryMode(batch ReplicaCatchupBatch) error {
 		if batch.TruncateTo == nil && endOffset == batch.CommittedHWM && !batch.Verified {
 			return fmt.Errorf("replica catch-up completed without prefix verification")
 		}
+	case BootstrapRecoveryProtocolVersion:
+		if batch.MatchedPrefix != nil || batch.TruncateTo != nil || !validRetainedPrefix(batch.RetainedPrefix) || batch.RetainedPrefix.End != batch.StartOffset {
+			return fmt.Errorf("invalid retained recovery response")
+		}
+		if batch.BootstrapRequired {
+			if batch.MatchedRetainedPrefix != nil || len(batch.Messages) != 0 || batch.Verified || batch.Compacted || batch.EndOffset != batch.StartOffset {
+				return fmt.Errorf("invalid retained bootstrap-required response")
+			}
+			return ErrReplicaBootstrapRequired
+		}
+		if !validRetainedPrefix(batch.MatchedRetainedPrefix) || *batch.MatchedRetainedPrefix != *batch.RetainedPrefix || batch.StartOffset > batch.CommittedHWM {
+			return fmt.Errorf("retained recovery match differs from challenge")
+		}
+		if batch.Verified != (batch.EndOffset == batch.CommittedHWM) {
+			return fmt.Errorf("retained recovery verification does not match committed boundary")
+		}
 	default:
 		return fmt.Errorf("%w: recovery protocol %d", ErrUnsupportedRecoveryProtocol, batch.RecoveryProtocol)
 	}
@@ -158,6 +252,9 @@ func (f *BrokerFSM) WithReplicaRecoveryFence(batch ReplicaCatchupBatch, apply fu
 	}
 	if valid && batch.RecoveryProtocol == IndexedRecoveryProtocolVersion {
 		valid = !containsString(meta.ISR, batch.BrokerID) && source.RecoveryProtocol >= IndexedRecoveryProtocolVersion && receiver.RecoveryProtocol >= IndexedRecoveryProtocolVersion
+	}
+	if valid && batch.RecoveryProtocol == BootstrapRecoveryProtocolVersion {
+		valid = source.RecoveryProtocol >= BootstrapRecoveryProtocolVersion && receiver.RecoveryProtocol >= BootstrapRecoveryProtocolVersion
 	}
 	f.mu.RUnlock()
 	if !valid {

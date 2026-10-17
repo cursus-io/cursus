@@ -25,6 +25,9 @@ type ReplicaBootstrapSourceTicket struct {
 	anchor     uint64
 }
 
+// EventSourcing uses the definition captured and revalidated by this ticket.
+func (t *ReplicaBootstrapSourceTicket) EventSourcing() bool { return t.definition.EventSourcing }
+
 // ReplicaBootstrapCapture binds the actual cut and export to their source ticket.
 // Callers cannot supply a different end or manufacture publication authority.
 type ReplicaBootstrapCapture struct {

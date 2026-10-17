@@ -135,9 +135,11 @@ func TestBuildReplicaCatchupRequestsUsesLocalLEOAndLeaderFence(t *testing.T) {
 	requests := brokerFSM.BuildReplicaCatchupRequests("node-2")
 	require.Len(t, requests, 1)
 	require.NotNil(t, requests[0].LocalWitness)
+	require.NotNil(t, requests[0].localAuthority)
 	require.Equal(t, ReplicaCatchupRequest{
-		LocalWitness: requests[0].LocalWitness,
-		Topic:        "orders", Partition: 0, BrokerID: "node-2", NextOffset: 0, CommittedHWM: 3,
+		localAuthority: requests[0].localAuthority,
+		LocalWitness:   requests[0].LocalWitness,
+		Topic:          "orders", Partition: 0, BrokerID: "node-2", NextOffset: 0, CommittedHWM: 3,
 		Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 4, LifecycleEpoch: topic.InitialLifecycleEpoch,
 		MaxRecords: MaxReplicaCatchupRecords, SourceAddress: "127.0.0.1:9000",
 	}, requests[0])

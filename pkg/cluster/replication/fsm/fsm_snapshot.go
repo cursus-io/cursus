@@ -24,6 +24,7 @@ type BrokerFSMSnapshot struct {
 	transactionCoordinatorShards     map[int]TransactionCoordinatorShard
 	transactionCoordinatorShardCount int
 	offsetReservationsActivated      bool
+	consumerMetadataRoutingActivated bool
 	topicState                       map[string]*topic.Definition
 }
 
@@ -43,6 +44,7 @@ func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 		TransactionCoordinatorShards:     s.transactionCoordinatorShards,
 		TransactionCoordinatorShardCount: s.transactionCoordinatorShardCount,
 		OffsetReservationsActivated:      s.offsetReservationsActivated,
+		ConsumerMetadataRoutingActivated: s.consumerMetadataRoutingActivated,
 		TopicState:                       s.topicState,
 	}
 

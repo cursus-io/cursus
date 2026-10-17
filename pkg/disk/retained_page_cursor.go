@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"sync/atomic"
+
+	"github.com/cursus-io/cursus/pkg/metrics"
 )
 
 const retainedPageCheckpointLimit = 128
@@ -50,6 +52,7 @@ func (d *DiskHandler) retainedPageSnapshot(ctx context.Context, start, end uint6
 	if d.file == nil {
 		return rawFrameCursor{}, 0, fmt.Errorf("retained page log is closed")
 	}
+	metrics.RecordRecoveryWork(metrics.RecoveryRetainedPage, metrics.RecoverySyncCalls, 1)
 	if err := d.syncFile(d.file); err != nil {
 		return rawFrameCursor{}, 0, d.markWriteUnavailable(fmt.Errorf("sync retained page: %w", err))
 	}
@@ -67,10 +70,12 @@ func (d *DiskHandler) retainedPageSnapshot(ctx context.Context, start, end uint6
 	}
 	if best >= 0 {
 		d.retainedPageWork.CacheHits++
+		metrics.RecordRecoveryWork(metrics.RecoveryRetainedPage, metrics.RecoveryCacheHits, 1)
 		copy(d.retainedCursors[best:], d.retainedCursors[best+1:])
 		d.retainedCursors[len(d.retainedCursors)-1] = cursor
 	} else {
 		d.retainedPageWork.CacheMisses++
+		metrics.RecordRecoveryWork(metrics.RecoveryRetainedPage, metrics.RecoveryCacheMisses, 1)
 	}
 	return cursor, tail, nil
 }
@@ -85,6 +90,7 @@ func (d *DiskHandler) captureRetainedPage(ctx context.Context, cursor rawFrameCu
 		return rawFrameBatch{}, err
 	}
 	batch := d.captureRawFramesLocked(ctx, cursor, budget)
+	metrics.RecordRecoveryWork(metrics.RecoveryRetainedPage, metrics.RecoveryReadBytes, batch.BytesRead)
 	d.retainedPageWork.BytesRead += batch.BytesRead
 	d.retainedPageWork.SegmentTransitions += batch.Transitions
 	return batch, nil

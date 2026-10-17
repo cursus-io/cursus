@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/topic"
 )
 
@@ -23,6 +25,7 @@ func retryReplicaBootstrapRPC(ctx context.Context, call func() error) error {
 			return err
 		}
 		err := call()
+		metrics.RecordRecoveryAttempt(metrics.RecoveryReplicaRPC, err)
 		var network net.Error
 		transient := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &network)
 		if err == nil || !transient {
@@ -31,6 +34,7 @@ func retryReplicaBootstrapRPC(ctx context.Context, call func() error) error {
 		if err = waitForContext(ctx, delay); err != nil {
 			return err
 		}
+		metrics.RecordRecoveryWork(metrics.RecoveryReplicaRPC, metrics.RecoveryRetries, 1)
 		delay = min(delay*2, time.Second)
 	}
 }
@@ -109,6 +113,7 @@ func (r *replicaBootstrapRecovery) receive(ctx context.Context, a *replicaBootst
 				}
 				var e error
 				data, e = r.client.ReadBootstrapTransferChunk(ctx, address, r.port, chunk, file.Size)
+				metrics.RecordRecoveryBytes(metrics.RecoveryReplicaRPC, metrics.RecoveryTransferBytes, int64(len(data.Data)))
 				return e
 			})
 			if err != nil {
@@ -139,6 +144,7 @@ func (r *replicaBootstrapRecovery) receive(ctx context.Context, a *replicaBootst
 
 func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partition, manifest disk.BootstrapMetadata, receiver *disk.BootstrapReceiver, ticket *fsm.ReplicaBootstrapReceiverTicket, fenced func(bool)) error {
 	ch := r.ch
+	eventSourcing := false
 	if fenced != nil {
 		defer fenced(false)
 	}
@@ -168,6 +174,11 @@ func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partiti
 				return err
 			}
 		}
+		var err error
+		eventSourcing, err = r.state.ReplicaBootstrapEventSourcingPrelocked(p, manifest)
+		if err != nil {
+			return err
+		}
 		// Controller gates and the actual FSM fence are now held. Metadata
 		// cannot change until this local attempt leaves the validated boundary.
 		if fenced != nil {
@@ -179,6 +190,13 @@ func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partiti
 		return ch.ESHandler.DetachPartitionForBootstrap(manifest.Fence.Topic, manifest.Fence.Partition)
 	}
 	rebuild := func(view *topic.PartitionReadView, catalog []byte) error {
+		if !eventSourcing {
+			if len(catalog) != 0 {
+				return fmt.Errorf("ordinary topic bootstrap contains an application snapshot catalog")
+			}
+			// BootstrapSession already rebuilt raw producer and transaction state.
+			return nil
+		}
 		return ch.ESHandler.RebuildBootstrapState(manifest.Fence.Topic, manifest.Fence.Partition, view, catalog, manifest.Fence.LifecycleEpoch)
 	}
 	if manifest.Fence.Topic == config.ConsumerOffsetsTopicName {
@@ -195,6 +213,7 @@ func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partiti
 			if err = waitForContext(ctx, delay); err != nil {
 				return err
 			}
+			metrics.RecordRecoveryWork(metrics.RecoveryReplicaRPC, metrics.RecoveryRetries, 1)
 			delay = min(delay*2, time.Second)
 		}
 	}

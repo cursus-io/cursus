@@ -649,6 +649,10 @@ func (c *Coordinator) GetOffset(groupName, topic string, partition int) (uint64,
 
 // updateOffsetPartitionCount updates the number of partitions for the internal offset topic.
 func (c *Coordinator) updateOffsetPartitionCount() {
+	// Distributed routing is defined by committed topology, never local load.
+	if !c.standalone {
+		return
+	}
 	c.mu.RLock()
 	groupCount := len(c.groups)
 	currentCount := c.offsetTopicPartitionCount

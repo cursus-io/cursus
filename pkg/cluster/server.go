@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -296,7 +298,27 @@ func (h *ClusterServer) handleJoinCluster(payload wire.CommandPayload) (any, *wi
 
 	var leader string
 	var err error
-	if req.TransactionCoordinatorShards > 0 {
+	if registration := payload.Fields["registration"]; registration != "" {
+		if len(registration) > 16*1024 {
+			return nil, validationError("registration is too large")
+		}
+		var info fsm.BrokerInfo
+		decoder := json.NewDecoder(strings.NewReader(registration))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&info); err != nil || decoder.Decode(new(any)) != io.EOF {
+			return nil, validationError("invalid registration")
+		}
+		if info.ID != req.NodeID || info.Addr != req.Address || info.TransactionCoordinatorShards != req.TransactionCoordinatorShards {
+			return nil, validationError("registration does not match JOIN identity or shard count")
+		}
+		extended, ok := h.sd.(interface {
+			AddNodeWithRegistration(string, string, int, *fsm.BrokerInfo) (string, error)
+		})
+		if !ok {
+			return nil, internalClusterError(fmt.Errorf("service discovery does not support process registration"))
+		}
+		leader, err = extended.AddNodeWithRegistration(req.NodeID, req.Address, req.TransactionCoordinatorShards, &info)
+	} else if req.TransactionCoordinatorShards > 0 {
 		extended, ok := h.sd.(interface {
 			AddNodeWithTransactionCoordinatorShards(string, string, int) (string, error)
 		})

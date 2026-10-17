@@ -38,6 +38,10 @@ func (f *BrokerFSM) applyMessageBatch(cmd *types.MessageCommand) interface{} {
 	partitionKey := cmd.Topic + "-" + strconv.Itoa(cmd.Partition)
 
 	f.mu.Lock()
+	if err := f.validateConsumerMetadataMessagesLocked(*cmd); err != nil {
+		f.mu.Unlock()
+		return errorAckResponse(err.Error(), first.ProducerID, first.Epoch)
+	}
 	meta, topicExists := f.partitionMetadata[partitionKey]
 	var metadata PartitionMetadata
 	if topicExists && meta != nil {

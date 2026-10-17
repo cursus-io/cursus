@@ -233,9 +233,7 @@ func (ch *CommandHandler) ResolveGroupCoordinators(groupNames []string) (map[str
 		if ownerID != localID {
 			return nil, fmt.Errorf("coordinator ownership changed while observing group %q", groupName)
 		}
-		ch.groupRecoveryMu.Lock()
-		recovered := ch.groupRecoveryEpoch[partition] == epoch
-		ch.groupRecoveryMu.Unlock()
+		recovered := ch.consumerOwnershipRecovered(partition, epoch)
 		if !recovered {
 			return nil, fmt.Errorf("consumer metadata recovery pending for group %q", groupName)
 		}
@@ -324,11 +322,14 @@ func (ch *CommandHandler) ensureGroupRecovery(partition uint64, epoch int) error
 	if err := ch.consumerReadinessError(); err != nil {
 		return err
 	}
-	ch.groupRecoveryMu.Lock()
-	recovered := ch.groupRecoveryEpoch[partition] == epoch
-	ch.groupRecoveryMu.Unlock()
+	recovered := ch.consumerOwnershipRecovered(partition, epoch)
 	if recovered {
 		return nil
+	}
+	if ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() {
+		// The monitor performs owned recovery outside ordinary admission. A
+		// request cannot drain the admission lease it is currently holding.
+		return ErrConsumerRecoveryPending
 	}
 
 	ch.groupRecoveryReloadMu.Lock()
@@ -371,13 +372,19 @@ func (ch *CommandHandler) StartGroupRecoveryMonitor(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, finish, err := ch.beginMonitor(ctx, "consumer-recovery")
+	if err != nil {
+		return err
+	}
 	// Reconcile synchronously before the public listener starts. The ownership
 	// baseline is captured before startup replay, so an ownership change during
 	// that replay cannot be mistaken for already recovered state.
 	if err := ch.refreshLocalGroupRecoveryContext(ctx); err != nil {
+		finish()
 		return err
 	}
 	go func() {
+		defer finish()
 		ticker := time.NewTicker(groupRecoveryMonitorInterval)
 		defer ticker.Stop()
 		lastFailure := ""
@@ -428,6 +435,18 @@ func (ch *CommandHandler) refreshLocalGroupRecoveryContext(ctx context.Context) 
 	}
 	if err := ch.consumerReadinessError(); err != nil {
 		return err
+	}
+	if ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() {
+		epochs, err := ch.localGroupRecoveryEpochs()
+		if err != nil {
+			return err
+		}
+		for partition, epoch := range epochs {
+			if !ch.consumerOwnershipRecovered(partition, epoch) {
+				return ch.recoverDistributedConsumerMetadata(ctx, true)
+			}
+		}
+		return nil
 	}
 	ch.groupRecoveryReloadMu.Lock()
 	defer ch.groupRecoveryReloadMu.Unlock()
@@ -926,7 +945,11 @@ func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID 
 	}, nil
 }
 
-func (ch *CommandHandler) commitPartitionHWMAtEpoch(topicName string, partitionID int, hwm uint64, leader string, leaderEpoch int, lifecycleEpoch uint64) error {
+func (ch *CommandHandler) commitPartitionHWMAtEpoch(topicName string, partitionID int, hwm uint64, leader string, leaderEpoch int, lifecycleEpoch uint64, routes ...*types.ConsumerMetadataRoute) error {
+	var route *types.ConsumerMetadataRoute
+	if len(routes) > 0 {
+		route = routes[0]
+	}
 	_, err := ch.applyViaLeader("PARTITION_COMMIT", map[string]interface{}{
 		"topic":           topicName,
 		"partition":       partitionID,
@@ -934,6 +957,7 @@ func (ch *CommandHandler) commitPartitionHWMAtEpoch(topicName string, partitionI
 		"leader_epoch":    leaderEpoch,
 		"hwm":             hwm,
 		"lifecycle_epoch": lifecycleEpoch,
+		"consumer_route":  route,
 	})
 	if errors.Is(err, replicationFSM.ErrPartitionCommitFenced) {
 		return fmt.Errorf("%w: %v", clusterController.ErrPartitionLeaderFenced, err)
@@ -947,6 +971,9 @@ func (ch *CommandHandler) validateReplicaLeader(cmd types.MessageCommand) string
 	}
 	if ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.Cluster.RaftManager.GetFSM() == nil {
 		return "ERROR: cluster_metadata_unavailable command=REPLICATE_MESSAGE"
+	}
+	if err := ch.Cluster.RaftManager.GetFSM().ValidateConsumerMetadataMessages(cmd); err != nil {
+		return fmt.Sprintf("ERROR: consumer_route_fenced reason=%q", err)
 	}
 	metadata := ch.Cluster.RaftManager.GetFSM().GetPartitionMetadata(fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition))
 	if metadata == nil {

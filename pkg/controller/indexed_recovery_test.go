@@ -17,6 +17,10 @@ import (
 )
 
 func indexedApplyFixture(t *testing.T) (*CommandHandler, *fsm.BrokerFSM, *topic.Partition, fsm.ReplicaCatchupBatch) {
+	return indexedApplyFixtureWithProvider(t, nil)
+}
+
+func indexedApplyFixtureWithProvider(t *testing.T, wrap func(*disk.DiskManager) topic.HandlerProvider) (*CommandHandler, *fsm.BrokerFSM, *topic.Partition, fsm.ReplicaCatchupBatch) {
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
@@ -24,7 +28,11 @@ func indexedApplyFixture(t *testing.T) (*CommandHandler, *fsm.BrokerFSM, *topic.
 	cfg.DiskMinFreeBytes = 1
 	cfg.DiskMinFreePercent = 0.1
 	dm := disk.NewDiskManager(cfg)
-	tm := topic.NewTopicManager(cfg, dm, nil)
+	var provider topic.HandlerProvider = dm
+	if wrap != nil {
+		provider = wrap(dm)
+	}
+	tm := topic.NewTopicManager(cfg, provider, nil)
 	require.NoError(t, tm.CreateTopic("orders", 1, false, false))
 	state := fsm.NewBrokerFSM(tm, nil)
 	for _, id := range []string{"broker-1", "broker-2"} {

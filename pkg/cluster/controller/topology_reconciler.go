@@ -20,14 +20,20 @@ const topologyReconcileInterval = time.Second
 // StartTopologyReconciler repairs one legacy underfilled assignment per pass.
 // Data catch-up and ISR admission remain in their existing independently
 // fenced loops after the target replica set is durable.
-func (cc *ClusterController) StartTopologyReconciler(ctx context.Context) {
+func (cc *ClusterController) StartTopologyReconciler(ctx context.Context) func() {
 	if cc == nil || cc.RaftManager == nil {
-		return
+		return func() {}
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(topologyReconcileInterval)
 		defer ticker.Stop()
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			if err := cc.RunTopologyReconciliationOnce(); err != nil {
 				util.Debug("topology reconciliation pending: %v", err)
 			}
@@ -38,6 +44,7 @@ func (cc *ClusterController) StartTopologyReconciler(ctx context.Context) {
 			}
 		}
 	}()
+	return func() { cancel(); <-done }
 }
 
 // RunTopologyReconciliationOnce expands the first durable partition whose

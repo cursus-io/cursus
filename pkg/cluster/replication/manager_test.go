@@ -605,6 +605,18 @@ func TestRaftReplicationManager_AddRemoveVoter(t *testing.T) {
 	})
 }
 
+func TestConditionalVoterAdmissionPreservesCapturedConfiguration(t *testing.T) {
+	mr := new(MockRaft)
+	rm := &RaftReplicationManager{raft: mr, peers: make(map[string]string)}
+	fut := new(MockIndexFuture)
+	fut.On("Error").Return(raft.ErrNotLeader).Once()
+	mr.On("AddVoter", raft.ServerID("new"), raft.ServerAddress("new:7000"), uint64(42), 10*time.Second).Return(fut).Once()
+	assert.ErrorIs(t, rm.AddVoterAtIndex("new", "new:7000", 42), raft.ErrNotLeader)
+	assert.Empty(t, rm.peers)
+	mr.AssertExpectations(t)
+	fut.AssertExpectations(t)
+}
+
 type MockISRManager struct {
 	mock.Mock
 }

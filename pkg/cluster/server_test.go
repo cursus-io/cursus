@@ -44,6 +44,43 @@ func (m *MockServiceDiscovery) AddNodeWithTransactionCoordinatorShards(nodeID st
 	args := m.Called(nodeID, addr, shardCount)
 	return args.String(0), args.Error(1)
 }
+
+func (m *MockServiceDiscovery) AddNodeWithRegistration(id, addr string, shards int, info *fsm.BrokerInfo) (string, error) {
+	args := m.Called(id, addr, shards, info)
+	return args.String(0), args.Error(1)
+}
+
+func TestClusterJoinPreservesProcessRegistration(t *testing.T) {
+	info := fsm.BrokerInfo{ID: "new", Addr: "new:7000", IncarnationID: "current-process", RecoveryProtocol: 2, LifecycleProtocol: 6, TransactionCoordinatorShards: 7}
+	data, err := json.Marshal(info)
+	require.NoError(t, err)
+	for _, change := range []string{"none", "identity", "shards", "trailing", "unknown"} {
+		t.Run(change, func(t *testing.T) {
+			msd := new(MockServiceDiscovery)
+			server := NewClusterServer(msd)
+			fields := map[string]string{"node_id": "new", "address": "new:7000", "transaction_coordinator_shards": "7", "registration": string(data)}
+			switch change {
+			case "none":
+				msd.On("AddNodeWithRegistration", "new", "new:7000", 7, &info).Return("leader", nil).Once()
+			case "identity":
+				fields["node_id"] = "other"
+			case "shards":
+				fields["transaction_coordinator_shards"] = "8"
+			case "trailing":
+				fields["registration"] += " {}"
+			case "unknown":
+				fields["registration"] = `{"unknown":true}`
+			}
+			_, responseErr := server.handleJoinCluster(wire.CommandPayload{Fields: fields})
+			if change == "none" {
+				require.Nil(t, responseErr)
+			} else {
+				require.NotNil(t, responseErr)
+			}
+			msd.AssertExpectations(t)
+		})
+	}
+}
 func (m *MockServiceDiscovery) RemoveNode(nodeID string) (string, error) {
 	args := m.Called(nodeID)
 	return args.String(0), args.Error(1)
