@@ -34,7 +34,7 @@ type replicaPublicationStorage interface {
 // CaptureReplicaRequestWitness requires the caller's reconciliation read fence
 // to span capture, challenge reads, and ValidateReplicaRequestWitness.
 func (p *Partition) CaptureReplicaRequestWitness(ctx context.Context, leo uint64) (*ReplicaRequestWitness, error) {
-	unlock, err := lockReplicaContext(ctx, p.mu.TryLock, p.mu.Unlock)
+	unlock, err := lockReplicaContext(ctx, p.mu.LockContext, p.mu.Unlock)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +63,7 @@ func (p *Partition) replicaRecoveryErrorLocked() error {
 }
 
 func (p *Partition) ValidateReplicaRequestWitness(ctx context.Context, w *ReplicaRequestWitness, leo uint64) error {
-	unlock, err := lockReplicaContext(ctx, p.mu.TryRLock, p.mu.RUnlock)
+	unlock, err := lockReplicaContext(ctx, p.mu.RLockContext, p.mu.RUnlock)
 	if err != nil {
 		return err
 	}

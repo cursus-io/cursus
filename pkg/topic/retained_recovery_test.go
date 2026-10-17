@@ -57,3 +57,33 @@ func TestReplicaRequestCancelsPartitionLockWaits(t *testing.T) {
 		})
 	}
 }
+
+func TestReplicaRequestWitnessQueuesAheadOfNewReaders(t *testing.T) {
+	p, _, _ := rollbackPartition(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	p.mu.RLock()
+	locked := true
+	defer func() {
+		if locked {
+			p.mu.RUnlock()
+		}
+	}()
+	done := make(chan error, 1)
+	go func() { _, err := p.CaptureReplicaRequestWitness(ctx, 3); done <- err }()
+	require.Eventually(t, func() bool {
+		if p.mu.TryRLock() {
+			p.mu.RUnlock()
+			return false
+		}
+		return true
+	}, time.Second, time.Millisecond, "witness capture must queue a writer")
+	p.mu.RUnlock()
+	locked = false
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal("witness capture starved behind readers")
+	}
+}

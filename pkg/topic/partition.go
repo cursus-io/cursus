@@ -21,6 +21,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
+	"github.com/cursus-io/cursus/util/contextlock"
 )
 
 var ErrReplicaOffsetGap = errors.New("replica offset gap")
@@ -72,8 +73,8 @@ type Partition struct {
 	replicaWitness             *ReplicaCatchupWitness
 	replicaAttempt             uint64
 	distributed                bool
-	mu                         sync.RWMutex
-	reconcileMu                sync.RWMutex
+	mu                         contextlock.RWMutex
+	reconcileMu                contextlock.RWMutex
 	visibilityMu               sync.RWMutex
 	visibilityGeneration       uint64
 	bootstrapPending           atomic.Bool

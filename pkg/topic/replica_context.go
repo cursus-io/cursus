@@ -3,40 +3,20 @@ package topic
 import (
 	"context"
 	"errors"
-	"time"
 )
 
-// lockReplicaContext waits without creating a goroutine that could outlive its
-// recovery owner. Already-started filesystem calls remain synchronous.
-func lockReplicaContext(ctx context.Context, tryLock func() bool, unlock func()) (func(), error) {
+// Wait in the lock's fair queue without a background owner or polling timer.
+func lockReplicaContext(ctx context.Context, lock func(context.Context) error, unlock func()) (func(), error) {
 	if ctx == nil {
 		return nil, errors.New("replica lock requires context")
 	}
-	var ticker *time.Ticker
-	defer func() {
-		if ticker != nil {
-			ticker.Stop()
-		}
-	}()
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if tryLock() {
-			return unlock, nil
-		}
-		if ticker == nil {
-			ticker = time.NewTicker(time.Millisecond)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-ticker.C:
-		}
+	if err := lock(ctx); err != nil {
+		return nil, err
 	}
+	return unlock, nil
 }
 
 // BeginReplicationMutationContext fences replacement for a cancellable request.
 func (p *Partition) BeginReplicationMutationContext(ctx context.Context) (func(), error) {
-	return lockReplicaContext(ctx, p.reconcileMu.TryRLock, p.reconcileMu.RUnlock)
+	return lockReplicaContext(ctx, p.reconcileMu.RLockContext, p.reconcileMu.RUnlock)
 }

@@ -107,9 +107,10 @@ func sameRequestBroker(a, b BrokerInfo) bool {
 	return a.ID == b.ID && a.Addr == b.Addr && a.Status == b.Status && a.RecoveryProtocol == b.RecoveryProtocol && a.IncarnationID == b.IncarnationID && a.IncarnationEpoch == b.IncarnationEpoch
 }
 
-func (s replicaRequestState) same(current replicaRequestState) bool {
+func (s replicaRequestState) same(current replicaRequestState, exactHWM bool) bool {
+	hwmOK := s.meta.CommittedHWM == current.meta.CommittedHWM || (!exactHWM && s.meta.CommittedHWM < current.meta.CommittedHWM)
 	return s.partition == current.partition && reflect.DeepEqual(s.definition, current.definition) &&
-		s.meta.Leader == current.meta.Leader && s.meta.LeaderEpoch == current.meta.LeaderEpoch && s.meta.LifecycleEpoch == current.meta.LifecycleEpoch && s.meta.CommittedHWM == current.meta.CommittedHWM &&
+		s.meta.Leader == current.meta.Leader && s.meta.LeaderEpoch == current.meta.LeaderEpoch && s.meta.LifecycleEpoch == current.meta.LifecycleEpoch && hwmOK &&
 		reflect.DeepEqual(s.meta.Replicas, current.meta.Replicas) && reflect.DeepEqual(s.meta.ISR, current.meta.ISR) &&
 		sameRequestBroker(s.source, current.source) && sameRequestBroker(s.receiver, current.receiver)
 }
@@ -139,9 +140,9 @@ func (f *BrokerFSM) BuildReplicaCatchupRequestContext(ctx context.Context, broke
 	proof := func() error {
 		return addReplicaRecoveryProofContext(ctx, p, &r, state.receiver, state.source, inISR, state.definition)
 	}
-	check := func() error {
+	check := func(exactHWM bool) error {
 		current, exists := f.replicaRequestState(brokerID, name, id)
-		if !exists || !state.same(current) {
+		if !exists || !state.same(current, exactHWM) {
 			return fmt.Errorf("recovery request metadata changed")
 		}
 		return ctx.Err()
@@ -152,7 +153,7 @@ func (f *BrokerFSM) BuildReplicaCatchupRequestContext(ctx context.Context, broke
 			return empty, false, err
 		}
 		defer unlock()
-		if err = check(); err == nil {
+		if err = check(true); err == nil {
 			err = p.ApplyReplicaHWM(r.CommittedHWM)
 		}
 		if err == nil {
@@ -171,7 +172,7 @@ func (f *BrokerFSM) BuildReplicaCatchupRequestContext(ctx context.Context, broke
 		if err != nil {
 			return empty, false, err
 		}
-		if err = check(); err == nil && capable {
+		if err = check(true); err == nil && capable {
 			err = p.ValidateReplicaRequestWitness(ctx, r.LocalWitness, leo)
 		}
 		if err == nil {
@@ -197,7 +198,7 @@ func (f *BrokerFSM) BuildReplicaCatchupRequestContext(ctx context.Context, broke
 		return empty, false, err
 	}
 	defer unlock()
-	if err = check(); err != nil {
+	if err = check(false); err != nil {
 		return empty, false, err
 	}
 	if err = p.ValidateReplicaRequestWitness(ctx, r.LocalWitness, r.NextOffset); err != nil {
