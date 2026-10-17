@@ -29,7 +29,14 @@ func newLineageHandler(t *testing.T) (*DiskHandler, *config.Config) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.syncFileFn = nil; _ = d.Close() })
+	t.Cleanup(func() {
+		// A coalesced lineage request may still be syncing the log. Reset the
+		// fault hook under the same I/O exclusion before Close joins the worker.
+		d.ioMu.Lock()
+		d.syncFileFn = nil
+		d.ioMu.Unlock()
+		_ = d.Close()
+	})
 	return d, cfg
 }
 
@@ -92,14 +99,18 @@ func TestLineageSyncFailureDoesNotExposeProof(t *testing.T) {
 	d, _ := newLineageHandler(t)
 	appendLineageRecords(t, d, "one")
 	_ = lineageTail(t, d, 1)
+	d.ioMu.Lock()
 	d.syncFileFn = func(*os.File) error { return errors.New("injected sync failure") }
+	d.ioMu.Unlock()
 	if _, err := d.AppendMessageSync("orders", 0, &types.Message{Payload: "failed"}); err == nil {
 		t.Fatal("expected sync failure")
 	}
 	if p, err := d.LineageCandidates(2); err == nil || len(p) != 0 {
 		t.Fatalf("published failed write: %+v %v", p, err)
 	}
+	d.ioMu.Lock()
 	d.syncFileFn = nil
+	d.ioMu.Unlock()
 	if p, err := d.LineageCandidates(1); err == nil || len(p) != 0 {
 		t.Fatalf("terminal writer exposed cached proof: %+v %v", p, err)
 	}
