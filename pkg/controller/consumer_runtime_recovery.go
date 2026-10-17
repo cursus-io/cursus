@@ -9,6 +9,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 )
@@ -16,10 +17,12 @@ import (
 var ErrConsumerRecoveryPending = errors.New("consumer metadata local recovery pending")
 
 type consumerRecoveryReader struct {
-	ctx    context.Context
-	views  []*topic.PartitionReadView
-	ends   []uint64
-	staged StagedConsumerMetadataRecovery
+	repairGenerations map[int]disk.ContentGeneration
+	ctx               context.Context
+	views             []*topic.PartitionReadView
+	ends              []uint64
+	staged            StagedConsumerMetadataRecovery
+	metadata          []fsm.PartitionMetadata
 }
 
 func (r *consumerRecoveryReader) ExistingPartitionCount(string) (int, error) {
@@ -110,17 +113,17 @@ func (ch *CommandHandler) RecoverDistributedConsumerMetadata(ctx context.Context
 			if err != nil {
 				return err
 			}
-			if err := ch.Coordinator.ApplyFullConsumerMetadataReplay(prepared); err != nil {
-				return err
-			}
 			epochs, err := ch.localGroupRecoveryEpochs()
 			if err != nil {
+				return err
+			}
+			if err := ch.Coordinator.ApplyFullConsumerMetadataReplayAndComplete(prepared); err != nil {
 				return err
 			}
 			ch.groupRecoveryMu.Lock()
 			ch.groupRecoveryEpoch = epochs
 			ch.groupRecoveryMu.Unlock()
-			return ch.Coordinator.CompleteConsumerRecovery(current.RequiredGeneration)
+			return nil
 		})
 	})
 	if errors.Is(err, fsm.ErrConsumerMetadataFencePending) {

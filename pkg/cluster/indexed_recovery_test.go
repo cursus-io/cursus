@@ -17,6 +17,7 @@ func TestFitIndexedRecoveryBatchPreservesMatchedPrefix(t *testing.T) {
 	expected := batch
 	expected.Messages = expected.Messages[:2]
 	expected.EndOffset = 3
+	expected.Verified = false
 	expected, err = fsm.SealReplicaCatchupBatch(expected)
 	require.NoError(t, err)
 	encoded, err := json.Marshal(expected)
@@ -25,6 +26,7 @@ func TestFitIndexedRecoveryBatchPreservesMatchedPrefix(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, prefix, *fitted.MatchedPrefix)
 	require.Equal(t, uint64(3), fitted.EndOffset)
+	require.False(t, fitted.Verified)
 	require.NoError(t, fsm.ValidateReplicaRecoveryMode(fitted))
 	require.NoError(t, fsm.ValidateReplicaCatchupBatchDigest(fitted))
 }

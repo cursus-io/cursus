@@ -2,6 +2,7 @@ package disk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -17,30 +18,52 @@ func (d *DiskHandler) ScanRetainedRange(ctx context.Context, start, end uint64, 
 	if ctx == nil || visit == nil {
 		return fmt.Errorf("retained scan requires context and visitor")
 	}
-	d.maintenanceMu.Lock()
-	defer d.maintenanceMu.Unlock()
-	d.appendMu.Lock()
-	defer d.appendMu.Unlock()
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.ioMu.Lock()
-	defer d.ioMu.Unlock()
-	_, err := d.scanRetainedRangeLocked(ctx, start, end, func(m types.DiskMessage) error { return visit(retainedMessage(m)) })
+	unlock, err := lockProofContext(ctx, &d.maintenanceMu, &d.appendMu, &d.mu, &d.ioMu)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	_, err = d.scanRetainedRangeLocked(ctx, start, end, func(m types.DiskMessage) error { return visit(retainedMessage(m)) })
 	return err
 }
 
 // Caller owns maintenanceMu, appendMu, mu and ioMu. Validate every physical
 // frame of each intersecting segment, even outside the requested subrange.
 func (d *DiskHandler) scanRetainedRangeLocked(ctx context.Context, start, end uint64, visit func(types.DiskMessage) error) (bool, error) {
+	result, err := d.scanRetainedFramesLocked(ctx, start, end, false, func(frame compactionFrame) (bool, error) {
+		return true, visit(frame.message)
+	})
+	return result.compacted, err
+}
+
+// A private successful stop is distinct from all visitor errors. Only the
+// bounded scanner creates it, after validating the first omitted frame and the
+// gap preceding it. Full retained scans always validate intersecting files to EOF.
+var errRetainedPageStop = errors.New("certified retained page stop")
+
+type retainedScanResult struct {
+	end       uint64
+	exhausted bool
+	compacted bool
+}
+
+func (d *DiskHandler) scanRetainedFramesLocked(ctx context.Context, start, end uint64, bounded bool, visit func(compactionFrame) (bool, error)) (retainedScanResult, error) {
+	result := retainedScanResult{end: start}
 	tail := atomic.LoadUint64(&d.FlushedOffset)
 	if start > end || end > tail || len(d.segments) == 0 || start < d.segments[0] {
-		return false, fmt.Errorf("retained scan outside durable bounds")
+		return result, fmt.Errorf("retained scan outside durable bounds")
 	}
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return result, err
 	}
-	compactedRange := false
+	if bounded && start == end {
+		result.exhausted = true
+		return result, nil
+	}
 	for i, base := range d.segments {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
 		logicalEnd := tail
 		if i+1 < len(d.segments) {
 			logicalEnd = d.segments[i+1]
@@ -54,16 +77,19 @@ func (d *DiskHandler) scanRetainedRangeLocked(ctx context.Context, start, end ui
 		path := d.GetSegmentPath(base)
 		info, err := os.Stat(path)
 		if err != nil {
-			return false, err
+			return result, err
 		}
 		compacted := d.segmentAllowsOffsetGaps(base, info.Size())
-		compactedRange = compactedRange || compacted
+		result.compacted = result.compacted || compacted
 		next := base
 		err = scanCompactionSegment(path, base, false, compacted, func(frame compactionFrame) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			m := frame.message
+			if m.Topic != d.topicName || int(m.Partition) != d.partitionID {
+				return fmt.Errorf("retained record identity mismatch")
+			}
 			if m.Offset < base || m.Offset >= logicalEnd {
 				return fmt.Errorf("record outside physical segment bounds")
 			}
@@ -71,19 +97,41 @@ func (d *DiskHandler) scanRetainedRangeLocked(ctx context.Context, start, end ui
 				return fmt.Errorf("unmarked retained offset gap")
 			}
 			next = m.Offset + 1
+			if bounded && m.Offset >= end {
+				result.end, result.exhausted = end, true
+				return errRetainedPageStop
+			}
 			if m.Offset >= start && m.Offset < end {
-				return visit(m)
+				included, err := visit(frame)
+				if err != nil {
+					return err
+				}
+				if bounded && !included {
+					result.end = m.Offset
+					return errRetainedPageStop
+				}
+				// A fixed prefix is certified by its included end-1 record;
+				// do not decode an unrelated future frame. At the durable
+				// tail, still require clean physical EOF (including headers).
+				if bounded && end < tail && next == end {
+					result.end, result.exhausted = end, true
+					return errRetainedPageStop
+				}
 			}
 			return nil
 		})
+		if bounded && errors.Is(err, errRetainedPageStop) {
+			return result, nil
+		}
 		if err != nil {
-			return false, err
+			return result, err
 		}
 		if !compacted && next != logicalEnd {
-			return false, fmt.Errorf("unmarked retained trailing offset gap")
+			return result, fmt.Errorf("unmarked retained trailing offset gap")
 		}
 	}
-	return compactedRange, nil
+	result.end, result.exhausted = end, true
+	return result, nil
 }
 
 func retainedMessage(m types.DiskMessage) types.Message {

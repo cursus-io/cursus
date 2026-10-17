@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -19,7 +20,8 @@ import (
 
 // Handler processes event sourcing commands (APPEND_STREAM, READ_STREAM, etc.).
 type Handler struct {
-	tm *topic.TopicManager
+	replicaIndexGenerations map[string]disk.ContentGeneration
+	tm                      *topic.TopicManager
 
 	mu          sync.RWMutex
 	indexSyncMu sync.Mutex
@@ -232,6 +234,9 @@ func (h *Handler) IndexCommittedToHWM(topicName string, partitionID int, targetH
 			return nil
 		}
 		if err := h.replayIndex(idx, v, start, end); err != nil {
+			h.mu.Lock()
+			delete(h.replicaIndexGenerations, key)
+			h.mu.Unlock()
 			return err
 		}
 		h.mu.Lock()
@@ -245,6 +250,9 @@ func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *St
 	return h.withReadView(topicName, partitionID, func(v *topic.PartitionReadView) error {
 		h.indexSyncMu.Lock()
 		defer h.indexSyncMu.Unlock()
+		h.mu.Lock()
+		delete(h.replicaIndexGenerations, topicName+":"+strconv.Itoa(partitionID))
+		h.mu.Unlock()
 		return h.recoverIndexWithView(topicName, partitionID, idx, v, v.LastStableOffset())
 	})
 }
@@ -1091,6 +1099,7 @@ func (h *Handler) DeleteTopic(topicName string) error {
 		}
 		delete(h.indexes, key)
 		delete(h.indexedHWM, key)
+		delete(h.replicaIndexGenerations, key)
 	}
 	for key, ss := range h.snapshots {
 		if !strings.HasPrefix(key, prefix) {

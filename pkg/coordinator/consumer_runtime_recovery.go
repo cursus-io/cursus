@@ -81,7 +81,7 @@ func (c *Coordinator) CompleteConsumerRecovery(generation uint64) error {
 	g := &c.consumerAdmission
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if !g.owned || generation != g.requiredGeneration || g.installedGeneration != generation || g.installedLease != g.lease || g.installedRevision != c.authorityRevision || g.restoreInstalling || g.restoreError != nil {
+	if len(g.pendingLogRepairs) != 0 || !g.owned || generation != g.requiredGeneration || g.installedGeneration != generation || g.installedLease != g.lease || g.installedRevision != c.authorityRevision || g.restoreInstalling || g.restoreError != nil {
 		return fmt.Errorf("consumer metadata recovery generation is stale or incomplete")
 	}
 	g.completedGeneration = generation
