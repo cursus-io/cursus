@@ -24,12 +24,17 @@ func (c *Coordinator) monitorHeartbeats() {
 }
 
 func (c *Coordinator) checkAllGroupsTimeout() {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return
+	}
 	c.mu.RLock()
 	groupNames := make([]string, 0, len(c.groups))
 	for name := range c.groups {
 		groupNames = append(groupNames, name)
 	}
 	c.mu.RUnlock()
+	release()
 
 	timeout := time.Duration(c.cfg.ConsumerSessionTimeoutMS) * time.Millisecond
 	for _, name := range groupNames {
@@ -43,10 +48,15 @@ func (c *Coordinator) checkSingleGroupTimeout(groupName string, timeout time.Dur
 		return
 	}
 
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return
+	}
 	c.mu.Lock()
 	group, exists := c.groups[groupName]
 	if !exists || len(group.Members) == 0 {
 		c.mu.Unlock()
+		release()
 		return
 	}
 
@@ -58,8 +68,9 @@ func (c *Coordinator) checkSingleGroupTimeout(groupName string, timeout time.Dur
 	}
 	generation := group.Generation
 	handler := c.expirationHandler
-	distributed := c.cfg.EnabledDistribution
+	distributed := !c.standalone
 	c.mu.Unlock()
+	release()
 
 	if len(timedOutMembers) == 0 {
 		return
@@ -83,14 +94,21 @@ func (c *Coordinator) checkSingleGroupTimeout(groupName string, timeout time.Dur
 }
 
 func (c *Coordinator) ownsGroupSession(groupName string, now time.Time, timeout time.Duration) bool {
-	if !c.cfg.EnabledDistribution {
+	if c.standalone {
 		return true
 	}
 
 	c.mu.RLock()
 	checker := c.groupOwnerChecker
 	c.mu.RUnlock()
-	if checker == nil || !checker(groupName) {
+	// Owner resolution may reload metadata and must run outside admission.
+	owned := checker != nil && checker(groupName)
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return false
+	}
+	defer release()
+	if !owned {
 		c.mu.Lock()
 		delete(c.ownershipSince, groupName)
 		c.mu.Unlock()
@@ -113,11 +131,25 @@ func (c *Coordinator) ownsGroupSession(groupName string, now time.Time, timeout 
 
 // RecordHeartbeat updates the consumer's last heartbeat timestamp.
 func (c *Coordinator) RecordHeartbeat(groupName, consumerID string) error {
-	return c.RecordHeartbeatForGeneration(groupName, consumerID, -1)
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return c.recordHeartbeatForGeneration(groupName, consumerID, -1)
 }
 
 // RecordHeartbeatForGeneration atomically fences and refreshes a member session.
 func (c *Coordinator) RecordHeartbeatForGeneration(groupName, consumerID string, generation int) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return c.recordHeartbeatForGeneration(groupName, consumerID, generation)
+}
+
+func (c *Coordinator) recordHeartbeatForGeneration(groupName, consumerID string, generation int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if errResp := c.validateMemberGenerationLocked(groupName, consumerID, generation); errResp != "" {

@@ -31,7 +31,6 @@ import (
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
-	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/sdk"
 	"github.com/cursus-io/cursus/util"
@@ -266,8 +265,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	if cd != nil {
 		cd.SetGroupSessionCallbacks(globalCH.IsGroupCoordinator, globalCH.ExpireGroupMembers)
 		cd.SetGroupObservationBatchResolver(globalCH.ResolveGroupCoordinators)
-		cd.Start()
-		util.Info("🔄 Coordinator started with heartbeat monitoring")
+		if !cfg.EnabledDistribution {
+			cd.Start()
+		}
 	}
 	if cc != nil {
 		cc.SetLocalProcessor(globalCH)
@@ -293,12 +293,13 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		if err := globalCH.CaptureGroupRecoveryOwnership(); err != nil {
 			return fmt.Errorf("%w: capture ownership baseline: %w", ErrConsumerMetadataRecovery, err)
 		}
-		if err := awaitDistributedConsumerMetadataRecovery(ctx, cd, tm); err != nil {
+		if err := awaitDistributedConsumerMetadataRecovery(ctx, globalCH); err != nil {
 			return err
 		}
 		if err := globalCH.StartGroupRecoveryMonitor(ctx); err != nil {
 			return fmt.Errorf("%w: reconcile ownership after startup replay: %w", ErrConsumerMetadataRecovery, err)
 		}
+		cd.Start()
 	}
 	if err := registerStaticConsumerGroups(cfg, tm, globalCH); err != nil {
 		return fmt.Errorf("register static consumer groups: %w", err)
@@ -501,17 +502,18 @@ func observationBackendHost(bindAddress string) string {
 	return "::1"
 }
 
-func awaitDistributedConsumerMetadataRecovery(ctx context.Context, cd *coordinator.Coordinator, tm *topic.TopicManager) error {
+func awaitDistributedConsumerMetadataRecovery(ctx context.Context, handler *controller.CommandHandler) error {
 	const retryInterval = 100 * time.Millisecond
 	for {
-		if consumerMetadataHWMReady(tm) {
-			err := cd.ReloadDistributedConsumerMetadata()
-			if err == nil {
-				return nil
-			}
-			if !errors.Is(err, types.ErrCommittedHWMUnavailable) {
-				return fmt.Errorf("%w: %w", ErrConsumerMetadataRecovery, err)
-			}
+		err := handler.RecoverDistributedConsumerMetadata(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !errors.Is(err, controller.ErrConsumerRecoveryPending) && !errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("%w: %w", ErrConsumerMetadataRecovery, err)
 		}
 		select {
 		case <-ctx.Done():
@@ -521,6 +523,8 @@ func awaitDistributedConsumerMetadataRecovery(ctx context.Context, cd *coordinat
 	}
 }
 
+// consumerMetadataHWMReady is a local diagnostic only. Startup additionally
+// requires the common controller driver and authoritative FSM generation.
 func consumerMetadataHWMReady(tm *topic.TopicManager) bool {
 	if tm == nil {
 		return false
@@ -529,8 +533,8 @@ func consumerMetadataHWMReady(tm *topic.TopicManager) bool {
 	if current == nil || len(current.Partitions) == 0 {
 		return false
 	}
-	for _, partition := range current.Partitions {
-		if partition == nil || !partition.HWMKnown() {
+	for _, p := range current.Partitions {
+		if p == nil || !p.HWMKnown() {
 			return false
 		}
 	}

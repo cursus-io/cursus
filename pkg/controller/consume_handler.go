@@ -36,6 +36,9 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 	if authResp := ch.authorizeClientPermissions("CONSUME", argsMap, ctx, PermissionTopicRead, PermissionGroup); authResp != "" {
 		return 0, fmt.Errorf("%s", authResp)
 	}
+	if err := ch.consumerReadinessError(); err != nil {
+		return 0, err
+	}
 	if err := ch.validateConsumeArgs(argsMap); err != nil {
 		return 0, err
 	}
@@ -313,6 +316,9 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	}
 	if authResp := ch.authorizeClientPermissions("STREAM", argsMap, ctx, PermissionTopicRead, PermissionGroup); authResp != "" {
 		return fmt.Errorf("%s", authResp)
+	}
+	if err := ch.consumerReadinessError(); err != nil {
+		return err
 	}
 	if err := ch.validateStreamArgs(argsMap); err != nil {
 		return err

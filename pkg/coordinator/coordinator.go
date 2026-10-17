@@ -14,13 +14,25 @@ import (
 
 // Coordinator manages consumer groups, membership, heartbeats, and partition assignment.
 type Coordinator struct {
-	groups           map[string]*GroupMetadata // All consumer groups
-	mu               sync.RWMutex              // Global lock for coordinator state
-	lifecycleMu      sync.Mutex                // Serializes durable group lifecycle transitions
-	lifecyclePending map[string]bool           // Groups whose durable lifecycle write is in progress
-	cfg              *config.Config            // Configuration reference
-	ctx              context.Context
-	cancel           context.CancelFunc
+	consumerAdmission consumerAdmission
+	// Lock order: authorityMu -> lifecycleMu -> mu -> group.mu. Provenance is
+	// copied only after group locks are released; writers may hold those locks.
+	authorityMu              sync.Mutex
+	authorityRevision        uint64 // Guarded by authorityMu; invalidates detached replay results.
+	stateImportGeneration    uint64 // Guarded by mu; fences publications/scans begun before import.
+	raftCompatibility        *Coordinator
+	raftCompatibilityKnown   bool
+	provenanceMu             sync.Mutex
+	metadataSources          map[string]map[int]struct{}
+	metadataSourcesKnown     bool
+	offsetRecordWriterRouted bool
+	groups                   map[string]*GroupMetadata // All consumer groups
+	mu                       sync.RWMutex              // Global lock for coordinator state
+	lifecycleMu              sync.Mutex                // Serializes durable group lifecycle transitions
+	lifecyclePending         map[string]bool           // Groups whose durable lifecycle write is in progress
+	cfg                      *config.Config            // Configuration reference
+	ctx                      context.Context
+	cancel                   context.CancelFunc
 
 	topicHandler              TopicHandler
 	offsetTopic               string
@@ -91,6 +103,7 @@ type TransactionalOffsetResolver interface {
 func (c *Coordinator) SetOffsetRecordWriter(writer func(ConsumerMetadataRecord) error) {
 	c.offsetRecordWriterMu.Lock()
 	c.offsetRecordWriter = writer
+	c.offsetRecordWriterRouted = false
 	c.offsetRecordWriterMu.Unlock()
 }
 
@@ -262,6 +275,10 @@ func newCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandle
 	childCtx, cancel := context.WithCancel(ctx)
 	standalone := cfg == nil || !cfg.EnabledDistribution
 	c := &Coordinator{
+		raftCompatibility:         newCompatibilityCoordinator(),
+		raftCompatibilityKnown:    true,
+		metadataSources:           make(map[string]map[int]struct{}),
+		metadataSourcesKnown:      true,
 		groups:                    make(map[string]*GroupMetadata),
 		lifecyclePending:          make(map[string]bool),
 		cfg:                       cfg,
@@ -278,6 +295,10 @@ func newCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandle
 		},
 	}
 	recoveryComplete := false
+	if !standalone && !recoverDistributed {
+		c.consumerAdmission.startupPending = true
+		c.consumerAdmission.requiredGeneration = 1
+	}
 	defer func() {
 		if !recoveryComplete {
 			cancel()
@@ -310,6 +331,11 @@ func newCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandle
 		}
 		c.migrationRecords = append([]ConsumerMetadataRecord(nil), records...)
 		c.migrationAuthoritative = authoritative
+		// Migration records and selection do not prove physical partition history.
+		// Only an explicit recovery envelope can restore that authority.
+		if len(records) != 0 || authoritative {
+			c.markConsumerMetadataSourcesUnknown()
+		}
 	}
 	if reader, ok := handler.(OffsetLogReader); ok {
 		if c.standalone {
@@ -373,6 +399,11 @@ func (c *Coordinator) SetGroupObservationBatchResolver(resolver func(groupNames 
 // startup or coordinator ownership changes: metrics collection must never scan
 // the durable consumer metadata log on the request path.
 func (c *Coordinator) ObserveConsumerGroups() []ConsumerGroupObservation {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil
+	}
+	defer release()
 	if c == nil {
 		return nil
 	}
@@ -471,6 +502,11 @@ func (c *Coordinator) ObserveConsumerGroups() []ConsumerGroupObservation {
 // leader for a group's offsets partition; no controller-Raft group mutation is
 // involved.
 func (c *Coordinator) ReloadDistributedConsumerMetadata() error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	if c == nil || c.standalone {
 		return nil
 	}
@@ -501,6 +537,11 @@ func (c *Coordinator) Stop() {
 
 // GetAssignments returns the current partition assignments for each group member.
 func (c *Coordinator) GetAssignments(groupName string) map[string][]int {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil
+	}
+	defer release()
 	c.mu.RLock()
 	group := c.groups[groupName]
 	if group == nil || len(group.Members) == 0 {
@@ -524,6 +565,11 @@ func (c *Coordinator) GetAssignments(groupName string) map[string][]int {
 
 // GetMemberAssignments returns the partition assignments for a specific member in a group.
 func (c *Coordinator) GetMemberAssignments(groupName string, memberID string) []int {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -544,6 +590,11 @@ func (c *Coordinator) GetMemberAssignments(groupName string, memberID string) []
 
 // GetMemberTopicAssignments returns assignments with their topic identity.
 func (c *Coordinator) GetMemberTopicAssignments(groupName, memberID string) []TopicPartition {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	group := c.groups[groupName]
@@ -562,6 +613,11 @@ func (c *Coordinator) GetMemberTopicAssignments(groupName, memberID string) []To
 }
 
 func (c *Coordinator) ListGroups() []string {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -574,6 +630,11 @@ func (c *Coordinator) ListGroups() []string {
 
 // GetGroupStatus returns the current status of a consumer group
 func (c *Coordinator) GetGroupStatus(groupName string) (*GroupStatus, error) {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	c.mu.RLock()
 	group := c.groups[groupName]
 	if group == nil {
@@ -627,6 +688,11 @@ func (c *Coordinator) GetGroupStatus(groupName string) (*GroupStatus, error) {
 }
 
 func (c *Coordinator) GetGroup(groupName string) *GroupMetadata {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -634,6 +700,11 @@ func (c *Coordinator) GetGroup(groupName string) *GroupMetadata {
 }
 
 func (c *Coordinator) IsSubscriptionGroup(groupName string) bool {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return false
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	group := c.groups[groupName]
@@ -641,6 +712,11 @@ func (c *Coordinator) IsSubscriptionGroup(groupName string) bool {
 }
 
 func (c *Coordinator) GetGeneration(groupName string) int {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return 0
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -651,6 +727,11 @@ func (c *Coordinator) GetGeneration(groupName string) int {
 }
 
 func (c *Coordinator) GetRegistrationEpoch(groupName string) uint64 {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return 0
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if group := c.groups[groupName]; group != nil {
@@ -662,6 +743,11 @@ func (c *Coordinator) GetRegistrationEpoch(groupName string) uint64 {
 // ValidateMemberGeneration returns a wire-ready error code when a member is not
 // valid for the supplied group generation. Empty string means valid.
 func (c *Coordinator) ValidateMemberGeneration(groupName, memberID string, generation int) string {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err.Error()
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -688,6 +774,11 @@ func (c *Coordinator) validateMemberGenerationLocked(groupName, memberID string,
 // ResumeConsumer refreshes a known member session without changing membership,
 // generation, or assignments. It is used after a transient reconnect.
 func (c *Coordinator) ResumeConsumer(groupName, memberID string, generation int) ([]int, error) {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -702,6 +793,11 @@ func (c *Coordinator) ResumeConsumer(groupName, memberID string, generation int)
 }
 
 func (c *Coordinator) ResumeConsumerTopicAssignments(groupName, memberID string, generation int) ([]TopicPartition, error) {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
@@ -715,6 +811,11 @@ func (c *Coordinator) ResumeConsumerTopicAssignments(groupName, memberID string,
 // ValidateOwnershipFailure returns a wire-ready error code when a member does
 // not own a partition in the supplied generation. Empty string means valid.
 func (c *Coordinator) ValidateOwnershipFailure(groupName, memberID string, generation int, partition int) string {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err.Error()
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -731,6 +832,11 @@ func (c *Coordinator) ValidateOwnershipFailure(groupName, memberID string, gener
 }
 
 func (c *Coordinator) ValidateTopicPartitionOwnershipFailure(groupName, memberID string, generation int, topic string, partition int) string {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err.Error()
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
@@ -748,7 +854,14 @@ func (c *Coordinator) ValidateTopicPartitionOwnershipFailure(groupName, memberID
 	return fmt.Sprintf("ERROR: NOT_OWNER topic=%s partition=%d member=%s group=%s generation=%d", topic, partition, memberID, groupName, generation)
 }
 
+// WithTopicOwnershipFence holds consumer admission through fn. In distributed mode, fn
+// must not reenter ordinary public coordinator APIs; use a single operation.
 func (c *Coordinator) WithTopicOwnershipFence(groupName, memberID string, generation int, partitions []TopicPartition, fn func() error) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	c.mu.RLock()
 	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
 		c.mu.RUnlock()
@@ -777,7 +890,15 @@ func (c *Coordinator) WithTopicOwnershipFence(groupName, memberID string, genera
 	}
 	return fn()
 }
+
+// WithOwnershipFence holds consumer admission through fn. In distributed mode, fn
+// must not reenter ordinary public coordinator APIs; use a single operation.
 func (c *Coordinator) WithOwnershipFence(groupName, memberID string, generation int, partitions []int, fn func() error) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	c.mu.RLock()
 	if errResp := c.validateMemberGenerationLocked(groupName, memberID, generation); errResp != "" {
 		c.mu.RUnlock()
@@ -849,11 +970,26 @@ func (gm *GroupMetadata) storeOffsetMonotonic(groupName, topic string, partition
 
 // ExportState returns a serializable snapshot of all consumer groups.
 func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
+	return c.exportState(nil)
+}
+
+func (c *Coordinator) exportState(onlyGroup *string) map[string]*GroupStateSnapshot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	result := make(map[string]*GroupStateSnapshot, len(c.groupEpochs))
-	for name, group := range c.groups {
+	groups, epochs := c.groups, c.groupEpochs
+	if onlyGroup != nil {
+		groups = make(map[string]*GroupMetadata, 1)
+		epochs = make(map[string]uint64, 1)
+		if group := c.groups[*onlyGroup]; group != nil {
+			groups[*onlyGroup] = group
+		}
+		if epoch, ok := c.groupEpochs[*onlyGroup]; ok {
+			epochs[*onlyGroup] = epoch
+		}
+	}
+	result := make(map[string]*GroupStateSnapshot, len(epochs))
+	for name, group := range groups {
 		group.mu.RLock()
 		snap := &GroupStateSnapshot{
 			TopicName:            group.TopicName,
@@ -892,8 +1028,8 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 		group.mu.RUnlock()
 		result[name] = snap
 	}
-	for name, epoch := range c.groupEpochs {
-		if _, live := c.groups[name]; live {
+	for name, epoch := range epochs {
+		if _, live := groups[name]; live {
 			continue
 		}
 		result[name] = &GroupStateSnapshot{
@@ -906,12 +1042,18 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 
 // ImportState restores consumer group state from a current-version snapshot.
 func (c *Coordinator) ImportState(state map[string]*GroupStateSnapshot) error {
-	if err := ValidateImportState(state); err != nil {
-		return err
-	}
+	return c.ImportStateWithRecovery(state, nil)
+}
 
+// importStateValidated requires validation by the caller and never sets authority.
+func (c *Coordinator) importStateValidated(state map[string]*GroupStateSnapshot) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.importStateLocked(state)
+}
+
+func (c *Coordinator) importStateLocked(state map[string]*GroupStateSnapshot) error {
+	c.stateImportGeneration++
 
 	c.groups = make(map[string]*GroupMetadata, len(state))
 	c.groupEpochs = make(map[string]uint64, len(state))
