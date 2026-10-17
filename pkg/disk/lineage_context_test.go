@@ -29,6 +29,7 @@ func TestLineageContextCancelsQueuedLocks(t *testing.T) {
 		lock *sync.Mutex
 		call func(context.Context) error
 	}{
+		{"lineage builder", &d.lineageMu, func(ctx context.Context) error { _, err := api.MatchLineageCandidatesContext(ctx, nil, 0); return err }},
 		{"lineage maintenance", &d.maintenanceMu, func(ctx context.Context) error { _, err := api.MatchLineageCandidatesContext(ctx, nil, 0); return err }},
 		{"generation capture", &d.mu, func(ctx context.Context) error { _, err := api.CaptureContentGenerationContext(ctx); return err }},
 		{"generation check", &d.mu, func(ctx context.Context) error { return api.CheckContentGenerationContext(ctx, token) }},

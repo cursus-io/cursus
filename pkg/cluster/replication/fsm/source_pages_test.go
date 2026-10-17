@@ -29,6 +29,38 @@ func TestSourceCertifiedBytePageDoesNotInferHWM(t *testing.T) {
 	require.NoError(t, ValidateReplicaCatchupBatchDigest(batch))
 }
 
+func TestSourceRetainedCursorWorkWithPreviousRecordDigest(t *testing.T) {
+	const count = 1024
+	messages := make([]types.Message, count)
+	for i := range messages {
+		messages[i] = types.Message{Offset: uint64(i), Payload: strings.Repeat("x", 4096)}
+	}
+	var provider *sourceMutationProvider
+	f, _ := indexedRecoveryFSMWithProvider(t, messages, func(dm *disk.DiskManager) topic.HandlerProvider {
+		provider = &sourceMutationProvider{DiskManager: dm}
+		return provider
+	})
+	r := ReplicaCatchupRequest{Topic: "orders", BrokerID: "node-2", Leader: "node-1", SourceBroker: "node-1", LeaderEpoch: 4, LifecycleEpoch: f.partitionMetadata["orders-0"].LifecycleEpoch, CommittedHWM: count, MaxRecords: 7}
+	for r.NextOffset < count {
+		batch, err := f.FetchReplicaCatchup(r)
+		require.NoError(t, err)
+		require.NoError(t, ValidateReplicaCatchupBatchDigest(batch))
+		require.Equal(t, r.NextOffset, batch.Messages[0].Offset)
+		r.PreviousRecordDigest, err = replicaRecordDigest(batch.Messages[len(batch.Messages)-1])
+		require.NoError(t, err)
+		r.NextOffset = batch.EndOffset
+	}
+	work := provider.storage.RetainedPageWorkSnapshot()
+	t.Logf("source catch-up including previous-record digests: %+v", work)
+	info, err := os.Stat(provider.storage.GetSegmentPath(0))
+	require.NoError(t, err)
+	require.Greater(t, work.BytesRead, uint64(info.Size()))
+	require.Less(t, work.BytesRead, uint64(info.Size()*2), "source previous-record proofs must reuse the certified position: %+v", work)
+	require.Less(t, work.DecodedFrames, uint64(count*2))
+	require.Greater(t, work.CacheHits, uint64(0))
+	require.LessOrEqual(t, work.PeakCheckpoints, uint64(128))
+}
+
 func TestSourceContextCancelsFenceWaits(t *testing.T) {
 	f, _ := indexedRecoveryFSM(t, nil)
 	api, ok := any(f).(interface {

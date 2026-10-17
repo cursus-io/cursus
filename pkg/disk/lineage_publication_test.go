@@ -2,6 +2,8 @@ package disk
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"testing"
 
@@ -12,16 +14,16 @@ import (
 // timer races, keeping the same data sync and lock order as production.
 func runLineagePeriodicPass(t *testing.T, d *DiskHandler) {
 	t.Helper()
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.ioMu.Lock()
-	defer d.ioMu.Unlock()
-	if err := d.syncFile(d.file); err != nil {
+	unlock, err := d.lockLineageBuilder(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	d.updateLineageAfterSyncLocked()
+	defer unlock()
+	err = d.prepareLineage(context.Background(), true)
+	if err != nil && !errors.Is(err, errLineageRebuildRequired) {
+		t.Fatal(err)
+	}
 }
-
 func lineageSidecarBytes(t *testing.T, d *DiskHandler) []byte {
 	t.Helper()
 	data, err := os.ReadFile(d.BaseName + ".lineage")
@@ -107,7 +109,7 @@ func TestLineageSynchronousPathsDoNotPublish(t *testing.T) {
 func TestLineageBackgroundPublicationBounded(t *testing.T) {
 	d, _ := newLineageHandler(t)
 	_ = lineageTail(t, d, 0)
-	cache := d.lineage
+	cache := d.lineageProgress
 	batch := make([]types.DiskMessage, 3073)
 	for i := range batch {
 		batch[i] = types.DiskMessage{Topic: "orders", Offset: uint64(i), Payload: "record"}
@@ -120,7 +122,7 @@ func TestLineageBackgroundPublicationBounded(t *testing.T) {
 		if records := readLineageJournal(t, d); records[0].EndOffset != want {
 			t.Fatalf("background tail=%d want=%d", records[0].EndOffset, want)
 		}
-		if d.lineage != cache {
+		if d.lineageProgress != cache {
 			t.Fatal("background pass rebuilt retained history")
 		}
 	}

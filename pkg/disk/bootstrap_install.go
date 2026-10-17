@@ -459,7 +459,7 @@ func (r *BootstrapReceiver) Install() error {
 			d.bootstrapInstalled.Store(false)
 			t.installed = true
 			t.timer.Stop()
-			t.releaseBudget()
+			t.releaseTransientOwnership()
 		}
 		return err
 	}
@@ -467,7 +467,7 @@ func (r *BootstrapReceiver) Install() error {
 	d.bootstrapInstalled.Store(false)
 	t.installed = true
 	t.timer.Stop()
-	t.releaseBudget()
+	t.releaseTransientOwnership()
 	if err = d.segmentReaders.invalidateAll(); err != nil {
 		return err
 	}
