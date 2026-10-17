@@ -92,6 +92,9 @@ type DiskHandler struct {
 	lineageMu               sync.Mutex    // builder gate, always acquired BEFORE storage locks
 	retainedPageMu          sync.Mutex    // page gate, always acquired BEFORE storage locks
 	retainedPageWork        RetainedPageWork
+	retainedPrefixMu        sync.Mutex // builder gate, acquired before storage locks
+	retainedPrefixWork      RetainedPrefixWork
+	retainedPrefixes        []retainedPrefixCheckpoint
 	retainedBootstrapWorkMu sync.Mutex
 	retainedBootstrapWork   RetainedBootstrapWork
 	retainedCursors         []rawFrameCursor
