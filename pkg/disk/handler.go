@@ -249,6 +249,10 @@ func newDiskHandlerWithPolicy(cfg *config.Config, topicName string, partitionID 
 }
 
 func newDiskHandler(cfg *config.Config, topicName string, partitionID int, cleanupPolicy string, initialRetention retentionLimits) (*DiskHandler, error) {
+	bootstrapLimits, err := BootstrapLimitsFromConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
 	base := fmt.Sprintf("%s%c%s%cpartition_%d", cfg.LogDir, os.PathSeparator, topicName, os.PathSeparator, partitionID)
 	if err := os.MkdirAll(filepath.Dir(base), 0o750); err != nil {
 		return nil, err
@@ -384,6 +388,7 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		compactedSegments:      compactedSegments,
 		segmentReaders:         newSegmentReaderCache(defaultSegmentReaderCacheEntries),
 		headroom:               newDiskHeadroomGuard(cfg.LogDir, cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent),
+		bootstrapLimits:        bootstrapLimits,
 		file:                   file,
 		writer:                 bufio.NewWriter(file),
 	}

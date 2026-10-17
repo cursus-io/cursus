@@ -54,6 +54,14 @@ func consumerBootstrapFixtureWithStorage(t *testing.T) (*CommandHandler, *topic.
 	t.Cleanup(func() { require.NoError(t, export.Close()) })
 	receiver, err := p.StageBootstrap(export.Manifest())
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		// Install hands ownership to durable intent; only transient staging
+		// still belongs to the receiver when this fixture leaves it unused.
+		err := receiver.Abort()
+		if !errors.Is(err, disk.ErrBootstrapPending) {
+			require.NoError(t, err)
+		}
+	})
 	for _, file := range export.Manifest().Files {
 		for offset := int64(0); offset < file.Size; {
 			chunk, err := export.ReadChunk(file.ID, offset, disk.BootstrapChunkBytes)

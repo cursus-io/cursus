@@ -71,14 +71,15 @@ type RaftManager interface {
 }
 
 type ClusterController struct {
-	RaftManager     RaftManager
-	Discovery       ServiceDiscovery
-	Election        *ControllerElection
-	Router          *ClusterRouter
-	Config          *config.Config
-	brokerID        string
-	snapshotCatchup func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error
-	proofSubmitter  func(context.Context, fsm.ISRCatchupProof) error
+	RaftManager      RaftManager
+	Discovery        ServiceDiscovery
+	Election         *ControllerElection
+	Router           *ClusterRouter
+	Config           *config.Config
+	brokerID         string
+	snapshotCatchup  func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error
+	proofSubmitter   func(context.Context, fsm.ISRCatchupProof) error
+	replicaBootstrap ReplicaBootstrapRecovery
 }
 
 func (cc *ClusterController) SetReplicaSnapshotCatchup(callback func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error) {

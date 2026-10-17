@@ -32,6 +32,16 @@ type metadataTransferProbe struct {
 	bytes       int64
 }
 
+func TestConsumerMetadataCacheUsesConfiguredBootstrapLimits(t *testing.T) {
+	receiver, source, probe, r := metadataCacheFixture(t, func(cfg *config.Config) { cfg.BootstrapMaxTransferBytes = 1; cfg.BootstrapMaxTotalBytes = 2 })
+	transferAppend(t, source, source.bootstrapSource, r)
+	_, err := receiver.consumerRecoveryCache.stage(context.Background(), metadataCacheRequest(source, 0))
+	var limit *disk.BootstrapLimitError
+	require.ErrorAs(t, err, &limit)
+	require.EqualValues(t, 1, limit.Limit)
+	require.Len(t, probe.releases, 1)
+}
+
 func (p *metadataTransferProbe) BeginBootstrapTransfer(ctx context.Context, address string, port int, r fsm.BootstrapBeginRequest) (fsm.BootstrapBeginResponse, error) {
 	p.requests = append(p.requests, r)
 	if p.beforeBegin != nil {
