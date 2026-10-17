@@ -347,3 +347,11 @@ consumer recovery and transaction monitors, including synchronous initialization
 
 Complete bundle activation, metadata routing activation, metrics and mixed-version
 acceptance remain required before advertising production recovery capability 2.
+
+Consumer metadata writers capture the group partition, partition count, original
+owner, leader epoch and topic lifecycle from one metadata view. Forwarding keeps
+that route unchanged. Append preparation, replica delivery and the durable commit
+validate it, so a delayed request cannot acquire a newer owner's authority. Local
+group growth no longer changes the distributed offsets partition count. Legacy
+unprotected writes remain accepted pending durable cluster-wide routing activation;
+finite remote recovery cuts are not enabled by this route validation alone.

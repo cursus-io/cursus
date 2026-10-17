@@ -10,6 +10,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -36,10 +37,14 @@ func localRegistrationCurrent(sd clusterController.ServiceDiscovery, state *fsm.
 		return false
 	}
 	actual := state.GetBroker(wanted.ID)
+	shards := wanted.TransactionCoordinatorShards
+	if shards == 0 {
+		shards = transaction.DefaultCoordinatorShardCount
+	}
 	return actual != nil && actual.Status == "active" && actual.IncarnationID == wanted.IncarnationID &&
 		actual.Addr == wanted.Addr && actual.ClientAddr == wanted.ClientAddr &&
 		actual.RecoveryProtocol == wanted.RecoveryProtocol && actual.LifecycleProtocol == wanted.LifecycleProtocol &&
-		actual.TransactionCoordinatorShards == wanted.TransactionCoordinatorShards
+		state.TransactionCoordinatorShardCount() == shards
 }
 
 // Success is observed in the local FSM. A successful older registration must

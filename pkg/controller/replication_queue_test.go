@@ -169,6 +169,7 @@ func (e *barrierReplicationExecutor) committed() uint64 {
 func newBarrierReplicationExecutor() *barrierReplicationExecutor {
 	return &barrierReplicationExecutor{
 		snapshot: clusterController.PartitionReplicationSnapshot{
+			PartitionCount: 1,
 			Leader:         "broker-1",
 			LeaderEpoch:    7,
 			LifecycleEpoch: topic.InitialLifecycleEpoch,

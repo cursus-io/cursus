@@ -274,6 +274,10 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 	if partition < 0 {
 		partition = t.GetPartitionForMessage(*msg)
 	}
+	consumerRoute, routeErr := ch.parseConsumerRoute(args["consumer_route"], topicName, partition, clientCtx)
+	if routeErr != nil {
+		return fmt.Sprintf("ERROR: consumer_route_fenced reason=%q", routeErr)
+	}
 	p, err := t.GetPartition(partition)
 	if err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
@@ -326,6 +330,9 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 				releaseWrite()
 			}
 		}()
+		if err := validateConsumerRouteSnapshot(consumerRoute, replicationSnapshot); err != nil {
+			return fmt.Sprintf("ERROR: consumer_route_fenced reason=%q", err)
+		}
 		if ch.replication == nil {
 			return "ERROR: cluster_metadata_unavailable command=PUBLISH"
 		}
@@ -345,6 +352,7 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 
 		scope := "partition"
 		messageData := types.MessageCommand{
+			ConsumerRoute:               consumerRoute,
 			Topic:                       topicName,
 			Partition:                   partition,
 			LifecycleEpoch:              t.LifecycleEpoch,
