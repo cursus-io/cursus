@@ -60,6 +60,9 @@ type CommandHandler struct {
 	closed                     bool
 	closeOnce                  sync.Once
 	closeErr                   error
+	monitorMu                  sync.Mutex
+	monitors                   map[string]*handlerMonitor
+	monitorsClosed             bool
 }
 
 func (ch *CommandHandler) transactionStateLock(transactionalID string) *sync.Mutex {
@@ -501,6 +504,7 @@ func (ch *CommandHandler) Close() error {
 		return nil
 	}
 	ch.closeOnce.Do(func() {
+		ch.stopMonitors()
 		ch.consumerRecoveryInitMu.Lock()
 		ch.bootstrapMu.Lock()
 		ch.closed = true

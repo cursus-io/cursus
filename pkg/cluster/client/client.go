@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -49,11 +50,17 @@ func (c *TCPClusterClient) StartHeartbeat(
 	nodeID, incarnationID, localAddr string,
 	discoveryPort int,
 	proofProvider func() []fsm.ISRCatchupProof,
-) {
+) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	ticker := time.NewTicker(1 * time.Second)
 	go func() {
+		defer close(done)
 		defer ticker.Stop()
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -67,15 +74,22 @@ func (c *TCPClusterClient) StartHeartbeat(
 			}
 		}
 	}()
+	return func() { cancel(); <-done }
 }
 
 // StartLeaderHeartbeat sends a broker liveness session only to the Raft
 // leader, which is the sole authority allowed to replicate membership changes.
-func (c *TCPClusterClient) StartLeaderHeartbeat(ctx context.Context, leader func() string, nodeID, incarnationID string, discoveryPort int) {
+func (c *TCPClusterClient) StartLeaderHeartbeat(ctx context.Context, leader func() string, nodeID, incarnationID string, discoveryPort int) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	ticker := time.NewTicker(time.Second)
 	go func() {
+		defer close(done)
 		defer ticker.Stop()
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -86,6 +100,7 @@ func (c *TCPClusterClient) StartLeaderHeartbeat(ctx context.Context, leader func
 			}
 		}
 	}()
+	return func() { cancel(); <-done }
 }
 
 func (c *TCPClusterClient) sendHeartbeatToLeader(ctx context.Context, leaderAddr, nodeID, incarnationID string, discoveryPort int) error {
@@ -137,20 +152,23 @@ func (c *TCPClusterClient) sendHeartbeat(
 	targets = append(targets, peers...)
 	targets = append(targets, localAddr)
 	seen := make(map[string]struct{}, len(targets))
+	var workers sync.WaitGroup
 	for _, peer := range targets {
 		target := heartbeatTarget(peer, apiPort)
 		if _, ok := seen[target]; ok {
 			continue
 		}
 		seen[target] = struct{}{}
-		// Launch each heartbeat in a separate goroutine to avoid blocking on DNS/Connection
+		workers.Add(1)
 		go func(target string) {
+			defer workers.Done()
 			// Use short timeout for heartbeat connection
 			heartbeatCtx, cancel := context.WithTimeout(ctx, time.Second)
 			_, _ = c.sendRequest(heartbeatCtx, target, wire.CommandHeartbeatCluster, fields)
 			cancel()
 		}(target)
 	}
+	workers.Wait()
 	return nil
 }
 
@@ -201,6 +219,10 @@ func (c *TCPClusterClient) JoinClusterWithTransactionCoordinatorShards(peers []s
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	return c.joinClusterWithContextAndShards(ctx, peers, nodeID, addr, discoveryPort, shardCount)
+}
+
+func (c *TCPClusterClient) JoinClusterContext(ctx context.Context, peers []string, nodeID, addr string, discoveryPort, shardCount int) error {
 	return c.joinClusterWithContextAndShards(ctx, peers, nodeID, addr, discoveryPort, shardCount)
 }
 

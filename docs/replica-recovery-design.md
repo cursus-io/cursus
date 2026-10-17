@@ -339,5 +339,11 @@ membership, lifecycle, catalog revision or storage authority discards the attemp
 Only completed catalog recovery can publish verification and submit an ISR proof.
 Snapshot certification may still replay retained bytes within a step.
 
-Complete runtime ownership, metadata routing activation, metrics and mixed-version
+The server owns heartbeat, registration, topology and recovery workers and joins
+them before closing their dependencies. Registration continues until the local
+FSM reflects the current process identity and advertised configuration; an older
+successful request cannot suppress a later update. Handler shutdown also joins
+consumer recovery and transaction monitors, including synchronous initialization.
+
+Complete bundle activation, metadata routing activation, metrics and mixed-version
 acceptance remain required before advertising production recovery capability 2.
