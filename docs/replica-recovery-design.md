@@ -300,3 +300,35 @@ shared disk and metadata-history budgets remain charged until ownership ends.
 Shutdown joins staging and readers, and reports physical cleanup debt without
 spinning. Production recovery capability remains zero until the general replica
 receiver, resumable installation and remaining recovery bundle are complete.
+
+## Automatic retained recovery and bounded log turns
+
+For mutually capable peers outside ISR, request preparation selects a proof
+before reading a previous record or trimming a speculative tail. Ordinary
+contiguous logs retain indexed recovery. Current compacted policies and durable
+marked history use retained-prefix recovery, including after a policy changes to
+delete. Historical fallback requires validated marked authority; corruption,
+unsupported storage accessors and I/O failures do not authorize bootstrap.
+Retained mode preserves the original local tail and witness. A challenge beyond
+the source's committed cut requests full replacement without speculative trim.
+
+Candidate discovery reads only metadata. Each partition builds its proof during
+its own turn, with cancellable lock waits and storage scans. Publication rechecks
+the original partition, complete definition, membership, committed boundary and
+both broker process identities. Expensive proof work runs outside global FSM
+gates. Ordinary speculative truncation still requires its checked mutation path;
+filesystem calls already in progress remain synchronous.
+
+Each log turn allows at most 64 fetch iterations and a cooperative 30-second
+deadline, including initial proof construction. Durable progress survives yielding
+and later partitions receive their own turns. The next pass resumes from the
+durable tail. A final apply is recorded before yielding; a proof is not regenerated
+when no next fetch iteration is available. The catch-up loop has one process owner
+and shutdown cancels and joins it before closing its dependencies.
+
+Cold proof construction and validation can scan retained bytes; warm proofs reuse
+their bounded caches. This scheduling limit does not imply bounded total disk
+work, a hard filesystem deadline, or a bound on the legacy snapshot callback's
+page count. Resumable snapshot turns, complete runtime ownership, metadata routing
+activation, metrics and mixed-version acceptance remain required before advertising
+production recovery capability 2.

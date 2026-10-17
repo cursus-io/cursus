@@ -58,6 +58,8 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		return fmt.Errorf("server context must not be nil")
 	}
 	shutdownCtx := ctx
+	ctx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
 	drainCtx, cancelDrain := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelDrain()
 
@@ -91,6 +93,10 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		return fmt.Errorf("start health server: %w", healthErr)
 	}
 	defer func() {
+		cancelRun()
+		if cc != nil {
+			cc.StopReplicaCatchup()
+		}
 		healthState.Close()
 		shutdownHTTPServer(healthServer)
 		if cs != nil {
@@ -259,6 +265,10 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		cfg.EnabledDistribution && cfg.InternalBrokerPort > 0,
 	)
 	defer func() {
+		cancelRun()
+		if cc != nil {
+			cc.StopReplicaCatchup()
+		}
 		// Join discovery reads before the source closes exports and storage.
 		if cs != nil {
 			_ = cs.Close()

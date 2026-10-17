@@ -80,6 +80,11 @@ type ClusterController struct {
 	snapshotCatchup  func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error
 	proofSubmitter   func(context.Context, fsm.ISRCatchupProof) error
 	replicaBootstrap ReplicaBootstrapRecovery
+	catchupMu        sync.Mutex
+	catchupRunMu     sync.Mutex
+	catchupCancel    context.CancelFunc
+	catchupDone      chan struct{}
+	catchupStopped   bool
 }
 
 func (cc *ClusterController) SetReplicaSnapshotCatchup(callback func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error) {

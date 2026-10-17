@@ -5,31 +5,42 @@ import (
 	"errors"
 	"fmt"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/util"
 )
 
 // ErrReplicaBootstrapRequired means retained histories have no comparable anchor.
 // It never authorizes truncation or an empty-log reset.
 var ErrReplicaBootstrapRequired = errors.New("replica bootstrap required: no common retained prefix")
 
-func addReplicaRecoveryProof(partition *topic.Partition, request *ReplicaCatchupRequest, receiver, source BrokerInfo, inISR bool, definition *topic.Definition) error {
-	release := partition.BeginReplicationMutation()
-	defer release()
-	witness, err := partition.CaptureReplicaRequestWitness(context.Background(), request.NextOffset)
+func addReplicaRecoveryProofContext(ctx context.Context, partition *topic.Partition, request *ReplicaCatchupRequest, receiver, source BrokerInfo, inISR bool, definition *topic.Definition) error {
+	release, err := partition.BeginReplicationMutationContext(ctx)
 	if err != nil {
 		return err
 	}
-	if err := addReplicaRecoveryChallenge(partition, request, receiver, source, inISR, definition); err != nil {
+	defer release()
+	witness, err := partition.CaptureReplicaRequestWitness(ctx, request.NextOffset)
+	if err != nil {
 		return err
 	}
-	if err := partition.ValidateReplicaRequestWitness(context.Background(), witness, request.NextOffset); err != nil {
+	if err := addReplicaRecoveryChallengeContext(ctx, partition, request, receiver, source, inISR, definition); err != nil {
+		return err
+	}
+	if err := partition.ValidateReplicaRequestWitness(ctx, witness, request.NextOffset); err != nil {
 		return err
 	}
 	request.LocalWitness = witness
 	return nil
 }
 
-func addReplicaRecoveryChallenge(partition *topic.Partition, request *ReplicaCatchupRequest, receiver, source BrokerInfo, inISR bool, definition *topic.Definition) error {
+func addReplicaRecoveryChallengeContext(ctx context.Context, partition *topic.Partition, request *ReplicaCatchupRequest, receiver, source BrokerInfo, inISR bool, definition *topic.Definition) error {
+	if !inISR && receiver.RecoveryProtocol >= BootstrapRecoveryProtocolVersion && source.RecoveryProtocol >= BootstrapRecoveryProtocolVersion {
+		return addCapableReplicaChallenge(ctx, partition, request, definition)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := addPreviousReplicaRecord(partition, request); err != nil {
 		return err
 	}
@@ -43,6 +54,56 @@ func addReplicaRecoveryChallenge(partition *topic.Partition, request *ReplicaCat
 	request.RecoveryProtocol = IndexedRecoveryProtocolVersion
 	request.PrefixCandidates = proofs
 	return nil
+}
+
+func addCapableReplicaChallenge(ctx context.Context, partition *topic.Partition, request *ReplicaCatchupRequest, definition *topic.Definition) error {
+	compacted := config.HasCleanupPolicy(definition.Policy.CleanupPolicy, config.CleanupPolicyCompact)
+	if !compacted {
+		proofs, err := partition.ReplicaLineageCandidatesContext(ctx, request.NextOffset)
+		if err == nil {
+			request.RecoveryProtocol, request.PrefixCandidates = IndexedRecoveryProtocolVersion, proofs
+			return addPreviousReplicaRecordContext(ctx, partition, request)
+		}
+		if !errors.Is(err, disk.ErrLineageUnsupported) {
+			return err
+		}
+	}
+	anchor, err := partition.ReplicaFirstOffsetContext(ctx)
+	if err != nil {
+		return err
+	}
+	proof, err := partition.ReplicaRetainedPrefixContext(ctx, anchor, request.NextOffset)
+	if err != nil {
+		return err
+	}
+	if !compacted && !proof.UsedMarkedAuthority {
+		return fmt.Errorf("unsupported lineage lacks marked retained authority")
+	}
+	request.RecoveryProtocol, request.RetainedPrefix = BootstrapRecoveryProtocolVersion, &proof.Proof
+	request.PrefixCandidates, request.PreviousRecordDigest, request.PreviousLeaderEpoch = nil, "", 0
+	return nil
+}
+
+func addPreviousReplicaRecordContext(ctx context.Context, partition *topic.Partition, request *ReplicaCatchupRequest) error {
+	first, err := partition.ReplicaFirstOffsetContext(ctx)
+	if err != nil {
+		return err
+	}
+	if request.NextOffset == 0 || request.NextOffset <= first {
+		return nil
+	}
+	page, err := partition.ReadReplicaRetainedPage(ctx, request.NextOffset-1, request.NextOffset, 1, util.MaxMessageSize)
+	if err != nil {
+		return err
+	}
+	if len(page.Messages) != 1 || page.Messages[0].Offset != request.NextOffset-1 {
+		return fmt.Errorf("previous replica record is unavailable")
+	}
+	message := page.Messages[0]
+	message.Topic, message.Partition = "", 0
+	request.PreviousLeaderEpoch = message.LeaderEpoch
+	request.PreviousRecordDigest, err = replicaRecordDigest(message)
+	return err
 }
 
 func validateReplicaRecoveryRequest(request ReplicaCatchupRequest, source, receiver BrokerInfo, meta PartitionMetadata) error {
