@@ -390,115 +390,16 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 // Exclusions run before any tail/HWM mutation. A pending durable install always
 // wins, even when no runtime bootstrap receiver is configured yet.
 func (f *BrokerFSM) BuildReplicaCatchupRequestsExcluding(brokerID string, excluded func(string, int) bool) []ReplicaCatchupRequest {
-	if brokerID == "" {
-		return nil
-	}
-	f.mu.RLock()
-	metadata := make(map[string]PartitionMetadata, len(f.partitionMetadata))
-	for key, value := range f.partitionMetadata {
-		if value != nil {
-			copy := *value
-			copy.Replicas = append([]string(nil), value.Replicas...)
-			copy.ISR = append([]string(nil), value.ISR...)
-			copy.RecoveryReplicas = append([]string(nil), value.RecoveryReplicas...)
-			metadata[key] = copy
-		}
-	}
-	definitions := copyTopicState(f.topicState)
-	topicManager := f.tm
-	brokers := make(map[string]BrokerInfo, len(f.brokers))
-	for id, broker := range f.brokers {
-		if broker != nil {
-			brokers[id] = *broker
-		}
-	}
-	f.mu.RUnlock()
-	if topicManager == nil {
-		return nil
-	}
-
-	requests := make([]ReplicaCatchupRequest, 0)
-	for key, meta := range metadata {
-		if !meta.CommittedHWMKnown || !containsString(meta.Replicas, brokerID) {
+	var requests []ReplicaCatchupRequest
+	for _, key := range f.ReplicaCatchupCandidates(brokerID) {
+		if excluded != nil && excluded(key.Topic, key.Partition) {
 			continue
 		}
-		separator := strings.LastIndex(key, "-")
-		if separator <= 0 {
-			continue
-		}
-		partitionID, err := strconv.Atoi(key[separator+1:])
-		if err != nil {
-			continue
-		}
-		topicName := key[:separator]
-		if excluded != nil && excluded(topicName, partitionID) {
-			continue
-		}
-		definition := definitions[topicName]
-		localTopic := topicManager.GetTopic(topicName)
-		source, sourceKnown := selectReplicaCatchupSource(meta, brokerID, brokers)
-		if definition == nil || localTopic == nil || !sourceKnown || source.Addr == "" ||
-			definition.LifecycleEpoch != meta.LifecycleEpoch || localTopic.Definition().LifecycleEpoch != meta.LifecycleEpoch {
-			continue
-		}
-		partition, err := localTopic.GetPartition(partitionID)
-		if err != nil {
-			continue
-		}
-		if partition.BootstrapPending() {
-			continue
-		}
-		leo := partition.NextOffset()
-		inISR := containsString(meta.ISR, brokerID)
-		if inISR && leo >= meta.CommittedHWM {
-			// An ISR member can receive a direct append after leo is sampled.
-			// Publishing the known committed boundary is safe and monotonic;
-			// reconciling here is not, because a stale scan could truncate that
-			// newly appended record before the leader commits it.
-			if err := partition.ApplyReplicaHWM(meta.CommittedHWM); err == nil {
-				partition.FlushDisk()
-			}
-			continue
-		}
-		if leo > meta.CommittedHWM && !inISR {
-			if err := partition.TruncateReplicaTail(meta.CommittedHWM); err != nil {
-				continue
-			}
-			partition.FlushDisk()
-			leo = partition.NextOffset()
-		}
-		if leo >= meta.CommittedHWM {
-			if leo == meta.CommittedHWM && !inISR {
-				request := ReplicaCatchupRequest{
-					Topic: topicName, Partition: partitionID, BrokerID: brokerID,
-					NextOffset: leo, CommittedHWM: meta.CommittedHWM,
-					Leader: meta.Leader, SourceBroker: source.ID,
-					LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch,
-					MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr, SnapshotCatchup: localTopic.IsEventSourcing,
-				}
-				if err := addReplicaRecoveryProof(partition, &request, brokers[brokerID], source, inISR, definition); err == nil {
-					requests = append(requests, request)
-				}
-			}
-			continue
-		}
-		request := ReplicaCatchupRequest{
-			Topic: topicName, Partition: partitionID, BrokerID: brokerID,
-			NextOffset: leo, CommittedHWM: meta.CommittedHWM,
-			Leader: meta.Leader, SourceBroker: source.ID,
-			LeaderEpoch: meta.LeaderEpoch, LifecycleEpoch: meta.LifecycleEpoch,
-			MaxRecords: MaxReplicaCatchupRecords, SourceAddress: source.Addr, SnapshotCatchup: localTopic.IsEventSourcing,
-		}
-		if err := addReplicaRecoveryProof(partition, &request, brokers[brokerID], source, inISR, definition); err == nil {
+		request, ok, err := f.BuildReplicaCatchupRequestContext(context.Background(), brokerID, key.Topic, key.Partition)
+		if err == nil && ok {
 			requests = append(requests, request)
 		}
 	}
-	sort.Slice(requests, func(i, j int) bool {
-		if requests[i].Topic != requests[j].Topic {
-			return requests[i].Topic < requests[j].Topic
-		}
-		return requests[i].Partition < requests[j].Partition
-	})
 	return requests
 }
 

@@ -22,6 +22,17 @@ func (p *Partition) ReplicaLineageCandidates(tail uint64) ([]disk.LineagePrefix,
 	return storage.LineageCandidates(tail)
 }
 
+// ReplicaLineageCandidatesContext cancels queued and incremental proof work.
+func (p *Partition) ReplicaLineageCandidatesContext(ctx context.Context, tail uint64) ([]disk.LineagePrefix, error) {
+	storage, ok := p.dh.(interface {
+		LineageCandidatesContext(context.Context, uint64) ([]disk.LineagePrefix, error)
+	})
+	if !ok {
+		return nil, ErrReplicaSourceUnsupported
+	}
+	return storage.LineageCandidatesContext(ctx, tail)
+}
+
 func (p *Partition) MatchReplicaLineage(candidates []disk.LineagePrefix, hwm uint64) (*disk.LineagePrefix, error) {
 	storage, ok := p.dh.(replicaLineageStorage)
 	if !ok {
