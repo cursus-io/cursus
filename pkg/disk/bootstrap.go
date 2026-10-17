@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -339,7 +340,8 @@ func (e *BootstrapExport) ReadChunk(fileID string, offset int64, maxBytes int) (
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	_, err = f.ReadAt(data, offset)
+	n, err := f.ReadAt(data, offset)
+	metrics.RecordRecoveryBytes(metrics.RecoveryChunkRead, metrics.RecoveryReadBytes, int64(n))
 	if len(data) == 0 && errors.Is(err, io.EOF) {
 		err = nil
 	}
@@ -464,6 +466,12 @@ func (d *DiskHandler) exportBootstrapContext(ctx context.Context, start, end uin
 	defer func() { _ = log.Close() }()
 	var outputBytes int64
 	var work FullBootstrapWork
+	defer func() {
+		metrics.RecordRecoveryWork(metrics.RecoveryFullExport, metrics.RecoveryDecodedFrames, work.DecodedFrames)
+		metrics.RecordRecoveryWork(metrics.RecoveryFullExport, metrics.RecoveryDecodedBytes, work.DecodedFrameBytes)
+		metrics.RecordRecoveryWork(metrics.RecoveryFullExport, metrics.RecoveryWriteBytes, work.CanonicalWriteBytes)
+		metrics.RecordRecoveryAttempt(metrics.RecoveryFullExport, resultErr)
+	}()
 	scan, err := d.scanRetainedFramesLocked(ctx, start, end, false, func(frame compactionFrame) (bool, error) {
 		msg := frame.message
 		if msg.Topic != fence.Topic || int(msg.Partition) != fence.Partition {
@@ -497,15 +505,16 @@ func (d *DiskHandler) exportBootstrapContext(ctx context.Context, start, end uin
 		work.CanonicalWriteBytes += uint64(n)
 		return true, err
 	})
+	work.DecodedFrames, work.DecodedFrameBytes = scan.decodedFrames, scan.decodedFrameBytes
 	if err != nil {
 		return nil, err
 	}
 	m.Compacted = scan.compacted
-	work.DecodedFrames, work.DecodedFrameBytes = scan.decodedFrames, scan.decodedFrameBytes
 
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
+	metrics.RecordRecoveryWork(metrics.RecoveryFullExport, metrics.RecoverySyncCalls, 1)
 	if err = d.syncFile(log); err != nil {
 		return nil, err
 	}
@@ -701,7 +710,9 @@ func (r *BootstrapReceiver) WriteChunk(fileID string, offset int64, data []byte)
 		}
 		defer func() { _ = file.Close() }()
 		old := make([]byte, len(data))
-		if _, err = file.ReadAt(old, offset); err != nil && (len(old) != 0 || !errors.Is(err, io.EOF)) {
+		n, readErr := file.ReadAt(old, offset)
+		metrics.RecordRecoveryBytes(metrics.RecoveryChunkReceive, metrics.RecoveryReadBytes, int64(n))
+		if err = readErr; err != nil && (len(old) != 0 || !errors.Is(err, io.EOF)) {
 			return err
 		}
 		if !bytes.Equal(old, data) {
@@ -729,7 +740,9 @@ func writeBootstrapChunkLocked(t *bootstrapTransfer, fileID string, offset int64
 			return fmt.Errorf("overlapping bootstrap chunk")
 		}
 		old := make([]byte, len(data))
-		if _, err = file.ReadAt(old, offset); err != nil {
+		n, readErr := file.ReadAt(old, offset)
+		metrics.RecordRecoveryBytes(metrics.RecoveryChunkReceive, metrics.RecoveryReadBytes, int64(n))
+		if err = readErr; err != nil {
 			return err
 		}
 		if !bytes.Equal(old, data) {
@@ -741,6 +754,7 @@ func writeBootstrapChunkLocked(t *bootstrapTransfer, fileID string, offset int64
 		return fmt.Errorf("out-of-order bootstrap chunk")
 	}
 	n, err := file.WriteAt(data, offset)
+	metrics.RecordRecoveryBytes(metrics.RecoveryChunkReceive, metrics.RecoveryWriteBytes, int64(n))
 	if err != nil {
 		return err
 	}
@@ -754,13 +768,18 @@ func writeBootstrapChunkLocked(t *bootstrapTransfer, fileID string, offset int64
 type bootstrapContextReader struct {
 	context context.Context
 	reader  io.Reader
+	observe func(int)
 }
 
 func (r *bootstrapContextReader) Read(data []byte) (int, error) {
 	if err := r.context.Err(); err != nil {
 		return 0, err
 	}
-	return r.reader.Read(data)
+	n, err := r.reader.Read(data)
+	if r.observe != nil {
+		r.observe(n)
+	}
+	return n, err
 }
 
 func describeBootstrapFileContext(ctx context.Context, path, id, role string) (BootstrapFile, error) {
@@ -787,6 +806,7 @@ func describeBootstrapFileWorkContext(ctx context.Context, path, id, role string
 	}
 	h := sha256.New()
 	readBytes, err := io.CopyBuffer(h, &bootstrapContextReader{context: ctx, reader: f}, make([]byte, BootstrapChunkBytes))
+	metrics.RecordRecoveryBytes(metrics.RecoveryChecksum, metrics.RecoveryHashBytes, readBytes)
 	if err != nil {
 		return BootstrapFile{}, readBytes, err
 	}
@@ -802,10 +822,13 @@ func writeBootstrapFile(path string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	if _, err = f.Write(data); err != nil {
+	n, writeErr := f.Write(data)
+	metrics.RecordRecoveryBytes(metrics.RecoveryBootstrapFile, metrics.RecoveryWriteBytes, int64(n))
+	if err = writeErr; err != nil {
 		_ = f.Close()
 		return err
 	}
+	metrics.RecordRecoveryWork(metrics.RecoveryBootstrapFile, metrics.RecoverySyncCalls, 1)
 	if err = f.Sync(); err != nil {
 		_ = f.Close()
 		return err

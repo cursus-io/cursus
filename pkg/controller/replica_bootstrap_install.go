@@ -11,6 +11,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/topic"
 )
 
@@ -23,6 +24,7 @@ func retryReplicaBootstrapRPC(ctx context.Context, call func() error) error {
 			return err
 		}
 		err := call()
+		metrics.RecordRecoveryAttempt(metrics.RecoveryReplicaRPC, err)
 		var network net.Error
 		transient := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &network)
 		if err == nil || !transient {
@@ -31,6 +33,7 @@ func retryReplicaBootstrapRPC(ctx context.Context, call func() error) error {
 		if err = waitForContext(ctx, delay); err != nil {
 			return err
 		}
+		metrics.RecordRecoveryWork(metrics.RecoveryReplicaRPC, metrics.RecoveryRetries, 1)
 		delay = min(delay*2, time.Second)
 	}
 }
@@ -109,6 +112,7 @@ func (r *replicaBootstrapRecovery) receive(ctx context.Context, a *replicaBootst
 				}
 				var e error
 				data, e = r.client.ReadBootstrapTransferChunk(ctx, address, r.port, chunk, file.Size)
+				metrics.RecordRecoveryBytes(metrics.RecoveryReplicaRPC, metrics.RecoveryTransferBytes, int64(len(data.Data)))
 				return e
 			})
 			if err != nil {
@@ -195,6 +199,7 @@ func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partiti
 			if err = waitForContext(ctx, delay); err != nil {
 				return err
 			}
+			metrics.RecordRecoveryWork(metrics.RecoveryReplicaRPC, metrics.RecoveryRetries, 1)
 			delay = min(delay*2, time.Second)
 		}
 	}

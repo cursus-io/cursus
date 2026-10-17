@@ -1,6 +1,7 @@
 package fsm
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -10,6 +11,52 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/stretchr/testify/require"
 )
+
+func TestConsumerTransactionMarkerBindsDecisionAndControlBytes(t *testing.T) {
+	for _, marker := range []string{types.TransactionMarkerCommit, types.TransactionMarkerAbort} {
+		t.Run(marker, func(t *testing.T) {
+			tx := &transaction.Snapshot{ID: "marker-transaction", Epoch: 3, CoordinatorEpoch: 7, Mode: transaction.ModeProcessingV1, State: transaction.StatePrepareCommit}
+			state := types.TransactionStateCommitted
+			if marker == types.TransactionMarkerAbort {
+				tx.State, state = transaction.StatePrepareAbort, types.TransactionStateAborted
+			}
+			key, value, err := types.TransactionMarkerControlBytes(marker, tx.CoordinatorEpoch)
+			require.NoError(t, err)
+			message := types.Message{ProducerID: fmt.Sprintf("txn-marker:%s:%d:%s", tx.ID, tx.CoordinatorEpoch, marker), SeqNum: 1, TransactionState: state, TransactionMarker: marker, ControlBatchType: types.ControlBatchTransaction, ControlBatchVersion: types.ControlBatchVersionCursusV2, ControlBatchCoordinatorEpoch: tx.CoordinatorEpoch, ControlBatchKey: key, ControlBatchValue: value}
+			require.NoError(t, validateConsumerTransactionMarker(tx, message))
+			for _, change := range []string{"producer", "sequence", "state", "type", "version", "epoch", "key", "value", "decision"} {
+				t.Run(change, func(t *testing.T) {
+					copyMessage, copyTx := message, *tx
+					switch change {
+					case "producer":
+						copyMessage.ProducerID = "different"
+					case "sequence":
+						copyMessage.SeqNum++
+					case "state":
+						copyMessage.TransactionState = types.TransactionStateOpen
+					case "type":
+						copyMessage.ControlBatchType = "different"
+					case "version":
+						copyMessage.ControlBatchVersion++
+					case "epoch":
+						copyMessage.ControlBatchCoordinatorEpoch++
+					case "key":
+						copyMessage.ControlBatchKey = []byte{0}
+					case "value":
+						copyMessage.ControlBatchValue = []byte{0}
+					case "decision":
+						if marker == types.TransactionMarkerCommit {
+							copyTx.State = transaction.StatePrepareAbort
+						} else {
+							copyTx.State = transaction.StatePrepareCommit
+						}
+					}
+					require.ErrorIs(t, validateConsumerTransactionMarker(&copyTx, copyMessage), ErrPartitionCommitFenced)
+				})
+			}
+		})
+	}
+}
 
 func TestConsumerTransactionRouteRequiresOriginalAuthorityAndExactRecord(t *testing.T) {
 	f := NewBrokerFSM(nil, nil)

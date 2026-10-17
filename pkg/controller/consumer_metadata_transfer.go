@@ -13,6 +13,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/metrics"
 )
 
 func (c *consumerMetadataRecoveryCache) source(m fsm.PartitionMetadata, cached *consumerMetadataCacheEntry) (*fsm.BrokerInfo, error) {
@@ -58,11 +59,13 @@ func retryConsumerMetadataRPC(ctx context.Context, call func() error) error {
 			return err
 		}
 		err := call()
+		metrics.RecordRecoveryAttempt(metrics.RecoveryMetadataRPC, err)
 		var network net.Error
 		transient := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &network)
 		if err == nil || !transient || attempt == 1 || ctx.Err() != nil {
 			return err
 		}
+		metrics.RecordRecoveryWork(metrics.RecoveryMetadataRPC, metrics.RecoveryRetries, 1)
 	}
 }
 
@@ -156,6 +159,7 @@ func (c *consumerMetadataRecoveryCache) stagePartition(ctx context.Context, requ
 			err = retryConsumerMetadataRPC(ctx, func() error {
 				var e error
 				data, e = c.client.ReadBootstrapTransferChunk(ctx, b.Addr, c.port, chunk, file.Size)
+				metrics.RecordRecoveryBytes(metrics.RecoveryMetadataRPC, metrics.RecoveryTransferBytes, int64(len(data.Data)))
 				return e
 			})
 			if err != nil {

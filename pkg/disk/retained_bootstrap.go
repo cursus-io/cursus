@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
@@ -39,6 +40,9 @@ func (d *DiskHandler) RetainedBootstrapWorkSnapshot() RetainedBootstrapWork {
 func (d *DiskHandler) recordRetainedBootstrapWork(work RetainedBootstrapWork) {
 	d.retainedBootstrapWorkMu.Lock()
 	defer d.retainedBootstrapWorkMu.Unlock()
+	metrics.RecordRecoveryWork(metrics.RecoveryRetainedExport, metrics.RecoveryPages, work.Pages)
+	metrics.RecordRecoveryWork(metrics.RecoveryRetainedExport, metrics.RecoveryWriteBytes, work.CanonicalWriteBytes)
+	metrics.RecordRecoveryWork(metrics.RecoveryRetainedExport, metrics.RecoveryHashBytes, work.HashReadBytes)
 	d.retainedBootstrapWork.Pages += work.Pages
 	d.retainedBootstrapWork.CanonicalWriteBytes += work.CanonicalWriteBytes
 	d.retainedBootstrapWork.HashReadBytes += work.HashReadBytes
@@ -101,9 +105,12 @@ func (d *DiskHandler) checkRetainedExportSource(ctx context.Context, expected Co
 	return nil
 }
 
-func (d *DiskHandler) exportRetainedBootstrap(ctx context.Context, expected ContentGeneration, anchor, start, end uint64, fence BootstrapFence, ops retainedExportIO) (*BootstrapExport, error) {
+func (d *DiskHandler) exportRetainedBootstrap(ctx context.Context, expected ContentGeneration, anchor, start, end uint64, fence BootstrapFence, ops retainedExportIO) (_ *BootstrapExport, resultErr error) {
 	var work RetainedBootstrapWork
-	defer func() { d.recordRetainedBootstrapWork(work) }()
+	defer func() {
+		d.recordRetainedBootstrapWork(work)
+		metrics.RecordRecoveryAttempt(metrics.RecoveryRetainedExport, resultErr)
+	}()
 	if ctx == nil {
 		return nil, fmt.Errorf("retained bootstrap requires context")
 	}
@@ -224,6 +231,7 @@ func (d *DiskHandler) exportRetainedBootstrap(ctx context.Context, expected Cont
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
+	metrics.RecordRecoveryWork(metrics.RecoveryRetainedExport, metrics.RecoverySyncCalls, 1)
 	if err = ops.sync(log); err != nil {
 		return nil, err
 	}
@@ -237,6 +245,7 @@ func (d *DiskHandler) exportRetainedBootstrap(ctx context.Context, expected Cont
 	if err != nil {
 		return nil, err
 	}
+	metrics.RecordRecoveryWork(metrics.RecoveryRetainedExport, metrics.RecoverySyncCalls, 1)
 	syncErr := ops.sync(catalog)
 	closeErr := catalog.Close()
 	if err = errors.Join(syncErr, closeErr); err != nil {
@@ -252,6 +261,7 @@ func (d *DiskHandler) exportRetainedBootstrap(ctx context.Context, expected Cont
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
+	metrics.RecordRecoveryWork(metrics.RecoveryRetainedExport, metrics.RecoverySyncCalls, 1)
 	if err = ops.syncDirectory(t.dir); err != nil {
 		return nil, err
 	}

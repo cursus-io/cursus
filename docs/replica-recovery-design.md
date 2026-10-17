@@ -1,12 +1,10 @@
 # Replica recovery with durable lineage and bootstrap
 
-Approved scope: Cursus #246, following merged #251. Three dependent, independently
-testable layers are published as ready-for-review PRs through `gh stack`.
-
-Implementation status: storage lineage and indexed wire protocol 1 are present.
-Production registration advertises recovery protocol **0** until the complete
-bootstrap bundle is installed. The retained-range bootstrap section below is
-planned behavior, not an available recovery service in this layer.
+Implementation status: indexed and retained-prefix proofs, fenced bootstrap
+transport and installation, detached consumer metadata recovery, and runtime
+capability negotiation are implemented. A process advertises recovery protocol
+**2** only after its source, consumer cache, replica receiver and internal listener
+are ready. Startup registration and JOIN wait for that bundle.
 
 ## Recovery design and regression contract
 
@@ -21,16 +19,16 @@ protocol 6 remain compatible; unknown mandatory recovery versions fail closed.
 
 Different cumulative-hash anchors cannot be made comparable by selecting the
 larger start. Recovery below a retained start requires a separately fenced
-retained-range bootstrap with derived-state recovery. Until that is complete,
-unavailable recovery stays unavailable: this layer's capability gate prevents
-premature activation, but does not solve retention recovery.
+retained-range bootstrap with derived-state recovery. An unavailable source,
+stale fence, or incomplete installation keeps recovery and admission pending.
 
 Regression checks derived before implementation cover every small-span rollback
 boundary, nonzero anchors, a near-million-record tail with one bad record,
 MaxUint64 arithmetic, real-disk and source/receiver FSM recovery with single-tail,
 early reconvergent and long divergence, authoritative-HWM caps, stale fences and
 incomparable anchors. Direct and forwarded registration must advertise the same
-identity, incarnation, transaction shard count, lifecycle 6 and recovery 0.
+identity, incarnation, transaction shard count, lifecycle 6 and installed recovery
+capability. Restored registration cannot stand in for a new process registration.
 Recovery tests count retransferred records and JSON record-batch bytes as well as
 exchanges; these are not claims about bounded disk bytes or elapsed time.
 
@@ -57,14 +55,23 @@ gaps require the existing compacted recovery path or a retained-range bootstrap.
 ## Negotiated recovery
 
 Recovery capability is separate additive broker metadata, without raising the
-existing lifecycle protocol requirement. Protocol 1 remains implemented and
-explicit capability-1 fixtures exercise it, but both production registration
-paths use one process-owned payload advertising 0. There is no public activation
-flag or setter. Production peers continue using the existing digest protocol.
-Unknown mandatory recovery features fail closed. A later complete bundle must
-install source, transport, receiver, resumable installation, derived-state recovery
-and provider wiring before advertising protocol 2; its startup advertisement
-remains 0 until ready. Do not temporarily activate protocol 1 during startup.
+existing lifecycle protocol requirement. Protocol 1 remains supported. Installed
+production peers advertise protocol 2; a peer advertising 0 selects the existing
+digest protocol. There is no public activation flag or setter. Unknown mandatory
+features fail closed. The source also checks its own current process registration
+before serving a negotiated request.
+
+New voters must register their current complete capability before membership
+changes. The captured Raft configuration index fences that change. An existing
+voter may reconnect without changing membership; failed admission never removes
+an existing voter as rollback. A failed membership change can leave a retryable
+registered nonvoter.
+
+Consumer route enforcement activates through a durable Raft command only when
+all registered brokers, including inactive brokers, and all current voters have
+compatible process registrations. Snapshots preserve this decision. Once enabled,
+legacy or incomplete registrations are rejected, so downgrading a broker requires
+an explicitly supported migration rather than silently disabling the fence.
 
 A bounded set of cumulative prefix proofs allows one source exchange to find a
 proven common boundary even for long legacy or same-epoch divergent tails. The
@@ -88,11 +95,9 @@ wall-clock time, and do not apply to incomparable or compacted/gapped histories.
 
 ## Retained-range bootstrap
 
-This is the next layer, not implemented by the capability gate. Today a
-`BootstrapRequired` response stops recovery without mutation or a legacy fallback.
-The planned behavior is: when the requested prefix predates retention or cannot
-be proven, an active ISR
-source supplies a fenced committed retained range. The receiver stages a bounded
+When the requested prefix predates retention or cannot be proven, an active ISR
+source supplies a fenced committed retained range. `BootstrapRequired` selects
+this path without speculative truncation or a legacy downgrade. The receiver stages a bounded
 transfer, validates checksums and offsets, and installs through a durable pending
 manifest. Restart completes or safely rejects an interrupted installation.
 Transaction, producer, consumer-offset and application snapshot state must remain
@@ -189,9 +194,10 @@ incremental recovery remain separate proposals.
 - Full-prefix compacted proofs and bootstrap reconstruction retain full scans.
   Ordinary retained pages reuse process-local validated physical positions as
   described below; that does not remove the work of those separate proofs.
-- Consumer metadata still has a transitional global strict replay gate. Validate
-  availability under busy unrelated traffic and prepare partition-scoped recovery.
-  This layer does not change that architecture or claim to fix its availability cost.
+- Consumer metadata retains a global atomic replay gate. After durable route
+  activation, nonowned partitions use captured finite ends while owned partitions
+  must include their latest committed local end. This removes moving remote-end
+  starvation; it does not implement independent per-partition admission gates.
 
 ## Bounded lineage reconstruction contract
 
@@ -202,7 +208,7 @@ restart authority. Durable restart reuse remains a separate proposal; the existi
 sidecar is preserved. A private paged metadata export is implemented in disk
 storage, as documented in `pkg/disk/BOOTSTRAP.md`. The metadata source registry
 and authenticated transport are implemented, together with the consumer metadata
-recovery provider. General replica receiver integration remains separate work.
+recovery provider. The replica receiver installs through the same fenced recovery runtime.
 
 The regression contract is bounded physical reads (bytes including headers,
 records, and empty-segment transitions), completed-chunk resume after cancellation,
@@ -361,3 +367,55 @@ validate it, so a delayed request cannot acquire a newer owner's authority. Loca
 group growth no longer changes the distributed offsets partition count. Legacy
 unprotected writes remain accepted pending durable cluster-wide routing activation;
 finite remote recovery cuts are not enabled by this route validation alone.
+
+## Consumer ownership and transaction records
+
+Ordinary metadata writes carry the original group owner, partition epoch,
+partition count and lifecycle through forwarding, replication and commit. The
+record payload must identify the same group. After durable activation, an
+unrouted raw offsets write cannot bypass that authority. Transaction records
+instead carry the original transaction coordinator, producer epoch and exact
+transaction revision. Their offset snapshot or decision marker must match the
+durable transaction and its touched metadata partition; a transaction ID alone
+is insufficient authorization.
+
+A finite consumer replay captures ownership before remote work. Publication
+rechecks partition mapping, owner epochs and lifecycle. Nonowned remote commits
+may advance beyond the captured end; owned partitions must supply their latest
+committed end from durable local storage. A changed owner or mapping discards the
+attempt. The captured ownership certificate is published with replay and is never
+restamped from a later topology. A coordinator whose certificate is missing stays
+pending while the recovery worker obtains a new one outside ordinary admission.
+
+## Recovery work metrics
+
+The existing `/metrics` exporter includes `cursus_recovery_work_total{stage,unit}`
+and `cursus_recovery_attempts_total{stage,outcome}`. Labels are fixed enums; topic,
+partition, broker, path, attempt identity and error text are excluded. Work counts
+include partial writes, failed reads and retries. They describe logical file/API
+work, not physical device I/O or network framing bytes. Counters reset on process
+restart; compare deltas within each process lifetime.
+
+Stages distinguish full and retained exports, retained page/scan reads, checksum
+verification, chunk reads and staging writes, detached cache copies/replay, and
+metadata/replica RPCs. Units distinguish read, write, hash and transferred payload
+bytes, decoded records/bytes, sync calls, page attempts, cache hits/misses and
+retries. Transfer bytes count returned chunk payloads before validation; a transport
+failure that returns no payload contributes an attempt but no observable payload
+bytes. Sync counts count attempted calls, not completed durability. A checksum
+read belongs to `hash_bytes`; do not add it to a separately inferred file-read
+estimate. Decode bytes and read bytes overlap and must not be summed as disk I/O.
+
+For example, `sum by (stage, unit) (increase(cursus_recovery_work_total[5m]))`
+shows work during a recovery interval. Compare `metadata_rpc` transfer bytes and
+`retained_page` reads between cold, suffix-only and unchanged-end recovery. A
+low request count alone is insufficient: cold seeks, cache eviction, checksum
+verification and full derived-state rebuilds may still read retained history.
+`sum by (stage, outcome) (increase(cursus_recovery_attempts_total[5m]))` separates
+successful calls, failures and cancellations without exposing error identities.
+
+Validate convergence with full ISR held for at least twice the ISR heartbeat
+expiry interval while committing consumer offsets. Preserve separate evidence
+for mixed binaries, retention bootstrap, interrupted installation, stale fences,
+transaction decisions and unrelated partitions; one healthy restart test does
+not establish all of those conditions.
