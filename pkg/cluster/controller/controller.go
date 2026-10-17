@@ -78,6 +78,8 @@ type ClusterController struct {
 	Config           *config.Config
 	brokerID         string
 	snapshotCatchup  func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error
+	snapshotStep     ReplicaSnapshotStep
+	snapshotPending  map[fsm.ReplicaCatchupCandidate]*replicaSnapshotContinuation
 	proofSubmitter   func(context.Context, fsm.ISRCatchupProof) error
 	replicaBootstrap ReplicaBootstrapRecovery
 	catchupMu        sync.Mutex

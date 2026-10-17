@@ -114,17 +114,35 @@ func (cc *ClusterController) RunReplicaCatchupOnceVerified(ctx context.Context, 
 		excluded, catchupErr = cc.replicaBootstrap.ResumePendingReplicaBootstraps(ctx)
 	}
 	_ = fsmState.ReconcileReplicaMaterializations(cc.brokerID)
-	for _, candidate := range fsmState.ReplicaCatchupCandidates(cc.brokerID) {
+	candidates := fsmState.ReplicaCatchupCandidates(cc.brokerID)
+	current := make(map[fsm.ReplicaCatchupCandidate]bool, len(candidates))
+	for _, candidate := range candidates {
+		current[candidate] = true
+	}
+	for key := range cc.snapshotPending {
+		if !current[key] {
+			delete(cc.snapshotPending, key)
+		}
+	}
+	for _, candidate := range candidates {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(catchupErr, err)
 		}
 		if excluded[fmt.Sprintf("%s-%d", candidate.Topic, candidate.Partition)] || (cc.replicaBootstrap != nil && cc.replicaBootstrap.ReplicaBootstrapExcluded(candidate.Topic, candidate.Partition)) {
+			delete(cc.snapshotPending, candidate)
 			continue
 		}
 		turnCtx, cancel := context.WithTimeout(ctx, replicaCatchupTurnTimeout)
-		request, ok, err := fsmState.BuildReplicaCatchupRequestContext(turnCtx, cc.brokerID, candidate.Topic, candidate.Partition)
-		if err == nil && ok {
-			err = cc.catchupReplicaTurn(turnCtx, fetcher, apply, request)
+		var err error
+		if cc.snapshotPending[candidate] != nil {
+			err = cc.continueReplicaSnapshots(turnCtx, candidate, replicaCatchupTurnSteps)
+		} else {
+			var request fsm.ReplicaCatchupRequest
+			var ok bool
+			request, ok, err = fsmState.BuildReplicaCatchupRequestContext(turnCtx, cc.brokerID, candidate.Topic, candidate.Partition)
+			if err == nil && ok {
+				err = cc.catchupReplicaTurn(turnCtx, fetcher, apply, request)
+			}
 		}
 		cancel()
 		if err != nil {
@@ -198,6 +216,14 @@ func (cc *ClusterController) catchupReplicaTurn(ctx context.Context, fetcher Rep
 			return fmt.Errorf("actual receiver verification witness is required")
 		}
 		if request.SnapshotCatchup {
+			if cc.snapshotStep != nil {
+				if cc.snapshotPending == nil {
+					cc.snapshotPending = make(map[fsm.ReplicaCatchupCandidate]*replicaSnapshotContinuation)
+				}
+				key := fsm.ReplicaCatchupCandidate{Topic: request.Topic, Partition: request.Partition}
+				cc.snapshotPending[key] = &replicaSnapshotContinuation{request: request, witness: witness}
+				return cc.continueReplicaSnapshots(ctx, key, replicaCatchupTurnSteps-step-1)
+			}
 			if cc.snapshotCatchup == nil {
 				return fmt.Errorf("event snapshot catch-up is unavailable")
 			}

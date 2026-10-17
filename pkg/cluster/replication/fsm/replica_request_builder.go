@@ -133,7 +133,7 @@ func (f *BrokerFSM) BuildReplicaCatchupRequestContext(ctx context.Context, broke
 	p := state.partition
 	leo := p.NextOffset()
 	inISR := containsString(state.meta.ISR, brokerID)
-	r := ReplicaCatchupRequest{Topic: name, Partition: id, BrokerID: brokerID, NextOffset: leo, CommittedHWM: state.meta.CommittedHWM,
+	r := ReplicaCatchupRequest{localAuthority: &state, Topic: name, Partition: id, BrokerID: brokerID, NextOffset: leo, CommittedHWM: state.meta.CommittedHWM,
 		Leader: state.meta.Leader, SourceBroker: state.source.ID, LeaderEpoch: state.meta.LeaderEpoch, LifecycleEpoch: state.meta.LifecycleEpoch,
 		MaxRecords: MaxReplicaCatchupRecords, SourceAddress: state.source.Addr, SnapshotCatchup: state.snapshot}
 	proof := func() error {
