@@ -10,6 +10,7 @@ import (
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
@@ -77,6 +78,7 @@ func TestRegistrationWorkerRepublishesChangesAfterInflightSuccess(t *testing.T) 
 	state := fsm.NewBrokerFSM(nil, nil)
 	sd := &runtimeRegistrationDiscovery{state: state, entered: make(chan struct{}), release: make(chan struct{}), wanted: fsm.BrokerInfo{ID: "local", Addr: "raft:1", ClientAddr: "client:2", Status: "active", IncarnationID: "current", LifecycleProtocol: fsm.BrokerProtocolVersionCurrent}}
 	cc := &clusterController.ClusterController{RaftManager: &registrationCaptureRaftManager{state: state}}
+	sd.wanted.TransactionCoordinatorShards = transaction.DefaultCoordinatorShardCount
 	stop := startServerWorker(context.Background(), func(ctx context.Context) { runLocalRegistration(ctx, sd, cc, config.DefaultConfig()) })
 	var releaseOnce sync.Once
 	t.Cleanup(func() { releaseOnce.Do(func() { close(sd.release) }); stop() })
@@ -96,4 +98,5 @@ func TestRegistrationWorkerRepublishesChangesAfterInflightSuccess(t *testing.T) 
 	require.Equal(t, 2, actual.RecoveryProtocol)
 	require.Equal(t, "client:3", actual.ClientAddr)
 	require.Equal(t, "current", actual.IncarnationID)
+	require.Zero(t, actual.TransactionCoordinatorShards, "registration-only shard count is stored separately in the FSM")
 }

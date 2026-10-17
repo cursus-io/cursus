@@ -12,9 +12,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
-	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/wire"
-	"github.com/cursus-io/cursus/util"
 )
 
 type LocalProcessor interface {
@@ -182,22 +180,14 @@ func (r *ClusterRouter) coordinatorRoutes(groupNames []string) (map[string]coord
 	if fsmRef == nil {
 		return nil, fmt.Errorf("FSM not available")
 	}
-	root := fsmRef.GetPartitionMetadata(config.ConsumerOffsetsTopicName + "-0")
-	if root == nil || root.PartitionCount <= 0 {
-		return nil, fmt.Errorf("consumer offsets topology unavailable")
+	captured, addresses, err := fsmRef.ConsumerMetadataRoutes(groupNames)
+	if err != nil {
+		return nil, err
 	}
 	routes := make(map[string]coordinatorRoute, len(groupNames))
 	for _, groupName := range groupNames {
-		partition := util.GenerateID(coordinator.ConsumerMetadataGroupPartitionKey(groupName)) % uint64(root.PartitionCount)
-		metadata := fsmRef.GetPartitionMetadata(config.ConsumerOffsetsTopicName + "-" + strconv.FormatUint(partition, 10))
-		if metadata == nil || metadata.Leader == "" {
-			return nil, fmt.Errorf("consumer offsets partition %d has no durable leader", partition)
-		}
-		broker := fsmRef.GetBroker(metadata.Leader)
-		if broker == nil || broker.Status != "active" {
-			return nil, fmt.Errorf("consumer offsets partition %d leader %s is not active", partition, metadata.Leader)
-		}
-		routes[groupName] = coordinatorRoute{id: metadata.Leader, addr: broker.Addr, partition: partition, epoch: metadata.LeaderEpoch}
+		route := captured[groupName]
+		routes[groupName] = coordinatorRoute{id: route.Owner, addr: addresses[groupName], partition: uint64(route.Partition), epoch: route.LeaderEpoch}
 	}
 	return routes, nil
 }

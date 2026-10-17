@@ -932,7 +932,11 @@ func (ch *CommandHandler) preparePartitionReplica(topicName string, partitionID 
 	}, nil
 }
 
-func (ch *CommandHandler) commitPartitionHWMAtEpoch(topicName string, partitionID int, hwm uint64, leader string, leaderEpoch int, lifecycleEpoch uint64) error {
+func (ch *CommandHandler) commitPartitionHWMAtEpoch(topicName string, partitionID int, hwm uint64, leader string, leaderEpoch int, lifecycleEpoch uint64, routes ...*types.ConsumerMetadataRoute) error {
+	var route *types.ConsumerMetadataRoute
+	if len(routes) > 0 {
+		route = routes[0]
+	}
 	_, err := ch.applyViaLeader("PARTITION_COMMIT", map[string]interface{}{
 		"topic":           topicName,
 		"partition":       partitionID,
@@ -940,6 +944,7 @@ func (ch *CommandHandler) commitPartitionHWMAtEpoch(topicName string, partitionI
 		"leader_epoch":    leaderEpoch,
 		"hwm":             hwm,
 		"lifecycle_epoch": lifecycleEpoch,
+		"consumer_route":  route,
 	})
 	if errors.Is(err, replicationFSM.ErrPartitionCommitFenced) {
 		return fmt.Errorf("%w: %v", clusterController.ErrPartitionLeaderFenced, err)
@@ -953,6 +958,9 @@ func (ch *CommandHandler) validateReplicaLeader(cmd types.MessageCommand) string
 	}
 	if ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.Cluster.RaftManager.GetFSM() == nil {
 		return "ERROR: cluster_metadata_unavailable command=REPLICATE_MESSAGE"
+	}
+	if err := ch.Cluster.RaftManager.GetFSM().ValidateConsumerMetadataRoute(cmd.Topic, cmd.Partition, cmd.ConsumerRoute); err != nil {
+		return fmt.Sprintf("ERROR: consumer_route_fenced reason=%q", err)
 	}
 	metadata := ch.Cluster.RaftManager.GetFSM().GetPartitionMetadata(fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition))
 	if metadata == nil {

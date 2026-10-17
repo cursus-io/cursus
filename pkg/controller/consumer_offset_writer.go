@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -29,7 +30,7 @@ func (ch *CommandHandler) writeConsumerOffsetRecord(record coordinator.ConsumerM
 	}
 	// Partition by group identity so lifecycle and offset records share one
 	// durable coordinator partition, while retaining their independent keys.
-	partitionText, err := ch.consumerOffsetPartition(topic, record.Group)
+	partitionText, route, err := ch.consumerOffsetRoute(topic, record.Group)
 	if err != nil {
 		return err
 	}
@@ -41,7 +42,15 @@ func (ch *CommandHandler) writeConsumerOffsetRecord(record coordinator.ConsumerM
 	if ch.Coordinator != nil {
 		ch.Coordinator.RecordConsumerMetadataSource(record.Group, physicalPartition)
 	}
-	cmd := fmt.Sprintf("PUBLISH topic=%s partition=%s acks=all producerId=consumer-offset-coordinator key=%s message=%s", config.ConsumerOffsetsTopicName, partitionText, key, payload)
+	cmd := fmt.Sprintf("PUBLISH topic=%s partition=%s acks=all producerId=consumer-offset-coordinator key=%s", config.ConsumerOffsetsTopicName, partitionText, key)
+	if route != nil {
+		encoded, err := json.Marshal(route)
+		if err != nil {
+			return err
+		}
+		cmd += " consumer_route=" + base64.RawURLEncoding.EncodeToString(encoded)
+	}
+	cmd += " message=" + string(payload)
 	resp := ch.handlePublish(cmd, NewInternalClientContext("default-group", 0))
 	if strings.HasPrefix(resp, "OK") {
 		return nil
@@ -54,13 +63,22 @@ func (ch *CommandHandler) writeConsumerOffsetRecord(record coordinator.ConsumerM
 }
 
 func (ch *CommandHandler) consumerOffsetPartition(internalTopic *topic.Topic, groupName string) (string, error) {
+	partition, _, err := ch.consumerOffsetRoute(internalTopic, groupName)
+	return partition, err
+}
+
+func (ch *CommandHandler) consumerOffsetRoute(internalTopic *topic.Topic, groupName string) (string, *types.ConsumerMetadataRoute, error) {
 	if ch.hasRouter() {
-		_, _, durablePartition, _, err := ch.Cluster.Router.FindCoordinatorWithEpoch(groupName)
+		routes, _, err := ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutes([]string{groupName})
 		if err != nil {
-			return "", fmt.Errorf("resolve durable consumer offset partition: %w", err)
+			return "", nil, fmt.Errorf("resolve durable consumer offset partition: %w", err)
 		}
-		return strconv.FormatUint(durablePartition, 10), nil
+		route := routes[groupName]
+		if route.Owner != ch.Cluster.Router.BrokerID() {
+			return "", nil, fmt.Errorf("consumer metadata origin is not the current coordinator")
+		}
+		return strconv.Itoa(route.Partition), &route, nil
 	}
 	partition := internalTopic.GetPartitionForMessage(types.Message{Key: coordinator.ConsumerMetadataGroupPartitionKey(groupName)})
-	return strconv.Itoa(partition), nil
+	return strconv.Itoa(partition), nil, nil
 }
