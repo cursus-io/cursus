@@ -60,6 +60,10 @@ func (ch *CommandHandler) reconcileStreamAppendLocked(ctx context.Context, name 
 	release := p.BeginReplicationMutation()
 	defer release()
 	if marker == nil {
+		// Do not return (false, nil) for unsupported retained stream tails:
+		// preparation would then call ReconcileCommittedHWM and truncate them.
+		// Preserving uncertain events takes precedence over write availability;
+		// old-epoch/multiple-record tails require explicit recovery instead.
 		if current.CommittedHWM == math.MaxUint64 || p.NextOffset() != current.CommittedHWM+1 {
 			return false, fmt.Errorf("stream reconciliation requires a single retained tail record")
 		}

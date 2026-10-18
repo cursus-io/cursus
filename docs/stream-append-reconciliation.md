@@ -25,6 +25,14 @@ under the partition write lock instead of remaining permanently fenced.
   transactions, multiple tail records, missing records, and identity conflicts
   remain fail-closed. Recovery does not quarantine or delete divergent data.
 
+For event-sourcing topics, refusing unsupported retained tails deliberately
+prevents falling through to the previous HWM reconciliation path, which would
+truncate them. An old-epoch or multiple-record tail can therefore keep writes
+blocked until explicit recovery. This availability trade-off is intentional:
+automatic write resumption must not discard uncertain events. Repeated retries
+are tested to preserve both the committed prefix and the entire retained tail.
+Non-event-sourcing topics retain their existing preparation behavior.
+
 Each producer retry makes one bounded attempt using existing internal request
 timeouts. There is no new background worker, persistent database, wire command,
 or disk-format migration. If no producer retries, this path is not invoked.

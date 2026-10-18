@@ -222,11 +222,14 @@ func TestStreamRecoveryRetainedTailRejectsInvalidIdentity(t *testing.T) {
 			}
 			before, err := p.ReadMessages(0, 10)
 			require.NoError(t, err)
-			require.Contains(t, h.handleAppendStream(recoveryAppend), "ERROR")
-			after, err := p.ReadMessages(0, 10)
-			require.NoError(t, err)
-			require.Equal(t, before, after)
-			require.Equal(t, uint64(1), p.GetHWM())
+			for attempt := 0; attempt < 3; attempt++ {
+				require.Contains(t, h.handleAppendStream(recoveryAppend), "ERROR")
+				after, err := p.ReadMessages(0, 10)
+				require.NoError(t, err)
+				require.Equal(t, before, after)
+				require.Equal(t, uint64(len(before)), p.NextOffset())
+				require.Equal(t, uint64(1), p.GetHWM())
+			}
 		})
 	}
 }
