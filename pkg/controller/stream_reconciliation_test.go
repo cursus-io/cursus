@@ -265,7 +265,7 @@ func TestStreamRecoveryLostReplicaReplyPreservesBothCopies(t *testing.T) {
 				return
 			}
 			func() {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 				wc, err := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
 				if err != nil {
