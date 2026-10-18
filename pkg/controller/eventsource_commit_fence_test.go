@@ -52,18 +52,20 @@ func TestAppendStreamUncertainCommitPreservesOffset(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Another aggregate uses a different stream lock but shares this offset space.
-	second := handler.handleAppendStream("APPEND_STREAM topic=events key=aggregate-b version=1 message=replacement")
+	// A retry must finish the original operation rather than reuse its offset.
+	// Plain streams retain their version-conflict response for duplicate versions.
+	second := handler.handleAppendStream("APPEND_STREAM topic=events key=aggregate-a version=1 message=original")
 	after, err := p.ReadMessages(0, 10)
 	require.NoError(t, err)
 	require.Equal(t, before, after, "an uncertain commit must not permit offset reuse")
 	require.True(t, strings.HasPrefix(second, "ERROR"), second)
-	require.Error(t, p.RecoveryError())
+	require.Contains(t, second, "version_conflict")
+	require.NoError(t, p.RecoveryError())
 	require.Equal(t, uint64(1), p.NextOffset())
 	for path, original := range logBytes {
 		current, readErr := os.ReadFile(path)
 		require.NoError(t, readErr)
-		require.Equal(t, original, current, "blocked append must rewrite zero retained log bytes")
+		require.Equal(t, original, current, "recovered append must rewrite zero retained log bytes")
 	}
 
 	// The delayed entry can still commit. It must refer to the original bytes.
