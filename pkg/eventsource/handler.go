@@ -362,6 +362,8 @@ func (r *AppendResult) Response() string {
 	return fmt.Sprintf("OK version=%d offset=%d partition=%d", r.Version, r.Offset, r.Partition)
 }
 
+// AppendStream validates stream identity and version, then preserves the chosen
+// replication/commit contract before acknowledging the resulting offset.
 func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, string) {
 	h.wg.Add(1)
 	defer h.wg.Done()

@@ -10,10 +10,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// aggregateCommand builds a replay append with a per-aggregate producer.
 func aggregateCommand(key, id string, version int) string {
 	return fmt.Sprintf("APPEND_STREAM topic=matches key=%s version=%d event_id=%s producerId=%s seqNum=%d message=payload", key, version, id, key, version)
 }
 
+// TestAggregateEventIndexScansOnlyNewCommittedRecords guards incremental reads,
+// same-version retries and cross-key identity conflict rejection.
 func TestAggregateEventIndexScansOnlyNewCommittedRecords(t *testing.T) {
 	h, hp := newTestHandlerWithProvider(t)
 	defer func() { require.NoError(t, h.Close()) }()
@@ -35,6 +38,8 @@ func TestAggregateEventIndexScansOnlyNewCommittedRecords(t *testing.T) {
 	require.Len(t, storage.msgs, 105)
 }
 
+// TestAggregateEventIndexSerializesCrossKeyDuplicates permits only one append
+// when concurrent writers reuse an ID across different aggregate keys.
 func TestAggregateEventIndexSerializesCrossKeyDuplicates(t *testing.T) {
 	h, hp := newTestHandlerWithProvider(t)
 	defer func() { require.NoError(t, h.Close()) }()

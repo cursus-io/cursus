@@ -1813,6 +1813,8 @@ func (p *Partition) reconcileCommittedHWMLocked(hwm uint64) error {
 	return nil
 }
 
+// truncateReplicaTailLocked invalidates derived identity evidence and rebuilds
+// transaction/producer state after a fenced tail truncation. The caller holds mu.
 func (p *Partition) truncateReplicaTailLocked(offset uint64) error {
 	leo := p.LEO.Load()
 	if leo < offset {

@@ -16,10 +16,10 @@ type committedEventIDIndex struct {
 	generation uint64
 }
 
-// CommittedEventIDExists checks identity in the stable retained prefix. Callers
-// use this for aggregate replay streams, which prohibit log compaction and
-// transactional publishing; ordinary appends cannot rewrite the indexed prefix.
-// must serialize check-and-append for a partition and retain their replication
+// CommittedEventIDExists checks identity in the stable retained prefix of an
+// aggregate replay stream, which prohibits compaction and transactional writes.
+// Ordinary appends cannot rewrite its indexed prefix. Callers must serialize
+// check-and-append for a partition and retain their replication
 // mutation fence until the write outcome is resolved. The cache mutex alone
 // does not reserve an ID for a future append.
 func (p *Partition) CommittedEventIDExists(eventID string) (exists bool, err error) {
