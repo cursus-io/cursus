@@ -61,6 +61,7 @@ func (ch *CommandHandler) handleAppendStreamLocked(cmd string) string {
 		if indexResp := ch.reconcileEventSourceIndex(topicName, partition); indexResp != "" {
 			return indexResp
 		}
+		var retainedMessage types.Message
 		result, errResp := ch.ESHandler.AppendStream(cmd, eventsource.AppendOptions{
 			LeaderAppend: true,
 			LeaderEpoch:  int64(replicationSnapshot.LeaderEpoch),
@@ -74,11 +75,12 @@ func (ch *CommandHandler) handleAppendStreamLocked(cmd string) string {
 				if err != nil {
 					// A failed reply can still refer to an accepted Raft entry. The
 					// next writer must not truncate this tail using stale metadata.
-					p.MarkReconciliationPending(fmt.Errorf("stream commit outcome requires reconciliation: %w", err))
+					p.MarkReconciliationPending(&streamAppendOutcome{cause: err, stage: "commit", message: retainedMessage, snapshot: replicationSnapshot})
 				}
 				return err
 			},
 			AfterAppend: func(topic string, partition int, msg types.Message) error {
+				retainedMessage = msg
 				msgCmd := types.MessageCommand{
 					Topic:          topic,
 					Partition:      partition,
@@ -90,7 +92,7 @@ func (ch *CommandHandler) handleAppendStreamLocked(cmd string) string {
 				if err := ch.Cluster.ReplicateToFollowers(topic, partition, msgCmd, effectiveMinISR); err != nil {
 					// Some replicas may already have persisted the assigned offset.
 					// Preserve it until fenced recovery establishes a common history.
-					p.MarkReconciliationPending(fmt.Errorf("stream replication outcome requires reconciliation: %w", err))
+					p.MarkReconciliationPending(&streamAppendOutcome{cause: err, stage: "replication", message: msg, snapshot: replicationSnapshot})
 					return err
 				}
 				return nil

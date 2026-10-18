@@ -751,6 +751,45 @@ func TestHandler_RecoverIndexUsesCapturedStableTail(t *testing.T) {
 	require.NoError(t, h.RecoverIndexFromLog("orders", 0, idx))
 	require.Equal(t, uint64(1), idx.GetVersion("stable-key"))
 	require.Zero(t, idx.GetVersion("late-key"))
+	require.Equal(t, uint64(1), h.indexedHWM["orders:0"])
+	require.NoError(t, h.IndexCommittedToHWM("orders", 0, 2))
+	require.Equal(t, uint64(1), idx.GetVersion("late-key"))
+	require.Equal(t, uint64(2), h.indexedHWM["orders:0"])
+}
+
+func TestHandler_RecoverIndexPreservesFencedHistory(t *testing.T) {
+	for _, fence := range []string{"replication", "snapshot"} {
+		t.Run(fence, func(t *testing.T) {
+			h := newTestHandler(t)
+			defer func() { _ = h.Close() }()
+			require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=history version=1 message=old"), "OK version=1")
+			idx, err := h.getIndex("orders", 0)
+			require.NoError(t, err)
+			p, err := h.tm.GetTopic("orders").GetPartition(0)
+			require.NoError(t, err)
+			marker := fmt.Errorf("ambiguous replication")
+			if fence == "replication" {
+				p.MarkReconciliationPending(marker)
+			} else {
+				require.NoError(t, p.ReconcileSnapshotHWM(1))
+			}
+			if fence == "replication" {
+				require.Zero(t, p.LastStableOffset())
+			}
+			_, err = p.CheckedLastStableOffset()
+			require.Error(t, err)
+			require.Error(t, h.IndexCommittedToHWM("orders", 0, 1))
+			require.ErrorContains(t, h.RecoverIndexFromLog("orders", 0, idx), "boundary unavailable")
+			require.Equal(t, uint64(1), idx.GetVersion("history"), "fence must not reset committed history")
+			require.Equal(t, uint64(1), h.indexedHWM["orders:0"])
+			if fence == "replication" {
+				require.NoError(t, p.CompleteReconciliation(p.ReconciliationError(), 1))
+				require.NoError(t, h.IndexCommittedToHWM("orders", 0, 1))
+				require.NotContains(t, h.indexErrors, "orders:0")
+				require.Equal(t, uint64(1), idx.GetVersion("history"))
+			}
+		})
+	}
 }
 
 func TestHandler_RecoverIndexFromRetentionCheckpoint(t *testing.T) {
@@ -794,6 +833,16 @@ func TestHandler_RecoverIndexKeepsDurableReadFailuresFailClosed(t *testing.T) {
 	err = h.RecoverIndexFromLog("orders", 0, idx)
 	require.ErrorContains(t, err, "recover stream index from log offset=0")
 	require.ErrorContains(t, err, "unreadable durable record")
+	_, _, err = h.CurrentVersion("orders", "unreadable-key")
+	require.ErrorContains(t, err, "unreadable durable record", "partial rebuild must not return version zero")
+	hp.handlers["orders:0"].readErr = nil
+	// An ordinary lookup retries recovery after a transient fault clears;
+	// no restart or explicit administrative rebuild is required.
+	version, _, err := h.CurrentVersion("orders", "unreadable-key")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), version)
+	require.NotContains(t, h.indexErrors, "orders:0")
+	require.NoError(t, h.IndexCommittedToHWM("orders", 0, 1))
 }
 
 func TestHandler_RecoverIndexRejectsGapBeforeStableTail(t *testing.T) {

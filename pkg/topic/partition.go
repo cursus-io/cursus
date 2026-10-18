@@ -963,13 +963,29 @@ func (p *Partition) FirstOffset() uint64 {
 // LastStableOffset returns the first offset that may still be blocked by an
 // unresolved transaction, capped by the committed and flushed partition tail.
 func (p *Partition) LastStableOffset() uint64 {
-	if p.RecoveryError() != nil {
-		return 0
-	}
-	if p.hwmReadinessError() != nil {
-		return 0
+	offset, _ := p.lastStableOffset(false)
+	return offset
+}
+
+// CheckedLastStableOffset distinguishes an empty committed log from a fenced
+// partition. Derived indexes must never interpret an unavailable boundary as 0.
+func (p *Partition) CheckedLastStableOffset() (uint64, error) {
+	return p.lastStableOffset(true)
+}
+
+func (p *Partition) lastStableOffset(checkSnapshot bool) (uint64, error) {
+	if err := p.RecoveryError(); err != nil {
+		return 0, err
 	}
 	p.mu.RLock()
+	if checkSnapshot && p.snapshotRecovery {
+		p.mu.RUnlock()
+		return 0, fmt.Errorf("snapshot recovery is pending")
+	}
+	if err := p.hwmReadinessErrorLocked(); err != nil {
+		p.mu.RUnlock()
+		return 0, err
+	}
 	hwm := p.HWM
 	p.mu.RUnlock()
 
@@ -980,7 +996,7 @@ func (p *Partition) LastStableOffset() uint64 {
 	p.pruneTransactionIndex(p.dh.GetFirstOffset())
 	p.txnMarkerMu.Lock()
 	defer p.txnMarkerMu.Unlock()
-	return firstUnresolvedOpenOffset(hwm, p.txnRetentionFloor, p.txnOpenOffsets, p.txnMarkers, p.txnResolver)
+	return firstUnresolvedOpenOffset(hwm, p.txnRetentionFloor, p.txnOpenOffsets, p.txnMarkers, p.txnResolver), nil
 }
 func (p *Partition) ReadCommitted(offset uint64, max int) ([]types.Message, error) {
 	messages, _, err := p.ReadCommittedBounded(offset, max, 0, true)

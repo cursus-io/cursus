@@ -1842,6 +1842,10 @@ func newDistributedAckTestHandler(t *testing.T, brokerMinISR int) (*CommandHandl
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
+	// Tiny test logs should not require 5% of a large operator filesystem.
+	// Disk-admission thresholds have their own dedicated storage tests.
+	cfg.DiskMinFreeBytes = 1024 * 1024
+	cfg.DiskMinFreePercent = 0.001
 	cfg.EnabledDistribution = true
 	cfg.MinInSyncReplicas = brokerMinISR
 	cfg.ChannelBufferSize = 2

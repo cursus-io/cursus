@@ -27,6 +27,7 @@ type Handler struct {
 	wg          sync.WaitGroup
 	indexes     map[string]*StreamIndex   // key: "topic:partition"
 	indexedHWM  map[string]uint64         // committed log tail represented by each index
+	indexErrors map[string]error          // failed rebuilds must not expose partial indexes
 	snapshots   map[string]*SnapshotStore // key: "topic:partition"
 }
 
@@ -58,10 +59,11 @@ type SnapshotResult struct {
 // NewHandler creates a new event sourcing command handler.
 func NewHandler(tm *topic.TopicManager) *Handler {
 	return &Handler{
-		tm:         tm,
-		indexes:    make(map[string]*StreamIndex),
-		indexedHWM: make(map[string]uint64),
-		snapshots:  make(map[string]*SnapshotStore),
+		tm:          tm,
+		indexes:     make(map[string]*StreamIndex),
+		indexedHWM:  make(map[string]uint64),
+		indexErrors: make(map[string]error),
+		snapshots:   make(map[string]*SnapshotStore),
 	}
 }
 
@@ -75,8 +77,9 @@ func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, err
 		return nil, fmt.Errorf("handler is closed")
 	}
 	idx, ok := h.indexes[key]
+	indexErr := h.indexErrors[key]
 	h.mu.RUnlock()
-	if ok {
+	if ok && indexErr == nil {
 		return idx, nil
 	}
 
@@ -84,7 +87,23 @@ func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, err
 	defer h.mu.Unlock()
 
 	// Double-check after acquiring write lock.
+	if h.closed {
+		return nil, fmt.Errorf("handler is closed")
+	}
 	if idx, ok := h.indexes[key]; ok {
+		if h.indexErrors[key] != nil {
+			// Retry a failed rebuild under the same lifetime/publication lock
+			// as lazy initialization. Do not call the public recovery method:
+			// callers may already hold indexSyncMu. A still-fenced boundary is
+			// checked before Reset, and a failed scan remains inaccessible.
+			indexedThrough, err := h.recoverIndexFromLog(topicName, partitionID, idx)
+			if err != nil {
+				h.indexErrors[key] = err
+				return nil, err
+			}
+			h.indexedHWM[key] = indexedThrough
+			delete(h.indexErrors, key)
+		}
 		return idx, nil
 	}
 
@@ -96,25 +115,16 @@ func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, err
 	if err != nil {
 		return nil, fmt.Errorf("open stream index for %s:%d: %w", topicName, partitionID, err)
 	}
-	if err := h.RecoverIndexFromLog(topicName, partitionID, idx); err != nil {
-		_ = idx.Close()
-		return nil, err
-	}
-	t := h.tm.GetTopic(topicName)
-	if t == nil {
-		_ = idx.Close()
-		return nil, fmt.Errorf("topic %s not found during stream index recovery", topicName)
-	}
-	p, err := t.GetPartition(partitionID)
+	indexedThrough, err := h.recoverIndexFromLog(topicName, partitionID, idx)
 	if err != nil {
 		_ = idx.Close()
-		return nil, fmt.Errorf("partition lookup for stream index %s:%d: %w", topicName, partitionID, err)
+		return nil, err
 	}
 	h.indexes[key] = idx
 	// Recovery reads only the stable committed prefix. Never claim that an
 	// unresolved transactional tail has been indexed merely because it is in
 	// the partition HWM.
-	h.indexedHWM[key] = p.LastStableOffset()
+	h.indexedHWM[key] = indexedThrough
 	return idx, nil
 }
 
@@ -208,8 +218,12 @@ func (h *Handler) IndexCommittedToHWM(topicName string, partitionID int, targetH
 	start := h.indexedHWM[key]
 	h.mu.RUnlock()
 
+	stable, err := p.CheckedLastStableOffset()
+	if err != nil {
+		return fmt.Errorf("committed stream index boundary unavailable: %w", err)
+	}
 	scanEnd := targetHWM
-	if stable := p.LastStableOffset(); stable < scanEnd {
+	if stable < scanEnd {
 		scanEnd = stable
 	}
 	if scanEnd <= start {
@@ -257,22 +271,43 @@ func (h *Handler) IndexCommittedToHWM(topicName string, partitionID int, targetH
 }
 
 func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *StreamIndex) error {
-	if err := idx.Reset(); err != nil {
-		return fmt.Errorf("reset stream index topic=%s partition=%d: %w", topicName, partitionID, err)
+	h.indexSyncMu.Lock()
+	defer h.indexSyncMu.Unlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	key := topicName + ":" + strconv.Itoa(partitionID)
+	indexedThrough, err := h.recoverIndexFromLog(topicName, partitionID, idx)
+	if err != nil {
+		// The old index may still be intact (a fenced boundary), or a rebuild
+		// may have failed partway. Never advertise a partial index as complete.
+		h.indexErrors[key] = err
+		return err
 	}
+	h.indexedHWM[key] = indexedThrough
+	delete(h.indexErrors, key)
+	return nil
+}
+
+func (h *Handler) recoverIndexFromLog(topicName string, partitionID int, idx *StreamIndex) (uint64, error) {
 	t := h.tm.GetTopic(topicName)
 	if t == nil || !t.IsEventSourcing {
-		return nil
+		return 0, fmt.Errorf("event sourcing topic %s unavailable during index recovery", topicName)
 	}
 	p, err := t.GetPartition(partitionID)
 	if err != nil {
-		return fmt.Errorf("partition lookup for index recovery topic=%s partition=%d: %w", topicName, partitionID, err)
+		return 0, fmt.Errorf("partition lookup for index recovery topic=%s partition=%d: %w", topicName, partitionID, err)
 	}
 
 	first := p.GetFirstOffset()
-	latest := p.LastStableOffset()
+	latest, err := p.CheckedLastStableOffset()
+	if err != nil {
+		return 0, fmt.Errorf("stream index recovery boundary unavailable: %w", err)
+	}
 	if first > latest {
-		return fmt.Errorf("stream retention floor %d exceeds stable tail %d", first, latest)
+		return 0, fmt.Errorf("stream retention floor %d exceeds stable tail %d", first, latest)
+	}
+	if err := idx.Reset(); err != nil {
+		return 0, fmt.Errorf("reset stream index topic=%s partition=%d: %w", topicName, partitionID, err)
 	}
 	if first > 0 {
 		// The stream index is disposable. Once retention removes its prefix,
@@ -280,19 +315,19 @@ func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *St
 		// preceding version.
 		ss, err := NewSnapshotStore(h.tm.GetLogDir(topicName, partitionID), partitionID)
 		if err != nil {
-			return fmt.Errorf("open snapshot checkpoint for stream index recovery: %w", err)
+			return 0, fmt.Errorf("open snapshot checkpoint for stream index recovery: %w", err)
 		}
 		records, listErr := ss.List()
 		closeErr := ss.Close()
 		if err := errors.Join(listErr, closeErr); err != nil {
-			return fmt.Errorf("load snapshot checkpoint for stream index recovery: %w", err)
+			return 0, fmt.Errorf("load snapshot checkpoint for stream index recovery: %w", err)
 		}
 		if len(records) == 0 {
-			return fmt.Errorf("cannot recover retained event stream at offset %d without a snapshot checkpoint", first)
+			return 0, fmt.Errorf("cannot recover retained event stream at offset %d without a snapshot checkpoint", first)
 		}
 		for _, record := range records {
 			if err := idx.SeedVersion(record.Key, record.Version); err != nil {
-				return fmt.Errorf("seed stream index from snapshot: %w", err)
+				return 0, fmt.Errorf("seed stream index from snapshot: %w", err)
 			}
 		}
 	}
@@ -300,10 +335,10 @@ func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *St
 	for offset := first; offset < latest; {
 		msgs, _, next, err := p.ReadCommittedPage(offset, batchSize, 0, true)
 		if err != nil {
-			return fmt.Errorf("recover stream index from log offset=%d: %w", offset, err)
+			return 0, fmt.Errorf("recover stream index from log offset=%d: %w", offset, err)
 		}
 		if next <= offset {
-			return fmt.Errorf("recover stream index stopped before stable tail at offset=%d tail=%d", offset, latest)
+			return 0, fmt.Errorf("recover stream index stopped before stable tail at offset=%d tail=%d", offset, latest)
 		}
 		bounded := msgs[:0]
 		for _, msg := range msgs {
@@ -314,12 +349,12 @@ func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *St
 		}
 		if len(bounded) != 0 {
 			if err := h.indexMessages(idx, bounded); err != nil {
-				return err
+				return 0, err
 			}
 		}
 		offset = min(next, latest)
 	}
-	return nil
+	return latest, nil
 }
 
 type SnapshotPage struct {
@@ -522,6 +557,12 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 	})
 	recoveredCommit := false
 	if err != nil {
+		// Replication uncertainty fences reads, it does not invalidate the
+		// already committed index. Preserve it until reconciliation can index
+		// the retained record. A zero fail-closed LSO is not an empty history.
+		if _, boundaryErr := p.CheckedLastStableOffset(); boundaryErr != nil {
+			return nil, fmt.Sprintf("ERROR: append_stream_failed reason=%q recovery_reason=%q", err.Error(), boundaryErr.Error())
+		}
 		if recoveryErr := h.RecoverIndexFromLog(topicName, partitionID, idx); recoveryErr != nil {
 			return nil, fmt.Sprintf("ERROR: append_stream_failed reason=%q recovery_reason=%q", err.Error(), recoveryErr.Error())
 		}
@@ -1045,6 +1086,7 @@ func (h *Handler) DeleteTopic(topicName string) error {
 		}
 		delete(h.indexes, key)
 		delete(h.indexedHWM, key)
+		delete(h.indexErrors, key)
 	}
 	for key, ss := range h.snapshots {
 		if !strings.HasPrefix(key, prefix) {
