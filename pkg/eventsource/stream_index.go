@@ -39,6 +39,9 @@ type streamState struct {
 // that share the same hash. This is a known imprecision with negligible probability.
 type StreamIndex struct {
 	mu sync.RWMutex
+	// Serialize aggregate ID absence checks through append acknowledgement,
+	// including standalone writers using different aggregate keys.
+	aggregateAppendMu sync.Mutex
 
 	dir         string
 	partitionID int
