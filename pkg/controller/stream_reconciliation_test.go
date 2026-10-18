@@ -23,6 +23,33 @@ import (
 
 const recoveryAppend = "APPEND_STREAM topic=events key=match-1 version=1 event_id=event-1 producerId=producer-1 seqNum=1 message=original"
 
+// A failed append must not reset the committed historical index using the
+// fail-closed stable offset (zero). Retry must preserve other aggregates too.
+func TestStreamRecoveryPreservesHistoricalIndexWithoutRestart(t *testing.T) {
+	h, p := newStreamRecoveryFixture(t)
+	for _, cmd := range []string{
+		"APPEND_STREAM topic=events key=history-a version=1 event_id=history-a-1 producerId=history-a seqNum=1 message=old-a",
+		"APPEND_STREAM topic=events key=history-b version=1 event_id=history-b-1 producerId=history-b seqNum=1 message=old-b",
+	} {
+		require.True(t, strings.HasPrefix(h.handleAppendStream(cmd), "OK "))
+	}
+	loseStreamCommitReply(t, h)
+	before, err := p.ReadMessages(0, 10)
+	require.NoError(t, err)
+	require.Len(t, before, 3)
+	require.Equal(t, "OK version=1 offset=2 partition=0", h.handleAppendStream(recoveryAppend))
+	for _, key := range []string{"history-a", "history-b", "match-1"} {
+		version, _, err := h.ESHandler.CurrentVersion("events", key)
+		require.NoError(t, err)
+		require.Equal(t, uint64(1), version, "historical aggregate %s", key)
+	}
+	after, err := p.ReadCommitted(0, 10)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	require.Equal(t, "OK version=1 offset=2 partition=0", h.handleAppendStream(recoveryAppend))
+	require.Contains(t, h.handleAppendStream("APPEND_STREAM topic=events key=history-a version=2 event_id=history-a-2 producerId=history-a seqNum=2 message=next"), "OK version=2 offset=3")
+}
+
 // newStreamRecoveryFixture uses real temporary log files and small explicit
 // test headroom, independent of the operator disk's percentage of free space.
 func newStreamRecoveryFixture(t *testing.T) (*CommandHandler, *topic.Partition) {

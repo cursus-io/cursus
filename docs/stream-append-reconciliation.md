@@ -37,6 +37,20 @@ Each producer retry makes one bounded attempt using existing internal request
 timeouts. There is no new background worker, persistent database, wire command,
 or disk-format migration. If no producer retries, this path is not invoked.
 
+## Historical index preservation
+
+An unavailable committed-read boundary is not an empty log. Failed append
+handling preserves the existing historical index while replication or snapshot
+recovery is fenced, instead of resetting it using the fail-closed LSO of zero.
+After the original event commits, incremental indexing starts at the retained
+indexed watermark and preserves every other aggregate's version.
+
+Full index reconstruction records the exact stable boundary it scanned, not a
+later watermark sampled after reconstruction. A failed explicit rebuild keeps
+subsequent lookups fail-closed until a successful rebuild or restart; it does
+not return a successful version zero from a partial index. The original log,
+consumer offsets, deduplication identities and recovery fences are unchanged.
+
 ## Validation and operational limits
 
 Regression tests cover a follower storing the event but losing its wire reply,
