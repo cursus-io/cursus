@@ -767,8 +767,9 @@ func TestHandler_RecoverIndexPreservesFencedHistory(t *testing.T) {
 			require.NoError(t, err)
 			p, err := h.tm.GetTopic("orders").GetPartition(0)
 			require.NoError(t, err)
+			marker := fmt.Errorf("ambiguous replication")
 			if fence == "replication" {
-				p.MarkReconciliationPending(fmt.Errorf("ambiguous replication"))
+				p.MarkReconciliationPending(marker)
 			} else {
 				require.NoError(t, p.ReconcileSnapshotHWM(1))
 			}
@@ -781,6 +782,12 @@ func TestHandler_RecoverIndexPreservesFencedHistory(t *testing.T) {
 			require.ErrorContains(t, h.RecoverIndexFromLog("orders", 0, idx), "boundary unavailable")
 			require.Equal(t, uint64(1), idx.GetVersion("history"), "fence must not reset committed history")
 			require.Equal(t, uint64(1), h.indexedHWM["orders:0"])
+			if fence == "replication" {
+				require.NoError(t, p.CompleteReconciliation(p.ReconciliationError(), 1))
+				require.NoError(t, h.IndexCommittedToHWM("orders", 0, 1))
+				require.NotContains(t, h.indexErrors, "orders:0")
+				require.Equal(t, uint64(1), idx.GetVersion("history"))
+			}
 		})
 	}
 }
@@ -829,10 +836,13 @@ func TestHandler_RecoverIndexKeepsDurableReadFailuresFailClosed(t *testing.T) {
 	_, _, err = h.CurrentVersion("orders", "unreadable-key")
 	require.ErrorContains(t, err, "unreadable durable record", "partial rebuild must not return version zero")
 	hp.handlers["orders:0"].readErr = nil
-	require.NoError(t, h.RecoverIndexFromLog("orders", 0, idx))
+	// An ordinary lookup retries recovery after a transient fault clears;
+	// no restart or explicit administrative rebuild is required.
 	version, _, err := h.CurrentVersion("orders", "unreadable-key")
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), version)
+	require.NotContains(t, h.indexErrors, "orders:0")
+	require.NoError(t, h.IndexCommittedToHWM("orders", 0, 1))
 }
 
 func TestHandler_RecoverIndexRejectsGapBeforeStableTail(t *testing.T) {

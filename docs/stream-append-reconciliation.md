@@ -47,9 +47,16 @@ indexed watermark and preserves every other aggregate's version.
 
 Full index reconstruction records the exact stable boundary it scanned, not a
 later watermark sampled after reconstruction. A failed explicit rebuild keeps
-subsequent lookups fail-closed until a successful rebuild or restart; it does
-not return a successful version zero from a partial index. The original log,
+subsequent lookups fail-closed until a successful rebuild. An ordinary lookup
+retries that rebuild so a transient read failure does not require a restart;
+it does not return a successful version zero from a partial index. The original log,
 consumer offsets, deduplication identities and recovery fences are unchanged.
+
+Full rebuilds deliberately retain the handler lifetime/publication lock, so
+unrelated index lookups can wait during a long scan. Narrowing that lock needs
+partition-scoped lifetime and atomic publication guards, not just an unlocked
+scan that exposes an intermediate index. Ordinary ambiguous-append retries
+preserve the index and use the incremental path instead of a full rebuild.
 
 ## Validation and operational limits
 

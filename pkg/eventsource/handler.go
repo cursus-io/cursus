@@ -79,10 +79,7 @@ func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, err
 	idx, ok := h.indexes[key]
 	indexErr := h.indexErrors[key]
 	h.mu.RUnlock()
-	if indexErr != nil {
-		return nil, indexErr
-	}
-	if ok {
+	if ok && indexErr == nil {
 		return idx, nil
 	}
 
@@ -90,10 +87,23 @@ func (h *Handler) getIndex(topicName string, partitionID int) (*StreamIndex, err
 	defer h.mu.Unlock()
 
 	// Double-check after acquiring write lock.
-	if err := h.indexErrors[key]; err != nil {
-		return nil, err
+	if h.closed {
+		return nil, fmt.Errorf("handler is closed")
 	}
 	if idx, ok := h.indexes[key]; ok {
+		if h.indexErrors[key] != nil {
+			// Retry a failed rebuild under the same lifetime/publication lock
+			// as lazy initialization. Do not call the public recovery method:
+			// callers may already hold indexSyncMu. A still-fenced boundary is
+			// checked before Reset, and a failed scan remains inaccessible.
+			indexedThrough, err := h.recoverIndexFromLog(topicName, partitionID, idx)
+			if err != nil {
+				h.indexErrors[key] = err
+				return nil, err
+			}
+			h.indexedHWM[key] = indexedThrough
+			delete(h.indexErrors, key)
+		}
 		return idx, nil
 	}
 
