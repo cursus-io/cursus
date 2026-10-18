@@ -450,6 +450,10 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 	if err != nil {
 		return nil, fmt.Sprintf("ERROR: stream_index_failed partition=%d reason=%q", partitionID, err.Error())
 	}
+	if t.Policy.AggregateReplay {
+		idx.aggregateAppendMu.Lock()
+		defer idx.aggregateAppendMu.Unlock()
+	}
 	if t.Policy.AggregateReplay && expectedVersion <= idx.GetVersion(key) {
 		entries, lookupErr := idx.Lookup(key, expectedVersion)
 		if lookupErr != nil {
@@ -470,7 +474,7 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 		}
 	}
 	if t.Policy.AggregateReplay {
-		seen, scanErr := aggregateEventIDExists(p, msg.EventID)
+		seen, scanErr := p.CommittedEventIDExists(msg.EventID)
 		if scanErr != nil {
 			return nil, fmt.Sprintf("ERROR: aggregate_proof_unavailable reason=%q", scanErr.Error())
 		}
@@ -544,35 +548,6 @@ func (h *Handler) AppendStream(cmd string, opts AppendOptions) (*AppendResult, s
 	h.mu.Unlock()
 
 	return &AppendResult{Topic: topicName, Key: key, Version: expectedVersion, Offset: appendedOffset, Partition: partitionID, Message: appendedMsg}, ""
-}
-
-// aggregateEventIDExists consults the committed retained log rather than an
-// in-memory index so an event-id uniqueness decision survives broker restart.
-func aggregateEventIDExists(p *topic.Partition, eventID string) (bool, error) {
-	limit := p.LastStableOffset()
-	for offset := p.OffsetRange().Earliest; offset < limit; {
-		messages, err := p.ReadCommitted(offset, 256)
-		if err != nil {
-			return false, err
-		}
-		if len(messages) == 0 {
-			return false, fmt.Errorf("committed log scan made no progress")
-		}
-		for _, existing := range messages {
-			if existing.Offset >= limit {
-				return false, nil
-			}
-			if existing.EventID == eventID {
-				return true, nil
-			}
-		}
-		next := messages[len(messages)-1].Offset + 1
-		if next <= offset {
-			return false, fmt.Errorf("committed log scan did not advance")
-		}
-		offset = next
-	}
-	return false, nil
 }
 
 // HandleReadStream writes event data directly to conn.

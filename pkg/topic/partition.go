@@ -72,6 +72,8 @@ type Partition struct {
 	distributed                bool
 	mu                         sync.RWMutex
 	reconcileMu                sync.RWMutex
+	eventIDGeneration          atomic.Uint64
+	eventIDs                   committedEventIDIndex
 	recoveryMu                 sync.RWMutex
 	recoveryErr                error
 	reconciliationErr          error
@@ -1710,6 +1712,7 @@ func (p *Partition) ReconcileSnapshotHWM(snapshotHWM uint64) error {
 	defer p.reconcileMu.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.eventIDGeneration.Add(1)
 	if p.snapshotRecovery {
 		if snapshotHWM < p.recoverySnapshotHWM {
 			return fmt.Errorf("snapshot recovery boundary changed: current=%d requested=%d", p.recoverySnapshotHWM, snapshotHWM)
@@ -1818,6 +1821,9 @@ func (p *Partition) truncateReplicaTailLocked(offset uint64) error {
 	if leo == offset {
 		return nil
 	}
+	// Invalidate derived identity proofs even if the replacement tail later
+	// reaches exactly the same offsets. No on-disk index is authoritative.
+	p.eventIDGeneration.Add(1)
 	if err := p.dh.TruncateTo(offset); err != nil {
 		return fmt.Errorf("truncate replica tail to %d: %w", offset, err)
 	}
