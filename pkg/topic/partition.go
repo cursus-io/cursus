@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -87,10 +87,14 @@ type Partition struct {
 	hwmCheckpointCh            chan struct{}
 	hwmCheckpointMu            sync.Mutex
 	hwmCheckpointWG            sync.WaitGroup
+	hwmCheckpointSaved         *hwmCheckpoint // protected by hwmCheckpointMu
+	hwmCheckpointWarning       checkpointWarning
+	checkpointIO               checkpointFileIO
 	producerStatePath          string
 	producerStateCh            chan struct{}
 	producerStateMu            sync.RWMutex
 	producerCheckpointMu       sync.Mutex
+	producerCheckpointSaved    *producerStateCheckpoint // protected by producerCheckpointMu
 	producerStateWG            sync.WaitGroup
 	producerState              sync.Map // map[string]*producerEntry
 	producerStateIndex         map[string]producerStateCheckpointEntry
@@ -187,6 +191,9 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 				}
 			} else {
 				p.HWM = persistedHWM
+				if versioned {
+					p.hwmCheckpointSaved = &hwmCheckpoint{Version: hwmCheckpointVersion, HWM: persistedHWM}
+				}
 				if p.distributed {
 					p.hwmAuthoritative = versioned
 				}
@@ -1421,6 +1428,7 @@ func (p *Partition) RecoverProducerStateFromLog() error {
 		p.producerStateIndex = make(map[string]producerStateCheckpointEntry)
 		p.producerStateCoveredOffset = durableTail
 		p.producerStateMu.Unlock()
+		p.signalProducerStateCheckpoint()
 		return nil
 	}
 	offset := first
@@ -1526,11 +1534,17 @@ func (p *Partition) StartProducerStateMaintenance() {
 }
 
 // FlushDisk forces all pending async writes to disk.
+// The data barrier is unconditional: unchanged metadata cannot prove that no
+// data is pending. Only checkpoint publication is conditional on saved state.
 func (p *Partition) FlushDisk() {
 	p.dh.Flush()
-	p.persistHWMCheckpoint()
+	if err := p.persistHWMCheckpoint(); err != nil {
+		p.warnHWMCheckpoint(err)
+		p.signalHWMCheckpointLocked()
+	}
 	if err := p.persistProducerStateCheckpoint(); err != nil {
 		util.Warn("failed to persist producer state checkpoint %s during flush: %v", p.producerStatePath, err)
+		p.signalProducerStateCheckpoint()
 	}
 }
 
@@ -1784,16 +1798,14 @@ func (p *Partition) FinalizeSnapshotRecovery(hwm uint64) error {
 		if p.HWM > p.LEO.Load() {
 			p.HWM = p.LEO.Load()
 		}
-		if checkpointHWM != p.HWM {
-			p.signalHWMCheckpointLocked()
-		}
+		p.signalHWMCheckpointLocked()
 		return nil
 	}
 	p.HWM = hwm
-	if checkpointHWM != hwm {
-		p.signalHWMCheckpointLocked()
-	}
 	p.hwmAuthoritative = true
+	// A save may have been deferred during replay, including a retry of a
+	// pre-snapshot failure. Equality at publication will suppress redundant I/O.
+	p.signalHWMCheckpointLocked()
 	return nil
 }
 
@@ -1837,7 +1849,9 @@ func (p *Partition) truncateReplicaTailLocked(offset uint64) error {
 		return fmt.Errorf("replica is behind repair boundary: leo=%d offset=%d", leo, offset)
 	}
 	if leo == offset {
-		return nil
+		// A previous attempt may have truncated successfully but failed to
+		// publish the reconstructed producer checkpoint. Retry that publication.
+		return p.persistProducerStateCheckpoint()
 	}
 	// Invalidate derived identity proofs even if the replacement tail later
 	// reaches exactly the same offsets. No on-disk index is authoritative.
@@ -1863,13 +1877,19 @@ func (p *Partition) truncateReplicaTailLocked(offset uint64) error {
 	})
 	p.producerStateMu.Lock()
 	p.producerStateIndex = make(map[string]producerStateCheckpointEntry)
+	// The cleared checkpoint covers no retained records until reconstruction.
+	p.producerStateCoveredOffset = p.dh.GetFirstOffset()
 	p.producerStateMu.Unlock()
-	if err := p.persistProducerStateCheckpoint(); err != nil {
-		return fmt.Errorf("persist cleared producer state after truncation: %w", err)
-	}
+	checkpointErr := p.persistProducerStateCheckpoint()
 	if err := p.RecoverProducerStateFromLog(); err != nil {
 		p.setRecoveryError(fmt.Errorf("recover producer state after truncation: %w", err))
 		return p.RecoveryError()
+	}
+	if checkpointErr != nil {
+		// Truncation is irreversible. Recover the retained fencing/dedup state
+		// even when the intermediate empty checkpoint could not be saved.
+		p.signalProducerStateCheckpoint()
+		return fmt.Errorf("persist cleared producer state after truncation: %w", checkpointErr)
 	}
 	return nil
 }
@@ -1920,82 +1940,74 @@ func (p *Partition) runHWMCheckpointLoop() {
 			dirty = true
 		case <-ticker.C:
 			if dirty {
-				p.persistHWMCheckpoint()
-				dirty = false
+				if err := p.persistHWMCheckpoint(); err != nil {
+					p.warnHWMCheckpoint(err)
+				} else {
+					dirty = false
+				}
 			}
 		case <-p.closeCh:
-			p.persistHWMCheckpoint()
+			if err := p.persistHWMCheckpoint(); err != nil {
+				util.Warn("failed to persist HWM checkpoint %s during shutdown: %v", p.hwmCheckpointPath, err)
+			}
 			return
 		}
 	}
 }
 
-func (p *Partition) persistHWMCheckpoint() {
-	p.mu.RLock()
-	checkpointPath := p.hwmCheckpointPath
-	hwm := p.HWM
-	authoritative := p.hwmAuthoritative
-	p.mu.RUnlock()
-
-	if checkpointPath == "" || !authoritative {
-		return
-	}
-
+// persistHWMCheckpoint serializes capture and publication, so an old capture
+// cannot follow a newer publication. Release mu before I/O so appends can proceed;
+// updates during I/O remain different from the saved image and signal another save.
+func (p *Partition) persistHWMCheckpoint() error {
 	p.hwmCheckpointMu.Lock()
 	defer p.hwmCheckpointMu.Unlock()
-
-	tmp := checkpointPath + ".tmp"
-	data, err := json.Marshal(hwmCheckpoint{Version: hwmCheckpointVersion, HWM: hwm})
+	p.mu.RLock()
+	checkpoint := hwmCheckpoint{Version: hwmCheckpointVersion, HWM: p.HWM}
+	authoritative, recovering := p.hwmAuthoritative, p.snapshotRecovery
+	p.mu.RUnlock()
+	// Temporary snapshot visibility must not replace the pre-replay boundary.
+	if p.hwmCheckpointPath == "" || !authoritative || recovering {
+		return nil
+	}
+	if p.hwmCheckpointSaved != nil && *p.hwmCheckpointSaved == checkpoint {
+		return nil
+	}
+	data, err := json.Marshal(checkpoint)
 	if err != nil {
-		util.Warn("failed to marshal HWM checkpoint %s: %v", checkpointPath, err)
-		return
+		return fmt.Errorf("marshal HWM checkpoint: %w", err)
 	}
-	data = append(data, '\n')
-	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		util.Warn("failed to open HWM checkpoint %s: %v", tmp, err)
-		return
+	// A failed directory sync may follow a successful replacement. Invalidate
+	// the previous image too: even a rollback to it must retry publication.
+	p.hwmCheckpointSaved = nil
+	if err := p.writeCheckpoint(p.hwmCheckpointPath, append(data, '\n')); err != nil {
+		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		util.Warn("failed to write HWM checkpoint %s: %v", tmp, err)
-		return
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		util.Warn("failed to sync HWM checkpoint %s: %v", tmp, err)
-		return
-	}
-	if err := f.Close(); err != nil {
-		util.Warn("failed to close HWM checkpoint %s: %v", tmp, err)
-		return
-	}
-	if err := replaceCheckpointFile(tmp, checkpointPath); err != nil {
-		util.Warn("failed to rename HWM checkpoint %s: %v", checkpointPath, err)
-		return
-	}
-	syncParentDir(filepath.Dir(checkpointPath))
+	p.hwmCheckpointSaved = &checkpoint
+	p.hwmCheckpointWarning = checkpointWarning{}
+	return nil
 }
 
-func syncParentDir(path string) {
-	if runtime.GOOS == "windows" {
-		return
+// Explicit flushes and background retries share a warning budget. Failure must
+// keep retrying, but an unhealthy filesystem must not generate a log storm.
+func (p *Partition) warnHWMCheckpoint(err error) {
+	p.hwmCheckpointMu.Lock()
+	defer p.hwmCheckpointMu.Unlock()
+	if p.hwmCheckpointWarning.allow(err.Error(), time.Now()) {
+		util.Warn("failed to persist HWM checkpoint %s: %v", p.hwmCheckpointPath, err)
 	}
-	// #nosec G304 -- checkpoint directory is derived from the broker-owned partition log directory.
-	dir, err := os.Open(path)
-	if err != nil {
-		util.Warn("failed to open HWM checkpoint directory %s: %v", path, err)
-		return
+}
+
+type checkpointWarning struct {
+	message string
+	last    time.Time
+}
+
+func (w *checkpointWarning) allow(message string, now time.Time) bool {
+	if message == w.message && now.Sub(w.last) < 30*time.Second {
+		return false
 	}
-	defer func() {
-		if closeErr := dir.Close(); closeErr != nil {
-			util.Warn("failed to close HWM checkpoint directory %s: %v", path, closeErr)
-		}
-	}()
-	if err := dir.Sync(); err != nil {
-		util.Warn("failed to sync HWM checkpoint directory %s: %v", path, err)
-	}
+	w.message, w.last = message, now
+	return true
 }
 
 func hwmCheckpointPath(dh types.StorageHandler, partitionID int) string {
@@ -2118,6 +2130,7 @@ func (p *Partition) loadProducerStateCheckpoint() {
 	}
 	p.producerStateMu.Lock()
 	defer p.producerStateMu.Unlock()
+	p.producerCheckpointSaved = &checkpoint
 	p.producerStateCoveredOffset = checkpoint.CoveredOffset
 	for producerID, entry := range checkpoint.Producers {
 		if producerID == "" || entry.Seq == 0 || entry.Offset < first || entry.Offset >= durableTail {
@@ -2146,51 +2159,36 @@ func (p *Partition) persistProducerStateCheckpoint() error {
 	if p.producerStatePath == "" {
 		return nil
 	}
-
 	p.producerCheckpointMu.Lock()
 	defer p.producerCheckpointMu.Unlock()
 	if p.dh != nil {
 		p.pruneProducerStateIndex(p.dh.GetFirstOffset())
 	}
 
+	p.producerStateMu.RLock()
+	saved := p.producerCheckpointSaved
+	if saved != nil && saved.CoveredOffset == p.producerStateCoveredOffset &&
+		maps.Equal(saved.Producers, p.producerStateIndex) {
+		p.producerStateMu.RUnlock()
+		return nil
+	}
 	checkpoint := producerStateCheckpoint{
 		Version:       producerStateCheckpointVersion,
 		CoveredOffset: p.producerStateCoveredOffset,
-		Producers:     make(map[string]producerStateCheckpointEntry),
-	}
-	p.producerStateMu.RLock()
-	for producerID, entry := range p.producerStateIndex {
-		checkpoint.Producers[producerID] = entry
+		Producers:     maps.Clone(p.producerStateIndex),
 	}
 	p.producerStateMu.RUnlock()
-
-	tmp := p.producerStatePath + ".tmp"
+	// Never acknowledge the live map after I/O: a concurrent update belongs to
+	// the next checkpoint, even when its notification was coalesced.
 	data, err := json.Marshal(checkpoint)
 	if err != nil {
 		return fmt.Errorf("marshal producer state checkpoint: %w", err)
 	}
-	data = append(data, '\n')
-
-	// #nosec G304 -- checkpoint path is derived from the broker-owned partition log directory.
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("open producer state checkpoint %s: %w", tmp, err)
+	p.producerCheckpointSaved = nil
+	if err := p.writeCheckpoint(p.producerStatePath, append(data, '\n')); err != nil {
+		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("write producer state checkpoint %s: %w", tmp, err)
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("sync producer state checkpoint %s: %w", tmp, err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close producer state checkpoint %s: %w", tmp, err)
-	}
-	if err := replaceCheckpointFile(tmp, p.producerStatePath); err != nil {
-		return fmt.Errorf("replace producer state checkpoint %s: %w", p.producerStatePath, err)
-	}
-	syncParentDir(filepath.Dir(p.producerStatePath))
+	p.producerCheckpointSaved = &checkpoint
 	return nil
 }
 

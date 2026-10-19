@@ -2,7 +2,10 @@ package fsm
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/disk"
@@ -11,6 +14,53 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
+
+func TestIdleISRCatchupPreservesCheckpointFiles(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskMinFreeBytes = 1
+	cfg.DiskMinFreePercent = 0.1
+	dm := disk.NewDiskManager(cfg)
+	t.Cleanup(dm.CloseAllHandlers)
+	tm := topic.NewTopicManager(cfg, dm, nil)
+	require.NoError(t, tm.CreateTopic("idle", 1, false, true))
+	p, err := tm.GetTopic("idle").GetPartition(0)
+	require.NoError(t, err)
+	t.Cleanup(p.Close)
+	require.NoError(t, p.EnqueueSyncIdempotent(types.Message{ProducerID: "p", SeqNum: 1, Epoch: 1, Payload: "durable"}))
+	p.FlushDisk()
+	state := NewBrokerFSM(tm, nil)
+	registerActiveBroker(t, state, "node-1")
+	registerActiveBroker(t, state, "node-2")
+	definition := tm.GetTopic("idle").Definition()
+	state.topicState["idle"] = &definition
+	state.partitionMetadata["idle-0"] = &PartitionMetadata{Leader: "node-1", LeaderEpoch: 4,
+		LifecycleEpoch: definition.LifecycleEpoch, CommittedHWM: 1, CommittedHWMKnown: true,
+		PartitionCount: 1, Replicas: []string{"node-1", "node-2"}, ISR: []string{"node-1", "node-2"}}
+	stamp := time.Unix(1000000000, 0)
+	before := make(map[string][]byte)
+	for _, suffix := range []string{"hwm", "producers"} {
+		path := filepath.Join(cfg.LogDir, "idle", "partition_0."+suffix)
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		before[path] = data
+		require.NoError(t, os.Chtimes(path, stamp, stamp))
+	}
+	for epoch := 4; epoch <= 5; epoch++ {
+		state.partitionMetadata["idle-0"].LeaderEpoch = epoch
+		for i := 0; i < 10; i++ {
+			require.Empty(t, state.BuildReplicaCatchupRequests("node-2"))
+		}
+	}
+	for path, want := range before {
+		got, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		require.Equal(t, stamp, info.ModTime(), path)
+	}
+}
 
 func newISRCatchupTestFSM(t *testing.T) *BrokerFSM {
 	t.Helper()
