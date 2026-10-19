@@ -154,7 +154,9 @@ func TestSnapshotEvidenceResolvedOpenCacheDeletionIsEquivalent(t *testing.T) {
 	require.NoError(t, p.WithSnapshotCertification(context.Background(), func(c *SnapshotReadCut) error {
 		require.Equal(t, uint64(2), c.LastStableOffset())
 		before := p.txnEvidenceRevision
-		require.Equal(t, uint64(2), p.lastStableOffset())
+		stable, err := p.lastStableOffset(false)
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), stable)
 		require.Empty(t, p.txnOpenOffsets)
 		require.Equal(t, before, p.txnEvidenceRevision)
 		require.True(t, p.txnMarkers[transactionMarkerKey{transactionalID: "tx", epoch: 1}].hasOpenOffset)
