@@ -172,9 +172,21 @@ func joinClusterGroup(t *testing.T, addrs []string, topic, group string) (*e2e.B
 		client.Close()
 		t.Fatalf("join group %s: %v", group, err)
 	}
-	if _, err := client.SyncGroup(topic, group, generation, memberID); err != nil {
-		client.Close()
-		t.Fatalf("sync group %s: %v", group, err)
+	// A successful join may overlap a metadata recovery turn on the next
+	// serving broker. Keep the same membership and retry only that admission
+	// rejection; generation, identity and protocol failures remain fatal.
+	deadline := time.Now().Add(clusterReadyTimeout)
+	for {
+		_, syncErr := client.SyncGroup(topic, group, generation, memberID)
+		if syncErr == nil {
+			break
+		}
+		var brokerErr *wire.BrokerError
+		if !errors.As(syncErr, &brokerErr) || brokerErr.Code != "consumer_metadata_recovering" || time.Now().Add(clusterPollInterval).After(deadline) {
+			client.Close()
+			t.Fatalf("sync group %s: %v", group, syncErr)
+		}
+		time.Sleep(clusterPollInterval)
 	}
 	return client, generation, memberID
 }
