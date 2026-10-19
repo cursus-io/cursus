@@ -225,8 +225,8 @@ func TestLineageShutdownWaitsOutsideStorageAndRejectsLatePublication(t *testing.
 	available := make(chan struct{})
 	go func() {
 		d.mu.Lock()
-		d.mu.Unlock()
 		close(available)
+		d.mu.Unlock()
 	}()
 	select {
 	case <-available:
