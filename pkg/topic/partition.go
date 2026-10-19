@@ -88,6 +88,7 @@ type Partition struct {
 	hwmCheckpointMu            sync.Mutex
 	hwmCheckpointWG            sync.WaitGroup
 	hwmCheckpointSaved         *hwmCheckpoint // protected by hwmCheckpointMu
+	hwmCheckpointWarning       checkpointWarning
 	checkpointIO               checkpointFileIO
 	producerStatePath          string
 	producerStateCh            chan struct{}
@@ -1538,7 +1539,7 @@ func (p *Partition) StartProducerStateMaintenance() {
 func (p *Partition) FlushDisk() {
 	p.dh.Flush()
 	if err := p.persistHWMCheckpoint(); err != nil {
-		util.Warn("failed to persist HWM checkpoint %s during flush: %v", p.hwmCheckpointPath, err)
+		p.warnHWMCheckpoint(err)
 		p.signalHWMCheckpointLocked()
 	}
 	if err := p.persistProducerStateCheckpoint(); err != nil {
@@ -1940,7 +1941,7 @@ func (p *Partition) runHWMCheckpointLoop() {
 		case <-ticker.C:
 			if dirty {
 				if err := p.persistHWMCheckpoint(); err != nil {
-					util.Warn("failed to persist HWM checkpoint %s: %v", p.hwmCheckpointPath, err)
+					p.warnHWMCheckpoint(err)
 				} else {
 					dirty = false
 				}
@@ -1982,7 +1983,31 @@ func (p *Partition) persistHWMCheckpoint() error {
 		return err
 	}
 	p.hwmCheckpointSaved = &checkpoint
+	p.hwmCheckpointWarning = checkpointWarning{}
 	return nil
+}
+
+// Explicit flushes and background retries share a warning budget. Failure must
+// keep retrying, but an unhealthy filesystem must not generate a log storm.
+func (p *Partition) warnHWMCheckpoint(err error) {
+	p.hwmCheckpointMu.Lock()
+	defer p.hwmCheckpointMu.Unlock()
+	if p.hwmCheckpointWarning.allow(err.Error(), time.Now()) {
+		util.Warn("failed to persist HWM checkpoint %s: %v", p.hwmCheckpointPath, err)
+	}
+}
+
+type checkpointWarning struct {
+	message string
+	last    time.Time
+}
+
+func (w *checkpointWarning) allow(message string, now time.Time) bool {
+	if message == w.message && now.Sub(w.last) < 30*time.Second {
+		return false
+	}
+	w.message, w.last = message, now
+	return true
 }
 
 func hwmCheckpointPath(dh types.StorageHandler, partitionID int) string {

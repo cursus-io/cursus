@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 
@@ -56,6 +57,24 @@ def trace_counts(path, start, end):
     return dict(counts)
 
 
+def execute(command, env, log, timeout=210):
+    # The Go deadline cannot bound a stalled tracer. Own a process group so a
+    # timeout terminates both strace and its test process, not unrelated jobs.
+    with subprocess.Popen(command, env=env, stdout=log, stderr=log,
+                          start_new_session=True) as process:
+        try:
+            status = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise RuntimeError(f"measurement exceeded {timeout}s; see its log") from error
+        if status:
+            raise subprocess.CalledProcessError(status, command)
+
+
 def run(root, name, revision, load, seconds, trace=False):
     result = root / (name + ".json")
     env = dict(os.environ, CURSUS_CHECKPOINT_RESULT=str(result),
@@ -69,7 +88,7 @@ def run(root, name, revision, load, seconds, trace=False):
                    "trace=write,pwrite64,fsync,fdatasync,rename,renameat,renameat2,openat,close"] + command
     print("running", name, flush=True)
     with (root / (name + ".log")).open("w") as log:
-        subprocess.run(command, env=env, stdout=log, stderr=log, check=True)
+        execute(command, env, log)
     data = json.loads(result.read_text())
     data.update(revision=revision, traced=trace, run=name)
     elapsed = data["seconds"]

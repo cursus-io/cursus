@@ -7,6 +7,9 @@ on October 19). All eight untraced runs completed in 30.000–30.002 seconds;
 all four trace runs completed in 10.000–10.002 seconds. These results replace
 the exploratory runs discussed below. [Raw counters, timestamps and binary
 hashes](benchmarks/idle-checkpoints-2026-10-20.json) are retained.
+The measured implementation is commit `f5c37fd`. The initial-review follow-up
+only limits repeated HWM failure warnings and bounds the measurement subprocess
+lifetime; it does not change checkpoint comparison, publication or data barriers.
 
 Untraced means of two runs per revision/condition:
 

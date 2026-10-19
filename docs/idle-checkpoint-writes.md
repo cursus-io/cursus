@@ -59,6 +59,9 @@ A failed publication invalidates the saved image even when rename succeeded.
 Returning to the former value therefore retries rather than trusting an image
 that may no longer exist on disk. The HWM maintenance loop retains pending work
 after failure. Explicit flush failures signal maintenance for another attempt.
+Background and explicit HWM retries share a warning limit: report the first
+failure, a changed error, or a 30-second reminder. Successful publication resets
+that budget; shutdown still reports a final failure. Retry cadence is unchanged.
 This does not change the public `FlushDisk()` signature or promise callers a
 new error-returning durability API.
 

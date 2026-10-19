@@ -1,7 +1,10 @@
 package topic
 
 import (
+	"bytes"
 	"errors"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -406,8 +409,36 @@ func (r *retryCheckpointIO) open(path string) (checkpointFile, error) {
 	return r.osCheckpointIO.open(path)
 }
 
+type checkpointLogCounter struct {
+	writer   io.Writer
+	path     []byte
+	warnings atomic.Int32
+}
+
+func (c *checkpointLogCounter) Write(data []byte) (int, error) {
+	if bytes.Contains(data, c.path) {
+		c.warnings.Add(1)
+	}
+	return c.writer.Write(data)
+}
+
+func TestCheckpointWarningReportsChangedErrorAndPeriodicReminder(t *testing.T) {
+	var warning checkpointWarning
+	now := time.Now()
+	require.True(t, warning.allow("disk full", now))
+	require.False(t, warning.allow("disk full", now.Add(time.Second)))
+	require.True(t, warning.allow("read only", now.Add(2*time.Second)))
+	require.False(t, warning.allow("read only", now.Add(31*time.Second)))
+	require.True(t, warning.allow("read only", now.Add(32*time.Second)))
+}
+
 func TestCheckpointBackgroundRetriesWithoutNewMutation(t *testing.T) {
 	p, _ := checkpointFixture(t)
+	counter := &checkpointLogCounter{writer: log.Writer(), path: []byte(p.hwmCheckpointPath)}
+	log.SetOutput(counter)
+	t.Cleanup(func() { log.SetOutput(counter.writer) })
+	p.dh = &checkpointStorage{}
+	p.producerStatePath = ""
 	ops := &retryCheckpointIO{}
 	ops.fail.Store(true)
 	p.checkpointIO = ops
@@ -416,8 +447,14 @@ func TestCheckpointBackgroundRetriesWithoutNewMutation(t *testing.T) {
 	t.Cleanup(p.Close)
 	p.SetHWM(1)
 	require.Eventually(t, func() bool { return ops.attempts.Load() >= 2 }, 2*time.Second, 10*time.Millisecond)
+	p.FlushDisk()
+	require.Equal(t, int32(1), counter.warnings.Load(), "explicit flush and repeated background failures share the warning limit")
 	ops.fail.Store(false)
 	require.Eventually(t, func() bool { hwm, ok, _ := loadHWMCheckpoint(p.hwmCheckpointPath); return ok && hwm == 1 }, 2*time.Second, 10*time.Millisecond)
+	ops.fail.Store(true)
+	p.SetHWM(2)
+	require.Eventually(t, func() bool { return counter.warnings.Load() == 2 }, 2*time.Second, 10*time.Millisecond, "success resets the warning budget for a later failure")
+	ops.fail.Store(false)
 }
 
 func checkpointDiskConfig(dir string) *config.Config {
