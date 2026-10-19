@@ -289,7 +289,7 @@ func (h *Handler) publishRecoveredIndex(topicName string, partitionID int, idx *
 func (h *Handler) recoverIndexFromView(topicName string, partitionID int, idx *StreamIndex, view *topic.PartitionReadView) (uint64, error) {
 	end, err := view.CheckedLastStableOffset()
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("stream index recovery boundary unavailable: %w", err)
 	}
 	return end, h.recoverIndexWithView(topicName, partitionID, idx, view, end)
 }
