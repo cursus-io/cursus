@@ -253,15 +253,16 @@ func TestHWMCheckpointCapturesOnlyAfterSerialization(t *testing.T) {
 	t.Cleanup(p.Close)
 	p.SetHWM(1)
 	p.hwmCheckpointMu.Lock()
-	done := make(chan struct{})
-	go func() { p.persistHWMCheckpoint(); close(done) }()
+	done := make(chan error, 1)
+	go func() { done <- p.persistHWMCheckpoint() }()
 	time.Sleep(30 * time.Millisecond)
 	p.mu.Lock()
 	p.HWM = 8
 	p.mu.Unlock()
 	p.hwmCheckpointMu.Unlock()
 	select {
-	case <-done:
+	case err := <-done:
+		require.NoError(t, err)
 	case <-time.After(time.Second):
 		t.Fatal("checkpoint blocked")
 	}
