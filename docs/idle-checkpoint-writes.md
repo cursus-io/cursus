@@ -16,20 +16,33 @@ host runner was active. These observations identify repeated checkpoint work;
 they do not establish that the whole node was idle or predict a CPU reduction.
 This change does not alter MySQL, deploy an image, or tune flush intervals.
 
-## Kafka comparison and design
+## Design requirements
 
-The reference is released **Apache Kafka 4.0.0**, not its moving trunk.
+Checkpoint equality is only a reason to skip unchanged metadata writes. It
+neither authorizes truncation nor admits a replica to ISR. Cursus retains its
+existing leader/lifecycle/prefix verification and Raft-authoritative rollback
+entry points; a local HWM alone does not establish a safe truncation boundary.
 
-| Reference | Adopt | Cursus difference and consequence |
-| --- | --- | --- |
-| [Accepted KIP-101](https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=177052956) | A local HWM alone is not proof of a safe truncation boundary; retain leader-epoch lineage checks. | This patch preserves Cursus's existing leader/lifecycle/prefix verification and Raft-authoritative rollback entry points. Checkpoint equality neither authorizes truncation nor admits a replica to ISR. |
-| [ProducerStateManager.takeSnapshot](https://github.com/apache/kafka/blob/4.0.0/storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerStateManager.java) | Publish a new snapshot only when persistence state changes; acknowledge the captured snapshot after success. | Kafka uses map/snapshot offsets. Cursus must compare producer epoch, sequence, record offset, coverage and deletions: rollback/refill can change state at the same offset. TTL removes the memory cache only; retained fencing entries remain until retention removes their records. |
-| [LocalLog.flush and markFlushed](https://github.com/apache/kafka/blob/4.0.0/storage/src/main/java/org/apache/kafka/storage/internals/log/LocalLog.java) | Keep data flush progress separate from metadata checkpoint progress. | All existing Cursus `StorageHandler.Flush` calls, synchronous append barriers, periodic disk syncs and replication fences remain. Checkpoint equality cannot prove that queued data is durable. |
-| [CheckpointFile.write](https://github.com/apache/kafka/blob/4.0.0/server-common/src/main/java/org/apache/kafka/server/common/CheckpointFile.java) | Serialize publication and use a temporary file, file sync, then replacement. | Cursus also requires successful parent-directory sync on Unix before caching success. Windows retains its existing `MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH`. Errors invalidate the prior saved image, including errors after rename. |
-| [ReplicaManager.checkpointHighWatermarks](https://github.com/apache/kafka/blob/4.0.0/core/src/main/scala/kafka/server/ReplicaManager.scala) | Keep committed visibility distinct from the local log tail and preserve shutdown checkpointing. | Kafka periodically writes grouped HWM checkpoints; it does **not** provide a general unchanged-HWM skip here. Cursus has per-partition files and Raft-driven recovery; temporary snapshot visibility must not overwrite the pre-replay durable HWM. |
-| [Official 4.0 topic configuration](https://kafka.apache.org/40/generated/topic_config.html#topicconfigs_flush.messages) | Understand the distinction between replicated durability and physical flush policy. | Kafka recommends replication/OS flushing in its default operating model. This is not permission to remove Cursus fsyncs or weaken its existing synchronous API guarantees. |
+Producer checkpoint comparison includes epoch, sequence, record offset, coverage
+and deletions, because rollback/refill can change state at the same offset. TTL
+eviction removes the memory cache only; retained fencing entries remain until
+retention removes their records.
 
-Before implementation, the comparison defined the regression checks: zero
+Data flush progress remains separate from checkpoint progress. Existing
+`StorageHandler.Flush` calls, synchronous append barriers, periodic disk syncs
+and replication fences remain: unchanged metadata does not prove that queued
+data is durable. Changed checkpoints still use serialized publication through a
+temporary file, file sync and replacement. Unix additionally requires successful
+parent-directory sync before caching success; Windows retains
+`MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`. Errors invalidate the saved
+image, including errors after rename.
+
+Committed visibility remains distinct from the local log tail. Cursus uses
+per-partition files and Raft-driven recovery, so temporary snapshot visibility
+must not overwrite the pre-replay durable HWM. Shutdown checkpointing and the
+existing synchronous API guarantees remain in place.
+
+These requirements define the regression checks: zero
 checkpoint operations for unchanged state with a retained data barrier; durable
 publication of each changed component; retry at every failure stage including
 post-rename directory failure; concurrent state changes; monotonic ordinary HWM;
