@@ -201,6 +201,14 @@ func TestLineageShutdownWaitsOutsideStorageAndRejectsLatePublication(t *testing.
 	d, _ := newLineageHandler(t)
 	appendLineageRecords(t, d, "record")
 	entered, release := make(chan struct{}), make(chan struct{})
+	// Fatal paths must unblock the builder before fixture cleanup joins Close.
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
 	d.lineageSyncFn = func(f *os.File) error { close(entered); <-release; return f.Sync() }
 	proof := make(chan error, 1)
 	go func() { _, err := d.LineageCandidates(1); proof <- err }()
@@ -212,10 +220,19 @@ func TestLineageShutdownWaitsOutsideStorageAndRejectsLatePublication(t *testing.
 	case <-time.After(time.Second):
 		t.Fatal("close did not stop admission")
 	}
-	if !d.mu.TryLock() {
+	// done closes while Close still holds mu briefly. Wait for its release;
+	// a single TryLock can mistake ordinary contention for a shutdown deadlock.
+	available := make(chan struct{})
+	go func() {
+		d.mu.Lock()
+		d.mu.Unlock()
+		close(available)
+	}()
+	select {
+	case <-available:
+	case <-time.After(time.Second):
 		t.Fatal("close waits for builder while holding storage mutex")
 	}
-	d.mu.Unlock()
 	close(release)
 	if err := <-proof; err == nil {
 		t.Fatal("late proof published after shutdown")
