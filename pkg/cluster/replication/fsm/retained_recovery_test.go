@@ -36,13 +36,25 @@ func retainedRequest(t *testing.T, f *BrokerFSM, p *topic.Partition, end uint64)
 func TestRetainedRecoverySourceMarkedRangesAndBootstrap(t *testing.T) {
 	f, p := indexedRecoveryFSM(t, nil)
 	retainedRecoveryCapabilities(f)
+	// Background data flushes can temporarily hold the publication gate. Retry
+	// only that documented contention result; all proof failures remain fatal.
+	fetch := func(r ReplicaCatchupRequest) ReplicaCatchupBatch {
+		t.Helper()
+		var batch ReplicaCatchupBatch
+		var err error
+		require.Eventually(t, func() bool {
+			batch, err = f.FetchReplicaCatchup(r)
+			return !errors.Is(err, disk.ErrContentPublicationBusy)
+		}, 5*time.Second, time.Millisecond)
+		require.NoError(t, err)
+		return batch
+	}
 	require.NoError(t, p.ReplicaAppendCompactedRange([]types.Message{{Offset: 2, Payload: "first"}, {Offset: 5, Payload: "last"}}, 8))
 	require.NoError(t, p.ApplyReplicaHWM(8))
 	f.partitionMetadata["orders-0"].CommittedHWM = 8
 	for _, end := range []uint64{0, 1, 3, 6, 8} {
 		r := retainedRequest(t, f, p, end)
-		batch, err := f.FetchReplicaCatchup(r)
-		require.NoError(t, err)
+		batch := fetch(r)
 		require.NoError(t, ValidateReplicaRecoveryMode(batch))
 		require.NoError(t, ValidateReplicaCatchupBatchDigest(batch))
 		require.Equal(t, r.RetainedPrefix, batch.RetainedPrefix)
@@ -63,8 +75,7 @@ func TestRetainedRecoverySourceMarkedRangesAndBootstrap(t *testing.T) {
 		case "beyond cut":
 			r.NextOffset, r.RetainedPrefix.End = 9, 9
 		}
-		batch, err := f.FetchReplicaCatchup(r)
-		require.NoError(t, err)
+		batch := fetch(r)
 		require.ErrorIs(t, ValidateReplicaRecoveryMode(batch), ErrReplicaBootstrapRequired)
 		require.NoError(t, ValidateReplicaCatchupBatchDigest(batch))
 		require.Equal(t, r.RetainedPrefix, batch.RetainedPrefix)
