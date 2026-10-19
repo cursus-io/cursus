@@ -102,6 +102,48 @@ func TestReplicaRequestCancelsQueuedMetadataFence(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestReplicaRequestCanceledTailRepairReleasesFSMWithoutMutation(t *testing.T) {
+	f, p := indexedRecoveryFSM(t, nil)
+	retainedRecoveryCapabilities(f)
+	require.NoError(t, p.ReplicaAppend([]types.Message{{Offset: 0, Payload: "committed"}, {Offset: 1, Payload: "speculative"}}))
+	require.NoError(t, p.ApplyReplicaHWM(1))
+	f.partitionMetadata["orders-0"].CommittedHWM = 1
+	release := p.BeginReplicationMutation()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, _, err := f.BuildReplicaCatchupRequestContext(ctx, "node-2", "orders", 0); done <- err }()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(2 * time.Second):
+		release()
+		release = nil
+		<-done
+		t.Fatal("canceled builder retained FSM gates while waiting for tail repair")
+	}
+	// The local partition remains busy, but unrelated metadata must progress.
+	gateCtx, gateCancel := context.WithTimeout(context.Background(), time.Second)
+	defer gateCancel()
+	unlock, err := lockSourceContext(gateCtx, &f.transitionMu, &f.materializationMu)
+	require.NoError(t, err)
+	unlock()
+	release()
+	release = nil
+	require.Equal(t, uint64(2), p.NextOffset(), "canceled repair cannot truncate after the owner releases its lock")
+	require.Equal(t, uint64(1), p.GetHWM())
+	require.NoError(t, p.RecoveryError())
+	_, ok, err := f.BuildReplicaCatchupRequestContext(context.Background(), "node-2", "orders", 0)
+	require.NoError(t, err)
+	require.True(t, ok, "a fresh turn can still perform the repair")
+	require.Equal(t, uint64(1), p.NextOffset())
+}
+
 func TestReplicaRequestAllowsCommittedAdvanceDuringProof(t *testing.T) {
 	var provider *retainedSourceTestProvider
 	f, p := indexedRecoveryFSMWithProvider(t, nil, func(dm *disk.DiskManager) topic.HandlerProvider {

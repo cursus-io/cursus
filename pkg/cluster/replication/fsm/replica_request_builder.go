@@ -176,7 +176,7 @@ func (f *BrokerFSM) BuildReplicaCatchupRequestContext(ctx context.Context, broke
 			err = p.ValidateReplicaRequestWitness(ctx, r.LocalWitness, leo)
 		}
 		if err == nil {
-			err = p.TruncateReplicaTail(r.CommittedHWM)
+			err = p.TruncateReplicaTailContext(ctx, r.CommittedHWM)
 		}
 		if err == nil {
 			p.FlushDisk()
