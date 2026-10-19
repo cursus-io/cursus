@@ -3,6 +3,7 @@ package eventsource
 import (
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -151,6 +152,37 @@ func TestHandlerAppendFailureDoesNotRecoverOverReplacement(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(7), version)
 	assertIndexUnusable(t, old)
+}
+
+func TestHandlerFencedAppendRetiresIndexWithoutErasingHistory(t *testing.T) {
+	h := newTestHandler(t)
+	t.Cleanup(func() { _ = h.Close(); h.tm.Stop() })
+	require.Contains(t, h.HandleAppendStream("APPEND_STREAM topic=orders key=history version=1 message=old"), "OK")
+	idx, err := h.getIndex("orders", 0)
+	require.NoError(t, err)
+	path := idx.indexFile.Name()
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.NotEmpty(t, before)
+	p, err := h.tm.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	marker := errors.New("commit response lost")
+	release := p.BeginReplicationMutation()
+	_, response := h.AppendStreamWithControllerFence("APPEND_STREAM topic=orders key=new version=1 message=new", AppendOptions{AfterAppend: func(string, int, types.Message) error {
+		p.MarkReconciliationPending(marker)
+		return marker
+	}})
+	release()
+	require.Contains(t, response, "append_stream_failed")
+	require.NotContains(t, h.indexes, "orders:0")
+	assertIndexUnusable(t, idx)
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "fenced retirement must not truncate history")
+	require.NoError(t, p.CompleteReconciliation(p.ReconciliationError(), 2))
+	version, _, err := h.CurrentVersion("orders", "history")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), version)
 }
 
 func TestRetireFailedIndexPreservesReplacement(t *testing.T) {

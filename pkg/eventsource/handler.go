@@ -639,12 +639,16 @@ func (h *Handler) appendStream(cmd string, opts AppendOptions, controllerFenced 
 		if appendErr != nil {
 			h.indexSyncMu.Lock()
 			defer h.indexSyncMu.Unlock()
-			if _, boundaryErr := view.CheckedLastStableOffset(); boundaryErr != nil {
-				return fmt.Errorf("append_stream_failed reason=%q recovery_reason=%q", appendErr.Error(), boundaryErr.Error())
-			}
 			indexKey := topicName + ":" + strconv.Itoa(partitionID)
 			if !h.retireIndex(indexKey, idx, appendErr) {
 				return fmt.Errorf("stream_index_replaced retryable=true")
+			}
+			// The failed append has already invalidated this object. Detach it
+			// even while recovery is fenced so the next attempt can rebuild.
+			// Retirement only closes files; the checked boundary below still
+			// prevents a reset from erasing the previously committed history.
+			if _, boundaryErr := view.CheckedLastStableOffset(); boundaryErr != nil {
+				return fmt.Errorf("append_stream_failed reason=%q recovery_reason=%q", appendErr.Error(), boundaryErr.Error())
 			}
 			var recoveryErr error
 			idx, recoveryErr = h.getIndexWithView(topicName, partitionID, view)
