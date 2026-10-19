@@ -23,6 +23,13 @@ type replicaRollbackStorage interface {
 
 type replicaRepairPolicy uint8
 
+// Only the compatibility API can resume this exact completed physical repair.
+// Checked recovery still requires its original authority and witness validation.
+type replicaCheckpointRetry struct {
+	offset     uint64
+	generation disk.ContentGeneration
+}
+
 const (
 	canonicalReplicaRollback replicaRepairPolicy = iota
 	speculativeReplicaTail
@@ -73,9 +80,18 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 	p.recoveryMu.RLock()
 	// A separate reconciliation marker may need canonical catch-up before its
 	// normal owner can resolve it. Preserve it without blocking physical repair.
-	err := errors.Join(p.recoveryErr, p.txnRecoveryErr, p.producerRecoveryErr, p.bootstrapErrorLocked(), p.rollbackErrorLocked())
+	baseErr := errors.Join(p.recoveryErr, p.txnRecoveryErr, p.producerRecoveryErr, p.bootstrapErrorLocked())
+	retry := p.rollbackCheckpointRetry
+	canRetry := retry != nil && p.rollbackErr != nil && !checked && policy == canonicalReplicaRollback &&
+		offset == retry.offset && expectedLEO == offset && p.LEO.Load() == offset && p.HWM == offset &&
+		!p.closed && !p.snapshotRecovery && baseErr == nil
+	err := errors.Join(baseErr, p.rollbackErrorLocked())
 	marker := p.reconciliationRevision
 	p.recoveryMu.RUnlock()
+	if canRetry {
+		p.mu.Unlock()
+		return p.retryReplicaCheckpoints(ctx, retry)
+	}
 	oldHWM, wasAuthoritative := p.HWM, p.hwmAuthoritative
 	if policy != canonicalReplicaRollback {
 		// Public repair boundaries are not tied to an earlier fetch request.
@@ -225,11 +241,17 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 	p.installProducerState(state)
 	_, durable := p.dh.(durablePartitionStorage)
 	strictCheckpoint := checked || supported || durable
+	checkpointFailure := func(err error) error {
+		if !checked && policy == canonicalReplicaRollback && supported {
+			p.rollbackCheckpointRetry = &replicaCheckpointRetry{offset: offset, generation: generation}
+		}
+		return err
+	}
 	// Explicitly non-durable legacy adapters have no checkpoint files. Real
 	// durable storage must still reject absent paths and failed persistence.
 	if strictCheckpoint || p.producerStatePath != "" {
 		if err := p.persistProducerStateCheckpointLocked(strictCheckpoint); err != nil {
-			return err
+			return checkpointFailure(err)
 		}
 	}
 	checkpointHWM := offset
@@ -240,7 +262,7 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 	// unknown old watermark merely because its speculative tail was removed.
 	if (policy != speculativeReplicaTail || wasAuthoritative) && (strictCheckpoint || p.hwmCheckpointPath != "") {
 		if err := p.persistHWMCheckpointLocked(checkpointHWM, strictCheckpoint); err != nil {
-			return err
+			return checkpointFailure(err)
 		}
 	}
 	p.mu.Lock()
@@ -273,6 +295,34 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 		}
 	}
 	return nil
+}
+
+// Caller owns all repair gates. No truncation or raw scan is repeated here.
+func (p *Partition) retryReplicaCheckpoints(ctx context.Context, retry *replicaCheckpointRetry) error {
+	storage, ok := p.dh.(replicaRollbackStorage)
+	if !ok || p.dh.GetAbsoluteOffset() != retry.offset {
+		return ErrReplicaRollbackFailed
+	}
+	if err := storage.CheckContentGenerationContext(ctx, retry.generation); err != nil {
+		return err
+	}
+	if err := p.persistProducerStateCheckpointLocked(true); err != nil {
+		return err
+	}
+	if err := p.persistHWMCheckpointLocked(retry.offset, true); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.recoveryMu.Lock()
+	defer p.recoveryMu.Unlock()
+	if p.closed {
+		return ErrReplicaRollbackFailed
+	}
+	return storage.PublishIfContentGeneration(retry.generation, func() {
+		p.rollbackErr = nil
+		p.rollbackCheckpointRetry = nil
+	})
 }
 
 func (p *Partition) clearOwnedReconciliationError(revision uint64) {

@@ -81,6 +81,7 @@ type Partition struct {
 	bootstrapPending           atomic.Bool
 	rollbackPending            atomic.Bool
 	rollbackErr                error                   // recoveryMu; only rollback failures
+	rollbackCheckpointRetry    *replicaCheckpointRetry // reconcileMu; completed legacy repair awaiting checkpoints
 	bootstrapMetadata          *disk.BootstrapMetadata // recoveryMu
 	bootstrapAttemptErr        error                   // recoveryMu
 	bootstrapLifecycle         uint64                  // recoveryMu
