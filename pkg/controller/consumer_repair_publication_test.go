@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
@@ -23,7 +25,16 @@ type rewritingRepairPublication struct {
 
 func (p *rewritingRepairPublication) Publish(fn func()) error {
 	p.before()
-	return p.ConsumerLogRepairPublication.Publish(fn)
+	// Keep the original tokens after rewriting. A background flush can delay
+	// publication, but must never let the stale generation publish state.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := p.ConsumerLogRepairPublication.Publish(fn)
+		if !errors.Is(err, disk.ErrContentPublicationBusy) || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 func (r *rewritingRepairReader) AcquireConsumerLogRepairPublication(repairs map[int]uint64) (coordinator.ConsumerLogRepairPublication, error) {
 	publication, err := r.consumerRecoveryReader.AcquireConsumerLogRepairPublication(repairs)
