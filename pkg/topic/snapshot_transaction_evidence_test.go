@@ -164,6 +164,27 @@ func TestSnapshotEvidenceResolvedOpenCacheDeletionIsEquivalent(t *testing.T) {
 	}))
 }
 
+func TestSnapshotCheckedStableBoundaryRemainsFixedAcrossDecisionChange(t *testing.T) {
+	p, _ := snapshotEvidencePartition(t)
+	m := transaction.NewManager()
+	importSnapshotCutOpen(t, m)
+	p.SetTransactionDecisionResolver(m)
+	require.NoError(t, p.WithSnapshotCertification(context.Background(), func(c *SnapshotReadCut) error {
+		fixed := c.LastStableOffset()
+		state := m.ExportState()
+		state["tx"].State = transaction.StateCommitted
+		require.NoError(t, m.ImportState(state))
+		live, err := p.lastStableOffset(false)
+		require.NoError(t, err)
+		require.Greater(t, live, fixed)
+		stable, err := c.View().CheckedLastStableOffset()
+		require.NoError(t, err)
+		require.Equal(t, fixed, stable, "the checked view must not sample a later live transaction boundary")
+		require.Error(t, c.ValidateTransactional(context.Background()))
+		return nil
+	}))
+}
+
 func TestSnapshotEvidenceSaturationPreservesRawExport(t *testing.T) {
 	for _, exhaustedAtEntry := range []bool{false, true} {
 		p, _ := snapshotEvidencePartition(t)

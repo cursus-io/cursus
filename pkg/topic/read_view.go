@@ -126,7 +126,7 @@ func (v *PartitionReadView) CheckedLastStableOffset() (uint64, error) {
 	if err := v.check(); err != nil {
 		return 0, err
 	}
-	if v.offline {
+	if v.offline || v.snapshotCut != nil {
 		return v.LastStableOffset(), nil
 	}
 	return v.p.lastStableOffset(true)
