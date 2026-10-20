@@ -1,4 +1,45 @@
-# Retained bootstrap admission
+# Retained bootstrap storage
+
+Bootstrap replaces a partition's retained log when replication cannot prove a
+usable prefix. The caller validates membership and leadership; a persisted
+installation fence alone never authorizes ISR admission.
+
+## Installation and publication
+
+`ExportBootstrapContext` captures canonical records and a bounded snapshot
+catalog, preserving control records and transaction metadata. Logical bounds
+are independent of record count: marked compacted ranges may contain holes or
+no records.
+
+`StageBootstrap` accepts the fixed `records` (`canonical-log`) and `catalog`
+(`snapshot-catalog`) descriptors. It validates identities, bounds, checksums and
+sizes before staging. Chunks arrive in order; exact duplicates are accepted,
+while conflicting duplicates and gaps are rejected.
+
+Before writing durable intent, installation validates hashes, framing, topic
+and partition identity, logical bounds and permitted gaps. Valid checksums alone
+are insufficient. Failure before intent preserves the old log and permits abort.
+After intent, recovery must finish replacement and derived-state reconstruction.
+Reopen validates the complete replacement/deletion inventory before replay;
+malformed intent cannot authorize deleting partition or neighboring files.
+
+The topic layer's `BootstrapSession` drains read views and fences publication.
+It detaches derived file handles, installs the records, and rebuilds event-source,
+producer, transaction and checkpoint state before releasing the pending barrier.
+Storage installation alone does not publish recovered state.
+
+`WithBootstrapSource` captures one local generation at its committed, flushed
+end even if the physical log has an uncommitted tail. Exported files can outlive
+the callback, but the read view and callback object cannot, including on error.
+Callbacks detach their results before making network or Raft calls.
+
+Regression coverage includes interrupted replacement and reopen, missing or
+corrupt staging files, malformed inventories and checksum-valid malformed
+records, compacted gaps, transaction reconstruction, checkpoint failure/retry,
+callback lifetime and committed bounds. Storage tests alone do not establish
+complete broker activation or mixed-version recovery.
+
+## Admission limits
 
 `DiskHandler.SetBootstrapLimits(BootstrapLimits{MaxTransferBytes: ..., MaxTotalBytes: ...})`
 sets positive byte limits for new exports and receives. `BootstrapLimits()` returns
@@ -46,9 +87,10 @@ is independent of a suffix start; the fixed end cannot exceed the fence's commit
 HWM. The caller must hold no storage/partition locks and must establish a bounded
 creating owner with a finite lifetime and cancellation before calling. Success
 transfers `Close` responsibility to that owner. This path starts no TTL and returns
-only a private prepared handle; a future registry must check the original token
-again at publication and establish the ready-state TTL. Production networking,
-registry ownership, and recovery capability negotiation are not wired to this API.
+only a private prepared handle. The controller's metadata source registry checks
+the original token again at publication and owns the ready-state TTL. The broker
+wires authenticated transport and capability negotiation around this storage
+API; a disk handle alone does not authorize a network transfer.
 
 Admission retries one cleanup, checks headroom, and acquires the shared active
 slot before the first page. Pages request at most 1 MiB of serialized payload and

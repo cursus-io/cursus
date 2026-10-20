@@ -31,6 +31,8 @@ This index separates normative contracts from implementation notes. When prose c
 - [Disk Persistence](core/storage/disk-persistence.md)
 - [Segment Management](core/storage/segment-management.md)
 - [Platform Optimizations](core/storage/platform-optimizations.md)
+- [Replica Recovery](replica-recovery-design.md): proof, bootstrap, activation, and recovery work guarantees.
+- [Bootstrap Storage](../pkg/disk/BOOTSTRAP.md): staging, durable installation, and publication fences.
 
 ## Operations And Evaluation
 

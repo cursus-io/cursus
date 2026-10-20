@@ -34,16 +34,13 @@ exchanges; these are not claims about bounded disk bytes or elapsed time.
 
 ## Restart observation in fault tests
 
-[Kafka 4.0.0's BrokerLifecycleManager](https://github.com/apache/kafka/blob/4.0.0/core/src/main/scala/kafka/server/BrokerLifecycleManager.scala)
-separates initial metadata catch-up from initial unfencing. Cursus adopts that
-distinction in its recovery test barrier: a failed readiness probe does not
-prove that a restarted broker has applied the recovery fence. Each broker must
+A failed readiness probe does not prove that a restarted broker has applied
+the recovery fence. Each broker must
 locally report the expected partition, leader epoch, and recovery replica before
 the test submits unrelated consumer metadata writes. Readiness must still return
 503 while the fault deliberately pauses catch-up.
 
-This is a test synchronization change, not a Kafka-style broker lifecycle
-implementation. Cursus retains its Raft FSM and partition recovery markers.
+The test barrier observes the existing Raft FSM and partition recovery markers.
 Waiting on each local view preserves the safety assertion and avoids mistaking
 initial metadata replay for the intended recovery state. It does not make global
 readiness available during a partition recovery, retry failed group mutations,
@@ -210,9 +207,9 @@ rebuild, marker replacement, checkpoint failure, no-op and snapshot/bootstrap
 guards. This changes liveness and publication safety, not recovery asymptotics:
 destructive repair still reads all retained record bytes and rebuilds all retained
 producer/transaction state; no-op tail repair needs no scan. Byte/time budgets and
-incremental recovery remain separate proposals.
+incremental reconstruction for destructive tail repair remain separate proposals.
 
-## Outstanding audit follow-ups
+## Recovery work and remaining limits
 
 - Lineage now rebuilds through resumable physical chunks bounded by 1 MiB,
   1,024 records and 64 segment EOF transitions, with one MaxMessageSize-bounded
@@ -222,9 +219,10 @@ incremental recovery remain separate proposals.
   work. Cold restart still scans the retained bytes once and never trusts the old
   sidecar; durable restart reuse remains a separate proposal. Budgets cannot
   preempt a filesystem operation already in progress.
-- Full-prefix compacted proofs and bootstrap reconstruction retain full scans.
-  Ordinary retained pages reuse process-local validated physical positions as
-  described below; that does not remove the work of those separate proofs.
+- Retained-prefix proofs reuse bounded process-local checkpoints; cold calls,
+  eviction and destructive changes can require rescanning. Bootstrap
+  reconstruction still scans the replacement records. Ordinary retained pages
+  use the separate physical-position cache described below.
 - Consumer metadata retains a global atomic replay gate. After durable route
   activation, nonowned partitions use captured finite ends while owned partitions
   must include their latest committed local end. This removes moving remote-end
@@ -335,8 +333,8 @@ independently of six source captures. The adopted-store limit is the effective
 partition limit plus two, including retired, pinned and undeleted generations;
 shared disk and metadata-history budgets remain charged until ownership ends.
 Shutdown joins staging and readers, and reports physical cleanup debt without
-spinning. Production recovery capability remains zero until the general replica
-receiver, resumable installation and remaining recovery bundle are complete.
+spinning. Production capability 2 is advertised only after the source, consumer
+cache, replica receiver and internal listener are ready.
 
 ## Automatic retained recovery and bounded log turns
 
