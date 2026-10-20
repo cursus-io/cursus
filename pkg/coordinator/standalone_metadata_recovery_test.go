@@ -13,6 +13,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSharedTopicCleanupProtectionSurvivesDurableRestart(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	dm, tm, cd := startStandaloneCoordinator(t, cfg, false)
+	require.NoError(t, tm.CreateTopic("orders", 1, false, false))
+	require.NoError(t, tm.CreateTopic("payments", 1, false, false))
+	require.NoError(t, cd.RegisterGroupSubscription("workers", []string{"orders", "payments"}, "", map[string]int{"orders": 1, "payments": 1}))
+	require.NoError(t, cd.CommitOffset("workers", "orders", 0, 17))
+	require.NoError(t, cd.CommitOffset("workers", "payments", 0, 29))
+	_, err := cd.DeleteInactiveGroupsForTopic("orders")
+	require.ErrorContains(t, err, "outside topic")
+	cd.Stop()
+	tm.Stop()
+	dm.CloseAllHandlers()
+
+	restartedDM, restartedTM, restarted := startStandaloneCoordinator(t, cfg, true)
+	t.Cleanup(restartedDM.CloseAllHandlers)
+	t.Cleanup(restartedTM.Stop)
+	t.Cleanup(restarted.Stop)
+	for range 2 {
+		_, err := restarted.DeleteInactiveGroupsForTopic("orders")
+		require.ErrorContains(t, err, "outside topic")
+		for name, want := range map[string]uint64{"orders": 17, "payments": 29} {
+			offset, found := restarted.GetOffset("workers", name, 0)
+			require.True(t, found)
+			require.Equal(t, want, offset)
+		}
+	}
+}
+
 func TestStandaloneGroupRegistrationSurvivesRestartWithoutCommit(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

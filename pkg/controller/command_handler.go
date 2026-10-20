@@ -366,10 +366,8 @@ func (ch *CommandHandler) prepareTopicDependencies(topicName string) (map[string
 				return nil, fmt.Errorf("%w: refresh replicated consumer groups: %v", topic.ErrTopicDeleteBlocked, err)
 			}
 		}
-		for _, reference := range ch.Coordinator.TopicGroupReferences(topicName) {
-			if reference.MemberCount != 0 {
-				return nil, fmt.Errorf("%w: consumer group %q has %d active member(s)", topic.ErrTopicDeleteBlocked, reference.Name, reference.MemberCount)
-			}
+		if err := ch.Coordinator.ValidateTopicGroupCleanup(topicName); err != nil {
+			return nil, fmt.Errorf("%w: %v", topic.ErrTopicDeleteBlocked, err)
 		}
 	}
 

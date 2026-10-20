@@ -29,6 +29,74 @@ func TestDeleteIfExistsAndInternalTopicProtection(t *testing.T) {
 	require.Contains(t, handler.HandleCommand("DELETE topic="+config.ConsumerOffsetsTopicName+" if_exists=true", ctx), "internal_topic_delete_forbidden")
 }
 
+func TestTopicLifecycleRejectsSharedGroupsBeforeMutation(t *testing.T) {
+	for _, distributed := range []bool{false, true} {
+		for _, operation := range []string{"DELETE", "TRUNCATE"} {
+			t.Run(map[bool]string{false: "standalone", true: "distributed"}[distributed]+"/"+operation, func(t *testing.T) {
+				var handler *CommandHandler
+				var groupCoordinator *coordinator.Coordinator
+				var state *fsm.BrokerFSM
+				if distributed {
+					handler, state, groupCoordinator = newDistributedLifecycleHandler(t)
+				} else {
+					handler, _, groupCoordinator = newTestHandlerWithCoordinator(t)
+				}
+				ctx := NewClientContext("", 0)
+				for _, name := range []string{"orders", "payments"} {
+					require.Contains(t, handler.HandleCommand("CREATE topic="+name+" partitions=1 replication_factor=1", ctx), "OK topic="+name)
+				}
+				if distributed {
+					metadata := &replicatedConsumerMetadata{}
+					var err error
+					groupCoordinator, err = coordinator.NewCoordinatorWithRecovery(context.Background(), handler.Config, metadata)
+					require.NoError(t, err)
+					t.Cleanup(groupCoordinator.Stop)
+					groupCoordinator.SetOffsetRecordWriter(func(record coordinator.ConsumerMetadataRecord) error {
+						metadata.messages = append(metadata.messages, consumerMetadataMessage(t, record, uint64(len(metadata.messages))))
+						return nil
+					})
+					handler.Coordinator = groupCoordinator
+					state.SetCoordinator(groupCoordinator)
+				}
+				require.NoError(t, groupCoordinator.RegisterGroupSubscription("workers", []string{"orders", "payments"}, "", map[string]int{"orders": 1, "payments": 1}))
+				_, err := groupCoordinator.AddConsumer("workers", "member")
+				require.NoError(t, err)
+				command := operation + " topic=orders"
+				if operation == "TRUNCATE" {
+					command += " expected_revision=1"
+				}
+				response := handler.HandleCommand(command, ctx)
+				require.Contains(t, response, "topic_"+strings.ToLower(operation)+"_blocked", "subscription without offsets must protect active membership")
+				require.Contains(t, response, "active")
+				require.NoError(t, groupCoordinator.RemoveConsumer("workers", "member"))
+				require.NoError(t, groupCoordinator.CommitOffset("workers", "orders", 0, 17))
+				require.NoError(t, groupCoordinator.CommitOffset("workers", "payments", 0, 29))
+				if distributed {
+					// Compare replayed snapshots so time.Time's local/monotonic
+					// representation does not differ from its durable encoding.
+					require.NoError(t, groupCoordinator.ReloadDistributedConsumerMetadata())
+				}
+				before := groupCoordinator.ExportState()
+				for range 2 {
+					response := handler.HandleCommand(command, ctx)
+					require.Contains(t, response, "topic_"+strings.ToLower(operation)+"_blocked")
+					require.Contains(t, response, "outside topic")
+					require.Equal(t, before, groupCoordinator.ExportState())
+					for _, name := range []string{"orders", "payments"} {
+						require.NotNil(t, handler.TopicManager.GetTopic(name))
+						require.Equal(t, uint64(1), handler.TopicManager.GetTopic(name).Revision)
+						if distributed {
+							definition, found := state.GetTopicDefinition(name)
+							require.True(t, found)
+							require.Equal(t, uint64(1), definition.Revision)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestDeleteFailsWithActiveGroupAndClearsInactiveOffsets(t *testing.T) {
 	handler, _, coordinator := newTestHandlerWithCoordinator(t)
 	ctx := NewClientContext("", 0)
@@ -49,6 +117,36 @@ func TestDeleteFailsWithActiveGroupAndClearsInactiveOffsets(t *testing.T) {
 	require.True(t, strings.HasPrefix(handler.HandleCommand("CREATE topic=orders partitions=1", ctx), "OK "))
 	_, found := coordinator.GetOffset("workers", "orders", 0)
 	require.False(t, found, "recreating a topic must not revive a deleted group's offset")
+}
+
+func TestTopicLifecyclePreflightsDepartedMemberReservation(t *testing.T) {
+	for _, operation := range []string{"DELETE", "TRUNCATE"} {
+		t.Run(operation, func(t *testing.T) {
+			handler, _, c := newTestHandlerWithCoordinator(t)
+			ctx := NewClientContext("", 0)
+			require.Contains(t, handler.HandleCommand("CREATE topic=orders partitions=1", ctx), "OK ")
+			require.NoError(t, c.RegisterGroup("orders", "workers", 1))
+			_, err := c.AddConsumer("workers", "member")
+			require.NoError(t, err)
+			generation := c.GetGeneration("workers")
+			require.NoError(t, c.PrepareOffsetReservation("workers", c.GetRegistrationEpoch("workers"), coordinator.TransactionOffsetReservation{
+				TransactionalID: "tx", ProducerID: "producer", MemberID: "member", Generation: generation,
+				Offsets: []coordinator.ReservedTransactionOffset{{Topic: "orders", Partition: 0, Offset: 10}},
+			}))
+			require.NoError(t, c.RemoveConsumerForGeneration("workers", "member", generation))
+			before := c.ExportState()
+			command := operation + " topic=orders"
+			if operation == "TRUNCATE" {
+				command += " expected_revision=1"
+			}
+			response := handler.HandleCommand(command, ctx)
+			require.Contains(t, response, "topic_"+strings.ToLower(operation)+"_blocked")
+			require.Contains(t, response, "pending transaction")
+			require.Equal(t, before, c.ExportState())
+			require.NotNil(t, handler.TopicManager.GetTopic("orders"))
+			require.Equal(t, uint64(1), handler.TopicManager.GetTopic("orders").Revision)
+		})
+	}
 }
 
 func TestDeleteFailsWithActiveTransactionAndPrunesTerminalReferences(t *testing.T) {

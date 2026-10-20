@@ -172,7 +172,7 @@ Responses:
 
 `if_exists` defaults to `false`, so a missing topic returns `ERROR: topic_not_found topic=<name>`. Invalid boolean values return `ERROR: invalid_if_exists ...`. `DELETE` requires the admin permission; topic read/write permission is insufficient. Broker-owned `__consumer_offsets` returns `ERROR: internal_topic_delete_forbidden ...` even with `if_exists=true`.
 
-Deletion fails closed with `ERROR: topic_delete_blocked ...` while a consumer group for the topic has active members or an open/committing transaction references it. Successful deletion writes lifecycle tombstones for inactive groups and removes their offsets, removes producer sequence state, and removes target-topic operations from terminal transactions. Event-sourcing indexes and snapshot handles are closed before topic storage is removed. Recreating the same name starts at definition revision 1 and must not restore old logs, offsets, producer state, transaction operations, or event-sourcing metadata.
+Deletion fails closed with `ERROR: topic_delete_blocked ...` while a consumer group for the topic has active members or pending transaction offset reservations, or an open/committing transaction references it. Subscription references count even before the first offset commit. Inactive groups with subscriptions or retained state for another topic, and pattern-backed groups, also block deletion: the current cleanup writes a whole-group tombstone and cannot remove only the target topic's state safely. Successful deletion writes lifecycle tombstones only for inactive groups confined to the target topic and removes their offsets, removes producer sequence state, and removes target-topic operations from terminal transactions. Event-sourcing indexes and snapshot handles are closed before topic storage is removed. Recreating the same name starts at definition revision 1 and must not restore old logs, offsets, producer state, transaction operations, or event-sourcing metadata.
 
 Standalone deletion first preflights active group and transaction references, then commits removal from the durable manifest before mutating their durable metadata. A manifest or pre-commit event-state failure returns `ERROR: delete_topic_failed ...` and leaves the topic, group offsets, and transaction references live. After the manifest commit, storage or dependency cleanup failure returns success with `cleanup_pending=true` because the topic is no longer authoritative; `if_exists=true` retries dependency cleanup. Stale group/transaction references and the orphan-storage guard reject same-name recreation until cleanup succeeds or an operator remediates the old storage. Distributed deletion is routed to the current leader and serialized in Raft; topic, partition, group, transaction, and producer state remain absent after replay and snapshot restore. Node-local cleanup failures remain visible to the topic materialization reconciler and metrics.
 
@@ -189,9 +189,17 @@ TRUNCATE topic=<name> expected_revision=<N>
 OK topic=<name> truncated=true revision=<N> lifecycle_epoch=<N> leo=0 hwm=0 [cleanup_pending=true]
 ```
 
-The operation fails closed while a consumer group has active members or an open/committing transaction references the topic. On success it deletes inactive groups and offsets, producer sequence state, terminal transaction references, event-sourcing indexes/snapshots, records, and committed watermarks. The broker-owned `__consumer_offsets` topic cannot be truncated.
+The operation uses the same group-scope, active-member, pending offset-reservation and transaction checks as DELETE, returning `ERROR: topic_truncate_blocked ...` on rejection. On success it deletes inactive groups confined to the target topic and their offsets, producer sequence state, terminal transaction references, event-sourcing indexes/snapshots, records, and committed watermarks. The broker-owned `__consumer_offsets` topic cannot be truncated.
 
 Standalone mode durably commits the new definition epoch before replacing storage. Until the matching local epoch marker is synced, all access to the topic is fenced and startup resumes cleanup instead of serving the old generation. Distributed mode commits one `TOPIC_TRUNCATE` Raft transition, advances partition leader epochs, and fences message replication, partition commits, and event snapshots whose lifecycle epoch is missing or stale. A node-local cleanup failure returns `cleanup_pending=true` and remains unavailable on that node until materialization converges.
+
+The group-scope checks also apply during local materialization of an already
+committed DELETE or TRUNCATE. Protected group state is preserved and cleanup
+remains pending; repeated retries cannot authorize a whole-group tombstone.
+Committed lifecycle reconciliation is tracked separately in #272. Do not clear
+shared offsets or delete a multi-topic group just to unblock a pending topic.
+See [topic cleanup safety](core/topic-cleanup-safety.md) for the implementation
+boundary and Kafka comparison.
 
 Every active broker must advertise lifecycle protocol version 1 before a distributed truncate is accepted. A Raft directory is valid only when its `.cursus-raft-format` marker contains `9`; non-empty unmarked directories, older markers, older snapshots, and partition metadata without explicit committed-HWM provenance fail startup with `unsupported recovery protocol`. Recovery requires removing all Cursus persistent state and clean-bootstrapping the whole cluster; mixed-version rolling upgrades and downgrade are unsupported.
 

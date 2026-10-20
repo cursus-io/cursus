@@ -72,6 +72,12 @@ OK topic=<name> deleted=true cleanup_pending=true
 
 `cleanup_pending=true` means the durable logical deletion succeeded and node-local physical cleanup is queued for reconciliation; it is not permission to recreate the name until every broker has converged.
 
+DELETE and TRUNCATE check subscriptions even before the first offset commit.
+They reject active members, pending transaction offset reservations, and
+inactive groups with other-topic state or pattern subscriptions. Current
+cleanup removes an entire group, so it cannot safely clean only one topic of a
+shared group. These protections also apply to already-committed cleanup retries.
+
 Common errors:
 
 ```text
