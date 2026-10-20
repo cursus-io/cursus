@@ -1,6 +1,9 @@
 package coordinator
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // ConsumerRecoveryRequirement is detached runtime state, not snapshot authority.
 // Reading it never waits for lifecycle, group, FSM, or storage locks.
@@ -25,7 +28,8 @@ func (c *Coordinator) ConsumerRecoveryRequirement() ConsumerRecoveryRequirement 
 }
 
 // ValidateConsumerRestoreOrigin is FSM-specific: ordinary import APIs keep their
-// historical semantics. Only the original startup can accept unknown authority.
+// historical semantics. A live restore may preserve unknown authority, but must
+// never replace known authority with an unproven snapshot.
 func (c *Coordinator) ValidateConsumerRestoreOrigin(envelope *ConsumerRecoveryEnvelope) error {
 	if c == nil || c.standalone {
 		return nil
@@ -33,10 +37,10 @@ func (c *Coordinator) ValidateConsumerRestoreOrigin(envelope *ConsumerRecoveryEn
 	if envelope != nil && envelope.KnownComplete {
 		return nil
 	}
-	if !c.ConsumerRecoveryRequirement().StartupPending {
-		return ErrConsumerMetadataBootstrapUnknown
+	if c.ConsumerRecoveryRequirement().StartupPending || errors.Is(c.ValidateConsumerMetadataBootstrapEligibility(0), ErrConsumerMetadataBootstrapUnknown) {
+		return nil
 	}
-	return nil
+	return ErrConsumerMetadataBootstrapUnknown
 }
 
 // BeginConsumerRestore invalidates preparation before the first FSM mutation.

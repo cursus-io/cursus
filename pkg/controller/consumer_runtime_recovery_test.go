@@ -95,6 +95,52 @@ func (*consumerRecoverySnapshotSink) ID() string    { return "consumer-recovery-
 func (*consumerRecoverySnapshotSink) Close() error  { return nil }
 func (*consumerRecoverySnapshotSink) Cancel() error { return nil }
 
+func TestUnknownAuthorityLiveRestoreCompletesWithoutRestart(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+	tm := topic.NewTopicManager(cfg, &testMockHandlerProvider{}, nil)
+	t.Cleanup(tm.Stop)
+	c, err := coordinator.NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, tm)
+	require.NoError(t, err)
+	t.Cleanup(c.Stop)
+	state := fsm.NewBrokerFSM(tm, c)
+	registerRoutingBroker(t, state, "remote")
+	installRoutingOffsetsTopology(t, state, "remote")
+	h := newCoordinatorRoutingHandler("local", state, c)
+	h.TopicManager = tm
+	overlay := map[string]*coordinator.GroupStateSnapshot{"legacy": {TopicName: "orders", RegistrationEpoch: 1, Partitions: []int{0}, Offsets: map[string]map[int]uint64{"orders": {0: 17}}, LastActivity: time.Unix(1, 0)}}
+	require.NoError(t, c.ImportStateWithRecovery(overlay, nil))
+	require.NoError(t, h.RecoverDistributedConsumerMetadata(context.Background()))
+	require.False(t, c.ConsumerRecoveryRequirement().StartupPending)
+
+	for range 2 {
+		snapshot, err := state.Snapshot()
+		require.NoError(t, err)
+		sink := &consumerRecoverySnapshotSink{}
+		require.NoError(t, snapshot.Persist(sink))
+		snapshot.Release()
+		before := c.ConsumerRecoveryRequirement().RequiredGeneration
+		require.NoError(t, state.Restore(io.NopCloser(bytes.NewReader(sink.Bytes()))))
+		require.Greater(t, c.ConsumerRecoveryRequirement().RequiredGeneration, before)
+		require.ErrorIs(t, c.ConsumerOperationsReadinessError(), coordinator.ErrConsumerMetadataRecovering)
+		require.ErrorIs(t, h.RecoverDistributedConsumerMetadata(context.Background()), ErrConsumerRecoveryPending)
+		require.NoError(t, state.ReconcileTopicMaterializations())
+		require.NoError(t, state.FinalizeRecoveredPartitions())
+		require.NoError(t, h.RecoverDistributedConsumerMetadata(context.Background()))
+		require.NoError(t, c.RecoveryReadinessError())
+		require.False(t, c.ConsumerRecoveryRequirement().Pending())
+		require.ErrorIs(t, c.ValidateConsumerMetadataBootstrapEligibility(0), coordinator.ErrConsumerMetadataBootstrapUnknown)
+		_, proof, err := c.ExportStateWithRecovery()
+		require.NoError(t, err)
+		require.False(t, proof.KnownComplete, "legacy replay must never manufacture authority")
+		offset, found := c.GetOffset("legacy", "orders", 0)
+		require.True(t, found)
+		require.Equal(t, uint64(17), offset)
+		t.Logf("restored snapshot_bytes=%d generation=%d", sink.Len(), c.ConsumerRecoveryRequirement().RequiredGeneration)
+	}
+}
+
 func TestLiveFSMRestoreRequiresFinalizationBeforeUnchangedOwnershipRecovery(t *testing.T) {
 	for _, owner := range []string{"local", "remote"} {
 		t.Run(owner, func(t *testing.T) {

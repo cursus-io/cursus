@@ -97,7 +97,7 @@ func (ch *CommandHandler) prepareConsumerRecoveryPlan(ctx context.Context, metad
 		if p.HWMKnown() {
 			err = p.WithReadView(func(v *topic.PartitionReadView) error {
 				if legacy {
-					// Unknown original-startup snapshots keep historical local
+					// Unknown-authority snapshots keep historical local
 					// compatibility replay, without acquiring completeness proof.
 					plan.ends[i] = v.CommittedEnd()
 					covered = true
@@ -157,6 +157,9 @@ func (p *consumerRecoveryPlan) close() {
 }
 
 func (ch *CommandHandler) validateConsumerRecoveryPlan(plan *consumerRecoveryPlan, metadata []fsm.PartitionMetadata) error {
+	if err := plan.restageLocalEnds(metadata); err != nil {
+		return err
+	}
 	r := ch.Coordinator.ConsumerRecoveryRequirement()
 	if r.RequiredGeneration != plan.generation || r.Installing || r.Failure != nil || !reflect.DeepEqual(plan.metadata, metadata) {
 		return ErrConsumerRecoveryPending
@@ -206,6 +209,11 @@ func (ch *CommandHandler) withConsumerRecoveryPlan(ctx context.Context, plan *co
 		}
 		reader.ends[i] = plan.ends[i]
 		accept := func(v *topic.PartitionReadView) error {
+			if plan.legacy {
+				// Compatibility replay uses the durable local cut, including
+				// commits that arrived while admission was being drained.
+				reader.ends[i] = v.CommittedEnd()
+			}
 			if v.CommittedEnd() < reader.ends[i] {
 				return ErrConsumerRecoveryPending
 			}

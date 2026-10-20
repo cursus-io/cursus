@@ -71,10 +71,10 @@ func (ch *CommandHandler) RecoverDistributedConsumerMetadata(ctx context.Context
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrConsumerRecoveryPending, err)
 	}
-	// Select the legacy exception by original-startup identity and unknown
-	// authority BEFORE coverage checks. Coverage failure never downgrades known
-	// authority, including when no remote staging provider has been installed.
-	legacy := requirement.StartupPending && errors.Is(ch.Coordinator.ValidateConsumerMetadataBootstrapEligibility(0), coordinator.ErrConsumerMetadataBootstrapUnknown)
+	// Compatibility replay is selected by unknown authority, never by a failed
+	// coverage check. The coordinator also requires a pending startup/restore
+	// generation, so known authority cannot fall back to a partial local overlay.
+	legacy := errors.Is(ch.Coordinator.ValidateConsumerMetadataBootstrapEligibility(0), coordinator.ErrConsumerMetadataBootstrapUnknown)
 	plan, err := ch.prepareConsumerRecoveryPlan(ctx, metadata, -1, legacy)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrConsumerRecoveryPending, err)
@@ -103,7 +103,7 @@ func (ch *CommandHandler) RecoverDistributedConsumerMetadata(ctx context.Context
 			var prepared *coordinator.PreparedConsumerMetadataReplay
 			var err error
 			if plan.legacy {
-				prepared, err = ch.Coordinator.PrepareStartupConsumerMetadataReplay(reader)
+				prepared, err = ch.Coordinator.PrepareLegacyConsumerMetadataReplay(reader)
 			} else {
 				prepared, err = ch.Coordinator.PrepareFullConsumerMetadataReplay(reader)
 			}

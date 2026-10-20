@@ -131,7 +131,7 @@ func (c *Coordinator) captureConsumerMetadataReplayStampForStartup(legacy bool) 
 	if !g.owned {
 		return consumerMetadataReplayStamp{}, fmt.Errorf("consumer metadata replay requires an active exclusive lease")
 	}
-	if legacy && !g.startupPending {
+	if legacy && ((!g.startupPending && g.requiredGeneration == g.completedGeneration) || g.restoreInstalling || g.restoreError != nil) {
 		return consumerMetadataReplayStamp{}, ErrConsumerMetadataBootstrapUnknown
 	}
 	if legacy && c.raftCompatibilityKnown && c.metadataSourcesKnown && c.raftCompatibility != nil {
@@ -280,6 +280,17 @@ func (c *Coordinator) PrepareFullConsumerMetadataReplay(reader ConsumerMetadataC
 // an original startup with an unknown historical envelope. It preserves that
 // uncertainty permanently; it cannot be used after startup or for bootstrap.
 func (c *Coordinator) PrepareStartupConsumerMetadataReplay(reader ConsumerMetadataCommittedReader) (*PreparedConsumerMetadataReplay, error) {
+	if !c.ConsumerRecoveryRequirement().StartupPending {
+		return nil, ErrConsumerMetadataBootstrapUnknown
+	}
+	return c.PrepareLegacyConsumerMetadataReplay(reader)
+}
+
+// PrepareLegacyConsumerMetadataReplay rebuilds an unknown-authority overlay
+// during startup or a pending live restore. It requires an exclusive lease and
+// preserves the unknown proof; it cannot authorize destructive bootstrap or
+// turn an ordinary reload into a compatibility recovery.
+func (c *Coordinator) PrepareLegacyConsumerMetadataReplay(reader ConsumerMetadataCommittedReader) (*PreparedConsumerMetadataReplay, error) {
 	stamp, err := c.captureConsumerMetadataReplayStampForStartup(true)
 	if err != nil {
 		return nil, err
@@ -364,7 +375,7 @@ func (c *Coordinator) prepareConsumerMetadataReplay(reader ConsumerMetadataCommi
 	}
 	scratch.offsetTopic = c.offsetTopic
 	scratch.offsetTopicPartitionCount = count
-	// Unknown original-startup snapshots retain the historical merge policy.
+	// Unknown-authority snapshots retain the historical merge policy.
 	// Known authority always uses replacement replay from the Raft baseline.
 	status, err := scratch.recoverConsumerMetadataWithOptions(bounded, !stamp.legacyStartup)
 	if err != nil {

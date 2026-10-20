@@ -74,7 +74,26 @@ func TestLegacyOriginalStartupCompletesWithoutGainingBootstrapAuthority(t *testi
 	release()
 	require.NoError(t, c.RecoveryReadinessError())
 	require.ErrorIs(t, c.ValidateConsumerMetadataBootstrapEligibility(0), ErrConsumerMetadataBootstrapUnknown)
-	require.ErrorIs(t, c.ValidateConsumerRestoreOrigin(nil), ErrConsumerMetadataBootstrapUnknown)
+	require.NoError(t, c.ValidateConsumerRestoreOrigin(nil))
+	release = acquireReplay(t, c)
+	_, err = c.PrepareLegacyConsumerMetadataReplay(strictReader(c))
+	require.ErrorIs(t, err, ErrConsumerMetadataBootstrapUnknown, "ordinary reload cannot select compatibility recovery")
+	release()
+	for range 2 {
+		generation := c.BeginConsumerRestore()
+		_, err = c.PrepareLegacyConsumerMetadataReplay(strictReader(c))
+		require.Error(t, err, "restore must finish and acquire an exclusive lease")
+		require.NoError(t, c.ImportStateWithRecovery(nil, nil))
+		c.FinishConsumerRestore(generation, nil)
+		release = acquireReplay(t, c)
+		p, err = c.PrepareLegacyConsumerMetadataReplay(strictReader(c))
+		require.NoError(t, err)
+		require.NoError(t, c.ApplyFullConsumerMetadataReplay(p))
+		require.NoError(t, c.CompleteConsumerRecovery(generation))
+		release()
+		require.NoError(t, c.RecoveryReadinessError())
+		require.ErrorIs(t, c.ValidateConsumerMetadataBootstrapEligibility(0), ErrConsumerMetadataBootstrapUnknown)
+	}
 }
 
 func TestCompletionCannotReuseInstallationFromReleasedLease(t *testing.T) {
@@ -99,4 +118,37 @@ func TestKnownStartupCannotSelectLegacyOverlayReplay(t *testing.T) {
 	acquireReplay(t, c)
 	_, err = c.PrepareStartupConsumerMetadataReplay(strictReader(c))
 	require.Error(t, err)
+}
+
+func TestLegacyRestoreReplayRejectsChangedGenerationOrAuthority(t *testing.T) {
+	for _, mutation := range []string{"restore", "authority", "failure"} {
+		t.Run(mutation, func(t *testing.T) {
+			c := newAuthorityTestCoordinator(t)
+			require.NoError(t, c.ImportStateWithRecovery(nil, nil))
+			generation := c.BeginConsumerRestore()
+			c.FinishConsumerRestore(generation, nil)
+			acquireReplay(t, c)
+			prepared, err := c.PrepareLegacyConsumerMetadataReplay(strictReader(c))
+			require.NoError(t, err)
+			switch mutation {
+			case "restore":
+				next := c.BeginConsumerRestore()
+				c.FinishConsumerRestore(next, nil)
+			case "authority":
+				known := newAuthorityTestCoordinator(t)
+				groups, proof, err := known.ExportStateWithRecovery()
+				require.NoError(t, err)
+				require.NoError(t, c.ImportStateWithRecovery(groups, proof))
+				require.ErrorIs(t, c.ValidateConsumerRestoreOrigin(nil), ErrConsumerMetadataBootstrapUnknown)
+				_, err = c.PrepareLegacyConsumerMetadataReplay(strictReader(c))
+				require.Error(t, err, "a known envelope cannot use compatibility replay")
+			case "failure":
+				c.FinishConsumerRestore(generation, errors.New("restore failed"))
+			}
+			before := c.ExportState()
+			require.Error(t, c.ApplyFullConsumerMetadataReplay(prepared))
+			require.Equal(t, before, c.ExportState())
+			require.Error(t, c.CompleteConsumerRecovery(generation))
+		})
+	}
 }
