@@ -64,7 +64,8 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	var cc *clusterController.ClusterController
 	var rm *replication.RaftReplicationManager
 	var clusterClient *client.TCPClusterClient
-	var discoveryListener net.Listener
+	var sd clusterController.ServiceDiscovery
+	var cs *cluster.ClusterServer
 	var brokerIncarnationID string
 	healthState := NewHealthState()
 	defer healthState.Close()
@@ -92,8 +93,8 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	defer func() {
 		healthState.Close()
 		shutdownHTTPServer(healthServer)
-		if discoveryListener != nil {
-			_ = discoveryListener.Close()
+		if cs != nil {
+			_ = cs.Close()
 		}
 		if rm != nil {
 			if transferErr := rm.TransferLeadership(); transferErr != nil {
@@ -126,20 +127,24 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		}
 		clientAddr := fmt.Sprintf("%s:%d", clientHost, clientPort)
 
-		sd := clusterController.NewServiceDiscovery(rm, brokerID, localAddr, clientAddr)
+		sd = clusterController.NewServiceDiscovery(rm, brokerID, localAddr, clientAddr)
 		discoveryAddr := fmt.Sprintf(":%d", cfg.DiscoveryPort)
-		cs := cluster.NewSecureClusterServerWithTokens(sd, cfg.InternalAuthToken, cfg.InternalAuthTokenNext, cfg.InternalServerTLSConfig())
-		discoveryListener, err = cs.Start(discoveryAddr)
+		cs = cluster.NewSecureClusterServerWithTokens(sd, cfg.InternalAuthToken, cfg.InternalAuthTokenNext, cfg.InternalServerTLSConfig())
+		_, err = cs.Start(discoveryAddr)
 		if err != nil {
 			return fmt.Errorf("start discovery server: %w", err)
 		}
-		go closeListenerOnDone(ctx, discoveryListener)
+		stopDiscoveryShutdown := context.AfterFunc(ctx, func() { _ = cs.Close() })
+		defer stopDiscoveryShutdown()
 
 		cc = clusterController.NewClusterController(ctx, cfg, rm, sd, brokerID, localAddr)
 		sd.StartReconciler(ctx)
 		incarnationID := ""
 		if identity, ok := sd.(interface{ BrokerIncarnationID() string }); ok {
 			incarnationID = identity.BrokerIncarnationID()
+		}
+		if incarnationID == "" {
+			return fmt.Errorf("discovery process incarnation unavailable")
 		}
 		brokerIncarnationID = incarnationID
 		cc.SetReplicaCatchupProofSubmitter(func(ctx context.Context, proof fsm.ISRCatchupProof) error {
@@ -254,10 +259,26 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		cfg.EnabledDistribution && cfg.InternalBrokerPort > 0,
 	)
 	defer func() {
+		// Join discovery reads before the source closes exports and storage.
+		if cs != nil {
+			_ = cs.Close()
+		}
 		if err := globalCH.Close(); err != nil {
 			util.Error("Failed to close command handler: %v", err)
 		}
 	}()
+	if cfg.EnabledDistribution {
+		if err := globalCH.ConfigureBootstrapTransferSource(ctx, brokerIncarnationID); err != nil {
+			return fmt.Errorf("configure metadata bootstrap source: %w", err)
+		}
+		binder, ok := sd.(clusterController.BootstrapTransferSourceBinder)
+		if !ok {
+			return fmt.Errorf("discovery bootstrap source binding unavailable")
+		}
+		if err := binder.BindBootstrapTransferSource(globalCH); err != nil {
+			return fmt.Errorf("bind metadata bootstrap source: %w", err)
+		}
+	}
 	if !cfg.EnabledDistribution {
 		journalPath := filepath.Join(cfg.LogDir, "__transaction_state.journal")
 		if err := globalCH.ConfigureTransactionJournal(journalPath); err != nil {

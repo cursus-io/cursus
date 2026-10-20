@@ -28,7 +28,8 @@ const (
 	ReplicaGapRecoveryProtocolVersion    = 6
 	BrokerProtocolVersionCurrent         = ReplicaGapRecoveryProtocolVersion
 	// Recovery capabilities are additive and do not raise lifecycle requirements.
-	IndexedRecoveryProtocolVersion = 1
+	IndexedRecoveryProtocolVersion   = 1
+	BootstrapRecoveryProtocolVersion = 2
 )
 
 type ReplicationEntry struct {
