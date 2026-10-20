@@ -23,6 +23,7 @@ type stagedConsumerTestReader struct {
 	records  map[int][]types.Message
 	readHook func()
 	reads    int
+	bytes    int
 }
 
 func (r *stagedConsumerTestReader) ExistingPartitionCount(string) (int, error) {
@@ -42,6 +43,7 @@ func (r *stagedConsumerTestReader) ReadCommittedConsumerMetadata(_ string, parti
 	}
 	for _, record := range r.records[partition] {
 		if record.Offset >= offset && record.Offset < r.ends[partition] {
+			r.bytes += len(record.Payload)
 			// Deliberately short pages with a hole exercise strict pagination;
 			// one page must not be mistaken for the end of the staged range.
 			return []types.Message{record}, nil

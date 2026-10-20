@@ -177,14 +177,20 @@ func (p *consumerRecoveryPlan) close() {
 }
 
 func (ch *CommandHandler) validateConsumerRecoveryPlan(plan *consumerRecoveryPlan, metadata []fsm.PartitionMetadata) error {
-	if err := plan.restageLocalEnds(metadata); err != nil {
-		return err
+	if !plan.finite {
+		if err := plan.restageLocalEnds(metadata); err != nil {
+			return err
+		}
 	}
 	r := ch.Coordinator.ConsumerRecoveryRequirement()
 	if r.RequiredGeneration != plan.generation || r.Installing || r.Failure != nil || len(plan.metadata) != len(metadata) {
 		return fmt.Errorf("%w: recovery generation or topology size changed", ErrConsumerRecoveryPending)
 	}
 	if plan.finite {
+		// Durable routing activation prevents new records for locally owned
+		// groups from entering remote partitions. Keep those historical cuts
+		// fixed; only owned partitions are re-staged to the final committed end.
+		// Ownership changes invalidate the entire plan and require fresh staging.
 		if !ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() {
 			return ErrConsumerRecoveryPending
 		}
