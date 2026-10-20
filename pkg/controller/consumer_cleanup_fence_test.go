@@ -37,7 +37,7 @@ func TestConsumerTombstoneWriterRejectsFollowerAndUnrecoveredOwner(t *testing.T)
 			if broker == "node-1" {
 				require.ErrorContains(t, err, "recovery pending")
 			} else {
-				require.ErrorContains(t, err, "ownership changed")
+				require.ErrorContains(t, err, "not the current coordinator")
 			}
 			for _, p := range manager.GetTopic(config.ConsumerOffsetsTopicName).Partitions {
 				require.Zero(t, p.NextOffset(), "rejection must not append or forward a new tombstone")
