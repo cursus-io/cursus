@@ -278,6 +278,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		if err := binder.BindBootstrapTransferSource(globalCH); err != nil {
 			return fmt.Errorf("bind metadata bootstrap source: %w", err)
 		}
+		if err := globalCH.ConfigureConsumerMetadataRecovery(ctx, brokerIncarnationID, clusterClient); err != nil {
+			return fmt.Errorf("configure consumer metadata recovery: %w", err)
+		}
 	}
 	if !cfg.EnabledDistribution {
 		journalPath := filepath.Join(cfg.LogDir, "__transaction_state.journal")
