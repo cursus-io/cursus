@@ -41,3 +41,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{- define "cursus.image" -}}
+{{- if .Values.image.digest -}}
+{{- if not (regexMatch "^sha256:[0-9a-fA-F]{64}$" (.Values.image.digest | toString)) -}}
+{{- fail "image.digest must be a sha256 OCI image digest" -}}
+{{- end -}}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) -}}
+{{- end -}}
+{{- end }}

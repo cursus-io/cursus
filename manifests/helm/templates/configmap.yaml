@@ -1,3 +1,7 @@
+{{- if not (has .Values.performanceProfile (list "low-latency" "balanced" "high-throughput")) }}
+{{- fail "performanceProfile must be low-latency, balanced, or high-throughput; use performance.custom for overrides" }}
+{{- end }}
+{{- $performance := mergeOverwrite (deepCopy (index .Values.performance .Values.performanceProfile)) .Values.performance.custom }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -7,8 +11,8 @@ data:
     log_level: {{ .Values.logLevel | default "info" }}
     log_dir: {{ .Values.persistence.logDir.path }} 
 
-    disk_flush_batch_size: {{ .Values.performance.custom.diskFlushBatchSize | default (index .Values.performance .Values.performanceProfile "diskFlushBatchSize") }}  
-    linger_ms: {{ .Values.performance.custom.lingerMS | default (index .Values.performance .Values.performanceProfile "lingerMS") }}  
-    channel_buffer_size: {{ .Values.performance.custom.channelBufferSize | default (index .Values.performance .Values.performanceProfile "channelBufferSize") }}  
-    partition_channel_buffer_size: {{ .Values.performance.custom.partitionChannelBufSize | default (index .Values.performance .Values.performanceProfile "partitionChannelBufSize") }}  
-    consumer_channel_buffer_size: {{ .Values.performance.custom.consumerChannelBufSize | default (index .Values.performance .Values.performanceProfile "consumerChannelBufSize") }}
+    disk_flush_batch_size: {{ $performance.diskFlushBatchSize }}
+    linger_ms: {{ $performance.lingerMS }}
+    channel_buffer_size: {{ $performance.channelBufferSize }}
+    partition_channel_buffer_size: {{ $performance.partitionChannelBufSize }}
+    consumer_channel_buffer_size: {{ $performance.consumerChannelBufSize }}

@@ -2,7 +2,7 @@
 
 `manifests/helm-cluster` is a deliberately fixed three-member production topology. It is separate from the existing standalone chart so that a values change cannot turn a single PVC into a false cluster deployment.
 
-Each StatefulSet ordinal owns one `ReadWriteOnce` PVC, publishes a stable headless-service DNS name, and uses those three names for Raft membership and discovery. Initial Pods are created in parallel because the Raft bootstrap needs all three voters; broker `-0` is the only member permitted to bootstrap an empty cluster. Restart recovery uses the existing Raft state on each PVC. The PodDisruptionBudget requires two available members and the default required anti-affinity therefore requires three schedulable nodes.
+Each StatefulSet ordinal owns one `ReadWriteOnce` PVC, publishes a stable headless-service DNS name, and uses those three names for Raft membership and discovery. Initial Pods are created in parallel; broker `-0` bootstraps as the sole Raft voter and admits the other two members. Only broker `-0` may bootstrap an empty cluster. Restart recovery uses the existing Raft state on each PVC. The PodDisruptionBudget requires two available members and the default required anti-affinity therefore requires three schedulable nodes.
 
 Cluster DNS is part of the quorum network path because every Raft, replication,
 and internal command address is a StatefulSet DNS name. Before installing,
@@ -161,6 +161,13 @@ report the exact image revision, Wire protocol, broker lifecycle protocol,
 Raft snapshot format, and disk record format required by this chart. A stale
 image, a digest/revision mismatch, or an unsupported storage/protocol contract
 prevents the broker container from starting.
+
+The current chart expects Wire protocol `2`, broker lifecycle protocol `6`,
+Raft snapshot format `10`, and disk record format `CDM5`. Chart version `0.2.1`
+identifies the Helm packaging, not the broker binary version. Do not override
+these contract values to bypass an incompatible image. `image.allowMutableTag`
+must be a YAML boolean; mutable tags are reserved for source-built validation.
+Neither the init container nor the broker needs a mounted Kubernetes API token.
 
 ## Rotate internal credentials without losing quorum
 

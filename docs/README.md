@@ -36,11 +36,12 @@ This index separates normative contracts from implementation notes. When prose c
 
 - [Observability](reference/observability.md): health, readiness, metrics, alerts, and security boundaries.
 - [Production Incident Runbook](operations/production-runbook.md): first response and remediation for the alerts shipped by the Helm charts.
+- [Kubernetes Cluster](operations/kubernetes-cluster.md): three-member Helm installation, image contracts, PVC expansion, and credential rotation.
+- [Cluster Transport Security](operations/cluster-transport-security.md): internal mTLS and broker authentication.
 - [Upgrade And Recovery](operations/upgrade-and-recovery.md): storage compatibility, coordinated rollout, rollback, and restore boundaries.
 - [Consumer Lifecycle Alerts](operations/consumer-lifecycle-alerts.md): external minimum-member contracts and canary validation.
 - [Performance](reference/performance.md): tuning knobs and durability/latency trade-offs.
 - [Benchmarks](reference/benchmark.md): tools, workload model, and result interpretation.
-- [Benchmark Verification](benchmark-verification.md): local standalone and cluster verification.
 - [Comparison](reference/comparison.md): product scope, strengths, and explicit maturity gaps.
 - [Container Publishing](operations/container-publishing.md): GHCR image publication, tags, permissions, and verification.
 

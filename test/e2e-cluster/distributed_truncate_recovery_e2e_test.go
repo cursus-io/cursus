@@ -91,6 +91,9 @@ func TestDistributedTruncateRecoveryPreservesConsumerOffsetReplication(t *testin
 		setReplicaAppendSkipFault(t, node, config.ConsumerOffsetsTopicName, offsetPartition, internalLEO)
 		setReplicaCatchupPauseFault(t, node, config.ConsumerOffsetsTopicName, true)
 		defer setReplicaCatchupPauseFaultBestEffort(node, config.ConsumerOffsetsTopicName, false)
+		// Docker exec can be slow on a cold host. Keep the session alive while
+		// installing faults; HEARTBEAT does not append consumer offset records.
+		heartbeatGroup(t, groupClient, businessTopic, group, generation, member)
 	}
 	commitGroupOffset(t, groupClient, businessTopic, group, 2, generation, member)
 	heartbeatGroup(t, groupClient, businessTopic, group, generation, member)
@@ -382,11 +385,39 @@ func requireRecoveryPendingAndNotReady(t *testing.T, addrs []string, topicName s
 	t.Helper()
 	recoveryNode := 0
 	require.NoError(t, eventually(t, "replica recovery pending and readiness closed", clusterReadyTimeout, func() (bool, string, error) {
-		client := e2e.NewBrokerClient(addrs)
-		response, err := client.SendCommand("admin", "CLUSTER_STATUS", 5*time.Second)
-		client.Close()
+		node, err := observeRecoveryFence(addrs, topicName, partitionID, leaderEpoch, func(addr string) (string, error) {
+			client := e2e.NewBrokerClient([]string{addr})
+			defer client.Close()
+			return client.SendCommand("admin", "CLUSTER_STATUS", 5*time.Second)
+		})
+		if err != nil {
+			return false, "waiting for every broker to apply the recovery fence", err
+		}
+		recoveryNode = node
+		for node := 1; node <= len(addrs); node++ {
+			code, body, err := readReadiness(node)
+			if err != nil {
+				return false, fmt.Sprintf("broker-%d readiness error: %v", node, err), nil
+			}
+			if code != 503 {
+				return false, fmt.Sprintf("broker-%d expected recovery readiness 503, got %d: %s", node, code, body), nil
+			}
+		}
+		return true, "all brokers observe the recovery fence and return readiness 503", nil
+	}))
+	return recoveryNode
+}
+
+// A surviving broker can report the recovery fence while a restarted peer is
+// still replaying CREATE and partition metadata. Observe every broker locally
+// before testing unrelated consumer metadata writes. Global readiness must stay
+// closed because catch-up for the deliberately divergent partition is paused.
+func observeRecoveryFence(addrs []string, topicName string, partitionID, leaderEpoch int, query func(string) (string, error)) (int, error) {
+	recoveryNode := 0
+	for _, addr := range addrs {
+		response, err := query(addr)
 		if err != nil || !strings.HasPrefix(response, "OK cluster=") {
-			return false, response, err
+			return 0, fmt.Errorf("%s cluster status: response=%q err=%v", addr, response, err)
 		}
 		var status struct {
 			Healthy         bool `json:"healthy"`
@@ -400,10 +431,10 @@ func requireRecoveryPendingAndNotReady(t *testing.T, addrs []string, topicName s
 			} `json:"partitions"`
 		}
 		if err := json.Unmarshal([]byte(strings.TrimPrefix(response, "OK cluster=")), &status); err != nil {
-			return false, response, err
+			return 0, fmt.Errorf("%s cluster status: response=%q err=%v", addr, response, err)
 		}
 		if status.Healthy || status.RecoveryPending == 0 {
-			return false, fmt.Sprintf("healthy=%t recovery_pending=%d", status.Healthy, status.RecoveryPending), nil
+			return 0, fmt.Errorf("healthy=%t recovery_pending=%d", status.Healthy, status.RecoveryPending)
 		}
 		partitionFound := false
 		for _, partition := range status.Partitions {
@@ -412,36 +443,26 @@ func requireRecoveryPendingAndNotReady(t *testing.T, addrs []string, topicName s
 			}
 			partitionFound = true
 			if partition.LeaderEpoch != leaderEpoch {
-				return false, fmt.Sprintf("leader epoch changed: got=%d want=%d", partition.LeaderEpoch, leaderEpoch), nil
+				return 0, fmt.Errorf("leader epoch changed: got=%d want=%d", partition.LeaderEpoch, leaderEpoch)
 			}
 			if !partition.RecoveryPending || len(partition.RecoveryReplicas) == 0 {
-				return false, fmt.Sprintf("partition recovery_pending=%t replicas=%v", partition.RecoveryPending, partition.RecoveryReplicas), nil
+				return 0, fmt.Errorf("partition recovery_pending=%t replicas=%v", partition.RecoveryPending, partition.RecoveryReplicas)
 			}
 			parts := strings.Split(strings.TrimPrefix(partition.RecoveryReplicas[0], "broker-"), "-")
 			if len(parts) == 0 {
-				return false, fmt.Sprintf("invalid recovery broker id %q", partition.RecoveryReplicas[0]), nil
+				return 0, fmt.Errorf("invalid recovery broker id %q", partition.RecoveryReplicas[0])
 			}
 			node, err := strconv.Atoi(parts[0])
 			if err != nil || node < 1 || node > len(addrs) {
-				return false, fmt.Sprintf("invalid recovery broker id %q", partition.RecoveryReplicas[0]), nil
+				return 0, fmt.Errorf("invalid recovery broker id %q", partition.RecoveryReplicas[0])
 			}
 			recoveryNode = node
 		}
 		if !partitionFound {
-			return false, "recovery partition not found", nil
+			return 0, fmt.Errorf("%s recovery partition not found", addr)
 		}
-		for node := 1; node <= 3; node++ {
-			code, body, err := readReadiness(node)
-			if err != nil {
-				return false, fmt.Sprintf("broker-%d readiness error: %v", node, err), nil
-			}
-			if code == 200 {
-				return false, fmt.Sprintf("broker-%d unexpectedly ready: %s", node, body), nil
-			}
-		}
-		return true, fmt.Sprintf("healthy=false recovery_pending=%d", status.RecoveryPending), nil
-	}))
-	return recoveryNode
+	}
+	return recoveryNode, nil
 }
 
 func restartBrokerDuringRecovery(t *testing.T, node int) {

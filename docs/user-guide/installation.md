@@ -15,11 +15,12 @@ go mod download
 make build
 ```
 
-`make build` creates two binaries for the current OS:
+`make build` creates three binaries for the current OS:
 
 ```text
 bin/cursus
 bin/cursus-cli
+bin/cursus-storage
 ```
 
 Build individually:
@@ -27,9 +28,10 @@ Build individually:
 ```bash
 make build-api
 make build-cli
+make build-storage
 ```
 
-Cross-compile both for Linux:
+Cross-compile all three for Linux (the output names end in `-linux`):
 
 ```bash
 make build-linux
@@ -41,7 +43,7 @@ Direct broker build:
 CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/cursus ./cmd/broker
 ```
 
-There is no standalone `cmd/bench` binary. End-to-end benchmarks use Docker Compose and `test/e2e-benchmark`; storage microbenchmarks use `go test -bench`. See [Benchmark Verification](../benchmark-verification.md).
+There is no standalone `cmd/bench` binary. End-to-end benchmarks use Docker Compose and `test/e2e-benchmark`; storage microbenchmarks use `go test -bench`. See [Benchmarks](../reference/benchmark.md).
 
 ## Run From Source
 
@@ -107,7 +109,53 @@ docker run --rm \
 
 ## Helm
 
-A Helm chart is available under `manifests/helm`. Review `values.yaml`, persistent volume settings, TLS/internal mTLS secrets, advertised addresses, replica/quorum values, and resource limits before installing. Do not treat chart defaults as a production security profile.
+Two Helm charts are maintained with the broker source:
+
+| Chart | Topology | Storage and upgrade behavior |
+|---|---|---|
+| `manifests/helm` | Exactly one standalone broker | One log PVC; `Recreate` Deployment upgrades interrupt service |
+| `manifests/helm-cluster` | Exactly three Raft members | One PVC per ordinal; explicit `OnDelete` rolling upgrades |
+
+Use the [Kubernetes cluster runbook](../operations/kubernetes-cluster.md) for the
+three-member chart, including the required image digest/revision, internal
+credentials, certificate SANs, and placement on three nodes. Do not increase
+standalone `replicaCount` to create a cluster.
+
+### Standalone installation
+
+Create TLS and SASL Secrets in the release namespace before installing. The
+certificate must cover the hostname used by clients; the SASL Secret's `users`
+entry uses `principal:token:permission1|permission2` entries separated by commas.
+Keep the operator token available to your client through your secret manager.
+
+```bash
+kubectl create namespace brokers
+kubectl -n brokers create secret tls cursus-tls \
+  --cert=broker.crt --key=broker.key
+kubectl -n brokers create secret generic cursus-client-auth \
+  --from-file=users=./sasl-users.txt
+
+# Set DIGEST to the sha256 digest of the selected published broker image.
+helm upgrade --install cursus manifests/helm --namespace brokers \
+  --set-string image.digest="$DIGEST" \
+  --set tls.enabled=true \
+  --set tls.secretName=cursus-tls \
+  --set clientSecurity.sasl.secretName=cursus-client-auth \
+  --wait --timeout 5m
+```
+
+`image.digest` takes precedence over `image.tag`. Unlike the cluster chart,
+standalone does not verify the image revision or storage/protocol contract in an
+init container; review [upgrade compatibility](../operations/upgrade-and-recovery.md)
+before changing images. The chart defaults intentionally refuse to render until
+TLS and SASL are configured. Only an isolated development deployment should use
+`--set clientSecurity.allowInsecure=true`.
+
+Both charts default to non-root containers, `RuntimeDefault` seccomp, dropped
+Linux capabilities, no privilege escalation, a read-only root filesystem, and
+no mounted Kubernetes API token. The log volume remains writable. Restrict health
+and metrics access to trusted operators; these endpoints do not authenticate
+clients. The standalone chart does not install a NetworkPolicy.
 
 The standalone chart requests `250m` CPU and `512Mi` memory. It does not set a
 generic memory limit because the safe value depends on workload and recovery
@@ -121,6 +169,26 @@ the cluster's default StorageClass. Set `persistence.storageClass` to select a
 named class. For a pre-provisioned PersistentVolume that deliberately has no
 class, set `persistence.classless=true`; it cannot be combined with a named
 storage class.
+
+Configuration is mounted from a ConfigMap at `persistence.config.path`; only
+`persistence.logDir.size` allocates storage. The unused `persistence.config.size`
+and `broker.config.logLevel` values have been removed; use `logLevel` to set
+broker logging. `performanceProfile` selects `low-latency`, `balanced`, or
+`high-throughput`. Override individual settings with `performance.custom`;
+`performance.custom.lingerMS=0` disables the batch linger delay.
+
+Before installing, run `helm lint` and `helm template` with the same values and
+Secret names as the install. Templates reference existing Secrets and do not
+verify that they exist or contain valid credentials. After a Secret change,
+restart the standalone Deployment to reload TLS/SASL credentials:
+
+```bash
+kubectl -n brokers rollout restart deployment/cursus
+kubectl -n brokers rollout status deployment/cursus --timeout=5m
+```
+
+This causes a standalone outage. Follow the cluster runbook's one-member-at-a-time
+rotation procedure for the three-member chart.
 
 ## Verify
 

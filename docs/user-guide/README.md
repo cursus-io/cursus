@@ -51,7 +51,8 @@ Development mode:
 make run
 ```
 
-`make build` creates `bin/cursus` and `bin/cursus-cli`. Benchmarks are Docker/Go test workloads rather than a third binary.
+`make build` creates `bin/cursus`, `bin/cursus-cli`, and `bin/cursus-storage`.
+Benchmarks run through Docker/Go test workloads; there is no benchmark binary.
 
 ## Publish And Consume With Go Examples
 

@@ -21,6 +21,9 @@
 {{- if and (not .Values.clientSecurity.allowInsecure) (not .Values.clientSecurity.sasl.secretName) }}
 {{- fail "clientSecurity.sasl.secretName is required unless clientSecurity.allowInsecure=true" }}
 {{- end }}
+{{- if and .Values.clientSecurity.sasl.secretName (not (.Values.clientSecurity.sasl.secretKey | toString | trim)) }}
+{{- fail "clientSecurity.sasl.secretKey must identify the SASL_USERS entry in the client auth Secret" }}
+{{- end }}
 apiVersion: apps/v1  
 kind: Deployment  
 metadata:  
@@ -42,6 +45,7 @@ spec:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}  
     spec:  
       serviceAccountName: {{ include "cursus.serviceAccountName" . }}  
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:  
         {{- toYaml .Values.podSecurityContext | nindent 8 }}  
@@ -49,7 +53,7 @@ spec:
         - name: {{ .Chart.Name }}  
           securityContext:  
             {{- toYaml .Values.securityContext | nindent 12 }}  
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"  
+          image: {{ include "cursus.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}  
           lifecycle:
             preStop:

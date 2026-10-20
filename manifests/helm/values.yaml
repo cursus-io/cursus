@@ -2,6 +2,9 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/cursus-io/cursus
+  # Prefer a published OCI digest for repeatable production deployments.
+  # When set, digest takes precedence over tag.
+  digest: ""
   tag: "0.2.0"
   pullPolicy: IfNotPresent
 
@@ -19,7 +22,6 @@ persistence:
   classless: false
   config:
     path: /app/config.yaml
-    size: 1Gi
   logDir:
     path: /data/logs
     size: 10Gi
@@ -41,19 +43,22 @@ clientSecurity:
 podSecurityContext:
   fsGroup: 1000
   supplementalGroups: [1000]
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
   runAsNonRoot: true
   runAsUser: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
 
 serviceAccount:
   create: true
   name: ""
 
 logLevel: info
-broker:
-  config:
-    logLevel: {}
 
 limits:
   maxTopics: 10000

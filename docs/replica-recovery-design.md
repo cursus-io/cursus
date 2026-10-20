@@ -32,6 +32,31 @@ capability. Restored registration cannot stand in for a new process registration
 Recovery tests count retransferred records and JSON record-batch bytes as well as
 exchanges; these are not claims about bounded disk bytes or elapsed time.
 
+## Restart observation in fault tests
+
+[Kafka 4.0.0's BrokerLifecycleManager](https://github.com/apache/kafka/blob/4.0.0/core/src/main/scala/kafka/server/BrokerLifecycleManager.scala)
+separates initial metadata catch-up from initial unfencing. Cursus adopts that
+distinction in its recovery test barrier: a failed readiness probe does not
+prove that a restarted broker has applied the recovery fence. Each broker must
+locally report the expected partition, leader epoch, and recovery replica before
+the test submits unrelated consumer metadata writes. Readiness must still return
+503 while the fault deliberately pauses catch-up.
+
+This is a test synchronization change, not a Kafka-style broker lifecycle
+implementation. Cursus retains its Raft FSM and partition recovery markers.
+Waiting on each local view preserves the safety assertion and avoids mistaking
+initial metadata replay for the intended recovery state. It does not make global
+readiness available during a partition recovery, retry failed group mutations,
+or change data transfer, scan bytes, hashing work, or recovery algorithms.
+
+Regression checks cover a stale first, middle, or last broker, missing partition
+metadata, a stale epoch, a missing fence, and an unreachable peer. The Docker
+checks retain committed-prefix preservation, `acks=all` and leader-ack behavior,
+full ISR restoration, and stable consumer generation/offsets for 65 seconds.
+The truncate fixture sends heartbeats between Docker fault setup operations so
+slow setup does not expire the session before the recovery scenario begins.
+These checks establish correctness; they make no recovery-efficiency claim.
+
 ## Storage evidence
 
 The retained log remains authoritative. A versioned, checksummed per-partition
