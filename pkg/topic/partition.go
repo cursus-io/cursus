@@ -1125,32 +1125,6 @@ func (p *Partition) readCommittedRange(offset, endOffset uint64, max int) ([]typ
 	return p.readVisibleCommitted(offset, max, hwm, readEnd)
 }
 
-func (p *Partition) readCommittedMetadataUngated(offset uint64, max int) ([]types.Message, error) {
-	if err := p.RecoveryError(); err != nil {
-		return nil, fmt.Errorf("partition recovery incomplete: %w", err)
-	}
-	if err := p.hwmReadinessError(); err != nil {
-		return nil, err
-	}
-	if max <= 0 {
-		return nil, nil
-	}
-	p.mu.RLock()
-	hwm := p.HWM
-	p.mu.RUnlock()
-	if flushed := p.dh.GetFlushedOffset(); flushed < hwm {
-		hwm = flushed
-	}
-	earliest := p.dh.GetFirstOffset()
-	if offset < earliest {
-		return nil, &types.OffsetOutOfRangeError{Requested: offset, Earliest: earliest, Latest: hwm}
-	}
-	p.txnMarkerMu.RLock()
-	defer p.txnMarkerMu.RUnlock()
-	messages, _, _, err := p.readCommittedScanRangeBounded(offset, hwm, hwm, max, 0, true, p.txnMarkers, p.txnResolver)
-	return messages, err
-}
-
 func (p *Partition) readVisibleCommitted(offset uint64, max int, hwm, readEnd uint64) ([]types.Message, error) {
 	messages, _, _, err := p.readVisibleCommittedBounded(offset, max, 0, true, hwm, readEnd)
 	return messages, err
@@ -1212,7 +1186,9 @@ func (p *Partition) readCommittedScanRangeBounded(offset, scanLimit, committedHW
 		}
 		for _, msg := range batch {
 			if msg.Offset >= scanLimit {
-				break
+				// Compacted reads can return the first surviving record beyond
+				// this fixed boundary. A full batch must not retry that hole.
+				return visible, decodedBytes, scanLimit, nil
 			}
 			next := msg.Offset + 1
 			if next <= current {

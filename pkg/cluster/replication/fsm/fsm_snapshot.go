@@ -11,6 +11,7 @@ import (
 )
 
 type BrokerFSMSnapshot struct {
+	consumerRecovery                 *coordinator.ConsumerRecoveryEnvelope
 	applied                          uint64
 	logs                             map[uint64]*ReplicationEntry
 	brokers                          map[string]*BrokerInfo
@@ -36,6 +37,7 @@ func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 		PartitionMetadata:                s.partitionMetadata,
 		ProducerState:                    s.producerState,
 		GroupState:                       s.groupState,
+		ConsumerRecovery:                 s.consumerRecovery,
 		TransactionState:                 s.transactionState,
 		NextProducerEpoch:                &s.nextProducerEpoch,
 		TransactionCoordinatorShards:     s.transactionCoordinatorShards,

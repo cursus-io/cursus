@@ -131,6 +131,11 @@ func restoreOffsetReservations(groups map[string]*GroupMetadata, snapshots map[s
 // mutations are excluded. The controller must receive success before persisting
 // prepare_commit. An identical retry remains valid after membership changes.
 func (c *Coordinator) PrepareOffsetReservation(groupName string, registrationEpoch uint64, reservation TransactionOffsetReservation) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := validateOffsetReservations([]TransactionOffsetReservation{reservation}); err != nil {
 		return err
 	}
@@ -213,6 +218,11 @@ func (c *Coordinator) PrepareOffsetReservation(groupName string, registrationEpo
 // durable final decision. A commit materializes offsets before releasing the
 // reservation; failure keeps stable reads fenced for an idempotent retry.
 func (c *Coordinator) ResolveOffsetReservation(groupName string, registrationEpoch uint64, transactionalID, producerID string, producerEpoch int64, committed bool) error {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	if transactionalID == "" || producerID == "" || producerEpoch < 0 || registrationEpoch == 0 {
 		return fmt.Errorf("invalid transaction reservation identity")
 	}
@@ -350,6 +360,11 @@ func reservedOffsetError(group *GroupMetadata, groupName, topic string, partitio
 // GetStableOffset refuses to expose a resume position while its transaction
 // has a durable reservation. Unrelated partitions remain available.
 func (c *Coordinator) GetStableOffset(groupName, topic string, partition int) (uint64, bool, error) {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return 0, false, err
+	}
+	defer release()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	group := c.groups[groupName]

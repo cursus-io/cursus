@@ -169,6 +169,46 @@ func (v *PartitionReadView) ReadCommittedRange(offset, end uint64, max int) ([]t
 	}
 	return v.p.readVisibleCommitted(offset, max, v.end, min(end, v.end))
 }
+
+// ReadCommittedMetadata scans the full committed boundary, including metadata
+// after an independent unresolved transaction. Unlike ReadCommittedPage it is
+// not capped at LSO. Transaction records still require committed visibility.
+func (v *PartitionReadView) ReadCommittedMetadata(offset uint64, max int) ([]types.Message, error) {
+	if err := v.check(); err != nil {
+		return nil, err
+	}
+	return v.ReadCommittedMetadataThrough(offset, v.CommittedEnd(), max)
+}
+
+// ReadCommittedMetadataThrough freezes BOTH the scan and transaction-marker
+// visibility boundary. Repeated pages can use one captured end even if normal
+// HWM advances; a marker beyond that end cannot make an earlier record visible.
+func (v *PartitionReadView) ReadCommittedMetadataThrough(offset, end uint64, max int) ([]types.Message, error) {
+	if err := v.check(); err != nil {
+		return nil, err
+	}
+	if !v.offline {
+		if err := v.p.RecoveryError(); err != nil {
+			return nil, err
+		}
+		if err := v.p.hwmReadinessError(); err != nil {
+			return nil, err
+		}
+	}
+	if end > v.CommittedEnd() {
+		return nil, fmt.Errorf("metadata end exceeds committed read view")
+	}
+	if offset < v.FirstOffset() {
+		return nil, &types.OffsetOutOfRangeError{Requested: offset, Earliest: v.FirstOffset(), Latest: end}
+	}
+	if max <= 0 {
+		return nil, nil
+	}
+	v.p.txnMarkerMu.RLock()
+	defer v.p.txnMarkerMu.RUnlock()
+	messages, _, _, err := v.p.readCommittedScanRangeBounded(offset, end, end, max, 0, true, v.p.txnMarkers, v.p.txnResolver)
+	return messages, err
+}
 func (v *PartitionReadView) OffsetRange() (PartitionOffsetRange, error) {
 	if err := v.check(); err != nil {
 		return PartitionOffsetRange{}, err
@@ -208,7 +248,7 @@ func (p *Partition) ReadCommittedRange(offset, end uint64, max int) (out []types
 	return
 }
 func (p *Partition) readCommittedMetadata(offset uint64, max int) (out []types.Message, err error) {
-	err = p.WithReadView(func(v *PartitionReadView) error { out, err = p.readCommittedMetadataUngated(offset, max); return err })
+	err = p.WithReadView(func(v *PartitionReadView) error { out, err = v.ReadCommittedMetadata(offset, max); return err })
 	return
 }
 func (p *Partition) ProducerSequenceOffset(id string, epoch int64, seq uint64) (offset uint64, found bool, err error) {

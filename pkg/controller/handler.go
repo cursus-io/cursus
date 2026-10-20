@@ -37,19 +37,21 @@ type CommandHandler struct {
 	TxnManager    *transaction.Manager
 	commands      []commandEntry
 
-	coordCache               map[string]coordCacheEntry
-	coordCacheMu             sync.RWMutex
-	topicLifecycleGates      topicLifecycleGates
-	topicCreateMu            sync.Mutex
-	groupRecoveryEpoch       map[uint64]int
-	groupRecoveryMu          sync.Mutex
-	groupRecoveryReloadMu    sync.Mutex
-	txnJournal               *transaction.Journal
-	transactionStateSyncHook func(string) error
-	transactionStateLocks    [transactionStateLockStripes]sync.Mutex
-	partitionWriteLocks      sync.Map // map[string]*contextMutex
-	partitionPreparedEpochs  sync.Map // map[string]partitionLeadershipFence
-	replication              *partitionReplicationCoordinator
+	coordCache                 map[string]coordCacheEntry
+	coordCacheMu               sync.RWMutex
+	topicLifecycleGates        topicLifecycleGates
+	topicCreateMu              sync.Mutex
+	groupRecoveryEpoch         map[uint64]int
+	groupRecoveryMu            sync.Mutex
+	groupRecoveryReloadMu      sync.Mutex
+	consumerRecoveryProviderMu sync.RWMutex
+	consumerRecoveryProvider   ConsumerMetadataRecoveryProvider
+	txnJournal                 *transaction.Journal
+	transactionStateSyncHook   func(string) error
+	transactionStateLocks      [transactionStateLockStripes]sync.Mutex
+	partitionWriteLocks        sync.Map // map[string]*contextMutex
+	partitionPreparedEpochs    sync.Map // map[string]partitionLeadershipFence
+	replication                *partitionReplicationCoordinator
 }
 
 func (ch *CommandHandler) transactionStateLock(transactionalID string) *sync.Mutex {
@@ -190,7 +192,7 @@ func NewCommandHandler(
 	if cd != nil {
 		cd.SetTransactionalOffsetResolver(ch.TxnManager)
 		if ch.isDistributed() {
-			cd.SetOffsetRecordWriter(ch.writeConsumerOffsetRecord)
+			cd.SetRoutedOffsetRecordWriter(ch.writeConsumerOffsetRecord)
 		}
 	}
 	if cc != nil && cc.RaftManager != nil {
@@ -355,6 +357,9 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 
 	if resp := ch.authorizeClientCommand(input, ctx); resp != "" {
 		return ch.fail(rawCmd, resp)
+	}
+	if err := ch.consumerCommandReadinessError(input); err != nil {
+		return ch.fail(rawCmd, err.Error())
 	}
 	if _, topicMismatch := raftApplyLifecycleTopic(input); topicMismatch {
 		return ch.fail(rawCmd, "ERROR: raft_apply_topic_mismatch")

@@ -18,6 +18,15 @@ type TopicGroupReference struct {
 // TopicGroupReferences returns a detached, deterministic view of groups that
 // subscribe to or retain state for topicName, including before the first commit.
 func (c *Coordinator) TopicGroupReferences(topicName string) []TopicGroupReference {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil
+	}
+	defer release()
+	return c.topicGroupReferences(topicName)
+}
+
+func (c *Coordinator) topicGroupReferences(topicName string) []TopicGroupReference {
 	if c == nil || topicName == "" {
 		return nil
 	}
@@ -101,7 +110,12 @@ func (reference TopicGroupReference) validateCleanup(topicName string) error {
 // ValidateTopicGroupCleanup checks admission without mutating group state.
 // Actual cleanup repeats these checks after the topic intent has committed.
 func (c *Coordinator) ValidateTopicGroupCleanup(topicName string) error {
-	for _, reference := range c.TopicGroupReferences(topicName) {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	for _, reference := range c.topicGroupReferences(topicName) {
 		if err := reference.validateCleanup(topicName); err != nil {
 			return err
 		}
@@ -112,10 +126,15 @@ func (c *Coordinator) ValidateTopicGroupCleanup(topicName string) error {
 // DeleteInactiveGroupsForTopic writes normal lifecycle tombstones before
 // removing groups confined to this topic. All references must pass preflight.
 func (c *Coordinator) DeleteInactiveGroupsForTopic(topicName string) ([]string, error) {
+	release, err := c.admitConsumerOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
-	references := c.TopicGroupReferences(topicName)
+	references := c.topicGroupReferences(topicName)
 	for _, reference := range references {
 		if err := reference.validateCleanup(topicName); err != nil {
 			return nil, err

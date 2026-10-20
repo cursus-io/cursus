@@ -104,6 +104,11 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 	if !ok || topicName == "" {
 		return "ERROR: missing_topic command=PUBLISH"
 	}
+	if topicName == config.ConsumerOffsetsTopicName {
+		if err := ch.consumerReadinessError(); err != nil {
+			return err.Error()
+		}
+	}
 
 	message, ok := args["message"]
 	if !ok || message == "" {

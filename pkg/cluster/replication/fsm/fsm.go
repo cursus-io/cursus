@@ -73,6 +73,7 @@ type BrokerFSMState struct {
 	PartitionMetadata                map[string]*PartitionMetadata                  `json:"partitionMetadata"`
 	ProducerState                    map[string]map[int]map[string]ProducerSequence `json:"producerState"`
 	GroupState                       map[string]*coordinator.GroupStateSnapshot     `json:"groupState,omitempty"`
+	ConsumerRecovery                 *coordinator.ConsumerRecoveryEnvelope          `json:"consumerRecovery,omitempty"`
 	TransactionState                 map[string]*transaction.Snapshot               `json:"transactionState,omitempty"`
 	NextProducerEpoch                *uint64                                        `json:"nextProducerEpoch,omitempty"`
 	TransactionCoordinatorShards     map[int]TransactionCoordinatorShard            `json:"transactionCoordinatorShards,omitempty"`
@@ -339,7 +340,7 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 	return res
 }
 
-func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
+func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	f.transitionMu.Lock()
 	defer f.transitionMu.Unlock()
 
@@ -396,8 +397,16 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		return fmt.Errorf("restore topic definitions: %w", err)
 	}
 	restoredTopicState = topicStateFromDefinitions(definitions)
+	if err := coordinator.ValidateConsumerRecoveryEnvelope(state.ConsumerRecovery); err != nil {
+		return err
+	}
 	if err := coordinator.ValidateImportState(state.GroupState); err != nil {
 		return fmt.Errorf("restore consumer groups: %w", err)
+	}
+	if f.cd != nil {
+		if err := f.cd.ValidateConsumerRestoreOrigin(state.ConsumerRecovery); err != nil {
+			return err
+		}
 	}
 	if err := transaction.ValidateImportState(state.TransactionState); err != nil {
 		return fmt.Errorf("restore transactions: %w", err)
@@ -430,6 +439,10 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 		}
 	}
 
+	if f.cd != nil {
+		generation := f.cd.BeginConsumerRestore()
+		defer func() { f.cd.FinishConsumerRestore(generation, restoreErr) }()
+	}
 	f.mu.Lock()
 	previousMaterialization := f.topicMaterialization
 
@@ -513,8 +526,8 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) error {
 	if f.transactionCoordinatorChanges == nil {
 		f.transactionCoordinatorChanges = make(chan []int, 1)
 	}
-	if state.GroupState != nil && f.cd != nil {
-		if err := f.cd.ImportState(state.GroupState); err != nil {
+	if f.cd != nil {
+		if err := f.cd.ImportStateWithRecovery(state.GroupState, state.ConsumerRecovery); err != nil {
 			f.mu.Unlock()
 			f.materializationMu.Unlock()
 			return fmt.Errorf("restore consumer groups: %w", err)
@@ -841,8 +854,12 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	topicStateCopy = topicStateFromDefinitions(definitions)
 
 	var groupState map[string]*coordinator.GroupStateSnapshot
+	var consumerRecovery *coordinator.ConsumerRecoveryEnvelope
 	if f.cd != nil {
-		groupState = f.cd.ExportState()
+		groupState, consumerRecovery, err = f.cd.ExportStateWithRecovery()
+		if err != nil {
+			return nil, fmt.Errorf("snapshot consumer recovery: %w", err)
+		}
 		if err := coordinator.ValidateImportState(groupState); err != nil {
 			return nil, fmt.Errorf("snapshot consumer groups: %w", err)
 		}
@@ -866,6 +883,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		partitionMetadata:                metadataCopy,
 		producerState:                    producerStateCopy,
 		groupState:                       groupState,
+		consumerRecovery:                 consumerRecovery,
 		transactionState:                 transactionState,
 		nextProducerEpoch:                nextProducerEpoch,
 		transactionCoordinatorShards:     transactionCoordinatorShards,

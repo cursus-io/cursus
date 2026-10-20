@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -9,11 +10,14 @@ import (
 	"testing"
 	"time"
 
+	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
+	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/hashicorp/raft"
 )
 
 func TestCloseListenerOnDone(t *testing.T) {
@@ -111,6 +115,13 @@ func TestRunServerContextRejectsPartialObservationCredentials(t *testing.T) {
 	}
 }
 
+type startupRecoveryRaft struct {
+	clusterController.RaftManager
+	state *fsm.BrokerFSM
+}
+
+func (r *startupRecoveryRaft) GetFSM() *fsm.BrokerFSM { return r.state }
+
 func TestDistributedConsumerMetadataRecoveryWaitsForAuthoritativeHWMs(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
@@ -128,14 +139,16 @@ func TestDistributedConsumerMetadataRecoveryWaitsForAuthoritativeHWMs(t *testing
 		diskManager.CloseAllHandlers()
 	})
 
-	if consumerMetadataHWMReady(topicManager) {
-		t.Fatal("consumer metadata recovery was ready before Raft established committed HWMs")
-	}
+	state := fsm.NewBrokerFSM(topicManager, c)
+	rm := &startupRecoveryRaft{state: state}
+	router := clusterController.NewClusterRouter("local", "127.0.0.1:7000", nil, rm, cfg.BrokerPort, cfg.AdvertisedClientHost, cfg)
+	handler := controller.NewCommandHandler(topicManager, cfg, c, nil, &clusterController.ClusterController{RaftManager: rm, Router: router})
+	t.Cleanup(func() { _ = handler.Close() })
 	recoveryDone := make(chan error, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	go func() {
-		recoveryDone <- awaitDistributedConsumerMetadataRecovery(ctx, c, topicManager)
+		recoveryDone <- awaitDistributedConsumerMetadataRecovery(ctx, handler)
 	}()
 
 	select {
@@ -151,8 +164,22 @@ func TestDistributedConsumerMetadataRecoveryWaitsForAuthoritativeHWMs(t *testing
 	for _, partition := range offsetsTopic.Partitions {
 		partition.SetHWM(0)
 	}
-	if !consumerMetadataHWMReady(topicManager) {
-		t.Fatal("consumer metadata recovery remained blocked after all committed HWMs became authoritative")
+	select {
+	case err := <-recoveryDone:
+		t.Fatalf("local HWM alone authorized startup: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	definition := offsetsTopic.Definition()
+	definition.ReplicationFactor = 1
+	if result := state.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"local","addr":"127.0.0.1:7000","status":"active","lifecycle_protocol":2}`)}); result != nil {
+		t.Fatal(result)
+	}
+	payload, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := state.Apply(&raft.Log{Data: append([]byte("TOPIC:"), payload...)}); result != nil {
+		t.Fatal(result)
 	}
 
 	select {
