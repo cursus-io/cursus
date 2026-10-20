@@ -67,12 +67,17 @@ func (dh *DiskHandler) ReadReplayPage(offset, end uint64, cursor types.ReplayCur
 	if err != nil {
 		return page, err
 	}
-	if page.Cursor.Position > uint64(stat.Size()) || page.Cursor.Position > math.MaxInt64-4 {
+	sizeOnDisk := stat.Size()
+	if sizeOnDisk < 0 {
+		return page, fmt.Errorf("invalid replay segment length")
+	}
+	segmentBytes := uint64(sizeOnDisk)
+	if page.Cursor.Position > segmentBytes || page.Cursor.Position > math.MaxInt64-4 {
 		return page, fmt.Errorf("replay cursor exceeds segment length")
 	}
 	var length [4]byte
 	for page.Records < maxRecords && page.Bytes < maxBytes {
-		if page.Cursor.Position == uint64(stat.Size()) {
+		if page.Cursor.Position == segmentBytes {
 			if hasNext {
 				page.Cursor.Segment = nextSegment
 				page.Cursor.Position = 0
@@ -91,7 +96,7 @@ func (dh *DiskHandler) ReadReplayPage(offset, end uint64, cursor types.ReplayCur
 		if size == 0 || size > MaxMessageSize {
 			return page, fmt.Errorf("invalid replay record length %d", size)
 		}
-		if uint64(size)+4 > uint64(stat.Size())-page.Cursor.Position {
+		if uint64(size)+4 > segmentBytes-page.Cursor.Position {
 			return page, fmt.Errorf("truncated committed replay record")
 		}
 		if int(size) > maxBytes-page.Bytes {
