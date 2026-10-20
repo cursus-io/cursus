@@ -383,12 +383,18 @@ func runReplicaFaultSentinelCommand(node int, operation, name string, enabled bo
 
 func requireRecoveryPendingAndNotReady(t *testing.T, addrs []string, topicName string, partitionID, leaderEpoch int) int {
 	t.Helper()
+	// Startup recovery deliberately keeps the client listener closed. Query the
+	// authenticated internal listener to observe each peer's replayed fence.
+	internalAddrs := make([]string, len(addrs))
+	for i := range addrs {
+		internalAddrs[i] = fmt.Sprintf("127.0.0.1:%d", 19001+i)
+	}
 	recoveryNode := 0
 	require.NoError(t, eventually(t, "replica recovery pending and readiness closed", clusterReadyTimeout, func() (bool, string, error) {
-		node, err := observeRecoveryFence(addrs, topicName, partitionID, leaderEpoch, func(addr string) (string, error) {
+		node, err := observeRecoveryFence(internalAddrs, topicName, partitionID, leaderEpoch, func(addr string) (string, error) {
 			client := e2e.NewBrokerClient([]string{addr})
 			defer client.Close()
-			return client.SendCommand("admin", "CLUSTER_STATUS", 5*time.Second)
+			return client.SendCommand("admin", "CLUSTER_STATUS internal_token=cursus-test-internal-token", 5*time.Second)
 		})
 		if err != nil {
 			return false, "waiting for every broker to apply the recovery fence", err

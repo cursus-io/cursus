@@ -1002,6 +1002,16 @@ func processMessage(data []byte, cmdHandler *controller.CommandHandler, ctx *con
 			writeResponse(conn, resp)
 			return false, nil
 		}
+		// Recovery keeps the client listener closed. Permit authenticated local
+		// status observations through the internal listener without changing the
+		// public command's exact, argument-free contract.
+		if ctx != nil && ctx.Internal {
+			fields := strings.Fields(rawInput)
+			if len(fields) == 2 && strings.EqualFold(fields[0], "CLUSTER_STATUS") &&
+				strings.HasPrefix(fields[1], "internal_token=") {
+				rawInput = fields[0]
+			}
+		}
 		return handleCommandMessage(rawInput, cmdHandler, ctx, conn)
 	}
 
