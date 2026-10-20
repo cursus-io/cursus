@@ -57,17 +57,22 @@ func runRecoveryDiagnostics(ctx context.Context, cfg *config.Config, tm *topic.T
 	}
 
 	state := NewHealthState()
+	defer state.Close()
 	addStorageReadinessChecks(state, tm, dm)
 	if includeCoordinator {
 		addConsumerMetadataReadinessCheck(state, cd)
 	}
+	state.Start()
 	state.SetReady(true)
+	// Preserve a nil interface when this diagnostics mode has no coordinator.
 	collector := observability.NewCollector(tm, nil, dm, nil, nil, state)
 	if cd != nil {
 		collector = observability.NewCollector(tm, cd, dm, nil, nil, state)
 	}
 
 	if cfg.EnableExporter {
+		collector.Start()
+		defer collector.Close()
 		metricsServer, err := metrics.StartMetricsServer(cfg.ExporterPort, collector)
 		if err != nil {
 			return fmt.Errorf("start diagnostics metrics exporter: %w", err)

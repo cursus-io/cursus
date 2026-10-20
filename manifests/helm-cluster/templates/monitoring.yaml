@@ -77,6 +77,14 @@ spec:
           annotations:
             summary: Cursus cluster replication is unsafe
             description: At least one partition lacks its declared replicas, assignment, or minimum in-sync quorum.
+        - alert: CursusObservationUnavailable
+          expr: cursus_observation_valid{namespace={{ .Release.Namespace | quote }}} == 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: Cursus diagnostic observation is unavailable
+            description: A readiness, runtime, or process observation is missing, failed, expired, or over budget. Omitted metrics do not indicate healthy state.
         - alert: CursusStorageWritesStalled
           expr: min_over_time(cursus_storage_pending_writes{namespace={{ .Release.Namespace | quote }}}[{{ .Values.monitoring.prometheusRule.storagePendingFor }}]) > 0
           labels:

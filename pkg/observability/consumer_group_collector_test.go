@@ -32,7 +32,7 @@ func TestCollectorExportsAuthoritativeConsumerLifecycle(t *testing.T) {
 	require.NoError(t, err)
 
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(NewCollector(
+	registry.MustRegister(newSampleCollector(
 		fixedTopics{snapshot: topic.RuntimeSnapshot{TopicCount: 1, Partitions: []topic.PartitionRuntimeSnapshot{{Topic: "events", Partition: 0}}}},
 		groups, fixedDisk{}, nil, nil, fixedReadiness(true),
 	))
@@ -61,7 +61,7 @@ func TestCollectorCountsBoundedObservationFailuresAndOmitsStaleState(t *testing.
 	})
 
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(NewCollector(
+	registry.MustRegister(newSampleCollector(
 		fixedTopics{snapshot: topic.RuntimeSnapshot{TopicCount: 1, Partitions: []topic.PartitionRuntimeSnapshot{{Topic: "events", Partition: 0}}}},
 		groups, fixedDisk{}, nil, nil, fixedReadiness(true),
 	))
@@ -93,7 +93,7 @@ func TestCollectorCountsTopicLookupFailuresWithoutInventingExpectedGroups(t *tes
 	t.Cleanup(groups.Stop)
 	require.NoError(t, groups.RegisterGroup("missing-topic", "known-group", 1))
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(NewCollector(fixedTopics{}, groups, fixedDisk{}, nil, nil, fixedReadiness(true)))
+	registry.MustRegister(newSampleCollector(fixedTopics{}, groups, fixedDisk{}, nil, nil, fixedReadiness(true)))
 
 	families, err := registry.Gather()
 	require.NoError(t, err)
@@ -121,7 +121,7 @@ func TestCollectorThreeBrokerCoordinatorMovementConvergesWithoutDuplicateMembers
 	require.NoError(t, brokers[2].ImportState(state))
 
 	owner := 1
-	collectors := make([]*Collector, len(brokers))
+	collectors := make([]*sampleCollector, len(brokers))
 	for index, broker := range brokers {
 		brokerIndex := index
 		broker.SetGroupObservationBatchResolver(func(groupNames []string) (map[string]bool, error) {
@@ -131,7 +131,7 @@ func TestCollectorThreeBrokerCoordinatorMovementConvergesWithoutDuplicateMembers
 			}
 			return resolved, nil
 		})
-		collectors[index] = NewCollector(
+		collectors[index] = newSampleCollector(
 			fixedTopics{snapshot: topic.RuntimeSnapshot{TopicCount: 1, Partitions: []topic.PartitionRuntimeSnapshot{{Topic: "events", Partition: 0}}}},
 			broker, fixedDisk{}, nil, nil, fixedReadiness(true),
 		)
@@ -151,7 +151,7 @@ func TestConsumerLifecycleMetricLabelsAreBounded(t *testing.T) {
 	_, err := groups.AddConsumer("workers", "member-sensitive-id")
 	require.NoError(t, err)
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(NewCollector(
+	registry.MustRegister(newSampleCollector(
 		fixedTopics{snapshot: topic.RuntimeSnapshot{Partitions: []topic.PartitionRuntimeSnapshot{{Topic: "events", Partition: 0}}}},
 		groups, fixedDisk{}, nil, nil, fixedReadiness(true),
 	))
@@ -179,7 +179,7 @@ func TestConsumerLifecycleMetricLabelsAreBounded(t *testing.T) {
 	}
 }
 
-func assertThreeBrokerLifecycleAggregate(t *testing.T, collectors []*Collector, owner, wantMembers int) {
+func assertThreeBrokerLifecycleAggregate(t *testing.T, collectors []*sampleCollector, owner, wantMembers int) {
 	t.Helper()
 	coordinatorSum := 0.0
 	memberSeries := 0

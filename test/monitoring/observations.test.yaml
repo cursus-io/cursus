@@ -1,0 +1,110 @@
+rule_files:
+  - rules.yaml
+evaluation_interval: 1m
+tests:
+  - name: Measured low headroom fires the existing alert and resolves after recovery
+    interval: 1m
+    input_series:
+      - series: 'cursus_storage_filesystem_headroom_ready{namespace="brokers",instance="low-space"}'
+        values: '0x2 1x2'
+      - series: 'cursus_observation_valid{namespace="brokers",instance="low-space",component="runtime"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CursusStorageDiskHeadroomLow
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: CursusStorageDiskHeadroomLow
+        exp_alerts:
+          - exp_labels:
+              namespace: brokers
+              instance: low-space
+              severity: critical
+            exp_annotations:
+              summary: Cursus storage filesystem headroom is exhausted
+              description: The broker is rejecting writes because the log filesystem is below its configured free-space reserve.
+      - eval_time: 1m
+        alertname: CursusObservationUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CursusStorageDiskHeadroomLow
+        exp_alerts: []
+
+  - name: Failed expired and timed-out observations alert despite successful scrapes and omitted runtime series
+    interval: 1m
+    input_series:
+      - series: 'up{namespace="brokers",instance="failed"}'
+        values: '1x5'
+      - series: 'cursus_storage_filesystem_headroom_ready{namespace="brokers",instance="failed"}'
+        values: '1 stale'
+      - series: 'cursus_observation_valid{namespace="brokers",instance="failed",component="runtime"}'
+        values: '1 0x1 1x2'
+      - series: 'cursus_observation_last_failed{namespace="brokers",instance="failed",component="runtime"}'
+        values: '0 1x1 0x2'
+      - series: 'cursus_observation_valid{namespace="brokers",instance="expired",component="readiness"}'
+        values: '1 0x1 1x2'
+      - series: 'cursus_observation_stale{namespace="brokers",instance="expired",component="readiness"}'
+        values: '0 1x1 0x2'
+      - series: 'cursus_observation_valid{namespace="brokers",instance="blocked",component="process"}'
+        values: '1 0x1 1x2'
+      - series: 'cursus_observation_timed_out{namespace="brokers",instance="blocked",component="process"}'
+        values: '0 1x1 0x2'
+      - series: 'cursus_observation_valid{namespace="brokers",instance="healthy",component="runtime"}'
+        values: '1x5'
+      - series: 'cursus_observation_valid{namespace="other",instance="ignored",component="runtime"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: CursusObservationUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: CursusObservationUnavailable
+        exp_alerts:
+          - exp_labels:
+              namespace: brokers
+              instance: failed
+              component: runtime
+              severity: warning
+            exp_annotations: &unavailable
+              summary: Cursus diagnostic observation is unavailable
+              description: A readiness, runtime, or process observation is missing, failed, expired, or over budget. Omitted metrics do not indicate healthy state.
+          - exp_labels:
+              namespace: brokers
+              instance: expired
+              component: readiness
+              severity: warning
+            exp_annotations: *unavailable
+          - exp_labels:
+              namespace: brokers
+              instance: blocked
+              component: process
+              severity: warning
+            exp_annotations: *unavailable
+      - eval_time: 2m
+        alertname: CursusStorageDiskHeadroomLow
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CursusObservationUnavailable
+        exp_alerts: []
+
+  - name: An uncompleted initial observation alerts only after the grace period
+    interval: 1m
+    input_series:
+      - series: 'cursus_observation_valid{namespace="brokers",instance="starting",component="runtime"}'
+        values: '0x1 1x2'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CursusObservationUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: CursusObservationUnavailable
+        exp_alerts:
+          - exp_labels:
+              namespace: brokers
+              instance: starting
+              component: runtime
+              severity: warning
+            exp_annotations: *unavailable
+      - eval_time: 2m
+        alertname: CursusObservationUnavailable
+        exp_alerts: []

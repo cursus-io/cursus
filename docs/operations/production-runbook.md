@@ -34,6 +34,17 @@ cursus-storage backup validate --log-dir /backup/cursus-logs
 Restore only from one validated backup generation. Never edit journal, segment,
 index, manifest, or Raft files in place.
 
+## Diagnostic observations unavailable
+
+`CursusObservationUnavailable` means the labeled readiness, runtime or process
+observation has been invalid for at least one minute. `/metrics` may still return
+200 while the affected metrics are omitted. Inspect `cursus_observation_stale`,
+`cursus_observation_timed_out`, `cursus_observation_in_progress`, last completion
+and last failure. An uncompleted initial sample has no completion timestamp.
+Do not interpret missing storage, replication or consumer metrics as healthy
+zeros; use node/storage telemetry and `/ready` to investigate the blocked or
+failed source. The alert resolves after a fresh successful observation.
+
 ## Storage headroom exhausted
 
 `CursusStorageDiskHeadroomLow` means new writes are being rejected before the

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -157,9 +158,10 @@ func TestIsCommand_CaseInsensitive(t *testing.T) {
 
 func TestHealthHandlerSeparatesLivenessAndReadiness(t *testing.T) {
 	state := NewHealthState()
-	dependencyReady := false
+	t.Cleanup(state.Close)
+	var dependencyReady atomic.Bool
 	state.AddCheck("cluster_leader", func(context.Context) error {
-		if !dependencyReady {
+		if !dependencyReady.Load() {
 			return errors.New("no leader")
 		}
 		return nil
@@ -175,12 +177,15 @@ func TestHealthHandlerSeparatesLivenessAndReadiness(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, removed.Code)
 
 	state.SetReady(true)
+	state.Start()
+	require.Eventually(t, func() bool { return !state.ObservationStatus().CompletedAt.IsZero() }, time.Second, time.Millisecond)
 	ready := httptest.NewRecorder()
 	handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/ready", nil))
 	assert.Equal(t, http.StatusServiceUnavailable, ready.Code)
 	assert.Contains(t, ready.Body.String(), `"cluster_leader":"no leader"`)
 
-	dependencyReady = true
+	dependencyReady.Store(true)
+	require.Eventually(t, state.IsReady, 3*time.Second, time.Millisecond)
 	ready = httptest.NewRecorder()
 	handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/ready", nil))
 	assert.Equal(t, http.StatusOK, ready.Code)
@@ -198,8 +203,11 @@ func TestReadinessDoesNotDependOnConsumerGroupMembers(t *testing.T) {
 	require.Zero(t, requireGroupMembers(t, groupCoordinator, "lazy-group"))
 
 	state := NewHealthState()
+	t.Cleanup(state.Close)
 	addConsumerMetadataReadinessCheck(state, groupCoordinator)
 	state.SetReady(true)
+	state.Start()
+	require.Eventually(t, state.IsReady, time.Second, time.Millisecond)
 	recorder := httptest.NewRecorder()
 	newHealthHandler(state).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
 	require.Equal(t, http.StatusOK, recorder.Code)
