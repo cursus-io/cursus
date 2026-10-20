@@ -280,6 +280,12 @@ func (c *Coordinator) DeleteGroup(groupName string) error {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
+	return c.deleteGroupLocked(groupName, "")
+}
+
+// deleteGroupLocked requires lifecycleMu. A nonempty topicName additionally
+// constrains deletion to a group whose state is confined to that topic.
+func (c *Coordinator) deleteGroupLocked(groupName, topicName string) error {
 	c.mu.Lock()
 	group := c.groups[groupName]
 	if group == nil {
@@ -287,6 +293,19 @@ func (c *Coordinator) DeleteGroup(groupName string) error {
 		return nil
 	}
 	group.mu.Lock()
+	if topicName != "" {
+		reference, found := topicGroupReferenceLocked(groupName, group, topicName)
+		if !found {
+			group.mu.Unlock()
+			c.mu.Unlock()
+			return fmt.Errorf("consumer group %q no longer references topic %q", groupName, topicName)
+		}
+		if err := reference.validateCleanup(topicName); err != nil {
+			group.mu.Unlock()
+			c.mu.Unlock()
+			return err
+		}
+	}
 	if len(group.Members) != 0 {
 		group.mu.Unlock()
 		c.mu.Unlock()
@@ -307,7 +326,7 @@ func (c *Coordinator) DeleteGroup(groupName string) error {
 		c.mu.Unlock()
 		return fmt.Errorf("group lifecycle epoch overflow")
 	}
-	topicName := group.TopicName
+	registrationTopic := group.TopicName
 	if c.lifecyclePending == nil {
 		c.lifecyclePending = make(map[string]bool)
 	}
@@ -315,7 +334,7 @@ func (c *Coordinator) DeleteGroup(groupName string) error {
 	group.mu.Unlock()
 	c.mu.Unlock()
 
-	err := c.writeGroupTombstone(groupName, topicName, epoch)
+	err := c.writeGroupTombstone(groupName, registrationTopic, epoch)
 
 	c.mu.Lock()
 	delete(c.lifecyclePending, groupName)

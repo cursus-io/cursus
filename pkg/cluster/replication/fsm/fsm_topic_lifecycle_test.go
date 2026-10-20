@@ -54,6 +54,48 @@ func (*recoverableLifecyclePublisher) CreateTopic(string, int, bool, bool) error
 	return nil
 }
 
+func TestCommittedTopicCleanupPreservesSharedGroupsOnRetry(t *testing.T) {
+	for _, operation := range []string{"delete", "truncate"} {
+		t.Run(operation, func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			cfg.EnabledDistribution = true
+			cfg.LogDir = t.TempDir()
+			manager := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+			t.Cleanup(manager.Stop)
+			c := coordinator.NewCoordinator(context.Background(), cfg, manager)
+			t.Cleanup(c.Stop)
+			state := NewBrokerFSM(manager, c)
+			registerLifecycleBroker(t, state, "broker-1", TopicLifecycleProtocolVersion)
+			for i, name := range []string{"orders", "payments"} {
+				create, err := json.Marshal(testTopicCommand(name, 1, 1))
+				require.NoError(t, err)
+				require.Nil(t, state.Apply(&raft.Log{Data: []byte("TOPIC:" + string(create)), Index: uint64(i + 2)}))
+			}
+			require.NoError(t, c.RegisterGroupSubscription("workers", []string{"orders", "payments"}, "", map[string]int{"orders": 1, "payments": 1}))
+			require.NoError(t, c.CommitOffset("workers", "orders", 0, 17))
+			require.NoError(t, c.CommitOffset("workers", "payments", 0, 29))
+			before := c.ExportState()
+			writes := 0
+			c.SetOffsetRecordWriter(func(coordinator.ConsumerMetadataRecord) error { writes++; return nil })
+			if operation == "delete" {
+				result := state.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"orders"}`), Index: 4})
+				require.Equal(t, topic.DeleteResult{Deleted: true, CleanupPending: true}, result)
+			} else {
+				result := state.Apply(&raft.Log{Data: []byte(`TOPIC_TRUNCATE:{"topic":"orders","expected_revision":1}`), Index: 4})
+				require.True(t, result.(topic.TruncateResult).Truncated)
+				require.True(t, result.(topic.TruncateResult).CleanupPending)
+			}
+			for range 2 {
+				require.ErrorContains(t, state.ReconcileTopicMaterializations(), "outside topic")
+				require.Equal(t, before, c.ExportState())
+				require.Equal(t, uint64(1), manager.GetTopic("payments").Revision)
+				require.Nil(t, manager.GetTopic("orders"))
+			}
+			require.Zero(t, writes, "committed topic intent cannot authorize a shared group tombstone")
+		})
+	}
+}
+
 func TestBrokerFSMTopicDeleteCleansLifecycleStateAndIsExplicitlyIdempotent(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
