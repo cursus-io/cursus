@@ -3,6 +3,7 @@ package disk
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -54,10 +55,70 @@ func TestRuntimeObservationRejectsMissingSegmentMeasurements(t *testing.T) {
 	cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent = 0, 0
 	dm := NewDiskManager(cfg)
 	dm.handlers["missing"] = &DiskHandler{BaseName: filepath.Join(cfg.LogDir, "missing")}
-	snapshot := dm.RuntimeSnapshot()
+	calls := 0
+	snapshot := dm.runtimeSnapshot(func(path string) (os.FileInfo, error) {
+		calls++
+		return os.Stat(path)
+	})
 	require.Equal(t, 2, snapshot.StatFailures, "missing log and index must invalidate partial byte accounting")
+	require.Equal(t, 4, calls, "persistent absence permits only one extra pass")
 	var unavailable *DiskManager
 	require.Positive(t, unavailable.RuntimeSnapshot().StatFailures)
+}
+
+func TestRuntimeObservationReconcilesConcurrentRetention(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent = 0, 0
+	dm := NewDiskManager(cfg)
+	handler := &DiskHandler{BaseName: filepath.Join(cfg.LogDir, "retention"), segments: []uint64{0, 1}, CurrentSegment: 1}
+	dm.handlers["retention"] = handler
+	for _, base := range handler.segments {
+		for _, path := range []string{handler.GetSegmentPath(base), handler.GetIndexPath(base)} {
+			require.NoError(t, os.WriteFile(path, []byte("data"), 0o600))
+		}
+	}
+	calls := 0
+	snapshot := dm.runtimeSnapshot(func(path string) (os.FileInfo, error) {
+		calls++
+		if calls == 1 {
+			// The observer has copied membership; normal retention now removes
+			// the closed segment and updates membership under its usual locks.
+			handler.maintenanceMu.Lock()
+			handler.mu.Lock()
+			err := handler.markAsDeletedLocked(handler.GetSegmentPath(0))
+			handler.mu.Unlock()
+			handler.maintenanceMu.Unlock()
+			require.NoError(t, err)
+		}
+		return os.Stat(path)
+	})
+	require.Zero(t, snapshot.StatFailures)
+	require.Equal(t, 1, snapshot.Segments)
+	require.EqualValues(t, 8, snapshot.Bytes)
+	require.Equal(t, 6, calls, "one original pass and one pass over retained membership")
+}
+
+func TestRuntimeObservationReconcilesTruncateIndexRecreation(t *testing.T) {
+	handler, cfg := newLineageHandler(t)
+	appendLineageRecords(t, handler, "one", "two", "three")
+	dm := NewDiskManager(cfg)
+	dm.handlers["orders"] = handler
+	calls := 0
+	snapshot := dm.runtimeSnapshot(func(path string) (os.FileInfo, error) {
+		calls++
+		if calls == 2 {
+			require.NoError(t, handler.TruncateTo(1))
+			// Simulate stat having observed the temporary index absence inside
+			// truncate. Truncate recreates the file before releasing handler.mu.
+			return nil, &os.PathError{Op: "stat", Path: path, Err: os.ErrNotExist}
+		}
+		return os.Stat(path)
+	})
+	require.Zero(t, snapshot.StatFailures)
+	require.Equal(t, 4, calls)
+	require.Equal(t, dm.RuntimeSnapshot().Bytes, snapshot.Bytes, "discard pre-truncate byte counts")
+	require.EqualValues(t, 1, handler.GetAbsoluteOffset())
 }
 
 func TestDiagnosticWorkersBoundFilesystemAndDiskLockWaits(t *testing.T) {

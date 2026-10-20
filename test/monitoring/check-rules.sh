@@ -28,5 +28,5 @@ for rendered in "$@"; do
   echo "Testing monitoring rules from $rendered"
   docker run --rm --network none --entrypoint /bin/promtool \
     --mount "type=bind,source=$work,target=/work,readonly" -w /work \
-    prom/prometheus:v3.5.5 test rules tests.yaml
+    prom/prometheus:v3.5.5@sha256:332c2f43e7e389d74d3893b55bb02fbbd684208e681eeb604641d5d769c0fe2a test rules tests.yaml
 done

@@ -58,7 +58,9 @@ workers below are the Cursus design, not a claim of Kafka equivalence.
   unchanged. Run existing storage/recovery tests. Diagnostic recovery performs
   metadata/stat work only: no payload replay, copied recovery bytes or checkpoint
   writes. Re-observing disk usage is O(handlers + segments), with two path stats
-  per distinct segment; a blocked pass is never duplicated by requests.
+  per distinct segment. A missing path allows one extra pass for that handler,
+  after refreshing membership, to reconcile retention/truncate races. This stays
+  O(handlers + segments), with no unbounded retries or request-driven work.
 
 ## Availability and lifecycle limits
 
@@ -94,8 +96,11 @@ in-progress, deadline overrun, stale status, last completion, age, last failure,
 and completed failure count. Timestamp/age/last-failure series are absent until
 the first completion. A stuck first attempt exports valid=0, in_progress=1 and
 (after two seconds) timed_out=1 without inventing a completed result. A storage
-stat failure, including a missing segment/index during removal, invalidates the
-runtime observation instead of exposing partial usage/capacity as zero. Successfully
+stat failure invalidates the runtime observation instead of exposing partial
+usage/capacity as zero. Missing segment/index paths trigger one membership refresh
+and resample: completed retention can remove the segment, and truncate recreates
+its index before releasing the mutation lock. Persistent absence after that bounded
+retry still invalidates the observation; it is never counted as measured zero. Successfully
 measured capacity below the configured headroom threshold is different: it remains
 a valid runtime observation with actual free/total bytes and headroom readiness
 `0`, while broker readiness and write admission still fail. Both Helm charts retain
@@ -136,6 +141,9 @@ metadata recovery and other existing dependency checks retain their meaning.
   periods, namespace isolation and alert resolution. Run
   `bash test/monitoring/check-rules.sh STANDALONE_RENDER.yaml CLUSTER_RENDER.yaml`
   with monitoring enabled and namespace `brokers`; the deployment CI does so.
+- Retention and truncate/index-recreation race tests verify one bounded resample,
+  correct retained byte counts and continued failure for persistently missing
+  files. The retry performs only metadata queries, not index rebuilding or writes.
 - Recovery work remains the existing storage protocol: no added replay, payload
   bytes copied or checkpoint publication. Storage sampling uses metadata/stat
   operations; unchanged durable barrier code is covered by existing disk, topic

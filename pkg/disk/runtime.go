@@ -26,6 +26,10 @@ type RuntimeSnapshot struct {
 // RuntimeSnapshot samples storage state and may block on filesystem calls or
 // locks shared with fsync. Call it only from a bounded background observer.
 func (dm *DiskManager) RuntimeSnapshot() RuntimeSnapshot {
+	return dm.runtimeSnapshot(os.Stat)
+}
+
+func (dm *DiskManager) runtimeSnapshot(stat func(string) (os.FileInfo, error)) RuntimeSnapshot {
 	if dm == nil {
 		return RuntimeSnapshot{StatFailures: 1}
 	}
@@ -52,33 +56,18 @@ func (dm *DiskManager) RuntimeSnapshot() RuntimeSnapshot {
 			continue
 		}
 
-		handler.mu.Lock()
-		segments := append([]uint64(nil), handler.segments...)
-		current := handler.CurrentSegment
-		pending := len(handler.writeCh)
-		handler.mu.Unlock()
-
-		seen := make(map[uint64]struct{}, len(segments)+1)
-		segments = append(segments, current)
-		for _, baseOffset := range segments {
-			if _, exists := seen[baseOffset]; exists {
-				continue
-			}
-			seen[baseOffset] = struct{}{}
-			snapshot.Segments++
-			for _, path := range []string{handler.GetSegmentPath(baseOffset), handler.GetIndexPath(baseOffset)} {
-				info, err := os.Stat(path)
-				if err != nil {
-					// A missing file may be a concurrent retention/removal race,
-					// but it is not evidence of a measured zero-byte segment.
-					snapshot.StatFailures++
-					continue
-				}
-				snapshot.Bytes += info.Size()
-			}
+		files, missing := handler.runtimeFiles(stat)
+		if missing {
+			// Retention/truncation may change membership or recreate the index
+			// after we copy the segment list. Reconcile once with the mutation
+			// lock and resample the entire handler to avoid mixed byte counts.
+			// Persistent absence remains a failure; there is no retry loop.
+			files, _ = handler.runtimeFiles(stat)
 		}
-
-		snapshot.PendingWrites += pending
+		snapshot.Segments += files.Segments
+		snapshot.Bytes += files.Bytes
+		snapshot.StatFailures += files.StatFailures
+		snapshot.PendingWrites += files.PendingWrites
 		snapshot.ActiveReaders += int(handler.GetActiveReaders())
 		cache := handler.segmentReaders.stats()
 		snapshot.SegmentCacheEntries += cache.Entries
@@ -88,6 +77,34 @@ func (dm *DiskManager) RuntimeSnapshot() RuntimeSnapshot {
 	}
 
 	return snapshot
+}
+
+func (d *DiskHandler) runtimeFiles(stat func(string) (os.FileInfo, error)) (RuntimeSnapshot, bool) {
+	d.mu.Lock()
+	segments := append([]uint64(nil), d.segments...)
+	segments = append(segments, d.CurrentSegment)
+	result := RuntimeSnapshot{PendingWrites: len(d.writeCh)}
+	d.mu.Unlock()
+
+	missing := false
+	seen := make(map[uint64]struct{}, len(segments))
+	for _, base := range segments {
+		if _, exists := seen[base]; exists {
+			continue
+		}
+		seen[base] = struct{}{}
+		result.Segments++
+		for _, path := range []string{d.GetSegmentPath(base), d.GetIndexPath(base)} {
+			info, err := stat(path)
+			if err != nil {
+				missing = missing || os.IsNotExist(err)
+				result.StatFailures++
+				continue
+			}
+			result.Bytes += info.Size()
+		}
+	}
+	return result, missing
 }
 
 // Ready verifies that the configured log directory and active handlers are available.
