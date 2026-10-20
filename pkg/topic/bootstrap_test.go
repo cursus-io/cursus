@@ -505,3 +505,19 @@ func TestBootstrapSourceCapturesOneAvailableGeneration(t *testing.T) {
 		}
 	}
 }
+
+func TestBootstrapSourceContextStopsAfterGateWait(t *testing.T) {
+	d, cfg := bootstrapPartitionDisk(t, 0)
+	p := NewPartition(0, "orders", d, nil, cfg)
+	t.Cleanup(p.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	p.reconcileMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		done <- p.WithBootstrapSourceContext(ctx, func(*BootstrapSource) error { t.Error("canceled capture entered callback"); return nil })
+	}()
+	cancel()
+	p.reconcileMu.Unlock()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.Error(t, p.WithBootstrapSourceContext(nil, func(*BootstrapSource) error { return nil })) //nolint:staticcheck // Verify rejection of an invalid nil caller context.
+}

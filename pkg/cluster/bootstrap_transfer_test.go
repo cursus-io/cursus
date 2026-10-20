@@ -80,6 +80,13 @@ func TestBootstrapTransportStrictRequests(t *testing.T) {
 	payload, err := wire.DecodeError(response.Payload)
 	require.NoError(t, err)
 	require.Equal(t, "bootstrap_unavailable", payload.Code)
+	r.Purpose = fsm.BootstrapPurposeReplica
+	encoded, err = json.Marshal(r)
+	require.NoError(t, err)
+	response = clusterRoundTrip(t, addr, wire.CommandBootstrapBegin, map[string]string{"auth_token": "secret", "request": string(encoded)})
+	payload, err = wire.DecodeError(response.Payload)
+	require.NoError(t, err)
+	require.Equal(t, "bootstrap_unavailable", payload.Code, "valid replica request reaches the configured-source boundary")
 }
 
 func TestBootstrapTransportTypedFailures(t *testing.T) {

@@ -376,6 +376,12 @@ func (f *BrokerFSM) MarkReplicaCatchupVerified(request ReplicaCatchupRequest, wi
 // remote active ISR member and is independent from metadata leadership, so a
 // restarted lagging leader can recover without a forced leader election.
 func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchupRequest {
+	return f.BuildReplicaCatchupRequestsExcluding(brokerID, nil)
+}
+
+// Exclusions run before any tail/HWM mutation. A pending durable install always
+// wins, even when no runtime bootstrap receiver is configured yet.
+func (f *BrokerFSM) BuildReplicaCatchupRequestsExcluding(brokerID string, excluded func(string, int) bool) []ReplicaCatchupRequest {
 	if brokerID == "" {
 		return nil
 	}
@@ -417,6 +423,9 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 			continue
 		}
 		topicName := key[:separator]
+		if excluded != nil && excluded(topicName, partitionID) {
+			continue
+		}
 		definition := definitions[topicName]
 		localTopic := topicManager.GetTopic(topicName)
 		source, sourceKnown := selectReplicaCatchupSource(meta, brokerID, brokers)
@@ -426,6 +435,9 @@ func (f *BrokerFSM) BuildReplicaCatchupRequests(brokerID string) []ReplicaCatchu
 		}
 		partition, err := localTopic.GetPartition(partitionID)
 		if err != nil {
+			continue
+		}
+		if partition.BootstrapPending() {
 			continue
 		}
 		leo := partition.NextOffset()

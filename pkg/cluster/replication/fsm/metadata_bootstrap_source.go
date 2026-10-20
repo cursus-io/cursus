@@ -53,6 +53,9 @@ func (f *BrokerFSM) PrepareMetadataBootstrapSource(ctx context.Context, local Bo
 	if err := request.Validate(); err != nil {
 		return nil, err
 	}
+	if request.Purpose != BootstrapPurposeMetadata {
+		return nil, ErrBootstrapTransferUnsupported
+	}
 	unlock, err := lockSourceContext(ctx, &f.transitionMu, &f.materializationMu)
 	if err != nil {
 		return nil, err

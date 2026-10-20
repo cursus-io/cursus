@@ -43,6 +43,13 @@ func (owner *bootstrapByteOwner) release() {
 }
 
 func (owner *bootstrapByteOwner) grow(d *DiskHandler, size int64) error {
+	return owner.growWithHeadroom(d.headroom, size)
+}
+
+// Probe outside process-wide accounting: a blocked filesystem must not stop
+// unrelated admissions. A later budget rejection retains the conservative
+// headroom reservation; no physical free-space refund is fabricated.
+func (owner *bootstrapByteOwner) growWithHeadroom(headroom *diskHeadroomGuard, size int64) error {
 	if size < 0 || !owner.owned {
 		return fmt.Errorf("invalid bootstrap byte ownership or size")
 	}
@@ -53,6 +60,10 @@ func (owner *bootstrapByteOwner) grow(d *DiskHandler, size int64) error {
 		return &BootstrapLimitError{Resource: "canonical bytes", Requested: size, Limit: owner.limits.MaxTransferBytes}
 	}
 	delta := size - owner.reserved
+	// #nosec G115 -- size > owner.reserved >= 0 above, so delta is positive and fits int64.
+	if _, err := headroom.reserve(uint64(delta), false); err != nil {
+		return err
+	}
 	bootstrapBudget.Lock()
 	defer bootstrapBudget.Unlock()
 	requested, err := addBootstrapBytes(bootstrapBudget.bytes, delta)
@@ -62,11 +73,7 @@ func (owner *bootstrapByteOwner) grow(d *DiskHandler, size int64) error {
 	if requested > owner.limits.MaxTotalBytes {
 		return &BootstrapLimitError{Resource: "total staging bytes", Requested: requested, Limit: owner.limits.MaxTotalBytes}
 	}
-	// #nosec G115 -- size > owner.reserved >= 0 above, so delta is positive and fits int64.
-	if _, err := d.headroom.reserve(uint64(delta), false); err != nil {
-		return err
-	}
-	bootstrapBudget.bytes += delta
+	bootstrapBudget.bytes = requested
 	owner.reserved = size
 	return nil
 }

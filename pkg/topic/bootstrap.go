@@ -177,6 +177,16 @@ func (s *BootstrapSession) Install(receiver *disk.BootstrapReceiver, detach func
 	if s.metadata != nil && s.metadata.TransferID != m.TransferID {
 		return s.fail(fmt.Errorf("different bootstrap already pending"))
 	}
+	// The session owns checkpoint exclusion. Read committed authority only on
+	// fresh install, before detaching caches or persisting a replacement intent.
+	// Pending replay may already have deleted this checkpoint on restart.
+	floor, err := loadBootstrapCommittedHWM(s.p.hwmCheckpointPath)
+	if err != nil {
+		return s.fail(err)
+	}
+	if m.EndOffset < floor {
+		return s.fail(fmt.Errorf("bootstrap end %d is below committed checkpoint %d", m.EndOffset, floor))
+	}
 	if detach != nil {
 		if err := detach(); err != nil {
 			return s.fail(err)
@@ -186,7 +196,7 @@ func (s *BootstrapSession) Install(receiver *disk.BootstrapReceiver, detach func
 	s.p.eventIDGeneration.Add(1)
 	s.p.hwmCheckpointSaved = nil
 	s.p.producerCheckpointSaved = nil
-	err := receiver.Install()
+	err = receiver.Install()
 	pending, pendingErr := s.disk.PendingBootstrap()
 	if pending != nil {
 		s.durable = true
@@ -214,6 +224,11 @@ func (s *BootstrapSession) validate(m disk.BootstrapMetadata) error {
 	p.recoveryMu.RUnlock()
 	if known && epoch != m.Fence.LifecycleEpoch {
 		return fmt.Errorf("bootstrap lifecycle mismatch")
+	}
+	// A retained same-process floor also constrains pending/prepared resume.
+	// After restart, the validated pending manifest supplies the boundary.
+	if floor := p.RecoveryCommittedHWMFloor(); m.EndOffset < floor {
+		return fmt.Errorf("bootstrap end %d is below retained committed floor %d", m.EndOffset, floor)
 	}
 	return nil
 }
@@ -370,6 +385,15 @@ func (s *BootstrapSource) SnapshotReadCut() (*SnapshotReadCut, error) {
 }
 
 func (s *BootstrapSource) Export(ctx context.Context, fence disk.BootstrapFence, catalog []byte) (*disk.BootstrapExport, error) {
+	return s.export(ctx, fence, catalog, false)
+}
+
+// ExportOwnedContext leaves cleanup and expiration entirely with the caller.
+func (s *BootstrapSource) ExportOwnedContext(ctx context.Context, fence disk.BootstrapFence, catalog []byte) (*disk.BootstrapExport, error) {
+	return s.export(ctx, fence, catalog, true)
+}
+
+func (s *BootstrapSource) export(ctx context.Context, fence disk.BootstrapFence, catalog []byte, owned bool) (*disk.BootstrapExport, error) {
 	if err := s.view.check(); err != nil {
 		return nil, err
 	}
@@ -379,7 +403,11 @@ func (s *BootstrapSource) Export(ctx context.Context, fence disk.BootstrapFence,
 	if err := s.cut.ValidateRaw(ctx); err != nil {
 		return nil, err
 	}
-	export, err := s.disk.ExportBootstrapContext(ctx, s.cut.anchor, s.cut.end, fence, catalog)
+	exportFn := s.disk.ExportBootstrapContext
+	if owned {
+		exportFn = s.disk.ExportBootstrapOwnedContext
+	}
+	export, err := exportFn(ctx, s.cut.anchor, s.cut.end, fence, catalog)
 	if err != nil {
 		return nil, err
 	}
@@ -389,15 +417,34 @@ func (s *BootstrapSource) Export(ctx context.Context, fence disk.BootstrapFence,
 	return export, nil
 }
 func (p *Partition) WithBootstrapSource(fn func(*BootstrapSource) error) error {
+	return p.WithBootstrapSourceContext(context.Background(), fn)
+}
+
+// WithBootstrapSourceContext owns the partition gates throughout the full copy.
+// Cancellation is checked around waits and by paged readers; mutex waits and
+// individual filesystem calls remain synchronous and cannot be preempted.
+func (p *Partition) WithBootstrapSourceContext(ctx context.Context, fn func(*BootstrapSource) error) error {
+	if ctx == nil || fn == nil {
+		return fmt.Errorf("bootstrap source requires context and callback")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	d, ok := p.dh.(*disk.DiskHandler)
 	if !ok {
-		return fmt.Errorf("bootstrap requires disk storage")
+		return ErrReplicaSourceUnsupported
 	}
 	p.reconcileMu.Lock()
 	defer p.reconcileMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	p.visibilityMu.Lock()
 	defer p.visibilityMu.Unlock()
-	return p.withSnapshotCutLocked(context.Background(), snapshotCutBootstrapSource, nil, func(cut *SnapshotReadCut) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return p.withSnapshotCutLocked(ctx, snapshotCutBootstrapSource, nil, func(cut *SnapshotReadCut) error {
 		return p.withReadViewLocked(true, cut.end, func(v *PartitionReadView) error {
 			return fn(&BootstrapSource{view: v, disk: d, cut: cut})
 		})
