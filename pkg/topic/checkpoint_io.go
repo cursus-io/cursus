@@ -48,7 +48,7 @@ func (osCheckpointIO) syncDir(path string) error {
 	return dir.Close()
 }
 
-func (p *Partition) writeCheckpoint(path string, data []byte) error {
+func (p *Partition) writeCheckpointWithDirectorySync(path string, data []byte, syncDir func(string) error) error {
 	ops := p.checkpointIO
 	if ops == nil {
 		ops = osCheckpointIO{}
@@ -76,7 +76,10 @@ func (p *Partition) writeCheckpoint(path string, data []byte) error {
 	if err := ops.replace(tmp, path); err != nil {
 		return fmt.Errorf("replace checkpoint %s: %w", path, err)
 	}
-	if err := ops.syncDir(filepath.Dir(path)); err != nil {
+	if syncDir == nil {
+		syncDir = ops.syncDir
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("sync checkpoint directory %s: %w", path, err)
 	}
 	return nil

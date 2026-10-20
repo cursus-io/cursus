@@ -38,11 +38,29 @@ func (d *DiskHandler) GetIndexPath(baseOffset uint64) string {
 
 // OpenIndexFiles public method for testing
 func (d *DiskHandler) OpenIndexFiles() error {
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
+	if err := d.writeAvailabilityError(); err != nil {
+		return err
+	}
 	return d.openIndexFiles()
 }
 
 // CloseIndexFiles public method for testing
 func (d *DiskHandler) CloseIndexFiles() error {
+	d.maintenanceMu.Lock()
+	defer d.maintenanceMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
+	if err := d.writeAvailabilityError(); err != nil {
+		return err
+	}
 	return d.closeIndexFiles()
 }
 

@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
@@ -48,84 +49,94 @@ func (h *Handler) HandleReadStreamHistory(cmd string, conn net.Conn) {
 		return
 	}
 	partition := t.GetPartitionForMessage(types.Message{Key: key})
-	idx, err := h.getIndex(topicName, partition)
-	if err != nil {
-		writeHistoryError(conn, "stream_index_failed")
-		return
-	}
-	head := idx.GetVersion(key)
-	to := head
-	if supplied := args["to_version"]; supplied != "" {
-		to, err = strconv.ParseUint(supplied, 10, 64)
-		if err != nil || to < from || to > head {
-			writeHistoryError(conn, "invalid_to_version")
-			return
+	var head, next uint64
+	var messages []types.Message
+	var completeness string
+	var hasMore bool
+	err = h.withReadView(topicName, partition, func(view *topic.PartitionReadView) error {
+		idx, err := h.getIndexWithView(topicName, partition, view)
+		if err != nil {
+			return fmt.Errorf("stream_index_failed: %w", err)
 		}
-	}
-	entries, err := idx.LookupRange(key, from, to, maxRecords)
-	if err != nil {
-		writeHistoryError(conn, "index_lookup_failed")
-		return
-	}
-	p, err := t.GetPartition(partition)
-	if err != nil {
-		writeHistoryError(conn, "partition_not_found")
-		return
-	}
-	messages := make([]types.Message, 0, len(entries))
-	completeness := "complete"
-	next := uint64(0)
-	used := 0
-	expected := from
-	for _, entry := range entries {
-		if entry.AggregateVersion != expected {
-			completeness = "partial"
+		head = idx.GetVersion(key)
+		to := head
+		if supplied := args["to_version"]; supplied != "" {
+			to, err = strconv.ParseUint(supplied, 10, 64)
+			if err != nil || to < from || to > head {
+				return fmt.Errorf("invalid_to_version")
+			}
+		}
+		entries, err := idx.LookupRange(key, from, to, maxRecords)
+		if err != nil {
+			return fmt.Errorf("index_lookup_failed: %w", err)
+		}
+		messages = make([]types.Message, 0, len(entries))
+		completeness = "complete"
+		next = uint64(0)
+		used := 0
+		wireBytes := 0
+		expected := from
+		for _, entry := range entries {
+			if entry.AggregateVersion != expected {
+				completeness = "partial"
+				next = expected
+				break
+			}
+			batch, readErr := view.ReadCommittedRange(entry.Offset, entry.Offset+1, 1)
+			if readErr != nil {
+				return readErr
+			}
+			if len(batch) != 1 || batch[0].Key != key || batch[0].AggregateVersion != entry.AggregateVersion || batch[0].Offset != entry.Offset {
+				completeness = "partial"
+				next = entry.AggregateVersion + 1
+				break
+			}
+			message := batch[0]
+			size := len(message.Payload) + len(message.Key) + len(message.Metadata) + len(message.EventType) + 64
+			// Keep the historical byte-budget contract while also bounding all wire
+			// metadata copied out of the view, including producer and replay identity.
+			wireSize := estimateEventMessageBytes(message)
+			if len(messages) == 0 && (size > maxBytes || wireSize > maxHistoryBytes) {
+				return fmt.Errorf("record_too_large version=%d offset=%d", message.AggregateVersion, message.Offset)
+			}
+			if used+size > maxBytes || wireBytes+wireSize > maxHistoryBytes {
+				next = message.AggregateVersion
+				break
+			}
+			if message.AggregateVersion != expected {
+				completeness = "partial"
+				next = expected
+				break
+			}
+			messages = append(messages, detachEventMessage(message))
+			used += size
+			wireBytes += wireSize
+			expected++
 			next = expected
-			break
 		}
-		batch, readErr := p.ReadCommittedRange(entry.Offset, entry.Offset+1, 1)
-		if readErr != nil || len(batch) != 1 || batch[0].Key != key || batch[0].AggregateVersion != entry.AggregateVersion || batch[0].Offset != entry.Offset {
+		hasMore = next != 0 && next <= to
+		if len(entries) == 0 {
+			if from <= to {
+				completeness = "unknown"
+			}
+			next = 0
+			hasMore = false
+		} else if completeness == "complete" && next != 0 && next <= to && len(entries) < maxRecords && len(messages) == len(entries) {
+			// A fixed range ended before its advertised upper bound. The index can no
+			// longer prove continuity (for example after retention), so never describe
+			// this as a complete history or offer a cursor that repeats the gap.
+			// If the byte budget stopped before the last entry, the next indexed
+			// version is still available and must remain a resumable page.
 			completeness = "partial"
-			next = entry.AggregateVersion + 1
-			break
+			hasMore = false
+		} else if completeness != "complete" {
+			hasMore = false
 		}
-		message := batch[0]
-		size := len(message.Payload) + len(message.Key) + len(message.Metadata) + len(message.EventType) + 64
-		if len(messages) == 0 && size > maxBytes {
-			writeHistoryError(conn, fmt.Sprintf("record_too_large version=%d offset=%d", message.AggregateVersion, message.Offset))
-			return
-		}
-		if used+size > maxBytes {
-			next = message.AggregateVersion
-			break
-		}
-		if message.AggregateVersion != expected {
-			completeness = "partial"
-			next = expected
-			break
-		}
-		messages = append(messages, message)
-		used += size
-		expected++
-		next = expected
-	}
-	hasMore := next != 0 && next <= to
-	if len(entries) == 0 {
-		if from <= to {
-			completeness = "unknown"
-		}
-		next = 0
-		hasMore = false
-	} else if completeness == "complete" && next != 0 && next <= to && len(entries) < maxRecords && len(messages) == len(entries) {
-		// A fixed range ended before its advertised upper bound. The index can no
-		// longer prove continuity (for example after retention), so never describe
-		// this as a complete history or offer a cursor that repeats the gap.
-		// If the byte budget stopped before the last entry, the next indexed
-		// version is still available and must remain a resumable page.
-		completeness = "partial"
-		hasMore = false
-	} else if completeness != "complete" {
-		hasMore = false
+		return nil
+	})
+	if err != nil {
+		writeHistoryError(conn, err.Error())
+		return
 	}
 	envelope := struct {
 		Status       string `json:"status"`
@@ -142,11 +153,12 @@ func (h *Handler) HandleReadStreamHistory(cmd string, conn net.Conn) {
 		writeHistoryError(conn, "marshal_failed")
 		return
 	}
-	if err := util.WriteWithLength(conn, data); err != nil {
-		return
-	}
 	batch, err := util.EncodeBatchMessages(topicName, partition, "1", false, messages)
 	if err != nil {
+		writeHistoryError(conn, "encode_failed")
+		return
+	}
+	if err := util.WriteWithLength(conn, data); err != nil {
 		return
 	}
 	_ = util.WriteWithLength(conn, batch)

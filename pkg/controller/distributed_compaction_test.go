@@ -21,6 +21,10 @@ func TestDistributedCompactionGateRequiresCurrentProtocolAndCaughtUpISR(t *testi
 	cfg.EnabledDistribution = true
 	diskManager := disk.NewDiskManager(cfg)
 	topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+	t.Cleanup(func() {
+		topicManager.Stop()
+		diskManager.CloseAllHandlers()
+	})
 	state := fsm.NewBrokerFSM(topicManager, nil)
 	for index, brokerID := range []string{"broker-1", "broker-2", "broker-3"} {
 		payload, err := json.Marshal(fsm.BrokerInfo{
@@ -50,7 +54,6 @@ func TestDistributedCompactionGateRequiresCurrentProtocolAndCaughtUpISR(t *testi
 	handler := NewCommandHandler(topicManager, cfg, nil, nil, cluster)
 	t.Cleanup(func() {
 		_ = handler.Close()
-		diskManager.CloseAllHandlers()
 	})
 
 	allowed, reason := handler.distributedCompactionAllowed("state", 0)

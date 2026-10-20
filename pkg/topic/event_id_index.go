@@ -23,6 +23,23 @@ type committedEventIDIndex struct {
 // mutation fence until the write outcome is resolved. The cache mutex alone
 // does not reserve an ID for a future append.
 func (p *Partition) CommittedEventIDExists(eventID string) (exists bool, err error) {
+	err = p.WithReadView(func(view *PartitionReadView) error {
+		exists, err = view.CommittedEventIDExists(eventID)
+		return err
+	})
+	return
+}
+
+// CommittedEventIDExists reuses the caller's visibility fence, without acquiring
+// a recursive read lock behind a pending replacement writer.
+func (view *PartitionReadView) CommittedEventIDExists(eventID string) (exists bool, err error) {
+	if err := view.check(); err != nil {
+		return false, err
+	}
+	if view.offline {
+		return false, fmt.Errorf("event ID lookup requires a live read view")
+	}
+	p := view.p
 	idx := &p.eventIDs
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -39,7 +56,7 @@ func (p *Partition) CommittedEventIDExists(eventID string) (exists bool, err err
 		return false, err
 	}
 	generation := p.eventIDGeneration.Load()
-	first, limit := p.FirstOffset(), p.LastStableOffset()
+	first, limit := view.FirstOffset(), view.LastStableOffset()
 	if first > limit {
 		return false, fmt.Errorf("event ID retention floor %d exceeds stable tail %d", first, limit)
 	}
@@ -50,7 +67,7 @@ func (p *Partition) CommittedEventIDExists(eventID string) (exists bool, err err
 	for idx.next < limit {
 		// Match the committed reader's storage batch size, avoiding repeated
 		// decoding of overlapping 1024-record batches for 256-record pages.
-		messages, _, next, readErr := p.ReadCommittedPage(idx.next, 1024, 0, true)
+		messages, _, next, readErr := view.ReadCommittedPage(idx.next, 1024, 0, true)
 		if readErr != nil {
 			return false, readErr
 		}
@@ -67,7 +84,7 @@ func (p *Partition) CommittedEventIDExists(eventID string) (exists bool, err err
 		}
 		idx.next = min(next, limit)
 	}
-	if p.eventIDGeneration.Load() != generation || p.FirstOffset() != first || p.LastStableOffset() < limit {
+	if p.eventIDGeneration.Load() != generation || view.FirstOffset() != first || view.LastStableOffset() < limit {
 		return false, fmt.Errorf("committed event ID history changed during scan")
 	}
 	if err = p.RecoveryError(); err != nil {

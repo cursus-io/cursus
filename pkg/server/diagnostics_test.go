@@ -112,15 +112,19 @@ func TestRunConsumerMetadataDiagnosticsExposesFailureAndMetrics(t *testing.T) {
 	cfg.BrokerPort = reserveTCPPort(t)
 
 	seedDM := disk.NewDiskManager(cfg)
+	t.Cleanup(seedDM.CloseAllHandlers)
 	seedTM := topic.NewTopicManager(cfg, seedDM, nil)
+	t.Cleanup(seedTM.Stop)
 	seedCoordinator, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, seedTM)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(seedCoordinator.Stop)
 	if err := seedTM.PublishWithAck(config.ConsumerOffsetsTopicName, &types.Message{Key: "corrupt", Payload: "not-json"}); err != nil {
 		t.Fatal(err)
 	}
 	seedCoordinator.Stop()
+	seedTM.Stop()
 	seedDM.CloseAllHandlers()
 
 	dm := disk.NewDiskManager(cfg)

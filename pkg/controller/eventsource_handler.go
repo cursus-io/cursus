@@ -62,7 +62,7 @@ func (ch *CommandHandler) handleAppendStreamLocked(cmd string) string {
 			return indexResp
 		}
 		var retainedMessage types.Message
-		result, errResp := ch.ESHandler.AppendStream(cmd, eventsource.AppendOptions{
+		result, errResp := ch.ESHandler.AppendStreamWithControllerFence(cmd, eventsource.AppendOptions{
 			LeaderAppend: true,
 			LeaderEpoch:  int64(replicationSnapshot.LeaderEpoch),
 			AfterCommit: func(topic string, partition int, hwm uint64) error {
