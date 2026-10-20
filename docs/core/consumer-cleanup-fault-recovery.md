@@ -123,3 +123,17 @@ not equivalent three-broker injection coverage. Distributed internal metadata
 compaction remains disabled; compacted-gap unit tests do not prove a live
 distributed compaction scenario. Oversized cleanup records stay pending, and
 startup/ownership recovery keeps its existing full-replay cost.
+
+Review follow-up checks retain the Kafka comparison above: derived replay
+cursors are expendable, while committed deletion evidence remains authoritative.
+Before changing cache admission, test that a superseded unfinished intent frees
+a slot without evicting active unfinished scans or applying its old evidence.
+The bounded cache checks at most 64 intent predicates; discarded work may need
+re-reading if the intent returns, but does not authorize metadata deletion.
+Predicates run in reconciliation, never by acquiring the cleanup lock in Apply.
+
+For snapshot contention, test repeated busy failures and reset after a successful
+capture. Export a failure counter and consecutive-busy gauge with an operator
+alert; do not back off inside the shared Raft Apply/Snapshot goroutine. This
+preserves write availability while making delayed snapshots and growing recovery
+work visible. It does not guarantee a snapshot under sustained contention.

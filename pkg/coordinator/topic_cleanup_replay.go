@@ -77,6 +77,7 @@ type cleanupTarget struct {
 }
 
 type topicCleanupScan struct {
+	current    func() bool
 	targets    map[string]*cleanupTarget
 	partitions []ConsumerCleanupPartition
 	next       []uint64
@@ -122,7 +123,8 @@ func (c *Coordinator) CheckTopicGroupCleanup(topicName string) ([]string, error)
 
 // ReconcileTopicGroupsIf validates the caller's topic intent after capturing
 // group targets under lifecycleMu. The callback must not mutate coordinator
-// state. New registrations cannot replace those targets until cleanup returns.
+// state and may be retained to reclaim superseded scans on cache admission.
+// New registrations cannot replace those targets until cleanup returns.
 func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bool) ([]string, error) {
 	if c.standalone {
 		if !current() {
@@ -177,7 +179,8 @@ func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bo
 			// Preserve unfinished scans so a large pending-topic set cannot
 			// continually evict every cursor before it reaches the log tail.
 			for name, candidate := range c.cleanupProgress {
-				if len(candidate.partitions) > 0 && candidate.matches(candidate.partitions) {
+				if (candidate.current != nil && !candidate.current()) ||
+					(len(candidate.partitions) > 0 && candidate.matches(candidate.partitions)) {
 					delete(c.cleanupProgress, name)
 					break
 				}
@@ -193,6 +196,7 @@ func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bo
 		delete(c.cleanupProgress, topicName)
 		return nil, fmt.Errorf("topic cleanup intent changed")
 	}
+	scan.current = current
 	var deleted []string
 	err := reader.WithConsumerCleanupView(scan.read)
 	if err == nil {

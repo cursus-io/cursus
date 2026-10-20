@@ -12,13 +12,25 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
 
+func snapshotMetricValue(t *testing.T, metric prometheus.Metric) float64 {
+	t.Helper()
+	var value dto.Metric
+	require.NoError(t, metric.Write(&value))
+	return value.GetCounter().GetValue() + value.GetGauge().GetValue()
+}
+
 func TestBrokerFSMSnapshotDoesNotWaitForConsumerOffsetWriter(t *testing.T) {
+	busyBefore := snapshotMetricValue(t, metrics.ConsumerSnapshotBusy)
+	metrics.ConsumerSnapshotBusyConsecutive.Set(0)
 	c := authorityCoordinator(t)
 	c.SetRoutedOffsetRecordWriter(func(record coordinator.ConsumerMetadataRecord) error {
 		c.RecordConsumerMetadataSource(record.Group, 0)
@@ -38,11 +50,17 @@ func TestBrokerFSMSnapshotDoesNotWaitForConsumerOffsetWriter(t *testing.T) {
 	f := NewBrokerFSM(nil, c)
 	snapshotDone := make(chan error, 1)
 	go func() {
-		snapshot, err := f.Snapshot()
-		if snapshot != nil {
-			snapshot.Release()
+		for range 3 {
+			snapshot, err := f.Snapshot()
+			if snapshot != nil {
+				snapshot.Release()
+			}
+			if !errors.Is(err, coordinator.ErrConsumerSnapshotBusy) {
+				snapshotDone <- err
+				return
+			}
 		}
-		snapshotDone <- err
+		snapshotDone <- coordinator.ErrConsumerSnapshotBusy
 	}()
 	blocked := false
 	select {
@@ -59,7 +77,10 @@ func TestBrokerFSMSnapshotDoesNotWaitForConsumerOffsetWriter(t *testing.T) {
 	if blocked {
 		<-snapshotDone
 	}
+	require.Equal(t, busyBefore+3, snapshotMetricValue(t, metrics.ConsumerSnapshotBusy))
+	require.Equal(t, float64(3), snapshotMetricValue(t, metrics.ConsumerSnapshotBusyConsecutive))
 	raw := persistAuthorityFSM(t, f)
+	require.Zero(t, snapshotMetricValue(t, metrics.ConsumerSnapshotBusyConsecutive))
 	restored := authorityCoordinator(t)
 	require.NoError(t, NewBrokerFSM(nil, restored).Restore(io.NopCloser(bytes.NewReader(raw))))
 	require.Equal(t, uint64(7), restored.ExportState()["workers"].Offsets["orders"][0])

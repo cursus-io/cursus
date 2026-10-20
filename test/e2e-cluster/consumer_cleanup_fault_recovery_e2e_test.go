@@ -39,6 +39,13 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 		sendClusterTopicCommand(t, addrs, "CREATE topic="+topicName+" partitions=1 replication_factor=3")
 	}
 	sendClusterTopicCommand(t, addrs, "CREATE topic="+cleanupRetainedEvents+" partitions=1 replication_factor=3 aggregate_replay=true")
+	// CREATE acknowledges committed intent before every follower has applied it.
+	// Seed data only after all local replicas expose the initial committed range.
+	for _, topicName := range []string{cleanupRecoveryTopic, cleanupRetainedMessages, cleanupRetainedEvents} {
+		requireClusterDefinitionEventually(t, addrs, topicName, map[string]string{"revision": "1"})
+		requireReplicaOffsetsEventually(t, addrs, topicName, 0)
+	}
+	requireClusterStatusMaterialized(t, addrs)
 	proof := &cleanupRetainedProof{}
 	proof.advance(t, addrs)
 	client, generation, member := joinRecoveryGroup(t, addrs, cleanupRecoveryTopic, cleanupRecoveryGroup)

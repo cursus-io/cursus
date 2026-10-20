@@ -3,6 +3,14 @@ package metrics
 import "github.com/prometheus/client_golang/prometheus"
 
 var (
+	ConsumerSnapshotBusy = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "consumer_snapshot_busy_total",
+		Help: "Raft snapshot captures refused because consumer state was busy.",
+	})
+	ConsumerSnapshotBusyConsecutive = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "consumer_snapshot_busy_consecutive",
+		Help: "Busy consumer snapshot refusals since the last successful FSM snapshot capture; resets on process restart.",
+	})
 	ConsumerCleanupReplayReads = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "consumer_cleanup_replay_reads_total",
 		Help: "Bounded physical segment reads used to reconcile committed consumer group cleanup.",

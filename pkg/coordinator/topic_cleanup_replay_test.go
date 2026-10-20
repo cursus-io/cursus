@@ -395,3 +395,38 @@ func TestTopicCleanupCapacityPreservesUnfinishedProgress(t *testing.T) {
 	require.NotContains(t, c.cleanupProgress, "x")
 	require.Len(t, c.cleanupProgress, topicCleanupTopics-1)
 }
+
+func TestTopicCleanupCapacityReclaimsSupersededUnfinishedIntent(t *testing.T) {
+	c, log := newCleanupFollower(t)
+	current := true
+	for range topicCleanupRecords + 1 {
+		log.append(types.Message{Payload: `{"group":"other"}`})
+	}
+	_, err := c.ReconcileTopicGroupsIf("orders", func() bool { return current })
+	require.ErrorContains(t, err, "budget")
+	abandoned := c.cleanupProgress["orders"]
+	require.NotNil(t, abandoned.current)
+	// Model a later CREATE clearing the old materialization issue, so this
+	// unfinished intent never receives another reconciliation call.
+	delete(c.cleanupProgress, "orders")
+	c.cleanupProgress["superseded"] = abandoned
+	for i := range topicCleanupTopics - 1 {
+		c.cleanupProgress[strings.Repeat("x", i+1)] = &topicCleanupScan{
+			current:    func() bool { return true },
+			partitions: []ConsumerCleanupPartition{{Identity: 0, End: 2}}, next: []uint64{1},
+		}
+	}
+	current = false
+	_, err = c.ReconcileTopicGroups("orders")
+	require.ErrorContains(t, err, "budget")
+	require.NotContains(t, c.cleanupProgress, "superseded")
+	require.Len(t, c.cleanupProgress, topicCleanupTopics)
+	for i := range topicCleanupTopics - 1 {
+		require.Equal(t, []uint64{1}, c.cleanupProgress[strings.Repeat("x", i+1)].next)
+	}
+	require.NotNil(t, c.GetGroup("workers"))
+	log.append(cleanupMessage(t, cleanupDeletion()))
+	_, err = c.ReconcileTopicGroups("orders")
+	require.NoError(t, err)
+	require.Nil(t, c.GetGroup("workers"))
+}

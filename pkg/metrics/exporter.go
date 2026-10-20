@@ -17,6 +17,7 @@ func init() {
 	prometheus.MustRegister(ClientConnectionsTotal, ClientConnectionsActive, ClientResponseWriteFailures, RequestsInflight, RequestBytesInflight, RequestAdmissionWaiters, RequestAdmissionRejections, CommandsTotal, CommandDuration, CommandErrors, PublishAcknowledgements, AsyncReplicationFailures, ReplicationRetries, LogCompactionRuns)
 	prometheus.MustRegister(ClusterReplicationLag)
 	prometheus.MustRegister(ConsumerCleanupReplayRecords, ConsumerCleanupReplayBytes, ConsumerCleanupReplayReads, ConsumerCleanupReplayInvalidations)
+	prometheus.MustRegister(ConsumerSnapshotBusy, ConsumerSnapshotBusyConsecutive)
 }
 
 // Handler returns an isolated metrics handler containing process and runtime collectors.
