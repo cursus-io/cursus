@@ -1,0 +1,11 @@
+services:
+  broker-1:
+    container_name: cursus-cleanup-broker-1
+  broker-2:
+    container_name: cursus-cleanup-broker-2
+  broker-3:
+    container_name: cursus-cleanup-broker-3
+
+networks:
+  cluster_network:
+    name: cursus-cleanup-e2e

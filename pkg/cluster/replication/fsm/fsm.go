@@ -571,7 +571,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 
 	f.mu.Unlock()
 	f.materializationMu.Unlock()
-	if err := f.ReconcileTopicMaterializations(); err != nil {
+	if err := f.reconcileTopicMaterializations(false); err != nil {
 		util.Warn("FSM Restore: Topic materialization pending: %v", err)
 	}
 	if err := f.reconcileCommittedPartitions(); err != nil {
@@ -756,7 +756,7 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 	f.partitionRecoveryPending = false
 	f.recoveryReplayPending = false
 	f.mu.Unlock()
-	if err := f.ReconcileTopicMaterializations(); err != nil {
+	if err := f.reconcileTopicMaterializations(false); err != nil {
 		util.Warn("FSM: Topic materialization pending after Raft replay: %v", err)
 	}
 	return nil

@@ -325,8 +325,16 @@ func (c *Coordinator) deleteGroup(groupName string) error {
 // deleteGroupLocked requires lifecycleMu. A nonempty topicName additionally
 // constrains deletion to a group whose state is confined to that topic.
 func (c *Coordinator) deleteGroupLocked(groupName, topicName string) error {
+	return c.deleteGroupWithFenceLocked(groupName, topicName, nil)
+}
+
+func (c *Coordinator) deleteGroupWithFenceLocked(groupName, topicName string, expected *GroupMetadata) error {
 	c.mu.Lock()
 	group := c.groups[groupName]
+	if expected != nil && group != expected {
+		c.mu.Unlock()
+		return fmt.Errorf("group %q changed before durable deletion", groupName)
+	}
 	if group == nil {
 		c.mu.Unlock()
 		return nil

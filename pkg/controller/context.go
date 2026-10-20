@@ -22,6 +22,9 @@ type ClientContext struct {
 	// transaction lock; forwarded requests intentionally do not inherit it.
 	transactionStateLockHeld bool
 	requestContext           context.Context
+	// consumerMetadataFence is local-only authority for originating a group
+	// tombstone. It must never be forwarded to another partition leader.
+	consumerMetadataFence func() error
 }
 
 func NewClientContext(group string, idx int) *ClientContext {

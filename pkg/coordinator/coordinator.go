@@ -56,6 +56,9 @@ type Coordinator struct {
 	ownershipSince    map[string]time.Time
 	observationOwner  func(groupName string) (bool, error)
 	observationOwners func(groupNames []string) (map[string]bool, error)
+
+	cleanupMu       sync.Mutex
+	cleanupProgress map[string]*topicCleanupScan
 }
 
 type TopicHandler interface {

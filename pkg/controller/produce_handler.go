@@ -287,7 +287,11 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 	if err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
 	}
-	if ch.Config.EnabledDistribution && ch.Cluster != nil {
+	if clientCtx != nil && clientCtx.consumerMetadataFence != nil {
+		if err := clientCtx.consumerMetadataFence(); err != nil {
+			return fmt.Sprintf("ERROR: coordinator_not_available reason=%q", err)
+		}
+	} else if ch.Config.EnabledDistribution && ch.Cluster != nil {
 		forwardCmd := cmd
 		if _, explicitPartition := args["partition"]; !explicitPartition {
 			forwardCmd = publishCommandWithPartition(cmd, partition)
@@ -340,6 +344,11 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 		}
 		if err := ch.Cluster.RaftManager.GetFSM().ValidateConsumerMetadataMessages(types.MessageCommand{Topic: topicName, Partition: partition, ConsumerRoute: consumerRoute, Messages: []types.Message{*msg}}); err != nil {
 			return fmt.Sprintf("ERROR: consumer_route_fenced reason=%q", err)
+		}
+		if clientCtx != nil && clientCtx.consumerMetadataFence != nil {
+			if err := clientCtx.consumerMetadataFence(); err != nil {
+				return fmt.Sprintf("ERROR: coordinator_not_available reason=%q", err)
+			}
 		}
 		if ch.replication == nil {
 			return "ERROR: cluster_metadata_unavailable command=PUBLISH"
