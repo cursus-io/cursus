@@ -95,7 +95,14 @@ and completed failure count. Timestamp/age/last-failure series are absent until
 the first completion. A stuck first attempt exports valid=0, in_progress=1 and
 (after two seconds) timed_out=1 without inventing a completed result. A storage
 stat failure, including a missing segment/index during removal, invalidates the
-runtime observation instead of exposing partial usage/capacity as zero. Existing metric names and labels remain unchanged when
+runtime observation instead of exposing partial usage/capacity as zero. Successfully
+measured capacity below the configured headroom threshold is different: it remains
+a valid runtime observation with actual free/total bytes and headroom readiness
+`0`, while broker readiness and write admission still fail. Both Helm charts retain
+the disk-headroom alert and add `CursusObservationUnavailable` when any component's
+observation stays invalid for one minute, including initial absence, failure,
+expiry and deadline overrun. A successful HTTP scrape alone does not establish
+healthy storage. Existing metric names and labels remain unchanged when
 the observation is valid. Removed dynamic labels disappear on the next valid
 sample, or when the previous observation expires.
 
@@ -122,6 +129,13 @@ metadata recovery and other existing dependency checks retain their meaning.
   another integrated test issues 60 requests across all three endpoints with a
   one-second HTTP client deadline while only two storage observations remain
   outstanding. Runtime and process tests add 40 and 100 repeated scrapes.
+- Headroom regression tests distinguish measured low capacity from failed statfs,
+  preserve admission rejection, and verify recovery. Both rendered Helm charts
+  pass the same [promtool rule tests](https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/)
+  for disk-headroom alerts, failed/expired/blocked/initial observations, grace
+  periods, namespace isolation and alert resolution. Run
+  `bash test/monitoring/check-rules.sh STANDALONE_RENDER.yaml CLUSTER_RENDER.yaml`
+  with monitoring enabled and namespace `brokers`; the deployment CI does so.
 - Recovery work remains the existing storage protocol: no added replay, payload
   bytes copied or checkpoint publication. Storage sampling uses metadata/stat
   operations; unchanged durable barrier code is covered by existing disk, topic

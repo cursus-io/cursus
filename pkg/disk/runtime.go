@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"errors"
 	"fmt"
 	"os"
 )
@@ -37,7 +38,9 @@ func (dm *DiskManager) RuntimeSnapshot() RuntimeSnapshot {
 	dm.mu.Unlock()
 
 	snapshot := RuntimeSnapshot{Handlers: len(handlers)}
-	if space, err := dm.headroom.snapshot(true); err == nil {
+	if space, err := dm.headroom.snapshot(true); err == nil || errors.Is(err, errInsufficientHeadroom) {
+		// Low headroom is a measured unhealthy state, not a failed measurement.
+		// Keep its capacity and false readiness visible to the disk-space alert.
 		snapshot.FilesystemFreeBytes = space.Free
 		snapshot.FilesystemTotalBytes = space.Total
 		snapshot.FilesystemHeadroomOK = space.Ready

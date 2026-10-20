@@ -143,6 +143,9 @@ jobs:
           grep -q 'value: "67108864"' /tmp/cursus-cluster.yaml
           grep -q 'value: "268435456"' /tmp/cursus-cluster.yaml
 
+      - name: Test rendered monitoring alert behavior
+        run: bash test/monitoring/check-rules.sh /tmp/cursus-monitoring.yaml /tmp/cursus-cluster-monitoring.yaml
+
       - name: Reject insecure cluster client transport
         run: |
           if helm template cursus manifests/helm-cluster \

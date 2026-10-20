@@ -2,18 +2,42 @@ package observability
 
 import (
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/observation"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMetricsPreservesMeasuredLowHeadroom(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	// Reject admission without filling or changing the local filesystem.
+	cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent = math.MaxInt64, 0
+	dm := disk.NewDiskManager(cfg)
+	require.ErrorContains(t, dm.Ready(), "insufficient filesystem headroom")
+	c := NewCollector(nil, nil, dm, nil, nil, fixedReadiness(false))
+	c.Start()
+	t.Cleanup(c.Close)
+	require.Eventually(t, func() bool { return c.worker.Snapshot().Valid() }, time.Second, time.Millisecond)
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(c)
+	families, err := registry.Gather()
+	require.NoError(t, err)
+	assertGauge(t, families, "cursus_storage_filesystem_headroom_ready", nil, 0)
+	assertGauge(t, families, "cursus_storage_stat_failures", nil, 0)
+	assertGauge(t, families, "cursus_broker_ready", nil, 0)
+	assertGauge(t, families, "cursus_observation_valid", map[string]string{"component": "runtime"}, 1)
+	assertGauge(t, families, "cursus_storage_filesystem_total_bytes", nil, float64(dm.RuntimeSnapshot().FilesystemTotalBytes))
+}
 
 type delayedDisk struct {
 	block   atomic.Bool

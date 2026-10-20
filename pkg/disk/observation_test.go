@@ -2,6 +2,7 @@ package disk
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,41 @@ import (
 	"github.com/cursus-io/cursus/pkg/observation"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRuntimeObservationDistinguishesLowHeadroomFromQueryFailure(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent = 100, 0
+	dm := NewDiskManager(cfg)
+	free := uint64(50)
+	var queryErr error
+	dm.headroom.query = func(string) (uint64, uint64, error) { return free, 1000, queryErr }
+
+	// Known low capacity still blocks readiness and admission, but is observable.
+	require.ErrorIs(t, dm.Ready(), errInsufficientHeadroom)
+	_, err := dm.headroom.reserve(1, false)
+	require.ErrorIs(t, err, errInsufficientHeadroom)
+	snapshot := dm.RuntimeSnapshot()
+	require.Zero(t, snapshot.StatFailures)
+	require.EqualValues(t, 50, snapshot.FilesystemFreeBytes)
+	require.EqualValues(t, 1000, snapshot.FilesystemTotalBytes)
+	require.False(t, snapshot.FilesystemHeadroomOK)
+
+	// Failed queries cannot certify capacity, even if the query returns values.
+	queryErr = errors.New("statfs unavailable")
+	require.ErrorIs(t, dm.Ready(), queryErr)
+	require.Equal(t, 1, dm.RuntimeSnapshot().StatFailures)
+
+	// Recovery restores both admission and measured healthy capacity.
+	queryErr, free = nil, 500
+	require.NoError(t, dm.Ready())
+	_, err = dm.headroom.reserve(1, false)
+	require.NoError(t, err)
+	snapshot = dm.RuntimeSnapshot()
+	require.Zero(t, snapshot.StatFailures)
+	require.True(t, snapshot.FilesystemHeadroomOK)
+	require.EqualValues(t, 500, snapshot.FilesystemFreeBytes)
+}
 
 func TestRuntimeObservationRejectsMissingSegmentMeasurements(t *testing.T) {
 	cfg := config.DefaultConfig()

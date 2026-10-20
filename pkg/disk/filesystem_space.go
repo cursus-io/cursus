@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -8,6 +9,9 @@ import (
 )
 
 const filesystemSpaceCacheTTL = time.Second
+
+// Capacity was measured successfully, but admission must reject more writes.
+var errInsufficientHeadroom = errors.New("insufficient filesystem headroom")
 
 func checkedFilesystemBytes(blocks, blockSize uint64) (uint64, error) {
 	if blockSize != 0 && blocks > math.MaxUint64/blockSize {
@@ -96,7 +100,7 @@ func (g *diskHeadroomGuard) reserve(required uint64, forceRefresh bool) (filesys
 		}
 	}
 	if remaining < minimum {
-		return snapshot, fmt.Errorf("insufficient filesystem headroom: free=%d reserved=%d write=%d remaining=%d required=%d", g.free, g.reserved, required, remaining, minimum)
+		return snapshot, fmt.Errorf("%w: free=%d reserved=%d write=%d remaining=%d required=%d", errInsufficientHeadroom, g.free, g.reserved, required, remaining, minimum)
 	}
 	if math.MaxUint64-g.reserved < required {
 		return snapshot, fmt.Errorf("filesystem headroom reservation overflow: reserved=%d write=%d", g.reserved, required)

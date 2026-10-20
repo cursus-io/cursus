@@ -129,7 +129,7 @@ the lifetime or payload transfer time of a stream.
 | `cursus_storage_bytes` | Segment and offset-index bytes represented by open handlers |
 | `cursus_storage_pending_writes` | Messages queued for disk writes |
 | `cursus_storage_active_readers` | Current segment readers |
-| `cursus_storage_stat_failures` | Files that could not be inspected during the scrape |
+| `cursus_storage_stat_failures` | `0` in a valid runtime observation; failed measurements invalidate the snapshot and omit this series |
 | `cursus_storage_segment_cache_entries` | Memory-mapped segment readers retained by open handlers |
 | `cursus_storage_segment_cache_hits` | Cache hits accumulated by open handlers |
 | `cursus_storage_segment_cache_misses` | Cache misses accumulated by open handlers |
@@ -140,6 +140,20 @@ the lifetime or payload transfer time of a stream.
 `cursus_storage_bytes` covers open topic handlers. It is not filesystem capacity
 or free-space telemetry; collect those values with the node or container
 runtime exporter.
+
+Runtime metrics use background snapshots. Initial, failed, expired or over-budget
+observations omit their values; missing series must not be interpreted as zero.
+Use `cursus_observation_valid{component=~"readiness|runtime|process"}`,
+`cursus_observation_stale`, `cursus_observation_timed_out`,
+`cursus_observation_in_progress` and `cursus_observation_last_failed` to distinguish
+observation health from broker health. Completion timestamp, age and last-failure
+series are absent before the first completed sample. Both Helm charts alert on
+invalid observations lasting one minute with `CursusObservationUnavailable`.
+
+A successful capacity measurement below the configured free-space reserve still
+exports `cursus_storage_filesystem_headroom_ready=0` and the measured free/total
+bytes. This preserves `CursusStorageDiskHeadroomLow` without treating a failed
+filesystem query as a measured zero. See [snapshot lifecycle and defaults](../bounded-health-snapshots.md).
 
 ### Consumer Metadata Recovery
 
