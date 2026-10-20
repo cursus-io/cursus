@@ -4,6 +4,8 @@ import (
 	"os"
 	"testing"
 
+	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,6 +52,27 @@ func TestCheckpointStrictPublicationSharesSavedImagesAndRetries(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestRollbackCheckpointRetryRejectsChangedPhysicalGeneration(t *testing.T) {
+	p, d, _ := rollbackPartition(t)
+	ops := &retryCheckpointIO{}
+	ops.fail.Store(true)
+	p.hwmCheckpointMu.Lock()
+	p.producerCheckpointMu.Lock()
+	p.checkpointIO = ops
+	p.producerCheckpointMu.Unlock()
+	p.hwmCheckpointMu.Unlock()
+	require.ErrorContains(t, p.ApplyReplicaRollback(1), "temporary open failure")
+	require.ErrorIs(t, p.RecoveryError(), ErrReplicaRollbackFailed)
+	require.Equal(t, uint64(1), p.NextOffset())
+	// An identical LEO/HWM tuple is not enough to resume publication.
+	require.NoError(t, d.TruncateTo(0))
+	require.NoError(t, d.WriteBatchSync([]types.DiskMessage{{Topic: "orders", Partition: 0, Offset: 0, Payload: "replacement"}}))
+	ops.fail.Store(false)
+	require.ErrorIs(t, p.ApplyReplicaRollback(1), disk.ErrStaleContentGeneration)
+	require.ErrorIs(t, p.RecoveryError(), ErrReplicaRollbackFailed)
+	require.Error(t, p.Enqueue(types.Message{Payload: "must remain fenced"}))
 }
 
 func TestBootstrapRewritesRemovedCheckpointsThenIdleFlushIsClean(t *testing.T) {

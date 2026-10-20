@@ -114,6 +114,74 @@ source, offsets, progress, retries, rebuild/bootstrap/readmission transitions an
 terminal versus transient failures. CI and the initial CodeRabbit review must be
 resolved before handoff. PR merging remains user-owned.
 
+## Receiver verification authority
+
+Kafka's [4.1 AbstractFetcherThread](https://github.com/apache/kafka/blob/4.1/core/src/main/scala/kafka/server/AbstractFetcherThread.scala)
+checks the original request offset and current leader epoch before consuming a
+fetch response. Its [4.1 Partition](https://github.com/apache/kafka/blob/4.1/core/src/main/scala/kafka/cluster/Partition.scala)
+checks replica eligibility, the committed boundary and leader-epoch start before
+ISR expansion. Cursus adopts request-bound response validation and a separate
+admission check. Its Raft-authoritative HWM, push replication and possible
+same-epoch content divergence require additional local content-generation
+evidence; matching epoch/offset tuples alone cannot certify a repaired log.
+
+Implemented receiver witnesses bind the original partition, pre-challenge disk
+generation, verification attempt and reconciliation-marker revision. The actual
+terminal apply returns opaque authority only after data and required ES indexing
+succeed. Final admission rechecks that authority after snapshot transfer, and
+heartbeat/direct proof builders share the same current-generation eligibility.
+Legacy error-only apply APIs cannot manufacture admission authority. Protocol
+zero still proves only its existing last-record challenge, not full-prefix
+equivalence. Checked generation validation adds constant local work, no extra
+network round or retained-history scan; existing challenge/hash costs remain.
+ES recovery uses a fixed committed view that bypasses only its unchanged owned
+reconciliation marker while retaining transaction visibility. Unknown or changed
+index content generations require a reset/replay to remove divergent entries;
+repeated verification and append catch-up within one certified generation reuse
+index progress. This derived-index rebuild cost is separate from constant-size
+witness validation.
+
+A consumer log repair records every affected partition's latest required
+generation. Clean mutation rejection does not discharge it. Strict full replay
+requires actual verified repair evidence for the whole pending set; one atomic,
+nonwaiting multi-disk generation check publishes replay and readiness. A busy,
+rewritten or unavailable disk keeps admission closed for retry. Scoped bootstrap
+rebuilds remain possible before prefix verification and cannot clear full-repair
+requirements. Regression checks cover earlier-prefix rewrites with identical
+tails, snapshot-transfer races, marker replacement, repeated and multi-partition
+repairs, and a raw disk rewrite immediately before replay publication.
+The shared proof builder withholds offsets-partition ISR admission until pending
+full replay finishes: this is a Cursus consumer-transition constraint beyond
+Kafka's epoch/offset eligibility checks, keeping recovery verification available
+if concurrent non-ISR replication advances the boundary before replay.
+
+## Speculative tail and committed-watermark repair
+
+Kafka's [4.1 AbstractFetcherThread, lines 193–208](https://github.com/apache/kafka/blob/4.1/core/src/main/scala/kafka/server/AbstractFetcherThread.scala#L193-L208)
+serializes truncation with current fetch-state validation. This follow-up adopts
+that exclusion for both Cursus tail-repair entry points, reusing the checked
+physical rollback engine. Cursus must retain separate publication policies:
+speculative repair preserves the old HWM and its authority; committed reconciliation
+publishes the Raft watermark only after index rebuild and durable checkpoints.
+Canonical divergence rollback may still lower a stale local HWM.
+
+The shared repair engine releases the partition mutex before disk maintenance or
+raw scans. Compaction can sample LEO equal to the cluster HWM, then wait for the
+partition HWM after a normal append creates a speculative tail; repair waiting
+for maintenance while holding the partition mutex deadlocks that valid interleaving.
+Reconciliation, visibility and checkpoint exclusions keep mutation serialized
+without this lock inversion. A changed reconciliation marker must survive repair.
+Uncertain mutation or rebuild failure keeps the partition unavailable; speculative
+repair must not create an authoritative checkpoint from an unknown watermark.
+
+Regression checks defined before implementation cover that exact sampled-LEO interleaving
+for both entry points, watermark policy and bounds, raw producer/transaction
+rebuild, marker replacement, checkpoint failure, no-op and snapshot/bootstrap
+guards. This changes liveness and publication safety, not recovery asymptotics:
+destructive repair still reads all retained record bytes and rebuilds all retained
+producer/transaction state; no-op tail repair needs no scan. Byte/time budgets and
+incremental recovery remain separate proposals.
+
 ## Outstanding audit follow-ups
 
 - Cold sidecar rebuilds still scan retained history under recovery/storage locks.

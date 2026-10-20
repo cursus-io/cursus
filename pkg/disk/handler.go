@@ -31,6 +31,12 @@ type DiskHandler struct {
 	AbsoluteOffset uint64
 	CurrentSegment uint64
 	segments       []uint64
+	topicName      string
+	partitionID    int
+	// Protected by mu. Unlike allocated AbsoluteOffset or regressing
+	// FlushedOffset, writtenTail remembers every successfully written offset.
+	writtenTail     uint64
+	contentRevision uint64
 
 	indexFile         *os.File
 	indexWriter       *bufio.Writer
@@ -343,6 +349,9 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 		CurrentOffset:  recovery.validBytes,
 		AbsoluteOffset: recovery.nextOffset,
 		FlushedOffset:  recovery.nextOffset,
+		writtenTail:    recovery.nextOffset,
+		topicName:      topicName,
+		partitionID:    partitionID,
 
 		indexInterval: safeIntToUint64(cfg.IndexIntervalBytes),
 

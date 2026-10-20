@@ -49,11 +49,13 @@ type ConsumerMetadataScope struct {
 // PreparedConsumerMetadataReplay is single-use, detached, and bound to the
 // exclusive recovery lease and authority generation that prepared it.
 type PreparedConsumerMetadataReplay struct {
-	owner   *Coordinator
-	stamp   consumerMetadataReplayStamp
-	scope   *ConsumerMetadataScope
-	scratch *Coordinator
-	status  ConsumerMetadataRecoveryStatus
+	repairs         map[int]uint64
+	repairValidator ConsumerLogRepairValidator
+	owner           *Coordinator
+	stamp           consumerMetadataReplayStamp
+	scope           *ConsumerMetadataScope
+	scratch         *Coordinator
+	status          ConsumerMetadataRecoveryStatus
 }
 
 // A stamp belongs to one operation, not to a reusable conservative scope.
@@ -273,7 +275,20 @@ func (c *Coordinator) PrepareFullConsumerMetadataReplay(reader ConsumerMetadataC
 	if err != nil {
 		return nil, err
 	}
-	return c.prepareConsumerMetadataReplay(reader, nil, stamp)
+	repairs := c.pendingConsumerLogRepairs()
+	validator, _ := reader.(ConsumerLogRepairValidator)
+	if err := validateConsumerLogRepairs(validator, repairs); err != nil {
+		return nil, err
+	}
+	prepared, err := c.prepareConsumerMetadataReplay(reader, nil, stamp)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateConsumerLogRepairs(validator, repairs); err != nil {
+		return nil, err
+	}
+	prepared.repairs, prepared.repairValidator = repairs, validator
+	return prepared, nil
 }
 
 // PrepareStartupConsumerMetadataReplay is the exclusive compatibility path for
@@ -295,7 +310,20 @@ func (c *Coordinator) PrepareLegacyConsumerMetadataReplay(reader ConsumerMetadat
 	if err != nil {
 		return nil, err
 	}
-	return c.prepareConsumerMetadataReplay(reader, nil, stamp)
+	repairs := c.pendingConsumerLogRepairs()
+	validator, _ := reader.(ConsumerLogRepairValidator)
+	if err := validateConsumerLogRepairs(validator, repairs); err != nil {
+		return nil, err
+	}
+	prepared, err := c.prepareConsumerMetadataReplay(reader, nil, stamp)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateConsumerLogRepairs(validator, repairs); err != nil {
+		return nil, err
+	}
+	prepared.repairs, prepared.repairValidator = repairs, validator
+	return prepared, nil
 }
 
 func (c *Coordinator) PrepareScopedConsumerMetadataReplay(reader ConsumerMetadataCommittedReader, replacementRaw ConsumerMetadataRawReader, old *ConsumerMetadataScope, route ConsumerMetadataRoute) (*PreparedConsumerMetadataReplay, error) {
@@ -421,15 +449,49 @@ func (c *Coordinator) validatePreparedReplayLocked(p *PreparedConsumerMetadataRe
 	return nil
 }
 func (c *Coordinator) ApplyFullConsumerMetadataReplay(p *PreparedConsumerMetadataReplay) error {
-	return c.applyConsumerMetadataReplay(p, false)
+	return c.applyConsumerMetadataReplay(p, false, false)
 }
 func (c *Coordinator) ApplyScopedConsumerMetadataReplay(p *PreparedConsumerMetadataReplay) error {
-	return c.applyConsumerMetadataReplay(p, true)
+	return c.applyConsumerMetadataReplay(p, true, false)
 }
 
-func (c *Coordinator) applyConsumerMetadataReplay(p *PreparedConsumerMetadataReplay, scoped bool) error {
+// ApplyFullConsumerMetadataReplayAndComplete publishes verified repaired logs
+// and readiness in one generation-checked transaction under the exclusive lease.
+func (c *Coordinator) ApplyFullConsumerMetadataReplayAndComplete(p *PreparedConsumerMetadataReplay) error {
+	return c.applyConsumerMetadataReplay(p, false, true)
+}
+
+func (c *Coordinator) applyConsumerMetadataReplay(p *PreparedConsumerMetadataReplay, scoped, complete bool) error {
 	if c == nil || c.standalone {
 		return ErrConsumerMetadataRecoveryStandalone
+	}
+	var publication ConsumerLogRepairPublication
+	if p == nil {
+		return fmt.Errorf("prepared replay is nil")
+	}
+	if !scoped && len(p.repairs) != 0 {
+		if err := c.validateConsumerMetadataReplayStamp(p.stamp); err != nil {
+			return err
+		}
+		if !complete {
+			return fmt.Errorf("pending log repair requires atomic full replay completion")
+		}
+		if err := validateConsumerLogRepairs(p.repairValidator, p.repairs); err != nil {
+			return err
+		}
+		var err error
+		publisher, ok := p.repairValidator.(ConsumerLogRepairPublisher)
+		if !ok {
+			return fmt.Errorf("consumer repair atomic publication unavailable")
+		}
+		publication, err = publisher.AcquireConsumerLogRepairPublication(p.repairs)
+		if err != nil {
+			return err
+		}
+		if publication == nil {
+			return fmt.Errorf("consumer repair publication unavailable")
+		}
+		defer publication.Close()
 	}
 	c.authorityMu.Lock()
 	defer c.authorityMu.Unlock()
@@ -444,32 +506,63 @@ func (c *Coordinator) applyConsumerMetadataReplay(p *PreparedConsumerMetadataRep
 		c.consumerAdmission.mu.Unlock()
 		return fmt.Errorf("consumer metadata prepared replay scope mismatch")
 	}
-	if scoped {
-		for name := range p.scope.names {
-			delete(c.groups, name)
-			delete(c.groupEpochs, name)
-			delete(c.ownershipSince, name)
-			if g := p.scratch.groups[name]; g != nil {
-				c.groups[name] = g
-			}
-			if epoch, ok := p.scratch.groupEpochs[name]; ok {
-				c.groupEpochs[name] = epoch
+	if !scoped {
+		if len(p.repairs) != len(c.consumerAdmission.pendingLogRepairs) {
+			c.consumerAdmission.mu.Unlock()
+			return fmt.Errorf("pending repair set changed")
+		}
+		for partition, generation := range c.consumerAdmission.pendingLogRepairs {
+			if p.repairs[partition] != generation {
+				c.consumerAdmission.mu.Unlock()
+				return fmt.Errorf("pending repair generation changed")
 			}
 		}
-	} else {
-		c.groups = p.scratch.groups
-		c.groupEpochs = p.scratch.groupEpochs
-		c.ownershipSince = make(map[string]time.Time)
-		c.consumerAdmission.installedGeneration = p.stamp.required
 	}
 	sourcesByGroup := p.scratch.metadataSources
-	c.authorityRevision++
-	if !scoped {
-		c.consumerAdmission.installedLease = c.consumerAdmission.lease
-		c.consumerAdmission.installedRevision = c.authorityRevision
+	ownership := make(map[string]time.Time)
+	publish := func() {
+		if scoped {
+			for name := range p.scope.names {
+				delete(c.groups, name)
+				delete(c.groupEpochs, name)
+				delete(c.ownershipSince, name)
+				if g := p.scratch.groups[name]; g != nil {
+					c.groups[name] = g
+				}
+				if epoch, ok := p.scratch.groupEpochs[name]; ok {
+					c.groupEpochs[name] = epoch
+				}
+			}
+		} else {
+			c.groups = p.scratch.groups
+			c.groupEpochs = p.scratch.groupEpochs
+			c.ownershipSince = ownership
+			c.consumerAdmission.installedGeneration = p.stamp.required
+		}
+		c.authorityRevision++
+		if !scoped {
+			c.consumerAdmission.installedLease = c.consumerAdmission.lease
+			c.consumerAdmission.installedRevision = c.authorityRevision
+		}
+		// Drop every prepared reference to installed mutable state.
+		p.scratch = nil
+		if complete {
+			c.consumerAdmission.completedGeneration = p.stamp.required
+			c.consumerAdmission.startupPending = false
+			c.consumerAdmission.pendingLogRepairs = nil
+		}
 	}
-	// Drop every prepared reference to installed mutable state.
-	p.scratch = nil
+	if publication != nil {
+		if err := publication.Publish(publish); err != nil {
+			c.consumerAdmission.mu.Unlock()
+			return err
+		}
+	} else {
+		publish()
+	}
+	if complete {
+		c.consumerAdmission.notifyLocked()
+	}
 	c.consumerAdmission.mu.Unlock()
 	if !scoped {
 		c.markRecoveryComplete(p.status)

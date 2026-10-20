@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -97,7 +98,8 @@ func (h *ClusterServer) handleConnection(conn net.Conn) {
 	}
 
 	for {
-		if err := conn.SetDeadline(time.Now().Add(h.requestTimeout)); err != nil {
+		deadline := time.Now().Add(h.requestTimeout)
+		if err := conn.SetDeadline(deadline); err != nil {
 			return
 		}
 		request, err := connection.ReadFrame()
@@ -133,7 +135,9 @@ func (h *ClusterServer) handleConnection(conn net.Conn) {
 		case wire.CommandHeartbeatCluster:
 			response, requestError = h.handleHeartbeatCluster(payload)
 		case wire.CommandReplicaCatchup:
-			response, requestError = h.handleReplicaCatchup(payload)
+			ctx, cancel := context.WithDeadline(context.Background(), deadline)
+			response, requestError = h.handleReplicaCatchupContext(ctx, payload)
+			cancel()
 		case wire.CommandListCluster:
 			response, requestError = h.handleListCluster()
 		default:
@@ -181,6 +185,12 @@ func (h *ClusterServer) handleHeartbeatCluster(payload wire.CommandPayload) (any
 }
 
 func (h *ClusterServer) handleReplicaCatchup(payload wire.CommandPayload) (any, *wire.ErrorPayload) {
+	ctx, cancel := context.WithTimeout(context.Background(), h.requestTimeout)
+	defer cancel()
+	return h.handleReplicaCatchupContext(ctx, payload)
+}
+
+func (h *ClusterServer) handleReplicaCatchupContext(ctx context.Context, payload wire.CommandPayload) (any, *wire.ErrorPayload) {
 	encoded := payload.Fields["request"]
 	if encoded == "" {
 		return nil, validationError("replica catch-up request is required")
@@ -189,7 +199,14 @@ func (h *ClusterServer) handleReplicaCatchup(payload wire.CommandPayload) (any, 
 	if err := json.Unmarshal([]byte(encoded), &request); err != nil {
 		return nil, validationError("invalid replica catch-up request")
 	}
-	batch, err := h.sd.FetchReplicaCatchup(request)
+	var batch fsm.ReplicaCatchupBatch
+	var err error
+	if contextual, ok := h.sd.(controller.ContextReplicaCatchupSource); ok {
+		batch, err = contextual.FetchReplicaCatchupContext(ctx, request)
+	} else {
+		// Preserve existing third-party ServiceDiscovery implementations.
+		batch, err = h.sd.FetchReplicaCatchup(request)
+	}
 	if err != nil {
 		return nil, internalClusterError(err)
 	}
@@ -220,6 +237,7 @@ func fitReplicaCatchupBatchToLimit(batch fsm.ReplicaCatchupBatch, limit int) (fs
 		// The first unsent retained record is the exclusive boundary of this
 		// fitted logical range. Keeping the original EndOffset would skip it.
 		batch.EndOffset = batch.Messages[messageCount].Offset
+		batch.Verified = false
 		batch.Messages = batch.Messages[:messageCount]
 		batch, err = fsm.SealReplicaCatchupBatch(batch)
 		if err != nil {

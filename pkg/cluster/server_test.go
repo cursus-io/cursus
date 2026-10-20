@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -79,7 +80,7 @@ func clusterRoundTrip(t *testing.T, address string, command wire.Command, fields
 
 func TestFitReplicaCatchupBatchPreservesFirstUnsentOffset(t *testing.T) {
 	batch := fsm.ReplicaCatchupBatch{
-		StartOffset: 0, EndOffset: 20, CommittedHWM: 20, Compacted: true,
+		StartOffset: 0, EndOffset: 20, CommittedHWM: 20, Compacted: true, Verified: true,
 		Messages: []types.Message{
 			{Offset: 2, Payload: "first"},
 			{Offset: 4, Payload: "second"},
@@ -91,6 +92,7 @@ func TestFitReplicaCatchupBatchPreservesFirstUnsentOffset(t *testing.T) {
 	require.NoError(t, err)
 	expectedPrefix := batch
 	expectedPrefix.EndOffset = 8
+	expectedPrefix.Verified = false
 	expectedPrefix.Messages = expectedPrefix.Messages[:2]
 	expectedPrefix, err = fsm.SealReplicaCatchupBatch(expectedPrefix)
 	require.NoError(t, err)
@@ -100,6 +102,8 @@ func TestFitReplicaCatchupBatchPreservesFirstUnsentOffset(t *testing.T) {
 	fitted, err := fitReplicaCatchupBatchToLimit(batch, len(encodedPrefix))
 	require.NoError(t, err)
 	require.True(t, fitted.Compacted)
+	require.False(t, fitted.Verified)
+	require.NoError(t, fsm.ValidateReplicaCatchupBatchDigest(fitted))
 	require.Equal(t, uint64(20), fitted.CommittedHWM)
 	require.Equal(t, uint64(8), fitted.EndOffset)
 	require.Equal(t, []uint64{2, 4}, []uint64{fitted.Messages[0].Offset, fitted.Messages[1].Offset})
@@ -270,4 +274,73 @@ func TestClusterServer_List(t *testing.T) {
 	require.Equal(t, wire.StatusOK, response.Status)
 	assert.Contains(t, string(response.Payload), "n1")
 	msd.AssertExpectations(t)
+}
+
+type contextCatchupDiscovery struct {
+	*MockServiceDiscovery
+	observed context.Context
+}
+
+func (s *contextCatchupDiscovery) FetchReplicaCatchupContext(ctx context.Context, r fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error) {
+	s.observed = ctx
+	return fsm.ReplicaCatchupBatch{}, nil
+}
+func TestCatchupServerUsesBoundedContextServicePath(t *testing.T) {
+	sd := &contextCatchupDiscovery{MockServiceDiscovery: new(MockServiceDiscovery)}
+	sd.On("FetchReplicaCatchup", mock.Anything).Return(fsm.ReplicaCatchupBatch{}, nil)
+	h := NewClusterServer(sd)
+	h.requestTimeout = time.Second
+	_, err := h.handleReplicaCatchup(wire.CommandPayload{Fields: map[string]string{"request": "{}"}})
+	require.Nil(t, err)
+	require.NotNil(t, sd.observed, "context-aware service path must be used")
+	_, bounded := sd.observed.Deadline()
+	require.True(t, bounded)
+	require.ErrorIs(t, sd.observed.Err(), context.Canceled, "handler must release request timer")
+}
+
+type deadlineRecordingConn struct {
+	net.Conn
+	deadlines chan time.Time
+}
+
+func (c deadlineRecordingConn) SetDeadline(t time.Time) error {
+	c.deadlines <- t
+	return c.Conn.SetDeadline(t)
+}
+
+type dispatchedContextDiscovery struct {
+	*MockServiceDiscovery
+	contexts chan context.Context
+}
+
+func (s *dispatchedContextDiscovery) FetchReplicaCatchupContext(ctx context.Context, _ fsm.ReplicaCatchupRequest) (fsm.ReplicaCatchupBatch, error) {
+	s.contexts <- ctx
+	return fsm.ReplicaCatchupBatch{}, nil
+}
+func TestCatchupDispatchUsesSocketRequestDeadline(t *testing.T) {
+	sd := &dispatchedContextDiscovery{MockServiceDiscovery: new(MockServiceDiscovery), contexts: make(chan context.Context, 1)}
+	h := NewClusterServer(sd)
+	server, client := net.Pipe()
+	defer func() { _ = client.Close() }()
+	deadlines := make(chan time.Time, 4)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		h.handleConnection(deadlineRecordingConn{Conn: server, deadlines: deadlines})
+	}()
+	connection, err := wire.ClientHandshake(client, []wire.Compression{wire.CompressionNone})
+	require.NoError(t, err)
+	<-deadlines // handshake
+	requestDeadline := <-deadlines
+	payload, err := wire.EncodeCommandPayload(wire.CommandPayload{Fields: map[string]string{"request": "{}"}})
+	require.NoError(t, err)
+	require.NoError(t, connection.WriteFrame(wire.Frame{Kind: wire.KindRequest, Command: wire.CommandReplicaCatchup, RequestID: 1, Payload: payload}))
+	observed := <-sd.contexts
+	actual, ok := observed.Deadline()
+	require.True(t, ok)
+	require.Equal(t, requestDeadline, actual)
+	_, err = connection.ReadFrame()
+	require.NoError(t, err)
+	require.NoError(t, client.Close())
+	<-stopped
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -15,6 +16,7 @@ type ReplicaCatchupFetcher interface {
 }
 
 type ReplicaCatchupApplier func(context.Context, fsm.ReplicaCatchupBatch) error
+type VerifiedReplicaCatchupApplier func(context.Context, fsm.ReplicaCatchupRequest, fsm.ReplicaCatchupBatch) (*topic.ReplicaCatchupWitness, error)
 
 const replicaCatchupFetchTimeout = 30 * time.Second
 const replicaCatchupProofSubmitTimeout = 5 * time.Second
@@ -23,7 +25,7 @@ const replicaCatchupProofRetryBackoff = 25 * time.Millisecond
 // StartReplicaCatchup periodically fills local replicas that are outside ISR.
 // ISR admission remains separate and happens only through the existing proof
 // emitted by a later heartbeat.
-func (cc *ClusterController) StartReplicaCatchup(ctx context.Context, fetcher ReplicaCatchupFetcher, apply ReplicaCatchupApplier) {
+func (cc *ClusterController) StartReplicaCatchupVerified(ctx context.Context, fetcher ReplicaCatchupFetcher, apply VerifiedReplicaCatchupApplier) {
 	if cc == nil || cc.RaftManager == nil || fetcher == nil || apply == nil {
 		return
 	}
@@ -31,7 +33,7 @@ func (cc *ClusterController) StartReplicaCatchup(ctx context.Context, fetcher Re
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
-			if err := cc.RunReplicaCatchupOnce(ctx, fetcher, apply); err != nil {
+			if err := cc.RunReplicaCatchupOnceVerified(ctx, fetcher, apply); err != nil {
 				util.Debug("replica catch-up pending on %s: %v", cc.brokerID, err)
 			}
 			select {
@@ -43,7 +45,7 @@ func (cc *ClusterController) StartReplicaCatchup(ctx context.Context, fetcher Re
 	}()
 }
 
-func (cc *ClusterController) RunReplicaCatchupOnce(ctx context.Context, fetcher ReplicaCatchupFetcher, apply ReplicaCatchupApplier) error {
+func (cc *ClusterController) RunReplicaCatchupOnceVerified(ctx context.Context, fetcher ReplicaCatchupFetcher, apply VerifiedReplicaCatchupApplier) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -69,7 +71,7 @@ func (cc *ClusterController) RunReplicaCatchupOnce(ctx context.Context, fetcher 
 	return catchupErr
 }
 
-func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher ReplicaCatchupFetcher, apply ReplicaCatchupApplier, request fsm.ReplicaCatchupRequest) error {
+func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher ReplicaCatchupFetcher, apply VerifiedReplicaCatchupApplier, request fsm.ReplicaCatchupRequest) error {
 	discoveryPort := 0
 	if cc.Config != nil {
 		discoveryPort = cc.Config.DiscoveryPort
@@ -87,9 +89,11 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		if err := validateReplicaCatchupBatch(request, batch); err != nil {
 			return err
 		}
-		if err := apply(ctx, batch); err != nil {
+		witness, err := apply(ctx, request, batch)
+		if err != nil {
 			return err
 		}
+
 		if batch.TruncateTo != nil {
 			return nil
 		}
@@ -102,7 +106,7 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		}
 		nextOffset := request.NextOffset
 		if nextOffset != request.CommittedHWM {
-			if request.RecoveryProtocol != 0 {
+			{
 				refreshed, ok := cc.refreshReplicaCatchupRequest(request)
 				if !ok || refreshed.RecoveryProtocol != request.RecoveryProtocol {
 					return fmt.Errorf("indexed recovery proofs could not be refreshed")
@@ -122,7 +126,10 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 				return fmt.Errorf("event snapshot catch-up: %w", err)
 			}
 		}
-		if err := cc.RaftManager.GetFSM().MarkReplicaCatchupVerified(request); err != nil {
+		if witness == nil {
+			return fmt.Errorf("actual receiver verification witness is required")
+		}
+		if err := cc.RaftManager.GetFSM().MarkReplicaCatchupVerified(request, witness); err != nil {
 			refreshed, ok := cc.refreshReplicaCatchupRequest(request)
 			if !ok {
 				return err
@@ -133,10 +140,17 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 		if cc.proofSubmitter == nil {
 			return nil
 		}
-		proof := fsm.ISRCatchupProof{
-			Topic: request.Topic, Partition: request.Partition, BrokerID: request.BrokerID,
-			CommittedHWM: request.CommittedHWM, LocalLEO: request.CommittedHWM, LocalHWM: request.CommittedHWM,
-			LeaderEpoch: request.LeaderEpoch, LifecycleEpoch: request.LifecycleEpoch,
+		var proof fsm.ISRCatchupProof
+		found := false
+		for _, candidate := range cc.RaftManager.GetFSM().BuildISRCatchupProofs(request.BrokerID) {
+			if candidate.Topic == request.Topic && candidate.Partition == request.Partition {
+				proof = candidate
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("replica proof eligibility changed")
 		}
 		proofCtx, cancel := context.WithTimeout(ctx, replicaCatchupProofSubmitTimeout)
 		err = cc.proofSubmitter(proofCtx, proof)
@@ -237,4 +251,26 @@ func validateReplicaCatchupBatch(request fsm.ReplicaCatchupRequest, batch fsm.Re
 		next = message.Offset + 1
 	}
 	return nil
+}
+
+// ValidateReplicaCatchupBatch validates the original request before local apply.
+func ValidateReplicaCatchupBatch(request fsm.ReplicaCatchupRequest, batch fsm.ReplicaCatchupBatch) error {
+	return validateReplicaCatchupBatch(request, batch)
+}
+
+// The legacy callback API can still apply data, but never creates admission
+// authority. Callers must migrate to the typed verified API for ISR recovery.
+func legacyReplicaCatchupApplier(apply ReplicaCatchupApplier) VerifiedReplicaCatchupApplier {
+	if apply == nil {
+		return nil
+	}
+	return func(ctx context.Context, _ fsm.ReplicaCatchupRequest, batch fsm.ReplicaCatchupBatch) (*topic.ReplicaCatchupWitness, error) {
+		return nil, apply(ctx, batch)
+	}
+}
+func (cc *ClusterController) StartReplicaCatchup(ctx context.Context, fetcher ReplicaCatchupFetcher, apply ReplicaCatchupApplier) {
+	cc.StartReplicaCatchupVerified(ctx, fetcher, legacyReplicaCatchupApplier(apply))
+}
+func (cc *ClusterController) RunReplicaCatchupOnce(ctx context.Context, fetcher ReplicaCatchupFetcher, apply ReplicaCatchupApplier) error {
+	return cc.RunReplicaCatchupOnceVerified(ctx, fetcher, legacyReplicaCatchupApplier(apply))
 }
