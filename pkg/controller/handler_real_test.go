@@ -7,6 +7,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/controller"
+	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 )
@@ -300,12 +301,13 @@ func TestCommandHandler_PublishErrors(t *testing.T) {
 }
 
 func TestCommandHandler_EventSourcingCommands(t *testing.T) {
-	dir := t.TempDir()
-	cfg := &config.Config{LogDir: dir}
-	hp := &mockHandlerProvider{}
-	tm := topic.NewTopicManager(cfg, hp, nil)
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent = 1, 0.1
+	dm := disk.NewDiskManager(cfg)
+	tm := topic.NewTopicManager(cfg, dm, nil)
 	ch := controller.NewCommandHandler(tm, cfg, nil, nil, nil)
-	t.Cleanup(func() { _ = ch.Close() })
+	t.Cleanup(func() { _ = ch.Close(); tm.Stop(); dm.CloseAllHandlers() })
 	ctx := controller.NewClientContext("test-group", 0)
 
 	// Create event-sourcing topic

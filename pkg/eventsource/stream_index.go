@@ -2,6 +2,7 @@ package eventsource
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -38,9 +39,16 @@ type streamState struct {
 // a hash collision, after a restart, entries for colliding keys may appear under all keys
 // that share the same hash. This is a known imprecision with negligible probability.
 type StreamIndex struct {
-	mu sync.RWMutex
-	// Serialize aggregate ID absence checks through append acknowledgement,
-	// including standalone writers using different aggregate keys.
+	mu             sync.RWMutex
+	invalid        error
+	closed         bool
+	resetRevision  uint64
+	seeds          map[string]uint64
+	seedAnchors    map[string]uint64
+	offsetVersions map[string][]offsetVersion
+	orderedRecords []indexedStreamRecord
+	certificate    *snapshotIndexCertificate
+	// Serialize aggregate identity checks through append acknowledgement.
 	aggregateAppendMu sync.Mutex
 
 	dir         string
@@ -152,6 +160,7 @@ func (si *StreamIndex) loadFromDisk() error {
 		// the in-memory entries will be resolved by the caller's key lookup.
 		for _, key := range keys {
 			si.entries[key] = append(si.entries[key], entry)
+			si.rememberEntryLocked(key, entry)
 
 			st, exists := si.states[key]
 			if !exists {
@@ -185,6 +194,9 @@ func (si *StreamIndex) loadFromDisk() error {
 func (si *StreamIndex) CheckAndAppend(key string, expectedVersion, offset, position uint64) (bool, uint64, error) {
 	si.mu.Lock()
 	defer si.mu.Unlock()
+	if err := si.checkLocked(); err != nil {
+		return false, 0, err
+	}
 
 	current := uint64(0)
 	if st, ok := si.states[key]; ok {
@@ -207,6 +219,9 @@ func (si *StreamIndex) CheckAndAppend(key string, expectedVersion, offset, posit
 func (si *StreamIndex) CheckEnqueueAndAppend(key string, expectedVersion uint64, enqueueFn func() (uint64, error)) (bool, uint64, error) {
 	si.mu.Lock()
 	defer si.mu.Unlock()
+	if err := si.checkLocked(); err != nil {
+		return false, 0, err
+	}
 
 	current := uint64(0)
 	if st, ok := si.states[key]; ok {
@@ -219,6 +234,7 @@ func (si *StreamIndex) CheckEnqueueAndAppend(key string, expectedVersion uint64,
 
 	offset, err := enqueueFn()
 	if err != nil {
+		si.invalidateLocked(err)
 		return false, current, err
 	}
 
@@ -237,7 +253,15 @@ func (si *StreamIndex) Append(key string, aggregateVersion, offset, position uin
 }
 
 // appendLocked writes an entry while the caller already holds si.mu.
-func (si *StreamIndex) appendLocked(key string, aggregateVersion, offset, position uint64) error {
+func (si *StreamIndex) appendLocked(key string, aggregateVersion, offset, position uint64) (err error) {
+	if err := si.checkLocked(); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			si.invalidateLocked(err)
+		}
+	}()
 	keyHash := util.GenerateID(key)
 
 	// Write to sidecar on first occurrence of this key.
@@ -262,12 +286,15 @@ func (si *StreamIndex) appendLocked(key string, aggregateVersion, offset, positi
 	binary.BigEndian.PutUint64(buf[16:24], entry.Offset)
 	binary.BigEndian.PutUint64(buf[24:32], entry.Position)
 
-	if _, err := si.indexFile.Write(buf[:]); err != nil {
+	if n, err := si.indexFile.Write(buf[:]); err != nil {
 		return fmt.Errorf("write index entry: %w", err)
+	} else if n != len(buf) {
+		return io.ErrShortWrite
 	}
 
 	// Update in-memory state.
 	si.entries[key] = append(si.entries[key], entry)
+	si.rememberEntryLocked(key, entry)
 
 	st, exists := si.states[key]
 	if !exists {
@@ -300,38 +327,110 @@ func (si *StreamIndex) writeSidecarEntry(hash uint64, key string) error {
 	binary.BigEndian.PutUint16(buf[8:10], keyLength)
 	copy(buf[10:], keyBytes)
 
-	if _, err := si.sidecarFile.Write(buf); err != nil {
+	if n, err := si.sidecarFile.Write(buf); err != nil {
 		return err
+	} else if n != len(buf) {
+		return io.ErrShortWrite
 	}
 	return nil
 }
 
-// GetVersion returns the current aggregate version for the given key.
-// Returns 0 if the key is not found.
+// GetVersion is a compatibility accessor for tests. Zero means either a missing
+// key or an unusable index. Production callers must use CheckedVersion so a
+// failed index cannot authorize a new stream or snapshot as version zero.
 func (si *StreamIndex) GetVersion(key string) uint64 {
+	version, _ := si.CheckedVersion(key)
+	return version
+}
+
+// CheckedVersion refuses to expose partial state after a failed write or rebuild.
+func (si *StreamIndex) CheckedVersion(key string) (uint64, error) {
 	si.mu.RLock()
 	defer si.mu.RUnlock()
+	if err := si.checkLocked(); err != nil {
+		return 0, err
+	}
 
 	st, ok := si.states[key]
 	if !ok {
-		return 0
+		return 0, nil
 	}
-	return st.currentVersion
+	return st.currentVersion, nil
+}
+
+var ErrStreamIndexInvalid = errors.New("stream index is invalid")
+
+func (si *StreamIndex) checkLocked() error {
+	if si.invalid != nil {
+		return fmt.Errorf("%w: %v", ErrStreamIndexInvalid, si.invalid)
+	}
+	if si.closed {
+		return fmt.Errorf("%w: closed", ErrStreamIndexInvalid)
+	}
+	return nil
+}
+
+func (si *StreamIndex) invalidateLocked(err error) {
+	if si.invalid == nil {
+		si.invalid = err
+	}
+}
+
+// Invalidate is terminal: callers must retire this object and rebuild a new one.
+func (si *StreamIndex) Invalidate(err error) {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+	if err == nil {
+		err = ErrStreamIndexInvalid
+	}
+	si.invalidateLocked(err)
+}
+
+func (si *StreamIndex) ResetRevision() (uint64, error) {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	return si.resetRevision, si.checkLocked()
 }
 
 // SeedVersion establishes a retention checkpoint in the rebuilt in-memory
 // index. It is derived from a durable application snapshot and is not written
 // to the disposable stream index files.
 func (si *StreamIndex) SeedVersion(key string, version uint64) error {
+	return si.seedVersionAt(key, version, 0)
+}
+
+func (si *StreamIndex) seedVersionAt(key string, version, anchor uint64) error {
 	if key == "" || version == 0 {
 		return fmt.Errorf("invalid stream snapshot seed")
 	}
 	si.mu.Lock()
 	defer si.mu.Unlock()
-	if current := si.states[key]; current != nil && current.currentVersion != version {
-		return fmt.Errorf("stream snapshot seed conflict key=%s current=%d incoming=%d", key, current.currentVersion, version)
+	if err := si.checkLocked(); err != nil {
+		return err
 	}
-	si.states[key] = &streamState{currentVersion: version}
+	if si.seeds[key] == version && si.seedAnchors[key] == anchor {
+		return nil
+	}
+	if si.resetRevision == ^uint64(0) {
+		si.invalidateLocked(fmt.Errorf("stream index seed revision exhausted"))
+		return si.checkLocked()
+	}
+	if si.seeds == nil {
+		si.seeds = make(map[string]uint64)
+	}
+	if si.seedAnchors == nil {
+		si.seedAnchors = make(map[string]uint64)
+	}
+	si.seeds[key] = version
+	si.seedAnchors[key] = anchor
+	si.resetRevision++
+	si.certificate = nil
+	if current := si.states[key]; current == nil {
+		si.states[key] = &streamState{currentVersion: version}
+	} else if current.currentVersion < version {
+		current.currentVersion = version
+	}
+
 	return nil
 }
 
@@ -340,6 +439,9 @@ func (si *StreamIndex) SeedVersion(key string, version uint64) error {
 func (si *StreamIndex) Lookup(key string, fromVersion uint64) ([]StreamIndexEntry, error) {
 	si.mu.RLock()
 	defer si.mu.RUnlock()
+	if err := si.checkLocked(); err != nil {
+		return nil, err
+	}
 
 	entries, ok := si.entries[key]
 	if !ok {
@@ -360,11 +462,14 @@ func (si *StreamIndex) Lookup(key string, fromVersion uint64) ([]StreamIndexEntr
 // callers must not use Lookup and trim the result after materializing an
 // entire long aggregate history.
 func (si *StreamIndex) LookupRange(key string, fromVersion, toVersion uint64, max int) ([]StreamIndexEntry, error) {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	if err := si.checkLocked(); err != nil {
+		return nil, err
+	}
 	if fromVersion == 0 || toVersion < fromVersion || max <= 0 {
 		return nil, nil
 	}
-	si.mu.RLock()
-	defer si.mu.RUnlock()
 	entries := si.entries[key]
 	start := sort.Search(len(entries), func(i int) bool { return entries[i].AggregateVersion >= fromVersion })
 	if start == len(entries) {
@@ -380,9 +485,25 @@ func (si *StreamIndex) LookupRange(key string, fromVersion, toVersion uint64, ma
 }
 
 // Reset clears the derived index so it can be rebuilt from the committed log.
-func (si *StreamIndex) Reset() error {
+func (si *StreamIndex) Reset() (err error) {
 	si.mu.Lock()
 	defer si.mu.Unlock()
+	return si.resetLocked()
+}
+
+func (si *StreamIndex) resetLocked() (err error) {
+	if err := si.checkLocked(); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			si.invalidateLocked(err)
+		}
+	}()
+	if si.resetRevision == ^uint64(0) {
+		return fmt.Errorf("stream index reset revision exhausted")
+	}
+	si.resetRevision++
 
 	if err := si.indexFile.Truncate(0); err != nil {
 		return fmt.Errorf("truncate index file: %w", err)
@@ -403,6 +524,11 @@ func (si *StreamIndex) Reset() error {
 		return fmt.Errorf("sync sidecar file: %w", err)
 	}
 
+	si.seeds = nil
+	si.seedAnchors = nil
+	si.offsetVersions = nil
+	si.orderedRecords = nil
+	si.certificate = nil
 	si.states = make(map[string]*streamState)
 	si.entries = make(map[string][]StreamIndexEntry)
 	si.knownKeys = make(map[string]bool)
@@ -413,6 +539,10 @@ func (si *StreamIndex) Reset() error {
 func (si *StreamIndex) Close() error {
 	si.mu.Lock()
 	defer si.mu.Unlock()
+	if si.closed {
+		return nil
+	}
+	si.closed = true
 
 	var firstErr error
 	if err := si.indexFile.Close(); err != nil && firstErr == nil {
@@ -425,9 +555,17 @@ func (si *StreamIndex) Close() error {
 }
 
 // Sync durably flushes both populated index files before bootstrap publication.
-func (si *StreamIndex) Sync() error {
+func (si *StreamIndex) Sync() (err error) {
 	si.mu.Lock()
 	defer si.mu.Unlock()
+	if err := si.checkLocked(); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			si.invalidateLocked(err)
+		}
+	}()
 	if err := si.indexFile.Sync(); err != nil {
 		return err
 	}

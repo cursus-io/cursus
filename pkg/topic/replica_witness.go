@@ -181,6 +181,9 @@ func (v *PartitionReadView) ReplicaRepairGeneration(leader int, lifecycle, hwm, 
 	if err := v.check(); err != nil {
 		return disk.ContentGeneration{}, err
 	}
+	if v.snapshotCut != nil {
+		return disk.ContentGeneration{}, fmt.Errorf("snapshot cut views cannot authorize replica repair publication")
+	}
 	p := v.p
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -203,6 +206,9 @@ func (v *PartitionReadView) ReplicaRepairGeneration(leader int, lifecycle, hwm, 
 func (v *PartitionReadView) AcquireReplicaRepairPublication(leader int, lifecycle, hwm, repair uint64, generation disk.ContentGeneration) (func(), error) {
 	if err := v.check(); err != nil {
 		return nil, err
+	}
+	if v.snapshotCut != nil {
+		return nil, fmt.Errorf("snapshot cut views cannot authorize replica repair publication")
 	}
 	p := v.p
 	p.mu.RLock()

@@ -1,6 +1,7 @@
 package eventsource
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -179,6 +180,9 @@ func (h *Handler) getSnapshotWithView(topicName string, partitionID int, view *t
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	if h.closed {
+		return nil, fmt.Errorf("handler is closed")
+	}
 	if ss, ok := h.snapshots[key]; ok {
 		return ss, nil
 	}
@@ -228,8 +232,8 @@ func (h *Handler) CurrentVersion(topicName, key string) (uint64, int, error) {
 		if err != nil {
 			return err
 		}
-		version = idx.GetVersion(key)
-		return nil
+		version, err = idx.CheckedVersion(key)
+		return err
 	})
 	return version, partition, err
 }
@@ -254,18 +258,13 @@ func (h *Handler) IndexCommittedToHWM(topicName string, partitionID int, targetH
 		}
 		end := min(targetHWM, stable)
 		if end <= start {
-			return nil
+			return h.publishIndexProgress(key, idx, nil, nil)
 		}
 		if err := h.replayIndex(idx, v, start, end); err != nil {
-			h.mu.Lock()
-			delete(h.replicaIndexGenerations, key)
-			h.mu.Unlock()
+			h.retireIndex(key, idx, err)
 			return err
 		}
-		h.mu.Lock()
-		h.indexedHWM[key] = end
-		h.mu.Unlock()
-		return nil
+		return h.publishIndexProgress(key, idx, &end, nil)
 	})
 }
 
@@ -274,24 +273,28 @@ func (h *Handler) RecoverIndexFromLog(topicName string, partitionID int, idx *St
 		h.indexSyncMu.Lock()
 		defer h.indexSyncMu.Unlock()
 		h.mu.Lock()
-		delete(h.replicaIndexGenerations, topicName+":"+strconv.Itoa(partitionID))
+		key := topicName + ":" + strconv.Itoa(partitionID)
+		if h.indexes[key] != idx {
+			h.mu.Unlock()
+			return fmt.Errorf("stream_index_replaced retryable=true")
+		}
+		delete(h.replicaIndexGenerations, key)
 		h.mu.Unlock()
 		return h.publishRecoveredIndex(topicName, partitionID, idx, v)
 	})
 }
 
 func (h *Handler) publishRecoveredIndex(topicName string, partitionID int, idx *StreamIndex, view *topic.PartitionReadView) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	key := topicName + ":" + strconv.Itoa(partitionID)
-	end, err := h.recoverIndexFromView(topicName, partitionID, idx, view)
+	end, err := view.CheckedLastStableOffset()
 	if err != nil {
-		h.indexErrors[key] = err
+		return fmt.Errorf("stream index recovery boundary unavailable: %w", err)
+	}
+	key := topicName + ":" + strconv.Itoa(partitionID)
+	if err := h.recoverIndexWithView(topicName, partitionID, idx, view, end); err != nil {
+		h.retireIndex(key, idx, err)
 		return err
 	}
-	h.indexedHWM[key] = end
-	delete(h.indexErrors, key)
-	return nil
+	return h.publishIndexProgress(key, idx, &end, nil)
 }
 
 func (h *Handler) recoverIndexFromView(topicName string, partitionID int, idx *StreamIndex, view *topic.PartitionReadView) (uint64, error) {
@@ -302,7 +305,12 @@ func (h *Handler) recoverIndexFromView(topicName string, partitionID int, idx *S
 	return end, h.recoverIndexWithView(topicName, partitionID, idx, view, end)
 }
 
-func (h *Handler) recoverIndexWithView(topicName string, partitionID int, idx *StreamIndex, view *topic.PartitionReadView, latest uint64) error {
+func (h *Handler) recoverIndexWithView(topicName string, partitionID int, idx *StreamIndex, view *topic.PartitionReadView, latest uint64) (err error) {
+	defer func() {
+		if err != nil {
+			idx.Invalidate(err)
+		}
+	}()
 	first := view.FirstOffset()
 	if first > latest {
 		return fmt.Errorf("stream retention floor %d exceeds stable tail %d", first, latest)
@@ -335,7 +343,12 @@ func (h *Handler) recoverIndexWithView(topicName string, partitionID int, idx *S
 	return h.replayIndex(idx, view, first, latest)
 }
 
-func (h *Handler) replayIndex(idx *StreamIndex, view *topic.PartitionReadView, first, latest uint64) error {
+func (h *Handler) replayIndex(idx *StreamIndex, view *topic.PartitionReadView, first, latest uint64) (err error) {
+	defer func() {
+		if err != nil {
+			idx.Invalidate(err)
+		}
+	}()
 	const batchSize = 256
 	for offset := first; offset < latest; {
 		msgs, _, next, err := view.ReadCommittedPage(offset, batchSize, 0, true)
@@ -373,7 +386,10 @@ func (h *Handler) indexMessages(idx *StreamIndex, messages []types.Message) erro
 		if msg.Key == "" || msg.AggregateVersion == 0 {
 			continue
 		}
-		current := idx.GetVersion(msg.Key)
+		current, err := idx.CheckedVersion(msg.Key)
+		if err != nil {
+			return err
+		}
 		switch {
 		case msg.AggregateVersion <= current:
 			continue
@@ -526,7 +542,11 @@ func (h *Handler) appendStream(cmd string, opts AppendOptions, controllerFenced 
 				idx.aggregateAppendMu.Lock()
 				releaseAggregate = idx.aggregateAppendMu.Unlock
 			}
-			if t.Policy.AggregateReplay && expectedVersion <= idx.GetVersion(key) {
+			currentVersion, versionErr := idx.CheckedVersion(key)
+			if versionErr != nil {
+				return nil, fmt.Sprintf("ERROR: stream_index_failed reason=%q", versionErr.Error())
+			}
+			if t.Policy.AggregateReplay && expectedVersion <= currentVersion {
 				entries, lookupErr := idx.Lookup(key, expectedVersion)
 				if lookupErr != nil {
 					return nil, fmt.Sprintf("ERROR: aggregate_index_lookup_failed reason=%q", lookupErr.Error())
@@ -619,10 +639,27 @@ func (h *Handler) appendStream(cmd string, opts AppendOptions, controllerFenced 
 		if appendErr != nil {
 			h.indexSyncMu.Lock()
 			defer h.indexSyncMu.Unlock()
-			if recoveryErr := h.publishRecoveredIndex(topicName, partitionID, idx, view); recoveryErr != nil {
+			indexKey := topicName + ":" + strconv.Itoa(partitionID)
+			if !h.retireIndex(indexKey, idx, appendErr) {
+				return fmt.Errorf("stream_index_replaced retryable=true")
+			}
+			// The failed append has already invalidated this object. Detach it
+			// even while recovery is fenced so the next attempt can rebuild.
+			// Retirement only closes files; the checked boundary below still
+			// prevents a reset from erasing the previously committed history.
+			if _, boundaryErr := view.CheckedLastStableOffset(); boundaryErr != nil {
+				return fmt.Errorf("append_stream_failed reason=%q recovery_reason=%q", appendErr.Error(), boundaryErr.Error())
+			}
+			var recoveryErr error
+			idx, recoveryErr = h.getIndexWithView(topicName, partitionID, view)
+			if recoveryErr != nil {
 				return fmt.Errorf("append_stream_failed reason=%q recovery_reason=%q", appendErr.Error(), recoveryErr.Error())
 			}
-			if idx.GetVersion(key) != expectedVersion {
+			version, versionErr := idx.CheckedVersion(key)
+			if versionErr != nil {
+				return versionErr
+			}
+			if version != expectedVersion {
 				return fmt.Errorf("append_stream_failed reason=%q", appendErr.Error())
 			}
 			recoveredCommit = true
@@ -633,6 +670,10 @@ func (h *Handler) appendStream(cmd string, opts AppendOptions, controllerFenced 
 		committed := view.LastStableOffset()
 		indexKey := topicName + ":" + strconv.Itoa(partitionID)
 		h.mu.Lock()
+		if h.indexes[indexKey] != idx {
+			h.mu.Unlock()
+			return fmt.Errorf("stream_index_replaced retryable=true")
+		}
 		if h.indexedHWM[indexKey] < committed {
 			h.indexedHWM[indexKey] = committed
 		}
@@ -736,7 +777,10 @@ func (h *Handler) HandleReadStream(cmd string, conn net.Conn) {
 			actualFromVersion = snap.Version + 1
 		}
 
-		currentVersion := idx.GetVersion(key)
+		currentVersion, err := idx.CheckedVersion(key)
+		if err != nil {
+			return err
+		}
 		var entries []StreamIndexEntry
 		if paginated {
 			entries, err = idx.LookupRange(key, actualFromVersion, currentVersion, maxEvents+1)
@@ -895,7 +939,8 @@ func (h *Handler) SaveSnapshot(cmd string, afterSave func(result SnapshotResult)
 	if t == nil {
 		return nil, fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
-	if !t.IsEventSourcing {
+	definition := t.Definition()
+	if !definition.EventSourcing {
 		return nil, fmt.Sprintf("ERROR: event_sourcing_not_enabled topic=%s", topicName)
 	}
 
@@ -904,59 +949,69 @@ func (h *Handler) SaveSnapshot(cmd string, afterSave func(result SnapshotResult)
 		return nil, "ERROR: no_partitions_available"
 	}
 
-	result := SnapshotResult{Topic: topicName, Key: key, Version: version, Partition: partitionID, Payload: payload}
-	var generation uint64
-	validate := func(view *topic.PartitionReadView, save bool) error {
-		idx, err := h.getIndexWithView(topicName, partitionID, view)
-		if err != nil {
-			return err
-		}
-		currentVersion := idx.GetVersion(key)
-		if version > currentVersion {
-			return fmt.Errorf("snapshot_version_exceeds_stream version=%d current=%d", version, currentVersion)
-		}
-		ss, err := h.getSnapshotWithView(topicName, partitionID, view)
-		if err != nil {
-			return err
-		}
-		if save {
-			return ss.Save(key, version, payload)
-		}
-		return ss.ValidateSave(key, version, payload)
+	p, err := t.GetPartition(partitionID)
+	if err != nil {
+		return nil, "ERROR: " + err.Error()
 	}
-	err = h.withReadView(topicName, partitionID, func(view *topic.PartitionReadView) error {
-		generation = view.Generation()
-		return validate(view, false)
+	result := SnapshotResult{Topic: topicName, Key: key, Version: version, Partition: partitionID, Payload: payload, LifecycleEpoch: definition.LifecycleEpoch}
+	ctx := context.Background()
+	var visibility uint64
+	var generation disk.ContentGeneration
+	firstIndex, err := h.withSnapshotCandidate(ctx, p, result, false, func(cut *topic.SnapshotReadCut) error {
+		visibility, generation = cut.View().Generation(), cut.ContentGeneration()
+		return nil
 	})
 	if err != nil {
 		return nil, "ERROR: " + err.Error()
 	}
 	if afterSave != nil {
-		if err := afterSave(result); err != nil {
+		if err = afterSave(result); err != nil {
 			return nil, fmt.Sprintf("ERROR: snapshot_replicate_failed reason=%q", err.Error())
 		}
 	}
-	err = h.withReadView(topicName, partitionID, func(view *topic.PartitionReadView) error {
-		if generation != view.Generation() {
+	currentTopic := h.tm.GetTopic(topicName)
+	if currentTopic != t || currentTopic.Definition().LifecycleEpoch != definition.LifecycleEpoch {
+		h.retireIndex(snapshotCacheKey(topicName, partitionID), firstIndex, fmt.Errorf("snapshot generation changed"))
+		return nil, "ERROR: snapshot_generation_changed retryable=true"
+	}
+	currentPartition, err := currentTopic.GetPartition(partitionID)
+	if err != nil || currentPartition != p {
+		h.retireIndex(snapshotCacheKey(topicName, partitionID), firstIndex, fmt.Errorf("snapshot generation changed"))
+		return nil, "ERROR: snapshot_generation_changed retryable=true"
+	}
+	_, err = h.withSnapshotCandidate(ctx, p, result, true, func(cut *topic.SnapshotReadCut) error {
+		if visibility != cut.View().Generation() || generation != cut.ContentGeneration() {
+			h.retireIndex(snapshotCacheKey(topicName, partitionID), firstIndex, fmt.Errorf("snapshot generation changed"))
 			return fmt.Errorf("snapshot_generation_changed retryable=true")
 		}
-		return validate(view, true)
+		return nil
 	})
 	if err != nil {
 		return nil, "ERROR: " + err.Error()
 	}
+
 	return &result, ""
 
 }
 
 func (h *Handler) SaveSnapshotReplica(result SnapshotResult) string {
-	err := h.withReadView(result.Topic, result.Partition, func(view *topic.PartitionReadView) error {
-		ss, err := h.getSnapshotWithView(result.Topic, result.Partition, view)
-		if err != nil {
-			return err
-		}
-		return ss.Save(result.Key, result.Version, result.Payload)
-	})
+	t := h.tm.GetTopic(result.Topic)
+	if t == nil {
+		return "ERROR: topic_not_found"
+	}
+	definition := t.Definition()
+	if !definition.EventSourcing {
+		return "ERROR: event_sourcing_not_enabled"
+	}
+	if result.LifecycleEpoch != 0 && result.LifecycleEpoch != definition.LifecycleEpoch {
+		return "ERROR: snapshot_lifecycle_changed"
+	}
+	p, err := t.GetPartition(result.Partition)
+	if err != nil {
+		return "ERROR: " + err.Error()
+	}
+	ctx := context.Background()
+	_, err = h.withSnapshotCandidate(ctx, p, result, true, nil)
 	if err != nil {
 		return "ERROR: snapshot_save_failed reason=" + strconv.Quote(err.Error())
 	}
@@ -1116,17 +1171,15 @@ func (h *Handler) HandleStreamVersion(cmd string) string {
 // DeleteTopic closes cached stream indexes and snapshot stores for a deleted topic.
 func (h *Handler) DeleteTopic(topicName string) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	prefix := topicName + ":"
-	var firstErr error
+	indexes := make(map[string]*StreamIndex)
+	snapshots := make(map[string]*SnapshotStore)
 	for key, idx := range h.indexes {
 		if !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		if err := idx.Close(); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("close index %s: %w", key, err)
-		}
+		indexes[key] = idx
 		delete(h.indexes, key)
 		delete(h.indexedHWM, key)
 		delete(h.indexErrors, key)
@@ -1136,12 +1189,11 @@ func (h *Handler) DeleteTopic(topicName string) error {
 		if !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		if err := ss.Close(); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("close snapshot store %s: %w", key, err)
-		}
+		snapshots[key] = ss
 		delete(h.snapshots, key)
 	}
-	return firstErr
+	h.mu.Unlock()
+	return closeIndexStores(indexes, snapshots)
 }
 
 // Close closes all StreamIndex and SnapshotStore instances held by this handler.
@@ -1154,22 +1206,28 @@ func (h *Handler) Close() error {
 	h.wg.Wait()
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	indexes, snapshots := h.indexes, h.snapshots
+	h.indexes = nil
+	h.snapshots = nil
+	h.indexedHWM = nil
+	h.replicaIndexGenerations = nil
+	h.mu.Unlock()
+	return closeIndexStores(indexes, snapshots)
+}
 
+func closeIndexStores(indexes map[string]*StreamIndex, snapshots map[string]*SnapshotStore) error {
 	var firstErr error
-	for key, idx := range h.indexes {
+	for key, idx := range indexes {
 		if err := idx.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("close index %s: %w", key, err)
 		}
 	}
-	for key, ss := range h.snapshots {
+	for key, ss := range snapshots {
 		if err := ss.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("close snapshot store %s: %w", key, err)
 		}
 	}
 
-	h.indexes = nil
-	h.snapshots = nil
 	return firstErr
 }
 

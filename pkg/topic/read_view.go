@@ -11,6 +11,7 @@ import (
 // Acquire this view BEFORE event-source cache/index locks. Never call public
 // Partition read wrappers from inside a view; they acquire a new read lock.
 type PartitionReadView struct {
+	snapshotCut         *SnapshotReadCut
 	replicaIndexWitness *ReplicaRequestWitness
 	p                   *Partition
 	active              bool
@@ -65,7 +66,7 @@ func (v *PartitionReadView) validateBootstrap(name string, partition int, lifecy
 	if err := v.ValidateIdentity(name, partition); err != nil {
 		return err
 	}
-	if !v.offline || v.replicaIndexWitness != nil || v.p.BootstrapPending() != pending {
+	if v.snapshotCut != nil || !v.offline || v.replicaIndexWitness != nil || v.p.BootstrapPending() != pending {
 		return fmt.Errorf("bootstrap operation requires its exclusive callback view")
 	}
 	v.p.recoveryMu.RLock()
@@ -86,11 +87,17 @@ func (v *PartitionReadView) FirstOffset() uint64 {
 	if v.check() != nil {
 		return 0
 	}
+	if v.snapshotCut != nil {
+		return v.snapshotCut.anchor
+	}
 	return v.p.firstOffset()
 }
 func (v *PartitionReadView) CommittedEnd() uint64 {
 	if v.check() != nil {
 		return 0
+	}
+	if v.snapshotCut != nil {
+		return v.snapshotCut.end
 	}
 	if v.offline {
 		return v.end
@@ -100,6 +107,9 @@ func (v *PartitionReadView) CommittedEnd() uint64 {
 func (v *PartitionReadView) LastStableOffset() uint64 {
 	if v.check() != nil {
 		return 0
+	}
+	if v.snapshotCut != nil {
+		return v.snapshotCut.stable
 	}
 	if !v.offline {
 		offset, _ := v.p.lastStableOffset(false)
@@ -116,7 +126,7 @@ func (v *PartitionReadView) CheckedLastStableOffset() (uint64, error) {
 	if err := v.check(); err != nil {
 		return 0, err
 	}
-	if v.offline {
+	if v.offline || v.snapshotCut != nil {
 		return v.LastStableOffset(), nil
 	}
 	return v.p.lastStableOffset(true)
@@ -124,6 +134,10 @@ func (v *PartitionReadView) CheckedLastStableOffset() (uint64, error) {
 func (v *PartitionReadView) ReadMessages(offset uint64, max int) ([]types.Message, error) {
 	if err := v.check(); err != nil {
 		return nil, err
+	}
+	if v.snapshotCut != nil {
+		page, err := v.snapshotCut.ReadRawPage(v.snapshotCut.ctx, offset, max, 0, true)
+		return page.Messages, err
 	}
 	records, err := v.p.readMessages(offset, max)
 	if v.offline {
@@ -139,6 +153,10 @@ func (v *PartitionReadView) ReadMessagesBounded(offset uint64, max, maxBytes int
 	if err := v.check(); err != nil {
 		return nil, 0, err
 	}
+	if v.snapshotCut != nil {
+		page, err := v.snapshotCut.ReadRawPage(v.snapshotCut.ctx, offset, max, maxBytes, oversized)
+		return page.Messages, page.DecodedBytes, err
+	}
 	records, n, err := v.p.readMessagesBounded(offset, max, maxBytes, oversized)
 	if v.offline {
 		for i, m := range records {
@@ -153,6 +171,9 @@ func (v *PartitionReadView) ReadCommittedPage(offset uint64, max, maxBytes int, 
 	if err := v.check(); err != nil {
 		return nil, 0, offset, err
 	}
+	if v.snapshotCut != nil {
+		return v.snapshotCut.ReadVisiblePage(v.snapshotCut.ctx, offset, max, maxBytes, oversized)
+	}
 	if !v.offline {
 		return v.p.readCommittedPage(offset, max, maxBytes, oversized)
 	}
@@ -164,6 +185,10 @@ func (v *PartitionReadView) ReadCommittedPage(offset uint64, max, maxBytes int, 
 func (v *PartitionReadView) ReadCommittedRange(offset, end uint64, max int) ([]types.Message, error) {
 	if err := v.check(); err != nil {
 		return nil, err
+	}
+	if v.snapshotCut != nil {
+		messages, _, _, err := v.snapshotCut.readVisiblePageThrough(v.snapshotCut.ctx, offset, min(end, v.snapshotCut.stable), max, 0, true)
+		return messages, err
 	}
 	if !v.offline {
 		return v.p.readCommittedRange(offset, end, max)
@@ -187,6 +212,9 @@ func (v *PartitionReadView) ReadCommittedMetadata(offset uint64, max int) ([]typ
 func (v *PartitionReadView) ReadCommittedMetadataThrough(offset, end uint64, max int) ([]types.Message, error) {
 	if err := v.check(); err != nil {
 		return nil, err
+	}
+	if v.snapshotCut != nil {
+		return nil, fmt.Errorf("snapshot cut views do not support committed metadata scans")
 	}
 	if !v.offline {
 		if err := v.p.RecoveryError(); err != nil {
@@ -213,6 +241,9 @@ func (v *PartitionReadView) ReadCommittedMetadataThrough(offset, end uint64, max
 func (v *PartitionReadView) OffsetRange() (PartitionOffsetRange, error) {
 	if err := v.check(); err != nil {
 		return PartitionOffsetRange{}, err
+	}
+	if v.snapshotCut != nil {
+		return PartitionOffsetRange{Earliest: v.snapshotCut.anchor, Latest: v.snapshotCut.end, LEO: v.snapshotCut.end, HWM: v.snapshotCut.end}, nil
 	}
 	if v.offline {
 		return PartitionOffsetRange{Earliest: v.FirstOffset(), Latest: v.end, LEO: v.end, HWM: v.end}, nil

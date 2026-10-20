@@ -28,7 +28,7 @@ func localRecoveryRequest(t *testing.T, state *fsm.BrokerFSM, broker, name strin
 	return fsm.ReplicaCatchupRequest{}
 }
 
-func receiverWitnessFixture(t *testing.T, count, end, protocol int, event bool) (*CommandHandler, *fsm.BrokerFSM, *topic.Partition, *disk.DiskHandler) {
+func receiverWitnessFixture(t *testing.T, count, end, protocol int, event bool, wrappers ...func(*disk.DiskManager) topic.HandlerProvider) (*CommandHandler, *fsm.BrokerFSM, *topic.Partition, *disk.DiskHandler) {
 	t.Helper()
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
@@ -36,7 +36,11 @@ func receiverWitnessFixture(t *testing.T, count, end, protocol int, event bool) 
 	cfg.DiskMinFreeBytes = 1
 	cfg.DiskMinFreePercent = 0.1
 	dm := disk.NewDiskManager(cfg)
-	tm := topic.NewTopicManager(cfg, dm, nil)
+	var provider topic.HandlerProvider = dm
+	if len(wrappers) > 0 {
+		provider = wrappers[0](dm)
+	}
+	tm := topic.NewTopicManager(cfg, provider, nil)
 	state := fsm.NewBrokerFSM(tm, nil)
 	for _, id := range []string{"source", "receiver"} {
 		data, err := json.Marshal(fsm.BrokerInfo{ID: id, Addr: id + ":9001", Status: "active", RecoveryProtocol: protocol})
@@ -162,7 +166,7 @@ func TestReceiverWitnessSchedulerUsesActualApplyAndRechecksAfterSnapshotWork(t *
 			h.Cluster.SetReplicaCatchupProofSubmitter(func(context.Context, fsm.ISRCatchupProof) error { submitted++; return nil })
 
 			if event {
-				h.Cluster.SetReplicaSnapshotCatchup(func(context.Context, fsm.ReplicaCatchupRequest) error {
+				h.Cluster.SetReplicaSnapshotCatchup(func(context.Context, fsm.ReplicaCatchupRequest, *topic.ReplicaCatchupWitness) error {
 					_, err := d.AppendMessageSync("orders", 0, &types.Message{Payload: "temporary rewritten tail"})
 					require.NoError(t, err)
 					require.NoError(t, d.TruncateTo(0))

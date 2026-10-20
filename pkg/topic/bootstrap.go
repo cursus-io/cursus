@@ -352,9 +352,23 @@ func (p *Partition) StageBootstrap(m disk.BootstrapMetadata) (*disk.BootstrapRec
 type BootstrapSource struct {
 	view *PartitionReadView
 	disk *disk.DiskHandler
+	cut  *SnapshotReadCut
 }
 
 func (s *BootstrapSource) View() *PartitionReadView { return s.view }
+
+// SnapshotReadCut exposes the fixed certification bounds without changing the
+// legacy source view's metadata scanning semantics.
+func (s *BootstrapSource) SnapshotReadCut() (*SnapshotReadCut, error) {
+	if s == nil || s.cut == nil {
+		return nil, fmt.Errorf("bootstrap source has no snapshot cut")
+	}
+	if err := s.cut.check(context.Background()); err != nil {
+		return nil, err
+	}
+	return s.cut, nil
+}
+
 func (s *BootstrapSource) Export(ctx context.Context, fence disk.BootstrapFence, catalog []byte) (*disk.BootstrapExport, error) {
 	if err := s.view.check(); err != nil {
 		return nil, err
@@ -362,7 +376,17 @@ func (s *BootstrapSource) Export(ctx context.Context, fence disk.BootstrapFence,
 	if fence.CommittedHWM != s.view.end {
 		return nil, fmt.Errorf("bootstrap source HWM mismatch")
 	}
-	return s.disk.ExportBootstrapContext(ctx, s.view.FirstOffset(), s.view.end, fence, catalog)
+	if err := s.cut.ValidateRaw(ctx); err != nil {
+		return nil, err
+	}
+	export, err := s.disk.ExportBootstrapContext(ctx, s.cut.anchor, s.cut.end, fence, catalog)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.cut.ValidateRaw(ctx); err != nil {
+		return nil, errors.Join(err, export.Close())
+	}
+	return export, nil
 }
 func (p *Partition) WithBootstrapSource(fn func(*BootstrapSource) error) error {
 	d, ok := p.dh.(*disk.DiskHandler)
@@ -373,14 +397,11 @@ func (p *Partition) WithBootstrapSource(fn func(*BootstrapSource) error) error {
 	defer p.reconcileMu.Unlock()
 	p.visibilityMu.Lock()
 	defer p.visibilityMu.Unlock()
-	if err := p.RecoveryError(); err != nil {
-		return err
-	}
-	if err := p.hwmReadinessError(); err != nil {
-		return err
-	}
-	end := min(p.GetHWM(), d.GetFlushedOffset())
-	return p.withReadViewLocked(true, end, func(v *PartitionReadView) error { return fn(&BootstrapSource{view: v, disk: d}) })
+	return p.withSnapshotCutLocked(context.Background(), snapshotCutBootstrapSource, nil, func(cut *SnapshotReadCut) error {
+		return p.withReadViewLocked(true, cut.end, func(v *PartitionReadView) error {
+			return fn(&BootstrapSource{view: v, disk: d, cut: cut})
+		})
+	})
 }
 
 func (p *Partition) setProducerRecoveryError(err error) {
