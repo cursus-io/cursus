@@ -868,7 +868,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	var groupState map[string]*coordinator.GroupStateSnapshot
 	var consumerRecovery *coordinator.ConsumerRecoveryEnvelope
 	if f.cd != nil {
-		groupState, consumerRecovery, err = f.cd.ExportStateWithRecovery()
+		groupState, consumerRecovery, err = f.cd.TryExportStateWithRecovery()
 		if err != nil {
 			return nil, fmt.Errorf("snapshot consumer recovery: %w", err)
 		}

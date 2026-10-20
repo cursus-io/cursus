@@ -977,7 +977,18 @@ func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 }
 
 func (c *Coordinator) exportState(onlyGroup *string) map[string]*GroupStateSnapshot {
-	c.mu.RLock()
+	state, _ := c.exportStateWithLockMode(onlyGroup, false)
+	return state
+}
+
+func (c *Coordinator) exportStateWithLockMode(onlyGroup *string, nonblocking bool) (map[string]*GroupStateSnapshot, error) {
+	if nonblocking {
+		if !c.mu.TryRLock() {
+			return nil, ErrConsumerSnapshotBusy
+		}
+	} else {
+		c.mu.RLock()
+	}
 	defer c.mu.RUnlock()
 
 	groups, epochs := c.groups, c.groupEpochs
@@ -993,7 +1004,13 @@ func (c *Coordinator) exportState(onlyGroup *string) map[string]*GroupStateSnaps
 	}
 	result := make(map[string]*GroupStateSnapshot, len(epochs))
 	for name, group := range groups {
-		group.mu.RLock()
+		if nonblocking {
+			if !group.mu.TryRLock() {
+				return nil, ErrConsumerSnapshotBusy
+			}
+		} else {
+			group.mu.RLock()
+		}
 		snap := &GroupStateSnapshot{
 			TopicName:            group.TopicName,
 			Topics:               append([]string(nil), group.Topics...),
@@ -1040,7 +1057,7 @@ func (c *Coordinator) exportState(onlyGroup *string) map[string]*GroupStateSnaps
 			Deleted:           true,
 		}
 	}
-	return result
+	return result, nil
 }
 
 // ImportState restores consumer group state from a current-version snapshot.

@@ -1,0 +1,16 @@
+services:
+  broker-1:
+    image: cursus-cleanup-recovery:local
+    environment:
+      LOG_DIR: /app/cluster-logs
+      RAFT_SNAPSHOT_INTERVAL_MS: "1000"
+  broker-2:
+    image: cursus-cleanup-recovery:local
+    environment:
+      LOG_DIR: /app/cluster-logs
+      RAFT_SNAPSHOT_INTERVAL_MS: "1000"
+  broker-3:
+    image: cursus-cleanup-recovery:local
+    environment:
+      LOG_DIR: /app/cluster-logs
+      RAFT_SNAPSHOT_INTERVAL_MS: "1000"

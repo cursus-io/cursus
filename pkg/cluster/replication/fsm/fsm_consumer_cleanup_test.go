@@ -1,10 +1,13 @@
 package fsm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
@@ -14,6 +17,53 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBrokerFSMSnapshotDoesNotWaitForConsumerOffsetWriter(t *testing.T) {
+	c := authorityCoordinator(t)
+	c.SetRoutedOffsetRecordWriter(func(record coordinator.ConsumerMetadataRecord) error {
+		c.RecordConsumerMetadataSource(record.Group, 0)
+		return nil
+	})
+	require.NoError(t, c.RegisterGroup("orders", "workers", 1))
+	entered, finish := make(chan struct{}), make(chan struct{})
+	c.SetRoutedOffsetRecordWriter(func(record coordinator.ConsumerMetadataRecord) error {
+		c.RecordConsumerMetadataSource(record.Group, 0)
+		close(entered)
+		<-finish // Model a durable append awaiting the same Raft FSM goroutine.
+		return nil
+	})
+	committed := make(chan error, 1)
+	go func() { committed <- c.CommitOffset("workers", "orders", 0, 7) }()
+	<-entered
+	f := NewBrokerFSM(nil, c)
+	snapshotDone := make(chan error, 1)
+	go func() {
+		snapshot, err := f.Snapshot()
+		if snapshot != nil {
+			snapshot.Release()
+		}
+		snapshotDone <- err
+	}()
+	blocked := false
+	select {
+	case err := <-snapshotDone:
+		if !errors.Is(err, coordinator.ErrConsumerSnapshotBusy) {
+			t.Errorf("snapshot must refuse an in-flight writer: %v", err)
+		}
+	case <-time.After(time.Second):
+		blocked = true
+		t.Error("snapshot blocked the Raft loop while an offset write awaited it")
+	}
+	close(finish)
+	require.NoError(t, <-committed)
+	if blocked {
+		<-snapshotDone
+	}
+	raw := persistAuthorityFSM(t, f)
+	restored := authorityCoordinator(t)
+	require.NoError(t, NewBrokerFSM(nil, restored).Restore(io.NopCloser(bytes.NewReader(raw))))
+	require.Equal(t, uint64(7), restored.ExportState()["workers"].Offsets["orders"][0])
+}
 
 // These existing FSM tests model an owning coordinator with an acknowledged
 // writer. Their MockStorageHandler intentionally does not retain record bodies.
@@ -27,6 +77,28 @@ func configureLifecycleCleanupOwner(t *testing.T, manager *topic.TopicManager, c
 	c.SetOffsetRecordWriter(func(coordinator.ConsumerMetadataRecord) error { return nil })
 }
 
+type cleanupStartupReader struct{ *topic.TopicManager }
+
+func (r cleanupStartupReader) EndTopicOffset(name string, partition int) (uint64, error) {
+	p, err := r.GetTopic(name).GetPartition(partition)
+	if err != nil {
+		return 0, err
+	}
+	return p.GetHWM(), nil
+}
+
+// No writers or replication run during fixture startup, so the manager's
+// committed bounds remain fixed throughout this exclusive recovery.
+func recoverCleanupCoordinator(t *testing.T, manager *topic.TopicManager, c *coordinator.Coordinator) {
+	t.Helper()
+	release, err := c.BeginConsumerMetadataRecovery(context.Background())
+	require.NoError(t, err)
+	defer release()
+	prepared, err := c.PrepareFullConsumerMetadataReplay(cleanupStartupReader{manager})
+	require.NoError(t, err)
+	require.NoError(t, c.ApplyFullConsumerMetadataReplayAndComplete(prepared))
+}
+
 func TestBrokerFSMOwnerCleanupNeverAppendsDuringRaftApply(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
@@ -36,6 +108,7 @@ func TestBrokerFSMOwnerCleanupNeverAppendsDuringRaftApply(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { c.Stop(); manager.Stop() })
 	configureLifecycleCleanupOwner(t, manager, c)
+	recoverCleanupCoordinator(t, manager, c)
 	f := NewBrokerFSM(manager, c)
 	registerLifecycleBroker(t, f, "broker-1", TopicLifecycleProtocolVersion)
 	create, err := json.Marshal(testTopicCommand("orders", 1, 1))
@@ -73,6 +146,7 @@ func TestBrokerFSMFollowerCleanupRequiresCommittedTombstone(t *testing.T) {
 			for _, p := range manager.GetTopic(config.ConsumerOffsetsTopicName).Partitions {
 				require.NoError(t, p.ReconcileCommittedHWM(0))
 			}
+			recoverCleanupCoordinator(t, manager, c)
 			f := NewBrokerFSM(manager, c)
 			registerLifecycleBroker(t, f, "broker-1", TopicLifecycleProtocolVersion)
 			create, err := json.Marshal(testTopicCommand("orders", 1, 1))

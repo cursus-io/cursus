@@ -131,6 +131,30 @@ jobs:
         working-directory: test/e2e-cluster
         run: docker compose -p cursus-cleanup-e2e -f docker-compose.yml -f docker-compose.consumer-cleanup.yml down -v --remove-orphans
 
+  consumer-cleanup-fault-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.2'
+          cache: false
+      - name: Run cleanup coordinator failover and snapshot recovery
+        env:
+          RUN_E2E_CLEANUP_RECOVERY: "1"
+        run: go test -v -count=1 -timeout 25m ./test/e2e-cluster -run '^TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot$'
+      - name: Show cleanup recovery cluster logs
+        if: failure()
+        working-directory: test/e2e-cluster
+        run: docker compose -p cursus-cleanup-e2e -f docker-compose.yml -f docker-compose.snapshot.yml -f docker-compose.consumer-cleanup.yml -f docker-compose.consumer-cleanup-recovery.yml logs --no-color --tail 300
+      - name: Clean cleanup recovery cluster
+        if: always()
+        working-directory: test/e2e-cluster
+        run: docker compose -p cursus-cleanup-e2e -f docker-compose.yml -f docker-compose.snapshot.yml -f docker-compose.consumer-cleanup.yml -f docker-compose.consumer-cleanup-recovery.yml down -v --remove-orphans
+
   raft-snapshot-restore:
     runs-on: ubuntu-latest
     timeout-minutes: 30
