@@ -2,6 +2,7 @@ package disk
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -217,6 +218,10 @@ func shouldRemoveCompactionRecord(message types.DiskMessage, latestKeyOffset, la
 }
 
 func scanCompactionSegment(path string, expectedBase uint64, includeRaw, allowOffsetGaps bool, visit func(compactionFrame) error) error {
+	return scanCompactionSegmentContext(context.Background(), path, expectedBase, includeRaw, allowOffsetGaps, visit)
+}
+
+func scanCompactionSegmentContext(ctx context.Context, path string, expectedBase uint64, includeRaw, allowOffsetGaps bool, visit func(compactionFrame) error) error {
 	// #nosec G304 -- path is generated from the broker-owned log directory and a numeric segment ID.
 	file, err := os.Open(path)
 	if err != nil {
@@ -224,11 +229,14 @@ func scanCompactionSegment(path string, expectedBase uint64, includeRaw, allowOf
 	}
 	defer func() { _ = file.Close() }()
 
-	reader := bufio.NewReader(file)
+	reader := bufio.NewReader(&bootstrapContextReader{context: ctx, reader: file})
 	var position uint64
 	var previousOffset uint64
 	havePrevious := false
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var lengthBytes [4]byte
 		_, err := io.ReadFull(reader, lengthBytes[:])
 		if errors.Is(err, io.EOF) {
@@ -242,9 +250,15 @@ func scanCompactionSegment(path string, expectedBase uint64, includeRaw, allowOf
 		if length == 0 || length > MaxMessageSize {
 			return fmt.Errorf("invalid record length %d at byte %d", length, position)
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(reader, payload); err != nil {
 			return fmt.Errorf("read record payload at byte %d: %w", position, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		message, err := util.DeserializeDiskMessage(payload)
 		if err != nil {

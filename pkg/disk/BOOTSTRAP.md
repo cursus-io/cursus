@@ -3,7 +3,7 @@
 `DiskHandler.SetBootstrapLimits(BootstrapLimits{MaxTransferBytes: ..., MaxTotalBytes: ...})`
 sets positive byte limits for new exports and receives. `BootstrapLimits()` returns
 the effective settings. Defaults are 8 GiB per transfer and 32 GiB across active
-process-wide reservations, so a normal 1 GiB segment fits. Receiving reserves
+process-wide reservations, including adopted cache bytes, so a normal 1 GiB segment fits. Receiving reserves
 space for the incoming records/catalog and locally generated indexes. Existing
 filesystem headroom checks still apply independently.
 
@@ -22,8 +22,9 @@ This separation is required for recovery after an operator lowers limits.
 
 Records are streamed in at most 256 KiB chunks and canonicalized one record at a
 time. Raising byte limits does not allocate a transfer-sized memory buffer. The
-catalog remains capped at 16 MiB; eight active transfers and a five-minute transfer
-TTL remain fixed. Limit failures return `BootstrapLimitError` with resource,
+catalog remains capped at 16 MiB; eight active transfers and the generic export/receive
+five-minute TTL remain fixed. Private paged exports use caller-owned lifetimes as
+described below. Limit failures return `BootstrapLimitError` with resource,
 requested bytes/count, and limit; they never trigger reset or truncation.
 
 Network source capture should call `ExportBootstrapContext(ctx, start, end,
@@ -35,6 +36,51 @@ are synchronous. Cancellation is checked after lock acquisition and flushing, so
 this bounds ongoing copy/hash work rather than guaranteeing a strict lock-wait
 deadline.
 
+## Private paged metadata export
+
+`ExportRetainedBootstrapContext(ctx, expected, expectedAnchor, start, end, fence)`
+prepares a canonical records file and empty catalog without copying the entire
+range under storage or partition locks. Capture the original local content token
+before reading the retained anchor or fixed logical bounds. The retained anchor
+is independent of a suffix start; the fixed end cannot exceed the fence's committed
+HWM. The caller must hold no storage/partition locks and must establish a bounded
+creating owner with a finite lifetime and cancellation before calling. Success
+transfers `Close` responsibility to that owner. This path starts no TTL and returns
+only a private prepared handle; a future registry must check the original token
+again at publication and establish the ready-state TTL. Production networking,
+registry ownership, and recovery capability negotiation are not wired to this API.
+
+Admission retries one cleanup, checks headroom, and acquires the shared active
+slot before the first page. Pages request at most 1 MiB of serialized payload and
+1,024 records. A first oversized record retries alone with a 64 MiB limit. Every
+page checks the original generation and contributes its range-local marked-gap
+authority; an empty range still reads one page for availability and bounds checks.
+Appends and normal rolls may proceed while the fixed export is built. Destructive
+changes reject it, including truncate-and-restore ABA. After file syncs, checksums,
+and directory sync, the original generation and anchor are checked once more.
+
+All disk fields survive canonicalization, including legacy defaults, aborted
+records, and transaction controls. Exact canonical bytes plus four-byte headers
+are reserved before writes, with filesystem headroom probes outside the global
+accounting mutex. Serialization, export-file writes, checksums, and syncs hold no
+storage locks. Context checks occur between records and 256 KiB checksum reads;
+an individual filesystem operation is still non-preemptible. Failed copies return
+no handle, and failed deletion retains the active slot and complete byte charge
+in the existing cleanup queue.
+
+`RetainedWork()` reports this successful export's page attempts, actual canonical
+write bytes including headers, and checksum read bytes.
+`RetainedBootstrapWorkSnapshot()` preserves these counters across all completed
+attempts, including partial writes, failed checksums, and cancellation; concurrent
+exports contribute to its deltas. The accounting lock never covers file I/O.
+Source physical bytes, decoded frames, and segment transitions remain visible through the cumulative
+handler-wide `RetainedPageWorkSnapshot`; concurrent readers contribute to its
+deltas. Warm suffix export reuses validated checkpoints. Cold seeks and checkpoint
+eviction can scan prior segment bytes again. Tests compare that source work with
+canonical write/hash costs, and cover mixed marked/unmarked cache extensions,
+admission before reading/writing, cancellation, failed I/O and cleanup debt, and
+append progress during blocked export I/O.
+
 ## Transient ownership and failed cleanup
 
 Before durable intent, each transfer owns one active-transfer token and a separate
@@ -43,7 +89,8 @@ estimate and any growth reserved before a write; it is not a measurement of live
 file lengths. A failed or partial deletion retains the entire reservation and the
 active token until deletion succeeds. Closing retires the handle immediately, so
 reads, writes, and installation cannot reuse partially removed staging. Repeated
-close/abort calls retry cleanup.
+close/abort calls retry cleanup. Detached cache adoption transfers ownership to a
+separate bounded generation slot, as described below.
 
 Failed cleanup owners remain reachable in a process-wide deduplicated queue.
 The eight-active-transfer limit also bounds this queue, including zero-byte
@@ -70,3 +117,136 @@ zero-byte saturation and recovery, busy-lock admission, constructor failure,
 unchanged growth/overflow limits, and durable handoff with lower-limit restart
 and preserved catalog bytes. Accounting checks compare active tokens and reserved
 bytes before and after each operation; partial deletion must not reduce charges.
+
+## Detached canonical staging
+
+`NewDetachedBootstrapRoot(dir, limits, minFreeBytes, minFreePercent, maxAdoptedStores)` opens a
+private ephemeral root with its own `.cursus.lock`. A future caller can place it
+under the broker log directory, for example `.recovery-metadata`. The root has no
+partition handler or worker. Startup removes only directories named
+`.detached.bootstrap-<32 lowercase hexadecimal digits>`; unknown names and
+partition bootstrap pending/completed files are preserved. Invalid recognized
+entries or failed orphan deletion fail opening the root.
+
+`root.Stage(topic, partition, metadata)` checks identity and the stable bootstrap
+format, requires a zero-size catalog with the SHA-256 of empty bytes, and reserves
+incoming bytes plus the full sparse-index upper bound before creating files.
+It uses the same process-wide active-transfer and byte limits and the same
+filesystem headroom guard as bootstrap transfers. A private child identity is
+registered before filesystem creation, so closing the root cannot miss work in
+progress. Chunk writes accept exact duplicates and reject holes, conflicting
+bytes, overlapping extensions, and out-of-bounds requests.
+
+`stage.Prepare(ctx)` verifies completeness, regular files, checksums, canonical
+record identity/order, fixed logical bounds, and gap authority, then syncs the
+files and builds the on-disk sparse index. Durable installation and
+preparation share these checks. Preparation alone creates no live partition
+files, tail index, compaction marker, pending manifest, or HWM. An empty detached
+index uses zero bytes; durable installation retains its live-index preallocation.
+Preparation checks cancellation between checksum chunks and before frame reads
+and decoding; individual filesystem operations remain synchronous.
+
+Preparation moves the same child and reservation to `DetachedRawStore` and stops
+its transfer TTL. A callback that was already running must observe the ownership
+transition under the transfer mutex. Old stage abort, write, and prepare handles
+cannot delete or mutate the prepared store. A prepared store retains its
+active-transfer token until deletion or successful cache adoption.
+
+`root.Adopt(prepared)` registers a bounded cache-generation slot before releasing
+the active-transfer token. It moves the same child, files, and byte owner without
+copying or releasing bytes. Failed adoption leaves the prepared owner intact.
+Stale stage/prepared handles cannot acquire or delete an adopted generation;
+existing prepared leases remain valid. The caller derives `maxAdoptedStores` from
+its bounded partition vector plus an allowance for retired generations, rather
+than from the eight-active-transfer limit. Pinned, retired, zero-byte, and
+failed-cleanup generations all occupy their slot until actual deletion. A topic
+visibility adapter is available; production provider integration is not yet wired.
+
+`store.Acquire()` opens a `DetachedRawLease` with its own records/index handles,
+fixed logical start/end, fixed raw byte length, and fixed index extent. Acquisition
+performs no content scan. `lease.ReadRaw(ctx, start, maxRecords, maxBytes)` returns
+all canonical `DiskMessage` fields, including transaction and control data, plus
+`NextOffset`, `Exhausted`, and payload `DecodedBytes`. Page limits count payload
+bytes, excluding four-byte frame headers. A first record exceeding the byte limit
+returns `ErrRetainedPageLimit`; a later omitted frame may be decoded once and
+retained for the next call. Every frame allocation is bounded by `MaxMessageSize`.
+Errors and cancellation return no partial page.
+
+Sequential pages reuse the lease cursor. Non-contiguous requests binary-search
+16-byte on-disk index entries and decode only from the preceding sparse anchor.
+Logical holes advance toward the fixed end without filtering physical records.
+`lease.Work()` reports cumulative actual raw read bytes, index read bytes, and
+decoded records, separately from the conservative staging-byte reservation.
+Immutable published prefixes assume no out-of-band file mutation; this is not a tampering
+proof.
+
+An adopted store exposes `Bounds()`, `Acquire()`, `AppendPrepared(ctx, expected,
+suffix)`, and `Close()`. Bounds and acquisition do not hash, scan, or rebuild
+indexes. Append requires an exclusively prepared suffix in the same root with
+the same topic and partition, adjacent increasing logical
+bounds, and a match against the entire expected published extent. The upper layer
+must certify source continuity and fences; disk does not equate transfer IDs or
+claim membership authority. The incoming manifest and its SHA-256 descriptors
+remain immutable evidence of the original transfer, separate from grown extents.
+The `Compacted` flag belongs to each original range's gap validation. Prepared
+marked and unmarked ranges may be adjacent in either order, including a fully
+compacted empty extension. Preparation still rejects actual gaps in an unmarked
+range; append never changes or ORs flags into the original manifest.
+
+Append reserves destination growth while both the old destination and the complete
+suffix remain charged. It copies only suffix records and adjusted suffix index
+entries, adding a boundary anchor when needed to keep repeated small appends
+searchable. Initial reservation slack does not grow on each append. After both
+files sync, one publication advances the logical end and raw/index extents. Old
+leases retain fixed bounds and see only their original prefix; a new lease sees
+the complete extended range. A fully compacted logical extension with no raw
+bytes is valid. `DetachedAppendWork` reports source `RawReadBytes` and
+`IndexReadBytes`, and destination `RawBytes` and `IndexBytes` actually written,
+including partial work on failure. No old prefix is copied, hashed, or indexed.
+
+Validation, open, and reservation failures leave the suffix caller-owned. Once
+copying starts, append consumes and retires it on every outcome. A prepublication
+write, sync, cancellation, or root-close failure attempts both file truncations
+and both syncs before releasing growth charges. Failed rollback retains the peak
+charge and blocks further append until a next-append repair succeeds. Old-prefix
+reads and acquisition still work with the unchanged published extent. A nil
+append error means publication committed: `CleanupError` separately reports
+suffix deletion failure and must not cause append replay. The failed suffix
+retains its active slot and bytes in the existing bounded cleanup queue.
+
+Store close retires new leases while existing leases remain readable. Root close
+retires new work, skips busy child locks, and returns
+`ErrDetachedBootstrapPending` while work, pins, or failed cleanup remain. Closing
+is repeatable; individual deletion operations can still block. The nested kernel
+lock remains held until an explicit root-close retry observes every child
+physically removed. A nonadopted owner's failed cleanup enters the existing
+bounded process-wide queue only after the last lease closes. Adopted failed
+cleanup stays in the root registry and never enters that active-token queue.
+Stage and adoption each attempt at most one eligible retired cache cleanup in
+round-robin order, skipping busy children; explicit root close retries all
+available children. Successful cleanup removes the root's child and cache-slot
+bookkeeping. Filesystem work runs outside root, queue, and budget mutexes,
+including append headroom probes. Physical bytes and the applicable active or
+cache slot remain charged until deletion succeeds.
+
+Regression coverage includes shared install/preparation rejection cases,
+field-preserving sparse pages, actual read/decode costs, cancellation, a running
+TTL callback during ownership transfer, creation/preparation versus root close,
+lease survival after retirement, cleanup failure and admission retry, recognized
+startup cleanup, and partial handle-open failure. Adoption/append coverage adds
+more than eight retained generations, zero-byte and pinned slot saturation,
+deterministic cleanup rotation, atomic extent changes, old lease visibility,
+suffix-only read/write costs, bounded seeks after repeated small appends,
+aggregate peak admission, prepublication rollback, retained tail debt with retry,
+committed suffix cleanup failure, identity/CAS rejection, and ownership races.
+
+`topic.DetachedMetadataStore` filters committed metadata using the current receiver
+resolver supplied on each read. Marker history respects each lease's fixed end;
+append scans only the prepared suffix. All adapters must share one
+`DetachedMetadataBudget`, which bounds retained keys, ID bytes, marker backing
+capacities (including replacement peaks), and concurrent decode scratch. Visible
+pages contain at most 1 MiB of serialized payloads or 1024 records; a first
+oversized record up to 64 MiB is returned alone. Store and budget work counters
+include actual failed attempts and retries, including failed constructor scans
+in the budget totals. After retirement, the last lease releases history charges
+even when physical cleanup reports an error.

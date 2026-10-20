@@ -1366,6 +1366,11 @@ func transactionDecisionMatchesMarker(key transactionMarkerKey, marker transacti
 }
 
 func isReadCommittedVisible(msg types.Message, hwm uint64, markers map[transactionMarkerKey]transactionMarkerInfo, resolver TransactionDecisionResolver) bool {
+	marker, ok := markers[messageTransactionMarkerKey(msg)]
+	return isReadCommittedVisibleWithMarker(msg, hwm, marker, ok, resolver)
+}
+
+func isReadCommittedVisibleWithMarker(msg types.Message, hwm uint64, marker transactionMarkerInfo, ok bool, resolver TransactionDecisionResolver) bool {
 	if msg.TransactionMarker != types.TransactionMarkerNone {
 		return false
 	}
@@ -1376,7 +1381,6 @@ func isReadCommittedVisible(msg types.Message, hwm uint64, markers map[transacti
 		return false
 	}
 	key := messageTransactionMarkerKey(msg)
-	marker, ok := markers[key]
 	return ok && marker.offset < hwm && marker.offset > msg.Offset && marker.marker == types.TransactionMarkerCommit &&
 		transactionDecisionMatchesMarker(key, marker, resolver)
 }

@@ -130,6 +130,7 @@ type BootstrapMetadata struct {
 }
 
 type bootstrapTransfer struct {
+	detached        *detachedBootstrapChild
 	mu              sync.Mutex
 	dir             string
 	metadata        BootstrapMetadata
@@ -144,7 +145,10 @@ type bootstrapTransfer struct {
 	received        map[string]int64
 }
 
-type BootstrapExport struct{ transfer *bootstrapTransfer }
+type BootstrapExport struct {
+	transfer     *bootstrapTransfer
+	retainedWork RetainedBootstrapWork
+}
 type BootstrapReceiver struct {
 	transfer *bootstrapTransfer
 	handler  *DiskHandler
@@ -176,37 +180,45 @@ func newBootstrapTransfer(base string, metadata BootstrapMetadata, size int64, l
 // Callers with filesystem headroom checks retry cleanup before checking capacity.
 // This helper admits without a second cleanup attempt for the same request.
 func newBootstrapTransferAfterCleanup(base string, metadata BootstrapMetadata, size int64, limits BootstrapLimits) (*bootstrapTransfer, error) {
-	if err := validateBootstrapLimits(limits); err != nil {
+	t := &bootstrapTransfer{}
+	if err := initializeBootstrapTransfer(t, base, metadata, size, limits); err != nil {
 		return nil, err
 	}
+	return t, nil
+}
+
+// initializeBootstrapTransfer runs before publication, or with the caller's child mutex held.
+func initializeBootstrapTransfer(t *bootstrapTransfer, base string, metadata BootstrapMetadata, size int64, limits BootstrapLimits) error {
+	if err := validateBootstrapLimits(limits); err != nil {
+		return err
+	}
 	if size < 0 || size > limits.MaxTransferBytes {
-		return nil, &BootstrapLimitError{Resource: "staging bytes", Requested: size, Limit: limits.MaxTransferBytes}
+		return &BootstrapLimitError{Resource: "staging bytes", Requested: size, Limit: limits.MaxTransferBytes}
 	}
 	bootstrapBudget.Lock()
 	if bootstrapBudget.active >= BootstrapMaxActive {
 		requested := bootstrapBudget.active + 1
 		bootstrapBudget.Unlock()
-		return nil, &BootstrapLimitError{Resource: "active transfers", Requested: int64(requested), Limit: BootstrapMaxActive}
+		return &BootstrapLimitError{Resource: "active transfers", Requested: int64(requested), Limit: BootstrapMaxActive}
 	}
 	requested, err := addBootstrapBytes(bootstrapBudget.bytes, size)
 	if err != nil {
 		bootstrapBudget.Unlock()
-		return nil, err
+		return err
 	}
 	if requested > limits.MaxTotalBytes {
 		bootstrapBudget.Unlock()
-		return nil, &BootstrapLimitError{Resource: "total staging bytes", Requested: requested, Limit: limits.MaxTotalBytes}
+		return &BootstrapLimitError{Resource: "total staging bytes", Requested: requested, Limit: limits.MaxTotalBytes}
 	}
 	bootstrapBudget.active++
 	bootstrapBudget.bytes += size
 	bootstrapBudget.Unlock()
-	t := &bootstrapTransfer{
-		metadata:    cloneBootstrapMetadata(metadata),
-		activeToken: bootstrapActiveToken{owned: true},
-		byteOwner:   bootstrapByteOwner{owned: true, reserved: size, limits: limits},
-		removeAll:   os.RemoveAll,
-		received:    map[string]int64{},
-	}
+	t.metadata = cloneBootstrapMetadata(metadata)
+	t.activeToken = bootstrapActiveToken{owned: true}
+	t.byteOwner = bootstrapByteOwner{owned: true, reserved: size, limits: limits}
+	t.removeAll = os.RemoveAll
+	t.received = map[string]int64{}
+
 	id, err := newBootstrapID()
 	if err == nil {
 		t.dir = base + ".bootstrap-" + id
@@ -214,9 +226,9 @@ func newBootstrapTransferAfterCleanup(base string, metadata BootstrapMetadata, s
 	}
 	if err != nil {
 		t.releaseTransientOwnership()
-		return nil, err
+		return err
 	}
-	return t, nil
+	return nil
 }
 
 func (t *bootstrapTransfer) startTTL() {
@@ -233,10 +245,16 @@ func (t *bootstrapTransfer) releaseTransientOwnership() {
 func (t *bootstrapTransfer) close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.detached != nil && t.detached.prepared {
+		return nil
+	}
 	return t.cleanupLocked()
 }
 
 func (t *bootstrapTransfer) cleanupLocked() error {
+	if t.detached != nil && t.detached.prepared && (!t.detached.retired || t.detached.leases != 0) {
+		return ErrDetachedBootstrapPending
+	}
 	if t.installed {
 		return ErrBootstrapPending
 	}
@@ -248,12 +266,17 @@ func (t *bootstrapTransfer) cleanupLocked() error {
 		t.timer.Stop()
 	}
 	if err := t.removeAll(t.dir); err != nil {
-		retainBootstrapCleanup(t)
+		if t.detached == nil || !t.detached.adopted {
+			retainBootstrapCleanup(t)
+		}
 		return err
 	}
 	t.cleanupComplete = true
 	forgetBootstrapCleanup(t)
 	t.releaseTransientOwnership()
+	if t.detached != nil {
+		t.detached.root.forget(t)
+	}
 	return nil
 }
 
@@ -640,6 +663,11 @@ func (r *BootstrapReceiver) WriteChunk(fileID string, offset int64, data []byte)
 		}
 		return nil
 	}
+	return writeBootstrapChunkLocked(t, fileID, offset, data)
+}
+
+// Caller owns t.mu and has checked the transfer state and descriptor bounds.
+func writeBootstrapChunkLocked(t *bootstrapTransfer, fileID string, offset int64, data []byte) error {
 	position := t.received[fileID]
 	// #nosec G304 -- fileID matched the fixed records/catalog descriptors validated by StageBootstrap; t.dir is privately generated.
 	file, err := os.OpenFile(filepath.Join(t.dir, fileID), os.O_RDWR, 0o600)
