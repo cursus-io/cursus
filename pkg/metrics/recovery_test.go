@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -21,6 +22,18 @@ func TestRecoveryExporterIncludesWorkFailuresAndBoundedLabels(t *testing.T) {
 	RecordRecoveryAttempt(RecoveryStage(255), nil)
 	handler, err := Handler()
 	require.NoError(t, err)
+	snapshot := handler.(*snapshotHandler)
+	t.Cleanup(func() {
+		require.NoError(t, snapshot.Close())
+		select {
+		case <-snapshot.process.worker.Done():
+		case <-time.After(5 * time.Second):
+			t.Error("metrics observation worker did not stop")
+		}
+	})
+	require.Eventually(t, func() bool {
+		return snapshot.process.worker.Snapshot().Valid()
+	}, 5*time.Second, time.Millisecond, "initial metrics observation did not complete")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest("GET", "/metrics", nil))
 	body := response.Body.String()
