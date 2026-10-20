@@ -172,6 +172,25 @@ func TestBootstrapReceiverPreparedCorruptionRejectedBeforeIntent(t *testing.T) {
 	}
 }
 
+type manualBootstrapTimer struct {
+	active        bool
+	stops, resets int
+}
+
+func (t *manualBootstrapTimer) Stop() bool {
+	wasActive := t.active
+	t.active = false
+	t.stops++
+	return wasActive
+}
+
+func (t *manualBootstrapTimer) Reset(time.Duration) bool {
+	wasActive := t.active
+	t.active = true
+	t.resets++
+	return wasActive
+}
+
 func TestBootstrapReceiverPreparedTTLAndAbortOwnership(t *testing.T) {
 	for _, expire := range []bool{false, true} {
 		t.Run(map[bool]string{false: "abort failure", true: "original TTL"}[expire], func(t *testing.T) {
@@ -179,11 +198,18 @@ func TestBootstrapReceiverPreparedTTLAndAbortOwnership(t *testing.T) {
 			active, reserved := bootstrapBudgetSnapshot()
 			owned := r.transfer.byteOwner.reserved
 			if expire {
-				// Shorten the original TTL; preparation must not refresh it to
-				// BootstrapTTL or prevent its callback from reclaiming ownership.
-				r.transfer.timer.Reset(200 * time.Millisecond)
+				// Control expiry explicitly: slow fsync must not consume the
+				// test's lifetime before it can verify repeated preparation.
+				require.True(t, r.transfer.timer.Stop())
+				timer := &manualBootstrapTimer{active: true}
+				r.transfer.timer = timer
 				require.NoError(t, r.PrepareContext(context.Background()))
 				require.NoError(t, r.PrepareContext(context.Background()))
+				require.Same(t, timer, r.transfer.timer, "preparation must keep the original TTL owner")
+				require.Zero(t, timer.stops, "preparation must not cancel expiry")
+				require.Zero(t, timer.resets, "preparation must not extend the original TTL")
+				timer.active = false
+				require.NoError(t, r.transfer.close(), "run the original expiry callback")
 			} else {
 				require.NoError(t, r.PrepareContext(context.Background()))
 				remove := r.transfer.removeAll

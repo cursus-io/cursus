@@ -135,6 +135,13 @@ type BootstrapMetadata struct {
 	Files       []BootstrapFile `json:"files"`
 }
 
+// bootstrapTimer permits deterministic expiry tests while production transfers
+// continue to use time.AfterFunc with their original staging TTL.
+type bootstrapTimer interface {
+	Stop() bool
+	Reset(time.Duration) bool
+}
+
 type bootstrapTransfer struct {
 	detached        *detachedBootstrapChild
 	mu              sync.Mutex
@@ -144,7 +151,7 @@ type bootstrapTransfer struct {
 	byteOwner       bootstrapByteOwner
 	cleanupComplete bool
 	removeAll       func(string) error
-	timer           *time.Timer
+	timer           bootstrapTimer
 	closed          bool
 	installed       bool
 	installFinished bool
