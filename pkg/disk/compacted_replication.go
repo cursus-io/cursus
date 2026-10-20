@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
@@ -351,7 +352,8 @@ func installCompactedRangeFile(tempPath, destination string, size int64, checksu
 	return validateCompactedRangeFile(destination, size, checksum)
 }
 
-func validateCompactedRangeFile(path string, size int64, checksum string) error {
+func validateCompactedRangeFile(path string, size int64, checksum string) (result error) {
+	defer func() { metrics.RecordRecoveryAttempt(metrics.RecoveryChecksum, result) }()
 	// #nosec G304 -- path is derived from the broker-owned partition base.
 	file, err := os.Open(path)
 	if err != nil {
@@ -366,7 +368,9 @@ func validateCompactedRangeFile(path string, size int64, checksum string) error 
 		return fmt.Errorf("file size %d does not match pending size %d", info.Size(), size)
 	}
 	digest := sha256.New()
-	if _, err := io.Copy(digest, file); err != nil {
+	n, err := io.Copy(digest, file)
+	metrics.RecordRecoveryBytes(metrics.RecoveryChecksum, metrics.RecoveryHashBytes, n)
+	if err != nil {
 		return err
 	}
 	if actual := hex.EncodeToString(digest.Sum(nil)); actual != checksum {

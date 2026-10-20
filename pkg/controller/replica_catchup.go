@@ -37,11 +37,17 @@ func (ch *CommandHandler) applyReplicaCatchupRequest(ctx context.Context, reques
 	if err := replicationFSM.ValidateReplicaRecoveryMode(batch); err != nil {
 		return err
 	}
+	if batch.RecoveryProtocol == replicationFSM.BootstrapRecoveryProtocolVersion && (request == nil || request.LocalWitness == nil) {
+		return fmt.Errorf("retained recovery requires the original receiver witness")
+	}
 	if ch == nil || ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.TopicManager == nil {
 		return fmt.Errorf("replica catch-up dependencies are unavailable")
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := injectedReplicaResponseDelay(ctx, batch.Topic); err != nil {
+		return err
 	}
 	if batch.TruncateTo != nil && batch.Topic == config.ConsumerOffsetsTopicName {
 		if ch.Coordinator == nil {
@@ -67,6 +73,29 @@ func (ch *CommandHandler) applyReplicaCatchupRequest(ctx context.Context, reques
 		return err
 	}
 	defer writeLock.Unlock()
+	if batch.RecoveryProtocol == replicationFSM.BootstrapRecoveryProtocolVersion {
+		// The original witness is revalidated again under the FSM fence below.
+		// Keep the potentially cold retained-prefix scan outside global gates.
+		local := ch.TopicManager.GetTopic(batch.Topic)
+		if local == nil {
+			return fmt.Errorf("retained recovery topic unavailable")
+		}
+		partition, err := local.GetPartition(batch.Partition)
+		if err != nil {
+			return err
+		}
+		if err := partition.ValidateReplicaRequestWitness(ctx, request.LocalWitness, batch.StartOffset); err != nil {
+			return err
+		}
+		prefix := batch.MatchedRetainedPrefix
+		actual, err := partition.ReplicaRetainedPrefixContext(ctx, prefix.Start, prefix.End)
+		if err != nil {
+			return err
+		}
+		if actual.Proof != *prefix {
+			return fmt.Errorf("local retained prefix changed before recovery")
+		}
+	}
 	if request != nil || batch.RecoveryProtocol != 0 || batch.TruncateTo != nil {
 		if ch.Cluster.RaftManager.GetFSM() == nil {
 			return fmt.Errorf("replica catch-up metadata is unavailable")
@@ -136,7 +165,7 @@ func (ch *CommandHandler) applyReplicaCatchup(ctx context.Context, request *repl
 	if partition.NextOffset() != batch.StartOffset {
 		return fmt.Errorf("replica catch-up local LEO changed: current=%d response_start=%d", partition.NextOffset(), batch.StartOffset)
 	}
-	if batch.RecoveryProtocol != 0 && batch.TruncateTo == nil {
+	if batch.RecoveryProtocol == replicationFSM.IndexedRecoveryProtocolVersion && batch.TruncateTo == nil {
 		matched, err := partition.VerifyReplicaLineage(*batch.MatchedPrefix, batch.CommittedHWM)
 		if err != nil {
 			return err
@@ -250,7 +279,7 @@ func (ch *CommandHandler) applyReplicaCatchup(ctx context.Context, request *repl
 		next = message.Offset + 1
 	}
 	if batch.Compacted {
-		if !config.HasCleanupPolicy(localTopic.PolicySnapshot().CleanupPolicy, config.CleanupPolicyCompact) {
+		if batch.RecoveryProtocol != replicationFSM.BootstrapRecoveryProtocolVersion && !config.HasCleanupPolicy(localTopic.PolicySnapshot().CleanupPolicy, config.CleanupPolicyCompact) {
 			return fmt.Errorf("compacted replica catch-up is not allowed for topic policy")
 		}
 		if err := partition.ReplicaAppendCompactedRange(batch.Messages, endOffset); err != nil {
@@ -259,6 +288,7 @@ func (ch *CommandHandler) applyReplicaCatchup(ctx context.Context, request *repl
 	} else if err := partition.ReplicaAppendWithMode(batch.Messages, true); err != nil {
 		return err
 	}
+	injectedReplicaCatchupCrash(batch.Topic, batch.Partition)
 	if endOffset != batch.CommittedHWM {
 		return nil
 	}

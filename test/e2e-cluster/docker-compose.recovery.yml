@@ -1,0 +1,16 @@
+services:
+  broker-1:
+    command: ["./broker", "--log-level=debug"]
+    environment:
+      LOG_SEGMENT_BYTES: "65536"
+      LOG_RETENTION_CHECK_INTERVAL_MS: "250"
+  broker-2:
+    command: ["./broker", "--log-level=debug"]
+    environment:
+      LOG_SEGMENT_BYTES: "65536"
+      LOG_RETENTION_CHECK_INTERVAL_MS: "250"
+  broker-3:
+    command: ["./broker", "--log-level=debug"]
+    environment:
+      LOG_SEGMENT_BYTES: "65536"
+      LOG_RETENTION_CHECK_INTERVAL_MS: "250"

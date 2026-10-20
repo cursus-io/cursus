@@ -9,6 +9,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/util"
 )
 
 type ConsumerMetadataRecoveryStageRequest struct {
@@ -45,6 +46,9 @@ func (ch *CommandHandler) SetConsumerMetadataRecoveryProvider(provider ConsumerM
 }
 
 type consumerRecoveryPlan struct {
+	skip       int
+	finite     bool
+	owned      map[uint64]consumerRecoveryOwnership
 	generation uint64
 	metadata   []fsm.PartitionMetadata
 	ends       []uint64
@@ -76,7 +80,17 @@ func (ch *CommandHandler) prepareConsumerRecoveryPlan(ctx context.Context, metad
 		return nil, ErrConsumerRecoveryPending
 	}
 	localID := ch.Cluster.Router.BrokerID()
+	plan.finite = !legacy && ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled()
+	plan.skip = skip
+	plan.owned = make(map[uint64]consumerRecoveryOwnership)
 	for i, m := range metadata {
+		if m.Leader == localID {
+			partition, ok := util.SafeIntToUint64(i)
+			if !ok {
+				return nil, ErrConsumerRecoveryPending
+			}
+			plan.owned[partition] = consumerRecoveryOwnership{Epoch: m.LeaderEpoch, PartitionCount: m.PartitionCount, Lifecycle: m.LifecycleEpoch, End: m.CommittedHWM}
+		}
 		plan.ends[i] = m.CommittedHWM
 		if i == skip {
 			continue
@@ -163,12 +177,52 @@ func (p *consumerRecoveryPlan) close() {
 }
 
 func (ch *CommandHandler) validateConsumerRecoveryPlan(plan *consumerRecoveryPlan, metadata []fsm.PartitionMetadata) error {
-	if err := plan.restageLocalEnds(metadata); err != nil {
-		return err
+	if !plan.finite {
+		if err := plan.restageLocalEnds(metadata); err != nil {
+			return err
+		}
 	}
 	r := ch.Coordinator.ConsumerRecoveryRequirement()
-	if r.RequiredGeneration != plan.generation || r.Installing || r.Failure != nil || !reflect.DeepEqual(plan.metadata, metadata) {
-		return ErrConsumerRecoveryPending
+	if r.RequiredGeneration != plan.generation || r.Installing || r.Failure != nil || len(plan.metadata) != len(metadata) {
+		return fmt.Errorf("%w: recovery generation or topology size changed", ErrConsumerRecoveryPending)
+	}
+	if plan.finite {
+		// Durable routing activation prevents new records for locally owned
+		// groups from entering remote partitions. Keep those historical cuts
+		// fixed; only owned partitions are re-staged to the final committed end.
+		// Ownership changes invalidate the entire plan and require fresh staging.
+		if !ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() {
+			return ErrConsumerRecoveryPending
+		}
+		for i, current := range metadata {
+			before := plan.metadata[i]
+			if current.CommittedHWM < before.CommittedHWM {
+				return ErrConsumerRecoveryPending
+			}
+			if i == plan.skip && current.CommittedHWM != before.CommittedHWM {
+				return ErrConsumerRecoveryPending
+			}
+			current.CommittedHWM = before.CommittedHWM
+			if !reflect.DeepEqual(before, current) {
+				return fmt.Errorf("%w: partition %d authority changed", ErrConsumerRecoveryPending, i)
+			}
+			if i != plan.skip && current.Leader == ch.Cluster.Router.BrokerID() {
+				if plan.local[i] == nil {
+					return fmt.Errorf("%w: owned partition %d lacks local coverage", ErrConsumerRecoveryPending, i)
+				}
+				plan.ends[i] = metadata[i].CommittedHWM
+				plan.metadata[i].CommittedHWM = metadata[i].CommittedHWM
+				partition, ok := util.SafeIntToUint64(i)
+				if !ok {
+					return ErrConsumerRecoveryPending
+				}
+				proof := plan.owned[partition]
+				proof.End = plan.ends[i]
+				plan.owned[partition] = proof
+			}
+		}
+	} else if !reflect.DeepEqual(plan.metadata, metadata) {
+		return fmt.Errorf("%w: exact metadata vector changed", ErrConsumerRecoveryPending)
 	}
 	t := ch.TopicManager.GetTopic(config.ConsumerOffsetsTopicName)
 	if t == nil || t.Definition().Partitions != len(metadata) {
@@ -200,7 +254,7 @@ func (ch *CommandHandler) validateConsumerRecoveryPlan(plan *consumerRecoveryPla
 		if err != nil {
 			return err
 		}
-		if end != metadata[i].CommittedHWM {
+		if end != plan.ends[i] {
 			return fmt.Errorf("%w: staged metadata end changed", ErrConsumerRecoveryPending)
 		}
 	}
@@ -227,7 +281,7 @@ func (ch *CommandHandler) withConsumerRecoveryPlan(ctx context.Context, plan *co
 				reader.ends[i] = v.CommittedEnd()
 			}
 			if v.CommittedEnd() < reader.ends[i] {
-				return ErrConsumerRecoveryPending
+				return fmt.Errorf("%w: partition %d durable end %d is below required end %d", ErrConsumerRecoveryPending, i, v.CommittedEnd(), reader.ends[i])
 			}
 			reader.views[i] = v
 			return visit(i + 1)

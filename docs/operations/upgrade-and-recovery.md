@@ -161,71 +161,44 @@ and legacy records encountered while scanning the source. Each subsequent
 request must prove the preceding prefix before records can be transferred;
 the authoritative source log is never truncated. Storage or checksum failures,
 unavailable prefix records, stale fences, and invalid committed HWMs still stop
-recovery. Indexed wire protocol 1 is implemented for non-compacted replicas
-outside ISR, and explicit capability-1 fixtures exercise mutual negotiation.
-Production direct and leader-forwarded registration both advertise recovery
-protocol **0** through the same payload builder. This deliberate activation gate
-keeps production on the existing digest path until retained-range bootstrap is
-complete; it does not solve missing retained history. Lifecycle protocol remains
-6. There is no operator switch to enable the incomplete service. A future bundle
-must wire source, transport, receiver, resumable installation, derived-state
-recovery and providers before advertising protocol 2, with startup capability 0
-until ready. Compacted replicas keep their existing recovery path.
+recovery.
 
-Each partition can maintain a derived `partition_N.lineage` sidecar. It stores
-checksummed leader-epoch spans and cumulative record-hash checkpoints. A zero
-leader epoch remains unknown history. Prefix hashes cover the whole
-retained interval, so an equal last record cannot hide earlier divergence.
-Checkpoints are sparse (one per 256 records), and the durable tail uses a fixed
-slot rather than growing the file on every append.
+Current brokers advertise recovery protocol **2** only after the source,
+consumer metadata cache, replica receiver and authenticated internal listener
+are ready. Direct and leader-forwarded registration use the same payload.
+Lifecycle protocol remains 6; protocol-1 peers retain indexed recovery and
+protocol-0 peers use the legacy digest path. There is no operator activation
+switch.
 
-The log remains authoritative. Startup leaves the sidecar uninitialized. The
-first explicit proof request rebuilds it from retained records without rewriting
-them; this request's work is proportional to retained history. Missing, stale,
-damaged and unsupported sidecars are rebuilt on explicit requests in the same way.
-Acknowledged writes, explicit flush, segment rotation and shutdown keep their log
-durability guarantees without synchronously publishing the sidecar. Once the
-index is initialized, periodic log sync advances it by at most 1,024 records per
-pass, so its durable tail can lag the log. Every proof API synchronizes the log,
-catches up the index and durably publishes the sidecar before returning evidence.
+Consumer routing activates durably only when every registered broker, including
+inactive registrations, and every Raft voter has a compatible current process
+registration. Check these registrations if activation remains pending after an
+upgrade. Once active, the cluster rejects legacy or incomplete registrations;
+do not downgrade binaries on the same volumes without a supported migration.
 
-Retention changes the prefix anchor, and truncation or compaction invalidates
-previous evidence. Background publication never rebuilds an invalidated index;
-it waits for an explicit proof request. Marked compacted histories continue using
-the existing compacted recovery path. A sidecar publication failure suspends
-background updates and logs the transition once. It does not reverse a successful
-durable append, but no indexed proof is returned until explicit recovery can
-publish successfully. Recovery logs once and resumes bounded background updates.
-Indexed recovery sends at most 64 candidates: the exact tail, tail minus 1, 3,
-7, ... records, and the retained-start anchor. It rolls back only to a matching
-cumulative prefix at or below the authoritative exclusive HWM. On stable,
-contiguous histories with the same anchor, define required rollback as
-`D = tail - min(longest_common_prefix, source_HWM)` and actual rollback as `R`.
-`D = 0` gives `R = 0`, and one bad tail record gives `R = 1`. For positive `D`,
-`D <= R < 2D` when the retained span is at most MaxInt64; the full uint64 range
-has `D <= R < 4D` because the final slot is reserved for the anchor. These are
-record-count bounds, not byte or time budgets. With a fixed source HWM,
-retransferred records within the receiver's original tail are at most `R`;
-ordinary catch-up of newer records beyond that tail is outside the bound.
-Measure transferred bytes separately.
-Equal final records cannot conceal
-earlier divergence. Responses are checksummed and fenced by source, receiver,
-leader and lifecycle; stale or unsupported responses cannot mutate local storage.
-Proofs are refreshed after each append. The first request may scan retained history
-while holding the FSM transition fence, which can delay metadata application.
-If retention has removed the common anchor, recovery reports bootstrap required
-and leaves local data unchanged. Never fall back to legacy truncation or choose
-a larger anchor to bypass `BootstrapRequired`. Automated retained-range bootstrap
-remains the next layer of #246, and production capability remains 0 in this layer.
+Capable replicas use retained-prefix proofs for compacted histories and fenced,
+restartable bootstrap when the common retained history is unavailable. Source,
+receiver, leader and lifecycle checks remain mandatory through installation and
+ISR admission. Missing authoritative data or invalid proofs leave the partition
+unavailable. Do not choose a larger anchor, edit offsets, or truncate committed
+records to bypass a bootstrap requirement.
 
-The [recovery design and regression contract](../replica-recovery-design.md#recovery-design-and-regression-contract)
-describes epoch and lifecycle fencing, same-epoch/legacy cumulative proofs,
-and the separate bootstrap required when retained anchors differ.
-Outstanding audit follow-ups remain cold sidecar rebuild bytes/time and lock
-contention, compacted full-prefix rescan work, and consumer metadata's global
-strict replay gate under busy unrelated traffic. None is fixed by these probe or
-advertisement changes. Include recovery bytes, hashing/scanning work and elapsed
-time in fault reports alongside request counts.
+The log remains authoritative; `partition_N.lineage` is a derived sidecar.
+Startup and invalidation require cold reconstruction on an explicit proof
+request. Sidecar publication failures stop proof publication without reversing
+acknowledged appends. Preserve the log and inspect the source error rather than
+editing sidecars to manufacture agreement.
+
+Cold proof reconstruction and bootstrap can still scan retained records.
+Resumable chunks and bounded caches reduce repeated work but cannot interrupt an
+OS read or fsync already in progress. After routing activation, consumer recovery
+uses fixed remote history and the latest owned commits under a global replay
+gate. Record actual transfer bytes, scan/hash work and elapsed time alongside
+request counts when diagnosing slow recovery.
+
+See the [recovery design](../replica-recovery-design.md) for proof bounds,
+checkpoint invalidation, recovery budgets and regression coverage, and
+[bootstrap storage](../../pkg/disk/BOOTSTRAP.md) for durable installation guarantees.
 
 The same-epoch restart regression commits a replacement on the two surviving
 brokers before restarting a divergent follower, then checks exact raw-record

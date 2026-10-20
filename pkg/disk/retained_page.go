@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
@@ -75,6 +76,8 @@ func (d *DiskHandler) ReadRetainedPage(ctx context.Context, start, end uint64, m
 			}
 			if !frame.EOF {
 				d.retainedPageWork.DecodedFrames++
+				metrics.RecordRecoveryWork(metrics.RecoveryRetainedPage, metrics.RecoveryDecodedFrames, 1)
+				metrics.RecordRecoveryBytes(metrics.RecoveryRetainedPage, metrics.RecoveryDecodedBytes, int64(len(frame.Payload)))
 			}
 			next, message, included, done, err := d.validateRawFrame(cursor, frame, rawFramesMarkedGaps, end, batch.Tail)
 			if err != nil {

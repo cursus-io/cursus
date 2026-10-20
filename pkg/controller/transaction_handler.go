@@ -797,6 +797,10 @@ func (ch *CommandHandler) abortTimedOutTransactionsBatch(shards []int, now time.
 }
 
 func (ch *CommandHandler) StartTransactionTimeoutMonitor(ctx context.Context) {
+	ctx, finish, err := ch.beginMonitor(ctx, "transaction-timeout")
+	if err != nil {
+		return
+	}
 	interval := transactionTimeout(ch.Config) / 4
 	if interval < time.Second {
 		interval = time.Second
@@ -829,6 +833,7 @@ func (ch *CommandHandler) StartTransactionTimeoutMonitor(ctx context.Context) {
 		}
 	}
 	go func() {
+		defer finish()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -1286,7 +1291,11 @@ func touchedTransactionPartitions(tx *transaction.Transaction) []transactionPart
 
 func (ch *CommandHandler) publishTransactionMarker(topicName string, partition int, msg types.Message) error {
 	if ch.isDistributed() {
-		cmd := fmt.Sprintf("PUBLISH topic=%s acks=all producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true transactional_id=%s transaction_state=%s transaction_marker=%s control_batch_type=%s control_batch_version=%d control_batch_coordinator_epoch=%d control_batch_key=%s control_batch_value=%s internal_txn_publish=true message=%s", topicName, msg.ProducerID, partition, msg.SeqNum, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.ControlBatchType, msg.ControlBatchVersion, msg.ControlBatchCoordinatorEpoch, base64.StdEncoding.EncodeToString(msg.ControlBatchKey), base64.StdEncoding.EncodeToString(msg.ControlBatchValue), msg.Payload)
+		routeArg, err := ch.transactionConsumerRouteArgument(topicName, partition, msg.TransactionalID)
+		if err != nil {
+			return err
+		}
+		cmd := fmt.Sprintf("PUBLISH topic=%s acks=all producerId=%s partition=%d seqNum=%d epoch=%d isIdempotent=true transactional_id=%s transaction_state=%s transaction_marker=%s control_batch_type=%s control_batch_version=%d control_batch_coordinator_epoch=%d control_batch_key=%s control_batch_value=%s internal_txn_publish=true%s message=%s", topicName, msg.ProducerID, partition, msg.SeqNum, msg.Epoch, msg.TransactionalID, msg.TransactionState, msg.TransactionMarker, msg.ControlBatchType, msg.ControlBatchVersion, msg.ControlBatchCoordinatorEpoch, base64.StdEncoding.EncodeToString(msg.ControlBatchKey), base64.StdEncoding.EncodeToString(msg.ControlBatchValue), routeArg, msg.Payload)
 		return ch.publishInternalTransactionCommand(cmd)
 	}
 	return ch.TopicManager.PublishToPartitionWithAckIdempotent(topicName, partition, &msg)
@@ -1315,7 +1324,11 @@ func (ch *CommandHandler) publishCommittedTransactionMessage(op transaction.Mess
 		if msg.TransactionalID != "" {
 			cmd += fmt.Sprintf(" transactional_id=%s transaction_state=%s", msg.TransactionalID, msg.TransactionState)
 		}
-		cmd += " message=" + msg.Payload
+		routeArg, err := ch.transactionConsumerRouteArgument(op.Topic, op.Partition, msg.TransactionalID)
+		if err != nil {
+			return err
+		}
+		cmd += routeArg + " message=" + msg.Payload
 		return ch.publishInternalTransactionCommand(cmd)
 	}
 	return ch.TopicManager.PublishToPartitionWithAckIdempotent(op.Topic, op.Partition, &msg)

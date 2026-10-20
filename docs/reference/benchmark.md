@@ -24,7 +24,37 @@ $env:RUN_E2E_BENCHMARK = "1"
 go test -v -timeout 30m ./test/e2e-benchmark/...
 ```
 
-`make bench` runs the standalone compose workload. See [Benchmark Verification](../benchmark-verification.md) for direct compose commands and cleanup.
+`make bench` runs the standalone compose workload, checks container exit codes
+and correctness/fatal markers, prints compose logs, and always tears down the
+stack. The Go suite is the authoritative way to validate both topologies.
+
+Docker Engine with Compose, sufficient CPU/memory for the clients and three
+brokers, and unused fixture container names are required. The suite builds each
+stack, starts it with `--no-build --force-recreate`, checks client exit and
+summaries, and removes containers and volumes. Fixed-name cleanup is limited to
+containers whose Compose labels identify this repository's test stacks.
+Without `RUN_E2E_BENCHMARK=1`, or with `go test -short`, the Docker tests skip.
+
+Run one topology:
+
+```bash
+RUN_E2E_BENCHMARK=1 go test -v -timeout 15m -run '^TestStandaloneBenchmark$' ./test/e2e-benchmark/...
+RUN_E2E_BENCHMARK=1 go test -v -timeout 15m -run '^TestClusterBenchmark$' ./test/e2e-benchmark/...
+```
+
+For direct log inspection, start one stack and tear it down with the matching
+compose file after inspection:
+
+```bash
+docker compose -f test/docker-compose.yml up --build --force-recreate
+docker compose -f test/docker-compose.yml down -v --remove-orphans
+
+docker compose -f test/cluster/docker-compose.yml up --build --force-recreate
+docker compose -f test/cluster/docker-compose.yml down -v --remove-orphans
+```
+
+The standalone clients are `bench-publisher`/`bench-consumer`; cluster clients
+are `broker-publisher`/`broker-consumer`.
 
 ## Durable Storage Workload
 
@@ -90,6 +120,19 @@ The test output filters successful logs to benchmark summaries. Full compose ser
 - production TLS/mTLS certificate overhead.
 
 Those require purpose-built workloads and failure tests. Do not infer them from this benchmark.
+
+## Troubleshooting
+
+- Commit errors or duplicates: inspect coordinator redirects, group generation
+  and member state, and `BATCH_COMMIT` responses.
+- Consumer timeout: compare unique published records, per-partition totals, and
+  committed offsets.
+- Broker not ready: inspect `/ready`, Raft leader/ISR state, and container-name
+  collisions.
+- Slow cold build: prebuild the images; preserve correctness counters and fatal
+  checks.
+- For deeper traces, temporarily use `log_level: debug` in test configs and
+  restore INFO after diagnosis.
 
 ## CI Policy
 

@@ -34,8 +34,11 @@ type replicaPublicationStorage interface {
 // CaptureReplicaRequestWitness requires the caller's reconciliation read fence
 // to span capture, challenge reads, and ValidateReplicaRequestWitness.
 func (p *Partition) CaptureReplicaRequestWitness(ctx context.Context, leo uint64) (*ReplicaRequestWitness, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock, err := lockReplicaContext(ctx, p.mu.LockContext, p.mu.Unlock)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if p.closed || p.snapshotRecovery || p.LEO.Load() != leo || p.replicaAttempt == math.MaxUint64 {
 		return nil, fmt.Errorf("replica request state changed")
 	}
@@ -60,8 +63,11 @@ func (p *Partition) replicaRecoveryErrorLocked() error {
 }
 
 func (p *Partition) ValidateReplicaRequestWitness(ctx context.Context, w *ReplicaRequestWitness, leo uint64) error {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	unlock, err := lockReplicaContext(ctx, p.mu.RLockContext, p.mu.RUnlock)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if w == nil || w.owner != p || w.attempt != p.replicaAttempt || w.leo != leo || p.LEO.Load() != leo || p.closed {
 		return fmt.Errorf("replica request witness is stale")
 	}

@@ -109,4 +109,4 @@ These are starting points, not safe production defaults. Validate storage latenc
 
 Run benchmarks with a cold and warm storage cache, retained history, the intended isolation level, and both standalone and cluster modes. A run is valid only when publish count, unique consumed count, missing count, duplicate count, commit errors, and process exit status agree. Container build/compose noise should be separated from the benchmark summary, but broker/consumer error lines must remain available for diagnosis.
 
-See [Benchmarks](benchmark.md) and [Benchmark Verification](../benchmark-verification.md).
+See [Benchmarks](benchmark.md) for workloads, correctness gates, and local verification.

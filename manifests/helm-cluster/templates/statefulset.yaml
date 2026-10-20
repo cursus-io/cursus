@@ -16,6 +16,9 @@
 {{- if not (kindIs "bool" .Values.networkPolicy.enabled) }}
 {{- fail "networkPolicy.enabled must be a boolean" }}
 {{- end }}
+{{- if not (kindIs "bool" .Values.image.allowMutableTag) }}
+{{- fail "image.allowMutableTag must be a boolean" }}
+{{- end }}
 {{- if and (not .Values.clientSecurity.allowInsecure) (not .Values.clientSecurity.tls.secretName) }}
 {{- fail "clientSecurity.tls.secretName must name a pre-created Secret containing tls.crt and tls.key" }}
 {{- end }}
@@ -85,6 +88,7 @@ spec:
       annotations:
         cursus.io/internal-credential-generation: {{ .Values.cluster.internalAuthGeneration | quote }}
     spec:
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}

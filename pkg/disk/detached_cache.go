@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/cursus-io/cursus/pkg/metrics"
 )
 
 // AdoptedRawStore owns a bounded cache slot and physical bytes, independently of
@@ -176,6 +178,7 @@ func repairDetachedTail(t *bootstrapTransfer, raw, index *os.File) error {
 		return nil
 	}
 	ops := t.detached.root.appendIO
+	metrics.RecordRecoveryWork(metrics.RecoveryDetachedCopy, metrics.RecoverySyncCalls, 2)
 	err := errors.Join(ops.truncate(raw, debt.bounds.RawBytes), ops.truncate(index, debt.bounds.IndexBytes), ops.sync(raw), ops.sync(index))
 	if err != nil {
 		return err
@@ -293,6 +296,7 @@ func (s *AdoptedRawStore) AppendPrepared(ctx context.Context, expected DetachedR
 	if err != nil {
 		return result, err
 	}
+	metrics.RecordRecoveryWork(metrics.RecoveryDetachedCopy, metrics.RecoverySyncCalls, 2)
 	if err = errors.Join(c.root.appendIO.sync(raw), c.root.appendIO.sync(index)); err != nil {
 		return result, err
 	}
@@ -329,12 +333,14 @@ func copyDetachedSuffix(ctx context.Context, ops detachedAppendIO, target, sourc
 		n, err := source.ReadAt(chunk, position)
 		// #nosec G115 -- os.File.ReadAt returns a nonnegative byte count, including partial failures.
 		work.RawReadBytes += uint64(n)
+		metrics.RecordRecoveryBytes(metrics.RecoveryDetachedCopy, metrics.RecoveryReadBytes, int64(n))
 		if err != nil {
 			return err
 		}
 		n, err = ops.writeAt(target, chunk, offset+position)
 		// #nosec G115 -- the private I/O adapter follows os.File.WriteAt's nonnegative byte-count contract.
 		work.RawBytes += uint64(n)
+		metrics.RecordRecoveryBytes(metrics.RecoveryDetachedCopy, metrics.RecoveryWriteBytes, int64(n))
 		if err != nil {
 			return err
 		}
@@ -355,6 +361,7 @@ func appendDetachedIndex(ctx context.Context, ops detachedAppendIO, target, sour
 		n, err := ops.writeAt(target, entry, position)
 		// #nosec G115 -- the private I/O adapter follows os.File.WriteAt's nonnegative byte-count contract.
 		work.IndexBytes += uint64(n)
+		metrics.RecordRecoveryBytes(metrics.RecoveryDetachedCopy, metrics.RecoveryWriteBytes, int64(n))
 		if err != nil {
 			return err
 		}
@@ -381,6 +388,7 @@ func appendDetachedIndex(ctx context.Context, ops detachedAppendIO, target, sour
 		n, err := source.ReadAt(entry[:], pos)
 		// #nosec G115 -- os.File.ReadAt returns a nonnegative byte count bounded by the entry buffer.
 		work.IndexReadBytes += uint64(n)
+		metrics.RecordRecoveryBytes(metrics.RecoveryDetachedCopy, metrics.RecoveryReadBytes, int64(n))
 		if err != nil {
 			return lastIndex, err
 		}

@@ -119,9 +119,12 @@ type RaftReplicationManager struct {
 	peers     map[string]string // brokerID -> addr
 	mu        sync.RWMutex
 	raftStore *raftboltdb.BoltStore
+	snapshots raft.SnapshotStore
 
-	isLeader atomic.Bool
-	leaderCh chan bool
+	isLeader          atomic.Bool
+	leaderCh          chan bool
+	backgroundCancel  context.CancelFunc
+	backgroundWorkers sync.WaitGroup
 }
 
 func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID string, topicManager *topic.TopicManager, coordinator *coordinator.Coordinator, client client.TCPClusterClient) (*RaftReplicationManager, error) {
@@ -265,22 +268,25 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 		peers:     make(map[string]string),
 		leaderCh:  make(chan bool, 10),
 		raftStore: raftStore,
+		snapshots: snapshots,
 	}
 
+	ctx, rm.backgroundCancel = context.WithCancel(ctx)
 	rm.isrManager = NewISRManager(ctx, brokerFSM, brokerID, 5*time.Second, rm)
-	go rm.isrManager.Start()
-
-	go rm.observeLeadership(notifyCh)
-	go watchRecoveredPartitionReplay(
-		ctx,
-		rm.raft,
-		rm.raftStore,
-		rm.fsm,
-		rm.brokerID,
-		recoveredPartitionReplayPollInterval,
-		recoveredPartitionReplayNoProgressTimeout,
-	)
-	go rm.reconcileTopicMaterializations(ctx, 5*time.Second)
+	rm.isrManager.Start()
+	rm.backgroundWorkers.Add(3)
+	go func() {
+		defer rm.backgroundWorkers.Done()
+		rm.observeLeadershipContext(ctx, notifyCh)
+	}()
+	go func() {
+		defer rm.backgroundWorkers.Done()
+		watchRecoveredPartitionReplay(ctx, rm.raft, rm.raftStore, rm.fsm, rm.brokerID, recoveredPartitionReplayPollInterval, recoveredPartitionReplayNoProgressTimeout)
+	}()
+	go func() {
+		defer rm.backgroundWorkers.Done()
+		rm.reconcileTopicMaterializations(ctx, 5*time.Second)
+	}()
 
 	return rm, nil
 }
@@ -533,8 +539,18 @@ func (rm *RaftReplicationManager) reconcileTopicMaterializations(ctx context.Con
 		}
 	}
 }
-func (rm *RaftReplicationManager) observeLeadership(notifyCh <-chan bool) {
-	for isLeader := range notifyCh {
+func (rm *RaftReplicationManager) observeLeadershipContext(ctx context.Context, notifyCh <-chan bool) {
+	for {
+		var isLeader bool
+		select {
+		case <-ctx.Done():
+			return
+		case value, ok := <-notifyCh:
+			if !ok {
+				return
+			}
+			isLeader = value
+		}
 		rm.isLeader.Store(isLeader)
 
 		if rm.isrManager != nil {
@@ -619,7 +635,11 @@ func (rm *RaftReplicationManager) ApplyCommand(prefix string, data []byte) error
 }
 
 func (rm *RaftReplicationManager) AddVoter(id string, addr string) error {
-	future := rm.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(addr), 0, 10*time.Second)
+	return rm.AddVoterAtIndex(id, addr, 0)
+}
+
+func (rm *RaftReplicationManager) AddVoterAtIndex(id string, addr string, configurationIndex uint64) error {
+	future := rm.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(addr), configurationIndex, 10*time.Second)
 	if err := future.Error(); err != nil {
 		return err
 	}
@@ -729,6 +749,7 @@ func newDurableRaftStore(dataDir string) (*raftboltdb.BoltStore, error) {
 }
 
 func (rm *RaftReplicationManager) Shutdown() error {
+	rm.StopBackgroundWork()
 	var shutdownErr error
 	if rm.raft != nil {
 		if err := rm.raft.Shutdown().Error(); err != nil {
@@ -744,6 +765,18 @@ func (rm *RaftReplicationManager) Shutdown() error {
 		}
 	}
 	return shutdownErr
+}
+
+// StopBackgroundWork joins all local recovery and ISR work before the server
+// closes derived state. Raft remains available until Shutdown is called.
+func (rm *RaftReplicationManager) StopBackgroundWork() {
+	if rm.backgroundCancel != nil {
+		rm.backgroundCancel()
+	}
+	if owner, ok := rm.isrManager.(interface{ Stop() }); ok {
+		owner.Stop()
+	}
+	rm.backgroundWorkers.Wait()
 }
 
 // TransferLeadership asks Raft to hand leadership to an eligible follower

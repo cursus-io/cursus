@@ -274,6 +274,15 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 	if partition < 0 {
 		partition = t.GetPartitionForMessage(*msg)
 	}
+	consumerRoute, routeErr := ch.parseConsumerRoute(args["consumer_route"], topicName, partition, clientCtx)
+	if routeErr != nil {
+		return fmt.Sprintf("ERROR: consumer_route_fenced reason=%q", routeErr)
+	}
+	if consumerRoute != nil {
+		if err := ch.Cluster.RaftManager.GetFSM().ValidateConsumerMetadataMessages(types.MessageCommand{Topic: topicName, Partition: partition, ConsumerRoute: consumerRoute, Messages: []types.Message{*msg}}); err != nil {
+			return fmt.Sprintf("ERROR: consumer_route_fenced reason=%q", err)
+		}
+	}
 	p, err := t.GetPartition(partition)
 	if err != nil {
 		return fmt.Sprintf("ERROR: partition_not_found partition=%d", partition)
@@ -326,6 +335,12 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 				releaseWrite()
 			}
 		}()
+		if err := validateConsumerRouteSnapshot(consumerRoute, replicationSnapshot); err != nil {
+			return fmt.Sprintf("ERROR: consumer_route_fenced reason=%q", err)
+		}
+		if err := ch.Cluster.RaftManager.GetFSM().ValidateConsumerMetadataMessages(types.MessageCommand{Topic: topicName, Partition: partition, ConsumerRoute: consumerRoute, Messages: []types.Message{*msg}}); err != nil {
+			return fmt.Sprintf("ERROR: consumer_route_fenced reason=%q", err)
+		}
 		if ch.replication == nil {
 			return "ERROR: cluster_metadata_unavailable command=PUBLISH"
 		}
@@ -345,6 +360,7 @@ func (ch *CommandHandler) handlePublish(cmd string, ctx ...*ClientContext) (resp
 
 		scope := "partition"
 		messageData := types.MessageCommand{
+			ConsumerRoute:               consumerRoute,
 			Topic:                       topicName,
 			Partition:                   partition,
 			LifecycleEpoch:              t.LifecycleEpoch,
@@ -570,6 +586,12 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 	if err := json.Unmarshal([]byte(payload), &msgCmd); err != nil {
 		return fmt.Sprintf("ERROR: unmarshal_failed reason=%q", err.Error())
 	}
+	if msgCmd.ConsumerRoute != nil && msgCmd.ConsumerRoute.Transaction != nil {
+		proof := msgCmd.ConsumerRoute.Transaction
+		if response := ch.waitForReplicatedTransactionState([]types.Message{{TransactionalID: proof.ID, Epoch: proof.ProducerEpoch}}, proof.Revision, DefaultFSMApplyTimeout); response != "" {
+			return response
+		}
+	}
 
 	if errResp := ch.validateReplicaLeader(msgCmd); errResp != "" {
 		return errResp
@@ -764,6 +786,9 @@ func (ch *CommandHandler) HandleBatchMessage(data []byte, conn net.Conn, ctx ...
 		scope := "partition"
 
 		effectiveMinISR := t.PolicySnapshot().EffectiveMinInSyncReplicas(ch.Config.MinInSyncReplicas)
+		if err := ch.Cluster.RaftManager.GetFSM().ValidateConsumerMetadataMessages(types.MessageCommand{Topic: batch.Topic, Partition: batch.Partition, Messages: batch.Messages}); err != nil {
+			return fmt.Sprintf("ERROR: consumer_route_fenced reason=%q", err), nil
+		}
 		requiredISR := 0
 		if ackSelection.Mode == ackpolicy.All {
 			requiredISR = effectiveMinISR

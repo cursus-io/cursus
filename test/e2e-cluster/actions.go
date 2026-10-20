@@ -70,13 +70,18 @@ func (a *ClusterActions) StartCluster() *ClusterActions {
 
 // waitForNodeHealth checks if a node is healthy
 func (a *ClusterActions) waitForNodeHealth(nodeIndex int, healthURL string) error {
+	return a.waitForNodeHealthWithin(nodeIndex, healthURL, clusterReadyTimeout)
+}
+
+func (a *ClusterActions) waitForNodeHealthWithin(nodeIndex int, healthURL string, timeout time.Duration) error {
 	if err := validateNodeHealthURL(nodeIndex, healthURL); err != nil {
 		return err
 	}
 	a.ctx.GetT().Logf("Waiting for node %d health check", nodeIndex)
-	return eventually(a.ctx.GetT(), fmt.Sprintf("node %d health at %s", nodeIndex, healthURL), clusterReadyTimeout, func() (bool, string, error) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	return eventually(a.ctx.GetT(), fmt.Sprintf("node %d health at %s", nodeIndex, healthURL), timeout, func() (bool, string, error) {
 		// #nosec G107 -- validateNodeHealthURL restricts requests to the expected loopback test endpoint.
-		resp, err := http.Get(healthURL)
+		resp, err := client.Get(healthURL)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			_ = resp.Body.Close()
 			return true, "healthy", nil
@@ -228,6 +233,12 @@ func (a *ClusterActions) KillBroker(nodeIndex int) {
 }
 
 func (a *ClusterActions) StartBroker(nodeIndex int) {
+	a.startBrokerWithin(nodeIndex, clusterReadyTimeout)
+}
+
+// Fault scenarios that repeatedly replay retained history set an explicit startup
+// deadline. Their full-ISR stability checks remain independent of this deadline.
+func (a *ClusterActions) startBrokerWithin(nodeIndex int, timeout time.Duration) {
 	if nodeIndex <= 0 || nodeIndex > a.ctx.clusterSize {
 		a.ctx.GetT().Fatalf("invalid broker index %d: cluster size is %d", nodeIndex, a.ctx.clusterSize)
 	}
@@ -236,7 +247,7 @@ func (a *ClusterActions) StartBroker(nodeIndex int) {
 	if err := exec.Command("docker", "start", containerName).Run(); err != nil {
 		a.ctx.GetT().Fatalf("failed to start %s: %v", containerName, err)
 	}
-	if err := a.waitForNodeHealth(nodeIndex, clusterHealthCheckAddrs(a.ctx.clusterSize)[nodeIndex-1]); err != nil {
+	if err := a.waitForNodeHealthWithin(nodeIndex, clusterHealthCheckAddrs(a.ctx.clusterSize)[nodeIndex-1], timeout); err != nil {
 		// #nosec G204 -- nodeIndex is range-checked above and forms a fixed broker-N container name.
 		if output, logErr := exec.Command("docker", "inspect", "--format", "status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}", containerName).CombinedOutput(); logErr == nil {
 			a.ctx.GetT().Logf("%s state: %s", containerName, strings.TrimSpace(string(output)))

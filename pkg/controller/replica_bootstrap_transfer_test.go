@@ -59,7 +59,7 @@ func TestReplicaBootstrapTransferMixedAdmissionAndNoCertificateSlots(t *testing.
 		require.NoError(t, err)
 		if request.Purpose == fsm.BootstrapPurposeReplica {
 			require.Empty(t, response.CertificateID)
-			require.Positive(t, response.Manifest.Files[1].Size)
+			require.Zero(t, response.Manifest.Files[1].Size)
 		}
 	}
 	r.Partition = 7

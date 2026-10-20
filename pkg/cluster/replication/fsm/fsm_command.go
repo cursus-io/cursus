@@ -12,6 +12,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
 
@@ -563,12 +564,13 @@ func (f *BrokerFSM) applyPartitionCommand(jsonData string) interface{} {
 }
 
 type partitionCommitCommand struct {
-	Topic          string `json:"topic"`
-	Partition      int    `json:"partition"`
-	Leader         string `json:"leader"`
-	LeaderEpoch    int    `json:"leader_epoch"`
-	HWM            uint64 `json:"hwm"`
-	LifecycleEpoch uint64 `json:"lifecycle_epoch,omitempty"`
+	ConsumerRoute  *types.ConsumerMetadataRoute `json:"consumer_route,omitempty"`
+	Topic          string                       `json:"topic"`
+	Partition      int                          `json:"partition"`
+	Leader         string                       `json:"leader"`
+	LeaderEpoch    int                          `json:"leader_epoch"`
+	HWM            uint64                       `json:"hwm"`
+	LifecycleEpoch uint64                       `json:"lifecycle_epoch,omitempty"`
 }
 
 func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
@@ -579,6 +581,10 @@ func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
 	key := fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition)
 
 	f.mu.Lock()
+	if err := f.validateConsumerMetadataRouteLocked(cmd.Topic, cmd.Partition, cmd.ConsumerRoute); err != nil {
+		f.mu.Unlock()
+		return err
+	}
 	metadata := f.partitionMetadata[key]
 	if metadata == nil {
 		f.mu.Unlock()
@@ -752,6 +758,10 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 	if f.offsetReservationsActivated && info.LifecycleProtocol < OffsetReservationsProtocolVersion {
 		f.mu.Unlock()
 		return fmt.Errorf("broker_registration_fenced broker=%s reason=offset_reservations_protocol required=%d", info.ID, OffsetReservationsProtocolVersion)
+	}
+	if f.consumerMetadataRoutingActivated && (info.RecoveryProtocol < BootstrapRecoveryProtocolVersion || info.LifecycleProtocol < BrokerProtocolVersionCurrent || info.IncarnationID == "") {
+		f.mu.Unlock()
+		return fmt.Errorf("broker_registration_fenced broker=%s reason=consumer_metadata_routing", info.ID)
 	}
 	if info.LifecycleProtocol < ReplicaGapRecoveryProtocolVersion {
 		for _, metadata := range f.partitionMetadata {

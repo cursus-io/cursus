@@ -111,6 +111,10 @@ func (m *ComprehensiveMockRaftManager) AddVoter(id string, addr string) error {
 	return m.Called(id, addr).Error(0)
 }
 
+func (m *ComprehensiveMockRaftManager) AddVoterAtIndex(id string, addr string, index uint64) error {
+	return m.Called(id, addr, index).Error(0)
+}
+
 func (m *ComprehensiveMockRaftManager) RemoveServer(id string) error {
 	return m.Called(id).Error(0)
 }
@@ -213,10 +217,16 @@ func TestServiceDiscovery_NodeOperations(t *testing.T) {
 		rm.isLeader = true
 		rm.On("GetLeaderAddress").Return("localhost:9001").Once()
 		rm.On("GetConfiguration").Return(staticConfigurationFuture{configuration: raft.Configuration{}}).Once()
-		rm.On("AddVoter", "node2", "localhost:9002").Return(nil).Once()
+		rm.On("AddVoterAtIndex", "node2", "localhost:9002", uint64(1)).Run(func(mock.Arguments) {
+			broker := rm.mockFSM.GetBroker("node2")
+			require.NotNil(t, broker, "registration must commit before membership changes")
+			require.Equal(t, "new-process", broker.IncarnationID)
+			require.Equal(t, 2, broker.RecoveryProtocol)
+		}).Return(nil).Once()
 		rm.On("ApplyCommand", "REGISTER", mock.Anything).Return(nil).Once()
 
-		leader, err := sd.AddNode("node2", "localhost:9002")
+		registration := voterRegistration(rm.mockFSM)
+		leader, err := sd.(*serviceDiscovery).AddNodeWithRegistration("node2", "localhost:9002", 0, &registration)
 		assert.NoError(t, err)
 		assert.Equal(t, "localhost:9001", leader)
 
@@ -502,15 +512,12 @@ func TestServiceDiscoveryReplicaCatchupSourceAndFollowerReconcileFences(t *testi
 // next cancellation. Calling the compatibility wrapper would lose this context.
 type catchupForwardContext struct {
 	context.Context
-	calls int
+	cancel context.CancelFunc
 }
 
-func (c *catchupForwardContext) Err() error {
-	c.calls++
-	if c.calls > 1 {
-		return context.Canceled
-	}
-	return nil
+func (c *catchupForwardContext) Done() <-chan struct{} {
+	c.cancel()
+	return c.Context.Done()
 }
 func TestServiceDiscoveryForwardsCatchupContextToFSM(t *testing.T) {
 	rm := new(ComprehensiveMockRaftManager)
@@ -522,7 +529,9 @@ func TestServiceDiscoveryForwardsCatchupContextToFSM(t *testing.T) {
 	sd := NewServiceDiscoveryImpl(rm, "leader", "localhost:9001", "")
 	api, ok := any(sd).(ContextReplicaCatchupSource)
 	require.True(t, ok)
-	ctx := &catchupForwardContext{Context: context.Background()}
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &catchupForwardContext{Context: parent, cancel: cancel}
 	_, err = api.FetchReplicaCatchupContext(ctx, fsm.ReplicaCatchupRequest{Topic: "orders", Leader: "leader"})
 	require.ErrorIs(t, err, context.Canceled)
 }

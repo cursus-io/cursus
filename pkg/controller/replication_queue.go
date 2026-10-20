@@ -159,9 +159,11 @@ func (e clusterPartitionReplicationExecutor) Commit(task partitionReplicationTas
 		task.snapshot.Leader,
 		task.snapshot.LeaderEpoch,
 		task.snapshot.LifecycleEpoch,
+		task.command.ConsumerRoute,
 	); err != nil {
 		metadata := e.handler.Cluster.RaftManager.GetFSM().GetPartitionMetadata(fmt.Sprintf("%s-%d", task.topic, task.partition))
 		result.accepted = metadata != nil && metadata.Leader == task.snapshot.Leader &&
+			e.handler.Cluster.RaftManager.GetFSM().ValidateConsumerMetadataRoute(task.topic, task.partition, task.command.ConsumerRoute) == nil &&
 			metadata.LeaderEpoch == task.snapshot.LeaderEpoch && metadata.LifecycleEpoch == task.snapshot.LifecycleEpoch &&
 			metadata.CommittedHWMKnown && metadata.CommittedHWM >= task.commitHWM
 		return result, err
@@ -623,6 +625,7 @@ func (l *partitionReplicationLane) replicationSnapshot(task partitionReplication
 func sameReplicationFence(left, right clusterController.PartitionReplicationSnapshot) bool {
 	return left.Leader == right.Leader &&
 		left.LeaderEpoch == right.LeaderEpoch &&
+		left.PartitionCount == right.PartitionCount &&
 		left.LifecycleEpoch == right.LifecycleEpoch
 }
 

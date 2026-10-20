@@ -21,6 +21,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
+	"github.com/cursus-io/cursus/util/contextlock"
 )
 
 var ErrReplicaOffsetGap = errors.New("replica offset gap")
@@ -72,11 +73,11 @@ type Partition struct {
 	replicaWitness             *ReplicaCatchupWitness
 	replicaAttempt             uint64
 	distributed                bool
-	mu                         sync.RWMutex
-	reconcileMu                sync.RWMutex
+	mu                         contextlock.RWMutex
+	reconcileMu                contextlock.RWMutex
 	eventIDGeneration          atomic.Uint64
 	eventIDs                   committedEventIDIndex
-	visibilityMu               sync.RWMutex
+	visibilityMu               contextlock.RWMutex
 	visibilityGeneration       uint64
 	bootstrapPending           atomic.Bool
 	rollbackPending            atomic.Bool
@@ -101,7 +102,7 @@ type Partition struct {
 	streamManager              StreamManager
 	hwmCheckpointPath          string
 	hwmCheckpointCh            chan struct{}
-	hwmCheckpointMu            sync.Mutex
+	hwmCheckpointMu            contextlock.RWMutex
 	hwmCheckpointWG            sync.WaitGroup
 	hwmCheckpointSaved         *hwmCheckpoint // protected by hwmCheckpointMu
 	hwmCheckpointStrict        bool           // protected by hwmCheckpointMu
@@ -110,7 +111,7 @@ type Partition struct {
 	producerStatePath          string
 	producerStateCh            chan struct{}
 	producerStateMu            sync.RWMutex
-	producerCheckpointMu       sync.Mutex
+	producerCheckpointMu       contextlock.RWMutex
 	producerCheckpointSaved    *producerStateCheckpoint // protected by producerCheckpointMu
 	producerCheckpointStrict   bool                     // protected by producerCheckpointMu
 	producerStateWG            sync.WaitGroup
@@ -1639,7 +1640,12 @@ func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
 // TruncateReplicaTail removes only records above a repair boundary. It does not
 // publish that boundary as committed; prefix verification must complete first.
 func (p *Partition) TruncateReplicaTail(offset uint64) error {
-	return p.repairReplicaTail(context.Background(), offset, 0, nil, 0, nil, false, speculativeReplicaTail)
+	return p.TruncateReplicaTailContext(context.Background(), offset)
+}
+
+// TruncateReplicaTailContext cancels queued repair before it changes storage.
+func (p *Partition) TruncateReplicaTailContext(ctx context.Context, offset uint64) error {
+	return p.repairReplicaTail(ctx, offset, 0, nil, 0, nil, false, speculativeReplicaTail)
 }
 
 // ApplyReplicaRollback moves a recovering follower to a leader-proven

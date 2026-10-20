@@ -78,8 +78,15 @@ type ClusterController struct {
 	Config           *config.Config
 	brokerID         string
 	snapshotCatchup  func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error
+	snapshotStep     ReplicaSnapshotStep
+	snapshotPending  map[fsm.ReplicaCatchupCandidate]*replicaSnapshotContinuation
 	proofSubmitter   func(context.Context, fsm.ISRCatchupProof) error
 	replicaBootstrap ReplicaBootstrapRecovery
+	catchupMu        sync.Mutex
+	catchupRunMu     sync.Mutex
+	catchupCancel    context.CancelFunc
+	catchupDone      chan struct{}
+	catchupStopped   bool
 }
 
 func (cc *ClusterController) SetReplicaSnapshotCatchup(callback func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error) {
@@ -99,6 +106,7 @@ func (cc *ClusterController) SetReplicaCatchupProofSubmitter(callback func(conte
 // PartitionReplicationSnapshot is an immutable view of the replication fence
 // and replica sets used by one partition append.
 type PartitionReplicationSnapshot struct {
+	PartitionCount   int
 	Leader           string
 	LeaderEpoch      int
 	LifecycleEpoch   uint64
@@ -322,6 +330,7 @@ func (cc *ClusterController) GetPartitionReplicationSnapshot(topic string, parti
 		lifecycleEpoch = topicpkg.InitialLifecycleEpoch
 	}
 	return PartitionReplicationSnapshot{
+		PartitionCount:   meta.PartitionCount,
 		Leader:           meta.Leader,
 		LeaderEpoch:      meta.LeaderEpoch,
 		LifecycleEpoch:   lifecycleEpoch,
@@ -413,6 +422,12 @@ func (cc *ClusterController) replicateToReplicaSet(topic string, partition int, 
 	}
 	if current.LifecycleEpoch != snapshot.LifecycleEpoch {
 		return fmt.Errorf("%w: current lifecycle=%d requested=%d", ErrPartitionLeaderFenced, current.LifecycleEpoch, snapshot.LifecycleEpoch)
+	}
+	if current.PartitionCount != snapshot.PartitionCount {
+		return fmt.Errorf("%w: partition count changed", ErrPartitionLeaderFenced)
+	}
+	if err := cc.RaftManager.GetFSM().ValidateConsumerMetadataRoute(topic, partition, msgCmd.ConsumerRoute); err != nil {
+		return err
 	}
 	if msgCmd.LifecycleEpoch == 0 {
 		if current.LifecycleEpoch > topicpkg.InitialLifecycleEpoch {

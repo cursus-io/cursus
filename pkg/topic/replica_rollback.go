@@ -68,15 +68,25 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 	if ctx == nil {
 		return fmt.Errorf("replica rollback requires context")
 	}
-	p.reconcileMu.Lock()
+	if err := p.reconcileMu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer p.reconcileMu.Unlock()
-	p.visibilityMu.Lock()
+	if err := p.visibilityMu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer p.visibilityMu.Unlock()
-	p.hwmCheckpointMu.Lock()
+	if err := p.hwmCheckpointMu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer p.hwmCheckpointMu.Unlock()
-	p.producerCheckpointMu.Lock()
+	if err := p.producerCheckpointMu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer p.producerCheckpointMu.Unlock()
-	p.mu.Lock()
+	if err := p.mu.LockContext(ctx); err != nil {
+		return err
+	}
 	p.recoveryMu.RLock()
 	// A separate reconciliation marker may need canonical catch-up before its
 	// normal owner can resolve it. Preserve it without blocking physical repair.
