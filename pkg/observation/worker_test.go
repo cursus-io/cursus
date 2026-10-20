@@ -10,6 +10,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestWorkerCloseBeforeStartCancelsAndPreventsWork(t *testing.T) {
+	w := New[int](time.Second, time.Second, time.Second)
+	w.Close()
+	require.ErrorIs(t, w.ctx.Err(), context.Canceled)
+	select {
+	case <-w.Done():
+	default:
+		t.Fatal("unstarted worker did not close")
+	}
+	var calls atomic.Int32
+	w.Start(func(context.Context) (int, error) { calls.Add(1); return 1, nil })
+	require.Zero(t, calls.Load())
+	require.False(t, w.Snapshot().Valid())
+}
+
 func TestWorkerBoundsUncooperativeWorkAndRecovers(t *testing.T) {
 	w := New[int](10*time.Millisecond, 40*time.Millisecond, 100*time.Millisecond)
 	t.Cleanup(w.Close)

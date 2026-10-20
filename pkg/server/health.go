@@ -69,29 +69,33 @@ func (state *HealthState) ObservationStatus() observation.Status {
 }
 
 func (state *HealthState) IsReady() bool {
-	ready, _ := state.report()
+	ready, _, _ := state.report()
 	return ready
 }
 
-func (state *HealthState) report() (bool, map[string]string) {
-	if state == nil || !state.ready.Load() {
-		return false, map[string]string{"broker": "starting"}
+func (state *HealthState) report() (bool, map[string]string, observation.Status) {
+	if state == nil {
+		return false, map[string]string{"broker": "starting"}, observation.Status{Stale: true}
 	}
 	snapshot := state.worker.Snapshot()
+	if !state.ready.Load() {
+		return false, map[string]string{"broker": "starting"}, snapshot.Status
+	}
 	state.mu.RLock()
 	version := state.version
 	state.mu.RUnlock()
 	if snapshot.Value.version != version || snapshot.CompletedAt.IsZero() {
-		return false, map[string]string{"observation": "not yet checked"}
+		snapshot.Stale = true
+		return false, map[string]string{"observation": "not yet checked"}, snapshot.Status
 	}
 	if snapshot.Stopped {
-		return false, map[string]string{"observation": "stopped"}
+		return false, map[string]string{"observation": "stopped"}, snapshot.Status
 	}
 	if snapshot.TimedOut {
-		return false, map[string]string{"observation": "check deadline exceeded"}
+		return false, map[string]string{"observation": "check deadline exceeded"}, snapshot.Status
 	}
 	if snapshot.Stale {
-		return false, map[string]string{"observation": "last completed check expired"}
+		return false, map[string]string{"observation": "last completed check expired"}, snapshot.Status
 	}
 	checks := make(map[string]string, len(snapshot.Value.checks)+1)
 	for name, result := range snapshot.Value.checks {
@@ -100,7 +104,7 @@ func (state *HealthState) report() (bool, map[string]string) {
 	if snapshot.Error != "" {
 		checks["observation"] = snapshot.Error
 	}
-	return snapshot.Valid(), checks
+	return snapshot.Valid(), checks, snapshot.Status
 }
 
 func (state *HealthState) sample(ctx context.Context) (healthResult, error) {
@@ -148,19 +152,15 @@ func newHealthHandler(state *HealthState) http.Handler {
 		if !allowHealthMethod(w, r) {
 			return
 		}
-		ready, checks := state.report()
+		ready, checks, observed := state.report()
 		status := http.StatusOK
 		label := "ready"
 		if !ready {
 			status = http.StatusServiceUnavailable
 			label = "not_ready"
 		}
-		var observed *observation.Status
-		if state != nil {
-			status := state.ObservationStatus()
-			observed = &status
-		}
-		writeHealthJSON(w, status, healthResponse{Status: label, Checks: checks, Observation: observed})
+
+		writeHealthJSON(w, status, healthResponse{Status: label, Checks: checks, Observation: &observed})
 	})
 	return mux
 }

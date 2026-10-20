@@ -2,6 +2,7 @@ package disk
 
 import (
 	"context"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,6 +11,18 @@ import (
 	"github.com/cursus-io/cursus/pkg/observation"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRuntimeObservationRejectsMissingSegmentMeasurements(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskMinFreeBytes, cfg.DiskMinFreePercent = 0, 0
+	dm := NewDiskManager(cfg)
+	dm.handlers["missing"] = &DiskHandler{BaseName: filepath.Join(cfg.LogDir, "missing")}
+	snapshot := dm.RuntimeSnapshot()
+	require.Equal(t, 2, snapshot.StatFailures, "missing log and index must invalidate partial byte accounting")
+	var unavailable *DiskManager
+	require.Positive(t, unavailable.RuntimeSnapshot().StatFailures)
+}
 
 func TestDiagnosticWorkersBoundFilesystemAndDiskLockWaits(t *testing.T) {
 	for _, mode := range []string{"statfs", "headroom_lock", "manager_lock", "fsync_handler_lock"} {

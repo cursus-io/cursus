@@ -66,9 +66,9 @@ func (dm *DiskManager) RuntimeSnapshot() RuntimeSnapshot {
 			for _, path := range []string{handler.GetSegmentPath(baseOffset), handler.GetIndexPath(baseOffset)} {
 				info, err := os.Stat(path)
 				if err != nil {
-					if !os.IsNotExist(err) {
-						snapshot.StatFailures++
-					}
+					// A missing file may be a concurrent retention/removal race,
+					// but it is not evidence of a measured zero-byte segment.
+					snapshot.StatFailures++
 					continue
 				}
 				snapshot.Bytes += info.Size()

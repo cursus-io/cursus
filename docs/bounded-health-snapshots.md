@@ -94,8 +94,8 @@ in-progress, deadline overrun, stale status, last completion, age, last failure,
 and completed failure count. Timestamp/age/last-failure series are absent until
 the first completion. A stuck first attempt exports valid=0, in_progress=1 and
 (after two seconds) timed_out=1 without inventing a completed result. A storage
-stat failure invalidates the runtime observation instead of exposing partial
-usage/capacity as zero. Existing metric names and labels remain unchanged when
+stat failure, including a missing segment/index during removal, invalidates the
+runtime observation instead of exposing partial usage/capacity as zero. Existing metric names and labels remain unchanged when
 the observation is valid. Removed dynamic labels disappear on the next valid
 sample, or when the previous observation expires.
 
@@ -111,10 +111,9 @@ metadata recovery and other existing dependency checks retain their meaning.
   packages pass `go test -race` including real HTTP probes while both storage
   observation paths remain blocked. Windows targeted snapshot/endpoint tests
   also pass with normal local permissions; the sandbox denies loopback sockets.
-- The full `go test -race ./pkg/... ./cmd/...` run passed the other packages,
-  including topic checkpoint crash/restart, replication/FSM recovery and ACK
-  regression suites. It caught a diagnostics typed-nil coordinator bug during
-  development; the corrected server package is included in the final rerun.
+- The full `go test -race ./pkg/... ./cmd/...` run passed, including topic
+  checkpoint crash/restart, replication/FSM recovery and ACK regression suites.
+  Affected packages were rerun after follow-up changes.
 - `go build ./cmd/...` passes on Linux; changed-package `golangci-lint` reports
   zero issues. No workflow trigger exceptions or production workloads were used.
 - Fault tests cover blocked statfs, actual headroom/manager/handler mutexes,

@@ -154,7 +154,7 @@ func TestHealthExpiresSuccessfulSnapshotAndInvalidatesNewChecks(t *testing.T) {
 	require.Eventually(t, func() bool { return state.ObservationStatus().Stale }, time.Second, time.Millisecond)
 	require.False(t, state.IsReady())
 	state.AddCheck("storage", func(context.Context) error { return errors.New("unavailable") })
-	ready, checks := state.report()
+	ready, checks, _ := state.report()
 	require.False(t, ready)
 	require.Equal(t, "not yet checked", checks["observation"])
 }

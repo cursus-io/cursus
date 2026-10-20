@@ -53,7 +53,7 @@ func New[T any](interval, timeout, maxAge time.Duration) *Worker[T] {
 	if interval <= 0 || timeout <= 0 || maxAge <= 0 {
 		panic("observation durations must be positive")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118 -- Ownership transfers to Worker.Close, including before Start; cancellation is covered by lifecycle tests.
 	return &Worker[T]{interval: interval, timeout: timeout, maxAge: maxAge, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 }
 
