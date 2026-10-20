@@ -68,6 +68,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	var discoveryListener net.Listener
 	var brokerIncarnationID string
 	healthState := NewHealthState()
+	defer healthState.Close()
 	var startupComplete atomic.Bool
 	healthState.AddCheck("broker_startup", func(context.Context) error {
 		if !startupComplete.Load() {
@@ -79,6 +80,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	if cd != nil {
 		addConsumerMetadataReadinessCheck(healthState, cd)
 	}
+	healthState.Start()
 	healthState.SetReady(true)
 	healthPort := cfg.HealthCheckPort
 	if healthPort == 0 {
@@ -89,7 +91,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		return fmt.Errorf("start health server: %w", healthErr)
 	}
 	defer func() {
-		healthState.SetReady(false)
+		healthState.Close()
 		shutdownHTTPServer(healthServer)
 		if discoveryListener != nil {
 			_ = discoveryListener.Close()
@@ -381,6 +383,8 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 
 	runtimeCollector := observability.NewCollector(tm, cd, dm, sm, cc, healthState, globalCH.TxnManager)
 	if cfg.EnableExporter {
+		runtimeCollector.Start()
+		defer runtimeCollector.Close()
 		metricsServer, startErr := metrics.StartMetricsServer(cfg.ExporterPort, runtimeCollector)
 		if startErr != nil {
 			return fmt.Errorf("start metrics exporter: %w", startErr)
@@ -412,7 +416,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		}()
 	}
 	defer func() {
-		healthState.SetReady(false)
+		healthState.Close()
 		close(drainConnections)
 		close(workerCh)
 		workerWG.Wait()

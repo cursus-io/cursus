@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/observation"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/wire"
@@ -47,12 +49,14 @@ type transactionSource interface {
 }
 
 // ReadinessSource reports whether the broker is ready to accept client work.
+// Implementations must read memory only, without application/I/O lock waits.
 type ReadinessSource interface {
 	IsReady() bool
 }
 
-// Collector exports scrape-time state rather than retaining stale gauge labels.
+// Collector publishes expiring runtime observations. Collect never queries storage.
 type Collector struct {
+	worker       *observation.Worker[[]prometheus.Metric]
 	topics       topicSource
 	groups       groupSource
 	disk         diskSource
@@ -156,6 +160,7 @@ type observationFailureSample struct {
 // NewCollector creates a broker runtime collector. Nil sources are supported.
 func NewCollector(topics topicSource, groups groupSource, diskState diskSource, streams streamSource, cluster clusterSource, readiness ReadinessSource, transactions ...transactionSource) *Collector {
 	c := &Collector{
+		worker:                          observation.New[[]prometheus.Metric](5*time.Second, observation.Timeout, 15*time.Second),
 		topics:                          topics,
 		groups:                          groups,
 		disk:                            diskState,
@@ -263,6 +268,7 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		c.partitionLeaderEpoch, c.partitionLeader, c.isrCatchupProofs,
 		c.transactionRecovery, c.transactionStates, c.transactionExpired, c.transactionOldestActive,
 	}
+	c.descriptors = append(c.descriptors, observation.Descriptors...)
 	return c
 }
 
@@ -272,24 +278,20 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	}
 }
 
-func (c *Collector) Collect(ch chan<- prometheus.Metric) {
-	ready := false
-	if c.readiness != nil {
-		ready = c.readiness.IsReady()
-	}
-	ch <- gauge(c.ready, boolValue(ready))
-
+func (c *Collector) sample(ctx context.Context) ([]prometheus.Metric, error) {
+	var result []prometheus.Metric
+	ch := func(m prometheus.Metric) { result = append(result, m) }
 	topicState := topic.RuntimeSnapshot{}
 	if c.topics != nil {
 		topicState = c.topics.RuntimeSnapshot()
 	}
-	ch <- gauge(c.topicCount, float64(topicState.TopicCount))
-	ch <- gauge(c.metadataLoadFailure, boolValue(topicState.MetadataLoadFailure != ""))
-	ch <- gauge(c.metadataRestoredTopics, float64(topicState.MetadataRestoredTopicCount))
-	ch <- gauge(c.metadataOrphanTopics, float64(topicState.MetadataOrphanTopicCount))
-	ch <- gauge(c.metadataDurabilityWarning, boolValue(topicState.MetadataDurabilityWarning != ""))
-	ch <- prometheus.MustNewConstMetric(c.metadataDurabilityWarningsTotal, prometheus.CounterValue, float64(topicState.MetadataDurabilityWarningsTotal))
-	ch <- gauge(c.partitionCount, float64(len(topicState.Partitions)))
+	ch(gauge(c.topicCount, float64(topicState.TopicCount)))
+	ch(gauge(c.metadataLoadFailure, boolValue(topicState.MetadataLoadFailure != "")))
+	ch(gauge(c.metadataRestoredTopics, float64(topicState.MetadataRestoredTopicCount)))
+	ch(gauge(c.metadataOrphanTopics, float64(topicState.MetadataOrphanTopicCount)))
+	ch(gauge(c.metadataDurabilityWarning, boolValue(topicState.MetadataDurabilityWarning != "")))
+	ch(prometheus.MustNewConstMetric(c.metadataDurabilityWarningsTotal, prometheus.CounterValue, float64(topicState.MetadataDurabilityWarningsTotal)))
+	ch(gauge(c.partitionCount, float64(len(topicState.Partitions))))
 	partitionState := make(map[string]topic.PartitionRuntimeSnapshot, len(topicState.Partitions))
 	partitionKeysByTopic := make(map[string][]string, topicState.TopicCount)
 	for _, partition := range topicState.Partitions {
@@ -297,12 +299,18 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		key := partitionKey(partition.Topic, partition.Partition)
 		partitionState[key] = partition
 		partitionKeysByTopic[partition.Topic] = append(partitionKeysByTopic[partition.Topic], key)
-		ch <- gauge(c.logStart, float64(partition.LogStart), partition.Topic, partitionLabel)
-		ch <- gauge(c.logEnd, float64(partition.LogEnd), partition.Topic, partitionLabel)
-		ch <- gauge(c.highWatermark, float64(partition.HighWatermark), partition.Topic, partitionLabel)
+		ch(gauge(c.logStart, float64(partition.LogStart), partition.Topic, partitionLabel))
+		ch(gauge(c.logEnd, float64(partition.LogEnd), partition.Topic, partitionLabel))
+		ch(gauge(c.highWatermark, float64(partition.HighWatermark), partition.Topic, partitionLabel))
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	c.collectGroupLifecycle(ch, partitionKeysByTopic)
 	c.collectGroups(ch, partitionState, partitionKeysByTopic)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if recoverySource, ok := c.groups.(interface {
 		RecoverySnapshot() coordinator.ConsumerMetadataRecoveryStatus
 	}); ok {
@@ -311,39 +319,48 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		if phase == "" {
 			phase = "unknown"
 		}
-		ch <- gauge(c.consumerMetadataRecovery, boolValue(status.Ready && status.Failure == ""), phase)
-		ch <- gauge(c.consumerMetadataRestoredGroups, float64(status.RestoredGroups))
-		ch <- gauge(c.consumerMetadataRestoredOffsets, float64(status.RestoredOffsets))
-		ch <- gauge(c.consumerMetadataReplayedRecords, float64(status.ReplayedRecords))
-		ch <- gauge(c.consumerMetadataOrphanRecords, float64(status.OrphanRecords))
-		ch <- gauge(c.consumerMetadataCorruptRecords, float64(status.CorruptRecords))
+		ch(gauge(c.consumerMetadataRecovery, boolValue(status.Ready && status.Failure == ""), phase))
+		ch(gauge(c.consumerMetadataRestoredGroups, float64(status.RestoredGroups)))
+		ch(gauge(c.consumerMetadataRestoredOffsets, float64(status.RestoredOffsets)))
+		ch(gauge(c.consumerMetadataReplayedRecords, float64(status.ReplayedRecords)))
+		ch(gauge(c.consumerMetadataOrphanRecords, float64(status.OrphanRecords)))
+		ch(gauge(c.consumerMetadataCorruptRecords, float64(status.CorruptRecords)))
 	}
 
 	activeStreams := 0
 	if c.streams != nil {
 		activeStreams = c.streams.ActiveCount()
 	}
-	ch <- gauge(c.activeStreams, float64(activeStreams))
-	c.collectStorage(ch)
+	ch(gauge(c.activeStreams, float64(activeStreams)))
+	if err := c.collectStorage(ch); err != nil {
+		return nil, err
+	}
 	c.collectWire(ch)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c.collectCluster(ch)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c.collectTransactions(ch)
+	return result, ctx.Err()
 }
 
-func (c *Collector) collectTransactions(ch chan<- prometheus.Metric) {
+func (c *Collector) collectTransactions(ch func(prometheus.Metric)) {
 	state := transaction.RuntimeSnapshot{}
 	if c.transactions != nil {
 		state = c.transactions.RuntimeSnapshot()
 	}
-	ch <- gauge(c.transactionRecovery, boolValue(state.RecoveryReady))
+	ch(gauge(c.transactionRecovery, boolValue(state.RecoveryReady)))
 	for _, transactionState := range []transaction.State{transaction.StateOpen, transaction.StateCommitting, transaction.StateCommitted, transaction.StateAborted} {
-		ch <- gauge(c.transactionStates, float64(state.ByState[transactionState]), string(transactionState))
+		ch(gauge(c.transactionStates, float64(state.ByState[transactionState]), string(transactionState)))
 	}
-	ch <- gauge(c.transactionExpired, float64(state.Expired))
-	ch <- gauge(c.transactionOldestActive, state.OldestActiveAgeSeconds)
+	ch(gauge(c.transactionExpired, float64(state.Expired)))
+	ch(gauge(c.transactionOldestActive, state.OldestActiveAgeSeconds))
 }
 func (c *Collector) collectGroups(
-	ch chan<- prometheus.Metric,
+	ch func(prometheus.Metric),
 	partitions map[string]topic.PartitionRuntimeSnapshot,
 	partitionKeysByTopic map[string][]string,
 ) {
@@ -366,8 +383,8 @@ func (c *Collector) collectGroups(
 		for _, memberAssignments := range state.Members {
 			assignments += len(memberAssignments)
 		}
-		ch <- gauge(c.groupGeneration, float64(state.Generation), name, state.TopicName)
-		ch <- gauge(c.groupAssignments, float64(assignments), name, state.TopicName)
+		ch(gauge(c.groupGeneration, float64(state.Generation), name, state.TopicName))
+		ch(gauge(c.groupAssignments, float64(assignments), name, state.TopicName))
 
 		positions := make(map[string]uint64)
 		if !strings.ContainsAny(state.TopicName, "*?") {
@@ -398,14 +415,14 @@ func (c *Collector) collectGroups(
 			}
 			outOfRange := committed < partition.LogStart || committed > partition.HighWatermark
 			partitionLabel := strconv.Itoa(partition.Partition)
-			ch <- gauge(c.groupCommittedOffset, float64(committed), name, partition.Topic, partitionLabel)
-			ch <- gauge(c.groupLag, float64(lag), name, partition.Topic, partitionLabel)
-			ch <- gauge(c.groupOffsetOutOfRange, boolValue(outOfRange), name, partition.Topic, partitionLabel)
+			ch(gauge(c.groupCommittedOffset, float64(committed), name, partition.Topic, partitionLabel))
+			ch(gauge(c.groupLag, float64(lag), name, partition.Topic, partitionLabel))
+			ch(gauge(c.groupOffsetOutOfRange, boolValue(outOfRange), name, partition.Topic, partitionLabel))
 		}
 	}
 }
 
-func (c *Collector) collectGroupLifecycle(ch chan<- prometheus.Metric, partitionKeysByTopic map[string][]string) {
+func (c *Collector) collectGroupLifecycle(ch func(prometheus.Metric), partitionKeysByTopic map[string][]string) {
 	if c.groups == nil {
 		return
 	}
@@ -426,17 +443,17 @@ func (c *Collector) collectGroupLifecycle(ch chan<- prometheus.Metric, partition
 			})
 		}
 
-		ch <- gauge(c.groupCoordinatorUp, boolValue(observation.CoordinatorUp), observation.TopicName, observation.GroupName)
+		ch(gauge(c.groupCoordinatorUp, boolValue(observation.CoordinatorUp), observation.TopicName, observation.GroupName))
 		if !observation.CoordinatorUp || failureReason != "" {
 			continue
 		}
 
-		ch <- gauge(c.groupMembers, float64(observation.MemberCount), observation.TopicName, observation.GroupName)
+		ch(gauge(c.groupMembers, float64(observation.MemberCount), observation.TopicName, observation.GroupName))
 		for _, state := range []string{coordinator.ConsumerGroupStateStable, coordinator.ConsumerGroupStateEmpty} {
-			ch <- gauge(c.groupState, boolValue(observation.State == state), observation.TopicName, observation.GroupName, state)
+			ch(gauge(c.groupState, boolValue(observation.State == state), observation.TopicName, observation.GroupName, state))
 		}
-		ch <- gauge(c.groupLastActivity, timestampSeconds(observation.LastActivity), observation.TopicName, observation.GroupName)
-		ch <- gauge(c.groupLastRebalance, timestampSeconds(observation.LastRebalance), observation.TopicName, observation.GroupName)
+		ch(gauge(c.groupLastActivity, timestampSeconds(observation.LastActivity), observation.TopicName, observation.GroupName))
+		ch(gauge(c.groupLastRebalance, timestampSeconds(observation.LastRebalance), observation.TopicName, observation.GroupName))
 	}
 	c.collectObservationFailureCounters(ch, active, failed)
 }
@@ -476,7 +493,7 @@ func (c *Collector) consumerGroupObservations() []coordinator.ConsumerGroupObser
 }
 
 func (c *Collector) collectObservationFailureCounters(
-	ch chan<- prometheus.Metric,
+	ch func(prometheus.Metric),
 	active map[observationGroupKey]struct{},
 	failed []observationFailureKey,
 ) {
@@ -509,7 +526,7 @@ func (c *Collector) collectObservationFailureCounters(
 
 	for _, sample := range samples {
 		key := sample.key
-		ch <- counter(c.groupObservationFailures, float64(sample.value), key.topic, key.group, key.reason)
+		ch(counter(c.groupObservationFailures, float64(sample.value), key.topic, key.group, key.reason))
 	}
 }
 
@@ -541,72 +558,76 @@ func timestampSeconds(value time.Time) float64 {
 	return float64(value.Unix())
 }
 
-func (c *Collector) collectStorage(ch chan<- prometheus.Metric) {
-	state := disk.RuntimeSnapshot{}
-	if c.disk != nil {
-		state = c.disk.RuntimeSnapshot()
+func (c *Collector) collectStorage(ch func(prometheus.Metric)) error {
+	if c.disk == nil {
+		return nil
 	}
-	ch <- gauge(c.storageHandlers, float64(state.Handlers))
-	ch <- gauge(c.storageSegments, float64(state.Segments))
-	ch <- gauge(c.storageBytes, float64(state.Bytes))
-	ch <- gauge(c.storageFilesystemFreeBytes, float64(state.FilesystemFreeBytes))
-	ch <- gauge(c.storageFilesystemTotalBytes, float64(state.FilesystemTotalBytes))
-	ch <- gauge(c.storageFilesystemHeadroom, boolValue(state.FilesystemHeadroomOK))
-	ch <- gauge(c.storagePendingWrites, float64(state.PendingWrites))
-	ch <- gauge(c.storageActiveReaders, float64(state.ActiveReaders))
-	ch <- gauge(c.storageStatFailures, float64(state.StatFailures))
-	ch <- gauge(c.storageSegmentCacheEntries, float64(state.SegmentCacheEntries))
-	ch <- gauge(c.storageSegmentCacheHits, float64(state.SegmentCacheHits))
-	ch <- gauge(c.storageSegmentCacheMisses, float64(state.SegmentCacheMisses))
-	ch <- gauge(c.storageSegmentCacheEvictions, float64(state.SegmentCacheEvictions))
+	state := c.disk.RuntimeSnapshot()
+	if state.StatFailures > 0 {
+		return fmt.Errorf("storage observation failed: %d stat failures", state.StatFailures)
+	}
+	ch(gauge(c.storageHandlers, float64(state.Handlers)))
+	ch(gauge(c.storageSegments, float64(state.Segments)))
+	ch(gauge(c.storageBytes, float64(state.Bytes)))
+	ch(gauge(c.storageFilesystemFreeBytes, float64(state.FilesystemFreeBytes)))
+	ch(gauge(c.storageFilesystemTotalBytes, float64(state.FilesystemTotalBytes)))
+	ch(gauge(c.storageFilesystemHeadroom, boolValue(state.FilesystemHeadroomOK)))
+	ch(gauge(c.storagePendingWrites, float64(state.PendingWrites)))
+	ch(gauge(c.storageActiveReaders, float64(state.ActiveReaders)))
+	ch(gauge(c.storageStatFailures, float64(state.StatFailures)))
+	ch(gauge(c.storageSegmentCacheEntries, float64(state.SegmentCacheEntries)))
+	ch(gauge(c.storageSegmentCacheHits, float64(state.SegmentCacheHits)))
+	ch(gauge(c.storageSegmentCacheMisses, float64(state.SegmentCacheMisses)))
+	ch(gauge(c.storageSegmentCacheEvictions, float64(state.SegmentCacheEvictions)))
+	return nil
 }
 
-func (c *Collector) collectWire(ch chan<- prometheus.Metric) {
+func (c *Collector) collectWire(ch func(prometheus.Metric)) {
 	state := wire.RuntimeMetrics()
 	for _, reason := range sortedCounterKeys(state.ProtocolFailures) {
-		ch <- counter(c.wireProtocolFailures, float64(state.ProtocolFailures[reason]), reason)
+		ch(counter(c.wireProtocolFailures, float64(state.ProtocolFailures[reason]), reason))
 	}
 	for _, reason := range sortedCounterKeys(state.DecompressionRejections) {
-		ch <- counter(c.wireDecompressionRejections, float64(state.DecompressionRejections[reason]), reason)
+		ch(counter(c.wireDecompressionRejections, float64(state.DecompressionRejections[reason]), reason))
 	}
 }
 
-func (c *Collector) collectCluster(ch chan<- prometheus.Metric) {
+func (c *Collector) collectCluster(ch func(prometheus.Metric)) {
 	state := clustercontroller.RuntimeSnapshot{}
 	if c.cluster != nil {
 		state = c.cluster.RuntimeSnapshot()
 	}
-	ch <- gauge(c.distributionEnabled, boolValue(state.Enabled))
-	ch <- gauge(c.clusterBrokers, float64(state.BrokerCount))
-	ch <- gauge(c.clusterHasLeader, boolValue(state.HasLeader))
-	ch <- gauge(c.clusterIsLeader, boolValue(state.IsLeader))
-	ch <- gauge(c.clusterOffline, float64(state.Offline))
-	ch <- gauge(c.clusterUnderReplicated, float64(state.UnderReplicated))
-	ch <- gauge(c.clusterAssignmentDeficient, float64(state.AssignmentDeficient))
-	ch <- gauge(c.clusterInactivePartitions, float64(state.InactiveReplicaPartitions))
-	ch <- gauge(c.clusterInactiveReplicas, float64(state.InactiveReplicas))
-	ch <- gauge(c.clusterMinISRUnsatisfied, float64(state.MinISRUnsatisfied))
+	ch(gauge(c.distributionEnabled, boolValue(state.Enabled)))
+	ch(gauge(c.clusterBrokers, float64(state.BrokerCount)))
+	ch(gauge(c.clusterHasLeader, boolValue(state.HasLeader)))
+	ch(gauge(c.clusterIsLeader, boolValue(state.IsLeader)))
+	ch(gauge(c.clusterOffline, float64(state.Offline)))
+	ch(gauge(c.clusterUnderReplicated, float64(state.UnderReplicated)))
+	ch(gauge(c.clusterAssignmentDeficient, float64(state.AssignmentDeficient)))
+	ch(gauge(c.clusterInactivePartitions, float64(state.InactiveReplicaPartitions)))
+	ch(gauge(c.clusterInactiveReplicas, float64(state.InactiveReplicas)))
+	ch(gauge(c.clusterMinISRUnsatisfied, float64(state.MinISRUnsatisfied)))
 	for _, metric := range replication.ISRProofMetrics() {
-		ch <- counter(c.isrCatchupProofs, float64(metric.Count), metric.Outcome, metric.Reason)
+		ch(counter(c.isrCatchupProofs, float64(metric.Count), metric.Outcome, metric.Reason))
 	}
 	for _, operation := range []string{"create", "restore", "delete"} {
-		ch <- gauge(c.topicMaterializationPending, float64(state.TopicMaterializationsPending[operation]), operation)
+		ch(gauge(c.topicMaterializationPending, float64(state.TopicMaterializationsPending[operation]), operation))
 		attempts := state.TopicMaterializationAttempts[operation]
-		ch <- counter(c.topicMaterializationAttempts, float64(attempts.Success), operation, "success")
-		ch <- counter(c.topicMaterializationAttempts, float64(attempts.Failure), operation, "failure")
+		ch(counter(c.topicMaterializationAttempts, float64(attempts.Success), operation, "success"))
+		ch(counter(c.topicMaterializationAttempts, float64(attempts.Failure), operation, "failure"))
 	}
-	ch <- gauge(c.topicMaterializationOldest, state.TopicMaterializationOldestPending)
+	ch(gauge(c.topicMaterializationOldest, state.TopicMaterializationOldestPending))
 	for _, partition := range state.PartitionDetails {
 		partitionLabel := strconv.Itoa(partition.Partition)
-		ch <- gauge(c.partitionReplicas, float64(partition.Replicas), partition.Topic, partitionLabel)
-		ch <- gauge(c.partitionExpectedReplicas, float64(partition.ExpectedReplicas), partition.Topic, partitionLabel)
-		ch <- gauge(c.partitionActiveReplicas, float64(partition.ActiveReplicas), partition.Topic, partitionLabel)
-		ch <- gauge(c.partitionInSync, float64(partition.InSync), partition.Topic, partitionLabel)
-		ch <- gauge(c.partitionMinInSyncReplicas, float64(partition.MinInSyncReplicas), partition.Topic, partitionLabel)
-		ch <- gauge(c.partitionTopologyHealthy, boolValue(partition.Healthy), partition.Topic, partitionLabel)
-		ch <- gauge(c.partitionLeaderEpoch, float64(partition.LeaderEpoch), partition.Topic, partitionLabel)
+		ch(gauge(c.partitionReplicas, float64(partition.Replicas), partition.Topic, partitionLabel))
+		ch(gauge(c.partitionExpectedReplicas, float64(partition.ExpectedReplicas), partition.Topic, partitionLabel))
+		ch(gauge(c.partitionActiveReplicas, float64(partition.ActiveReplicas), partition.Topic, partitionLabel))
+		ch(gauge(c.partitionInSync, float64(partition.InSync), partition.Topic, partitionLabel))
+		ch(gauge(c.partitionMinInSyncReplicas, float64(partition.MinInSyncReplicas), partition.Topic, partitionLabel))
+		ch(gauge(c.partitionTopologyHealthy, boolValue(partition.Healthy), partition.Topic, partitionLabel))
+		ch(gauge(c.partitionLeaderEpoch, float64(partition.LeaderEpoch), partition.Topic, partitionLabel))
 		if partition.Leader != "" {
-			ch <- gauge(c.partitionLeader, 1, partition.Topic, partitionLabel, partition.Leader)
+			ch(gauge(c.partitionLeader, 1, partition.Topic, partitionLabel, partition.Leader))
 		}
 	}
 }

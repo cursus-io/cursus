@@ -22,10 +22,11 @@ type RuntimeSnapshot struct {
 	FilesystemHeadroomOK  bool
 }
 
-// RuntimeSnapshot returns storage state without retaining manager locks during I/O.
+// RuntimeSnapshot samples storage state and may block on filesystem calls or
+// locks shared with fsync. Call it only from a bounded background observer.
 func (dm *DiskManager) RuntimeSnapshot() RuntimeSnapshot {
 	if dm == nil {
-		return RuntimeSnapshot{}
+		return RuntimeSnapshot{StatFailures: 1}
 	}
 
 	dm.mu.Lock()
@@ -87,6 +88,7 @@ func (dm *DiskManager) RuntimeSnapshot() RuntimeSnapshot {
 }
 
 // Ready verifies that the configured log directory and active handlers are available.
+// It performs synchronous I/O and must not run on a health HTTP request goroutine.
 func (dm *DiskManager) Ready() error {
 	if dm == nil || dm.cfg == nil {
 		return fmt.Errorf("disk manager unavailable")

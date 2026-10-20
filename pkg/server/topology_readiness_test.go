@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/topic"
@@ -37,7 +38,10 @@ func TestClusterTopologyDegradationDoesNotGateNodeReadiness(t *testing.T) {
 	require.Error(t, state.EvaluateTopology(2).ReadinessError())
 
 	health := NewHealthState()
+	t.Cleanup(health.Close)
+	health.Start()
 	health.SetReady(true)
+	require.Eventually(t, health.IsReady, time.Second, time.Millisecond)
 	response := httptest.NewRecorder()
 	newHealthHandler(health).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/ready", nil))
 	require.Equal(t, http.StatusOK, response.Code)

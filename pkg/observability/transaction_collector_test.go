@@ -12,7 +12,7 @@ type fixedTransactions struct{ snapshot transaction.RuntimeSnapshot }
 func (source fixedTransactions) RuntimeSnapshot() transaction.RuntimeSnapshot { return source.snapshot }
 
 func TestCollectorExportsTransactionState(t *testing.T) {
-	collector := NewCollector(nil, nil, nil, nil, nil, nil, fixedTransactions{snapshot: transaction.RuntimeSnapshot{
+	collector := newSampleCollector(nil, nil, nil, nil, nil, nil, fixedTransactions{snapshot: transaction.RuntimeSnapshot{
 		ByState: map[transaction.State]int{
 			transaction.StateOpen:       2,
 			transaction.StateCommitting: 1,

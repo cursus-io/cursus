@@ -13,23 +13,33 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/observation"
 	"github.com/cursus-io/cursus/util"
 )
 
-const healthCheckTimeout = 2 * time.Second
-
 type readinessCheck func(context.Context) error
 
-// HealthState tracks startup readiness and dynamic dependency checks.
+type healthResult struct {
+	checks  map[string]string
+	version uint64
+}
+
+// HealthState publishes dependency observations independently of HTTP requests.
+// Start and Close are owned by the broker/diagnostics server lifecycle.
 type HealthState struct {
-	ready  atomic.Bool
-	mu     sync.RWMutex
-	checks map[string]readinessCheck
+	ready   atomic.Bool
+	mu      sync.RWMutex // registration only; never held while invoking a check
+	checks  map[string]readinessCheck
+	version uint64
+	worker  *observation.Worker[healthResult]
 }
 
 func NewHealthState() *HealthState {
-	return &HealthState{checks: make(map[string]readinessCheck)}
+	return &HealthState{checks: make(map[string]readinessCheck), worker: observation.New[healthResult](observation.Interval, observation.Timeout, observation.MaxAge)}
 }
+
+func (state *HealthState) Start() { state.worker.Start(state.sample) }
+func (state *HealthState) Close() { state.SetReady(false); state.worker.Close() }
 
 func (state *HealthState) SetReady(ready bool) {
 	if state != nil {
@@ -43,10 +53,21 @@ func (state *HealthState) AddCheck(name string, check readinessCheck) {
 	}
 	state.mu.Lock()
 	state.checks[name] = check
+	state.version++ // An earlier result cannot certify a newly registered check.
 	state.mu.Unlock()
 }
 
-// IsReady reports startup state plus all current dependency checks.
+func (state *HealthState) ObservationStatus() observation.Status {
+	snapshot := state.worker.Snapshot()
+	state.mu.RLock()
+	version := state.version
+	state.mu.RUnlock()
+	if snapshot.Value.version != version {
+		snapshot.Stale = true
+	}
+	return snapshot.Status
+}
+
 func (state *HealthState) IsReady() bool {
 	ready, _ := state.report()
 	return ready
@@ -56,7 +77,33 @@ func (state *HealthState) report() (bool, map[string]string) {
 	if state == nil || !state.ready.Load() {
 		return false, map[string]string{"broker": "starting"}
 	}
+	snapshot := state.worker.Snapshot()
+	state.mu.RLock()
+	version := state.version
+	state.mu.RUnlock()
+	if snapshot.Value.version != version || snapshot.CompletedAt.IsZero() {
+		return false, map[string]string{"observation": "not yet checked"}
+	}
+	if snapshot.Stopped {
+		return false, map[string]string{"observation": "stopped"}
+	}
+	if snapshot.TimedOut {
+		return false, map[string]string{"observation": "check deadline exceeded"}
+	}
+	if snapshot.Stale {
+		return false, map[string]string{"observation": "last completed check expired"}
+	}
+	checks := make(map[string]string, len(snapshot.Value.checks)+1)
+	for name, result := range snapshot.Value.checks {
+		checks[name] = result
+	}
+	if snapshot.Error != "" {
+		checks["observation"] = snapshot.Error
+	}
+	return snapshot.Valid(), checks
+}
 
+func (state *HealthState) sample(ctx context.Context) (healthResult, error) {
 	state.mu.RLock()
 	names := make([]string, 0, len(state.checks))
 	checks := make(map[string]readinessCheck, len(state.checks))
@@ -64,28 +111,29 @@ func (state *HealthState) report() (bool, map[string]string) {
 		names = append(names, name)
 		checks[name] = check
 	}
+	version := state.version
 	state.mu.RUnlock()
 	sort.Strings(names)
-
-	result := make(map[string]string, len(names))
-	ready := true
+	result := healthResult{checks: make(map[string]string, len(names)), version: version}
+	var failure error
 	for _, name := range names {
-		ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
-		err := checks[name](ctx)
-		cancel()
-		if err != nil {
-			ready = false
-			result[name] = err.Error()
-			continue
+		if err := ctx.Err(); err != nil {
+			return result, errors.Join(failure, err)
 		}
-		result[name] = "ok"
+		if err := checks[name](ctx); err != nil {
+			result.checks[name] = err.Error()
+			failure = errors.Join(failure, fmt.Errorf("%s: %w", name, err))
+		} else {
+			result.checks[name] = "ok"
+		}
 	}
-	return ready, result
+	return result, failure
 }
 
 type healthResponse struct {
-	Status string            `json:"status"`
-	Checks map[string]string `json:"checks,omitempty"`
+	Status      string              `json:"status"`
+	Checks      map[string]string   `json:"checks,omitempty"`
+	Observation *observation.Status `json:"observation,omitempty"`
 }
 
 func newHealthHandler(state *HealthState) http.Handler {
@@ -107,7 +155,12 @@ func newHealthHandler(state *HealthState) http.Handler {
 			status = http.StatusServiceUnavailable
 			label = "not_ready"
 		}
-		writeHealthJSON(w, status, healthResponse{Status: label, Checks: checks})
+		var observed *observation.Status
+		if state != nil {
+			status := state.ObservationStatus()
+			observed = &status
+		}
+		writeHealthJSON(w, status, healthResponse{Status: label, Checks: checks, Observation: observed})
 	})
 	return mux
 }

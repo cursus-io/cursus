@@ -53,7 +53,7 @@ type fixedReadiness bool
 func (source fixedReadiness) IsReady() bool { return bool(source) }
 
 func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
-	collector := NewCollector(
+	collector := newSampleCollector(
 		fixedTopics{snapshot: topic.RuntimeSnapshot{
 			TopicCount:                      1,
 			MetadataLoadFailure:             "decode failed",
@@ -162,7 +162,7 @@ func assertMetricExists(t *testing.T, families []*dto.MetricFamily, name string,
 }
 
 func TestCollectorExportsConsumerMetadataRecoveryStatus(t *testing.T) {
-	collector := NewCollector(
+	collector := newSampleCollector(
 		fixedTopics{},
 		fixedRecoveryGroups{recovery: coordinator.ConsumerMetadataRecoveryStatus{
 			Phase: "committed_offset_replay", Ready: false,

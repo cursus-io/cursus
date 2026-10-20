@@ -24,6 +24,7 @@ type filesystemSpaceSnapshot struct {
 
 type diskHeadroomGuard struct {
 	mu             sync.Mutex
+	query          func(string) (uint64, uint64, error)
 	path           string
 	minFreeBytes   uint64
 	minFreePercent float64
@@ -43,6 +44,7 @@ func newDiskHeadroomGuard(path string, minFreeBytes int64, minFreePercent float6
 	}
 	return &diskHeadroomGuard{
 		path:           path,
+		query:          queryFilesystemSpace,
 		minFreeBytes:   uint64(minFreeBytes),
 		minFreePercent: minFreePercent,
 	}
@@ -57,7 +59,11 @@ func (g *diskHeadroomGuard) reserve(required uint64, forceRefresh bool) (filesys
 
 	now := time.Now()
 	if forceRefresh || g.checkedAt.IsZero() || now.Sub(g.checkedAt) >= filesystemSpaceCacheTTL {
-		free, total, err := queryFilesystemSpace(g.path)
+		query := g.query
+		if query == nil {
+			query = queryFilesystemSpace
+		}
+		free, total, err := query(g.path)
 		g.checkedAt = now
 		g.reserved = 0
 		g.free = free
