@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -92,9 +93,11 @@ func logGenerationRecoveryWork(t *testing.T, before map[generationWorkKey]float6
 func restartGenerationRecoveryCluster(t *testing.T, ctx *ClusterTestContext, actions *ClusterActions) {
 	t.Helper()
 	// Stop all before starting any. Restart, do not recreate/delete their volumes.
-	recoveryDocker(t, "stop", "broker-1", "broker-2", "broker-3")
+	prefix := os.Getenv("CURSUS_E2E_CONTAINER_PREFIX")
+	brokers := []string{prefix + "broker-1", prefix + "broker-2", prefix + "broker-3"}
+	recoveryDocker(t, append([]string{"stop"}, brokers...)...)
 	ctx.GetClient().Close()
-	recoveryDocker(t, "start", "broker-1", "broker-2", "broker-3")
+	recoveryDocker(t, append([]string{"start"}, brokers...)...)
 	for node := 1; node <= 3; node++ {
 		require.NoError(t, actions.waitForNodeHealthWithin(node, clusterHealthCheckAddrs(3)[node-1], 2*time.Minute))
 	}

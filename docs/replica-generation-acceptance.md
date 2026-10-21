@@ -97,7 +97,54 @@ Local Docker reruns encountered occupied ports from a concurrent cluster test.
 The remaining local integration validation uses an isolated copy with only test
 ports, Compose project/network and container names changed. Production sources
 are compared byte-for-byte with the PR checkout. Workflow branch filters are
-unchanged. Full integration results will be appended after that run.
+unchanged. The isolated copy verified 796 production/support files as identical.
+
+### Completed local integration run
+
+Both selected three-node scenarios passed (417.369 seconds total):
+
+- `TestIndexedRecoveryBoundsLargeLegacyTailOnThreeNodes`: 306.77 seconds,
+  including 10 interleaved offline append/offset-commit batches, HWM advancement
+  from 10001 to 10002 under a delayed response, unchanged local segment hashes
+  and LEO/HWM after rejection, ISR exclusion, 53 further offset commits during
+  recovery, truncate/incremental process crashes, and a restart of all brokers.
+  Every raw history record, offset 10002, producer retry and aggregate-event
+  retry/history survived. Fresh aggregate version 4 also succeeded after restart.
+- `TestReplicaRecoveryWithoutLaterEpochBoundary`: 103.35 seconds, including its
+  original nonzero source-epoch assertions, follower restart, the added complete
+  cluster restart, exact raw equality and producer retry with no extra offset.
+
+The actual indexed repair log was `start=10001 current=0 target=10002` under
+leader epoch 2. It took 17 exchanges including failed turns. The incremental
+authoritative range reconstructed was `[0,10002)` (10002 unique records), including
+the seed at offset 0. This is the concrete counterexample to claiming that this
+fixture physically preserves the local committed prefix during repair.
+
+Work deltas sampled before comparison reads and subsequent process crashes:
+
+| Broker | Lineage logical read bytes | Canonically hashed records | Canonical hash bytes | Catch-up response bytes | Retained replay/validation scan records |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 7,571 | 1 | 183 | 0 | 0 |
+| 2 (receiver) | 4,706,657 | 23,935 | 4,257,937 | 4,776,823 | 0 |
+| 3 (new leader) | 1,772,829 | 10,768 | 1,915,694 | 0 | 0 |
+| Total | 6,487,057 | 34,704 | 6,173,814 | 4,776,823 | 0 |
+
+The repeated counter sample later in the test includes another 1,024 receiver
+read bytes from background work; the table uses the single delimited measurement
+window. Source and receiver cold/warm index state differs, so these figures are
+an observed workload, not a general complexity bound.
+
+Repeat through the existing CI jobs, or locally with Docker:
+
+```sh
+RUN_E2E_RETAINED_BOOTSTRAP=1 RUN_E2E_CHAOS=1 go test -v -count=1 -timeout 30m ./test/e2e-cluster -run '^Test(IndexedRecoveryBoundsLargeLegacyTailOnThreeNodes|ReplicaRecoveryWithoutLaterEpochBoundary)$'
+```
+
+The initial CodeRabbit review found one actionable problem: the new full-cluster
+restart helper needed to honor `CURSUS_E2E_CONTAINER_PREFIX`. The helper now does
+so. The isolated run used the same prefixed targets via its endpoint-only test
+copy; final CI exercises the repository's default configuration. No additional
+bot review was requested.
 
 Metrics are process-wide deltas, including background proof work, failed work,
 the other recovered partitions and live consumer commits. `lineage/decoded_frames`
