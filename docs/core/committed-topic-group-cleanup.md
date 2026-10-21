@@ -33,6 +33,12 @@ file metadata are additional bounded work. The sequential reader carries the
 segment and byte position between pages; it does not consult sparse indexes or
 fall back to rescanning the log prefix. Counts include every decoded record,
 even records skipped before the requested offset or beyond a compacted gap.
+The physical prefix also includes non-JSON transaction commit/abort controls.
+Cleanup validates their broker marker payload, unkeyed envelope, producer
+identity, terminal state and canonical control bytes before skipping them.
+They count against the same scan budget and never supply lifecycle evidence.
+A malformed control or a keyed lifecycle record disguised as one keeps cleanup
+pending; transaction flags alone are not permission to skip metadata.
 Progress survives ordinary append and transient
 read failures; partition replacement, rollback, snapshot recovery, retained
 start changes and local group replacement invalidate it. Only tracked groups'

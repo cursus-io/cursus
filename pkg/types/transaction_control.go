@@ -6,6 +6,9 @@ import (
 	"fmt"
 )
 
+// TransactionControlMarkerPayload identifies the broker-generated control record.
+const TransactionControlMarkerPayload = "__cursus_txn_control_marker__"
+
 func TransactionMarkerControlBytes(marker string, coordinatorEpoch int64) ([]byte, []byte, error) {
 	if coordinatorEpoch < -(1<<31) || coordinatorEpoch > (1<<31)-1 {
 		return nil, nil, fmt.Errorf("coordinator epoch out of int32 range: %d", coordinatorEpoch)

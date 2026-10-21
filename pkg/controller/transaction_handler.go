@@ -23,7 +23,7 @@ import (
 
 const maxTransactionReconcilePagesPerPass = 4
 
-const transactionControlMarkerPayload = "__cursus_txn_control_marker__"
+const transactionControlMarkerPayload = types.TransactionControlMarkerPayload
 
 type transactionRequestFingerprint struct {
 	Command            string `json:"command"`
