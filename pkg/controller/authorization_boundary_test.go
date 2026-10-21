@@ -37,6 +37,7 @@ func TestProtectedCommandsRequireAuthenticationWhenSASLIsEnabled(t *testing.T) {
 		"LIST",
 		"CREATE topic=blocked partitions=1",
 		"TRUNCATE topic=blocked expected_revision=1",
+		"TRUNCATE_INSTANCE topic=blocked expected_revision=1 expected_instance=instance-original-1234",
 		"CLUSTER_STATUS",
 		"ELECT_LEADER topic=orders partition=0 broker=broker-2",
 		"JOIN_GROUP topic=missing group=workers member=m1",

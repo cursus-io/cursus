@@ -195,7 +195,7 @@ func TestLocalRegistrationWithholdsIncompleteRecoveryCapability(t *testing.T) {
 	require.Equal(t, "active", captured.Status)
 	require.False(t, captured.LastSeen.IsZero())
 	require.Equal(t, 7, captured.TransactionCoordinatorShards)
-	require.Equal(t, 6, captured.LifecycleProtocol)
+	require.Equal(t, fsm.BrokerProtocolVersionCurrent, captured.LifecycleProtocol)
 	rm.AssertExpectations(t)
 }
 

@@ -59,6 +59,9 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 
 		var current *topic.Definition
 		if fsmRef := ch.Cluster.RaftManager.GetFSM(); fsmRef != nil {
+			if fsmRef.SupportsTruncateReceipts() {
+				defaults.InstanceID = rand.Text()
+			}
 			if definition, found := fsmRef.GetTopicDefinition(topicName); found {
 				current = &definition
 			}
@@ -100,6 +103,7 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 				return formatCreateTopicError(topicName, err)
 			}
 		}
+		defaults.InstanceID = rand.Text()
 		if _, err := tm.CreateTopicWithPatch(defaults, patch); err != nil {
 			return formatCreateTopicError(topicName, err)
 		}
@@ -120,7 +124,7 @@ func (ch *CommandHandler) handleCreate(cmd string, ctx ...*ClientContext) string
 		}
 	}
 	definition := t.Definition()
-	return formatTopicDefinitionResponse(definition) + " " + ch.topicMinISRMetadata(definition.Policy) + fmt.Sprintf(" aggregate_replay=%t", definition.Policy.AggregateReplay)
+	return formatTopicDefinitionResponse(definition) + " " + ch.topicMinISRMetadata(definition.Policy) + fmt.Sprintf(" aggregate_replay=%t instance_id=%s", definition.Policy.AggregateReplay, definition.InstanceID)
 }
 
 // handleDelete processes DELETE command
@@ -223,7 +227,15 @@ func (ch *CommandHandler) handleDelete(cmd string, ctx ...*ClientContext) string
 // once by the lifecycle epoch transition.
 func (ch *CommandHandler) handleTruncate(cmd string, ctx ...*ClientContext) string {
 	requestCtx := firstClientContext(ctx).RequestContext()
-	args := parseKeyValueArgs(strings.TrimPrefix(cmd, "TRUNCATE "))
+	input := decodeCommandInput(cmd)
+	args := input.Args
+	instance := ""
+	if input.Name == "TRUNCATE_INSTANCE" {
+		instance = args["expected_instance"]
+		if !topic.ValidInstanceID(instance) {
+			return "ERROR: invalid_expected_instance command=TRUNCATE_INSTANCE"
+		}
+	}
 	topicName := args["topic"]
 	if topicName == "" {
 		return "ERROR: missing_topic expected=\"TRUNCATE topic=<name> expected_revision=<N>\""
@@ -247,7 +259,21 @@ func (ch *CommandHandler) handleTruncate(cmd string, ctx ...*ClientContext) stri
 		if resp, forwarded, _ := ch.isLeaderAndForwardContext(requestCtx, cmd); forwarded {
 			return resp
 		}
-		if _, err := ch.prepareTopicDependencies(topicName); err != nil {
+		replay := false
+		if instance != "" {
+			state := ch.Cluster.RaftManager.GetFSM()
+			if state == nil || !state.SupportsTruncateReceipts() {
+				return "ERROR: truncate_receipt_unsupported reason=\"all active brokers must support lifecycle protocol 7\""
+			}
+			if definition, found := state.GetTopicDefinition(topicName); found {
+				var checkErr error
+				replay, checkErr = definition.CheckTruncate(expectedRevision, instance)
+				if checkErr != nil {
+					return formatTruncateError(topicName, expectedRevision, checkErr)
+				}
+			}
+		}
+		if _, err := ch.prepareTruncateDependencies(topicName, replay); err != nil {
 			if errors.Is(err, topic.ErrTopicDeleteBlocked) {
 				return fmt.Sprintf("ERROR: topic_truncate_blocked topic=%s reason=%q", topicName, err.Error())
 			}
@@ -256,6 +282,7 @@ func (ch *CommandHandler) handleTruncate(cmd string, ctx ...*ClientContext) stri
 		result, applyErr := ch.applyAndWaitContext(requestCtx, "TOPIC_TRUNCATE", map[string]interface{}{
 			"topic":             topicName,
 			"expected_revision": expectedRevision,
+			"expected_instance": instance,
 		})
 		if applyErr != nil {
 			return formatTruncateError(topicName, expectedRevision, applyErr)
@@ -267,6 +294,15 @@ func (ch *CommandHandler) handleTruncate(cmd string, ctx ...*ClientContext) stri
 		return formatTruncateResult(truncateResult)
 	}
 
+	if instance != "" {
+		result, replay, checkErr := ch.TopicManager.TruncateRetryResult(topicName, expectedRevision, instance)
+		if checkErr != nil {
+			return formatTruncateError(topicName, expectedRevision, checkErr)
+		}
+		if replay && !result.CleanupPending {
+			return formatTruncateResult(result)
+		}
+	}
 	transactionState, err := ch.prepareTopicDependencies(topicName)
 	if err != nil {
 		if errors.Is(err, topic.ErrTopicDeleteBlocked) {
@@ -274,7 +310,7 @@ func (ch *CommandHandler) handleTruncate(cmd string, ctx ...*ClientContext) stri
 		}
 		return fmt.Sprintf("ERROR: truncate_topic_failed topic=%s reason=%q", topicName, err.Error())
 	}
-	result, truncateErr := ch.TopicManager.TruncateTopicDurable(topicName, expectedRevision)
+	result, truncateErr := ch.TopicManager.TruncateTopicInstanceDurable(topicName, expectedRevision, instance)
 	if truncateErr != nil && !result.Truncated {
 		return formatTruncateError(topicName, expectedRevision, truncateErr)
 	}
@@ -315,7 +351,22 @@ func formatTruncateResult(result topic.TruncateResult) string {
 	if result.CleanupPending {
 		response += " cleanup_pending=true"
 	}
+	if result.Definition.InstanceID != "" && result.Definition.TruncateRevision != 0 {
+		response += " instance_id=" + result.Definition.InstanceID
+	}
+	if result.Replayed {
+		response += " replayed=true"
+	}
 	return response
+}
+
+func (ch *CommandHandler) prepareTruncateDependencies(name string, replay bool) (map[string]*transaction.Snapshot, error) {
+	if replay {
+		// A replicated receipt is a read of a historical outcome. New memberships
+		// and transactions are unrelated to that already committed operation.
+		return nil, nil
+	}
+	return ch.prepareTopicDependencies(name)
 }
 
 // RecoverPendingTruncations resumes a standalone lifecycle transition found

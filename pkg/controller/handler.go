@@ -232,6 +232,7 @@ func NewCommandHandler(
 		{prefix: "ALTER_TOPIC_CONFIG ", exact: false, helpOrder: 41, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleAlterTopicConfig(cmd, ctx) }},
 		{prefix: "DELETE ", exact: false, helpOrder: 2, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleDelete(cmd, ctx) }},
 		{prefix: "TRUNCATE ", exact: false, helpOrder: 3, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTruncate(cmd, ctx) }},
+		{prefix: "TRUNCATE_INSTANCE ", exact: false, helpOrder: 46, permissions: []string{PermissionAdmin}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleTruncate(cmd, ctx) }},
 		{prefix: "PUBLISH ", exact: false, helpOrder: 5, permissions: []string{PermissionTopicWrite}, handler: func(cmd string, ctx *ClientContext) string { return ch.handlePublish(cmd, ctx) }},
 		{prefix: "CONSUME ", exact: false, helpOrder: 6, permissions: []string{PermissionTopicRead, PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.validateConsumeSyntax(cmd, cmd) }},
 		{prefix: "STREAM ", exact: false, helpOrder: 7, permissions: []string{PermissionTopicRead, PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.validateStreamSyntax(cmd, cmd) }},
@@ -396,7 +397,7 @@ func (ch *CommandHandler) HandleCommand(rawCmd string, ctx *ClientContext) (resp
 	}
 	if topicName := lifecycleTopicName(input); topicName != "" && ch.TopicManager != nil && ch.TopicManager.IsTruncationPending(topicName) {
 		switch input.Name {
-		case "TRUNCATE":
+		case "TRUNCATE", "TRUNCATE_INSTANCE":
 		default:
 			return ch.fail(rawCmd, fmt.Sprintf("ERROR: topic_lifecycle_pending topic=%s operation=truncate", topicName))
 		}

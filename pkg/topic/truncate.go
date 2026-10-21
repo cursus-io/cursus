@@ -25,6 +25,7 @@ type TruncateResult struct {
 	Topic          string
 	Truncated      bool
 	CleanupPending bool
+	Replayed       bool
 	Definition     Definition
 }
 
@@ -33,6 +34,10 @@ type TruncateResult struct {
 // group/transaction dependencies and call CompleteTruncation before the topic
 // is made available again.
 func (tm *TopicManager) TruncateTopicDurable(name string, expectedRevision uint64) (TruncateResult, error) {
+	return tm.TruncateTopicInstanceDurable(name, expectedRevision, "")
+}
+
+func (tm *TopicManager) TruncateTopicInstanceDurable(name string, expectedRevision uint64, instance string) (TruncateResult, error) {
 	if tm == nil {
 		return TruncateResult{}, fmt.Errorf("topic manager is not available")
 	}
@@ -51,15 +56,24 @@ func (tm *TopicManager) TruncateTopicDurable(name string, expectedRevision uint6
 		return TruncateResult{}, fmt.Errorf("%w: %s", ErrTopicNotFound, name)
 	}
 	if pending {
+		if instance != "" && instance != target.InstanceID {
+			tm.mu.Unlock()
+			return TruncateResult{}, fmt.Errorf("%w: topic instance changed", ErrTopicRevisionConflict)
+		}
 		if expectedRevision == math.MaxUint64 || target.Revision != expectedRevision+1 {
 			tm.mu.Unlock()
 			return TruncateResult{}, revisionConflict(name, target.Revision, expectedRevision)
 		}
 	} else {
 		definition := current.Definition()
-		if definition.Revision != expectedRevision {
+		replay, err := definition.CheckTruncate(expectedRevision, instance)
+		if err != nil {
 			tm.mu.Unlock()
-			return TruncateResult{}, revisionConflict(name, definition.Revision, expectedRevision)
+			return TruncateResult{}, err
+		}
+		if replay {
+			tm.mu.Unlock()
+			return TruncateResult{Topic: name, Truncated: true, Definition: definition, Replayed: true}, nil
 		}
 		if definition.Revision == math.MaxUint64 || definition.LifecycleEpoch == math.MaxUint64 {
 			tm.mu.Unlock()
@@ -68,6 +82,12 @@ func (tm *TopicManager) TruncateTopicDurable(name string, expectedRevision uint6
 		target = definition
 		target.Revision++
 		target.LifecycleEpoch++
+		if instance != "" {
+			target.TruncateRevision = target.Revision
+			target.TruncateEpoch = target.LifecycleEpoch
+		} else {
+			target.TruncateRevision, target.TruncateEpoch = 0, 0
+		}
 	}
 	if tm.deleting[name] {
 		tm.mu.Unlock()
@@ -198,10 +218,12 @@ func (tm *TopicManager) resetTopicStorageLocked(target Definition) error {
 	if err := tm.deleteTopicLogDirLocked(target.Name); err != nil {
 		return fmt.Errorf("remove old lifecycle storage %q: %w", target.Name, err)
 	}
+	tm.observeTruncatePhase("storage_removed")
 	recreated, err := newTopicWithDefinition(target, tm.hp, tm.cfg, tm.StreamManager)
 	if err != nil {
 		return fmt.Errorf("create empty lifecycle storage %q: %w", target.Name, err)
 	}
+	tm.observeTruncatePhase("storage_created")
 	for _, partition := range recreated.Partitions {
 		if err := partition.ReconcileCommittedHWM(0); err != nil {
 			for _, created := range recreated.Partitions {
@@ -209,6 +231,7 @@ func (tm *TopicManager) resetTopicStorageLocked(target Definition) error {
 			}
 			return fmt.Errorf("establish empty lifecycle watermark %q[%d]: %w", target.Name, partition.ID(), err)
 		}
+		tm.observeTruncatePhase("watermark_persisted")
 	}
 	recreated.SetTransactionDecisionResolver(tm.txnResolver)
 	tm.topics[target.Name] = recreated
@@ -346,14 +369,23 @@ func (tm *TopicManager) writeLifecycleEpochMarkerLocked(definition Definition) e
 		_ = file.Close()
 		return fmt.Errorf("sync lifecycle epoch marker: %w", err)
 	}
+	tm.observeTruncatePhase("marker_synced")
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close lifecycle epoch marker: %w", err)
 	}
 	if err := replaceCheckpointFile(tmp, path); err != nil {
 		return fmt.Errorf("replace lifecycle epoch marker: %w", err)
 	}
+	tm.observeTruncatePhase("marker_renamed")
 	if err := syncTopicMetadataDirectoryFn(dir); err != nil {
 		return fmt.Errorf("sync lifecycle epoch marker directory: %w", err)
 	}
+	tm.observeTruncatePhase("marker_directory_synced")
 	return nil
+}
+
+func (tm *TopicManager) observeTruncatePhase(phase string) {
+	if tm.truncatePhase != nil {
+		tm.truncatePhase(phase)
+	}
 }

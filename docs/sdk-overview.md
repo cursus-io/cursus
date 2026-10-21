@@ -275,14 +275,17 @@ deleted, err := admin.DeleteTopic("retired-player-state", sdk.DeleteTopicOptions
     IfExists: true,
 })
 
-truncated, err := admin.TruncateTopic("test-player-state", sdk.TruncateTopicOptions{
+truncated, err := admin.TruncateTopic(definition.Topic, sdk.TruncateTopicOptions{
     ExpectedRevision: definition.Revision,
+    ExpectedInstance: definition.InstanceID,
 })
 ```
 
 `AdminClient` validates values locally, returns the broker's complete `TopicDefinition` for create/update, a `DeleteTopicResult` for delete, and a `TruncateTopicResult` for reset. Attempts are bounded by `MaxRetries + 1` and rotate across configured brokers for retryable routing/availability and pre-submission transport failures. The SDK canonicalizes `compact,delete` to `delete,compact`, enforces the portable topic-name contract, and rejects unsafe command values, zero expected revisions, negative retention, or unknown policy enums before opening a broker connection. Compact policies require a non-event-sourcing application topic; the broker enforces the additional distributed safety gates. `EventStore.CreateTopic` explicitly declares `cleanup_policy=delete`.
 
-`DeleteTopic` and `TruncateTopic` exist only on the admin client; producer and consumer clients do not expose destructive lifecycle methods. `IfExists` makes an explicit deletion retry idempotent; without it, a missing topic returns `topic_not_found`. The admin client retries a dropped connection after command submission only for `IfExists=true`; non-idempotent delete and truncate stop with an unknown-outcome error. A truncate replay cannot erase a second generation because `ExpectedRevision` is mandatory, but a committed first attempt would return a conflict rather than the original result, so the SDK does not hide that ambiguity. `CleanupPending` means the logical lifecycle committed while broker-local storage cleanup is still converging. Kubernetes reconcilers should call delete only for an explicit absent/tombstone resource that crossed a separate approval boundary, and should never emulate truncation with delete-and-create.
+`DeleteTopic` and `TruncateTopic` exist only on the admin client. `IfExists=true` permits ambiguous delete retries. For truncate, a nonempty `ExpectedInstance` selects `TRUNCATE_INSTANCE` and permits bounded retries of the exact instance/revision pair after a lost reply. Persist that pair before submission; never fetch a fresh revision to retry an unknown outcome. A proven replay returns `Replayed=true` and the historical reset offsets without deleting new records or groups. The receipt survives restart and snapshots until another definition revision; a changed definition, deleted/recreated topic, or missing proof returns a conflict. The broker requires lifecycle protocol 7 on every active broker, and the SDK never falls back to legacy truncate on an unsupported server.
+
+Omitting `ExpectedInstance` preserves legacy `TRUNCATE`: a successful old-revision retry conflicts and an ambiguous transport failure is not automatically retried. `CleanupPending` distinguishes committed intent from unfinished local materialization; its absence does not certify every replica. Check broker readiness and per-broker materialization before resuming traffic. Desired-list omission never authorizes delete or truncate; only an explicit destructive action may call these APIs. See the [truncate recovery contract](core/truncate-contract-recovery.md) and [upgrade runbook](operations/upgrade-and-recovery.md).
 
 ## Go Transactional Producer
 

@@ -201,7 +201,56 @@ shared offsets or delete a multi-topic group just to unblock a pending topic.
 See [topic cleanup safety](core/topic-cleanup-safety.md) for the implementation
 boundary and Kafka comparison.
 
-Every active broker must advertise lifecycle protocol version 1 before a distributed truncate is accepted. A Raft directory is valid only when its `.cursus-raft-format` marker contains `9`; non-empty unmarked directories, older markers, older snapshots, and partition metadata without explicit committed-HWM provenance fail startup with `unsupported recovery protocol`. Recovery requires removing all Cursus persistent state and clean-bootstrapping the whole cluster; mixed-version rolling upgrades and downgrade are unsupported.
+Legacy `TRUNCATE` consumes the revision once: after completed success, repeating
+the old revision returns `topic_revision_conflict`. A timeout is an unknown
+outcome; it is never permission to read a new revision and truncate again.
+The original same-revision retry requirement is provided by the instance-bound
+command below, not retroactively by legacy callers or old stored transitions.
+
+**TRUNCATE_INSTANCE** (Wire command ID 61)
+
+```text
+TRUNCATE_INSTANCE topic=<name> expected_revision=<N> expected_instance=<instance_id>
+OK topic=<name> truncated=true revision=<N+1> lifecycle_epoch=<E+1> leo=0 hwm=0 instance_id=<id> [replayed=true] [cleanup_pending=true]
+```
+
+Use the `instance_id` and revision returned by an explicit `CREATE`/admin SDK
+update. `DESCRIBE` also includes the instance in its definition. Preserve this
+pair across retries. A first call requires both to match; the committed transition
+stores its result in the definition. A matching retry returns that historical
+result without storage or dependency cleanup, even if fresh records, members or
+transactions now exist. `leo=0 hwm=0` describe the reset result, not current offsets.
+The receipt is bounded to the latest truncate and remains usable until a later
+definition revision; older/unproven revisions and other instances fail without
+mutation. Delete/recreate receives a new instance even when revision returns to 1.
+Legacy `TRUNCATE` retains its conflict behavior and invalidates any prior receipt.
+
+The new command requires admin permission, rejects internal topics and preserves
+the original active-member/shared/pattern/reservation/transaction admission fences.
+Pending standalone cleanup retries remain fenced until dependencies are durable.
+Distributed retries read replicated evidence and leave pending work to local
+reconciliation. `cleanup_pending` describes the responding broker only; absence
+does not prove all replicas materialized. Inspect cluster/local materialization
+status before resuming dependent operations. Desired-list omission never invokes
+either truncate command or DELETE.
+
+A distinct command ID prevents older brokers from ignoring the instance guard.
+All active brokers must advertise lifecycle protocol 7 for identity binding or
+instance truncation; older registrations are rejected while bound topics exist.
+Legacy topics have no fabricated receipt. An explicit CREATE binds a missing
+instance and advances the revision once (together with any configuration change).
+It preserves records and does not imply a reset. The official Go admin SDK uses
+the new command only when `TruncateTopicOptions.ExpectedInstance` is provided,
+and may retry an ambiguous response with the exact same pair. Existing callers
+remain source-compatible and retain the conservative legacy behavior.
+
+Topic manifests now write version 4 and read version 3 without fabricating
+identities. Raft snapshots/format markers write version 11 and accept versions
+9/10 through the supported one-way recovery path. Perform a coordinated upgrade
+of every broker and validate copied backups first; mixed-version rolling upgrades
+and downgrade after new-format writes are unsupported. Never clear live storage
+to resolve pending cleanup. See [upgrade and recovery](operations/upgrade-and-recovery.md)
+and [truncate verification](core/truncate-contract-recovery.md).
 
 **LIST**
 ```

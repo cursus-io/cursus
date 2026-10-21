@@ -5,16 +5,30 @@
 | Persistent artifact | Current writer | Older reader support | Upgrade rule |
 |---|---:|---|---|
 | Application record | CDM5 (CRC32C and leader epoch) | CDM2, CDM3, and CDM4 records remain readable | Upgrade every reader before a CDM5 writer appends; older binaries cannot read the new records. |
-| Topic manifest | 3 | older manifests are rejected | Migrate and validate an offline copy before starting current brokers. |
+| Topic manifest | 4 | version 3 remains readable without invented instance/receipt evidence | Validate an offline copy before coordinated upgrade; no downgrade after version 4 is written. |
 | Transaction journal | 3 plus checksummed cut manifest | version-1 and version-2 records remain readable | Preserve the journal and its manifest with all partition and offset data. Version 3 writes bounded deltas between full checkpoints. |
 | Event snapshot catalog | v2 (CRC32C) | legacy snapshot files remain readable beside v2 | Preserve both snapshot files until a clean bootstrap removes the legacy boundary. |
 | Consumer metadata records | 5 | versions 1-4 remain replayable | Upgrade readers before writing offset-reservation records. |
-| Raft FSM snapshot | 10 | version 9 is accepted only for the supported one-way recovery transition | Older formats require a clean bootstrap; never downgrade a volume after writing version 10. |
+| Raft FSM snapshot | 11 | versions 9/10 are accepted only for the supported one-way recovery transition | Older formats require a clean bootstrap; never downgrade a volume after writing version 11. |
+| Instance-bound truncate | broker lifecycle protocol 7, Wire command 61 | legacy TRUNCATE keeps its conflict contract | Upgrade all brokers before binding identities or using durable retries. |
 | Replica-gap recovery control state | broker lifecycle protocol 6 | An older active broker blocks a new quarantine transition and cannot register while a durable recovery marker exists | Complete the rolling upgrade before relying on automatic gap quarantine and proof-based ISR re-admission. |
 
 Mixed-version rolling upgrades across a format boundary are unsupported. A
 normal restart of the same compatible release is supported; a format-changing
 upgrade is a coordinated whole-cluster operation.
+
+For an instance-bound truncate, save the CREATE response's `instance_id` and
+`revision` with the requested operation before sending it. Retry only that pair
+after a timeout or lost connection. `replayed=true` acknowledges the retained
+historical result; it does not mean today's topic is still empty. Never replace
+the revision with a newly fetched value to resolve an unknown outcome.
+`cleanup_pending=true` means intent committed but the responding broker has not
+finished local materialization. Inspect every broker's readiness and topic/replica
+materialization before resuming traffic; a missing flag is not a cluster-wide
+barrier. Keep a pending standalone manifest, journal and epoch marker together;
+restart resumes the committed cleanup. Do not remove the manifest or manually
+advance the marker. See the [verification ledger](../core/truncate-contract-recovery.md)
+for tested crash boundaries, costs and remaining acceptance checks.
 
 CDM5 checksums cover every serialized authoritative field, including topic,
 partition, offset, producer and transaction metadata, event identity, and

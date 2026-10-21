@@ -59,7 +59,7 @@ func raftApplyLifecycleTopic(input commandInput) (string, bool) {
 // lifecycleOperationExclusive identifies commands that mutate topic existence or data.
 func lifecycleOperationExclusive(input commandInput) bool {
 	switch input.Name {
-	case "DELETE", "TRUNCATE":
+	case "DELETE", "TRUNCATE", "TRUNCATE_INSTANCE":
 		return true
 	case "RAFT_APPLY":
 		switch strings.ToUpper(strings.TrimSpace(input.Args["type"])) {

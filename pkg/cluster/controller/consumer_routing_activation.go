@@ -26,7 +26,7 @@ func ActivateConsumerMetadataRouting(rm RaftManager) error {
 	}
 	capable := make(map[string]bool, len(brokers))
 	for _, broker := range brokers {
-		if broker.RecoveryProtocol < fsm.BootstrapRecoveryProtocolVersion || broker.LifecycleProtocol < fsm.BrokerProtocolVersionCurrent || broker.IncarnationID == "" || broker.IncarnationEpoch == 0 {
+		if broker.RecoveryProtocol < fsm.BootstrapRecoveryProtocolVersion || broker.LifecycleProtocol < fsm.ReplicaGapRecoveryProtocolVersion || broker.IncarnationID == "" || broker.IncarnationEpoch == 0 {
 			return nil
 		}
 		capable[broker.ID] = true
