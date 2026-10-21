@@ -301,7 +301,11 @@ func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string, restoringSna
 				reconcileErr = currentPartition.ReconcileSnapshotHWM(partitionMetadata.CommittedHWM)
 			}
 		} else {
-			reconcileErr = currentPartition.ReconcileCommittedHWM(partitionMetadata.CommittedHWM)
+			// Live definition application must not wait for replication ownership:
+			// its HWM command may be queued behind this same FSM application.
+			// Publish only the committed visibility boundary and preserve any
+			// in-flight tail. Leader promotion owns destructive reconciliation.
+			reconcileErr = currentPartition.ApplyReplicaHWM(partitionMetadata.CommittedHWM)
 		}
 		if reconcileErr != nil {
 			return fmt.Errorf("reconcile partition %d committed HWM: %w", partition, reconcileErr)

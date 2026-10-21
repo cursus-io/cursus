@@ -131,6 +131,17 @@ validation before clearing the fence. The regression reproduces the stall on
 the previous code; a missing committed index 43 remains fenced. A snapshot-only
 completion reads zero compacted log entries rather than replaying old history.
 
+Seeding the target with real data exposed a second ordering defect before the
+truncate: a live CREATE/UPDATE application used leader-promotion tail repair.
+That repair waited for a publish's replication ownership while its HWM command
+was queued behind the same FSM application. After the wait failed, stale repair
+could remove the pending record. Live definition materialization now applies
+only the committed visibility watermark; leadership recovery retains ownership
+of destructive tail reconciliation. The disk-backed regression holds a real
+replication mutation, reapplies the definition and checks both nonblocking FSM
+progress and preservation of the hidden tail before committing it. It fails
+against the previous implementation.
+
 The process-crash tests exit the subprocess with code 86, bypassing all deferred
 closes, and reopen the actual files in a fresh process. They are process-failure
 tests, not simulated power-loss or filesystem write-reordering tests.
@@ -142,6 +153,7 @@ tests, not simulated power-loss or filesystem write-reordering tests.
 | Receipt regression | Real standalone disk restart; FSM command replay and snapshot restore; same-name recreation and later-definition conflicts; shared-group preservation; internal-topic/admin guards; exact SDK retry after an actual dropped reply and mismatched-receipt rejection. |
 | Three brokers, initial recovery run | Actual coordinator movement, stopped old-owner return, dropped successful truncate reply, receipt retry, two all-broker snapshot restores, removed group/offset non-resurrection and preserved unrelated event/producer dedup history. Each restart verifies `FSM restore completed`. |
 | Three brokers, extended recovery run | Concurrent acknowledged writes survive the reset and restore. Explicit Raft leader loss elects a different leader; a surviving follower routes the retained-receipt retry successfully. The previously stalled old-owner return completes after the snapshot-coverage fix. This run passed in 379.56 seconds including image build and restarts. |
+| Three brokers, strengthened target-data run | Seed an old idempotent target record, truncate, then reuse the same producer ID/epoch/sequence for a fresh record. After actual leader loss, receipt replay and snapshot restore, exactly the fresh record remains. Both the snapshot-coverage and live-materialization fixes are included. This run passed in 313.59 seconds including image build and restarts. |
 | Local validation | Linux package tests for `pkg`, `sdk`, `cmd`, `util` pass. Focused topic/transaction/controller/FSM/SDK lifecycle tests pass with `-race`. Native build and repository lint pass. Windows full-suite disk failures involve existing open mapped-file deletion semantics; the Linux run passes those checks. |
 
 The replay-gate regression also passes with the entire replication package under
@@ -166,6 +178,11 @@ Measured on the small test fixture, not a scalability benchmark:
 - Stored snapshot files ranged from 6,868 to 11,818 bytes in that run. These
   are stored file sizes, not measured snapshot restore I/O. Counters are logged
   independently per process; no subtraction across restarts is used.
+- With target data and concurrent traffic in the strengthened run, retained
+  scans were 4,098 bytes per surviving broker after cleanup, 7,406 bytes per
+  broker after truncate snapshot restart, and 12,828 bytes per broker after
+  the later delete snapshot restart. Cleanup replay was zero after each
+  snapshot restart; the retained scan work was still nonzero.
 
 Reproduce the process faults with
 `go test -v ./pkg/topic ./pkg/transaction -run 'Truncate.*ProcessCrash'`.

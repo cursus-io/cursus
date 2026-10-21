@@ -47,6 +47,7 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 		requireReplicaOffsetsEventually(t, addrs, topicName, 0)
 	}
 	requireClusterStatusMaterialized(t, addrs)
+	waitForStableFullISRAndZeroUnderReplicated(t, ctx, "initial truncate fixture")
 	proof := &cleanupRetainedProof{}
 	admin, err := sdk.NewAdminClient(&sdk.AdminConfig{BrokerAddrs: addrs, MaxRetries: 3, RequestTimeoutMS: 15000})
 	require.NoError(t, err)
@@ -54,9 +55,7 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, definition.InstanceID)
 	truncateOptions := sdk.TruncateTopicOptions{ExpectedRevision: definition.Revision, ExpectedInstance: definition.InstanceID}
-	targetProducer := e2e.NewBrokerClient(addrs)
-	defer targetProducer.Close()
-	require.NoError(t, targetProducer.PublishIdempotentToPartition(cleanupRecoveryTopic, "reset-producer", 0, 1, 1, "old-target-record", "all", true))
+	publishTruncateTarget(t, addrs, "old-target-record")
 	proof.advance(t, addrs)
 	client, generation, member := joinRecoveryGroup(t, addrs, cleanupRecoveryTopic, cleanupRecoveryGroup)
 	defer client.Close()
@@ -108,9 +107,7 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 	requireClusterDefinitionEventually(t, available, cleanupRecoveryTopic, map[string]string{"revision": "2", "lifecycle_epoch": "2"})
 	requireCleanupSurvivorsMaterialized(t, available)
 	requireReplicaOffsetsEventually(t, available, cleanupRecoveryTopic, 0)
-	freshProducer := e2e.NewBrokerClient(available)
-	defer freshProducer.Close()
-	require.NoError(t, freshProducer.PublishIdempotentToPartition(cleanupRecoveryTopic, "reset-producer", 0, 1, 1, "fresh-target-record", "all", true))
+	publishTruncateTarget(t, available, "fresh-target-record")
 	proof.verify(t, available)
 	requireCleanupGroupAbsent(t, available)
 	logCleanupRecoveryWork(t, survivorNodes(oldOwner), "after failover cleanup")

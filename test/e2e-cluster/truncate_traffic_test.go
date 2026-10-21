@@ -2,6 +2,7 @@ package e2e_cluster
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -10,6 +11,19 @@ import (
 	"github.com/cursus-io/cursus/test/e2e"
 	"github.com/stretchr/testify/require"
 )
+
+func publishTruncateTarget(t *testing.T, addrs []string, payload string) {
+	t.Helper()
+	client := e2e.NewBrokerClient(addrs)
+	defer client.Close()
+	response, err := client.SendCommand("", fmt.Sprintf("PUBLISH topic=%s partition=0 acks=all producerId=reset-producer seqNum=1 epoch=1 isIdempotent=true message=%s", cleanupRecoveryTopic, payload), 15*time.Second)
+	require.NoError(t, err, "publish broker detail: %#v", err)
+	var result struct {
+		Status string `json:"status"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(response), &result))
+	require.Equal(t, "OK", result.Status)
+}
 
 func startTruncateConcurrentTraffic(t *testing.T, addrs []string) func() int {
 	t.Helper()
