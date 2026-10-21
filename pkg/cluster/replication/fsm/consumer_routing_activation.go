@@ -17,7 +17,7 @@ func (f *BrokerFSM) ConsumerMetadataRoutingEnabled() bool {
 
 func consumerRoutingCapable(broker *BrokerInfo) bool {
 	return broker != nil && broker.IncarnationID != "" && broker.IncarnationEpoch > 0 &&
-		broker.RecoveryProtocol >= BootstrapRecoveryProtocolVersion && broker.LifecycleProtocol >= BrokerProtocolVersionCurrent
+		broker.RecoveryProtocol >= BootstrapRecoveryProtocolVersion && broker.LifecycleProtocol >= ReplicaGapRecoveryProtocolVersion
 }
 
 func validateConsumerRoutingBrokers(brokers map[string]*BrokerInfo) error {

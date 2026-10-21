@@ -63,6 +63,7 @@ type TopicDefinitionPatch struct {
 // TopicDefinition is the authoritative definition returned by CREATE.
 type TopicDefinition struct {
 	Topic             string
+	InstanceID        string
 	Revision          uint64
 	LifecycleEpoch    uint64
 	Partitions        int
@@ -97,6 +98,9 @@ type DeleteTopicResult struct {
 // revision so a delayed or duplicated request cannot erase a newer lifecycle.
 type TruncateTopicOptions struct {
 	ExpectedRevision uint64
+	// ExpectedInstance opts into durable retries. Retain the instance/revision
+	// pair returned by CREATE/UpdateTopic; never refresh it after a lost reply.
+	ExpectedInstance string
 }
 
 // TruncateTopicResult reports the newly committed empty topic lifecycle.
@@ -104,6 +108,8 @@ type TruncateTopicOptions struct {
 // broker-local cleanup operations remain fenced for reconciliation.
 type TruncateTopicResult struct {
 	Topic          string
+	InstanceID     string
+	Replayed       bool
 	Truncated      bool
 	Revision       uint64
 	LifecycleEpoch uint64
@@ -222,14 +228,18 @@ func (c *AdminClient) TruncateTopicContext(ctx context.Context, topic string, op
 	if err != nil {
 		return TruncateTopicResult{}, err
 	}
-	// Retry connection/routing failures, but never retry after the command may
-	// have been written: expected_revision makes a replay safe, yet a committed
-	// first attempt would correctly return a conflict rather than the result.
-	response, err := c.execute(ctx, command, false)
+	// The instance command has a distinct Wire ID: old brokers cannot silently
+	// ignore the identity guard and execute a legacy truncate.
+	response, err := c.execute(ctx, command, options.ExpectedInstance != "")
 	if err != nil {
 		return TruncateTopicResult{}, err
 	}
-	return parseTruncateTopicResponse(response)
+	result, err := parseTruncateTopicResponse(response)
+	if err == nil && options.ExpectedInstance != "" && (result.InstanceID != options.ExpectedInstance ||
+		options.ExpectedRevision == ^uint64(0) || result.Revision != options.ExpectedRevision+1) {
+		return TruncateTopicResult{}, fmt.Errorf("truncate receipt does not match the requested instance/revision")
+	}
+	return result, err
 }
 
 func (c *AdminClient) applyTopicPatch(ctx context.Context, topic string, patch TopicDefinitionPatch) (TopicDefinition, error) {
@@ -449,7 +459,29 @@ func buildAdminTruncateTopicCommand(topic string, options TruncateTopicOptions) 
 	if options.ExpectedRevision == 0 {
 		return "", fmt.Errorf("expected revision must be greater than zero")
 	}
-	return "TRUNCATE topic=" + topic + " expected_revision=" + strconv.FormatUint(options.ExpectedRevision, 10), nil
+	command := "TRUNCATE"
+	suffix := ""
+	if options.ExpectedInstance != "" {
+		if !validAdminInstanceID(options.ExpectedInstance) {
+			return "", fmt.Errorf("invalid expected instance identifier")
+		}
+		command = "TRUNCATE_INSTANCE"
+		suffix = " expected_instance=" + options.ExpectedInstance
+	}
+	return command + " topic=" + topic + " expected_revision=" + strconv.FormatUint(options.ExpectedRevision, 10) + suffix, nil
+}
+
+func validAdminInstanceID(id string) bool {
+	if len(id) < 16 || len(id) > 64 {
+		return false
+	}
+	for _, c := range id {
+		valid := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_'
+		if !valid {
+			return false
+		}
+	}
+	return true
 }
 
 func appendAdminACLField(fields []string, name string, values *[]string) ([]string, error) {
@@ -469,7 +501,7 @@ func parseTopicDefinitionResponse(response string) (TopicDefinition, error) {
 	if err != nil {
 		return TopicDefinition{}, err
 	}
-	definition := TopicDefinition{Topic: fields["topic"]}
+	definition := TopicDefinition{Topic: fields["topic"], InstanceID: fields["instance_id"]}
 	if definition.Topic == "" {
 		return TopicDefinition{}, fmt.Errorf("missing topic")
 	}
@@ -534,7 +566,13 @@ func parseTruncateTopicResponse(response string) (TruncateTopicResult, error) {
 	if err != nil {
 		return TruncateTopicResult{}, err
 	}
-	result := TruncateTopicResult{Topic: fields["topic"]}
+	result := TruncateTopicResult{Topic: fields["topic"], InstanceID: fields["instance_id"]}
+	if value, present := fields["replayed"]; present {
+		result.Replayed, err = strconv.ParseBool(value)
+		if err != nil {
+			return TruncateTopicResult{}, fmt.Errorf("invalid replayed: %w", err)
+		}
+	}
 	if result.Topic == "" {
 		return TruncateTopicResult{}, fmt.Errorf("missing topic")
 	}

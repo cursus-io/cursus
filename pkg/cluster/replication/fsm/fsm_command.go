@@ -164,6 +164,9 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		currentTopic := stagedTopics[topicName]
 
 		definition := base
+		if base.InstanceID != "" && !f.supportsTruncateReceiptsLocked() {
+			return fmt.Errorf("topic instance binding requires broker protocol %d", TruncateReceiptProtocolVersion)
+		}
 		if currentTopic != nil {
 			currentPartitions = currentTopic.Partitions
 			var patch topic.DefinitionPatch
@@ -179,6 +182,14 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 			if err != nil {
 				return err
 			}
+		}
+		var previousRevision uint64
+		if currentTopic != nil {
+			previousRevision = currentTopic.Revision
+		}
+		definition, err = topic.BindInstance(definition, base.InstanceID, previousRevision)
+		if err != nil {
+			return err
 		}
 		if config.HasCleanupPolicy(definition.Policy.CleanupPolicy, config.CleanupPolicyCompact) {
 			for _, broker := range f.brokers {
@@ -435,6 +446,7 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 	var payload struct {
 		Topic            string `json:"topic"`
 		ExpectedRevision uint64 `json:"expected_revision"`
+		ExpectedInstance string `json:"expected_instance,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(jsonData), &payload); err != nil {
 		return err
@@ -451,6 +463,10 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 
 	f.mu.RLock()
 	current := copyTopicDefinition(f.topicState[payload.Topic])
+	if payload.ExpectedInstance != "" && !f.supportsTruncateReceiptsLocked() {
+		f.mu.RUnlock()
+		return fmt.Errorf("truncate receipt requires broker protocol %d", TruncateReceiptProtocolVersion)
+	}
 	for _, broker := range f.brokers {
 		if broker.Status == "active" && broker.LifecycleProtocol < TopicLifecycleProtocolVersion {
 			f.mu.RUnlock()
@@ -460,22 +476,16 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 			)
 		}
 	}
-	for key, metadata := range f.partitionMetadata {
-		idx := strings.LastIndex(key, "-")
-		if idx != -1 && key[:idx] == payload.Topic && metadata != nil && metadata.LeaderEpoch == math.MaxInt {
-			f.mu.RUnlock()
-			return fmt.Errorf("leader epoch overflow for partition %q", key)
-		}
-	}
 	f.mu.RUnlock()
 	if current == nil {
 		return fmt.Errorf("%w: %s", topic.ErrTopicNotFound, payload.Topic)
 	}
-	if current.Revision != payload.ExpectedRevision {
-		return fmt.Errorf(
-			"%w for topic %q: current=%d expected=%d",
-			topic.ErrTopicRevisionConflict, payload.Topic, current.Revision, payload.ExpectedRevision,
-		)
+	replay, err := current.CheckTruncate(payload.ExpectedRevision, payload.ExpectedInstance)
+	if err != nil {
+		return err
+	}
+	if replay {
+		return f.truncateReplayResult(*current)
 	}
 	if current.Revision == math.MaxUint64 || current.LifecycleEpoch == math.MaxUint64 {
 		return fmt.Errorf("topic lifecycle counter overflow for %q", payload.Topic)
@@ -484,6 +494,11 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 	target := *current
 	target.Revision++
 	target.LifecycleEpoch++
+	if payload.ExpectedInstance != "" {
+		target.TruncateRevision, target.TruncateEpoch = target.Revision, target.LifecycleEpoch
+	} else {
+		target.TruncateRevision, target.TruncateEpoch = 0, 0
+	}
 	f.mu.Lock()
 	latest := f.topicState[payload.Topic]
 	if latest == nil || latest.Revision != current.Revision || latest.LifecycleEpoch != current.LifecycleEpoch {
@@ -759,9 +774,17 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 		f.mu.Unlock()
 		return fmt.Errorf("broker_registration_fenced broker=%s reason=offset_reservations_protocol required=%d", info.ID, OffsetReservationsProtocolVersion)
 	}
-	if f.consumerMetadataRoutingActivated && (info.RecoveryProtocol < BootstrapRecoveryProtocolVersion || info.LifecycleProtocol < BrokerProtocolVersionCurrent || info.IncarnationID == "") {
+	if f.consumerMetadataRoutingActivated && (info.RecoveryProtocol < BootstrapRecoveryProtocolVersion || info.LifecycleProtocol < ReplicaGapRecoveryProtocolVersion || info.IncarnationID == "") {
 		f.mu.Unlock()
 		return fmt.Errorf("broker_registration_fenced broker=%s reason=consumer_metadata_routing", info.ID)
+	}
+	if info.LifecycleProtocol < TruncateReceiptProtocolVersion {
+		for _, definition := range f.topicState {
+			if definition != nil && definition.InstanceID != "" {
+				f.mu.Unlock()
+				return fmt.Errorf("broker_registration_fenced broker=%s reason=truncate_receipt_protocol required=%d", info.ID, TruncateReceiptProtocolVersion)
+			}
+		}
 	}
 	if info.LifecycleProtocol < ReplicaGapRecoveryProtocolVersion {
 		for _, metadata := range f.partitionMetadata {

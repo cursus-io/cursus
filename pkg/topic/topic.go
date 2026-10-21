@@ -28,6 +28,9 @@ type Topic struct {
 	ReplicationFactor int
 	Revision          uint64
 	LifecycleEpoch    uint64
+	InstanceID        string
+	TruncateRevision  uint64
+	TruncateEpoch     uint64
 	Policy            Policy
 	txnResolver       TransactionDecisionResolver
 	compactionGate    func(topic string, partition int) (bool, string)
@@ -161,6 +164,9 @@ func newTopicWithDefinition(definition Definition, hp HandlerProvider, cfg *conf
 		ReplicationFactor: definition.ReplicationFactor,
 		Revision:          definition.Revision,
 		LifecycleEpoch:    definition.LifecycleEpoch,
+		InstanceID:        definition.InstanceID,
+		TruncateRevision:  definition.TruncateRevision,
+		TruncateEpoch:     definition.TruncateEpoch,
 		Policy:            definition.Policy,
 	}, nil
 }
@@ -251,6 +257,9 @@ func (t *Topic) definitionLocked() Definition {
 		Name:              t.Name,
 		Revision:          t.Revision,
 		LifecycleEpoch:    t.LifecycleEpoch,
+		InstanceID:        t.InstanceID,
+		TruncateRevision:  t.TruncateRevision,
+		TruncateEpoch:     t.TruncateEpoch,
 		Partitions:        len(t.Partitions),
 		ReplicationFactor: t.ReplicationFactor,
 		Idempotent:        t.IsIdempotent,
@@ -272,6 +281,9 @@ func (t *Topic) applyFullDefinitionLocked(definition Definition, hp HandlerProvi
 	}
 	if definition.Name != t.Name {
 		return fmt.Errorf("topic definition name mismatch: current=%q requested=%q", t.Name, definition.Name)
+	}
+	if t.InstanceID != "" && definition.InstanceID != t.InstanceID {
+		return fmt.Errorf("topic instance is immutable for topic %q", t.Name)
 	}
 	if definition.Idempotent != t.IsIdempotent {
 		return fmt.Errorf("idempotent mode is immutable for existing topic %q", t.Name)
@@ -331,6 +343,9 @@ func (t *Topic) applyFullDefinitionLocked(definition Definition, hp HandlerProvi
 	t.ReplicationFactor = definition.ReplicationFactor
 	t.Revision = definition.Revision
 	t.LifecycleEpoch = definition.LifecycleEpoch
+	t.InstanceID = definition.InstanceID
+	t.TruncateRevision = definition.TruncateRevision
+	t.TruncateEpoch = definition.TruncateEpoch
 	t.Partitions = append(t.Partitions, staged...)
 	return nil
 }

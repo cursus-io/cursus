@@ -94,6 +94,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"group_not_found", "partition_metadata_not_found", "partition_not_found", "topic_not_found", "transaction_not_found",
 	)
 	register(ErrorClassValidation, false,
+		"invalid_expected_instance", "truncate_receipt_unsupported",
 		"UNSUPPORTED_FEATURE", "UNSUPPORTED_PROTOCOL_VERSION", "batch_decode_failed", "decode_failed",
 		"consumer_group_subscriptions_feature_required", "distribution_not_enabled", "distribution_required", "duplicate_partition", "empty_command", "empty_messages", "invalid_aggregate_version", "invalid_expected_version", "missing_min_in_sync_replicas",
 		"empty_required_params", "event_sourcing_not_enabled", "invalid_acks", "invalid_batch_commit_entry", "invalid_batch_commit_format", "invalid_min_in_sync_replicas",

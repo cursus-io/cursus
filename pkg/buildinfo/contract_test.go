@@ -11,4 +11,5 @@ import (
 
 func TestBrokerProtocolMatchesRuntimeLifecycleProtocol(t *testing.T) {
 	require.Equal(t, strconv.Itoa(fsm.BrokerProtocolVersionCurrent), buildinfo.BrokerProtocolVersion)
+	require.Equal(t, strconv.Itoa(fsm.SnapshotVersionCurrent), buildinfo.SnapshotFormatVersion)
 }

@@ -45,7 +45,7 @@ func TestForwardedLocalRegistrationUsesDirectPayload(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(payload), &forwarded))
 	require.Zero(t, direct.RecoveryProtocol)
 	require.Zero(t, forwarded.RecoveryProtocol)
-	require.Equal(t, 6, forwarded.LifecycleProtocol)
+	require.Equal(t, fsm.BrokerProtocolVersionCurrent, forwarded.LifecycleProtocol)
 	require.Equal(t, "node-1", forwarded.ID)
 	require.Equal(t, "raft:9001", forwarded.Addr)
 	require.Equal(t, "client:9000", forwarded.ClientAddr)

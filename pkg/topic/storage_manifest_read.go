@@ -51,7 +51,7 @@ func readStandaloneManifest(path string) ([]Definition, error) {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("decode topic metadata trailing content")
 	}
-	if manifest.Version != topicMetadataFormatVersion {
+	if manifest.Version != topicMetadataFormatVersion && manifest.Version != 3 {
 		return nil, fmt.Errorf("unsupported topic metadata version %d; clean bootstrap required", manifest.Version)
 	}
 	for _, definition := range manifest.Topics {

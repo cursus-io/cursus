@@ -29,7 +29,8 @@ const (
 	ReplicaReassignmentProtocolVersion   = 4
 	LeaderEpochRecoveryProtocolVersion   = 5
 	ReplicaGapRecoveryProtocolVersion    = 6
-	BrokerProtocolVersionCurrent         = ReplicaGapRecoveryProtocolVersion
+	TruncateReceiptProtocolVersion       = 7
+	BrokerProtocolVersionCurrent         = TruncateReceiptProtocolVersion
 	// Recovery capabilities are additive and do not raise lifecycle requirements.
 	IndexedRecoveryProtocolVersion   = 1
 	BootstrapRecoveryProtocolVersion = 2
@@ -371,7 +372,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 		util.Error("Failed to decode snapshot: %v", err)
 		return fmt.Errorf("failed to restore snapshot: %w", err)
 	}
-	if header.Version != SnapshotVersionCurrent && header.Version != SnapshotVersionLegacyEpoch {
+	if header.Version != SnapshotVersionCurrent && header.Version != SnapshotVersionProducerEpoch && header.Version != SnapshotVersionLegacyEpoch {
 		return fmt.Errorf("%w: snapshot version %d is not supported; remove all Cursus persistent state and clean bootstrap version %d", ErrUnsupportedRecoveryProtocol, header.Version, SnapshotVersionCurrent)
 	}
 	var state BrokerFSMState

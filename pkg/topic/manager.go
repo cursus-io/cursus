@@ -48,6 +48,7 @@ type TopicManager struct {
 	txnResolver        TransactionDecisionResolver
 	metadataStore      *topicMetadataStore
 	deleteHook         func(string) error
+	truncatePhase      func(string) // test-only process-crash observer; installed before use
 	compactionGate     func(topic string, partition int) (bool, string)
 
 	metadataLoadFailure             string
@@ -184,6 +185,10 @@ func (tm *TopicManager) CreateTopicWithPatch(defaults Definition, patch Definiti
 			return Definition{}, fmt.Errorf("internal consumer metadata topic has incompatible mode")
 		}
 		target, mergeErr := MergeDefinitionPatch(current, patch, true)
+		if mergeErr != nil {
+			return Definition{}, mergeErr
+		}
+		target, mergeErr = BindInstance(target, defaults.InstanceID, current.Revision)
 		if mergeErr != nil {
 			return Definition{}, mergeErr
 		}

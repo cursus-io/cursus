@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	topicMetadataFormatVersion = 3
+	topicMetadataFormatVersion = 4
 	maxTopicMetadataBytes      = 16 << 20
 	maxTopicNameBytes          = 249
 	TopicMetadataFileName      = config.TopicMetadataFileName
@@ -29,6 +29,9 @@ type Definition struct {
 	Name              string `json:"name"`
 	Revision          uint64 `json:"revision"`
 	LifecycleEpoch    uint64 `json:"lifecycle_epoch"`
+	InstanceID        string `json:"instance_id,omitempty"`
+	TruncateRevision  uint64 `json:"truncate_revision,omitempty"`
+	TruncateEpoch     uint64 `json:"truncate_epoch,omitempty"`
 	Partitions        int    `json:"partitions"`
 	ReplicationFactor int    `json:"replication_factor"`
 	Idempotent        bool   `json:"idempotent"`
@@ -38,6 +41,9 @@ type Definition struct {
 
 // Normalize validates and canonicalizes a durable topic definition.
 func (d Definition) Normalize() (Definition, error) {
+	if err := d.ValidateTruncateReceipt(); err != nil {
+		return d, err
+	}
 	if err := ValidateName(d.Name); err != nil {
 		return d, err
 	}
@@ -112,7 +118,8 @@ type topicMetadataManifest struct {
 }
 
 type topicMetadataStore struct {
-	path string
+	path  string
+	phase func(string) // test-only process-crash observer; installed before use
 }
 
 func newTopicMetadataStore(cfg *config.Config, provider HandlerProvider) *topicMetadataStore {
@@ -183,7 +190,7 @@ func (s *topicMetadataStore) Load() (_ []Definition, err error) {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("decode topic metadata trailing content")
 	}
-	if manifest.Version != topicMetadataFormatVersion {
+	if manifest.Version != topicMetadataFormatVersion && manifest.Version != 3 {
 		return nil, fmt.Errorf("unsupported topic metadata version %d; clean bootstrap required", manifest.Version)
 	}
 
@@ -252,17 +259,26 @@ func (s *topicMetadataStore) Save(definitions []Definition) (err error) {
 		_ = file.Close()
 		return err
 	}
+	if s.phase != nil {
+		s.phase("manifest_synced")
+	}
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close topic metadata temporary file: %w", err)
 	}
 	if err := replaceCheckpointFile(tmp, s.path); err != nil {
 		return fmt.Errorf("replace topic metadata: %w", err)
 	}
+	if s.phase != nil {
+		s.phase("manifest_renamed")
+	}
 	if err := syncTopicMetadataDirectoryFn(dir); err != nil {
 		return &topicMetadataSaveError{
 			committed: true,
 			err:       fmt.Errorf("sync topic metadata directory: %w", err),
 		}
+	}
+	if s.phase != nil {
+		s.phase("manifest_directory_synced")
 	}
 	return nil
 }

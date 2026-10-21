@@ -71,6 +71,7 @@ const (
 	CommandBootstrapBegin
 	CommandBootstrapChunk
 	CommandBootstrapRelease
+	CommandTruncateInstance
 )
 
 var commandNames = [...]string{
@@ -80,6 +81,7 @@ var commandNames = [...]string{
 	CommandAlterTopicConfig:        "ALTER_TOPIC_CONFIG",
 	CommandDelete:                  "DELETE",
 	CommandTruncate:                "TRUNCATE",
+	CommandTruncateInstance:        "TRUNCATE_INSTANCE",
 	CommandList:                    "LIST",
 	CommandListCluster:             "LIST_CLUSTER",
 	CommandClusterStatus:           "CLUSTER_STATUS",
