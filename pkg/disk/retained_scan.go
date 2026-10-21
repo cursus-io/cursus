@@ -86,6 +86,7 @@ func (d *DiskHandler) scanRetainedFramesLocked(ctx context.Context, start, end u
 		next := base
 		err = scanCompactionSegmentObserved(ctx, path, base, false, compacted, func(frame compactionFrame) error {
 			result.decodedFrames++
+			metrics.RecordRecoveryWork(metrics.RecoveryRetainedScan, metrics.RecoveryDecodedFrames, 1)
 			// #nosec G115 -- scanCompactionSegment invokes the visitor only with a validated positive frame size.
 			result.decodedFrameBytes += uint64(frame.size)
 			if err := ctx.Err(); err != nil {

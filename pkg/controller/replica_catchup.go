@@ -25,6 +25,9 @@ func (ch *CommandHandler) ApplyReplicaCatchupVerified(ctx context.Context, reque
 	if err := clusterController.ValidateReplicaCatchupBatch(request, batch); err != nil {
 		return nil, err
 	}
+	if _, needed := replicationFSM.ReplicaPrefixRefinement(request, batch); needed {
+		return nil, fmt.Errorf("indexed rollback requires exact common-prefix refinement")
+	}
 	var witness *topic.ReplicaCatchupWitness
 	err := ch.applyReplicaCatchupRequest(ctx, &request, batch, &witness)
 	return witness, err

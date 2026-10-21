@@ -99,6 +99,26 @@ func TestApplyIndexedRecoveryValidatesDurablePrefixAndCurrentFences(t *testing.T
 	}
 }
 
+func TestApplyIndexedRecoveryVerifiedRejectsSparseRollbackBeforeMutation(t *testing.T) {
+	handler, _, p, batch := indexedApplyFixture(t)
+	proofs, err := p.ReplicaLineageCandidates(2)
+	require.NoError(t, err)
+	// Omit the actual common boundary at one, as a sparse set can do for a
+	// longer tail. A matching anchor alone must not authorize verified apply.
+	request := fsm.ReplicaCatchupRequest{Topic: batch.Topic, BrokerID: batch.BrokerID,
+		Leader: batch.Leader, SourceBroker: batch.SourceBroker, LeaderEpoch: batch.LeaderEpoch,
+		LifecycleEpoch: batch.LifecycleEpoch, NextOffset: 2, CommittedHWM: batch.CommittedHWM,
+		RecoveryProtocol: 1, PrefixCandidates: []disk.LineagePrefix{proofs[0], proofs[len(proofs)-1]}}
+	zero := uint64(0)
+	batch.TruncateTo, batch.MatchedPrefix = &zero, &request.PrefixCandidates[1]
+	batch, err = fsm.SealReplicaCatchupBatch(batch)
+	require.NoError(t, err)
+	_, err = handler.ApplyReplicaCatchupVerified(context.Background(), request, batch)
+	require.ErrorContains(t, err, "exact common-prefix refinement")
+	require.Equal(t, uint64(2), p.NextOffset())
+	require.Equal(t, uint64(2), p.GetHWM())
+}
+
 func TestApplyIndexedRecoveryDoesNotHoldRaftFenceWhileWaitingForWriteGate(t *testing.T) {
 	handler, state, _, batch := indexedApplyFixture(t)
 	gate := handler.partitionWriteLock("orders", 0)

@@ -37,6 +37,9 @@ func appendFixtureTail() error {
 	if os.Getenv("CURSUS_E2E_TAIL_START") == "10001" {
 		start = 10001
 	}
+	if os.Getenv("CURSUS_E2E_TAIL_START") == "10002" {
+		start = 10002
+	}
 	if d.GetAbsoluteOffset() != start || d.GetFirstOffset() != 0 {
 		return fmt.Errorf("fixture requires the expected retained committed seeds")
 	}

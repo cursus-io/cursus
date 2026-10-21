@@ -161,7 +161,7 @@ func (cc *ClusterController) catchupReplica(ctx context.Context, fetcher Replica
 
 func (cc *ClusterController) catchupReplicaTurn(ctx context.Context, fetcher ReplicaCatchupFetcher, apply VerifiedReplicaCatchupApplier, request fsm.ReplicaCatchupRequest) (result error) {
 	started, start := time.Now(), request.NextOffset
-	phase, exchanges := "incremental", 0
+	phase, exchanges, refinements := "incremental", 0, 0
 	defer func() {
 		var lag uint64
 		if request.CommittedHWM > request.NextOffset {
@@ -190,6 +190,23 @@ func (cc *ClusterController) catchupReplicaTurn(ctx context.Context, fetcher Rep
 				return cc.replicaBootstrap.RecoverReplicaBootstrap(ctx, request, batch)
 			}
 			return err
+		}
+		if _, needed := fsm.ReplicaPrefixRefinement(request, batch); needed {
+			phase = "prefix_refinement"
+			refinements++
+			if refinements > 64 {
+				return fmt.Errorf("indexed prefix refinement did not converge")
+			}
+			refined, err := cc.RaftManager.GetFSM().RefineReplicaPrefixContext(ctx, request, batch)
+			if err != nil {
+				return err
+			}
+			request = refined
+			// Up to 64 read-only probes cover any uint64 interval. Keep them
+			// separate from the bounded mutation steps so the final adjacent
+			// proof can still be applied; the same turn deadline bounds both.
+			step--
+			continue
 		}
 		witness, err := apply(ctx, request, batch)
 		if err != nil {
