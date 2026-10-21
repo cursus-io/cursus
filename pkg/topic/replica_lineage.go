@@ -33,6 +33,16 @@ func (p *Partition) ReplicaLineageCandidatesContext(ctx context.Context, tail ui
 	return storage.LineageCandidatesContext(ctx, tail)
 }
 
+func (p *Partition) ReplicaLineagePrefixContext(ctx context.Context, end uint64) (disk.LineagePrefix, error) {
+	storage, ok := p.dh.(interface {
+		LineagePrefixContext(context.Context, uint64) (disk.LineagePrefix, error)
+	})
+	if !ok {
+		return disk.LineagePrefix{}, ErrReplicaSourceUnsupported
+	}
+	return storage.LineagePrefixContext(ctx, end)
+}
+
 func (p *Partition) MatchReplicaLineage(candidates []disk.LineagePrefix, hwm uint64) (*disk.LineagePrefix, error) {
 	storage, ok := p.dh.(replicaLineageStorage)
 	if !ok {

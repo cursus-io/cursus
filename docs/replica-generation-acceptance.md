@@ -5,7 +5,8 @@ Audit baseline: `cursus-io/cursus` main `6b92842311150c5a8e5a991c3fc8beed5fa19d8
 GitHub reports PRs 239, 240, 243, 244, 245, 251, 252 and 253 merged; their merge
 commits and actual changes were compared with this baseline. Issue
 [246](https://github.com/cursus-io/cursus/issues/246) was closed by merged PR 267.
-The open-PR audit found dependency updates only, with no competing recovery PR.
+The refreshed open-PR audit found this work in PR 279 and dependency updates
+only, with no competing recovery PR. The main SHA is unchanged.
 
 ## Existing implementation and evidence
 
@@ -49,7 +50,7 @@ Primary sources:
 | Common prefix | Use proven ancestry, not a stale follower HWM, to select the rollback boundary. Kafka's epoch cache returns the next epoch start or LEO for the latest epoch. | Cursus supports same-epoch divergent records and legacy epoch zero; it requires digest/cumulative proofs. Existing 251 fallback handles absent later boundaries. Hashing and replay cost bytes/records even when exchanges are bounded. |
 | HWM protection | Preserve authoritative committed history and copy only source-committed ranges. Never infer a safe deletion from follower HWM alone. | Cursus can lower an excluded replica's *local recovery* HWM during authenticated reconciliation (240); that is not permission to delete authoritative committed data. Validate raw committed records and group offsets, not just a scalar HWM. |
 | ISR reentry | Kafka 4.1.0 requires an eligible follower at least at leader HWM and current epoch start. | Cursus requires a current-generation verified prefix and exact local LEO/HWM equal to current authoritative HWM plus recent proof. A moving target can require further fetches; availability waits for proof rather than weakening admission. |
-| Recovery cost | Avoid replaying a known common prefix unnecessarily; count actual work. | Indexed candidates can conservatively select an earlier *proven* common prefix, not necessarily the maximal mathematical common prefix. Existing 246 metrics measure logical file reads, canonical hashing and transfer bytes; these are not physical device I/O. Cold index reconstruction and retries remain real costs. |
+| Recovery cost | Avoid replaying a known common prefix unnecessarily; count actual work. | Main's sparse candidates can select an earlier proven prefix. This correction refines that interval before mutation, preserving every common record at the cost of logarithmic proof exchanges. Existing 246 metrics measure logical file reads, canonical hashing and transfer bytes; these are not physical device I/O. Cold index reconstruction and retries remain real costs. |
 
 ## Regression and fault checks selected before code changes
 
@@ -66,7 +67,33 @@ Reuse the nonzero-epoch test and add only missing integrated/restart assertions.
 
 ## Execution results
 
-### Contract gap found by the combined scenario
+### Follow-up design before the safety correction
+
+The follow-up keeps the existing mode-1 wire format, cumulative lineage index,
+source matcher and receiver witnesses. Before applying an indexed rollback,
+the receiver refines the interval between the greatest matching candidate and
+the next nonmatching candidate. Each read-only exchange offers the original
+tail, interval endpoints and midpoint. Only an adjacent mismatch authorizes
+the final rollback, so no common record (including committed records) is erased
+merely because sparse candidates skipped its boundary. Metadata and local
+storage witnesses are rechecked while preparing probes and before mutation.
+
+This follows KIP-101's ancestry-before-truncation rule. Unlike Kafka 4.1.0's
+epoch search, Cursus must distinguish same-epoch records with cumulative hashes.
+It adds at most 64 read-only binary probes per turn for any uint64 interval,
+separate from the existing 64 mutation steps and under the same 30-second turn
+deadline. Each probe uses the existing bounded index reader; it removes replay of the skipped common
+prefix. Cancellation or changed authority leaves the original tail untouched.
+This is a boundary-selection correction, not a second bootstrap/lineage system.
+
+Selected regression checks: preserve a common boundary absent from the sparse
+set; never invoke apply during refinement; reject changed leader/storage and
+cancellation before mutation; retain exact-tail behavior and protocol limits.
+The three-broker scenario must now observe `10001 -> 1`, preserve the original
+seed, retain stale-response rejection and ISR exclusion, and pass crash/full
+restart checks. Re-measure bytes, hashes, replay and exchanges after the change.
+
+### Baseline contract gap found by the combined scenario
 
 The initial strengthened run rejected the old-generation response before local
 mutation and performed 46 live offset commits while recovering, but failed an
@@ -76,14 +103,11 @@ not offered. The existing protocol can therefore authenticate anchor 0 and
 reconstruct the excluded replica, including its previously committed seed.
 `ApplyReplicaRollbackChecked` permits this authenticated local reconciliation.
 
-This preserves authoritative committed data and converges to identical records,
-but does **not** establish the literal 242 requirement that committed records
-are never locally removed/rewound. The scenario now records the actual selected
-boundary instead of mistaking the mathematical common prefix for an offered
-proof. Closure under that literal requirement remains unsupported. Changing
-prefix-selection/committed-boundary semantics would need a separate design
-compatible with the already merged 246 protocol; this audit does not silently
-change that protocol or treat reconstruction as physical prefix preservation.
+That baseline preserved authoritative committed data and converged to identical
+records, but did **not** establish the literal requirement that committed records
+are never locally removed/rewound. The follow-up correction described above
+refines the sparse interval before applying the rollback. The integrated test
+now requires boundary 1 rather than accepting reconstruction from boundary 0.
 
 The disk package passed a complete Linux race run (84.260 seconds). Focused
 Linux race tests for source fetch fences, ISR proof validation, receiver apply
@@ -99,7 +123,7 @@ ports, Compose project/network and container names changed. Production sources
 are compared byte-for-byte with the PR checkout. Workflow branch filters are
 unchanged. The isolated copy verified 796 production/support files as identical.
 
-### Completed local integration run
+### Initial local integration run, before the correction
 
 Both selected three-node scenarios passed (417.369 seconds total):
 
@@ -155,3 +179,57 @@ the empty anchor is meaningful: there is no retained prefix to rebuild at that
 boundary. Incremental records are still transferred and their final raw range
 is checked. These measurements are not physical disk I/O or a claim of minimal
 recovery work.
+
+### Follow-up correction and integrated acceptance
+
+The corrected three-broker indexed scenario passed in **187.17 seconds**.
+The authenticated repair was `start=10001 current=1 target=10002` at leader
+epoch 2: 12 exchanges in the successful repair turn, 46 exchanges including
+failed/held turns and subsequent data catch-up. The original committed seed
+remained below the truncation boundary; only `[1,10001)` was discarded, then
+`[1,10002)` was fetched (10001 unique authoritative records). The retained-state
+rebuild decoded one record / 140 logical bytes, rather than rebuilding from an
+empty log. These are distinct from the transfer and hashing counts below.
+
+| Broker | Lineage logical read bytes | Canonically hashed records | Canonical hash bytes | Catch-up response bytes | Retained scan records / bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 (previous leader) | 2,158,993 | 11,533 | 2,050,612 | 0 | 0 / 0 |
+| 2 (receiver) | 4,798,312 | 22,505 | 4,009,119 | 4,796,874 | 1 / 140 |
+| 3 (new leader) | 2,495,241 | 11,563 | 2,056,340 | 0 | 0 / 0 |
+| Total | 9,452,546 | 45,601 | 8,116,071 | 4,796,874 | 1 / 140 |
+
+The one-record common prefix makes saved data replay small in this fixture;
+the extra proof reads and exchanges are a measured safety cost, not an efficiency
+improvement claimed from request count alone. Index warmth, background work and
+live commit counts differ from the baseline run, so these are observations,
+not a controlled latency benchmark. Regression cases also locate noncandidate
+common prefixes at 17 and 64 and preserve every common record.
+
+| Acceptance criterion | Corrected integrated evidence |
+| --- | --- |
+| Offline append and offset traffic | 10 interleaved append/commit batches while the follower was stopped; one commit while the old response was held and 49 more during recovery. |
+| Previous generation rejected before mutation | Old response released after leader/HWM change; rejection observed with identical persisted segment hashes, LEO and HWM while fresh application remained paused. |
+| Divergent suffix only | 10000 divergent records; exact common boundary 1 found before the single rollback. Unit/controller tests prohibit applying a coarse sparse rollback. |
+| Committed data, offsets and materialization | Original seed matches in every persisted field; all source records converge; group offset 10002 and producer/aggregate retries remain idempotent. |
+| Latest HWM and ISR admission | Receiver absent from both survivors' ISR under target 10002; eventual readiness observation is 503 while held; full ISR only after catch-up to 10002 and raw-prefix equality. |
+| Crash and durable restart | Crashes after durable truncation and incremental append recover; stopping all brokers before restarting any preserves all 10004 raw records, group offset 10002 and duplicate suppression. Fresh aggregate version 4 succeeds. |
+
+Readiness is sampled by the existing observation worker. The first follow-up
+attempt exposed a test timing error: an immediate HTTP assertion read the prior
+successful sample after HWM advanced. The test now waits up to 10 seconds for
+503 while recovery remains held, without changing the product readiness rules
+or weakening the direct ISR and no-mutation assertions.
+
+Final focused Linux race regressions passed in replication FSM (14.478s),
+cluster controller (2.728s), command controller (4.099s), topic (7.929s) and disk
+(15.446s). Lint reported zero issues. The isolated final integration copy had
+799 production/support files byte-identical to the checkout; only test endpoints
+and Compose names differed. No workflow branch exception was introduced.
+
+`TestReplicaRecoveryWithoutLaterEpochBoundary` also passed in the final run
+(81.64s), including nonzero-epoch/no-later-boundary recovery, complete cluster
+restart, exact raw equality and an idempotent producer retry. Both scenarios
+completed together in 274.083s. The local implementation and integrated fault
+acceptance evidence now support completion of the seven criteria; upstream
+integration remains subject to final CI and user-owned review/merge. This work
+does not merge the PR or close the issue automatically.

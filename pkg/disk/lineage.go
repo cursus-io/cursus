@@ -117,6 +117,31 @@ func (d *DiskHandler) LineageCandidates(tail uint64) ([]LineagePrefix, error) {
 	return d.LineageCandidatesContext(context.Background(), tail)
 }
 
+// LineagePrefixContext proves one boundary without constructing another sparse
+// candidate set. Recovery uses it to refine a mismatch without truncating first.
+func (d *DiskHandler) LineagePrefixContext(ctx context.Context, end uint64) (LineagePrefix, error) {
+	unlock, err := d.lockLineageBuilder(ctx)
+	if err != nil {
+		return LineagePrefix{}, err
+	}
+	defer unlock()
+	if err := d.prepareLineage(ctx, false); err != nil {
+		return LineagePrefix{}, err
+	}
+	index := d.lineageProgress.index
+	if end < index.start || end > index.tail.EndOffset {
+		return LineagePrefix{}, fmt.Errorf("lineage end %d outside retained range [%d,%d]", end, index.start, index.tail.EndOffset)
+	}
+	proof, err := d.lineagePrefix(ctx, end)
+	if err != nil {
+		return LineagePrefix{}, err
+	}
+	if err := d.checkLineageGeneration(ctx); err != nil {
+		return LineagePrefix{}, err
+	}
+	return proof, nil
+}
+
 // LineageCandidatesContext permits cancellation while queued or between bounded
 // chunks. Successfully committed chunks remain available to the next request.
 func (d *DiskHandler) LineageCandidatesContext(ctx context.Context, tail uint64) ([]LineagePrefix, error) {

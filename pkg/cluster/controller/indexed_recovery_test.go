@@ -25,47 +25,49 @@ func (s *indexedSourceFetcher) FetchReplicaCatchup(_ context.Context, _ string, 
 	return s.source.FetchReplicaCatchup(request)
 }
 
-func TestIndexedRecoveryRefreshesDurableProofAfterEachBatch(t *testing.T) {
-	makeFSM := func(messages []types.Message) (*fsm.BrokerFSM, *topic.Partition, *config.Config) {
-		cfg := config.DefaultConfig()
-		cfg.LogDir = t.TempDir()
-		cfg.EnabledDistribution = true
-		cfg.DiskMinFreeBytes = 1
-		cfg.DiskMinFreePercent = 0.1
-		dm := disk.NewDiskManager(cfg)
-		t.Cleanup(dm.CloseAllHandlers)
-		tm := topic.NewTopicManager(cfg, dm, nil)
-		state := fsm.NewBrokerFSM(tm, nil)
-		for _, id := range []string{"node-1", "node-2"} {
-			data, err := json.Marshal(fsm.BrokerInfo{ID: id, Addr: id + ":9001", Status: "active", RecoveryProtocol: 1})
-			require.NoError(t, err)
-			require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("REGISTER:"), data...)}))
-		}
-		definition := topic.DefaultDefinition("orders", cfg)
-		definition.Partitions = 1
-		definition.ReplicationFactor = 2
-		command, err := json.Marshal(fsm.TopicCommand{Definition: &definition, LeaderID: "node-1"})
+func indexedControllerFSM(t *testing.T, messages []types.Message, hwm uint64) (*fsm.BrokerFSM, *topic.Partition, *config.Config) {
+	t.Helper()
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.EnabledDistribution = true
+	cfg.DiskMinFreeBytes = 1
+	cfg.DiskMinFreePercent = 0.1
+	dm := disk.NewDiskManager(cfg)
+	t.Cleanup(dm.CloseAllHandlers)
+	tm := topic.NewTopicManager(cfg, dm, nil)
+	state := fsm.NewBrokerFSM(tm, nil)
+	for _, id := range []string{"node-1", "node-2"} {
+		data, err := json.Marshal(fsm.BrokerInfo{ID: id, Addr: id + ":9001", Status: "active", RecoveryProtocol: 1})
 		require.NoError(t, err)
-		require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("TOPIC:"), command...)}))
-		p, err := tm.GetTopic("orders").GetPartition(0)
-		require.NoError(t, err)
-		t.Cleanup(p.Close)
-		if len(messages) > 0 {
-			require.NoError(t, p.ReplicaAppendWithMode(messages, true))
-			require.NoError(t, p.ApplyReplicaHWM(uint64(len(messages))))
-		}
-		metadata := state.GetPartitionMetadata("orders-0")
-		metadata.CommittedHWM = 3
-		metadata.CommittedHWMKnown = true
-		metadata.ISR = []string{"node-1"}
-		data, err := json.Marshal(metadata)
-		require.NoError(t, err)
-		require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("PARTITION:orders-0:"), data...)}))
-		return state, p, cfg
+		require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("REGISTER:"), data...)}))
 	}
+	definition := topic.DefaultDefinition("orders", cfg)
+	definition.Partitions = 1
+	definition.ReplicationFactor = 2
+	command, err := json.Marshal(fsm.TopicCommand{Definition: &definition, LeaderID: "node-1"})
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("TOPIC:"), command...)}))
+	p, err := tm.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+	t.Cleanup(p.Close)
+	if len(messages) > 0 {
+		require.NoError(t, p.ReplicaAppendWithMode(messages, true))
+		require.NoError(t, p.ApplyReplicaHWM(uint64(len(messages))))
+	}
+	metadata := state.GetPartitionMetadata("orders-0")
+	metadata.CommittedHWM = hwm
+	metadata.CommittedHWMKnown = true
+	metadata.ISR = []string{"node-1"}
+	data, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("PARTITION:orders-0:"), data...)}))
+	return state, p, cfg
+}
+
+func TestIndexedRecoveryRefreshesDurableProofAfterEachBatch(t *testing.T) {
 	messages := []types.Message{{Offset: 0, Payload: "one"}, {Offset: 1, Payload: "two"}, {Offset: 2, Payload: "three"}}
-	source, _, _ := makeFSM(messages)
-	receiver, p, cfg := makeFSM(nil)
+	source, _, _ := indexedControllerFSM(t, messages, 3)
+	receiver, p, cfg := indexedControllerFSM(t, nil, 3)
 	cc := NewClusterController(context.Background(), cfg, &MockRaftManager{mockFSM: receiver}, nil, "node-2", "node-2:9001")
 	fetcher := &indexedSourceFetcher{source: source}
 	require.NoError(t, cc.RunReplicaCatchupOnceVerified(context.Background(), fetcher, func(ctx context.Context, request fsm.ReplicaCatchupRequest, batch fsm.ReplicaCatchupBatch) (*topic.ReplicaCatchupWitness, error) {
@@ -79,6 +81,40 @@ func TestIndexedRecoveryRefreshesDurableProofAfterEachBatch(t *testing.T) {
 	require.NotEqual(t, fetcher.requests[0].PrefixCandidates[0].Digest, fetcher.requests[1].PrefixCandidates[0].Digest)
 	require.Equal(t, uint64(3), p.NextOffset())
 	require.Len(t, receiver.BuildISRCatchupProofs("node-2"), 1)
+}
+
+func TestIndexedRecoveryRefinesBeforeApplyingOneRollback(t *testing.T) {
+	a, b := make([]types.Message, 101), make([]types.Message, 101)
+	for i := range a {
+		a[i] = types.Message{Offset: uint64(i), Payload: "source"}
+		b[i] = a[i]
+		if i != 0 {
+			b[i].Payload = "divergent"
+		}
+	}
+	source, _, _ := indexedControllerFSM(t, a, 101)
+	receiver, p, cfg := indexedControllerFSM(t, b, 101)
+	cc := NewClusterController(context.Background(), cfg, &MockRaftManager{mockFSM: receiver}, nil, "node-2", "node-2:9001")
+	fetcher := &indexedSourceFetcher{source: source}
+	applied := 0
+	require.NoError(t, cc.RunReplicaCatchupOnceVerified(context.Background(), fetcher, func(ctx context.Context, request fsm.ReplicaCatchupRequest, batch fsm.ReplicaCatchupBatch) (*topic.ReplicaCatchupWitness, error) {
+		applied++
+		require.Equal(t, uint64(101), p.NextOffset())
+		require.Equal(t, uint64(101), p.GetHWM())
+		require.Greater(t, len(fetcher.requests), 1, "initial sparse anchor must not reach apply")
+		require.NotNil(t, batch.TruncateTo)
+		require.Equal(t, uint64(1), *batch.TruncateTo)
+		return nil, p.ApplyReplicaRollbackChecked(ctx, *batch.TruncateTo, request.NextOffset, batch.MatchedPrefix, batch.CommittedHWM, func() error {
+			return p.CheckReplicaRequestGeneration(ctx, request.LocalWitness)
+		})
+	}))
+	require.Equal(t, 1, applied)
+	require.LessOrEqual(t, len(fetcher.requests), 8)
+	require.Equal(t, uint64(1), p.NextOffset())
+	require.Equal(t, uint64(1), p.GetHWM())
+	for _, request := range fetcher.requests {
+		require.Equal(t, uint64(101), request.NextOffset, "all probes use the unchanged log")
+	}
 }
 
 func TestValidateIndexedRecoveryResponseBindsModeAndRequestedPrefix(t *testing.T) {

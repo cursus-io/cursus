@@ -245,12 +245,12 @@ func TestIndexedRecoveryBoundsLargeLegacyTailOnThreeNodes(t *testing.T) {
 		}
 	}
 	require.Positive(t, exchanges, "the indexed protocol must be observed")
-	require.LessOrEqual(t, exchanges, 24)
-	// The sparse candidates do not include end=1 for this 10,001-record
-	// fixture. The only matching candidate is the retained anchor at zero.
-	// This certifies reconstruction, NOT physical preservation of the seed;
-	// the acceptance audit explicitly keeps that stricter requirement open.
-	require.Contains(t, repair, "start=10001 current=0 ")
+	// Each of the two generations may need up to 14 binary probes after the
+	// sparse challenge. Include the original 24-exchange transfer/retry budget.
+	require.LessOrEqual(t, exchanges, 24+2*14)
+	// End=1 is absent from the sparse set. Read-only refinement must preserve
+	// the committed seed instead of clearing it and reconstructing from zero.
+	require.Contains(t, repair, "start=10001 current=1 ")
 	t.Logf("observed authenticated repair boundary: %s", repair)
 	t.Logf("10000 divergent epoch-zero records repaired; indexed exchanges including failed turns=%d incremental response bytes=%.0f", exchanges, bytes)
 	t.Logf("receiver lineage work after startup: read bytes=%.0f hash bytes=%.0f", recoveryWorkMetric(t, offline, "lineage", "read_bytes")-readBefore, recoveryWorkMetric(t, offline, "lineage", "canonical_hash_bytes")-hashBefore)

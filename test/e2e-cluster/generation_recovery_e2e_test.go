@@ -50,9 +50,12 @@ func requireGenerationReplicaExcluded(t *testing.T, addrs []string, history stri
 		}
 		require.True(t, found, "partition absent on %s", addr)
 	}
-	code, _, err := readReadiness(offline)
-	require.NoError(t, err)
-	require.NotEqual(t, 200, code, "unverified replica must remain unready")
+	// /ready publishes a periodic observation, not an inline metadata read.
+	// Keep recovery held while waiting for the new HWM to reach that sample.
+	require.NoError(t, eventually(t, "unverified replica observed unready", 10*time.Second, func() (bool, string, error) {
+		code, body, err := readReadiness(offline)
+		return err == nil && code == 503, fmt.Sprintf("status=%d body=%s", code, body), err
+	}))
 }
 
 type generationWorkKey struct {
