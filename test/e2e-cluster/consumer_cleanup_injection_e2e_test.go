@@ -81,6 +81,7 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 				}
 				commitGroupOffset(t, live, cleanupRetainedMessages, liveGroup, offset, liveGeneration, liveMember)
 			}
+			requireReplicaPartitionOffsetsConverge(t, addrs, config.ConsumerOffsetsTopicName, livePartition)
 			liveState, err := live.GetConsumerGroupStatus(liveGroup)
 			require.NoError(t, err)
 			require.Len(t, liveState.Members, 1)
@@ -127,10 +128,19 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 				out, err := exec.CommandContext(execCtx, "docker", "exec", fmt.Sprintf("cursus-cleanup-broker-%d", owner), "test", "-f", faultSentinelRoot+"/consumer-cleanup-ack/"+cleanupRecoveryTopic+".fired").CombinedOutput()
 				return err == nil, string(out), nil
 			}))
-			first := waitCleanupReadPending(t, addrs[follower-1], 0)
+			pending := waitCleanupReadPending(t, addrs[follower-1], 0)
+			// The tombstone can arrive after the reader has passed its partition,
+			// moving the active retry back from the separate live-group partition.
+			// Freeze the comparison only after committed ends converge and a new
+			// failed attempt observes them; retain all accumulated-work assertions.
+			requireReplicaPartitionOffsetsConverge(t, addrs, config.ConsumerOffsetsTopicName, targetPartition)
+			first := waitCleanupReadPending(t, addrs[follower-1], pending.Reads+1)
+			require.Equal(t, pending.Records, first.Records)
+			require.Equal(t, pending.Bytes, first.Bytes)
 			require.GreaterOrEqual(t, first.Records, uint64(128))
 			require.Positive(t, first.Bytes)
 			second := waitCleanupReadPending(t, addrs[follower-1], first.Reads+2)
+			require.Equal(t, first.Partition, second.Partition)
 			require.Equal(t, first.Next, second.Next)
 			require.Equal(t, first.Position, second.Position)
 			require.Equal(t, first.Records, second.Records, "failed retries must not rescan the completed prefix")

@@ -397,6 +397,14 @@ all internal offset partitions to another broker. The fixture now explicitly
 elects the separate offset partition's leader and verifies routing as described
 above; it does not weaken timestamp or stale-follower assertions.
 
+With separate offset partitions, the tombstone may extend an earlier partition
+after the reader has reached the live group's partition. The retry's active
+partition can legitimately change without decoding more records. The injection
+fixture therefore waits for replica committed ends to converge and another
+failed read before comparing the active cursor. It still requires unchanged
+records/bytes across that settling attempt and unchanged partition, cursor,
+records and bytes through the subsequent failed retries.
+
 The issue had no comments when checked. Prerequisite PR #275 is merged; its
 shared/pattern subscription and pending reservation guards are already in main
 and are not reimplemented. PRs #276/#277 were also merged before this follow-up.
