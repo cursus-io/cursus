@@ -117,6 +117,17 @@ func TestReplicaRecoveryWithoutLaterEpochBoundary(t *testing.T) {
 	require.Equal(t, committed, readReplicaEpochBoundaryRecords(t, ctx.GetBrokerAddrs(), history, divergentNode, epoch))
 	require.NoError(t, client.PublishIdempotentToPartition(history, "replacement", 0, 3, 0, "resumed", "all", true))
 	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), history, 4)
+	// The existing scenario proves same-epoch repair and a follower restart.
+	// Also lose every process after recovery, preserving all durable volumes.
+	want := readReplicaEpochBoundaryRecords(t, ctx.GetBrokerAddrs(), history, divergentNode, epoch)
+	restartGenerationRecoveryCluster(t, ctx, actions)
+	epoch = requirePartitionRecoveryState(t, ctx.GetBrokerAddrs(), history, 0, false, 3, 0)
+	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), history, 4)
+	for node := 1; node <= 3; node++ {
+		require.Equal(t, want, readReplicaEpochBoundaryRecords(t, ctx.GetBrokerAddrs(), history, node, epoch))
+	}
+	require.NoError(t, client.PublishIdempotentToPartition(history, "replacement", 0, 3, 0, "resumed", "all", true))
+	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), history, 4)
 }
 
 // readReplicaEpochBoundaryRecords reads authenticated raw records from the

@@ -105,6 +105,7 @@ func lineageHash(previous [sha256.Size]byte, message types.DiskMessage) ([sha256
 	_, _ = h.Write(length[:])
 	_, _ = h.Write(canonical)
 	metrics.RecordRecoveryBytes(metrics.RecoveryLineage, metrics.RecoveryCanonicalHashBytes, int64(len(previous)+len(length)+len(canonical)))
+	metrics.RecordRecoveryWork(metrics.RecoveryLineage, metrics.RecoveryDecodedFrames, 1)
 	var digest [sha256.Size]byte
 	copy(digest[:], h.Sum(nil))
 	return digest, nil

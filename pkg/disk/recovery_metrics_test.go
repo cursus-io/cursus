@@ -31,6 +31,7 @@ func TestRecoveryMetricsRetainCanceledLineageWork(t *testing.T) {
 	read := recoveryMetric(t, "lineage", "read_bytes")
 	written := recoveryMetric(t, "lineage", "write_bytes")
 	hashed := recoveryMetric(t, "lineage", "canonical_hash_bytes")
+	records := recoveryMetric(t, "lineage", "decoded_frames")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	d.lineageSyncFn = func(file *os.File) error {
@@ -44,9 +45,30 @@ func TestRecoveryMetricsRetainCanceledLineageWork(t *testing.T) {
 	require.Greater(t, recoveryMetric(t, "lineage", "read_bytes"), read)
 	require.Greater(t, recoveryMetric(t, "lineage", "write_bytes"), written)
 	require.Greater(t, recoveryMetric(t, "lineage", "canonical_hash_bytes"), hashed)
+	require.Positive(t, recoveryMetric(t, "lineage", "decoded_frames")-records)
 	_, err = d.MatchLineageCandidatesContext(context.Background(), nil, 1200)
 	require.NoError(t, err)
 	require.Equal(t, uint64(1200), d.lineageProgress.recordsHashed)
+	require.Equal(t, float64(1200), recoveryMetric(t, "lineage", "decoded_frames")-records, "resuming a canceled builder must not repeat completed hash work")
+}
+
+func TestRecoveryMetricsCountRetainedReplayBeforeVisitorFailure(t *testing.T) {
+	d, _ := bootstrapTestHandler(t, 1)
+	require.NoError(t, d.WriteBatchSync(detachedCacheRecords(0, 3, 100)))
+	before := recoveryMetric(t, "retained_scan", "decoded_frames")
+	reads := recoveryMetric(t, "retained_scan", "read_bytes")
+	failure := errors.New("replay interrupted")
+	visits := 0
+	err := d.ScanRetainedRange(context.Background(), 0, 3, func(types.Message) error {
+		visits++
+		if visits == 2 {
+			return failure
+		}
+		return nil
+	})
+	require.ErrorIs(t, err, failure)
+	require.Equal(t, float64(2), recoveryMetric(t, "retained_scan", "decoded_frames")-before)
+	require.Greater(t, recoveryMetric(t, "retained_scan", "read_bytes"), reads)
 }
 
 func recoveryMetric(t *testing.T, stage, unit string) float64 {
