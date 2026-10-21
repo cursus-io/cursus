@@ -216,9 +216,12 @@ physical I/O, transfer-byte or whole-recovery bounds. Record timestamps cause
 small byte differences between runs. The test logs the other brokers' cleanup
 and available lineage/retained-page/retained-scan counters separately.
 
-Each case preserves unrelated generation, membership, assignments, last
-rebalance and heartbeat timestamps across cleanup, then accepts another
-heartbeat. Offset 140 survives. Exact event history and ordinary messages,
+Each case preserves unrelated generation, membership, assignments and last
+rebalance across admission and cleanup. Exact heartbeat timestamps are checked
+from the committed response through bounded retries and completion, then another
+heartbeat is accepted. Admission's separate clock-reset limitation is recorded
+below; whole-operation timestamp preservation is not established. Offset 140
+survives. Exact event history and ordinary messages,
 event-ID retries and producer-sequence retries remain unchanged; fresh writes
 advance each unrelated stream from one to exactly two records. The truncate
 retry does not advance revision 2, and `DELETE if_exists=true` reports
@@ -256,7 +259,7 @@ Acceptance evidence remains deliberately split by test level:
 | 4: concurrent registration/generation | Unit replay/snapshot replacement and fencing tests; delayed deletion versus concurrent registration has not been injected across three brokers here. |
 | 5: lost reply/transient read | Three-broker committed tombstone acknowledgement loss plus retained-cursor read failure pass for both operations. Administrative transport response loss is a separate, untested boundary. |
 | 6: recovery boundaries | Three-broker coordinator failover, old-owner return and actual full snapshot restores after truncate/delete pass. Rollback and compacted gaps remain unit evidence; distributed internal metadata compaction is disabled, so there is no supported live compaction scenario to declare passed. |
-| 7: unrelated group/scope safety | Three-broker heartbeat, membership, generation and offset preservation; shared/pattern groups and unfinished reservations retain the safety regressions from the prerequisite. Topic-scoped cleanup of shared groups remains future work, not a whole-group tombstone bypass. |
+| 7: unrelated group/scope safety | Three-broker heartbeat acceptance, membership, generation and offset preservation; exact heartbeat time during bounded retries. Administrative full replay can reconstruct heartbeat/ownership clocks, so whole-operation clock preservation remains open. Shared/pattern groups and unfinished reservations retain the prerequisite safety regressions. Topic-scoped cleanup of shared groups remains future work, not a whole-group tombstone bypass. |
 | 8: unrelated records/dedup | Exact event/message history, duplicate retry identity/offsets and fresh writes pass, including the separate restart/snapshot scenario. |
 | 9: bounded progress/status | Page/cursor regressions and the measured injection above; the wire now exposes existing FSM details. A record over 1 MiB remains pending. Cache limits and invalidation tests do not bound total work under endless failures or invalidations. |
 | 10: operator/protocol contract | Committed intent, local completion, retry reasons and oversized-record limitation are documented. Full startup, ownership recovery and administrative admission replay remain outside bounded cleanup. |
@@ -329,6 +332,18 @@ comment: bound the two new `docker exec` calls. They now use context deadlines
 (30 seconds for marker polling and one minute for sentinel changes), allowing
 normal failure reporting and cleanup instead of waiting for the suite timeout.
 No additional review was requested.
+
+The corrected-port CI attempt also exposed a separate acceptance gap: TRUNCATE
+admission advanced an unrelated member's heartbeat timestamp by about 118 ms
+without a heartbeat from that member. `prepareTopicDependencies` calls full
+`ReloadDistributedConsumerMetadata`; replayed lifecycle snapshots reconstruct
+member heartbeat times and full replay replaces the ownership-clock map. This
+is outside the bounded follower reader, but remains an issue acceptance gap,
+not a successful whole-operation clock-preservation result. The test keeps
+membership, assignment, generation, last-rebalance and offset assertions across
+admission, logs its heartbeat boundary, then captures the post-admission baseline
+and checks exact heartbeat timestamps through repeated read failures and final
+materialization. No timestamp comparison is weakened within bounded retries.
 
 The issue had no comments when checked. Prerequisite PR #275 is merged; its
 shared/pattern subscription and pending reservation guards are already in main
