@@ -19,7 +19,6 @@ import (
 const (
 	runClusterFailureE2E = "RUN_E2E_CLUSTER_FAILURE"
 	clusterFailureWait   = 90 * time.Second
-	baseExporterPort     = 9100
 )
 
 func TestRaftLeaderFailoverPropagatesDirectTopicMutations(t *testing.T) {

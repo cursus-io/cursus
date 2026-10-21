@@ -23,6 +23,7 @@ const (
 	faultComposeFile      = "docker-compose.faults.yml"
 	baseBrokerPort        = 9000
 	baseHealthPort        = 9080
+	baseExporterPort      = 9100
 	composeLogTimeout     = 30 * time.Second
 )
 
