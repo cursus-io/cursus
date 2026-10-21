@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/test/e2e"
 	"github.com/stretchr/testify/require"
@@ -52,15 +53,23 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 			// Admission runs on the Raft leader. Put the unrelated live session
 			// there too so its clock assertion always exercises admission replay.
 			raftLeader := waitForStorageFaultRaftLeader(t, 3)
-			liveGroup := ""
-			for candidate := 0; candidate < 64; candidate++ {
-				name := fmt.Sprintf("cleanup-injection-live-%d", candidate)
-				if coordinatorNode(t, findGroupCoordinator(t, 1, name)) == raftLeader {
-					liveGroup = name
-					break
+			targetPartition, partitionCount := consumerOffsetPartition(t, addrs, cleanupRecoveryGroup)
+			liveGroup := consumerGroupOnDifferentOffsetPartition("cleanup-injection-live", targetPartition, partitionCount)
+			livePartition, _ := consumerOffsetPartition(t, addrs, liveGroup)
+			requireReplicaPartitionOffsetsConverge(t, addrs, config.ConsumerOffsetsTopicName, livePartition)
+			sendClusterTopicCommand(t, addrs, fmt.Sprintf("ELECT_LEADER topic=%s partition=%d broker=broker-%d-9000",
+				config.ConsumerOffsetsTopicName, livePartition, raftLeader))
+			require.NoError(t, eventually(t, "unrelated session owner is admission broker", clusterReadyTimeout, func() (bool, string, error) {
+				for node := 1; node <= 3; node++ {
+					id, err := findGroupCoordinatorFrom(node, liveGroup)
+					if err != nil || id != fmt.Sprintf("broker-%d-9000", raftLeader) {
+						return false, fmt.Sprintf("node=%d owner=%s err=%v", node, id, err), nil
+					}
 				}
-			}
-			require.NotEmpty(t, liveGroup, "no unrelated group maps to the admission broker")
+				return true, "route converged", nil
+			}))
+			require.Equal(t, owner, coordinatorNode(t, findGroupCoordinator(t, 1, cleanupRecoveryGroup)))
+			t.Logf("admission broker=%d live group=%s offsets partition=%d target partition=%d", raftLeader, liveGroup, livePartition, targetPartition)
 			live, liveGeneration, liveMember := joinRecoveryGroup(t, addrs, cleanupRetainedMessages, liveGroup)
 			defer live.Close()
 			// Force multiple bounded pages using valid unrelated metadata, not

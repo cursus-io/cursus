@@ -111,11 +111,11 @@ replay. New lifecycle identities and ordinary startup/ownership/repair recovery
 must not inherit the old session clocks. Preserve a heartbeat received during
 the scan by copying from the live state at publication, not from a pre-scan copy.
 
-Before implementation, define checks for repeated refresh, real timeout after
+The checks defined before implementation cover repeated refresh, real timeout after
 refresh, concurrent heartbeat, newer offsets with unchanged session, changed
 epoch/generation/assignment, tombstones, read failure and normal ownership
-recovery. Restore exact three-broker heartbeat equality across admission and
-administrative retries, while retaining shared/pattern and reservation guards.
+recovery, plus exact three-broker heartbeat equality across admission and
+administrative retries while retaining shared/pattern and reservation guards.
 Safety comes from identity and existing import-generation fences; availability
 does not gain synthetic grace from unrelated admin requests. The added matching
 work is linear in already-replayed group membership and performs no extra I/O.
@@ -126,8 +126,10 @@ timestamp at publication. `prepareTopicDependencies` now uses
 `RefreshConsumerMetadataForAdmission`; ownership/startup recovery retains the
 ordinary reload policy. Regression checks also exercise acknowledged reservation
 prepare/release progress against a stale scan. The three-broker injection fixture
-selects an unrelated group owned by the Raft leader so its exact timestamp check
-must cross the admission replay, including retries of the administrative command.
+uses `ELECT_LEADER` on an offset partition different from the cleanup target's
+partition, then verifies every broker routes the unrelated group to the Raft
+leader. Its exact timestamp check must cross admission replay, including retries
+of the administrative command, without moving the cleanup target's owner.
 
 ## Snapshot/write exclusion found during integration
 
@@ -378,6 +380,13 @@ initial evidence-only change at `e5dc8af` distinguished that boundary but did no
 fix it. The admission-specific policy above fixes the cause; the test again
 requires exact timestamps across the entire operation, including administrative
 retries. Actual coordinator ownership recovery still grants its intended grace.
+
+The first admission-fix CI run (`9e039ce`) passed the other 27 checks but failed
+the injection fixture before its administrative operation: choosing group names
+could not place the live group on the Raft leader because bootstrap had assigned
+all internal offset partitions to another broker. The fixture now explicitly
+elects the separate offset partition's leader and verifies routing as described
+above; it does not weaken timestamp or stale-follower assertions.
 
 The issue had no comments when checked. Prerequisite PR #275 is merged; its
 shared/pattern subscription and pending reservation guards are already in main
