@@ -92,6 +92,43 @@ same snapshot for the count. The injection test must inspect this actual wire
 field, including its cleanup reason/cursor/work; an internal FSM assertion alone
 does not prove operator visibility. No payloads or credentials are added.
 
+## Admission clock preservation
+
+Before this correction, rechecked the official Admin API and adopted KIP-496
+above, and [Kafka 3.9.0 GroupCoordinator](https://github.com/apache/kafka/blob/3.9.0/core/src/main/scala/kafka/coordinator/group/GroupCoordinator.scala).
+Kafka separates coordinator loading/session initialization from administrative
+offset deletion; loading is epoch-fenced in GroupMetadataManager. Adopt that
+separation: administrative refresh must not manufacture a new session timeout
+or ownership grace period for an unchanged live group. Cursus still performs
+its existing full replay for admission, so its scan bytes/work remain unbounded
+by the cleanup page budget; this correction changes publication, not that cost.
+
+The admission-only replay policy now carries, under the existing publication lock,
+the current heartbeat, last-activity and ownership timestamps only when the
+replayed registration epoch, generation, subscription, rebalance and complete
+member/assignment identity match. Keep committed offsets/reservations from normal
+replay. New lifecycle identities and ordinary startup/ownership/repair recovery
+must not inherit the old session clocks. Preserve a heartbeat received during
+the scan by copying from the live state at publication, not from a pre-scan copy.
+
+Before implementation, define checks for repeated refresh, real timeout after
+refresh, concurrent heartbeat, newer offsets with unchanged session, changed
+epoch/generation/assignment, tombstones, read failure and normal ownership
+recovery. Restore exact three-broker heartbeat equality across admission and
+administrative retries, while retaining shared/pattern and reservation guards.
+Safety comes from identity and existing import-generation fences; availability
+does not gain synthetic grace from unrelated admin requests. The added matching
+work is linear in already-replayed group membership and performs no extra I/O.
+
+The regression failed before the correction: repeated refresh reset the member
+heartbeat, and a heartbeat accepted during a paused scan lost its last-activity
+timestamp at publication. `prepareTopicDependencies` now uses
+`RefreshConsumerMetadataForAdmission`; ownership/startup recovery retains the
+ordinary reload policy. Regression checks also exercise acknowledged reservation
+prepare/release progress against a stale scan. The three-broker injection fixture
+selects an unrelated group owned by the Raft leader so its exact timestamp check
+must cross the admission replay, including retries of the administrative command.
+
 ## Snapshot/write exclusion found during integration
 
 The repeat run exposed a commit timeout after snapshot recovery and group
@@ -216,12 +253,11 @@ physical I/O, transfer-byte or whole-recovery bounds. Record timestamps cause
 small byte differences between runs. The test logs the other brokers' cleanup
 and available lineage/retained-page/retained-scan counters separately.
 
-Each case preserves unrelated generation, membership, assignments and last
-rebalance across admission and cleanup. Exact heartbeat timestamps are checked
-from the committed response through bounded retries and completion, then another
-heartbeat is accepted. Admission's separate clock-reset limitation is recorded
-below; whole-operation timestamp preservation is not established. Offset 140
-survives. Exact event history and ordinary messages,
+Each case checks unrelated generation, membership, assignments, last rebalance
+and exact heartbeat timestamps across admission, bounded retries, completion and
+administrative retry, then accepts another heartbeat. The live group is owned by
+the admission broker to exercise the corrected replay path deterministically.
+Offset 140 survives. Exact event history and ordinary messages,
 event-ID retries and producer-sequence retries remain unchanged; fresh writes
 advance each unrelated stream from one to exactly two records. The truncate
 retry does not advance revision 2, and `DELETE if_exists=true` reports
@@ -259,7 +295,7 @@ Acceptance evidence remains deliberately split by test level:
 | 4: concurrent registration/generation | Unit replay/snapshot replacement and fencing tests; delayed deletion versus concurrent registration has not been injected across three brokers here. |
 | 5: lost reply/transient read | Three-broker committed tombstone acknowledgement loss plus retained-cursor read failure pass for both operations. Administrative transport response loss is a separate, untested boundary. |
 | 6: recovery boundaries | Three-broker coordinator failover, old-owner return and actual full snapshot restores after truncate/delete pass. Rollback and compacted gaps remain unit evidence; distributed internal metadata compaction is disabled, so there is no supported live compaction scenario to declare passed. |
-| 7: unrelated group/scope safety | Three-broker heartbeat acceptance, membership, generation and offset preservation; exact heartbeat time during bounded retries. Administrative full replay can reconstruct heartbeat/ownership clocks, so whole-operation clock preservation remains open. Shared/pattern groups and unfinished reservations retain the prerequisite safety regressions. Topic-scoped cleanup of shared groups remains future work, not a whole-group tombstone bypass. |
+| 7: unrelated group/scope safety | Admission refresh now preserves heartbeat/activity/ownership clocks for unchanged lifecycle identity; regressions cover real expiration, concurrent heartbeat and ordinary ownership recovery. The three-broker test requires exact heartbeat time across admission and retries, plus membership, generation and offset preservation. Shared/pattern groups and unfinished reservations retain the prerequisite safety regressions. Topic-scoped cleanup of shared groups remains future work, not a whole-group tombstone bypass. |
 | 8: unrelated records/dedup | Exact event/message history, duplicate retry identity/offsets and fresh writes pass, including the separate restart/snapshot scenario. |
 | 9: bounded progress/status | Page/cursor regressions and the measured injection above; the wire now exposes existing FSM details. A record over 1 MiB remains pending. Cache limits and invalidation tests do not bound total work under endless failures or invalidations. |
 | 10: operator/protocol contract | Committed intent, local completion, retry reasons and oversized-record limitation are documented. Full startup, ownership recovery and administrative admission replay remain outside bounded cleanup. |
@@ -333,17 +369,15 @@ comment: bound the two new `docker exec` calls. They now use context deadlines
 normal failure reporting and cleanup instead of waiting for the suite timeout.
 No additional review was requested.
 
-The corrected-port CI attempt also exposed a separate acceptance gap: TRUNCATE
+The corrected-port CI attempt also exposed a production defect: TRUNCATE
 admission advanced an unrelated member's heartbeat timestamp by about 118 ms
 without a heartbeat from that member. `prepareTopicDependencies` calls full
 `ReloadDistributedConsumerMetadata`; replayed lifecycle snapshots reconstruct
-member heartbeat times and full replay replaces the ownership-clock map. This
-is outside the bounded follower reader, but remains an issue acceptance gap,
-not a successful whole-operation clock-preservation result. The test keeps
-membership, assignment, generation, last-rebalance and offset assertions across
-admission, logs its heartbeat boundary, then captures the post-admission baseline
-and checks exact heartbeat timestamps through repeated read failures and final
-materialization. No timestamp comparison is weakened within bounded retries.
+member heartbeat times and full replay replaces the ownership-clock map. The
+initial evidence-only change at `e5dc8af` distinguished that boundary but did not
+fix it. The admission-specific policy above fixes the cause; the test again
+requires exact timestamps across the entire operation, including administrative
+retries. Actual coordinator ownership recovery still grants its intended grace.
 
 The issue had no comments when checked. Prerequisite PR #275 is merged; its
 shared/pattern subscription and pending reservation guards are already in main

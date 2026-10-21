@@ -351,7 +351,7 @@ func newCoordinator(ctx context.Context, cfg *config.Config, handler TopicHandle
 			c.recoveryMu.Lock()
 			c.recovery = ConsumerMetadataRecoveryStatus{Phase: "awaiting_cluster_recovery"}
 			c.recoveryMu.Unlock()
-		} else if status, recoveryErr := c.loadDistributedOffsetsFromLog(reader); recoveryErr != nil {
+		} else if status, recoveryErr := c.loadDistributedOffsetsFromLog(reader, false); recoveryErr != nil {
 			wrapped := fmt.Errorf("replay distributed consumer metadata from %q: %w", c.offsetTopic, recoveryErr)
 			c.setRecoveryFailure(wrapped)
 			return c, wrapped
@@ -505,6 +505,10 @@ func (c *Coordinator) ObserveConsumerGroups() []ConsumerGroupObservation {
 // leader for a group's offsets partition; no controller-Raft group mutation is
 // involved.
 func (c *Coordinator) ReloadDistributedConsumerMetadata() error {
+	return c.reloadDistributedConsumerMetadata(false)
+}
+
+func (c *Coordinator) reloadDistributedConsumerMetadata(preserveSessionClocks bool) error {
 	release, err := c.admitConsumerOperation()
 	if err != nil {
 		return err
@@ -519,13 +523,19 @@ func (c *Coordinator) ReloadDistributedConsumerMetadata() error {
 	}
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
-	status, err := c.loadDistributedOffsetsFromLog(reader)
+	status, err := c.loadDistributedOffsetsFromLog(reader, preserveSessionClocks)
 	if err != nil {
 		c.setRecoveryFailureStatus(status, err)
 		return err
 	}
 	c.markRecoveryComplete(status)
 	return nil
+}
+
+// RefreshConsumerMetadataForAdmission checks committed state without treating
+// an administrative request as a coordinator ownership transition.
+func (c *Coordinator) RefreshConsumerMetadataForAdmission() error {
+	return c.reloadDistributedConsumerMetadata(true)
 }
 
 // Start launches background monitoring processes (e.g., heartbeat monitor).

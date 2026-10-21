@@ -49,7 +49,18 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 				require.NoError(t, actions.waitForNodeHealth(node, clusterHealthCheckAddrs(3)[node-1]))
 				waitForStableFullISRAndZeroUnderReplicated(t, ctx, "injection follower recovered live membership")
 			}
-			const liveGroup = "cleanup-injection-live"
+			// Admission runs on the Raft leader. Put the unrelated live session
+			// there too so its clock assertion always exercises admission replay.
+			raftLeader := waitForStorageFaultRaftLeader(t, 3)
+			liveGroup := ""
+			for candidate := 0; candidate < 64; candidate++ {
+				name := fmt.Sprintf("cleanup-injection-live-%d", candidate)
+				if coordinatorNode(t, findGroupCoordinator(t, 1, name)) == raftLeader {
+					liveGroup = name
+					break
+				}
+			}
+			require.NotEmpty(t, liveGroup, "no unrelated group maps to the admission broker")
 			live, liveGeneration, liveMember := joinRecoveryGroup(t, addrs, cleanupRetainedMessages, liveGroup)
 			defer live.Close()
 			// Force multiple bounded pages using valid unrelated metadata, not
@@ -64,7 +75,7 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 			liveState, err := live.GetConsumerGroupStatus(liveGroup)
 			require.NoError(t, err)
 			require.Len(t, liveState.Members, 1)
-			verifyLive := func(preserveHeartbeatTime bool) {
+			verifyLive := func() {
 				status, err := live.GetConsumerGroupStatus(liveGroup)
 				require.NoError(t, err)
 				require.Equal(t, liveState.Generation, status.Generation)
@@ -72,22 +83,18 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 				require.Len(t, status.Members, 1)
 				require.Equal(t, liveState.Members[0].MemberID, status.Members[0].MemberID)
 				require.Equal(t, liveState.Members[0].Assignments, status.Members[0].Assignments)
-				if preserveHeartbeatTime {
-					require.Equal(t, liveState.Members[0].LastHeartbeat, status.Members[0].LastHeartbeat,
-						"bounded cleanup retries must preserve unrelated heartbeat time")
-				} else {
-					t.Logf("administrative admission heartbeat boundary: before=%s after=%s", liveState.Members[0].LastHeartbeat, status.Members[0].LastHeartbeat)
-				}
+				require.Equal(t, liveState.Members[0].LastHeartbeat, status.Members[0].LastHeartbeat,
+					"admission and cleanup retries must preserve unrelated heartbeat time")
 				heartbeatGroup(t, live, cleanupRetainedMessages, liveGroup, liveGeneration, liveMember)
 				require.Equal(t, uint64(140), fetchCommittedOffset(t, live, cleanupRetainedMessages, liveGroup))
 				liveState, err = live.GetConsumerGroupStatus(liveGroup)
 				require.NoError(t, err)
 			}
-			verifyLive(true)
+			verifyLive()
 			leaveCleanupGroup(t, client, generation, member)
 			// Avoid the Raft leader: administrative admission on that broker
 			// refreshes its cache and need not retain the stale follower state.
-			raftLeader := waitForStorageFaultRaftLeader(t, 3)
+			require.Equal(t, raftLeader, waitForStorageFaultRaftLeader(t, 3), "admission broker must still own the observed live session")
 			follower := 0
 			for _, node := range survivorNodes(owner) {
 				if node != raftLeader {
@@ -104,10 +111,7 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 			}
 			response := sendClusterTopicCommand(t, addrs, command)
 			t.Logf("committed %s intent: %s; owner=%d read-fault follower=%d", operation, response, owner, follower)
-			// Administrative admission still performs full metadata replay and
-			// may reconstruct session clocks. Check identity/state across that
-			// boundary, then retain exact clock assertions for scoped retries.
-			verifyLive(false)
+			verifyLive()
 			require.NoError(t, eventually(t, "committed tombstone acknowledgement was lost", clusterReadyTimeout, func() (bool, string, error) {
 				execCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
@@ -123,13 +127,13 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 			require.Equal(t, first.Records, second.Records, "failed retries must not rescan the completed prefix")
 			require.Equal(t, first.Bytes, second.Bytes)
 			t.Logf("%s pending read retries: records=%d bytes=%d reads=%d->%d cursor=%d/%d position=%d", operation, first.Records, first.Bytes, first.Reads, second.Reads, first.Next, first.End, first.Position)
-			verifyLive(true)
+			verifyLive()
 			proof.verify(t, addrs)
 			logCleanupRecoveryWork(t, []int{1, 2, 3}, operation+" fault held")
 			cleanupFaultFile(t, follower, "release-read")
 			requireClusterStatusMaterialized(t, addrs)
 			requireCleanupGroupAbsent(t, addrs)
-			verifyLive(true)
+			verifyLive()
 			if operation == "TRUNCATE" {
 				requireClusterDefinitionEventually(t, addrs, cleanupRecoveryTopic, map[string]string{"revision": "2", "lifecycle_epoch": "2"})
 				requireReplicaOffsetsEventually(t, addrs, cleanupRecoveryTopic, 0)
@@ -143,7 +147,7 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 				retry := sendClusterTopicCommand(t, addrs, command+" if_exists=true")
 				require.Contains(t, retry, "deleted=false")
 			}
-			verifyLive(false) // Administrative retries have their own full-replay boundary.
+			verifyLive()
 			proof.advance(t, addrs)
 			cleanupFaultFile(t, owner, "assert-single-append")
 			logCleanupRecoveryWork(t, []int{1, 2, 3}, operation+" faults recovered")

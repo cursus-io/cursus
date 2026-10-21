@@ -577,13 +577,13 @@ func (c *Coordinator) LoadOffsetsFromLog(reader OffsetLogReader) error {
 // group lifecycle snapshots. All of those records share the group-selected
 // __consumer_offsets partition, so a partition leader can rebuild its local
 // fencing state without consulting controller Raft.
-func (c *Coordinator) loadDistributedOffsetsFromLog(reader OffsetLogReader) (ConsumerMetadataRecoveryStatus, error) {
+func (c *Coordinator) loadDistributedOffsetsFromLog(reader OffsetLogReader, preserveSessionClocks bool) (ConsumerMetadataRecoveryStatus, error) {
 	if metadata, ok := reader.(committedConsumerMetadataReader); ok {
 		reader = committedConsumerMetadataAdapter{reader: metadata}
 	} else if committed, ok := reader.(committedOffsetLogReader); ok {
 		reader = committedOffsetReaderAdapter{reader: committed}
 	}
-	return c.recoverConsumerMetadata(reader)
+	return c.recoverConsumerMetadataWithPolicy(reader, false, preserveSessionClocks)
 }
 
 type committedConsumerMetadataAdapter struct {

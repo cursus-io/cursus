@@ -751,6 +751,10 @@ func (c *Coordinator) recoverConsumerMetadata(reader OffsetLogReader) (ConsumerM
 // strict is used only on a detached compatibility coordinator. Ordinary replay
 // retains its concurrent-publication merge and tolerant distributed decoding.
 func (c *Coordinator) recoverConsumerMetadataWithOptions(reader OffsetLogReader, strict bool) (ConsumerMetadataRecoveryStatus, error) {
+	return c.recoverConsumerMetadataWithPolicy(reader, strict, false)
+}
+
+func (c *Coordinator) recoverConsumerMetadataWithPolicy(reader OffsetLogReader, strict, preserveSessionClocks bool) (ConsumerMetadataRecoveryStatus, error) {
 	const batchSize = 1024
 	status := ConsumerMetadataRecoveryStatus{Phase: "consumer_metadata_scan"}
 	c.mu.RLock()
@@ -1025,12 +1029,16 @@ func (c *Coordinator) recoverConsumerMetadataWithOptions(reader OffsetLogReader,
 	// v4 lifecycle snapshot, so retain that restored FSM membership while
 	// replacing only the committed-offset view. Once a v4 snapshot exists it
 	// is authoritative and this compatibility path is deliberately bypassed.
+	ownershipSince := make(map[string]time.Time)
 	for groupName, existing := range c.groups {
 		recovered := groups[groupName]
 		if recovered == nil || existing == nil {
 			continue
 		}
 		if recovered == existing {
+			if since, ok := c.ownershipSince[groupName]; preserveSessionClocks && ok {
+				ownershipSince[groupName] = since
+			}
 			continue
 		}
 		existing.mu.RLock()
@@ -1091,11 +1099,23 @@ func (c *Coordinator) recoverConsumerMetadataWithOptions(reader OffsetLogReader,
 				recovered.Members[memberID] = &MemberMetadata{ID: member.ID, LastHeartbeat: member.LastHeartbeat, Assignments: append([]int(nil), member.Assignments...), TopicAssignments: append([]TopicPartition(nil), member.TopicAssignments...)}
 			}
 		}
+		// Admission is not an ownership transition. Read clocks at publication
+		// so a heartbeat accepted during the scan is not lost. A changed durable
+		// session must retain replay's fresh clocks and ownership grace instead.
+		if preserveSessionClocks && sameConsumerSession(existing, recovered) {
+			recovered.LastActivity = existing.LastActivity
+			for memberID, member := range existing.Members {
+				recovered.Members[memberID].LastHeartbeat = member.LastHeartbeat
+			}
+			if since, ok := c.ownershipSince[groupName]; ok {
+				ownershipSince[groupName] = since
+			}
+		}
 		existing.mu.RUnlock()
 	}
 	c.groups = groups
 	c.groupEpochs = groupEpochs
-	c.ownershipSince = make(map[string]time.Time)
+	c.ownershipSince = ownershipSince
 	c.mu.Unlock()
 
 	status.RestoredGroups = len(groups)
