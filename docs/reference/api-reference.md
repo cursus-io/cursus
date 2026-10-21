@@ -532,6 +532,8 @@ ERROR: distribution_not_enabled
 
 `topic_materialization_pending` and `replica_materialization_pending` distinguish metadata that has not materialized locally from topology-only under-replication. `healthy=true` requires every defined partition to have its exact distinct replica count on active brokers, an active assigned leader, a full active ISR that satisfies the effective minimum, no recovery marker, and no pending local materialization.
 
+When topic cleanup is pending, `topic_materialization_issues` identifies the local topic, operation, pending time, error and (for truncate) revision/lifecycle epoch. Its optional `consumer_cleanup` entry reports group/epoch, committed scan boundary, cursor, decoded records, serialized bytes, page attempts and retry reason. The list is omitted when empty; counts and details describe this broker, not an acknowledgement from every replica. A committed administrative response does not imply that this list is empty. Read failures and records larger than the 1 MiB cleanup budget remain pending. These bounded cleanup counters exclude the existing full startup, ownership and administrative-admission replay paths; distributed internal consumer metadata compaction is currently disabled.
+
 Common errors are `ERROR: distribution_required command=CLUSTER_STATUS`, `ERROR: fsm_not_available command=CLUSTER_STATUS`, and `ERROR: marshal_cluster_status_failed reason="..."`.
 
 ### ELECT_LEADER

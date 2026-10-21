@@ -1,16 +1,59 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/hashicorp/raft"
+	"github.com/stretchr/testify/require"
 )
+
+func TestClusterStatusExposesCommittedCleanupPendingOnWire(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.LogDir = t.TempDir()
+	manager := topic.NewTopicManager(cfg, &testMockHandlerProvider{}, nil)
+	c := coordinator.NewCoordinator(context.Background(), cfg, &dummyPublisher{})
+	t.Cleanup(func() { c.Stop(); manager.Stop() })
+	c.SetOffsetRecordWriter(func(coordinator.ConsumerMetadataRecord) error { return nil })
+	require.NoError(t, c.RegisterGroup("orders", "workers", 1))
+	_, err := c.AddConsumer("workers", "still-live")
+	require.NoError(t, err)
+	state := fsm.NewBrokerFSM(manager, c)
+	registerRoutingBroker(t, state, "local")
+	definition := topic.DefaultDefinition("orders", cfg)
+	definition.ReplicationFactor = 1
+	create, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("TOPIC:"), create...)}))
+	state.Apply(&raft.Log{Data: []byte(`TOPIC_TRUNCATE:{"topic":"orders","expected_revision":1}`)})
+
+	encoded, err := json.Marshal(buildClusterStatus(state, "local:9001", 1))
+	require.NoError(t, err)
+	var wire struct {
+		Pending int                             `json:"topic_materialization_pending"`
+		Issues  []fsm.TopicMaterializationIssue `json:"topic_materialization_issues"`
+	}
+	require.NoError(t, json.Unmarshal(encoded, &wire))
+	require.Equal(t, 1, wire.Pending)
+	require.Len(t, wire.Issues, wire.Pending)
+	issue := wire.Issues[0]
+	require.Equal(t, "orders", issue.Topic)
+	require.Equal(t, "truncate", issue.Operation)
+	require.Equal(t, uint64(2), issue.Revision)
+	require.Equal(t, uint64(2), issue.LifecycleEpoch)
+	require.NotNil(t, issue.ConsumerCleanup)
+	require.Equal(t, "workers", issue.ConsumerCleanup.Group)
+	require.NotEmpty(t, issue.ConsumerCleanup.Reason)
+	require.NotNil(t, c.GetGroup("workers"), "status cannot authorize cleanup")
+}
 
 func TestBuildClusterStatusReportsAvailabilityAndReplication(t *testing.T) {
 	state := fsm.NewBrokerFSM(nil, nil)

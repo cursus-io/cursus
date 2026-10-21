@@ -22,3 +22,5 @@ coverage.out
 .DS_Store
 Thumbs.db
 NUL
+.cleanup-compose-*.json
+test/e2e-cluster/.cleanup-compose-*.json

@@ -604,7 +604,10 @@ func (c *Coordinator) writeConsumerMetadataRecord(record ConsumerMetadataRecord)
 		if !routed {
 			c.markConsumerMetadataSourcesUnknown()
 		}
-		return writer(record)
+		if err := writer(record); err != nil {
+			return err
+		}
+		return consumerCleanupAcknowledgementFault(record)
 	}
 	if !c.standalone {
 		c.markConsumerMetadataSourcesUnknown()

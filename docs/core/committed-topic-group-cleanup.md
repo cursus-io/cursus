@@ -44,8 +44,9 @@ read failures; partition replacement, rollback, snapshot recovery, retained
 start changes and local group replacement invalidate it. Only tracked groups'
 latest lifecycle evidence is retained. A fixed maximum number of targets and
 pending topics bounds cache memory (64 groups per scan, 64 cached topics).
-Unfinished scans are not evicted to admit more topics; completed scans can be
-evicted and rebuilt if capacity is needed. Progress is derived and is rebuilt after
+Active unfinished scans are not evicted to admit more topics; completed scans
+and unfinished scans whose topic intent was superseded can be reclaimed when
+capacity is needed. Progress is derived and is rebuilt after
 restart; durable epoch fences remain in normal coordinator snapshots.
 
 A follower applies an existing valid deletion only when its epoch exceeds the
@@ -104,7 +105,8 @@ takes that lock before pinning a second view, following the existing
 coordinator-to-topic-manager lock order, and verifies that the captured log
 boundaries have not changed. A newer commit is read on the next retry.
 
-`CLUSTER_STATUS` pending topic entries include `consumer_cleanup` with group
+`CLUSTER_STATUS` exposes pending topic entries in `topic_materialization_issues`.
+They include `consumer_cleanup` with group
 epoch, cursor, end, records, bytes, reads and reason. Truncation entries also
 include topic revision and lifecycle epoch. Existing materialization readiness
 and pending/attempt metrics continue to apply. Aggregate counters are
