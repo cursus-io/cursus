@@ -405,6 +405,13 @@ failed read before comparing the active cursor. It still requires unchanged
 records/bytes across that settling attempt and unchanged partition, cursor,
 records and bytes through the subsequent failed retries.
 
+That cross-partition case also exposed a progress-reporting defect: on a failed
+read, `partition/next` referred to the active partition but `segment/position`
+still described the previously read partition. Publication now selects all
+cursor fields together before reading. A two-partition regression reproduces
+the stale segment before the fix and checks the correct active cursor on repeated
+failures without changing retained cursors or accumulated records/bytes.
+
 The issue had no comments when checked. Prerequisite PR #275 is merged; its
 shared/pattern subscription and pending reservation guards are already in main
 and are not reimplemented. PRs #276/#277 were also merged before this follow-up.
