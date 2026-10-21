@@ -36,17 +36,27 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 	actions := ctx.WhenCluster().StartCluster()
 	addrs := ctx.GetBrokerAddrs()
 	for _, topicName := range []string{cleanupRecoveryTopic, cleanupRetainedMessages} {
-		sendClusterTopicCommand(t, addrs, "CREATE topic="+topicName+" partitions=1 replication_factor=3")
+		sendClusterTopicCommand(t, addrs, "CREATE topic="+topicName+" partitions=1 replication_factor=3 idempotent=true")
 	}
 	sendClusterTopicCommand(t, addrs, "CREATE topic="+cleanupRetainedEvents+" partitions=1 replication_factor=3 aggregate_replay=true")
+	sendClusterTopicCommand(t, addrs, "CREATE topic=cleanup-concurrent partitions=1 replication_factor=3 idempotent=true")
 	// CREATE acknowledges committed intent before every follower has applied it.
 	// Seed data only after all local replicas expose the initial committed range.
-	for _, topicName := range []string{cleanupRecoveryTopic, cleanupRetainedMessages, cleanupRetainedEvents} {
+	for _, topicName := range []string{cleanupRecoveryTopic, cleanupRetainedMessages, cleanupRetainedEvents, "cleanup-concurrent"} {
 		requireClusterDefinitionEventually(t, addrs, topicName, map[string]string{"revision": "1"})
 		requireReplicaOffsetsEventually(t, addrs, topicName, 0)
 	}
 	requireClusterStatusMaterialized(t, addrs)
 	proof := &cleanupRetainedProof{}
+	admin, err := sdk.NewAdminClient(&sdk.AdminConfig{BrokerAddrs: addrs, MaxRetries: 3, RequestTimeoutMS: 15000})
+	require.NoError(t, err)
+	definition, err := admin.UpdateTopic(cleanupRecoveryTopic, sdk.TopicDefinitionPatch{})
+	require.NoError(t, err)
+	require.NotEmpty(t, definition.InstanceID)
+	truncateOptions := sdk.TruncateTopicOptions{ExpectedRevision: definition.Revision, ExpectedInstance: definition.InstanceID}
+	targetProducer := e2e.NewBrokerClient(addrs)
+	defer targetProducer.Close()
+	require.NoError(t, targetProducer.PublishIdempotentToPartition(cleanupRecoveryTopic, "reset-producer", 0, 1, 1, "old-target-record", "all", true))
 	proof.advance(t, addrs)
 	client, generation, member := joinRecoveryGroup(t, addrs, cleanupRecoveryTopic, cleanupRecoveryGroup)
 	defer client.Close()
@@ -78,12 +88,29 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 	recovered := e2e.NewBrokerClient(available)
 	defer recovered.Close()
 	require.Equal(t, uint64(9), fetchCommittedOffset(t, recovered, cleanupRecoveryTopic, cleanupRecoveryGroup))
-	for _, topicName := range []string{cleanupRetainedEvents, cleanupRetainedMessages} {
+	for _, topicName := range []string{cleanupRetainedEvents, cleanupRetainedMessages, "cleanup-concurrent"} {
+		if topicName == "cleanup-concurrent" {
+			requireFailoverISRReady(t, available, topicName, oldOwner, 0)
+			continue
+		}
 		requireFailoverISRReady(t, available, topicName, oldOwner, uint64(proof.count))
 	}
-	sendClusterTopicCommand(t, available, "TRUNCATE topic="+cleanupRecoveryTopic+" expected_revision=1")
+	stopTraffic := startTruncateConcurrentTraffic(t, available)
+	proxy, dropped := dropTruncateReplyProxy(t, available[0])
+	lostReplyAdmin, err := sdk.NewAdminClient(&sdk.AdminConfig{BrokerAddrs: append([]string{proxy}, available...), MaxRetries: 4, RequestTimeoutMS: 15000})
+	require.NoError(t, err)
+	truncateResult, err := lostReplyAdmin.TruncateTopic(cleanupRecoveryTopic, truncateOptions)
+	require.NoError(t, err)
+	require.True(t, truncateResult.Replayed)
+	require.NoError(t, <-dropped, "proxy must receive and discard the committed response")
+	trafficCount := stopTraffic()
+	verifyTruncateConcurrentTraffic(t, available, trafficCount)
 	requireClusterDefinitionEventually(t, available, cleanupRecoveryTopic, map[string]string{"revision": "2", "lifecycle_epoch": "2"})
 	requireCleanupSurvivorsMaterialized(t, available)
+	requireReplicaOffsetsEventually(t, available, cleanupRecoveryTopic, 0)
+	freshProducer := e2e.NewBrokerClient(available)
+	defer freshProducer.Close()
+	require.NoError(t, freshProducer.PublishIdempotentToPartition(cleanupRecoveryTopic, "reset-producer", 0, 1, 1, "fresh-target-record", "all", true))
 	proof.verify(t, available)
 	requireCleanupGroupAbsent(t, available)
 	logCleanupRecoveryWork(t, survivorNodes(oldOwner), "after failover cleanup")
@@ -95,10 +122,20 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 	requireCleanupGroupAbsent(t, addrs)
 	proof.advance(t, addrs)
 	logCleanupRecoveryWork(t, []int{1, 2, 3}, "old coordinator recovered")
+	verifyTruncateReceiptAfterRaftLeaderLoss(t, ctx, actions, truncateOptions)
 	restartCleanupFromSnapshots(t, ctx, actions, "truncate")
 	requireCleanupGroupAbsent(t, addrs)
 	requireClusterDefinitionEventually(t, addrs, cleanupRecoveryTopic, map[string]string{"revision": "2", "lifecycle_epoch": "2"})
-	requireReplicaOffsetsEventually(t, addrs, cleanupRecoveryTopic, 0)
+	requireReplicaOffsetsEventually(t, addrs, cleanupRecoveryTopic, 1)
+	replayed, err := admin.TruncateTopic(cleanupRecoveryTopic, truncateOptions)
+	require.NoError(t, err)
+	require.True(t, replayed.Replayed, "receipt survives actual snapshot restore")
+	pageCtx, pageCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	targetPage, err := admin.BrowseMessages(pageCtx, sdk.BrowseRequest{Topic: cleanupRecoveryTopic, Partition: 0, MaxRecords: 32, MaxBytes: 65536})
+	pageCancel()
+	require.NoError(t, err)
+	require.Len(t, targetPage.Messages, 1)
+	require.Equal(t, "fresh-target-record", targetPage.Messages[0].Payload, "old data stays removed and a same-sequence fresh record survives retries and restore")
 	proof.advance(t, addrs)
 
 	recreated, nextGeneration, nextMember := joinRecoveryGroup(t, addrs, cleanupRecoveryTopic, cleanupRecoveryGroup)
@@ -106,6 +143,10 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 	require.Equal(t, uint64(0), fetchCommittedOffset(t, recreated, cleanupRecoveryTopic, cleanupRecoveryGroup), "old offset must not resurrect")
 	heartbeatGroup(t, recreated, cleanupRecoveryTopic, cleanupRecoveryGroup, nextGeneration, nextMember)
 	commitGroupOffset(t, recreated, cleanupRecoveryTopic, cleanupRecoveryGroup, 1, nextGeneration, nextMember)
+	replayed, err = admin.TruncateTopic(cleanupRecoveryTopic, truncateOptions)
+	require.NoError(t, err)
+	require.True(t, replayed.Replayed)
+	require.Equal(t, uint64(1), fetchCommittedOffset(t, recreated, cleanupRecoveryTopic, cleanupRecoveryGroup), "retry must preserve new active group offsets")
 	leaveCleanupGroup(t, recreated, nextGeneration, nextMember)
 	sendClusterTopicCommand(t, addrs, "DELETE topic="+cleanupRecoveryTopic)
 	requireClusterStatusMaterialized(t, addrs)
@@ -118,6 +159,7 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 	}
 	requireCleanupGroupAbsent(t, addrs)
 	proof.advance(t, addrs)
+	verifyTruncateConcurrentTraffic(t, addrs, trafficCount)
 }
 
 func cleanupBrokerCommand(t *testing.T, operation string, nodes ...int) string {
@@ -125,7 +167,7 @@ func cleanupBrokerCommand(t *testing.T, operation string, nodes ...int) string {
 	args := []string{operation}
 	for _, node := range nodes {
 		require.Contains(t, []int{1, 2, 3}, node)
-		args = append(args, fmt.Sprintf("cursus-cleanup-broker-%d", node))
+		args = append(args, cleanupContainerName(node))
 	}
 	commandCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -273,7 +315,7 @@ func restartCleanupFromSnapshots(t *testing.T, ctx *ClusterTestContext, actions 
 		status, err := actions.WaitForLocalSnapshot(node, targets[node])
 		require.NoError(t, err)
 		targets[node] = status.RaftLastSnapshotIndex
-		output, err := exec.Command("docker", "exec", fmt.Sprintf("cursus-cleanup-broker-%d", node), "sh", "-c", "wc -c /app/cluster-logs/raft/snapshots/*/state.bin").CombinedOutput()
+		output, err := exec.Command("docker", "exec", cleanupContainerName(node), "sh", "-c", "wc -c /app/cluster-logs/raft/snapshots/*/state.bin").CombinedOutput()
 		require.NoError(t, err, string(output))
 		t.Logf("%s snapshot node=%d index=%d stored bytes: %s", phase, node, status.RaftLastSnapshotIndex, strings.TrimSpace(string(output)))
 	}
@@ -284,7 +326,7 @@ func restartCleanupFromSnapshots(t *testing.T, ctx *ClusterTestContext, actions 
 		require.NoError(t, actions.waitForNodeHealth(node, clusterHealthCheckAddrs(3)[node-1]))
 		_, err := actions.WaitForLocalSnapshot(node, targets[node])
 		require.NoError(t, err)
-		logs, err := exec.Command("docker", "logs", "--since", since, fmt.Sprintf("cursus-cleanup-broker-%d", node)).CombinedOutput()
+		logs, err := exec.Command("docker", "logs", "--since", since, cleanupContainerName(node)).CombinedOutput()
 		require.NoError(t, err, string(logs))
 		require.Contains(t, string(logs), "FSM restore completed", "node=%d must actually restore a snapshot", node)
 	}
@@ -297,7 +339,7 @@ func logCleanupRecoveryWork(t *testing.T, nodes []int, phase string) {
 	t.Helper()
 	client := &http.Client{Timeout: 5 * time.Second}
 	for _, node := range nodes {
-		response, err := client.Get(fmt.Sprintf("http://localhost:%d/metrics", baseExporterPort+node))
+		response, err := client.Get(fmt.Sprintf("http://localhost:%d/metrics", baseExporterPort+node+cleanupPortOffset()))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, response.StatusCode)
 		scanner := bufio.NewScanner(response.Body)

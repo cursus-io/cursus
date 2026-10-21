@@ -32,11 +32,11 @@ type ClusterTestContext struct {
 }
 
 func brokerPort(nodeIndex int) int {
-	return baseBrokerPort + nodeIndex // nodeIndex: 1-based
+	return baseBrokerPort + nodeIndex + cleanupPortOffset() // nodeIndex: 1-based
 }
 
 func healthPort(nodeIndex int) int {
-	return baseHealthPort + nodeIndex // nodeIndex: 1-based
+	return baseHealthPort + nodeIndex + cleanupPortOffset() // nodeIndex: 1-based
 }
 
 func clusterBrokerAddrs(size int) []string {
@@ -90,6 +90,7 @@ func GivenFaultClusterRestart(t *testing.T) *ClusterTestContext {
 }
 
 func givenClusterRestart(t *testing.T, project string, composeFiles ...string) *ClusterTestContext {
+	project, composeFiles = isolateCleanupCompose(t, project, composeFiles)
 	downArgs := composeCommandArgs(project, composeFiles, "down", "-v", "--remove-orphans")
 	_ = e2e.RunCompose(downArgs...).Run()
 	upArgs := composeCommandArgs(project, composeFiles, "up", "-d", "--force-recreate", "--build")
