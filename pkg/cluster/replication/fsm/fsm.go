@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -571,7 +573,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 
 	f.mu.Unlock()
 	f.materializationMu.Unlock()
-	if err := f.ReconcileTopicMaterializations(); err != nil {
+	if err := f.reconcileTopicMaterializations(false); err != nil {
 		util.Warn("FSM Restore: Topic materialization pending: %v", err)
 	}
 	if err := f.reconcileCommittedPartitions(); err != nil {
@@ -756,7 +758,7 @@ func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 	f.partitionRecoveryPending = false
 	f.recoveryReplayPending = false
 	f.mu.Unlock()
-	if err := f.ReconcileTopicMaterializations(); err != nil {
+	if err := f.reconcileTopicMaterializations(false); err != nil {
 		util.Warn("FSM: Topic materialization pending after Raft replay: %v", err)
 	}
 	return nil
@@ -868,8 +870,12 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	var groupState map[string]*coordinator.GroupStateSnapshot
 	var consumerRecovery *coordinator.ConsumerRecoveryEnvelope
 	if f.cd != nil {
-		groupState, consumerRecovery, err = f.cd.ExportStateWithRecovery()
+		groupState, consumerRecovery, err = f.cd.TryExportStateWithRecovery()
 		if err != nil {
+			if errors.Is(err, coordinator.ErrConsumerSnapshotBusy) {
+				metrics.ConsumerSnapshotBusy.Inc()
+				metrics.ConsumerSnapshotBusyConsecutive.Inc()
+			}
 			return nil, fmt.Errorf("snapshot consumer recovery: %w", err)
 		}
 		if err := coordinator.ValidateImportState(groupState); err != nil {
@@ -887,6 +893,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	}
 
 	util.Debug("Creating FSM snapshot")
+	metrics.ConsumerSnapshotBusyConsecutive.Set(0)
 	return &BrokerFSMSnapshot{
 		applied:                          f.applied,
 		logs:                             logsCopy,

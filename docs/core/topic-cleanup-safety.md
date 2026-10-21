@@ -66,4 +66,5 @@ Regression and fault-recovery checks defined before implementation:
 
 The original three-broker stale-membership convergence, committed-record
 validation, generation races, compaction, bounded retry progress and recovery
-observability remain follow-up work under #272.
+observability were follow-up work under #272. The subsequent implementation is
+described in [Committed group cleanup on replicas](committed-topic-group-cleanup.md).

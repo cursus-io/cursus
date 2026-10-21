@@ -13,6 +13,10 @@ const ConsumerRecoveryEnvelopeVersion = 1
 // and unprovable history. Scanning surviving records cannot recover this proof.
 var ErrConsumerMetadataBootstrapUnknown = errors.New("consumer metadata bootstrap authority is unknown")
 
+// ErrConsumerSnapshotBusy lets the Raft FSM retry a snapshot without blocking
+// the Apply loop needed by a consumer metadata writer holding these locks.
+var ErrConsumerSnapshotBusy = errors.New("consumer snapshot busy")
+
 // ConsumerRecoveryEnvelope keeps historical Raft state separate from the live
 // disk overlay. SourcePartitions is a conservative, monotonic physical history,
 // including names that no longer have live records after deletion/compaction.
@@ -180,16 +184,44 @@ func (c *Coordinator) ValidateConsumerMetadataBootstrapEligibility(partition int
 }
 
 func (c *Coordinator) ExportStateWithRecovery() (map[string]*GroupStateSnapshot, *ConsumerRecoveryEnvelope, error) {
-	c.authorityMu.Lock()
+	return c.exportStateWithRecovery(false)
+}
+
+// TryExportStateWithRecovery returns either the complete detached state/proof
+// pair or an error. It never waits for consumer locks from the Raft Apply loop.
+func (c *Coordinator) TryExportStateWithRecovery() (map[string]*GroupStateSnapshot, *ConsumerRecoveryEnvelope, error) {
+	return c.exportStateWithRecovery(true)
+}
+
+func (c *Coordinator) exportStateWithRecovery(nonblocking bool) (map[string]*GroupStateSnapshot, *ConsumerRecoveryEnvelope, error) {
+	if nonblocking {
+		if !c.authorityMu.TryLock() {
+			return nil, nil, ErrConsumerSnapshotBusy
+		}
+	} else {
+		c.authorityMu.Lock()
+	}
 	defer c.authorityMu.Unlock()
 	// Do not wait for any group lock while holding provenanceMu. Recording
 	// precedes exposing values, so this order includes every exported source.
-	groups := c.ExportState()
+	groups, err := c.exportStateWithLockMode(nil, nonblocking)
+	if err != nil {
+		return nil, nil, err
+	}
 	baseline := make(map[string]*GroupStateSnapshot)
 	if c.raftCompatibility != nil {
-		baseline = c.raftCompatibility.ExportState()
+		baseline, err = c.raftCompatibility.exportStateWithLockMode(nil, nonblocking)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
-	c.provenanceMu.Lock()
+	if nonblocking {
+		if !c.provenanceMu.TryLock() {
+			return nil, nil, ErrConsumerSnapshotBusy
+		}
+	} else {
+		c.provenanceMu.Lock()
+	}
 	defer c.provenanceMu.Unlock()
 	envelope := &ConsumerRecoveryEnvelope{Version: ConsumerRecoveryEnvelopeVersion, RaftCompatibilityKnown: c.raftCompatibilityKnown, SourcePartitionsKnown: c.metadataSourcesKnown, RaftCompatibilityState: baseline, SourcePartitions: make(map[string][]int)}
 	envelope.KnownComplete = envelope.RaftCompatibilityKnown && envelope.SourcePartitionsKnown

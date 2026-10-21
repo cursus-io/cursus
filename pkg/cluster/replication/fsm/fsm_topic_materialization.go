@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/topic"
 )
 
@@ -21,10 +22,13 @@ const (
 // TopicMaterializationIssue describes node-local work that has not converged
 // with the authoritative topic state committed by Raft.
 type TopicMaterializationIssue struct {
-	Topic        string    `json:"topic"`
-	Operation    string    `json:"operation"`
-	Error        string    `json:"error"`
-	PendingSince time.Time `json:"pending_since"`
+	Topic           string                           `json:"topic"`
+	Operation       string                           `json:"operation"`
+	Error           string                           `json:"error"`
+	PendingSince    time.Time                        `json:"pending_since"`
+	ConsumerCleanup *coordinator.TopicCleanupPending `json:"consumer_cleanup,omitempty"`
+	Revision        uint64                           `json:"revision,omitempty"`
+	LifecycleEpoch  uint64                           `json:"lifecycle_epoch,omitempty"`
 }
 
 // TopicMaterializationAttempts counts completed node-local attempts by result.
@@ -101,6 +105,10 @@ func (f *BrokerFSM) TopicMaterializationReadinessError() error {
 // ReconcileTopicMaterializations retries node-local operations against the
 // authoritative desired state. Calls are serialized with Apply side effects.
 func (f *BrokerFSM) ReconcileTopicMaterializations() error {
+	return f.reconcileTopicMaterializations(true)
+}
+
+func (f *BrokerFSM) reconcileTopicMaterializations(allowGroupWrites bool) error {
 	f.mu.RLock()
 	desired := make(map[string]*topic.Definition)
 	deletes := make([]string, 0)
@@ -131,7 +139,12 @@ func (f *BrokerFSM) ReconcileTopicMaterializations() error {
 		case TopicMaterializationRestore:
 			err = f.materializeTopicRestore(desired[name])
 		case TopicMaterializationTruncate:
-			err = f.materializeTopicTruncate(desired[name])
+			if allowGroupWrites {
+				err = f.reconcileTopicGroups(name, operation, desired[name])
+			}
+			if err == nil {
+				err = f.materializeTopicTruncate(desired[name])
+			}
 		default:
 			err = f.materializeTopicCreate(desired[name])
 		}
@@ -140,11 +153,38 @@ func (f *BrokerFSM) ReconcileTopicMaterializations() error {
 		}
 	}
 	for _, name := range deletes {
-		if err := f.materializeTopicDelete(name); err != nil {
+		var err error
+		if allowGroupWrites {
+			err = f.reconcileTopicGroups(name, TopicMaterializationDelete, nil)
+		}
+		if err == nil {
+			err = f.materializeTopicDelete(name)
+		}
+		if err != nil {
 			reconcileErr = errors.Join(reconcileErr, err)
 		}
 	}
 	return reconcileErr
+}
+
+// Never hold materializationMu while originating a consumer metadata write:
+// its partition commit must be able to pass through Raft Apply/Restore.
+func (f *BrokerFSM) reconcileTopicGroups(name, operation string, expected *topic.Definition) error {
+	f.mu.RLock()
+	c := f.cd
+	f.mu.RUnlock()
+	if c == nil {
+		return nil
+	}
+	_, err := c.ReconcileTopicGroupsIf(name, func() bool {
+		f.mu.RLock()
+		defer f.mu.RUnlock()
+		return reflect.DeepEqual(f.topicState[name], expected) && !f.recoveryReplayPending
+	})
+	if err != nil {
+		f.recordTopicMaterializationIfCurrent(name, operation, expected, err)
+	}
+	return err
 }
 
 func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
@@ -178,7 +218,7 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 	if err == nil {
 		err = f.reconcileMaterializedTopicHWM(definition.Name, replaying)
 	}
-	f.recordTopicMaterialization(definition.Name, TopicMaterializationCreate, err)
+	f.recordTopicMaterializationIfCurrent(definition.Name, TopicMaterializationCreate, definition, err)
 	if err != nil {
 		return fmt.Errorf("materialize topic %q: %w", definition.Name, err)
 	}
@@ -211,7 +251,7 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 	if err == nil {
 		err = f.reconcileMaterializedTopicHWM(definition.Name, true)
 	}
-	f.recordTopicMaterialization(definition.Name, TopicMaterializationRestore, err)
+	f.recordTopicMaterializationIfCurrent(definition.Name, TopicMaterializationRestore, definition, err)
 	if err != nil {
 		return fmt.Errorf("restore local topic %q: %w", definition.Name, err)
 	}
@@ -295,7 +335,7 @@ func (f *BrokerFSM) materializeTopicTruncate(definition *topic.Definition) error
 	if err == nil && f.tm != nil {
 		err = f.tm.CompleteTruncation(definition.Name)
 	}
-	f.recordTopicMaterialization(definition.Name, TopicMaterializationTruncate, err)
+	f.recordTopicMaterializationIfCurrent(definition.Name, TopicMaterializationTruncate, definition, err)
 	if err != nil {
 		return fmt.Errorf("truncate local topic %q: %w", definition.Name, err)
 	}
@@ -345,7 +385,7 @@ func (f *BrokerFSM) materializeTopicDelete(name string) error {
 	if err == nil {
 		err = f.cleanupTopicDependencies(name)
 	}
-	f.recordTopicMaterialization(name, TopicMaterializationDelete, err)
+	f.recordTopicMaterializationIfCurrent(name, TopicMaterializationDelete, nil, err)
 	if err != nil {
 		return fmt.Errorf("delete local topic %q: %w", name, err)
 	}
@@ -359,7 +399,7 @@ func (f *BrokerFSM) cleanupTopicDependencies(name string) error {
 	f.mu.RUnlock()
 
 	if coordinatorRef != nil {
-		if _, err := coordinatorRef.DeleteInactiveGroupsForTopic(name); err != nil {
+		if _, err := coordinatorRef.CheckTopicGroupCleanup(name); err != nil {
 			return fmt.Errorf("delete consumer groups for topic %q: %w", name, err)
 		}
 	}
@@ -374,6 +414,19 @@ func (f *BrokerFSM) cleanupTopicDependencies(name string) error {
 func (f *BrokerFSM) recordTopicMaterialization(name, operation string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.recordTopicMaterializationLocked(name, operation, err)
+}
+
+func (f *BrokerFSM) recordTopicMaterializationIfCurrent(name, operation string, expected *topic.Definition, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !reflect.DeepEqual(f.topicState[name], expected) {
+		return
+	}
+	f.recordTopicMaterializationLocked(name, operation, err)
+}
+
+func (f *BrokerFSM) recordTopicMaterializationLocked(name, operation string, err error) {
 	if f.topicMaterialization == nil {
 		f.topicMaterialization = make(map[string]TopicMaterializationIssue)
 	}
@@ -393,10 +446,19 @@ func (f *BrokerFSM) recordTopicMaterialization(name, operation string, err error
 	if existing, ok := f.topicMaterialization[name]; ok && !existing.PendingSince.IsZero() {
 		pendingSince = existing.PendingSince
 	}
+	var cleanup *coordinator.TopicCleanupPending
+	errors.As(err, &cleanup)
+	var revision, lifecycleEpoch uint64
+	if definition := f.topicState[name]; definition != nil {
+		revision, lifecycleEpoch = definition.Revision, definition.LifecycleEpoch
+	}
 	f.topicMaterialization[name] = TopicMaterializationIssue{
-		Topic:        name,
-		Operation:    operation,
-		Error:        err.Error(),
-		PendingSince: pendingSince,
+		Topic:           name,
+		Operation:       operation,
+		Error:           err.Error(),
+		PendingSince:    pendingSince,
+		ConsumerCleanup: cleanup,
+		Revision:        revision,
+		LifecycleEpoch:  lifecycleEpoch,
 	}
 }

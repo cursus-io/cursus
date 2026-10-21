@@ -34,6 +34,28 @@ func (ch *CommandHandler) writeConsumerOffsetRecord(record coordinator.ConsumerM
 	if err != nil {
 		return err
 	}
+	ctx := NewInternalClientContext("default-group", 0)
+	if record.Type == coordinator.ConsumerMetadataRecordTombstone && ch.isDistributed() {
+		if !ch.hasRouter() {
+			return fmt.Errorf("group tombstone coordinator unavailable")
+		}
+		_, _, partition, epoch, err := ch.Cluster.Router.FindCoordinatorWithEpoch(record.Group)
+		if err != nil || strconv.FormatUint(partition, 10) != partitionText {
+			return fmt.Errorf("group tombstone coordinator changed")
+		}
+		ctx.consumerMetadataFence = func() error {
+			ch.groupRecoveryMu.Lock()
+			recovered := ch.groupRecoveryEpoch[partition] == epoch
+			ch.groupRecoveryMu.Unlock()
+			if !recovered {
+				return fmt.Errorf("group tombstone coordinator recovery pending")
+			}
+			return ch.validateRecoveredCoordinatorRoute(record.Group, partition, epoch)
+		}
+		if err := ctx.consumerMetadataFence(); err != nil {
+			return err
+		}
+	}
 	// Use the resolved route, never recompute the fallback hash after routing.
 	physicalPartition, err := strconv.Atoi(partitionText)
 	if err != nil || physicalPartition < 0 {
@@ -51,7 +73,7 @@ func (ch *CommandHandler) writeConsumerOffsetRecord(record coordinator.ConsumerM
 		cmd += " consumer_route=" + base64.RawURLEncoding.EncodeToString(encoded)
 	}
 	cmd += " message=" + string(payload)
-	resp := ch.handlePublish(cmd, NewInternalClientContext("default-group", 0))
+	resp := ch.handlePublish(cmd, ctx)
 	if strings.HasPrefix(resp, "OK") {
 		return nil
 	}

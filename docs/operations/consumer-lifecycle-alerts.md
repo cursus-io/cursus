@@ -164,3 +164,30 @@ members, because its aggregate would not reach zero.
 
 This procedure validates actual Cursus state and the external expectation join
 without adding application-specific group names to the broker configuration.
+
+## Consumer snapshot contention
+
+`consumer_snapshot_busy_total` counts nonblocking FSM snapshot refusals.
+`consumer_snapshot_busy_consecutive` counts those refusals since a successful
+FSM snapshot capture, and resets on process restart. Successful capture does
+not imply successful snapshot persistence; also monitor Raft persistence errors
+and log disk usage. For example, add this rule to the broker Prometheus rules:
+
+```yaml
+- alert: CursusConsumerSnapshotBusy
+  expr: consumer_snapshot_busy_consecutive >= 3
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: Consumer state repeatedly prevents Raft snapshot capture
+    description: Check offset-write latency, snapshot errors and Raft log disk growth on this broker.
+```
+
+Tune the threshold and duration to the configured Raft snapshot interval. The
+counter can show shorter bursts using `increase(consumer_snapshot_busy_total[15m])`.
+Sustained contention delays compaction and increases retained recovery work.
+Investigate slow durable consumer writes and reduce excessive offset commit
+frequency if needed. Retrying with a wait inside FSM Snapshot would block the
+same goroutine needed to apply the pending write, so retries use Raft's ordinary
+snapshot scheduling.
