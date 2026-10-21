@@ -314,6 +314,22 @@ latency benchmarks.
 
 ### Existing review and CI evidence
 
+The follow-up PR's first CI attempt found a fixture regression: the shared ISR
+metric reader still queried the default exporter port after cleanup's host-port
+isolation. On the development host another cluster answered that request; the
+isolated CI runner correctly failed with connection refused. Earlier local
+results therefore do not prove the target cluster's zero-under-replicated metric,
+even though the direct target-broker data/materialization assertions passed.
+The reader now applies the same port shift, and an HTTP-server regression checks
+the actual request destination. All three cleanup scenarios must be rerun with
+this correction before accepting the isolated-cluster evidence.
+
+The follow-up's first CodeRabbit review completed on `a3733c8` with one actionable
+comment: bound the two new `docker exec` calls. They now use context deadlines
+(30 seconds for marker polling and one minute for sentinel changes), allowing
+normal failure reporting and cleanup instead of waiting for the suite timeout.
+No additional review was requested.
+
 The issue had no comments when checked. Prerequisite PR #275 is merged; its
 shared/pattern subscription and pending reservation guards are already in main
 and are not reimplemented. PRs #276/#277 were also merged before this follow-up.

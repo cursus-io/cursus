@@ -2,6 +2,9 @@ package e2e_cluster
 
 import (
 	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
@@ -10,6 +13,22 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
+
+func TestCleanupMetricReaderUsesIsolatedPort(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte("cleanup_test_identity 42\n"))
+	}))
+	t.Cleanup(server.Close)
+	port := server.Listener.Addr().(*net.TCPAddr).Port
+	t.Setenv("CURSUS_E2E_PORT_SHIFT", strconv.Itoa(port-baseExporterPort-1))
+	value, err := fetchMetric(1, "cleanup_test_identity")
+	require.NoError(t, err)
+	require.Equal(t, float64(42), value, "ISR readiness must query the isolated cluster, not another cluster's default port")
+}
 
 // Separate host ports as well as containers, volumes and network from other
 // local E2E work. Keep the same broker source, internal ports and test sequence.

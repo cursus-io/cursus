@@ -1,6 +1,7 @@
 package e2e_cluster
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -96,7 +97,9 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 			response := sendClusterTopicCommand(t, addrs, command)
 			t.Logf("committed %s intent: %s; owner=%d read-fault follower=%d", operation, response, owner, follower)
 			require.NoError(t, eventually(t, "committed tombstone acknowledgement was lost", clusterReadyTimeout, func() (bool, string, error) {
-				out, err := exec.Command("docker", "exec", fmt.Sprintf("cursus-cleanup-broker-%d", owner), "test", "-f", faultSentinelRoot+"/consumer-cleanup-ack/"+cleanupRecoveryTopic+".fired").CombinedOutput()
+				execCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				out, err := exec.CommandContext(execCtx, "docker", "exec", fmt.Sprintf("cursus-cleanup-broker-%d", owner), "test", "-f", faultSentinelRoot+"/consumer-cleanup-ack/"+cleanupRecoveryTopic+".fired").CombinedOutput()
 				return err == nil, string(out), nil
 			}))
 			first := waitCleanupReadPending(t, addrs[follower-1], 0)
@@ -177,6 +180,8 @@ func cleanupFaultFile(t *testing.T, node int, operation string) {
 	}
 	command, ok := commands[operation]
 	require.True(t, ok)
-	out, err := exec.Command("docker", "exec", fmt.Sprintf("cursus-cleanup-broker-%d", node), "sh", "-c", command).CombinedOutput()
+	execCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(execCtx, "docker", "exec", fmt.Sprintf("cursus-cleanup-broker-%d", node), "sh", "-c", command).CombinedOutput()
 	require.NoError(t, err, string(out))
 }
