@@ -72,7 +72,7 @@ func TestStandaloneTruncateProcessCrash(t *testing.T) {
 			require.Equal(t, []transaction.MessageOperation{{Topic: "audit"}}, h.TxnManager.ExportState()["tx"].Messages)
 			ctx := controller.NewClientContext("", 0)
 			read := h.HandleCommand("READ_SNAPSHOT topic=events key=aggregate", ctx)
-			require.NotContains(t, read, `"old":true`)
+			require.Equal(t, "OK snapshot=null", read)
 			version := h.HandleCommand("STREAM_VERSION topic=events key=aggregate", ctx)
 			require.Contains(t, version, "version=0")
 			// A fresh version-one event proves the old index is gone and the topic is usable.

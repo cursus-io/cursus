@@ -61,6 +61,9 @@ func (view *consumerCleanupView) Partitions() []coordinator.ConsumerCleanupParti
 
 func (view *consumerCleanupView) Read(partition int, offset uint64, cursor types.ReplayCursor, maxRecords, maxBytes int) (coordinator.ConsumerCleanupPage, error) {
 	page := coordinator.ConsumerCleanupPage{Next: offset}
+	if err := injectedConsumerCleanupReadError(); err != nil {
+		return page, err
+	}
 	if partition < 0 || partition >= len(view.partitions) || maxRecords <= 0 || maxBytes <= 0 {
 		return page, fmt.Errorf("invalid consumer metadata page request")
 	}

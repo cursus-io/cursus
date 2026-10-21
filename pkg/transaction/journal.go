@@ -542,6 +542,7 @@ func (j *Journal) compactLocked() (err error) {
 }
 
 func (j *Journal) observeRewritePhase(phase string) {
+	injectedJournalPhase(j.path, phase)
 	if j.rewritePhase != nil {
 		j.rewritePhase(phase)
 	}

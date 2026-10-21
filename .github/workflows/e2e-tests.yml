@@ -37,6 +37,27 @@ on:
       - 'util/**'
 
 jobs:
+  standalone-guest-power-loss:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build isolated ext4 guest recovery harness
+        run: docker build -f test/power-loss/Dockerfile -t cursus-power-loss .
+      - name: Cut guest power and recover every journal rewrite phase
+        run: |
+          mkdir -p power-loss-results
+          docker run --rm -v "$PWD/power-loss-results:/results" cursus-power-loss
+      - name: Upload guest recovery transcripts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: standalone-guest-power-loss
+          path: power-loss-results
+          if-no-files-found: ignore
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 45

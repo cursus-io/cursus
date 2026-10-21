@@ -1,16 +1,25 @@
 services:
   broker-1:
     image: cursus-cleanup-recovery:local
+    build:
+      dockerfile: test/e2e-cluster/Dockerfile.e2e-faults
     environment:
+      CURSUS_E2E_FAULTS: "1"
       LOG_DIR: /app/cluster-logs
       RAFT_SNAPSHOT_INTERVAL_MS: "1000"
   broker-2:
     image: cursus-cleanup-recovery:local
+    build:
+      dockerfile: test/e2e-cluster/Dockerfile.e2e-faults
     environment:
+      CURSUS_E2E_FAULTS: "1"
       LOG_DIR: /app/cluster-logs
       RAFT_SNAPSHOT_INTERVAL_MS: "1000"
   broker-3:
     image: cursus-cleanup-recovery:local
+    build:
+      dockerfile: test/e2e-cluster/Dockerfile.e2e-faults
     environment:
+      CURSUS_E2E_FAULTS: "1"
       LOG_DIR: /app/cluster-logs
       RAFT_SNAPSHOT_INTERVAL_MS: "1000"
