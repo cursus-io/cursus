@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -404,6 +405,14 @@ func (scan *topicCleanupScan) read(view ConsumerCleanupView) error {
 }
 
 func (scan *topicCleanupScan) observe(message types.Message) error {
+	// The physical committed prefix includes non-JSON transaction controls.
+	// Validate their complete envelope before skipping them: a marker flag
+	// must never hide a keyed lifecycle record or supply deletion authority.
+	if message.TransactionMarker != "" || message.ControlBatchType != "" ||
+		message.ControlBatchVersion != 0 || message.ControlBatchCoordinatorEpoch != 0 ||
+		len(message.ControlBatchKey) != 0 || len(message.ControlBatchValue) != 0 {
+		return validateCleanupTransactionControl(message)
+	}
 	var identity struct {
 		Group string `json:"group"`
 	}
@@ -461,6 +470,37 @@ func (scan *topicCleanupScan) observe(message types.Message) error {
 	}
 	if record.Epoch > evidence.epoch {
 		evidence.epoch, evidence.kind, evidence.topic, evidence.digest = record.Epoch, record.Type, record.Topic, digest
+	}
+	return nil
+}
+
+func validateCleanupTransactionControl(message types.Message) error {
+	invalid := fmt.Errorf("invalid consumer metadata transaction control")
+	if message.TransactionalID == "" || message.Payload != types.TransactionControlMarkerPayload ||
+		message.Key != "" || message.EventType != "" || message.SchemaVersion != 0 || message.AggregateVersion != 0 ||
+		message.Metadata != "" || message.EventID != "" || message.PayloadDigest != "" ||
+		message.SeqNum != 1 || message.ControlBatchType != types.ControlBatchTransaction ||
+		message.ControlBatchVersion != types.ControlBatchVersionCursusV2 {
+		return invalid
+	}
+	key, value, err := types.TransactionMarkerControlBytes(message.TransactionMarker, message.ControlBatchCoordinatorEpoch)
+	if err != nil || !bytes.Equal(message.ControlBatchKey, key) || !bytes.Equal(message.ControlBatchValue, value) {
+		return invalid
+	}
+	state := types.TransactionStateCommitted
+	if message.TransactionMarker == types.TransactionMarkerAbort {
+		state = types.TransactionStateAborted
+	}
+	if message.TransactionState != state {
+		return invalid
+	}
+	// Legacy transactions use the producer epoch; processing transactions
+	// use a separately fenced coordinator epoch in the marker producer ID.
+	legacy := fmt.Sprintf("txn-marker:%s:%s", message.TransactionalID, message.TransactionMarker)
+	processing := fmt.Sprintf("txn-marker:%s:%d:%s", message.TransactionalID, message.ControlBatchCoordinatorEpoch, message.TransactionMarker)
+	if message.ProducerID != processing &&
+		(message.ProducerID != legacy || message.Epoch != message.ControlBatchCoordinatorEpoch) {
+		return invalid
 	}
 	return nil
 }

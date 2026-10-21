@@ -127,13 +127,7 @@ func (dh *DiskHandler) ReadReplayPage(offset, end uint64, cursor types.ReplayCur
 		if message.Offset < offset {
 			continue
 		}
-		page.Messages = append(page.Messages, types.Message{
-			Offset: message.Offset, Payload: message.Payload, Key: message.Key,
-			TransactionalID: message.TransactionalID, TransactionState: message.TransactionState,
-			TransactionMarker: message.TransactionMarker, ControlBatchType: message.ControlBatchType,
-			ControlBatchVersion: message.ControlBatchVersion, ControlBatchCoordinatorEpoch: message.ControlBatchCoordinatorEpoch,
-			ControlBatchKey: message.ControlBatchKey, ControlBatchValue: message.ControlBatchValue,
-		})
+		page.Messages = append(page.Messages, retainedMessage(message))
 		page.Next = message.Offset + 1
 		if page.Next == end {
 			return page, nil

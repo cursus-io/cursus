@@ -9,6 +9,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestReplayPagesPreserveControlValidationFields(t *testing.T) {
+	handler, err := NewDiskHandler(compactionTestConfig(t), "metadata", 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, handler.Close()) }()
+	key, value, err := types.TransactionMarkerControlBytes(types.TransactionMarkerCommit, 7)
+	require.NoError(t, err)
+	message := types.Message{
+		Topic: "metadata", ProducerID: "txn-marker:history:7:commit", SeqNum: 1, Epoch: 3, LeaderEpoch: 9,
+		Payload: types.TransactionControlMarkerPayload, TransactionalID: "history",
+		TransactionState: types.TransactionStateCommitted, TransactionMarker: types.TransactionMarkerCommit,
+		ControlBatchType: types.ControlBatchTransaction, ControlBatchVersion: types.ControlBatchVersionCursusV2,
+		ControlBatchCoordinatorEpoch: 7, ControlBatchKey: key, ControlBatchValue: value,
+		// Invalid user fields must survive decoding so cleanup can reject a
+		// disguised lifecycle record rather than silently treating it as control.
+		Key: "group:workers", EventType: "event", SchemaVersion: 2, AggregateVersion: 4,
+		Metadata: "metadata", EventID: "event-id", PayloadDigest: "digest",
+	}
+	_, err = handler.AppendMessageSync("metadata", 0, &message)
+	require.NoError(t, err)
+	page, err := handler.ReadReplayPage(0, 1, types.ReplayCursor{}, 1, 4096)
+	require.NoError(t, err)
+	require.Equal(t, []types.Message{message}, page.Messages)
+}
+
 func TestReplayPagesResumePhysicalPositionWithoutIndexLookups(t *testing.T) {
 	cfg := compactionTestConfig(t)
 	cfg.IndexIntervalBytes = 1 << 30
