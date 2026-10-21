@@ -278,8 +278,13 @@ func (ch *CommandHandler) handleTruncate(cmd string, ctx ...*ClientContext) stri
 	if truncateErr != nil && !result.Truncated {
 		return formatTruncateError(topicName, expectedRevision, truncateErr)
 	}
-	dependencyErr := ch.applyStandaloneTopicDependencyCleanup(topicName, transactionState)
-	completeErr := ch.TopicManager.CompleteTruncation(topicName)
+	var dependencyErr, completeErr error
+	if truncateErr == nil {
+		dependencyErr = ch.applyStandaloneTopicDependencyCleanup(topicName, transactionState)
+	}
+	if truncateErr == nil && dependencyErr == nil {
+		completeErr = ch.TopicManager.CompleteTruncation(topicName)
+	}
 	if truncateErr != nil || dependencyErr != nil || completeErr != nil {
 		util.Warn("Topic %s truncate committed with pending cleanup: storage=%v dependencies=%v completion=%v", topicName, truncateErr, dependencyErr, completeErr)
 		result.CleanupPending = true
@@ -327,8 +332,8 @@ func (ch *CommandHandler) RecoverPendingTruncations() error {
 		if err != nil {
 			return err
 		}
-		result, truncateErr := ch.TopicManager.TruncateTopicDurable(definition.Name, definition.Revision-1)
-		if truncateErr != nil && !result.Truncated {
+		_, truncateErr := ch.TopicManager.TruncateTopicDurable(definition.Name, definition.Revision-1)
+		if truncateErr != nil {
 			return truncateErr
 		}
 		if err := ch.applyStandaloneTopicDependencyCleanup(definition.Name, transactionState); err != nil {
