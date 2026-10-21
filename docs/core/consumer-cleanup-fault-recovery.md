@@ -110,6 +110,10 @@ member/assignment identity match. Keep committed offsets/reservations from norma
 replay. New lifecycle identities and ordinary startup/ownership/repair recovery
 must not inherit the old session clocks. Preserve a heartbeat received during
 the scan by copying from the live state at publication, not from a pre-scan copy.
+Partition and assignment identity is independent of slice order: validated
+snapshots may permute those slices while committed replay canonicalizes them.
+An import-and-refresh regression covers legacy and multi-topic groups. The
+comparison keeps duplicate multiplicities and never sorts the live state.
 
 The checks defined before implementation cover repeated refresh, real timeout after
 refresh, concurrent heartbeat, newer offsets with unchanged session, changed
@@ -370,6 +374,11 @@ comment: bound the two new `docker exec` calls. They now use context deadlines
 (30 seconds for marker polling and one minute for sentinel changes), allowing
 normal failure reporting and cleanup instead of waiting for the suite timeout.
 No additional review was requested.
+
+An unsolicited automatic review of the admission follow-up identified the
+snapshot-ordering case above. The legacy import regression reproduced the clock
+reset; both legacy and multi-topic import cases pass with the corrected identity
+comparison. This was an additional automatic finding, not another requested review.
 
 The corrected-port CI attempt also exposed a production defect: TRUNCATE
 admission advanced an unrelated member's heartbeat timestamp by about 118 ms

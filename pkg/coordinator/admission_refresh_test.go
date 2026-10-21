@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -162,4 +163,43 @@ func TestAdmissionRefreshReadFailureDoesNotChangeLiveState(t *testing.T) {
 	require.Same(t, live, c.groups["live"])
 	require.Equal(t, old, live.Members["member"].LastHeartbeat)
 	require.Equal(t, old, c.ownershipSince["live"])
+}
+
+func TestAdmissionRefreshPreservesImportedSliceOrderingIdentity(t *testing.T) {
+	for _, subscription := range []bool{false, true} {
+		t.Run(fmt.Sprintf("subscription=%t", subscription), func(t *testing.T) {
+			c, handler, old := admissionClockFixture(t)
+			if subscription {
+				registration, _, err := decodeConsumerMetadataRecord(handler.messages[0][0].Payload)
+				require.NoError(t, err)
+				lifecycle, _, err := decodeConsumerMetadataRecord(handler.messages[0][1].Payload)
+				require.NoError(t, err)
+				registration.Version = ConsumerMetadataRecordVersionSubscriptions
+				registration.Topic, registration.PartitionCount = "", 0
+				registration.Topics = []string{"payments", "refunds"}
+				registration.TopicPartitions = []TopicPartition{{Topic: "payments", Partition: 0}, {Topic: "refunds", Partition: 0}}
+				lifecycle.Lifecycle.TopicName = subscriptionDisplayName(registration.Topics, "")
+				lifecycle.Lifecycle.Topics = registration.Topics
+				lifecycle.Lifecycle.TopicPartitions = registration.TopicPartitions
+				lifecycle.Lifecycle.Partitions = nil
+				lifecycle.Lifecycle.Members[0].Assignments = nil
+				lifecycle.Lifecycle.Members[0].TopicAssignments = registration.TopicPartitions
+				handler.messages[0] = []types.Message{encodedMetadataMessage(t, registration, 0), encodedMetadataMessage(t, lifecycle, 1)}
+				require.NoError(t, c.ReloadDistributedConsumerMetadata())
+			}
+			state := c.ExportState()
+			slices.Reverse(state["live"].Partitions)
+			slices.Reverse(state["live"].TopicPartitions)
+			slices.Reverse(state["live"].Members["member"])
+			slices.Reverse(state["live"].TopicAssignments["member"])
+			require.NoError(t, c.ImportState(state))
+			require.NoError(t, c.RecordHeartbeatForGeneration("live", "member", 1))
+			heartbeat := c.groups["live"].Members["member"].LastHeartbeat
+			c.ownershipSince["live"] = old
+			require.NoError(t, c.RefreshConsumerMetadataForAdmission())
+			require.Equal(t, heartbeat, c.groups["live"].Members["member"].LastHeartbeat)
+			require.Equal(t, heartbeat, c.groups["live"].LastActivity)
+			require.Equal(t, old, c.ownershipSince["live"])
+		})
+	}
 }
