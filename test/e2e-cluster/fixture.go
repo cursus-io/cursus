@@ -42,6 +42,9 @@ func healthPort(nodeIndex int) int {
 }
 
 func clusterPortShift() int {
+	if offset := cleanupPortOffset(); offset != 0 {
+		return offset
+	}
 	shift, _ := strconv.Atoi(os.Getenv("CURSUS_E2E_PORT_SHIFT"))
 	return shift
 }

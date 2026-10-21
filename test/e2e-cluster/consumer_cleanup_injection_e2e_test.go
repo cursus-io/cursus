@@ -125,7 +125,7 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 			require.NoError(t, eventually(t, "committed tombstone acknowledgement was lost", clusterReadyTimeout, func() (bool, string, error) {
 				execCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
-				out, err := exec.CommandContext(execCtx, "docker", "exec", fmt.Sprintf("cursus-cleanup-broker-%d", owner), "test", "-f", faultSentinelRoot+"/consumer-cleanup-ack/"+cleanupRecoveryTopic+".fired").CombinedOutput()
+				out, err := exec.CommandContext(execCtx, "docker", "exec", cleanupContainerName(owner), "test", "-f", faultSentinelRoot+"/consumer-cleanup-ack/"+cleanupRecoveryTopic+".fired").CombinedOutput()
 				return err == nil, string(out), nil
 			}))
 			pending := waitCleanupReadPending(t, addrs[follower-1], 0)
@@ -220,6 +220,6 @@ func cleanupFaultFile(t *testing.T, node int, operation string) {
 	require.True(t, ok)
 	execCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	out, err := exec.CommandContext(execCtx, "docker", "exec", fmt.Sprintf("cursus-cleanup-broker-%d", node), "sh", "-c", command).CombinedOutput()
+	out, err := exec.CommandContext(execCtx, "docker", "exec", cleanupContainerName(node), "sh", "-c", command).CombinedOutput()
 	require.NoError(t, err, string(out))
 }

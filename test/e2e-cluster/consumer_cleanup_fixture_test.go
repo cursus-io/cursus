@@ -2,10 +2,12 @@ package e2e_cluster
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -13,6 +15,44 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
+
+func TestCleanupExplicitOffsetMatchesComposeAndClients(t *testing.T) {
+	t.Setenv("CURSUS_CLEANUP_PORT_OFFSET", "20000")
+	t.Setenv("CURSUS_E2E_PORT_SHIFT", "40000")
+	project, files := isolateCleanupCompose(t, "cursus-cleanup-e2e", []string{
+		composeFile, "docker-compose.consumer-cleanup.yml", "docker-compose.consumer-cleanup-recovery.yml", faultComposeFile,
+	})
+	require.Equal(t, "cursus-truncate-20000-e2e", project)
+	require.Len(t, files, 3)
+	data, err := os.ReadFile(filepath.Clean(files[0]))
+	require.NoError(t, err)
+	var compose struct {
+		Services map[string]struct {
+			ContainerName string   `yaml:"container_name"`
+			Ports         []string `yaml:"ports"`
+			Environment   []string `yaml:"environment"`
+		} `yaml:"services"`
+	}
+	require.NoError(t, yaml.Unmarshal(data, &compose))
+	for node := 1; node <= 3; node++ {
+		service := compose.Services[fmt.Sprintf("broker-%d", node)]
+		require.Equal(t, cleanupContainerName(node), service.ContainerName)
+		require.Contains(t, service.Ports, fmt.Sprintf("%d:9000", brokerPort(node)))
+		require.Contains(t, service.Ports, fmt.Sprintf("%d:9080", healthPort(node)))
+		require.Contains(t, service.Ports, fmt.Sprintf("%d:9100", baseExporterPort+clusterPortShift()+node))
+		require.Contains(t, service.Environment, fmt.Sprintf("ADVERTISED_BROKER_PORT=%d", brokerPort(node)))
+	}
+	recovery, err := os.ReadFile(filepath.Clean(files[1]))
+	require.NoError(t, err)
+	require.Contains(t, string(recovery), "image: "+project+":local")
+	faults, err := os.ReadFile(filepath.Clean(files[2]))
+	require.NoError(t, err)
+	for node := 1; node <= 3; node++ {
+		require.Contains(t, string(faults), fmt.Sprintf(`"%d:9100"`, baseExporterPort+clusterPortShift()+node))
+		require.NotContains(t, string(faults), fmt.Sprintf(`"%d:9100"`, baseExporterPort+node))
+	}
+	require.NotContains(t, string(faults), "context: ../..")
+}
 
 func TestCleanupMetricReaderUsesIsolatedPort(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -24,6 +64,7 @@ func TestCleanupMetricReaderUsesIsolatedPort(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	port := server.Listener.Addr().(*net.TCPAddr).Port
+	t.Setenv("CURSUS_CLEANUP_PORT_OFFSET", "")
 	t.Setenv("CURSUS_E2E_PORT_SHIFT", strconv.Itoa(port-baseExporterPort-1))
 	value, err := fetchMetric(1, "cleanup_test_identity")
 	require.NoError(t, err)
@@ -34,6 +75,11 @@ func TestCleanupMetricReaderUsesIsolatedPort(t *testing.T) {
 // local E2E work. Keep the same broker source, internal ports and test sequence.
 func givenCleanupCluster(t *testing.T, files ...string) *ClusterTestContext {
 	t.Helper()
+	// The explicit offset uses main's compose isolation, including its custom
+	// container names. Do not rewrite those ports a second time here.
+	if cleanupPortOffset() != 0 {
+		return givenClusterRestart(t, "cursus-cleanup-e2e", files...)
+	}
 	const shift = 40000
 	t.Setenv("CURSUS_E2E_PORT_SHIFT", strconv.Itoa(shift))
 	isolated := make([]string, 0, len(files))

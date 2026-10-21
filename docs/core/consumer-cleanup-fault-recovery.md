@@ -426,3 +426,23 @@ The recorded checks at PR heads `8ee4f83` and `f2e11be` passed, as did main
 check labelled "Review rate limited" is not evidence of a new review of
 `f2e11be`. These historical remote checks are separate from this follow-up's
 local validation; no new PR or remote-head CI result is implied.
+
+### Integration with subsequent truncate recovery changes
+
+The follow-up is rebased onto main `ddb1c1b`. Its transaction-control replay,
+truncate fence, instance-bound receipt and recovery checks are retained. The
+recovery fixture now also includes main's actual administrative TCP response
+loss and delayed registration across failover/snapshot restore. Earlier results
+above describe their recorded revisions; they do not establish those newer
+combined scenarios without a fresh run.
+
+Cleanup fixtures default to the existing isolated ports. An explicit
+`CURSUS_CLEANUP_PORT_OFFSET` instead selects main's custom project, container
+names and ports, without applying the default shift again. Both client/health
+and metrics probes use that selection; fault commands use the selected container
+names. The fault Compose override also shifts its exporter bindings and resolves
+its build context, so it cannot add the default cluster's metrics ports back.
+A regression compares the generated Compose bindings, advertised addresses,
+container names and recovery image against the client selection with both port
+variables present. No production cleanup or admission contract changes are
+introduced by this conflict resolution.
