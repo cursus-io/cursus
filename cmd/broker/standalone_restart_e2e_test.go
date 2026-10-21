@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -117,19 +118,28 @@ func waitForBrokerReady(t *testing.T, healthPort int, output *bytes.Buffer) {
 	url := fmt.Sprintf("http://127.0.0.1:%d/ready", healthPort)
 	client := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.Now().Add(15 * time.Second)
+	if os.Getenv("CURSUS_POWER_STAGE") != "" {
+		// The software-emulated guest also boots under contended CI runners.
+		deadline = time.Now().Add(90 * time.Second)
+	}
+	lastObservation := "no health response"
 	for time.Now().Before(deadline) {
 		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil) // #nosec G107 -- loopback test child.
 		require.NoError(t, err)
 		response, err := client.Do(request)
 		if err == nil {
+			body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+			lastObservation = fmt.Sprintf("status=%d body=%s", response.StatusCode, body)
 			_ = response.Body.Close()
 			if response.StatusCode == http.StatusOK {
 				return
 			}
+		} else {
+			lastObservation = err.Error()
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatalf("broker did not become ready: %s", output.String())
+	t.Fatalf("broker did not become ready: %s; logs: %s", lastObservation, output.String())
 }
 
 func brokerCommand(t *testing.T, port int, command string) string {

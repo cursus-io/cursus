@@ -345,6 +345,34 @@ func TestAwaitRecoveredPartitionReplayReportsStalledIndexes(t *testing.T) {
 	require.ErrorContains(t, err, "applied_index=5")
 }
 
+func TestAwaitRecoveredPartitionReplayUsesInstalledSnapshotCoverage(t *testing.T) {
+	for _, test := range []struct {
+		name, commit string
+		complete     bool
+	}{
+		{"snapshot covers commit despite compacted log", "42", true},
+		{"missing committed tail remains fenced", "43", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &countingLogStore{LogStore: raft.NewInmemStore()}
+			stats := &mutableRaftStats{stats: map[string]string{
+				"state": raft.Follower.String(), "last_contact": "1ms",
+				"last_snapshot_index": "42", "commit_index": test.commit, "last_log_index": "28",
+			}}
+			brokerFSM := &fakeRecoveredPartitionFSM{pending: true, applied: 42}
+			err := awaitRecoveredPartitionReplay(context.Background(), stats, store, brokerFSM, "broker-3", 30*time.Millisecond)
+			if test.complete {
+				require.NoError(t, err)
+				require.True(t, brokerFSM.wasFinalized())
+				require.Zero(t, store.reads.Load(), "snapshot-covered history must not be reread")
+			} else {
+				require.ErrorContains(t, err, "without progress")
+				require.False(t, brokerFSM.wasFinalized())
+			}
+		})
+	}
+}
+
 func TestAwaitRecoveredPartitionReplayScansStableCommitRangeOnce(t *testing.T) {
 	baseStore := raft.NewInmemStore()
 	require.NoError(t, baseStore.StoreLogs([]*raft.Log{

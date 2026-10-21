@@ -1,0 +1,27 @@
+#!/bin/sh
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+modprobe virtio_pci
+modprobe virtio_blk
+modprobe crc32c_generic
+modprobe ext4
+modprobe ipv6
+ifconfig lo 127.0.0.1 up
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        cursus_stage=*) export CURSUS_POWER_STAGE=${arg#cursus_stage=} ;;
+        cursus_phase=*) export CURSUS_POWER_PHASE=${arg#cursus_phase=} ;;
+    esac
+done
+if ! mount -t ext4 -o data=ordered /dev/vda /data; then
+    echo POWER_TEST_FAILED_MOUNT
+    poweroff -f
+fi
+export CURSUS_POWER_ROOT=/data/broker
+export CURSUS_E2E_FAULTS=1
+/broker-tests -test.v -test.run='^TestStandaloneBrokerTruncateJournalCrashRecovery$' -test.timeout=10m
+result=$?
+echo POWER_TEST_EXIT=$result
+poweroff -f

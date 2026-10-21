@@ -78,6 +78,7 @@ type JournalManifestInspection struct {
 // Journal durably appends standalone transaction coordinator snapshots.
 type Journal struct {
 	mu                        sync.Mutex
+	rewritePhase              func(string) // process-crash observer installed only by tests
 	path                      string
 	validEnd                  int64
 	loaded                    bool
@@ -519,6 +520,7 @@ func (j *Journal) compactLocked() (err error) {
 	if syncErr := temp.Sync(); syncErr != nil {
 		return fmt.Errorf("sync compacted transaction journal: %w", syncErr)
 	}
+	j.observeRewritePhase("journal_synced")
 	if closeErr := temp.Close(); closeErr != nil {
 		return fmt.Errorf("close compacted transaction journal: %w", closeErr)
 	}
@@ -526,6 +528,7 @@ func (j *Journal) compactLocked() (err error) {
 	if renameErr := os.Rename(tempPath, j.path); renameErr != nil {
 		return fmt.Errorf("replace transaction journal with compacted state: %w", renameErr)
 	}
+	j.observeRewritePhase("journal_renamed")
 	j.validEnd = compactedSize
 	j.latestBytes = compactedSize
 	j.latestRecordBytes = compactedRecordBytes
@@ -534,7 +537,15 @@ func (j *Journal) compactLocked() (err error) {
 	if syncErr := syncJournalDirectory(dir); syncErr != nil {
 		return syncErr
 	}
+	j.observeRewritePhase("journal_directory_synced")
 	return j.writeManifestLocked()
+}
+
+func (j *Journal) observeRewritePhase(phase string) {
+	injectedJournalPhase(j.path, phase)
+	if j.rewritePhase != nil {
+		j.rewritePhase(phase)
+	}
 }
 
 func (j *Journal) writeManifestLocked() error {
@@ -570,16 +581,19 @@ func (j *Journal) writeManifestLocked() error {
 		_ = file.Close()
 		return fmt.Errorf("write transaction journal manifest: %w", err)
 	}
+	j.observeRewritePhase("journal_manifest_written")
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
 		return fmt.Errorf("sync transaction journal manifest: %w", err)
 	}
+	j.observeRewritePhase("journal_manifest_synced")
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close transaction journal manifest: %w", err)
 	}
 	if err := syncJournalDirectory(filepath.Dir(manifestPath)); err != nil {
 		return fmt.Errorf("persist transaction journal manifest: %w", err)
 	}
+	j.observeRewritePhase("journal_manifest_directory_synced")
 	return nil
 }
 

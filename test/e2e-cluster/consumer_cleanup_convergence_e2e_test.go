@@ -35,7 +35,7 @@ func TestCommittedConsumerCleanupConvergesOnFollowers(t *testing.T) {
 			continue
 		}
 		heartbeatGroup(t, client, topicName, group, generation, member)
-		name := fmt.Sprintf("cursus-cleanup-broker-%d", node)
+		name := cleanupContainerName(node)
 		output, err := exec.Command("docker", "restart", name).CombinedOutput()
 		require.NoError(t, err, string(output))
 		require.NoError(t, actions.waitForNodeHealth(node, fmt.Sprintf("http://localhost:%d/ready", healthPort(node))))

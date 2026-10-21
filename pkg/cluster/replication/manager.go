@@ -378,7 +378,10 @@ func awaitRecoveredPartitionReplay(ctx context.Context, r raftStatsReader, logSt
 			lastLogIndex:  lastLogIndex,
 			appliedIndex:  brokerFSM.AppliedIndex(),
 		}
-		if snapshotErr == nil && commitErr == nil && lastLogErr == nil && commitIndex >= snapshotIndex && lastLogIndex >= commitIndex {
+		// An installed snapshot covers its committed prefix even when Raft's
+		// physical log store still ends before that snapshot. Require actual log
+		// coverage only for a committed tail beyond the snapshot boundary.
+		if snapshotErr == nil && commitErr == nil && lastLogErr == nil && commitIndex >= snapshotIndex && max(lastLogIndex, snapshotIndex) >= commitIndex {
 			scanStart := snapshotIndex
 			if targetKnown && snapshotIndex == scannedSnapshotIndex && commitIndex >= scannedCommitIndex {
 				scanStart = scannedCommitIndex

@@ -85,3 +85,5 @@ jobs:
           cache: true
       - name: Run command package tests with race detection
         run: go test -race ./cmd/...
+      - name: Recover standalone broker after every journal rewrite phase
+        run: go test -tags=e2e_faults -race -count=1 ./cmd/broker -run '^TestStandaloneBrokerTruncateJournalCrashRecovery$'
