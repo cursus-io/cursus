@@ -27,6 +27,7 @@ func (d *DiskHandler) CleanupGenerationContext(ctx context.Context) (string, err
 		return "", err
 	}
 	path := d.BaseName + ".cleanup-generation"
+	// #nosec G304 -- BaseName is the broker-owned partition path.
 	data, err := os.ReadFile(path)
 	if err == nil && len(data) == 32 {
 		return hex.EncodeToString(data), nil
