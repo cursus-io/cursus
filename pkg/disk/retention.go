@@ -258,7 +258,9 @@ func (d *DiskHandler) markAsDeletedLocked(logPath string) (err error) {
 	indexPath := logPath[:len(logPath)-4] + ".index"
 	deletedIndexPath := indexPath + ".deleted"
 	renamedIndex := false
-	d.advanceContentGenerationLocked()
+	if err := d.advanceContentGenerationLocked(); err != nil {
+		return err
+	}
 	defer func() {
 		if err != nil {
 			err = d.markWriteUnavailable(err)

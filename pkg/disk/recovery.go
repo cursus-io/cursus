@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -33,6 +34,13 @@ func recoverActiveSegment(logPath string, baseOffset uint64) (segmentRecovery, e
 		return segmentRecovery{}, err
 	}
 	if partial {
+		separator := strings.LastIndex(logPath, "_segment_")
+		if separator < 0 {
+			return segmentRecovery{}, fmt.Errorf("invalid recovery segment path")
+		}
+		if _, err := replaceCleanupGeneration(logPath[:separator], false); err != nil {
+			return segmentRecovery{}, err
+		}
 		if err := truncateAndSync(logPath, validBytes); err != nil {
 			return segmentRecovery{}, fmt.Errorf("truncate partial segment tail: %w", err)
 		}

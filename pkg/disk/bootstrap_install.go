@@ -451,7 +451,9 @@ func (r *BootstrapReceiver) Install() error {
 	if err = validateBootstrapTransaction(d.BaseName, tx); err != nil {
 		return err
 	}
-	d.advanceContentGenerationLocked()
+	if err := d.advanceContentGenerationLocked(); err != nil {
+		return err
+	}
 	if err = writeBootstrapEnvelope(bootstrapPendingPath(d.BaseName), tx); err != nil {
 		if _, statErr := os.Stat(bootstrapPendingPath(d.BaseName)); statErr == nil {
 			d.bootstrapPending.Store(true)
@@ -508,6 +510,9 @@ func (r *BootstrapReceiver) Install() error {
 }
 
 func replayBootstrapTransaction(base string, tx bootstrapTransaction) error {
+	if _, err := replaceCleanupGeneration(base, false); err != nil {
+		return err
+	}
 	if err := validateBootstrapTransaction(base, tx); err != nil {
 		return err
 	}

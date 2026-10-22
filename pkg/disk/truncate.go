@@ -126,7 +126,9 @@ func (d *DiskHandler) truncateTo(ctx context.Context, nextOffset uint64, token *
 		return err
 	}
 	started = true
-	d.advanceContentGenerationLocked()
+	if err := d.advanceContentGenerationLocked(); err != nil {
+		return err
+	}
 	d.lineage = nil
 	defer func() {
 		if err != nil {

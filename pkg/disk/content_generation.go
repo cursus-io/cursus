@@ -151,12 +151,15 @@ func (d *DiskHandler) contentGenerationLocked() ContentGeneration {
 }
 
 // Caller holds mu, immediately before a potentially destructive operation.
-func (d *DiskHandler) advanceContentGenerationLocked() {
+func (d *DiskHandler) advanceContentGenerationLocked() error {
+	if _, err := replaceCleanupGeneration(d.BaseName, false); err != nil {
+		return d.markWriteUnavailable(err)
+	}
 	if d.contentRevision == math.MaxUint64 {
-		_ = d.markWriteUnavailable(fmt.Errorf("disk content generation exhausted"))
-		return
+		return d.markWriteUnavailable(fmt.Errorf("disk content generation exhausted"))
 	}
 	d.contentRevision++
+	return nil
 }
 
 // GetFirstOffsetContext reads the retained start without an uncancellable wait

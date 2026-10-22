@@ -207,7 +207,9 @@ func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error
 
 	for _, msg := range batch {
 		if msg.Offset < d.writtenTail {
-			d.advanceContentGenerationLocked()
+			if err := d.advanceContentGenerationLocked(); err != nil {
+				return err
+			}
 			break
 		}
 	}
@@ -376,7 +378,9 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 		return err
 	}
 	if msg.Offset < d.writtenTail {
-		d.advanceContentGenerationLocked()
+		if err := d.advanceContentGenerationLocked(); err != nil {
+			return err
+		}
 	}
 	const entrySize = uint64(types.IndexEntrySize)
 	msgPosition := d.CurrentOffset
@@ -456,7 +460,9 @@ func (d *DiskHandler) rotateSegment(nextBaseOffset uint64) error {
 	// FlushedOffset may regress after a legacy overlap. A later timer roll at
 	// that offset changes existing segment bounds rather than extending the log.
 	if nextBaseOffset < d.writtenTail {
-		d.advanceContentGenerationLocked()
+		if err := d.advanceContentGenerationLocked(); err != nil {
+			return err
+		}
 	}
 
 	var errs []error
