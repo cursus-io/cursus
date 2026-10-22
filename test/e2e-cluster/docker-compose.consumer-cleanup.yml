@@ -1,9 +1,15 @@
 services:
   broker-1:
+    build:
+      context: ${CURSUS_CLEANUP_BUILD_CONTEXT:-../..}
     container_name: cursus-cleanup-broker-1
   broker-2:
+    build:
+      context: ${CURSUS_CLEANUP_BUILD_CONTEXT:-../..}
     container_name: cursus-cleanup-broker-2
   broker-3:
+    build:
+      context: ${CURSUS_CLEANUP_BUILD_CONTEXT:-../..}
     container_name: cursus-cleanup-broker-3
 
 networks:

@@ -365,6 +365,7 @@ func (scan *topicCleanupScan) read(view ConsumerCleanupView) error {
 	records, bytes, pages := topicCleanupRecords, topicCleanupBytes, topicCleanupRecords
 	for partition, bounds := range partitions {
 		scan.status.Partition, scan.status.Next, scan.status.End = partition, scan.next[partition], bounds.End
+		scan.status.Segment, scan.status.Position = scan.cursors[partition].Segment, scan.cursors[partition].Position
 		for scan.next[partition] < bounds.End {
 			if records == 0 || bytes == 0 || pages == 0 {
 				return fmt.Errorf("metadata scan budget exhausted")

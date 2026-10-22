@@ -72,6 +72,9 @@ func (view *consumerCleanupView) Read(partition int, offset uint64, cursor types
 		return page, fmt.Errorf("consumer metadata cursor outside committed range")
 	}
 	p := view.partitions[partition]
+	if err := consumerCleanupReadFault(cursor); err != nil {
+		return page, err
+	}
 	reader, ok := p.dh.(types.BoundedReplayReader)
 	if !ok {
 		return page, fmt.Errorf("bounded physical consumer metadata reader unavailable")

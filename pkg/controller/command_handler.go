@@ -418,7 +418,7 @@ func (ch *CommandHandler) ensureTopicRecreationIsClean(topicName string) error {
 func (ch *CommandHandler) prepareTopicDependencies(topicName string) (map[string]*transaction.Snapshot, error) {
 	if ch.Coordinator != nil {
 		if ch.isDistributed() {
-			if err := ch.Coordinator.ReloadDistributedConsumerMetadata(); err != nil {
+			if err := ch.Coordinator.RefreshConsumerMetadataForAdmission(); err != nil {
 				return nil, fmt.Errorf("%w: refresh replicated consumer groups: %v", topic.ErrTopicDeleteBlocked, err)
 			}
 		}

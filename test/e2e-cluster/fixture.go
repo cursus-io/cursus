@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +23,7 @@ const (
 	faultComposeFile      = "docker-compose.faults.yml"
 	baseBrokerPort        = 9000
 	baseHealthPort        = 9080
+	baseExporterPort      = 9100
 	composeLogTimeout     = 30 * time.Second
 )
 
@@ -32,11 +35,19 @@ type ClusterTestContext struct {
 }
 
 func brokerPort(nodeIndex int) int {
-	return baseBrokerPort + nodeIndex + cleanupPortOffset() // nodeIndex: 1-based
+	return baseBrokerPort + clusterPortShift() + nodeIndex // nodeIndex: 1-based
 }
 
 func healthPort(nodeIndex int) int {
-	return baseHealthPort + nodeIndex + cleanupPortOffset() // nodeIndex: 1-based
+	return baseHealthPort + clusterPortShift() + nodeIndex // nodeIndex: 1-based
+}
+
+func clusterPortShift() int {
+	if offset := cleanupPortOffset(); offset != 0 {
+		return offset
+	}
+	shift, _ := strconv.Atoi(os.Getenv("CURSUS_E2E_PORT_SHIFT"))
+	return shift
 }
 
 func clusterBrokerAddrs(size int) []string {

@@ -158,7 +158,7 @@ func waitForMetric(t *testing.T, node int, name string, labels map[string]string
 
 func readMetric(node int, name string, labels map[string]string) (float64, error) {
 	client := &http.Client{Timeout: 2 * time.Second}
-	response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", storageFaultBaseExporterPort+node)) // #nosec G107 -- fixed loopback test endpoint.
+	response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", storageFaultBaseExporterPort+clusterPortShift()+node)) // #nosec G107 -- fixed loopback test endpoint.
 	if err != nil {
 		return 0, err
 	}

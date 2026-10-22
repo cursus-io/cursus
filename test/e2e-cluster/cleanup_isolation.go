@@ -74,6 +74,16 @@ func isolateCleanupCompose(t *testing.T, project string, files []string) (string
 				absolute = filepath.Join(filepath.Dir(base), "recovery.yml")
 				require.NoError(t, outputRoot.WriteFile("recovery.yml", []byte(strings.ReplaceAll(string(override), "cursus-cleanup-recovery:local", project+":local")), 0o600))
 			}
+			if file == faultComposeFile {
+				override, readErr := os.ReadFile(faultComposeFile)
+				require.NoError(t, readErr)
+				faults := strings.ReplaceAll(string(override), "context: ../..", "context: "+filepath.ToSlash(root))
+				for node := 1; node <= 3; node++ {
+					faults = strings.ReplaceAll(faults, fmt.Sprintf(`"%d:`, baseExporterPort+node), fmt.Sprintf(`"%d:`, baseExporterPort+node+offset))
+				}
+				absolute = filepath.Join(filepath.Dir(base), "faults.yml")
+				require.NoError(t, outputRoot.WriteFile("faults.yml", []byte(faults), 0o600))
+			}
 			isolated = append(isolated, absolute)
 		}
 	}

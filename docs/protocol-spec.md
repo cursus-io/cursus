@@ -387,6 +387,13 @@ CLUSTER_STATUS
 ```
 Response: `OK cluster=<json>`. The JSON payload reports active and inactive brokers, the Raft leader and indexes, per-partition leader/epoch/committed-HWM/replica/ISR state, and aggregate leaderless, under-replicated, assignment-deficient, inactive-replica, minimum-ISR-unsatisfied, and recovery-pending counts. A gap-quarantined partition sets `recovery_pending=true` and lists `recovery_replicas`; the broker remains assigned but outside ISR until catch-up and prefix verification complete. Top-level topic and replica materialization counts expose node-local recovery that has not converged. Serialization failure returns `ERROR: marshal_cluster_status_failed reason="..."`.
 
+For pending local cleanup, `CLUSTER_STATUS` additionally returns
+`topic_materialization_issues` (omitted when empty). Each issue names the topic,
+operation, pending time and error, with the revision/lifecycle epoch when known.
+The optional `consumer_cleanup` contains group/epoch, committed end, cursor,
+records, serialized bytes, page attempts and retry reason. These local details
+distinguish committed administrative intent from completed materialization.
+
 **ELECT_LEADER**
 ```
 ELECT_LEADER topic=<name> partition=<N> broker=<broker-id>

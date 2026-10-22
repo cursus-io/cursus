@@ -30,7 +30,7 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 	if os.Getenv("RUN_E2E_CLEANUP_RECOVERY") != "1" {
 		t.Skip("set RUN_E2E_CLEANUP_RECOVERY=1 to run cleanup fault recovery")
 	}
-	ctx := givenClusterRestart(t, "cursus-cleanup-e2e", composeFile, snapshotComposeFile, "docker-compose.consumer-cleanup.yml", "docker-compose.consumer-cleanup-recovery.yml").
+	ctx := givenCleanupCluster(t, composeFile, snapshotComposeFile, "docker-compose.consumer-cleanup.yml", "docker-compose.consumer-cleanup-recovery.yml").
 		WithClusterSize(3).WithTopic(cleanupRecoveryTopic).WithPartitions(1).WithAcks("all")
 	defer ctx.Cleanup()
 	actions := ctx.WhenCluster().StartCluster()
@@ -342,7 +342,7 @@ func logCleanupRecoveryWork(t *testing.T, nodes []int, phase string) {
 	t.Helper()
 	client := &http.Client{Timeout: 5 * time.Second}
 	for _, node := range nodes {
-		response, err := client.Get(fmt.Sprintf("http://localhost:%d/metrics", baseExporterPort+node+cleanupPortOffset()))
+		response, err := client.Get(fmt.Sprintf("http://localhost:%d/metrics", baseExporterPort+clusterPortShift()+node))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, response.StatusCode)
 		scanner := bufio.NewScanner(response.Body)

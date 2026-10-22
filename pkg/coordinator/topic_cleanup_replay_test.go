@@ -261,6 +261,42 @@ func TestTopicCleanupResumesBoundedPagesAndReadFailures(t *testing.T) {
 	require.Equal(t, totalBytes, log.bytes)
 }
 
+type cleanupCursorView struct {
+	partitions []ConsumerCleanupPartition
+	fail       bool
+}
+
+func (view *cleanupCursorView) Partitions() []ConsumerCleanupPartition { return view.partitions }
+
+func (view *cleanupCursorView) Read(partition int, offset uint64, _ types.ReplayCursor, _, _ int) (ConsumerCleanupPage, error) {
+	if view.fail {
+		return ConsumerCleanupPage{}, errors.New("injected read failure")
+	}
+	return ConsumerCleanupPage{Next: offset + 1, Records: 1, Bytes: 100,
+		Cursor: types.ReplayCursor{Initialized: true, Segment: uint64(partition + 1), Position: uint64((partition + 1) * 100)}}, nil
+}
+
+func TestTopicCleanupReadFailureReportsActivePartitionCursor(t *testing.T) {
+	view := &cleanupCursorView{partitions: []ConsumerCleanupPartition{{Identity: 0, End: 1}, {Identity: 1, End: 1}}}
+	scan := &topicCleanupScan{}
+	require.NoError(t, scan.read(view))
+	require.Equal(t, 1, scan.status.Partition)
+	require.Equal(t, uint64(200), scan.status.Position)
+	cursors := append([]types.ReplayCursor(nil), scan.cursors...)
+	view.partitions[0].End = 2 // A late commit requires returning to an earlier partition.
+	view.fail = true
+	for range 2 {
+		require.ErrorContains(t, scan.read(view), "injected read failure")
+		require.Equal(t, 0, scan.status.Partition)
+		require.Equal(t, uint64(1), scan.status.Next)
+		require.Equal(t, cursors[0].Segment, scan.status.Segment)
+		require.Equal(t, cursors[0].Position, scan.status.Position)
+		require.Equal(t, uint64(2), scan.status.Records)
+		require.Equal(t, uint64(200), scan.status.Bytes)
+		require.Equal(t, cursors, scan.cursors)
+	}
+}
+
 func TestTopicCleanupTailsNewCommitAndInvalidatesReplacedLog(t *testing.T) {
 	for _, replace := range []bool{false, true} {
 		t.Run(map[bool]string{false: "append", true: "replacement"}[replace], func(t *testing.T) {

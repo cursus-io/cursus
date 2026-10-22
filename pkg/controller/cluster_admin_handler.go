@@ -67,6 +67,8 @@ type clusterStatus struct {
 	Healthy                       bool                     `json:"healthy"`
 	Brokers                       []clusterBrokerStatus    `json:"brokers"`
 	Partitions                    []clusterPartitionStatus `json:"partitions"`
+
+	TopicMaterializationIssues []fsm.TopicMaterializationIssue `json:"topic_materialization_issues,omitempty"`
 }
 
 // handleListCluster processes the read-only LIST_CLUSTER command.
@@ -153,7 +155,8 @@ func buildClusterStatus(state *fsm.BrokerFSM, raftLeader string, defaultMinISR i
 	status.InactiveReplicas = topology.InactiveReplicas
 	status.MinISRUnsatisfied = topology.MinISRUnsatisfied
 	status.RecoveryPending = topology.RecoveryPending
-	status.TopicMaterializationPending = len(state.TopicMaterializationIssues())
+	status.TopicMaterializationIssues = state.TopicMaterializationIssues()
+	status.TopicMaterializationPending = len(status.TopicMaterializationIssues)
 	status.ReplicaMaterializationPending = len(state.ReplicaMaterializationIssues())
 	status.Healthy = topology.Healthy && status.TopicMaterializationPending == 0 && status.ReplicaMaterializationPending == 0
 	for _, partition := range topology.Partitions {

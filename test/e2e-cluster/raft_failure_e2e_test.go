@@ -19,7 +19,6 @@ import (
 const (
 	runClusterFailureE2E = "RUN_E2E_CLUSTER_FAILURE"
 	clusterFailureWait   = 90 * time.Second
-	baseExporterPort     = 9100
 )
 
 func TestRaftLeaderFailoverPropagatesDirectTopicMutations(t *testing.T) {
@@ -126,7 +125,7 @@ func waitForSingleRaftLeader(t *testing.T, nodes []int, excluded int) int {
 }
 
 func fetchMetric(node int, metricName string) (float64, error) {
-	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", baseExporterPort+node)
+	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", baseExporterPort+clusterPortShift()+node)
 	client := &http.Client{Timeout: 2 * time.Second}
 	response, err := client.Get(url) // #nosec G107 -- loopback ports are fixed by the test compose file.
 	if err != nil {

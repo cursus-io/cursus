@@ -19,7 +19,7 @@ func TestCommittedConsumerCleanupConvergesOnFollowers(t *testing.T) {
 	if os.Getenv("RUN_E2E_CHAOS") != "1" {
 		t.Skip("set RUN_E2E_CHAOS=1 to run consumer cleanup convergence")
 	}
-	ctx := givenClusterRestart(t, "cursus-cleanup-e2e", composeFile, "docker-compose.consumer-cleanup.yml").
+	ctx := givenCleanupCluster(t, composeFile, "docker-compose.consumer-cleanup.yml").
 		WithClusterSize(3).WithTopic("cleanup-orders").WithPartitions(1).WithAcks("all")
 	defer ctx.Cleanup()
 	actions := ctx.WhenCluster().StartCluster()

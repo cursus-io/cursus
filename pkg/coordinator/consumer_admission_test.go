@@ -229,9 +229,10 @@ func TestConsumerAdmissionAllOrdinaryEntrypoints(t *testing.T) {
 		"topic-fence": func() error {
 			return c.WithTopicOwnershipFence("g", "m", 1, nil, func() error { t.Error("blocked callback"); return nil })
 		},
-		"reload": c.ReloadDistributedConsumerMetadata,
-		"status": func() error { _, err := c.GetGroupStatus("g"); return err },
-		"stable": func() error { _, _, err := c.GetStableOffset("g", "events", 0); return err },
+		"reload":            c.ReloadDistributedConsumerMetadata,
+		"admission-refresh": c.RefreshConsumerMetadataForAdmission,
+		"status":            func() error { _, err := c.GetGroupStatus("g"); return err },
+		"stable":            func() error { _, _, err := c.GetStableOffset("g", "events", 0); return err },
 	}
 	for name, operation := range mutations {
 		t.Run(name, func(t *testing.T) { require.ErrorIs(t, operation(), ErrConsumerMetadataRecovering) })
