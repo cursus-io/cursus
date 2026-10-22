@@ -151,7 +151,9 @@ func TestRetainedPageCursorMutationDuringDetachedValidation(t *testing.T) {
 	ctx := retainedPageTestContext{Context: context.Background(), check: func() error {
 		if !mutated && d.retainedPageWork.DecodedFrames != 0 && d.mu.TryLock() {
 			mutated = true
-			d.advanceContentGenerationLocked()
+			if err := d.advanceContentGenerationLocked(); err != nil {
+				t.Fatal(err)
+			}
 			d.mu.Unlock()
 		}
 		return nil
