@@ -1,0 +1,120 @@
+{
+  "baseline_commit": "aff3c938cb26ba374aba97d162cfa0c15a686c65",
+  "environment": {
+    "os": "Linux Docker Desktop",
+    "go": "1.25.0",
+    "cpus": 2,
+    "memory_limit_bytes": 2147483648,
+    "storage": "container writable layer",
+    "runs": 3
+  },
+  "timing": "Active work is measured. Historical scheduler waits are simulated, not slept. No production estimate is claimed.",
+  "samples": {
+    "baseline": [
+      {
+        "active_wall_seconds": 0.272971319,
+        "allocated_bytes": 415102736,
+        "batches": 441,
+        "gomaxprocs": 2,
+        "history": 56000,
+        "mode": "baseline",
+        "other_max_ns": 78644,
+        "other_operations": 235,
+        "other_p99_ns": 37988,
+        "peak_sampled_heap_bytes": 7609048,
+        "physical_page_bytes": 158984674,
+        "process_cpu_seconds": 0.34295699999999996,
+        "reads": 448,
+        "records_per_active_second": 205149.75787621117,
+        "simulated_wait_seconds": 2200
+      },
+      {
+        "active_wall_seconds": 0.288903858,
+        "allocated_bytes": 415097048,
+        "batches": 441,
+        "gomaxprocs": 2,
+        "history": 56000,
+        "mode": "baseline",
+        "other_max_ns": 188054,
+        "other_operations": 233,
+        "other_p99_ns": 58765,
+        "peak_sampled_heap_bytes": 7686296,
+        "physical_page_bytes": 158984674,
+        "process_cpu_seconds": 0.36501000000000006,
+        "reads": 448,
+        "records_per_active_second": 193836.11000445692,
+        "simulated_wait_seconds": 2200
+      },
+      {
+        "active_wall_seconds": 0.26635662,
+        "allocated_bytes": 415093648,
+        "batches": 441,
+        "gomaxprocs": 2,
+        "history": 56000,
+        "mode": "baseline",
+        "other_max_ns": 189733,
+        "other_operations": 227,
+        "other_p99_ns": 45890,
+        "peak_sampled_heap_bytes": 7153896,
+        "physical_page_bytes": 158984674,
+        "process_cpu_seconds": 0.33501400000000015,
+        "reads": 448,
+        "records_per_active_second": 210244.44596120797,
+        "simulated_wait_seconds": 2200
+      }
+    ],
+    "continuation": [
+      {
+        "active_wall_seconds": 1.059182233,
+        "allocated_bytes": 418556880,
+        "batches": 441,
+        "gomaxprocs": 2,
+        "history": 56000,
+        "mode": "continuation",
+        "other_max_ns": 699150,
+        "other_operations": 894,
+        "other_p99_ns": 28823,
+        "peak_sampled_heap_bytes": 7509048,
+        "physical_page_bytes": 158984674,
+        "process_cpu_seconds": 0.5191839999999999,
+        "reads": 448,
+        "records_per_active_second": 52870.97749117927,
+        "simulated_wait_seconds": 0.44
+      },
+      {
+        "active_wall_seconds": 1.432539765,
+        "allocated_bytes": 418593904,
+        "batches": 441,
+        "gomaxprocs": 2,
+        "history": 56000,
+        "mode": "continuation",
+        "other_max_ns": 436219,
+        "other_operations": 1198,
+        "other_p99_ns": 56392,
+        "peak_sampled_heap_bytes": 7747568,
+        "physical_page_bytes": 158984674,
+        "process_cpu_seconds": 0.7037,
+        "reads": 448,
+        "records_per_active_second": 39091.41049218972,
+        "simulated_wait_seconds": 0.44
+      },
+      {
+        "active_wall_seconds": 1.330184052,
+        "allocated_bytes": 418549104,
+        "batches": 441,
+        "gomaxprocs": 2,
+        "history": 56000,
+        "mode": "continuation",
+        "other_max_ns": 420242,
+        "other_operations": 1130,
+        "other_p99_ns": 67854,
+        "peak_sampled_heap_bytes": 7742272,
+        "physical_page_bytes": 158984674,
+        "process_cpu_seconds": 0.5970449999999996,
+        "reads": 448,
+        "records_per_active_second": 42099.437228856514,
+        "simulated_wait_seconds": 0.44
+      }
+    ]
+  }
+}

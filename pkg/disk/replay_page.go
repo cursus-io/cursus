@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -18,13 +19,20 @@ import (
 // The caller must exclude log replacement/rollback and invalidate the cursor
 // when the partition identity, mutation generation or retained start changes.
 func (dh *DiskHandler) ReadReplayPage(offset, end uint64, cursor types.ReplayCursor, maxRecords, maxBytes int) (types.ReplayPage, error) {
+	return dh.ReadReplayPageContext(context.Background(), offset, end, cursor, maxRecords, maxBytes)
+}
+
+func (dh *DiskHandler) ReadReplayPageContext(ctx context.Context, offset, end uint64, cursor types.ReplayCursor, maxRecords, maxBytes int) (types.ReplayPage, error) {
 	page := types.ReplayPage{Next: offset, Cursor: cursor}
 	if maxRecords <= 0 || maxBytes <= 0 || offset >= end {
 		return page, fmt.Errorf("invalid replay page bounds")
 	}
 	atomic.AddInt32(&dh.activeReaders, 1)
 	defer atomic.AddInt32(&dh.activeReaders, -1)
-	dh.mu.Lock()
+	unlock, err := lockProofContext(ctx, &dh.mu)
+	if err != nil {
+		return page, err
+	}
 	count := len(dh.segments)
 	if count == 0 || dh.segments[count-1] != dh.CurrentSegment {
 		count++
@@ -39,13 +47,13 @@ func (dh *DiskHandler) ReadReplayPage(offset, end uint64, cursor types.ReplayCur
 	if cursor.Initialized {
 		index = sort.Search(count, func(i int) bool { return segmentAt(i) >= cursor.Segment })
 		if index == count || segmentAt(index) != cursor.Segment {
-			dh.mu.Unlock()
+			unlock()
 			return page, fmt.Errorf("replay cursor segment is no longer retained")
 		}
 	} else {
 		index = sort.Search(count, func(i int) bool { return segmentAt(i) > offset }) - 1
 		if index < 0 {
-			dh.mu.Unlock()
+			unlock()
 			return page, fmt.Errorf("replay offset precedes retained segments")
 		}
 		page.Cursor = types.ReplayCursor{Initialized: true, Segment: segmentAt(index)}
@@ -55,7 +63,7 @@ func (dh *DiskHandler) ReadReplayPage(offset, end uint64, cursor types.ReplayCur
 	if hasNext {
 		nextSegment = segmentAt(index + 1)
 	}
-	dh.mu.Unlock()
+	unlock()
 	path := dh.GetSegmentPath(page.Cursor.Segment)
 	// #nosec G304 -- path is derived from the broker-owned segment directory.
 	file, err := os.Open(path)
@@ -77,6 +85,9 @@ func (dh *DiskHandler) ReadReplayPage(offset, end uint64, cursor types.ReplayCur
 	}
 	var length [4]byte
 	for page.Records < maxRecords && page.Bytes < maxBytes {
+		if err := ctx.Err(); err != nil {
+			return page, err
+		}
 		if page.Cursor.Position == segmentBytes {
 			if hasNext {
 				page.Cursor.Segment = nextSegment
@@ -101,7 +112,7 @@ func (dh *DiskHandler) ReadReplayPage(offset, end uint64, cursor types.ReplayCur
 		}
 		if int(size) > maxBytes-page.Bytes {
 			if page.Records == 0 {
-				return page, fmt.Errorf("replay record exceeds remaining byte budget")
+				return page, &types.ReplayByteBudget{Size: int(size), Budget: maxBytes}
 			}
 			return page, nil
 		}

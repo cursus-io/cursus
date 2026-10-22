@@ -526,21 +526,7 @@ func buildRaftConfig(cfg *config.Config, brokerID string) (*raft.Config, error) 
 }
 
 func (rm *RaftReplicationManager) reconcileTopicMaterializations(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := rm.fsm.ReconcileTopicMaterializations(); err != nil {
-				util.Warn("Topic materialization reconcile pending on broker %s: %v", rm.brokerID, err)
-			}
-			if err := rm.fsm.ReconcileReplicaMaterializations(rm.brokerID); err != nil {
-				util.Warn("Replica materialization reconcile pending on broker %s: %v", rm.brokerID, err)
-			}
-		}
-	}
+	runMaterializations(ctx, rm.fsm, rm.brokerID, interval, materializationClock{time.Now, waitMaterialization})
 }
 func (rm *RaftReplicationManager) observeLeadershipContext(ctx context.Context, notifyCh <-chan bool) {
 	for {

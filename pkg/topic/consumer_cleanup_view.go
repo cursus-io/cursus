@@ -1,6 +1,7 @@
 package topic
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -11,6 +12,7 @@ import (
 type consumerCleanupView struct {
 	partitions []*Partition
 	bounds     []coordinator.ConsumerCleanupPartition
+	ctx        context.Context
 }
 
 // WithConsumerCleanupView pins local partition identities and excludes replica
@@ -18,22 +20,37 @@ type consumerCleanupView struct {
 // Ordinary appends may continue: the view only exposes the captured committed,
 // flushed prefix. Distributed internal metadata compaction is disabled.
 func (tm *TopicManager) WithConsumerCleanupView(fn func(coordinator.ConsumerCleanupView) error) error {
-	tm.mu.RLock()
+	return tm.WithConsumerCleanupViewContext(context.Background(), fn)
+}
+
+func (tm *TopicManager) WithConsumerCleanupViewContext(ctx context.Context, fn func(coordinator.ConsumerCleanupView) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !tm.mu.TryRLock() {
+		return cleanupViewWaiting("consumer metadata manager busy")
+	}
 	defer tm.mu.RUnlock()
 	t := tm.topics[config.ConsumerOffsetsTopicName]
 	if t == nil {
-		return fmt.Errorf("consumer metadata topic unavailable")
+		return cleanupViewWaiting("consumer metadata topic unavailable")
 	}
-	t.mu.RLock()
+	if !t.mu.TryRLock() {
+		return cleanupViewWaiting("consumer metadata topic busy")
+	}
 	defer t.mu.RUnlock()
-	view := &consumerCleanupView{partitions: t.Partitions}
+	view := &consumerCleanupView{partitions: t.Partitions, ctx: ctx}
 	for _, p := range t.Partitions {
-		p.reconcileMu.RLock()
+		if err := p.reconcileMu.RLockContext(ctx); err != nil {
+			return err
+		}
 		defer p.reconcileMu.RUnlock()
 		if err := p.RecoveryError(); err != nil {
 			return err
 		}
-		p.mu.RLock()
+		if err := p.mu.RLockContext(ctx); err != nil {
+			return err
+		}
 		err := p.hwmReadinessErrorLocked()
 		pending := p.snapshotRecovery
 		end := min(p.HWM, p.dh.GetFlushedOffset())
@@ -42,14 +59,25 @@ func (tm *TopicManager) WithConsumerCleanupView(fn func(coordinator.ConsumerClea
 			return err
 		}
 		if pending {
-			return fmt.Errorf("consumer metadata snapshot recovery pending")
+			return cleanupViewWaiting("consumer metadata snapshot recovery pending")
 		}
 		start := p.dh.GetFirstOffset()
 		if end < start {
-			return fmt.Errorf("consumer metadata committed range unavailable")
+			return cleanupViewWaiting("consumer metadata committed range unavailable")
+		}
+		var durable string
+		if storage, ok := p.dh.(interface {
+			CleanupGenerationContext(context.Context) (string, error)
+		}); ok {
+			token, err := storage.CleanupGenerationContext(ctx)
+			if err != nil {
+				return err
+			}
+			durable = fmt.Sprintf("%s:%d:%s", t.InstanceID, t.LifecycleEpoch, token)
 		}
 		view.bounds = append(view.bounds, coordinator.ConsumerCleanupPartition{
-			Identity: p, Generation: p.eventIDGeneration.Load(), Start: start, End: end,
+			DurableGeneration: durable,
+			Identity:          p, Generation: p.eventIDGeneration.Load(), Start: start, End: end,
 		})
 	}
 	return fn(view)
@@ -79,5 +107,27 @@ func (view *consumerCleanupView) Read(partition int, offset uint64, cursor types
 	if !ok {
 		return page, fmt.Errorf("bounded physical consumer metadata reader unavailable")
 	}
+	if reader, ok := p.dh.(interface {
+		ReadReplayPageContext(context.Context, uint64, uint64, types.ReplayCursor, int, int) (types.ReplayPage, error)
+	}); ok {
+		return reader.ReadReplayPageContext(view.ctx, offset, bounds.End, cursor, maxRecords, maxBytes)
+	}
 	return reader.ReadReplayPage(offset, bounds.End, cursor, maxRecords, maxBytes)
+}
+
+func cleanupViewWaiting(reason string) error {
+	return &coordinator.TopicCleanupPending{State: coordinator.CleanupWait, Reason: reason}
+}
+
+func (view *consumerCleanupView) PrepareCleanupCheckpoint() error {
+	for _, p := range view.partitions {
+		storage, ok := p.dh.(interface{ SyncCleanupCheckpointContext(context.Context) error })
+		if !ok {
+			return fmt.Errorf("durable cleanup checkpoint unsupported")
+		}
+		if err := storage.SyncCleanupCheckpointContext(view.ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }

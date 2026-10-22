@@ -2,28 +2,33 @@ package coordinator
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
 const (
-	topicCleanupRecords = 128
-	topicCleanupBytes   = 1 << 20
-	topicCleanupGroups  = 64
-	topicCleanupTopics  = 64
+	topicCleanupDuration = 10 * time.Millisecond
+	topicCleanupRecords  = 128
+	topicCleanupBytes    = 1 << 20
+	topicCleanupGroups   = 64
+	topicCleanupTopics   = 64
 )
 
 // ConsumerCleanupPartition identifies an immutable committed prefix. Identity
 // must be comparable and change when the underlying partition is replaced.
 type ConsumerCleanupPartition struct {
-	Identity   any
-	Generation uint64
-	Start      uint64
-	End        uint64
+	Identity          any
+	DurableGeneration string
+	Generation        uint64
+	Start             uint64
+	End               uint64
 }
 
 // ConsumerCleanupPage counts all storage work, including filtered records.
@@ -55,7 +60,19 @@ type TopicCleanupPending struct {
 	Segment   uint64 `json:"segment"`
 	Position  uint64 `json:"position"`
 	Reason    string `json:"reason"`
+	State     string `json:"state,omitempty"`
+	cause     error
 }
+
+const (
+	CleanupContinue = "continue"
+	CleanupWait     = "wait"
+	CleanupError    = "error"
+)
+
+var errCleanupBudget = errors.New("metadata scan budget exhausted")
+
+func (p *TopicCleanupPending) Unwrap() error { return p.cause }
 
 func (p *TopicCleanupPending) Error() string {
 	return fmt.Sprintf("consumer cleanup pending topic=%q group=%q epoch=%d partition=%d next=%d end=%d records=%d bytes=%d reads=%d reason=%s",
@@ -78,12 +95,15 @@ type cleanupTarget struct {
 }
 
 type topicCleanupScan struct {
-	current    func() bool
-	targets    map[string]*cleanupTarget
-	partitions []ConsumerCleanupPartition
-	next       []uint64
-	cursors    []types.ReplayCursor
-	status     TopicCleanupPending
+	current           func() bool
+	targets           map[string]*cleanupTarget
+	partitions        []ConsumerCleanupPartition
+	next              []uint64
+	cursors           []types.ReplayCursor
+	status            TopicCleanupPending
+	checkpointLoaded  bool
+	checkpointRecords uint64
+	checkpointBytes   uint64
 }
 
 // ReconcileTopicGroups preserves standalone cleanup and makes distributed
@@ -99,7 +119,7 @@ func (c *Coordinator) CheckTopicGroupCleanup(topicName string) ([]string, error)
 	if c.standalone {
 		return c.DeleteInactiveGroupsForTopic(topicName)
 	}
-	pending := &TopicCleanupPending{Topic: topicName, Reason: "consumer cleanup scheduled outside Raft apply"}
+	pending := &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "consumer cleanup scheduled outside Raft apply"}
 	if !c.mu.TryLock() {
 		return nil, pending
 	}
@@ -127,13 +147,27 @@ func (c *Coordinator) CheckTopicGroupCleanup(topicName string) ([]string, error)
 // state and may be retained to reclaim superseded scans on cache admission.
 // New registrations cannot replace those targets until cleanup returns.
 func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bool) ([]string, error) {
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.ReconcileTopicGroupsContext(ctx, topicName, current)
+}
+
+func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName string, current func() bool) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	if c.standalone {
 		if !current() {
 			return nil, fmt.Errorf("topic cleanup intent changed")
 		}
 		return c.DeleteInactiveGroupsForTopic(topicName)
 	}
-	c.cleanupMu.Lock()
+	if !c.cleanupMu.TryLock() {
+		return nil, &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "cleanup worker busy"}
+	}
 	defer c.cleanupMu.Unlock()
 
 	// Ownership recovery may itself take lifecycleMu. Never invoke it while
@@ -148,15 +182,21 @@ func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bo
 			break
 		}
 		if checkOwner != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			owners[reference.Name] = checkOwner(reference.Name)
 		}
 	}
 
-	c.lifecycleMu.Lock()
+	if !c.lifecycleMu.TryLock() {
+		return nil, &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "group lifecycle busy"}
+	}
 	defer c.lifecycleMu.Unlock()
 	references = c.TopicGroupReferences(topicName)
 	if len(references) == 0 {
 		delete(c.cleanupProgress, topicName)
+		c.removeCleanupCheckpoint(topicName)
 		return nil, nil
 	}
 	for _, reference := range references {
@@ -169,7 +209,7 @@ func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bo
 	}
 	reader, ok := c.topicHandler.(consumerCleanupReader)
 	if !ok {
-		return nil, &TopicCleanupPending{Topic: topicName, Reason: "committed metadata view unavailable"}
+		return nil, &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "committed metadata view unavailable"}
 	}
 	if c.cleanupProgress == nil {
 		c.cleanupProgress = make(map[string]*topicCleanupScan)
@@ -183,11 +223,12 @@ func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bo
 				if (candidate.current != nil && !candidate.current()) ||
 					(len(candidate.partitions) > 0 && candidate.matches(candidate.partitions)) {
 					delete(c.cleanupProgress, name)
+					c.removeCleanupCheckpoint(name)
 					break
 				}
 			}
 			if len(c.cleanupProgress) >= topicCleanupTopics {
-				return nil, &TopicCleanupPending{Topic: topicName, Reason: "waiting for cleanup scan capacity"}
+				return nil, &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "waiting for cleanup scan capacity"}
 			}
 		}
 		scan = c.newTopicCleanupScan(topicName, references)
@@ -195,17 +236,34 @@ func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bo
 	}
 	if !current() {
 		delete(c.cleanupProgress, topicName)
+		c.removeCleanupCheckpoint(topicName)
 		return nil, fmt.Errorf("topic cleanup intent changed")
 	}
 	scan.current = current
 	var deleted []string
-	err := reader.WithConsumerCleanupView(scan.read)
+	scan.status.State, scan.status.cause = CleanupWait, nil
+	err := withCleanupView(ctx, reader, func(view ConsumerCleanupView) error {
+		c.loadCleanupCheckpoint(scan, view.Partitions())
+		err := scan.readContext(ctx, view, time.Now)
+		if err == nil || errors.Is(err, errCleanupBudget) {
+			if saveErr := c.saveCleanupCheckpoint(scan, view); saveErr != nil {
+				return saveErr
+			}
+		}
+		return err
+	})
 	if err == nil {
 		// CommitOffset holds c.mu while consulting the topic manager. Acquire
 		// locks in that same order when applying proof; never take c.mu from a
 		// read view. Disk I/O above does not hold the global coordinator lock.
 		c.mu.Lock()
-		err = reader.WithConsumerCleanupView(func(view ConsumerCleanupView) error {
+		err = withCleanupView(ctx, reader, func(view ConsumerCleanupView) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if !current() {
+				return fmt.Errorf("topic cleanup intent changed")
+			}
 			if !scan.matches(view.Partitions()) {
 				return fmt.Errorf("committed metadata view changed before cleanup apply")
 			}
@@ -243,8 +301,17 @@ func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bo
 	if len(deleted) > 0 {
 		c.updateOffsetPartitionCount()
 		delete(c.cleanupProgress, topicName)
+		c.removeCleanupCheckpoint(topicName)
 	}
 	if err != nil {
+		scan.status.State, scan.status.cause = CleanupError, err
+		var waiting *TopicCleanupPending
+		if errors.As(err, &waiting) && waiting.State == CleanupWait {
+			scan.status.State = CleanupWait
+		}
+		if errors.Is(err, errCleanupBudget) {
+			scan.status.State = CleanupContinue
+		}
 		scan.status.Reason = err.Error()
 		status := scan.status
 		return deleted, &status
@@ -261,10 +328,14 @@ func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bo
 			writerAvailable := c.offsetRecordWriter != nil
 			c.offsetRecordWriterMu.RUnlock()
 			if !writerAvailable {
-				return deleted, &TopicCleanupPending{Topic: topicName, Group: reference.Name, Reason: "durable group writer unavailable"}
+				return deleted, &TopicCleanupPending{Topic: topicName, Group: reference.Name, State: CleanupWait, Reason: "durable group writer unavailable"}
 			}
 			if err := c.deleteGroupWithFenceLocked(reference.Name, topicName, target.group); err != nil {
 				scan.status.Group = reference.Name
+				scan.status.State, scan.status.cause = CleanupError, err
+				if errors.Is(err, errCleanupBudget) {
+					scan.status.State = CleanupContinue
+				}
 				scan.status.Reason = err.Error()
 				status := scan.status
 				return deleted, &status
@@ -275,6 +346,7 @@ func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bo
 	remaining := c.TopicGroupReferences(topicName)
 	if len(remaining) == 0 {
 		delete(c.cleanupProgress, topicName)
+		c.removeCleanupCheckpoint(topicName)
 		return deleted, nil
 	}
 	scan.status.Group = remaining[0].Name
@@ -282,6 +354,10 @@ func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bo
 		scan.status.Epoch = target.epoch
 	}
 	scan.status.Reason = "waiting for a newer committed group tombstone"
+	if len(deleted) > 0 {
+		scan.status.State = CleanupContinue
+		scan.status.Reason = "more cleanup targets remain"
+	}
 	status := scan.status
 	return deleted, &status
 }
@@ -336,7 +412,23 @@ func (c *Coordinator) newTopicCleanupScan(topicName string, refs []TopicGroupRef
 	return scan
 }
 
+func withCleanupView(ctx context.Context, reader consumerCleanupReader, fn func(ConsumerCleanupView) error) error {
+	if r, ok := reader.(interface {
+		WithConsumerCleanupViewContext(context.Context, func(ConsumerCleanupView) error) error
+	}); ok {
+		return r.WithConsumerCleanupViewContext(ctx, fn)
+	}
+	return reader.WithConsumerCleanupView(fn)
+}
+
 func (scan *topicCleanupScan) read(view ConsumerCleanupView) error {
+	return scan.readContext(context.Background(), view, time.Now)
+}
+
+func (scan *topicCleanupScan) readContext(ctx context.Context, view ConsumerCleanupView, now func() time.Time) error {
+	started := now()
+	progressed := false
+
 	partitions := view.Partitions()
 	if len(partitions) == 0 {
 		return fmt.Errorf("consumer metadata partitions unavailable")
@@ -348,7 +440,7 @@ func (scan *topicCleanupScan) read(view ConsumerCleanupView) error {
 		}
 		old := scan.partitions[i]
 		reset = partition.Identity != old.Identity || partition.Generation != old.Generation ||
-			partition.Start != old.Start || partition.End < old.End
+			partition.Start != old.Start || partition.End < old.End || partition.DurableGeneration != old.DurableGeneration
 	}
 	if reset {
 		metrics.ConsumerCleanupReplayInvalidations.Inc()
@@ -367,8 +459,11 @@ func (scan *topicCleanupScan) read(view ConsumerCleanupView) error {
 		scan.status.Partition, scan.status.Next, scan.status.End = partition, scan.next[partition], bounds.End
 		scan.status.Segment, scan.status.Position = scan.cursors[partition].Segment, scan.cursors[partition].Position
 		for scan.next[partition] < bounds.End {
-			if records == 0 || bytes == 0 || pages == 0 {
-				return fmt.Errorf("metadata scan budget exhausted")
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if records == 0 || bytes == 0 || pages == 0 || (progressed && now().Sub(started) >= topicCleanupDuration) {
+				return errCleanupBudget
 			}
 			page, err := view.Read(partition, scan.next[partition], scan.cursors[partition], records, bytes)
 			pages--
@@ -379,6 +474,10 @@ func (scan *topicCleanupScan) read(view ConsumerCleanupView) error {
 			scan.status.Records += uint64(max(0, page.Records))
 			scan.status.Bytes += uint64(max(0, page.Bytes))
 			if err != nil {
+				var budget *types.ReplayByteBudget
+				if errors.As(err, &budget) && progressed && budget.Size <= topicCleanupBytes {
+					return errCleanupBudget
+				}
 				return err
 			}
 			if page.Records < 0 || page.Records > records || page.Bytes < 0 || page.Bytes > bytes ||
@@ -394,6 +493,7 @@ func (scan *topicCleanupScan) read(view ConsumerCleanupView) error {
 					return err
 				}
 			}
+			progressed = true
 			records -= page.Records
 			bytes -= page.Bytes
 			scan.next[partition] = page.Next
