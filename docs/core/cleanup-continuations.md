@@ -74,14 +74,18 @@ epochs/generations, accumulated lifecycle evidence, all partition bounds and
 physical cursors. It contains no event payloads. Saves occur after the first
 batch, then after 1,024 records or 8 MiB, and at the completed cut. The actual
 uncheckpointed work can include one bounded batch beyond a threshold. A failed
-save is an error with backoff; a failed/missing/stale load falls back to scanning.
+save during an incomplete scan is an error with backoff. A completed scan logs
+the cache failure and proceeds through the normal final validation and apply;
+a disposable checkpoint cannot block an already complete proof. A failed,
+missing or stale load falls back to scanning.
 
 Partitions expose a local durable 32-byte random generation file. Appends keep
 it. Every existing prefix-mutation gate overwrites and fsyncs it **before** data
 mutation; failure prevents the mutation. Bootstrap/range recovery and torn-tail
 repair also invalidate it. This file is never a remote replication proof.
 Checkpoint publication syncs the referenced active logs, writes and fsyncs a
-temporary checkpoint, then atomically replaces the previous file. Losing a new
+temporary checkpoint, then atomically replaces the previous file and syncs the
+parent directory on Unix (Windows uses write-through replacement). Losing a new
 directory entry can only lose the cache or expose an older validated checkpoint.
 
 Loading requires the same topic instance/lifecycle and durable partition tokens,

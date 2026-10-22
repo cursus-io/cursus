@@ -572,7 +572,15 @@ func requireOffsetResponsesConverge(t *testing.T, addrs []string, topicName stri
 
 func requireClusterStatusMaterialized(t *testing.T, addrs []string) {
 	t.Helper()
-	require.NoError(t, eventually(t, "cluster status materialization health", clusterReadyTimeout, func() (bool, string, error) {
+	requireClusterStatusMaterializedWithin(t, addrs, clusterReadyTimeout, nil)
+}
+
+func requireClusterStatusMaterializedWithin(t *testing.T, addrs []string, timeout time.Duration, poll func()) {
+	t.Helper()
+	require.NoError(t, eventually(t, "cluster status materialization health", timeout, func() (bool, string, error) {
+		if poll != nil {
+			poll()
+		}
 		for _, addr := range addrs {
 			client := e2e.NewBrokerClient([]string{addr})
 			response, err := client.SendCommand("admin", "CLUSTER_STATUS", 5*time.Second)

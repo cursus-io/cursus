@@ -11,6 +11,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 const (
@@ -247,7 +248,15 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		err := scan.readContext(ctx, view, time.Now)
 		if err == nil || errors.Is(err, errCleanupBudget) {
 			if saveErr := c.saveCleanupCheckpoint(scan, view); saveErr != nil {
-				return saveErr
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				if err != nil {
+					return saveErr
+				}
+				// The completed in-memory proof is still checked against the
+				// current view below. A disposable cache must not block apply.
+				util.Warn("Consumer cleanup checkpoint save failed for topic %s: %v", topicName, saveErr)
 			}
 		}
 		return err

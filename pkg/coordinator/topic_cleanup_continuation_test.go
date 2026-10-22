@@ -3,7 +3,9 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -150,4 +152,30 @@ func TestCleanupNoProgressIsAnErrorNotAContinuation(t *testing.T) {
 	require.ErrorContains(t, err, "invalid bounded metadata page")
 	require.False(t, errors.Is(err, errCleanupBudget))
 	require.Zero(t, scan.next[0])
+}
+
+func TestCleanupCheckpointSaveFailure(t *testing.T) {
+	for _, records := range []int{1, 301} {
+		t.Run(fmt.Sprint(records), func(t *testing.T) {
+			c, log := newCleanupFollower(t)
+			c.cfg.LogDir = t.TempDir()
+			c.topicHandler = &durableCleanupTestLog{log, "generation-a"}
+			log.append(cleanupMessage(t, cleanupDeletion()))
+			for i := 1; i < records; i++ {
+				log.append(types.Message{Payload: `{"group":"unrelated"}`})
+			}
+			// A file where the cache directory belongs deterministically rejects saves.
+			require.NoError(t, os.WriteFile(filepath.Dir(c.cleanupCheckpointPath("orders")), []byte("blocked"), 0o600))
+			_, err := c.ReconcileTopicGroups("orders")
+			if records == 1 {
+				require.NoError(t, err)
+				require.Nil(t, c.GetGroup("workers"))
+			} else {
+				var pending *TopicCleanupPending
+				require.ErrorAs(t, err, &pending)
+				require.Equal(t, CleanupError, pending.State)
+				require.NotNil(t, c.GetGroup("workers"), "an incomplete proof must never apply")
+			}
+		})
+	}
 }
