@@ -5,6 +5,10 @@ The identical opt-in test was run three times at incident commit
 checkpointing enabled. Linux Docker Desktop, Go 1.25.0, 2 CPU quota,
 `GOMAXPROCS=2`, 2 GiB memory limit, container writable-layer storage. Fixture
 construction and normal coordinator startup are outside the timed interval.
+The final measurements include Unix parent-directory sync. Before/after runs
+execute sequentially without overlapping local validation. Three samples are
+not sufficient to claim a general improvement in concurrent probe latency;
+host scheduling and run-to-run noise remain visible in the raw observations.
 All individual observations are in
 [`cleanup-continuations-2026-10-23.json`](../benchmarks/cleanup-continuations-2026-10-23.json).
 
@@ -17,19 +21,19 @@ counter. It is not a count of currently live consumer metadata.
 
 | Quantity | Incident version | Continuations + checkpoints |
 | --- | ---: | ---: |
-| Active scan wall time, median | 0.273 s | 1.330 s |
-| Process user + system CPU, median | 0.343 CPU-s | 0.597 CPU-s |
-| Total allocations, median | 415,097,048 B | 418,556,880 B |
-| Peak sampled live heap, median | 7,609,048 B | 7,742,272 B |
-| Concurrent operation p99, median of run p99s | 45.9 us | 56.4 us |
-| Largest concurrent operation observation | 189.7 us | 699.2 us |
+| Active scan wall time, median | 0.506 s | 1.688 s |
+| Process user + system CPU, median | 0.616 CPU-s | 0.742 CPU-s |
+| Total allocations, median | 415,128,368 B | 418,639,416 B |
+| Peak sampled live heap, median | 7,683,088 B | 7,735,552 B |
+| Concurrent operation p99, median of run p99s | 282.3 us | 46.8 us |
+| Largest concurrent operation observation | 2,385.2 us | 371.0 us |
 | Injected inter-batch wait, per run | 2,200 s | 0.440 s |
 
-Active scan throughput is approximately 205k records/s before and 42k records/s
+Active scan throughput is approximately 111k records/s before and 33k records/s
 after at the median. Persisting and checking progress costs CPU, metadata I/O
 and fsyncs; it does **not** make the decoder faster. The scheduling improvement
 removes fixed polling between successful batches. Adding observed active time
-to injected wait yields about 2,200.27 s versus 1.77 s, but these are **modelled
+to injected wait yields about 2,200.51 s versus 2.13 s, but these are **modelled
 totals**, not measured production or real-time end-to-end runs. In particular,
 the baseline was not allowed to sleep for 36 minutes and neither test includes
 the initial five-second startup tick. No production speedup ratio is claimed.
