@@ -682,12 +682,12 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 				return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 			}
 			if err := ch.Coordinator.RegisterGroup(topicName, groupName, len(topic.Partitions)); err != nil {
-				return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
+				return formatJoinAdmissionError(err, "register_group_failed")
 			}
 		}
 		joined, err = ch.Coordinator.AddConsumerWithResult(groupName, consumerID)
 		if err != nil {
-			return fmt.Sprintf("ERROR: coordinator_not_available reason=%q", err.Error())
+			return formatJoinAdmissionError(err, "coordinator_not_available")
 		}
 	} else {
 		if ch.Coordinator != nil {
