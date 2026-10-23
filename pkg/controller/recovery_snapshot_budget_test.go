@@ -13,6 +13,9 @@ func TestSnapshotReadLeaseIncludesResponseWriter(t *testing.T) {
 	for _, command := range []string{"LIST_SNAPSHOTS", "FETCH_SNAPSHOT"} {
 		t.Run(command, func(t *testing.T) {
 			cfg := config.DefaultConfig()
+			// Test owner slots, independently of the few microseconds needed to
+			// refill a full-burst reservation after charging the first response.
+			cfg.Recovery.QuantumBytes = 4096
 			limits, err := cfg.RecoverySettings().Limits()
 			require.NoError(t, err)
 			budget, err := recovery.NewBudget(limits, nil)

@@ -98,6 +98,9 @@ four total inflight requests for a distributed broker. FSM/storage locks
 are not held while waiting for recovery byte or operation admission. Atomic
 storage work retains its slot until its actual completion, including after
 cancellation. Source creation and receiver lifetime/storage limits still apply.
+Consumer-offset installation stages nonlocal metadata before acquiring its
+atomic-work slot. Each pending retry releases that slot, so a metadata provider
+can use the single default atomic-work slot without depending on its own caller.
 Source transfer leases extend through response serialization and socket writes;
 finishing the handler or canceling its context does not release a live writer.
 
@@ -294,3 +297,22 @@ All initial and final raw observations, including the failed baseline sample,
 are in [the measurement directory](benchmarks/recovery-2026-10-23/README.md).
 Final commands used `-GoImage golang:1.26.2 -Offline` with a populated module
 volume; the documented runner's default Go 1.25.0 reproduces the initial series.
+
+## Regression validation
+
+Linux race checks cover recovery/config/cluster/controller/topic/wire/server,
+including controlled transport cancellation/source replacement, exact ISR
+admission, snapshot revision/witness continuation, bootstrap lifetime/writer
+ownership and metadata-provider slot dependencies. Fake-clock tests check
+quota refill/debt, bounded waiter admission across both atomic-work waits and
+shared-source backoff when one partition disappears. The error registry treats
+`recovery_busy` as retryable availability. The generation E2E pauses fresh apply
+before replacing authority and accepts either explicit fencing or cooperative
+cancellation of the held old response; its disk/HWM/ISR invariants are unchanged.
+
+Broad Go 1.26.2 race testing also ran the other packages, command binaries, util
+and SDK. The existing `TestDurableRetentionRestartAndCorruptEvidence` failed on
+the local tmpfs fixture; the same test failed 17/20 attempts on unmodified
+baseline `2260df1`. This unrelated baseline failure is not counted as a full
+passing suite and no retention assertion or durability setting was relaxed.
+Physical-volume mixed-load tests are separate from these tmpfs correctness runs.

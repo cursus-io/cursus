@@ -156,11 +156,6 @@ func (r *replicaBootstrapRecovery) receive(ctx context.Context, a *replicaBootst
 }
 
 func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partition, manifest disk.BootstrapMetadata, receiver *disk.BootstrapReceiver, ticket *fsm.ReplicaBootstrapReceiverTicket, fenced func(bool)) (result error) {
-	releaseWork, err := r.ch.recoveryBudget.AcquireWork(ctx, manifest.Fence.SourceID)
-	if err != nil {
-		return err
-	}
-	defer releaseWork()
 	started := time.Now()
 	util.Info("replica_recovery phase=bootstrap_install topic=%q partition=%d start=%d end=%d resume=%t", manifest.Fence.Topic, manifest.Fence.Partition, manifest.StartOffset, manifest.EndOffset, receiver == nil)
 	defer func() {
@@ -224,6 +219,9 @@ func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partiti
 		return ch.ESHandler.RebuildBootstrapState(manifest.Fence.Topic, manifest.Fence.Partition, view, catalog, manifest.Fence.LifecycleEpoch)
 	}
 	if manifest.Fence.Topic == config.ConsumerOffsetsTopicName {
+		// The metadata provider may itself need the sole atomic-work slot.
+		// RunConsumerMetadataBootstrap acquires it after staging dependencies
+		// and releases it between pending retries, before this backoff wait.
 		identity := coordinator.ConsumerBootstrapIdentity{Partition: manifest.Fence.Partition, Lifecycle: manifest.Fence.LifecycleEpoch, Attempt: manifest.TransferID}
 		delay := 10 * time.Millisecond
 		for {
@@ -241,6 +239,11 @@ func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partiti
 			delay = min(delay*2, time.Second)
 		}
 	}
+	releaseWork, err := r.ch.recoveryBudget.AcquireWork(ctx, manifest.Fence.SourceID)
+	if err != nil {
+		return err
+	}
+	defer releaseWork()
 	releaseLifecycle, err := ch.topicLifecycleGates.acquire(ctx, manifest.Fence.Topic, false)
 	if err != nil {
 		return err

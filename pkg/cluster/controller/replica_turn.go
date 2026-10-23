@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/util"
 )
 
 // replicaTurn is owned by exactly one scheduler entry. Network waits never own
@@ -45,6 +47,17 @@ func (cc *ClusterController) advanceReplicaTurn(ctx context.Context, candidate f
 		return
 	}
 	r := *turn.request
+	started, start := time.Now(), r.NextOffset
+	phase, exchanges := "incremental", 0
+	defer func() {
+		var lag uint64
+		if r.CommittedHWM > r.NextOffset {
+			lag = r.CommittedHWM - r.NextOffset
+		}
+		// Preserve the recovery diagnostics used to audit rejected generations,
+		// divergence boundaries and total exchanges across resumable turns.
+		util.Debug("replica_recovery phase=%s protocol=%d topic=%q partition=%d source=%q leader_epoch=%d lifecycle=%d start=%d current=%d target=%d remaining=%d exchanges=%d elapsed_ms=%d error=%q", phase, r.RecoveryProtocol, r.Topic, r.Partition, r.SourceBroker, r.LeaderEpoch, r.LifecycleEpoch, start, r.NextOffset, r.CommittedHWM, lag, exchanges, time.Since(started).Milliseconds(), fmt.Sprint(result.err))
+	}()
 	if turn.witness != nil {
 		// Recheck authority even when a previous proof RPC failed or its reply
 		// was lost. A changed HWM requires a new exact proof, not readmission.
@@ -54,6 +67,7 @@ func (cc *ClusterController) advanceReplicaTurn(ctx context.Context, candidate f
 			return
 		}
 		if r.SnapshotCatchup && !turn.snapshotDone {
+			phase = "snapshot_replay"
 			if cc.snapshotStep == nil {
 				result.err = fmt.Errorf("resumable snapshot recovery unavailable")
 				return
@@ -71,6 +85,7 @@ func (cc *ClusterController) advanceReplicaTurn(ctx context.Context, candidate f
 			return
 		}
 		if cc.proofSubmitter == nil {
+			phase = "prefix_verified"
 			result.done = true
 			return
 		}
@@ -80,6 +95,7 @@ func (cc *ClusterController) advanceReplicaTurn(ctx context.Context, candidate f
 			return
 		}
 		if found {
+			phase = "proof_submitted"
 			result.err = cc.proofSubmitter(ctx, proof)
 			result.done = result.err == nil
 			return
@@ -97,6 +113,7 @@ func (cc *ClusterController) advanceReplicaTurn(ctx context.Context, candidate f
 	if cc.Config != nil {
 		port = cc.Config.DiscoveryPort
 	}
+	exchanges++
 	batch, err := fetcher.FetchReplicaCatchup(ctx, r.SourceAddress, port, r)
 	if err != nil {
 		var network net.Error
@@ -113,6 +130,7 @@ func (cc *ClusterController) advanceReplicaTurn(ctx context.Context, candidate f
 	if err = validateReplicaCatchupBatch(r, batch); err != nil {
 		// Bootstrap retains its process-owned lifetime and storage admission.
 		if errors.Is(err, fsm.ErrReplicaBootstrapRequired) && cc.replicaBootstrap != nil {
+			phase = "bootstrap_required"
 			result.err = cc.replicaBootstrap.RecoverReplicaBootstrap(ctx, r, batch)
 			result.done = result.err == nil
 			return
@@ -122,6 +140,7 @@ func (cc *ClusterController) advanceReplicaTurn(ctx context.Context, candidate f
 		return
 	}
 	if _, needed := fsm.ReplicaPrefixRefinement(r, batch); needed {
+		phase = "prefix_refinement"
 		turn.refinements++
 		if turn.refinements > 64 {
 			result.err = fmt.Errorf("indexed prefix refinement did not converge")
@@ -144,6 +163,7 @@ func (cc *ClusterController) advanceReplicaTurn(ctx context.Context, candidate f
 		return
 	}
 	if batch.TruncateTo != nil {
+		phase, r.NextOffset = "divergence_repaired", *batch.TruncateTo
 		*turn = replicaTurn{}
 		return
 	}

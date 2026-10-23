@@ -9,6 +9,7 @@ func TestSnapshotRecoveryErrorClassification(t *testing.T) {
 		retryable bool
 	}{
 		{"snapshot_generation_changed", ErrorClassAvailability, true},
+		{"recovery_busy", ErrorClassAvailability, true},
 		{"snapshot_lifecycle_changed", ErrorClassFencing, false},
 	} {
 		if !IsKnownErrorCode(test.code) {

@@ -43,6 +43,7 @@ func verifyRetainedBootstrap(t *testing.T, crash bool) {
 	actions.WaitForTopicMetadata()
 	const unrelated, group = "bootstrap-unrelated", "bootstrap-unrelated-reader"
 	require.NoError(t, client.CreateTopic(unrelated, 1, true))
+	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), unrelated, 0)
 	require.NoError(t, client.PublishIdempotent(unrelated, "unrelated-producer", 1, 0, "preserved", "all", true))
 	reader, generation, member := joinRecoveryGroup(t, ctx.GetBrokerAddrs(), unrelated, group)
 	defer reader.Close()

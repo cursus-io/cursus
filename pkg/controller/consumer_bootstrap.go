@@ -119,6 +119,24 @@ func (ch *CommandHandler) RunConsumerMetadataBootstrap(ctx context.Context, iden
 		return err
 	}
 	defer plan.close()
+	// Dependency staging can perform network transfers and atomic storage work.
+	// Reserve installation only after that work returns, before any drain/FSM/
+	// storage gate. Otherwise a one-slot budget deadlocks its own provider.
+	source := "consumer-bootstrap-install"
+	if receiver != nil {
+		source = receiver.Manifest().Fence.SourceID
+	} else if local := ch.TopicManager.GetTopic(config.ConsumerOffsetsTopicName); local != nil {
+		if p, err := local.GetPartition(identity.Partition); err == nil {
+			if manifest, _ := p.BootstrapStatus(); manifest != nil {
+				source = manifest.Fence.SourceID
+			}
+		}
+	}
+	releaseWork, err := ch.recoveryBudget.AcquireWork(ctx, source)
+	if err != nil {
+		return err
+	}
+	defer releaseWork()
 	release, err := ch.Coordinator.BeginConsumerMetadataRecovery(ctx)
 	if err != nil {
 		return err
