@@ -60,6 +60,7 @@ type TopicCleanupPending struct {
 	End       uint64 `json:"end"`
 	Records   uint64 `json:"records"`
 	Bytes     uint64 `json:"bytes"`
+	ReadBytes uint64 `json:"read_bytes"`
 	Reads     uint64 `json:"reads"`
 	Segment   uint64 `json:"segment"`
 	Position  uint64 `json:"position"`
@@ -75,6 +76,11 @@ const (
 )
 
 var errCleanupBudget = errors.New("metadata scan budget exhausted")
+
+// Reserve the complete read/decode/validation lifetime, not just the disk
+// buffer. One process may host more than one Coordinator. Try acquisition is
+// required because callers already pin lifecycle and partition read views.
+var cleanupReplaySlot = make(chan struct{}, 1)
 
 func (p *TopicCleanupPending) Unwrap() error { return p.cause }
 
@@ -564,6 +570,15 @@ func (scan *topicCleanupScan) read(view ConsumerCleanupView) error {
 }
 
 func (scan *topicCleanupScan) readContext(ctx context.Context, view ConsumerCleanupView, now func() time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case cleanupReplaySlot <- struct{}{}:
+		defer func() { <-cleanupReplaySlot }()
+	default:
+		return &TopicCleanupPending{State: CleanupWait, Reason: "cleanup replay memory reservation busy"}
+	}
 	started := now()
 	progressed := false
 
@@ -614,36 +629,61 @@ func (scan *topicCleanupScan) readContext(ctx context.Context, view ConsumerClea
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if records == 0 || bytes == 0 || pages == 0 || (progressed && now().Sub(started) >= topicCleanupDuration) {
+			if records == 0 || bytes <= 0 || pages == 0 || (progressed && now().Sub(started) >= topicCleanupDuration) {
 				return errCleanupBudget
 			}
-			page, err := view.Read(partition, scan.next[partition], scan.cursors[partition], records, bytes)
-			pages--
-			scan.status.Reads++
-			metrics.ConsumerCleanupReplayReads.Inc()
-			metrics.ConsumerCleanupReplayRecords.Add(float64(max(0, page.Records)))
-			metrics.ConsumerCleanupReplayBytes.Add(float64(max(0, page.Bytes)))
-			scan.status.Records += uint64(max(0, page.Records))
-			scan.status.Bytes += uint64(max(0, page.Bytes))
+			read := func(recordLimit, byteLimit int) (ConsumerCleanupPage, error) {
+				page, err := view.Read(partition, scan.next[partition], scan.cursors[partition], recordLimit, byteLimit)
+				pages--
+				scan.status.Reads++
+				metrics.ConsumerCleanupReplayReads.Inc()
+				metrics.ConsumerCleanupReplayRecords.Add(float64(max(0, page.Records)))
+				metrics.ConsumerCleanupReplayBytes.Add(float64(max(0, page.Bytes)))
+				scan.status.Records += uint64(max(0, page.Records))
+				scan.status.Bytes += uint64(max(0, page.Bytes))
+				scan.status.ReadBytes += uint64(max(0, page.ReadBytes))
+				return page, err
+			}
+			page, err := read(records, bytes)
+			limitRecords, limitBytes := records, bytes
 			if err != nil {
 				var budget *types.ReplayByteBudget
-				if errors.As(err, &budget) && progressed && budget.Size <= topicCleanupBytes {
-					return errCleanupBudget
+				if errors.As(err, &budget) && budget.Size > bytes && budget.Size <= util.MaxMessageSize &&
+					page.Records == 0 && page.Bytes == 0 && len(page.Messages) == 0 {
+					if progressed || pages == 0 {
+						return errCleanupBudget
+					}
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					// The reserved slot admits one full storage record, including
+					// its envelope, through validation. Retry the ORIGINAL cursor;
+					// a length-only probe cannot advance a validated checkpoint.
+					limitRecords, limitBytes = 1, budget.Size
+					page, err = read(limitRecords, limitBytes)
 				}
-				return err
+				if err != nil {
+					return err
+				}
 			}
-			if page.Records < 0 || page.Records > records || page.Bytes < 0 || page.Bytes > bytes ||
+			if page.Records < 0 || page.Records > limitRecords || page.Bytes < 0 || page.Bytes > limitBytes ||
 				page.Next < scan.next[partition] || page.Next > bounds.End ||
 				(page.Next == scan.next[partition] && page.Cursor == scan.cursors[partition]) {
 				return fmt.Errorf("invalid bounded metadata page")
 			}
 			for _, message := range page.Messages {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				if message.Offset < scan.next[partition] || message.Offset >= page.Next {
 					return fmt.Errorf("metadata record outside committed page")
 				}
 				if err := scan.observeAt(message, partition); err != nil {
 					return err
 				}
+			}
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 			progressed = true
 			records -= page.Records
@@ -667,7 +707,8 @@ func (scan *topicCleanupScan) observeAt(message types.Message, partition int) er
 		return validateCleanupTransactionControl(message)
 	}
 	var identity struct {
-		Group string `json:"group"`
+		Group   string          `json:"group"`
+		Version json.RawMessage `json:"version"`
 	}
 	if err := json.Unmarshal([]byte(message.Payload), &identity); err != nil {
 		return fmt.Errorf("malformed consumer metadata")
@@ -679,6 +720,15 @@ func (scan *topicCleanupScan) observeAt(message types.Message, partition int) er
 			key := consumerMetadataRecordKey(ConsumerMetadataRecord{Type: ConsumerMetadataRecordTombstone, Group: name})
 			if message.Key == key {
 				return fmt.Errorf("consumer metadata key/group mismatch")
+			}
+		}
+		// Size and unrelated identity never exempt a versioned record from
+		// schema/key validation. Legacy offset objects retain their existing
+		// syntax-only treatment and cannot supply lifecycle evidence.
+		if len(identity.Version) != 0 {
+			record, versioned, err := decodeConsumerMetadataRecord(message.Payload)
+			if err != nil || !versioned || message.Key != consumerMetadataRecordKey(record) {
+				return fmt.Errorf("invalid consumer metadata for unrelated group")
 			}
 		}
 		return nil

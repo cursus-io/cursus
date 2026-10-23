@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -39,10 +40,12 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 				requireReplicaOffsetsEventually(t, addrs, name, 0)
 			}
 			requireClusterStatusMaterialized(t, addrs)
+			seedLargeCleanupHistory(t, ctx)
 			proof := &cleanupRetainedProof{}
 			proof.advance(t, addrs)
 			client, generation, member := joinRecoveryGroup(t, addrs, cleanupRecoveryTopic, cleanupRecoveryGroup)
 			defer client.Close()
+			stopSetupHeartbeat := keepCleanupSetupMemberAlive(t, addrs, generation, member)
 			owner := coordinatorNode(t, findGroupCoordinator(t, 1, cleanupRecoveryGroup))
 			for _, node := range survivorNodes(owner) {
 				heartbeatGroup(t, client, cleanupRecoveryTopic, cleanupRecoveryGroup, generation, member)
@@ -85,7 +88,17 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 			liveState, err := live.GetConsumerGroupStatus(liveGroup)
 			require.NoError(t, err)
 			require.Len(t, liveState.Members, 1)
+			var liveRequestLatency []time.Duration
+			defer func() {
+				if len(liveRequestLatency) == 0 {
+					return
+				}
+				sort.Slice(liveRequestLatency, func(i, j int) bool { return liveRequestLatency[i] < liveRequestLatency[j] })
+				t.Logf("%s unrelated status+heartbeat+offset+status latency samples=%d p50=%s p99=%s max=%s", operation, len(liveRequestLatency), liveRequestLatency[len(liveRequestLatency)/2], liveRequestLatency[(len(liveRequestLatency)-1)*99/100], liveRequestLatency[len(liveRequestLatency)-1])
+			}()
 			verifyLive := func() {
+				started := time.Now()
+				defer func() { liveRequestLatency = append(liveRequestLatency, time.Since(started)) }()
 				status, err := live.GetConsumerGroupStatus(liveGroup)
 				require.NoError(t, err)
 				require.Equal(t, liveState.Generation, status.Generation)
@@ -101,6 +114,7 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 				require.NoError(t, err)
 			}
 			verifyLive()
+			stopSetupHeartbeat()
 			leaveCleanupGroup(t, client, generation, member)
 			// Avoid the Raft leader: administrative admission on that broker
 			// refreshes its cache and need not retain the stale follower state.
@@ -114,6 +128,10 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 			}
 			require.NotZero(t, follower)
 			cleanupFaultFile(t, owner, "arm-ack")
+			if os.Getenv("RUN_E2E_CLEANUP_LARGE") == "1" {
+				output, err := exec.Command("docker", "exec", cleanupContainerName(follower), "touch", faultSentinelRoot+"/consumer-cleanup-after-large").CombinedOutput()
+				require.NoError(t, err, string(output))
+			}
 			cleanupFaultFile(t, follower, "arm-read")
 			command := operation + " topic=" + cleanupRecoveryTopic
 			if operation == "TRUNCATE" {
@@ -137,7 +155,12 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 			first := waitCleanupReadPending(t, addrs[follower-1], pending.Reads+1, verifyLive)
 			require.Equal(t, pending.Records, first.Records)
 			require.Equal(t, pending.Bytes, first.Bytes)
-			require.GreaterOrEqual(t, first.Records, uint64(128))
+			if os.Getenv("RUN_E2E_CLEANUP_LARGE") == "1" {
+				require.Greater(t, first.Bytes, uint64(1<<20), "fault must follow validated large-record progress")
+				require.GreaterOrEqual(t, first.Records, uint64(2))
+			} else {
+				require.GreaterOrEqual(t, first.Records, uint64(128))
+			}
 			require.Positive(t, first.Bytes)
 			second := waitCleanupReadPending(t, addrs[follower-1], first.Reads+2, verifyLive)
 			require.Equal(t, first.Partition, second.Partition)
@@ -152,6 +175,10 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 			proof.verify(t, addrs)
 			logCleanupRecoveryWork(t, []int{1, 2, 3}, operation+" fault held")
 			cleanupFaultFile(t, follower, "release-read")
+			if os.Getenv("RUN_E2E_CLEANUP_LARGE") == "1" {
+				cleanupBrokerCommand(t, "restart", follower)
+				require.NoError(t, actions.waitForNodeHealth(follower, clusterHealthCheckAddrs(3)[follower-1]))
+			}
 			requireClusterStatusMaterializedWithin(t, addrs, 2*time.Minute, verifyLive)
 			requireCleanupGroupAbsent(t, addrs)
 			verifyLive()

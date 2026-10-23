@@ -15,6 +15,11 @@ func consumerCleanupReadFault(cursor types.ReplayCursor) error {
 	if os.Getenv("CURSUS_E2E_FAULTS") != "1" || !cursor.Initialized {
 		return nil
 	}
+	// Large-record scenarios place the interruption after the exceptional
+	// record has been validated and checkpointed, not after its small prefix.
+	if _, err := os.Stat("/run/cursus-e2e-faults/consumer-cleanup-after-large"); err == nil && cursor.Position <= 1<<20 {
+		return nil
+	}
 	_, err := os.Stat("/run/cursus-e2e-faults/consumer-cleanup-read")
 	if os.IsNotExist(err) {
 		return nil

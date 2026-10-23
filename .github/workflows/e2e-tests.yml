@@ -166,6 +166,7 @@ jobs:
       - name: Run cleanup failover, snapshot and re-registration recovery
         env:
           RUN_E2E_CLEANUP_RECOVERY: "1"
+          RUN_E2E_CLEANUP_LARGE: "1"
         run: go test -v -count=1 -timeout 25m ./test/e2e-cluster -run '^(TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot|TestTruncateReregistrationConvergesDelayedFollower)$'
       - name: Show cleanup recovery cluster logs
         if: failure()
@@ -190,6 +191,7 @@ jobs:
       - name: Run committed cleanup acknowledgement and read faults
         env:
           RUN_E2E_CLEANUP_INJECTION: "1"
+          RUN_E2E_CLEANUP_LARGE: "1"
         run: go test -v -count=1 -timeout 25m ./test/e2e-cluster -run '^TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure$'
       - name: Show cleanup injection logs
         if: failure()
