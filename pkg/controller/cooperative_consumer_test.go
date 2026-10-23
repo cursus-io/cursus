@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"testing"
 )
@@ -48,4 +49,23 @@ func TestCooperativeLifecycleErrorPreservesRetryClassification(t *testing.T) {
 	require.True(t, ok)
 	require.True(t, parsed.Retryable)
 	require.Equal(t, "coordinator_not_available", parsed.Code)
+}
+
+func TestCooperativeDistributedActivationSurvivesLocalFlagDisable(t *testing.T) {
+	state := fsm.NewBrokerFSM(nil, nil)
+	require.Nil(t, state.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"local","incarnation_id":"process","lifecycle_protocol":10,"recovery_protocol":2}`)}))
+	ch := newCoordinatorRoutingHandler("local", state, nil)
+	t.Cleanup(func() { require.NoError(t, ch.Close()) })
+	ch.Config.ConsumerCooperativeEnabled = true
+	require.False(t, ch.cooperativeEnabled(), "local trigger alone cannot activate distributed membership")
+	require.Nil(t, state.Apply(&raft.Log{Data: []byte(`COOPERATIVE_CONSUMER_ACTIVATE:{"voters":["local"]}`)}))
+	ch.Config.ConsumerCooperativeEnabled = false
+	require.True(t, ch.cooperativeEnabled(), "durable activation survives local configuration changes")
+	require.Contains(t, ch.handleHelp(), "consumer_cooperative_v1")
+}
+
+func TestCooperativeTokenlessFetchToleratesMissingFSMBeforeActivation(t *testing.T) {
+	ch := newCoordinatorRoutingHandler("local", nil, nil)
+	t.Cleanup(func() { require.NoError(t, ch.Close()) })
+	require.NoError(t, ch.validateCooperativeFetch(CommonArgs{TopicName: "orders", GroupName: "workers"}))
 }

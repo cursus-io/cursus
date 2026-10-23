@@ -30,13 +30,18 @@ full lifecycle checkpoint. Expiration rechecks clocks and session identities
 under the mutation lock. Publication follows durable metadata append.
 
 CONSUME, STREAM, COMMIT_OFFSET and transaction offset authorization carry the
-same token. Reads consult the authoritative coordinator, including when the
-data leader differs. SDK delivery checks cancellation, and commit submission checks the worker
+same token. Reads validate ownership immediately before delivery, including when
+the data leader differs. The existing stable-offset lookup already requires the
+authoritative coordinator on each page, including for eager groups. Activation
+adds one final ownership check, including for tokenless reads, to reject silent
+protocol downgrade. No long-lived eager-mode cache can authorize a later
+cooperative group without a durable invalidation protocol. SDK delivery checks
+cancellation, and commit submission checks the worker
 identity. Delayed operations keep their original grant; they never acquire the
 replacement worker's authority. An already authorized operation may complete
 while revocation is pending.
 
-Existing eager commands keep their behavior. Activation is explicit and requires
+Existing eager commands retain their protocol and assignment behavior. Activation is explicit and requires
 capable registered processes and voters; admission must reject later incompatible
 processes. Persist the activation barrier in a versioned controller snapshot.
 An old SDK cannot silently downgrade a cooperative group. Binary downgrade is
@@ -70,7 +75,10 @@ Set `consumer_cooperative_enabled: true` (`--consumer-cooperative-enabled` or
 `CONSUMER_COOPERATIVE_ENABLED=true`) on all brokers after upgrading every
 registered broker and Raft voter. Activation requires lifecycle protocol 10 and
 bootstrap recovery protocol 2. It is durable and rejects incompatible later
-registrations. Cooperative groups cannot switch back to eager membership.
+registrations. In distributed mode the durable activation state remains the gate
+even when a restarted broker has its local trigger flag disabled; standalone
+mode continues to use the local flag. Cooperative groups cannot switch back to
+eager membership.
 
 The Raft directory marker advances to 13 when this binary starts, including when
 cooperative activation is disabled. Activated controller snapshots use version
@@ -114,7 +122,9 @@ configured minimum if larger). Healthy polling retains its configured cadence.
 Partition fetch connections retain their cursors until reconnect.
 
 An ambiguous lifecycle append closes ownership admission until strict metadata
-recovery resolves it. Standalone mode requires restart for that recovery; it
+recovery resolves it. Successful full strict replay atomically clears lifecycle
+fences; failed or scoped replay cannot clear them. Standalone mode requires
+restart for that recovery; it
 does not reuse a possibly persisted ownership revision. Transient coordinator
 routing and metadata append outages remain retryable without weakening grant fences.
 
@@ -147,16 +157,16 @@ controlled comparison of commit policies: eager commits asynchronously every
 | Measurement | Eager/sticky | Cooperative |
 | --- | ---: | ---: |
 | Unique records per run | 960 | 960 |
-| Handler throughput, records/s | 2,201–2,225 | 670–765 |
-| Backlog drain after join | 380–390 ms | 1,170–1,343 ms |
-| Partition 0 maximum processing gap | 43–55 ms | 106–628 ms |
-| Duplicate handler deliveries | 144 | 0–17 |
-| Duplicate payload bytes | 18,432 | 0–2,176 |
+| Handler throughput, records/s | 2,551–3,356 | 1,360–1,406 |
+| Backlog drain after join | 250–331 ms | 632–660 ms |
+| Partition 0 maximum processing gap | 13–64 ms | 38–51 ms |
+| Duplicate handler deliveries | 96–144 | 5–15 |
+| Duplicate payload bytes | 12,288–18,432 | 640–1,920 |
 
 Cooperative reduced replay in these runs, but did **not** improve throughput or
 consistently improve the processing gap. It constructed six initial workers and
 three workers on the joining member, with no replacement workers for retained
-grants. Total fetched work was 960–984 records / 122,880–125,952 payload bytes;
+grants. Total fetched work was 968–976 records / 123,904–124,928 payload bytes;
 fetched but cancelled records are counted even if never delivered to a handler.
 The benchmark stops after all unique records reach handlers; the cluster test
 separately waits for every committed consumer offset to reach the log end.

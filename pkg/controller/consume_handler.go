@@ -164,9 +164,6 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 }
 
 func (ch *CommandHandler) readFromTopicBounded(topicName string, cArgs CommonArgs, ctx *ClientContext, batchSize, maxBytes int, allowOversizedFirst bool) ([]types.Message, int, error) {
-	if err := ch.validateCooperativeFetch(cArgs); err != nil {
-		return nil, 0, err
-	}
 	t, p, err := ch.getTopicAndPartition(topicName, cArgs.PartitionID)
 	if err != nil {
 		return nil, 0, err
@@ -373,9 +370,6 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	// delivered offset so empty filtered pages cannot strand later visible data.
 	scanOffset := actualOffset
 	readFn := func(offset uint64, max int) ([]types.Message, error) {
-		if err := ch.validateCooperativeFetch(cArgs); err != nil {
-			return nil, err
-		}
 		stable, found, err := ch.stableGroupOffset(cArgs.GroupName, cArgs.TopicName, cArgs.PartitionID)
 		if err != nil {
 			return nil, err

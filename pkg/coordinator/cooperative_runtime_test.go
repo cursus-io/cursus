@@ -205,3 +205,45 @@ func TestCooperativeRuntimeRejectsNegativeLegacyGeneration(t *testing.T) {
 	require.Nil(t, c.ExportGroupState("workers").Cooperative)
 	require.Len(t, *records, writes)
 }
+
+func TestCooperativeRuntimeStrictRecoveryClearsAmbiguousLifecycleFence(t *testing.T) {
+	for _, persisted := range []bool{false, true} {
+		t.Run(fmt.Sprint(persisted), func(t *testing.T) {
+			c := newAuthorityTestCoordinator(t)
+			reader := strictReader(c)
+			fail := false
+			c.SetRoutedOffsetRecordWriter(func(record ConsumerMetadataRecord) error {
+				c.RecordConsumerMetadataSource(record.Group, 0)
+				if !fail || persisted {
+					reader.messages[0] = append(reader.messages[0], encodedMetadataMessage(t, record, uint64(len(reader.messages[0]))))
+				}
+				if fail {
+					return errors.New("ambiguous append")
+				}
+				return nil
+			})
+			require.NoError(t, c.RegisterGroup("orders", "workers", 2))
+			parts := []CooperativePartition{{Topic: "orders", Partition: 0, LifecycleEpoch: 1}, {Topic: "orders", Partition: 1, LifecycleEpoch: 1}}
+			a := runtimeJoin(t, c, parts, "a")
+			fail = true
+			_, err := c.ReconcileCooperative("workers", "b", 0, 0, parts, nil, false)
+			require.ErrorContains(t, err, "ambiguous append")
+			require.True(t, c.lifecyclePending["workers"])
+			release := acquireReplay(t, c)
+			reader.read = func(int, uint64, int) ([]types.Message, error) { return nil, errors.New("log unavailable") }
+			_, err = c.PrepareFullConsumerMetadataReplay(reader)
+			require.Error(t, err)
+			require.True(t, c.lifecyclePending["workers"], "failed recovery must remain fenced")
+			reader.read = nil
+			prepared, err := c.PrepareFullConsumerMetadataReplay(reader)
+			require.NoError(t, err)
+			require.NoError(t, c.ApplyFullConsumerMetadataReplayAndComplete(prepared))
+			release()
+			require.False(t, c.lifecyclePending["workers"])
+			fail = false
+			a = runtimeHeartbeat(t, c, parts, a, nil)
+			require.NoError(t, c.CommitCooperative("workers", a.RegistrationEpoch, a.Grants[0], 1))
+			runtimeJoin(t, c, parts, "b")
+		})
+	}
+}

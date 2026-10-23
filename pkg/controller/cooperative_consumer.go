@@ -12,15 +12,15 @@ import (
 )
 
 func (ch *CommandHandler) cooperativeEnabled() bool {
-	if ch.Config == nil || !ch.Config.ConsumerCooperativeEnabled {
-		return false
+	if ch.isDistributed() {
+		return ch.Cluster.RaftManager != nil && ch.Cluster.RaftManager.GetFSM() != nil && ch.Cluster.RaftManager.GetFSM().CooperativeConsumerEnabled()
 	}
-	return !ch.isDistributed() || (ch.Cluster.RaftManager != nil && ch.Cluster.RaftManager.GetFSM() != nil && ch.Cluster.RaftManager.GetFSM().CooperativeConsumerEnabled())
+	return ch.Config != nil && ch.Config.ConsumerCooperativeEnabled
 }
 
 func (ch *CommandHandler) cooperativeTopic(name string) (topic.Definition, error) {
 	if ch.isDistributed() {
-		if ch.Cluster.RaftManager == nil {
+		if ch.Cluster.RaftManager == nil || ch.Cluster.RaftManager.GetFSM() == nil {
 			return topic.Definition{}, fmt.Errorf("ERROR: coordinator_not_available")
 		}
 		definition, ok := ch.Cluster.RaftManager.GetFSM().GetTopicDefinition(name)
@@ -156,7 +156,7 @@ func (ch *CommandHandler) validateCooperativeToken(group string, token *protocol
 // Used for both local and remote data leaders; a missing token must also be
 // checked at the authoritative coordinator, never a stale follower group map.
 func (ch *CommandHandler) validateCooperativeFetch(args CommonArgs) error {
-	if args.Ownership == nil && ch.isDistributed() && (ch.Cluster.RaftManager == nil || !ch.Cluster.RaftManager.GetFSM().CooperativeConsumerEnabled()) {
+	if args.Ownership == nil && ch.isDistributed() && (ch.Cluster.RaftManager == nil || ch.Cluster.RaftManager.GetFSM() == nil || !ch.Cluster.RaftManager.GetFSM().CooperativeConsumerEnabled()) {
 		return nil
 	}
 	if ch.isDistributed() {
