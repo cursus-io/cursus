@@ -243,13 +243,28 @@ consumers:
 1. A fresh `JOIN_GROUP` atomically establishes the topic and partition set when
    the group does not exist; `REGISTER_GROUP` can provision an empty group explicitly.
 2. The join creates a broker-assigned member ID, increments the
-   generation, and runs deterministic range assignment.
+   generation, and runs deterministic sticky assignment. Valid existing owners
+   are retained while member partition counts differ by at most one.
 3. `SYNC_GROUP` confirms assignments for that member and generation.
 4. `HEARTBEAT` refreshes the session only when both values are current.
 5. `COMMIT_OFFSET` and `BATCH_COMMIT` apply only to partitions owned by
    that member in the current generation.
 6. `LEAVE_GROUP` or session expiration removes membership, increments the
    generation once, and reassigns partitions.
+
+Sticky assignment reduces partition movement, but retains the eager generation
+contract: every membership change fences the previous generation, including
+partitions whose owner did not change. SDKs still rejoin and restart workers.
+This is not cooperative handoff and does not guarantee uninterrupted processing
+or fewer application replay bytes. Fresh joins receive new broker-assigned IDs;
+this change does not introduce static membership across restarts.
+
+New lifecycle snapshots persist the resulting assignment in the existing format.
+Historical Raft membership commands retain their original range assignment on
+replay so subsequent historical offset commits keep the same ownership meaning.
+An older broker can read the new lifecycle snapshots; if it becomes coordinator,
+its next membership change may use range assignment again under a new generation.
+No new SDK capability or metadata version is activated by sticky assignment.
 
 After a transient connection failure, a client should first send:
 
@@ -313,7 +328,7 @@ above.
 ### Embedded Channel Layer Limitations
 
 - **Static direct registration**: In-process consumers cannot be added or removed without re-registration.
-- **Coordinator boundary**: Dynamic membership and range rebalancing belong to the text protocol coordinator.
+- **Coordinator boundary**: Dynamic membership and sticky rebalancing belong to the text protocol coordinator.
 - **Channel-only layer**: Network consumers use `CONSUME` or `STREAM` instead.
 
 ## Embedded Channel Registration Lifecycle
@@ -377,7 +392,7 @@ flowchart TD
 # Summary
 
 Network consumers use the broker coordinator for generation-fenced membership,
-range assignment, replicated timeout removal, and durable offsets. Separate
+sticky assignment, replicated timeout removal, and durable offsets. Separate
 groups retain independent offsets and assignments. The in-process TopicManager
 channel layer uses static modulo distribution and buffered goroutines; its
 registration lifecycle should not be confused with the dynamic protocol
