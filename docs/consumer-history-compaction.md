@@ -2,8 +2,9 @@
 
 ## Implementation and rollout contract
 
-Official main `2260df1` now contains the large-record and durable append-time
-changes. They are incorporated through the existing PRs. Production metadata
+Official main `c8199d9` contains the large-record, durable append-time and
+cooperative ownership/recovery changes. They are incorporated through the
+existing PRs. Production metadata
 uses producer ID `consumer-offset-coordinator`; fixtures must use that ID too.
 Keep both the last physical producer record and the maximum positive
 epoch/sequence/offset record used by partition recovery. Kafka 4.1.0 LogCleaner
@@ -29,7 +30,7 @@ producer/control state have an equivalent certified representation.
 ## Scope and comparison before implementation
 
 The implementation base is official main
-`2260df1`. Its distributed internal-topic
+`c8199d9`. Its distributed internal-topic
 compaction guard remains necessary. The recovery index is disposable and must
 never authorize deleting authoritative records.
 
@@ -62,6 +63,14 @@ removing ordinary snapshots. Completed transactions materialize ordinary offset
 snapshots separately; those snapshots may be compacted after replay equivalence.
 Reservation and decision snapshots remain ordinary metadata and are compared in
 full. Certification never installs replayed state or changes membership clocks.
+
+Cooperative metadata v6 is a complete lifecycle snapshot: retain its member
+sessions, current grants, target assignments and pending revocation revisions.
+The certificate compares those fields as part of the entire recovered state.
+Regression coverage repeatedly removes/rejoins the same member name, compacts
+superseded lifecycle records, then recovers without a cache and rejects an eager
+downgrade. The activation flag also survives the conditional cooperative Raft
+snapshot v12; restoring that snapshot still rejects protocol-9 registration.
 
 The unit of atomic replacement is one closed segment, not a whole log: certify
 the range that will actually be replaced. Applying a whole-log deletion plan
@@ -299,3 +308,20 @@ and compaction without complete local metadata coverage remain separate acceptan
 conditions. Retaining necessary deleted-name fences
 or decisions is authoritative state growth, and is not bounded by live-group
 count alone. Do not close the history-growth issue based only on these results.
+
+## Verified cache-absent cluster restart
+
+The strengthened fixture passed in [CI run 39917076635](https://github.com/cursus-io/cursus/actions/runs/39917076635)
+at `e4f2c280c9328c51ef9d30b661994b5632e5e596`, before the cooperative-base refresh.
+Every broker was stopped before removing and checking the absence of its derived
+index. Start-to-ready/full-ISR was 7.511/7.516/7.505 s. Four groups performed 400
+commits in 33.128 s, with completion p50/p95/max 81.609/106.885/142.713 ms and
+29 availability retries across commit/heartbeat. The E2E test elapsed 160.94 s,
+including image setup and cleanup but excluding pre-test Go compilation.
+Exact offsets, replica history removal and unrelated member state passed.
+
+This is a cache-absent correctness sample with warm OS caches, not a baseline/fix
+comparison of cold startup or a measurement of the newly rebased head. Shutdown
+and cache removal are excluded from the restart timer. Broker CPU, peak heap,
+physical I/O, network transfer and complete fsync counts were not collected.
+The full history ladder and resource measurements remain required separately.
