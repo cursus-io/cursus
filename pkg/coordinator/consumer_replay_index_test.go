@@ -20,6 +20,7 @@ import (
 
 type replayIndexTestReader struct {
 	*strictReplayReader
+	hidePending            bool
 	identity               string
 	reads, rawReads, syncs int
 	syncErr                error
@@ -41,6 +42,15 @@ func (r *replayIndexTestReader) ConsumerMetadataIndexIdentity(int) (string, erro
 }
 func (r *replayIndexTestReader) ReadCommittedConsumerMetadata(topic string, p int, next uint64, max int) ([]types.Message, error) {
 	messages, err := r.ReadTopicPartition(topic, p, next, max)
+	if r.hidePending {
+		visible := make([]types.Message, 0, len(messages))
+		for _, m := range messages {
+			if m.TransactionState != types.TransactionStateOpen {
+				visible = append(visible, m)
+			}
+		}
+		messages = visible
+	}
 	r.reads += len(messages)
 	return messages, err
 }
@@ -90,7 +100,7 @@ func TestConsumerReplayIndexSuffixAndBounds(t *testing.T) {
 	r.messages[0] = append(r.messages[0], encodedMetadataMessage(t, replayOffset("g", 1, 102, 999), 102))
 	r.end = map[int]uint64{0: 102}
 	// The committed adapter must itself respect its end, as production does.
-	r.strictReplayReader.read = func(p int, next uint64, max int) ([]types.Message, error) {
+	r.read = func(p int, next uint64, max int) ([]types.Message, error) {
 		var out []types.Message
 		end, _ := r.EndTopicOffset("", p)
 		for _, m := range r.messages[p] {
@@ -224,6 +234,31 @@ func TestConsumerReplayIndexDeclinesTransactionsAndLegacy(t *testing.T) {
 			require.Zero(t, p.status.IndexWriteBytes)
 		})
 	}
+}
+
+func TestConsumerReplayIndexTransactionalSuffixInvalidatesReuse(t *testing.T) {
+	c, r := newIndexFixture(t, 10)
+	p, err := c.PrepareFullConsumerMetadataReplay(r)
+	require.NoError(t, err)
+	require.Positive(t, p.status.IndexWriteBytes)
+	// A cached ordinary prefix must not hide a newly pending transaction. Even
+	// before its decision becomes visible, raw certification must decline reuse.
+	pending := encodedMetadataMessage(t, replayOffset("g", 1, 11, 11), 11)
+	pending.TransactionalID = "pending"
+	pending.TransactionState = types.TransactionStateOpen
+	r.messages[0] = append(r.messages[0], pending)
+	r.hidePending = true
+	p, err = c.PrepareFullConsumerMetadataReplay(r)
+	require.NoError(t, err)
+	require.False(t, p.status.IndexHit)
+	require.Zero(t, p.status.IndexWriteBytes)
+	require.Equal(t, uint64(10), p.scratch.groups["g"].Offsets["events"][0])
+	// Repeated recovery still checks the suffix; an older published index cannot
+	// accidentally certify a transaction-bearing prefix on the following retry.
+	p, err = c.PrepareFullConsumerMetadataReplay(r)
+	require.NoError(t, err)
+	require.False(t, p.status.IndexHit)
+	require.Zero(t, p.status.IndexWriteBytes)
 }
 
 func TestConsumerReplayIndexReservationsAndProvenance(t *testing.T) {
