@@ -667,7 +667,7 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 	}
 	consumerID = fmt.Sprintf("%s-%s", consumerID, randSuffix)
 
-	var assignments []int
+	var joined coordinator.ConsumerJoinResult
 	if ch.isDistributed() {
 		if ch.Coordinator == nil {
 			return coordinatorUnavailableResponse
@@ -685,7 +685,7 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 				return fmt.Sprintf("ERROR: register_group_failed reason=%q", err.Error())
 			}
 		}
-		assignments, err = ch.Coordinator.AddConsumer(groupName, consumerID)
+		joined, err = ch.Coordinator.AddConsumerWithResult(groupName, consumerID)
 		if err != nil {
 			return fmt.Sprintf("ERROR: coordinator_not_available reason=%q", err.Error())
 		}
@@ -703,9 +703,10 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 				}
 			}
 
-			assignments, err = ch.Coordinator.AddConsumer(groupName, consumerID)
+			joined, err = ch.Coordinator.AddConsumerWithResult(groupName, consumerID)
 			if err != nil {
 				util.Error("failed to join %s: %v", groupName, err)
+				return formatCoordinatorError(err)
 			}
 		} else {
 			return "ERROR: coordinator_not_available"
@@ -713,12 +714,12 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 	}
 
 	ctx.MemberID = consumerID
-	ctx.Generation = ch.Coordinator.GetGeneration(groupName)
+	ctx.Generation = joined.Generation
 	if multiTopic {
-		return fmt.Sprintf("OK generation=%d member=%s topic_assignments=%s", ctx.Generation, ctx.MemberID, formatTopicAssignments(ch.Coordinator.GetMemberTopicAssignments(groupName, consumerID)))
+		return fmt.Sprintf("OK generation=%d member=%s topic_assignments=%s", ctx.Generation, ctx.MemberID, formatTopicAssignments(joined.TopicAssignments))
 	}
-	util.Info("✅ Joined group '%s' member '%s' generation '%d' with partitions: %v", groupName, ctx.MemberID, ctx.Generation, assignments)
-	return fmt.Sprintf("OK generation=%d member=%s assignments=%v", ctx.Generation, ctx.MemberID, assignments)
+	util.Info("✅ Joined group '%s' member '%s' generation '%d' with partitions: %v", groupName, ctx.MemberID, ctx.Generation, joined.Assignments)
+	return fmt.Sprintf("OK generation=%d member=%s assignments=%v", ctx.Generation, ctx.MemberID, joined.Assignments)
 }
 
 // handleSyncGroup processes SYNC_GROUP command

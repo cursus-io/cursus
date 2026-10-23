@@ -421,6 +421,10 @@ func (c *Coordinator) AddConsumer(groupName, consumerID string) ([]int, error) {
 }
 
 func (c *Coordinator) addConsumer(groupName, consumerID string, mode lifecycleWriteMode) ([]int, error) {
+	return c.addConsumerResult(groupName, consumerID, mode, nil)
+}
+
+func (c *Coordinator) addConsumerResult(groupName, consumerID string, mode lifecycleWriteMode, result *ConsumerJoinResult) ([]int, error) {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
@@ -474,6 +478,10 @@ func (c *Coordinator) addConsumer(groupName, consumerID string, mode lifecycleWr
 		return nil, fmt.Errorf("group %q changed during durable lifecycle update", groupName)
 	}
 	applyGroupLifecycle(group, candidate)
+	if result != nil {
+		*result = ConsumerJoinResult{Generation: gen, Assignments: assignments,
+			TopicAssignments: append([]TopicPartition(nil), candidate.Members[consumerID].TopicAssignments...)}
+	}
 	c.mu.Unlock()
 
 	util.Info("✅ Consumer '%s' joined (Generation: %d, Assignments: %v)", consumerID, gen, assignments)
