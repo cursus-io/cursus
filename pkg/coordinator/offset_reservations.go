@@ -150,6 +150,9 @@ func (c *Coordinator) PrepareOffsetReservation(groupName string, registrationEpo
 	if registrationEpoch == 0 || group.RegistrationEpoch != registrationEpoch {
 		return fmt.Errorf("ERROR: group_epoch_mismatch group=%s", groupName)
 	}
+	if group.Cooperative != nil {
+		return errCooperativeProtocolRequired
+	}
 	if c.lifecyclePending[groupName] {
 		return fmt.Errorf("group %q lifecycle update in progress", groupName)
 	}

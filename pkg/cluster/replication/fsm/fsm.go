@@ -375,7 +375,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 		util.Error("Failed to decode snapshot: %v", err)
 		return fmt.Errorf("failed to restore snapshot: %w", err)
 	}
-	if header.Version != SnapshotVersionCurrent && header.Version != SnapshotVersionProducerEpoch && header.Version != SnapshotVersionLegacyEpoch {
+	if header.Version != SnapshotVersionCurrent && header.Version != SnapshotVersionProducerEpoch && header.Version != SnapshotVersionLegacyEpoch && header.Version != SnapshotVersionCooperative {
 		return fmt.Errorf("%w: snapshot version %d is not supported; remove all Cursus persistent state and clean bootstrap version %d", ErrUnsupportedRecoveryProtocol, header.Version, SnapshotVersionCurrent)
 	}
 	var state BrokerFSMState
@@ -417,6 +417,13 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	}
 	if err := coordinator.ValidateImportState(state.GroupState); err != nil {
 		return fmt.Errorf("restore consumer groups: %w", err)
+	}
+	if state.Version != SnapshotVersionCooperative {
+		for _, group := range state.GroupState {
+			if group != nil && group.Cooperative != nil {
+				return fmt.Errorf("%w: cooperative ownership requires snapshot version 12", ErrUnsupportedRecoveryProtocol)
+			}
+		}
 	}
 	if f.cd != nil {
 		if err := f.cd.ValidateConsumerRestoreOrigin(state.ConsumerRecovery); err != nil {

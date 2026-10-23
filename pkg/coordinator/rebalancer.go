@@ -37,6 +37,11 @@ func (c *Coordinator) registerGroup(topicName, groupName string, partitionCount 
 	existing := c.groups[groupName]
 	if existing != nil {
 		existing.mu.Lock()
+		if existing.Cooperative != nil {
+			existing.mu.Unlock()
+			c.mu.Unlock()
+			return errCooperativeProtocolRequired
+		}
 		if existing.TopicName != "" && existing.TopicName != topicName {
 			existing.mu.Unlock()
 			c.mu.Unlock()
@@ -191,6 +196,10 @@ func (c *Coordinator) registerGroupSubscription(groupName string, topics []strin
 		if !sameSubscription(existing, canonicalTopics, pattern, topicPartitions) {
 			c.mu.Unlock()
 			return fmt.Errorf("subscription mismatch for group %q", groupName)
+		}
+		if existing.Cooperative != nil {
+			c.mu.Unlock()
+			return errCooperativeProtocolRequired
 		}
 		if existing.RegistrationEpoch != 0 && !existing.RegistrationInferred {
 			c.mu.Unlock()
@@ -429,6 +438,10 @@ func (c *Coordinator) addConsumer(groupName, consumerID string, mode lifecycleWr
 		c.mu.Unlock()
 		return nil, fmt.Errorf("group requires durable registration")
 	}
+	if group.Cooperative != nil {
+		c.mu.Unlock()
+		return nil, errCooperativeProtocolRequired
+	}
 
 	now := time.Now()
 	candidate := cloneGroupLifecycle(group)
@@ -486,6 +499,10 @@ func (c *Coordinator) RemoveConsumer(groupName, consumerID string) error {
 	if _, exists := group.Members[consumerID]; !exists {
 		c.mu.Unlock()
 		return fmt.Errorf("ERROR: member_not_found member=%s group=%s", consumerID, groupName)
+	}
+	if group.Cooperative != nil {
+		c.mu.Unlock()
+		return errCooperativeProtocolRequired
 	}
 	candidate := cloneGroupLifecycle(group)
 	delete(candidate.Members, consumerID)
@@ -569,6 +586,10 @@ func (c *Coordinator) expireConsumers(groupName string, expectedGeneration int, 
 		c.mu.Unlock()
 		return fmt.Errorf("ERROR: GEN_MISMATCH current=%d requested=%d group=%s", group.Generation, expectedGeneration, groupName)
 	}
+	if group.Cooperative != nil {
+		c.mu.Unlock()
+		return errCooperativeProtocolRequired
+	}
 
 	candidate := cloneGroupLifecycle(group)
 	removed := 0
@@ -610,6 +631,7 @@ func cloneGroupLifecycle(group *GroupMetadata) *GroupMetadata {
 		TopicPartitions: append([]TopicPartition(nil), group.TopicPartitions...), Generation: group.Generation,
 		Members: make(map[string]*MemberMetadata, len(group.Members)), Partitions: append([]int(nil), group.Partitions...),
 		LastActivity: group.LastActivity, LastRebalance: group.LastRebalance, RegistrationEpoch: group.RegistrationEpoch, RegistrationInferred: group.RegistrationInferred,
+		Cooperative: group.Cooperative.Clone(),
 	}
 	for id, member := range group.Members {
 		candidate.Members[id] = &MemberMetadata{ID: member.ID, LastHeartbeat: member.LastHeartbeat, Assignments: append([]int(nil), member.Assignments...), TopicAssignments: append([]TopicPartition(nil), member.TopicAssignments...)}
@@ -622,6 +644,13 @@ func applyGroupLifecycle(group, candidate *GroupMetadata) {
 	group.Members = candidate.Members
 	group.LastActivity = candidate.LastActivity
 	group.LastRebalance = candidate.LastRebalance
+	// Standalone administrative commits may retain only group.mu after selecting
+	// the group; publish ownership under that lock as well as the caller's c.mu.
+	if group.Cooperative != nil || candidate.Cooperative != nil {
+		group.mu.Lock()
+		group.Cooperative = candidate.Cooperative.Clone()
+		group.mu.Unlock()
+	}
 }
 
 //nolint:unused // Lifecycle mutations use durable snapshot transitions instead.
@@ -663,7 +692,7 @@ func (c *Coordinator) rebalanceRange(groupName string) {
 }
 
 func rebalanceGroup(group *GroupMetadata) {
-	if group == nil {
+	if group == nil || group.Cooperative != nil {
 		return
 	}
 

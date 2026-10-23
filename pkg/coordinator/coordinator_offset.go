@@ -63,6 +63,9 @@ func (c *Coordinator) commitOffsetForGroup(gm *GroupMetadata, groupName, topic s
 }
 
 func (c *Coordinator) commitOffsetForGroupLocked(gm *GroupMetadata, groupName, topic string, partition int, offset uint64) error {
+	if gm.Cooperative != nil {
+		return errCooperativeProtocolRequired
+	}
 	if err := reservedOffsetError(gm, groupName, topic, partition); err != nil {
 		return err
 	}
@@ -168,6 +171,9 @@ func (c *Coordinator) commitOffsetsBulkForGroup(gm *GroupMetadata, groupName, to
 }
 
 func (c *Coordinator) commitOffsetsBulkForGroupLocked(gm *GroupMetadata, groupName, topic string, offsets []OffsetItem) error {
+	if gm.Cooperative != nil {
+		return errCooperativeProtocolRequired
+	}
 	if err := validateOffsetBatchLocked(gm, groupName, topic, offsets); err != nil {
 		return err
 	}
@@ -360,6 +366,10 @@ func (c *Coordinator) applyOffsetUpdateFromFSM(groupName, topic string, offsets 
 	// FSM replay may arrive before RegisterGroup, so we need to get-or-create.
 	c.mu.Lock()
 	gm, ok := c.groups[groupName]
+	if gm != nil && gm.Cooperative != nil {
+		c.mu.Unlock()
+		return errCooperativeProtocolRequired
+	}
 	if !ok {
 		gm = &GroupMetadata{
 			TopicName: topic,
@@ -712,7 +722,7 @@ func (c *Coordinator) ValidateOwnershipAtomic(groupName, memberID string, genera
 	defer c.mu.RUnlock()
 
 	group := c.getGroupUnsafe(groupName)
-	if group == nil {
+	if group == nil || group.Cooperative != nil {
 		util.Debug("failed to validate ownership for partition %d: Group '%s' not found.", partition, groupName)
 		return false
 	}

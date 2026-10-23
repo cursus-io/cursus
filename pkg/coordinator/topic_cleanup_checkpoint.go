@@ -19,6 +19,7 @@ type cleanupCheckpointTarget struct {
 	RegistrationAfter        bool
 	Epoch                    uint64
 	Generation               int
+	CooperativeRevision      uint64 `json:",omitempty"`
 	EvidenceEpoch, LiveEpoch uint64
 	Kind, Topic              string
 	Digest                   [32]byte
@@ -85,7 +86,7 @@ func (c *Coordinator) loadCleanupCheckpoint(scan *topicCleanupScan, partitions [
 	}
 	for name, target := range scan.targets {
 		saved, ok := cp.Targets[name]
-		if !ok || saved.Epoch != target.epoch || saved.Generation != target.generation {
+		if !ok || saved.Epoch != target.epoch || saved.Generation != target.generation || saved.CooperativeRevision != target.cooperativeRevision {
 			return
 		}
 	}
@@ -132,7 +133,7 @@ func (c *Coordinator) saveCleanupCheckpoint(scan *topicCleanupScan, view Consume
 	}
 	for name, target := range scan.targets {
 		e := target.evidence
-		cp.Targets[name] = cleanupCheckpointTarget{BeforeLive: e.beforeLive, DeletedEpoch: e.deletedEpoch, RegistrationAfter: e.registrationAfter, Epoch: target.epoch, Generation: target.generation, EvidenceEpoch: e.epoch, LiveEpoch: e.liveEpoch, Kind: e.kind, Topic: e.topic, Digest: e.digest}
+		cp.Targets[name] = cleanupCheckpointTarget{BeforeLive: e.beforeLive, DeletedEpoch: e.deletedEpoch, RegistrationAfter: e.registrationAfter, Epoch: target.epoch, Generation: target.generation, CooperativeRevision: target.cooperativeRevision, EvidenceEpoch: e.epoch, LiveEpoch: e.liveEpoch, Kind: e.kind, Topic: e.topic, Digest: e.digest}
 	}
 	payload, err := json.Marshal(cp)
 	if err != nil {
