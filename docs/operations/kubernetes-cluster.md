@@ -162,8 +162,8 @@ Raft snapshot format, and disk record format required by this chart. A stale
 image, a digest/revision mismatch, or an unsupported storage/protocol contract
 prevents the broker container from starting.
 
-The current chart expects Wire protocol `2`, broker lifecycle protocol `7`,
-Raft snapshot format `11`, and disk record format `CDM5`. Chart version `0.2.2`
+The current chart expects Wire protocol `2`, broker lifecycle protocol `8`,
+Raft snapshot format `11`, and disk record format `CDM5`. Chart version `0.2.3`
 identifies the Helm packaging, not the broker binary version. Do not override
 these contract values to bypass an incompatible image. `image.allowMutableTag`
 must be a YAML boolean; mutable tags are reserved for source-built validation.

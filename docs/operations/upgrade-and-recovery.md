@@ -11,6 +11,7 @@
 | Consumer metadata records | 5 | versions 1-4 remain replayable | Upgrade readers before writing offset-reservation records. |
 | Raft FSM snapshot | 11 | versions 9/10 are accepted only for the supported one-way recovery transition | Older formats require a clean bootstrap; never downgrade a volume after writing version 11. |
 | Instance-bound truncate | broker lifecycle protocol 7, Wire command 61 | legacy TRUNCATE keeps its conflict contract | Upgrade all brokers before binding identities or using durable retries. |
+| Truncate consumer cleanup boundary | broker lifecycle protocol 8, optional snapshot-11 evidence | omitted while any registered broker advertises an older capability | Upgrade every registered broker, including offline members, before relying on snapshot-persistent cleanup ordering. See [truncate registration recovery](../truncate-registration-recovery.md). |
 | Replica-gap recovery control state | broker lifecycle protocol 6 | An older active broker blocks a new quarantine transition and cannot register while a durable recovery marker exists | Complete the rolling upgrade before relying on automatic gap quarantine and proof-based ISR re-admission. |
 
 Mixed-version rolling upgrades across a format boundary are unsupported. A

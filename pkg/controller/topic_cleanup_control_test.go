@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -23,6 +24,7 @@ func TestTopicCleanupReplaysBrokerControlsFromDiskAfterSnapshot(t *testing.T) {
 				stale := owner.ExportState()
 				cfg := config.DefaultConfig()
 				cfg.EnabledDistribution = true
+				cfg.LogDir = t.TempDir()
 				follower, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, tm)
 				require.NoError(t, err)
 				t.Cleanup(follower.Stop)
@@ -42,6 +44,14 @@ func TestTopicCleanupReplaysBrokerControlsFromDiskAfterSnapshot(t *testing.T) {
 				require.Len(t, follower.TopicGroupReferences("orders"), 1)
 				unrelated := follower.ExportState()["unrelated"]
 				deleted, err := follower.ReconcileTopicGroups("orders")
+				for attempts := 0; err != nil && attempts < 128; attempts++ {
+					var pending *coordinator.TopicCleanupPending
+					require.True(t, errors.As(err, &pending), "%v", err)
+					require.Equal(t, coordinator.CleanupContinue, pending.State, "%v", err)
+					var next []string
+					next, err = follower.ReconcileTopicGroups("orders")
+					deleted = append(deleted, next...)
+				}
 				require.NoError(t, err)
 				require.Equal(t, []string{"workers"}, deleted)
 				require.Nil(t, follower.GetGroup("workers"))

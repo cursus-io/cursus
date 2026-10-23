@@ -209,6 +209,10 @@ func (f *BrokerFSM) reconcileTopicGroups(name, operation string, expected *topic
 func (f *BrokerFSM) reconcileTopicGroupsContext(ctx context.Context, name, operation string, expected *topic.Definition) error {
 	f.mu.RLock()
 	c := f.cd
+	var boundary *coordinator.TopicCleanupBoundary
+	if operation == TopicMaterializationTruncate {
+		boundary = f.topicCleanupBoundaryLocked(expected)
+	}
 	f.mu.RUnlock()
 	if c == nil {
 		return nil
@@ -217,7 +221,7 @@ func (f *BrokerFSM) reconcileTopicGroupsContext(ctx context.Context, name, opera
 		f.mu.RLock()
 		defer f.mu.RUnlock()
 		return reflect.DeepEqual(f.topicState[name], expected) && !f.recoveryReplayPending
-	})
+	}, boundary)
 	if err != nil {
 		f.recordTopicMaterializationIfCurrent(name, operation, expected, err)
 	}
@@ -241,11 +245,16 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 	}
 
 	var err error
+	operation := TopicMaterializationCreate
 	if f.tm.IsTruncationPending(definition.Name) {
 		// A later Raft definition update may supersede a truncate whose local
 		// reset is still pending. Rebuild the empty generation at the latest
 		// authoritative definition before publishing its epoch marker.
 		err = f.tm.RestoreDefinitions([]topic.Definition{*definition})
+		if err == nil {
+			operation = TopicMaterializationTruncate
+			err = f.cleanupTopicDependencies(definition.Name, definition)
+		}
 		if err == nil {
 			err = f.tm.CompleteTruncation(definition.Name)
 		}
@@ -255,7 +264,7 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 	if err == nil {
 		err = f.reconcileMaterializedTopicHWM(definition.Name, replaying)
 	}
-	f.recordTopicMaterializationIfCurrent(definition.Name, TopicMaterializationCreate, definition, err)
+	f.recordTopicMaterializationIfCurrent(definition.Name, operation, definition, err)
 	if err != nil {
 		return fmt.Errorf("materialize topic %q: %w", definition.Name, err)
 	}
@@ -282,13 +291,18 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 	}
 
 	err := f.tm.RestoreDefinitions([]topic.Definition{*definition})
+	operation := TopicMaterializationRestore
 	if err == nil && f.tm.IsTruncationPending(definition.Name) {
-		err = f.tm.CompleteTruncation(definition.Name)
+		operation = TopicMaterializationTruncate
+		err = f.cleanupTopicDependencies(definition.Name, definition)
+		if err == nil {
+			err = f.tm.CompleteTruncation(definition.Name)
+		}
 	}
 	if err == nil {
 		err = f.reconcileMaterializedTopicHWM(definition.Name, true)
 	}
-	f.recordTopicMaterializationIfCurrent(definition.Name, TopicMaterializationRestore, definition, err)
+	f.recordTopicMaterializationIfCurrent(definition.Name, operation, definition, err)
 	if err != nil {
 		return fmt.Errorf("restore local topic %q: %w", definition.Name, err)
 	}
@@ -371,7 +385,7 @@ func (f *BrokerFSM) materializeTopicTruncate(definition *topic.Definition) error
 		_, err = f.tm.ApplyTruncateDefinition(*definition)
 	}
 	if err == nil {
-		err = f.cleanupTopicDependencies(definition.Name)
+		err = f.cleanupTopicDependencies(definition.Name, definition)
 	}
 	if err == nil && f.tm != nil {
 		err = f.tm.CompleteTruncation(definition.Name)
@@ -433,14 +447,18 @@ func (f *BrokerFSM) materializeTopicDelete(name string) error {
 	return nil
 }
 
-func (f *BrokerFSM) cleanupTopicDependencies(name string) error {
+func (f *BrokerFSM) cleanupTopicDependencies(name string, truncate ...*topic.Definition) error {
 	f.mu.RLock()
 	coordinatorRef := f.cd
 	transactionManager := f.txn
+	var boundary *coordinator.TopicCleanupBoundary
+	if len(truncate) > 0 {
+		boundary = f.topicCleanupBoundaryLocked(truncate[0])
+	}
 	f.mu.RUnlock()
 
 	if coordinatorRef != nil {
-		if _, err := coordinatorRef.CheckTopicGroupCleanup(name); err != nil {
+		if _, err := coordinatorRef.CheckTopicGroupCleanup(name, boundary); err != nil {
 			return fmt.Errorf("delete consumer groups for topic %q: %w", name, err)
 		}
 	}

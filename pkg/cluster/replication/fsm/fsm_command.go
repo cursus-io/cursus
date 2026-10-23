@@ -309,6 +309,27 @@ func (f *BrokerFSM) applyTopicCommand(jsonData string) interface{} {
 		}
 
 		stagedTopics[topicName] = copyTopicDefinition(&definition)
+		if topicName == config.ConsumerOffsetsTopicName && currentTopic != nil {
+			for name, b := range f.topicCleanupBoundaries {
+				if b.MetadataInstance != currentTopic.InstanceID || b.MetadataEpoch != definition.LifecycleEpoch || len(b.Ends) == 0 {
+					continue
+				}
+				b = b.Clone()
+				b.MetadataInstance = definition.InstanceID
+				for len(b.Ends) < definition.Partitions {
+					b.Ends = append(b.Ends, 0)
+				}
+				f.topicCleanupBoundaries[name] = b
+			}
+		}
+		if b := f.topicCleanupBoundaries[topicName]; b != nil && currentTopic != nil &&
+			b.TopicInstance == currentTopic.InstanceID && b.TopicEpoch == definition.LifecycleEpoch {
+			// Binding the first instance ID is a serialized definition update,
+			// not a new truncate; retain its historical cut under the bound ID.
+			b = b.Clone()
+			b.TopicInstance = definition.InstanceID
+			f.topicCleanupBoundaries[topicName] = b
+		}
 		f.partitionMetadata = stagedPartitions
 		f.topicState = stagedTopics
 		appliedDefinition = definition
@@ -428,6 +449,7 @@ func (f *BrokerFSM) applyTopicDeleteCommand(jsonData string) interface{} {
 		}
 	}
 	delete(f.topicState, payload.Topic)
+	delete(f.topicCleanupBoundaries, payload.Topic)
 	delete(f.producerState, payload.Topic)
 	f.mu.Unlock()
 
@@ -532,6 +554,7 @@ func (f *BrokerFSM) applyTopicTruncateCommand(jsonData string) interface{} {
 	f.logs = stagedLogs
 	delete(f.producerState, payload.Topic)
 	f.topicState[payload.Topic] = copyTopicDefinition(&target)
+	f.captureTopicCleanupBoundaryLocked(target)
 	f.mu.Unlock()
 
 	result := topic.TruncateResult{Topic: payload.Topic, Truncated: true, Definition: target}

@@ -15,6 +15,41 @@ type consumerCleanupView struct {
 	ctx        context.Context
 }
 
+// CheckConsumerCleanupProof fences a completed in-memory proof at final Raft
+// apply without disk I/O or blocking locks. A rollback, replacement or pending
+// snapshot requires reconciliation to validate the log again.
+func (tm *TopicManager) CheckConsumerCleanupProof(bounds []coordinator.ConsumerCleanupPartition) error {
+	invalid := cleanupViewWaiting("completed consumer cleanup proof changed or busy")
+	if !tm.mu.TryRLock() {
+		return invalid
+	}
+	defer tm.mu.RUnlock()
+	t := tm.topics[config.ConsumerOffsetsTopicName]
+	if t == nil || !t.mu.TryRLock() {
+		return invalid
+	}
+	defer t.mu.RUnlock()
+	if len(bounds) != len(t.Partitions) {
+		return invalid
+	}
+	for i, p := range t.Partitions {
+		b := bounds[i]
+		if b.TopicInstance != t.InstanceID || b.TopicEpoch != t.LifecycleEpoch || b.Identity != p || !p.reconcileMu.TryRLock() {
+			return invalid
+		}
+		defer p.reconcileMu.RUnlock()
+		if !p.mu.TryRLock() {
+			return invalid
+		}
+		valid := !p.snapshotRecovery && p.hwmReadinessErrorLocked() == nil && p.HWM >= b.End && p.eventIDGeneration.Load() == b.Generation
+		p.mu.RUnlock()
+		if !valid {
+			return invalid
+		}
+	}
+	return nil
+}
+
 // WithConsumerCleanupView pins local partition identities and excludes replica
 // rollback/snapshot transitions while the callback reads and applies evidence.
 // Ordinary appends may continue: the view only exposes the captured committed,
@@ -76,6 +111,7 @@ func (tm *TopicManager) WithConsumerCleanupViewContext(ctx context.Context, fn f
 			durable = fmt.Sprintf("%s:%d:%s", t.InstanceID, t.LifecycleEpoch, token)
 		}
 		view.bounds = append(view.bounds, coordinator.ConsumerCleanupPartition{
+			TopicInstance: t.InstanceID, TopicEpoch: t.LifecycleEpoch,
 			DurableGeneration: durable,
 			Identity:          p, Generation: p.eventIDGeneration.Load(), Start: start, End: end,
 		})
