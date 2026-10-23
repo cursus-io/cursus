@@ -262,7 +262,7 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 		err = f.tm.ApplyDefinition(*definition)
 	}
 	if err == nil {
-		err = f.reconcileMaterializedTopicHWM(definition.Name, replaying)
+		err = f.reconcileMaterializedTopicHWM(definition.Name, replaying, false)
 	}
 	f.recordTopicMaterializationIfCurrent(definition.Name, operation, definition, err)
 	if err != nil {
@@ -300,7 +300,7 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 		}
 	}
 	if err == nil {
-		err = f.reconcileMaterializedTopicHWM(definition.Name, true)
+		err = f.reconcileMaterializedTopicHWM(definition.Name, true, false)
 	}
 	f.recordTopicMaterializationIfCurrent(definition.Name, operation, definition, err)
 	if err != nil {
@@ -309,7 +309,7 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 	return nil
 }
 
-func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string, restoringSnapshot bool) error {
+func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string, restoringSnapshot, finalizeSnapshot bool) error {
 	if f.tm == nil {
 		return nil
 	}
@@ -351,6 +351,9 @@ func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string, restoringSna
 			if !currentPartition.SnapshotRecoveryPending() {
 				reconcileErr = currentPartition.ReconcileSnapshotHWM(partitionMetadata.CommittedHWM)
 			}
+			if reconcileErr == nil && finalizeSnapshot {
+				reconcileErr = currentPartition.FinalizeSnapshotRecovery(partitionMetadata.CommittedHWM)
+			}
 		} else {
 			// Live definition application must not wait for replication ownership:
 			// its HWM command may be queued behind this same FSM application.
@@ -375,20 +378,36 @@ func (f *BrokerFSM) materializeTopicTruncate(definition *topic.Definition) error
 	defer f.materializationMu.Unlock()
 	f.mu.RLock()
 	current := copyTopicDefinition(f.topicState[definition.Name])
+	replaying := f.recoveryReplayPending
 	f.mu.RUnlock()
 	if !reflect.DeepEqual(current, definition) {
 		return nil
 	}
 
 	var err error
+	restoredMissing := false
 	if f.tm != nil {
-		_, err = f.tm.ApplyTruncateDefinition(*definition)
+		restoredMissing = f.tm.GetTopic(definition.Name) == nil
+		if restoredMissing && !f.tm.IsTruncationPending(definition.Name) {
+			// A failed handler open during Raft replay can leave no local
+			// topic or pending fence. Reconstruct from the authoritative
+			// definition; never require a local predecessor to retry cleanup.
+			err = f.tm.RestoreDefinitions([]topic.Definition{*definition})
+		} else {
+			_, err = f.tm.ApplyTruncateDefinition(*definition)
+		}
 	}
 	if err == nil {
 		err = f.cleanupTopicDependencies(definition.Name, definition)
 	}
 	if err == nil && f.tm != nil {
 		err = f.tm.CompleteTruncation(definition.Name)
+	}
+	if err == nil && restoredMissing {
+		// Startup finalizes its whole replay later. A background retry has no
+		// such future callback: publish the current boundary now, retaining
+		// replica catch-up checks when the local LEO is still below it.
+		err = f.reconcileMaterializedTopicHWM(definition.Name, true, !replaying)
 	}
 	f.recordTopicMaterializationIfCurrent(definition.Name, TopicMaterializationTruncate, definition, err)
 	if err != nil {

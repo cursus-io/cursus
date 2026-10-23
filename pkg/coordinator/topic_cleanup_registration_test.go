@@ -59,6 +59,15 @@ func TestTruncateCleanupPreservesReregisteredGroup(t *testing.T) {
 				require.Error(t, err)
 				_, err = c.CheckTopicGroupCleanup("orders", next)
 				require.Error(t, err)
+				log.append(cleanupMessage(t, ConsumerMetadataRecord{Version: 1, Type: ConsumerMetadataRecordTombstone, Group: "workers", Topic: "orders", Epoch: registrationEpoch + 1}))
+				log.append(cleanupMessage(t, ConsumerMetadataRecord{Version: 1, Type: ConsumerMetadataRecordRegistration, Group: "workers", Topic: "orders", PartitionCount: 1, Epoch: registrationEpoch + 2}))
+				c.groups["workers"].RegistrationEpoch, c.groupEpochs["workers"] = registrationEpoch+2, registrationEpoch+2
+				before = c.ExportState()
+				_, err = c.ReconcileTopicGroupsContext(context.Background(), "orders", func() bool { return true }, next)
+				require.NoError(t, err)
+				_, err = c.CheckTopicGroupCleanup("orders", next)
+				require.NoError(t, err)
+				require.Equal(t, before, c.ExportState(), "repeated truncate preserves its own later registration")
 			})
 		}
 	}

@@ -68,6 +68,14 @@ and snapshot status without reading disk. Rollback or replacement invalidates it
 Snapshot restore and definition updates leave truncation pending until that
 check succeeds. Membership generations are no longer copied across registration
 epochs during ordinary replay. The normal same-epoch compatibility path remains.
+If a failed handler open leaves no local topic during Raft replay, retry restores
+the authoritative definition before performing the same cleanup check. It also
+restores the authoritative HWM fence, so missing new-generation data must be
+recovered by replication before readiness can succeed.
+Startup replay retains its existing finalization phase; a background retry
+finalizes its staged watermark immediately instead of waiting for that already
+completed callback. Replica eligibility still checks local data against the
+authoritative committed watermark.
 
 Checkpoint version 2 binds the cut and accumulated evidence to the current
 targets and durable log generation. Version 1, damaged or mismatched checkpoints
@@ -107,12 +115,23 @@ The deployed commit reproduces a fully scanned three-record history ending at
 fails because a fresh registration inherits membership generation 14; the fixed
 replay returns generation 0 with no inherited members.
 
-The isolated three-broker delayed-follower scenario passed its first run: the
-owner and other broker completed truncate, the same group was registered with
-an active member and committed offset, then the follower restarted and recovered
-Ready/full ISR. Its cleanup scanned 8 records / 3,921 frame bytes in 2 reads after
-restart. These are small-fixture counters, not estimates for the reported
-286,710,274-byte production scan. Final validation results are recorded in the PR.
+The isolated three-broker snapshot scenario passes with a real new-generation
+message, offset 1 and the same active generation/member after Ready/full ISR
+recovery. The fixture holds the target's handler open across restart until
+consumer metadata recovery is ready, then releases local materialization. This
+forces cleanup to encounter the recovered registration instead of completing
+against a temporarily empty startup overlay. The fixed run took 119.48 seconds;
+follower cleanup scanned 8 records / 3,931 frame bytes in 2 reads after restart.
+Other recovery work included 5,918 catch-up transfer bytes and 4,928 retained-scan
+read bytes / 10 frames. These are small-fixture counters, not estimates for the
+reported 286,710,274-byte production scan.
+
+The same snapshot sequence on the baseline fails: restore completes topic
+materialization without revisiting consumer cleanup. At the failed assertion,
+the replica is still at LEO/HWM 0 with committed HWM 1. The paired retained-Raft
+baseline also fails to converge (`topic_pending=1`, `replica_pending=1`). The
+suite exercises both replay paths in the existing cleanup recovery CI job.
+Final validation results are recorded in the PR.
 
 ## Regression and fault checks defined before implementation
 

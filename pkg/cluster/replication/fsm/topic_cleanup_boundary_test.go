@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"testing"
 
@@ -109,4 +110,34 @@ func TestTruncateSnapshotRestoreRetainsConsumerCleanupUntilProof(t *testing.T) {
 	offset, found := c.GetOffset("workers", "orders", 0)
 	require.True(t, found)
 	require.Equal(t, uint64(17), offset)
+}
+
+func TestTruncateCleanupRestoresMissingLocalTopicAfterReplay(t *testing.T) {
+	for _, hwm := range []uint64{0, 1} {
+		for _, replaying := range []bool{false, true} {
+			t.Run(fmt.Sprintf("hwm-%d/replaying-%t", hwm, replaying), func(t *testing.T) {
+				cfg := config.DefaultConfig()
+				cfg.EnabledDistribution = true
+				cfg.LogDir = t.TempDir()
+				m := durableCleanupTestManager(t, cfg)
+				f := NewBrokerFSM(m, nil)
+				f.recoveryReplayPending = replaying
+				d := topic.DefaultDefinition("orders", nil)
+				d.Partitions, d.Revision, d.LifecycleEpoch = 1, 2, 2
+				f.topicState[d.Name] = &d
+				f.partitionMetadata["orders-0"] = authoritativePartitionMetadata(1)
+				f.partitionMetadata["orders-0"].LifecycleEpoch = 2
+				f.partitionMetadata["orders-0"].CommittedHWM = hwm
+				require.Nil(t, m.GetTopic("orders"))
+				require.NoError(t, f.materializeTopicTruncate(&d))
+				require.NotNil(t, m.GetTopic("orders"))
+				require.False(t, m.IsTruncationPending("orders"))
+				p, err := m.GetTopic("orders").GetPartition(0)
+				require.NoError(t, err)
+				require.Equal(t, replaying, p.SnapshotRecoveryPending(), "a background retry must not await a startup callback that already finished")
+				require.Zero(t, p.NextOffset())
+				require.Equal(t, hwm, f.partitionMetadata["orders-0"].CommittedHWM, "missing records must still be recovered to the authoritative watermark")
+			})
+		}
+	}
 }
