@@ -451,7 +451,7 @@ func (l *DetachedMetadataLease) ReadCommittedMetadata(ctx context.Context, offse
 func detachedMetadataMessage(m types.DiskMessage) types.Message {
 	return types.Message{
 		Topic: m.Topic, Partition: int(m.Partition), Offset: m.Offset, Payload: m.Payload,
-		ProducerID: m.ProducerID, SeqNum: m.SeqNum, Epoch: m.Epoch, LeaderEpoch: m.LeaderEpoch, Key: m.Key,
+		ProducerID: m.ProducerID, SeqNum: m.SeqNum, Epoch: m.Epoch, LeaderEpoch: m.LeaderEpoch, AppendTimeMS: m.AppendTimeMS, Key: m.Key,
 		EventType: m.EventType, SchemaVersion: m.SchemaVersion, AggregateVersion: m.AggregateVersion,
 		Metadata: m.Metadata, EventID: m.EventID, PayloadDigest: m.PayloadDigest,
 		TransactionalID: m.TransactionalID, TransactionState: m.TransactionState, TransactionMarker: m.TransactionMarker,

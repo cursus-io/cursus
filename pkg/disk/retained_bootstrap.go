@@ -324,7 +324,7 @@ func retainedDiskMessage(m types.Message) types.DiskMessage {
 	return types.DiskMessage{
 		// #nosec G115 -- retainedMessage widened this validated on-disk int32 partition; this restores its original type.
 		Topic: m.Topic, Partition: int32(m.Partition), Offset: m.Offset, Payload: m.Payload,
-		ProducerID: m.ProducerID, SeqNum: m.SeqNum, Epoch: m.Epoch, LeaderEpoch: m.LeaderEpoch,
+		ProducerID: m.ProducerID, SeqNum: m.SeqNum, Epoch: m.Epoch, LeaderEpoch: m.LeaderEpoch, AppendTimeMS: m.AppendTimeMS,
 		Key: m.Key, EventType: m.EventType, SchemaVersion: m.SchemaVersion, AggregateVersion: m.AggregateVersion,
 		Metadata: m.Metadata, EventID: m.EventID, PayloadDigest: m.PayloadDigest,
 		TransactionalID: m.TransactionalID, TransactionState: m.TransactionState, TransactionMarker: m.TransactionMarker,

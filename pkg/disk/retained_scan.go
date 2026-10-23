@@ -145,12 +145,12 @@ func (d *DiskHandler) scanRetainedFramesLocked(ctx context.Context, start, end u
 func retainedMessage(m types.DiskMessage) types.Message {
 	return types.Message{
 		Topic: m.Topic, Partition: int(m.Partition),
-		Offset:                       m.Offset,
-		Payload:                      m.Payload,
-		ProducerID:                   m.ProducerID,
-		SeqNum:                       m.SeqNum,
-		Epoch:                        m.Epoch,
-		LeaderEpoch:                  m.LeaderEpoch,
+		Offset:      m.Offset,
+		Payload:     m.Payload,
+		ProducerID:  m.ProducerID,
+		SeqNum:      m.SeqNum,
+		Epoch:       m.Epoch,
+		LeaderEpoch: m.LeaderEpoch, AppendTimeMS: m.AppendTimeMS,
 		Key:                          m.Key,
 		EventType:                    m.EventType,
 		SchemaVersion:                m.SchemaVersion,

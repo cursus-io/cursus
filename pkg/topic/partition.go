@@ -734,13 +734,13 @@ func (p *Partition) EnqueueBatchLeaderWithMode(msgs []types.Message, forceIdempo
 			index: i,
 		})
 		diskBatch = append(diskBatch, types.DiskMessage{
-			Topic:                        p.topic,
-			Partition:                    partitionID,
-			Offset:                       offset,
-			ProducerID:                   msgs[i].ProducerID,
-			SeqNum:                       msgs[i].SeqNum,
-			Epoch:                        msgs[i].Epoch,
-			LeaderEpoch:                  msgs[i].LeaderEpoch,
+			Topic:       p.topic,
+			Partition:   partitionID,
+			Offset:      offset,
+			ProducerID:  msgs[i].ProducerID,
+			SeqNum:      msgs[i].SeqNum,
+			Epoch:       msgs[i].Epoch,
+			LeaderEpoch: msgs[i].LeaderEpoch, AppendTimeMS: msgs[i].AppendTimeMS,
 			Payload:                      msgs[i].Payload,
 			Key:                          msgs[i].Key,
 			EventType:                    msgs[i].EventType,
@@ -924,13 +924,13 @@ func writeBatchDurably(storage types.StorageHandler, batch []types.DiskMessage) 
 
 func diskMessageFromMessage(topic string, partition int32, msg types.Message) types.DiskMessage {
 	return types.DiskMessage{
-		Topic:                        topic,
-		Partition:                    partition,
-		Offset:                       msg.Offset,
-		ProducerID:                   msg.ProducerID,
-		SeqNum:                       msg.SeqNum,
-		Epoch:                        msg.Epoch,
-		LeaderEpoch:                  msg.LeaderEpoch,
+		Topic:       topic,
+		Partition:   partition,
+		Offset:      msg.Offset,
+		ProducerID:  msg.ProducerID,
+		SeqNum:      msg.SeqNum,
+		Epoch:       msg.Epoch,
+		LeaderEpoch: msg.LeaderEpoch, AppendTimeMS: msg.AppendTimeMS,
 		Payload:                      msg.Payload,
 		Key:                          msg.Key,
 		EventType:                    msg.EventType,
@@ -951,7 +951,7 @@ func diskMessageFromMessage(topic string, partition int32, msg types.Message) ty
 }
 
 func sameReplicatedMessage(a, b types.Message) bool {
-	return a.Offset == b.Offset && a.ProducerID == b.ProducerID && a.SeqNum == b.SeqNum && a.LeaderEpoch == b.LeaderEpoch &&
+	return a.AppendTimeMS == b.AppendTimeMS && a.Offset == b.Offset && a.ProducerID == b.ProducerID && a.SeqNum == b.SeqNum && a.LeaderEpoch == b.LeaderEpoch &&
 		a.Payload == b.Payload && a.Key == b.Key && a.Epoch == b.Epoch &&
 		a.EventType == b.EventType && a.SchemaVersion == b.SchemaVersion &&
 		a.AggregateVersion == b.AggregateVersion && a.Metadata == b.Metadata &&
