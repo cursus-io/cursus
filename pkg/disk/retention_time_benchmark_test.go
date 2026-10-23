@@ -2,7 +2,9 @@ package disk
 
 import (
 	"context"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -83,6 +85,21 @@ func TestRetentionTimeRecoveryWork(t *testing.T) {
 	}
 	require.Equal(t, timedBytes, stat.Size())
 	require.Equal(t, int64(8*len(records)), timedBytes-legacyBytes)
+	var retainedFiles int64
+	require.NoError(t, filepath.WalkDir(cfg.LogDir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		retainedFiles += info.Size()
+		return nil
+	}))
 	d.EnforceRetention(cfg)
 	work := d.RetentionTimeWorkSnapshot()
 	d.EnforceRetention(cfg)
@@ -106,5 +123,6 @@ func TestRetentionTimeRecoveryWork(t *testing.T) {
 	}
 	after := d.RetainedPageWorkSnapshot()
 	t.Logf("records=%d retained_log_bytes=%d legacy_log_bytes=%d metadata_overhead_bytes=%d summary_read_bytes=%d summary_records=%d summary_write_bytes=0 summary_temp_bytes=0 warm_extra_read_bytes=0", len(records), stat.Size(), legacyBytes, timedBytes-legacyBytes, work.ReadBytes, work.Records)
+	t.Logf("retained_all_file_lengths_bytes=%d (includes allocated index file lengths; not physical blocks)", retainedFiles)
 	t.Logf("subsequent_bootstrap page_read_bytes=%d page_decoded_records=%d canonical_write_bytes=%d hash_read_bytes=%d chunk_transfer_bytes=%d export_payload_temp_bytes=%d pages=%d (logical API bytes; no physical I/O attribution)", after.BytesRead-before.BytesRead, after.DecodedFrames-before.DecodedFrames, export.RetainedWork().CanonicalWriteBytes, export.RetainedWork().HashReadBytes, transfer, temporary, export.RetainedWork().Pages)
 }

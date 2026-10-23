@@ -56,7 +56,7 @@ func (d *DiskHandler) timeNow() time.Time {
 }
 
 func (d *DiskHandler) segmentTimeLocked(path string, info os.FileInfo) segmentTimeSummary {
-	if old, ok := d.retentionTimes[path]; ok && os.SameFile(old.info, info) && old.info.Size() == info.Size() && old.info.ModTime() == info.ModTime() {
+	if old, ok := d.retentionTimes[path]; ok && os.SameFile(old.info, info) && old.info.Size() == info.Size() && old.info.ModTime().Equal(info.ModTime()) {
 		d.retentionTimeWork.CacheHits++
 		metrics.RecordRecoveryWork(metrics.RecoveryRetentionTime, metrics.RecoveryCacheHits, 1)
 		return old
@@ -80,7 +80,11 @@ func (d *DiskHandler) segmentTimeLocked(path string, info os.FileInfo) segmentTi
 		}
 		return nil
 	}, func(n int) {
-		d.retentionTimeWork.ReadBytes += uint64(n)
+		readBytes, ok := util.SafeIntToUint64(n)
+		if !ok {
+			return
+		}
+		d.retentionTimeWork.ReadBytes += readBytes
 		metrics.RecordRecoveryBytes(metrics.RecoveryRetentionTime, metrics.RecoveryReadBytes, int64(n))
 	})
 	metrics.RecordRecoveryAttempt(metrics.RecoveryRetentionTime, result.err)

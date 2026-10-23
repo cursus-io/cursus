@@ -1,0 +1,11 @@
+goos: linux
+goarch: amd64
+pkg: github.com/cursus-io/cursus/pkg/topic
+cpu: 13th Gen Intel(R) Core(TM) i5-1340P
+BenchmarkRetentionTimeAppend/enabled=false-2         	2026/10/23 02:41:00 [DEBUG] Flushing 1 messages on timer
+     200	   9433507 ns/op	   8072514 p50-ns	  15860099 p95-ns	    3613 B/op	      19 allocs/op
+BenchmarkRetentionTimeAppend/enabled=true-2          	2026/10/23 02:41:01 [DEBUG] Success: From=0 To=0 (Count=1, Range: [0-0])
+2026/10/23 02:41:02 [DEBUG] Flushing 1 messages on timer
+     200	   9854217 ns/op	   8598821 p50-ns	  15710185 p95-ns	    3499 B/op	      19 allocs/op
+PASS
+PROCESS wall=4.060656384s user_cpu=47.271ms system_cpu=283.628ms maxrss_KiB=17332 (includes startup, fixtures, tests and teardown)

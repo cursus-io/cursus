@@ -216,7 +216,7 @@ func TestDurableRetentionBackupRestoreAndMissingIndex(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		defer input.Close()
+		defer func() { require.NoError(t, input.Close()) }()
 		output, err := os.Create(target)
 		if err != nil {
 			return err
