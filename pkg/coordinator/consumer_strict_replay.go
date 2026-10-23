@@ -578,7 +578,7 @@ func (c *Coordinator) applyConsumerMetadataReplay(p *PreparedConsumerMetadataRep
 			continue
 		}
 		previous.mu.RLock()
-		if sameRecoveredSession(previous, next) {
+		if sameConsumerSession(previous, next) {
 			if previous.LastActivity.After(next.LastActivity) {
 				next.LastActivity = previous.LastActivity
 			}

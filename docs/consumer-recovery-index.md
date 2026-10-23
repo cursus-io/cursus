@@ -2,11 +2,22 @@
 
 ## Design and evidence
 
-The official main inspected on 2026-10-23 is
-`a49138e7922aa66b14cb4482a8b084e5b9c1b8cd`. Distributed internal-topic
+The original audit inspected official main
+`a49138e7922aa66b14cb4482a8b084e5b9c1b8cd`; implementation is rebased onto
+official main `17fa455` on 2026-10-23 (including the cooperative ownership and
+recovery scheduling changes). Distributed internal-topic
 compaction is disabled in `pkg/disk/compaction.go`. Strict startup reads every
 committed metadata partition. Cleanup checkpoints and detached transfer staging
 do not replace this scan. No end-to-end cold-start speedup has been measured.
+
+The updated base includes cooperative ownership metadata v6 and conditional
+Raft snapshot v12. Original lifecycle records retain member sessions, current
+grants, target assignments and pending revocations in the replay projection.
+Clock preservation uses the same complete session comparison as ordinary
+recovery, including cooperative revision and grant epochs. An unchanged eager
+generation alone cannot certify unchanged ownership. Regression checks cover
+valid, missing and corrupt indexes, suffix ownership changes and unrelated
+member clocks; a changed grant must not inherit the replaced grant's clocks.
 
 [Accepted KIP-848](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/217387038/KIP-848+The+Next+Generation+of+the+Consumer+Rebalance+Protocol)
 proposes partitioned coordinator state and incremental reconciliation; it is

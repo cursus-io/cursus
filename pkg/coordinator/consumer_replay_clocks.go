@@ -1,9 +1,6 @@
 package coordinator
 
-import (
-	"fmt"
-	"slices"
-)
+import "fmt"
 
 // PreserveConsumerReplayClocks selects only partitions whose ownership proof
 // remains unchanged. Restore/startup and newly acquired partitions must not
@@ -26,17 +23,4 @@ func (c *Coordinator) PreserveConsumerReplayClocks(p *PreparedConsumerMetadataRe
 		}
 	}
 	return nil
-}
-
-func sameRecoveredSession(a, b *GroupMetadata) bool {
-	if a.RegistrationEpoch != b.RegistrationEpoch || a.Generation != b.Generation || a.TopicName != b.TopicName || a.TopicPattern != b.TopicPattern || !a.LastRebalance.Equal(b.LastRebalance) || !slices.Equal(a.Topics, b.Topics) || !slices.Equal(a.TopicPartitions, b.TopicPartitions) || !slices.Equal(a.Partitions, b.Partitions) || len(a.Members) != len(b.Members) {
-		return false
-	}
-	for id, member := range a.Members {
-		next := b.Members[id]
-		if member == nil || next == nil || !slices.Equal(member.Assignments, next.Assignments) || !slices.Equal(member.TopicAssignments, next.TopicAssignments) {
-			return false
-		}
-	}
-	return true
 }
