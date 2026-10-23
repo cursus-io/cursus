@@ -170,7 +170,9 @@ func TestRetainedPrefixAvailabilityAtPublication(t *testing.T) {
 			case "failure":
 				return injected
 			case "generation":
-				d.advanceContentGenerationLocked()
+				if err := d.advanceContentGenerationLocked(); err != nil {
+					t.Fatal(err)
+				}
 			case "pending":
 				d.bootstrapPending.Store(true)
 			}

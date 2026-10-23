@@ -305,6 +305,9 @@ func recoverPendingCompactedRange(base string) error {
 }
 
 func completeCompactedRangeTransaction(base string, transaction compactedRangeTransaction) error {
+	if _, err := replaceCleanupGeneration(base, false); err != nil {
+		return err
+	}
 	if transaction.Version != compactedRangeTransactionVersion || transaction.EndOffset <= transaction.StartOffset ||
 		transaction.LogSize < 0 || transaction.IndexSize < 0 || transaction.LogChecksum == "" || transaction.IndexChecksum == "" {
 		return fmt.Errorf("invalid pending compacted range")

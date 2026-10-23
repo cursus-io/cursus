@@ -419,7 +419,9 @@ func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool,
 	directory := filepath.Dir(logPath)
 	// Invalidate under the same lock as replacement, including partial failure.
 	d.lineage = nil
-	d.advanceContentGenerationLocked()
+	if err := d.advanceContentGenerationLocked(); err != nil {
+		return 0, before, before, err
+	}
 	defer func() {
 		if resultErr != nil {
 			resultErr = d.markWriteUnavailable(resultErr)

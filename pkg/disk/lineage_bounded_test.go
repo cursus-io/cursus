@@ -183,7 +183,9 @@ func TestLineageMutationDuringJournalRejectsPublication(t *testing.T) {
 	appendLineageRecords(t, d, "old")
 	d.lineageSyncFn = func(f *os.File) error {
 		d.mu.Lock()
-		d.advanceContentGenerationLocked()
+		if err := d.advanceContentGenerationLocked(); err != nil {
+			t.Fatal(err)
+		}
 		d.mu.Unlock()
 		return f.Sync()
 	}

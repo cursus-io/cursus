@@ -124,7 +124,9 @@ func TestRawFrameRotationOldEOFAndGeneration(t *testing.T) {
 		t.Fatal("foreign owner accepted")
 	}
 	d.mu.Lock()
-	d.advanceContentGenerationLocked()
+	if err := d.advanceContentGenerationLocked(); err != nil {
+		t.Fatal(err)
+	}
 	d.mu.Unlock()
 	if b := rawTestCapture(t, d, cursor, rawFrameBudget{1 << 20, 10, 10}); !errors.Is(b.Err, ErrStaleContentGeneration) {
 		t.Fatal("mutated generation accepted")
