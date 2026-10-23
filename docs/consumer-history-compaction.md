@@ -2,8 +2,8 @@
 
 ## Implementation and rollout contract
 
-Official main `c8199d9` contains the large-record, durable append-time and
-cooperative ownership/recovery changes. They are incorporated through the
+Official main `17fa455` contains the large-record, durable append-time,
+cooperative ownership/recovery and recovery scheduling changes. They are incorporated through the
 existing PRs. Production metadata
 uses producer ID `consumer-offset-coordinator`; fixtures must use that ID too.
 Keep both the last physical producer record and the maximum positive
@@ -30,7 +30,7 @@ producer/control state have an equivalent certified representation.
 ## Scope and comparison before implementation
 
 The implementation base is official main
-`c8199d9`. Its distributed internal-topic
+`17fa455`. Its distributed internal-topic
 compaction guard remains necessary. The recovery index is disposable and must
 never authorize deleting authoritative records.
 
@@ -109,8 +109,9 @@ current protocol. Turning the flag off stops maintenance, not the durable gate.
 The local Raft recovery marker is **13**. A supported marker-12 volume is first
 replayed successfully, then atomically upgraded and synced before this binary
 can advertise its new capability. Previous binaries reject marker 13. Snapshot
-version 11 gains optional activation evidence; older strict decoders reject that
-field after activation. Metadata record versions and original frame bytes are
+versions 11 and 12 carry optional activation evidence (12 when cooperative
+ownership is present); older strict decoders reject that field after activation.
+Metadata record versions and original frame bytes are
 unchanged. Perform a coordinated upgrade with complete immutable backups; mixed
 release operation and in-place downgrade are unsupported. Restore a complete
 pre-upgrade backup into isolated volumes to return to an older binary. Never
@@ -141,9 +142,14 @@ Compaction invalidates the index's durable generation before publication, so a
 stale cache falls back to retained-log replay. Corrupt authoritative records
 remain an error, never a reason to trust a cache.
 
-The checked disk installer stages and syncs log, index and gap marker,
+The checked disk installer stages and syncs log, index and gap marker, then
 invalidates the durable source generation, publishes/syncs the marker, replaces
-log then index, and syncs the directory. Reopen accepts either the original log
+log then index, and syncs the directory. It honors cancellation while the
+replacement files remain private. Once durable generation
+invalidation begins, it completes publication even if the maintenance deadline
+expires; real storage failures still fence writes until recovery. Cancellation
+at each of the nine durable stages is checked for immediate write availability,
+unchanged committed offsets and cache-free reopen. Reopen accepts either the original log
 or its fully replaced log; existing startup index reconstruction handles the
 window with a replaced log and old index. The tests kill a subprocess at each
 boundary. They exercise process crashes, not host power loss or every filesystem
@@ -156,6 +162,15 @@ durable segment deletion protocol. Deleting the empty base extends that
 predecessor's logical range. Without the earlier marker, strict startup and
 bootstrap scans would correctly reject an unexplained trailing gap. Crash tests
 cover both the predecessor-marker boundary and completed empty-segment deletion.
+
+The recovery scheduler from the updated main continues to own bootstrap/transfer
+admission. This maintenance path uses ordinary local read views and its own
+interval/deadline; it does not add a remote transfer or another scheduler.
+Linux race regressions cover the consumer bootstrap staging and installation
+slot ordering together with replay and compaction. Native Windows bootstrap
+fixtures can reject a low-space host before exercising recovery (the default
+5% reserve required 24.6 GB on the validation host). The same checks pass in the
+isolated Linux filesystem; the production reserve is not lowered to run them.
 
 The current certification deliberately replays all partitions twice and scans
 the raw committed records once **per candidate segment**. A filtered page can

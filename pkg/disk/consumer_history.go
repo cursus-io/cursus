@@ -131,7 +131,9 @@ func (d *DiskHandler) RewriteConsumerHistory(ctx context.Context, segment Consum
 		return result, fmt.Errorf("history removal references missing records")
 	}
 	result.SegmentsScanned = 1
-	result.RecordsRemoved, result.BytesBefore, result.BytesAfter, err = d.rewriteClosedSegment(segment.first, gaps, func(m types.DiskMessage) bool { _, ok := remove[m.Offset]; return ok }, func(string) error { return ctx.Err() })
+	result.RecordsRemoved, result.BytesBefore, result.BytesAfter, err = d.rewriteClosedSegment(segment.first, gaps, func(m types.DiskMessage) bool { _, ok := remove[m.Offset]; return ok }, func(stage string) error {
+		return consumerHistoryRewriteStage(ctx, stage)
+	})
 	if result.RecordsRemoved > 0 {
 		result.SegmentsRewritten = 1
 	}
@@ -139,6 +141,20 @@ func (d *DiskHandler) RewriteConsumerHistory(ctx context.Context, segment Consum
 		err = d.pruneEmptyConsumerHistorySegment(segment.first, nil)
 	}
 	return result, err
+}
+
+// Cancellation is safe only while replacement files are still private. Once
+// generation invalidation starts authoritative publication, finish all durable
+// stages. Real storage failures still fence writes in rewriteClosedSegment.
+// A maintenance deadline must not leave a healthy handler unavailable until
+// restart, or publish a log without its matching index.
+func consumerHistoryRewriteStage(ctx context.Context, stage string) error {
+	switch stage {
+	case "written", "log_synced", "index_synced", "marker_synced":
+		return ctx.Err()
+	default:
+		return nil
+	}
 }
 
 // Keep the first segment as the logical start anchor. Empty interior segments

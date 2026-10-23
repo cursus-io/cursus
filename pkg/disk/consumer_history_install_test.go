@@ -2,6 +2,8 @@ package disk
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"testing"
@@ -11,6 +13,77 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/stretchr/testify/require"
 )
+
+func TestConsumerHistoryCancellationAtDurableStages(t *testing.T) {
+	for _, stage := range []string{"written", "log_synced", "index_synced", "marker_synced", "generation_invalidated", "marker_published", "log_published", "index_published", "directory_synced"} {
+		t.Run(stage, func(t *testing.T) {
+			cfg := consumerHistoryDiskConfig(t, t.TempDir())
+			r := openConsumerHistoryDisks(t, cfg, 10, true)
+			c := historyDiskCoordinator(t, cfg, r)
+			d := r.handlers[0]
+			generation, err := d.CaptureContentGeneration()
+			require.NoError(t, err)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			reached := false
+			removed, _, _, err := certifyAndRewriteHistorySegment(t, c, r, 0, func(current string) error {
+				if current == stage {
+					reached = true
+					cancel()
+				}
+				return consumerHistoryRewriteStage(ctx, current)
+			})
+			require.True(t, reached)
+			switch stage {
+			case "written", "log_synced", "index_synced", "marker_synced":
+				require.ErrorIs(t, err, context.Canceled)
+				require.Zero(t, removed)
+				require.NoError(t, d.CheckContentGeneration(generation))
+			default:
+				require.NoError(t, err)
+				require.Equal(t, 9, removed)
+				require.ErrorIs(t, d.CheckContentGeneration(generation), ErrStaleContentGeneration)
+			}
+			require.NoError(t, d.writeAvailabilityError(), "maintenance cancellation must not fence healthy writes")
+			assertHistoryDiskRecovery(t, cfg, r, 10)
+			require.NoError(t, d.WriteBatchSync([]types.DiskMessage{{Topic: config.ConsumerOffsetsTopicName, Offset: r.end + 1, Payload: "another uncommitted tail"}}))
+			closeConsumerHistoryDisks(t, r)
+			reopened := openConsumerHistoryDisks(t, cfg, 10, false)
+			recovered := historyDiskCoordinator(t, cfg, reopened)
+			replay, err := recovered.PrepareFullConsumerMetadataReplay(reopened)
+			require.NoError(t, err)
+			require.NoError(t, recovered.ApplyFullConsumerMetadataReplayAndComplete(replay))
+			for partition := range reopened.handlers {
+				require.Equal(t, uint64(10), recovered.ExportState()[fmt.Sprintf("g%d", partition)].Offsets["events"][0])
+			}
+			require.Equal(t, r.end+2, reopened.handlers[0].GetAbsoluteOffset())
+			tail, err := reopened.handlers[0].ReadMessages(r.end, 2)
+			require.NoError(t, err)
+			require.Len(t, tail, 2)
+			require.Equal(t, "uncommitted tail", tail[0].Payload)
+			require.Equal(t, "another uncommitted tail", tail[1].Payload)
+		})
+	}
+}
+
+func TestConsumerHistoryPublicationFailureStillFencesWrites(t *testing.T) {
+	cfg := consumerHistoryDiskConfig(t, t.TempDir())
+	r := openConsumerHistoryDisks(t, cfg, 10, true)
+	c := historyDiskCoordinator(t, cfg, r)
+	failure := errors.New("injected storage publication failure")
+	_, _, _, err := certifyAndRewriteHistorySegment(t, c, r, 0, func(stage string) error {
+		if stage == "log_published" {
+			return failure
+		}
+		return nil
+	})
+	require.ErrorIs(t, err, failure)
+	require.ErrorIs(t, r.handlers[0].writeAvailabilityError(), failure)
+	closeConsumerHistoryDisks(t, r)
+	reopened := openConsumerHistoryDisks(t, cfg, 10, false)
+	assertHistoryDiskRecovery(t, cfg, reopened, 10)
+	require.NoError(t, reopened.handlers[0].writeAvailabilityError())
+}
 
 func TestConsumerHistoryInstallerRejectsStaleOrForgedRemoval(t *testing.T) {
 	cfg := consumerHistoryDiskConfig(t, t.TempDir())
