@@ -65,6 +65,11 @@ func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 }
 
 func (s *BrokerFSMSnapshot) writeVersion() int {
+	for _, group := range s.groupState {
+		if group != nil && group.Cooperative != nil {
+			return SnapshotVersionCooperative
+		}
+	}
 	return SnapshotVersionCurrent
 }
 

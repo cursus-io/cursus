@@ -275,6 +275,9 @@ func ValidateConsumerRecoveryEnvelope(envelope *ConsumerRecoveryEnvelope) error 
 // in the compatibility baseline; live GroupState validation remains unchanged.
 func validateCompatibilityState(state map[string]*GroupStateSnapshot) error {
 	for name, snap := range state {
+		if snap != nil && snap.Cooperative != nil {
+			return fmt.Errorf("historical consumer compatibility state cannot contain cooperative ownership")
+		}
 		if snap == nil || snap.RegistrationEpoch != 0 {
 			if err := ValidateImportState(map[string]*GroupStateSnapshot{name: snap}); err != nil {
 				return err

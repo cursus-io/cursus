@@ -120,6 +120,7 @@ func TestClassifyFencingAndAvailability(t *testing.T) {
 		{"invalid_partition", ErrorClassValidation, false},
 		{"invalid_from_version", ErrorClassValidation, false},
 		{"missing_generation", ErrorClassValidation, false},
+		{"cooperative_protocol_required", ErrorClassValidation, false},
 	}
 	for _, test := range tests {
 		got := ClassifyErrorCode(test.code)

@@ -22,6 +22,7 @@ const (
 	ConsumerMetadataRecordVersionTransactions  = 3
 	ConsumerMetadataRecordVersionLifecycle     = 4
 	ConsumerMetadataRecordVersionReservations  = 5
+	ConsumerMetadataRecordVersionCooperative   = 6
 
 	ConsumerMetadataRecordRegistration                = "group_registration"
 	ConsumerMetadataRecordOffsetSnapshot              = "offset_snapshot"
@@ -62,6 +63,7 @@ type GroupLifecycleSnapshot struct {
 	Partitions      []int                  `json:"partitions,omitempty"`
 	LastActivity    time.Time              `json:"last_activity,omitempty"`
 	LastRebalance   time.Time              `json:"last_rebalance,omitempty"`
+	Cooperative     *CooperativeAssignment `json:"cooperative,omitempty"`
 }
 
 // ConsumerMetadataRecord is the versioned record stored in
@@ -270,6 +272,10 @@ func canonicalConsumerMetadataRecord(record ConsumerMetadataRecord) ConsumerMeta
 	record.InitialOffsets = initial
 	if record.Lifecycle != nil {
 		lifecycle := *record.Lifecycle
+		lifecycle.Cooperative = lifecycle.Cooperative.Clone()
+		if lifecycle.Cooperative != nil {
+			lifecycle.Cooperative.canonicalize()
+		}
 		lifecycle.LastActivity = lifecycle.LastActivity.UTC()
 		lifecycle.LastRebalance = lifecycle.LastRebalance.UTC()
 		lifecycle.Topics = append([]string(nil), lifecycle.Topics...)
@@ -309,11 +315,18 @@ func canonicalOffsetItems(offsets []OffsetItem) []OffsetItem {
 }
 
 func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
-	if record.Version != ConsumerMetadataRecordVersion && record.Version != ConsumerMetadataRecordVersionSubscriptions && record.Version != ConsumerMetadataRecordVersionTransactions && record.Version != ConsumerMetadataRecordVersionLifecycle && record.Version != ConsumerMetadataRecordVersionReservations {
+	if record.Version != ConsumerMetadataRecordVersion && record.Version != ConsumerMetadataRecordVersionSubscriptions && record.Version != ConsumerMetadataRecordVersionTransactions && record.Version != ConsumerMetadataRecordVersionLifecycle && record.Version != ConsumerMetadataRecordVersionReservations && record.Version != ConsumerMetadataRecordVersionCooperative {
 		return fmt.Errorf("unsupported consumer metadata record version %d", record.Version)
 	}
 	if record.Group == "" || record.Epoch == 0 {
 		return fmt.Errorf("consumer metadata record is missing group or epoch")
+	}
+	if record.Version == ConsumerMetadataRecordVersionCooperative {
+		if record.Type != ConsumerMetadataRecordLifecycleSnapshot || record.Lifecycle == nil || record.Lifecycle.Cooperative == nil {
+			return fmt.Errorf("consumer metadata version 6 requires cooperative lifecycle state")
+		}
+	} else if record.Lifecycle != nil && record.Lifecycle.Cooperative != nil {
+		return fmt.Errorf("cooperative lifecycle state requires consumer metadata version 6")
 	}
 	if record.Type == ConsumerMetadataRecordOffsetReservations {
 		if record.Version != ConsumerMetadataRecordVersionReservations || record.Revision == 0 {
@@ -400,7 +413,7 @@ func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
 			return fmt.Errorf("group tombstone contains live metadata fields")
 		}
 	case ConsumerMetadataRecordLifecycleSnapshot:
-		if record.Version != ConsumerMetadataRecordVersionLifecycle || record.Lifecycle == nil {
+		if (record.Version != ConsumerMetadataRecordVersionLifecycle && record.Version != ConsumerMetadataRecordVersionCooperative) || record.Lifecycle == nil {
 			return fmt.Errorf("group lifecycle snapshot is missing version or state")
 		}
 		if record.Topic != "" || record.PartitionCount != 0 || len(record.Offsets) != 0 || len(record.InitialOffsets) != 0 || hasConsumerMetadataTransactionFields(record) {
@@ -410,7 +423,14 @@ func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
 			return err
 		}
 		generation := record.Lifecycle.Generation
-		if generation < 0 || record.Revision != uint64(generation) {
+		if record.Lifecycle.Cooperative != nil {
+			if err := validateCooperativeLifecycle(record.Epoch, record.Lifecycle); err != nil {
+				return err
+			}
+			if record.Revision != record.Lifecycle.Cooperative.Revision {
+				return fmt.Errorf("cooperative lifecycle revision mismatch")
+			}
+		} else if generation < 0 || record.Revision != uint64(generation) {
 			return fmt.Errorf("group lifecycle snapshot revision does not match generation")
 		}
 	default:
@@ -635,6 +655,7 @@ func lifecycleSnapshot(group *GroupMetadata) *GroupLifecycleSnapshot {
 		Partitions:      append([]int(nil), group.Partitions...),
 		LastActivity:    group.LastActivity,
 		LastRebalance:   group.LastRebalance,
+		Cooperative:     group.Cooperative.Clone(),
 	}
 	for _, member := range group.Members {
 		snapshot.Members = append(snapshot.Members, GroupLifecycleMember{
@@ -650,15 +671,23 @@ func (c *Coordinator) writeGroupLifecycleSnapshot(groupName string, epoch uint64
 	if group == nil || group.Generation < 0 {
 		return fmt.Errorf("group lifecycle snapshot has invalid generation")
 	}
-	return c.writeConsumerMetadataRecord(ConsumerMetadataRecord{
-		Version:   ConsumerMetadataRecordVersionLifecycle,
+	version, revision := ConsumerMetadataRecordVersionLifecycle, uint64(group.Generation)
+	if group.Cooperative != nil {
+		version, revision = ConsumerMetadataRecordVersionCooperative, group.Cooperative.Revision
+	}
+	record := ConsumerMetadataRecord{
+		Version:   version,
 		Type:      ConsumerMetadataRecordLifecycleSnapshot,
 		Group:     groupName,
 		Epoch:     epoch,
-		Revision:  uint64(group.Generation),
+		Revision:  revision,
 		Lifecycle: lifecycleSnapshot(group),
 		Timestamp: time.Now().UTC(),
-	})
+	}
+	if err := validateConsumerMetadataRecord(record); err != nil {
+		return err
+	}
+	return c.writeConsumerMetadataRecord(record)
 }
 
 func registrationInitialOffsets(group *GroupMetadata) []TopicOffsetSnapshot {
@@ -1090,6 +1119,7 @@ func (c *Coordinator) recoverConsumerMetadataWithPolicy(reader OffsetLogReader, 
 				continue
 			}
 			recovered.Generation = existing.Generation
+			recovered.Cooperative = existing.Cooperative.Clone()
 			if c.standalone || !existing.LastActivity.IsZero() {
 				recovered.LastActivity = existing.LastActivity
 			}
@@ -1134,6 +1164,21 @@ func selectLifecycleSnapshot(candidates map[string]lifecycleSnapshotCandidate, r
 
 func selectLifecycleSnapshotAt(candidates map[string]lifecycleSnapshotCandidate, record ConsumerMetadataRecord, status *ConsumerMetadataRecoveryStatus, position consumerMetadataRecordPosition, orderedSupersession bool) error {
 	candidate, exists := candidates[record.Group]
+	if exists && record.Epoch == candidate.record.Epoch {
+		if err := validateCooperativeRecordOrder(candidate.record, record); err != nil {
+			return err
+		}
+		if record.Version == ConsumerMetadataRecordVersionCooperative || candidate.record.Version == ConsumerMetadataRecordVersionCooperative {
+			if record.Revision == candidate.record.Revision && !sameConsumerMetadataRecord(record, candidate.record) {
+				return fmt.Errorf("conflicting cooperative lifecycle revision for group %q", record.Group)
+			}
+			if candidate.record.Version == ConsumerMetadataRecordVersionCooperative && record.Version != ConsumerMetadataRecordVersionCooperative &&
+				candidate.position.ordered && position.ordered && candidate.position.partition == position.partition && candidate.position.offset < position.offset {
+				return fmt.Errorf("eager lifecycle follows cooperative ownership for group %q", record.Group)
+			}
+			orderedSupersession = false
+		}
+	}
 	switch {
 	case !exists || record.Epoch > candidate.record.Epoch || (record.Epoch == candidate.record.Epoch && record.Revision > candidate.record.Revision):
 		if exists && status != nil {
@@ -1175,6 +1220,9 @@ func selectLifecycleSnapshotAt(candidates map[string]lifecycleSnapshotCandidate,
 }
 
 func sameEmptyLifecycleState(left, right ConsumerMetadataRecord) bool {
+	if left.Version == ConsumerMetadataRecordVersionCooperative || right.Version == ConsumerMetadataRecordVersionCooperative {
+		return false
+	}
 	if left.Type != ConsumerMetadataRecordLifecycleSnapshot || right.Type != ConsumerMetadataRecordLifecycleSnapshot ||
 		left.Lifecycle == nil || right.Lifecycle == nil || len(left.Lifecycle.Members) != 0 || len(right.Lifecycle.Members) != 0 {
 		return false
@@ -1281,6 +1329,7 @@ func materializeConsumerMetadata(
 			return nil, nil, orphans, fmt.Errorf("lifecycle snapshot does not match registration group=%s", groupName)
 		}
 		group.Generation = lifecycle.Generation
+		group.Cooperative = lifecycle.Cooperative.Clone()
 		group.LastActivity = lifecycle.LastActivity
 		if group.LastActivity.IsZero() {
 			// Version-4 snapshots written before last_activity was added still

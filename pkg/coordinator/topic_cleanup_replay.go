@@ -101,11 +101,12 @@ type cleanupEvidence struct {
 }
 
 type cleanupTarget struct {
-	singleTopic bool
-	group       *GroupMetadata
-	epoch       uint64
-	generation  int
-	evidence    cleanupEvidence
+	singleTopic         bool
+	group               *GroupMetadata
+	epoch               uint64
+	generation          int
+	cooperativeRevision uint64
+	evidence            cleanupEvidence
 }
 
 type topicCleanupScan struct {
@@ -394,7 +395,7 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 				ref, found := topicGroupReferenceLocked(reference.Name, group, topicName)
 				ref.MemberCount = 0
 				valid := found && ref.validateCleanup(topicName) == nil &&
-					group.RegistrationEpoch == target.epoch && group.Generation == target.generation &&
+					group.RegistrationEpoch == target.epoch && group.Generation == target.generation && cooperativeRevision(group) == target.cooperativeRevision &&
 					!c.lifecyclePending[reference.Name] && deletionProven &&
 					evidence.topic == topicName && deletionEpoch > group.RegistrationEpoch &&
 					deletionEpoch > c.groupEpochs[reference.Name]
@@ -531,7 +532,7 @@ func (c *Coordinator) cleanupTargetsCurrent(scan *topicCleanupScan, refs []Topic
 			return false
 		}
 		group.mu.RLock()
-		same := group.RegistrationEpoch == target.epoch && (scan.boundary != nil || group.Generation == target.generation)
+		same := group.RegistrationEpoch == target.epoch && (scan.boundary != nil || (group.Generation == target.generation && cooperativeRevision(group) == target.cooperativeRevision))
 		group.mu.RUnlock()
 		if !same {
 			return false
@@ -550,7 +551,7 @@ func (c *Coordinator) newTopicCleanupScan(topicName string, refs []TopicGroupRef
 			continue
 		}
 		group.mu.RLock()
-		scan.targets[ref.Name] = &cleanupTarget{singleTopic: !ref.Shared && !ref.Pattern, group: group, epoch: group.RegistrationEpoch, generation: group.Generation}
+		scan.targets[ref.Name] = &cleanupTarget{singleTopic: !ref.Shared && !ref.Pattern, group: group, epoch: group.RegistrationEpoch, generation: group.Generation, cooperativeRevision: cooperativeRevision(group)}
 		group.mu.RUnlock()
 	}
 	return scan

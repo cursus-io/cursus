@@ -11,6 +11,7 @@ import (
 const (
 	SnapshotVersionProducerEpoch = 10
 	SnapshotVersionCurrent       = 11
+	SnapshotVersionCooperative   = 12
 	SnapshotVersionLegacyEpoch   = 9
 	CommittedHWMVersionCurrent   = 1
 )

@@ -9,6 +9,7 @@ func sameConsumerSession(installed, replayed *GroupMetadata) bool {
 	if installed.RegistrationEpoch != replayed.RegistrationEpoch ||
 		installed.RegistrationInferred != replayed.RegistrationInferred ||
 		installed.Generation != replayed.Generation ||
+		!sameCooperativeAssignment(installed.Cooperative, replayed.Cooperative) ||
 		installed.TopicName != replayed.TopicName ||
 		installed.TopicPattern != replayed.TopicPattern ||
 		!installed.LastRebalance.Equal(replayed.LastRebalance) ||

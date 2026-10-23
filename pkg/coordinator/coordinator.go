@@ -135,6 +135,7 @@ type GroupMetadata struct {
 	OffsetReservations   []TransactionOffsetReservation
 	ReservationRevision  uint64
 	ReservationDecisions map[string]OffsetReservationDecision
+	Cooperative          *CooperativeAssignment // nil preserves the eager protocol
 }
 
 // MemberMetadata holds state for a single consumer instance.
@@ -170,6 +171,7 @@ type GroupStateSnapshot struct {
 	ReservationRevision  uint64                               `json:"reservation_revision,omitempty"`
 	ReservationDecisions map[string]OffsetReservationDecision `json:"reservation_decisions,omitempty"`
 	Deleted              bool                                 `json:"deleted,omitempty"`
+	Cooperative          *CooperativeAssignment               `json:"cooperative,omitempty"`
 }
 
 // GroupStatus represents the status of a consumer group
@@ -772,6 +774,9 @@ func (c *Coordinator) validateMemberGenerationLocked(groupName, memberID string,
 	if group == nil {
 		return fmt.Sprintf("ERROR: group_not_found group=%s", groupName)
 	}
+	if group.Cooperative != nil {
+		return errCooperativeProtocolRequired.Error()
+	}
 	if memberID == "" {
 		return "ERROR: missing_member"
 	}
@@ -1039,6 +1044,7 @@ func (c *Coordinator) exportStateWithLockMode(onlyGroup *string, nonblocking boo
 			OffsetReservations:   cloneOffsetReservations(group.OffsetReservations),
 			ReservationRevision:  group.ReservationRevision,
 			ReservationDecisions: cloneReservationDecisions(group.ReservationDecisions),
+			Cooperative:          group.Cooperative.Clone(),
 		}
 		for mid, member := range group.Members {
 			assignments := make([]int, len(member.Assignments))
@@ -1111,6 +1117,7 @@ func (c *Coordinator) importStateLocked(state map[string]*GroupStateSnapshot) er
 			OffsetReservations:   cloneOffsetReservations(snap.OffsetReservations),
 			ReservationRevision:  snap.ReservationRevision,
 			ReservationDecisions: cloneReservationDecisions(snap.ReservationDecisions),
+			Cooperative:          snap.Cooperative.Clone(),
 		}
 		for mid, assignments := range snap.Members {
 			group.Members[mid] = &MemberMetadata{
@@ -1150,6 +1157,9 @@ func ValidateImportState(state map[string]*GroupStateSnapshot) error {
 			return fmt.Errorf("consumer group %q snapshot is missing registration epoch; clean bootstrap is required", name)
 		}
 		if snap.Deleted {
+			if snap.Cooperative != nil {
+				return fmt.Errorf("consumer group %q tombstone contains cooperative ownership", name)
+			}
 			if len(snap.OffsetReservations) != 0 || snap.ReservationRevision != 0 || len(snap.ReservationDecisions) != 0 {
 				return fmt.Errorf("consumer group %q tombstone contains offset reservations", name)
 			}
@@ -1163,6 +1173,9 @@ func ValidateImportState(state map[string]*GroupStateSnapshot) error {
 		}
 		if snap.Generation < 0 {
 			return fmt.Errorf("consumer group %q snapshot has negative generation %d", name, snap.Generation)
+		}
+		if err := validateCooperativeSnapshot(snap); err != nil {
+			return fmt.Errorf("consumer group %q: %w", name, err)
 		}
 		if (len(snap.OffsetReservations) != 0 || len(snap.ReservationDecisions) != 0) && snap.ReservationRevision == 0 {
 			return fmt.Errorf("consumer group %q reservations lack a durable revision", name)
