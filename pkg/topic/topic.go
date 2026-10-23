@@ -16,6 +16,7 @@ const DefaultConsumerBufSize = 1000
 
 // Topic represents a logical message stream divided into partitions and consumer groups.
 type Topic struct {
+	retentionTimeGate func() bool
 	Name              string
 	Partitions        []*Partition
 	counter           uint64
@@ -319,6 +320,7 @@ func (t *Topic) applyFullDefinitionLocked(definition Definition, hp HandlerProvi
 		partition.validateBootstrapDefinition(definition)
 		partition.SetTransactionDecisionResolver(t.txnResolver)
 		partition.SetDistributedCompactionGate(t.compactionGate)
+		partition.retentionTimeGate = t.retentionTimeGate
 		partition.isIdempotent = t.IsIdempotent
 		if err := partition.RecoverProducerStateFromLog(); err != nil {
 			partition.setProducerRecoveryError(fmt.Errorf("recover producer state: %w", err))

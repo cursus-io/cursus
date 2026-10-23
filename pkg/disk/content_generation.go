@@ -152,6 +152,7 @@ func (d *DiskHandler) contentGenerationLocked() ContentGeneration {
 
 // Caller holds mu, immediately before a potentially destructive operation.
 func (d *DiskHandler) advanceContentGenerationLocked() error {
+	d.retentionTimes = nil
 	if _, err := replaceCleanupGeneration(d.BaseName, false); err != nil {
 		return d.markWriteUnavailable(err)
 	}

@@ -262,6 +262,11 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
+					if cfg.RetentionTimeEnabled {
+						if err := clusterController.ActivateRetentionTime(rm); err != nil {
+							util.Debug("retention time activation pending: %v", err)
+						}
+					}
 					if err := clusterController.ActivateConsumerMetadataRouting(rm); err != nil {
 						util.Debug("consumer routing activation pending: %v", err)
 					}

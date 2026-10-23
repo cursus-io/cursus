@@ -23,7 +23,16 @@ uint32_be serializedLength
 byte[serializedLength] serializedDiskMessage
 ```
 
-The maximum accepted serialized record size is 16 MiB. New records use the `CDM5` magic. The serialized message uses big-endian fixed-width integers and length-prefixed strings/bytes in this order:
+The maximum accepted serialized record size is 16 MiB. Legacy-time records use
+`CDM5`; durable broker-time activation writes `CDM6`. CDM6 adds an eight-byte,
+positive Unix-millisecond broker append time immediately before the checksum,
+and includes that field and its magic in CRC32C. Zero time continues to use CDM5;
+CDM6 with zero, negative, overflowing or corrupt time is rejected. See the
+[retention contract](../../durable-retention-time-operations.md) for activation,
+legacy holds, replication preservation and downgrade fences.
+
+The CDM5 serialized message uses big-endian fixed-width integers and
+length-prefixed strings/bytes in this order:
 
 | Field | Encoding |
 |---|---|

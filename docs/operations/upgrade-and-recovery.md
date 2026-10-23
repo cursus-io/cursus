@@ -4,7 +4,7 @@
 
 | Persistent artifact | Current writer | Older reader support | Upgrade rule |
 |---|---:|---|---|
-| Application record | CDM5 (CRC32C and leader epoch) | CDM2, CDM3, and CDM4 records remain readable | Upgrade every reader before a CDM5 writer appends; older binaries cannot read the new records. |
+| Application record | CDM6 (CRC32C, leader epoch and broker append time), CDM5 until activation | CDM2 through CDM5 remain readable | See the [durable retention upgrade contract](../durable-retention-time-operations.md): capability activation, local Raft marker 12 and standalone manifest fencing prevent unsafe downgrade. |
 | Topic manifest | 4 | version 3 remains readable without invented instance/receipt evidence | Validate an offline copy before coordinated upgrade; no downgrade after version 4 is written. |
 | Transaction journal | 3 plus checksummed cut manifest | version-1 and version-2 records remain readable | Preserve the journal and its manifest with all partition and offset data. Version 3 writes bounded deltas between full checkpoints. |
 | Event snapshot catalog | v2 (CRC32C) | legacy snapshot files remain readable beside v2 | Preserve both snapshot files until a clean bootstrap removes the legacy boundary. |

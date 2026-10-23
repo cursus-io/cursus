@@ -12,9 +12,9 @@ var (
 
 const (
 	WireProtocolVersion   = "2"
-	BrokerProtocolVersion = "8"
+	BrokerProtocolVersion = "9"
 	SnapshotFormatVersion = "11"
-	RecordFormatVersion   = "CDM5"
+	RecordFormatVersion   = "CDM6"
 )
 
 func VerifyDeploymentContract() error {

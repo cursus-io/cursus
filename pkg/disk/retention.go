@@ -166,7 +166,17 @@ func (d *DiskHandler) EnforceRetention(cfg *config.Config) {
 	if d.internalMetadata {
 		return
 	}
-	d.maintenanceMu.Lock()
+	boundary, release, err := d.retentionBoundary()
+	if err != nil {
+		metrics.RecordRetentionHold("partition_unavailable")
+		return
+	}
+	defer release()
+	// Compaction may hold maintenanceMu while sampling a partition gate. Never
+	// wait for it while retaining the partition visibility/commit locks.
+	if !d.maintenanceMu.TryLock() {
+		return
+	}
 	defer d.maintenanceMu.Unlock()
 	if d.writeAvailabilityError() != nil {
 		return
@@ -209,30 +219,49 @@ func (d *DiskHandler) EnforceRetention(cfg *config.Config) {
 		}
 	}
 
-	now := time.Now()
+	now := d.timeNow()
 	limits := d.effectiveRetention(cfg)
-	retentionDuration := time.Duration(limits.hours) * time.Hour
 
 	for i := 0; i < len(metas)-1; i++ {
 		meta := metas[i]
+		nextBase, parseErr := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(metas[i+1].path, d.BaseName+"_segment_"), ".log"), 10, 64)
+		if parseErr != nil || nextBase > boundary {
+			metrics.RecordRetentionHold("committed_boundary")
+			break
+		}
 
-		if meta.info.Mode().Perm() != 0444 {
+		if meta.info.Mode().Perm() != 0400 {
 			_ = os.Chmod(meta.path, 0o400)
 			indexPath := strings.TrimSuffix(meta.path, ".log") + ".index"
 			_ = os.Chmod(indexPath, 0o400)
 			util.Debug("Segment %s secured (read-only)", filepath.Base(meta.path))
 		}
 
-		isExpired := limits.hours > 0 && now.Sub(meta.info.ModTime()) > retentionDuration
+		isExpired := d.timeExpiredLocked(meta.path, meta.info, now, limits.hours)
 		isOverCapacity := limits.bytes > 0 && totalSize > limits.bytes
 		if isExpired || isOverCapacity {
+			evidence := d.segmentTimeLocked(meta.path, meta.info)
+			if evidence.err != nil || evidence.protected {
+				if evidence.err != nil {
+					metrics.RecordRetentionHold("corrupt_data")
+				} else {
+					metrics.RecordRetentionHold("event_history")
+				}
+				break
+			}
 			fileSize := meta.info.Size()
+			// Prefix deletion preserves evidence for untouched remaining segments.
+			summaries := d.retentionTimes
 			if err := d.markAsDeletedLocked(meta.path); err == nil {
+				delete(summaries, meta.path)
+				d.retentionTimes = summaries
 				totalSize -= fileSize
 			} else {
 				util.Debug("retention failed to delete %s: %v", meta.path, err)
 				break
 			}
+		} else {
+			break
 		}
 	}
 }

@@ -1,0 +1,44 @@
+=== RUN   TestRetentionRecoveryBaselineMtimeDrift
+2026/10/23 02:40:54 [DEBUG] Success: From=0 To=0 (Count=1, Range: [0-0])
+    retention_recovery_baseline_test.go:40: baseline path=original bytes=110 mtime=2026-10-23T02:40:54.366539758Z cutoff=2026-10-23T03:40:54.366539759Z expired=true
+    retention_recovery_baseline_test.go:40: baseline path=incremental bytes=110 mtime=2026-10-23T02:40:54.486541339Z cutoff=2026-10-23T03:40:54.366539759Z expired=false
+    retention_recovery_baseline_test.go:40: baseline path=bootstrap bytes=110 mtime=2026-10-23T02:40:54.556542262Z cutoff=2026-10-23T03:40:54.366539759Z expired=false
+--- PASS: TestRetentionRecoveryBaselineMtimeDrift (0.35s)
+=== RUN   TestRetentionTimeRecoveryWork
+2026/10/23 02:40:54 [DEBUG] Segment partition_1_segment_00000000000000000000.log secured (read-only)
+    retention_time_benchmark_test.go:125: records=4096 retained_log_bytes=4661248 legacy_log_bytes=4628480 metadata_overhead_bytes=32768 summary_read_bytes=4661248 summary_records=4096 summary_write_bytes=0 summary_temp_bytes=0 warm_extra_read_bytes=0
+    retention_time_benchmark_test.go:126: retained_all_file_lengths_bytes=6758400 (includes allocated index file lengths; not physical blocks)
+    retention_time_benchmark_test.go:127: subsequent_bootstrap page_read_bytes=4665816 page_decoded_records=4100 canonical_write_bytes=4661248 hash_read_bytes=4661248 chunk_transfer_bytes=4661248 export_payload_temp_bytes=4661248 pages=5 (logical API bytes; no physical I/O attribution)
+--- PASS: TestRetentionTimeRecoveryWork (0.16s)
+=== RUN   TestDurableRetentionRecoveryGranularity
+2026/10/23 02:40:54 [DEBUG] Success: From=0 To=1 (Count=2, Range: [0-1])
+2026/10/23 02:40:55 [DEBUG] Success: From=0 To=1 (Count=2, Range: [0-1])
+2026/10/23 02:40:55 [DEBUG] Segment partition_1_segment_00000000000000000000.log secured (read-only)
+2026/10/23 02:40:55 [DEBUG] Segment partition_1_segment_00000000000000000001.log secured (read-only)
+    retention_time_test.go:127: original reconstruction={ReadBytes:236 Records:2 Rebuilds:2 CacheHits:5 UnknownSegments:0 InvalidSegments:0} export={Pages:1 CanonicalWriteBytes:236 HashReadBytes:236}
+2026/10/23 02:40:55 [DEBUG] Success: From=0 To=1 (Count=2, Range: [0-1])
+2026/10/23 02:40:55 [DEBUG] Segment partition_1_segment_00000000000000000000.log secured (read-only)
+2026/10/23 02:40:55 [DEBUG] Segment partition_1_segment_00000000000000000001.log secured (read-only)
+    retention_time_test.go:127: incremental reconstruction={ReadBytes:236 Records:2 Rebuilds:2 CacheHits:5 UnknownSegments:0 InvalidSegments:0} export={Pages:1 CanonicalWriteBytes:236 HashReadBytes:236}
+2026/10/23 02:40:55 [DEBUG] Success: From=0 To=1 (Count=2, Range: [0-1])
+2026/10/23 02:40:55 [DEBUG] Segment partition_1_segment_00000000000000000000.log secured (read-only)
+    retention_time_test.go:127: bootstrap reconstruction={ReadBytes:236 Records:2 Rebuilds:1 CacheHits:4 UnknownSegments:0 InvalidSegments:0} export={Pages:1 CanonicalWriteBytes:236 HashReadBytes:236}
+--- PASS: TestDurableRetentionRecoveryGranularity (0.34s)
+goos: linux
+goarch: amd64
+pkg: github.com/cursus-io/cursus/pkg/disk
+cpu: 13th Gen Intel(R) Core(TM) i5-1340P
+BenchmarkRetentionTimeSummary
+BenchmarkRetentionTimeSummary/cold
+2026/10/23 02:40:55 [DEBUG] Segment partition_1_segment_00000000000000000000.log secured (read-only)
+2026/10/23 02:40:55 [DEBUG] Segment partition_1_segment_00000000000000000000.log secured (read-only)
+2026/10/23 02:40:56 [DEBUG] Segment partition_1_segment_00000000000000000000.log secured (read-only)
+BenchmarkRetentionTimeSummary/cold-2         	     165	   8399192 ns/op	   4661248 read-B/op	      4096 records/op	         0 write-B/op	 8994258 B/op	   16426 allocs/op
+BenchmarkRetentionTimeSummary/warm
+2026/10/23 02:40:57 [DEBUG] Segment partition_1_segment_00000000000000000000.log secured (read-only)
+2026/10/23 02:40:57 [DEBUG] Segment partition_1_segment_00000000000000000000.log secured (read-only)
+2026/10/23 02:40:57 [DEBUG] Segment partition_1_segment_00000000000000000000.log secured (read-only)
+2026/10/23 02:40:58 [DEBUG] Segment partition_1_segment_00000000000000000000.log secured (read-only)
+BenchmarkRetentionTimeSummary/warm-2         	   57249	     18085 ns/op	         0 read-B/op	         0 records/op	         0 write-B/op	    2103 B/op	      27 allocs/op
+PASS
+PROCESS wall=4.930324336s user_cpu=3.175747s system_cpu=1.552587s maxrss_KiB=33920 (includes startup, fixtures, tests and teardown)

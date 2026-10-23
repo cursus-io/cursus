@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
@@ -31,7 +32,8 @@ const (
 	ReplicaGapRecoveryProtocolVersion      = 6
 	TruncateReceiptProtocolVersion         = 7
 	TruncateCleanupBoundaryProtocolVersion = 8
-	BrokerProtocolVersionCurrent           = TruncateCleanupBoundaryProtocolVersion
+	RetentionTimeProtocolVersion           = 9
+	BrokerProtocolVersionCurrent           = RetentionTimeProtocolVersion
 	// Recovery capabilities are additive and do not raise lifecycle requirements.
 	IndexedRecoveryProtocolVersion   = 1
 	BootstrapRecoveryProtocolVersion = 2
@@ -72,6 +74,7 @@ type TransactionCoordinatorShard struct {
 
 type BrokerFSMState struct {
 	TopicCleanupBoundaries           map[string]*coordinator.TopicCleanupBoundary   `json:"topicCleanupBoundaries,omitempty"`
+	RetentionTimeActivated           bool                                           `json:"retentionTimeActivated,omitempty"`
 	Version                          int                                            `json:"version"`
 	Applied                          uint64                                         `json:"applied"`
 	Logs                             map[uint64]*ReplicationEntry                   `json:"logs"`
@@ -92,6 +95,8 @@ type BrokerFSMState struct {
 
 type BrokerFSM struct {
 	topicCleanupBoundaries map[string]*coordinator.TopicCleanupBoundary
+	retentionTimeFlag      atomic.Bool
+	retentionTimeActivated bool
 	notifiers              map[string]chan interface{}
 	mu                     sync.RWMutex
 	transitionMu           contextlock.RWMutex
@@ -335,6 +340,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyOffsetSyncCommand(strings.TrimPrefix(data, "OFFSET_SYNC:"))
 	case strings.HasPrefix(data, "BATCH_OFFSET:"):
 		res = f.applyBatchOffsetSyncCommand(strings.TrimPrefix(data, "BATCH_OFFSET:"))
+	case strings.HasPrefix(data, "RETENTION_TIME_ACTIVATE:"):
+		res = f.applyRetentionTimeActivation(strings.TrimPrefix(data, "RETENTION_TIME_ACTIVATE:"))
 	case strings.HasPrefix(data, "TXN_SYNC:"):
 		res = f.applyTransactionSyncCommand(strings.TrimPrefix(data, "TXN_SYNC:"))
 	default:
@@ -382,6 +389,11 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	if err := decodeStrictJSON(snapshotData, &state); err != nil {
 		util.Error("Failed to decode snapshot version %d: %v", header.Version, err)
 		return fmt.Errorf("failed to restore snapshot version %d: %w", header.Version, err)
+	}
+	if state.RetentionTimeActivated {
+		if err := validateRetentionTimeBrokers(state.Brokers); err != nil {
+			return err
+		}
 	}
 	util.Info("FSM Restore: Validating snapshot Version %d", state.Version)
 	persistedShardCount := state.TransactionCoordinatorShardCount
@@ -473,6 +485,8 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	f.topicState = restoredTopicState
 	f.topicCleanupBoundaries = copyTopicCleanupBoundaries(state.TopicCleanupBoundaries)
 	f.transactionCoordinatorShardCount = persistedShardCount
+	f.retentionTimeActivated = state.RetentionTimeActivated
+	f.retentionTimeFlag.Store(state.RetentionTimeActivated)
 	f.offsetReservationsActivated = state.OffsetReservationsActivated
 	f.consumerMetadataRoutingActivated = state.ConsumerMetadataRoutingActivated
 	f.transactionCoordinatorShards = state.TransactionCoordinatorShards
@@ -916,6 +930,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		nextProducerEpoch:                nextProducerEpoch,
 		transactionCoordinatorShards:     transactionCoordinatorShards,
 		transactionCoordinatorShardCount: f.effectiveTransactionCoordinatorShardCountLocked(),
+		retentionTimeActivated:           f.retentionTimeActivated,
 		offsetReservationsActivated:      f.offsetReservationsActivated,
 		consumerMetadataRoutingActivated: f.consumerMetadataRoutingActivated,
 		topicState:                       topicStateCopy,

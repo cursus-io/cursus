@@ -69,9 +69,11 @@ func TestReplicaRollbackRejectsRetentionDuringRawRebuild(t *testing.T) {
 		d.EnforceRetention(cfg)
 		return nil
 	}}
-	require.ErrorIs(t, p.ApplyReplicaRollbackChecked(context.Background(), 4, 5, nil, 5, nil), disk.ErrStaleContentGeneration)
-	require.Equal(t, uint64(3), d.GetFirstOffset())
-	require.ErrorIs(t, p.RecoveryError(), ErrReplicaRollbackFailed)
+	// Retention now holds during the exclusive rollback view, rather than
+	// deleting the prefix and forcing recovery to reject a stale generation.
+	require.NoError(t, p.ApplyReplicaRollbackChecked(context.Background(), 4, 5, nil, 5, nil))
+	require.Equal(t, uint64(0), d.GetFirstOffset())
+	require.NoError(t, p.RecoveryError())
 	require.Equal(t, uint64(4), p.NextOffset())
 	require.Equal(t, uint64(4), p.GetHWM())
 }
