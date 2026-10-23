@@ -193,3 +193,15 @@ func TestCooperativeRuntimeRetainedGrantDuringDurableHandoff(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, uint64(5), offset)
 }
+
+func TestCooperativeRuntimeRejectsNegativeLegacyGeneration(t *testing.T) {
+	c, parts, records := runtimeCooperativeFixture(t, 1)
+	c.mu.Lock()
+	c.groups["workers"].Generation = -1
+	c.mu.Unlock()
+	writes := len(*records)
+	_, err := c.ReconcileCooperative("workers", "a", 0, 0, parts, nil, false)
+	require.ErrorContains(t, err, "invalid_generation")
+	require.Nil(t, c.ExportGroupState("workers").Cooperative)
+	require.Len(t, *records, writes)
+}

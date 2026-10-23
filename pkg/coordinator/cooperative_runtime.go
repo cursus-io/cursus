@@ -48,6 +48,10 @@ func (c *Coordinator) ReconcileCooperative(groupName, member string, registratio
 			c.mu.Unlock()
 			return CooperativeMembership{}, fmt.Errorf("ERROR: cooperative_protocol_required")
 		}
+		if group.Generation < 0 {
+			c.mu.Unlock()
+			return CooperativeMembership{}, fmt.Errorf("ERROR: invalid_generation")
+		}
 		state, err = NewCooperativeAssignment(group.RegistrationEpoch, partitions)
 		if err == nil {
 			state.Revision = uint64(group.Generation) + 1

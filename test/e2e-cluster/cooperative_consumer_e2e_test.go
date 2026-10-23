@@ -72,6 +72,11 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	}
 	cfg := cooperativeE2EConfig(addrs)
 	sendClusterTopicCommand(t, addrs, "CREATE topic="+cfg.Topic+" partitions=6 replication_factor=3 idempotent=true")
+	// METADATA is local; DESCRIBE forwards to the leader and cannot prove
+	// that the selected group coordinator has applied topic creation yet.
+	for node := 1; node <= 3; node++ {
+		require.NoError(t, fixture.WhenCluster().WaitForLocalTopicDefinition(node, LocalTopicDefinition{Topic: cfg.Topic, Partitions: 6, CleanupPolicy: "delete"}, true))
+	}
 	require.Eventually(t, func() bool {
 		for _, addr := range addrs {
 			admin, err := sdk.NewAdminClient(&sdk.AdminConfig{BrokerAddrs: []string{addr}, RequestTimeoutMS: 1000})
