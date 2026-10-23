@@ -12,7 +12,7 @@ ordering rather than assume physical order implies sequence order.
 
 The maintenance path captures a detached compatibility baseline without closing
 consumer admission, certifies ordinary fixed read views outside live admission,
-then acquire a new lease and FSM fence to install a generation-checked closed
+then acquires a new lease and FSM fence to install a generation-checked closed
 segment. Ordinary suffix appends may advance the committed end; prefix changes,
 restore, lifecycle or compatibility changes invalidate the work. No live state
 is installed and membership clocks are never rewritten. Empty interior segments
@@ -82,7 +82,7 @@ tail, original offsets, topic/partition identity and producer continuity.
 - Disk replacement faults before source generation invalidation, after marker
   publication, after log replacement and after index replacement. Reopen and
   replay both possible durable outcomes; no recovery cache is required.
-- Producer/control/transaction records and uncommitted tails are never selected
+- Producer recovery witnesses, control/transaction records and uncommitted tails are never selected
   for deletion. Bootstrap and snapshot replacement must invalidate old plans.
 
 ## Format, upgrade and downgrade
@@ -172,8 +172,8 @@ key/payload bytes, rewrite frame bytes, temporary file sizes and kernel physical
 I/O. Source/rewrite sync counters count instrumented successful boundaries; they
 are not a complete syscall trace (identity creation and reopen work are outside
 those counters). Transfer is zero because the fixture is local. Whole broker
-startup/failover, cold OS-cache recovery, normal request latency and cluster
-activation/replica compatibility remain unmeasured acceptance conditions.
+startup/failover and cold OS-cache recovery remain unmeasured acceptance
+conditions. The cluster correctness and request-latency sample below is separate.
 
 ## Earlier certificate-only measurements (2026-10-23)
 
@@ -268,8 +268,34 @@ empty-segment-pruning process-crash boundaries. A queued recovery during JOIN
 must return the generation captured from the durable lifecycle candidate;
 a second admitted getter must not fabricate a successful generation-zero reply.
 
+An isolated three-broker integration run passed at source `f301a0a` in 428.901 s
+(package elapsed time, including Docker image build, cluster setup and cleanup;
+Go compilation before the package run is excluded). Four groups committed 400
+offset updates in 71.786 s. Commit completion p50/p95/max were
+164.218/273.896/439.695 ms, including retries; 388 availability retries were
+counted across commit and heartbeat commands. Each broker was limited to one CPU
+and 1 GiB. Every replica removed at least 20 records. TRUNCATE and DELETE followed
+by recreation reset the target offsets while the unrelated member retained its
+generation, heartbeat admission and offset 17.
+
+That run removed the derived cache immediately before each running-container
+restart; restart-to-ready/full-ISR was 12.279/9.779/8.760 s. Because the process
+could theoretically republish the cache before stopping, these timings alone do
+not certify a cache miss. The test now stops the broker first, removes and checks
+the cache through an isolated helper using the exact existing image/volume, then
+times start-to-ready/full-ISR. Shutdown and cache removal are excluded from that
+new timing. Neither sequence drops OS caches. Broker CPU/peak heap/device I/O,
+transfer bytes and total fsync counts were not measured in this cluster sample;
+the local-storage measurements above must not be substituted for them.
+
+The current production path requires all metadata partitions to have ordinary
+local committed coverage. Layouts lacking that coverage defer compaction; they
+do not acquire partial deletion authority or reuse remote transfer caches as
+current-state snapshots.
+
 Whole cold broker startup/failover across the history ladder, transactional
 intent/control history reclamation, and a proven maintenance-throughput bound
-remain separate acceptance conditions. Retaining necessary deleted-name fences
+and compaction without complete local metadata coverage remain separate acceptance
+conditions. Retaining necessary deleted-name fences
 or decisions is authoritative state growth, and is not bounded by live-group
 count alone. Do not close the history-growth issue based only on these results.

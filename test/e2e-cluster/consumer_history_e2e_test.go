@@ -89,15 +89,24 @@ func TestConsumerHistoryCompactionRecovery(t *testing.T) {
 	}
 	for node := 1; node <= 3; node++ {
 		name := cleanupContainerName(node)
-		// Only the derived index in this test's isolated volume is removed.
-		output, err := exec.Command("docker", "exec", name, "rm", "-f", "/app/cluster-logs/.consumer-replay-index.json").CombinedOutput()
+		output, err := exec.Command("docker", "inspect", "--format", "{{.Image}}", name).CombinedOutput()
 		require.NoError(t, err, string(output))
+		imageID := strings.TrimSpace(string(output))
+		output, err = exec.Command("docker", "stop", name).CombinedOutput()
+		require.NoError(t, err, string(output))
+		// Remove the disposable cache only after the writer has stopped. Reuse
+		// this fixture's exact image and volume, with no network or image pull.
+		output, err = exec.Command("docker", "run", "--rm", "--network", "none", "--pull", "never",
+			"--volumes-from", name, "--entrypoint", "/bin/sh", imageID, "-c",
+			"rm -f /app/cluster-logs/.consumer-replay-index.json && test ! -e /app/cluster-logs/.consumer-replay-index.json").CombinedOutput()
+		require.NoError(t, err, string(output))
+		// The measured start excludes shutdown and explicit cache removal.
 		start = time.Now()
-		output, err = exec.Command("docker", "restart", name).CombinedOutput()
+		output, err = exec.Command("docker", "start", name).CombinedOutput()
 		require.NoError(t, err, string(output))
 		require.NoError(t, actions.waitForNodeHealth(node, fmt.Sprintf("http://localhost:%d/ready", healthPort(node))))
 		waitForStableFullISRAndZeroUnderReplicated(t, ctx, "history cache-miss restart")
-		t.Logf("node=%d restart-to-ready-and-full-ISR=%s OS cache not dropped", node, time.Since(start))
+		t.Logf("node=%d cache-absent-start-to-ready-and-full-ISR=%s OS cache not dropped; shutdown/cache removal excluded", node, time.Since(start))
 	}
 	for i := 0; i < 4; i++ {
 		group := fmt.Sprintf("history-group-%d", i)
