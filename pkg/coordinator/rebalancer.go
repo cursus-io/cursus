@@ -432,13 +432,17 @@ func (c *Coordinator) addConsumer(groupName, consumerID string, mode lifecycleWr
 
 	now := time.Now()
 	candidate := cloneGroupLifecycle(group)
-	candidate.Members[consumerID] = &MemberMetadata{
-		ID:            consumerID,
-		LastHeartbeat: now,
+	member := candidate.Members[consumerID]
+	if member == nil || mode == replayLifecycle {
+		member = &MemberMetadata{ID: consumerID}
+		candidate.Members[consumerID] = member
 	}
+	// A rejoin still fences the previous generation, but its valid assignment
+	// is useful input to the sticky assignor.
+	member.LastHeartbeat = now
 	candidate.Generation++
 
-	rebalanceGroup(candidate)
+	mode.rebalance(candidate)
 	assignments := append([]int(nil), candidate.Members[consumerID].Assignments...)
 	gen := candidate.Generation
 	c.lifecyclePending[groupName] = true
@@ -523,7 +527,7 @@ func (c *Coordinator) removeConsumerForGeneration(groupName, consumerID string, 
 	candidate := cloneGroupLifecycle(group)
 	delete(candidate.Members, consumerID)
 	candidate.Generation++
-	rebalanceGroup(candidate)
+	mode.rebalance(candidate)
 	c.lifecyclePending[groupName] = true
 	memberCount, newGeneration := len(candidate.Members), candidate.Generation
 	c.mu.Unlock()
@@ -579,7 +583,7 @@ func (c *Coordinator) expireConsumers(groupName string, expectedGeneration int, 
 		return nil
 	}
 	candidate.Generation++
-	rebalanceGroup(candidate)
+	mode.rebalance(candidate)
 	c.lifecyclePending[groupName] = true
 	c.mu.Unlock()
 	return c.persistAndApplyLifecycle(groupName, group, candidate, mode)
@@ -647,7 +651,8 @@ func (c *Coordinator) Rebalance(groupName string) {
 	c.rebalanceRange(groupName)
 }
 
-// rebalanceRange redistributes partitions among consumers using range-based assignment.
+// rebalanceRange retains the historical entry point for explicit rebalances.
+// Assignment is sticky; membership changes still fence the entire generation.
 func (c *Coordinator) rebalanceRange(groupName string) {
 	group := c.groups[groupName]
 	if group == nil {
@@ -676,60 +681,42 @@ func rebalanceGroup(group *GroupMetadata) {
 		return
 	}
 
-	if len(group.TopicPartitions) > 0 {
+	if len(group.TopicPartitions) > 0 || len(group.Topics) > 0 || group.TopicPattern != "" {
 		rebalanceTopicPartitions(group, members)
 		group.LastRebalance = time.Now()
 		return
 	}
 
-	pCount := len(group.Partitions)
-	mCount := len(members)
-	partitionsPerConsumer := pCount / mCount
-	remainder := pCount % mCount
-
-	partitionIdx := 0
-	for i, memberID := range members {
-		count := partitionsPerConsumer
-		if i < remainder {
-			count++
-		}
-
-		var newAssignments []int
-		if partitionIdx < pCount {
-			end := partitionIdx + count
-			if end > pCount {
-				end = pCount
-			}
-			// Copy the slice to avoid sharing the backing array with group.Partitions
-			newAssignments = make([]int, end-partitionIdx)
-			copy(newAssignments, group.Partitions[partitionIdx:end])
-		}
-
-		group.Members[memberID].Assignments = newAssignments
-		partitionIdx += len(newAssignments)
-
-		util.Info("📋 Assigned %v to %s", newAssignments, memberID)
+	partitions := slices.Clone(group.Partitions)
+	slices.Sort(partitions)
+	previous := make(map[string][]int, len(members))
+	for _, id := range members {
+		previous[id] = group.Members[id].Assignments
+	}
+	assignments := stickyAssignments(slices.Compact(partitions), members, previous)
+	for _, id := range members {
+		group.Members[id].Assignments = assignments[id]
+		group.Members[id].TopicAssignments = nil
+		util.Info("📋 Assigned %v to %s", assignments[id], id)
 	}
 }
 
 func rebalanceTopicPartitions(group *GroupMetadata, members []string) {
-	pCount := len(group.TopicPartitions)
-	mCount := len(members)
-	partitionsPerConsumer := pCount / mCount
-	remainder := pCount % mCount
-	partitionIdx := 0
-	for i, memberID := range members {
-		count := partitionsPerConsumer
-		if i < remainder {
-			count++
+	partitions := slices.Clone(group.TopicPartitions)
+	sort.Slice(partitions, func(i, j int) bool {
+		if partitions[i].Topic != partitions[j].Topic {
+			return partitions[i].Topic < partitions[j].Topic
 		}
-		end := partitionIdx + count
-		if end > pCount {
-			end = pCount
-		}
-		member := group.Members[memberID]
+		return partitions[i].Partition < partitions[j].Partition
+	})
+	previous := make(map[string][]TopicPartition, len(members))
+	for _, id := range members {
+		previous[id] = group.Members[id].TopicAssignments
+	}
+	assignments := stickyAssignments(slices.Compact(partitions), members, previous)
+	for _, id := range members {
+		member := group.Members[id]
 		member.Assignments = nil
-		member.TopicAssignments = append([]TopicPartition(nil), group.TopicPartitions[partitionIdx:end]...)
-		partitionIdx = end
+		member.TopicAssignments = assignments[id]
 	}
 }
