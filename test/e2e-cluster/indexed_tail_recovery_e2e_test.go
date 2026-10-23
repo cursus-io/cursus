@@ -3,6 +3,7 @@ package e2e_cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -66,11 +67,24 @@ func readRecoveryHistory(t *testing.T, history string, node, leader, epoch int, 
 		SourceBroker: fmt.Sprintf("broker-%d-9000", node), CommittedHWM: end, MaxRecords: fsm.MaxReplicaCatchupRecords,
 	}
 	transport := clusterClient.NewSecureTCPClusterClient("cursus-test-internal-token", nil)
+	readCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
+	defer stop()
 	var records []types.Message
 	for request.NextOffset < end {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(readCtx, 5*time.Second)
 		batch, err := transport.FetchReplicaCatchup(ctx, "localhost", 7999+node, request)
 		cancel()
+		var busy *wire.BrokerError
+		if errors.As(err, &busy) && busy.Code == "recovery_busy" && busy.Retryable {
+			// This inspection competes with production recovery on the same
+			// source budget. Only explicit quota contention is retryable here.
+			select {
+			case <-readCtx.Done():
+				require.NoError(t, readCtx.Err(), "source admission did not recover")
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
 		require.NoError(t, err)
 		require.NoError(t, fsm.ValidateReplicaCatchupBatchDigest(batch))
 		require.Nil(t, batch.TruncateTo)

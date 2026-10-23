@@ -363,7 +363,7 @@ func (c *TCPClusterClient) sendRequest(
 		if decodeErr != nil {
 			return nil, fmt.Errorf("decode cluster Wire v2 error: %w", decodeErr)
 		}
-		return nil, fmt.Errorf("%s: %s", brokerError.Code, brokerError.Message)
+		return nil, wire.NewBrokerError(brokerError)
 	}
 	if response.Status != wire.StatusOK {
 		return nil, fmt.Errorf("unexpected cluster Wire v2 status %d", response.Status)

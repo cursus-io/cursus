@@ -9,6 +9,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/wire"
 )
 
@@ -74,6 +75,9 @@ func bootstrapValidationError(err error) *wire.ErrorPayload {
 }
 
 func bootstrapTransferError(err error) *wire.ErrorPayload {
+	if errors.Is(err, recovery.ErrBusy) {
+		return internalClusterError(err)
+	}
 	code, class := "bootstrap_internal", wire.ErrorClassInternal
 	switch {
 	case errors.Is(err, context.Canceled):

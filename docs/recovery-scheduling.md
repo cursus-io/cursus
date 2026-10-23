@@ -309,6 +309,10 @@ shared-source backoff when one partition disappears. The error registry treats
 `recovery_busy` as retryable availability. The generation E2E pauses fresh apply
 before replacing authority and accepts either explicit fencing or cooperative
 cancellation of the held old response; its disk/HWM/ISR invariants are unchanged.
+Discovery and bootstrap wire responses preserve the structured retryable
+`recovery_busy` classification through the client. Direct verification reads
+retry only that explicit quota response within a fixed overall deadline; all
+digest, record, witness and exact-ISR assertions still execute.
 
 Broad Go 1.26.2 race testing also ran the other packages, command binaries, util
 and SDK. The existing `TestDurableRetentionRestartAndCorruptEvidence` failed on

@@ -467,5 +467,8 @@ func validationError(message string) *wire.ErrorPayload {
 }
 
 func internalClusterError(err error) *wire.ErrorPayload {
+	if errors.Is(err, recovery.ErrBusy) {
+		return &wire.ErrorPayload{Code: "recovery_busy", Class: wire.ErrorClassAvailability, Retryable: true, Message: err.Error()}
+	}
 	return &wire.ErrorPayload{Code: "cluster_request_failed", Class: wire.ErrorClassInternal, Message: err.Error()}
 }
