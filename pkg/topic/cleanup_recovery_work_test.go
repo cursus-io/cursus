@@ -31,6 +31,12 @@ func (r *measuredCleanupReader) WithConsumerCleanupView(fn func(coordinator.Cons
 	})
 }
 
+func (r *measuredCleanupReader) WithConsumerCleanupViewContext(ctx context.Context, fn func(coordinator.ConsumerCleanupView) error) error {
+	return r.TopicManager.WithConsumerCleanupViewContext(ctx, func(v coordinator.ConsumerCleanupView) error {
+		return fn(&measuredCleanupView{ConsumerCleanupView: v, reader: r})
+	})
+}
+
 func (v *measuredCleanupView) Read(partition int, offset uint64, cursor types.ReplayCursor, maxRecords, maxBytes int) (coordinator.ConsumerCleanupPage, error) {
 	r := v.reader
 	r.reads++
@@ -114,4 +120,11 @@ func TestConsumerCleanupDiskRecoveryWork(t *testing.T) {
 				count, attempts, reader.reads, reader.decoded, reader.bytes, reader.records, reader.maxRecords, reader.maxBytes, writes, time.Since(started))
 		})
 	}
+}
+
+func (v *measuredCleanupView) PrepareCleanupCheckpoint() error {
+	if view, ok := v.ConsumerCleanupView.(interface{ PrepareCleanupCheckpoint() error }); ok {
+		return view.PrepareCleanupCheckpoint()
+	}
+	return nil
 }

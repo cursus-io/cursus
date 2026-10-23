@@ -1,0 +1,121 @@
+{
+  "baseline_commit": "aff3c938cb26ba374aba97d162cfa0c15a686c65",
+  "environment": {
+    "os": "Linux Docker Desktop",
+    "go": "1.25.0",
+    "cpus": 2,
+    "memory_limit_bytes": 2147483648,
+    "storage": "container writable layer",
+    "runs": 3
+  },
+  "timing": "Active work is measured. Historical scheduler waits are simulated, not slept. No production estimate is claimed.",
+  "samples": {
+    "baseline": [
+      {
+        "active_wall_seconds": 0.47609002,
+        "allocated_bytes": 415125944,
+        "batches": 441,
+        "gomaxprocs": 2,
+        "history": 56000,
+        "mode": "baseline",
+        "other_max_ns": 340164,
+        "other_operations": 371,
+        "other_p99_ns": 115893,
+        "peak_sampled_heap_bytes": 7863856,
+        "physical_page_bytes": 158984674,
+        "process_cpu_seconds": 0.577121,
+        "reads": 448,
+        "records_per_active_second": 117624.81389548976,
+        "simulated_wait_seconds": 2200
+      },
+      {
+        "active_wall_seconds": 0.505975988,
+        "allocated_bytes": 415128368,
+        "batches": 441,
+        "gomaxprocs": 2,
+        "history": 56000,
+        "mode": "baseline",
+        "other_max_ns": 557971,
+        "other_operations": 390,
+        "other_p99_ns": 282283,
+        "peak_sampled_heap_bytes": 7676624,
+        "physical_page_bytes": 158984674,
+        "process_cpu_seconds": 0.616117,
+        "reads": 448,
+        "records_per_active_second": 110677.18889458447,
+        "simulated_wait_seconds": 2200
+      },
+      {
+        "active_wall_seconds": 0.696833813,
+        "allocated_bytes": 415139920,
+        "batches": 441,
+        "gomaxprocs": 2,
+        "history": 56000,
+        "mode": "baseline",
+        "other_max_ns": 2385179,
+        "other_operations": 515,
+        "other_p99_ns": 284489,
+        "peak_sampled_heap_bytes": 7683088,
+        "physical_page_bytes": 158984674,
+        "process_cpu_seconds": 0.8557629999999996,
+        "reads": 448,
+        "records_per_active_second": 80363.49407172065,
+        "simulated_wait_seconds": 2200
+      }
+    ],
+    "continuation": [
+      {
+        "active_wall_seconds": 1.7657132,
+        "allocated_bytes": 418683592,
+        "batches": 441,
+        "gomaxprocs": 2,
+        "history": 56000,
+        "mode": "continuation",
+        "other_max_ns": 370974,
+        "other_operations": 1480,
+        "other_p99_ns": 63328,
+        "peak_sampled_heap_bytes": 6974800,
+        "physical_page_bytes": 158984674,
+        "process_cpu_seconds": 0.886897,
+        "reads": 448,
+        "records_per_active_second": 31715.229857261078,
+        "simulated_wait_seconds": 0.44
+      },
+      {
+        "active_wall_seconds": 1.687642042,
+        "allocated_bytes": 418639224,
+        "batches": 441,
+        "gomaxprocs": 2,
+        "history": 56000,
+        "mode": "continuation",
+        "other_max_ns": 300413,
+        "other_operations": 1449,
+        "other_p99_ns": 46823,
+        "peak_sampled_heap_bytes": 7735552,
+        "physical_page_bytes": 158984674,
+        "process_cpu_seconds": 0.741501,
+        "reads": 448,
+        "records_per_active_second": 33182.39212246408,
+        "simulated_wait_seconds": 0.44
+      },
+      {
+        "active_wall_seconds": 1.674673042,
+        "allocated_bytes": 418639416,
+        "batches": 441,
+        "gomaxprocs": 2,
+        "history": 56000,
+        "mode": "continuation",
+        "other_max_ns": 246860,
+        "other_operations": 1438,
+        "other_p99_ns": 20747,
+        "peak_sampled_heap_bytes": 7739480,
+        "physical_page_bytes": 158984674,
+        "process_cpu_seconds": 0.7116889999999998,
+        "reads": 448,
+        "records_per_active_second": 33439.36314465376,
+        "simulated_wait_seconds": 0.44
+      }
+    ]
+  },
+  "measured_change": "Includes Unix checkpoint parent-directory synchronization; before/after runs execute sequentially without overlapping local validation."
+}

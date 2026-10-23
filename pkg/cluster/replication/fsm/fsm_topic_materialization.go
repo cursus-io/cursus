@@ -1,6 +1,7 @@
 package fsm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -108,6 +109,38 @@ func (f *BrokerFSM) ReconcileTopicMaterializations() error {
 	return f.reconcileTopicMaterializations(true)
 }
 
+// ReconcileTopicMaterializationContext attempts one topic without holding FSM
+// locks across consumer replay or durable writes. The scheduler owns retries.
+func (f *BrokerFSM) ReconcileTopicMaterializationContext(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.RLock()
+	issue, exists := f.topicMaterialization[name]
+	expected := copyTopicDefinition(f.topicState[name])
+	f.mu.RUnlock()
+	if !exists {
+		return nil
+	}
+	switch issue.Operation {
+	case TopicMaterializationDelete, TopicMaterializationTruncate:
+		if err := f.reconcileTopicGroupsContext(ctx, name, issue.Operation, expected); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if issue.Operation == TopicMaterializationDelete {
+			return f.materializeTopicDelete(name)
+		}
+		return f.materializeTopicTruncate(expected)
+	case TopicMaterializationRestore:
+		return f.materializeTopicRestore(expected)
+	default:
+		return f.materializeTopicCreate(expected)
+	}
+}
+
 func (f *BrokerFSM) reconcileTopicMaterializations(allowGroupWrites bool) error {
 	f.mu.RLock()
 	desired := make(map[string]*topic.Definition)
@@ -170,13 +203,17 @@ func (f *BrokerFSM) reconcileTopicMaterializations(allowGroupWrites bool) error 
 // Never hold materializationMu while originating a consumer metadata write:
 // its partition commit must be able to pass through Raft Apply/Restore.
 func (f *BrokerFSM) reconcileTopicGroups(name, operation string, expected *topic.Definition) error {
+	return f.reconcileTopicGroupsContext(context.Background(), name, operation, expected)
+}
+
+func (f *BrokerFSM) reconcileTopicGroupsContext(ctx context.Context, name, operation string, expected *topic.Definition) error {
 	f.mu.RLock()
 	c := f.cd
 	f.mu.RUnlock()
 	if c == nil {
 		return nil
 	}
-	_, err := c.ReconcileTopicGroupsIf(name, func() bool {
+	_, err := c.ReconcileTopicGroupsContext(ctx, name, func() bool {
 		f.mu.RLock()
 		defer f.mu.RUnlock()
 		return reflect.DeepEqual(f.topicState[name], expected) && !f.recoveryReplayPending

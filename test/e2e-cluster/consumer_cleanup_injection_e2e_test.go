@@ -128,18 +128,18 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 				out, err := exec.CommandContext(execCtx, "docker", "exec", cleanupContainerName(owner), "test", "-f", faultSentinelRoot+"/consumer-cleanup-ack/"+cleanupRecoveryTopic+".fired").CombinedOutput()
 				return err == nil, string(out), nil
 			}))
-			pending := waitCleanupReadPending(t, addrs[follower-1], 0)
+			pending := waitCleanupReadPending(t, addrs[follower-1], 0, verifyLive)
 			// The tombstone can arrive after the reader has passed its partition,
 			// moving the active retry back from the separate live-group partition.
 			// Freeze the comparison only after committed ends converge and a new
 			// failed attempt observes them; retain all accumulated-work assertions.
 			requireReplicaPartitionOffsetsConverge(t, addrs, config.ConsumerOffsetsTopicName, targetPartition)
-			first := waitCleanupReadPending(t, addrs[follower-1], pending.Reads+1)
+			first := waitCleanupReadPending(t, addrs[follower-1], pending.Reads+1, verifyLive)
 			require.Equal(t, pending.Records, first.Records)
 			require.Equal(t, pending.Bytes, first.Bytes)
 			require.GreaterOrEqual(t, first.Records, uint64(128))
 			require.Positive(t, first.Bytes)
-			second := waitCleanupReadPending(t, addrs[follower-1], first.Reads+2)
+			second := waitCleanupReadPending(t, addrs[follower-1], first.Reads+2, verifyLive)
 			require.Equal(t, first.Partition, second.Partition)
 			require.Equal(t, first.Next, second.Next)
 			require.Equal(t, first.End, second.End)
@@ -152,7 +152,7 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 			proof.verify(t, addrs)
 			logCleanupRecoveryWork(t, []int{1, 2, 3}, operation+" fault held")
 			cleanupFaultFile(t, follower, "release-read")
-			requireClusterStatusMaterialized(t, addrs)
+			requireClusterStatusMaterializedWithin(t, addrs, 2*time.Minute, verifyLive)
 			requireCleanupGroupAbsent(t, addrs)
 			verifyLive()
 			if operation == "TRUNCATE" {
@@ -176,10 +176,13 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 	}
 }
 
-func waitCleanupReadPending(t *testing.T, addr string, minimumReads uint64) coordinator.TopicCleanupPending {
+func waitCleanupReadPending(t *testing.T, addr string, minimumReads uint64, verifyLive func()) coordinator.TopicCleanupPending {
 	t.Helper()
 	var pending coordinator.TopicCleanupPending
-	require.NoError(t, eventually(t, "scoped cleanup page-read failure remains pending", clusterReadyTimeout, func() (bool, string, error) {
+	require.NoError(t, eventually(t, "scoped cleanup page-read failure remains pending", 2*time.Minute, func() (bool, string, error) {
+		// Error retries back off independently. Keep the unrelated session alive
+		// while still checking that replay itself never changes its heartbeat.
+		verifyLive()
 		client := e2e.NewBrokerClient([]string{addr})
 		response, err := client.SendCommand("admin", "CLUSTER_STATUS", 5*time.Second)
 		client.Close()

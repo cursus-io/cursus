@@ -1,5 +1,7 @@
 package types
 
+import "fmt"
+
 // ReplayCursor is a derived physical position, valid only for the partition
 // identity/generation and retention boundary pinned by the caller.
 type ReplayCursor struct {
@@ -24,4 +26,12 @@ type ReplayPage struct {
 // offset-index lookup. Empty compacted segments still advance Cursor.
 type BoundedReplayReader interface {
 	ReadReplayPage(offset, end uint64, cursor ReplayCursor, maxRecords, maxBytes int) (ReplayPage, error)
+}
+
+// ReplayByteBudget identifies an intact record that does not fit this request.
+// Callers can distinguish a partial-batch yield from a full-batch hard limit.
+type ReplayByteBudget struct{ Size, Budget int }
+
+func (e *ReplayByteBudget) Error() string {
+	return fmt.Sprintf("replay record size %d exceeds remaining byte budget %d", e.Size, e.Budget)
 }
