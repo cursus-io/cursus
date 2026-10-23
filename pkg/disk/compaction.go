@@ -295,6 +295,23 @@ func scanCompactionSegmentObserved(ctx context.Context, path string, expectedBas
 }
 
 func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool, latestKeyOffset, latestProducerOffset map[string]uint64) (_ int, _ int64, _ int64, resultErr error) {
+	return d.rewriteClosedSegment(segment, allowOffsetGaps, func(message types.DiskMessage) bool {
+		return shouldRemoveCompactionRecord(message, latestKeyOffset, latestProducerOffset)
+	}, nil)
+}
+
+// rewriteClosedSegment is the shared atomic single-log replacement primitive.
+// maintenanceMu must be held; remove must be a previously validated predicate.
+// This does not activate consumer-history compaction: its only production caller
+// remains the policy/gate-checked ordinary compactor above. after is a per-call
+// fault-injection seam, never a package-global hook shared by concurrent tests.
+func (d *DiskHandler) rewriteClosedSegment(segment uint64, allowOffsetGaps bool, remove func(types.DiskMessage) bool, afterStage func(string) error) (_ int, _ int64, _ int64, resultErr error) {
+	stage := func(name string) error {
+		if afterStage != nil {
+			return afterStage(name)
+		}
+		return nil
+	}
 	logPath := d.GetSegmentPath(segment)
 	indexPath := d.GetIndexPath(segment)
 	logTemp := logPath + ".compacting"
@@ -344,7 +361,7 @@ func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool,
 	}
 	err = scanCompactionSegment(logPath, segment, true, allowOffsetGaps, func(frame compactionFrame) error {
 		before += int64(frame.size)
-		if shouldRemoveCompactionRecord(frame.message, latestKeyOffset, latestProducerOffset) {
+		if remove(frame.message) {
 			removed++
 			return nil
 		}
@@ -368,10 +385,19 @@ func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool,
 	if removed == 0 {
 		return 0, before, before, nil
 	}
+	if err := stage("written"); err != nil {
+		return 0, before, after, err
+	}
 	if err := logFile.Sync(); err != nil {
 		return 0, before, after, err
 	}
+	if err := stage("log_synced"); err != nil {
+		return 0, before, after, err
+	}
 	if err := indexFile.Sync(); err != nil {
+		return 0, before, after, err
+	}
+	if err := stage("index_synced"); err != nil {
 		return 0, before, after, err
 	}
 	if err := logFile.Close(); err != nil {
@@ -403,6 +429,9 @@ func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool,
 	if err := markerFile.Close(); err != nil {
 		return 0, before, after, err
 	}
+	if err := stage("marker_synced"); err != nil {
+		return 0, before, after, err
+	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -427,11 +456,17 @@ func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool,
 			resultErr = d.markWriteUnavailable(resultErr)
 		}
 	}()
+	if err := stage("generation_invalidated"); err != nil {
+		return 0, before, after, err
+	}
 	if err := replaceCompactedFile(markerTemp, markerPath); err != nil {
 		return 0, before, after, err
 	}
 	if err := syncDirectory(directory); err != nil {
 		_ = os.Remove(markerPath)
+		return 0, before, after, err
+	}
+	if err := stage("marker_published"); err != nil {
 		return 0, before, after, err
 	}
 
@@ -448,15 +483,24 @@ func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool,
 		return 0, before, after, err
 	}
 	d.recordCompactedSegment(segment, after)
+	if err := stage("log_published"); err != nil {
+		return 0, before, after, err
+	}
 	if err := replaceCompactedFile(indexTemp, indexPath); err != nil {
 		_ = os.Chmod(logPath, originalMode)
 		_ = syncDirectory(directory)
+		return 0, before, after, err
+	}
+	if err := stage("index_published"); err != nil {
 		return 0, before, after, err
 	}
 	cleanupTemps = false
 	_ = os.Chmod(logPath, originalMode)
 	_ = os.Chmod(indexPath, originalMode)
 	if err := syncDirectory(directory); err != nil {
+		return 0, before, after, err
+	}
+	if err := stage("directory_synced"); err != nil {
 		return 0, before, after, err
 	}
 	return removed, before, after, nil
