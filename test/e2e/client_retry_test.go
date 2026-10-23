@@ -47,6 +47,7 @@ func TestRetryableJoinGroupRequiresARejectionBeforeMemberPersistence(t *testing.
 	join := "JOIN_GROUP topic=orders group=workers member=member-1"
 	for _, brokerErr := range []*wire.BrokerError{
 		{Code: "coordinator_not_available", Retryable: true},
+		{Code: "consumer_metadata_recovering", Retryable: true},
 		{Code: "topic_materialization_pending", Retryable: true, Fields: map[string]string{"reason": "local handler unavailable"}},
 	} {
 		if !shouldRetryBrokerError(join, brokerErr) {

@@ -13,15 +13,30 @@ import (
 // ConsumerHistoryCompactionPlan is a non-serializable certificate for replacing
 // ONE atomic range (normally one closed segment). It is not a replay cache or a
 // cluster activation gate. Only the owning coordinator and recovery lease may
-// validate it. No production cleaner consumes these certificates yet.
+// validate it. Cluster activation and storage installation are separate gates.
 type ConsumerHistoryCompactionPlan struct {
-	owner     *Coordinator
-	stamp     consumerMetadataReplayStamp
-	partition int
-	first     uint64
-	end       uint64
-	bounds    []consumerReplayIndexPartition
-	removed   []types.Message
+	owner                         *Coordinator
+	stamp                         consumerMetadataReplayStamp
+	partition                     int
+	first                         uint64
+	end                           uint64
+	bounds                        []consumerReplayIndexPartition
+	removed                       []types.Message
+	detached                      bool
+	readRecords, readPayloadBytes int64
+}
+
+// ReadWork counts decoded source records and key/payload bytes, including
+// repeated full/raw/filtered reads. These are not physical device I/O bytes.
+func (p *ConsumerHistoryCompactionPlan) ReadWork() (int64, int64) {
+	return p.readRecords, p.readPayloadBytes
+}
+
+func (p *ConsumerHistoryCompactionPlan) observeRead(messages []types.Message) {
+	p.readRecords += int64(len(messages))
+	for _, m := range messages {
+		p.readPayloadBytes += int64(len(m.Key) + len(m.Payload))
+	}
 }
 
 // RemovedRecords returns detached original records, in physical offset order.
@@ -89,13 +104,26 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 		return nil, fmt.Errorf("consumer history candidate exceeds committed range")
 	}
 	var candidates []types.Message
+	// Match partition recovery's producer ordering, which is epoch/sequence/
+	// offset, not simply physical arrival order. Also keep the last physical
+	// producer record for legacy sequence-zero writers.
+	producerHigh := make(map[string]types.Message)
+	producerLast := make(map[string]uint64)
 	fullReader := &historyPlanReader{ConsumerMetadataCommittedReader: source}
 	fullReader.read = func(topic string, p int, next uint64, max int) ([]types.Message, error) {
 		messages, err := bounded.ReadTopicPartition(topic, p, next, max)
+		plan.observeRead(messages)
 		if err != nil {
 			return nil, err
 		}
 		for _, m := range messages {
+			protected, err := protectedConsumerHistoryTransaction(m)
+			if err != nil {
+				return nil, err
+			}
+			if protected {
+				continue
+			}
 			record, versioned, err := decodeConsumerMetadataRecord(m.Payload)
 			if err != nil || !versioned || indexTransaction(m) || record.Type == ConsumerMetadataRecordTransactionalOffsetSnapshot || m.Key != consumerMetadataRecordKey(record) {
 				return nil, fmt.Errorf("consumer history requires nontransactional versioned metadata at %d:%d", p, m.Offset)
@@ -105,6 +133,13 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 			}
 			if p == partition && m.Offset >= first && m.Offset < end {
 				candidates = append(candidates, m)
+			}
+			if p == partition && m.ProducerID != "" {
+				producerLast[m.ProducerID] = m.Offset
+				previous, exists := producerHigh[m.ProducerID]
+				if m.SeqNum > 0 && (!exists || m.Epoch > previous.Epoch || m.Epoch == previous.Epoch && (m.SeqNum > previous.SeqNum || m.SeqNum == previous.SeqNum && m.Offset > previous.Offset)) {
+					producerHigh[m.ProducerID] = m
+				}
 			}
 		}
 		return messages, selectors[p].observe(p, messages, false)
@@ -134,6 +169,7 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 		digest := sha256.New()
 		for next := b.First; next < b.End; {
 			messages, err := raw.ReadTopicPartition(c.offsetTopic, p, next, 1024)
+			plan.observeRead(messages)
 			if err != nil {
 				return nil, err
 			}
@@ -141,8 +177,13 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 				break
 			}
 			for _, m := range messages {
-				if indexTransaction(m) {
-					return nil, fmt.Errorf("consumer history raw range contains transaction metadata")
+				next = m.Offset + 1
+				protected, err := protectedConsumerHistoryTransaction(m)
+				if err != nil {
+					return nil, err
+				}
+				if protected {
+					continue
 				}
 				if err := json.NewEncoder(digest).Encode(m); err != nil {
 					return nil, err
@@ -158,11 +199,15 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 	for _, entry := range selectors[partition].selected {
 		keep[entry.Message.Offset] = true
 	}
+	for _, offset := range producerLast {
+		keep[offset] = true
+	}
+	for _, message := range producerHigh {
+		keep[message.Offset] = true
+	}
 	remove := make(map[uint64]bool)
 	for _, m := range candidates {
-		// Retain all producer records until producer-state checkpointing has
-		// an independently verified compaction contract.
-		if !keep[m.Offset] && m.ProducerID == "" {
+		if !keep[m.Offset] {
 			remove[m.Offset] = true
 			plan.removed = append(plan.removed, m)
 		}
@@ -172,6 +217,7 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 		// Empty filtered pages must not prematurely end replay.
 		for next < bounded.bounds[p].end {
 			messages, err := bounded.ReadTopicPartition(topic, p, next, max)
+			plan.observeRead(messages)
 			if err != nil || len(messages) == 0 {
 				return messages, err
 			}
@@ -204,6 +250,31 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 	return plan, nil
 }
 
+// Transactional offset intents do not supply ordinary snapshot authority:
+// committed decisions materialize separate ordinary snapshots. Preserve every
+// intent and control frame, including invisible open/aborted transactions. An
+// ordinary lifecycle/offset record carrying physical transaction fields is an
+// incompatible format and must not authorize deletion.
+func protectedConsumerHistoryTransaction(m types.Message) (bool, error) {
+	if m.TransactionMarker != types.TransactionMarkerNone {
+		return true, validateCleanupTransactionControl(m)
+	}
+	r, versioned, err := decodeConsumerMetadataRecord(m.Payload)
+	if err != nil {
+		return false, err
+	}
+	if versioned && r.Type == ConsumerMetadataRecordTransactionalOffsetSnapshot {
+		if indexTransaction(m) && (m.TransactionalID != r.TransactionalID || m.ProducerID != r.ProducerID || m.Epoch != r.ProducerEpoch) {
+			return false, fmt.Errorf("consumer history transaction identity mismatch")
+		}
+		return true, nil
+	}
+	if indexTransaction(m) {
+		return false, fmt.Errorf("consumer history requires versioned transaction intent")
+	}
+	return false, nil
+}
+
 // ValidateConsumerHistoryCompaction must run under the original FSM fence and
 // lease, immediately before storage installation. It is necessary but not
 // sufficient: storage must recheck the generation under its replacement lock.
@@ -211,8 +282,18 @@ func (c *Coordinator) ValidateConsumerHistoryCompaction(source ConsumerMetadataI
 	if source == nil || plan == nil || plan.owner != c {
 		return fmt.Errorf("invalid consumer history certificate")
 	}
-	if err := c.validateConsumerMetadataReplayStamp(plan.stamp); err != nil {
+	current, err := c.captureConsumerMetadataReplayStamp()
+	if err != nil {
 		return err
+	}
+	expected := plan.stamp
+	if plan.detached {
+		// The scanning lease belonged to the detached proof. Publication owns
+		// a new live lease, but restore/compatibility generations must match.
+		expected.lease = current.lease
+	}
+	if current != expected {
+		return fmt.Errorf("consumer history authority changed")
 	}
 	count, err := source.ExistingPartitionCount(c.offsetTopic)
 	if err != nil || count != len(plan.bounds) {
@@ -224,7 +305,7 @@ func (c *Coordinator) ValidateConsumerHistoryCompaction(source ConsumerMetadataI
 			return err
 		}
 		identity, err := source.ConsumerMetadataIndexIdentity(p)
-		if err != nil || identity != old.Identity || b.first != old.First || b.end != old.End {
+		if err != nil || identity != old.Identity || b.first != old.First || b.end < old.End || !plan.detached && b.end != old.End {
 			return fmt.Errorf("consumer history source changed")
 		}
 	}

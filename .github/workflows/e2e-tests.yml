@@ -325,6 +325,31 @@ jobs:
           docker compose -f docker-compose.yml -f docker-compose.compaction.yml \
             down -v --remove-orphans
 
+  consumer-history-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.2'
+          cache: false
+      - name: Verify certified history removal and cache-miss recovery
+        env:
+          RUN_E2E_CONSUMER_HISTORY: "1"
+          CURSUS_CLEANUP_PORT_OFFSET: "31000"
+        run: |
+          go test -v -count=1 -timeout 25m ./test/e2e-cluster \
+            -run '^TestConsumerHistoryCompactionRecovery$'
+      - name: Clean isolated consumer history cluster
+        if: always()
+        working-directory: test/e2e-cluster
+        run: |
+          docker compose -p cursus-truncate-31000-e2e \
+            -f docker-compose.yml -f docker-compose.consumer-history.yml down -v --remove-orphans
+
   cluster-failure-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30

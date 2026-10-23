@@ -33,7 +33,8 @@ const (
 	TruncateReceiptProtocolVersion         = 7
 	TruncateCleanupBoundaryProtocolVersion = 8
 	RetentionTimeProtocolVersion           = 9
-	BrokerProtocolVersionCurrent           = RetentionTimeProtocolVersion
+	ConsumerHistoryProtocolVersion         = 10
+	BrokerProtocolVersionCurrent           = ConsumerHistoryProtocolVersion
 	// Recovery capabilities are additive and do not raise lifecycle requirements.
 	IndexedRecoveryProtocolVersion   = 1
 	BootstrapRecoveryProtocolVersion = 2
@@ -74,6 +75,7 @@ type TransactionCoordinatorShard struct {
 
 type BrokerFSMState struct {
 	TopicCleanupBoundaries           map[string]*coordinator.TopicCleanupBoundary   `json:"topicCleanupBoundaries,omitempty"`
+	ConsumerHistoryActivated         bool                                           `json:"consumerHistoryActivated,omitempty"`
 	RetentionTimeActivated           bool                                           `json:"retentionTimeActivated,omitempty"`
 	Version                          int                                            `json:"version"`
 	Applied                          uint64                                         `json:"applied"`
@@ -94,13 +96,15 @@ type BrokerFSMState struct {
 }
 
 type BrokerFSM struct {
-	topicCleanupBoundaries map[string]*coordinator.TopicCleanupBoundary
-	retentionTimeFlag      atomic.Bool
-	retentionTimeActivated bool
-	notifiers              map[string]chan interface{}
-	mu                     sync.RWMutex
-	transitionMu           contextlock.RWMutex
-	materializationMu      contextlock.RWMutex
+	topicCleanupBoundaries   map[string]*coordinator.TopicCleanupBoundary
+	consumerHistoryFlag      atomic.Bool
+	consumerHistoryActivated bool
+	retentionTimeFlag        atomic.Bool
+	retentionTimeActivated   bool
+	notifiers                map[string]chan interface{}
+	mu                       sync.RWMutex
+	transitionMu             contextlock.RWMutex
+	materializationMu        contextlock.RWMutex
 
 	logs                      map[uint64]*ReplicationEntry
 	brokers                   map[string]*BrokerInfo
@@ -340,6 +344,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyOffsetSyncCommand(strings.TrimPrefix(data, "OFFSET_SYNC:"))
 	case strings.HasPrefix(data, "BATCH_OFFSET:"):
 		res = f.applyBatchOffsetSyncCommand(strings.TrimPrefix(data, "BATCH_OFFSET:"))
+	case strings.HasPrefix(data, "CONSUMER_HISTORY_ACTIVATE:"):
+		res = f.applyConsumerHistoryActivation(strings.TrimPrefix(data, "CONSUMER_HISTORY_ACTIVATE:"))
 	case strings.HasPrefix(data, "RETENTION_TIME_ACTIVATE:"):
 		res = f.applyRetentionTimeActivation(strings.TrimPrefix(data, "RETENTION_TIME_ACTIVATE:"))
 	case strings.HasPrefix(data, "TXN_SYNC:"):
@@ -389,6 +395,11 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	if err := decodeStrictJSON(snapshotData, &state); err != nil {
 		util.Error("Failed to decode snapshot version %d: %v", header.Version, err)
 		return fmt.Errorf("failed to restore snapshot version %d: %w", header.Version, err)
+	}
+	if state.ConsumerHistoryActivated {
+		if err := validateConsumerHistoryBrokers(state.Brokers); err != nil {
+			return err
+		}
 	}
 	if state.RetentionTimeActivated {
 		if err := validateRetentionTimeBrokers(state.Brokers); err != nil {
@@ -492,6 +503,8 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	f.topicState = restoredTopicState
 	f.topicCleanupBoundaries = copyTopicCleanupBoundaries(state.TopicCleanupBoundaries)
 	f.transactionCoordinatorShardCount = persistedShardCount
+	f.consumerHistoryActivated = state.ConsumerHistoryActivated
+	f.consumerHistoryFlag.Store(state.ConsumerHistoryActivated)
 	f.retentionTimeActivated = state.RetentionTimeActivated
 	f.retentionTimeFlag.Store(state.RetentionTimeActivated)
 	f.offsetReservationsActivated = state.OffsetReservationsActivated
@@ -937,6 +950,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		nextProducerEpoch:                nextProducerEpoch,
 		transactionCoordinatorShards:     transactionCoordinatorShards,
 		transactionCoordinatorShardCount: f.effectiveTransactionCoordinatorShardCountLocked(),
+		consumerHistoryActivated:         f.consumerHistoryActivated,
 		retentionTimeActivated:           f.retentionTimeActivated,
 		offsetReservationsActivated:      f.offsetReservationsActivated,
 		consumerMetadataRoutingActivated: f.consumerMetadataRoutingActivated,

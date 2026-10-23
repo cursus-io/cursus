@@ -113,10 +113,11 @@ type Config struct {
 	MaxTransactionOffsets        int   `yaml:"max_transaction_offsets" json:"max.transaction.offsets"`
 
 	// consumer
-	ConsumerRecoveryIndexEnabled bool                  `yaml:"consumer_recovery_index_enabled" json:"consumer.recovery.index.enabled"`
-	ConsumerSessionTimeoutMS     int                   `yaml:"consumer_session_timeout_ms" json:"consumer.session.timeout.ms"`
-	ConsumerHeartbeatCheckMS     int                   `yaml:"consumer_heartbeat_check_ms" json:"consumer.heartbeat.check.ms"`
-	StaticConsumerGroups         []ConsumerGroupConfig `yaml:"static_consumer_groups" json:"static_consumer_groups"`
+	ConsumerHistoryCompactionEnabled bool                  `yaml:"consumer_history_compaction_enabled" json:"consumer.history.compaction.enabled"`
+	ConsumerRecoveryIndexEnabled     bool                  `yaml:"consumer_recovery_index_enabled" json:"consumer.recovery.index.enabled"`
+	ConsumerSessionTimeoutMS         int                   `yaml:"consumer_session_timeout_ms" json:"consumer.session.timeout.ms"`
+	ConsumerHeartbeatCheckMS         int                   `yaml:"consumer_heartbeat_check_ms" json:"consumer.heartbeat.check.ms"`
+	StaticConsumerGroups             []ConsumerGroupConfig `yaml:"static_consumer_groups" json:"static_consumer_groups"`
 
 	// network
 	MaxClientConnections    int   `yaml:"max_client_connections" json:"max.client.connections"`
@@ -357,6 +358,7 @@ func LoadConfig() (*Config, error) {
 
 	// consumer
 	flag.IntVar(&cfg.ConsumerSessionTimeoutMS, "consumer-session-timeout", cfg.ConsumerSessionTimeoutMS, "Session timeout")
+	flag.BoolVar(&cfg.ConsumerHistoryCompactionEnabled, "consumer-history-compaction", cfg.ConsumerHistoryCompactionEnabled, "Activate certified consumer history compaction after all brokers support it")
 	flag.BoolVar(&cfg.ConsumerRecoveryIndexEnabled, "consumer-recovery-index", cfg.ConsumerRecoveryIndexEnabled, "Enable the disposable local consumer replay index")
 	flag.IntVar(&cfg.ConsumerHeartbeatCheckMS, "consumer-heartbeat-check", cfg.ConsumerHeartbeatCheckMS, "Heartbeat check")
 	flag.IntVar(&cfg.MaxClientConnections, "max-client-connections", cfg.MaxClientConnections, "Maximum concurrently serviced client connections")
@@ -541,6 +543,7 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt(&cfg.MaxTransactionOffsets, "MAX_TRANSACTION_OFFSETS")
 
 	overrideEnvInt(&cfg.ConsumerSessionTimeoutMS, "CONSUMER_SESSION_TIMEOUT")
+	overrideEnvBool(&cfg.ConsumerHistoryCompactionEnabled, "CONSUMER_HISTORY_COMPACTION_ENABLED")
 	overrideEnvBool(&cfg.ConsumerRecoveryIndexEnabled, "CONSUMER_RECOVERY_INDEX_ENABLED")
 	overrideEnvInt(&cfg.ConsumerHeartbeatCheckMS, "CONSUMER_HEARTBEAT_CHECK")
 	overrideEnvBool(&cfg.UseTLS, "USE_TLS")

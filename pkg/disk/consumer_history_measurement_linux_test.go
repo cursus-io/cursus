@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // This is a local-storage fixture, NOT broker startup or distributed failover.
@@ -30,9 +31,16 @@ func TestConsumerHistoryDiskMeasurement(t *testing.T) {
 			cfg := consumerHistoryDiskConfig(t, t.TempDir())
 			r := openConsumerHistoryDisks(t, cfg, history, true)
 			c := historyDiskCoordinator(t, cfg, r)
-			for _, mode := range []string{"full", "certify_rewrite", "reopen_full"} {
-				if mode == "reopen_full" {
+			modes := []string{"full", "certify_rewrite", "reopen_full"}
+			if os.Getenv("CURSUS_HISTORY_EVICT_FILES") == "1" {
+				modes = []string{"reopen_evicted_baseline", "certify_rewrite", "reopen_evicted_compacted"}
+			}
+			for _, mode := range modes {
+				if strings.HasPrefix(mode, "reopen") {
 					closeConsumerHistoryDisks(t, r)
+				}
+				if strings.HasPrefix(mode, "reopen_evicted") {
+					historyEvictOwnedFiles(t, cfg.LogDir)
 				}
 				r.records, r.bytes, r.syncs = 0, 0, 0
 				runtime.GC()
@@ -102,7 +110,7 @@ func TestConsumerHistoryDiskMeasurement(t *testing.T) {
 						removed += n
 						logicalRewriteRead += b
 					}
-				case "reopen_full":
+				case "reopen_full", "reopen_evicted_baseline", "reopen_evicted_compacted":
 					r = openConsumerHistoryDisks(t, cfg, history, false)
 					assertHistoryDiskRecovery(t, cfg, r, history)
 				}
@@ -130,6 +138,9 @@ func TestConsumerHistoryDiskMeasurement(t *testing.T) {
 					return nil
 				}))
 				result := map[string]any{"scope": "local_storage_os_cache_not_dropped", "history_per_group": history, "groups": 4, "partitions": 4, "mode": mode, "wall_ms": float64(elapsed) / float64(time.Millisecond), "cpu_ms": cpu * 1000, "allocated_bytes": after.TotalAlloc - before.TotalAlloc, "sampled_peak_heap_bytes": peak.Load(), "retained_log_bytes": retained, "source_records": r.records, "source_key_payload_bytes": r.bytes, "rewrite_read_frame_bytes": logicalRewriteRead, "rewrite_write_file_bytes": logicalRewriteWrite, "removed_records": removed, "rewrite_temp_peak_bytes": tempPeak, "instrumented_source_syncs": r.syncs, "instrumented_rewrite_syncs": rewriteFsyncs, "transfer_bytes": 0, "physical_read_bytes": ioAfter["read_bytes"] - ioBefore["read_bytes"], "physical_write_bytes": ioAfter["write_bytes"] - ioBefore["write_bytes"]}
+				if strings.HasPrefix(mode, "reopen_evicted") {
+					result["scope"] = "local_storage_log_index_eviction_requested"
+				}
 				encoded, err := json.Marshal(result)
 				require.NoError(t, err)
 				t.Log("HISTORY_MEASUREMENT " + string(encoded))
@@ -137,6 +148,32 @@ func TestConsumerHistoryDiskMeasurement(t *testing.T) {
 			closeConsumerHistoryDisks(t, r)
 		})
 	}
+}
+
+// Evict only this test's synced log/index pages, never the host-wide page cache.
+// FADV_DONTNEED is advisory: physical_read_bytes is reported separately and a
+// zero result must not be presented as a measured cold device read.
+func historyEvictOwnedFiles(t *testing.T, root string) {
+	t.Helper()
+	require.NoError(t, filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || (!strings.HasSuffix(path, ".log") && !strings.HasSuffix(path, ".index")) {
+			return err
+		}
+		file, err := os.Open(path) // #nosec G304 -- only this test's private temporary directory.
+		if err != nil {
+			return err
+		}
+		err = file.Sync()
+		if err == nil {
+			// #nosec G115 -- Linux file descriptors originate as nonnegative int values.
+			err = unix.Fadvise(int(file.Fd()), 0, 0, unix.FADV_DONTNEED)
+		}
+		closeErr := file.Close()
+		if err != nil {
+			return err
+		}
+		return closeErr
+	}))
 }
 
 func historyMeasurementCPU(t *testing.T) float64 {

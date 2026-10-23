@@ -12,6 +12,7 @@ import (
 )
 
 func init() {
+	prometheus.MustRegister(ConsumerHistoryPhaseSeconds, ConsumerHistoryRuns, ConsumerHistoryReadRecords, ConsumerHistoryReadPayloadBytes, ConsumerHistoryRemovedRecords, ConsumerHistoryRemovedBytes)
 	prometheus.MustRegister(recoveryWork, recoveryAttempts, RetentionHolds)
 	prometheus.MustRegister(MessagesProcessed, MessagesPerSec, LatencyHist, QueueSize, CleanupCount, SeqNumGapTotal, SeqNumDuplicateTotal)
 	prometheus.MustRegister(ClientConnectionsTotal, ClientConnectionsActive, ClientResponseWriteFailures, RequestsInflight, RequestBytesInflight, RequestAdmissionWaiters, RequestAdmissionRejections, CommandsTotal, CommandDuration, CommandErrors, PublishAcknowledgements, AsyncReplicationFailures, ReplicationRetries, LogCompactionRuns)

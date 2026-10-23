@@ -102,7 +102,7 @@ func openConsumerHistoryDisks(t *testing.T, cfg *config.Config, history int, pop
 			}
 			payload, key, err := coordinator.EncodeConsumerMetadataRecord(record)
 			require.NoError(t, err)
-			batch = append(batch, types.DiskMessage{Topic: config.ConsumerOffsetsTopicName, Partition: int32(p), Offset: uint64(i), Key: key, Payload: string(payload)})
+			batch = append(batch, types.DiskMessage{Topic: config.ConsumerOffsetsTopicName, Partition: int32(p), Offset: uint64(i), Key: key, Payload: string(payload), ProducerID: "consumer-offset-coordinator"})
 		}
 		require.NoError(t, d.WriteBatchSync(batch))
 		rollCompactionSegment(t, d)
@@ -134,10 +134,17 @@ func historyDiskCoordinator(t *testing.T, cfg *config.Config, r *consumerHistory
 
 func certifyAndRewriteHistorySegment(t *testing.T, c *coordinator.Coordinator, r *consumerHistoryDiskReader, p int, stage func(string) error) (int, int64, int64, error) {
 	t.Helper()
+	d := r.handlers[p]
+	segments, err := d.ConsumerHistorySegments(context.Background(), r.end)
+	require.NoError(t, err)
+	require.NotEmpty(t, segments)
 	plan, err := c.PrepareConsumerHistoryCompaction(r, p, 0, r.end)
 	require.NoError(t, err)
 	require.NoError(t, c.ValidateConsumerHistoryCompaction(r, plan))
-	d := r.handlers[p]
+	if stage == nil {
+		result, err := d.RewriteConsumerHistory(context.Background(), segments[0], plan.RemovedRecords())
+		return result.RecordsRemoved, result.BytesBefore, result.BytesAfter, err
+	}
 	witness, err := d.CaptureContentGeneration()
 	require.NoError(t, err)
 	remove := make(map[uint64]types.Message)
@@ -151,7 +158,7 @@ func certifyAndRewriteHistorySegment(t *testing.T, c *coordinator.Coordinator, r
 	require.NoError(t, err)
 	return d.rewriteClosedSegment(0, d.segmentAllowsOffsetGaps(0, info.Size()), func(m types.DiskMessage) bool {
 		old, ok := remove[m.Offset]
-		return ok && old.Payload == m.Payload && old.Key == m.Key && m.ProducerID == "" && !hasTransactionMetadata(m)
+		return ok && old.Payload == m.Payload && old.Key == m.Key && old.ProducerID == m.ProducerID && old.Epoch == m.Epoch && old.SeqNum == m.SeqNum && !hasTransactionMetadata(m)
 	}, stage)
 }
 

@@ -53,6 +53,9 @@ func TestConsumerHistoryPlanFixedState(t *testing.T) {
 	for _, history := range []int{100, 1000, 10000} {
 		t.Run(fmt.Sprint(history), func(t *testing.T) {
 			c, r := newIndexFixture(t, history)
+			for i := range r.messages[0] {
+				r.messages[0][i].ProducerID = "consumer-offset-coordinator"
+			}
 			start := time.Now()
 			plan, err := c.PrepareConsumerHistoryCompaction(r, 0, 0, uint64(history+1))
 			require.NoError(t, err)
@@ -71,6 +74,55 @@ func TestConsumerHistoryPlanFixedState(t *testing.T) {
 			require.Equal(t, 2, p.status.ReplayedRecords)
 		})
 	}
+}
+
+func TestConsumerHistoryPlanProducerRecoveryOrder(t *testing.T) {
+	c, r := newIndexFixture(t, 10)
+	for i := range r.messages[0] {
+		r.messages[0][i].ProducerID = "consumer-offset-coordinator"
+		r.messages[0][i].Epoch = 2
+		r.messages[0][i].SeqNum = uint64(i + 1)
+	}
+	// A physically later lower epoch must not displace the recovery anchor.
+	r.messages[0][4].Epoch = 3
+	r.messages[0][4].SeqNum = 1
+	plan, err := c.PrepareConsumerHistoryCompaction(r, 0, 0, 11)
+	require.NoError(t, err)
+	applyHistoryPlanToFixture(r, plan)
+	var offsets []uint64
+	for _, m := range r.messages[0] {
+		offsets = append(offsets, m.Offset)
+	}
+	require.Equal(t, []uint64{0, 4, 10}, offsets)
+}
+
+func TestConsumerHistoryPlanPreservesPendingIntentAndDecisionControl(t *testing.T) {
+	c, r := newIndexFixture(t, 10)
+	intent := replayOffset("g", 1, 11, 11)
+	intent.Version, intent.Type = 3, ConsumerMetadataRecordTransactionalOffsetSnapshot
+	intent.TransactionalID, intent.ProducerID, intent.ProducerEpoch = "pending", "transaction-producer", 2
+	message := encodedMetadataMessage(t, intent, 11)
+	message.TransactionalID, message.ProducerID, message.Epoch, message.SeqNum, message.TransactionState = "pending", "transaction-producer", 2, 1, types.TransactionStateOpen
+	r.messages[0] = append(r.messages[0], message)
+	r.hidePending = true
+	reservation := reservationFixture()
+	reservation.Group, reservation.Epoch = "g", 1
+	reservation.Reservations[0].Offsets = []ReservedTransactionOffset{{Topic: "events", Partition: 0, Offset: 11}}
+	r.messages[0] = append(r.messages[0], encodedMetadataMessage(t, reservation, 12))
+	key, value, err := types.TransactionMarkerControlBytes(types.TransactionMarkerAbort, 2)
+	require.NoError(t, err)
+	control := types.Message{Offset: 13, Payload: types.TransactionControlMarkerPayload, TransactionalID: "previous", ProducerID: "txn-marker:previous:abort", Epoch: 2, SeqNum: 1, TransactionState: types.TransactionStateAborted, TransactionMarker: types.TransactionMarkerAbort, ControlBatchType: types.ControlBatchTransaction, ControlBatchVersion: types.ControlBatchVersionCursusV2, ControlBatchCoordinatorEpoch: 2, ControlBatchKey: key, ControlBatchValue: value}
+	r.messages[0] = append(r.messages[0], control)
+	plan, err := c.PrepareConsumerHistoryCompaction(r, 0, 0, 14)
+	require.NoError(t, err)
+	require.Len(t, plan.removed, 9)
+	applyHistoryPlanToFixture(r, plan)
+	require.Contains(t, r.messages[0], message)
+	require.Contains(t, r.messages[0], control)
+	p, err := c.PrepareFullConsumerMetadataReplay(r)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), p.scratch.groups["g"].Offsets["events"][0])
+	require.Equal(t, reservation.Reservations, p.scratch.groups["g"].OffsetReservations)
 }
 
 func TestConsumerHistoryPlanSegmentRangeAndCacheIndependence(t *testing.T) {

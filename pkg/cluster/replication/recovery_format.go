@@ -12,7 +12,7 @@ import (
 )
 
 const raftFormatMarkerName = ".cursus-raft-format"
-const raftFormatVersionCurrent = 12
+const raftFormatVersionCurrent = 13
 
 var syncRaftDirectoryFn = syncRaftDirectory
 
@@ -91,7 +91,7 @@ func readRaftFormatMarker(dataDir string) (int, error) {
 		return 0, fmt.Errorf("read Raft format marker: %w", err)
 	}
 	version, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || (version != raftFormatVersionCurrent && version != fsm.SnapshotVersionCurrent && version != fsm.SnapshotVersionProducerEpoch && version != fsm.SnapshotVersionLegacyEpoch) {
+	if err != nil || (version != raftFormatVersionCurrent && version != 12 && version != fsm.SnapshotVersionCurrent && version != fsm.SnapshotVersionProducerEpoch && version != fsm.SnapshotVersionLegacyEpoch) {
 		return 0, fmt.Errorf(
 			"%w: Raft format marker %q is not supported by version %d; clean bootstrap required",
 			fsm.ErrUnsupportedRecoveryProtocol, strings.TrimSpace(string(data)), raftFormatVersionCurrent,

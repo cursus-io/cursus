@@ -383,6 +383,10 @@ func (ch *CommandHandler) StartGroupRecoveryMonitor(ctx context.Context) error {
 		finish()
 		return err
 	}
+	if err := ch.startConsumerHistoryMonitor(ctx); err != nil {
+		finish()
+		return err
+	}
 	go func() {
 		defer finish()
 		ticker := time.NewTicker(groupRecoveryMonitorInterval)

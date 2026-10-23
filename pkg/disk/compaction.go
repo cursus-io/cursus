@@ -302,8 +302,8 @@ func (d *DiskHandler) compactClosedSegment(segment uint64, allowOffsetGaps bool,
 
 // rewriteClosedSegment is the shared atomic single-log replacement primitive.
 // maintenanceMu must be held; remove must be a previously validated predicate.
-// This does not activate consumer-history compaction: its only production caller
-// remains the policy/gate-checked ordinary compactor above. after is a per-call
+// Callers are the policy/gate-checked ordinary compactor and the separately
+// activated certified consumer-history installer. afterStage is a per-call
 // fault-injection seam, never a package-global hook shared by concurrent tests.
 func (d *DiskHandler) rewriteClosedSegment(segment uint64, allowOffsetGaps bool, remove func(types.DiskMessage) bool, afterStage func(string) error) (_ int, _ int64, _ int64, resultErr error) {
 	stage := func(name string) error {
