@@ -1085,7 +1085,7 @@ func (c *Coordinator) recoverConsumerMetadataWithPolicy(reader OffsetLogReader, 
 			}
 		}
 		if snapshot, ok := candidates.lifecycleSnapshots[groupName]; !ok || snapshot.record.Epoch != recovered.RegistrationEpoch {
-			if strict && existing.RegistrationEpoch != recovered.RegistrationEpoch {
+			if existing.RegistrationEpoch != recovered.RegistrationEpoch {
 				existing.mu.RUnlock()
 				continue
 			}

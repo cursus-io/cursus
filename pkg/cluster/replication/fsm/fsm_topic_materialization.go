@@ -209,6 +209,10 @@ func (f *BrokerFSM) reconcileTopicGroups(name, operation string, expected *topic
 func (f *BrokerFSM) reconcileTopicGroupsContext(ctx context.Context, name, operation string, expected *topic.Definition) error {
 	f.mu.RLock()
 	c := f.cd
+	var boundary *coordinator.TopicCleanupBoundary
+	if operation == TopicMaterializationTruncate {
+		boundary = f.topicCleanupBoundaryLocked(expected)
+	}
 	f.mu.RUnlock()
 	if c == nil {
 		return nil
@@ -217,7 +221,7 @@ func (f *BrokerFSM) reconcileTopicGroupsContext(ctx context.Context, name, opera
 		f.mu.RLock()
 		defer f.mu.RUnlock()
 		return reflect.DeepEqual(f.topicState[name], expected) && !f.recoveryReplayPending
-	})
+	}, boundary)
 	if err != nil {
 		f.recordTopicMaterializationIfCurrent(name, operation, expected, err)
 	}
@@ -241,11 +245,16 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 	}
 
 	var err error
+	operation := TopicMaterializationCreate
 	if f.tm.IsTruncationPending(definition.Name) {
 		// A later Raft definition update may supersede a truncate whose local
 		// reset is still pending. Rebuild the empty generation at the latest
 		// authoritative definition before publishing its epoch marker.
 		err = f.tm.RestoreDefinitions([]topic.Definition{*definition})
+		if err == nil {
+			operation = TopicMaterializationTruncate
+			err = f.cleanupTopicDependencies(definition.Name, definition)
+		}
 		if err == nil {
 			err = f.tm.CompleteTruncation(definition.Name)
 		}
@@ -253,9 +262,9 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 		err = f.tm.ApplyDefinition(*definition)
 	}
 	if err == nil {
-		err = f.reconcileMaterializedTopicHWM(definition.Name, replaying)
+		err = f.reconcileMaterializedTopicHWM(definition.Name, replaying, false)
 	}
-	f.recordTopicMaterializationIfCurrent(definition.Name, TopicMaterializationCreate, definition, err)
+	f.recordTopicMaterializationIfCurrent(definition.Name, operation, definition, err)
 	if err != nil {
 		return fmt.Errorf("materialize topic %q: %w", definition.Name, err)
 	}
@@ -282,20 +291,25 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 	}
 
 	err := f.tm.RestoreDefinitions([]topic.Definition{*definition})
+	operation := TopicMaterializationRestore
 	if err == nil && f.tm.IsTruncationPending(definition.Name) {
-		err = f.tm.CompleteTruncation(definition.Name)
+		operation = TopicMaterializationTruncate
+		err = f.cleanupTopicDependencies(definition.Name, definition)
+		if err == nil {
+			err = f.tm.CompleteTruncation(definition.Name)
+		}
 	}
 	if err == nil {
-		err = f.reconcileMaterializedTopicHWM(definition.Name, true)
+		err = f.reconcileMaterializedTopicHWM(definition.Name, true, false)
 	}
-	f.recordTopicMaterializationIfCurrent(definition.Name, TopicMaterializationRestore, definition, err)
+	f.recordTopicMaterializationIfCurrent(definition.Name, operation, definition, err)
 	if err != nil {
 		return fmt.Errorf("restore local topic %q: %w", definition.Name, err)
 	}
 	return nil
 }
 
-func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string, restoringSnapshot bool) error {
+func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string, restoringSnapshot, finalizeSnapshot bool) error {
 	if f.tm == nil {
 		return nil
 	}
@@ -337,6 +351,9 @@ func (f *BrokerFSM) reconcileMaterializedTopicHWM(topicName string, restoringSna
 			if !currentPartition.SnapshotRecoveryPending() {
 				reconcileErr = currentPartition.ReconcileSnapshotHWM(partitionMetadata.CommittedHWM)
 			}
+			if reconcileErr == nil && finalizeSnapshot {
+				reconcileErr = currentPartition.FinalizeSnapshotRecovery(partitionMetadata.CommittedHWM)
+			}
 		} else {
 			// Live definition application must not wait for replication ownership:
 			// its HWM command may be queued behind this same FSM application.
@@ -361,20 +378,36 @@ func (f *BrokerFSM) materializeTopicTruncate(definition *topic.Definition) error
 	defer f.materializationMu.Unlock()
 	f.mu.RLock()
 	current := copyTopicDefinition(f.topicState[definition.Name])
+	replaying := f.recoveryReplayPending
 	f.mu.RUnlock()
 	if !reflect.DeepEqual(current, definition) {
 		return nil
 	}
 
 	var err error
+	restoredMissing := false
 	if f.tm != nil {
-		_, err = f.tm.ApplyTruncateDefinition(*definition)
+		restoredMissing = f.tm.GetTopic(definition.Name) == nil
+		if restoredMissing && !f.tm.IsTruncationPending(definition.Name) {
+			// A failed handler open during Raft replay can leave no local
+			// topic or pending fence. Reconstruct from the authoritative
+			// definition; never require a local predecessor to retry cleanup.
+			err = f.tm.RestoreDefinitions([]topic.Definition{*definition})
+		} else {
+			_, err = f.tm.ApplyTruncateDefinition(*definition)
+		}
 	}
 	if err == nil {
-		err = f.cleanupTopicDependencies(definition.Name)
+		err = f.cleanupTopicDependencies(definition.Name, definition)
 	}
 	if err == nil && f.tm != nil {
 		err = f.tm.CompleteTruncation(definition.Name)
+	}
+	if err == nil && restoredMissing {
+		// Startup finalizes its whole replay later. A background retry has no
+		// such future callback: publish the current boundary now, retaining
+		// replica catch-up checks when the local LEO is still below it.
+		err = f.reconcileMaterializedTopicHWM(definition.Name, true, !replaying)
 	}
 	f.recordTopicMaterializationIfCurrent(definition.Name, TopicMaterializationTruncate, definition, err)
 	if err != nil {
@@ -433,14 +466,18 @@ func (f *BrokerFSM) materializeTopicDelete(name string) error {
 	return nil
 }
 
-func (f *BrokerFSM) cleanupTopicDependencies(name string) error {
+func (f *BrokerFSM) cleanupTopicDependencies(name string, truncate ...*topic.Definition) error {
 	f.mu.RLock()
 	coordinatorRef := f.cd
 	transactionManager := f.txn
+	var boundary *coordinator.TopicCleanupBoundary
+	if len(truncate) > 0 {
+		boundary = f.topicCleanupBoundaryLocked(truncate[0])
+	}
 	f.mu.RUnlock()
 
 	if coordinatorRef != nil {
-		if _, err := coordinatorRef.CheckTopicGroupCleanup(name); err != nil {
+		if _, err := coordinatorRef.CheckTopicGroupCleanup(name, boundary); err != nil {
 			return fmt.Errorf("delete consumer groups for topic %q: %w", name, err)
 		}
 	}

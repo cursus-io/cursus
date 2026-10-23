@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 
 	"github.com/cursus-io/cursus/pkg/types"
 )
@@ -14,6 +15,8 @@ import (
 const cleanupCheckpointLimit = 1 << 20
 
 type cleanupCheckpointTarget struct {
+	BeforeLive, DeletedEpoch uint64
+	RegistrationAfter        bool
 	Epoch                    uint64
 	Generation               int
 	EvidenceEpoch, LiveEpoch uint64
@@ -26,6 +29,7 @@ type cleanupCheckpointPartition struct {
 	Cursor           types.ReplayCursor
 }
 type cleanupCheckpoint struct {
+	Boundary   *TopicCleanupBoundary
 	Version    int
 	Topic      string
 	Targets    map[string]cleanupCheckpointTarget
@@ -76,7 +80,7 @@ func (c *Coordinator) loadCleanupCheckpoint(scan *topicCleanupScan, partitions [
 		return
 	}
 	var cp cleanupCheckpoint
-	if json.Unmarshal(envelope.Payload, &cp) != nil || cp.Version != 1 || cp.Topic != scan.status.Topic || len(cp.Targets) != len(scan.targets) || len(cp.Partitions) != len(partitions) {
+	if json.Unmarshal(envelope.Payload, &cp) != nil || cp.Version != 2 || !reflect.DeepEqual(cp.Boundary, scan.boundary) || cp.Topic != scan.status.Topic || len(cp.Targets) != len(scan.targets) || len(cp.Partitions) != len(partitions) {
 		return
 	}
 	for name, target := range scan.targets {
@@ -101,7 +105,7 @@ func (c *Coordinator) loadCleanupCheckpoint(scan *topicCleanupScan, partitions [
 		scan.next[i], scan.cursors[i] = saved.Next, saved.Cursor
 	}
 	for name, saved := range cp.Targets {
-		scan.targets[name].evidence = cleanupEvidence{epoch: saved.EvidenceEpoch, liveEpoch: saved.LiveEpoch, kind: saved.Kind, topic: saved.Topic, digest: saved.Digest}
+		scan.targets[name].evidence = cleanupEvidence{beforeLive: saved.BeforeLive, deletedEpoch: saved.DeletedEpoch, registrationAfter: saved.RegistrationAfter, epoch: saved.EvidenceEpoch, liveEpoch: saved.LiveEpoch, kind: saved.Kind, topic: saved.Topic, digest: saved.Digest}
 	}
 }
 
@@ -112,7 +116,7 @@ func (c *Coordinator) saveCleanupCheckpoint(scan *topicCleanupScan, view Consume
 	if scan.checkpointRecords != 0 && scan.status.Records-scan.checkpointRecords < 1024 && scan.status.Bytes-scan.checkpointBytes < 8<<20 && !scan.matches(scan.partitions) {
 		return nil
 	}
-	cp := cleanupCheckpoint{Version: 1, Topic: scan.status.Topic, Targets: make(map[string]cleanupCheckpointTarget)}
+	cp := cleanupCheckpoint{Version: 2, Boundary: scan.boundary.Clone(), Topic: scan.status.Topic, Targets: make(map[string]cleanupCheckpointTarget)}
 	for i, p := range scan.partitions {
 		if p.DurableGeneration == "" {
 			return nil
@@ -128,7 +132,7 @@ func (c *Coordinator) saveCleanupCheckpoint(scan *topicCleanupScan, view Consume
 	}
 	for name, target := range scan.targets {
 		e := target.evidence
-		cp.Targets[name] = cleanupCheckpointTarget{target.epoch, target.generation, e.epoch, e.liveEpoch, e.kind, e.topic, e.digest}
+		cp.Targets[name] = cleanupCheckpointTarget{BeforeLive: e.beforeLive, DeletedEpoch: e.deletedEpoch, RegistrationAfter: e.registrationAfter, Epoch: target.epoch, Generation: target.generation, EvidenceEpoch: e.epoch, LiveEpoch: e.liveEpoch, Kind: e.kind, Topic: e.topic, Digest: e.digest}
 	}
 	payload, err := json.Marshal(cp)
 	if err != nil {

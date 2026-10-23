@@ -704,7 +704,7 @@ func TestDistributedLifecycleRecoveryBackfillsLegacyLastActivity(t *testing.T) {
 	require.Equal(t, activity, recovered.GetGroup("workers").LastActivity)
 }
 
-func TestDistributedReloadPreservesMembershipWhenSelectedLifecycleSnapshotIsOrphaned(t *testing.T) {
+func TestDistributedReloadDoesNotTransferMembershipWhenRegistrationChanged(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
 	handler := &metadataReplayHandler{}
@@ -728,8 +728,9 @@ func TestDistributedReloadPreservesMembershipWhenSelectedLifecycleSnapshotIsOrph
 	handler.messages = map[int][]types.Message{0: {encodedMetadataMessage(t, staleLifecycle, 0), encodedMetadataMessage(t, registration, 1)}}
 
 	require.NoError(t, recoverDeferredMetadataForTest(t, coordinator))
-	require.Equal(t, 1, coordinator.GetGeneration("workers"))
-	require.Equal(t, []int{0}, coordinator.GetMemberAssignments("workers", "member-a"))
+	require.Zero(t, coordinator.GetGeneration("workers"))
+	require.Empty(t, coordinator.GetMemberAssignments("workers", "member-a"))
+	require.Equal(t, uint64(2), coordinator.GetRegistrationEpoch("workers"))
 }
 
 func TestDistributedRecoveryPrefersVersionedSnapshotOverLegacyOffsets(t *testing.T) {

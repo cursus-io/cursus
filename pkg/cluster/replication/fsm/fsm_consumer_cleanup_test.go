@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -98,6 +99,46 @@ func configureLifecycleCleanupOwner(t *testing.T, manager *topic.TopicManager, c
 	c.SetOffsetRecordWriter(func(coordinator.ConsumerMetadataRecord) error { return nil })
 }
 
+func durableCleanupTestManager(t *testing.T, cfg *config.Config) *topic.TopicManager {
+	t.Helper()
+	cfg.DiskMinFreePercent = 0
+	dm := disk.NewDiskManager(cfg)
+	m := topic.NewTopicManager(cfg, dm, nil)
+	t.Cleanup(func() { m.Stop(); dm.CloseAllHandlers() })
+	return m
+}
+
+// Unlike the old acknowledgement-only fixture, this establishes an actual
+// committed registration prefix for the truncate cut.
+func configureDurableCleanupOwner(t *testing.T, f *BrokerFSM) {
+	t.Helper()
+	internal := f.tm.GetTopic(config.ConsumerOffsetsTopicName)
+	d := internal.Definition()
+	f.topicState[d.Name] = &d
+	for p := range internal.Partitions {
+		f.partitionMetadata[fmt.Sprintf("%s-%d", d.Name, p)] = authoritativePartitionMetadata(d.Partitions)
+	}
+	f.cd.SetRoutedOffsetRecordWriter(func(r coordinator.ConsumerMetadataRecord) error {
+		f.cd.RecordConsumerMetadataSource(r.Group, 0)
+		payload, key, err := coordinator.EncodeConsumerMetadataRecord(r)
+		if err != nil {
+			return err
+		}
+		p := internal.Partitions[0]
+		offset := p.NextOffset()
+		if err := p.ReplicaAppend([]types.Message{{Offset: offset, Payload: string(payload), Key: key}}); err != nil {
+			return err
+		}
+		if err := p.ApplyReplicaHWM(offset + 1); err != nil {
+			return err
+		}
+		f.mu.Lock()
+		f.partitionMetadata[d.Name+"-0"].CommittedHWM = offset + 1
+		f.mu.Unlock()
+		return nil
+	})
+}
+
 type cleanupStartupReader struct{ *topic.TopicManager }
 
 func (r cleanupStartupReader) EndTopicOffset(name string, partition int) (uint64, error) {
@@ -124,13 +165,14 @@ func TestBrokerFSMOwnerCleanupNeverAppendsDuringRaftApply(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
 	cfg.LogDir = t.TempDir()
-	manager := topic.NewTopicManager(cfg, &MockHandlerProvider{}, nil)
+	manager := durableCleanupTestManager(t, cfg)
 	c, err := coordinator.NewCoordinatorAwaitingDistributedRecovery(context.Background(), cfg, manager)
 	require.NoError(t, err)
 	t.Cleanup(func() { c.Stop(); manager.Stop() })
 	configureLifecycleCleanupOwner(t, manager, c)
 	recoverCleanupCoordinator(t, manager, c)
 	f := NewBrokerFSM(manager, c)
+	configureDurableCleanupOwner(t, f)
 	registerLifecycleBroker(t, f, "broker-1", TopicLifecycleProtocolVersion)
 	create, err := json.Marshal(testTopicCommand("orders", 1, 1))
 	require.NoError(t, err)

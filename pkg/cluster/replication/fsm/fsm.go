@@ -23,14 +23,15 @@ import (
 )
 
 const (
-	TopicLifecycleProtocolVersion        = 1
-	DistributedCompactionProtocolVersion = 2
-	OffsetReservationsProtocolVersion    = 3
-	ReplicaReassignmentProtocolVersion   = 4
-	LeaderEpochRecoveryProtocolVersion   = 5
-	ReplicaGapRecoveryProtocolVersion    = 6
-	TruncateReceiptProtocolVersion       = 7
-	BrokerProtocolVersionCurrent         = TruncateReceiptProtocolVersion
+	TopicLifecycleProtocolVersion          = 1
+	DistributedCompactionProtocolVersion   = 2
+	OffsetReservationsProtocolVersion      = 3
+	ReplicaReassignmentProtocolVersion     = 4
+	LeaderEpochRecoveryProtocolVersion     = 5
+	ReplicaGapRecoveryProtocolVersion      = 6
+	TruncateReceiptProtocolVersion         = 7
+	TruncateCleanupBoundaryProtocolVersion = 8
+	BrokerProtocolVersionCurrent           = TruncateCleanupBoundaryProtocolVersion
 	// Recovery capabilities are additive and do not raise lifecycle requirements.
 	IndexedRecoveryProtocolVersion   = 1
 	BootstrapRecoveryProtocolVersion = 2
@@ -70,6 +71,7 @@ type TransactionCoordinatorShard struct {
 }
 
 type BrokerFSMState struct {
+	TopicCleanupBoundaries           map[string]*coordinator.TopicCleanupBoundary   `json:"topicCleanupBoundaries,omitempty"`
 	Version                          int                                            `json:"version"`
 	Applied                          uint64                                         `json:"applied"`
 	Logs                             map[uint64]*ReplicationEntry                   `json:"logs"`
@@ -89,10 +91,11 @@ type BrokerFSMState struct {
 }
 
 type BrokerFSM struct {
-	notifiers         map[string]chan interface{}
-	mu                sync.RWMutex
-	transitionMu      contextlock.RWMutex
-	materializationMu contextlock.RWMutex
+	topicCleanupBoundaries map[string]*coordinator.TopicCleanupBoundary
+	notifiers              map[string]chan interface{}
+	mu                     sync.RWMutex
+	transitionMu           contextlock.RWMutex
+	materializationMu      contextlock.RWMutex
 
 	logs                      map[uint64]*ReplicationEntry
 	brokers                   map[string]*BrokerInfo
@@ -406,6 +409,9 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 		return fmt.Errorf("restore topic definitions: %w", err)
 	}
 	restoredTopicState = topicStateFromDefinitions(definitions)
+	if err := validateTopicCleanupBoundaries(state.TopicCleanupBoundaries, restoredTopicState, state.PartitionMetadata); err != nil {
+		return err
+	}
 	if err := coordinator.ValidateConsumerRecoveryEnvelope(state.ConsumerRecovery); err != nil {
 		return err
 	}
@@ -465,6 +471,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	f.retiredBrokerIncarnations = importRetiredBrokerIncarnations(state.RetiredBrokerIncarnations)
 	f.partitionMetadata = state.PartitionMetadata
 	f.topicState = restoredTopicState
+	f.topicCleanupBoundaries = copyTopicCleanupBoundaries(state.TopicCleanupBoundaries)
 	f.transactionCoordinatorShardCount = persistedShardCount
 	f.offsetReservationsActivated = state.OffsetReservationsActivated
 	f.consumerMetadataRoutingActivated = state.ConsumerMetadataRoutingActivated
@@ -896,6 +903,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	util.Debug("Creating FSM snapshot")
 	metrics.ConsumerSnapshotBusyConsecutive.Set(0)
 	return &BrokerFSMSnapshot{
+		topicCleanupBoundaries:           f.snapshotTopicCleanupBoundariesLocked(),
 		applied:                          f.applied,
 		logs:                             logsCopy,
 		brokers:                          brokersCopy,

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/metrics"
@@ -25,6 +26,8 @@ const (
 // ConsumerCleanupPartition identifies an immutable committed prefix. Identity
 // must be comparable and change when the underlying partition is replaced.
 type ConsumerCleanupPartition struct {
+	TopicInstance     string
+	TopicEpoch        uint64
 	Identity          any
 	DurableGeneration string
 	Generation        uint64
@@ -81,30 +84,38 @@ func (p *TopicCleanupPending) Error() string {
 }
 
 type cleanupEvidence struct {
-	epoch     uint64
-	liveEpoch uint64
-	kind      string
-	topic     string
-	digest    [32]byte
+	beforeLive        uint64
+	deletedEpoch      uint64
+	registrationAfter bool
+	epoch             uint64
+	liveEpoch         uint64
+	kind              string
+	topic             string
+	digest            [32]byte
 }
 
 type cleanupTarget struct {
-	group      *GroupMetadata
-	epoch      uint64
-	generation int
-	evidence   cleanupEvidence
+	singleTopic bool
+	group       *GroupMetadata
+	epoch       uint64
+	generation  int
+	evidence    cleanupEvidence
 }
 
 type topicCleanupScan struct {
-	current           func() bool
-	targets           map[string]*cleanupTarget
-	partitions        []ConsumerCleanupPartition
-	next              []uint64
-	cursors           []types.ReplayCursor
-	status            TopicCleanupPending
-	checkpointLoaded  bool
-	checkpointRecords uint64
-	checkpointBytes   uint64
+	completed           map[string]*cleanupTarget
+	completedPartitions []ConsumerCleanupPartition
+	validated           bool
+	boundary            *TopicCleanupBoundary
+	current             func() bool
+	targets             map[string]*cleanupTarget
+	partitions          []ConsumerCleanupPartition
+	next                []uint64
+	cursors             []types.ReplayCursor
+	status              TopicCleanupPending
+	checkpointLoaded    bool
+	checkpointRecords   uint64
+	checkpointBytes     uint64
 }
 
 // ReconcileTopicGroups preserves standalone cleanup and makes distributed
@@ -116,15 +127,43 @@ func (c *Coordinator) ReconcileTopicGroups(topicName string) ([]string, error) {
 // CheckTopicGroupCleanup is the nonblocking Raft-Apply path. Both replay and
 // new writes run in reconciliation: even waiting for a coordinator lock here
 // could block a writer whose partition commit needs the same Raft apply loop.
-func (c *Coordinator) CheckTopicGroupCleanup(topicName string) ([]string, error) {
+func (c *Coordinator) CheckTopicGroupCleanup(topicName string, boundaries ...*TopicCleanupBoundary) ([]string, error) {
 	if c.standalone {
 		return c.DeleteInactiveGroupsForTopic(topicName)
 	}
 	pending := &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "consumer cleanup scheduled outside Raft apply"}
+	// Snapshot installation can temporarily empty the live overlay. Absence
+	// is meaningful only while consumer recovery admission remains open.
+	gate := &c.consumerAdmission
+	if !gate.mu.TryLock() {
+		return nil, pending
+	}
+	defer gate.mu.Unlock()
+	if gate.unavailableLocked() {
+		return nil, pending
+	}
 	if !c.mu.TryLock() {
 		return nil, pending
 	}
 	defer c.mu.Unlock()
+	var boundary *TopicCleanupBoundary
+	if len(boundaries) > 0 {
+		boundary = boundaries[0]
+	}
+	// The final check runs from Raft apply and cannot perform disk I/O. A
+	// completed proof is reusable only for the same operation and group epoch.
+	var scan *topicCleanupScan
+	if boundary != nil && c.cleanupMu.TryLock() {
+		defer c.cleanupMu.Unlock()
+		candidate := c.cleanupProgress[topicName]
+		if candidate != nil && candidate.validated && reflect.DeepEqual(candidate.boundary, boundary) && candidate.matches(candidate.partitions) {
+			if validator, ok := c.topicHandler.(interface {
+				CheckConsumerCleanupProof([]ConsumerCleanupPartition) error
+			}); ok && validator.CheckConsumerCleanupProof(candidate.partitions) == nil {
+				scan = candidate
+			}
+		}
+	}
 	for name, group := range c.groups {
 		if group == nil {
 			continue
@@ -134,6 +173,12 @@ func (c *Coordinator) CheckTopicGroupCleanup(topicName string) ([]string, error)
 		}
 		_, found := topicGroupReferenceLocked(name, group, topicName)
 		epoch := group.RegistrationEpoch
+		if scan != nil {
+			target := scan.preservedTarget(name)
+			if target != nil && target.group == group && target.epoch == epoch && !c.lifecyclePending[name] && scan.preserves(target) {
+				found = false
+			}
+		}
 		group.mu.RUnlock()
 		if found {
 			pending.Group, pending.Epoch = name, epoch
@@ -155,7 +200,11 @@ func (c *Coordinator) ReconcileTopicGroupsIf(topicName string, current func() bo
 	return c.ReconcileTopicGroupsContext(ctx, topicName, current)
 }
 
-func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName string, current func() bool) ([]string, error) {
+func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName string, current func() bool, boundaries ...*TopicCleanupBoundary) ([]string, error) {
+	var boundary *TopicCleanupBoundary
+	if len(boundaries) > 0 {
+		boundary = boundaries[0].Clone()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -178,6 +227,11 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 	c.mu.RUnlock()
 	owners := make(map[string]bool)
 	references := c.TopicGroupReferences(topicName)
+	previous := c.cleanupProgress[topicName]
+	if previous != nil && !reflect.DeepEqual(previous.boundary, boundary) {
+		previous = nil
+	}
+	references = c.pendingCleanupReferences(references, previous, boundary)
 	for i, reference := range references {
 		if i == topicCleanupGroups {
 			break
@@ -200,11 +254,12 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		c.removeCleanupCheckpoint(topicName)
 		return nil, nil
 	}
+	references = c.pendingCleanupReferences(references, previous, boundary)
 	for _, reference := range references {
 		// Stale members may be covered by a committed deletion. The remaining
 		// scope protections cannot be bypassed by follower reconciliation.
 		reference.MemberCount = 0
-		if err := reference.validateCleanup(topicName); err != nil {
+		if err := reference.validateCleanup(topicName); err != nil && (boundary == nil || reference.Shared || reference.Pattern) {
 			return nil, err
 		}
 	}
@@ -216,7 +271,7 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		c.cleanupProgress = make(map[string]*topicCleanupScan)
 	}
 	scan := c.cleanupProgress[topicName]
-	if !c.cleanupTargetsCurrent(scan, references) {
+	if !c.cleanupTargetsCurrent(scan, references) || !reflect.DeepEqual(scan.boundary, boundary) {
 		if scan == nil && len(c.cleanupProgress) >= topicCleanupTopics {
 			// Preserve unfinished scans so a large pending-topic set cannot
 			// continually evict every cursor before it reaches the log tail.
@@ -233,6 +288,13 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 			}
 		}
 		scan = c.newTopicCleanupScan(topicName, references)
+		scan.boundary = boundary
+		if previous != nil {
+			scan.completed, scan.completedPartitions = previous.completed, previous.completedPartitions
+			if len(references) == 0 {
+				scan.partitions, scan.next, scan.cursors = previous.partitions, previous.next, previous.cursors
+			}
+		}
 		c.cleanupProgress[topicName] = scan
 	}
 	if !current() {
@@ -241,9 +303,13 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		return nil, fmt.Errorf("topic cleanup intent changed")
 	}
 	scan.current = current
+	scan.validated = false
 	var deleted []string
 	scan.status.State, scan.status.cause = CleanupWait, nil
 	err := withCleanupView(ctx, reader, func(view ConsumerCleanupView) error {
+		if err := boundary.validateView(view.Partitions()); err != nil {
+			return err
+		}
 		c.loadCleanupCheckpoint(scan, view.Partitions())
 		err := scan.readContext(ctx, view, time.Now)
 		if err == nil || errors.Is(err, errCleanupBudget) {
@@ -276,6 +342,23 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 			if !scan.matches(view.Partitions()) {
 				return fmt.Errorf("committed metadata view changed before cleanup apply")
 			}
+			if err := boundary.validateView(view.Partitions()); err != nil {
+				return err
+			}
+			for name, target := range scan.completed {
+				group := c.groups[name]
+				if group == nil || group != target.group {
+					delete(scan.completed, name)
+					return fmt.Errorf("preserved group replaced during cleanup")
+				}
+				group.mu.RLock()
+				valid := group.RegistrationEpoch == target.epoch && !c.lifecyclePending[name]
+				group.mu.RUnlock()
+				if !valid {
+					delete(scan.completed, name)
+					return fmt.Errorf("preserved group changed during cleanup")
+				}
+			}
 			for _, reference := range references {
 				target := scan.targets[reference.Name]
 				if target == nil {
@@ -286,20 +369,35 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 					return fmt.Errorf("local group replaced during cleanup")
 				}
 				group.mu.Lock()
+				if group.RegistrationEpoch == target.epoch && !c.lifecyclePending[reference.Name] && scan.preserves(target) {
+					group.mu.Unlock()
+					continue
+				}
 				evidence := target.evidence
+				deletionEpoch := evidence.epoch
+				deletionProven := evidence.kind == ConsumerMetadataRecordTombstone && evidence.epoch > evidence.liveEpoch
+				// A later committed registration cannot revive an older local
+				// incarnation already covered by a tombstone. Remove only that
+				// stale cache; the newer registration/members/offsets stay in the
+				// log and are installed by normal ownership recovery.
+				if boundary != nil && len(boundary.Ends) != 0 && evidence.registrationAfter &&
+					evidence.kind == ConsumerMetadataRecordRegistration && target.epoch <= evidence.beforeLive &&
+					evidence.deletedEpoch > target.epoch && evidence.deletedEpoch < evidence.epoch {
+					deletionEpoch, deletionProven = evidence.deletedEpoch, true
+				}
 				ref, found := topicGroupReferenceLocked(reference.Name, group, topicName)
 				ref.MemberCount = 0
 				valid := found && ref.validateCleanup(topicName) == nil &&
 					group.RegistrationEpoch == target.epoch && group.Generation == target.generation &&
-					!c.lifecyclePending[reference.Name] && evidence.kind == ConsumerMetadataRecordTombstone &&
-					evidence.topic == topicName && evidence.epoch > group.RegistrationEpoch &&
-					evidence.epoch > c.groupEpochs[reference.Name] && evidence.epoch > evidence.liveEpoch
+					!c.lifecyclePending[reference.Name] && deletionProven &&
+					evidence.topic == topicName && deletionEpoch > group.RegistrationEpoch &&
+					deletionEpoch > c.groupEpochs[reference.Name]
 				group.mu.Unlock()
 				if !valid {
 					continue
 				}
 				delete(c.groups, reference.Name)
-				c.groupEpochs[reference.Name] = evidence.epoch
+				c.groupEpochs[reference.Name] = deletionEpoch
 				delete(c.ownershipSince, reference.Name)
 				deleted = append(deleted, reference.Name)
 			}
@@ -309,8 +407,10 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 	}
 	if len(deleted) > 0 {
 		c.updateOffsetPartitionCount()
-		delete(c.cleanupProgress, topicName)
-		c.removeCleanupCheckpoint(topicName)
+		if boundary == nil {
+			delete(c.cleanupProgress, topicName)
+			c.removeCleanupCheckpoint(topicName)
+		}
 	}
 	if err != nil {
 		scan.status.State, scan.status.cause = CleanupError, err
@@ -325,11 +425,26 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		status := scan.status
 		return deleted, &status
 	}
+	scan.validated = true
+	if boundary != nil {
+		if scan.completed == nil {
+			scan.completed = make(map[string]*cleanupTarget)
+		}
+		for name, target := range scan.targets {
+			if scan.preserves(target) {
+				scan.completed[name] = target
+			}
+		}
+		scan.completedPartitions = append([]ConsumerCleanupPartition(nil), scan.partitions...)
+	}
 	// Only a recovered owner can originate a new deletion. The configured
 	// durable writer must additionally fence ownership at append time.
 	for _, reference := range c.TopicGroupReferences(topicName) {
 		if owners[reference.Name] {
 			target := scan.targets[reference.Name]
+			if !scan.mayDelete(target) {
+				continue
+			}
 			if target == nil || target.evidence.epoch > target.epoch || target.evidence.liveEpoch > target.epoch {
 				continue
 			}
@@ -353,9 +468,20 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		}
 	}
 	remaining := c.TopicGroupReferences(topicName)
+	if boundary != nil {
+		filtered := remaining[:0]
+		for _, ref := range remaining {
+			if !scan.preserves(scan.preservedTarget(ref.Name)) {
+				filtered = append(filtered, ref)
+			}
+		}
+		remaining = filtered
+	}
 	if len(remaining) == 0 {
-		delete(c.cleanupProgress, topicName)
-		c.removeCleanupCheckpoint(topicName)
+		if boundary == nil {
+			delete(c.cleanupProgress, topicName)
+			c.removeCleanupCheckpoint(topicName)
+		}
 		return deleted, nil
 	}
 	scan.status.Group = remaining[0].Name
@@ -363,7 +489,10 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		scan.status.Epoch = target.epoch
 	}
 	scan.status.Reason = "waiting for a newer committed group tombstone"
-	if len(deleted) > 0 {
+	if boundary != nil && len(boundary.Ends) == 0 {
+		scan.status.Reason = "truncate ordering evidence unavailable"
+	}
+	if len(deleted) > 0 || (len(scan.completed) > 0 && scan.targets[remaining[0].Name] == nil) {
 		scan.status.State = CleanupContinue
 		scan.status.Reason = "more cleanup targets remain"
 	}
@@ -396,7 +525,7 @@ func (c *Coordinator) cleanupTargetsCurrent(scan *topicCleanupScan, refs []Topic
 			return false
 		}
 		group.mu.RLock()
-		same := group.RegistrationEpoch == target.epoch && group.Generation == target.generation
+		same := group.RegistrationEpoch == target.epoch && (scan.boundary != nil || group.Generation == target.generation)
 		group.mu.RUnlock()
 		if !same {
 			return false
@@ -415,7 +544,7 @@ func (c *Coordinator) newTopicCleanupScan(topicName string, refs []TopicGroupRef
 			continue
 		}
 		group.mu.RLock()
-		scan.targets[ref.Name] = &cleanupTarget{group: group, epoch: group.RegistrationEpoch, generation: group.Generation}
+		scan.targets[ref.Name] = &cleanupTarget{singleTopic: !ref.Shared && !ref.Pattern, group: group, epoch: group.RegistrationEpoch, generation: group.Generation}
 		group.mu.RUnlock()
 	}
 	return scan
@@ -439,6 +568,20 @@ func (scan *topicCleanupScan) readContext(ctx context.Context, view ConsumerClea
 	progressed := false
 
 	partitions := view.Partitions()
+	if len(scan.completed) > 0 {
+		valid := len(partitions) == len(scan.completedPartitions)
+		for i, p := range partitions {
+			if !valid {
+				break
+			}
+			old := scan.completedPartitions[i]
+			valid = p.Identity == old.Identity && p.Generation == old.Generation && p.DurableGeneration == old.DurableGeneration && p.Start == old.Start && p.End >= old.End
+		}
+		if !valid {
+			scan.completed = nil
+			return fmt.Errorf("completed cleanup evidence view changed")
+		}
+	}
 	if len(partitions) == 0 {
 		return fmt.Errorf("consumer metadata partitions unavailable")
 	}
@@ -498,7 +641,7 @@ func (scan *topicCleanupScan) readContext(ctx context.Context, view ConsumerClea
 				if message.Offset < scan.next[partition] || message.Offset >= page.Next {
 					return fmt.Errorf("metadata record outside committed page")
 				}
-				if err := scan.observe(message); err != nil {
+				if err := scan.observeAt(message, partition); err != nil {
 					return err
 				}
 			}
@@ -514,7 +657,7 @@ func (scan *topicCleanupScan) readContext(ctx context.Context, view ConsumerClea
 	return nil
 }
 
-func (scan *topicCleanupScan) observe(message types.Message) error {
+func (scan *topicCleanupScan) observeAt(message types.Message, partition int) error {
 	// The physical committed prefix includes non-JSON transaction controls.
 	// Validate their complete envelope before skipping them: a marker flag
 	// must never hide a keyed lifecycle record or supply deletion authority.
@@ -553,13 +696,16 @@ func (scan *topicCleanupScan) observe(message types.Message) error {
 		return fmt.Errorf("transactional consumer lifecycle evidence for group %q", identity.Group)
 	}
 	evidence := &target.evidence
+	if scan.boundary != nil && len(scan.boundary.Ends) > partition && record.Type != ConsumerMetadataRecordTombstone && message.Offset < scan.boundary.Ends[partition] {
+		evidence.beforeLive = max(evidence.beforeLive, record.Epoch)
+	}
 	if record.Type != ConsumerMetadataRecordTombstone {
 		evidence.liveEpoch = max(evidence.liveEpoch, record.Epoch)
 	}
 	if record.Type != ConsumerMetadataRecordRegistration && record.Type != ConsumerMetadataRecordTombstone {
 		return nil
 	}
-	if record.Epoch < target.epoch {
+	if record.Epoch < target.epoch && scan.boundary == nil {
 		return nil
 	}
 	if record.Type == ConsumerMetadataRecordTombstone &&
@@ -567,6 +713,9 @@ func (scan *topicCleanupScan) observe(message types.Message) error {
 			len(record.Topics) != 0 || record.TopicPattern != "" || len(record.TopicPartitions) != 0 ||
 			record.Lifecycle != nil || len(record.Reservations) != 0 || len(record.ReservationDecisions) != 0) {
 		return fmt.Errorf("invalid tombstone scope for group %q", identity.Group)
+	}
+	if record.Type == ConsumerMetadataRecordTombstone {
+		evidence.deletedEpoch = max(evidence.deletedEpoch, record.Epoch)
 	}
 	// Timestamp is not lifecycle identity (acknowledgement retries may differ).
 	record.Timestamp = ConsumerMetadataRecord{}.Timestamp
@@ -580,6 +729,7 @@ func (scan *topicCleanupScan) observe(message types.Message) error {
 	}
 	if record.Epoch > evidence.epoch {
 		evidence.epoch, evidence.kind, evidence.topic, evidence.digest = record.Epoch, record.Type, record.Topic, digest
+		evidence.registrationAfter = scan.boundary != nil && len(scan.boundary.Ends) > partition && message.Offset >= scan.boundary.Ends[partition] && len(record.InitialOffsets) == 0
 	}
 	return nil
 }

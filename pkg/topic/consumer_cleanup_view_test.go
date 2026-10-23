@@ -13,6 +13,7 @@ import (
 
 func TestConsumerCleanupViewBoundsDiskWorkAndCommitVisibility(t *testing.T) {
 	cfg := config.DefaultConfig()
+	cfg.DiskMinFreePercent = 0
 	cfg.LogDir = t.TempDir()
 	dm := disk.NewDiskManager(cfg)
 	manager := NewTopicManager(cfg, dm, nil)
@@ -45,12 +46,18 @@ func TestConsumerCleanupViewBoundsDiskWorkAndCommitVisibility(t *testing.T) {
 		require.ErrorContains(t, err, "committed range")
 		return nil
 	}))
+	require.NoError(t, manager.CheckConsumerCleanupProof([]coordinator.ConsumerCleanupPartition{before}))
+	p.reconcileMu.Lock()
+	require.Error(t, manager.CheckConsumerCleanupProof([]coordinator.ConsumerCleanupPartition{before}), "final apply must not wait for rollback")
+	p.reconcileMu.Unlock()
 	require.NoError(t, p.ReconcileSnapshotHWM(2))
+	require.Error(t, manager.CheckConsumerCleanupProof([]coordinator.ConsumerCleanupPartition{before}))
 	require.ErrorContains(t, manager.WithConsumerCleanupView(func(coordinator.ConsumerCleanupView) error {
 		t.Error("snapshot-pending view must not be exposed")
 		return nil
 	}), "snapshot recovery pending")
 	require.NoError(t, p.FinalizeSnapshotRecovery(2))
+	require.Error(t, manager.CheckConsumerCleanupProof([]coordinator.ConsumerCleanupPartition{before}), "same HWM after restore cannot reuse an old proof")
 	require.NoError(t, manager.WithConsumerCleanupView(func(view coordinator.ConsumerCleanupView) error {
 		require.NotEqual(t, before.Generation, view.Partitions()[0].Generation)
 		return nil
