@@ -6,12 +6,11 @@ import "fmt"
 // truncate commit. Epochs on opposite sides of this structure are NOT comparable.
 // Empty Ends means the historical cut is unknown, never an empty log.
 type TopicCleanupBoundary struct {
-	TopicInstance      string
-	TopicEpoch         uint64
-	MetadataInstance   string
-	MetadataEpoch      uint64
-	LegacyGroupsAbsent bool
-	Ends               []uint64
+	TopicInstance    string
+	TopicEpoch       uint64
+	MetadataInstance string
+	MetadataEpoch    uint64
+	Ends             []uint64
 }
 
 func (b *TopicCleanupBoundary) Clone() *TopicCleanupBoundary {
@@ -45,7 +44,7 @@ func (scan *topicCleanupScan) preserves(target *cleanupTarget) bool {
 	e := target.evidence
 	return target.singleTopic && e.topic == scan.status.Topic && e.kind == ConsumerMetadataRecordRegistration && e.epoch == target.epoch &&
 		e.registrationAfter && e.epoch > e.beforeLive && e.liveEpoch <= e.epoch &&
-		((scan.boundary.LegacyGroupsAbsent && e.beforeLive == 0 && e.epoch == 1) || (e.deletedEpoch > e.beforeLive && e.deletedEpoch < e.epoch))
+		e.deletedEpoch > e.beforeLive && e.deletedEpoch < e.epoch
 }
 
 func (scan *topicCleanupScan) preservedTarget(name string) *cleanupTarget {

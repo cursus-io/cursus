@@ -132,6 +132,16 @@ func (c *Coordinator) CheckTopicGroupCleanup(topicName string, boundaries ...*To
 		return c.DeleteInactiveGroupsForTopic(topicName)
 	}
 	pending := &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "consumer cleanup scheduled outside Raft apply"}
+	// Snapshot installation can temporarily empty the live overlay. Absence
+	// is meaningful only while consumer recovery admission remains open.
+	gate := &c.consumerAdmission
+	if !gate.mu.TryLock() {
+		return nil, pending
+	}
+	defer gate.mu.Unlock()
+	if gate.unavailableLocked() {
+		return nil, pending
+	}
 	if !c.mu.TryLock() {
 		return nil, pending
 	}

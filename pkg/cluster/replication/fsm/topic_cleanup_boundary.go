@@ -12,7 +12,6 @@ import (
 // coordinator state or local storage HWM to reconstruct an historical boundary.
 func (f *BrokerFSM) captureTopicCleanupBoundaryLocked(target topic.Definition) {
 	b := &coordinator.TopicCleanupBoundary{TopicInstance: target.InstanceID, TopicEpoch: target.LifecycleEpoch}
-	b.LegacyGroupsAbsent = f.cd.HistoricalConsumerGroupsAbsent()
 	d := f.topicState[config.ConsumerOffsetsTopicName]
 	if d != nil {
 		b.MetadataInstance, b.MetadataEpoch = d.InstanceID, d.LifecycleEpoch

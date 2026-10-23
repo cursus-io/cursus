@@ -115,29 +115,28 @@ func TestTruncateCleanupMissingEvidenceFailsClosed(t *testing.T) {
 	}
 }
 
-func TestTruncateCleanupEmptyFirstRegistrationRequiresLegacyAbsence(t *testing.T) {
-	for _, absent := range []bool{false, true} {
-		t.Run(fmt.Sprint(absent), func(t *testing.T) {
-			c, log := newCleanupFollower(t)
-			c.topicHandler = &boundaryCleanupLog{log}
-			c.groups["workers"].Members = make(map[string]*MemberMetadata)
-			c.groups["workers"].Offsets = nil
-			log.append(cleanupMessage(t, ConsumerMetadataRecord{Version: 1, Type: ConsumerMetadataRecordRegistration, Group: "workers", Topic: "orders", PartitionCount: 1, Epoch: 1}))
-			b := &TopicCleanupBoundary{TopicEpoch: 999, MetadataEpoch: 1, LegacyGroupsAbsent: absent, Ends: []uint64{0}}
-			before := c.ExportState()
-			_, err := c.ReconcileTopicGroupsContext(context.Background(), "orders", func() bool { return true }, b)
-			if !absent {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-				_, err = c.CheckTopicGroupCleanup("orders", b)
-				require.NoError(t, err)
-				log.identity++
-				_, err = c.CheckTopicGroupCleanup("orders", b)
-				require.Error(t, err, "final apply must reject replaced log evidence")
-			}
-			require.Equal(t, before, c.ExportState())
-		})
+func TestTruncateCleanupFirstRegistrationWithoutPriorDeletionFailsClosed(t *testing.T) {
+	c, log := newCleanupFollower(t)
+	c.topicHandler = &boundaryCleanupLog{log}
+	c.groups["workers"].Members = make(map[string]*MemberMetadata)
+	c.groups["workers"].Offsets = nil
+	log.append(cleanupMessage(t, ConsumerMetadataRecord{Version: 1, Type: ConsumerMetadataRecordRegistration, Group: "workers", Topic: "orders", PartitionCount: 1, Epoch: 1}))
+	b := &TopicCleanupBoundary{TopicEpoch: 999, MetadataEpoch: 1, Ends: []uint64{0}}
+	before := c.ExportState()
+	// Even an empty local historical overlay is not replicated proof of absence.
+	// Lock contention must not change the outcome or block Raft apply.
+	for _, locked := range []bool{false, true} {
+		if locked {
+			c.authorityMu.Lock()
+		}
+		_, err := c.ReconcileTopicGroupsContext(context.Background(), "orders", func() bool { return true }, b)
+		if locked {
+			c.authorityMu.Unlock()
+		}
+		require.Error(t, err)
+		_, err = c.CheckTopicGroupCleanup("orders", b)
+		require.Error(t, err)
+		require.Equal(t, before, c.ExportState())
 	}
 }
 
@@ -157,6 +156,26 @@ func TestTruncateCleanupPreservesEmptyReregistration(t *testing.T) {
 	_, err = c.CheckTopicGroupCleanup("orders", b)
 	require.NoError(t, err)
 	require.Equal(t, before, c.ExportState())
+	log.identity++
+	_, err = c.CheckTopicGroupCleanup("orders", b)
+	require.Error(t, err, "final apply must reject replaced log evidence")
+}
+
+func TestTruncateCleanupCannotUseEmptyOverlayDuringRecovery(t *testing.T) {
+	c, _ := newCleanupFollower(t)
+	delete(c.groups, "workers")
+	b := &TopicCleanupBoundary{TopicEpoch: 2}
+	release, err := c.BeginConsumerMetadataRecovery(context.Background())
+	require.NoError(t, err)
+	_, err = c.CheckTopicGroupCleanup("orders", b)
+	require.Error(t, err, "an unavailable empty overlay cannot prove absence")
+	release()
+	_, err = c.CheckTopicGroupCleanup("orders", b)
+	require.NoError(t, err)
+	c.consumerAdmission.mu.Lock()
+	_, err = c.CheckTopicGroupCleanup("orders", b)
+	c.consumerAdmission.mu.Unlock()
+	require.Error(t, err, "Raft apply must never wait for recovery admission")
 }
 
 func TestOrdinaryReplayDoesNotAttachOldMembershipToNewRegistration(t *testing.T) {
@@ -180,10 +199,11 @@ func TestTruncateCleanupPreservedBatchesDoNotStarveLaterGroups(t *testing.T) {
 	delete(c.groups, "workers")
 	for i := 0; i < topicCleanupGroups*2+1; i++ {
 		name := fmt.Sprintf("new-%03d", i)
-		c.groups[name] = &GroupMetadata{TopicName: "orders", RegistrationEpoch: 1, Members: make(map[string]*MemberMetadata)}
-		log.append(cleanupMessage(t, ConsumerMetadataRecord{Version: 1, Type: ConsumerMetadataRecordRegistration, Group: name, Topic: "orders", PartitionCount: 1, Epoch: 1}))
+		c.groups[name] = &GroupMetadata{TopicName: "orders", RegistrationEpoch: 3, Members: make(map[string]*MemberMetadata)}
+		log.append(cleanupMessage(t, ConsumerMetadataRecord{Version: 1, Type: ConsumerMetadataRecordTombstone, Group: name, Topic: "orders", Epoch: 2}))
+		log.append(cleanupMessage(t, ConsumerMetadataRecord{Version: 1, Type: ConsumerMetadataRecordRegistration, Group: name, Topic: "orders", PartitionCount: 1, Epoch: 3}))
 	}
-	b := &TopicCleanupBoundary{TopicEpoch: 888, MetadataEpoch: 1, LegacyGroupsAbsent: true, Ends: []uint64{0}}
+	b := &TopicCleanupBoundary{TopicEpoch: 888, MetadataEpoch: 1, Ends: []uint64{0}}
 	var err error
 	for i := 0; i < 30; i++ {
 		_, err = c.ReconcileTopicGroupsContext(context.Background(), "orders", func() bool { return true }, b)

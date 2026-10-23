@@ -51,9 +51,10 @@ No production state mutation or destructive workaround is part of this work.
 The scanner retains the highest live group epoch before the cut, the latest
 validated deletion epoch, and the latest registration's position relative to the
 cut. A later same-name registration survives only when a committed scoped
-tombstone proves the previous live epoch was deleted. A first registration also
-requires known absence of historical Raft-only groups; contention or unknown
-legacy provenance does not establish absence. Timestamp values never order the
+tombstone proves the previous live epoch was deleted. A first registration with
+no preceding deletion remains fail closed: the FSM has no deterministic proof
+that historical Raft-only groups were absent. Local compatibility state or lock
+contention must never become persisted Raft evidence. Timestamp values never order the
 operation. Shared and pattern subscriptions retain their existing fail-closed
 scope protection; registration initial offsets do not authorize preservation.
 
@@ -65,6 +66,8 @@ fenced owner may write a deletion for a group proven live before the cut.
 The final Raft-apply check consumes the same validated operation-bound proof and
 nonblockingly checks the current partition identity, generation, committed HWM
 and snapshot status without reading disk. Rollback or replacement invalidates it.
+The check also holds consumer recovery admission nonblockingly: an empty overlay
+during snapshot installation cannot establish that all old groups were removed.
 Snapshot restore and definition updates leave truncation pending until that
 check succeeds. Membership generations are no longer copied across registration
 epochs during ordinary replay. The normal same-epoch compatibility path remains.

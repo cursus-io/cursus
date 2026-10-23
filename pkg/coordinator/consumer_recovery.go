@@ -35,17 +35,6 @@ func newCompatibilityCoordinator() *Coordinator {
 	return &Coordinator{groups: make(map[string]*GroupMetadata), groupEpochs: make(map[string]uint64), lifecyclePending: make(map[string]bool), ownershipSince: make(map[string]time.Time)}
 }
 
-// HistoricalConsumerGroupsAbsent is a nonblocking Raft-apply proof. Local disk
-// overlays cannot establish absence of older Raft-only registrations. Contention
-// or unknown compatibility provenance conservatively returns false.
-func (c *Coordinator) HistoricalConsumerGroupsAbsent() bool {
-	if c == nil || !c.authorityMu.TryLock() {
-		return false
-	}
-	defer c.authorityMu.Unlock()
-	return c.raftCompatibilityKnown && c.raftCompatibility != nil && len(c.raftCompatibility.groups) == 0
-}
-
 type lifecycleWriteMode bool
 
 const (
