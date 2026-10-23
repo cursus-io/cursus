@@ -34,8 +34,8 @@ func NewQueue(capacity int) *Queue {
 
 // Reconcile returns running keys whose old owners must be canceled. They remain
 // charged/running until Complete acknowledges that the owner has actually left.
-// Items are in stable inventory order. The discovery cursor advances even when
-// a full queue cannot admit more work, so new arrivals cannot reset priority.
+// Items are in stable inventory order. A full queue retains the discovery
+// cursor; the next free slot resumes after the last examined inventory item.
 func (q *Queue) Reconcile(items []Item, now time.Time) []string {
 	live := make(map[string]Item, len(items))
 	for _, item := range items {
@@ -47,7 +47,11 @@ func (q *Queue) Reconcile(items []Item, now time.Time) []string {
 		if !exists || e.Item != item {
 			// A changed generation must not inherit a dead incarnation's retry
 			// delay. Byte debt remains in Budget, keyed by stable broker ID.
-			delete(q.sources, e.Source)
+			if exists {
+				delete(q.sources, e.Source)
+			}
+			// Removal alone must not reset another partition's shared source
+			// backoff. The admitted-source sweep below retires unused state.
 			if e.Running {
 				e.Retired = true
 				cancel = append(cancel, key)

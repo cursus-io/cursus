@@ -96,6 +96,36 @@ func TestQueueGenerationChangeJoinsBeforeReplacement(t *testing.T) {
 	}
 }
 
+func TestQueueRemovalPreservesSharedSourceBackoff(t *testing.T) {
+	q := NewQueue(3)
+	now := time.Unix(1, 0)
+	items := []Item{{"a", "shared", "1"}, {"b", "shared", "1"}, {"c", "other", "1"}}
+	admit := func(Item) bool { return true }
+	q.Reconcile(items, now)
+	a, _ := q.Next(now, admit)
+	q.Complete(a.Item, now, false, true, true)
+	q.Reconcile(items[1:], now)
+	c, ok := q.Next(now, admit)
+	if !ok || c.Key != "c" {
+		t.Fatal("removing a partition erased its peer's source backoff", c)
+	}
+	q.Complete(c.Item, now, true, false, false)
+	if _, ok := q.Next(now, admit); ok {
+		t.Fatal("remaining source ran before its retry deadline")
+	}
+	items[1].Generation = "2"
+	q.Reconcile(items[1:2], now)
+	b, ok := q.Next(now, admit)
+	if !ok || b.Key != "b" {
+		t.Fatal("replacement generation inherited obsolete source backoff", b)
+	}
+	q.Complete(b.Item, now, true, false, false)
+	q.Reconcile(nil, now)
+	if len(q.sources) != 0 {
+		t.Fatal("removed sources retained retry state")
+	}
+}
+
 func TestQueueCapacityDiscoveryAndNonblockingAdmission(t *testing.T) {
 	q := NewQueue(2)
 	now := time.Unix(1, 0)

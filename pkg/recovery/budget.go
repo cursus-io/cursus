@@ -116,17 +116,19 @@ func (b *Budget) AcquireWork(ctx context.Context, source string) (func(), error)
 	b.waiters++
 	b.mu.Unlock()
 	unwait := func() { b.mu.Lock(); b.waiters--; b.mu.Unlock() }
+	defer unwait()
 	select {
 	case b.workSlots <- struct{}{}:
 	case <-ctx.Done():
-		unwait()
 		return nil, ctx.Err()
 	}
-	unwait()
 	b.mu.Lock()
 	b.workWaiting[source]++
 	b.mu.Unlock()
-	l, err := b.acquire(ctx, source, 0, true)
+	// Keep the original waiter admission across both stages. Releasing and
+	// reacquiring it lets new fetch waiters steal an already admitted owner's
+	// place after it finally wins the scarce work slot.
+	l, err := b.waitForLease(ctx, source, 0, true)
 	b.mu.Lock()
 	b.workWaiting[source]--
 	if b.workWaiting[source] == 0 {
@@ -254,6 +256,10 @@ func (b *Budget) acquire(ctx context.Context, source string, bytes int64, work b
 	b.waiters++
 	b.mu.Unlock()
 	defer func() { b.mu.Lock(); b.waiters--; b.mu.Unlock() }()
+	return b.waitForLease(ctx, source, bytes, work)
+}
+
+func (b *Budget) waitForLease(ctx context.Context, source string, bytes int64, work bool) (*Lease, error) {
 	for {
 		lease, delay, err := b.tryAcquire(ctx, source, bytes, work)
 		if !errors.Is(err, ErrBusy) {

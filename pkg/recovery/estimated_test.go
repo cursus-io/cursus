@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -93,5 +94,60 @@ func TestAtomicWorkReservesNextSourceSlotAgainstReadyTransfers(t *testing.T) {
 	release()
 	if got := b.Usage(); got.Active != 0 || got.Waiters != 0 {
 		t.Fatalf("atomic work leaked: %+v", got)
+	}
+}
+
+func TestAtomicWorkRetainsWaiterAdmissionAcrossBothWaits(t *testing.T) {
+	b, clock := fixture(t) // One admitted waiter, one atomic-work slot.
+	transfer := acquire(t, b, "a", 1)
+	b.workSlots <- struct{}{} // Independently owned atomic work is finishing.
+	waiting, wake := make(chan struct{}), make(chan struct{})
+	clock.wait = func(ctx context.Context, _ time.Duration) error {
+		close(waiting)
+		select {
+		case <-wake:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		release, err := b.AcquireWork(ctx, "a")
+		if release != nil {
+			release()
+		}
+		result <- err
+	}()
+	for b.Usage().Waiters == 0 && ctx.Err() == nil {
+		runtime.Gosched()
+	}
+	if b.Usage().Waiters != 1 {
+		t.Fatal("work-slot wait was not admitted")
+	}
+	if _, err := b.Acquire(ctx, "b", 1); !errors.Is(err, ErrBusy) {
+		t.Fatal("work-slot wait lost its bounded waiter reservation", err)
+	}
+	<-b.workSlots
+	select {
+	case <-waiting:
+	case <-ctx.Done():
+		t.Fatal("work never reached broker/source admission")
+	}
+	if b.Usage().Waiters != 1 {
+		t.Fatal("broker/source wait lost the original reservation")
+	}
+	if _, err := b.AcquireEstimated(ctx, "b", 1); !errors.Is(err, ErrBusy) {
+		t.Fatal("new transfer displaced admitted atomic work", err)
+	}
+	finish(t, transfer, 1)
+	close(wake)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if got := b.Usage(); got.Waiters != 0 || got.Active != 0 {
+		t.Fatalf("work completion leaked resources: %+v", got)
 	}
 }
