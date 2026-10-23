@@ -149,6 +149,7 @@ var diskMsgBufPool = sync.Pool{
 }
 
 const (
+	timedDiskMessageMagic          = "CDM6"
 	diskMessageMagic               = "CDM5"
 	checksumDiskMessageMagic       = "CDM4"
 	replayIdentityDiskMessageMagic = "CDM3"
@@ -162,13 +163,20 @@ var (
 
 // EstimateDiskMessageSize returns the serialized size of a DiskMessage without allocating.
 func EstimateDiskMessageSize(msg types.DiskMessage) int {
-	return len(diskMessageMagic) + 2 + len(msg.Topic) + 4 + 8 + 2 + len(msg.ProducerID) + 8 + 8 + 8 +
+	timeBytes := 0
+	if msg.AppendTimeMS != 0 {
+		timeBytes = 8
+	}
+	return timeBytes + len(diskMessageMagic) + 2 + len(msg.Topic) + 4 + 8 + 2 + len(msg.ProducerID) + 8 + 8 + 8 +
 		4 + len(msg.Payload) + 2 + len(msg.Key) +
 		2 + len(msg.EventType) + 4 + 8 + 2 + len(msg.Metadata) + 2 + len(msg.TransactionalID) + 2 + len(msg.TransactionState) + 2 + len(msg.TransactionMarker) + 2 + len(msg.ControlBatchType) + 2 + 8 + 2 + len(msg.ControlBatchKey) + 2 + len(msg.ControlBatchValue) + 2 + len(msg.EventID) + 2 + len(msg.PayloadDigest) + 4
 }
 
 // SerializeDiskMessage serializes a DiskMessage for disk storage
 func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
+	if msg.AppendTimeMS < 0 {
+		return nil, fmt.Errorf("negative append time: %d", msg.AppendTimeMS)
+	}
 	topicLen, ok := SafeIntToUint16(len(msg.Topic))
 	if !ok {
 		return nil, fmt.Errorf("topic too long: %d", len(msg.Topic))
@@ -246,7 +254,11 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	}
 
 	var tmp [8]byte
-	buf = append(buf, diskMessageMagic...)
+	magic := diskMessageMagic
+	if msg.AppendTimeMS != 0 {
+		magic = timedDiskMessageMagic
+	}
+	buf = append(buf, magic...)
 
 	// Topic (length + string)
 	binary.BigEndian.PutUint16(tmp[:2], topicLen)
@@ -350,6 +362,10 @@ func SerializeDiskMessage(msg types.DiskMessage) ([]byte, error) {
 	buf = append(buf, tmp[:2]...)
 	buf = append(buf, msg.PayloadDigest...)
 
+	if msg.AppendTimeMS != 0 {
+		binary.BigEndian.PutUint64(tmp[:], uint64(msg.AppendTimeMS)) // #nosec G115 -- negative values rejected above.
+		buf = append(buf, tmp[:]...)
+	}
 	checksum := crc32.Checksum(buf, diskMessageChecksumTable)
 	binary.BigEndian.PutUint32(tmp[:4], checksum)
 	buf = append(buf, tmp[:4]...)
@@ -370,10 +386,10 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 		return msg, fmt.Errorf("unsupported disk message format: clean bootstrap required")
 	}
 	magic := string(data[:len(diskMessageMagic)])
-	if magic != diskMessageMagic && magic != checksumDiskMessageMagic && magic != replayIdentityDiskMessageMagic && magic != legacyDiskMessageMagic {
+	if magic != timedDiskMessageMagic && magic != diskMessageMagic && magic != checksumDiskMessageMagic && magic != replayIdentityDiskMessageMagic && magic != legacyDiskMessageMagic {
 		return msg, fmt.Errorf("unsupported disk message format: clean bootstrap required")
 	}
-	if magic == diskMessageMagic || magic == checksumDiskMessageMagic {
+	if magic == timedDiskMessageMagic || magic == diskMessageMagic || magic == checksumDiskMessageMagic {
 		if len(data) < len(diskMessageMagic)+4 {
 			return msg, fmt.Errorf("%w: truncated checksum", ErrDiskMessageChecksumMismatch)
 		}
@@ -449,7 +465,7 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	}
 	msg.Epoch = diskEpochVal
 	offset += 8
-	if magic == diskMessageMagic {
+	if magic == timedDiskMessageMagic || magic == diskMessageMagic {
 		if offset+8 > len(data) {
 			return msg, errors.New("data too short for leader epoch")
 		}
@@ -534,13 +550,24 @@ func DeserializeDiskMessage(data []byte) (types.DiskMessage, error) {
 	if err := readDiskBytes(data, &offset, &msg.ControlBatchValue, "control batch value"); err != nil {
 		return msg, err
 	}
-	if magic == diskMessageMagic || magic == checksumDiskMessageMagic || magic == replayIdentityDiskMessageMagic {
+	if magic == timedDiskMessageMagic || magic == diskMessageMagic || magic == checksumDiskMessageMagic || magic == replayIdentityDiskMessageMagic {
 		if err := readDiskString(data, &offset, &msg.EventID, "event ID"); err != nil {
 			return msg, err
 		}
 		if err := readDiskString(data, &offset, &msg.PayloadDigest, "payload digest"); err != nil {
 			return msg, err
 		}
+	}
+	if magic == timedDiskMessageMagic {
+		if offset+8 > len(data) {
+			return msg, fmt.Errorf("truncated append time")
+		}
+		value, ok := SafeUint64ToInt64(binary.BigEndian.Uint64(data[offset : offset+8]))
+		if !ok || value <= 0 {
+			return msg, fmt.Errorf("invalid append time")
+		}
+		msg.AppendTimeMS = value
+		offset += 8
 	}
 	if offset != len(data) {
 		return msg, fmt.Errorf("disk message has %d trailing bytes", len(data)-offset)

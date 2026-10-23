@@ -19,10 +19,13 @@ const (
 
 // Message is the canonical broker and Go SDK record schema.
 type Message struct {
-	Topic     string
-	Partition int
-	Offset    uint64
-	Timestamp int64
+	// AppendTimeMS is internal broker provenance, never producer event time.
+	// Internal replication JSON carries it; the public v3 wire codec does not.
+	AppendTimeMS int64 `json:",omitempty"`
+	Topic        string
+	Partition    int
+	Offset       uint64
+	Timestamp    int64
 
 	ProducerID string
 	SeqNum     uint64

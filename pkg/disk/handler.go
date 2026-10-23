@@ -511,13 +511,13 @@ func (d *DiskHandler) AppendMessageSync(topic string, partition int, msg *types.
 
 func diskMessageFromMessage(topic string, partition int32, msg types.Message) types.DiskMessage {
 	return types.DiskMessage{
-		Topic:                        topic,
-		Partition:                    partition,
-		Offset:                       msg.Offset,
-		ProducerID:                   msg.ProducerID,
-		SeqNum:                       msg.SeqNum,
-		Epoch:                        msg.Epoch,
-		LeaderEpoch:                  msg.LeaderEpoch,
+		Topic:       topic,
+		Partition:   partition,
+		Offset:      msg.Offset,
+		ProducerID:  msg.ProducerID,
+		SeqNum:      msg.SeqNum,
+		Epoch:       msg.Epoch,
+		LeaderEpoch: msg.LeaderEpoch, AppendTimeMS: msg.AppendTimeMS,
 		Payload:                      msg.Payload,
 		Key:                          msg.Key,
 		EventType:                    msg.EventType,
@@ -821,12 +821,12 @@ func (dh *DiskHandler) readMessagesFromPositionBounded(reader *mmap.ReaderAt, po
 		}
 
 		messages = append(messages, types.Message{
-			Offset:                       diskMsg.Offset,
-			Payload:                      diskMsg.Payload,
-			ProducerID:                   diskMsg.ProducerID,
-			SeqNum:                       diskMsg.SeqNum,
-			Epoch:                        diskMsg.Epoch,
-			LeaderEpoch:                  diskMsg.LeaderEpoch,
+			Offset:      diskMsg.Offset,
+			Payload:     diskMsg.Payload,
+			ProducerID:  diskMsg.ProducerID,
+			SeqNum:      diskMsg.SeqNum,
+			Epoch:       diskMsg.Epoch,
+			LeaderEpoch: diskMsg.LeaderEpoch, AppendTimeMS: diskMsg.AppendTimeMS,
 			Key:                          diskMsg.Key,
 			EventType:                    diskMsg.EventType,
 			SchemaVersion:                diskMsg.SchemaVersion,

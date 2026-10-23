@@ -37,7 +37,7 @@ func retainedExportTest(t *testing.T, d *DiskHandler, anchor, start, end uint64)
 
 func TestRetainedBootstrapRawFieldRoundTripAndPages(t *testing.T) {
 	d, _ := bootstrapTestHandler(t, 1)
-	record := types.DiskMessage{Topic: "orders", Partition: 1, Offset: 0, ProducerID: "p", SeqNum: 8, Epoch: 2, LeaderEpoch: 7, Payload: "body", Key: "key", EventType: "event", SchemaVersion: 3, AggregateVersion: 4, Metadata: `{"k":"v"}`, EventID: "id", PayloadDigest: "digest", TransactionalID: "tx", TransactionState: types.TransactionStateAborted, TransactionMarker: types.TransactionMarkerAbort, ControlBatchType: types.ControlBatchTransaction, ControlBatchVersion: types.ControlBatchVersionCursusV2, ControlBatchCoordinatorEpoch: 9, ControlBatchKey: []byte{1, 2}, ControlBatchValue: []byte{3, 4}}
+	record := types.DiskMessage{AppendTimeMS: 1700000000000, Topic: "orders", Partition: 1, Offset: 0, ProducerID: "p", SeqNum: 8, Epoch: 2, LeaderEpoch: 7, Payload: "body", Key: "key", EventType: "event", SchemaVersion: 3, AggregateVersion: 4, Metadata: `{"k":"v"}`, EventID: "id", PayloadDigest: "digest", TransactionalID: "tx", TransactionState: types.TransactionStateAborted, TransactionMarker: types.TransactionMarkerAbort, ControlBatchType: types.ControlBatchTransaction, ControlBatchVersion: types.ControlBatchVersionCursusV2, ControlBatchCoordinatorEpoch: 9, ControlBatchKey: []byte{1, 2}, ControlBatchValue: []byte{3, 4}}
 	// Every current disk field must be populated so a newly added field cannot
 	// silently escape this round-trip regression check.
 	value := reflect.ValueOf(record)

@@ -335,13 +335,13 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	defer d.ioMu.Unlock()
 
 	diskMsg := types.DiskMessage{
-		Topic:                        topic,
-		Partition:                    int32(partition),
-		Offset:                       msg.Offset,
-		ProducerID:                   msg.ProducerID,
-		SeqNum:                       msg.SeqNum,
-		Epoch:                        msg.Epoch,
-		LeaderEpoch:                  msg.LeaderEpoch,
+		Topic:       topic,
+		Partition:   int32(partition),
+		Offset:      msg.Offset,
+		ProducerID:  msg.ProducerID,
+		SeqNum:      msg.SeqNum,
+		Epoch:       msg.Epoch,
+		LeaderEpoch: msg.LeaderEpoch, AppendTimeMS: msg.AppendTimeMS,
 		Payload:                      msg.Payload,
 		Key:                          msg.Key,
 		EventType:                    msg.EventType,
