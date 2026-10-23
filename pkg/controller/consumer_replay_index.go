@@ -1,0 +1,46 @@
+package controller
+
+import (
+	"fmt"
+
+	"github.com/cursus-io/cursus/pkg/types"
+)
+
+func (r *consumerRecoveryReader) ConsumerMetadataIndexIdentity(p int) (string, error) {
+	if p < 0 || p >= len(r.views) || r.views[p] == nil || r.indexTopicInstance == "" {
+		return "", fmt.Errorf("local replay index identity unavailable")
+	}
+	token, err := r.views[p].ConsumerReplayIndexIdentity(r.ctx)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s:%d:%d:%s", r.indexTopicInstance, r.metadata[p].LifecycleEpoch, p, token), nil
+}
+
+func (r *consumerRecoveryReader) ReadRawConsumerMetadataIndex(p int, offset uint64, max int) ([]types.Message, error) {
+	if err := r.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if p < 0 || p >= len(r.views) || r.views[p] == nil {
+		return nil, fmt.Errorf("local replay index view unavailable")
+	}
+	messages, err := r.views[p].ReadMessages(offset, max)
+	for i, m := range messages {
+		if m.Offset >= r.ends[p] {
+			return messages[:i], err
+		}
+	}
+	return messages, err
+}
+
+func (r *consumerRecoveryReader) SyncConsumerMetadataIndex() error {
+	for _, v := range r.views {
+		if v == nil {
+			return fmt.Errorf("local replay index view unavailable")
+		}
+		if err := v.SyncConsumerReplayIndex(r.ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}

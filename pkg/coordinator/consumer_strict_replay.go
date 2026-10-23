@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -49,6 +50,7 @@ type ConsumerMetadataScope struct {
 // PreparedConsumerMetadataReplay is single-use, detached, and bound to the
 // exclusive recovery lease and authority generation that prepared it.
 type PreparedConsumerMetadataReplay struct {
+	preserveClocks  map[string]bool
 	repairs         map[int]uint64
 	repairValidator ConsumerLogRepairValidator
 	owner           *Coordinator
@@ -348,6 +350,10 @@ func (c *Coordinator) PrepareScopedConsumerMetadataReplay(reader ConsumerMetadat
 }
 
 func (c *Coordinator) prepareConsumerMetadataReplay(reader ConsumerMetadataCommittedReader, scope *ConsumerMetadataScope, stamp consumerMetadataReplayStamp) (*PreparedConsumerMetadataReplay, error) {
+	return c.prepareConsumerMetadataReplayIndexed(reader, scope, stamp, true)
+}
+
+func (c *Coordinator) prepareConsumerMetadataReplayIndexed(reader ConsumerMetadataCommittedReader, scope *ConsumerMetadataScope, stamp consumerMetadataReplayStamp, loadIndex bool) (*PreparedConsumerMetadataReplay, error) {
 	if err := c.validateConsumerMetadataReplayStamp(stamp); err != nil {
 		return nil, err
 	}
@@ -405,7 +411,32 @@ func (c *Coordinator) prepareConsumerMetadataReplay(reader ConsumerMetadataCommi
 	scratch.offsetTopicPartitionCount = count
 	// Unknown-authority snapshots retain the historical merge policy.
 	// Known authority always uses replacement replay from the Raft baseline.
-	status, err := scratch.recoverConsumerMetadataWithOptions(bounded, !stamp.legacyStartup)
+	var replayReader OffsetLogReader = bounded
+	var indexed *indexedMetadataReader
+	if !stamp.legacyStartup && scope == nil {
+		indexed = c.newIndexedMetadataReader(reader, bounded, state, loadIndex)
+		if indexed != nil {
+			if indexed.certifyRaw() {
+				replayReader = indexed
+			} else {
+				indexed.cached = nil
+				indexed.selected = make(map[replayIndexKey]consumerReplayIndexRecord)
+				indexed.epochs = make(map[string]uint64)
+				indexed.eligible = false
+				replayReader = indexed
+			}
+		}
+	}
+	status, err := scratch.recoverConsumerMetadataWithOptions(replayReader, !stamp.legacyStartup)
+	if errors.Is(err, errConsumerReplayIndexFallback) || err != nil && indexed != nil && indexed.cached != nil {
+		full, fullErr := c.prepareConsumerMetadataReplayIndexed(reader, scope, stamp, false)
+		if full != nil && indexed != nil {
+			full.status.IndexSourceRecords += indexed.readRecords
+			full.status.IndexSourcePayloadBytes += indexed.readBytes
+			full.status.IndexReadBytes += indexed.cacheBytes
+		}
+		return full, fullErr
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -416,6 +447,27 @@ func (c *Coordinator) prepareConsumerMetadataReplay(reader ConsumerMetadataCommi
 	// Fail preparation too if historical authority moved while local reads ran.
 	if err := c.validateConsumerMetadataReplayStamp(stamp); err != nil {
 		return nil, err
+	}
+	if indexed != nil {
+		if err := indexed.validateIdentity(); err != nil {
+			return nil, err
+		}
+		if indexed.cached != nil {
+			for name, partitions := range indexed.cached.Sources {
+				for p := range partitions {
+					scratch.RecordConsumerMetadataSource(name, p)
+				}
+			}
+			prepared.status.IndexHit = true
+		}
+		prepared.status.IndexReadBytes = indexed.cacheBytes
+		prepared.status.IndexSourceRecords = indexed.readRecords
+		prepared.status.IndexSourcePayloadBytes = indexed.readBytes
+		written, saveErr := indexed.save(state, scratch)
+		prepared.status.IndexWriteBytes = written
+		if saveErr != nil {
+			prepared.status.IndexFailure = saveErr.Error()
+		}
 	}
 	return prepared, nil
 }
@@ -520,6 +572,25 @@ func (c *Coordinator) applyConsumerMetadataReplay(p *PreparedConsumerMetadataRep
 	}
 	sourcesByGroup := p.scratch.metadataSources
 	ownership := make(map[string]time.Time)
+	for name := range p.preserveClocks {
+		previous, next := c.groups[name], p.scratch.groups[name]
+		if previous == nil || next == nil {
+			continue
+		}
+		previous.mu.RLock()
+		if sameRecoveredSession(previous, next) {
+			if previous.LastActivity.After(next.LastActivity) {
+				next.LastActivity = previous.LastActivity
+			}
+			for id, member := range previous.Members {
+				next.Members[id].LastHeartbeat = member.LastHeartbeat
+			}
+			if since, ok := c.ownershipSince[name]; ok {
+				ownership[name] = since
+			}
+		}
+		previous.mu.RUnlock()
+	}
 	publish := func() {
 		if scoped {
 			for name := range p.scope.names {

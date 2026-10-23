@@ -17,12 +17,13 @@ import (
 var ErrConsumerRecoveryPending = errors.New("consumer metadata local recovery pending")
 
 type consumerRecoveryReader struct {
-	repairGenerations map[int]disk.ContentGeneration
-	ctx               context.Context
-	views             []*topic.PartitionReadView
-	ends              []uint64
-	staged            StagedConsumerMetadataRecovery
-	metadata          []fsm.PartitionMetadata
+	indexTopicInstance string
+	repairGenerations  map[int]disk.ContentGeneration
+	ctx                context.Context
+	views              []*topic.PartitionReadView
+	ends               []uint64
+	staged             StagedConsumerMetadataRecovery
+	metadata           []fsm.PartitionMetadata
 }
 
 func (r *consumerRecoveryReader) ExistingPartitionCount(string) (int, error) {
@@ -116,6 +117,25 @@ func (ch *CommandHandler) recoverDistributedConsumerMetadata(ctx context.Context
 			}
 			if err != nil {
 				return err
+			}
+			if !requirement.Pending() && plan.finite {
+				unchanged := make(map[int]bool)
+				ch.groupRecoveryMu.Lock()
+				for partition, after := range plan.owned {
+					before, ok := ch.groupRecoveryOwnership[partition]
+					if ok && before.Epoch == after.Epoch && before.Lifecycle == after.Lifecycle && before.PartitionCount == after.PartitionCount {
+						// Router partitions are reduced modulo an int partition count.
+						unchanged[int(partition)] = true // #nosec G115
+					}
+				}
+				ch.groupRecoveryMu.Unlock()
+				route := func(group string) (int, error) {
+					_, _, partition, _, err := ch.Cluster.Router.FindCoordinatorWithEpoch(group)
+					return int(partition), err // #nosec G115 -- router bounds partition by its int partition count.
+				}
+				if err := ch.Coordinator.PreserveConsumerReplayClocks(prepared, route, unchanged); err != nil {
+					return err
+				}
 			}
 			epochs := make(map[uint64]int, len(plan.owned))
 			for partition, proof := range plan.owned {
