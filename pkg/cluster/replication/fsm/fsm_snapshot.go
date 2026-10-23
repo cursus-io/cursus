@@ -12,6 +12,7 @@ import (
 
 type BrokerFSMSnapshot struct {
 	topicCleanupBoundaries           map[string]*coordinator.TopicCleanupBoundary
+	retentionTimeActivated           bool
 	consumerRecovery                 *coordinator.ConsumerRecoveryEnvelope
 	applied                          uint64
 	logs                             map[uint64]*ReplicationEntry
@@ -32,6 +33,7 @@ type BrokerFSMSnapshot struct {
 func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	state := BrokerFSMState{
 		TopicCleanupBoundaries:           s.topicCleanupBoundaries,
+		RetentionTimeActivated:           s.retentionTimeActivated,
 		Version:                          s.writeVersion(),
 		Applied:                          s.applied,
 		Logs:                             s.logs,

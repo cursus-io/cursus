@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"sort"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,7 +23,13 @@ func TestDiskHandler_EnforceRetention(t *testing.T) {
 		indexPath := dh.GetIndexPath(baseOffset)
 
 		require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o750))
-		require.NoError(t, os.WriteFile(logPath, make([]byte, size), 0o600))
+		record, err := util.SerializeDiskMessage(types.DiskMessage{Offset: baseOffset})
+		require.NoError(t, err)
+		frame := make([]byte, 4, 4+len(record))
+		binary.BigEndian.PutUint32(frame, uint32(len(record)))
+		frame = append(frame, record...)
+		require.Len(t, frame, size)
+		require.NoError(t, os.WriteFile(logPath, frame, 0o600))
 		require.NoError(t, os.Chtimes(logPath, modTime, modTime))
 		require.NoError(t, os.WriteFile(indexPath, []byte("index_data"), 0o600))
 

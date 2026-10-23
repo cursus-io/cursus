@@ -113,13 +113,15 @@ type metadataPathProvider interface {
 }
 
 type topicMetadataManifest struct {
-	Version int          `json:"version"`
-	Topics  []Definition `json:"topics"`
+	RetentionTime bool         `json:"retention_time,omitempty"`
+	Version       int          `json:"version"`
+	Topics        []Definition `json:"topics"`
 }
 
 type topicMetadataStore struct {
-	path  string
-	phase func(string) // test-only process-crash observer; installed before use
+	retentionTime bool
+	path          string
+	phase         func(string) // test-only process-crash observer; installed before use
 }
 
 func newTopicMetadataStore(cfg *config.Config, provider HandlerProvider) *topicMetadataStore {
@@ -134,7 +136,7 @@ func newTopicMetadataStore(cfg *config.Config, provider HandlerProvider) *topicM
 	if path == "" {
 		return nil
 	}
-	return &topicMetadataStore{path: filepath.Clean(path)}
+	return &topicMetadataStore{path: filepath.Clean(path), retentionTime: cfg.RetentionTimeEnabled}
 }
 
 func (s *topicMetadataStore) Load() (_ []Definition, err error) {
@@ -193,6 +195,9 @@ func (s *topicMetadataStore) Load() (_ []Definition, err error) {
 	if manifest.Version != topicMetadataFormatVersion && manifest.Version != 3 {
 		return nil, fmt.Errorf("unsupported topic metadata version %d; clean bootstrap required", manifest.Version)
 	}
+	if manifest.RetentionTime && !s.retentionTime {
+		return nil, fmt.Errorf("durable retention time is activated; LOG_RETENTION_TIME_ENABLED must remain enabled")
+	}
 
 	seen := make(map[string]struct{}, len(manifest.Topics))
 	definitions := make([]Definition, 0, len(manifest.Topics))
@@ -238,6 +243,21 @@ func (s *topicMetadataStore) Save(definitions []Definition) (err error) {
 	if err != nil {
 		return err
 	}
+	if s.retentionTime {
+		var manifest topicMetadataManifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			return err
+		}
+		manifest.RetentionTime = true
+		data, err = json.MarshalIndent(manifest, "", "  ")
+		if err != nil {
+			return err
+		}
+		data = append(data, '\n')
+		if len(data) > maxTopicMetadataBytes {
+			return fmt.Errorf("topic metadata size %d exceeds limit %d", len(data), maxTopicMetadataBytes)
+		}
+	}
 
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -270,6 +290,11 @@ func (s *topicMetadataStore) Save(definitions []Definition) (err error) {
 	}
 	if s.phase != nil {
 		s.phase("manifest_renamed")
+	}
+	if s.retentionTime {
+		if err := syncPartitionDirectory(dir); err != nil {
+			return &topicMetadataSaveError{committed: true, err: err}
+		}
 	}
 	if err := syncTopicMetadataDirectoryFn(dir); err != nil {
 		return &topicMetadataSaveError{
@@ -359,6 +384,12 @@ func (tm *TopicManager) RestoreTopics() error {
 		restoreErr := fmt.Errorf("load durable topic metadata: %w", err)
 		tm.recordMetadataLoadResult(restoreErr, confirmedOrphanCount(err), 0)
 		return restoreErr
+	}
+	// Fence old binaries before opening any partition under the new contract.
+	if tm.metadataStore.retentionTime {
+		if err := tm.metadataStore.Save(definitions); err != nil {
+			return err
+		}
 	}
 	if err := tm.RestoreDefinitions(definitions); err != nil {
 		restoreErr := fmt.Errorf("restore durable topics: %w", err)
@@ -462,6 +493,7 @@ func (tm *TopicManager) RestoreDefinitions(definitions []Definition) error {
 			return fmt.Errorf("restore topic %q: %w", definition.Name, err)
 		}
 		restored.SetDistributedCompactionGate(tm.compactionGate)
+		restored.setRetentionTimeGate(tm.retentionTimeGate)
 		restored.SetTransactionDecisionResolver(tm.txnResolver)
 		tm.topics[definition.Name] = restored
 		created = append(created, definition.Name)

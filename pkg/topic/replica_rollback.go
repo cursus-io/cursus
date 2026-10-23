@@ -223,6 +223,8 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 	uncertain = true
 	p.mu.Lock()
 	p.LEO.Store(offset)
+	p.appendTimeSeeded = false
+	p.lastAppendTimeMS = 0
 	if policy == canonicalReplicaRollback {
 		p.HWM = offset
 		p.hwmAuthoritative = true

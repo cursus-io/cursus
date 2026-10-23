@@ -62,3 +62,9 @@ retention contract, activation/clock/visibility gates and recovery tests.
 Existing cleanup and metadata-compaction work owns its algorithms. Preserve
 the main branch's generation primitives and invalidate derived summaries at
 those existing boundaries; do not depend on unrelated issue branches.
+
+The later open PR check found consumer replay indexes in PR 297 and cleanup
+record reservation in PR 296. The former shares only `config/properties.go`
+(different configuration sections); the latter has no common implementation
+file. Neither replaces the generation primitives used here. No dependency or
+duplicate metadata/cleanup algorithm is added.

@@ -199,6 +199,9 @@ func NewCommandHandler(
 		tm.SetDeleteHook(ch.ESHandler.DeleteTopic)
 		if cfg != nil && cfg.EnabledDistribution {
 			tm.SetDistributedCompactionGate(ch.distributedCompactionAllowed)
+			tm.SetRetentionTimeGate(func() bool {
+				return cc != nil && cc.RaftManager != nil && cc.RaftManager.GetFSM() != nil && cc.RaftManager.GetFSM().RetentionTimeEnabled()
+			})
 		}
 	}
 	if cd != nil {

@@ -24,15 +24,22 @@ import (
 const MaxMessageSize = util.MaxMessageSize
 
 type DiskHandler struct {
-	BaseName       string
-	SegmentSize    uint64
-	IndexSize      uint64
-	CurrentOffset  uint64
-	AbsoluteOffset uint64
-	CurrentSegment uint64
-	segments       []uint64
-	topicName      string
-	partitionID    int
+	retentionClockAnchor time.Time
+	retentionTimeEnabled bool
+	retentionTimes       map[string]segmentTimeSummary // mu; derived, never authoritative
+	retentionTimeWork    RetentionTimeWork             // mu
+	retentionClock       func() time.Time              // immutable after construction
+	retentionGuardMu     sync.RWMutex
+	retentionGuard       func() (uint64, func(), error)
+	BaseName             string
+	SegmentSize          uint64
+	IndexSize            uint64
+	CurrentOffset        uint64
+	AbsoluteOffset       uint64
+	CurrentSegment       uint64
+	segments             []uint64
+	topicName            string
+	partitionID          int
 	// Protected by mu. Unlike allocated AbsoluteOffset or regressing
 	// FlushedOffset, writtenTail remembers every successfully written offset.
 	writtenTail     uint64
@@ -356,18 +363,20 @@ func newDiskHandler(cfg *config.Config, topicName string, partitionID int, clean
 	}
 
 	dh := &DiskHandler{
-		storageLock:    storageLock,
-		BaseName:       base,
-		SegmentSize:    uint64(cfg.SegmentSize),
-		IndexSize:      indexCapacity,
-		CurrentSegment: currentSegmentBase,
-		segments:       make([]uint64, 0),
-		CurrentOffset:  recovery.validBytes,
-		AbsoluteOffset: recovery.nextOffset,
-		FlushedOffset:  recovery.nextOffset,
-		writtenTail:    recovery.nextOffset,
-		topicName:      topicName,
-		partitionID:    partitionID,
+		retentionClockAnchor: time.Now(),
+		retentionTimeEnabled: cfg.RetentionTimeEnabled,
+		storageLock:          storageLock,
+		BaseName:             base,
+		SegmentSize:          uint64(cfg.SegmentSize),
+		IndexSize:            indexCapacity,
+		CurrentSegment:       currentSegmentBase,
+		segments:             make([]uint64, 0),
+		CurrentOffset:        recovery.validBytes,
+		AbsoluteOffset:       recovery.nextOffset,
+		FlushedOffset:        recovery.nextOffset,
+		writtenTail:          recovery.nextOffset,
+		topicName:            topicName,
+		partitionID:          partitionID,
 
 		indexInterval: safeIntToUint64(cfg.IndexIntervalBytes),
 

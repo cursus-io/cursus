@@ -59,6 +59,12 @@ type transactionCoordinatorEpochResolver interface {
 
 // Partition handles messages for one shard of a topic.
 type Partition struct {
+	appendTimeSeeded           bool
+	retentionTimeEnabled       bool
+	retentionTimeGate          func() bool // set before serving requests, protected by mu
+	retentionClock             func() time.Time
+	retentionClockAnchor       time.Time
+	lastAppendTimeMS           int64
 	bootstrapPrepared          bool               // recoveryMu
 	checkpointDirectorySync    func(string) error // configured before starting a bootstrap session
 	id                         int
@@ -193,22 +199,32 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	initialOffset := dh.GetLatestOffset()
 
 	p := &Partition{
-		id:                 id,
-		topic:              topic,
-		dh:                 dh,
-		streamManager:      sm,
-		messageNotifyCh:    make(chan struct{}),
-		closeCh:            make(chan struct{}),
-		txnMarkers:         make(map[transactionMarkerKey]transactionMarkerInfo),
-		txnOpenOffsets:     make(map[transactionMarkerKey]uint64),
-		producerStateIndex: make(map[string]producerStateCheckpointEntry),
-		producerStateTTL:   producerStateTTLFromConfig(cfg),
-		hwmAuthoritative:   cfg == nil || !cfg.EnabledDistribution,
-		distributed:        cfg != nil && cfg.EnabledDistribution,
+		retentionTimeEnabled: cfg != nil && cfg.RetentionTimeEnabled,
+		retentionClockAnchor: time.Now(),
+		id:                   id,
+		topic:                topic,
+		dh:                   dh,
+		streamManager:        sm,
+		messageNotifyCh:      make(chan struct{}),
+		closeCh:              make(chan struct{}),
+		txnMarkers:           make(map[transactionMarkerKey]transactionMarkerInfo),
+		txnOpenOffsets:       make(map[transactionMarkerKey]uint64),
+		producerStateIndex:   make(map[string]producerStateCheckpointEntry),
+		producerStateTTL:     producerStateTTLFromConfig(cfg),
+		hwmAuthoritative:     cfg == nil || !cfg.EnabledDistribution,
+		distributed:          cfg != nil && cfg.EnabledDistribution,
 	}
 
 	p.LEO.Store(initialOffset)
 	p.HWM = initialOffset
+	if setter, ok := dh.(interface {
+		SetRetentionGuard(func() (uint64, func(), error))
+	}); ok {
+		// Construction restores HWM and transaction state without p.mu. Publish
+		// the deletion guard only after that state is complete.
+		setter.SetRetentionGuard(func() (uint64, func(), error) { return 0, nil, fmt.Errorf("partition recovery initializing") })
+		defer setter.SetRetentionGuard(p.lockRetentionBoundary)
+	}
 
 	if handler, ok := dh.(durablePartitionStorage); ok {
 		p.hwmCheckpointPath = hwmCheckpointPath(handler, id)
@@ -467,6 +483,9 @@ func (p *Partition) Enqueue(msg types.Message) error {
 		return nil
 	}
 
+	if err := p.stampAppendTimeLocked(&msg); err != nil {
+		return err
+	}
 	offset, err := p.dh.AppendMessage(p.topic, p.id, &msg)
 	if err != nil {
 		util.Error("❌ Failed to enqueue message to disk [partition-%d]: %v", p.id, err)
@@ -513,6 +532,9 @@ func (p *Partition) enqueueSync(msg types.Message, forceIdempotent bool) error {
 		return nil
 	}
 
+	if err := p.stampAppendTimeLocked(&msg); err != nil {
+		return err
+	}
 	offset, err := p.dh.AppendMessageSync(p.topic, p.id, &msg)
 	if err != nil {
 		return fmt.Errorf("disk write failed: %w", err)
@@ -572,6 +594,9 @@ func (p *Partition) EnqueueBatchSyncWithMode(msgs []types.Message, forceIdempote
 			if duplicate {
 				continue
 			}
+			if err := p.stampAppendTimeLocked(&msgs[i]); err != nil {
+				return err
+			}
 			offset, err := p.dh.AppendMessageSync(p.topic, p.id, &msgs[i])
 			if err != nil {
 				p.NotifyNewMessage()
@@ -603,6 +628,9 @@ func (p *Partition) EnqueueBatchSyncWithMode(msgs []types.Message, forceIdempote
 		}
 		if effectiveIdempotent && msgs[i].ProducerID != "" && msgs[i].SeqNum > 0 {
 			staged[msgs[i].ProducerID] = stagedProducerEntry{lastEpoch: msgs[i].Epoch, lastSeq: msgs[i].SeqNum}
+		}
+		if err := p.stampAppendTimeLocked(&msgs[i]); err != nil {
+			return err
 		}
 		stagedMessage := msgs[i]
 		stagedMessage.Offset = nextOffset
@@ -660,6 +688,9 @@ func (p *Partition) EnqueueBatch(msgs []types.Message) error {
 			continue
 		}
 
+		if err := p.stampAppendTimeLocked(&msgs[i]); err != nil {
+			return err
+		}
 		offset, err := p.dh.AppendMessage(p.topic, p.id, &msgs[i])
 		if err != nil {
 			p.NotifyNewMessage()
@@ -727,6 +758,9 @@ func (p *Partition) EnqueueBatchLeaderWithMode(msgs []types.Message, forceIdempo
 			}
 		}
 
+		if err := p.stampAppendTimeLocked(&msgs[i]); err != nil {
+			return err
+		}
 		offset := nextOffset
 		nextOffset++
 		msgs[i].Offset = offset
@@ -807,6 +841,7 @@ func (p *Partition) ReplicaAppend(msgs []types.Message) error {
 func (p *Partition) ReplicaAppendWithMode(msgs []types.Message, forceIdempotent bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.appendTimeSeeded = false
 	if err := p.rollbackError(); err != nil {
 		return err
 	}
@@ -873,6 +908,7 @@ func (p *Partition) ReplicaAppendWithMode(msgs []types.Message, forceIdempotent 
 func (p *Partition) ReplicaAppendCompactedRange(msgs []types.Message, endOffset uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.appendTimeSeeded = false
 	if err := p.rollbackError(); err != nil {
 		return err
 	}
@@ -2102,6 +2138,7 @@ func (p *Partition) UpdateLEO(leo uint64) {
 		return
 	}
 	p.LEO.Store(leo)
+	p.appendTimeSeeded = false
 }
 
 // Close shuts down the partition.

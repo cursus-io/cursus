@@ -291,6 +291,8 @@ func (s *BootstrapSession) completePrepared() error {
 	p := s.p
 	p.mu.Lock()
 	p.LEO.Store(m.EndOffset)
+	p.appendTimeSeeded = false
+	p.lastAppendTimeMS = 0
 	p.HWM = m.EndOffset
 	p.hwmAuthoritative = true
 	p.snapshotRecovery = false

@@ -12,6 +12,7 @@ import (
 )
 
 const raftFormatMarkerName = ".cursus-raft-format"
+const raftFormatVersionCurrent = 12
 
 var syncRaftDirectoryFn = syncRaftDirectory
 
@@ -41,7 +42,7 @@ func ensureRaftRecoveryFormat(dataDir string) error {
 	if len(entries) != 0 {
 		return fmt.Errorf(
 			"%w: Raft directory %q has data but no version %d marker; remove all Cursus persistent state and clean bootstrap",
-			fsm.ErrUnsupportedRecoveryProtocol, dataDir, fsm.SnapshotVersionCurrent,
+			fsm.ErrUnsupportedRecoveryProtocol, dataDir, raftFormatVersionCurrent,
 		)
 	}
 
@@ -54,7 +55,7 @@ func ensureRaftRecoveryFormat(dataDir string) error {
 		return fmt.Errorf("create Raft format marker: %w", err)
 	}
 	writeErr := error(nil)
-	if _, err := marker.WriteString(strconv.Itoa(fsm.SnapshotVersionCurrent) + "\n"); err != nil {
+	if _, err := marker.WriteString(strconv.Itoa(raftFormatVersionCurrent) + "\n"); err != nil {
 		writeErr = fmt.Errorf("write Raft format marker: %w", err)
 	} else if err := marker.Sync(); err != nil {
 		writeErr = fmt.Errorf("sync Raft format marker: %w", err)
@@ -90,10 +91,10 @@ func readRaftFormatMarker(dataDir string) (int, error) {
 		return 0, fmt.Errorf("read Raft format marker: %w", err)
 	}
 	version, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || (version != fsm.SnapshotVersionCurrent && version != fsm.SnapshotVersionProducerEpoch && version != fsm.SnapshotVersionLegacyEpoch) {
+	if err != nil || (version != raftFormatVersionCurrent && version != fsm.SnapshotVersionCurrent && version != fsm.SnapshotVersionProducerEpoch && version != fsm.SnapshotVersionLegacyEpoch) {
 		return 0, fmt.Errorf(
 			"%w: Raft format marker %q is not supported by version %d; clean bootstrap required",
-			fsm.ErrUnsupportedRecoveryProtocol, strings.TrimSpace(string(data)), fsm.SnapshotVersionCurrent,
+			fsm.ErrUnsupportedRecoveryProtocol, strings.TrimSpace(string(data)), raftFormatVersionCurrent,
 		)
 	}
 	return version, nil
@@ -108,7 +109,7 @@ func upgradeRaftRecoveryFormat(dataDir string) (err error) {
 	if err != nil {
 		return err
 	}
-	if version == fsm.SnapshotVersionCurrent {
+	if version == raftFormatVersionCurrent {
 		return nil
 	}
 
@@ -126,7 +127,7 @@ func upgradeRaftRecoveryFormat(dataDir string) (err error) {
 			err = errors.Join(err, fmt.Errorf("remove upgraded Raft format marker temp file: %w", removeErr))
 		}
 	}()
-	if _, err := temp.WriteString(strconv.Itoa(fsm.SnapshotVersionCurrent) + "\n"); err != nil {
+	if _, err := temp.WriteString(strconv.Itoa(raftFormatVersionCurrent) + "\n"); err != nil {
 		return fmt.Errorf("write upgraded Raft format marker: %w", err)
 	}
 	if err := temp.Sync(); err != nil {

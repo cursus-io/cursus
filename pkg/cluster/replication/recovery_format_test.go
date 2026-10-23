@@ -17,7 +17,7 @@ func TestEnsureRaftRecoveryFormatCreatesAndValidatesCurrentMarker(t *testing.T) 
 	// #nosec G304 -- the marker path is fixed beneath t.TempDir.
 	data, err := os.ReadFile(filepath.Join(directory, raftFormatMarkerName))
 	require.NoError(t, err)
-	require.Equal(t, strconv.Itoa(fsm.SnapshotVersionCurrent)+"\n", string(data))
+	require.Equal(t, strconv.Itoa(raftFormatVersionCurrent)+"\n", string(data))
 	require.NoError(t, ensureRaftRecoveryFormat(directory))
 }
 
@@ -40,7 +40,7 @@ func TestUpgradeRaftRecoveryFormatAtomicallyMigratesLegacyMarker(t *testing.T) {
 	require.NoError(t, upgradeRaftRecoveryFormat(directory))
 	data, err := os.ReadFile(markerPath)
 	require.NoError(t, err)
-	require.Equal(t, strconv.Itoa(fsm.SnapshotVersionCurrent)+"\n", string(data))
+	require.Equal(t, strconv.Itoa(raftFormatVersionCurrent)+"\n", string(data))
 	require.NoError(t, upgradeRaftRecoveryFormat(directory))
 }
 

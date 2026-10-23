@@ -46,14 +46,14 @@
 {{- if ne (.Values.compatibility.wireProtocol | toString) "2" }}
 {{- fail "compatibility.wireProtocol must remain 2 for this chart" }}
 {{- end }}
-{{- if ne (.Values.compatibility.brokerProtocol | toString) "8" }}
-{{- fail "compatibility.brokerProtocol must remain 8 for this chart" }}
+{{- if ne (.Values.compatibility.brokerProtocol | toString) "9" }}
+{{- fail "compatibility.brokerProtocol must remain 9 for this chart" }}
 {{- end }}
 {{- if ne (.Values.compatibility.snapshotFormat | toString) "11" }}
 {{- fail "compatibility.snapshotFormat must remain 11 for this chart" }}
 {{- end }}
-{{- if ne (.Values.compatibility.recordFormat | toString) "CDM5" }}
-{{- fail "compatibility.recordFormat must remain CDM5 for this chart" }}
+{{- if ne (.Values.compatibility.recordFormat | toString) "CDM6" }}
+{{- fail "compatibility.recordFormat must remain CDM6 for this chart" }}
 {{- end }}
 {{- $statefulSetName := include "cursus-cluster.fullname" . }}
 {{- with (lookup "apps/v1" "StatefulSet" .Release.Namespace $statefulSetName) }}

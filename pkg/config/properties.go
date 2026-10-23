@@ -35,12 +35,13 @@ type ConsumerGroupConfig struct {
 }
 
 type Config struct {
-	BrokerBindAddress string        `yaml:"broker_bind_address" json:"broker.bind.address"`
-	BrokerPort        int           `yaml:"broker_port" json:"broker.port"`
-	HealthCheckPort   int           `yaml:"health_check_port" json:"health.check.port"`
-	EnableExporter    bool          `yaml:"enable_exporter" json:"enable.exporter"`
-	ExporterPort      int           `yaml:"exporter_port" json:"exporter.port"`
-	LogLevel          util.LogLevel `yaml:"log_level" json:"log_level"`
+	RetentionTimeEnabled bool          `yaml:"log_retention_time_enabled" json:"log.retention.time.enabled"`
+	BrokerBindAddress    string        `yaml:"broker_bind_address" json:"broker.bind.address"`
+	BrokerPort           int           `yaml:"broker_port" json:"broker.port"`
+	HealthCheckPort      int           `yaml:"health_check_port" json:"health.check.port"`
+	EnableExporter       bool          `yaml:"enable_exporter" json:"enable.exporter"`
+	ExporterPort         int           `yaml:"exporter_port" json:"exporter.port"`
+	LogLevel             util.LogLevel `yaml:"log_level" json:"log_level"`
 
 	// disk storage
 	BootstrapMaxTransferBytes int64   `yaml:"bootstrap_max_transfer_bytes" json:"bootstrap.max.transfer.bytes"`
@@ -305,6 +306,7 @@ func LoadConfig() (*Config, error) {
 	flag.Int64Var(&indexSizeInt64, "index-size", indexSizeInt64, "Max index file size")
 	flag.IntVar(&cfg.IndexIntervalBytes, "index-interval-bytes", cfg.IndexIntervalBytes, "Index interval bytes")
 	flag.StringVar(&cfg.CleanupPolicy, "cleanup-policy", cfg.CleanupPolicy, "Cleanup policy (delete, compact, or delete,compact)")
+	flag.BoolVar(&cfg.RetentionTimeEnabled, "retention-time-enabled", cfg.RetentionTimeEnabled, "Enable durable broker-time retention after capability activation")
 	flag.IntVar(&cfg.RetentionHours, "retention-hours", cfg.RetentionHours, "Retention hours")
 	flag.Int64Var(&cfg.RetentionBytes, "retention-bytes", cfg.RetentionBytes, "Retention bytes")
 	flag.IntVar(&cfg.RetentionCheckIntervalMS, "retention-check-interval", cfg.RetentionCheckIntervalMS, "Retention check interval")
@@ -484,6 +486,7 @@ func LoadConfig() (*Config, error) {
 	overrideEnvUint64(&cfg.IndexSize, "LOG_INDEX_SIZE_BYTES")
 	overrideEnvInt(&cfg.IndexIntervalBytes, "LOG_INDEX_INTERVAL_BYTES")
 	overrideEnvString(&cfg.CleanupPolicy, "LOG_CLEANUP_POLICY")
+	overrideEnvBool(&cfg.RetentionTimeEnabled, "LOG_RETENTION_TIME_ENABLED")
 	overrideEnvInt(&cfg.RetentionHours, "LOG_RETENTION_HOURS")
 	overrideEnvInt64(&cfg.RetentionBytes, "LOG_RETENTION_BYTES")
 	overrideEnvInt(&cfg.RetentionCheckIntervalMS, "LOG_RETENTION_CHECK_INTERVAL_MS")

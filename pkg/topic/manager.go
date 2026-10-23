@@ -35,6 +35,7 @@ type StreamManager interface {
 }
 
 type TopicManager struct {
+	retentionTimeGate  func() bool
 	topics             map[string]*Topic
 	deleting           map[string]bool
 	pendingTruncations map[string]Definition
@@ -243,6 +244,7 @@ func (tm *TopicManager) CreateTopicWithPatch(defaults Definition, patch Definiti
 	}
 	created.SetTransactionDecisionResolver(tm.txnResolver)
 	created.SetDistributedCompactionGate(tm.compactionGate)
+	created.setRetentionTimeGate(tm.retentionTimeGate)
 	if err := tm.persistDefinitionLocked(target); err != nil {
 		closePartiallyInitializedTopic(target.Name, tm.hp, created.Partitions)
 		return Definition{}, err
@@ -304,6 +306,7 @@ func (tm *TopicManager) ApplyDefinition(raw Definition) error {
 	}
 	created.SetTransactionDecisionResolver(tm.txnResolver)
 	created.SetDistributedCompactionGate(tm.compactionGate)
+	created.setRetentionTimeGate(tm.retentionTimeGate)
 	if err := tm.persistDefinitionLocked(definition); err != nil {
 		closePartiallyInitializedTopic(definition.Name, tm.hp, created.Partitions)
 		return err
