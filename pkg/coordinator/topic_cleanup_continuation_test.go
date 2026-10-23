@@ -121,7 +121,7 @@ func (v *byteBoundaryView) Read(_ int, offset uint64, _ types.ReplayCursor, _, b
 	}
 	return ConsumerCleanupPage{Next: offset + 1, Records: 1, Bytes: size}, nil
 }
-func TestCleanupByteBoundaryYieldsButOversizedRecordFails(t *testing.T) {
+func TestCleanupByteBoundaryAndReservedOversizedProgress(t *testing.T) {
 	view := &byteBoundaryView{}
 	scan := &topicCleanupScan{}
 	require.ErrorIs(t, scan.read(view), errCleanupBudget)
@@ -129,11 +129,11 @@ func TestCleanupByteBoundaryYieldsButOversizedRecordFails(t *testing.T) {
 	require.NoError(t, scan.read(view))
 	view = &byteBoundaryView{oversized: true}
 	scan = &topicCleanupScan{}
-	err := scan.read(view)
-	var budget *types.ReplayByteBudget
-	require.ErrorAs(t, err, &budget)
-	require.False(t, errors.Is(err, errCleanupBudget))
-	require.Equal(t, 1, view.calls)
+	require.ErrorIs(t, scan.read(view), errCleanupBudget)
+	require.Equal(t, uint64(1), scan.next[0])
+	require.Equal(t, 2, view.calls, "one length probe and one reserved read")
+	require.NoError(t, scan.read(view))
+	require.Equal(t, uint64(2), scan.next[0])
 }
 
 func (l *durableCleanupTestLog) PrepareCleanupCheckpoint() error { return nil }

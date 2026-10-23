@@ -100,7 +100,9 @@ func (dh *DiskHandler) ReadReplayPageContext(ctx context.Context, offset, end ui
 		// #nosec G115 -- cursor position is checked against MaxInt64 above and
 		// advanced only within stat.Size().
 		position := int64(page.Cursor.Position)
-		if _, err := file.ReadAt(length[:], position); err != nil {
+		n, err := file.ReadAt(length[:], position)
+		page.ReadBytes += n
+		if err != nil {
 			return page, fmt.Errorf("read replay record length: %w", err)
 		}
 		size := binary.BigEndian.Uint32(length[:])
@@ -117,7 +119,9 @@ func (dh *DiskHandler) ReadReplayPageContext(ctx context.Context, offset, end ui
 			return page, nil
 		}
 		payload := make([]byte, int(size))
-		if _, err := file.ReadAt(payload, position+4); err != nil {
+		n, err = file.ReadAt(payload, position+4)
+		page.ReadBytes += n
+		if err != nil {
 			return page, fmt.Errorf("read replay record: %w", err)
 		}
 		page.Bytes += int(size)

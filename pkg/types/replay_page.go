@@ -20,6 +20,9 @@ type ReplayPage struct {
 	Cursor   ReplayCursor
 	Records  int
 	Bytes    int
+	// ReadBytes counts bytes returned by file reads, including length probes
+	// and partial reads. This is logical I/O, not physical device traffic.
+	ReadBytes int
 }
 
 // BoundedReplayReader reads at most one physical segment per call without an

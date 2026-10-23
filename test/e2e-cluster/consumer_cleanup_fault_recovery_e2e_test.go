@@ -48,6 +48,7 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 	}
 	requireClusterStatusMaterialized(t, addrs)
 	waitForStableFullISRAndZeroUnderReplicated(t, ctx, "initial truncate fixture")
+	seedLargeCleanupHistory(t, ctx)
 	proof := &cleanupRetainedProof{}
 	admin, err := sdk.NewAdminClient(&sdk.AdminConfig{BrokerAddrs: addrs, MaxRetries: 3, RequestTimeoutMS: 15000})
 	require.NoError(t, err)
@@ -348,12 +349,17 @@ func logCleanupRecoveryWork(t *testing.T, nodes []int, phase string) {
 		scanner := bufio.NewScanner(response.Body)
 		for scanner.Scan() {
 			line := scanner.Text()
-			if strings.HasPrefix(line, "consumer_cleanup_replay_") || strings.HasPrefix(line, "cursus_recovery_work_total{") {
+			if strings.HasPrefix(line, "consumer_cleanup_replay_") || strings.HasPrefix(line, "cursus_recovery_work_total{") || strings.HasPrefix(line, "go_memstats_heap_alloc_bytes ") || strings.HasPrefix(line, "process_cpu_seconds_total ") {
 				t.Logf("%s node=%d %s", phase, node, line)
 			}
 		}
 		err = scanner.Err()
 		_ = response.Body.Close()
 		require.NoError(t, err)
+		if os.Getenv("RUN_E2E_CLEANUP_LARGE") == "1" {
+			output, readErr := exec.Command("docker", "exec", cleanupContainerName(node), "cat", "/proc/1/io").CombinedOutput()
+			require.NoError(t, readErr, string(output))
+			t.Logf("%s node=%d cumulative_process_io=%s", phase, node, strings.ReplaceAll(string(output), "\n", ", "))
+		}
 	}
 }

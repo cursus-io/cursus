@@ -22,16 +22,23 @@ or retained start changes. Concurrent compaction must be excluded as well;
 distributed internal consumer metadata currently disables compaction. Cursors
 are derived memory state, never an authoritative checkpoint.
 
-Corrupt checksums, truncated records and oversized first records fail closed.
+Corrupt checksums, truncated records and records above the storage maximum fail closed.
 The reader never treats a partially written record as an empty compacted gap.
-An oversized record remains pending; it is not silently skipped.
+A first record above the requested page budget returns `ReplayByteBudget`
+without allocating its payload. Cleanup now reserves a process-wide
+read/validation slot and retries that record alone with its exact stored size;
+see [the progress and resource contract](cleanup-record-progress.md). The
+primitive's hard caller-supplied bound is unchanged. `ReadBytes` reports logical
+file-read bytes including headers and failed probes, while `Bytes` remains
+the sum of complete serialized payloads presented to the decoder. Neither
+counter claims physical device I/O.
 
 The design comparison uses Kafka 3.9.0's
 [GroupMetadataManager loading path](https://github.com/apache/kafka/blob/3.9.0/core/src/main/scala/kafka/coordinator/group/GroupMetadataManager.scala):
 adopt resumable replay and explicit loading work, but use Cursus's committed
 prefix and physical cursor. Kafka can grow its buffer for `minOneMessage`;
-this primitive instead keeps a hard byte limit, trading oversized-record
-availability for bounded allocation. Kafka's normal coordinator load and this
+this primitive keeps a hard byte limit, with explicit cleanup reservation
+providing first-record progress at its caller. Kafka's normal coordinator load and this
 narrow Cursus cleanup primitive have different responsibilities.
 
 Regression checks cover multiple small pages with a missing sparse index,
