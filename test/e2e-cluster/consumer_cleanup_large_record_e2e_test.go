@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +12,50 @@ import (
 	"github.com/cursus-io/cursus/test/e2e"
 	"github.com/stretchr/testify/require"
 )
+
+// Setup restarts followers and waits for ISR convergence, which can exceed a
+// session timeout on a busy host. Keep the real member alive without changing
+// broker timeouts or the unrelated session whose heartbeat replay is asserted.
+func keepCleanupSetupMemberAlive(t *testing.T, addrs []string, generation int, member string) func() {
+	t.Helper()
+	stop, done := make(chan struct{}), make(chan struct{})
+	failures := make(chan error, 1)
+	go func() {
+		defer close(done)
+		client := e2e.NewBrokerClient(addrs)
+		defer client.Close()
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				response, err := client.SendCommand("", fmt.Sprintf("HEARTBEAT topic=%s group=%s member=%s generation=%d", cleanupRecoveryTopic, cleanupRecoveryGroup, member, generation), 15*time.Second)
+				if err == nil && !strings.HasPrefix(response, "OK") {
+					err = fmt.Errorf("setup heartbeat: %.200s", response)
+				}
+				if err != nil {
+					select {
+					case failures <- err:
+					default:
+					}
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	stopHeartbeat := func() { once.Do(func() { close(stop); <-done }) }
+	t.Cleanup(stopHeartbeat)
+	return func() {
+		stopHeartbeat()
+		select {
+		case err := <-failures:
+			require.NoError(t, err, "setup heartbeat must keep the target member alive")
+		default:
+		}
+	}
+}
 
 // Opt in to a large historical record in the existing destructive fault
 // scenarios. No fixture endpoint or disk mutation creates this metadata: the

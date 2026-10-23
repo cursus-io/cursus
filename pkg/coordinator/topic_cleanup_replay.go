@@ -672,6 +672,9 @@ func (scan *topicCleanupScan) readContext(ctx context.Context, view ConsumerClea
 				return fmt.Errorf("invalid bounded metadata page")
 			}
 			for _, message := range page.Messages {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				if message.Offset < scan.next[partition] || message.Offset >= page.Next {
 					return fmt.Errorf("metadata record outside committed page")
 				}

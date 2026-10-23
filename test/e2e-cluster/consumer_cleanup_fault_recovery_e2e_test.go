@@ -60,6 +60,7 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 	proof.advance(t, addrs)
 	client, generation, member := joinRecoveryGroup(t, addrs, cleanupRecoveryTopic, cleanupRecoveryGroup)
 	defer client.Close()
+	stopSetupHeartbeat := keepCleanupSetupMemberAlive(t, addrs, generation, member)
 	commitGroupOffset(t, client, cleanupRecoveryTopic, cleanupRecoveryGroup, 9, generation, member)
 	oldID := findGroupCoordinator(t, 1, cleanupRecoveryGroup)
 	oldOwner := coordinatorNode(t, oldID)
@@ -69,6 +70,7 @@ func TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot(t *testing.T) {
 		require.NoError(t, actions.waitForNodeHealth(node, clusterHealthCheckAddrs(3)[node-1]))
 		waitForStableFullISRAndZeroUnderReplicated(t, ctx, "live cleanup group recovered on follower")
 	}
+	stopSetupHeartbeat()
 	leaveCleanupGroup(t, client, generation, member)
 	cleanupBrokerCommand(t, "stop", oldOwner)
 	available := availableBrokerAddrs(addrs, oldOwner)

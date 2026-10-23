@@ -68,7 +68,7 @@ func TestCleanupLargeInvalidRecordsFailClosed(t *testing.T) {
 				if fault == "over-maximum" {
 					binary.BigEndian.PutUint32(data[:], uint32(util.MaxMessageSize+1))
 				} else {
-					position = 4
+					position = int64(len(message.Payload) / 2) // Damage payload while preserving the storage magic.
 				}
 				_, err = file.WriteAt(data[:], position)
 				require.NoError(t, err)
@@ -79,7 +79,11 @@ func TestCleanupLargeInvalidRecordsFailClosed(t *testing.T) {
 			}
 			scan := &topicCleanupScan{targets: map[string]*cleanupTarget{"workers": {epoch: 1}}, status: TopicCleanupPending{Topic: "orders"}}
 			for range 2 {
-				require.Error(t, scan.read(view))
+				err := scan.read(view)
+				require.Error(t, err)
+				if fault == "checksum" {
+					require.ErrorContains(t, err, "checksum")
+				}
 				require.Zero(t, scan.next[0])
 				require.False(t, scan.cursors[0].Initialized)
 				require.Zero(t, scan.targets["workers"].evidence.epoch)
@@ -182,6 +186,10 @@ func TestCleanupLargeCommittedRecordProgress(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, c.CommitOffset("unrelated-live", "payments", 0, 29))
 			unrelated := c.GetGroup("unrelated-live")
+			unrelated.OffsetReservations = []TransactionOffsetReservation{{TransactionalID: "unrelated-tx", ProducerID: "producer", MemberID: "member", Generation: unrelated.Generation,
+				Offsets: []ReservedTransactionOffset{{Topic: "payments", Partition: 0, Offset: 29}}}}
+			unrelated.ReservationRevision = 2
+			unrelated.ReservationDecisions = map[string]OffsetReservationDecision{"completed-tx": {ProducerID: "producer", ProducerEpoch: 1, Committed: true}}
 			before := c.ExportState()["unrelated-live"]
 			heartbeat := unrelated.Members["member"].LastHeartbeat
 			c.standalone = false
@@ -226,15 +234,16 @@ func TestCleanupLargeRecordCancellationReleasesReservation(t *testing.T) {
 			view := newCleanupDiskView(t, cleanupMessage(t, largeCleanupRecord(32, 1024)))
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			var cancelledAt time.Time
 			view.afterRead = func() {
 				if view.calls == after {
+					cancelledAt = time.Now()
 					cancel()
 				}
 			}
 			scan := &topicCleanupScan{}
-			start := time.Now()
 			require.ErrorIs(t, scan.readContext(ctx, view, time.Now), context.Canceled)
-			t.Logf("cancel_after_read=%d response_time=%s decoded=%d", after, time.Since(start), view.decoded)
+			t.Logf("cancel_after_read=%d cancellation_response=%s decoded=%d", after, time.Since(cancelledAt), view.decoded)
 			require.Zero(t, scan.next[0])
 			require.Empty(t, cleanupReplaySlot)
 			view.afterRead = nil
@@ -256,4 +265,65 @@ func TestCleanupMixedSmallAndLargeTurns(t *testing.T) {
 	require.Equal(t, 2, view.decoded)
 	require.NoError(t, scan.read(view))
 	require.Equal(t, 3, view.decoded)
+}
+
+func TestCleanupDiskRecordFitsOnlyFreshTurn(t *testing.T) {
+	message := cleanupMessage(t, ConsumerMetadataRecord{Version: 1, Type: ConsumerMetadataRecordTombstone, Group: "other", Topic: "retired", Epoch: 2})
+	base := util.EstimateDiskMessageSize(types.DiskMessage{Topic: config.ConsumerOffsetsTopicName, Payload: message.Payload, Key: message.Key})
+	const size = 700000
+	message.Payload += strings.Repeat(" ", size-base)
+	view := newCleanupDiskView(t, message, message)
+	scan := &topicCleanupScan{}
+	require.ErrorIs(t, scan.read(view), errCleanupBudget)
+	require.EqualValues(t, 1, scan.next[0])
+	require.Equal(t, 1, view.decoded, "remaining budget must not admit a second payload")
+	require.NoError(t, scan.read(view))
+	require.EqualValues(t, 2, scan.next[0])
+	require.Equal(t, 2, view.decoded)
+	require.Equal(t, 2*size, view.bytes)
+}
+
+func TestCleanupTrackedLargeRecordRetainsLifecycleFence(t *testing.T) {
+	for _, newer := range []bool{false, true} {
+		t.Run(fmt.Sprint(newer), func(t *testing.T) {
+			record := largeCleanupRecord(32, 1024)
+			record.Group = "workers"
+			if newer {
+				record.Epoch = 3
+			}
+			view := newCleanupDiskView(t, cleanupMessage(t, record), cleanupMessage(t, cleanupDeletion()))
+			c, _ := newCleanupFollower(t)
+			c.cfg.LogDir = t.TempDir()
+			c.topicHandler = view
+			_, err := c.ReconcileTopicGroups("orders")
+			var pending *TopicCleanupPending
+			require.ErrorAs(t, err, &pending)
+			require.Equal(t, CleanupContinue, pending.State, "%v", err)
+			deleted, err := c.ReconcileTopicGroups("orders")
+			if newer {
+				require.Error(t, err)
+				require.Empty(t, deleted)
+				require.NotNil(t, c.GetGroup("workers"))
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, []string{"workers"}, deleted)
+			}
+		})
+	}
+}
+
+func TestCleanupLargeHistoryDoesNotBypassTransactionReservation(t *testing.T) {
+	view := newCleanupDiskView(t, cleanupMessage(t, largeCleanupRecord(32, 1024)), cleanupMessage(t, cleanupDeletion()))
+	c, _ := newCleanupFollower(t)
+	c.topicHandler = view
+	group := c.GetGroup("workers")
+	group.OffsetReservations = []TransactionOffsetReservation{{TransactionalID: "tx", ProducerID: "producer", MemberID: "member", Generation: group.Generation,
+		Offsets: []ReservedTransactionOffset{{Topic: "orders", Partition: 0, Offset: 7}}}}
+	group.ReservationRevision = 1
+	before := c.ExportState()["workers"]
+	deleted, err := c.ReconcileTopicGroups("orders")
+	require.Error(t, err)
+	require.Empty(t, deleted)
+	require.Zero(t, view.calls)
+	require.Equal(t, before, c.ExportState()["workers"])
 }

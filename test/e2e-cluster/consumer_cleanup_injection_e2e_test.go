@@ -45,6 +45,7 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 			proof.advance(t, addrs)
 			client, generation, member := joinRecoveryGroup(t, addrs, cleanupRecoveryTopic, cleanupRecoveryGroup)
 			defer client.Close()
+			stopSetupHeartbeat := keepCleanupSetupMemberAlive(t, addrs, generation, member)
 			owner := coordinatorNode(t, findGroupCoordinator(t, 1, cleanupRecoveryGroup))
 			for _, node := range survivorNodes(owner) {
 				heartbeatGroup(t, client, cleanupRecoveryTopic, cleanupRecoveryGroup, generation, member)
@@ -113,6 +114,7 @@ func TestCommittedConsumerCleanupLostAcknowledgementAndReadFailure(t *testing.T)
 				require.NoError(t, err)
 			}
 			verifyLive()
+			stopSetupHeartbeat()
 			leaveCleanupGroup(t, client, generation, member)
 			// Avoid the Raft leader: administrative admission on that broker
 			// refreshes its cache and need not retain the stale follower state.

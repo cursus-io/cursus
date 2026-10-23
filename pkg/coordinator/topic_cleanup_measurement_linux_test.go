@@ -100,3 +100,36 @@ func TestCleanupLargeRecordMeasuredWork(t *testing.T) {
 		})
 	}
 }
+
+func TestCleanupLargeRecordMeasuredCancellation(t *testing.T) {
+	if os.Getenv("RUN_CLEANUP_RECORD_MEASUREMENT") != "1" {
+		t.Skip("opt-in isolated process measurement")
+	}
+	view := newCleanupDiskView(t, cleanupMessage(t, largeCleanupRecord(128, 1024)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelled := make(chan time.Time, 1)
+	view.afterRead = func() {
+		if view.calls == 2 {
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				at := time.Now()
+				cancel()
+				cancelled <- at
+			}()
+		}
+	}
+	scan := &topicCleanupScan{}
+	err := scan.readContext(ctx, view, time.Now)
+	returned := time.Now()
+	at := <-cancelled
+	if returned.Before(at) {
+		require.NoError(t, err)
+		t.Log("scan completed before the delayed cancellation; no in-flight response sample")
+		return
+	}
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, scan.next[0])
+	require.Empty(t, cleanupReplaySlot)
+	t.Logf("cancel_scheduled_after_disk_read=10ms cancellation_response=%s serialized_bytes=%d logical_read_bytes=%d disk_decodes=%d", returned.Sub(at), scan.status.Bytes, scan.status.ReadBytes, view.decoded)
+}
