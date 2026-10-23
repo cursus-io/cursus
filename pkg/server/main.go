@@ -29,6 +29,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/observability"
 	"github.com/cursus-io/cursus/pkg/observationgrpc"
 	wireprotocol "github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/wire"
@@ -58,6 +59,18 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		return fmt.Errorf("server context must not be nil")
 	}
 	shutdownCtx := ctx
+	if err := cfg.ValidateRecovery(); err != nil {
+		return err
+	}
+	recoverySettings := cfg.RecoverySettings()
+	recoveryLimits, err := recoverySettings.Limits()
+	if err != nil {
+		return err
+	}
+	recoveryBudget, err := recovery.NewBudget(recoveryLimits, nil)
+	if err != nil {
+		return err
+	}
 	ctx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	drainCtx, cancelDrain := context.WithCancel(context.WithoutCancel(ctx))
@@ -150,6 +163,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		sd = clusterController.NewServiceDiscovery(rm, brokerID, localAddr, clientAddr)
 		discoveryAddr := fmt.Sprintf(":%d", cfg.DiscoveryPort)
 		cs = cluster.NewSecureClusterServerWithTokens(sd, cfg.InternalAuthToken, cfg.InternalAuthTokenNext, cfg.InternalServerTLSConfig())
+		cs.SetRecoveryBudget(recoveryBudget, recoverySettings.QuantumBytes)
 		_, err = cs.Start(discoveryAddr)
 		if err != nil {
 			return fmt.Errorf("start discovery server: %w", err)
@@ -285,6 +299,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		util.Info("🌐 Distributed clustering enabled (brokerID=%s, localAddr=%s)", brokerID, localAddr)
 	}
 	globalCH := controller.NewCommandHandler(tm, cfg, cd, sm, cc)
+	globalCH.SetRecoveryBudget(recoveryBudget)
 	requestBudget, internalRequestBudget := newBrokerRequestBudgets(
 		cfg.MaxInflightRequests,
 		cfg.MaxInflightRequestBytes,
@@ -333,6 +348,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 	}
 	if cc != nil {
 		cc.SetLocalProcessor(globalCH)
+		cc.SetRecoveryBudget(recoveryBudget)
 		cc.SetReplicaSnapshotCatchupStep(globalCH.CatchupReplicaSnapshotPage)
 		runtimeStops = append(runtimeStops, cc.StartTopologyReconciler(ctx))
 		cc.StartReplicaCatchupVerified(ctx, clusterClient, globalCH.ApplyReplicaCatchupVerified)
@@ -393,7 +409,6 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 
 	addr := net.JoinHostPort(cfg.BrokerBindAddress, strconv.Itoa(cfg.BrokerPort))
 	var ln net.Listener
-	var err error
 	if cfg.UseTLS {
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{cfg.TLSCert},
@@ -864,9 +879,14 @@ func handleConnWithBudgetAndDrain(ctx context.Context, conn net.Conn, cmdHandler
 			requestParent = ctx
 		}
 		requestCtx, cancelRequest := context.WithTimeout(requestParent, requestTimeout)
+		var completion *recovery.Completion
+		if request.frame.Command == wire.CommandListSnapshots || request.frame.Command == wire.CommandFetchSnapshot {
+			requestCtx, completion = recovery.WithCompletion(requestCtx)
+		}
 		responseConn.setRequest(request.frame, requestCtx)
 		cmdCtx.SetRequestContext(requestCtx)
 		shouldExit, err := processMessage(request.frame.Payload, cmdHandler, cmdCtx, responseConn)
+		completion.Finish()
 		cmdCtx.SetRequestContext(clientCtx)
 		cancelRequest()
 		if shouldExit || err != nil {

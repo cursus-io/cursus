@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	clusterClient "github.com/cursus-io/cursus/pkg/cluster/client"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/stretchr/testify/assert"
@@ -291,6 +293,26 @@ func TestClusterServer_FetchesAuthenticatedReplicaCatchupBatch(t *testing.T) {
 	require.NoError(t, json.Unmarshal(response.Payload, &decoded))
 	require.Equal(t, batch, decoded)
 	msd.AssertExpectations(t)
+}
+
+func TestClusterCatchupPreservesRetryableAdmissionError(t *testing.T) {
+	sd := new(MockServiceDiscovery)
+	server := NewClusterServer(sd)
+	listener, err := server.Start("127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+	request := fsm.ReplicaCatchupRequest{Topic: "orders", BrokerID: "replica", SourceBroker: "source"}
+	sd.On("FetchReplicaCatchup", request).Return(fsm.ReplicaCatchupBatch{}, fmt.Errorf("source quota: %w", recovery.ErrBusy)).Once()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = clusterClient.NewTCPClusterClient().FetchReplicaCatchup(ctx, "127.0.0.1", listener.Addr().(*net.TCPAddr).Port, request)
+	var remote *wire.BrokerError
+	require.ErrorAs(t, err, &remote)
+	require.Equal(t, "recovery_busy", remote.Code)
+	require.Equal(t, wire.ErrorClassAvailability, remote.Class)
+	require.True(t, remote.Retryable)
+	require.Equal(t, internalClusterError(recovery.ErrBusy), bootstrapTransferError(recovery.ErrBusy))
+	sd.AssertExpectations(t)
 }
 
 func TestClusterServer_List(t *testing.T) {

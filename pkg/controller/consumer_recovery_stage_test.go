@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
@@ -61,6 +63,11 @@ func (r *stagedConsumerTestReader) Sources() map[int]ConsumerMetadataRecoverySou
 
 func TestConsumerBootstrapStagesNonlocalOtherPartitionBeforeLease(t *testing.T) {
 	h, p, receiver, identity := consumerBootstrapFixture(t)
+	limits, err := config.DefaultRecoveryConfig().Limits()
+	require.NoError(t, err)
+	budget, err := recovery.NewBudget(limits, nil)
+	require.NoError(t, err)
+	h.SetRecoveryBudget(budget)
 	state := h.Cluster.RaftManager.GetFSM()
 	transferRegister(t, state, "remote", "remote-process", "active", 2)
 	transferRegister(t, state, h.Cluster.Router.BrokerID(), "local-process", "active", 2)
@@ -90,13 +97,21 @@ func TestConsumerBootstrapStagesNonlocalOtherPartitionBeforeLease(t *testing.T) 
 	staged.readHook = func() { assertConsumerReadUnderFSMFence(t, state) }
 	h.SetConsumerMetadataRecoveryProvider(func(ctx context.Context, request ConsumerMetadataRecoveryStageRequest) (StagedConsumerMetadataRecovery, error) {
 		require.Equal(t, []int{1}, request.Partitions)
+		require.Zero(t, budget.Usage().Active, "install cannot reserve the provider's only work slot")
+		releaseWork, err := budget.AcquireWork(ctx, "remote")
+		require.NoError(t, err)
+		releaseWork()
 		release, err := h.Coordinator.BeginConsumerMetadataRecovery(ctx)
 		require.NoError(t, err)
 		release()
 		transferRegister(t, state, "remote", "remote-process", "active", 2)
 		return staged, nil
 	})
-	require.NoError(t, h.RunConsumerMetadataBootstrap(context.Background(), identity, receiver, nil, nil))
+	require.NoError(t, h.RunConsumerMetadataBootstrap(context.Background(), identity, receiver, nil, nil, func(bool) error {
+		require.Equal(t, 1, budget.Usage().Active, "publication must own an installation slot")
+		return nil
+	}))
+	require.Zero(t, budget.Usage().Active)
 	require.True(t, staged.closed)
 	require.False(t, p.BootstrapPending())
 	require.NoError(t, h.Coordinator.RecoveryReadinessError())
@@ -104,6 +119,47 @@ func TestConsumerBootstrapStagesNonlocalOtherPartitionBeforeLease(t *testing.T) 
 	offset, found := h.Coordinator.GetOffset(group, "orders", 0)
 	require.True(t, found)
 	require.Equal(t, uint64(37), offset, "scoped replay must replace the Raft offset using the nonlocal partition")
+}
+
+func TestReplicaOffsetsInstallDoesNotHoldProviderWorkSlot(t *testing.T) {
+	h, p, receiver, _ := consumerBootstrapFixture(t)
+	limits, err := config.DefaultRecoveryConfig().Limits()
+	require.NoError(t, err)
+	budget, err := recovery.NewBudget(limits, nil)
+	require.NoError(t, err)
+	h.SetRecoveryBudget(budget)
+	state := h.Cluster.RaftManager.GetFSM()
+	transferRegister(t, state, "remote", "remote-process", "active", 2)
+	transferRegister(t, state, h.Cluster.Router.BrokerID(), "local-process", "active", 2)
+	m := state.GetPartitionMetadata(config.ConsumerOffsetsTopicName + "-1")
+	m.Replicas, m.ISR, m.Leader = []string{"remote"}, []string{"remote"}, "remote"
+	m.LeaderEpoch++
+	m.CommittedHWM = 1
+	data, err := json.Marshal(m)
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("PARTITION:"+config.ConsumerOffsetsTopicName+"-1:"), data...)}))
+	providerResult := errors.New("controlled provider exit")
+	called := false
+	h.SetConsumerMetadataRecoveryProvider(func(ctx context.Context, _ ConsumerMetadataRecoveryStageRequest) (StagedConsumerMetadataRecovery, error) {
+		called = true
+		// With one atomic slot, this acquisition used to depend on the outer
+		// install returning, while install was waiting for this provider.
+		require.Zero(t, budget.Usage().Active)
+		release, err := budget.AcquireWork(ctx, "remote")
+		if err != nil {
+			return nil, err
+		}
+		release()
+		return nil, providerResult
+	})
+	r := &replicaBootstrapRecovery{ch: h, state: state, brokerID: h.Cluster.Router.BrokerID()}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = r.install(ctx, p, receiver.Manifest(), receiver, nil, nil)
+	require.True(t, called)
+	require.ErrorIs(t, err, providerResult)
+	require.Zero(t, budget.Usage().Active)
+	require.Zero(t, budget.Usage().Waiters)
 }
 
 // These fixtures have no transactional records. Production staging must retain

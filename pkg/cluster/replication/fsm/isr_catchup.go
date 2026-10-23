@@ -39,6 +39,7 @@ type ReplicaCatchupRequest struct {
 	LeaderEpoch          int                          `json:"leader_epoch"`
 	LifecycleEpoch       uint64                       `json:"lifecycle_epoch"`
 	MaxRecords           int                          `json:"max_records"`
+	MaxBytes             int                          `json:"max_bytes,omitempty"`
 	PreviousLeaderEpoch  int64                        `json:"previous_leader_epoch,omitempty"`
 	PreviousRecordDigest string                       `json:"previous_record_digest,omitempty"`
 	SourceAddress        string                       `json:"-"`
@@ -265,13 +266,40 @@ func (f *BrokerFSM) BuildISRCatchupProofs(brokerID string) []ISRCatchupProof {
 	defer f.transitionMu.Unlock()
 	f.materializationMu.Lock()
 	defer f.materializationMu.Unlock()
+	return f.buildISRCatchupProofsPrelocked(brokerID, "")
+}
+
+// BuildISRCatchupProofContext examines only the scheduled partition, avoiding an
+// inventory-wide proof scan on each resumable turn. It shares all eligibility
+// checks with heartbeat proof construction.
+func (f *BrokerFSM) BuildISRCatchupProofContext(ctx context.Context, brokerID, name string, id int) (ISRCatchupProof, bool, error) {
+	unlock, err := lockSourceContext(ctx, &f.transitionMu, &f.materializationMu)
+	if err != nil {
+		return ISRCatchupProof{}, false, err
+	}
+	defer unlock()
+	proofs := f.buildISRCatchupProofsPrelocked(brokerID, name+"-"+strconv.Itoa(id))
+	if len(proofs) == 0 {
+		return ISRCatchupProof{}, false, nil
+	}
+	return proofs[0], true, nil
+}
+
+func (f *BrokerFSM) buildISRCatchupProofsPrelocked(brokerID, onlyKey string) []ISRCatchupProof {
 	if brokerID == "" {
 		return nil
 	}
 
 	f.mu.RLock()
-	metadata := make(map[string]PartitionMetadata, len(f.partitionMetadata))
-	for key, value := range f.partitionMetadata {
+	input := f.partitionMetadata
+	definitions := f.topicState
+	if onlyKey != "" {
+		input = map[string]*PartitionMetadata{onlyKey: input[onlyKey]}
+		name := onlyKey[:strings.LastIndex(onlyKey, "-")]
+		definitions = map[string]*topic.Definition{name: definitions[name]}
+	}
+	metadata := make(map[string]PartitionMetadata, len(input))
+	for key, value := range input {
 		if value != nil {
 			copy := *value
 			copy.Replicas = append([]string(nil), value.Replicas...)
@@ -280,7 +308,7 @@ func (f *BrokerFSM) BuildISRCatchupProofs(brokerID string) []ISRCatchupProof {
 			metadata[key] = copy
 		}
 	}
-	definitions := copyTopicState(f.topicState)
+	definitions = copyTopicState(definitions)
 	topicManager := f.tm
 	consumerCoordinator := f.cd
 	f.mu.RUnlock()
@@ -346,13 +374,18 @@ func (f *BrokerFSM) BuildISRCatchupProofs(brokerID string) []ISRCatchupProof {
 // MarkReplicaCatchupVerified records a completed, leader-fenced prefix check.
 // A later ISR proof must still match the current metadata tuple.
 func (f *BrokerFSM) MarkReplicaCatchupVerified(request ReplicaCatchupRequest, witnesses ...*topic.ReplicaCatchupWitness) error {
+	return f.MarkReplicaCatchupVerifiedContext(context.Background(), request, witnesses...)
+}
+
+func (f *BrokerFSM) MarkReplicaCatchupVerifiedContext(ctx context.Context, request ReplicaCatchupRequest, witnesses ...*topic.ReplicaCatchupWitness) error {
 	if len(witnesses) != 1 || witnesses[0] == nil {
 		return fmt.Errorf("actual receiver verification witness is required")
 	}
-	f.transitionMu.Lock()
-	defer f.transitionMu.Unlock()
-	f.materializationMu.Lock()
-	defer f.materializationMu.Unlock()
+	unlock, err := lockSourceContext(ctx, &f.transitionMu, &f.materializationMu)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := f.validateReplicaRequestAuthority(request); err != nil {
 		return err
 	}
@@ -476,6 +509,9 @@ func (f *BrokerFSM) FetchReplicaCatchup(request ReplicaCatchupRequest) (ReplicaC
 // capable retained sources. Older modes retain their original fence lifetime.
 // f.mu is always released before disk maintenance.
 func (f *BrokerFSM) FetchReplicaCatchupContext(ctx context.Context, request ReplicaCatchupRequest) (ReplicaCatchupBatch, error) {
+	if request.MaxBytes < 0 || request.MaxBytes > util.MaxMessageSize {
+		return ReplicaCatchupBatch{}, fmt.Errorf("invalid replica catch-up byte limit")
+	}
 	if ctx == nil {
 		return ReplicaCatchupBatch{}, fmt.Errorf("catch-up requires context")
 	}
@@ -584,7 +620,7 @@ func (f *BrokerFSM) fetchReplicaCatchup(ctx context.Context, request ReplicaCatc
 		return sealed, nil
 	}
 	readPage := func(start, end uint64, max int) (disk.RetainedPage, error) {
-		page, err := partition.ReadReplicaRetainedPage(ctx, start, end, max, util.MaxMessageSize)
+		page, err := readRecoveryPage(ctx, partition, start, end, max, request.MaxBytes)
 		if err != nil {
 			return disk.RetainedPage{}, err
 		}

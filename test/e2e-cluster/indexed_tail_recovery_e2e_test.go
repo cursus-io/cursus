@@ -3,6 +3,7 @@ package e2e_cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -66,11 +67,24 @@ func readRecoveryHistory(t *testing.T, history string, node, leader, epoch int, 
 		SourceBroker: fmt.Sprintf("broker-%d-9000", node), CommittedHWM: end, MaxRecords: fsm.MaxReplicaCatchupRecords,
 	}
 	transport := clusterClient.NewSecureTCPClusterClient("cursus-test-internal-token", nil)
+	readCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
+	defer stop()
 	var records []types.Message
 	for request.NextOffset < end {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(readCtx, 5*time.Second)
 		batch, err := transport.FetchReplicaCatchup(ctx, "localhost", 7999+node, request)
 		cancel()
+		var busy *wire.BrokerError
+		if errors.As(err, &busy) && busy.Code == "recovery_busy" && busy.Retryable {
+			// This inspection competes with production recovery on the same
+			// source budget. Only explicit quota contention is retryable here.
+			select {
+			case <-readCtx.Done():
+				require.NoError(t, readCtx.Err(), "source admission did not recover")
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
 		require.NoError(t, err)
 		require.NoError(t, fsm.ValidateReplicaCatchupBatchDigest(batch))
 		require.Nil(t, batch.TruncateTo)
@@ -157,6 +171,9 @@ func TestIndexedRecoveryBoundsLargeLegacyTailOnThreeNodes(t *testing.T) {
 	require.NoError(t, err)
 	heldLEO, heldHWM, err := parsePartitionOffsets(heldOffsets, 0)
 	require.NoError(t, err)
+	// A generation change now cancels the old owner promptly. Pause fresh
+	// applies before changing authority so they cannot race this inspection.
+	recoveryDocker(t, "exec", container, "touch", "/run/cursus-e2e-faults/replica-catchup-pause/indexed-tail-history")
 	newLeader := 6 - leader - offline // The other live member of this three-node cluster.
 	newLeaderID := fmt.Sprintf("broker-%d-9000", newLeader)
 	_, err = client.SendCommand("", fmt.Sprintf("ELECT_LEADER topic=%s partition=0 broker=%s", history, newLeaderID), 5*time.Second)
@@ -191,8 +208,9 @@ func TestIndexedRecoveryBoundsLargeLegacyTailOnThreeNodes(t *testing.T) {
 	require.NoError(t, eventually(t, "old leader response rejected", clusterReadyTimeout, func() (bool, string, error) {
 		logs := recoveryDocker(t, "logs", container)
 		for _, line := range strings.Split(logs, "\n") {
-			if strings.Contains(line, `protocol=1 topic="indexed-tail-history"`) && strings.Contains(line, fmt.Sprintf(`source="broker-%d-9000"`, leader)) && strings.Contains(line, `error="replica recovery fence changed"`) {
-				return true, "original response fenced", nil
+			rejected := strings.Contains(line, `error="replica recovery fence changed"`) || strings.Contains(line, `error="context canceled"`) || strings.Contains(line, `error="context deadline exceeded"`)
+			if strings.Contains(line, `protocol=1 topic="indexed-tail-history"`) && strings.Contains(line, fmt.Sprintf(`source="broker-%d-9000"`, leader)) && rejected {
+				return true, "original response fenced or canceled before mutation", nil
 			}
 		}
 		return false, "waiting for fenced response", nil

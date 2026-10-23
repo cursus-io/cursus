@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/eventsource"
 	"github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -230,7 +232,7 @@ func (ch *CommandHandler) handleFetchSnapshot(cmd string) string {
 	return fmt.Sprintf("OK snapshot=%s", string(payload))
 }
 
-func (ch *CommandHandler) handleCatchupSnapshots(cmd string) string {
+func (ch *CommandHandler) handleCatchupSnapshots(ctx context.Context, cmd string) string {
 	args := parseKeyValueArgs(strings.TrimPrefix(cmd, "CATCHUP_SNAPSHOTS "))
 	topicName := args["topic"]
 	if topicName == "" {
@@ -250,58 +252,92 @@ func (ch *CommandHandler) handleCatchupSnapshots(cmd string) string {
 	if ch.Cluster == nil {
 		return "ERROR: cluster_not_available"
 	}
+	source, requester := "legacy-snapshot-source", "legacy-snapshot"
+	if ch.Cluster.Router != nil {
+		requester = ch.Cluster.Router.BrokerID()
+	}
+	if ch.Cluster.RaftManager != nil && ch.Cluster.RaftManager.GetFSM() != nil {
+		for _, broker := range ch.Cluster.RaftManager.GetFSM().GetBrokers() {
+			if broker.Addr == leaderAddr {
+				source = broker.ID
+				break
+			}
+		}
+	}
 	applied := 0
 	cursor := ""
 	var revision uint64
 	for pageNumber := 0; pageNumber < 1_000_000; pageNumber++ {
-		request := fmt.Sprintf("LIST_SNAPSHOTS %stopic=%s partition=%d limit=256", ch.internalAuthPrefix(), topicName, partition)
-		if cursor != "" {
-			request += " after_key=" + cursor
-		}
-		if revision != 0 {
-			request += fmt.Sprintf(" revision=%d", revision)
-		}
-		resp, forwardErr := ch.Cluster.ForwardCommandToBroker(leaderAddr, request)
-		if forwardErr != nil {
-			return fmt.Sprintf("ERROR: snapshot_catchup_failed reason=%q", forwardErr.Error())
-		}
-		if protocol.IsErrorResponse(resp) {
-			return resp
-		}
-		payload := strings.TrimPrefix(resp, "OK snapshot_page=")
-		if payload == resp {
-			return fmt.Sprintf("ERROR: invalid_snapshot_catchup_response response=%q", resp)
-		}
-		var page eventsource.SnapshotPage
-		if err := json.Unmarshal([]byte(payload), &page); err != nil {
-			return fmt.Sprintf("ERROR: unmarshal_failed reason=%q", err.Error())
-		}
-		if page.Revision == 0 || (revision != 0 && page.Revision != revision) {
-			return "ERROR: snapshot_catalog_revision_changed"
-		}
-		revision = page.Revision
-		for _, snap := range page.Snapshots {
-			if snap.Topic == "" {
-				snap.Topic = topicName
+		result := func() string {
+			if err := ctx.Err(); err != nil {
+				return fmt.Sprintf("ERROR: snapshot_catchup_failed reason=%q", err.Error())
 			}
-			if snap.Partition == 0 {
-				snap.Partition = partition
+			var lease *recovery.Lease
+			if ch.recoveryBudget != nil {
+				var err error
+				lease, err = ch.recoveryBudget.AcquireEstimated(ctx, source, ch.Config.RecoverySettings().QuantumBytes)
+				if err != nil {
+					return fmt.Sprintf("ERROR: snapshot_catchup_failed reason=%q", err.Error())
+				}
 			}
-			if errResp := ch.validateEventSnapshotLifecycle(snap); errResp != "" {
-				return errResp
+			pageCtx, meter := recovery.Measure(ctx)
+			defer func() { _ = lease.Finish(meter.Bytes()) }()
+			request := fmt.Sprintf("LIST_SNAPSHOTS %stopic=%s partition=%d limit=1 recovery_requester=%s", ch.internalAuthPrefix(), topicName, partition, requester)
+			if cursor != "" {
+				request += " after_key=" + cursor
 			}
-			if errResp := ch.ESHandler.SaveSnapshotReplica(snap); errResp != "" {
-				return errResp
+			if revision != 0 {
+				request += fmt.Sprintf(" revision=%d", revision)
 			}
-			applied++
+			resp, forwardErr := ch.Cluster.ForwardCommandToBrokerContext(pageCtx, leaderAddr, request)
+			if forwardErr != nil {
+				return fmt.Sprintf("ERROR: snapshot_catchup_failed reason=%q", forwardErr.Error())
+			}
+			if protocol.IsErrorResponse(resp) {
+				return resp
+			}
+			payload := strings.TrimPrefix(resp, "OK snapshot_page=")
+			if payload == resp {
+				return fmt.Sprintf("ERROR: invalid_snapshot_catchup_response response=%q", resp)
+			}
+			var page eventsource.SnapshotPage
+			if err := json.Unmarshal([]byte(payload), &page); err != nil {
+				return fmt.Sprintf("ERROR: unmarshal_failed reason=%q", err.Error())
+			}
+			if page.Revision == 0 || (revision != 0 && page.Revision != revision) {
+				return "ERROR: snapshot_catalog_revision_changed"
+			}
+			revision = page.Revision
+			for _, snap := range page.Snapshots {
+				if err := ctx.Err(); err != nil {
+					return fmt.Sprintf("ERROR: snapshot_catchup_failed reason=%q", err.Error())
+				}
+				if snap.Topic == "" {
+					snap.Topic = topicName
+				}
+				if snap.Partition == 0 {
+					snap.Partition = partition
+				}
+				if errResp := ch.validateEventSnapshotLifecycle(snap); errResp != "" {
+					return errResp
+				}
+				if errResp := ch.ESHandler.SaveSnapshotReplica(snap); errResp != "" {
+					return errResp
+				}
+				applied++
+			}
+			if page.Done {
+				return fmt.Sprintf("OK snapshots=%d", applied)
+			}
+			if len(page.Snapshots) == 0 {
+				return "ERROR: snapshot_catchup_page_did_not_advance"
+			}
+			cursor = base64.RawURLEncoding.EncodeToString([]byte(page.Snapshots[len(page.Snapshots)-1].Key))
+			return ""
+		}()
+		if result != "" {
+			return result
 		}
-		if page.Done {
-			return fmt.Sprintf("OK snapshots=%d", applied)
-		}
-		if len(page.Snapshots) == 0 {
-			return "ERROR: snapshot_catchup_page_did_not_advance"
-		}
-		cursor = base64.RawURLEncoding.EncodeToString([]byte(page.Snapshots[len(page.Snapshots)-1].Key))
 	}
 	return "ERROR: snapshot_catchup_page_limit_exceeded"
 }

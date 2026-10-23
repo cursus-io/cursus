@@ -161,3 +161,20 @@ func TestFrameAdmissionPrecedesPayloadRead(t *testing.T) {
 	require.ErrorIs(t, err, rejected)
 	require.Equal(t, 4096, reader.Len())
 }
+
+func TestCommandAdmissionPrecedesRecoveryPayloadRead(t *testing.T) {
+	codec, err := wire.NewCodec(wire.CompressionNone)
+	require.NoError(t, err)
+	encoded, err := codec.Encode(wire.Frame{Kind: wire.KindRequest, Command: wire.CommandListSnapshots, RequestID: 1, Payload: make([]byte, 4096)})
+	require.NoError(t, err)
+	reader := bytes.NewReader(encoded)
+	rejected := errors.New("recovery subset exhausted")
+	_, _, err = codec.ReadFrameReservedCommand(reader, func(command wire.Command, bytes uint64) (func(), error) {
+		require.Equal(t, wire.CommandListSnapshots, command)
+		require.EqualValues(t, 4096, bytes)
+		require.Equal(t, 4096, reader.Len())
+		return nil, rejected
+	})
+	require.ErrorIs(t, err, rejected)
+	require.Equal(t, 4096, reader.Len())
+}

@@ -61,6 +61,7 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"NOT_COORDINATOR", "NOT_LEADER", "NOT_PARTITION_LEADER",
 	)
 	register(ErrorClassAvailability, true,
+		"recovery_busy",
 		"snapshot_generation_changed",
 		"consumer_metadata_recovering",
 		"replica_offset_conflict",

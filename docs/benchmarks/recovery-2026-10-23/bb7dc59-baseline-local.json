@@ -1,0 +1,28 @@
+{
+  "calls": {
+    "0": 2,
+    "1": 64,
+    "2": 64,
+    "3": 2
+  },
+  "consume_storage": {
+    "count": 3755,
+    "p95_us": 201,
+    "p99_us": 374
+  },
+  "metadata_storage": {
+    "count": 3755,
+    "p95_us": 7370,
+    "p99_us": 10339
+  },
+  "produce_storage": {
+    "count": 3755,
+    "p95_us": 7870,
+    "p99_us": 14302
+  },
+  "scope": "controlled transport, local durable storage and exact FSM ISR admission; not client RPC",
+  "small_complete_ms": 32829,
+  "small_first_ms": 32813,
+  "transfer_bytes": 1160324,
+  "window_seconds": 40
+}

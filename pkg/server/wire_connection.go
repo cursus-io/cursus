@@ -148,8 +148,12 @@ func negotiateServerConnection(conn net.Conn, writeTimeout time.Duration) (*wire
 	return connection, newServerWireConn(conn, connection, writeTimeout), nil
 }
 
-func readWireRequestReserved(connection *wire.Connection, reserve wire.FrameReservation) (wire.Frame, func(), error) {
-	frame, release, err := connection.ReadFrameReserved(reserve)
+func readWireRequestReservedCommand(connection *wire.Connection, reserve func(wire.Command, uint64) (func(), error)) (wire.Frame, func(), error) {
+	frame, release, err := connection.ReadFrameReservedCommand(reserve)
+	return renderWireRequest(frame, release, err)
+}
+
+func renderWireRequest(frame wire.Frame, release func(), err error) (wire.Frame, func(), error) {
 	if err != nil {
 		return wire.Frame{}, func() {}, err
 	}

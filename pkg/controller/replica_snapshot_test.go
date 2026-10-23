@@ -14,6 +14,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/eventsource"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/pkg/wire"
@@ -142,6 +143,11 @@ func TestSnapshotPageResumesOnlySuccessfullyPublishedKeys(t *testing.T) {
 
 func TestSnapshotCatalogNetworkWaitHoldsNoLocalGatesAndCancels(t *testing.T) {
 	receiver, state, p, _ := receiverWitnessFixture(t, 0, 0, 1, true)
+	limits, err := config.DefaultRecoveryConfig().Limits()
+	require.NoError(t, err)
+	budget, err := recovery.NewBudget(limits, nil)
+	require.NoError(t, err)
+	receiver.SetRecoveryBudget(budget)
 	_, source, _, _ := receiverWitnessFixture(t, 0, 0, 1, true)
 	request := localRecoveryRequest(t, state, "receiver", "orders", 0)
 	batch, err := source.FetchReplicaCatchup(request)
@@ -181,6 +187,7 @@ func TestSnapshotCatalogNetworkWaitHoldsNoLocalGatesAndCancels(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("catalog request not received")
 	}
+	require.Equal(t, 1, budget.Usage().Active)
 	gateCtx, stop := context.WithTimeout(context.Background(), time.Second)
 	defer stop()
 	release, err := receiver.topicLifecycleGates.acquire(gateCtx, "orders", true)
@@ -202,6 +209,8 @@ func TestSnapshotCatalogNetworkWaitHoldsNoLocalGatesAndCancels(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("catalog connection remained open")
 	}
+	require.Zero(t, budget.Usage().Active)
+	require.Zero(t, budget.Usage().Waiters)
 }
 
 func TestActualCatchupSnapshotPublishesAfterAdvancingRequest(t *testing.T) {

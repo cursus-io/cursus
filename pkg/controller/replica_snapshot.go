@@ -11,6 +11,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/eventsource"
 	"github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/topic"
 )
 
@@ -19,7 +20,21 @@ import (
 func (ch *CommandHandler) CatchupReplicaSnapshots(ctx context.Context, request fsm.ReplicaCatchupRequest, actual *topic.ReplicaCatchupWitness) error {
 	progress := &clusterController.ReplicaSnapshotProgress{}
 	for {
-		done, err := ch.CatchupReplicaSnapshotPage(ctx, request, actual, progress)
+		done, err := func() (bool, error) {
+			if ch == nil || ch.recoveryBudget == nil {
+				return ch.CatchupReplicaSnapshotPage(ctx, request, actual, progress)
+			}
+			if ctx == nil {
+				return false, fmt.Errorf("snapshot catch-up requires context")
+			}
+			lease, err := ch.recoveryBudget.AcquireEstimated(ctx, request.SourceBroker, ch.Config.RecoverySettings().QuantumBytes)
+			if err != nil {
+				return false, err
+			}
+			pageCtx, meter := recovery.Measure(ctx)
+			defer func() { _ = lease.Finish(meter.Bytes()) }()
+			return ch.CatchupReplicaSnapshotPage(pageCtx, request, actual, progress)
+		}()
 		if err != nil || done {
 			return err
 		}
@@ -51,7 +66,7 @@ func (ch *CommandHandler) CatchupReplicaSnapshotPage(ctx context.Context, reques
 		return false, err
 	}
 	cursor, revision := progress.AfterKey, progress.Revision
-	command := fmt.Sprintf("LIST_SNAPSHOTS %stopic=%s partition=%d limit=256", ch.internalAuthPrefix(), request.Topic, request.Partition)
+	command := fmt.Sprintf("LIST_SNAPSHOTS %stopic=%s partition=%d limit=1 recovery_requester=%s", ch.internalAuthPrefix(), request.Topic, request.Partition, request.BrokerID)
 	if cursor != "" {
 		command += " after_key=" + base64.RawURLEncoding.EncodeToString([]byte(cursor))
 	}

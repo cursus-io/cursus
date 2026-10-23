@@ -9,12 +9,13 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/wire"
 )
 
 const bootstrapBeginTimeout = 120 * time.Second
 
-func (h *ClusterServer) handleBootstrapTransfer(conn net.Conn, command wire.Command, payload wire.CommandPayload, deadline time.Time) (any, *wire.ErrorPayload) {
+func (h *ClusterServer) handleBootstrapTransferContext(parent context.Context, conn net.Conn, command wire.Command, payload wire.CommandPayload, deadline time.Time) (any, *wire.ErrorPayload) {
 	// Unlike legacy discovery commands, exports always require configured authentication.
 	if len(h.authTokens) == 0 {
 		return nil, &wire.ErrorPayload{Code: "cluster_unauthorized", Class: wire.ErrorClassAuthorization, Message: "bootstrap requires cluster authentication"}
@@ -48,7 +49,7 @@ func (h *ClusterServer) handleBootstrapTransfer(conn net.Conn, command wire.Comm
 			return nil, internalClusterError(err)
 		}
 	}
-	ctx, cancel := context.WithDeadline(h.ctx, deadline)
+	ctx, cancel := context.WithDeadline(parent, deadline)
 	defer cancel()
 	var response any
 	var err error
@@ -74,6 +75,9 @@ func bootstrapValidationError(err error) *wire.ErrorPayload {
 }
 
 func bootstrapTransferError(err error) *wire.ErrorPayload {
+	if errors.Is(err, recovery.ErrBusy) {
+		return internalClusterError(err)
+	}
 	code, class := "bootstrap_internal", wire.ErrorClassInternal
 	switch {
 	case errors.Is(err, context.Canceled):

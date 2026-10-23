@@ -35,13 +35,14 @@ type ConsumerGroupConfig struct {
 }
 
 type Config struct {
-	RetentionTimeEnabled bool          `yaml:"log_retention_time_enabled" json:"log.retention.time.enabled"`
-	BrokerBindAddress    string        `yaml:"broker_bind_address" json:"broker.bind.address"`
-	BrokerPort           int           `yaml:"broker_port" json:"broker.port"`
-	HealthCheckPort      int           `yaml:"health_check_port" json:"health.check.port"`
-	EnableExporter       bool          `yaml:"enable_exporter" json:"enable.exporter"`
-	ExporterPort         int           `yaml:"exporter_port" json:"exporter.port"`
-	LogLevel             util.LogLevel `yaml:"log_level" json:"log_level"`
+	Recovery             RecoveryConfig `yaml:"recovery" json:"recovery"`
+	RetentionTimeEnabled bool           `yaml:"log_retention_time_enabled" json:"log.retention.time.enabled"`
+	BrokerBindAddress    string         `yaml:"broker_bind_address" json:"broker.bind.address"`
+	BrokerPort           int            `yaml:"broker_port" json:"broker.port"`
+	HealthCheckPort      int            `yaml:"health_check_port" json:"health.check.port"`
+	EnableExporter       bool           `yaml:"enable_exporter" json:"enable.exporter"`
+	ExporterPort         int            `yaml:"exporter_port" json:"exporter.port"`
+	LogLevel             util.LogLevel  `yaml:"log_level" json:"log_level"`
 
 	// disk storage
 	BootstrapMaxTransferBytes int64   `yaml:"bootstrap_max_transfer_bytes" json:"bootstrap.max.transfer.bytes"`
@@ -154,6 +155,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	defaultOnce.Do(func() {
 		defaultConfig = &Config{
+			Recovery:                  DefaultRecoveryConfig(),
 			BootstrapMaxTransferBytes: DefaultBootstrapMaxTransferBytes,
 			BootstrapMaxTotalBytes:    DefaultBootstrapMaxTotalBytes,
 			BrokerBindAddress:         "127.0.0.1",
@@ -554,6 +556,9 @@ func LoadConfig() (*Config, error) {
 	}
 
 	if err := cfg.loadBootstrapAdmissionEnvironment(); err != nil {
+		return nil, err
+	}
+	if err := cfg.loadRecoveryEnvironment(); err != nil {
 		return nil, err
 	}
 	cfg.Normalize()

@@ -9,6 +9,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/recovery"
 )
 
 const bootstrapSourceLimit = 6
@@ -55,6 +56,8 @@ type bootstrapSourceAttempt struct {
 	response                  *fsm.BootstrapBeginResponse
 	export                    bootstrapSourceExport
 	expires                   time.Time
+	hardExpires               time.Time
+	activity                  chan struct{}
 	err                       error
 	prior                     *fsm.MetadataBootstrapContinuity
 }
@@ -64,6 +67,7 @@ type bootstrapSourceCertificate struct {
 	expires    time.Time
 }
 type bootstrapTransferSource struct {
+	budget          *recovery.Budget
 	incarnation     string
 	mu              sync.Mutex
 	state           *fsm.BrokerFSM
@@ -85,6 +89,7 @@ type bootstrapTransferSource struct {
 	replicaCapture func(context.Context, *fsm.ReplicaBootstrapSourceTicket) (*fsm.ReplicaBootstrapCapture, error)
 	replicaFence   func(context.Context, *fsm.ReplicaBootstrapCapture, func(*fsm.ReplicaBootstrapPublication) error) error
 	ttl            time.Duration
+	maxLifetime    time.Duration
 }
 
 func newBootstrapTransferSource(ctx context.Context, state *fsm.BrokerFSM, identity func() (fsm.BootstrapProcessIdentity, error)) *bootstrapTransferSource {
@@ -164,7 +169,7 @@ func (s *bootstrapTransferSource) begin(ctx context.Context, r fsm.BootstrapBegi
 	}
 	creating, cancel := context.WithTimeout(ctx, bootstrapSourceCreateTimeout)
 	stop := context.AfterFunc(s.ctx, cancel)
-	e := &bootstrapSourceAttempt{request: r, local: local, key: key, partition: partition, createCtx: creating, cancelCreate: func() { stop(); cancel() }, done: make(chan struct{}), retire: make(chan struct{}), pinsDrained: make(chan struct{})}
+	e := &bootstrapSourceAttempt{request: r, local: local, key: key, partition: partition, createCtx: creating, cancelCreate: func() { stop(); cancel() }, done: make(chan struct{}), retire: make(chan struct{}), pinsDrained: make(chan struct{}), activity: make(chan struct{}, 1)}
 	if r.PriorCertificateID != "" {
 		for _, c := range s.certificates {
 			if c != nil && c.id == r.PriorCertificateID && time.Now().Before(c.expires) {
@@ -270,6 +275,15 @@ func (s *bootstrapTransferSource) read(ctx context.Context, r fsm.BootstrapChunk
 	if err := s.requester(r.Requester); err != nil {
 		return fsm.BootstrapChunkResponse{}, err
 	}
+	var transferred int64
+	if s.budget != nil {
+		key := r.Requester.BrokerID
+		lease, err := s.budget.Acquire(ctx, key, int64(r.Size)*2+4096)
+		if err != nil {
+			return fsm.BootstrapChunkResponse{}, err
+		}
+		defer func() { recovery.SettleAfterResponse(ctx, func() { _ = lease.Finish(transferred) }) }()
+	}
 	s.mu.Lock()
 	e := s.attempts[bootstrapAttemptKey{r.Requester, r.AttemptID}]
 	if s.closed || e == nil || s.transfers[r.TransferID] != e || e.phase != bootstrapReady || !time.Now().Before(e.expires) {
@@ -302,6 +316,7 @@ func (s *bootstrapTransferSource) read(ctx context.Context, r fsm.BootstrapChunk
 		return fsm.BootstrapChunkResponse{}, err
 	}
 	data, err := export.ReadChunk(r.FileID, r.Offset, r.Size)
+	transferred = int64(len(data))*4/3 + 4096
 	if err != nil {
 		return fsm.BootstrapChunkResponse{}, err
 	}
@@ -312,5 +327,27 @@ func (s *bootstrapTransferSource) read(ctx context.Context, r fsm.BootstrapChunk
 	if err = response.ValidateFor(r, size); err != nil {
 		return fsm.BootstrapChunkResponse{}, err
 	}
+	s.mu.Lock()
+	s.touchReadyLocked(e, time.Now())
+	s.mu.Unlock()
 	return response, nil
+}
+
+// A progressing rate-limited transfer keeps its five-minute idle lease, but
+// cannot extend the finite overall lifetime. Failed reads never renew it.
+func (s *bootstrapTransferSource) touchReadyLocked(e *bootstrapSourceAttempt, now time.Time) {
+	if e.phase != bootstrapReady || e.hardExpires.IsZero() || !now.Before(e.expires) {
+		return
+	}
+	expires := now.Add(s.ttl)
+	if e.hardExpires.Before(expires) {
+		expires = e.hardExpires
+	}
+	if expires.After(e.expires) {
+		e.expires = expires
+		select {
+		case e.activity <- struct{}{}:
+		default:
+		}
+	}
 }

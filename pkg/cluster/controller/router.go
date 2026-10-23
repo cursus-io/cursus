@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
@@ -400,7 +401,7 @@ func (r *ClusterRouter) sendDataRequestContext(ctx context.Context, addr string,
 		return "", err
 	}
 
-	connection, err := wire.ClientHandshake(conn, []wire.Compression{wire.CompressionNone})
+	connection, err := wire.ClientHandshake(recovery.MeterConnection(ctx, conn), []wire.Compression{wire.CompressionNone})
 	if err != nil {
 		return "", fmt.Errorf("negotiate internal Wire v2 connection: %w", err)
 	}

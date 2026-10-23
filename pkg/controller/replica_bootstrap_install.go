@@ -113,7 +113,7 @@ func (r *replicaBootstrapRecovery) receive(ctx context.Context, a *replicaBootst
 					return err
 				}
 				var e error
-				data, e = r.client.ReadBootstrapTransferChunk(ctx, address, r.port, chunk, file.Size)
+				data, e = r.readBudgetedChunk(ctx, address, chunk, file.Size, a.request.Source)
 				metrics.RecordRecoveryBytes(metrics.RecoveryReplicaRPC, metrics.RecoveryTransferBytes, int64(len(data.Data)))
 				return e
 			})
@@ -126,13 +126,25 @@ func (r *replicaBootstrapRecovery) receive(ctx context.Context, a *replicaBootst
 			if err = ctx.Err(); err != nil {
 				return err
 			}
-			if err = stage.WriteChunk(file.ID, offset, data.Data); err != nil {
+			releaseWork, admissionErr := r.ch.recoveryBudget.AcquireWork(ctx, a.request.Source.BrokerID)
+			if admissionErr != nil {
+				return admissionErr
+			}
+			err = stage.WriteChunk(file.ID, offset, data.Data)
+			releaseWork()
+			if err != nil {
 				return err
 			}
 			offset += int64(len(data.Data))
 		}
 	}
-	if err = stage.PrepareContext(ctx); err != nil {
+	releaseWork, err := r.ch.recoveryBudget.AcquireWork(ctx, a.request.Source.BrokerID)
+	if err != nil {
+		return err
+	}
+	err = stage.PrepareContext(ctx)
+	releaseWork()
+	if err != nil {
 		return err
 	}
 	release()
@@ -207,6 +219,9 @@ func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partiti
 		return ch.ESHandler.RebuildBootstrapState(manifest.Fence.Topic, manifest.Fence.Partition, view, catalog, manifest.Fence.LifecycleEpoch)
 	}
 	if manifest.Fence.Topic == config.ConsumerOffsetsTopicName {
+		// The metadata provider may itself need the sole atomic-work slot.
+		// RunConsumerMetadataBootstrap acquires it after staging dependencies
+		// and releases it between pending retries, before this backoff wait.
 		identity := coordinator.ConsumerBootstrapIdentity{Partition: manifest.Fence.Partition, Lifecycle: manifest.Fence.LifecycleEpoch, Attempt: manifest.TransferID}
 		delay := 10 * time.Millisecond
 		for {
@@ -224,6 +239,11 @@ func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partiti
 			delay = min(delay*2, time.Second)
 		}
 	}
+	releaseWork, err := r.ch.recoveryBudget.AcquireWork(ctx, manifest.Fence.SourceID)
+	if err != nil {
+		return err
+	}
+	defer releaseWork()
 	releaseLifecycle, err := ch.topicLifecycleGates.acquire(ctx, manifest.Fence.Topic, false)
 	if err != nil {
 		return err

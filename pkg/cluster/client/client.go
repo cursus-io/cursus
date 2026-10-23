@@ -14,6 +14,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/metrics"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/wire"
 )
 
@@ -318,13 +319,15 @@ func (c *TCPClusterClient) sendRequest(
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
+	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancellation()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	} else {
 		_ = conn.SetDeadline(time.Now().Add(c.timeout))
 	}
 
-	connection, err := wire.ClientHandshake(conn, []wire.Compression{wire.CompressionNone})
+	connection, err := wire.ClientHandshake(recovery.MeterConnection(ctx, conn), []wire.Compression{wire.CompressionNone})
 	if err != nil {
 		return nil, err
 	}
@@ -360,7 +363,7 @@ func (c *TCPClusterClient) sendRequest(
 		if decodeErr != nil {
 			return nil, fmt.Errorf("decode cluster Wire v2 error: %w", decodeErr)
 		}
-		return nil, fmt.Errorf("%s: %s", brokerError.Code, brokerError.Message)
+		return nil, wire.NewBrokerError(brokerError)
 	}
 	if response.Status != wire.StatusOK {
 		return nil, fmt.Errorf("unexpected cluster Wire v2 status %d", response.Status)

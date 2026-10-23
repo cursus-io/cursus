@@ -142,6 +142,19 @@ func (c *Connection) ReadFrameReserved(reserve FrameReservation) (Frame, func(),
 	return c.codec.ReadFrameReserved(reader, reserve)
 }
 
+func (c *Connection) ReadFrameReservedCommand(reserve func(Command, uint64) (func(), error)) (Frame, func(), error) {
+	if c == nil || c.conn == nil || c.codec == nil {
+		return Frame{}, func() {}, fmt.Errorf("wire v2 connection is not initialized")
+	}
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	reader := c.reader
+	if reader == nil {
+		reader = c.conn
+	}
+	return c.codec.ReadFrameReservedCommand(reader, reserve)
+}
+
 func (c *Connection) WriteFrame(frame Frame) error {
 	if c == nil || c.conn == nil || c.codec == nil {
 		return fmt.Errorf("wire v2 connection is not initialized")
