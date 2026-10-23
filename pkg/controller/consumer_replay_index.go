@@ -3,18 +3,25 @@ package controller
 import (
 	"fmt"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
 func (r *consumerRecoveryReader) ConsumerMetadataIndexIdentity(p int) (string, error) {
-	if p < 0 || p >= len(r.views) || r.views[p] == nil || r.indexTopicInstance == "" {
+	if p < 0 || p >= len(r.views) || p >= len(r.metadata) || r.views[p] == nil {
 		return "", fmt.Errorf("local replay index identity unavailable")
 	}
 	token, err := r.views[p].ConsumerReplayIndexIdentity(r.ctx)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s:%d:%d:%s", r.indexTopicInstance, r.metadata[p].LifecycleEpoch, p, token), nil
+	if token == "" {
+		return "", fmt.Errorf("local replay index durable generation unavailable")
+	}
+	// Auto-created internal topics predate InstanceID. Their durable disk
+	// generation still identifies the physical incarnation and changes on
+	// destructive replacement; never substitute a name-only cache identity.
+	return fmt.Sprintf("%s:%s:%d:%d:%s", config.ConsumerOffsetsTopicName, r.indexTopicInstance, r.metadata[p].LifecycleEpoch, p, token), nil
 }
 
 func (r *consumerRecoveryReader) ReadRawConsumerMetadataIndex(p int, offset uint64, max int) ([]types.Message, error) {

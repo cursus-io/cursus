@@ -41,7 +41,8 @@ func TestConsumerReplayIndexRealDiskStartupAndSuffix(t *testing.T) {
 	definition.Partitions = 4
 	definition.ReplicationFactor = 1
 	definition.Policy = topic.ConsumerMetadataPolicy()
-	definition.InstanceID = "replay-index-fixture"
+	// Match BootstrapConsumerOffsetsTopic: internal topics have no InstanceID.
+	require.Empty(t, definition.InstanceID)
 	payload, err := json.Marshal(fsm.TopicCommand{Definition: &definition, LeaderID: "local"})
 	require.NoError(t, err)
 	require.Nil(t, state.Apply(&raft.Log{Index: 2, Data: append([]byte("TOPIC:"), payload...)}))

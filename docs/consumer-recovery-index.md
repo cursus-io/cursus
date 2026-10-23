@@ -55,6 +55,13 @@ the compatibility digest and disk identity; bootstrap and truncation cannot
 reuse another generation. Local projections are not replication authority and
 must not be copied independently onto a different log.
 
+Auto-created internal topics have an empty optional `InstanceID`. They remain
+eligible only with the durable disk generation: the identity includes the fixed
+internal topic name, optional instance, lifecycle and partition as well as that
+generation. An absent generation is a cache miss. No name-only fallback exists.
+The internal topic cannot be deleted or truncated through the public topic API;
+bootstrap/restore replacement still changes or validates its physical generation.
+
 Publication order: validate replay and reduced projection equivalence; sync
 the source log; validate identity again; write a checksummed bounded temporary
 file; sync and close it; atomically replace the published cache. A missing,
