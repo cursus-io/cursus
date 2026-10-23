@@ -158,7 +158,7 @@ func (c *consumerMetadataRecoveryCache) stagePartition(ctx context.Context, requ
 			var data fsm.BootstrapChunkResponse
 			err = retryConsumerMetadataRPC(ctx, func() error {
 				var e error
-				data, e = c.client.ReadBootstrapTransferChunk(ctx, b.Addr, c.port, chunk, file.Size)
+				data, e = c.ch.readBudgetedBootstrapChunk(ctx, c.client, b.Addr, c.port, chunk, file.Size, r.Source)
 				metrics.RecordRecoveryBytes(metrics.RecoveryMetadataRPC, metrics.RecoveryTransferBytes, int64(len(data.Data)))
 				return e
 			})
@@ -171,12 +171,23 @@ func (c *consumerMetadataRecoveryCache) stagePartition(ctx context.Context, requ
 			if err = ctx.Err(); err != nil {
 				return err
 			}
-			if err = stage.WriteChunk(file.ID, offset, data.Data); err != nil {
+			releaseWork, admissionErr := c.ch.recoveryBudget.AcquireWork(ctx, r.Source.BrokerID)
+			if admissionErr != nil {
+				return admissionErr
+			}
+			err = stage.WriteChunk(file.ID, offset, data.Data)
+			releaseWork()
+			if err != nil {
 				return err
 			}
 			offset += int64(len(data.Data))
 		}
 	}
+	releaseWork, err := c.ch.recoveryBudget.AcquireWork(ctx, r.Source.BrokerID)
+	if err != nil {
+		return err
+	}
+	defer releaseWork()
 	raw, err := stage.Prepare(ctx)
 	if err != nil {
 		return err

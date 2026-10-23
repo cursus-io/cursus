@@ -14,6 +14,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/metrics"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/wire"
 )
 
@@ -318,13 +319,15 @@ func (c *TCPClusterClient) sendRequest(
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
+	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancellation()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	} else {
 		_ = conn.SetDeadline(time.Now().Add(c.timeout))
 	}
 
-	connection, err := wire.ClientHandshake(conn, []wire.Compression{wire.CompressionNone})
+	connection, err := wire.ClientHandshake(recovery.MeterConnection(ctx, conn), []wire.Compression{wire.CompressionNone})
 	if err != nil {
 		return nil, err
 	}

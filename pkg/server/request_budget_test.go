@@ -3,9 +3,36 @@ package server
 import (
 	"context"
 	"errors"
+	"github.com/cursus-io/cursus/pkg/wire"
+	"strconv"
 	"testing"
 	"time"
 )
+
+func TestRecoverySubsetLeavesInternalControlCapacity(t *testing.T) {
+	for _, command := range []wire.Command{wire.CommandListSnapshots, wire.CommandFetchSnapshot, wire.CommandCatchupSnapshots} {
+		t.Run(strconv.Itoa(int(command)), func(t *testing.T) { testRecoverySubsetLeavesInternalControlCapacity(t, command) })
+	}
+}
+
+func testRecoverySubsetLeavesInternalControlCapacity(t *testing.T, command wire.Command) {
+	_, budget := newBrokerRequestBudgets(8, 1024, true)
+	release, err := budget.reserveCommand(context.Background(), command, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := budget.reserveCommand(ctx, command, 1); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	control, err := budget.reserveCommand(context.Background(), wire.CommandHeartbeatCluster, 384)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control()
+}
 
 func TestRequestMemoryBudgetBoundsCountAndBytes(t *testing.T) {
 	budget := newRequestMemoryBudget(1, 128)

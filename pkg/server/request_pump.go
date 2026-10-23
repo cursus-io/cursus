@@ -92,7 +92,7 @@ func pumpWireRequests(ctx context.Context, cancelConnection context.CancelFunc, 
 	close(previousDone)
 	for {
 		var release func()
-		request, release, err := readWireRequestReserved(connection, func(bytes uint64) (func(), error) {
+		request, release, err := readWireRequestReservedCommand(connection, func(command wire.Command, bytes uint64) (func(), error) {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -101,7 +101,7 @@ func pumpWireRequests(ctx context.Context, cancelConnection context.CancelFunc, 
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			return budget.reserve(ctx, bytes)
+			return budget.reserveCommand(ctx, command, bytes)
 		})
 		if err != nil {
 			if ctx.Err() == nil {

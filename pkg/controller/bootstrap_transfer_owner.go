@@ -19,13 +19,7 @@ func (s *bootstrapTransferSource) own(e *bootstrapSourceAttempt) {
 	if err == nil {
 		e.cancelCreate()
 		close(e.done)
-		timer := time.NewTimer(time.Until(e.expires))
-		select {
-		case <-timer.C:
-		case <-e.retire:
-		case <-s.ctx.Done():
-		}
-		timer.Stop()
+		s.waitReady(e)
 	}
 	s.mu.Lock()
 	s.retireLocked(e)
@@ -55,8 +49,39 @@ func (s *bootstrapTransferSource) own(e *bootstrapSourceAttempt) {
 	}
 }
 
+func (s *bootstrapTransferSource) waitReady(e *bootstrapSourceAttempt) {
+	for {
+		s.mu.Lock()
+		expires := e.expires
+		s.mu.Unlock()
+		timer := time.NewTimer(time.Until(expires))
+		select {
+		case <-timer.C:
+			s.mu.Lock()
+			expired := !time.Now().Before(e.expires)
+			s.mu.Unlock()
+			if expired {
+				return
+			}
+		case <-e.activity:
+			timer.Stop()
+		case <-e.retire:
+			timer.Stop()
+			return
+		case <-s.ctx.Done():
+			timer.Stop()
+			return
+		}
+	}
+}
+
 func (s *bootstrapTransferSource) capture(e *bootstrapSourceAttempt) (bootstrapSourceExport, error) {
 	ctx := e.createCtx
+	releaseWork, err := s.budget.AcquireWork(ctx, e.request.Requester.BrokerID)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseWork()
 	prepared, err := s.preparePublication(e)
 	export := prepared.export
 	if err != nil {
@@ -98,6 +123,9 @@ func (s *bootstrapTransferSource) capture(e *bootstrapSourceAttempt) (bootstrapS
 				e.response = response
 				e.export = export
 				e.expires = expires
+				if s.maxLifetime > 0 {
+					e.hardExpires = now.Add(s.maxLifetime)
+				}
 				e.phase = bootstrapReady
 			})
 			if publishErr != nil {

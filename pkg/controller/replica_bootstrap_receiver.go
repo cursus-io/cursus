@@ -75,8 +75,16 @@ func (ch *CommandHandler) ConfigureReplicaBootstrapRecovery(ctx context.Context,
 	if state == nil || id == "" {
 		return fsm.ErrBootstrapTransferUnavailable
 	}
+	timeout := 7 * time.Minute
+	if ch.recoveryBudget != nil {
+		var err error
+		timeout, err = ch.Config.RecoveryBootstrapTimeout()
+		if err != nil {
+			return err
+		}
+	}
 	ownerCtx, cancel := context.WithCancel(ctx)
-	ch.replicaBootstrap = &replicaBootstrapRecovery{ch: ch, state: state, client: client, brokerID: id, incarnation: incarnation, port: ch.Config.DiscoveryPort, ctx: ownerCtx, cancel: cancel, timeout: 7 * time.Minute, attempts: make(map[replicaBootstrapKey]*replicaBootstrapAttempt), offsets: newContextMutex()}
+	ch.replicaBootstrap = &replicaBootstrapRecovery{ch: ch, state: state, client: client, brokerID: id, incarnation: incarnation, port: ch.Config.DiscoveryPort, ctx: ownerCtx, cancel: cancel, timeout: timeout, attempts: make(map[replicaBootstrapKey]*replicaBootstrapAttempt), offsets: newContextMutex()}
 	ch.Cluster.SetReplicaBootstrapRecovery(ch)
 	return nil
 }

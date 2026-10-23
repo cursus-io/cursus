@@ -201,6 +201,21 @@ func (c *Codec) ReadFrameReserved(reader io.Reader, reserve FrameReservation) (F
 	})
 }
 
+// ReadFrameReservedCommand exposes the already validated command before payload
+// allocation, allowing recovery to use a subset of internal request capacity.
+func (c *Codec) ReadFrameReservedCommand(reader io.Reader, reserve func(Command, uint64) (func(), error)) (Frame, func(), error) {
+	if reserve == nil {
+		return c.readFrameReserved(reader, nil)
+	}
+	return c.readFrameReserved(reader, func(header decodedHeader) (func(), error) {
+		required := uint64(header.encodedSize)
+		if header.compression != CompressionNone {
+			required += uint64(header.decodedSize)
+		}
+		return reserve(header.frame.Command, required)
+	})
+}
+
 func (c *Codec) readFrameReserved(reader io.Reader, reserve func(decodedHeader) (func(), error)) (Frame, func(), error) {
 	noopRelease := func() {}
 	if c == nil {

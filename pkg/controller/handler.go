@@ -14,6 +14,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/eventsource"
 	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/transaction"
@@ -54,6 +55,7 @@ type CommandHandler struct {
 	partitionPreparedEpochs    sync.Map // map[string]partitionLeadershipFence
 	replication                *partitionReplicationCoordinator
 	bootstrapMu                sync.Mutex
+	recoveryBudget             *recovery.Budget
 	bootstrapSource            *bootstrapTransferSource
 	replicaBootstrap           *replicaBootstrapRecovery
 	consumerRecoveryInitMu     sync.Mutex
@@ -275,9 +277,15 @@ func NewCommandHandler(
 		{prefix: "FIND_COORDINATOR ", exact: false, helpOrder: 33, permissions: []string{PermissionGroup}, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFindCoordinator(cmd) }},
 		{prefix: "REPLICATE_MESSAGE ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateMessage(cmd) }},
 		{prefix: "REPLICATE_SNAPSHOT ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleReplicateSnapshot(cmd) }},
-		{prefix: "LIST_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleListSnapshots(cmd) }},
-		{prefix: "FETCH_SNAPSHOT ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleFetchSnapshot(cmd) }},
-		{prefix: "CATCHUP_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleCatchupSnapshots(cmd) }},
+		{prefix: "LIST_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string {
+			return ch.handleBudgetedSnapshotRead(ctx.RequestContext(), cmd, ch.handleListSnapshots)
+		}},
+		{prefix: "FETCH_SNAPSHOT ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string {
+			return ch.handleBudgetedSnapshotRead(ctx.RequestContext(), cmd, ch.handleFetchSnapshot)
+		}},
+		{prefix: "CATCHUP_SNAPSHOTS ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string {
+			return ch.handleCatchupSnapshots(ctx.RequestContext(), cmd)
+		}},
 		{prefix: "RAFT_APPLY ", exact: false, internal: true, handler: func(cmd string, ctx *ClientContext) string { return ch.handleRaftApply(cmd, ctx) }},
 	}
 	return ch

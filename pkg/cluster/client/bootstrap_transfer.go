@@ -10,6 +10,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/wire"
 )
 
@@ -103,7 +104,7 @@ func (c *TCPClusterClient) sendBootstrapRequest(parent context.Context, address 
 	if err = conn.SetDeadline(deadline); err != nil {
 		return nil, err
 	}
-	connection, err := wire.ClientHandshake(conn, []wire.Compression{wire.CompressionNone})
+	connection, err := wire.ClientHandshake(recovery.MeterConnection(ctx, conn), []wire.Compression{wire.CompressionNone})
 	if err != nil {
 		return nil, err
 	}

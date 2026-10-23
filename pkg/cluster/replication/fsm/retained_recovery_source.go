@@ -8,7 +8,6 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
-	"github.com/cursus-io/cursus/util"
 )
 
 type retainedSourceState struct {
@@ -181,7 +180,7 @@ func (f *BrokerFSM) fetchRetainedRecovery(ctx context.Context, request ReplicaCa
 		return result, err
 	}
 	readPage := func(start, end uint64, max int) (disk.RetainedPage, error) {
-		page, err := p.ReadReplicaRetainedPage(ctx, start, end, max, util.MaxMessageSize)
+		page, err := readRecoveryPage(ctx, p, start, end, max, request.MaxBytes)
 		if err != nil {
 			return disk.RetainedPage{}, err
 		}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
 )
@@ -47,19 +48,28 @@ type heartbeatRequest struct {
 }
 
 type ClusterServer struct {
-	sd             controller.ServiceDiscovery
-	authTokens     []string
-	tlsConfig      *tls.Config
-	connectionSlot chan struct{}
-	requestTimeout time.Duration
-	ctx            context.Context
-	cancel         context.CancelFunc
-	lifecycleMu    sync.Mutex
-	closed         bool
-	listeners      map[net.Listener]struct{}
-	connections    map[net.Conn]struct{}
-	workers        sync.WaitGroup
-	closeDone      chan struct{}
+	sd               controller.ServiceDiscovery
+	authTokens       []string
+	tlsConfig        *tls.Config
+	connectionSlot   chan struct{}
+	requestTimeout   time.Duration
+	ctx              context.Context
+	cancel           context.CancelFunc
+	lifecycleMu      sync.Mutex
+	closed           bool
+	listeners        map[net.Listener]struct{}
+	connections      map[net.Conn]struct{}
+	workers          sync.WaitGroup
+	closeDone        chan struct{}
+	recoveryBudget   *recovery.Budget
+	recoveryQuantum  int64
+	recoveryRequests chan struct{}
+}
+
+// SetRecoveryBudget must precede Start. Control commands do not consume it.
+func (h *ClusterServer) SetRecoveryBudget(b *recovery.Budget, quantum int64) {
+	h.recoveryBudget, h.recoveryQuantum = b, quantum
+	h.recoveryRequests = make(chan struct{}, max(1, cap(h.connectionSlot)/4))
 }
 
 func NewClusterServer(sd controller.ServiceDiscovery) *ClusterServer {
@@ -137,11 +147,12 @@ func (h *ClusterServer) serveConnection(conn net.Conn) {
 		if err := conn.SetDeadline(deadline); err != nil {
 			return
 		}
-		request, err := connection.ReadFrame()
+		request, releaseRequest, err := connection.ReadFrameReservedCommand(h.reserveRecoveryRequest)
 		if err != nil {
 			return
 		}
 		if request.Kind != wire.KindRequest || request.Status != wire.StatusNone || request.RequestID == 0 {
+			releaseRequest()
 			return
 		}
 		payload, err := wire.DecodeCommandPayload(request.Payload)
@@ -149,12 +160,14 @@ func (h *ClusterServer) serveConnection(conn net.Conn) {
 			h.writeErrorResponse(connection, request, wire.ErrorPayload{
 				Code: "invalid_cluster_request", Class: wire.ErrorClassValidation, Message: err.Error(),
 			})
+			releaseRequest()
 			continue
 		}
 		if !h.authenticate(payload) {
 			h.writeErrorResponse(connection, request, wire.ErrorPayload{
 				Code: "cluster_unauthorized", Class: wire.ErrorClassAuthorization, Message: "invalid cluster auth token",
 			})
+			releaseRequest()
 			return
 		}
 		delete(payload.Fields, "auth_token")
@@ -162,6 +175,11 @@ func (h *ClusterServer) serveConnection(conn net.Conn) {
 
 		var response any
 		var requestError *wire.ErrorPayload
+		requestContext := h.ctx
+		var completion *recovery.Completion
+		if request.Command == wire.CommandReplicaCatchup || request.Command == wire.CommandBootstrapChunk {
+			requestContext, completion = recovery.WithCompletion(requestContext)
+		}
 		switch request.Command {
 		case wire.CommandJoinCluster:
 			response, requestError = h.handleJoinCluster(payload)
@@ -170,11 +188,11 @@ func (h *ClusterServer) serveConnection(conn net.Conn) {
 		case wire.CommandHeartbeatCluster:
 			response, requestError = h.handleHeartbeatCluster(payload)
 		case wire.CommandReplicaCatchup:
-			ctx, cancel := context.WithDeadline(h.ctx, deadline)
+			ctx, cancel := context.WithDeadline(requestContext, deadline)
 			response, requestError = h.handleReplicaCatchupContext(ctx, payload)
 			cancel()
 		case wire.CommandBootstrapBegin, wire.CommandBootstrapChunk, wire.CommandBootstrapRelease:
-			response, requestError = h.handleBootstrapTransfer(conn, request.Command, payload, deadline)
+			response, requestError = h.handleBootstrapTransferContext(requestContext, conn, request.Command, payload, deadline)
 		case wire.CommandListCluster:
 			response, requestError = h.handleListCluster()
 		default:
@@ -185,9 +203,31 @@ func (h *ClusterServer) serveConnection(conn net.Conn) {
 		}
 		if requestError != nil {
 			h.writeErrorResponse(connection, request, *requestError)
+			completion.Finish()
+			releaseRequest()
 			continue
 		}
 		h.writeResponse(connection, request, response)
+		completion.Finish()
+		releaseRequest()
+	}
+}
+
+// Release and heartbeat/proof traffic must remain available while bulk recovery
+// requests are waiting. Bound recovery headers before allocating their payloads.
+func (h *ClusterServer) reserveRecoveryRequest(command wire.Command, bytes uint64) (func(), error) {
+	if h.recoveryRequests == nil || (command != wire.CommandReplicaCatchup && command != wire.CommandBootstrapBegin && command != wire.CommandBootstrapChunk) {
+		return func() {}, nil
+	}
+	if bytes > 1<<20 {
+		return nil, wire.ErrFrameTooLarge
+	}
+	select {
+	case h.recoveryRequests <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-h.recoveryRequests }) }, nil
+	default:
+		return nil, recovery.ErrBusy
 	}
 }
 
@@ -236,8 +276,21 @@ func (h *ClusterServer) handleReplicaCatchupContext(ctx context.Context, payload
 	if err := json.Unmarshal([]byte(encoded), &request); err != nil {
 		return nil, validationError("invalid replica catch-up request")
 	}
+	var lease *recovery.Lease
+	var transferred int64
+	if h.recoveryBudget != nil {
+		var err error
+		lease, _, err = h.recoveryBudget.TryAcquireEstimated(ctx, request.BrokerID, h.recoveryQuantum)
+		if err != nil {
+			return nil, internalClusterError(err)
+		}
+		defer func() { recovery.SettleAfterResponse(ctx, func() { _ = lease.Finish(transferred) }) }()
+	}
 	var batch fsm.ReplicaCatchupBatch
 	var err error
+	if err = injectedRecoverySourceDelay(ctx, request.Topic); err != nil {
+		return nil, internalClusterError(err)
+	}
 	if contextual, ok := h.sd.(controller.ContextReplicaCatchupSource); ok {
 		batch, err = contextual.FetchReplicaCatchupContext(ctx, request)
 	} else {
@@ -250,6 +303,28 @@ func (h *ClusterServer) handleReplicaCatchupContext(ctx context.Context, payload
 	batch, err = fitReplicaCatchupBatch(batch)
 	if err != nil {
 		return nil, internalClusterError(err)
+	}
+	if request.MaxBytes > 0 && request.MaxBytes < wire.MaxFramePayload {
+		for len(batch.Messages) > 1 {
+			data, encodeErr := json.Marshal(batch)
+			if encodeErr != nil {
+				return nil, internalClusterError(encodeErr)
+			}
+			if len(data) <= request.MaxBytes {
+				break
+			}
+			count := len(batch.Messages) / 2
+			batch.EndOffset = batch.Messages[count].Offset
+			batch.Messages = batch.Messages[:count]
+			batch.Verified = false
+			batch, err = fsm.SealReplicaCatchupBatch(batch)
+			if err != nil {
+				return nil, internalClusterError(err)
+			}
+		}
+	}
+	if data, err := json.Marshal(batch); err == nil {
+		transferred = int64(len(data))
 	}
 	return batch, nil
 }

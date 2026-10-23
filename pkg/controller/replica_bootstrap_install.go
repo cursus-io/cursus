@@ -113,7 +113,7 @@ func (r *replicaBootstrapRecovery) receive(ctx context.Context, a *replicaBootst
 					return err
 				}
 				var e error
-				data, e = r.client.ReadBootstrapTransferChunk(ctx, address, r.port, chunk, file.Size)
+				data, e = r.readBudgetedChunk(ctx, address, chunk, file.Size, a.request.Source)
 				metrics.RecordRecoveryBytes(metrics.RecoveryReplicaRPC, metrics.RecoveryTransferBytes, int64(len(data.Data)))
 				return e
 			})
@@ -126,13 +126,25 @@ func (r *replicaBootstrapRecovery) receive(ctx context.Context, a *replicaBootst
 			if err = ctx.Err(); err != nil {
 				return err
 			}
-			if err = stage.WriteChunk(file.ID, offset, data.Data); err != nil {
+			releaseWork, admissionErr := r.ch.recoveryBudget.AcquireWork(ctx, a.request.Source.BrokerID)
+			if admissionErr != nil {
+				return admissionErr
+			}
+			err = stage.WriteChunk(file.ID, offset, data.Data)
+			releaseWork()
+			if err != nil {
 				return err
 			}
 			offset += int64(len(data.Data))
 		}
 	}
-	if err = stage.PrepareContext(ctx); err != nil {
+	releaseWork, err := r.ch.recoveryBudget.AcquireWork(ctx, a.request.Source.BrokerID)
+	if err != nil {
+		return err
+	}
+	err = stage.PrepareContext(ctx)
+	releaseWork()
+	if err != nil {
 		return err
 	}
 	release()
@@ -144,6 +156,11 @@ func (r *replicaBootstrapRecovery) receive(ctx context.Context, a *replicaBootst
 }
 
 func (r *replicaBootstrapRecovery) install(ctx context.Context, p *topic.Partition, manifest disk.BootstrapMetadata, receiver *disk.BootstrapReceiver, ticket *fsm.ReplicaBootstrapReceiverTicket, fenced func(bool)) (result error) {
+	releaseWork, err := r.ch.recoveryBudget.AcquireWork(ctx, manifest.Fence.SourceID)
+	if err != nil {
+		return err
+	}
+	defer releaseWork()
 	started := time.Now()
 	util.Info("replica_recovery phase=bootstrap_install topic=%q partition=%d start=%d end=%d resume=%t", manifest.Fence.Topic, manifest.Fence.Partition, manifest.StartOffset, manifest.EndOffset, receiver == nil)
 	defer func() {

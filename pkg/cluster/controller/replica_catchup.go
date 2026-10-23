@@ -57,21 +57,7 @@ func (cc *ClusterController) StartReplicaCatchupVerified(ctx context.Context, fe
 	cc.catchupMu.Unlock()
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-			if err := cc.RunReplicaCatchupOnceVerified(ctx, fetcher, apply); err != nil {
-				util.Debug("replica catch-up pending on %s: %v", cc.brokerID, err)
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-		}
+		cc.runReplicaScheduler(ctx, fetcher, apply)
 	}()
 }
 

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/disk"
@@ -46,6 +47,15 @@ func (ch *CommandHandler) ConfigureBootstrapTransferSource(ctx context.Context, 
 		return fsm.BootstrapProcessIdentity{BrokerID: brokerID, IncarnationID: incarnation, IncarnationEpoch: b.IncarnationEpoch}, nil
 	}
 	source := newBootstrapTransferSource(ctx, state, identity)
+	source.budget = ch.recoveryBudget
+	if source.budget != nil {
+		timeout, err := ch.Config.RecoveryBootstrapTimeout()
+		if err != nil {
+			source.cancel()
+			return err
+		}
+		source.maxLifetime = timeout - 2*time.Minute
+	}
 	source.incarnation = incarnation
 	// Capture the dependency before admission. Missing catalog authority disables
 	// only replica capture; metadata sources remain independently available.

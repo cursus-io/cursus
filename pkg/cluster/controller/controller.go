@@ -15,6 +15,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/cursus-io/cursus/pkg/recovery"
 	topicpkg "github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -87,7 +88,11 @@ type ClusterController struct {
 	catchupCancel    context.CancelFunc
 	catchupDone      chan struct{}
 	catchupStopped   bool
+	recoveryBudget   *recovery.Budget
 }
+
+// SetRecoveryBudget binds the process-wide budget before background work starts.
+func (cc *ClusterController) SetRecoveryBudget(b *recovery.Budget) { cc.recoveryBudget = b }
 
 func (cc *ClusterController) SetReplicaSnapshotCatchup(callback func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error) {
 	if cc != nil {
