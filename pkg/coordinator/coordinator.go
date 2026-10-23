@@ -29,8 +29,9 @@ type Coordinator struct {
 	groups                   map[string]*GroupMetadata // All consumer groups
 	mu                       sync.RWMutex              // Global lock for coordinator state
 	lifecycleMu              sync.Mutex                // Serializes durable group lifecycle transitions
-	lifecyclePending         map[string]bool           // Groups whose durable lifecycle write is in progress
-	cfg                      *config.Config            // Configuration reference
+	cooperativePending       map[string]*CooperativeAssignment
+	lifecyclePending         map[string]bool // Groups whose durable lifecycle write is in progress
+	cfg                      *config.Config  // Configuration reference
 	ctx                      context.Context
 	cancel                   context.CancelFunc
 
@@ -986,6 +987,11 @@ func (gm *GroupMetadata) storeOffsetMonotonic(groupName, topic string, partition
 	return nil
 }
 
+// ExportGroupState returns a detached snapshot of one group.
+func (c *Coordinator) ExportGroupState(group string) *GroupStateSnapshot {
+	return c.exportState(&group)[group]
+}
+
 // ExportState returns a serializable snapshot of all consumer groups.
 func (c *Coordinator) ExportState() map[string]*GroupStateSnapshot {
 	return c.exportState(nil)
@@ -1094,6 +1100,7 @@ func (c *Coordinator) importStateLocked(state map[string]*GroupStateSnapshot) er
 	c.groups = make(map[string]*GroupMetadata, len(state))
 	c.groupEpochs = make(map[string]uint64, len(state))
 	c.lifecyclePending = make(map[string]bool)
+	c.cooperativePending = nil
 	c.ownershipSince = make(map[string]time.Time)
 	for name, snap := range state {
 		c.groupEpochs[name] = snap.RegistrationEpoch

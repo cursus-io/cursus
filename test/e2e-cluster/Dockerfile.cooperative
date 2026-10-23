@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+# Same broker build/runtime as production, without unrelated CLI rebuilds.
+FROM golang:1.26.6 AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN --mount=type=cache,id=cursus-cooperative-mod,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,id=cursus-cooperative-mod,target=/go/pkg/mod --mount=type=cache,id=cursus-cooperative-build,target=/root/.cache/go-build CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w" -o /app/broker ./cmd/broker
+FROM alpine:3.20
+RUN apk add --no-cache bash curl && addgroup -g 1000 cursus && adduser -D -u 1000 -G cursus cursus
+WORKDIR /app
+ENV LOG_DIR=/data/logs
+COPY --from=builder --chown=cursus:cursus /app/broker /app/broker
+COPY --chown=cursus:cursus entrypoint.sh /app/entrypoint.sh
+RUN mkdir -p /data/logs /app/cluster-logs && chown -R cursus:cursus /app /data && chmod +x /app/entrypoint.sh
+USER cursus
+ENTRYPOINT ["/app/entrypoint.sh"]

@@ -67,12 +67,19 @@ func (c *Coordinator) checkSingleGroupTimeout(groupName string, timeout time.Dur
 		}
 	}
 	generation := group.Generation
+	cooperative := group.Cooperative != nil
 	handler := c.expirationHandler
 	distributed := !c.standalone
 	c.mu.Unlock()
 	release()
 
 	if len(timedOutMembers) == 0 {
+		return
+	}
+	if cooperative {
+		if err := c.expireCooperative(groupName, timeout); err != nil {
+			util.Warn("Group '%s': cooperative expiration deferred: %v", groupName, err)
+		}
 		return
 	}
 

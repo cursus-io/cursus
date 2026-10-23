@@ -20,6 +20,7 @@ type ReservedTransactionOffset struct {
 // Group registration epoch and snapshot revision live on the enclosing record.
 // Membership may subsequently change without invalidating this authorization.
 type TransactionOffsetReservation struct {
+	Grants          []CooperativeGrant          `json:"grants,omitempty"`
 	TransactionalID string                      `json:"transactional_id"`
 	ProducerID      string                      `json:"producer_id"`
 	ProducerEpoch   int64                       `json:"producer_epoch"`
@@ -63,6 +64,14 @@ func cloneOffsetReservations(reservations []TransactionOffsetReservation) []Tran
 	}
 	result := append([]TransactionOffsetReservation(nil), reservations...)
 	for i := range result {
+		result[i].Grants = append([]CooperativeGrant(nil), result[i].Grants...)
+		sort.Slice(result[i].Grants, func(a, b int) bool {
+			l, r := result[i].Grants[a].Partition, result[i].Grants[b].Partition
+			if l.Topic != r.Topic {
+				return l.Topic < r.Topic
+			}
+			return l.Partition < r.Partition
+		})
 		result[i].Offsets = append([]ReservedTransactionOffset(nil), result[i].Offsets...)
 		sort.Slice(result[i].Offsets, func(a, b int) bool {
 			left, right := result[i].Offsets[a], result[i].Offsets[b]
@@ -87,6 +96,27 @@ func validateOffsetReservations(reservations []TransactionOffsetReservation) err
 			return fmt.Errorf("duplicate transaction offset reservation %q", reservation.TransactionalID)
 		}
 		transactions[reservation.TransactionalID] = true
+		if len(reservation.Grants) > 0 {
+			if len(reservation.Grants) != len(reservation.Offsets) {
+				return fmt.Errorf("reservation ownership count mismatch")
+			}
+			grants := make(map[TopicPartition]bool, len(reservation.Grants))
+			var session uint64
+			for _, grant := range reservation.Grants {
+				key := TopicPartition{Topic: grant.Partition.Topic, Partition: grant.Partition.Partition}
+				if !validCooperativePartition(grant.Partition) || grant.Member != reservation.MemberID || grant.Session == 0 || grant.Epoch == 0 || grants[key] || (session != 0 && grant.Session != session) {
+					return fmt.Errorf("invalid reservation ownership")
+				}
+				session = grant.Session
+				grants[key] = true
+			}
+			for _, offset := range reservation.Offsets {
+				if !grants[TopicPartition{Topic: offset.Topic, Partition: offset.Partition}] {
+					return fmt.Errorf("reservation ownership partition mismatch")
+				}
+			}
+		}
+
 		for _, offset := range reservation.Offsets {
 			if offset.Topic == "" || offset.Partition < 0 {
 				return fmt.Errorf("invalid reserved offset partition")
@@ -150,8 +180,8 @@ func (c *Coordinator) PrepareOffsetReservation(groupName string, registrationEpo
 	if registrationEpoch == 0 || group.RegistrationEpoch != registrationEpoch {
 		return fmt.Errorf("ERROR: group_epoch_mismatch group=%s", groupName)
 	}
-	if group.Cooperative != nil {
-		return errCooperativeProtocolRequired
+	if group.Cooperative == nil && len(reservation.Grants) > 0 {
+		return fmt.Errorf("ERROR: cooperative_fenced")
 	}
 	if c.lifecyclePending[groupName] {
 		return fmt.Errorf("group %q lifecycle update in progress", groupName)
@@ -172,7 +202,27 @@ func (c *Coordinator) PrepareOffsetReservation(groupName string, registrationEpo
 			return fmt.Errorf("transaction offset reservation conflict transactional_id=%s", reservation.TransactionalID)
 		}
 	}
-	if response := c.validateMemberGenerationLocked(groupName, reservation.MemberID, reservation.Generation); response != "" {
+	if group.Cooperative != nil {
+		if len(reservation.Grants) != len(reservation.Offsets) {
+			return errCooperativeProtocolRequired
+		}
+		grants := make(map[TopicPartition]CooperativeGrant, len(reservation.Grants))
+		for _, grant := range reservation.Grants {
+			key := TopicPartition{Topic: grant.Partition.Topic, Partition: grant.Partition.Partition}
+			if _, duplicate := grants[key]; duplicate || grant.Member != reservation.MemberID {
+				return fmt.Errorf("ERROR: cooperative_fenced")
+			}
+			if err := group.Cooperative.ValidateGrant(registrationEpoch, grant); err != nil {
+				return fmt.Errorf("ERROR: cooperative_fenced")
+			}
+			grants[key] = grant
+		}
+		for _, offset := range reservation.Offsets {
+			if _, ok := grants[TopicPartition{Topic: offset.Topic, Partition: offset.Partition}]; !ok {
+				return fmt.Errorf("ERROR: cooperative_fenced")
+			}
+		}
+	} else if response := c.validateMemberGenerationLocked(groupName, reservation.MemberID, reservation.Generation); response != "" {
 		return fmt.Errorf("%s", response)
 	}
 	member := group.Members[reservation.MemberID]

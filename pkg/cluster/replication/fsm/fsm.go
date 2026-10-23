@@ -34,7 +34,8 @@ const (
 	TruncateCleanupBoundaryProtocolVersion = 8
 	RetentionTimeProtocolVersion           = 9
 	ConsumerHistoryProtocolVersion         = 10
-	BrokerProtocolVersionCurrent           = ConsumerHistoryProtocolVersion
+	CooperativeConsumerProtocolVersion     = 11
+	BrokerProtocolVersionCurrent           = CooperativeConsumerProtocolVersion
 	// Recovery capabilities are additive and do not raise lifecycle requirements.
 	IndexedRecoveryProtocolVersion   = 1
 	BootstrapRecoveryProtocolVersion = 2
@@ -74,6 +75,7 @@ type TransactionCoordinatorShard struct {
 }
 
 type BrokerFSMState struct {
+	CooperativeConsumerActivated     bool                                           `json:"cooperativeConsumerActivated,omitempty"`
 	TopicCleanupBoundaries           map[string]*coordinator.TopicCleanupBoundary   `json:"topicCleanupBoundaries,omitempty"`
 	ConsumerHistoryActivated         bool                                           `json:"consumerHistoryActivated,omitempty"`
 	RetentionTimeActivated           bool                                           `json:"retentionTimeActivated,omitempty"`
@@ -96,15 +98,16 @@ type BrokerFSMState struct {
 }
 
 type BrokerFSM struct {
-	topicCleanupBoundaries   map[string]*coordinator.TopicCleanupBoundary
-	consumerHistoryFlag      atomic.Bool
-	consumerHistoryActivated bool
-	retentionTimeFlag        atomic.Bool
-	retentionTimeActivated   bool
-	notifiers                map[string]chan interface{}
-	mu                       sync.RWMutex
-	transitionMu             contextlock.RWMutex
-	materializationMu        contextlock.RWMutex
+	cooperativeConsumerActivated bool
+	topicCleanupBoundaries       map[string]*coordinator.TopicCleanupBoundary
+	consumerHistoryFlag          atomic.Bool
+	consumerHistoryActivated     bool
+	retentionTimeFlag            atomic.Bool
+	retentionTimeActivated       bool
+	notifiers                    map[string]chan interface{}
+	mu                           sync.RWMutex
+	transitionMu                 contextlock.RWMutex
+	materializationMu            contextlock.RWMutex
 
 	logs                      map[uint64]*ReplicationEntry
 	brokers                   map[string]*BrokerInfo
@@ -308,6 +311,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 
 	var res interface{}
 	switch {
+	case strings.HasPrefix(data, "COOPERATIVE_CONSUMER_ACTIVATE:"):
+		res = f.applyCooperativeConsumerActivation(strings.TrimPrefix(data, "COOPERATIVE_CONSUMER_ACTIVATE:"))
 	case strings.HasPrefix(data, "CONSUMER_ROUTING_ACTIVATE:"):
 		res = f.applyConsumerRoutingActivation(strings.TrimPrefix(data, "CONSUMER_ROUTING_ACTIVATE:"))
 	case strings.HasPrefix(data, "REGISTER:"):
@@ -388,7 +393,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 		util.Error("Failed to decode snapshot: %v", err)
 		return fmt.Errorf("failed to restore snapshot: %w", err)
 	}
-	if header.Version != SnapshotVersionCurrent && header.Version != SnapshotVersionProducerEpoch && header.Version != SnapshotVersionLegacyEpoch && header.Version != SnapshotVersionCooperative {
+	if header.Version != SnapshotVersionCurrent && header.Version != SnapshotVersionProducerEpoch && header.Version != SnapshotVersionLegacyEpoch && header.Version != SnapshotVersionCooperative && header.Version != SnapshotVersionCooperativeRuntime {
 		return fmt.Errorf("%w: snapshot version %d is not supported; remove all Cursus persistent state and clean bootstrap version %d", ErrUnsupportedRecoveryProtocol, header.Version, SnapshotVersionCurrent)
 	}
 	var state BrokerFSMState
@@ -398,6 +403,14 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	}
 	if state.ConsumerHistoryActivated {
 		if err := validateConsumerHistoryBrokers(state.Brokers); err != nil {
+			return err
+		}
+	}
+	if state.CooperativeConsumerActivated {
+		if state.Version < SnapshotVersionCooperativeRuntime {
+			return fmt.Errorf("%w: cooperative runtime requires snapshot version 13", ErrUnsupportedRecoveryProtocol)
+		}
+		if err := validateCooperativeConsumerBrokers(state.Brokers); err != nil {
 			return err
 		}
 	}
@@ -441,7 +454,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	if err := coordinator.ValidateImportState(state.GroupState); err != nil {
 		return fmt.Errorf("restore consumer groups: %w", err)
 	}
-	if state.Version != SnapshotVersionCooperative {
+	if state.Version < SnapshotVersionCooperative {
 		for _, group := range state.GroupState {
 			if group != nil && group.Cooperative != nil {
 				return fmt.Errorf("%w: cooperative ownership requires snapshot version 12", ErrUnsupportedRecoveryProtocol)
@@ -505,6 +518,7 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	f.transactionCoordinatorShardCount = persistedShardCount
 	f.consumerHistoryActivated = state.ConsumerHistoryActivated
 	f.consumerHistoryFlag.Store(state.ConsumerHistoryActivated)
+	f.cooperativeConsumerActivated = state.CooperativeConsumerActivated
 	f.retentionTimeActivated = state.RetentionTimeActivated
 	f.retentionTimeFlag.Store(state.RetentionTimeActivated)
 	f.offsetReservationsActivated = state.OffsetReservationsActivated
@@ -951,6 +965,7 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 		transactionCoordinatorShards:     transactionCoordinatorShards,
 		transactionCoordinatorShardCount: f.effectiveTransactionCoordinatorShardCountLocked(),
 		consumerHistoryActivated:         f.consumerHistoryActivated,
+		cooperativeConsumerActivated:     f.cooperativeConsumerActivated,
 		retentionTimeActivated:           f.retentionTimeActivated,
 		offsetReservationsActivated:      f.offsetReservationsActivated,
 		consumerMetadataRoutingActivated: f.consumerMetadataRoutingActivated,

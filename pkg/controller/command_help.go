@@ -28,5 +28,9 @@ func (ch *CommandHandler) handleHelp() string {
 	for i := range entries {
 		names[i] = entries[i].name
 	}
-	return fmt.Sprintf("OK commands=%s", strings.Join(names, ","))
+	features := ""
+	if ch.cooperativeEnabled() {
+		features = " features=consumer_cooperative_v1"
+	}
+	return fmt.Sprintf("OK commands=%s%s", strings.Join(names, ","), features)
 }

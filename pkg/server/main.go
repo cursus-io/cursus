@@ -281,6 +281,11 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 							util.Debug("consumer history activation pending: %v", err)
 						}
 					}
+					if cfg.ConsumerCooperativeEnabled {
+						if err := clusterController.ActivateCooperativeConsumer(rm); err != nil {
+							util.Debug("cooperative consumer activation pending: %v", err)
+						}
+					}
 					if cfg.RetentionTimeEnabled {
 						if err := clusterController.ActivateRetentionTime(rm); err != nil {
 							util.Debug("retention time activation pending: %v", err)

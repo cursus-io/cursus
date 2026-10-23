@@ -149,6 +149,12 @@ func NegotiateProtocol(conn net.Conn, request ProtocolNegotiation) (*NegotiatedP
 		return nil, fmt.Errorf("capability response is missing commands")
 	}
 	available := wireV2CommandFeatures(splitObservationList(fields["commands"]))
+	for _, feature := range splitObservationList(fields["features"]) {
+		if feature == "consumer_cooperative_v1" {
+			available = append(available, feature)
+		}
+	}
+	sort.Strings(available)
 	result := &NegotiatedProtocol{Version: version}
 	if len(features) == 1 && features[0] == "*" {
 		features = available

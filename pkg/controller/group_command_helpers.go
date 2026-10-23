@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -72,8 +73,10 @@ func formatCoordinatorError(err error) string {
 		return "OK"
 	}
 	msg := err.Error()
-	if protocol.IsErrorResponse(msg) {
-		return msg
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		if protocol.IsErrorResponse(cause.Error()) {
+			return cause.Error()
+		}
 	}
 	if strings.Contains(msg, "offset regression") {
 		return fmt.Sprintf("ERROR: offset_regression reason=%q", msg)

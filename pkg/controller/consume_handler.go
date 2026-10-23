@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/stream"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -130,6 +131,9 @@ func (ch *CommandHandler) HandleConsumeCommand(conn net.Conn, rawCmd string, ctx
 		return totalStreamed, err
 	}
 
+	if err := ch.validateCooperativeFetch(cArgs); err != nil {
+		return 0, err
+	}
 	batchData, err := util.EncodeBatchMessages(cArgs.TopicName, cArgs.PartitionID, "1", false, allMessages)
 	if err != nil {
 		return 0, fmt.Errorf("failed to encode batch: %w", err)
@@ -160,6 +164,9 @@ func (ch *CommandHandler) readFromTopic(topicName string, cArgs CommonArgs, ctx 
 }
 
 func (ch *CommandHandler) readFromTopicBounded(topicName string, cArgs CommonArgs, ctx *ClientContext, batchSize, maxBytes int, allowOversizedFirst bool) ([]types.Message, int, error) {
+	if err := ch.validateCooperativeFetch(cArgs); err != nil {
+		return nil, 0, err
+	}
 	t, p, err := ch.getTopicAndPartition(topicName, cArgs.PartitionID)
 	if err != nil {
 		return nil, 0, err
@@ -265,6 +272,9 @@ func waitForConsumeNotification(ctx context.Context, timeout time.Duration, noti
 }
 
 func consumerOffsetCacheKey(topicName string, args CommonArgs) string {
+	if args.Ownership != nil {
+		return fmt.Sprintf("%q/%s", args.GroupName, protocol.EncodeCooperative(args.Ownership))
+	}
 	return fmt.Sprintf("%q/%q/%q/%d/%d", args.GroupName, args.MemberID, topicName, args.Generation, args.PartitionID)
 }
 
@@ -363,6 +373,9 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 	// delivered offset so empty filtered pages cannot strand later visible data.
 	scanOffset := actualOffset
 	readFn := func(offset uint64, max int) ([]types.Message, error) {
+		if err := ch.validateCooperativeFetch(cArgs); err != nil {
+			return nil, err
+		}
 		stable, found, err := ch.stableGroupOffset(cArgs.GroupName, cArgs.TopicName, cArgs.PartitionID)
 		if err != nil {
 			return nil, err
@@ -376,6 +389,9 @@ func (ch *CommandHandler) HandleStreamCommand(conn net.Conn, rawCmd string, ctx 
 		messages, _, next, err := readPartitionPage(p, scanOffset, max, wire.MaxFetchDecodedBytes, true, cArgs.ReadIsolation)
 		if err == nil {
 			scanOffset = next
+		}
+		if err == nil {
+			err = ch.validateCooperativeFetch(cArgs)
 		}
 		return messages, err
 	}
@@ -508,6 +524,7 @@ func implicitDefaultGroupName(topicName string) string {
 }
 
 type CommonArgs struct {
+	Ownership       *protocol.CooperativeToken
 	TopicName       string
 	PartitionID     int
 	GroupName       string
@@ -522,6 +539,10 @@ type CommonArgs struct {
 }
 
 func (ch *CommandHandler) parseCommonArgs(args map[string]string) (CommonArgs, error) {
+	ownership, tokenErr := parseCooperativeToken(args)
+	if tokenErr != nil {
+		return CommonArgs{}, tokenErr
+	}
 	pID, err := strconv.Atoi(args["partition"])
 	if err != nil && args["partition"] != "" {
 		return CommonArgs{}, fmt.Errorf("invalid partition value: %s", args["partition"])
@@ -572,6 +593,7 @@ func (ch *CommandHandler) parseCommonArgs(args map[string]string) (CommonArgs, e
 	}
 
 	return CommonArgs{
+		Ownership:       ownership,
 		TopicName:       args["topic"],
 		PartitionID:     pID,
 		GroupName:       ch.resolveConsumerGroup(args["group"], args["topic"]),

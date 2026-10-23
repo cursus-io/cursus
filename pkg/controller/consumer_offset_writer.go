@@ -9,6 +9,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 )
@@ -79,7 +80,7 @@ func (ch *CommandHandler) writeConsumerOffsetRecord(record coordinator.ConsumerM
 	}
 	var ack types.AckResponse
 	if err := json.Unmarshal([]byte(resp), &ack); err != nil || ack.Status != "OK" {
-		return fmt.Errorf("consumer offset append failed: %s", resp)
+		return consumerOffsetAppendError(resp)
 	}
 	return nil
 }
@@ -103,4 +104,18 @@ func (ch *CommandHandler) consumerOffsetRoute(internalTopic *topic.Topic, groupN
 	}
 	partition := internalTopic.GetPartitionForMessage(types.Message{Key: coordinator.ConsumerMetadataGroupPartitionKey(groupName)})
 	return strconv.Itoa(partition), nil, nil
+}
+
+// A failed durable append must not turn a transient storage/route outage into
+// a terminal consumer error. Grant fencing and malformed requests stay terminal.
+func consumerOffsetAppendError(response string) error {
+	if parsed, ok := protocol.ParseErrorResponse(response); ok {
+		if parsed.Retryable {
+			return fmt.Errorf("%s", response)
+		}
+		if parsed.Code == "broker_error" || parsed.Code == "consumer_route_fenced" {
+			return fmt.Errorf("ERROR: coordinator_not_available reason=%q", "consumer offset append failed: "+response)
+		}
+	}
+	return fmt.Errorf("consumer offset append failed: %s", response)
 }

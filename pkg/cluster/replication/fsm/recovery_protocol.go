@@ -9,11 +9,12 @@ import (
 )
 
 const (
-	SnapshotVersionProducerEpoch = 10
-	SnapshotVersionCurrent       = 11
-	SnapshotVersionCooperative   = 12
-	SnapshotVersionLegacyEpoch   = 9
-	CommittedHWMVersionCurrent   = 1
+	SnapshotVersionProducerEpoch      = 10
+	SnapshotVersionCurrent            = 11
+	SnapshotVersionCooperative        = 12
+	SnapshotVersionCooperativeRuntime = 13
+	SnapshotVersionLegacyEpoch        = 9
+	CommittedHWMVersionCurrent        = 1
 )
 
 var (

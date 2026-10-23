@@ -66,6 +66,10 @@ func (c *Coordinator) commitOffsetForGroupLocked(gm *GroupMetadata, groupName, t
 	if gm.Cooperative != nil {
 		return errCooperativeProtocolRequired
 	}
+	return c.commitAuthorizedOffsetForGroupLocked(gm, groupName, topic, partition, offset)
+}
+
+func (c *Coordinator) commitAuthorizedOffsetForGroupLocked(gm *GroupMetadata, groupName, topic string, partition int, offset uint64) error {
 	if err := reservedOffsetError(gm, groupName, topic, partition); err != nil {
 		return err
 	}
