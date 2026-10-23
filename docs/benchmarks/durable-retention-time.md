@@ -96,7 +96,7 @@ go test ./pkg/topic -run '^$' -bench BenchmarkRetentionTimeAppend -benchtime=200
 Focused contract tests pass for legacy/new mixtures, future timestamps,
 committed and transaction boundaries, event-history protection, capability
 activation, Raft snapshot restore, standalone downgrade rejection, compaction,
-interrupted bootstrap replacement, restart, cold backup restore, absent/corrupt
+interrupted bootstrap replacement, torn CDM6 checksum repair, restart, cold backup restore, absent/corrupt
 offset indexes and corrupt authoritative records. The controller integration
 test transports sealed JSON through verified catch-up and rejects timestamp
 tampering before append. Tail repair reseeds the leader clock and retention

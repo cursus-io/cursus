@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"io/fs"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -261,4 +263,37 @@ func TestDurableRetentionDoesNotWaitForCompactionUnderPartitionGuard(t *testing.
 	case <-time.After(5 * time.Second):
 		t.Fatal("retention held the partition guard while waiting for compaction")
 	}
+}
+
+func TestDurableRetentionCrashRepairKeepsCompleteRecordTime(t *testing.T) {
+	d, cfg := bootstrapTestHandler(t, 1)
+	stamp := time.Unix(1700000000, 0).UnixMilli()
+	record := types.DiskMessage{Topic: "orders", Partition: 1, AppendTimeMS: stamp, Payload: "durable"}
+	require.NoError(t, d.WriteBatchSync([]types.DiskMessage{record}))
+	path := d.GetSegmentPath(0)
+	require.NoError(t, d.Close())
+	before, err := os.Stat(path)
+	require.NoError(t, err)
+	torn := record
+	torn.Offset = 1
+	torn.AppendTimeMS++
+	encoded, err := util.SerializeDiskMessage(torn)
+	require.NoError(t, err)
+	length, ok := util.SafeIntToUint32(len(encoded))
+	require.True(t, ok)
+	frame := binary.BigEndian.AppendUint32(nil, length)
+	frame = append(frame, encoded[:len(encoded)-3]...) // interrupted checksum write
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0600)
+	require.NoError(t, err)
+	_, err = file.Write(frame)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	reopened, err := NewDiskHandler(cfg, "orders", 1)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reopened.Close()) }()
+	require.Equal(t, uint64(1), reopened.GetAbsoluteOffset())
+	require.Equal(t, []types.DiskMessage{record}, bootstrapRawRecords(t, path))
+	after, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, before.Size(), after.Size())
 }

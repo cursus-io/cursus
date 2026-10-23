@@ -137,7 +137,8 @@ not a count of unique records. There are no topic/partition/path metric labels.
 and demonstrates new mtimes on actual isolated incremental and bootstrap files.
 It does not modify mtimes. `TestDurableRetentionRecoveryGranularity` compares
 the same record times at controlled cutoffs with different segment boundaries.
-Compaction, interrupted bootstrap replacement, restart, cold backup restore,
+Compaction, interrupted bootstrap replacement, torn CDM6 checksum repair,
+restart, cold backup restore,
 missing/corrupt offset indexes, corrupt record CRC, legacy mixtures, HWM, open
 transactions, event histories, capability activation and snapshot restore have
 dedicated regression tests. Clock fixtures control policy time only; benchmark
